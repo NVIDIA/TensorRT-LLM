@@ -259,6 +259,13 @@ speculative configurations than the split target, so `route` checks the fused
 target first and returns the split target for the deployments the fused target
 declines.
 
+More generally, when several targets of a family support a deployment, `route`
+checks the most specialized one first, the one written for the narrowest set of
+deployments, and falls through to the more general ones. This holds with or
+without speculative decoding: a target written for one parallel layout can come
+ahead of the split target for that layout's deployments without speculation
+too. A fused target ahead of its split sibling is one case of this rule.
+
 ### Writing a fused target
 
 #### Required
@@ -291,15 +298,16 @@ mode the target uses.
   `validate_request`, the requests that need them, such as requests with
   logits post-processors; the speculative sampler already refuses logprobs
   and context or generation logits.
-* **Naming.** When a fused target and a split target serve the same
-  checkpoint, GPU and parallel layout, name the fused target after its split
-  sibling, with a suffix on the parallel segment that names the mode, for
-  example `<checkpoint>__<sm>__<parallel>_mtp_fused`, and carry the suffix
-  into the class name, for example
-  `ModelingV2Glm53FlashNvfp4Sm100DefaultMtpFused`. A target that has no split
-  sibling, and runs both without speculation and with fused speculation,
-  follows the plain target naming in [Families and targets](#families-and-targets)
-  and states the modes it fuses in its module docstring.
+* **Naming.** When a fused target is a variant of a split target, written
+  for the same checkpoint, GPU and parallel layout as that split sibling, name
+  it after the sibling with a suffix on the parallel segment that names the
+  mode, for example `<checkpoint>__<sm>__<parallel>_mtp_fused`, and carry the
+  suffix into the class name, for example
+  `ModelingV2Glm53FlashNvfp4Sm100DefaultMtpFused`. A target written on its own,
+  with no split sibling, follows the plain target naming in
+  [Families and targets](#families-and-targets), even where its deployments
+  overlap another target's, and states the modes it fuses in its module
+  docstring.
 
 #### Recommendations
 
@@ -511,3 +519,11 @@ That boundary may move as models need more customization. Model-specific
 runtime policy can be split from shared services, but a change to common
 runtime behavior still has to work for every other model. How to specialize
 the runtime further is still being designed.
+
+### Beam diagnostic validation
+
+For Beam, `TRTLLM_MODELING_V2_VALIDATE=1` additionally enables repeated per-layer
+metadata checks and per-step, all-rank routing agreement using device-to-host copies
+and SHA-256 hashes. The serving adapter also enables checkpoint digests in this mode.
+This is expensive diagnostic behavior, not only a first-forward contract check.
+Use the same setting on every rank and leave it disabled for performance measurements.

@@ -180,6 +180,7 @@ l0_b200:
   - unittest/_torch/modules/kimi_kda/test_kda_decode_op.py
   - unittest/_torch/modules/kimi_kda/test_kimi_kda_decode_state_parity.py
   - unittest/_torch/modules/kimi_kda/test_kda_prefill_state_parity.py
+  - unittest/_torch/modules/kimi_kda/test_kda_replay_acceptance.py
   # Shared catalog entries used by K3's generic path.
   - unittest/_torch/modeling_v2/moe/test_modeling_v2_noaux_tc_op.py::test_kimi_k3_config
   - unittest/_torch/modeling_v2/quantization/test_modeling_v2_mxfp8_quantize.py::test_kimi_k3_routed_hidden
@@ -257,6 +258,7 @@ l0_b200:
   # ------------- MoE: test_moe_backend (by backend) ---------------
   - unittest/_torch/moe/test_moe_backend.py::test_cutlass_moe_routing_round_trip
   - unittest/_torch/moe/test_moe_backend.py::test_cutlass_moe_public_activation_ids
+  - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_mxfp4_fp8_input_quantization
   - unittest/_torch/moe/test_kimi_k3_moe_gate.py::test_fused_route_quant_matches_unfused_chain
   - unittest/_torch/moe/test_kimi_k3_moe_gate.py::test_router_logits_kernel_matches_router_gemm
   - unittest/_torch/moe/test_megamoe_streaming_load.py
@@ -476,6 +478,7 @@ l0_b200:
   - unittest/_torch/visual_gen/test_cosmos3_transformer.py
   - unittest/_torch/visual_gen/test_attention_qkv_share.py
   - unittest/_torch/visual_gen/test_cosmos3_pipeline.py
+  - unittest/_torch/visual_gen/test_cosmos3_seacache.py
   - unittest/_torch/visual_gen/test_cosmos3_distilled.py
   - unittest/_torch/visual_gen/test_cosmos3_fp8.py
   - unittest/_torch/visual_gen/test_cosmos3_step_precision_component.py

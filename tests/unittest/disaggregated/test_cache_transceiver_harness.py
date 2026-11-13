@@ -737,6 +737,7 @@ def test_single_node_transfer(tmp_path):
     timeout_error = None
     processes = []
     process_group_ids = []
+    ctx_proc = gen_proc = None
     processes_succeeded = False
     with open(ctx_log_path, "wb") as ctx_log_file, open(gen_log_path, "wb") as gen_log_file:
         try:

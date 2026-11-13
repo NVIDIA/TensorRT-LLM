@@ -327,17 +327,22 @@ def test_the_mtp_verify_buffers_hold_this_ranks_heads(monkeypatch, member, rank)
             assert cache.intermediate_ssm is None, "the cached replay keeps no per-step state"
         meta = cm.get_replay_state_update_metadata()
         assert meta is not None
+        # The history and its bookkeeping have replay slots of their own.
+        replay_slots = meta.prev_num_accepted_tokens.shape[0]
         P.check_replay_state(
             meta.replay_history_size,
             meta.replay_step_width,
             meta.prev_num_accepted_tokens,
             meta.cache_buf_idx,
             ssm0,
+            replay_slots,
         )
         assert meta.replay_step_width == spec.max_draft_len + 1
-        history, slots = meta.replay_history_size, ssm0.shape[0]
+        history = meta.replay_history_size
         for i, cache in caches.items():
-            P.check_replay_history(g, i, history, slots, cache.old_x, cache.old_B, cache.old_dt)
+            P.check_replay_history(
+                g, i, history, replay_slots, cache.old_x, cache.old_B, cache.old_dt
+            )
 
         draft_in_trunk = MTP_LAYER in cm.layer_offsets
         assert draft_in_trunk == MEMBERS[member]["enable_attention_dp"]

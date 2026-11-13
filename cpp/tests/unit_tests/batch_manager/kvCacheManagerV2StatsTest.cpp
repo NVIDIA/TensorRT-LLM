@@ -37,6 +37,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace
@@ -446,7 +447,28 @@ std::vector<SplitSsmBuffer> splitSsmBuffers()
     return buffers;
 }
 
-KVCacheManagerConfig makeSplitSsmConfig(bool withHostTier)
+// How makeSplitSsmConfig() declares the PRIVATE replay buffers.
+enum class SplitSsmReplay
+{
+    kBufferOverrides, //!< BufferConfig::reusePolicy on each SSM layer.
+    kRegion,          //!< One request region named "replay", sized by ratio.
+    kFixedRegion,     //!< The same region with kSplitSsmFixedSlots slots.
+};
+
+constexpr std::int64_t kSplitSsmFixedSlots = 8;
+
+std::string toString(SplitSsmReplay replay)
+{
+    switch (replay)
+    {
+    case SplitSsmReplay::kBufferOverrides: return "buffer overrides";
+    case SplitSsmReplay::kRegion: return "region";
+    case SplitSsmReplay::kFixedRegion: return "fixed region";
+    }
+    return "unknown";
+}
+
+KVCacheManagerConfig makeSplitSsmConfig(bool withHostTier, SplitSsmReplay replay = SplitSsmReplay::kBufferOverrides)
 {
     auto config = makeConfig();
     config.commitMinSnapshot = true;
@@ -455,11 +477,23 @@ KVCacheManagerConfig makeSplitSsmConfig(bool withHostTier)
     {
         config.cacheTiers.emplace_back(HostCacheTierConfig{4 << 20});
     }
+    bool const asRegion = replay != SplitSsmReplay::kBufferOverrides;
+    RegionConfig region{.name = "replay"};
+    if (replay == SplitSsmReplay::kFixedRegion)
+    {
+        region.fixedSlotCount = kSplitSsmFixedSlots;
+    }
     std::map<LayerId, SsmLayerConfig> layers;
     for (auto const& buffer : splitSsmBuffers())
     {
         auto& layer = layers[buffer.layer];
         layer.layerId = buffer.layer;
+        if (buffer.isPrivate && asRegion)
+        {
+            region.buffers.push_back(RegionBuffer{
+                .layerId = buffer.layer, .buffer = BufferConfig{.role = buffer.role, .size = buffer.size}});
+            continue;
+        }
         layer.buffers.push_back(BufferConfig{.role = buffer.role,
             .size = buffer.size,
             .reusePolicy = buffer.isPrivate ? std::optional<ReusePolicy>{ReusePolicy::PRIVATE} : std::nullopt});
@@ -467,6 +501,10 @@ KVCacheManagerConfig makeSplitSsmConfig(bool withHostTier)
     for (auto& [layerId, layer] : layers)
     {
         config.layers.emplace_back(std::move(layer));
+    }
+    if (asRegion)
+    {
+        config.regions.push_back(std::move(region));
     }
     return config;
 }
@@ -657,20 +695,23 @@ TEST_F(ReplayCacheTest, PrivateSsmBuffersStayOutOfSnapshotsAndFollowBeams)
     }
 }
 
-TEST_F(ReplayCacheTest, SuspendedSsmStateSurvivesOffloadAndSlotChange)
+// Suspends a cache, hands its former GPU slots to other owners, and checks that resume restores every
+// SSM and replay buffer elsewhere.
+void checkSuspendedSsmStateSurvivesOffloadAndSlotChange(
+    SplitSsmReplay replay, cudaStream_t stream, std::vector<TokenIdExt> const& tokens)
 {
-    auto manager = std::make_shared<KvCacheManager>(makeSplitSsmConfig(/*withHostTier=*/true));
+    SCOPED_TRACE(toString(replay));
+    auto manager = std::make_shared<KvCacheManager>(makeSplitSsmConfig(/*withHostTier=*/true, replay));
     auto const required = manager->getBufferGroupId(1, "state");
     auto const privateGroup = manager->getBufferGroupId(1, "old_x");
-    auto const tokens = makeTokens(8);
     TokenSpan const span{tokens.data(), 8};
     auto cache = manager->createKvCache({}, {}, 1);
-    ASSERT_TRUE(cache->resume(mStream));
+    ASSERT_TRUE(cache->resume(stream));
     ASSERT_TRUE(cache->resize(10));
     for (auto const& buffer : splitSsmBuffers())
     {
         EXPECT_EQ(cudaMemsetAsync(reinterpret_cast<void*>(ssmBufferAddress(*manager, *cache, buffer, 0)),
-                      splitSsmPattern(buffer, 0), buffer.size, mStream),
+                      splitSsmPattern(buffer, 0), buffer.size, stream),
             cudaSuccess);
     }
     cache->commit(span);
@@ -711,7 +752,7 @@ TEST_F(ReplayCacheTest, SuspendedSsmStateSurvivesOffloadAndSlotChange)
     for (auto const& [group, slot] : oldSlotReservations)
     {
         // Offload can still be reading the recycled GPU slot on another stream.
-        slot.readyEvent.waitInStream(reinterpret_cast<CudaStream>(mStream));
+        slot.readyEvent.waitInStream(reinterpret_cast<CudaStream>(stream));
     }
     for (auto const& buffer : splitSsmBuffers())
     {
@@ -719,16 +760,16 @@ TEST_F(ReplayCacheTest, SuspendedSsmStateSurvivesOffloadAndSlotChange)
         auto const address = manager->getMemPoolBaseAddress(buffer.layer, buffer.role)
             + static_cast<size_t>(oldSlots[group]) * manager->getPageIndexScale(buffer.layer, buffer.role)
                 * manager->getPageStride(buffer.layer, buffer.role);
-        EXPECT_EQ(cudaMemsetAsync(reinterpret_cast<void*>(address), 0xEE, buffer.size, mStream), cudaSuccess);
+        EXPECT_EQ(cudaMemsetAsync(reinterpret_cast<void*>(address), 0xEE, buffer.size, stream), cudaSuccess);
     }
-    EXPECT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+    EXPECT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
 
-    ASSERT_TRUE(cache->resume(mStream));
+    ASSERT_TRUE(cache->resume(stream));
     for (auto const group : {required, privateGroup})
     {
         EXPECT_NE(cache->getSsmBlockBaseIndex(group), oldSlots[group]);
     }
-    EXPECT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+    EXPECT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
     for (auto const& buffer : splitSsmBuffers())
     {
         std::vector<uint8_t> data(buffer.size);
@@ -744,6 +785,269 @@ TEST_F(ReplayCacheTest, SuspendedSsmStateSurvivesOffloadAndSlotChange)
         storage.releaseSlot(group, kHotLevel, std::move(slot));
     }
     cache->close();
+    manager->shutdown();
+}
+
+TEST_F(ReplayCacheTest, SuspendedSsmStateSurvivesOffloadAndSlotChange)
+{
+    for (auto const replay : {SplitSsmReplay::kBufferOverrides, SplitSsmReplay::kRegion, SplitSsmReplay::kFixedRegion})
+    {
+        checkSuspendedSsmStateSurvivesOffloadAndSlotChange(replay, mStream, makeTokens(8));
+    }
+}
+
+// GPU slot count of every hot-tier pool group.
+std::vector<SlotCount> hotSlotCounts(KvCacheManager const& manager)
+{
+    std::vector<SlotCount> counts;
+    for (auto const& stats : manager.getStorageStatistics(kHotLevel))
+    {
+        counts.push_back(stats.total);
+    }
+    return counts;
+}
+
+// Hot-tier pool group of every layer group.
+std::vector<int> hotPoolGroups(KvCacheManager const& manager)
+{
+    std::vector<int> groups;
+    for (auto const poolGroup : manager.getLifeCyclePoolGroupIndices(kHotLevel))
+    {
+        groups.push_back(poolGroup.value());
+    }
+    return groups;
+}
+
+TEST_F(ReplayCacheTest, RegionLaysOutLikeItsBufferOverrides)
+{
+    // The same PRIVATE replay buffers, declared as per-buffer overrides and as a ratio-sized region, get the
+    // same group ids, addresses and pool sizes.
+    auto overrides = std::make_shared<KvCacheManager>(makeSplitSsmConfig(/*withHostTier=*/false));
+    auto region = std::make_shared<KvCacheManager>(makeSplitSsmConfig(/*withHostTier=*/false, SplitSsmReplay::kRegion));
+    auto const replayGroup = region->getRegionGroupId("replay");
+    EXPECT_EQ(replayGroup, overrides->getBufferGroupId(1, "old_x"));
+    EXPECT_THROW(static_cast<void>(region->getRegionGroupId("missing")), std::out_of_range);
+    EXPECT_THROW(static_cast<void>(overrides->getRegionGroupId("replay")), std::out_of_range);
+    EXPECT_EQ(std::get<SsmLifeCycle>(region->lifeCycles()[replayGroup]).regionIndex, std::optional<int>{0});
+    EXPECT_EQ(region->lifeCycles().size(), overrides->lifeCycles().size());
+    for (auto const& buffer : splitSsmBuffers())
+    {
+        SCOPED_TRACE(std::to_string(buffer.layer) + "/" + buffer.role);
+        EXPECT_EQ(region->getBufferGroupId(buffer.layer, buffer.role),
+            overrides->getBufferGroupId(buffer.layer, buffer.role));
+        EXPECT_EQ(
+            region->getPageStride(buffer.layer, buffer.role), overrides->getPageStride(buffer.layer, buffer.role));
+        EXPECT_EQ(region->getPageIndexScale(buffer.layer, buffer.role),
+            overrides->getPageIndexScale(buffer.layer, buffer.role));
+        EXPECT_EQ(region->getPageIndexUpperBound(buffer.layer, buffer.role),
+            overrides->getPageIndexUpperBound(buffer.layer, buffer.role));
+    }
+    EXPECT_EQ(hotPoolGroups(*region), hotPoolGroups(*overrides));
+    EXPECT_EQ(hotSlotCounts(*region), hotSlotCounts(*overrides));
+    region->shutdown();
+    overrides->shutdown();
+}
+
+TEST_F(ReplayCacheTest, FixedRegionCapacityTakesItsSlotsBeforeRatioSizing)
+{
+    using tensorrt_llm::batch_manager::kv_cache_manager_v2::test::makeReplayRegionConfig;
+    std::map<size_t, std::vector<SlotCount>> fixedSlots;
+    for (size_t const quota : {size_t{32 << 20}, size_t{64 << 20}})
+    {
+        SCOPED_TRACE(quota);
+        auto elastic = std::make_shared<KvCacheManager>(makeReplayRegionConfig(quota, std::nullopt));
+        EXPECT_EQ(hotPoolGroups(*elastic), (std::vector<int>{0, 1, 2, 2}));
+        elastic->shutdown();
+
+        auto manager = std::make_shared<KvCacheManager>(makeReplayRegionConfig(quota, 9));
+        EXPECT_EQ(manager->getRegionGroupId("replay"), LifeCycleId{3});
+        EXPECT_EQ(manager->getBufferGroupId(1, "old_x"), LifeCycleId{3});
+        EXPECT_EQ(hotPoolGroups(*manager), (std::vector<int>{0, 1, 2, 3}));
+        auto const slots = hotSlotCounts(*manager);
+        ASSERT_EQ(slots.size(), 4U);
+        // The supplied count at every quota; the other groups split the rest of it.
+        EXPECT_EQ(slots[3], 9);
+        EXPECT_EQ(manager->getQuota(kHotLevel), quota);
+        EXPECT_EQ(manager->poolGroupDescs()[PoolGroupIndex{3}].numSlots, 9);
+        // Both old_x buffers share each slot, at offsets 0 and 1.
+        EXPECT_EQ(manager->getPageIndexUpperBound(1, "old_x"), 18U);
+        EXPECT_EQ(manager->getPageIndexUpperBound(2, "old_x"), 17U);
+        fixedSlots[quota] = slots;
+        manager->shutdown();
+    }
+    for (size_t pgIdx = 0; pgIdx < 3; ++pgIdx)
+    {
+        EXPECT_GT(fixedSlots.at(64 << 20)[pgIdx], fixedSlots.at(32 << 20)[pgIdx]) << pgIdx;
+    }
+
+    // initialPoolRatio keeps an entry for the fixed group, which the hot tier ignores.
+    std::optional<std::vector<SlotCount>> previous;
+    for (float const regionWeight : {0.1F, 0.7F})
+    {
+        SCOPED_TRACE(regionWeight);
+        auto config = makeReplayRegionConfig(32 << 20, 9);
+        float const otherWeight = (1.0F - regionWeight) / 3.0F;
+        config.initialPoolRatio = std::vector<float>{otherWeight, otherWeight, otherWeight, regionWeight};
+        auto manager = std::make_shared<KvCacheManager>(config);
+        auto const slots = hotSlotCounts(*manager);
+        EXPECT_EQ(slots.at(3), 9);
+        if (previous.has_value())
+        {
+            EXPECT_EQ(slots, *previous);
+        }
+        previous = slots;
+        manager->shutdown();
+    }
+}
+
+TEST_F(ReplayCacheTest, ResizeAndTunerLeaveFixedRegionCapacityAlone)
+{
+    using tensorrt_llm::batch_manager::kv_cache_manager_v2::test::makeReplayRegionConfig;
+    auto config = makeReplayRegionConfig(32 << 20, 9);
+    config.poolRebalance.minSampledKvCaches = 4;
+    config.poolRebalance.cooldownSecs = 0.0;
+    config.poolRebalance.targetRatioUpdateInterval = 1;
+    auto manager = std::make_shared<KvCacheManager>(config);
+    EXPECT_EQ(manager->storage().getPoolGroupIndex(kHotLevel, LifeCycleId{3}), PoolGroupIndex{3});
+    auto const before = hotSlotCounts(*manager);
+    auto sampleCaches = [&](int count)
+    {
+        for (int i = 0; i < count; ++i)
+        {
+            auto cache = manager->createKvCache({}, {}, i);
+            ASSERT_TRUE(cache->resume(mStream));
+            ASSERT_TRUE(cache->resize(16));
+            cache->close();
+        }
+    };
+
+    // Short requests move the ratio-sized targets far from the initial 2048-token sizing. The fixed group's
+    // 9 slots of 4 KiB fill one 2 MiB allocation unit, which its target must count as the current ratio
+    // does, or the tuner would keep requesting adjustments that cannot change it.
+    EXPECT_FLOAT_EQ(manager->storage().getRatioList(kHotLevel)[PoolGroupIndex{3}], 1.0F / 16.0F);
+    sampleCaches(4);
+    ASSERT_TRUE(manager->needAdjustment());
+    manager->adjust();
+    auto const after = hotSlotCounts(*manager);
+    EXPECT_EQ(after.at(3), 9);
+    EXPECT_NE(after, before);
+    EXPECT_EQ(manager->getQuota(kHotLevel), size_t{32 << 20});
+    EXPECT_FALSE(manager->needAdjustment());
+
+    sampleCaches(4);
+    EXPECT_FALSE(manager->needAdjustment());
+    manager->adjust();
+    EXPECT_EQ(hotSlotCounts(*manager), after);
+
+    // An explicit resize moves only the ratio-sized groups.
+    ASSERT_TRUE(manager->resize(kHotLevel, 48 << 20));
+    auto const grown = hotSlotCounts(*manager);
+    EXPECT_EQ(grown.at(3), 9);
+    for (size_t pgIdx = 0; pgIdx < 3; ++pgIdx)
+    {
+        EXPECT_GT(grown[pgIdx], after[pgIdx]) << pgIdx;
+    }
+    // A quota below the floors, the fixed group among them, is refused and changes nothing.
+    EXPECT_FALSE(manager->resize(kHotLevel, 2 << 20));
+    EXPECT_EQ(hotSlotCounts(*manager), grown);
+    EXPECT_EQ(manager->getQuota(kHotLevel), size_t{48 << 20});
+    manager->shutdown();
+}
+
+TEST_F(ReplayCacheTest, FixedRegionCapacityLetsEveryOwnerResume)
+{
+    // The owner supplies ceil(4 / 0.8) = 5 slots for four caches: resuming the last of them finds the group
+    // at exactly 80%.
+    auto config = makeSplitSsmConfig(/*withHostTier=*/false, SplitSsmReplay::kFixedRegion);
+    config.cacheTiers.front() = GpuCacheTierConfig{32 << 20};
+    config.regions.front().fixedSlotCount = 5;
+    config.maxUtilForResume = 0.8F;
+    auto manager = std::make_shared<KvCacheManager>(config);
+    auto& storage = manager->storage();
+    auto const regionPool = storage.getPoolGroupIndex(kHotLevel, manager->getRegionGroupId("replay"));
+    EXPECT_NE(regionPool, storage.getPoolGroupIndex(kHotLevel, manager->getBufferGroupId(1, "state")));
+    EXPECT_EQ(storage.numSlots(regionPool), 5);
+
+    auto fill = [&](KvCache const& cache, int salt)
+    {
+        for (auto const& buffer : splitSsmBuffers())
+        {
+            EXPECT_EQ(cudaMemsetAsync(reinterpret_cast<void*>(ssmBufferAddress(*manager, cache, buffer, 0)),
+                          splitSsmPattern(buffer, salt), buffer.size, mStream),
+                cudaSuccess);
+        }
+    };
+    auto check = [&](KvCache const& cache, int salt)
+    {
+        EXPECT_EQ(cudaStreamSynchronize(mStream), cudaSuccess);
+        for (auto const& buffer : splitSsmBuffers())
+        {
+            std::vector<uint8_t> data(buffer.size);
+            EXPECT_EQ(
+                cudaMemcpy(data.data(), reinterpret_cast<void const*>(ssmBufferAddress(*manager, cache, buffer, 0)),
+                    data.size(), cudaMemcpyDeviceToHost),
+                cudaSuccess);
+            auto const pattern = splitSsmPattern(buffer, salt);
+            EXPECT_TRUE(std::all_of(data.begin(), data.end(), [pattern](uint8_t value) { return value == pattern; }))
+                << buffer.layer << "/" << buffer.role << " salt " << salt;
+        }
+    };
+
+    std::vector<std::shared_ptr<KvCache>> caches;
+    for (int i = 0; i < 4; ++i)
+    {
+        caches.push_back(manager->createKvCache({}, {}, i));
+        ASSERT_TRUE(caches.back()->resume(mStream));
+        ASSERT_TRUE(caches.back()->resize(8));
+        fill(*caches.back(), i);
+    }
+
+    // The rebalance pattern: suspend every cache, then resume them all.
+    for (auto const& cache : caches)
+    {
+        cache->suspend();
+    }
+    for (auto const& cache : caches)
+    {
+        ASSERT_TRUE(cache->resume(mStream));
+    }
+    auto const stats = storage.getStatistics(kHotLevel, regionPool);
+    EXPECT_EQ(stats.total, 5);
+    EXPECT_EQ(stats.free, 1);
+    for (int i = 0; i < 4; ++i)
+    {
+        check(*caches[i], i);
+    }
+
+    // Closing a cache returns its slot.
+    caches.front()->close();
+    EXPECT_EQ(storage.getStatistics(kHotLevel, regionPool).free, 2);
+    caches.front() = manager->createKvCache({}, {}, 4);
+    ASSERT_TRUE(caches.front()->resume(mStream));
+    ASSERT_TRUE(caches.front()->resize(8));
+    for (auto const& cache : caches)
+    {
+        cache->close();
+    }
+    manager->shutdown();
+}
+
+TEST_F(ReplayCacheTest, FixedRegionCapacityRaisesASmallGpuQuota)
+{
+    // 8 MiB holds the ratio-sized layout and a 9-slot fixed group, but not 2112 slots of 4 KiB, which take
+    // 5 allocation units of 2 MiB before the other groups' minimum slots. The fixed group then raises the
+    // quota, as the constraint floors do, and keeps its full size.
+    using tensorrt_llm::batch_manager::kv_cache_manager_v2::test::makeReplayRegionConfig;
+    auto small = std::make_shared<KvCacheManager>(makeReplayRegionConfig(8 << 20, 9));
+    EXPECT_EQ(hotSlotCounts(*small).at(3), 9);
+    small->shutdown();
+    auto const manager = std::make_shared<KvCacheManager>(makeReplayRegionConfig(8 << 20, 2112));
+    auto const counts = hotSlotCounts(*manager);
+    EXPECT_EQ(counts.at(3), 2112);
+    for (auto const count : counts)
+    {
+        EXPECT_GT(count, 0);
+    }
     manager->shutdown();
 }
 

@@ -1131,6 +1131,13 @@ class DeepseekV4CacheManager(SparseOffloadCacheMixin, KVCacheManagerV2):
         # A compressed page holds tokens_per_block // ratio rows.
         return self.compressed_block_sizes[self.pp_layers[local_layer_idx]]
 
+    def _mixed_precision_layer_page(self, local_layer_idx: int) -> tuple[int, DataRole]:
+        # The high layer holds compressed rows, so it copies the COMPRESS page.
+        layer_id = self._layer_attn_to_layer_id[
+            self.pp_layers[local_layer_idx], DeepseekV4AttentionType.COMPRESS
+        ]
+        return int(layer_id), DeepseekV4AttentionType.COMPRESS.role
+
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """
         Add DeepSeek-V4 layers and warmup constraints to the cache config.

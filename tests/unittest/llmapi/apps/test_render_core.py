@@ -1158,6 +1158,7 @@ class TestRenderedRequest:
 
     def test_unknown_fields_are_rejected(self) -> None:
         with pytest.raises(ValidationError):
+            # pyrefly: ignore [unexpected-keyword]
             RenderedRequest(token_ids=[1], surprise=True)
 
     def test_an_unset_request_id_is_generated(self) -> None:
@@ -1167,4 +1168,5 @@ class TestRenderedRequest:
 
     def test_a_per_response_fingerprint_is_no_longer_part_of_the_schema(self) -> None:
         with pytest.raises(ValidationError):
+            # pyrefly: ignore [unexpected-keyword]
             RenderedRequest(fingerprint={"digest": "abc"}, token_ids=[1])
