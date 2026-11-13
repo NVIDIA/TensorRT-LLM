@@ -247,8 +247,8 @@ def _dep(m) -> bool:
 
 
 def _m31_topology(m) -> Optional[str]:
-    """Name the MiniMax-M3.1-Flash target topology, or None if no M3.1 target implements it (tp4 runs on sm103
-    only; ``_m31_refused`` checks the architecture)."""
+    """Name the MiniMax-M3.1-Flash target topology, or None if no M3.1 target implements it (``_m31_refused``
+    checks the architecture)."""
     parallel = _parallel(m)
     if parallel in ("tp2", "tp4", "tp8"):
         return parallel
@@ -362,8 +362,6 @@ def _m31_refused(
             refused.append(f"{topology} on sm103 (GB300), where only tp4 and tp8 run")
     elif compute_capability != _SM_RUBIN:
         refused.append("neither sm103 (GB300) nor sm107 (Rubin)")
-    elif topology == "tp4":
-        refused.append("tp4 on sm107 (Rubin), where no tp4 target runs")
     if kv_cache_quant_algo not in (QuantAlgo.FP8, QuantAlgo.NVFP4):
         refused.append("a KV cache other than FP8 or NVFP4")
     if topology is None:
@@ -510,8 +508,8 @@ def route(
 
         return ModelingV2MiniMaxM3Nvfp4Sm107Tp8
 
-    # MiniMax-M3.1-Flash (the same architecture class and shape, another checkpoint) on Rubin GPUs (sm107): tp2 / tp8
-    # with tensor-parallel attention and experts; the 2-rank context worker with EP2 experts and tensor-parallel
+    # MiniMax-M3.1-Flash (the same architecture class and shape, another checkpoint) on Rubin GPUs (sm107): tp2 / tp4 /
+    # tp8 with tensor-parallel attention and experts; the 2-rank context worker with EP2 experts and tensor-parallel
     # (tp2ctx) or attention-DP (dep2ctx) attention; the DEP4/8/16 generation worker (dep, built only when
     # modeling_v2 is set). A standalone MiniMax DSpark drafter or no speculative decoding.
     if shape == _SHAPE and _m31_mismatch(pretrained_config, text_config, quant_algo) is None:
@@ -538,6 +536,12 @@ def route(
             )
 
             return ModelingV2MiniMaxM31FlashNvfp4Sm107Tp2
+        if not m31_refused and m31_topology == "tp4":
+            from .minimax_m3_1_flash_nvfp4__sm_107__tp4.modeling import (
+                ModelingV2MiniMaxM31FlashNvfp4Sm107Tp4,
+            )
+
+            return ModelingV2MiniMaxM31FlashNvfp4Sm107Tp4
         if not m31_refused and m31_topology == "tp8":
             from .minimax_m3_1_flash_nvfp4__sm_107__tp8.modeling import (
                 ModelingV2MiniMaxM31FlashNvfp4Sm107Tp8,
@@ -570,7 +574,7 @@ def route(
             f"{spec_config.spec_dec_mode.name if spec_config is not None else 'off'}"
             f", KV cache {kv_cache_quant_algo or 'bf16'}; the MiniMax-M3.1-Flash targets run on sm103 (GB300) with 4 "
             "or 8 ranks of tensor-parallel attention and experts, or on sm107 (Rubin) with "
-            "2 or 8 ranks of tensor-parallel attention and experts, 2 ranks of tensor-parallel or attention-DP "
+            "2, 4 or 8 ranks of tensor-parallel attention and experts, 2 ranks of tensor-parallel or attention-DP "
             "attention with EP2 experts (the context worker), or attention DP with expert parallelism over 4, 8 "
             "or 16 ranks, with a standalone MiniMax DSpark drafter or no speculative decoding, and an FP8 or "
             "NVFP4 KV cache"
