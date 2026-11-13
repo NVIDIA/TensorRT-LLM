@@ -4649,20 +4649,29 @@ def cacheErrorAndUploadResult(pipeline, stageName, taskRunner, finallyRunner, no
 def loadStageResourceRequests(pipeline)
 {
     def configPath = "jenkins/config/stage_resources.json"
-    def configDir = "${pipeline.pwd(tmp: true)}/stage-resources"
-    def configFile = "${configDir}/stage_resources.json"
+    def configUrl = "https://artifactory.pdx.nvidia.com/artifactory/vcs-remote/NVIDIA/TensorRT-LLM/raw/${env.gitlabCommit}/${configPath}"
+    def configText = null
     try {
-        // Download only this file. A git fetch of the commit downloads the whole source tree.
-        pipeline.sh "mkdir -p '${configDir}' && wget -nv --tries=3 --timeout=60 -O '${configFile}' " +
-            "'https://artifactory.pdx.nvidia.com/artifactory/vcs-remote/NVIDIA/TensorRT-LLM/raw/${env.gitlabCommit}/${configPath}'"
+        // Read only this file. The request runs on the Jenkins controller.
+        def response = Utils.sendHttpRequest(null, configUrl, "GET", null, 60000)
+        if (response[0] == 200) {
+            configText = response[1]
+        } else {
+            pipeline.echo "Reading ${configUrl} returned HTTP ${response[0]}; using git instead."
+        }
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
-        // For example, the commit is not on GitHub or Artifactory is not available.
-        pipeline.echo "Failed to download ${configPath} at ${env.gitlabCommit} from Artifactory; using git instead. Error: ${e.toString()}"
-        trtllm_utils.checkoutFile(LLM_REPO, env.gitlabCommit, configPath, configDir)
+        pipeline.echo "Failed to read ${configUrl}; using git instead. Error: ${e.toString()}"
     }
-    def config = pipeline.readJSON(file: configFile, returnPojo: true)
+    if (configText == null) {
+        // For example, the commit is not on GitHub or Artifactory is not available.
+        // A git fetch of the commit downloads the whole source tree.
+        def configDir = "${pipeline.pwd(tmp: true)}/stage-resources"
+        trtllm_utils.checkoutFile(LLM_REPO, env.gitlabCommit, configPath, configDir)
+        configText = pipeline.readFile("${configDir}/stage_resources.json")
+    }
+    def config = pipeline.readJSON(text: configText, returnPojo: true)
     if (!(config instanceof Map)) {
         pipeline.error("stage_resources.json must contain a JSON object")
     }

@@ -38,9 +38,10 @@ and limits. SLURM dispatcher pods keep their hardcoded resources, even if their
 stage name appears in the file. JNLP and service containers keep their existing
 resources; GPU and ephemeral-storage requests and limits are also unchanged.
 
-`L0_Test.groovy` loads and validates the file once during Setup Environment. It
-downloads only this file at the build's `gitlabCommit` through the Artifactory
-GitHub proxy (`vcs-remote`), and uses a git fetch only when that download fails.
+`L0_Test.groovy` loads and validates the file once during Setup Environment. The
+Jenkins controller reads only this file at the build's `gitlabCommit` from the
+Artifactory GitHub proxy (`vcs-remote`) over HTTP. A git fetch is used only when
+that request fails.
 All Pod retries use the same resource settings.
 
 Configured Pods get the Guaranteed QoS class because every container in them has
