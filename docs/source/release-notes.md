@@ -47,6 +47,22 @@ All published functionality in the Release Notes has been fully tested and verif
   `TRTLLM_DISALLOW_LOCAL_MEDIA_PATH` is renamed to `TRTLLM_MEDIA_DISABLE_PATH_RESPONSE`, which
   accepts only `1`, `0` or empty. A VisualGen server refuses to start while `TRTLLM_DISALLOW_LOCAL_MEDIA_PATH`
   is set to anything other than `0` or empty; set `TRTLLM_MEDIA_DISABLE_PATH_RESPONSE=1` instead.
+- <span style="color: red">**[BREAKING CHANGE] Removed the compatibility forwarding at pre-reorganization import paths.**</span> Importing any of the following modules now raises `ImportError`; import from the module in parentheses instead:
+  - `tensorrt_llm._common` (internal; no public replacement)
+  - `tensorrt_llm.serialization` (`tensorrt_llm.llmapi.serialization`)
+  - `tensorrt_llm._ray_utils` (`tensorrt_llm.executor.ray.utils`)
+  - `tensorrt_llm.ray_stub` (`tensorrt_llm.executor.ray.stub`)
+  - `tensorrt_llm.executor.ray_executor` (`tensorrt_llm.executor.ray.executor`)
+  - `tensorrt_llm.executor.ray_gpu_worker` (`tensorrt_llm.executor.ray.gpu_worker`)
+  - `tensorrt_llm.lora_helper` (`tensorrt_llm._torch.peft.lora.config`)
+  - `tensorrt_llm.lora_manager` (`tensorrt_llm._torch.peft.lora.config`, `tensorrt_llm._torch.peft.lora.loaders` and `tensorrt_llm._torch.peft.lora.manager`)
+  - `tensorrt_llm.prompt_adapter_manager` (`tensorrt_llm._torch.peft.prompt_adapter`)
+  - `tensorrt_llm._torch.modules.attention` (`tensorrt_llm._torch.attention.attention`)
+  - `tensorrt_llm._torch.attention_backend` (`tensorrt_llm._torch.attention.backends`)
+  - `tensorrt_llm._torch.visual_gen.modules.attention` (`tensorrt_llm._torch.visual_gen.attention.attention`)
+  - `tensorrt_llm._torch.visual_gen.attention_backend` (`tensorrt_llm._torch.visual_gen.attention.backends`)
+
+  `Attention` and `QKVMode` are no longer importable from `tensorrt_llm._torch.visual_gen.modules`; import them from `tensorrt_llm._torch.visual_gen.attention.attention`. `BASE_EXAMPLE_CLASSES` in `tensorrt_llm.llmapi.serialization` no longer lists `LoraConfig` under `tensorrt_llm.lora_helper` or `tensorrt_llm.lora_manager`, so restricted deserialization with that allowlist rejects artifacts pickled under those module names; re-create them.
 - **[DEPRECATION]** KV cache manager V1 (`kv_cache_config.use_kv_cache_manager_v2=False`) is deprecated as of TensorRT-LLM 1.4 (2026-11) and will be removed after the 3-month migration period. KV cache manager V2 is the default (`use_kv_cache_manager_v2=True`). During the migration period V1 keeps working and logs a one-time warning when it is constructed, including when `use_kv_cache_manager_v2="auto"` resolves to it and when sleep mode (`sleep_config`), which V2 does not support yet, falls back to it. See the [deprecation policy](https://github.com/NVIDIA/TensorRT-LLM#deprecation-policy).
 - **[DEPRECATION]** The C++ cache transceiver (`cache_transceiver_config.transceiver_runtime="CPP"`, or `None`) is deprecated as of TensorRT-LLM 1.4 (2026-11) and will be removed after the 3-month migration period. The Python transceiver is the default (`transceiver_runtime="PYTHON"`); it runs on the NIXL backend with KV cache manager V2, so deployments on the UCX, MPI or MOONCAKE backend must move to NIXL. The C++ NIXL transfer agent that the Python transceiver uses is not affected. During the migration period the C++ transceiver keeps working and logs a one-time warning when it is constructed, including when `transceiver_runtime="auto"` resolves or falls back to it. See the [deprecation policy](https://github.com/NVIDIA/TensorRT-LLM#deprecation-policy).
 - **Migration prerequisites:** Sleep mode and RocketKV still require KV cache manager V1. Experimental in-flight cancellation (`TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=1`) still requires a supported C++ transceiver configuration. Keep those implementations for these features during migration.

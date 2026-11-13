@@ -63,11 +63,6 @@ CASES = [
         "sampler_common",
         "tensorrt_llm._torch.pyexecutor.sampler.sampler_common",
     ),
-    (
-        "tensorrt_llm._torch.visual_gen.modules",
-        "Attention",
-        "tensorrt_llm._torch.visual_gen.attention.attention",
-    ),
     ("tensorrt_llm.serve", "OpenAIServer", "tensorrt_llm.serve.openai_server"),
     (
         "tensorrt_llm.serve",
