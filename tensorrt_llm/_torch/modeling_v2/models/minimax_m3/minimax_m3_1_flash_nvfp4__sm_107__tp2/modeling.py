@@ -5219,8 +5219,8 @@ class MiniMaxM3Tp2ModelingV2(DecoderModel):
         65..128-token chunk's variant did, stalling the steps behind it by 0.8-1.6 ms). The variant follows only the
         longest query row: fmha_sm100 packs a row of up to 32 tokens by its pack factor, then takes the 128- or 256-row
         query tile and the single-warpgroup kernel from the packed length, so query lengths 1..129 reach every variant.
-        Compile and load only, nothing runs: no numerics change. The variants are those of the packaged fmha_sm100 the
-        engine's MSA backend resolves (``require_msa_module``), the module the proxy pass runs. fmha_sm100 keys its
+        Compile and load only, nothing runs: no numerics change. The variants are those of the fmha_sm100 the layers'
+        MSA backend runs (``msa.engine.require_msa_module``), the module the proxy pass runs. fmha_sm100 keys its
         cache by its installed sources, so a source overlay builds its own variants. Returns the variant names."""
         fmha_sm100 = _msa_engine.require_msa_module()
         fmha_api = fmha_sm100.api
