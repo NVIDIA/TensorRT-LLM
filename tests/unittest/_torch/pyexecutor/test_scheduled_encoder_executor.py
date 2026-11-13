@@ -18,6 +18,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from tensorrt_llm._torch.pyexecutor import scheduled_encoder_executor
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
 from tensorrt_llm._torch.pyexecutor.scheduled_encoder_executor import (
     ScheduledEncoderExecutor,
@@ -285,6 +286,31 @@ def test_a_fatal_forward_error_fails_everything_queued_and_shuts_down():
             assert "illegal memory access" in response.error_msg
         assert h.executor.shutdown_event.wait(timeout=30)
         assert not h.executor.can_enqueue_requests()
+        assert h.runner.batches == [[running]]
+
+
+def test_a_fatal_error_with_peers_fails_everything_queued_and_kills_every_rank(monkeypatch):
+    kills = []
+    monkeypatch.setattr(
+        scheduled_encoder_executor, "start_rank_crash_kill_watchdog", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        scheduled_encoder_executor,
+        "hard_kill_on_rank_crash",
+        lambda world_size, **kwargs: kills.append(world_size),
+    )
+    with _harness(max_batch_size=1) as h:
+        h.executor.dist.world_size = 2
+        h.executor._broadcaster.broadcast = lambda items, prefer_cpu: items
+        h.runner.errors.append(RuntimeError("an illegal memory access was encountered"))
+        running, waiting = h.submit(), h.submit()
+        h.executor.start_worker()
+
+        for request_id in (running, waiting):
+            (response,) = h.responses(request_id)
+            assert "illegal memory access" in response.error_msg
+        h.executor._worker_thread.join(timeout=30)
+        assert kills == [2]
         assert h.runner.batches == [[running]]
 
 

@@ -578,7 +578,12 @@ class ScheduledEncoderExecutor:
         return responses
 
     def _fail(self, requests: list[LlmRequest], error: Exception) -> None:
-        """Fail the batch; a fatal error also fails everything queued and shuts the loop down."""
+        """Fail the batch; a fatal error also fails everything queued and shuts the loop down.
+
+        With several ranks, a fatal error then raises out of the loop: the loop's crash path
+        kills every rank, because the peers' queues still hold work for a forward this rank
+        will never join.
+        """
         traceback.print_exc()
         error_msg = str(error) or "error"
         logger.error(f"Encountered an error in forward function: {error_msg}")
@@ -596,7 +601,8 @@ class ScheduledEncoderExecutor:
             if not request.is_child
         ]
         released = [request.py_request_id for request in requests]
-        if self._error_budget.consume(error_msg):
+        fatal = self._error_budget.consume(error_msg)
+        if fatal:
             logger.error(f"Fatal error detected, initiating shutdown: {error_msg}")
             self.is_shutdown = True
             drained = [
@@ -619,6 +625,8 @@ class ScheduledEncoderExecutor:
             self._request_queue.enqueue_shutdown_request()
         if self.dist.rank == 0:
             self._publish(responses, released)
+        if fatal and self.dist.world_size > 1:
+            raise RuntimeError(f"Fatal error: {error_msg}") from error
 
     def _respond_with_errors(self, rejected: list[tuple[RequestQueueItem, str]]) -> None:
         responses = [

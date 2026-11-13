@@ -185,14 +185,19 @@ def test_scheduled_pooling_tp2():
             future.result(timeout=60).outputs[0].finish_reason
             for future in futures
         ]
+        # A forward after the abort runs on both ranks only if they dropped the same request.
+        after_abort = llm.generate(prompts[:1], sampling_params=params)
     with LLM(**llm_kwargs) as llm:
         single = [
             output.context_logits.float().cpu()
             for output in llm.generate(prompts, sampling_params=params)
         ]
 
-    assert finished == ["length"] * 49 + ["cancelled"]
-    for got, expected in zip(sharded, single):
+    # The abort may land before or after the request's forward.
+    assert finished[:-1] == ["length"] * 49
+    assert finished[-1] in ("cancelled", "length")
+    sharded.append(after_abort[0].context_logits.float().cpu())
+    for got, expected in zip(sharded, single + single[:1]):
         assert torch.nn.functional.cosine_similarity(got.flatten(),
                                                      expected.flatten(),
                                                      dim=0) > 0.999
