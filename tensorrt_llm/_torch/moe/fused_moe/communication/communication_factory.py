@@ -25,6 +25,7 @@ from typing import Optional
 
 import torch
 
+from tensorrt_llm._errors import RuntimeInitError
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm.logger import logger
 
@@ -103,7 +104,7 @@ class CommunicationFactory:
         2. Auto-selection (tries in order):
            - NVLinkOneSided (highest priority for throughput)
            - NVLinkTwoSided (high priority for latency)
-           - NcclEP (if nccl-ep is available)
+           - NcclEP (requires Device API support and GIN between LSA teams)
            - DeepEP (if enabled via TRTLLM_CAN_USE_DEEP_EP)
            - DeepEPLowLatency (if enabled via TRTLLM_CAN_USE_DEEP_EP)
            - AllGather + ReduceScatter (fallback, always works)
@@ -276,6 +277,8 @@ class CommunicationFactory:
                 )
                 logger.info("Selected communication strategy: NcclEP")
                 return strategy
+            except RuntimeInitError:
+                raise
             except RuntimeError as e:
                 logger.debug(f"NcclEP not available: {e}")
         else:

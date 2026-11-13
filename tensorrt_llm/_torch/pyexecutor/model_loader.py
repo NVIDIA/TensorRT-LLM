@@ -14,7 +14,8 @@ from typing import Any, Callable, Iterator, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._errors import ConfigInputError, UnsupportedError
+from tensorrt_llm._errors import (ConfigInputError, RuntimeInitError,
+                                  UnsupportedError)
 from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import (
     AutoCheckpointMapper, BaseCheckpointLoader)
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
@@ -1330,6 +1331,8 @@ class ModelLoader:
                     model = AutoModelForCausalLM.from_config(config_copy)
                 config = config_copy
                 is_meta_init = True
+            except RuntimeInitError:
+                raise
             except Exception:
                 logger.info(
                     f"Fallback to regular model init: {traceback.format_exc(limit=10)}"
