@@ -103,6 +103,27 @@ def throwaway_topk_max_chunk() -> int:
     return max_chunk
 
 
+def throwaway_topk_launch_rows(n_heads: int, max_query_rows: Optional[int]) -> int:
+    """Returns the query rows one kernel launch is built for.
+
+    The kernels are built for a fixed row count and address all of its rows, so a chunk with
+    fewer rows still pays for the sampling of the unused ones and has its rows staged through
+    copies. A launch sized to the rows of a full prefill chunk avoids both for every chunk but
+    the last of a request. ``TRTLLM_THROWAWAY_TOPK_MAX_CHUNK`` caps the size; larger chunks run
+    in tiles.
+
+    Args:
+        n_heads: Number of indexer heads; the launch rows are a multiple of the row tile of
+            this head count.
+        max_query_rows: Query rows of a full prefill chunk on this rank, or None for the cap.
+    """
+    rows = throwaway_topk_max_chunk()
+    if max_query_rows is not None and max_query_rows > 0:
+        rows = min(rows, max_query_rows)
+    row_tile = max(8 if n_heads == 32 else 1, 256 // n_heads)
+    return -(-rows // row_tile) * row_tile
+
+
 def throwaway_topk_logits_dtype() -> torch.dtype:
     """Returns the score dtype from ``TRTLLM_THROWAWAY_TOPK_LOGITS_DTYPE`` (default fp32)."""
     name = os.environ.get(THROWAWAY_LOGITS_DTYPE_ENV, "fp32")
@@ -153,6 +174,7 @@ class ThrowawayPrefillTopK:
         logits_dtype: Optional[torch.dtype] = None,
         qkv_dtype: str = "fp8",
         model_config: Optional[str] = None,
+        max_query_rows: Optional[int] = None,
     ):
         """Builds the wrapper and the K staging buffers.
 
@@ -172,6 +194,8 @@ class ThrowawayPrefillTopK:
                 weight contract: every head weight must equal ``128 ** -0.5`` and token-scaled FP8
                 key scales must be 1. The kernel policy is otherwise inferred from the geometry,
                 and a 4-head geometry alone does not imply the Qwen contract.
+            max_query_rows: Query rows of a full prefill chunk on this rank, or None if unknown.
+                See ``throwaway_topk_launch_rows``.
 
         Raises:
             ValueError: If the kernels do not support this configuration.
@@ -183,7 +207,7 @@ class ThrowawayPrefillTopK:
             FP8MQATopKWrapper,
         )
 
-        self.max_chunk_size = throwaway_topk_max_chunk()
+        self.max_chunk_size = throwaway_topk_launch_rows(n_heads, max_query_rows)
         if logits_dtype is None:
             logits_dtype = throwaway_topk_logits_dtype()
         elif logits_dtype not in _LOGITS_DTYPES.values():
@@ -405,12 +429,12 @@ class ThrowawayPrefillTopK:
         torch.cuda.empty_cache()
 
 
-# One runner per (geometry, max length, device), shared by every layer of a model. The runner owns
-# the K staging buffers, the selected-index buffer and the kernel workspace; keeping one per layer
-# would multiply that memory by the number of indexer layers. The layers' indexers hold the
-# runner, so it is referenced weakly here and released with the model. Configurations that failed
-# to build are remembered by key so the fallback warning is logged once.
-_RunnerKey = Tuple[int, int, int, int, str, str]
+# One runner per (geometry, max length, device, launch rows), shared by every layer of a model. The
+# runner owns the K staging buffers, the selected-index buffer and the kernel workspace; keeping
+# one per layer would multiply that memory by the number of indexer layers. The layers' indexers
+# hold the runner, so it is referenced weakly here and released with the model. Configurations
+# that failed to build are remembered by key so the fallback warning is logged once.
+_RunnerKey = Tuple[int, int, int, int, str, str, int]
 _RUNNERS: "weakref.WeakValueDictionary[_RunnerKey, ThrowawayPrefillTopK]" = (
     weakref.WeakValueDictionary()
 )
@@ -425,14 +449,25 @@ def get_throwaway_prefill_topk(
     max_context_length: int,
     device: torch.device,
     qkv_dtype: str = "fp8",
+    max_query_rows: Optional[int] = None,
 ) -> Optional[ThrowawayPrefillTopK]:
     """Returns the runner shared by the live layers for this configuration, building it on
     first use.
 
-    Returns None (after one warning) if the kernels do not support the configuration or its
-    buffers do not fit in GPU memory.
+    ``max_query_rows`` is the query row count of a full prefill chunk on this rank (see
+    ``throwaway_topk_launch_rows``). Returns None (after one warning) if the kernels do not
+    support the configuration or its buffers do not fit in GPU memory.
     """
-    key = (n_heads, index_topk, compress_ratio, max_context_length, str(device), qkv_dtype)
+    launch_rows = throwaway_topk_launch_rows(n_heads, max_query_rows)
+    key = (
+        n_heads,
+        index_topk,
+        compress_ratio,
+        max_context_length,
+        str(device),
+        qkv_dtype,
+        launch_rows,
+    )
     if key in _FAILED:
         return None
     runner = _RUNNERS.get(key)
@@ -454,6 +489,7 @@ def get_throwaway_prefill_topk(
             max_context_length=max_context_length,
             device=device,
             qkv_dtype=qkv_dtype,
+            max_query_rows=launch_rows,
         )
     except (ValueError, ImportError, torch.OutOfMemoryError) as error:
         logger.warning(

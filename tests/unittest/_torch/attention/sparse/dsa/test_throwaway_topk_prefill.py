@@ -49,6 +49,7 @@ from tensorrt_llm._torch.attention.backends.sparse.dsa.throwaway_topk import (
     THROWAWAY_MIN_CONTEXT_ENV,
     ThrowawayPrefillTopK,
     get_throwaway_prefill_topk,
+    throwaway_topk_launch_rows,
     throwaway_topk_logits_dtype,
     throwaway_topk_max_chunk,
     throwaway_topk_min_context,
@@ -839,13 +840,19 @@ def test_prewarm_builds_the_shared_runner_and_warms_it(
     indexer.compress_ratio = 4
     indexer.use_fp4 = True
     indexer._build_throwaway_topk = Indexer._build_throwaway_topk.__get__(indexer)
-    assert Indexer.prewarm_throwaway_topk(indexer, 1 << 20, torch.device("cuda", 0)) is expected
+    indexer._throwaway_query_rows = Indexer._throwaway_query_rows.__get__(indexer)
+    indexer._indexer_max_chunk_size, indexer._q_split_threshold = None, 8192
+    prewarmed = Indexer.prewarm_throwaway_topk(
+        indexer, 1 << 20, torch.device("cuda", 0), 8448, _mapping(8, 2)
+    )
+    assert prewarmed is expected
     assert runner.warmups == warmups
     if warmups:
         assert built[0]["compress_ratio"] == 4
         assert built[0]["max_context_length"] == 1 << 20
         assert built[0]["qkv_dtype"] == "mxfp4"
         assert built[0]["device"] == torch.device("cuda", 0)
+        assert built[0]["max_query_rows"] == 1056  # this rank's share of a full chunk
         assert indexer._throwaway_topk is runner  # the forward reuses the warmed runner
 
 
@@ -1189,3 +1196,36 @@ def test_dispatch_slices_fp4_query_scales_with_the_rows():
     )
     assert handled is True
     assert torch.equal(runner.calls[0][7], q_scale[5:10])
+
+
+def test_launch_rows_follow_the_full_chunk_rows(monkeypatch):
+    monkeypatch.delenv(THROWAWAY_MAX_CHUNK_ENV, raising=False)
+    assert throwaway_topk_launch_rows(64, None) == 8192  # unknown chunk rows: the cap
+    assert throwaway_topk_launch_rows(64, 4096) == 4096
+    assert throwaway_topk_launch_rows(64, 1056) == 1056
+    assert throwaway_topk_launch_rows(64, 16384) == 8192  # larger chunks run in tiles
+    assert throwaway_topk_launch_rows(64, 1057) == 1060  # whole row tiles of 4 rows
+    assert throwaway_topk_launch_rows(32, 1003) == 1008  # 8 rows
+    assert throwaway_topk_launch_rows(4, 100) == 128  # 64 rows
+    monkeypatch.setenv(THROWAWAY_MAX_CHUNK_ENV, "2048")
+    assert throwaway_topk_launch_rows(64, 4096) == 2048
+
+
+def _mapping(tp_size, tp_rank=0, attention_dp=False):
+    return SimpleNamespace(tp_size=tp_size, tp_rank=tp_rank, enable_attention_dp=attention_dp)
+
+
+@pytest.mark.parametrize(
+    "max_num_tokens,chunk_size,mapping,rows",
+    [
+        (4096, None, None, 4096),
+        (4096, None, _mapping(8), 4096),  # below the split threshold: every rank has all rows
+        (4096, 2048, _mapping(1), 2048),  # the indexer chunk size bounds a chunk
+        (8448, None, _mapping(8, 3), 1056),  # split over the attention-TP ranks
+        (8450, None, _mapping(8, 7), 1057),
+        (8448, None, _mapping(8, 3, attention_dp=True), 8448),
+    ],
+)
+def test_throwaway_query_rows(max_num_tokens, chunk_size, mapping, rows):
+    indexer = SimpleNamespace(_indexer_max_chunk_size=chunk_size, _q_split_threshold=8192)
+    assert Indexer._throwaway_query_rows(indexer, max_num_tokens, mapping) == rows
