@@ -456,7 +456,7 @@ def test_departed_context_send_frees_resources_once_after_its_last_owner(
     assert not coordinator._transfers.has_any_inflight_requests()
     executor.resource_manager.free_resources.assert_called_once_with(request)
     assert executor.active_requests == []
-    assert executor.responses == {}
+    assert executor._response_channel.responses == {}
     assert executor._pending_transfer_responses == []
 
     coordinator.reap_context_sends(0)
@@ -644,14 +644,14 @@ def test_idle_legacy_gen_timeout_retries_then_frees_once_without_a_model_batch(m
     assert transceiver.cancel_request.call_count == 1
     executor.resource_manager.free_resources.assert_not_called()
     assert executor.active_requests == [timed_out, healthy, user_canceled]
-    assert executor.responses == {}
+    assert executor._response_channel.responses == {}
     coordinator.poll_gen_transfers()  # pacing: no attempt
     assert transceiver.cancel_request.call_count == 1
     coordinator.poll_gen_transfers()  # attempt 2: raises
     assert transceiver.cancel_request.call_count == 2
     executor.resource_manager.free_resources.assert_not_called()
     assert executor.active_requests == [timed_out, healthy, user_canceled]
-    assert executor.responses == {}
+    assert executor._response_channel.responses == {}
     transceiver.cancel_request.side_effect = cancel
     coordinator.poll_gen_transfers()  # pacing: no attempt
     assert transceiver.cancel_request.call_count == 2
@@ -659,10 +659,13 @@ def test_idle_legacy_gen_timeout_retries_then_frees_once_without_a_model_batch(m
     assert transceiver.cancel_request.call_count == 3
     assert executor.active_requests == [healthy, user_canceled]
     executor.resource_manager.free_resources.assert_called_once_with(timed_out)
-    assert len(executor.responses[1]) == 1
+    assert len(executor._response_channel.responses[1]) == 1
     coordinator.poll_gen_transfers()
     executor.resource_manager.free_resources.assert_called_once_with(timed_out)
-    assert 2 not in executor.responses and 3 not in executor.responses
+    assert (
+        2 not in executor._response_channel.responses
+        and 3 not in executor._response_channel.responses
+    )
 
 
 def test_idle_legacy_gen_timeout_defers_adp_failure_to_existing_error_vote(monkeypatch):
