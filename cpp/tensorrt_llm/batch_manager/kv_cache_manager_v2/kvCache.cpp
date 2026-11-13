@@ -2735,6 +2735,82 @@ std::unique_ptr<PlannedDropHandle> KvCache::planCommittedBlockDrop()
 }
 
 // ---------------------------------------------------------------------------
+// CommittedRetentionHandle
+// ---------------------------------------------------------------------------
+
+CommittedRetentionHandle::CommittedRetentionHandle(KvCacheManager& manager, Block& leaf, BlockOrdinal ownedBegin)
+    : mManager(manager.shared_from_this())
+    , mLeaf(leaf.sharedFromThis())
+    , mOwnedBegin(ownedBegin)
+{
+}
+
+CommittedRetentionHandle::~CommittedRetentionHandle()
+{
+    KVCM2_POISON_ON_EXCEPT(
+        [this]()
+        {
+            // Runs from tp_dealloc/GC with the GIL held: release it before taking the API lock,
+            // as ~PlannedDropHandle does.
+            OptionalGilRelease const gilRelease;
+            auto const apiLock = mManager->lockExclusive();
+            mLeaf = WeakPtr<Block>{};
+        });
+}
+
+int CommittedRetentionHandle::setPriority(Priority priority)
+{
+    TLLM_CHECK_WITH_INFO(
+        kPriorityMin <= priority && priority <= kPriorityMax, "Retention priority must be between 0 and 100");
+    // Exclusive: re-queues pages in the shared eviction lists and reads the tree's links.
+    auto const apiLock = mManager->lockExclusive();
+    auto const leaf = mLeaf.lock();
+    int numPages = 0;
+    // The leaf must not have been extended; an ancestor on the path continues to exactly one block.
+    size_t expectedNext = 0;
+    NodeBase* node = leaf.get();
+    while (node != nullptr && node->type() == NodeBase::Type::kBLOCK)
+    {
+        auto* blk = static_cast<Block*>(node);
+        if (blk->prev == nullptr || blk->ordinal() < mOwnedBegin || blk->next.size() > expectedNext)
+        {
+            break;
+        }
+        for (LifeCycleId lc{0}; lc < blk->numLifeCycles(); ++lc)
+        {
+            if (CommittedPage* page = blk->getPage(lc))
+            {
+                page->claimRetention(priority, std::nullopt);
+                ++numPages;
+            }
+        }
+        node = blk->prev;
+        expectedNext = 1;
+    }
+    return numPages;
+}
+
+std::unique_ptr<CommittedRetentionHandle> KvCache::planCommittedRetention(int ownedBeginTokens)
+{
+    KVCM2_REJECT_IF_POISONED();
+    auto const apiLock = mManager->lockExclusive();
+    if (mCommitState != CommitState::USER_STOP)
+        throw LogicError("plan_committed_retention() requires stop_committing()");
+    TLLM_CHECK_WITH_INFO(ownedBeginTokens >= 0, "owned_begin_tokens must be non-negative");
+    if (numCommittedTokens() == 0)
+        return nullptr;
+    auto const match = mManager->radixTree().match(
+        mReuseScope, toSpan(mCommittedTokens), textOnly(), mManager->enablePartialMatch());
+    if (match.numTokens != numCommittedTokens() || match.blocks.empty())
+        return nullptr;
+    // A block that starts inside the reused prefix is (partly) someone else's.
+    BlockOrdinal const ownedBegin{(ownedBeginTokens + mTokensPerBlock - 1) / mTokensPerBlock};
+    if (ownedBegin >= match.blocks.size())
+        return nullptr;
+    return std::make_unique<CommittedRetentionHandle>(*mManager, *match.blocks.back(), ownedBegin);
+}
+
+// ---------------------------------------------------------------------------
 // _onStopCommitting: release stale held uncommitted pages for SWA layers.
 // Mirrors Python's _on_stop_committing().
 // ---------------------------------------------------------------------------

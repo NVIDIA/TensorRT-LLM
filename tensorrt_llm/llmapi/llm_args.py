@@ -5178,6 +5178,31 @@ class BlockReuseConfig(StrictBaseModel):
         "Only used when "
         "`policy` is 'per_conversation'.")
 
+    finished_subagent_priority: Optional[int] = Field(
+        default=None,
+        ge=0,
+        le=100,
+        status="prototype",
+        description=
+        "KV cache manager v2 retention priority given to the committed blocks a "
+        "finished sub-agent conversation computed itself. A sub-agent is a request "
+        "with a parent conversation id (the disaggregated edge's sub-agent affinity "
+        "hint, `conversation_affinity_header_for_subagents`); it is considered "
+        "finished when its parent conversation sends its next request while the "
+        "sub-agent has no request in flight. Lower priorities are evicted first at "
+        "every cache level, and blocks below the cold-tier offload threshold (30) are "
+        "dropped instead of offloaded. None disables the demotion. Requires "
+        "`policy` 'per_conversation'.")
+
+    finished_subagent_min_idle_iterations: NonNegativeInt = Field(
+        default=32,
+        status="prototype",
+        description=
+        "Minimum number of scheduler steps since a sub-agent's last context finished "
+        "before its parent's next request demotes it (see "
+        "`finished_subagent_priority`). Counted in steps rather than seconds so that "
+        "every rank of a tensor-parallel group takes the same decision.")
+
     swa_endpoint_rewind_tokens: NonNegativeInt = Field(
         default=0,
         status="prototype",
@@ -5210,6 +5235,11 @@ class BlockReuseConfig(StrictBaseModel):
             raise ValueError(
                 "block_reuse_config.swa_endpoint_rewind_tokens requires "
                 "block_reuse_config.policy='all_reusable'.")
+        if (self.finished_subagent_priority is not None
+                and self.policy != "per_conversation"):
+            raise ValueError(
+                "block_reuse_config.finished_subagent_priority requires "
+                "block_reuse_config.policy='per_conversation'.")
         return self
 
 

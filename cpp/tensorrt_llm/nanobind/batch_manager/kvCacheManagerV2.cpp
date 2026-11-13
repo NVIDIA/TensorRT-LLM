@@ -920,6 +920,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     m.attr("NDEBUG") = nb::bool_(!kv::gDebug);
     m.attr("DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY")
         = nb::int_(tensorrt_llm::batch_manager::kDefaultColdTierOffloadMinPriority);
+    m.attr("DEFAULT_RETENTION_PRIORITY") = nb::int_(kv::kPriorityDefault);
 
     // ---- Exceptions --------------------------------------------------------
     static nb::object sOutOfMemoryError = nb::exception<kv::OutOfMemoryError>(m, "OutOfMemoryError");
@@ -2040,6 +2041,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     nb::class_<kv::PlannedDropHandle>(m, "PlannedDropHandle")
         .def("drop", &kv::PlannedDropHandle::drop, nb::call_guard<nb::gil_scoped_release>());
 
+    nb::class_<kv::CommittedRetentionHandle>(m, "CommittedRetentionHandle")
+        .def("set_priority", &kv::CommittedRetentionHandle::setPriority, nb::arg("priority"),
+            nb::call_guard<nb::gil_scoped_release>());
+
     nb::class_<kv::ReuseGroupStatus>(m, "ReuseGroupStatus")
         .def_prop_ro("group_id", [](kv::ReuseGroupStatus const& s) { return s.groupId.value(); })
         .def_ro("policy", &kv::ReuseGroupStatus::policy)
@@ -2249,6 +2254,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def(
             "plan_committed_block_drop", [](kv::KvCache& self) { return self.planCommittedBlockDrop(); },
             nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "plan_committed_retention",
+            [](kv::KvCache& self, int ownedBeginTokens) { return self.planCommittedRetention(ownedBeginTokens); },
+            nb::arg("owned_begin_tokens") = 0, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "get_aggregated_page_indices",
             [](kv::KvCache const& self, int layerGroupId, int beamIdx, bool validOnly) {
