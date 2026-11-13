@@ -25,15 +25,27 @@ _GENERIC_MODULES = (
 # Names that mention replay for another reason: a KV connector replays a request's prefix.
 _UNRELATED_NAMES = frozenset({"context_replay_tokens"})
 _FAMILY_PACKAGES = (
-    "tensorrt_llm._torch.modules.fla",
-    "tensorrt_llm._torch.modules.kimi_kda",
-    "tensorrt_llm._torch.modules.qwen4_exp",
+    "tensorrt_llm._torch.modules.fla.",
+    "tensorrt_llm._torch.modules.kimi_kda.",
+    "tensorrt_llm._torch.modules.mamba.",
+    "tensorrt_llm._torch.modules.qwen4_exp.",
 )
-_FAMILY_MODULES = (
+# The families' managers and metadata classes, which own their replay state. Any other
+# family module counts as replay code when its name says so; kernels the generic code
+# shares with a family (e.g. GDN chunk helpers) do not.
+_FAMILY_REPLAY_OWNERS = (
+    "tensorrt_llm._torch.modules.fla.cache_manager",
+    "tensorrt_llm._torch.modules.kimi_kda.cache_manager",
+    "tensorrt_llm._torch.modules.kimi_kda.kimi_k3_mamba_metadata",
     "tensorrt_llm._torch.modules.mamba.cache_manager",
-    "tensorrt_llm._torch.modules.mamba.replay_metadata",
-    "tensorrt_llm._torch.modules.mamba.replay_region",
+    "tensorrt_llm._torch.modules.qwen4_exp.cache_manager",
 )
+
+
+def _is_family_replay_code(module: str) -> bool:
+    return module.startswith(_FAMILY_REPLAY_OWNERS) or (
+        module.startswith(_FAMILY_PACKAGES) and "replay" in module.lower()
+    )
 
 
 def _package_dir() -> Path:
@@ -86,8 +98,6 @@ def test_generic_module_imports_no_family_replay_code(relative_path: str) -> Non
     tree = ast.parse(path.read_text(), filename=str(path))
     module = "tensorrt_llm." + relative_path[: -len(".py")].replace("/", ".")
     imported = sorted(
-        name
-        for name in set(_imported_modules(tree, module))
-        if name.startswith(_FAMILY_PACKAGES) or name.startswith(_FAMILY_MODULES)
+        name for name in set(_imported_modules(tree, module)) if _is_family_replay_code(name)
     )
-    assert not imported, f"{relative_path} imports model-family code: {imported}"
+    assert not imported, f"{relative_path} imports model-family replay code: {imported}"
