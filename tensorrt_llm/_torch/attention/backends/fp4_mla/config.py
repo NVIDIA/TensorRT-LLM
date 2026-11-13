@@ -130,6 +130,11 @@ def _fp4_mla_cutedsl_fused_v_transpose_enabled() -> bool:
 
 
 FP4_MLA_PACKED_Q_ENV = "TRTLLM_FP4_MLA_PACKED_Q"
+# four-CTA-cluster (4x) decode (fp4_mla_cutedsl_4x.py): the four-CTA-cluster variant of the FP4 MLA decode kernel
+# (256 packed [token, head] rows of one request per cluster, two CTA pairs splitting the KV tiles and exchanging P
+# over DSMEM; same FP4 operands as the two-CTA packed kernel). Opt-in sub-selection of the cutedsl backend for even-q
+# MTP shapes (see fp4_mla_cutedsl_4x_host.envelope_reason_static). Default off.
+FP4_MLA_CUTEDSL_4X_ENV = "TRTLLM_FP4_MLA_CUTEDSL_4X"
 # Packed decode: each request owns a 128-row-padded block of [query token, head]
 # Q rows, the kernel splits KV across grid.z tasks and reads per-row causal
 # bounds, so no Q padding/copies, no Q replication, and Helix stays split.
@@ -143,6 +148,22 @@ FP4_MLA_PACKED_WAVE_PLAN_ENV = "TRTLLM_FP4_MLA_PACKED_WAVE_PLAN"
 def _fp4_mla_packed_wave_plan_enabled() -> bool:
     """Enable the optional wave simulation only when explicitly requested."""
     return _env_enabled_default(FP4_MLA_PACKED_WAVE_PLAN_ENV, False)
+
+
+# Packed decode launches its split budget (grid.z slots past one per request) only for steps whose balanced
+# plan splits a request; an even step launches one task per request, without plan, reduction or empty slots.
+# Decode graphs are keyed by that decision (packed_plan.packed_split_variants). 0 restores the budget always.
+FP4_MLA_SPLIT_ON_DEMAND_ENV = "TRTLLM_FP4_MLA_SPLIT_ON_DEMAND"
+
+
+def _fp4_mla_split_on_demand_enabled() -> bool:
+    """Whether the packed decode launches its split budget only for steps that split (default on)."""
+    return _env_enabled_default(FP4_MLA_SPLIT_ON_DEMAND_ENV, True)
+
+
+def _fp4_mla_cutedsl_4x_enabled() -> bool:
+    """Whether the 4x kernel may replace the packed 2x decode inside its envelope (default off)."""
+    return _env_enabled_default(FP4_MLA_CUTEDSL_4X_ENV, False)
 
 
 def _fp4_mla_packed_q_enabled() -> bool:

@@ -3,7 +3,7 @@
 """Launch geometry and per-step KV split plan of the packed FP4 MLA decode."""
 
 import os
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, Sequence
 
 import torch
 
@@ -16,8 +16,9 @@ from .config import (
     _fp4_mla_cutedsl_kernel_module,
     _fp4_mla_packed_rows_per_seq,
     _fp4_mla_packed_wave_plan_enabled,
+    _fp4_mla_split_on_demand_enabled,
 )
-from .layout import _ensure_workspace_tensor
+from .layout import _ensure_workspace_tensor, _max_sequences
 
 _SM_COUNT_CACHE: dict[int, int] = {}
 
@@ -32,10 +33,21 @@ def _get_sm_count(device: torch.device) -> int:
     return count
 
 
+def _wave_tasks(sm_count: int, m_tiles: int) -> int:
+    """Tasks that fill one wave of 2-CTA clusters on ``sm_count`` SMs."""
+    return max(1, max(1, sm_count // 2) // max(1, m_tiles))
+
+
 def _packed_wave_tasks(device: torch.device, m_tiles: int) -> int:
     """Tasks that fill one wave of 2-CTA clusters."""
-    clusters_per_wave = max(1, _get_sm_count(device) // 2)
-    return max(1, clusters_per_wave // max(1, m_tiles))
+    return _wave_tasks(_get_sm_count(device), m_tiles)
+
+
+def _graph_split_budget(num_requests: int, wave_tasks: int) -> int:
+    """Slots per request of a CUDA-graph decode: two waves of tasks (the plan's finest target) plus one rounding
+    task per request, so the target share fits whenever the batch is skewed; never fewer than two."""
+    splits = _ceil_div(2 * wave_tasks, max(1, num_requests)) + 1
+    return max(2, min(_FP4_MLA_PACKED_MAX_SPLITS, splits))
 
 
 def _select_packed_split_count(
@@ -60,15 +72,160 @@ def _select_packed_split_count(
     override = os.getenv(_FP4_MLA_SPLIT_KV_ENV, "auto")
     if override != "auto":
         return max(1, min(int(override), _FP4_MLA_PACKED_MAX_SPLITS))
-    # Slots for two waves of tasks (the plan's finest target) plus one rounding
-    # task per request, so the target share fits whenever the batch is skewed.
-    wave_tasks = _packed_wave_tasks(device, m_tiles)
-    splits = _ceil_div(2 * wave_tasks, max(1, num_requests)) + 1
-    splits = max(2, min(_FP4_MLA_PACKED_MAX_SPLITS, splits))
+    splits = _graph_split_budget(num_requests, _packed_wave_tasks(device, m_tiles))
     if not is_cuda_graph:
         kv_tiles = _ceil_div(max(max_kv_len, 1), 256)
         splits = max(1, min(splits, _ceil_div(kv_tiles, _FP4_MLA_PACKED_MIN_TILES_PER_SPLIT)))
     return splits
+
+
+# On-demand split budget (TRTLLM_FP4_MLA_SPLIT_ON_DEMAND, default on). The budget of _select_packed_split_count
+# costs a call one cluster launch per slot, the plan and the reduction launch even when the step's balanced plan
+# keeps every request whole, as it does for an even batch that fills the machine: each wave of empty 2-CTA
+# clusters takes ~2 us (DeepSeek-R1 B128/q4 on Rubin: +10.8 us per call, independent of the KV length). A step
+# whose plan splits keeps the budget, so a long request still spreads over the other requests' slots; any other
+# step launches one task per request. The decision is the host mirror of the kernels' plan (plan_packed_tasks);
+# a graph runner keys its decode graphs by it (packed_split_variants) and hands it to the graph's metadata
+# (Fp4MlaState.packed_split).
+
+
+def packed_split_needed(
+    kv_lens: Sequence[int],
+    *,
+    query_len: int,
+    m_tiles: int,
+    sm_count: int,
+    splits: int | None = None,
+) -> bool:
+    """Whether the balanced plan of a decode step with these per-request KV lengths splits a request.
+
+    The host mirror of the kernels' plan (``plan_packed_tasks``) over ``splits`` slots per request (default: the
+    CUDA-graph budget). False when every request keeps one task, so the step needs no split budget.
+    """
+    num_requests = len(kv_lens)
+    if num_requests == 0:
+        return False
+    wave_tasks = _wave_tasks(sm_count, m_tiles)
+    if splits is None:
+        splits = _graph_split_budget(num_requests, wave_tasks)
+    if splits <= 1:
+        return False
+    from .fp4_mla_packed_reduce import plan_packed_tasks, request_kv_tiles
+
+    _, begins = plan_packed_tasks(
+        request_kv_tiles(list(kv_lens), query_len), splits * num_requests, wave_tasks
+    )
+    return begins[-1] > num_requests
+
+
+def packed_split_variants(num_requests: int, *, m_tiles: int, sm_count: int) -> tuple[bool, ...]:
+    """Split decisions a decode graph of this batch shape can replay, the values a graph runner keys it by.
+
+    An even batch keeps every request whole once it fills two thirds of a wave (the plan splits a request only
+    when it outlasts 1.5x the balanced share), so such a shape gets an unsplit and a split graph. A smaller batch
+    splits at any KV worth splitting and keeps the split graph alone; a step it would keep whole (a very short
+    one) replays the split graph, as without the on-demand rule.
+    """
+    wave_tasks = _wave_tasks(sm_count, m_tiles)
+    return (False, True) if 3 * num_requests >= 2 * wave_tasks else (True,)
+
+
+def _host_generation_kv_lens(metadata: Any, num_requests: int) -> list[int] | None:
+    """KV lengths (past + new tokens) of the step's generation requests, the last ``num_requests`` of
+    ``kv_lens_runtime`` on the host, or None. ``prompt_lens_cpu_runtime`` is no substitute: in generation it
+    holds the new tokens per request."""
+    lens = getattr(metadata, "kv_lens_runtime", None)
+    if (
+        isinstance(lens, torch.Tensor)
+        and lens.device.type == "cpu"
+        and lens.numel() >= num_requests
+    ):
+        return [int(x) for x in lens[lens.numel() - num_requests :].tolist()]
+    return None
+
+
+def _on_demand_split_count(
+    splits: int,
+    metadata: Any,
+    *,
+    num_requests: int,
+    m_tiles: int,
+    query_len: int,
+    device: torch.device,
+    helix: bool,
+) -> int:
+    """Slots per request after the on-demand rule: ``splits`` when the step's plan splits a request, else 1.
+
+    A decode graph keyed by the decision (``Fp4MlaState.packed_split``) replays it; a graph without one keeps the
+    budget, since its replays may split; an eager step decides on its host KV lengths. Helix (skewed per-rank KV
+    slices) and a ``TRTLLM_FP4_MLA_SPLIT_KV`` override keep the budget.
+    """
+    if (
+        splits <= 1
+        or helix
+        or not _fp4_mla_split_on_demand_enabled()
+        or os.getenv(_FP4_MLA_SPLIT_KV_ENV, "auto") != "auto"
+    ):
+        return splits
+    decided = getattr(metadata.fp4_mla_state, "packed_split", None)
+    if decided is not None:
+        return splits if decided else 1
+    if bool(getattr(metadata, "is_cuda_graph", False)):
+        return splits
+    kv_lens = _host_generation_kv_lens(metadata, num_requests)
+    if kv_lens is None:
+        return splits
+    needed = packed_split_needed(
+        kv_lens,
+        query_len=query_len,
+        m_tiles=m_tiles,
+        sm_count=_get_sm_count(device),
+        splits=splits,
+    )
+    return splits if needed else 1
+
+
+_SPLIT_TASK_BOUND_CACHE: dict[tuple[int, int], int] = {}
+
+
+def packed_split_task_bound(max_requests: int, m_tiles: int, device: torch.device) -> int:
+    """Largest ``splits * requests`` any batch up to ``max_requests`` can ask for: the capacity of the shared
+    split-KV scratch (``layout._ensure_workspace_tensor``). The graph rule bounds the eager rule (eager only caps
+    the splits further by the KV length) and the eager floor of 32 slots is kept."""
+    override = os.getenv(_FP4_MLA_SPLIT_KV_ENV, "auto")
+    if override != "auto":
+        splits = max(1, min(int(override), _FP4_MLA_PACKED_MAX_SPLITS))
+        return max(32, splits * max(1, int(max_requests)))
+    wave_tasks = _packed_wave_tasks(device, m_tiles)
+    key = (wave_tasks, max(1, int(max_requests)))
+    bound = _SPLIT_TASK_BOUND_CACHE.get(key)
+    if bound is None:
+        bound = 32
+        for requests in range(1, key[1] + 1):
+            splits = max(
+                2, min(_FP4_MLA_PACKED_MAX_SPLITS, _ceil_div(2 * wave_tasks, requests) + 1)
+            )
+            bound = max(bound, splits * requests)
+        _SPLIT_TASK_BOUND_CACHE[key] = bound
+    return bound
+
+
+def packed_split_scratch_bound(
+    metadata: Any, num_heads: int, query_len: int, device: torch.device, *, max_requests: int
+) -> tuple[int, int]:
+    """(slot bound, slot x row bound) of the shared packed split scratch over every query width the engine can
+    decode (1 .. 1 + max_total_draft_tokens, ``query_len`` included). Narrow rows mean more wave tasks and more
+    splits, so neither bound is monotonic in the width: both are maxima over all of them."""
+    width = max(int(query_len), 1 + int(getattr(metadata, "max_total_draft_tokens", None) or 0))
+    slots_bound, slot_rows_bound = 32, 0
+    for q in range(1, width + 1):
+        rows = _fp4_mla_packed_rows_per_seq(num_heads, q)
+        if rows <= 0:
+            continue
+        slots = packed_split_task_bound(max_requests, rows // FP4_MLA_SCALE_ROW_GROUP, device)
+        slots_bound = max(slots_bound, slots)
+        slot_rows_bound = max(slot_rows_bound, slots * rows)
+    return slots_bound, slot_rows_bound
 
 
 class _PackedPlanGeometry(NamedTuple):
@@ -84,6 +241,9 @@ class _PackedPlanGeometry(NamedTuple):
     helix_kv_bounds: torch.Tensor | None
     plan: torch.Tensor | None
     key: tuple | None
+    # capacity of the shared split-KV scratch: task slots and slot x row products (0 = single task per request)
+    task_bound: int = 0
+    slot_rows_bound: int = 0
 
 
 def _fp4_mla_packed_plan_geometry(
@@ -123,6 +283,15 @@ def _fp4_mla_packed_plan_geometry(
         max_kv_len=max_kv_len,
         is_cuda_graph=is_cuda_graph,
     )
+    splits = _on_demand_split_count(
+        splits,
+        metadata,
+        num_requests=num_requests,
+        m_tiles=m_tiles,
+        query_len=query_len,
+        device=device,
+        helix=helix_kv_bounds is not None or bool(getattr(metadata, "enable_helix", False)),
+    )
     # Tasks that fill one wave of 2-CTA clusters: the plan's task-length reference.
     wave_tasks = _packed_wave_tasks(device, m_tiles)
     # The runtime KV profile only has to cover one task: the kernel clamps the
@@ -155,14 +324,22 @@ def _fp4_mla_packed_plan_geometry(
     from .fp4_mla_packed_reduce import packed_plan_length
 
     tasks = splits * num_requests
-    # Graph buckets hold exactly their tasks; eager metadata grows on demand.
+    # Graph buckets hold exactly their tasks; eager metadata grows on demand. The buffers themselves are
+    # process-wide (layout._ensure_workspace_tensor), sized once for the largest batch any bucket can bring.
     task_capacity = tasks if is_cuda_graph else max(tasks, 32)
+    max_requests = max(_max_sequences(metadata), num_requests)
+    slots_bound, slot_rows_bound = packed_split_scratch_bound(
+        metadata, num_heads, query_len, device, max_requests=max_requests
+    )
+    task_bound = max(slots_bound, task_capacity)
+    slot_rows_bound = max(slot_rows_bound, task_capacity * rows_per_seq)
     plan = _ensure_workspace_tensor(
         metadata,
         "_fp4_mla_packed_plan",
         (packed_plan_length(num_requests, task_capacity),),
         dtype=torch.int32,
         device=device,
+        capacity_numel=packed_plan_length(max_requests, task_bound),
     )
     kv_lens = metadata.fp4_mla_state.generation_kv_lens
     key = (
@@ -187,6 +364,8 @@ def _fp4_mla_packed_plan_geometry(
         helix_kv_bounds,
         plan,
         key,
+        task_bound,
+        slot_rows_bound,
     )
 
 

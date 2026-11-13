@@ -567,6 +567,41 @@ class AttentionMetadata:
         cuda_graph_metadata.__post_init__()
         return cuda_graph_metadata
 
+    def set_decode_kv_regime(self, kv_regime: Optional[int]) -> None:
+        """Bound the KV length the decode kernels choose their path on.
+
+        A CUDA graph runner that keys its decode graphs by KV regime passes
+        the regime ceiling of the graph this metadata serves, an upper bound
+        of the longest KV a replay reads.
+
+        Args:
+            kv_regime: The regime ceiling in tokens; None restores the
+                page-table capacity. Backends whose decode path does not
+                depend on the KV length ignore it.
+        """
+
+    @property
+    def decode_kv_regime(self) -> Optional[int]:
+        """The KV regime set by ``set_decode_kv_regime``; None when unset or ignored."""
+        return None
+
+    def set_decode_packed_split(self, packed_split: Optional[bool]) -> None:
+        """Fix whether the decode launches its KV split budget.
+
+        A CUDA graph runner that keys its decode graphs by the split
+        decision passes the decision of the graph this metadata serves.
+
+        Args:
+            packed_split: True launches the split budget, False one task
+                per request; None restores the per-call decision. Backends
+                without a split decode ignore it.
+        """
+
+    @property
+    def decode_packed_split(self) -> Optional[bool]:
+        """The decision set by ``set_decode_packed_split``; None when unset or ignored."""
+        return None
+
     def prepare_for_spec_dec(self, *fields) -> None:
         assert len(self._saved_tensors) == 0, (
             "prepare_for_spec_dec called while fields "
