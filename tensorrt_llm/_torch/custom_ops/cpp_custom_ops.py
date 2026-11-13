@@ -7,7 +7,7 @@ import torch
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 
-from ..._utils import get_sm_version
+from ..._utils import is_sm_100f
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 
 if IS_CUTLASS_DSL_AVAILABLE:
@@ -1095,7 +1095,9 @@ def _register_fake():
     def _(input: torch.Tensor, use_ue8m0: bool = False):
         pad_m = fp4_utils.pad_up(input.shape[0], 4)
         blocked_n = (input.shape[1] + 127) // 128
-        if get_sm_version() >= 100:
+        # Mirror fp8Quantize.cpp: only the SM100 family reshapes the scales to
+        # [blocked_n, M]; SM89/SM90 and SM120/SM121 return the 1D padded buffer.
+        if is_sm_100f():
             sz = (blocked_n, input.shape[0])
         else:
             sz = (fp4_utils.pad_up(pad_m * blocked_n * 4, 128) // 4, )
