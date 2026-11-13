@@ -57,6 +57,10 @@ skip_not_sm107 = pytest.mark.skipif(
     get_sm_version() != 107,
     reason="the MiniMax-M3.1-Flash modeling_v2 targets are certified on sm_107 only",
 )
+skip_not_sm103 = pytest.mark.skipif(
+    get_sm_version() != 103,
+    reason="the MiniMax-M3.1-Flash GB300 modeling_v2 targets are certified on sm_103 only",
+)
 
 
 class _MiniMaxM31Target(LlmapiAccuracyTestHarness):
