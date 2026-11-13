@@ -329,6 +329,7 @@ def test_cute_dsl_fp4_paged_mqa_logits(
         kv_fused,
         weights,
         context_lens,
+        context_lens,
         block_table,
         schedule_meta,
         max_model_len,
@@ -494,6 +495,7 @@ def test_cute_dsl_fp4_paged_mqa_logits_kernel_split(
         kv_fused,
         weights,
         context_lens,
+        context_lens,
         block_table,
         schedule_meta,
         max_model_len,
@@ -653,6 +655,7 @@ def test_cute_dsl_fp4_paged_mqa_logits_block_meta(
         sf_q,
         kv_fused,
         weights,
+        context_lens,
         context_lens,
         block_table,
         schedule_meta,
@@ -814,6 +817,7 @@ def test_cute_dsl_fp4_paged_mqa_logits_seed_counts(
         kv_fused,
         weights,
         context_lens,
+        context_lens,
         block_table,
         schedule_meta,
         max_model_len,
@@ -852,6 +856,7 @@ def test_cute_dsl_fp4_paged_mqa_logits_seed_counts(
         sf_q,
         kv_fused,
         weights,
+        context_lens,
         context_lens,
         block_table,
         schedule_meta,
@@ -965,6 +970,7 @@ def test_cute_dsl_fp4_paged_mqa_logits_cand(
         sf_q,
         kv_fused,
         weights,
+        context_lens,
         context_lens,
         block_table,
         schedule_meta,
@@ -1624,6 +1630,7 @@ def test_cute_dsl_fp4_paged_mqa_logits_cand_bucketed(
         kv_fused,
         weights,
         context_lens,
+        context_lens,
         block_table,
         schedule_meta,
         max_model_len,
@@ -1658,6 +1665,7 @@ def test_cute_dsl_fp4_paged_mqa_logits_cand_bucketed(
         sf_q,
         kv_fused,
         weights,
+        context_lens,
         context_lens,
         block_table,
         schedule_meta,
@@ -1722,3 +1730,62 @@ def test_cute_dsl_fp4_paged_mqa_logits_cand_bucketed(
             assert cap_mode == "tight", f"unexpected void {tag}"
     if cap_mode == "tight":
         assert int(cand_ctl[:, 1].sum()) > 0, "tight caps never voided"
+
+
+@skip_not_sm100
+def test_cute_dsl_fp4_paged_mqa_logits_partial_final_tile():
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+
+    batch_size, next_n, num_heads, head_dim = 1, 1, 64, 128
+    context_len, phys_block_kv, max_model_len = 129, 128, 256
+    device = "cuda"
+    context_lens = torch.tensor([context_len], dtype=torch.int32, device=device)
+    block_table = torch.tensor([[0, 1]], dtype=torch.int32, device=device)
+    q = torch.randn((batch_size, next_n, num_heads, head_dim), device=device, dtype=torch.bfloat16)
+    kv_cache = torch.randn((2, phys_block_kv, 1, head_dim), device=device, dtype=torch.bfloat16)
+    weights = torch.randn((batch_size * next_n, num_heads), device=device, dtype=torch.float32)
+
+    q_packed, sf_q_packed = DSAVanillaIndexer.quantize_fp4(
+        q.view(-1, head_dim), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True
+    )
+    q_fp4 = q_packed.view(torch.uint8).view(batch_size, next_n, num_heads, head_dim // 2)
+    sf_q = sf_q_packed.view(torch.int32).view(batch_size, next_n, num_heads)
+    q_simulated = (
+        DSAVanillaIndexer.dequantize_fp4(q_packed, sf_q_packed, gran_k=32, use_packed_ue8m0=True)
+        .view(batch_size, next_n, num_heads, head_dim)
+        .to(torch.bfloat16)
+    )
+    kv_fused, kv_simulated = kv_cache_cast_to_fp4(kv_cache)
+    schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(
+        context_lens.unsqueeze(-1), 64, deep_gemm.get_num_sms()
+    )
+
+    ref = paged_mqa_logits(
+        q_simulated.float(),
+        kv_simulated.float(),
+        weights,
+        context_lens,
+        context_lens,
+        block_table,
+        max_model_len,
+    )
+    logits = torch.ops.trtllm.cute_dsl_fp4_paged_mqa_logits(
+        q_fp4,
+        sf_q,
+        kv_fused,
+        weights,
+        context_lens,
+        context_lens,
+        block_table,
+        schedule_meta,
+        max_model_len,
+        num_epi_subtiles=1,
+        epi_dtype=torch.float32,
+        output_dtype=torch.bfloat16,
+    )
+
+    assert logits.dtype == torch.bfloat16
+    torch.testing.assert_close(
+        logits[0, :context_len].float(), ref[0, :context_len], atol=1e-2, rtol=1e-2
+    )

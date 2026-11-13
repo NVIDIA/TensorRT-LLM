@@ -208,6 +208,28 @@ def _sm100():
         pytest.skip("Fused CSA2 store is enabled only after SM100-family validation")
 
 
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_cache_kernel_namespace_is_memoized():
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import kernel
+
+    _sm100()
+    if not kernel.dsl_available():
+        pytest.skip("CSA2 cache kernels require the CuTe DSL")
+
+    # Do not cache_clear(): the namespace is process-global and shared with
+    # every other test in this module. Measure deltas instead.
+    kernels = kernel._cache_kernels()
+    before = kernel._cache_kernels.cache_info()
+
+    assert callable(kernels.QuantizeScatterKernel)
+    assert callable(kernels.GatherDequantKernel)
+    assert kernel._cache_kernels() is kernels
+    after = kernel._cache_kernels.cache_info()
+    assert after.misses == before.misses
+    assert after.hits == before.hits + 1
+
+
 def _values(rows, dim, cache_format):
     storage = torch.randn(rows, dim + 17, dtype=torch.bfloat16, device="cuda")
     x = storage[:, :dim]
