@@ -1101,7 +1101,11 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
                         beam_output.token_ids_diff,
                         prev_text=beam_output.text,
                         states=beam_output._incremental_states,
-                        flush=self._done,
+                        # A choice that finished before the request did is not
+                        # sent again by the serve streams, so release what the
+                        # decoder holds back in the response that finishes it.
+                        flush=(self._done
+                               or beam_output.finish_reason is not None),
                         stream_interval=self.sampling_params._stream_interval,
                         **kwargs)
                 else:

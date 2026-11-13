@@ -26,6 +26,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tensorrt_llm.executor.result import DetokenizedGenerationResultBase, GenerationResultBase
+from tensorrt_llm.sampling_params import SamplingParams
 from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest, CompletionRequest
 from tensorrt_llm.serve.postprocess_handlers import (
     ChatPostprocArgs,
@@ -55,11 +57,12 @@ def _rsp(outputs, done=False):
 
 def _responses():
     # Sequence 0 finishes in the first response. Later responses carry sequence 1
-    # and list sequence 0 again with nothing new, still finished.
+    # and list sequence 0 again with nothing new, still finished. The last
+    # response carries a text delta of its own.
     return [
         _rsp([_output(0, "A", [1], "stop"), _output(1, "", [], None)]),
         _rsp([_output(0, "", [], "stop"), _output(1, "B", [2], None)]),
-        _rsp([_output(0, "", [], "stop"), _output(1, "", [], "length")], done=True),
+        _rsp([_output(0, "", [], "stop"), _output(1, "C", [3], "length")], done=True),
     ]
 
 
@@ -102,3 +105,88 @@ def test_a_finished_choice_streams_nothing_after_its_finish(collect):
     )
 
     assert not [c for c in choices[first_finish + 1 :] if c["index"] == 0]
+
+
+def _text(choice):
+    # chat chunks carry the delta under "delta", completion chunks under "text"
+    if "text" in choice:
+        return choice["text"]
+    return choice["delta"].get("content") or ""
+
+
+@pytest.mark.parametrize("collect", [_chat_choices, _completion_choices])
+def test_terminal_text_of_each_choice_is_kept(collect):
+    choices = collect()
+
+    for index, expected in [(0, "A"), (1, "BC")]:
+        assert "".join(_text(c) for c in choices if c["index"] == index) == expected
+
+
+def test_chat_terminal_text_precedes_the_finish_chunk():
+    choices = _chat_choices()
+
+    for index in (0, 1):
+        own = [c for c in choices if c["index"] == index and (_text(c) or c.get("finish_reason"))]
+        assert own[-1].get("finish_reason")
+        assert not any(c.get("finish_reason") for c in own[:-1])
+        assert any(_text(c) for c in own[:-1])
+
+
+class _HoldingTokenizer:
+    """Incremental decoder that keeps the newest piece back until it is flushed."""
+
+    def decode_incrementally(self, token_ids, prev_text=None, states=None, *, flush=False, **_):
+        held = (states or {}).get("held", "")
+        pieces = held + "".join(f"t{token_id}" for token_id in token_ids)
+        if flush or not token_ids:
+            return (prev_text or "") + pieces, {"held": ""}
+        return (prev_text or "") + pieces[:-2], {"held": pieces[-2:]}
+
+    def decode(self, token_ids, **_):
+        return "".join(f"t{token_id}" for token_id in token_ids)
+
+
+def test_finished_choice_streams_its_held_decoder_text_once(monkeypatch):
+    # n=2: choice 0 finishes while the decoder still holds its last piece and
+    # choice 1 keeps generating. The held piece must leave with choice 0's
+    # finishing chunk: later responses skip choice 0.
+    script = [
+        ({0: ([1, 2], "stop"), 1: ([5], None)}, False),
+        ({1: ([6], None)}, False),
+        ({1: ([7], "length")}, True),
+    ]
+    steps = iter(script)
+
+    def scripted_base_handler(self, response):
+        updates, done = next(steps)
+        self._done = done
+        for output in self._outputs:
+            output._last_token_ids_len = len(output.token_ids)
+        for index, (ids, finish_reason) in updates.items():
+            output = self._outputs[index]
+            output.token_ids = output.token_ids + ids
+            if finish_reason is not None:
+                output.finish_reason = finish_reason
+
+    monkeypatch.setattr(GenerationResultBase, "_handle_response", scripted_base_handler)
+    result = DetokenizedGenerationResultBase(
+        1,
+        SamplingParams(n=2, detokenize=True, temperature=0.8, top_k=5),
+        tokenizer=_HoldingTokenizer(),
+        streaming=True,
+    )
+    request = CompletionRequest(model="m", prompt="hi", n=2, stream=True)
+    args = CompletionPostprocArgs.from_request(request)
+    args.prompt = "hi"
+    args.num_prompt_tokens = 3
+
+    choices = []
+    for _ in script:
+        result._handle_response(None)
+        choices += list(_choices(completion_stream_post_processor(result, args)))
+
+    assert "".join(c["text"] for c in choices if c["index"] == 0) == "t1t2"
+    assert sorted((c["index"], c["finish_reason"]) for c in choices if c["finish_reason"]) == [
+        (0, "stop"),
+        (1, "length"),
+    ]
