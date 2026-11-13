@@ -1303,8 +1303,7 @@ def generate_multi_gpu_test_params(
                 # TP modes shard intermediate_size; EP modes don't
                 moe_tp_size = 4 if parallel_mode in ("DTP", "TTP") else 1
                 # Match the canonical predicate used by the worker impl so
-                # backend skip checks (e.g. the W4A8_MXFP4_FP8 + TRTLLM-Gen
-                # gpt-oss SwiGLU kernel-bug skip) fire on multi-GPU runs too.
+                # backend skip checks also apply to multi-GPU runs.
                 swiglu_gptoss_style = (
                     swiglu_alpha != 1 or swiglu_beta != 0 or swiglu_limit != float("inf")
                 )
