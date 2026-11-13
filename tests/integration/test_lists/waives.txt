@@ -75,6 +75,8 @@ full:B300/accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_a
 full:B300/disaggregated/test_disaggregated.py::test_disaggregated_ctxpp4_gentp4 SKIP (https://nvbugs/7023201)
 full:B300/disaggregated/test_disaggregated.py::test_disaggregated_mamba_conc_greater_than_mbs[NVIDIA-Nemotron-3-Super-120B-A12B-FP8] SKIP (https://nvbugs/6770978)
 full:B300/disaggregated/test_disaggregated.py::test_disaggregated_overlap_gen_first[ctx_pp4] SKIP (https://nvbugs/7023197)
+full:CPU/unittest/_torch/pyexecutor/test_overlap_admission_lifetime.py::test_adp_replacements_acquire_slots_before_retiring_requests_release_them[no-overlap] SKIP (https://nvbugs/7075738)
+full:CPU/unittest/_torch/pyexecutor/test_overlap_admission_lifetime.py::test_adp_replacements_acquire_slots_before_retiring_requests_release_them[overlap] SKIP (https://nvbugs/7075738)
 full:CPU/unittest/_torch/modeling_v2/test_modeling_v2_ci_selection.py::test_every_test_is_in_a_test_list SKIP (https://nvbugs/7082290)
 full:CPU/unittest/_torch/modeling_v2/test_modeling_v2_ci_selection.py::test_unit_test_directories_mirror_source SKIP (https://nvbugs/7082289)
 full:CPU/unittest/scripts/test_subprocess_timeouts.py::test_every_subprocess_run_call_in_test_code_must_set_timeout SKIP (https://nvbugs/6929769)
