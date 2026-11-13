@@ -747,6 +747,16 @@ def _test_moe_worker_impl(
             ref_fused_moe.load_weights([ref_weights])
             ref_fused_moe.cuda(f"cuda:{mapping.rank}")
 
+            if (
+                mapping.enable_attention_dp
+                and backend_type == MoeBackendType.TRTLLM
+                and quant_algo == QuantAlgo.W4A8_MXFP4_FP8
+            ):
+                # Keep checkpoint weights and scales identical across ranks,
+                # then vary inputs/routes without changing their calibration range.
+                x.copy_(x.roll(mapping.rank, dims=-1))
+                router_logits.copy_(router_logits.roll(mapping.rank, dims=-1))
+
             # Define forward function
             def run_forward():
                 with torch.inference_mode():
@@ -1316,7 +1326,6 @@ def generate_multi_gpu_test_params(
                         quant_algo,
                         model_config,
                         swiglu_gptoss_style=swiglu_gptoss_style,
-                        comm_method=comm_method,
                         moe_tp_size=moe_tp_size,
                         parallel_mode=parallel_mode,
                     ),
@@ -1765,6 +1774,17 @@ MULTI_GPU_TEST_PARAMS += _generate_focused_multi_gpu_test_params(
     quant_algo=QuantAlgo.NVFP4,
     parallel_modes=["DEP"] if IS_CI_MODE else ["DEP", "TEP"],
     comm_methods=["ALLGATHER"],
+)
+MULTI_GPU_TEST_PARAMS += generate_multi_gpu_test_params(
+    parallel_modes=["DEP"],
+    comm_methods=["ALLGATHER"],
+    swiglu_combos=[(1, 0, float("inf"))],
+    model_configs=[MoeModelConfig(8, 1, 512, 512)],
+    seq_lens=[8],
+    dtypes=[torch.bfloat16],
+    backend_types=[MoeBackendType.TRTLLM],
+    quant_algos=[QuantAlgo.W4A8_MXFP4_FP8],
+    routing_methods=[RenormalizeMoeRoutingMethod],
 )
 MULTI_GPU_TEST_PARAMS += _generate_focused_multi_gpu_test_params(
     backend_type=MoeBackendType.MEGAMOE_DEEPGEMM,

@@ -199,6 +199,7 @@ def _generate_ltx23_av(rank, world_size, *, video_out_path, audio_out_path, conf
     _require_exists(model_path, "LTX-2.3 dev checkpoint")
     _require_exists(text_encoder_path, "LTX-2.3 text encoder (Gemma QAT-unquantized)", is_dir=True)
 
+    video = audio = audio_rate = None
     with _lpips_deterministic_algorithms():
         config_path = os.path.join(
             REPO_ROOT, "examples", "visual_gen", "configs", f"ltx23-t2v-{config_name}.yaml"
@@ -316,10 +317,12 @@ def _generate_ltx23_retake_video(
 
     model_path, text_encoder_path = _ltx23_model_paths()
     _require_exists(text_encoder_path, "LTX-2.3 text encoder (Gemma QAT-unquantized)", is_dir=True)
+    frame_rate = None
     checkpoint = os.environ.get(LTX23_RETAKE_CHECKPOINT_ENV) or os.path.join(
         os.path.dirname(model_path), "ltx-2.3-22b-distilled-1.1.safetensors"
     )
     _require_exists(checkpoint, "LTX-2.3 retake checkpoint")
+    video = audio = audio_rate = None
     with _lpips_deterministic_algorithms():
         config = os.path.join(REPO_ROOT, "examples", "visual_gen", "configs", config_filename)
         args = VisualGenArgs.from_yaml(config)

@@ -351,7 +351,7 @@ def test_production_forward_updates_live_cache(state_dtype: torch.dtype) -> None
     slots = torch.empty(batch.n + 1, dtype=torch.int32, device="cuda")
     slots[1:].copy_(batch.indices)
     batch.indices = slots[1:]
-    batch.metadata.state_indices = batch.indices
+    batch.metadata.state_indices = batch.metadata.replay_state_indices = batch.indices
     state = batch.state.to(state_dtype)
     initial_state = state.clone()
     ref_state, ref_conv = state.clone(), batch.conv.clone()

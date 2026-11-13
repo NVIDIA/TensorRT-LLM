@@ -383,12 +383,13 @@ def test_invalid_slot_fails_closed(fault) -> None:
     remaining blocks."""
     case = build_step((1500, 2048, 700), 4, identity=False, seed=303)
     tok, slot = 5, 2
+    req = tok // 4
+    hits = None
     if fault == "neg_in_window":
         case.topk[0, tok, slot] = -1
     elif fault == "id_past_row":
         case.topk[0, tok, slot] = case.block_table.shape[1] + 7
     else:
-        req = tok // 4
         blk = int(case.topk[0, tok, slot])
         bad_page = case.k_paged.shape[0] + 1000
         case.block_table = case.block_table.clone()

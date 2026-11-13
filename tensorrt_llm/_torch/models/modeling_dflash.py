@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+from tensorrt_llm._errors import ConfigInputError, UnsupportedError
 from tensorrt_llm.llmapi.llm_args import is_dflash2_checkpoint, is_lilicorr_checkpoint
 from tensorrt_llm.logger import logger
 
@@ -670,7 +671,7 @@ class DFlashForCausalLM(nn.Module):
         pretrained_cfg = draft_config.pretrained_config
         try:
             DraftModelClass, _ = get_model_architecture(pretrained_cfg)
-        except RuntimeError:
+        except (RuntimeError, ConfigInputError, UnsupportedError):
             model_type = pretrained_cfg.model_type
             arch_name = "".join(w.capitalize() for w in model_type.split("_")) + "ForCausalLM"
             logger.info(
@@ -1724,7 +1725,7 @@ class DFlashForCausalLM(nn.Module):
 
         sm_count = self._dflash_trtllm_gen_sm_count
         counter_bytes = trtllm_gen_ops.get_multi_ctas_kv_counter_size(
-            num_heads * block_size, max_batch_size, sm_count
+            max(heads for _, heads in shapes), max_batch_size, sm_count
         )
         counters = self._dflash_trtllm_gen_counters
         counters_need_allocation = (

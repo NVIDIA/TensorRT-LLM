@@ -63,12 +63,8 @@ from .engine.multimodal import (
 from .engine.runners import resolve_runner_type
 from .engine.runners.common import make_scheduled_inputs, resolve_mrope_position_deltas_cache
 from .engine.runners.decoder import DecoderRunner, DecoderRunnerConfig
-from .engine.runners.encoder import EncoderRunner, resolve_scheduled_encoder_args
-from .engine.runners.encoder_decoder import (
-    EncoderDecoderRunner,
-    EncoderDecoderRunnerConfig,
-    EncoderStageConfig,
-)
+from .engine.runners.encoder import EncoderConfig, EncoderRunner, resolve_scheduled_encoder_args
+from .engine.runners.encoder_decoder import EncoderDecoderRunner, EncoderDecoderRunnerConfig
 from .engine.runners.interface import ModelRunner, ScheduledInputs, ScheduledModelRunner
 from .engine.runners.mm_encoder import MultimodalEncoderRunner
 from .guided_decoder import CapturableGuidedDecoder
@@ -518,7 +514,7 @@ class ModelEngine:
     def _initialize_encoder_decoder_runner(
         self, runner_cls: type[EncoderDecoderRunner]
     ) -> EncoderDecoderRunner:
-        encoder_config = EncoderStageConfig.create(
+        encoder_config = EncoderConfig.create(
             model=self.model,
             mapping=self.mapping,
             graph_config=self.llm_args.encoder_cuda_graph_config,
@@ -591,6 +587,7 @@ class ModelEngine:
                 and self.llm_args.lora_config.cuda_graph_specialize_lora
             ),
             spec_decode_fast_paths=self.spec_decode_fast_paths,
+            watermark_config=self.llm_args.watermark_config,
             **extra_fields,
         )
 
@@ -874,11 +871,20 @@ class ModelEngine:
         with self.warmup_scope():
             self._warmup_impl(resource_manager)
 
+    def _configure_allreduce_tuning(self) -> None:
+        """Configure profiling buckets from the resolved budget before runner warmup."""
+        from ..custom_ops.torch_custom_ops import AllReduceRunner
+
+        if not self.llm_args.enable_autotuner:
+            return
+        AllReduceRunner.configure_tuning_buckets(self.max_num_tokens)
+
     def _warmup_impl(self, resource_manager: ResourceManager | None = None) -> None:
         """
         Orchestrates the warmup process by calling specialized warmup methods for
         torch.compile, the autotuner, and CUDA graphs.
         """
+        self._configure_allreduce_tuning()
         assert resource_manager is not None, "scheduled warmup requires a resource manager"
         assert isinstance(self._runner, ScheduledModelRunner)
         self._runner.warmup(resource_manager)
