@@ -184,9 +184,11 @@ def print_summary(report_path: Path, *, all_diagnostics: bool = False) -> None:
                 kind = error.get("name", "error")
                 message = (
                     error.get("description") or error.get("concise_description", "")
-                    if all_diagnostics
+                    if all_diagnostics and kind != "missing-import"
                     else error.get("concise_description") or error.get("description", "")
                 )
+                if kind == "missing-import":
+                    message = str(message).split("Looked in these locations", 1)[0].rstrip()
                 if not all_diagnostics:
                     message = str(message).replace("\n", " ")
                 print(f"{location}: [{kind}] {message}")
