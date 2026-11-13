@@ -4,9 +4,16 @@ This project is licensed under the Apache 2.0 license, unless otherwise
 specified. The full text for every license used in this project is
 available below.
 
-Any directory in this project named "cubin" or "cubins" is licensed under the
+The following directories in this project are licensed under the
 NVIDIA Software License Agreement, with product specific terms for NVIDIA AI
-products.
+products:
+- cpp/tensorrt_llm/kernels/trtllmGenKernels/fmha/lib
+- cpp/tensorrt_llm/kernels/internal_cutlass_kernels
+- cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/cubin
+- cpp/tensorrt_llm/kernels/trtllmGenKernels/fmha/cubin
+- cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/cubins
+- cpp/tensorrt_llm/kernels/trtllmGenKernels/gemm/trtllmGen_gemm_export/cubins
+- cpp/tensorrt_llm/kernels/trtllmGenKernels/gemmGatedAct/trtllmGen_gatedAct_export/cubins
 
 This project contains portions of code that are based on or derived from
 other open source projects, which may have different licenses.
