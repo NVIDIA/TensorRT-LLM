@@ -63,6 +63,8 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import importlib
+import importlib.util
 import os
 import sys
 import threading
@@ -274,6 +276,15 @@ R6_DENSE_PREQUANT = m31_enabled("R6_DENSE_PREQUANT")
 # boundary, the routed experts' NVFP4 input), instead of the fused all-reduce + norm followed by the consumers' own
 # quantize passes. The quantized outputs equal mxfp8_quantize / fp4_quantize of the norm bit for bit; the norm itself
 # is not bitwise against the fused all-reduce's (reduction order). Kill switch: TRTLLM_M31_DISABLE_CTXNORMQ=1.
+
+# PrimTS (the full-context decode) and FA4 trace in one process: scope task scheduling's WorkTileInfo rebind to the
+# PrimTS traces where the engine has that scope (attention/backends/prims_ts/_worktile_scope.py; its kill switch is
+# TRTLLM_PRIMS_TS_SCOPED_WORKTILE=0).
+if (
+    importlib.util.find_spec("tensorrt_llm._torch.attention.backends.prims_ts._worktile_scope")
+    is not None
+):
+    importlib.import_module("tensorrt_llm._torch.attention.backends.prims_ts._worktile_scope").arm()
 
 CTXNORMQ = not m31_disabled("CTXNORMQ")
 # GQAMIX: a mixed ctx+gen step's sparse generation rows (MsaDecodeFmha) run the Triton block-sparse decode
