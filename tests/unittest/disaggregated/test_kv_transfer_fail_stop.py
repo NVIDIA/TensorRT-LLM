@@ -485,12 +485,28 @@ def cannot_terminate(**_kwargs):
 hang_detector.propagate_hard_kill = cannot_terminate
 now = [1.0]
 watchdog = RetirementWatchdog(transceiver._fail_unproven_transfer, clock=lambda: now[0])
-owner = watchdog.create_owner(12, "send", 1.0)
-assert owner.expose(object())
-owner.request_drain("test cancellation")
-now[0] = 2.0
-watchdog.start()
+owner = None
+if sys.argv[2] == "deadline":
+    owner = watchdog.create_owner(12, "send", 1.0)
+    assert owner.expose(object())
+    owner.request_drain("test cancellation")
+    now[0] = 2.0
+    watchdog.start()
+else:
+    if sys.argv[2] == "stopped-handoff":
+        watchdog.start()
+        watchdog.stop()
+    else:
+        watchdog.request_shutdown()
+    watchdog.fail_closed(12, "receive", "test ownership handoff refused")
 assert notified.wait(5), "fatal callback never ran"
+assert watchdog.fatal is not None
+try:
+    watchdog.create_owner(13, "receive", 1.0)
+except RuntimeError:
+    pass
+else:
+    raise AssertionError("fatal root retention reopened admission")
 # If the fatal thread exits, the old implementation becomes collectable. The
 # live thread must own its callback/root graph after the caller drops everything.
 watchdog._thread.join(timeout=1)
@@ -513,11 +529,12 @@ def _standalone_process_env() -> dict[str, str]:
 
 
 @pytest.mark.parametrize("kill_result", ["return", "raise"])
+@pytest.mark.parametrize("failure", ["deadline", "handoff", "stopped-handoff"])
 @pytest.mark.timeout(360)
-def test_fatal_watchdog_retains_complete_transceiver_roots(kill_result: str) -> None:
+def test_fatal_watchdog_retains_complete_transceiver_roots(kill_result: str, failure: str) -> None:
     """Fatal root retention survives GC without leaking fatal threads into pytest."""
     result = subprocess.run(
-        [sys.executable, "-c", _FATAL_ROOTS_SCRIPT, kill_result],
+        [sys.executable, "-c", _FATAL_ROOTS_SCRIPT, kill_result, failure],
         env={**_standalone_process_env(), "TLLM_DISABLE_MPI": "1"},
         capture_output=True,
         text=True,

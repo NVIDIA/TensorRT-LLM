@@ -4,6 +4,7 @@
 import atexit
 import dataclasses
 import datetime
+import itertools
 import math
 import os
 import sys
@@ -2427,6 +2428,16 @@ class PyExecutor:
         """
         self.executor_request_queue.enqueue_cancel_request(id)
 
+    def _cancel_context_transfer(self, client_id: int) -> None:
+        """Request cleanup after a CTX result has left frontend routing.
+
+        This enqueues intent, not an acceptance or resource-release receipt.
+
+        Args:
+            client_id: Original frontend identity of the retained CTX request.
+        """
+        self.executor_request_queue.enqueue_context_transfer_cancel(client_id)
+
     def _start_mpi_progress_thread(self) -> None:
         """Start a native thread that keeps this rank's MPI sends moving.
 
@@ -2782,6 +2793,10 @@ class PyExecutor:
         """
         return self.executor_request_queue.can_enqueue_request()
 
+    def _can_enqueue_cancellation(self) -> bool:
+        """Keep existing-work cancellation open during a sleep drain."""
+        return self.executor_request_queue.can_enqueue_cancellation()
+
     def begin_sleep_transition(self, tags: list[ExecutorMemoryType]) -> None:
         self.executor_request_queue.begin_sleep_transition(tag.value
                                                            for tag in tags)
@@ -2930,7 +2945,21 @@ class PyExecutor:
     def should_stop_processing(self) -> bool:
         return self.is_shutdown and len(self.active_requests) == 0 and \
             len(self.waiting_queue) == 0 and not self._has_pending_connector_transfers() and \
-            not self.disagg.has_retiring_gen_receives
+            not self.disagg.has_retiring_gen_receives and \
+            not self._has_pending_context_retirement()
+
+    def _has_pending_context_retirement(self) -> bool:
+        """Keep qualified source retirement live after the logical result leaves.
+
+        Returns:
+            Whether a source claim still awaits TP-agreed retirement. All
+            qualified cleanup paths retain these claims until group settlement.
+        """
+        transfers = getattr(self, "async_transfer_manager", None)
+        return (getattr(self, "kv_cache_transceiver", None) is not None
+                and transfers is not None and any(
+                    self.disagg.supports_logical_context_cancellation(req)
+                    for req in transfers.requests_in_transfer().values()))
 
     def _has_pending_connector_transfers(self) -> bool:
         connector = getattr(self, "kv_connector_manager", None)
@@ -5446,9 +5475,16 @@ class PyExecutor:
 
         self._handle_control_request()
 
+        new_requests = self._progress_context_cancellations(new_requests)
         new_requests = self._cancel_waiting_disagg_requests(new_requests)
         self.disagg.prepare_context_schedulable(new_requests)
         self.disagg.poll_gen_transfers()
+        supports_gen_cancel = getattr(self.kv_cache_transceiver,
+                                      "supports_logical_gen_cancellation", None)
+        if callable(supports_gen_cancel) and supports_gen_cancel() is True:
+            # The symmetric receive poll commits TP-wide logical decisions.
+            # Apply them before GEN_INIT can enter this iteration's scheduler.
+            new_requests = self._cancel_waiting_disagg_requests(new_requests)
         self._activate_completed_remote_tails()
         self.disagg.check_transfer_timeouts()
         # After the polls so a transfer that completed this iteration releases
@@ -6666,7 +6702,8 @@ class PyExecutor:
             drained = (len(self.active_requests) == 0
                        and len(self.waiting_queue) == 0
                        and not self._has_pending_connector_transfers()
-                       and not self.disagg.has_retiring_gen_receives)
+                       and not self.disagg.has_retiring_gen_receives
+                       and not self._has_pending_context_retirement())
             if self.enable_attention_dp and self.dist.world_size != 1:
                 # Attention-DP ranks drain independently (per-rank queues), and
                 # the retire below issues attention-DP gathers that every rank
@@ -8041,27 +8078,66 @@ class PyExecutor:
             if validate_mm is not None:
                 validate_mm(mm_data)
 
+    def _fetch_drain_cancellations(
+            self, waiting_queue: WaitingQueue) -> List[RequestQueueItem]:
+        """Fetch only cancellations for work already on this side of the control."""
+        retained = self.async_transfer_manager.requests_in_transfer().values()
+        request_ids = {item.id for item in waiting_queue}
+        request_ids.update(
+            req.parent_request_id if req.is_child else req.py_request_id
+            for req in itertools.chain(self.active_requests, retained))
+        client_ids = {req.py_client_id for req in retained}
+        if self.enable_attention_dp:
+            # Every bridge rank enters this fixed drain-fetch slot, including
+            # empty ranks. Rank zero need not own the request being cancelled.
+            participants = self.dist.tp_allgather((request_ids, client_ids))
+            request_ids = set().union(*(ids for ids, _ in participants))
+            client_ids = set().union(*(ids for _, ids in participants))
+        if self.dist.rank != 0:
+            return []
+        self.request_accumulated.extend(
+            self.executor_request_queue.get_from_request_queue(
+                datetime.timedelta(0), wait_for_batch=False))
+        cancellations = []
+        deferred = []
+        for item in self.request_accumulated:
+            matches_existing = (item.id in request_ids
+                                if item.cancel_context_client_id is None else
+                                item.cancel_context_client_id in client_ids)
+            if item.is_canceled_request and matches_existing:
+                cancellations.append(item)
+            else:
+                # In particular, a cancel for a submit behind the control must
+                # stay with that submit, not be consumed as an unknown request.
+                deferred.append(item)
+        self.request_accumulated[:] = deferred
+        return cancellations
+
     def _fetch_and_enqueue_requests(self, waiting_queue: WaitingQueue,
                                     total_num_live_requests: int) -> None:
         """Fetch requests from request_queue and enqueue to waiting_queue."""
         connector = self.kv_connector_manager
         control_pending = len(self.control_requests) != 0
-        # ADP polls owner-local completions before routing. All owners must
-        # skip this broadcast together while a control request drains. TP
-        # still needs the broadcast to deliver rank-zero prefix completions.
-        if control_pending and (self.enable_attention_dp or not (
-                connector is not None and connector.prefix_reservations_enabled
-                and connector.has_pending_loads())):
-            return
+        # Continue the existing broadcast slot for cancellations during drain.
+        # The request-independent capability selects the same bridge on every
+        # ADP rank; unqualified ADP and connector controls keep their old path.
+        if control_pending and self.enable_attention_dp:
+            transceiver = self.kv_cache_transceiver
+            if (not self.control_requests[0].control_requires_drain
+                    or connector is not None or transceiver is None
+                    or transceiver.supports_idle_request_cancellation()
+                    is not True):
+                return
 
         # Calculate timeout. Never wait once the shutdown sentinel has been
         # consumed: no further item will arrive to wake a blocking get(), so
         # blocking would keep the loop from reaching the
         # `should_stop_processing` check that ends it, deadlocking shutdown()
         # on `shutdown_event`.
-        pending_retirement = self.disagg.has_retiring_gen_receives
-        idle = (total_num_live_requests == 0 and len(waiting_queue) == 0
-                and not self.is_shutdown
+        pending_retirement = (self.disagg.has_retiring_gen_receives
+                              or self._has_pending_context_retirement())
+        idle = (not control_pending and total_num_live_requests == 0
+                and len(waiting_queue) == 0 and not self.is_shutdown
                 and not self._has_pending_connector_transfers()
                 and not pending_retirement)
         if idle:
@@ -8074,7 +8150,10 @@ class PyExecutor:
 
         # Fetch requests from rank 0
         new_requests = []
-        if self.dist.rank == 0 and not control_pending:
+        if control_pending:
+            if self.control_requests[0].control_requires_drain:
+                new_requests = self._fetch_drain_cancellations(waiting_queue)
+        elif self.dist.rank == 0:
             # Process accumulated requests that were queued during control request handling.
             if len(self.request_accumulated) != 0:
                 new_requests.extend(self.request_accumulated)
@@ -8082,6 +8161,8 @@ class PyExecutor:
                 # Reset timeout to 0 to avoid hanging when no new requests are available
                 timeout = datetime.timedelta(0)
             with self.hang_detector.pause():
+                # Zero queue timeout does not disable waiting to fill a batch.
+                # Retirement and shutdown must keep progressing without arrivals.
                 new_requests.extend(
                     self.executor_request_queue.get_from_request_queue(
                         timeout,
@@ -8529,7 +8610,21 @@ class PyExecutor:
                 self.is_shutdown = True
                 break
             elif req_item.is_canceled_request:
-                self.canceled_req_ids.append(req_item.id)
+                if req_item.cancel_context_client_id is None:
+                    self.canceled_req_ids.append(req_item.id)
+                else:
+                    # Never reinterpret a client ID as an executor ID. A late
+                    # abort applies only to its still-retained CTX transfer.
+                    transfers = getattr(self, "async_transfer_manager", None)
+                    if transfers is not None:
+                        for req in transfers.requests_in_transfer().values():
+                            if (req.py_client_id
+                                    == req_item.cancel_context_client_id
+                                    and self.disagg.
+                                    supports_logical_context_cancellation(req)):
+                                self.canceled_req_ids.append(
+                                    req.parent_request_id if req.
+                                    is_child else req.py_request_id)
             elif req_item.is_control_request:
                 self.control_requests.append(req_item)
                 if self.dist.rank == 0:
@@ -11170,7 +11265,7 @@ class PyExecutor:
             if (generation_waiting
                     and id(request) in self._held_transfer_failures()):
                 # Progress retirement without replacing the earlier executor error.
-                if self.disagg.request_cancellation(request):
+                if self.disagg.request_cancellation(request, failed=True):
                     request.state = LlmRequestState.DISAGG_TRANS_ERROR
                 continue
             logically_cancelled = (generation_waiting and
@@ -11217,6 +11312,79 @@ class PyExecutor:
             req for req in new_requests if req.py_request_id not in retired_ids
         ]
 
+    def _progress_context_cancellations(
+            self, new_requests: List[LlmRequest]) -> List[LlmRequest]:
+        """Cancel qualified model-idle CTX work without waiting for its I/O.
+
+        Retained transfers are visited even after their context result was
+        emitted. A previous overlap batch still owns model work and reaches
+        the ordinary post-forward cancellation boundary instead.
+
+        Args:
+            new_requests: Requests activated before this scheduling boundary.
+
+        Returns:
+            Newly activated requests that remain eligible for scheduling.
+        """
+        if (not self.canceled_req_ids or self.kv_cache_transceiver is None
+                or getattr(self, "kv_connector_manager", None) is not None):
+            return new_requests
+        previous = getattr(self, "previous_batch", None)
+        model_owned = ({
+            id(req)
+            for req in previous.scheduled_requests.all_requests()
+        } if previous is not None else set())
+        cancelled = set(self.canceled_req_ids)
+        transfers = self.async_transfer_manager.requests_in_transfer()
+        candidates = {id(req): req for req in self.active_requests}
+        candidates.update({id(req): req for req in transfers.values()})
+        completed = set()
+        deferred = set()
+        removed = set()
+        for request in candidates.values():
+            cancel_id = (request.parent_request_id
+                         if request.is_child else request.py_request_id)
+            if (cancel_id not in cancelled
+                    or not self.disagg.supports_logical_context_cancellation(
+                        request)):
+                continue
+            if (id(request) in model_owned or request.py_request_id in getattr(
+                    self, "inflight_req_ids", ())):
+                deferred.add(cancel_id)
+                continue
+            if not self.disagg.request_logical_context_cancellation(request):
+                deferred.add(cancel_id)
+                continue
+            completed.add(cancel_id)
+            if (request not in self.active_requests
+                    or request.state in (LlmRequestState.GENERATION_COMPLETE,
+                                         LlmRequestState.DISAGG_TRANS_ERROR)):
+                # Its prior result is immutable; only transfer obligations
+                # remain. The reaper, not this notification, retires them.
+                continue
+            request.py_kv_transfer_timed_out = False
+            request.finish_by_reason(FinishReason.CANCELLED)
+            request.decoding_iter = request.py_decoding_iter
+            response = request.create_response()
+            if response is not None:
+                response.result.cached_tokens = request.cached_tokens
+                self._pending_transfer_responses.append(
+                    (request.py_request_id, response))
+            self._pending_response_terminations.append(request)
+            removed.add(id(request))
+        self.active_requests[:] = [
+            req for req in self.active_requests if id(req) not in removed
+        ]
+        self.canceled_req_ids[:] = [
+            rid for rid in self.canceled_req_ids
+            if rid not in completed or rid in deferred
+        ]
+        # This profile is PP1/non-ADP. All TP ranks reach this same boundary;
+        # a request with a transfer claim remains protected at termination.
+        if removed:
+            self._flush_pending_transfer_responses()
+        return [req for req in new_requests if id(req) not in removed]
+
     def _try_cancel_request(self, request: LlmRequest) -> bool:
         """Check if a request can be canceled and attempt cancellation if needed.
 
@@ -11247,7 +11415,7 @@ class PyExecutor:
                 and id(request) in self._held_transfer_failures()
                 and self.kv_cache_transceiver.
                 supports_idle_request_cancellation(request) is True):
-            if self.disagg.request_cancellation(request):
+            if self.disagg.request_cancellation(request, failed=True):
                 request.state = LlmRequestState.DISAGG_TRANS_ERROR
             return False
 
@@ -11256,6 +11424,15 @@ class PyExecutor:
         if (not self._kv_connector_moves_kv
                 and self.disagg.cancel_gen_logically(request)):
             return True
+        if self.disagg.owns_gen_cancellation(request):
+            # The local destination may already be safe while a TP peer is
+            # still deciding its outcome or retaining an accessor.
+            return self.disagg.request_cancellation(request)
+        if (connector is None
+                and self.disagg.supports_logical_context_cancellation(request)):
+            if request.py_request_id in getattr(self, "inflight_req_ids", ()):
+                return False
+            return self.disagg.request_logical_context_cancellation(request)
 
         async_transfer_manager = getattr(self, "async_transfer_manager", None)
         if (getattr(request, "is_context_only_request", False) is True
@@ -11289,6 +11466,15 @@ class PyExecutor:
         for request in self.active_requests:
             req_id = request.py_request_id if not request.is_child else request.parent_request_id
             if req_id not in canceled_req_ids_set:
+                continue
+
+            if (self.kv_cache_transceiver is not None and
+                    self.disagg.supports_logical_context_cancellation(request)
+                    and request.state in (LlmRequestState.GENERATION_COMPLETE,
+                                          LlmRequestState.DISAGG_TRANS_ERROR)):
+                if not self.disagg.request_logical_context_cancellation(
+                        request):
+                    still_pending_canceled_ids.append(req_id)
                 continue
 
             is_cancelled = self._try_cancel_request(request)
