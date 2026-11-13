@@ -26,6 +26,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from typing import Any, List
 
 import cloudpickle
@@ -1952,6 +1953,117 @@ def test_autotune_post_tune_merge_before_save(tmp_path):
     # The temporary full-world distributed state was restored.
     assert tuner.mapping is prev_mapping
     assert tuner._dist is prev_dist
+
+
+_CACHE_IO_ROUNDS = 50
+
+
+def _save_and_load_while_peers_do(cache_path, rank, num_procs):
+    """Each round, save a new entry to `cache_path` and reload the file."""
+    shared_op = "autotuner_test::cache_io_shared"
+    rank_op = "autotuner_test::cache_io_rank"
+    cache_dir = os.path.dirname(cache_path)
+    open(os.path.join(cache_dir, f"ready_{rank}"), "w").close()
+    # Start together so the saves and loads of all processes interleave.
+    deadline = time.monotonic() + 300
+    while sum(f.startswith("ready_")
+              for f in os.listdir(cache_dir)) < num_procs:
+        assert time.monotonic() < deadline, "peers did not start"
+        time.sleep(0.01)
+
+    cache = autotuner.AutoTunerProfilingCache()
+    cache.add_independent_op(shared_op, DistributedTuningStrategy.MERGE)
+    for i in range(_CACHE_IO_ROUNDS):
+        rank_key = (rank_op, "Runner", "()", ((rank, i), ))
+        cache.cache[rank_key] = (0, i, 1.0)
+        # Every process holds the same merged entry; one of them saves it.
+        cache.cache[(shared_op, "Runner", "()", ((i, ), ))] = (0, i, 1.0)
+        if rank != 0:
+            # Must not reach the file: only rank 0 writes the shared section.
+            extra_key = (shared_op, "Runner", "()", ((-rank, i), ))
+            cache.cache[extra_key] = (0, 0, 1.0)
+        cache.save_cache(cache_path, rank, write_shared=rank == 0)
+        reloaded = autotuner.AutoTunerProfilingCache()
+        reloaded.load_cache(cache_path, rank)
+        assert reloaded.cache[rank_key] == (0, i, 1.0)
+    return True
+
+
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_cache_saves_and_loads_from_concurrent_processes(
+        tmp_path, mpi_pool_executor):
+    """Processes saving to and loading from one cache file lose no entries."""
+    cache_path = str(tmp_path / "cache.json")
+    num_procs = mpi_pool_executor.num_workers + 1
+    peers = mpi_pool_executor.map(
+        _save_and_load_while_peers_do,
+        *zip(*[(cache_path, rank, num_procs) for rank in range(1, num_procs)]))
+    assert _save_and_load_while_peers_do(cache_path, 0, num_procs)
+    assert all(peers)
+
+    with open(cache_path) as f:
+        saved = json.load(f)
+    for rank in range(num_procs):
+        assert len(saved[f"rank_{rank}"]) == _CACHE_IO_ROUNDS
+    assert len(saved["shared"]) == _CACHE_IO_ROUNDS
+
+
+_HOLD_LOCK = """
+import fcntl, os, sys
+fd = os.open(sys.argv[1], os.O_CREAT | os.O_RDWR, 0o644)
+fcntl.lockf(fd, fcntl.LOCK_EX)
+print("locked", flush=True)
+sys.stdin.read()
+"""
+
+
+def test_cache_save_is_skipped_while_another_process_holds_the_lock(
+        tmp_path, monkeypatch):
+    """A save that cannot take the writer lock in time is skipped with one
+    warning; loads and the process carry on and keep the unsaved entry."""
+    path = tmp_path / "cache.json"
+    saved_key = ("autotuner_test::cache_lock", "Runner", "()", ((1, ), ))
+    new_key = ("autotuner_test::cache_lock", "Runner", "()", ((2, ), ))
+    cache = autotuner.AutoTunerProfilingCache()
+    cache.cache[saved_key] = (0, 1, 1.0)
+    cache.save_cache(path, rank=0)
+    saved_text = path.read_text()
+
+    warnings = []
+    monkeypatch.setattr(autotuner.logger, "warning", warnings.append)
+
+    def skips():
+        return sum("Skipped saving" in w for w in warnings)
+
+    monkeypatch.setenv("TLLM_AUTOTUNER_CACHE_LOCK_TIMEOUT", "1")
+    # The holder keeps the lock until its stdin closes when the block exits.
+    with subprocess.Popen([sys.executable, "-c", _HOLD_LOCK, f"{path}.lock"],
+                          stdin=subprocess.PIPE,
+                          stdout=subprocess.PIPE,
+                          text=True) as holder:
+        assert holder.stdout.readline() == "locked\n"
+        reloaded = autotuner.AutoTunerProfilingCache()
+        reloaded.load_cache(path, rank=0)
+        assert reloaded.cache[saved_key] == (0, 1, 1.0)
+        # Nothing new: no need for the lock, so no wait and no skip.
+        reloaded.save_cache(path, rank=0)
+        assert skips() == 0
+
+        cache.cache[new_key] = (0, 2, 2.0)
+        start = time.monotonic()
+        cache.save_cache(path, rank=0)
+        assert 1.0 <= time.monotonic() - start < 30.0
+        assert skips() == 1
+        assert path.read_text() == saved_text
+        # A later load (the next autotune session) keeps the unsaved entry.
+        cache.load_cache(path, rank=0)
+        assert cache.cache[new_key] == (0, 2, 2.0)
+
+    cache.save_cache(path, rank=0)
+    reloaded = autotuner.AutoTunerProfilingCache()
+    reloaded.load_cache(path, rank=0)
+    assert reloaded.cache[new_key] == (0, 2, 2.0)
+    assert skips() == 1
 
 
 def _post_tune_merge_worker(world_size):
