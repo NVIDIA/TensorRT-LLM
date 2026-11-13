@@ -596,12 +596,9 @@ __global__ void __launch_bounds__(kHeads * 32)
             amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, off));
         float rcp;
         asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(rcp) : "f"(448.0F));
-        // LC2's UE8M0 exponent (minimaxM3Sm107Tp2SparseDecodeLc2.cu), so both launches write the same bytes.
-        float const sfv = amax * rcp;
-        int const bits = __float_as_int(sfv);
-        int e = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0);
-        e = min(e, 254);
-        float const qs = amax != 0.F ? __int_as_float((254 - e) << 23) : 0.F;
+        int const e = __nv_cvt_float_to_e8m0(amax * rcp, __NV_SATFINITE, cudaRoundPosInf);
+        // trtllm::mxfp8_quantize's scale: byte 0 (0 < amax <= 448 * 2^-127) quantizes to zero like an all-zero block.
+        float const qs = amax != 0.F && e != 0 ? __int_as_float((254 - e) << 23) : 0.F;
         uint8_t q8v[4];
 #pragma unroll
         for (int i = 0; i < 4; ++i)

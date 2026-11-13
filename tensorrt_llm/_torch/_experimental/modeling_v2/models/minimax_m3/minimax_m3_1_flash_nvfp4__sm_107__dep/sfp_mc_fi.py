@@ -106,8 +106,8 @@ def prebuild(device: Optional[torch.device] = None) -> Optional[torch.Tensor]:
 def _outside_contract(probs, seed, offset) -> Optional[tuple[str, str]]:
     """Why the inputs fall outside the kernel's contract, as (reason, the offending value), or None inside it: float32
     CUDA [rows, vocab] probs with a unit inner stride, a row stride divisible by 4 and 16-byte alignment (1..MAX_ROWS
-    rows, vocab divisible by 4 and <= MAX_VOCAB), and contiguous int64 seed / offset with at least one entry on the
-    probs' device."""
+    rows, vocab divisible by 4 and <= MAX_VOCAB), and contiguous 1-D int64 seed / offset on the probs' device with one
+    entry or one per row (FlashInfer 0.7.2 broadcasts the first and indexes the second by row)."""
     for name, t in (("probs", probs), ("seed", seed), ("offset", offset)):
         if not isinstance(t, torch.Tensor):
             return "probs / seed / offset not all tensors", f"{name} is {type(t).__name__}"
@@ -129,8 +129,8 @@ def _outside_contract(probs, seed, offset) -> Optional[tuple[str, str]]:
     for name, t in (("seed", seed), ("offset", offset)):
         if t.dtype != torch.int64:
             return f"{name} not int64", str(t.dtype)
-        if t.numel() < 1:
-            return f"{name} empty", "0 entries"
+        if t.dim() != 1 or t.numel() not in (1, rows):
+            return f"{name} not one entry or one per row", str(tuple(t.shape))
         if not t.is_contiguous():
             return f"{name} not contiguous", str(t.stride())
         if t.device != probs.device:

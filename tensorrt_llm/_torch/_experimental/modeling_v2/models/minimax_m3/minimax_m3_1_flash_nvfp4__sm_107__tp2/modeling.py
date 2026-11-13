@@ -3921,8 +3921,8 @@ def _next_norm(core, i: int) -> torch.Tensor:
 # The core
 # --------------------------------------------------------------------------------------------------------------------
 
-# Engine states (compiled kernel + workspace) per (device, token count[, shared fold]), shared by every layer: a step
-# runs the layers one after another on one stream.
+# Engine states (compiled kernel + workspace) per (device, token count, shared fold, MOE_HANDOFF tables), shared by
+# every layer: a step runs the layers one after another on one stream.
 _ENGINE_STATES: Dict[tuple, object] = {}
 _MOE16_STATES: Dict[tuple, object] = {}
 # TP2WC_MOE_ENGINE states (the reference engine on the m3_moe state of the same key), per (device, token count, B2LAG,
@@ -4527,7 +4527,7 @@ class MiniMaxM3Tp2ModelingV2(DecoderModel):
         pairs = [(self.w[f"l{i}_e_w31"], self.w[f"l{i}_e_w2"]) for i in sorted(self.moe_layers)]
         device = pairs[0][0].device
         try:
-            ours = self._engine_state(device, TP2WC_DIE_LOCAL_ROWS, True)
+            ours = self._engine_state(device, TP2WC_DIE_LOCAL_ROWS, True, handoff=False)
             dl = _die_local.prepare(ours, pairs, hidden=int(pairs[0][1].shape[1]))
         except Exception as err:  # any probe / placement failure (incl. a LocalityMap assert): plain roles, same bits
             logger.warning(
@@ -4631,17 +4631,22 @@ class MiniMaxM3Tp2ModelingV2(DecoderModel):
         )
 
     @staticmethod
-    def _engine_state(device: torch.device, num_tokens: int, shared: bool) -> object:
-        """The m3_moe state (compiled kernel + workspace) every layer's engine at ``num_tokens`` shares."""
-        state = _ENGINE_STATES.get((str(device), num_tokens, shared))
+    def _engine_state(
+        device: torch.device, num_tokens: int, shared: bool, handoff: Optional[bool] = None
+    ) -> object:
+        """The m3_moe state (compiled kernel + workspace) every layer's engine at ``num_tokens`` shares. ``handoff``:
+        the MOE_HANDOFF tables (None: the kill switch's default; False: the plain m3_moe schedule)."""
+        key = (str(device), num_tokens, shared, handoff)
+        state = _ENGINE_STATES.get(key)
         if state is None:
             sms = torch.cuda.get_device_properties(device).multi_processor_count
-            state = _ENGINE_STATES[(str(device), num_tokens, shared)] = M3MoeState(
+            state = _ENGINE_STATES[key] = M3MoeState(
                 device,
                 num_tokens=num_tokens,
                 num_ctas=sms
                 - (shared_ctas_for(num_tokens, shared) if shared else MOE_ENGINE_RESERVED_SMS),
                 shared=shared,
+                handoff=handoff,
             )
         return state
 
@@ -4652,7 +4657,9 @@ class MiniMaxM3Tp2ModelingV2(DecoderModel):
         ValueError / ImportError (m3_moe then serves)."""
         tensors, scale = self._expert_operands(i)
         device = tensors[0].device
-        ours = self._engine_state(device, num_tokens, True)
+        # The reference engine runs on m3_moe's plain schedule (tagged-record keys off): the MOE_HANDOFF tables are
+        # m3_moe kernel scheduling the reference kernel does not have (tp4_moe_engine.NOT_TAKEN_KEYS).
+        ours = self._engine_state(device, num_tokens, True, handoff=False)
         dl = getattr(self, "_die_local", None) if num_tokens == TP2WC_DIE_LOCAL_ROWS else None
         # DIE_LOCAL first when prepared; if its build fails, the plain-role engine (same bits) instead of m3_moe
         for use_dl in (True, False) if dl is not None else (False,):

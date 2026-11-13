@@ -126,6 +126,7 @@ def test_lc2_hook_runs_the_op_on_a_taken_call(monkeypatch):
     calls = []
     monkeypatch.setattr(lc2_decode, "lc2_op", lambda: lambda *a: calls.append(a))
     monkeypatch.setattr(lc2_decode, "DEP_LC2_PDL", True)
+    monkeypatch.setattr(lc2_decode, "LC2_SPLIT", True)
     args, kwargs = _decode_call(reqs=40)
     lc2_decode.dep_lc2_decode(*args, **kwargs)
     (call,) = calls
@@ -135,7 +136,7 @@ def test_lc2_hook_runs_the_op_on_a_taken_call(monkeypatch):
     assert call[3] is kwargs["k_block_scale"] and call[6] is kwargs["v_global_scale"]
     out = call[10]
     assert out.shape == (320, 8192) and out.data_ptr() == kwargs["output"].data_ptr()
-    assert call[11:] == (None, None, 64, 8, kwargs["sm_scale"], False, True, False, None)
+    assert call[11:] == (None, None, 64, 8, kwargs["sm_scale"], False, True, False, None, True)
 
 
 @pytest.mark.parametrize(
@@ -146,10 +147,22 @@ def test_lc2_pdl_launches_only_the_split_grid(monkeypatch, reqs, enabled, use_pd
     calls = []
     monkeypatch.setattr(lc2_decode, "lc2_op", lambda: lambda *a: calls.append(a))
     monkeypatch.setattr(lc2_decode, "DEP_LC2_PDL", enabled)
+    monkeypatch.setattr(lc2_decode, "LC2_SPLIT", True)
     args, kwargs = _decode_call(reqs=reqs)
     lc2_decode.dep_lc2_decode(*args, **kwargs)
     (call,) = calls
-    assert call[16:] == (False, use_pdl, False, None)
+    assert call[16:] == (False, use_pdl, False, None, True)
+
+
+@pytest.mark.parametrize("allow_split", [True, False])
+def test_lc2_passes_the_split_kill_switch_as_allow_split(monkeypatch, allow_split):
+    calls = []
+    monkeypatch.setattr(lc2_decode, "lc2_op", lambda: lambda *a: calls.append(a))
+    monkeypatch.setattr(lc2_decode, "LC2_SPLIT", allow_split)
+    args, kwargs = _decode_call(reqs=40)
+    lc2_decode.dep_lc2_decode(*args, **kwargs)
+    (call,) = calls
+    assert call[-1] is allow_split
 
 
 def _no_stock_decode(monkeypatch):

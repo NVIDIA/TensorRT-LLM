@@ -31,16 +31,17 @@ namespace kernels
 namespace minimaxM31
 {
 
-//! REJ_MC_FI: FlashInfer 0.6.18's chain speculative sampling (include/flashinfer/sampling.cuh,
+//! REJ_MC_FI: FlashInfer 0.7.2's chain speculative sampling (include/flashinfer/sampling.cuh,
 //! ChainSpeculativeSampling<1024, BLOCK_SCAN_WARP_SCANS, BLOCK_REDUCE_WARP_REDUCTIONS, 4, DETERMINISTIC = true>, the
 //! kernel behind flashinfer.sampling.chain_speculative_sampling(deterministic=True) with tensor seed / offset) as ONE
 //! launch of batch x ctasPerRow CTAs (1024 threads each) instead of one CTA per request. Same inputs and outputs as
 //! invokeChainSpecSamplingMc ([batch, numDraft + 1] tokens padded with -1, [batch] counts = accepted + 1).
 //!
 //! Bitwise contract vs FlashInfer's kernel (tokens and counts):
-//!   1. Philox: every CTA of a request replays FlashInfer's stream, curand_init(seed[0], request, offset[0]) (element
-//!      0 of the seed / offset tensors for every request, as FlashInfer reads them), the acceptance draws up to the
-//!      first rejection, the counting loop's draws from that position on, then the resampling draw u;
+//!   1. Philox: every CTA of a request replays FlashInfer's stream, curand_init(seed[request], request,
+//!      offset[request]) (one seed / offset entry per request, which FlashInfer 0.7.2 indexes by request), the
+//!      acceptance draws up to the first rejection, the counting loop's draws from that position on, then the
+//!      resampling draw u;
 //!   2. each 4096-element chunk's sum of max(target - draft, 0) (draft 0 for the bonus row) is FlashInfer's cub
 //!      BlockReduce<float, 1024, WARP_REDUCTIONS>::Sum over the same per-thread vec4; each chunk's last index with mass
 //!      is a max (order-free);

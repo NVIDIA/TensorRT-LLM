@@ -53,9 +53,22 @@ def worker_method(
     return namespace[name]
 
 
+def module_constant(name: str, source: str = "dspark.py"):
+    """A module-level literal of the served source (e.g. a tuple of names), read without importing it."""
+    tree = ast.parse((TARGET / source).read_text())
+    node = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == name for t in n.targets)
+    )
+    return ast.literal_eval(node.value)
+
+
 class TestTP8Chain(unittest.TestCase):
     def prebuild(self, killed: set[str], *, his=(0, 0), stop="mx ="):
         ns = {
+            "_WORKER_HOOKS": module_constant("_WORKER_HOOKS"),
             "functools": functools,
             "m31_disabled": killed.__contains__,
             "s10_applies": lambda _: True,

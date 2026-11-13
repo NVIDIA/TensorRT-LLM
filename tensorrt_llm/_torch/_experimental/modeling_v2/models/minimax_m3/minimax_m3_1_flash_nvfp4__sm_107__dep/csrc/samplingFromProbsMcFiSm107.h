@@ -33,7 +33,7 @@ namespace minimaxM31
 //! The largest vocabulary invokeSamplingFromProbsMcFi takes (64 chunks of 4096).
 constexpr int32_t kSamplingFromProbsMcMaxVocab = 64 * 4096;
 
-//! SFP_MC_FI: FlashInfer 0.6.18's categorical sampling from probabilities (include/flashinfer/sampling.cuh,
+//! SFP_MC_FI: FlashInfer 0.7.2's categorical sampling from probabilities (include/flashinfer/sampling.cuh,
 //! SamplingFromProbKernel<1024, BLOCK_SCAN_WARP_SCANS, BLOCK_REDUCE_WARP_REDUCTIONS, 4, DETERMINISTIC = true>, the
 //! kernel behind flashinfer.sampling.sampling_from_probs(deterministic=True) with tensor seed / offset) as ONE launch
 //! of rows x ctasPerRow CTAs (1024 threads each) instead of one CTA per row: one int32 token per row.
@@ -43,8 +43,9 @@ constexpr int32_t kSamplingFromProbsMcMaxVocab = 64 * 4096;
 //! split over the row's CTAs, so its time does not depend on the draw.
 //!
 //! Bitwise contract vs FlashInfer's kernel (tokens):
-//!   1. u = curand_uniform of curand_init(seed[0], row, offset[0]) (element 0 of the seed / offset tensors for every
-//!      row, as FlashInfer reads them), unscaled;
+//!   1. u = curand_uniform of curand_init(seed[row * seedStride], row, offset[row * offsetStride]), unscaled: as
+//!      FlashInfer 0.7.2 reads them, a stride is 1 for a tensor with one entry per row and 0 for a one-entry tensor
+//!      broadcast to every row;
 //!   2. each chunk's sum of (p > 0 ? p : 0) is FlashInfer's cub BlockReduce<float, 1024, WARP_REDUCTIONS>::Sum over the
 //!      same per-thread vec4; each chunk's last index with p > 0 is a max (order-free);
 //!   3. one CTA walks the chunks in order with FlashInfer's fp32 adds up to the first chunk where aggregate + sum > u,
@@ -64,9 +65,9 @@ constexpr int32_t kSamplingFromProbsMcMaxVocab = 64 * 4096;
 //! Workspace: samplingFromProbsMcFiWorkspaceBytesPerRow() x rows bytes, 16-byte aligned, ZERO-initialized once before
 //! the first launch and then reused as is (each launch adds 1024 to a row's arrival counter whatever its ctasPerRow, so
 //! the counter needs no reset; CUDA-graph safe). Launches that share one workspace must be stream-ordered.
-cudaError_t invokeSamplingFromProbsMcFi(float const* probs, int64_t rowStride, int64_t const* seed,
-    int64_t const* offset, int32_t* outputTokenIds, int32_t rows, int32_t vocabSize, int ctasPerRow, void* workspace,
-    cudaStream_t stream);
+cudaError_t invokeSamplingFromProbsMcFi(float const* probs, int64_t rowStride, int64_t const* seed, int32_t seedStride,
+    int64_t const* offset, int32_t offsetStride, int32_t* outputTokenIds, int32_t rows, int32_t vocabSize,
+    int ctasPerRow, void* workspace, cudaStream_t stream);
 
 //! Workspace bytes per row of invokeSamplingFromProbsMcFi.
 size_t samplingFromProbsMcFiWorkspaceBytesPerRow();

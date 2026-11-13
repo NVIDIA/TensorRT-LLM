@@ -1,10 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """DEP_SFP_MC_FI on an SM107 GPU: ``sfp_mc_fi.sampling_from_probs_mc_fi`` returns FlashInfer's
-``sampling_from_probs(deterministic=True)`` tokens bit for bit (int64 seed / offset tensors), on spread and
-frequency-skewed rows at DEP's row counts, with the drawn token in the first or the last chunk, on FlashInfer's
-fallbacks (rows summing below u, all-zero rows), on padding rows, on denormal probabilities, at every ctas_per_row and
-under CUDA-graph replay."""
+``sampling_from_probs(deterministic=True)`` tokens bit for bit (int64 seed / offset tensors, one per row or one for
+every row), on spread and frequency-skewed rows at DEP's row counts, with the drawn token in the first or the last
+chunk, on FlashInfer's fallbacks (rows summing below u, all-zero rows), on padding rows, on denormal probabilities, at
+every ctas_per_row and under CUDA-graph replay."""
 
 import pytest
 import torch
@@ -64,6 +64,15 @@ def test_bitwise_flashinfer_at_deps_row_counts(rows, mode):
     for k in range(6):
         probs = _probs(rows, 10 * rows + k, mode, temp=(0.6, 0.8, 1.0)[k % 3])
         _assert_same(probs, *_seeds(rows, k))
+
+
+@pytest.mark.parametrize("rows", [1, 12, 48])
+def test_bitwise_flashinfer_with_one_seed_and_offset_for_every_row(rows):
+    # FlashInfer 0.7.2 broadcasts a one-entry seed / offset tensor to every row (and indexes a per-row one by row).
+    for k in range(4):
+        probs = _probs(rows, 900 + rows + k)
+        s, o = _seeds(rows, 900 + k)
+        _assert_same(probs, s[:1].contiguous(), o[:1].contiguous())
 
 
 @pytest.mark.parametrize("mode", ["first", "last"])
