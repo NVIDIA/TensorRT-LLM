@@ -1301,6 +1301,7 @@ class BaseWorker(GenerationExecutor):
         prev_device_step_time_ms = stats[5] if len(stats) > 5 else None
         scheduler_mode = stats[6] if len(stats) > 6 else None
         gpu_forward_time_ms = stats[7] if len(stats) > 7 else None
+        fmha_step_stats = stats[8] if len(stats) > 8 else None
 
         stats_dict = json.loads(iteration_stats.to_json_str())
         # Always tag the row so Dynamo's adapter can read
@@ -1343,6 +1344,10 @@ class BaseWorker(GenerationExecutor):
         # CPU wall. Set per-record so consumers do not need server config.
         if scheduler_mode is not None:
             stats_dict["schedulerMode"] = scheduler_mode
+        # Cumulative per-step counters of the enabled FMHA libraries that keep
+        # them, by record field (e.g. sharedPrefixAttnStats).
+        if fmha_step_stats is not None:
+            stats_dict.update(fmha_step_stats)
 
         # Convert back to JSON string
         return json.dumps(stats_dict)

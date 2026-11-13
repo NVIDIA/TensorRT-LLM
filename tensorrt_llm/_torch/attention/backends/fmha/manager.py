@@ -35,10 +35,10 @@ from tensorrt_llm._torch.attention.backends.interface import (
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 
-from .combined import CombinedFmha
+from .combined import CombinedFmha, generation_rows_uniform
 from .interface import Fmha, FmhaPhase
 from .phased import PhasedFmha
-from .registry import get_enabled_fmha_lib_classes
+from .registry import get_enabled_fmha_lib_classes, step_planning_fmha_lib_classes
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.trtllm import (
@@ -132,6 +132,9 @@ class _FmhaCacheKey(NamedTuple):
     context_batch_size: int
     generation_batch_size: int
     generation_seq_len_q: int
+    # Whether every generation row carries generation_seq_len_q tokens: a row without drafts can
+    # sit next to 1 + K rows, and libraries that slice the tokens into equal rows decline that.
+    generation_rows_uniform: bool
     attention_mask_type: AttentionMaskType
     has_variable_window: bool
     use_spec_decoding: bool
@@ -142,6 +145,9 @@ class _FmhaCacheKey(NamedTuple):
     output_sf_dtype: torch.dtype | None
     # The query is the raw projection of a deferred prologue (Fmha.supports_deferred_prologue).
     deferred_prologue: bool
+    # Per-step plan state of the libraries that plan steps (Fmha.selection_cache_key):
+    # such a library supports a batch only as its plan says.
+    library_plans: tuple
 
 
 _FmhaCacheInputs = dict[str, str]
@@ -343,7 +349,17 @@ class FmhaManager:
         ):
             if fmha_cls.is_available(attn):
                 self.fmha_libs.append(fmha_cls(attn))
+        # Libraries of this layer that prepare() plans every step (Fmha.plan_step): their
+        # support follows that plan.
+        available = {type(fmha) for fmha in self.fmha_libs}
+        self._planning_libs = tuple(
+            fmha_cls for fmha_cls in step_planning_fmha_lib_classes() if fmha_cls in available
+        )
         self._layer_idx = getattr(attn, "layer_idx", None)
+        # Only a library that serves uniform generation rows alone makes the key check them.
+        self._keys_rows_uniform = any(
+            getattr(fmha, "requires_uniform_generation_rows", False) for fmha in self.fmha_libs
+        )
 
     def _announce(self, fmha: Fmha, cache_key: _FmhaCacheKey) -> None:
         # One line per library per layer is enough to tell which kernel
@@ -372,8 +388,10 @@ class FmhaManager:
         Batch size and generation Q length use ceiling grid buckets based on
         TRTLLM-Gen JIT warmup candidates. Each candidate and its predecessor
         are separate grid points so a support boundary at the candidate cannot
-        alias with the interval below it. Generation Q lengths are uniform in
-        the executor, including padded speculative-decoding batches.
+        alias with the interval below it. The executor pads linear
+        speculative-decoding rows to a uniform Q length, but a row without
+        drafts keeps one token, so with a library that serves only uniform
+        rows the key also records whether the generation rows are uniform.
 
         The batch fields describe the complete source scheduler batch, even
         when ``q`` contains only one compacted phase. Ordinary attention
@@ -404,10 +422,13 @@ class FmhaManager:
             metadata.num_generations, _FMHA_CACHE_BATCH_SIZE_GRID
         )
         generation_seq_len_q = 0
+        rows_uniform = True
         if attention_input_type != AttentionInputType.context_only and metadata.num_generations > 0:
             generation_num_tokens = q.shape[0]
             if attention_input_type == AttentionInputType.mixed:
                 generation_num_tokens -= metadata.num_ctx_tokens
+            if self._keys_rows_uniform:
+                rows_uniform = generation_rows_uniform(q, metadata, generation_num_tokens)
             generation_seq_len_q = generation_num_tokens // metadata.num_generations
             generation_seq_len_q = _normalize_fmha_cache_grid_value(
                 generation_seq_len_q, _FMHA_CACHE_SEQ_LEN_Q_GRID
@@ -418,6 +439,7 @@ class FmhaManager:
             context_batch_size=context_batch_size,
             generation_batch_size=generation_batch_size,
             generation_seq_len_q=generation_seq_len_q,
+            generation_rows_uniform=rows_uniform,
             attention_mask_type=attention_mask_type,
             has_variable_window=forward_args.variable_window_token_starts is not None,
             use_spec_decoding=metadata.use_spec_decoding,
@@ -426,6 +448,9 @@ class FmhaManager:
             output_sf_dtype=output_sf_dtype,
             deferred_prologue=(
                 forward_args.kv_append is not None and forward_args.kv_append.fold is not None
+            ),
+            library_plans=tuple(
+                fmha_cls.selection_cache_key(metadata) for fmha_cls in self._planning_libs
             ),
         )
 
@@ -510,6 +535,20 @@ class FmhaManager:
         generation_fmha = None
         for fmha in self.fmha_libs:
             if fmha.is_supported(q, k, v, metadata, forward_args):
+                # A higher-priority phased library that opted in already took the
+                # generation rows of this mixed batch: let this library serve only the
+                # context requests rather than the whole batch.
+                if (
+                    context_fmha is None
+                    and generation_fmha is not None
+                    and generation_fmha.pairs_with_whole_batch_context
+                    and forward_args.attention_input_type == AttentionInputType.mixed
+                    and generation_fmha is not fmha
+                    and self._serves_context_phase(fmha, q, k, v, metadata, forward_args)
+                ):
+                    combined_fmha = CombinedFmha(attn)
+                    combined_fmha.set_fmha_impls(fmha, generation_fmha, whole_batch_context=True)
+                    return combined_fmha
                 return fmha
 
             if not isinstance(fmha, PhasedFmha):
@@ -551,6 +590,20 @@ class FmhaManager:
             combined_fmha.set_fmha_impls(context_fmha, generation_fmha)
             return combined_fmha
         return None
+
+    @staticmethod
+    def _serves_context_phase(
+        fmha: Fmha,
+        q: torch.Tensor,
+        k: torch.Tensor | None,
+        v: torch.Tensor | None,
+        metadata: TrtllmAttentionMetadata,
+        forward_args: AttentionForwardArgs,
+    ) -> bool:
+        """Whether ``fmha``, which supports a whole mixed batch, can serve its context phase alone."""
+        return isinstance(fmha, PhasedFmha) and fmha.is_supported(
+            q, k, v, metadata, forward_args, phase=FmhaPhase.CONTEXT
+        )
 
     def _select_mla(
         self,

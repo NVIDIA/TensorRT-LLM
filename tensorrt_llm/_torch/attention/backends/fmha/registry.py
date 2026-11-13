@@ -13,15 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import os
 from typing import TypeAlias
 
 from .cute_dsl_mla import CuteDslMlaFmha
 from .fallback import FallbackFmha
+from .flash_attn4_generation import FlashAttn4GenerationFmha
 from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
 from .fp4_mla import Fp4MlaFmha
 from .interface import Fmha
 from .prims_ts import PrimsTSFmha
+from .sampling_shared_prefix import SamplingSharedPrefixFmha
 from .triton_custom_mask import TritonCustomMaskFmha
 
 FmhaCls: TypeAlias = type[Fmha]
@@ -64,6 +67,16 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
         # DeepSeek-V4 on SM100, so every other model and architecture never
         # sees it; everything else keeps the TRTLLM-Gen libraries below.
         "prims_ts_sparse_mla": PrimsTSSparseMlaFmha,
+        # Opt-in shared-prefix generation path (TLLM_FMHA_LIBS=+sampling_shared_prefix).
+        # It must precede flashinfer_trtllm_gen, which takes every generation
+        # batch it supports. It declines eager batches without a shared prefix
+        # but serves every batch it plans when a CUDA graph is captured for it,
+        # n = 1 requests included (each attended on its own).
+        "sampling_shared_prefix": SamplingSharedPrefixFmha,
+        # Opt-in FlashAttention-4 generation path on SM90 (TLLM_FMHA_LIBS=+flash_attn4_generation):
+        # decode and linear speculative verification. After sampling_shared_prefix, which takes the
+        # n-sample batches it plans.
+        "flash_attn4_generation": FlashAttn4GenerationFmha,
         # GQA decode layers (GqaDecodeSetup) only: dedicated generation kernels in order of precedence, then
         # trtllm-gen with the module's KV append / deferred prologue.
         "gqa_kv_replica_fused": GqaKvReplicaFusedFmha,
@@ -77,14 +90,25 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
 
 
 FMHA_LIBS: dict[str, FmhaCls] = init_fmha_libs()
-_OPT_IN_FMHA_LIBS: frozenset[str] = frozenset({"prims_ts"})
+# Libraries left out of the default set and enabled explicitly through
+# TLLM_FMHA_LIBS: dense PrimTS can add host overhead; sampling_shared_prefix is a
+# narrow-scope n-sample path (KV cache manager V2); flash_attn4_generation is an SM90 generation
+# path under evaluation.
+_OPT_IN_FMHA_LIBS: frozenset[str] = frozenset(
+    {"prims_ts", "sampling_shared_prefix", "flash_attn4_generation"}
+)
 DEFAULT_FMHA_LIBS: tuple[str, ...] = tuple(
     name for name in FMHA_LIBS if name not in _OPT_IN_FMHA_LIBS
 )
 
 
 def _parse_fmha_libs_env() -> tuple[str, ...]:
-    value = os.environ.get("TLLM_FMHA_LIBS")
+    return _parse_fmha_libs_value(os.environ.get("TLLM_FMHA_LIBS"))
+
+
+@functools.lru_cache(maxsize=8)
+def _parse_fmha_libs_value(value: str | None) -> tuple[str, ...]:
+    """Parse a ``TLLM_FMHA_LIBS`` value; cached because per-step host code queries it."""
     if value is None or not value.strip():
         return DEFAULT_FMHA_LIBS
 
@@ -128,10 +152,57 @@ def get_enabled_fmha_lib_classes() -> list[FmhaCls]:
     return [FMHA_LIBS[name] for name in _parse_fmha_libs_env()]
 
 
+def is_fmha_lib_enabled(name: str) -> bool:
+    """Whether ``TLLM_FMHA_LIBS`` (or the default set) enables ``name``."""
+    return name in _parse_fmha_libs_env()
+
+
+@functools.lru_cache(maxsize=8)
+def _step_planning_classes(names: tuple[str, ...]) -> tuple[FmhaCls, ...]:
+    return tuple(FMHA_LIBS[name] for name in names if FMHA_LIBS[name].plans_steps())
+
+
+@functools.lru_cache(maxsize=8)
+def _step_stats_classes(names: tuple[str, ...]) -> tuple[FmhaCls, ...]:
+    return tuple(FMHA_LIBS[name] for name in names if FMHA_LIBS[name].step_stats_field is not None)
+
+
+def step_planning_fmha_lib_classes() -> tuple[FmhaCls, ...]:
+    """Enabled libraries that plan every step (``Fmha.plan_step``); cached, prepare() calls it."""
+    return _step_planning_classes(_parse_fmha_libs_env())
+
+
+def step_stats_fmha_lib_classes() -> tuple[FmhaCls, ...]:
+    """Enabled libraries that keep per-step counters (``Fmha.step_stats``)."""
+    return _step_stats_classes(_parse_fmha_libs_env())
+
+
+def fmha_step_stats(kv_cache_manager: object) -> dict[str, dict[str, int]] | None:
+    """Cumulative per-step counters of the enabled libraries that keep them, for the steps attended
+    on ``kv_cache_manager``'s cache, by iteration-stats record field; None when no such library is
+    enabled. Cumulative, so a consumer that misses records still reads exact totals."""
+    classes = step_stats_fmha_lib_classes()
+    if not classes or kv_cache_manager is None:
+        return None
+    return {cls.step_stats_field: cls.step_stats(kv_cache_manager) for cls in classes}
+
+
+def reset_fmha_step_stats(kv_cache_manager: object) -> None:
+    """Zero the counters of ``kv_cache_manager`` (the executor drops its warmup steps)."""
+    if kv_cache_manager is not None:
+        for cls in step_stats_fmha_lib_classes():
+            cls.reset_step_stats(kv_cache_manager)
+
+
 __all__ = [
     "DEFAULT_FMHA_LIBS",
     "FMHA_LIBS",
     "FmhaCls",
+    "fmha_step_stats",
     "get_enabled_fmha_lib_classes",
     "init_fmha_libs",
+    "is_fmha_lib_enabled",
+    "reset_fmha_step_stats",
+    "step_planning_fmha_lib_classes",
+    "step_stats_fmha_lib_classes",
 ]

@@ -445,6 +445,45 @@ class TestSpecDecodingStats:
         collector.log_iteration_stats(stats)
 
 
+class TestSharedPrefixAttnStats:
+    """Cumulative shared-prefix attention counters become per-rank Prometheus increments."""
+
+    NAMES = {
+        "requestSteps": "trtllm_shared_prefix_attn_request_steps_total",
+        "shareableRequestSteps": "trtllm_shared_prefix_attn_shareable_request_steps_total",
+        "sharedRequestSteps": "trtllm_shared_prefix_attn_shared_request_steps_total",
+    }
+
+    def _values(self, collector, rank="0"):
+        labels = {**collector.labels, "dp_rank": rank}
+        return {key: REGISTRY.get_sample_value(name, labels) for key, name in self.NAMES.items()}
+
+    def test_counts_increase_per_rank(self, collector):
+        records = [
+            (0, {"requestSteps": 10, "shareableRequestSteps": 8, "sharedRequestSteps": 6}),
+            (1, {"requestSteps": 7, "shareableRequestSteps": 7, "sharedRequestSteps": 7}),
+            # A record was missed in between: the totals are still exact.
+            (0, {"requestSteps": 30, "shareableRequestSteps": 20, "sharedRequestSteps": 15}),
+            # The engine restarted its counts: new baseline, no increment.
+            (0, {"requestSteps": 4, "shareableRequestSteps": 4, "sharedRequestSteps": 4}),
+            (0, {"requestSteps": 9, "shareableRequestSteps": 6, "sharedRequestSteps": 5}),
+        ]
+        for rank, record in records:
+            collector.log_iteration_stats(
+                {"attentionDpRank": rank, "sharedPrefixAttnStats": record}
+            )
+        assert self._values(collector, "0") == {
+            "requestSteps": 35.0,
+            "shareableRequestSteps": 22.0,
+            "sharedRequestSteps": 16.0,
+        }
+        assert self._values(collector, "1") == {
+            "requestSteps": 7.0,
+            "shareableRequestSteps": 7.0,
+            "sharedRequestSteps": 7.0,
+        }
+
+
 class TestPartialStats:
     """Test that partial iteration stats don't cause errors."""
 

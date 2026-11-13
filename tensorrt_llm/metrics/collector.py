@@ -172,6 +172,7 @@ class MetricsCollector:
         self._registry = REGISTRY if registry is None else registry
         self._gauge_multiprocess_mode = gauge_multiprocess_mode
         Counter = partial(Counter, registry=self._registry)
+        self._counter_cls = Counter
         Histogram = partial(Histogram, registry=self._registry)
         Gauge = partial(Gauge,
                         registry=self._registry,
@@ -489,6 +490,12 @@ class MetricsCollector:
             documentation="Draft overhead in speculative decoding",
             labelnames=self.labels.keys())
 
+        # Shared-prefix attention counters, registered by the first record
+        # that carries them (only when TLLM_FMHA_LIBS enables the library).
+        self.counters_shared_prefix_attn: Optional[Dict[str, Counter]] = None
+        # Per counter: dp_rank -> last cumulative value seen.
+        self._prev_shared_prefix_attn: Dict[str, Dict[str, int]] = {}
+
         # Prompt cache hit tracking
         self.counter_tokens_cached_prompt = Counter(
             name=self.metric_prefix + "prompt_cached_tokens_total",
@@ -798,9 +805,46 @@ class MetricsCollector:
         # Convenience function for logging to gauge.
         gauge.labels(**self._label_merge(labels)).set(data)
 
-    def _log_cumulative_kv_counter(self, counter: "Counter", value: int,
-                                   previous: dict[str, int], rank: str, *,
-                                   field_name: str) -> None:
+    def _shared_prefix_attn_counters(self) -> Dict[str, "Counter"]:
+        """The shared-prefix attention counters, registered on first use.
+
+        Each counts generation requests per decode step: a request decoding for
+        100 steps adds 100.
+        """
+        if self.counters_shared_prefix_attn is None:
+            labelnames = (*self.labels, self.labelname_dp_rank)
+            self.counters_shared_prefix_attn = {
+                key:
+                self._counter_cls(name=self.metric_prefix + name,
+                                  documentation=documentation,
+                                  labelnames=labelnames)
+                for key, name, documentation in (
+                    ("requestSteps", "shared_prefix_attn_request_steps_total",
+                     "Generation requests decoded, summed over decode steps"),
+                    ("shareableRequestSteps",
+                     "shared_prefix_attn_shareable_request_steps_total",
+                     "Generation requests that share prompt KV pages with "
+                     "another request of the step, summed over decode steps"),
+                    ("sharedRequestSteps",
+                     "shared_prefix_attn_shared_request_steps_total",
+                     "Generation requests attended through shared-prefix "
+                     "attention, summed over decode steps"),
+                )
+            }
+            self._prev_shared_prefix_attn = {
+                key: {}
+                for key in self.counters_shared_prefix_attn
+            }
+        return self.counters_shared_prefix_attn
+
+    def _log_cumulative_kv_counter(self,
+                                   counter: "Counter",
+                                   value: int,
+                                   previous: dict[str, int],
+                                   rank: str,
+                                   *,
+                                   field_name: str,
+                                   source: str = "KV cache") -> None:
         """Accumulate positive deltas from one rank's ordered snapshots.
 
         A decrease emits a warning and updates the baseline without incrementing
@@ -812,12 +856,13 @@ class MetricsCollector:
             previous: Per-rank baselines, updated after processing the snapshot.
             rank: Normalized data-parallel rank label.
             field_name: Source KV statistics field named in decrease warnings.
+            source: What the counts describe, named in decrease warnings.
         """
         previous_value = previous.get(rank, 0)
         delta = value - previous_value
         if delta < 0:
             logger.warning(
-                f"Cumulative KV cache {field_name} decreased for dp_rank={rank} "
+                f"Cumulative {source} {field_name} decreased for dp_rank={rank} "
                 f"from {previous_value} to {value}; "
                 "skipping increment and updating baseline.")
         elif delta > 0:
@@ -951,7 +996,8 @@ class MetricsCollector:
                 Top-level fields: numActiveRequests, numQueuedRequests, numCompletedRequests,
                 maxNumActiveRequests, iterLatencyMS, gpuMemUsage, cpuMemUsage, pinnedMemUsage,
                 maxBatchSizeStatic, maxBatchSizeRuntime, maxNumTokensRuntime.
-                Nested dicts: kvCacheStats, inflightBatchingStats, specDecodingStats.
+                Nested dicts: kvCacheStats, inflightBatchingStats, specDecodingStats,
+                sharedPrefixAttnStats.
 
         Note:
             - Needs `enable_iter_perf_stats: true` in LLM args to collect iteration-level stats.
@@ -1058,6 +1104,18 @@ class MetricsCollector:
             rank: Normalized data-parallel rank label.
         """
         rank_labels = {self.labelname_dp_rank: rank}
+
+        # Shared-prefix attention counters (cumulative per rank).
+        if attn_stats := iteration_stats.get("sharedPrefixAttnStats"):
+            for key, counter in self._shared_prefix_attn_counters().items():
+                if key in attn_stats:
+                    self._log_cumulative_kv_counter(
+                        counter,
+                        attn_stats[key],
+                        self._prev_shared_prefix_attn[key],
+                        rank,
+                        field_name=key,
+                        source="shared-prefix attention")
 
         # KV cache stats
         if kv_stats := iteration_stats.get("kvCacheStats"):

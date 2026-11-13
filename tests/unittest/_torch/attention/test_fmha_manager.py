@@ -23,7 +23,10 @@ import torch
 from fmha_test_utils import FakeAttention, FakeFmha, FakePhasedFmha
 
 from tensorrt_llm._torch.attention.backends.fmha import manager as fmha_manager
-from tensorrt_llm._torch.attention.backends.fmha.combined import CombinedFmha
+from tensorrt_llm._torch.attention.backends.fmha.combined import (
+    CombinedFmha,
+    generation_rows_uniform,
+)
 from tensorrt_llm._torch.attention.backends.fmha.interface import FmhaPhase
 from tensorrt_llm._torch.attention.backends.fmha.manager import FmhaManager
 from tensorrt_llm._torch.attention.backends.interface import (
@@ -62,6 +65,7 @@ def _make_metadata(
         num_ctx_tokens=num_ctx_tokens,
         use_spec_decoding=use_spec_decoding,
         num_sparse_topk=num_sparse_topk,
+        fmha_plan_caches={},
     )
 
 
@@ -230,6 +234,145 @@ def test_select_non_mla_fmha_preserves_registry_order() -> None:
 
     assert selected is non_phased_fmha
     assert events == [("support", "non-phased", None)]
+
+
+def _whole_batch_fake(attn, events, supported_phases=None):
+    """A phased library that supports whole mixed batches and their phases (like the thop op)."""
+    if supported_phases is None:
+        supported_phases = {None, FmhaPhase.CONTEXT, FmhaPhase.GENERATION}
+    return FakePhasedFmha(attn, supported_phases, "fallback", events)
+
+
+class _PairingFakePhasedFmha(FakePhasedFmha):
+    """A generation library that opted in to pair with a whole-batch context library."""
+
+    pairs_with_whole_batch_context = True
+
+
+def _select_mixed(manager, attn, *, num_contexts=1, num_generations=2):
+    return manager.select(
+        attn,
+        torch.empty((1 + 4 * num_generations, 4)),
+        None,
+        None,
+        _make_metadata(
+            num_contexts=num_contexts,
+            num_generations=num_generations,
+            num_ctx_tokens=num_contexts,
+        ),
+        AttentionForwardArgs(attention_input_type=AttentionInputType.mixed),
+    )
+
+
+def test_select_non_mla_fmha_pairs_generation_library_with_whole_batch_context() -> None:
+    """A mixed batch: the opted-in generation library keeps its rows, the phased whole-batch
+    library takes only the context requests."""
+    events: list[tuple] = []
+    attn, manager = _make_manager()
+    generation_fmha = _PairingFakePhasedFmha(attn, {FmhaPhase.GENERATION}, "generation", events)
+    fallback_fmha = _whole_batch_fake(attn, events)
+    manager.fmha_libs = [generation_fmha, fallback_fmha]
+
+    selected = _select_mixed(manager, attn)
+
+    assert isinstance(selected, CombinedFmha)
+    assert selected._get_context_impl() is fallback_fmha
+    assert selected._get_generation_impl() is generation_fmha
+    assert events == [
+        ("support", "generation", None),
+        ("support", "generation", FmhaPhase.CONTEXT),
+        ("support", "generation", FmhaPhase.GENERATION),
+        ("support", "fallback", None),
+        ("support", "fallback", FmhaPhase.CONTEXT),
+    ]
+
+
+@pytest.mark.parametrize("pairs, phased", [(False, True), (True, False)])
+def test_select_non_mla_fmha_keeps_whole_batch_library_without_both_opt_ins(
+    pairs: bool, phased: bool
+) -> None:
+    """Without the generation library's opt-in, or with a whole-batch library that is not
+    phased (it cannot serve the context phase alone), the whole-batch library serves the
+    mixed batch as before."""
+    events: list[tuple] = []
+    attn, manager = _make_manager()
+    generation_cls = _PairingFakePhasedFmha if pairs else FakePhasedFmha
+    generation_fmha = generation_cls(attn, {FmhaPhase.GENERATION}, "generation", events)
+    fallback_fmha = (
+        _whole_batch_fake(attn, events) if phased else FakeFmha(attn, "fallback", events)
+    )
+    manager.fmha_libs = [generation_fmha, fallback_fmha]
+
+    assert _select_mixed(manager, attn) is fallback_fmha
+
+
+def test_select_non_mla_fmha_pairing_requires_context_phase_support() -> None:
+    events: list[tuple] = []
+    attn, manager = _make_manager()
+    generation_fmha = _PairingFakePhasedFmha(attn, {FmhaPhase.GENERATION}, "generation", events)
+    # Whole batch supported, context phase alone refused.
+    fallback_fmha = _whole_batch_fake(attn, events, supported_phases={None})
+    manager.fmha_libs = [generation_fmha, fallback_fmha]
+
+    assert _select_mixed(manager, attn) is fallback_fmha
+
+
+def test_select_non_mla_fmha_pairing_leaves_pure_batches_alone() -> None:
+    events: list[tuple] = []
+    attn, manager = _make_manager()
+    generation_fmha = _PairingFakePhasedFmha(attn, {FmhaPhase.GENERATION}, "generation", events)
+    fallback_fmha = _whole_batch_fake(attn, events)
+    manager.fmha_libs = [generation_fmha, fallback_fmha]
+
+    assert _select_mixed(manager, attn, num_contexts=0, num_generations=2) is generation_fmha
+    assert _select_mixed(manager, attn, num_contexts=2, num_generations=0) is fallback_fmha
+
+
+def test_only_flash_attn4_opts_in_to_whole_batch_pairing() -> None:
+    """Pairing is opt-in: with FA4 disabled no enabled library changes its mixed-batch selection."""
+    from tensorrt_llm._torch.attention.backends.fmha.registry import FMHA_LIBS
+
+    assert {
+        name
+        for name, cls in FMHA_LIBS.items()
+        if getattr(cls, "pairs_with_whole_batch_context", False)
+    } == {"flash_attn4_generation"}
+
+
+def test_fmha_cache_separates_non_uniform_generation_rows() -> None:
+    """Two rows of 3 + 3 and of 1 + 5 tokens (a row without drafts next to a 1 + K row) have the
+    same batch size and average Q length; with a library that serves only uniform rows, one selected
+    for the first is not reused from the cache for the second."""
+    events: list[tuple] = []
+    attn, manager = _make_manager()
+    uniform_only = FakeFmha(
+        attn,
+        "uniform-only",
+        events,
+        request_support_predicate=lambda q, metadata: generation_rows_uniform(q, metadata),
+    )
+    fallback = FakeFmha(attn, "fallback", events)
+    manager.fmha_libs = [uniform_only, fallback]
+    manager._keys_rows_uniform = True
+    q = torch.empty((6, 4))
+    forward_args = AttentionForwardArgs(attention_input_type=AttentionInputType.generation_only)
+    metadata_by_rows = {}
+    for uniform, gen_lens in ((True, [3, 3]), (False, [1, 5])):
+        metadata = _make_metadata(num_contexts=0, num_generations=2, use_spec_decoding=True)
+        metadata.seq_lens = torch.tensor(gen_lens, dtype=torch.int32)
+        metadata.max_total_draft_tokens = 4
+        metadata_by_rows[uniform] = metadata
+    with patch.object(fmha_manager, "_is_fmha_cache_enabled", return_value=True):
+        for _ in range(2):
+            selected = {
+                uniform: manager.select(
+                    attn, q, None, None, metadata_by_rows[uniform], forward_args
+                )
+                for uniform in (True, False)
+            }
+            assert selected == {True: uniform_only, False: fallback}
+
+    assert len(manager._cache) == 2
 
 
 @pytest.mark.parametrize(("lower_q_length", "upper_q_length"), [(3, 4), (7, 8)])
@@ -1103,3 +1246,55 @@ def test_manager_skips_an_unavailable_prepended_library() -> None:
 
     assert [type(lib) for lib in manager.fmha_libs] == registry
     assert [name for name, _ in checked] == ["Prepended", "First"]
+
+
+class _PlanningFakePhasedFmha(FakePhasedFmha):
+    """A library whose support follows its per-step plan (``metadata.planned``)."""
+
+    def __init__(self, attn: FakeAttention) -> None:
+        super().__init__(
+            attn,
+            {None, FmhaPhase.GENERATION},
+            "planning",
+            [],
+            support_predicate=lambda metadata, phase: metadata.planned,
+        )
+
+    @classmethod
+    def plan_step(cls, metadata) -> None:
+        pass
+
+    @classmethod
+    def selection_cache_key(cls, metadata) -> bool:
+        return metadata.planned
+
+
+def test_fmha_cache_keys_on_the_plans_of_libraries_that_plan_steps() -> None:
+    """A selection made on a planned step is not reused on an unplanned one of the same shape."""
+    attn = FakeAttention()
+    with (
+        patch.object(
+            fmha_manager, "get_enabled_fmha_lib_classes", return_value=[_PlanningFakePhasedFmha]
+        ),
+        patch.object(
+            fmha_manager, "step_planning_fmha_lib_classes", return_value=(_PlanningFakePhasedFmha,)
+        ),
+    ):
+        manager = FmhaManager(attn)
+    planning_fmha = manager.fmha_libs[0]
+
+    def select(planned: bool):
+        metadata = _make_metadata(num_contexts=0, num_generations=2)
+        metadata.planned = planned
+        return manager.select(
+            attn,
+            torch.empty((8, 4)),
+            None,
+            None,
+            metadata,
+            AttentionForwardArgs(attention_input_type=AttentionInputType.generation_only),
+        )
+
+    assert select(True) is planning_fmha
+    assert select(False) is None
+    assert select(True) is planning_fmha

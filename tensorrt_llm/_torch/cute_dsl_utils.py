@@ -114,6 +114,18 @@ def install_cutlass_dsl_compatibility() -> None:
         cute.make_fragment = cute.make_rmem_tensor
 
 
+def load_flash_attn_cute_forward():
+    """FlashAttention-4's forward (``flash_attn.cute``) with the CuTe aliases it needs.
+
+    Raises ``ImportError``, ``OSError`` or ``AttributeError`` when the CuTe DSL interface
+    cannot be imported; callers decide whether that is fatal.
+    """
+    install_cutlass_dsl_compatibility()
+    from flash_attn.cute.interface import _flash_attn_fwd
+
+    return _flash_attn_fwd
+
+
 # SMs that a kernel resident for the whole step holds (the DWDP fabric gather;
 # ``DwdpManager`` sets it once, before the model is built). Persistent grids
 # leave them out, so CTAs that would land on those SMs do not run their static
