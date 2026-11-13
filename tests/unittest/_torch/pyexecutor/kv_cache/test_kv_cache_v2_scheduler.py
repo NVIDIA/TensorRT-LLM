@@ -4603,6 +4603,31 @@ class TestPrefixAwareSkip:
         out = sched.schedule_request([req0, req1], {0})
         assert ids(out.context_requests) == [1]
 
+    def test_unpaid_deferral_stops_after_contributor_leaves_context(self):
+        """A duplicate whose first new block is still uncommitted after its contributor finished the
+        context phase was not repaid; it and later duplicates of that block are admitted together
+        instead of one per iteration (n samples of one prompt)."""
+        mgr = self._keyed_manager({i: b"blockA" for i in range(4)})
+        sched = make_scheduler(mgr, max_num_tokens=10000)
+        reqs = [make_ctx_request(i, 40) for i in range(4)]
+        assert ids(sched.schedule_request(reqs, set()).context_requests) == [0]
+        # req0 ran its whole context and is generating (still active, in flight); the block is
+        # still not in the tree.
+        reqs[0].state_value = make_gen_request(0).state_value
+        reqs[0].is_context_init_state = False
+        out = sched.schedule_request(reqs, {0})
+        assert ids(out.context_requests) == [1, 2, 3]
+
+    def test_deferral_kept_while_contributor_is_still_in_context(self):
+        """A contributor still prefilling (chunked) keeps its duplicates deferred."""
+        mgr = self._keyed_manager({0: b"blockA", 1: b"blockA"})
+        sched = make_scheduler(mgr, max_num_tokens=10000)
+        req0, req1 = make_ctx_request(0, 500), make_ctx_request(1, 500)
+        assert ids(sched.schedule_request([req0, req1], set()).context_requests) == [0]
+        req0.is_first_context_chunk = False
+        out = sched.schedule_request([req0, req1], {0})
+        assert 1 not in ids(out.context_requests)
+
     def test_distinct_prefixes_not_deferred(self):
         mgr = self._keyed_manager({0: b"blockA", 1: b"blockB"})
         sched = make_scheduler(mgr, max_num_tokens=10000)
