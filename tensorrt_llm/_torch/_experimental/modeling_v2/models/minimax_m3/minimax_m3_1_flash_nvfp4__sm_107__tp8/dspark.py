@@ -78,6 +78,7 @@ from ..m31_tail_bookkeep import tail_bookkeep_draft_len, tail_bookkeep_log_once
 # set-up. Bitwise the stock gathers. Default ON; kill switch TRTLLM_M31_DISABLE_TP8_FLAGFREE_GATHER=1, read at import.
 from ..ops import flagfree_gather as _ffg  # noqa: E402
 from . import dspark_ctxlen
+from .drafter_down_splitk import route_down_splitk, route_oproj_splitk
 from .drafter_mxfp8 import route_gu_swiglu, route_his_layout, route_mx_linears
 from .dspark_markov_worker import MAX_FAST_BATCH, TAILBK_SPEC, S4WorkerMixin
 from .kernels import m3_mc_allreduce
@@ -774,6 +775,19 @@ class M3DSparkWorker(S4WorkerMixin, DSparkWorker):
         logger.info(
             f"M3.1 DSpark DRAFT_GU_SWIGLU_EPI: gate_up SwiGLU epilogue on {gus} drafter MLPs on rank {rank}"
         )
+        # DRAFTER_DOWN_SPLITK / DRAFTER_OPROJ_SPLITK: the drafter's down / o_proj projections on FlashInfer's BF16
+        # split-K GEMM at a pinned tactic, on the 7-token draft passes whose all-reduce the fused drafter boundary
+        # (DRAFT_AR_NORM_FUSED) defers; a projection the layout routing (DRAFTER_HISLAYOUT) took keeps that route.
+        down = route_down_splitk(
+            draft_model,
+            enabled=not his[1] and k == 7 and s9b and not m31_disabled("DRAFTER_DOWN_SPLITK"),
+        )
+        logger.info(f"M3.1 DRAFTER_DOWN_SPLITK: armed {down}/5 projections on rank {rank}")
+        oproj = route_oproj_splitk(
+            draft_model,
+            enabled=not his[0] and k == 7 and s9b and not m31_disabled("DRAFTER_OPROJ_SPLITK"),
+        )
+        logger.info(f"M3.1 DRAFTER_OPROJ_SPLITK: armed {oproj}/5 projections on rank {rank}")
         self.prebuild_s4(lm_head, draft_model)
         # N3 A2 compiles (rank-local), then the N3 A1 workspace and compiles (collective), outside capture.
         if not N3A_DISABLED and lm_head is not None:

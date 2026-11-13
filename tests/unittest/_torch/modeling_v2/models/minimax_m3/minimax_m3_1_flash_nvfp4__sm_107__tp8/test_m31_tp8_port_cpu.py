@@ -86,6 +86,8 @@ class TestTP8Chain(unittest.TestCase):
             "route_his_layout": Mock(return_value=his),
             "route_mx_linears": Mock(return_value=0),
             "route_gu_swiglu": Mock(return_value=0),
+            "route_down_splitk": Mock(return_value=0),
+            "route_oproj_splitk": Mock(return_value=0),
             "install_draft_swiglu": Mock(return_value=5),
             "native_swiglu": Mock(),
             "fold_k_norm_weight": lambda v: v,
@@ -118,6 +120,9 @@ class TestTP8Chain(unittest.TestCase):
         for killed in (set(), {"DRAFTER_HISLAYOUT"}):
             _, ns = self.prebuild(killed, his=(3, 1), stop="self.prebuild_s4")
             self.assertEqual(ns["route_gu_swiglu"].call_count, int(bool(killed)))
+            # The layout's projections keep its route: the split-K routes arm only where the layout took nothing.
+            for route in ("route_down_splitk", "route_oproj_splitk"):
+                self.assertEqual(ns[route].call_args.kwargs["enabled"], bool(killed))
 
 
 class TestTP8Fsel(unittest.TestCase):
