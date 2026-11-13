@@ -336,7 +336,7 @@ def DISABLE_CBTS = "disable_cbts"
 def INFRA_DRY_RUN = "infra_dry_run"
 // CBTS per-test coverage is limited to post-merge test runs.
 @Field
-def ENABLE_CBTS_COVERAGE = true
+def ENABLE_CBTS_COVERAGE = false
 // Version-controlled Tier 2 application policy. Coverage decisions are evaluated
 // for every eligible PR, but only these authors receive coverage-based narrowing.
 // Keep the policy in the infra-owned Groovy boundary so rollout requires infra review.
