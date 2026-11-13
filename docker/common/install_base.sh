@@ -142,7 +142,24 @@ init_ubuntu() {
   pip3 uninstall -y tensorrt
 }
 
+# The base image enables the UBI AppStream repo, whose gcc can be newer than the
+# libgcc/libgomp in Rocky BaseOS. Enable the matching UBI BaseOS repo so the
+# dependencies of those packages resolve.
+enable_ubi_baseos_rockylinux() {
+  if [ -f /etc/yum.repos.d/ubi-8-appstream.repo ] && [ ! -f /etc/yum.repos.d/ubi-8-baseos.repo ]; then
+    cat > /etc/yum.repos.d/ubi-8-baseos.repo <<'EOF'
+[ubi-8-baseos]
+name=Red Hat Universal Base Image 8 (BaseOS)
+baseurl=https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi8/8/$basearch/baseos/os
+enabled=1
+gpgcheck=1
+gpgkey=https://www.redhat.com/security/data/fd431d51.txt
+EOF
+  fi
+}
+
 install_python_rockylinux() {
+  enable_ubi_baseos_rockylinux
   PYTHON_VERSION=$1
   PYTHON_MAJOR="3"
   PYTHON_URL="https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tgz"
