@@ -6,8 +6,9 @@ SPDX-License-Identifier: Apache-2.0
 # Muse Spark Open
 
 This example serves Muse Spark Open (816B-A42B) with TensorRT-LLM on a single
-4-GPU NVIDIA Blackwell node. It provides the validated aggregated serving
-configuration (TP4/EP4) and an overlay that adds DFlash2 speculative decoding;
+4-GPU NVIDIA Blackwell node. The validated aggregated serving configuration
+(TP4/EP4) is the curated recipe `examples/configs/curated/musespark-open.yaml`;
+this directory adds an overlay that enables DFlash2 speculative decoding;
 suffix-automaton (SA) drafting is covered in the speculative-decoding
 deployment guide linked below.
 
@@ -33,14 +34,14 @@ validated on GB300 NVL (`SM103`) with 4 GPUs (TP4/EP4).
 
 ## Serve the model
 
-From this directory:
+From the repository root:
 
 ```bash
 MODEL=/path/to/musespark-open-checkpoint
 
 trtllm-serve ${MODEL} \
     --host 0.0.0.0 --port 8000 \
-    --config serve_config.yaml \
+    --config examples/configs/curated/musespark-open.yaml \
     --tool_parser musespark \
     --reasoning_parser musespark
 ```
@@ -65,7 +66,7 @@ be spent entirely on reasoning and leave `content` empty. The request above sets
 the reasoning is returned separately in `reasoning_content`.
 
 Guided decoding (JSON mode / JSON schema via the `xgrammar` backend) is
-enabled by `guided_decoding_backend: xgrammar` in `serve_config.yaml` and used
+enabled by `guided_decoding_backend: xgrammar` in the recipe and used
 through the standard OpenAI `response_format` field.
 
 ## Speculative decoding (opt-in)
@@ -74,14 +75,14 @@ through the standard OpenAI `response_format` field.
 (a small drafter cross-attending to target hidden states, drafting 7 tokens
 per step) with the published drafter checkpoint
 [`nvidia/Muse-Spark-Open-816B-A42B-DFlash2`](https://huggingface.co/nvidia/Muse-Spark-Open-816B-A42B-DFlash2).
-Merge the keys into a copy of `serve_config.yaml` and launch with that
-merged file:
+Merge the keys into a copy of the recipe and launch with that merged file:
 
 ```bash
-cat serve_config.yaml spec_dflash.yaml > serve_config_spec.yaml
+cat examples/configs/curated/musespark-open.yaml examples/musespark_open/spec_dflash.yaml \
+    > musespark-open-dflash.yaml
 trtllm-serve ${MODEL} \
     --host 0.0.0.0 --port 8000 \
-    --config serve_config_spec.yaml \
+    --config musespark-open-dflash.yaml \
     --tool_parser musespark \
     --reasoning_parser musespark
 ```
@@ -104,7 +105,7 @@ for its configuration and measured trade-offs.
   reuse.** For head dimension 64 on `SM103`, the fused paged-context FMHA
   kernel exists only for the FP8 KV-cache dtype, and any request entering
   attention with a cached prefix (chunked prefill, block reuse, draft
-  verification) uses that path. `serve_config.yaml` sets
+  verification) uses that path. The recipe sets
   `kv_cache_config.dtype: fp8` accordingly; a 16-bit KV cache in that
   combination is refused.
 - **Disaggregated serving:** some disaggregated configurations currently

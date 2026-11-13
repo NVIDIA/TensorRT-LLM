@@ -150,3 +150,8 @@
   config_path: examples/configs/curated/deepseek-v4-pro-throughput.yaml
   scenario: Max Throughput
   gpu_compatibility: "B200"
+- model: meta-models/Muse-Spark-Open-816B-A42B-NVFP4
+  arch: MuseSparkForConditionalGeneration
+  config_path: examples/configs/curated/musespark-open.yaml
+  scenario: General deployment
+  gpu_compatibility: "GB300"

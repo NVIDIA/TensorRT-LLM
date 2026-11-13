@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Overlay for serve_config.yaml: enable DFlash2 speculative decoding for
-# Muse Spark Open. Merge these keys into the serving YAML (or append them
-# to a copy of serve_config.yaml) before launching trtllm-serve.
+# Overlay for examples/configs/curated/musespark-open.yaml: enable DFlash2
+# speculative decoding for Muse Spark Open. Merge these keys into the serving
+# YAML (or append them to a copy of that recipe) before launching trtllm-serve.
 #
 # Acceptance is strict: an accepted draft token is exactly the token the
 # target model emits at that position. At temperature 0, completions still
