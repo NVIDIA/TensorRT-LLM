@@ -445,6 +445,12 @@ def executor_for_preemption(p, reqs, scheduler):
     executor._cancelled_disagg_model_request_ids = MethodType(
         PyExecutor._cancelled_disagg_model_request_ids, executor
     )
+    executor._encoder_requests_in_arrival_order = MethodType(
+        PyExecutor._encoder_requests_in_arrival_order, executor
+    )
+    executor._fit_encoder_requests_to_encoder_step = MethodType(
+        PyExecutor._fit_encoder_requests_to_encoder_step, executor
+    )
     return executor
 
 

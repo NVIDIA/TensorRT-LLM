@@ -822,7 +822,9 @@ def launch_server(
             multi_frontend_serving = MultiFrontendServing(
                 launcher_uds=attached_launcher_uds,
                 is_launcher=False,
-                launcher_pid=os.getppid())
+                launcher_pid=os.getppid(),
+                frontend_id=int(os.environ["TLLM_EXECUTOR_FRONTEND_ID"]),
+                num_frontends=multi_frontend.num_frontends)
     if enable_runtime_control_endpoints and multi_frontend.num_frontends > 1:
         raise click.BadParameter(
             "Runtime control endpoints require num_serve_frontends=1 because "
@@ -923,7 +925,9 @@ def launch_server(
                     stop_watching_frontends = _watch_attached_frontends(
                         frontend_children)
                     multi_frontend_serving = MultiFrontendServing(
-                        launcher_uds=launcher_uds_path, is_launcher=True)
+                        launcher_uds=launcher_uds_path,
+                        is_launcher=True,
+                        num_frontends=multi_frontend.num_frontends)
                     sockets.append(launcher_uds_sock)
 
                 server = OpenAIServer(

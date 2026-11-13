@@ -2,7 +2,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Common runtime pipeline for cold-page quantization."""
 
-from typing import Any, Sequence
+from typing import Any, Optional, Sequence
 
 from ...pyexecutor.resource_manager import DataType, KVCacheCompressionManager
 
@@ -12,6 +12,11 @@ class ColdPageQuantizationCompression(KVCacheCompressionManager):
 
     uses_iteration_lifecycle = False
     provides_cold_page_codec = True
+
+    @property
+    def mixed_precision_high_window(self) -> Optional[tuple[int, int]]:
+        """``(first_n, last_n)`` from the config, else None."""
+        return getattr(self.config, "mixed_precision_high_window", None)
 
     def create_cold_page_codec(
         self,

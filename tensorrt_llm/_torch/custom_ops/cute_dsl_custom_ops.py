@@ -3407,7 +3407,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                           ConstraintSpec(
                                               10, 0,
                                               helper.infer_shape_input5_rows)),
-                        use_cold_l2_cache=True)
+                        use_cold_l2_cache=True,
+                        share_jit_builds=True)
                     return self.__class__.tuning_config_cache[key]
                 self.__class__.tuning_config_cache[key] = TuningConfig(
                     dynamic_tensor_specs=(DynamicTensorSpec(
@@ -3423,6 +3424,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         ConstraintSpec(10, 0, helper.infer_shape_num_tokens)),
                     inputs_pre_hook=helper.inputs_pre_hook_finalize_fusion,
                     use_cold_l2_cache=True,
+                    share_jit_builds=True,
                 )
             return self.__class__.tuning_config_cache[key]
 
@@ -4278,7 +4280,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             helper.map_to_expert_capacity_tuning_bucket), ),
                         constraint_specs=(ConstraintSpec(
                             2, 0, helper.infer_shape_input0_rows), ),
-                        use_cold_l2_cache=True)
+                        use_cold_l2_cache=True,
+                        share_jit_builds=True)
                     return self.__class__.tuning_config_cache[key]
                 helper = GatherGroupedGemmInputsHelper(
                     self.num_experts,
@@ -4307,6 +4310,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                           helper.infer_shape_max_num_tiles)),
                     inputs_pre_hook=helper.inputs_pre_hook,
                     use_cold_l2_cache=True,
+                    share_jit_builds=True,
                 )
             return self.__class__.tuning_config_cache[key]
 
@@ -12865,6 +12869,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     constraint_specs=(batch_constraints + static_constraints +
                                       stats_constraints),
                     inputs_pre_hook=self._tuning_inputs_pre_hook,
+                    share_jit_builds=True,
                 )
             return cache[key]
 

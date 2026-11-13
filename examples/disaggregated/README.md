@@ -575,6 +575,13 @@ disagg_cluster:
     generation_servers: 1
   heartbeat_interval_sec: 5
   inactive_interval_sec: 10
+  # Only for an etcd:// cluster_uri, see below:
+  # user: <etcd user>
+  # password: <etcd password>
+  # ca_cert: /path/to/ca.pem
+  # cert_key: /path/to/client-key.pem
+  # cert_cert: /path/to/client-cert.pem
+  # record_auth_key: <shared secret>
 ```
 - `cluster_uri`: the http address of disagg-server like `http://<your-disagg-server-host>:<your-disagg-server-port>` or a pre-configured Etcd server address like `etcd://<your-etcd-host>:2379`.
 - `cluster_name` : optional namespace to isolate multiple disagg-clusters in Etcd.
@@ -582,6 +589,10 @@ disagg_cluster:
 the active context/generation servers is below the corresponding threshold.
 - `heartbeat_interval_sec`: frequency at which context/generation servers send heartbeats to the disagg-server.
 - `inactive_interval_sec`: A server is marked inactive if no heartbeat is received within this interval (set higher than the heartbeat interval).
+
+To use an ETCD server with TLS, set `ca_cert` to the path of the PEM file of the CA certificate, and for a client certificate set `cert_key` and `cert_cert` to the paths of the PEM files of the client key and certificate. To use ETCD authentication, set `user` and `password` together with `ca_cert`: the etcd client sends its authentication token only over a TLS connection, and the configuration is rejected if `user` and `password` are set without `ca_cert`. These settings apply to an `etcd://` `cluster_uri` only and are read from the configuration file, not from the command line. The ETCD user needs read and write permission on the `/trtllm-disagg/` key prefix. The servers connect to ETCD on first use and log in again when ETCD stops accepting the authentication token. When a watch stream to ETCD ends, for example when ETCD restarts, the disaggregated server watches again and catches up with the servers that registered or left meanwhile.
+
+Set `record_auth_key` to the same non-empty secret in the `disagg_cluster` section of the disaggregated server and of every context/generation server: servers then sign the records they register, and readers ignore records without a valid signature. A valid signature shows that a server with the key wrote the record, not that the record is current: a client that can write to ETCD can store a record again after its server has left. Access control of the store itself comes from the ETCD server, for example with the authentication above.
 
 Note that the disaggregated server and all the context/generation servers should have the same `disagg_cluster` configuration values, or the disaggregated server may not be able to keep alive or detect inactivity the other servers properly. If `disagg_cluster` section is specified, 
 the disaggregated server and all context/generation worker configs should also set the
