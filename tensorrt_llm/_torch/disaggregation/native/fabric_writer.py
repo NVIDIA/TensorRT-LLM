@@ -576,7 +576,7 @@ class FabricWriter:
                 f"nopeer:{name}", f"KV fabric write: peer {name} exports no fabric pools; NIXL"
             )
             return
-        digest = hashlib.sha1(export_blob).hexdigest()
+        digest = hashlib.sha1(export_blob, usedforsecurity=False).hexdigest()
         with self._lock:
             old = self._peers.get(name)
             if old is not None and old.digest == digest:
