@@ -335,6 +335,9 @@ def _serve_schema() -> dict:
     """The serve schema without ``_cross_field_rules``, so that later merges see unmodified definitions."""
     from tensorrt_llm.llmapi.disagg_utils import DisaggClusterConfig, InternalRequestAuthKey
     from tensorrt_llm.llmapi.llm_args import (
+        _NVFP4_COLD_PAGE_OPTIONS,
+        _TURBOQUANT_COLD_PAGE_OPTIONS,
+        _TURBOQUANT_PROD_BITS,
         SERVE_CONFIG_ALIASES,
         MoeLoadBalancerConfig,
         MoePerLayerDynamicLoadBalancerConfig,
@@ -458,6 +461,26 @@ def _serve_schema() -> dict:
         "".join(f"[{char}{char.lower()}]" for char in name) for name in encoder_backend.pop("enum")
     ]
     encoder_backend["pattern"] = "^(?:" + "|".join(alternatives) + r")$(?![\s\S])"
+
+    # Mirror ColdPageQuantizationCompressionConfig._validate_format_options(): the options of the
+    # format not selected stay unset (quant defaults to nvfp4), and prod takes whole bit widths.
+    def unset(names: frozenset[str]) -> dict:
+        return {"not": {"anyOf": [{"required": [name]} for name in sorted(names)]}}
+
+    schema["$defs"]["ColdPageQuantizationCompressionConfig"]["allOf"] = [
+        {
+            "if": {"properties": {"quant": {"const": "turboquant"}}, "required": ["quant"]},
+            "then": unset(_NVFP4_COLD_PAGE_OPTIONS),
+            "else": unset(_TURBOQUANT_COLD_PAGE_OPTIONS),
+        },
+        {
+            "if": {
+                "properties": {"turboquant_mode": {"const": "prod"}},
+                "required": ["turboquant_mode"],
+            },
+            "then": {"properties": {"turboquant_bits": {"enum": list(_TURBOQUANT_PROD_BITS)}}},
+        },
+    ]
     # These object/Any annotations are Python API hooks, not arbitrary YAML mappings.
     # Update these restrictions when hooks are added or gain YAML construction support.
     for name in ("batched_logits_processor", "checkpoint_loader", "_mpi_session"):

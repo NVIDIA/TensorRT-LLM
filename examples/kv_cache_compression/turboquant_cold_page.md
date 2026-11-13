@@ -204,6 +204,25 @@ documents = [
 ]
 sampling = SamplingParams(max_tokens=16, temperature=0.0)
 
+
+def collect(llm):
+    """Drain the iteration statistics recorded since the previous call and total them."""
+    totals = {"offload": 0, "onboard": 0, "cached_tokens": {}, "cold_slot_sizes": set()}
+    records = []
+    while batch := llm.get_stats(timeout=2):
+        records += batch
+    for stats in records:
+        for pool in stats.get("kvCacheIterationStatsByPoolGroup", {}).values():
+            totals["offload"] += pool["iterOffloadBytes"]
+            totals["onboard"] += pool["iterOnboardBytes"]
+        tiers = stats.get("kvCacheLevelTiers", [])
+        for tier, tokens in zip(tiers, stats.get("iterCachedTokensByLevel", [])):
+            totals["cached_tokens"][tier] = totals["cached_tokens"].get(tier, 0) + tokens
+        for pool in stats.get("kvCacheIterationStatsByColdPoolGroup", {}).values():
+            totals["cold_slot_sizes"].update(pool["slotSize"])
+    return totals
+
+
 with LLM(
     model="Qwen/Qwen3-8B",
     backend="pytorch",
@@ -223,33 +242,26 @@ with LLM(
 ) as llm:
     for document in documents:  # fill the GPU tier and offload the oldest prefixes
         llm.generate([document + "\nSummarize the document."], sampling)
+    fill = collect(llm)
     for document in documents[:2]:  # reuse prefixes that now live in the Host tier
         llm.generate([document + "\nWhich fact comes first?"], sampling)
+    reuse = collect(llm)  # only the two reuse requests
 
-    offload_bytes = onboard_bytes = 0
-    cached_tokens = {}
-    cold_slot_sizes = set()
-    for stats in llm.get_stats(timeout=2):
-        for pool in stats.get("kvCacheIterationStatsByPoolGroup", {}).values():
-            offload_bytes += pool["iterOffloadBytes"]
-            onboard_bytes += pool["iterOnboardBytes"]
-        tiers = stats.get("kvCacheLevelTiers", [])
-        for tier, tokens in zip(tiers, stats.get("iterCachedTokensByLevel", [])):
-            cached_tokens[tier] = cached_tokens.get(tier, 0) + tokens
-        for pool in stats.get("kvCacheIterationStatsByColdPoolGroup", {}).values():
-            cold_slot_sizes.update(pool["slotSize"])
-    print("offload bytes:", offload_bytes, "onboard bytes:", onboard_bytes)
-    print("reused prompt tokens by tier:", cached_tokens)
-    print("cold slot sizes:", sorted(cold_slot_sizes))
+    print("fill: offload bytes:", fill["offload"])
+    print("reuse: onboard bytes:", reuse["onboard"])
+    print("reuse: reused prompt tokens by tier:", reuse["cached_tokens"])
+    print("cold slot sizes:", sorted(fill["cold_slot_sizes"] | reuse["cold_slot_sizes"]))
 ```
 
 Look for these signals:
 
-* Offload bytes (`iterOffloadBytes`) become nonzero while the later documents
-  push the earlier prefixes out of the GPU tier, and onboard bytes
-  (`iterOnboardBytes`) become nonzero when the last two requests reuse them.
-* The reused prompt tokens of the last two requests are attributed to the
-  `host` tier (`iterCachedTokensByLevel`, labeled by `kvCacheLevelTiers`).
+* Offload bytes (`iterOffloadBytes`) of the fill phase become nonzero while the
+  later documents push the earlier prefixes out of the GPU tier, and onboard
+  bytes (`iterOnboardBytes`) of the reuse phase become nonzero when the last two
+  requests reuse them.
+* The reused prompt tokens of the reuse phase, which holds only the last two
+  requests, are attributed to the `host` tier (`iterCachedTokensByLevel`,
+  labeled by `kvCacheLevelTiers`).
 * The cold slot size (`slotSize` of `kvCacheIterationStatsByColdPoolGroup`) is
   the TurboQuant cold-page size rather than the hot Page size: about 1.2 MiB
   instead of 4.5 MiB for Qwen3-8B (36 layers, 8 KV heads, head dimension 128)
