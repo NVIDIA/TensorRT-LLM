@@ -7288,11 +7288,23 @@ class KVCacheManagerV2(BaseResourceManager):
                     )
                 # A paired scheduler already grew both pools atomically; the
                 # recorded width says so, so do not charge this step twice.
-                if preallocated_dummy or req.py_request_id in self._allocated_draft_lens:
+                # Unpaired, any record is ours from an earlier step that
+                # update_resources skipped (suspended cache), so grow again
+                # and overwrite it, as try_allocate_generation does.
+                if preallocated_dummy or (
+                    self.enable_joint_kv_cache_reuse
+                    and req.py_request_id in self._allocated_draft_lens
+                ):
                     continue
-                new_cap = self._required_gen_capacity(req, kv_cache.capacity)
+                draft_slots = self._generation_draft_slots(req)
+                new_cap = kv_cache.capacity + BASE_GENERATION_TOKEN_COUNT + draft_slots
                 if not kv_cache.resize(new_cap):
                     raise self._mirror_resize_error(req, "generation", new_cap)
+                # Unpaired draft path (block reuse off): record the width so
+                # update_resources rewinds the same slots it grew, instead of
+                # falling back to SpecSampler runtime_draft_len alone.
+                self._allocated_draft_lens[req.py_request_id] = draft_slots
+                self._inflight_draft_lens.setdefault(req.py_request_id, []).append(draft_slots)
 
     def _mirror_resize_error(self, req: LlmRequest, phase: str, capacity: int) -> RuntimeError:
         """The error for a draft mirror that could not grow to ``capacity``.
@@ -9586,6 +9598,18 @@ class KVCacheManagerV2(BaseResourceManager):
                 if self.kv_compression_manages_history or self._has_cp_helix
                 else req.max_beam_num_tokens - 1
             )
+            # Rejected-draft reclaim must not drop capacity below the history
+            # we are about to commit. Schedule-time draft width can lag the
+            # padded runtime_draft_len (MTP pads after try_allocate and does
+            # not extend capacity), and the unpaired draft mirror can rewind
+            # from a fallback width; either way resize would raise
+            # "History length cannot exceed capacity" and kill the executor.
+            # When compression or helix owns history, resize keeps the
+            # retained native history, so clamp against that instead.
+            if new_capacity is not None:
+                min_capacity = kv_cache.history_length if history_length is None else history_length
+                if new_capacity < min_capacity:
+                    new_capacity = min_capacity
             success = kv_cache.resize(new_capacity, history_length)
             if not success:
                 raise ValueError(
