@@ -9,7 +9,7 @@ takes a shard only for the fc it was built from and the checked row counts, and 
 project_target_hidden takes it only within those rows. Default on; TRTLLM_M31_DISABLE_FC_SHARD=1 turns it off."""
 
 import importlib
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
@@ -146,7 +146,14 @@ def test_project_target_hidden_takes_the_shard_within_its_rows(rows):
         fc.weight.copy_(torch.randn(32, 96, generator=g).bfloat16())
         norm.weight.copy_((1 + 0.1 * torch.randn(32, generator=g)).bfloat16())
     shard = _HalfShard(fc, 8)
-    model = SimpleNamespace(fc=fc, hidden_norm=norm, _dflash_fc_split=None, _dflash_fc_shard=shard)
+    model = SimpleNamespace(
+        fc=fc,
+        hidden_norm=norm,
+        _fc_input_slice=None,
+        _dflash_fc_split=None,
+        _dflash_fc_shard=shard,
+    )
+    model._project_features = MethodType(DFlashForCausalLM._project_features, model)
     x = torch.randn(rows, 96, generator=g)
     out = DFlashForCausalLM.project_target_hidden(model, x)
     assert torch.equal(out, norm(fc(x.to(torch.bfloat16))))
