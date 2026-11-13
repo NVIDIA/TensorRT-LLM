@@ -145,8 +145,10 @@ class _PlainMtpLayer(_DraftAttnLayer):
 
 
 class _OverridingMtpLayer(_PickingMtpLayer):
-    """Inherits the capability attribute but overrides ``forward`` without
-    ``pick_rows``: must be treated as unsupported."""
+    """Overrides ``forward`` without ``pick_rows`` and opts out of the
+    inherited capability: must be treated as unsupported."""
+
+    supports_pick_rows = False
 
     def forward(
         self, input_ids, position_ids, hidden_states, embed_tokens, attn_metadata, **kwargs

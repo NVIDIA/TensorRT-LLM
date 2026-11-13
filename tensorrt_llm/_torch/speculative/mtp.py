@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, List, Optional
 
 import torch
+from torch import nn
 
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
@@ -281,7 +282,7 @@ class MTPWorker(SpecWorkerBase):
     def max_draft_len(self) -> int:
         return self.spec_config.max_draft_len
 
-    def _mtp_layers_pick_rows(self, draft_model) -> bool:
+    def _mtp_layers_pick_rows(self, draft_model: nn.Module) -> bool:
         """Whether the MTP layers take ``pick_rows`` (see
         draft_layer_picks_rows). Declined under attention DP, where this
         worker passes the MTP layers no per-rank token counts."""

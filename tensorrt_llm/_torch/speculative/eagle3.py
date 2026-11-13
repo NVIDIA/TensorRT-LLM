@@ -518,7 +518,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             self.is_mtp_eagle and isinstance(draft_model, MTPForCausalLM)
             and draft_model.folds_kv_lens_increment)
 
-    def _step0_draft_layer_picks_rows(self, draft_model) -> bool:
+    def _step0_draft_layer_picks_rows(self, draft_model: nn.Module) -> bool:
         """Whether the draft layer of step 0 takes ``pick_rows`` (see
         draft_layer_picks_rows)."""
         if self.is_mtp_eagle:
@@ -1232,7 +1232,9 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         return next_draft_tokens, next_new_tokens
 
     @staticmethod
-    def _step0_gather_ids(seq_lens, num_accepted_tokens, spec_metadata,
+    def _step0_gather_ids(seq_lens: torch.Tensor,
+                          num_accepted_tokens: torch.Tensor,
+                          spec_metadata: Eagle3OneModelSpecMetadata,
                           num_contexts: int, num_gens: int,
                           runtime_draft_len: int,
                           num_ctx_tokens: int) -> torch.Tensor:
