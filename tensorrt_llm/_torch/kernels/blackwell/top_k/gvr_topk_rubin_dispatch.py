@@ -20,609 +20,317 @@ class _Tuning(NamedTuple):
 
 
 _REFERENCE_SMS = 208
-_N_BUCKET = 2048
-# Keys are (K, floor(N / 2048), power-of-two reference row count).
-_RULES: dict[tuple[int, int, int], _Tuning] = {
-    (512, 0, 2): _Tuning(family="default", options=(("warp_rank", True),), expected_family="reg"),
-    (512, 0, 1024): _Tuning(
-        family="default", options=(("warp_rank", True),), expected_family="reg"
-    ),
-    (512, 1, 512): _Tuning(
-        family="reg", block=256, min_blocks=3, options=(("warp_rank", True),), expected_family="reg"
-    ),
-    (512, 1, 1024): _Tuning(
-        family="reg", block=256, min_blocks=4, options=(("warp_rank", True),), expected_family="reg"
-    ),
-    (512, 2, 256): _Tuning(
-        family="blackwell_options", options=(("bracket_sample_lanes", 4),), expected_family="reg"
-    ),
-    (512, 2, 512): _Tuning(
-        family="reg", block=256, min_blocks=3, options=(("warp_rank", True),), expected_family="reg"
-    ),
-    (512, 2, 1024): _Tuning(
-        family="reg", block=256, min_blocks=4, options=(("warp_rank", True),), expected_family="reg"
-    ),
-    (512, 4, 2): _Tuning(
-        family="reg", block=1024, bins=2048, options=(("static_npad", True),), expected_family="reg"
-    ),
-    (512, 4, 512): _Tuning(
-        family="main",
-        block=256,
-        min_blocks=4,
-        unroll=8,
-        options=(("sfac", 96),),
-        expected_family="main",
-    ),
-    (512, 8, 2): _Tuning(
-        family="blackwell_options", options=(("dense_bracket", False),), expected_family="reg"
-    ),
-    (512, 16, 2): _Tuning(family="reg_clus", cluster=4, expected_family="reg_clus"),
-    (512, 16, 8): _Tuning(family="reg_clus", cluster=4, expected_family="reg_clus"),
-    (512, 16, 256): _Tuning(
-        family="main",
-        block=512,
-        min_blocks=2,
-        unroll=4,
-        options=(("sfac", 48),),
-        expected_family="main",
-    ),
-    (512, 32, 16): _Tuning(family="reg_clus", cluster=8, expected_family="reg_clus"),
-    (512, 32, 128): _Tuning(
-        family="main", block=1024, unroll=4, options=(("aim_num", 4),), expected_family="main"
-    ),
-    (512, 32, 256): _Tuning(
-        family="main",
-        block=512,
-        min_blocks=2,
-        unroll=4,
-        options=(("warp_rank", True),),
-        expected_family="main",
-    ),
-    (512, 32, 1024): _Tuning(
-        family="main",
-        block=512,
-        min_blocks=2,
-        unroll=4,
-        options=(("warp_rank", True),),
-        expected_family="main",
-    ),
-    (512, 64, 16): _Tuning(family="reg_clus", cluster=8, expected_family="reg_clus"),
-    (512, 64, 256): _Tuning(
-        family="main",
-        block=512,
-        min_blocks=2,
-        unroll=4,
-        options=(("aim_num", 8),),
-        expected_family="main",
-    ),
-    (512, 64, 512): _Tuning(family="default", options=(("aim_num", 8),), expected_family="main"),
-    (512, 64, 1024): _Tuning(
-        family="main", block=1024, unroll=4, options=(("aim_num", 4),), expected_family="main"
-    ),
-    (512, 127, 4): _Tuning(
-        family="main",
-        block=1024,
-        unroll=2,
-        parts=37,
-        options=(("amin_num", 4),),
-        expected_family="main",
-    ),
-    (512, 127, 8): _Tuning(
-        family="main",
-        block=1024,
-        unroll=4,
-        parts=16,
-        options=(("amin_num", 4),),
-        expected_family="main",
-    ),
-    (512, 127, 16): _Tuning(
-        family="clus", unroll=8, cluster=4, options=(("scap", 4096),), expected_family="clus"
-    ),
-    (512, 127, 128): _Tuning(
-        family="main", block=1024, unroll=4, options=(("sfac", 16),), expected_family="main"
-    ),
-    (512, 127, 256): _Tuning(
-        family="main",
-        block=512,
-        min_blocks=2,
-        unroll=4,
-        options=(("sfac", 16),),
-        expected_family="main",
-    ),
-    (512, 127, 512): _Tuning(
-        family="blackwell_options", options=(("sfac", 16),), expected_family="main"
-    ),
-    (512, 127, 1024): _Tuning(
-        family="main", block=1024, unroll=4, options=(("sfac", 16),), expected_family="main"
-    ),
-    (1024, 0, 1): _Tuning(
-        family="blackwell_options", options=(("bins", 512),), expected_family="reg"
-    ),
-    (1024, 0, 2): _Tuning(
-        family="blackwell_options", options=(("bins", 512),), expected_family="reg"
-    ),
-    (1024, 0, 4): _Tuning(
-        family="blackwell_options", options=(("bins", 512),), expected_family="reg"
-    ),
-    (1024, 0, 8): _Tuning(
-        family="blackwell_options", options=(("bins", 512),), expected_family="reg"
-    ),
-    (1024, 0, 16): _Tuning(
-        family="blackwell_options", options=(("stage_output", False),), expected_family="reg"
-    ),
-    (1024, 0, 32): _Tuning(
-        family="blackwell_options", options=(("warp_rank", False),), expected_family="reg"
-    ),
-    (1024, 0, 64): _Tuning(
-        family="blackwell_options", options=(("dense_bracket", False),), expected_family="reg"
-    ),
-    (1024, 0, 128): _Tuning(
-        family="blackwell_options", options=(("bins", 512),), expected_family="reg"
-    ),
-    (1024, 0, 256): _Tuning(
-        family="blackwell_options", options=(("bins", 1024),), expected_family="reg"
-    ),
-    (1024, 0, 512): _Tuning(
-        family="blackwell_options", options=(("rematerialize_bins", False),), expected_family="reg"
-    ),
-    (1024, 0, 1024): _Tuning(
-        family="blackwell_options", options=(("bins", 512),), expected_family="reg"
-    ),
-    (1024, 1, 1): _Tuning(
-        family="blackwell_options", options=(("bins", 1024),), expected_family="reg"
-    ),
-    (1024, 1, 2): _Tuning(
-        family="blackwell_options", options=(("bins", 2048),), expected_family="reg"
-    ),
-    (1024, 1, 4): _Tuning(
-        family="blackwell_options", options=(("bracket_sample_lanes", 8),), expected_family="reg"
-    ),
-    (1024, 1, 8): _Tuning(
-        family="blackwell_options", options=(("bracket_sample_lanes", 16),), expected_family="reg"
-    ),
-    (1024, 1, 16): _Tuning(
-        family="blackwell_options", options=(("warp_rank", True),), expected_family="reg"
-    ),
-    (1024, 1, 32): _Tuning(family="blackwell_options", expected_family="reg"),
-    (1024, 1, 64): _Tuning(
-        family="blackwell_options", options=(("bins", 1024),), expected_family="reg"
-    ),
-    (1024, 1, 128): _Tuning(
-        family="blackwell_options", options=(("QC", 160),), expected_family="reg"
-    ),
-    (1024, 1, 256): _Tuning(
-        family="blackwell_options", options=(("QC", 320),), expected_family="reg"
-    ),
-    (1024, 1, 512): _Tuning(
-        family="reg",
-        block=256,
-        min_blocks=4,
-        options=(("static_npad", True),),
-        expected_family="reg",
-    ),
-    (1024, 1, 1024): _Tuning(
-        family="blackwell_options", options=(("bracket_sample_lanes", 8),), expected_family="reg"
-    ),
-    (1024, 2, 1): _Tuning(
-        family="blackwell_options", options=(("warp_rank", True),), expected_family="reg"
-    ),
-    (1024, 2, 2): _Tuning(
-        family="blackwell_options", options=(("static_npad", True),), expected_family="reg"
-    ),
-    (1024, 2, 4): _Tuning(
-        family="blackwell_options", options=(("bracket_sample_lanes", 1),), expected_family="reg"
-    ),
-    (1024, 2, 8): _Tuning(family="blackwell_options", expected_family="reg"),
-    (1024, 2, 16): _Tuning(
-        family="blackwell_options", options=(("bracket_sample_lanes", 4),), expected_family="reg"
-    ),
-    (1024, 2, 32): _Tuning(
-        family="blackwell_options", options=(("bracket_sample_lanes", 8),), expected_family="reg"
-    ),
-    (1024, 2, 64): _Tuning(
-        family="blackwell_options", options=(("bracket_sample_lanes", 4),), expected_family="reg"
-    ),
-    (1024, 2, 128): _Tuning(
-        family="blackwell_options", options=(("dense_bracket", False),), expected_family="reg"
-    ),
-    (1024, 2, 256): _Tuning(
-        family="reg",
-        block=512,
-        min_blocks=2,
-        options=(("static_npad", True),),
-        expected_family="reg",
-    ),
-    (1024, 2, 512): _Tuning(
-        family="reg",
-        block=256,
-        min_blocks=3,
-        options=(("static_npad", True),),
-        expected_family="reg",
-    ),
-    (1024, 2, 1024): _Tuning(
-        family="reg", block=256, min_blocks=4, options=(("warp_rank", True),), expected_family="reg"
-    ),
-    (1024, 4, 1): _Tuning(
-        family="blackwell_options", options=(("bins", 2048),), expected_family="reg"
-    ),
-    (1024, 4, 2): _Tuning(
-        family="blackwell_options", options=(("QC", 320),), expected_family="reg"
-    ),
-    (1024, 4, 4): _Tuning(
-        family="blackwell_options", options=(("bracket_sample_lanes", 32),), expected_family="reg"
-    ),
-    (1024, 4, 8): _Tuning(family="blackwell_options", expected_family="reg"),
-    (1024, 4, 16): _Tuning(
-        family="blackwell_options", options=(("QC", 160),), expected_family="reg"
-    ),
-    (1024, 4, 32): _Tuning(
-        family="blackwell_options", options=(("bracket_sample_lanes", 16),), expected_family="reg"
-    ),
-    (1024, 4, 64): _Tuning(
-        family="blackwell_options", options=(("rematerialize_bins", False),), expected_family="reg"
-    ),
-    (1024, 4, 128): _Tuning(
-        family="blackwell_options", options=(("dense_bracket", False),), expected_family="reg"
-    ),
-    (1024, 4, 256): _Tuning(
-        family="blackwell_options", options=(("bins", 1024),), expected_family="reg"
-    ),
-    (1024, 4, 512): _Tuning(
-        family="blackwell_options", options=(("stage_output", False),), expected_family="reg"
-    ),
-    (1024, 4, 1024): _Tuning(
-        family="reg",
-        block=256,
-        min_blocks=4,
-        options=(("stage_output", False),),
-        expected_family="reg",
-    ),
-    (1024, 8, 1): _Tuning(family="reg_clus", cluster=4, expected_family="reg_clus"),
-    (1024, 8, 2): _Tuning(
-        family="blackwell_options", options=(("stage_output", True),), expected_family="reg"
-    ),
-    (1024, 8, 8): _Tuning(
-        family="blackwell_options", options=(("bracket_sample_lanes", 32),), expected_family="reg"
-    ),
-    (1024, 8, 16): _Tuning(
-        family="blackwell_options", options=(("stage_output", True),), expected_family="reg"
-    ),
-    (1024, 8, 32): _Tuning(
-        family="blackwell_options", options=(("bracket_sample_lanes", 32),), expected_family="reg"
-    ),
-    (1024, 8, 64): _Tuning(
-        family="blackwell_options", options=(("stage_output", True),), expected_family="reg"
-    ),
-    (1024, 8, 128): _Tuning(
-        family="blackwell_options", options=(("stage_output", True),), expected_family="reg"
-    ),
-    (1024, 16, 128): _Tuning(
-        family="reg", block=1024, bins=2048, options=(("static_npad", True),), expected_family="reg"
-    ),
-    (1024, 16, 256): _Tuning(
-        family="main",
-        block=512,
-        min_blocks=2,
-        unroll=4,
-        options=(("sfac", 48),),
-        expected_family="main",
-    ),
-    (1024, 32, 128): _Tuning(
-        family="main", block=1024, unroll=4, options=(("aim_num", 3),), expected_family="main"
-    ),
-    (1024, 32, 256): _Tuning(
-        family="main",
-        block=512,
-        min_blocks=2,
-        unroll=4,
-        options=(("sfac", 48),),
-        expected_family="main",
-    ),
-    (1024, 32, 1024): _Tuning(
-        family="main",
-        block=512,
-        min_blocks=2,
-        unroll=4,
-        options=(("sfac", 48),),
-        expected_family="main",
-    ),
-    (1024, 64, 16): _Tuning(family="reg_clus", cluster=8, expected_family="reg_clus"),
-    (1024, 64, 128): _Tuning(
-        family="main", block=1024, unroll=4, options=(("aim_num", 4),), expected_family="main"
-    ),
-    (1024, 64, 512): _Tuning(
-        family="main",
-        block=256,
-        min_blocks=4,
-        unroll=8,
-        options=(("aim_num", 7),),
-        expected_family="main",
-    ),
-    (1024, 64, 1024): _Tuning(
-        family="main", block=1024, unroll=4, options=(("sfac", 48),), expected_family="main"
-    ),
-    (1024, 127, 4): _Tuning(
-        family="main",
-        block=1024,
-        unroll=2,
-        parts=52,
-        options=(("warp_rank", True),),
-        expected_family="main",
-    ),
-    (1024, 127, 8): _Tuning(
-        family="main",
-        block=1024,
-        unroll=4,
-        parts=16,
-        options=(("tsh_en", 1),),
-        expected_family="main",
-    ),
-    (1024, 127, 128): _Tuning(
-        family="main", block=1024, unroll=4, options=(("sfac", 16),), expected_family="main"
-    ),
-    (1024, 127, 256): _Tuning(
-        family="main",
-        block=512,
-        min_blocks=2,
-        unroll=4,
-        options=(("aim_num", 7),),
-        expected_family="main",
-    ),
-    (1024, 127, 1024): _Tuning(
-        family="main", block=1024, unroll=4, options=(("aim_num", 8),), expected_family="main"
-    ),
-    (2048, 2, 1): _Tuning(
-        family="blackwell_options", options=(("bins", 1024),), expected_family="reg"
-    ),
-    (2048, 2, 2): _Tuning(
-        family="blackwell_options", options=(("bracket_sample_lanes", 32),), expected_family="reg"
-    ),
-    (2048, 2, 4): _Tuning(
-        family="blackwell_options", options=(("bracket_sample_lanes", 16),), expected_family="reg"
-    ),
-    (2048, 2, 8): _Tuning(
-        family="blackwell_options", options=(("bracket_sample_lanes", 16),), expected_family="reg"
-    ),
-    (2048, 2, 16): _Tuning(
-        family="blackwell_options", options=(("bracket_sample_lanes", 16),), expected_family="reg"
-    ),
-    (2048, 2, 32): _Tuning(
-        family="blackwell_options", options=(("bracket_sample_lanes", 16),), expected_family="reg"
-    ),
-    (2048, 2, 64): _Tuning(
-        family="blackwell_options", options=(("dense_bracket", False),), expected_family="reg"
-    ),
-    (2048, 2, 128): _Tuning(
-        family="blackwell_options", options=(("static_npad", True),), expected_family="reg"
-    ),
-    (2048, 2, 256): _Tuning(
-        family="blackwell_options", options=(("warp_rank", True),), expected_family="reg"
-    ),
-    (2048, 2, 512): _Tuning(
-        family="blackwell_options", options=(("warp_rank", True),), expected_family="reg"
-    ),
-    (2048, 2, 1024): _Tuning(
-        family="blackwell_options", options=(("warp_rank", True),), expected_family="reg"
-    ),
-    (2048, 4, 1): _Tuning(
-        family="blackwell_options", options=(("rematerialize_bins", True),), expected_family="reg"
-    ),
-    (2048, 4, 2): _Tuning(
-        family="blackwell_options", options=(("dense_bracket", False),), expected_family="reg"
-    ),
-    (2048, 4, 4): _Tuning(family="blackwell_options", expected_family="reg"),
-    (2048, 4, 8): _Tuning(
-        family="blackwell_options", options=(("rematerialize_bins", True),), expected_family="reg"
-    ),
-    (2048, 4, 16): _Tuning(
-        family="blackwell_options", options=(("dense_bracket", False),), expected_family="reg"
-    ),
-    (2048, 4, 32): _Tuning(
-        family="blackwell_options", options=(("rematerialize_bins", True),), expected_family="reg"
-    ),
-    (2048, 4, 64): _Tuning(
-        family="blackwell_options", options=(("rematerialize_bins", True),), expected_family="reg"
-    ),
-    (2048, 4, 128): _Tuning(
-        family="blackwell_options", options=(("static_npad", True),), expected_family="reg"
-    ),
-    (2048, 4, 256): _Tuning(
-        family="blackwell_options", options=(("dense_bracket", False),), expected_family="reg"
-    ),
-    (2048, 4, 512): _Tuning(
-        family="blackwell_options", options=(("bracket_sample_lanes", 2),), expected_family="reg"
-    ),
-    (2048, 4, 1024): _Tuning(
-        family="blackwell_options", options=(("warp_rank", True),), expected_family="reg"
-    ),
-    (2048, 8, 16): _Tuning(
-        family="reg", block=1024, options=(("static_npad", True),), expected_family="reg"
-    ),
-    (2048, 8, 32): _Tuning(
-        family="blackwell_options", options=(("QC", 160),), expected_family="reg"
-    ),
-    (2048, 8, 64): _Tuning(
-        family="blackwell_options", options=(("warp_rank", True),), expected_family="reg"
-    ),
-    (2048, 8, 128): _Tuning(
-        family="blackwell_options", options=(("rematerialize_bins", True),), expected_family="reg"
-    ),
-    (2048, 8, 256): _Tuning(
-        family="main",
-        block=512,
-        min_blocks=2,
-        unroll=4,
-        options=(("warp_rank", True),),
-        expected_family="main",
-    ),
-    (2048, 8, 512): _Tuning(
-        family="blackwell_options", options=(("staged_k", 2048),), expected_family="main"
-    ),
-    (2048, 8, 1024): _Tuning(
-        family="main",
-        block=512,
-        min_blocks=2,
-        unroll=4,
-        options=(("warp_rank", True),),
-        expected_family="main",
-    ),
-    (2048, 16, 64): _Tuning(
-        family="main", block=512, unroll=8, options=(("aim_num", 3),), expected_family="main"
-    ),
-    (2048, 16, 128): _Tuning(
-        family="main", block=512, unroll=8, options=(("aim_num", 3),), expected_family="main"
-    ),
-    (2048, 16, 256): _Tuning(
-        family="main",
-        block=512,
-        min_blocks=2,
-        unroll=4,
-        options=(("warp_rank", True),),
-        expected_family="main",
-    ),
-    (2048, 16, 1024): _Tuning(
-        family="main",
-        block=512,
-        min_blocks=2,
-        unroll=4,
-        options=(("warp_rank", True),),
-        expected_family="main",
-    ),
-    (2048, 32, 16): _Tuning(family="reg_clus", cluster=8, expected_family="reg_clus"),
-    (2048, 32, 64): _Tuning(
-        family="main",
-        block=1024,
-        unroll=8,
-        parts=3,
-        options=(("amin_num", 2),),
-        expected_family="main",
-    ),
-    (2048, 32, 128): _Tuning(
-        family="main", block=1024, unroll=4, options=(("aim_num", 4),), expected_family="main"
-    ),
-    (2048, 32, 256): _Tuning(
-        family="main",
-        block=512,
-        min_blocks=2,
-        unroll=4,
-        options=(("warp_rank", True),),
-        expected_family="main",
-    ),
-    (2048, 32, 1024): _Tuning(
-        family="main",
-        block=512,
-        min_blocks=2,
-        unroll=4,
-        options=(("warp_rank", True),),
-        expected_family="main",
-    ),
-    (2048, 64, 8): _Tuning(
-        family="main",
-        block=1024,
-        unroll=2,
-        parts=26,
-        options=(("sfac", 64),),
-        expected_family="main",
-    ),
-    (2048, 64, 16): _Tuning(
-        family="main",
-        block=1024,
-        unroll=4,
-        parts=13,
-        options=(("sfac", 64),),
-        expected_family="main",
-    ),
-    (2048, 64, 64): _Tuning(
-        family="main",
-        block=1024,
-        unroll=4,
-        parts=3,
-        options=(("sfac", 64),),
-        expected_family="main",
-    ),
-    (2048, 64, 128): _Tuning(
-        family="main", block=1024, unroll=4, options=(("aim_num", 3),), expected_family="main"
-    ),
-    (2048, 64, 256): _Tuning(
-        family="main",
-        block=512,
-        min_blocks=2,
-        unroll=4,
-        options=(("warp_rank", True),),
-        expected_family="main",
-    ),
-    (2048, 64, 1024): _Tuning(
-        family="main",
-        block=512,
-        min_blocks=2,
-        unroll=4,
-        options=(("warp_rank", True),),
-        expected_family="main",
-    ),
-    (2048, 79, 4): _Tuning(
-        family="main",
-        block=1024,
-        unroll=2,
-        parts=40,
-        options=(("amin_num", 2),),
-        expected_family="main",
-    ),
-    (2048, 79, 8): _Tuning(
-        family="main",
-        block=1024,
-        unroll=2,
-        parts=26,
-        options=(("amin_num", 2),),
-        expected_family="main",
-    ),
-    (2048, 79, 16): _Tuning(
-        family="main",
-        block=1024,
-        unroll=4,
-        parts=13,
-        options=(("amin_num", 2),),
-        expected_family="main",
-    ),
-    (2048, 79, 32): _Tuning(
-        family="main",
-        block=1024,
-        unroll=8,
-        parts=6,
-        options=(("amin_num", 2),),
-        expected_family="main",
-    ),
-    (2048, 79, 64): _Tuning(
-        family="main",
-        block=1024,
-        unroll=4,
-        parts=2,
-        options=(("warp_rank", True),),
-        expected_family="main",
-    ),
-    (2048, 79, 128): _Tuning(
-        family="main", block=1024, unroll=4, options=(("aim_num", 3),), expected_family="main"
-    ),
-    (2048, 79, 256): _Tuning(
-        family="main",
-        block=512,
-        min_blocks=2,
-        unroll=4,
-        options=(("sfac", 48),),
-        expected_family="main",
-    ),
-    (2048, 79, 1024): _Tuning(
-        family="main", block=1024, unroll=4, options=(("sfac", 48),), expected_family="main"
-    ),
-}
+# Inclusive (K, N minimum, N maximum, reference rows minimum/maximum, tuning).
+_REGIONS: tuple[tuple[int, int, int, int, int, _Tuning], ...] = (
+    (512, 513, 2047, 3, 4, _Tuning(family="reg", block=256, min_blocks=3, bins=1024)),
+    (512, 2048, 4095, 3, 4, _Tuning(family="reg", block=512, min_blocks=2, bins=1024)),
+    (512, 4096, 65535, 3, 256, _Tuning(family="blackwell_options")),
+    (512, 65536, 260095, 3, 16, _Tuning(family="reg_clus", cluster=8)),
+    (
+        512,
+        260096,
+        262143,
+        3,
+        16,
+        _Tuning(
+            family="main", block=1024, min_blocks=1, unroll=4, parts=16, options=(("amin_num", 4),)
+        ),
+    ),
+    (
+        512,
+        65536,
+        262143,
+        65,
+        128,
+        _Tuning(
+            family="main",
+            block=1024,
+            min_blocks=1,
+            unroll=4,
+            parts=1,
+            options=(("warp_rank", True),),
+        ),
+    ),
+    (
+        512,
+        65536,
+        262143,
+        129,
+        256,
+        _Tuning(
+            family="main", block=512, min_blocks=2, unroll=4, parts=1, options=(("aim_num", 4),)
+        ),
+    ),
+    (512, 513, 2047, 257, 1024, _Tuning(family="default", options=(("bins", 512),))),
+    (
+        512,
+        2048,
+        8191,
+        257,
+        1024,
+        _Tuning(family="reg", block=256, min_blocks=4, bins=1024, options=(("warp_rank", True),)),
+    ),
+    (
+        512,
+        8192,
+        131071,
+        257,
+        512,
+        _Tuning(family="main", block=256, min_blocks=4, unroll=8, parts=1),
+    ),
+    (512, 8192, 32767, 513, 1024, _Tuning(family="blackwell_options")),
+    (
+        512,
+        32768,
+        131071,
+        513,
+        1024,
+        _Tuning(
+            family="main", block=512, min_blocks=2, unroll=4, parts=1, options=(("aim_num", 4),)
+        ),
+    ),
+    (512, 131072, 262143, 257, 512, _Tuning(family="default", options=(("aim_num", 8),))),
+    (
+        512,
+        131072,
+        262143,
+        513,
+        1024,
+        _Tuning(
+            family="main", block=1024, min_blocks=1, unroll=4, parts=1, options=(("aim_num", 8),)
+        ),
+    ),
+    (1024, 1025, 2047, 1, 4, _Tuning(family="blackwell_options", options=(("bins", 512),))),
+    (1024, 1025, 2047, 5, 1024, _Tuning(family="blackwell_options", options=(("bins", 256),))),
+    (1024, 2048, 16383, 1, 128, _Tuning(family="blackwell_options", options=(("QC", 80),))),
+    (
+        1024,
+        2048,
+        4095,
+        129,
+        256,
+        _Tuning(family="blackwell_options", options=(("bracket_sample_lanes", 8),)),
+    ),
+    (
+        1024,
+        4096,
+        8191,
+        129,
+        256,
+        _Tuning(family="reg", block=512, min_blocks=2, bins=1024, options=(("static_npad", True),)),
+    ),
+    (
+        1024,
+        2048,
+        8191,
+        257,
+        1024,
+        _Tuning(family="reg", block=256, min_blocks=4, bins=1024, options=(("warp_rank", True),)),
+    ),
+    (
+        1024,
+        8192,
+        16383,
+        129,
+        512,
+        _Tuning(family="blackwell_options", options=(("stage_output", False),)),
+    ),
+    (1024, 8192, 16383, 513, 1024, _Tuning(family="reg", block=256, min_blocks=4, bins=1024)),
+    (
+        1024,
+        16384,
+        32767,
+        1,
+        128,
+        _Tuning(family="blackwell_options", options=(("stage_output", True),)),
+    ),
+    (1024, 32768, 260095, 1, 16, _Tuning(family="reg_clus", cluster=8)),
+    (
+        1024,
+        260096,
+        262143,
+        1,
+        16,
+        _Tuning(
+            family="main",
+            block=1024,
+            min_blocks=1,
+            unroll=2,
+            parts=52,
+            options=(("warp_rank", True),),
+        ),
+    ),
+    (
+        1024,
+        32768,
+        65535,
+        65,
+        128,
+        _Tuning(
+            family="reg", block=1024, min_blocks=1, bins=2048, options=(("static_npad", True),)
+        ),
+    ),
+    (
+        1024,
+        65536,
+        262143,
+        65,
+        128,
+        _Tuning(
+            family="main", block=1024, min_blocks=1, unroll=4, parts=1, options=(("aim_num", 4),)
+        ),
+    ),
+    (
+        1024,
+        16384,
+        262143,
+        129,
+        256,
+        _Tuning(family="main", block=512, min_blocks=2, unroll=4, parts=1),
+    ),
+    (1024, 65536, 260095, 257, 512, _Tuning(family="default", options=(("sfac", 48),))),
+    (
+        1024,
+        65536,
+        131071,
+        513,
+        1024,
+        _Tuning(family="main", block=512, min_blocks=2, unroll=4, parts=1, options=(("sfac", 48),)),
+    ),
+    (
+        1024,
+        131072,
+        260095,
+        513,
+        1024,
+        _Tuning(
+            family="main", block=1024, min_blocks=1, unroll=4, parts=1, options=(("sfac", 48),)
+        ),
+    ),
+    (
+        1024,
+        260096,
+        262143,
+        257,
+        1024,
+        _Tuning(
+            family="main", block=1024, min_blocks=1, unroll=4, parts=1, options=(("aim_num", 8),)
+        ),
+    ),
+    (
+        2048,
+        4096,
+        16383,
+        1,
+        1024,
+        _Tuning(family="blackwell_options", options=(("warp_rank", True),)),
+    ),
+    (2048, 16384, 163839, 1, 1, _Tuning(family="blackwell_options")),
+    (
+        2048,
+        16384,
+        32767,
+        2,
+        4,
+        _Tuning(
+            family="reg", block=1024, min_blocks=1, bins=1024, options=(("static_npad", True),)
+        ),
+    ),
+    (
+        2048,
+        16384,
+        32767,
+        5,
+        8,
+        _Tuning(
+            family="reg", block=1024, min_blocks=1, bins=1024, options=(("dense_bracket", True),)
+        ),
+    ),
+    (
+        2048,
+        16384,
+        32767,
+        9,
+        128,
+        _Tuning(
+            family="reg", block=1024, min_blocks=1, bins=1024, options=(("static_npad", True),)
+        ),
+    ),
+    (2048, 32768, 131071, 2, 16, _Tuning(family="reg_clus", cluster=8)),
+    (
+        2048,
+        131072,
+        161791,
+        2,
+        16,
+        _Tuning(family="main", block=1024, min_blocks=1, unroll=2, parts=208),
+    ),
+    (2048, 32768, 161791, 17, 32, _Tuning(family="blackwell_options")),
+    (
+        2048,
+        161792,
+        163839,
+        2,
+        32,
+        _Tuning(
+            family="main", block=1024, min_blocks=1, unroll=2, parts=40, options=(("amin_num", 2),)
+        ),
+    ),
+    (
+        2048,
+        32768,
+        65535,
+        33,
+        128,
+        _Tuning(
+            family="main", block=512, min_blocks=1, unroll=8, parts=1, options=(("aim_num", 3),)
+        ),
+    ),
+    (
+        2048,
+        65536,
+        131071,
+        33,
+        128,
+        _Tuning(
+            family="main", block=1024, min_blocks=1, unroll=4, parts=1, options=(("aim_num", 4),)
+        ),
+    ),
+    (
+        2048,
+        131072,
+        163839,
+        33,
+        128,
+        _Tuning(
+            family="main", block=1024, min_blocks=1, unroll=4, parts=1, options=(("aim_num", 3),)
+        ),
+    ),
+    (2048, 16384, 163839, 129, 512, _Tuning(family="blackwell_options")),
+    (
+        2048,
+        16384,
+        163839,
+        513,
+        1024,
+        _Tuning(family="main", block=512, min_blocks=2, unroll=4, parts=1),
+    ),
+)
 
 
 def select_tuning(rows: int, n: int, k: int, num_sms: int, sm_version: int) -> _Tuning | None:
-    """Select by resource-normalized shape; scores and model identity are not inputs."""
+    """Select continuous resource-normalized regions independently of allocation."""
     if sm_version != 107 or n <= k or rows < 1 or num_sms < 1:
         return None
     reference_rows = (rows * _REFERENCE_SMS + num_sms - 1) // num_sms
-    row_bucket = 1 << (reference_rows - 1).bit_length()
-    tuning = _RULES.get((k, n // _N_BUCKET, row_bucket))
+    tuning = next(
+        (
+            t
+            for kk, lo, hi, blo, bhi, t in _REGIONS
+            if kk == k and lo <= n <= hi and blo <= reference_rows <= bhi
+        ),
+        None,
+    )
     if tuning is None:
         return None
     if tuning.family == "reg":
@@ -630,6 +338,10 @@ def select_tuning(rows: int, n: int, k: int, num_sms: int, sm_version: int) -> _
         if vpt > 8 or k > 4 * tuning.block:
             return None
     if tuning.family == "reg_clus" and (n >> 2) > 4 * 1024 * tuning.cluster:
+        return None
+    if tuning.family in ("main", "clus") and n <= 4096:
+        return None
+    if tuning.family == "clus" and k > 1024:
         return None
     if tuning.family == "main" and tuning.parts > 1 and rows > 160:
         return None
@@ -723,6 +435,23 @@ def make_plan(
         )
         plan["rt"].update(R=parts, SCAP_=scap, CMP_=cmp_)
     for name, value in tuning.options:
+        register_options = {
+            "stage_output",
+            "static_npad",
+            "rematerialize_bins",
+            "dense_bracket",
+            "bracket_sample_lanes",
+            "QC",
+            "bins",
+        }
+        streaming_options = {"staged_k", "aim_num", "sfac", "amin_num", "sd_en", "tsh_en"}
+        if (
+            (name in register_options and plan["kernel"] not in ("reg", "regimg"))
+            or (name in streaming_options and plan["kernel"] != "main")
+            or (name in ("scap", "cmp_") and plan["kernel"] != "clus")
+            or (name == "warp_rank" and plan["kernel"] not in ("reg", "regimg", "main"))
+        ):
+            return baseline_route(rows, n, npad, k, num_sms, 107)
         if name == "bins" and (value < plan["block"] or value % plan["block"]):
             return baseline_route(rows, n, npad, k, num_sms, 107)
         if name == "staged_k" and value and plan["rt"].get("R") != 1:
