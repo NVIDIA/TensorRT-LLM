@@ -363,7 +363,8 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
                         if cutlass.const_expr(finalize_attention):
                             stats_weight *= stats_sink_scale
                         smem_scale[
-                            stats_row * Int32(cfg.num_ctas_per_seq_kv) + weight_split_idx
+                            stats_row * Int32(cfg.num_ctas_per_seq_kv)
+                            + weight_split_idx
                         ] = stats_weight
 
     prims.barrier_cta_sync(
