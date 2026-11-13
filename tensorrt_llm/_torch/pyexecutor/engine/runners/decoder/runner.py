@@ -72,6 +72,7 @@ from tensorrt_llm._torch.speculative import (
     prepare_attn_metadata_for_draft_replay,
     restore_attn_metadata_after_draft_replay,
 )
+from tensorrt_llm._torch.speculative.block_verification import poll_block_verification_stats
 from tensorrt_llm._torch.speculative.interface import INVALID_PROMPT_LOOKAHEAD_TOKEN
 from tensorrt_llm._torch.speculative.spec_sampler_base import SampleStateTensorsSpec
 from tensorrt_llm._torch.speculative.utils import get_static_draft_len, resolve_draft_len
@@ -4326,6 +4327,8 @@ class DecoderRunner(ScheduledModelRunner):
                 spec_metadata.populate_context_prompt_lookahead(context_prompt_lookahead)
             # No-op for non 1-model
             spec_metadata.populate_sampling_params_for_one_model(scheduled_requests.all_requests())
+            # Engagement counters of block verification, for every one-model drafter.
+            poll_block_verification_stats()
             spec_metadata.prepare()
             # One-model rejection: one-hot the stale draft_probs rows of gen
             # requests that produced no draft tokens this step, so the (possibly

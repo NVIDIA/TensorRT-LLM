@@ -32,7 +32,6 @@ from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
 from ..pyexecutor.resource_manager import BaseResourceManager
 from .accept_stats import maybe_create_recorder
-from .block_verification import poll_block_verification_stats
 from .dflash_attention import (
     dflash_trtllm_gen_unavailability_reason,
     get_dflash_paged_append,
@@ -595,7 +594,6 @@ class DFlashSpecMetadata(SpecMetadata):
 
     def prepare(self):
         assert self.request_ids is not None
-        poll_block_verification_stats()
 
         num_seqs = len(self.request_ids)
         batch_indices = torch.arange(

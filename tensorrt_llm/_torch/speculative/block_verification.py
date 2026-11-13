@@ -615,7 +615,13 @@ def verify_drafts(
         f"larger batches keep the token-level rule ({_MAX_BATCH_ENV}).",
         key="spec.block_verification_route",
     )
-    if batch <= limit:
+    joint = batch <= limit
+    logger.info_once(
+        f"Block verification: a batch of {batch} requests is served by the "
+        f"{'joint' if joint else 'token-level'} rule.",
+        key=f"spec.block_verification_batch_{batch}",
+    )
+    if joint:
         return block_verify_one_model(
             draft_tokens, draft_probs, target_probs, seed, offset, slot_ids, dummy_slot
         )
@@ -630,10 +636,6 @@ def verify_drafts(
     stats = _STATS.get(num_accepted.device) if slot_ids is not None else None
     if stats is not None:
         _count_token_level_kernel[(batch,)](num_accepted, _aligned(slot_ids), stats, dummy_slot)
-    logger.info_once(
-        f"Block verification: a batch of {batch} requests is served by the token-level rule.",
-        key="spec.block_verification_token_level",
-    )
     return tokens, num_accepted
 
 
