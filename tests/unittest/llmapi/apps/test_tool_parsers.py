@@ -5282,6 +5282,51 @@ class TestMiniMaxM2ToolParser:
         assert normal_text == "I'll check the weather in Paris for you."
         assert names == ["get_weather"]
 
+    @pytest.mark.timeout(10)
+    def test_parameter_value_with_angle_brackets_streams_within_time_bound(
+            self, sample_tools):
+        """Stream a long parameter value full of `>` within the time bound.
+
+        Code values such as `if (a > b) { p->x = q; }` hold many `>`, four per
+        increment here. The runner timeout guards against regex work that
+        grows with every `>` seen on each increment.
+        """
+        value = "if (a > b) { p->x = q; }\n" * 160 + "return;"
+        text = ('<minimax:tool_call>'
+                '<invoke name="get_weather">'
+                f'<parameter name="location">{value}</parameter>'
+                '</invoke>'
+                '</minimax:tool_call>')
+        parser = MiniMaxM2ToolParser()
+        calls = []
+        for i in range(0, len(text), 4):
+            calls.extend(
+                parser.parse_streaming_increment(text[i:i + 4],
+                                                 sample_tools).calls)
+        calls.extend(parser.finish(sample_tools).calls)
+
+        first_call = [c for c in calls if c.tool_index == 0]
+        assert first_call[0].name == "get_weather"
+        arguments = "".join(c.parameters for c in first_call)
+        assert json.loads(arguments) == {"location": value}
+
+    def test_detect_and_parse_parameter_value_with_angle_brackets(
+            self, sample_tools, parser):
+        """Parameter values retain their `>` and `->` characters."""
+        text = ('<minimax:tool_call>'
+                '<invoke name="get_weather">'
+                '<parameter name="location">a > b -> c</parameter>'
+                '</invoke>'
+                '</minimax:tool_call>')
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get_weather"
+        assert json.loads(result.calls[0].parameters) == {
+            "location": "a > b -> c"
+        }
+
 
 # ============================================================================
 # Reasoning Parser Tests for Interleaved Thinking
