@@ -42,10 +42,13 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.distributed as dist
+
+if TYPE_CHECKING:
+    from _validating import validating
 
 assert torch.cuda.is_available(), "allgather requires CUDA devices"
 

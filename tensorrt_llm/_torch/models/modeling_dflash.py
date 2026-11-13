@@ -1725,7 +1725,7 @@ class DFlashForCausalLM(nn.Module):
 
         sm_count = self._dflash_trtllm_gen_sm_count
         counter_bytes = trtllm_gen_ops.get_multi_ctas_kv_counter_size(
-            num_heads * block_size, max_batch_size, sm_count
+            max(heads for _, heads in shapes), max_batch_size, sm_count
         )
         counters = self._dflash_trtllm_gen_counters
         counters_need_allocation = (
