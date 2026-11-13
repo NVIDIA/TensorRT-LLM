@@ -1,3 +1,5 @@
+<!-- Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved. -->
+
 # Description
 
 This folder contains QA test definitions for TensorRT-LLM, which are executed on a daily/release schedule. These tests focus on end-to-end validation, accuracy verification, disaggregated testing, and performance benchmarking.
@@ -48,13 +50,19 @@ This directory contains various test configuration files:
 
 ### Functional Test Lists
 - `llm_function_core.txt` - Primary test list for single node multi-GPU scenarios (all new test cases should be added here)
-- `llm_function_multinode.yml` - Multi-node functional test cases with per-case launch parameters
+- `functional/llm_function_multinode.yml` - Multi-node functional test cases with per-case launch parameters
 - `llm_function_rtx6k.txt` - RTX 6000 series specific tests
 - `llm_function_l20.txt` - L20 specific tests, only contains single gpu cases
 
+YAML case lists with `defaults` and `tests[].case` belong in `functional/`.
+Keep only versioned `trt-test-db` YAML files directly in `qa/`. The pinned
+`trt-test-db` reader scans `qa/*.yml` without recursion and parses every file
+before selecting a context; a case list there prevents performance list generation.
+Both QA validators include `functional/*.yml`.
+
 ### Multi-node Launch Parameters
 
-`llm_function_multinode.yml` contains a `tests` sequence. Each entry has an exact
+`functional/llm_function_multinode.yml` contains a `tests` sequence. Each entry has an exact
 pytest node ID in `case` and an optional `launch` mapping. Entries without
 `launch` use `defaults.launch`, which specifies `mode: mpi`, `world_size: 16`,
 and `nodes: 2`. Per-case launch fields override the defaults; omit fields whose
@@ -80,8 +88,14 @@ The Jenkins consumer must parse this YAML, resolve each entry's launch parameter
 and generate a temporary single-case text list for the existing test runner.
 The QA validator generates temporary text lists from YAML for runtime collection
 and includes those cases when checking membership against `waives.txt`.
-Jenkins consumers that still reference `llm_function_multinode.txt` must migrate
-to the YAML list and generate temporary text lists before invoking the runner.
+The QA cluster runner is maintained separately in the internal `trt_jenkins`
+repository (`jenkinsfile/llm_test_cluster.groovy`). Its functional list selector
+and any job defaults must use `qa/functional/llm_function_multinode.yml`, relative
+to `tests/integration/test_lists/`. Coordinate that consumer update with this
+layout change. Consumers of the former text list must also parse the YAML launch
+parameters and generate temporary single-case text lists before invoking the runner.
+Do not pass this case list to `trt-test-db`; performance selectors continue to use
+`qa/llm_perf_multinode.yml` and the `qa/` database directory.
 
 ### Performance Test Files
 - `llm_perf_full.yml` - Main performance test configuration

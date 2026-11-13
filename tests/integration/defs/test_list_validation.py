@@ -83,7 +83,9 @@ def test_list_validation(test_root, all_pytest_items, trt_config):
 
     # Glob all the test db files.
     test_db_path = os.path.join(test_root, "test_lists", "*", "*.yml")
-    all_test_dbs = glob.glob(test_db_path)
+    functional_list_path = os.path.join(test_root, "test_lists", "qa",
+                                        "functional", "*.yml")
+    all_test_dbs = glob.glob(test_db_path) + glob.glob(functional_list_path)
     assert len(all_test_dbs
                ) > 0, f"Cannot find any test lists with path {test_db_path}!"
 
