@@ -10769,6 +10769,13 @@ class PyExecutor:
         # Cancellation and request-scoped failures can terminate before the
         # normal post-prefill release point, including with a partial buffer.
         self._release_multimodal_resources(request)
+        # Finished requests can remain in the last batch. Generation no longer
+        # needs the retained MRoPE delta, including its CUDA IPC storage.
+        if getattr(request, "py_mrope_position_delta", None) is not None:
+            request.py_mrope_position_delta = None
+        mm_data = getattr(request, "py_multimodal_data", None)
+        if mm_data:
+            mm_data.clear()
         if self.gather_all_responses or self.dist.rank == 0:
             self.result_wait_queues.pop(request.py_request_id, None)
 

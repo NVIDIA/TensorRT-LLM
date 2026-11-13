@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import weakref
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -12,6 +13,7 @@ from _torch.pyexecutor.multimodal_utils import (
     make_mm_request,
     record_output,
 )
+from torch.multiprocessing.reductions import StorageWeakRef
 
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     MultimodalEncoderContractError,
@@ -1133,6 +1135,41 @@ def test_terminate_request_releases_multimodal_cache_references_idempotently() -
     # A repeated termination finds no references left to release.
     executor._do_terminate_request(request)
     assert cache.stats() == stats
+
+
+def test_mrope_storage_is_retained_for_generation_and_released_at_termination() -> None:
+    delta = torch.tensor([[7]], dtype=torch.int32)
+    tensor_ref = weakref.ref(delta)
+    storage_ref = StorageWeakRef(delta.untyped_storage())
+    request = make_llm_request(
+        1,
+        {"mrope_config": {"mrope_position_deltas": delta}, "image": {"pixels": torch.ones(1)}},
+    )
+    request.py_mrope_position_delta = delta
+    del delta
+
+    executor = object.__new__(PyExecutor)
+    executor._free_request_resources = Mock()
+    executor.gather_all_responses = False
+    executor.dist = SimpleNamespace(rank=0)
+    executor.result_wait_queues = {request.py_request_id: object()}
+    executor.previous_batch = SimpleNamespace(requests=[request])
+
+    executor._release_multimodal_resources(request)
+    assert tensor_ref() is request.py_mrope_position_delta
+    assert not storage_ref.expired()
+    assert set(request.py_multimodal_data) == {"mrope_config"}
+
+    executor._do_terminate_request(request)
+    assert request.py_mrope_position_delta is None
+    assert request.py_multimodal_data == {}
+    assert tensor_ref() is None
+    assert storage_ref.expired()
+    assert executor.previous_batch.requests == [request]
+    assert not executor.result_wait_queues
+
+    executor._do_terminate_request(request)
+    assert storage_ref.expired()
 
 
 def test_weight_invalidation_rejects_live_references():
