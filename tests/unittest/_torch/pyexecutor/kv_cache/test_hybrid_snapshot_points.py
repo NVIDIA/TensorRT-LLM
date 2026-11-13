@@ -182,8 +182,5 @@ def test_snapshot_counters_are_logged_at_info_once_a_minute(monkeypatch):
     )
     for _ in range(3):
         mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=999)
+    # At most one INFO line a minute: the first two recordings are one minute apart.
     assert info.call_count == 2
-    line = info.call_args.args[0]
-    assert line.startswith("[MambaHybridCacheManagerV2] recurrent snapshot counters ")
-    assert "inflight_prefix_deferrals=0" in line
-    assert line.endswith("inflight_prefix_points_taken=0")

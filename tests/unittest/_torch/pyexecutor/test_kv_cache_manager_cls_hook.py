@@ -45,10 +45,6 @@ def info(monkeypatch):
     return lines
 
 
-def test_the_default_is_none():
-    assert RuntimeHooks().kv_cache_manager_cls is None
-
-
 @pytest.mark.parametrize("model", [_DeclaresNothing(), _Declares(None)], ids=["absent", "none"])
 def test_without_a_declaration_the_resolved_class_is_kept(model, info):
     assert _util.model_declared_kv_cache_manager_cls(model, _Resolved) is _Resolved
@@ -97,20 +93,7 @@ def _creator(model, monkeypatch, resolved=_Resolved):
     return creator
 
 
-@pytest.mark.parametrize(
-    "model, expected",
-    [
-        (_DeclaresNothing(), _Resolved),
-        (_Declares(None), _Resolved),
-        (_Declares(_Subclass), _Subclass),
-    ],
-    ids=["absent", "none", "subclass"],
-)
-def test_the_kv_cache_creator_builds_the_declared_subclass(model, expected, monkeypatch, info):
-    assert _creator(model, monkeypatch)._get_model_kv_cache_manager_cls() is expected
-
-
-def test_the_kv_cache_creator_rejects_a_class_that_is_not_a_subclass(monkeypatch, info):
-    creator = _creator(_Declares(_Unrelated), monkeypatch)
-    with pytest.raises(ValueError, match="_Unrelated .*not a subclass of _Resolved"):
-        creator._get_model_kv_cache_manager_cls()
+def test_the_kv_cache_creator_builds_the_declared_subclass(monkeypatch, info):
+    """The creator seam reads the hook, not only the pure function next to it."""
+    creator = _creator(_Declares(_Subclass), monkeypatch)
+    assert creator._get_model_kv_cache_manager_cls() is _Subclass

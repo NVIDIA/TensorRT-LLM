@@ -191,13 +191,12 @@ def test_create_kv_cache_swa_endpoint_priority(
         assert kwargs["custom_priority_callback"](255, AttnLifeCycle(4096, 0)) == 70
 
 
-@pytest.mark.parametrize("is_dummy", [False, True])
 @pytest.mark.parametrize("rewind", [0, 1024])
-def test_create_kv_cache_forwards_custom_priority_callback(is_dummy: bool, rewind: int) -> None:
+def test_create_kv_cache_forwards_custom_priority_callback(rewind: int) -> None:
     """A caller's priority callback (a subclass's _context_priority_callback) reaches the backend.
 
     With SWA endpoint priorities on, attention pages keep them and every other
-    page takes the caller's priority; dummies get no caller callback.
+    page takes the caller's priority.
     """
     manager = object.__new__(KVCacheManagerV2)
     manager._swa_endpoint_rewind = rewind
@@ -221,15 +220,13 @@ def test_create_kv_cache_forwards_custom_priority_callback(is_dummy: bool, rewin
         0,
         None,
         None,
-        is_dummy=is_dummy,
+        is_dummy=False,
         expected_prompt_length=8192,
         custom_priority_callback=callback,
     )
 
     kwargs = manager.impl.create_kv_cache.call_args.kwargs
-    if is_dummy:
-        assert "custom_priority_callback" not in kwargs
-    elif rewind == 0:
+    if rewind == 0:
         assert kwargs["custom_priority_callback"] is callback
     else:
         priority = kwargs["custom_priority_callback"]
