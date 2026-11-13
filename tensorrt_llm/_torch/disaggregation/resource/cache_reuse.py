@@ -15,7 +15,8 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import List, Sequence
+from functools import cached_property
+from typing import Dict, List, Sequence
 
 import numpy as np
 
@@ -119,6 +120,15 @@ class _CacheReuseAdapterV2(CacheReuseAdapter):
         tpb = self.tokens_per_block
         return (kv_cache.num_committed_tokens // tpb) * tpb
 
+    @cached_property
+    def _sink_tokens(self) -> Dict[int, int]:
+        """Sink tokens of each native layer group, read from its first layer."""
+        sinks: Dict[int, int] = {}
+        for layer in self._mgr.kv_cache_manager_py_config.layers:
+            group = self._mgr.layer_to_pool_mapping_dict[layer.layer_id]
+            sinks.setdefault(group, layer.num_sink_tokens)
+        return sinks
+
     def get_cached_token_count_per_layer_group(
         self,
         req: LlmRequest,
@@ -143,12 +153,7 @@ class _CacheReuseAdapterV2(CacheReuseAdapter):
                 cached.append(min(scalar, status.endpoint // tpb * tpb))
             elif status.policy == ReusePolicy.SINK_REQUIRED_ONLY:
                 # The transfer must not write the shared sink pages, whole blocks of them.
-                layer = next(
-                    layer
-                    for layer in self._mgr.kv_cache_manager_py_config.layers
-                    if self._mgr.layer_to_pool_mapping_dict[layer.layer_id] == group
-                )
-                cached.append(min(scalar, -(-layer.num_sink_tokens // tpb) * tpb))
+                cached.append(min(scalar, -(-self._sink_tokens[group] // tpb) * tpb))
             else:
                 cached.append(0)
         return cached

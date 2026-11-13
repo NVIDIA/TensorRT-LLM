@@ -1156,37 +1156,24 @@ class DeepseekV4CacheManager(SparseOffloadCacheMixin, KVCacheManagerV2):
             layer_idx = self.pp_layers[local]
             ratio = self._compress_ratios[layer_idx]
             rows_per_page = self.compressed_block_sizes[layer_idx]
-            data_pool, scale_pool = self.get_compress_pool_buffers(ratio)
+            data, scales = self.get_compress_pool_buffers(ratio)
+            high = self._get_mixed_precision_buffers(local, "NHD", "high").data_ptr()
             # Pool rows as deepseek_v4_local_to_global_indices computes them.
             layer_rows = (
                 self.get_buffers(layer_idx, DeepseekV4AttentionType.COMPRESS).data_ptr()
                 - self.compress_pool_ptrs[ratio]
             ) // row_bytes
-            high = self._get_mixed_precision_buffers(local, "NHD", "high")
+            source, high_table = which[index], which[len(high_layers) + index]
+            pages = (source, high_table, rows_per_page, layer_rows, rows_per_page, ratio)
             rows.append(
-                [
-                    data_pool.data_ptr(),
-                    scale_pool.data_ptr(),
-                    high.data_ptr(),
-                    data_pool.numel() // row_bytes,
-                    which[index],
-                    which[len(high_layers) + index],
-                    rows_per_page,
-                    layer_rows,
-                    rows_per_page,
-                    ratio,
-                ]
+                (data.data_ptr(), scales.data_ptr(), high, data.numel() // row_bytes, *pages)
             )
         return torch.tensor(rows, dtype=torch.int64, device="cuda"), tables
 
     def _decode_mixed_precision_window(self, request_id: int, start: int, end: int) -> None:
         """Decode the whole compressed rows of tokens `[start, end)` from the NVFP4 COMPRESS pool
         into the FP8 high rows of every high layer in one launch, as the read decodes them."""
-        from ..dsa.backend import (
-            _NVFP4_MAX_BLOCK_SCALE,
-            _NVFP4_MAX_VALUE,
-            _get_nvfp4_mla_kv_cache_amax,
-        )
+        from ..dsa.cache_manager import restore_nvfp4_window
 
         layers, tables = self._nvfp4_restore_plan
         pages = torch.full(
@@ -1196,15 +1183,7 @@ class DeepseekV4CacheManager(SparseOffloadCacheMixin, KVCacheManagerV2):
             pin_memory=prefer_pinned(),
         )
         self._fill_page_tables(request_id, tables, pages.numpy())
-        torch.ops.trtllm.nvfp4_mla_kv_cache_restore(
-            layers,
-            pages.cuda(non_blocking=True),
-            start,
-            end,
-            self.head_dim,
-            self.nvfp4_residual_dim,
-            _get_nvfp4_mla_kv_cache_amax() / (_NVFP4_MAX_BLOCK_SCALE * _NVFP4_MAX_VALUE),
-        )
+        restore_nvfp4_window(layers, pages, start, end, self.head_dim, self.nvfp4_residual_dim)
 
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """
