@@ -38,6 +38,7 @@ l0_h100:
   - unittest/_torch/misc
   # ------------- modules (non-MoE) ---------------
   - unittest/_torch/modules/test_fused_add_rms_norm_quant.py
+  - unittest/_torch/modules/test_rms_norm_fp8_per_token.py
   - unittest/_torch/modules/test_fused_activation_quant.py
   - unittest/_torch/modules/test_awq_quantization.py
   - unittest/_torch/modules/test_triton_linear.py
@@ -47,11 +48,13 @@ l0_h100:
   - unittest/_torch/modules/test_w4a16_nvfp4_linear.py
   - unittest/_torch/modules/test_lm_head_output_dtype.py
   - unittest/_torch/modules/test_multi_stream_utils.py
+  - unittest/_torch/kernels/fused_ops/test_fp8_static_quant.py
   # ------------- MoE components tests ---------------
   - unittest/_torch/moe/test_moe_load_balancer.py
   - unittest/_torch/moe/test_moe_routing.py
   - unittest/_torch/moe/fused_moe/test_deepgemm_fused_gather_finalize.py
   - unittest/_torch/moe/fused_moe/test_deepgemm_fused_expand_quant.py
+  - unittest/_torch/moe/fused_moe/test_triton_fp8_block_scale.py::test_moe_align_block_size_matches_reference
   # ------------- MoE: test_moe_backend (by backend) ---------------
   # ------------- MoE: test_single_gpu (by backend) ---------------
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS and not None"
@@ -101,6 +104,7 @@ l0_h100:
   - unittest/_torch/modeling/test_gemma4_unified.py
   - unittest/_torch/modeling/test_modeling_deepseekv3.py
   - unittest/_torch/modeling/test_modeling_deepseekv32.py
+  - unittest/_torch/modeling/test_modeling_kimi_k25.py::test_kimi_k25_forward_with_attached_embeddings
   - unittest/_torch/modeling/test_modeling_nemotron_h.py::test_nemotron_h_sanity
   # Real-weight Nano CG/overlap and chunked-prefill path smoke (MoE L0 cannot
   # reuse dense-8B greedy/logprob equality; accuracy stays on GSM8K/MMLU).
@@ -212,6 +216,8 @@ l0_h100:
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_qwen3[True-True-Qwen3-8B-FP8]
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_llama_context_capacity[False-False-DeepSeek-V3-Lite-fp8/fp8]
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_spec_dec_batch_slot_limit[False-Qwen3-8B-eagle3-Qwen3-8B]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_gen_preemption_greedy_parity[False]
+  - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_gen_preemption_greedy_parity[True]
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_cancel_gen_requests[Qwen3-0.6B]
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logits[False-Qwen3-0.6B]
   - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logits[True-Qwen3-0.6B]
@@ -229,6 +235,14 @@ l0_h100:
   - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_block_reuse_requested
   - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_feature_combinations[bf16-kv-v2-decoder-graphs-on-greedy]
   - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_beam_search[bf16-kv-v2-decoder-graphs-on-beam2]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_encoder_steps_take_requests_in_arrival_order[kv-v2]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_encoder_steps_take_requests_in_arrival_order[kv-v1-python-scheduler]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_encoder_steps_take_requests_in_arrival_order[kv-v1-cpp-scheduler]
+  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_concurrent_requests_encoder_step_limits[token-limit]
+  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_concurrent_requests_encoder_step_limits[request-limit]
+  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_concurrent_requests_encoder_step_limits[within-limits]
+  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_concurrent_requests_encoder_step_limits[token-limit-batch-waiting]
+  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_concurrent_requests_encoder_step_limits[request-limit-batch-waiting]
   - test_e2e.py::test_openai_chat_harmony
   - test_e2e.py::test_openai_chat_harmony_perf_metrics
   - test_e2e.py::test_openai_responses

@@ -31,12 +31,16 @@ from tqdm import tqdm
 from transformers import PreTrainedTokenizerBase
 
 from tensorrt_llm._utils import mpi_disabled
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.kv_hints import KvHintsInput
 from tensorrt_llm.llmapi import tracing
 from tensorrt_llm.metrics.enums import MetricNames
 
+from .._errors import ConfigInputError
+from .._startup_errors import (classify_startup_error, log_startup_error,
+                               mark_llm_initialized)
 from .._utils import nvtx_range_debug
 from ..bindings import steady_clock_now
 from ..conversation_params import ConversationParams
@@ -64,11 +68,14 @@ from .llm_args import (ENCODER_RUNNER_MANAGED_INPUTS,
                        validate_token_encoder_bucket_config)
 from .llm_utils import CachedModelLoader, KvCacheRetentionConfig, ModelLoader
 from .mpi_session import MpiPoolSession, external_mpi_comm_available
+from .startup_checks import (check_architecture_registered,
+                             check_quantization_compute_capability,
+                             check_visible_gpus)
 from .thinking_budget import add_thinking_budget_logits_processor
 from .tokenizer import TokenizerBase
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
-from .utils import (append_docstring, exception_handler, get_device_count,
-                    logger_debug, set_api_status)
+from .utils import (append_docstring, exception_handler, logger_debug,
+                    set_api_status)
 
 _RUNTIME_MEMORY_TYPES = tuple(
     memory_type for memory_type in ExecutorMemoryType
@@ -413,7 +420,7 @@ class BaseLLM:
                     kwargs["orchestrator_type"] = "ray"
 
             else:
-                raise ValueError(
+                raise ConfigInputError(
                     f"Unknown backend: {backend!r}. Supported backends are "
                     "'pytorch'.")
 
@@ -486,11 +493,14 @@ class BaseLLM:
         self._is_attached_frontend = os.getenv(
             "TLLM_EXECUTOR_ATTACH_INFO") is not None
         if self.args.parallel_config.is_multi_gpu and not self._is_attached_frontend:
-            if os.getenv("RAY_LOCAL_WORLD_SIZE") is None and get_device_count(
-            ) < self.args.parallel_config.world_size_per_node:
-                raise RuntimeError(
-                    f"Only {get_device_count()} GPUs are available, but {self.args.parallel_config.world_size} are required."
-                )
+            if os.getenv("RAY_LOCAL_WORLD_SIZE") is None:
+                # An LLM that creates its own MPI pool spawns every rank on this
+                # node; Ray and external launches may spread them over nodes.
+                check_visible_gpus(
+                    self.args.parallel_config,
+                    all_ranks_local=self.args.orchestrator_type != "ray"
+                    and self.mpi_session is None
+                    and not get_spawn_proxy_process_env())
 
             logger.info(
                 f'start MpiSession with {self.args.parallel_config.world_size} workers'
@@ -572,8 +582,7 @@ class BaseLLM:
             if getattr(self, "_encoder_executor", None) is not None:
                 try:
                     runtime_pretrained_config = (
-                        self._encoder_executor.model_engine.model.model_config.
-                        pretrained_config)
+                        self._encoder_executor.pretrained_config)
                     if runtime_pretrained_config is not None:
                         pretrained_config = runtime_pretrained_config
                 except AttributeError:
@@ -1242,10 +1251,10 @@ class BaseLLM:
         if unbatched:
             inputs = [inputs]
 
-        engine = self._encoder_executor.model_engine
-        max_seq_len = engine.max_seq_len
-        max_num_tokens = engine.max_num_tokens
-        max_batch_size = engine.batch_size
+        executor = self._encoder_executor
+        max_seq_len = executor.max_seq_len
+        max_num_tokens = executor.max_num_tokens
+        max_batch_size = executor.max_batch_size
 
         if len(inputs) > max_batch_size:
             raise ValueError(
@@ -1913,10 +1922,14 @@ class _TorchLLM(BaseLLM):
                              tokenizer_revision,
                              backend=backend,
                              **kwargs)
-        except Exception:
+        except Exception as exc:
+            info = log_startup_error(exc, "LLM initialization failed")
             if self._usage_attempt_tracked and _usage is not None:
-                _usage.record_llm_initialization_failure()
+                # An already logged failure (e.g. by the proxy) classifies the same.
+                _usage.record_llm_initialization_failure(
+                    (info or classify_startup_error(exc)).category)
             raise
+        mark_llm_initialized()
 
         try:
             if not self._usage_attempt_tracked and _usage is not None:
@@ -2093,8 +2106,8 @@ class _TorchLLM(BaseLLM):
         # "consumes packed tokens" wording would only confuse there.
         if (config is None or not self._is_encoder_decoder_model()
                 or self.args.model_kwargs is not None
-                or self.args.checkpoint_loader is not None
-                or self.args.checkpoint_format not in (None, "HF")):
+                or self.args.checkpoint_loader is not None or
+                self.args.checkpoint_format not in (None, CheckpointFormat.HF)):
             return
         bucket_config_error = validate_token_encoder_bucket_config(
             config.num_tokens, config.seq_lens)
@@ -2125,6 +2138,10 @@ class _TorchLLM(BaseLLM):
         self._generation_config = self._try_load_generation_config()
         self._generation_config_explicit_values = self._try_load_generation_config_explicit_values(
         )
+        # The checkpoint's quantization config is merged by now; fail before
+        # any worker loads weights.
+        check_quantization_compute_capability(self.args)
+        check_architecture_registered(self.args, self._hf_model_config)
 
         # Multimodal special handling:
         # 1. Default load_tokenizer may fail because MM has different tokenizer configuration. Hence we initialize it inside input processor
@@ -2134,6 +2151,8 @@ class _TorchLLM(BaseLLM):
         video_pruning_rate = self.args.multimodal_config.video_pruning_rate
         if video_pruning_rate is not None:
             input_processor_kwargs['video_pruning_rate'] = video_pruning_rate
+        if self.args.multimodal_config.vision_gpu_normalize:
+            input_processor_kwargs['vision_gpu_normalize'] = True
         self.input_processor = create_input_processor(
             self._hf_model_dir,
             self.tokenizer,
@@ -2161,7 +2180,7 @@ class _TorchLLM(BaseLLM):
             return  # Skip _executor creation
 
         # Hint: if this looks like an encoder model, suggest encode()
-        if self.args.encode_only is None and not self.args.mm_encoder_only:
+        if not self.args.encode_only and not self.args.mm_encoder_only:
             from tensorrt_llm._torch.model_config import ModelConfig
             architectures = getattr(self._hf_model_config, 'architectures',
                                     None) if self._hf_model_config else None
@@ -2207,7 +2226,7 @@ class _TorchLLM(BaseLLM):
         unsupported_args = [key for key in kwargs if key not in accepted_keys]
 
         if unsupported_args:
-            raise ValueError(
+            raise ConfigInputError(
                 f"The following arguments are not supported by the PyTorch backend: {unsupported_args}."
             )
 

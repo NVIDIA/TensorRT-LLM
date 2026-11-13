@@ -23,12 +23,17 @@ Python and C++ codebase with a PyTorch execution path.
   affected accepted/rejected values. Run
   `pytest -m cpu_only tests/unittest/llmapi/test_trtllm_serve_config_schemas.py`.
   Commit the generated `tensorrt_llm/schemas/*.json` snapshots; never hand-edit them.
-  Version bumps in `tensorrt_llm/version.py` also require regeneration: the snapshots
-  include the package version in their `$id` and `title`. For an automated version-only
-  bump, `python3 scripts/generate_trtllm_serve_schemas.py --sync-version` updates only
-  that metadata without importing TensorRT-LLM or requiring a matching build.
+  The snapshots also include the package version in their `$id` and `title`;
+  `python3 scripts/bump_version.py <version>` updates that metadata with
+  `python3 scripts/generate_trtllm_serve_schemas.py --sync-version`, which does not import
+  TensorRT-LLM or require a matching build.
   `python3 scripts/generate_trtllm_serve_schemas.py --check` and the CPU schema tests
   reject missing or stale snapshots. Wheels and HTML docs publish these same files.
+- Change the package version only with `python3 scripts/bump_version.py <version>`, which updates
+  every file that records it. When a file starts recording the package version (for example a
+  `tensorrt_llm==<version>` pin), add it to `VERSION_PATTERNS` in that script in the same change.
+  The `version-records-check` pre-commit hook (`bump_version.py --check`) rejects records that do
+  not match `tensorrt_llm/version.py`.
 - When adding or renaming a public model architecture identifier, update
   `tensorrt_llm/usage/architecture_allowlist.py` with its exact identifier. It must be publicly
   documented by the upstream model provider or in `docs/source/models/supported-models.md`; never add
@@ -114,6 +119,7 @@ Encoder and LLM forward Params are execution views.
 | `tensorrt_llm/_torch/models/` | PyTorch backend model implementations (distinct from the top-level `models/` package) |
 | `tensorrt_llm/_torch/attention/ATTENTION_DEVELOPER_GUIDE.md` | Attention, MLA, backend families, sparse backends, metadata contracts, and KV-cache behavior - **read before modifying anything under `tensorrt_llm/_torch/attention/`** |
 | `tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md` | MoE architecture, backends, communication, development patterns — **read before modifying MoE code** |
+| `tensorrt_llm/_torch/pyexecutor/kv_cache/REGIONS_DEVELOPER_GUIDE.md` | KV cache regions: persistent state declared with a life cycle of its own and laid out as native regions — **read before adding model- or backend-specific state to the KV cache managers** |
 | `CODING_GUIDELINES.md` | C++ and Python coding standards (referenced throughout, must read before contributing) |
 
 ## Design Patterns
@@ -190,6 +196,22 @@ See [CI overview](docs/source/developer-guide/ci-overview.md) for full details.
 | Test waives | `tests/integration/test_lists/waives.txt` | Skip known-failing tests with NVBug links |
 | Performance | See [benchmarking guide](docs/source/developer-guide/perf-benchmarking.md) | `trtllm-bench` and `trtllm-serve` benchmarks |
 
+Pass product Python file paths to `scripts/run_pyrefly.sh` for a file-list static
+check; pre-commit supplies these paths with `pass_filenames: true`. If none are
+eligible, the script skips the check. `--full-project` requests a scan of all
+product Python files. For supplied files, diagnostics are filtered to added
+and modified lines when Git provides them and retained at file level otherwise.
+File-list checks print every remaining diagnostic; full-project checks save the
+report and print its absolute path.
+Jenkins runs a full-project check with path/module and symbol exclusions.
+Whole-project checks always return success; file-list checks can opt into
+`--strict`. Jenkins and pre-commit checks are advisory. The `[tool.pyrefly]`
+section in `pyproject.toml` defines the product roots, diagnostics, and native
+exclusions. `[tool.pyrefly-exclusions]` defines additional symbol exclusions
+for the wrapper.
+Pyrefly is pinned in `requirements-dev.txt`. Missing imports are reported except for
+PyTorch, generated bindings, and configured third-party libraries.
+
 New C++ unit tests should use `add_tllm_gtest` with explicit `SOURCES`,
 `LINK_LIBRARIES`, `OWNER`, and scheduling `LABELS`. Request `FULL_STACK` explicitly
 for integration tests and include `gpu` in `LABELS` for tests that need a GPU.
@@ -229,6 +251,7 @@ For a full list of up-to-date bot commands, post `/bot help` as a PR comment and
 | Architecture overview | `docs/source/developer-guide/overview.md` |
 | PyTorch backend | `docs/source/torch/arch_overview.md` |
 | Adding a new model | `docs/source/torch/adding_new_model.md` |
+| ModelExpress (MX) checkpoint loading | `docs/source/features/model-express.md` |
 | Disaggregated serving | `docs/source/features/disagg-serving.md` |
 | Speculative decoding | `docs/source/features/speculative-decoding.md` |
 | Quantization | `docs/source/features/quantization.md` |

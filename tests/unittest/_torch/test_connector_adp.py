@@ -114,7 +114,9 @@ def _configure_recovery_controls(executor: "PyExecutor") -> None:
     executor.hang_detector = MagicMock()
     executor.hang_detector.detected.return_value = False
     executor._profile_manager = MagicMock()
+    executor.model_engine = SimpleNamespace(cuda_graph_runner=None)
     executor.draft_model_engine = None
+    executor.enable_joint_kv_cache_reuse = False
     executor.sampler = None
     executor.worker_thread = MagicMock()
     executor._shutdown_sleep_wakeup_listeners = MagicMock()
@@ -668,6 +670,7 @@ def test_shutdown_drains_save_before_loop_exit(
         executor.virtual_memory_pools = {}
         executor.sampler = None
         executor.dwdp_manager = None
+        executor.dense_dwdp_manager = None
         executor.resource_manager = MagicMock()
         resource = MagicMock()
         executor.resource_manager.resource_managers = {"kv": resource}
@@ -1236,7 +1239,7 @@ def test_idle_fleet_polls_saves_without_new_traffic(outcome: str) -> None:
         executor.waiting_queue = MagicMock()
         executor.waiting_queue.__len__.return_value = 0
         executor.request_broadcaster = MagicMock()
-        executor.request_broadcaster.broadcast.return_value = ([], {})
+        executor.request_broadcaster.broadcast.return_value = []
         executor._pop_from_waiting_queue = MagicMock(return_value=([], None))
         executor.executor_request_queue.get_from_request_queue = MagicMock(return_value=[])
         executor._enable_non_overlap_adp_forward_intent = True

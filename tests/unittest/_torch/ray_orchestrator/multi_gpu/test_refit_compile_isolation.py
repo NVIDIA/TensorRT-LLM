@@ -293,7 +293,7 @@ class _RefitIsolationExtension(Qwen35_35BTP8WorkerExtension):
         ``begin_update_weights``, the ``pre_reload_weights`` walk, ``reload``,
         then ``_finalize_weight_update`` -- and, critically, **no**
         ``begin_weight_update`` / ``finish_weight_update``, so
-        ``_remove_torch_compile()`` never runs.
+        ``remove_torch_compile()`` never runs.
 
         This exists to demonstrate the production failure directly instead of
         inferring it from the tekit-side rows: with torch.compile enabled this

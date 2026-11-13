@@ -242,6 +242,22 @@ class Fp4QuantizedTensor:
 
 
 @dataclass
+class Fp8PerTokenQuantizedTensor:
+    """FP8 E4M3 activation with an FP32 scale per token.
+
+    ``unquantized_hidden_states`` optionally keeps the BF16/FP16 source for
+    non-FP8 consumers of the same input.
+    """
+    fp8_tensor: torch.Tensor
+    per_token_scale: torch.Tensor  # [num_tokens, 1], fp32
+    unquantized_hidden_states: Optional[torch.Tensor] = None
+
+    @property
+    def shape(self):
+        return self.fp8_tensor.shape
+
+
+@dataclass
 class MxFp8QuantizedTensor:
     """MXFP8 activation and its per-1x32 UE8M0 scaling factors.
 
@@ -445,8 +461,8 @@ def deep_gemm_jit_warmup_buckets(max_m: int):
 
     DeepGemm picks its tile layout from a heuristic over M and compiles one
     kernel per selected layout. A layout no bucket selects gets compiled
-    mid-inference instead, and DeepGemm forks nvcc while holding the GIL, so
-    that compile stalls every rank of the attention-DP group.
+    mid-inference instead, inside that rank's forward, so that compile stalls
+    every rank of the attention-DP group.
 
     Step 16 is exactly the right spacing, and it is needed over the whole
     range. In ``deepgemm/csrc/jit_kernels/heuristics/sm100.hpp`` the selection

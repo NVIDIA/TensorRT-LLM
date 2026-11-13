@@ -76,6 +76,10 @@ scheduler_config:
 
 ### Selecting the KV Cache Manager
 
+```{warning}
+KV cache manager V1 (`use_kv_cache_manager_v2: false`, or `auto` when it resolves to V1) is deprecated as of TensorRT-LLM 1.4 (2026-11) and will be removed after the 3-month migration period. Use KV cache manager V2, the default, for supported features. Sleep mode (`sleep_config`), RocketKV, and skip-softmax still require V1 until V2 support is available; keep V1 for these features during migration.
+```
+
 TensorRT LLM ships two KV cache manager implementations. `use_kv_cache_manager_v2`
 selects between them and defaults to `true`, which selects the V2 manager. Set it
 to `false` to select the V1 C++ manager for models that support it. Set it to
@@ -356,9 +360,13 @@ their activation points.
 
 ### Partial Reuse
 
-Partial reuse of a block can happen when some but not all tokens are matched. It is enabled by default, but can be disabled by setting ```enable_partial_reuse``` to False.
+Partial reuse of a block can happen when some but not all tokens are matched. It is enabled by default. Set `enable_partial_reuse=False` to stop matching part of a cached block.
 
-The property ```copy_on_partial_reuse``` specifies whether a block should be copied or not in order to allow partial reuse. If copying is disabled, a partially matched block can only be reused if no other request is using it. If copying is enabled, partially matched blocks are not reused directly, instead a new block is created and the matched tokens are copied into the new block. This allows multiple requests to partially reuse a block.
+KV cache manager V2 (the default; see [Selecting the KV Cache Manager](#selecting-the-kv-cache-manager)) ignores `copy_on_partial_reuse`. Before extending a reused partial tail page, V2 copies it into a new page owned by the request, even for an unreferenced leaf that V1 could reuse directly. The cached page stays in the reuse tree, so multiple requests can partially reuse it.
+
+With one-model speculative decoding, V2's draft-lookahead backoff can still shorten a block-aligned reuse match (by `max_draft_len` for vanilla MTP, or one token for the EAGLE3 and MTP-Eagle one-model modes), leaving a partial tail page that is copied even when `enable_partial_reuse=False`.
+
+KV cache manager V1 can reuse an unreferenced leaf directly, even with `copy_on_partial_reuse=True`. When direct reuse is not possible, enabling this property allows a new block to be allocated and the matched tokens to be copied into it. With `copy_on_partial_reuse=False`, partial matching is restricted to unreferenced leaves. If two requests in one batch partially match the same unreferenced leaf, V1 copies the matched tokens for the earlier request even with `copy_on_partial_reuse=False`.
 
 ### Attention Window Size
 
