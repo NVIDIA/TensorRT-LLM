@@ -24,7 +24,8 @@ from tensorrt_llm._ipc_utils import can_access_peer
 
 from ..attention.backends import AttentionMetadata
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
-                           MoEAllReduce, MoEAllReduceParams)
+                           MoEAllReduce, MoEAllReduceParams,
+                           allreduce_workspace_ipc_failed)
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
@@ -244,6 +245,10 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
         self.moe_allreduce = None
         if not self.enable_attention_dp and self.mapping.tp_size > 1:
             self.moe_allreduce = MoEAllReduce(mapping=model_config.mapping)
+            # MoEAllReduce has no NCCL path: skip the fused kernel without CUDA IPC.
+            self.is_p2p_supported = (
+                self.is_p2p_supported
+                and not allreduce_workspace_ipc_failed(self.mapping))
 
     def forward(
         self,

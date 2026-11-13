@@ -48,6 +48,7 @@ from tensorrt_llm._torch.distributed import (
     AllReduceParams,
     MoEAllReduce,
     MoEAllReduceParams,
+    allreduce_workspace_ipc_failed,
 )
 from tensorrt_llm._torch.locality_domain.policy import LocalityDomainPolicy
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -741,6 +742,10 @@ class Glm52DecoderLayer(DecoderLayer):
                 dtype=config.torch_dtype,
             )
             self.moe_allreduce = MoEAllReduce(self.mapping)
+            # MoEAllReduce has no NCCL path: skip the fused kernel without CUDA IPC.
+            self.is_p2p_supported = self.is_p2p_supported and not allreduce_workspace_ipc_failed(
+                self.mapping
+            )
 
         has_tp = mapping.has_tp()
         if (
