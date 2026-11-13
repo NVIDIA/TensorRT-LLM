@@ -1029,6 +1029,26 @@ def resolve_num_topk_chunks(total_q: int, num_kv_heads: int, max_topk: int) -> i
 
 # NVFP4 instructions are supported on the datacenter Blackwell and SM107 targets.
 _SM100F_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
+
+
+# Devices already found to support the NVFP4 decode kernels, by capability.
+_NVFP4_DEVICE_CAPABILITIES: dict[torch.device, tuple[int, int]] = {}
+
+
+def _nvfp4_device_capability(device: torch.device) -> tuple[int, int]:
+    """Return the device's capability, checking NVFP4 support once per device."""
+    capability = _NVFP4_DEVICE_CAPABILITIES.get(device)
+    if capability is None:
+        capability = torch.cuda.get_device_capability(device)
+        if capability not in _SM100F_CAPABILITIES:
+            raise NotImplementedError(
+                "MiniMax-M3 NVFP4 sparse decode requires SM100/SM103/SM107; "
+                f"got SM{capability[0] * 10 + capability[1]}."
+            )
+        _NVFP4_DEVICE_CAPABILITIES[device] = capability
+    return capability
+
+
 # Shape-specific tuning was measured on SM103 only. SM100 uses the defaults.
 _NVFP4_TUNED_CAPABILITIES = ((10, 3),)
 
@@ -1439,12 +1459,8 @@ def minimax_m3_sparse_attn_decode(
     kv_nvfp4 = any(arg is not None for arg in nvfp4_args)
     scale_cols = head_dim // NVFP4_SF_VEC_SIZE
     if kv_nvfp4:
-        capability = torch.cuda.get_device_capability(q.device)
-        if capability not in _SM100F_CAPABILITIES:
-            raise NotImplementedError(
-                "MiniMax-M3 NVFP4 sparse decode requires SM100/SM103/SM107; "
-                f"got SM{capability[0] * 10 + capability[1]}."
-            )
+        # Checked once per device.
+        _nvfp4_device_capability(q.device)
         _check_nvfp4_inputs(k_paged, v_paged, nvfp4_args, head_dim=head_dim, scale_cols=scale_cols)
         # Two E2M1 elements per byte; Triton must see them unsigned so that the
         # high-nibble shift does not sign-extend.

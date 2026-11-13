@@ -32,6 +32,7 @@ from tensorrt_llm._torch.speculative import interface as _spec_interface
 from tensorrt_llm.logger import logger
 
 from .. import runtime_hooks_compat
+from ..msa import engine as _msa_engine
 from ..ops import add_rmsnorm as _native_norm
 from ..ops import native_swiglu as _swiglu
 from ..ops import step_hooks as _step_hooks
@@ -170,6 +171,7 @@ def dep_runtime_hooks() -> Optional[RuntimeHooks]:
     fixes = not m31_disabled("DEP_FIX_HOOKS")
     persist_tactics = not m31_disabled("DEP_TACTIC_BUNDLE")
     hooks = dict(
+        sparse_attention=_msa_engine.sparse_attention_classes(),
         late_compile_detect=True,
         merge_tuned_tactics_across_ranks=not m31_disabled("DEP_TACTIC_PIN"),
         pack_step_inputs=inputs,
@@ -363,6 +365,9 @@ class ModelingV2MiniMaxM31FlashNvfp4Sm107Dep(MiniMaxM3VLForConditionalGeneration
                 f"the MiniMax-M3.1 DEP target does not serve this deployment: {mismatch}"
             )
         super().__init__(model_config)
+        # The family's MSA backend in place of main's when the engine builds its step metadata (msa.engine).
+        for layer in self.model.layers:
+            _msa_engine.use_family_backend(layer.self_attn)
         if getattr(self.model, "disagg_remote_tail_replay", False):
             raise NoTarget(
                 "the MiniMax-M3.1 DEP target does not serve the attention-DP remote tail replay"

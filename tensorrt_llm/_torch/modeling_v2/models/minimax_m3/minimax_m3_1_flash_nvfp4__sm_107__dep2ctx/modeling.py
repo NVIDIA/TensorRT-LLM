@@ -146,6 +146,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from .. import cute_aot, runtime_hooks_compat
+from ..msa import engine as _msa_engine
 from ..ops import swiglu_rows_plan
 from . import ctx_boundary_plan as _cbplan
 from . import idx_scorer as _idx_scorer
@@ -3361,6 +3362,8 @@ class MiniMaxM3Attention(Attention):
             dtype=config.torch_dtype,
             config=model_config,
         )
+        # The family's MSA backend in place of main's when the engine builds its step metadata (msa.engine).
+        _msa_engine.use_family_backend(self)
 
         self.qk_norm_type = getattr(config, "qk_norm_type", "per_layer")
         if self.qk_norm_type != "per_head":
@@ -5456,6 +5459,7 @@ class ModelingV2MiniMaxM31FlashNvfp4Sm107Dep2ctx(MiniMaxM3ForCausalLM):
     # Built for this engine: a requested hook it does not have is classified and dropped (runtime_hooks_compat).
     runtime_hooks = runtime_hooks_compat.build(
         dict(
+            sparse_attention=_msa_engine.sparse_attention_classes(),
             disagg_draft_kv=True,
             # The windowed draft pool's sizing and resize fixes.
             draft_pool_fixes=True,

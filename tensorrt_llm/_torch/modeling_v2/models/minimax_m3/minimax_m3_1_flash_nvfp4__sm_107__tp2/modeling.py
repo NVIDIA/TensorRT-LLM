@@ -121,7 +121,6 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import MiniMaxM3Ms
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
     MSA_REQUIRED_TOPK,
     msa_paged_kv,
-    require_msa_module,
     write_msa_phase_kv,
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.paged_cache import (
@@ -183,6 +182,7 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 from .. import cute_aot, m31_capture_fork, m31_decode_fsel, runtime_hooks_compat
 from ..kernels.m3ll import die_local as _die_local
 from ..kernels.m3ll import tp4_moe_engine as _wc_moe_engine
+from ..msa import engine as _msa_engine
 from ..ops import gumbel_draft as _gumbel
 from ..ops import m3_fsel_topk as _fsel
 from . import dspark as _dspark
@@ -4438,7 +4438,7 @@ class MiniMaxM3Tp2ModelingV2(DecoderModel):
         quant_config = model_config.get_quant_config()
         self.attn: List[MiniMaxM3MsaSparseAttention] = []
         for i in range(self.num_layers):
-            backend = create_attention(
+            backend = _msa_engine.create_msa_attention(
                 model_config.attn_backend,
                 i,
                 self.heads,
@@ -5222,7 +5222,7 @@ class MiniMaxM3Tp2ModelingV2(DecoderModel):
         Compile and load only, nothing runs: no numerics change. The variants are those of the packaged fmha_sm100 the
         engine's MSA backend resolves (``require_msa_module``), the module the proxy pass runs. fmha_sm100 keys its
         cache by its installed sources, so a source overlay builds its own variants. Returns the variant names."""
-        fmha_sm100 = require_msa_module()
+        fmha_sm100 = _msa_engine.require_msa_module()
         fmha_api = fmha_sm100.api
         fmha_jit = fmha_sm100.jit
 
@@ -9075,6 +9075,7 @@ def _runtime_hooks(spec_fold: Optional[M3SpecStepFold]) -> runtime_hooks_compat.
     # Built for this engine: a requested hook it does not have is classified and dropped (runtime_hooks_compat).
     return runtime_hooks_compat.build(
         dict(
+            sparse_attention=_msa_engine.sparse_attention_classes(),
             fp8_saturating_casts=True,
             msa_kv_cache_fixes=True,
             draft_pool_fixes=True,

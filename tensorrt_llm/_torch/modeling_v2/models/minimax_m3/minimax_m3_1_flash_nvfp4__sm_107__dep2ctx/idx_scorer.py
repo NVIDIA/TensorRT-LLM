@@ -345,8 +345,8 @@ def _off_reason(model) -> Optional[str]:
 
 def register(model) -> int:
     """Register ``score`` (bound to the indexer's per-rank KV head count) on every layer's MSA indexer that has an
-    unset scorer hook, with ``tile_select.select_rows`` as its ``prefill_scorer_selector`` when that is unset; the
-    number registered."""
+    unset scorer hook, with ``tile_select.select_rows`` as its ``prefill_scorer_selector`` when that is unset, and arm
+    the family's lazy proxy plan (with ``accepts`` and ``prewarm``); the number registered."""
     reason = _off_reason(model)
     if reason is not None:
         logger.info(f"[M3.1 dep2ctx] IDX_SCORER_OFF: {reason}; the proxy scores")
@@ -366,5 +366,9 @@ def register(model) -> int:
             "[M3.1 dep2ctx] IDX_SCORER_OFF: no MSA indexer exposes prefill_scorer_hook; the proxy scores"
         )
         return 0
+    # The family MSA indexer plans the step's proxy lazily while a scorer is armed (msa_indexer).
+    from ..msa import msa_indexer
+
+    msa_indexer.arm_prefill_context_scorer(registered, accepts=accepts, prewarm=prewarm)
     logger.info(f"[M3.1 dep2ctx] IDX_SCORER_REGISTERED: prefill scorer on {registered} layers")
     return registered

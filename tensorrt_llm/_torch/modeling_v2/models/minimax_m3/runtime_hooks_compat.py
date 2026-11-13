@@ -64,6 +64,7 @@ PERF_ONLY: FrozenSet[str] = frozenset(
         "prefill_capture_extra_num_tokens",
         "prefill_capture_max_num_tokens",
         "proxy_ms_reuse",
+        "sparse_attention",
         "skip_accepted_draft_upload",
         "skip_unchanged_draft_block_offsets",
         "spec_batch_map_changed_only",
