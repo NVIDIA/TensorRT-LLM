@@ -51,7 +51,7 @@ NUM_LAYERS = 5
 TPB = 32
 MAX_SEQ_LEN = 1024
 # VSWA with unequal layer counts per window -> two pool groups with different slot sizes (512 KiB and
-# 128 KiB, both dividing the 2 MiB VMM chunk; see kv_pool_rebalance_worker.py).
+# 128 KiB, the layout of kv_pool_rebalance_worker.py).
 WINDOWS = [256, 256, 256, 256, MAX_SEQ_LEN]
 REQ_LEN = 200
 LIVE_RID = 800_000
