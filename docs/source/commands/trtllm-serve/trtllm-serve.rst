@@ -475,6 +475,35 @@ aggregate it explicitly. Used/free block counts can be summed across ranks;
 the maximum utilization identifies the fullest rank. Do not sum utilization or
 cache-hit ratios, or multiply rank-0-owned metrics by the number of ranks.
 
+Speculative decoding counters
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``trtllm_spec_decode_num_drafts_total`` counts request verification rounds that
+contain draft tokens. Together with ``trtllm_spec_decode_num_accepted_tokens_total``,
+it gives a round-weighted acceptance length, including the final target-model
+token. Use identical selectors for both counters and evaluate the ratio only
+when the verification-round rate is positive:
+
+.. code-block:: text
+
+   (
+     1 + sum(rate(trtllm_spec_decode_num_accepted_tokens_total[5m]))
+       / sum(rate(trtllm_spec_decode_num_drafts_total[5m]))
+   )
+   and (sum(rate(trtllm_spec_decode_num_drafts_total[5m])) > 0)
+
+The draft-token, accepted-token, and verification-round counter series appear
+on the first non-null ``specDecodingStats`` report. Even an empty or zero-count
+report initializes all three at zero, so an interval containing only rejected
+drafts has a zero accepted-token numerator and acceptance length 1. Deployments
+that never report speculative statistics do not expose these counter series.
+
+With attention DP, these three iteration counters cover rank 0's requests only:
+speculative statistics are copied from rank 0 rather than aggregated across
+ranks. The totals are not global ADP totals. The ratio describes the same
+reported rank-0 workload; it is not a global ADP mean when ranks process
+different speculative workloads.
+
 .. _runtime-profiling-endpoints:
 
 Runtime Profiling Endpoints

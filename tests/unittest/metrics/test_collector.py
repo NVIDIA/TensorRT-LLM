@@ -92,7 +92,8 @@ SAMPLE_ITERATION_STATS = {
     "specDecodingStats": {
         "numDraftTokens": 20,
         "numAcceptedTokens": 15,
-        "acceptanceLength": 3.75,
+        "numRequestsWithDraftTokens": 4,
+        "acceptanceLength": 4.75,
         "draftOverhead": 1.2,
     },
 }
@@ -308,6 +309,7 @@ class TestAttentionDpIterationMetrics:
     def test_rank0_owned_fields_are_not_overwritten_or_counted_twice(
         self, collector: MetricsCollector
     ) -> None:
+        """Keep shared gauges and counters unchanged by copied rank-1 statistics."""
         collector.log_iteration_stats({**SAMPLE_ITERATION_STATS, "attentionDpRank": 0})
         collector.log_iteration_stats(
             {
@@ -331,7 +333,7 @@ class TestAttentionDpIterationMetrics:
             "max_batch_size_runtime": 32,
             "max_num_tokens_runtime": 8192,
             "avg_decoded_tokens_per_iter": 4.5,
-            "spec_decode_acceptance_length": 3.75,
+            "spec_decode_acceptance_length": 4.75,
             "spec_decode_draft_overhead": 1.2,
         }
         for metric, value in expected.items():
@@ -339,6 +341,7 @@ class TestAttentionDpIterationMetrics:
         assert _get_counter_value(collector, "counter_num_requests_completed") == 2
         assert _get_counter_value(collector, "counter_spec_decode_num_draft_tokens") == 20
         assert _get_counter_value(collector, "counter_spec_decode_num_accepted_tokens") == 15
+        assert _get_counter_value(collector, "counter_spec_decode_num_drafts") == 4
 
     def test_iteration_deltas_and_zero_cache_tiers_are_ranked(
         self, collector: MetricsCollector
@@ -431,18 +434,103 @@ class TestInflightBatchingStats:
 class TestSpecDecodingStats:
     """Test speculative decoding stats are correctly exposed."""
 
+    _COUNTER_NAMES = (
+        "trtllm_spec_decode_num_draft_tokens_total",
+        "trtllm_spec_decode_num_accepted_tokens_total",
+        "trtllm_spec_decode_num_drafts_total",
+    )
+
+    def test_verification_rounds_support_aggregate_acceptance_length(
+        self, collector: MetricsCollector
+    ) -> None:
+        """Accumulate rounds to compute a round-weighted acceptance length."""
+        assert (
+            REGISTRY.get_sample_value("trtllm_spec_decode_num_drafts_total", collector.labels)
+            is None
+        )
+        for accepted, rounds in ((3, 2), (8, 4)):
+            collector.log_iteration_stats(
+                {
+                    "specDecodingStats": {
+                        "numAcceptedTokens": accepted,
+                        "numRequestsWithDraftTokens": rounds,
+                    }
+                }
+            )
+        collector.log_iteration_stats({"specDecodingStats": {"numRequestsWithDraftTokens": 0}})
+        collector.log_iteration_stats({"specDecodingStats": {"numDraftTokens": 0}})
+
+        rounds = _get_counter_value(collector, "counter_spec_decode_num_drafts")
+        accepted = _get_counter_value(collector, "counter_spec_decode_num_accepted_tokens")
+        assert rounds == 6
+        assert 1 + accepted / rounds == pytest.approx(1 + 11 / 6)
+
+    @pytest.mark.parametrize(
+        "spec_stats",
+        [{}, {"numRequestsWithDraftTokens": 0}, {"numDraftTokens": 0}],
+        ids=["empty", "zero-rounds", "zero-draft-tokens"],
+    )
+    def test_zero_spec_report_initializes_counters(
+        self, collector: MetricsCollector, spec_stats: dict[str, int]
+    ) -> None:
+        """Expose all three zero series on the first speculative report."""
+        collector.log_iteration_stats({"specDecodingStats": spec_stats})
+
+        for metric_name in self._COUNTER_NAMES:
+            assert REGISTRY.get_sample_value(metric_name, collector.labels) == 0
+
+    def test_copied_rank1_stats_do_not_initialize_counters(
+        self, collector: MetricsCollector
+    ) -> None:
+        """Wait for rank 0 before exposing copied speculative measurements."""
+        collector.log_iteration_stats({**SAMPLE_ITERATION_STATS, "attentionDpRank": 1})
+
+        for metric_name in self._COUNTER_NAMES:
+            assert REGISTRY.get_sample_value(metric_name, collector.labels) is None
+
+    def test_rejected_drafts_expose_zero_acceptance(self, collector: MetricsCollector) -> None:
+        """Expose zero accepted tokens so all-rejected rounds have length one."""
+        for metric_name in self._COUNTER_NAMES:
+            assert REGISTRY.get_sample_value(metric_name, collector.labels) is None
+
+        collector.log_iteration_stats(
+            {
+                "specDecodingStats": {
+                    "numDraftTokens": 8,
+                    "numAcceptedTokens": 0,
+                    "numRequestsWithDraftTokens": 2,
+                }
+            }
+        )
+
+        accepted = REGISTRY.get_sample_value(
+            "trtllm_spec_decode_num_accepted_tokens_total", collector.labels
+        )
+        rounds = REGISTRY.get_sample_value("trtllm_spec_decode_num_drafts_total", collector.labels)
+        assert accepted == 0
+        assert rounds == 2
+        assert 1 + accepted / rounds == 1
+
     def test_spec_decoding_metrics(self, collector):
         collector.log_iteration_stats(SAMPLE_ITERATION_STATS)
 
         assert _get_counter_value(collector, "counter_spec_decode_num_draft_tokens") == 20
         assert _get_counter_value(collector, "counter_spec_decode_num_accepted_tokens") == 15
-        assert _get_gauge_value(collector, "spec_decode_acceptance_length") == pytest.approx(3.75)
+        assert _get_gauge_value(collector, "spec_decode_acceptance_length") == pytest.approx(4.75)
         assert _get_gauge_value(collector, "spec_decode_draft_overhead") == pytest.approx(1.2)
 
-    def test_missing_spec_decoding_stats(self, collector):
-        """No error when specDecodingStats is absent."""
+    @pytest.mark.parametrize("include_none", [False, True], ids=["absent", "null"])
+    def test_missing_spec_decoding_stats(
+        self, collector: MetricsCollector, include_none: bool
+    ) -> None:
+        """Keep speculative counter series absent without a speculative report."""
         stats = {k: v for k, v in SAMPLE_ITERATION_STATS.items() if k != "specDecodingStats"}
+        if include_none:
+            stats["specDecodingStats"] = None
         collector.log_iteration_stats(stats)
+
+        for metric_name in self._COUNTER_NAMES:
+            assert REGISTRY.get_sample_value(metric_name, collector.labels) is None
 
 
 class TestPartialStats:
