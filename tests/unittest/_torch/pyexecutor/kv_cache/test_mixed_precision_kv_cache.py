@@ -12,7 +12,7 @@ import torch
 from tensorrt_llm._torch.memory_buffer_utils import Buffers
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm._torch.pyexecutor.kv_cache.mixed_precision_staging import MixedPrecisionKVStaging
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType, SamplingConfig
 from tensorrt_llm._utils import binding_to_torch_dtype
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
@@ -404,6 +404,40 @@ def test_default_reuse_backs_off_a_rematch_that_ends_inside_a_block(make_manager
     pages = torch.full((2, 1, 8), -1, dtype=torch.int32)
     manager.fill_mixed_precision_page_tables([2], 0, pages.numpy())
     assert pages[1, 0, 0] >= 0 and pages[1, 0, 1] == kv.BAD_PAGE_INDEX and pages[1, 0, 2] >= 0
+    manager.free_resources(reader)
+
+
+def test_disaggregated_context_request_computes_the_window_it_sends(make_manager):
+    """A disaggregated context request sends its last window to the generation worker, so before a
+    missing window it stops N tokens early, as with recompute, and computes that window itself."""
+    manager = make_manager(config=mixed_config())
+    block = manager.tokens_per_block
+    staging = MixedPrecisionKVStaging(
+        manager, Buffers(), rows=1, layout="NHD", pool_layout="NHD", tokens_per_block=block
+    )
+    pool, _, high = staging.pools[0]
+    tokens = list(range(640))
+    _cache_prompt(manager, tokens)
+    reader = LlmRequest(
+        request_id=2,
+        max_new_tokens=1,
+        input_tokens=tokens[:512] + [9999],
+        sampling_config=SamplingConfig(1),
+        is_streaming=False,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY,
+    )
+    assert manager.prepare_context(reader)
+    # 512 - 65 = 447 rounds down to 384; the window of the 513-token prompt starts at 448.
+    assert manager.kv_cache_map[2].num_committed_tokens == 384
+    assert manager.resize_context(reader, 513 - 384)
+    staging.update([2], [384], [513 - 384], capture_graph=False)
+    values = torch.randn(pool.shape[1:], device="cuda").to(pool.dtype)
+    pool[3:5] = values
+    staging.convert(0, writeback=True)
+    # The window it sends, tokens 448 to 512, holds what it wrote.
+    _, high_pages = (table[0] for table in manager.get_mixed_precision_page_tables([2], 0))
+    assert torch.equal(high[high_pages[3]][:, 64:], values[:, 64:])
+    assert torch.equal(high[high_pages[4]][:, :1], values[:, :1])
     manager.free_resources(reader)
 
 

@@ -6274,10 +6274,15 @@ class KVCacheManagerV2(BaseResourceManager):
                 kv_cache = create(tokens)
                 if kv_cache is None:
                     return None
-                # Stop at a block boundary ("recompute": N tokens earlier) so the window pages after
-                # it hold only what this request computes; a rematch pruned inside a block backs off
-                # to the block's start.
-                back_off = self.last_n if self.mixed_precision_reuse == "recompute" else 0
+                # Stop at a block boundary so the window pages after it hold only what this request
+                # computes; a rematch pruned inside a block backs off to the block's start.
+                # "recompute" stops N tokens earlier, and so does a disaggregated context request:
+                # the window it sends must hold computed tokens, not empty pages.
+                back_off = (
+                    self.last_n
+                    if self.mixed_precision_reuse == "recompute" or req.is_context_only_request
+                    else 0
+                )
                 while (
                     window_limit := self._mixed_precision_reuse_limit(req, kv_cache, back_off)
                 ) is not None:

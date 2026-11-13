@@ -177,7 +177,9 @@ sets what reuse does then. `default` reuses the prefix down to its last block
 boundary and reads those tokens from the NVFP4 history, at NVFP4 precision,
 until they leave the window. `recompute` reuses the prefix up to before them and
 recomputes them in high precision. `strict` stops reuse where the high-precision
-copy is complete; it is the only mode without first-N tokens. The cold-page first/last-N window of
+copy is complete; it is the only mode without first-N tokens. In disaggregated
+serving, a context server recomputes them in `default` mode too, since it sends
+them to the generation server as high-precision KV. The cold-page first/last-N window of
 [cold-page quantization](kv-cache-compression.md) reads them from its history
 pages, at the runtime KV type.
 
