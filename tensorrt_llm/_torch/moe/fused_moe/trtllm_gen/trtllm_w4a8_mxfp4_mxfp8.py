@@ -55,7 +55,7 @@ class TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl(TRTLLMGenW4a8Mxfp4Mxfp8Base):
         """Fuse Kimi K3 no-aux routing and MXFP8 input quantization.
 
         The op is MXFP8-activation and native-cubin only, which is exactly this
-        identity, so no format or provider test is needed here.
+        identity, so no format test is needed here.
 
         Beyond that the op is specialized to the K3 decode shape: it hardcodes
         896 experts, top-16, hidden 3584 and at most 64 tokens. The checks

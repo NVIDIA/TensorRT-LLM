@@ -219,6 +219,7 @@ configured environment variable takes precedence.
 | `FLASHINFER_WORKSPACE_BASE` | `$HOME/.cache/flashinfer` | `flashinfer` |
 | `CUTE_DSL_CACHE_DIR` | `/tmp/$USER/cutlass_python_cache` | `cute_dsl` |
 | `DG_JIT_CACHE_DIR` | `$HOME/.deep_gemm` | `deep_gemm` |
+| `TLLM_JIT_SHARE_DIR` | Disabled | Not set (one directory per launch, see below) |
 | `TRTLLM_DG_CACHE_DIR` | Disabled | `trtllm_deep_gemm` |
 | `CUDA_CACHE_PATH` | `$HOME/.nv/ComputeCache` | `cuda` |
 
@@ -242,6 +243,20 @@ NVRTC-generated cubins are persisted. An explicitly configured dump setting
 still takes precedence. See the
 [DeepGEMM environment variables](source:examples/models/core/deepseek_v3/README.md#deepgemm)
 for details.
+
+Set `TLLM_JIT_SHARE_DIR` to a directory that every process of a launch can see
+(on a multi-node launch, a shared file system; use a fresh directory per
+launch) to build each DeepGEMM and CuTe DSL kernel that warmup tunes once
+across the processes: the first process to claim a kernel builds it, and the
+others load the result. Unless `DG_JIT_CACHE_DIR` is set, it also places
+DeepGEMM's disk cache in `<TLLM_JIT_SHARE_DIR>/deep_gemm`, ahead of the
+`TRTLLM_CACHE_DIR` default. Every process runs the kernels it finds there, so
+the directory must belong to you and other users must not be able to write to
+it (group members who can write to it must be trusted); otherwise TensorRT-LLM
+ignores the setting with a warning. A process waits for another process's build
+at most `TLLM_JIT_SHARE_WAIT_S` seconds (default 60) and then builds the kernel
+itself, as it does whenever the directory cannot be used.
+`TLLM_JIT_SHARE_LOG=1` records each kernel in `<TLLM_JIT_SHARE_DIR>/log`.
 
 Note that, when `TRTLLM_CACHE_DIR` is set, the FlashInfer workspace isolation
 mechanism described below still applies. This will prevent race conditions
@@ -345,6 +360,15 @@ concurrent MPI processes never write to each other's compiler inputs while JIT
 artifacts stay warm across launches. Set
 `TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=0` before invoking the launcher or
 creating the LLM instance to disable this behavior.
+
+Downloaded TRTLLM-Gen FMHA kernel cubins are the exception: FlashInfer only
+loads them and never compiles them, so ranks with persistent slots share them
+through a `cubins` directory next to the slots. A rank looks a kernel cubin up
+in its own slot, then in the shared directory, and downloads it only when
+neither has it, publishing the download to the shared directory with an atomic
+rename. Every cubin read from the shared directory is checked against its
+SHA-256. Headers and other compiler inputs are never shared. Set
+`TRTLLM_FLASHINFER_SHARED_CUBINS=0` to keep these cubins per-rank as well.
 
 Persistent slots are not pruned automatically, so their count can grow with
 peak job concurrency. When no TensorRT-LLM processes are using the cache, the

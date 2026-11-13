@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from tensorrt_llm.checkpoint_format import CheckpointFormat
+
 from .._torch.async_llm import AsyncLLM
 from ..conversation_params import ConversationParams
 from ..disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
@@ -12,7 +14,7 @@ from .llm import LLM, RequestOutput
 # yapf: disable
 from .llm_args import (AttentionDpConfig, AutoDecodingConfig, BlockReuseConfig,
                        CacheTransceiverConfig, CalibConfig,
-                       CapacitySchedulerPolicy,
+                       CapacitySchedulerPolicy, CheckpointIOPolicy,
                        ColdPageQuantizationCompressionConfig,
                        ContextChunkingPolicy, CudaGraphConfig,
                        DecodeCudaGraphConfig, DeepSeekSparseAttentionConfig,
@@ -30,8 +32,8 @@ from .llm_args import (AttentionDpConfig, AutoDecodingConfig, BlockReuseConfig,
                        RuntimeMemoryStatus, SADecodingConfig, SAEnhancerConfig,
                        SaveHiddenStatesDecodingConfig, SchedulerConfig,
                        SkipSoftmaxAttentionConfig, SleepConfig,
-                       TorchCompileConfig, TorchLlmArgs,
-                       TriAttentionKvCacheCompressionConfig,
+                       SparseKvCacheOffloadConfig, TorchCompileConfig,
+                       TorchLlmArgs, TriAttentionKvCacheCompressionConfig,
                        UserProvidedDecodingConfig)
 from .llm_utils import KvCacheRetentionConfig, QuantAlgo, QuantConfig
 from .mm_encoder import MultimodalEncoder
@@ -71,6 +73,8 @@ __all__ = [
     'MTPDecodingConfig',
     'SchedulerConfig',
     'CapacitySchedulerPolicy',
+    'CheckpointIOPolicy',
+    'CheckpointFormat',
     'QuantConfig',
     'QuantAlgo',
     'CalibConfig',
@@ -100,6 +104,7 @@ __all__ = [
     'DeepSeekSparseAttentionConfig',
     'DeepSeekV4SparseAttentionConfig',
     'MiniMaxM3SparseAttentionConfig',
+    'SparseKvCacheOffloadConfig',
     'SchedulingParams',
     'SkipSoftmaxAttentionConfig',
     'ColdPageQuantizationCompressionConfig',

@@ -1,7 +1,5 @@
-import re
 from contextlib import nullcontext
 from pathlib import Path
-from typing import cast
 
 import pytest
 
@@ -82,9 +80,11 @@ class TestOutOfTree:
             monkeypatch.syspath_prepend(oot_path)
             import modeling_opt  # noqa
 
-        with (nullcontext() if import_oot_code else
-              pytest.raises(RuntimeError,
-                            match=".*Executor worker returned error.*")) as ctx:
+        # Without the out-of-tree code the architecture is unregistered, which
+        # the LLM rejects before spawning any worker.
+        with (nullcontext() if import_oot_code else pytest.raises(
+                ValueError,
+                match="Unknown model architecture: OPTForCausalLM")):
             with LLM(
                     model=str(model_dir),
                     kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.2),
@@ -94,13 +94,6 @@ class TestOutOfTree:
 
             for output, ref in zip(outputs, references):
                 assert similar(output.outputs[0].text, ref)
-
-        if not import_oot_code:
-            exc_val = cast(pytest.ExceptionInfo, ctx).value
-            assert re.match(
-                ".*Unknown architecture for AutoModelForCausalLM: OPTForCausalLM.*",
-                str(exc_val.__cause__),
-            ) is not None
 
     @pytest.mark.parametrize("import_oot_code", [False, True])
     def test_serve(

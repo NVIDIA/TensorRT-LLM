@@ -334,6 +334,7 @@ def cute_run(
         onorm_weight=data.get("onorm_weight"),
         onorm_eps=data.get("onorm_eps", 1e-5),
         fuse_output_norm=fuse_output_norm,
+        replay_state_indices=data.get("replay_state_indices"),
     )
     output_scale = None
     if quantize_output:
@@ -452,8 +453,6 @@ def _fla_sequential_reference(data, num_accepted):
                 xk = data["cs_k"][n, :, W - 1 + i_t].float()
                 xv = data["cs_v"][n, :, W - 1 + i_t].float()
                 tok = None
-                g_t = data["g_cache"][n, i_t].float()
-                beta_t = data["beta_cache"][n, i_t].float()
                 replay = True
             else:
                 tok = bos + i_t
@@ -474,6 +473,8 @@ def _fla_sequential_reference(data, num_accepted):
             if replay:
                 # Replayed tokens use the cached post-processed k/g/v/beta
                 # exactly as the kernel does (delta rule applied directly).
+                g_t = data["g_cache"][n, i_t].float()
+                beta_t = data["beta_cache"][n, i_t].float()
                 k_t = data["k_cache"][n, i_t].float().view(H, K)
                 gk_t = g_t.view(H, K)
                 v_t = data["v_cache"][n, i_t].float().view(H, V)
@@ -1077,250 +1078,6 @@ def test_beta_cache_sibling_layer_after_aligned_warmup(
         )
 
 
-def _dim_contiguous_clone(cache):
-    clone = torch.empty(
-        cache.shape[0], cache.shape[2], cache.shape[1], dtype=cache.dtype, device=cache.device
-    ).transpose(1, 2)
-    clone.copy_(cache)
-    return clone
-
-
-def _verify_after_round_one(B, H, num_spec, seed):
-    """Inputs of a verify that follows a first verify run by the kernel, with
-    a different number of the first round's drafts accepted per request.
-
-    The conv windows start at bf16 values, as they do when the cache manager
-    seeds them from its bf16 conv pool."""
-    data = make_conv_data(B, H, M=num_spec, seed=seed)
-    for name in ("cs_q", "cs_k", "cs_v"):
-        data[name].copy_(data[name].bfloat16().float())
-    first = cute_run(data)
-    data = make_conv_data(B, H, M=num_spec, seed=seed + 1)
-    for name in ("k_cache", "g_cache", "v_cache", "beta_cache", "cs_q", "cs_k", "cs_v"):
-        data[name] = first[name]
-    data["initial_state_cute"] = first["state_v_first"]
-    data["num_accepted_tokens"] = torch.arange(B, dtype=torch.int32, device="cuda") % (num_spec + 1)
-    return data
-
-
-@pytest.mark.parametrize("B,H,num_spec", [(32, 12, 2), (32, 6, 2), (4, 6, 7)], ids=lambda v: str(v))
-def test_commit_pending_drafts_matches_the_next_verify(B, H, num_spec):
-    """Committing the pending drafts first leaves the next verify's results
-    unchanged.
-
-    This is what the cache manager does across a suspend.
-    ``kda_mtp_commit_pending_drafts`` folds the accepted drafts into the
-    state, ``store_kda_replay_conv_window`` puts the conv window after them in
-    the bf16 conv pool, and the resume seeds the replay caches from that pool
-    with nothing pending. The verify that follows must give the caches and
-    windows of the verify that replays the drafts itself bit for bit, and its
-    outputs and state to the kernel's accuracy: the tensor-core verify computes
-    a chunk in one WY-form pass, so splitting the replayed drafts and the new
-    tokens into two chunks rounds differently."""
-    from tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_kda_mtp_ops import (
-        kda_mtp_commit_pending_drafts,
-    )
-    from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import (
-        copy_kda_replay_conv_window,
-        store_kda_replay_conv_window,
-    )
-
-    data = _verify_after_round_one(B, H, num_spec, seed=41)
-    accepted = data["num_accepted_tokens"]
-    slots = data["ssm_state_indices"]
-    replayed = cute_run(data)
-
-    state = data["initial_state_cute"].clone()
-    cs = [_dim_contiguous_clone(data[name]) for name in ("cs_q", "cs_k", "cs_v")]
-    kda_mtp_commit_pending_drafts(
-        state,
-        *cs,
-        data["k_cache"].clone(),
-        data["g_cache"].clone(),
-        data["v_cache"].clone(),
-        data["beta_cache"].clone(),
-        slots,
-        accepted,
-        num_spec,
-        conv_width=data["W"],
-    )
-    for n in range(B):
-        unchanged = torch.equal(state[n], data["initial_state_cute"][n])
-        assert unchanged == (int(accepted[n]) == 0), n
-    conv_pool = torch.zeros(
-        B, 3 * H * data["K"], data["W"] - 1, dtype=torch.bfloat16, device="cuda"
-    )
-    store_kda_replay_conv_window(conv_pool, *cs, slots, accepted)
-    for cache in cs:
-        cache.zero_()
-    copy_kda_replay_conv_window(conv_pool, *cs, slots)
-
-    resumed = dict(data)
-    resumed.update(
-        initial_state_cute=state,
-        cs_q=cs[0],
-        cs_k=cs[1],
-        cs_v=cs[2],
-        k_cache=torch.zeros_like(data["k_cache"]),
-        g_cache=torch.zeros_like(data["g_cache"]),
-        v_cache=torch.zeros_like(data["v_cache"]),
-        beta_cache=torch.zeros_like(data["beta_cache"]),
-        num_accepted_tokens=torch.zeros_like(accepted),
-        # The same token rows: the verify reads request n's new tokens from
-        # cu_seqlens[n] + num_accepted_tokens[n].
-        cu_seqlens=data["cu_seqlens"] + torch.cat([accepted, accepted.new_zeros(1)]),
-    )
-    resumed = cute_run(resumed)
-
-    for name in ("k_cache", "g_cache", "v_cache", "beta_cache", "cs_q", "cs_k", "cs_v"):
-        assert torch.equal(resumed[name], replayed[name]), name
-    _assert_close("out(commit vs replay)", resumed["out"], replayed["out"], atol=2e-2)
-    _assert_close(
-        "state(commit vs replay)",
-        resumed["state_v_first"],
-        replayed["state_v_first"],
-        atol=2e-4,
-        rtol=1e-4,
-    )
-
-
-def _replay_drafts_reference(data, slots, accepted):
-    """fp32 CPU replay of each selected slot's first ``accepted`` cached drafts onto its state,
-    the replay steps of ``cpu_reference``. Returns the K-first states of every slot."""
-    H, K, V = data["H"], data["K"], data["V"]
-    state = data["initial_state_kfirst"].float().cpu().clone()
-    caches = {
-        name: data[name].float().cpu() for name in ("k_cache", "g_cache", "v_cache", "beta_cache")
-    }
-    for slot, count in zip(slots.tolist(), accepted.tolist()):
-        for h in range(H):
-            hk, hv = h * K, h * V
-            h_state = state[slot, h]
-            for t in range(count):
-                k_t = caches["k_cache"][slot, t, hk : hk + K]
-                decay = torch.exp(caches["g_cache"][slot, t, hk : hk + K])
-                v_t = caches["v_cache"][slot, t, hv : hv + V]
-                beta_t = caches["beta_cache"][slot, t, h]
-                h_state = h_state * decay.unsqueeze(1)
-                v_new = (v_t - (h_state * k_t.unsqueeze(1)).sum(dim=0)) * beta_t
-                h_state = h_state + k_t.unsqueeze(1) * v_new.unsqueeze(0)
-            state[slot, h] = h_state
-    return state
-
-
-@pytest.mark.parametrize(
-    "B,H,M", [(32, 12, 2), (32, 6, 2), (2, 12, 7), (16, 12, 7)], ids=lambda v: str(v)
-)
-def test_commit_pending_drafts_matches_the_replay_reference(B, H, M):
-    """The replay-only variant of the verify kernel commits, for each selected slot, the state
-    after its accepted drafts: the replay steps of a full verify, checked against the fp32 CPU
-    replay. It only reads the conv and replay caches, leaves a slot with nothing pending and the
-    unselected slots bit for bit, and covers both the cluster-pair and the one-CTA launch."""
-    from tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_kda_mtp_ops import (
-        kda_mtp_commit_pending_drafts,
-    )
-
-    data, accept = _round2_inputs(B, H, M)
-    # Every other slot, in reverse order, with its own accepted count (0 included).
-    slots = torch.arange(B - 1, -1, -2, dtype=torch.int32)
-    accepted = accept[slots.long()]
-    expected = _replay_drafts_reference(data, slots, accepted).cuda()
-
-    state = data["initial_state_cute"].clone()
-    cs = [_dim_contiguous_clone(data[name]) for name in ("cs_q", "cs_k", "cs_v")]
-    caches = [data[name].clone() for name in ("k_cache", "g_cache", "v_cache", "beta_cache")]
-    kda_mtp_commit_pending_drafts(
-        state,
-        *cs,
-        *caches,
-        slots.cuda(),
-        accepted.cuda(),
-        M,
-        conv_width=data["W"],
-    )
-
-    committed = state.permute(0, 1, 3, 2)
-    _assert_close(
-        "state(commit vs cpu replay)", committed[slots.long()], expected[slots.long()], atol=1e-4
-    )
-    for slot, count in zip(slots.tolist(), accepted.tolist()):
-        if count == 0:
-            assert torch.equal(state[slot], data["initial_state_cute"][slot]), slot
-    others = [slot for slot in range(B) if slot not in slots.tolist()]
-    assert torch.equal(state[others], data["initial_state_cute"][others])
-    for name, cache in zip(("cs_q", "cs_k", "cs_v"), cs):
-        assert torch.equal(cache, data[name]), name
-    for name, cache in zip(("k_cache", "g_cache", "v_cache", "beta_cache"), caches):
-        assert torch.equal(cache, data[name]), name
-
-
-def test_commit_pending_drafts_replays_the_per_token_records():
-    """With the Kimi K3 verify kernels' draft records, a slot's accepted drafts
-    are replayed onto its pool state, in order, from its records (vn,
-    beta * k, decay), and the conv window after them is stored; other slots
-    are left alone."""
-    from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import commit_kda_pending_drafts
-
-    torch.manual_seed(5)
-    num_slots, H, K, W, num_spec = 9, 6, 128, 4, 7
-
-    def small(*shape, scale):
-        # Few significant bits: every product and sum below is exact in fp32,
-        # so the reference does not depend on fused or separate rounding.
-        return torch.randint(-4, 5, shape, device="cuda").float() * scale
-
-    state = small(num_slots, H, K, K, scale=2.0**-4)
-    vn = small(num_slots, num_spec, H, K, scale=2.0**-2)
-    beta_k = small(num_slots, num_spec, H, K, scale=2.0**-3)
-    decay = torch.randint(1, 3, (num_slots, num_spec, H, K), device="cuda").float() * 0.5
-    state_tok = torch.zeros(num_slots, 3, num_spec, H, K, device="cuda")
-    records = state_tok.view(num_slots, -1)
-    size = num_spec * H * K
-    for i, part in enumerate((vn, beta_k, decay)):
-        records[:, i * size : (i + 1) * size] = part.reshape(num_slots, -1)
-    cs = [
-        torch.randn(num_slots, W - 1 + num_spec, H * K, device="cuda")
-        .bfloat16()
-        .float()
-        .transpose(1, 2)
-        for _ in range(3)
-    ]
-    conv_pool = torch.zeros(num_slots, 3 * H * K, W - 1, dtype=torch.bfloat16, device="cuda")
-    slots = torch.tensor([7, 0, 3, 5, 1, 8], dtype=torch.int32, device="cuda")
-    accepted = torch.tensor([0, 1, 3, 7, 2, 5], dtype=torch.int32, device="cuda")
-    before = state.clone()
-    unread = torch.empty(0, device="cuda")
-
-    commit_kda_pending_drafts(
-        state,
-        conv_pool,
-        *cs,
-        # k / g / v / beta replay caches: unread with per-token states.
-        unread,
-        unread,
-        unread,
-        unread,
-        slots,
-        accepted,
-        state_tok=state_tok,
-    )
-
-    for slot, count in zip(slots.tolist(), accepted.tolist()):
-        expected = before[slot].clone()
-        for t in range(count):
-            expected = (
-                decay[slot, t][:, None, :] * expected
-                + vn[slot, t][:, :, None] * beta_k[slot, t][:, None, :]
-            )
-        assert torch.equal(state[slot], expected), slot
-        for section, cache in enumerate(cs):
-            window = conv_pool[slot, section * H * K : (section + 1) * H * K].float()
-            assert torch.equal(window, cache[slot, :, count : count + W - 1]), (slot, section)
-    others = [slot for slot in range(num_slots) if slot not in slots.tolist()]
-    assert torch.equal(state[others], before[others])
-    assert not conv_pool[others].any()
-
-
 def _packed_fused_norm_inputs(B, H, num_spec, state_dtype):
     """Runtime-contract inputs for the packed / fused-norm path: section-strided q / k / v /
     output-gate views of one fused projection, the bf16 beta tail of [f_a | beta], replay caches
@@ -1506,7 +1263,6 @@ def test_verify_kernel_selection():
         fuse_output_norm=True,
         quantize_output=False,
         bf16_math=False,
-        replay_only=False,
         num_spec=7,
         num_tiles=148,
         num_sms=148,
@@ -1525,10 +1281,188 @@ def test_verify_kernel_selection():
         ("packed_token_layout", False),
         ("fuse_output_norm", False),
         ("bf16_math", True),
-        ("replay_only", True),
         ("num_spec", 8),
     ):
         assert _select_verify_kernel(**{**contract, name: value, "operands_ok": None}) == "v1", name
+
+
+_REPLAY_CACHE_NAMES = ("k_cache", "g_cache", "v_cache", "beta_cache", "cs_q", "cs_k", "cs_v")
+
+
+def _scatter_rows(tensor, rows, num_rows):
+    """A pool of ``num_rows`` zero rows holding ``tensor``'s rows at ``rows``, in ``tensor``'s
+    layout (the conv caches stay dim-contiguous)."""
+    if tensor.stride(1) == 1 and tensor.ndim == 3:
+        pool = torch.zeros(
+            num_rows, tensor.shape[2], tensor.shape[1], dtype=tensor.dtype, device=tensor.device
+        ).transpose(1, 2)
+    else:
+        pool = torch.zeros(num_rows, *tensor.shape[1:], dtype=tensor.dtype, device=tensor.device)
+    pool[rows.long()] = tensor
+    return pool
+
+
+def _separate_replay_pool(data, state_slots, replay_slots, num_state_rows, num_replay_rows):
+    """``data`` with its states moved to ``state_slots`` of a state pool and its conv and replay
+    caches to ``replay_slots`` of a separate replay pool."""
+    separate = dict(data)
+    separate["ssm_state_indices"] = state_slots
+    separate["replay_state_indices"] = replay_slots
+    separate["initial_state_cute"] = _scatter_rows(
+        data["initial_state_cute"], state_slots, num_state_rows
+    )
+    for name in _REPLAY_CACHE_NAMES:
+        separate[name] = _scatter_rows(data[name], replay_slots, num_replay_rows)
+    return separate
+
+
+def _distinct_slots(num_requests, num_state_rows, num_replay_rows, seed):
+    generator = torch.Generator().manual_seed(seed)
+    state_slots = torch.randperm(num_state_rows, generator=generator)[:num_requests]
+    replay_slots = torch.randperm(num_replay_rows, generator=generator)[:num_requests]
+    if torch.equal(state_slots, replay_slots):
+        replay_slots = replay_slots.flip(0)
+    assert not torch.equal(state_slots, replay_slots)
+    return state_slots.int().cuda(), replay_slots.int().cuda()
+
+
+@pytest.mark.parametrize("packed", [False, True], ids=["shifted", "packed"])
+@pytest.mark.parametrize("B,H,M", [(4, 6, 2), (2, 12, 7), (16, 12, 7)], ids=lambda v: str(v))
+def test_replay_slots_separate_from_state_slots(B, H, M, packed):
+    """The conv and replay caches, and on the packed path the accepted counts, live in a pool of
+    their own addressed by ``replay_state_indices``, while ``ssm_state_indices`` addresses the
+    states. The verify gives, bit for bit, the outputs, states and caches of the verify whose
+    caches share the state slots, and leaves the other rows of both pools alone. ``B=2`` runs
+    the cluster-pair form, ``B=16`` the single-CTA form."""
+    coupled, accept = _round2_inputs(B, H, M)
+    if packed:
+        coupled, _ = _pack_new_token_projection_views(coupled)
+    num_state_rows, num_replay_rows = B + 3, B + 5
+    state_slots, replay_slots = _distinct_slots(B, num_state_rows, num_replay_rows, seed=B + M)
+    separate = _separate_replay_pool(
+        coupled, state_slots, replay_slots, num_state_rows, num_replay_rows
+    )
+    if packed:
+        # The packed path reads each request's count at its replay slot.
+        pool_accepted = torch.full((num_replay_rows,), M + 9, dtype=torch.int32, device="cuda")
+        pool_accepted[replay_slots.long()] = accept.cuda()
+        separate["num_accepted_tokens"] = pool_accepted
+
+    expected = cute_run(coupled, packed_token_layout=packed)
+    actual = cute_run(separate, packed_token_layout=packed)
+
+    assert torch.equal(actual["out"], expected["out"])
+    assert torch.equal(actual["state_v_first"][state_slots.long()], expected["state_v_first"])
+    for name in _REPLAY_CACHE_NAMES:
+        assert torch.equal(actual[name][replay_slots.long()], expected[name]), name
+    other_states = torch.ones(num_state_rows, dtype=torch.bool, device="cuda")
+    other_states[state_slots.long()] = False
+    assert not actual["state_v_first"][other_states].any()
+    other_replay = torch.ones(num_replay_rows, dtype=torch.bool, device="cuda")
+    other_replay[replay_slots.long()] = False
+    for name in _REPLAY_CACHE_NAMES:
+        assert not actual[name][other_replay].any(), name
+
+
+def test_replay_slots_must_match_the_requests():
+    """One replay slot per request; without replay slots the caches must cover the state rows."""
+    data = make_conv_data(B=2, H=6, M=M, seed=19)
+    mismatched = dict(data, replay_state_indices=torch.zeros(3, dtype=torch.int32, device="cuda"))
+    with pytest.raises(ValueError, match="one replay_state_indices entry"):
+        cute_run(mismatched)
+    short = dict(data)
+    for name in ("k_cache", "g_cache", "v_cache", "beta_cache"):
+        short[name] = data[name][:1]
+    with pytest.raises(ValueError, match="cover recurrent_state rows"):
+        cute_run(short)
+
+
+def test_triton_replay_conv_window_copy_with_separate_replay_slots():
+    """The conv-window copy reads the conv pool at the state slots and writes the replay caches
+    at the replay slots, bit for bit as with replay caches that share the state slots."""
+    from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import copy_kda_replay_conv_window
+
+    torch.manual_seed(23)
+    num_requests, H, K, W, num_spec = 5, 6, 128, 4, 7
+    num_state_rows, num_replay_rows = 8, 11
+    state_slots, replay_slots = _distinct_slots(
+        num_requests, num_state_rows, num_replay_rows, seed=5
+    )
+    identity = torch.arange(num_requests, dtype=torch.int32, device="cuda")
+    conv = torch.randn(num_requests, 3 * H * K, W - 1, device="cuda").bfloat16()
+    cs = [
+        torch.randn(num_requests, W - 1 + num_spec, H * K, device="cuda").bfloat16().transpose(1, 2)
+        for _ in range(3)
+    ]
+    coupled = {
+        "conv": conv.clone(),
+        "cs": [_scatter_rows(cache, identity, num_requests) for cache in cs],
+    }
+    separate = {
+        "conv": _scatter_rows(conv, state_slots, num_state_rows),
+        "cs": [_scatter_rows(cache, replay_slots, num_replay_rows) for cache in cs],
+    }
+    for pools in (coupled, separate):
+        for cache in pools["cs"]:
+            cache.zero_()
+
+    copy_kda_replay_conv_window(coupled["conv"], *coupled["cs"], identity)
+    copy_kda_replay_conv_window(separate["conv"], *separate["cs"], state_slots, replay_slots)
+
+    assert torch.equal(separate["conv"][state_slots.long()], coupled["conv"])
+    for actual, expected in zip(separate["cs"], coupled["cs"]):
+        assert torch.equal(actual[replay_slots.long()], expected)
+    torch.cuda.synchronize()
+
+
+@pytest.mark.parametrize(
+    "kernel,quantize_output",
+    [("v2", False), ("two_cta", False), ("two_cta", True)],
+    ids=["v2", "two_cta", "two_cta_mxfp8"],
+)
+@pytest.mark.parametrize("B,H,num_spec", [(2, 6, 7), (32, 6, 6)], ids=lambda v: str(v))
+def test_verify_kernels_with_separate_replay_slots(
+    B, H, num_spec, kernel, quantize_output, monkeypatch
+):
+    """v2 and the two-CTA kernel (which alone takes the MXFP8 output) read and write the conv and
+    replay caches and the accepted counts at ``replay_state_indices`` and the states at
+    ``ssm_state_indices``: bit for bit the verify whose caches share the state slots, with the
+    other replay rows left alone."""
+    coupled = _packed_fused_norm_inputs(B, H, num_spec, torch.float32)
+    state_slots = coupled["ssm_state_indices"].long()
+    num_replay_rows = B + 5
+    generator = torch.Generator().manual_seed(B + num_spec)
+    replay_slots = torch.randperm(num_replay_rows, generator=generator)[:B].int().cuda()
+    separate = dict(coupled, replay_state_indices=replay_slots)
+    for name in _REPLAY_CACHE_NAMES:
+        # cute_run copies the conv caches into dim-contiguous pools, so the rows' layout is free.
+        separate[name] = _scatter_rows(coupled[name][state_slots], replay_slots, num_replay_rows)
+    accepted = torch.full((num_replay_rows,), num_spec + 9, dtype=torch.int32, device="cuda")
+    accepted[replay_slots.long()] = coupled["num_accepted_tokens"][state_slots]
+    separate["num_accepted_tokens"] = accepted
+
+    def run(data):
+        if quantize_output:
+            return cute_run(data, packed_token_layout=True, quantize_output=True)
+        return cute_run(data, packed_token_layout=True, fuse_output_norm=True)
+
+    expected = _run_with_verify_kernel(monkeypatch, kernel, lambda: run(coupled))
+    actual = _run_with_verify_kernel(monkeypatch, kernel, lambda: run(separate))
+    if quantize_output:
+        assert torch.equal(actual["out"].view(torch.uint8), expected["out"].view(torch.uint8))
+        rows = B * (num_spec + 1)
+        assert torch.equal(
+            _valid_mxfp8_scales(actual["output_scale"], rows, H),
+            _valid_mxfp8_scales(expected["output_scale"], rows, H),
+        )
+    else:
+        assert torch.equal(actual["out"], expected["out"])
+    assert torch.equal(actual["state_v_first"], expected["state_v_first"])
+    other_replay = torch.ones(num_replay_rows, dtype=torch.bool, device="cuda")
+    other_replay[replay_slots.long()] = False
+    for name in _REPLAY_CACHE_NAMES:
+        assert torch.equal(actual[name][replay_slots.long()], expected[name][state_slots]), name
+        assert not actual[name][other_replay].any(), name
 
 
 if __name__ == "__main__":

@@ -1,8 +1,8 @@
 {
   "_meta": {
     "generated_by": "scripts/legacy_utils.py lint-update-violations",
-    "total_violations": 2089,
-    "total_files": 221
+    "total_violations": 2060,
+    "total_files": 219
   },
   ".github/scripts/label_community_user.py": {
     "D212": 1
@@ -164,12 +164,12 @@
   "tensorrt_llm/_torch/compilation/piecewise_optimizer.py": {
     "E711": 2
   },
-  "tensorrt_llm/_torch/kernels/blackwell/dense_blockscaled_gemm_persistent.py": {
-    "E741": 3
-  },
   "tensorrt_llm/_torch/distributed/ops.py": {
     "E712": 1,
     "E731": 1
+  },
+  "tensorrt_llm/_torch/kernels/blackwell/dense_blockscaled_gemm_persistent.py": {
+    "E741": 3
   },
   "tensorrt_llm/_torch/models/checkpoints/auto_mapper.py": {
     "F821": 1
@@ -745,10 +745,6 @@
     "D411": 2,
     "D415": 2
   },
-  "tests/integration/defs/perf/sanity_perf_check.py": {
-    "D205": 2,
-    "D212": 3
-  },
   "tests/integration/defs/perf/session_data_writer.py": {
     "D200": 2,
     "D205": 2,
@@ -785,8 +781,7 @@
   "tests/integration/defs/sysinfo/get_sysinfo.py": {
     "D210": 1,
     "D415": 5,
-    "E722": 3,
-    "F821": 2
+    "E722": 2
   },
   "tests/integration/defs/test_e2e.py": {
     "D200": 5,
@@ -807,31 +802,23 @@
     "F811": 1
   },
   "tests/integration/defs/triton_server/conftest.py": {
-    "D200": 3,
-    "D202": 1,
-    "D205": 1,
-    "D208": 1,
-    "D209": 1,
-    "D212": 2,
+    "D200": 2,
+    "D212": 1,
     "D300": 3,
     "D403": 3,
     "D415": 3,
-    "E741": 3,
-    "F821": 1
+    "E741": 3
   },
   "tests/integration/defs/triton_server/test_list_parser.py": {
-    "D202": 5,
-    "D205": 5,
+    "D202": 4,
+    "D205": 3,
     "D208": 1,
-    "D209": 2,
+    "D209": 1,
     "D212": 3,
-    "D214": 3,
-    "D410": 1,
-    "D411": 1,
+    "D214": 1,
     "E731": 2,
     "E741": 2,
-    "F811": 1,
-    "F821": 2
+    "F811": 1
   },
   "tests/integration/defs/triton_server/trt_test_alternative.py": {
     "D200": 1,

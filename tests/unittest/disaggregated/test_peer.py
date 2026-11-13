@@ -40,7 +40,10 @@ from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
     MambaPolicy,
 )
 from tensorrt_llm._torch.disaggregation.native.peer import PeerOverlap, PeerRegistrar
-from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
+from tensorrt_llm._torch.disaggregation.native.rank_info import (
+    NATIVE_TRANSFER_PROTOCOL_VERSION,
+    RankInfo,
+)
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.disaggregation.resource.page import (
     BUFFER_ENTRY_DTYPE,
@@ -711,6 +714,7 @@ def test_receiver_rejects_view_mismatch_before_registration(
         for rid in (1, 2):
             params = SimpleNamespace(ctx_info_endpoint=bad_endpoint, ctx_dp_rank=0)
             task = KVRecvTask(rid, chunk, slice_id=0, params=params, aux_slot=None)
+            task._enforce_physical_ownership = enforce_physical_ownership
             if enforce_physical_ownership:
                 task.begin_publication()
 
@@ -913,6 +917,17 @@ def test_peer_registrar_incompatible_peer_raises():
         instance_name="peer", instance_rank=3, is_mla=True, page_table=make_page_table()
     )
     with pytest.raises(ValueError):
+        reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+
+
+def test_peer_registrar_rejects_mismatched_protocol_version():
+    # A peer whose native transfer protocol version differs is rejected at
+    # registration, before any other RankInfo field is trusted.
+    self_rankinfo = make_rankinfo(instance_name="local")
+    reg = _make_peer_registrar(self_rankinfo)
+    peer_ri = make_rankinfo(instance_name="peer", instance_rank=4, page_table=make_page_table())
+    peer_ri.protocol_version = NATIVE_TRANSFER_PROTOCOL_VERSION + 1
+    with pytest.raises(ValueError, match="protocol version"):
         reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
 
 

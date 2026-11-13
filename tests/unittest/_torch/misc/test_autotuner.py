@@ -14,6 +14,7 @@
 
 import contextlib
 import enum
+import errno
 import itertools
 import json
 import math
@@ -21,8 +22,10 @@ import os
 import pickle
 import re
 import statistics
+import subprocess
 import sys
 import tempfile
+import threading
 from typing import Any, List
 
 import cloudpickle
@@ -32,6 +35,7 @@ from mpi4py import MPI
 
 import tensorrt_llm
 import tensorrt_llm._torch.autotuner as autotuner
+from tensorrt_llm import _jit_share as jit_share
 from tensorrt_llm._torch.autotuner import (AutoTuner, DistributedTuningStrategy,
                                            DynamicDim, DynamicTensorSpec,
                                            FakeTensor, OptimizationProfile,
@@ -1846,6 +1850,25 @@ def test_parallel_tactics_split_skips_non_helix_cp_ranks():
         tactics, DistributedTuningStrategy.PARALLEL) == tactics
 
 
+@pytest.mark.parametrize("num_tactics", [0, 1, 3, 15, 16, 17])
+@pytest.mark.parametrize("offset", [0, 1, 7, 15])
+def test_parallel_tactics_short_list_partitions_without_duplicates(
+        num_tactics: int, offset: int) -> None:
+    from types import SimpleNamespace
+
+    tactics = list(range(num_tactics))
+    shards = []
+    for rank in range(16):
+        tuner = SimpleNamespace(_is_distributed=lambda: True,
+                                _tuning_group=lambda: (16, rank))
+        selected = autotuner.AutoTuner._maybe_parallelize_tactics(
+            tuner, tactics, DistributedTuningStrategy.PARALLEL, offset=offset)
+        shards.append(selected)
+    assert sorted(tactic for shard in shards for tactic in shard) == tactics
+    assert max(map(len, shards)) - min(map(len, shards)) <= 1
+    assert sum(not shard for shard in shards) == max(0, 16 - num_tactics)
+
+
 def test_profiling_cache_enum_tactic_roundtrip(tmp_path):
     # An enum tactic must survive save -> load: repr("<Enum.X: v>") isn't
     # ast.literal_eval-parsable, so the cache serializes tactic.value instead.
@@ -2087,3 +2110,919 @@ def test_failed_profiling_capture_moves_to_a_fresh_graph_pool(monkeypatch):
     assert len(set(after)) == 1 and after[0] != failed_pool, captures
     assert events["release"] == captures[:failed_at] + after
     assert tuner._profile_graph_pool is None
+
+
+def test_parallel_split_deals_pairs_across_runners(monkeypatch):
+    """PARALLEL shares the (runner, tactic) pairs of all runners evenly.
+
+    Each rank of the group profiles only its share of a profile's pairs.
+    Splitting each runner's tactics on its own would put the first tactic of
+    every runner on group rank 0, so ranks with low indices would build and
+    time most of the candidates while the others wait at the merge. With fewer
+    pairs than ranks, a rank dealt none logs no warning: the merge brings it
+    the winner.
+    """
+
+    class ListedTacticsRunner(TunableRunner):
+
+        def __init__(self, name: str, num_tactics: int):
+            self.name, self.num_tactics = name, num_tactics
+
+        def unique_id(self):
+            return (self.name, )
+
+        def get_valid_tactics(self, inputs, profile, **kwargs) -> List[int]:
+            return list(range(self.num_tactics))
+
+        def forward(self, /, inputs, *, tactic: int = -1, **kwargs):
+            return inputs[0]
+
+    timed = {}
+
+    def record_pair(self, runner, inputs, tactic, **kwargs):
+        timed.setdefault(self._tuning_group()[1], []).append(
+            (runner.name, tactic))
+        return 1.0
+
+    warnings = []
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", record_pair)
+    monkeypatch.setattr(autotuner.logger, "warning_once",
+                        lambda *args, **kwargs: warnings.append(args))
+    group_size = 4
+    op = "autotuner_test::parallel_deal"
+    config = TuningConfig(
+        distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL)
+    profile = OptimizationProfile([[StaticDim(8), StaticDim(64)]])
+    x = torch.zeros(8, 64)
+
+    def deal(runners):
+        timed.clear()
+        for rank in range(group_size):
+            tuner = autotuner.AutoTuner()
+            tuner.setup_distributed_state(Mapping(world_size=group_size,
+                                                  rank=rank,
+                                                  tp_size=group_size),
+                                          dist=object())
+            # choose_one sets these up before it profiles.
+            tuner.stats.tuned_op_profiled_configs[op] = 0
+            tuner.stats.failed_profiling_count[op] = set()
+            tuner._profile_runners_impl(op, runners, [x], profile, config)
+        return tuner, [timed.get(rank, []) for rank in range(group_size)]
+
+    runners = [
+        ListedTacticsRunner("cublas", 1),
+        ListedTacticsRunner("direct", 7),
+        ListedTacticsRunner("splitk", 3)
+    ]
+    tuner, shares = deal(runners)
+    # Every pair is timed on exactly one rank, and the shares differ by at most one.
+    assert sorted(pair for share in shares for pair in share) == sorted(
+        (r.name, t) for r in runners for t in range(r.num_tactics))
+    assert max(map(len, shares)) - min(map(len, shares)) <= 1, shares
+    # The deal starts at the profile's start rank.
+    start = tuner._parallel_deal_start(op, profile,
+                                       DistributedTuningStrategy.PARALLEL)
+    assert shares[start][0] == ("cublas", 0), (start, shares)
+    # Two pairs on four ranks: two ranks are dealt none and do not warn.
+    _, shares = deal([ListedTacticsRunner("direct", 2)])
+    assert sorted(map(len, shares)) == [0, 0, 1, 1], shares
+    assert warnings == [], warnings
+
+
+@pytest.mark.parametrize("group_size", [2, 4, 16])
+def test_parallel_rank_dealt_no_pair_runs_the_merged_winner(
+        monkeypatch: pytest.MonkeyPatch, group_size: int) -> None:
+    """choose_one on a PARALLEL rank that profiles nothing returns the winner
+    the group found: with one (runner, tactic) pair, all ranks the deal skips
+    get it from the merge without warning."""
+
+    class SingleTacticRunner(TunableRunner):
+
+        def get_valid_tactics(self, inputs, profile, **kwargs) -> List[int]:
+            return [7]
+
+        def forward(self, /, inputs, *, tactic: int = -1, **kwargs):
+            return inputs[0]
+
+    profiled = []
+
+    def record_pair(self, runner, inputs, tactic, **kwargs):
+        profiled.append((self._tuning_group()[1], tactic))
+        return 1.0
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", record_pair)
+    warnings = []
+    monkeypatch.setattr(autotuner.logger, "warning_once",
+                        lambda *args, **kwargs: warnings.append(args))
+    gathered = {}
+
+    class _AllgatherDist:
+        """tp_cp_allgather of the ranks run so far, in rank order."""
+
+        def __init__(self, rank):
+            self.rank = rank
+
+        def tp_cp_allgather(self, obj):
+            gathered[self.rank] = obj
+            return [gathered[r] for r in sorted(gathered)]
+
+    op = "autotuner_test::parallel_rank_without_pairs"
+    config = TuningConfig(
+        distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL)
+    runner = SingleTacticRunner()
+    inputs = [torch.zeros(8, 64), torch.zeros(64, 32)]
+
+    def tuner_for(rank):
+        tuner = autotuner.AutoTuner()
+        tuner.setup_distributed_state(Mapping(world_size=group_size,
+                                              rank=rank,
+                                              tp_size=group_size),
+                                      dist=_AllgatherDist(rank))
+        tuner.is_tuning_mode = True
+        return tuner
+
+    profile = tuner_for(0)._optimization_profiles(config, inputs)[0]
+    profiling_rank = tuner_for(0)._parallel_deal_start(
+        op, profile, DistributedTuningStrategy.PARALLEL)
+    results = {}
+    ranks = [profiling_rank
+             ] + [rank for rank in range(group_size) if rank != profiling_rank]
+    for rank in ranks:
+        results[rank] = tuner_for(rank).choose_one(op, [runner], config, inputs)
+    assert profiled == [(profiling_rank, 7)], profiled
+    assert all(result == (runner, 7) for result in results.values()), results
+    assert warnings == [], warnings
+
+
+def test_parallel_search_cache_picks_fastest_runner():
+    """After a PARALLEL merge a shape can hold one entry per runner.
+
+    The lookup must return the fastest of them; other strategies keep one
+    entry per shape and return the first runner found.
+    """
+    runners = [
+        GemmRunner(),
+        GemmRunnerWithAttributes(block_size=128, num_warps=4)
+    ]
+    shapes = (torch.Size([M, 64]), torch.Size([64, 128]))
+    for strategy, expected in ((DistributedTuningStrategy.PARALLEL, 1),
+                               (DistributedTuningStrategy.INDEPENDENT, 0)):
+        config = TuningConfig(distributed_tuning_strategy=strategy)
+        cache = autotuner.AutoTunerProfilingCache()
+        for runner, tactic, ms in ((runners[0], 0, 2.0), (runners[1], 1, 1.0)):
+            cache[cache.get_cache_key("autotuner_test::parallel_lookup", runner,
+                                      shapes, config)] = (0, tactic, ms)
+        hit, runner_id, tactic, _ = cache.search_cache(
+            "autotuner_test::parallel_lookup", runners, shapes, config)
+        assert hit and runner_id == expected, (strategy, runner_id)
+
+
+def test_parallel_deal_start_is_stable_and_spread():
+    """Each profile's PARALLEL deal starts at a rank derived from the op and
+    the shapes: the same on every rank and in every process, and spread over
+    the group so a runner's costly tactics do not land on the same ranks."""
+    group_size = 16
+    starts = []
+    for m in range(1, 129):
+        profile = autotuner.OptimizationProfile(
+            [[autotuner.StaticDim(m),
+              autotuner.StaticDim(7168)],
+             [autotuner.StaticDim(7168),
+              autotuner.StaticDim(2048)]])
+        per_rank = set()
+        for rank in range(group_size):
+            tuner = autotuner.AutoTuner()
+            tuner.setup_distributed_state(Mapping(world_size=group_size,
+                                                  rank=rank,
+                                                  tp_size=group_size),
+                                          dist=object())
+            per_rank.add(
+                tuner._parallel_deal_start("autotuner_test::deal", profile,
+                                           DistributedTuningStrategy.PARALLEL))
+        assert len(per_rank) == 1, (m, per_rank)
+        starts.append(per_rank.pop())
+    assert set(starts) == set(range(group_size)), sorted(set(starts))
+
+
+def test_share_jit_builds_sets_aside_profiles_built_elsewhere(
+        monkeypatch, tmp_path):
+    """With DeepGEMM's builds shared across ranks, a rank runs the profiles it
+    claims first. One whose kernel another rank is building is set aside rather
+    than failed and runs after the others; a profile another rank claimed runs
+    last, once that rank has run it."""
+    calls: List[int] = []
+
+    class SharedBuildRunner(TunableRunner):
+
+        def unique_id(self):
+            return ()
+
+        def get_valid_tactics(self, inputs: List[FakeTensor],
+                              profile: OptimizationProfile,
+                              **kwargs) -> List[int]:
+            return [0]
+
+        def forward(self,
+                    /,
+                    inputs: List[torch.Tensor],
+                    *,
+                    tactic: int = -1,
+                    **kwargs) -> torch.Tensor:
+            m = inputs[0].shape[0]
+            calls.append(m)
+            if m in (2, 4) and calls.count(m) == 1:
+                raise RuntimeError(
+                    f"command failed with exit code 75:\n{jit_share.BUSY_MARK} 0"
+                )
+            return inputs[0]
+
+    monkeypatch.setattr(jit_share, "enabled", lambda: True)
+    monkeypatch.setattr(jit_share, "start_fraction", lambda: 0.0)
+    monkeypatch.setenv(jit_share.SHARE_DIR_ENV, str(tmp_path))
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    op = "autotuner_test::share_jit_builds"
+    config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+        0, 0, (1, 2, 4, 8)), ),
+                          share_jit_builds=True)
+    real_claim = jit_share.SharedSweep.claim
+    # Another rank holds the claim on the last profile (M = 8) and has run it.
+    monkeypatch.setattr(jit_share.SharedSweep, "claim",
+                        lambda self, i: i != 3 and real_claim(self, i))
+    monkeypatch.setattr(jit_share.SharedSweep, "wait_done",
+                        lambda self, i: calls.append(-i))
+    with autotune():
+        tuner.choose_one(op, [SharedBuildRunner()], config,
+                         [torch.zeros(8, 64, device="cuda")])
+    assert calls == [1, 2, 4, 2, 4, -3, 8], calls
+    assert not tuner.stats.failed_profiling_count[op]
+    assert len(tuner.profiling_cache.get_specific_custom_op(op)) == 4
+    assert jit_share._DEFER_ENV not in os.environ
+    assert jit_share._DEADLINE_ENV not in os.environ
+
+
+def test_share_jit_builds_sets_aside_a_timed_profile_whose_kernel_is_busy(
+        monkeypatch, tmp_path):
+    """The ranks split a sweep by profile when its first profile has one tactic.
+    A later profile with several tactics is timed, and a tactic whose kernel
+    another rank is building does not fail there either: the profile is set
+    aside and timed again, every tactic, after the others."""
+    calls: List[tuple] = []
+
+    class MixedTacticsRunner(TunableRunner):
+
+        def unique_id(self):
+            return ()
+
+        def get_valid_tactics(self, inputs: List[FakeTensor],
+                              profile: OptimizationProfile,
+                              **kwargs) -> List[int]:
+            return [0] if inputs[0].shape[0] == 1 else [0, 1]
+
+        def forward(self,
+                    /,
+                    inputs: List[torch.Tensor],
+                    *,
+                    tactic: int = -1,
+                    **kwargs) -> torch.Tensor:
+            m = inputs[0].shape[0]
+            calls.append((m, tactic))
+            if (m, tactic) == (2, 0) and calls.count((2, 0)) == 1:
+                raise RuntimeError(
+                    f"command failed with exit code 75:\n{jit_share.BUSY_MARK} 0"
+                )
+            if tactic == 1:
+                torch.cuda._sleep(1_000_000)  # The slower tactic.
+            return inputs[0] + 1
+
+    monkeypatch.setattr(jit_share, "enabled", lambda: True)
+    monkeypatch.setattr(jit_share, "start_fraction", lambda: 0.0)
+    monkeypatch.setenv(jit_share.SHARE_DIR_ENV, str(tmp_path))
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    op = "autotuner_test::share_jit_builds_timed_busy"
+    config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+        0, 0, (1, 2, 4)), ),
+                          share_jit_builds=True)
+    runners = [MixedTacticsRunner()]
+    with autotune():
+        tuner.choose_one(op, runners, config,
+                         [torch.zeros(4, 64, device="cuda")])
+    assert not tuner.stats.failed_profiling_count[op]
+    after_m4 = max(i for i, (m, _) in enumerate(calls) if m == 4)
+    assert {t for m, t in calls[after_m4:] if m == 2} == {0, 1}, calls
+    assert len(tuner.profiling_cache.get_specific_custom_op(op)) == 3
+    _, tactic = tuner.choose_one(op, runners, config,
+                                 [torch.zeros(2, 64, device="cuda")])
+    assert tactic == 0
+    tuner.clear_cache()
+
+
+def test_deep_gemm_jit_share_builds_each_kernel_once(tmp_path, monkeypatch):
+    """DeepGEMM's compiler wrapper builds a kernel in the process that claims
+    it. Others copy the published cubin, report busy while it is being built if
+    asked to defer, and build it themselves when the claimant does not publish
+    it within their wait, which an enclosing deadline cuts short."""
+    # The keys computed here must match the wrapper's, which runs without the salt.
+    monkeypatch.delenv(jit_share._SALT_ENV, raising=False)
+    calls = tmp_path / "calls"
+    compiler = tmp_path / "fake_nvcc"
+    compiler.write_text(
+        f"#!{sys.executable}\n"
+        "import sys\n"
+        "args = sys.argv[1:]\n"
+        f"open({str(calls)!r}, 'a').write(' '.join(args) + '\\n')\n"
+        "if args == ['--version']:\n"
+        "    print('Cuda compilation tools, release 13.0')\n"
+        "    sys.exit(0)\n"
+        "out = args[args.index('--output-file') + 1]\n"
+        "open(out, 'wb').write(open(args[0], 'rb').read()[::-1])\n")
+    compiler.chmod(0o755)
+    kernels = tmp_path / "share" / "kernels"
+    env = {
+        k: v
+        for k, v in os.environ.items() if not k.startswith("TLLM_JIT_SHARE_")
+    }
+    env.update({
+        jit_share.SHARE_DIR_ENV: str(tmp_path / "share"),
+        jit_share._REAL_COMPILER_ENV: str(compiler),
+    })
+
+    def kernel(name: str, source: str) -> List[str]:
+        work = tmp_path / name
+        work.mkdir()
+        (work / "kernel.cu").write_text(source)
+        return [
+            str(work / "kernel.cu"), "--cubin", "--output-file",
+            str(work / "kernel.cubin"), "-O3"
+        ]
+
+    def run(argv: List[str], **extra_env) -> subprocess.CompletedProcess:
+        return subprocess.run([sys.executable, "-I", "-S", jit_share.__file__] +
+                              argv,
+                              env=dict(env, **extra_env),
+                              capture_output=True,
+                              text=True)
+
+    def builds() -> int:
+        return calls.read_text().count("--cubin") if calls.exists() else 0
+
+    def claim(argv: List[str]) -> None:
+        kernels.mkdir(parents=True, exist_ok=True)
+        path = kernels / f"{jit_share._kernel_key(argv[0], argv)}.claim"
+        path.write_text("another process\n")
+
+    assert "release 13.0" in run(["--version"]).stdout
+
+    for name in ("a", "b"):  # built once, then copied
+        argv = kernel(name, "kernel one")
+        assert run(argv).returncode == 0
+        assert (tmp_path / name / "kernel.cubin").read_text() == "eno lenrek"
+    assert builds() == 1
+
+    argv = kernel("c", "kernel two")
+    claim(argv)
+    busy = run(argv, **{jit_share._DEFER_ENV: "1"})
+    assert busy.returncode == jit_share.BUSY_EXIT_CODE
+    assert jit_share.BUSY_MARK in busy.stdout and builds() == 1
+    assert run(argv, **{jit_share._WAIT_ENV: "0.2"}).returncode == 0
+    assert builds() == 2
+
+    argv = kernel("d", "kernel three")
+    claim(argv)
+    past = {jit_share._WAIT_ENV: "600", jit_share._DEADLINE_ENV: repr(0.0)}
+    assert run(argv, **past).returncode == 0
+    assert builds() == 3
+
+
+def test_deep_gemm_jit_share_builds_here_when_the_directory_fails(
+        tmp_path, monkeypatch):
+    """Where the share directory cannot be used (here its kernels directory is
+    a file), DeepGEMM's compiler wrapper runs the real compiler, as without
+    sharing. A kernel built here that cannot be published (the quota is full)
+    is still this build's result, and is marked failed for the others."""
+    calls = tmp_path / "calls"
+    compiler = tmp_path / "fake_nvcc"
+    compiler.write_text(
+        f"#!{sys.executable}\n"
+        "import sys\n"
+        "args = sys.argv[1:]\n"
+        f"open({str(calls)!r}, 'a').write(' '.join(args) + '\\n')\n"
+        "out = args[args.index('--output-file') + 1]\n"
+        "open(out, 'wb').write(open(args[0], 'rb').read()[::-1])\n")
+    compiler.chmod(0o755)
+    share = tmp_path / "share"
+    share.mkdir()
+    (share / "kernels").write_text("not a directory")
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "kernel.cu").write_text("kernel one")
+    output = work / "kernel.cubin"
+    argv = [str(work / "kernel.cu"), "--cubin", "--output-file", str(output)]
+    env = {
+        k: v
+        for k, v in os.environ.items() if not k.startswith("TLLM_JIT_SHARE_")
+    }
+    env.update({
+        jit_share.SHARE_DIR_ENV: str(share),
+        jit_share._REAL_COMPILER_ENV: str(compiler),
+    })
+    run = subprocess.run([sys.executable, "-I", "-S", jit_share.__file__] +
+                         argv,
+                         env=env,
+                         capture_output=True,
+                         text=True)
+    assert run.returncode == 0, run.stderr
+    assert output.read_text() == "eno lenrek"
+    assert calls.read_text().count("--cubin") == 1
+
+    def quota_full(output: str, cubin: str) -> None:
+        raise OSError(errno.EDQUOT, os.strerror(errno.EDQUOT))
+
+    monkeypatch.setattr(jit_share, "_publish", quota_full)
+    kernels = tmp_path / "kernels"
+    kernels.mkdir()
+    assert jit_share._build(str(compiler), argv, str(output),
+                            str(kernels / "k.cubin"),
+                            str(kernels / "k.failed")) == 0
+    assert (kernels / "k.failed").exists()
+    assert calls.read_text().count("--cubin") == 2
+
+
+def test_jit_share_wrapper_needs_a_private_directory(tmp_path):
+    """DeepGEMM runs the compiler wrapper found in its directory, so the wrapper
+    is written to and used from a directory only this user can write to: one
+    another user could write to, or a symlink, is refused."""
+    if os.statvfs(tmp_path).f_flag & os.ST_NOEXEC:
+        pytest.skip("the temporary directory does not allow executing files")
+    private = tmp_path / "private"
+    wrapper = jit_share._write_wrapper(str(private))
+    assert wrapper is not None and os.access(wrapper, os.X_OK)
+    assert os.stat(private).st_mode & 0o077 == 0
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    shared.chmod(0o777)
+    assert jit_share._write_wrapper(str(shared)) is None
+    link = tmp_path / "link"
+    link.symlink_to(private)
+    assert jit_share._write_wrapper(str(link)) is None
+
+
+def test_jit_share_wrapper_stays_where_only_this_user_can_replace_it(
+        tmp_path, monkeypatch):
+    """DeepGEMM runs the compiler wrapper at its path for the life of the
+    process, so the wrapper goes where no other user can rename a directory on
+    that path: this user's directory in a sticky (or private) temporary
+    directory first, the share directory only if no one else can write to it."""
+    sticky = tmp_path / "tmp"
+    sticky.mkdir()
+    sticky.chmod(0o1777)
+    monkeypatch.setattr(tempfile, "tempdir", str(sticky))
+    mine = str(sticky / f"tllm_jit_share_{os.getuid()}")
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    shared.chmod(0o777)
+    assert jit_share._wrapper_dirs(str(shared)) == [mine]
+    private = tmp_path / "private"
+    private.mkdir()
+    private.chmod(0o700)
+    assert jit_share._wrapper_dirs(str(private)) == [mine, str(private / "bin")]
+    sticky.chmod(0o777)  # others could rename this user's directory in it
+    assert jit_share._wrapper_dirs(str(private)) == [str(private / "bin")]
+
+
+def test_jit_share_install_moves_past_an_unusable_wrapper_directory(
+        tmp_path, monkeypatch):
+    """install() writes DeepGEMM's compiler wrapper to the first of its
+    directories that can hold it and makes that wrapper DeepGEMM's compiler."""
+    if os.statvfs(tmp_path).f_flag & os.ST_NOEXEC:
+        pytest.skip("the temporary directory does not allow executing files")
+    bad, good = str(tmp_path / "bad"), str(tmp_path / "good")
+    write = jit_share._write_wrapper
+    monkeypatch.setattr(jit_share, "_wrapper_dirs",
+                        lambda share_dir: [bad, good])
+    monkeypatch.setattr(jit_share, "_write_wrapper", lambda d: None
+                        if d == bad else write(d))
+    monkeypatch.setattr(jit_share, "_installed", False)
+    compiler = tmp_path / "nvcc"
+    compiler.write_text("#!/bin/sh\n")
+    compiler.chmod(0o700)
+    # install() sets these; registering them first makes the test restore them.
+    for name in ("DG_JIT_NVCC_COMPILER", "DG_JIT_CACHE_DIR",
+                 jit_share._SALT_ENV, jit_share._PROCESS_ENV):
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
+    monkeypatch.setenv(jit_share.SHARE_DIR_ENV, str(tmp_path / "share"))
+    monkeypatch.setenv(jit_share._REAL_COMPILER_ENV, str(compiler))
+    assert jit_share.install()
+    assert os.path.dirname(os.environ["DG_JIT_NVCC_COMPILER"]) == good
+    assert os.environ[jit_share._REAL_COMPILER_ENV] == str(compiler)
+
+
+def test_jit_share_install_needs_a_directory_other_users_cannot_write(
+        tmp_path, monkeypatch):
+    """Every process runs the kernels it finds in the share directory, so
+    install() shares builds only when the directory, and the ones it holds
+    kernels in, belong to this user and other users cannot write to them."""
+    if os.statvfs(tmp_path).f_flag & os.ST_NOEXEC:
+        pytest.skip("the temporary directory does not allow executing files")
+    monkeypatch.setattr(jit_share, "_wrapper_dirs",
+                        lambda share_dir: [str(tmp_path / "bin")])
+    monkeypatch.setattr(jit_share, "_installed", False)
+    compiler = tmp_path / "nvcc"
+    compiler.write_text("#!/bin/sh\n")
+    compiler.chmod(0o700)
+    # install() sets these; registering them first makes the test restore them.
+    for name in ("DG_JIT_NVCC_COMPILER", "DG_JIT_CACHE_DIR",
+                 jit_share._SALT_ENV, jit_share._PROCESS_ENV):
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
+    share = tmp_path / "share"
+    share.mkdir()
+    share.chmod(0o777)
+    monkeypatch.setenv(jit_share.SHARE_DIR_ENV, str(share))
+    monkeypatch.setenv(jit_share._REAL_COMPILER_ENV, str(compiler))
+    with pytest.warns(RuntimeWarning, match="other users cannot write"):
+        assert not jit_share.install()
+    assert "DG_JIT_NVCC_COMPILER" not in os.environ
+    share.chmod(0o755)
+    (share / "cute").chmod(0o777)
+    with pytest.warns(RuntimeWarning, match="cute"):
+        assert not jit_share.install()
+    (share / "cute").chmod(0o755)
+    assert jit_share.install()
+    assert os.environ["DG_JIT_CACHE_DIR"] == str(share / "deep_gemm")
+
+
+def test_shared_kernel_cache_exports_and_loads(monkeypatch, tmp_path):
+    """A CuTe DSL kernel stored in a shared runner cache is exported, and the
+    cache of another process (a second instance here) loads it instead of
+    compiling it. A kernel claimed but not yet exported is busy inside
+    defer_busy_builds, and a miss once the wait runs out otherwise."""
+    exported = {}
+
+    def export(kernel, obj, name, meta):
+        exported[name] = kernel
+        for path in (meta, obj):
+            with open(path, "w") as f:
+                f.write(name)
+
+    monkeypatch.setenv(jit_share.SHARE_DIR_ENV, str(tmp_path))
+    monkeypatch.setenv(jit_share._WAIT_ENV, "0.1")
+    monkeypatch.setattr(jit_share, "_cute_identity", lambda: "test")
+    monkeypatch.setattr(jit_share, "_export_kernel", export)
+    monkeypatch.setattr(jit_share, "_load_kernel", lambda obj, name, meta:
+                        ("loaded", exported[name]))
+    first, second = (jit_share.SharedKernelCache("Runner") for _ in range(2))
+
+    def claims() -> int:
+        return len(list((tmp_path / "cute").glob("*.claim")))
+
+    with jit_share.sharing_kernels():
+        assert (1, "tile") not in first  # claimed: this process compiles it
+        first[(1, "tile")] = "kernel"
+        assert (1, "tile") in second
+        assert second[(1, "tile")] == ("loaded", "kernel")
+        # Another process claimed (2, "tile") and has not exported it yet.
+        open(second._paths((2, "tile"))[2], "w").close()
+        with jit_share.defer_busy_builds(), pytest.raises(jit_share.KernelBusy):
+            _ = (2, "tile") in second
+        assert (2, "tile") not in second
+        before = claims()
+        assert object() not in first  # its repr holds an address: not shared
+        assert claims() == before
+    assert (1, "tile") not in jit_share.SharedKernelCache("Runner")
+
+
+def test_shared_kernel_cache_marks_a_raised_compile_failed(
+        monkeypatch, tmp_path):
+    """A claimed kernel that is never stored (its compile raised) is marked
+    failed at the thread's next lookup, or when tuning ends: this process
+    compiles it again without waiting for its own claim, and another process
+    (a second instance here) stops waiting for it."""
+    waits = []
+    wait = jit_share._wait
+
+    def record_wait(obj, failed):
+        waits.append(os.path.exists(failed))
+        return wait(obj, failed)
+
+    monkeypatch.setenv(jit_share.SHARE_DIR_ENV, str(tmp_path))
+    monkeypatch.setenv(jit_share._WAIT_ENV, "600")
+    monkeypatch.setattr(jit_share, "_cute_identity", lambda: "test")
+    monkeypatch.setattr(jit_share, "_wait", record_wait)
+    here, other = (jit_share.SharedKernelCache("Runner") for _ in range(2))
+    with jit_share.sharing_kernels():
+        assert (1, "tile") not in here  # claimed; its compile raises
+        assert (1, "tile") not in here  # compiled here again
+        assert (1, "tile") not in other
+        assert (2, "tile") not in here  # claimed; tuning ends before a store
+    assert waits == [True]
+    assert len(list((tmp_path / "cute").glob("*.failed"))) == 2
+
+
+def test_jit_share_waits_end_at_the_deadline(monkeypatch, tmp_path):
+    """A wait for another process's sweep item or kernel ends at the deadline
+    of an enclosing wait_until, however long the wait setting, so that a
+    claimant that hangs delays the others by one wait at most."""
+    monkeypatch.setenv(jit_share.SHARE_DIR_ENV, str(tmp_path))
+    monkeypatch.setenv(jit_share._WAIT_ENV, "600")
+    monkeypatch.setattr(jit_share, "_cute_identity", lambda: "test")
+    sweep = jit_share.SharedSweep("sweep")
+    assert sweep.claim(0) and not sweep.claim(0)
+    cache = jit_share.SharedKernelCache("Runner")
+    (tmp_path / "cute").mkdir()
+    open(cache._paths((1, "tile"))[2], "w").close()  # claimed elsewhere
+    with jit_share.sharing_kernels(), jit_share.wait_until(0.0):
+        assert not sweep.wait_done(0)
+        assert (1, "tile") not in cache
+    assert jit_share._DEADLINE_ENV not in os.environ
+    sweep.done(0)
+    assert sweep.wait_done(0)
+
+
+def test_jit_share_builds_here_when_the_directory_fails(monkeypatch, tmp_path):
+    """Where the share directory cannot be used (here the directories in it are
+    files, so that nothing can be created in them), a process builds each
+    kernel itself, as without sharing: a pass starts at the front, a sweep's
+    items are all this process's, and a CuTe DSL lookup is a miss whose store
+    keeps the kernel here."""
+    for name in ("slots", "sweeps", "cute"):
+        (tmp_path / name).write_text("not a directory")
+    monkeypatch.setenv(jit_share.SHARE_DIR_ENV, str(tmp_path))
+    monkeypatch.setattr(jit_share, "_slot", None)
+    monkeypatch.setattr(jit_share, "_cute_identity", lambda: "test")
+    assert jit_share.start_fraction() == 0.0
+    sweep = jit_share.SharedSweep("sweep")
+    assert sweep.claim(0) and sweep.claim(0)
+    sweep.done(0)
+    assert sweep.wait_done(0)
+    cache = jit_share.SharedKernelCache("Runner")
+    with jit_share.sharing_kernels():
+        assert (1, "tile") not in cache
+        cache[(1, "tile")] = "kernel"  # its export fails
+        assert (1, "tile") in cache and cache[(1, "tile")] == "kernel"
+
+
+def test_build_across_ranks_runs_only_claimed_items(monkeypatch, tmp_path):
+    """With several tactics under INDEPENDENT tuning, a build pass runs each
+    (profile, runner, tactic) this process claims once, before profiling, and
+    leaves the items other processes claimed to them; profiling then times
+    every pair."""
+    ran: List[tuple] = []
+    timed: List[tuple] = []
+
+    class TwoTacticRunner(TunableRunner):
+
+        def unique_id(self):
+            return ()
+
+        def get_valid_tactics(self, inputs: List[FakeTensor],
+                              profile: OptimizationProfile,
+                              **kwargs) -> List[int]:
+            return [0, 1]
+
+        def forward(self,
+                    /,
+                    inputs: List[torch.Tensor],
+                    *,
+                    tactic: int = -1,
+                    **kwargs) -> torch.Tensor:
+            ran.append((inputs[0].shape[0], tactic))
+            return inputs[0]
+
+    def time_pair(self, runner, inputs, tactic, tuning_config, **kwargs):
+        timed.append((inputs[0].shape[0], tactic))
+        return 1.0 + tactic
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", time_pair)
+    monkeypatch.setattr(jit_share, "enabled", lambda: True)
+    monkeypatch.setattr(jit_share, "start_fraction", lambda: 0.0)
+    monkeypatch.setenv(jit_share.SHARE_DIR_ENV, str(tmp_path))
+    real_claim = jit_share.SharedSweep.claim
+    # Other processes hold the odd items.
+    monkeypatch.setattr(jit_share.SharedSweep, "claim",
+                        lambda self, k: k % 2 == 0 and real_claim(self, k))
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(0, 0,
+                                                                  (2, 4)), ),
+                          share_jit_builds=True)
+    with autotune():
+        tuner.choose_one("autotuner_test::build_across_ranks",
+                         [TwoTacticRunner()], config,
+                         [torch.zeros(4, 64, device="cuda")])
+    # Items: (2, 0), (2, 1), (4, 0), (4, 1); this process holds 0 and 2.
+    assert ran == [(2, 0), (4, 0)], ran
+    assert sorted(timed) == [(2, 0), (2, 1), (4, 0), (4, 1)], timed
+
+
+def test_jit_share_salt_ignores_file_times(tmp_path):
+    """Copies of the same files installed at different times give the same
+    salt, as each node installs its own copy; different contents do not."""
+    for name, stamp in (("a", 1_000_000), ("b", 2_000_000)):
+        (tmp_path / name).mkdir()
+        compiler = tmp_path / name / "nvcc"
+        compiler.write_text("compiler")
+        os.utime(compiler, (stamp, stamp))
+    salt_a = jit_share._salt(str(tmp_path / "a" / "nvcc"))
+    assert salt_a == jit_share._salt(str(tmp_path / "b" / "nvcc"))
+    (tmp_path / "b" / "nvcc").write_text("another compiler")
+    assert salt_a != jit_share._salt(str(tmp_path / "b" / "nvcc"))
+
+
+def test_excluded_op_reuses_the_sweep_profiled_in_this_process(monkeypatch):
+    """Once this process has profiled an exclude_from_cache op's sweep, later
+    tuning-mode calls hit those entries instead of walking the sweep again, and
+    input tensors are only built for the profiles that missed the cache."""
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    counts = {"sweeps": 0, "inputs": 0}
+    real_profiles = tuner._optimization_profiles
+    real_inputs = tuner._prepare_input_tensors
+
+    def profiles(*args, **kwargs):
+        counts["sweeps"] += 1
+        return real_profiles(*args, **kwargs)
+
+    def inputs(*args, **kwargs):
+        counts["inputs"] += 1
+        return real_inputs(*args, **kwargs)
+
+    monkeypatch.setattr(tuner, "_optimization_profiles", profiles)
+    monkeypatch.setattr(tuner, "_prepare_input_tensors", inputs)
+    config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+        0, 0, (4, 8, 16, 32)), ),
+                          exclude_from_cache=True)
+    w = torch.randn(64, 128, device="cuda")
+    op = "autotuner_test::excluded_op_sweep_reuse"
+    with autotune():
+        tuner.choose_one(op, [GemmRunner()], config,
+                         [torch.randn(M, 64, device="cuda"), w])
+        assert counts == {"sweeps": 1, "inputs": 4}
+        # The same op in later layers, at swept and unswept shapes.
+        for m in (M, M // 2, M):
+            tuner.choose_one(op, [GemmRunner()], config,
+                             [torch.randn(m, 64, device="cuda"), w])
+    assert counts == {"sweeps": 1, "inputs": 4}
+
+    # An entry this process did not profile (e.g. received from a peer) does
+    # not prove the op's JIT ran here, so the call walks the sweep again.
+    tuner._keys_profiled_in_process.clear()
+    with autotune():
+        tuner.choose_one(op, [GemmRunner()], config,
+                         [torch.randn(M, 64, device="cuda"), w])
+    assert counts["sweeps"] == 2
+    tuner.clear_cache()
+
+
+class ThreadRecordingRunner(TunableRunner):
+    """One tactic. Records the thread that ran each shape, as a runner whose
+    first call per shape JIT-compiles a kernel would compile it there."""
+    calls: list[tuple[int, int]] = []
+
+    def get_valid_tactics(self, inputs: List[FakeTensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
+        return [0]
+
+    def forward(self,
+                /,
+                inputs: List[torch.Tensor],
+                *,
+                tactic: int = -1,
+                **kwargs) -> torch.Tensor:
+        type(self).calls.append((inputs[0].shape[0], threading.get_ident()))
+        return inputs[0] @ inputs[1]
+
+
+@pytest.mark.parametrize("threads, env, expect_pool", [
+    (0, None, False),
+    (4, None, True),
+    (4, "0", False),
+])
+def test_parallel_jit_warmup_runs_pending_profiles_on_a_thread_pool(
+        monkeypatch, threads, env, expect_pool):
+    """With parallel_jit_warmup, every not-yet-tuned profile runs once on a
+    thread pool before the profiling loop, which still profiles every profile
+    on the calling thread. TLLM_AUTOTUNER_PARALLEL_JIT_WARMUP overrides it."""
+    if env is None:
+        monkeypatch.delenv("TLLM_AUTOTUNER_PARALLEL_JIT_WARMUP", raising=False)
+    else:
+        monkeypatch.setenv("TLLM_AUTOTUNER_PARALLEL_JIT_WARMUP", env)
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    ThreadRecordingRunner.calls.clear()
+    buckets = (4, 8, 16, 32, 64, 128)
+    config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+        0, 0, buckets), ),
+                          parallel_jit_warmup=threads)
+    x = torch.randn(128, 64, device="cuda")
+    w = torch.randn(64, 128, device="cuda")
+    caller = threading.get_ident()
+    with autotune():
+        tuner.choose_one(f"autotuner_test::parallel_jit_warmup_{threads}_{env}",
+                         [ThreadRecordingRunner()], config, [x, w])
+
+    on_caller = {m for m, t in ThreadRecordingRunner.calls if t == caller}
+    on_pool = sorted(m for m, t in ThreadRecordingRunner.calls if t != caller)
+    assert on_caller == set(buckets)
+    assert on_pool == (sorted(buckets) if expect_pool else [])
+    tuner.clear_cache()
+
+
+def test_parallel_jit_warmup_worker_failure_is_left_to_profiling(monkeypatch):
+    """A profile that fails on the warmup pool does not fail choose_one: the
+    profiling loop still runs every profile on the calling thread."""
+    monkeypatch.delenv("TLLM_AUTOTUNER_PARALLEL_JIT_WARMUP", raising=False)
+    caller = threading.get_ident()
+
+    class WorkerFailingRunner(ThreadRecordingRunner):
+        calls: list[tuple[int, int]] = []
+
+        def forward(self, /, inputs, *, tactic=-1, **kwargs):
+            if threading.get_ident() != caller:
+                raise RuntimeError("fails on warmup threads only")
+            return super().forward(inputs, tactic=tactic, **kwargs)
+
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    buckets = (4, 8, 16, 32, 64, 128)
+    config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+        0, 0, buckets), ),
+                          parallel_jit_warmup=4)
+    x = torch.randn(128, 64, device="cuda")
+    w = torch.randn(64, 128, device="cuda")
+    with autotune():
+        tuner.choose_one("autotuner_test::parallel_jit_warmup_worker_failure",
+                         [WorkerFailingRunner()], config, [x, w])
+
+    assert {m for m, _ in WorkerFailingRunner.calls} == set(buckets)
+    assert all(t == caller for _, t in WorkerFailingRunner.calls)
+    assert not tuner.stats.failed_profiling_count.get(
+        "autotuner_test::parallel_jit_warmup_worker_failure")
+    tuner.clear_cache()
+
+
+@pytest.mark.parametrize(
+    "host_cpus, affinity, local_ranks, env_local, mpi_off, expected", [
+        (144, 144, 4, None, False, 32),
+        (64, 64, 8, None, False, 8),
+        (64, 8, 8, None, False, 8),
+        (64, 64, 1, "16", True, 4),
+        (64, 64, RuntimeError("no node split"), None, False, 32),
+    ])
+def test_default_parallel_jit_warmup_threads(monkeypatch, host_cpus, affinity,
+                                             local_ranks, env_local, mpi_off,
+                                             expected):
+    """parallel_jit_warmup=-1 uses the CPUs this rank may run on: unpinned ranks
+    share the host's CPUs with the other ranks on the node, a rank pinned to a
+    subset has it to itself, and the result is capped at 32."""
+
+    def node_ranks():
+        if isinstance(local_ranks, Exception):
+            raise local_ranks
+        return local_ranks
+
+    monkeypatch.setattr(os, "cpu_count", lambda: host_cpus)
+    monkeypatch.setattr(os, "sched_getaffinity",
+                        lambda pid: set(range(affinity)))
+    monkeypatch.setattr(autotuner, "local_mpi_size", node_ranks)
+    monkeypatch.setattr(autotuner, "mpi_disabled", lambda: mpi_off)
+    if env_local is None:
+        monkeypatch.delenv("LOCAL_WORLD_SIZE", raising=False)
+    else:
+        monkeypatch.setenv("LOCAL_WORLD_SIZE", env_local)
+    assert autotuner._default_parallel_jit_warmup_threads() == expected
+
+
+@pytest.mark.parametrize("sharing", [False, True])
+def test_shared_jit_builds_replace_the_warmup_pool(monkeypatch, tmp_path,
+                                                   sharing):
+    """An op with both parallel_jit_warmup and share_jit_builds runs its sweep on
+    the warmup pool only when the processes do not share their JIT builds. When
+    they do, the claims split the builds and every profile runs on the calling
+    thread."""
+    monkeypatch.delenv("TLLM_AUTOTUNER_PARALLEL_JIT_WARMUP", raising=False)
+    monkeypatch.setattr(jit_share, "enabled", lambda: sharing)
+    monkeypatch.setattr(jit_share, "start_fraction", lambda: 0.0)
+    monkeypatch.setenv(jit_share.SHARE_DIR_ENV, str(tmp_path))
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    ThreadRecordingRunner.calls.clear()
+    buckets = (4, 8, 16, 32, 64, 128)
+    config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+        0, 0, buckets), ),
+                          parallel_jit_warmup=4,
+                          share_jit_builds=True)
+    x = torch.randn(128, 64, device="cuda")
+    w = torch.randn(64, 128, device="cuda")
+    caller = threading.get_ident()
+    with autotune():
+        tuner.choose_one(f"autotuner_test::shared_builds_or_pool_{sharing}",
+                         [ThreadRecordingRunner()], config, [x, w])
+
+    on_caller = {m for m, t in ThreadRecordingRunner.calls if t == caller}
+    on_pool = sorted(m for m, t in ThreadRecordingRunner.calls if t != caller)
+    assert on_caller == set(buckets)
+    assert on_pool == ([] if sharing else sorted(buckets))
+    tuner.clear_cache()

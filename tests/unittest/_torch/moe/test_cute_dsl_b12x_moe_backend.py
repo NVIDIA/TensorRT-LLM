@@ -15,10 +15,11 @@
 """B12x MoE backend gating and dispatch tests."""
 
 import dataclasses
+import inspect
 import math
 import sys
 import types
-from typing import Optional
+from typing import NoReturn, Optional
 from unittest.mock import patch
 
 import pytest
@@ -505,6 +506,8 @@ def test_nvfp4_post_load_uses_checkpoint_scale_contract(
         fc31_input_scale=fc31_input_scale,
         fc2_input_scale=fc2_input_scale,
     )
+    # The checkpoint has two local experts out of four global experts.
+    module.num_experts = 4
 
     with patch.object(NVFP4CutlassFusedMoEMethod, "transform_weights", return_value=None):
         NVFP4CuteDslB12xFusedMoEMethod().transform_weights(module)
@@ -512,6 +515,7 @@ def test_nvfp4_post_load_uses_checkpoint_scale_contract(
     assert fake_b12x_flashinfer
     wrapper_kwargs = fake_b12x_flashinfer[0]
     assert wrapper_kwargs.get("quant_mode") == "nvfp4", wrapper_kwargs
+    assert wrapper_kwargs["num_experts"] == 4
     assert wrapper_kwargs["intermediate_size"] == padded_intermediate_size
     weights = module._b12x_weights
     assert weights is not None
@@ -804,11 +808,14 @@ def test_run_moe_joins_the_input_ready_event_before_its_kernel(
 # flashinfer W4A16 ultra-wide FC2 tile re-validation shim (nvbug 6721561)
 # ---------------------------------------------------------------------------
 
-# FC2 problem of Qwen3.6-35B-A3B (N=hidden_size, K=moe_intermediate_size) and
-# the RTX PRO 6000 opt-in shared memory minus flashinfer's 512-byte reserve:
-# the exact geometry the post-merge failure re-pinned.
+# FC2 problem of Qwen3.6-35B-A3B (N=hidden_size, K=moe_intermediate_size), the
+# SM count and opt-in shared memory of the RTX PRO 6000, and that memory minus
+# flashinfer's 512-byte reserve: the exact geometry the post-merge failure
+# re-pinned.
 _QWEN36_FC2 = dict(problem_n=2048, problem_k=512)
-_RTX_PRO_6000_SMEM = 101376 - 512
+_RTX_PRO_6000_SMS = 188
+_RTX_PRO_6000_OPTIN_SMEM = 101376
+_RTX_PRO_6000_SMEM = _RTX_PRO_6000_OPTIN_SMEM - 512
 _ULTRA_FC2 = dict(tile_n=512, tile_k=32, cta_threads=256)
 
 
@@ -828,6 +835,46 @@ def _reset_to_stock_validator(kernel, monkeypatch) -> None:
     )
 
 
+def _reset_to_pre_fix_validator(kernel: types.ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Start from a validator that applies the search floor to every tile, as
+    flashinfer 0.6.17 to 0.7.1 do, with their signature. Where the installed
+    validator exempts forced tiles through ``enforce_search_floor``, that
+    validator with the floor always on stands in for them."""
+    _reset_to_stock_validator(kernel, monkeypatch)
+    stock = kernel._candidate_tile_fits
+    if "enforce_search_floor" not in inspect.signature(stock).parameters:
+        return
+
+    def pre_fix_fits(
+        *,
+        problem_n: int,
+        problem_k: int,
+        cta_m_blocks: int,
+        tile_n: int,
+        tile_k: int,
+        cta_threads: int,
+        max_shared_mem: int,
+        scale_format: str = "e4m3_k16",
+        weight_layout: str = "packed",
+        allow_logical_tail: bool = False,
+    ) -> bool:
+        return stock(
+            problem_n=problem_n,
+            problem_k=problem_k,
+            cta_m_blocks=cta_m_blocks,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            cta_threads=cta_threads,
+            max_shared_mem=max_shared_mem,
+            scale_format=scale_format,
+            weight_layout=weight_layout,
+            allow_logical_tail=allow_logical_tail,
+            enforce_search_floor=True,
+        )
+
+    monkeypatch.setattr(kernel, "_candidate_tile_fits", pre_fix_fits)
+
+
 def _fits(kernel, **overrides) -> bool:
     kwargs = dict(cta_m_blocks=1, max_shared_mem=_RTX_PRO_6000_SMEM, **_QWEN36_FC2, **_ULTRA_FC2)
     kwargs.update(overrides)
@@ -836,7 +883,7 @@ def _fits(kernel, **overrides) -> bool:
 
 def test_w4a16_ultra_wide_fc2_shim_accepts_repinned_ultra_tile(monkeypatch):
     kernel = _flashinfer_w4a16_kernel()
-    _reset_to_stock_validator(kernel, monkeypatch)
+    _reset_to_pre_fix_validator(kernel, monkeypatch)
     assert not _fits(kernel), (
         "flashinfer's stock validator accepts the ultra-wide FC2 tile; the shim in "
         "fused_moe_cute_dsl_b12x.py is no longer needed"
@@ -860,7 +907,7 @@ def test_w4a16_ultra_wide_fc2_shim_accepts_repinned_ultra_tile(monkeypatch):
 
 def test_w4a16_ultra_wide_fc2_shim_is_idempotent(monkeypatch):
     kernel = _flashinfer_w4a16_kernel()
-    _reset_to_stock_validator(kernel, monkeypatch)
+    _reset_to_pre_fix_validator(kernel, monkeypatch)
     stock = kernel._candidate_tile_fits
 
     assert _patch_flashinfer_w4a16_ultra_wide_fc2_tile_validation() is True
@@ -873,9 +920,67 @@ def test_w4a16_ultra_wide_fc2_shim_is_idempotent(monkeypatch):
 
 def test_w4a16_ultra_wide_fc2_shim_yields_to_upstream_fix(monkeypatch):
     kernel = _flashinfer_w4a16_kernel()
-    _reset_to_stock_validator(kernel, monkeypatch)
+    _reset_to_pre_fix_validator(kernel, monkeypatch)
     stock = kernel._candidate_tile_fits
     monkeypatch.setattr(kernel, "_ultra_wide_fc2_tile_fits", lambda **_: True, raising=False)
 
     assert _patch_flashinfer_w4a16_ultra_wide_fc2_tile_validation() is False
     assert kernel._candidate_tile_fits is stock
+
+
+def test_w4a16_ultra_wide_fc2_shim_stands_aside_on_enforce_search_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """flashinfer 0.7.2 re-validates forced tiles with
+    ``_candidate_tile_fits(..., enforce_search_floor=False)``; the hook leaves
+    that validator in place."""
+    kernel = _flashinfer_w4a16_kernel()
+    _reset_to_stock_validator(kernel, monkeypatch)
+    stock = kernel._candidate_tile_fits
+    if "enforce_search_floor" not in inspect.signature(stock).parameters:
+        pytest.skip("installed flashinfer predates enforce_search_floor")
+
+    assert _patch_flashinfer_w4a16_ultra_wide_fc2_tile_validation() is False
+    assert kernel._candidate_tile_fits is stock
+
+
+def test_w4a16_forced_ultra_wide_fc2_tile_reaches_kernel_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The custom-op launch recompiles with the tiles the selector chose,
+    forced through ``force_tile_config``. After the hook every W4A16 B12x leaf
+    runs at construction, that re-pin of the ultra-wide FC2 tile gets past tile
+    validation to the kernel build, on the installed flashinfer."""
+    kernel = _flashinfer_w4a16_kernel()
+    _reset_to_stock_validator(kernel, monkeypatch)
+    _patch_flashinfer_w4a16_ultra_wide_fc2_tile_validation()
+
+    class KernelBuildReached(Exception):
+        pass
+
+    built: dict[str, object] = {}
+
+    def build_kernel(**kwargs: object) -> NoReturn:
+        built.update(kwargs)
+        raise KernelBuildReached
+
+    # The build compiles CuTe DSL code for a GPU; only the tiles it gets matter.
+    monkeypatch.setattr(kernel, "W4A16FusedMoeKernel", build_kernel)
+    with pytest.raises(KernelBuildReached):
+        kernel.compile_w4a16_fused_moe(
+            size_m=4,
+            hidden_size=_QWEN36_FC2["problem_n"],
+            intermediate_size=_QWEN36_FC2["problem_k"],
+            num_experts=8,
+            top_k=2,
+            activation="silu",
+            apply_router_weight_on_input=False,
+            zero_fc2_output=False,
+            moe_block_size=8,
+            max_m_blocks=1,
+            sms=_RTX_PRO_6000_SMS,
+            max_shared_mem=_RTX_PRO_6000_OPTIN_SMEM,
+            # (fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n), 256 threads each.
+            force_tile_config=(128, 128, 32, 512),
+        )
+    assert (built["fc2_tile_n"], built["fc2_tile_k"]) == (512, 32)

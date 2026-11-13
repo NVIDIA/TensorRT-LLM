@@ -92,8 +92,8 @@ from transformers import AutoTokenizer
 from utils.util import skip_pre_rubin
 
 from tensorrt_llm import LLM
-from tensorrt_llm._ray_utils import control_action_decorator
 from tensorrt_llm._torch.utils import get_device_uuid
+from tensorrt_llm.executor.ray.utils import control_action_decorator
 from tensorrt_llm.llmapi import KvCacheConfig, MoeConfig, SamplingParams, TorchCompileConfig
 from tensorrt_llm.llmapi.rlhf_utils import WorkerExtension
 
@@ -293,7 +293,7 @@ class _RefitIsolationExtension(Qwen35_35BTP8WorkerExtension):
         ``begin_update_weights``, the ``pre_reload_weights`` walk, ``reload``,
         then ``_finalize_weight_update`` -- and, critically, **no**
         ``begin_weight_update`` / ``finish_weight_update``, so
-        ``_remove_torch_compile()`` never runs.
+        ``remove_torch_compile()`` never runs.
 
         This exists to demonstrate the production failure directly instead of
         inferring it from the tekit-side rows: with torch.compile enabled this
