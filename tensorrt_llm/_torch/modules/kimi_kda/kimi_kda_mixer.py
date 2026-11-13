@@ -566,6 +566,9 @@ class KimiKDALinearAttention(nn.Module):
         num_tokens = attn_metadata.num_tokens
         batch_size = attn_metadata.seq_lens.shape[0]
         state_indices = mamba_metadata.state_indices[:batch_size]
+        # Replay caches have slots of their own when the cache manager keeps
+        # them in a separate pool; otherwise these are the state slots.
+        replay_state_indices = mamba_metadata.replay_state_indices[:batch_size]
         cu_seqlens = getattr(mamba_metadata, "kda_cu_seqlens", None)
         if cu_seqlens is None or cu_seqlens.shape[0] != num_prefills + 1:
             cu_seqlens = mamba_metadata.query_start_loc_long[: num_prefills + 1]
@@ -577,6 +580,11 @@ class KimiKDALinearAttention(nn.Module):
         generation_state_indices = getattr(mamba_metadata, "generation_state_indices", None)
         if generation_state_indices is None:
             generation_state_indices = state_indices[num_prefills:]
+        generation_replay_state_indices = getattr(
+            mamba_metadata, "generation_replay_state_indices", None
+        )
+        if generation_replay_state_indices is None:
+            generation_replay_state_indices = replay_state_indices[num_prefills:]
 
         cores: List[torch.Tensor] = []
         if num_prefills > 0:
@@ -590,6 +598,7 @@ class KimiKDALinearAttention(nn.Module):
                 state_indices[:num_prefills],
                 layer_cache,
                 output=output[:num_ctx_tokens] if output is not None else None,
+                replay_slot_indices=replay_state_indices[:num_prefills],
             )
             if output is None:
                 cores.append(prefill_core)
@@ -607,6 +616,7 @@ class KimiKDALinearAttention(nn.Module):
                         generation_state_indices if self._use_indexed_ssm_pool else None
                     ),
                     output=output[num_ctx_tokens:num_tokens] if output is not None else None,
+                    replay_slot_indices=generation_replay_state_indices,
                 )
                 if output is None:
                     cores.append(decode_core)
@@ -631,6 +641,7 @@ class KimiKDALinearAttention(nn.Module):
                     # The MXFP8 core cannot be concatenated with a prefill
                     # core or stored into the BCG buffer.
                     allow_prequantized_output=output is None and num_prefills == 0,
+                    replay_slot_indices=generation_replay_state_indices,
                     # The MXFP8 input covers every row of a verify-only batch.
                     prequantized_input=(
                         prequantized_input
@@ -660,17 +671,20 @@ class KimiKDALinearAttention(nn.Module):
         """True when the manager allocated the fused-verify replay caches."""
         return bool(getattr(layer_cache, "has_kda_replay_caches", False))
 
-    def _sync_kda_replay_conv_window(self, layer_cache, slot_indices, conv_pool) -> None:
+    def _sync_kda_replay_conv_window(
+        self, layer_cache, slot_indices, conv_pool, replay_slot_indices=None
+    ) -> None:
         """Seed replay conv caches from the live committed conv pool.
 
         The fused verify kernel keeps its own extended fp32 dim-contiguous
         conv caches; their committed window (columns ``[0, W-1)``) must hold
         the live pool's ``W - 1`` raw inputs whenever prefill or plain decode
-        advances it.
+        advances it. Pool row ``slot_indices[n]`` goes to replay row
+        ``replay_slot_indices[n]`` (``slot_indices[n]`` when ``None``).
         """
         if not self._has_kda_replay_caches(layer_cache):
             return
-        layer_cache.commit_conv_window(slot_indices, conv_pool)
+        layer_cache.commit_conv_window(slot_indices, conv_pool, replay_slot_indices)
 
     def _project_gate_inputs(
         self, x: torch.Tensor
@@ -767,6 +781,7 @@ class KimiKDALinearAttention(nn.Module):
         slot_indices,
         layer_cache=None,
         output: Optional[torch.Tensor] = None,
+        replay_slot_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from einops import rearrange
 
@@ -774,7 +789,9 @@ class KimiKDALinearAttention(nn.Module):
             reset_recurrent_state_rows(
                 ssm_pool, slot_indices, mamba_metadata.has_initial_states[:num_prefills], conv_pool
             )
-            self._sync_kda_replay_conv_window(layer_cache, slot_indices, conv_pool)
+            self._sync_kda_replay_conv_window(
+                layer_cache, slot_indices, conv_pool, replay_slot_indices
+            )
             return self._store_core(x2d.new_empty((0, self.num_heads, self.head_dim)), output)
         x = x2d.unsqueeze(0)  # [1, T, hidden]
         if self._dispatch.prefill_kernel_path == "optimized":
@@ -823,7 +840,7 @@ class KimiKDALinearAttention(nn.Module):
         # Fused-verify replay caches: seed the committed conv window so the
         # first verify round convolves the correct history (pending drafts
         # are zero for a fresh request, so the tail columns are unused).
-        self._sync_kda_replay_conv_window(layer_cache, slot_indices, conv_pool)
+        self._sync_kda_replay_conv_window(layer_cache, slot_indices, conv_pool, replay_slot_indices)
 
         core = self._output_gate(x, o, onorm_g)
         return self._store_core(core, output)
@@ -987,6 +1004,7 @@ class KimiKDALinearAttention(nn.Module):
         layer_cache=None,
         ssm_state_indices=None,
         output: Optional[torch.Tensor] = None,
+        replay_slot_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Plain T=1 decode, fast path.
 
@@ -1025,6 +1043,7 @@ class KimiKDALinearAttention(nn.Module):
                 layer_cache,
                 ssm_state_indices,
                 output,
+                replay_slot_indices=replay_slot_indices,
             )
         d = self.proj_size
         hd = self.head_dim
@@ -1061,6 +1080,7 @@ class KimiKDALinearAttention(nn.Module):
                         slot_indices,
                         layer_cache,
                         ssm_state_indices,
+                        replay_slot_indices=replay_slot_indices,
                     )
                 self._o_dense = torch.empty(
                     max(conv_pool.shape[0], B),
@@ -1137,7 +1157,7 @@ class KimiKDALinearAttention(nn.Module):
             _writeback_state_rows(ssm_pool, slots_long, staged_state)
         # Fused-verify replay caches (spec decoding only): keep the
         # committed conv window in sync with the plain-decode advance.
-        self._sync_kda_replay_conv_window(layer_cache, slot_indices, conv_pool)
+        self._sync_kda_replay_conv_window(layer_cache, slot_indices, conv_pool, replay_slot_indices)
 
         # decode_kda applies output gate/RMSNorm and returns the supplied
         # BCG buffer when out=kda_out, so both modes share the core contract.
@@ -1152,6 +1172,7 @@ class KimiKDALinearAttention(nn.Module):
         layer_cache=None,
         ssm_state_indices=None,
         output: Optional[torch.Tensor] = None,
+        replay_slot_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Portable or unfused decode with the production pool contract."""
         if output is not None:
@@ -1283,7 +1304,7 @@ class KimiKDALinearAttention(nn.Module):
         # pools lag by the pending prefix and only the fused verify kernel
         # can advance them. The spec workers pad drafts to the static max,
         # so drafted batches always take the verify path.
-        self._sync_kda_replay_conv_window(layer_cache, slot_indices, conv_pool)
+        self._sync_kda_replay_conv_window(layer_cache, slot_indices, conv_pool, replay_slot_indices)
 
         # FLA's gated norm is [tokens * heads, head_dim]; the optimized
         # fallback kernel is [B, 1, H, V]. Prefill returns [tokens, H, V],
@@ -1300,10 +1321,15 @@ class KimiKDALinearAttention(nn.Module):
         slot_indices,
         output: Optional[torch.Tensor] = None,
         allow_prequantized_output: bool = False,
+        replay_slot_indices: Optional[torch.Tensor] = None,
         prequantized_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Union[torch.Tensor, _KdaPrequantizedCore]:
         """Speculative verification: advance each request ``num_steps``
         tokens (1 golden + ``num_steps - 1`` padded drafts).
+
+        ``slot_indices`` are the requests' recurrent-state slots and
+        ``replay_slot_indices`` their slots in the KDA replay caches
+        (``slot_indices`` when ``None``).
 
         Two paths:
 
@@ -1333,6 +1359,7 @@ class KimiKDALinearAttention(nn.Module):
                 slot_indices,
                 output=output,
                 allow_prequantized_output=allow_prequantized_output,
+                replay_slot_indices=replay_slot_indices,
                 prequantized_input=prequantized_input,
             )
         return self.forward_verify_sequential(
@@ -1430,9 +1457,14 @@ class KimiKDALinearAttention(nn.Module):
         slot_indices,
         output: Optional[torch.Tensor] = None,
         allow_prequantized_output: bool = False,
+        replay_slot_indices: Optional[torch.Tensor] = None,
         prequantized_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Union[torch.Tensor, _KdaPrequantizedCore]:
         """Fused multi-token verify via ``trtllm::kda_mtp_decode``.
+
+        The kernel addresses the recurrent state by ``slot_indices`` and the
+        replay caches and accepted counts by ``replay_slot_indices``
+        (``slot_indices`` when ``None``).
 
         Fused epilogue path (the output gate is available and the output-norm
         weights are finalized): the runtime packs ``num_steps`` new rows
@@ -1453,6 +1485,8 @@ class KimiKDALinearAttention(nn.Module):
         Python. A negative entry for request 0 is fine: ``bos`` is only used
         additively with a token offset ``>= num_accepted``.
         """
+        if replay_slot_indices is None:
+            replay_slot_indices = slot_indices
         num_generations = x2d.shape[0] // num_steps
         num_spec = num_steps - 1
         H = self.num_heads
@@ -1512,6 +1546,7 @@ class KimiKDALinearAttention(nn.Module):
             v_cache=layer_cache.kda_v_cache,
             beta_cache=layer_cache.kda_beta_cache,
             ssm_state_indices=slot_indices,
+            replay_state_indices=replay_slot_indices,
             num_spec=num_spec,
             lower_bound=self.gate_lower_bound,
             scale=self.head_k_dim**-0.5,
@@ -1541,7 +1576,7 @@ class KimiKDALinearAttention(nn.Module):
             return self._store_core(out, output)
 
         pending = layer_cache.prev_num_accepted_tokens[
-            slot_indices
+            replay_slot_indices
         ]  # accepted drafts of the previous round, per req
         cu_seqlens = torch.arange(
             0, (num_generations + 1) * num_steps, num_steps, dtype=torch.int32, device=x2d.device

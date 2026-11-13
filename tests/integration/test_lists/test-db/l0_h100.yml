@@ -241,6 +241,14 @@ l0_h100:
   - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_block_reuse_requested
   - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_feature_combinations[bf16-kv-v2-decoder-graphs-on-greedy]
   - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_beam_search[bf16-kv-v2-decoder-graphs-on-beam2]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_encoder_steps_take_requests_in_arrival_order[kv-v2]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_encoder_steps_take_requests_in_arrival_order[kv-v1-python-scheduler]
+  - llmapi/test_llm_api_pytorch_t5.py::test_t5_encoder_steps_take_requests_in_arrival_order[kv-v1-cpp-scheduler]
+  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_concurrent_requests_encoder_step_limits[token-limit]
+  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_concurrent_requests_encoder_step_limits[request-limit]
+  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_concurrent_requests_encoder_step_limits[within-limits]
+  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_concurrent_requests_encoder_step_limits[token-limit-batch-waiting]
+  - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_concurrent_requests_encoder_step_limits[request-limit-batch-waiting]
   - test_e2e.py::test_openai_chat_harmony
   - test_e2e.py::test_openai_chat_harmony_perf_metrics
   - test_e2e.py::test_openai_responses
