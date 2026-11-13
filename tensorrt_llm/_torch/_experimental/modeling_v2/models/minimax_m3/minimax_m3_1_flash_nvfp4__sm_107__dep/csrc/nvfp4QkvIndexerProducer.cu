@@ -15,9 +15,10 @@
  * limitations under the License.
  */
 
-// The MiniMax-M3 sparse horizontal producer for an NVFP4 main KV cache (kernels/fusedQKNormRopeKernel.cu's
-// minimaxM3Nvfp4QKVIndexerNormRopeKVInsertKernel) with the index-K output modes of nvfp4QkvIndexerProducer.h and the
-// early PDL trigger.
+// The MiniMax-M3 sparse horizontal producers (kernels/fusedQKNormRopeKernel.cu's
+// minimaxM3Nvfp4QKVIndexerNormRopeKVInsertKernel for an NVFP4 main KV cache, with the early PDL trigger, and
+// minimaxM3Fp8QKVIndexerNormRopeKVInsertKernel for an FP8 one) with the index-K output modes of
+// nvfp4QkvIndexerProducer.h.
 
 #include "minimax_m3/csrc/m31/idxkNvfp4Quant.cuh"
 #include "minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__dep/csrc/nvfp4QkvIndexerProducer.h"
@@ -135,6 +136,161 @@ __device__ __forceinline__ void storeMinimaxM3IndexKDirect(__nv_fp8_e4m3* indexK
         packed.y = reinterpret_cast<uint32_t const&>(high);
         *reinterpret_cast<uint2*>(reinterpret_cast<__nv_bfloat16*>(indexKCache) + outputOffset) = packed;
     }
+}
+
+// The FP8 horizontal sparse producer (kernels/fusedQKNormRopeKernel.cu's minimaxM3Fp8QKVIndexerNormRopeKVInsertKernel)
+// with the index-K output modes of nvfp4QkvIndexerProducer.h, for a packed [Q|K|V|index-Q|index-K] row.
+// One warp owns one (token, head slot). All four norm/RoPE branches share the
+// model's precomputed FP32 RoPE table, eliminating per-head powf/sincos work.
+// kIdxkMode selects the index-K store (kMinimaxM3IndexK*); every other output
+// is the same in all modes.
+template <int kIdxkMode>
+__global__ void minimaxM3Fp8QKVIndexerNormRopeKVInsertKernel(__nv_bfloat16 const* packedInput, __nv_fp8_e4m3* qOutput,
+    __nv_fp8_e4m3* indexQOutput, __nv_fp8_e4m3* kvCache, __nv_fp8_e4m3* indexKCache, int const* outCacheLoc,
+    int64_t kvPageStride, int64_t kvPlaneStride, int64_t kvHeadStride, int64_t kvTokenStride, int64_t indexPageStride,
+    int64_t indexTokenStride, int64_t numPages, int numTokens, int numHeadsQ, int numHeadsKV, int numHeadsIndex,
+    float eps, __nv_bfloat16 const* qWeight, __nv_bfloat16 const* kWeight, __nv_bfloat16 const* indexQWeight,
+    __nv_bfloat16 const* indexKWeight, float const* rotaryCosSin, int const* positionIds)
+{
+    int const warpsPerBlock = blockDim.x / 32;
+    int const warpId = threadIdx.x / 32;
+    int const laneId = threadIdx.x % 32;
+    int const globalWarp = blockIdx.x * warpsPerBlock + warpId;
+    int const totalHeads = numHeadsQ + 2 * numHeadsKV + numHeadsIndex + 1;
+    int const tokenIdx = globalWarp / totalHeads;
+    int const localHead = globalWarp % totalHeads;
+    if (tokenIdx >= numTokens)
+    {
+        return;
+    }
+
+    int const kBegin = numHeadsQ;
+    int const vBegin = kBegin + numHeadsKV;
+    int const indexQBegin = vBegin + numHeadsKV;
+    int const indexKHead = indexQBegin + numHeadsIndex;
+    bool const isQ = localHead < kBegin;
+    bool const isK = localHead >= kBegin && localHead < vBegin;
+    bool const isV = localHead >= vBegin && localHead < indexQBegin;
+    bool const isIndexQ = localHead >= indexQBegin && localHead < indexKHead;
+    bool const isIndexK = localHead == indexKHead;
+
+    int64_t const inputOffset = (static_cast<int64_t>(tokenIdx) * totalHeads + localHead) * kMinimaxM3HeadDim
+        + laneId * kMinimaxM3ElemsPerThread;
+    constexpr int kVecSize = kMinimaxM3ElemsPerThread * sizeof(__nv_bfloat16) / 4;
+    using VecT = typename tensorrt_llm::common::packed_as<uint, kVecSize>::type;
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    // packedInput is the fused QKV GEMM's output, so wait before the first load
+    // of it rather than at entry.
+    cudaGridDependencySynchronize();
+#endif
+    VecT const packed = *reinterpret_cast<VecT const*>(packedInput + inputOffset);
+
+    float elements[kMinimaxM3ElemsPerThread];
+    float sumSquares = 0.0F;
+#pragma unroll
+    for (int pair = 0; pair < kVecSize; ++pair)
+    {
+        float2 const values = __bfloat1622float2(
+            *reinterpret_cast<__nv_bfloat162 const*>(reinterpret_cast<uint const*>(&packed) + pair));
+        elements[2 * pair] = values.x;
+        elements[2 * pair + 1] = values.y;
+        if (!isV)
+        {
+            sumSquares += values.x * values.x + values.y * values.y;
+        }
+    }
+
+    if (!isV)
+    {
+        auto const* normWeight = isQ ? qWeight : (isK ? kWeight : (isIndexQ ? indexQWeight : indexKWeight));
+        sumSquares = tensorrt_llm::common::warpReduceSum(sumSquares);
+        float const rmsReciprocal = rsqrtf(sumSquares / static_cast<float>(kMinimaxM3HeadDim) + eps);
+#pragma unroll
+        for (int i = 0; i < kMinimaxM3ElemsPerThread; ++i)
+        {
+            int const dim = laneId * kMinimaxM3ElemsPerThread + i;
+            elements[i] *= rmsReciprocal * (1.0F + __bfloat162float(normWeight[dim]));
+        }
+
+        __syncwarp();
+        constexpr int kPairOffset = (kMinimaxM3RotaryDim / 2) / kMinimaxM3ElemsPerThread;
+        int positionId = laneId == 0 ? positionIds[tokenIdx] : 0;
+        positionId = __shfl_sync(0xffffffff, positionId, 0);
+        int64_t const ropeRow = static_cast<int64_t>(positionId) * kMinimaxM3RotaryDim;
+#pragma unroll
+        for (int i = 0; i < kMinimaxM3ElemsPerThread; ++i)
+        {
+            int const dim = laneId * kMinimaxM3ElemsPerThread + i;
+            float paired = __shfl_xor_sync(0xffffffff, elements[i], kPairOffset);
+            if (dim < kMinimaxM3RotaryDim)
+            {
+                bool const firstHalf = dim < kMinimaxM3RotaryDim / 2;
+                if (firstHalf)
+                {
+                    paired = -paired;
+                }
+                int const coefficient = firstHalf ? dim : dim - kMinimaxM3RotaryDim / 2;
+                float const cosine = rotaryCosSin[ropeRow + coefficient];
+                float const sine = rotaryCosSin[ropeRow + kMinimaxM3RotaryDim / 2 + coefficient];
+                elements[i] = elements[i] * cosine + paired * sine;
+            }
+        }
+        __syncwarp();
+    }
+
+    if (isQ)
+    {
+        int const head = localHead;
+        int64_t const outputOffset = (static_cast<int64_t>(tokenIdx) * numHeadsQ + head) * kMinimaxM3HeadDim
+            + laneId * kMinimaxM3ElemsPerThread;
+        storeFp8HeadElements64<kMinimaxM3ElemsPerThread>(qOutput, outputOffset, elements);
+        return;
+    }
+    if (isIndexQ)
+    {
+        int const head = localHead - indexQBegin;
+        int64_t const outputOffset = (static_cast<int64_t>(tokenIdx) * numHeadsIndex + head) * kMinimaxM3HeadDim
+            + laneId * kMinimaxM3ElemsPerThread;
+        // Match vLLM's CUDA path: normalized/RoPE FP32 registers convert
+        // directly to saturating E4M3, without an intermediate BF16 round.
+        storeFp8HeadElements64<kMinimaxM3ElemsPerThread>(indexQOutput, outputOffset, elements);
+        return;
+    }
+
+    int slot = laneId == 0 ? outCacheLoc[tokenIdx] : 0;
+    slot = __shfl_sync(0xffffffff, slot, 0);
+    if (slot < 0)
+    {
+        return;
+    }
+    int const page = slot / kMinimaxM3PageSize;
+    if (page >= numPages)
+    {
+        return;
+    }
+    int const withinPage = slot & (kMinimaxM3PageSize - 1);
+    if (isIndexK)
+    {
+        if constexpr (kIdxkMode == kMinimaxM3IndexKFp8Sink)
+        {
+            int64_t const outputOffset = static_cast<int64_t>(page) * indexPageStride
+                + static_cast<int64_t>(withinPage) * indexTokenStride + laneId * kMinimaxM3ElemsPerThread;
+            storeFp8HeadElements64<kMinimaxM3ElemsPerThread>(indexKCache, outputOffset, elements);
+        }
+        else
+        {
+            storeMinimaxM3IndexKDirect<kIdxkMode>(
+                indexKCache, page, withinPage, indexPageStride, indexTokenStride, laneId, elements);
+        }
+        return;
+    }
+
+    int const head = isK ? localHead - kBegin : localHead - vBegin;
+    int const plane = isV ? 1 : 0;
+    int64_t const outputOffset = static_cast<int64_t>(page) * kvPageStride + static_cast<int64_t>(plane) * kvPlaneStride
+        + static_cast<int64_t>(head) * kvHeadStride + static_cast<int64_t>(withinPage) * kvTokenStride
+        + laneId * kMinimaxM3ElemsPerThread;
+    storeFp8HeadElements64<kMinimaxM3ElemsPerThread>(kvCache, outputOffset, elements);
 }
 
 // NVFP4-cache counterpart of the FP8 horizontal sparse producer
@@ -365,6 +521,51 @@ void launchMinimaxM3Nvfp4QKVIndexerNormRopeKVInsert(void const* packed_input, vo
         static_cast<__nv_bfloat16 const*>(q_weight), static_cast<__nv_bfloat16 const*>(k_weight),
         static_cast<__nv_bfloat16 const*>(index_q_weight), static_cast<__nv_bfloat16 const*>(index_k_weight),
         rotary_cos_sin, position_ids, early_trigger));
+}
+
+void launchMinimaxM3Fp8QKVIndexerNormRopeKVInsert(void const* packed_input, void* q_output, void* index_q_output,
+    void* kv_cache, void* index_k_cache, int const* out_cache_loc, int64_t kv_page_stride, int64_t kv_plane_stride,
+    int64_t kv_head_stride, int64_t kv_token_stride, int64_t index_page_stride, int64_t index_token_stride,
+    int64_t num_pages, int page_size, int num_tokens, int num_heads_q, int num_heads_kv, int num_heads_index,
+    int head_dim, int rotary_dim, float eps, void const* q_weight, void const* k_weight, void const* index_q_weight,
+    void const* index_k_weight, float const* rotary_cos_sin, int const* position_ids, int index_k_mode,
+    cudaStream_t stream)
+{
+    TLLM_CHECK_WITH_INFO(head_dim == kMinimaxM3HeadDim, "MiniMax-M3 horizontal producer requires head_dim=128");
+    TLLM_CHECK_WITH_INFO(rotary_dim == kMinimaxM3RotaryDim, "MiniMax-M3 horizontal producer requires rotary_dim=64");
+    TLLM_CHECK_WITH_INFO(page_size == kMinimaxM3PageSize, "MiniMax-M3 horizontal producer requires page_size=128");
+    TLLM_CHECK_WITH_INFO(num_heads_q > 0 && num_heads_kv > 0 && num_heads_index > 0,
+        "MiniMax-M3 horizontal producer requires Q, KV, and index heads");
+    TLLM_CHECK_WITH_INFO(
+        num_heads_index == num_heads_kv, "MiniMax-M3 horizontal producer requires index heads to equal KV heads");
+
+    constexpr int kBlockSize = 256;
+    constexpr int kWarpsPerBlock = kBlockSize / 32;
+    int const slotsPerToken = num_heads_q + 2 * num_heads_kv + num_heads_index + 1;
+    int const totalWarps = num_tokens * slotsPerToken;
+    int const gridSize = tensorrt_llm::common::divUp(totalWarps, kWarpsPerBlock);
+    auto kernel = minimaxM3Fp8QKVIndexerNormRopeKVInsertKernel<kMinimaxM3IndexKFp8Sink>;
+    if (index_k_mode == kMinimaxM3IndexKNvfp4Pages)
+    {
+        kernel = minimaxM3Fp8QKVIndexerNormRopeKVInsertKernel<kMinimaxM3IndexKNvfp4Pages>;
+    }
+    else if (index_k_mode == kMinimaxM3IndexKBf16Tap)
+    {
+        kernel = minimaxM3Fp8QKVIndexerNormRopeKVInsertKernel<kMinimaxM3IndexKBf16Tap>;
+    }
+    else
+    {
+        TLLM_CHECK_WITH_INFO(index_k_mode == kMinimaxM3IndexKFp8Sink,
+            "MiniMax-M3 horizontal producer: unknown index_k_mode %d", index_k_mode);
+    }
+    tensorrt_llm::common::launchWithPdlWhenEnabled("minimaxM3Fp8QKVIndexerNormRopeKVInsert", kernel, gridSize,
+        kBlockSize, 0, stream, static_cast<__nv_bfloat16 const*>(packed_input), static_cast<__nv_fp8_e4m3*>(q_output),
+        static_cast<__nv_fp8_e4m3*>(index_q_output), static_cast<__nv_fp8_e4m3*>(kv_cache),
+        static_cast<__nv_fp8_e4m3*>(index_k_cache), out_cache_loc, kv_page_stride, kv_plane_stride, kv_head_stride,
+        kv_token_stride, index_page_stride, index_token_stride, num_pages, num_tokens, num_heads_q, num_heads_kv,
+        num_heads_index, eps, static_cast<__nv_bfloat16 const*>(q_weight), static_cast<__nv_bfloat16 const*>(k_weight),
+        static_cast<__nv_bfloat16 const*>(index_q_weight), static_cast<__nv_bfloat16 const*>(index_k_weight),
+        rotary_cos_sin, position_ids);
 }
 
 } // namespace kernels
