@@ -630,3 +630,28 @@ Use the normal commands with `flashinfer-prims-ts`, for example:
 python scripts/vendor/manage.py status flashinfer-prims-ts
 python scripts/vendor/manage.py check flashinfer-prims-ts
 ```
+
+## MiniMax-M3.1 MSA kernels
+
+The MiniMax-M3.1-Flash targets of the Modeling V2 `minimax_m3` family use their
+own copy of the MSA Q8KV4 and Q8KV8 index scorers, in
+`tensorrt_llm/_torch/_experimental/modeling_v2/models/minimax_m3/kernels/msa_kernels/`.
+They compile at run time (JIT); no prebuilt objects are checked in. Every other
+MSA kernel these targets run comes from the top-level `fmha_sm100` package that
+`3rdparty/fetch_content.json` builds.
+
+| Entry | Upstream source | Destination (under `msa_kernels/`) |
+|-------|-----------------|------------------------------------|
+| `msa-m31-q8kv8-indexer` | `vllm-project/MSA` `python/fmha_sm100/cute` | `fmha_sm100_q8kv8` |
+
+The `msa-m31-q8kv8-indexer` patch carries the MiniMax-M3.1 indexer changes and
+makes the package imports relative. It also adds `LICENSE` and `NOTICE`, verbatim
+copies of the upstream repository's root files, which lie outside the selected
+source directory, and the package `__init__.py`.
+
+Check or refresh the entry with the normal commands:
+
+```bash
+python scripts/vendor/manage.py check msa-m31-q8kv8-indexer
+python scripts/vendor/manage.py patch msa-m31-q8kv8-indexer refresh --repo /path/to/MSA
+```
