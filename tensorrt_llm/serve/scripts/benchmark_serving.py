@@ -25,7 +25,8 @@ import random
 import time
 import warnings
 from argparse import ArgumentParser as FlexibleArgumentParser
-from collections.abc import AsyncGenerator, Iterable
+from collections import deque
+from collections.abc import AsyncGenerator, Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -42,8 +43,9 @@ from tensorrt_llm.serve.scripts.backend_request_func import (
     RequestFuncInput, RequestFuncOutput, get_tokenizer)
 from tensorrt_llm.serve.scripts.benchmark_dataset import (
     AIMODataset, BurstGPTDataset, ConversationDataset, CustomDataset,
-    HuggingFaceDataset, InstructCoderDataset, RandomDataset, RandomImageDataset,
-    SampleRequest, ShareGPTDataset, SonnetDataset, VisionArenaDataset)
+    HuggingFaceDataset, InstructCoderDataset, RandomConversations,
+    RandomDataset, RandomImageDataset, SampleRequest, ShareGPTDataset,
+    SonnetDataset, VisionArenaDataset)
 from tensorrt_llm.serve.scripts.benchmark_utils import (
     convert_to_pytorch_benchmark_format, write_to_json)
 from tensorrt_llm.serve.scripts.time_breakdown import RequestTimeBreakdown
@@ -92,6 +94,14 @@ class BenchmarkMetrics:
     median_avg_decoded_tokens_per_iter: float
     std_avg_decoded_tokens_per_iter: float
     percentiles_avg_decoded_tokens_per_iter: list[tuple[float, float]]
+    # Prompt tokens served from the server's KV cache (usage cached_tokens) and
+    # the rest, which the server computed; None if the server did not report.
+    total_cached_tokens: Optional[int] = None
+    cache_hit_ratio: Optional[float] = None
+    mean_cached_tokens: Optional[float] = None
+    median_cached_tokens: Optional[float] = None
+    mean_computed_tokens: Optional[float] = None
+    median_computed_tokens: Optional[float] = None
 
 
 async def get_request(
@@ -158,6 +168,8 @@ def calculate_metrics(
     e2els: list[float] = []
     tput_user: list[float] = []
     avg_decoded_tokens_per_iter_list: list[float] = []
+    cached_tokens: list[int] = []
+    computed_tokens: list[int] = []
     error_counts: dict[str, int] = {}
     for i in range(len(outputs)):
         if outputs[i].exception_type:
@@ -189,6 +201,10 @@ def calculate_metrics(
             e2els.append(outputs[i].latency)
             tput_user.append(output_len / (outputs[i].latency))
             completed += 1
+            if outputs[i].cached_tokens is not None:
+                cached_tokens.append(outputs[i].cached_tokens)
+                computed_tokens.append(input_requests[i].prompt_len -
+                                       outputs[i].cached_tokens)
 
             # Collect avg_decoded_tokens_per_iter for all requests
             if hasattr(outputs[i], 'avg_decoded_tokens_per_iter'
@@ -288,7 +304,71 @@ def calculate_metrics(
             for p in selected_percentiles
         ],
     )
+    if cached_tokens:
+        metrics.total_cached_tokens = sum(cached_tokens)
+        metrics.cache_hit_ratio = sum(cached_tokens) / (sum(cached_tokens) +
+                                                        sum(computed_tokens))
+        metrics.mean_cached_tokens = float(np.mean(cached_tokens))
+        metrics.median_cached_tokens = float(np.median(cached_tokens))
+        metrics.mean_computed_tokens = float(np.mean(computed_tokens))
+        metrics.median_computed_tokens = float(np.median(computed_tokens))
     return metrics, actual_output_lens
+
+
+async def prime_conversations(
+    conversations: RandomConversations,
+    request_func: Callable,
+    make_request_input: Callable[[SampleRequest, bytes], RequestFuncInput],
+    streaming: bool,
+    max_concurrency: Optional[int],
+) -> dict[str, Any]:
+    """Send turn 0 of every conversation so its history is in the KV cache."""
+    num_conversations = conversations.num_conversations
+    concurrency = min(num_conversations, max_concurrency or num_conversations)
+    print(f"Priming {num_conversations} conversations, "
+          f"{concurrency} at a time...")
+    semaphore = asyncio.Semaphore(concurrency)
+    start_time = time.perf_counter()
+    async with aiohttp.ClientSession(trust_env=True,
+                                     timeout=AIOHTTP_TIMEOUT,
+                                     connector=aiohttp.TCPConnector(
+                                         limit=0,
+                                         limit_per_host=0,
+                                         force_close=True)) as session:
+
+        async def prime(conversation: int) -> RequestFuncOutput:
+            async with semaphore:
+                return await request_func(request_func_input=make_request_input(
+                    conversations.priming_requests[conversation],
+                    conversations.priming_prompt_json(conversation)),
+                                          streaming=streaming,
+                                          session=session)
+
+        outputs = await asyncio.gather(
+            *(prime(conversation) for conversation in range(num_conversations)))
+    duration = time.perf_counter() - start_time
+
+    failed = [output for output in outputs if not output.success]
+    if failed:
+        raise ValueError(
+            f"{len(failed)} of {num_conversations} priming requests failed. "
+            f"First error: {failed[0].error}")
+    prompt_tokens = sum(request.prompt_len
+                        for request in conversations.priming_requests)
+    reported = [
+        output.cached_tokens for output in outputs
+        if output.cached_tokens is not None
+    ]
+    cached_tokens = sum(reported) if reported else None
+    print(f"Primed {num_conversations} conversations in {duration:.2f} s: "
+          f"{prompt_tokens} prompt tokens, {cached_tokens} served from cache.")
+    return {
+        "num_conversations": num_conversations,
+        "history_len": conversations.priming_requests[0].prompt_len,
+        "priming_duration": duration,
+        "priming_prompt_tokens": prompt_tokens,
+        "priming_cached_tokens": cached_tokens,
+    }
 
 
 async def benchmark(
@@ -313,13 +393,34 @@ async def benchmark(
     extra_body: Optional[dict],
     streaming: bool,
     no_test_input: bool = False,
+    conversations: Optional[RandomConversations] = None,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
-    if not no_test_input:
+    def conversation_request_input(request: SampleRequest,
+                                   prompt_json: bytes) -> RequestFuncInput:
+        return RequestFuncInput(
+            model=model_id,
+            model_name=model_name,
+            prompt=None,
+            prompt_json=prompt_json,
+            api_url=api_url,
+            prompt_len=request.prompt_len,
+            output_len=request.expected_output_len,
+            logprobs=logprobs,
+            ignore_eos=ignore_eos,
+            extra_body={
+                **(extra_body or {}), "conversation_params": {
+                    "conversation_id": request.conversation_id
+                }
+            },
+        )
+
+    # The conversations' priming turns take the place of the test request.
+    if not no_test_input and conversations is None:
         print("Starting initial single prompt test run...")
         test_prompt, test_prompt_len, test_output_len, test_mm_content = \
             input_requests[0].prompt, input_requests[0].prompt_len, \
@@ -351,6 +452,12 @@ async def benchmark(
             print("Initial test run completed. Starting main benchmark run...")
     else:
         print("Skipping initial test run. Starting main benchmark run...")
+
+    priming_result = {}
+    if conversations is not None:
+        priming_result = await prime_conversations(conversations, request_func,
+                                                   conversation_request_input,
+                                                   streaming, max_concurrency)
 
     if lora_modules:
         # For each input request, choose a LoRA module at random.
@@ -421,36 +528,63 @@ async def benchmark(
                                         limit_per_host=0,
                                         force_close=True))
 
-    i = 0
-    async for request in get_request(input_requests, request_rate, burstiness):
-        prompt, prompt_len, output_len, mm_content = request.prompt, \
-            request.prompt_len, request.expected_output_len, request.multi_modal_data
+    if conversations is not None:
+        # Each worker takes an idle conversation, sends its next turn and puts
+        # it back, so a conversation never has two turns in flight.
+        outputs: list[RequestFuncOutput] = [None] * len(input_requests)
+        idle_conversations = deque(range(conversations.num_conversations))
 
-        req_model_id, req_model_name = model_id, model_name
-        if lora_modules:
-            req_lora_module = next(lora_modules)
-            req_model_id, req_model_name = req_lora_module, req_lora_module
+        async def drive_conversations():
+            while idle_conversations:
+                conversation = idle_conversations.popleft()
+                turn = conversations.next_turn(conversation)
+                if turn is None:
+                    continue
+                index, prompt_json = turn
+                outputs[index] = await request_func(
+                    request_func_input=conversation_request_input(
+                        input_requests[index], prompt_json),
+                    streaming=streaming,
+                    pbar=pbar,
+                    session=session)
+                idle_conversations.append(conversation)
 
-        request_func_input = RequestFuncInput(
-            model=req_model_id,
-            model_name=req_model_name,
-            prompt=prompt,
-            api_url=api_url,
-            prompt_len=prompt_len,
-            output_len=output_len,
-            logprobs=logprobs,
-            ignore_eos=ignore_eos,
-            extra_body=extra_body,
-            multi_modal_content=mm_content,
-        )
-        tasks.append(
-            asyncio.create_task(
-                limited_request_func(request_func_input=request_func_input,
-                                     streaming=streaming,
-                                     pbar=pbar,
-                                     session=session)))
-        i += 1
-    outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks)
+        num_workers = min(conversations.num_conversations, max_concurrency
+                          or conversations.num_conversations)
+        await asyncio.gather(*(drive_conversations()
+                               for _ in range(num_workers)))
+    else:
+        i = 0
+        async for request in get_request(input_requests, request_rate,
+                                         burstiness):
+            prompt, prompt_len, output_len, mm_content = request.prompt, \
+                request.prompt_len, request.expected_output_len, request.multi_modal_data
+
+            req_model_id, req_model_name = model_id, model_name
+            if lora_modules:
+                req_lora_module = next(lora_modules)
+                req_model_id, req_model_name = req_lora_module, req_lora_module
+
+            request_func_input = RequestFuncInput(
+                model=req_model_id,
+                model_name=req_model_name,
+                prompt=prompt,
+                api_url=api_url,
+                prompt_len=prompt_len,
+                output_len=output_len,
+                logprobs=logprobs,
+                ignore_eos=ignore_eos,
+                extra_body=extra_body,
+                multi_modal_content=mm_content,
+            )
+            tasks.append(
+                asyncio.create_task(
+                    limited_request_func(request_func_input=request_func_input,
+                                         streaming=streaming,
+                                         pbar=pbar,
+                                         session=session)))
+            i += 1
+        outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks)
 
     if profile:
         print("Stopping profiler...")
@@ -522,6 +656,15 @@ async def benchmark(
                                     metrics.total_token_throughput))
     print("{:<40} {:<10.2f}".format("User throughput (tok/s):",
                                     metrics.tput_user))
+    if metrics.total_cached_tokens is not None:
+        print("{:<40} {:<10}".format("Total cached prompt tokens:",
+                                     metrics.total_cached_tokens))
+        print("{:<40} {:<10.4f}".format("Cache hit ratio:",
+                                        metrics.cache_hit_ratio))
+        print("{:<40} {:<10.2f}".format("Mean cached tokens per request:",
+                                        metrics.mean_cached_tokens))
+        print("{:<40} {:<10.2f}".format("Mean computed tokens per request:",
+                                        metrics.mean_computed_tokens))
 
     if len(outputs) - metrics.completed > 0:
         print(
@@ -560,6 +703,27 @@ async def benchmark(
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
     }
+
+    if metrics.total_cached_tokens is not None:
+        result.update({
+            "total_cached_tokens":
+            metrics.total_cached_tokens,
+            "cache_hit_ratio":
+            metrics.cache_hit_ratio,
+            "mean_cached_tokens":
+            metrics.mean_cached_tokens,
+            "median_cached_tokens":
+            metrics.median_cached_tokens,
+            "mean_computed_tokens":
+            metrics.mean_computed_tokens,
+            "median_computed_tokens":
+            metrics.median_computed_tokens,
+            "cached_tokens": [output.cached_tokens for output in outputs],
+        })
+    if conversations is not None:
+        result.update(priming_result)
+        result["turns_per_conversation"] = (len(input_requests) /
+                                            conversations.num_conversations)
 
     if metrics.total_energy_j is not None:
         result["energy"] = {
@@ -824,6 +988,7 @@ def main(args: argparse.Namespace):
             "Please specify '--dataset-name' and the corresponding "
             "'--dataset-path' if required.")
 
+    conversations = None
     if args.dataset_name == "sonnet":
         dataset = SonnetDataset(dataset_path=args.dataset_path)
         # For the "sonnet" dataset, formatting depends on the backend.
@@ -895,6 +1060,37 @@ def main(args: argparse.Namespace):
                 tokenizer=tokenizer,
                 output_len=args.trtllm_custom_output_len,
             )
+
+    elif args.dataset_name == "random" and args.random_cached_len > 0:
+        if not args.tokenize_on_client:
+            raise ValueError(
+                "--random-cached-len requires --tokenize-on-client "
+                "so that cached prefixes match token for token.")
+        if backend != "openai":
+            raise ValueError("--random-cached-len requires --backend openai.")
+        if (args.random_prefix_len or args.request_rate != float("inf")
+                or args.lora_modules or args.profile):
+            raise ValueError(
+                "--random-cached-len does not support --random-prefix-len, "
+                "--request-rate, --lora-modules or --profile.")
+        num_conversations = (args.random_num_conversations
+                             or args.max_concurrency)
+        if num_conversations is None:
+            raise ValueError("--random-cached-len requires "
+                             "--random-num-conversations or --max-concurrency.")
+        conversations = RandomDataset(
+            sample_from_sharegpt=False,
+            return_text=False,
+            random_seed=args.seed).sample_conversations(
+                tokenizer=tokenizer,
+                num_requests=args.num_prompts,
+                num_conversations=num_conversations,
+                cached_len=args.random_cached_len,
+                range_ratio=args.random_range_ratio,
+                input_len=args.random_input_len,
+                output_len=args.random_output_len,
+            )
+        input_requests = conversations.requests
 
     else:
 
@@ -1023,6 +1219,7 @@ def main(args: argparse.Namespace):
             extra_body=sampling_params,
             streaming=not args.non_streaming,
             no_test_input=args.no_test_input,
+            conversations=conversations,
         ))
 
     # Save config and results to json
@@ -1054,7 +1251,7 @@ def main(args: argparse.Namespace):
             # Remove fields with too many data points
             for field in [
                     "input_lens", "output_lens", "ttfts", "itls", "e2els",
-                    "generated_texts", "errors"
+                    "generated_texts", "errors", "cached_tokens"
             ]:
                 if field in result_json:
                     del result_json[field]
@@ -1079,8 +1276,9 @@ def main(args: argparse.Namespace):
         save_to_pytorch_benchmark_format(args, result_json, file_name)
 
     if perf_metrics_output_dir:
-        expected_count = benchmark_result["completed"] + int(
-            not args.no_test_input)
+        expected_count = benchmark_result["completed"] + (
+            conversations.num_conversations
+            if conversations is not None else int(not args.no_test_input))
         perf_metrics = _read_new_perf_metrics(perf_metrics_output_dir,
                                               perf_metrics_offsets,
                                               expected_count)
@@ -1437,6 +1635,26 @@ if __name__ == "__main__":
         "--random-ids",
         action="store_true",
         help="Generate random ids instead of sample from ShareGPT dataset.",
+    )
+    random_group.add_argument(
+        "--random-cached-len",
+        type=int,
+        default=0,
+        help="Mean number of prompt tokens per request that the server can "
+        "serve from its KV cache. When positive, requests form multi-turn "
+        "conversations of random token ids: each turn appends "
+        "--random-input-len new tokens to the previous turn's prompt and "
+        "sends the conversation id in conversation_params, so a server with "
+        "KV cache block reuse computes only the new tokens. Turn 0 of each "
+        "conversation primes the cache before the measured run and is not "
+        "measured. Requires --tokenize-on-client and --backend openai.",
+    )
+    random_group.add_argument(
+        "--random-num-conversations",
+        type=int,
+        default=None,
+        help="Number of conversations for --random-cached-len; the prompts "
+        "are spread evenly over them. Defaults to --max-concurrency.",
     )
     random_group.add_argument(
         "--tokenize-on-client",
