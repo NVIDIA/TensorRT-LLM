@@ -111,6 +111,7 @@ ITEMS: Dict[str, str] = {
     "NATIVE_SWIGLU": "the Triton SwiGLU-OAI activation",
     "NVFP4_STEP_CACHE": "the NVFP4 decode reader's history scheduler built per sparse layer",
     "ONEDIV_CAP": "the one-division normalization at every row count",
+    "OPROJ_PUSH_GEMM": "the stock o_proj GEMM and attention boundary all-reduce (instead of the Lamport-push GEMM)",
     "PACK_CPP_SCATTER": "the Triton parallel scatter on eager step-input flushes",
     "PACK_EARLY_COPY": "the step prologue copying the pinned window itself",
     "PACK_IN_GRAPH": "the eager step-input upload and scatter between the graphs",

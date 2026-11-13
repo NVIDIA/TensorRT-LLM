@@ -43,5 +43,23 @@ def _s2_moe_tail_fake(
     )
 
 
+def _ar_prepushed_fake(
+    rank,
+    workspace,
+    allreduce_in,
+    residual_in,
+    residual_out,
+    norm_out,
+    gamma,
+    eps,
+    trigger_completion_at_end,
+    mx_out=None,
+    mx_sf=None,
+):
+    """m31_ar_prepushed (OPROJ_PUSH_GEMM): writes residual_out, norm_out (and mx_out / mx_sf) in place."""
+    return None
+
+
 torch.library.register_fake(f"{_NS}::minimax_m31_s1b_fold")(_s1b_fold_fake)
 torch.library.register_fake(f"{_NS}::minimax_m31_s2_moe_tail")(_s2_moe_tail_fake)
+torch.library.register_fake(f"{_NS}::minimax_m31_ar_prepushed")(_ar_prepushed_fake)
