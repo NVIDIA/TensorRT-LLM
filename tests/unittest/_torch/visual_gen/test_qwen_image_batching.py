@@ -21,6 +21,7 @@ from tensorrt_llm._torch.visual_gen.models.qwen_image.request_batch import (
 from tensorrt_llm._torch.visual_gen.models.qwen_image.transformer_qwen_image import (
     QwenImageTransformer2DModel,
 )
+from tensorrt_llm.visual_gen.args import AttentionConfig
 
 pytestmark = pytest.mark.cpu_only
 
@@ -113,7 +114,7 @@ def test_sensitive_projections_receive_original_shapes():
 def test_graph_keys_distinguish_request_layout_at_same_tensor_shape():
     model = QwenImageTransformer2DModel.__new__(QwenImageTransformer2DModel)
     torch.nn.Module.__init__(model)
-    model.model_config = SimpleNamespace(attention=SimpleNamespace(sparse_attention_config=None))
+    model.model_config = SimpleNamespace(attention=AttentionConfig())
     runner = CUDAGraphRunner(CUDAGraphRunnerConfig(use_cuda_graph=True))
     model.register_cuda_graph_extra_key_fns(runner)
     assert runner.get_graph_key() == ()
