@@ -6427,6 +6427,9 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             }
         }
 
+        // Clear prior results after extracting reused passes, before collecting new logs.
+        sh "rm -rf '${stageName}/'"
+
         // Process shard test list and create separate files for regular and isolate tests
         def collectionLogDir = "${WORKSPACE}/${stageName}/collection${postTag}"
         def preprocessedLists = processShardTestList(llmSrc, testDBList, splitId, splits, stageName, collectionLogDir, clusterDurationsPath)
@@ -6535,7 +6538,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                                         bash '${llmSrc}/jenkins/scripts/progress_upload_watcher.sh' &
                                         WATCHER_PID=\$!
                                         ${checkpointNetrcWait(watcher.netrcDir)}
-                                        rm -rf '${stageName}/'
                                         cd '${llmSrc}/tests/integration/defs'
                                         ${pytestCommand.join(" ")}
                                         rc=\$?
