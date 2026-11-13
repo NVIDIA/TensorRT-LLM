@@ -400,6 +400,29 @@ def _rank_dspark_on_host_without_overlap(
         spec_config.enable_fused_confidence_scheduler = False
 
 
+def _force_chunk_ctx_chunk_config(
+        ctx_chunk_config: Optional[tuple],
+        chunk_unit_size: int,
+        configured_policy: Optional[ContextChunkingPolicy],
+        setting: str,
+        scope: str = "") -> tuple:
+    """Select FORCE_CHUNK for ``setting``, warning once about what it overrides."""
+    if ctx_chunk_config is None:
+        logger.warning_once(
+            f"{setting}{scope} turns on chunked prefill with the FORCE_CHUNK "
+            "policy, although enable_chunked_prefill is False. Disable "
+            f"{setting} to keep chunked prefill off.",
+            key=f"{setting}_enables_chunking")
+    elif (configured_policy is not None
+          and configured_policy != ContextChunkingPolicy.FORCE_CHUNK):
+        logger.warning_once(
+            f"{setting}{scope} replaces "
+            f"scheduler_config.context_chunking_policy={configured_policy} "
+            f"with FORCE_CHUNK. Disable {setting} to keep the configured policy.",
+            key=f"{setting}_replaces_chunking_policy")
+    return (ContextChunkingPolicy.FORCE_CHUNK, chunk_unit_size)
+
+
 def _branch_snapshot_ctx_chunk_config(
     ctx_chunk_config: Optional[tuple],
     kv_cache_manager: Optional[BaseResourceManager],
@@ -415,23 +438,12 @@ def _branch_snapshot_ctx_chunk_config(
     if not (isinstance(kv_cache_manager, KVCacheManagerV2)
             and kv_cache_manager.records_branch_snapshots):
         return ctx_chunk_config
-    if ctx_chunk_config is None:
-        logger.warning_once(
-            "block_reuse_config.enable_branch_snapshot turns on chunked "
-            "prefill with the FORCE_CHUNK policy, although "
-            "enable_chunked_prefill is False.",
-            key="branch_snapshot_enables_chunking")
-    elif (configured_policy is not None
-          and configured_policy != ContextChunkingPolicy.FORCE_CHUNK):
-        logger.warning_once(
-            "block_reuse_config.enable_branch_snapshot replaces "
-            f"scheduler_config.context_chunking_policy={configured_policy} "
-            "with FORCE_CHUNK.",
-            key="branch_snapshot_replaces_chunking_policy")
     # Keep the unit chosen for this model; it only aligns budget-shortened chunks.
     chunk_unit_size = (ctx_chunk_config[1]
                        if ctx_chunk_config is not None else tokens_per_block)
-    return (ContextChunkingPolicy.FORCE_CHUNK, chunk_unit_size)
+    return _force_chunk_ctx_chunk_config(
+        ctx_chunk_config, chunk_unit_size, configured_policy,
+        "block_reuse_config.enable_branch_snapshot")
 
 
 def _check_no_kv_execution(llm_args: TorchLlmArgs, mapping: Mapping,
@@ -1114,7 +1126,10 @@ def _create_py_executor(
     if kv_cache_config.enable_block_reuse and is_hybrid_linear(config):
         # Snapshot boundaries come from expect_snapshot_points.  The unit is
         # only used to align chunks shortened by the scheduling budget.
-        ctx_chunk_config = (ContextChunkingPolicy.FORCE_CHUNK, tokens_per_block)
+        ctx_chunk_config = _force_chunk_ctx_chunk_config(
+            ctx_chunk_config, tokens_per_block,
+            scheduler_config.context_chunking_policy, "enable_block_reuse",
+            " on a hybrid linear-attention model")
     if is_mla(config):
         _validate_fp4_mla_chunk_unit(model_engine.model.model_config,
                                      ctx_chunk_config)

@@ -18,7 +18,10 @@ from unittest.mock import Mock, patch
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.py_executor_creator import _branch_snapshot_ctx_chunk_config
+from tensorrt_llm._torch.pyexecutor.py_executor_creator import (
+    _branch_snapshot_ctx_chunk_config,
+    _force_chunk_ctx_chunk_config,
+)
 from tensorrt_llm.llmapi.llm_args import ContextChunkingPolicy
 
 pytestmark = pytest.mark.cpu_only
@@ -72,3 +75,34 @@ def test_branch_snapshot_ctx_chunk_config_reports_overrides(
     with patch("tensorrt_llm._torch.pyexecutor.py_executor_creator.logger") as logger:
         _branch_snapshot_ctx_chunk_config(ctx_chunk_config, RECORDS, 32, configured_policy)
     assert logger.warning_once.called == warned
+
+
+@pytest.mark.parametrize(
+    ("ctx_chunk_config", "configured_policy", "warning_key", "warning_text"),
+    [
+        (None, None, "setting_enables_chunking", "Disable setting to keep chunked prefill off."),
+        (
+            (FCFS, 256),
+            FCFS,
+            "setting_replaces_chunking_policy",
+            "Disable setting to keep the configured policy.",
+        ),
+        ((FCFS, 256), None, None, None),
+        ((FORCE, 32), FORCE, None, None),
+    ],
+)
+def test_force_chunk_ctx_chunk_config_reports_overrides(
+    ctx_chunk_config: tuple | None,
+    configured_policy: ContextChunkingPolicy | None,
+    warning_key: str | None,
+    warning_text: str | None,
+) -> None:
+    with patch("tensorrt_llm._torch.pyexecutor.py_executor_creator.logger") as logger:
+        result = _force_chunk_ctx_chunk_config(ctx_chunk_config, 32, configured_policy, "setting")
+    assert result == (FORCE, 32)
+    if warning_key is None:
+        logger.warning_once.assert_not_called()
+    else:
+        logger.warning_once.assert_called_once()
+        assert logger.warning_once.call_args.kwargs["key"] == warning_key
+        assert warning_text in logger.warning_once.call_args.args[0]
