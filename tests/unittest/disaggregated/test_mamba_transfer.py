@@ -817,6 +817,15 @@ def run_mamba_transfer_test(
         tc.shutdown()
 
 
+def _force_bounce_path(monkeypatch):
+    """Keep the same-node direct peer copy off so the C++ bounce carries every write.
+
+    With TRTLLM_NIXL_DIRECT_COPY=1 the transfer agent tries the direct copy before the bounce, so
+    same-node writes would not reach the bounce these cases assert on.
+    """
+    monkeypatch.setenv("TRTLLM_NIXL_DIRECT_COPY", "0")
+
+
 # ---------------------------------------------------------------------------
 # Test parametrization
 # ---------------------------------------------------------------------------
@@ -844,8 +853,10 @@ def test_mamba_transfer(ctx_tp, gen_tp):
     ],
     ids=["same_tp_xbc", "expand_tp_qkv", "contract_tp_xbc"],
 )
-def test_v2_mamba_transfer(ctx_tp, gen_tp, conv_state_layout, cpp_bounce):
+def test_v2_mamba_transfer(ctx_tp, gen_tp, conv_state_layout, cpp_bounce, monkeypatch):
     """Transfer slot-major V2 Mamba states through Python/NIXL."""
+    if cpp_bounce:
+        _force_bounce_path(monkeypatch)
     run_mamba_transfer_test(
         ctx_tp,
         gen_tp,
@@ -857,6 +868,8 @@ def test_v2_mamba_transfer(ctx_tp, gen_tp, conv_state_layout, cpp_bounce):
 
 @pytest.mark.timeout(180)
 @pytest.mark.parametrize("cpp_bounce", [False, True], ids=["no_bounce", "cpp_bounce"])
-def test_v2_mamba_transfer_with_replicated_ple_state(cpp_bounce):
+def test_v2_mamba_transfer_with_replicated_ple_state(cpp_bounce, monkeypatch):
     """Transfer PLE state once while standard Mamba state contracts from TP2 to TP1."""
+    if cpp_bounce:
+        _force_bounce_path(monkeypatch)
     run_mamba_transfer_test(2, 1, use_v2=True, with_ple=True, cpp_bounce=cpp_bounce)

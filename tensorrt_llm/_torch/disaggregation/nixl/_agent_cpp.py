@@ -188,6 +188,21 @@ class BindingsNixlTransferAgent(BaseTransferAgent):
         """Per-reason rejection counts, keyed by the C++ BounceRejectReason snake_case name."""
         return self._cpp_agent.bounce_reject_counts
 
+    @property
+    def direct_submit_count(self) -> int:
+        """Number of transfer requests served by the direct peer copy (TRTLLM_NIXL_DIRECT_COPY=1)."""
+        return int(getattr(self._cpp_agent, "direct_submit_count", 0))
+
+    @property
+    def direct_cross_node_submit_count(self) -> int:
+        """The part of direct_submit_count written to peers on other nodes of the NVLink domain."""
+        return int(getattr(self._cpp_agent, "direct_cross_node_submit_count", 0))
+
+    @property
+    def direct_mapped_peer_count(self) -> int:
+        """Remote agents whose memory the direct peer copy has mapped (imports run in the background)."""
+        return int(getattr(self._cpp_agent, "direct_mapped_peer_count", 0))
+
     def get_local_agent_desc(self) -> bytes:
         """Get the local agent descriptor as bytes."""
         agent_desc = self._cpp_agent.get_local_agent_desc()

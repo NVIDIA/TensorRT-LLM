@@ -1685,6 +1685,7 @@ def test_python_nixl_cache_transceiver_uses_cpp_bounce(
     is_mla: bool,
     use_v2: bool,
     pipelined_piece_tokens: Optional[int],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Exercise C++ bounce v2 through representative Python NIXL transceiver paths.
 
@@ -1698,6 +1699,9 @@ def test_python_nixl_cache_transceiver_uses_cpp_bounce(
 
     assert hasattr(TransferStatus, "get_last_status_str")
 
+    # The same-node direct peer copy (TRTLLM_NIXL_DIRECT_COPY=1) is tried before the bounce; keep it
+    # off so the writes reach the bounce this test asserts on.
+    monkeypatch.setenv("TRTLLM_NIXL_DIRECT_COPY", "0")
     run_transfer_test(
         ctx_tp=ctx_tp,
         ctx_pp=ctx_pp,
