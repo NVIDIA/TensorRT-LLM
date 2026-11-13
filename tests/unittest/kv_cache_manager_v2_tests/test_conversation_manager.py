@@ -97,20 +97,25 @@ def test_cached_block_keys_match_native_hash_chain(native_cache: SimpleNamespace
 
 
 @pytest.mark.parametrize(
-    "candidate,salt,continues",
+    "previous_length,candidate,salt,advances",
     [
-        (list(range(100, 116)), "scope", False),
-        (list(range(4)) + list(range(100, 112)), "scope", False),
-        (list(range(4)), "scope", False),
-        (list(range(16)) + list(range(100, 108)), "scope", True),
-        (list(range(16)), "other-scope", False),
+        (16, list(range(100, 116)), "scope", False),
+        (16, list(range(4)) + list(range(100, 112)), "scope", False),
+        (16, list(range(4)), "scope", False),
+        (16, list(range(16)) + list(range(100, 108)), "scope", True),
+        (16, list(range(16)), "other-scope", False),
+        (19, list(range(16)) + [100, 101, 102], "scope", True),
     ],
 )
-def test_only_continuing_history_advances_retention(
-    native_cache: SimpleNamespace, candidate: list[int], salt: str, continues: bool
+def test_complete_block_prefix_controls_retention(
+    native_cache: SimpleNamespace,
+    previous_length: int,
+    candidate: list[int],
+    salt: str,
+    advances: bool,
 ) -> None:
     manager, conversation = native_cache.manager, native_cache.conversation
-    tokens = list(range(16))
+    tokens = list(range(previous_length))
     first = native_cache.create(tokens, "scope")
     conversation.prepare_request(_request(1, "scope"))
     conversation.save_drop_plan(_request(1, "scope"), first)
@@ -122,4 +127,5 @@ def test_only_continuing_history_advances_retention(
     conversation.prepare_request(_request(2, salt))
     conversation.save_drop_plan(_request(2, salt), second)
     second.close()
-    assert manager.probe_reuse(scope, tokens) == (0 if continues else len(tokens))
+    remaining = manager.probe_reuse(scope, tokens)
+    assert remaining < len(tokens) if advances else remaining == len(tokens)

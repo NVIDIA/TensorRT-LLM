@@ -522,6 +522,7 @@ class ConversationManager:
         if state is None or state.current_request_id != request_id:
             return
 
+        # Compare complete-block prefixes only; trailing partial tokens are not checked.
         prefix_length = (
             kv_cache.num_committed_tokens // kv_cache.tokens_per_block * kv_cache.tokens_per_block
         )
@@ -530,7 +531,6 @@ class ConversationManager:
             state.prefix_hash is not None
             and kv_cache._get_committed_prefix_key(state.prefix_length) != state.prefix_hash
         ):
-            # An ID collision or a fork does not advance another history's retention plans.
             self.finish_request(request)
             return
 
