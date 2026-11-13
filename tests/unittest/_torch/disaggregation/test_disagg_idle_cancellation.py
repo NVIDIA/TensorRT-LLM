@@ -2008,9 +2008,9 @@ def test_legacy_tp_cancel_waits_for_peer_retirement_and_retries_while_idle(
     # A receive still referenced by a prior model batch cannot be closed by
     # the loop-head retry, even when local transport retirement reports ready.
     for rank, engine in enumerate(engines):
-        engine.previous_batch = SimpleNamespace(
-            scheduled_requests=ScheduledRequests(generation_requests=[requests[rank]])
-        )
+        scheduled = ScheduledRequests()
+        scheduled.generation_requests = [requests[rank]]
+        engine.previous_batch = SimpleNamespace(scheduled_requests=scheduled)
     group.run(lambda rank: engines[rank]._cancel_waiting_disagg_requests([]))
     assert all(not request.is_finished for request in requests)
     for engine in engines:
