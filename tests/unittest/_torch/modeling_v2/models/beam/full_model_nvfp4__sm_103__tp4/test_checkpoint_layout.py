@@ -25,6 +25,7 @@ import json
 import math
 import os
 import struct
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -273,6 +274,26 @@ def test_inconsistent_configuration_is_rejected(change) -> None:
     cfg.update(change)
     with pytest.raises(ValueError):
         layout.tensor_specs(cfg)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("as_object", [False, True])
+@pytest.mark.parametrize("scaling", [{}, {"rope_type": "linear", "factor": 2.0}, False])
+def test_top_level_rope_scaling_is_rejected(as_object: bool, scaling: object) -> None:
+    cfg = model_config()
+    cfg["rope_scaling"] = scaling
+    with pytest.raises(ValueError, match="rope_scaling"):
+        layout.check_config(SimpleNamespace(**cfg) if as_object else cfg)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("partial", [None, 1.0])
+def test_supported_rope_with_null_scaling(partial: float | None) -> None:
+    cfg = model_config()
+    cfg["rope_scaling"] = None
+    if partial is not None:
+        cfg["rope_parameters"]["sliding_attention"]["partial_rotary_factor"] = partial
+    assert layout.check_config(cfg).num_layers == NUM_LAYERS
 
 
 @pytest.mark.cpu_only
