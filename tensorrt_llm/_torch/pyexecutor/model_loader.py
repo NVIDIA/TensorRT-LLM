@@ -1410,9 +1410,6 @@ class ModelLoader:
 
             validate_lm_head_output_dtype(model,
                                           self.llm_args.lm_head_output_dtype)
-            # Queues the kernel builds the configuration alone determines; they
-            # run on KernelBuilder's worker threads while the weights load.
-            KernelBuilder.get().model_created(config, model)
 
             requires_standard_hf_loading = any(
                 getattr(module, "_requires_standard_hf_loading", False)

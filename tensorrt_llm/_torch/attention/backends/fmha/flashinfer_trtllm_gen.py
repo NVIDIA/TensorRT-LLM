@@ -40,7 +40,7 @@ Example:
 
 import math
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
@@ -54,7 +54,6 @@ if IS_FLASHINFER_AVAILABLE:
     import flashinfer
 
 from tensorrt_llm._torch.attention.backends.interface import (
-    AttentionBackend,
     AttentionForwardArgs,
     AttentionInputType,
 )
@@ -946,10 +945,11 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
 
     @staticmethod
     def _rehearsing(params: FmhaParams) -> bool:
-        """In a KernelBuilder rehearsal no trtllm-gen kernel runs and the output holds zeros:
-        their module builds on a KernelBuilder worker (``queue_fmha_module_build``)."""
+        """In a KernelBuilder rehearsal no trtllm-gen kernel runs: the call queues the build
+        of their module on a KernelBuilder worker, and the output holds zeros."""
         if not KernelBuilder.get().rehearsing():
             return False
+        queue_trtllm_gen_fmha_module_build()
         params.output.zero_()
         return True
 
@@ -1405,17 +1405,3 @@ def queue_trtllm_gen_fmha_module_build() -> bool:
     from flashinfer.jit import gen_trtllm_gen_fmha_module
 
     return queue_flashinfer_module_build("trtllm_gen_fmha", gen_trtllm_gen_fmha_module)
-
-
-def queue_fmha_module_build(model_config: Any, model: Any) -> None:
-    """KernelBuilder op family: the trtllm-gen FMHA module, for a model with an attention
-    layer this library serves, built from when the model is created."""
-    del model_config
-    if model is not None and any(
-        isinstance(fmha, FlashInferTrtllmGenFmha)
-        for module in model.modules()
-        for value in vars(module).values()
-        if isinstance(value, AttentionBackend)
-        for fmha in getattr(getattr(value, "_fmha_manager", None), "fmha_libs", ())
-    ):
-        queue_trtllm_gen_fmha_module_build()

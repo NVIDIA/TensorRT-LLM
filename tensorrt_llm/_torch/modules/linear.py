@@ -3612,33 +3612,6 @@ def flashinfer_mxfp8_autotune() -> Iterator[None]:
         _FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.reset(token)
 
 
-def queue_flashinfer_autotune_build(model_config, model) -> None:
-    """KernelBuilder op family: FlashInfer's ``trtllm_utils`` module, whose
-    delay kernel FlashInfer's autotuner loads when the warmup tunes the MXFP8
-    linears that dispatch through FlashInfer (``flashinfer_mxfp8_autotune``),
-    built on a worker thread from when the model is created. Queued for a
-    model with MXFP8 linears that use FlashInfer already, or that the warmup
-    may switch to it (``_use_flashinfer_mxfp8_decode_graph_default``)."""
-    del model_config
-    if model is None:
-        return
-    modules = list(model.modules())
-    methods = [
-        module.quant_method for module in modules
-        if isinstance(getattr(module, "quant_method", None), MXFP8LinearMethod)
-    ]
-    uses_flashinfer = any(method.needs_flashinfer_autotune
-                          for method in methods)
-    may_switch = any(
-        getattr(module, "_use_flashinfer_mxfp8_decode_graph_default", False)
-        for module in modules)
-    if methods and (uses_flashinfer or may_switch):
-        from flashinfer.jit.tllm_utils import gen_trtllm_utils_module
-
-        from ..flashinfer_utils import queue_flashinfer_module_build
-        queue_flashinfer_module_build("trtllm_utils", gen_trtllm_utils_module)
-
-
 @contextmanager
 def flashinfer_mxfp8_decode_graph_capture() -> Iterator[None]:
     """Enable auto-dispatched FlashInfer calls only for decode graph capture."""

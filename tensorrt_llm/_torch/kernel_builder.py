@@ -20,9 +20,6 @@ An op that goes through the autotuner builds through it instead: in the autotune
 build state (``autotuner.build_kernels``), ``choose_one`` queues here the builds of every
 shape, runner and tactic the op's tuning will time.
 
-An op whose kernels the configuration alone determines needs no forward: its op family in
-``_FAMILIES`` queues their builds when the model is created (``model_created``).
-
 A rehearsal is a build pass over the autotuner warmup's forwards on dummy weights, run
 before the checkpoint loads, in the autotuner's build state: the ops list their kernels
 without building or launching them, and the pass does not wait, so the builds run while
@@ -40,7 +37,6 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import functools
-import importlib
 import itertools
 import os
 import queue
@@ -71,23 +67,6 @@ _ENV = "TLLM_KERNEL_BUILDER"
 _REHEARSAL_ENV = "TLLM_KERNEL_BUILDER_REHEARSAL"
 _THREADS_ENV = "TLLM_KERNEL_BUILDER_THREADS"
 _PROGRESS_EVERY_S = 60.0
-
-# The op families with kernels the configuration alone determines: name -> "module:function".
-# The function takes the model config and the model as created and queues those builds. A
-# module is imported only when asked.
-_FAMILIES = {
-    "fmha_sm100": (
-        "tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_kernel_builds"
-        ":queue_builds"
-    ),
-    "flashinfer_sampling": (
-        "tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer:queue_sampling_module_build"
-    ),
-    "flashinfer_trtllm_gen_fmha": (
-        "tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen:queue_fmha_module_build"
-    ),
-    "flashinfer_autotune": "tensorrt_llm._torch.modules.linear:queue_flashinfer_autotune_build",
-}
 
 # A build returns True when it compiled the kernel, False when the kernel was already there.
 Build = Callable[[], bool]
@@ -256,22 +235,6 @@ class KernelBuilder:
     def rehearsing(self) -> bool:
         """True inside a rehearsal: an op lists its kernels, then skips its own launch."""
         return self.enabled and self._rehearsals > 0
-
-    def model_created(self, model_config: Any, model: Any = None) -> None:
-        """Each op family in ``_FAMILIES`` queues the builds the configuration alone
-        determines; called once ``model`` is created from ``model_config``, before its
-        weights load."""
-        if not self.enabled:
-            return
-        for name, target in _FAMILIES.items():
-            module_name, function = target.split(":")
-            try:
-                getattr(importlib.import_module(module_name), function)(model_config, model)
-            except Exception as e:  # noqa: BLE001 - the family's kernels build on first use
-                logger.warning(
-                    f"[KernelBuilder] {name}: could not queue its builds for the model; its "
-                    f"kernels build on first use. {type(e).__name__}: {e}"
-                )
 
     # Registration.
 

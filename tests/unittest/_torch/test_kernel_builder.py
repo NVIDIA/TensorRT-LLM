@@ -2,14 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """KernelBuilder: builds an op lists for the shapes it sweeps, run on worker threads."""
 
-import sys
 import threading
-import types
 
 import pytest
 import torch
 
-from tensorrt_llm._torch import kernel_builder
 from tensorrt_llm._torch.kernel_builder import (
     BuildConfig,
     DynamicSpec,
@@ -168,32 +165,6 @@ def test_a_rehearsal_leaves_its_builds_running_for_the_next_pass():
         _prebuild(builder, "sig", lambda: pytest.fail("listed twice"))
     # The warmup pass waited for it.
     assert builder.state("op", "k") == "done"
-
-
-def test_each_op_family_queues_its_builds_when_the_model_is_created(monkeypatch):
-    builder = KernelBuilder(threads=1, enabled=True, rehearse=False)
-    asked, built = [], []
-
-    def queue_builds(model_config, model):
-        asked.append((model_config, model))
-        builder.submit("module", model_config, _recorder(built, model_config))
-
-    family = types.ModuleType("family")
-    family.queue_builds = queue_builds
-    monkeypatch.setitem(sys.modules, "family", family)
-    monkeypatch.setattr(kernel_builder, "_FAMILIES", {"module": "family:queue_builds"})
-    # The builds need only the configuration, so they start with the rehearsal off too.
-    builder.model_created("config", "model")
-    builder.join(timeout=30)
-    assert asked == [("config", "model")]
-    assert built == ["config"]
-    # A family that cannot queue its builds leaves its kernels to their first use.
-    family.queue_builds = lambda model_config, model: 1 / 0
-    builder.model_created("config", "model")
-    # Turned off, KernelBuilder asks no family.
-    family.queue_builds = queue_builds
-    KernelBuilder(threads=1, enabled=False).model_created("other", "model")
-    assert asked == [("config", "model")]
 
 
 def test_a_flashinfer_module_builds_once_only_where_nothing_is_built(monkeypatch):

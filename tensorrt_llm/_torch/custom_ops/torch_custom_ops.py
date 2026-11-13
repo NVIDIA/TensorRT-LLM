@@ -922,10 +922,15 @@ def prebuild_flashinfer_mxfp8_gemm(act: torch.Tensor, act_scale: torch.Tensor,
                                    weight_scale: torch.Tensor,
                                    output_dtype: torch.dtype) -> None:
     """In the autotuner's build state, queue the builds of the FlashInfer MXFP8 GEMM
-    that ``mxfp8_gemm_autotuned`` and FlashInfer's own MXFP8 tuning time."""
+    that ``mxfp8_gemm_autotuned`` and FlashInfer's own MXFP8 tuning time, and of
+    FlashInfer's ``trtllm_utils`` module, whose delay kernel that tuning loads."""
     tuner = AutoTuner.get()
     if not tuner.is_build_mode:
         return
+    from flashinfer.jit.tllm_utils import gen_trtllm_utils_module
+
+    from ..flashinfer_utils import queue_flashinfer_module_build
+    queue_flashinfer_module_build("trtllm_utils", gen_trtllm_utils_module)
     runner = FlashInferMXFP8GemmRunner(output_dtype)
     tuner.prebuild(_FLASHINFER_MXFP8_GEMM_AUTOTUNED_OP, [runner],
                    runner.tuning_config, [act, act_scale, weight, weight_scale])

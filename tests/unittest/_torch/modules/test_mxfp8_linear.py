@@ -925,31 +925,32 @@ def test_mxfp8_fused_scales_follow_weight_rows_per_tp_rank(weight_mode, shard_ro
 
 
 @pytest.mark.cpu_only
-def test_flashinfer_autotuner_module_is_queued_for_a_model_that_tunes_through_flashinfer(
+def test_flashinfer_autotuner_module_is_queued_in_the_build_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    pytest.importorskip("flashinfer")
     import tensorrt_llm._torch.flashinfer_utils as flashinfer_utils
+    from tensorrt_llm._torch.autotuner import build_kernels
+    from tensorrt_llm._torch.custom_ops.torch_custom_ops import prebuild_flashinfer_mxfp8_gemm
+    from tensorrt_llm._torch.kernel_builder import KernelBuilder
 
-    monkeypatch.delenv("TRTLLM_MXFP8_GEMM_BACKEND", raising=False)
     queued = []
     monkeypatch.setattr(
         flashinfer_utils,
         "queue_flashinfer_module_build",
         lambda name, gen_spec: queued.append(name) or True,
     )
+    # Turned off, KernelBuilder takes none of the GEMM's own builds.
+    monkeypatch.setattr(KernelBuilder, "_instance", KernelBuilder(threads=1, enabled=False))
+    act = torch.zeros(4, 128, dtype=torch.float8_e4m3fn)
+    act_sf = torch.zeros(16, dtype=torch.uint8)
+    weight = torch.zeros(64, 128, dtype=torch.float8_e4m3fn)
+    weight_sf = torch.zeros(256, dtype=torch.uint8)
 
-    def model(flashinfer_decode_graphs: bool) -> torch.nn.Module:
-        layer = torch.nn.Module()
-        layer.quant_method = MXFP8LinearMethod()
-        root = torch.nn.Module()
-        root.layer = layer
-        if flashinfer_decode_graphs:
-            root._use_flashinfer_mxfp8_decode_graph_default = True
-        return root
-
-    # The native backend never tunes through FlashInfer.
-    linear_module.queue_flashinfer_autotune_build(None, model(False))
+    prebuild_flashinfer_mxfp8_gemm(act, act_sf, weight, weight_sf, torch.bfloat16)
     assert queued == []
-    # A model the warmup may switch to FlashInfer tunes through its autotuner.
-    linear_module.queue_flashinfer_autotune_build(None, model(True))
+    # The warmup will tune the GEMM through FlashInfer, whose tuning loads the module's
+    # delay kernel.
+    with build_kernels():
+        prebuild_flashinfer_mxfp8_gemm(act, act_sf, weight, weight_sf, torch.bfloat16)
     assert queued == ["trtllm_utils"]

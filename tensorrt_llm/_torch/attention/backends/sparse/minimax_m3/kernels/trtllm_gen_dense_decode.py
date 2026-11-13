@@ -273,8 +273,13 @@ def minimax_m3_trtllm_gen_dense_decode(
         decode_query_len,
     )
     if KernelBuilder.get().rehearsing():
-        # A rehearsal runs no trtllm-gen kernel: their module builds on a KernelBuilder
-        # worker (msa_kernel_builds.queue_builds). The output holds zeros.
+        # A rehearsal runs no trtllm-gen kernel: the call queues the build of their module
+        # on a KernelBuilder worker, and the output holds zeros.
+        from tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen import (
+            queue_trtllm_gen_fmha_module_build,
+        )
+
+        queue_trtllm_gen_fmha_module_build()
         output.zero_()
         return
 

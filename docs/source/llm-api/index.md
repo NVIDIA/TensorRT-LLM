@@ -212,11 +212,6 @@ states: the autotuner warmup tunes it, a build state builds the kernels of every
 runner and tactic its tuning will time on the same worker threads without timing them, and
 serving runs the tuned tactic.
 
-Kernels the configuration alone determines start building on worker threads when the model
-is created, for every model, and build while the weights load: FlashInfer's sampling,
-trtllm-gen FMHA and autotuner modules, and MiniMax-M3's MSA modules with its k2q CSR
-extension. The calls that need them find them built, or wait for their builds.
-
 Where the checkpoint can load after them, the engine first loads dummy weights and runs the
 autotuner warmup's two forwards on them (a context batch at the maximum token count and one
 generation request) in the build state, then loads the checkpoint while the kernels the
@@ -228,8 +223,8 @@ off.
 The startup log shows these as the `rehearsal`, `checkpoint` and `gpu_builds` phases,
 which `model_engine_creation_seconds` then does not include; `gpu_builds` waits for the
 builds that run kernels on the GPU. Supported ops: MiniMax-M3's MSA attention
-(`fmha_sm100`), and in the build state, DeepGEMM's FP8 block-scale GEMMs on Blackwell and
-FlashInfer's MXFP8 GEMM.
+(`fmha_sm100`) and Triton sparse decode, FlashInfer's trtllm-gen FMHA, and in the build
+state, DeepGEMM's FP8 block-scale GEMMs on Blackwell and FlashInfer's MXFP8 GEMM.
 
 | Environment variable | Default | Effect |
 |----------------------|---------|--------|

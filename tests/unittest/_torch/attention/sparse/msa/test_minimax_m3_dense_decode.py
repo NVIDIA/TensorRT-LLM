@@ -390,3 +390,35 @@ def test_accepts_the_m3_geometry():
     pytest.importorskip("flashinfer")
     pool = torch.zeros((1, 1, PAGE_SIZE, HEAD_DIM), device="cuda", dtype=torch.bfloat16)
     assert dense_decode_unsupported_reason(_StubManager(pool, 2), HEAD_DIM) is None
+
+
+def test_a_rehearsal_queues_the_kernels_module_and_launches_nothing(monkeypatch):
+    pytest.importorskip("flashinfer")
+    from tensorrt_llm._torch import kernel_builder
+    from tensorrt_llm._torch.attention.backends.fmha import flashinfer_trtllm_gen
+
+    builder = kernel_builder.KernelBuilder(threads=1, enabled=True)
+    monkeypatch.setattr(kernel_builder.KernelBuilder, "_instance", builder)
+    queued = []
+    monkeypatch.setattr(
+        flashinfer_trtllm_gen, "queue_trtllm_gen_fmha_module_build", lambda: queued.append(True)
+    )
+    q = torch.ones((2, 4, HEAD_DIM), device="cuda", dtype=torch.bfloat16)
+    output = torch.ones_like(q)
+    seq_lens = torch.ones(2, dtype=torch.int32, device="cuda")
+    # No cache manager or block table: any step past the rehearsal check would fail.
+    with builder.rehearsal():
+        minimax_m3_trtllm_gen_dense_decode(
+            q,
+            None,
+            0,
+            None,
+            seq_lens,
+            sm_scale=1.0,
+            output=output,
+            decode_query_len=1,
+            max_seq_len=PAGE_SIZE,
+            max_num_requests=2,
+        )
+    assert queued == [True]
+    assert torch.equal(output, torch.zeros_like(output))
