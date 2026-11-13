@@ -241,7 +241,8 @@ def _multirow_gated_rmsnorm_eligible(N, ngroups, bias, z, norm_before_gate,
             and ngroups == 1 and N <= _MULTIROW_MAX_N and (N & (N - 1)) == 0)
 
 
-def launch_rms_norm_gated_token_major(
+@torch.library.custom_op("trtllm::rms_norm_gated_token_major", mutates_args=())
+def rms_norm_gated_token_major(
     x: torch.Tensor,
     z: torch.Tensor,
     weight: torch.Tensor,
@@ -249,10 +250,7 @@ def launch_rms_norm_gated_token_major(
     fp8_scale: torch.Tensor | None = None,
     gate_activation: str = "silu",
 ) -> torch.Tensor:
-    """``trtllm::rms_norm_gated_token_major``'s launch, for eager callers that
-    skip the custom-op dispatch.
-
-    Gated rmsnorm(x) with z read from a 3D token-major view.
+    """Gated rmsnorm(x) with z read from a 3D token-major view.
 
     x: [num_tokens * heads, N] with contiguous rows. z: [num_tokens, heads, N]
     whose (heads, N) block is contiguous per token and whose token stride is
@@ -321,20 +319,6 @@ def launch_rms_norm_gated_token_major(
             launch_pdl=launch_with_pdl,
         )
     return out
-
-
-@torch.library.custom_op("trtllm::rms_norm_gated_token_major", mutates_args=())
-def rms_norm_gated_token_major(
-    x: torch.Tensor,
-    z: torch.Tensor,
-    weight: torch.Tensor,
-    eps: float,
-    fp8_scale: torch.Tensor | None = None,
-    gate_activation: str = "silu",
-) -> torch.Tensor:
-    """``launch_rms_norm_gated_token_major`` as a custom op."""
-    return launch_rms_norm_gated_token_major(x, z, weight, eps, fp8_scale,
-                                             gate_activation)
 
 
 @rms_norm_gated_token_major.register_fake

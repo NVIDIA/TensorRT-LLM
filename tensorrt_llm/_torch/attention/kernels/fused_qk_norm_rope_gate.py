@@ -904,11 +904,15 @@ def _fused_sigmoid_mul_kernel(
     )
 
 
-def launch_fused_sigmoid_mul_inplace(
+@torch.library.custom_op(
+    "trtllm::fused_sigmoid_mul_inplace",
+    mutates_args=("attention_output",),
+)
+def fused_sigmoid_mul_inplace(
     attention_output: torch.Tensor,
     gate: torch.Tensor,
 ) -> None:
-    """``trtllm::fused_sigmoid_mul_inplace``'s launch, for eager callers that skip the custom-op dispatch."""
+    """Apply ``attention_output *= sigmoid(gate)`` with a Triton kernel."""
     assert attention_output.dim() == 2 and attention_output.stride(-1) == 1
     num_tokens, hidden_size = attention_output.shape
     if gate.dim() == 3:
@@ -950,15 +954,3 @@ def launch_fused_sigmoid_mul_inplace(
         num_warps=4,
         **pdl_kwargs,
     )
-
-
-@torch.library.custom_op(
-    "trtllm::fused_sigmoid_mul_inplace",
-    mutates_args=("attention_output",),
-)
-def fused_sigmoid_mul_inplace(
-    attention_output: torch.Tensor,
-    gate: torch.Tensor,
-) -> None:
-    """Apply ``attention_output *= sigmoid(gate)`` with a Triton kernel."""
-    launch_fused_sigmoid_mul_inplace(attention_output, gate)

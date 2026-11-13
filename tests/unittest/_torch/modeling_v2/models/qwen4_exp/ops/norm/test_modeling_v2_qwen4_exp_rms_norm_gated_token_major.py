@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the rms_norm_gated_token_major entry."""
+"""GPU test for the rms_norm_gated_token_major entry: every cell against the
+entry's reference, the direct launch bitwise equal to the registered op, and the
+weight-length guard."""
 
 import zlib
 
@@ -8,6 +10,9 @@ import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.norm import (
+    rms_norm_gated_token_major as op_module,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.norm.rms_norm_gated_token_major import (  # noqa: E501
     rms_norm_gated_token_major as op,
 )
@@ -124,6 +129,44 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
     for t, b in zip((x, z, weight), before):
         assert torch.equal(t, b), "inputs are read-only"
     torch.testing.assert_close(out, op.reference(*args))
+
+
+#: The direct-launch cells below the 8-row threshold and more shapes for the pin test: the
+#: last row count before it, a PDL grid at each width, the silu gate over a packed `z`.
+_PIN_SPECS = tuple(
+    c.spec
+    for c in CELLS
+    if c.spec.get("direct_launch")
+    and c.spec["tokens"] * c.spec["heads"] < op_module._PREFILL_MIN_ROWS
+) + (
+    dict(_FP8_TP2, tokens=4),
+    dict(_FP8_TP2, tokens=128),
+    dict(_FP8_TP2, tokens=1365),
+    dict(op.CELLS[3].spec, tokens=4, direct_launch=True),
+    dict(op.CELLS[3].spec, tokens=2730, direct_launch=True),
+    dict(op.CELLS[-1].spec, direct_launch=True),
+    dict(_PACKED, tokens=16, gate_activation="silu", direct_launch=True),
+)
+
+
+@pytest.mark.parametrize(
+    "spec",
+    _PIN_SPECS,
+    ids=[
+        f"{s['tokens']}x{s['heads']}h-{s.get('z_row_stride', s['z'])}-{s['gate_activation']}"
+        for s in _PIN_SPECS
+    ],
+)
+def test_direct_launch_is_bitwise_the_registered_op(spec) -> None:
+    """`_direct_launch` is a copy of `torch.ops.trtllm.rms_norm_gated_token_major`'s
+    multi-row launch: it is taken at every shape here and returns the op's bytes, so a
+    change to the op's launch (kernel, rows a program, warps) fails here."""
+    x, z, weight, eps, _, act, _ = _build(spec, seed=_seed(f"pin {spec}"))
+    assert x.shape[0] < op_module._PREFILL_MIN_ROWS and op_module._multirow(x, z, act)
+    expected = torch.ops.trtllm.rms_norm_gated_token_major(x, z, weight, eps, None, act)
+
+    assert torch.equal(op_module._direct_launch(x, z, weight, eps, act), expected)
+    assert torch.equal(op(x, z, weight, eps, None, act, True), expected)
 
 
 def test_guard_refuses_a_weight_of_the_wrong_length() -> None:

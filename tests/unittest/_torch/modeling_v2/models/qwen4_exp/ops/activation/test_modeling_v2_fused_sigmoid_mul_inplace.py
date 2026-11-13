@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the fused_sigmoid_mul_inplace catalog entry: every cell against
 the entry's reference with nothing written past `attention_output`'s last row,
-graph capture of the default target's fused-row and MTP forms, the band refusing
-a wrong gate read, and the loud layout refusal."""
+the direct launch bitwise equal to the registered op, graph capture of the
+default target's fused-row and MTP forms, the band refusing a wrong gate read,
+and the loud layout refusal."""
 
 import zlib
 
@@ -11,6 +12,9 @@ import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.activation import (
+    fused_sigmoid_mul_inplace as op_module,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.activation.fused_sigmoid_mul_inplace import (  # noqa: E501
     fused_sigmoid_mul_inplace as op,
 )
@@ -117,6 +121,39 @@ def test_certified_cells(cell, certifying):  # noqa: F811 — pytest resolves th
     torch.testing.assert_close(result, expected)
     assert torch.equal(gate_buffer, gate_before)
     assert torch.equal(out_buffer[out.numel() :], tail_before), "a masked lane stored"
+
+
+#: The direct-launch cells and more shapes for the pin test: 0 rows, both block widths
+#: either side of 1024 rows, a compact 2-D gate, the default target's fused-row and
+#: 6-head forms.
+_PIN_SPECS = tuple(c.spec for c in CELLS if c.spec.get("direct_launch")) + (
+    dict(tokens=0, **_FP8_TP2_ROW),
+    dict(tokens=1023, **_FP8_TP2_ROW),
+    dict(tokens=1024, **_FP8_TP2_ROW),
+    dict(tokens=1, **_FP8_MTP),
+    dict(_FP8_TP2_ROW, tokens=64, row_stride=3072, gate_col=0),
+    dict(next(c.spec for c in op.CELLS if c.spec.get("row_stride") == 4352), tokens=8),
+    _mtp_spec(512),
+)
+
+
+@pytest.mark.parametrize(
+    "spec",
+    _PIN_SPECS,
+    ids=[f"{s['tokens']}x{s['heads']}h-{s['gate']}-{s.get('row_stride', '')}" for s in _PIN_SPECS],
+)
+def test_direct_launch_is_bitwise_the_registered_op(spec) -> None:
+    """`_launch` is a copy of `torch.ops.trtllm.fused_sigmoid_mul_inplace`'s launch: it
+    launches at every shape here and writes the op's bytes, so a change to the op's
+    launch (kernel, grid, block) fails here."""
+    out, _, _, gate = _build(spec, seed=_seed(f"pin {spec}"))
+    expected = out.clone()
+    torch.ops.trtllm.fused_sigmoid_mul_inplace(expected, gate)
+    direct = out.clone()
+
+    assert op_module._launch(direct, gate), "the direct launch declined"
+    assert torch.equal(direct, expected)
+    assert torch.equal(op(out, gate, True), expected)
 
 
 @pytest.mark.parametrize("direct_launch", [False, True], ids=["op", "direct"])
