@@ -47,6 +47,15 @@ tests:
     launch:
       mode: mpi
       world_size: 8
+  # ModelingV2 MiniMax-M3.1-Flash: 8 GB300s (SM103) over two trays, TP8.
+  - case: accuracy/modeling_v2/minimax_m3/minimax_m3_1_flash_nvfp4__sm_103__tp8/test_accuracy.py::TestModelingV2MiniMaxM31FlashNvfp4Sm103Tp8::test_gsm8k TIMEOUT (60)
+    launch:
+      mode: mpi
+      world_size: 8
+  - case: accuracy/modeling_v2/minimax_m3/minimax_m3_1_flash_nvfp4__sm_103__tp8/test_accuracy.py::TestModelingV2MiniMaxM31FlashNvfp4Sm103Tp8::test_dspark_gsm8k TIMEOUT (60)
+    launch:
+      mode: mpi
+      world_size: 8
   - case: accuracy/test_disaggregated_multinode.py::TestDeepSeekV4ProDSparkMultinode::test_gsm8k_1p1d_dep4
     launch:
       mode: per_node
