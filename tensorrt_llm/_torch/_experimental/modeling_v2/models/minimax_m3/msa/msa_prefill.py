@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import functools
 import inspect
-import sys
 from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
@@ -189,10 +188,9 @@ def _k2q_csr_parts():
     Internals of the packaged MSA builder, resolved once; a build that moves
     them leaves every call on build_k2q_csr itself.
     """
-    _msa_sparse_api()  # puts the CuTe-DSL sources on sys.path
+    _msa_sparse_api()  # the vendored package and its CuTe DSL name shim
     try:
-        from sparse_index_utils import _K2Q_CSR_BUILDER
-
+        from ..kernels.msa_kernels.fmha_sm100.cute.sparse_index_utils import _K2Q_CSR_BUILDER
         from ..kernels.msa_kernels.fmha_sm100.cute.src.sm100.prepare_scheduler import (
             SPARSE_SCHEDULE_MODEL,
             SparseAttentionSchedule,
@@ -213,7 +211,7 @@ def _k2q_lpt_parts():
 
     Internals of the packaged MSA builder (prepare_k2q_csr), resolved once; a build that moves them leaves every LPT
     call on build_k2q_csr itself."""
-    _msa_sparse_api()  # puts the CuTe-DSL sources on sys.path
+    _msa_sparse_api()  # the vendored package and its CuTe DSL name shim
     try:
         from ..kernels.msa_kernels.fmha_sm100.cute.src.sm100 import prepare_k2q_csr
     except ImportError:
@@ -369,8 +367,11 @@ def _nvfp4_attention_parts():
     Internals of the packaged MSA entry point, resolved once; a build that
     moves them leaves every call on sparse_atten_nvfp4_kv_func itself.
     """
-    _msa_sparse_api()  # puts the CuTe-DSL sources on sys.path
-    interface = sys.modules.get("interface")
+    _msa_sparse_api()  # the vendored package and its CuTe DSL name shim
+    try:
+        from ..kernels.msa_kernels.fmha_sm100.cute import interface
+    except ImportError:
+        return None
     names = (
         "_validate_csr_varlen_nvfp4_kv_inputs",
         "_validate_fwd_schedule",

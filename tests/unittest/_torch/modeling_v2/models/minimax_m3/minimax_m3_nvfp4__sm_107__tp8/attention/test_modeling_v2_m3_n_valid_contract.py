@@ -45,11 +45,16 @@ _MUTATORS = {
 # Calls whose first argument is the destination they write: ``step_inputs.copy_(dst, src)`` and the H2D helpers.
 _COPY_HELPERS = {"copy_", "copy_h2d_if_changed", "copy_h2d_pool_shared"}
 _BACKEND = "attention/backends/sparse/minimax_m3/msa_backend.py"
+_FAMILY_BACKEND = "_experimental/modeling_v2/models/minimax_m3/msa/msa_backend.py"
 # (file relative to tensorrt_llm/_torch, enclosing function) -> writes allowed there
 _ALLOWED = {
     (_BACKEND, "_alloc_msa_proxy_scratch"),  # the allocation
     (_BACKEND, "_build_step_plans"),  # the H2D copy in prepare()
     (_BACKEND, "on_update_kv_lens"),  # the device-side correction before the forward
+    # The MiniMax-M3.1 family's MSA backend (msa/msa_backend.py) writes it at the same three places.
+    (_FAMILY_BACKEND, "_alloc_msa_proxy_scratch"),
+    (_FAMILY_BACKEND, "_build_step_plans"),
+    (_FAMILY_BACKEND, "on_update_kv_lens"),
 }
 
 

@@ -17,7 +17,10 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp8 import (  # noqa: E501
     modeling,
 )
-from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
+
+# The fmha_sm100 the target's attention runs: the family's vendored copy on an engine that takes the family MSA
+# classes, else the package main's backend imports.
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.msa.engine import (
     require_msa_module,
 )
 

@@ -22,7 +22,9 @@ try:
     )
 except NoTarget as exc:
     pytest.skip(str(exc), allow_module_level=True)
-from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
+# The fmha_sm100 the target's attention runs: the family's vendored copy on an engine that takes the family MSA
+# classes, else the package main's backend imports.
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.msa.engine import (
     require_msa_module,
 )
 
@@ -32,7 +34,7 @@ WANT = {"1_0_0_2_1_0_1", "1_0_0_2_1_0_0", "1_0_1_2_1_0_0", "1_1_1_2_1_0_0"}
 
 @pytest.fixture
 def proxy_builds(monkeypatch):
-    fmha_jit = require_msa_module().jit  # the packaged fmha_sm100 the target's prebuild resolves
+    fmha_jit = require_msa_module().jit  # the fmha_sm100 the target's prebuild resolves
 
     built = []
 
