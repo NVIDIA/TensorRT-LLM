@@ -123,6 +123,10 @@ class RankInfo:
             if bytes_for_eight_elements % 8 == 0
             else bytes_for_eight_elements / 8
         )
+        # Explicit draft layers (layer specs) ride the target's pages and
+        # requests; folded MTP/Eagle layers travel as ordinary layers.
+        get_draft_view = getattr(kvm, "get_draft_kv_cache_view", None)
+        shares_draft_layers = get_draft_view is not None and get_draft_view() is kvm
         return cls(
             instance_name=instance_name,
             instance_rank=m.rank,
@@ -150,9 +154,7 @@ class RankInfo:
             aux_meta=aux_buffer_meta,
             page_table=build_page_table_from_manager(kvm),
             bounded_replay_on_generation=getattr(kvm, "bounded_replay_on_generation", False),
-            num_draft_layers=(
-                len(kvm.draft_layer_ids) if getattr(kvm, "layer_specs", None) is not None else 0
-            ),
+            num_draft_layers=len(kvm.draft_layer_ids) if shares_draft_layers else 0,
         )
 
     @classmethod

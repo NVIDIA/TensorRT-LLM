@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Run Pyrefly on supplied product Python files, or the whole project when
+# Run Pyrefly on supplied product or test Python files, or the whole project when
 # --full-project is used. With no eligible file paths, return success without
 # checking. Pre-commit supplies the file list with pass_filenames: true.
 # Paths from tool.pyrefly.project-excludes and symbols from
@@ -17,6 +17,7 @@
 # --no-diff-filter for file-level output on every supplied file.
 # Path and symbol exclusions are enabled by default; use --no-path-module-filter
 # to also disable Pyrefly's configured project and import exclusions.
+# Product and test checks use separate configurations to isolate import resolution.
 
 set -euo pipefail
 
@@ -37,13 +38,13 @@ while (( $# > 0 )); do
             ;;
         --help|-h)
             cat <<'EOF'
-Run Pyrefly on supplied product Python files, or the whole project.
+Run Pyrefly on supplied product or test Python files, or the whole project.
 
 Pre-commit passes filenames to this script. With no eligible filenames, skip
 the check. Use --full-project to check all configured sources explicitly.
 
 Options:
-  --full-project           Check all product Python files.
+  --full-project           Check all configured product and test Python files.
   --strict                 Fail file-list checks on diagnostics or check failures.
   --no-diff-filter         Keep diagnostics from all lines in supplied files.
   --no-path-module-filter  Include diagnostics from excluded paths and modules.
@@ -83,11 +84,9 @@ REPORT_FILE="${PYREFLY_REPORT_PATH:-$PROJECT_DIR/pyrefly_final_report.json}"
 if [[ "$REPORT_FILE" != /* ]]; then
     REPORT_FILE="$PROJECT_DIR/$REPORT_FILE"
 fi
-PYREFLY_OUTPUT=""
-PYREFLY_STDERR=""
+CHECK_DIR=""
 FILTERED_REPORT=""
 DIFF_FILTERED_OUTPUT=""
-PYREFLY_CONFIG=""
 CANDIDATE_PATHS=""
 ALLOWED_PATHS=""
 FILTERED_ARG_COUNT=0
@@ -95,13 +94,15 @@ SKIP_CHECK=0
 
 cleanup() {
     local status=$?
-    for file in "$PYREFLY_OUTPUT" "$PYREFLY_STDERR" "$FILTERED_REPORT" \
-                "$DIFF_FILTERED_OUTPUT" "$PYREFLY_CONFIG" \
+    for file in "$FILTERED_REPORT" "$DIFF_FILTERED_OUTPUT" \
                 "$CANDIDATE_PATHS" "$ALLOWED_PATHS"; do
         if [[ -n "$file" ]]; then
             rm -f "$file" || true
         fi
     done
+    if [[ -n "$CHECK_DIR" ]]; then
+        rm -rf "$CHECK_DIR" || true
+    fi
     if (( SKIP_CHECK )); then
         trap - EXIT
         exit 0
@@ -140,9 +141,6 @@ for argument in "$@"; do
             > "$REPORT_FILE"
         exit 2
     fi
-    if (( ! FULL_PROJECT )) && [[ "$argument" != tensorrt_llm/* ]]; then
-        continue
-    fi
     if (( ! FULL_PROJECT )) && [[ "$argument" != *.py && "$argument" != *.pyi ]]; then
         continue
     fi
@@ -153,11 +151,20 @@ for argument in "$@"; do
     FILTERED_ARG_COUNT=$((FILTERED_ARG_COUNT + 1))
 done
 
-if (( ! FULL_PROJECT && PATH_MODULE_FILTER && FILTERED_ARG_COUNT > 0 )); then
+if (( FULL_PROJECT || FILTERED_ARG_COUNT > 0 )); then
+    CHECK_DIR="$(mktemp -d)"
+    TESTS_CONFIG="$CHECK_DIR/tests.toml"
+    python3 "$WORKFLOW_SCRIPT" write-test-config "$EXCLUSIONS_CONFIG" "$TESTS_CONFIG"
+fi
+
+if (( ! FULL_PROJECT && FILTERED_ARG_COUNT > 0 )); then
     CANDIDATE_PATHS="$(mktemp)"
     ALLOWED_PATHS="$(mktemp)"
     printf '%s\0' "${FILTERED_ARGS[@]}" > "$CANDIDATE_PATHS"
-    if ! python3 "$EXCLUSION_SCRIPT" filter-input-paths \
+    python3 "$WORKFLOW_SCRIPT" select-project-files \
+        "$CANDIDATE_PATHS" "$ALLOWED_PATHS" "$EXCLUSIONS_CONFIG" "$TESTS_CONFIG"
+    cp "$ALLOWED_PATHS" "$CANDIDATE_PATHS"
+    if (( PATH_MODULE_FILTER )) && ! python3 "$EXCLUSION_SCRIPT" filter-input-paths \
         "$CANDIDATE_PATHS" "$ALLOWED_PATHS" "$EXCLUSIONS_CONFIG" \
         --project-root "$PROJECT_DIR"; then
         printf '{"tool":"pyrefly","report_error":"could not filter input paths"}\n' \
@@ -173,7 +180,7 @@ fi
 
 if (( ! FULL_PROJECT && FILTERED_ARG_COUNT == 0 )); then
     SKIP_CHECK=1
-    printf 'No eligible supplied product Python files; skipping Pyrefly check.\n' >&3
+    printf 'No eligible supplied product or test Python files; skipping Pyrefly check.\n' >&3
     exit 0
 fi
 if (( FULL_PROJECT )); then
@@ -185,32 +192,59 @@ if ! command -v pyrefly >/dev/null 2>&1; then
     exit 127
 fi
 
-PYREFLY_OUTPUT="$(mktemp)"
-PYREFLY_STDERR="$(mktemp)"
 FILTERED_REPORT="$(mktemp)"
-PYREFLY_ARGS=(check --output-format=json --summary=none --progress-bar=no
-    --relative-to "$PROJECT_DIR")
-if (( ! PATH_MODULE_FILTER )); then
-    PYREFLY_CONFIG="$(mktemp "$PROJECT_DIR/.pyrefly-config.XXXXXX")"
-    python3 "$WORKFLOW_SCRIPT" clear-exclusions-config \
-        "$PROJECT_DIR/pyproject.toml" "$PYREFLY_CONFIG"
-    PYREFLY_ARGS+=(--config "$PYREFLY_CONFIG")
-fi
-if (( ! FULL_PROJECT )); then
-    PYREFLY_ARGS+=("${FILTERED_ARGS[@]}")
-fi
-
 PYREFLY_STATUS=0
-pyrefly "${PYREFLY_ARGS[@]}" > "$PYREFLY_OUTPUT" 2> "$PYREFLY_STDERR" || PYREFLY_STATUS=$?
-
-if (( PATH_MODULE_FILTER )); then
-    python3 "$EXCLUSION_SCRIPT" filter-report "$PYREFLY_OUTPUT" "$FILTERED_REPORT" \
-        "$EXCLUSIONS_CONFIG" --project-root "$PROJECT_DIR" \
-        --pyrefly-exit-code "$PYREFLY_STATUS" --stderr "$PYREFLY_STDERR"
-else
-    python3 "$WORKFLOW_SCRIPT" wrap-unfiltered-report \
-        "$PYREFLY_OUTPUT" "$FILTERED_REPORT" "$PYREFLY_STDERR" "$PYREFLY_STATUS"
-fi
+PASS_REPORTS=()
+for scope in tensorrt_llm tests; do
+    PYREFLY_CONFIG="$PROJECT_DIR/pyproject.toml"
+    if [[ "$scope" == tests ]]; then
+        PYREFLY_CONFIG="$TESTS_CONFIG"
+    fi
+    SCOPE_ARGS=()
+    if (( ! FULL_PROJECT )); then
+        printf '%s\0' "${FILTERED_ARGS[@]}" > "$CANDIDATE_PATHS"
+        python3 "$WORKFLOW_SCRIPT" select-project-files \
+            "$CANDIDATE_PATHS" "$ALLOWED_PATHS" "$PYREFLY_CONFIG"
+        while IFS= read -r -d '' argument; do
+            SCOPE_ARGS+=("$argument")
+        done < "$ALLOWED_PATHS"
+        if (( ${#SCOPE_ARGS[@]} == 0 )); then
+            continue
+        fi
+    fi
+    if (( ! PATH_MODULE_FILTER )); then
+        python3 "$WORKFLOW_SCRIPT" clear-exclusions-config \
+            "$PYREFLY_CONFIG" "$CHECK_DIR/$scope.unfiltered.toml"
+        PYREFLY_CONFIG="$CHECK_DIR/$scope.unfiltered.toml"
+    fi
+    PYREFLY_ARGS=(check --output-format=json --summary=none --progress-bar=no
+        --relative-to "$PROJECT_DIR" --config "$PYREFLY_CONFIG")
+    if (( ! FULL_PROJECT )); then
+        PYREFLY_ARGS+=("${SCOPE_ARGS[@]}")
+    fi
+    PASS_STATUS=0
+    pyrefly "${PYREFLY_ARGS[@]}" > "$CHECK_DIR/$scope.raw.json" \
+        2> "$CHECK_DIR/$scope.stderr" || PASS_STATUS=$?
+    if (( PASS_STATUS > PYREFLY_STATUS )); then
+        PYREFLY_STATUS=$PASS_STATUS
+    fi
+    if (( PATH_MODULE_FILTER )); then
+        FILTER_ARGS=(--project-root "$PROJECT_DIR" --pyrefly-exit-code "$PASS_STATUS"
+            --stderr "$CHECK_DIR/$scope.stderr")
+        if (( ! FULL_PROJECT )) && [[ "$scope" == tests ]]; then
+            FILTER_ARGS+=(--ignore-uninstalled-dependencies)
+        fi
+        python3 "$EXCLUSION_SCRIPT" filter-report \
+            "$CHECK_DIR/$scope.raw.json" "$CHECK_DIR/$scope.json" \
+            "$EXCLUSIONS_CONFIG" "${FILTER_ARGS[@]}"
+    else
+        python3 "$WORKFLOW_SCRIPT" wrap-unfiltered-report \
+            "$CHECK_DIR/$scope.raw.json" "$CHECK_DIR/$scope.json" \
+            "$CHECK_DIR/$scope.stderr" "$PASS_STATUS"
+    fi
+    PASS_REPORTS+=("$CHECK_DIR/$scope.json")
+done
+python3 "$WORKFLOW_SCRIPT" merge-reports "$FILTERED_REPORT" "${PASS_REPORTS[@]}"
 
 FINAL_REPORT="$FILTERED_REPORT"
 if [[ -n "$DIFF_BASE" ]]; then

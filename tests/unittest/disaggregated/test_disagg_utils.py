@@ -542,3 +542,110 @@ def test_subagent_affinity_inert_when_header_unset(caplog):
         )
     assert "sub-agent" not in caplog.text.lower()
     assert "subagent_affinity_scope" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "decoding_type, backend, blocked",
+    [("DSpark", "CUTEDSL", False), ("DSpark", "TRTLLM", True),
+     ("DFlash", "CUTEDSL", True)],
+)
+def test_shared_draft_kv_under_helix_needs_the_cutedsl_dspark_drafter(
+        decoding_type, backend, blocked):
+    from types import SimpleNamespace
+
+    from tensorrt_llm.commands.serve import _shared_draft_kv_blocker
+
+    spec = {"decoding_type": decoding_type, "attention_backend": backend}
+    configs = [
+        SimpleNamespace(
+            type=role,
+            other_args={
+                "speculative_config": spec,
+                "tensor_parallel_size": 1,
+                "context_parallel_size": 2,
+            },
+        ) for role in ("ctx", "gen")
+    ]
+    blocker = _shared_draft_kv_blocker(configs)
+    assert (blocker is not None) == blocked
+
+
+@pytest.mark.parametrize(
+    "backend, tokens_per_block, blocked",
+    [("CUTEDSL", 128, False), ("CUTEDSL", 64, False), ("CUTEDSL", 96, True),
+     ("TRTLLM", 128, True), ("TRTLLM", 64, False)],
+)
+def test_shared_draft_kv_page_size_follows_the_dspark_drafter_backend(
+        backend, tokens_per_block, blocked):
+    from types import SimpleNamespace
+
+    from tensorrt_llm.commands.serve import _shared_draft_kv_blocker
+
+    spec = {"decoding_type": "DSpark", "attention_backend": backend}
+    configs = [
+        SimpleNamespace(
+            type=role,
+            other_args={
+                "speculative_config": spec,
+                "tensor_parallel_size": 1,
+                "kv_cache_config": {
+                    "tokens_per_block": tokens_per_block
+                },
+            },
+        ) for role in ("ctx", "gen")
+    ]
+    blocker = _shared_draft_kv_blocker(configs)
+    assert (blocker is not None) == blocked
+
+
+@pytest.mark.parametrize(
+    "roles_with_spec, blocked",
+    [((("ctx", True), ), False), ((("ctx", True), ("ctx", True)), False),
+     ((("ctx", True), ("ctx", False)), True),
+     ((("ctx", True), ("gen", False)), True), ((("gen", True), ), False),
+     ((), True)],
+)
+def test_shared_draft_kv_checks_a_one_sided_config_for_its_own_side(
+        roles_with_spec, blocked):
+    """A DWDP context MPI world's config lists only its context servers."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm.commands.serve import _shared_draft_kv_blocker
+
+    spec = {"decoding_type": "DSpark", "attention_backend": "CUTEDSL"}
+    configs = [
+        SimpleNamespace(
+            type=role,
+            other_args={
+                "tensor_parallel_size": 1,
+                "kv_cache_config": {
+                    "tokens_per_block": 64
+                },
+                **({
+                    "speculative_config": spec
+                } if has_spec else {}),
+            },
+        ) for role, has_spec in roles_with_spec
+    ]
+    blocker = _shared_draft_kv_blocker(configs)
+    assert (blocker is not None) == blocked
+
+
+@pytest.mark.parametrize(
+    "roles, blocker, expected",
+    [(("ctx", "gen"), None, "auto"), (("ctx", "ctx"), None, "0"),
+     (("gen", ), None, "0"), (("ctx", "gen"), "a reason", "0")],
+)
+def test_launcher_shares_draft_kv_by_default_only_when_both_sides_are_listed(
+        roles, blocker, expected):
+    """A one-sided config leaves sharing off unless it is asked for.
+
+    A DWDP context MPI world lists only its context servers and cannot see
+    how the generation side is launched.
+    """
+    from types import SimpleNamespace
+
+    from tensorrt_llm.commands.serve import _shared_draft_kv_default
+
+    configs = [SimpleNamespace(type=role, other_args={}) for role in roles]
+    assert _shared_draft_kv_default(configs, blocker) == expected
