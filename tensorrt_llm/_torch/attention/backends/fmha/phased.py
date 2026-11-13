@@ -327,7 +327,9 @@ class PhasedFmha(Fmha):
                 else None
             )
             params.key_input = _kv_rows(k, num_ctx_tokens, kv_row_total) if k is not None else None
-            params.value_input = _kv_rows(v, num_ctx_tokens, kv_row_total) if v is not None else None
+            params.value_input = (
+                _kv_rows(v, num_ctx_tokens, kv_row_total) if v is not None else None
+            )
         params.output = out_tensor if fused_epilogue else _leading_rows(out_tensor, num_ctx_tokens)
         params.sequence_lengths = metadata.kv_lens_cuda_runtime
         params.context_lengths = metadata.prompt_lens_cuda_runtime
