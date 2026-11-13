@@ -1391,6 +1391,7 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
         staged, event = self._stage_on_side_stream(mrope_config["mrope_position_ids"], side_stream)
         mrope_config["mrope_position_ids"] = staged
         context.py_mm_encoder_event = event
+        event.synchronize()
         expected = staged.clone()
         torch.cuda.synchronize()
 
