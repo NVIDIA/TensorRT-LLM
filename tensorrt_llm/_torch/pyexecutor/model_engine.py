@@ -124,7 +124,11 @@ class ModelEngine:
         checkpoint_loader: BaseCheckpointLoader | None = None,
         model_weights_memory_tag: str | None = None,
         model_weights_restore_mode=None,
+        defer_checkpoint: bool = False,
     ):
+        """``defer_checkpoint``: build the engine on dummy weights for a KernelBuilder
+        rehearsal, where the loader can (``ModelLoader.load``); ``has_deferred_checkpoint``
+        then tells, and the caller runs ``rehearse`` and ``load_deferred_checkpoint``."""
         # cleanup() also runs on an engine whose construction failed part-way.
         self._cleanup_done = False
         self.model_loader: ModelLoader | None = None
@@ -144,7 +148,11 @@ class ModelEngine:
             checkpoint_loader=checkpoint_loader,
             model_weights_memory_tag=model_weights_memory_tag,
             model_weights_restore_mode=model_weights_restore_mode,
+            defer_checkpoint=defer_checkpoint,
         )
+        if self.has_deferred_checkpoint and not self.model.model_config.is_generation:
+            # No KV cache to rehearse with.
+            self.model_loader.load_deferred_checkpoint(self.model)
         if not self.model.model_config.is_generation:
             self.llm_args = resolve_scheduled_encoder_args(self.llm_args)
         self._validate_breakable_cuda_graph_compatibility()
@@ -258,6 +266,7 @@ class ModelEngine:
         checkpoint_loader: BaseCheckpointLoader | None,
         model_weights_memory_tag: str | None,
         model_weights_restore_mode,
+        defer_checkpoint: bool = False,
     ) -> None:
         """Load the model, or take the given one, at the requested capacity."""
         self.moe_load_balancer: BaseMoeLoadBalancer | None = None
@@ -274,7 +283,9 @@ class ModelEngine:
             )
             # Open checkpoint and load the LLM module object.
             self.model, moe_load_balancer = self.model_loader.load(
-                checkpoint_dir=model_path, checkpoint_loader=checkpoint_loader
+                checkpoint_dir=model_path,
+                checkpoint_loader=checkpoint_loader,
+                defer_checkpoint=defer_checkpoint,
             )
             if isinstance(moe_load_balancer, BaseMoeLoadBalancer):
                 self.moe_load_balancer = moe_load_balancer
@@ -1077,6 +1088,27 @@ class ModelEngine:
         self._release_cuda_graphs()
         if isinstance(self._runner, DecoderRunner):
             self._runner.attn_metadata = None
+
+    @property
+    def has_deferred_checkpoint(self) -> bool:
+        """True while the model holds the dummy weights of a deferred checkpoint load."""
+        return self.model_loader is not None and self.model_loader.has_deferred_checkpoint
+
+    def rehearse(self, resource_manager: ResourceManager) -> None:
+        """Warmup forwards on the dummy weights, inside the caller's KernelBuilder
+        rehearsal, so the ops list their kernels; every rank calls it."""
+        if not isinstance(self._runner, DecoderRunner):
+            return
+        self.set_warmup_purpose("rehearsal")
+        with self.warmup_scope():
+            self._runner.rehearse(resource_manager)
+
+    def load_deferred_checkpoint(self) -> None:
+        """Load the checkpoint the model loader deferred, as a weight update does."""
+        self.unwrap_compiled_model_for_refit()
+        self.model_loader.load_deferred_checkpoint(self.model)
+        self.restore_compiled_model_after_refit(None)
+        self.invalidate_multimodal_encoder_cache()
 
     def unwrap_compiled_model_for_refit(self) -> None:
         """Release compiled state before refit.

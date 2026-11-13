@@ -440,6 +440,17 @@ class DecoderRunner(ScheduledModelRunner):
         self._eager_workspace_reclaimer = None
         self._eager_workspace_reclaimer = self._warmup.run(resource_manager)
 
+    def rehearse(self, resource_manager: ResourceManager) -> None:
+        """The warmup's rehearsal forwards. The state they bind to ``resource_manager``
+        (attention and speculative metadata, cached input copies) goes with it."""
+        try:
+            self._warmup.rehearse(resource_manager)
+        finally:
+            self.attn_metadata = None
+            self.spec_metadata = None
+            if self._h2d_cache is not None:
+                self._h2d_cache.clear()
+
     def release_graphs(self, *, release_nccl_window_owners: bool = True) -> None:
         self._graphs.release(release_nccl_window_owners=release_nccl_window_owners)
 

@@ -44,7 +44,11 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
+from tensorrt_llm._torch.flashinfer_utils import (
+    IS_FLASHINFER_AVAILABLE,
+    get_env_enable_pdl,
+    queue_flashinfer_module_build,
+)
 
 if IS_FLASHINFER_AVAILABLE:
     import flashinfer
@@ -54,6 +58,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionInputType,
 )
 from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import SkipSoftmaxParams
+from tensorrt_llm._torch.kernel_builder import KernelBuilder
 from tensorrt_llm._utils import get_sm_version, torch_dtype_to_binding
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal import thop
@@ -938,10 +943,22 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         )
         return [op for op in required_ops if not hasattr(thop, op)]
 
+    @staticmethod
+    def _rehearsing(params: FmhaParams) -> bool:
+        """In a KernelBuilder rehearsal no trtllm-gen kernel runs: the call queues the build
+        of their module on a KernelBuilder worker, and the output holds zeros."""
+        if not KernelBuilder.get().rehearsing():
+            return False
+        queue_trtllm_gen_fmha_module_build()
+        params.output.zero_()
+        return True
+
     def run_context(
         self,
         params: FmhaParams,
     ) -> None:
+        if self._rehearsing(params):
+            return
         attention_input = params.qkv_input if params.qkv_input is not None else params.query_input
         if attention_input is None:
             raise RuntimeError("trtllm-gen context requires QKV or query input.")
@@ -1103,6 +1120,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         self,
         params: FmhaParams,
     ) -> None:
+        if self._rehearsing(params):
+            return
         attention_input = params.qkv_input if params.qkv_input is not None else params.query_input
         if attention_input is None:
             raise RuntimeError("trtllm-gen generation requires QKV or query input.")
@@ -1275,6 +1294,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         params: FmhaParams,
     ) -> None:
         """MLA generation decode using flashinfer MLA kernel."""
+        if self._rehearsing(params):
+            return
         attn = params.attn
         meta = params.meta
         fwd = params.fwd
@@ -1371,3 +1392,16 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             uses_shared_paged_kv_idx=self.USE_SHARED_PAGED_KV_IDX,
             multi_ctas_kv_counter_buffer=self._get_multi_ctas_kv_counter_buffer(),
         )
+
+
+def queue_trtllm_gen_fmha_module_build() -> bool:
+    """Queue a build of FlashInfer's trtllm-gen FMHA module on a KernelBuilder worker thread.
+
+    The worker only builds it: loading it also installs FlashInfer's cubin loader, which the
+    thread that runs the kernels does on their first call.
+    """
+    if not IS_FLASHINFER_AVAILABLE:
+        return False
+    from flashinfer.jit import gen_trtllm_gen_fmha_module
+
+    return queue_flashinfer_module_build("trtllm_gen_fmha", gen_trtllm_gen_fmha_module)

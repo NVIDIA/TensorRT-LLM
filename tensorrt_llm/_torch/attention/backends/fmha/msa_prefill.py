@@ -21,6 +21,7 @@ module-scope import here would close a cycle.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 from types import ModuleType
 from typing import TYPE_CHECKING, Optional
@@ -147,7 +148,10 @@ def _aligned_nvfp4_dequant_scales(
     if cache.device != kv_scale_quant_orig.device:
         raise ValueError("MiniMax-M3 NVFP4 scale reload must preserve the scale buffer device")
     if refresh or getattr(attn, "_msa_nvfp4_dequant_scale_source_ptr", None) != source_ptr:
-        cache[:, 0].copy_(kv_scale_quant_orig[1:3])
+        # A buffer a forward created is an inference tensor, which only inference mode
+        # may update in place.
+        with torch.inference_mode() if cache.is_inference() else contextlib.nullcontext():
+            cache[:, 0].copy_(kv_scale_quant_orig[1:3])
         attn._msa_nvfp4_dequant_scale_source_ptr = source_ptr
 
     k_global_scale = cache[0, :1]
@@ -340,6 +344,13 @@ def run_msa_prefill_gqa(
             )
         if row_first != 0:
             raise ValueError("NVFP4 sparse prefill must cover the context prefix")
+        from tensorrt_llm._torch.kernel_builder import KernelBuilder
+
+        if KernelBuilder.get().rehearsing():
+            # A rehearsal runs none of it: the k2q CSR extension it loads builds on a
+            # KernelBuilder worker (msa_kernel_builds). The output holds zeros.
+            out_view.zero_()
+            return
         k_scale, v_scale = _aligned_nvfp4_dequant_scales(attn, kv_scale_quant_orig)
         run_msa_nvfp4_sparse_gqa(
             q_view,

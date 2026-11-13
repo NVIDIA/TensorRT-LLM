@@ -308,3 +308,25 @@ def test_sm107_serves_only_extra_page_sizes(
         assert supported is expected, reason
         if not expected:
             assert "SM107" in reason
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("run", ["run_context", "run_generation", "run_mla_generation"])
+def test_a_rehearsal_runs_no_trtllm_gen_kernel(monkeypatch: pytest.MonkeyPatch, run: str) -> None:
+    from tensorrt_llm._torch import kernel_builder
+    from tensorrt_llm._torch.attention.backends.fmha import flashinfer_trtllm_gen
+
+    builder = kernel_builder.KernelBuilder(threads=1, enabled=True)
+    monkeypatch.setattr(kernel_builder.KernelBuilder, "_instance", builder)
+    queued = []
+    monkeypatch.setattr(
+        flashinfer_trtllm_gen, "queue_trtllm_gen_fmha_module_build", lambda: queued.append(True)
+    )
+    fmha = FlashInferTrtllmGenFmha(FakeAttention())
+    # Nothing but the output: any step past it would fail on the missing inputs.
+    params = SimpleNamespace(output=torch.ones(4))
+    with builder.rehearsal():
+        getattr(fmha, run)(params)
+    # The call queued the build of the kernels' module instead of running them.
+    assert queued == [True]
+    assert torch.equal(params.output, torch.zeros(4))

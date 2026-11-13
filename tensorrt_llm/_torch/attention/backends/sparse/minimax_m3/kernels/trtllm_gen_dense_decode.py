@@ -28,6 +28,7 @@ import torch
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.paged_cache import (
     fp8_e4m3_saturate,
 )
+from tensorrt_llm._torch.kernel_builder import KernelBuilder
 from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
 
 from .msa_utils import check_decode_span_shape
@@ -271,6 +272,16 @@ def minimax_m3_trtllm_gen_dense_decode(
         int(seq_lens.shape[0]),
         decode_query_len,
     )
+    if KernelBuilder.get().rehearsing():
+        # A rehearsal runs no trtllm-gen kernel: the call queues the build of their module
+        # on a KernelBuilder worker, and the output holds zeros.
+        from tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen import (
+            queue_trtllm_gen_fmha_module_build,
+        )
+
+        queue_trtllm_gen_fmha_module_build()
+        output.zero_()
+        return
 
     kv_pool, subpages_per_slot = kv_cache_manager.get_kv_subpage_pool(layer_idx, "HND")
     num_heads = int(q.shape[1])

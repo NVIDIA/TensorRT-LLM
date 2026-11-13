@@ -203,6 +203,36 @@ curl http://localhost:8000/server_info
 }
 ```
 
+### Kernel builds ahead of first use
+
+An op that compiles its kernels on first use lists them when it runs, for every shape it
+sweeps down from that call's and has not listed yet, as the autotuner sweeps its tuning
+buckets; worker threads build them in parallel. An op that the autotuner tunes has three
+states: the autotuner warmup tunes it, a build state builds the kernels of every shape,
+runner and tactic its tuning will time on the same worker threads without timing them, and
+serving runs the tuned tactic.
+
+Where the checkpoint can load after them, the engine first loads dummy weights and runs the
+autotuner warmup's two forwards on them (a context batch at the maximum token count and one
+generation request) in the build state, then loads the checkpoint while the kernels the
+forwards listed build. It loads the checkpoint first with load formats other than AUTO, MX
+checkpoints, host-resident weights, a failed meta-device init, sleep mode, the MoE load
+balancer, DWDP, the multimodal encoders' CUDA graphs, Modeling V2 targets, encoder-only,
+pooling, multimodal-encoder and encoder-decoder models, and where the KV cache estimation is
+off.
+The startup log shows these as the `rehearsal`, `checkpoint` and `gpu_builds` phases,
+which `model_engine_creation_seconds` then does not include; `gpu_builds` waits for the
+builds that run kernels on the GPU. Supported ops: MiniMax-M3's MSA attention
+(`fmha_sm100`) and Triton sparse decode, FlashInfer's trtllm-gen FMHA, and in the build
+state, DeepGEMM's FP8 block-scale GEMMs on Blackwell and FlashInfer's MXFP8 GEMM.
+
+| Environment variable | Default | Effect |
+|----------------------|---------|--------|
+| `TLLM_KERNEL_BUILDER` | `1` | `0` compiles each kernel on its first use instead. |
+| `TLLM_KERNEL_BUILDER_REHEARSAL` | `1` | `0` loads the checkpoint first; the kernels a forward lists then build from the warmup on. |
+| `TLLM_KERNEL_BUILDER_AUTOTUNER` | `1` | `0` leaves the autotuned ops' kernels to the autotuner warmup. |
+| `TLLM_KERNEL_BUILDER_THREADS` | this rank's share of the CPUs, up to 32 | Worker threads per process. |
+
 ## Unified Cache for Compiled Artifacts
 
 Set `TRTLLM_CACHE_DIR` before importing TensorRT-LLM to place its compiled

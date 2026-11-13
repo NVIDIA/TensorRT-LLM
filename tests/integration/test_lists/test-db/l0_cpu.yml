@@ -216,6 +216,7 @@ l0_cpu:
   - unittest/_torch/flashinfer/test_flashinfer_cubin_pool.py
   - unittest/_torch/test_custom_config_registration.py
   - unittest/_torch/test_hf_quant_config.py
+  - unittest/_torch/test_kernel_builder.py
   - unittest/_torch/test_mmap_utils.py
   - unittest/_torch/test_connector.py
   - unittest/_torch/test_connector_adp.py
