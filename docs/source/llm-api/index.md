@@ -203,6 +203,32 @@ curl http://localhost:8000/server_info
 }
 ```
 
+### Capturing Generation CUDA Graphs in One Pass (Prototype)
+
+By default the model engine captures its generation CUDA graphs in two passes: the warmup-only pass
+runs every graph shape once, so that shared buffers such as the attention workspace reach their
+largest size before any graph bakes in their addresses, and the capture pass then warms up and
+captures each shape. Setting `TLLM_CUDA_GRAPH_SKIP_WARMUP_PASS=1` on every rank lets the final model
+engine skip the warmup-only pass:
+
+- Each shape still runs one eager warmup forward right before its capture. These forwards keep the
+  warmup MoE communication timeouts, each capture uses the serving ones, and the ranks line up
+  before each graph's first replay.
+- After the last capture, every rank checks that no captured graph's top-level attention or
+  speculative-decoding metadata tensor was reallocated, and the ranks agree on the result. If one
+  was on any rank, every rank discards the graphs and captures them again with both passes, so a
+  fallback costs one extra capture pass and logs a warning.
+- The check does not see other buffers, such as module buffers or tensors nested in the metadata.
+  Such a buffer that a smaller shape regrows after a larger shape's capture goes unnoticed, so
+  compare a model's outputs with and without the switch before relying on it.
+- The switch is ignored, with a warning, for LoRA CUDA graphs, FlashInfer MXFP8 decode GEMMs that
+  need autotuning, encoder-decoder models, DWDP and pipeline parallelism, and when not every rank
+  sets it. The KV cache estimation executor always uses both passes, so the KV cache size does not
+  depend on the switch.
+- With the switch, the final model engine's `gen_cuda_graph_capture_seconds` includes each shape's
+  eager warmup forward and, after a fallback, the discarded pass; `gen_cuda_graph_warmup_seconds`
+  then covers only a fallback's warmup-only pass.
+
 ## Unified Cache for Compiled Artifacts
 
 Set `TRTLLM_CACHE_DIR` before importing TensorRT-LLM to place its compiled

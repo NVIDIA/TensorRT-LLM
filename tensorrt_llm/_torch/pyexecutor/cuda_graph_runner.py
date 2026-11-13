@@ -832,13 +832,24 @@ class CUDAGraphRunner:
                 (key.batch_size * self.max_beam_width - key.num_contexts) *
                 token_per_generation)
 
-    def capture(self,
-                key: KeyType,
-                forward_fn: Callable,
-                initial_inputs: Dict[str, Any],
-                enable_spec_decode: bool = False,
-                postprocess_fn: Optional[Callable] = None) -> Any:
-        """Warm up and/or capture the forward pass for a graph key."""
+    def capture(
+        self,
+        key: KeyType,
+        forward_fn: Callable,
+        initial_inputs: Dict[str, Any],
+        enable_spec_decode: bool = False,
+        postprocess_fn: Optional[Callable] = None,
+        capture_scope: Callable[
+            [], contextlib.AbstractContextManager] = contextlib.nullcontext,
+        record_tensor_ptrs: bool = False,
+    ) -> Any:
+        """Warm up and/or capture the forward pass for a graph key.
+
+        ``capture_scope`` encloses the graph capture but not the warmup
+        forwards before it. It is entered before the stream capture begins, so
+        it may switch the MoE communication timeouts. ``record_tensor_ptrs``
+        records the graph's metadata tensor addresses for moved_graph_tensors().
+        """
         batch_size = key.batch_size
         # [CUDA graph spec decode padding]
         # We pad input IDs/position IDs to the maximum draft length (token per request).
@@ -925,15 +936,15 @@ class CUDAGraphRunner:
             # setup/capture; release its reference before entering.
             output = None
             graph_pool = self.memory_pool or torch.cuda.graph_pool_handle()
-            with nccl_window_graph_capture(graph, graph_pool):
+            with capture_scope(), nccl_window_graph_capture(graph, graph_pool):
                 # A pre-replay hook reads the static inputs before the replay, so their copies must land before it.
                 prologue_pack = (None if self._pre_replay_hooks else
                                  step_inputs.capture_prologue())
                 if prologue_pack is not None:
                     self._step_input_prologue_keys[key] = prologue_pack
                 output = forward_fn(capture_inputs)
-            # The addresses the graph baked in, for the strict buffer check.
-            self._record_strict_buffer_snapshot(key)
+            if record_tensor_ptrs or _STRICT_BUFFER_CHECK:
+                self._record_graph_tensor_ptrs(key)
             _restore_spec_decode_capture_state(attn_metadata,
                                                saved_kv_lens_cuda)
 
@@ -1111,20 +1122,23 @@ class CUDAGraphRunner:
 
         These are the addresses the captured graph's kernels may have baked
         in; any of them changing before a later replay means the graph would
-        read stale (or freed) memory. obj.graph_temporary_attrs are skipped.
+        read stale (or freed) memory. obj.graph_temporary_attrs are skipped,
+        and an object without a __dict__ records nothing.
         """
         graph_temporary_attrs = getattr(obj, "graph_temporary_attrs", ())
         return {
             name: value.data_ptr()
-            for name, value in vars(obj).items()
+            for name, value in getattr(obj, "__dict__", {}).items()
             if isinstance(value, torch.Tensor) and value.is_cuda
             and name not in graph_temporary_attrs
         }
 
     @staticmethod
-    def _assert_graph_tensor_ptrs_stable(obj: Any,
-                                         expected_ptrs: Dict[str, int]) -> None:
-        """Raise if any tensor captured by _snapshot_graph_tensor_ptrs has moved.
+    def _moved_graph_tensors(
+            obj: Any,
+            expected_ptrs: Dict[str, int]) -> Iterator[Tuple[str, Any, int]]:
+        """Yield (name, live value, captured data_ptr) for each tensor captured by
+        _snapshot_graph_tensor_ptrs that is no longer at its captured address.
 
         Attributes in obj.draft_replay_swapped_attrs are deliberately rebound
         to draft KV cache buffers for the duration of a draft replay, so their
@@ -1135,25 +1149,47 @@ class CUDAGraphRunner:
         for name, expected_ptr in expected_ptrs.items():
             value = (swapped_attrs[name] if name in swapped_attrs else getattr(
                 obj, name, None))
+            if (not isinstance(value, torch.Tensor)
+                    or value.data_ptr() != expected_ptr):
+                yield name, value, expected_ptr
+
+    @staticmethod
+    def _assert_graph_tensor_ptrs_stable(obj: Any,
+                                         expected_ptrs: Dict[str, int]) -> None:
+        """Raise if any tensor captured by _snapshot_graph_tensor_ptrs has moved."""
+        for name, value, expected_ptr in CUDAGraphRunner._moved_graph_tensors(
+                obj, expected_ptrs):
             if not isinstance(value, torch.Tensor):
                 raise RuntimeError(
                     f"CUDA graph metadata attribute `{type(obj).__name__}."
                     f"{name}` was a tensor at capture time but is now "
                     f"{type(value).__name__}. Graph-visible buffers must be "
                     "updated in place, not rebound.")
-            if value.data_ptr() != expected_ptr:
-                raise RuntimeError(
-                    f"CUDA graph metadata tensor `{type(obj).__name__}."
-                    f"{name}` was reallocated between capture and replay "
-                    f"(data_ptr 0x{expected_ptr:x} -> 0x{value.data_ptr():x}). "
-                    "Graph-visible buffers must be updated in place; "
-                    "rebinding invalidates addresses baked into the captured "
-                    "CUDA graph.")
+            raise RuntimeError(
+                f"CUDA graph metadata tensor `{type(obj).__name__}."
+                f"{name}` was reallocated between capture and replay "
+                f"(data_ptr 0x{expected_ptr:x} -> 0x{value.data_ptr():x}). "
+                "Graph-visible buffers must be updated in place; "
+                "rebinding invalidates addresses baked into the captured "
+                "CUDA graph.")
 
-    def _record_strict_buffer_snapshot(self, key: KeyType) -> None:
-        """Snapshot graph-visible tensor addresses for key, if strict checking is enabled."""
-        if not _STRICT_BUFFER_CHECK:
-            return
+    def moved_graph_tensors(self) -> List[str]:
+        """Name each graph-visible metadata tensor that moved since its graph was captured."""
+        moved = []
+        for key, stored_meta in self.graph_metadata.items():
+            for owner in ("attn_metadata", "spec_metadata"):
+                expected_ptrs = stored_meta.get(f"{owner}_ptrs")
+                if expected_ptrs is None:
+                    continue
+                obj = stored_meta[owner]
+                moved.extend(f"{type(obj).__name__}.{name} (graph batch size "
+                             f"{key.batch_size}, draft length {key.draft_len})"
+                             for name, _, _ in self._moved_graph_tensors(
+                                 obj, expected_ptrs))
+        return moved
+
+    def _record_graph_tensor_ptrs(self, key: KeyType) -> None:
+        """Snapshot the graph-visible tensor addresses the graph for key baked in."""
         stored_meta = self.graph_metadata[key]
         stored_meta["attn_metadata_ptrs"] = self._snapshot_graph_tensor_ptrs(
             stored_meta["attn_metadata"])

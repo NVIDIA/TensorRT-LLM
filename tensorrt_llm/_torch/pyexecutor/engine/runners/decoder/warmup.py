@@ -537,7 +537,11 @@ class DecoderWarmup:
             gc.collect()
             torch.cuda.empty_cache()
         with self._warmup_timer.phase("cuda_graph_capture"):
-            self._graphs.warmup_and_capture(resource_manager)
+            # KV-cache estimation always uses both passes, so the KV-cache size ignores the switch.
+            self._graphs.warmup_and_capture(
+                resource_manager,
+                allow_single_pass=not getattr(kv_cache_manager, "is_estimating_kv_cache", False),
+            )
         log_mem_snapshot("warmup/after_cuda_graph_capture")
         # Pre-compile DeepGEMM paged_mqa_logits_metadata for every 32-aligned
         # batch bucket the runtime can produce (max_batch_size scaled by the
