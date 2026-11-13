@@ -46,7 +46,10 @@ from tensorrt_llm._torch.speculative import (
     restore_attn_metadata_after_draft_replay,
 )
 from tensorrt_llm._torch.speculative.utils import get_static_draft_len
-from tensorrt_llm._torch.utils import get_per_request_prefill_cuda_graph_flag
+from tensorrt_llm._torch.utils import (
+    get_per_request_prefill_cuda_graph_flag,
+    is_batch_shape_deterministic,
+)
 from tensorrt_llm.inputs.multimodal import _has_mm_payload_keys
 from tensorrt_llm.llmapi.llm_args import BaseSparseAttentionConfig, PrefillCudaGraphBackend
 from tensorrt_llm.logger import logger
@@ -457,6 +460,9 @@ class DecoderCudaGraphs:
             # fresh final-context row would skip its cache-slot reset.
             and not self._model_uses_ple_recurrent_state
             and self.mapping.cp_size == 1
+            # The decode kernels round differently from the context kernels, so
+            # promotion would make a repeat differ from the prompt's first call.
+            and not is_batch_shape_deterministic()
         ):
             return scheduled_requests, frozenset()
         return _make_single_token_context_graph_batch(

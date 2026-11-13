@@ -311,6 +311,30 @@ def test_llm_prefix_cache_reuse(attn_backend):
 
 @skip_ray
 @pytest.mark.part3
+def test_llm_kv_reuse_deterministic_logits(monkeypatch):
+    monkeypatch.setenv("FORCE_KV_REUSE_DETERMINISTIC", "1")
+    model_path = get_model_path("Qwen3/Qwen3-0.6B")
+    prompt = "The future of AI is " * 20
+    sampling_params = SamplingParams(temperature=0,
+                                     max_tokens=1,
+                                     ignore_eos=True,
+                                     return_generation_logits=True)
+
+    with LLM(
+            model=model_path,
+            kv_cache_config=KvCacheConfig(enable_block_reuse=True),
+            gather_generation_logits=True,
+    ) as llm:
+        cold, warm, again = (llm.generate(
+            prompt, sampling_params).outputs[0].generation_logits
+                             for _ in range(3))
+
+    assert torch.equal(cold, warm)
+    assert torch.equal(warm, again)
+
+
+@skip_ray
+@pytest.mark.part3
 def test_llm_prometheus():
     test_prompts = [
         "Hello, my name is",

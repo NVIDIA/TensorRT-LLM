@@ -49,8 +49,9 @@ from ..locality_domain.policy import (DISABLED_PLAN, LinearPartitionPlan,
 from ..locality_domain.runtime import LocalityDomainRuntime
 from ..locality_domain_utils import _copy_to_new_cuda_allocation
 from ..utils import (Fp4QuantizedTensor, Fp8PerTokenQuantizedTensor,
-                     get_model_extra_attrs, is_torch_compiling,
-                     replace_parameter_and_save_metadata, unswizzle_sf)
+                     get_model_extra_attrs, is_batch_shape_deterministic,
+                     is_torch_compiling, replace_parameter_and_save_metadata,
+                     unswizzle_sf)
 from .low_m_gemm import (_should_apply_low_m_gemm, apply_low_m_gemm,
                          low_m_gemm_dispatcher)
 
@@ -665,6 +666,34 @@ class LinearMethodBase(ABC):
         return 1
 
 
+# Rows in every GEMM when a row's output must not depend on its batch shape.
+# Larger values pad short batches more, smaller ones split long prompts into
+# more GEMMs.
+FIXED_GEMM_HEIGHT = 64
+
+
+def _fixed_height_linear(input: torch.Tensor, weight: torch.Tensor,
+                         bias: Optional[torch.Tensor]) -> torch.Tensor:
+    """Apply a linear layer with every GEMM at ``FIXED_GEMM_HEIGHT`` rows.
+
+    cuBLAS picks its kernel from the matrix shape and kernels round differently,
+    so one row can produce different bits at different batch heights. Short
+    chunks are padded and the padding rows are dropped from the output.
+    """
+    rows = input.reshape(-1, input.shape[-1])
+    if rows.shape[0] == 0:
+        return F.linear(input, weight, bias)
+    outputs = []
+    for start in range(0, rows.shape[0], FIXED_GEMM_HEIGHT):
+        chunk = rows[start:start + FIXED_GEMM_HEIGHT]
+        count = chunk.shape[0]
+        if count < FIXED_GEMM_HEIGHT:
+            padding = chunk[-1:].expand(FIXED_GEMM_HEIGHT - count, -1)
+            chunk = torch.cat((chunk, padding))
+        outputs.append(F.linear(chunk, weight, bias)[:count])
+    return torch.cat(outputs).view(*input.shape[:-1], -1)
+
+
 class UnquantizedLinearMethod(LinearMethodBase):
     """Linear method for unquantized (BF16 / FP16 / FP32) weights.
 
@@ -767,6 +796,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 out_dtype=None,
                 output_buffer_kind=output_buffer_kind,
                 group=group)
+        elif getattr(module, "use_fixed_height_gemm", False):
+            output = _fixed_height_linear(input, weight, bias)
         else:
             output = F.linear(input, weight, bias)
         return output
@@ -4403,6 +4434,7 @@ class Linear(nn.Module):
         self.reduce_output = reduce_output
         self._output_slice_cache: Optional[Fp8BlockScaleWeightSliceCache] = None
         self.use_custom_cublas_mm = use_custom_cublas_mm
+        self.use_fixed_height_gemm = is_batch_shape_deterministic()
         self.use_cute_dsl_bf16_gemm = use_cute_dsl_bf16_gemm
         self.lora = lora
 

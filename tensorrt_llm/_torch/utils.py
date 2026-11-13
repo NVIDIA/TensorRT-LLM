@@ -63,6 +63,12 @@ def is_gdn_flashinfer_replay_required() -> bool:
     return os.environ.get("TRTLLM_USE_GDN_FLASHINFER_REPLAY", "0") == "force"
 
 
+def is_batch_shape_deterministic() -> bool:
+    """Return whether a row's output must not depend on the batch shape it ran in."""
+    return (os.environ.get("FORCE_DETERMINISTIC", "0") == "1"
+            or os.environ.get("FORCE_KV_REUSE_DETERMINISTIC", "0") == "1")
+
+
 # IMPORTANT: Keep the same order of activation functions in this enum and the enum in
 # cpp/tensorrt_llm/kernels/cutlass_kernels/include/common.h
 class ActivationType(IntEnum):

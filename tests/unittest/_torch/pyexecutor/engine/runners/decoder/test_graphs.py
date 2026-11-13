@@ -58,6 +58,43 @@ def test_cuda_graph_factory_preserves_input_preparer(
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("switch", ["FORCE_DETERMINISTIC", "FORCE_KV_REUSE_DETERMINISTIC"])
+def test_batch_shape_determinism_keeps_final_context_on_context_path(
+    monkeypatch: pytest.MonkeyPatch, switch: str
+) -> None:
+    for name in ("FORCE_DETERMINISTIC", "FORCE_KV_REUSE_DETERMINISTIC"):
+        monkeypatch.delenv(name, raising=False)
+    batch = ScheduledRequests()
+    batch.context_requests_last_chunk = [_make_request_stub(10, prompt_len=1)]
+    graphs = SimpleNamespace(
+        cuda_graph_runner=SimpleNamespace(enabled=True),
+        _config=SimpleNamespace(max_beam_width=1, spec_config=None),
+        _context_promotion_supported=True,
+        _model_uses_ple_recurrent_state=False,
+        mapping=SimpleNamespace(cp_size=1),
+        _is_final_multimodal_context_decode_compatible=lambda request: True,
+    )
+
+    def promote() -> tuple[ScheduledRequests, frozenset[int]]:
+        return DecoderCudaGraphs.promote_final_contexts(
+            graphs,
+            batch,
+            SimpleNamespace(),
+            enable_spec_decode=False,
+            runtime_draft_len=0,
+            ced_enabled=False,
+        )
+
+    assert promote()[1] == frozenset({10})
+
+    monkeypatch.setenv(switch, "1")
+    graph_batch, promoted_ids = promote()
+
+    assert graph_batch is batch
+    assert promoted_ids == frozenset()
+
+
+@pytest.mark.cpu_only
 class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
     def test_generation_only_is_identity(self) -> None:
         generation = _make_request_stub(1)

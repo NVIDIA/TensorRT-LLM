@@ -74,6 +74,17 @@ scheduler_config:
   enable_prefix_aware_scheduling: false
 ```
 
+### Reproducible Logits With Block Reuse
+
+Block reuse does not change which tokens a request attends to, but it can change the low-order bits of the result. A request that reuses a cached prefix computes only the remaining tokens, so its layers run at a different batch height than the first call for that prompt did. Two effects make the results differ:
+
+- cuBLAS picks a GEMM kernel from the matrix shape and different kernels round differently, so the same row of a `Linear` layer can produce different bits at different batch heights.
+- With CUDA graphs enabled, a request with one uncached prompt token left runs on the decode attention path instead of the context path.
+
+The first call for a prompt and its repeats can therefore return slightly different logits, occasionally enough to change the most likely token and the text that follows. The batch height effect also applies when a request shares a batch with different requests, even with block reuse disabled.
+
+To make logits independent of cache state and batch shape, set both `FORCE_KV_REUSE_DETERMINISTIC=1` and `FORCE_ATTENTION_KERNEL_DETERMINISTIC=1` before the process starts. The first keeps block reuse, runs unquantized `Linear` layers on the default GEMM path as GEMMs of one fixed height, and keeps the final prompt token on the context path. The second turns off multi-block decode attention, whose layout otherwise depends on the load. Both lower throughput, so they are off by default. `FORCE_DETERMINISTIC=1` applies both and also disables block reuse. Decode can still differ when the KV cache is too small for the concurrent requests. Quantized `Linear` layers, and layers that use the CuTe DSL, low-M or custom cuBLAS GEMM kernels, are not covered.
+
 ### Selecting the KV Cache Manager
 
 ```{warning}
