@@ -4,7 +4,6 @@
 """TRTLLM FP4 MLA helper tests."""
 
 from types import SimpleNamespace
-from unittest.mock import create_autospec
 
 import pytest
 import torch
@@ -40,8 +39,6 @@ from tensorrt_llm._torch.attention.backends.fp4_mla import (
 )
 from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import Fp4MlaKVCacheManagerV2
 from tensorrt_llm._torch.attention.backends.fp4_mla.config import (
-    FP4_MLA_PREPACK_V_ENV,
-    FP4_MLA_TRITON_PREPACK_V_ENV,
     fp4_mla_generation_backend_supported,
 )
 from tensorrt_llm._torch.attention.backends.fp4_mla.fp4_mla_context import (
@@ -2872,7 +2869,6 @@ def _assert_fp4_mla_attention_decode_accuracy(
     enable_block_reuse: bool = False,
     packed_queries: bool = False,
     split_kv: int | None = None,
-    expected_prepack_v: bool | None = None,
     runtime_metadata: bool = False,
     expected_page_stride: int | None = None,
     query_scale: float = 0.25,
@@ -2911,11 +2907,6 @@ def _assert_fp4_mla_attention_decode_accuracy(
             )
         if expected_page_stride is not None:
             assert metadata.fp4_mla_state.page_table_stride == expected_page_stride
-        if expected_prepack_v is not None:
-            v_packed = metadata.fp4_mla_state.workspaces.get(
-                fp4_mla_v_cache._triton_v_packed_attr(0)
-            )
-            assert (v_packed is not None) is expected_prepack_v
         v_packed_pool = fp4_mla_backend._get_fp4_mla_v_packed_pool(metadata, 0)
         assert (v_packed_pool is None) is (backend == "triton" or fused_v_transpose)
 
@@ -2938,6 +2929,8 @@ def _assert_fp4_mla_attention_decode_accuracy(
             q_batch_capacity=metadata.fp4_mla_state.q_batch_capacity,
             softmax_stats_tensor=softmax_stats,
         )
+        if backend == "triton":
+            assert not any("v_packed" in name for name in metadata.fp4_mla_state.workspaces)
         torch.cuda.synchronize()
 
         ref_output, ref_softmax_stats = _fp4_mla_attention_decode_reference(
@@ -3046,7 +3039,9 @@ def test_fp4_mla_attention_decode_cutedsl_matches_reference(
     _fp4_mla_triton_unavailable(),
     reason="requires SM100, SM103 or SM107 for Triton FP4 MLA",
 )
-@pytest.mark.parametrize("prepack_v", [False, True], ids=["default", "prepack-v"])
+@pytest.mark.parametrize(
+    "legacy_prepack_env", [None, "TRTLLM_FP4_MLA_PREPACK_V", "TRTLLM_FP4_MLA_TRITON_PREPACK_V"]
+)
 @pytest.mark.parametrize(
     "num_heads,query_len_per_seq,seq_lens",
     [
@@ -3060,14 +3055,13 @@ def test_fp4_mla_attention_decode_triton_matches_reference(
     num_heads: int,
     seq_lens: list[int],
     query_len_per_seq: int,
-    prepack_v: bool,
+    legacy_prepack_env: str | None,
 ) -> None:
     """The fused generation update quantizes Q for the triton decode on SM100/SM103."""
-    monkeypatch.delenv(FP4_MLA_PREPACK_V_ENV, raising=False)
-    if prepack_v:
-        monkeypatch.setenv(FP4_MLA_TRITON_PREPACK_V_ENV, "1")
-    else:
-        monkeypatch.delenv(FP4_MLA_TRITON_PREPACK_V_ENV, raising=False)
+    monkeypatch.delenv("TRTLLM_FP4_MLA_PREPACK_V", raising=False)
+    monkeypatch.delenv("TRTLLM_FP4_MLA_TRITON_PREPACK_V", raising=False)
+    if legacy_prepack_env is not None:
+        monkeypatch.setenv(legacy_prepack_env, "1")
     _assert_fp4_mla_attention_decode_accuracy(
         monkeypatch,
         backend="triton",
@@ -3076,14 +3070,11 @@ def test_fp4_mla_attention_decode_triton_matches_reference(
         seq_lens=seq_lens,
         seed=29,
         query_len_per_seq=query_len_per_seq,
-        expected_prepack_v=prepack_v,
     )
 
 
 @pytest.mark.skipif(_fp4_mla_triton_unavailable(), reason="requires Triton FP4 MLA")
 def test_fp4_mla_eager_decode_keeps_exact_page_capacity(monkeypatch) -> None:
-    monkeypatch.delenv(FP4_MLA_PREPACK_V_ENV, raising=False)
-    monkeypatch.delenv(FP4_MLA_TRITON_PREPACK_V_ENV, raising=False)
     _assert_fp4_mla_attention_decode_accuracy(
         monkeypatch,
         backend="triton",
@@ -3105,11 +3096,11 @@ def test_fp4_mla_decode_bounds_reduce_specializations_across_batches(monkeypatch
         fp4_mla_triton._fp4_mla_attention_reduce_stats_kernel,
         fp4_mla_triton._fp4_mla_attention_group_reduce_stats_kernel,
     ]
-    monkeypatch.delenv(FP4_MLA_PREPACK_V_ENV, raising=False)
-    monkeypatch.delenv(FP4_MLA_TRITON_PREPACK_V_ENV, raising=False)
     compiled = None
     target_ctas = 3 * torch.cuda.get_device_properties(0).multi_processor_count
-    batches = (max(1, target_ctas // 64), (target_ctas + 47) // 48, (target_ctas + 39) // 40)
+    # Cross group-length boundaries (2, 3 and 5 pages on B200/B300) while
+    # keeping the page capacity and reduction tensor alignment unchanged.
+    batches = tuple(target_ctas // groups + 1 for groups in (64, 32, 16))
     for batch_size in batches:
         _assert_fp4_mla_attention_decode_accuracy(
             monkeypatch,
@@ -3132,8 +3123,6 @@ def test_fp4_mla_decode_bounds_reduce_specializations_across_batches(monkeypatch
 def test_fp4_mla_decode_reuses_pv_specializations_across_page_counts(monkeypatch) -> None:
     from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_triton
 
-    monkeypatch.delenv(FP4_MLA_PREPACK_V_ENV, raising=False)
-    monkeypatch.delenv(FP4_MLA_TRITON_PREPACK_V_ENV, raising=False)
     kernel = fp4_mla_triton._fp4_mla_attention_pv_kernel
     compiled = None
     for pages in (68, 76, 84):
@@ -3170,8 +3159,8 @@ def test_fp4_mla_decode_graphs_share_runner_scratch_and_match_reference(
     from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 
     monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
-    monkeypatch.delenv(FP4_MLA_PREPACK_V_ENV, raising=False)
-    monkeypatch.delenv(FP4_MLA_TRITON_PREPACK_V_ENV, raising=False)
+    monkeypatch.setenv("TRTLLM_FP4_MLA_PREPACK_V", "1")
+    monkeypatch.setenv("TRTLLM_FP4_MLA_TRITON_PREPACK_V", "1")
     seq_len = 68 * FP4_MLA_TOKENS_PER_BLOCK - 1
     kernel_launches = []
 
@@ -3304,7 +3293,7 @@ def test_fp4_mla_decode_graphs_share_runner_scratch_and_match_reference(
                     ]
                     assert len(grouped) == 1, kernel_launches
                     groups = grouped[0]["grid"][2]
-                    assert groups > 1 and groups & (groups - 1), grouped
+                    assert 1 < groups <= 64 and groups & (groups - 1) == 0, grouped
                     split_pv = [
                         entry
                         for entry in kernel_launches
@@ -3321,6 +3310,8 @@ def test_fp4_mla_decode_graphs_share_runner_scratch_and_match_reference(
             torch.testing.assert_close(
                 output.float(), reference[: output.shape[0]], rtol=0.15, atol=0.15
             )
+        for _, _, metadata in captured:
+            assert not any("v_packed" in name for name in metadata.fp4_mla_state.workspaces)
         first_state = captured[0][2].fp4_mla_state
         second_state = captured[1][2].fp4_mla_state
         for name in (
@@ -3342,30 +3333,6 @@ def test_fp4_mla_decode_graphs_share_runner_scratch_and_match_reference(
         _reset_triton_allocator()
         manager.shutdown()
         torch.cuda.synchronize()
-
-
-@pytest.mark.cpu_only
-def test_fp4_mla_triton_prepack_v_is_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
-    warnings = []
-    warning = create_autospec(
-        fp4_mla_v_cache.logger.warning_once,
-        side_effect=lambda *messages, key: warnings.append(" ".join(messages)),
-    )
-    monkeypatch.setattr(fp4_mla_v_cache.logger, "warning_once", warning)
-    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
-    monkeypatch.delenv(FP4_MLA_PREPACK_V_ENV, raising=False)
-    monkeypatch.delenv(FP4_MLA_TRITON_PREPACK_V_ENV, raising=False)
-    assert not fp4_mla_v_cache._triton_prepack_v_enabled()
-
-    monkeypatch.setenv(FP4_MLA_TRITON_PREPACK_V_ENV, "1")
-    assert fp4_mla_v_cache._triton_prepack_v_enabled()
-    assert len(warnings) == 1
-    assert "outside the KV cache budget" in warnings[0]
-    monkeypatch.delenv(FP4_MLA_TRITON_PREPACK_V_ENV)
-    monkeypatch.setenv(FP4_MLA_PREPACK_V_ENV, "1")
-    assert fp4_mla_v_cache._triton_prepack_v_enabled()
-    monkeypatch.setenv(FP4_MLA_TRITON_PREPACK_V_ENV, "0")
-    assert not fp4_mla_v_cache._triton_prepack_v_enabled()
 
 
 @pytest.mark.cpu_only

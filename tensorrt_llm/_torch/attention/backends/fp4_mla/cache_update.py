@@ -51,7 +51,6 @@ from .layout import (
 )
 from .metadata import (
     _fp4_mla_generation_hp_page_ids,
-    _fp4_mla_generation_num_blocks_device,
     _fp4_mla_generation_page_ids,
     _fp4_mla_uniform_generation_lengths,
     _materialize_fp4_mla_device_page_table_for_forward,
@@ -60,7 +59,6 @@ from .packed_plan import _fp4_mla_helix_plan_bounds, _fp4_mla_packed_plan_geomet
 from .v_cache import (
     _get_cutedsl_persistent_v_packed_cache,
     _get_fp4_mla_v_packed_pool_base,
-    _maybe_update_triton_v_packed_cache,
     _repack_cutedsl_v_packed_cache,
 )
 
@@ -1009,7 +1007,6 @@ def scatter_fp4_mla_kv_cache(
                     "FP4 MLA V-packed layer view does not match its stable "
                     "full-pool base and page offset."
                 )
-    v_pack_num_valid = None
     if phase == "context":
         _materialize_fp4_mla_device_page_table_for_forward(metadata)
         hp_pool_updated = _scatter_fp4_mla_kv_cache_2d_context(
@@ -1064,10 +1061,6 @@ def scatter_fp4_mla_kv_cache(
         v_pack_page_ids = _fp4_mla_generation_page_ids(
             metadata, metadata.num_seqs - metadata.num_contexts
         )
-        if getattr(metadata, "is_cuda_graph", False):
-            # Frozen launch grids cannot follow the per-replay page count;
-            # the repack kernels stride over this device-side count instead.
-            v_pack_num_valid = _fp4_mla_generation_num_blocks_device(metadata)
     cutedsl_repack_page_indptr = None
     cutedsl_repack_kv_lens = None
     cutedsl_repack_generation_lens = None
@@ -1116,18 +1109,6 @@ def scatter_fp4_mla_kv_cache(
         )
     if context_only_cache:
         return hp_pool_updated
-    _maybe_update_triton_v_packed_cache(
-        metadata,
-        layer_idx,
-        kv_cache,
-        v_pack_page_ids,
-        num_queries=num_tokens,
-        v_head_dim=v_head_dim,
-        page_size=metadata.page_size,
-        local_layer=local_layer,
-        v_sf=v_sf[local_layer],
-        num_valid_pages=v_pack_num_valid,
-    )
     if phase == "generation":
         metadata.fp4_mla_state.generation_cache_scattered = hp_pool_updated
     return hp_pool_updated

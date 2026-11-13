@@ -66,7 +66,6 @@ class Fp4MlaState:
     num_context_blocks: int = 0
     num_generation_blocks: int = 0
     workspaces: dict[str, torch.Tensor] = field(default_factory=dict)
-    v_packed_cache_tags: dict[str, tuple] = field(default_factory=dict)
 
     @property
     def paged_kv_indices(self) -> torch.Tensor:

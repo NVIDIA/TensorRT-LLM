@@ -20,13 +20,8 @@ or any private-Triton extension):
   perfect (NUM_HEADS=128, BLOCK_H=128) case used by page-stats and PV.
 * ``tl.assume()`` stride hints in front of every ``make_tensor_descriptor``
   call -- helps Triton vectorize TMA loads.
-* Optional prepacked-V PV path using ``tl.make_tensor_descriptor`` only. It
-  stores V as ``[page, dim-block, v, packed-token-pair]`` so PV can skip the
-  per-query V transpose/repack inside the page loop.
 * Pipelined PV loop via ``tl.range(..., num_stages=PV_LOOP_STAGES)``.
 """
-
-from typing import Any, Optional
 
 import triton
 import triton.language as tl
@@ -140,255 +135,6 @@ def _fp4_e2m1_quantize_packed(even, odd):
         dtype=tl.uint8,
         is_pure=True,
         pack=1,
-    )
-
-
-@triton.jit
-def _fp4_mla_attention_v_repack_kernel(
-    v_packed_ptr,
-    kv_cache_ptr,
-    num_pages,
-    kv_s0,
-    kv_s2,
-    kv_s4,
-    V_HEAD_D: tl.constexpr,
-    PAGE_SIZE: tl.constexpr,
-    BLOCK_V: tl.constexpr,
-    occupancy: tl.constexpr = 1,
-):
-    page_idx = tl.program_id(0)
-    dim_block = tl.program_id(1)
-
-    tl.assume(kv_s0 % 8 == 0)
-    tl.assume(kv_s2 % 8 == 0)
-    tl.assume(kv_s4 == 1)
-    v_desc = tl.make_tensor_descriptor(
-        kv_cache_ptr,
-        shape=[num_pages, PAGE_SIZE, V_HEAD_D // 2],
-        strides=[kv_s0, kv_s2, kv_s4],
-        block_shape=[1, PAGE_SIZE, BLOCK_V // 2],
-    )
-    v_tile = v_desc.load(
-        [
-            page_idx.to(tl.int32),
-            0,
-            (dim_block * (BLOCK_V // 2)).to(tl.int32),
-        ]
-    )
-    v_tile = tl.reshape(v_tile, (PAGE_SIZE, BLOCK_V // 2))
-    v_pairs = tl.reshape(v_tile.T, (BLOCK_V // 2, PAGE_SIZE // 2, 2))
-    even_packed, odd_packed = tl.split(v_pairs)
-    low_vals = _fp4_pack_low_nibbles(even_packed, odd_packed)
-    high_vals = _fp4_pack_high_nibbles(even_packed, odd_packed)
-    v_vals = tl.reshape(
-        tl.join(low_vals, high_vals).permute(0, 2, 1),
-        (BLOCK_V, PAGE_SIZE // 2),
-    )
-
-    out_desc = tl.make_tensor_descriptor(
-        v_packed_ptr,
-        shape=[num_pages * (V_HEAD_D // BLOCK_V) * BLOCK_V, PAGE_SIZE // 2],
-        strides=[PAGE_SIZE // 2, 1],
-        block_shape=[BLOCK_V, PAGE_SIZE // 2],
-    )
-    row_base = (page_idx * (V_HEAD_D // BLOCK_V) + dim_block) * BLOCK_V
-    out_desc.store([row_base.to(tl.int32), 0], v_vals)
-
-
-@triton.jit
-def _fp4_mla_attention_v_repack_pages_kernel(
-    v_packed_ptr,
-    kv_cache_ptr,
-    page_ids_ptr,
-    num_pages,
-    kv_s0,
-    kv_s2,
-    kv_s4,
-    V_HEAD_D: tl.constexpr,
-    PAGE_SIZE: tl.constexpr,
-    BLOCK_V: tl.constexpr,
-    occupancy: tl.constexpr = 1,
-):
-    page_list_idx = tl.program_id(0)
-    dim_block = tl.program_id(1)
-    page_idx = tl.load(page_ids_ptr + page_list_idx).to(tl.int64)
-
-    tl.assume(kv_s0 % 8 == 0)
-    tl.assume(kv_s2 % 8 == 0)
-    tl.assume(kv_s4 == 1)
-    v_desc = tl.make_tensor_descriptor(
-        kv_cache_ptr,
-        shape=[num_pages, PAGE_SIZE, V_HEAD_D // 2],
-        strides=[kv_s0, kv_s2, kv_s4],
-        block_shape=[1, PAGE_SIZE, BLOCK_V // 2],
-    )
-    v_tile = v_desc.load(
-        [
-            page_idx.to(tl.int32),
-            0,
-            (dim_block * (BLOCK_V // 2)).to(tl.int32),
-        ]
-    )
-    v_tile = tl.reshape(v_tile, (PAGE_SIZE, BLOCK_V // 2))
-    v_pairs = tl.reshape(v_tile.T, (BLOCK_V // 2, PAGE_SIZE // 2, 2))
-    even_packed, odd_packed = tl.split(v_pairs)
-    low_vals = _fp4_pack_low_nibbles(even_packed, odd_packed)
-    high_vals = _fp4_pack_high_nibbles(even_packed, odd_packed)
-    v_vals = tl.reshape(
-        tl.join(low_vals, high_vals).permute(0, 2, 1),
-        (BLOCK_V, PAGE_SIZE // 2),
-    )
-
-    out_desc = tl.make_tensor_descriptor(
-        v_packed_ptr,
-        shape=[num_pages * (V_HEAD_D // BLOCK_V) * BLOCK_V, PAGE_SIZE // 2],
-        strides=[PAGE_SIZE // 2, 1],
-        block_shape=[BLOCK_V, PAGE_SIZE // 2],
-    )
-    row_base = (page_idx * (V_HEAD_D // BLOCK_V) + dim_block) * BLOCK_V
-    out_desc.store([row_base.to(tl.int32), 0], v_vals)
-
-
-@triton.jit
-def _fp4_mla_attention_v_repack_pages_dyn_kernel(
-    v_packed_ptr,
-    kv_cache_ptr,
-    page_ids_ptr,
-    num_valid_pages_ptr,
-    num_pages,
-    kv_s0,
-    kv_s2,
-    kv_s4,
-    V_HEAD_D: tl.constexpr,
-    PAGE_SIZE: tl.constexpr,
-    BLOCK_V: tl.constexpr,
-    occupancy: tl.constexpr = 1,
-):
-    """Grid-strided variant of the pages repack for CUDA graph replay.
-
-    The page count varies per replay while launch grids are frozen at
-    capture, so the grid covers the page-id buffer capacity and each
-    program strides over the live count read from device memory.
-    """
-    prog = tl.program_id(0)
-    num_progs = tl.num_programs(0)
-    dim_block = tl.program_id(1)
-    num_valid = tl.load(num_valid_pages_ptr)
-
-    tl.assume(kv_s0 % 8 == 0)
-    tl.assume(kv_s2 % 8 == 0)
-    tl.assume(kv_s4 == 1)
-    v_desc = tl.make_tensor_descriptor(
-        kv_cache_ptr,
-        shape=[num_pages, PAGE_SIZE, V_HEAD_D // 2],
-        strides=[kv_s0, kv_s2, kv_s4],
-        block_shape=[1, PAGE_SIZE, BLOCK_V // 2],
-    )
-    out_desc = tl.make_tensor_descriptor(
-        v_packed_ptr,
-        shape=[num_pages * (V_HEAD_D // BLOCK_V) * BLOCK_V, PAGE_SIZE // 2],
-        strides=[PAGE_SIZE // 2, 1],
-        block_shape=[BLOCK_V, PAGE_SIZE // 2],
-    )
-    for page_list_idx in range(prog, num_valid, num_progs):
-        page_idx = tl.load(page_ids_ptr + page_list_idx).to(tl.int64)
-        v_tile = v_desc.load(
-            [
-                page_idx.to(tl.int32),
-                0,
-                (dim_block * (BLOCK_V // 2)).to(tl.int32),
-            ]
-        )
-        v_tile = tl.reshape(v_tile, (PAGE_SIZE, BLOCK_V // 2))
-        v_pairs = tl.reshape(v_tile.T, (BLOCK_V // 2, PAGE_SIZE // 2, 2))
-        even_packed, odd_packed = tl.split(v_pairs)
-        low_vals = _fp4_pack_low_nibbles(even_packed, odd_packed)
-        high_vals = _fp4_pack_high_nibbles(even_packed, odd_packed)
-        v_vals = tl.reshape(
-            tl.join(low_vals, high_vals).permute(0, 2, 1),
-            (BLOCK_V, PAGE_SIZE // 2),
-        )
-        row_base = (page_idx * (V_HEAD_D // BLOCK_V) + dim_block) * BLOCK_V
-        out_desc.store([row_base.to(tl.int32), 0], v_vals)
-
-
-def fp4_mla_repack_v_cache(
-    v_packed: Any,
-    kv_cache: Any,
-    page_ids: Optional[Any] = None,
-    *,
-    v_head_dim: int,
-    page_size: int,
-    block_v: int = 128,
-    kernel_occupancy: int = 8,
-    kernel_num_stages: int = 1,
-    num_valid_pages: Optional[Any] = None,
-) -> None:
-    """Populate the public-Triton V-packed auxiliary cache."""
-    if v_head_dim % block_v != 0:
-        raise ValueError(f"v_head_dim={v_head_dim} must be divisible by block_v={block_v}.")
-    if kv_cache.ndim < 5:
-        raise ValueError(
-            f"kv_cache must expose the paged FP4 layout, got shape={tuple(kv_cache.shape)}."
-        )
-    num_pages = kv_cache.shape[0]
-    num_dim_blocks = triton.cdiv(v_head_dim, block_v)
-    launch_meta = {
-        "occupancy": int(kernel_occupancy),
-        "num_stages": int(kernel_num_stages),
-    }
-    if page_ids is None:
-        if num_pages == 0:
-            return
-        _fp4_mla_attention_v_repack_kernel[(num_pages, num_dim_blocks)](
-            v_packed,
-            kv_cache,
-            num_pages,
-            kv_cache.stride(0),
-            kv_cache.stride(2),
-            kv_cache.stride(4),
-            V_HEAD_D=v_head_dim,
-            PAGE_SIZE=page_size,
-            BLOCK_V=block_v,
-            **launch_meta,
-        )
-        return
-
-    if page_ids.numel() == 0:
-        return
-    if num_valid_pages is not None:
-        # CUDA-graph path: the live page count varies per replay while launch
-        # grids and scalar args are frozen at capture. Launch a
-        # capacity-independent program count and stride over the device-side
-        # count so every replay repacks exactly the current batch's pages.
-        num_programs = min(int(page_ids.numel()), 2048)
-        _fp4_mla_attention_v_repack_pages_dyn_kernel[(num_programs, num_dim_blocks)](
-            v_packed,
-            kv_cache,
-            page_ids,
-            num_valid_pages,
-            num_pages,
-            kv_cache.stride(0),
-            kv_cache.stride(2),
-            kv_cache.stride(4),
-            V_HEAD_D=v_head_dim,
-            PAGE_SIZE=page_size,
-            BLOCK_V=block_v,
-            **launch_meta,
-        )
-        return
-    _fp4_mla_attention_v_repack_pages_kernel[(page_ids.numel(), num_dim_blocks)](
-        v_packed,
-        kv_cache,
-        page_ids,
-        num_pages,
-        kv_cache.stride(0),
-        kv_cache.stride(2),
-        kv_cache.stride(4),
-        V_HEAD_D=v_head_dim,
-        PAGE_SIZE=page_size,
-        BLOCK_V=block_v,
-        **launch_meta,
     )
 
 
@@ -1541,7 +1287,7 @@ def _fp4_mla_attention_page_stats_mtp_kernel(
         tl.store(page_sum_ptr + out_offsets, page_sum)
 
 
-@triton.jit(do_not_specialize=["MAX_PAGES"])
+@triton.jit(do_not_specialize=["MAX_PAGES", "num_pages"])
 def _fp4_mla_attention_reduce_stats_kernel(
     max_ptr,
     denom_ptr,
@@ -1593,7 +1339,7 @@ def _fp4_mla_attention_reduce_stats_kernel(
     tl.store(denom_ptr + gen_idx * stats_s0 + safe_offs_h, denom, mask=mask_h)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["GROUP_PAGES", "num_pages"])
 def _fp4_mla_attention_group_reduce_stats_kernel(
     group_max_ptr,
     group_sum_ptr,
@@ -1605,7 +1351,7 @@ def _fp4_mla_attention_group_reduce_stats_kernel(
     page_stats_s0,
     page_stats_s1,
     NUM_HEADS: tl.constexpr,
-    GROUP_PAGES: tl.constexpr,
+    GROUP_PAGES,
     BLOCK_H: tl.constexpr,
     PIPELINE_STAGES: tl.constexpr,
     occupancy: tl.constexpr = 1,
@@ -1742,7 +1488,6 @@ def _fp4_mla_attention_pv_kernel(
     p_fp4_ptr,
     p_sf_ptr,
     kv_cache_ptr,
-    v_packed_ptr,
     v_sf_ptr,
     global_scale_ptr,
     src_page_ids_ptr,
@@ -1773,7 +1518,6 @@ def _fp4_mla_attention_pv_kernel(
     BLOCK_V: tl.constexpr,
     USE_TMA_P_LOAD: tl.constexpr,
     USE_TMA_V_LOAD: tl.constexpr,
-    USE_PREPACKED_V: tl.constexpr,
     PV_LOOP_STAGES: tl.constexpr,
     ASSUME_FULL_HEADS: tl.constexpr,
     ASSUME_FULL_PAGES: tl.constexpr,
@@ -1851,14 +1595,7 @@ def _fp4_mla_attention_pv_kernel(
             strides=[out_s1, out_s2],
             block_shape=[BLOCK_H, BLOCK_V],
         )
-    if USE_PREPACKED_V:
-        v_packed_desc = tl.make_tensor_descriptor(
-            v_packed_ptr,
-            shape=[num_pages * (V_HEAD_D // BLOCK_V) * BLOCK_V, PAGE_SIZE // 2],
-            strides=[PAGE_SIZE // 2, 1],
-            block_shape=[BLOCK_V, PAGE_SIZE // 2],
-        )
-    elif USE_TMA_V_LOAD:
+    if USE_TMA_V_LOAD:
         tl.assume(kv_s0 % 8 == 0)
         tl.assume(kv_s2 % 8 == 0)
         tl.assume(kv_s4 == 1)
@@ -1929,12 +1666,7 @@ def _fp4_mla_attention_pv_kernel(
             else:
                 valid_even_t = page_start + even_t < kv_len
                 valid_odd_t = page_start + odd_t < kv_len
-            if USE_PREPACKED_V:
-                v_row = (safe_physical_page * (V_HEAD_D // BLOCK_V) + dim_block) * BLOCK_V
-                v_vals = v_packed_desc.load([v_row.to(tl.int32), 0])
-                if not ASSUME_VALID_PAGES:
-                    v_vals = tl.where(valid_physical_page, v_vals, 0)
-            elif USE_TMA_V_LOAD:
+            if USE_TMA_V_LOAD:
                 v_tile = v_desc.load(
                     [
                         safe_physical_page.to(tl.int32),
@@ -2035,228 +1767,6 @@ def _fp4_mla_attention_pv_kernel(
             + safe_offs_h[:, None] * out_s1
             + safe_offs_v[None, :] * out_s2,
             acc * out_scale,
-            mask=mask_h[:, None] & mask_v[None, :],
-        )
-
-
-@triton.jit(do_not_specialize=["MAX_PAGES", "PAGES_PER_SPLIT"])
-def _fp4_mla_attention_pv_prepacked_v_kernel(
-    out_ptr,
-    p_fp4_ptr,
-    p_sf_ptr,
-    v_packed_ptr,
-    v_sf_ptr,
-    global_scale_ptr,
-    src_page_ids_ptr,
-    paged_kv_indptr_decode_ptr,
-    kv_lens_ptr,
-    page_ids_len,
-    num_pages,
-    out_s0,
-    out_s1,
-    out_s2,
-    out_num_rows,
-    p_s0,
-    p_s1,
-    p_num_rows,
-    vsf_s0,
-    NUM_HEADS: tl.constexpr,
-    V_HEAD_D: tl.constexpr,
-    PAGE_SIZE: tl.constexpr,
-    FP4_BLOCK: tl.constexpr,
-    SF_PER_PAGE: tl.constexpr,
-    QUERY_LEN_PER_SEQ: tl.constexpr,
-    MAX_PAGES,
-    P_GLOBAL_SCALE: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-    BLOCK_V: tl.constexpr,
-    USE_TMA_P_LOAD: tl.constexpr,
-    USE_TMA_OUT_STORE: tl.constexpr,
-    PV_LOOP_STAGES: tl.constexpr,
-    ASSUME_FULL_HEADS: tl.constexpr,
-    ASSUME_FULL_PAGES: tl.constexpr,
-    ASSUME_FULL_V: tl.constexpr,
-    ASSUME_VALID_PAGES: tl.constexpr,
-    PAGE_SPLIT: tl.constexpr = 1,
-    PAGES_PER_SPLIT=0,
-    PARTIAL_OUT: tl.constexpr = False,
-    partial_out_ptr=None,
-    partial_s0: tl.constexpr = 0,
-    partial_s1: tl.constexpr = 0,
-    partial_s2: tl.constexpr = 0,
-    partial_s3: tl.constexpr = 0,
-    occupancy: tl.constexpr = 1,
-):
-    query_idx = tl.program_id(0)
-    head_block = tl.program_id(1)
-    prog2 = tl.program_id(2)
-    if PAGE_SPLIT > 1:
-        dim_block = prog2 // PAGE_SPLIT
-        split_idx = prog2 - dim_block * PAGE_SPLIT
-    else:
-        dim_block = prog2
-        split_idx = 0
-    seq_idx = query_idx // QUERY_LEN_PER_SEQ
-    query_offset = query_idx - seq_idx * QUERY_LEN_PER_SEQ
-
-    offs_h = head_block * BLOCK_H + tl.arange(0, BLOCK_H)
-    offs_v = dim_block * BLOCK_V + tl.arange(0, BLOCK_V)
-    if ASSUME_FULL_HEADS:
-        mask_h = tl.full([BLOCK_H], True, dtype=tl.int1)
-        safe_offs_h = offs_h
-    else:
-        mask_h = offs_h < NUM_HEADS
-        safe_offs_h = tl.where(mask_h, offs_h, 0)
-    if ASSUME_FULL_V:
-        mask_v = tl.full([BLOCK_V], True, dtype=tl.int1)
-        safe_offs_v = offs_v
-    else:
-        mask_v = offs_v < V_HEAD_D
-        safe_offs_v = tl.where(mask_v, offs_v, 0)
-    packed_t = tl.arange(0, PAGE_SIZE // 2)
-    scale_cols = tl.arange(0, PAGE_SIZE // FP4_BLOCK)
-    if ASSUME_FULL_V and BLOCK_V == 128:
-        v_sf_offsets = _fp4_mla_swizzled_sf_offset_row_block(
-            dim_block, offs_v[:, None], scale_cols[None, :], SF_PER_PAGE
-        )
-    else:
-        v_sf_offsets = _fp4_mla_swizzled_sf_offset(
-            safe_offs_v[:, None], scale_cols[None, :], SF_PER_PAGE
-        )
-    if USE_TMA_P_LOAD:
-        tl.assume(p_s0 % 8 == 0)
-        tl.assume(p_s1 == 1)
-        p_desc = tl.make_tensor_descriptor(
-            p_fp4_ptr,
-            shape=[p_num_rows, PAGE_SIZE // 2],
-            strides=[p_s0, p_s1],
-            block_shape=[BLOCK_H, PAGE_SIZE // 2],
-        )
-    if not PARTIAL_OUT and USE_TMA_OUT_STORE and ASSUME_FULL_HEADS and ASSUME_FULL_V:
-        tl.assume(out_s1 % 8 == 0)
-        tl.assume(out_s2 == 1)
-        out_desc = tl.make_tensor_descriptor(
-            out_ptr,
-            shape=[out_num_rows, V_HEAD_D],
-            strides=[out_s1, out_s2],
-            block_shape=[BLOCK_H, BLOCK_V],
-        )
-    v_packed_desc = tl.make_tensor_descriptor(
-        v_packed_ptr,
-        shape=[num_pages * (V_HEAD_D // BLOCK_V) * BLOCK_V, PAGE_SIZE // 2],
-        strides=[PAGE_SIZE // 2, 1],
-        block_shape=[BLOCK_V, PAGE_SIZE // 2],
-    )
-    if ASSUME_FULL_PAGES:
-        kv_len = 0
-    else:
-        kv_len = tl.load(kv_lens_ptr + seq_idx) - (QUERY_LEN_PER_SEQ - 1 - query_offset)
-        kv_len = tl.maximum(kv_len, 0)
-    page_table_start = tl.load(paged_kv_indptr_decode_ptr + seq_idx).to(tl.int64)
-    global_scale = tl.load(global_scale_ptr)
-    out_scale = 1.0 / (global_scale * P_GLOBAL_SCALE)
-    acc = tl.zeros((BLOCK_V, BLOCK_H), dtype=tl.float32)
-    if PAGE_SPLIT > 1:
-        page_lo = split_idx * PAGES_PER_SPLIT
-        page_hi = tl.minimum(page_lo + PAGES_PER_SPLIT, MAX_PAGES)
-    else:
-        page_lo = 0
-        page_hi = MAX_PAGES
-    for page_rel in tl.range(page_lo, page_hi, num_stages=PV_LOOP_STAGES):
-        page_start = page_rel * PAGE_SIZE
-        if ASSUME_FULL_PAGES or page_start < kv_len:
-            compact_page = page_table_start + page_rel
-            if ASSUME_VALID_PAGES:
-                safe_compact_page = compact_page
-                physical_page = tl.load(src_page_ids_ptr + safe_compact_page).to(tl.int64)
-                safe_physical_page = physical_page
-            else:
-                valid_compact_page = (compact_page >= 0) & (compact_page < page_ids_len)
-                safe_compact_page = tl.where(valid_compact_page, compact_page, 0)
-                physical_page = tl.load(
-                    src_page_ids_ptr + safe_compact_page, mask=valid_compact_page, other=-1
-                ).to(tl.int64)
-                valid_physical_page = (
-                    valid_compact_page & (physical_page >= 0) & (physical_page < num_pages)
-                )
-                safe_physical_page = tl.where(valid_physical_page, physical_page, 0)
-
-            p_page = query_idx * MAX_PAGES + page_rel
-            p_rows = p_page * NUM_HEADS + offs_h
-            safe_p_rows = (
-                p_rows if ASSUME_FULL_HEADS else tl.where(mask_h, p_rows, p_page * NUM_HEADS)
-            ).to(tl.int64)
-            if USE_TMA_P_LOAD:
-                p_vals = p_desc.load([(p_page * NUM_HEADS + head_block * BLOCK_H).to(tl.int32), 0])
-            else:
-                p_vals = tl.load(
-                    p_fp4_ptr + safe_p_rows[:, None] * p_s0 + packed_t[None, :] * p_s1,
-                    mask=mask_h[:, None]
-                    if ASSUME_VALID_PAGES
-                    else valid_compact_page & mask_h[:, None],
-                    other=0,
-                )
-            if ASSUME_FULL_HEADS and NUM_HEADS == 128 and BLOCK_H == 128:
-                p_sf_offsets = _fp4_mla_swizzled_sf_offset_row_block(
-                    p_page, offs_h[:, None], scale_cols[None, :], SF_PER_PAGE
-                )
-            else:
-                p_sf_offsets = _fp4_mla_swizzled_sf_offset(
-                    safe_p_rows[:, None], scale_cols[None, :], SF_PER_PAGE
-                )
-            p_scales = tl.load(p_sf_ptr + p_sf_offsets)
-            v_row = (safe_physical_page * (V_HEAD_D // BLOCK_V) + dim_block) * BLOCK_V
-            v_vals = v_packed_desc.load([v_row.to(tl.int32), 0])
-            if not ASSUME_VALID_PAGES:
-                v_vals = tl.where(valid_physical_page, v_vals, 0)
-            v_scales = tl.load(v_sf_ptr + safe_physical_page * vsf_s0 + v_sf_offsets)
-            acc = tl.dot_scaled(
-                v_vals,
-                v_scales,
-                "e2m1",
-                p_vals.T,
-                p_scales,
-                "e2m1",
-                acc=acc,
-                fast_math=True,
-                rhs_k_pack=True,
-            )
-
-    out_vals = acc.T
-    if PARTIAL_OUT:
-        base = (
-            query_idx * partial_s0
-            + split_idx * partial_s1
-            + safe_offs_h[:, None] * partial_s2
-            + safe_offs_v[None, :] * partial_s3
-        )
-        tl.store(partial_out_ptr + base, out_vals, mask=mask_h[:, None] & mask_v[None, :])
-    elif ASSUME_FULL_HEADS and ASSUME_FULL_V:
-        out_vals = out_vals * out_scale
-        if USE_TMA_OUT_STORE:
-            if out_ptr.dtype.element_ty == tl.bfloat16:
-                out_vals = out_vals.to(tl.bfloat16)
-            elif out_ptr.dtype.element_ty == tl.float16:
-                out_vals = out_vals.to(tl.float16)
-            out_desc.store(
-                [
-                    (query_idx * NUM_HEADS + head_block * BLOCK_H).to(tl.int32),
-                    (dim_block * BLOCK_V).to(tl.int32),
-                ],
-                out_vals,
-            )
-        else:
-            tl.store(
-                out_ptr + query_idx * out_s0 + offs_h[:, None] * out_s1 + offs_v[None, :] * out_s2,
-                out_vals,
-            )
-    else:
-        tl.store(
-            out_ptr
-            + query_idx * out_s0
-            + safe_offs_h[:, None] * out_s1
-            + safe_offs_v[None, :] * out_s2,
-            out_vals * out_scale,
             mask=mask_h[:, None] & mask_v[None, :],
         )
 

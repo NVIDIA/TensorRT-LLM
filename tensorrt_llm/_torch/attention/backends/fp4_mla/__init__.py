@@ -123,21 +123,8 @@ from .v_cache import (
 from .v_cache import _get_fp4_mla_v_packed_pool as _get_fp4_mla_v_packed_pool
 from .v_cache import _get_fp4_mla_v_packed_pool_base as _get_fp4_mla_v_packed_pool_base
 from .v_cache import _get_fp4_mla_v_scale_pool_base as _get_fp4_mla_v_scale_pool_base
-from .v_cache import _get_triton_v_packed_cache as _get_triton_v_packed_cache
-from .v_cache import _is_triton_v_packed_cache_valid as _is_triton_v_packed_cache_valid
-from .v_cache import _maybe_update_triton_v_packed_cache as _maybe_update_triton_v_packed_cache
 from .v_cache import _repack_cutedsl_v_packed_cache as _repack_cutedsl_v_packed_cache
 from .v_cache import _select_triton_block_v as _select_triton_block_v
-from .v_cache import _set_triton_v_packed_cache_valid as _set_triton_v_packed_cache_valid
-from .v_cache import _shared_v_pack_storage_enabled as _shared_v_pack_storage_enabled
-from .v_cache import _triton_can_prepack_v as _triton_can_prepack_v
-from .v_cache import _triton_prepack_v_enabled as _triton_prepack_v_enabled
-from .v_cache import _triton_shared_v_packed_valid_attr as _triton_shared_v_packed_valid_attr
-from .v_cache import _triton_v_packed_attr as _triton_v_packed_attr
-from .v_cache import _triton_v_packed_cache_tag as _triton_v_packed_cache_tag
-from .v_cache import _triton_v_packed_valid_attr as _triton_v_packed_valid_attr
-from .v_cache import _update_triton_v_packed_cache as _update_triton_v_packed_cache
-from .v_cache import _v_packed_cache_tag as _v_packed_cache_tag
 from .v_cache import _v_packed_shape as _v_packed_shape
 from .v_cache import rebuild_fp4_mla_disagg_imported_cache
 
