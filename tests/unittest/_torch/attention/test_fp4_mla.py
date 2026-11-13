@@ -3,6 +3,7 @@
 
 """TRTLLM FP4 MLA helper tests."""
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import cast
 
@@ -3290,6 +3291,7 @@ def test_fp4_mla_mtp_context_to_generation_refreshes_page_bound(
             return torch.zeros(batch_size, dtype=torch.int32, device="cuda")
 
         decoded_substep = False
+        fail_after_decode = False
 
         def draft_forward(
             _model: object, draft_inputs: dict[str, object], _spec: object, step: int
@@ -3327,12 +3329,16 @@ def test_fp4_mla_mtp_context_to_generation_refreshes_page_bound(
                 )
                 torch.testing.assert_close(output.float(), reference, rtol=0.15, atol=0.15)
                 decoded_substep = True
+                if fail_after_decode:
+                    assert active.fp4_mla_state.device_page_table_valid
+                    assert active.fp4_mla_state.generation_lengths_num_tokens == active.num_tokens
+                    raise RuntimeError("draft model failure after attention")
             hidden = torch.zeros((active.num_tokens, 8), device="cuda")
             return hidden, hidden
 
         monkeypatch.setattr(worker, "_run_draft_forward", draft_forward)
         monkeypatch.setattr(worker, "sample_draft_tokens", sample_tokens)
-        for _draft_round in range(2):
+        for draft_round in range(2):
             metadata.num_contexts = 1
             metadata.prepare()
             assert metadata.fp4_mla_state.generation_max_pages == (2 if mixed_batch else 0)
@@ -3342,24 +3348,31 @@ def test_fp4_mla_mtp_context_to_generation_refreshes_page_bound(
                     < metadata.fp4_mla_state.page_table_stride
                 )
             decoded_substep = False
+            fail_after_decode = draft_round == 1
+            expected_result = (
+                pytest.raises(RuntimeError, match="draft model failure after attention")
+                if fail_after_decode
+                else nullcontext()
+            )
             worker._prepare_attn_metadata_for_spec_dec(metadata)
             try:
-                worker._forward_linear_draft_loop(
-                    {
-                        "position_ids": torch.arange(sum(sequence_lengths), device="cuda"),
-                        "attn_metadata": metadata,
-                    },
-                    metadata,
-                    spec_metadata,
-                    draft_model,
-                    draft_kv_cache_manager=None,
-                    num_contexts=1,
-                    batch_size=batch_size,
-                    num_accepted_tokens=torch.tensor(
-                        [1, 3] if mixed_batch else [1], dtype=torch.int32, device="cuda"
-                    ),
-                    original_all_rank_num_tokens=None,
-                )
+                with expected_result:
+                    worker._forward_linear_draft_loop(
+                        {
+                            "position_ids": torch.arange(sum(sequence_lengths), device="cuda"),
+                            "attn_metadata": metadata,
+                        },
+                        metadata,
+                        spec_metadata,
+                        draft_model,
+                        draft_kv_cache_manager=None,
+                        num_contexts=1,
+                        batch_size=batch_size,
+                        num_accepted_tokens=torch.tensor(
+                            [1, 3] if mixed_batch else [1], dtype=torch.int32, device="cuda"
+                        ),
+                        original_all_rank_num_tokens=None,
+                    )
             finally:
                 worker._restore_attn_metadata_from_spec_dec(metadata)
             assert decoded_substep
