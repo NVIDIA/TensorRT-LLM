@@ -13661,7 +13661,32 @@ class PyExecutor:
             self.inflight_req_ids.erase(req_id)
         scheduled_requests.added_inflight_req_ids = []
 
+    def _release_padding_dummies_for_reuse_reset(self) -> None:
+        """Release the CUDA graph padding dummies before a V2 reuse reset.
+
+        KVCacheManagerV2.clear_reusable_blocks() refuses to run while any KV
+        cache is open, and a padding dummy keeps one open between steps, so
+        every reset after a weight update failed on an engine that had padded
+        a batch. Releasing goes through CUDAGraphRunner.release_padding_dummy,
+        which frees the dummy in every manager holding it; the next padded step
+        re-creates it, as after a KV pool rebalance.
+        """
+        if not self._is_kv_manager_v2:
+            return
+        runner = getattr(getattr(self, "model_engine", None),
+                         "cuda_graph_runner", None)
+        if runner is None:
+            return
+        draft_lens = sorted({
+            draft_len
+            for cache in runner._padding_dummy_caches()
+            for draft_len in cache
+        })
+        for draft_len in draft_lens:
+            runner.release_padding_dummy(self.resource_manager, draft_len)
+
     def reset_prefix_cache(self):
+        self._release_padding_dummies_for_reuse_reset()
         # Invalidate routes after the native V2 clear returns, even when a
         # later reset step fails. A precondition rejection keeps them intact.
         route_capture = getattr(getattr(self, "model_engine", None),
