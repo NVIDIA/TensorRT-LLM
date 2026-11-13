@@ -54,6 +54,7 @@ def test_the_classes_are_disjoint():
         runtime_hooks_compat.REQUIRED,
     )
     assert sum(len(c) for c in classes) == len(frozenset().union(*classes))
+    assert not runtime_hooks_compat.MSA_PERF_ONLY & runtime_hooks_compat.MSA_MAIN_DEFAULT
 
 
 def test_fields_the_engine_has_pass_through(logged):
@@ -94,10 +95,11 @@ def test_a_field_requested_off_is_dropped_silently(logged):
     assert logged == []
 
 
-def test_msa_fields_the_engine_lacks_are_dropped(logged):
-    names = sorted(runtime_hooks_compat.MSA_PERF_ONLY - _MSA)
+@pytest.mark.parametrize("kind", ["MSA_PERF_ONLY", "MSA_MAIN_DEFAULT"])
+def test_msa_fields_the_engine_lacks_are_dropped(logged, kind):
+    names = sorted(getattr(runtime_hooks_compat, kind) - _MSA)
     if not names:
-        pytest.skip("this engine has every MSA_PERF_ONLY field")
+        pytest.skip(f"this engine has every {kind} field")
     hooks = runtime_hooks_compat.build({}, dict.fromkeys(names, 1), target="t")
     assert hooks.msa == MsaRuntimePolicy()
     assert len(logged) == 1 and all(f"msa.{name}" in logged[0] for name in names)
