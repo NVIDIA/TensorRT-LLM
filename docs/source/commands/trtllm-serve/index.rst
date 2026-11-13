@@ -8,3 +8,4 @@ trtllm-serve
    trtllm-serve
    render-endpoints
    run-benchmark-with-trtllm-serve
+   audio-transcriptions
