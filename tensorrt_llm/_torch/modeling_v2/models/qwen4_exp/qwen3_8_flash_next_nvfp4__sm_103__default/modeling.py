@@ -1557,9 +1557,51 @@ class Qwen4ExpDefaultModelingV2(DecoderModel):
         # group, as `allreduce_group_args` routes them.
         process_group = self.mapping.tp_group_pg.boxed() if mpi_disabled() else None
 
+        # TRTLLM_QWEN4_EXP_MOE_LAMPORT_ROUND_TRIP=1: both collectives of the round trip as
+        # one Lamport launch each over symmetric memory (`ops/moe/dep_lamport_round_trip`)
+        # instead of NCCL's ring kernels, for every row count up to the token budget. The same
+        # rows in the same rank order and the ring's sum order; a -0.0 lane travels as +0.0.
+        # One NVLink domain only: a pure SM103 DEP4 worker. Default off.
+        lamport = None
+        if _switch("TRTLLM_QWEN4_EXP_MOE_LAMPORT_ROUND_TRIP"):
+            if (
+                self.mapping.world_size != 4
+                or self.dp_size != 4
+                or list(group) != list(range(4))
+                or torch.cuda.get_device_capability() != (10, 3)
+            ):
+                raise ValueError("the Lamport MoE round trip is certified on a pure SM103 DEP4 worker")
+            import torch.distributed as dist
+
+            from tensorrt_llm._torch.distributed.initialization import (
+                ensure_cutedsl_torch_distributed,
+            )
+
+            from ..ops.moe import dep_lamport_round_trip
+
+            # MPI workers have no torch process group: the existing collective bootstrap.
+            ensure_cutedsl_torch_distributed(4)
+            if not dist.is_initialized() or dist.get_world_size() != 4:
+                raise RuntimeError("the Lamport MoE round trip found no 4-rank torch group")
+            if dist.get_rank() != self.dp_rank:
+                raise RuntimeError("the torch WORLD rank order differs from the DP rank order")
+            lamport = dep_lamport_round_trip.build(
+                self.hidden, int(self.max_num_tokens), self.dp_rank, self.dp_size
+            )
+            logger.info(
+                "MoE Lamport round trip enabled: DEP4, up to %d rows a rank", lamport.max_rows
+            )
+
         def round_trip(run, x: torch.Tensor, pad_rows: int) -> torch.Tensor:
             rows = x.shape[0]
             padded = x if not pad_rows else nn.functional.pad(x, [0, 0, 0, pad_rows])
+            if lamport is not None and lamport.takes(padded.shape[0], padded):
+                partial = run(lamport.gather(padded))
+                if partial.dtype is torch.bfloat16 and partial.shape[1] == lamport.hidden:
+                    mine = lamport.reduce_scatter(partial)
+                else:
+                    mine = reducescatter(partial, None, group, process_group)
+                return mine if not pad_rows else mine[:rows]
             gathered = allgather(padded, None, group, process_group)
             mine = reducescatter(run(gathered), None, group, process_group)
             return mine if not pad_rows else mine[:rows]
