@@ -725,9 +725,14 @@ _INFORWARD_MIN_MAIN = _GDN_INPLACE_MAX_TOKENS + 1
 _TP_SUM_MNNVL_MAX_ROWS = 32
 #: The engine `allreduce_strategy` values under which the target runs its own communication: the
 #: MNNVL `tp_sum` and the IPC buffers `_own_ipc` admits. Under another strategy every TP sum is
-#: the raw all-reduce at that strategy and the gathers run NCCL; `check_deployment` declines UB
-#: and LOWPRECISION, whose setup only the stock `AllReduce` module does.
+#: the raw all-reduce at that strategy (AUTO for SYMM_MEM) and the gathers run NCCL;
+#: `check_deployment` declines UB and LOWPRECISION, whose setup only the stock `AllReduce`
+#: module does.
 _OWN_COMM_STRATEGIES = frozenset({int(AllReduceStrategy.AUTO), int(AllReduceStrategy.MNNVL)})
+#: Strategies of the stock `AllReduce` module's own kernels, which the raw all-reduce op has no
+#: branch for: the module runs the MNNVL or symmetric-memory kernel where it can and calls the op
+#: at AUTO otherwise (`_torch/distributed/ops.py`), and so does `tp_sum`.
+_MODULE_ONLY_STRATEGIES = frozenset({int(AllReduceStrategy.MNNVL), int(AllReduceStrategy.SYMM_MEM)})
 #: The stock IPC fusion all-reduce's accumulation switch (`use_fp32_acc` in
 #: `allReduceFusionKernels.cu`): fp32 unless the value starts with `0`. `hc_allreduce_inject_norm`
 #: always sums in fp32, so with the opt-out the decode sites sum apart (`_hc_ar_inject`).
@@ -1294,11 +1299,14 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
         """Return the attention-TP sum of block partials, bit-identical on every rank.
 
         At AUTO or MNNVL, where the platform supports MNNVL, rows up to `_TP_SUM_MNNVL_MAX_ROWS`
-        take the MNNVL kernel; every other sum is the raw all-reduce, which `allreduce_group_args`
-        hands MNNVL as AUTO."""
+        take the MNNVL kernel; every other sum is the raw all-reduce, called at AUTO for MNNVL
+        and SYMM_MEM (`_MODULE_ONLY_STRATEGIES`)."""
         if self.attn_tp_size == 1:
             return lambda x: x
-        group = allreduce_group_args(self.mapping, self.allreduce_strategy)
+        strategy = self.allreduce_strategy
+        if strategy in _MODULE_ONLY_STRATEGIES:
+            strategy = int(AllReduceStrategy.AUTO)
+        group = allreduce_group_args(self.mapping, strategy)
 
         def tp_sum(x: torch.Tensor) -> torch.Tensor:
             return allreduce(

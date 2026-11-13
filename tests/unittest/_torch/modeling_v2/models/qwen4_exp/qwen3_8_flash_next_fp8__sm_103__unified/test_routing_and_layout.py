@@ -461,11 +461,11 @@ def test_a_strategy_only_the_stock_module_sets_up_declines(on_sm103, strategy):
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "strategy", ["NCCL", "NCCL_SYMMETRIC", "MIN_LATENCY", "ONESHOT", "TWOSHOT", "MNNVL"]
+    "strategy", ["NCCL", "NCCL_SYMMETRIC", "MIN_LATENCY", "ONESHOT", "TWOSHOT", "MNNVL", "SYMM_MEM"]
 )
 def test_a_strategy_the_target_runs_is_admitted(on_sm103, strategy):
     """The raw all-reduce op runs these; MNNVL takes the target's MNNVL sum and the raw op at
-    AUTO."""
+    AUTO, SYMM_MEM the raw op at AUTO."""
     for member in ("tp2", "tep4"):
         _admitted(replace(_routed_config(member), allreduce_strategy=AllReduceStrategy[strategy]))
 
@@ -586,11 +586,12 @@ def _core(member: str, rank: int, spec_config=None, **config):
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("strategy", ["AUTO", "MNNVL", "NCCL"])
+@pytest.mark.parametrize("strategy", ["AUTO", "MNNVL", "SYMM_MEM", "NCCL"])
 def test_the_tp_sum_runs_at_the_engines_allreduce_strategy(strategy, monkeypatch) -> None:
     """At AUTO or MNNVL, sums up to `_TP_SUM_MNNVL_MAX_ROWS` rows take the MNNVL kernel (asked
     for by name, so one node qualifies) and wider ones the raw op at AUTO, which has no MNNVL
-    branch. Another strategy reaches the raw op as it is; NCCL reads no IPC workspace."""
+    branch. SYMM_MEM, which the raw op has no branch for either, reaches it at AUTO at every
+    width. Another strategy reaches the raw op as it is; NCCL reads no IPC workspace."""
     import tensorrt_llm._utils as utils
     from tensorrt_llm._torch.distributed import ops as dist_ops
 
@@ -615,6 +616,12 @@ def test_the_tp_sum_runs_at_the_engines_allreduce_strategy(strategy, monkeypatch
     if strategy == "NCCL":
         assert asked == []
         assert tp_sum(narrow) == tp_sum(wide) == ("raw", int(AllReduceStrategy.NCCL), None)
+        return
+    if strategy == "SYMM_MEM":
+        assert asked == []
+        assert (
+            tp_sum(narrow) == tp_sum(wide) == ("raw", int(AllReduceStrategy.AUTO), "ipc workspace")
+        )
         return
     assert asked == [True]
     assert tp_sum(narrow) == ("mnnvl", "mnnvl workspace")
