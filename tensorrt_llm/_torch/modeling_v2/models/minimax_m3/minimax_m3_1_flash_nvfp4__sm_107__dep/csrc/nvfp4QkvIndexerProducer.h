@@ -37,6 +37,16 @@ constexpr int kMinimaxM3IndexKFp8Sink = 0;
 constexpr int kMinimaxM3IndexKNvfp4Pages = 1;
 constexpr int kMinimaxM3IndexKBf16Tap = 2;
 
+// MiniMax-M3 sparse horizontal producer for an FP8 main KV cache: Q, index-Q and main K/V as E4M3, index-K as
+// index_k_mode says (mode 0: the same outputs as trtllm::minimax_m3_fp8_qkv_indexer_norm_rope_kv_insert).
+void launchMinimaxM3Fp8QKVIndexerNormRopeKVInsert(void const* packed_input, void* q_output, void* index_q_output,
+    void* kv_cache, void* index_k_cache, int const* out_cache_loc, int64_t kv_page_stride, int64_t kv_plane_stride,
+    int64_t kv_head_stride, int64_t kv_token_stride, int64_t index_page_stride, int64_t index_token_stride,
+    int64_t num_pages, int page_size, int num_tokens, int num_heads_q, int num_heads_kv, int num_heads_index,
+    int head_dim, int rotary_dim, float eps, void const* q_weight, void const* k_weight, void const* index_q_weight,
+    void const* index_k_weight, float const* rotary_cos_sin, int const* position_ids, int index_k_mode,
+    cudaStream_t stream);
+
 // MiniMax-M3 sparse horizontal producer for an NVFP4 main KV cache.  Q and
 // index-Q remain FP8; index-K is written as index_k_mode says.  Main K/V are
 // quantized directly from the normalized/RoPE registers into packed E2M1 data

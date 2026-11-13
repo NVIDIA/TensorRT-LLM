@@ -66,11 +66,40 @@ def _nvfp4_qkv_indexer_norm_rope_kv_insert_fake(
     )
 
 
+def _fp8_qkv_indexer_norm_rope_kv_insert_fake(
+    packed,
+    kv_cache,
+    index_k_cache,
+    out_cache_loc,
+    num_heads_q,
+    num_heads_kv,
+    num_heads_index,
+    head_dim,
+    rotary_dim,
+    eps,
+    q_weight,
+    k_weight,
+    index_q_weight,
+    index_k_weight,
+    rotary_cos_sin,
+    position_ids,
+):
+    """FP8 q [T, Hq, head_dim] and index-q [T, Hidx, head_dim]; the paged caches are written in place."""
+    num_tokens = packed.shape[0]
+    return (
+        packed.new_empty((num_tokens, num_heads_q, head_dim), dtype=torch.float8_e4m3fn),
+        packed.new_empty((num_tokens, num_heads_index, head_dim), dtype=torch.float8_e4m3fn),
+    )
+
+
 def _sampling_from_probs_mc_fi_fake(probs, seed, offset, workspace, ctas_per_row):
     """One sampled token per row of probs, int32 [rows]."""
     return probs.new_empty((probs.shape[0],), dtype=torch.int32)
 
 
+torch.library.register_fake(f"{_NS}::minimax_m3_fp8_qkv_indexer_norm_rope_kv_insert")(
+    _fp8_qkv_indexer_norm_rope_kv_insert_fake
+)
 torch.library.register_fake(f"{_NS}::minimax_m3_nvfp4_qkv_indexer_norm_rope_kv_insert")(
     _nvfp4_qkv_indexer_norm_rope_kv_insert_fake
 )
