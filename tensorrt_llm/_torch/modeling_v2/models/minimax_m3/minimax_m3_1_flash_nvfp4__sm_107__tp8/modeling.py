@@ -188,7 +188,7 @@ from .kernels import msa_kv_update as _msa_kv_update_kernel
 from .kernels import triton_sparse_decode as _sparse_decode_kernel
 from .kernels.long_select import long_select_blocks
 from .kernels.mx_gemv import op as mx_gemv
-from .m31_switches import m31_disabled
+from .m31_switches import m31_disabled, m31_enabled
 from .ops import gqamix_sparse_decode as _gqamix_kernel
 from .ops.activation.m3_shared_swiglu_mxfp8 import m3_shared_swiglu_mxfp8
 from .ops.activation.m3_silu_and_mul import m3_silu_and_mul
@@ -264,6 +264,11 @@ _SM = (10, 7)
 # load only, no numerics change. TRTLLM_M31_DISABLE_MSA_PROXY_PREBUILD=1: each variant compiles on its first call
 # instead (which can be after the server is ready).
 MSA_PROXY_PREBUILD = not m31_disabled("MSA_PROXY_PREBUILD")
+# R6_DENSE_PREQUANT (opt-in, TRTLLM_M31_ENABLE_R6_DENSE_PREQUANT=1): the dense-MLP layer boundary also publishes the
+# next layer's MXFP8 QKV activation (as the MoE boundary does): M3.1's layers 1-3 follow a dense MLP but have the sparse
+# five-way QKV. Off by default: on sm_107 the hand-off's QKV output is not bitwise against the BF16 hand-off (where the
+# next QKV quantizes its own input). Read at import.
+R6_DENSE_PREQUANT = m31_enabled("R6_DENSE_PREQUANT")
 # CTXNORMQ: a prefill layer boundary of at least ``CTXNORMQ_MIN_ROWS`` rows runs the plain all-reduce, then
 # one kernel for the residual add + RMSNorm that also writes the next MXFP8 projection's activation (and, at a MoE
 # boundary, the routed experts' NVFP4 input), instead of the fused all-reduce + norm followed by the consumers' own
@@ -2512,12 +2517,15 @@ _ENGINE_STATES: Dict[tuple, object] = {}
 # AR-DET: AllReduce AUTO's per-process timing autotuner made SM107 runs differ across server starts
 # (0 / 888 same-node and 0 / 296 across node pairs with it off, bitwise to the
 # modal autotuned output). The target turns it off for the whole process at init (AUTO then takes the C++ size / world
-# heuristic, a pure function of the shape). An explicit TLLM_DISABLE_ALLREDUCE_AUTOTUNE is left as given.
+# heuristic, a pure function of the shape), unless TRTLLM_M31_ENABLE_AR_AUTOTUNE=1 (opt-in: keep the autotuner). An
+# explicit TLLM_DISABLE_ALLREDUCE_AUTOTUNE is left as given. Read once, at import.
+AR_AUTOTUNE_ENABLED = m31_enabled("AR_AUTOTUNE")
 
 
 def _pin_allreduce_heuristic(rank: int) -> bool:
     """Default the AllReduce autotune off for this process (see AR-DET); returns whether it is off. Logs one line."""
-    os.environ.setdefault("TLLM_DISABLE_ALLREDUCE_AUTOTUNE", "1")
+    if not AR_AUTOTUNE_ENABLED:
+        os.environ.setdefault("TLLM_DISABLE_ALLREDUCE_AUTOTUNE", "1")
     off = os.environ.get("TLLM_DISABLE_ALLREDUCE_AUTOTUNE", "0") == "1"
     if off:
         logger.info(f"[M3.1] rank {rank}: AR_DET engaged (AllReduce autotune off for this process)")
@@ -3868,6 +3876,22 @@ class DecodeTarget:
             # A dense layer: its MLP's down projection pushes into the post-MLP boundary's all-reduce, as the o_proj
             # does into the attention one (the same exchange; the gate_up projection never pushes); bitwise equal to
             # the unpushed boundary (the same bf16 words).
+            # R6_DENSE_PREQUANT: the next layer's QKV takes its MXFP8 activation from this boundary, as after a MoE
+            # layer.
+            quant = R6_DENSE_PREQUANT and plan.qkv_prequant and i + 1 < core.num_layers
+            if plan.qkv_prequant and i + 1 < core.num_layers:
+                _log_once(
+                    logger.info,
+                    "r6_dense_prequant",
+                    "on" if quant else "off",
+                    "[M3 dispatch] r6_dense_prequant "
+                    + (
+                        "taken: the dense-MLP boundary hands the next QKV its MXFP8 activation"
+                        if quant
+                        else "off (default; TRTLLM_M31_ENABLE_R6_DENSE_PREQUANT=1 turns it on), BF16 hand-off"
+                    )
+                    + " (logged once)",
+                )
             dense_push = plan.attn_mc_ar and decode_graph and DENSE_PUSH.covers(num_tokens)
             armed = self._attn_push_target(num_tokens) if dense_push else None
             out, pushed = self._swiglu_mlp(hidden, f"l{i}_mlp", True, armed, dense=True)
@@ -3877,7 +3901,7 @@ class DecodeTarget:
                     out,
                     residual,
                     norm_w,
-                    False,
+                    quant,
                     AR_PUSH_MODE,
                     "dense down push",
                     capture=capture,
@@ -3889,7 +3913,7 @@ class DecodeTarget:
                     "the dense MLP's down projection did not push its rows into the armed boundary all-reduce",
                 )
             return self._boundary(
-                plan.attn_mc_ar, out, residual, norm_w, quant=False, capture=capture
+                plan.attn_mc_ar, out, residual, norm_w, quant=quant, capture=capture
             )
 
         quant = plan.qkv_prequant and i + 1 < core.num_layers
@@ -6487,6 +6511,21 @@ def _log_tailbk(worker) -> None:
     logger.info(f"[M3 host] tail bookkeeping: {items}")
 
 
+# SLOT_IDS_CHANGED (opt-in, TRTLLM_M31_ENABLE_SLOT_IDS_CHANGED=1; RuntimeHooks spec_slot_ids_changed_only): the spec
+# metadata's per-request slot-id table (batch_slot_ids; rejection sampling) is re-uploaded only when the slot ids
+# change, not copied every step. With BLOCKOFF_GUARD it empties the eager step-boundary stream the next decode graph
+# waits on. Off by default: on this target's step loop the skip can miss a slot-id change (outputs were not token
+# identical to the every-step copy on some requests). Read at import.
+SLOT_IDS_CHANGED = m31_enabled("SLOT_IDS_CHANGED")
+# TP8_SHORT_FAMILY (opt-in, TRTLLM_M31_ENABLE_TP8_SHORT_FAMILY=1; not bitwise): decode steps whose requests' attended
+# lengths sum below TP8_LONG_FAMILY_MIN_TOKENS replay a CUDA graph family of their own
+# (MsaRuntimePolicy.long_family_min_total_tokens), captured at a warmup of half that length instead of the longest
+# warmup. The capture length changes capture-time length choices, so the outputs of a short step are not bitwise those
+# of the single family. Read at import.
+TP8_LONG_FAMILY_MIN_TOKENS = 540000 if m31_enabled("TP8_SHORT_FAMILY") else None
+_SHORT_FAMILY_LOGGED: list = []
+
+
 def _runtime_hooks(spec_fold: Optional[M3SpecStepFold]) -> runtime_hooks_compat.RuntimeHooks:
     """The step-loop hooks this target opts into.
 
@@ -6540,6 +6579,18 @@ def _runtime_hooks(spec_fold: Optional[M3SpecStepFold]) -> runtime_hooks_compat.
       unchanged block-table copies skipped, pool views built once, block-id tables copied from the page-index views
       (the stock builder makes a Python list of the whole padded row).
     """
+    logger.info(f"[M3.1] SLOT_IDS_CHANGED {'on' if SLOT_IDS_CHANGED else 'off'}")
+    if not _SHORT_FAMILY_LOGGED:
+        _SHORT_FAMILY_LOGGED.append(True)
+        logger.info(
+            "[M3 dispatch sm_107 tp8] TP8_SHORT_FAMILY "
+            + (
+                f"armed: decode graphs keyed at {TP8_LONG_FAMILY_MIN_TOKENS} summed tokens (short family captured "
+                f"at {TP8_LONG_FAMILY_MIN_TOKENS // 2})"
+                if TP8_LONG_FAMILY_MIN_TOKENS is not None
+                else "off: one decode graph family"
+            )
+        )
     # Built for this engine: a requested hook it does not have is classified and dropped (runtime_hooks_compat).
     return runtime_hooks_compat.build(
         dict(
@@ -6569,7 +6620,7 @@ def _runtime_hooks(spec_fold: Optional[M3SpecStepFold]) -> runtime_hooks_compat.
             spec_small_h2d=STEP_SMALL_H2D,
             skip_accepted_draft_upload=STEP_SKIP_ACCEPTED_UPLOAD,
             spec_batch_map_changed_only=STEP_BATCH_CHANGED_ONLY,
-            spec_slot_ids_changed_only=False,
+            spec_slot_ids_changed_only=SLOT_IDS_CHANGED,
             spec_step_fold=spec_fold,
             sampler_d2h_side_stream=STEP_HOST_D2H_SIDE,
             skip_unchanged_draft_block_offsets=STEP_BLOCKOFF_GUARD,
@@ -6579,7 +6630,7 @@ def _runtime_hooks(spec_fold: Optional[M3SpecStepFold]) -> runtime_hooks_compat.
         ),
         msa=dict(
             short_sequence_identity=True,
-            long_family_min_total_tokens=None,
+            long_family_min_total_tokens=TP8_LONG_FAMILY_MIN_TOKENS,
             kv_update=_msa_kv_update_kernel.msa_kv_update,
             kv_update_tail=_msa_kv_update_kernel.msa_kv_update_tail
             if _msa_kv_update_kernel.FOLD_F4A

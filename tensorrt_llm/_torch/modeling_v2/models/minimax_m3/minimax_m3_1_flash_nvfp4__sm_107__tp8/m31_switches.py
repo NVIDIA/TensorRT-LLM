@@ -85,6 +85,7 @@ ITEMS: Dict[str, str] = {
     "MOE_XDEFER": "the MoE engine's x copy at its stock place in the 8-token B1 path",
     "MSA_PROXY_PREBUILD": "compiling each MSA proxy fmha_sm100 variant on its first call (instead of before warmup)",
     "MXGEMV_SM107_CFG": "the MXFP8 GEMV's table ring for the SwiGLU-prologue calls",
+    "ONEDIV_CAP": "LC8_ONEDIV at every row count (instead of up to 8 query rows)",
     "PACK_CPP_SCATTER": "the Triton parallel scatter on eager step-input flushes",
     "PACK_EARLY_COPY": "the step prologue copying the pinned window itself",
     "PACK_IN_GRAPH": "the eager step-input upload and scatter between the graphs",
@@ -166,3 +167,58 @@ def m31_disabled(item_id: str) -> bool:
             f"{item_id!r} is not a registered switch of this target (m31_switches.ITEMS)"
         )
     return item_id in _DISABLED
+
+
+# Default-off items (opt-ins): ``TRTLLM_M31_ENABLE_<ID>=1`` turns item ``<ID>`` on. Each changes the target's numerics
+# against the default path (not bitwise) or is not faster on every shape, so it stays off unless asked for. Same strict
+# values as the kill switches, read once at import; an opt-in variable naming an id this target does not register is
+# logged once and otherwise ignored.
+_ENABLE_PREFIX = "TRTLLM_M31_ENABLE_"
+
+# Opt-in id -> what TRTLLM_M31_ENABLE_<id>=1 turns on.
+OPT_INS: Dict[str, str] = {
+    "AR_AUTOTUNE": (
+        "AllReduce AUTO's per-process timing autotuner (the target otherwise pins the C++ size / world heuristic)"
+    ),
+    "DRAFT_AR_NORM_CLUSTER": (
+        "the drafter's fused all-reduce + norm on the multicast all-reduce + norm kernel at 8 rows"
+    ),
+    "DRAFT_FC_TP_SPLIT": "the drafter's replicated fc split row-parallel with one fp32 all-reduce (not bitwise)",
+    "DRAFT_LOGITS_ALLGATHER_MC": "the rejection sampler's draft-logits all-gather as one multicast launch",
+    "DRAFT_WINDOW_CAPPED_DECODE": "the window-capped max_seq_len for the drafter's sliding-window decode (not bitwise)",
+    "LC8_ONEDIV": "the long-context decode's split-K merge dividing once per output (not bitwise)",
+    "R6_DENSE_PREQUANT": "the dense-MLP boundary's MXFP8 QKV hand-off to the next layer (not bitwise)",
+    "SLOT_IDS_CHANGED": (
+        "the spec sampler's slot-id table uploaded only when it changes (RuntimeHooks spec_slot_ids_changed_only)"
+    ),
+    "TP8_ANCESTRAL_DRAFT": "the in-tree DSpark ancestral draft under advanced draft sampling",
+    "TP8_SHORT_FAMILY": "a separate decode CUDA graph family for short steps (not bitwise)",
+}
+
+
+def _read_enabled() -> FrozenSet[str]:
+    """The registered opt-in ids switched on in this process; logs each unregistered opt-in variable once."""
+    out = set()
+    for name, value in os.environ.items():
+        if not name.startswith(_ENABLE_PREFIX):
+            continue
+        item_id = name[len(_ENABLE_PREFIX) :]
+        if item_id not in OPT_INS:
+            logger.warning(f"{name} is not an opt-in of this MiniMax-M3.1 target; ignored")
+            continue
+        if _is_set(name, value):
+            out.add(item_id)
+    return frozenset(out)
+
+
+# The opt-in ids switched on in this process, read once at import.
+_ENABLED: FrozenSet[str] = _read_enabled()
+
+
+def m31_enabled(item_id: str) -> bool:
+    """Whether ``TRTLLM_M31_ENABLE_<item_id>`` turned the default-off item on for this process."""
+    if item_id not in OPT_INS:
+        raise KeyError(
+            f"{item_id!r} is not a registered opt-in of this target (m31_switches.OPT_INS)"
+        )
+    return item_id in _ENABLED

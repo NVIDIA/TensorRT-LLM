@@ -64,7 +64,7 @@ from .engagement import (
     identity_lines,
     moe_engagement,
 )
-from .m31_switches import m31_disabled
+from .m31_switches import m31_disabled, m31_enabled
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
@@ -114,7 +114,8 @@ def dep_runtime_hooks() -> Optional[RuntimeHooks]:
 
       Item switches as on the TP targets: HOSTTAIL (its six items), SKIP_ACCEPTED_UPLOAD, BATCH_CHANGED_ONLY,
       HOST_D2H_SIDE, SMALL_H2D, PHILOX_PACK, KV_LENS_ONCE, PACK_PSCATTER, PACK_IN_GRAPH, PACK_EARLY_COPY,
-      H2D_CHANGED_SPAN, BLOCKOFF_GUARD, BLOCKOFF_PATCH.
+      H2D_CHANGED_SPAN, BLOCKOFF_GUARD, BLOCKOFF_PATCH. SLOT_IDS_CHANGED (the spec sampler's slot ids re-uploaded only
+      on change) stays opt-in (``TRTLLM_M31_ENABLE_SLOT_IDS_CHANGED=1``, with the input path), as on the TP8 target.
     * Native step launches (``DEP_STEP_NATIVE``, inside the step loop; ``TRTLLM_M31_DISABLE_DEP_STEP_NATIVE=1`` restores
       the engine's own lines, as the group switch does): the sm_107 TP targets' four step-glue launches, from the
       family module ``ops.step_hooks`` (CUDA C++ ops, no Triton), each writing what the line it replaces writes:
@@ -140,7 +141,7 @@ def dep_runtime_hooks() -> Optional[RuntimeHooks]:
       acceptance length, not the target's distribution. A request whose context worker ships no window starts from an
       empty one.
 
-    Never armed: the short-sequence identity selection and the greedy-only Philox skip.
+    Opt-in: SLOT_IDS_CHANGED. Never armed: the short-sequence identity selection and the greedy-only Philox skip.
     ``TRTLLM_M31_DISABLE_<GROUP>=1`` turns a group off; ``TRTLLM_M31_DISABLE_DEP_HOOKS=1`` keeps the built-in model's
     hooks (None)."""
     if m31_disabled("DEP_HOOKS"):
@@ -188,6 +189,7 @@ def dep_runtime_hooks() -> Optional[RuntimeHooks]:
         spec_small_h2d=spec_inputs and not m31_disabled("SMALL_H2D"),
         skip_accepted_draft_upload=spec_inputs and not m31_disabled("SKIP_ACCEPTED_UPLOAD"),
         spec_batch_map_changed_only=spec_inputs and not m31_disabled("BATCH_CHANGED_ONLY"),
+        spec_slot_ids_changed_only=inputs and m31_enabled("SLOT_IDS_CHANGED"),
         sampler_d2h_side_stream=host_tail and not m31_disabled("HOST_D2H_SIDE"),
         skip_unchanged_draft_block_offsets=draft_offsets,
         patch_unchanged_draft_block_offsets=draft_offsets and not m31_disabled("BLOCKOFF_PATCH"),

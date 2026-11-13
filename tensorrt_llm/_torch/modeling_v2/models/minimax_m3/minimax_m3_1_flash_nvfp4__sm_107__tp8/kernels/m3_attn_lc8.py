@@ -25,13 +25,26 @@ Geometry: 8 query heads per KV head (TP8), one KV head, head_dim 128, page 128, 
 
 import torch
 
+from ..m31_switches import m31_disabled, m31_enabled
 from ..ops.attention.m3_sparse_decode_lc8 import NUM_HEADS, WIDTH, m3_sparse_decode_lc8
 
 # Up to this many query rows the kernel stages the request length, the query rows and the block-table row before its
 # grid wait.
 PREWAIT_MAX_ROWS = 8  # capacity: fixed: the occupancy crossover
-# The split-K merge forms its weights once per CTA (MERGE_ONCE: also enables the identity route and the L2 prefetches).
+# The split-K merge forms its weights once per CTA (MERGE_ONCE: also enables the identity route and the L2 prefetches)
+# and, with LC8_ONEDIV, divides once per output (sum_c w_c acc_c / sum_c w_c l_c in chunk order; deterministic, in the
+# float64 reference's band, not bitwise to the per-chunk division). LC8_ONEDIV is off by default:
+# TRTLLM_M31_ENABLE_LC8_ONEDIV=1 opts in.
 MERGE_ONCE = True
+ONE_DIV_MERGE = m31_enabled("LC8_ONEDIV")
+# Up to this many query rows the merge divides once (above it the division per chunk is not slower at 128K-token
+# contexts). TRTLLM_M31_DISABLE_ONEDIV_CAP=1 keeps LC8_ONEDIV at every row count.
+ONE_DIV_MAX_ROWS = 1 << 30 if m31_disabled("ONEDIV_CAP") else 8  # capacity: fixed: row crossover
+
+
+def one_div_applies(total_q: int) -> bool:
+    """Whether the merge divides once at ``total_q`` query rows."""
+    return ONE_DIV_MERGE and MERGE_ONCE and total_q <= ONE_DIV_MAX_ROWS
 
 
 class PrefetchSlot:
@@ -139,7 +152,7 @@ def m3_lc8_attn(
         merge_once=merge_once,
         identity=bool(identity) and merge_once,
         identity_step=bool(identity_step) and merge_once,
-        one_div=False,
+        one_div=merge_once and one_div_applies(total_q),
         prefetch=prefetch if merge_once else None,
         next_kv=(
             tuple(next_kv[:2]) + tuple(t.view(torch.uint8) for t in next_kv[2:])

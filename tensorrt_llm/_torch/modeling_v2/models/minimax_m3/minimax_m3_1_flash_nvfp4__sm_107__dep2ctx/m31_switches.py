@@ -112,3 +112,43 @@ def large_prefill_graphs_disabled(item_id: str) -> bool:
     is off: ``TRTLLM_M31_DISABLE_DEP2CTX_LARGE_PREFILL_GRAPHS=1`` turns every such item off,
     ``TRTLLM_M31_DISABLE_<item_id>=1`` that one."""
     return m31_disabled("DEP2CTX_LARGE_PREFILL_GRAPHS") or m31_disabled(item_id)
+
+
+# Default-off items (opt-ins): ``TRTLLM_M31_ENABLE_<ID>=1`` turns item ``<ID>`` on. Each changes the target's numerics
+# against the default path (not bitwise) or is not faster on every shape, so it stays off unless asked for. Same strict
+# values as the kill switches, read once at import; an opt-in variable naming an id this target does not register is
+# logged once and otherwise ignored.
+_ENABLE_PREFIX = "TRTLLM_M31_ENABLE_"
+
+# Opt-in id -> what TRTLLM_M31_ENABLE_<id>=1 turns on.
+OPT_INS: Dict[str, str] = {
+    "DEP2CTX_IDX_SCORER_K64": "the prefill scorer built at MMA K = 64 (TRTLLM_M31_IDX_SCORER_MMA_K=64; not bitwise)",
+}
+
+
+def _read_enabled() -> FrozenSet[str]:
+    """The registered opt-in ids switched on in this process; logs each unregistered opt-in variable once."""
+    out = set()
+    for name, value in os.environ.items():
+        if not name.startswith(_ENABLE_PREFIX):
+            continue
+        item_id = name[len(_ENABLE_PREFIX) :]
+        if item_id not in OPT_INS:
+            logger.warning(f"{name} is not an opt-in of this MiniMax-M3.1 target; ignored")
+            continue
+        if _is_set(name, value):
+            out.add(item_id)
+    return frozenset(out)
+
+
+# The opt-in ids switched on in this process, read once at import.
+_ENABLED: FrozenSet[str] = _read_enabled()
+
+
+def m31_enabled(item_id: str) -> bool:
+    """Whether ``TRTLLM_M31_ENABLE_<item_id>`` turned the default-off item on for this process."""
+    if item_id not in OPT_INS:
+        raise KeyError(
+            f"{item_id!r} is not a registered opt-in of this target (m31_switches.OPT_INS)"
+        )
+    return item_id in _ENABLED
