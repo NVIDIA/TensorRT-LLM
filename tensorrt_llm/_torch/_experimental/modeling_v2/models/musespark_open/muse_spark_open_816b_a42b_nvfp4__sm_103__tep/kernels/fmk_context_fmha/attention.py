@@ -3,7 +3,7 @@
 """``fmk_context_fmha``: the context rows of mixed steps on the multi-instance paged context FMHA
 (``ops/attention/context_fmha_fmk``), sm_103.
 
-Opt-in: ``MUSESPARK_OPEN_FMK_CONTEXT_FMHA=1``. Lossless-numeric, not on under any default.
+Opt-in: ``MUSESPARK_OPEN_FMK_CONTEXT_FMHA=1``, not on under any default. Not bitwise (see Numerics).
 
 Where it acts. A mixed step (context rows and generation rows in one batch) of a full-attention
 layer is served by the layer's ``FlashInferTrtllmGenFmha``: its ``run_context`` preprocesses the
@@ -32,9 +32,11 @@ preprocess needs.
 
 Cache blocks: 32 or 64 tokens. The kernel reads a 64-token block as its two 32-token halves.
 
-Numerics: the same precision as the trtllm-gen cubin (the same E4M3 Q / K / V and P, fp32
-accumulation, BF16 O, the same scales) with another summation order and P rounding point, so not
-bitwise.
+Numerics: the same E4M3 Q / K / V and P, fp32 accumulation, BF16 O and scales as the
+trtllm-gen cubin, but not bitwise and not exact: another summation order and P rounding point,
+and three of every four pairs of softmax exponentials are computed in half precision (f16x2 ex2)
+with their row sum in packed f16 adds. Outputs, and so speculative acceptance, can differ from
+the library's.
 
 Install after every other attention install (it only replaces the context phase of the FMHA
 library) and before any CUDA graph is captured: it reserves the partial-result workspace
