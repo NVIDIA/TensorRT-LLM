@@ -175,9 +175,12 @@ def test_fused_catalog_changing_input_graph(n, k):
 
 
 # The wq projection's per-rank width is 1024 under TP8 and 2048 under TP4. Both are tuned cells
-# up to 16 rows; 32 rows exceed the fused kernel and stay on the MXFP8 kernel.
+# up to 16 rows; 32 rows exceed the fused kernel and stay on the MXFP8 kernel, as does the
+# indexer's wq_b (4096 wide) at 16 rows, where the table has no cell.
 @pytest.mark.parametrize(
-    "m,n,fused", ((4, 1024, True), (16, 2048, True), (32, 1024, False)), ids=("tp8", "tp4", "m32")
+    "m,n,fused",
+    ((4, 1024, True), (16, 2048, True), (32, 1024, False), (16, 4096, False)),
+    ids=("tp8", "tp4", "m32", "untuned"),
 )
 def test_decode_target_dispatch(m, n, fused):
     from importlib import import_module

@@ -9,28 +9,87 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cute_dsl_fp8_blo
     cute_dsl_fp8_block_scale_linear as baseline,
 )
 
-# The decode target's per-rank FP8 projections at TP8 and TP4: (N, K) -> (Split-K slices, warps
-# per CTA). One tactic per (N, K) serves every M in _ROWS, on the assumption that streaming the
-# weights dominates at these M. The TP8 rows are the fastest probed M=4 tactics at the kernel's
-# default prefetch depth. The TP4-only rows are not probed: each keeps the warps and, as nearly
-# as K allows, the K128 slots per CTA of the nearest probed shape with the same N or K.
-_NK_TACTICS = {
-    (1024, 6144): (24, 8),  # TP8 wq
-    (1536, 6144): (16, 4),  # TP8 shared-expert gate/up
-    (4096, 6144): (12, 4),  # TP8 and TP4 indexer wq_b
-    (6144, 768): (1, 4),  # TP8 shared-expert down
-    (6144, 1024): (1, 4),  # TP8 wo
-    (6144, 3072): (4, 8),  # TP8 dense down
-    (6144, 6144): (12, 4),  # TP8 dense gate/up, TP4 dense down
-    (2048, 6144): (16, 4),  # TP4 wq
-    (3072, 6144): (12, 4),  # TP4 shared-expert gate/up
-    (6144, 1536): (2, 4),  # TP4 shared-expert down
-    (6144, 2048): (2, 4),  # TP4 wo
-    (12288, 6144): (12, 4),  # TP4 dense gate/up
+# (M, N, K) -> (Split-K slices, warps per CTA) for the decode target's per-rank FP8 projections
+# at TP8 and TP4, M = 1, 2, 4, 8, 12 and 16. Each cell holds the fastest tactic at the kernel's
+# default prefetch depth on VR200. A shape is absent at an M where no tactic beat the MXFP8
+# kernel by 3% with both L2-resident and streamed weights, and runs that kernel there: wq_b,
+# dense down and 6144x6144 above M=8, and TP4 dense gate/up from M=4.
+_TACTICS = {
+    # TP8 wq
+    (1, 1024, 6144): (12, 8),
+    (2, 1024, 6144): (12, 8),
+    (4, 1024, 6144): (24, 8),
+    (8, 1024, 6144): (24, 4),
+    (12, 1024, 6144): (24, 8),
+    (16, 1024, 6144): (24, 8),
+    # TP8 shared-expert gate/up
+    (1, 1536, 6144): (16, 4),
+    (2, 1536, 6144): (16, 4),
+    (4, 1536, 6144): (24, 4),
+    (8, 1536, 6144): (24, 4),
+    (12, 1536, 6144): (24, 8),
+    (16, 1536, 6144): (24, 8),
+    # TP8 and TP4 indexer wq_b
+    (1, 4096, 6144): (12, 4),
+    (2, 4096, 6144): (12, 4),
+    (4, 4096, 6144): (12, 4),
+    (8, 4096, 6144): (12, 8),
+    # TP8 shared-expert down
+    (1, 6144, 768): (1, 4),
+    (2, 6144, 768): (1, 4),
+    (4, 6144, 768): (1, 4),
+    (8, 6144, 768): (1, 4),
+    (12, 6144, 768): (6, 8),
+    (16, 6144, 768): (6, 4),
+    # TP8 wo
+    (1, 6144, 1024): (1, 4),
+    (2, 6144, 1024): (1, 4),
+    (4, 6144, 1024): (1, 4),
+    (8, 6144, 1024): (4, 4),
+    (12, 6144, 1024): (4, 8),
+    (16, 6144, 1024): (4, 8),
+    # TP8 dense down
+    (1, 6144, 3072): (4, 8),
+    (2, 6144, 3072): (4, 8),
+    (4, 6144, 3072): (4, 8),
+    (8, 6144, 3072): (6, 8),
+    # TP8 dense gate/up, TP4 dense down
+    (1, 6144, 6144): (12, 4),
+    (2, 6144, 6144): (12, 4),
+    (4, 6144, 6144): (12, 4),
+    (8, 6144, 6144): (12, 8),
+    # TP4 wq
+    (1, 2048, 6144): (16, 4),
+    (2, 2048, 6144): (16, 4),
+    (4, 2048, 6144): (16, 4),
+    (8, 2048, 6144): (12, 8),
+    (12, 2048, 6144): (24, 8),
+    (16, 2048, 6144): (24, 8),
+    # TP4 shared-expert gate/up
+    (1, 3072, 6144): (8, 8),
+    (2, 3072, 6144): (8, 8),
+    (4, 3072, 6144): (8, 8),
+    (8, 3072, 6144): (12, 8),
+    (12, 3072, 6144): (24, 8),
+    (16, 3072, 6144): (12, 8),
+    # TP4 shared-expert down
+    (1, 6144, 1536): (4, 4),
+    (2, 6144, 1536): (6, 4),
+    (4, 6144, 1536): (6, 4),
+    (8, 6144, 1536): (6, 4),
+    (12, 6144, 1536): (6, 8),
+    (16, 6144, 1536): (6, 8),
+    # TP4 wo
+    (1, 6144, 2048): (8, 4),
+    (2, 6144, 2048): (8, 8),
+    (4, 6144, 2048): (8, 8),
+    (8, 6144, 2048): (4, 8),
+    (12, 6144, 2048): (8, 8),
+    (16, 6144, 2048): (8, 8),
+    # TP4 dense gate/up
+    (1, 12288, 6144): (12, 4),
+    (2, 12288, 6144): (12, 4),
 }
-_ROWS = (1, 2, 4, 8, 12, 16)
-# (M, N, K) -> (Split-K slices, warps per CTA).
-_TACTICS = {(m, n, k): tactic for (n, k), tactic in _NK_TACTICS.items() for m in _ROWS}
 
 
 @torch.library.custom_op("trtllm::cute_dsl_fused_fp8_block_scale_linear", mutates_args=())
