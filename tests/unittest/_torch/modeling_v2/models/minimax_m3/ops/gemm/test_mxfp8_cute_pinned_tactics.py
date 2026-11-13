@@ -128,3 +128,28 @@ def test_the_kill_switch_restores_the_default_path(monkeypatch):
     with pin.engaged_for("test"):
         assert pin.tactic_for(80, 4992, 6144) is None
         assert pin.run(q, s, wq, ws, torch.bfloat16) is None
+
+
+@sm107
+@pytest.mark.parametrize("key", sorted(DEP_ENTRIES), ids=lambda k: f"N{k[0]}_K{k[1]}_M{k[2]}")
+def test_a_caller_runs_the_dep_entries_bitwise_in_a_cuda_graph(key):
+    """Inside engaged_for() a dep table entry runs captured: the replay on new operands writes the eager pinned run's
+    bits on them. (Pinned against the default path is test_pinned_equals_default_bitwise.)"""
+    n, k, bucket = key
+    for m in sorted({bucket // 2 + 1 if bucket > 64 else 33, bucket}):
+        q, s, wq, ws = _operands(m, n, k, seed=m)
+        with pin.engaged_for("test"):
+            assert pin.run(q, s, wq, ws, torch.bfloat16) is not None, (
+                "the pinned path declined a table entry"
+            )
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured = pin.run(q, s, wq, ws, torch.bfloat16)
+        fresh = _operands(m, n, k, seed=m + 1)
+        for static, value in zip((q, s, wq, ws), fresh):
+            static.copy_(value)
+        graph.replay()
+        with pin.engaged_for("test"):
+            eager = pin.run(*fresh, torch.bfloat16)
+        torch.cuda.synchronize()
+        assert torch.equal(captured, eager), (key, m)

@@ -3,9 +3,10 @@
 """Where a MiniMax-M3.1-Flash deployment on 2 Rubin GPUs lands (routing.route), driven by synthetic configs.
 
 The tp2 decode target takes tp 2 with the experts tensor-parallel (moe_tp 2, moe_ep 1); the tp2ctx context worker takes
-tp 2 with expert parallelism (moe_tp 1, moe_ep 2), so the two never meet. tp8 routes to its own target; GB300 (sm103)
-has no M3.1 target; a bf16 KV cache, other layouts and the MiniMax-M3 checkpoint never land on the tp2 target. The
-target modules are stubbed: this checks the decision, not that the modeling code imports on this host. CPU only.
+tp 2 with expert parallelism (moe_tp 1, moe_ep 2), so the two never meet, and the plain tensor-parallel topology name
+is the decode one only. tp8 routes to its own target; sm_103 has no M3.1 target; a bf16 KV cache, other layouts and
+the MiniMax-M3 checkpoint never land on the tp2 target. The target modules are stubbed: this checks the decision, not
+that the modeling code imports on this host. CPU only.
 """
 
 import sys
@@ -72,6 +73,12 @@ def test_the_topology_names_the_decode_and_the_context_worker_apart():
     assert routing._tp2ctx(Mapping(**_CTX)) and not routing._tp2ctx(Mapping(**_DECODE))
 
 
+def test_parallel_names_the_decode_topology_tp2_and_not_the_context_one():
+    assert routing._parallel(Mapping(**_DECODE)) == "tp2"
+    assert routing._parallel(Mapping(**_CTX)) is None
+    assert routing._tp2ctx(Mapping(**_CTX)) and not routing._tp2ctx(Mapping(**_DECODE))
+
+
 def test_the_decode_topology_lands_on_the_tp2_target(monkeypatch):
     assert _route(monkeypatch, _DECODE).__name__ == "ModelingV2MiniMaxM31FlashNvfp4Sm107Tp2"
 
@@ -85,7 +92,7 @@ def test_tp8_lands_on_its_own_target(monkeypatch):
     assert _route(monkeypatch, mapping_kwargs).__name__ == "ModelingV2MiniMaxM31FlashNvfp4Sm107Tp8"
 
 
-def test_gb300_has_no_m31_target(monkeypatch):
+def test_sm_103_has_no_m31_target(monkeypatch):
     with pytest.raises(NoTarget, match="MiniMax-M3.1-Flash: not sm107"):
         _route(monkeypatch, _DECODE, capability=(10, 3))
 
