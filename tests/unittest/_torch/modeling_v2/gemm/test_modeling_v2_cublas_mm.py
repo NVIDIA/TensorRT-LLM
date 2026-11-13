@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import (  # noqa: E501
+    _LOW_M_DIRECT_TACTICS,
     _low_m_direct_tactic,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import (
@@ -337,10 +338,15 @@ def test_low_m_fixed_tactic_graph_and_offsets(cell, seed, certifying) -> None:  
     _compare(out, low_m_op.reference(a, b))
 
 
-@pytest.mark.parametrize("m", [1, 2, 8, 16, 32, 64, 128, 256, 2048, 16384])
-def test_low_m_protection_fallback(m) -> None:
+@pytest.mark.parametrize(
+    "m,n",
+    [(m, 160) for m in (1, 2, 3, 12, 32, 64, 128, 256, 2048, 16384)]
+    + [(16, 512), (16, 576), (24, 576), (32, 576)],
+)
+def test_low_m_protection_fallback(m, n) -> None:
+    assert (m, n, 6144) not in _LOW_M_DIRECT_TACTICS
     a = torch.randn(m, 6144, device="cuda", dtype=torch.bfloat16)
-    b = torch.randn(160, 6144, device="cuda", dtype=torch.bfloat16).t()
+    b = torch.randn(n, 6144, device="cuda", dtype=torch.bfloat16).t()
     actual = low_m_op(a, b)
     assert torch.equal(actual, op(a, b))
     _compare(actual, low_m_op.reference(a, b))

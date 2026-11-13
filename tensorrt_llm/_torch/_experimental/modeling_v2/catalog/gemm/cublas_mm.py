@@ -518,11 +518,22 @@ class CublasMm(OpWrapper):
 cublas_mm = CublasMm()
 
 
+# (M, N, K) -> DirectTactic(block_size, outputs_per_block, rows_per_block). M is the decode
+# rows of a captured batch: 3 per sequence for the draft's kv_a, 4 per sequence for the
+# target's kv_a and indexer projections. Every CTA re-reads all of A, so the direct kernel's
+# cost grows with M x N while cuBLAS's stays nearly flat; 16x512, 16x576 and larger M stay on
+# cuBLAS.
 _LOW_M_DIRECT_TACTICS: dict[tuple[int, int, int], tuple[int, int, int]] = {
     (3, 576, 6144): (128, 1, 3),
     (4, 160, 6144): (128, 2, 4),
     (4, 512, 6144): (128, 1, 4),
     (4, 576, 6144): (128, 1, 4),
+    (6, 576, 6144): (128, 2, 6),
+    (8, 160, 6144): (128, 2, 8),
+    (8, 512, 6144): (128, 2, 8),
+    (8, 576, 6144): (128, 2, 8),
+    (12, 576, 6144): (64, 2, 4),
+    (16, 160, 6144): (128, 2, 8),
 }
 
 
