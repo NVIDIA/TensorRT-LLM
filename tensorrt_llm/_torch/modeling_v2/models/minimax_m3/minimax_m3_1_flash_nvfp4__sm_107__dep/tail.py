@@ -30,6 +30,7 @@ would (``config_decline_reason``).
 from __future__ import annotations
 
 import functools
+import os
 import types
 from typing import TYPE_CHECKING, Iterable, Optional, Tuple
 
@@ -40,10 +41,11 @@ from tensorrt_llm._torch.models.modeling_minimaxm3 import MiniMaxM3DecoderLayer,
 from tensorrt_llm._torch.modules import linear as _linear
 from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
-from tensorrt_llm._torch.moe.fused_moe import mega_moe as _mega_moe
 from tensorrt_llm._torch.utils import EventType
 from tensorrt_llm.logger import logger
 
+from ..ops.moe.megamoe_local.local_impl import MegaMoEDeferredTopkReduce
+from ..ops.moe.megamoe_local.local_plan import SHARED_SERIAL_DISABLE_ENV
 from . import norm_mxfp8 as _norm_mxfp8
 from . import se_side as _se_side
 from .m31_switches import m31_disabled
@@ -51,13 +53,10 @@ from .m31_switches import m31_disabled
 if TYPE_CHECKING:
     from tensorrt_llm._torch.model_config import ModelConfig
 
-# The routed output of a MegaMoE launch that left its top-k reduce to the caller. None on a runtime whose MegaMoE
-# backend has no deferred reduce: every routed output there is already reduced.
-MegaMoEDeferredTopkReduce = getattr(_mega_moe, "MegaMoEDeferredTopkReduce", None)
-
 
 def _is_deferred_topk_reduce(routed) -> bool:
-    return MegaMoEDeferredTopkReduce is not None and isinstance(routed, MegaMoEDeferredTopkReduce)
+    """Whether ``routed`` is the routed output of a MegaMoE launch that left its top-k reduce to the caller."""
+    return isinstance(routed, MegaMoEDeferredTopkReduce)
 
 
 def _on_pinned_mxfp8(compute_shared, bucket: int, kernel: str):
@@ -216,13 +215,16 @@ def _routed_and_shared(
     (the backend's ``shared_corun_pin_kernel``) where its ``shared_corun_pin`` holds for the step."""
     all_rank_num_tokens = attn_metadata.all_rank_num_tokens
     backend = moe.experts.backend
-    if hidden_states.dtype != torch.bfloat16:
-        reason = "the activation is not BF16"
-    else:
-        reason = backend.request_deferred_topk_reduce(all_rank_num_tokens, hidden_states.shape[0])
-    if reason is not None:
-        backend.cancel_deferred_topk_reduce()
-        _log_once("stock", reason)
+    if getattr(moe, "_dep_tail_defer", True):
+        if hidden_states.dtype != torch.bfloat16:
+            reason = "the activation is not BF16"
+        else:
+            reason = backend.request_deferred_topk_reduce(
+                all_rank_num_tokens, hidden_states.shape[0]
+            )
+        if reason is not None:
+            backend.cancel_deferred_topk_reduce()
+            _log_once("stock", reason)
 
     def _compute_experts(router_logits):
         return moe.experts(
@@ -380,6 +382,8 @@ def install(layers: Iterable[torch.nn.Module], model_config: ModelConfig) -> Tup
             _log_once("not installed", reason)
             continue
         moe.forward = types.MethodType(_moe_forward, moe)
+        moe._dep_tail_defer = True
+        _set_shared_plan(moe)
         reason = (
             None
             if _replaced(layer, "forward_MoE", _forward_moe_norm)
@@ -405,3 +409,60 @@ def _replaced(module: torch.nn.Module, name: str, func) -> bool:
 
 def _replaceable(module: torch.nn.Module, name: str, func) -> bool:
     return name not in module.__dict__ or _replaced(module, name, func)
+
+
+def shared_plan_decline_reason(moe: Optional[torch.nn.Module]) -> Optional[str]:
+    """Why the MoE block ``moe`` keeps the built-in placement of its shared expert, or None if this module's forward
+    may place it by its backend's answers (``shared_expert_serial``, ``route_beside_shared``, ``shared_corun_pin``)."""
+    if type(moe) is not MiniMaxM3MoE:
+        return f"MoE block {type(moe).__name__}"
+    if moe.shared_experts is None:
+        return "no shared expert"
+    if moe.allreduce is not None or not moe.routed_output_is_global:
+        return "not attention DP on a fused-communication MoE"
+    backend = getattr(moe.experts, "backend", None)
+    if not hasattr(backend, "shared_expert_serial") or not hasattr(
+        backend, "request_deferred_topk_reduce"
+    ):
+        return f"backend {type(backend).__name__} has no shared-expert placement"
+    return None
+
+
+def _set_shared_plan(moe: MiniMaxM3MoE) -> None:
+    """The MoE block's per-layer placement switches; each step's answer is its backend's.
+
+    The shared expert runs after the routed launch where the backend's ``shared_expert_serial`` holds for the step
+    (``TRTLLM_M31_DISABLE_MEGAMOE_SHARED_SERIAL=1`` keeps it beside the launch at every step), with the router and the
+    route-quant seat beside it on the aux stream where its ``route_beside_shared`` holds too; beside the launch, its
+    MXFP8 linears take the pinned GEMM where its ``shared_corun_pin`` holds.
+    """
+    backend = moe.experts.backend
+    has_plan = hasattr(backend, "shared_expert_serial")
+    moe.shared_expert_serial = has_plan and os.environ.get(SHARED_SERIAL_DISABLE_ENV, "0") != "1"
+    moe.shared_corun_pinnable = has_plan
+    moe.route_beside_shared = hasattr(backend, "prestage_route_quant")
+
+
+def install_shared_plan(layers: Iterable[torch.nn.Module]) -> int:
+    """Give every MoE block the tail did not take this module's forward without the top-k deferral, so its shared
+    expert is placed by its backend's answers (``_set_shared_plan``); returns how many blocks run this module's forward
+    afterwards, the tail's included. Logs each distinct decline once."""
+    count = 0
+    for layer in layers:
+        moe = getattr(layer, "block_sparse_moe", None)
+        if moe is None:
+            continue
+        if serves(moe):
+            count += 1
+            continue
+        reason = shared_plan_decline_reason(moe)
+        if reason is None and not _replaceable(moe, "forward", _moe_forward):
+            reason = "the MoE block's forward is already replaced"
+        if reason is not None:
+            _log_once("shared placement not installed", reason)
+            continue
+        moe.forward = types.MethodType(_moe_forward, moe)
+        moe._dep_tail_defer = False
+        _set_shared_plan(moe)
+        count += 1
+    return count

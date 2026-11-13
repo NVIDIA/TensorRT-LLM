@@ -19,6 +19,7 @@ l0_gr100:
   - unittest/_torch/modeling_v2/models/minimax_m3/ops/attention
   - unittest/_torch/modeling_v2/models/minimax_m3/ops/dspark
   - unittest/_torch/modeling_v2/models/minimax_m3/ops/gemm
+  - unittest/_torch/modeling_v2/models/minimax_m3/ops/moe
   - unittest/_torch/modeling_v2/models/minimax_m3/ops/test_m31_add_rmsnorm_gpu.py
   - unittest/_torch/modeling_v2/models/minimax_m3/ops/test_m31_dspark_draft_swiglu_gpu.py
   - unittest/_torch/modeling_v2/models/minimax_m3/ops/test_m31_idxk_split_gpu.py

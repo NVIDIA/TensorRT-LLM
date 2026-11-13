@@ -24,7 +24,6 @@ from tensorrt_llm._torch.models.modeling_minimaxm3 import (
 )
 from tensorrt_llm._torch.modules import logits_processor as _logits_processor
 from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as _megamoe_op
-from tensorrt_llm._torch.moe.fused_moe import mega_moe as _mega_moe
 from tensorrt_llm._torch.moe.fused_moe.interface import MoESchedulerKind
 from tensorrt_llm._torch.pyexecutor.sampler.ops import flashinfer as _sampler_flashinfer
 from tensorrt_llm._torch.speculative import dspark as _spec_dspark
@@ -36,6 +35,7 @@ from ..msa import engine as _msa_engine
 from ..ops import add_rmsnorm as _native_norm
 from ..ops import native_swiglu as _swiglu
 from ..ops import step_hooks as _step_hooks
+from ..ops.moe.megamoe_local import local_impl as _megamoe_local
 from ..runtime_hooks_compat import MsaRuntimePolicy, RuntimeHooks
 from . import corun_band as _cb
 from . import drafter_mxfp8 as _mxd
@@ -377,10 +377,9 @@ class ModelingV2MiniMaxM31FlashNvfp4Sm107Dep(MiniMaxM3VLForConditionalGeneration
             self.model.layers,
             moe_layer_ids,
             MoESchedulerKind.FUSED_COMM,
-            # A runtime without the MegaMoE local implementation builds the stock one whatever the switch says.
-            arm_identity()
-            if hasattr(_mega_moe, "TrtllmCutedslMegaMoeLocalNvfp4Impl")
-            else ARM_IDENTITIES[False],
+            # A runtime whose MoE resolution cannot select the MegaMoE local implementation builds the stock one
+            # whatever the switch says.
+            arm_identity() if _megamoe_local.is_registered() else ARM_IDENTITIES[False],
         )
         for line in identity_lines(mapping.rank, mapping.world_size, identities, _KERNEL):
             logger.info(line)
@@ -393,6 +392,7 @@ class ModelingV2MiniMaxM31FlashNvfp4Sm107Dep(MiniMaxM3VLForConditionalGeneration
         self._shared_gate_up = 0
         self._shared_down = 0
         self._corun_band_layers = 0
+        self._shared_plan_layers = 0
         self._se_side = (0, None, None)
         self._proj_pins = 0
         self._idxk_producer_nvfp4 = False
@@ -420,6 +420,8 @@ class ModelingV2MiniMaxM31FlashNvfp4Sm107Dep(MiniMaxM3VLForConditionalGeneration
         self._lc2_layers = _lc2.install(self.model.layers)
         self._merge_layers = _mx.install(self.model.layers, _lc2.serves) if self._lc2_layers else 0
         tail_a, tail_b = _tail.install(self.model.layers, self.model_config)
+        # The shared expert's placement by the MegaMoE backend's answers, on every MoE block the tail did not take too.
+        self._shared_plan_layers = _tail.install_shared_plan(self.model.layers)
         self._norm_sites = _nm.install(self.model.layers)
         self._router_sites = _ro.install(self.model.layers)
         self._shared_gate_up, self._shared_down = _sm.install(self.model.layers, _ro.is_site)
@@ -495,7 +497,7 @@ class ModelingV2MiniMaxM31FlashNvfp4Sm107Dep(MiniMaxM3VLForConditionalGeneration
             f"form (a) reduce + shared add on {tail_a} layers"
             if tail_a or tail_b
             else ("off (TRTLLM_M31_DISABLE_DEP_TAIL=1)" if not _tail.DEP_TAIL else "not installed")
-        )
+        ) + f"; shared-expert placement by the MegaMoE backend on {self._shared_plan_layers} layers"
         norm_handoff = (
             f"on {self._norm_sites} layer boundaries"
             if self._norm_sites

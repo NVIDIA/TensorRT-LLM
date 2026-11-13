@@ -29,6 +29,7 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/minimax_m3/ops/gemm/test_router_half_pin.py
   - unittest/_torch/modeling_v2/models/minimax_m3/ops/test_m31_add_rmsnorm_l2pf.py
   - unittest/_torch/modeling_v2/models/minimax_m3/ops/test_m31_bcg_ptr_guard.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/ops/moe
   - unittest/_torch/modeling_v2/models/minimax_m3/kernels/m3ll/prob1
   - unittest/_torch/modeling_v2/models/minimax_m3/test_m31_decode_scope_source.py
   - unittest/_torch/modeling_v2/models/minimax_m3/test_m31_tp8_routing_source.py
