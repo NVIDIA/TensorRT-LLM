@@ -27,9 +27,13 @@ _PREFILL_ROUTE_BUCKET = 256
 _PREFILL_ROW_BUCKET = 64
 # Query rows (requests x query tokens per request, so MTP counts draft tokens)
 # below which Triton is faster under CUDA graphs (Rubin SM107 and B300, 32K
-# context, TP2): the core ties at one row, the indexer until ~32 rows.
+# context, TP2): the core ties at one row, the indexer until ~32 rows. On
+# Rubin the Triton decode scorer runs at the K-bar streaming rate and the
+# PrimTS scorer ties it at 32-64 rows and trails by 5-11% from 256 rows, so
+# decode batches stay on Triton there.
 _MIN_DECODE_ROWS = 2
 _MIN_INDEXER_DECODE_ROWS = 32
+_INDEXER_DECODE_TRITON_CAPABILITIES = ((10, 7),)
 _KV_BLOCK_SIZE = 4
 _SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 _SUPPORTED_Q_DTYPES = (torch.float16, torch.bfloat16)
@@ -124,15 +128,22 @@ def use_prims_ts_indexer(
 
     Follows ``sparse_core_backend`` unless ``indexer_backend`` is set:
     ``triton`` never, ``prims_ts`` always (raising if unsupported), ``auto``
-    when the device and inputs qualify and decode batches are large enough.
+    when the device and inputs qualify and decode batches are large enough on
+    a part where the PrimTS scorer wins them.
     """
     backend = params.indexer_backend
     if backend == "follow":
         backend = params.sparse_core_backend
     if backend == "triton":
         return False
-    if backend == "auto" and is_decode and q.shape[0] < _MIN_INDEXER_DECODE_ROWS:
-        return False
+    if backend == "auto" and is_decode:
+        if q.shape[0] < _MIN_INDEXER_DECODE_ROWS:
+            return False
+        if (
+            q.is_cuda
+            and torch.cuda.get_device_capability(q.device) in _INDEXER_DECODE_TRITON_CAPABILITIES
+        ):
+            return False
     reason = None
     if not q.is_cuda:
         reason = "requires CUDA tensors"
