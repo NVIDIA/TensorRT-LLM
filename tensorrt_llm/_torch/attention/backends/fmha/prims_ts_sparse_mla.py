@@ -47,6 +47,7 @@ signoff-qualified upstream, so it keeps the fallback for now.
 
 from __future__ import annotations
 
+import functools
 import math
 import time
 import weakref
@@ -87,17 +88,22 @@ _MIN_CUTLASS_DSL_VERSION = Version("4.7.0")
 # Same compiler-target gate as fmha/prims_ts.py: the kernels share one CuTe DSL
 # task-scheduling stack, so a toolchain the dense libraries refuse is refused here too.
 _MIN_CUTLASS_COMPILER_VERSION = "13.3"
-# Process-level state shared by every library instance and metadata object:
-# the static profiles whose kernel variants were warmed (compiled kernels are
-# cached per process by the vendored wrapper, so one warm-up per profile is
-# enough), and the index contracts that were validated with one eager launch.
-_WARMED_PROFILES: set = set()
+# Index contracts validated by an eager launch in this process.
 _VALIDATED_CONTRACTS: set = set()
 _LATENT_DIM = 512
 # Prepared-sinks cache entries (one per layer; DeepSeek-V4 has 61).
 _SINKS_CACHE_LIMIT = 512
 _ROPE_DIM = 64
 _FUSED_OUTPUT_BLOCK = 128
+
+
+@functools.cache
+def _workspace_size(device: torch.device, rows: int, heads: int, **plan_kwargs) -> int:
+    from tensorrt_llm._torch.attention.backends.prims_ts.mla_decode import (
+        get_prims_ts_sparse_mla_decode_workspace_size,
+    )
+
+    return int(get_prims_ts_sparse_mla_decode_workspace_size(device, rows, heads, **plan_kwargs))
 
 
 def get_prims_ts_toolchain_unsupported_reason() -> Optional[str]:
@@ -144,16 +150,10 @@ class PrimsTSSparseMlaFmha(Fmha):
     # metadata object execute serially. All plans of a metadata object share
     # one kernel workspace (under WORKSPACE_CACHE_KEY) that is grown to the
     # largest profile planned so far (a plan keeps the buffer it was planned
-    # with alive until the metadata object is dropped); warming plans the
-    # largest row count first so the metadata that warms allocates it once.
+    # with alive until the metadata object is dropped); warmup loads the plan
+    # with the largest workspace first so the metadata allocates it once.
     PLAN_CACHE_KEY = "prims_ts_sparse_mla"
     WORKSPACE_CACHE_KEY = "prims_ts_sparse_mla.workspace"
-    # Generation row counts scanned when warming a profile's kernel variants:
-    # every count up to WARM_ROW_SCAN (the split-KV schedule changes often
-    # at small counts), then a geometric tail up to the metadata's token
-    # budget. One plan is created per distinct kernel compile signature.
-    WARM_ROW_SCAN = 128
-    WARM_ROW_TAIL = (192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096)
 
     def __init__(self, attn: "TrtllmAttention") -> None:
         super().__init__(attn)
@@ -506,11 +506,8 @@ class PrimsTSSparseMlaFmha(Fmha):
         plan_kwargs, _ = self._plan_kwargs(extra, q_dtype, has_sinks, fused_groups)
         # One workspace per metadata object, shared by every plan and grown to
         # the largest profile: plans run serially, and a plan's scratch is only
-        # live during its own launch. The size comes from the same resolver the
-        # wrapper's plan() uses (its fifth result is the byte extent).
-        required_bytes = int(
-            mla_decode._resolve_sparse_mla_plan(device, rows, heads, **plan_kwargs)[4]
-        )
+        # live during its own launch.
+        required_bytes = _workspace_size(device, rows, heads, **plan_kwargs)
         shared = metadata.fmha_plan_caches.setdefault(self.WORKSPACE_CACHE_KEY, {})
         workspace = shared.get("buffer")
         if workspace is None or workspace.numel() < required_bytes:
@@ -571,155 +568,37 @@ class PrimsTSSparseMlaFmha(Fmha):
             )
         return plan_kwargs, holes_possible
 
-    def _warm_kernel_variants(
-        self,
-        *,
-        metadata: "TrtllmAttentionMetadata",
-        device: torch.device,
-        extra: int,
-        q_dtype: torch.dtype,
-        has_sinks: bool,
-        fused_groups: Optional[int],
-    ) -> None:
-        """Load every kernel variant of a static profile during eager warmup.
-
-        A batch's context ramp brings a new generation row count almost every
-        step, and mixed (context + generation) steps run eager. Planning a new
-        row count is cheap (~1 ms), but the first plan of each kernel variant
-        (the split-KV schedule changes with the row count and the extra
-        capacity) loads it from the persistent compile cache (~0.25 s), which
-        stalls the host while the GPU runs prefill. Compiled kernels are cached
-        per process by the wrapper, so this runs once per process and profile,
-        on the eager metadata only (CUDA graph metadata objects replay one row
-        count each and never need it), and never under capture. It scans the
-        row counts a step can carry, keeps one representative per distinct
-        compile signature, and plans them largest first so the shared
-        workspace is allocated once at its final size.
-        """
-        if torch.cuda.is_current_stream_capturing() or getattr(metadata, "is_cuda_graph", False):
-            return
-        attn = self.attn
-        heads = int(attn.num_heads)
-        profile_key = (
-            str(device),
-            heads,
-            extra,
-            q_dtype,
-            has_sinks,
-            fused_groups,
-            int(attn.sparse_attention_config.window_size),
-        )
-        if profile_key in _WARMED_PROFILES:
-            return
-        _WARMED_PROFILES.add(profile_key)
+    def _kernel_variant_rows(
+        self, metadata: "TrtllmAttentionMetadata", device: torch.device, plan_kwargs: dict
+    ) -> list[int]:
+        """Plan every reachable row count without compiling and retain unique specs."""
         from tensorrt_llm._torch.attention.backends.prims_ts import mla_decode
 
-        from . import prims_ts_precompile
-
-        plan_kwargs, _ = self._plan_kwargs(extra, q_dtype, has_sinks, fused_groups)
-        # Generation rows per step: one per request, plus its draft tokens with
-        # speculative decoding, within the step's token budget. The fields are
-        # declared on TrtllmAttentionMetadata; read them directly so a rename
-        # fails here instead of silently shrinking the warmed set and moving
-        # the MTP row counts' compiles to the first serving step.
         requests = int(metadata.max_num_requests or 0)
         draft = int(metadata.max_total_draft_tokens or 0)
         tokens = int(metadata.max_num_tokens or 0)
         max_rows = requests * (1 + draft)
         if tokens:
             max_rows = min(max_rows, tokens) if max_rows else tokens
-        candidates = [r for r in range(1, min(max_rows, self.WARM_ROW_SCAN) + 1)]
-        candidates += [r for r in self.WARM_ROW_TAIL if self.WARM_ROW_SCAN < r <= max_rows]
-        t_warm = time.perf_counter()
-        representative: dict = {}
-        for rows in candidates:
-            spec = mla_decode._resolve_sparse_mla_plan(device, rows, heads, **plan_kwargs)[2]
-            signature = mla_decode._mla_kernel_compile_signature(spec.kernel)
-            representative[signature] = rows  # the largest row count of each variant
-        self._precompile_variants(
-            device,
-            heads,
-            plan_kwargs,
-            sorted(representative.values(), reverse=True),
-            local_ranks=prims_ts_precompile.local_rank_count(metadata.mapping),
-        )
-        for rows in sorted(representative.values(), reverse=True):
-            self._get_plan(
-                metadata=metadata,
-                device=device,
-                rows=rows,
-                extra=extra,
-                q_dtype=q_dtype,
-                has_sinks=has_sinks,
-                fused_groups=fused_groups,
-            )
-        logger.debug(
-            f"PrimTS sparse MLA warmed {len(representative)} kernel variants for extra={extra} "
-            f"(rows scanned up to {max_rows}): {(time.perf_counter() - t_warm) * 1e3:.0f} ms"
-        )
-
-    @staticmethod
-    def _precompile_variants(
-        device: torch.device,
-        heads: int,
-        plan_kwargs: dict,
-        rows_list: list,
-        *,
-        local_ranks: int = 1,
-    ) -> None:
-        """Populate the on-disk kernel cache for ``rows_list`` with worker subprocesses.
-
-        Skipped when every variant is already cached (a probe plans each row
-        count without compiling), so a warm restart spawns nothing. Otherwise
-        best-effort: on any failure the serial plan loop that follows compiles
-        in-process, exactly as without workers. See ``prims_ts_precompile``.
-        """
-        from tensorrt_llm._torch.attention.backends.prims_ts import _compile_cache, mla_decode
-
-        from . import prims_ts_precompile
-
-        workers = prims_ts_precompile.worker_count(len(rows_list), local_ranks=local_ranks)
-        if workers <= 1:
-            return
-        try:
-            with _compile_cache.probe_cached():
-                for rows in rows_list:
-                    mla_decode.BatchSparseMLADecodePagedTSWrapper().plan(
-                        device, rows, heads, **plan_kwargs
-                    )
-        except _compile_cache.KernelNotCached:
-            pass
-        except Exception as error:  # noqa: BLE001 -- a probe failure only costs the fan-out
-            if prims_ts_precompile.strict():
-                raise
-            logger.warning(
-                f"PrimTS sparse MLA cache probe failed: {error!r}; compiling in-process."
-            )
-            return
-        else:
-            logger.debug("PrimTS sparse MLA kernel variants are all cached; no precompile workers")
-            return
-        device_index = device.index if device.index is not None else torch.cuda.current_device()
-        payloads = [
-            prims_ts_precompile.encode_payload(device_index, rows, heads, plan_kwargs)
-            for rows in rows_list
-        ]
-        t_pre = time.perf_counter()
-        try:
-            ok = prims_ts_precompile.run_precompile_workers(payloads, workers)
-        except Exception as error:  # noqa: BLE001 -- warmup must not fail on a helper
-            if prims_ts_precompile.strict():
-                raise
-            logger.warning(f"PrimTS sparse MLA parallel precompile skipped: {error!r}")
-            return
-        if not ok and prims_ts_precompile.strict():
-            raise RuntimeError(
-                "PrimTS sparse MLA precompile workers failed (TLLM_PRIMTS_WARM_STRICT=1)"
-            )
-        logger.info(
-            f"PrimTS sparse MLA precompiled {len(payloads)} kernel variants with {workers} workers "
-            f"in {time.perf_counter() - t_pre:.0f} s{'' if ok else ' (some workers failed)'}"
-        )
+        if not max_rows:
+            return []
+        heads = int(self.attn.num_heads)
+        sizes = {
+            rows: _workspace_size(device, rows, heads, **plan_kwargs)
+            for rows in range(1, max_rows + 1)
+        }
+        workspace = torch.empty(max(sizes.values()), device=device, dtype=torch.uint8)
+        wrapper = mla_decode.BatchSparseMLADecodePagedTSWrapper(workspace_buffer=workspace)
+        representatives: dict[object, int] = {}
+        for rows in sizes:
+            wrapper.plan(device, rows, heads, compile=False, **plan_kwargs)
+            spec = wrapper._state["compile_spec"]
+            previous = representatives.get(spec)
+            # Split counts can change with rows. Keep the largest workspace,
+            # breaking ties by rows, so later local loading allocates it once.
+            if previous is None or (sizes[rows], rows) > (sizes[previous], previous):
+                representatives[spec] = rows
+        return sorted(representatives.values(), key=lambda rows: (sizes[rows], rows), reverse=True)
 
     @staticmethod
     def _claim_contract_validation(contract_key: tuple) -> bool:
@@ -839,7 +718,6 @@ class PrimsTSSparseMlaFmha(Fmha):
             has_sinks=sinks is not None,
             fused_groups=groups,
         )
-        self._warm_kernel_variants(**profile)
         plan = self._get_plan(rows=rows, **profile)
 
         # Storage-row indices straight from sparse_attn_predict: the window
@@ -908,4 +786,118 @@ class PrimsTSSparseMlaFmha(Fmha):
         )
 
 
-__all__ = ["PrimsTSSparseMlaFmha", "get_prims_ts_toolchain_unsupported_reason"]
+@dataclass(frozen=True)
+class _WarmupProfile:
+    library: PrimsTSSparseMlaFmha
+    device: torch.device
+    extra: int
+    q_dtype: torch.dtype
+    has_sinks: bool
+    fused_groups: Optional[int]
+
+    def plan_kwargs(self) -> dict:
+        return self.library._plan_kwargs(
+            self.extra, self.q_dtype, self.has_sinks, self.fused_groups
+        )[0]
+
+    def load(self, metadata: "TrtllmAttentionMetadata", rows: int) -> None:
+        self.library._get_plan(
+            metadata=metadata,
+            device=self.device,
+            rows=rows,
+            extra=self.extra,
+            q_dtype=self.q_dtype,
+            has_sinks=self.has_sinks,
+            fused_groups=self.fused_groups,
+        )
+
+
+def _warmup_profiles(profiles: list[_WarmupProfile], metadata: "TrtllmAttentionMetadata") -> None:
+    """Compile all layer profiles in one worker group, then load them locally."""
+    if not profiles:
+        return
+    from . import prims_ts_precompile
+
+    payloads = []
+    plans = []
+    seen = set()
+    for profile in profiles:
+        kwargs = profile.plan_kwargs()
+        heads = int(profile.library.attn.num_heads)
+        key = (profile.device, heads, tuple(kwargs.items()))
+        if key in seen:
+            continue
+        seen.add(key)
+        for rows in profile.library._kernel_variant_rows(metadata, profile.device, kwargs):
+            device_index = profile.device.index
+            if device_index is None:
+                device_index = torch.cuda.current_device()
+            payloads.append(prims_ts_precompile.encode_payload(device_index, rows, heads, kwargs))
+            workspace_bytes = _workspace_size(profile.device, rows, heads, **kwargs)
+            plans.append((workspace_bytes, profile, rows))
+    if not payloads:
+        return
+    start = time.perf_counter()
+    prims_ts_precompile.precompile_payloads(
+        payloads, local_ranks=prims_ts_precompile.local_rank_count(metadata.mapping)
+    )
+    # Allocate the largest workspace first so all profiles can share it. The
+    # serving process must load every artifact even when the disk cache is warm.
+    for _, profile, rows in sorted(plans, key=lambda plan: plan[0], reverse=True):
+        profile.load(metadata, rows)
+    logger.info(
+        f"PrimTS sparse MLA warmup loaded {len(payloads)} variants across {len(seen)} profiles "
+        f"in {time.perf_counter() - start:.1f} s"
+    )
+
+
+def warmup_prims_ts_sparse_mla(
+    model: torch.nn.Module, metadata: "DeepseekV4TrtllmAttentionMetadata"
+) -> None:
+    """Warm enabled DeepSeek-V4 generation profiles before the first model forward."""
+    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.backend import (
+        DeepseekV4TrtllmAttention,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.module import (
+        supports_dsv4_epilogue_fusion,
+    )
+    from tensorrt_llm._torch.attention.mla import MLA
+
+    if metadata.is_cuda_graph or torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("PrimTS kernel warmup requires eager metadata outside graph capture")
+    profiles = []
+    device = metadata.token_positions_cuda.device
+    is_fp8 = PrimsTSSparseMlaFmha._is_fp8_cache(metadata)
+    for layer in model.modules():
+        if not isinstance(layer, MLA) or not isinstance(layer.mqa, DeepseekV4TrtllmAttention):
+            continue
+        if layer.o_a_proj is None:
+            continue
+        if not is_fp8 and layer.dtype != torch.bfloat16:
+            continue
+        manager = layer.mqa._fmha_manager
+        if manager is None:
+            continue
+        for library in manager.fmha_libs:
+            if isinstance(library, PrimsTSSparseMlaFmha):
+                fused = supports_dsv4_epilogue_fusion(layer)
+                if not fused and layer.dtype != torch.bfloat16:
+                    continue  # The unfused kernel only writes BF16 output.
+                profiles.append(
+                    _WarmupProfile(
+                        library=library,
+                        device=device,
+                        extra=library._extra_capacity(metadata),
+                        q_dtype=torch.float8_e4m3fn if is_fp8 else torch.bfloat16,
+                        has_sinks=getattr(layer.mqa, "attn_sink", None) is not None,
+                        fused_groups=layer.n_local_groups if fused else None,
+                    )
+                )
+    _warmup_profiles(profiles, metadata)
+
+
+__all__ = [
+    "PrimsTSSparseMlaFmha",
+    "get_prims_ts_toolchain_unsupported_reason",
+    "warmup_prims_ts_sparse_mla",
+]

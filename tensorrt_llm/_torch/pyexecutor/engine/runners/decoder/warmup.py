@@ -462,6 +462,8 @@ class DecoderWarmup:
         # reaches with every variant (e.g. Kimi-K3's attention-residual kernels).
         with self._warmup_timer.phase("model_decode_kernels"):
             self._prewarm_model_decode_kernels(kv_cache_manager)
+        with self._warmup_timer.phase("prims_ts_sparse_mla"):
+            self._prewarm_prims_ts_sparse_mla(resource_manager, kv_cache_manager)
         if self._context_warmups_supported:
             with (
                 self._warmup_timer.phase(
@@ -900,6 +902,38 @@ class DecoderWarmup:
                 f"Decode kernel prewarm complete ({compiled} kernels, "
                 f"{time.perf_counter() - start:.1f} s)"
             )
+
+    def _prewarm_prims_ts_sparse_mla(
+        self, resource_manager: ResourceManager, kv_cache_manager
+    ) -> None:
+        """Compile and load the enabled PrimTS profiles before any model forward."""
+        from tensorrt_llm._torch.attention.backends.fmha.prims_ts_sparse_mla import (
+            warmup_prims_ts_sparse_mla,
+        )
+        from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.metadata import (
+            DeepseekV4TrtllmAttentionMetadata,
+        )
+
+        if not issubclass(
+            self._config.attention_backend.Metadata, DeepseekV4TrtllmAttentionMetadata
+        ):
+            return
+        if is_context_only_kv_cache(kv_cache_manager) or (
+            getattr(kv_cache_manager, "context_swa_layer_limit", None) is not None
+        ):
+            return
+        metadata = self._metadata.setup_attention(
+            kv_cache_manager, get_draft_kv_cache_manager(self._config.spec_config, resource_manager)
+        )
+        with torch.inference_mode():
+            warmup_prims_ts_sparse_mla(self.model, metadata)
+        torch.cuda.synchronize()
+        # Compilation is local; align peers before the first collective-bearing forward.
+        if self.dist is not None:
+            if self.mapping.cp_size > 1:
+                self.dist.tp_cp_allgather(1)
+            elif self.mapping.tp_size > 1:
+                self.dist.tp_allgather(1)
 
     def _ensure_dsa_attn_metadata_for_warmup(self, resource_manager: ResourceManager) -> None:
         """Build the DSA attention metadata if no warmup forward created it, so
