@@ -605,7 +605,7 @@ class KvCacheConnectorSchedulerOutputRequest:
         from ..kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 
         is_v2 = isinstance(kv_cache_manager, KVCacheManagerV2)
-        tokens = req.get_tokens(0)
+        num_tokens = req.get_num_tokens(0)
 
         new_block_ids_by_layer_group: List[List[int]] = []
         if is_v2:
@@ -638,7 +638,8 @@ class KvCacheConnectorSchedulerOutputRequest:
             new_block_ids = block_ids[len(self.block_ids) :]
             self.block_ids.extend(new_block_ids)
 
-        new_tokens = tokens[len(self.tokens) :]
+        # Copy only the tokens added since the last call; get_tokens(0) copies them all.
+        new_tokens = req.get_tokens_range(0, len(self.tokens), num_tokens)
         self.tokens.extend(new_tokens)
 
         if req.state in (
@@ -648,7 +649,7 @@ class KvCacheConnectorSchedulerOutputRequest:
             computed_position = req.context_current_position
             num_scheduled_tokens = min(req.context_remaining_length, req.context_chunk_size)
         else:
-            computed_position = len(tokens) - 1
+            computed_position = num_tokens - 1
             num_scheduled_tokens = 1 + get_draft_token_length(
                 req
             )  # Specdec with draft tokens is not supported yet.

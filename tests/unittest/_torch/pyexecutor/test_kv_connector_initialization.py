@@ -126,7 +126,8 @@ def test_single_group_priorities_follow_new_page_ordinals() -> None:
         kv_cache_retention_config=KvCacheRetentionConfig([]),
         cache_salt=None,
     )
-    req.get_tokens.return_value = list(range(64))
+    req.get_num_tokens.return_value = 64
+    req.get_tokens_range.side_effect = lambda beam, begin, end: list(range(64))[begin:end]
     tracker = KvCacheConnectorSchedulerOutputRequest()
 
     first = tracker.update_and_build_data(req, manager)
