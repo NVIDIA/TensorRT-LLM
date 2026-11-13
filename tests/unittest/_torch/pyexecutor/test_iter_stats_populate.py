@@ -56,6 +56,7 @@ from tensorrt_llm.bindings.executor import (
     KvCacheStats,
     SpecDecodingStats,
 )
+from tensorrt_llm.metrics.perf import PerfMetricsCollector
 
 pytestmark = pytest.mark.cpu_only
 
@@ -196,6 +197,9 @@ def _build_fake_self(queued_items, model_engine_iter_states, *, enable_attention
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
     fake = MagicMock()
+    fake._perf_metrics = PerfMetricsCollector()
+    fake.dist.rank = 0
+    fake.global_rank = 0
     fake.max_num_active_requests = 64
     fake.iter_counter = 1
     fake.executor_request_queue.get_request_queue_size.return_value = len(queued_items)
@@ -1257,3 +1261,5 @@ def test_update_iter_stats_does_not_overwrite_construction_iter():
 
     # If someone re-introduces ``stats.iter = self.iter_counter`` this becomes 999.
     assert stats.iter == 17
+    assert fake_self._perf_metrics.latest_rank["captureIter"] == 999
+    assert fake_self._perf_metrics.latest_rank["batchIter"] == 17

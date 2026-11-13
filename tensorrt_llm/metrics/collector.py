@@ -22,6 +22,8 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Union
 from tensorrt_llm.logger import logger
 
 from .enums import MetricNames
+from .perf import (FINISH_REASON_LABEL, PerfMetricsCollector, PerfMetricsRecord,
+                   kv_cache_utilization)
 
 if TYPE_CHECKING:
     from prometheus_client import CollectorRegistry, Counter
@@ -38,7 +40,7 @@ MAX_SPEC_DECODE_POSITION_LABELS = 16
 
 
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.10.0rc1/vllm/engine/metrics.py#L30
-class MetricsCollector:
+class PrometheusExposure:
     """Collects and logs metrics from TensorRT-LLM engine stats to Prometheus.
 
     Used by OpenAIServer in tensorrt_llm/serve/openai_server.py.
@@ -120,7 +122,7 @@ class MetricsCollector:
             trtllm_speculative_config_info
             trtllm_kv_cache_config_info
     """
-    labelname_finish_reason = "finished_reason"
+    labelname_finish_reason = FINISH_REASON_LABEL
     labelname_cache_level = "cache_level"
     labelname_cache_tier = "cache_tier"
     labelname_dp_rank = "dp_rank"
@@ -195,6 +197,7 @@ class MetricsCollector:
                     f"{name} must be strictly increasing, got {buckets}.")
         self.last_log_time = time.time()
         self.labels = labels
+        self._last_rank_snapshots: dict[str, object] = {}
         iteration_labelnames = (*self.labels, self.labelname_dp_rank)
         self.metric_prefix = "trtllm_"
 
@@ -824,7 +827,42 @@ class MetricsCollector:
             self._log_counter(counter, {self.labelname_dp_rank: rank}, delta)
         previous[rank] = value
 
+    def emit(self, record: PerfMetricsRecord) -> None:
+        """Expose collected observations through the legacy statistics adapters."""
+        if record.kind == "request":
+            self._expose_request_metrics(record.per_req)
+        elif record.kind == "loop":
+            self._expose_rank_snapshot(record)
+            self._expose_iteration_stats(
+                {"executorLoop": {
+                    "kind": "loop",
+                    "per_iter": record.per_iter
+                }})
+        elif record.kind == "rank":
+            self._expose_rank_snapshot(record)
+        else:
+            self._expose_iteration_stats(record.iteration_view())
+
+    def _expose_rank_snapshot(self, record: PerfMetricsRecord) -> None:
+        """A cached rank snapshot may accompany several loop records; observe it once."""
+        if not record.per_rank:
+            return
+        identity = str(
+            record.per_rank.get("globalRank", record.per_rank.get("rank", 0)))
+        if self._last_rank_snapshots.get(identity) is record.per_rank:
+            return
+        self._last_rank_snapshots[identity] = record.per_rank
+        self._expose_iteration_stats(record.per_rank)
+
     def log_request_metrics_dict(self, metrics_dict: dict) -> None:
+        """Compatibility adapter for legacy candidate dictionaries."""
+        self.emit(PerfMetricsCollector.collect_request(metrics_dict))
+
+    def log_iteration_stats(self, iteration_stats: dict) -> None:
+        """Compatibility adapter for legacy iteration dictionaries."""
+        self.emit(PerfMetricsCollector.collect_iteration(iteration_stats))
+
+    def _expose_request_metrics(self, metrics_dict: dict) -> None:
         """Log per-request metrics from TRTLLM engine responses.
 
         This method updates Prometheus metrics including:
@@ -940,7 +978,7 @@ class MetricsCollector:
 
             self.last_log_time = time.time()
 
-    def log_iteration_stats(self, iteration_stats: dict) -> None:
+    def _expose_iteration_stats(self, iteration_stats: dict) -> None:
         """Log iteration-level statistics from TRTLLM engine.
 
         Updates Prometheus gauges/counters for queue load, memory usage, batch sizes,
@@ -1083,7 +1121,7 @@ class MetricsCollector:
             if "usedNumBlocks" in kv_stats and "maxNumBlocks" in kv_stats:
                 max_num_blocks = kv_stats["maxNumBlocks"]
                 if max_num_blocks:
-                    utilization = kv_stats["usedNumBlocks"] / max_num_blocks
+                    utilization = kv_cache_utilization(kv_stats)
                     self._log_gauge(self.kv_cache_utilization,
                                     utilization,
                                     labels=rank_labels)
@@ -1253,3 +1291,7 @@ class MetricsCollector:
         """Increment the error counter, labeled by HTTP status code."""
         labels = {**self.labels, self.labelname_http_code: str(http_code)}
         self.counter_request_error.labels(**labels).inc(1)
+
+
+class MetricsCollector(PrometheusExposure):
+    """Compatibility name for the long-lived Prometheus exposure adapter."""

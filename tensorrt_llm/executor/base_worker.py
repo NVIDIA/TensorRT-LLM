@@ -32,7 +32,7 @@ import torch
 from tensorrt_llm.logger import logger
 
 from .._torch.peft.lora.manager import LoraManager
-from .._torch.pyexecutor.kv_cache_stats import append_kv_cache_iteration_stats
+from .._torch.pyexecutor.iteration_stats import IterationStatsRecord
 from .._torch.pyexecutor.llm_request import LlmResponse
 from .._torch.pyexecutor.request_inputs import (ExecutorRequest,
                                                 PythonRequestInputs)
@@ -48,6 +48,7 @@ from ..llmapi.startup_checks import no_visible_gpu_error
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import _SyncQueue, configure_cpu_affinity, logger_debug
+from ..metrics.perf import PerfMetricsCollector
 from ..sampling_params import SamplingParams
 from .executor import GenerationExecutor
 from .ipc import IpcQueue
@@ -1283,69 +1284,19 @@ class BaseWorker(GenerationExecutor):
             return
         stop_fn()
 
-    # Define a Callable to join iteration and request stats
     @staticmethod
-    def _stats_serializer(stats) -> str:
-        # Per-rank path: stats is ("per_rank_dict", {..., "rank": N}).
-        # Already serialized on the producing rank via allgather — just emit.
-        if (isinstance(stats, tuple) and len(stats) == 2
-                and stats[0] == "per_rank_dict"):
-            return json.dumps(stats[1])
+    def _stats_serializer(stats: tuple) -> str:
+        """Serialize named stats records, legacy tuples, or tagged per-rank rows."""
+        if isinstance(stats, tuple) and len(stats) == 2:
+            tag, rank_stats = stats
+            if tag == "per_rank_dict":
+                return PerfMetricsCollector.collect_iteration(
+                    rank_stats).iteration_json()
 
-        iteration_stats, req_stats = stats[0], stats[1]
-        kv_iter_stats = stats[2] if len(stats) > 2 else None
-        attention_dp_rank = stats[3] if len(stats) > 3 else None
-        # Newer slots — guarded with len() checks so historical 4-tuples and
-        # any external code still appending the legacy shape keep working.
-        host_step_time_ms = stats[4] if len(stats) > 4 else None
-        prev_device_step_time_ms = stats[5] if len(stats) > 5 else None
-        scheduler_mode = stats[6] if len(stats) > 6 else None
-        gpu_forward_time_ms = stats[7] if len(stats) > 7 else None
+        entry = IterationStatsRecord.from_tuple(stats)
 
-        stats_dict = json.loads(iteration_stats.to_json_str())
-        # Always tag the row so Dynamo's adapter can read
-        # stat["attentionDpRank"] without a missing-key branch. Non-ADP stats
-        # default to rank 0; ADP stats carry the rank supplied by PyExecutor.
-        stats_dict["attentionDpRank"] = (0 if attention_dp_rank is None else
-                                         attention_dp_rank)
-
-        if req_stats is not None and len(req_stats) > 0:
-            stats_dict["requestStats"] = []
-            for req_stat in req_stats:
-                stats_dict["requestStats"].append(
-                    json.loads(req_stat.to_json_str()))
-
-        append_kv_cache_iteration_stats(stats_dict, kv_iter_stats)
-
-        # Per-loop CPU wall captured by profile_step() — always a clean
-        # single-loop measurement, matching the log line's `host_step_time`.
-        # Prefer this over iterLatencyMS when you need absolute per-loop
-        # CPU cost, especially under the overlap scheduler where
-        # iterLatencyMS measures the batch's full lifecycle (~2 loops).
-        if host_step_time_ms is not None:
-            stats_dict["hostStepTimeMS"] = host_step_time_ms
-        # GPU forward time read via the ping-pong CUDA event pair in
-        # profile_step(). Note the "prev" in the name: under steady state
-        # the value lags its sibling host_step_time on the same record by
-        # one loop (the event-pair being read corresponds to the loop
-        # before the one host_step_time describes). See the ping-pong
-        # comment in PyExecutor._profiler for the design rationale.
-        if prev_device_step_time_ms is not None:
-            stats_dict["prevDeviceStepTimeMS"] = prev_device_step_time_ms
-        # Batch-matched GPU forward time measured from the CUDA events around
-        # this record's _forward_step. This is the preferred field for
-        # ForwardPassMetrics wall_time.
-        if gpu_forward_time_ms is not None:
-            stats_dict["gpuForwardTimeMS"] = gpu_forward_time_ms
-        # Scheduler mode for this record. "overlap" means iterLatencyMS
-        # spans ~2 loops (use hostStepTimeMS for clean per-loop cost);
-        # "non_overlap" means iterLatencyMS is itself the clean per-loop
-        # CPU wall. Set per-record so consumers do not need server config.
-        if scheduler_mode is not None:
-            stats_dict["schedulerMode"] = scheduler_mode
-
-        # Convert back to JSON string
-        return json.dumps(stats_dict)
+        record = PerfMetricsCollector.collect_iteration(entry.to_dict())
+        return record.iteration_json()
 
     @staticmethod
     def _kv_cache_capacity_serializer(capacity) -> str:

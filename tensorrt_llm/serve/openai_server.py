@@ -66,6 +66,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.media.encoding import image_to_bytes
 from tensorrt_llm.media.tensor_payload import is_tensor_format
 from tensorrt_llm.metrics.collector import MetricsCollector
+from tensorrt_llm.metrics.perf import PerfMetricsCollector
 from tensorrt_llm.runtime.kv_cache_hash import \
     get_effective_kv_cache_event_hash_algo
 from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
@@ -1957,7 +1958,11 @@ class OpenAIServer(_VideoRoutesMixin):
             if record is not None and raw_request is not None:
                 raw_request.state.perf_metrics_records.append(record)
         if self.metrics_collector:
-            if res.candidate_metrics:
+            records = getattr(res, "candidate_metric_records", None)
+            if records:
+                for record in records:
+                    self.metrics_collector.emit(record)
+            elif res.candidate_metrics:
                 for candidate_m in res.candidate_metrics:
                     self.metrics_collector.log_request_metrics_dict(candidate_m)
             elif res.metrics_dict:
@@ -2078,7 +2083,8 @@ class OpenAIServer(_VideoRoutesMixin):
             self, "_spec_decode_num_spec_tokens", None)
 
     def _record_iteration_stat(self, llm_stat: dict) -> None:
-        self.metrics_collector.log_iteration_stats(llm_stat)
+        self.metrics_collector.emit(
+            PerfMetricsCollector.collect_iteration(llm_stat))
         # Tee into the /metrics snapshot buffer so the HTTP handler can serve
         # without competing for the engine queue (nvbug 6102381).
         if self._iteration_stats_buffer is not None:

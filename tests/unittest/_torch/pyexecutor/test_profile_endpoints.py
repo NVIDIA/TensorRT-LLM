@@ -21,9 +21,15 @@ or an MPI/RPC environment.
 """
 
 import threading
+from types import SimpleNamespace
+from unittest.mock import Mock
 
+import pytest
+
+from tensorrt_llm._torch.pyexecutor import profiling
 from tensorrt_llm._torch.pyexecutor.profiling import PyExecutorProfileManager
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+from tensorrt_llm.metrics.perf import PerfMetricsCollector
 
 
 def _bare_executor():
@@ -45,6 +51,7 @@ def _bare_executor():
     # real PyExecutor.__init__ wires this up; replicate that here for
     # the bare-bones test double so ``executor.start_profile``,
     # ``executor.stop_profile``, etc. delegate correctly.
+    executor._perf_metrics = PerfMetricsCollector()
     executor._profile_manager = PyExecutorProfileManager(executor)
     return executor
 
@@ -393,3 +400,84 @@ def test_apply_profile_stop_config_reports_cancel_vs_schedule(tmp_path):
     assert executor._apply_profile_stop_config() is False
     assert executor._runtime_profile_pending_stop_iter == 8
     assert 8 in executor.profile_stop_iters
+
+
+@pytest.mark.cpu_only
+def test_rebind_resets_phase_metrics_without_stale_profile_reference() -> None:
+    executor = _bare_executor()
+    executor._closed = False
+    executor._resources_released = True
+    executor._event_loop_error = None
+    executor._fatal_error = None
+    collector = executor._perf_metrics
+    collector.collect_rank({"kvCacheStats": {"maxNumBlocks": 10}}, capture_iter=8)
+    values = {"iter": 8, "rank": 0, "globalRank": 0, "numFetchedRequestsTotal": 20}
+    collector.collect_loop(values)
+    executor._initialize_execution = Mock()
+    executor.rebind_resources(Mock())
+    assert executor._profile_manager.metrics is collector
+    assert collector.latest_loop is None
+    assert not collector.latest_rank
+    new = collector.collect_loop({**values, "iter": 0, "numFetchedRequestsTotal": 2})
+    assert new.per_iter["numFetchedRequests"] == 2
+    assert new.per_iter["loopSequence"] == 0
+    assert not new.per_rank
+    executor._initialize_execution.assert_called_once()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("rank,stats_enabled", [(0, False), (1, False), (0, True), (1, True)])
+def test_profile_step_collects_with_source_and_logging_gates(
+    monkeypatch: pytest.MonkeyPatch, rank: int, stats_enabled: bool
+) -> None:
+    executor = _bare_executor()
+    executor.dist = SimpleNamespace(rank=rank, pp_size=1)
+    executor.model_engine = SimpleNamespace(model=None, iter_states="decode")
+    executor.print_log = True
+    executor.enable_iter_perf_stats = stats_enabled
+    executor.is_warmup = False
+    executor.num_scheduled_requests = 0
+    executor.num_fetch_requests_cur_rank = 2
+    executor.num_fetch_requests = 2
+    executor.active_requests = []
+    executor.num_dummy_requests = 0
+    executor.num_unscheduled_requests = 0
+    executor._iter_adp_dummy_ctx_tokens = 0
+    executor._iter_adp_dummy_gen_tokens = 0
+    reader = Mock(return_value=SimpleNamespace(max_num_blocks=10, free_num_blocks=4))
+    executor.kv_cache_manager = SimpleNamespace(get_kv_cache_stats=reader)
+    monkeypatch.setenv(profiling.PROFILE_LOG_RANKS_ENV_VAR_NAME, "0")
+    monkeypatch.delenv(profiling.PROFILE_START_STOP_ENV_VAR_NAME, raising=False)
+    monkeypatch.setattr(profiling.torch.cuda, "Event", Mock())
+    monkeypatch.setattr(profiling, "get_calibrator", Mock(return_value=Mock()))
+    monkeypatch.setattr(
+        profiling,
+        "runtime_hooks_of",
+        Mock(return_value=SimpleNamespace(iteration_timing_one_event=False)),
+    )
+    messages = []
+    executor._profile_manager.metrics_logger._write = messages.append
+    with executor._profile_manager.profile_step() as step:
+        step()
+        executor.iter_counter = 1
+        step()
+    assert executor._perf_metrics.latest_loop is not None
+    if stats_enabled:
+        import json
+
+        from tensorrt_llm.executor.base_worker import BaseWorker
+
+        executor.enable_attention_dp = False
+        executor.disable_overlap_scheduler = True
+        executor._latest_kv_iter_stats = None
+        executor.stats = []
+        executor.stats_lock = threading.Lock()
+        executor.max_stats_len = 10
+        native_stats = Mock()
+        native_stats.to_json_str.return_value = '{"iter": 0}'
+        executor._append_iter_stats(native_stats)
+        wire = json.loads(BaseWorker._stats_serializer(executor.stats[0]))
+        assert wire["executorLoop"]["per_iter"]["iter"] == 1
+        assert wire["iter"] == 0
+    assert reader.call_count == int(rank == 0 and not stats_enabled)
+    assert any("iter = " in message for message in messages) == (rank == 0)
