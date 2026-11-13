@@ -4671,12 +4671,10 @@ def loadStageResourceRequests(pipeline)
         trtllm_utils.checkoutFile(LLM_REPO, env.gitlabCommit, configPath, configDir)
         configText = pipeline.readFile("${configDir}/stage_resources.json")
     }
-    def config = pipeline.readJSON(text: configText, returnPojo: true)
-    if (!(config instanceof Map)) {
+    def requests = pipeline.readJSON(text: configText, returnPojo: true)
+    if (!(requests instanceof Map)) {
         pipeline.error("stage_resources.json must contain a JSON object")
     }
-    // Top-level keys are stage names. Keys that start with "_", such as _copyright, are not stages.
-    def requests = config.findAll { stageName, resources -> !stageName.startsWith("_") }
     requests.each { stageName, resources ->
         ["cpu_m", "memory_mi"].each { key ->
             def value = resources[key]
