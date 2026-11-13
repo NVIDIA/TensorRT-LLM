@@ -126,8 +126,8 @@ class _BlockOffsetsMemo:
 
     A ``BLOCKS`` descriptor writes ``K[i] = f(page[i])`` and ``V[i] = f(page[i]) +
     kv_offset`` into the device block table from the host page-index row, a pure
-    function of the page index, the pool's scale and its offset. So when a device
-    row ``(pool, seq)`` last received ``f`` of the host row ``row`` over columns
+    function of the page index, the table's scale and its offset. So when a device
+    row ``(table, seq)`` last received ``f`` of the host row ``row`` over columns
     ``[0, n)`` with the same scale and offset, and nothing else has written the
     device table since, re-copying a column whose page index is unchanged writes
     the word already there; ``changed_runs`` lists the others.
@@ -149,7 +149,7 @@ class _BlockOffsetsMemo:
 
     def __init__(self):
         self._scope: Optional[tuple] = None
-        #: (pool, seq) -> (host row, scale, kv_offset, page indices of columns [0, n)).
+        #: (table, seq) -> (host row, scale, kv_offset, page indices of columns [0, n)).
         self._rows: dict[tuple[int, int], tuple[int, int, int, np.ndarray]] = {}
 
     def forget(self) -> None:
@@ -170,15 +170,24 @@ class _BlockOffsetsMemo:
             self._rows.clear()
         self._scope = scope
 
+    def width(self, table: int, seq: int) -> Optional[int]:
+        """Columns of device row ``(table, seq)`` the recorded copies wrote, or None if unknown.
+
+        Past them the row holds the words its writer left there: the bad-page word for an
+        attention-op table, whose copy clears what its previous width covered.
+        """
+        entry = self._rows.get((table, seq))
+        return None if entry is None else entry[3].shape[0]
+
     def changed_runs(
-        self, pool: int, seq: int, row: int, scale: int, kv_offset: int, pages: np.ndarray
+        self, table: int, seq: int, row: int, scale: int, kv_offset: int, pages: np.ndarray
     ) -> list[tuple[int, int]]:
         """Column runs ``[lo, hi)`` of ``pages`` (this step's first ``n`` page indices) to copy.
 
         Remembers ``pages`` as what the device row holds once the recorded copies have run.
         """
         n = pages.shape[0]
-        entry = self._rows.get((pool, seq))
+        entry = self._rows.get((table, seq))
         if entry is None or entry[:3] != (row, scale, kv_offset):
             runs = [(0, n)] if n else []
         else:
@@ -198,7 +207,7 @@ class _BlockOffsetsMemo:
                     runs.append((m, n))
             if len(runs) > _MAX_BLOCK_RUNS:
                 runs = [(runs[0][0], runs[-1][1])]
-        self._rows[(pool, seq)] = (row, scale, kv_offset, pages.copy())
+        self._rows[(table, seq)] = (row, scale, kv_offset, pages.copy())
         return runs
 
 
@@ -455,6 +464,11 @@ class _PrepareStager:
         first ``ceil(capacity / tokens_per_block) + 1`` columns (the batch maximum)
         carry everything read; the built-in copy moves all ``max_blocks_per_seq``.
 
+        The device table has one table per pool, or, for a manager with attention-op
+        pool groups (life cycles that mix page sizes, as a target and a drafter in one
+        manager), one per group: its life cycle's host rows at the group's scale and
+        K/V offset, with ``BAD_PAGE_INDEX`` kept, as the manager's own copy writes them.
+
         Returns:
             True if the copy is recorded; False if it is declined (the caller
             copies), which it is after an earlier decline.
@@ -467,8 +481,6 @@ class _PrepareStager:
             host is None
             or getattr(manager, "sparse_metadata_batch", None) is not None
             or getattr(manager, "_use_per_layer_page_tables", True)
-            # Shared attention-op tables are not the life cycles' SHARED-path tables.
-            or getattr(manager, "_attention_op_pool_groups", None) is not None
             or not dst.is_cuda
             or dst.dtype != torch.int32
             or host.dtype != torch.int32
@@ -476,7 +488,6 @@ class _PrepareStager:
             or not host.is_contiguous()
             or dst.dim() != 4
             or host.dim() != 4
-            or dst.shape[0] != host.shape[0]
             or dst.shape[2] != 2
             or dst.shape[3] != host.shape[3]
             or num_seqs > dst.shape[1]
@@ -500,50 +511,67 @@ class _PrepareStager:
         rows = copy_idx.tolist()
         if len(rows) != num_seqs:
             return self._decline_blocks("block offsets: copy index length")
-        scales = [int(s) for s in manager._index_scale_ints]
-        kv_offsets = [int(o) for o in manager.kv_offset.tolist()]
-        host_rows, dst_rows = host.shape[1], dst.shape[1]
-        # (pool, seq, host row, column runs): one full-width run per row without a memo.
-        memo = self.blocks_memo
-        if memo is None:
-            plan = [
-                (pool, seq, row, [(0, cols)])
-                for pool in range(host.shape[0])
-                for seq, row in enumerate(rows)
-            ]
+        # Per device table: (host pool, scale, K/V offset, word for a BAD_PAGE_INDEX page).
+        groups = getattr(manager, "_attention_op_pool_groups", None)
+        if groups is None:
+            scales = [int(s) for s in manager._index_scale_ints]
+            kv_offsets = [int(o) for o in manager.kv_offset.tolist()]
+            tables = [(pool, scales[pool], kv_offsets[pool], 0) for pool in range(host.shape[0])]
         else:
+            from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
+
+            tables = [
+                (int(g.pool_id), int(g.scale), int(g.kv_offset), BAD_PAGE_INDEX) for g in groups
+            ]
+        if dst.shape[0] != len(tables):
+            return self._decline_blocks("block offsets: layout or manager mode")
+        host_rows, dst_rows = host.shape[1], dst.shape[1]
+        # A drafter in the manager reads its rows past the readable columns for their extent,
+        # so attention-op tables hold the bad-page word there, as the manager's own copy writes.
+        clear_tail = groups is not None
+        memo = self.blocks_memo
+        if memo is not None:
             memo.open(manager, dst, self.attn_metadata)
             pages = host.numpy()
-            plan = [
-                (
-                    pool,
-                    seq,
-                    row,
-                    memo.changed_runs(
-                        pool, seq, row, scales[pool], kv_offsets[pool], pages[pool, row, 0, :cols]
-                    ),
-                )
-                for pool in range(host.shape[0])
-                for seq, row in enumerate(rows)
-            ]
-        if not self.staging.room(sum(len(runs) for *_, runs in plan)):
+        # (table, seq, host row, column runs, columns past them to clear): one full-width run
+        # per row without a memo.
+        plan = []
+        for table, (pool, scale, kv_offset, _) in enumerate(tables):
+            for seq, row in enumerate(rows):
+                if memo is None:
+                    runs, written = [(0, cols)], None
+                else:
+                    written = memo.width(table, seq)
+                    runs = memo.changed_runs(
+                        table, seq, row, scale, kv_offset, pages[pool, row, 0, :cols]
+                    )
+                tail = (cols, num_blocks if written is None else written) if clear_tail else (0, 0)
+                plan.append((table, seq, row, runs, tail))
+        num_descriptors = sum(len(runs) + 2 * (hi > lo) for *_, runs, (lo, hi) in plan)
+        if not self.staging.room(num_descriptors):
             return self._decline_blocks("staging block full")
         st = self.staging
         copied = 0
-        for pool, seq, row, runs in plan:
+        for table, seq, row, runs, (lo_tail, hi_tail) in plan:
+            pool, scale, kv_offset, bad_page = tables[table]
             src = _addr(host, (pool * host_rows + row) * 2 * num_blocks)
-            k = _addr(dst, (pool * dst_rows + seq) * 2 * num_blocks)
-            v = _addr(dst, ((pool * dst_rows + seq) * 2 + 1) * num_blocks)
+            k = _addr(dst, (table * dst_rows + seq) * 2 * num_blocks)
+            v = _addr(dst, ((table * dst_rows + seq) * 2 + 1) * num_blocks)
             for lo, hi in runs:
                 st.blocks(
                     self._dst(k + lo * 4, (hi - lo) * 4),
                     self._dst(v + lo * 4, (hi - lo) * 4),
                     src + lo * 4,
                     hi - lo,
-                    scales[pool],
-                    kv_offsets[pool],
+                    scale,
+                    kv_offset,
+                    bad_page,
                 )
                 copied += hi - lo
+            if hi_tail > lo_tail:
+                n = hi_tail - lo_tail
+                st.fill(self._dst(k + lo_tail * 4, n * 4), 1, n, bad_page)
+                st.fill(self._dst(v + lo_tail * 4, n * 4), 1, n, bad_page)
         if memo is not None:
             self.counts["block columns copied"] += copied
             self.counts["block columns kept"] += cols * len(plan) - copied
@@ -659,7 +687,7 @@ class _PrepareStager:
         if not self.staging.room(len(rows)):
             return None
         for row in rows:
-            self.staging._add(*(int(v) for v in row[:7]))
+            self.staging._add(*(int(v) for v in row))
         return (input_ids.data_ptr(), position_ids.data_ptr(), n)
 
 

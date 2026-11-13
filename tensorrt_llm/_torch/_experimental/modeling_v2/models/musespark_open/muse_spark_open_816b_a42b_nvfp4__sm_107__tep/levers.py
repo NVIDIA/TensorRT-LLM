@@ -944,15 +944,20 @@ def _decode_qkv_excluded(d: Deployment, t: Resolving) -> Optional[str]:
     return None
 
 
-#: The deployment the single-request decode schedule of sm107 TEP8 was measured on.
+#: The deployments the single-request decode schedule of sm107 TEP8 was measured on.
 _SINGLE_REQUEST = (
-    "aggregated sm107 tep8 servers of max_batch_size 1 over a dense drafter context arena"
+    "aggregated sm107 tep8 servers of max_batch_size 1 over a dense or paged drafter context arena"
 )
 
 
 def _single_request_tep8(d: Deployment) -> bool:
-    """Whether ``d`` is the deployment the single-request decode schedule was measured on."""
-    return d.tp == 8 and d.role is Role.AGG and d.max_batch_size == 1 and d.arena is Arena.DENSE
+    """Whether ``d`` is a deployment the single-request decode schedule was measured on."""
+    return (
+        d.tp == 8
+        and d.role is Role.AGG
+        and d.max_batch_size == 1
+        and d.arena in (Arena.DENSE, Arena.PAGED)
+    )
 
 
 def _on_single_request(what: str) -> RuleFn:
@@ -1064,11 +1069,13 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
             params=(Param("MAX_BATCH", 8, 1, 64),),
         ),
         "drafter_kv_side_chain": Rule(
-            "LL", Kind.BITWISE, _always("decode steps of 1..64 requests over a dense arena")
+            "LL",
+            Kind.BITWISE,
+            _always("decode steps of 1..64 requests over a dense arena or pages"),
         ),
         "drafter_fc_early_fork": Rule("LL", Kind.BITWISE, _always("forked side-chain steps")),
         "drafter_preamble_from_commit": Rule(
-            "LL", Kind.BITWISE, _always("folded steps over a dense arena")
+            "LL", Kind.BITWISE, _always("folded steps over a dense arena or pages")
         ),
         "head_sampler_coop_fold": Rule(
             "LL",

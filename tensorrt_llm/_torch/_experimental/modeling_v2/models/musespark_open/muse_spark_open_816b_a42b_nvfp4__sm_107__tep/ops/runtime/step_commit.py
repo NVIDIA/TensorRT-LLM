@@ -14,12 +14,13 @@ Descriptor kinds (every element is a 32-bit word):
 * ``COPY``   ``dst[i] = staged[i]`` -- host bytes recorded with ``copy``.
 * ``GATHER`` ``dst[i * dst_stride] = src[i * src_stride] + add`` -- device int32.
 * ``FILL``   ``dst[i * dst_stride] = value``.
-* ``BLOCKS`` the KV-cache block-offset transform of
-  ``copyBatchBlockOffsetsToDeviceKernel``
-  (``cpp/tensorrt_llm/batch_manager/kvCacheManagerV2Utils.cu``) over the first
-  ``count`` columns of one host page-index row: ``K[i] = 0`` if the page index
-  is ``BAD_PAGE_INDEX`` (-1) else ``scale * v``, and ``V[i]`` the same plus
-  ``kv_offset``, in int32 arithmetic as the C++ kernel.
+* ``BLOCKS`` the KV-cache block-offset transform over the first ``count``
+  columns of one host page-index row: ``K[i] = scale * v`` and
+  ``V[i] = scale * v + kv_offset`` in int32 arithmetic, and both are
+  ``bad_page`` where the page index is ``BAD_PAGE_INDEX`` (-1). With
+  ``bad_page`` 0 this is ``copyBatchBlockOffsetsToDeviceKernel``
+  (``cpp/tensorrt_llm/batch_manager/kvCacheManagerV2Utils.cu``); with -1 it is
+  ``KVCacheManagerV2``'s attention-op table conversion.
 
 Programs run concurrently and in no particular order, so the descriptors of one
 launch must write disjoint words and must not read a word another descriptor of
@@ -68,7 +69,7 @@ from tensorrt_llm.logger import logger
 
 KIND_COPY, KIND_GATHER, KIND_FILL, KIND_BLOCKS = 0, 1, 2, 3
 
-#: int64 fields per descriptor: kind, dst, src, count, a4, a5, a6, unused.
+#: int64 fields per descriptor: kind, dst, src, count, a4, a5, a6, a7.
 DESC_FIELDS = 8
 _DESC_BYTES = DESC_FIELDS * 8
 
@@ -136,12 +137,13 @@ def _step_commit_kernel(desc_addr, BLOCK: tl.constexpr):
             values = tl.zeros([BLOCK], dtype=tl.int32) + a5.to(tl.int32)
             tl.store(dst + offs * a6, values, mask=mask)
         else:
+            bad_page = tl.load(desc + 7, cache_modifier=".cv").to(tl.int32)
             pages = tl.load(src + offs, mask=mask, cache_modifier=".cv")
             scaled = pages * a4.to(tl.int32)
             bad = pages == -1
-            tl.store(dst + offs, tl.where(bad, 0, scaled), mask=mask)
+            tl.store(dst + offs, tl.where(bad, bad_page, scaled), mask=mask)
             dst_v = a6.to(tl.pointer_type(tl.int32))
-            tl.store(dst_v + offs, tl.where(bad, 0, scaled + a5.to(tl.int32)), mask=mask)
+            tl.store(dst_v + offs, tl.where(bad, bad_page, scaled + a5.to(tl.int32)), mask=mask)
 
 
 @triton.jit(do_not_specialize=["desc_addr"])
@@ -317,12 +319,14 @@ class StepStaging:
             self.short = True
         return fits
 
-    def _add(self, kind: int, dst: int, src: int, count: int, a4: int, a5: int, a6: int) -> None:
+    def _add(
+        self, kind: int, dst: int, src: int, count: int, a4: int, a5: int, a6: int, a7: int = 0
+    ) -> None:
         if count <= 0:
             return
         if self.num >= self._desc_np.shape[0]:
             raise RuntimeError(f"StepStaging: more than {self._desc_np.shape[0]} descriptors")
-        self._desc_np[self.num] = (kind, dst, src, count, a4, a5, a6, 0)
+        self._desc_np[self.num] = (kind, dst, src, count, a4, a5, a6, a7)
         self.num += 1
         if count > self._max_count:
             self._max_count = count
@@ -386,9 +390,13 @@ class StepStaging:
         count: int,
         scale: int,
         kv_offset: int,
+        bad_page: int = 0,
     ) -> None:
-        """Record the block-offset transform of one host page-index row's first ``count`` columns."""
-        self._add(KIND_BLOCKS, dst_k_addr, src_addr, count, scale, kv_offset, dst_v_addr)
+        """Record the block-offset transform of one host page-index row's first ``count`` columns.
+
+        ``bad_page`` is the word both lanes get for a ``BAD_PAGE_INDEX`` page.
+        """
+        self._add(KIND_BLOCKS, dst_k_addr, src_addr, count, scale, kv_offset, dst_v_addr, bad_page)
 
     # Execution -------------------------------------------------------------
 

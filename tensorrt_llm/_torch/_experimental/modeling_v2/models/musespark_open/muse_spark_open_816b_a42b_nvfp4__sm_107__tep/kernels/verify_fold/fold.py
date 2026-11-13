@@ -85,7 +85,12 @@ from ...ops.embedding.replicated_gather import (
     replicated_embedding_gather_twice,
 )
 from ...ops.spec.dflash_accept import FORCE_FRACTIONAL
-from ...ops.spec.dflash_verify_fold import MAX_REQUESTS, VerifyFold, dflash_verify_fold
+from ...ops.spec.dflash_verify_fold import (
+    ACCEPTED_GIVEN,
+    MAX_REQUESTS,
+    VerifyFold,
+    dflash_verify_fold,
+)
 from ...ops.spec.draft_path_walk_tail import draft_path_walk_tail
 from ..draft_head import head as _draft_head
 from ..drafter_block_decode import block_decode as _block_decode
@@ -126,19 +131,42 @@ def _join_holding(fork, launched, held) -> None:
     fork.join(launched)
 
 
-def _preamble_refusal(worker, fold, attn_metadata, num_gens: int, block_size: int) -> Optional[str]:
+def _preamble_refusal(
+    worker,
+    fork,
+    fold,
+    attn_metadata,
+    slots,
+    num_accepted,
+    batch_idx,
+    num_gens: int,
+    block_size: int,
+) -> Optional[str]:
     """Why the preamble commit cannot write this step's preamble, or None.
 
     With ``drafter_preamble_from_commit`` (``SpecLoopFoldDFlashWorker._fold_preamble``), on
     a forked folded step the commit also writes the drafter forward's integer preamble
     (``drafter_block_decode.DrafterPreamble``) and the ``_seq_lens_cuda`` fill, and the
-    noise gather also writes the residual's copy. Its kernel
-    (``context_kv_commit_preamble``) is the dense full-length arena's commit only: no KV
-    cache manager pages (``_ctx_paged`` / ``_ctx_block_tables``) and no windowed arena
-    (``_ctx_base``); every other arena, and every other shape, takes ``ContextKvFork.commit``.
+    noise gather also writes the residual's copy. Its kernel is the dense full-length
+    arena's commit (``context_kv_commit_preamble``) or the paged one
+    (``context_kv_commit_paged_preamble``, where ``ContextKvFork.commit`` would launch
+    ``context_kv_commit_paged``); a windowed arena (``_ctx_base``), any other pages, and
+    every other shape take ``ContextKvFork.commit``. ``batch_idx`` is the drafter forward's
+    ``ctx_cache_batch_idx``, which the paged kernel reads.
     """
-    if worker._ctx_paged or worker._ctx_block_tables is not None or worker._ctx_base is not None:
-        return "the drafter context is not the dense full-length arena"
+    if worker._ctx_base is not None:
+        return "the drafter context is a windowed arena"
+    if worker._ctx_paged:
+        if not fork._commits_paged(worker, slots, num_accepted):
+            return "the paged drafter context's commit is not context_kv_commit_paged's"
+        if not (
+            batch_idx.dtype in (torch.int32, torch.int64)
+            and batch_idx.is_contiguous()
+            and batch_idx.numel() >= num_gens
+        ):
+            return "the drafter's batch index is not a contiguous int32 / int64 [requests]"
+    elif worker._ctx_block_tables is not None:
+        return "the drafter context has block tables but no pages"
     qpos = fold.query_positions
     seq_lens = getattr(attn_metadata, "_seq_lens_cuda", None)
     if not (
@@ -163,6 +191,7 @@ OVERRIDDEN = (
     "_forward_impl",
     "sample_and_accept_draft_tokens",
     "_sample_and_accept_draft_tokens_base",
+    "_sample_and_accept_draft_tokens_rejection",
     "_prepare_attn_metadata_for_dflash",
     "_prepare_kv_for_draft_forward",
     "prepare_1st_drafter_inputs",
@@ -277,6 +306,8 @@ class SpecLoopFoldDFlashWorker(DFlashWorker):
     """
 
     _fold_verify: bool = False
+    #: ``rejection_fold`` (with ``verify_fold``): a rejection-sampled step's bookkeeping too.
+    _fold_rejection: bool = False
     _fold_path_walk_tail: bool = False
     #: ``drafter_preamble_from_commit``: a forked folded step's commit writes the preamble.
     _fold_preamble: bool = False
@@ -423,7 +454,6 @@ class SpecLoopFoldDFlashWorker(DFlashWorker):
             return super()._sample_and_accept_draft_tokens_base(
                 logits, draft_tokens, num_contexts, batch_size, spec_metadata
             )
-        attn_metadata = step.attn_metadata
         runtime_draft_len = draft_tokens.shape[1]
         # fused_accept's statements up to its dflash_accept call.
         target_tokens = self._sample_tokens_for_batch(
@@ -434,6 +464,82 @@ class SpecLoopFoldDFlashWorker(DFlashWorker):
         if mode == FORCE_FRACTIONAL:
             self._ensure_force_accept_rng_state(logits.device)
             pool, counter = self._force_accept_rng_pool, self._force_accept_rng_counter
+        fold = self._launch_fold(
+            step,
+            target_tokens.reshape(-1),
+            draft_tokens,
+            num_contexts,
+            batch_size,
+            mode,
+            base_total,
+            max_total,
+            frac,
+            pool,
+            counter,
+        )
+        return fold.accepted, fold.num_accepted
+
+    def _sample_and_accept_draft_tokens_rejection(
+        self, logits, draft_tokens, draft_probs, num_contexts, batch_size, spec_metadata
+    ):
+        """The built-in rejection sampler, then its step's bookkeeping in one launch (``rejection_fold``).
+
+        The fold takes the sampler's accepted tokens and counts as given
+        (``ACCEPTED_GIVEN``): the forced override has already run inside the
+        built-in method, so the fold neither recomputes nor bumps anything there.
+        """
+        accepted, num_accepted = super()._sample_and_accept_draft_tokens_rejection(
+            logits, draft_tokens, draft_probs, num_contexts, batch_size, spec_metadata
+        )
+        if not self._fold_rejection:
+            return accepted, num_accepted
+        if logits.dim() == 1:
+            logits = logits.unsqueeze(0)
+        step = self._fold_current()
+        if not (
+            self._verify_fold_applies(
+                step, logits, draft_tokens, num_contexts, batch_size, spec_metadata
+            )
+            and accepted.dtype == torch.int32
+            and num_accepted.dtype == torch.int32
+            and tuple(accepted.shape) == (batch_size, draft_tokens.shape[1] + 1)
+            and accepted.is_contiguous()
+            and num_accepted.is_contiguous()
+        ):
+            return accepted, num_accepted
+        fold = self._launch_fold(
+            step,
+            accepted.reshape(-1),
+            draft_tokens,
+            num_contexts,
+            batch_size,
+            ACCEPTED_GIVEN,
+            0,
+            0,
+            0.0,
+            None,
+            None,
+            given_counts=num_accepted,
+        )
+        return fold.accepted, fold.num_accepted
+
+    def _launch_fold(
+        self,
+        step,
+        target_tokens,
+        draft_tokens,
+        num_contexts,
+        batch_size,
+        mode,
+        base_total,
+        max_total,
+        frac,
+        pool,
+        counter,
+        given_counts=None,
+    ) -> VerifyFold:
+        """``dflash_verify_fold`` on this step, and the rewind it now owes."""
+        attn_metadata = step.attn_metadata
         seq_lens = attn_metadata._seq_lens_cuda
         bumps_kv_lens = hasattr(attn_metadata, "kv_lens_cuda")
         fold = dflash_verify_fold(
@@ -453,6 +559,7 @@ class SpecLoopFoldDFlashWorker(DFlashWorker):
             attn_metadata.kv_lens_cuda if bumps_kv_lens else None,
             seq_lens,
             self._fold_verify_pdl,
+            given_counts=given_counts,
         )
         step.fold, step.seq_lens_source = fold, seq_lens
         if bumps_kv_lens:
@@ -464,7 +571,7 @@ class SpecLoopFoldDFlashWorker(DFlashWorker):
             self._kv_rewind_nc = num_contexts
             self._kv_rewind_bs = batch_size
             self._kv_rewind_pending = True
-        return fold.accepted, fold.num_accepted
+        return fold
 
     def _prepare_attn_metadata_for_dflash(self, attn_metadata, spec_metadata):
         method = "_prepare_attn_metadata_for_dflash"
@@ -649,8 +756,20 @@ class SpecLoopFoldDFlashWorker(DFlashWorker):
                 f"{num_gens} and K {spec_metadata.runtime_draft_len}"
                 + ("; the step has no target features" if not has_target_features else "")
             )
+        # The drafter forward's ctx_cache_batch_idx (``_drafter_inputs``).
+        batch_idx = fold.gen_rows if self._ctx_block_tables is not None else slots
         refusal = (
-            _preamble_refusal(self, fold, attn_metadata, num_gens, block_size)
+            _preamble_refusal(
+                self,
+                fork,
+                fold,
+                attn_metadata,
+                slots,
+                gen_num_accepted,
+                batch_idx,
+                num_gens,
+                block_size,
+            )
             if self._fold_preamble
             else None
         )
@@ -665,6 +784,7 @@ class SpecLoopFoldDFlashWorker(DFlashWorker):
                 attn_metadata._seq_lens_cuda,
                 total_tokens_per_req,
                 block_size,
+                batch_idx,
             )
             table = _replicated_embedding.table_of(embed_tokens)
             residual = None
@@ -702,7 +822,10 @@ class SpecLoopFoldDFlashWorker(DFlashWorker):
                 # drafter_preamble_late_join: the drafter forward joins right before layer 0's
                 # QK norm + RoPE.
                 join = functools.partial(
-                    _join_holding, fork, launched, (slots, gen_num_accepted, fold.query_positions)
+                    _join_holding,
+                    fork,
+                    launched,
+                    (slots, gen_num_accepted, fold.query_positions, batch_idx),
                 )
                 _log_late_join_once()
             else:
@@ -711,7 +834,11 @@ class SpecLoopFoldDFlashWorker(DFlashWorker):
             inputs = self._drafter_inputs(
                 noise_embed_2d, fold.query_positions, num_ctx, slots, fold.gen_rows, fold.bonus
             )
-            # The dense arena (``_preamble_refusal``): the drafter reads the context by slot.
+            if inputs["ctx_cache_batch_idx"] is not batch_idx:
+                raise FoldStateError(
+                    "[musespark_open] drafter_preamble_from_commit: the drafter's batch index is "
+                    "not the one the commit wrote the preamble from"
+                )
             _block_decode.publish_preamble(
                 _block_decode.DrafterPreamble(
                     num_ctx,
@@ -996,11 +1123,13 @@ def install(
     declined: Optional[Callable[..., None]] = None,
     verify_pdl: bool = False,
     late_join: bool = False,
+    rejection: bool = False,
 ) -> bool:
     """Re-class the DFlash worker for the verify fold (``verify_fold``) and the path-walk tail
     (``path_walk_tail``) asked for; return whether anything changed.
 
-    ``preamble`` (``drafter_preamble_from_commit``, with ``verify_fold``) has a forked
+    ``rejection`` (``rejection_fold``, with ``verify_fold``) folds a rejection-sampled
+    step's bookkeeping too. ``preamble`` (``drafter_preamble_from_commit``, with ``verify_fold``) has a forked
     folded step's commit write the drafter preamble; ``declined`` reports the steps it
     leaves to ``ContextKvFork.commit`` (``dispatch.Plan.declined``). ``verify_pdl``
     (``distributed_head_sampler``) and ``late_join`` (``drafter_preamble_late_join``, with
@@ -1025,6 +1154,7 @@ def install(
         raise ValueError(f"[musespark_open] {','.join(selected)} cannot run here: {reason}")
     preamble = bool(preamble and verify_fold)
     late_join = bool(late_join and preamble)
+    rejection = bool(rejection and verify_fold)
     if isinstance(spec_worker, SpecLoopFoldDFlashWorker):
         changed = (
             spec_worker._fold_verify,
@@ -1032,10 +1162,12 @@ def install(
             spec_worker._fold_preamble,
             spec_worker._fold_verify_pdl,
             spec_worker._fold_late_join,
-        ) != (verify_fold, path_walk_tail, preamble, verify_pdl, late_join)
+            spec_worker._fold_rejection,
+        ) != (verify_fold, path_walk_tail, preamble, verify_pdl, late_join, rejection)
         spec_worker._fold_verify = verify_fold
         spec_worker._fold_path_walk_tail = path_walk_tail
         spec_worker._fold_preamble = preamble
+        spec_worker._fold_rejection = rejection
         spec_worker._fold_declined = declined
         spec_worker._fold_verify_pdl = verify_pdl
         spec_worker._fold_late_join = late_join
@@ -1056,6 +1188,7 @@ def install(
     spec_worker._fold_verify = verify_fold
     spec_worker._fold_path_walk_tail = path_walk_tail
     spec_worker._fold_preamble = preamble
+    spec_worker._fold_rejection = rejection
     spec_worker._fold_declined = declined
     spec_worker._fold_verify_pdl = verify_pdl
     spec_worker._fold_late_join = late_join
@@ -1063,6 +1196,7 @@ def install(
         name
         for on, name in (
             (verify_fold, "the acceptance kernel"),
+            (rejection, "the rejection-sampled steps' fold"),
             (path_walk_tail, "the draft-head walk"),
         )
         if on

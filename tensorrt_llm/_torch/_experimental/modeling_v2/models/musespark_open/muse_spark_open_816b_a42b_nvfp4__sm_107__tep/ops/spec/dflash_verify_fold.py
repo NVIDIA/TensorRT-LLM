@@ -23,6 +23,11 @@ Nothing reads a count before it is computed; the work only leaves the launch
 count. Integer arithmetic plus ``dflash_accept``'s one fp32 comparison, so
 every output is bitwise the built-in one.
 
+A rejection-sampled step (fast path ``rejection_fold``) has its accepted tokens and
+counts already, from the built-in rejection sampler and its forced override:
+``ACCEPTED_GIVEN`` takes them as given (``target_tokens`` the accepted tokens,
+``given_counts`` the counts) and writes the same bookkeeping from them.
+
 Generation-only steps (no context rows), which is every decode step the target
 captures; a step with context rows takes the built-in path.
 """
@@ -45,6 +50,8 @@ from .dflash_accept import (
     dflash_accept,
 )
 
+#: ``force_mode`` of a step whose accepted tokens and counts are given (rejection sampling).
+ACCEPTED_GIVEN = 3
 #: The requests one launch takes: its single program loops over them, as
 #: ``dflash_accept``'s per-request loop does up to ``LOOP_REQUESTS``.
 MAX_REQUESTS = LOOP_REQUESTS
@@ -90,6 +97,7 @@ def _dflash_verify_fold_kernel(
     num_accepted_ptr,
     pool_ptr,
     counter_ptr,
+    given_counts_ptr,
     num_gens,
     base_total,
     max_total,
@@ -165,6 +173,8 @@ def _dflash_verify_fold_kernel(
             accepted = tl.min(tl.where(mismatch, cols, K), axis=0) + 1
         elif FORCE == 1:
             accepted = tl.zeros([], dtype=tl.int32) + base_total
+        elif FORCE == 3:
+            accepted = tl.load(given_counts_ptr)
         else:
             accepted = tl.minimum(base_total + (draw_pre < frac).to(tl.int32), max_total)
         accepted = accepted.to(tl.int32)
@@ -208,6 +218,8 @@ def _dflash_verify_fold_kernel(
                 accepted = tl.min(tl.where(mismatch, cols, K), axis=0) + 1
             elif FORCE == 1:
                 accepted = tl.zeros([], dtype=tl.int32) + base_total
+            elif FORCE == 3:
+                accepted = tl.load(given_counts_ptr + g)
             else:
                 index = (counter * COUNTER_STRIDE + g * SLOT_STRIDE) & POOL_MASK
                 draw = tl.load(pool_ptr + index)
@@ -250,7 +262,8 @@ class DflashVerifyFold(OpWrapper):
     """``dflash_accept`` for a generation-only verify block, plus the DFlash worker's step bookkeeping.
 
     Inputs: the ``g * (K + 1)`` sampled target tokens, the ``[g, K]`` drafts,
-    the forced-acceptance plan (as ``dflash_accept``), the worker's
+    the forced-acceptance plan (as ``dflash_accept``) -- or, with ``ACCEPTED_GIVEN``,
+    the ``g * (K + 1)`` accepted tokens and the ``[g]`` int32 ``given_counts`` -- the worker's
     ``_batch_to_slot[:g]`` (``slots``), ``_ctx_len`` and ``_max_ctx``, the
     drafter block width ``block_size`` and ``mask_token_id``; optionally the
     attention metadata's ``kv_lens_cuda`` (``+= 1`` on its first ``g``
@@ -305,6 +318,7 @@ class DflashVerifyFold(OpWrapper):
         kv_lens: Optional[torch.Tensor],
         seq_lens: Optional[torch.Tensor],
         pre_wait: bool = False,
+        given_counts: Optional[torch.Tensor] = None,
     ) -> VerifyFold:
         num_gens, k = draft_tokens.shape
         device = target_tokens.device
@@ -337,6 +351,7 @@ class DflashVerifyFold(OpWrapper):
             out.num_accepted,
             pool if fractional else dummy,
             counter if fractional else dummy,
+            given_counts if force_mode == ACCEPTED_GIVEN else dummy,
             num_gens,
             base_total,
             max_total,
@@ -392,6 +407,7 @@ class DflashVerifyFold(OpWrapper):
         kv_lens: Optional[torch.Tensor],
         seq_lens: Optional[torch.Tensor],
         pre_wait: bool = False,
+        given_counts: Optional[torch.Tensor] = None,
     ) -> VerifyFold:
         """The built-in chain, statement for statement, on a batch with no context rows.
 
@@ -403,9 +419,22 @@ class DflashVerifyFold(OpWrapper):
         """
         num_contexts, batch_size = 0, draft_tokens.shape[0]
         num_gens, k = draft_tokens.shape
-        accepted_tokens, num_accepted_tokens = dflash_accept.reference(
-            target_tokens, draft_tokens, 0, force_mode, base_total, max_total, frac, pool, counter
-        )
+        if force_mode == ACCEPTED_GIVEN:
+            # What the built-in rejection sampler returns: the accepted tokens and counts.
+            accepted_tokens = target_tokens.view(num_gens, k + 1).to(torch.int32).clone()
+            num_accepted_tokens = given_counts[:num_gens].clone()
+        else:
+            accepted_tokens, num_accepted_tokens = dflash_accept.reference(
+                target_tokens,
+                draft_tokens,
+                0,
+                force_mode,
+                base_total,
+                max_total,
+                frac,
+                pool,
+                counter,
+            )
         seq_lens_copy = None if seq_lens is None else seq_lens.clone()
         rewind = 1 - num_accepted_tokens[num_contexts:batch_size]
         if kv_lens is not None:
@@ -462,6 +491,7 @@ class DflashVerifyFold(OpWrapper):
         kv_lens: Optional[torch.Tensor],
         seq_lens: Optional[torch.Tensor],
         pre_wait: bool = False,
+        given_counts: Optional[torch.Tensor] = None,
     ) -> None:
         assert draft_tokens.dim() == 2 and draft_tokens.stride(-1) == 1, (
             "draft_tokens must be [gens, K] with unit column stride"
@@ -487,6 +517,13 @@ class DflashVerifyFold(OpWrapper):
             )
         if seq_lens is not None:
             assert seq_lens.is_contiguous(), "seq_lens is copied as a flat buffer"
+        if force_mode == ACCEPTED_GIVEN:
+            assert (
+                given_counts is not None
+                and given_counts.dtype == torch.int32
+                and given_counts.numel() >= num_gens
+                and given_counts.is_contiguous()
+            ), "ACCEPTED_GIVEN takes [g] int32 counts"
         if force_mode == FORCE_FRACTIONAL:
             assert pool is not None and pool.dtype == torch.float32 and pool.dim() == 1
             assert pool.numel() & (pool.numel() - 1) == 0, "the pool length must be a power of two"
