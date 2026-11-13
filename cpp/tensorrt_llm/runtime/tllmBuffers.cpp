@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,10 +15,143 @@
  */
 
 #include "tensorrt_llm/runtime/tllmBuffers.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/tllmDataType.h"
+
+#include <cstdint>
+#include <limits>
+#include <new>
+
+#include <unistd.h>
 
 namespace tensorrt_llm::runtime
 {
+namespace
+{
+//! \brief Rounds \p size up to a whole number of host pages, as required by ::cudaHostRegister.
+std::size_t pageAlignedSize(std::size_t size)
+{
+    auto const pageSize = PinnedAllocator::hostPageSize();
+    TLLM_CHECK_WITH_INFO(size <= std::numeric_limits<std::size_t>::max() - (pageSize - 1),
+        "Size %zu cannot be rounded up to a multiple of the host page size %zu", size, pageSize);
+    return common::ceilDiv(size, pageSize) * pageSize;
+}
+
+//! \brief Whether an allocation of \p n bytes is backed by host memory that is page-locked in chunks.
+bool useChunkedPinning(std::size_t n)
+{
+    auto const chunkSize = PinnedAllocator::getPinChunkSize();
+    return chunkSize != 0 && n > chunkSize;
+}
+} // namespace
+
+void hostRegisterChunked(void* ptr, std::size_t size, std::size_t chunkSize)
+{
+    auto const pageSize = PinnedAllocator::hostPageSize();
+    TLLM_CHECK_WITH_INFO(chunkSize > 0 && chunkSize % pageSize == 0,
+        "Page-locking chunk size %zu must be a positive multiple of the host page size %zu", chunkSize, pageSize);
+    TLLM_CHECK_WITH_INFO(reinterpret_cast<std::uintptr_t>(ptr) % pageSize == 0,
+        "Chunk-pinned host memory must be aligned to the host page size %zu", pageSize);
+    auto* const base = static_cast<std::uint8_t*>(ptr);
+    std::size_t offset{0};
+    try
+    {
+        for (; offset < size; offset += chunkSize)
+        {
+            TLLM_CUDA_CHECK(
+                ::cudaHostRegister(base + offset, std::min(chunkSize, size - offset), cudaHostRegisterDefault));
+        }
+    }
+    catch (...)
+    {
+        // Leave no partially registered range behind. Warn instead of throwing on the unwind so that the original
+        // registration failure is the one that reaches the caller.
+        for (std::size_t undone{0}; undone < offset; undone += chunkSize)
+        {
+            TLLM_CUDA_CHECK_WARN(::cudaHostUnregister(base + undone));
+        }
+        throw;
+    }
+}
+
+void hostUnregisterChunked(void* ptr, std::size_t size, std::size_t chunkSize)
+{
+    TLLM_CHECK_WITH_INFO(chunkSize > 0, "Page-locking chunk size must be positive");
+    auto* const base = static_cast<std::uint8_t*>(ptr);
+    for (std::size_t offset{0}; offset < size; offset += chunkSize)
+    {
+        TLLM_CUDA_CHECK_FREE_RESOURCE(::cudaHostUnregister(base + offset));
+    }
+}
+
+std::size_t PinnedAllocator::hostPageSize()
+{
+    static std::size_t const pageSize = []
+    {
+        auto const size = ::sysconf(_SC_PAGESIZE);
+        return size > 0 ? static_cast<std::size_t>(size) : std::size_t{4096};
+    }();
+    return pageSize;
+}
+
+std::size_t PinnedAllocator::getPinChunkSize()
+{
+    static std::size_t const chunkSize = []
+    {
+        auto const requested = common::getUInt64Env("TRTLLM_HOST_PIN_CHUNK_BYTES").value_or(kDefaultPinChunkSize);
+        return pageAlignedSize(requested);
+    }();
+    return chunkSize;
+}
+
+PinnedAllocator::PointerType PinnedAllocator::allocateChunkPinned(std::size_t n, std::size_t chunkSize)
+{
+    auto const lockedBytes = pageAlignedSize(n);
+    TLLM_LOG_DEBUG("PinnedAllocator: page-locking %zu B in chunks of %zu B", lockedBytes, chunkSize);
+
+    auto* const base = std::aligned_alloc(hostPageSize(), lockedBytes);
+    if (base == nullptr)
+    {
+        throw std::bad_alloc();
+    }
+    try
+    {
+        hostRegisterChunked(base, lockedBytes, chunkSize);
+    }
+    catch (...)
+    {
+        std::free(base);
+        throw;
+    }
+    return base;
+}
+
+void PinnedAllocator::deallocateChunkPinned(PointerType ptr, std::size_t n, std::size_t chunkSize)
+{
+    hostUnregisterChunked(ptr, pageAlignedSize(n), chunkSize);
+    std::free(ptr);
+}
+
+void PinnedAllocator::allocateImpl(PointerType* ptr, std::size_t n)
+{
+    if (!useChunkedPinning(n))
+    {
+        TLLM_CUDA_CHECK(::cudaHostAlloc(ptr, n, cudaHostAllocDefault));
+        return;
+    }
+    *ptr = allocateChunkPinned(n, getPinChunkSize());
+}
+
+void PinnedAllocator::deallocateImpl(PointerType ptr, std::size_t n)
+{
+    if (!useChunkedPinning(n))
+    {
+        TLLM_CUDA_CHECK_FREE_RESOURCE(::cudaFreeHost(ptr));
+        return;
+    }
+    deallocateChunkPinned(ptr, n, getPinChunkSize());
+}
+
 template <typename TAllocator>
 typename PoolAllocator<TAllocator>::PoolType& PoolAllocator<TAllocator>::getPool()
 {
