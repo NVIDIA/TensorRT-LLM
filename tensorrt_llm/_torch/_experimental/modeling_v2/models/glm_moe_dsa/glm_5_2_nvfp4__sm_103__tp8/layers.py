@@ -115,9 +115,9 @@ class GlmMoE(Deepseekv3MoE):
         if router_logits is None:
             router_logits = self.gate(hidden_states)
 
-        # The draft layer's BF16 routed experts (the FlashInfer TRT-LLM-Gen BF16 leaf) through
-        # the draft routed-MoE kernels on the leaf's own buffers, bit-identical to the native
-        # call. Its eligibility (leaf type, routing, shapes, dtypes, device, finalized output)
+        # The draft layer's BF16 routed experts (the TRT-LLM-Gen BF16 leaf) through
+        # the draft routed-MoE kernels on the leaf's own buffers (routing math as noted in
+        # draft_routed_moe.routed_moe). Its eligibility (leaf type, routing, shapes, dtypes, device, finalized output)
         # is decided before any device work; None keeps the path below (NVFP4 layers always
         # decline).
         if (

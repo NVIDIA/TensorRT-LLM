@@ -292,6 +292,42 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
             batch, new_tokens, None, None, True
         )
 
+    def test_prepare_inputs_single_cp_rank_ignores_cp_type(self) -> None:
+        for cp_type in (CpType.ULYSSES, CpType.RING):
+            with self.subTest(cp_type=cp_type):
+                inputs = _input_preparer()
+                inputs.mapping = Mapping(world_size=1, cp_size=1, cp_config={"cp_type": cp_type})
+                inputs._config = SimpleNamespace(spec_config=None)
+                inputs._can_use_steady_gen_fast_prepare = Mock(return_value=True)
+                fast_inputs = PreparedInputs({"prepared": True})
+                inputs._apply_steady_gen_fast_prepare = Mock(return_value=fast_inputs)
+
+                result = inputs.prepare_inputs(
+                    ScheduledRequests(),
+                    Mock(),
+                    Mock(),
+                    new_tensors_device=SimpleNamespace(new_tokens=torch.zeros(1)),
+                    enable_spec_decode=False,
+                    runtime_draft_len=0,
+                    is_dummy=True,
+                )
+
+                self.assertIs(result.kwargs, fast_inputs.kwargs)
+
+    def test_prepare_inputs_rejects_unsupported_cp_type_with_context_parallelism(self) -> None:
+        inputs = _input_preparer()
+        inputs.mapping = Mapping(world_size=2, cp_size=2, cp_config={"cp_type": CpType.RING})
+
+        with self.assertRaisesRegex(NotImplementedError, "Unsupported cp_type RING"):
+            inputs.prepare_inputs(
+                ScheduledRequests(),
+                Mock(),
+                Mock(),
+                enable_spec_decode=False,
+                runtime_draft_len=0,
+                is_dummy=True,
+            )
+
     def test_prepare_inputs_reports_tree_draft_length(self) -> None:
         inputs = _input_preparer(
             spec_config=SimpleNamespace(is_linear_tree=False, tokens_per_gen_step=8)
@@ -1208,6 +1244,7 @@ class DecoderInputPreparerTestCase(unittest.TestCase):
                     ced_kv_precompute=True, decoder_replay_split=20
                 )
                 scheduled = ScheduledRequests()
+                context = None
                 if mixed:
                     context = _create_request_with_tokens(list(range(5000)), 7)
                     context.context_current_position = 4000

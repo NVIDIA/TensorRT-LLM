@@ -209,8 +209,7 @@ def test_encode_empty_string(bert_encode_llm):
 
 def test_encode_oversized_batch(bert_encode_llm):
     """encode() raises ValueError when batch exceeds max_batch_size."""
-    engine = bert_encode_llm._encoder_executor.model_engine
-    max_batch = engine.batch_size
+    max_batch = bert_encode_llm._encoder_executor.max_batch_size
 
     # Create a batch that exceeds max_batch_size
     oversized = ["Hello"] * (max_batch + 1)
@@ -528,7 +527,7 @@ def test_encode_undeclared_non_tensor_kwarg_falls_back_to_eager(
     token_type_ids = _build_token_type_ids(PROMPTS)
     # `some_flag` is undeclared and non-tensor: previously this raised
     # ("not declared"); now it is allowed and triggers eager fallback.
-    graph_runner = llm._encoder_executor.model_engine._runner._encoder_cuda_graph_runner
+    graph_runner = llm._encoder_executor._runner._encoder_cuda_graph_runner
     with patch.object(graph_runner, "replay", wraps=graph_runner.replay) as replay:
         llm.encode(PROMPTS, token_type_ids=token_type_ids)
         assert replay.call_count == 1

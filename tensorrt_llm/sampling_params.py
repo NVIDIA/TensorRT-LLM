@@ -262,6 +262,7 @@ class SamplingParams:
 
         guided_decoding (tensorrt_llm.sampling_params.GuidedDecodingParams, optional): Guided decoding params. Defaults to None.
         thinking_token_budget (int, optional): Experimental. Maximum number of tokens allowed inside a reasoning block. Set to -1 or None for unlimited. Defaults to None.
+        watermarking (bool, optional): Whether to watermark the generated text. Takes effect only when the engine is configured with `watermark_config`. None or True requests a watermark; False opts this request out (unless the engine sets `allow_request_opt_out=False`). Greedy and beam-search requests cannot carry a watermark and are generated normally. Defaults to None.
 
         ignore_eos (bool): Whether to ignore the EOS token and continue generating tokens after the EOS token is generated. Defaults to False.
         detokenize (bool): Whether to detokenize the output. Defaults to True.
@@ -347,6 +348,8 @@ class SamplingParams:
     # Guided decoding params
     guided_decoding: Optional[GuidedDecodingParams] = None
     thinking_token_budget: Optional[int] = None
+
+    watermarking: Optional[bool] = None
 
     # Tokenizer-related configs
     ignore_eos: bool = False
@@ -589,20 +592,7 @@ class SamplingParams:
             if self.pad_id is None:
                 self.pad_id = self.end_id
 
-        def _encode(tokenizer, text, add_special_tokens):
-            try:
-                return tokenizer.encode(text, add_special_tokens=add_special_tokens)
-            except TypeError:
-                # For tiktokenizer, the encode method does not have add_special_tokens argument
-                return tokenizer.encode(text)
-
-        if self.bad is not None:
-            strs = [self.bad] if isinstance(self.bad, str) else self.bad
-            self._bad_word_ids = [_encode(tokenizer, s, add_special_tokens) for s in strs]
-
-        if self.stop is not None:
-            strs = [self.stop] if isinstance(self.stop, str) else self.stop
-            self._stop_word_ids = [_encode(tokenizer, s, add_special_tokens) for s in strs]
+        self._setup_word_ids(tokenizer, add_special_tokens)
 
         # Add eos_token_id in generation_config to stop_token_ids
         # The eos_token_id in generation_config are really mean to stop the text generation.
@@ -620,6 +610,28 @@ class SamplingParams:
                 self.stop_token_ids = None
 
         return self
+
+    def _setup_word_ids(self, tokenizer, add_special_tokens: bool = False) -> None:
+        """Tokenize the ``stop`` and ``bad`` strings into the token sequences the engine matches.
+
+        This only depends on the tokenizer, so it is needed whether or not ``end_id`` was
+        given explicitly.
+        """
+
+        def _encode(text):
+            try:
+                return tokenizer.encode(text, add_special_tokens=add_special_tokens)
+            except TypeError:
+                # For tiktokenizer, the encode method does not have add_special_tokens argument
+                return tokenizer.encode(text)
+
+        if self.bad is not None:
+            strs = [self.bad] if isinstance(self.bad, str) else self.bad
+            self._bad_word_ids = [_encode(s) for s in strs]
+
+        if self.stop is not None:
+            strs = [self.stop] if isinstance(self.stop, str) else self.stop
+            self._stop_word_ids = [_encode(s) for s in strs]
 
     def _get_bad_words(self) -> List[List[int]]:
         words = []
@@ -707,13 +719,9 @@ class SamplingParams:
                 "internally enabling context logits for prompt logprobs computation. "
                 "context logits will be dropped after computation as the user didn't explicitly request them."
             )
-            # TODO: Find a more elegant way to do this.
-            # NOTE: This is an internal hack, so we can entirely avoid introducing
-            # `prompt_logprobs` into the executor bindings and further into
-            # model engine / sampler.
-            # This is because, prompt_logprobs is a derived quantity from
-            # context logits, and the capability to post-compute it
-            # already exists in the worker. (see _get_logprobs in base_worker.py)
+            # The context-output flag requests per-position predictions.
+            # Python workers carry prompt-logprob options separately to
+            # distinguish compact probability results from full logits.
             config_kwargs["return_context_logits"] = True
 
         if config_kwargs.get("additional_model_outputs") is not None:

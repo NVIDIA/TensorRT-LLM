@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <map>
 #include <optional>
+#include <string>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -86,13 +87,16 @@ struct AttnLifeCycle
 };
 
 // ---------------------------------------------------------------------------
-// SsmLifeCycle — lifecycle for SSM (State Space Model) buffers.
+// SsmLifeCycle — lifecycle for SSM (State Space Model) buffers and request regions.
 // All blocks before the last full block are stale (recurrent state).
-// SSM buffers with the same effective reuse policy share a lifecycle.
+// SSM layer buffers with the same effective reuse policy share a lifecycle. A request
+// region's lifecycle carries the region's index, so it is never shared.
 // ---------------------------------------------------------------------------
 struct SsmLifeCycle
 {
     ReusePolicy reusePolicy = ReusePolicy::REQUIRED;
+    //! Index into KVCacheManagerConfig::regions; nullopt for a lifecycle of SSM layer buffers.
+    std::optional<int> regionIndex;
 
     HalfOpenRange<BlockOrdinal> getStaleRange(int historyLength, int tokensPerBlock) const
     {
@@ -101,12 +105,16 @@ struct SsmLifeCycle
 
     bool operator==(SsmLifeCycle const& other) const noexcept
     {
-        return reusePolicy == other.reusePolicy;
+        return reusePolicy == other.reusePolicy && regionIndex == other.regionIndex;
     }
 
     bool operator<(SsmLifeCycle const& other) const noexcept
     {
-        return reusePolicy < other.reusePolicy;
+        if (reusePolicy != other.reusePolicy)
+        {
+            return reusePolicy < other.reusePolicy;
+        }
+        return regionIndex < other.regionIndex;
     }
 };
 
@@ -133,6 +141,16 @@ inline bool requiresPrefixCoverage(LifeCycle const& lc)
 inline bool allowsCheckpoint(LifeCycle const& lc)
 {
     return reusePolicy(lc) == ReusePolicy::OPTIONAL || reusePolicy(lc) == ReusePolicy::SINK_REQUIRED_ONLY;
+}
+
+//! Reuse policy that decides which pools a lifecycle shares. SINK_REQUIRED_ONLY shares the REQUIRED pools, so its
+//! pages can be reached through the block offsets of a REQUIRED layer of the same page shape. This is safe: evicting
+//! a page has the same effect on reuse whichever pool holds it. OPTIONAL keeps its own pools, so the extra slot per
+//! request that pool sizing gives it (ratioFromBatch) is not used up by other lifecycles.
+inline ReusePolicy effectivePoolReusePolicy(LifeCycle const& lc)
+{
+    auto const policy = reusePolicy(lc);
+    return policy == ReusePolicy::SINK_REQUIRED_ONLY ? ReusePolicy::REQUIRED : policy;
 }
 
 // Free function: compute stale range via std::visit.
@@ -164,6 +182,9 @@ inline HalfOpenRange<BlockOrdinal> computeScratchRange(
 // Factory: create the LifeCycle that holds one buffer of a layer, using the buffer's effective reuse policy.
 LifeCycle makeLifeCycle(LayerConfig const& layer, BufferConfig const& buffer, int tokensPerBlock);
 
+// Factory: create the LifeCycle of a region, the `regionIndex`-th of KVCacheManagerConfig::regions.
+LifeCycle makeLifeCycle(RegionConfig const& region, int regionIndex);
+
 // Integer id assigned to each unique LifeCycle.
 using LifeCycleId = StrongIndex<int, struct LifeCycleIdTag>;
 
@@ -176,6 +197,10 @@ using LayerGroupId = LifeCycleId;
 // ---------------------------------------------------------------------------
 // LifeCycleRegistry — deduplicates LifeCycle objects and assigns integer ids.
 // Mirrors _life_cycle_registry.py::LifeCycleRegistry.
+//
+// Ids follow registration order: the layers' buffers first, in layer and buffer order,
+// then one lifecycle per region in declaration order. Declaring a region therefore
+// never renumbers the lifecycles of the layers.
 // ---------------------------------------------------------------------------
 class LifeCycleRegistry
 {
@@ -234,6 +259,20 @@ public:
     {
         return !mSsmLifeCycleIds.empty();
     }
+
+    // Region helpers. Regions are indexed as in KVCacheManagerConfig::regions.
+    [[nodiscard]] int numRegions() const noexcept
+    {
+        return static_cast<int>(mRegionLifeCycleIds.size());
+    }
+
+    [[nodiscard]] LifeCycleId regionLifeCycleId(int regionIndex) const
+    {
+        return mRegionLifeCycleIds.at(static_cast<size_t>(regionIndex));
+    }
+
+    //! Lifecycle of the region named `name`; throws std::out_of_range for an unknown name.
+    [[nodiscard]] LifeCycleId regionLifeCycleId(std::string const& name) const;
 
     // Return (id, AttnLifeCycle*) pairs for attention lifecycles only. Used by _setupForReuse.
     std::vector<std::pair<LifeCycleId, AttnLifeCycle const*>> attentionLifeCycles() const
@@ -309,6 +348,8 @@ private:
     TypedVec<LifeCycleId, LifeCycle> mLifeCycleList;
     std::map<LifeCycle, LifeCycleId> mLifeCycleIdMap;
     std::vector<LifeCycleId> mSsmLifeCycleIds;
+    std::vector<LifeCycleId> mRegionLifeCycleIds;
+    std::map<std::string, LifeCycleId> mRegionLifeCycleIdByName;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

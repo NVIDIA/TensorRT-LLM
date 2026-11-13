@@ -17,7 +17,7 @@ import os
 import weakref
 from collections import deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, List, Optional
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -37,7 +37,7 @@ from ..pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
 from ..pyexecutor.resource_manager import BaseResourceManager
 from .accept_stats import maybe_create_recorder
 from .dflash_attention import (
-    DFLASH_CONTEXT_LOWERING,
+    DFLASH_FOLDED_DECODE_LOWERING,
     get_dflash_paged_append,
     validate_dflash_fa4_runtime,
     validate_dflash_trtllm_gen_runtime,
@@ -92,12 +92,13 @@ def compute_dflash_ctx_buffer_bytes(
     page_size: int = 32,
     kv_factor: int = 2,
     paged: Optional[bool] = None,
+    extra_request_slots: int = 0,
 ) -> int:
     """Per-GPU bytes ``_lazy_init_ctx_buffers`` will allocate for the DFlash
     pooled-context K/V buffers.
 
-    Mirrors the allocation exactly: ``max_batch_size + 1`` slots (one scratch
-    slot for padding/warmup dummies), capacity ``max_ctx_len + block_size``
+    Mirrors the allocation exactly: ``max_batch_size + extra_request_slots + 1``
+    slots (one scratch slot for padding/warmup dummies), capacity ``max_ctx_len + block_size``
     per slot, ``kv_factor`` halves for every drafter attention layer (K and V,
     so 2; the MLA drafter keeps one latent and no V, so 1). The dense layout
     holds ``kv_factor`` contiguous ``[slots, L, capacity, Hkv, D]`` tensors;
@@ -110,7 +111,7 @@ def compute_dflash_ctx_buffer_bytes(
     no drafter to ask -- it falls back to whether ``attention_backend`` is a
     paged backend.
     """
-    num_slots = max_batch_size + 1
+    num_slots = max_batch_size + extra_request_slots + 1
     capacity = max_ctx_len + block_size
     if paged is None:
         paged = attention_backend in _PAGED_ATTENTION_BACKENDS
@@ -246,6 +247,7 @@ def validate_dflash_ctx_buffer_budget(
     tp_size: int = 1,
     memory_budget_bytes: Optional[int] = None,
     arena_before_pool: bool = True,
+    gen_preemption_enabled: bool = False,
 ) -> None:
     """Config-time checks for failure modes DFlash otherwise hits late.
 
@@ -285,6 +287,7 @@ def validate_dflash_ctx_buffer_budget(
         arena_before_pool: Which headroom ``memory_budget_bytes`` describes
             (see ``derive_dflash_ctx_memory_budget_bytes``); only affects
             the wording and remedy of the refusal.
+        gen_preemption_enabled: Reserve private-arena rows for paused requests.
 
     Raises:
         ValueError: On a token-budget violation or when the pooled-context
@@ -368,6 +371,10 @@ def validate_dflash_ctx_buffer_budget(
     dtype_bytes = 4 if draft_config.get("torch_dtype") in ("float32", "float") else 2
     block_size = K + 1
 
+    from ..pyexecutor.scheduler.gen_preemption import paused_cap
+
+    extra_slots = paused_cap(max_batch_size) if gen_preemption_enabled else 0
+    num_slots = max_batch_size + extra_slots + 1
     required = compute_dflash_ctx_buffer_bytes(
         max_batch_size,
         max_ctx,
@@ -377,11 +384,21 @@ def validate_dflash_ctx_buffer_budget(
         head_dim,
         dtype_bytes=dtype_bytes,
         attention_backend=attention_backend,
+        extra_request_slots=extra_slots,
     )
     if required <= memory_budget_bytes:
         return
-    per_slot = required // (max_batch_size + 1)
-    fitting = int(memory_budget_bytes // per_slot) - 1  # one slot is scratch
+    per_slot = required // num_slots
+    fitting = max(0, int(memory_budget_bytes // per_slot) - 1)  # one scratch slot
+    if gen_preemption_enabled:
+        lo, hi = 0, fitting
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if mid + paused_cap(mid) + 1 <= memory_budget_bytes // per_slot:
+                lo = mid
+            else:
+                hi = mid - 1
+        fitting = lo
     gib = 1024**3
     if arena_before_pool:
         budget_desc = (
@@ -412,13 +429,18 @@ def validate_dflash_ctx_buffer_budget(
         if fitting >= 1
         else "no max_batch_size fits; lower max_seq_len or the drafter context"
     )
+    slot_formula = (
+        "max_batch_size + resident_headroom + 1 slots"
+        if gen_preemption_enabled
+        else "max_batch_size + 1 slots"
+    )
     message = (
         f"DFlash: the pooled-context K/V buffers for max_batch_size="
         f"{max_batch_size} need {required / gib:.2f} GiB per GPU, exceeding "
         f"{budget_desc} Size formula: "
-        "2 (K and V) x (max_batch_size + 1 slots) x num_layers x "
+        f"2 (K and V) x ({slot_formula}) x num_layers x "
         "(max_ctx + block_size) x kv_heads_per_rank x head_dim x dtype_bytes "
-        f"= 2 x {max_batch_size + 1} x {num_layers} x ({max_ctx} + "
+        f"= 2 x {num_slots} x {num_layers} x ({max_ctx} + "
         f"{block_size}) x {num_kv_heads_per_rank} x {head_dim} x "
         f"{dtype_bytes}. With the current settings, {remedy}."
     )
@@ -517,6 +539,10 @@ def dflash_allocated_ctx_limit(
 ) -> torch.Tensor:
     """Context length a request may advertise, given the pages it holds.
 
+    ``block_counts`` is each row's extent: one past its last backed entry
+    (``decode_draft_block_table``), so positions are absolute even when a
+    sliding window released the low entries.
+
     Leaves ``block_size`` positions of room: the MLA path writes the block's own
     latents at ``ctx_len .. ctx_len + block_size``, so stopping at exactly the
     allocation puts the first of them on an unallocated page, whose table entry
@@ -530,6 +556,51 @@ def dflash_allocated_ctx_limit(
     per-request guarantee into it there.
     """
     return (block_counts * page_size - block_size).clamp(min=0)
+
+
+def dflash_windows_span_a_page(windows: Optional[List[Optional[int]]], page_size: int) -> bool:
+    """Whether every attention window of a draft pool spans at least a page.
+
+    ``None`` (for the list or an entry) is a layer without a window, which
+    keeps every page it was given.
+    """
+    return all(window >= page_size for window in windows or () if window is not None)
+
+
+def dflash_rebased_ctx_rows(rows: torch.Tensor, base_pages: torch.Tensor) -> torch.Tensor:
+    """Block-table rows shifted left by ``base_pages`` entries each.
+
+    Entry ``j`` of the result names the page entry ``j + base`` of the input
+    row named, so a reader that numbers positions from ``base * page_size``
+    reaches the same physical pages as one numbering from 0 and never
+    addresses an entry below ``base``. Entries shifted in from past the row's
+    end repeat the last entry; a reader never dereferences them because its
+    sequence length is shortened by the same ``base * page_size``.
+    """
+    width = rows.size(1)
+    index = torch.arange(width, device=rows.device).unsqueeze(0) + base_pages.view(-1, 1)
+    return rows.gather(1, index.clamp_(max=width - 1))
+
+
+def dflash_rebased_ctx_view(
+    rows: torch.Tensor, base_pages: torch.Tensor, num_ctx: torch.Tensor, page_size: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Block-table rows and context lengths the block decode reads for slots
+    whose first ``base_pages`` pages hold no drafter K/V (see
+    ``DFlashWorker._ctx_base_pages``).
+
+    The context length is shortened by the base, so the decode never reads
+    below it. The decode also writes the block's own K/V through the returned
+    rows, at rebased positions ``num_ctx .. num_ctx + block_size``, so entry 0
+    of a row has to name a page the request holds. While the context is
+    shorter than the base (the first tokens stored inside the rounded-up page)
+    it reads nothing and the row is shifted only to the page holding the
+    context length, which is the page those tokens were written to. From
+    ``base * page_size`` on the shift is the base itself.
+    """
+    rebase_pages = torch.minimum(base_pages, num_ctx // page_size)
+    num_ctx = (num_ctx - base_pages * page_size).clamp(min=0)
+    return dflash_rebased_ctx_rows(rows, rebase_pages), num_ctx
 
 
 @dataclass
@@ -602,28 +673,33 @@ class DFlashSpecMetadata(SpecMetadata):
         # Update slot mapping for DFlash context buffers
         worker = getattr(self, "_dflash_worker", None)
         if worker is not None and worker._ctx_buf_inited:
-            current = set(self.request_ids)
-            evicted = {}
+            # Requests paused in place (GEN slot preemption) keep their slot.
+            current = set(self.request_ids) | getattr(self, "paused_in_place_ids", frozenset())
+            # Slot lengths (and bases) written in one batch: evicted slots are
+            # emptied, newly assigned ones seeded below.
+            updates, bases = {}, {}
             for rid in list(worker._req_to_slot.keys()):
                 if rid not in current:
                     slot = worker._req_to_slot.pop(rid)
-                    evicted[slot] = 0
+                    updates[slot] = 0
                     worker._req_ctx_pos.pop(rid, None)
                     worker._free_slots.append(slot)
-            worker._write_ctx_len(evicted)
 
             # A disagg generation worker receives prompt KV instead of
             # prefilling, so _store_prefill_context -- the only other assigner --
-            # never runs and every request would land on the dummy slot.
+            # never runs and every request would land on the dummy slot. The
+            # same holds for a request whose slot was evicted above. Each such
+            # slot starts empty at its row's absolute position, on a page
+            # boundary (_seed_generation_slot).
             num_contexts = max(0, len(self.request_ids) - self.num_generations)
-            assigned = {}
-            for request_idx, rid in enumerate(self.request_ids[num_contexts:], num_contexts):
+            row_starts = None
+            for row, rid in enumerate(self.request_ids[num_contexts:], start=num_contexts):
                 if (
                     rid != ATTENTION_DP_DUMMY_REQUEST_ID
                     and rid < worker._graph_dummy_id_floor
                     and rid not in worker._req_to_slot
                 ):
-                    slot = worker._assign_slot(rid, updates=assigned)
+                    slot = worker._assign_slot(rid, updates=updates, bases=bases)
                     if slot is None:
                         # Not fatal -- spec dec is lossless, so the dummy-slot
                         # fallback only costs acceptance. Warn so it is not silent.
@@ -631,20 +707,30 @@ class DFlashSpecMetadata(SpecMetadata):
                             f"DFlash: no free drafter slot for generation request {rid}; "
                             "it shares the dummy slot and will draft poorly."
                         )
-                    elif worker._ctx_unified_cache:
-                        # New requests have no in-flight predecessor. Subsequent
-                        # accepted tokens advance the device length during replay.
-                        token_offset = sum(self.seq_lens[:request_idx])
-                        assigned[slot] = min(
-                            int(self.host_position_ids[token_offset]), worker._max_ctx
+                        continue
+                    if self.host_position_ids is None or self.seq_lens is None:
+                        raise RuntimeError(
+                            f"DFlash: no host positions to seed the slot of generation request {rid}"
                         )
-            if assigned:
-                worker._write_ctx_len(assigned)
+                    if row_starts is None:
+                        row_starts = [0]
+                        for seq_len in self.seq_lens:
+                            row_starts.append(row_starts[-1] + int(seq_len))
+                    position = int(self.host_position_ids[row_starts[row]])
+                    worker._seed_generation_slot(slot, position, updates, bases)
+            worker._write_ctx_len(updates, bases)
 
             # Route unknown request IDs (cuda graph padding or warmup dummies)
-            # to dummy slot to avoid corrupting real request's context
+            # to dummy slot to avoid corrupting real request's context. A
+            # generation row with the idle id is a dummy even when a context
+            # warmup stored a prompt under that id: its length is not this row's.
             mapping = torch.tensor(
-                [worker._req_to_slot.get(rid, worker._dummy_slot) for rid in self.request_ids],
+                [
+                    worker._dummy_slot
+                    if i >= num_contexts and rid == ATTENTION_DP_DUMMY_REQUEST_ID
+                    else worker._req_to_slot.get(rid, worker._dummy_slot)
+                    for i, rid in enumerate(self.request_ids)
+                ],
                 dtype=torch.long,
             )
             worker._batch_to_slot_buffer.update(mapping)
@@ -730,6 +816,27 @@ class VocabParallelSelection:
     draft_tokens: Optional[VocabParallelDraftTokens] = None
 
 
+def check_draft_logits_processor(draft_model) -> None:
+    """Require the plain logits processor on a drafter that declares a logit transform.
+
+    The worker applies the transform a drafter's `dflash_config` declares to
+    the logits of the drafter's own processor, so that processor must be the
+    plain `LogitsProcessor`. One that transforms the logits itself, such as a
+    target's, would get the transform a second time.
+    """
+    declares = (
+        getattr(draft_model, "logit_multiplier", 1.0) != 1.0
+        or getattr(draft_model, "logit_softcap", None) is not None
+    )
+    processor = getattr(draft_model, "logits_processor", None)
+    if declares and type(processor) is not LogitsProcessor:
+        raise RuntimeError(
+            "The DFlash drafter declares a logit transform (output_multiplier "
+            f"{draft_model.logit_multiplier}, final_logit_softcapping {draft_model.logit_softcap}), "
+            f"which assumes the plain LogitsProcessor; got {type(processor).__name__}"
+        )
+
+
 class DFlashWorker(SpecWorkerBase):
     """
     Worker for DFlash speculative decoding.
@@ -746,6 +853,19 @@ class DFlashWorker(SpecWorkerBase):
 
     Reference: https://arxiv.org/pdf/2602.06036
     """
+
+    # Whether the block decode reads _ctx_block_tables_read, the per-slot view
+    # rebased past _ctx_base_pages. Only then can a slot on the managed pool
+    # start at an absolute position other than 0 (_ctx_store_start,
+    # _seed_generation_slot); a subclass with its own generation-step
+    # preparation that reads _ctx_block_tables directly sets it False and
+    # numbers every slot from 0.
+    _ctx_reads_rebased_view = True
+    # Whether the bound draft pool releases pages behind a sliding window, and
+    # how many tokens it keeps below each window (kv_cache_manager_v2's
+    # draft_slot_trail_tokens). Set in _lazy_init_ctx_buffers.
+    _ctx_pool_windowed = False
+    _ctx_pool_trail = 0
 
     def __init__(
         self,
@@ -801,9 +921,22 @@ class DFlashWorker(SpecWorkerBase):
         # manager it is replaced by _ctx_block_tables, refreshed per iteration.
         self._ctx_page_table = None
         self._ctx_block_tables = None  # [max_batch+1, max_blocks_per_seq] int32
+        # The block table the block decode reads: each row of _ctx_block_tables
+        # shifted left by that slot's _ctx_base_pages, so pages below the first
+        # position the drafter stored are not addressable.
+        self._ctx_block_tables_read = None
+        # [max_batch+1] pages below a slot's first stored position: the slot
+        # holds no drafter K/V there (a prompt this worker did not prefill, or
+        # a prefix the target reused from an unpaired pool). Host shadow and
+        # pre-forward snapshots as for _ctx_len.
+        self._ctx_base_pages = None
+        self._ctx_base_host = None
+        self._saved_ctx_base = None
+        self._saved_ctx_base_host = None
         self._ctx_block_indptr = None
-        # Pages the manager handed this request, per batch row. Saturates at
-        # the table width on the default backend -- dflash_allocated_ctx_limit.
+        # Extent of the pages the manager handed this request (one past its
+        # last backed entry), per batch row. Saturates at the table width on
+        # the default backend -- dflash_allocated_ctx_limit.
         self._ctx_block_counts = None
         self._ctx_pool_idx = 0
         self._ctx_layer_ids = None
@@ -820,6 +953,11 @@ class DFlashWorker(SpecWorkerBase):
         # makes a reused prefix's drafter K/V still addressable. Set in
         # _lazy_init_ctx_buffers; read by _store_prefill_context.
         self._ctx_reuse_addressable = False
+        # Whether a seeded slot may start at the first position of the page
+        # holding its row's position (_seed_generation_slot): true when every
+        # window of the bound draft pool spans at least a page. Set in
+        # _lazy_init_ctx_buffers.
+        self._ctx_seed_page_aligned = False
         self._dflash_attention_backend = spec_config.attention_backend
         # Set by bind_target_lm_head.
         self._vocab_parallel: Optional[VocabParallelSelection] = None
@@ -962,7 +1100,9 @@ class DFlashWorker(SpecWorkerBase):
         if target_model is not None:
             self.bind_target_lm_head(target_model.lm_head, target_model.logits_processor)
         if self._draft_model_ref is not None:
-            self.bind_draft_lm_head(self._draft_model_ref())
+            draft_model = self._draft_model_ref()
+            check_draft_logits_processor(draft_model)
+            self.bind_draft_lm_head(draft_model)
 
     def post_load_weights(self) -> None:
         self.setup_aliases()
@@ -1137,7 +1277,8 @@ class DFlashWorker(SpecWorkerBase):
         ``kv_cache_block_offsets`` entries are ``pool_block_index *
         num_pool_layers * kv_factor`` plus the K/V field index. What that has to
         be divided by to index a ``get_buffers`` view depends on the manager --
-        see the stride check below; attention_backend/utils.py hardcodes the V1
+        see the stride check below;
+        ``append_mla_latent_cache_generation_cuda_graph_safe`` hardcodes the V1
         divisor and is not a general contract.
         """
         mgr = draft_kv_cache_manager
@@ -1151,26 +1292,28 @@ class DFlashWorker(SpecWorkerBase):
         if isinstance(mgr, KVCacheManagerV2):
             converter = mgr.impl.get_page_index_converter(layer_offset, Role.KEY)
             layer_group_id = mgr.layer_to_pool_mapping_dict[layer_offset]
+            unsupported = None
             if mgr.enable_swa_scratch_reuse:
-                raise NotImplementedError(
-                    "DFlash managed context does not support SWA scratch pages"
-                )
+                unsupported = "DFlash managed context does not support SWA scratch pages"
             for layer_id in self._ctx_layer_ids:
                 local_id = mgr.layer_offsets[layer_id]
                 if (
                     mgr.layer_to_pool_mapping_dict[local_id] != layer_group_id
                     or mgr.get_layer_page_index_scale(layer_id) != converter.scale
                 ):
-                    if self._ctx_unified_cache:
-                        raise NotImplementedError(
-                            "DFlash's shared context block table requires draft layers "
-                            "with the same lifecycle and page-index scale"
-                        )
-                    logger.warning(
-                        "DFlash: draft KV layers have different lifecycles or page-index "
-                        "scales; using the private ctx arena."
+                    unsupported = (
+                        "DFlash's shared context block table requires draft layers "
+                        "with the same lifecycle and page-index scale"
                     )
-                    return False
+                    break
+            if unsupported is not None:
+                # A unified manager was selected for this layout, so the drafter
+                # cannot move to private storage without breaking allocation,
+                # reuse and transfer. A separate manager keeps the private arena.
+                if self._ctx_unified_cache:
+                    raise NotImplementedError(unsupported)
+                logger.warning(f"{unsupported}; using the private ctx arena.")
+                return False
             if per_layer_tables:
                 # Attention tables address the physical pool origin, whereas
                 # get_buffers() starts at this layer's own K buffer.
@@ -1213,6 +1356,7 @@ class DFlashWorker(SpecWorkerBase):
         self._ctx_block_tables = torch.zeros(
             (num_slots, max_blocks), dtype=torch.int32, device="cuda"
         )
+        self._ctx_block_tables_read = torch.zeros_like(self._ctx_block_tables)
         self._ctx_block_indptr = torch.arange(
             0, (num_slots + 1) * max_blocks, max_blocks, dtype=torch.int32, device="cuda"
         )
@@ -1223,6 +1367,23 @@ class DFlashWorker(SpecWorkerBase):
             f"view_pages={pool[0].size(0)}"
         )
         return True
+
+    @staticmethod
+    def _check_block_within_allocation(
+        num_ctx: torch.Tensor, allocated_ctx_limit: torch.Tensor, block_size: int
+    ) -> None:
+        """Raise when a request's drafter block would leave its allocated pages.
+
+        The shared manager sizes the request, so a shortfall there would have the
+        block's scratch write land on the last context position, or on another
+        request's page. Asynchronous, so it adds no host sync and is safe to
+        capture in a CUDA graph; on the device it traps instead of raising.
+        """
+        torch._assert_async(
+            (num_ctx <= allocated_ctx_limit).all(),
+            f"DFlash: the drafter's block of {block_size} positions falls outside the "
+            "pages the shared KV cache manager allocated for the request",
+        )
 
     def _refresh_ctx_block_tables(self, attn_metadata, num_seqs: int) -> bool:
         """Decode this iteration's draft block table into the persistent buffer.
@@ -1289,10 +1450,33 @@ class DFlashWorker(SpecWorkerBase):
             logger.info("DFlash: draft KV cache manager replaced, rebinding the ctx cache.")
             self._ctx_buf_inited = False
 
+        # checkpoint's trained block width
+        self._resolved_block_size = getattr(draft_model, "block_size", None) or (
+            self.max_draft_len + 1
+        )
+        # what the draft forward actually computes
+        self._compute_block_size = self._draft_block_width(draft_model)
+        if self._compute_block_size > self._resolved_block_size:
+            slack = self._compute_block_size - self.max_draft_len
+            raise ValueError(
+                f"DFlash checkpoint was trained with block_size={self._resolved_block_size}."
+                f"Lower max_draft_len to at most {self._resolved_block_size - slack}."
+                f"Current max_draft_len={self.max_draft_len}."
+            )
+        if self._ctx_unified_cache:
+            reserved = getattr(draft_kv_cache_manager, "_shared_draft_block_width", 0)
+            if self._compute_block_size > reserved:
+                raise ValueError(
+                    f"Drafter block width {self._compute_block_size} exceeds the "
+                    f"{reserved} positions reserved by the shared KV cache manager. "
+                    "The manager must reserve the drafter's resolved block width."
+                )
+
         # Recorded even when the buffers stay private, so that the estimation
         # pass falling back to the arena still rebinds once the real pool lands.
         self._ctx_kv_manager = draft_kv_cache_manager
         self._ctx_block_tables = None
+        self._ctx_block_tables_read = None
         self._ctx_block_counts = None
         self._paged_latent_prepare = False
         max_batch = spec_metadata.max_num_requests
@@ -1335,11 +1519,13 @@ class DFlashWorker(SpecWorkerBase):
 
         dtype = dflash_context_dtype(draft_model)
 
-        # Reserve slot index max_batch as a scratch slot for padding/unknown
-        # dummies; real requests only draw slots 0..max_batch-1, so dummy
-        # writes land here and can't corrupt a real request's context.
-        self._dummy_slot = max_batch
-        num_slots = max_batch + 1
+        # Real requests draw slots 0..num_req_slots-1 (max_batch plus requests
+        # paused in place by GEN slot preemption); the next slot is a scratch
+        # slot for padding/unknown dummies, so dummy writes can't corrupt a
+        # real request's context.
+        num_req_slots = max_batch + getattr(cache_manager, "gen_preemption_headroom", 0)
+        self._dummy_slot = num_req_slots
+        num_slots = num_req_slots + 1
         # CUDA-graph padding uses ids counting down from
         # CUDA_GRAPH_DUMMY_REQUEST_ID; a floor of one draft block separates them
         # from real ids. Imported lazily to avoid an import cycle.
@@ -1349,28 +1535,16 @@ class DFlashWorker(SpecWorkerBase):
 
         self._ctx_len = torch.zeros(num_slots, dtype=torch.long, device="cuda")
         self._ctx_len_host = [0] * num_slots
+        self._ctx_base_pages = torch.zeros(num_slots, dtype=torch.long, device="cuda")
+        self._ctx_base_host = [0] * num_slots
         self._batch_to_slot_buffer = DeviceCopyBuffer(
             torch.zeros(max_batch, dtype=torch.long, device="cuda"),
             pin_memory=prefer_pinned(),
         )
 
-        self._free_slots = deque(range(max_batch))
+        self._free_slots = deque(range(num_req_slots))
         self._req_to_slot = {}
         self._req_ctx_pos = {}
-
-        # checkpoint's trained block width
-        self._resolved_block_size = getattr(draft_model, "block_size", None) or (
-            self.max_draft_len + 1
-        )
-        # what the draft forward actually computes
-        self._compute_block_size = self._draft_block_width(draft_model)
-        if self._compute_block_size > self._resolved_block_size:
-            slack = self._compute_block_size - self.max_draft_len
-            raise ValueError(
-                f"DFlash checkpoint was trained with block_size={self._resolved_block_size}."
-                f"Lower max_draft_len to at most {self._resolved_block_size - slack}."
-                f"Current max_draft_len={self.max_draft_len}."
-            )
 
         # +block_size slack lets each backend append the per-iteration noise
         # K/V after the accumulated request context.
@@ -1414,20 +1588,20 @@ class DFlashWorker(SpecWorkerBase):
             if self._dflash_attention_backend == "TRTLLM" and getattr(
                 draft_model, "_uses_worker_attention_backend", True
             ):
-                # Gated on the drafter that actually runs the trtllm-gen ops:
-                # one paging its own block decode the same way is not shaped
-                # like them. The context kernel's head-size limits apply only
-                # to layers lowered to it; a non-causal windowed layer runs
-                # the block decode plus the future-block merge.
+                # All supported masks lower to decode, including full non-causal
+                # attention with block queries folded into the query heads.
                 lowerings = draft_model.validate_block_attention_windows()
-                has_context_attention = DFLASH_CONTEXT_LOWERING in lowerings
                 validate_dflash_trtllm_gen_runtime(
                     dtype=dtype,
                     num_heads=nh,
                     num_kv_heads=nkv,
                     head_dim=hd,
                     tokens_per_block=page_size,
-                    has_context_attention=has_context_attention,
+                    folded_block_size=(
+                        self._compute_block_size
+                        if DFLASH_FOLDED_DECODE_LOWERING in lowerings
+                        else None
+                    ),
                 )
             elif self._dflash_attention_backend == "FA4":
                 validate_dflash_fa4_runtime(dtype=dtype, head_dim=hd)
@@ -1482,6 +1656,32 @@ class DFlashWorker(SpecWorkerBase):
                 self._ctx_reuse_addressable = self._ctx_unified_cache or bool(
                     getattr(draft_kv_cache_manager, "enable_joint_kv_cache_reuse", False)
                 )
+                # A slot seeded on a page boundary trails its request by less
+                # than a page; a windowed pool backs that trail only when it
+                # keeps a page below its windows (kv_cache_manager_v2's
+                # draft_slot_trail_tokens; a V1 pool does not).
+                windows = getattr(draft_kv_cache_manager, "max_attention_window_vec", None)
+                max_seq_len = getattr(draft_kv_cache_manager, "max_seq_len", None)
+                self._ctx_pool_windowed = any(
+                    window is not None and (max_seq_len is None or window < max_seq_len)
+                    for window in windows or ()
+                )
+                self._ctx_pool_trail = getattr(draft_kv_cache_manager, "draft_slot_trail_tokens", 0)
+                if (
+                    not self._ctx_reads_rebased_view
+                    and self._ctx_pool_windowed
+                    and getattr(draft_kv_cache_manager, "is_disagg", False)
+                ):
+                    # A disaggregated generation worker seeds every slot past
+                    # position 0 (_seed_generation_slot).
+                    raise ValueError(
+                        f"{type(self).__name__} numbers drafter slots from 0 and cannot serve a "
+                        "disaggregated worker with a sliding-window draft KV pool."
+                    )
+                self._ctx_seed_page_aligned = dflash_windows_span_a_page(windows, page_size) and (
+                    all(window is None for window in windows or ())
+                    or getattr(draft_kv_cache_manager, "draft_slot_trail_tokens", 0) >= page_size
+                )
             self._ctx_kv_last_page_len = torch.full(
                 (num_slots,), page_size, dtype=torch.int32, device="cuda"
             )
@@ -1534,13 +1734,125 @@ class DFlashWorker(SpecWorkerBase):
             indptr = self._ctx_kv_indptr
         return table.flatten().contiguous(), indptr
 
-    def _assign_slot(self, req_id: int, reset: bool = False, updates: Optional[dict] = None):
+    def _ctx_store_start(self, cur: int, first_pos: int) -> Optional[int]:
+        """Position at which a context chunk's drafter K/V is stored, or None
+        when this worker cannot store it.
+
+        ``cur`` is the slot's stored length, ``first_pos`` the chunk's first
+        target position. They differ only when the target skipped
+        [0, first_pos) (block reuse, or a prefix computed elsewhere), so just
+        the tail reaches the capture buffer.
+
+        On the managed pool the block table is indexed by target position, so
+        the tail is stored at ``first_pos``: always on a pool paired with the
+        target's reuse, which holds the prefix's drafter K/V below it, and on
+        an unpaired pool when the worker reads the rebased view, which hides
+        the empty prefix. Otherwise (the private arena, or an unpaired pool
+        read from position 0) every request numbers from 0, where the tail is
+        all the context there is -- except on a sliding-window pool more than
+        its trailing page past position 0 (None).
+        """
+        if (
+            cur == 0
+            and first_pos > 0
+            and self._ctx_block_tables is not None
+            and (self._ctx_reuse_addressable or self._ctx_reads_rebased_view)
+        ):
+            return first_pos
+        if (
+            cur == 0
+            and first_pos > self._ctx_pool_trail
+            and self._ctx_block_tables is not None
+            and self._ctx_pool_windowed
+        ):
+            # A slot numbered from 0 lags the request's absolute positions by
+            # first_pos, and the manager keeps pages only from the absolute
+            # position less the window and trail: past the trail, the slot's
+            # window reaches entries without a page once the request outgrows it.
+            return None
+        return cur
+
+    def _ctx_base_for_store(self, cur: int, start: int) -> Optional[int]:
+        """Pages the block decode must not read for a slot whose first stored
+        position is ``start``, or None when the slot numbers from ``cur``.
+
+        A pool paired with the target's reuse holds the prefix's drafter K/V
+        below ``start``, so it stays readable. An unpaired pool holds no drafter
+        K/V there: the block decode is handed the slot's block-table row shifted
+        past those pages (``dflash_rebased_ctx_rows``) and a context length
+        shortened by the same amount, so a tail shorter than the drafter's
+        window attends only to itself. ``start`` is rounded up to a page
+        boundary; the tail tokens inside that page stay stored but unread.
+        """
+        if start == cur or self._ctx_reuse_addressable:
+            return None
+        return -(-start // self._ctx_page_size)
+
+    def _seed_generation_slot(self, slot: int, position: int, updates: dict, bases: dict) -> None:
+        """Record the context length and base of a slot newly assigned to a
+        generation row whose first token sits at absolute ``position``.
+
+        Bound to the draft KV cache manager, the slot addresses the request's
+        mirror, whose positions are absolute (the target's). The slot holds no
+        drafter K/V for the positions before ``position`` -- a disaggregated
+        generation worker received only the target's prompt KV, and a request
+        that lost its slot lost its context -- whether or not the pool joins
+        block reuse: the mirror of such a request never looked a prefix up.
+        The slot therefore starts with an empty context on a page boundary,
+        and the block decode reads from its base, never below it:
+
+        * at the first position of the page holding ``position``. The slot's
+          positions then trail the absolute ones by less than a page, and the
+          mirror keeps one page below each window for that trail
+          (``_draft_slot_trail_tokens`` in kv_cache_manager_v2), so every
+          entry the window reads stays on a page the request holds. Taken
+          when every window of the pool spans a page
+          (``_ctx_seed_page_aligned``); the slot reads what it stores from
+          its first step;
+        * otherwise at ``position`` itself, with the base rounded up to the
+          next page: the slot reads nothing until its context reaches it.
+
+        The private arena is slot-addressed and starts at 0, as does a worker
+        that does not read the rebased view (_ctx_reads_rebased_view).
+
+        A unified manager (_ctx_unified_cache) is the exception: the draft
+        layers live in the target's manager and travel with the target's
+        prompt KV, so the slot holds drafter K/V for every position below
+        ``position`` and reads from base 0.
+        """
+        if self._ctx_block_tables is None or position <= 0:
+            updates[slot] = 0
+            return
+        position = min(position, self._max_ctx)
+        if self._ctx_unified_cache:
+            updates[slot] = position
+            bases[slot] = 0
+            return
+        if not self._ctx_reads_rebased_view:
+            updates[slot] = 0
+            return
+        page = self._ctx_page_size
+        if self._ctx_seed_page_aligned:
+            bases[slot] = position // page
+            updates[slot] = bases[slot] * page
+        else:
+            bases[slot] = -(-position // page)
+            updates[slot] = position
+
+    def _assign_slot(
+        self,
+        req_id: int,
+        reset: bool = False,
+        updates: Optional[dict] = None,
+        bases: Optional[dict] = None,
+    ) -> Optional[int]:
         """Get (or refresh) this request's context slot; None when none is free.
 
         ``reset`` recycles an existing slot, which is how a reused request id is
-        told apart from a continuation. Pass ``updates`` to defer the length
-        resets into a caller's batch instead of writing _ctx_len per request;
-        either way the host mirror stays in step with the device tensor.
+        told apart from a continuation. Pass ``updates`` (and ``bases``, which
+        then gets the base-page resets) to defer the length resets into a
+        caller's batch instead of writing _ctx_len per request; either way the
+        host mirror stays in step with the device tensor.
         """
 
         def clear(slot: int) -> None:
@@ -1548,6 +1860,8 @@ class DFlashWorker(SpecWorkerBase):
                 self._write_ctx_len({slot: 0})
             else:
                 updates[slot] = 0
+                if bases is not None:
+                    bases[slot] = 0
 
         if reset and req_id in self._req_to_slot:
             old_slot = self._req_to_slot.pop(req_id)
@@ -1615,7 +1929,12 @@ class DFlashWorker(SpecWorkerBase):
         is_capturing = torch.cuda.is_current_stream_capturing()
 
         if spec_metadata.is_cuda_graph and not is_capturing:
-            attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda", "kv_lens_cuda")
+            # Only TRTLLM attention metadata keeps device-side KV lengths; on
+            # other backends (FlashInfer) there is nothing to save.
+            fields = ["_seq_lens", "_seq_lens_cuda"]
+            if hasattr(attn_metadata, "kv_lens_cuda"):
+                fields.append("kv_lens_cuda")
+            attn_metadata.prepare_for_spec_dec(*fields)
         else:
             attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
 
@@ -1670,29 +1989,50 @@ class DFlashWorker(SpecWorkerBase):
         mapping = [self._req_to_slot.get(rid, self._dummy_slot) for rid in request_ids]
         self._batch_to_slot_buffer.update(torch.tensor(mapping, dtype=torch.long))
 
-    def _write_ctx_len(self, updates: dict[int, int]) -> None:
-        """Apply a slot-to-length mapping to _ctx_len in one async scatter."""
-        if not updates:
+    def _write_ctx_len(
+        self, updates: dict[int, int], base_updates: Optional[dict[int, int]] = None
+    ) -> None:
+        """Apply slot-to-length (and slot-to-base-page) mappings in one async
+        scatter each. A slot reset to length 0 also drops its base pages, and
+        that reset wins over a base recorded for the same slot in
+        ``base_updates`` (a chunk's base is recorded before the overflow check
+        that may reset the slot)."""
+        if not updates and not base_updates:
             return
+        bases = dict(base_updates or {})
+        bases.update({slot: 0 for slot, value in updates.items() if value == 0})
         for slot, value in updates.items():  # Update host side mirror
             self._ctx_len_host[slot] = value
+        for slot, value in bases.items():
+            self._ctx_base_host[slot] = value
 
-        slots, values = zip(*updates.items())
         pinned = prefer_pinned()
-        slots_pinned = torch.tensor(slots, dtype=torch.long, pin_memory=pinned)
-        vals_pinned = torch.tensor(values, dtype=torch.long, pin_memory=pinned)
-        self._ctx_len.index_copy_(
-            0,
-            slots_pinned.to("cuda", non_blocking=True),
-            vals_pinned.to("cuda", non_blocking=True),
-        )
+        for target, mapping in ((self._ctx_len, updates), (self._ctx_base_pages, bases)):
+            if not mapping:
+                continue
+            slots, values = zip(*mapping.items())
+            slots_pinned = torch.tensor(slots, dtype=torch.long, pin_memory=pinned)
+            vals_pinned = torch.tensor(values, dtype=torch.long, pin_memory=pinned)
+            target.index_copy_(
+                0,
+                slots_pinned.to(target.device, non_blocking=True),
+                vals_pinned.to(target.device, non_blocking=True),
+            )
 
     def _restore_ctx_len_host(self) -> None:
         """Roll the host shadows back to their pre-forward snapshot."""
         if self._saved_ctx_len_host is not None:
             self._ctx_len_host = list(self._saved_ctx_len_host)
+        if self._saved_ctx_base_host is not None:
+            self._ctx_base_host = list(self._saved_ctx_base_host)
         if self._saved_req_ctx_pos is not None:
             self._req_ctx_pos = dict(self._saved_req_ctx_pos)
+
+    def _restore_ctx_len_device(self) -> None:
+        """Roll _ctx_len and _ctx_base_pages back to their pre-forward snapshot."""
+        self._ctx_len.copy_(self._saved_ctx_len)
+        if self._saved_ctx_base is not None:
+            self._ctx_base_pages.copy_(self._saved_ctx_base)
 
     def _store_prefill_context(
         self,
@@ -1733,6 +2073,7 @@ class DFlashWorker(SpecWorkerBase):
         # the same values, but reading it costs a D2H sync per request.
         host_pos = spec_metadata.host_position_ids
         ctx_len_updates = {}
+        ctx_base_updates = {}
         offset = 0
         num_contexts = attn_metadata.num_contexts
         # A context write addresses pages through row i of the block table, so
@@ -1762,7 +2103,12 @@ class DFlashWorker(SpecWorkerBase):
             # request id reused after completion, a prefill restarted after
             # preemption -- has to start from a clean slot.
             reset = self._req_ctx_pos.get(req_id) != first_pos
-            if self._assign_slot(req_id, reset=reset, updates=ctx_len_updates) is None:
+            if (
+                self._assign_slot(
+                    req_id, reset=reset, updates=ctx_len_updates, bases=ctx_base_updates
+                )
+                is None
+            ):
                 logger.warning("DFlash: no free slots, skipping context store")
                 self._req_ctx_pos.pop(req_id, None)
                 offset += slen
@@ -1771,11 +2117,28 @@ class DFlashWorker(SpecWorkerBase):
             slot = self._req_to_slot[req_id]
             cur = ctx_len_updates.get(slot, self._ctx_len_host[slot])
             cap = self._max_ctx if ctx_alloc is None else min(self._max_ctx, ctx_alloc[i])
-            if cur == 0 and first_pos > 0 and self._ctx_reuse_addressable:
-                # Reuse let the target skip [0, first_pos), so only the tail
-                # reaches the capture buffer. The prefix K/V are still in the
-                # paired pool: precompute_context_kv is per-token in (hidden, p).
-                cur = first_pos
+            # A paired pool still holds the prefix K/V below the tail
+            # (precompute_context_kv is per-token in (hidden, p)); an unpaired
+            # one does not, so the slot reads from a base above it.
+            start = self._ctx_store_start(cur, first_pos)
+            if start is None:
+                # Request-level, like the overflow below: the slot is released
+                # rather than failing the batch's forward.
+                logger.warning(
+                    f"DFlash: {type(self).__name__} numbers drafter slots from 0 and cannot store "
+                    f"the context chunk at position {first_pos} of request {req_id} on a "
+                    "sliding-window draft KV pool; skipping its context store."
+                )
+                self._req_to_slot.pop(req_id, None)
+                self._req_ctx_pos.pop(req_id, None)
+                ctx_len_updates[slot] = 0
+                self._free_slots.append(slot)
+                offset += slen
+                continue
+            base = self._ctx_base_for_store(cur, start)
+            if base is not None:
+                ctx_base_updates[slot] = base
+            cur = start
             if cur + slen > cap:
                 # Request-level, like the no-free-slots path above: truncating
                 # would silently draft from a stale prefix, but killing the
@@ -1834,7 +2197,7 @@ class DFlashWorker(SpecWorkerBase):
                         self._ctx_v_buf[slot, :, cur:end] = chunk_v.permute(1, 0, 2, 3)
             offset += slen
 
-        self._write_ctx_len(ctx_len_updates)
+        self._write_ctx_len(ctx_len_updates, ctx_base_updates)
 
     def _ensure_spec_dec_state_restored(self, attn_metadata, spec_metadata):
         # Restore first (in warmup mode kv_lens_cuda was saved and comes back
@@ -1854,7 +2217,7 @@ class DFlashWorker(SpecWorkerBase):
         ):
             # A failed forward must not keep this iteration's in-place
             # _ctx_len updates: roll back to the pre-forward snapshot.
-            self._ctx_len.copy_(self._saved_ctx_len)
+            self._restore_ctx_len_device()
             self._restore_ctx_len_host()
             self._ctx_len_restore_pending = False
 
@@ -1928,6 +2291,8 @@ class DFlashWorker(SpecWorkerBase):
             # mutate _ctx_len until replay.
             self._saved_ctx_len = self._ctx_len.clone()
             self._saved_ctx_len_host = list(self._ctx_len_host)
+            self._saved_ctx_base = self._ctx_base_pages.clone()
+            self._saved_ctx_base_host = list(self._ctx_base_host)
             self._saved_req_ctx_pos = dict(self._req_ctx_pos)
             self._ctx_len_restore_pending = True
 
@@ -2041,6 +2406,11 @@ class DFlashWorker(SpecWorkerBase):
                     gen_logits = draft_model.logits_processor(
                         gen_hidden_states, draft_model.lm_head, attn_metadata, True
                     )
+                    # The drafter shares the target's LM head but not its logits
+                    # processor, so apply the transform its config declares,
+                    # before any refinement: a DSpark Markov bias is added to
+                    # the transformed logits.
+                    gen_logits = draft_model.apply_draft_logit_transform(gen_logits)
 
                     vocab_size = gen_logits.shape[-1]
                     gen_logits = gen_logits.reshape(num_gens, K, vocab_size)
@@ -2131,7 +2501,7 @@ class DFlashWorker(SpecWorkerBase):
 
         # Restore context lengths after warmup; real runs keep the updates.
         if is_warmup:
-            self._ctx_len.copy_(self._saved_ctx_len)
+            self._restore_ctx_len_device()
             self._restore_ctx_len_host()
         self._ctx_len_restore_pending = False
 
@@ -2154,7 +2524,12 @@ class DFlashWorker(SpecWorkerBase):
         this alongside :meth:`_draft_slot_ids` — the two must agree, since
         the width bounds the slots the gather is allowed to name.
         """
-        return self.max_draft_len + 1
+        return self.block_width_for(self.spec_config)
+
+    @staticmethod
+    def block_width_for(spec_config) -> int:
+        """Block slots a worker of this family computes for ``spec_config``."""
+        return spec_config.max_draft_len + 1
 
     def _draft_slot_ids(
         self, draft_model, num_gens: int, block_size: int, num_draft_tokens: int
@@ -2480,6 +2855,7 @@ class DFlashWorker(SpecWorkerBase):
                 self._advance_ctx_len(slots, gen_num_accepted_long)
 
             num_ctx_per_req_t = self._ctx_len[slots]
+            ctx_page_table = self._ctx_page_table
             if self._ctx_block_tables is not None:
                 # The write above clamps columns to the request's allocation, so
                 # a context that outruns it has its tail written over the last
@@ -2488,7 +2864,23 @@ class DFlashWorker(SpecWorkerBase):
                 allocated = dflash_allocated_ctx_limit(
                     self._ctx_block_counts, self._ctx_page_size, block_size
                 )
+                if self._ctx_unified_cache:
+                    self._check_block_within_allocation(
+                        num_ctx_per_req_t, allocated[gen_rows_out], block_size
+                    )
                 num_ctx_per_req_t = torch.minimum(num_ctx_per_req_t, allocated[gen_rows_out])
+                # Pages below a slot's base hold no drafter K/V: the read
+                # numbers from the base instead (dflash_rebased_ctx_view).
+                # Writes above keep the absolute table.
+                self._ctx_block_tables_read[gen_rows_out], num_ctx_per_req_t = (
+                    dflash_rebased_ctx_view(
+                        self._ctx_block_tables[gen_rows_out],
+                        self._ctx_base_pages[slots],
+                        num_ctx_per_req_t,
+                        self._ctx_page_size,
+                    )
+                )
+                ctx_page_table = self._ctx_block_tables_read
             noise_embedding = noise_embed_2d
             query_positions = query_position_ids.long()
 
@@ -2505,6 +2897,11 @@ class DFlashWorker(SpecWorkerBase):
             slots = torch.empty(0, dtype=torch.long, device="cuda")
             gen_rows_out = slots
             bonus = torch.empty(0, dtype=torch.long, device="cuda")
+            ctx_page_table = (
+                self._ctx_block_tables_read
+                if self._ctx_block_tables is not None
+                else self._ctx_page_table
+            )
 
         return {
             "lilicorr_anchor": lilicorr_anchor,
@@ -2520,11 +2917,8 @@ class DFlashWorker(SpecWorkerBase):
             # token. The dspark Markov chain conditions its first step on it.
             "first_prev_tokens": bonus,
             "ctx_kv_cache": self._ctx_kv_buf,
-            "ctx_page_table": (
-                self._ctx_block_tables
-                if self._ctx_block_tables is not None
-                else self._ctx_page_table
-            ),
+            # The manager-bound table is the read view rebased per slot above.
+            "ctx_page_table": ctx_page_table,
             "block_placement": None,
         }
 
@@ -2534,6 +2928,9 @@ class DFlashWorker(SpecWorkerBase):
         features, drafting from all ``K + 1`` target tokens."""
         return (
             self._paged_latent_prepare
+            # Shared allocations require the generic path's strict capacity
+            # check; the fused preparation silently caps the context length.
+            and not self._ctx_unified_cache
             and spec_metadata.runtime_draft_len + 1 == self._draft_tokens_per_req
             and spec_metadata.captured_hidden_states is not None
         )
@@ -2567,6 +2964,7 @@ class DFlashWorker(SpecWorkerBase):
             accepted_tokens,
             self._batch_to_slot_buffer.tensor[num_contexts : num_contexts + num_gens],
             self._ctx_len,
+            self._ctx_base_pages,
             self._ctx_block_counts,
             self._ctx_block_tables,
             attn_metadata._seq_lens_cuda,
@@ -2601,6 +2999,15 @@ class DFlashWorker(SpecWorkerBase):
             prep.store_offsets,
             prep.store_mask,
         )
+        # The block decode reads each row shifted past the slot's base, as the
+        # eager path's dflash_rebased_ctx_view; the kernel already placed the
+        # block and advertised the context in those rebased positions.
+        gen_rows = torch.arange(
+            num_contexts, num_contexts + num_gens, dtype=torch.long, device="cuda"
+        )
+        self._ctx_block_tables_read[gen_rows] = dflash_rebased_ctx_rows(
+            self._ctx_block_tables[gen_rows], prep.rebase_pages
+        )
         return {
             "lilicorr_anchor": None,
             "noise_embedding": noise_embedding,
@@ -2608,12 +3015,10 @@ class DFlashWorker(SpecWorkerBase):
             "num_ctx_per_req": prep.num_ctx,
             "ctx_k_cache": self._ctx_k_buf,
             "ctx_v_cache": self._ctx_v_buf,
-            "ctx_cache_batch_idx": torch.arange(
-                num_contexts, num_contexts + num_gens, dtype=torch.long, device="cuda"
-            ),
+            "ctx_cache_batch_idx": gen_rows,
             "first_prev_tokens": prep.bonus,
             "ctx_kv_cache": self._ctx_kv_buf,
-            "ctx_page_table": self._ctx_block_tables,
+            "ctx_page_table": self._ctx_block_tables_read,
             "block_placement": DraftBlockPlacement(
                 prep.blk_pages, prep.blk_offsets, prep.blk_seq_lens, prep.blk_kv_bounds
             ),

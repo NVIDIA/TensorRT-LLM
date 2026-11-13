@@ -23,6 +23,7 @@ from .create_moe import (MoEImplClass, create_moe, resolve_moe_cls,
 from .cutedsl import (TrtllmCutedslFusedFc12Nvfp4Impl,
                       TrtllmCutedslGroupedGemmBf16Impl,
                       TrtllmCutedslGroupedGemmNvfp4Impl,
+                      TrtllmCutedslGroupedGemmNvfp4PlusImpl,
                       cutedsl_grouped_gemm_leaf, find_cutedsl_grouped_gemm_leaf)
 from .cutlass import cutlass_leaf, find_cutlass_leaf
 from .fused_moe_cute_dsl import CuteDslFusedMoE
@@ -75,6 +76,7 @@ __all__ = [
     "TrtllmCutedslFusedFc12Nvfp4Impl",
     "CuteDslFusedMoE",
     "TrtllmCutedslGroupedGemmNvfp4Impl",
+    "TrtllmCutedslGroupedGemmNvfp4PlusImpl",
     "TrtllmCutedslGroupedGemmBf16Impl",
     "cutedsl_grouped_gemm_leaf",
     "find_cutedsl_grouped_gemm_leaf",

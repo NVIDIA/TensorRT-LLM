@@ -19,6 +19,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
+from tensorrt_llm._torch.modules.context_logits import context_logits_heads, context_logits_scope
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
     MoeLoadBalancerIterContext,
@@ -28,6 +29,7 @@ from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
 from tensorrt_llm._torch.pyexecutor import h2d_cache, step_inputs
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner
+from tensorrt_llm._torch.pyexecutor.context_logits_plan import ContextLogitsPlan
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     CUDAGraphRunner,
     CUDAGraphRunnerConfig,
@@ -36,8 +38,13 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
 )
 from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
 from tensorrt_llm._torch.pyexecutor.h2d_cache import H2DSkipCache
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
+from tensorrt_llm._torch.pyexecutor.resource_manager import (
+    KVCacheManager,
+    ResourceManager,
+    ResourceManagerType,
+)
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import (
     DEFAULT_RUNTIME_HOOKS,
     RuntimeHooks,
@@ -202,11 +209,44 @@ class DecoderRunner(ScheduledModelRunner):
 
         self._config = config
         self.runtime_hooks = runtime_hooks_of(model)
-        self._h2d_cache = H2DSkipCache() if self.runtime_hooks.skip_unchanged_h2d else None
+        self._h2d_cache = (
+            H2DSkipCache(changed_span=self.runtime_hooks.h2d_changed_span)
+            if self.runtime_hooks.skip_unchanged_h2d
+            else None
+        )
         self._step_pack = (
-            StepInputPack(torch.device("cuda", torch.cuda.current_device()))
+            StepInputPack(
+                torch.device("cuda", torch.cuda.current_device()),
+                parallel_scatter=self.runtime_hooks.pack_parallel_scatter,
+                in_graph=self.runtime_hooks.pack_in_graph,
+                early_copy=self.runtime_hooks.pack_early_copy,
+                step_epoch=self.runtime_hooks.pack_step_epoch,
+                prologue_op=self.runtime_hooks.pack_prologue_op,
+            )
             if self.runtime_hooks.pack_step_inputs
             else None
+        )
+        if self._step_pack is not None and self._step_pack.parallel_scatter:
+            logger.info("[M3 host] step-input pack: parallel scatter for non-overlapping copies")
+        if self._step_pack is not None and self._step_pack.in_graph:
+            logger.info("[M3 host] step-input pack issued by the decode graph's prologue")
+        if self._step_pack is not None and self._step_pack.early_copy:
+            logger.info(
+                "[M3 host] step-input pack: window uploaded ahead of the replay on a side copy stream"
+            )
+        if self._step_pack is not None and self._step_pack.epoch is not None:
+            logger.info(
+                "[M3 host] step epoch: one device counter bumped by the decode graph's prologue"
+            )
+        if self._step_pack is not None and self._step_pack.prologue_op is not None:
+            logger.info(
+                "[M3 host] step-input pack: the decode graph's prologue is one launch (scatter, header, epoch)"
+            )
+        if self._h2d_cache is not None and self._h2d_cache.changed_span:
+            logger.info("[M3 host] changed metadata uploads stage only each row's changed span")
+        # Heads that can project context logits eagerly; the model is fixed.
+        self._context_logits_heads = context_logits_heads(
+            model, mapping, is_spec_decode=config.is_spec_decode
         )
 
         self.forward_pass_callable = None
@@ -272,6 +312,7 @@ class DecoderRunner(ScheduledModelRunner):
             context_warmups_supported=self._context_warmups_supported,
             eager_workspace_reclaimable=self._eager_workspace_reclaim_supported,
             warmup_inputs=self._buffers.input_ids_cuda,
+            context_logits_heads=self._context_logits_heads,
         )
 
     def _make_dummy_requests(self) -> DummyRequestFactory:
@@ -500,7 +541,11 @@ class DecoderRunner(ScheduledModelRunner):
 
         Set by a sparse attention config that asks for the split, or by a model whose MSA
         policy stages identity selections for short sequences: a sequence within the
-        top-k blocks attends every valid block.
+        top-k blocks attends every valid block. The short family runs the identity selection,
+        so every token it attends must fit in the top-k blocks. The graph key estimates a
+        sequence's length from host token counts, which under the overlap scheduler miss up to
+        the in-flight step's accepted tokens; the identity threshold leaves one generation
+        step's tokens of headroom for that.
         """
         sparse_config = self._sparse_attention_config
         if (
@@ -514,7 +559,8 @@ class DecoderRunner(ScheduledModelRunner):
                     "MsaRuntimePolicy.short_sequence_identity requires a MiniMax-M3 sparse "
                     f"attention config, got {type(sparse_config).__name__}"
                 )
-            return sparse_config.sparse_topk_blocks * sparse_config.sparse_block_size
+            topk_span = sparse_config.sparse_topk_blocks * sparse_config.sparse_block_size
+            return topk_span - self._get_runtime_tokens_per_gen_step(self._config.max_draft_len)
         return None
 
     def _initialize_breakable_cuda_graph_runner(self) -> BreakableCUDAGraphRunner | None:
@@ -580,6 +626,15 @@ class DecoderRunner(ScheduledModelRunner):
         )
         assert kv_cache_manager is not None, "the legacy runner requires a KV cache manager"
         semantic_requests = scheduled_requests
+        context_plan = (
+            ContextLogitsPlan.for_batch(
+                self._context_logits_heads,
+                semantic_requests,
+                is_spec_decode=self._config.is_spec_decode or enable_spec_decode,
+            )
+            if gather_context_logits
+            else None
+        )
         scheduled_requests = self._graphs.attention_dp_execution_batch(scheduled_requests)
         draft_kv_cache_manager = get_draft_kv_cache_manager(
             self._config.spec_config, resource_manager
@@ -610,12 +665,11 @@ class DecoderRunner(ScheduledModelRunner):
         ced_enabled = uses_private_decoder_cache(
             getattr(self._model, "model", None), kv_cache_manager
         )
-        graph_requests, promoted_context_request_ids = self._graphs.promote_final_contexts(
+        graph_requests, promoted_context_request_ids = self.make_graph_batch(
             scheduled_requests,
             kv_cache_manager,
             enable_spec_decode=enable_spec_decode,
             runtime_draft_len=runtime_draft_len,
-            ced_enabled=ced_enabled,
         )
 
         with self._graphs.pad_batch(
@@ -663,8 +717,14 @@ class DecoderRunner(ScheduledModelRunner):
             key = selection.key
             use_lora_graph = selection.use_lora_graph
 
-            can_run_graph = key is not None and not (
-                ced_enabled and scheduled_requests.num_context_requests > 0
+            if context_plan is not None and key is not None and promoted_context_request_ids:
+                # Every context is a promoted one-row final chunk, so its logits
+                # are decode-sized and need no bounded projection; replay the graph.
+                context_plan = None
+            can_run_graph = (
+                key is not None
+                and context_plan is None
+                and not (ced_enabled and scheduled_requests.num_context_requests > 0)
             )
             if can_run_graph:
                 attn_metadata = selection.attn_metadata
@@ -773,27 +833,34 @@ class DecoderRunner(ScheduledModelRunner):
 
             graph_key = key if can_run_graph else None
             captures_model_body = self._graphs.captures_model_body(graph_key)
-            outputs = self._graphs.run(
-                graph_key,
-                inputs,
-                run_model,
-                postprocess_inputs,
-                attn_metadata=attn_metadata,
-                draft_kv_cache_manager=draft_kv_cache_manager,
-                moe_load_balancer=moe_load_balancer,
-                enable_spec_decode=enable_spec_decode,
-                gather_context_logits=gather_context_logits,
-                static_inputs_staged=prepared.static_inputs_staged,
-                position_id_offsets=(
-                    self._buffers.previous_pos_id_offsets_cuda
-                    if enable_spec_decode
-                    and not self._config.disable_overlap_scheduler
-                    and attn_metadata.kv_cache_manager is not None
-                    else None
-                ),
-            )
+            with (
+                self._maybe_bypass_torch_compile(bypass=context_plan is not None),
+                context_logits_scope(context_plan),
+            ):
+                outputs = self._graphs.run(
+                    graph_key,
+                    inputs,
+                    run_model,
+                    postprocess_inputs,
+                    attn_metadata=attn_metadata,
+                    draft_kv_cache_manager=draft_kv_cache_manager,
+                    moe_load_balancer=moe_load_balancer,
+                    enable_spec_decode=enable_spec_decode,
+                    gather_context_logits=gather_context_logits,
+                    static_inputs_staged=prepared.static_inputs_staged,
+                    position_id_offsets=(
+                        self._buffers.previous_pos_id_offsets_cuda
+                        if enable_spec_decode
+                        and not self._config.disable_overlap_scheduler
+                        and attn_metadata.kv_cache_manager is not None
+                        else None
+                    ),
+                )
             # No-op unless a pack was opened above and the replay did not issue it.
             step_inputs.flush()
+            if context_plan is not None and context_plan.handled:
+                outputs = dict(outputs) if isinstance(outputs, dict) else {"logits": outputs}
+                outputs["context_logits_handled"] = True
             if captures_model_body:
                 return outputs
 
@@ -1132,6 +1199,36 @@ class DecoderRunner(ScheduledModelRunner):
         ):
             return defer()
         return contextlib.nullcontext()
+
+    def make_graph_batch(
+        self,
+        scheduled_requests: ScheduledRequests,
+        kv_cache_manager: KVCacheManager | KVCacheManagerV2 | None,
+        *,
+        enable_spec_decode: bool,
+        runtime_draft_len: int,
+    ) -> tuple[ScheduledRequests, frozenset[int]]:
+        """The batch ``forward`` hands to the CUDA-graph runner.
+
+        Final one-token context requests are promoted into a decode-shaped
+        graph candidate when the engine configuration allows it; otherwise the
+        scheduled batch is returned as is with no promoted ids. The executor
+        evaluates it right after scheduling (enable_packed_sync packs the
+        runner's attention-DP padding vector into its post-schedule exchange,
+        see ``PyTorchModelEngine.make_graph_batch``) and obtains exactly the
+        rows the runner would gather in the forward.
+        """
+        from tensorrt_llm._torch.pyexecutor.ced_replay import uses_private_decoder_cache
+
+        return self._graphs.promote_final_contexts(
+            scheduled_requests,
+            kv_cache_manager,
+            enable_spec_decode=enable_spec_decode,
+            runtime_draft_len=runtime_draft_len,
+            ced_enabled=uses_private_decoder_cache(
+                getattr(self._model, "model", None), kv_cache_manager
+            ),
+        )
 
     @staticmethod
     def _restore_attention_dp_semantic_outputs(

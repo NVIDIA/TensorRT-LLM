@@ -61,6 +61,9 @@ class KimiK3DFlashWorker(DFlashWorker):
     # inputs as trtllm::k3_spec_accept, keep the target logits vocabulary-sharded and write the drafter's context
     # K/V with trtllm::k3_ctx_kv.
     k3_decode = False
+    # The generation-step preparation below reads _ctx_block_tables, not the
+    # rebased view, so every drafter slot numbers from 0.
+    _ctx_reads_rebased_view = False
 
     def _mask_token_id(self, draft_model) -> int:
         """The drafter's mask token id, resolved once."""
@@ -95,8 +98,8 @@ class KimiK3DFlashWorker(DFlashWorker):
 
         That mode: a decode step (no context requests, at most 8 gen requests) with greedy strict acceptance (no
         rejection sampling, penalties or guided decoding, the base draft-token and logits layouts), fp32 target
-        logits of a vocabulary the kernel splits, the V2 Mamba manager's KDA replay record, the draft pool's block
-        table, and an unsharded bf16 draft embedding. Any other step keeps the torch path.
+        logits of a vocabulary the kernel splits, the V2 Mamba manager's KDA replay record, the block table of a draft
+        pool without sliding windows, and an unsharded bf16 draft embedding. Any other step keeps the torch path.
         """
         if not self._k3_accept_step_applies(
             attn_metadata, spec_metadata, draft_model, num_contexts, num_gens
@@ -156,11 +159,14 @@ class KimiK3DFlashWorker(DFlashWorker):
             or mgr._kda_replay.prev_num_accepted_tokens is None
             or getattr(mgr, "_dummy_request_mask", None) is None
             or mamba_metadata is None
-            or mamba_metadata.state_indices.dtype != torch.int32
+            or mamba_metadata.replay_state_indices.dtype != torch.int32
         ):
             return False
+        # The kernel's block counts are backed entries, which a sliding-window
+        # pool's released entries put below the extent the drafter writes to.
         if (
             self._ctx_block_tables is None
+            or self._ctx_pool_windowed
             or getattr(attn_metadata, "draft_kv_cache_block_offsets", None) is None
             or getattr(attn_metadata, "kv_lens_cuda", None) is None
         ):
@@ -462,7 +468,7 @@ class KimiK3DFlashWorker(DFlashWorker):
             self._ctx_block_counts,
             self._ctx_block_tables,
             mgr._kda_replay.prev_num_accepted_tokens,
-            attn_metadata.mamba_metadata.state_indices,
+            attn_metadata.mamba_metadata.replay_state_indices,
             mgr._dummy_request_mask,
             attn_metadata.kv_lens_cuda,
             self._batch_to_slot_buffer.tensor,

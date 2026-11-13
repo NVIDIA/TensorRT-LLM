@@ -23,7 +23,7 @@ from datetime import datetime
 from http import HTTPStatus
 from pathlib import Path
 from typing import (TYPE_CHECKING, Annotated, Any, AsyncGenerator,
-                    AsyncIterator, Dict, List, Optional, Tuple, Union)
+                    AsyncIterator, Callable, Dict, List, Optional, Tuple, Union)
 
 import msgspec
 import uvicorn
@@ -38,6 +38,7 @@ from transformers import AutoProcessor
 from tensorrt_llm._startup import _StartupTimer
 from tensorrt_llm._torch.async_llm import AsyncLLM
 from tensorrt_llm._utils import EnergyMonitor
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocArgs, PostprocParams
@@ -50,13 +51,14 @@ from tensorrt_llm.inputs.data import TokensPrompt
 from tensorrt_llm.inputs.media_io import (BaseMediaIO,
                                           log_allowed_local_media_path)
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
+from tensorrt_llm.inputs.prefix_token_cache import tokenization_routing_key
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.inputs.utils import ConversationMessage
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import MultimodalEncoder, SchedulingParams, tracing
 from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               MetadataServerConfig, ServerRole)
-from tensorrt_llm.llmapi.llm import LLM, RequestOutput
+from tensorrt_llm.llmapi.llm import LLM, PreprocessedInputs, RequestOutput
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 from tensorrt_llm.llmapi.thinking_budget import \
     add_thinking_budget_logits_processor
@@ -85,7 +87,8 @@ from tensorrt_llm.serve.chat_tokenization import tokenize_harmony_chat_request
 from tensorrt_llm.serve.chat_utils import (load_chat_template,
                                            parse_chat_messages_coroutines)
 from tensorrt_llm.serve.cluster_storage import create_cluster_storage_client
-from tensorrt_llm.serve.conversation_id import resolve_request_conversation_id
+from tensorrt_llm.serve.conversation_id import (get_request_conversation_id,
+                                                resolve_request_conversation_id)
 from tensorrt_llm.serve.disagg_auth import (
     request_requires_internal_disagg_auth, validate_internal_disagg_request,
     validate_subagent_affinity)
@@ -144,6 +147,8 @@ from tensorrt_llm.serve.rl_control_auth import validate_rl_control_request
 from tensorrt_llm.serve.runtime_control_auth import (
     RuntimeControlReplayCache, validate_runtime_control_request)
 from tensorrt_llm.serve.serving_extensions import load_builtin_extensions
+from tensorrt_llm.serve.tokenization_owners import (TokenizationOwners,
+                                                    start_tokenization_owners)
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
 from tensorrt_llm.serve.visual_gen_metrics import (
     build_visual_gen_server_timings, build_visual_gen_timing_headers)
@@ -161,6 +166,14 @@ from .kv_hints import KvHintsRequest, KvHintsRoute
 
 if TYPE_CHECKING:
     from tensorrt_llm.visual_gen import VisualGen
+
+
+def _preprocess_in_conversation(
+        routing_id: Optional[str],
+        preprocess_fn: Callable[[], PreprocessedInputs]) -> PreprocessedInputs:
+    """Run ``preprocess_fn`` with its prompt tagged as conversation ``routing_id``."""
+    with tokenization_routing_key(routing_id):
+        return preprocess_fn()
 
 
 def _is_visual_gen_instance(obj) -> bool:
@@ -422,7 +435,8 @@ def _build_forced_tool_call_decoding(tools, tool_parser_name, forced_tool_name):
 
     1. Asking the caller to prepend ``begin_prefix`` (e.g.
        ``<tool_call>\n{"name":"X", "arguments":``) to the rendered prompt
-       so the model starts generation *already inside* the tool call.
+       so the model starts generation *already inside* the tool call. It is
+       the parser's `forced_call_prefix` followed by its `begin`.
     2. Constraining what follows with a plain JSON-schema (or json-object)
        guided-decoding mode so the arguments are guaranteed to be valid
        against ``tool.function.parameters``.
@@ -466,7 +480,8 @@ def _build_forced_tool_call_decoding(tools, tool_parser_name, forced_tool_name):
             f"not present in `tools`. Available functions: {available}.")
 
     info = parser.structure_info()(forced_tool.function.name)
-    begin_prefix = info.begin
+    begin_prefix = parser.forced_call_prefix(
+        forced_tool.function.name) + info.begin
 
     if forced_tool.function.parameters:
         guided = GuidedDecodingParams(json=forced_tool.function.parameters)
@@ -602,7 +617,15 @@ class OpenAIServer(_VideoRoutesMixin):
             rl_control_api_key: Optional[str] = None,
             enable_runtime_control_endpoints: bool = False,
             runtime_control_api_key: Optional[str] = None,
-            multi_frontend_serving: Optional[MultiFrontendServing] = None):
+            multi_frontend_serving: Optional[MultiFrontendServing] = None,
+            graceful_shutdown_timeout: Optional[int] = None):
+        if graceful_shutdown_timeout is not None and graceful_shutdown_timeout <= 0:
+            raise ValueError(
+                "graceful_shutdown_timeout must be a positive number of "
+                f"seconds, got {graceful_shutdown_timeout}")
+        # Seconds uvicorn waits after a shutdown signal for request handlers
+        # still running before it cancels them; None waits for every handler.
+        self.graceful_shutdown_timeout = graceful_shutdown_timeout
         if enable_rl_control_endpoints:
             logger.warning(
                 "RL control endpoints are deprecated; use generic runtime "
@@ -743,6 +766,10 @@ class OpenAIServer(_VideoRoutesMixin):
         if multi_frontend_serving is not None and multi_frontend_serving.is_attached:
             self._launcher_forwarder = LauncherForwarder(
                 multi_frontend_serving.launcher_uds)
+        self._tokenization_owners: Optional[
+            TokenizationOwners] = start_tokenization_owners(
+                multi_frontend_serving,
+                getattr(generator, "input_processor", None))
         self._shared_clock_offset: Optional[SharedClockOffset] = (
             SharedClockOffset(
                 os.path.dirname(multi_frontend_serving.launcher_uds))
@@ -855,6 +882,8 @@ class OpenAIServer(_VideoRoutesMixin):
                         pass
             if self._launcher_forwarder is not None:
                 await self._launcher_forwarder.close()
+            if self._tokenization_owners is not None:
+                await asyncio.to_thread(self._tokenization_owners.close)
             if self.embedding_batcher is not None:
                 await self.embedding_batcher.shutdown()
                 logger.info("Stopped encode dynamic batcher")
@@ -969,7 +998,8 @@ class OpenAIServer(_VideoRoutesMixin):
         trust_remote_code = self.generator.args.trust_remote_code
         checkpoint_format = getattr(self.generator.args, "checkpoint_format",
                                     None)
-        if checkpoint_format in ("mistral", "mistral_large_3"):
+        if checkpoint_format in (CheckpointFormat.MISTRAL,
+                                 CheckpointFormat.MISTRAL_LARGE_3):
             # Do not load HF processor for mistral native checkpoints
             # even if it is available
             self.processor = None
@@ -1075,10 +1105,10 @@ class OpenAIServer(_VideoRoutesMixin):
             getattr(self, "_internal_disagg_auth_key", None), request, headers)
 
     def _get_scheduling_params(
-            self, request: ChatCompletionRequest,
+            self, request: Union[ChatCompletionRequest, CompletionRequest],
             raw_request: Optional[Request]) -> SchedulingParams:
         return SchedulingParams(
-            agent_hierarchy=request.agent_hierarchy,
+            agent_hierarchy=getattr(request, "agent_hierarchy", None),
             subagent_affinity_id=validate_subagent_affinity(
                 getattr(self, "_internal_disagg_auth_key", None), request,
                 getattr(self, "server_role", None),
@@ -1463,20 +1493,19 @@ class OpenAIServer(_VideoRoutesMixin):
             # returns one EncoderOutput per item, in input order.
             return self.generator.encode(token_ids_batch)
 
-        # Source the batch limits from the resolved encoder engine — the same
-        # attributes encode() validates against (llm.py: engine.max_seq_len /
-        # max_num_tokens / batch_size). LlmArgs.max_seq_len/max_num_tokens default
+        # Source the batch limits from the encoder executor's resolved limits —
+        # the same attributes encode() validates against. LlmArgs.max_seq_len/max_num_tokens default
         # to None and are not written back to args, so reading them from args
         # would leave the batcher's seq-len/token-budget guards inert (typed 400s
         # would never fire) and could let it form a batch encode() then rejects.
-        engine = self.generator._encoder_executor.model_engine
+        encoder_executor = self.generator._encoder_executor
         self.embedding_batcher = EncodeBatcher(
             encode_fn,
-            max_batch_size=engine.batch_size,
+            max_batch_size=encoder_executor.max_batch_size,
             max_queue_delay=self._embedding_max_queue_delay,
             max_queue_size=self._embedding_max_queue_size,
-            max_num_tokens=engine.max_num_tokens,
-            max_seq_len=engine.max_seq_len,
+            max_num_tokens=encoder_executor.max_num_tokens,
+            max_seq_len=encoder_executor.max_seq_len,
         )
 
     def register_embedding_routes(self):
@@ -1677,7 +1706,8 @@ class OpenAIServer(_VideoRoutesMixin):
         if self.disagg_cluster_config:
             self.disagg_cluster_storage = create_cluster_storage_client(
                 self.disagg_cluster_config.cluster_uri,
-                self.disagg_cluster_config.cluster_name)
+                self.disagg_cluster_config.cluster_name,
+                **self.disagg_cluster_config.cluster_storage_options())
             self.disagg_cluster_worker = DisaggClusterWorker(
                 self.server_role, self.host, self.port,
                 self.disagg_cluster_config, self.disagg_cluster_storage)
@@ -2015,8 +2045,8 @@ class OpenAIServer(_VideoRoutesMixin):
                         self._record_iteration_stat(llm_stat)
                 except Exception as e:
                     # Log errors but continue collecting stats
-                    logger.error(f"Error collecting iteration stats: {e}",
-                                 exc_info=True)
+                    logger.error(f"Error collecting iteration stats: {e}\n"
+                                 f"{traceback.format_exc()}")
                     # Brief sleep to avoid tight loop on persistent errors
                     await asyncio.sleep(0.1)
         except asyncio.CancelledError:
@@ -2470,11 +2500,19 @@ class OpenAIServer(_VideoRoutesMixin):
             generate_inputs = prompt
             preprocess_fn = getattr(self.generator, "preprocess", None)
             if preprocess_fn is not None:
+                preprocess = functools.partial(preprocess_fn, prompt,
+                                               sampling_params,
+                                               disaggregated_params)
+                if self._tokenization_owners is not None:
+                    # A disaggregated context worker gets the sub-agent's
+                    # parent id only from the signed header.
+                    preprocess = functools.partial(
+                        _preprocess_in_conversation,
+                        scheduling_params.subagent_affinity_id
+                        or get_request_conversation_id(request), preprocess)
                 loop = asyncio.get_event_loop()
                 generate_inputs = await loop.run_in_executor(
-                    self._input_proc_executor,
-                    functools.partial(preprocess_fn, prompt, sampling_params,
-                                      disaggregated_params))
+                    self._input_proc_executor, preprocess)
 
             promise = self.generator.generate_async(
                 inputs=generate_inputs,
@@ -2493,6 +2531,13 @@ class OpenAIServer(_VideoRoutesMixin):
                 if request.priority is not None else DEFAULT_REQUEST_PRIORITY,
             )
             asyncio.create_task(self.await_disconnected(raw_request, promise))
+            if raw_request is not None:
+                # The executor client id, which the perf metrics, the
+                # post-processor hook records and the disconnect log carry. A
+                # caller that names its reply after the request (the Anthropic
+                # route) reads it here; a non-streamed chat completion's own id
+                # is random.
+                raw_request.state.executor_client_id = promise.request_id
             if not self.postproc_worker_enabled:
                 postproc_args.tokenizer = self.tokenizer
                 postproc_args.num_prompt_tokens = len(promise.prompt_token_ids)
@@ -2553,10 +2598,14 @@ class OpenAIServer(_VideoRoutesMixin):
             return anthropic_error_response("Internal server error",
                                             "api_error", 500)
 
+        # The reply is named after the request (see anthropic_message_id).
+        executor_client_id = getattr(raw_request.state, "executor_client_id",
+                                     None)
         if isinstance(response, StreamingResponse):
             return StreamingResponse(
                 content=reframe_openai_stream(response.body_iterator,
-                                              model=self.model),
+                                              model=self.model,
+                                              request_id=executor_client_id),
                 media_type="text/event-stream",
             )
 
@@ -2573,7 +2622,8 @@ class OpenAIServer(_VideoRoutesMixin):
 
         try:
             chat_response = ChatCompletionResponse(**json.loads(response.body))
-            anthropic_response = convert_chat_response(chat_response)
+            anthropic_response = convert_chat_response(
+                chat_response, request_id=executor_client_id)
         except (AnthropicResponseError, ValidationError, json.JSONDecodeError):
             logger.error("Invalid response from OpenAI chat pipeline:\n"
                          f"{traceback.format_exc()}")
@@ -2723,7 +2773,10 @@ class OpenAIServer(_VideoRoutesMixin):
 
         try:
             chat_response = ChatCompletionResponse(**json.loads(response.body))
-            anthropic_response = convert_chat_response(chat_response)
+            anthropic_response = convert_chat_response(
+                chat_response,
+                request_id=getattr(raw_request.state, "executor_client_id",
+                                   None))
         except (AnthropicResponseError, ValidationError, json.JSONDecodeError):
             logger.error(
                 "Invalid response from OpenAI chat pipeline in batch:\n"
@@ -3088,6 +3141,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 request, None if raw_request is None else raw_request.headers)
             conversation_params = to_llm_conversation_params(
                 request.conversation_params)
+            scheduling_params = self._get_scheduling_params(
+                request, raw_request)
             for idx, prompt in enumerate(prompts):
                 postproc_args = CompletionPostprocArgs.from_request(request)
                 self._apply_spec_decode_stats_opt_in(postproc_args)
@@ -3125,6 +3180,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     lora_request=request.lora_request,
                     disaggregated_params=disaggregated_params,
                     conversation_params=conversation_params,
+                    scheduling_params=scheduling_params,
                     trace_headers=trace_headers,
                     kv_hints=request.kv_hints,
                     priority=request.priority if request.priority is not None
@@ -4246,18 +4302,28 @@ class OpenAIServer(_VideoRoutesMixin):
             )
 
     async def __call__(self,
-                       host,
-                       port,
-                       sockets: list[socket.socket] | None = None):
+                       host: str,
+                       port: int,
+                       sockets: list[socket.socket] | None = None) -> None:
         # Store the binding address for server registration
         self.binding_addr = f"http://{host}:{port}"
         self.host = host
         self.port = port
+        # Without graceful_shutdown_timeout, uvicorn keeps its default and
+        # waits for every request handler during graceful shutdown.
+        config_kwargs = {}
+        shutdown_timeout = self.graceful_shutdown_timeout
+        if shutdown_timeout is not None:
+            config_kwargs["timeout_graceful_shutdown"] = shutdown_timeout
+            logger.info(f"graceful_shutdown_timeout={shutdown_timeout}: "
+                        "uvicorn graceful shutdown cancels request handlers "
+                        f"still running after {shutdown_timeout}s")
         config = uvicorn.Config(self.app,
                                 host=host,
                                 port=port,
                                 log_level="info",
-                                timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
+                                timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
+                                **config_kwargs)
         server = create_uvicorn_server(config)
 
         async def _register_after_serving():

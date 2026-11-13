@@ -53,6 +53,7 @@ from benchmark_utils import (
     AGGREGATED_DISAGG_YAML_MODES,
     DISAGG_BENCHMARK_MODES,
     GEN_ONLY_NO_CONTEXT_MODE,
+    add_eplb_shm_mount,
     ctx_only_world_size,
     dwdp_ctx_layout,
     dwdp_ctx_size,
@@ -949,6 +950,13 @@ def main():
     with open(args.srun_args, "r") as f:
         srun_args_content = f.read()
     srun_args_lines = srun_args_content.split()
+    mounts_prefix = "--container-mounts="
+    srun_args_lines = [
+        mounts_prefix + add_eplb_shm_mount(line[len(mounts_prefix) :], config, args.llm_src)
+        if line.startswith(mounts_prefix)
+        else line
+        for line in srun_args_lines
+    ]
 
     (
         agg_pytest_command,
@@ -978,7 +986,6 @@ def main():
             ucx_prefix = ucx_tls_cmd.strip()
             env_prefix_parts.append("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1")
             script_prefix_lines.append("export TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1")
-            srun_args_lines.append("--container-env=TRTLLM_DISAGG_BENCHMARK_GEN_ONLY")
 
         server_env_var = env_config["server_env_var"]
         if server_env_var.strip():
@@ -1004,7 +1011,6 @@ def main():
                 f"export testOutputDir={test_output_dir}",
             ]
         )
-        srun_args_lines.append("--container-env=pytestCommand")
     else:
         # Disaggregated (e2e or gen_only).
         base_prefix = (
@@ -1022,7 +1028,6 @@ def main():
             gen_worker_env_vars = f"TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1 {gen_worker_env_vars}"
             server_env_vars = f"TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1 {server_env_vars}"
             script_prefix_lines.append("export TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1")
-            srun_args_lines.append("--container-env=TRTLLM_DISAGG_BENCHMARK_GEN_ONLY")
         elif benchmark_mode == "gen_only":
             concurrency = benchmark_config.get("concurrency", 1)
             # GEN worker only: the same flag on the CTX worker has been seen to
@@ -1127,15 +1132,13 @@ def main():
                 skip_precheck=selected_test_skipped,
             )
         )
-        srun_args_lines.extend(
-            ["--container-env=DISAGG_SERVING_TYPE", "--container-env=pytestCommand"]
-        )
-        if precheck_enabled:
-            srun_args_lines.append("--container-env=LLM_MODELS_ROOT")
 
     script_prefix_lines = remove_whitespace_lines(script_prefix_lines)
     script_prefix = "\n".join(script_prefix_lines)
 
+    # Role variables inherit their exported job values. Any required image overrides
+    # belong in the caller's single comma-separated --container-env option;
+    # Repeating --container-env forwards only the last value.
     srun_args_lines = remove_whitespace_lines(srun_args_lines)
     srun_args_lines = ["srunArgs=("] + [f'  "{line}"' for line in srun_args_lines] + [")"]
     srun_args = "\n".join(srun_args_lines)
