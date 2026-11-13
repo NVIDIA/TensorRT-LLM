@@ -4785,7 +4785,7 @@ class TransferWorker:
         """Forward fatal evidence while rooting all worker-owned resources.
 
         Args:
-            event: Immutable deadline decision; never authorizes resource release.
+            event: Immutable physical-retirement failure; never authorizes resource release.
         """
         callback = self._config.quiescence_fatal_callback
         assert callback is not None
@@ -4835,6 +4835,16 @@ class TransferWorker:
         return self._retirement_watchdog.create_owner(
             request_id, "receive", self._config.rx_timeout_s
         )
+
+    def fail_receive_retirement(self, request_id: int, reason: str) -> None:
+        """Contain a retained receive that cannot enroll in physical ownership.
+
+        Args:
+            request_id: Exact destination request retained by the transceiver.
+            reason: Description of the failed ownership handoff.
+        """
+        assert self._retirement_watchdog is not None
+        self._retirement_watchdog.fail_closed(request_id, "receive", reason)
 
     def create_rx_session(self, request: LlmRequest) -> RxSession:
         params = request.py_disaggregated_params

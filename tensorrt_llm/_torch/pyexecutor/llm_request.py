@@ -919,6 +919,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_kv_transfer_timed_out = False
         # Prevent recreation after a send session drops peer registration.
         self.py_kv_send_session_retired = False
+        # Preserve the receive's terminal vote after its live owner is retired.
+        self.py_kv_receive_cancellation_retired = False
+        self.py_kv_receive_cancel_failed = False
 
         # Encoder-decoder handoff, set by PyExecutor._scatter_encoder_output
         # when the encoder output is published:
