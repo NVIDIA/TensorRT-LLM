@@ -195,7 +195,8 @@ def test_triton_route_at_tp2_shapes(step, monkeypatch) -> None:
 
 def test_rows_up_to_32_keep_the_triton_route(monkeypatch) -> None:
     """``lc_applies`` accepts the TP2 q [T, 32, 128] on two KV heads (LC2), but at most 32 rows the dispatch never
-    asks it: the step runs the Triton route. (8 rows at the K3 verify: below lc_min_rows(4).)"""
+    asks it: the step runs the Triton route, also with the LC_TP2 opt-in forced on (bit for bit the default rows).
+    (8 rows at the K3 verify: below lc_min_rows(4).)"""
     case = build_step((165521, 3000), 4, identity=False, seed=31)
     assert 2 * 4 < target_kernel.lc_min_rows(4)
     assert m3_attn_lc.lc_applies(
@@ -214,10 +215,15 @@ def test_rows_up_to_32_keep_the_triton_route(monkeypatch) -> None:
         "m3_sparse_decode_lc",
         lambda *a, **k: (lc_calls.append(1), real(*a, **k))[1],
     )
-    _call(case, _empty(case), False)
+    default = _empty(case)
+    _call(case, default, False)
+    monkeypatch.setattr(target_kernel, "LC_TP2", True)
+    forced = _empty(case)
+    _call(case, forced, False)
     m3_prequant.SLOT.clear()
     torch.cuda.synchronize()
     assert not lc_calls, "the C++ long-context op ran at 8 rows"
+    assert torch.equal(default.view(torch.int16), forced.view(torch.int16))
 
 
 @pytest.mark.parametrize("requests", [1, 2, 4])
