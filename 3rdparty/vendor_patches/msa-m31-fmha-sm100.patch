@@ -4333,7 +4333,7 @@ index 10b2b1f667b25ae9a4beba003f7c6fc7f7421c12..f12aed329822d155600f5e21cbc4182a
  
  @dsl_user_op
 diff --git a/cute/src/sm100/build_k2q_csr/__init__.py b/cute/src/sm100/build_k2q_csr/__init__.py
-index 830343e2fab66e423105772322a82e05bd8b29ee..3dd76532c9772abeb8a165b13642281144500f03 100644
+index 830343e2fab66e423105772322a82e05bd8b29ee..b931d9548e17aa34bad0cb81e96480028cf00473 100644
 --- a/cute/src/sm100/build_k2q_csr/__init__.py
 +++ b/cute/src/sm100/build_k2q_csr/__init__.py
 @@ -1,4 +1,5 @@
@@ -4342,18 +4342,50 @@ index 830343e2fab66e423105772322a82e05bd8b29ee..3dd76532c9772abeb8a165b136422811
  # SPDX-License-Identifier: MIT
  
  """JIT-loaded CUDA C++ extension for the q2k -> k2q CSR builder.
-@@ -33,8 +34,10 @@ _extra_cuda_cflags = [
+@@ -14,6 +15,8 @@ architectures are not supported.
+ 
+ from __future__ import annotations
+ 
++import importlib.machinery
++import importlib.util
+ import os
+ 
+ import torch
+@@ -33,13 +36,27 @@ _extra_cuda_cflags = [
      "-I/usr/local/cuda/include/cccl",
  ]
  
+-_ext = load(
+-    name="sparse_build_k2q_csr_ext",
+-    sources=[_SRC],
+-    extra_cflags=_extra_cflags,
+-    extra_cuda_cflags=_extra_cuda_cflags,
+-    verbose=False,
+-)
 +# TensorRT-LLM: the extension name differs from the packaged top-level fmha_sm100's, whose
 +# build_k2q_csr.cu differs from this copy's, so the two never share or evict one build cache entry.
- _ext = load(
--    name="sparse_build_k2q_csr_ext",
-+    name="sparse_build_k2q_csr_m31_ext",
-     sources=[_SRC],
-     extra_cflags=_extra_cflags,
-     extra_cuda_cflags=_extra_cuda_cflags,
++# The opt-in ahead-of-time build (BUILD_MSA_AOT) builds it with the flags above into
++# tensorrt_llm/libs/msa_fmha_sm100/k2q, and it loads from there when present; otherwise it compiles here.
++# This directory is tensorrt_llm/_torch/_experimental/modeling_v2/models/minimax_m3/kernels/msa_kernels/
++# fmha_sm100/cute/src/sm100/build_k2q_csr.
++_PACKAGE_ROOT = os.path.abspath(os.path.join(_THIS_DIR, *[os.pardir] * 12))
++_PREBUILT = os.path.join(_PACKAGE_ROOT, "libs", "msa_fmha_sm100", "k2q", "sparse_build_k2q_csr_m31_ext.so")
++if os.path.isfile(_PREBUILT):
++    _loader = importlib.machinery.ExtensionFileLoader("sparse_build_k2q_csr_m31_ext", _PREBUILT)
++    _ext = importlib.util.module_from_spec(
++        importlib.util.spec_from_file_location("sparse_build_k2q_csr_m31_ext", _PREBUILT, loader=_loader))
++    _loader.exec_module(_ext)
++else:
++    _ext = load(
++        name="sparse_build_k2q_csr_m31_ext",
++        sources=[_SRC],
++        extra_cflags=_extra_cflags,
++        extra_cuda_cflags=_extra_cuda_cflags,
++        verbose=False,
++    )
+ 
+ 
+ def run_build_k2q_csr(
 diff --git a/cute/src/sm100/build_k2q_csr/build_k2q_csr.cu b/cute/src/sm100/build_k2q_csr/build_k2q_csr.cu
 index 8ee5457c50cd4d0bab15c8f02b10210ec418d215..720fa4b5e65d935f286f965b059085f89c69200d 100644
 --- a/cute/src/sm100/build_k2q_csr/build_k2q_csr.cu
@@ -8849,7 +8881,7 @@ index 6d13fa9804b58f797f8849784784bc91e9475e69..1d79fcbaa09bfb8e68dc3f8ce192ffd8
          loaded = try_load_aot(key)
          if loaded is not None:
 diff --git a/jit.py b/jit.py
-index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..a8373fb9d16cdd2658fc5de8d20190800e2e8985 100644
+index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..807546650e790b0265761f1eb11ff8a6085b2d88 100644
 --- a/jit.py
 +++ b/jit.py
 @@ -1,4 +1,5 @@
@@ -8995,7 +9027,7 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..a8373fb9d16cdd2658fc5de8d2019080
      # Different build configs get separate cache dirs to avoid conflicts
      suffix = ""
      if os.environ.get("GPU_TRACE") is not None:
-@@ -35,12 +143,58 @@ def _compute_cache_base():
+@@ -35,12 +143,76 @@ def _compute_cache_base():
          suffix += "_sm_timing"
      if os.environ.get("FMHA_GMEM_CHECK") is not None:
          suffix += "_gmem_check"
@@ -9031,8 +9063,7 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..a8373fb9d16cdd2658fc5de8d2019080
 +
 +class _LazyCacheBase:
 +    """The cache root, computed on first use: its suffix depends on the device (see _proxy_modes)."""
- 
--CACHE_BASE = _compute_cache_base()
++
 +    _path = None
 +
 +    def _resolve(self) -> Path:
@@ -9051,13 +9082,32 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..a8373fb9d16cdd2658fc5de8d2019080
 +
 +    def __getattr__(self, name):
 +        return getattr(self._resolve(), name)
-+
+ 
+-CACHE_BASE = _compute_cache_base()
 +
 +CACHE_BASE = _LazyCacheBase()
++
++
++# TensorRT-LLM: the opt-in ahead-of-time build (BUILD_MSA_AOT, the family's csrc/msa_aot) compiles the modules the
++# MiniMax-M3.1 targets call into tensorrt_llm/libs/msa_fmha_sm100, in this cache's layout, for the SM107 OnlyScore
++# proxy modes without diagnostics. They load from there when present; no such module ships by default, so anything
++# else, and everything without that build, compiles at run time.
++# This file is tensorrt_llm/_torch/_experimental/modeling_v2/models/minimax_m3/kernels/msa_kernels/fmha_sm100/jit.py.
++_PREBUILT_DIR = Path(os.path.abspath(__file__)).parents[8] / "libs" / "msa_fmha_sm100"
++
++
++def _prebuilt(relative: str):
++    """The ahead-of-time built module ``relative`` when this process may use it, else None."""
++    if any(os.environ.get(v) is not None for v in ("GPU_TRACE", "SM_TIMING", "FMHA_GMEM_CHECK")):
++        return None
++    if _proxy_modes() != (False, False):
++        return None
++    path = _PREBUILT_DIR / relative
++    return path if path.is_file() else None
  
  
  def _acquire_file_lock(lock_path):
-@@ -55,13 +209,6 @@ def _release_file_lock(fd):
+@@ -55,13 +227,6 @@ def _release_file_lock(fd):
      os.close(fd)
  
  
@@ -9071,7 +9121,7 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..a8373fb9d16cdd2658fc5de8d2019080
  
  _PACK_FACTORS = [1,2,4,6,8,16]
  # _PACK_FACTORS = [1, 6]
-@@ -187,18 +334,98 @@ def _get_cuda_home():
+@@ -187,18 +352,98 @@ def _get_cuda_home():
      raise RuntimeError("Cannot find CUDA toolkit. Set CUDA_HOME.")
  
  
@@ -9173,7 +9223,7 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..a8373fb9d16cdd2658fc5de8d2019080
          "-static-global-template-stub=false",
          "-DFLASHINFER_ENABLE_BF16",
          "-DFLASHINFER_ENABLE_FP8_E4M3",
-@@ -225,7 +452,12 @@ def _get_nvcc_flags(cache_dir, fmha=True):
+@@ -225,7 +470,12 @@ def _get_nvcc_flags(cache_dir, fmha=True):
          nvcc_flags.append("-DSM_TIMING_ENABLED")
      if os.environ.get("FMHA_GMEM_CHECK") is not None:
          nvcc_flags.append("-DFMHA_GMEM_BOUNDS_CHECK")
@@ -9187,7 +9237,7 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..a8373fb9d16cdd2658fc5de8d2019080
  
  class _VariantWrapper:
      """Wraps a TVM-FFI function to look like a module with .run()."""
-@@ -257,9 +489,10 @@ class FMHAVariantManager:
+@@ -257,9 +507,10 @@ class FMHAVariantManager:
      def _ensure_all_module(self):
          if not self._all_module_checked:
              self._all_module_checked = True
@@ -9200,7 +9250,20 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..a8373fb9d16cdd2658fc5de8d2019080
  
      def get_variant(self, dtype_code, qo_tile_size, single_wg,
                      sparse_mode, page_size, split_kv, pack_factor):
-@@ -289,12 +522,12 @@ class FMHAVariantManager:
+@@ -278,6 +529,12 @@ class FMHAVariantManager:
+ 
+             fn_name = f"run_{variant_name}"
+ 
++            prebuilt = _prebuilt(f"{variant_name}/{variant_name}.so")
++            if prebuilt is not None:
++                import tvm_ffi
++                self._loaded[variant_name] = _VariantWrapper(getattr(tvm_ffi.load_module(str(prebuilt)), fn_name))
++                return self._loaded[variant_name]
++
+             # Try all_variants.so
+             self._ensure_all_module()
+             if self._all_module is not None:
+@@ -289,12 +546,12 @@ class FMHAVariantManager:
                      pass
  
              # Try per-variant .so
@@ -9215,7 +9278,7 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..a8373fb9d16cdd2658fc5de8d2019080
  
                  import tvm_ffi
                  module = tvm_ffi.load_module(str(so_path))
-@@ -304,9 +537,14 @@ class FMHAVariantManager:
+@@ -304,9 +561,14 @@ class FMHAVariantManager:
              self._loaded[variant_name] = _VariantWrapper(fn)
              return self._loaded[variant_name]
  
@@ -9233,7 +9296,7 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..a8373fb9d16cdd2658fc5de8d2019080
          so_path = cache_dir / f"{variant_name}.so"
  
          if so_path.exists():
-@@ -363,7 +601,7 @@ build {so_path}: nvcc_link {inst_obj} {run_obj}
+@@ -363,7 +625,7 @@ build {so_path}: nvcc_link {inst_obj} {run_obj}
  
      def _run_ninja(self, cache_dir):
          result = subprocess.run(
@@ -9242,7 +9305,7 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..a8373fb9d16cdd2658fc5de8d2019080
              cwd=str(cache_dir),
              capture_output=True,
              text=True,
-@@ -395,9 +633,11 @@ _plan_module = None
+@@ -395,9 +657,11 @@ _plan_module = None
  _plan_lock = threading.Lock()
  
  
@@ -9257,7 +9320,7 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..a8373fb9d16cdd2658fc5de8d2019080
      so_path = cache_dir / "fmha_sm100_plan.so"
  
      if so_path.exists():
-@@ -455,11 +695,14 @@ def _compile_plan_only():
+@@ -455,11 +719,14 @@ def _compile_plan_only():
  
  def _compile_plan_module():
      """Compile and load plan kernel."""
@@ -9275,7 +9338,19 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..a8373fb9d16cdd2658fc5de8d2019080
          return tvm_ffi.load_module(str(so_path))
      finally:
          _release_file_lock(lock_fd)
-@@ -486,8 +729,9 @@ _sparse_topk_module = None
+@@ -474,6 +741,11 @@ def get_plan_fn():
+     with _plan_lock:
+         if _plan_module is not None:
+             return _plan_module
++        prebuilt = _prebuilt("plan/fmha_sm100_plan.so")
++        if prebuilt is not None:
++            import tvm_ffi
++            _plan_module = tvm_ffi.load_module(str(prebuilt))
++            return _plan_module
+         _plan_module = _compile_plan_module()
+         return _plan_module
+ 
+@@ -486,8 +758,9 @@ _sparse_topk_module = None
  _sparse_topk_lock = threading.Lock()
  
  
@@ -9287,11 +9362,16 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..a8373fb9d16cdd2658fc5de8d2019080
      so_path = cache_dir / "sparse_topk_select.so"
  
      if so_path.exists():
-@@ -553,11 +797,14 @@ def get_sparse_topk_module():
+@@ -553,11 +826,19 @@ def get_sparse_topk_module():
      with _sparse_topk_lock:
          if _sparse_topk_module is not None:
              return _sparse_topk_module
 -        lock_fd = _acquire_file_lock(CACHE_BASE / "sparse_topk.lock")
++        prebuilt = _prebuilt("sparse_topk/sparse_topk_select.so")
++        if prebuilt is not None:
++            import tvm_ffi
++            _sparse_topk_module = tvm_ffi.load_module(str(prebuilt))
++            return _sparse_topk_module
 +        # Build and load in one directory, under the lock every process
 +        # building there takes.
 +        cache_dir = _built_dir("sparse_topk", "sparse_topk_select.so")
@@ -9305,7 +9385,7 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..a8373fb9d16cdd2658fc5de8d2019080
              _sparse_topk_module = tvm_ffi.load_module(str(so_path))
          finally:
              _release_file_lock(lock_fd)
-@@ -572,8 +819,9 @@ _reduction_module = None
+@@ -572,8 +853,9 @@ _reduction_module = None
  _reduction_lock = threading.Lock()
  
  
@@ -9317,11 +9397,16 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..a8373fb9d16cdd2658fc5de8d2019080
      so_path = cache_dir / "fmha_sm100_reduction.so"
  
      if so_path.exists():
-@@ -638,11 +886,14 @@ def get_reduction_module():
+@@ -638,11 +920,19 @@ def get_reduction_module():
      with _reduction_lock:
          if _reduction_module is not None:
              return _reduction_module
 -        lock_fd = _acquire_file_lock(CACHE_BASE / "reduction.lock")
++        prebuilt = _prebuilt("reduction/fmha_sm100_reduction.so")
++        if prebuilt is not None:
++            import tvm_ffi
++            _reduction_module = tvm_ffi.load_module(str(prebuilt))
++            return _reduction_module
 +        # Build and load in one directory, under the lock every process
 +        # building there takes.
 +        cache_dir = _built_dir("reduction", "fmha_sm100_reduction.so")

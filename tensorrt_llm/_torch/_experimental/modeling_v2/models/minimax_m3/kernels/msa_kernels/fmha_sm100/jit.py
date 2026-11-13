@@ -197,6 +197,24 @@ class _LazyCacheBase:
 CACHE_BASE = _LazyCacheBase()
 
 
+# TensorRT-LLM: the opt-in ahead-of-time build (BUILD_MSA_AOT, the family's csrc/msa_aot) compiles the modules the
+# MiniMax-M3.1 targets call into tensorrt_llm/libs/msa_fmha_sm100, in this cache's layout, for the SM107 OnlyScore
+# proxy modes without diagnostics. They load from there when present; no such module ships by default, so anything
+# else, and everything without that build, compiles at run time.
+# This file is tensorrt_llm/_torch/_experimental/modeling_v2/models/minimax_m3/kernels/msa_kernels/fmha_sm100/jit.py.
+_PREBUILT_DIR = Path(os.path.abspath(__file__)).parents[8] / "libs" / "msa_fmha_sm100"
+
+
+def _prebuilt(relative: str):
+    """The ahead-of-time built module ``relative`` when this process may use it, else None."""
+    if any(os.environ.get(v) is not None for v in ("GPU_TRACE", "SM_TIMING", "FMHA_GMEM_CHECK")):
+        return None
+    if _proxy_modes() != (False, False):
+        return None
+    path = _PREBUILT_DIR / relative
+    return path if path.is_file() else None
+
+
 def _acquire_file_lock(lock_path):
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o666)
@@ -511,6 +529,12 @@ class FMHAVariantManager:
 
             fn_name = f"run_{variant_name}"
 
+            prebuilt = _prebuilt(f"{variant_name}/{variant_name}.so")
+            if prebuilt is not None:
+                import tvm_ffi
+                self._loaded[variant_name] = _VariantWrapper(getattr(tvm_ffi.load_module(str(prebuilt)), fn_name))
+                return self._loaded[variant_name]
+
             # Try all_variants.so
             self._ensure_all_module()
             if self._all_module is not None:
@@ -717,6 +741,11 @@ def get_plan_fn():
     with _plan_lock:
         if _plan_module is not None:
             return _plan_module
+        prebuilt = _prebuilt("plan/fmha_sm100_plan.so")
+        if prebuilt is not None:
+            import tvm_ffi
+            _plan_module = tvm_ffi.load_module(str(prebuilt))
+            return _plan_module
         _plan_module = _compile_plan_module()
         return _plan_module
 
@@ -796,6 +825,11 @@ def get_sparse_topk_module():
 
     with _sparse_topk_lock:
         if _sparse_topk_module is not None:
+            return _sparse_topk_module
+        prebuilt = _prebuilt("sparse_topk/sparse_topk_select.so")
+        if prebuilt is not None:
+            import tvm_ffi
+            _sparse_topk_module = tvm_ffi.load_module(str(prebuilt))
             return _sparse_topk_module
         # Build and load in one directory, under the lock every process
         # building there takes.
@@ -885,6 +919,11 @@ def get_reduction_module():
 
     with _reduction_lock:
         if _reduction_module is not None:
+            return _reduction_module
+        prebuilt = _prebuilt("reduction/fmha_sm100_reduction.so")
+        if prebuilt is not None:
+            import tvm_ffi
+            _reduction_module = tvm_ffi.load_module(str(prebuilt))
             return _reduction_module
         # Build and load in one directory, under the lock every process
         # building there takes.

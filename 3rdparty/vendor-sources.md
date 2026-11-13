@@ -654,11 +654,12 @@ not selected. Its persistent patch contains the changes of
 MiniMax-M3.1 kernel changes (k2q CSR schedule and plan, split combine with the
 MXFP8 output, NVFP4 KV forward) and the TensorRT-LLM adaptations: `cute` is a
 regular package with relative imports (it never edits `sys.path` or registers
-top-level `src` or `interface` modules), `jit.py` loads no prebuilt modules and
-compiles against `CUTLASS_ROOT`, or else against the CUTLASS headers packaged with
+top-level `src` or `interface` modules), `jit.py` compiles against `CUTLASS_ROOT`, or else against the CUTLASS headers packaged with
 the top-level `fmha_sm100`, the package registers no global TVM-FFI functions, the
-CuTe DSL object cache uses its own directory, and the k2q CSR extension builds
-under its own name. `LICENSE` and `NOTICE` are verbatim copies of the upstream
+CuTe DSL object cache uses its own directory, the k2q CSR extension builds
+under its own name, and the modules of the opt-in ahead-of-time build
+(`BUILD_MSA_AOT`, the family's `csrc/msa_aot`) load from `tensorrt_llm/libs/msa_fmha_sm100`
+when that build installed them. `LICENSE` and `NOTICE` are verbatim copies of the upstream
 repository's root files, which lie outside the selected source directory.
 
 The `msa-m31-q8kv8-indexer` patch carries the MiniMax-M3.1 indexer changes and

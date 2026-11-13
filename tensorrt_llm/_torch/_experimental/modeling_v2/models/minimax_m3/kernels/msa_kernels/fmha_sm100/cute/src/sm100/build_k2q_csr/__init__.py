@@ -15,6 +15,8 @@ architectures are not supported.
 
 from __future__ import annotations
 
+import importlib.machinery
+import importlib.util
 import os
 
 import torch
@@ -36,13 +38,25 @@ _extra_cuda_cflags = [
 
 # TensorRT-LLM: the extension name differs from the packaged top-level fmha_sm100's, whose
 # build_k2q_csr.cu differs from this copy's, so the two never share or evict one build cache entry.
-_ext = load(
-    name="sparse_build_k2q_csr_m31_ext",
-    sources=[_SRC],
-    extra_cflags=_extra_cflags,
-    extra_cuda_cflags=_extra_cuda_cflags,
-    verbose=False,
-)
+# The opt-in ahead-of-time build (BUILD_MSA_AOT) builds it with the flags above into
+# tensorrt_llm/libs/msa_fmha_sm100/k2q, and it loads from there when present; otherwise it compiles here.
+# This directory is tensorrt_llm/_torch/_experimental/modeling_v2/models/minimax_m3/kernels/msa_kernels/
+# fmha_sm100/cute/src/sm100/build_k2q_csr.
+_PACKAGE_ROOT = os.path.abspath(os.path.join(_THIS_DIR, *[os.pardir] * 12))
+_PREBUILT = os.path.join(_PACKAGE_ROOT, "libs", "msa_fmha_sm100", "k2q", "sparse_build_k2q_csr_m31_ext.so")
+if os.path.isfile(_PREBUILT):
+    _loader = importlib.machinery.ExtensionFileLoader("sparse_build_k2q_csr_m31_ext", _PREBUILT)
+    _ext = importlib.util.module_from_spec(
+        importlib.util.spec_from_file_location("sparse_build_k2q_csr_m31_ext", _PREBUILT, loader=_loader))
+    _loader.exec_module(_ext)
+else:
+    _ext = load(
+        name="sparse_build_k2q_csr_m31_ext",
+        sources=[_SRC],
+        extra_cflags=_extra_cflags,
+        extra_cuda_cflags=_extra_cuda_cflags,
+        verbose=False,
+    )
 
 
 def run_build_k2q_csr(
