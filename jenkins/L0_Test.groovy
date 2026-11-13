@@ -7242,17 +7242,18 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
     // SLURM dispatcher pods opt in to off-pod resource reconciliation: on a
     // mid-run pod death their SLURM job / Jenkins node would otherwise leak.
     boolean slurmDispatcher = opts.slurmDispatcher ?: false
-    def prepareAttemptPodSpec = { excludedHostNodes ->
-        // Host exclusion matches the original YAML formatting; apply resources afterwards.
-        def attemptPodSpec = trtllm_utils.withKubernetesHostNodeExclusion(podSpec, excludedHostNodes)
-        return slurmDispatcher ? attemptPodSpec : applyStageResourceRequests(pipeline, attemptPodSpec, stageName)
-    }
     // Per-stage override of the K8s pod-level infra-retry budget (opts.infraRetryMax,
     // 0 = no retry) so resource-scarce pools can cap or disable stage retries. Applies
     // to the outer test-pod retry loop below; the singleAttempt launch-retry keeps the
     // global (relaunching a dispatcher pod doesn't tax the scarce test hardware). SLURM
     // dispatchers carry the same opt through to their inner SLURM retry via retryContext.
     int k8sInfraRetryMax = resolveInfraRetryMax(InfraFailure.K8S, opts.infraRetryMax as Integer)
+
+    def prepareAttemptPodSpec = { excludedHostNodes ->
+        // Host exclusion matches the original YAML formatting; apply resources afterwards.
+        def attemptPodSpec = trtllm_utils.withKubernetesHostNodeExclusion(podSpec, excludedHostNodes)
+        return slurmDispatcher ? attemptPodSpec : applyStageResourceRequests(pipeline, attemptPodSpec, stageName)
+    }
 
     // DEBUG_MODE preserves the existing 2-hour-input human-inspection workflow
     // inside runLLMTestlistOnPlatform's finallyRunner: a single attempt only.
