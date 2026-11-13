@@ -88,6 +88,7 @@ def _instance_mapping(**kwargs) -> Mapping:
 def broadcast_string(s: str | None, src: int, group: dist.ProcessGroup | None = None) -> str:
     """Broadcast a string from src rank to all other ranks in the group."""
     # Use CPU tensors for gloo backend compatibility
+    encoded = None
     if dist.get_rank(group) == src:
         encoded = s.encode("utf-8")
         length = torch.tensor([len(encoded)], dtype=torch.long)
@@ -195,6 +196,7 @@ def worker_fn(
 ):
     """Worker function for each process."""
     # Set environment variables for distributed
+    gen_layer_num_per_pp = None
     os.environ["MASTER_ADDR"] = master_addr
     os.environ["MASTER_PORT"] = str(master_port)
     os.environ["RANK"] = str(rank)
