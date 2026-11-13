@@ -8,7 +8,7 @@ metadata:
 hardware:
   gpus_per_node: 8
 environment:
-  server_env_var: TLLM_LOG_LEVEL=info TLLM_LTX2_FORCE_ONE_STAGE_PIPELINE=0
+  server_env_var: TLLM_LOG_LEVEL=info
   client_env_var: ""
 server_configs:
   - name: ltx2_2stage_bf16_fa4_i2v_cfg2_ulysses4_cg_compile_on
