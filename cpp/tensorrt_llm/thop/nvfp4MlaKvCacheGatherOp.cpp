@@ -197,26 +197,6 @@ void nvFp4MlaKvCacheGatherDirect(th::Tensor const& dataPool, th::Tensor const& s
         static_cast<int32_t>(residualDim), numPoolTokens, stream);
 }
 
-void nvFp4MlaKvCacheRestore(th::Tensor const& layers, th::Tensor const& pageTables, int64_t tokenBegin,
-    int64_t tokenEnd, int64_t headDim, int64_t residualDim, double globalDequantScale)
-{
-    int64_t constexpr kLayerFields = sizeof(tk::NvFp4MlaKvCacheRestoreLayer) / sizeof(int64_t);
-    TORCH_CHECK(layers.is_cuda() && pageTables.is_cuda() && layers.device() == pageTables.device(),
-        "layers and page_tables must be CUDA tensors on the same device");
-    TORCH_CHECK(layers.scalar_type() == th::kInt64 && layers.dim() == 2 && layers.size(1) == kLayerFields
-            && layers.is_contiguous(),
-        "layers must be a contiguous int64 [num_layers, ", kLayerFields, "] tensor");
-    TORCH_CHECK(pageTables.scalar_type() == th::kInt32 && pageTables.dim() == 2 && pageTables.is_contiguous(),
-        "page_tables must be a contiguous int32 [num_tables, max_pages] tensor");
-
-    auto stream = at::cuda::getCurrentCUDAStream(layers.get_device()).stream();
-    tk::invokeNvFp4MlaKvCacheRestore(
-        reinterpret_cast<tk::NvFp4MlaKvCacheRestoreLayer const*>(layers.data_ptr<int64_t>()),
-        static_cast<int32_t>(layers.size(0)), pageTables.data_ptr<int32_t>(), static_cast<int32_t>(pageTables.size(1)),
-        static_cast<int32_t>(tokenBegin), static_cast<int32_t>(tokenEnd), static_cast<int32_t>(headDim),
-        static_cast<int32_t>(residualDim), static_cast<float>(globalDequantScale), stream);
-}
-
 void nvFp4MlaContextKvCacheGatherDirect(th::Tensor const& dataPool, th::Tensor const& scalePool,
     th::Tensor const& localTopKIndices, th::Tensor const& queryReqIndices, th::Tensor const& compressedKvLengths,
     th::Tensor& globalIndices, th::Tensor& output, th::Tensor const& globalDequantScale, int64_t residualDim,
@@ -302,9 +282,6 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor(b!) output, Tensor global_dequant_scale, int residual_dim, "
         "int num_pool_tokens) -> ()");
     m.def(
-        "nvfp4_mla_kv_cache_restore(Tensor layers, Tensor page_tables, int token_begin, int token_end, "
-        "int head_dim, int residual_dim, float global_dequant_scale) -> ()");
-    m.def(
         "nvfp4_mla_context_kv_cache_gather_direct(Tensor data_pool, Tensor scale_pool, Tensor local_topk_indices, "
         "Tensor query_req_indices, Tensor compressed_kv_lengths, Tensor(a!) global_indices, Tensor(b!) output, "
         "Tensor global_dequant_scale, int residual_dim, int max_kv_tokens, int num_pool_tokens) -> ()");
@@ -320,7 +297,6 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("nvfp4_mla_kv_cache_gather", &tensorrt_llm::torch_ext::nvFp4MlaKvCacheGather);
     m.impl("nvfp4_mla_kv_cache_gather_direct", &tensorrt_llm::torch_ext::nvFp4MlaKvCacheGatherDirect);
-    m.impl("nvfp4_mla_kv_cache_restore", &tensorrt_llm::torch_ext::nvFp4MlaKvCacheRestore);
     m.impl("nvfp4_mla_context_kv_cache_gather_direct", &tensorrt_llm::torch_ext::nvFp4MlaContextKvCacheGatherDirect);
     m.impl("nvfp4_mla_context_kv_cache_gather", &tensorrt_llm::torch_ext::nvFp4MlaContextKvCacheGather);
 }

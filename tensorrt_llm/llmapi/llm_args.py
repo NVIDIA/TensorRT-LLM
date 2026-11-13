@@ -5430,10 +5430,11 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         default=False,
         status="prototype",
         description=
-        "Mixed-precision KV and the cold-page first/last-N window: reuse a cached prefix in full "
-        "even when the high-precision copy of its last N tokens was evicted. Resuming the cache "
-        "then restores that copy from the history (the low-precision pool, or with the cold-page window "
-        "the layer's own pages), so those tokens keep the history's precision. When False "
+        "Mixed-precision KV and the cold-page first/last-N window: reuse a cached prefix down to its "
+        "last block boundary even when the high-precision copy of its last N tokens was evicted. "
+        "Those tokens are then read from the history (the low-precision pool, or with the cold-page "
+        "window the layer's own pages) until they leave the window, so they keep the history's "
+        "precision. When False "
         "(default), reuse stops where the high-precision copy is still complete and the rest is "
         "recomputed.")
 
@@ -5443,7 +5444,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description=
         "With mixed_precision_reuse_with_optional_last_n: when the high-precision copy of a reused "
         "prefix's last N tokens was evicted, reuse the prefix only up to before them and recompute "
-        "them, so they keep the high precision. The N tokens before them are restored from the "
+        "them, so they keep the high precision. The N tokens before them are read from the "
         "history as context for that recomputation.")
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.

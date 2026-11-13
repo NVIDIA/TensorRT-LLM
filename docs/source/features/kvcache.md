@@ -174,11 +174,12 @@ feature's per-step cost.
 With block reuse, the high-precision copy of a cached prefix's last N tokens
 can be evicted while its NVFP4 history is still cached; reuse then stops where
 that copy is complete. `mixed_precision_reuse_with_optional_last_n: true` reuses the
-whole prefix and restores those tokens from the NVFP4 history, at NVFP4
-precision. `mixed_precision_recompute_last_n: true` also set reuses the prefix
-up to before them and recomputes them in high precision. The cold-page
-first/last-N window of [cold-page quantization](kv-cache-compression.md) restores
-from its history pages, at the runtime KV type.
+prefix down to its last block boundary and reads those tokens from the NVFP4
+history, at NVFP4 precision, until they leave the window.
+`mixed_precision_recompute_last_n: true` also set reuses the prefix up to before
+them and recomputes them in high precision. The cold-page first/last-N window of
+[cold-page quantization](kv-cache-compression.md) reads them from its history
+pages, at the runtime KV type.
 
 The prototype requires `use_kv_cache_manager_v2: true` with the TRTLLM or
 FlashInfer attention backend. It supports the standard V2 manager (dense

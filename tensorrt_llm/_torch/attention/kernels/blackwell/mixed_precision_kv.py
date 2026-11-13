@@ -94,13 +94,11 @@ class _NVFP4Codec:
 
 
 class _PagedMixedPrecisionKV:
-    """Paged gather (read) or scatter (write) between staging and the two pools, or (restore) a
-    decode of the low pool straight into the high pages."""
+    """Paged gather (read) or scatter (write) between staging and the two pools."""
 
-    def __init__(self, write: bool, codec: object, restore: bool = False) -> None:
+    def __init__(self, write: bool, codec: object) -> None:
         self.write = write
         self.codec = codec
-        self.restore = restore
 
     # Tokens covered by one pass of a request's threads; longer requests loop. The grid
     # therefore does not grow with the capacity, which a CUDA graph freezes at the longest
@@ -152,7 +150,7 @@ class _PagedMixedPrecisionKV:
         # Only the tokens this request really has are visited, read from device memory so
         # a replayed graph follows the current lengths.
         count = start
-        if cutlass.const_expr(self.write or self.restore):
+        if cutlass.const_expr(self.write):
             count = lengths[1, request] - start
         count = cutlass.min(count, capacity)
         total = count * (rows_per_token * groups)
@@ -163,7 +161,7 @@ class _PagedMixedPrecisionKV:
             head = row % pool.shape[3]
             kv = row // pool.shape[3] % pool.shape[1]
             position = row // rows_per_token
-            if cutlass.const_expr(self.write or self.restore):
+            if cutlass.const_expr(self.write):
                 position += start
             view_page = request * pages_per_request + position // pool.shape[2]
             view_row = pool[view_page, kv, position % pool.shape[2], head, None]
@@ -172,15 +170,7 @@ class _PagedMixedPrecisionKV:
             offset = position % low.shape[2]
             low_page = cutlass.Int64(tables[0, request, page])
             high_page = cutlass.Int64(tables[1, request, page])
-            if cutlass.const_expr(self.restore):
-                if high_page >= 0:
-                    high_row = high[high_page, kv, offset, head, None]
-                    self.codec.decode(
-                        low[low_page, kv, offset, head, None],
-                        group,
-                        cute.local_tile(high_row, (self.codec.group_size,), (group,)),
-                    )
-            elif cutlass.const_expr(self.write):
+            if cutlass.const_expr(self.write):
                 self.codec.encode(
                     view_row,
                     low[low_page, kv, offset, head, None],
@@ -225,10 +215,8 @@ def convert_mixed_precision_kv(
     layout: str,
     *,
     low_dtype: DataType,
-    restore: bool = False,
 ) -> None:
-    """Convert up to capacity tokens per request between native and mixed KV pools; with
-    `restore`, decode tokens `[lengths[0], lengths[1])` of the low pool into the high pages."""
+    """Convert up to capacity tokens per request between native and mixed KV pools."""
     if capacity == 0 or lengths.shape[1] == 0:
         return
     pools = (pool, low.view(torch.uint8), high)
@@ -238,7 +226,6 @@ def convert_mixed_precision_kv(
     key = (
         low_dtype,
         write,
-        restore,
         tuple((t.dtype, t.shape[1:], t.stride(), t.device.index) for t in pools),
         tuple((t.dtype, t.shape[0], t.ndim, t.device.index) for t in (page_tables, lengths)),
     )
@@ -270,7 +257,7 @@ def convert_mixed_precision_kv(
             )
         with BaseDSL.enable_pyir():
             _compiled_kernels[key] = cute.compile(
-                _PagedMixedPrecisionKV(write, codec, restore),
+                _PagedMixedPrecisionKV(write, codec),
                 *fake_tensors,
                 cutlass.Int32(capacity),
                 cutlass.Int32(capacity),
