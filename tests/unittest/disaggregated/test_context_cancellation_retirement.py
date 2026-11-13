@@ -38,6 +38,7 @@ def _context_request() -> SimpleNamespace:
     """Build the request fields consumed by native context send retirement."""
     request = _request()
     request.is_context_only_request = True
+    request.is_generation_only_request = False
     request.is_child = False
     request.py_kv_send_session_retired = False
     request.py_kv_transfer_timed_out = False

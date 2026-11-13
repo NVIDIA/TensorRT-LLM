@@ -69,6 +69,7 @@ from ..disaggregation.kv_cache_transceiver import (
     KvCacheTransceiver, is_disagg_inflight_cancel_enabled)
 from ..disaggregation.orchestration.admission import \
     DisaggTransferAdmissionController
+from ..disaggregation.orchestration.cancellation import ReceiveCancellation
 from ..disaggregation.orchestration.coordinator import (
     DisaggTransferCoordinator, NoopDisaggCoordinator, attach_ctx_usage,
     is_gen_only_no_context_benchmark, transfer_window_bypass_eligible)
@@ -6022,6 +6023,10 @@ class PyExecutor:
         new_requests = self._cancel_waiting_disagg_requests(new_requests)
         self.disagg.prepare_context_schedulable(new_requests)
         self.disagg.poll_gen_transfers()
+        if self.disagg.supports_group_receive_cancellation:
+            # The symmetric receive poll commits TP-wide logical decisions.
+            # Apply them before GEN_INIT can enter this iteration's scheduler.
+            new_requests = self._cancel_waiting_disagg_requests(new_requests)
         self._activate_completed_remote_tails()
         self.disagg.check_transfer_timeouts()
         # After the polls so a transfer that completed this iteration releases
@@ -12747,8 +12752,7 @@ class PyExecutor:
                 or self.kv_cache_transceiver is None or self.dist.pp_size != 1):
             return set()
         replicated_gen_cancel = self.disagg.requires_gen_cancellation_consensus
-        if (getattr(self, "kv_connector_manager", None) is not None
-                and not replicated_gen_cancel):
+        if self._kv_connector_moves_kv and not replicated_gen_cancel:
             return set()
         restricted_model = (
             getattr(self, "is_encoder_decoder", False)
@@ -12767,7 +12771,17 @@ class PyExecutor:
                 continue
             if request.state not in (LlmRequestState.CONTEXT_INIT,
                                      LlmRequestState.GENERATION_IN_PROGRESS):
-                continue
+                # A pending receive cancellation closes future KV admission and
+                # decode too, even before the request has entered a model batch.
+                if not (self.disagg.supports_group_receive_cancellation
+                        and request.is_generation_only_request
+                        and self.kv_cache_transceiver.
+                        supports_idle_request_cancellation(request) is True
+                        and request.state in (
+                            LlmRequestState.DISAGG_GENERATION_INIT,
+                            LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE,
+                        )):
+                    continue
             if (self.kv_cache_transceiver.supports_idle_request_cancellation(
                     request) is True or replicated_gen):
                 model_ids.add(request.py_request_id)
@@ -12793,8 +12807,7 @@ class PyExecutor:
         if self.kv_cache_transceiver is None:
             return new_requests
         replicated_gen_cancel = self.disagg.requires_gen_cancellation_consensus
-        if (getattr(self, "kv_connector_manager", None) is not None
-                and not replicated_gen_cancel):
+        if self._kv_connector_moves_kv and not replicated_gen_cancel:
             # A connector owns its requests' cancellation, except where the
             # replicated GEN consensus runs: those requests retire only through
             # the rank vote, which this rank must join even with a connector.
@@ -12857,11 +12870,14 @@ class PyExecutor:
             if (generation_waiting
                     and id(request) in self._held_transfer_failures()):
                 # Progress retirement without replacing the earlier executor error.
-                if self.disagg.request_cancellation(request):
+                if self.disagg.request_cancellation(request, failed=True):
                     request.state = LlmRequestState.DISAGG_TRANS_ERROR
                 continue
-            logically_cancelled = (generation_waiting and
-                                   self.disagg.cancel_gen_logically(request))
+            outcome = (self.disagg.cancel_gen_logically(request) if
+                       generation_waiting else ReceiveCancellation.NOT_HANDLED)
+            if outcome is ReceiveCancellation.FAILED:
+                request.state = LlmRequestState.DISAGG_TRANS_ERROR
+            logically_cancelled = outcome is ReceiveCancellation.CANCELLED
             # Even an unsubmitted CTX request may be in the transceiver's
             # peer-info wait set. Cancel there before a late ready can revive it.
             if not logically_cancelled and not self.disagg.request_cancellation(
@@ -13027,15 +13043,24 @@ class PyExecutor:
                 and id(request) in self._held_transfer_failures()
                 and self.kv_cache_transceiver.
                 supports_idle_request_cancellation(request) is True):
-            if self.disagg.request_cancellation(request):
+            if self.disagg.request_cancellation(request, failed=True):
                 request.state = LlmRequestState.DISAGG_TRANS_ERROR
             return False
 
         # KV-moving connectors can read destination pages when cancellation
         # finishes the request. Keep that handoff behind physical retirement.
-        if (not self._kv_connector_moves_kv
-                and self.disagg.cancel_gen_logically(request)):
+        outcome = (self.disagg.cancel_gen_logically(request)
+                   if not self._kv_connector_moves_kv else
+                   ReceiveCancellation.NOT_HANDLED)
+        if outcome is ReceiveCancellation.CANCELLED:
             return True
+        if outcome is ReceiveCancellation.PENDING:
+            return False
+        if outcome is ReceiveCancellation.FAILED:
+            request.state = LlmRequestState.DISAGG_TRANS_ERROR
+            # The local destination may already be safe while a TP peer is
+            # retaining an accessor. Preserve failure until that access ends.
+            return self.disagg.request_cancellation(request)
         if (connector is None
                 and self.disagg.supports_logical_context_cancellation(request)):
             if request.py_request_id in getattr(self, "inflight_req_ids", ()):
@@ -13116,7 +13141,7 @@ class PyExecutor:
             if (request.state == LlmRequestState.DISAGG_TRANS_ERROR
                     and request.is_generation_only_request
                     and self.kv_cache_transceiver is not None
-                    and getattr(self, "kv_connector_manager", None) is None
+                    and not self._kv_connector_moves_kv
                     and self.kv_cache_transceiver.
                     supports_idle_request_cancellation(request) is True):
                 # Drop the pending cancel so synchronized error cleanup
@@ -13448,7 +13473,8 @@ class PyExecutor:
                     new_active_requests.append(request)
                     continue
 
-                is_cancelled = self.disagg.request_cancellation(request)
+                is_cancelled = self.disagg.request_cancellation(request,
+                                                                failed=True)
                 if is_cancelled:
                     # _handle_errors enters response collectives under ADP.
                     # Defer it until the rank-uniform vote below.

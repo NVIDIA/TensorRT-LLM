@@ -54,9 +54,14 @@ def _reset_inflight_cancel_env_cache(monkeypatch):
     monkeypatch.setattr(transceiver_module, "_disagg_inflight_cancel_enabled_cache", None)
 
 
-def _make_timeout_request(request_id=7, in_progress=False):
+def _make_timeout_request(
+    request_id: int = 7, in_progress: bool = False, *, context: bool = False
+) -> SimpleNamespace:
+    """Model the request role independently of its transfer progress."""
     return SimpleNamespace(
         is_attention_dp_dummy=False,
+        is_generation_only_request=not context,
+        is_context_only_request=context,
         py_kv_transfer_timed_out=True,
         py_request_id=request_id,
         is_disagg_generation_transmission_in_progress=in_progress,
@@ -242,7 +247,7 @@ def test_enabled_generation_timeout_fails_transfer_that_completed_late(monkeypat
 
 
 def test_flag_unset_context_timeout_preserves_legacy_cleanup():
-    request = _make_timeout_request()
+    request = _make_timeout_request(context=True)
     request.py_kv_transfer_start_time = 1.0
     request.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
     coordinator, transceiver, effects = _make_reap_coordinator(
@@ -261,7 +266,7 @@ def test_flag_unset_context_timeout_preserves_legacy_cleanup():
 
 
 def test_enabled_context_timeout_defers_cleanup_until_cpp_terminal_state(monkeypatch):
-    request = _make_timeout_request()
+    request = _make_timeout_request(context=True)
     request.py_kv_transfer_start_time = 1.0
     request.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
     coordinator, transceiver, effects = _make_reap_coordinator(

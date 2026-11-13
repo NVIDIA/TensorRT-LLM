@@ -453,6 +453,8 @@ def test_gen_timeout_start_and_observation_share_request_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     request = _disagg_request(21, 2021)
+    request.is_generation_only_request = True
+    request.is_context_only_request = False
     request.state = LlmRequestState.DISAGG_GENERATION_INIT
     request.py_kv_transfer_start_time = None
     request.py_kv_transfer_timed_out = False

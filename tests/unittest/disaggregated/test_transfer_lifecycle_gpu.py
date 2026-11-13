@@ -891,10 +891,18 @@ def _exercise_live_session(
             )
         retained()
         drain_started = session._retirement._drain_started
-        for _ in range(3):
+        for poll_index in range(3):
             if case.startswith("cancel_"):
-                assert executor._try_cancel_request(request) is cancel_before_retirement
-                if role == "gen" and not context_first:
+                # BF16 GEN commits its logical result at the receive vote,
+                # independently of the still-masked physical completion.
+                logical_cancel_ready = cancel_before_retirement or (
+                    role == "gen" and context_first and poll_index > 0
+                )
+                assert executor._try_cancel_request(request) is logical_cancel_ready
+                if role == "gen" and logical_cancel_ready:
+                    assert executor.disagg._retiring_gen_receives == {
+                        request.py_request_id: request
+                    }
                     executor._terminate_request(request)
                 assert session._retirement._drain_started == drain_started
             status = poll(0)

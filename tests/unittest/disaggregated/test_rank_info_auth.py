@@ -25,9 +25,11 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     _rank_info_auth_tag,
     _validate_rank_info_auth_key,
 )
+from tensorrt_llm._torch.disaggregation.orchestration.cancellation import ReceiveCancellation
 from tensorrt_llm._torch.disaggregation.orchestration.coordinator import DisaggTransferCoordinator
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm.bindings import LlmRequestState
+from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
 
 pytestmark = pytest.mark.cpu_only
 
@@ -374,6 +376,8 @@ def test_rank_info_admission_waits_for_asymmetric_receive_fences(
         coordinator._defer_unready_gen_receives = True
         coordinator._unpublished_gen_receives = {7: (req, fence)}
         coordinator._retiring_gen_receives = {}
+        coordinator._pending_gen_cancellation_intents = {}
+        coordinator._peer_failed_gen_cancellations = set()
         coordinator._stamp_gen_transfer_start = Mock()
         coordinator.inflight_cancel_active = Mock(return_value=False)
         coordinator._check_transfer_errors = Mock()
@@ -556,6 +560,180 @@ def test_cancel_pending_rank_info_admission_does_not_publish():
     tc._start_async_receive.assert_not_called()
 
 
+@pytest.mark.parametrize("prior_start_failure", [False, True])
+@pytest.mark.parametrize("session_first", [False, True])
+def test_protected_cancel_joins_keyed_admission_and_retains_peer_access(
+    prior_start_failure, session_first
+):
+    """Keyed TP progress votes cancellation without publishing or releasing its pages.
+
+    One rank retains a local CUDA fence and the other a published destination.
+    A healthy admission must still progress through the same collective sequence.
+    """
+    barrier = threading.Barrier(2, timeout=5)
+    payloads = [None, None]
+    histories = [[], []]
+    transceivers, requests, healthy = [], [], []
+    fence = Mock(query=Mock(return_value=False))
+    owner = Mock(settle=Mock(return_value=True), close=Mock(return_value=True))
+    session = Mock(
+        _enforce_physical_ownership=True,
+        status=SessionStatus.INIT,
+        resources_drained=Mock(return_value=False),
+        close=Mock(return_value=True),
+    )
+
+    def gather(rank, payload):
+        histories[rank].append(type(payload))
+        payloads[rank] = payload
+        barrier.wait()
+        result = list(payloads)
+        barrier.wait()
+        return result
+
+    for rank in range(2):
+        tc = object.__new__(KvCacheTransceiverV2)
+        tc._context_first_ownership = True
+        tc._gen_need_sync = True
+        tc._init_gen_idle_poll(True)
+        tc._gen_allgather = lambda payload, rank=rank: gather(rank, payload)
+        tc._recv_sessions, tc._recv_reqs = {}, {}
+        tc._cancelled_gen_receives, tc._cancelled_receive_fences = {}, {}
+        tc._transfer_worker = Mock(create_receive_retirement=Mock(return_value=owner))
+        tc._start_async_receive = Mock()
+        req = SimpleNamespace(
+            py_request_id=7,
+            request_id=7,
+            is_generation_only_request=True,
+            py_disaggregated_params=DisaggregatedParams(
+                disagg_request_id=7, schedule_style=DisaggScheduleStyle.CONTEXT_FIRST
+            ),
+            state=LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
+            py_kv_receive_cancel_outcome=None,
+        )
+        next_req = SimpleNamespace(py_request_id=8, request_id=8)
+        tc._pending_rank_info_admissions = {7: (req, None), 8: (next_req, None)}
+        tc._rank_info_start_failures = {7: req} if prior_start_failure else {}
+        if rank == 1:
+            tc._recv_sessions[7] = session
+        assert (
+            tc.cancel_gen_logically(req, fence if rank == 0 else None)
+            is ReceiveCancellation.PENDING
+        )
+        assert 7 not in tc._pending_rank_info_admissions
+        assert histories[rank] == []
+        transceivers.append(tc)
+        requests.append(req)
+        healthy.append(next_req)
+
+    def poll_both():
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(tc.check_gen_transfer_status, 0) for tc in transceivers]
+            return [future.result(timeout=10) for future in futures]
+
+    with patch(
+        "tensorrt_llm._torch.disaggregation.transceiver.disagg_diagnostics."
+        "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED",
+        False,
+    ):
+        poll_both()
+        assert histories == [[tuple, dict, list]] * 2
+        for tc, req, next_req in zip(transceivers, requests, healthy):
+            assert tc._cancelled_gen_receives[7].outcome is (
+                ReceiveCancellation.FAILED if prior_start_failure else ReceiveCancellation.CANCELLED
+            )
+            assert tc._recv_reqs[7] is req
+            assert req.py_kv_receive_cancel_outcome is None
+            tc._start_async_receive.assert_called_once_with(next_req)
+        session.close.assert_not_called()
+        owner.close.assert_not_called()
+
+        if session_first:
+            session.resources_drained.return_value = True
+        else:
+            fence.query.return_value = True
+        poll_both()
+        for tc, req in zip(transceivers, requests):
+            assert tc._recv_reqs[7] is req
+            assert req.py_kv_receive_cancel_outcome is None
+        session.close.assert_not_called()
+        owner.close.assert_not_called()
+
+        session.resources_drained.return_value = True
+        fence.query.return_value = True
+        poll_both()
+        assert histories == [[tuple, dict, list, tuple, list, tuple, list]] * 2
+        for tc, req, next_req in zip(transceivers, requests, healthy):
+            assert req.py_kv_receive_cancel_outcome is (
+                ReceiveCancellation.FAILED if prior_start_failure else ReceiveCancellation.CANCELLED
+            )
+            assert not tc._recv_reqs
+            assert not tc._cancelled_gen_receives
+            assert not tc._rank_info_start_failures
+            assert tc.cancel_gen_logically(req) is req.py_kv_receive_cancel_outcome
+            tc.request_and_receive_async(req)
+            tc._start_async_receive.assert_called_once_with(next_req)
+        session.close.assert_called_once()
+        owner.close.assert_called_once()
+        poll_both()
+        assert histories == [[tuple, dict, list, tuple, list, tuple, list]] * 2
+
+
+@pytest.mark.parametrize("entry_point", ["cancel_gen_logically", "cancel_request"])
+def test_protected_cancel_preserves_rejected_rank_info_outcome(entry_point):
+    """One rank's rejected admission wins on both participants before publication."""
+    barrier = threading.Barrier(2, timeout=5)
+    payloads = [None, None]
+    transceivers, requests = [], []
+
+    def gather(rank, payload):
+        payloads[rank] = payload
+        barrier.wait()
+        result = list(payloads)
+        barrier.wait()
+        return result
+
+    for rank in range(2):
+        tc = object.__new__(KvCacheTransceiverV2)
+        tc._context_first_ownership = True
+        tc._gen_need_sync = True
+        tc._gen_allgather = lambda payload, rank=rank: gather(rank, payload)
+        tc._init_gen_idle_poll(True)
+        tc._recv_sessions, tc._recv_reqs = {}, {}
+        tc._cancelled_gen_receives, tc._cancelled_receive_fences = {}, {}
+        req = SimpleNamespace(
+            py_request_id=7,
+            request_id=7,
+            is_generation_only_request=True,
+            is_context_only_request=False,
+            py_disaggregated_params=DisaggregatedParams(
+                disagg_request_id=7, schedule_style=DisaggScheduleStyle.CONTEXT_FIRST
+            ),
+            state=LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
+            py_kv_receive_cancel_outcome=None,
+        )
+        tc._pending_rank_info_admissions = {
+            7: (req, "peer authentication rejected" if rank == 1 else None)
+        }
+        tc._start_async_receive = Mock()
+        assert getattr(tc, entry_point)(req) is (
+            ReceiveCancellation.PENDING if entry_point == "cancel_gen_logically" else False
+        )
+        transceivers.append(tc)
+        requests.append(req)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(tc._poll_rank_info_admissions, []) for tc in transceivers]
+        assert [result.result(timeout=10) for result in futures] == [([], []), ([], [])]
+    for tc, req in zip(transceivers, requests):
+        assert req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+        assert req.py_kv_receive_cancel_outcome is ReceiveCancellation.FAILED
+        assert not tc._pending_rank_info_admissions
+        assert not tc._recv_reqs
+        assert tc.cancel_gen_logically(req) is ReceiveCancellation.FAILED
+        assert tc.cancel_request(req)
+        tc._start_async_receive.assert_not_called()
+
+
 @pytest.mark.parametrize("after_challenge", [False, True])
 def test_rank_info_timeout_uses_one_deadline_and_closes_socket(after_challenge):
     receiver = _make_receiver()
@@ -666,3 +844,139 @@ def test_sync_rank_info_admission_rejects_all_ranks_before_publication(rejected_
             assert req.state == LlmRequestState.DISAGG_TRANS_ERROR
         assert not tc._recv_sessions
         assert not tc._recv_reqs
+
+
+def test_one_rank_timeout_enrolls_unpublished_peer_without_starting_its_clock(monkeypatch):
+    """Peer timeout closes publication while a local admission fence remains held."""
+    from tensorrt_llm._torch.disaggregation.orchestration import coordinator as coordinator_module
+
+    monkeypatch.setenv("TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL", "0")
+    monkeypatch.delenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", raising=False)
+    monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
+    now = [0.0]
+    monkeypatch.setattr(coordinator_module.time, "monotonic", lambda: now[0])
+    barrier = threading.Barrier(2, timeout=5)
+    payloads, histories = [None, None], [[], []]
+    coordinators, transceivers, requests, healthy_requests = [], [], [], []
+    fence = Mock(query=Mock(return_value=False))
+    owner = Mock(settle=Mock(return_value=True), close=Mock(return_value=True))
+
+    def gather(rank, payload):
+        histories[rank].append(type(payload))
+        payloads[rank] = payload
+        barrier.wait()
+        result = list(payloads)
+        barrier.wait()
+        return result
+
+    for rank in range(2):
+        tc = object.__new__(KvCacheTransceiverV2)
+        tc._context_first_ownership = True
+        tc._gen_need_sync = True
+        tc._init_gen_idle_poll(True)
+        tc._gen_allgather = lambda payload, rank=rank: gather(rank, payload)
+        tc._recv_sessions, tc._recv_reqs = {}, {}
+        tc._cancelled_gen_receives, tc._cancelled_receive_fences = {}, {}
+        tc._transfer_worker = Mock(create_receive_retirement=Mock(return_value=owner))
+        tc._start_async_receive = Mock()
+        tc.kv_transfer_timeout_ms = 1000
+        tc._ever_had_recv_session = False
+        req = SimpleNamespace(
+            py_request_id=7,
+            request_id=7,
+            is_generation_only_request=True,
+            is_context_only_request=False,
+            is_child=False,
+            parent_request_id=None,
+            py_disaggregated_params=DisaggregatedParams(
+                disagg_request_id=700, schedule_style=DisaggScheduleStyle.CONTEXT_FIRST
+            ),
+            state=LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
+            is_disagg_generation_transmission_in_progress=True,
+            py_kv_receive_cancel_outcome=None,
+            py_kv_transfer_timed_out=False,
+            py_kv_transfer_start_time=0.0 if rank == 0 else None,
+        )
+        tc._pending_rank_info_admissions = {700: (req, None)} if rank == 0 else {}
+        healthy = SimpleNamespace(**vars(req))
+        healthy.py_request_id = healthy.request_id = 8
+        healthy.py_disaggregated_params = DisaggregatedParams(
+            disagg_request_id=800, schedule_style=DisaggScheduleStyle.CONTEXT_FIRST
+        )
+        healthy.state = LlmRequestState.GENERATION_IN_PROGRESS
+        healthy.is_disagg_generation_transmission_in_progress = False
+        healthy.py_kv_transfer_start_time = None
+        active_requests = [req, healthy]
+        registry = SimpleNamespace(
+            active_requests=lambda active=active_requests: active,
+            canceled_request_ids=lambda: [],
+        )
+        coordinator = DisaggTransferCoordinator(
+            transceiver=tc,
+            transfer_manager=Mock(),
+            kv_cache_manager=None,
+            dist=SimpleNamespace(world_size=2, tp_size=2, pp_size=1, cp_size=1),
+            effects=Mock(),
+            registry=registry,
+            enable_attention_dp=False,
+            defer_unready_gen_receives=True,
+        )
+        if rank == 1:
+            coordinator._unpublished_gen_receives[7] = (req, fence)
+            coordinator._report_deferred_gen_receives()
+        transceivers.append(tc)
+        coordinators.append(coordinator)
+        requests.append(req)
+        healthy_requests.append(healthy)
+
+    def poll_both() -> None:
+        """Poll both ranks without hiding a peer exception behind a broken barrier."""
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(coordinator.poll_gen_transfers) for coordinator in coordinators]
+            errors = [future.exception(timeout=10) for future in futures]
+            for error in errors:
+                if error is not None and not isinstance(error, threading.BrokenBarrierError):
+                    raise error
+            for future in futures:
+                future.result(timeout=10)
+
+    with patch(
+        "tensorrt_llm._torch.disaggregation.transceiver.disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED",
+        False,
+    ):
+        now[0] = 2.0
+        coordinators[0]._retire_legacy_timed_out_gen_transfers()
+        assert requests[0].py_kv_transfer_timed_out
+        assert not requests[1].py_kv_transfer_timed_out
+        assert not transceivers[0]._pending_rank_info_admissions
+        poll_both()  # Peer learns intent and hands off its still-unready fence.
+        assert not coordinators[1]._unpublished_gen_receives
+        assert 700 in transceivers[1]._cancelled_gen_receives
+        poll_both()  # Every actual owner now supplies the first complete vote.
+        for tc, coordinator, req in zip(transceivers, coordinators, requests):
+            assert tc._cancelled_gen_receives[700].outcome is ReceiveCancellation.FAILED
+            assert tc._recv_reqs[700] is req
+            assert req.py_kv_receive_cancel_outcome is None
+            tc._start_async_receive.assert_not_called()
+            coordinator._effects.fail_requests.assert_not_called()
+        assert requests[1].py_kv_transfer_start_time is None
+        assert not requests[1].py_kv_transfer_timed_out
+        owner.close.assert_not_called()
+        fence.query.return_value = True
+        poll_both()
+        for tc, coordinator, req, healthy in zip(
+            transceivers, coordinators, requests, healthy_requests
+        ):
+            assert req.py_kv_receive_cancel_outcome is ReceiveCancellation.FAILED
+            assert req.state == LlmRequestState.DISAGG_TRANS_ERROR
+            coordinator._effects.fail_requests.assert_called_once_with(
+                "Error in kv cache transfer for generation requests", [req], charge_budget=False
+            )
+            assert healthy in coordinator._registry.active_requests()
+            assert healthy.state == LlmRequestState.GENERATION_IN_PROGRESS
+            assert not healthy.py_kv_transfer_timed_out
+            assert healthy.py_kv_receive_cancel_outcome is None
+            assert not tc._recv_reqs
+            tc._start_async_receive.assert_not_called()
+        owner.close.assert_called_once_with()
+        assert histories[0] == histories[1]

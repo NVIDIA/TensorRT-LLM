@@ -7,9 +7,11 @@ import inspect
 from unittest.mock import Mock
 
 import pytest
+from coordinator_harness import CoordinatorHarness, TransferRequest
 
 from tensorrt_llm._torch.disaggregation.orchestration import coordinator as coordinator_module
 from tensorrt_llm._torch.disaggregation.orchestration import interfaces as interfaces_module
+from tensorrt_llm._torch.disaggregation.orchestration.cancellation import ReceiveCancellation
 from tensorrt_llm._torch.disaggregation.orchestration.coordinator import (
     DisaggTransferCoordinator,
     NoopDisaggCoordinator,
@@ -18,6 +20,7 @@ from tensorrt_llm._torch.disaggregation.orchestration.interfaces import (
     ActiveRequestRegistry,
     ExecutorEffects,
 )
+from tensorrt_llm.bindings import LlmRequestState
 
 pytestmark = pytest.mark.cpu_only
 
@@ -95,15 +98,38 @@ def test_noop_coordinator_overrides_every_entry_point() -> None:
     assert inherited == set(), inherited
 
 
-def test_noop_coordinator_accepts_every_loop_call() -> None:
+@pytest.mark.parametrize("use_keywords", [False, True], ids=["positional", "keyword"])
+@pytest.mark.parametrize("include_defaults", [False, True], ids=["required-only", "all"])
+def test_noop_coordinator_accepts_every_loop_call(
+    use_keywords: bool, include_defaults: bool
+) -> None:
     """Loops call the coordinator unconditionally, so the no-op variant must
-    accept every call the real one does."""
+    accept positional and keyword calls, including omitted optional arguments."""
     noop = NoopDisaggCoordinator()
     for name in (
         _public_methods(DisaggTransferCoordinator) - {"admit"} - _LOOP_ENTRY_POINTS_EXCLUDED
     ):
-        params = inspect.signature(getattr(noop, name)).parameters
-        getattr(noop, name)(*[Mock() for _ in params])
+        params = [
+            param
+            for key, param in inspect.signature(
+                getattr(DisaggTransferCoordinator, name)
+            ).parameters.items()
+            if key != "self" and (include_defaults or param.default is inspect.Parameter.empty)
+        ]
+        args = [
+            Mock()
+            for param in params
+            if param.kind == inspect.Parameter.POSITIONAL_ONLY
+            or (param.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD and not use_keywords)
+        ]
+        kwargs = {
+            param.name: Mock()
+            for param in params
+            if param.kind == inspect.Parameter.KEYWORD_ONLY
+            or (param.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD and use_keywords)
+        }
+        inspect.signature(getattr(noop, name)).bind(*args, **kwargs)
+        getattr(noop, name)(*args, **kwargs)
 
 
 def test_noop_coordinator_refuses_release_transfer() -> None:
@@ -111,3 +137,51 @@ def test_noop_coordinator_refuses_release_transfer() -> None:
     silently leak the request."""
     with pytest.raises(RuntimeError, match="no transceiver"):
         NoopDisaggCoordinator().release_transfer(Mock())
+
+
+def test_unsupported_receive_cancellation_does_not_take_fence() -> None:
+    harness = CoordinatorHarness()
+    request = TransferRequest(
+        1,
+        is_context_only_request=False,
+        state=LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
+    )
+    ready = Mock(spec=["query"])
+    harness.coordinator._unpublished_gen_receives[1] = (request, ready)
+    assert harness.coordinator.cancel_gen_logically(request) is ReceiveCancellation.NOT_HANDLED
+    assert harness.coordinator._unpublished_gen_receives == {1: (request, ready)}
+    ready.query.assert_not_called()
+    assert NoopDisaggCoordinator().cancel_gen_logically(request) is ReceiveCancellation.NOT_HANDLED
+    assert not NoopDisaggCoordinator().supports_group_receive_cancellation
+
+
+@pytest.mark.parametrize("physical_entry", [False, True])
+@pytest.mark.parametrize("prior_failure", [False, True])
+def test_coordinator_passes_failure_without_writing_request_state(
+    physical_entry: bool, prior_failure: bool
+) -> None:
+    harness = CoordinatorHarness()
+    request = TransferRequest(
+        1,
+        is_context_only_request=False,
+        state=LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
+    )
+    ready = Mock(spec=["query"])
+    harness.coordinator._unpublished_gen_receives[1] = (request, ready)
+    harness.transceiver.supports_group_receive_cancellation = Mock(return_value=True)
+    harness.transceiver.cancel_gen_logically = Mock(return_value=ReceiveCancellation.PENDING)
+    harness.transceiver.cancel_request = Mock(return_value=False)
+    if physical_entry:
+        assert not harness.coordinator.request_cancellation(request, failed=prior_failure)
+    else:
+        assert (
+            harness.coordinator.cancel_gen_logically(request, prior_failure=prior_failure)
+            is ReceiveCancellation.PENDING
+        )
+    harness.transceiver.cancel_gen_logically.assert_called_once_with(
+        request, ready, prior_failure=prior_failure
+    )
+    assert request.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+    assert not harness.coordinator._unpublished_gen_receives
+    assert not harness.coordinator._retiring_gen_receives
+    ready.query.assert_not_called()

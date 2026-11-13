@@ -128,6 +128,7 @@ class _ReceiveCase:
             py_request_id=_OLD_REQUEST,
             is_child=False,
             is_context_only_request=False,
+            is_generation_only_request=True,
             is_disagg_generation_transmission_in_progress=True,
             py_kv_transfer_start_time=self.now,
             py_kv_transfer_timed_out=False,

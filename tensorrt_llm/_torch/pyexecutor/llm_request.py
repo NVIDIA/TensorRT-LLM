@@ -77,6 +77,7 @@ def make_mm_encoder_transient_cache_key(request_id: int,
 
 
 if TYPE_CHECKING:
+    from ..disaggregation.orchestration.cancellation import ReceiveCancellation
     from ..speculative.interface import OneModelSamplingParams
     from ..tensor_lru_cache import TensorLRUCache
 
@@ -942,6 +943,12 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_locality_domain_id = locality_domain_id
         # Prevent recreation after a send session drops peer registration.
         self.py_kv_send_session_retired = False
+        # Written once by the receive owner after closure; duplicate-call
+        # outcome, not independent evidence that memory may be released.
+        self.py_kv_receive_cancel_outcome: "ReceiveCancellation | None" = None
+        # Legacy rank-local logical disposition, independent of physical
+        # retirement. Group cancellation keeps its decision with its owner.
+        self.py_kv_receive_cancel_disposition: "ReceiveCancellation | None" = None
 
         # Encoder-decoder handoff, set by PyExecutor._scatter_encoder_output
         # when the encoder output is published:
