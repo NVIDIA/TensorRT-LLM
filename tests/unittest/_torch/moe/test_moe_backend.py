@@ -5549,11 +5549,15 @@ def test_moe_backend(
         # flashinfer has no capture and replay mechanisms, so we skip test_all_kernels
         use_flashinfer = getattr(backend, "use_flashinfer", False)
 
-        # The SM90 Triton FP8-activation leaf runs decode-sized batches without
-        # any autotuned op, so those runs leave nothing to capture.
+        # The SM90 Triton FP8-activation leaf runs decode-sized BF16 batches
+        # without any autotuned op, so those runs leave nothing to capture.
+        # Every other call (FP16 input, a non-uniform clamp, more rows) runs
+        # the parent's tuned fused op and keeps the tactic replay below.
         runs_untuned_triton = (
             isinstance(backend, TrtllmTritonFp8ActGroupedGemmFp8BlockScalesImpl)
             and seq_len <= backend.TRITON_FP8_ACT_MAX_TOKENS
+            and dtype_activation == torch.bfloat16
+            and backend._triton_swiglu is not None
         )
 
         # Check if this backend+quant_algo combination supports autotuner capture/replay
