@@ -49,6 +49,25 @@ def _prefill_multirow(x: torch.Tensor, z: torch.Tensor, gate_activation: str) ->
     return x.shape[0] >= _PREFILL_MIN_ROWS and _multirow(x, z, gate_activation)
 
 
+def _direct_launch(x, z, weight, eps, gate_activation):
+    """The registered op's own multi-row launch (same kernel, 4 rows a program, PDL by the
+    op's policy), skipping only the custom-op dispatch."""
+    rows, n = x.shape
+    out = torch.empty_like(x)
+    grid = triton.cdiv(rows, _layernorm_gated._MULTIROW_ROWS)
+    device = x.device.index
+    pdl = _layernorm_gated._multirow_pdl(grid, device)
+    with torch.cuda.device(device):
+        _layernorm_gated._rms_norm_gated_fwd_multirow_kernel[(grid,)](
+            x, out, weight, z, None, None, x.stride(0), out.stride(0), z.stride(0), rows, eps,
+            N=n, ROWS=_layernorm_gated._MULTIROW_ROWS, HEADS_PER_TOK=z.shape[1],
+            GATE_SIGMOID=gate_activation == "sigmoid", WEIGHT_IS_DELTA=False,
+            LAUNCH_WITH_PDL=pdl, num_warps=_layernorm_gated._MULTIROW_NUM_WARPS,
+            EARLY_TRIGGER=_layernorm_gated._pdl_device_policy(device)[0], launch_pdl=pdl,
+        )  # fmt: skip
+    return out
+
+
 def _prefill_launch(x, z, weight, eps, gate_activation):
     """The multi-row kernel at `_PREFILL_ROWS` rows a program (no PDL: the grid covers every SM)."""
     rows, n = x.shape
@@ -135,9 +154,12 @@ class RmsNormGatedTokenMajor(OpWrapper):
     SM count and `TRTLLM_ENABLE_PDL != 0`; results are bitwise identical with
     it off. The 8-row programs reduce a row's mean square in another order
     than the 4-row ones (one-ulp differences on some outputs). With
-    `direct_launch=True` (the FP8 target) below the 8-row threshold, the op's own
-    launch `launch_rms_norm_gated_token_major` (the op's body) is called, skipping
-    only the custom-op dispatch: 24 instead of 39 us of host time a call on GB300.
+    `direct_launch=True` (the FP8 target) below the 8-row threshold, the 4-row
+    launch is made here (`_direct_launch`, a copy of the registered op's own),
+    skipping only the custom-op dispatch: 24 instead of 39 us of host time a
+    call on GB300. The test holds it bitwise equal to the op at the
+    direct-launch cells and more shapes, so a change to the op's launch fails
+    there.
 
     Loud (measured), so not guarded: 3-D `x` (ValueError), a `z` not covering `x`
     (AssertionError "does not match x shape"; 2-D `z` ValueError), an unknown
@@ -200,12 +222,18 @@ class RmsNormGatedTokenMajor(OpWrapper):
     ) -> torch.Tensor:
         if fp8_scale is None and z.dim() == 3 and _prefill_multirow(x, z, gate_activation):
             return _prefill_launch(x, z, weight, eps, gate_activation)
-        launch = (
-            _layernorm_gated.launch_rms_norm_gated_token_major
-            if direct_launch
-            else torch.ops.trtllm.rms_norm_gated_token_major
+        if (
+            direct_launch
+            and fp8_scale is None
+            and x.dim() == 2
+            and z.dim() == 3
+            and weight.is_contiguous()
+            and _multirow(x, z, gate_activation)
+        ):
+            return _direct_launch(x, z, weight, eps, gate_activation)
+        return torch.ops.trtllm.rms_norm_gated_token_major(
+            x, z, weight, eps, fp8_scale, gate_activation
         )
-        return launch(x, z, weight, eps, fp8_scale, gate_activation)
 
     def reference(
         self,
