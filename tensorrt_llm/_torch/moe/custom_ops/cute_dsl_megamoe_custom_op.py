@@ -960,11 +960,30 @@ def _construct_megamoe_kernel(
             raise NotImplementedError(f"{kernel_cls.__name__} does not support swiglu_alpha.")
         return kernel_cls(problem_desc, impl_desc)
 
+    def construct_genphase():
+        kernel = construct(RubinInferenceGenphaseMegaMoE)
+        # The gen kernel addresses activation rows by its padded strides, while the backend
+        # stages compact rows (megamoe_activation_sf_bytes_per_row); with dynamic layouts a
+        # mismatch is only caught by a trap at launch, so reject it here (e.g. hidden 2880).
+        token_comm = kernel.token_comm
+        sf_row_bytes = megamoe_activation_sf_bytes_per_row(int(hidden_size))
+        if (
+            token_comm.plain_activation_row_elements != int(hidden_size)
+            or token_comm.plain_activation_sf_row_elements != sf_row_bytes
+        ):
+            raise ValueError(
+                f"hidden_size {hidden_size}: the generation-phase kernel needs activation rows of "
+                f"{token_comm.plain_activation_row_elements} elements and SF rows of "
+                f"{token_comm.plain_activation_sf_row_elements} bytes, but the backend stages "
+                f"{hidden_size} and {sf_row_bytes}."
+            )
+        return kernel
+
     bucket = _sm107_tactic_bucket(int(common["max_tokens_per_rank"])) if sm_version == 107 else None
     rejection = None
     if bucket is not None and bucket not in _SM107_GENERIC_KERNEL_BUCKETS:
         try:
-            return construct(RubinInferenceGenphaseMegaMoE), None
+            return construct_genphase(), None
         except (ValueError, TypeError, NotImplementedError) as exc:
             rejection = exc
     kernel_cls = RubinInferenceMegaMoE if sm_version == 107 else BlackwellInferenceMegaMoE
