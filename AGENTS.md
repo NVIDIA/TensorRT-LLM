@@ -236,12 +236,6 @@ for integration tests and include `gpu` in `LABELS` for tests that need a GPU.
 CI controls test concurrency through `parallel_run_ctest`. `google-tests`
 continues to build all C++ tests; component aggregate targets build migrated tests.
 
-### Advisory semantic review
-
-The bot-to-bot semantic review workflow is disabled. See
-[.github/semantic-review.md](.github/semantic-review.md) for its current status and
-historical implementation details.
-
 ### Vendor source tools and promotion
 
 Use the tools under `scripts/vendor/` to manage locked vendor sources, prepare
