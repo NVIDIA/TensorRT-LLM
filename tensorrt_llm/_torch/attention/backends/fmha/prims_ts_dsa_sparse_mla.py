@@ -47,6 +47,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
 )
+from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 
@@ -96,6 +97,20 @@ def may_use_nvfp4_mla_record_cache(attn: "TrtllmAttention") -> bool:
     )
 
     return get_requested_nvfp4_mla_kv_cache_layout() != NVFP4_MLA_RESIDUAL_LAYOUT
+
+
+def _gpu_unsupported_reason() -> Optional[str]:
+    """Why the kernel cannot run on this GPU, if so.
+
+    SM107 needs a CuTe DSL with the Rubin helpers: an older one reaches the GPU only through the
+    ``sm_100f`` family target (``CUTE_DSL_ARCH``), which this library does not set up.
+    """
+    sm = get_sm_version()
+    if sm not in (100, 103, 107):
+        return f"requires SM100, SM103 or SM107, got SM{sm}."
+    if sm == 107 and not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+        return "SM107 requires a CuTe DSL with the Rubin helpers."
+    return None
 
 
 def _metadata_unsupported_reason(metadata) -> Optional[str]:
@@ -150,7 +165,7 @@ def prims_ts_reads_nvfp4_mla_records(metadata, attn: Optional["TrtllmAttention"]
 
     if PrimsTSDsaSparseMlaFmha not in get_enabled_fmha_lib_classes():
         return False
-    if get_sm_version() not in (100, 103):
+    if _gpu_unsupported_reason() is not None:
         return False
     return get_prims_ts_toolchain_unsupported_reason() is None
 
@@ -194,9 +209,9 @@ class PrimsTSDsaSparseMlaFmha(Fmha):
 
     @classmethod
     def _unavailable_reason(cls, attn: "TrtllmAttention") -> Optional[str]:
-        sm = get_sm_version()
-        if sm not in (100, 103):
-            return f"requires SM100 or SM103, got SM{sm}."
+        reason = _gpu_unsupported_reason()
+        if reason is not None:
+            return reason
         if int(attn.kv_lora_rank) != _LATENT_DIM or int(attn.qk_rope_head_dim) != _ROPE_DIM:
             return (
                 f"requires a {_LATENT_DIM} + {_ROPE_DIM} latent, got "

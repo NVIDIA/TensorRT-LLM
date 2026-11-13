@@ -646,7 +646,8 @@ The FMHA package is split by role:
   removes it. For compress-ratio-4 layers under KV-cache offload, its extra
   source is the layer's sparse cache arena (§3.2.5).
 - `fmha/prims_ts_dsa_sparse_mla.py` runs DSA generation on the vendored PrimTS
-  D576 sparse MLA kernel (SM100/SM103), which reads the NVFP4 KV records of the
+  D576 sparse MLA kernel (SM100/SM103, and SM107 with the Rubin helpers of the
+  CuTe DSL), which reads the NVFP4 KV records of the
   `fp8rope` layout in place. Its `prims_ts_reads_nvfp4_mla_records()` is the
   one decision behind both gather skips:
   `DSATrtllmAttention.sparse_attn_predict` skips the NVFP4-to-FP8 gather and

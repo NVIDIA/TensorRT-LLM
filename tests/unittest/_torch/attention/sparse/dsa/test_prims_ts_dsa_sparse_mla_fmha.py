@@ -115,6 +115,22 @@ def test_metadata_leaves_out_the_gather_rows_only_when_the_library_can_run(monke
 
 
 @pytest.mark.cpu_only
+def test_sm107_needs_the_rubin_helpers_of_the_cute_dsl(monkeypatch):
+    monkeypatch.setattr(registry, "get_enabled_fmha_lib_classes", lambda: [PrimsTSDsaSparseMlaFmha])
+    monkeypatch.setattr(
+        prims_ts_dsa_sparse_mla, "get_prims_ts_toolchain_unsupported_reason", lambda: None
+    )
+    monkeypatch.setattr(prims_ts_dsa_sparse_mla, "get_sm_version", lambda: 107)
+    layer = _Layer()
+    monkeypatch.setattr(prims_ts_dsa_sparse_mla, "IS_CUTLASS_DSL_RUBIN_AVAILABLE", True)
+    assert prims_ts_reads_nvfp4_mla_records(_metadata())
+    assert PrimsTSDsaSparseMlaFmha._unavailable_reason(layer) is None
+    monkeypatch.setattr(prims_ts_dsa_sparse_mla, "IS_CUTLASS_DSL_RUBIN_AVAILABLE", False)
+    assert not prims_ts_reads_nvfp4_mla_records(_metadata())
+    assert "Rubin helpers" in PrimsTSDsaSparseMlaFmha._unavailable_reason(layer)
+
+
+@pytest.mark.cpu_only
 def test_library_rejects_the_requests_the_gather_skip_rejects():
     """The library's request check and the gather skip share the metadata conditions."""
     layer = _Layer()
@@ -296,8 +312,8 @@ def test_record_writer_round_trips_through_the_gather(written_records):
 @requires_blackwell
 def test_prims_ts_matches_the_gather(written_records, monkeypatch):
     """PrimTS reading the records in place agrees with attention over the gathered rows."""
-    if get_sm_version() not in (100, 103):
-        pytest.skip("PrimTS DSA sparse MLA requires SM100 or SM103")
+    if get_sm_version() not in (100, 103, 107):
+        pytest.skip("PrimTS DSA sparse MLA requires SM100, SM103 or SM107")
     reason = get_prims_ts_toolchain_unsupported_reason()
     if reason is not None:
         pytest.skip(reason)
