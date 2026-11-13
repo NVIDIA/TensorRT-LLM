@@ -43,8 +43,12 @@ tail from a rank seed.
 """
 
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
-import _lockstep as ls
+if TYPE_CHECKING:
+    from _torch.modeling_v2.comm import _lockstep as ls
+else:
+    import _lockstep as ls
 import torch
 from torch import nn
 

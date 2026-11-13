@@ -46,12 +46,16 @@ import sys
 import zlib
 from pathlib import Path
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "comm"))
-import _lockstep as ls  # noqa: E402
+if TYPE_CHECKING:
+    from _torch.modeling_v2.comm import _lockstep as ls
+else:
+    import _lockstep as ls  # noqa: E402
 
 assert torch.cuda.is_available(), "k3_moe_front requires CUDA devices"
 

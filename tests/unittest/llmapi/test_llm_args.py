@@ -3645,6 +3645,7 @@ class TestTorchLlmArgs:
     @pytest.mark.cpu_only
     def test_dynamic_setattr(self):
         with pytest.raises(pydantic_core._pydantic_core.ValidationError):
+            # pyrefly: ignore [unexpected-keyword]
             args = TorchLlmArgs(model=llama_model_path, invalid_arg=1)
 
         with pytest.raises(ValueError):
@@ -3975,8 +3976,10 @@ class TestStrictBaseModelArbitraryArgs:
         # Arbitrary arguments should be rejected
         with pytest.raises(
                 pydantic_core._pydantic_core.ValidationError) as exc_info:
-            TorchLlmArgs(model=llama_model_path,
-                         unsupported_option="should_fail")
+            TorchLlmArgs(
+                model=llama_model_path,
+                # pyrefly: ignore [unexpected-keyword]
+                unsupported_option="should_fail")
         assert "unsupported_option" in str(exc_info.value)
 
     def test_nested_config_arbitrary_args(self):

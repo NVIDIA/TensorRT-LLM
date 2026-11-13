@@ -557,6 +557,18 @@ def test_out_of_scope_rule_removes_ruff_config_preflight_blockers(tmp_path: Path
             '[[tool.pyrefly.sub-config]]\nmatches = "old"\n',
             '[[tool.pyrefly.sub-config]]\nmatches = "new"\n',
         ),
+        (
+            '[tool.pyrefly-tests]\nsearch-path = ["old"]\n',
+            '[tool.pyrefly-tests]\nsearch-path = ["new"]\n',
+        ),
+        (
+            '[tool.pyrefly-tests.errors]\nmissing-argument = "error"\n',
+            '[tool.pyrefly-tests.errors]\nmissing-argument = "ignore"\n',
+        ),
+        (
+            '[tool.pyrefly-exclusions]\nsymbols = ["old"]\n',
+            '[tool.pyrefly-exclusions]\nsymbols = ["new"]\n',
+        ),
     ),
 )
 def test_out_of_scope_rule_claims_static_check_tables_as_noop(
@@ -585,6 +597,14 @@ def test_out_of_scope_rule_claims_static_check_tables_as_noop(
         (
             "[build-system]\nrequires = []\n[tool.ruff]\nfix = false\n",
             '[build-system]\nrequires = ["new"]\n[tool.ruff]\nfix = true\n',
+        ),
+        (
+            '[project]\ndependencies = ["old"]\n[tool.pyrefly-tests]\nsearch-path = ["old"]\n',
+            '[project]\ndependencies = ["new"]\n[tool.pyrefly-tests]\nsearch-path = ["new"]\n',
+        ),
+        (
+            '[tool.pyrefly-tests-extra]\nvalue = "old"\n',
+            '[tool.pyrefly-tests-extra]\nvalue = "new"\n',
         ),
         ('description = """old\n[tool.ruff]\n"""\n', 'description = """new\n[tool.ruff]\n"""\n'),
         ('["tool".ruff]\nfix = false\n', '["tool".ruff]\nfix = true\n'),
