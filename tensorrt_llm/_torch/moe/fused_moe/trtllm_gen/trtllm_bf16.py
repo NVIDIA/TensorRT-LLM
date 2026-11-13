@@ -12,11 +12,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""``flashinfer.trtllm_gen.fused_moe.none`` -- the unquantized path."""
+"""``trtllm.trtllm_gen.fused_moe.none`` -- the unquantized path."""
+
+import os
 
 import torch
 
+from tensorrt_llm._torch.moe.expert_statistic import ExpertStatistic
+from tensorrt_llm._torch.route_capture import get_active_route_capture
 from tensorrt_llm._torch.utils import ActivationType
+from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
+from tensorrt_llm.tools.layer_wise_benchmarks.calibrator import Mode as CalibratorMode
 
 from ..impl_contract import (
     MoEDeployment,
@@ -25,44 +31,49 @@ from ..impl_contract import (
     MoERejectReason,
     MoERunContext,
 )
-from ..impl_environment import MoEDep
 from ..impl_identity import register_moe_impl
 from ..interface import _reject
 from ..quantization import BF16TRTLLMGenFusedMoEMethod
-from ..routing import DeepSeekV3MoeRoutingMethod
 from .base import TrtllmGenFusedMoEBase
 from .eligibility import (
-    check_flashinfer_shard_alignment,
+    check_intermediate_shard_alignment,
     check_no_activation_constants,
     check_no_expert_bias,
     check_trtllm_gen_leaf,
 )
-from .identity import PROVIDER_FLASHINFER, trtllm_gen_descriptor
+from .identity import PROVIDER_TRTLLM, trtllm_gen_descriptor
 from .kernel_inputs import prepare_kernel_inputs, to_trtllm_gen_act_type
 
 
 @register_moe_impl
-class FlashinferTrtllmGenBf16Impl(TrtllmGenFusedMoEBase):
-    """``flashinfer.trtllm_gen.fused_moe.none`` -- the unquantized path.
+class TrtllmTrtllmGenBf16Impl(TrtllmGenFusedMoEBase):
+    """``trtllm.trtllm_gen.fused_moe.none`` -- the unquantized path.
 
-    The only FlashInfer leaf: ``trtllm_bf16_moe`` has no counterpart in
-    TRT-LLM's own cubins, so there is no native leaf for this format. It is
-    also the only leaf whose kernel does not route internally, which is what
-    ``_requires_separated_routing`` below says.
+    BF16 activations times BF16 weights on the ``Bmm_Bfloat16_Bfloat16Bfloat16``
+    cubins, through ``trtllm::bf16_moe_runner``. The weights are stored in the
+    shuffled BlockMajorK layout ``BF16TRTLLMGenFusedMoEMethod`` produces.
     """
 
     descriptor = trtllm_gen_descriptor(
-        PROVIDER_FLASHINFER,
+        PROVIDER_TRTLLM,
         "none",
-        "FlashInfer's TRTLLM-Gen bf16 fused MoE, unquantized, SM100 family.",
+        "TRTLLM-Gen batched-GEMM cubins, BF16 activations and weights, SM100 family.",
     )
 
-    #: What the FlashInfer bf16 kernels implement. Read from both sides here:
-    #: the eligibility gate below and ``_check_configs``.
+    #: The gemm1 epilogues the BF16 cubins ship: gated SwiGLU and non-gated
+    #: Relu2. Read from both sides here: the eligibility gate below and
+    #: ``_check_configs``.
     _BF16_SUPPORTED_ACTIVATIONS = {
         ActivationType.Swiglu,
         ActivationType.Relu2,
     }
+    #: Every BF16 cubin has tileM 128 and tileK 128 (or 64). The hidden size is
+    #: gemm1's K and gemm2's M; each rank's intermediate shard is gemm2's K and
+    #: (half of) gemm1's M. Both must be multiples of this, or no cubin applies.
+    _SHAPE_ALIGNMENT = 128
+    #: The routing kernels' limits (``runner.cu``, ``RoutingCustomPolicy.cuh``).
+    _MAX_ROUTING_EXPERTS = 2048
+    _MAX_ROUTING_TOP_K = 32
 
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
@@ -76,16 +87,24 @@ class FlashinferTrtllmGenBf16Impl(TrtllmGenFusedMoEBase):
         )
 
     def _requires_separated_routing(self) -> bool:
-        """``trtllm_bf16_moe`` has no internal routing, so top-k comes from the host.
+        """Route on the host while something reads the host top-k.
 
-        The DeepSeekV3 exception stays a runtime test because routing is a
-        per-layer argument, not part of the identity: that kernel's separated
-        variant has accuracy issues, so its fused form is used instead.
+        The kernel routes from the logits, which leaves Router Replay capture,
+        ExpertStatistic, the layer-wise benchmark calibrator and
+        ``ENABLE_PERFECT_ROUTER=expert_ids`` with no top-k to read. Asked per
+        forward, because Router Replay registers its capturer after the model
+        is built.
         """
-        return not isinstance(self.routing_method, DeepSeekV3MoeRoutingMethod)
+        return (
+            get_active_route_capture() is not None
+            or ExpertStatistic.get() is not None
+            or get_calibrator().mode != CalibratorMode.NONE
+            # Read like MoE._init_perfect_router; the leaf does not run that init.
+            or os.environ.get("ENABLE_PERFECT_ROUTER") == "expert_ids"
+        )
 
     def supports_unfinalized_output(self) -> bool:
-        """``trtllm_bf16_moe`` honors ``do_finalize=False`` and returns the triple."""
+        """``bf16_moe_runner`` honors ``do_finalize=False`` and returns the triple."""
         return True
 
     def _check_configs(self) -> None:
@@ -124,16 +143,32 @@ class FlashinferTrtllmGenBf16Impl(TrtllmGenFusedMoEBase):
                 MoERejectReason.ACTIVATION_UNSUPPORTED,
                 f"{cls.__name__} only supports {supported} activations, got {p.activation}",
             )
-        # Stronger than MoEDep.FLASHINFER: the wheel has to expose the two
-        # bf16 entry points, which older ones do not.
-        if not d.env.has_dep(MoEDep.FLASHINFER_BF16_MOE):
+        # Rejected here rather than in the op, so the layer falls back to
+        # another backend instead of failing at warmup.
+        if p.hidden_size is not None and p.hidden_size % cls._SHAPE_ALIGNMENT != 0:
             return _reject(
-                MoERejectReason.DEP_MISSING,
-                f"{cls.__name__} requires FlashInfer fused MoE with trtllm_bf16_moe support.",
+                MoERejectReason.SHAPE_UNALIGNED,
+                f"{cls.__name__} requires hidden_size ({p.hidden_size}) to be a "
+                f"multiple of {cls._SHAPE_ALIGNMENT}",
             )
-        # ``trtllm_bf16_moe`` constrains only the intermediate dimension: each
-        # rank's shard has to be a multiple of 128.
-        return check_flashinfer_shard_alignment(cls, p, d, weight_alignment=128)
+        if d.num_slots > cls._MAX_ROUTING_EXPERTS:
+            return _reject(
+                MoERejectReason.ROUTING_UNSUPPORTED,
+                f"{cls.__name__} routes at most {cls._MAX_ROUTING_EXPERTS} experts, "
+                f"got {d.num_slots} slots",
+            )
+        if p.top_k is not None and p.top_k > cls._MAX_ROUTING_TOP_K:
+            return _reject(
+                MoERejectReason.ROUTING_UNSUPPORTED,
+                f"{cls.__name__} routes at most top_k={cls._MAX_ROUTING_TOP_K}, got {p.top_k}",
+            )
+        if p.top_k is not None and p.top_k >= d.num_slots:
+            return _reject(
+                MoERejectReason.ROUTING_UNSUPPORTED,
+                f"{cls.__name__} needs more expert slots than top_k, got "
+                f"{d.num_slots} slots for top_k={p.top_k}",
+            )
+        return check_intermediate_shard_alignment(cls, p, d, weight_alignment=cls._SHAPE_ALIGNMENT)
 
     def _get_quant_method(self) -> object:
         return BF16TRTLLMGenFusedMoEMethod()
@@ -171,9 +206,9 @@ class FlashinferTrtllmGenBf16Impl(TrtllmGenFusedMoEBase):
             topk_ids=k.token_selected_experts,
             gated_act_type=to_trtllm_gen_act_type(self.activation_type),
             output=k.moe_output,
-            use_shuffled_weight=getattr(self.quant_method, "use_shuffled_weight", False),
-            weight_layout=getattr(self.quant_method, "weight_layout", 0),
             do_finalize=k.do_finalize,
+            tune_max_num_tokens=self.max_num_tokens,
+            use_dp=self.use_dp,
         )
         if not k.do_finalize:
             return self._unfinalized(result)
