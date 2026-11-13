@@ -455,10 +455,11 @@ def should_skip_trtllm(
             and not is_restored_relu2_seq8_case
         ):
             return (
-                f"[Potential Bug] TRTLLMGenFusedMoE NVFP4 with large model config"
+                f"TRTLLMGenFusedMoE NVFP4 seq_len=8 with large model config "
                 f"(num_experts={num_experts}, top_k={model_config.top_k}, "
-                f"hidden_size={model_config.hidden_size}, intermediate_size={model_config.intermediate_size})"
-                f"and seq_len=8: flaky happen tactics failure with tactic[24] and tactic[28]"
+                f"hidden_size={model_config.hidden_size}, intermediate_size={model_config.intermediate_size}) "
+                "is not yet validated on B200/B300; lift it per configuration once all tactics "
+                "pass the accuracy check"
             )
         # Issue: NVFP4 with large expert count + large hidden_size
         # has a single FP4BlockScaleMoERunner tactic with accuracy failure.

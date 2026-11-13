@@ -1324,6 +1324,9 @@ def test_trtllm_nvfp4_seq8_skip(
         assert skip_reason is not None and "seq_len=8" in skip_reason
     else:
         assert skip_reason is None
+        assert params["model_configs"][0] in MOE_MODEL_CONFIGS
+        assert params["seq_lens"][0] in SEQ_LENS_TO_TEST
+        assert params["dtypes"][0] in DTYPES_TO_TEST
         monkeypatch.setattr(sys.modules[__name__], "MOE_MODEL_CONFIGS", params["model_configs"])
         monkeypatch.setattr(sys.modules[__name__], "SEQ_LENS_TO_TEST", params["seq_lens"])
         monkeypatch.setattr(sys.modules[__name__], "DTYPES_TO_TEST", params["dtypes"])
