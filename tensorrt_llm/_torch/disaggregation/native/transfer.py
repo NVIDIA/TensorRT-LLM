@@ -3657,8 +3657,16 @@ class Receiver(ReceiverBase):
         else:
             return self._sender_ep_instance_map[info_endpoint]
 
-    def send_cancel_to_senders(self, unique_rid: int, sender_endpoints: set[str]) -> set[str]:
-        """Notify senders and return the endpoints whose cancel message was sent."""
+    def send_cancel_to_senders(
+        self, unique_rid: int, sender_endpoints: set[str], *, nonblocking: bool = False
+    ) -> set[str]:
+        """Notify senders and return only successfully queued endpoints.
+
+        Args:
+            unique_rid: Immutable receive identity.
+            sender_endpoints: Writers that still need cancellation notification.
+            nonblocking: Leave backpressured endpoints unsent for later progress.
+        """
         message = [MessageType.CANCEL_SESSION, str(unique_rid).encode("ascii")]
         session = self._get_session(unique_rid)
         if session is not None and session._enforce_physical_ownership:
@@ -3669,7 +3677,12 @@ class Receiver(ReceiverBase):
         sent = set()
         for endpoint in sender_endpoints:
             try:
-                self._get_or_connect_dealer(endpoint).send(message)
+                dealer = self._get_or_connect_dealer(endpoint)
+                if nonblocking:
+                    if not dealer.try_send(message):
+                        continue
+                else:
+                    dealer.send(message)
                 sent.add(endpoint)
             except Exception as e:
                 logger.warning(f"send_cancel_to_senders: failed for rid={unique_rid}: {e}")
@@ -4507,17 +4520,36 @@ class RxSession(RxSessionBase):
         with self.lock:
             return set(self._sender_endpoints)
 
-    def notify_cancel(self, sender_endpoints: Optional[set[str]] = None) -> None:
-        with self._publication_lock:
+    def notify_cancel(
+        self, sender_endpoints: Optional[set[str]] = None, *, nonblocking: bool = False
+    ) -> None:
+        """Notify writers after publication, retaining unsent endpoints for retry.
+
+        Args:
+            sender_endpoints: Explicit targets or the session's published writers.
+            nonblocking: Do not wait for publication serialization or socket capacity.
+        """
+        if not self._publication_lock.acquire(blocking=not nonblocking):
+            return
+        try:
             if sender_endpoints is None:
                 sender_endpoints = self.capture_cancel_targets()
             if self._enforce_physical_ownership:
                 with self.lock:
                     self._cancel_notification_started = True
                 sender_endpoints = sender_endpoints - self._cancelled_sender_endpoints
-            sent = self._receiver.send_cancel_to_senders(self.disagg_request_id, sender_endpoints)
+            if nonblocking:
+                sent = self._receiver.send_cancel_to_senders(
+                    self.disagg_request_id, sender_endpoints, nonblocking=True
+                )
+            else:
+                sent = self._receiver.send_cancel_to_senders(
+                    self.disagg_request_id, sender_endpoints
+                )
             if self._enforce_physical_ownership and sent:
                 self._cancelled_sender_endpoints.update(sent)
+        finally:
+            self._publication_lock.release()
 
     def process_session_quiesced(self, peer_rank: int) -> None:
         """Settle missing pieces only after every published candidate fences writes."""
@@ -4931,7 +4963,7 @@ class TransferWorker:
         """Forward fatal evidence while rooting all worker-owned resources.
 
         Args:
-            event: Immutable deadline decision; never authorizes resource release.
+            event: Immutable physical-retirement failure; never authorizes resource release.
         """
         callback = self._config.quiescence_fatal_callback
         assert callback is not None
@@ -4985,6 +5017,16 @@ class TransferWorker:
     def prepare_rank_info(self, request: LlmRequest) -> None:
         """Authenticate and cache the context peer without publishing receive buffers."""
         self._receiver._get_sender_info(request.py_disaggregated_params)
+
+    def fail_receive_retirement(self, request_id: int, reason: str) -> None:
+        """Contain a retained receive that cannot enroll in physical ownership.
+
+        Args:
+            request_id: Exact destination request retained by the transceiver.
+            reason: Description of the failed ownership handoff.
+        """
+        assert self._retirement_watchdog is not None
+        self._retirement_watchdog.fail_closed(request_id, "receive", reason)
 
     def create_rx_session(self, request: LlmRequest) -> RxSession:
         params = request.py_disaggregated_params

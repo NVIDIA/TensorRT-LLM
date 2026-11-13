@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from abc import ABC, abstractmethod
 from threading import Event, Lock, Thread
 from typing import Callable, Optional
@@ -124,6 +127,26 @@ class ZMQMessenger(MessengerInterface):
             self._socket.send_multipart([recipient] + messages)
         else:
             self._socket.send_multipart(messages)
+
+    def try_send(self, messages: list[bytes]) -> bool:
+        """Queue one DEALER message without waiting for transport capacity.
+
+        Args:
+            messages: Complete multipart message to queue.
+
+        Returns:
+            False on backpressure; the caller retains responsibility for retry.
+
+        Raises:
+            ValueError: The messenger is not a DEALER socket.
+        """
+        if self._mode != "DEALER":
+            raise ValueError("try_send requires a DEALER socket")
+        try:
+            self._socket.send_multipart(messages, flags=zmq.DONTWAIT)
+        except zmq.Again:
+            return False
+        return True
 
     def receive(self, timeout_ms: Optional[int] = None) -> list[bytes]:
         if timeout_ms is not None and not self._socket.poll(timeout_ms, zmq.POLLIN):

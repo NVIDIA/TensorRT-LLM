@@ -23,6 +23,7 @@ from ..pyexecutor.kv_cache.mamba_cache_manager import (
     MambaHybridCacheManagerV2, MixedMambaHybridCacheManager)
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import KVCacheManager
+from .orchestration.cancellation import ReceiveCancellation
 
 CacheTransceiverCpp = tensorrt_llm.bindings.internal.batch_manager.CacheTransceiver
 AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
@@ -440,22 +441,45 @@ class KvCacheTransceiver(ABC):
     def cancel_gen_logically(
             self,
             req: LlmRequest,
-            ready: Optional["torch.cuda.Event"] = None) -> bool:
-        """Accept logical GEN cancellation without authorizing memory release.
+            ready: Optional["torch.cuda.Event"] = None,
+            *,
+            prior_failure: bool = False) -> ReceiveCancellation:
+        """Close GEN publication and return its logical cancellation disposition.
 
         Args:
             req: Model-idle generation request to cancel.
             ready: Unpublished destination's outstanding admission fence, if any.
+            prior_failure: An executor failure that preceded cancellation.
 
         Returns:
-            Whether cancellation was accepted under a qualified retirement policy.
-            The caller must still use cancel_request to establish safe retirement.
-            Under that policy, the transceiver retains a passed ready fence until
-            cancel_request returns True, even if an earlier failure makes this
-            method return False. Unsupported implementations return False without
-            taking ownership of ready.
+            NOT_HANDLED leaves ready with the caller. PENDING, CANCELLED and
+            FAILED retain it under the runtime's physical-retirement policy.
+            Repeated calls preserve a committed result, including prior failure.
+            The caller must use cancel_request separately for release permission.
+            The receive owner alone writes py_kv_receive_cancel_outcome, once
+            after successful owner closure, as a duplicate-call tombstone. That
+            field is not independent access-end evidence. Only the executor
+            applies this disposition to LlmRequest.state.
+        """
+        return ReceiveCancellation.NOT_HANDLED
+
+    def supports_group_receive_cancellation(self) -> bool:
+        """Whether this runtime binds owned access, immutable IDs and shared progress.
+
+        This rank-uniform capability permits cancellation agreement in the
+        existing receive-progress collective. It does not qualify a new profile.
         """
         return False
+
+    def take_receive_cancellation_intents(self) -> dict[int, bool]:
+        """Take peer intent observed by the existing receive-progress exchange.
+
+        Returns:
+            Immutable transfer IDs mapped to prior failure, not release evidence.
+            The coordinator must close local publication and supply a real local
+            cancellation vote, including any unpublished readiness fence it owns.
+        """
+        return {}
 
     def supports_inflight_request_cancellation(self) -> bool:
         """Return True when in-flight transfers can be cancelled safely."""
