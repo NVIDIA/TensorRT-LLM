@@ -165,7 +165,7 @@ TEST(KvCacheManagerV2SmallObjectPoolTest, AllocatorBypassesLargeAndOverAlignedAr
 }
 
 // makeShared pools a small object's control block and keeps an over-aligned object (a tree block's
-// digest key) aligned through the class-scope aligned operator new.
+// digest key) aligned by taking its control block from the aligned heap.
 TEST(KvCacheManagerV2SmallObjectPoolTest, MakeSharedKeepsObjectAlignment)
 {
     std::vector<SharedPtr<DigestLike>> digests;

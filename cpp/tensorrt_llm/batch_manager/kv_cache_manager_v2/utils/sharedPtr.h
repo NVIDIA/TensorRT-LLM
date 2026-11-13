@@ -124,39 +124,32 @@ struct InplaceControlBlock final : ControlBlockBase
         ptr()->~T();
     }
 
+    // Pages, page holders and page locks come and go by the thousand per claim and release, so their
+    // control blocks come from the small-object pool. Over-aligned ones (a tree block's digest key)
+    // and large ones come from the aligned heap.
+    static InplaceControlBlock* create()
+    {
+        void* mem = nullptr;
+        if constexpr (pooled())
+            mem = poolAllocate(sizeof(InplaceControlBlock));
+        else
+            mem = ::operator new(sizeof(InplaceControlBlock), std::align_val_t{alignof(InplaceControlBlock)});
+        return ::new (mem) InplaceControlBlock();
+    }
+
     void deallocate() noexcept override
     {
-        delete this;
-    }
-
-    // Pages, page holders and page locks come and go by the thousand per claim and release.
-    static void* operator new(size_t size)
-    {
-        if constexpr (poolServes(sizeof(InplaceControlBlock), alignof(InplaceControlBlock)))
-            return poolAllocate(size);
+        this->~InplaceControlBlock();
+        if constexpr (pooled())
+            poolDeallocate(this, sizeof(InplaceControlBlock));
         else
-            return ::operator new(size);
+            ::operator delete(this, std::align_val_t{alignof(InplaceControlBlock)});
     }
 
-    static void operator delete(void* ptr, size_t size) noexcept
+private:
+    static constexpr bool pooled() noexcept
     {
-        if constexpr (poolServes(sizeof(InplaceControlBlock), alignof(InplaceControlBlock)))
-            poolDeallocate(ptr, size);
-        else
-            ::operator delete(ptr);
-    }
-
-    // Over-aligned control blocks (a tree block's digest key) are not pooled. The class-scope
-    // operator new above hides the global aligned forms, so restore them.
-    static void* operator new(size_t size, std::align_val_t align)
-    {
-        return ::operator new(size, align);
-    }
-
-    // The global sized forms need -fsized-deallocation, which clang before 19 leaves off.
-    static void operator delete(void* ptr, size_t, std::align_val_t align) noexcept
-    {
-        ::operator delete(ptr, align);
+        return poolServes(sizeof(InplaceControlBlock), alignof(InplaceControlBlock));
     }
 };
 
@@ -631,16 +624,16 @@ private:
 template <typename T, typename... Args>
 SharedPtr<T> makeShared(Args&&... args)
 {
-    auto* cb = new detail::InplaceControlBlock<T>();
+    auto* cb = detail::InplaceControlBlock<T>::create();
     try
     {
         new (cb->storage) T(std::forward<Args>(args)...);
     }
     catch (...)
     {
-        // T's constructor threw — control block was never fully initialized.
-        // Release directly; destroyObject() must not run.
-        delete cb;
+        // T's constructor threw, so there is no T to destroy: free the control block only,
+        // without destroyObject().
+        cb->deallocate();
         throw;
     }
 
