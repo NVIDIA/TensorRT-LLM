@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import os
 import subprocess
 import time
@@ -100,14 +103,19 @@ def wait_for_endpoint_ready(
     )
 
 
-def wait_for_endpoint_down(url: str, timeout: int = 300):
-    start = time.monotonic()
-    while time.monotonic() - start < timeout:
+def wait_for_endpoint_down(url: str, timeout: int = 300, required_failures: int = 10):
+    """Wait until ``url`` fails ``required_failures`` consecutive probes."""
+    deadline = time.monotonic() + timeout
+    consecutive_failures = 0
+    while time.monotonic() < deadline:
         try:
-            if requests.get(url, timeout=5).status_code >= 100:
-                print(f"endpoint {url} returned status code {requests.get(url).status_code}")
-                time.sleep(1)
-        except Exception as err:
-            print(f"endpoint {url} is down, with exception: {err}")
-            return
+            status_code = requests.get(url, timeout=5).status_code
+            consecutive_failures = 0
+            print(f"endpoint {url} returned status code {status_code}")
+        except requests.RequestException as err:
+            consecutive_failures += 1
+            if consecutive_failures >= required_failures:
+                print(f"endpoint {url} is down, with exception: {err}")
+                return
+        time.sleep(1)
     raise RuntimeError(f"Endpoint {url} did not become down within {timeout} seconds")
