@@ -20,7 +20,9 @@ from transformers import (
     LlamaConfig,
     MistralConfig,
     Phi3Config,
+    PretrainedConfig,
     Qwen2Config,
+    Qwen3_5MoeTextConfig,
     Qwen3Config,
     Qwen3MoeConfig,
 )
@@ -721,6 +723,41 @@ def _qwen3_moe_hf_config(**overrides: object) -> Qwen3MoeConfig:
     return Qwen3MoeConfig(**values)
 
 
+def _qwen3_30b_a3b_expert_config() -> Qwen3MoeConfig:
+    # The Qwen3-30B-A3B expert shapes: 128 experts, top-8, MoE intermediate size 768.
+    return _qwen3_moe_hf_config(
+        hidden_size=2048,
+        moe_intermediate_size=768,
+        num_experts=128,
+        num_experts_per_tok=8,
+    )
+
+
+_QWEN3_5_MOE_PROFILE_ID = "qwen3_5-moe-for-conditional-generation-bf16-cutlass-complete-v1"
+
+
+def _qwen3_5_35b_a3b_expert_config() -> PretrainedConfig:
+    # The Qwen3.5-35B-A3B language-model expert shapes: 256 experts, top-8,
+    # MoE and shared-expert intermediate size 512.
+    return Qwen3_5MoeTextConfig(
+        hidden_size=2048,
+        moe_intermediate_size=512,
+        shared_expert_intermediate_size=512,
+        num_experts=256,
+        num_experts_per_tok=8,
+        torch_dtype=torch.bfloat16,
+    )
+
+
+# The language-model config, at its canary's expert shapes, that each qualified
+# MoE profile resolves its pinned MoE backend literal with. Every MoE profile
+# needs an entry.
+_MOE_PROFILE_CANARY_CONFIGS: dict[str, Callable[[], PretrainedConfig]] = {
+    _QWEN3_MOE_PROFILE_ID: _qwen3_30b_a3b_expert_config,
+    _QWEN3_5_MOE_PROFILE_ID: _qwen3_5_35b_a3b_expert_config,
+}
+
+
 # `_tiny_qwen3_moe_model` builds its routed experts on CUDA through the CUTLASS
 # leaf for unquantized weights, which supports SM80 and newer.
 _requires_cutlass_bf16_moe = pytest.mark.skipif(
@@ -1406,7 +1443,10 @@ def _documented_names(text: str, start: str, end: str, known_names: set[str]) ->
 
 
 # The documentation spells these families differently from their architecture names.
-_MX_FAMILY_DISPLAY_NAMES = {"Qwen3MoeForCausalLM": "Qwen3 MoE"}
+_MX_FAMILY_DISPLAY_NAMES = {
+    "Qwen3MoeForCausalLM": "Qwen3 MoE",
+    "Qwen3_5MoeForConditionalGeneration": "Qwen3.5 MoE",
+}
 
 
 def _documented_family(profile: PostTransformProfile) -> str:
@@ -1455,6 +1495,11 @@ _MX_E2E_ROWS = {
         "qwen3-moe-bf16",
         "qwen3-moe",
         "TRTLLM_MX_QWEN3_MOE_MODEL",
+    ),
+    "qwen3_5-moe-for-conditional-generation-bf16-cutlass-complete-v1": (
+        "qwen3_5-moe-bf16",
+        "qwen3_5-moe",
+        "TRTLLM_MX_QWEN3_5_MOE_MODEL",
     ),
     "qwen3-for-causal-lm-fp8-block-sm90-target-v1": (
         "qwen3-fp8-block",
@@ -3301,32 +3346,30 @@ def test_moe_profile_backend_literals_realize_one_implementation(
         for profile in ModelLoader._post_transform_profile_registry().profiles
         if profile.runtime_constraints.moe_backends is not None
     ]
-    assert [profile.profile_id for profile in moe_profiles] == [_QWEN3_MOE_PROFILE_ID], (
-        "extend this test with the new MoE profile's model configuration"
+    assert {profile.profile_id for profile in moe_profiles} == set(_MOE_PROFILE_CANARY_CONFIGS), (
+        "add the new MoE profile's canary config to `_MOE_PROFILE_CANARY_CONFIGS`"
     )
-    constraints = moe_profiles[0].runtime_constraints
-    assert constraints.quant_algorithms == frozenset({"none"})
-    for moe_backend in constraints.moe_backends:
-        model_config = ModelConfig(
-            # The Qwen3-30B-A3B expert shapes: 128 experts, top-8, MoE intermediate size 768.
-            pretrained_config=_qwen3_moe_hf_config(
-                hidden_size=2048,
-                moe_intermediate_size=768,
-                num_experts=128,
-                num_experts_per_tok=8,
-            ),
-            mapping=mapping_mod.Mapping(**mapping_kwargs),
-            moe_backend=moe_backend,
-        )
-        # Every optional dependency is present, so a candidate that only a missing
-        # wheel keeps out of the running still counts.
-        environment = MoEEnvironment(sm=sm, available_deps=tuple(dep.value for dep in MoEDep))
-        with override_moe_environment(environment):
-            report = resolve_moe_impl(model_config)
+    mapping = mapping_mod.Mapping(**mapping_kwargs)
+    # Every optional dependency is present, so a candidate that only a missing
+    # wheel keeps out of the running still counts.
+    environment = MoEEnvironment(sm=sm, available_deps=tuple(dep.value for dep in MoEDep))
+    for profile in moe_profiles:
+        constraints = profile.runtime_constraints
+        assert constraints.quant_algorithms == frozenset({"none"})
+        if mapping.tp_size not in constraints.tp_sizes:
+            continue
+        for moe_backend in constraints.moe_backends:
+            model_config = ModelConfig(
+                pretrained_config=_MOE_PROFILE_CANARY_CONFIGS[profile.profile_id](),
+                mapping=mapping,
+                moe_backend=moe_backend,
+            )
+            with override_moe_environment(environment):
+                report = resolve_moe_impl(model_config)
 
-        assert report.eligible == (TrtllmCutlassUnquantizedImpl.__name__,)
-        assert report.winner == TrtllmCutlassUnquantizedImpl.__name__
-        assert not report.degraded
+            assert report.eligible == (TrtllmCutlassUnquantizedImpl.__name__,), profile.profile_id
+            assert report.winner == TrtllmCutlassUnquantizedImpl.__name__
+            assert not report.degraded
 
 
 @pytest.mark.cpu_only
