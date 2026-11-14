@@ -10,7 +10,11 @@ import torch
 from torch import nn
 
 from ..models.modeling_utils import timing_metric
-from ..nccl_window_graph import abandon_nccl_window_graph_owner, release_nccl_window_graph_owner
+from ..nccl_window_graph import (
+    abandon_nccl_window_graph_owner,
+    promote_synchronized_nccl_window_releases,
+    release_nccl_window_graph_owner,
+)
 from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from ..utils import make_weak_ref
 from .breakable_cuda_graph import (
@@ -124,6 +128,7 @@ class BreakableCUDAGraphRunner:
         if num_tokens in self._graphs:
             raise ValueError(f"BCG for num_tokens={num_tokens} is already captured")
 
+        promote_synchronized_nccl_window_releases()
         current_stream = torch.cuda.current_stream()
         self._capture_stream.wait_stream(current_stream)
         graph = None

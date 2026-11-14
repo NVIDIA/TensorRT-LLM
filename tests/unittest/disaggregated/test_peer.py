@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import ANY, Mock
 
 import numpy as np
 import pytest
@@ -741,7 +741,7 @@ def test_receiver_rejects_view_mismatch_before_registration(
         assert messenger_factory.call_count == 2  # Receiver listener and one info lookup.
         receiver._request_sender_data.assert_not_called()
         messengers[bad_endpoint].send.assert_called_once_with([MessageType.REQUEST_INSTANCE_INFO])
-        messengers[bad_endpoint].receive.assert_called_once_with()
+        messengers[bad_endpoint].receive.assert_called_once_with(timeout_ms=ANY)
         messengers[bad_endpoint].stop.assert_called_once_with()
         with pytest.raises(KeyError):
             registrar.get_peer_rank_info(bad_ri.instance_name, bad_ri.instance_rank)
@@ -756,7 +756,7 @@ def test_receiver_rejects_view_mismatch_before_registration(
         )
         assert receiver._get_sender_info(good_params) is sender_info
         assert messenger_factory.call_count == 4  # One more info lookup and one sender dealer.
-        messengers[good_endpoint].receive.assert_called_once_with()
+        messengers[good_endpoint].receive.assert_called_once_with(timeout_ms=ANY)
         with pytest.raises(KeyError):
             registrar.get_peer_rank_info(good_ri.instance_name, good_ri.instance_rank)
     finally:
@@ -1874,32 +1874,50 @@ def test_peer_registrar_requires_matching_unified_draft_layers(
 
 
 @pytest.mark.parametrize(
-    ("peer_tp_size", "peer_kv_heads", "peer_attention_dp"),
-    [(4, 1, False), (2, 2, True)],
-    ids=["tp_mismatch", "attention_dp_mismatch"],
+    ("self_kwargs", "peer_kwargs", "compatible"),
+    [
+        # GQA draft layers carry the target's per-rank heads, which differ here.
+        ({"tp_size": 1, "kv_heads_per_rank": 2}, {"tp_size": 2, "kv_heads_per_rank": 1}, False),
+        # Attention DP keeps every head on each rank at any TP size.
+        (
+            {"tp_size": 1, "kv_heads_per_rank": 2, "enable_attention_dp": True},
+            {"tp_size": 4, "dp_size": 4, "kv_heads_per_rank": 2, "enable_attention_dp": True},
+            True,
+        ),
+        # A K-only (MLA) cache holds the whole latent on every rank.
+        (
+            {"tp_size": 1, "kv_heads_per_rank": 1, "is_mla": True},
+            {"tp_size": 4, "kv_heads_per_rank": 1, "is_mla": True},
+            True,
+        ),
+    ],
+    ids=["gqa_different_attention_tp", "attention_dp", "mla"],
 )
-def test_peer_registrar_accepts_unified_draft_layers_across_tp_and_attention_dp(
-    peer_tp_size: int, peer_kv_heads: int, peer_attention_dp: bool
+def test_peer_registrar_shares_draft_layers_when_heads_per_rank_agree(
+    self_kwargs: dict, peer_kwargs: dict, compatible: bool
 ) -> None:
-    """Peers sharing draft KV register across a TP or attention-DP mismatch; the views reshard."""
-    self_rankinfo = make_rankinfo(instance_name="local")
-    self_rankinfo.num_draft_layers = 1
+    def mamba_tp(kwargs: dict) -> int:
+        # The synthetic recurrent state is sharded by TP unless attention DP.
+        return 1 if kwargs.get("enable_attention_dp") else kwargs["tp_size"]
+
+    self_rankinfo = make_rankinfo(
+        instance_name="local",
+        page_table=make_page_table(mamba_tp=mamba_tp(self_kwargs)),
+        **self_kwargs,
+    )
+    self_rankinfo.num_draft_layers = 5
     reg = _make_peer_registrar(self_rankinfo)
     peer_ri = make_rankinfo(
         instance_name="peer",
         instance_rank=1,
-        tp_size=peer_tp_size,
-        kv_heads_per_rank=peer_kv_heads,
-        enable_attention_dp=peer_attention_dp,
         layer_num_per_pp=[2],
-        # Same bytes per KV head as the local side's 2 heads in 1024-byte blocks.
-        page_table=make_page_table(
-            block_bytes=[512 * peer_kv_heads],
-            mamba_tp=1 if peer_attention_dp else peer_tp_size,
-            kv_heads=peer_kv_heads,
-        ),
+        page_table=make_page_table(mamba_tp=mamba_tp(peer_kwargs)),
+        **peer_kwargs,
     )
-    peer_ri.num_draft_layers = 1
-
+    peer_ri.num_draft_layers = 5
+    if not compatible:
+        with pytest.raises(ValueError, match="same attention TP size"):
+            reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+        return
     reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
     assert reg.get_peer_rank_info("peer", 1) == peer_ri

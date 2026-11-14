@@ -14,6 +14,7 @@
 # limitations under the License.
 """A standalone DSpark drafter's layers as explicit draft layer specs of the MiniMax-M3 manager."""
 
+import functools
 import re
 from dataclasses import replace
 from types import SimpleNamespace
@@ -25,6 +26,7 @@ import torch
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.cache_manager import (
     MiniMaxM3KVCacheManagerV2,
 )
+from tensorrt_llm._torch.models.modeling_dflash import DFlashForCausalLM
 from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheLayerOwner,
@@ -792,6 +794,9 @@ def _dspark_creator(*, is_disagg: bool, context_kernel: bool = False) -> KvCache
     draft.pretrained_config.sliding_window = 4096
     # A drafter that cannot report its lowerings is assumed to need the context kernel.
     drafter = SimpleNamespace(dflash_attention_backend="TRTLLM")
+    drafter.reads_managed_ctx_pages = functools.partial(
+        DFlashForCausalLM.reads_managed_ctx_pages, drafter
+    )
     if not context_kernel:
         drafter.validate_block_attention_windows = (
             lambda: ["causal decode + future-block merge"] * 2
@@ -996,7 +1001,7 @@ _GATE_CASES = [
         "1",
         dict(plain_v2=True, nvfp4_target=False),
         False,
-        "tokens_per_block is 128",
+        "tokens_per_block=128",
     ),
     # An NVFP4 target pairs with a BF16 draft in transfer only when the draft has pools of its own.
     (

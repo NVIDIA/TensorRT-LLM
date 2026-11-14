@@ -1113,6 +1113,24 @@ def test_post_processor_hook_rejected_with_skip_tokenizer_init():
 class TestModelDefaults:
     """Test suite for model-specific default overrides functionality."""
 
+    @pytest.mark.parametrize("key", [None, b"deployment-key"])
+    def test_model_defaults_preserve_private_transceiver_key(self, key):
+        config = CacheTransceiverConfig(backend="NIXL",
+                                        transceiver_runtime="PYTHON")
+        config._rank_info_auth_key = key
+        args = TorchLlmArgs(model="/tmp/dummy_model",
+                            cache_transceiver_config=config)
+
+        applied = apply_model_defaults_to_llm_args(
+            args, {"enable_chunked_prefill": False})
+
+        assert applied == {"enable_chunked_prefill": False}
+        assert args.cache_transceiver_config._rank_info_auth_key == key
+        assert args.cache_transceiver_config.backend == "NIXL"
+        assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+        assert "_rank_info_auth_key" not in args.model_dump(
+        )["cache_transceiver_config"]
+
     def test_compute_applied_llm_defaults_simple_field(self):
         model_defaults = {"enable_chunked_prefill": False}
         llm_args = TorchLlmArgs(model="/tmp/dummy_model")
@@ -3645,6 +3663,7 @@ class TestTorchLlmArgs:
     @pytest.mark.cpu_only
     def test_dynamic_setattr(self):
         with pytest.raises(pydantic_core._pydantic_core.ValidationError):
+            # pyrefly: ignore [unexpected-keyword]
             args = TorchLlmArgs(model=llama_model_path, invalid_arg=1)
 
         with pytest.raises(ValueError):
@@ -3975,8 +3994,10 @@ class TestStrictBaseModelArbitraryArgs:
         # Arbitrary arguments should be rejected
         with pytest.raises(
                 pydantic_core._pydantic_core.ValidationError) as exc_info:
-            TorchLlmArgs(model=llama_model_path,
-                         unsupported_option="should_fail")
+            TorchLlmArgs(
+                model=llama_model_path,
+                # pyrefly: ignore [unexpected-keyword]
+                unsupported_option="should_fail")
         assert "unsupported_option" in str(exc_info.value)
 
     def test_nested_config_arbitrary_args(self):

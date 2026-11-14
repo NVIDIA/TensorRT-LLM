@@ -145,7 +145,12 @@ def executor(monkeypatch: pytest.MonkeyPatch) -> PyExecutor:
     engine.is_encoder_decoder = False
     engine._mm_encoder_item_scheduling_enabled = False
     engine.dist = SimpleNamespace(
-        rank=0, tp_size=1, pp_size=1, world_size=1, mapping=SimpleNamespace(tp_group=[0])
+        rank=0,
+        tp_size=1,
+        pp_size=1,
+        world_size=1,
+        mapping=SimpleNamespace(tp_group=[0]),
+        tp_allreduce=lambda value, op=None: value,
     )
     engine.executor_request_queue = ExecutorRequestQueue(
         dist=engine.dist, max_batch_size=8, enable_iter_perf_stats=False, batch_wait_timeout_ms=0.0
@@ -160,7 +165,9 @@ def executor(monkeypatch: pytest.MonkeyPatch) -> PyExecutor:
     engine.model_engine = SimpleNamespace(wait_for_input_copy=Mock(), is_spec_decode=False)
     engine.draft_model_engine = None
     engine._maybe_record_hang_diagnostic_phase = Mock()
-    engine.async_transfer_manager = SimpleNamespace(requests_in_transfer=lambda: {})
+    engine.async_transfer_manager = SimpleNamespace(
+        requests_in_transfer=lambda: {}, has_any_inflight_requests=lambda: False
+    )
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._fp4_mla_bridge_enabled = True
     transceiver._ever_had_recv_session = False

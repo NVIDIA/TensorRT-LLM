@@ -24,6 +24,7 @@ from tensorrt_llm.serve.openai_protocol import ConversationParams
 
 def test_openai_conversation_params_requires_conversation_id():
     with pytest.raises(ValidationError):
+        # pyrefly: ignore [missing-argument]
         ConversationParams()
 
 

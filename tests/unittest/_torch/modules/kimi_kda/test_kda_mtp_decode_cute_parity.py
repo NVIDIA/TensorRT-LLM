@@ -453,8 +453,6 @@ def _fla_sequential_reference(data, num_accepted):
                 xk = data["cs_k"][n, :, W - 1 + i_t].float()
                 xv = data["cs_v"][n, :, W - 1 + i_t].float()
                 tok = None
-                g_t = data["g_cache"][n, i_t].float()
-                beta_t = data["beta_cache"][n, i_t].float()
                 replay = True
             else:
                 tok = bos + i_t
@@ -475,6 +473,8 @@ def _fla_sequential_reference(data, num_accepted):
             if replay:
                 # Replayed tokens use the cached post-processed k/g/v/beta
                 # exactly as the kernel does (delta rule applied directly).
+                g_t = data["g_cache"][n, i_t].float()
+                beta_t = data["beta_cache"][n, i_t].float()
                 k_t = data["k_cache"][n, i_t].float().view(H, K)
                 gk_t = g_t.view(H, K)
                 v_t = data["v_cache"][n, i_t].float().view(H, V)
