@@ -4147,7 +4147,11 @@ class KVCacheManagerV2(BaseResourceManager):
         )
 
     def _copy_idx_to_device(self, copy_idx: torch.Tensor) -> torch.Tensor:
-        self._device_copy_idx_staging[: copy_idx.size(0)].copy_(copy_idx, non_blocking=True)
+        copy_idx_snapshot = torch.empty_like(copy_idx, pin_memory=prefer_pinned())
+        copy_idx_snapshot.copy_(copy_idx)
+        self._device_copy_idx_staging[: copy_idx.size(0)].copy_(
+            copy_idx_snapshot, non_blocking=True
+        )
         return self._device_copy_idx_staging
 
     def _copy_scratch_metadata_to_device(
@@ -4155,9 +4159,9 @@ class KVCacheManagerV2(BaseResourceManager):
         request_ids: List[int],
         num_contexts: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        host_begs = self._host_scratch_begs_staging[:, :num_contexts]
-        host_ends = self._host_scratch_ends_staging[:, :num_contexts]
-        host_slots = self._host_scratch_slots_staging[:, :num_contexts, :]
+        host_begs = torch.empty_like(self._host_scratch_begs_staging, pin_memory=prefer_pinned())
+        host_ends = torch.empty_like(self._host_scratch_ends_staging, pin_memory=prefer_pinned())
+        host_slots = torch.empty_like(self._host_scratch_slots_staging, pin_memory=prefer_pinned())
         host_begs.zero_()
         host_ends.zero_()
         host_slots.zero_()
@@ -4179,15 +4183,15 @@ class KVCacheManagerV2(BaseResourceManager):
                     host_slots[pool_id, context_idx, slot_idx] = int(slot_id)
 
         self._device_scratch_begs_staging.copy_(
-            self._host_scratch_begs_staging,
+            host_begs,
             non_blocking=True,
         )
         self._device_scratch_ends_staging.copy_(
-            self._host_scratch_ends_staging,
+            host_ends,
             non_blocking=True,
         )
         self._device_scratch_slots_staging.copy_(
-            self._host_scratch_slots_staging,
+            host_slots,
             non_blocking=True,
         )
         return (
@@ -4205,8 +4209,13 @@ class KVCacheManagerV2(BaseResourceManager):
         num_seqs: int,
     ) -> None:
         device_copy_idx = self._copy_idx_to_device(copy_idx)
-        self._device_kv_cache_block_offsets_input.copy_(
+        host_block_offsets_snapshot = torch.empty_like(
             self.host_kv_cache_block_offsets,
+            pin_memory=prefer_pinned(),
+        )
+        host_block_offsets_snapshot.copy_(self.host_kv_cache_block_offsets)
+        self._device_kv_cache_block_offsets_input.copy_(
+            host_block_offsets_snapshot,
             non_blocking=True,
         )
         scratch_begs, scratch_ends, scratch_slots = self._copy_scratch_metadata_to_device(
