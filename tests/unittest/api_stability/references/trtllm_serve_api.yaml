@@ -1240,7 +1240,7 @@ models:
       top_logprobs:
         kind: openai
         type: Optional[int]
-        default: 0
+        default: null
         status: stable
         required: false
       top_p:
@@ -1428,10 +1428,10 @@ models:
         required: false
       top_logprobs:
         kind: openai
-        type: int
+        type: Optional[int]
         default: null
         status: stable
-        required: true
+        required: false
       truncation:
         kind: openai
         type: Literal['auto', 'disabled']
