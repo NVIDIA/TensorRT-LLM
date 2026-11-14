@@ -20,6 +20,7 @@ from tensorrt_llm.mapping import Mapping
 
 from ..attention.backends.trtllm import TrtllmAttentionMetadata
 from ..distributed import Distributed
+from ..hostfunc import HOSTFUNC_USER_DATA_HANDLES, record_hostfunc_graph_replay
 from ..memory_buffer_utils import Buffers, get_memory_buffers
 from ..modules.multi_stream_utils import with_multi_stream
 from ..moe.expert_statistic import ExpertStatistic
@@ -299,6 +300,8 @@ class CUDAGraphRunner:
         self.graph_outputs: Dict[KeyType,
                                  Callable[[], Optional[torch.Tensor]]] = {}
         self.graph_metadata: Dict[KeyType, Dict[str, Any]] = {}
+        # Keys of the graphs that captured host functions.
+        self._hostfunc_graph_keys: set[KeyType] = set()
         self.memory_pool = None
         self.padding_dummy_requests: Dict[int, LlmRequest] = {}
         # (batch, every rank's sampling mode) when the padding exchange carried one.
@@ -960,6 +963,7 @@ class CUDAGraphRunner:
             # setup/capture; release its reference before entering.
             output = None
             graph_pool = self.memory_pool or torch.cuda.graph_pool_handle()
+            num_hostfuncs = len(HOSTFUNC_USER_DATA_HANDLES)
             with nccl_window_graph_capture(
                     graph, graph_pool, stream=self._priority_capture_stream()):
                 # A pre-replay hook reads the static inputs before the replay, so their copies must land before it.
@@ -968,6 +972,8 @@ class CUDAGraphRunner:
                 if prologue_pack is not None:
                     self._step_input_prologue_keys[key] = prologue_pack
                 output = forward_fn(capture_inputs)
+            if len(HOSTFUNC_USER_DATA_HANDLES) > num_hostfuncs:
+                self._hostfunc_graph_keys.add(key)
             # The addresses the graph baked in, for the strict buffer check.
             self._record_strict_buffer_snapshot(key)
             _restore_spec_decode_capture_state(attn_metadata,
@@ -1143,6 +1149,8 @@ class CUDAGraphRunner:
         finally:
             if prologue_pack is not None:
                 prologue_pack.on_graph_replay()
+        if key in self._hostfunc_graph_keys:
+            record_hostfunc_graph_replay()
         output_ref = self.graph_outputs[key]
 
         return output_ref
@@ -1698,6 +1706,7 @@ class CUDAGraphRunner:
         self.graphs.clear()
         self.graph_outputs.clear()
         self.graph_metadata.clear()
+        self._hostfunc_graph_keys.clear()
         self._pre_replay_position_ids = None
         self._step_input_prologue_keys.clear()
         self.reset_padding_dummies()

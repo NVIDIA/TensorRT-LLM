@@ -259,6 +259,28 @@ def test_cross_iter_prefetch_max_ahead_config_override(monkeypatch):
     assert [req.py_request_id for req, _, _ in dispatches[0]] == [1]
 
 
+@pytest.mark.parametrize("pending", [False, True])
+def test_cross_iter_prefetch_skips_while_hostfuncs_pending(monkeypatch, pending):
+    """Prefetch is skipped while host functions of a replayed graph are pending."""
+    monkeypatch.setattr(mm_mixin, "_get_mm_aux_stream", lambda *args, **kwargs: object())
+    monkeypatch.setattr(mm_mixin, "hostfuncs_pending", lambda: pending)
+
+    dispatches = []
+    monkeypatch.setattr(
+        mm_mixin,
+        "_dispatch_cross_iter_prefetch",
+        lambda model, candidates, aux_stream: dispatches.append(candidates),
+    )
+
+    model = _StubModel(hidden_size=8, tokens_per_image=4)
+    req = _make_request(request_id=0, num_tokens=4)
+
+    n = maybe_prefetch_mm_encoder_for_next_iter(model, [req], max_prefetch_ahead=1)
+
+    assert n == int(not pending)
+    assert len(dispatches) == int(not pending)
+
+
 def test_cross_iter_prefetch_max_ahead_counts_pending_event(monkeypatch):
     monkeypatch.setattr(mm_mixin, "_get_mm_aux_stream", lambda *args, **kwargs: object())
 

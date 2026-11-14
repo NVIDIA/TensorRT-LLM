@@ -666,6 +666,7 @@ def test_replay_defers_copies_only_to_its_captured_pack(monkeypatch, same_pack, 
     runner._get_num_tokens_for_key = lambda key: 1
     runner._step_input_prologue_keys = {key: captured}
     runner._pre_replay_hooks = []
+    runner._hostfunc_graph_keys = set()
 
     def replay():
         queued.append("replay")
