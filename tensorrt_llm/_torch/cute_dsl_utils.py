@@ -47,7 +47,7 @@ if platform.system() != "Windows":
     try:
         from cutlass import cute  # noqa
         _skip_legacy_cutlass_mlir_helpers()
-        logger.info(f"cutlass dsl is available")
+        logger.info("cutlass dsl is available")
         IS_CUTLASS_DSL_AVAILABLE = True
 
         try:
@@ -112,6 +112,18 @@ def install_cutlass_dsl_compatibility() -> None:
             setattr(cute.core, name, getattr(cute, name))
     if not hasattr(cute, "make_fragment") and hasattr(cute, "make_rmem_tensor"):
         cute.make_fragment = cute.make_rmem_tensor
+
+
+def load_flash_attn_cute_forward():
+    """FlashAttention-4's forward (``flash_attn.cute``) with the CuTe aliases it needs.
+
+    Raises ``ImportError``, ``OSError`` or ``AttributeError`` when the CuTe DSL interface
+    cannot be imported; callers decide whether that is fatal.
+    """
+    install_cutlass_dsl_compatibility()
+    from flash_attn.cute.interface import _flash_attn_fwd
+
+    return _flash_attn_fwd
 
 
 # SMs that a kernel resident for the whole step holds (the DWDP fabric gather;
