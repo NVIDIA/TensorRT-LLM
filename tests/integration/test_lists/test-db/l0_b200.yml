@@ -270,6 +270,12 @@ l0_b200:
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_situ_selects_padded_quant_method
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_situ_fc31_scale_c_drops_dequant_scale
   - unittest/_torch/moe/test_moe_backend.py::test_cutedsl_nvfp4_pre_quant_scale_matches_cutlass
+  # FP8 block-scale loaders and CUTLASS padding are not cpu_only, so only a GPU stage runs them.
+  - unittest/_torch/moe/test_moe_backend.py::test_fp8_block_scales_method_loads_padded_non_gated_experts
+  - unittest/_torch/moe/test_moe_backend.py::test_fp8_block_scales_method_keeps_aligned_gated_layout
+  - unittest/_torch/moe/test_moe_backend.py::test_fp8_block_scales_method_rejects_unaligned_moe_tp_shard
+  - unittest/_torch/moe/test_moe_backend.py::test_fp8_block_scales_method_rejects_short_scale_grid
+  - unittest/_torch/moe/test_moe_backend.py::test_cutlass_pads_fp8_block_scales_intermediate_on_single_moe_tp_rank
   - unittest/_torch/moe/kernels/parallel/test_cute_dsl_moe.py::test_count_native_cutedsl_matches_legacy_sort_bitwise
   # ------------- MoE: test_single_gpu (by backend) ---------------
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS and not None"

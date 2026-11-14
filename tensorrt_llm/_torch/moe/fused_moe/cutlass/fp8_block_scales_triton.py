@@ -53,14 +53,15 @@ class TrtllmTritonFp8BlockScalesImpl(CutlassFusedMoEBase):
     sm_support = SmSupport(allowed=frozenset({120, 121}))
     #: The Triton kernel is instantiated for BF16 activations only.
     supported_dtypes = BF16_ONLY
-    # Only these two gated kinds, and of the three ABI registers only the clamp:
+    # Two gated kinds and Relu2, and of the three ABI registers only the clamp:
     # the kernel takes it by value, so a per-expert clamp cannot be honoured.
     # ``clamp_after_silu`` stays unset -- the kernel clamps before the SiLU only.
     activation_support = MoEActivationSupport(
-        kinds=frozenset({ActivationType.Swiglu, ActivationType.Geglu}),
+        kinds=frozenset({ActivationType.Swiglu, ActivationType.Geglu, ActivationType.Relu2}),
         limit=ActivationParamShape.UNIFORM_SCALAR,
     )
     issues_fused_moe_op = False
+    pad_intermediate_on_single_tp_rank_to = 128
 
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
