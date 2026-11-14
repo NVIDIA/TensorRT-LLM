@@ -156,6 +156,13 @@ Key files:
 - **Integration tests need GPUs + models** — always set `LLM_MODELS_ROOT` and ensure GPU access. Unit tests don't.
 - **Copyright year** — update to current year when modifying existing files; add full header to new files.
 - **Avoid broad exception handling** — catch specific exceptions, not bare `except:` (see `CODING_GUIDELINES.md`).
+- **Avoid host syncs on per-step and per-request paths** — the CPU waits for all queued GPU work, which neither
+  the overlap scheduler nor CUDA graphs can hide. On CUDA tensors avoid `.item()`, `.tolist()`, `.cpu()` and `if t:`
+  (read the host copy instead); `torch.tensor(list, device="cuda")` and blocking `.to("cuda")` (use
+  `async_tensor_h2d` or `maybe_pin_memory` from `tensorrt_llm._utils`); boolean-mask reads and `nonzero` (use
+  `torch.where`, `masked_fill_` or a fixed `output_size`); and Python scalars written to one element or through
+  a tensor index (`t[i] = 0`, `t[idx] = 0`; use `t[i].fill_(0)` or `index_fill_`). Check new code under
+  `torch.cuda.set_sync_debug_mode("error")`.
 - **One concern per PR** — avoid scope creep. If a PR touches unrelated areas, split it.
 - **User-facing configuration classes** - when editing or defining any user-facing configuration classes (particularly `BaseLlmArgs` or any class used in its fields), you **MUST** follow the Pydantic guidelines in `CODING_GUIDELINES.md`.
 
