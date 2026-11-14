@@ -154,6 +154,7 @@ After the user selects a target version, update these files:
 | `requirements.txt` | `flashinfer-python==OLD` → `flashinfer-python==NEW` | Yes |
 | `security_scanning/pyproject.toml` | `"flashinfer-python (==OLD)"` → `"flashinfer-python (==NEW)"` | Yes |
 | `ATTRIBUTIONS-Python.md` | `## flashinfer-python (OLD)` → `## flashinfer-python (NEW)` | Yes |
+| `tensorrt_llm/_torch/_experimental/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_103__tp8/kernels/draft_front/native_norm.py` | Extend the exact-match `VERIFIED_FLASHINFER_VERSIONS` list only after the Step 5 compatibility check | Yes |
 | `security_scanning/poetry.lock` | Update `version = "OLD"` → `version = "NEW"` under `[[package]] name = "flashinfer-python"`, and update the `files` list with new hashes | Only if user opted in at Step 3 question 3 |
 
 #### Updating `security_scanning/poetry.lock` hashes
@@ -211,9 +212,17 @@ grep -rn 'flashinfer.*__version__\|flashinfer.*version' \
 
 Known locations with version checks:
 - `tensorrt_llm/_torch/speculative/interface.py` — `flashinfer.__version__ >= "0.6.4"`
+- `tensorrt_llm/_torch/_experimental/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_103__tp8/kernels/draft_front/native_norm.py` — `VERIFIED_FLASHINFER_VERSIONS` is an exact-match list, not a minimum version.
 
-If the new version is still >= the gated version, no changes needed. Otherwise, flag
-to the user.
+For the minimum-version gate, no changes are needed if the new version is still >=
+the gated version. Otherwise, flag it to the user.
+
+For `VERIFIED_FLASHINFER_VERSIONS`, a newer version is not automatically compatible.
+Before extending the list, re-check FlashInfer's CuTe RMSNorm path for bit-exact
+compatibility or re-run the draft-front bit-exactness check in
+`tests/unittest/_torch/modeling_v2/models/glm_moe_dsa/test_draft_front.py` on SM103.
+The CPU test `test_draft_front_flashinfer_version.py` checks that the dependency pin
+is listed; it does not establish numerical compatibility.
 
 ### Step 6: Summary
 
@@ -312,6 +321,7 @@ All files that contain flashinfer-python version pins:
 | `security_scanning/pyproject.toml` | `"flashinfer-python (==X.Y.Z)"` |
 | `security_scanning/poetry.lock` | `name = "flashinfer-python"` block with version + hashes |
 | `ATTRIBUTIONS-Python.md` | `## flashinfer-python (X.Y.Z)` |
+| `tensorrt_llm/_torch/_experimental/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_103__tp8/kernels/draft_front/native_norm.py` | Exact-match `VERIFIED_FLASHINFER_VERSIONS`; extend only after the Step 5 compatibility check |
 
 ## Notes
 
