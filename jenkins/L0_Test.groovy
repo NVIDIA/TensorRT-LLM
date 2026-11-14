@@ -4131,6 +4131,8 @@ BOLT_PINNED_REF = ""
 BOLT_TEST_BOLTED_TARBALL = false
 // Release scripts repository as [url: ..., commit: ...], resolved by L0_MergeRequest.
 TRTLLM_RELEASE_REPO = null
+@Field
+Map stageResourceRequests = [:]
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
@@ -4644,6 +4646,42 @@ def cacheErrorAndUploadResult(pipeline, stageName, taskRunner, finallyRunner, no
     }
 }
 
+def loadStageResourceRequests(pipeline)
+{
+    def configDir = "${pipeline.pwd(tmp: true)}/stage-resources"
+    trtllm_utils.checkoutFile(LLM_REPO, env.gitlabCommit, "jenkins/config/stage_resources.json", configDir)
+    def requests = pipeline.readJSON(file: "${configDir}/stage_resources.json", returnPojo: true).stages
+    if (!(requests instanceof Map)) {
+        pipeline.error("stage_resources.json must contain a stages object")
+    }
+    requests.each { stageName, resources ->
+        ["cpu_m", "memory_mi"].each { key ->
+            def value = resources[key]
+            if (!(value instanceof Integer || value instanceof Long) || value <= 0) {
+                pipeline.error("stage_resources.json: ${stageName}.${key} must be a positive integer")
+            }
+        }
+    }
+    return requests
+}
+
+def applyStageResourceRequests(pipeline, Map podConfig, String stageName)
+{
+    def resources = stageResourceRequests[stageName]
+    if (resources == null) {
+        pipeline.echo "[Stage resources] ${stageName}: using default requests and limits."
+        return podConfig
+    }
+
+    def pod = pipeline.readYaml(text: podConfig.yaml)
+    def container = pod.spec.containers.find { it.name == "trt-llm" }
+    def requests = [cpu: "${resources.cpu_m}m".toString(), memory: "${resources.memory_mi}Mi".toString()]
+    container.resources.requests.putAll(requests)
+    container.resources.limits.putAll(requests)
+    pipeline.echo "[Stage resources] ${stageName}: requests=${requests}, limits=${requests}."
+    return podConfig + [yaml: pipeline.writeYaml(returnText: true, data: pod)]
+}
+
 def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, modelExpress = false)
 {
     def targetCloud = "kubernetes-cpu"
@@ -4997,7 +5035,6 @@ ${scratchUnreachableNodeAffinity}
                         cpu: '2'
                         memory: 10Gi
                         ephemeral-storage: 25Gi
-                qosClass: Guaranteed
                 volumes:
                 - name: dshm
                   emptyDir:
@@ -7212,10 +7249,16 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
     // dispatchers carry the same opt through to their inner SLURM retry via retryContext.
     int k8sInfraRetryMax = resolveInfraRetryMax(InfraFailure.K8S, opts.infraRetryMax as Integer)
 
+    def prepareAttemptPodSpec = { excludedHostNodes ->
+        // Host exclusion matches the original YAML formatting; apply resources afterwards.
+        def attemptPodSpec = trtllm_utils.withKubernetesHostNodeExclusion(podSpec, excludedHostNodes)
+        return slurmDispatcher ? attemptPodSpec : applyStageResourceRequests(pipeline, attemptPodSpec, stageName)
+    }
+
     // DEBUG_MODE preserves the existing 2-hour-input human-inspection workflow
     // inside runLLMTestlistOnPlatform's finallyRunner: a single attempt only.
     if (testFilter[(DEBUG_MODE)]) {
-        trtllm_utils.launchKubernetesPod(pipeline, podSpec, containerName, { runner("", true, null) })
+        trtllm_utils.launchKubernetesPod(pipeline, prepareAttemptPodSpec([]), containerName, { runner("", true, null) })
         return
     }
 
@@ -7242,7 +7285,7 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
                 if (launchAttempt > 1 && !avoidedKubernetesHostNodes.isEmpty()) {
                     echo "[INFRA-RETRY] ${stageName}: relaunching pod (attempt ${launchAttempt}), avoiding prior host node(s): ${avoidedKubernetesHostNodes.join(', ')}"
                 }
-                attemptPodSpec = trtllm_utils.withKubernetesHostNodeExclusion(podSpec, avoidedKubernetesHostNodes)
+                attemptPodSpec = prepareAttemptPodSpec(avoidedKubernetesHostNodes)
                 if (slurmDispatcher) {
                     // Record the dispatcher pod spec so the off-pod finalizer/sweep can
                     // launch a fresh cleanup pod if this pod dies mid-run.
@@ -7347,7 +7390,7 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
             // another intermediate attempt.
             def effectiveMaxThisAttempt = (lastSeverity == InfraFailure.PERSISTENT) ? Math.min(1, k8sInfraRetryMax) : k8sInfraRetryMax
             boolean isFinalAttempt = (attempt > effectiveMaxThisAttempt)
-            def attemptPodSpec = trtllm_utils.withKubernetesHostNodeExclusion(podSpec, avoidedKubernetesHostNodes)
+            def attemptPodSpec = prepareAttemptPodSpec(avoidedKubernetesHostNodes)
             trtllm_utils.launchKubernetesPodWithPlacement(pipeline, attemptPodSpec, containerName, attemptPlacementContext, { runner(attemptTag, isFinalAttempt, retryContext) })
             if (attempt > 1) {
                 echo "[INFRA-RETRY] ${stageName}: Succeeded on attempt ${attempt}"
@@ -8467,6 +8510,7 @@ pipeline {
                     globalVars = trtllm_utils.updateMapWithJson(this, globalVars, env.globalVars, "globalVars")
                     globalVars = trtllm_utils.initializeCiBudget(this, globalVars, 24, 'HOURS', 'L0_Test')
                     globalVars[ACTION_INFO] = trtllm_utils.setupPipelineDescription(this, globalVars[ACTION_INFO])
+                    stageResourceRequests = loadStageResourceRequests(this)
                     if (globalVars[LLM_ARTIFACTS_PRIMARY_KEY]) {
                         LLM_ARTIFACTS_PRIMARY_FROM_PARENT = globalVars[LLM_ARTIFACTS_PRIMARY_KEY].toString()
                         echo "Build artifacts: primary location ${llmArtifactsPrimary()}, passed by the parent pipeline"
