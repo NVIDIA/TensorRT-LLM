@@ -60,6 +60,10 @@ class GuidedRequest:
     is_draft: bool = False
     draft_tokens: Optional[List[int]] = None
     num_accepted_draft_tokens: Optional[int] = None
+    # Tokens the request generated before reset_for_recompute moved them into
+    # its prompt. A new matcher accepts them first, so that its state matches
+    # the output so far.
+    tokens_to_replay: Optional[List[int]] = None
 
     def require_matcher_init(self) -> bool:
         if self.guided_decoding_params is None:
@@ -83,14 +87,25 @@ class GuidedRequest:
 
     @classmethod
     def from_llm_request(cls, request: LlmRequest):
+        is_last_context_chunk = (request.is_context_init_state
+                                 and request.is_last_context_chunk)
+        tokens_to_replay = None
+        # A recompute appends the generated tokens to the prompt. The C++
+        # orig_prompt_len keeps the user's prompt length across a recompute
+        # (py_orig_prompt_len is reset to the longer prompt), so the tokens past
+        # it are the ones to replay. Only guided requests copy them.
+        if (is_last_context_chunk
+                and request.py_guided_decoding_params is not None
+                and request.prompt_len > request.orig_prompt_len):
+            tokens_to_replay = request.get_tokens(
+                0)[request.orig_prompt_len:request.prompt_len]
         return cls(
             guided_decoding_params=request.py_guided_decoding_params,
             request_id=request.py_request_id,
             seq_slot=request.py_seq_slot,
             prev_seq_slot=request.py_batch_idx,
             is_context_init_state=request.is_context_init_state,
-            is_last_context_chunk=(request.is_context_init_state
-                                   and request.is_last_context_chunk),
+            is_last_context_chunk=is_last_context_chunk,
             is_generation_in_progress_state=request.
             is_generation_in_progress_state,
             is_generation_only_first_iteration=(
@@ -100,7 +115,8 @@ class GuidedRequest:
                 and request.py_batch_idx is None),
             new_token=request.get_last_tokens(0),
             draft_tokens=request.py_draft_tokens,
-            num_accepted_draft_tokens=request.py_num_accepted_draft_tokens)
+            num_accepted_draft_tokens=request.py_num_accepted_draft_tokens,
+            tokens_to_replay=tokens_to_replay)
 
     def cast_to_draft(self) -> None:
         self.is_draft = True
@@ -267,6 +283,13 @@ class GuidedDecoder:
                     matcher = self.grammar_matcher_factory.create(
                         req.guided_decoding_params)
                     self.grammar_matchers[slot] = matcher
+                    for token in req.tokens_to_replay or ():
+                        if not matcher.accept_token(token):
+                            raise ValueError(
+                                f"Request {req.request_id} at slot {slot}: the "
+                                f"new grammar matcher rejected token {token}, "
+                                "which the request generated before it was "
+                                "recomputed.")
 
                 if matcher_advance:
                     matcher = self.grammar_matchers[slot]

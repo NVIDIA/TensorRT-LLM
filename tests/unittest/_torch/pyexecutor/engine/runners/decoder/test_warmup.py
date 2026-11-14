@@ -1725,6 +1725,8 @@ def test_general_warmup_oom_restores_guided_batch_queue(callback_pending: bool) 
             py_guided_decoding_params=object() if guided else None,
             py_seq_slot=0,
             py_batch_idx=None,
+            prompt_len=1,
+            orig_prompt_len=1,
             is_context_init_state=True,
             is_last_context_chunk=True,
             is_generation_in_progress_state=False,
