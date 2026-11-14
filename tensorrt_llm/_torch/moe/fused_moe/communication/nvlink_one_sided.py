@@ -25,11 +25,9 @@ NVLINK One-Sided supports post-quant dispatch.
 """
 
 import os
-import re
 import sys
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
-import pynvml
 import torch
 
 from tensorrt_llm._torch.alltoall_watchdog import (
@@ -42,198 +40,221 @@ from tensorrt_llm._torch.alltoall_watchdog import (
     EPGroupHealthLike,
     reject_rank_mask_cuda_graph_capture,
 )
-from tensorrt_llm._torch.distributed.mnnvl_memory import (
-    CftMnnvlMemory,
-    MnnvlCheckpointCommunicator,
-    MnnvlMemory,
-    cuda,
-)
+from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlCheckpointCommunicator, MnnvlMemory
 from tensorrt_llm._torch.mnnvl_alltoall_workspace import _MnnvlAlltoAllWorkspaceLifecycle
-from tensorrt_llm.bindings import BuildInfo
 from tensorrt_llm.bindings import internal as _tllm_internal
 from tensorrt_llm.logger import logger as tllm_logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import pad_up
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..moe_comm_timeout_guard import register_moe_comm_timeout_proxy
 from .base import Communication
 
-_CFT_DEFAULT_MAX_BATCH_FOR_DISPATCH = 128
-_CFT_MAX_BATCH_FOR_DISPATCH_ENV = "TRTLLM_NVLINK_ONE_SIDED_A2A_CFT_MAX_BATCH_FOR_DISPATCH"
-_CFT_DEFAULT_MAX_BATCH_FOR_COMBINE = 128
-_CFT_MAX_BATCH_FOR_COMBINE_ENV = "TRTLLM_NVLINK_ONE_SIDED_A2A_CFT_MAX_BATCH_FOR_COMBINE"
-FORCE_CFT_ENV = "TRTLLM_NVLINK_ONE_SIDED_A2A_FORCE_CFT"
-_CFT_ALIGNMENT_BYTES = 16
-_CFT_MIN_DRIVER_BRANCH = 615
+SYNC_PROTOCOL_ENV = "TRTLLM_NVLINK_ONE_SIDED_A2A_SYNC_PROTOCOL"
+# How a rank learns that a step's rows have arrived: "fence" (completion flags behind a
+# system-scope fence), "sentinel" (receivers poll the data itself) or "auto" (sentinel for the
+# steps it can carry, fence for the others). Same names as FlashInfer's ``sync_protocol``.
+SYNC_PROTOCOLS = ("auto", "fence", "sentinel")
+SENTINEL_MAX_TOKENS_ENV = "TRTLLM_NVLINK_ONE_SIDED_A2A_SENTINEL_MAX_TOKENS"
+# Sentinel payload formats (the MOE_A2A_SENTINEL_FORMAT_<name> constants).
+SENTINEL_PAYLOAD_FORMATS = ("BF16", "MXFP8", "FP8_BLOCK128", "NVFP4")
+# Default token limit of the sentinel transport (default_sentinel_max_tokens). Both constants are
+# FlashInfer's (flashinfer-ai/flashinfer#7498), from its GB300 measurements of the sentinel transport
+# against FlashInfer's own fence path; they were not re-measured against this fence path. Up to 159
+# tokens per rank the sentinel transport was faster in every configuration measured there (EP 4 to
+# 64, hidden 3584 to 7168, every payload format), so the default never goes below.
+_SENTINEL_MIN_DEFAULT_MAX_TOKENS = 159
+# Above it the default keeps the ep_size * limit rows a sentinel step polls, copies out and re-arms
+# within this: a speed bound, not a memory budget; the largest that kept every GB300 case faster.
+# The 159 floor takes precedence, so at wide EP the regions exceed it (hidden 7168, top-8 BF16 rows:
+# about 52 / 105 / 210 / 419 MiB per rank at EP 8 / 16 / 32 / 64).
+_SENTINEL_MAX_DEFAULT_REGION_BYTES = 64 << 20
 
 
-def get_force_cft() -> bool | None:
-    value = os.environ.get(FORCE_CFT_ENV)
-    if value == "0":
-        return False
-    if value == "1":
-        return True
-    return None
+class NVLinkOneSidedConfigError(ValueError):
+    """An invalid NVLinkOneSided environment setting. Raised on every EP rank alike, and not
+    treated by the communication factory as "NVLinkOneSided unavailable"."""
 
 
-def _get_nvidia_driver_version() -> str | None:
-    try:
-        try:
-            pynvml.nvmlDeviceGetCount()
-        except pynvml.NVMLError_Uninitialized:
-            pynvml.nvmlInit()
-        value = pynvml.nvmlSystemGetDriverVersion()
-    except pynvml.NVMLError as error:
-        tllm_logger.warning_once(
-            "CFT counted writes disabled: failed to query the NVIDIA driver "
-            f"version via NVML ({error}). Falling back to fence-based dispatch.",
-            key="moe_a2a_cft_driver_query_failed",
+# CFT counted writes are gone; these variables shipped in v1.4.0rc1 / rc2 and are no longer read.
+# FORCE_CFT=0 pinned the fence path, so it still selects fence (with a warning) for one release.
+_REMOVED_FORCE_CFT_ENV = "TRTLLM_NVLINK_ONE_SIDED_A2A_FORCE_CFT"
+_REMOVED_CFT_ENVS = (
+    _REMOVED_FORCE_CFT_ENV,
+    "TRTLLM_NVLINK_ONE_SIDED_A2A_CFT_MAX_BATCH_FOR_DISPATCH",
+    "TRTLLM_NVLINK_ONE_SIDED_A2A_CFT_MAX_BATCH_FOR_COMBINE",
+)
+_WORKSPACE_MB_ENV = "TRTLLM_NVLINK_ONE_SIDED_A2A_WORKSPACE_MB"
+
+
+def _sentinel_env() -> tuple[str | None, ...]:
+    """The raw settings the sentinel vote reads; every EP rank must see the same ones."""
+    return tuple(
+        os.environ.get(name)
+        for name in (
+            SYNC_PROTOCOL_ENV,
+            SENTINEL_MAX_TOKENS_ENV,
+            _WORKSPACE_MB_ENV,
+            *_REMOVED_CFT_ENVS,
         )
+    )
+
+
+def get_sync_protocol() -> str:
+    """``TRTLLM_NVLINK_ONE_SIDED_A2A_SYNC_PROTOCOL``: "auto" (also when unset), "fence" or "sentinel".
+
+    Raises:
+        NVLinkOneSidedConfigError: If the value is none of these.
+    """
+    for name in _REMOVED_CFT_ENVS:
+        if os.environ.get(name) is not None and not (
+            name == _REMOVED_FORCE_CFT_ENV and os.environ.get(name) == "0"
+        ):
+            tllm_logger.warning_once(
+                f"{name} is no longer read: CFT counted writes were removed from NVLinkOneSided. "
+                f"Use {SYNC_PROTOCOL_ENV}=fence|sentinel|auto.",
+                key=f"nvlink_one_sided_removed_{name}",
+            )
+    value = os.environ.get(SYNC_PROTOCOL_ENV, "").strip().lower()
+    if not value and os.environ.get(_REMOVED_FORCE_CFT_ENV) == "0":
+        tllm_logger.warning_once(
+            f"{_REMOVED_FORCE_CFT_ENV}=0 is deprecated and will stop working in a future release; "
+            f"it now selects the fence path, as {SYNC_PROTOCOL_ENV}=fence does.",
+            key="nvlink_one_sided_force_cft_0",
+        )
+        return "fence"
+    value = value or "auto"
+    if value not in SYNC_PROTOCOLS:
+        raise NVLinkOneSidedConfigError(
+            f"{SYNC_PROTOCOL_ENV} must be one of {', '.join(SYNC_PROTOCOLS)}, got {value!r}"
+        )
+    return value
+
+
+def get_sentinel_max_tokens() -> int | None:
+    """``TRTLLM_NVLINK_ONE_SIDED_A2A_SENTINEL_MAX_TOKENS``: a positive token limit, or None when unset.
+
+    Raises:
+        NVLinkOneSidedConfigError: If the value is not a positive integer.
+    """
+    env_value = os.environ.get(SENTINEL_MAX_TOKENS_ENV, "").strip()
+    if not env_value:
         return None
-    if isinstance(value, bytes):
-        return value.decode(errors="replace")
-    return str(value)
-
-
-def cft_driver_is_supported(driver_version: str | bytes | None) -> bool:
-    if isinstance(driver_version, bytes):
-        driver_version = driver_version.decode(errors="replace")
-    if not driver_version:
-        return False
-    match = re.match(r"^(\d+)(?:\.|$)", driver_version.strip())
-    return bool(match and int(match.group(1)) >= _CFT_MIN_DRIVER_BRANCH)
-
-
-def resolve_cft_counted_writes(
-    force_cft: bool | None,
-    driver_version: str | bytes | None,
-) -> bool:
-    """Allow automatic or forced CFT only on a supported driver."""
-    return force_cft is not False and cft_driver_is_supported(driver_version)
-
-
-def _cft_device_support_reason() -> str | None:
-    """Return why the current device cannot use counted-write fabric endpoints."""
-    major, minor = torch.cuda.get_device_capability()
-    if major < 10:
-        return f"SM{major}{minor} requires SM100 or newer"
     try:
-        attributes = (
-            cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED,
-            cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_LOGICAL_ENDPOINT_UNICAST_SUPPORTED,
-            cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_LOGICAL_ENDPOINT_COUNTED_OPS_SUPPORTED,
-        )
-    except AttributeError:
-        return "CUDA Python bindings do not expose Logical Endpoint capabilities"
-    device = torch.cuda.current_device()
-    for attribute in attributes:
-        status, supported = cuda.cuDeviceGetAttribute(attribute, device)
-        if status != cuda.CUresult.CUDA_SUCCESS:
-            return f"querying {attribute.name} failed with {status.name}"
-        if not supported:
-            return f"device does not support {attribute.name}"
-    return None
-
-
-def select_cft_counted_writes(force_cft: bool | None) -> bool:
-    """Resolve CFT availability identically for workspace sizing and construction."""
-    if not BuildInfo.CFT_COUNTED_WRITES:
-        tllm_logger.warning_once(
-            "CFT counted writes disabled: this build was compiled against CUDA "
-            "below 13.4 and has no logical endpoint support. Falling back to fence.",
-            key="moe_a2a_cft_not_compiled",
-        )
-        return False
-    driver_version = None
-    if force_cft is not False:
-        driver_version = _get_nvidia_driver_version()
-    if not resolve_cft_counted_writes(force_cft, driver_version):
-        if driver_version is not None:
-            tllm_logger.warning_once(
-                "CFT counted writes disabled: NVIDIA driver "
-                f"{driver_version} is below required {_CFT_MIN_DRIVER_BRANCH}.00. "
-                "Falling back to fence-based dispatch.",
-                key=f"moe_a2a_cft_driver_unsupported_{driver_version}",
-            )
-        return False
-    unsupported_reason = _cft_device_support_reason()
-    if unsupported_reason is not None:
-        tllm_logger.warning_once(
-            f"CFT counted writes disabled: {unsupported_reason}. Falling back to fence.",
-            key=f"moe_a2a_cft_device_unsupported_{unsupported_reason}",
-        )
-        return False
-    return True
-
-
-def should_use_cft(
-    can_use_cft: bool,
-    force_cft: bool | None,
-    max_batch: int | None,
-    runtime_max_tokens_per_rank: int,
-) -> bool:
-    if not can_use_cft:
-        return False
-    if force_cft is not None:
-        return force_cft
-    if max_batch is None:
-        return True
-    return runtime_max_tokens_per_rank <= max_batch
-
-
-def _use_cft_for_dispatch_payloads(use_cft: bool, payloads: list[torch.Tensor]) -> bool:
-    if not use_cft:
-        return False
-    for payload_index, payload in enumerate(payloads):
-        bytes_per_token = payload.shape[1] * payload.element_size()
-        if bytes_per_token % _CFT_ALIGNMENT_BYTES != 0:
-            tllm_logger.warning_once(
-                "CFT counted writes disabled: dispatch payload "
-                f"{payload_index} has {bytes_per_token} bytes per token, which is not "
-                f"{_CFT_ALIGNMENT_BYTES}-byte aligned. Falling back to fence-based dispatch.",
-                key=f"moe_a2a_cft_dispatch_alignment_{payload_index}_{bytes_per_token}",
-            )
-            return False
-    return True
-
-
-def _use_cft_for_combine_payload(
-    use_cft: bool, payload: torch.Tensor, use_low_precision: bool
-) -> bool:
-    if not use_cft:
-        return False
-    wire_element_size = 1 if use_low_precision else payload.element_size()
-    bytes_per_token = payload.shape[-1] * wire_element_size
-    if bytes_per_token % _CFT_ALIGNMENT_BYTES != 0:
-        tllm_logger.warning_once(
-            "CFT counted writes disabled: combine payload has "
-            f"{bytes_per_token} bytes per token, which is not "
-            f"{_CFT_ALIGNMENT_BYTES}-byte aligned. Falling back to fence-based combine.",
-            key=f"moe_a2a_cft_combine_alignment_{bytes_per_token}",
-        )
-        return False
-    return True
-
-
-def _get_cft_max_batch(env_name: str, default: int) -> int:
-    env_value = os.environ.get(env_name)
-    if env_value is None:
-        return default
-    try:
-        threshold = int(env_value)
+        max_tokens = int(env_value)
     except ValueError as e:
-        raise ValueError(f"{env_name} must be an integer") from e
-    if threshold < 0:
-        raise ValueError(f"{env_name} must be non-negative")
-    return threshold
+        raise NVLinkOneSidedConfigError(
+            f"{SENTINEL_MAX_TOKENS_ENV} must be a positive integer, got {env_value!r}"
+        ) from e
+    if max_tokens <= 0:
+        raise NVLinkOneSidedConfigError(
+            f"{SENTINEL_MAX_TOKENS_ENV} must be a positive integer, got {env_value!r} "
+            f"(use {SYNC_PROTOCOL_ENV}=fence to turn the sentinel transport off)"
+        )
+    return max_tokens
 
 
-def _get_cft_max_batch_for_dispatch() -> int:
-    return _get_cft_max_batch(_CFT_MAX_BATCH_FOR_DISPATCH_ENV, _CFT_DEFAULT_MAX_BATCH_FOR_DISPATCH)
+def sentinel_payload_format(quant_algo: QuantAlgo | None) -> str | None:
+    """Sentinel payload format of the rows a MoE layer of ``quant_algo`` dispatches, or None when
+    the transport carries no such rows.
+
+    NVFP4 (and its AWQ / ARC calibrations) and the MXFP8-activation formats dispatch quantized rows
+    with their block scales; FP8 per-tensor activations (FP8, W4A8_MXFP4_FP8, W4A8_NVFP4_FP8) travel
+    as e4m3 bytes without block scales, a format the kernels do not carry. The others dispatch BF16
+    activations (FP8 block-scale backends quantize after dispatch). Pass the layer's own quant algo:
+    a mixed-precision checkpoint overrides it per layer.
+    """
+    if quant_algo in (QuantAlgo.NVFP4, QuantAlgo.NVFP4_AWQ, QuantAlgo.NVFP4_ARC):
+        return "NVFP4"
+    if quant_algo in (QuantAlgo.MXFP8, QuantAlgo.W4A8_MXFP4_MXFP8):
+        return "MXFP8"
+    if quant_algo in (QuantAlgo.FP8, QuantAlgo.W4A8_MXFP4_FP8, QuantAlgo.W4A8_NVFP4_FP8):
+        return None
+    return "BF16"
 
 
-def _get_cft_max_batch_for_combine() -> int:
-    return _get_cft_max_batch(_CFT_MAX_BATCH_FOR_COMBINE_ENV, _CFT_DEFAULT_MAX_BATCH_FOR_COMBINE)
+class SentinelRow(NamedTuple):
+    """Row geometry of a sentinel payload format, from the native op."""
+
+    hidden_bytes: int  # one token's hidden states
+    scale_bytes: int  # one token's scales (0 for BF16)
+    blocks_per_token: int  # dispatch blocks per token slot
+    bytes_per_row: int  # sentinel workspace bytes per (source rank, token) row
+
+
+def sentinel_row(payload_format: str, hidden_size: int, top_k: int) -> SentinelRow:
+    """Raises if the kernels do not take rows of ``hidden_size`` in ``payload_format``."""
+    format_id = int(getattr(_tllm_internal.thop, f"MOE_A2A_SENTINEL_FORMAT_{payload_format}"))
+    return SentinelRow(
+        *map(int, torch.ops.trtllm.moe_a2a_sentinel_row_geometry(format_id, hidden_size, top_k))
+    )
+
+
+def default_sentinel_max_tokens(ep_size: int, num_sms: int, row: SentinelRow) -> int:
+    """Default token limit of the sentinel transport, in this order of precedence:
+
+    1. at least ``_SENTINEL_MIN_DEFAULT_MAX_TOKENS`` (159);
+    2. else the largest step whose dispatch grid stays below one full wave of
+       resident blocks (from a full wave on, the fence transport catches up),
+       at most the kernels' 512;
+    3. lowered while the sentinel regions (landing, combine and receive rows,
+       ``ep_size * limit`` of them) would exceed
+       ``_SENTINEL_MAX_DEFAULT_REGION_BYTES`` per rank.
+
+    So at wide EP, where 3 would go below 159, the regions are larger than
+    ``_SENTINEL_MAX_DEFAULT_REGION_BYTES``. The caller caps the result by
+    ``max_num_tokens_per_rank``.
+    """
+    thop = _tllm_internal.thop
+    below_one_wave = (
+        int(thop.MOE_A2A_SENTINEL_DISPATCH_BLOCKS_PER_SM) * num_sms - 1
+    ) // row.blocks_per_token
+    by_region_bytes = _SENTINEL_MAX_DEFAULT_REGION_BYTES // (ep_size * row.bytes_per_row)
+    return max(
+        min(below_one_wave, int(thop.MOE_A2A_SENTINEL_MAX_TOKENS_PER_RANK), by_region_bytes),
+        _SENTINEL_MIN_DEFAULT_MAX_TOKENS,
+    )
+
+
+def _sentinel_unsupported_reason(
+    *,
+    ep_size: int,
+    top_k: int,
+    num_slots: int,
+    hidden_size: int,
+    dtype: torch.dtype,
+    payload_format: str | None,
+    use_low_precision_combine: bool,
+    fault_tolerant: bool,
+) -> str | None:
+    """Why this rank cannot use the sentinel transport, or ``None`` if it can.
+
+    Every unsupported configuration is a reason, not an exception, so that every rank reaches the
+    collective sentinel vote.
+    """
+    thop = _tllm_internal.thop
+    if payload_format is None:
+        return "the layer dispatches FP8 per-tensor rows, which it does not carry"
+    if not torch.ops.trtllm.moe_a2a_sentinel_available():
+        return "its kernels are not built for this GPU (SM100, SM103 and SM107 only)"
+    if ep_size > int(thop.MOE_A2A_SENTINEL_MAX_RANKS):
+        return f"it supports at most {int(thop.MOE_A2A_SENTINEL_MAX_RANKS)} EP ranks"
+    if num_slots % ep_size != 0:
+        return "it needs the expert slots to split evenly across EP ranks"
+    if dtype != torch.bfloat16:
+        return "it combines BF16 expert outputs only"
+    if use_low_precision_combine:
+        return "it has no FP8 combine"
+    if fault_tolerant:
+        return "the AlltoAll watchdog and rank-mask recovery observe fence completion flags only"
+    if payload_format not in SENTINEL_PAYLOAD_FORMATS:
+        return f"it does not carry the payload format {payload_format}"
+    try:
+        sentinel_row(payload_format, hidden_size, top_k)
+    except RuntimeError as error:  # the native row check (TORCH_CHECK)
+        return f"it does not carry hidden size {hidden_size} in {payload_format}: {error}"
+    return None
 
 
 class _NVLinkOneSidedTimeoutProxy:
@@ -255,8 +276,9 @@ class NVLinkOneSided(Communication):
 
     This implementation utilizes symmetric memory to enable peer-to-peer access between GPUs over NVLink.
     The kernels only take the role as one side of the communication: the dispatch kernel puts the data
-    into peer ranks' symmetric memory from local buffer, while the combine kernel gets the data from peer
-    ranks' symmetric memory and reduces the data into local buffer. It is the most efficient implementation
+    into peer ranks' symmetric memory from local buffer. The fence combine kernel gets the data from peer
+    ranks' symmetric memory and reduces it into the local buffer; the sentinel combine instead puts each
+    expert output into the token owner's symmetric memory, where the owner polls and reduces it. It is the most efficient implementation
     by now, but requires symmetric memory size proportional to `max_num_tokens * n_ranks`, which may not
     scale well for very large-scale parallelization.
     """
@@ -266,17 +288,19 @@ class NVLinkOneSided(Communication):
     MAX_TOP_K = int(_tllm_internal.thop.MOE_A2A_MAX_TOP_K)
     MAX_PAYLOADS = int(_tllm_internal.thop.MOE_A2A_MAX_PAYLOADS)
 
-    # Shared workspaces/memory across the process, keyed by payload layout and CFT mode.
+    # Shared workspaces/memory across the process, keyed by payload layout.
     _WORKSPACES: Dict[Tuple[object, ...], dict] = {}
     _WORKSPACE_REFCOUNTS: Dict[Tuple[object, ...], int] = {}
+    # Outcome of the sentinel vote per layout and settings: (token limit, payload format, layout
+    # after the vote). Layers sharing a layout vote once; every rank builds its layers in the same
+    # order, so every rank hits or misses alike.
+    _SENTINEL_VOTES: Dict[Tuple[object, ...], Tuple[int, Optional[str], Tuple[int, ...]]] = {}
+    # The vote key whose layout a workspace was allocated with, per layout and settings with the
+    # payload format left out. While that workspace is alive, a layer that differs only in its
+    # sentinel format shares it, as it would without sentinel regions, and takes no sentinel steps
+    # (as on main, where only the first CFT workspace could use counted writes).
+    _SENTINEL_FIRST_VOTE_KEYS: Dict[Tuple[object, ...], Tuple[object, ...]] = {}
     _WORKSPACE: dict | None = None
-    # Layout of the workspace holding the process-wide CFT logical endpoints, if any.
-    # The endpoints are bound to a single allocation once per process, so only one
-    # workspace can use counted writes; a model whose MoE layers differ in layout
-    # allocates several, and the rest fall back to fence. Nemotron-H Puzzle is one
-    # such model: its top_k varies across MoE layers. Remove once the endpoints can
-    # be bound per workspace.
-    _CFT_OWNER_SHAPE: Tuple[object, ...] | None = None
 
     # MetaInfo indices - initialized from C++ constants
     FLAG_VAL_OFFSET_INDEX = None
@@ -290,8 +314,6 @@ class NVLinkOneSided(Communication):
     DISPATCH_PAYLOAD_SIZE_INDEX = None
     COMBINE_INPUT_OFFSET_INDEX = None
     COMBINE_INPUT_SIZE_INDEX = None
-    COMBINE_RECV_OFFSET_INDEX = None
-    COMBINE_RECV_SIZE_INDEX = None
     WORKSPACE_SIZE_INDEX = None
 
     @staticmethod
@@ -303,8 +325,6 @@ class NVLinkOneSided(Communication):
         dtype: torch.dtype,
         eplb_stats_num_experts: Optional[int],
         extra_payload_bytes_per_token: int,
-        can_use_cft_counted_writes: bool,
-        use_low_precision_combine: bool,
     ) -> torch.Tensor:
         """Plan per-rank control buffers and independently sized payload regions."""
         if hidden_size <= 0 or extra_payload_bytes_per_token < 0:
@@ -326,20 +346,13 @@ class NVLinkOneSided(Communication):
         # even when the communication wire format is FP8.
         combine_element_size = max(dtype.itemsize, 2)
         combine_input_bytes = tokens * hidden_size * combine_element_size
-        combine_recv_bytes = (
-            tokens * hidden_size * (1 if use_low_precision_combine else combine_element_size)
-            if can_use_cft_counted_writes
-            else 0
-        )
         return torch.ops.trtllm.moe_a2a_get_workspace_layout(
             ep_size,
             max_num_tokens,
             top_k,
             dispatch_bytes,
             combine_input_bytes,
-            combine_recv_bytes,
             eplb_stats_num_experts,
-            can_use_cft_counted_writes,
         )
 
     @staticmethod
@@ -347,7 +360,6 @@ class NVLinkOneSided(Communication):
         ep_size: int,
         max_num_tokens: int,
         eplb_stats_num_experts: Optional[int] = None,
-        can_use_cft_counted_writes: bool = False,
         top_k: Optional[int] = None,
     ) -> int:
         """Control-buffer bytes; omitted top_k reserves the native routing limit."""
@@ -357,9 +369,7 @@ class NVLinkOneSided(Communication):
             NVLinkOneSided.MAX_TOP_K if top_k is None else top_k,
             0,
             0,
-            0,
             eplb_stats_num_experts,
-            can_use_cft_counted_writes,
         )
         return int(layout[_tllm_internal.thop.MOE_A2A_WORKSPACE_SIZE_INDEX])
 
@@ -387,8 +397,6 @@ class NVLinkOneSided(Communication):
             cls.DISPATCH_PAYLOAD_SIZE_INDEX = int(thop.MOE_A2A_DISPATCH_PAYLOAD_SIZE_INDEX)
             cls.COMBINE_INPUT_OFFSET_INDEX = int(thop.MOE_A2A_COMBINE_INPUT_OFFSET_INDEX)
             cls.COMBINE_INPUT_SIZE_INDEX = int(thop.MOE_A2A_COMBINE_INPUT_SIZE_INDEX)
-            cls.COMBINE_RECV_OFFSET_INDEX = int(thop.MOE_A2A_COMBINE_RECV_OFFSET_INDEX)
-            cls.COMBINE_RECV_SIZE_INDEX = int(thop.MOE_A2A_COMBINE_RECV_SIZE_INDEX)
             cls.WORKSPACE_SIZE_INDEX = int(thop.MOE_A2A_WORKSPACE_SIZE_INDEX)
 
     def __init__(
@@ -406,17 +414,39 @@ class NVLinkOneSided(Communication):
         alltoall_watchdog_timeout_s: Optional[float] = None,
         alltoall_watchdog_poll_interval_s: float = DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
         alltoall_watchdog_on_timeout: Optional[Callable[[AlltoAllWatchdogTimeout], None]] = None,
+        sentinel_payload_format: Optional[str] = "BF16",
     ) -> None:
         """
         Initialize NVLinkOneSided with workspace allocation.
 
-        CFT is selected automatically on supported platforms using separate
-        dispatch/combine token-count thresholds (128 by default).
-        TRTLLM_NVLINK_ONE_SIDED_A2A_FORCE_CFT=0 selects fence; 1 bypasses the thresholds,
-        but not capability or payload-alignment requirements. CFT requires
-        sm_100+, a build against CUDA 13.4+, an NVLink fabric, and a driver
-        exporting the Logical Endpoint API (615.00+). Unsupported devices or
-        payloads fall back to fence with a one-time warning.
+        Steps take the fence transport: payloads, then a system fence and a
+        completion flag per peer.
+
+        Small steps can take the sentinel transport instead (moeAlltoAllSentinel.h):
+        one dispatch and one combine kernel in which every pushed 16-byte vector
+        carries its own arrival, so neither direction waits for a completion
+        flag or a system fence. Where every EP rank supports it, it takes every
+        step without EPLB statistics whose busiest rank sends at most
+        ``sentinel_max_tokens`` tokens and whose payloads are in the instance's
+        ``sentinel_payload_format``; the fence transport takes the other
+        steps. It needs SM100, SM103 or SM107, at most 64 EP ranks, BF16 expert
+        outputs without FP8 combine, expert slots that split evenly across ranks,
+        and no AlltoAll watchdog or rank-mask recovery (which observe the fence
+        completion flags). TRTLLM_NVLINK_ONE_SIDED_A2A_SYNC_PROTOCOL=fence turns it
+        off and =sentinel asks for it (a warning names the reason when it stays
+        off); unset or "auto", it is on. TRTLLM_NVLINK_ONE_SIDED_A2A_SENTINEL_MAX_TOKENS sets the token limit,
+        which otherwise is the largest step whose dispatch grid stays within one
+        wave of resident blocks and whose sentinel regions (``ep_size * limit``
+        landing, combine and receive rows, appended to the workspace) stay within
+        64 MiB per rank, clamped to 159..512 tokens and to
+        ``max_num_tokens_per_rank``; the 159 floor wins, so at wide EP the regions
+        are larger than 64 MiB (see ``default_sentinel_max_tokens``). Every rank votes, so a rank where it is off
+        turns it off everywhere. A sentinel step places the rows it receives from
+        rank ``src`` for its token ``t`` at ``src * runtime_max_tokens_per_rank + t``
+        and gives rows of tokens not routed here invalid expert IDs. Payload
+        words equal to the transport's sentinel arrive rewritten to the same
+        value (NaN stays NaN), so callers that send other bytes in BF16 rows must
+        turn it off.
 
         Args:
             mapping: TensorRT-LLM Mapping object containing rank information
@@ -439,6 +469,10 @@ class NVLinkOneSided(Communication):
                 watchdog is disabled.
             alltoall_watchdog_poll_interval_s: Poll interval for the watchdog thread.
             alltoall_watchdog_on_timeout: Optional callback invoked when the watchdog reports suspects.
+            sentinel_payload_format: Dispatch payload format whose small steps the sentinel transport carries,
+                one of SENTINEL_PAYLOAD_FORMATS (see sentinel_payload_format()), or None when the layer
+                dispatches rows the transport does not carry (no sentinel regions then). Needs
+                hidden_size and dtype.
         """
         super().__init__(mapping)
         if mapping.has_cp_helix():
@@ -473,49 +507,6 @@ class NVLinkOneSided(Communication):
             )
         self.enable_eplb = num_experts is not None
         self.eplb_stats_num_experts = num_experts
-        self._force_cft = get_force_cft()
-        can_use_cft_counted_writes = select_cft_counted_writes(self._force_cft)
-        self._cft_shape = (
-            self.ep_size,
-            max_num_tokens_per_rank,
-            self.eplb_stats_num_experts,
-            self.num_experts,
-            self.top_k,
-            hidden_size,
-            dtype,
-            use_low_precision_combine,
-        )
-        if can_use_cft_counted_writes:
-            owner = NVLinkOneSided._CFT_OWNER_SHAPE
-            if owner is not None and owner != self._cft_shape:
-                tllm_logger.warning_once(
-                    "CFT counted writes disabled for this workspace: logical endpoints are "
-                    "already bound to a workspace with a different layout, and only one "
-                    "workspace per process may use them. Falling back to fence.",
-                    key="moe_a2a_cft_workspace_already_bound",
-                )
-                can_use_cft_counted_writes = False
-        self.can_use_cft_counted_writes = can_use_cft_counted_writes
-        if self._force_cft is None:
-            self.cft_max_batch_for_dispatch = _get_cft_max_batch_for_dispatch()
-            self.cft_max_batch_for_combine = _get_cft_max_batch_for_combine()
-        else:
-            self.cft_max_batch_for_dispatch = None
-            self.cft_max_batch_for_combine = None
-        if can_use_cft_counted_writes:
-            if self._force_cft is True:
-                tllm_logger.info("NVLinkOneSided AlltoAll: CFT forced for supported workloads")
-            else:
-                tllm_logger.info(
-                    "NVLinkOneSided AlltoAll: automatic CFT enabled with token-count limits "
-                    f"dispatch={self.cft_max_batch_for_dispatch}, "
-                    f"combine={self.cft_max_batch_for_combine}"
-                )
-        else:
-            tllm_logger.info(
-                "NVLinkOneSided AlltoAll: CFT handle-based counted writes disabled for dispatch"
-            )
-
         # Initialize constants from C++
         self._init_constants()
 
@@ -531,11 +522,22 @@ class NVLinkOneSided(Communication):
                 dtype,
                 self.eplb_stats_num_experts,
                 0,
-                self.can_use_cft_counted_writes,
-                self.use_low_precision_combine,
+            )
+        # Largest step of the sentinel transport; 0 when this instance does not use it.
+        self.sentinel_max_tokens = 0
+        self._sentinel_format: str | None = None
+        self._sentinel_row: SentinelRow | None = None
+        if metainfo is not None:
+            self._setup_sentinel(
+                metainfo,
+                hidden_size,
+                dtype,
+                sentinel_payload_format,
+                fault_tolerant=ep_group_health is not None
+                or alltoall_watchdog_timeout_s is not None,
             )
             auto_workspace_size = int(metainfo[self.WORKSPACE_SIZE_INDEX])
-        workspace_mb_env = os.environ.get("TRTLLM_NVLINK_ONE_SIDED_A2A_WORKSPACE_MB")
+        workspace_mb_env = os.environ.get(_WORKSPACE_MB_ENV)
         if workspace_mb_env:
             self.workspace_size_per_rank = int(workspace_mb_env) * 1024 * 1024
             msg = f"NVLinkOneSided: Forcing workspace size to {self.workspace_size_per_rank} bytes (TRTLLM_NVLINK_ONE_SIDED_A2A_WORKSPACE_MB={workspace_mb_env})."
@@ -564,13 +566,10 @@ class NVLinkOneSided(Communication):
                 self.ep_size,
                 max_num_tokens_per_rank,
                 self.eplb_stats_num_experts,
-                self.can_use_cft_counted_writes,
                 self.top_k,
             )
-            regions = 3 if self.can_use_cft_counted_writes else 2
-            capacity = (
-                (self.workspace_size_per_rank - control_bytes) // regions // alignment * alignment
-            )
+            # Split the rest between the dispatch payload and combine input regions.
+            capacity = (self.workspace_size_per_rank - control_bytes) // 2 // alignment * alignment
             if capacity <= 0:
                 raise ValueError("Workspace byte budget leaves no room for payloads")
             metainfo = torch.ops.trtllm.moe_a2a_get_workspace_layout(
@@ -579,9 +578,7 @@ class NVLinkOneSided(Communication):
                 self.top_k,
                 capacity,
                 capacity,
-                capacity if self.can_use_cft_counted_writes else 0,
                 self.eplb_stats_num_experts,
-                self.can_use_cft_counted_writes,
             )
         # Fixed region capacities are shared by allocation, native bounds checks,
         # and workspace-backed views. Runtime shapes only pack tokens inside them.
@@ -597,19 +594,17 @@ class NVLinkOneSided(Communication):
             hidden_size,
             dtype,
             self.use_low_precision_combine,
-            self.can_use_cft_counted_writes,
             tuple(metainfo.tolist()),
         )
 
         workspace_state = NVLinkOneSided._WORKSPACES.get(self._workspace_key)
-        memory_cls = CftMnnvlMemory if self.can_use_cft_counted_writes else MnnvlMemory
         workspace_created = workspace_state is None
         if workspace_state is None:
             tllm_logger.info(
                 f"NVLinkOneSided: Allocating workspace with size {self.workspace_size_per_rank} bytes."
                 f"ep_rank: {self.ep_rank}, ep_size: {self.ep_size}, top_k: {self.top_k}, max_num_tokens_per_rank: {self.max_num_tokens_per_rank}"
             )
-            mnnvl_mem = memory_cls(mapping, self.workspace_size_per_rank)
+            mnnvl_mem = MnnvlMemory(mapping, self.workspace_size_per_rank)
             workspace = mnnvl_mem.as_torch_strided_tensor(torch.uint8)
             torch.ops.trtllm.moe_a2a_initialize(workspace, metainfo, self.ep_rank, self.ep_size)
             workspace_state = {
@@ -623,11 +618,9 @@ class NVLinkOneSided(Communication):
                 "hidden_size": hidden_size,
                 "dtype": dtype,
                 "use_low_precision_combine": self.use_low_precision_combine,
-                "can_use_cft_counted_writes": self.can_use_cft_counted_writes,
                 "mnnvl_mem": mnnvl_mem,
                 "workspace": workspace,
                 "metainfo": metainfo,
-                "cft_initialized": False,
             }
         else:
             expected_workspace_state = {
@@ -641,7 +634,6 @@ class NVLinkOneSided(Communication):
                 "hidden_size": hidden_size,
                 "dtype": dtype,
                 "use_low_precision_combine": self.use_low_precision_combine,
-                "can_use_cft_counted_writes": self.can_use_cft_counted_writes,
             }
             for key, expected_value in expected_workspace_state.items():
                 assert workspace_state[key] == expected_value, (
@@ -696,24 +688,227 @@ class NVLinkOneSided(Communication):
         )
         self._workspace_registered = True
 
-        # Initialize CFT Logical Endpoints by binding the LE to the workspace.
-        # The LE IS the workspace — no separate allocation or payload layout needed.
-        if self.can_use_cft_counted_writes and not workspace_state.get("cft_initialized", False):
-            torch.ops.trtllm.moe_a2a_cft_initialize(
-                self.workspace,
-                self.mnnvl_mem.local_mem_handle,
-                int(self.workspace.size(1)),
-                self.ep_rank,
-                self.ep_size,
-            )
-            workspace_state["cft_initialized"] = True
-            NVLinkOneSided._CFT_OWNER_SHAPE = self._cft_shape
-
         # Initialize dispatch state
         self._dispatch_state = {"phase": "idle"}
 
         # Invalid token expert ID (default to -1), the kernels in TRTLLM-gen is hard-code to support -1 only.
         self.invalid_token_expert_id: int = -1
+
+    def _setup_sentinel(
+        self,
+        metainfo: torch.Tensor,
+        hidden_size: int,
+        dtype: torch.dtype,
+        payload_format: Optional[str],
+        fault_tolerant: bool,
+    ) -> None:
+        """Vote on the sentinel transport and, where every rank takes it, append its regions to ``metainfo``.
+
+        Collective over the EP group, once per layout and settings (see ``_SENTINEL_VOTES``).
+        """
+        key = (
+            self.ep_rank,
+            self.ep_size,
+            self.num_experts,
+            self.top_k,
+            self.max_num_tokens_per_rank,
+            hidden_size,
+            dtype,
+            payload_format,
+            fault_tolerant,
+            self.use_low_precision_combine,
+            tuple(metainfo.tolist()),
+            _sentinel_env(),
+        )
+        base_key = tuple(item for i, item in enumerate(key) if i != 7)  # without payload_format
+        first_key = NVLinkOneSided._SENTINEL_FIRST_VOTE_KEYS.get(base_key)
+        first_vote = (
+            NVLinkOneSided._SENTINEL_VOTES.get(first_key)
+            if first_key is not None and first_key != key
+            else None
+        )
+        if first_vote is not None and any(
+            state and tuple(state["metainfo"].tolist()) == first_vote[2]
+            for state in NVLinkOneSided._WORKSPACES.values()
+        ):
+            # A live workspace was laid out for another sentinel format: share it without sentinel
+            # steps rather than allocate a second workspace. Every rank builds its layers in the
+            # same order, so every rank takes this branch alike.
+            _, first_format, layout = first_vote
+            metainfo.copy_(torch.tensor(layout, dtype=metainfo.dtype))
+            message = (
+                f"NVLinkOneSided: a layer with {payload_format} payloads shares the workspace laid "
+                f"out for {first_format} sentinel rows, so it uses the fence transport"
+            )
+            tllm_logger.info_once(message, key=message)
+            return
+        vote = NVLinkOneSided._SENTINEL_VOTES.get(key)
+        if vote is None:
+            vote = self._vote_sentinel(
+                metainfo.clone(), hidden_size, dtype, payload_format, fault_tolerant
+            )
+            NVLinkOneSided._SENTINEL_VOTES[key] = vote
+        NVLinkOneSided._SENTINEL_FIRST_VOTE_KEYS[base_key] = key
+        max_tokens, payload_format, layout = vote
+        metainfo.copy_(torch.tensor(layout, dtype=metainfo.dtype))
+        if max_tokens:
+            self.sentinel_max_tokens = max_tokens
+            self._sentinel_format = payload_format
+            self._sentinel_row = sentinel_row(payload_format, hidden_size, self.top_k)
+
+    def _vote_sentinel(
+        self,
+        metainfo: torch.Tensor,
+        hidden_size: int,
+        dtype: torch.dtype,
+        payload_format: Optional[str],
+        fault_tolerant: bool,
+    ) -> Tuple[int, Optional[str], Tuple[int, ...]]:
+        """The collective sentinel vote: (token limit, 0 when off; payload format; layout).
+
+        Every rank votes its own support and SM count (for the default token limit) along with its
+        raw settings, and parses the settings only after seeing that every rank has the same ones,
+        so an invalid or mismatched setting raises on every rank instead of stranding the others in
+        the collective.
+        """
+        reason = _sentinel_unsupported_reason(
+            ep_size=self.ep_size,
+            top_k=self.top_k,
+            num_slots=self.num_experts,
+            hidden_size=hidden_size,
+            dtype=dtype,
+            payload_format=payload_format,
+            use_low_precision_combine=self.use_low_precision_combine,
+            fault_tolerant=fault_tolerant,
+        )
+        num_sms = (
+            torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+            if reason is None
+            else None
+        )
+        votes = MnnvlMemory.get_comm(self.mapping).allgather(
+            (reason is None, num_sms, _sentinel_env())
+        )
+        if len({vote[2] for vote in votes}) > 1:
+            raise NVLinkOneSidedConfigError(
+                "NVLinkOneSided settings must be the same on every EP rank "
+                f"({SYNC_PROTOCOL_ENV}, {SENTINEL_MAX_TOKENS_ENV}, {_WORKSPACE_MB_ENV} and the removed "
+                f"CFT variables), got {sorted({repr(vote[2]) for vote in votes})}"
+            )
+        protocol = get_sync_protocol()
+        max_tokens_request = get_sentinel_max_tokens()
+        off = (0, None, tuple(metainfo.tolist()))
+        if protocol == "fence":
+            return off
+        if not all(vote[0] for vote in votes):
+            log = tllm_logger.warning_once if protocol == "sentinel" else tllm_logger.info_once
+            message = (
+                "NVLinkOneSided AlltoAll: sentinel transport disabled: "
+                f"{reason or 'another EP rank does not support it'}"
+            )
+            log(message, key=message)
+            return off
+
+        thop = _tllm_internal.thop
+        row = sentinel_row(payload_format, hidden_size, self.top_k)
+        cap = int(thop.MOE_A2A_SENTINEL_MAX_TOKENS_PER_RANK)
+        if max_tokens_request is None:
+            max_tokens = default_sentinel_max_tokens(
+                self.ep_size, min(vote[1] for vote in votes), row
+            )
+        else:
+            if max_tokens_request > cap:
+                tllm_logger.warning_once(
+                    f"{SENTINEL_MAX_TOKENS_ENV}={max_tokens_request} exceeds the sentinel "
+                    f"transport's {cap} tokens per rank; using {cap}",
+                    key="nvlink_one_sided_sentinel_max_tokens_clamped",
+                )
+            max_tokens = min(max_tokens_request, cap)
+        max_tokens = min(max_tokens, self.max_num_tokens_per_rank)
+        size_before = int(metainfo[self.WORKSPACE_SIZE_INDEX])
+        torch.ops.trtllm.moe_a2a_sentinel_extend_workspace_layout(
+            metainfo,
+            max_tokens,
+            int(getattr(thop, f"MOE_A2A_SENTINEL_FORMAT_{payload_format}")),
+            hidden_size,
+        )
+        size_after = int(metainfo[self.WORKSPACE_SIZE_INDEX])
+        workspace_mb = os.environ.get(_WORKSPACE_MB_ENV)
+        if workspace_mb and int(workspace_mb) * (1 << 20) < size_after:
+            # The same setting on every rank (checked above), so every rank turns it off alike.
+            message = (
+                f"NVLinkOneSided AlltoAll: sentinel transport disabled: {_WORKSPACE_MB_ENV}="
+                f"{workspace_mb} leaves no room for its {(size_after - size_before) / (1 << 20):.1f} "
+                "MiB of regions per rank"
+            )
+            tllm_logger.warning_once(message, key=message)
+            return off
+        message = (
+            f"NVLinkOneSided AlltoAll: sentinel transport for {payload_format} steps of up to "
+            f"{max_tokens} tokens per rank, {(size_after - size_before) / (1 << 20):.1f} MiB "
+            "of workspace per rank"
+        )
+        tllm_logger.info_once(message, key=message)
+        return max_tokens, payload_format, tuple(metainfo.tolist())
+
+    def use_sentinel_for_dispatch(
+        self,
+        runtime_max_tokens_per_rank: int,
+        hidden_states: torch.Tensor,
+        hidden_states_sf: Optional[torch.Tensor],
+        token_final_scales: Optional[torch.Tensor],
+        eplb_local_stats: Optional[torch.Tensor],
+    ) -> bool:
+        """Whether the sentinel transport carries this step: few enough tokens, no
+        EPLB statistics and payloads in the instance's format.
+
+        Args:
+            runtime_max_tokens_per_rank: Tokens of the busiest rank in this step.
+            hidden_states: [local_num_tokens, row] payload: bf16 [T, hidden] for a BF16
+                instance, else the quantized bytes (1-byte elements) of its format.
+            hidden_states_sf: [local_num_tokens, scale_row] block scales of a quantized
+                format, else None.
+            token_final_scales: [local_num_tokens, top_k] routing weights, 4-byte or bf16;
+                None when the step carries none.
+            eplb_local_stats: EPLB statistics to gather, or None.
+
+        Depends only on values every rank passes alike, so all ranks take the
+        same transport.
+        """
+        row = self._sentinel_row
+        if (
+            row is None
+            or runtime_max_tokens_per_rank > self.sentinel_max_tokens
+            or eplb_local_stats is not None
+        ):
+            return False
+
+        def row_bytes(tensor: Optional[torch.Tensor]) -> int:
+            if tensor is None:
+                return 0
+            return tensor.shape[1] * tensor.element_size() if tensor.dim() == 2 else -1
+
+        if (row_bytes(hidden_states), row_bytes(hidden_states_sf)) != (
+            row.hidden_bytes,
+            row.scale_bytes,
+        ):
+            return False
+        # Senders rewrite payload words equal to a sentinel the way the format
+        # keeps its values (NaN stays NaN), so the dtype must be the format's.
+        if self._sentinel_format == "BF16":
+            if hidden_states.dtype != torch.bfloat16:
+                return False
+        elif hidden_states.element_size() != 1:  # quantized values are bytes
+            return False
+        # Routing weights travel as 4-byte words; bf16 weights (TRTLLM-Gen) as the fp32 words
+        # of their values, which the receiver narrows back exactly.
+        return token_final_scales is None or (
+            token_final_scales.dim() == 2
+            and token_final_scales.shape[1] == self.top_k
+            and (
+                token_final_scales.element_size() == 4 or token_final_scales.dtype == torch.bfloat16
+            )
+        )
 
     @property
     def moe_a2a_metainfo(self) -> torch.Tensor:
@@ -753,34 +948,10 @@ class NVLinkOneSided(Communication):
         if workspace_state is None:
             return
 
-        owns_cft = workspace_state.get("cft_initialized", False)
-        try:
-            if owns_cft:
-                # The C++ manager owns a logical endpoint bound to this
-                # allocation. Destroy it before dropping the final Python
-                # references to the MNNVL memory, otherwise the endpoint
-                # outlives its backing pages and a recycled virtual address
-                # could resolve to it.
-                torch.ops.trtllm.moe_a2a_cft_release(
-                    workspace_state["workspace"], workspace_state["ep_rank"]
-                )
-        finally:
-            # This workspace held the process-wide endpoints, so a later
-            # workspace may claim them. Clear the owner even when the release
-            # raised: the entry is dropped below either way.
-            if owns_cft:
-                cls._CFT_OWNER_SHAPE = None
-            # Drop the workspace whether or not the release succeeded. By the
-            # time we get here ``destroy`` has already decremented the refcount
-            # and unregistered the lifecycle, so nothing will call this again:
-            # leaving the entry behind would hand a later communicator an
-            # allocation whose endpoint state is unknown. The exception still
-            # propagates -- the caller learns the release failed, but not by
-            # inheriting a reusable half-released workspace.
-            cls._WORKSPACES.pop(workspace_key, None)
-            if cls._WORKSPACE is workspace_state:
-                cls._WORKSPACE = None
-            workspace_state.clear()
+        cls._WORKSPACES.pop(workspace_key, None)
+        if cls._WORKSPACE is workspace_state:
+            cls._WORKSPACE = None
+        workspace_state.clear()
 
     def destroy(self):
         """Release this instance's reference after all ranks finish using the workspace."""
@@ -840,22 +1011,6 @@ class NVLinkOneSided(Communication):
         """
         return True
 
-    def use_cft_for_dispatch(self, runtime_max_tokens_per_rank: int) -> bool:
-        return should_use_cft(
-            self.can_use_cft_counted_writes,
-            self._force_cft,
-            self.cft_max_batch_for_dispatch,
-            runtime_max_tokens_per_rank,
-        )
-
-    def use_cft_for_combine(self, runtime_max_tokens_per_rank: int) -> bool:
-        return should_use_cft(
-            self.can_use_cft_counted_writes,
-            self._force_cft,
-            self.cft_max_batch_for_combine,
-            runtime_max_tokens_per_rank,
-        )
-
     def _require_mapped(self) -> None:
         if not self.mnnvl_mem.mapped:
             raise RuntimeError("Native MoE All-to-All workspace handles are unmapped")
@@ -864,26 +1019,8 @@ class NVLinkOneSided(Communication):
         """Identify wrappers sharing the same MNNVL workspace lifecycle."""
         return id(self._require_workspace_lifecycle())
 
-    def checkpoint_blocked_reason(self) -> Optional[str]:
-        """Block checkpointing while CFT counted writes are in use.
-
-        CFT binds logical endpoints to the workspace for the life of the
-        process, and detaching the backing memory would strand them.
-        """
-        if self.can_use_cft_counted_writes:
-            return (
-                "the MoE All-to-All workspace uses CFT counted writes, which pin "
-                "the workspace for the lifetime of the process. Set "
-                "TRTLLM_NVLINK_ONE_SIDED_A2A_FORCE_CFT=0 to select fence-based "
-                "dispatch and enable sleep/wakeup"
-            )
-        return None
-
     def checkpoint_prepare(self) -> None:
         """Collectively detach handles after every shared owner is idle."""
-        reason = self.checkpoint_blocked_reason()
-        if reason is not None:
-            raise RuntimeError(f"Cannot checkpoint the MoE All-to-All workspace: {reason}")
         self._require_workspace_lifecycle().checkpoint_prepare()
 
     def checkpoint_restore(
@@ -948,7 +1085,11 @@ class NVLinkOneSided(Communication):
 
         Returns:
             Tuple of (hidden_states, hidden_states_sf, token_selected_slots, token_final_scales)
-            Each tensor has shape [ep_size, max_tokens_per_rank, ...]
+            Each tensor has shape [ep_size, max_tokens_per_rank, ...]. On a sentinel step
+            (``use_sentinel_for_dispatch``) the rows are not compacted: row [src, t] holds token
+            t of rank src for t < runtime_max_tokens_per_rank, and a row whose token is not routed
+            to this rank (or that rank src does not have) has ``invalid_token_expert_id`` in every
+            top-k slot.
         """
         self._require_mapped()
         if self._dispatch_state.get("phase") == "dispatched":
@@ -957,7 +1098,16 @@ class NVLinkOneSided(Communication):
 
         # Calculate runtime_max_tokens_per_rank from all_rank_num_tokens
         runtime_max_tokens_per_rank = max(all_rank_num_tokens)
-        can_use_cft_for_dispatch = self.use_cft_for_dispatch(runtime_max_tokens_per_rank)
+        eplb_local_stats = kwargs.get("eplb_local_stats")
+        # The sentinel transport takes every step it can carry: its combine receives and
+        # reduces each token in the same kernel as it lands.
+        use_sentinel = self.use_sentinel_for_dispatch(
+            runtime_max_tokens_per_rank,
+            hidden_states,
+            hidden_states_sf,
+            token_final_scales,
+            eplb_local_stats,
+        )
 
         # Build payloads list - match TRTLLMGen baseline order for optimal performance
         # Order: [hidden_states, hidden_states_sf (optional), token_selected_slots, token_final_scales (optional)]
@@ -970,13 +1120,8 @@ class NVLinkOneSided(Communication):
         payloads.append(token_selected_slots)
         if token_final_scales is not None:
             payloads.append(token_final_scales)
-        can_use_cft_for_dispatch = _use_cft_for_dispatch_payloads(
-            can_use_cft_for_dispatch, payloads
-        )
         expert_id_payload_index = len(payloads) - (2 if token_final_scales is not None else 1)
-        can_fuse_sanitize = can_use_cft_for_dispatch
 
-        eplb_local_stats = kwargs.get("eplb_local_stats")
         if eplb_local_stats is not None:
             assert self.enable_eplb, "eplb_local_stats provided but enable_eplb is False"
             assert eplb_local_stats.dim() == 1, "eplb_local_stats must be a 1D tensor"
@@ -1003,16 +1148,19 @@ class NVLinkOneSided(Communication):
                 self.top_k,
                 self.num_experts,
                 eplb_local_stats,
-                can_use_cft_for_dispatch,
-                expert_id_payload_index if can_fuse_sanitize else None,
-                int(self.invalid_token_expert_id) if can_fuse_sanitize else None,
-                self._rank_mask_enabled,
-                active_rank_mask,
+                # A sentinel dispatch fills the expert IDs of rows without a token itself.
+                expert_id_payload_index=expert_id_payload_index if use_sentinel else None,
+                invalid_token_expert_id=int(self.invalid_token_expert_id) if use_sentinel else None,
+                enable_rank_mask=self._rank_mask_enabled,
+                active_rank_mask=active_rank_mask,
+                use_sentinel=use_sentinel,
             )
         )
-        self._watchdog_coordinator.watch_collective(
-            self._alltoall_watchdog, "dispatch", active_rank_mask
-        )
+        # A sentinel round writes no completion flags for the watchdog to observe.
+        if not use_sentinel:
+            self._watchdog_coordinator.watch_collective(
+                self._alltoall_watchdog, "dispatch", active_rank_mask
+            )
         if eplb_gathered_stats.numel() == 0:
             eplb_gathered_stats = None
         self._dispatch_state["eplb_gathered_stats"] = eplb_gathered_stats
@@ -1020,6 +1168,7 @@ class NVLinkOneSided(Communication):
         self._dispatch_state["local_num_tokens"] = token_selected_slots.size(0)
         self._dispatch_state["runtime_max_tokens_per_rank"] = runtime_max_tokens_per_rank
         self._dispatch_state["active_rank_mask_snapshot"] = active_rank_mask_snapshot
+        self._dispatch_state["sentinel"] = use_sentinel
         self._dispatch_state["phase"] = "dispatched"
 
         # Extract results from recv_buffers
@@ -1035,7 +1184,7 @@ class NVLinkOneSided(Communication):
             token_selected_slots_recv = recv_buffers[1]
             token_final_scales_recv = recv_buffers[2] if token_final_scales is not None else None
 
-        if not can_fuse_sanitize:
+        if not use_sentinel:
             torch.ops.trtllm.moe_a2a_sanitize_expert_ids(
                 token_selected_slots_recv,
                 self.workspace,
@@ -1132,11 +1281,8 @@ class NVLinkOneSided(Communication):
             active_rank_mask_snapshot,
             requested_active_rank_mask,
         )
-        use_cft_for_combine = _use_cft_for_combine_payload(
-            self.use_cft_for_combine(runtime_max_tokens_per_rank),
-            final_hidden_states,
-            self.use_low_precision_combine,
-        )
+        # A sentinel dispatch is followed by a sentinel combine.
+        use_sentinel = bool(self._dispatch_state.get("sentinel", False))
         output = torch.ops.trtllm.moe_a2a_combine(
             final_hidden_states,
             int(local_num_tokens),
@@ -1148,14 +1294,15 @@ class NVLinkOneSided(Communication):
             self.top_k,
             int(combine_payload_offset),
             bool(self.payload_in_workspace),
-            bool(self.use_low_precision_combine),
-            use_cft_for_combine,
-            self._rank_mask_enabled,
-            active_rank_mask,
+            use_low_precision=bool(self.use_low_precision_combine),
+            enable_rank_mask=self._rank_mask_enabled,
+            active_rank_mask=active_rank_mask,
+            use_sentinel=use_sentinel,
         )
-        self._watchdog_coordinator.watch_collective(
-            self._alltoall_watchdog, "combine", active_rank_mask
-        )
+        if not use_sentinel:
+            self._watchdog_coordinator.watch_collective(
+                self._alltoall_watchdog, "combine", active_rank_mask
+            )
 
         # Reset state for next round
         self.reset_state()
@@ -1169,6 +1316,12 @@ class NVLinkOneSided(Communication):
         recover from a forward that called ``dispatch`` but did not reach
         ``combine`` — e.g. because an OOM aborted the forward. Without this,
         the next ``dispatch`` would raise ``dispatch called twice``.
+
+        It resets this Python state machine only. After a sentinel dispatch
+        without its combine, the native op still holds the round open, and the
+        peers' rows of that round are still in flight; only re-initializing
+        the workspace (``moe_a2a_initialize``, collective) recovers it. The
+        in-tree caller (the warmup OOM handler) runs only without peers.
         """
         self._dispatch_state = {"phase": "idle"}
 

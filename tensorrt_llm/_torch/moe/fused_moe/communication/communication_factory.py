@@ -21,7 +21,7 @@ hardware support and configuration.
 """
 
 import os
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -40,8 +40,11 @@ from .base import Communication
 from .deep_ep import DeepEP
 from .deep_ep_low_latency import DeepEPLowLatency
 from .nccl_ep import NcclEP
-from .nvlink_one_sided import NVLinkOneSided
+from .nvlink_one_sided import NVLinkOneSided, NVLinkOneSidedConfigError, sentinel_payload_format
 from .nvlink_two_sided import NVLinkTwoSided
+
+if TYPE_CHECKING:
+    from tensorrt_llm.models.modeling_utils import QuantConfig
 
 # Temporary NCCL-EP v0.1.0 limitation. The LL combine kernel derives its
 # warp-group count and dynamic-SMEM requirement here:
@@ -94,6 +97,7 @@ class CommunicationFactory:
         hidden_size: Optional[int] = None,
         communication_method: Optional[str] = None,
         allow_alltoall: bool = True,
+        layer_quant_config: Optional["QuantConfig"] = None,
     ) -> Optional[Communication]:
         """
         Create the best communication method for the given configuration
@@ -122,6 +126,8 @@ class CommunicationFactory:
             communication_method: Optional model-selected communication method.
                 ``TRTLLM_FORCE_COMM_METHOD`` takes precedence when set.
             allow_alltoall: Whether the backend supports all-to-all dispatch.
+            layer_quant_config: The MoE layer's own quant config when it overrides the model's
+                (mixed-precision checkpoints); it decides the rows the layer dispatches.
             # TODO: Need a way to indicate whether EPLB is enabled.
 
         Returns:
@@ -154,6 +160,12 @@ class CommunicationFactory:
         moe_max_num_tokens = model_config.moe_max_num_tokens
         use_cuda_graph = model_config.use_cuda_graph
         use_low_precision_combine = model_config.use_low_precision_moe_combine
+        dispatch_quant_config = (
+            layer_quant_config if layer_quant_config is not None else quant_config
+        )
+        sentinel_format = sentinel_payload_format(
+            dispatch_quant_config.quant_algo if dispatch_quant_config is not None else None
+        )
 
         # If attention does not use data parallelism (either uses TP or single card), no MoE communication is needed
         if (not mapping.enable_attention_dp) or mapping.dp_size == 1:
@@ -195,6 +207,7 @@ class CommunicationFactory:
                 payload_in_workspace,
                 alltoall_result_do_sum,
                 hidden_size=hidden_size,
+                layer_quant_config=layer_quant_config,
             )
             logger.info(
                 f"Selected communication strategy: {strategy.__class__.__name__} "
@@ -223,9 +236,14 @@ class CommunicationFactory:
                 ep_group_health=ep_group_health,
                 alltoall_watchdog_timeout_s=watchdog_timeout_s,
                 alltoall_watchdog_poll_interval_s=watchdog_poll_interval_s,
+                sentinel_payload_format=sentinel_format,
             )
             logger.info("Selected communication strategy: NVLinkOneSided")
             return strategy
+        except NVLinkOneSidedConfigError:
+            # An invalid setting, raised on every rank alike: fail instead of silently
+            # selecting another strategy.
+            raise
         except Exception as e:
             logger.info(f"NVLinkOneSided not available: {e}")
 
@@ -339,9 +357,13 @@ class CommunicationFactory:
         payload_in_workspace: bool,
         alltoall_result_do_sum: bool,
         hidden_size: Optional[int] = None,
+        layer_quant_config: Optional["QuantConfig"] = None,
     ) -> Communication:
         """
         Create a specific method (for debugging/testing)
+
+        ``layer_quant_config`` is the MoE layer's own quantization config when it overrides the
+        model's; the NVLinkOneSided sentinel payload format follows it.
 
         Raises:
             RuntimeError: If the forced method is not supported on this platform
@@ -357,6 +379,12 @@ class CommunicationFactory:
         moe_max_num_tokens = model_config.moe_max_num_tokens
         use_cuda_graph = model_config.use_cuda_graph
         use_low_precision_combine = model_config.use_low_precision_moe_combine
+        dispatch_quant_config = (
+            layer_quant_config if layer_quant_config is not None else quant_config
+        )
+        sentinel_format = sentinel_payload_format(
+            dispatch_quant_config.quant_algo if dispatch_quant_config is not None else None
+        )
 
         method = method.upper()
 
@@ -397,6 +425,7 @@ class CommunicationFactory:
                 ep_group_health=ep_group_health,
                 alltoall_watchdog_timeout_s=watchdog_timeout_s,
                 alltoall_watchdog_poll_interval_s=watchdog_poll_interval_s,
+                sentinel_payload_format=sentinel_format,
             )
         elif method == "DEEPEP":
             return DeepEP(
