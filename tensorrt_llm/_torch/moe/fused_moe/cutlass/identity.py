@@ -14,7 +14,7 @@
 # limitations under the License.
 """CUTLASS-family identity segments, shared contracts and the descriptor factory.
 
-Ten leaves are ``trtllm.cutlass.grouped_gemm.<quant>``. Each ``fp8_block_scales``
+Eleven leaves are ``trtllm.cutlass.grouped_gemm.<quant>``. Each ``fp8_block_scales``
 leaf names the kernel it runs instead: ``deepgemm.cuda.hopper_grouped_gemm``
 (:mod:`.fp8_block_scales_hopper`) and ``trtllm.triton.grouped_gemm``
 (:mod:`.fp8_block_scales_triton`).
