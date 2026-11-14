@@ -399,7 +399,7 @@ def env(monkeypatch):
     calls = types.SimpleNamespace(fold=[], stock=[], v2=[])
     _Deferred.calls = []
 
-    def fold_op(shared, plane, scores, residual, weight, eps, write_norm, pdl):
+    def fold_op(shared, plane, scores, residual, weight, eps, write_norm, pdl, dual=True):
         calls.fold.append((shared, plane, scores, residual, weight, eps, write_norm, pdl))
         if getattr(calls, "raise_", False):
             raise RuntimeError("minimax_m31_ctx_boundary_normq_topk: bad arguments")
