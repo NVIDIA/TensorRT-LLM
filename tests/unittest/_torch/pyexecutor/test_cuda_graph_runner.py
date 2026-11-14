@@ -75,6 +75,38 @@ class GraphOwnerTeardownTestCase(unittest.TestCase):
         runner.clear.assert_called_once_with(release_nccl_window_owners=False)
 
 
+class SleepPaddingTestCase(unittest.TestCase):
+    def test_release_snapshots_variants_without_clearing_graphs(self) -> None:
+        """Release uses the existing all-manager path once per draft length."""
+        runner = Mock(spec=CUDAGraphRunner)
+        low = {0: Mock(), 2: Mock()}
+        high = {2: Mock()}
+        runner._padding_dummy_caches.return_value = (low, high)
+        owners = Mock()
+        variants = CUDAGraphRunner.release_padding_dummies(runner, owners)
+        self.assertEqual(variants, ((0, 0), (2, 0), (2, 1)))
+        self.assertEqual(runner.release_padding_dummy.call_count, 2)
+        runner.clear.assert_not_called()
+
+    def test_restore_initializes_every_saved_variant(self) -> None:
+        """Recreation goes through normal creation, including the high-row dummy."""
+        runner = Mock(spec=CUDAGraphRunner)
+        variants = ((0, 0), (2, 0), (2, 1))
+        owners = Mock()
+        CUDAGraphRunner.restore_padding_dummies(runner, owners, variants)
+        for draft_len, variant in variants:
+            runner._get_or_create_padding_dummy.assert_any_call(owners, draft_len, variant=variant)
+        self.assertEqual(runner._get_or_create_padding_dummy.call_count, 3)
+        runner.clear.assert_not_called()
+
+    def test_restore_requires_each_prior_dummy(self) -> None:
+        """Required padding cannot silently disappear after wake."""
+        runner = Mock(spec=CUDAGraphRunner)
+        runner._get_or_create_padding_dummy.side_effect = [Mock(), None]
+        with self.assertRaisesRegex(RuntimeError, "draft_len=2, variant=1"):
+            CUDAGraphRunner.restore_padding_dummies(runner, Mock(), ((2, 0), (2, 1)))
+
+
 class GraphKeyTestCase(unittest.TestCase):
     def test_graph_key_forwards_promoted_context_ids(self) -> None:
         runner = Mock()

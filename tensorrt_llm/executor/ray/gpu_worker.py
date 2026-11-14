@@ -25,7 +25,8 @@ import ray
 import torch
 
 from tensorrt_llm._torch.utils import get_device_uuid
-from tensorrt_llm._torch.virtual_memory import (materialize_with_tag,
+from tensorrt_llm._torch.virtual_memory import (MemoryReleaseAbortedError,
+                                                materialize_with_tag,
                                                 release_with_tag)
 from tensorrt_llm.executor.ray.utils import (_configure_deep_gemm_cache,
                                              control_action_decorator)
@@ -192,6 +193,9 @@ class RayWorkerWrapper:
             raise AttributeError(
                 f"The RayGPUWorker has no method called '{method_name}'.")
 
+    def wait_for_pending_calls(self) -> None:
+        """Complete after earlier calls on this serial actor have returned."""
+
     def shutdown(self):
         if hasattr(self, 'worker'):
             self.worker.shutdown()
@@ -326,6 +330,51 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
                         result_wait_queue: Queue | None = None) -> int:
         return self._enqueue_request(request, result_wait_queue)
 
+    def validate_sleep(self, sleep_tags: List[str]) -> None:
+        """Validate configuration before dispatch; page-capacity checks require draining.
+
+        Args:
+            sleep_tags: Runtime memory tags selected for release.
+
+        Raises:
+            AssertionError: The worker does not use TorchLLM.
+            ValueError: Sleep is disabled, a tag is invalid, or configuration is unsupported.
+            RuntimeError: Admission state does not allow a new release.
+            NotImplementedError: An external KV owner has no release lifecycle.
+        """
+        assert isinstance(self.llm_args,
+                          TorchLlmArgs), "sleep() only available for TorchLLM"
+        if self.llm_args.sleep_config is None:
+            raise ValueError(
+                "Sleep feature is not enabled, please set sleep_config in the LLM arguments."
+            )
+        tags = self._prepare_sleep_tags(
+            [ExecutorMemoryType(tag) for tag in sleep_tags])
+        if tags:
+            self._validate_sleep_tags(tags)
+            self._validate_sleep_config(tags)
+
+    def validate_wakeup(self, wakeup_tags: List[str]) -> None:
+        """Check wakeup inputs and state without changing admission or memory.
+
+        Args:
+            wakeup_tags: Runtime memory tags to restore.
+
+        Raises:
+            AssertionError: The worker does not use TorchLLM.
+            ValueError: Sleep is disabled or a tag is invalid.
+            TypeError: The argument cannot be iterated as memory tags.
+            RuntimeError: The worker is not running or parked.
+        """
+        assert isinstance(self.llm_args,
+                          TorchLlmArgs), "wakeup() only available for TorchLLM"
+        if self.llm_args.sleep_config is None:
+            raise ValueError(
+                "Sleep feature is not enabled, please set sleep_config in the LLM arguments."
+            )
+        self._prepare_wakeup_tags(
+            [ExecutorMemoryType(tag) for tag in wakeup_tags])
+
     def sleep(self, sleep_tags: List[str]) -> None:
         assert isinstance(self.llm_args,
                           TorchLlmArgs), "sleep() only available for TorchLLM"
@@ -346,14 +395,19 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
         try:
             with self.engine.control_action():
                 torch.cuda.synchronize()
+                self._validate_sleep_config(tags)
+                self._validate_memory_release(tags)
                 mutation_started = True
                 self._invalidate_v1_prefix_cache_for_sleep(tags)
-                release_with_tag(*tags)
+                release_with_tag(*tags, resource=self.engine)
                 torch.cuda.synchronize()
                 gc.collect()
                 torch.cuda.empty_cache()
-        except Exception:
-            if mutation_started:
+        except Exception as error:
+            distributed = self.llm_args.parallel_config.world_size > 1
+            recovered = isinstance(error, MemoryReleaseAbortedError)
+            # Other actors may have committed while this actor was validating.
+            if distributed or (mutation_started and not recovered):
                 self.engine.fail_sleep_wakeup_transition()
             self.engine.abort_sleep_transition()
             logger.error("Encountered an error in sleep:\n"
@@ -365,7 +419,6 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
             self.engine.fail_sleep_wakeup_transition()
             raise
 
-    @control_action_decorator
     def wakeup(self, wakeup_tags: List[str]):
         assert isinstance(self.llm_args,
                           TorchLlmArgs), "wakeup() only available for TorchLLM"
@@ -379,13 +432,18 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
         if not tags:
             return
 
+        self._wakeup(tags)
+
+    @control_action_decorator
+    def _wakeup(self, tags: list[ExecutorMemoryType]) -> None:
+        """Restore parked tags after draining the control barrier."""
         logger.info(f"Wakeup: {tags}")
         self.engine.begin_wakeup_transition(tags)
         mutation_started = False
         try:
             torch.cuda.synchronize()
             mutation_started = True
-            materialize_with_tag(*tags)
+            materialize_with_tag(*tags, resource=self.engine)
             torch.cuda.synchronize()
         except Exception:
             if mutation_started:

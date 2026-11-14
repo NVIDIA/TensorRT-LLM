@@ -86,6 +86,8 @@ public:
     }
 
 private:
+    friend class KvCacheIntrospection;
+
     size_t mPhysMemSize{};
     int mDeviceId{};
     CUmemAllocationProp mProp{};

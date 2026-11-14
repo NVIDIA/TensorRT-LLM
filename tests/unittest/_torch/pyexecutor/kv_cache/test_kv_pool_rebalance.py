@@ -44,6 +44,7 @@ import torch
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheEventManager, OutOfPagesError
 
 pytestmark = pytest.mark.cpu_only
@@ -94,6 +95,7 @@ def _make_executor(
 
     # Gate inputs.
     exe.enable_kv_pool_rebalance = enable_kv_pool_rebalance
+    exe._sleeping_memory_tags = set()
     exe.dist = MagicMock(pp_size=pp_size, tp_size=tp_size, cp_size=cp_size)
     exe.enable_attention_dp = enable_attention_dp
     exe.disable_overlap_scheduler = disable_overlap_scheduler
@@ -231,6 +233,15 @@ class TestCanPauseForRebalance:
     def test_flag_off_returns_false(self):
         exe = _make_executor(enable_kv_pool_rebalance=False)
         assert PyExecutor._can_pause_for_rebalance(exe) is False
+
+    def test_sleeping_memory_blocks_rebalance_until_restored(self) -> None:
+        """Released KV backing prevents rebalance until the sleep tag is cleared."""
+        exe = _make_executor(rebalance_check_interval=1)
+        exe._sleeping_memory_tags = {ExecutorMemoryType.KV_CACHE}
+        assert PyExecutor._can_pause_for_rebalance(exe) is False
+
+        exe._sleeping_memory_tags.clear()
+        assert PyExecutor._can_pause_for_rebalance(exe) is True
 
     def test_pp_size_gt_one_is_allowed(self):
         """PP no longer short-circuits the gate.

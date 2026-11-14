@@ -7930,8 +7930,9 @@ class TorchLlmArgs(BaseLlmArgs):
                 f"{feature} is not supported together with a KV connector.")
         if self.sleep_config is not None:
             raise ValueError(
-                f"{feature} requires KVCacheManagerV2, which does not support "
-                "sleep_config.")
+                f"{feature} with sleep_config is not supported; "
+                "pool restoration for this configuration has not been qualified."
+            )
         sparse = self.sparse_attention_config
         if sparse is not None and sparse.algorithm not in ("dsa",
                                                            "deepseek_v4"):

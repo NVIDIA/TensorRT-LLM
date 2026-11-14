@@ -6,9 +6,11 @@ from __future__ import annotations
 
 import contextlib
 import unittest
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import Mock
 
+import pytest
 import torch
 from _torch.pyexecutor.engine_test_utils import DummyModel, _create_request
 from _torch.pyexecutor.engine_test_utils import kv_cache_manager as managed_kv_cache
@@ -19,8 +21,10 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     CUDAGraphRunnerConfig,
     KeyType,
 )
+from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType, KvCacheConfig, SleepConfig
 from tensorrt_llm.mapping import Mapping
 
 if TYPE_CHECKING:
@@ -33,6 +37,7 @@ if TYPE_CHECKING:
 def cuda_graph_runner_and_kv_cache(
     *,
     execution_stream: torch.cuda.Stream | None = None,
+    config: KvCacheConfig | None = None,
 ) -> Iterator[tuple[CUDAGraphRunner, KVCacheManagerV2]]:
     runner = CUDAGraphRunner(
         CUDAGraphRunnerConfig(
@@ -53,7 +58,7 @@ def cuda_graph_runner_and_kv_cache(
         )
     )
     with managed_kv_cache(
-        model=DummyModel(torch.half), execution_stream=execution_stream
+        model=DummyModel(torch.half), execution_stream=execution_stream, config=config
     ) as manager:
         try:
             yield runner, manager
@@ -245,6 +250,60 @@ class CudaGraphPaddingTestCase(unittest.TestCase):
             for dummy in runner.padding_dummy_requests.values():
                 kv_cache_manager.free_resources(dummy)
             runner.padding_dummy_requests.clear()
+
+
+@pytest.mark.parametrize("mode", ["NONE", "MEMSET", "CPU", "PINNED"])
+@pytest.mark.parametrize("draft_len", [0, 2])
+def test_sleep_recreates_dummy_and_replays_original_graph(mode: str, draft_len: int) -> None:
+    """Native pool sleep reuses a captured graph with a new dummy cache object."""
+    config = KvCacheConfig(max_gpu_total_bytes=4 << 20, host_cache_size=8 << 20)
+    with cuda_graph_runner_and_kv_cache(config=config) as (runner, manager):
+        resource_manager = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: manager})
+        executor = object.__new__(PyExecutor)
+        executor.resource_manager = resource_manager
+        executor.model_engine = SimpleNamespace(cuda_graph_runner=runner)
+        executor.draft_model_engine = None
+        executor._sleeping_memory_tags = set()
+        executor.llm_args = SimpleNamespace(
+            sleep_config=SleepConfig(restore_modes={ExecutorMemoryType.KV_CACHE: mode})
+        )
+        dummy = runner._get_or_create_padding_dummy(resource_manager, draft_len)
+        assert dummy is not None
+        request_id = dummy.py_request_id
+        kv_pool = manager.get_buffers(0)
+        pool_address = kv_pool.data_ptr()
+        offsets = torch.zeros(
+            (manager.num_attention_op_pools, 1, 2, manager.max_blocks_per_seq),
+            dtype=torch.int32,
+            device="cuda",
+        )
+        result = torch.empty((), dtype=torch.float32, device="cuda")
+        manager.copy_batch_block_offsets(offsets, [request_id], 1, 0, 1)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            selected = kv_pool.flatten(0, 1).index_select(0, offsets[0, 0, 0, :1].long())
+            result.copy_(selected.sum(dtype=torch.float32))
+        tags = (ExecutorMemoryType.KV_CACHE,)
+        try:
+            for _ in range(3):
+                previous = manager.kv_cache_map[request_id]
+                executor.release_memory(tags)
+                assert not runner.padding_dummy_requests
+                assert request_id not in manager.kv_cache_map
+                executor.materialize_memory(tags)
+                assert manager.kv_cache_map[request_id] is not previous
+                assert manager.get_buffers(0).data_ptr() == pool_address
+                manager.copy_batch_block_offsets(offsets, [request_id], 1, 0, 1)
+                page = manager.get_batch_cache_indices([request_id], layer_idx=0)[0][0]
+                kv_pool[page].fill_(1)
+                graph.replay()
+                torch.cuda.synchronize()
+                assert result.item() == kv_pool.flatten(0, 1)[0].numel()
+                assert not executor._sleeping_memory_tags
+        finally:
+            torch.cuda.synchronize()
+            del graph, selected, result, offsets, kv_pool
+            runner.release_padding_dummies(resource_manager)
 
 
 class ExecutionStreamTestCase(unittest.TestCase):

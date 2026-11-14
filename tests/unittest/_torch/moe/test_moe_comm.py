@@ -2794,6 +2794,10 @@ def _worker_mnnvl_engine_checkpoint_coordination(config: CommTestConfig) -> bool
     executor.draft_model_engine = None
     executor._is_kv_manager_v2 = False
     executor.enable_kv_cache_reuse = False
+    executor._sleeping_memory_tags = set()
+    executor._sleep_padding_dummies = []
+    executor._sleep_guard_managers = []
+    executor._pp_rebalance_drain_iters = None
 
     class _ControlRequestQueue:
         def enqueue_control_request(self, *, drain, control_id):
@@ -2811,6 +2815,7 @@ def _worker_mnnvl_engine_checkpoint_coordination(config: CommTestConfig) -> bool
     retained_objects.append((communication, sleep_wakeup_comm, control_comm, executor))
     worker = object.__new__(BaseWorker)
     worker.doing_shutdown = True
+    worker._fatal_error = None
     worker._backend = "pytorch"
     worker.rank = rank
     worker.engine = executor

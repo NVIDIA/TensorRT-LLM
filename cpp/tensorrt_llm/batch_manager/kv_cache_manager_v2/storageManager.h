@@ -33,6 +33,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <unordered_map>
 #include <vector>
 
@@ -159,6 +160,9 @@ public:
 
     // Release a slot back to its pool.
     void releaseSlot(LifeCycleId lc, CacheLevel level, Slot slot);
+
+    //! Initialize a discarded cold slot with the codec's representation of a zero hot page.
+    void initializeColdSlot(LifeCycleId lc, CacheLevel level, Slot& destination);
 
     // ---- Eviction ----------------------------------------------------------
 
@@ -335,6 +339,20 @@ public:
     // Pool-group slot count (number of pages).
     [[nodiscard]] SlotCount numSlots(PoolGroupIndex pgIdx, CacheLevel level = kHotLevel) const;
 
+    //! Release GPU backing, or empty GPU and HOST pools when discarding. Retain GPU virtual addresses.
+    void releaseMemory(bool discard);
+
+    //! Check that the configured cold pools can accept required GPU pages without dropping held pages.
+    void validateReleaseMemory(std::set<Page const*> const& requiredPages) const;
+
+    //! Restore saved HOST and GPU pool capacities, optionally zeroing GPU backing.
+    void materializeMemory(bool zero);
+
+    bool hasSavedPoolCapacities() const noexcept
+    {
+        return mSleepingPoolSlots.has_value();
+    }
+
     // Layer-to-lifecycles mapping (for KvCacheManager queries); see StorageConfig::layerToLifeCycleIds().
     std::unordered_map<LayerId, std::vector<LifeCycleId>> const& layerToLifeCycleIds() const noexcept
     {
@@ -356,6 +374,13 @@ private:
     using PageQueue = std::deque<SharedPtr<Page>>;
     using PagesByLifeCycle = TypedVec<LifeCycleId, PageQueue>;
     using MigrationBatchKey = std::pair<CacheLevel, LayerGroupId>;
+    using SleepOffloadPlan = TypedVec<CacheLevel, TypedVec<LifeCycleId, SlotCount>>;
+
+    //! Assign required GPU pages to free or droppable non-GPU slots, without mutation.
+    SleepOffloadPlan _planSleepOffload(std::set<Page const*> const& requiredPages) const;
+
+    //! Place held pages according to the preflight plan, then offload reusable pages.
+    void _offloadForSleep();
 
     // Minimum per-pool-group slot counts to support a BatchDesc.
     TypedVec<PoolGroupIndex, SlotCount> computePoolGroupSlotsForBatch(
@@ -534,6 +559,7 @@ private:
     std::unique_ptr<PooledPhysMemAllocator> mGpuPhysMemAllocator;
     RetentionExpiryQueue mRetentionExpiries;
     TypedVec<CacheLevel, CacheLevelManager> mLevels;
+    std::optional<TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotCount>>> mSleepingPoolSlots;
 
     static constexpr size_t kDefaultPageStagingBytes = 64u << 20u;
     static constexpr size_t kPageStagingDepth = 3;

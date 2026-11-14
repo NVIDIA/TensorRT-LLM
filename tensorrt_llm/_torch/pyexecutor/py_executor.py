@@ -88,7 +88,7 @@ from .adp_iter_stats import ADPIterStatsBuffer
 from .config_utils import is_decode_only
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .connectors.kv_cache_layout import build_kv_cache_layout_v2
-from .cuda_graph_runner import ADPShapeAgreement
+from .cuda_graph_runner import ADPShapeAgreement, CUDAGraphRunner
 from .disagg_adapter import PyExecutorEffects, PyExecutorRequestRegistry
 from .dwdp import DwdpManager
 from .error_classification import ErrorBudget
@@ -124,9 +124,9 @@ from .profiling import load_iteration_indexes as _load_iteration_indexes
 from .request_utils import (RequestBroadcaster,
                             derive_attention_dp_per_rank_request_cap,
                             get_from_waiting_queue, merge_requests)
-from .resource_manager import (NoFreeSlotsError, ResourceManager,
-                               ResourceManagerType, is_context_only_kv_cache,
-                               request_context)
+from .resource_manager import (KVCacheManager, NoFreeSlotsError,
+                               ResourceManager, ResourceManagerType,
+                               is_context_only_kv_cache, request_context)
 from .runtime_hooks import ExecutorEvents, RuntimeHooks, runtime_hooks_of
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
                       SampleStateTensors)
@@ -451,10 +451,24 @@ def _sleep_wakeup_ack_ready(comm, source: int, tag: _SleepWakeupTag) -> bool:
 
 def _recv_sleep_wakeup_ack_until(comm,
                                  source: int,
-                                 deadline: float,
+                                 deadline: Optional[float],
                                  expected_op_id: Optional[str] = None,
                                  expected_phase: Optional[str] = None) -> dict:
-    """Receive a sleep/wakeup ACK before an absolute monotonic deadline."""
+    """Receive an ACK, optionally bounded by an absolute monotonic deadline.
+
+    Args:
+        comm: Communicator with nonblocking probe and receive operations.
+        source: Rank whose acknowledgement is required.
+        deadline: Monotonic deadline, or None for unbounded reconstruction.
+        expected_op_id: Operation identifier used to reject stale replies.
+        expected_phase: Protocol phase used to reject stale replies.
+
+    Returns:
+        The matching acknowledgement payload.
+
+    Raises:
+        TimeoutError: No matching reply arrives before a supplied deadline.
+    """
     while True:
         if _sleep_wakeup_ack_ready(comm, source, _SleepWakeupTag.ACK):
             ack = comm.recv(source=source, tag=_SleepWakeupTag.ACK)
@@ -473,7 +487,7 @@ def _recv_sleep_wakeup_ack_until(comm,
                     f"phase={ack_phase} (expected phase={expected_phase}).")
                 continue
             return ack
-        if time.monotonic() >= deadline:
+        if deadline is not None and time.monotonic() >= deadline:
             raise TimeoutError(
                 f"timed out waiting for sleep/wakeup ACK from rank {source} "
                 f"by deadline {deadline:.6f}")
@@ -979,6 +993,11 @@ class PyExecutor:
         self._pp_rebalance_drain_iters: Optional[int] = None
         self.enable_early_first_token_response = enable_early_first_token_response
         self.virtual_memory_pools = virtual_memory_pools
+        self._sleeping_memory_tags: set[ExecutorMemoryType] = set()
+        self._sleep_padding_dummies: list[tuple[CUDAGraphRunner,
+                                                tuple[tuple[int, int],
+                                                      ...]]] = []
+        self._sleep_guard_managers: list[KVCacheManagerV2] = []
 
         # enqueue and _fetch_new_requests used data
         self.active = True
@@ -2849,8 +2868,189 @@ class PyExecutor:
         return self.executor_request_queue.can_enqueue_request()
 
     def begin_sleep_transition(self, tags: list[ExecutorMemoryType]) -> None:
+        self.validate_sleep_tags(tags)
         self.executor_request_queue.begin_sleep_transition(tag.value
                                                            for tag in tags)
+
+    def validate_sleep_tags(self, tags: list[ExecutorMemoryType]) -> None:
+        """Reject KV sleep while external consumers can access native V2 pools.
+
+        Args:
+            tags: Runtime memory components requested for release.
+        """
+        if ExecutorMemoryType.KV_CACHE not in tags or not self._kv_memory_resources(
+        ):
+            return
+        if any(
+                isinstance(manager, (KVCacheManager, BaseMambaCacheManager))
+                and not isinstance(manager, KVCacheManagerV2) for manager in
+                self.resource_manager.resource_managers.values()):
+            raise ValueError(
+                "KV_CACHE sleep with mixed V1/V2 managers is not supported. "
+                "Exclude KV_CACHE or select a uniform supported manager configuration."
+            )
+        if self.kv_cache_transceiver is not None:
+            raise NotImplementedError(
+                "Sleep of registered V2 KV cache requires remote "
+                "memory re-registration, which is not supported. "
+                "Exclude KV_CACHE when using a cache transceiver.")
+        if self._kv_connector_moves_kv:
+            raise NotImplementedError(
+                "V2 KV cache sleep with a KV-moving connector requires "
+                "connector memory re-registration, which is not supported. "
+                "Exclude KV_CACHE when using a KV-moving connector.")
+
+    def _kv_memory_resources(self) -> list[KVCacheManagerV2]:
+        managers: list[KVCacheManagerV2] = []
+        for manager in self.resource_manager.resource_managers.values():
+            if isinstance(manager, KVCacheManagerV2) and not any(
+                    manager is existing for existing in managers):
+                managers.append(manager)
+        return managers
+
+    def validate_sleep_config(self, tags: list[ExecutorMemoryType]) -> None:
+        """Validate this rank's native KV ownership for any release mode.
+
+        Args:
+            tags: Normalized tags selected for release.
+
+        Raises:
+            ValueError: A selected KV manager has unsupported ownership or tiers.
+        """
+        if ExecutorMemoryType.KV_CACHE not in tags:
+            return
+        mode = self.llm_args.sleep_config.restore_modes[
+            ExecutorMemoryType.KV_CACHE]
+        errors = []
+        for manager in self._kv_memory_resources():
+            try:
+                manager.validate_sleep_config(mode)
+            except ValueError as error:
+                errors.append(str(error))
+        if errors:
+            raise ValueError("Invalid sleep configuration: " +
+                             "; ".join(errors))
+
+    def validate_memory_release(self, tags: list[ExecutorMemoryType]) -> None:
+        """Run non-mutating capacity checks inside the drained control barrier.
+
+        Args:
+            tags: Normalized tags selected for release.
+
+        Raises:
+            ValueError: Native KV capacity preflight fails.
+            RuntimeError: Native ownership or memory state is invalid.
+        """
+        if ExecutorMemoryType.KV_CACHE not in tags:
+            return
+        mode = self.llm_args.sleep_config.restore_modes[
+            ExecutorMemoryType.KV_CACHE]
+        for manager in self._kv_memory_resources():
+            manager.validate_memory_release(mode)
+
+    def _release_sleep_internal_caches(self) -> None:
+        """Retire internal requests while retaining graph-facing storage.
+
+        The caller holds the drained control barrier. Failure leaves admission
+        closed; no partially released request is safe for inference.
+        """
+        torch.cuda.synchronize()
+        self._sleep_padding_dummies = []
+        self._sleep_guard_managers = []
+        for engine in (getattr(self, "model_engine",
+                               None), getattr(self, "draft_model_engine",
+                                              None)):
+            runner = getattr(engine, "cuda_graph_runner", None)
+            if runner is not None and not any(
+                    runner is saved
+                    for saved, _ in self._sleep_padding_dummies):
+                variants = runner.release_padding_dummies(self.resource_manager)
+                self._sleep_padding_dummies.append((runner, variants))
+        for manager in self._kv_memory_resources():
+            if manager.release_guard_page_for_sleep():
+                self._sleep_guard_managers.append(manager)
+
+    def _restore_sleep_internal_caches(self) -> None:
+        """Rebuild prior internal requests before the rank can acknowledge wake.
+
+        Raises:
+            RuntimeError: Required internal resources could not be recreated.
+                Existing all-rank controls must keep admission closed.
+        """
+        for manager in self._sleep_guard_managers:
+            manager.restore_guard_page_after_sleep()
+        for runner, variants in self._sleep_padding_dummies:
+            runner.restore_padding_dummies(self.resource_manager, variants)
+        # Do not add a collective here: MPI can execute the leader's local
+        # operation before dispatching peer commits. Group ACKs gate admission.
+        torch.cuda.synchronize()
+        self._sleep_guard_managers.clear()
+        self._sleep_padding_dummies.clear()
+
+    def release_memory(self, tags: tuple[str, ...]) -> None:
+        """Release native KV pools before tagged auxiliary buffers, while drained.
+
+        Args:
+            tags: Normalized runtime tag values selected for release.
+
+        Raises:
+            MemoryReleaseAbortedError: Local execution recovered; a changed reuse
+                epoch still requires distributed failure handling.
+            Exception: Release or rollback failed; admission must remain closed.
+        """
+        from tensorrt_llm._torch.virtual_memory import MemoryReleaseAbortedError
+
+        new_tags = set(ExecutorMemoryType(tag)
+                       for tag in tags) - self._sleeping_memory_tags
+        self._sleeping_memory_tags.update(new_tags)
+        if ExecutorMemoryType.KV_CACHE in new_tags and self._kv_memory_resources(
+        ):
+            self._release_sleep_internal_caches()
+            mode = self.llm_args.sleep_config.restore_modes[
+                ExecutorMemoryType.KV_CACHE]
+            released = []
+            route_capture = getattr(getattr(self, "model_engine", None),
+                                    "route_capture", None)
+            try:
+                for manager in self._kv_memory_resources():
+                    if route_capture is not None and manager is self.kv_cache_manager:
+                        manager.release_memory(
+                            mode, on_cleared=route_capture.clear_shared)
+                    else:
+                        manager.release_memory(mode)
+                    released.append(manager)
+            except MemoryReleaseAbortedError as error:
+                for manager in reversed(released):
+                    manager.materialize_memory()
+                self._restore_sleep_internal_caches()
+                # Both discard and preserve can change prefix contents while releasing.
+                if released:
+                    error.reuse_state_changed = True
+                self._sleeping_memory_tags.difference_update(new_tags)
+                raise
+        self._pp_rebalance_drain_iters = None
+
+    def materialize_memory(self, tags: tuple[str, ...]) -> None:
+        """Restore native KV pools after tagged auxiliary buffers are available.
+
+        Args:
+            tags: Normalized runtime tag values selected for restoration.
+
+        Raises:
+            Exception: Backing or binding restoration failed. Keep admission closed.
+        """
+        if (ExecutorMemoryType.KV_CACHE in tags
+                and ExecutorMemoryType.KV_CACHE in self._sleeping_memory_tags
+                and self._kv_memory_resources()):
+            for manager in self._kv_memory_resources():
+                manager.materialize_memory()
+        remaining_tags = self._sleeping_memory_tags.difference(tags)
+        # Speculative dummy creation can also write MODEL_ENGINE buffers.
+        # A partial KV wake must wait until every tagged dependency is usable.
+        if not remaining_tags and (self._sleep_guard_managers
+                                   or self._sleep_padding_dummies):
+            self._restore_sleep_internal_caches()
+        self._sleeping_memory_tags.difference_update(tags)
 
     def complete_sleep_transition(self) -> None:
         self.executor_request_queue.complete_sleep_transition()
@@ -2869,6 +3069,8 @@ class PyExecutor:
         self.executor_request_queue.abort_wakeup_transition()
 
     def fail_sleep_wakeup_transition(self) -> None:
+        self._sleeping_memory_tags.update(ExecutorMemoryType)
+        self._pp_rebalance_drain_iters = None
         self.executor_request_queue.fail_sleep_wakeup_transition()
 
     def get_memory_status(self) -> dict[str, object]:
@@ -4531,23 +4733,29 @@ class PyExecutor:
                             logger.warning(
                                 f"Sleep/wakeup listener: {error_msg}")
                         else:
+                            if action == _SleepWakeupAction.PREPARE:
+                                # Even failed synchronization leaves PREPARE
+                                # parked until rank 0 sends the matching ABORT.
+                                release_control_request = False
                             torch.cuda.synchronize()
                             if action == _SleepWakeupAction.PREPARE:
+                                if target_action == _SleepWakeupAction.SLEEP:
+                                    self.validate_sleep_config(tags)
+                                    self.validate_memory_release(tags)
                                 # Prepared means this rank is quiesced and
                                 # ready to commit, but VMM state is unchanged.
                                 has_mnnvl_resources = (
                                     self._has_mnnvl_checkpoint_resources(tags))
-                                release_control_request = False
                             elif target_action == _SleepWakeupAction.SLEEP:
                                 self._run_mnnvl_checkpoint_resources(
                                     target_action, tags)
                                 self.invalidate_v1_prefix_cache_for_sleep(tags)
-                                release_with_tag(*tags)
+                                release_with_tag(*tags, resource=self)
                                 torch.cuda.synchronize()
                                 gc.collect()
                                 torch.cuda.empty_cache()
                             elif target_action == _SleepWakeupAction.WAKEUP:
-                                materialize_with_tag(*tags)
+                                materialize_with_tag(*tags, resource=self)
                                 torch.cuda.synchronize()
                                 self._run_mnnvl_checkpoint_resources(
                                     target_action, tags)
@@ -4561,16 +4769,17 @@ class PyExecutor:
                         error_msg = f"unknown action '{action}'"
                         logger.warning(
                             f"Sleep/wakeup listener: {error_msg}, ignoring.")
-                except (KeyError, TypeError, ValueError, RuntimeError,
-                        TimeoutError, torch.OutOfMemoryError) as exc:
+                except Exception as exc:
+                    # This is the control-message boundary. Native KV errors
+                    # must be ACKed without terminating the listener before ABORT.
                     error_msg = (f"rank {self.dist.rank} '{action}' failed: "
                                  f"{exc}\n{traceback.format_exc()}")
                     logger.error(f"Sleep/wakeup listener: {error_msg}")
                 finally:
                     # Always ACK so rank-0 does not deadlock; carry error
                     # details so rank-0 can raise after all ranks respond.
-                    # If an exception bypassed the narrow except above (e.g.,
-                    # MemoryError, SystemError), detect it via sys.exc_info()
+                    # If a BaseException bypassed the message boundary, detect
+                    # it via sys.exc_info()
                     # so the ACK correctly reflects failure rather than falsely
                     # reporting status=ok while the thread is unwinding.
                     if error_msg is None and sys.exc_info()[0] is not None:
@@ -7214,6 +7423,8 @@ class PyExecutor:
         return early here cannot carry a lasting cadence offset out of it.
         """
         if not self.enable_kv_pool_rebalance:
+            return False
+        if self._sleeping_memory_tags:
             return False
         if self.kv_cache_transceiver is not None:
             return False
@@ -12461,13 +12672,6 @@ class PyExecutor:
             self.draft_kv_cache_manager.reset_reuse_state()
         if route_capture is not None and not clear_routes_in_manager:
             route_capture.clear_shared()
-
-    def validate_sleep_tags(self, tags: List[ExecutorMemoryType]) -> None:
-        """Reject runtime-memory tags unsupported by the active KV manager."""
-        if (self._is_kv_manager_v2 and ExecutorMemoryType.KV_CACHE in tags):
-            raise ValueError(
-                "KV_CACHE sleep is not supported with KVCacheManagerV2 because "
-                "its main pools are not managed by tagged virtual memory.")
 
     def invalidate_v1_prefix_cache_for_sleep(
             self, tags: List[ExecutorMemoryType]) -> None:

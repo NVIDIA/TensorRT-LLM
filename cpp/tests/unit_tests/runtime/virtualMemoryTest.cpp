@@ -157,6 +157,7 @@ TEST_F(VirtualMemoryTest, TestBasic)
 
     CUDAVirtualMemoryChunk vm(std::move(creator), std::move(configurators));
     ASSERT_EQ(vm.status(), CUDAVirtualMemoryChunk::RELEASED);
+    EXPECT_EQ(vm.hostBackupBytes(), 0U);
 
     auto memoryBegin = getCurrentProcessMemoryInfo();
     vm.materialize();
@@ -174,6 +175,7 @@ TEST_F(VirtualMemoryTest, TestBasic)
 
     vm.release();
     ASSERT_EQ(vm.status(), CUDAVirtualMemoryChunk::RELEASED);
+    EXPECT_EQ(vm.hostBackupBytes(), 0U);
     auto memoryReleased = getCurrentProcessMemoryInfo();
     if (memoryInfoAvailable())
     {
@@ -225,14 +227,17 @@ TEST_P(VirtualMemoryOffloadConfigurator, Test)
     std::generate(data.begin(), data.end(), [engine = std::mt19937_64(address)]() mutable { return engine(); });
 
     vm.materialize();
+    EXPECT_EQ(vm.hostBackupBytes(), 0U);
 
     auto pointer = reinterpret_cast<void*>(address);
     auto result = cudaMemcpyAsync(pointer, data.data(), size, cudaMemcpyHostToDevice, stream.get());
     ASSERT_EQ(result, CUDA_SUCCESS) << "Copying memory returned failure";
 
     vm.release();
+    EXPECT_EQ(vm.hostBackupBytes(), size);
 
     vm.materialize();
+    EXPECT_EQ(vm.hostBackupBytes(), size) << "Non-ondemand backups remain allocated after wake";
 
     std::fill(data.begin(), data.end(), 0);
     result = cudaMemcpyAsync(data.data(), pointer, size, cudaMemcpyDeviceToHost, stream.get());
@@ -258,9 +263,11 @@ TEST_P(VirtualMemoryOffloadConfigurator, DetachWaitsForRestoreStream)
     CudaStream stream;
     OffloadConfigurator configurator(reinterpret_cast<CUdeviceptr>(buffer->data()), kSize, GetParam(), stream.get());
     EXPECT_EQ(configurator.detachHostBackup(), nullptr);
+    EXPECT_EQ(configurator.hostBackupBytes(), 0U);
     TLLM_CUDA_CHECK(cudaMemset(buffer->data(), kValue, kSize));
     TLLM_CUDA_CHECK(cudaDeviceSynchronize());
     configurator.teardown({}, false);
+    EXPECT_EQ(configurator.hostBackupBytes(), kSize);
     auto const* backupAddress = configurator.mBackedStorage->data();
     TLLM_CUDA_CHECK(cudaMemset(buffer->data(), 0, kSize));
     TLLM_CUDA_CHECK(cudaDeviceSynchronize());
@@ -312,6 +319,7 @@ TEST_P(VirtualMemoryOffloadConfigurator, DetachWaitsForRestoreStream)
     ASSERT_NE(backup, nullptr);
     EXPECT_EQ(backup->data(), backupAddress);
     EXPECT_EQ(configurator.mBackedStorage, nullptr);
+    EXPECT_EQ(configurator.hostBackupBytes(), 0U);
     EXPECT_EQ(configurator.detachHostBackup(), nullptr);
     std::vector<std::uint8_t> restored(kSize);
     TLLM_CUDA_CHECK(cudaMemcpy(restored.data(), buffer->data(), kSize, cudaMemcpyDeviceToHost));

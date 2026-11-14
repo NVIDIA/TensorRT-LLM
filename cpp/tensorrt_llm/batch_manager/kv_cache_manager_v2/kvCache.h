@@ -52,10 +52,17 @@ class StorageManager;
 //   - nullptr             → no page (block not allocated for this lifecycle/beam)
 //   - SharedPageLock      → locked (ACTIVE inference)
 //   - shared_ptr<PageHolder> → held (suspended, waiting for activation)
+//   - UnmaterializedPage   → discarded storage, retaining its place in the request
 // ---------------------------------------------------------------------------
+struct UnmaterializedPage
+{
+    CacheLevel level;
+};
+
 using BlockPage = std::variant<std::monostate, // nullptr
     SharedPageLock,                            // locked
-    SharedPtr<PageHolder>                      // held
+    SharedPtr<PageHolder>,                     // held
+    UnmaterializedPage                         // storage released
     >;
 
 inline bool blockPageIsNull(BlockPage const& bp) noexcept
@@ -265,7 +272,8 @@ public:
     {
         ACTIVE,
         SUSPENDED,
-        CLOSED
+        CLOSED,
+        UNMATERIALIZED
     };
     enum class CommitState
     {
@@ -302,10 +310,8 @@ public:
     //
     // Refused while the cache belongs to a Batch, for the reason resume() is.
     //
-    // Returns the sparse cache arena lease, which **discards whatever the GPU cache held**.
-    // A lease comes back with every entry free, so a unit whose only copy was in a cell can
-    // no longer be addressed: call Batch::flushSparseUnits() first for anything worth
-    // keeping.
+    // Sparse arena leases belong to Batch rows. Flush history before removing the cache
+    // from its Batch; suspend itself neither owns nor returns an arena lease.
     void suspend();
 
     // Close: release all blocks back to KvCacheManager.
@@ -651,10 +657,17 @@ public:
     std::optional<RequestIdType> id; // opaque identifier (mirrors Python's id field)
 
 private:
+    friend class KvCacheManager;
     friend class KvCacheIntrospection;
     friend class Batch;
     friend std::vector<SharedPageLock> batchedLockPages(
         KvCache& kvCache, std::vector<BatchedLockTarget> const& targets);
+
+    //! Discard uncommitted storage while retaining the suspended cache's logical state and page layout.
+    void releaseMemory();
+
+    //! Allocate replacement pages for released caches atomically, leaving them suspended.
+    static void materializeMemory(std::vector<KvCache*> const& caches);
 
     // Activate: lock active pages at their required levels. mCudaStream must already be set.
     // Internal — called by resume(). Not public (mirrors Python where activate() doesn't exist).
@@ -871,11 +884,8 @@ private:
     // SWA scratch slot support.
     bool mEnableSwaScratchReuse = false;
     TypedVec<LifeCycleId, ScratchSlots> mScratchSlots;
-
-    // This request's slot in the sparse cache arenas, which addresses its cells and the
-    // device-resident residency, recency and write-back scratch describing them in every
-    // life cycle at once. Taken when the cache joins a Batch, returned on removal,
-    // suspend() and close(). Empty unless some life cycle has its fetch path configured.
+    // Previously active caches resume after sleep without new-request utilization gating.
+    bool mResumeAfterSleep = false;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

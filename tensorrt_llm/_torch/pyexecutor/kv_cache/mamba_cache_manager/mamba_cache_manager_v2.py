@@ -1742,6 +1742,36 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._setup_state_indices(requests, num_contexts=num_contexts)
         self._reset_context_mamba_slots(num_contexts)
 
+    @override
+    def _restore_memory_bindings(self) -> None:
+        """Refresh SSM slots after wakeup or recovery from a failed release."""
+        super()._restore_memory_bindings()
+        if self.local_num_mamba_layers == 0:
+            return
+        # Padding requests can bypass prepare_resources() after wakeup. Refresh
+        # their slot mapping before metadata preparation uploads it for graph replay.
+        request_ids = [
+            request_id
+            for request_id, cache in self.kv_cache_map.items()
+            if cache.is_active and request_id in self._request_id_to_state_index
+        ]
+        new_slots = [
+            self.kv_cache_map[request_id].get_ssm_block_base_index(self.ssm_layer_group_id)
+            for request_id in request_ids
+        ]
+        old_slots = [self._request_id_to_state_index[request_id] for request_id in request_ids]
+        if old_slots != new_slots:
+            with torch.cuda.stream(self._stream):
+                self._on_state_slots_relocated(old_slots, new_slots)
+            self._stream.synchronize()
+            self._request_id_to_state_index.update(zip(request_ids, new_slots))
+        if self._replay_group_id is not None:
+            for request_id in request_ids:
+                self._request_id_to_replay_index[request_id] = self.kv_cache_map[
+                    request_id
+                ].get_ssm_block_base_index(self._replay_group_id)
+        self._steady_state_index_key = None
+
     def _setup_state_indices(
         self,
         requests: List[LlmRequest],

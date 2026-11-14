@@ -20,6 +20,7 @@ import pytest
 import ray
 from ray.util.placement_group import placement_group, remove_placement_group
 from utils.llm_data import llm_models_root
+from utils.sleep import assert_v2_gpu_pool_bytes
 from utils.util import get_current_process_gpu_memory
 
 from tensorrt_llm import AsyncLLM
@@ -32,7 +33,7 @@ from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType, SleepConfig
 @pytest.mark.asyncio
 async def test_async_llm_awaitable():
     llama_model_path = str(llm_models_root() / "Qwen3/Qwen3-0.6B")
-    kv_cache_config = KvCacheConfig(enable_block_reuse=False)
+    kv_cache_config = KvCacheConfig(enable_block_reuse=False, use_kv_cache_manager_v2=True)
 
     prompt = "The future of AI is"
     sampling_params = SamplingParams(temperature=0, max_tokens=12)
@@ -42,8 +43,10 @@ async def test_async_llm_awaitable():
         sleep_config=SleepConfig(),
         cuda_graph_config=None,
         kv_cache_config=kv_cache_config,
+        ray_worker_extension_cls="utils.sleep.V2SleepWorkerExtension",
     )
 
+    await llm.collective_rpc("assert_v2_cache_manager")
     output = await llm.generate_async(prompt, sampling_params)
     assert output.outputs[0].text
     print("Output text:", output.outputs[0].text)
@@ -57,7 +60,10 @@ async def test_async_llm_awaitable():
 @pytest.mark.parametrize("num_cycles", [3], ids=lambda x: f"{x}_cycle")
 async def test_async_llm_release_resume(process_gpu_memory_info_available, num_cycles):
     llama_model_path = str(llm_models_root() / "Qwen3/Qwen3-0.6B")
-    kv_cache_config = KvCacheConfig(enable_block_reuse=False, max_tokens=4096)
+    tp_size = 2
+    kv_cache_config = KvCacheConfig(
+        enable_block_reuse=False, max_tokens=4096, use_kv_cache_manager_v2=True
+    )
 
     prompt = "The future of AI is"
     sampling_params = SamplingParams(temperature=0, max_tokens=12)
@@ -76,13 +82,43 @@ async def test_async_llm_release_resume(process_gpu_memory_info_available, num_c
         sleep_config=SleepConfig(),
         cuda_graph_config=None,
         kv_cache_config=kv_cache_config,
-        tensor_parallel_size=2,
+        tensor_parallel_size=tp_size,
+        ray_worker_extension_cls="utils.sleep.V2SleepWorkerExtension",
     ) as llm:
+        await llm.collective_rpc("assert_v2_cache_manager")
         # Generate baseline
         output_before = await llm.generate_async(prompt, sampling_params)
         baseline_text = output_before.outputs[0].text
+        pool_replies = await llm.collective_rpc("get_v2_gpu_pool_bytes")
+        assert sorted(rank for rank, _ in pool_replies) == list(range(tp_size)), pool_replies
+        baseline_pool_bytes = dict(pool_replies)
+        assert all(num_bytes > 0 for num_bytes in baseline_pool_bytes.values()), baseline_pool_bytes
+        released_pool_bytes = dict.fromkeys(baseline_pool_bytes, 0)
+        print(f"Native GPU KV pool bytes before release: {baseline_pool_bytes}")
 
         for cycle in range(num_cycles):
+            # Isolate KV release from weight memory, and inspect every worker without NVML.
+            await llm.release([ExecutorMemoryType.KV_CACHE])
+            status = await llm.get_memory_status()
+            assert status.state == "parked"
+            assert status.parked_tags == [ExecutorMemoryType.KV_CACHE]
+            parked_pool_replies = await llm.collective_rpc("get_v2_gpu_pool_bytes")
+            assert_v2_gpu_pool_bytes(parked_pool_replies, released_pool_bytes)
+            print(
+                f"[Cycle {cycle + 1}] Native GPU KV pool bytes after release: {parked_pool_replies}"
+            )
+            await llm.resume([ExecutorMemoryType.KV_CACHE])
+            assert (await llm.get_memory_status()).state == "running"
+            restored_pool_replies = await llm.collective_rpc("get_v2_gpu_pool_bytes")
+            assert_v2_gpu_pool_bytes(restored_pool_replies, baseline_pool_bytes)
+            print(
+                f"[Cycle {cycle + 1}] Native GPU KV pool bytes after resume: {restored_pool_replies}"
+            )
+            output_after_kv_resume = await llm.generate_async(prompt, sampling_params)
+            assert output_after_kv_resume.outputs[0].text == baseline_text, (
+                f"Generated text mismatch after KV-only cycle {cycle + 1}"
+            )
+
             memory_usage_active = get_current_process_gpu_memory(True) / 1024**3
             print(f"[Cycle {cycle + 1}] Memory usage before release: {memory_usage_active:.2f} GB")
 
