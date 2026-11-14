@@ -39,6 +39,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHyb
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     _get_local_mamba_cache_layout,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import PageTableSpec, Replicated
 from tensorrt_llm._torch.pyexecutor.resource_manager import get_pp_layers
 from tensorrt_llm._utils import TensorWrapper, binding_to_torch_dtype, convert_to_torch_tensor
 from tensorrt_llm.bindings import DataType
@@ -65,6 +66,9 @@ QSA_SIDE_PLANES = DataRole("qsa_side_planes")
 
 PLE_CONV_STATE = DataRole("ple_conv_state")
 PLE_NGRAM_CONTEXT = DataRole("ple_ngram_context")
+# Side roles every tensor rank holds alike: PLE state computed from replicated inputs,
+# request-wide QSA positions and the packed side planes.
+_REPLICATED_SIDE_ROLES = (PLE_CONV_STATE, PLE_NGRAM_CONTEXT, QSA_INDEX_POSITION, QSA_SIDE_PLANES)
 
 
 def get_qwen4_exp_ple_layer_mask(config: transformers.PretrainedConfig) -> list[bool]:
@@ -185,14 +189,21 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
     _supports_mixed_precision_kv = False
 
     @override
+    def page_table_spec(self) -> PageTableSpec:
+        """PLE state is computed from replicated inputs and index positions are request-wide
+        coordinates, so every rank holds the same bytes; so do the packed side planes
+        (``_REPLICATED_SIDE_ROLES``). They carry no head axis, which splitting them by the
+        rank's KV heads would assume."""
+        spec = super().page_table_spec()
+        replicated = {role: Replicated() for role in _REPLICATED_SIDE_ROLES}
+        return replace(spec, role_layouts={**spec.role_layouts, **replicated})
+
+    @override
     def get_disagg_role_mapper_kinds(self) -> dict[DataRole, MapperKind]:
         """PLE state and request-wide QSA positions are replicated across TP."""
         return {
             **super().get_disagg_role_mapper_kinds(),
-            PLE_CONV_STATE: MapperKind.REPLICATED,
-            PLE_NGRAM_CONTEXT: MapperKind.REPLICATED,
-            QSA_INDEX_POSITION: MapperKind.REPLICATED,
-            QSA_SIDE_PLANES: MapperKind.REPLICATED,
+            **{role: MapperKind.REPLICATED for role in _REPLICATED_SIDE_ROLES},
         }
 
     @override

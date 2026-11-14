@@ -62,6 +62,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.regions import (
     RegionLifeCycle,
     RegionProvider,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import ByHead, PageTableSpec, Sectioned
 from tensorrt_llm._torch.pyexecutor.kv_cache_stats import KVCacheV2IterationStatsReport
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
@@ -728,6 +729,49 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         return 0
 
     @override
+    def page_table_spec(self) -> PageTableSpec:
+        """Lay out the recurrent roles as well.
+
+        Convolution state is sectioned: its flat per-layer buffer is a
+        concatenation of sections (Mamba2 ``[x | B | C]``, GDN ``[Q | K | V]``)
+        each split by byte over the ranks recurrent state splits over. SSM
+        state is split by head. Both name their element types, which their
+        dtypes configure apart from the KV cache's. The managed replay state's
+        roles never move: the generation worker starts it afresh. With the FP4
+        MLA cache layout, the policy lays its attention roles over them
+        (``_fp4_mla_disagg_page_table_spec``) and names the layers
+        (``_disagg_layer_names``).
+        """
+        spec = super().page_table_spec()
+        if self.local_num_mamba_layers > 0:
+            section_bytes, head_bytes = self._recurrent_state_bytes()
+            spec = replace(
+                spec,
+                role_layouts={
+                    **spec.role_layouts,
+                    MambaRole.CONV_STATE: Sectioned(section_bytes, dtype=self.conv_state_dtype),
+                    MambaRole.SSM_STATE: ByHead(head_bytes=head_bytes, dtype=self.ssm_state_dtype),
+                },
+            )
+        replay_roles = frozenset(
+            role for layout in self._replay_layouts.values() for role in layout
+        )
+        if replay_roles:
+            spec = replace(spec, untransferred_roles=spec.untransferred_roles | replay_roles)
+        if self._attention_cache_layout_policy is not None:
+            spec = self._fp4_mla_disagg_page_table_spec(spec)
+        return spec
+
+    @override
+    def _disagg_layer_names(self) -> dict[int, tuple[int, int]]:
+        """With the FP4 MLA cache layout, the policy's names, recurrent layers ``2 * L`` beside
+        the MLA layers' ``2 * L`` and ``2 * L + 1`` (``_fp4_mla_disagg_layer_names``); else the
+        base manager's."""
+        if self._attention_cache_layout_policy is not None:
+            return self._fp4_mla_disagg_layer_names(recurrent=self._is_local_mamba_layer)
+        return super()._disagg_layer_names()
+
+    @override
     def get_disagg_role_mapper_kinds(self) -> dict[DataRole, MapperKind]:
         """Convolution sections shard independently; SSM state shards by head.
 
@@ -798,22 +842,24 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             layouts.update(self._fp4_mla_disagg_role_layouts())
         if self.local_num_mamba_layers == 0:
             return layouts
-        d_conv_m1 = int(self.conv_state_shape[1])
-        _, head_dim, d_state = self.ssm_state_shape
+        section_bytes, head_bytes = self._recurrent_state_bytes()
         layouts.update(
             {
-                MambaRole.CONV_STATE: RoleLayout(
-                    section_bytes=tuple(
-                        int(dim) * d_conv_m1 * self.conv_state_dtype.itemsize
-                        for dim in self.conv_section_dims
-                    )
-                ),
-                MambaRole.SSM_STATE: RoleLayout(
-                    bytes_per_head=int(head_dim) * int(d_state) * self.ssm_state_dtype.itemsize
-                ),
+                MambaRole.CONV_STATE: RoleLayout(section_bytes=section_bytes),
+                MambaRole.SSM_STATE: RoleLayout(bytes_per_head=head_bytes),
             }
         )
         return layouts
+
+    def _recurrent_state_bytes(self) -> tuple[tuple[int, ...], int]:
+        """The bytes of each convolution-state section and of one SSM-state head on this rank,
+        which the page table spec and the disaggregation hooks both state."""
+        d_conv_m1 = int(self.conv_state_shape[1])
+        _, head_dim, d_state = self.ssm_state_shape
+        section_bytes = tuple(
+            int(dim) * d_conv_m1 * self.conv_state_dtype.itemsize for dim in self.conv_section_dims
+        )
+        return section_bytes, int(head_dim) * int(d_state) * self.ssm_state_dtype.itemsize
 
     def _extra_scratch_bytes_per_slot(self) -> int:
         return 0
