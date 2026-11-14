@@ -40,7 +40,7 @@ from transformers import PreTrainedTokenizerBase
 # isort: off
 from tensorrt_llm.serve.scripts.backend_request_func import (
     AIOHTTP_TIMEOUT, ASYNC_REQUEST_FUNCS, OPENAI_COMPATIBLE_BACKENDS,
-    RequestFuncInput, RequestFuncOutput, get_tokenizer)
+    RequestFuncInput, RequestFuncOutput, env_changes_request, get_tokenizer)
 from tensorrt_llm.serve.scripts.benchmark_dataset import (
     AIMODataset, BurstGPTDataset, ConversationDataset, CustomDataset,
     HuggingFaceDataset, InstructCoderDataset, RandomDataset, RandomImageDataset,
@@ -428,7 +428,7 @@ async def benchmark(
 
     benchmark_start_time = time.perf_counter()
     tasks: list[asyncio.Task] = []
-    session = aiohttp.ClientSession(trust_env=True,
+    session = aiohttp.ClientSession(trust_env=env_changes_request(api_url),
                                     timeout=AIOHTTP_TIMEOUT,
                                     connector=aiohttp.TCPConnector(
                                         limit=0,
