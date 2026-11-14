@@ -1,10 +1,15 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import json
 from pathlib import Path
 from typing import Callable, Dict, Optional, Set
 
+import yaml
 from pydantic import AliasChoices, BaseModel, Field
 
 from tensorrt_llm import LLM as PyTorchLLM
+from tensorrt_llm._torch.pyexecutor.config_utils import load_pretrained_config
 from tensorrt_llm.bench.benchmark.utils.processes import IterationWriter
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
@@ -49,6 +54,9 @@ class GeneralExecSettings(BaseModel):
     beam_width: int = Field(default=1, description="Number of search beams")
     model_path: Optional[Path] = Field(default=None,
                                        description="Path to model checkpoint")
+    checkpoint_format: Optional[str] = Field(
+        default=None,
+        description="Checkpoint format that extra_llm_api_options names")
     concurrency: int = Field(
         default=-1, description="Desired concurrency rate, <=0 for no limit")
     dataset_path: Optional[Path] = Field(default=None,
@@ -93,6 +101,11 @@ class GeneralExecSettings(BaseModel):
 
     @property
     def model_type(self) -> str:
+        if self.checkpoint_format is not None:
+            return load_pretrained_config(
+                self.checkpoint_path,
+                trust_remote_code=True,
+                checkpoint_format=self.checkpoint_format).model_type
         return get_model_config(self.model, self.checkpoint_path).model_type
 
     @property
@@ -144,6 +157,16 @@ def get_general_cli_options(
         "model_path": model_path,
         "model": model,
     })
+
+    # The checkpoint format extra_llm_api_options names decides how the model's
+    # config is read.
+    extra_llm_api_options = params.get("extra_llm_api_options")
+    if extra_llm_api_options:
+        with open(extra_llm_api_options) as f:
+            llm_args_dict = yaml.safe_load(f)
+        if isinstance(llm_args_dict, dict):
+            settings_dict["checkpoint_format"] = llm_args_dict.get(
+                "checkpoint_format")
 
     # Create and return the settings object, ignoring any extra fields
     return GeneralExecSettings(**settings_dict)

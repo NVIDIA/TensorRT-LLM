@@ -662,7 +662,8 @@ def resolve_hf_chat_template(
 class _RenderDispatch(NamedTuple):
     """The renderer `apply_chat_template` uses for a set of inputs.
 
-    `kind` is `"deepseek_v41"`, `"deepseek"` (the other DeepSeek
+    `kind` is `"mistral_large_4"` (mistral-common renders the chat),
+    `"deepseek_v41"`, `"deepseek"` (the other DeepSeek
     tokenizers), `"passthrough"` (the model skips chat templates),
     `"native"` (a tokenizer-native python template) or `"jinja"`.
     `tokenizer` is the object that renderer is called on, and `template`
@@ -682,6 +683,8 @@ def _resolve_render_dispatch(
     tools: Optional[list[dict[str, Any]]],
 ) -> _RenderDispatch:
     """Pick the renderer, in the order `apply_chat_template` checks them."""
+    if model_type == "mistral_large_4":
+        return _RenderDispatch("mistral_large_4", tokenizer)
     if isinstance(tokenizer, DeepseekV41Tokenizer):
         return _RenderDispatch("deepseek_v41", tokenizer)
     if isinstance(tokenizer, (DeepseekV32Tokenizer, DeepseekV4Tokenizer)):
@@ -715,8 +718,9 @@ def rendered_hf_chat_template_source(
     """The Jinja source `apply_chat_template` will render for these inputs.
 
     Returns `None` when `apply_chat_template` dispatches to a renderer
-    with no Jinja source to analyze (the DeepSeek custom tokenizers, a model
-    that skips chat templates, a tokenizer-native python template) or when no
+    with no Jinja source to analyze (Mistral Large 4's mistral-common renderer,
+    the DeepSeek custom tokenizers, a model that skips chat templates, a
+    tokenizer-native python template) or when no
     template resolves. Callers that construct chat_template_kwargs use this
     to run the same referenced-kwargs analysis the render-site guard applies,
     so they can avoid injecting a kwarg the active template never reads.
@@ -791,6 +795,133 @@ def _build_openai_content(
     return content_list
 
 
+# The `chat_template_kwargs` keys mistral-common's chat encoder reads. It has
+# no Jinja template, so other keys have nothing to apply to.
+_NATIVE_MISTRAL_CHAT_KWARGS = frozenset(
+    ("continue_final_message", "reasoning_effort", "response_format"))
+
+
+def _native_mistral_response_format(response_format):
+    """An OpenAI `response_format` as mistral-common's, or None if it renders nothing.
+
+    `json_object` and a named `json_schema` render into the prompt's model
+    settings; other formats only constrain decoding.
+    """
+    if not isinstance(response_format, dict):
+        return None
+    from mistral_common.protocol.instruct.request import (JsonSchema,
+                                                          ResponseFormat,
+                                                          ResponseFormats)
+    kind = response_format.get("type")
+    if kind == "json_object":
+        return ResponseFormat(type=ResponseFormats.json_object)
+    named = response_format.get("json_schema")
+    if (kind != "json_schema" or not isinstance(named, dict)
+            or named.get("schema") is None or not named.get("name")):
+        return None
+    return ResponseFormat(type=ResponseFormats.json_schema,
+                          json_schema=JsonSchema(name=named["name"],
+                                                 schema=named["schema"],
+                                                 strict=bool(
+                                                     named.get("strict"))))
+
+
+def _encode_native_mistral_chat(tokenizer, messages, *, tools,
+                                continue_final_message, reasoning_effort,
+                                response_format):
+    """Token ids of a chat encoded by mistral-common with a response format.
+
+    This passes the request to mistral-common as transformers'
+    `apply_chat_template` does, adding the response format it does not forward.
+    """
+    from mistral_common.protocol.instruct.request import ChatCompletionRequest
+
+    def image_url(part):
+        if part.get("type") != "image" or "base64" not in part:
+            return part
+        url = part["base64"]
+        if not url.startswith("data:image"):
+            url = "data:image/unk;base64," + url
+        return {"type": "image_url", "image_url": {"url": url}}
+
+    openai_messages = [{
+        **message, "content": [image_url(part) for part in message["content"]]
+    } if isinstance(message.get("content"), list) else message
+                       for message in messages]
+    request = ChatCompletionRequest.from_openai(
+        messages=openai_messages,
+        tools=tools,
+        continue_final_message=continue_final_message,
+        reasoning_effort=reasoning_effort,
+        response_format=response_format)
+    return tokenizer.mistral.encode_chat_completion(request).tokens
+
+
+def _native_mistral_tools(tools):
+    """OpenAI tool dicts in the form mistral-common validates: no null `strict`."""
+    if tools is None:
+        return None
+    normalized = []
+    for tool in tools:
+        function = tool.get("function")
+        if isinstance(function, dict) and function.get("strict", False) is None:
+            function = {
+                key: value
+                for key, value in function.items() if key != "strict"
+            }
+            tool = {**tool, "function": function}
+        normalized.append(tool)
+    return normalized
+
+
+def _validate_native_mistral_chat_args(messages, add_generation_prompt,
+                                       continue_final_message):
+    """Reject generation-prompt flags that contradict the final message."""
+    if add_generation_prompt and continue_final_message:
+        raise ValueError("Cannot set both `add_generation_prompt` and "
+                         "`continue_final_message` to True.")
+    last_role = messages[-1].get("role") if messages else None
+    if add_generation_prompt and last_role == "assistant":
+        raise ValueError(
+            "Cannot set `add_generation_prompt` to True when the last message "
+            "is from the assistant. Consider using `continue_final_message` "
+            "instead.")
+    if continue_final_message and last_role != "assistant":
+        raise ValueError("Cannot set `continue_final_message` to True when "
+                         "the last message is not from the assistant.")
+
+
+def _native_mistral_messages(conversation, mm_placeholder_counts, mm_data):
+    """Restore resolved images at their original positions in each chat turn."""
+    from tensorrt_llm._torch.models.modeling_mistral import \
+        MistralCommonImageProcessor
+
+    mm_data = mm_data or {}
+    if set(mm_data) - {"image"}:
+        raise ValueError("Mistral Large 4 currently supports image inputs only")
+    images = MistralCommonImageProcessor.image_list(mm_data.get("image"))
+    image_index = 0
+    messages = []
+    for conv, counts in zip(conversation, mm_placeholder_counts):
+        message = {
+            key: value
+            for key, value in conv.items()
+            if key not in ("media", "content_parts")
+        }
+        if counts or conv.get("content_parts"):
+            content = _build_openai_content(conv, counts)
+            for part in content:
+                if part["type"] == "text":
+                    continue
+                part["base64"] = encode_base64_image(
+                    MistralCommonImageProcessor.to_pil_image(
+                        images[image_index]))
+                image_index += 1
+            message["content"] = content
+        messages.append(message)
+    return messages
+
+
 def apply_chat_template(
     *,
     model_type: str,
@@ -805,7 +936,8 @@ def apply_chat_template(
     chat_template_kwargs: Optional[dict[str, Any]] = None,
     enable_tokenize: bool = False,
     injected_chat_template_kwargs: Optional[Collection[str]] = None,
-) -> (str | List[str]):
+    mm_data: Optional[Dict[str, Any]] = None,
+) -> (str | List[str] | List[int]):
     """Apply chat template to the conversation.
 
     `injected_chat_template_kwargs` names the keys of `chat_template_kwargs`
@@ -824,6 +956,63 @@ def apply_chat_template(
                                         processor=processor,
                                         chat_template=chat_template,
                                         tools=tools)
+
+    if dispatch.kind == "mistral_large_4":
+        from tensorrt_llm._torch.models.checkpoints.mistral.tokenizer import \
+            MistralTokenizer
+        if isinstance(tokenizer, TransformersTokenizer) and not isinstance(
+                tokenizer, MistralTokenizer):
+            raise ValueError(
+                "Mistral Large 4's native format renders chats with "
+                "mistral-common's MistralTokenizer, not an HF tokenizer "
+                f"({type(tokenizer).__name__})")
+        messages = _native_mistral_messages(conversation, mm_placeholder_counts,
+                                            mm_data)
+        requested = chat_template_kwargs or {}
+        continue_final_message = bool(
+            requested.get("continue_final_message", False))
+        _validate_native_mistral_chat_args(messages, add_generation_prompt,
+                                           continue_final_message)
+        ignored = sorted(set(requested) - _NATIVE_MISTRAL_CHAT_KWARGS)
+        if documents is not None:
+            ignored.append("documents")
+        if ignored:
+            logger.warning_once(
+                f"Mistral Large 4 renders chats with mistral-common, which "
+                f"does not use {ignored}; ignoring them.")
+        from mistral_common.exceptions import MistralCommonException
+
+        response_format = _native_mistral_response_format(
+            requested.get("response_format"))
+        # mistral-common validates the request against the checkpoint (for
+        # example a reasoning effort its tekken.json does not declare); its
+        # errors are invalid requests.
+        try:
+            if response_format is not None:
+                return _encode_native_mistral_chat(
+                    tokenizer,
+                    messages,
+                    tools=_native_mistral_tools(tools),
+                    continue_final_message=continue_final_message,
+                    reasoning_effort=requested.get("reasoning_effort"),
+                    response_format=response_format)
+            native_kwargs = {}
+            if requested.get("reasoning_effort") is not None:
+                native_kwargs["reasoning_effort"] = requested[
+                    "reasoning_effort"]
+            # add_generation_prompt only selects the validation above: the
+            # encoder always opens the assistant turn after a final user or
+            # tool message.
+            return tokenizer.apply_chat_template(
+                messages,
+                tools=_native_mistral_tools(tools),
+                continue_final_message=continue_final_message,
+                tokenize=True,
+                return_dict=False,
+                return_tensors=None,
+                **native_kwargs)
+        except MistralCommonException as error:
+            raise ValueError(str(error)) from error
 
     if dispatch.kind == "deepseek_v41":
         # The native renderer deep-copies messages; omit pending media coroutines
@@ -916,7 +1105,8 @@ async def async_apply_chat_template(
     chat_template_kwargs: Optional[dict[str, Any]] = None,
     enable_tokenize: bool = False,
     injected_chat_template_kwargs: Optional[Collection[str]] = None,
-) -> (str | List[str]):
+    mm_data: Optional[Dict[str, Any]] = None,
+) -> (str | List[str] | List[int]):
     """Apply chat template without blocking the event loop."""
     return await asyncio.to_thread(
         apply_chat_template,
@@ -932,7 +1122,21 @@ async def async_apply_chat_template(
         chat_template_kwargs=chat_template_kwargs,
         enable_tokenize=enable_tokenize,
         injected_chat_template_kwargs=injected_chat_template_kwargs,
+        mm_data=mm_data,
     )
+
+
+async def async_apply_chat_template_with_mm(mm_coroutines, **kwargs):
+    """Resolve native image geometry before encoding its chat token stream."""
+    if kwargs["model_type"] == "mistral_large_4":
+        mm_data, mm_embeddings = await mm_coroutines
+        if mm_embeddings:
+            raise ValueError(
+                "Native Mistral chat requires images, not external embeddings")
+        prompt = await async_apply_chat_template(**kwargs, mm_data=mm_data)
+        return prompt, (mm_data, mm_embeddings)
+    return await asyncio.gather(async_apply_chat_template(**kwargs),
+                                mm_coroutines)
 
 
 def apply_mm_placeholders(
@@ -1038,7 +1242,8 @@ async def async_build_multimodal_prompt(
     apply_mm_placeholders(model_type, message, placeholder_counts,
                           mm_data_tracker)
 
-    prompt_task = async_apply_chat_template(
+    rendered, (mm_data, _) = await async_apply_chat_template_with_mm(
+        mm_data_tracker.retrieve_all_async(),
         model_type=model_type,
         tokenizer=tokenizer,
         processor=processor,
@@ -1048,9 +1253,6 @@ async def async_build_multimodal_prompt(
         chat_template=chat_template,
         chat_template_kwargs=chat_template_kwargs,
     )
-    rendered, (mm_data,
-               _) = await asyncio.gather(prompt_task,
-                                         mm_data_tracker.retrieve_all_async())
 
     inputs = prompt_inputs(rendered)
     if mm_data:
@@ -1198,7 +1400,7 @@ def default_multimodal_input_loader(
             model_dir, trust_remote_code=trust_remote_code, use_fast=True)
 
     processor = None
-    if not is_passthrough:
+    if not is_passthrough and model_type != "mistral_large_4":
         processor = AutoProcessor.from_pretrained(
             model_dir, use_fast=True, trust_remote_code=trust_remote_code)
 
@@ -1217,7 +1419,7 @@ def default_multimodal_input_loader(
                                      is_embedding=is_embedding)
         mm_placeholder_counts = mm_data_tracker.placeholder_counts()
         prompt = conv["content"]
-        if mm_placeholder_counts:
+        if mm_placeholder_counts and model_type != "mistral_large_4":
             # Resolve content format to decide whether to pre-insert
             # placeholders.  OPENAI templates handle media natively (e.g.
             # numbered <image N> tags), so we must NOT pre-insert or the
@@ -1229,14 +1431,22 @@ def default_multimodal_input_loader(
             if content_format != ContentFormat.OPENAI:
                 conv["content"] = add_multimodal_placeholders(
                     model_type, conv["content"], mm_placeholder_counts)
+        native_mm_data = None
+        if model_type == "mistral_large_4":
+            if is_embedding:
+                raise ValueError(
+                    "Native Mistral chat requires images, not external embeddings"
+                )
+            native_mm_data, _ = mm_data_tracker.retrieve_all_sync()
         prompt = apply_chat_template(
             model_type=model_type,
             tokenizer=tokenizer,
             processor=processor,
             conversation=[conv],
             add_generation_prompt=True,
-            mm_placeholder_counts=[mm_placeholder_counts])
-        input = {"prompt": prompt}
+            mm_placeholder_counts=[mm_placeholder_counts],
+            mm_data=native_mm_data)
+        input = prompt_inputs(prompt)
 
         if mm_placeholder_counts:
             input["chat_template_applied"] = True
@@ -1245,9 +1455,12 @@ def default_multimodal_input_loader(
                     "multi_modal_embeddings"] = mm_data_tracker.retrieve_all_sync(
                     )
             else:
-                input[
-                    "multi_modal_data"], _ = mm_data_tracker.retrieve_all_sync(
-                    )
+                if native_mm_data is not None:
+                    input["multi_modal_data"] = native_mm_data
+                else:
+                    input[
+                        "multi_modal_data"], _ = mm_data_tracker.retrieve_all_sync(
+                        )
             item_order = mm_data_tracker.item_order()
             if item_order:
                 input["mm_item_order"] = item_order

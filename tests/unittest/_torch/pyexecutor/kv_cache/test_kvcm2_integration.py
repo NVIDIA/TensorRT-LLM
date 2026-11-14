@@ -2207,6 +2207,76 @@ def test_generation_allocation_reserves_dynamic_width() -> None:
     assert request.py_request_id not in manager._inflight_draft_lens
 
 
+@pytest.mark.parametrize("accepted", range(4))
+@pytest.mark.parametrize("prompt_length", [(1 << 20) - 65, (1 << 20) - 64, (1 << 20) - 63])
+@pytest.mark.parametrize("is_draft", [False, True], ids=["target", "draft"])
+def test_long_spec_rejection_rewinds_real_cache(
+    accepted: int, prompt_length: int, is_draft: bool
+) -> None:
+    """A four-token verification crossing a long page boundary must retain only accepted KV."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.synchronize()
+    core = KVCacheManager(
+        KVCacheManagerConfig(
+            tokens_per_block=64,
+            cache_tiers=[GpuCacheTierConfig(quota=96 << 20)],
+            layers=[AttentionLayerConfig(layer_id=0, buffers=[BufferConfig(role="key", size=16)])],
+        )
+    )
+    prompt = list(range(prompt_length))
+    cache = core.create_kv_cache(None, prompt)
+    manager = object.__new__(KVCacheManagerV2)
+    manager.is_draft = is_draft
+    manager.kv_cache_type = CacheType.SELF
+    manager.kv_cache_map = {1: cache}
+    manager._inflight_draft_lens = {1: [3]}
+    manager._allocated_draft_lens = {1: 3}
+    manager._kv_reserve_draft_tokens = 3
+    manager._has_cp_helix = False
+    manager.kv_compression_manages_history = False
+    manager._sharing = None
+    manager.enable_block_reuse = False
+    req = SimpleNamespace(
+        py_request_id=1,
+        state=LlmRequestState.GENERATION_IN_PROGRESS,
+        py_num_accepted_draft_tokens=accepted,
+        py_num_accepted_draft_tokens_indices=[],
+        py_rewind_len=3 - accepted,
+        max_beam_num_tokens=prompt_length + 1 + accepted,
+    )
+    batch = ScheduledRequests()
+    batch.generation_requests.append(req)
+    try:
+        stream = CudaStream(torch.cuda.current_stream().cuda_stream)
+        assert cache.resume(stream)
+        assert cache.resize(prompt_length)
+        cache.commit(prompt)
+        assert cache.resize(prompt_length + 4)
+        manager.update_resources(batch)
+        assert cache.capacity == prompt_length + 1 + accepted
+        assert cache.history_length == prompt_length + accepted
+        assert cache.num_committed_tokens == prompt_length
+        # A subsequent verification must be able to grow over the reclaimed boundary.
+        assert cache.resize(cache.capacity + 4)
+        manager._inflight_draft_lens = {1: [3]}
+        manager._allocated_draft_lens = {1: 3}
+        req.max_beam_num_tokens += 1
+        req.py_num_accepted_draft_tokens = 0
+        req.py_rewind_len = 3
+        manager.update_resources(batch)
+        assert cache.capacity == prompt_length + 2 + accepted
+        assert cache.history_length == prompt_length + 1 + accepted
+        cache.close()
+        cache = core.create_kv_cache(None, prompt)
+        assert cache.resume(stream)
+        assert cache.num_committed_tokens >= prompt_length // 64 * 64
+        assert cache.num_committed_tokens <= prompt_length
+    finally:
+        cache.close()
+        core.shutdown()
+
+
 def _revert_context_request(request_id: int) -> SimpleNamespace:
     return SimpleNamespace(
         py_request_id=request_id,

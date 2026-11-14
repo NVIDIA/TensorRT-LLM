@@ -1,5 +1,28 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# Mistral Large 4 NVFP4, DSpark K=3: an independent reference implementation,
+# TP4/GB300, CUDA 13.4. Full 1319-sample, 5-shot GSM8K with the quick/full test's saved
+# prompt token IDs, no chat template, greedy decoding, 256 output tokens,
+# concurrency 16. AL = 1 + 93126 accepted drafts / 42248 verification steps.
+# All six specializations use this independent reference; min_al is 95%.
+ModelingV2MistralLarge4Nvfp4::tep4::dspark3:
+  ref_al: 3.20427002461655
+  min_al: 3.044056523385722
+ModelingV2MistralLarge4Nvfp4::dep4::dspark3:
+  ref_al: 3.20427002461655
+  min_al: 3.044056523385722
+ModelingV2MistralLarge4Nvfp4::tp4::dspark3:
+  ref_al: 3.20427002461655
+  min_al: 3.044056523385722
+ModelingV2MistralLarge4Nvfp4::tep8::dspark3:
+  ref_al: 3.20427002461655
+  min_al: 3.044056523385722
+ModelingV2MistralLarge4Nvfp4::dep8::dspark3:
+  ref_al: 3.20427002461655
+  min_al: 3.044056523385722
+ModelingV2MistralLarge4Nvfp4::tp8::dspark3:
+  ref_al: 3.20427002461655
+  min_al: 3.044056523385722
 TestQwen3_4B::test_eagle3:
   ref_al: 2.02809899228679
   min_al: 1.9266940426724504

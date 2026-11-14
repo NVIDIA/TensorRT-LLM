@@ -22,6 +22,7 @@ MODEL_PATH_DICT = {
     "llama_v3.1_8b_instruct_fp4": "modelopt-hf-model-hub/Llama-3.1-8B-Instruct-fp4",
     "gemma_4_26b_a4b_nvfp4": "gemma/nvidia-Gemma-4-26B-A4B-NVFP4",
     "gemma_4_31b_it_nvfp4": "gemma/nvidia-Gemma-4-31B-IT-NVFP4",
+    "mistral_large_4_nvfp4": "Mistral-Large-4-1T-A52B-NVFP4",
     "deepseek_r1_0528_fp8": "DeepSeek-R1/DeepSeek-R1-0528/",
     "deepseek_r1_0528_fp4": "DeepSeek-R1/DeepSeek-R1-0528-FP4/",
     "deepseek_r1_0528_fp4_v2": "DeepSeek-R1/DeepSeek-R1-0528-FP4-v2/",

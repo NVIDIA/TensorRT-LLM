@@ -52,6 +52,13 @@ l0_gb300_multi_gpus_perf_sanity:
   # nemotron-ultra-v3-fp4 50k2k (ctx_only)
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb300_nemotron-ultra-v3-fp4_50k2k_con12_ctx1_dep4_gen6_tep4_eplb0_mtp6_ccb-NIXL] TIMEOUT (30)
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb300_nemotron-ultra-v3-fp4_50k2k_con1197_ctx16_dep4_gen1_dep8_eplb0_mtp3_ccb-NIXL] TIMEOUT (40)
+  # mistral-large-4-nvfp4 8k1k (aggregated)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-mistral_large_4_nvfp4_grace_blackwell-mistral_large_4_nvfp4_tp4_dspark3_con1_8k1k] TIMEOUT (90)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-mistral_large_4_nvfp4_grace_blackwell-mistral_large_4_nvfp4_tp4_dspark3_con16_8k1k] TIMEOUT (90)
+  # mistral-large-4-nvfp4 8k1k (ctx_only)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb300_mistral-large-4-nvfp4_8k1k_con64_ctx1_dep4_gen1_dep4_dspark3_ccb-NIXL] TIMEOUT (90)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb300_mistral-large-4-nvfp4_8k1k_con256_ctx1_dep4_gen1_dep4_dspark3_ccb-NIXL] TIMEOUT (90)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-gb300_mistral-large-4-nvfp4_8k1k_con1024_ctx1_dep4_gen1_dep4_dspark3_ccb-NIXL] TIMEOUT (90)
   # gen_only_no_context tests (disagg config)
   # nemotron-ultra-v3-fp4
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_nemotron-ultra-v3-fp4_8k64k_con1_ctx1_dep4_gen1_tep4_eplb0_mtp5_ccb-NIXL] TIMEOUT (40)
@@ -61,3 +68,7 @@ l0_gb300_multi_gpus_perf_sanity:
   # minimax-m3-fp4 eagle3 150k1k con1 and con64, TP4 gen worker
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_minimax-m3-fp4_150k1k_con1_ctx1_tp2_gen1_tp4_eplb0_eagle3_ccb-NIXL] TIMEOUT (35)
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_minimax-m3-fp4_150k1k_con64_ctx1_tp2_gen1_tp4_eplb0_eagle3_ccb-NIXL] TIMEOUT (45)
+  # mistral-large-4-nvfp4 8k1k (gen_only_no_context)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_mistral-large-4-nvfp4_8k1k_con64_ctx1_dep4_gen1_dep4_dspark3_ccb-NIXL] TIMEOUT (90)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_mistral-large-4-nvfp4_8k1k_con256_ctx1_dep4_gen1_dep4_dspark3_ccb-NIXL] TIMEOUT (90)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-gen_only_no_context-gb300_mistral-large-4-nvfp4_8k1k_con1024_ctx1_dep4_gen1_dep4_dspark3_ccb-NIXL] TIMEOUT (90)

@@ -165,6 +165,19 @@ l0_b300:
   - unittest/_torch/modeling_v2/models/minimax_m3/test_shared_kernel_contracts.py --import-mode=importlib TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4 --import-mode=importlib --ignore-glob=unittest/_torch/modeling_v2/models/minimax_m3/**/comm/* TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8 --import-mode=importlib --ignore-glob=unittest/_torch/modeling_v2/models/minimax_m3/**/comm/* TIMEOUT (30)
+  # mistral_large4: its GPU-run top-level file, op categories (ops/comm needs four GPUs and
+  # runs in l0_gb300_multi_gpus) and sm_103 targets.
+  - unittest/_torch/modeling_v2/models/mistral_large4/test_multimodal_vision.py TIMEOUT (30)
+  - unittest/_torch/modeling_v2/models/mistral_large4/ops/activation TIMEOUT (30)
+  - unittest/_torch/modeling_v2/models/mistral_large4/ops/attention TIMEOUT (30)
+  - unittest/_torch/modeling_v2/models/mistral_large4/ops/gemm TIMEOUT (30)
+  - unittest/_torch/modeling_v2/models/mistral_large4/ops/moe TIMEOUT (30)
+  - unittest/_torch/modeling_v2/models/mistral_large4/ops/norm TIMEOUT (30)
+  - unittest/_torch/modeling_v2/models/mistral_large4/ops/quantization TIMEOUT (30)
+  - unittest/_torch/modeling_v2/models/mistral_large4/ops/vision TIMEOUT (30)
+  - unittest/_torch/modeling_v2/models/mistral_large4/mistral_large_4_nvfp4__sm_103__dep TIMEOUT (30)
+  - unittest/_torch/modeling_v2/models/mistral_large4/mistral_large_4_nvfp4__sm_103__tep TIMEOUT (30)
+  - unittest/_torch/modeling_v2/models/mistral_large4/mistral_large_4_nvfp4__sm_103__tp TIMEOUT (30)
   # K3 single-GPU kernel and wrapper checks.
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_ctm_gemv/test_k3_ctm_gemv.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_ctx_kv/test_k3_ctx_kv.py

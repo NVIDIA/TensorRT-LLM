@@ -91,5 +91,9 @@ l0_gr100:
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/moe
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/quantization
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/spec
+  # The Mistral Large 4 sm_107 targets' own entries: the Rubin MXFP8 linear and the Triton
+  # indexer scorer. The B300 list reaches them too, where they skip.
+  - unittest/_torch/modeling_v2/models/mistral_large4/ops/gemm/test_modeling_v2_cute_dsl_fp8_block_scale_linear.py
+  - unittest/_torch/modeling_v2/models/mistral_large4/ops/attention/test_modeling_v2_triton_fp8_mqa_logits.py
   - unittest/_torch/visual_gen/kernels/parallel/test_fmha_dense_fp8.py
   - unittest/_torch/visual_gen/kernels/parallel/test_fused_dit_qk_norm_rope_fp8.py

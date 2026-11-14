@@ -618,6 +618,76 @@ def test_model_loader_session_spans_mapper_and_materialization() -> None:
     assert "checkpoint_finalization_seconds" in loader.metrics
 
 
+def test_model_loader_lets_a_model_read_its_own_checkpoint() -> None:
+    events = []
+
+    class _Model:
+        def load_checkpoint(self, checkpoint_dir):
+            events.append(("load_checkpoint", checkpoint_dir))
+
+    loader = ModelLoader.__new__(ModelLoader)
+    loader._metrics = {}
+    loader._startup_metadata = {"checkpoint_io_policy": "stale"}
+    loader._call_load_weights = MagicMock()
+    weights_preloaded = loader._materialize_checkpoint_weights(
+        _SessionCheckpointLoader(events),
+        "/checkpoint",
+        _Model(),
+        object(),
+        {"mapping": object()},
+    )
+
+    assert not weights_preloaded
+    assert events == [("load_checkpoint", "/checkpoint")]
+    loader._call_load_weights.assert_not_called()
+    assert "weight_population_seconds" in loader.metrics
+    assert "checkpoint_preparation_seconds" not in loader.metrics
+    # No checkpoint loader read the files, so no checkpoint IO policy applied.
+    assert loader._startup_metadata["checkpoint_io_policy"] is None
+
+
+@pytest.mark.parametrize("reads_own_checkpoint", [False, True])
+def test_dummy_loading_builds_a_weight_mapper_unless_the_model_reads_its_checkpoint(
+    monkeypatch: pytest.MonkeyPatch, reads_own_checkpoint: bool
+) -> None:
+    filled = []
+    monkeypatch.setattr(
+        model_loader_module, "initialize_dummy_weights", lambda model: filled.append(model)
+    )
+
+    class _Model:
+        pass
+
+    if reads_own_checkpoint:
+        _Model.load_checkpoint = lambda self, checkpoint_dir: None
+    model = _Model()
+    checkpoint_loader = MagicMock()
+    loader = ModelLoader.__new__(ModelLoader)
+    loader.weight_mapper = None
+
+    loader._initialize_dummy_weights(checkpoint_loader, model, object(), False)
+
+    assert filled == [model]
+    if reads_own_checkpoint:
+        checkpoint_loader.get_initialized_weight_mapper.assert_not_called()
+        assert loader.weight_mapper is None
+    else:
+        assert loader.weight_mapper is checkpoint_loader.get_initialized_weight_mapper.return_value
+
+
+def test_dummy_loading_copies_the_draft_weights_from_the_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(model_loader_module, "initialize_dummy_weights", lambda model: None)
+    model = MagicMock()
+    loader = ModelLoader.__new__(ModelLoader)
+    loader.weight_mapper = None
+
+    loader._initialize_dummy_weights(MagicMock(), model, object(), True)
+
+    model.draft_model.load_weights_from_target_model.assert_called_once_with(model)
+
+
 def test_shadow_plan_disabled_does_not_call_inspection_hooks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

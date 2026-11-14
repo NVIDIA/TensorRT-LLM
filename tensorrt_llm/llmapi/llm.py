@@ -350,6 +350,22 @@ TORCH_LLM_DOCSTRING = TORCH_LLMARGS_EXPLICIT_DOCSTRING + """
 """
 
 
+def _default_guided_decoding_backend(
+        args: Any, model_type: Optional[str]) -> Optional[str]:
+    """The guided decoding backend to serve with when the arguments set none.
+
+    Mistral Large 4 serves structured outputs (``response_format``) by default,
+    with xgrammar. A speculative decoding config keeps the given value: how it
+    combines with guided decoding is settled when the arguments are validated.
+    A multimodal-encoder-only instance generates nothing and keeps it too.
+    """
+    if (args.guided_decoding_backend is None and model_type == "mistral_large_4"
+            and args.speculative_config is None
+            and not getattr(args, "mm_encoder_only", False)):
+        return "xgrammar"
+    return args.guided_decoding_backend
+
+
 @dataclass
 class PreprocessedInputs:
     """Light structure for holding preprocessed inputs.
@@ -1756,8 +1772,21 @@ class BaseLLM:
 
     def _try_load_hf_model_config(
             self) -> Optional[transformers.PretrainedConfig]:
+        kwargs = {}
+        # A Mistral-Large-4 checkpoint keeps its config in params.json, which
+        # the Mistral-native format reads; every other checkpoint keeps the HF
+        # config lookup.
+        checkpoint_format = getattr(self.args, "checkpoint_format", None)
+        if checkpoint_format in (CheckpointFormat.MISTRAL,
+                                 CheckpointFormat.MISTRAL_LARGE_3):
+            from .._torch.models.checkpoints.mistral.config_loader import \
+                is_mistral_large4_checkpoint
+            if is_mistral_large4_checkpoint(self.args.model):
+                kwargs["checkpoint_format"] = checkpoint_format
         return ModelLoader.load_hf_model_config(
-            self.args.model, trust_remote_code=self.args.trust_remote_code)
+            self.args.model,
+            trust_remote_code=self.args.trust_remote_code,
+            **kwargs)
 
     @set_api_status("prototype")
     def start_profile(self,
@@ -2217,6 +2246,22 @@ class _TorchLLM(BaseLLM):
                     "using LLM(model=..., encode_only=True) with "
                     "llm.encode() for optimized batch-forward inference that "
                     "bypasses the decoder scheduler.", architectures[0])
+
+        model_type = getattr(self._hf_model_config, "model_type", None)
+        guided_decoding_backend = _default_guided_decoding_backend(
+            self.args, model_type)
+        if guided_decoding_backend != self.args.guided_decoding_backend:
+            logger.info(
+                f"Guided decoding backend {guided_decoding_backend} enabled "
+                "for structured outputs.")
+            self.args.guided_decoding_backend = guided_decoding_backend
+        elif (model_type == "mistral_large_4"
+              and guided_decoding_backend is None
+              and self.args.speculative_config is not None):
+            logger.info(
+                "Guided decoding stays off with speculative decoding; set "
+                "guided_decoding_backend to 'xgrammar' to serve structured "
+                "outputs.")
 
         # Create the standard executor for generate()/generate_async()
         # TODO: revisit gather_context_logits
