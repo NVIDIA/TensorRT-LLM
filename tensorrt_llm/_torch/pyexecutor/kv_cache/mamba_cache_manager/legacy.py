@@ -302,6 +302,10 @@ class PythonMambaCacheManager(BaseResourceManager):
         kda_replay_num_spec: Optional[int] = None,
     ) -> None:
         warn_legacy_mamba_cache_manager("python", type(self).__name__)
+        if ssm_cache_dtype == torch.int8:
+            raise NotImplementedError(
+                "mamba_ssm_cache_dtype=int8 is implemented only by the V2 Mamba cache manager"
+            )
         self.mamba_ssm_cache_dtype = ssm_cache_dtype
         self.speculative_num_draft_tokens = speculative_num_draft_tokens
         self.spec_state_size = spec_state_size
@@ -1764,6 +1768,10 @@ class CppMambaHybridCacheManager(KVCacheManager, _LegacyMambaHybridCacheManager)
         conv_dim = conv_dim // tp_size
         nheads = nheads // tp_size
         self.conv_state_shape = [conv_dim, mamba_d_conv - 1]
+        if self.ssm_state_dtype == torch.int8:
+            raise NotImplementedError(
+                "mamba_ssm_cache_dtype=int8 is implemented only by the V2 Mamba cache manager"
+            )
         self.ssm_state_shape = [nheads, mamba_head_dim, mamba_d_state]
         self.conv_state_dtype = mamba_cache_dtype
 

@@ -496,6 +496,11 @@
 # DeepSeek and GPT-OSS examples retain the Modeling V2 team ownership above.
 # Other model implementations and their tests belong to their submitting authors.
 
+# Qwen3.5 (Qwen3.8-27B), including its native code in csrc/
+/tensorrt_llm/_torch/_experimental/modeling_v2/models/qwen3_5 @nvchenghaoz
+/tests/unittest/_torch/modeling_v2/models/qwen3_5 @nvchenghaoz
+/tests/integration/defs/accuracy/modeling_v2/qwen3_5 @nvchenghaoz
+
 # Qwen4
 /tensorrt_llm/_torch/_experimental/modeling_v2/models/qwen4_exp @Wanli-Jiang
 /tests/unittest/_torch/modeling_v2/models/qwen4_exp @Wanli-Jiang

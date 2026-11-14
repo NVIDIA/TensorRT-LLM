@@ -1484,6 +1484,117 @@ class TestMambaEffectiveTpSize:
         ) == 16 * params.get_states_bytes_per_layer(helix)
 
 
+class TestInt8RecurrentStatePool:
+    """``mamba_ssm_cache_dtype='int8'``: an int8-typed pool a modeling_v2 target fills with
+    int16 row codes plus one fp32 scale per row. Its sizing reaches the budget through
+    ``ssm_state_rows``, and only a model a modeling_v2 target claims may ask for it."""
+
+    @staticmethod
+    def _tp1() -> SimpleNamespace:
+        return SimpleNamespace(
+            tp_size=1, cp_size=1, enable_attention_dp=False, has_cp_helix=lambda: False
+        )
+
+    def test_rows_hold_two_code_bytes_per_element_and_the_row_scales(self) -> None:
+        import torch
+
+        from tensorrt_llm._torch.pyexecutor.config_utils import ssm_state_rows
+
+        # 128 value rows of int16 codes = 256 int8 rows, then 128 fp32 scales = 4 rows.
+        assert ssm_state_rows(128, 128, torch.int8) == 2 * 128 + 4
+        for dtype in (torch.bfloat16, torch.float16, torch.float32):
+            assert ssm_state_rows(128, 128, dtype) == 128
+        # The scales must fill whole rows.
+        with pytest.raises(AssertionError):
+            ssm_state_rows(100, 128, torch.int8)
+
+    def test_budget_counts_the_int8_pool_bytes(self) -> None:
+        """Qwen3.8-27B's Gated-DeltaNet geometry: 48 value heads of 128x128, 16 key heads."""
+        import torch
+
+        from tensorrt_llm._torch.pyexecutor.config_utils import MambaKVCacheParams
+
+        def params(ssm_dtype):
+            return MambaKVCacheParams(
+                state_size=128,
+                conv_kernel=4,
+                num_heads=48,
+                n_groups=16,
+                head_dim=128,
+                mamba_layer_mask=[True],
+                target_full_attention_layer_mask=[False],
+                num_mamba_layers=1,
+                num_draft_layers=0,
+                dtype=torch.bfloat16,
+                mamba_ssm_cache_dtype=ssm_dtype,
+            )
+
+        conv_bytes = (48 * 128 + 2 * 16 * 128) * (4 - 1) * 2
+        int8 = params(torch.int8).get_states_bytes_per_layer(self._tp1())
+        assert int8 == conv_bytes + 48 * 260 * 128
+        # Twice the bytes of an int8 state plus 4 bytes per row: the bf16 pool's size plus
+        # the scales.
+        bf16 = params(torch.bfloat16).get_states_bytes_per_layer(self._tp1())
+        assert int8 - bf16 == 48 * 128 * 4
+
+    @staticmethod
+    def _model_config(target):
+        import torch
+
+        return SimpleNamespace(
+            pretrained_config=SimpleNamespace(model_type="qwen3_5_text"),
+            torch_dtype=torch.bfloat16,
+            modeling_v2_target=target,
+            quant_config=SimpleNamespace(),
+        )
+
+    def test_int8_is_refused_without_a_modeling_v2_target(self) -> None:
+        from tensorrt_llm._torch.pyexecutor.model_loader import (
+            validate_and_set_mamba_ssm_cache_dtype,
+        )
+
+        config = self._model_config(target=None)
+        with pytest.raises(ValueError, match="implemented only by modeling_v2 targets"):
+            validate_and_set_mamba_ssm_cache_dtype(config, "int8")
+        # Other dtypes are unaffected.
+        validate_and_set_mamba_ssm_cache_dtype(config, "bfloat16")
+
+    def test_int8_is_accepted_when_a_modeling_v2_target_claims_the_model(self) -> None:
+        import torch
+
+        from tensorrt_llm._torch.pyexecutor.model_loader import (
+            validate_and_set_mamba_ssm_cache_dtype,
+        )
+
+        config = self._model_config(target=type("Target", (), {}))
+        validate_and_set_mamba_ssm_cache_dtype(config, "int8")
+        assert config.quant_config.mamba_ssm_cache_dtype == torch.int8
+
+    def test_the_legacy_python_manager_refuses_int8(self) -> None:
+        """Only the V2 hybrid manager lays out the int8 pool; the guard runs before any
+        allocation."""
+        import torch
+
+        from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
+            PythonMambaCacheManager,
+        )
+
+        with pytest.raises(NotImplementedError, match="only by the V2 Mamba cache manager"):
+            PythonMambaCacheManager(
+                d_state=128,
+                d_conv=4,
+                num_heads=48,
+                n_groups=16,
+                head_dim=128,
+                num_layers=1,
+                max_batch_size=1,
+                spec_state_size=0,
+                mapping=Mapping(),
+                dtype=torch.bfloat16,
+                ssm_cache_dtype=torch.int8,
+            )
+
+
 def _v2_model_config(num_layers=24, layer_types=None, sliding_window=None):
     """Minimal model config the V2 static estimators accept."""
     pretrained = SimpleNamespace(

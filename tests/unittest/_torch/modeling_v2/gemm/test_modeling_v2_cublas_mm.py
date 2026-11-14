@@ -114,6 +114,18 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             spec=dict(m=16, k=2880, n=5120, dtype=torch.bfloat16, bias=True, out_dtype=None),
         ),
     ),
+    # qwen3_5 (Qwen3.8-27B) runs its Gated-DeltaNet in_proj_ba here above the
+    # small-N GEMV's 16 rows: hidden 5120 -> [b | a], 2 x 48 value heads.
+    "qwen3_5/qwen3_8_27b_nvfp4__sm_120__tp1": (
+        Cell(
+            why="qwen3.8-27b in_proj_ba, 17 rows: hidden 5120 -> 96",
+            spec=dict(m=17, k=5120, n=96, dtype=torch.bfloat16, bias=False, out_dtype=None),
+        ),
+        Cell(
+            why="qwen3.8-27b in_proj_ba, a prefill step of 8192 rows: hidden 5120 -> 96",
+            spec=dict(m=8192, k=5120, n=96, dtype=torch.bfloat16, bias=False, out_dtype=None),
+        ),
+    ),
 }
 
 CELLS = certified_cells(op, TARGET_CELLS)

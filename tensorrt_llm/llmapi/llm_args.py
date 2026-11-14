@@ -5723,11 +5723,13 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
     mamba_ssm_cache_dtype: Literal[
-        "auto", "float16", "bfloat16", "float32"] = Field(
+        "auto", "float16", "bfloat16", "float32", "int8"] = Field(
             default="auto",
             description=
-            "The data type to use for the Mamba SSM cache. If set to 'auto', the data type will be inferred from the model config."
-        )
+            "The data type to use for the Mamba SSM cache. If set to 'auto', the data type will be inferred from the model config. "
+            "'int8' allocates an int8-typed byte pool that a modeling_v2 target fills with its own quantized row "
+            "layout (int16 row codes plus one fp32 scale per row); only modeling_v2 targets that read "
+            "that layout accept it.")
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
     mamba_ssm_stochastic_rounding: bool = Field(
