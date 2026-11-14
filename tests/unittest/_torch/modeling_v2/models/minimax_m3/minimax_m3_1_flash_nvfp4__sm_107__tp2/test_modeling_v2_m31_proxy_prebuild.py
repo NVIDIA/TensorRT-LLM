@@ -22,8 +22,7 @@ try:
     )
 except NoTarget as exc:
     pytest.skip(str(exc), allow_module_level=True)
-# The fmha_sm100 the target's attention runs: the family's vendored copy on an engine that takes the family MSA
-# classes, else the package main's backend imports.
+# The fmha_sm100 the target's attention runs (msa.engine): the family's vendored copy.
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.msa.engine import (
     require_msa_module,
 )

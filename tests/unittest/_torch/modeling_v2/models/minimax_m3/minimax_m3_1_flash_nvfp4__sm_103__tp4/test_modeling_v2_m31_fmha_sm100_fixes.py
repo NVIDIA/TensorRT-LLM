@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The two arch-independent fmha_sm100 correctness fixes the M3.1 targets rely on, checked on the packaged fmha_sm100
-the engine's MSA backend resolves (``require_msa_module``):
+"""The two arch-independent fmha_sm100 correctness fixes the M3.1 targets rely on, checked on the fmha_sm100 their MSA
+attention runs (``msa.engine.require_msa_module``: the family's vendored copy):
 
 1. Sm100FmhaFwdKernelTmaWarpspecialized is PDL-launched, so it must run griddepcontrol.wait before reading any
    input (the upstream wait is commented out: a race with its predecessor; the M3.1 prefill index proxy pass runs it).
@@ -14,17 +14,11 @@ from pathlib import Path
 
 import pytest
 
-from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.msa.engine import (
     require_msa_module,
 )
 
-pytestmark = [
-    pytest.mark.cpu_only,
-    # The packaged fmha_sm100 does not carry these two fixes yet; they land with the vendored MSA tree update.
-    pytest.mark.skip(
-        reason="the packaged fmha_sm100 does not carry the PDL wait and NVFP4-KV tail fixes yet"
-    ),
-]
+pytestmark = pytest.mark.cpu_only
 
 
 def _pkg() -> Path:

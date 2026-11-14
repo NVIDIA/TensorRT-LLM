@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """The opt-in ahead-of-time build of the minimax_m3 family's vendored MSA kernels.
 
-With BUILD_MSA_AOT (scripts/build_wheel.py --msa_aot) the family's csrc/msa_aot renders the variant sources
+With BUILD_MSA_AOT set in the build the family's csrc/msa_aot renders the variant sources
 (generate_fmha_variants.py) and compiles them, the plan / reduction / sparse_topk modules, the k2q CSR builder and the
 E4M3X prefill into tensorrt_llm/libs/msa_fmha_sm100, and the vendored packages load them from there instead of
 compiling at run time. Without that build (the default) the GPU tests skip: everything compiles at run time.
@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 import torch
 
-_REPO = Path(__file__).resolve().parents[6]
+_REPO = Path(__file__).resolve().parents[7]
 _FAM = "tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3"
 _FAM_DIR = _REPO / "tensorrt_llm/_torch/_experimental/modeling_v2/models/minimax_m3"
 _GENERATOR = _FAM_DIR / "csrc/msa_aot/generate_fmha_variants.py"

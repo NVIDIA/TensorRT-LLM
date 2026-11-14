@@ -216,6 +216,14 @@ package_data += [
 # Non-Python sources and notices of the MSA kernels the MiniMax-M3.1 targets compile at run time.
 _MSA_KERNELS = '_torch/_experimental/modeling_v2/models/minimax_m3/kernels/msa_kernels'
 package_data += [
+    f'{_MSA_KERNELS}/fmha_sm100/LICENSE',
+    f'{_MSA_KERNELS}/fmha_sm100/NOTICE',
+    f'{_MSA_KERNELS}/fmha_sm100/csrc/**/*',
+    f'{_MSA_KERNELS}/fmha_sm100/cute/src/**/*.cu',
+    f'{_MSA_KERNELS}/prefill_bf16x/LICENSE',
+    f'{_MSA_KERNELS}/prefill_bf16x/NOTICE',
+    f'{_MSA_KERNELS}/prefill_bf16x/README.md',
+    f'{_MSA_KERNELS}/prefill_bf16x/csrc/**/*',
     f'{_MSA_KERNELS}/fmha_sm100_q8kv8/LICENSE',
     f'{_MSA_KERNELS}/fmha_sm100_q8kv8/NOTICE',
 ]

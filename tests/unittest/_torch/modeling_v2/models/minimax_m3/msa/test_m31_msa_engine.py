@@ -87,6 +87,44 @@ def test_an_engine_with_the_hook_takes_the_family_classes(monkeypatch):
     assert classes.indexer_prewarm is engine.indexer_prewarm
 
 
+def _keep_stock_lookups(monkeypatch):
+    import importlib
+
+    monkeypatch.setattr(engine, "_stock_routed", False)
+    modules = []
+    for module_name, attr in engine._STOCK_MSA_LOOKUPS:
+        module = importlib.import_module(module_name)
+        monkeypatch.setattr(module, attr, getattr(module, attr))
+        modules.append((module, attr))
+    return modules
+
+
+def test_main_classes_resolve_the_vendored_fmha_sm100(monkeypatch):
+    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.msa import msa_prefill
+    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.msa.kernels import (
+        msa_utils,
+    )
+
+    monkeypatch.delenv("TRTLLM_M31_DISABLE_FAMILY_MSA", raising=False)
+    modules = _keep_stock_lookups(monkeypatch)
+    vendored = {
+        "require_msa_module": msa_utils.require_msa_module,
+        "_msa_sparse_api": msa_prefill._msa_sparse_api,
+    }
+    assert engine.route_stock_msa_to_vendored()
+    for module, attr in modules:
+        assert getattr(module, attr) is vendored[attr], (module.__name__, attr)
+    assert engine.route_stock_msa_to_vendored()  # idempotent
+
+
+def test_the_kill_switch_keeps_the_packaged_fmha_sm100(monkeypatch):
+    monkeypatch.setenv("TRTLLM_M31_DISABLE_FAMILY_MSA", "1")
+    modules = _keep_stock_lookups(monkeypatch)
+    before = [getattr(module, attr) for module, attr in modules]
+    assert not engine.route_stock_msa_to_vendored()
+    assert [getattr(module, attr) for module, attr in modules] == before
+
+
 def test_the_hook_field_is_classified_for_engines_without_it():
     assert "sparse_attention" in runtime_hooks_compat.PERF_ONLY
 
