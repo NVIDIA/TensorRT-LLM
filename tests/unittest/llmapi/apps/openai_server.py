@@ -175,12 +175,13 @@ class RemoteOpenAIServer:
                         f"Log output: {self.log_path or 'stdout'}.") from err
 
                 time.sleep(0.5)
-                if time.time() - start > timeout:
-                    # Terminate the server to avoid the process keeping running in background after timeout
-                    self.terminate()
-                    raise RuntimeError(
-                        f"Server failed to start within {timeout}s at {url}. "
-                        f"Log output: {self.log_path or 'stdout'}.") from err
+
+            if time.time() - start > timeout:
+                # Terminate the server to avoid the process keeping running in background after timeout
+                self.terminate()
+                raise RuntimeError(
+                    f"Server failed to start within {timeout}s at {url}. "
+                    f"Log output: {self.log_path or 'stdout'}.")
 
     @property
     def url_root(self) -> str:
@@ -318,6 +319,34 @@ class RemoteEmbeddingServer(RemoteOpenAIServer):
 
         # Use the `embeddings` subcommand instead of the regular `serve`.
         launch_cmd = ["trtllm-serve", "embeddings"] + [model] + args
+
+        self.proc = subprocess.Popen(launch_cmd,
+                                     stdout=self._get_output(),
+                                     stderr=self._get_output())
+        self._wait_for_server(url=self.url_for("health"),
+                              timeout=self.MAX_SERVER_START_WAIT_S)
+
+
+class RemoteRerankServer(RemoteOpenAIServer):
+    """Remote server for the rerank endpoints."""
+
+    def __init__(self,
+                 model: str,
+                 cli_args: List[str] = None,
+                 port: int = None,
+                 log_path: Optional[str] = None) -> None:
+        self.host = "localhost"
+        self.port = port if port is not None else get_free_port()
+        self.rank = int(os.environ.get("SLURM_PROCID", 0))
+        self.log_path = log_path
+        self.log_file = None
+        self.role = None
+        self.extra_config_file = None
+
+        args = ["--host", self.host, "--port", str(self.port)]
+        if cli_args:
+            args += cli_args
+        launch_cmd = ["trtllm-serve", "rerank", model] + args
 
         self.proc = subprocess.Popen(launch_cmd,
                                      stdout=self._get_output(),
