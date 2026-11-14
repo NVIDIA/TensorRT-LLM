@@ -7,11 +7,18 @@ manager (:class:`~.cache_manager.MiniMaxM31KVCacheManagerV2`) derive from main's
 builds its attention layers from the family backend only when the engine can be told to build the matching step
 metadata and KV cache manager (``RuntimeHooks.sparse_attention``); on an engine without that hook the targets keep
 main's classes, which run the same tokens without the family's MSA paths.
+
+Either way the targets run the family's vendored fmha_sm100 (``kernels/msa_kernels/fmha_sm100``), which carries two
+correctness fixes the packaged module lacks: the forward kernel waits on its grid dependency before reading its inputs
+(it is PDL-launched), and the NVFP4-KV forward zeroes the V rows at or past the valid columns. With main's classes,
+:func:`route_stock_msa_to_vendored` points their fmha_sm100 lookups at the vendored copy.
 """
 
 from __future__ import annotations
 
 import contextlib
+import importlib
+import os
 from typing import Any, Optional
 
 import torch
@@ -26,6 +33,7 @@ __all__ = [
     "family_msa_enabled",
     "indexer_prewarm",
     "require_msa_module",
+    "route_stock_msa_to_vendored",
     "sparse_attention_classes",
     "use_family_backend",
     "warmup_scope",
@@ -35,13 +43,55 @@ __all__ = [
 _DISABLE_ENV = "TRTLLM_M31_DISABLE_FAMILY_MSA"
 
 
+# main's modules that resolve fmha_sm100 for its MiniMax-M3 MSA classes, and the attribute each resolves it through.
+_STOCK_MSA_LOOKUPS = (
+    (
+        "tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils",
+        "require_msa_module",
+    ),
+    ("tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_backend", "require_msa_module"),
+    ("tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_indexer", "require_msa_module"),
+    ("tensorrt_llm._torch.attention.backends.fmha.msa_prefill", "_msa_sparse_api"),
+)
+_stock_routed = False
+
+
+def _switch_off() -> bool:
+    return os.environ.get(_DISABLE_ENV, "0") == "1"
+
+
 def family_msa_enabled() -> bool:
     """Whether the targets build the family's MSA classes: the engine takes them and the switch is not set."""
-    import os
-
-    if os.environ.get(_DISABLE_ENV, "0") == "1":
+    if _switch_off():
         return False
     return runtime_hooks_compat.has_hook("sparse_attention")
+
+
+def route_stock_msa_to_vendored() -> bool:
+    """Point main's MiniMax-M3 MSA classes' fmha_sm100 lookups (the module their prefill, indexer proxy pass and
+    plans run) at the family's vendored copy, so the layers the targets build from main's classes run the fixed
+    kernels too. Process-wide and idempotent; call it before the first forward. Only the module lookup changes:
+    main's backend selection and code paths stay as they are. TRTLLM_M31_DISABLE_FAMILY_MSA=1 keeps the packaged
+    module. Whether the lookups resolve the vendored copy."""
+    global _stock_routed
+    if _switch_off():
+        return False
+    if _stock_routed:
+        return True
+    from . import msa_prefill as family_prefill
+    from .kernels import msa_utils as family_utils
+
+    vendored = {
+        "require_msa_module": family_utils.require_msa_module,
+        "_msa_sparse_api": family_prefill._msa_sparse_api,
+    }
+    for module_name, attr in _STOCK_MSA_LOOKUPS:
+        module = importlib.import_module(module_name)
+        if hasattr(module, attr):
+            setattr(module, attr, vendored[attr])
+    _stock_routed = True
+    logger.info("MiniMax-M3.1: main's MSA classes resolve the family's vendored fmha_sm100")
+    return True
 
 
 def sparse_attention_classes() -> Optional[Any]:
@@ -106,13 +156,17 @@ def create_msa_attention(
                 cache_context_plan=False,
                 **kwargs,
             )
+    route_stock_msa_to_vendored()
     return create_attention(backend_name, layer_idx, num_heads, head_dim, num_kv_heads, **kwargs)
 
 
 def use_family_backend(module) -> bool:
     """Rebuild ``module.attn`` (an ``Attention`` whose backend main's registry resolved to the MiniMax-M3 MSA
-    backend) as the family backend with the same arguments, when :func:`family_msa_enabled`; whether it did."""
+    backend) as the family backend with the same arguments, when :func:`family_msa_enabled`; whether it did. When it
+    does not, main's backend keeps the layer and :func:`route_stock_msa_to_vendored` points it at the vendored
+    fmha_sm100."""
     if not family_msa_enabled():
+        route_stock_msa_to_vendored()
         return False
     from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import MiniMaxM3MsaSparseAttention
 
@@ -149,9 +203,10 @@ def use_family_backend(module) -> bool:
 
 
 def require_msa_module():
-    """The fmha_sm100 module the targets' MSA attention runs: the family's vendored copy when
-    :func:`family_msa_enabled`, else the package main's backend imports."""
-    if family_msa_enabled():
+    """The fmha_sm100 module the targets' MSA attention runs: the family's vendored copy (the family backend's, and
+    main's backend's once :func:`route_stock_msa_to_vendored` ran), or with TRTLLM_M31_DISABLE_FAMILY_MSA=1 the
+    package main's backend imports."""
+    if not _switch_off():
         from .kernels.msa_utils import require_msa_module as family_require
     else:
         from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
