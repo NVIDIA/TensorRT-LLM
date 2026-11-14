@@ -1866,12 +1866,15 @@ void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, cudaStr
         // Convert Q to FP8 in absorption mode.
         if (params.absorption_mode)
         {
+            // Q-sized grids can reduce idle blocks but also useful CTA parallelism.
+            static bool const useQLenForQuantGrid = getBoolEnv("TRTLLM_MLA_Q_QUANT_GRID_USE_Q_LEN");
+            int const quantGridLen = useQLenForQuantGrid ? params.acc_q_len : total_kv_len;
 
             if (params.meta.rope_append)
             {
                 constexpr int threads_per_block = 288;
                 constexpr int num_tokens_per_block = threads_per_block * 16 / 576 * sizeof(T);
-                dim3 grid(int(tensorrt_llm::common::divUp(total_kv_len, num_tokens_per_block)), 1, params.head_num);
+                dim3 grid(int(tensorrt_llm::common::divUp(quantGridLen, num_tokens_per_block)), 1, params.head_num);
 
                 TLLM_LOG_DEBUG(
                     "Launching quantizeCopyInputToFp8Kernel with grid_size: (%d, %d, %d), threads_per_block: %d, "
@@ -1890,7 +1893,7 @@ void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, cudaStr
             {
                 constexpr int threads_per_block = 256;
                 constexpr int num_tokens_per_block = threads_per_block * 16 / 512 * sizeof(T);
-                dim3 grid(int(tensorrt_llm::common::divUp(total_kv_len, num_tokens_per_block)), 1, params.head_num);
+                dim3 grid(int(tensorrt_llm::common::divUp(quantGridLen, num_tokens_per_block)), 1, params.head_num);
 
                 TLLM_LOG_DEBUG(
                     "Launching quantizeCopyInputToFp8Kernel with grid_size: (%d, %d, %d), threads_per_block: %d, "

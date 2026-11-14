@@ -18,6 +18,15 @@ tests:
     launch:
       mode: mpi
       world_size: 8
+  - case: accuracy/modeling_v2/glm_moe_dsa/glm_5_2_nvfp4__sm_107__high_throughput/test_accuracy.py::TestModelingV2Glm52Nvfp4Sm107HighThroughput::test_gsm8k_and_acceptance[p05_tp16_ep16_b7_k7] TIMEOUT (30)
+    launch:
+      nodes: 4
+  - case: accuracy/modeling_v2/glm_moe_dsa/glm_5_2_nvfp4__sm_107__high_throughput/test_accuracy.py::TestModelingV2Glm52Nvfp4Sm107HighThroughput::test_gsm8k_and_acceptance[p06_tp16_ep16_b10_k5] TIMEOUT (30)
+    launch:
+      nodes: 4
+  - case: accuracy/modeling_v2/glm_moe_dsa/glm_5_2_nvfp4__sm_107__high_throughput/test_accuracy.py::TestModelingV2Glm52Nvfp4Sm107HighThroughput::test_gsm8k_and_acceptance[p07_tp16_ep16_b20_k5] TIMEOUT (30)
+    launch:
+      nodes: 4
   # ModelingV2 Kimi K3: 16 GB200 GPUs in one NVLink domain (SM100).
   - case: accuracy/modeling_v2/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_accuracy.py::TestModelingV2KimiK3Mxfp4Sm100Tp16Moetp16ep1::test_gsm8k
   - case: accuracy/modeling_v2/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_accuracy.py::TestModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4::test_gsm8k
