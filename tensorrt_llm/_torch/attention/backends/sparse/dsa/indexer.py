@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import os
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
 
@@ -90,6 +90,21 @@ _INDEXER_MQA_LOGITS_ELEM_BUDGET = get_indexer_mqa_logits_elem_budget()
 _INDEXER_PACKED_LOGITS_ELEM_BUDGET = int(
     os.environ.get("TLLM_INDEXER_PACKED_LOGITS_ELEM_BUDGET", 1 << 28)
 )
+# Per-device allocator pool of the eager compressed MQA logits; see _mqa_logits_pool.
+_MQA_LOGITS_POOLS: dict[int, torch.cuda.MemPool] = {}
+
+
+def _mqa_logits_pool(device: torch.device, max_seqlen_k: int):
+    """Allocator context of eager prefill MQA logits. Compressed logits (``max_seqlen_k > 0``, CSA2's
+    packed groups) change width with every group, so their own pool reuses one range where the
+    shared pool would map fresh multi-GiB ranges until a growth flushes the whole cache."""
+    if max_seqlen_k <= 0 or torch.cuda.is_current_stream_capturing():
+        return nullcontext()
+    pool = _MQA_LOGITS_POOLS.get(device.index)
+    if pool is None:
+        pool = _MQA_LOGITS_POOLS[device.index] = torch.cuda.MemPool()
+    return torch.cuda.use_mem_pool(pool, device=device)
+
 
 if TYPE_CHECKING:
     from tensorrt_llm.mapping import Mapping
@@ -1865,6 +1880,8 @@ class Indexer(nn.Module):
         cu_seqlen_ke: torch.Tensor,
         q_scale: Optional[torch.Tensor],
         clean_logits: bool = True,
+        max_seqlen_k: int = 0,
+        schedule_meta: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Dispatch fp8_mqa_logits vs fp8_fp4_mqa_logits based on use_fp4.
 
@@ -1878,6 +1895,12 @@ class Indexer(nn.Module):
         when the consumer never reads outside that window (the custom
         indexer_topk_prefill kernel); the torch topk fallback scans the full
         padded row and needs the fill.
+
+        max_seqlen_k > 0 returns compressed logits of shape [q, max_seqlen_k]
+        whose column j is key ks + j of that row.
+
+        schedule_meta (FP4 DeepGEMM path only) is get_mqa_logits_metadata's per-SM
+        split of the rows' key ranges; it changes which SM computes a logit, not its value.
         """
         if self.use_fp4:
             k_fp4_bytes = k_fp8.view(torch.int8)
@@ -1899,6 +1922,9 @@ class Indexer(nn.Module):
                 # rounding either to BF16 can change the exact Top-K selection.
                 logits = (dots.relu() * weights.float().unsqueeze(-1)).sum(1)
                 columns = torch.arange(k.shape[0], device=q.device)[None, :]
+                if max_seqlen_k > 0:
+                    columns = cu_seqlen_ks[:, None] + torch.arange(max_seqlen_k, device=q.device)
+                    logits = logits.gather(1, columns.clamp(0, k.shape[0] - 1))
                 return logits.masked_fill(
                     (columns < cu_seqlen_ks[:, None]) | (columns >= cu_seqlen_ke[:, None]),
                     -torch.inf,
@@ -1916,22 +1942,27 @@ class Indexer(nn.Module):
                 q_fp8 = F.pad(q_fp8, (0, 0, 0, padded_heads - heads))
                 q_scale_2d = F.pad(q_scale_2d, (0, padded_heads - heads))
                 weights = F.pad(weights, (0, padded_heads - heads))
-            return fp8_fp4_mqa_logits(
-                (q_fp8, q_scale_2d),
-                (k_fp4_bytes, k_scale_int32),
+            with _mqa_logits_pool(q_fp8.device, max_seqlen_k):
+                return fp8_fp4_mqa_logits(
+                    (q_fp8, q_scale_2d),
+                    (k_fp4_bytes, k_scale_int32),
+                    weights,
+                    cu_seqlen_ks,
+                    cu_seqlen_ke,
+                    clean_logits=clean_logits,
+                    max_seqlen_k=max_seqlen_k,
+                    schedule_meta=schedule_meta if padded_heads == heads else None,
+                )
+        with _mqa_logits_pool(q_fp8.device, max_seqlen_k):
+            return fp8_mqa_logits(
+                q_fp8,
+                (k_fp8, k_scale.reshape(-1)),
                 weights,
                 cu_seqlen_ks,
                 cu_seqlen_ke,
                 clean_logits=clean_logits,
+                max_seqlen_k=max_seqlen_k,
             )
-        return fp8_mqa_logits(
-            q_fp8,
-            (k_fp8, k_scale.reshape(-1)),
-            weights,
-            cu_seqlen_ks,
-            cu_seqlen_ke,
-            clean_logits=clean_logits,
-        )
 
     def _call_paged_mqa_logits(
         self,

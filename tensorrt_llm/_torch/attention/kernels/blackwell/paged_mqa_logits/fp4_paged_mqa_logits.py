@@ -541,6 +541,7 @@ class FP4MQALogitsKernel:
         use_flat_logits_view=None,
         use_two_level_task_loop=None,
         use_relu_trick: bool = True,
+        row_heads: int = 0,
     ):
         # The epilogue FMA works on head groups of 4. The N tile itself only
         # needs the tcgen05 rule (8 <= N <= N_max, N % 8 == 0); the SF layouts
@@ -706,6 +707,31 @@ class FP4MQALogitsKernel:
         # epilogue; x+|x| overflows to inf for finite x >= 2^127, which
         # unbounded scales and weights can reach.
         self.use_relu_trick = use_relu_trick
+        # ``row_heads`` < num_heads: each query row holds num_heads / row_heads
+        # rows of row_heads consecutive heads, each written as its own logits
+        # row (out_rows per sequence) and reduced in DeepGEMM's add order,
+        # (s0x + s1x) + (s0y + s1y), so the logits are DeepGEMM's bits.
+        self.split_rows = num_heads // row_heads if row_heads else 1
+        self.row_heads = num_heads // self.split_rows
+        if self.split_rows > 1 and (
+            row_heads * self.split_rows != num_heads
+            or row_heads % 4
+            or num_next_n_atoms != 1
+            or self.uneven
+            or num_epi_subtiles != 1
+            or epi_dtype != cutlass.Float32
+            or output_dtype != cutlass.Float32
+            or not use_batched_store
+            or emit_block_meta
+            or emit_seed_counts
+            or emit_cand
+            or emit_cand_bucketed
+        ):
+            raise ValueError(
+                "Split query rows need FP32, one atom, one epilogue sub-tile, "
+                "batched stores and no emission"
+            )
+        self.out_rows = next_n * self.split_rows
         # epi_bytes covers fp16 and bf16 (FP8 only handled fp16).
         self.epi_bytes = 2 if epi_dtype in (cutlass.Float16, cutlass.BFloat16) else 4
         # sW stage stride padded to 128-byte SMEM alignment for TMA bulk copy.
@@ -770,6 +796,8 @@ class FP4MQALogitsKernel:
     def _atom_out_row_base(self, qa):
         """Output row base for a q_atom_idx: seq*next_n + atom*next_n_atom (the
         +t within the atom is added by the caller). num_atoms == 1 => qa*next_n."""
+        if cutlass.const_expr(self.split_rows > 1):
+            return qa * self.out_rows
         na = self.num_next_n_atoms
         if cutlass.const_expr(not self.uneven):
             return (qa // na) * self.next_n + (qa % na) * self.next_n_atom
@@ -839,14 +867,14 @@ class FP4MQALogitsKernel:
                 packed_zero,
             )
         if cutlass.const_expr(self.use_batched_store):
-            # Batched STG: all result_arr[t] -> mLogits in one pass.
-            for t in range(n_valid):
+            # Batched STG: all result_arr[r] -> mLogits in one pass.
+            for r in range(n_valid * self.split_rows):
                 if cutlass.const_expr(self.use_flat_logits_view):
-                    out_off_t = out_row_off + t * logits_stride0 + kv_pos
-                    mLogits_flat[out_off_t] = result_arr[t]
+                    out_off_r = out_row_off + r * logits_stride0 + kv_pos
+                    mLogits_flat[out_off_r] = result_arr[r]
                 else:
-                    out_row = self._atom_out_row_base(q_idx) + t
-                    mLogits_2d[(out_row, kv_pos)] = result_arr[t]
+                    out_row = self._atom_out_row_base(q_idx) + r
+                    mLogits_2d[(out_row, kv_pos)] = result_arr[r]
 
     def _epi_t_body(
         self,
@@ -921,6 +949,16 @@ class FP4MQALogitsKernel:
             for h in range(0, reg_h_end, 4):
                 n0 = h
                 h_g = i * subtile_n + h
+                if cutlass.const_expr(
+                    self.split_rows > 1 and h_g > 0 and h_g % self.row_heads == 0
+                ):
+                    # This head starts the next row: close the previous one.
+                    row = t * self.split_rows + h_g // self.row_heads - 1
+                    result_arr[row] = self.output_dtype((s0x + s1x) + (s0y + s1y))
+                    s0x = cutlass.Float32(0.0)
+                    s0y = cutlass.Float32(0.0)
+                    s1x = cutlass.Float32(0.0)
+                    s1y = cutlass.Float32(0.0)
                 # packed path catches fp16 & bf16
                 if cutlass.const_expr(self.epi_dtype != cutlass.Float32):
                     pa01 = _mx(edt, _pk(edt, edt(acc_vec[n0]), edt(acc_vec[n0 + 1])), pz)
@@ -962,6 +1000,16 @@ class FP4MQALogitsKernel:
             for h in range(smem_h_start, subtile_n, 4):
                 n0 = h
                 h_g = i * subtile_n + h
+                if cutlass.const_expr(
+                    self.split_rows > 1 and h_g > 0 and h_g % self.row_heads == 0
+                ):
+                    # This head starts the next row: close the previous one.
+                    row = t * self.split_rows + h_g // self.row_heads - 1
+                    result_arr[row] = self.output_dtype((s0x + s1x) + (s0y + s1y))
+                    s0x = cutlass.Float32(0.0)
+                    s0y = cutlass.Float32(0.0)
+                    s1x = cutlass.Float32(0.0)
+                    s1y = cutlass.Float32(0.0)
                 if cutlass.const_expr(self.epi_dtype != cutlass.Float32):
                     pa01 = _mx(edt, _pk(edt, edt(acc_vec[n0]), edt(acc_vec[n0 + 1])), pz)
                     pa23 = _mx(edt, _pk(edt, edt(acc_vec[n0 + 2]), edt(acc_vec[n0 + 3])), pz)
@@ -1006,10 +1054,13 @@ class FP4MQALogitsKernel:
             # 4-9% slower on B200 by adding a dependent op
             # to the reduce->convert->store chain that
             # bounds the fp32 epilogue there).
-            result_t = s0x + s0y + s1x + s1y
+            if cutlass.const_expr(self.split_rows > 1):
+                result_t = (s0x + s1x) + (s0y + s1y)
+            else:
+                result_t = s0x + s0y + s1x + s1y
         # drop * scale_val (FP4 SF baked into acc).
         if cutlass.const_expr(self.use_batched_store):
-            result_arr[t] = self.output_dtype(result_t)
+            result_arr[t * self.split_rows + self.split_rows - 1] = self.output_dtype(result_t)
         elif cutlass.const_expr(self.use_flat_logits_view):
             out_off_t = out_row_off + t * logits_stride0 + kv_pos
             mLogits_flat[out_off_t] = self.output_dtype(result_t)
@@ -2727,7 +2778,9 @@ class FP4MQALogitsKernel:
                 # actual STG happens once after the for-t loop to land all
                 # STGs in one contiguous LSU phase.
                 if cutlass.const_expr(self.use_batched_store):
-                    result_arr = cute.make_rmem_tensor((next_n,), self.output_dtype)
+                    result_arr = cute.make_rmem_tensor(
+                        (next_n * self.split_rows,), self.output_dtype
+                    )
                 else:
                     result_arr = None
                 q_stage_local = cutlass.Int32(0)
@@ -3530,7 +3583,9 @@ class FP4MQALogitsKernel:
                 # actual STG happens once after the for-t loop to land all
                 # STGs in one contiguous LSU phase.
                 if cutlass.const_expr(self.use_batched_store):
-                    result_arr = cute.make_rmem_tensor((next_n,), self.output_dtype)
+                    result_arr = cute.make_rmem_tensor(
+                        (next_n * self.split_rows,), self.output_dtype
+                    )
                 else:
                     result_arr = None
                 q_stage_local = cutlass.Int32(0)

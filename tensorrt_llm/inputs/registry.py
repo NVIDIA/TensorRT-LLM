@@ -22,8 +22,9 @@ from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
-from typing import (Any, Callable, ClassVar, Dict, Iterator, List, Mapping,
-                    Optional, Protocol, Tuple, Type, TypeVar, Union)
+from typing import (TYPE_CHECKING, Any, Callable, ClassVar, Dict, Iterator,
+                    List, Mapping, Optional, Protocol, Tuple, Type, TypeVar,
+                    Union)
 
 import numpy as np
 import torch
@@ -56,6 +57,9 @@ from .multimodal_data import MEDIA_MODALITIES, serialize_item
 from .prefix_token_cache import (OffsetTokenizer, PrefixTokenCache,
                                  create_prefix_token_cache)
 from .tokenization import tokenize_prompt
+
+if TYPE_CHECKING:
+    from ..llmapi.llm_args import PromptTokenCacheConfig
 
 N = TypeVar("N", bound=Type[nn.Module])
 
@@ -216,6 +220,13 @@ class BaseMultimodalInputProcessor(ABC):
     # Whether the subclass takes `enable_tokenization_cache` in `__init__` and
     # uses `_init_tokenization_cache` and `_encode_with_tokenization_cache`.
     supports_tokenization_cache: ClassVar[bool] = False
+
+    # Whether the subclass takes `prompt_token_cache_config` in `__init__`.
+    supports_prompt_token_cache: ClassVar[bool] = False
+
+    # Whether the processor never needs a GPU, so attached serving frontends
+    # (num_serve_frontends > 1) start with no visible GPU.
+    runs_without_gpu: ClassVar[bool] = False
 
     # Set by `_init_tokenization_cache`; None (no cache) for a processor that
     # never calls it.
@@ -1206,12 +1217,20 @@ def register_input_processor(
     return wrapper
 
 
+def _warn_prompt_token_cache_ignored(processor_name: str) -> None:
+    logger.warning_once(
+        f"prompt_token_cache_config is ignored: {processor_name} does not "
+        "support the shared prompt token cache.",
+        key="prompt_token_cache_unsupported_processor")
+
+
 def create_input_processor(
     model_path_or_dir: str,
     tokenizer,
     checkpoint_format: CheckpointFormat | str | None = CheckpointFormat.HF,
     trust_remote_code: bool = True,
     enable_tokenization_cache: bool = False,
+    prompt_token_cache_config: Optional["PromptTokenCacheConfig"] = None,
     **kwargs,
 ) -> Union[InputProcessor, BaseMultimodalInputProcessor]:
     """Create an input processor for a specific model.
@@ -1229,6 +1248,8 @@ def create_input_processor(
             the tokenization of recent prompts. Ignored for model-specific
             (multimodal) input processors unless they set
             ``supports_tokenization_cache``.
+        prompt_token_cache_config: Node-shared prompt token cache, passed to
+            input processors that set ``supports_prompt_token_cache``.
         **kwargs: Additional arguments passed to input processor constructors
             (e.g., video_pruning_rate for multimodal models).
 
@@ -1259,6 +1280,9 @@ def create_input_processor(
             MistralNativeInputProcessor
         model_config = MistralConfigLoader().load(model_path_or_dir)
         config = model_config.pretrained_config
+        if prompt_token_cache_config is not None:
+            _warn_prompt_token_cache_ignored(
+                MistralNativeInputProcessor.__name__)
         return MistralNativeInputProcessor(model_path_or_dir,
                                            config,
                                            tokenizer,
@@ -1291,6 +1315,17 @@ def create_input_processor(
                     f"{input_processor_cls.__name__} does not support the "
                     "prefix tokenization cache.",
                     key="tokenization_cache_unsupported_processor")
+            if (issubclass(input_processor_cls, BaseMultimodalInputProcessor)
+                    and input_processor_cls.supports_prompt_token_cache):
+                kwargs["prompt_token_cache_config"] = prompt_token_cache_config
+                if (prompt_token_cache_config is not None
+                        and kwargs.pop("enable_tokenization_cache", False)):
+                    logger.warning(
+                        "prompt_token_cache_config takes precedence over "
+                        f"enable_tokenization_cache for {input_processor_cls.__name__}."
+                    )
+            elif prompt_token_cache_config is not None:
+                _warn_prompt_token_cache_ignored(input_processor_cls.__name__)
             # Input processors build an AutoTokenizer/AutoProcessor with
             # trust_remote_code; doing so copies the checkpoint's .py files
             # into the shared HF module cache non-atomically, and a rank that
@@ -1304,6 +1339,8 @@ def create_input_processor(
                                            trust_remote_code=trust_remote_code,
                                            **kwargs)
 
+    if prompt_token_cache_config is not None:
+        _warn_prompt_token_cache_ignored(DefaultInputProcessor.__name__)
     return DefaultInputProcessor(
         None,
         None,

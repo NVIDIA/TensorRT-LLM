@@ -15,8 +15,8 @@ The following is a table of supported models for the PyTorch backend:
 | `DeepseekV3ForCausalLM`              | DeepSeek-V3, Kimi-K2               | `deepseek-ai/DeepSeek-V3`                    |
 | `DeepseekV32ForCausalLM`             | DeepSeek-V3.2                      | `deepseek-ai/DeepSeek-V3.2`                  |
 | `DeepseekV4ForCausalLM` [^11]        | DeepSeek-V4                        | `deepseek-ai/DeepSeek-V4-Pro`                |
-| `DeepseekV41ForCausalLM`            | DeepSeek-V4.1 (text decoder)       | —                                          |
-| `DeepseekV41ForConditionalGeneration` | DeepSeek-V4.1                    | —                                          |
+| `DeepseekV41ForCausalLM` [^24]      | DeepSeek-V4.1 (text decoder)       | —                                          |
+| `DeepseekV41ForConditionalGeneration` [^24] | DeepSeek-V4.1              | —                                          |
 | `Exaone4ForCausalLM`                 | EXAONE 4.0                         | `LGAI-EXAONE/EXAONE-4.0-32B`                 |
 | `ExaoneMoeForCausalLM`               | K-EXAONE, K-EXAONE 2.0             | `LGAI-EXAONE/K-EXAONE-236B-A23B`, `LGAI-EXAONE/K-EXAONE-2.0-750B-A37B` |
 | `Gemma3ForCausalLM`                  | Gemma 3                            | `google/gemma-3-1b-it`                       |
@@ -127,6 +127,7 @@ statuses for the same architecture in the two matrices.
 [^21]: MiniMax-M3.1-Flash ships a standalone DSpark drafter in its `dspark/` directory (architecture `DSparkMiniMaxDraftModel`). Load it with `speculative_config: {decoding_type: DSpark, speculative_model: <checkpoint>/dspark, max_draft_len: 7}` (the drafter's block size is 7 and `max_draft_len` must match it). Keep KV cache block reuse enabled (the default): with `kv_cache_config.enable_block_reuse: false`, or on a disaggregated generation server, prompts of about 131k tokens or more fail with `Draft KV cache context resize failed`.
 [^22]: Text input only. The image and audio tokenizers of the checkpoint are not run, and the model generates only text tokens.
 [^23]: Text-only decision model. `trtllm-serve embeddings` detects the native checkpoint and selects the FlashInfer attention backend automatically. Python `LLM.encode` callers must set `model_kwargs.architectures` to `[PplxDeciderForDecision]`. The embedding vector contains the 255 raw decision logits; apply the checkpoint's calibration and candidate normalization in the caller.
+[^24]: DeepSeek-V4.1 uses CSA2 sparse attention; see [DeepSeek-V4.1 CSA2](../features/sparse-attention.md#deepseek-v41-csa2). Checkpoints with candidate-consumer layers, including the released one, run only on SM100-family GPUs with a DeepGEMM build that includes the sparse MQA-logits kernels; otherwise model construction fails. Checkpoints without such layers can also use the SM90 and SM120/SM121 attention routes. The Engram tables live in pinned host memory, placed on a GPU's host NUMA node when the GPUs report one. When that node lacks free memory, model loading evicts the node's page cache, which every process on the node loses, and retries. Set `TRTLLM_ENGRAM_EVICT_PAGE_CACHE=0` to skip the eviction; such a node's tables then fall back to host memory that can span NUMA nodes, which can slow lookups.
 
 # Encoder-Decoder Feature Support Matrix (PyTorch Backend)
 

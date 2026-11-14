@@ -19,8 +19,13 @@ from torch import nn
 from torch.nn.parameter import Parameter
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
+from tensorrt_llm._torch.custom_ops.mxfp8_gemm import (MXFP8_DEFAULT_BACKENDS,
+                                                       validate_mxfp8_backends)
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
-    BufferKind, mxfp8_quantize_gemm_autotuned)
+    _FP8_BLOCK_SCALE_GEMM_AUTOTUNED_OP, IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE,
+    BufferKind, FP8BlockScaleGemmRunner, MXFP8QuantizeRunner,
+    fp8_block_scale_gemm_autotuned, fp8_block_scale_swiglu_prefers_bf16,
+    mxfp8_quantize_gemm_autotuned, small_m_applies_on_tuning_group)
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm._utils import is_device_integrated, mpi_disabled
 from tensorrt_llm.bindings import ipc_nvls_supported
@@ -38,6 +43,7 @@ from tensorrt_llm.quantization.utils.fp8_utils import (
 
 from ..._utils import get_sm_version, is_sm_100f, is_sm_120f
 from ...models.modeling_utils import QuantConfig
+from ..autotuner import AutoTuner
 from ..cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
                               IS_CUTLASS_DSL_RUBIN_AVAILABLE)
 from ..kernels.fused_ops.fp8_static_quant import fp8_static_quant
@@ -52,7 +58,8 @@ from ..utils import (Fp4QuantizedTensor, Fp8PerTokenQuantizedTensor,
                      get_model_extra_attrs, is_torch_compiling,
                      replace_parameter_and_save_metadata, unswizzle_sf)
 from .low_m_gemm import (_should_apply_low_m_gemm, apply_low_m_gemm,
-                         low_m_gemm_dispatcher)
+                         low_m_gemm_dispatcher, lowm_fp8_supported)
+from .multi_stream_utils import no_eager_forks
 
 
 class WeightMode(str, enum.Enum):
@@ -213,6 +220,46 @@ def fp8_block_scale_ue8m0_gemm(
                                              weight_scale,
                                              output_dtype=output_dtype,
                                              disable_ue8m0_cast=True)
+
+
+def _fp8_block_scale_small_m_tuned(input: torch.Tensor, weight: torch.Tensor,
+                                   weight_scale: torch.Tensor,
+                                   block_scale: Optional[torch.Tensor]) -> bool:
+    """Whether ``fp8_block_scale_gemm_autotuned`` runs these rows: while tuning, to race its
+    small-M kernel against the quantized GEMM, and afterwards wherever that race ran."""
+    runner = FP8BlockScaleGemmRunner(torch.bfloat16)
+    inputs = [input, weight, weight_scale, block_scale]
+    if not small_m_applies_on_tuning_group(runner, inputs):
+        return False
+    tuner = AutoTuner.get()
+    if tuner.is_tuning_mode:
+        return True
+    hit, _, _, _ = tuner.profiling_cache.search_cache(
+        _FP8_BLOCK_SCALE_GEMM_AUTOTUNED_OP, [runner],
+        tuple(tensor.size() for tensor in inputs), runner.tuning_config)
+    return hit
+
+
+def _uses_fp8_small_m_gemm(module: Linear) -> bool:
+    """Whether the model opted ``module`` into the small-M kernel race (``use_fp8_small_m_gemm``
+    set before the weight transforms)."""
+    return getattr(module, "use_fp8_small_m_gemm",
+                   False) and lowm_fp8_supported()
+
+
+def _set_weight_scale_block128(module: Linear,
+                               weight_scale: torch.Tensor) -> None:
+    """Hold the small-M kernel's FP32 128x128 scales, refreshed in place on reload: captured
+    CUDA graphs keep reading the first buffer."""
+    current = getattr(module, "weight_scale_block128", None)
+    if (current is not None and current.shape == weight_scale.shape
+            and current.dtype == weight_scale.dtype
+            and current.device == weight_scale.device):
+        current.copy_(weight_scale)
+    else:
+        module.register_buffer("weight_scale_block128",
+                               weight_scale,
+                               persistent=False)
 
 
 def _uses_marlin_nvfp4_backend(module) -> bool:
@@ -568,6 +615,10 @@ class LinearMethodBase(ABC):
 
     def transform_weights(self, module: Linear) -> None:
         return None
+
+    def prefers_bf16_swiglu_input(self, module: Linear, gate_up: torch.Tensor,
+                                  swiglu_limit: Optional[float]) -> bool:
+        return False
 
     def cache_derived_state(self, module: Linear) -> None:
         return None
@@ -1428,6 +1479,25 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
     def get_tp_alignment(self, tp_mode, quant_config=None):
         return 128
 
+    def prefers_bf16_swiglu_input(self, module: Linear, gate_up: torch.Tensor,
+                                  swiglu_limit: Optional[float]) -> bool:
+        """Whether SwiGLU of ``gate_up`` should feed ``apply`` BF16 rows (the small-M kernel)
+        rather than its fused FP8 quantization (DeepGEMM)."""
+        block_scale = getattr(module, "weight_scale_block128", None)
+        if block_scale is None:
+            return False
+        use_cute_dsl_rubin = _fp8_block_scales_uses_cute_dsl_sm107(module)
+        return (is_sm_100f() and not is_torch_compiling() and
+                (use_cute_dsl_rubin or not (module.use_cute_dsl_blockscaling_mm
+                                            or module.disable_deep_gemm))
+                and fp8_block_scale_swiglu_prefers_bf16(
+                    gate_up,
+                    module.weight,
+                    module.weight_scale,
+                    block_scale,
+                    swiglu_limit,
+                    use_cute_dsl_rubin=use_cute_dsl_rubin))
+
     def create_weights(self, module: Linear, in_features: int,
                        out_features: int, bias: bool, dtype: torch.dtype):
         weight_shape = (out_features, in_features)
@@ -1508,14 +1578,26 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
 
         sm_version = get_sm_version()
         if is_sm_100f():
+            # FP32 128x128 block scales of the module's own weight (small-M kernel).
+            block_scale = (getattr(module, "weight_scale_block128", None)
+                           if weight is module.weight else None)
             if module.use_cute_dsl_blockscaling_mm or module.disable_deep_gemm:
                 if _fp8_block_scales_uses_cute_dsl_sm107(module):
                     # transform_weights() re-laid weight_scale out as UE8M0
                     # K32 R128c4; quantize the activation to match.
-                    act_input_fp8, act_input_sf = (
-                        torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(input))
-                    output = torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
-                        act_input_fp8, weight, act_input_sf, weight_scale)
+                    if block_scale is None or is_torch_compiling():
+                        act_input_fp8, act_input_sf = (
+                            torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(
+                                input))
+                        output = torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
+                            act_input_fp8, weight, act_input_sf, weight_scale)
+                    else:
+                        output = fp8_block_scale_gemm_autotuned(
+                            input,
+                            weight,
+                            weight_scale,
+                            block_scale,
+                            use_cute_dsl_rubin=True)
                 else:
                     act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
                         input)
@@ -1536,6 +1618,12 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
                                 key="cute_dsl_fp8_blockscale_unsupported_sm")
                         output = torch.ops.trtllm.fp8_block_scaling_gemm(
                             act_input_fp8, weight, act_input_sf, weight_scale)
+            elif (block_scale is not None and not is_torch_compiling()
+                  and _fp8_block_scale_small_m_tuned(
+                      input, weight, weight_scale, block_scale)):
+                output = fp8_block_scale_gemm_autotuned(input, weight,
+                                                        weight_scale,
+                                                        block_scale)
             else:
                 low_m = (module.fp8_low_m_gemm if weight is module.weight else
                          Fp8BlockScaleLowMGemmRange())
@@ -1694,6 +1782,8 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
         if _fp8_block_scales_uses_cute_dsl_sm107(module):
             weight, weight_scale = resmooth_to_fp8_e8m0(module.weight,
                                                         module.weight_scale)
+            if _uses_fp8_small_m_gemm(module):
+                _set_weight_scale_block128(module, weight_scale)
             transformed_scale = transform_k128_scales_to_cutedsl_mxfp8_layout(
                 weight_scale, mn=weight.shape[0], k=weight.shape[1])
             replace_parameter_and_save_metadata(
@@ -1715,6 +1805,9 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
         if use_deep_gemm_layout or use_indexer_q_cutedsl_layout or round_to_ue8m0:
             weight, weight_scale = resmooth_to_fp8_e8m0(module.weight,
                                                         module.weight_scale)
+            if use_deep_gemm_layout and _uses_fp8_small_m_gemm(module):
+                # The small-M kernel reads the power-of-two 128x128 scales as FP32.
+                _set_weight_scale_block128(module, weight_scale)
 
             if use_indexer_q_cutedsl_layout:
                 # Native SM100 MXF8 MMA consumes one scale per 32 K values.
@@ -3583,6 +3676,22 @@ def mxfp8_gemm_backend_override() -> Optional[str]:
     return backend
 
 
+# FlashInfer's CuTe DSL quantizer writes the same bytes as the native op and
+# takes less GPU time at every size, but about 9 us more host time per call;
+# from this many rows on, the GPU saving outweighs it.
+_CUTE_DSL_MXFP8_QUANTIZE_MIN_ROWS = 8192
+
+
+def mxfp8_quantize_activation(
+        input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """MXFP8-quantize an eager 2-D activation with swizzled scales."""
+    if (IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE and not is_torch_compiling()
+            and input.shape[0] >= _CUTE_DSL_MXFP8_QUANTIZE_MIN_ROWS):
+        return MXFP8QuantizeRunner(
+            input.dtype)([input], tactic=MXFP8QuantizeRunner.CUTE_DSL)
+    return torch.ops.trtllm.mxfp8_quantize(input, True)
+
+
 _FLASHINFER_MXFP8_AUTOTUNE_ACTIVE = ContextVar(
     "flashinfer_mxfp8_autotune_active", default=False)
 _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE = ContextVar(
@@ -3606,7 +3715,7 @@ def flashinfer_mxfp8_autotune() -> Iterator[None]:
 
     token = _FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.set(True)
     try:
-        with autotune():
+        with autotune(), no_eager_forks():
             yield
     finally:
         _FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.reset(token)
@@ -3697,11 +3806,11 @@ class MXFP8LinearMethod(LinearMethodBase):
         as a portable fallback.
       - CUTLASS (Blackwell sm100/103 + mxfp8_mxfp8_gemm op present): dynamic
         MXFP8 activation quantize + block-scaled e4m3xe4m3 GEMM.
-      - FlashInfer: reuse the CUTLASS-layout activations, weights, and scales
-        with ``mm_mxfp8``. MiniMax-M3 enables this path automatically only
-        while tuning or capturing decode CUDA graphs; eager execution remains
-        on the native TensorRT-LLM op. With ``tune_decode_graph_backends``,
-        decode graphs use per-bucket autotuned quantize and GEMM backends.
+      - Automatic: reuse the CUTLASS-layout activations, weights, and scales
+        with FlashInfer or Swap-AB. MiniMax-M3 enables this path automatically
+        during MXFP8 warmup and decode CUDA graph capture; eager execution
+        remains on the native TensorRT-LLM op. With ``tune_mxfp8_backends``,
+        one autotuner selects concrete GEMM tactics for each observed shape.
 
     ``TRTLLM_MXFP8_GEMM_BACKEND`` can explicitly select ``trtllm``,
     ``flashinfer``, or ``auto``. The reference layout is 2D [O,K/32]; both
@@ -3732,7 +3841,7 @@ class MXFP8LinearMethod(LinearMethodBase):
                              f"'flashinfer', or 'auto', got {self.backend!r}")
         self._flashinfer_mxfp8 = None
         self._flashinfer_autotuned = False
-        self.tune_decode_graph_backends = False
+        self.tune_mxfp8_backends = False
         if self.backend == "flashinfer":
             self._load_flashinfer(required=True)
         elif self.backend == "auto" and not self._load_flashinfer(
@@ -3751,6 +3860,14 @@ class MXFP8LinearMethod(LinearMethodBase):
     def needs_native_autotune(self) -> bool:
         return (self.use_native_autotuner and not self._native_autotuned
                 and self.use_cutlass)
+
+    @property
+    def uses_mxfp8_backend_autotune(self) -> bool:
+        """Use the unified cache during MXFP8 warmup and decode graph capture."""
+        return (self.tune_mxfp8_backends and self.backend == "auto"
+                and not is_torch_compiling()
+                and (_FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get()
+                     or _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get()))
 
     def _load_flashinfer(self, *, required: bool) -> bool:
         """Load the optional GEMM backend, raising only when explicitly required."""
@@ -3807,7 +3924,7 @@ class MXFP8LinearMethod(LinearMethodBase):
         if self.backend == "auto":
             self.backend = "trtllm"
             self._flashinfer_autotuned = False
-            self.tune_decode_graph_backends = False
+            self.tune_mxfp8_backends = False
 
     @classmethod
     def _swizzled_scale_size(cls, out_features: int, in_features: int) -> int:
@@ -3869,20 +3986,19 @@ class MXFP8LinearMethod(LinearMethodBase):
 
         if self.use_cutlass:
             input = input.contiguous()
-            if (self.tune_decode_graph_backends and not is_torch_compiling()
-                    and _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get()):
-                # Tune only in the warmup-only pass (flashinfer_mxfp8_autotune).
+            if self.uses_mxfp8_backend_autotune:
+                # Profiling is controlled by flashinfer_mxfp8_autotune.
                 output = mxfp8_quantize_gemm_autotuned(
                     input,
                     module.weight,
                     module.weight_scale,
                     module.dtype,
-                    tune=_FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get(),
+                    module.mxfp8_allowed_backends,
                 )
             else:
                 # Dynamic MXFP8 activation quantization (swizzled SF layout),
                 # then the CUTLASS block-scaled e4m3xe4m3 GEMM.
-                act_e4m3, act_sf = torch.ops.trtllm.mxfp8_quantize(input, True)
+                act_e4m3, act_sf = mxfp8_quantize_activation(input)
                 use_flashinfer = self.backend == "flashinfer" or (
                     self.backend == "auto" and not is_torch_compiling() and
                     (_FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get() or
@@ -4280,6 +4396,7 @@ class Linear(nn.Module):
                                                              int]]]] = None,
         locality_domain_policy: Optional[LocalityDomainPolicy] = None,
         enable_locality_domain_bf16_linear: bool = False,
+        mxfp8_allowed_backends: Optional[List[str]] = None,
     ):
         """
         Args:
@@ -4293,6 +4410,9 @@ class Linear(nn.Module):
                 Marlin is opt-in on SM89-99. W4A16 BF16 linear layers use
                 Marlin by default on SM120/121.
                 Configure via nvfp4_gemm_config.allowed_backends in extra_llm_api_options.yaml.
+            mxfp8_allowed_backends: Candidates for automatic MXFP8 GEMM selection.
+                Defaults to FlashInfer CUTLASS, FlashInfer CuTeDSL and CuTeDSL Swap-AB.
+                Explicit TRTLLM_MXFP8_GEMM_BACKEND overrides retain their routing policy.
         """
         from ..distributed import AllReduce
 
@@ -4328,6 +4448,9 @@ class Linear(nn.Module):
                 'cutlass', 'cublaslt', 'cutedsl', 'cuda_core'
             ]
         self.nvfp4_allowed_backends = list(nvfp4_allowed_backends)
+        self.mxfp8_allowed_backends = validate_mxfp8_backends(
+            MXFP8_DEFAULT_BACKENDS if mxfp8_allowed_backends is
+            None else tuple(mxfp8_allowed_backends))
 
         if self.tp_mode not in (TensorParallelMode.ROW,
                                 TensorParallelMode.COLUMN, None):
@@ -4665,6 +4788,13 @@ class Linear(nn.Module):
         assert self._weights_created
         return self.quant_config is not None and self.quant_config.layer_quant_mode.has_nvfp4(
         )
+
+    def prefers_bf16_swiglu_input(self, gate_up: torch.Tensor,
+                                  swiglu_limit: Optional[float]) -> bool:
+        """Whether SwiGLU of ``gate_up`` should feed this layer BF16 rows rather than its fused
+        FP8 quantization."""
+        return self.quant_method.prefers_bf16_swiglu_input(
+            self, gate_up, swiglu_limit)
 
     def can_use_cute_dsl_nvfp4_swiglu_blackwell(self) -> bool:
         """Return whether this layer can use the Blackwell NVFP4 SwiGLU op.

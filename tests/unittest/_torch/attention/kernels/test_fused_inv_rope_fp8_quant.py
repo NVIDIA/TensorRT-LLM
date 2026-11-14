@@ -113,8 +113,12 @@ def _check_match(fp8_ref, scale_ref, fp8_fused, scale_fused, *, ctx):
     ],
 )
 @pytest.mark.parametrize("is_neox", [True, False], ids=["neox", "gptj"])
-@pytest.mark.parametrize("num_tokens", [1, 3, 8, 64, 257, 1024, 4096, 8192])
-def test_fused_inv_rope_fp8_quant(num_tokens, shape, is_neox):
+@pytest.mark.parametrize(
+    "num_tokens,position_dtype",
+    [(tokens, torch.int32) for tokens in (1, 3, 8, 64, 257, 1024, 4096, 8192)]
+    + [(1, torch.int64), (257, torch.int64)],
+)
+def test_fused_inv_rope_fp8_quant(num_tokens, shape, is_neox, position_dtype):
     """Fused op (CUDA) vs the legacy 2-kernel reference. Covers both rope
     layouts and all production DSv4 shape combinations within 1 FP8 ULP."""
     torch.manual_seed(0)
@@ -147,7 +151,7 @@ def test_fused_inv_rope_fp8_quant(num_tokens, shape, is_neox):
     )
     fp8_fused, scale_fused = _fused_path(
         o_bf16,
-        position_ids,
+        position_ids.to(position_dtype),
         rotary_cos_sin,
         n_groups,
         heads_per_group,
@@ -171,5 +175,6 @@ if __name__ == "__main__":
             dict(n_groups=1, heads_per_group=16, nope_dim=64, rope_dim=64),
         ):
             for is_neox in (True, False):
-                test_fused_inv_rope_fp8_quant(M, sh, is_neox)
+                for position_dtype in (torch.int32, torch.int64):
+                    test_fused_inv_rope_fp8_quant(M, sh, is_neox, position_dtype)
     print("OK")

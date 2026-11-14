@@ -25,6 +25,7 @@
 #include "kv_cache_manager_v2/pendingStats.h"
 #include "kv_cache_manager_v2/sparseCache.h"
 #include "kv_cache_manager_v2/sparseCacheKernels.h"
+#include "kv_cache_manager_v2/storagePolicy.h"
 #include "kv_cache_manager_v2/utils/cudaEvent.h"
 #include "kv_cache_manager_v2/utils/funcGuard.h"
 
@@ -156,8 +157,8 @@ private:
 // pages[beamIdx][lcId] tracks who holds/locks each page.
 // treeBlock: non-null only for committed blocks (strong ref in rare cases).
 // ---------------------------------------------------------------------------
-using LifeCycleBlockPages = TypedVec<LifeCycleId, BlockPage>;
-using BeamBlockPages = TypedVec<BeamIndex, LifeCycleBlockPages>;
+using LifeCycleBlockPages = LifeCycleVec<BlockPage>;
+using BeamBlockPages = BeamVec<LifeCycleBlockPages>;
 
 struct SeqBlock
 {
@@ -421,6 +422,12 @@ public:
         return mBlocks.size();
     }
 
+    //! Changes whenever the page indices, block count, beam width or history block of this cache change.
+    uint64_t pageStorageVersion() const noexcept
+    {
+        return mPageStorageVersion;
+    }
+
     TypedVec<BlockOrdinal, SeqBlock> const& blocks() const noexcept
     {
         return mBlocks;
@@ -670,7 +677,8 @@ private:
     // Python's _get_matched_tokens); used when reuse-matching no longer has the
     // raw input tokens in scope.
     std::vector<TokenIdExt> _getMatchedTokens(BlockRadixTree::ReuseMatch const& match) const;
-    void _clearBlocks();
+    // keepPageIndices leaves the released locks' page indices for the caller to invalidate.
+    void _clearBlocks(bool keepPageIndices);
     // Copy `srcPage` into a new committed page attached to `treeBlock` for lifecycle
     // `lcIdx`, recording `numTokensInBlock` as the page's token count. Returns the page
     // now in the slot, or nullptr on OOM in all levels. No-op (returning the existing
@@ -808,6 +816,16 @@ private:
     // _basePageIndices[beamIdx][lcId][blockOrdinal] = slotId or BAD
     void _checkPageIndexBufferCapacity(BlockOrdinal newNumBlocks) const;
     void _resizePageIndexBuffers(BlockOrdinal newNumBlocks);
+    // Set the first numBlocks entries of every page-index table to BAD.
+    void _invalidateBasePageIndices(BlockOrdinal numBlocks);
+
+    void _onPageStorageChanged() noexcept
+    {
+        ++mPageStorageVersion;
+    }
+
+    // Sets mHistoryLength; a move into another block changes which blocks the window holds.
+    void _publishHistoryLength(int historyLength) noexcept;
 
     std::shared_ptr<KvCacheManager> mManager;
     ReuseScope mReuseScope;
@@ -820,6 +838,7 @@ private:
     BeamIndex mBeamWidth;
     int mCapacity;
     int mHistoryLength;
+    uint64_t mPageStorageVersion = 0;
     std::optional<int> mExpectedPromptLength;
     int mNumLookupTokens = 0;
     bool mGenerationAllocReady = false;

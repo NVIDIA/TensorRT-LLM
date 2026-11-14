@@ -4195,6 +4195,8 @@ def _create_kv_cache_manager(
         if getattr(sparse_attention_config, "algorithm", None) == "csa2":
             manager_extra_kwargs["context_swa_layer_limit"] = (
                 _model_config.extra_attrs.get("csa2_context_swa_layer_limit"))
+            manager_extra_kwargs["encoder_replay"] = (
+                _model_config.extra_attrs.get("csa2_encoder_replay"))
             manager_extra_kwargs["bounded_replay_on_generation"] = (
                 _model_config.extra_attrs.get("bounded_replay_on_generation",
                                               False))
@@ -4604,11 +4606,12 @@ def should_enable_overlap_headroom(mapping: Mapping,
     seat until the next iteration's ``_process_previous_batch``, which runs
     after that iteration has already admitted new work. Admission excludes such
     retiring requests whenever this gate is on (``ADPRouter`` on the
-    attention-DP path, ``_fetch_new_requests`` otherwise), so the replacement
-    cohort needs seats of its own. Without the extra micro-batch, a workload
-    whose requests retire after one iteration -- a context server, where every
-    request finishes in its prefill step -- can only refill the seats the
-    previous iteration did not use, and runs at roughly half its batch.
+    attention-DP path, ``_fetch_new_requests`` otherwise, except aggregated
+    requests), so the replacement cohort needs seats of its own. Without the
+    extra micro-batch, a workload whose requests retire after one iteration --
+    a context server, where every request finishes in its prefill step -- can
+    only refill the seats the previous iteration did not use, and runs at
+    roughly half its batch.
 
     Widening the pool is only safe when every ``py_seq_slot``-indexed pool is
     sized from ``compute_max_num_sequences``. Two model families size one from
@@ -4928,6 +4931,12 @@ def create_py_executor_resources(
             f"scheduler_config.context_scheduling_policy="
             f"{context_scheduling_policy.value} is ignored: it needs the KV "
             "cache manager V2 scheduler")
+    if (not isinstance(kv_cache_manager, KVCacheManagerV2)
+            and scheduler_config is not None
+            and scheduler_config.max_gen_init_admissions_per_pass is not None):
+        logger.warning(
+            "scheduler_config.max_gen_init_admissions_per_pass is ignored: it "
+            "needs the KV cache manager V2 scheduler")
 
     if isinstance(kv_cache_manager, KVCacheManagerV2):
         # V2: interleaved scheduler handles both capacity and budget
@@ -4958,6 +4967,9 @@ def create_py_executor_resources(
             context_starvation_iterations=scheduler_config.
             context_starvation_iterations
             if scheduler_config is not None else None,
+            max_gen_init_admissions_per_pass=(
+                scheduler_config.max_gen_init_admissions_per_pass
+                if scheduler_config is not None else None),
         )
     elif (scheduler_config is not None
           and scheduler_config.use_python_scheduler):

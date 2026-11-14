@@ -246,6 +246,10 @@ methods:
         annotation: bool
         default: False
         status: prototype
+      prompt_token_cache_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.PromptTokenCacheConfig]
+        default: null
+        status: prototype
       enable_iter_req_stats:
         annotation: bool
         default: False
@@ -270,6 +274,14 @@ methods:
         annotation: bool
         default: False
         status: beta
+      enable_client_io_during_gpu_wait:
+        annotation: bool
+        default: False
+        status: prototype
+      gen_prompt_tail_tokens:
+        annotation: Optional[int]
+        default: null
+        status: prototype
       perf_metrics_max_requests:
         annotation: int
         default: 0

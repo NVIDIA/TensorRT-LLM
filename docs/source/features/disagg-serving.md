@@ -468,6 +468,27 @@ in the `trtllm-serve` reference describes it for every server.
 serve_graceful_shutdown_timeout_s: 30
 ```
 
+### Generation server options
+
+Two prototype options of a generation server's configuration:
+
+* `scheduler_config.max_gen_init_admissions_per_pass` bounds how many
+  disaggregated generation requests a rank admits, allocating their KV cache, per
+  scheduling pass of the KV cache manager V2 scheduler; the others are admitted
+  in later passes, in order. A bound trades the start latency of a burst of
+  requests for shorter passes, which every attention-DP rank waits for. Unset,
+  the default, admits all that fit; KV cache manager V1 ignores it with a warning.
+* `gen_prompt_tail_tokens: N` (at least 256) sends a context-first
+  generation-only request to the generation workers with only its last `N`
+  prompt ids and the number of ids left out, since its KV cache comes from the
+  context server. Remote-tail, generation-first and multimodal requests keep
+  their full prompt, as do requests that read it (penalties, prompt logprobs,
+  logits processors, beams or several sequences, among others). The option is
+  rejected together with KV cache block reuse, KV cache events, a KV cache
+  connector, routed-expert capture, context parallelism, the SA, NGram or AUTO
+  drafters, KV cache manager V1, or a cache transceiver runtime other than
+  `PYTHON`.
+
 ## Environment Variables
 
 TRT-LLM uses some environment variables to control the behavior of disaggregated service.

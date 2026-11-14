@@ -258,7 +258,7 @@ LlmRequest::LlmRequest(LlmRequest const& parent, RequestIdType requestId)
         parent.mReturnPerfMetrics ? std::make_optional(parent.mPerfMetrics.timingMetrics.arrivalTime) : std::nullopt,
         parent.mAgentHierarchy, copyOptionalInput(parent.mMultimodalItemRunCuOffsets),
         copyOptionalInput(parent.mMultimodalRunPositions), copyOptionalInput(parent.mMultimodalRunLengths),
-        parent.mCacheSalt)
+        parent.mCacheSalt, parent.mTrackUniqueTokens)
 {
     TLLM_CHECK_WITH_INFO(!parent.isChild(), "A child request cannot create its own child.");
     TLLM_CHECK_WITH_INFO(parent.mChildRequests.size() + 1 < static_cast<size_t>(parent.getNumSubRequests()),

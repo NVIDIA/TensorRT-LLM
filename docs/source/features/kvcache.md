@@ -350,6 +350,8 @@ Before a block is evicted from GPU memory, it can optionally be offloaded to hos
 
 When offloading is enabled, `KvCacheConfig.cold_tier_offload_min_priority` controls which unreferenced blocks can be offloaded. Blocks below the threshold are discarded from GPU memory; blocks at or above it can move to a cold tier. The default threshold is 30. The old name, `secondary_offload_min_priority`, remains accepted as a deprecated alias.
 
+With the V2 KV cache manager, `host_cache_bind_to_gpu_numa_node: true` (prototype) allocates the host tier only on the GPU's host NUMA node, reclaiming page cache there instead of spilling to another node. When the binding cannot be honored, startup fails instead of falling back, for example when a GPU reports no host NUMA node or a node cannot hold the host tiers of all the ranks bound to it.
+
 Here is an [example](../../../examples/llm-api/llm_kv_cache_offloading.py) to show how to enable host offloading.
 
 KV cache compression can reduce the storage and transfer cost of offloaded

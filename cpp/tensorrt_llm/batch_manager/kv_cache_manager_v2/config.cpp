@@ -293,6 +293,7 @@ void KVCacheManagerConfig::validate() const
     }
 
     poolRebalance.validate();
+    hostMemBacking.validate();
 
     // These mirror Python's KVCacheManagerConfig.__post_init__ asserts, so they
     // throw AssertionError (translated in the binding layer) rather than ValueError.

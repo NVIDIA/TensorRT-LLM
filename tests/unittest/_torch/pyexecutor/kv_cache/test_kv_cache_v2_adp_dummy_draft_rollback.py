@@ -61,12 +61,14 @@ DRAFT_LEN = 5
 
 
 def _executor(**kwargs: object) -> SimpleNamespace:
-    """The attributes ``_finalize_adp_dummy_allocation`` and ``_revert_gen_alloc`` read."""
+    """The attributes ``_finalize_adp_dummy_allocation`` and ``_revert_unexecuted_alloc`` read."""
     defaults = dict(
         _pending_adp_dummy_request=None,
         _is_kv_manager_v2=True,
         enable_joint_kv_cache_reuse=False,
         active_requests=[],
+        _num_skipped_forward_ctx_chunks=0,
+        _num_reverted_ctx_tokens=0,
     )
     defaults.update(kwargs)
     return SimpleNamespace(**defaults)
@@ -210,7 +212,7 @@ def test_skipped_iteration_does_not_strand_the_dummy_draft_mirror(
     # Iteration K: not queued.
     _, batch_k = pad_and_schedule()
     assert ATTENTION_DP_DUMMY_REQUEST_ID in draft.kv_cache_map
-    PyExecutor._revert_gen_alloc(executor, batch_k)
+    PyExecutor._revert_unexecuted_alloc(executor, batch_k)
     PyExecutor._finalize_adp_dummy_allocation(executor, False)
     assert ATTENTION_DP_DUMMY_REQUEST_ID not in target.kv_cache_map
 

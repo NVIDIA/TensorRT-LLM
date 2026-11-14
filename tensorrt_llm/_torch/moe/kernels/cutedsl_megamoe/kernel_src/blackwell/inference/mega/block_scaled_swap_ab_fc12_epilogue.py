@@ -961,6 +961,9 @@ class SwapABGatedActEpilogue(KernelComponent):
     fc1_act_scale_scratch_region: ClassVar[str] = "blackwell.swap_ab_gated_act_epilogue.fc1_act_scale_scratch"
     fc1_staging_region: ClassVar[str] = "blackwell.swap_ab_gated_act_epilogue.fc1_staging"
     fc2_staging_region: ClassVar[str] = "blackwell.swap_ab_gated_act_epilogue.fc2_staging"
+    shared_fc1_staging_region: ClassVar[str] = (
+        "blackwell.swap_ab_gated_act_epilogue.shared_fc1_staging"
+    )
     # A 144 B FP8 stride rotates each row by four SMEM banks.
     _Fc2UblkFp8RowStrideBytes = 144
     _ScratchByteAlignment = 128
@@ -978,6 +981,9 @@ class SwapABGatedActEpilogue(KernelComponent):
             # existing SwiGLU descriptors stay valid unchanged. See _resolve_situ_betas.
             "situ_beta": OptionalRequirement(Optional[float]),
             "situ_linear_beta": OptionalRequirement(Optional[float]),
+            # The fused FP8 shared expert: its intermediate size and SwiGLU clamp.
+            "shared_intermediate_size": OptionalRequirement(Optional[int]),
+            "shared_gate_up_clamp": OptionalRequirement(Optional[float]),
             # "swiglu" (default) or "quick_geglu": up * gate * sigmoid(1.702 * gate). Same core as
             # SwiGLU with the sigmoid argument scaled, so it costs nothing extra; exclusive with SiTU.
             "gate_activation": OptionalRequirement(str),
@@ -1173,6 +1179,14 @@ class SwapABGatedActEpilogue(KernelComponent):
         if self.fc1_amax_slot_count * 4 > self.fc1_staging_stage_bytes:
             raise ValueError("The paired amax exchange does not fit in one fc1 staging stage.")
 
+        self.shared_intermediate_size = problem_desc.get("shared_intermediate_size")
+        self.shared_gate_up_clamp = problem_desc.get("shared_gate_up_clamp")
+        self.fuse_shared = self.shared_intermediate_size is not None
+        # Set by the kernel when shared down-projection tiles run in the dispatch window.
+        self.shared_fc1_signal_early = False
+        if self.fuse_shared:
+            self._init_shared_expert()
+
         requested_fc2_tma_stages = impl_desc.get("fc2_tma_stages")
         if requested_fc2_tma_stages is not None and not 1 <= requested_fc2_tma_stages <= self.subtile_cnt:
             raise ValueError(f"fc2_tma_stages must be in [1, {self.subtile_cnt}], got {requested_fc2_tma_stages}.")
@@ -1186,6 +1200,50 @@ class SwapABGatedActEpilogue(KernelComponent):
         else:
             self.fc2_tma_stages = 0
             self.fc2_staging_spec = None
+
+    def _init_shared_expert(self) -> None:
+        """The shared expert's gate/up tiles emit MXFP8 through the routed FC1 epilogue path."""
+        if self.quant_kind is not QuantKind.nvfp4 or self.combine_format.is_quantized:
+            raise ValueError("The fused shared expert requires NVFP4 tiles and a bf16 combine.")
+        if self.reduce_topk_in_kernel:
+            raise ValueError("The fused shared expert requires the separate top-k reduction.")
+        if self.act_scale_scratch_enabled:
+            raise ValueError("The fused shared expert does not support the per-token FC1 activation scale.")
+        shared_kind = QuantKind.mxfp8_e4m3
+        if self.shared_intermediate_size % self.cluster_tile_intermediate_downproj != 0:
+            raise ValueError(
+                f"The shared intermediate size {self.shared_intermediate_size} must be a multiple "
+                f"of {self.cluster_tile_intermediate_downproj}."
+            )
+        stage_bytes = (
+            self._EpilogueTokenTileSize
+            * self._EpilogueFc1IntermediateDownTileSize
+            * shared_kind.activation_dtype.width
+            // 8
+        )
+        amax_slot_count = self.fc1_amax_token_chunks * self._EpilogueWarpCnt * 32
+        if amax_slot_count * 4 > stage_bytes:
+            raise ValueError("The shared paired amax exchange does not fit one staging stage.")
+        self.shared_fc1_staging_bytes = self.subtile_cnt * stage_bytes
+        # Attributes a SwapABFc1Epilogue reads from its base, set for the shared expert's tiles.
+        self.shared_fc1_overrides = {
+            "quant_kind": shared_kind,
+            "fc1_output_dtype": shared_kind.activation_dtype,
+            "fc1_output_sf_dtype": shared_kind.sf_dtype,
+            "sf_vec_size": shared_kind.sf_vec_size,
+            "needs_pair_amax_exchange": (
+                shared_kind.sf_vec_size > self._EpilogueFc1IntermediateDownPerWarp
+            ),
+            "fc1_staging_stage_bytes": stage_bytes,
+            "fc1_amax_slot_count": amax_slot_count,
+            "intermediate_downproj": self.shared_intermediate_size,
+            "gate_up_clamp": self.shared_gate_up_clamp,
+            "gate_activation": "swiglu",
+            "swiglu_alpha": None,
+            "swiglu_beta": None,
+            "situ_beta": None,
+            "situ_linear_beta": None,
+        }
 
     @classmethod
     def epilogue_sync_barrier(cls) -> pipeline.NamedBarrier:
@@ -1217,6 +1275,13 @@ class SwapABGatedActEpilogue(KernelComponent):
         overlay.add_lifetime("fc1_staging").register_tensor(
             self.fc1_staging_region, cutlass.Int8, (self.fc1_staging_bytes,), byte_alignment=128
         )
+        if self.fuse_shared:
+            overlay.add_lifetime("shared_fc1_staging").register_tensor(
+                self.shared_fc1_staging_region,
+                cutlass.Int8,
+                (self.shared_fc1_staging_bytes,),
+                byte_alignment=128,
+            )
         if self.fc2_staging_spec is not None:
             overlay.add_lifetime("fc2_staging").register_tensor(
                 self.fc2_staging_region,
@@ -1228,10 +1293,10 @@ class SwapABGatedActEpilogue(KernelComponent):
             )
 
     def fc1_staged_smem_layout(
-        self, n_stages: int, without_stage_mode: bool = False
+        self, n_stages: int, without_stage_mode: bool = False, dtype=None
     ) -> Union[cute.Layout, cute.ComposedLayout]:
         layout = sm100_utils.make_smem_layout_epi(
-            self.fc1_output_dtype,
+            self.fc1_output_dtype if dtype is None else dtype,
             utils.LayoutEnum.ROW_MAJOR,
             (self._EpilogueTokenTileSize, self._EpilogueFc1IntermediateDownTileSize),
             n_stages,
@@ -1340,6 +1405,18 @@ class SwapABGatedActEpilogue(KernelComponent):
             fc2_tensor = None
         return fc1_atom, fc1_tensor, fc2_atom, fc2_tensor
 
+    def prepare_shared_tma_store_params(
+        self, shared_fc1_output_template: cute.Tensor
+    ) -> Tuple[cute.CopyAtom, cute.Tensor]:
+        """Build the TMA store of the shared expert's MXFP8 gate/up output."""
+        dtype = self.shared_fc1_overrides["fc1_output_dtype"]
+        return cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileS2GOp(),
+            shared_fc1_output_template,
+            self.fc1_staged_smem_layout(1, without_stage_mode=True, dtype=dtype),
+            (self._EpilogueTokenTileSize, self._EpilogueFc1IntermediateDownTileSize),
+        )
+
     @cute.jit
     def run(
         self,
@@ -1366,6 +1443,7 @@ class SwapABGatedActEpilogue(KernelComponent):
         optional_epi_args: Optional[GatedActEpilogueArgs] = None,
         relay_landing: Optional[cute.Tensor] = None,  # (slot, message, k, hidden) BF16 landing on the rail peer (internode)
         fc2_done_fanout=None,  # internode: fans the fc2_done increments out to the node peers' mirrors (make_tracker)
+        shared_args: Optional[dict] = None,
     ):
         if cutlass.const_expr(not smem_workspace.finalized):
             raise RuntimeError("SwapABGatedActEpilogue.run requires a finalized SmemWorkspace.")
@@ -1428,6 +1506,38 @@ class SwapABGatedActEpilogue(KernelComponent):
             optional_epi_args,
             relay_landing,
         )
+
+        if cutlass.const_expr(self.fuse_shared):
+            no_scale_args = GatedActEpilogueArgs(
+                fc1_alpha=None, fc2_alpha=None, fc1_norm_const=None, topk_scores=None
+            )
+            shared_fc1_epi = SwapABFc1Epilogue(
+                self,
+                tidx,
+                smem_workspace.ptr(self.shared_fc1_staging_region, smem_base),
+                None,
+                shared_args["kernel_extension"],
+                shared_args["fc1_output_tma_atom"],
+                shared_args["fc1_output_tma_tensor"],
+                shared_args["fc1_output_sf"],
+                shared_args["fc1_done_counter"],
+                no_scale_args,
+                overrides=self.shared_fc1_overrides,
+            )
+            shared_fc2_epi = SwapABFc2Epilogue(
+                self,
+                tidx,
+                None if self.fc2_use_tma else fc2_smem_tensor,
+                None,
+                None,
+                shared_args["output"],
+                None,
+                None,
+                None,
+                None,
+                no_scale_args,
+                local_stg=self.fc2_use_tma,
+            )
 
         acc_consumer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, self.num_accumulator_pipeline_stages
@@ -1495,6 +1605,9 @@ class SwapABGatedActEpilogue(KernelComponent):
             else:
                 tmem_stage_idx = acc_consumer_state.index
             tmem_acc_current = tmem_acc[None, None, tmem_stage_idx]
+            is_shared = cutlass.Boolean(False)
+            if cutlass.const_expr(self.fuse_shared):
+                is_shared = work_tile_info.phase >= cutlass.Int32(BlockPhase.SharedLinear1)
             if work_tile_info.phase == cutlass.Int32(BlockPhase.Linear1):
                 # The __call__ args should only take the while loop args, leave all loop irrevalent args to the init.
                 fc1_epi(
@@ -1506,6 +1619,25 @@ class SwapABGatedActEpilogue(KernelComponent):
                     act_scales_staged=act_scales_prefetched,
                     next_work_tile_info=next_work_tile_info if cutlass.const_expr(prefetch_act_scales) else None,
                 )
+            elif is_shared:
+                if cutlass.const_expr(self.fuse_shared):
+                    if work_tile_info.phase == cutlass.Int32(BlockPhase.SharedLinear1):
+                        shared_fc1_epi(
+                            work_tile_info=work_tile_info,
+                            tmem_acc_tensor=tmem_acc_current,
+                            acc_pipeline=acc_pipeline,
+                            acc_consumer_state=acc_consumer_state,
+                            is_odd_turn=is_odd_turn,
+                            act_scales_staged=cutlass.Int32(0),
+                        )
+                    else:
+                        shared_fc2_epi(
+                            work_tile_info=work_tile_info,
+                            tmem_acc_tensor=tmem_acc_current,
+                            acc_pipeline=acc_pipeline,
+                            acc_consumer_state=acc_consumer_state,
+                            is_odd_turn=is_odd_turn,
+                        )
             else:
                 # The __call__ args should only take the while loop args, leave all loop irrevalent args to the init.
                 fc2_epi(
@@ -1520,10 +1652,19 @@ class SwapABGatedActEpilogue(KernelComponent):
                 loop_iteration = loop_iteration + cutlass.Int32(1)
             prev_work_tile_info = work_tile_info
             cur_was_linear1 = prev_work_tile_info.phase == cutlass.Int32(BlockPhase.Linear1)
+            cur_was_shared = is_shared
 
             acc_consumer_state.advance()
             if cutlass.const_expr(self.overlapping_accum):
                 is_odd_turn = cutlass.Int32(1) - is_odd_turn
+
+            if cutlass.const_expr(self.fuse_shared and self.shared_fc1_signal_early):
+                # Shared down-projection tiles wait on this in the dispatch window, before this CTA's next tile
+                # exists: publish now rather than after the next tile is consumed.
+                if prev_work_tile_info.phase == cutlass.Int32(BlockPhase.SharedLinear1):
+                    cute.arch.cp_async_bulk_wait_group(0)
+                    wait_only_named_barrier.arrive_and_wait()
+                    flag_tracker = shared_fc1_epi.signal_fc1_done_now(prev_work_tile_info, flag_tracker)
 
             if cutlass.const_expr(prefetch_act_scales):
                 work_tile_info = next_work_tile_info
@@ -1538,6 +1679,16 @@ class SwapABGatedActEpilogue(KernelComponent):
             # Publish completion for the work tile snapshotted above.
             if cur_was_linear1:
                 flag_tracker = fc1_epi.signal_fc1_done(prev_work_tile_info, work_tile_info, flag_tracker)
+            elif cur_was_shared:
+                if cutlass.const_expr(self.fuse_shared):
+                    if cutlass.const_expr(self.shared_fc1_signal_early):
+                        # Gate/up completion is already published; nothing waits on the down projection.
+                        flag_tracker = flag_tracker.accumulate(work_tile_info.phase, 1, Int64(0), no_fire=True)
+                    elif prev_work_tile_info.phase == cutlass.Int32(BlockPhase.SharedLinear1):
+                        flag_tracker = shared_fc1_epi.signal_fc1_done(prev_work_tile_info, work_tile_info, flag_tracker)
+                    else:
+                        # Nothing in the kernel waits on the shared down projection.
+                        flag_tracker = flag_tracker.accumulate(work_tile_info.phase, 1, Int64(0), no_fire=True)
             else:
                 flag_tracker = fc2_epi.signal_fc2_done(prev_work_tile_info, work_tile_info, flag_tracker)
         # Tail flush
@@ -1570,16 +1721,20 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         fc1_output_sf: cute.Tensor,  # fake (m,n,l) domain
         fc1_done_counter: cute.Tensor,  # 1D tensor
         optional_epi_args: GatedActEpilogueArgs,
+        overrides: Optional[dict] = None,
     ):
         self.base = base
+        # Per-instance replacements of base attributes (the fused shared expert's MXFP8 output).
+        for name, value in (overrides or {}).items():
+            setattr(self, name, value)
         self.tidx = tidx % (base._EpilogueWarpCnt * 32)
         self.warp_idx = self.tidx // 32
         self.lane_idx = self.tidx % 32
         # (token64, intermediate, stage). The swizzle travels with the layout instead of being
         # spelled out here, so an 8-bit fc1 output picks up its own atom without a code change.
-        staged_layout = base.fc1_staged_smem_layout(base.subtile_cnt)
+        staged_layout = base.fc1_staged_smem_layout(base.subtile_cnt, dtype=self.fc1_output_dtype)
         self.smem_tensor = cute.make_tensor(
-            cute.recast_ptr(staging_pointer, staged_layout.inner, dtype=base.fc1_output_dtype), staged_layout.outer
+            cute.recast_ptr(staging_pointer, staged_layout.inner, dtype=self.fc1_output_dtype), staged_layout.outer
         )
         # Kept unswizzled and untyped so fc1_quant can carve an fp32 amax-exchange view out of one
         # staging stage without going through the staging tensor's swizzle.
@@ -1675,7 +1830,7 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         cute.arch.sync_warp()
 
     @cute.jit
-    def signal_fc1_done(self, work_tile_info, next_work_tile_info, flag_tracker):
+    def _done_flag_address(self, work_tile_info) -> Int64:
         # Only in-bound intermediate_downproj tiles signal; OOB -> null slot.
         needs_intermediate_guard = (
             self.intermediate_downproj is None
@@ -1689,7 +1844,18 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         flag_address = Int64(0)
         if in_bound:
             flag_address = (self.fc1_done_counter.iterator + slot).toint()
-        return flag_tracker.accumulate(next_work_tile_info.phase, self.fc1_epi_flag_batch, flag_address)
+        return flag_address
+
+    @cute.jit
+    def signal_fc1_done(self, work_tile_info, next_work_tile_info, flag_tracker):
+        return flag_tracker.accumulate(
+            next_work_tile_info.phase, self.fc1_epi_flag_batch, self._done_flag_address(work_tile_info)
+        )
+
+    @cute.jit
+    def signal_fc1_done_now(self, work_tile_info, flag_tracker):
+        """Publish this tile's completion at once, without waiting for the next tile."""
+        return flag_tracker.accumulate(work_tile_info.phase, 1, self._done_flag_address(work_tile_info))
 
     @cute.jit
     def __call__(
@@ -2391,6 +2557,7 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
         peer_rank_ptr_mapper: Optional[SymmetricBufferDevice],
         optional_epi_args: GatedActEpilogueArgs,
         relay_landing: Optional[cute.Tensor] = None,
+        local_stg: bool = False,
     ):
         self.base = base
         self.relay_landing = relay_landing
@@ -2405,7 +2572,15 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
         self.fc2_output_sf = fc2_output_sf
         self.peer_rank_ptr_mapper = peer_rank_ptr_mapper
         self.optional_epi_args = optional_epi_args
-        if cutlass.const_expr(base.fc2_use_tma):
+        if cutlass.const_expr(local_stg):
+            # A local output without a TMA descriptor of its own: plain stores.
+            self.smem_tensor = None
+            self.process_pipeline = make_fc2_stg_process_pipeline(
+                combine_format=base.combine_format,
+                cta_token_tile_size=base.cta_tile_n,
+                cta_hidden_tile_size=base.cta_tile_m,
+            )
+        elif cutlass.const_expr(base.fc2_use_tma):
             self.smem_tensor = smem_tensor
             self.process_pipeline = make_fc2_tma_process_pipeline(
                 combine_format=base.combine_format,

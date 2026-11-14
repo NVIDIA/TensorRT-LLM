@@ -1149,9 +1149,10 @@ def run_disaggregated_test(example_dir,
                            config_overrides=None):
     """Run disaggregated test using service discovery instead of MPI.
 
-    If assert_ctx_log_contains or assert_gen_log_contains is set, worker logs are captured and,
-    after the client tests, at least one worker of each specified role must log its substring
-    (used to prove an intended code path actually engaged instead of silently falling back).
+    If assert_ctx_log_contains or assert_gen_log_contains is set (a substring or a tuple of them),
+    worker logs are captured and, after the client tests, at least one worker of each specified
+    role must log each substring (used to prove an intended code path actually engaged instead of
+    silently falling back).
     """
     if mpi_disabled():
         pytest.skip(
@@ -1219,11 +1220,11 @@ def run_disaggregated_test(example_dir,
             use_ray=True)
         if post_client_test is not None:
             post_client_test(server_url)
-        for role, workers, marker in (
+        for role, workers, markers in (
             ("context", ctx_workers, assert_ctx_log_contains),
             ("generation", gen_workers, assert_gen_log_contains),
         ):
-            if marker is None:
+            if markers is None:
                 continue
             # Fail loudly if the marker is absent: the code path the test means to
             # exercise never ran and something else silently took its place.
@@ -1232,10 +1233,12 @@ def run_disaggregated_test(example_dir,
                 if w.log_path and os.path.exists(w.log_path):
                     with open(w.log_path, 'r', errors='replace') as f:
                         logs.append(f.read())
-            assert any(marker in log for log in logs), (
-                f"expected marker {marker!r} in a {role}-worker log, "
-                f"but none of {len(logs)} log(s) contained it "
-                f"(the intended code path did not engage)")
+            for marker in ((markers, )
+                           if isinstance(markers, str) else markers):
+                assert any(marker in log for log in logs), (
+                    f"expected marker {marker!r} in a {role}-worker log, "
+                    f"but none of {len(logs)} log(s) contained it "
+                    f"(the intended code path did not engage)")
         success = True
     finally:
         terminate(*ctx_workers, *gen_workers, disagg_server)
@@ -2187,16 +2190,49 @@ def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_gen_only(
 def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_overlap(
         disaggregated_test_root, llm_venv, disaggregated_example_root,
         deepseek_v3_model_root):
+    """Attention DP with the overlap scheduler and the servers' scheduling fields.
+
+    A long prompt reaches the generation workers trimmed to its tail and must still be answered.
+    """
     setup_model_symlink(llm_venv, deepseek_v3_model_root,
                         "DeepSeek-V3-Lite/fp8")
 
-    run_disaggregated_test(disaggregated_example_root,
-                           "deepseek_v3_lite_fp_8_attention_dp_overlap",
-                           num_iters=1,
-                           env=llm_venv._new_env,
-                           model_path=deepseek_v3_model_root,
-                           cwd=llm_venv.get_working_directory(),
-                           server_start_timeout=1200)
+    def trimmed_prompt_answer(server_url):
+        import requests
+
+        with open(
+                f"{disaggregated_example_root}/clients/long_prompts.json") as f:
+            prompt = json.load(f)[0]
+        # Longer than gen_prompt_tail_tokens: the generation workers get only its tail.
+        prompt += ("\n\nQuestion: What is the capital of Germany?\n"
+                   "Answer: The capital of Germany is")
+        response = requests.post(f"{server_url}/v1/completions",
+                                 json={
+                                     "model": "DeepSeek-V3-Lite/fp8",
+                                     "prompt": prompt,
+                                     "max_tokens": 8,
+                                     "temperature": 0
+                                 },
+                                 timeout=600)
+        assert response.status_code == 200, response.text
+        result = response.json()
+        assert result["usage"]["prompt_tokens"] > 256, result["usage"]
+        text = result["choices"][0]["text"]
+        assert "berlin" in text.lower(), text
+
+    run_disaggregated_test(
+        disaggregated_example_root,
+        "deepseek_v3_lite_fp_8_attention_dp_overlap",
+        num_iters=1,
+        env=llm_venv._new_env,
+        gen_env={"TLLM_LOG_LEVEL": "INFO"},
+        model_path=deepseek_v3_model_root,
+        cwd=llm_venv.get_working_directory(),
+        server_start_timeout=1200,
+        post_client_test=trimmed_prompt_answer,
+        assert_gen_log_contains=(
+            "max_gen_init_admissions_per_pass=1",
+            "prompt tail trimming: first trimmed request sends 256"))
 
 
 @skip_no_hopper

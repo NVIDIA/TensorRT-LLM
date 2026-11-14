@@ -30,6 +30,15 @@ The optimization introduces one extra decoding step but significantly improves t
 
 Enabled by default. To disable, set `disable_overlap_scheduler=True` in the configuration.
 
+### Client I/O During GPU Waits
+
+With `enable_client_io_during_gpu_wait: true` (prototype, off by default), the
+overlap loop publishes each iteration's responses, and the request intake parses
+newly received requests, while the executor waits on the GPU, so this work does
+not compete with the executor's own host work. Responses can reach clients up to
+one iteration later, and a new request can be scheduled up to one iteration
+later. The option has no effect when the overlap scheduler is disabled.
+
 
 ## References
 

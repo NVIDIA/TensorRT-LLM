@@ -6,11 +6,14 @@ Run directly on one node, or under ``mpirun -n 8 pytest ... -k world8`` on two
 four-GPU nodes. The external-MPI path uses node-local ranks for CUDA devices.
 """
 
+import gc
 import pickle
 import sys
+import weakref
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import cloudpickle
 import pytest
@@ -27,8 +30,11 @@ import tensorrt_llm
 from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
 from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout
 from tensorrt_llm._torch.distributed import AllReduceStrategy
-from tensorrt_llm._torch.models.modeling_deepseekv41 import DeepseekV41Engram
-from tensorrt_llm._torch.modules.engram import EngramConfig, EngramHashProvider
+from tensorrt_llm._torch.models.modeling_deepseekv41 import (
+    DeepseekV41Engram,
+    _ExchangedEngramLookup,
+)
+from tensorrt_llm._torch.modules.engram import EngramConfig, EngramHashProvider, adp_exchange
 from tensorrt_llm._torch.modules.engram.functional import engram_gate
 from tensorrt_llm.mapping import Mapping
 
@@ -85,6 +91,7 @@ def _hash_provider(num_heads: int) -> EngramHashProvider:
     provider._device = None
     provider._cached_hashes = None
     provider._cached_hashes_store = {}
+    provider._captured_shapes = set()
     provider._history = None
     provider._history_row_of = {}
     provider._history_free_rows = []
@@ -128,13 +135,24 @@ def _module(world_size: int, rank: int, num_heads: int) -> DeepseekV41Engram:
     assert module.kv_proj.weight_scale.dtype == torch.uint8
     assert module.multi_head_embedding.weight.is_pinned()
     assert module.multi_head_embedding.scale.is_pinned()
-    assert module.multi_head_embedding.shard_heads == (num_heads % world_size == 0)
+    group = _head_group_size(world_size, num_heads)
+    assert module.multi_head_embedding.shard_heads == (group is not None)
+    assert module.exchange_size == (group or world_size)
+    assert module.exchange_start == rank - rank % module.exchange_size
     assert module.multi_head_embedding.weight.shape[0] < sum(_buckets(num_heads))
     return module
 
 
-def _dense_lookup(indices: torch.Tensor, num_heads: int) -> torch.Tensor:
-    checkpoint = _checkpoint(num_heads)
+def _head_group_size(world_size: int, num_heads: int) -> int | None:
+    """Ranks that hold one copy of every head, or None for row shards."""
+    sizes = [d for d in range(2, world_size + 1) if world_size % d == 0 and num_heads % d == 0]
+    return max(sizes, default=None)
+
+
+def _dense_lookup(
+    indices: torch.Tensor, num_heads: int, checkpoint: dict[str, torch.Tensor] | None = None
+) -> torch.Tensor:
+    checkpoint = _checkpoint(num_heads) if checkpoint is None else checkpoint
     scales = torch.exp2(checkpoint["scale"].view(torch.uint8).float() - 127)
     table = (checkpoint["weight"].float() * scales.repeat_interleave(32, dim=-1)).to(
         device="cuda", dtype=torch.bfloat16
@@ -178,7 +196,8 @@ def _check_forward(module: DeepseekV41Engram, rank: int, counts: list[int], num_
     hidden = _hidden(rank, counts[rank])
     prefetched = module.precompute(indices, all_rank_num_tokens=counts)
     torch.cuda.current_stream().wait_event(module.sync_event)
-    assert prefetched.embeddings.shape[0] == sum(counts)
+    start = module.exchange_start
+    assert prefetched.embeddings.shape[0] == sum(counts[start : start + module.exchange_size])
     projection_inputs = []
     hook = module.kv_proj.register_forward_pre_hook(
         lambda _, args: projection_inputs.append(args[0])
@@ -275,14 +294,53 @@ def _run_rank(world_size: int, num_heads: int) -> bool:
     local_comm.Free()
     torch.cuda.set_device(local_rank)
     module = _module(world_size, rank, num_heads)
-    for counts in (
+    patterns = [
         [3] * world_size,
         [2, 5] + [1] * (world_size - 2),
         [0, 5] + [0] * (world_size - 2),
         [0] * world_size,
-    ):
+    ]
+    if world_size > 2:
+        # Head groups: the first group idle, the rest busy.
+        patterns.append([0, 0, 2] + [3] * (world_size - 3))
+    for counts in patterns:
         _check_forward(module, rank, counts, num_heads)
     _check_graph(module, rank, world_size, num_heads)
+    if (
+        world_size in (2, 4)
+        and module.exchanges_token_rows
+        and module.kv_proj.supports_packed_input()
+    ):
+        # The context overlap path, with idle ranks, matches the standard path.
+        counts = [0, 300, 7, 0][:world_size]
+        indices, hidden = _indices(rank, counts[rank], num_heads), _hidden(rank, counts[rank])
+        prefetched = module.precompute(indices, all_rank_num_tokens=counts)
+        torch.cuda.current_stream().wait_event(module.sync_event)
+        expected = module(hidden, prefetched, add_residual=True)
+        projected = module.project_lookup(module.precompute_lookup(indices, counts))
+        torch.cuda.current_stream().wait_event(module.sync_event)
+        actual = module(hidden, projected, add_residual=True)
+        torch.testing.assert_close(actual, expected, rtol=2**-7, atol=1e-5)
+    if world_size >= 4:
+        # The peer-memory hash exchange and owner push against the same dense lookup.
+        exchange = adp_exchange.EngramAdpExchange.create(
+            module.mapping,
+            module.exchange_start,
+            module.exchange_size,
+            capacity=8,
+            heads=num_heads,
+            dim=_HEAD_DIM,
+            num_layers=2,
+        )
+        graph = _check_exchange(module, exchange, rank, world_size, num_heads)
+        # Free the graph and the IPC peer buffers on every rank before any pool worker can exit.
+        graph.reset()
+        released = weakref.ref(exchange)
+        del graph, exchange
+        gc.collect()
+        assert released() is None, "the exchange's peer buffers outlived the test"
+        torch.cuda.synchronize()
+        MPI.COMM_WORLD.Barrier()
     torch.cuda.synchronize()
     return True
 
@@ -292,7 +350,12 @@ def _run_rank(world_size: int, num_heads: int) -> bool:
     "world_size,num_heads",
     [
         pytest.param(8, 24, id="world8-head-sharded"),
+        pytest.param(4, 24, id="world4-head-sharded"),
+        pytest.param(2, 24, id="world2-head-sharded"),
         pytest.param(2, 3, id="world2-row-sharded"),
+        # Heads not divisible by the world: one copy of every head per rank group.
+        pytest.param(4, 6, id="world4-head-groups"),
+        pytest.param(8, 12, id="world8-head-groups"),
     ],
 )
 def test_attention_dp_engram(world_size: int, num_heads: int) -> None:
@@ -308,8 +371,121 @@ def test_attention_dp_engram(world_size: int, num_heads: int) -> None:
         assert all(executor.map(_run_rank, [world_size] * world_size, [num_heads] * world_size))
 
 
+def _exchange_checkpoint(num_heads: int) -> dict[str, torch.Tensor]:
+    """``_checkpoint`` with negative zeros and UE8M0 code 0 (FP32-subnormal products)."""
+    checkpoint = _checkpoint(num_heads)
+    weight = checkpoint["weight"].view(torch.uint8).clone()
+    scale = checkpoint["scale"].view(torch.uint8).clone()
+    weight[::7, ::5] = 0x80
+    scale[::13, 0] = 0
+    return {"weight": weight.view(torch.float8_e4m3fn), "scale": scale.view(torch.float8_e8m0fnu)}
+
+
+def _check_exchange(
+    module: DeepseekV41Engram,
+    exchange: adp_exchange.EngramAdpExchange,
+    rank: int,
+    world_size: int,
+    num_heads: int,
+) -> torch.cuda.CUDAGraph:
+    """The peer-memory exchange of two layers' lookups equals the dense lookup bit for bit (and so
+    the NCCL path): counts with idle ranks and idle groups, forwards issued back to back with NCCL
+    forwards between them, and CUDA graph replays of the whole exchange with fresh hash rows."""
+    checkpoint = _exchange_checkpoint(num_heads)
+    module.multi_head_embedding.load_weights(checkpoint)
+    capacity = exchange.capacity
+    start, size = module.exchange_start, module.exchange_size
+    table = module.multi_head_embedding
+
+    def forward(indices, counts):
+        main = torch.cuda.current_stream()
+        round_ = exchange.exchange_hashes(indices, counts[start : start + size])
+        module.stream.wait_stream(main)
+        with torch.cuda.stream(module.stream):
+            for layer in range(2):
+                exchange.push(round_, layer, table)
+            module.sync_event.record()
+        main.wait_event(module.sync_event)
+        return [_ExchangedEngramLookup(exchange, round_, layer) for layer in range(2)]
+
+    def inputs(counts, seed):
+        return [_indices(rank + 101 * layer + seed, counts[rank], num_heads) for layer in range(2)]
+
+    def check(indices, rows, counts, label):
+        for layer in range(2):
+            expected = _dense_lookup(indices[layer], num_heads, checkpoint)
+            assert torch.equal(rows[layer].view(torch.int16), expected.view(torch.int16)), (
+                f"{label}: layer {layer} rows differ (counts {counts})"
+            )
+
+    patterns = [
+        [3] * world_size,
+        [2, 5] + [1] * (world_size - 2),
+        [0, 5] + [0] * (world_size - 2),
+        [0, 0, 2] + [3] * (world_size - 3),
+        [capacity] * world_size,
+    ]
+    for step, counts in enumerate(patterns):
+        indices = inputs(counts, step)
+        lookups = forward(indices, counts)
+        hidden = _hidden(rank, counts[rank])
+        actual = module(hidden, lookups[0], add_residual=True)
+        rows = [lookups[0].receive(), lookups[1].receive()]
+        check(indices, rows, counts, f"pattern {step}")
+        expected = _expected(module, hidden, _dense_lookup(indices[0], num_heads, checkpoint))
+        # Rows of subnormal blocks quantize to NaN in the projection, the same on both paths.
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
+    assert not exchange.takes([0] * world_size)
+    assert not exchange.takes([capacity + 1] + [1] * (world_size - 1))
+
+    # Back to back, without host synchronization; NCCL forwards in between leave the epochs alone.
+    generator = torch.Generator().manual_seed(9)
+    issued = []
+    for step in range(40):
+        counts = torch.randint(0, capacity + 1, (world_size,), generator=generator).tolist()
+        counts[step % world_size] = max(counts[step % world_size], 1)
+        indices = inputs(counts, 1000 + step)
+        lookups = forward(indices, counts)
+        issued.append((indices, [lookup.receive() for lookup in lookups], counts))
+        if step % 7 == 3:
+            module.precompute(indices[0], all_rank_num_tokens=counts)
+            torch.cuda.current_stream().wait_event(module.sync_event)
+    torch.cuda.synchronize()
+    for step, (indices, rows, counts) in enumerate(issued):
+        check(indices, rows, counts, f"back-to-back {step}")
+
+    # CUDA graphs of the whole exchange; eager forwards between replays.
+    counts = [capacity - rank % 3 for rank in range(world_size)]
+    static = inputs(counts, 5000)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        forward(static, counts)[0].receive()
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    MPI.COMM_WORLD.Barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = [lookup.receive() for lookup in forward(static, counts)]
+    for step in range(30):
+        fresh = inputs(counts, 6000 + step)
+        for buffer, values in zip(static, fresh):
+            buffer.copy_(values)
+        graph.replay()
+        torch.cuda.synchronize()
+        check(fresh, captured, counts, f"replay {step}")
+        if step % 5 == 0:
+            eager = inputs(counts, 7000 + step)
+            check(eager, [lookup.receive() for lookup in forward(eager, counts)], counts, "eager")
+    torch.cuda.synchronize()
+    # Peers keep writing into this rank's buffer until they finish too.
+    MPI.COMM_WORLD.Barrier()
+    return graph
+
+
 _REPLAY_HIDDEN_SIZE = 128
-_REPLAY_WINDOW = 4
+_REPLAY_SWA_WINDOW = 4
+_REPLAY_WINDOW = 5
 _REPLAY_MAX_TOKENS = 256
 
 
@@ -348,7 +524,7 @@ def _replay_attention(layout: CSA2Layout, mapping: Mapping, layer_idx: int = 0) 
 
 @contextmanager
 def _replay_metadata(
-    mapping: Mapping, layout: CSA2Layout, length: int, cached: int
+    mapping: Mapping, layout: CSA2Layout, length: int, cached: int, *, scratch: bool = False
 ) -> Iterator[CSA2TrtllmMetadata]:
     from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import CSA2CacheManager
     from tensorrt_llm._torch.metadata import KVCacheParams
@@ -361,7 +537,7 @@ def _replay_metadata(
         KvCacheConfig(
             enable_block_reuse=False,
             max_gpu_total_bytes=128 << 20,
-            enable_swa_scratch_reuse=False,
+            enable_swa_scratch_reuse=scratch,
             dtype="fp8",
         ),
         CacheType.SELFKONLY,
@@ -469,6 +645,8 @@ def _check_dp_replay_case(
     cached_counts: list[int],
     required_states: list[bool],
     prompt_ends: list[int] | None = None,
+    *,
+    scratch: bool = False,
 ) -> None:
     from tensorrt_llm._torch.metadata import KVCacheParams
     from tensorrt_llm._torch.modules.mhc.hyper_connection import HCState
@@ -485,7 +663,9 @@ def _check_dp_replay_case(
     )
     norm = model.layers[0].input_layernorm
     with ExitStack() as stack:
-        metadata = stack.enter_context(_replay_metadata(mapping, layout, count, cached))
+        metadata = stack.enter_context(
+            _replay_metadata(mapping, layout, count, cached, scratch=scratch)
+        )
         reference_metadata = stack.enter_context(_replay_metadata(Mapping(), layout, count, cached))
         metadata.all_rank_num_tokens = counts
         if prompt_ends is not None and metadata.num_contexts:
@@ -589,6 +769,8 @@ def _check_dp_encoder_replay_case(
     moe: torch.nn.Module,
     reference_moe: torch.nn.Module,
     reused_peer: bool,
+    *,
+    scratch: bool = False,
 ) -> None:
     from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import (
         CSA2CacheManager,
@@ -606,7 +788,7 @@ def _check_dp_encoder_replay_case(
     from tensorrt_llm.llmapi.llm_args import KvCacheConfig
     from tensorrt_llm.runtime.kv_cache_manager_v2 import _introspection
 
-    layout = CSA2Layout((1, 1), (0, 1), (0, 1), index_topk=256, window_size=_REPLAY_WINDOW)
+    layout = CSA2Layout((1, 1), (0, 1), (0, 1), index_topk=256, window_size=_REPLAY_SWA_WINDOW)
     rank = mapping.tp_rank
     prefix = 128 if rank == 0 or reused_peer else 0
     suffix = 5 if rank == 0 else 1 if reused_peer else 3
@@ -620,7 +802,7 @@ def _check_dp_encoder_replay_case(
         manager = CSA2CacheManager(
             KvCacheConfig(
                 enable_block_reuse=True,
-                enable_swa_scratch_reuse=False,
+                enable_swa_scratch_reuse=scratch,
                 max_gpu_total_bytes=128 << 20,
                 dtype="fp8",
             ),
@@ -692,8 +874,8 @@ def _check_dp_encoder_replay_case(
 
     def check_floor(metadata: CSA2TrtllmMetadata, layer: int, floor: int) -> None:
         metadata._ensure_swa_slots()
-        logical = metadata.csa2_positions[:, None] - _REPLAY_WINDOW + 1
-        logical = logical + torch.arange(_REPLAY_WINDOW, device="cuda")
+        logical = metadata.csa2_positions[:, None] - _REPLAY_SWA_WINDOW + 1
+        logical = logical + torch.arange(_REPLAY_SWA_WINDOW, device="cuda")
         assert (metadata.csa2_swa_indices[layer][logical < floor] == -1).all()
 
     with pytest.MonkeyPatch.context() as settings, ExitStack() as stack:
@@ -772,8 +954,8 @@ def _check_dp_encoder_replay_case(
             reference_metadata.prepare()
             reference_metadata.csa2_precomputed_kv_layers = {1}
             reference_metadata._ensure_swa_slots()
-            logical = reference_metadata.csa2_positions[:, None] - _REPLAY_WINDOW + 1
-            logical = logical + torch.arange(_REPLAY_WINDOW, device="cuda")
+            logical = reference_metadata.csa2_positions[:, None] - _REPLAY_SWA_WINDOW + 1
+            logical = logical + torch.arange(_REPLAY_SWA_WINDOW, device="cuda")
             reference_metadata.csa2_swa_indices[1].masked_fill_(logical < decoder_start, -1)
             new_positions, new_ids, replay_state = model._enter_bounded_replay(
                 plan, metadata, positions, ids, state
@@ -827,7 +1009,7 @@ def _check_dp_encoder_replay_case(
         for request in requests:
             assert request.context_current_position == prefix
             assert encoder_replay_tokens(request) == (_REPLAY_WINDOW if prefix else 0)
-        expected_counts = [9, 5 if reused_peer else 3]
+        expected_counts = [_REPLAY_WINDOW + 5, _REPLAY_WINDOW + 1 if reused_peer else 3]
         assert (
             MPI.COMM_WORLD.allgather(
                 requests[0].context_chunk_size + encoder_replay_tokens(requests[0])
@@ -838,7 +1020,7 @@ def _check_dp_encoder_replay_case(
 
 
 @torch.inference_mode()
-def _run_dp_decoder_replay() -> None:
+def _run_dp_decoder_replay(scratch: bool = False) -> None:
     from _torch.moe.quantize_utils import MXFP4MXFP8QuantizeUtil
     from transformers import PretrainedConfig
 
@@ -883,7 +1065,7 @@ def _run_dp_decoder_replay() -> None:
     try:
         with torch.device("cuda"):
             torch.manual_seed(1707)
-            layout = CSA2Layout((1,), (0,), (0,), index_topk=16, window_size=_REPLAY_WINDOW)
+            layout = CSA2Layout((1,), (0,), (0,), index_topk=16, window_size=_REPLAY_SWA_WINDOW)
             attention = _replay_attention(layout, mapping)
             reference_attention = _replay_attention(layout, Mapping())
             reference_attention.load_state_dict(attention.state_dict())
@@ -900,7 +1082,8 @@ def _run_dp_decoder_replay() -> None:
             reference = quantizer.create_ref_module(routing)
             reference.load_weights([weights])
             moe = create_moe(routing_method=routing, model_config=config, reduce_results=True)
-        with moe:
+        with moe, pytest.MonkeyPatch.context() as settings:
+            settings.setenv("TRTLLM_V41_BOUNDED_REPLAY_TOKENS", str(_REPLAY_WINDOW))
             moe.load_weights([weights])
             moe.post_load_weights()
             assert isinstance(moe.comm, AllGatherReduceScatter)
@@ -921,9 +1104,10 @@ def _run_dp_decoder_replay() -> None:
                     counts,
                     cached,
                     required,
+                    scratch=scratch,
                 )
             for reused_peer in (False, True):
-                _check_dp_encoder_replay_case(mapping, moe, reference, reused_peer)
+                _check_dp_encoder_replay_case(mapping, moe, reference, reused_peer, scratch=scratch)
             for ends in ([50, 7], [50, 50]):
                 _check_dp_replay_case(
                     mapping,
@@ -936,6 +1120,7 @@ def _run_dp_decoder_replay() -> None:
                     [0, 0],
                     [False, False],
                     prompt_ends=ends,
+                    scratch=scratch,
                 )
     finally:
         set_per_request_prefill_cuda_graph_flag(previous_graph_flag)
@@ -943,10 +1128,394 @@ def _run_dp_decoder_replay() -> None:
 
 @skip_pre_blackwell
 @pytest.mark.parametrize("parallel_moe_executor", [pytest.param(2, id="world2")], indirect=True)
-def test_attention_dp_decoder_bounded_replay(parallel_moe_executor: MPIPoolExecutor | None) -> None:
+def test_attention_dp_decoder_bounded_replay(
+    parallel_moe_executor: MPIPoolExecutor | None,
+) -> None:
     """Encoder recovery and decoder compaction preserve CSA2 and sharded MoE results."""
     if parallel_moe_executor is None:
-        _run_dp_decoder_replay()
+        _run_dp_decoder_replay(scratch=True)
         return
-    results = [parallel_moe_executor.submit(_run_dp_decoder_replay) for _ in range(2)]
+    results = [parallel_moe_executor.submit(_run_dp_decoder_replay, True) for _ in range(2)]
+    assert all(result.result() is None for result in results)
+
+
+def _decoder_pass_case(
+    model, config, sparse, mapping, case, use_graph, image=False, graph_name="_decoder_pass_graph"
+):
+    """One DEP2 bounded-replay forward of this rank's batch; returns its last-token logits.
+
+    ``case`` is ``(lengths, cached, prompt lengths, contexts)``; a context chunk ending
+    before its prompt's final window has no decoder rows. ``image`` marks every other token
+    as an image token, which routes experts with the vision bias. ``use_graph`` engages the
+    pass graph ``graph_name``.
+    """
+    import weakref
+
+    from _torch.modeling._deepseek_v41_test_utils import cache_case, canonical_routing, request
+
+    from tensorrt_llm._torch.distributed import Distributed
+    from tensorrt_llm._torch.pyexecutor.engine.runners.common import get_all_rank_num_tokens
+    from tensorrt_llm._torch.utils import model_extra_attrs
+
+    lengths, past, prompts, num_contexts = case
+    body = model.model
+    graph = getattr(body, graph_name)
+    with cache_case(config, sparse, "fp8", lengths, past, num_contexts) as (metadata, ids, _, _):
+        reqs = [request(i, prompt) for i, prompt in enumerate(prompts)]
+        metadata.request_ids = [r.py_request_id for r in reqs]
+        metadata.seq_lens = torch.tensor(lengths, dtype=torch.int32)
+        metadata.prompt_lens = lengths[:num_contexts] + [
+            p + n for p, n in zip(past[num_contexts:], lengths[num_contexts:])
+        ]
+        metadata.kv_cache_params.num_cached_tokens_per_seq = list(past)
+        metadata.prepare_context_replay(reqs[:num_contexts])
+        metadata.prepare()
+        model.prepare_adp_inputs(
+            metadata, all_token_states_required=False, requests=reqs[:num_contexts]
+        )
+        metadata.all_rank_num_tokens = get_all_rank_num_tokens(
+            metadata, enable_attention_dp=True, mapping=mapping, dist=Distributed.get(mapping)
+        )
+        positions = torch.cat(
+            [
+                torch.arange(p, p + n, device="cuda", dtype=torch.int32)
+                for p, n in zip(past, lengths)
+            ]
+        ).view(1, -1)
+        setattr(body, graph_name, graph if use_graph else None)
+        try:
+            with (
+                canonical_routing(),
+                model_extra_attrs(
+                    {**model.model_config.extra_attrs, "attention_metadata": weakref.ref(metadata)}
+                ),
+            ):
+                logits = model(
+                    attn_metadata=metadata,
+                    input_ids=ids,
+                    position_ids=positions,
+                    context_requests=reqs[:num_contexts] or None,
+                    **(
+                        {
+                            "orig_input_ids": ids,
+                            "image_mask": torch.arange(ids.numel(), device="cuda") % 2 == 0,
+                        }
+                        if image
+                        else {}
+                    ),
+                )
+        finally:
+            setattr(body, graph_name, graph)
+        return logits.float()
+
+
+@torch.inference_mode()
+def _run_decoder_pass_graph() -> None:
+    import os
+    from pathlib import Path
+
+    # The shared V4.1 model helpers import their siblings as top-level modules.
+    sys.path.append(str(Path(__file__).resolve().parents[1] / "modeling"))
+    from _torch.modeling._deepseek_v41_test_utils import _init_random_weights
+    from test_modeling_deepseekv41 import _tiny_v41_model_config
+
+    from tensorrt_llm._torch.models.modeling_deepseekv41 import DeepseekV41ForCausalLM
+    from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
+    from tensorrt_llm._torch.utils import (
+        get_per_request_prefill_cuda_graph_flag,
+        set_per_request_prefill_cuda_graph_flag,
+    )
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+
+    local_rank, local_size = _local_mpi_topology()
+    torch.cuda.set_device(local_rank)
+    world_size, rank = tensorrt_llm.mpi_world_size(), tensorrt_llm.mpi_rank()
+    mapping = Mapping(
+        world_size=world_size,
+        rank=rank,
+        gpus_per_node=local_size,
+        tp_size=world_size,
+        moe_ep_size=world_size,
+        moe_tp_size=1,
+        enable_attention_dp=True,
+    )
+    saved_env = {
+        name: os.environ.get(name)
+        for name in ("TRTLLM_V41_DECODER_BOUNDED_REPLAY", "TRTLLM_FORCE_COMM_METHOD")
+    }
+    saved_graph_flag = get_per_request_prefill_cuda_graph_flag()
+    os.environ["TRTLLM_V41_DECODER_BOUNDED_REPLAY"] = "1"
+    # The platform's own MoE communication, as served (EP all-to-all where supported).
+    os.environ.pop("TRTLLM_FORCE_COMM_METHOD", None)
+    set_per_request_prefill_cuda_graph_flag(False)
+    try:
+        # The CED test model of _deepseek_v41_test_utils.cache_config with FP8 KV.
+        config, sparse = _tiny_v41_model_config()
+        text = config.pretrained_config.text_config
+        text.candidate_source_layer_id = 5
+        text.candidate_topk_blocks = 72
+        text.candidate_block_size = 8
+        text.index_n_heads = 32
+        # Served checkpoints carry a vision tower, whose wrapper gives every gate a vision bias.
+        text.use_vision_bias = True
+        config.extra_attrs["kv_cache_dtype"] = "fp8"
+        config.extra_attrs["breakable_prefill_cuda_graph"] = True
+        config.quant_config = QuantConfig(kv_cache_quant_algo="FP8")
+        config.pretrained_config.mapping = text.mapping = mapping
+        config._frozen = False
+        config.mapping = mapping
+        config._frozen = True
+        model = DeepseekV41ForCausalLM(config).cuda()
+        _init_random_weights(model)
+        assert isinstance(model.model.layers[5].mlp.experts.comm, NVLinkOneSided)
+        # Separated expert biases fix every routing choice, so that a rounding difference
+        # cannot flip an expert; three experts on each EP rank keep the all-to-all busy.
+        for layer in model.model.layers:
+            gate = layer.mlp.gate
+            for bias, experts in (
+                (gate.e_score_correction_bias, [0, 1, 2, -3, -2, -1]),
+                (gate.e_score_correction_bias_vl, [3, 4, 5, -6, -5, -4]),
+            ):
+                bias.zero_()
+                bias[experts] = 100.0
+        graph = model.model._decoder_pass_graph
+        assert graph is not None and model.model.decoder_replay_split == 5
+        window = model.model.decoder_replay_window
+        # Per rank (lengths, cached, prompt lengths, contexts); buckets of one and two replay
+        # windows. Rank 0 compacts final windows or keeps a final-window chunk. Its peer fills
+        # the bucket, prefills a chunk before its final window (no decoder rows) or runs a dummy
+        # generation step padded into the bucket.
+        full = ([window, window], [0, 0], [window, window], 2)
+        cases = {
+            0: [([300, 300], [0, 0], [300, 300], 2), ([window], [0], [window], 1), full],
+            1: [full, ([window], [0], [1000], 1), ([1], [7], [7], 0)],
+        }
+        # The last step routes image tokens with the vision bias on both ranks.
+        for step, case in enumerate([*cases[rank], full]):
+            image = step == len(cases[rank])
+            eager = _decoder_pass_case(model, config, sparse, mapping, case, False, image)
+            with patch.object(graph, "run", wraps=graph.run) as run:
+                graphed = _decoder_pass_case(model, config, sparse, mapping, case, True, image)
+            assert run.call_count == 1
+            # Padding rows change the GEMM tactics serving the live rows: bf16 rounding only.
+            tolerance = 2**-4 if (rank, step) == (1, 2) else 0
+            error = None
+            try:
+                torch.testing.assert_close(graphed, eager, atol=tolerance, rtol=0)
+            except AssertionError as exc:
+                error = f"rank {rank}, case {case}: {exc}"
+            errors = [e for e in MPI.COMM_WORLD.allgather(error) if e is not None]
+            assert not errors, errors
+    finally:
+        for name, value in saved_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        set_per_request_prefill_cuda_graph_flag(saved_graph_flag)
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("parallel_moe_executor", [pytest.param(2, id="world2")], indirect=True)
+def test_attention_dp_decoder_pass_graph(parallel_moe_executor: MPIPoolExecutor | None) -> None:
+    """The decoder-pass CUDA graph reproduces the eager decoder pass on every DEP2 rank."""
+    if parallel_moe_executor is None:
+        _run_decoder_pass_graph()
+        return
+    results = [parallel_moe_executor.submit(_run_decoder_pass_graph) for _ in range(2)]
+    assert all(result.result() is None for result in results)
+
+
+def _dep2_engram_config(mapping: Mapping):
+    """An 18-layer V4.1 with Engram on the released layers 1 and 14 and small tables, whose
+    bounded replay starts at layer 15; None without the release tokenizer Engram hashes with."""
+    from test_modeling_deepseekv41 import RELEASE_CHECKPOINT, V41_TINY_TEXT_CONFIG
+
+    from tensorrt_llm._torch.configs.deepseek_v41 import DeepseekV41Config
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm.llmapi.llm_args import CSA2SparseAttentionConfig
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+
+    if not (RELEASE_CHECKPOINT / "tokenizer.json").is_file():
+        return None
+    ratios = [0, 0] + [2] * 13 + [1, 1, 1]
+    pretrained = DeepseekV41Config(
+        text_config={
+            **V41_TINY_TEXT_CONFIG,
+            "num_hidden_layers": len(ratios),
+            "compress_ratios": ratios,
+            "kv_source_layer_ids": [2, 15],
+            "index_source_layer_ids": [2, 15, 17],
+            "engram_layer_ids": [1, 14],
+            "engram_vocab_size": 1000,
+            "use_vision_bias": True,
+        }
+    )
+    # Engram hashes token ids compressed by the checkpoint's own tokenizer.
+    pretrained._name_or_path = str(RELEASE_CHECKPOINT)
+    pretrained.dtype = torch.bfloat16
+    pretrained.tie_word_embeddings = False
+    pretrained.mapping = mapping
+    sparse = CSA2SparseAttentionConfig()
+    pretrained.sparse_attention_config = sparse
+    config = ModelConfig(
+        pretrained_config=pretrained,
+        mapping=mapping,
+        sparse_attention_config=sparse,
+        attn_backend="TRTLLM",
+        quant_config=QuantConfig(kv_cache_quant_algo="FP8"),
+    )
+    return config, sparse
+
+
+@torch.inference_mode()
+def _run_encoder_pass_graph() -> None:
+    import os
+    from pathlib import Path
+
+    # The shared V4.1 model helpers import their siblings as top-level modules.
+    sys.path.append(str(Path(__file__).resolve().parents[1] / "modeling"))
+    from _torch.modeling._deepseek_v41_test_utils import _init_random_weights
+
+    from tensorrt_llm._torch.models.modeling_deepseekv41 import DeepseekV41ForCausalLM
+    from tensorrt_llm._torch.utils import (
+        get_per_request_prefill_cuda_graph_flag,
+        set_per_request_prefill_cuda_graph_flag,
+    )
+
+    local_rank, local_size = _local_mpi_topology()
+    torch.cuda.set_device(local_rank)
+    world_size, rank = tensorrt_llm.mpi_world_size(), tensorrt_llm.mpi_rank()
+    mapping = Mapping(
+        world_size=world_size,
+        rank=rank,
+        gpus_per_node=local_size,
+        tp_size=world_size,
+        moe_ep_size=world_size,
+        moe_tp_size=1,
+        enable_attention_dp=True,
+    )
+    saved_env = {
+        name: os.environ.get(name)
+        for name in ("TRTLLM_V41_DECODER_BOUNDED_REPLAY", "TRTLLM_FORCE_COMM_METHOD")
+    }
+    saved_graph_flag = get_per_request_prefill_cuda_graph_flag()
+    os.environ["TRTLLM_V41_DECODER_BOUNDED_REPLAY"] = "1"
+    # The platform's own MoE communication, as served (EP all-to-all where supported).
+    os.environ.pop("TRTLLM_FORCE_COMM_METHOD", None)
+    set_per_request_prefill_cuda_graph_flag(False)
+    try:
+        if torch.cuda.get_device_capability() != (10, 3):
+            pytest.skip("Engram's packed context overlap runs on SM103 only")
+        built = _dep2_engram_config(mapping)
+        if built is None:
+            pytest.skip("Engram hashing needs the release tokenizer")
+        config, sparse = built
+        config.extra_attrs["kv_cache_dtype"] = "fp8"
+        config.extra_attrs["breakable_prefill_cuda_graph"] = True
+        model = DeepseekV41ForCausalLM(config).cuda()
+        _init_random_weights(model)
+        body = model.model
+        assert body._engram_context_overlap
+        generator = torch.Generator().manual_seed(29)
+        for layer_id in body.engram_layer_ids:
+            module = body.layers[layer_id].engram
+            table = module.multi_head_embedding
+            rows, dim = table.num_embeddings, table.embedding_dim
+            scale = torch.randint(
+                124, 129, (rows, dim // 32), dtype=torch.uint8, generator=generator
+            )
+            table.load_weights(
+                {
+                    "weight": torch.randn(rows, dim, generator=generator).to(torch.float8_e4m3fn),
+                    "scale": scale.view(torch.float8_e8m0fnu),
+                }
+            )
+            table.post_load_weights()
+            module.post_load_weights()
+        # Separated expert biases fix every routing choice, so that a rounding difference
+        # cannot flip an expert.
+        for layer in body.layers:
+            gate = layer.mlp.gate
+            for bias, experts in (
+                (gate.e_score_correction_bias, [0, 1, 2, -3, -2, -1]),
+                (gate.e_score_correction_bias_vl, [3, 4, 5, -6, -5, -4]),
+            ):
+                bias.zero_()
+                bias[experts] = 100.0
+        graph = body._encoder_pass_graph
+        split = 15
+        assert graph is not None and body.decoder_replay_split == split
+        # The MoE routes padding rows to no expert, so a replay may pad a rank by any amount.
+        assert graph.max_pad is None
+        graph.buckets = (384, 512)
+        # The ranks prepare different request counts, which size the decoder-pass buckets a
+        # served model takes from its shared batch size: share them here.
+        body._decoder_pass_graph.buckets = (128, 256)
+        # Per rank (lengths, cached, prompt lengths, contexts). Both ranks fill bucket 512, then
+        # pad into bucket 384 (with a chunk before its final window, then a step below Engram's
+        # context-overlap threshold) and route image tokens with the vision bias.
+        full = ([256, 256], [0, 0], [256, 256], 2)
+        third = (([200], [0], [200], 1), ([256], [0], [256], 1))
+        cases = {
+            0: [full, ([384], [0], [384], 1), third[0], full],
+            1: [([512], [0], [512], 1), ([300], [0], [1000], 1), third[1], full],
+        }
+        for step, case in enumerate(cases[rank]):
+            image = step == len(cases[rank]) - 1
+            # Graphed first: the first forward's decoder pass captures while the encoder pass's
+            # outputs live in the graph pool the two passes share.
+            with patch.object(graph, "run", wraps=graph.run) as run:
+                graphed = _decoder_pass_case(
+                    model, config, sparse, mapping, case, True, image, "_encoder_pass_graph"
+                )
+            assert run.call_count == 1
+            eager = _decoder_pass_case(
+                model, config, sparse, mapping, case, False, image, "_encoder_pass_graph"
+            )
+            error = None
+            try:
+                if step in (0, 3):
+                    # The rows fill the bucket on every rank.
+                    torch.testing.assert_close(graphed, eager, atol=0, rtol=0)
+                elif not torch.equal(graphed, eager):
+                    # Padding rows change some kernels' tactics for the live rows. (A chunk that
+                    # ends before its final window has zero logits on both paths.)
+                    cosine = torch.nn.functional.cosine_similarity(
+                        graphed.flatten(), eager.flatten(), dim=0
+                    )
+                    assert graphed.isfinite().all() and cosine > 0.9999, f"cosine {cosine}"
+            except AssertionError as exc:
+                error = f"rank {rank}, step {step}, case {case}: {exc}"
+            errors = [e for e in MPI.COMM_WORLD.allgather(error) if e is not None]
+            assert not errors, errors
+            if step == 0:
+                first = graphed
+        # Autotuning drops both pass graphs during warmup; they capture again into a shared pool.
+        graph.reset()
+        body._decoder_pass_graph.reset()
+        again = _decoder_pass_case(
+            model, config, sparse, mapping, cases[rank][0], True, False, "_encoder_pass_graph"
+        )
+        error = None if torch.equal(again, first) else f"rank {rank}: recaptured graphs differ"
+        errors = [e for e in MPI.COMM_WORLD.allgather(error) if e is not None]
+        assert not errors, errors
+    finally:
+        for name, value in saved_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        set_per_request_prefill_cuda_graph_flag(saved_graph_flag)
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("parallel_moe_executor", [pytest.param(2, id="world2")], indirect=True)
+def test_attention_dp_encoder_pass_graph(parallel_moe_executor: MPIPoolExecutor | None) -> None:
+    """The encoder-pass CUDA graph reproduces the eager encoder layers on every DEP2 rank,
+    with Engram's overlapped context path in its eager breaks."""
+    if parallel_moe_executor is None:
+        _run_encoder_pass_graph()
+        return
+    results = [parallel_moe_executor.submit(_run_encoder_pass_graph) for _ in range(2)]
     assert all(result.result() is None for result in results)

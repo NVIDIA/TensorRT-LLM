@@ -67,6 +67,7 @@ from defs.deepseek_v41_serving import model_kwargs as serving_model_kwargs
 
 # Configuration and checkpoint topology
 
+
 # The released DeepSeek-V4.1-Flash topology: 40 decoder layers + 3 DSpark stages.
 # [0, 0] + [2] * 18 + [1] * 20 + [0, 0, 0]
 RELEASE_RATIOS = [0, 0] + [2] * 18 + [1] * 20 + [0, 0, 0]
@@ -1171,6 +1172,15 @@ def _build_release_model(*, bounded_replay_on_generation=False):
     # Construct on the host: a ``torch.device("cuda")`` default-device context
     # breaks YaRN RoPE table creation, which calls ``.numpy()``.
     torch.cuda.set_device(0)
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.indexer import (
+        candidate_consumer_requirement,
+    )
+
+    missing = candidate_consumer_requirement(
+        text.index_n_heads, text.index_head_dim, text.candidate_block_size
+    )
+    if missing is not None:
+        pytest.skip(f"The release checkpoint's candidate-consumer layers need {missing}")
     return v41.DeepseekV41ForCausalLM(model_config)
 
 
@@ -1949,6 +1959,7 @@ def _make_policy_case() -> tuple[DeepseekV41Model, SimpleNamespace]:
     model.num_hidden_layers = num_layers
     model.layers = layers
     model.engram_layer_ids = []
+    model._engram_context_overlap = False
     layout = SimpleNamespace(kv_source_layer_ids=[last_source], window_size=window)
     config = SimpleNamespace(
         sparse_attention_config=SimpleNamespace(
@@ -1989,7 +2000,7 @@ def test_attention_dp_replay_policy_requires_uniform_layer_schedule(
     config.mapping.enable_attention_dp = attention_dp
     config.extra_attrs["bounded_replay_on_generation"] = remote_tail
 
-    expected = (20, 128) if not attention_dp or not remote_tail or allowed else (None, 0)
+    expected = (20, 140) if not attention_dp or not remote_tail or allowed else (None, 0)
     assert model._resolve_replay_policy(config) == expected
     assert model.ced_kv_precompute is (expected[0] == 20)
 
@@ -2022,7 +2033,7 @@ def test_remote_tail_attention_dp_policy_keeps_unsupported_paths_disabled(
     elif unsupported == "speculative":
         config.spec_config = SimpleNamespace(
             spec_dec_mode=SimpleNamespace(is_dspark=lambda: True),
-            draft_is_embedded_in_target=True,
+            draft_is_embedded_in_target=False,
             target_layer_ids=[10, 20],
         )
     elif unsupported == "late-engram":
@@ -2073,14 +2084,15 @@ def test_replay_uses_pool_policy_independently_of_requests(
     model._decoder_replay_reuse_warning_emitted = False
     metadata = _ReplayMetadata([257, 6], num_contexts=1)
     metadata.kv_cache_manager.enable_block_reuse = True
+    metadata.kv_cache_manager.enable_swa_scratch_reuse = True
     metadata.kv_cache_manager.has_private_swa_suffix = Mock(return_value=private_decoder)
     requests = [SimpleNamespace(py_ced_replay=None)] if pass_requests else None
     split, plan = model._plan_bounded_replay(metadata, all_rows, requests)
     metadata.kv_cache_manager.has_private_swa_suffix.assert_called_once_with(20)
     if private_decoder:
         assert split == 20
-        assert plan.replay_seq_lens.tolist() == ([257, 6] if all_rows else [128, 6])
-        assert plan.swa_floors == ([0, 0] if all_rows else [129, 0])
+        assert plan.replay_seq_lens.tolist() == ([257, 6] if all_rows else [140, 6])
+        assert plan.swa_floors == ([0, 0] if all_rows else [117, 0])
     else:
         assert split is None and plan is None
 
@@ -2114,6 +2126,7 @@ def test_adp_replay_counts_follow_final_execution(monkeypatch, mode, speculative
     model._decoder_replay_reuse_warning_emitted = False
     metadata = _ReplayMetadata([257], num_contexts=1)
     metadata.mapping = Mapping(world_size=2, tp_size=2, rank=0, enable_attention_dp=True)
+    metadata.kv_cache_manager.enable_swa_scratch_reuse = True
     metadata.kv_cache_manager.has_private_swa_suffix = Mock(return_value=True)
     if mode in ("final_window", "all_empty"):
         metadata.decoder_context_ends = (1024,)
@@ -2134,6 +2147,22 @@ def test_adp_replay_counts_follow_final_execution(monkeypatch, mode, speculative
         else local_rows
     )
     peer_rows = 0 if mode == "all_empty" else 513 if mode in ("unprepared", "decode_graph") else 128
+    # Plans that rewrite local metadata (here: row compaction) must run whatever the peers'
+    # counts are.
+    required = int(
+        mode
+        in (
+            "compact",
+            "final_window",
+            "all_empty",
+            "late_full_states",
+            "late_padding",
+            "prefill_graph",
+        )
+    )
+    plan = metadata.decoder_replay_plan
+    assert int(plan is not None and plan.updates_local_metadata) == required
+    peer_required = int(mode not in ("unprepared", "decode_graph"))
     if speculative:
         from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import (
             DecoderInputPreparer,
@@ -2141,7 +2170,10 @@ def test_adp_replay_counts_follow_final_execution(monkeypatch, mode, speculative
 
         gather = Mock(
             return_value=torch.tensor(
-                [[local_rows, decoder_rows, 6, 1, 1], [513, peer_rows, 9, 2, 2]]
+                [
+                    [local_rows, decoder_rows, required, 6, 1, 1],
+                    [513, peer_rows, peer_required, 9, 2, 2],
+                ]
             )
         )
         inputs = SimpleNamespace(
@@ -2154,16 +2186,20 @@ def test_adp_replay_counts_follow_final_execution(monkeypatch, mode, speculative
             DecoderInputPreparer._get_all_rank_num_tokens_and_spec_counts(inputs, metadata, spec)
         )
         assert spec_counts == [[6, 9], [1, 2], [1, 2]]
-        gather.assert_called_once_with([local_rows, decoder_rows, 6, 1, 1])
+        gather.assert_called_once_with([local_rows, decoder_rows, required, 6, 1, 1])
     else:
-        gather = Mock(return_value=torch.tensor([[local_rows, decoder_rows], [513, peer_rows]]))
+        gather = Mock(
+            return_value=torch.tensor(
+                [[local_rows, decoder_rows, required], [513, peer_rows, peer_required]]
+            )
+        )
         metadata.all_rank_num_tokens = get_all_rank_num_tokens(
             metadata,
             enable_attention_dp=True,
             mapping=metadata.mapping,
             dist=SimpleNamespace(tp_allgather_int64=gather),
         )
-        gather.assert_called_once_with([local_rows, decoder_rows])
+        gather.assert_called_once_with([local_rows, decoder_rows, required])
     if mode == "late_full_states":
         with pytest.raises(ValueError, match="Full token states must be requested"):
             model._plan_bounded_replay(metadata, True)
@@ -2342,6 +2378,7 @@ def test_empty_decoder_moe_runs_expert_communication_without_local_gemms():
     module.shared_experts = Mock(side_effect=AssertionError("empty shared expert GEMM"))
     module.event_dict = {EventType.Main: None, EventType.MoeShared: None}
     module.aux_stream = None
+    module.eager_overlap_min_tokens = None
     with patch(
         "torch.ops.trtllm.dsv3_router_gemm_op", side_effect=AssertionError("empty router GEMM")
     ):
@@ -2384,12 +2421,12 @@ def test_model_boundary_preserves_full_cache_and_compacts_query_rows(
 ) -> None:
     monkeypatch.delenv("TRTLLM_V41_DECODER_BOUNDED_REPLAY", raising=False)
     torch.manual_seed(4120)
-    lengths = [129, 7, 6]
+    lengths = [141, 7, 6]
     layer, state = _make_boundary(sum(lengths))
     metadata = _ReplayMetadata(lengths, num_contexts=2)
     model, config = _make_policy_case()
     policy = DeepseekV41Model._resolve_replay_policy(model, config)
-    assert policy == (20, 128)
+    assert policy == (20, 140)
     assert model.ced_kv_precompute
     model.decoder_replay_split, model.decoder_replay_window = policy
     model._decoder_replay_observed = False
@@ -2421,7 +2458,7 @@ def test_model_boundary_preserves_full_cache_and_compacts_query_rows(
     torch.testing.assert_close(new_ids, ids[plan.rows])
     torch.testing.assert_close(new_state.residual, state.residual[plan.rows])
     torch.testing.assert_close(new_state.pre_mix, state.pre_mix[plan.rows])
-    assert metadata.seq_lens.tolist() == [128, 7, 6]
+    assert metadata.seq_lens.tolist() == [140, 7, 6]
     assert metadata.kv_cache_params.num_cached_tokens_per_seq == [1, 0, 0]
     # A later request must not see the cache-only marker from this forward.
     restored = model._exit_bounded_replay(plan, metadata, new_state.residual)
@@ -2459,6 +2496,7 @@ def test_remote_tail_source_reuses_boundary_collapse(
         mapping=Mapping(world_size=4, tp_size=4, enable_attention_dp=attention_dp)
     )
     model.use_engram = False
+    model._engram_context_overlap = False
     model.hc_mult = 4
     model.num_hidden_layers = 2
     model.decoder_replay_split = 1
@@ -2686,6 +2724,7 @@ def test_context_only_forward_routes_warmup_to_source_and_refuses_destination(mo
     model = DeepseekV41Model.__new__(DeepseekV41Model)
     nn.Module.__init__(model)
     model.disagg_context_only = True
+    model._engram_context_overlap = False
     metadata = SimpleNamespace(
         csa2_remote_tail_mode=mode, begin_model_forward=Mock(), all_rank_num_tokens=None
     )
@@ -2832,6 +2871,7 @@ def test_context_only_model_keeps_exact_prefix_and_boundary_parameter_inventory(
         for name, parameter in full_model.named_parameters()
     }
     split = full_model.model.decoder_replay_split
+    num_embeddings = full_model.lm_head.num_embeddings
     assert split == 5
     assert not full_model.model.disagg_context_only
     assert "csa2_context_swa_layer_limit" not in full_model.model_config.extra_attrs
@@ -2840,6 +2880,7 @@ def test_context_only_model_keeps_exact_prefix_and_boundary_parameter_inventory(
     monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "context")
     model = _build_context_only_inventory_model()
     assert model.model.disagg_context_only
+    assert model.lm_head.num_embeddings == num_embeddings
     assert model.model_config.extra_attrs["csa2_context_swa_layer_limit"] == split
     assert model.model.ced_kv_precompute
     assert len(model.model.layers) == model.config.num_hidden_layers == len(V41_TINY_RATIOS)
@@ -3014,6 +3055,8 @@ def test_model_boundary_resets_routing_and_preserves_layer_guard(monkeypatch):
     model = DeepseekV41Model.__new__(DeepseekV41Model)
     torch.nn.Module.__init__(model)
     model.disagg_context_only = False
+    model.use_engram = False
+    model._engram_context_overlap = False
     argument = object()
     outputs = []
 
@@ -3305,6 +3348,8 @@ class _MHC(nn.Module):
         pre: torch.Tensor,
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
+        nvfp4_scale: torch.Tensor | None = None,
+        fp8_1x128: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         updated = self.post_mapping(x=x, residual=residual, post_layer_mix=post, comb_res_mix=comb)
         pre_own, post_own, comb_own = self.hc_coeffs(updated)
