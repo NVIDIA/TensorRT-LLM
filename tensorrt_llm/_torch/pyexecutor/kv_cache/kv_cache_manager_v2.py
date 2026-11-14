@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import functools
 import math
 import os
 import sys
@@ -2062,6 +2063,11 @@ class KVCacheManagerV2(BaseResourceManager):
     _supports_mixed_precision_kv = False
     # True when the manager's own pool already holds the history in the mixed-precision low format.
     _own_pool_is_mixed_precision_low = False
+    # KvCacheConfig.mixed_precision_reuse; "strict" is plain reuse, as without mixed precision.
+    mixed_precision_reuse = "strict"
+    # Request id -> length of the prefix it reused without the high-precision last-N window
+    # (0: none), set by its first resume; those window tokens read the history.
+    _mixed_precision_low_prefix_len: dict[int, int] = {}
     # Read by KvCacheCreator: a subclass that overrides the context
     # commit/history protocol opts out of generic reuse-match backoff.
     _supports_reuse_match_backoff = True
@@ -4883,6 +4889,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # this value so the profiling run allocates it at its final size.
         self.mixed_precision_max_seq_len = max_seq_len
         self._shared_kv_layers: set[int] = set()
+        self._mixed_precision_low_prefix_len: dict[int, int] = {}
         # Tests pass plain config stand-ins that predate the mixed-precision fields.
         mixed = getattr(kv_cache_config, "mixed_precision_kv", None)
         # (first_n, last_n) of the cold-page compression config, if it asks for the window.
@@ -4898,6 +4905,7 @@ class KVCacheManagerV2(BaseResourceManager):
             raise NotImplementedError(f"{requested} is not supported by {type(self).__name__}")
         if torch.cuda.get_device_capability()[0] not in (10, 12):
             raise NotImplementedError("Mixed-precision KV requires Blackwell")
+        self.mixed_precision_reuse = getattr(kv_cache_config, "mixed_precision_reuse", "default")
         if mixed is not None:
             self.first_n, self.last_n = mixed.first_n, mixed.last_n
             self.mixed_precision_low_dtype = _MIXED_PRECISION_LOW_DTYPES[mixed.low]
@@ -4916,6 +4924,9 @@ class KVCacheManagerV2(BaseResourceManager):
             # dtype are the same; only pages in the cold tiers are quantized.
             self.first_n, self.last_n = cold_page_window
             self.mixed_precision_low_dtype = self.mixed_precision_high_dtype = dtype
+        # Reuse without the last N tokens keeps the sinks; with none, reuse is strict.
+        if not self.first_n:
+            self.mixed_precision_reuse = "strict"
         if getattr(pretrained_config, "num_kv_shared_layers", 0):
             config = pretrained_config
             first_shared = config.num_hidden_layers - config.num_kv_shared_layers
@@ -4973,8 +4984,8 @@ class KVCacheManagerV2(BaseResourceManager):
             for local_layer in self.mixed_precision_high_layers
         }
         for source_layer in sorted(source_layers):
-            pool_id = int(self.impl.get_layer_group_id(source_layer))
-            for layer_id in self.impl.layer_grouping[pool_id]:
+            pool_id = self._get_layer_execution_group(source_layer)
+            for layer_id in self._layer_ids_by_group[pool_id]:
                 if int(layer_id) not in source_layers:
                     raise ValueError(
                         f"Layer {int(layer_id)} takes no first/last-N mixed precision but shares KV "
@@ -5004,7 +5015,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 )
             self.mixed_precision_high_layer_offsets[local_layer] = int(high_converter.layer_offset)
             block_delta = int(high_converter.layer_offset) - int(source_converter.layer_offset)
-            pool_id = int(self.impl.get_layer_group_id(source_layer))
+            pool_id = self._get_layer_execution_group(source_layer)
             if (
                 self.mixed_precision_high_block_deltas.setdefault(pool_id, block_delta)
                 != block_delta
@@ -5037,8 +5048,14 @@ class KVCacheManagerV2(BaseResourceManager):
         layers = list(config.layers)
         layer_by_id = {int(layer.layer_id): layer for layer in layers}
         roles = (Role.KEY,) if self.kv_factor == 1 else (Role.KEY, Role.VALUE)
+        # Sinks come with a reused prefix; the last-N window is optional unless reuse is strict.
+        high_policy = (
+            ReusePolicy.REQUIRED
+            if self.mixed_precision_reuse == "strict"
+            else ReusePolicy.SINK_REQUIRED_ONLY
+        )
         if self.mixed_precision_low_dtype == self.mixed_precision_high_dtype:
-            self._check_high_layers_share_no_page_group(layers)
+            self._check_high_layers_share_no_page_group(layers, high_policy)
         for local in range(self.num_local_layers):
             if not self._is_mixed_precision_layer(local):
                 continue
@@ -5072,7 +5089,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     # Native SWA includes the next query's write position.
                     sliding_window_size=self.last_n + 1,
                     num_sink_tokens=self.first_n,
-                    reuse_policy=ReusePolicy.REQUIRED,
+                    reuse_policy=high_policy,
                 )
             )
 
@@ -5091,7 +5108,9 @@ class KVCacheManagerV2(BaseResourceManager):
         # group as well; the runtime rejects a mismatched length.
         return replace(config, layers=layers)
 
-    def _check_high_layers_share_no_page_group(self, layers: Sequence[object]) -> None:
+    def _check_high_layers_share_no_page_group(
+        self, layers: Sequence[object], high_policy: ReusePolicy
+    ) -> None:
         """Reject a first/last-N setting whose high layers would share a page group with a model layer.
 
         The KV cache manager groups layers by retention window, sink pages and reuse policy, and the
@@ -5108,7 +5127,7 @@ class KVCacheManagerV2(BaseResourceManager):
             if window != high_window:
                 continue
             sink_pages = math.ceil((layer.num_sink_tokens or 0) / tokens_per_block)
-            if sink_pages != high_sink_pages or layer.reuse_policy != ReusePolicy.REQUIRED:
+            if sink_pages != high_sink_pages or layer.reuse_policy != high_policy:
                 continue
             raise ValueError(
                 f"mixed_precision_first_n={self.first_n} with mixed_precision_last_n={self.last_n} "
@@ -5204,10 +5223,12 @@ class KVCacheManagerV2(BaseResourceManager):
         for role, layer in enumerate((local, self.mixed_precision_high_layers[local])):
             self._fill_page_table(layer, request_ids, out[role])
 
-    def _fill_page_table(self, layer: int, request_ids: list[int], out: np.ndarray) -> None:
+    def _fill_page_table(
+        self, layer: int, request_ids: list[int], out: np.ndarray, role: DataRole = Role.KEY
+    ) -> None:
         """Write the `(batch, pages)` page table of one manager layer into `out`."""
-        pool_id = int(self.impl.get_buffer_group_id(layer, Role.KEY))
-        scale = int(self.impl.get_page_index_converter(layer, Role.KEY).scale)
+        pool_id = int(self.impl.get_buffer_group_id(layer, role))
+        scale = int(self.impl.get_page_index_converter(layer, role).scale)
         # Gather the batch's rows from the core's zero-copy host table (not get_copy_index: its
         # buffer is shared with in-flight block-offset copies).
         rows = [self.index_mapper.get_index(req_id) * self.max_beam_width for req_id in request_ids]
@@ -5217,6 +5238,16 @@ class KVCacheManagerV2(BaseResourceManager):
         pages = np.where(base == BAD_PAGE_INDEX, BAD_PAGE_INDEX, base * scale // self.kv_factor)
         # Entries past a request's blocks are left as they are.
         np.copyto(out[:, :width], pages, where=np.arange(width) < counts[:, None])
+        if (
+            self._mixed_precision_low_prefix_len
+            and layer in self.mixed_precision_high_layers.values()
+        ):
+            # Window pages of a request's low prefix hold nothing: those tokens read the history.
+            block = self.tokens_per_block
+            sinks = -(-self.first_n // block)
+            for row, request_id in zip(out, request_ids):
+                low_len = self._mixed_precision_low_prefix_len.get(request_id, 0)
+                row[sinks : -(-low_len // block)] = BAD_PAGE_INDEX
 
     def get_mixed_precision_page_tables(
         self, request_ids: List[int], layer_idx: int
@@ -6048,7 +6079,57 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _resume_context_cache(self, req: LlmRequest, kv_cache: _KVCache) -> bool:
         """Resume context pages; subclasses may select model-specific reuse groups."""
-        return self._resume_and_restore(req.py_request_id, kv_cache)
+        if (
+            self.mixed_precision_reuse == "strict"
+            or not req.is_first_context_chunk
+            or kv_cache.is_active
+            # The first resume selects; a cache suspended before its first forward keeps that.
+            or req.py_request_id in self._mixed_precision_low_prefix_len
+        ):
+            return self._resume_and_restore(req.py_request_id, kv_cache)
+        # Sinks came with the prefix; a window is reused only when all of its pages are cached.
+        windows = [kv_cache.reuse_status[group] for group in self._mixed_precision_high_groups]
+        selected = [status.group_id for status in windows if status.complete]
+        if not self._resume_and_restore(req.py_request_id, kv_cache, selected):
+            return False
+        # A missing window's fresh pages hold only what this request writes. Disaggregated
+        # generation receives the window instead.
+        missing = len(selected) < len(windows) and not req.is_disagg_generation_init_state
+        self._mixed_precision_low_prefix_len[req.py_request_id] = (
+            kv_cache.num_committed_tokens if missing else 0
+        )
+        return True
+
+    @cached_property
+    def _mixed_precision_high_groups(self) -> list[int]:
+        """The buffer groups of the mixed-precision high layers' windows."""
+        return sorted(
+            {
+                int(self.impl.get_buffer_group_id(layer, Role.KEY))
+                for layer in self.mixed_precision_high_layers.values()
+            }
+        )
+
+    def _mixed_precision_reuse_limit(
+        self, req: LlmRequest, kv_cache: _KVCache, back_off: int = 0
+    ) -> int | None:
+        """For a prefix that came without its last-N window, the block boundary at least
+        `back_off` tokens before its end to reuse it up to; else None. A paired draft pool takes its
+        target's depth instead."""
+        if (
+            self.mixed_precision_reuse == "strict"
+            or self.is_draft
+            or req.is_disagg_generation_init_state
+            or kv_cache.num_committed_tokens == 0
+        ):
+            return None
+        if all(
+            kv_cache.reuse_status[group].complete for group in self._mixed_precision_high_groups
+        ):
+            return None
+        end = max(0, kv_cache.num_committed_tokens - back_off)
+        limit = end // self.tokens_per_block * self.tokens_per_block
+        return None if limit == kv_cache.num_committed_tokens else limit
 
     def _context_reuse_tokens(
         self, req: LlmRequest, reuse_limit: int | None = None
@@ -6264,10 +6345,10 @@ class KVCacheManagerV2(BaseResourceManager):
                 # prompt_len - 1, because augmentation can change the length
                 # for multimodal requests.
                 num_lookup_tokens = len(tokens) if tokens is not None else None
-                kv_cache = self._create_kv_cache(
+                create = functools.partial(
+                    self._create_kv_cache,
                     req.py_request_id,
                     req.lora_task_id,
-                    tokens,
                     cache_salt=req.cache_salt,
                     kv_cache_retention_config=self._retention_config_for_request(req),
                     is_dummy=req.is_dummy,
@@ -6276,8 +6357,28 @@ class KVCacheManagerV2(BaseResourceManager):
                         req.total_input_len_cp if self._has_cp_helix else req.prompt_len
                     ),
                 )
+                kv_cache = create(tokens)
                 if kv_cache is None:
                     return None
+                # Stop at a block boundary so the window pages after it hold only what this request
+                # computes; a rematch pruned inside a block backs off to the block's start.
+                # "recompute" stops N tokens earlier, and so does a disaggregated context request:
+                # the window it sends must hold computed tokens, not empty pages.
+                back_off = (
+                    self.last_n
+                    if self.mixed_precision_reuse == "recompute" or req.is_context_only_request
+                    else 0
+                )
+                while (
+                    window_limit := self._mixed_precision_reuse_limit(req, kv_cache, back_off)
+                ) is not None:
+                    self._remove_kv_cache(req.py_request_id)
+                    tokens = self._context_reuse_tokens(req, window_limit)
+                    num_lookup_tokens = len(tokens)
+                    kv_cache = create(tokens)
+                    if kv_cache is None:
+                        return None
+                    back_off = 0
                 kv_cache.cuda_stream = self._cache_stream(req.py_request_id)
 
             if not self.enable_block_reuse:
@@ -8597,6 +8698,7 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_cache.discard_pending_stats()
         if self._sharing is not None:
             self._sharing._on_free(request_id, kv_cache)
+        self._mixed_precision_low_prefix_len.pop(request_id, None)
         kv_cache.close()
         self.impl.clear_stats_excluded(request_id)
         if request_id in self._early_freed_index_requests:

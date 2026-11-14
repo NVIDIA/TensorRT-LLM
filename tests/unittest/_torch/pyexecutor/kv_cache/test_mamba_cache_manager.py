@@ -3914,6 +3914,7 @@ def _build_v2_hybrid_with_mamba_layer(
     mamba_d_state: int = 8,
     mamba_head_dim: int = 8,
     max_num_tokens: int = 8192,
+    cold_page_codec_provider=None,
 ) -> MambaHybridCacheManagerV2:
     """Construct a real MambaHybridCacheManagerV2."""
     # Draft layers of a combined speculative manager follow the model's layers in both masks.
@@ -4006,6 +4007,11 @@ def _build_v2_hybrid_with_mamba_layer(
         spec_config=spec_config,
         layer_mask=attn_mask,
         **({"pretrained_config": pretrained_config} if pretrained_config is not None else {}),
+        **(
+            {"cold_page_codec_provider": cold_page_codec_provider}
+            if cold_page_codec_provider is not None
+            else {}
+        ),
         vocab_size=1024,
         use_replay_state_update=use_replay_state_update,
         dtype=dtype,
@@ -8958,6 +8964,27 @@ def _assert_gdn_replay_slot_reset(mgr, replay_slot):
     bookkeeping, history = _gdn_replay_rows(mgr, replay_slot)
     assert bookkeeping == (0, 0, 0)
     assert all(torch.count_nonzero(rows) == 0 for rows in history)
+
+
+@skip_no_cuda
+def test_v2_gdn_replay_manager_builds_the_cold_page_window():
+    """With MTP replay each GDN layer keeps its replay history in a layer group of its own, so its
+    buffers sit in two groups. The cold-page first/last-N window of the attention layer still
+    builds, and points its blocks at the group attention runs the layer in."""
+    provider = SimpleNamespace(
+        config=SimpleNamespace(algorithm="quantization_for_cold_page"),
+        mixed_precision_high_window=(1, 33),
+        create_cold_page_codec=lambda cache_config, **kwargs: None,
+    )
+    mgr = _build_v2_gdn_replay_manager(cold_page_codec_provider=provider)
+    try:
+        assert mgr.replay_layer_group_id not in (None, mgr.ssm_layer_group_id)
+        (attention_layer,) = mgr.mixed_precision_high_layers
+        (pool_id,) = mgr.mixed_precision_high_block_deltas
+        assert pool_id == mgr._get_layer_execution_group(attention_layer)
+        assert mgr.mixed_precision_high_block_deltas[pool_id] is not None
+    finally:
+        mgr.shutdown()
 
 
 @skip_no_cuda

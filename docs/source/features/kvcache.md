@@ -171,6 +171,18 @@ forward converts up to the longest sequence in the batch for every
 mixed-precision layer (the full span inside CUDA graphs), which is the
 feature's per-step cost.
 
+With block reuse, the high-precision copy of a cached prefix's last N tokens
+can be evicted while its NVFP4 history is still cached. `mixed_precision_reuse`
+sets what reuse does then. `default` reuses the prefix down to its last block
+boundary and reads those tokens from the NVFP4 history, at NVFP4 precision,
+until they leave the window. `recompute` reuses the prefix up to before them and
+recomputes them in high precision. `strict` stops reuse where the high-precision
+copy is complete; it is the only mode without first-N tokens. In disaggregated
+serving, a context server recomputes them in `default` mode too, since it sends
+them to the generation server as high-precision KV. The cold-page first/last-N window of
+[cold-page quantization](kv-cache-compression.md) reads them from its history
+pages, at the runtime KV type.
+
 The prototype requires `use_kv_cache_manager_v2: true` with the TRTLLM or
 FlashInfer attention backend. It supports the standard V2 manager (dense
 models), the hybrid Mamba manager (Qwen3.5, Kimi-K3) and the sparse MLA

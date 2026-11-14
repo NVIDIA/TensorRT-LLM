@@ -5336,6 +5336,18 @@
           "title": "Mixed Precision Last N",
           "type": "integer"
         },
+        "mixed_precision_reuse": {
+          "default": "default",
+          "description": "Block reuse of a cached prefix whose high-precision copy of its last N tokens was evicted (mixed-precision KV and the cold-page first/last-N window). 'default' reuses the prefix down to its last block boundary and reads those tokens from the history (the low-precision pool, or with the cold-page window the layer's own pages) until they leave the window, so they keep the history's precision. 'recompute' reuses the prefix only up to before them and recomputes them in high precision, reading the N tokens before them from the history. 'strict' reuses the prefix only where its high-precision copy is complete and recomputes the rest; without first-N sink tokens, reuse is always strict.",
+          "enum": [
+            "default",
+            "strict",
+            "recompute"
+          ],
+          "status": "prototype",
+          "title": "Mixed Precision Reuse",
+          "type": "string"
+        },
         "pool_ratio": {
           "anyOf": [
             {

@@ -407,6 +407,7 @@ def test_mixed_precision_public_options():
     config = KvCacheConfig(dtype="mixed_nvfp4_fp8")
     assert config.mixed_precision_kv == ("nvfp4", "fp8", 256, 256)
     assert config.mixed_precision_first_n == config.mixed_precision_last_n == 256
+    assert config.mixed_precision_reuse == "default"
     assert config.pool_ratio is None
     for high in ("float16", "bfloat16"):
         assert KvCacheConfig(dtype=f"mixed_nvfp4_{high}").mixed_precision_kv.high == high
@@ -418,6 +419,7 @@ def test_mixed_precision_public_options():
         {"dtype": "mixed_nvfp4_fp8", "mixed_precision_last_n": -1},
         {"dtype": "mixed_nvfp4_fp8", "mixed_precision_first_n": 0, "mixed_precision_last_n": 0},
         {"mixed_precision_config": {"mixed_precision_first_n": 1}},
+        {"dtype": "mixed_nvfp4_fp8", "mixed_precision_reuse": "partial"},
     ):
         with pytest.raises(ValidationError):
             KvCacheConfig(**invalid)
@@ -1157,7 +1159,7 @@ def test_staging_covers_allocated_capacity(backend):
 
 @pytest.mark.parametrize("dtype", ["auto", "mixed_nvfp4_bfloat16", "cold"])
 def test_steady_decode_step_skips_mixed_precision(dtype):
-    """The steady MTP decode shortcut stands in for prepare() only without mixed precision."""
+    """The steady decode shortcuts stand in for prepare() only without mixed precision."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12):
         pytest.skip("Mixed-precision NVFP4 KV requires Blackwell")
     block, cached = 128, 32
@@ -1168,6 +1170,7 @@ def test_steady_decode_step_skips_mixed_precision(dtype):
         metadata = _small_metadata(TrtllmAttention, manager, mapping, block, cached)
         metadata.prepare()
         assert metadata.supports_steady_decode_step == (dtype == "auto")
+        assert metadata.support_steady_gen_step() == (dtype == "auto")
     finally:
         manager.shutdown()
 

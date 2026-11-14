@@ -8,6 +8,7 @@ from datetime import timedelta
 import pytest
 import torch
 
+from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
 from tensorrt_llm.bindings.executor import KvCacheRetentionConfig
 from tensorrt_llm.runtime import kv_cache_manager_v2 as kv
 from tensorrt_llm.runtime.kv_cache_manager_v2 import _introspection
@@ -347,10 +348,11 @@ def test_sink_required_claims_sinks_and_selects_window():
         assert warm.get_base_page_indices(one_sink)[0] == old[one_sink][0]
         assert warm.get_base_page_indices(one_sink)[3] == old[one_sink][3]
 
-        # Endpoint inside a block: the window cannot be selected, the sinks are still claimed.
+        # Endpoint inside a block: the window covers it and could be selected. Left unselected,
+        # it gets fresh pages while the sinks are still claimed.
         mid = manager.create_kv_cache(None, tokens[:14])
         caches.append(mid)
-        assert mid.num_committed_tokens == 14 and not mid.reuse_status[one_sink].complete
+        assert mid.num_committed_tokens == 14 and mid.reuse_status[one_sink].complete
         assert mid.resume(stream.cuda_stream, optional_reuse_groups=[])
         assert mid.get_base_page_indices(one_sink)[0] == old[one_sink][0]
         assert mid.get_base_page_indices(one_sink)[3] != old[one_sink][3]
@@ -381,6 +383,77 @@ def test_sink_required_claims_sinks_and_selects_window():
         gone = manager.create_kv_cache(None, tokens)
         caches.append(gone)
         assert gone.num_committed_tokens == 0
+    finally:
+        for cache in reversed(caches):
+            cache.close()
+        manager.shutdown()
+
+
+def _key_page(manager, cache, layer_id, block):
+    """One block's key page of a layer, as device bytes."""
+    group = manager.get_buffer_group_id(layer_id, "key")
+    converter = manager.get_page_index_converter(layer_id, "key")
+    index = converter(cache.get_base_page_indices(group), kv.PageIndexMode.PER_LAYER)[block]
+    base = manager.get_mem_pool_base_address(layer_id, "key", kv.PageIndexMode.PER_LAYER)
+    stride = manager.get_page_stride(layer_id, "key")
+    return convert_to_torch_tensor(TensorWrapper(int(base) + index * stride, torch.uint8, [stride]))
+
+
+def test_sink_required_selects_window_at_partial_endpoint():
+    """A SINK_REQUIRED_ONLY window can end inside a block; each reader copies that partial block."""
+    buffers = [kv.BufferConfig(role="key", size=4096)]
+    layers = [
+        kv.AttentionLayerConfig(layer_id=0, buffers=buffers),
+        kv.AttentionLayerConfig(
+            layer_id=1,
+            buffers=buffers,
+            sliding_window_size=4,
+            num_sink_tokens=4,
+            reuse_policy=kv.ReusePolicy.SINK_REQUIRED_ONLY,
+        ),
+    ]
+    config = kv.KVCacheManagerConfig(
+        tokens_per_block=4,
+        cache_tiers=[kv.GpuCacheTierConfig(quota=4 << 20)],
+        layers=layers,
+        commit_min_snapshot=True,
+    )
+    stream = torch.cuda.Stream()
+    manager = kv.KVCacheManager(config)
+    caches = []
+    tokens = list(range(14))
+    try:
+        source = manager.create_kv_cache(None, [], expected_prompt_length=14)
+        caches.append(source)
+        assert source.resume(stream.cuda_stream) and source.resize(14)
+        # Known bytes for tokens 12-13, the first half of block 3's page.
+        with torch.cuda.stream(stream):
+            written = torch.arange(2048, device="cuda").remainder(251).to(torch.uint8)
+            _key_page(manager, source, 1, 3)[:2048].copy_(written)
+        # The min snapshot also publishes the partial block 3 (tokens 12-13).
+        source.commit(tokens)
+        group = manager.get_layer_group_id(1)
+        old = source.get_base_page_indices(group).copy()
+        source.close()
+
+        readers = []
+        for _ in range(2):
+            reader = manager.create_kv_cache(None, tokens)
+            caches.append(reader)
+            status = reader.reuse_status[group]
+            assert reader.num_committed_tokens == 14 and status.complete
+            # The sink block, then the window from block 2 to the endpoint inside block 3.
+            assert list(status.coverage) == [(0, 4), (8, 14)]
+            assert reader.resume(stream.cuda_stream, optional_reuse_groups=[group])
+            readers.append(list(reader.get_base_page_indices(group)))
+        for pages in readers:
+            assert pages[0] == old[0] and pages[2] == old[2] and pages[3] >= 0
+        # The partial block is private to each reader, which appends to it.
+        assert readers[0][3] != readers[1][3]
+        # Each private copy holds the source's tokens 12-13.
+        stream.synchronize()
+        for reader in caches[1:]:
+            assert torch.equal(_key_page(manager, reader, 1, 3)[:2048], written)
     finally:
         for cache in reversed(caches):
             cache.close()
