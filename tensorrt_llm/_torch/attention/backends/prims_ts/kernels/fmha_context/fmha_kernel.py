@@ -144,8 +144,6 @@ from dataclasses import dataclass
 from collections.abc import Callable
 from typing import Any, Tuple
 
-import importlib
-
 import cutlass
 import cutlass.experimental.cuda as cuda
 import cutlass.cute as cute
@@ -3082,9 +3080,6 @@ class FmhaTs:
             is_causal=is_causal,
             window_size_left=window_size_left,
         )
-        # Load helpers before staged Sage copies enter GPU control flow.
-        importlib.import_module(f"{__package__}.helpers_paged")
-
         if causal_single_kv_tile and (not is_causal or head_paired):
             raise ValueError(
                 "causal_single_kv_tile requires query-paired causal attention"
