@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.engine.multimodal import MultimodalItemScheduler
     from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import ForwardWarmup
     from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.metadata import DecoderMetadata
+    from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
 
 
 def decoder_config(**changes: Any) -> DecoderRunnerConfig:
@@ -175,6 +176,7 @@ def decoder_warmup(
     dummy_requests: DummyRequestFactory | None = None,
     graphs: DecoderCudaGraphs | None = None,
     forward_warmup: ForwardWarmup | None = None,
+    guided_decoder: CapturableGuidedDecoder | None = None,
 ) -> DecoderWarmup:
     mapping = mapping or Mapping()
     model = model if model is not None else torch.nn.Identity()
@@ -212,7 +214,7 @@ def decoder_warmup(
         metadata=Mock(),
         dummy_requests=dummy_requests,
         graphs=graphs,
-        inputs=SimpleNamespace(guided_decoder=None),
+        inputs=SimpleNamespace(guided_decoder=guided_decoder),
         forward_warmup=forward_warmup,
         torch_compile_bypass=nullcontext,
         context_warmups_supported=True,
