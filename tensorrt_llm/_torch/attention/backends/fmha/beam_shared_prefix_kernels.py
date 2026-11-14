@@ -33,7 +33,9 @@ if TYPE_CHECKING:
 _LOG2E = 1.4426950408889634
 
 
-@triton.jit
+# tail_len and stride_tail_row vary between eager steps; keep Triton from compiling a variant at
+# tail_len == 1 and at multiples of 16.
+@triton.jit(do_not_specialize=["tail_len", "stride_tail_row"])
 def _tail_merge_kernel(
     q_ptr,
     k_ptr,

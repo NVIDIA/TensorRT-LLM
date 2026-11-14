@@ -396,6 +396,10 @@ def _kv_manager_supported(kv_cache_manager) -> bool:
     # group) index kv_cache_block_offsets by local layer instead of by pool.
     if getattr(kv_cache_manager, "_use_per_layer_page_tables", False):
         return False
+    # Variable sliding windows: layers differ in pool and in how many prompt pages they keep, so
+    # one prompt page table cannot serve them all.
+    if len(set(getattr(kv_cache_manager, "max_attention_window_vec", None) or ())) > 1:
+        return False
     return True
 
 
@@ -417,6 +421,23 @@ def metadata_eligible(metadata: "TrtllmAttentionMetadata") -> bool:
         and _kv_manager_supported(metadata.kv_cache_manager)
         and metadata.num_generations % metadata.beam_width == 0
     )
+
+
+def tail_exceeds_cuda_graph(generation_requests) -> bool:
+    """Whether a beam in this batch has generated more tokens than the CUDA graphs cover.
+
+    The runner calls this (only when the library is enabled) before choosing a graph, so such a step
+    runs eagerly, where the tail length is not fixed, instead of failing in ``plan_step``.
+    """
+    limit = _Config.from_env().max_tail
+    for request in generation_requests:
+        if request.sampling_config.beam_width > 1:
+            # With overlap scheduling the request has not yet counted the previous step's token,
+            # so the tail ``plan_step`` will see (generated positions before the current token)
+            # equals the tokens counted so far.
+            if request.max_beam_num_tokens - request.orig_prompt_len > limit:
+                return True
+    return False
 
 
 def plan_step(metadata: "TrtllmAttentionMetadata") -> None:

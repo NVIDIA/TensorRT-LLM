@@ -47,6 +47,7 @@ from tensorrt_llm._torch.attention.backends.fmha.beam_shared_prefix import (
     merge_prefix_and_tail,
     metadata_eligible,
     plan_step,
+    tail_exceeds_cuda_graph,
 )
 from tensorrt_llm._torch.attention.backends.fmha.beam_shared_prefix_kernels import (
     fused_tail_and_merge,
@@ -312,6 +313,26 @@ def test_only_kv_manager_v2_with_one_table_per_pool_is_eligible():
     assert not metadata_eligible(_beam_meta(v1))
     assert not metadata_eligible(_beam_meta(_ManagerV2({}, _use_per_layer_page_tables=True)))
     assert not metadata_eligible(_beam_meta(_ManagerV2({}), beam_width=1))
+    # Variable sliding windows give layers different pools and prompt pages.
+    assert metadata_eligible(_beam_meta(_ManagerV2({}, max_attention_window_vec=[512, 512])))
+    assert not metadata_eligible(_beam_meta(_ManagerV2({}, max_attention_window_vec=[128, 512])))
+
+
+def test_tail_exceeding_the_graph_is_detected_before_the_graph_is_chosen(monkeypatch):
+    """A beam that has generated more positions than ``MAX_TAIL`` covers sends the step to eager
+    execution; single-beam requests and shorter tails do not."""
+    monkeypatch.setenv("TLLM_BEAM_SHARED_PREFIX_MAX_TAIL", "3")
+
+    def request(generated, beam_width=4):
+        return SimpleNamespace(
+            sampling_config=SimpleNamespace(beam_width=beam_width),
+            orig_prompt_len=10,
+            max_beam_num_tokens=10 + generated,
+        )
+
+    assert not tail_exceeds_cuda_graph([request(3), request(1, beam_width=1)])
+    assert tail_exceeds_cuda_graph([request(2), request(4)])
+    assert not tail_exceeds_cuda_graph([request(30, beam_width=1)])
 
 
 @needs_flashinfer
