@@ -122,6 +122,9 @@ class _BatchRecord:
     batch: AnthropicMessageBatch
     items: List[AnthropicBatchRequestItem]
     results: List[_ItemResult] = field(default_factory=list)
+    result_counts: Dict[str, int] = field(
+        default_factory=lambda: {"succeeded": 0, "errored": 0, "canceled": 0, "expired": 0}
+    )
     task: Optional[asyncio.Task] = None
     # Set by cancel(); the worker checks it between requests. In-flight requests
     # are allowed to finish rather than being torn down mid-generation, which
@@ -135,10 +138,8 @@ class _BatchRecord:
 
 # Runs one Messages request and returns (result_type, payload). Supplied by the
 # server so this module stays free of engine and HTTP concerns.
-# Only these two outcomes come from the runner; canceled and expired are
-# recorded by _finalize's padding. Typing it keeps an unexpected value from
-# reaching the counter in _finalize, where setattr on a field that does not
-# exist would raise and strand the batch.
+# Only these two outcomes come from the runner. The store records canceled and
+# expired items during cancellation and finalization.
 BatchItemOutcome = Literal["succeeded", "errored"]
 BatchItemRunner = Callable[
     [AnthropicMessagesRequest], Awaitable[Tuple[BatchItemOutcome, Dict[str, Any]]]
@@ -397,14 +398,18 @@ class AnthropicBatchStore:
             if record.cancel_requested or record.is_expired():
                 state = "canceled" if record.cancel_requested else "expired"
                 record.results.append(_ItemResult(item.custom_id, state, {}))
+                record.result_counts[state] += 1
                 return
             async with self._semaphore:
                 # Re-check after queueing: cancellation or expiry may have
                 # arrived while this item waited for a slot, and starting
                 # generation then would waste engine time on a dead batch.
+                if record.batch.processing_status == "ended":
+                    return
                 if record.cancel_requested or record.is_expired():
                     state = "canceled" if record.cancel_requested else "expired"
                     record.results.append(_ItemResult(item.custom_id, state, {}))
+                    record.result_counts[state] += 1
                     return
                 try:
                     result_type, payload = await self._runner(item.params)
@@ -424,8 +429,7 @@ class AnthropicBatchStore:
             # Appended as each item lands rather than collected at the end, so
             # a cancelled task keeps the results it already earned; _finalize
             # pads only what never ran.
-            record.results.append(_ItemResult(item.custom_id, result_type, payload))
-            self._recount(record)
+            self._record_result(record, _ItemResult(item.custom_id, result_type, payload))
 
         # A queue with a fixed worker pool, not one task per item: gather()
         # would allocate a coroutine frame and a Task for every request before
@@ -441,7 +445,7 @@ class AnthropicBatchStore:
             queue.put_nowait(item)
 
         async def worker() -> None:
-            while True:
+            while record.batch.processing_status != "ended":
                 try:
                     item = queue.get_nowait()
                 except asyncio.QueueEmpty:
@@ -472,43 +476,41 @@ class AnthropicBatchStore:
         # by, and results_url would serve a truncated .jsonl.
         if len(record.results) < len(record.items):
             done = {result.custom_id for result in record.results}
+            remaining = len(record.items) - len(record.results)
             record.results.extend(
                 _ItemResult(item.custom_id, pad_state, {})
                 for item in record.items
                 if item.custom_id not in done
             )
-        self._recount(record, remaining_as_processing=False)
+            record.result_counts[pad_state] += remaining
+        self._publish_counts(record)
         record.batch.processing_status = "ended"
         record.batch.ended_at = _rfc3339(_now())
-
-    def _recount(self, record: _BatchRecord, remaining_as_processing: bool = True) -> None:
-        """Recompute request_counts from the results recorded so far.
-
-        Called as each result lands as well as at finalization, so a polling
-        client sees progress instead of `processing=N, succeeded=0` for the
-        whole run followed by a single jump.
-        """
-        counts = AnthropicBatchRequestCounts()
-        for result in record.results:
-            if not hasattr(counts, result.result_type):
-                # Counting runs before processing_status is set, so raising
-                # here would leave the batch in_progress forever: results stay
-                # None, delete is refused, and it is not evictable.
-                logger.error(
-                    f"Anthropic batch {record.batch.id} produced unknown result type "
-                    f"{result.result_type!r} for {result.custom_id}; counting it as errored"
-                )
-                result.result_type = "errored"
-            setattr(counts, result.result_type, getattr(counts, result.result_type) + 1)
-        if remaining_as_processing:
-            counts.processing = len(record.items) - len(record.results)
-        record.batch.request_counts = counts
-        # Relative rather than absolute: the server does not reliably know the
-        # scheme/host a client reached it by, and a wrong absolute URL is worse
-        # than a relative one the client can resolve itself.
+        # The server does not reliably know the scheme or host seen by the client.
         record.batch.results_url = f"/v1/messages/batches/{record.batch.id}/results"
         logger.info(
             f"Anthropic batch {record.batch.id} ended: {record.batch.request_counts.model_dump()}"
+        )
+
+    def _record_result(self, record: _BatchRecord, result: _ItemResult) -> None:
+        # Expiry finalizes before cancellation reaches the in-flight runner.
+        if record.batch.processing_status == "ended":
+            return
+        if result.result_type not in record.result_counts:
+            logger.error(
+                f"Anthropic batch {record.batch.id} produced unknown result type "
+                f"{result.result_type!r} for {result.custom_id}; counting it as errored"
+            )
+            result.result_type = "errored"
+        record.results.append(result)
+        record.result_counts[result.result_type] += 1
+        self._publish_counts(record)
+
+    @staticmethod
+    def _publish_counts(record: _BatchRecord) -> None:
+        record.batch.request_counts = AnthropicBatchRequestCounts(
+            processing=len(record.items) - len(record.results),
+            **record.result_counts,
         )
 
 
