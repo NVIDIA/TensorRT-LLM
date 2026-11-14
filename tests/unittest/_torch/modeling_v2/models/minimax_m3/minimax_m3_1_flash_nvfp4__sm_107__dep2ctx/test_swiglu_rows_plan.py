@@ -224,11 +224,13 @@ def _body(src, start, end):
 
 
 def test_launcher_constants_match_the_plan():
-    """The launcher engages from the plan's ROWS_MIN at the plan's default kRows; the native code reads no
-    environment, and its kRows dispatch covers the plan's choices with the default as the fallback."""
+    """The launcher engages from the plan's ROWS_MIN; kRows is an op argument whose default is the plan's default
+    kRows; the native code reads no environment, and its kRows dispatch covers the plan's choices with the default as
+    the fallback."""
     src = _cu()
     assert f"constexpr int64_t kSwigluRowsMinRows = {plan.ROWS_MIN};" in src
-    assert f"constexpr int kSwigluRowsK = {plan.K_ROWS_DEFAULT};" in src
+    op = (_CU.parent / "swigluOaiMxfp8Op.cpp").read_text()
+    assert f"int k_rows={plan.K_ROWS_DEFAULT}) -> ()" in op
     assert "getenv" not in src
     dispatch = _body(src, "cudaError_t dispatchSwigluRows(int kRows", "} // namespace")
     assert set(re.findall(r"case (\d):", dispatch)) == {"2", "8"} and "default:" in dispatch
@@ -260,8 +262,8 @@ def test_launcher_grid_and_engage_rule_match_the_plan():
     assert src.count("rows form kRows=") == 1
     assert "cudaOccupancyMaxActiveBlocksPerMultiprocessor(ctas, kernel, block, 0)" in src
     invoke = _body(src, "cudaError_t invokeSwigluOaiMxfp8(", "} // namespace minimaxM31")
-    assert "if (rows >= kSwigluRowsMinRows)" in invoke
-    assert "dispatch(kSwigluRowsK, cfg," in invoke
+    assert "if (rowsForm && rows >= kSwigluRowsMinRows)" in invoke
+    assert "dispatch(kRows, cfg," in invoke
     # Short inputs keep the one-row kernel on the 2048-threads-per-SM grid.
     tail = invoke[invoke.index("// The one-row launch") :]
     assert "int const blocksPerSm = std::max(1, 2048 / threads);" in tail

@@ -3,8 +3,9 @@
 """MiniMax-M3.1-Flash tp8 routing contract, CPU only: the family ``route`` with the target modules stubbed.
 
 The M3.1 checkpoint on 8 tensor-parallel ranks (experts tensor-parallel, no attention DP) goes to the sm_107 tp8
-target and nowhere else; every other chip, parallel layout or KV cache, and every checkpoint revision that is not the
-M3.1 export, is declined with ``NoTarget``. The full routing matrix lives in test_modeling_v2_routing.py.
+target on Rubin (the GB300 tp8 target on sm103) and nowhere else; every other chip, parallel layout or KV cache, and
+every checkpoint revision that is not the M3.1 export, is declined with ``NoTarget``. The full routing matrix lives in
+test_modeling_v2_routing.py.
 """
 
 import sys
@@ -25,6 +26,9 @@ _OTHERS = (
     ("minimax_m3_1_flash_nvfp4__sm_107__tp2ctx", "ModelingV2MiniMaxM31FlashNvfp4Sm107Tp2ctx"),
     ("minimax_m3_1_flash_nvfp4__sm_107__dep2ctx", "ModelingV2MiniMaxM31FlashNvfp4Sm107Dep2ctx"),
     ("minimax_m3_1_flash_nvfp4__sm_107__dep", "ModelingV2MiniMaxM31FlashNvfp4Sm107Dep"),
+    ("minimax_m3_1_flash_nvfp4__sm_107__tp4", "ModelingV2MiniMaxM31FlashNvfp4Sm107Tp4"),
+    ("minimax_m3_1_flash_nvfp4__sm_103__tp4", "ModelingV2MiniMaxM31FlashNvfp4Sm103Tp4"),
+    ("minimax_m3_1_flash_nvfp4__sm_103__tp8", "ModelingV2MiniMaxM31FlashNvfp4Sm103Tp8"),
 )
 
 
@@ -87,7 +91,6 @@ def test_tp8_routes_only_to_tp8(route, kv):
     ("name", "value"),
     [
         ("chip", (10, 0)),
-        ("chip", (10, 3)),
         ("chip", (12, 0)),
         ("world_size", 4),
         ("tp_size", 4),
@@ -118,6 +121,12 @@ def test_declines_outside_scope(route, name, value):
         kv = None
     with pytest.raises(NoTarget):
         route(config, mapping, chip, kv)
+
+
+def test_tp8_on_sm103_takes_the_gb300_target(route):
+    config, mapping = inputs()
+    target = route(config, mapping, (10, 3), QuantAlgo.NVFP4)
+    assert target.__name__ == "ModelingV2MiniMaxM31FlashNvfp4Sm103Tp8"
 
 
 def test_a_wrong_shape_is_declined(route):
