@@ -44,6 +44,7 @@ from .engine.lora import resolve_lora_owner
 from .engine.model_setup import (
     apply_torch_compile,
     compile_model,
+    configure_autotuner_nvmmh,
     create_model_loader,
     init_process_setup,
     prepare_loaded_model,
@@ -171,6 +172,7 @@ class ModelEngine:
                 "encode_only models run through EncoderExecutor, which does not use ModelEngine."
             )
         init_process_setup(mapping, dist)
+        configure_autotuner_nvmmh(llm_args)
 
         (
             max_beam_width,

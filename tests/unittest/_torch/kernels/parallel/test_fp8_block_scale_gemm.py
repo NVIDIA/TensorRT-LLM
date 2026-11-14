@@ -24,7 +24,7 @@ from _torch.helpers import (calc_diff, per_block_cast_to_fp8,
 from utils.util import getSMVersion, isSM100Family, isSM120Family
 
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
-from tensorrt_llm._torch.autotuner import AutoTuner, autotune
+from tensorrt_llm._torch.autotuner import AutoTuner, NvMMHConfig, autotune
 from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
 from tensorrt_llm._torch.cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
                                                 IS_CUTLASS_DSL_RUBIN_AVAILABLE)
@@ -402,6 +402,214 @@ def test_cute_dsl_fp8_block_scale_bmm_autotune_profiles() -> None:
         )
 
     assert cache_profile(5) == cache_profile(7)
+
+
+def _k_block_magnitudes(k: int) -> torch.Tensor:
+    """Per-128-column magnitudes, so a K slice that applied the block scales
+    of another slice would not compute the product."""
+    exponents = torch.randint(-3, 4, (k // 128, ), device='cuda')
+    return torch.exp2(exponents.float()).repeat_interleave(128)
+
+
+@pytest.mark.skipif(
+    getSMVersion() not in (100, 103),
+    reason="The test is for SM100 and SM103 only. Current SM is %d." %
+    getSMVersion(),
+)
+@pytest.mark.parametrize("split_k", [2, 4, 8])
+def test_cute_dsl_fp8_block_scale_gemm_split_k(split_k):
+    """The full sweep splits long K for small N, and every split launch
+    (also inside a CUDA graph) computes the product."""
+    torch.random.manual_seed(0)
+    m, n, k = 64, 512, 7168
+    a = (torch.randn(
+        (m, k), device='cuda') * _k_block_magnitudes(k) / k).to(torch.bfloat16)
+    b = (torch.randn(
+        (n, k), device='cuda') * _k_block_magnitudes(k) / k).to(torch.bfloat16)
+    a_fp8, a_sf = torch.ops.trtllm.fp8_quantize_1x128(a)
+    b_fp8, b_sf = per_block_cast_to_fp8(b)
+    inputs = [a_fp8, b_fp8, a_sf, b_sf]
+    expected = a.float() @ b.float().t()
+
+    runner = cute_dsl_custom_ops.CuteDSLFp8BlackwellRunner()
+    tactic = (False, (128, 128), (1, 1), "m", 1, split_k)
+    assert tactic in runner.get_valid_tactics(inputs, None)
+
+    assert calc_diff(runner(inputs, tactic=tactic), expected) < 1e-3
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = runner(inputs, tactic=tactic)
+    output.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert calc_diff(output, expected) < 1e-3
+
+
+@pytest.mark.skipif(
+    getSMVersion() not in (100, 103),
+    reason="The test is for SM100 and SM103 only. Current SM is %d." %
+    getSMVersion(),
+)
+@pytest.mark.parametrize("split_k", [2, 4, 8])
+def test_cute_dsl_fp8_block_scale_bmm_split_k(split_k):
+    """The full sweep splits long K for small N when the output holds exactly
+    M rows, and every split launch zeroes the output first."""
+    torch.random.manual_seed(0)
+    num_groups, m, n, k = 4, 64, 512, 7168
+    a = (torch.randn((m, num_groups, k), device='cuda') *
+         _k_block_magnitudes(k) / k).to(torch.bfloat16)
+    b = (torch.randn((num_groups, n, k), device='cuda') *
+         _k_block_magnitudes(k) / k).to(torch.bfloat16)
+    a_fp8, a_scales = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(a)
+    b_fp8 = torch.empty_like(b, dtype=torch.float8_e4m3fn)
+    b_scales = torch.empty((num_groups, n // 128, k // 128),
+                           device='cuda',
+                           dtype=torch.float)
+    for i in range(num_groups):
+        b_fp8[i], b_scales[i] = per_block_cast_to_fp8(b[i])
+    output = torch.empty((num_groups, m, n),
+                         device='cuda',
+                         dtype=torch.bfloat16)
+    inputs = [a_fp8, b_fp8, a_scales, b_scales, output]
+    expected = torch.einsum('mgk,gnk->gmn', a.float(), b.float())
+
+    runner = cute_dsl_custom_ops.CuteDSLFp8BlackwellBmmRunner()
+    tactic = (False, (128, 128), (1, 1), "m", 1, split_k)
+    assert tactic in runner.get_valid_tactics(inputs, None)
+    taller_output = torch.empty((num_groups, m + 8, n),
+                                device='cuda',
+                                dtype=torch.bfloat16)
+    assert all(
+        len(t) < 6
+        for t in runner.get_valid_tactics(inputs[:4] + [taller_output], None))
+
+    output.fill_(float("nan"))
+    runner(inputs, tactic=tactic)
+    torch.cuda.synchronize()
+    assert calc_diff(output, expected) < 1e-3
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        runner(inputs, tactic=tactic)
+    output.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert calc_diff(output, expected) < 1e-3
+
+
+def _n_block_magnitudes(n: int, k: int) -> torch.Tensor:
+    """Per-128x128-block magnitudes of B that differ between the N blocks of
+    every K block, so a tile that applied the scale of another N block would
+    not compute the product."""
+    n_blocks = torch.arange(n // 128, device='cuda')[:, None]
+    k_blocks = torch.arange(k // 128, device='cuda')[None, :]
+    magnitudes = torch.exp2(((n_blocks + 2 * k_blocks) % 5).float())
+    return magnitudes.repeat_interleave(128, 0).repeat_interleave(128, 1)
+
+
+def _dequantize_1x128(x_fp8: torch.Tensor,
+                      scales: torch.Tensor) -> torch.Tensor:
+    """FP64 values of rows quantized per 1x128 block, where
+    scales[..., j, i] scales K block j of row i."""
+    m = x_fp8.shape[-2]
+    return x_fp8.double() * scales[..., :m].transpose(
+        -1, -2).double().repeat_interleave(128, -1)
+
+
+def _dequantize_128x128(x_fp8: torch.Tensor,
+                        scales: torch.Tensor) -> torch.Tensor:
+    return x_fp8.double() * scales.double().repeat_interleave(
+        128, -2).repeat_interleave(128, -1)
+
+
+def _sm100_fp8_tile_shape_tactics(runner, inputs):
+    """Full-sweep 1-CTA and 2-CTA tactics, with and without a cluster along
+    N, of every MMA tile."""
+    clusters = {False: ((1, 1), (1, 2)), True: ((2, 1), (2, 2))}
+    tactics = [
+        tactic for tactic in runner.get_valid_tactics(inputs, None)
+        if tactic[2] in clusters[tactic[0]]
+    ]
+    assert {tactic[1][1] for tactic in tactics} == {32, 64, 128}
+    return tactics
+
+
+def _assert_matches_dequantized(output, expected, tactic):
+    assert torch.isfinite(output).all(), tactic
+    torch.testing.assert_close(output.double(),
+                               expected,
+                               rtol=1e-2,
+                               atol=1e-3 * expected.abs().amax().item(),
+                               msg=lambda msg: f"{tactic}: {msg}")
+    assert calc_diff(output, expected) < 1e-5, tactic
+
+
+@pytest.mark.skipif(
+    getSMVersion() not in (100, 103),
+    reason="The test is for SM100 and SM103 only. Current SM is %d." %
+    getSMVersion(),
+)
+@pytest.mark.parametrize("m", [7, 200])
+def test_cute_dsl_fp8_block_scale_gemm_tile_shapes(m, monkeypatch):
+    """Every MMA tile of the SM100 blockwise GEMM computes the product,
+    including the N = 32 and 64 tiles inside a 128-row scale block of B."""
+    k, n = 1024, 384
+    torch.random.manual_seed(0)
+    a = torch.randn((m, k), device='cuda', dtype=torch.bfloat16)
+    b = (torch.randn(
+        (n, k), device='cuda') * _n_block_magnitudes(n, k)).to(torch.bfloat16)
+    a_fp8, a_sf = torch.ops.trtllm.fp8_quantize_1x128(a)
+    b_fp8, b_sf = per_block_cast_to_fp8(b)
+    expected = _dequantize_1x128(a_fp8, a_sf) @ _dequantize_128x128(
+        b_fp8, b_sf).t()
+
+    monkeypatch.setattr(AutoTuner.get(), "nvmmh_config", None)
+    runner = cute_dsl_custom_ops.CuteDSLFp8BlackwellRunner()
+    inputs = [a_fp8, b_fp8, a_sf, b_sf]
+    for tactic in _sm100_fp8_tile_shape_tactics(runner, inputs):
+        output = runner(inputs, tactic=tactic)
+        torch.cuda.synchronize()
+        _assert_matches_dequantized(output, expected, tactic)
+        # The next tactic's output is likely allocated in this memory.
+        output.fill_(float("nan"))
+
+
+@pytest.mark.skipif(
+    getSMVersion() not in (100, 103),
+    reason="The test is for SM100 and SM103 only. Current SM is %d." %
+    getSMVersion(),
+)
+@pytest.mark.parametrize("m", [7, 200])
+def test_cute_dsl_fp8_block_scale_bmm_tile_shapes(m, monkeypatch):
+    """Every MMA tile of the SM100 blockwise BMM computes the product,
+    including the N = 32 and 64 tiles inside a 128-row scale block of B."""
+    k, n, num_groups = 1024, 384, 3
+    torch.random.manual_seed(0)
+    a = torch.randn((m, num_groups, k), device='cuda', dtype=torch.bfloat16)
+    a_fp8, a_scales = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(a)
+    b = (torch.randn((num_groups, n, k), device='cuda') *
+         _n_block_magnitudes(n, k)).to(torch.bfloat16)
+    b_fp8 = torch.empty_like(b, dtype=torch.float8_e4m3fn)
+    b_scales = torch.empty((num_groups, n // 128, k // 128),
+                           device='cuda',
+                           dtype=torch.float)
+    for i in range(num_groups):
+        b_fp8[i], b_scales[i] = per_block_cast_to_fp8(b[i])
+    expected = _dequantize_1x128(a_fp8, a_scales) @ _dequantize_128x128(
+        b_fp8, b_scales).transpose(1, 2)
+    output = torch.empty((num_groups, m, n),
+                         device='cuda',
+                         dtype=torch.bfloat16)
+
+    monkeypatch.setattr(AutoTuner.get(), "nvmmh_config", None)
+    runner = cute_dsl_custom_ops.CuteDSLFp8BlackwellBmmRunner()
+    inputs = [a_fp8, b_fp8, a_scales, b_scales, output]
+    for tactic in _sm100_fp8_tile_shape_tactics(runner, inputs):
+        output.fill_(float("nan"))
+        runner(inputs, tactic=tactic)
+        torch.cuda.synchronize()
+        _assert_matches_dequantized(output, expected, tactic)
 
 
 @pytest.mark.skipif(
@@ -1069,6 +1277,64 @@ def test_cute_dsl_fp8_block_scale_bmm_rubin(m, use_tvm_ffi):
     torch.testing.assert_close(output, output_expected, atol=1e-3, rtol=1e-3)
 
 
+@pytest.mark.skipif(
+    getSMVersion() != 107 or not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+    reason="The test requires SM107 and SM107 CuTe DSL support.",
+)
+@pytest.mark.parametrize("m", [7, 300])
+def test_cute_dsl_fp8_block_scale_bmm_rubin_tile_shapes(m, monkeypatch):
+    """Every MMA tile of the SM107 blockwise BMM, including the 256-row tiles
+    whose accumulator update is split over two warp groups."""
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
+        CuteDSLFp8RubinBmmRunner
+
+    # 8 K tiles wrap the A/B pipeline; 3 N tiles and 3 groups give every CTA
+    # several persistent tiles.
+    k, n, num_groups = 1024, 384, 3
+    torch.random.manual_seed(0)
+    a = torch.randn((m, num_groups, k), device="cuda", dtype=torch.bfloat16) / k
+    a_fp8, a_scales = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(a)
+    b = torch.randn((num_groups, n, k), device="cuda", dtype=torch.bfloat16) / k
+    b_fp8 = torch.empty_like(b, dtype=torch.float8_e4m3fn)
+    b_scales = torch.empty((num_groups, n // 128, k // 128),
+                           device="cuda",
+                           dtype=torch.float32)
+    for group_idx in range(num_groups):
+        b_fp8[group_idx], b_scales[group_idx] = per_block_cast_to_fp8(
+            b[group_idx])
+    output_expected = torch.einsum("mgk,gnk->gmn", a, b)
+    output = torch.empty((num_groups, m, n),
+                         device="cuda",
+                         dtype=torch.bfloat16)
+
+    monkeypatch.setattr(AutoTuner.get(), "nvmmh_config", None)
+    runner = CuteDSLFp8RubinBmmRunner()
+    inputs = [a_fp8, b_fp8, a_scales, b_scales, output]
+    clusters = {False: ((1, 1), (2, 2)), True: ((2, 1), (2, 2))}
+    tactics = [
+        tactic for tactic in runner.get_valid_tactics(inputs, None)
+        if tactic[3] in clusters[tactic[0]]
+    ]
+    assert len({tactic[:3] for tactic in tactics}) == 4
+
+    outputs_128_rows = {}
+    for tactic in tactics:
+        use_2cta_instrs, mma_tiler, mma_inst_shape = tactic[:3]
+        output.fill_(float("nan"))
+        runner(inputs, tactic=tactic)
+        torch.cuda.synchronize()
+        assert calc_diff(output, output_expected) < 1e-3, tactic
+        # A 256-row tile runs the same MMAs and FP32 promotion per element as
+        # the 128-row tile of its instruction.
+        if mma_tiler[0] // (2 if use_2cta_instrs else 1) == 128:
+            outputs_128_rows.setdefault(mma_inst_shape, output.clone())
+        else:
+            torch.testing.assert_close(output,
+                                       outputs_128_rows[mma_inst_shape],
+                                       rtol=0,
+                                       atol=0)
+
+
 def _allocate_fp8_bmm_quant_outputs(a_fp8, b_fp8):
     num_groups, m, _ = a_fp8.shape
     n = b_fp8.shape[1]
@@ -1156,6 +1422,78 @@ def test_cute_dsl_fp8_bmm_quantize_rubin_matches_separate(m):
                                ref_fp8.float(),
                                rtol=0.0,
                                atol=1.0 / 16.0)
+
+
+@pytest.mark.skipif(
+    getSMVersion() != 107 or not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+    reason="The test requires SM107 and SM107 CuTe DSL support.",
+)
+@pytest.mark.parametrize("m", [16, 256])
+def test_cute_dsl_fp8_bmm_quantize_rubin_nvmmh_tactics(m, monkeypatch):
+    """Every nvMMH-guided tactic of the fused FP8 BMM and 1x128 quantization
+    matches the BF16 BMM of the same tactic quantized separately."""
+    from tensorrt_llm._torch.custom_ops import \
+        cutedsl_matmul_heuristics as nvmmh
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
+        CuteDSLFp8RubinBmmQuantRunner, CuteDSLFp8RubinBmmRunner)
+
+    if not nvmmh.IS_NVMMH_AVAILABLE:
+        pytest.skip("nvMatmulHeuristics is not installed")
+    k, n, num_groups = 4096, 1024, 8
+    flat_n = num_groups * n
+    torch.manual_seed(314)
+    a = torch.randn((m, num_groups, k), device="cuda", dtype=torch.bfloat16) / k
+    a_fp8, a_scales = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(a)
+    b = torch.randn((num_groups, n, k), device="cuda", dtype=torch.bfloat16) / k
+    b_fp8 = torch.empty_like(b, dtype=torch.float8_e4m3fn)
+    b_scales = torch.empty((num_groups, n // 128, k // 128),
+                           device="cuda",
+                           dtype=torch.float32)
+    for group_idx in range(num_groups):
+        b_fp8[group_idx], b_scales[group_idx] = per_block_cast_to_fp8(
+            b[group_idx])
+    bf16_output = torch.empty((num_groups, m, n),
+                              device="cuda",
+                              dtype=torch.bfloat16)
+    fused_fp8, fused_batched, fused_scale = _allocate_fp8_bmm_quant_outputs(
+        a_fp8, b_fp8)
+
+    selected = []
+    select_tactics = nvmmh.select_tactics
+
+    def recording_select_tactics(ranked, max_tactics):
+        selected.append(select_tactics(ranked, max_tactics))
+        return selected[-1]
+
+    monkeypatch.setattr(nvmmh, "select_tactics", recording_select_tactics)
+    monkeypatch.setattr(AutoTuner.get(), "nvmmh_config",
+                        NvMMHConfig(max_tactics=3))
+    runner = CuteDSLFp8RubinBmmQuantRunner()
+    inputs = [a_fp8, b_fp8, a_scales, b_scales, fused_batched, fused_scale]
+    tactics = runner.get_valid_tactics(inputs, None)
+    # The tactics come from nvMMH, not from the full-sweep fallback.
+    assert tactics and tactics == selected[-1]
+
+    bf16_runner = CuteDSLFp8RubinBmmRunner()
+    for tactic in tactics:
+        bf16_output.fill_(float("nan"))
+        bf16_runner([a_fp8, b_fp8, a_scales, b_scales, bf16_output],
+                    tactic=tactic)
+        ref_fp8, ref_scale = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(
+            bf16_output.permute(1, 0, 2).reshape(m, flat_n))
+        # 0xFF is NaN in both E4M3 and UE8M0.
+        fused_fp8.view(torch.uint8).fill_(0xFF)
+        fused_scale.fill_(0xFF)
+        runner(inputs, tactic=tactic)
+        torch.cuda.synchronize()
+
+        _assert_valid_fp8_bmm_quant_scales_equal(fused_scale, ref_scale, m,
+                                                 flat_n)
+        torch.testing.assert_close(fused_fp8.float(),
+                                   ref_fp8.float(),
+                                   rtol=0.0,
+                                   atol=1.0 / 16.0,
+                                   msg=lambda msg: f"{tactic}: {msg}")
 
 
 @pytest.mark.skipif(

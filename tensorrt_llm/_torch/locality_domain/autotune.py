@@ -67,6 +67,9 @@ class LocalityDomainConcurrentTunableRunner(TunableRunner):
             self._runtime.topology_identity(),
         )
 
+    def tactic_space_key(self) -> tuple[Any, ...] | None:
+        return self._op_runner.tactic_space_key()
+
     def get_valid_tactics(
         self,
         inputs: list[torch.Tensor],
