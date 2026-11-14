@@ -3093,17 +3093,21 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
         raise click.UsageError(
             f"TRTLLM_DISAGG_SHARED_DRAFT_KV=1 requires {blocker}.")
     shared_draft_kv = os.environ.get("TRTLLM_DISAGG_SHARED_DRAFT_KV")
-    # Left unset, a manager hosting draft layers shares across attention TP
-    # (its gate compares global KV heads and the peers reshard its views),
-    # while other managers keep a separate draft KV cache.
-    attention_tp_only = (
-        blocker == _ATTENTION_TP_MISMATCH
-        and {cfg.type
-             for cfg in disagg_cfg.server_configs} == {"ctx", "gen"}
-        and _shared_draft_kv_blocker(disagg_cfg.server_configs,
-                                     check_attention_tp=False) is None)
+    # Left unset, each worker decides: a manager hosting draft layers shares
+    # (its gate compares global KV heads and the peers reshard its views), and
+    # other managers keep a separate draft KV cache. That holds when the sides
+    # differ only in attention TP, and for a one-sided config, whose other side
+    # is launched separately and decides the same way.
+    sides = {cfg.type for cfg in disagg_cfg.server_configs}
+    attention_tp_only = (blocker == _ATTENTION_TP_MISMATCH
+                         and sides == {"ctx", "gen"}
+                         and _shared_draft_kv_blocker(
+                             disagg_cfg.server_configs,
+                             check_attention_tp=False) is None)
+    one_sided = blocker is None and sides != {"ctx", "gen"}
     if shared_draft_kv == "auto" or (shared_draft_kv is None
-                                     and not attention_tp_only):
+                                     and not attention_tp_only
+                                     and not one_sided):
         resolved = _shared_draft_kv_default(disagg_cfg.server_configs, blocker)
         os.environ["TRTLLM_DISAGG_SHARED_DRAFT_KV"] = resolved
         if blocker is not None:
@@ -3120,11 +3124,14 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
             f"TRTLLM_DISAGG_SHARED_DRAFT_KV unset or 'auto' resolved to "
             f"'{resolved}': {reason}.")
     elif shared_draft_kv is None:
+        why = ("the sections differ only in attention tensor parallelism"
+               if attention_tp_only else
+               "the configuration lists only context or only generation "
+               "servers")
         logger.info(
-            "TRTLLM_DISAGG_SHARED_DRAFT_KV left unset: the sections differ only "
-            "in attention tensor parallelism, so a manager hosting draft layers "
-            "shares draft KV and other managers keep a separate draft KV cache."
-        )
+            f"TRTLLM_DISAGG_SHARED_DRAFT_KV left unset: {why}, so a manager "
+            "hosting draft layers shares draft KV and other managers keep a "
+            "separate draft KV cache.")
 
     # Run a server with the underlying LLM invokes a RemoteMPISessionClient
     if os.environ.get(DisaggLauncherEnvs.

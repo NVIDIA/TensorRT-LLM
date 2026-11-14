@@ -316,7 +316,10 @@ class _StopLauncher(Exception):
 
 
 def _launch_from_disagg_config(monkeypatch, tmp_path, context_servers, generation_servers):
-    """Run the real disaggregated_mpi_worker up to the rank-communicator split."""
+    """Run the real disaggregated_mpi_worker up to the rank-communicator split.
+
+    ``generation_servers=None`` writes a context-only config (no generation instances).
+    """
     from tensorrt_llm.commands import serve
 
     config = tmp_path / "disagg.yaml"
@@ -324,7 +327,11 @@ def _launch_from_disagg_config(monkeypatch, tmp_path, context_servers, generatio
         yaml.safe_dump(
             {
                 "context_servers": {"num_instances": 1, **context_servers},
-                "generation_servers": {"num_instances": 1, **generation_servers},
+                "generation_servers": (
+                    {"num_instances": 0}
+                    if generation_servers is None
+                    else {"num_instances": 1, **generation_servers}
+                ),
             }
         )
     )
@@ -803,6 +810,26 @@ def test_launcher_leaves_equal_page_sizes_to_the_worker_gates(
         creator._tokens_per_block = context_tokens_per_block
         assert "tokens_per_block=128" in creator._dflash_unify_blocker()
         assert not creator._should_unify_dflash_kv_cache()
+
+
+@pytest.mark.parametrize("request_mode", [None, "auto"], ids=["unset", "auto"])
+def test_launcher_leaves_a_one_sided_config_to_the_worker_gates(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, request_mode: str | None
+) -> None:
+    """A context-only config (a DWDP context world) cannot see how generation is launched.
+
+    Unset, the switch stays unset so each worker decides as a separately launched generation
+    worker does; "auto" still resolves to "0".
+    """
+    if request_mode is None:
+        monkeypatch.delenv(_SHARED_DRAFT_KV_ENV, raising=False)
+    else:
+        monkeypatch.setenv(_SHARED_DRAFT_KV_ENV, request_mode)
+    spec = {"decoding_type": "DSpark", "attention_backend": "TRTLLM"}
+    with pytest.raises(_StopLauncher):
+        _launch_from_disagg_config(monkeypatch, tmp_path, {"speculative_config": spec}, None)
+
+    assert os.environ.get(_SHARED_DRAFT_KV_ENV) == ("0" if request_mode else None)
 
 
 @pytest.mark.parametrize("request_mode", [None, "auto"], ids=["unset", "auto"])
