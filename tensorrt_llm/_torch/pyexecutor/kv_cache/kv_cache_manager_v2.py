@@ -8258,25 +8258,42 @@ class KVCacheManagerV2(BaseResourceManager):
         )
 
     def get_block_ids_per_seq(self, request_ids: List[int]) -> torch.Tensor:
+        """Pool-0 block IDs per request as a zero-padded int32 tensor.
+
+        Must match the rows of ``get_batch_cache_indices(request_ids)`` (raw
+        indices when ``layer_specs`` is set), with ``BAD_PAGE_INDEX`` read as
+        0. Without ``layer_specs`` the rows are also divided by the local layer
+        count, unless ``kv_factor`` does not divide pool 0's index scale. A
+        subclass that overrides that conversion must override this method too.
+
+        Args:
+            request_ids: Requests to read, one output row each.
+
+        Returns:
+            A ``[len(request_ids), max_num_blocks]`` CPU int32 tensor, pinned
+            when supported.
+        """
         if self.layer_specs is not None:
-            block_ids_per_seq = self.get_batch_cache_indices(request_ids, raw_indices=True)
-            div_factor = 1
+            index_scale, page_stride, layer_div = 1, 1, 1
         else:
-            block_ids_per_seq = self.get_batch_cache_indices(request_ids)
-            div_factor = self.num_local_layers
-            if self.kv_factor > 1 and self._index_scale_ints[0] % self.kv_factor != 0:
-                div_factor = 1
-        block_ids_per_seq_tensors = [
-            torch.tensor(
-                [i // div_factor if i != BAD_PAGE_INDEX else 0 for i in sublist],
-                dtype=torch.int,
-            )
-            for sublist in block_ids_per_seq
-        ]
-        padded_tensor = torch.nn.utils.rnn.pad_sequence(
-            block_ids_per_seq_tensors, batch_first=True, padding_value=0
+            index_scale, page_stride = self._default_pool_index_conversion()
+            layer_div = self.num_local_layers
+            if self.kv_factor > 1 and index_scale % self.kv_factor != 0:
+                layer_div = 1
+        num_blocks = [self.kv_cache_map[req_id].num_blocks for req_id in request_ids]
+        block_ids_tensor = torch.zeros(
+            (len(request_ids), max(num_blocks, default=0)),
+            dtype=torch.int32,
+            pin_memory=prefer_pinned(),
         )
-        return padded_tensor
+        block_ids = block_ids_tensor.numpy()
+        for row, indices in enumerate(self._gather_base_page_indices(request_ids, num_blocks, 0)):
+            block_ids[row, : len(indices)] = indices
+        block_ids[block_ids == BAD_PAGE_INDEX] = 0
+        if (index_scale, page_stride, layer_div) != (1, 1, 1):
+            # int64 so the multiply cannot overflow int32 before the divides.
+            block_ids[:] = block_ids.astype(np.int64) * index_scale // page_stride // layer_div
+        return block_ids_tensor
 
     def add_dummy_requests(
         self,
@@ -8666,6 +8683,37 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         return kv_factor if index_scale % kv_factor == 0 else index_scale
 
+    def _default_pool_index_conversion(self) -> Tuple[int, int]:
+        """Return pool 0's ``(index_scale, page_stride)`` for its KEY representative.
+
+        This is the conversion ``get_batch_cache_indices()`` applies when no
+        layer is given.
+        """
+        kv_factor = (
+            self._get_layer_kv_factor_by_local_id(self._pool_layer_ids_by_role[(0, Role.KEY)])
+            if self.layer_specs is not None
+            else self.kv_factor
+        )
+        index_scale = self._index_scale_ints[0]
+        return index_scale, self._get_cache_view_page_stride(index_scale, kv_factor)
+
+    def _gather_base_page_indices(
+        self, request_ids: List[int], num_blocks: List[int], pool_id: int
+    ) -> List[np.ndarray]:
+        """Return each request's first ``num_blocks[i]`` base page indices.
+
+        The arrays are read-only views of the caches' own int32 page-index
+        buffers; copy them before the caches change.
+        """
+        return [
+            np.frombuffer(
+                self.kv_cache_map[req_id].get_base_page_indices(pool_id),
+                dtype=np.int32,
+                count=n,
+            )
+            for req_id, n in zip(request_ids, num_blocks)
+        ]
+
     def get_batch_cache_indices(
         self,
         request_ids: List[int],
@@ -8764,12 +8812,7 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         if layer_idx is None:
             pool_id = 0
-            scale = self._index_scale_ints[pool_id]
-            kv_factor = (
-                self._get_layer_kv_factor_by_local_id(self._pool_layer_ids_by_role[(0, Role.KEY)])
-                if self.layer_specs is not None
-                else self.kv_factor
-            )
+            scale, div_factor = self._default_pool_index_conversion()
         else:
             pool_id = self._get_layer_execution_group(self.layer_offsets[layer_idx])
             # Layers sharing a pool can still require different page-index
@@ -8778,18 +8821,14 @@ class KVCacheManagerV2(BaseResourceManager):
             # and never feeds out-of-range page ids to FlashInfer.
             scale = self.get_layer_page_index_scale(layer_idx)
             kv_factor = self.get_layer_kv_factor(layer_idx)
-        div_factor = self._get_cache_view_page_stride(scale, kv_factor)
+            div_factor = self._get_cache_view_page_stride(scale, kv_factor)
 
         out_tensor = torch.empty(sum(num_blocks), dtype=torch.int32, pin_memory=prefer_pinned())
         out = out_tensor.numpy()
         offset = 0
-        for req_id, n in zip(request_ids, num_blocks):
-            out[offset : offset + n] = np.frombuffer(
-                self.kv_cache_map[req_id].get_base_page_indices(pool_id),
-                dtype=np.int32,
-                count=n,
-            )
-            offset += n
+        for indices in self._gather_base_page_indices(request_ids, num_blocks, pool_id):
+            out[offset : offset + len(indices)] = indices
+            offset += len(indices)
 
         # One batched transform over the real widths; BAD_PAGE_INDEX entries
         # (e.g. evicted out-of-window SWA blocks) stay untouched, matching
