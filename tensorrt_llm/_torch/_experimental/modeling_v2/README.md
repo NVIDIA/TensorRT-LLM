@@ -157,7 +157,9 @@ example that uses no Modeling V1 model code.
    for switches to it as soon as the target lands. To keep a target opt-in
    until it is validated, decorate its class with `@disable_v2_by_default`
    (from `tensorrt_llm._torch._experimental.modeling_v2`). Deployments then use
-   it only when they set `modeling_v2` to `auto` or `require` explicitly.
+   it only when they set `modeling_v2` to `auto` or `require` explicitly. A
+   target that implements expert load balancing lists its modes in
+   `EPLB_MODES`; see [Routing](#routing).
 4. Use catalog operations where they fit. Add new operations as `OpWrapper`s
    with tests. See [Writing operations](#writing-operations).
 5. For C++/CUDA code, follow the [native code guide](../../../../cpp/tensorrt_llm/modeling_v2/README.md).
@@ -206,6 +208,17 @@ batch composition or prefill versus decode are handled inside the target.
 Check in `route` every requirement the target has, not only in the target's
 constructor. A configuration that `route` declines falls back to Modeling V1
 under `auto`; one that the constructor rejects with an assertion fails.
+
+Expert load balancing (EPLB) is checked for every target. When a deployment
+runs EPLB (`moe_config.load_balancer` is set, the architecture is in
+`moe_model_arch_list` and the experts are split over more than one EP rank),
+the loader creates the load balancer whichever class it builds, but only a
+target that registers its MoE layers with it balances anything. After `route`
+returns a target, the resolver compares the deployment's EPLB mode (`static`,
+`online` or `per_layer_dynamic`) with the target class's `EPLB_MODES` and
+treats a target that does not list it as `NoTarget`: `auto` keeps Modeling V1
+for that deployment and `require` raises with the reason. `EPLB_MODES` is empty
+unless the target sets it.
 
 How the model loader resolves a target:
 
