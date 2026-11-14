@@ -245,8 +245,8 @@ During decode, it scores retained pages and attends to the selected Top-K
 pages.
 
 RocketKV currently requires CUDA compute capability 10.0 or newer. KV-cache
-block reuse and chunked prefill must be disabled, and disaggregated serving is
-not supported.
+block reuse and chunked prefill must be disabled. Speculative decoding,
+disaggregated serving, KV-cache compression, and beam search are not supported.
 
 ```python
 from tensorrt_llm import LLM, SamplingParams
@@ -279,6 +279,17 @@ enable_chunked_prefill: false
 
 The TRTLLM and Vanilla attention implementations support RocketKV. The
 Vanilla implementation requires a BF16 KT cache.
+
+RocketKV follows `kv_cache_config.use_kv_cache_manager_v2`. With the V2 KV
+cache manager (the default), each KV cache block also stores the KT rows of its
+request, so the KV cache memory budget covers the KT cache. The V2 manager has
+these additional restrictions:
+
+- Sleep mode (`sleep_config`) is not supported; it requires the V1 manager
+  (`kv_cache_config.use_kv_cache_manager_v2: false`).
+- `kv_cache_config.enable_swa_scratch_reuse` must be disabled.
+- Every attention layer must have the same number of KV heads and the same head
+  size on each rank, and all layers must share one attention window.
 
 #### DeepSeek Sparse Attention
 

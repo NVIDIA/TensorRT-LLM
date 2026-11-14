@@ -239,6 +239,9 @@ def test_update_resources_leaves_history_untouched_under_helix() -> None:
         # No lender attached, so a resize has no one to tell.
         _sharing=None,
     )
+    mgr._generation_history_length = lambda request: (
+        KVCacheManagerV2._generation_history_length(mgr, request)
+    )
     batch = SimpleNamespace(generation_requests=[req])
     KVCacheManagerV2.update_resources(mgr, batch)
     assert resizes == [(100, None)]

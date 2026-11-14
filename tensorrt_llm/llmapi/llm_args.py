@@ -7958,6 +7958,32 @@ class TorchLlmArgs(BaseLlmArgs):
         return self
 
     @model_validator(mode="after")
+    def validate_rocket_sparse_attention(self) -> 'TorchLlmArgs':
+        """Reject runtime features that RocketKV sparse attention does not support."""
+        if not isinstance(self.sparse_attention_config,
+                          RocketSparseAttentionConfig):
+            return self
+        unsupported = []
+        if self.enable_chunked_prefill:
+            unsupported.append("enable_chunked_prefill")
+        if self.speculative_config is not None:
+            unsupported.append("speculative_config")
+        if (self.cache_transceiver_config is not None
+                and self.cache_transceiver_config.backend is not None):
+            unsupported.append(
+                "cache_transceiver_config (disaggregated serving)")
+        if self.kv_cache_compression_config is not None:
+            unsupported.append("kv_cache_compression_config")
+        if self.kv_cache_config.enable_swa_scratch_reuse:
+            unsupported.append("kv_cache_config.enable_swa_scratch_reuse")
+        if self.max_beam_width is not None and self.max_beam_width > 1:
+            unsupported.append("max_beam_width > 1 (beam search)")
+        if unsupported:
+            raise ValueError("RocketKV sparse attention does not support " +
+                             ", ".join(unsupported) + ".")
+        return self
+
+    @model_validator(mode="after")
     def normalize_disabled_mm_encoder_cache(self) -> 'TorchLlmArgs':
         if (self.disable_mm_encoder
                 and self.multimodal_config.encoder_cache_max_bytes != 0):

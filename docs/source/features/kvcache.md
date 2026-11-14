@@ -77,7 +77,7 @@ scheduler_config:
 ### Selecting the KV Cache Manager
 
 ```{warning}
-KV cache manager V1 (`use_kv_cache_manager_v2: false`, or `auto` when it resolves to V1) is deprecated as of TensorRT-LLM 1.4 (2026-11) and will be removed after the 3-month migration period. Use KV cache manager V2, the default, for supported features. Sleep mode (`sleep_config`), RocketKV, and skip-softmax still require V1 until V2 support is available; keep V1 for these features during migration.
+KV cache manager V1 (`use_kv_cache_manager_v2: false`, or `auto` when it resolves to V1) is deprecated as of TensorRT-LLM 1.4 (2026-11) and will be removed after the 3-month migration period. Use KV cache manager V2, the default, for supported features. Sleep mode (`sleep_config`) and skip-softmax still require V1 until V2 support is available; keep V1 for these features during migration.
 ```
 
 TensorRT LLM ships two KV cache manager implementations. `use_kv_cache_manager_v2`
@@ -98,9 +98,18 @@ Models whose preference selects the V2 manager when the setting is `auto`:
 | Gemma3 / Gemma4 (text and multimodal) | Alternating sliding-window and full-attention layers (VSWA); same independent pool sizing |
 | Llama / Llama4 | Uniform KV pool layout; chunked attention does not partition the pools |
 
-Separately, Gemma4 hybrid attention and sparse-attention models are routed to
-V2 unconditionally: their per-layer buffer layouts cannot be represented by V1's
-unified pool, so `use_kv_cache_manager_v2` does not apply to them.
+Separately, Gemma4 hybrid attention models are routed to V2 unconditionally:
+their layers have different head sizes, which V1's unified pool cannot
+represent, so `use_kv_cache_manager_v2` does not apply to them. Sparse attention
+algorithms select their KV cache manager per algorithm:
+
+| Algorithm | KV cache manager |
+| --- | --- |
+| DeepSeek-V4, MiniMax-M3, CSA2 | The algorithm's V2 manager, whatever the setting |
+| QSA | The algorithm's V2 hybrid manager; the setting must select V2 |
+| DSA | Follows the setting (`DSACacheManagerV2` or `DSACacheManager`) |
+| RocketKV | Follows the setting (`RocketKVCacheManagerV2` or `RocketKVCacheManager`) |
+| Skip Softmax Attention | The V1 manager, whatever the setting |
 
 For a model whose `layer_types` mixes sliding-window and full-attention layers
 and that publishes a single `sliding_window` (GPT-OSS, Gemma3), the V2 manager

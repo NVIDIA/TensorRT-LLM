@@ -422,6 +422,31 @@ def test_sleep_rejects_v2_only_block_reuse_config(block_reuse_config):
         )
 
 
+@pytest.mark.parametrize(
+    "algorithm,has_v1_manager",
+    [
+        ("rocket", True),
+        # MiniMax-M3 only has a V2 manager.
+        ("minimax_m3", False),
+    ],
+)
+def test_sparse_sleep_error_names_the_v1_manager(algorithm: str, has_v1_manager: bool) -> None:
+    creator = object.__new__(KvCacheCreator)
+    creator._max_beam_width = 1
+    creator._llm_args = SimpleNamespace(sleep_config=SleepConfig())
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
+        sparse_attention_config=SimpleNamespace(algorithm=algorithm),
+    )
+
+    with pytest.raises(NotImplementedError, match="SleepConfig") as exc_info:
+        creator._validate_or_fallback_kv_cache_manager_v2(
+            KVCacheManagerV2, model_config, KvCacheConfig()
+        )
+
+    assert ("use_kv_cache_manager_v2=False" in str(exc_info.value)) is has_v1_manager
+
+
 @pytest.mark.parametrize("max_beam_width", [None, 1, 2, 4])
 def test_v2_incompatible_features_allow_beam_search(max_beam_width: int | None) -> None:
     assert kv_cache_manager_v2_incompatible_features(max_beam_width) == []
