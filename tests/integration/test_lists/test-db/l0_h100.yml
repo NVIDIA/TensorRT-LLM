@@ -17,6 +17,7 @@ l0_h100:
       orchestrator: mpi
   tests:
   - unittest/_torch/moe/test_moe_backend.py::test_cutlass_moe_routing_round_trip
+  - unittest/_torch/moe/test_moe_backend.py::test_cutlass_moe_finalize_aligned_matches_offset
   - unittest/_torch/moe/test_moe_backend.py::test_cutlass_moe_public_activation_ids
   - unittest/_torch/moe/test_moe_backend.py::test_cutlass_fp8_block_scales_skewed_routing
   # Covers the GPU cases of tests/unittest/_torch/attention/ on H100; its cpu_only cases

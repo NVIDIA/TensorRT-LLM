@@ -217,6 +217,100 @@ def test_cutlass_moe_routing_round_trip(dtype: torch.dtype) -> None:
     torch.testing.assert_close(restored, x, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("enable_alltoall", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_cutlass_moe_finalize_aligned_matches_offset(
+    dtype: torch.dtype, enable_alltoall: bool
+) -> None:
+    """The non-fused finalize gives the same bits for a 16-byte aligned GEMM output, which takes the
+    warp kernel on SM100/SM103, and for one 4 bytes off, which takes the block-per-row kernels.
+
+    Top-8 of 64 experts under EP 8 with router scales and a bias. With all-to-all, rows of tokens
+    without an expert on this rank are not written, so only the other rows are compared.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUTLASS MoE finalize requires CUDA")
+    torch.manual_seed(29)
+    num_tokens, hidden_size, top_k, num_experts, ep_size, ep_rank = 513, 2048, 8, 64, 8, 3
+    num_experts_per_node = num_experts // ep_size
+    start_expert = num_experts_per_node * ep_rank
+    selected = torch.stack(
+        [torch.randperm(num_experts, device="cuda")[:top_k] for _ in range(num_tokens)]
+    ).to(torch.int32)
+    scales = torch.rand(num_tokens, top_k, device="cuda", dtype=torch.float32) * 2 - 0.5
+    x = torch.randn(num_tokens, hidden_size, device="cuda", dtype=dtype)
+    unused_weights = torch.empty(num_experts_per_node, 1, 1, device="cuda", dtype=dtype)
+    p2u, _, _, offsets, _, u2p = torch.ops.trtllm.moe_permute_op(
+        x,
+        selected,
+        scales,
+        unused_weights,
+        unused_weights,
+        None,
+        None,
+        num_experts_per_node,
+        1,
+        0,
+        ep_size,
+        ep_rank,
+        1,
+        0,
+        False,
+        False,
+        False,
+    )
+    gemm2_output = torch.randn(num_tokens * top_k, hidden_size, device="cuda", dtype=dtype)
+    bias = torch.randn(num_experts_per_node, hidden_size, device="cuda", dtype=dtype)
+    # The same values 4 bytes past a 16-byte boundary.
+    shift = 4 // gemm2_output.element_size()
+    storage = torch.empty(gemm2_output.numel() + shift, device="cuda", dtype=dtype)
+    gemm2_output_offset = storage[shift:].view_as(gemm2_output)
+    gemm2_output_offset.copy_(gemm2_output)
+
+    def finalize(gemm2: torch.Tensor) -> torch.Tensor:
+        return torch.ops.trtllm.moe_finalize_scale_op(
+            gemm2,
+            bias,
+            scales,
+            u2p,
+            p2u,
+            selected,
+            offsets,
+            enable_alltoall,
+            num_tokens,
+            hidden_size,
+            hidden_size,
+            top_k,
+            num_experts_per_node,
+            1,
+            0,
+            ep_size,
+            ep_rank,
+        )
+
+    aligned = finalize(gemm2_output)
+    offset = finalize(gemm2_output_offset)
+    local = (selected >= start_expert) & (selected < start_expert + num_experts_per_node)
+    rows = local.any(dim=1) if enable_alltoall else torch.ones_like(local[:, 0])
+    assert torch.equal(
+        aligned[rows].view(torch.int16 if dtype != torch.float32 else torch.int32),
+        offset[rows].view(torch.int16 if dtype != torch.float32 else torch.int32),
+    )
+
+    expected = torch.zeros(num_tokens, hidden_size, device="cuda", dtype=torch.float32)
+    for k in range(top_k):
+        is_local = local[:, k]
+        permuted = u2p[k * num_tokens : (k + 1) * num_tokens].long()
+        expert = (selected[:, k] - start_expert).clamp(0, num_experts_per_node - 1).long()
+        term = scales[:, k : k + 1] * (
+            gemm2_output[permuted.clamp(0, num_tokens * top_k - 1)].float() + bias[expert].float()
+        )
+        expected += torch.where(is_local[:, None], term, torch.zeros_like(term))
+    # The kernel accumulates in FP32 with FMAs, the reference with separate products and sums.
+    atol, rtol = (1e-4, 1e-4) if dtype == torch.float32 else (5e-2, 2e-2)
+    torch.testing.assert_close(aligned[rows].float(), expected[rows], atol=atol, rtol=rtol)
+
+
 @pytest.mark.parametrize(
     "activation_type,clamp_limit,alpha_only,capture_first",
     [
