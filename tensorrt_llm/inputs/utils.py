@@ -4,6 +4,7 @@
 import asyncio
 import base64
 from collections import defaultdict
+from functools import partial
 from io import BytesIO
 from pathlib import Path
 from typing import (Any, Collection, Coroutine, Dict, List, NamedTuple,
@@ -625,6 +626,24 @@ def _has_python_chat_template(tokenizer: PreTrainedTokenizerBase) -> bool:
             is not PreTrainedTokenizerBase.apply_chat_template)
 
 
+def uses_tokenizer_native_renderer(tokenizer: Union[TransformersTokenizer,
+                                                    TokenizerBase],
+                                   processor: ProcessorMixin,
+                                   chat_template: Optional[str]) -> bool:
+    """Whether `apply_chat_template` renders with the tokenizer's own renderer.
+
+    It does when no Jinja template is declared anywhere (the call, the
+    processor or the tokenizer) and the tokenizer overrides
+    `apply_chat_template` in Python, as the kimi_k3 checkpoint tokenizer does.
+    """
+    if isinstance(tokenizer, TransformersTokenizer):
+        tokenizer = tokenizer.tokenizer
+    return (chat_template is None
+            and getattr(processor, "chat_template", None) is None
+            and getattr(tokenizer, "chat_template", None) is None
+            and _has_python_chat_template(tokenizer))
+
+
 def resolve_hf_chat_template(
     tokenizer: TokenizerBase,
     processor: ProcessorMixin,
@@ -694,10 +713,7 @@ def _resolve_render_dispatch(
     if isinstance(tokenizer, TransformersTokenizer):
         # The TokenizerBase renders the template.
         tokenizer = tokenizer.tokenizer
-    if (chat_template is None
-            and getattr(processor, "chat_template", None) is None
-            and getattr(tokenizer, "chat_template", None) is None
-            and _has_python_chat_template(tokenizer)):
+    if uses_tokenizer_native_renderer(tokenizer, processor, chat_template):
         return _RenderDispatch("native", tokenizer)
     return _RenderDispatch(
         "jinja", tokenizer,
@@ -888,7 +904,17 @@ def apply_chat_template(
                                                         mm_placeholder_count)
     # STRING path: placeholders already inserted in content by caller
 
-    result = tokenizer.apply_chat_template(
+    template_renderer = tokenizer.apply_chat_template
+    if (model_type in ("kimi_k3", "kimi_linear")
+            and isinstance(tokenizer, PreTrainedTokenizerBase)
+            and callable(getattr(tokenizer, "_encode_chat_segments", None))):
+        # Kimi-K3's segment renderer (also used by its kimi_linear text model)
+        # ignores Jinja templates. Other overrides, e.g. Kimi-K2.5's, delegate
+        # to Jinja after preprocessing tools and must remain in the call path.
+        template_renderer = partial(PreTrainedTokenizerBase.apply_chat_template,
+                                    tokenizer)
+
+    result = template_renderer(
         conversation=conversation,
         tokenize=enable_tokenize,
         return_dict=False,

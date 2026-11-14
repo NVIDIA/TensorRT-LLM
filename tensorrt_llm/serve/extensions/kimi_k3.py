@@ -141,7 +141,7 @@ def validate_kimi_dynamic_tools(request: ChatCompletionRequest) -> None:
 class KimiK3ServingExtension(ServingExtension):
     """Kimi/Moonshot API semantics for kimi_k3 chat requests."""
 
-    render_version = 2
+    render_version = 3
 
     # Trailing tokens of the native K3 generation prompt (the channel opener
     # ``<|open|>think|response<|sep|>``) that are not reported as prompt usage.
