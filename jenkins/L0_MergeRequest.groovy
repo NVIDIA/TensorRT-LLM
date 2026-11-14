@@ -218,9 +218,9 @@ def getContainerURIs()
 {
     // available tags can be found in: https://artifactory.nvidia.com/artifactory/sw-tensorrt-llm-docker-local/tensorrt-llm/
     // [base_image_name]-[arch]-[os](-[python_version])-[trt_version]-[torch_install_type]-[stage]-[date]-[mr_id]
-    tagProps = readProperties file: "${LLM_ROOT}/jenkins/current_image_tags.properties", interpolate: true
-    uris = [:]
-    keys = [
+    def tagProps = readProperties file: "${LLM_ROOT}/jenkins/current_image_tags.properties", interpolate: true
+    def uris = [:]
+    def keys = [
         "LLM_DOCKER_IMAGE",
         "LLM_SBSA_DOCKER_IMAGE",
         "LLM_SBSA_WHEEL_DOCKER_IMAGE",
@@ -258,7 +258,7 @@ def trimForStageList(stageNameList)
     if (stageNameList == null) {
         return null
     }
-    trimedList = []
+    def trimedList = []
     stageNameList.each { stageName ->
         trimedList.add(stageName.trim().replaceAll('\\\\', ''))
     }
@@ -665,9 +665,9 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
         env.gitlabCommit = env.gitlabMergeRequestLastCommit
         trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
     } else {
-        branch = env.gitlabBranch ? env.gitlabBranch : "main"
+        def branch = env.gitlabBranch ? env.gitlabBranch : "main"
         trtllm_utils.checkoutSource(LLM_REPO, branch, LLM_ROOT, true, true)
-        checkoutCommit = sh (script: "cd ${LLM_ROOT} && git rev-parse HEAD",returnStdout: true).trim()
+        def checkoutCommit = sh (script: "cd ${LLM_ROOT} && git rev-parse HEAD",returnStdout: true).trim()
         env.gitlabCommit = checkoutCommit
     }
     if (params.program_version_name) {
@@ -769,8 +769,8 @@ def mergeWaiveList(pipeline, globalVars)
     sh "cp ${LLM_ROOT}/jenkins/scripts/mergeWaiveList.py ./"
 
     // Get TOT waive list
-    LLM_TOT_ROOT = "llm-tot"
-    targetBranch = env.gitlabTargetBranch ? env.gitlabTargetBranch : globalVars[TARGET_BRANCH]
+    def LLM_TOT_ROOT = "llm-tot"
+    def targetBranch = env.gitlabTargetBranch ? env.gitlabTargetBranch : globalVars[TARGET_BRANCH]
     echo "Target branch: ${targetBranch}"
 
     def targetBranchTOTCommit = ""
@@ -889,8 +889,8 @@ def getMaintenanceStageList(pipeline, globalVars, Map targetBranchInfo)
 
 def preparation(pipeline, testFilter, globalVars)
 {
-    image = "artifactory.pdx.nvidia.com/docker-remote/buildpack-deps:trixie-scm"
-    setupPipelineSpec = createKubernetesPodConfig(image, "package")
+    def image = "artifactory.pdx.nvidia.com/docker-remote/buildpack-deps:trixie-scm"
+    def setupPipelineSpec = createKubernetesPodConfig(image, "package")
     trtllm_utils.launchKubernetesPod(pipeline, setupPipelineSpec, "trt-llm", {
         def targetBranchInfo = [:]
         stage("Setup Environment") {
@@ -958,7 +958,7 @@ def preparation(pipeline, testFilter, globalVars)
 
 def launchReleaseCheck(pipeline, globalVars)
 {
-    stages = {
+    def stages = {
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y python3-pip")
         sh "pip3 config set global.break-system-packages true"
         sh "git config --global --add safe.directory \"*\""
@@ -972,7 +972,7 @@ def launchReleaseCheck(pipeline, globalVars)
             trtllm_utils.checkoutSource(SCAN_REPO, SCAN_COMMIT, SCAN_ROOT, false, true)
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${SCAN_ROOT} && pip3 install -e .")
             try {
-                ignoreList = [
+                def ignoreList = [
                     "*/.git/*",
                     "*/3rdparty/*",
                     "*/cpp/tensorrt_llm/deep_ep/nvshmem_src_*.txz",
@@ -1044,7 +1044,7 @@ def launchReleaseCheck(pipeline, globalVars)
     }
 
     def image = "artifactory.pdx.nvidia.com/docker-remote/golang:1.23"
-    stageName = "Release-Check"
+    def stageName = "Release-Check"
     trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(image, "package"), "trt-llm", {
         stage("[${stageName}] Run") {
             if (RELEASE_CHECK_CHOICE == STAGE_CHOICE_SKIP) {
@@ -2374,7 +2374,7 @@ def uploadArchCoverage(String arch, pipeline, testFilter) {
 
 def collectTestResults(pipeline, testFilter, globalVars)
 {
-    collectResultPodSpec = createKubernetesPodConfig("", "agent")
+    def collectResultPodSpec = createKubernetesPodConfig("", "agent")
     trtllm_utils.launchKubernetesPod(pipeline, collectResultPodSpec, "alpine", {
         // 1. Serial: download tarballs, extract, and run junit
         stage ("Collect Test Result") {
@@ -2744,6 +2744,7 @@ def launchJob(pipeline, jobName, reuseBuild, enableFailFast, globalVars, additio
         jobName = jobName.substring(1)
     } else {
         def pos = env.JOB_NAME.lastIndexOf("/")
+        def jobDir
         if (pos != -1) {
             jobDir = env.JOB_NAME.substring(0, pos + 1)
         } else {
@@ -2796,7 +2797,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
     def containerSelected = releaseTargets.contains("container")
     def buildAllDockerImages = false
     def runContainerScanning = false
-    stages = [
+    def stages = [
         "Release-Check": {
             script {
                 if (testFilter[INFRA_DRY_RUN]) {
@@ -3500,7 +3501,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
     }
 
     def alwaysFailFastStages = ["Release-Check", "Check-Test-List"] as Set
-    parallelJobs = stages.collectEntries{key, value -> [key, {
+    def parallelJobs = stages.collectEntries{key, value -> [key, {
         script {
             stage(key) {
                 if (enableFailFast || key in alwaysFailFastStages) {
