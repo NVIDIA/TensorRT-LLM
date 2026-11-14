@@ -5,7 +5,7 @@ description = ""
 authors = [
     {name = "TensorRT LLM [90828364+tensorrt-cicd@users.noreply.github.com]"}
 ]
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.12,<3.13"
 dependencies = [
     "python-dateutil (<3.0.0)",
     "datasets (==3.1.0)",
