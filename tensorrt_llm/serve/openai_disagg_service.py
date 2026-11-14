@@ -342,9 +342,10 @@ class OpenAIDisaggregatedService(OpenAIService):
         else:
             # When need_ctx=False the gen server handles full generation and
             # must not see client-supplied disaggregated handoff params. The
-            # benchmark-only path above is the only trusted source here.
-            if not benchmark_gen_only:
-                gen_req = request.model_copy(update={"disaggregated_params": None})
+            # benchmark-only path above is the only trusted source here. Keep
+            # the same request object for the local router's reservation.
+            if not benchmark_gen_only and request.disaggregated_params is not None:
+                request.disaggregated_params = None
         self._strip_gen_subagent_affinity(gen_req)
         if ctx_response is None or self._need_gen(ctx_response):
             if not gen_server:
