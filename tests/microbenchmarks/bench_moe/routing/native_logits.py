@@ -45,7 +45,10 @@ _NATIVE_PROJECTION_CAPABILITIES: Dict[str, str] = {
     "SigmoidRenormMoeRoutingMethod": "exact_ids",
     "Llama4RenormalizeMoeRoutingMethod": "top1_exact",
     "MiniMaxM2MoeRoutingMethod": "exact_with_zero_bias",
+    "MiniMaxM3MoeRoutingMethod": "exact_ids",
+    "MuseSparkOpenRoutingMethod": "exact_ids",
     "DeepSeekV3MoeRoutingMethod": "projected_or_exact",
+    "DeepSeekV4MoeRoutingMethod": "exact_ids",
     "SparseMixerMoeRoutingMethod": "unsupported",
 }
 

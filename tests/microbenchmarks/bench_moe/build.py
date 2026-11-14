@@ -25,7 +25,7 @@ small set of introspection helpers (``actual_backend`` / ``scheduler_kind``
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import torch
 
@@ -34,6 +34,7 @@ from tensorrt_llm._torch.moe.fused_moe.activation import (
     MoEActivation,
     SimpleActivation,
     SiTuActivation,
+    SwigluActivation,
     SwigluBiasActivation,
 )
 from tensorrt_llm._torch.moe.fused_moe.impl_environment import MoEEnvFlag, collect_moe_environment
@@ -86,7 +87,7 @@ def _comm_method_name(moe) -> str:
 
 
 def _epilogue_activation_name(moe) -> str:
-    """Return the epilogue the built module actually runs: ``"situ"`` or ``"swiglu"``.
+    """Return the resolved epilogue kind, including SiTU and custom SwiGLU.
 
     The SiTU request can be dropped for reasons the spec cannot see (wrong
     backend, wrong quant, upstream fallback), so read it back rather than
@@ -100,6 +101,8 @@ def _epilogue_activation_name(moe) -> str:
     activation_type = getattr(backend, "activation_type", None)
     if activation_type is not None and ActivationType(activation_type) == ActivationType.SiTu:
         return "situ"
+    if activation_type is not None and ActivationType(activation_type) == ActivationType.SwigluBias:
+        return "swiglu_bias"
     return "swiglu"
 
 
@@ -235,6 +238,107 @@ class _UnfusedSharedMoE(torch.nn.Module):
         return routed + shared
 
 
+class _OutputScaledMoE(torch.nn.Module):
+    """Apply checkpoint routed scaling after expert aggregation and reduction."""
+
+    def __init__(self, moe: torch.nn.Module, scale: float):
+        super().__init__()
+        self.moe = moe
+        self.scale = float(scale)
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(super().__getattr__("moe"), name)
+
+    def forward(self, x: torch.Tensor, router_logits: torch.Tensor, **kwargs):
+        return self.moe(x, router_logits, **kwargs) * self.scale
+
+
+class _MusePostNormMoE(torch.nn.Module):
+    """Own routed experts and their native post-expert normalization/combine."""
+
+    def __init__(
+        self,
+        mapping: Mapping,
+        hidden_size: int,
+        top_k: int,
+        eps: float,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        super().__init__()
+        from tensorrt_llm._torch.distributed import AllReduce
+        from tensorrt_llm._torch.models.modeling_musespark_open import LayerNvtx
+        from tensorrt_llm.functional import AllReduceStrategy
+
+        pure_ep = mapping.moe_tp_size == 1 and mapping.moe_ep_size == mapping.tp_size
+        pure_tp = (
+            mapping.moe_ep_size == 1
+            and mapping.moe_tp_size == mapping.tp_size
+            and not mapping.enable_attention_dp
+        )
+        if not (pure_ep or pure_tp):
+            raise NotImplementedError(
+                "MuseSparkOpen production supports pure MoE EP or pure MoE TP without attention DP"
+            )
+        self.mapping = mapping
+        self.expert_hidden_size = hidden_size
+        self.top_k = top_k
+        self.post_expert_norm_eps = eps
+        # Zero-centered gamma: this is the identity checkpoint gain, not zero output.
+        self.post_expert_norm_weight = torch.nn.Parameter(
+            torch.zeros(hidden_size, dtype=dtype, device=device), requires_grad=False
+        )
+        self._all_reduce = AllReduce(mapping=mapping, strategy=AllReduceStrategy.NCCL)
+        self.nvtx = LayerNvtx("moe", 0, ("finalize", "all_reduce"))
+
+    def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
+        """Reject counts that the NCCL wrapper cannot represent."""
+        if self.mapping.tp_size > 1 and x.numel() > 2**31 - 1:
+            raise RuntimeError(
+                f"MuseSparkOpen benchmark refused NCCL AllReduce with {x.numel()} elements: "
+                "this TensorRT-LLM path uses a signed int32 element count."
+            )
+        return self._all_reduce(x)
+
+    def finalize_callback(self) -> Callable[..., torch.Tensor]:
+        import weakref
+        from functools import partial
+
+        from tensorrt_llm._torch.models.modeling_musespark_open import MuseSparkOpenMoE
+
+        # A strong bound callback would make wrapper -> experts -> wrapper a cycle,
+        # delaying release of large case allocations between candidates.
+        return partial(MuseSparkOpenMoE.finalize, weakref.proxy(self))
+
+    def attach_experts(self, moe: torch.nn.Module) -> "_MusePostNormMoE":
+        assert "moe" not in self._modules
+        self.moe = moe
+        return self
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(super().__getattr__("moe"), name)
+
+    def forward(self, x: torch.Tensor, router_logits: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+        # The production callback normalizes individual selected-expert rows
+        # before weighted combine; pure TP reduces FC2 partials before that norm.
+        kwargs.update(do_finalize=False, output_dtype=x.dtype, use_dp_padding=False)
+        combined = self.moe(x, router_logits, **kwargs).to(x.dtype)
+        if (
+            not self.mapping.enable_attention_dp
+            and self.mapping.has_tp()
+            and self.mapping.moe_tp_size == 1
+        ):
+            with self.nvtx("all_reduce"):
+                combined = self.all_reduce(combined)
+        return combined
+
+
 def _build_moe_module(
     *,
     model: ModelSpec,
@@ -298,14 +402,19 @@ def _build_moe_module(
 
     mc = model.to_moe_model_config()
     swiglu_gptoss_style = model.swiglu_gptoss_style
+    expert_bias = swiglu_gptoss_style if model.expert_bias is None else model.expert_bias
     activation_type = model.activation_type_enum
 
     routing_method = _create_routing_method(
         model.routing_method_cls,
         top_k=mc.top_k,
         num_experts=mc.num_experts,
-        bias_dtype=dtype,
+        bias_dtype=torch.float32 if model.router_fp32 else dtype,
         profile_model_config=mc,
+        routed_scaling_factor=(
+            1.0 if model.routed_scale_after_combine else model.routed_scaling_factor
+        ),
+        renorm_eps=model.routing_renorm_eps,
     )
 
     model_config = _build_model_config(
@@ -337,7 +446,7 @@ def _build_moe_module(
         intermediate_size=mc.intermediate_size,
         hidden_size=mc.hidden_size,
         quant_config=quant_config,
-        bias=swiglu_gptoss_style,
+        bias=expert_bias,
         swiglu_gptoss_style=swiglu_gptoss_style,
         swiglu_alpha=model.swiglu_alpha if swiglu_gptoss_style else None,
         swiglu_beta=model.swiglu_beta if swiglu_gptoss_style else None,
@@ -351,6 +460,16 @@ def _build_moe_module(
     )
 
     swiglu_tensors = quantize_util.get_swiglu_tensors()
+    if model.swiglu_clamp is not None:
+        activation = SwigluActivation(clamp=model.swiglu_clamp)
+    elif swiglu_tensors:
+        activation = SwigluBiasActivation(
+            gate_sigmoid_scale=swiglu_tensors["swiglu_alpha"],
+            linear_offset=swiglu_tensors["swiglu_beta"],
+            clamp=swiglu_tensors["swiglu_limit"],
+        )
+    else:
+        activation = _plain_activation(activation_type)
 
     # Merge then unpack so SiTU can override activation_type / swiglu_alpha-beta.
     moe_kwargs = dict(
@@ -362,18 +481,18 @@ def _build_moe_module(
         reduce_results=True,
         model_config=model_config,
         weight_loading_mode=weight_loading_mode,
-        bias=swiglu_gptoss_style,
-        activation=(
-            SwigluBiasActivation(
-                gate_sigmoid_scale=swiglu_tensors["swiglu_alpha"],
-                linear_offset=swiglu_tensors["swiglu_beta"],
-                clamp=swiglu_tensors["swiglu_limit"],
-            )
-            if swiglu_tensors
-            else _plain_activation(activation_type)
-        ),
+        bias=expert_bias,
+        activation=activation,
     )
     moe_kwargs.update(_situ_kwargs(model, moe_backend, quant_algo))
+    post_norm = None
+    if model.post_expert_norm_eps is not None:
+        post_norm = _MusePostNormMoE(
+            mapping, mc.hidden_size, mc.top_k, model.post_expert_norm_eps, dtype, device
+        )
+        moe_kwargs.update(
+            reduce_results=False, unfinalized_combine_fn=post_norm.finalize_callback()
+        )
     moe = _create_moe_for_benchmark(**moe_kwargs)
 
     if quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8:
@@ -386,6 +505,10 @@ def _build_moe_module(
     moe.load_weights([weights])
     moe.post_load_weights()
     moe.cuda(f"cuda:{torch.cuda.current_device()}")
+    if post_norm is not None:
+        moe = post_norm.attach_experts(moe)
+    if model.routed_scale_after_combine:
+        moe = _OutputScaledMoE(moe, model.routed_scaling_factor)
 
     # "unfused" baseline: the routed MoE above was built without fused shared
     # experts (mapping.py forces pretrained_config.n_shared_experts=0 in this mode);

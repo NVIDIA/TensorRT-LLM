@@ -28,9 +28,11 @@ from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from tensorrt_llm._torch.moe.fused_moe.routing import (
     DeepSeekV3MoeRoutingMethod,
+    DeepSeekV4MoeRoutingMethod,
     DefaultMoeRoutingMethod,
     Llama4RenormalizeMoeRoutingMethod,
     MiniMaxM2MoeRoutingMethod,
+    MiniMaxM3MoeRoutingMethod,
     RenormalizeMoeRoutingMethod,
     RenormalizeNaiveMoeRoutingMethod,
     SigmoidRenormMoeRoutingMethod,
@@ -40,13 +42,16 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from .backend import MoeBackendType, MoeModelConfig
 
-_ROUTING_METHODS: Dict[str, type] = {
+_ROUTING_METHODS: Dict[str, type | str] = {
     "DEFAULT": DefaultMoeRoutingMethod,
     "RENORMALIZE": RenormalizeMoeRoutingMethod,
     "RENORMALIZE_NAIVE": RenormalizeNaiveMoeRoutingMethod,
     "LLAMA4_RENORMALIZE": Llama4RenormalizeMoeRoutingMethod,
     "DEEPSEEK_V3": DeepSeekV3MoeRoutingMethod,
+    "DEEPSEEK_V4": DeepSeekV4MoeRoutingMethod,
     "MINIMAX_M2": MiniMaxM2MoeRoutingMethod,
+    "MINIMAX_M3": MiniMaxM3MoeRoutingMethod,
+    "MUSE_SPARK_OPEN": "tensorrt_llm._torch.models.modeling_musespark_open:MuseSparkOpenRoutingMethod",
     "SIGMOID_RENORM": SigmoidRenormMoeRoutingMethod,
 }
 
@@ -55,7 +60,9 @@ _ACTIVATIONS: Dict[str, ActivationType] = {
     "RELU2": ActivationType.Relu2,
 }
 
-_ROUTING_NAME_BY_CLS: Dict[type, str] = {cls: name for name, cls in _ROUTING_METHODS.items()}
+_ROUTING_NAME_BY_CLS: Dict[type, str] = {
+    cls: name for name, cls in _ROUTING_METHODS.items() if isinstance(cls, type)
+}
 _ALL_BACKENDS: List[str] = [b.value for b in MoeBackendType]
 _COMM_METHODS: Tuple[str, ...] = (
     "AUTO",
@@ -124,6 +131,14 @@ class ModelSpec:
     swiglu_beta: float = 0.0
     swiglu_limit: float = float("inf")
     activation_type: str = "SWIGLU"
+    # FC1/FC2 linear biases; None follows the custom SwiGLU activation style.
+    expert_bias: Optional[bool] = None
+    swiglu_clamp: float | None = None
+    routed_scaling_factor: float = 1.0
+    routed_scale_after_combine: bool = False
+    router_fp32: bool = False
+    routing_renorm_eps: Optional[float] = None
+    post_expert_norm_eps: Optional[float] = None
     # SiTU constants (Kimi-K3: activation_situ_beta / activation_situ_linear_beta).
     # SiTU is gated, so ``activation_type`` stays SWIGLU and only the epilogue
     # changes; backends take it through their own parameters (see build.py).
@@ -131,6 +146,38 @@ class ModelSpec:
     situ_linear_beta: Optional[float] = None
 
     def __post_init__(self) -> None:
+        if (
+            self.routed_scale_after_combine
+            and self.n_shared_experts
+            and self.shared_expert_mode == "fused"
+        ):
+            raise ValueError("Output routed scaling cannot also scale fused shared experts.")
+        if self.post_expert_norm_eps is not None:
+            if self.post_expert_norm_eps <= 0 or self.routing_method != "MUSE_SPARK_OPEN":
+                raise ValueError(
+                    "Per-expert post-norm requires Muse routing and a positive epsilon."
+                )
+            if self.routing_renorm_eps is None or self.routing_renorm_eps <= 0:
+                raise ValueError("Muse routing requires a positive normalization epsilon.")
+            if self.n_shared_experts or self.situ_beta is not None or self.swiglu_gptoss_style:
+                raise ValueError(
+                    "Muse routed-expert post-norm requires its native plain SwiGLU path."
+                )
+        if (
+            self.swiglu_gptoss_style
+            and self.expert_bias is False
+            and self.activation_type != "SWIGLU"
+        ):
+            raise ValueError("Custom SwiGLU parameters require activation_type=SWIGLU.")
+        if self.swiglu_clamp is not None:
+            if self.swiglu_clamp <= 0:
+                raise ValueError("swiglu_clamp must be positive.")
+            if self.activation_type != "SWIGLU":
+                raise ValueError("swiglu_clamp requires activation_type=SWIGLU.")
+            if self.swiglu_gptoss_style:
+                raise ValueError(
+                    "Plain SwiGLU clamp and gpt-oss activation are mutually exclusive."
+                )
         if self.n_shared_experts < 0:
             raise ValueError(f"n_shared_experts must be >= 0, got {self.n_shared_experts}.")
         if self.shared_expert_mode not in ("fused", "unfused"):
@@ -144,15 +191,25 @@ class ModelSpec:
                 raise ValueError("SiTU betas must be positive.")
             if self.activation_type != "SWIGLU":
                 raise ValueError("SiTU requires the SwiGLU fc1 geometry (activation_type=SWIGLU).")
-            if self.swiglu_limit != float("inf"):
+            if self.swiglu_limit != float("inf") or self.swiglu_clamp is not None:
                 raise ValueError("SiTU is mutually exclusive with a gate/up clamp.")
 
     @property
     def routing_method_cls(self) -> type:
-        return _ROUTING_METHODS[self.routing_method]
+        cls = _ROUTING_METHODS[self.routing_method]
+        if isinstance(cls, str):
+            from importlib import import_module
+
+            module, name = cls.split(":")
+            cls = getattr(import_module(module), name)
+            _ROUTING_METHODS[self.routing_method] = cls
+            _ROUTING_NAME_BY_CLS[cls] = self.routing_method
+        return cls
 
     @property
     def activation_type_enum(self) -> ActivationType:
+        if self.swiglu_gptoss_style and self.expert_bias is False:
+            return ActivationType.SwigluBias
         return _ACTIVATIONS[self.activation_type]
 
     @property
@@ -290,7 +347,7 @@ class RunResult:
     actual_backend: Optional[str] = None
     actual_comm_method: Optional[str] = None
     actual_comm_fallback_reason: Optional[str] = None
-    # Epilogue the built module ran ("swiglu" / "situ"), read back rather
+    # Epilogue the built module ran ("swiglu" / "swiglu_bias" / "situ"), read back rather
     # than echoed from the spec.
     actual_epilogue_activation: Optional[str] = None
     scheduler_kind: Optional[str] = None
@@ -394,6 +451,19 @@ BUILT_IN_MODELS: Dict[str, ModelSpec] = {
         quant_algo=None,
         routing_method="RENORMALIZE",
     ),
+    "deepseek_v4_1_flash": ModelSpec(
+        name="deepseek_v4_1_flash",
+        num_experts=384,
+        top_k=6,
+        hidden_size=5120,
+        intermediate_size=2304,
+        quant_algo=None,
+        routing_method="DEEPSEEK_V4",
+        n_group=1,
+        topk_group=1,
+        swiglu_clamp=10.0,
+        routed_scaling_factor=1.5,
+    ),
     "gpt_oss_120b": ModelSpec(
         name="gpt_oss_120b",
         num_experts=128,
@@ -433,5 +503,110 @@ BUILT_IN_MODELS: Dict[str, ModelSpec] = {
         topk_group=1,
         situ_beta=4.0,  # text_config.activation_situ_beta
         situ_linear_beta=25.0,  # text_config.activation_situ_linear_beta
+    ),
+    "inkling_2_small": ModelSpec(
+        name="inkling_2_small",
+        num_experts=384,
+        top_k=8,
+        hidden_size=4608,
+        intermediate_size=2304,
+        quant_algo=None,
+        routing_method="DEEPSEEK_V3",
+        n_group=1,
+        topk_group=1,
+        routed_scaling_factor=8.0,
+        router_fp32=True,
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+    ),
+    "kimi_k3_1_pro": ModelSpec(
+        name="kimi_k3_1_pro",
+        num_experts=896,
+        top_k=16,
+        hidden_size=3584,
+        intermediate_size=3072,
+        quant_algo=None,
+        routing_method="DEEPSEEK_V3",
+        n_group=1,
+        topk_group=1,
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+    ),
+    "glm_5_3_flash": ModelSpec(
+        name="glm_5_3_flash",
+        num_experts=288,
+        top_k=8,
+        hidden_size=4096,
+        intermediate_size=2048,
+        quant_algo=None,
+        routing_method="DEEPSEEK_V3",
+        n_group=1,
+        topk_group=1,
+        swiglu_clamp=10.0,
+        routed_scaling_factor=2.5,
+    ),
+    "minimax_m3_1_flash": ModelSpec(
+        name="minimax_m3_1_flash",
+        num_experts=128,
+        top_k=4,
+        hidden_size=6144,
+        intermediate_size=3072,
+        quant_algo=None,
+        routing_method="MINIMAX_M3",
+        routed_scaling_factor=2.0,
+        swiglu_alpha=1.702,
+        swiglu_beta=1.0,
+        swiglu_limit=7.0,
+        expert_bias=False,
+    ),
+    "glm_5_3": ModelSpec(
+        name="glm_5_3",
+        num_experts=256,
+        top_k=8,
+        hidden_size=6144,
+        intermediate_size=2048,
+        quant_algo=None,
+        routing_method="DEEPSEEK_V3",
+        n_group=1,
+        topk_group=1,
+        routed_scaling_factor=2.5,
+    ),
+    "muse_spark_open": ModelSpec(
+        name="muse_spark_open",
+        num_experts=256,
+        top_k=8,
+        hidden_size=4096,
+        intermediate_size=4096,
+        quant_algo=None,
+        routing_method="MUSE_SPARK_OPEN",
+        router_fp32=True,
+        routing_renorm_eps=1e-15,
+        post_expert_norm_eps=1e-8,
+    ),
+    "mistral_large_4": ModelSpec(
+        name="mistral_large_4",
+        num_experts=128,
+        top_k=4,
+        hidden_size=6144,
+        intermediate_size=6144,
+        quant_algo=None,
+        routing_method="RENORMALIZE",
+        router_fp32=True,
+        n_group=1,
+        topk_group=1,
+    ),
+    "reflection_beam": ModelSpec(
+        name="reflection_beam",
+        num_experts=256,
+        top_k=8,
+        hidden_size=5120,
+        intermediate_size=2560,
+        quant_algo=None,
+        routing_method="DEEPSEEK_V3",
+        router_fp32=True,
+        n_group=8,
+        topk_group=4,
+        routed_scaling_factor=2.5,
+        routed_scale_after_combine=True,
     ),
 }

@@ -664,9 +664,18 @@ includes full requested and observed dispatch/expert matrices.
 | `deepseek_r1` | 256 | 8 | 7168 | 2048 | `FP8_BLOCK_SCALES` | `DEEPSEEK_V3` |
 | `kimi_k2` | 384 | 8 | 7168 | 2048 | `FP8_BLOCK_SCALES` | `DEEPSEEK_V3` |
 | `kimi_k3` | 896 | 16 | 3584 † | 3072 | pass `--quant` | `DEEPSEEK_V3` |
+| `inkling_2_small` | 384 | 8 | 4608 | 2304 | pass `--quant` | `DEEPSEEK_V3` |
+| `kimi_k3_1_pro` | 896 | 16 | 3584 † | 3072 | pass `--quant` | `DEEPSEEK_V3` |
+| `glm_5_3_flash` | 288 | 8 | 4096 | 2048 | pass `--quant` | `DEEPSEEK_V3` |
+| `minimax_m3_1_flash` | 128 | 4 | 6144 | 3072 | pass `--quant` | `MINIMAX_M3` |
+| `glm_5_3` | 256 | 8 | 6144 | 2048 | pass `--quant` | `DEEPSEEK_V3` |
+| `muse_spark_open` | 256 | 8 | 4096 | 4096 | `NVFP4` | `MUSE_SPARK_OPEN` |
+| `mistral_large_4` | 128 | 4 | 6144 | 6144 | pass `--quant` | `RENORMALIZE` |
+| `reflection_beam` | 256 | 8 | 5120 | 2560 | pass `--quant` | `DEEPSEEK_V3` |
 | `glm_5` | 256 | 8 | 6144 | 2048 | pass `--quant` | `DEEPSEEK_V3` |
 | `deepseek_v4_pro` | 384 | 6 | 7168 | 3072 | pass `--quant` | `RENORMALIZE` |
 | `deepseek_v4_flash` | 256 | 6 | 4096 | 2048 | pass `--quant` | `RENORMALIZE` |
+| `deepseek_v4_1_flash` | 384 | 6 | 5120 | 2304 | pass `--quant` | `DEEPSEEK_V4` |
 | `qwen3_8` | 512 | 10 | 8192 | 2048 | pass `--quant` | `RENORMALIZE` |
 | `gpt_oss_120b` | 128 | 4 | 2880 | 2880 | `W4A8_MXFP4_MXFP8` | `RENORMALIZE` |
 
@@ -675,6 +684,58 @@ before dispatch and back up after combine, so the routed experts never see the
 model's `hidden_size`. For those, `Hidden` is the latent dimension — that is what
 both the expert GEMMs and the all-to-all payload actually run at. The outer
 down/up projections sit outside the MoE layer and are not benchmarked.
+
+`deepseek_v4_1_flash` uses the learned sqrt-softplus gate with zero synthetic
+score-correction bias, routed scaling factor 1.5, and SwiGLU clamp 10. It benchmarks
+the routed-expert branch; the checkpoint's separate shared expert, vision encoder,
+and DSpark draft experts are outside this preset.
+
+`inkling_2_small` uses FP32 sigmoid routing with a single expert group,
+normalized top-8 weights scaled by 8, and SiTU gate/linear softcaps 4/25.
+The routed-expert width is 4608. The benchmark records the actual epilogue;
+backend/quantization paths without SiTU retain the existing SwiGLU proxy.
+The explicit `--quant` selects the module's quantization; it does not reproduce
+the checkpoint's mixed layer precisions or checkpoint-specific quantization recipe.
+
+`kimi_k3_1_pro` uses the checkpoint's latent routed-expert width 3584 and
+SiTU gate/linear softcaps 4/25. The benchmark records the actual epilogue;
+backend/quantization paths without SiTU retain the existing SwiGLU proxy.
+Latent projections, outer normalization, and the separate shared expert are
+outside this routed-expert preset.
+
+`glm_5_3_flash` measures the routed-expert core with sigmoid DeepSeek routing,
+normalized top-8 weights scaled by 2.5, and plain SwiGLU clamped at 10.
+The separate shared expert and the surrounding transformer block are excluded.
+
+`minimax_m3_1_flash` uses FP32 sigmoid routing with normalized top-4 weights
+scaled by 2. Its SwiGLU-OAI activation uses gate sigmoid scale 1.702, linear
+offset 1, and clamp 7, without expert FC1/FC2 linear biases. The separate
+shared expert and the surrounding transformer block are excluded.
+
+`glm_5_3` measures the routed-expert core with sigmoid DeepSeek routing,
+normalized top-8 weights scaled by 2.5, and plain SwiGLU without a clamp.
+The separate shared expert and the surrounding transformer block are excluded.
+
+`muse_spark_open` measures routed experts at the pooled MoE width 4096
+(the residual-stream width is 8192), with FP32 sigmoid routing and the native
+weight-first per-expert RMSNorm before weighted combine. The production finalize
+also reduces FC2 partials before this nonlinear norm under pure MoE TP.
+Supported layouts are pure EP and pure MoE TP without attention DP; the pooler,
+unpooler, and dense router projection are outside the routed-expert benchmark.
+The fixed release's MXFP4/MXFP8 implementations do not return unfinalized
+expert outputs required by this norm; do not substitute a norm of their sum.
+Its NCCL reduction rejects element counts above signed int32 so that
+overflowing counts cannot be reported as successful performance measurements.
+
+`mistral_large_4` uses FP32 softmax routing, normalized top-4 weights and
+plain SwiGLU. Its routed intermediate size is 6144; the dense MLP width
+24576 and the separate shared expert are outside this routed-expert preset.
+
+`reflection_beam` uses FP32 sigmoid routing with 8 groups, group top-2 score
+sums, 4 selected groups and normalized top-8 weights. The checkpoint's 2.5
+routed scaling is applied after expert aggregation, rather than folded into
+low-precision routing weights. The native grouping constraint can project
+a requested synthetic traffic plan; retain the routing observation metadata.
 
 Custom shapes can be used instead of `--model`:
 

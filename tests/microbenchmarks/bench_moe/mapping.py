@@ -43,9 +43,11 @@ from transformers.configuration_utils import PretrainedConfig
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.moe.fused_moe.routing import (
     DeepSeekV3MoeRoutingMethod,
+    DeepSeekV4MoeRoutingMethod,
     DefaultMoeRoutingMethod,
     Llama4RenormalizeMoeRoutingMethod,
     MiniMaxM2MoeRoutingMethod,
+    MiniMaxM3MoeRoutingMethod,
     RenormalizeMoeRoutingMethod,
     RenormalizeNaiveMoeRoutingMethod,
     SigmoidRenormMoeRoutingMethod,
@@ -211,6 +213,8 @@ def _create_routing_method(
     num_experts: int,
     bias_dtype: torch.dtype,
     profile_model_config: MoeModelConfig,
+    routed_scaling_factor: float = 1.0,
+    renorm_eps: Optional[float] = None,
 ):
     """Create a routing-method instance mirroring ``test_moe_module._create_routing_method``."""
     if routing_method_cls in (RenormalizeMoeRoutingMethod, DefaultMoeRoutingMethod):
@@ -226,9 +230,40 @@ def _create_routing_method(
             top_k=top_k,
             n_group=n_group,
             topk_group=topk_group,
-            routed_scaling_factor=1.0,
+            routed_scaling_factor=routed_scaling_factor,
             callable_e_score_correction_bias=lambda: e_score_correction_bias,
             is_fused=True,
+        )
+
+    if routing_method_cls is DeepSeekV4MoeRoutingMethod:
+        e_score_correction_bias = torch.zeros(num_experts, dtype=torch.float32, device="cuda")
+        return routing_method_cls(
+            top_k=top_k,
+            n_group=profile_model_config.n_group or 1,
+            topk_group=profile_model_config.topk_group or 1,
+            routed_scaling_factor=routed_scaling_factor,
+            callable_e_score_correction_bias=lambda: e_score_correction_bias,
+            callable_tid2eid=lambda: None,
+            is_hashed=False,
+        )
+
+    if routing_method_cls.__name__ == "MuseSparkOpenRoutingMethod":
+        assert renorm_eps is not None and renorm_eps > 0
+        e_score_correction_bias = torch.zeros(num_experts, dtype=torch.float32, device="cuda")
+        return routing_method_cls(
+            top_k=top_k,
+            num_experts=num_experts,
+            callable_e_score_correction_bias=lambda: e_score_correction_bias,
+            renorm_eps=renorm_eps,
+        )
+
+    if routing_method_cls is MiniMaxM3MoeRoutingMethod:
+        e_score_correction_bias = torch.zeros(num_experts, dtype=torch.float32, device="cuda")
+        return routing_method_cls(
+            top_k=top_k,
+            num_experts=num_experts,
+            callable_e_score_correction_bias=lambda: e_score_correction_bias,
+            routed_scaling_factor=routed_scaling_factor,
         )
 
     if routing_method_cls is MiniMaxM2MoeRoutingMethod:
