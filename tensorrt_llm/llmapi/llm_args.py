@@ -2606,6 +2606,16 @@ class DecodingBaseConfig(StrictBaseModel):
         "(default) to use exact-match verification on non-greedy batches. "
         "The non-dynamic-tree one-model path requires FlashInfer.")
 
+    rejection_sample_method: Literal["standard", "block"] = Field(
+        default="standard",
+        status="prototype",
+        description=
+        "Verification rule of rejection sampling (use_rejection_sampling=True): "
+        "'standard' is token-level rejection sampling; 'block' is block "
+        "verification (Sun et al., 2024, arXiv:2403.10444), which is lossless "
+        "and accepts at least as many tokens. Linear-chain one-model paths "
+        "only; ragged (confidence-scheduled) steps use 'standard'.")
+
     allow_advanced_sampling: bool = Field(
         default=False,
         status="deprecated",
@@ -5584,6 +5594,24 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description="KV cache manager v2 configuration for block reuse policies."
     )
 
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    enable_disagg_completion_reservation: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "Reserve the GPU KV cache pages each admitted request needs to finish "
+        "on a disaggregated server. Applies only to KV cache manager v2 on a "
+        "disaggregated server with no cache tier below GPU (host_cache_size=0 "
+        "and no disk tier), beam width 1, a single pipeline stage and full "
+        "attention on every layer; elsewhere it is ignored, and KV cache "
+        "manager v2 logs a warning. A request is then admitted only while the "
+        "completion bound of every admitted request still fits: a generation "
+        "request through its output limit and, under a KV connector without "
+        "source reservations, a context request the connector may serve "
+        "through the end of its prompt. The bounds are logical; no page is "
+        "allocated early. A KV connector can request the same through its "
+        "worker's requires_completion_reservation declaration.")
+
     def _to_pybind(self):
         config = _KvCacheConfig(
             enable_block_reuse=self.enable_block_reuse,
@@ -8448,6 +8476,14 @@ class TorchLlmArgs(BaseLlmArgs):
                 # The enabled paths (Eagle3, vanilla MTP, PARD, DFlash,
                 # DraftTarget one-model) share the SpecMetadata slot-indexed
                 # dispatch.
+
+            if self.speculative_config.rejection_sample_method == "block" and (
+                    not self.speculative_config.use_rejection_sampling
+                    or getattr(self.speculative_config, "use_dynamic_tree",
+                               False)):
+                raise ValueError(
+                    "rejection_sample_method='block' requires "
+                    "use_rejection_sampling=True and no dynamic tree.")
 
             if isinstance(self.speculative_config, PARDDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0, "PARD max_draft_len must be > 0"

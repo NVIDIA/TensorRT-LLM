@@ -29,8 +29,10 @@ namespace tensorrt_llm::executor::kv_cache::bounce
 ///
 /// Direction-agnostic: used for gather (srcs=scattered, dsts=arena-region+offset) and scatter
 /// (srcs=arena-region+offset, dsts=scattered) — only the pointer arrays differ. 16-byte-aligned
-/// buffers take a vectorized uint4 path; otherwise a byte path.
+/// buffers take a vectorized uint4 path; otherwise a byte path. `maxBlocks` caps the grid (blocks
+/// then loop over several buffers); 0 launches one block per buffer. The bytes written are the same
+/// for every `maxBlocks`.
 [[nodiscard]] cudaError_t launchBatchedCopy(std::uint64_t const* srcs, std::uint64_t const* dsts,
-    std::uint32_t const* sizes, std::uint32_t n, cudaStream_t stream);
+    std::uint32_t const* sizes, std::uint32_t n, cudaStream_t stream, std::uint32_t maxBlocks = 0);
 
 } // namespace tensorrt_llm::executor::kv_cache::bounce

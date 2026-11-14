@@ -1362,6 +1362,15 @@ class DecoderWarmup:
             # serving different tactics for one shape: keep the fastest everywhere.
             # Collective; before the native MXFP8 cache below registers the tactics.
             AutoTuner.get().post_tune_merge_tactics()
+        if (
+            runtime_hooks_of(self.model).persist_flashinfer_mxfp8_tactics
+            and ran_flashinfer_forward
+            and cache_path is not None
+        ):
+            # The FlashInfer MXFP8 pass tunes after the native pass's autotune() context saved the cache:
+            # save again so its tactics persist across starts instead of being re-profiled every start.
+            autotuner = AutoTuner.get()
+            autotuner.profiling_cache.save_cache(cache_path, autotuner.mapping.rank)
 
         if enable_flashinfer_mxfp8_autotuner:
             if ran_flashinfer_forward:

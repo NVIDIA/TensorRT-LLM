@@ -2767,6 +2767,13 @@ class DecoderInputPreparer:
             # num_generations / num_tokens / seq_lens are set above, before the
             # attention-DP allgather that must agree with prepare().
             spec_metadata.host_position_ids = host.host_position_ids
+            # The full prompt length of each context request (a chunk covers only part of it), keyed by the
+            # context request ids so a reader can tell a stale list from this batch's.
+            context_requests = scheduled_requests.context_requests
+            spec_metadata.ctx_prompt_lens = (
+                tuple(request.py_request_id for request in context_requests),
+                [request.py_prompt_len for request in context_requests],
+            )
             if host.context_prompt_lookahead is not None:
                 spec_metadata.populate_context_prompt_lookahead(host.context_prompt_lookahead)
             if self._dspark_trims_submitted_tokens:

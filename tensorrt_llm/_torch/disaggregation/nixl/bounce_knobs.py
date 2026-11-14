@@ -30,5 +30,9 @@ AGENT_BOUNCE_PARAM_KEYS: frozenset = frozenset(
         "disable_fabric_memory",
         "enable_eager_gather",
         "use_zero_copy_arguments",
+        "scatter_on_order_stream",
+        "scatter_copy_engine",
+        "copy_stream_priority",
+        "max_copy_blocks",
     }
 )

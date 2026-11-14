@@ -127,9 +127,69 @@ public:
         bool mOwns{true};
     };
 
+    //! Non-blocking exclusive acquisition. acquired() is true when this thread now holds the lock
+    //! exclusively: either it was free and this guard took it (and releases it), or this thread
+    //! already held it (nested, nothing to release). acquired() is false when another thread holds
+    //! it in any mode; nothing is held then. Never waits, so it may be taken while holding a lock
+    //! that a lock holder could need (the Python GIL, see the KVCM2 AGENTS.md).
+    class TryExclusiveGuard
+    {
+    public:
+        explicit TryExclusiveGuard(ReentrantSharedMutex const& owner)
+            : mOwner(owner)
+        {
+            if (mOwner.mOwnerThread.load(std::memory_order_relaxed) == std::this_thread::get_id())
+            {
+                mAcquired = true;
+                return;
+            }
+            if (mOwner.mMutex.try_lock())
+            {
+                mOwner.mOwnerThread.store(std::this_thread::get_id(), std::memory_order_relaxed);
+                mAcquired = true;
+                mOwns = true;
+            }
+        }
+
+        ~TryExclusiveGuard()
+        {
+            if (mOwns)
+            {
+                mOwner.mOwnerThread.store(std::thread::id{}, std::memory_order_relaxed);
+                mOwner.mMutex.unlock();
+            }
+        }
+
+        TryExclusiveGuard(TryExclusiveGuard const&) = delete;
+        TryExclusiveGuard& operator=(TryExclusiveGuard const&) = delete;
+        TryExclusiveGuard(TryExclusiveGuard&&) = delete;
+        TryExclusiveGuard& operator=(TryExclusiveGuard&&) = delete;
+
+        [[nodiscard]] bool acquired() const noexcept
+        {
+            return mAcquired;
+        }
+
+        //! False when nothing was taken or the acquisition nested inside one this thread holds.
+        [[nodiscard]] bool owns() const noexcept
+        {
+            return mOwns;
+        }
+
+    private:
+        ReentrantSharedMutex const& mOwner;
+        bool mAcquired{false};
+        bool mOwns{false};
+    };
+
     [[nodiscard]] Guard lockExclusive() const
     {
         return {*this, true};
+    }
+
+    [[nodiscard]] TryExclusiveGuard tryLockExclusive() const
+    {
+        return TryExclusiveGuard{*this};
     }
 
     [[nodiscard]] Guard lockShared() const

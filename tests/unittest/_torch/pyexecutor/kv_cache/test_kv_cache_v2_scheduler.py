@@ -68,6 +68,9 @@ def make_gen_request(
     req.py_request_id = request_id
     req.state_value = GEN_IN_PROGRESS
     req.get_beam_width_by_iter.return_value = beam_width
+    # Prefill finished: the cursor sits at the end of a 100-token prompt.
+    req.context_current_position = 100
+    req.prepopulated_prompt_len = 0
     req.num_draft_tokens = num_draft_tokens
     req.has_draft_tokens = num_draft_tokens > 0
     req.py_draft_tokens = [0] * num_draft_tokens if num_draft_tokens > 0 else []
@@ -99,6 +102,7 @@ def make_ctx_request(
     req.context_remaining_length = context_remaining_length
     req.prompt_len = prompt_len or context_remaining_length
     req.context_current_position = 0
+    req.prepopulated_prompt_len = 0
     req.py_served_prefix_end = 0
     req.expect_snapshot_points = []
     req.num_draft_tokens = num_draft_tokens
@@ -370,6 +374,7 @@ def make_kv_cache_manager(
     # already-backed-off probe depths against each other.
     mgr.reuse_match_backoff = 0
     mgr.probe_context_reuse.side_effect = lambda req: None
+    mgr.probe_connector_prefix.return_value = None
     mgr.resize_context.side_effect = resize_context_fn or (lambda req, n: True)
     mgr.try_allocate_draft_context.side_effect = lambda req, n: True
     mgr.prepare_disagg_gen_init.side_effect = prepare_disagg_gen_init_fn or (lambda req: True)
@@ -407,6 +412,8 @@ def make_kv_cache_manager(
     mgr.preempt_request.side_effect = preempt_request
     # A bare Mock would answer truthily and suppress every stall check.
     mgr.has_pending_preemption.return_value = False
+    # Completion headroom is plentiful unless a test says otherwise.
+    mgr.reserve_context_completion.return_value = True
     return mgr
 
 
@@ -1556,8 +1563,8 @@ class TestKVCacheFailuresCtxChunked:
         managers = (mgr, draft_mgr, cross_mgr)
         for manager in managers:
             manager.kv_cache_map[0] = Mock(is_active=False)
-            manager.free_resources.side_effect = (
-                lambda req, manager=manager: manager.kv_cache_map.pop(req.py_request_id)
+            manager.free_resources.side_effect = lambda req, manager=manager: (
+                manager.kv_cache_map.pop(req.py_request_id)
             )
         sched = make_scheduler(
             mgr,
@@ -2289,6 +2296,75 @@ class TestPreemptionDefersToConnectorSaves:
             sched.schedule_request(reqs, set())
 
 
+@pytest.mark.parametrize("chunked", [False, True])
+def test_completion_reservation_deferral_preserves_started_context(chunked: bool) -> None:
+    """A new prompt waiting for completion headroom must let admitted prefill finish."""
+    manager = make_kv_cache_manager(has_cache_tier_below_gpu=False)
+    # Only the new prompt is refused, whatever order the pass consults them in.
+    manager.reserve_context_completion.side_effect = lambda req: req.py_request_id != 0
+    scheduler = make_scheduler(
+        manager,
+        max_num_tokens=1000,
+        ctx_chunk_config=(ContextChunkingPolicy.FIRST_COME_FIRST_SERVED, 64) if chunked else None,
+    )
+    waiting = make_ctx_request(0, 500)
+    started = make_ctx_request(99, 100, is_first_context_chunk=False)
+
+    batch = scheduler.schedule_request([waiting, started], set())
+
+    assert ids(batch.context_requests) == [99]
+    assert batch.paused_requests == []
+    manager.preempt_request.assert_not_called()
+    manager.resize_context.assert_called_once_with(started, 100)
+    started.pause.assert_not_called()
+
+    # Once headroom returns, admission accepts the queued prompt.
+    manager.reserve_context_completion.side_effect = None
+    manager.reserve_context_completion.return_value = True
+    resumed = scheduler.schedule_request([waiting], set())
+    assert ids(resumed.context_requests) == [0]
+    manager.preempt_request.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "chunked, max_num_tokens, align_to_nothing, reaches_prepare",
+    [
+        # Full path: the prompt does not fit the token budget once prepared.
+        (False, 100, False, True),
+        # Chunked path: the pass has no chunk budget left at all.
+        (True, 32, False, False),
+        # Chunked path: no multimodal-safe chunk boundary this pass.
+        (True, 1000, True, True),
+    ],
+    ids=["full_token_budget", "no_chunk_budget", "mm_alignment"],
+)
+def test_completion_reservation_not_consulted_before_budget_skips(
+    chunked: bool, max_num_tokens: int, align_to_nothing: bool, reaches_prepare: bool
+) -> None:
+    """Budget and alignment refusals come first, so they never record a completion bound."""
+    manager = make_kv_cache_manager(has_cache_tier_below_gpu=False)
+    scheduler = make_scheduler(
+        manager,
+        max_num_tokens=max_num_tokens,
+        ctx_chunk_config=(ContextChunkingPolicy.FIRST_COME_FIRST_SERVED, 64) if chunked else None,
+    )
+    if align_to_nothing:
+        scheduler._align_chunk_to_mm_block = Mock(return_value=0)
+    request = make_ctx_request(0, 200)
+
+    batch = scheduler.schedule_request([request], set())
+
+    assert batch.context_requests == []
+    if reaches_prepare:
+        manager.prepare_context.assert_called_once_with(request)
+    else:
+        manager.prepare_context.assert_not_called()
+    if align_to_nothing:
+        scheduler._align_chunk_to_mm_block.assert_called_once()
+    manager.reserve_context_completion.assert_not_called()
+    manager.resize_context.assert_not_called()
+
+
 class TestDeadlockDetection:
     """The scheduler must fail loudly rather than spin scheduling nothing.
 
@@ -2951,8 +3027,8 @@ class TestCrossKVAllocationFailures:
         failed_cache = Mock(capacity=0)
         failed_cache.resize.return_value = failure != "resize"
         cross_mgr.kv_cache_map[0] = failed_cache
-        cross_mgr._resume_and_restore.side_effect = lambda req_id, cache: not (
-            failure == "resume" and cache is failed_cache
+        cross_mgr._resume_and_restore.side_effect = lambda req_id, cache: (
+            not (failure == "resume" and cache is failed_cache)
         )
 
         def prepare_context(req: Mock, reuse_limit: int | None = None) -> bool:
@@ -2961,8 +3037,8 @@ class TestCrossKVAllocationFailures:
 
         self_mgr.prepare_context.side_effect = prepare_context
         for manager in (self_mgr, cross_mgr):
-            manager.free_resources.side_effect = (
-                lambda req, manager=manager: manager.kv_cache_map.pop(req.py_request_id)
+            manager.free_resources.side_effect = lambda req, manager=manager: (
+                manager.kv_cache_map.pop(req.py_request_id)
             )
         sched = make_encoder_scheduler(
             self_mgr,

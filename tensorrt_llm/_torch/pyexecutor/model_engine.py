@@ -71,6 +71,7 @@ from .guided_decoder import CapturableGuidedDecoder
 from .llm_request import LlmRequest
 from .model_loader import ModelLoader
 from .resource_manager import ResourceManager, ResourceManagerType
+from .runtime_hooks import apply_prefill_capture_hooks, runtime_hooks_of
 from .sampler import SampleStateTensors
 from .scheduler import ScheduledRequests
 
@@ -288,9 +289,11 @@ class ModelEngine:
         and leave the model in its final pre-compile form."""
         from ._util import (
             compute_max_num_sequences,
+            is_disagg_enabled,
             resolved_kv_cache_manager_is_v2,
             should_enable_overlap_headroom,
         )
+        from .disagg_gen_prefetch import resolve_disagg_gen_prefetch_requests
 
         # In-graph sampling needs the full vocabulary: top-k / top-p over a
         # tensor-parallel shard would rank against a slice of the logits and
@@ -307,26 +310,43 @@ class ModelEngine:
             )
             self.enable_in_graph_sampling = False
         pretrained_config = self.model.model_config.pretrained_config
+        kv_cache_manager_is_v2 = resolved_kv_cache_manager_is_v2(
+            self.llm_args.kv_cache_config,
+            self.max_beam_width,
+            enable_sleep=self.llm_args.sleep_config is not None,
+        )
+        is_hybrid = is_hybrid_linear(pretrained_config)
+        has_mrope_delta_cache = resolve_mrope_position_deltas_cache(self.model) is not None
         self.enable_overlap_headroom = should_enable_overlap_headroom(
             self.mapping,
             self.llm_args.disable_overlap_scheduler,
-            kv_cache_manager_is_v2=resolved_kv_cache_manager_is_v2(
-                self.llm_args.kv_cache_config,
-                self.max_beam_width,
-                enable_sleep=self.llm_args.sleep_config is not None,
-            ),
-            is_hybrid=is_hybrid_linear(pretrained_config),
-            has_mrope_delta_cache=resolve_mrope_position_deltas_cache(self.model) is not None,
+            kv_cache_manager_is_v2=kv_cache_manager_is_v2,
+            is_hybrid=is_hybrid,
+            has_mrope_delta_cache=has_mrope_delta_cache,
+        )
+        # Seats for the generation-only requests a disaggregated worker admits
+        # beyond max_batch_size to prefetch their KV (see disagg_gen_prefetch;
+        # 0 unless TRTLLM_DISAGG_GEN_PREFETCH_REQUESTS asks for it).
+        self.disagg_gen_prefetch_requests = resolve_disagg_gen_prefetch_requests(
+            is_disagg=is_disagg_enabled(getattr(self.llm_args, "cache_transceiver_config", None)),
+            enable_attention_dp=self.mapping.enable_attention_dp,
+            has_pp=self.mapping.has_pp(),
+            is_hybrid=is_hybrid,
+            has_mrope_delta_cache=has_mrope_delta_cache,
+            kv_cache_manager_is_v2=kv_cache_manager_is_v2,
         )
         from .scheduler.gen_preemption import headroom_for_args
 
         self.gen_preemption_headroom = headroom_for_args(self.batch_size, self.llm_args)
-        self.max_num_seq_slots = compute_max_num_sequences(
-            self.mapping,
-            self.batch_size,
-            self.llm_args.disable_overlap_scheduler,
-            enable_overlap_headroom=self.enable_overlap_headroom,
-            gen_preemption_headroom=self.gen_preemption_headroom,
+        self.max_num_seq_slots = (
+            compute_max_num_sequences(
+                self.mapping,
+                self.batch_size,
+                self.llm_args.disable_overlap_scheduler,
+                enable_overlap_headroom=self.enable_overlap_headroom,
+                gen_preemption_headroom=self.gen_preemption_headroom,
+            )
+            + self.disagg_gen_prefetch_requests
         )
         prepare_loaded_model(self.model, self.llm_args)
         # Router Replay (R3) capturer owned by this engine (None when disabled).
@@ -412,6 +432,22 @@ class ModelEngine:
         self._cuda_graph_batch_sizes = plan.batch_sizes
         self.max_cuda_graph_batch_size = plan.max_batch_size
         self._prefill_cuda_graph_num_tokens = plan.prefill_num_tokens
+        # On the breakable backend a model may add buckets or cap the list; the one list then feeds both the
+        # piecewise backend and the runners.
+        self._prefill_cuda_graph_num_tokens, added, dropped = apply_prefill_capture_hooks(
+            self._prefill_cuda_graph_num_tokens,
+            runtime_hooks_of(self.model),
+            max_num_tokens=min(
+                self.max_num_tokens, max(0, self.batch_size * (self.max_seq_len - 1))
+            ),
+            breakable=self.llm_args.prefill_cuda_graph_backend == PrefillCudaGraphBackend.BREAKABLE,
+        )
+        if added or dropped:
+            logger.info(
+                f"Prefill CUDA graph capture num_tokens after "
+                f"{type(self.model).__name__}.runtime_hooks: "
+                f"{self._prefill_cuda_graph_num_tokens} (added {added}, dropped {dropped})"
+            )
 
     def _compile_model(self, configured_encoder_max_num_tokens: int | None) -> None:
         """Compile the model, capture the local multimodal encoders' CUDA

@@ -49,6 +49,10 @@ wait, so per-step device flags can be tagged with it instead of being cleared be
 With ``prologue_op`` (``RuntimeHooks.pack_prologue_op``, on top of ``early_copy``) the prologue is the model's one
 launch, ``prologue_op(gdev, epoch, MAX_DESC)``, in place of the two scatter launches and the header fill: it writes the
 same bytes, zeroes the same header and increments the epoch the same once per replay (and once at warm-up).
+
+With ``cpp_scatter`` (``RuntimeHooks.pack_cpp_scatter``) the pack launches no Triton kernel: every eager flush takes
+the native serial scatter (``trtllm::step_inputs_scatter``, the same bytes), and the in-graph prologue is kept only
+with the model's ``prologue_op`` (otherwise the pack is issued eagerly before the replay).
 """
 
 from __future__ import annotations
@@ -163,6 +167,8 @@ class StepInputPack:
     ALIGN = 16
     # The pinned window a graph's prologue copies (in_graph): the header, the descriptors and up to ~10 KB of data.
     GRAPH_WINDOW = 1 << 14
+    # Class-level default: a pack built without __init__ takes the Triton scatters where they apply.
+    cpp_scatter = False
 
     def __init__(
         self,
@@ -172,12 +178,18 @@ class StepInputPack:
         early_copy: bool = False,
         step_epoch: bool = False,
         prologue_op: Optional[Callable[[torch.Tensor, Optional[torch.Tensor], int], None]] = None,
+        cpp_scatter: bool = False,
     ) -> None:
         self.parallel_scatter = parallel_scatter
+        # No Triton launch: every eager flush takes the native serial scatter, and the in-graph prologue runs only as
+        # the model's prologue_op (without one the pack is issued eagerly before the replay).
+        self.cpp_scatter = cpp_scatter
         self.in_graph = in_graph and parallel_scatter
         self.early_copy = early_copy and self.in_graph
         # The model's one-launch prologue (see the module docstring); None: the scatter launches and the header fill.
         self.prologue_op = prologue_op if self.early_copy else None
+        if cpp_scatter and self.prologue_op is None:
+            self.in_graph = self.early_copy = False
         # The step epoch (see the module docstring); None without step_epoch.
         self.epoch: Optional[torch.Tensor] = (
             torch.zeros(1, dtype=torch.int64, device=device)
@@ -217,10 +229,11 @@ class StepInputPack:
         self.staged: list[torch.Tensor] = []
         self._graph_staged: list[torch.Tensor] = []
         self.used = self.data_start
-        if parallel_scatter:
+        # (in_graph implies parallel_scatter; the native scatter compiles nothing.)
+        if parallel_scatter and not cpp_scatter:
             self._warm_up(device)
-            if self.in_graph:
-                self._warm_up_graph_kernel()
+        if self.in_graph:
+            self._warm_up_graph_kernel()
 
     def _warm_up(self, device: torch.device) -> None:
         """Compile the parallel scatter now, not on a serving step's flush."""
@@ -376,7 +389,7 @@ class StepInputPack:
         host[: 8 * len(desc)].view(torch.int64).copy_(torch.tensor(desc, dtype=torch.int64))
         # Descriptors and data in one upload; the gap between them is unused padding.
         self.dev[: self.used].copy_(host[: self.used], non_blocking=True)
-        if self.parallel_scatter and _parallel_ok(self.h2d, self.d2d):
+        if self.parallel_scatter and not self.cpp_scatter and _parallel_ok(self.h2d, self.d2d):
             stage_i64 = self.dev.view(torch.int64)
             if self.h2d:
                 _parallel_scatter_kernel[(len(self.h2d),)](

@@ -17,7 +17,7 @@ import os
 import weakref
 from collections import deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -50,6 +50,36 @@ from .spec_tail_kernels import (
     store_context_latents,
 )
 from .vocab_parallel import VocabParallelHead, VocabShardedLogits
+
+
+def host_counted_block_width(attn_metadata) -> Optional[int]:
+    """Per-row block count the drafter's refresh computes this step, when the host can tell; else None.
+
+    ``_refresh_ctx_block_tables`` counts, per row of ``draft_kv_cache_block_offsets``,
+    one past the last entry ``>= 0``. KVCacheManagerV2's shared-page-table copy
+    (``copy_batch_block_offsets_to_device``) rewrites every column of each row
+    it copies, mapping a missing page to 0 and every other page to a
+    non-negative offset, and it always copies on a step with context requests.
+    With source and destination rows of equal width, each row then holds no
+    negative entry, so its count is that width. Returns None for any other
+    writer (V1, the per-layer page-table path, a subclass's own copy), where
+    only the device knows the count.
+    """
+    offsets = getattr(attn_metadata, "draft_kv_cache_block_offsets", None)
+    manager = getattr(attn_metadata, "draft_kv_cache_manager", None)
+    if offsets is None or manager is None or not isinstance(manager, KVCacheManagerV2):
+        return None
+    if type(manager).copy_batch_block_offsets is not KVCacheManagerV2.copy_batch_block_offsets:
+        return None
+    if getattr(manager, "_use_per_layer_page_tables", True):
+        return None
+    host = getattr(manager, "host_kv_cache_block_offsets", None)
+    if host is None or host.dim() != 4 or offsets.dim() != 4:
+        return None
+    if host.size(-1) != offsets.size(-1):
+        return None
+    return int(offsets.size(-1))
+
 
 # Backends that keep the draft's private context K/V in a paged HND pool.
 # They share the pool layout, page table and paged append op
@@ -567,6 +597,66 @@ def dflash_windows_span_a_page(windows: Optional[List[Optional[int]]], page_size
     return all(window >= page_size for window in windows or () if window is not None)
 
 
+# The host-side context allocation is a per-worker model opt-in (RuntimeHooks.dflash_host_ctx_alloc, applied
+# through DFlashWorker.enable_host_ctx_alloc); kill switch TRTLLM_DFLASH_DISABLE_HOST_CTX_ALLOC=1.
+_HOST_CTX_ALLOC_CHECK = os.environ.get("TRTLLM_DFLASH_CHECK_HOST_CTX_ALLOC", "0") == "1"
+# Bound on the disagg drafter-context maps (context-side store events, generation-side seeds): an
+# entry is normally consumed within an iteration, so only requests that failed or were cancelled in
+# between linger, and the oldest are dropped first.
+_DISAGG_DRAFT_CTX_MAP_CAP = 8192
+
+# CTXDRAFT_WIN: a disagg context worker that ships the drafter's window
+# (disaggregation/draft_kv.py) stores, per prompt, only the rows that window can reach. Every drafter layer of a
+# windowed drafter (e.g. a DSpark drafter of sliding_attention layers) attends at most ``window_left`` positions
+# behind its block-decode queries, and those queries start at the prompt end, so a prompt row more than
+# ``window_left + 1`` positions behind the prompt end is never read: not by the context worker (it does not draft
+# context requests), not by the generation worker it ships to (the window pages below are stale and released), not
+# after the transfer (an unpaired draft pool publishes nothing to its radix tree). The store skips those rows: no
+# fc + hidden_norm projection, no K / V GEMM, no paged write. The slot's context length still advances over them, so
+# positions, the shipped (ctx_len, ctx_base) and every row that can be read are unchanged. ``_CTXDRAFT_WIN_MARGIN``
+# extra rows (default 1024, a multiple of every page and attention tile size in use) stay stored below the reach, so
+# no attention tile that starts below the window lands on a page this store skipped.
+# Kill switch: TRTLLM_M31_DISABLE_CTXDRAFT_WIN=1 (every prompt row stored).
+_CTXDRAFT_WIN_OFF = os.environ.get("TRTLLM_M31_DISABLE_CTXDRAFT_WIN", "0") == "1"
+_CTXDRAFT_WIN_MARGIN = max(0, int(os.environ.get("TRTLLM_M31_CTXDRAFT_WIN_MARGIN", "1024")))
+# Engagement summary cadence (prefill stores).
+_CTXDRAFT_WIN_LOG_EVERY = 2000
+
+
+def ctxdraft_win_skip_rows(
+    prompt_len: Optional[int], first_pos: int, chunk_len: int, reach: int
+) -> int:
+    """Leading rows of a context chunk the windowed store may skip.
+
+    A chunk covers target positions ``[first_pos, first_pos + chunk_len)`` of a prompt of ``prompt_len`` tokens. The
+    drafter reads back at most ``reach`` positions from the prompt end (window + margin), so rows below
+    ``prompt_len - reach`` are skipped. 0 for an unknown or inconsistent prompt length (the chunk would end past it).
+    """
+    if prompt_len is None or chunk_len <= 0 or reach <= 0 or first_pos < 0:
+        return 0
+    if first_pos + chunk_len > prompt_len:
+        return 0
+    return max(0, min(chunk_len, prompt_len - reach - first_pos))
+
+
+def _block_counts_are_full_rows(draft_kv_cache_manager) -> bool:
+    """Whether every row of the draft block table counts full in ``_ctx_block_counts``.
+
+    ``KVCacheManagerV2.copy_batch_block_offsets`` fills the table with one
+    ``copyBatchBlockOffsetsToDevice`` launch, which writes ``BAD_PAGE_INDEX`` as
+    0 and every page as ``scale * index`` (kvCacheManagerV2Utils.cu), so no entry
+    is negative and every row's count is the table width. A subclass that
+    overrides the copy, or the per-layer page-table path, may leave placeholders
+    negative, so neither counts as full.
+    """
+    return (
+        isinstance(draft_kv_cache_manager, KVCacheManagerV2)
+        and type(draft_kv_cache_manager).copy_batch_block_offsets
+        is KVCacheManagerV2.copy_batch_block_offsets
+        and not getattr(draft_kv_cache_manager, "_use_per_layer_page_tables", True)
+    )
+
+
 def dflash_rebased_ctx_rows(rows: torch.Tensor, base_pages: torch.Tensor) -> torch.Tensor:
     """Block-table rows shifted left by ``base_pages`` entries each.
 
@@ -603,6 +693,16 @@ def dflash_rebased_ctx_view(
     return dflash_rebased_ctx_rows(rows, rebase_pages), num_ctx
 
 
+def _context_onehot_vocab(spec_metadata, num_gens: int, draft_logits_vocab: int):
+    """The draft-prob width of a mixed step's context one-hot rows: the width the gen scatter published to
+    ``draft_probs`` (what acceptance reads next iteration), not the draft logits' width. A vocab-sharded drafter
+    gathers its logits to the full vocab before the scatter, so its shard width would leave stale columns in the
+    new requests' rows. None when the step has no generation requests (the writer then uses the buffer's width)."""
+    if num_gens <= 0:
+        return None
+    return spec_metadata.draft_probs_last_dim or draft_logits_vocab
+
+
 @dataclass
 class DFlashSpecMetadata(SpecMetadata):
     """Metadata for DFlash speculative decoding.
@@ -623,6 +723,10 @@ class DFlashSpecMetadata(SpecMetadata):
     captured_hidden_states: Optional[torch.Tensor] = None
 
     def __post_init__(self):
+        # Preserve the initial slot capacity across CUDA graph copies, whose
+        # max_num_requests is narrowed to the captured graph bucket.
+        self.num_seq_slots = self.num_seq_slots or self.max_num_requests
+
         self._batch_indices_buffer = DeviceCopyBuffer(
             torch.empty([self.max_num_requests], dtype=torch.int, device="cuda"),
             pin_memory=prefer_pinned(),
@@ -692,6 +796,13 @@ class DFlashSpecMetadata(SpecMetadata):
             # slot starts empty at its row's absolute position, on a page
             # boundary (_seed_generation_slot).
             num_contexts = max(0, len(self.request_ids) - self.num_generations)
+            # A disagg generation request whose drafter context window arrived
+            # with its prompt KV (seed_disagg_draft_ctx) starts from that window
+            # instead, applied when the request first holds a real slot: a slot
+            # taken earlier would have been evicted above, and the dummy slot is
+            # never seeded.
+            seeds = worker._disagg_draft_ctx_seeds
+            seeded_rids = []
             row_starts = None
             for row, rid in enumerate(self.request_ids[num_contexts:], start=num_contexts):
                 if (
@@ -708,6 +819,22 @@ class DFlashSpecMetadata(SpecMetadata):
                             "it shares the dummy slot and will draft poorly."
                         )
                         continue
+                    seed = seeds.pop(rid, None) if seeds else None
+                    if seed is not None:
+                        if worker._disagg_draft_kv_engaged:
+                            # A received window lives in the draft pool: the
+                            # drafter must be pool-bound.
+                            worker._check_disagg_draft_ctx_pool_bound()
+                        if worker._ctx_block_tables is not None:
+                            # Only a pool-bound context addresses the draft
+                            # pool's pages; the private arena numbers every
+                            # slot from 0 and has nothing to rebase.
+                            ctx_len, ctx_base, prompt_len = seed
+                            updates[slot] = ctx_len
+                            bases[slot] = ctx_base
+                            worker._req_ctx_pos[rid] = prompt_len
+                            seeded_rids.append(rid)
+                            continue
                     if self.host_position_ids is None or self.seq_lens is None:
                         raise RuntimeError(
                             f"DFlash: no host positions to seed the slot of generation request {rid}"
@@ -719,6 +846,12 @@ class DFlashSpecMetadata(SpecMetadata):
                     position = int(self.host_position_ids[row_starts[row]])
                     worker._seed_generation_slot(slot, position, updates, bases)
             worker._write_ctx_len(updates, bases)
+            hooks = worker._disagg_draft_ctx_seed_hooks
+            if hooks:
+                for rid in seeded_rids:
+                    hook = hooks.pop(rid, None)
+                    if hook is not None:
+                        hook()
 
             # Route unknown request IDs (cuda graph padding or warmup dummies)
             # to dummy slot to avoid corrupting real request's context. A
@@ -861,11 +994,53 @@ class DFlashWorker(SpecWorkerBase):
     # preparation that reads _ctx_block_tables directly sets it False and
     # numbers every slot from 0.
     _ctx_reads_rebased_view = True
+    # Whether the context store builds its per-row allocation on the host where the host knows it
+    # (enable_host_ctx_alloc, RuntimeHooks.dflash_host_ctx_alloc). Off, it is read back from the device.
+    _host_ctx_alloc_enabled = False
     # Whether the bound draft pool releases pages behind a sliding window, and
     # how many tokens it keeps below each window (kv_cache_manager_v2's
     # draft_slot_trail_tokens). Set in _lazy_init_ctx_buffers.
     _ctx_pool_windowed = False
     _ctx_pool_trail = 0
+    # Disaggregated serving with the drafter context window shipped (disaggregation/draft_kv.py),
+    # engaged by the cache transceiver only. Class-level so workers built without __init__ stay off.
+    _disagg_draft_kv_engaged: bool = False
+    # Context side: request id -> (store event, ctx_len, ctx_base) of its latest prefill store.
+    _disagg_draft_ctx_ready: Optional[Dict[int, Tuple[torch.cuda.Event, int, int]]] = None
+    # Generation side of disaggregated serving: request id -> (ctx_len, ctx_base, prompt_len) its
+    # drafter slot starts from (seed_disagg_draft_ctx). Class-level so workers built without
+    # __init__ never seed.
+    _disagg_draft_ctx_seeds: Optional[Dict[int, Tuple[int, int, int]]] = None
+    # Request id -> callback run right after its seed lands (seed_disagg_draft_ctx's on_seed).
+    _disagg_draft_ctx_seed_hooks: Optional[Dict[int, Callable[[], None]]] = None
+    # CTXDRAFT_WIN: the drafter's widest attention window in rows (0: a layer attends the full context), None until
+    # resolved, with the per-layer left windows; plus engagement counters (rows seen / rows skipped / stores).
+    _ctxdraft_win_reach: Optional[int] = None
+    _ctxdraft_win_lefts: Tuple[int, ...] = ()
+    _ctxdraft_win_logged: Optional[set] = None
+    _ctxdraft_win_rows: int = 0
+    _ctxdraft_win_skipped: int = 0
+    _ctxdraft_win_calls: int = 0
+
+    # Context arena sized by num_seq_slots (enable_full_slot_arena) instead of max_num_requests.
+    _full_slot_arena = False
+    # A model's opt-ins (the enable_* methods): lean glue, and its one-launch
+    # replacements of stock steps (None keeps the stock lines). Class-level so
+    # workers built without __init__ take the stock lines.
+    _lean_glue = False
+    _fused_ctx_store = None
+    _fused_prefill_store = None
+    _fused_block_refresh = None
+    _fused_drafter_inputs = None
+    _fused_ctx_advance = None
+    _fused_kv_rewind = None
+    # The arming model's log tag while its fused store / advance take the int32 accept counts (None: int64).
+    _int32_accept_counts = None
+    # Width of the draft block table last decoded, and whether every row of
+    # it counts full (see _ctx_alloc_tokens): then the per-request allocation
+    # the prefill store caps at is known on the host, with no device sync.
+    _ctx_table_width = 0
+    _ctx_counts_full_row = False
 
     def __init__(
         self,
@@ -1361,6 +1536,7 @@ class DFlashWorker(SpecWorkerBase):
             0, (num_slots + 1) * max_blocks, max_blocks, dtype=torch.int32, device="cuda"
         )
         self._ctx_block_counts = torch.zeros(num_slots, dtype=torch.long, device="cuda")
+        self._ctx_counts_full_row = _block_counts_are_full_rows(mgr)
         logger.info(
             f"DFlash: ctx block tables {tuple(self._ctx_block_tables.shape)}, "
             f"pool_idx={self._ctx_pool_idx}, divisor={self._ctx_block_divisor}, "
@@ -1411,6 +1587,25 @@ class DFlashWorker(SpecWorkerBase):
         # is taken before the clamp erases the placeholders; it is informative
         # only on the python V2 backend, the cpp one already mapped
         # BAD_PAGE_INDEX to 0.
+        self._ctx_table_width = int(src.shape[-1])
+        # A target's one-launch refresh (enable_fused_block_refresh) is taken
+        # only where every row counts full (_block_counts_are_full_rows): its
+        # count of entries >= 0 is then the extent decode_draft_block_table
+        # writes, and no per-layer block offset applies.
+        if (
+            self._fused_block_refresh is not None
+            and self._ctx_counts_full_row
+            and self._ctx_block_offset == 0
+            and self._fused_block_refresh(
+                src,
+                self._ctx_pool_idx,
+                num_seqs,
+                self._ctx_block_divisor,
+                self._ctx_block_tables,
+                self._ctx_block_counts,
+            )
+        ):
+            return True
         decode_draft_block_table(
             src[self._ctx_pool_idx, :num_seqs, 0],
             self._ctx_block_divisor,
@@ -1479,7 +1674,13 @@ class DFlashWorker(SpecWorkerBase):
         self._ctx_block_tables_read = None
         self._ctx_block_counts = None
         self._paged_latent_prepare = False
-        max_batch = spec_metadata.max_num_requests
+        # Worker-owned and allocated once, then reused for every later batch
+        # shape. With enable_full_slot_arena it spans num_seq_slots, the
+        # surviving proxy for the pre-graph capacity after max_num_requests is
+        # narrowed to a captured graph bucket; otherwise max_num_requests.
+        max_batch = (
+            spec_metadata.num_seq_slots if self._full_slot_arena else spec_metadata.max_num_requests
+        )
 
         # ctx_len is 1:1 with the target's positions, so max_seq_len bounds it.
         # max_position_embeddings does not: K3's drafter advertises 1048576,
@@ -1875,11 +2076,333 @@ class DFlashWorker(SpecWorkerBase):
             clear(slot)
         return self._req_to_slot[req_id]
 
+    def enable_full_slot_arena(self) -> None:
+        """Size the worker-owned context arena by the full seq-slot range (num_seq_slots) instead of
+        max_num_requests; call before the first prepare. Off by default."""
+        self._full_slot_arena = True
+
+    def enable_window_capped_decode(self, draft_model, max_batch: int) -> None:
+        """Bound the drafter's windowed block decode max_seq_len by the window (batches of at most ``max_batch``
+        requests; 0 = off, the default). See DFlashForCausalLM._decode_max_seq_len."""
+        if hasattr(draft_model, "_dflash_window_cap_max_batch"):
+            draft_model._dflash_window_cap_max_batch = int(max_batch)
+
+    def enable_fused_ar_norm(self, draft_model, enabled: bool = True) -> bool:
+        """Fuse each drafter layer's row-parallel all-reduce (o_proj, down_proj) with the add + RMSNorm after it. Off
+        by default. Returns whether it is on: it needs a TP group, no block convolutions, plain (non-Gemma) RMSNorms and
+        Linears that own their all-reduce."""
+        if not hasattr(draft_model, "_dflash_fused_ar_norm"):
+            return False
+        draft_model._dflash_fused_ar_norm = False
+        model = getattr(draft_model, "model", None)
+        layers = list(getattr(model, "layers", []) or [])
+        if (
+            not enabled
+            or self.mapping.tp_size <= 1
+            or not layers
+            or getattr(draft_model, "has_block_conv", False)
+        ):
+            return False
+        norms = [model.norm] + [
+            n for layer in layers for n in (layer.input_layernorm, layer.post_attention_layernorm)
+        ]
+        linears = [m for layer in layers for m in (layer.self_attn.o_proj, layer.mlp.down_proj)]
+        if any(getattr(n, "use_gemma", False) or getattr(n, "weight", None) is None for n in norms):
+            return False
+        if any(getattr(m, "all_reduce", None) is None for m in linears):
+            return False
+        draft_model._dflash_fused_ar_norm = True
+        return True
+
+    def enable_fused_ar_norm_op(self, draft_model, op) -> bool:
+        """Install a target's one-launch all-reduce + add + RMSNorm for the fused AR + norm (None, the default, keeps
+        each Linear's own fused all-reduce). Only while the fused AR + norm is on (enable_fused_ar_norm).
+
+        ``op(partial, residual, norm_weight, eps)`` must return (normed, residual + reduced) under the fused AR + norm's
+        contract (the reduced sum is not rounded before the add), identical on every TP rank, or None for
+        operands it does not take (decided by shapes / layouts only, so every rank agrees), and then the Linear's
+        all-reduce runs."""
+        if not hasattr(draft_model, "_dflash_fused_ar_norm_op"):
+            return False
+        draft_model._dflash_fused_ar_norm_op = (
+            op if getattr(draft_model, "_dflash_fused_ar_norm", False) else None
+        )
+        return draft_model._dflash_fused_ar_norm_op is not None
+
+    def enable_fc_tp_split(self, draft_model, enabled: bool = True) -> bool:
+        """Split the drafter's replicated fc row-parallel over the TP group: each rank reads 1/TP of its weight, and one
+        fp32 all-reduce sums the partials. Off by default; collective (every rank, outside capture). Returns whether it
+        is on: it needs a TP group, a plain fc, an input width the TP size divides and a draft model that reads the
+        split (``_dflash_fc_split``)."""
+        fc = getattr(draft_model, "fc", None)
+        if fc is None or not hasattr(draft_model, "_dflash_fc_split"):
+            return False
+        draft_model._dflash_fc_split = None
+        tp, rank = self.mapping.tp_size, self.mapping.tp_rank
+        if not enabled or tp <= 1 or getattr(fc, "bias", None) is not None:
+            return False
+        k = fc.weight.shape[1]
+        if k % tp:
+            return False
+        from tensorrt_llm.functional import AllReduceStrategy
+
+        from ..distributed import AllReduce
+
+        ks = k // tp
+        shard = fc.weight.detach()[:, rank * ks : (rank + 1) * ks].contiguous()
+        # MNNVL by name, with the fp32 dtype it needs to set up: its one-shot / two-shot kernels sum the partials in
+        # rank order, so every rank gets the same bits. AUTO would leave the choice to the autotuned all-reduce,
+        # whose tactic is picked per process start.
+        draft_model._dflash_fc_split = (
+            rank * ks,
+            (rank + 1) * ks,
+            shard,
+            AllReduce(mapping=self.mapping, strategy=AllReduceStrategy.MNNVL, dtype=torch.float32),
+        )
+        return True
+
     def _get_ctx_paged_append(self) -> Callable[..., None]:
         """flashinfer paged append, shared by the TRTLLM and FA4 backends."""
         if self._ctx_paged_append is None:
             self._ctx_paged_append = get_dflash_paged_append()
         return self._ctx_paged_append
+
+    def engage_disagg_gen_init_window(self) -> None:
+        """Seed disagg generation requests' drafter slots (see ``seed_disagg_draft_ctx``)."""
+        if self._disagg_draft_ctx_seeds is None:
+            self._disagg_draft_ctx_seeds = {}
+
+    def engage_disagg_draft_kv(self) -> None:
+        """Track the drafter context for the disagg draft-window transfer (cache transceiver only).
+
+        A context worker then records an event after each prefill store, which the send waits on
+        before publishing; a generation worker seeds each received request's context length over
+        the empty window its gen-init sizing seeded.
+        """
+        self._disagg_draft_kv_engaged = True
+        self._disagg_draft_ctx_ready = {}
+        self.engage_disagg_gen_init_window()
+
+    def _check_disagg_draft_ctx_pool_bound(self) -> None:
+        """The transferred window lives in the draft KV pool; a private arena is out of reach."""
+        if self._ctx_block_tables is None:
+            raise RuntimeError(
+                "DFlash: the disagg drafter context-window transfer needs the drafter context in "
+                "the managed draft KV pool, but it is on the private arena (FA4 or a pool "
+                "shape mismatch); set TRTLLM_M31_DISABLE_DISAGG_DRAFT_KV=1 to serve without it"
+            )
+
+    @staticmethod
+    def _bound_disagg_draft_ctx_map(entries: dict) -> None:
+        while len(entries) > _DISAGG_DRAFT_CTX_MAP_CAP:
+            entries.pop(next(iter(entries)))
+
+    def _record_disagg_draft_ctx_ready(self, spec_metadata, num_contexts: int) -> None:
+        """Context side of the disagg draft window: an event after this batch's drafter store.
+
+        Recorded on the current (execution) stream right after ``_store_prefill_context``, and
+        never while capturing a graph (context batches run eagerly). Each context request keeps
+        its latest store's event with the slot's host ``(ctx_len, ctx_base)``, read here because
+        the slot may be recycled before the send. No host synchronization.
+        """
+        if not self._disagg_draft_kv_engaged or num_contexts <= 0:
+            return
+        if torch.cuda.is_current_stream_capturing():
+            return
+        request_ids = spec_metadata.request_ids
+        if not request_ids:
+            return
+        self._check_disagg_draft_ctx_pool_bound()
+        event = torch.cuda.Event()
+        event.record()
+        ready = self._disagg_draft_ctx_ready
+        for rid in request_ids[:num_contexts]:
+            slot = self._req_to_slot.get(rid)
+            if slot is None:
+                ctx_len, ctx_base = 0, 0
+            else:
+                ctx_len, ctx_base = self._ctx_len_host[slot], self._ctx_base_host[slot]
+            # Re-inserted so the dict stays ordered by the latest store.
+            ready.pop(rid, None)
+            ready[rid] = (event, int(ctx_len), int(ctx_base))
+        self._bound_disagg_draft_ctx_map(ready)
+
+    def take_disagg_draft_ctx_ready(
+        self, request_id: int
+    ) -> Optional[Tuple[torch.cuda.Event, int, int]]:
+        """Hand over a context request's latest drafter-store event with its (ctx_len, ctx_base)."""
+        ready = self._disagg_draft_ctx_ready
+        return None if ready is None else ready.pop(request_id, None)
+
+    def seed_disagg_draft_ctx(
+        self,
+        request_id: int,
+        ctx_len: int,
+        ctx_base: int,
+        prompt_len: int,
+        on_seed: Optional[Callable[[], None]] = None,
+    ) -> None:
+        """Generation side: the drafter state a disagg generation request's slot starts from.
+
+        Applied by ``DFlashSpecMetadata.prepare`` when the request first holds a real slot, which
+        then runs ``on_seed`` (e.g. a test reading the window as the first step sees it).
+        """
+        seeds = self._disagg_draft_ctx_seeds
+        if seeds is None:
+            return
+        seeds.pop(request_id, None)
+        seeds[request_id] = (int(ctx_len), int(ctx_base), int(prompt_len))
+        self._bound_disagg_draft_ctx_map(seeds)
+        if on_seed is not None:
+            if self._disagg_draft_ctx_seed_hooks is None:
+                self._disagg_draft_ctx_seed_hooks = {}
+            self._disagg_draft_ctx_seed_hooks[request_id] = on_seed
+            self._bound_disagg_draft_ctx_map(self._disagg_draft_ctx_seed_hooks)
+
+    def seed_disagg_empty_window(
+        self, request_id: int, prompt_len: int, tokens_per_block: int
+    ) -> None:
+        """Start a disagg generation request's drafter from an empty window at the prompt end.
+
+        That is what ``DFlashSpecMetadata.prepare`` does for a generation request with no seed
+        (``_seed_generation_slot``), so this only drops a seed recorded earlier for the id.
+        ``prompt_len`` and ``tokens_per_block`` are accepted for the cache manager's gen-init
+        callback signature.
+        """
+        seeds = self._disagg_draft_ctx_seeds
+        if seeds is not None:
+            seeds.pop(request_id, None)
+
+    def enable_lean_glue(self, draft_model, enabled: bool = True) -> None:
+        """Skip the drafter's copies whose consumer reads strided views (worker and draft model); off by default.
+        The values are bitwise the same; only the copies go."""
+        self._lean_glue = bool(enabled)
+        if hasattr(draft_model, "_dflash_lean_glue"):
+            draft_model._dflash_lean_glue = bool(enabled)
+
+    def enable_fused_ctx_store(self, store) -> bool:
+        """Install a target's one-launch context K / V store (None, the default, keeps the stock path).
+
+        ``store(draft_model, projected, positions, num_accepted, request_rows, cols, block_table, kv_buf,
+        tokens_per_request)`` must write exactly what precompute_context_kv + the accept mask + _store_context_kv_paged
+        write, and return False (writing nothing) for a drafter or cache it does not reproduce. It is first called with
+        ``cols`` None and the keywords ``capacity_counts`` (bound pool: pages per block-table row) / ``max_col`` (the
+        private arena's last column), to derive each row's column from its position as the stock clamp does."""
+        self._fused_ctx_store = store
+        return store is not None
+
+    def enable_fused_prefill_store(self, store) -> bool:
+        """Install a target's per-chunk prefill context K / V store (None, the default, keeps the stock path).
+
+        ``store(draft_model, projected, start, end, row, block_table, kv_buf)`` must write exactly what
+        ``precompute_context_kv(projected, arange(start, end))`` + ``_store_context_kv_paged(k, v, full(row),
+        arange(start, end))`` write for one context chunk (``projected``: its ``end - start`` fc + hidden_norm'd rows;
+        ``row``: its block-table row; the stock caller has already checked ``end`` against the row's allocation), and
+        return False (writing nothing) for a drafter or cache it does not reproduce. It runs after the target's
+        decoder body, outside any capture (breakable prefill CUDA graphs capture only the layer forward); a store must
+        still decline, not allocate, if it ever finds the stream capturing."""
+        self._fused_prefill_store = store
+        return store is not None
+
+    def enable_fused_ctx_advance(self, advance) -> bool:
+        """Install a target's one-launch context advance + read view on a bound draft pool (None, the default, keeps
+        the stock path).
+
+        ``advance(slots, rows, num_accepted, ctx_len, max_ctx, dummy_slot, block_counts, base_pages, tables,
+        tables_read, page_size, block_size)`` must leave ``ctx_len`` and ``tables_read[rows]`` exactly as
+        _advance_ctx_len and the read view below do and return the advertised context lengths, or None (writing
+        nothing) for a layout it does not reproduce."""
+        self._fused_ctx_advance = advance
+        return advance is not None
+
+    def enable_int32_accept_counts(self, tag: Optional[str]) -> bool:
+        """Hand the generation rows' accept counts to the installed fused context store and advance as the int32
+        tensor they arrive in (None, the default, keeps the int64 copy).
+
+        Both fused ops must read int32 and int64 counts alike (the same integers), so this is taken only with both
+        installed; any stock path below converts on first use. ``tag`` names the arming target in its engagement
+        line."""
+        if tag is None or self._fused_ctx_store is None or self._fused_ctx_advance is None:
+            self._int32_accept_counts = None
+            return False
+        self._int32_accept_counts = tag
+        return True
+
+    def enable_fused_forward_indices(self, draft_model, indices) -> bool:
+        """Install a target's one-launch index prelude for the draft model's paged block decode (None, the default,
+        keeps the stock lines).
+
+        ``indices(num_ctx, batch_idx, query_positions, block_size, pages_per_slot, page_size)`` must return the int32
+        (cache_seqlens, cache_batch_idx, seq_lens_after, kv_indptr, kv_last_page_len, append_positions,
+        query_positions_flat) exactly as the stock lines of dflash_forward compute them, or None for a layout it does
+        not reproduce."""
+        if not hasattr(draft_model, "_dflash_fused_indices"):
+            return False
+        draft_model._dflash_fused_indices = indices
+        return indices is not None
+
+    def enable_fused_qk_norm_rope(self, draft_model, fused) -> bool:
+        """Install a target's one-launch q / k RMSNorm + RoPE for the draft model's flashinfer-RoPE branch (None, the
+        default, keeps the stock lines).
+
+        ``fused(qkv, q_size, kv_size, head_dim, q_norm, k_norm, positions, cos_sin_cache, is_neox)`` must return new
+        (q, k) exactly as the stock q_norm / k_norm + flashinfer RoPE lines leave them, or None for a layout it does
+        not reproduce."""
+        if not hasattr(draft_model, "_dflash_fused_qk_norm_rope"):
+            return False
+        draft_model._dflash_fused_qk_norm_rope = fused
+        return fused is not None
+
+    def enable_fused_qk_norm_rope_append(self, draft_model, fused) -> bool:
+        """Install a target's one-launch q / k RMSNorm + RoPE that also appends the block's K / V into the layer's
+        paged cache, for the draft model's flashinfer-RoPE branch on the TRTLLM backend (None, the default, keeps the
+        stock lines).
+
+        ``fused(qkv, q_size, kv_size, head_dim, q_norm, k_norm, positions, cos_sin_cache, is_neox, paged_kv_cache,
+        append_batch_indices, append_positions, kv_indices, kv_indptr)`` must return new (q, k) exactly as
+        ``enable_fused_qk_norm_rope``'s op does AND leave the cache exactly as flashinfer's append_paged_kv_cache of
+        that K / V would; or return None (nothing computed or written), and the stock lines run."""
+        if not hasattr(draft_model, "_dflash_fused_qk_norm_rope_append"):
+            return False
+        draft_model._dflash_fused_qk_norm_rope_append = fused
+        return fused is not None
+
+    def enable_attention_pdl(self, draft_model, enabled: bool) -> bool:
+        """Launch the draft model's TRTLLM-backend block attention (trtllm-gen decode / context) with programmatic
+        dependent launch: the same kernel and inputs, launched to overlap the previous kernel's tail (it waits for that
+        grid before reading). Off by default."""
+        if not hasattr(draft_model, "_dflash_attn_pdl"):
+            return False
+        draft_model._dflash_attn_pdl = bool(enabled)
+        return draft_model._dflash_attn_pdl
+
+    def enable_fused_drafter_inputs(self, inputs) -> bool:
+        """Install a target's one-launch drafter step inputs (None, the default, keeps the stock path).
+
+        ``inputs(embed_tokens, accepted_tokens, num_accepted, slots, ctx_len, max_ctx, mask_token_id,
+        trained_mask_embedding, block_size, tokens_per_request)`` must return exactly the stock (bonus,
+        query_position_ids, ctx_position_ids, noise block) of prepare_1st_drafter_inputs' generation branch, or None
+        (computing nothing) for an embedding or layout it does not reproduce."""
+        self._fused_drafter_inputs = inputs
+        return inputs is not None
+
+    def enable_fused_kv_rewind(self, rewind) -> bool:
+        """Install a target's one-launch draft-forward KV bookkeeping (None, the default, keeps the stock lines).
+
+        ``rewind(num_accepted, kv_lens, nc, bs)`` must leave ``kv_lens[nc:bs]`` incremented by one and return the
+        tensor ``1 - num_accepted[nc:bs]`` (the same values and dtype), exactly as _prepare_kv_for_draft_forward's
+        two lines, or None (writing nothing) for operands it does not take."""
+        self._fused_kv_rewind = rewind
+        return rewind is not None
+
+    def enable_fused_block_refresh(self, refresh) -> bool:
+        """Install a target's one-launch block-table refresh (None, the default, keeps the stock path).
+
+        ``refresh(offsets, pool_idx, num_seqs, divisor, tables, counts)`` must write exactly what
+        _refresh_ctx_block_tables writes into ``tables[:num_seqs]`` and ``counts[:num_seqs]``, and return False
+        (writing nothing) for a layout it does not reproduce."""
+        self._fused_block_refresh = refresh
+        return refresh is not None
 
     def _store_context_kv_paged(
         self,
@@ -1912,9 +2435,11 @@ class DFlashWorker(SpecWorkerBase):
         positions_i32 = positions.to(torch.int32)
         kv_indices, kv_indptr = self._ctx_paged_index_args()
         for layer_idx in range(k.size(1)):
+            # Lean glue: flashinfer's append is stride-aware (last dim contiguous), so the per-layer slices go
+            # in as views; the values written are bitwise the same.
             append_paged_kv_cache(
-                append_key=k[:, layer_idx].contiguous(),
-                append_value=v[:, layer_idx].contiguous(),
+                append_key=k[:, layer_idx] if self._lean_glue else k[:, layer_idx].contiguous(),
+                append_value=v[:, layer_idx] if self._lean_glue else v[:, layer_idx].contiguous(),
                 batch_indices=rows_i32,
                 positions=positions_i32,
                 paged_kv_cache=self._ctx_kv_buf[layer_idx],
@@ -1947,11 +2472,22 @@ class DFlashWorker(SpecWorkerBase):
     ):
         """Adjust kv_lens_cuda so the draft model sees correct RoPE positions."""
         if hasattr(attn_metadata, "kv_lens_cuda"):
-            self._kv_rewind_amount = 1 - num_accepted_tokens[num_contexts:batch_size]
+            # A target's one-launch bookkeeping: the same rewind amount and kv_lens increment as the lines below.
+            fused = (
+                self._fused_kv_rewind(
+                    num_accepted_tokens, attn_metadata.kv_lens_cuda, num_contexts, batch_size
+                )
+                if self._fused_kv_rewind is not None and batch_size > num_contexts
+                else None
+            )
+            if fused is not None:
+                self._kv_rewind_amount = fused
+            else:
+                self._kv_rewind_amount = 1 - num_accepted_tokens[num_contexts:batch_size]
             self._kv_rewind_nc = num_contexts
             self._kv_rewind_bs = batch_size
 
-            if batch_size > num_contexts:
+            if fused is None and batch_size > num_contexts:
                 attn_metadata.kv_lens_cuda[num_contexts:batch_size] += 1
             self._kv_rewind_pending = True
 
@@ -2034,6 +2570,122 @@ class DFlashWorker(SpecWorkerBase):
         if self._saved_ctx_base is not None:
             self._ctx_base_pages.copy_(self._saved_ctx_base)
 
+    def enable_host_ctx_alloc(self, enabled: bool = True) -> bool:
+        """Build the context store's per-row allocation on the host where it is known
+        (RuntimeHooks.dflash_host_ctx_alloc); off by default. ``TRTLLM_DFLASH_DISABLE_HOST_CTX_ALLOC=1``
+        keeps the device read-back. Returns whether it is on."""
+        killed = os.environ.get("TRTLLM_DFLASH_DISABLE_HOST_CTX_ALLOC", "0") == "1"
+        self._host_ctx_alloc_enabled = bool(enabled) and not killed
+        return self._host_ctx_alloc_enabled
+
+    def _ctx_alloc_tokens(self, attn_metadata, num_contexts: int) -> List[int]:
+        """Tokens addressable through each context row of the block table.
+
+        That is ``_ctx_block_counts[:num_contexts] * page_size``, read back from the
+        device: a device sync once per context chunk, so the host waits for the
+        target's whole chunk forward. With ``enable_host_ctx_alloc`` the list is
+        built on the host when the host can tell what the refresh counted: every
+        row counts full (``_block_counts_are_full_rows``), or the draft block
+        table comes from the manager's shared-page-table copy
+        (``host_counted_block_width``). ``TRTLLM_DFLASH_CHECK_HOST_CTX_ALLOC=1``
+        reads it back as well and asserts the two agree.
+        """
+        if self._host_ctx_alloc_enabled:
+            width = None
+            if self._ctx_counts_full_row and self._ctx_table_width > 0:
+                width = self._ctx_table_width
+            elif not self._ctx_unified_cache:
+                # A unified cache decodes the target's own offsets, which this
+                # host check does not describe.
+                width = host_counted_block_width(attn_metadata)
+            if width is not None:
+                alloc = [width * self._ctx_page_size] * num_contexts
+                if _HOST_CTX_ALLOC_CHECK:
+                    device = (self._ctx_block_counts[:num_contexts] * self._ctx_page_size).tolist()
+                    assert alloc == device, f"DFlash host ctx allocation {alloc} != device {device}"
+                return alloc
+        return (self._ctx_block_counts[:num_contexts] * self._ctx_page_size).tolist()
+
+    def _ctxdraft_win_resolve(self, draft_model) -> int:
+        """CTXDRAFT_WIN reach in rows (window + margin), or 0 (off). The drafter's windows are resolved once; the
+        worker conditions are read per store, since the transceiver engages and the draft pool binds after the first
+        (warmup) stores: every drafter layer windowed, the drafter context in the managed draft pool, unpaired (nothing
+        published for reuse), and this worker shipping the window (disagg)."""
+        window = self._ctxdraft_win_reach
+        if window is None:
+            window, lefts = 0, []
+            resolve = getattr(draft_model, "_resolve_block_attention", None)
+            num_layers = len(getattr(getattr(draft_model, "model", None), "layers", []) or [])
+            if resolve is not None and num_layers > 0:
+                lefts = [int(resolve(layer_idx)[1][0]) for layer_idx in range(num_layers)]
+                if min(lefts) >= 0:
+                    window = max(lefts) + 1
+            self._ctxdraft_win_reach = window
+            self._ctxdraft_win_lefts = tuple(lefts)
+        why = None
+        if _CTXDRAFT_WIN_OFF:
+            why = "killed (TRTLLM_M31_DISABLE_CTXDRAFT_WIN=1)"
+        elif window <= 0:
+            why = f"a drafter layer attends the full context (left windows {self._ctxdraft_win_lefts})"
+        elif not self._disagg_draft_kv_engaged:
+            why = "the drafter window is not shipped (not a disagg draft-window worker)"
+        elif self._ctx_block_tables is None:
+            why = "the drafter context is not in the managed draft pool"
+        elif self._ctx_reuse_addressable:
+            why = "the draft pool is paired with target reuse (stored rows are reusable)"
+        if self._ctxdraft_win_logged is None:
+            self._ctxdraft_win_logged = set()
+        if why not in self._ctxdraft_win_logged:
+            self._ctxdraft_win_logged.add(why)
+            if why is None:
+                logger.info(
+                    f"DFlash: CTXDRAFT_WIN taken: prompt rows more than {window + _CTXDRAFT_WIN_MARGIN} behind "
+                    f"the prompt end are not stored (drafter left windows {self._ctxdraft_win_lefts}, margin "
+                    f"{_CTXDRAFT_WIN_MARGIN})"
+                )
+            else:
+                logger.info(f"DFlash: CTXDRAFT_WIN not taken: {why}")
+        return 0 if why is not None else window + _CTXDRAFT_WIN_MARGIN
+
+    def _ctxdraft_win_skips(
+        self, draft_model, spec_metadata, attn_metadata, num_contexts: int
+    ) -> Optional[List[int]]:
+        """Per context request, the leading chunk rows CTXDRAFT_WIN skips; None when it skips nothing this step."""
+        if num_contexts == 0:
+            return None
+        # Resolved first: a worker that does not take it never queries the device.
+        reach = self._ctxdraft_win_resolve(draft_model)
+        if reach <= 0 or torch.cuda.is_current_stream_capturing():
+            return None
+        host_pos = spec_metadata.host_position_ids
+        keyed = getattr(spec_metadata, "ctx_prompt_lens", None)
+        if host_pos is None or keyed is None:
+            return None
+        ids, prompt_lens = keyed
+        # A list left from another batch (a prepare path that did not refresh it) is never applied.
+        if (
+            len(prompt_lens) != num_contexts
+            or tuple(spec_metadata.request_ids[:num_contexts]) != ids
+        ):
+            return None
+        skips = []
+        offset = 0
+        for i in range(num_contexts):
+            slen = int(attn_metadata._seq_lens[i])
+            first = int(host_pos[offset]) if slen > 0 and offset < host_pos.numel() else -1
+            skips.append(ctxdraft_win_skip_rows(prompt_lens[i], first, slen, reach))
+            offset += slen
+        skipped = sum(skips)
+        self._ctxdraft_win_rows += offset
+        self._ctxdraft_win_skipped += skipped
+        self._ctxdraft_win_calls += 1
+        if self._ctxdraft_win_calls % _CTXDRAFT_WIN_LOG_EVERY == 1:
+            logger.info(
+                f"DFlash: CTXDRAFT_WIN: {self._ctxdraft_win_skipped} of {self._ctxdraft_win_rows} context rows "
+                f"skipped over {self._ctxdraft_win_calls} prefill stores"
+            )
+        return skips if skipped else None
+
     def _store_prefill_context(
         self,
         draft_model,
@@ -2060,9 +2712,31 @@ class DFlashWorker(SpecWorkerBase):
         if captured_hs is None:
             return
 
-        # Project context tokens through fc + hidden_norm
+        # Project context tokens through fc + hidden_norm. CTXDRAFT_WIN: only the rows the drafter can read; proj_row[i]
+        # is where request i's first kept row sits in ctx_proj (its chunk offset when nothing is skipped).
         ctx_hs = captured_hs[:num_ctx_tokens]
-        ctx_proj = draft_model.project_target_hidden(ctx_hs)
+        skips = self._ctxdraft_win_skips(
+            draft_model, spec_metadata, attn_metadata, attn_metadata.num_contexts
+        )
+        proj_row = None
+        if skips is None:
+            ctx_proj = draft_model.project_target_hidden(ctx_hs)
+        else:
+            segments, proj_row, kept, row = [], [], 0, 0
+            for i, skip in enumerate(skips):
+                slen = int(attn_metadata._seq_lens[i])
+                proj_row.append(kept)
+                if slen > skip:
+                    segments.append(ctx_hs[row + skip : row + slen])
+                    kept += slen - skip
+                row += slen
+            ctx_proj = (
+                None
+                if not segments
+                else draft_model.project_target_hidden(
+                    segments[0] if len(segments) == 1 else torch.cat(segments, dim=0)
+                )
+            )
 
         # Split by request and store/append accumulated context.
         # Context requests may arrive in chunks (chunked prefill), so we must
@@ -2078,23 +2752,43 @@ class DFlashWorker(SpecWorkerBase):
         num_contexts = attn_metadata.num_contexts
         # A context write addresses pages through row i of the block table, so
         # it must fit that row's allocation as well as the arena's length.
-        # One tolist() for the whole loop: the lengths themselves come from
-        # _ctx_len_host, so the loop body below stays sync-free.
+        # Built once for the whole loop (on the host only with
+        # enable_host_ctx_alloc); the lengths themselves come from _ctx_len_host,
+        # so the loop body stays sync-free.
         ctx_alloc = (
-            (self._ctx_block_counts[:num_contexts] * self._ctx_page_size).tolist()
-            if self._ctx_block_tables is not None
-            else None
+            None
+            if self._ctx_block_tables is None
+            else self._ctx_alloc_tokens(attn_metadata, num_contexts)
         )
+        # A target's per-chunk fused store (enable_fused_prefill_store): paged caches only; the stock lines run for
+        # any chunk it declines. With it installed, the chunk's position copy is made only where it is read (no
+        # host_pos), so the loop launches nothing per chunk beyond the store itself.
+        fused_prefill = self._fused_prefill_store if self._ctx_paged else None
         for i in range(num_contexts):
             req_id = spec_metadata.request_ids[i]
             slen = int(attn_metadata._seq_lens[i])
-            chunk_proj = ctx_proj[offset : offset + slen].detach()
-            chunk_pos = position_ids[offset : offset + slen].long().detach()
+            skip = 0 if skips is None else skips[i]
+            chunk_proj = (
+                ctx_proj[offset : offset + slen].detach()
+                if proj_row is None
+                else (
+                    None
+                    if skip >= slen
+                    else ctx_proj[proj_row[i] : proj_row[i] + slen - skip].detach()
+                )
+            )
+            chunk_pos = (
+                None
+                if fused_prefill is not None
+                else position_ids[offset : offset + slen].long().detach()
+            )
 
             if slen == 0:
                 first_pos = 0
             elif host_pos is not None:
                 first_pos = int(host_pos[offset])
+            elif chunk_pos is None:
+                first_pos = int(position_ids[offset].item())
             else:
                 first_pos = chunk_pos[0].item()
 
@@ -2161,11 +2855,30 @@ class DFlashWorker(SpecWorkerBase):
             # continuation.
             self._req_ctx_pos[req_id] = first_pos + slen
             if actual > 0:
+                # CTXDRAFT_WIN: the context length covers the whole chunk; the skipped leading rows are never read.
+                ctx_len_updates[slot] = end
+                cur += skip
+                actual -= skip
+            if actual > 0:
                 cache_dtype = (
                     self._ctx_kv_buf[0].dtype if self._ctx_paged else self._ctx_k_buf.dtype
                 )
                 chunk_proj_cast = chunk_proj[:actual].to(cache_dtype)
-                ctx_len_updates[slot] = end
+                # Manager block tables are keyed by batch position, the
+                # private arena's by slot. See _ctx_paged_index_args.
+                if fused_prefill is not None and fused_prefill(
+                    draft_model,
+                    chunk_proj_cast,
+                    cur,
+                    end,
+                    i if self._ctx_block_tables is not None else slot,
+                    self._ctx_block_tables
+                    if self._ctx_block_tables is not None
+                    else self._ctx_page_table,
+                    self._ctx_kv_buf,
+                ):
+                    offset += slen
+                    continue
                 # Precompute post-norm/post-RoPE K,V for this prefill chunk
                 # so decode iters can read without re-projecting.
                 #
@@ -2346,6 +3059,7 @@ class DFlashWorker(SpecWorkerBase):
             self._store_prefill_context(
                 draft_model, spec_metadata, attn_metadata, position_ids, total_target_tokens
             )
+            self._record_disagg_draft_ctx_ready(spec_metadata, num_contexts)
             # Rebuild batch_to_slot after prefill assigns new slots
             if self._ctx_buf_inited and spec_metadata.request_ids:
                 self._rebuild_batch_to_slot(spec_metadata.request_ids)
@@ -2364,6 +3078,14 @@ class DFlashWorker(SpecWorkerBase):
 
         if num_gens > 0:
             with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
+                if hasattr(draft_model, "_dflash_cache_rows"):
+                    # Lean glue: in bound mode the cache rows are the contiguous
+                    # gen rows, so the block table is a slice.
+                    draft_model._dflash_cache_rows = (
+                        (num_contexts, num_contexts + num_gens)
+                        if self._lean_glue and self._ctx_block_tables is not None
+                        else None
+                    )
                 hidden_states_out = draft_model.dflash_forward(
                     noise_embedding=inputs["noise_embedding"],
                     query_positions=inputs["query_positions"],
@@ -2381,13 +3103,22 @@ class DFlashWorker(SpecWorkerBase):
                 # Which block slots carry them is a drafter-family convention,
                 # resolved through _draft_slot_ids.
                 block_size = self._compute_block_size
-                gen_gather_ids = self._draft_slot_ids(draft_model, num_gens, block_size, K)
-                # Shields only the last request: at block_size == K with
-                # shift_label off, slots run 1..K, so every request reads the
-                # next one's slot 0 and the last overruns. Degrades, never raises.
-                gen_gather_ids = gen_gather_ids.clamp(max=hidden_states_out.shape[0] - 1)
-
-                gen_hidden_states = hidden_states_out[gen_gather_ids]
+                if (
+                    self._lean_glue
+                    and getattr(draft_model, "_dspark_shift_label", False)
+                    and block_size == K
+                    and hidden_states_out.shape[0] == num_gens * block_size
+                ):
+                    # Lean glue: under shift_label with block_size == K the slot
+                    # ids are arange(num_gens * K), so the gather is the identity.
+                    gen_hidden_states = hidden_states_out
+                else:
+                    gen_gather_ids = self._draft_slot_ids(draft_model, num_gens, block_size, K)
+                    # Shields only the last request: at block_size == K with
+                    # shift_label off, slots run 1..K, so every request reads the
+                    # next one's slot 0 and the last overruns. Degrades, never raises.
+                    gen_gather_ids = gen_gather_ids.clamp(max=hidden_states_out.shape[0] - 1)
+                    gen_hidden_states = hidden_states_out[gen_gather_ids]
                 vocab_parallel = self._vocab_parallel
                 if (
                     vocab_parallel is not None
@@ -2403,21 +3134,31 @@ class DFlashWorker(SpecWorkerBase):
                     )
                     vocab_size = vocab_parallel.head.vocab_size
                 else:
-                    gen_logits = draft_model.logits_processor(
-                        gen_hidden_states, draft_model.lm_head, attn_metadata, True
+                    # A model's one-launch head + refinement, or None for the
+                    # stock lines below.
+                    gen_logits = self._try_fused_draft_head_and_refine(
+                        draft_model,
+                        gen_hidden_states,
+                        attn_metadata,
+                        inputs,
+                        spec_metadata,
+                        num_gens,
+                        K,
                     )
-                    # The drafter shares the target's LM head but not its logits
-                    # processor, so apply the transform its config declares,
-                    # before any refinement: a DSpark Markov bias is added to
-                    # the transformed logits.
-                    gen_logits = draft_model.apply_draft_logit_transform(gen_logits)
+                    if gen_logits is None:
+                        gen_logits = draft_model.logits_processor(
+                            gen_hidden_states, draft_model.lm_head, attn_metadata, True
+                        )
+                        # The drafter shares the target's LM head but not its logits
+                        # processor, so apply the transform its config declares,
+                        # before any refinement: a DSpark Markov bias is added to
+                        # the transformed logits.
+                        gen_logits = draft_model.apply_draft_logit_transform(gen_logits)
+                        gen_logits = gen_logits.reshape(num_gens, K, gen_logits.shape[-1])
 
-                    vocab_size = gen_logits.shape[-1]
-                    gen_logits = gen_logits.reshape(num_gens, K, vocab_size)
-
-                    gen_logits = self._refine_block_logits(
-                        draft_model, gen_logits, inputs, spec_metadata
-                    )
+                        gen_logits = self._refine_block_logits(
+                            draft_model, gen_logits, inputs, spec_metadata
+                        )
 
                     # DFlash 2: replace the independent per-position picks with
                     # one coherent path through the block (absent for plain
@@ -2430,7 +3171,6 @@ class DFlashWorker(SpecWorkerBase):
                             inputs["lilicorr_anchor"],
                             spec_metadata,
                         )
-                        vocab_size = gen_logits.shape[-1]
                     elif getattr(draft_model, "has_candidate_selector", False):
                         gen_logits = self._apply_dflash2_selector(
                             draft_model,
@@ -2439,13 +3179,9 @@ class DFlashWorker(SpecWorkerBase):
                             inputs["first_prev_tokens"],
                             spec_metadata,
                         )
-                        vocab_size = gen_logits.shape[-1]
 
-                    gen_draft_tokens = self.sample_draft_tokens(
-                        gen_logits,
-                        spec_metadata,
-                        batch_size,
-                        num_contexts=num_contexts,
+                    gen_draft_tokens, vocab_size = self._draft_block_tokens(
+                        draft_model, gen_logits, inputs, spec_metadata, batch_size, num_contexts
                     )
 
                 # Opt-in confidence-calibration recording (env-gated). The
@@ -2475,7 +3211,9 @@ class DFlashWorker(SpecWorkerBase):
         # Context requests are not drafted by the block worker (zero placeholder
         # token); fill their draft-prob slot rows with a one-hot placeholder so
         # they are a legal distribution when they become gen requests next iter.
-        gen_vocab = vocab_size if num_gens > 0 else None
+        gen_vocab = (
+            _context_onehot_vocab(spec_metadata, num_gens, vocab_size) if num_gens > 0 else None
+        )
         self.write_context_onehot_draft_probs(spec_metadata, num_contexts, num_gens, K, gen_vocab)
 
         if num_contexts > 0 and num_gens > 0:
@@ -2543,6 +3281,17 @@ class DFlashWorker(SpecWorkerBase):
         """
         return dflash_draft_slot_ids(num_gens, block_size, num_draft_tokens, False, device="cuda")
 
+    def _try_fused_draft_head_and_refine(
+        self, draft_model, hidden, attn_metadata, inputs, spec_metadata, num_gens, k
+    ):
+        """A model's one-launch draft head and block refinement, or None (the stock lines run).
+
+        Returns the ``[num_gens, k, vocab]`` block logits exactly as the logits processor,
+        ``apply_draft_logit_transform`` and :meth:`_refine_block_logits` give them for
+        ``hidden``. A worker subclass of a model that ships such a kernel overrides it.
+        """
+        return None
+
     def _refine_block_logits(
         self,
         draft_model,
@@ -2558,6 +3307,15 @@ class DFlashWorker(SpecWorkerBase):
         intra-block bias.
         """
         return gen_logits
+
+    def _draft_block_tokens(
+        self, draft_model, gen_logits, inputs, spec_metadata, batch_size, num_contexts
+    ):
+        """The block's draft tokens and the vocab width they index."""
+        tokens = self.sample_draft_tokens(
+            gen_logits, spec_metadata, batch_size, num_contexts=num_contexts
+        )
+        return tokens, gen_logits.shape[-1]
 
     def _apply_dflash2_selector(
         self,
@@ -2769,28 +3527,51 @@ class DFlashWorker(SpecWorkerBase):
             )
 
             K_plus_1 = K + 1
-
-            bonus_idx = (gen_num_accepted - 1).clamp_min(0).long().unsqueeze(1)
-            bonus = gen_accepted_tokens.gather(1, bonus_idx).squeeze(1).long()
-
-            ctx_len_gen = self._ctx_len[slots]
-            j_block = torch.arange(query_tokens_per_req, dtype=torch.long, device="cuda")
             offsets_kp1 = torch.arange(K_plus_1, dtype=torch.long, device="cuda")
 
-            # _ctx_len is clamped to _max_ctx only AFTER this step's accepted
-            # tokens are folded in (see the update below), so the running length
-            # used here has to be clamped on its own -- otherwise a request that
-            # already sits at the ceiling indexes num_accepted positions past
-            # any position the sequence can legitimately reach.
-            ctx_len_now = (ctx_len_gen + gen_num_accepted.long()).clamp_(max=self._max_ctx)
-            query_position_ids = ctx_len_now.unsqueeze(1) + j_block.unsqueeze(0)
-            ctx_position_ids = ctx_len_gen.unsqueeze(1) + offsets_kp1.unsqueeze(0)
-
-            noise_embed_2d = dflash_noise_block_embedding(
-                embed_tokens, bonus, mask_token_id, query_tokens_per_req, trained_mask_embedding
+            # A model's one-launch step inputs (enable_fused_drafter_inputs): the
+            # same bonus, positions and noise block as the stock lines below.
+            fused_inputs = (
+                self._fused_drafter_inputs(
+                    embed_tokens,
+                    gen_accepted_tokens,
+                    gen_num_accepted,
+                    slots,
+                    self._ctx_len,
+                    self._max_ctx,
+                    mask_token_id,
+                    trained_mask_embedding,
+                    query_tokens_per_req,
+                    K_plus_1,
+                )
+                if self._fused_drafter_inputs is not None
+                else None
             )
+            if fused_inputs is not None:
+                bonus, query_position_ids, ctx_position_ids, noise_embed_2d = fused_inputs
+                ctx_len_gen = None
+            else:
+                bonus_idx = (gen_num_accepted - 1).clamp_min(0).long().unsqueeze(1)
+                bonus = gen_accepted_tokens.gather(1, bonus_idx).squeeze(1).long()
+
+                ctx_len_gen = self._ctx_len[slots]
+                j_block = torch.arange(query_tokens_per_req, dtype=torch.long, device="cuda")
+
+                # _ctx_len is clamped to _max_ctx only AFTER this step's accepted
+                # tokens are folded in (see the update below), so the running length
+                # used here has to be clamped on its own -- otherwise a request that
+                # already sits at the ceiling indexes num_accepted positions past
+                # any position the sequence can legitimately reach.
+                ctx_len_now = (ctx_len_gen + gen_num_accepted.long()).clamp_(max=self._max_ctx)
+                query_position_ids = ctx_len_now.unsqueeze(1) + j_block.unsqueeze(0)
+                ctx_position_ids = ctx_len_gen.unsqueeze(1) + offsets_kp1.unsqueeze(0)
+
+                noise_embed_2d = dflash_noise_block_embedding(
+                    embed_tokens, bonus, mask_token_id, query_tokens_per_req, trained_mask_embedding
+                )
 
             # Accumulate new accepted features into context buffers
+            fused_num_ctx = None
             if has_target_features:
                 gen_start = attn_metadata.num_ctx_tokens
                 # Target now processes exactly K+1 tokens per gen req, so the
@@ -2803,84 +3584,170 @@ class DFlashWorker(SpecWorkerBase):
                     # row; the newly committed token itself has no target row yet.
                     projected_rows = projected_to_store.reshape(num_gens, K_plus_1, -1)
                     lilicorr_anchor = last_accepted_hidden(projected_rows, gen_num_accepted)
-                gen_num_accepted_long = gen_num_accepted.long()
-                col_idx = ctx_len_gen.unsqueeze(1) + offsets_kp1.unsqueeze(0)
-                write_mask = offsets_kp1.unsqueeze(0) < gen_num_accepted_long.unsqueeze(1)
-                if self._ctx_block_tables is not None:
-                    # Bound by what the manager handed THIS request: the masked
-                    # entries below are still written (fixed-size, for graph
-                    # safety) and a placeholder page resolves to another's.
-                    gen_capacity = self._ctx_block_counts[gen_rows_out] * self._ctx_page_size
-                    col_idx = torch.minimum(col_idx, (gen_capacity - 1).unsqueeze(1)).clamp_(min=0)
-                else:
-                    col_idx = col_idx.clamp(max=self._max_ctx - 1)
-
-                # Fixed-size writes for CUDA graph compatibility:
-                # Write ALL entries but zero out invalid ones. Invalid
-                # writes land at clamped column indices beyond valid
-                # _ctx_len range, so they're harmless.
-                slot_flat = slots.unsqueeze(1).expand(-1, K + 1).reshape(-1)
-                col_flat = col_idx.reshape(-1)
-                proj_flat = projected_to_store  # already [num_gens*(K+1), proj_dim]
-                pos_flat = ctx_position_ids.long().reshape(-1)
-                mask_1d = write_mask.reshape(-1)
-
-                # Fast path: store the pre-projected/pre-RoPE'd K/V.
-                # dflash_forward reads these directly via cache_batch_idx.
-                cache_dtype = (
-                    self._ctx_kv_buf[0].dtype if self._ctx_paged else self._ctx_k_buf.dtype
-                )
-                k_new, v_new = draft_model.precompute_context_kv(
-                    proj_flat.to(cache_dtype), pos_flat
-                )
-                mask_bc = mask_1d.view(-1, 1, 1, 1).to(k_new.dtype)
-                k_new.mul_(mask_bc)
-                if v_new is not None:
-                    v_new.mul_(mask_bc)
-                slot_long = slot_flat.long()
-                col_long = col_flat.long()
-                if self._ctx_paged:
+                # enable_int32_accept_counts: the fused store / advance take the
+                # int32 counts as they are; the stock lines convert on first use.
+                int32_counts = self._int32_accept_counts is not None
+                fused_counts = gen_num_accepted if int32_counts else gen_num_accepted.long()
+                gen_num_accepted_long = None if int32_counts else fused_counts
+                # A model's fused store (enable_fused_ctx_store) first derives each
+                # row's column from its position itself (the stock clamp below), so
+                # the column glue runs only when it declines.
+                fused_stored = False
+                if self._fused_ctx_store is not None and self._ctx_paged:
+                    bound = self._ctx_block_tables is not None
+                    fused_stored = self._fused_ctx_store(
+                        draft_model,
+                        projected_to_store.to(self._ctx_kv_buf[0].dtype),
+                        ctx_position_ids.long().reshape(-1),
+                        fused_counts,
+                        gen_rows_out if bound else slots,
+                        None,
+                        self._ctx_block_tables if bound else self._ctx_page_table,
+                        self._ctx_kv_buf,
+                        K + 1,
+                        capacity_counts=self._ctx_block_counts if bound else None,
+                        max_col=None if bound else self._max_ctx - 1,
+                    )
+                int32_stored = int32_counts and fused_stored
+                if not fused_stored:
+                    if gen_num_accepted_long is None:
+                        gen_num_accepted_long = gen_num_accepted.long()
+                    if ctx_len_gen is None:
+                        ctx_len_gen = self._ctx_len[slots]
+                    col_idx = ctx_len_gen.unsqueeze(1) + offsets_kp1.unsqueeze(0)
+                    write_mask = offsets_kp1.unsqueeze(0) < gen_num_accepted_long.unsqueeze(1)
                     if self._ctx_block_tables is not None:
-                        # Batch positions of the gen requests, matching the
-                        # per-request block table's row order.
-                        rows_long = gen_rows_out.unsqueeze(1).expand(-1, K + 1).reshape(-1)
+                        # Bound by what the manager handed THIS request: the masked
+                        # entries below are still written (fixed-size, for graph
+                        # safety) and a placeholder page resolves to another's.
+                        gen_capacity = self._ctx_block_counts[gen_rows_out] * self._ctx_page_size
+                        col_idx = torch.minimum(col_idx, (gen_capacity - 1).unsqueeze(1)).clamp_(
+                            min=0
+                        )
                     else:
-                        rows_long = slot_long
-                    self._store_context_kv_paged(k_new, v_new, rows_long, col_long)
-                else:  # VANILLA DFlash backend (FlashAttention)
-                    self._ctx_k_buf[slot_long, :, col_long] = k_new
-                    if v_new is not None:
-                        self._ctx_v_buf[slot_long, :, col_long] = v_new
+                        col_idx = col_idx.clamp(max=self._max_ctx - 1)
 
-                self._advance_ctx_len(slots, gen_num_accepted_long)
+                    # Fixed-size writes for CUDA graph compatibility:
+                    # Write ALL entries but zero out invalid ones. Invalid
+                    # writes land at clamped column indices beyond valid
+                    # _ctx_len range, so they're harmless.
+                    slot_flat = slots.unsqueeze(1).expand(-1, K + 1).reshape(-1)
+                    col_flat = col_idx.reshape(-1)
+                    proj_flat = projected_to_store  # already [num_gens*(K+1), proj_dim]
+                    pos_flat = ctx_position_ids.long().reshape(-1)
+                    mask_1d = write_mask.reshape(-1)
 
-            num_ctx_per_req_t = self._ctx_len[slots]
-            ctx_page_table = self._ctx_page_table
-            if self._ctx_block_tables is not None:
-                # The write above clamps columns to the request's allocation, so
-                # a context that outruns it has its tail written over the last
-                # valid slot. Truncate what is advertised to match, or the read
-                # attends that clobbered value -- or another request's page.
-                allocated = dflash_allocated_ctx_limit(
-                    self._ctx_block_counts, self._ctx_page_size, block_size
-                )
-                if self._ctx_unified_cache:
-                    self._check_block_within_allocation(
-                        num_ctx_per_req_t, allocated[gen_rows_out], block_size
+                    # Fast path: store the pre-projected/pre-RoPE'd K/V.
+                    # dflash_forward reads these directly via cache_batch_idx.
+                    cache_dtype = (
+                        self._ctx_kv_buf[0].dtype if self._ctx_paged else self._ctx_k_buf.dtype
                     )
-                num_ctx_per_req_t = torch.minimum(num_ctx_per_req_t, allocated[gen_rows_out])
-                # Pages below a slot's base hold no drafter K/V: the read
-                # numbers from the base instead (dflash_rebased_ctx_view).
-                # Writes above keep the absolute table.
-                self._ctx_block_tables_read[gen_rows_out], num_ctx_per_req_t = (
-                    dflash_rebased_ctx_view(
-                        self._ctx_block_tables[gen_rows_out],
-                        self._ctx_base_pages[slots],
-                        num_ctx_per_req_t,
+                    # The fused store with the stock columns: the K / V epilogue,
+                    # the accept mask and the paged write in one launch.
+                    fused_stored = (
+                        self._fused_ctx_store is not None
+                        and self._ctx_paged
+                        and self._fused_ctx_store(
+                            draft_model,
+                            proj_flat.to(cache_dtype),
+                            pos_flat,
+                            gen_num_accepted_long,
+                            gen_rows_out if self._ctx_block_tables is not None else slots,
+                            col_flat,
+                            self._ctx_block_tables
+                            if self._ctx_block_tables is not None
+                            else self._ctx_page_table,
+                            self._ctx_kv_buf,
+                            K + 1,
+                        )
+                    )
+                    if not fused_stored:
+                        k_new, v_new = draft_model.precompute_context_kv(
+                            proj_flat.to(cache_dtype), pos_flat
+                        )
+                        mask_bc = mask_1d.view(-1, 1, 1, 1).to(k_new.dtype)
+                        k_new.mul_(mask_bc)
+                        if v_new is not None:
+                            v_new.mul_(mask_bc)
+                        slot_long = slot_flat.long()
+                        col_long = col_flat.long()
+                        if self._ctx_paged:
+                            if self._ctx_block_tables is not None:
+                                # Batch positions of the gen requests, matching the
+                                # per-request block table's row order.
+                                rows_long = gen_rows_out.unsqueeze(1).expand(-1, K + 1).reshape(-1)
+                            else:
+                                rows_long = slot_long
+                            self._store_context_kv_paged(k_new, v_new, rows_long, col_long)
+                        else:  # VANILLA DFlash backend (FlashAttention)
+                            self._ctx_k_buf[slot_long, :, col_long] = k_new
+                            if v_new is not None:
+                                self._ctx_v_buf[slot_long, :, col_long] = v_new
+
+                # A model's one-launch advance + read view (enable_fused_ctx_advance):
+                # the stock lines' context lengths and read rows, or None. Not for a
+                # unified cache, whose read also checks the allocation below.
+                if (
+                    self._fused_ctx_advance is not None
+                    and self._ctx_block_tables is not None
+                    and not self._ctx_unified_cache
+                ):
+                    fused_num_ctx = self._fused_ctx_advance(
+                        slots,
+                        gen_rows_out,
+                        fused_counts,
+                        self._ctx_len,
+                        self._max_ctx,
+                        self._dummy_slot,
+                        self._ctx_block_counts,
+                        self._ctx_base_pages,
+                        self._ctx_block_tables,
+                        self._ctx_block_tables_read,
                         self._ctx_page_size,
+                        block_size,
                     )
-                )
+                if fused_num_ctx is None:
+                    if gen_num_accepted_long is None:
+                        gen_num_accepted_long = gen_num_accepted.long()
+                    self._advance_ctx_len(slots, gen_num_accepted_long)
+                elif int32_stored:
+                    logger.info_once(
+                        f"{self._int32_accept_counts} the int32 accept counts went to the fused "
+                        "context store and advance (no int64 copy)",
+                        key="dflash_int32_accept_counts",
+                    )
+
+            if fused_num_ctx is not None:
+                num_ctx_per_req_t = fused_num_ctx
                 ctx_page_table = self._ctx_block_tables_read
+            else:
+                num_ctx_per_req_t = self._ctx_len[slots]
+                ctx_page_table = self._ctx_page_table
+                if self._ctx_block_tables is not None:
+                    # The write above clamps columns to the request's allocation, so
+                    # a context that outruns it has its tail written over the last
+                    # valid slot. Truncate what is advertised to match, or the read
+                    # attends that clobbered value -- or another request's page.
+                    allocated = dflash_allocated_ctx_limit(
+                        self._ctx_block_counts, self._ctx_page_size, block_size
+                    )
+                    if self._ctx_unified_cache:
+                        self._check_block_within_allocation(
+                            num_ctx_per_req_t, allocated[gen_rows_out], block_size
+                        )
+                    num_ctx_per_req_t = torch.minimum(num_ctx_per_req_t, allocated[gen_rows_out])
+                    # Pages below a slot's base hold no drafter K/V: the read
+                    # numbers from the base instead (dflash_rebased_ctx_view).
+                    # Writes above keep the absolute table.
+                    self._ctx_block_tables_read[gen_rows_out], num_ctx_per_req_t = (
+                        dflash_rebased_ctx_view(
+                            self._ctx_block_tables[gen_rows_out],
+                            self._ctx_base_pages[slots],
+                            num_ctx_per_req_t,
+                            self._ctx_page_size,
+                        )
+                    )
+                    ctx_page_table = self._ctx_block_tables_read
             noise_embedding = noise_embed_2d
             query_positions = query_position_ids.long()
 

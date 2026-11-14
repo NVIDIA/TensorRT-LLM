@@ -39,6 +39,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <nanobind/nanobind.h>
@@ -294,6 +295,46 @@ static auto withTokens(nb::handle tokens, Fn&& fn)
     }
     auto [vec, knownNoDigest] = castTokenIterable(tokens);
     return fn(kv::toSpan(vec), knownNoDigest);
+}
+
+// GIL fast path for short, frequent calls (probe_reuse, KvCache.resize). Releasing the GIL around
+// such a call costs a GIL handoff whenever another Python thread is runnable: the caller then
+// waits up to the interpreter switch interval to run again, far longer than the call itself. So
+// when the manager's API lock is free right now, take it without waiting and run the call with
+// the GIL held; the core's own lock acquisitions nest inside. When the lock is busy, release the
+// GIL and block as usual. The GIL is never held while waiting for the API lock, so the deadlock
+// rule in kv_cache_manager_v2/AGENTS.md (a lock holder may need the GIL) still holds.
+// TRTLLM_KVCM2_DISABLE_GIL_FASTPATH=1 always releases first.
+//
+// A probe hashes and walks its prompt block by block, so its cost grows with the prompt. Up to
+// kGilFastPathMaxProbeTokens it stays well under one switch interval (a few hundred microseconds);
+// a longer probe releases the GIL and takes the shared lock, so other threads keep running and may
+// probe concurrently.
+constexpr size_t kGilFastPathMaxProbeTokens = size_t{1} << 18;
+
+static bool gilFastPathEnabled()
+{
+    static bool const enabled = []
+    {
+        char const* env = std::getenv("TRTLLM_KVCM2_DISABLE_GIL_FASTPATH");
+        return env == nullptr || std::strcmp(env, "1") != 0;
+    }();
+    return enabled;
+}
+
+template <class Fn>
+static auto callWithGilFastPath(kv::KvCacheManager const& manager, Fn&& fn)
+{
+    if (gilFastPathEnabled())
+    {
+        auto const fast = manager.tryLockExclusive();
+        if (fast.acquired())
+        {
+            return fn();
+        }
+    }
+    nb::gil_scoped_release release;
+    return fn();
 }
 
 static kv::TypedVec<kv::PoolIndex, size_t> typedPoolSizeList(std::vector<size_t> const& slotSizeList)
@@ -2090,9 +2131,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def(
             "resize",
             [](kv::KvCache& self, std::optional<int> capacity, std::optional<int> historyLength) -> bool
-            { return self.resize(capacity, historyLength); },
-            nb::arg("capacity") = std::nullopt, nb::arg("history_length") = std::nullopt,
-            nb::call_guard<nb::gil_scoped_release>())
+            { return callWithGilFastPath(self.manager(), [&] { return self.resize(capacity, historyLength); }); },
+            nb::arg("capacity") = std::nullopt, nb::arg("history_length") = std::nullopt)
         .def_prop_ro(
             "max_input_length", [](kv::KvCache const& self) { return self.maxInputLength(); },
             nb::call_guard<nb::gil_scoped_release>(),
@@ -3475,14 +3515,20 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 kv::ReuseScope reuseScope = castReuseScope(std::move(reuseScopeObj));
                 if (inputTokens.is_none())
                 {
-                    nb::gil_scoped_release release;
-                    return self->probeReuse(std::move(reuseScope), kv::TokenSpan{}, /*knownNoDigest=*/true);
+                    return callWithGilFastPath(*self,
+                        [&]
+                        { return self->probeReuse(std::move(reuseScope), kv::TokenSpan{}, /*knownNoDigest=*/true); });
                 }
                 return withTokens(inputTokens,
                     [&](kv::TokenSpan view, bool knownNoDigest)
                     {
-                        nb::gil_scoped_release release;
-                        return self->probeReuse(std::move(reuseScope), view, knownNoDigest);
+                        if (static_cast<size_t>(view.size()) > kGilFastPathMaxProbeTokens)
+                        {
+                            nb::gil_scoped_release release;
+                            return self->probeReuse(std::move(reuseScope), view, knownNoDigest);
+                        }
+                        return callWithGilFastPath(
+                            *self, [&] { return self->probeReuse(std::move(reuseScope), view, knownNoDigest); });
                     });
             },
             nb::arg("reuse_scope") = nb::none(), nb::arg("input_tokens") = nb::none())

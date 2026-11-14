@@ -28,6 +28,10 @@ so it never reaches the join.
 
 import faulthandler
 import itertools
+import os
+import subprocess
+import sys
+import textwrap
 import threading
 import time
 
@@ -515,6 +519,95 @@ def test_many_threads_probe_reuse_concurrently() -> None:
         assert all(value == 0 for value in results)
     finally:
         manager.shutdown()
+
+
+def test_gil_fast_path_resize_and_probe_with_priority_callback_antagonist() -> None:
+    """resize() and probe_reuse() keep the GIL when the API lock is free and release it otherwise.
+
+    The antagonist holds the lock while it reacquires the GIL for its priority callback, so the main
+    thread meets both a free lock (fast path, GIL kept) and a held one (GIL released before waiting).
+    Neither may deadlock, and the probe must answer the same depth on either path.
+    """
+    manager = KVCacheManager(_make_config())
+    source = None
+    try:
+        tokens_per_block = manager.tokens_per_block
+        # Far above the antagonist's ever-growing token ids, so its commits never extend this prefix.
+        tokens = list(range(1 << 30, (1 << 30) + tokens_per_block * 4))
+        stream = CudaStream(torch.cuda.Stream().cuda_stream)
+        source = manager.create_kv_cache(None, [])
+        assert source.resume(stream)
+        assert source.resize(len(tokens))
+        source.commit(tokens, is_end=True)
+        source.suspend()
+        stop = threading.Event()
+        hits = {"n": 0}
+        antagonist = _priority_callback_antagonist(manager, stop, hits)
+        antagonist.start()
+        try:
+            _await_antagonist(antagonist, hits)
+            cache = manager.create_kv_cache(None, [])
+            assert cache.resume(stream)
+            depths = set()
+            for _ in range(500):
+                assert cache.resize(tokens_per_block * 4)
+                assert cache.resize(tokens_per_block * 2)
+                depths.add(manager.probe_reuse(None, tokens))
+            cache.suspend()
+            cache.close()
+        finally:
+            stop.set()
+            _join(antagonist)
+        assert depths == {len(tokens)}
+        assert hits["n"] > 0, "priority callback never ran; test proves nothing"
+    finally:
+        if source is not None:
+            source.close()
+        manager.shutdown()
+
+
+def test_gil_fast_path_kill_switch_gives_the_same_answers() -> None:
+    """TRTLLM_KVCM2_DISABLE_GIL_FASTPATH=1 (read once per process) changes only GIL handling."""
+    script = textwrap.dedent(
+        """
+        import torch
+        from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+            BufferConfig, CudaStream, GpuCacheTierConfig, KVCacheManager, KVCacheManagerConfig,
+            AttentionLayerConfig)
+        torch.empty(1, device="cuda")
+        manager = KVCacheManager(KVCacheManagerConfig(
+            tokens_per_block=4, cache_tiers=[GpuCacheTierConfig(quota=8 << 20)],
+            layers=[AttentionLayerConfig(layer_id=0, buffers=[BufferConfig(role="key", size=4096)])]))
+        stream = CudaStream(torch.cuda.Stream().cuda_stream)
+        out = []
+        for n in (4, 9, 16):
+            tokens = list(range(n))
+            out.append(manager.probe_reuse(None, tokens))
+            cache = manager.create_kv_cache(None, [])
+            cache.resume(stream)
+            out.append(cache.resize(len(tokens)))
+            cache.commit(tokens, is_end=True)
+            out.append(cache.num_committed_tokens)
+            cache.suspend()
+            cache.close()
+            out.append(manager.probe_reuse(None, tokens))
+        manager.shutdown()
+        print(out)
+        """
+    )
+    answers = []
+    for value in ("0", "1"):
+        env = {**os.environ, "TRTLLM_KVCM2_DISABLE_GIL_FASTPATH": value}
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=TIMEOUT_S,
+            check=True,
+        )
+        answers.append(result.stdout.strip().splitlines()[-1])
+    assert answers[0] == answers[1]
 
 
 def test_priority_callback_under_the_lock_does_not_deadlock_stats_queries() -> None:

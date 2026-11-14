@@ -2409,6 +2409,10 @@ class ModelLoader:
             'kv_cache_dtype'] = self.llm_args.kv_cache_config.dtype
         config.extra_attrs["bounded_replay_on_generation"] = (
             self.llm_args.bounded_replay_on_generation)
+        # The model engine applies torch.compile only after the model is built,
+        # so a model that must know at build time reads it here.
+        config.extra_attrs["torch_compile_enabled"] = (
+            self.llm_args.torch_compile_config is not None)
         # Store allreduce pre-allocation config for AllReduce module access.
         # Use get_text_config() so VLM wrapper configs (e.g. KimiK2VLConfig,
         # KimiK25Config) that store the text config under .text_config are

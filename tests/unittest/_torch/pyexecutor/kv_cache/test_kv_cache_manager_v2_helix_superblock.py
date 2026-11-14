@@ -550,6 +550,7 @@ def _host_tier_preempt_scheduler(preempted: list) -> SimpleNamespace:
     sched = SimpleNamespace(
         has_cp_helix=True,
         enable_recompute_pause=True,
+        _ctx_preempt_least_progress=False,
         kv_cache_manager=SimpleNamespace(
             has_cache_tier_below_gpu=True,
             is_request_active=lambda request_id: True,

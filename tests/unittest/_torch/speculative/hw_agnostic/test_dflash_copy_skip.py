@@ -24,6 +24,8 @@ def _worker(req_to_slot):
         _dummy_slot=DUMMY_SLOT,
         _batch_to_slot_buffer=DeviceCopyBuffer(torch.zeros(8, dtype=torch.long)),
         _write_ctx_len=lambda updates, base_updates=None: None,
+        _disagg_draft_ctx_seeds=None,
+        _disagg_draft_ctx_seed_hooks=None,
     )
     # Generation requests are already assigned in these tests; prepare assigns nothing.
     worker._assign_slot = lambda rid, **kwargs: worker._req_to_slot.get(rid)

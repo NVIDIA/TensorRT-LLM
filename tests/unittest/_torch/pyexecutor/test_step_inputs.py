@@ -607,11 +607,11 @@ def test_threads_with_their_own_packs_keep_them_apart():
     assert dsts[1].tolist() == [2] * 4
 
 
-def _random_pack_run(parallel: bool, seed: int, overlap: bool):
+def _random_pack_run(parallel: bool, seed: int, overlap: bool, cpp: bool = False):
     """Stage a fixed random mix of host copies (2-D page-table rows included) and device copies that read a host
     copy's destination; return every destination after the flush."""
     g = torch.Generator().manual_seed(seed)
-    pack = StepInputPack(_device(), parallel_scatter=parallel)
+    pack = StepInputPack(_device(), parallel_scatter=parallel, cpp_scatter=cpp)
     big = _zeros(4096)
     table = torch.zeros((8, 64), dtype=torch.int32, device=_device())
     out = _zeros(256)
@@ -679,6 +679,46 @@ def test_parallel_scatter_is_bitwise_for_every_copy_count(count):
     assert torch.equal(mirror.cpu(), values.flatten())
     variants = _compiled_variants(step_inputs._parallel_scatter_kernel)
     assert variants in (-1, 1, 2), variants  # at most one per DEVICE_SRC
+
+
+@pytest.mark.parametrize("overlap", [False, True], ids=["disjoint", "overlapping"])
+@pytest.mark.parametrize("seed", [0, 1])
+def test_cpp_scatter_writes_what_the_parallel_scatter_writes_without_triton(seed, overlap):
+    """pack_cpp_scatter: an order-free pack takes the native serial scatter instead of the Triton parallel one."""
+    from triton.runtime import jit
+
+    parallel = _random_pack_run(True, seed, overlap)
+    launches = []
+    run = jit.JITFunction.run
+
+    def counted(fn, *args, **kwargs):
+        launches.append(fn)
+        return run(fn, *args, **kwargs)
+
+    jit.JITFunction.run = counted
+    try:
+        native = _random_pack_run(True, seed, overlap, cpp=True)
+    finally:
+        jit.JITFunction.run = run
+    for a, b in zip(parallel, native):
+        assert torch.equal(a, b)
+    assert launches == []
+
+
+def test_cpp_scatter_keeps_the_in_graph_prologue_only_with_a_prologue_op():
+    kwargs = dict(
+        parallel_scatter=True, in_graph=True, early_copy=True, step_epoch=True, cpp_scatter=True
+    )
+    without = StepInputPack(_device(), **kwargs)
+    assert not without.in_graph and not without.early_copy and without.epoch is None
+    calls = []
+    with_op = StepInputPack(
+        _device(), **kwargs, prologue_op=lambda window, epoch, max_desc: calls.append(max_desc)
+    )
+    assert with_op.in_graph and with_op.early_copy and with_op.epoch is not None
+    assert calls == [StepInputPack.MAX_DESC]  # the warm-up runs the op, compiling nothing
+    assert not StepInputPack(_device()).cpp_scatter
+    assert not object.__new__(StepInputPack).cpp_scatter
 
 
 def test_parallel_scatter_only_for_order_free_packs():

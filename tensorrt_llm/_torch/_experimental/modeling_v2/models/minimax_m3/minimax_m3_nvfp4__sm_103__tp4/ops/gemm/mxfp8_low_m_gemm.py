@@ -13,6 +13,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
     OpWrapper,
     true_fp32_matmul,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.native import family_ops
 
 _E4M3_MAX = 448.0
 
@@ -128,9 +129,7 @@ class Mxfp8LowMGemm(OpWrapper):
         row_tiles: int,
         pdl: bool,
     ) -> torch.Tensor:
-        return torch.ops.trtllm.minimax_m3_mxfp8_low_m_gemm(
-            x, w, wsf, warps, cluster_k, row_tiles, pdl
-        )
+        return family_ops().minimax_m3_mxfp8_low_m_gemm(x, w, wsf, warps, cluster_k, row_tiles, pdl)
 
     def reference(
         self,

@@ -328,6 +328,11 @@ class DisaggregatedParams(OpenAIBaseModel):
         default=None,
         description=
         "Prompt-token boundary transferred by a remote-tail context worker.")
+    draft_ctx_state: Optional[List[NonNegativeInt]] = Field(
+        default=None,
+        description=
+        "Context-first only: the standalone drafter's context-window decision "
+        "[ctx_len, ctx_base, ok] for the generation request.")
     multimodal_positions: Optional[List[NonNegativeInt]] = Field(
         default=None,
         description="Prompt-token offset of each multimodal item.")
@@ -2192,6 +2197,7 @@ def to_disaggregated_params(
         schedule_style=tllm_disagg_params.schedule_style,
         ctx_usage=ctx_usage,
         remote_tail_start=tllm_disagg_params.remote_tail_start,
+        draft_ctx_state=tllm_disagg_params.draft_ctx_state,
         multimodal_positions=tllm_disagg_params.multimodal_positions,
         multimodal_lengths=tllm_disagg_params.multimodal_lengths,
     )
@@ -2219,6 +2225,7 @@ def to_llm_disaggregated_params(
         schedule_style=disaggregated_params.schedule_style,
         ctx_usage=None if ctx_usage is None else ctx_usage.model_dump(),
         remote_tail_start=disaggregated_params.remote_tail_start,
+        draft_ctx_state=disaggregated_params.draft_ctx_state,
         multimodal_positions=disaggregated_params.multimodal_positions,
         multimodal_lengths=disaggregated_params.multimodal_lengths,
         orig_elapsed_s=disaggregated_params.orig_elapsed_s,

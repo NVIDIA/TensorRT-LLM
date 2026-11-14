@@ -81,6 +81,21 @@ def attach_ctx_usage(request: LlmRequest, response) -> None:
         response.result.ctx_usage = disagg_params.ctx_usage
 
 
+class _ReceiveReadyEvents:
+    """The readiness events of one receive destination that spans two pools (the target's and a
+    standalone drafter's): ready only once every one has completed."""
+
+    def __init__(self, events: List["torch.cuda.Event"]) -> None:
+        self._events = events
+
+    def query(self) -> bool:
+        return all(event.query() for event in self._events)
+
+    def synchronize(self) -> None:
+        for event in self._events:
+            event.synchronize()
+
+
 class DisaggTransferCoordinator:
     """Disagg transfer entry points used by every executor loop variant.
 
@@ -94,6 +109,7 @@ class DisaggTransferCoordinator:
     # Class-level default, so a coordinator assembled without ``__init__``
     # keeps the blocking receive fence.
     _defer_unready_gen_receives = False
+    _draft_kv_cache_manager = None
 
     def __init__(
         self,
@@ -149,6 +165,9 @@ class DisaggTransferCoordinator:
         self._retiring_gen_receives: Dict[int, LlmRequest] = {}
         self._gen_termination_requested: Set[int] = set()
         self._fleet_has_retiring_gen_receives = False
+        # Finished receives whose reuse commit try_finish_gen_receive deferred,
+        # for commit_deferred_gen_receives.
+        self._deferred_reuse_commits: List[LlmRequest] = []
 
     # -- loop head -----------------------------------------------------------
 
@@ -551,6 +570,7 @@ class DisaggTransferCoordinator:
                 disagg_diagnostics.emit_kv_admission_result(
                     req, self._kv_cache_manager, admitted=True, dist=self._dist
                 )
+        self._merge_draft_receive_fences(admitted, fences, defer_unready)
 
         # gen_only_no_context has no CTX worker, so mark each request as
         # transmission-complete immediately.
@@ -646,6 +666,35 @@ class DisaggTransferCoordinator:
             return {}
         return {req.py_request_id: take(req) for req in requests}
 
+    def _merge_draft_receive_fences(
+        self,
+        requests: List[LlmRequest],
+        fences: Dict[int, Optional["torch.cuda.Event"]],
+        defer_unready: bool,
+    ) -> None:
+        """Fold the draft pool's readiness events into the receive fences.
+
+        Only a draft pool that receives the drafter context window records one, during
+        ``prepare_gen_resources``. Deferred publication then polls both events; otherwise the
+        executor waits here, as the target pool's event is waited on in ``prepare_resources``.
+        """
+        manager = self._draft_kv_cache_manager
+        if not getattr(manager, "_disagg_draft_kv_receive", False):
+            return
+        for req in requests:
+            draft_ready = manager.take_disagg_receive_ready(req)
+            if draft_ready is None:
+                continue
+            if not defer_unready:
+                draft_ready.synchronize()
+                continue
+            target_ready = fences.get(req.py_request_id)
+            fences[req.py_request_id] = (
+                draft_ready
+                if target_ready is None
+                else _ReceiveReadyEvents([target_ready, draft_ready])
+            )
+
     def _publish_ready_gen_receives(self) -> None:
         """Start the asynchronous receive of each waiting request whose
         admission readiness event has completed.
@@ -736,22 +785,45 @@ class DisaggTransferCoordinator:
             if req.is_disagg_generation_transmission_complete
         ]
 
-    def try_finish_gen_receive(self, request: LlmRequest) -> bool:
+    def try_finish_gen_receive(self, request: LlmRequest, defer_commit: bool = False) -> bool:
         """Close out a completed KV receive and hand the request to generation.
 
         Returns False, touching nothing, when the request is no longer
         transmission-complete (batch-level preparation may have failed and
         terminated it). Errors from the transfer side propagate.
+
+        With ``defer_commit``, the received blocks' reuse commit waits for
+        ``commit_deferred_gen_receives``: the request itself never reads the
+        reuse tree, so the executor runs the commit's host work after the
+        step's forward is launched.
         """
         if not request.is_disagg_generation_transmission_complete:
             return False
         request.state = LlmRequestState.GENERATION_IN_PROGRESS
         # commit_blocks_for_reuse requires the position to be at the prompt end.
         request.context_current_position = request.prompt_len
-        self._transceiver.commit_blocks_for_reuse(request)
+        if defer_commit:
+            self._deferred_reuse_commits.append(request)
+        else:
+            self._transceiver.commit_blocks_for_reuse(request)
         request.py_kv_transfer_start_time = None
         request.py_kv_transfer_timed_out = False
         return True
+
+    def commit_deferred_gen_receives(self) -> None:
+        """Commit the blocks of the receives ``try_finish_gen_receive`` deferred.
+
+        A request no longer in generation at its prompt end (it finished or
+        was terminated since) is skipped; a skipped commit only keeps its
+        blocks out of the reuse tree.
+        """
+        pending, self._deferred_reuse_commits = self._deferred_reuse_commits, []
+        for request in pending:
+            if (
+                request.state == LlmRequestState.GENERATION_IN_PROGRESS
+                and request.context_current_position == request.prompt_len
+            ):
+                self._transceiver.commit_blocks_for_reuse(request)
 
     def send_completed_context(self, requests: List[LlmRequest]) -> None:
         """Start async KV sends for finished context-only requests."""
@@ -1378,8 +1450,11 @@ class NoopDisaggCoordinator(DisaggTransferCoordinator):
     def completed_gen_receives(self, scheduled_batch: "ScheduledRequests") -> List[LlmRequest]:
         return []
 
-    def try_finish_gen_receive(self, request: LlmRequest) -> bool:
+    def try_finish_gen_receive(self, request: LlmRequest, defer_commit: bool = False) -> bool:
         return False
+
+    def commit_deferred_gen_receives(self) -> None:
+        return None
 
     def prepare_context_schedulable(self, new_requests: List[LlmRequest]) -> None:
         return None

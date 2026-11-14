@@ -23,37 +23,36 @@ namespace tensorrt_llm::executor::kv_cache::bounce
 namespace
 {
 
-// One thread block per buffer. Within a block, threads stride over the buffer. When src, dst
+// Blocks stride over the buffers (one buffer per block per iteration; with an uncapped grid each
+// block copies exactly one buffer). Within a block, threads stride over the buffer. When src, dst
 // and size are all 16-byte aligned, a vectorized uint4 path gives coalesced 16-byte stores.
 __global__ void batchedCopyKernel(
     std::uint64_t const* srcs, std::uint64_t const* dsts, std::uint32_t const* sizes, std::uint32_t n)
 {
-    std::uint32_t const buf = blockIdx.x;
-    if (buf >= n)
+    for (std::uint32_t buf = blockIdx.x; buf < n; buf += gridDim.x)
     {
-        return;
-    }
-    auto const* src = reinterpret_cast<char const*>(srcs[buf]);
-    auto* dst = reinterpret_cast<char*>(dsts[buf]);
-    std::uint32_t const size = sizes[buf];
+        auto const* src = reinterpret_cast<char const*>(srcs[buf]);
+        auto* dst = reinterpret_cast<char*>(dsts[buf]);
+        std::uint32_t const size = sizes[buf];
 
-    auto const addrMask = reinterpret_cast<std::uintptr_t>(src) | reinterpret_cast<std::uintptr_t>(dst)
-        | static_cast<std::uintptr_t>(size);
-    if ((addrMask & 0xFU) == 0U)
-    {
-        auto const* s4 = reinterpret_cast<uint4 const*>(src);
-        auto* d4 = reinterpret_cast<uint4*>(dst);
-        std::uint32_t const n4 = size >> 4U;
-        for (std::uint32_t i = threadIdx.x; i < n4; i += blockDim.x)
+        auto const addrMask = reinterpret_cast<std::uintptr_t>(src) | reinterpret_cast<std::uintptr_t>(dst)
+            | static_cast<std::uintptr_t>(size);
+        if ((addrMask & 0xFU) == 0U)
         {
-            d4[i] = s4[i];
+            auto const* s4 = reinterpret_cast<uint4 const*>(src);
+            auto* d4 = reinterpret_cast<uint4*>(dst);
+            std::uint32_t const n4 = size >> 4U;
+            for (std::uint32_t i = threadIdx.x; i < n4; i += blockDim.x)
+            {
+                d4[i] = s4[i];
+            }
         }
-    }
-    else
-    {
-        for (std::uint32_t i = threadIdx.x; i < size; i += blockDim.x)
+        else
         {
-            dst[i] = src[i];
+            for (std::uint32_t i = threadIdx.x; i < size; i += blockDim.x)
+            {
+                dst[i] = src[i];
+            }
         }
     }
 }
@@ -61,14 +60,15 @@ __global__ void batchedCopyKernel(
 } // namespace
 
 cudaError_t launchBatchedCopy(std::uint64_t const* srcs, std::uint64_t const* dsts, std::uint32_t const* sizes,
-    std::uint32_t n, cudaStream_t stream)
+    std::uint32_t n, cudaStream_t stream, std::uint32_t maxBlocks)
 {
     if (n == 0)
     {
         return cudaSuccess;
     }
     constexpr int kThreads = 256;
-    batchedCopyKernel<<<n, kThreads, 0, stream>>>(srcs, dsts, sizes, n);
+    std::uint32_t const blocks = (maxBlocks == 0U || maxBlocks >= n) ? n : maxBlocks;
+    batchedCopyKernel<<<blocks, kThreads, 0, stream>>>(srcs, dsts, sizes, n);
     return cudaGetLastError();
 }
 

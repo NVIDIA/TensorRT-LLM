@@ -25,7 +25,10 @@ from tensorrt_llm._torch.pyexecutor.runtime_hooks import (
     runtime_hooks_of,
 )
 from tensorrt_llm._torch.speculative import SpecMetadata, get_spec_metadata
-from tensorrt_llm._torch.speculative.interface import supports_sharded_target_sampling
+from tensorrt_llm._torch.speculative.interface import (
+    onehot_index_fill_enabled,
+    supports_sharded_target_sampling,
+)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -117,8 +120,29 @@ class DecoderMetadata:
             )
         self.attn_metadata.mamba_metadata_cls = resolve_mamba_metadata_cls(self.model)
         self._arm_msa_policy(kv_cache_manager)
+        self._arm_draft_block_offset_guard(draft_kv_cache_manager)
 
         return self.attn_metadata
+
+    def _arm_draft_block_offset_guard(
+        self, draft_kv_cache_manager: KVCacheManager | KVCacheManagerV2 | None
+    ) -> None:
+        """Turn on the separate draft KV cache's unchanged block-table skip the model opted into."""
+        if not self.runtime_hooks.skip_unchanged_draft_block_offsets:
+            return
+        if not isinstance(draft_kv_cache_manager, KVCacheManagerV2) or not hasattr(
+            draft_kv_cache_manager, "skip_unchanged_block_offsets"
+        ):
+            return
+        if not draft_kv_cache_manager.skip_unchanged_block_offsets:
+            draft_kv_cache_manager.skip_unchanged_block_offsets = True
+            logger.info("Draft block-offset copy skipped when unchanged")
+        if (
+            self.runtime_hooks.patch_unchanged_draft_block_offsets
+            and not draft_kv_cache_manager.patch_unchanged_block_offsets
+        ):
+            draft_kv_cache_manager.patch_unchanged_block_offsets = True
+            logger.info("Draft block-offset changes patched with one row copy")
 
     def _arm_msa_policy(self, kv_cache_manager: KVCacheManager | KVCacheManagerV2 | None) -> None:
         """Hand the model's MiniMax-M3 MSA preparation choices to the metadata and the KV cache."""
@@ -156,6 +180,17 @@ class DecoderMetadata:
         )
         self.spec_metadata.skip_greedy_rng_upload = self.runtime_hooks.skip_greedy_rng_upload
         self.spec_metadata.pack_rng_uploads = self.runtime_hooks.pack_spec_rng_uploads
+        self.spec_metadata.tail_bookkeep = self.runtime_hooks.spec_tail_bookkeep
+        # Per-model opt-ins: set on this model's metadata and spec worker, never process-wide.
+        self.spec_metadata.context_onehot_index_fill = onehot_index_fill_enabled(
+            self.runtime_hooks.context_onehot_index_fill
+        )
+        if self.runtime_hooks.dflash_host_ctx_alloc:
+            enable = getattr(
+                getattr(self.model, "spec_worker", None), "enable_host_ctx_alloc", None
+            )
+            if enable is not None:
+                enable()
         if self.runtime_hooks.pack_spec_rng_uploads:
             logger.info("[M3 host] sampled-step Philox uploads staged into the step-input pack")
         if self.runtime_hooks.spec_small_h2d:

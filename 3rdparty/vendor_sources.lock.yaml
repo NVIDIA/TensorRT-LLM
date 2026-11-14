@@ -23,6 +23,29 @@ vendors:
     patch: 3rdparty/vendor_patches/flashinfer-prims-ts.patch
     patch_digest: sha256:5e19fc304c3152e940fa1a6b29b4e6a2ca10c0a73770f2648fbdda7576a8a73c
     digest: sha256-tree-v1:493689d123c87688d53549d97ce18a70e58ebc46c0b0d4b6a3ac05305bd6762a
+  msa-m31-q8kv8-indexer:
+    url: https://github.com/vllm-project/MSA.git
+    branch: dev
+    commit: 25c144700f727b638067e98066a60507081b63ad
+    source: python/fmha_sm100/cute
+    destination: tensorrt_llm/_torch/_experimental/modeling_v2/models/minimax_m3/kernels/msa_kernels/fmha_sm100_q8kv8
+    include:
+    - LICENSE
+    - NOTICE
+    - __init__.py
+    - q8_indexer_interface.py
+    - src/__init__.py
+    - src/common/__init__.py
+    - src/common/aot_cache.py
+    - src/common/utils.py
+    - src/sm100/__init__.py
+    - src/sm100/q8kv4_indexer_decode.py
+    - src/sm100/q8kv8_indexer_decode.py
+    - src/sm100/q8kv8_indexer_prefill.py
+    - src/sm100/q8kv8_indexer_prefill_plan.py
+    patch: 3rdparty/vendor_patches/msa-m31-q8kv8-indexer.patch
+    patch_digest: sha256:e1e0a81e85bc0c7590500a19edadb2b09af2525e779c439da877363eea95429e
+    digest: sha256-tree-v1:c7fac3cfa16767caa4bf273362411f2253407070c21565d0fa8a218a6d1514ba
   openengine-proto:
     url: https://github.com/ai-dynamo/openengine.git
     tag: v0.1.0

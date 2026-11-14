@@ -11,6 +11,7 @@ import torch
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import OpWrapper as OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.native import family_ops
 
 from ....ops.comm.reference import _E4M3_MAX as _E4M3_MAX
 from ....ops.comm.reference import McAllreduceNormReference
@@ -141,12 +142,12 @@ class M3McAllreduceNorm(McAllreduceNormReference):
         own_op: bool = False,
     ) -> list[torch.Tensor]:
         # The capture operands only with a capture: an op without the capture epilogue (an older image) takes the
-        # rest unchanged. own_op: this target's copy (trtllm::minimax_m3_sm107_tp8_mc_allreduce_norm, the same
+        # rest unchanged. own_op: this target's copy (mv2_minimax_m3::minimax_m3_sm107_tp8_mc_allreduce_norm, the same
         # kernels with the capture epilogue; modeling's MC_AR_OWN_OP).
         op = (
-            torch.ops.trtllm.minimax_m3_sm107_tp8_mc_allreduce_norm
+            family_ops().minimax_m3_sm107_tp8_mc_allreduce_norm
             if own_op
-            else torch.ops.trtllm.minimax_m3_sm107_tp2_mc_allreduce_norm
+            else family_ops().minimax_m3_sm107_tp2_mc_allreduce_norm
         )
         return op(
             x,

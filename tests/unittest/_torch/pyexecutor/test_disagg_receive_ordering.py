@@ -59,6 +59,9 @@ def _manager() -> Mock:
     manager._on_allocation_stream = set()
     manager._allocation_ready = {}
     manager._pending_preemption = {}
+    # No completion reservation: the bound ledgers are empty.
+    manager._disagg_completion_pool_counts = {}
+    manager._disagg_completion_limits = {}
     manager.is_draft = False
     manager.kv_connector_manager = None
     manager.enable_block_reuse = False

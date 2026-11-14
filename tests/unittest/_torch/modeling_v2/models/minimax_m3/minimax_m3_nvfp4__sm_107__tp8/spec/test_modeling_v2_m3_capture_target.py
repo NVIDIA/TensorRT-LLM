@@ -15,6 +15,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops import (  # noqa: E501
     m3_mc_allreduce,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.native import family_ops
 
 H = 64
 LAYERS = (2, 30, 58)
@@ -63,13 +64,14 @@ def test_none_without_the_capture_epilogue(monkeypatch) -> None:
 
 
 def test_capture_supported_reads_the_op_schema() -> None:
-    # The schema of the op the boundaries call: this target's copy (m3_mc_allreduce.OWN_OP), else the image's.
+    # The schema of the op the boundaries call, in the family library: this target's copy (m3_mc_allreduce.OWN_OP),
+    # else the TP2 one.
     name = (
         "minimax_m3_sm107_tp8_mc_allreduce_norm"
         if m3_mc_allreduce.own_op()
         else "minimax_m3_sm107_tp2_mc_allreduce_norm"
     )
-    op = getattr(torch.ops.trtllm, name, None)
+    op = getattr(family_ops(), name, None)
     want = op is not None and any(a.name == "cap_out" for a in op.default._schema.arguments)
     assert m3_mc_allreduce.capture_supported() is want
 
@@ -78,5 +80,5 @@ def test_own_op_follows_the_kernel_constant(monkeypatch) -> None:
     monkeypatch.setattr(m3_mc_allreduce, "OWN_OP", False)
     assert m3_mc_allreduce.own_op() is False
     monkeypatch.setattr(m3_mc_allreduce, "OWN_OP", True)
-    loaded = getattr(torch.ops.trtllm, "minimax_m3_sm107_tp8_mc_allreduce_norm", None) is not None
+    loaded = getattr(family_ops(), "minimax_m3_sm107_tp8_mc_allreduce_norm", None) is not None
     assert m3_mc_allreduce.own_op() is loaded

@@ -198,4 +198,85 @@ TEST(ReentrantSharedMutexTest, WriterWaitsForReaders)
     EXPECT_TRUE(writerIn.load());
 }
 
+TEST(ReentrantSharedMutexTest, TryExclusiveTakesAFreeLockAndReleasesIt)
+{
+    kv::ReentrantSharedMutex mutex;
+    {
+        auto const fast = mutex.tryLockExclusive();
+        EXPECT_TRUE(fast.acquired());
+        EXPECT_TRUE(fast.owns());
+        EXPECT_TRUE(mutex.heldExclusiveByThisThread());
+        // Guards taken inside nest, as for a blocking outer guard.
+        auto const inner = mutex.lockExclusive();
+        EXPECT_FALSE(inner.owns());
+        auto const shared = mutex.lockShared();
+        EXPECT_FALSE(shared.owns());
+    }
+    EXPECT_FALSE(mutex.heldExclusiveByThisThread());
+    std::atomic<bool> acquired{false};
+    std::thread other(
+        [&]
+        {
+            auto const guard = mutex.lockExclusive();
+            acquired.store(true);
+        });
+    other.join();
+    EXPECT_TRUE(acquired.load());
+}
+
+TEST(ReentrantSharedMutexTest, TryExclusiveNestsInsideThisThreadsExclusive)
+{
+    kv::ReentrantSharedMutex mutex;
+    auto const outer = mutex.lockExclusive();
+    {
+        auto const fast = mutex.tryLockExclusive();
+        EXPECT_TRUE(fast.acquired());
+        EXPECT_FALSE(fast.owns());
+    }
+    EXPECT_TRUE(mutex.heldExclusiveByThisThread());
+}
+
+// The GIL fast path relies on this: with another thread holding the lock in either mode, the
+// attempt returns at once, holding nothing, instead of waiting.
+TEST(ReentrantSharedMutexTest, TryExclusiveFailsWithoutWaitingWhenAnotherThreadHoldsIt)
+{
+    for (bool const exclusive : {true, false})
+    {
+        kv::ReentrantSharedMutex mutex;
+        std::atomic<bool> held{false};
+        std::atomic<bool> release{false};
+        std::thread holder(
+            [&]
+            {
+                if (exclusive)
+                {
+                    auto const guard = mutex.lockExclusive();
+                    held.store(true);
+                    waitFor([&] { return release.load(); });
+                }
+                else
+                {
+                    auto const guard = mutex.lockShared();
+                    held.store(true);
+                    waitFor([&] { return release.load(); });
+                }
+            });
+        // EXPECT, not ASSERT: `holder` is joinable here.
+        bool const isHeld = waitFor([&] { return held.load(); });
+        EXPECT_TRUE(isHeld) << "holder thread never ran";
+        if (isHeld)
+        {
+            auto const fast = mutex.tryLockExclusive();
+            EXPECT_FALSE(fast.acquired()) << (exclusive ? "exclusive" : "shared") << " holder";
+            EXPECT_FALSE(fast.owns());
+            EXPECT_FALSE(mutex.heldExclusiveByThisThread());
+        }
+        release.store(true);
+        holder.join();
+        auto const after = mutex.tryLockExclusive();
+        EXPECT_TRUE(after.acquired());
+        EXPECT_TRUE(after.owns());
+    }
+}
+
 } // namespace

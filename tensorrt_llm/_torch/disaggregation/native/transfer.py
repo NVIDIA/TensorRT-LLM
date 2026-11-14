@@ -42,6 +42,7 @@ except ImportError:
 import tensorrt_llm.bindings
 from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation import diagnostics as disagg_diagnostics
+from tensorrt_llm._torch.disaggregation.base import TokenRange
 from tensorrt_llm._torch.disaggregation.base.agent import (
     BaseTransferAgent,
     MemoryDescs,
@@ -65,8 +66,10 @@ from tensorrt_llm._torch.disaggregation.lifecycle.retirement import (
     RetirementDeadline,
     RetirementWatchdog,
 )
+from tensorrt_llm._torch.disaggregation.native import fabric_writer
 from tensorrt_llm._torch.disaggregation.native.auxiliary import (
     AuxBuffer,
+    AuxBufferMeta,
     build_aux_transfer_layout,
     get_non_empty_aux_indices,
 )
@@ -90,15 +93,18 @@ from tensorrt_llm._torch.disaggregation.native.ownership import SendOperationOwn
 from tensorrt_llm._torch.disaggregation.native.ownership import (
     TransferNotSubmittedError as _TransferNotSubmittedError,
 )
-from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
+from tensorrt_llm._torch.disaggregation.native.peer import PeerOverlap, PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.perf_logger import PerfTimer, perf_log_manager
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo, validate_protocol_version
 from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
 from tensorrt_llm._torch.disaggregation.nixl.agent import NixlTransferAgent
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
-from tensorrt_llm._torch.disaggregation.resource.page import CacheKind
+from tensorrt_llm._torch.disaggregation.resource.page import CacheKind, KVCachePageTable, MapperKind
 from tensorrt_llm._torch.disaggregation.resource.utils import (
+    get_layer_byte_ranges,
     get_physical_pool,
+    get_pool_view_global_layer_ids,
+    get_pool_view_slot_bytes,
     get_unique_pool_memory_descs,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
@@ -188,23 +194,30 @@ class RecvReqInfo:
     # Single-use token the receiver minted for this writer; echoed in every
     # KV result. Carried as a separate REQUEST_DATA frame, not in to_bytes().
     kv_result_report_token: bytes = field(default=b"", repr=False, compare=False)
+    # The receiver's draft-pool slots per draft layer group (see Chunk), or None when no draft set
+    # travels. Sent only when set, so a receiver without one emits exactly the old message.
+    draft_block_ids_per_layer_groups: Optional[list[np.ndarray]] = None
 
     def to_bytes(self) -> bytes:
-        return msgpack.packb(
-            {
-                "sender_req_id": self.sender_req_id,
-                "instance_name": self.instance_name,
-                "instance_rank": self.instance_rank,
-                "block_ids_per_layer_groups": [
-                    arr.tobytes() for arr in self.block_ids_per_layer_groups
-                ],
-                "unique_rid": self.unique_rid,
-                "dst_start_token": self.dst_start_token,
-                "aux_slot": self.aux_slot,
-                "slice_id": self.slice_id,
-                "context_first": self.context_first,
-            }
-        )
+        data = {
+            "sender_req_id": self.sender_req_id,
+            "instance_name": self.instance_name,
+            "instance_rank": self.instance_rank,
+            "block_ids_per_layer_groups": [
+                arr.tobytes() for arr in self.block_ids_per_layer_groups
+            ],
+            "unique_rid": self.unique_rid,
+            "dst_start_token": self.dst_start_token,
+            "aux_slot": self.aux_slot,
+            "slice_id": self.slice_id,
+            "context_first": self.context_first,
+        }
+        if self.draft_block_ids_per_layer_groups is not None:
+            data["draft_block_ids_per_layer_groups"] = [
+                np.asarray(arr, dtype=np.int64).tobytes()
+                for arr in self.draft_block_ids_per_layer_groups
+            ]
+        return msgpack.packb(data)
 
     @classmethod
     def from_bytes(cls, data: bytes) -> "RecvReqInfo":
@@ -212,6 +225,11 @@ class RecvReqInfo:
         d["block_ids_per_layer_groups"] = [
             np.frombuffer(b, dtype=np.int64).copy() for b in d["block_ids_per_layer_groups"]
         ]
+        if d.get("draft_block_ids_per_layer_groups") is not None:
+            d["draft_block_ids_per_layer_groups"] = [
+                np.frombuffer(b, dtype=np.int64).copy()
+                for b in d["draft_block_ids_per_layer_groups"]
+            ]
         from_older_release = _OLDER_RELEASE_REQUEST_KEY in d
         d.pop(_OLDER_RELEASE_REQUEST_KEY, None)
         # The report token comes only from its own checked REQUEST_DATA frame.
@@ -680,6 +698,193 @@ class _SessionQuiescence:
     endpoint: Optional[str]
 
 
+def _peer_has_draft_kv(peer_ri: RankInfo) -> bool:
+    # Strictly True: rank-info stand-ins without the property count as target-only peers.
+    return getattr(peer_ri, "has_draft_kv", False) is True
+
+
+def check_draft_kv_peer(
+    draft_registrar: Optional[PeerRegistrar], peer_ri: RankInfo
+) -> Optional[RankInfo]:
+    """The peer's draft view when both sides ship the drafter context window, else None.
+
+    Never raises: a peer pair where only one side engages the window
+    (``draft_peer_not_engaged``) moves the target set only.
+    """
+    if draft_registrar is None or not _peer_has_draft_kv(peer_ri):
+        return None
+    return peer_ri.draft_view()
+
+
+def draft_peer_not_engaged(
+    draft_registrar: Optional[PeerRegistrar], peer_ri: RankInfo
+) -> Optional[str]:
+    """Why the drafter window cannot travel because exactly one side engages it, or None.
+
+    E.g. a context server on a model without ``RuntimeHooks.disagg_draft_kv`` (or with the kill
+    switch) facing a generation server that has it. The pair then degrades to target-only
+    transfers: the window is disabled toward that peer on both sides, the generation side seeds an
+    empty drafter window, and the byte accounting stays exact. Not a target-path incompatibility.
+    """
+    local_has = draft_registrar is not None
+    peer_has = _peer_has_draft_kv(peer_ri)
+    if local_has == peer_has:
+        return None
+    return (
+        f"local rank {'engages' if local_has else 'does not engage'} the drafter context window "
+        f"but peer {peer_ri.instance_name} (rank={peer_ri.instance_rank}) "
+        f"{'does not' if local_has else 'does'}"
+    )
+
+
+def aux_meta_without_draft_ctx(meta: AuxBufferMeta) -> AuxBufferMeta:
+    """The auxiliary layout without its trailing drafter-context buffer.
+
+    A rank that engages the drafter window appends exactly one buffer, ``(ctx_len, ctx_base,
+    valid)`` per slot, after the common ones (``_make_aux_buffer(draft_ctx=True)``); toward a peer
+    that does not engage it only the common buffers travel.
+    """
+    return AuxBufferMeta(
+        ptrs=meta.ptrs[:-1],
+        size=meta.size[:-1],
+        item_sizes=meta.item_sizes[:-1],
+        device=meta.device,
+    )
+
+
+# draft_kv_fallback reasons counted here (disaggregation/draft_kv.py names the others).
+_PEER_DRAFT_GEOMETRY = "peer_draft_geometry"
+_PEER_NOT_ENGAGED = "peer_not_engaged"
+_DRAFT_FRAGMENT_ERROR = "draft_fragment_error"
+_CTX_RANK_DIVERGENCE = "ctx_rank_divergence"
+_RECEIVER_NOT_ASKED = "receiver_not_asked"
+
+
+def draft_window_bytes(page_table: Optional[KVCachePageTable], draft_block_ids) -> int:
+    """Local-rank bytes of the drafter context window a draft table names (0 for none)."""
+    if draft_block_ids is None or page_table is None:
+        return 0
+    total = 0
+    for lg_id, block_ids in enumerate(draft_block_ids):
+        n = int((np.asarray(block_ids) >= 0).sum())
+        if n:
+            for pool_view in page_table.layer_groups[lg_id].pool_views:
+                total += n * get_pool_view_slot_bytes(pool_view)
+    return total
+
+
+def _draft_view_pairs(self_table: KVCachePageTable, peer_table: KVCachePageTable):
+    """Pair every draft view with exactly one peer view, both ways: ``(pairs, None)``, or
+    ``(None, why)``.
+
+    The strict pairing of the upstream per-view transfer (#20709), for the drafter's tables only:
+    a view with no same-role peer view, several candidates, or a peer view left unpaired would
+    otherwise move a silently partial window.
+    """
+    pairs, used = [], set()
+    for self_lg_idx, self_lg in enumerate(self_table.layer_groups):
+        for self_pi, self_pv in enumerate(self_lg.pool_views):
+            self_layers = set(get_pool_view_global_layer_ids(self_pv, self_lg))
+            candidates = [
+                (peer_lg_idx, peer_pi, peer_pv)
+                for peer_lg_idx, peer_lg in enumerate(peer_table.layer_groups)
+                for peer_pi, peer_pv in enumerate(peer_lg.pool_views)
+                if peer_lg.kind == self_lg.kind
+                and peer_pv.pool_role == self_pv.pool_role
+                and self_layers & set(get_pool_view_global_layer_ids(peer_pv, peer_lg))
+            ]
+            if len(candidates) != 1:
+                return None, (
+                    f"draft view {sorted(self_pv.pool_role)} (lg={self_lg_idx}, pool={self_pi}) "
+                    f"matches {len(candidates)} peer views"
+                )
+            peer_lg_idx, peer_pi, peer_pv = candidates[0]
+            peer_layers = set(
+                get_pool_view_global_layer_ids(peer_pv, peer_table.layer_groups[peer_lg_idx])
+            )
+            if peer_layers != self_layers or peer_pv.mapper_kind != self_pv.mapper_kind:
+                return None, (
+                    f"draft view {sorted(self_pv.pool_role)} differs from its peer view in "
+                    "layers or mapper kind"
+                )
+            if (peer_lg_idx, peer_pi) in used:
+                return None, f"peer draft view (lg={peer_lg_idx}, pool={peer_pi}) paired twice"
+            used.add((peer_lg_idx, peer_pi))
+            pairs.append(((self_lg_idx, self_pi, self_pv), (peer_lg_idx, peer_pi, peer_pv)))
+    peer_views = sum(len(lg.pool_views) for lg in peer_table.layer_groups)
+    if len(used) != peer_views:
+        return None, f"{peer_views - len(used)} peer draft view(s) left unpaired"
+    return pairs, None
+
+
+def draft_peer_mismatch(
+    self_draft_ri: RankInfo, peer_draft_ri: RankInfo, overlaps=None
+) -> Optional[str]:
+    """Why two peers' drafter windows cannot be exchanged, or None when they can.
+
+    A pure function of both sides' draft geometry (and of the rank overlaps both sides compute
+    alike), so the sender's and the receiver's registration reach the same verdict. A mismatch
+    disables the draft set for that peer pair only; the target transfer is untouched. Ported from
+    the upstream per-view transfer's registration checks (#20709): bytes per head, strict view
+    pairing and the draft layer set, plus PP 1 and the draft/target overlap.
+    """
+    if self_draft_ri.pp_size != 1 or peer_draft_ri.pp_size != 1:
+        # The draft view copies the target's PP split, which says nothing of the draft layers.
+        return f"pipeline parallelism (pp={self_draft_ri.pp_size}/{peer_draft_ri.pp_size})"
+    a, b = self_draft_ri.attention, peer_draft_ri.attention
+    if a.dims_per_head != b.dims_per_head:
+        return f"head_dim {a.dims_per_head} != {b.dims_per_head}"
+    if a.element_bytes != b.element_bytes or a.is_mla != b.is_mla:
+        return (
+            f"dtype ({a.element_bytes} B, mla={a.is_mla}) != ({b.element_bytes} B, mla={b.is_mla})"
+        )
+    if a.tokens_per_block != b.tokens_per_block:
+        return f"tokens_per_block {a.tokens_per_block} != {b.tokens_per_block}"
+    self_table, peer_table = self_draft_ri.page_table, peer_draft_ri.page_table
+    self_layers = {ll.global_layer_id for lg in self_table.layer_groups for ll in lg.local_layers}
+    peer_layers = {ll.global_layer_id for lg in peer_table.layer_groups for ll in lg.local_layers}
+    if self_layers != peer_layers:
+        return f"draft layers {sorted(self_layers)} != {sorted(peer_layers)}"
+    pairs, why = _draft_view_pairs(self_table, peer_table)
+    if pairs is None:
+        return why
+    for self_side, peer_side in pairs:
+        if self_side[2].mapper_kind == MapperKind.REPLICATED:
+            continue
+        per_head = []
+        for (lg_idx, pool_idx, pool_view), heads in (
+            (self_side, a.kv_heads_per_rank),
+            (peer_side, b.kv_heads_per_rank),
+        ):
+            layer_bytes = get_layer_byte_ranges(pool_view)[1]
+            buffers = PeerRegistrar._get_buffers_per_layer(
+                pool_view, layer_group_id=lg_idx, pool_idx=pool_idx
+            )
+            if heads <= 0 or layer_bytes % (buffers * heads):
+                return f"draft view {sorted(pool_view.pool_role)} is not a whole number of heads"
+            per_head.append(layer_bytes // (buffers * heads))
+        if per_head[0] != per_head[1]:
+            return f"bytes per draft head {per_head[0]} != {per_head[1]}"
+    if overlaps is not None and list(overlaps[0]) != list(overlaps[1]):
+        return f"draft overlap ranks {list(overlaps[1])} != target {list(overlaps[0])}"
+    return None
+
+
+def draft_overlaps(target_registrar, draft_registrar, peer_ri: RankInfo, peer_draft_ri: RankInfo):
+    """Target and draft overlap ranks toward every DP group of a peer, as two flat lists."""
+    target, draft = [], []
+    for dp_rank in range(max(1, int(getattr(peer_ri, "dp_size", 1) or 1))):
+        target += target_registrar.get_peer_overlap(peer_ri, dp_rank).ranks
+        draft += draft_registrar.get_peer_overlap(peer_draft_ri, dp_rank).ranks
+    return target, draft
+
+
+# Sender.shutdown: how long it waits for each send worker to exit, and, with the fabric writer, how
+# long all workers get to finish after the writer drained before the process fail-stops.
+_SENDER_WORKER_JOIN_S = 5
+_SENDER_FABRIC_WORKER_DRAIN_S = 60.0
+
+
 class Sender(SenderBase):
     # Time-to-live for orphaned RecvReqInfo entries (seconds).
     # In gen-first ADP broadcast, non-assigned DP ranks accumulate
@@ -690,6 +895,14 @@ class Sender(SenderBase):
     # long after the context side gave up on it (its request may wait in the generation queue
     # for minutes), so this outlives the stale-request-info TTL.
     _RETIRED_SESSION_TTL_S = 600.0
+    # The standalone drafter's pool registrar (see TransferWorker); None ships the target set only.
+    _draft_registrar: Optional[PeerRegistrar] = None
+    # draft_kv counters of the context side (disaggregation/draft_kv.py), set by the transceiver.
+    _draft_kv_counters = None
+    # Peer key -> (counter reason, why) the drafter window is disabled toward that peer.
+    _draft_disabled_peers: Optional[Dict[str, tuple]] = None
+    # Fabric batch writer (native/fabric_writer.py); None = transfer agent only.
+    _fabric = None
 
     def __init__(
         self,
@@ -698,8 +911,10 @@ class Sender(SenderBase):
         enforce_physical_ownership: bool = False,
         retirement_watchdog: Optional[RetirementWatchdog] = None,
         context_first_ownership: bool = False,
+        draft_registrar: Optional[PeerRegistrar] = None,
     ) -> None:
         self._registrar = peer_registrar
+        self._draft_registrar = draft_registrar
         self._device_id = peer_registrar.self_rank_info.device_id
         self._agent = agent
         self._enforce_physical_ownership = enforce_physical_ownership
@@ -735,6 +950,8 @@ class Sender(SenderBase):
         self._ownership_poison_lock = (
             threading.Lock() if retirement_watchdog is None else retirement_watchdog.lock
         )
+        # Copy-engine writes into peers' imported KV pools (None = transfer agent only).
+        self._fabric = fabric_writer.FabricWriter.create(agent, self._device_id)
         self._num_threads = KV_TRANSFER_NUM_THREADS
         self._send_task_queues: List[queue.Queue] = [
             queue.Queue() for _ in range(self._num_threads)
@@ -1042,6 +1259,8 @@ class Sender(SenderBase):
         request: TransferRequest | _TransferRequestGroup,
         on_submitted: Optional[Callable[[], None]] = None,
     ) -> tuple[bool, Optional[str]]:
+        if fabric_writer.is_fabric_job(request):
+            return self._submit_fabric_job(task, request, on_submitted)
         requests = request.requests if isinstance(request, _TransferRequestGroup) else (request,)
         owned = self._owns_task(task)
         try:
@@ -1127,6 +1346,27 @@ class Sender(SenderBase):
         if not task.retire_backend_done_physical_operation(peer_rank):
             return False, "quiescence deadline expired before backend completion"
         return True, None
+
+    def _submit_fabric_job(
+        self,
+        task: SendTaskBase,
+        job: "fabric_writer.FabricJob",
+        on_submitted: Optional[Callable[[], None]] = None,
+    ) -> tuple[bool, Optional[str]]:
+        """Run a fabric job (built only for tasks without physical ownership) to completion."""
+        status = self._fabric.submit(job)
+        if on_submitted is not None:
+            with disagg_diagnostics.suppress_diagnostic_errors():
+                on_submitted()
+        completed = status.wait()
+        detail = None if completed else status.last_status_str()
+        if not completed and status.unquiesced:
+            # Without physical ownership a failed result lets both sides release the request's
+            # pages while a copy may still land in them: stop instead.
+            fabric_writer.fail_stop(
+                f"unquiesced write for request {getattr(task, '_unique_rid', '?')}: {detail}"
+            )
+        return completed, detail
 
     def _process_task_queue(self, thread_idx: int):
         device_id = self._device_id
@@ -1308,6 +1548,30 @@ class Sender(SenderBase):
             )
         return requests[0] if len(requests) == 1 else _TransferRequestGroup(tuple(requests))
 
+    def _build_kv_request(self, write_meta: WriteMeta, owned: bool):
+        """The KV write as a fabric job when eligible, else the transfer-agent request.
+
+        Fabric writes serve only device-to-device writes of tasks without physical ownership
+        enforcement; every other write keeps the transfer agent.
+        """
+
+        def make_agent_request():
+            return Sender._make_agent_request(write_meta, device_id=self._device_id)
+
+        if (
+            self._fabric is not None
+            and not owned
+            and len(write_meta.transfer_groups) <= 1
+            and all(
+                group.src_memory_type == "VRAM" and group.dst_memory_type == "VRAM"
+                for group in write_meta.transfer_groups
+            )
+        ):
+            job = self._fabric.prepare(write_meta, make_agent_request)
+            if job is not None:
+                return job
+        return make_agent_request()
+
     @nvtx_range("_deliver_kv_to_agent")
     def _deliver_kv_to_agent(self, write_meta: WriteMeta):
         assert write_meta.src_ptrs.size == write_meta.dst_ptrs.size == write_meta.sizes.size, (
@@ -1381,7 +1645,7 @@ class Sender(SenderBase):
             submission_callback = emit_submitted
         if write_meta.src_ptrs.size > 0:
             try:
-                request = Sender._make_agent_request(write_meta, device_id=self._device_id)
+                request = self._build_kv_request(write_meta, owned)
             except Exception as e:
                 # Report the failure instead of letting it escape: without a result the receiver
                 # waits until its transfer timeout. Nothing was submitted yet.
@@ -1682,54 +1946,33 @@ class Sender(SenderBase):
             ranges.append((start, max(start, end)))
         return ranges
 
-    @nvtx_range("_build_kv_write_meta")
-    def _build_kv_write_meta(self, task: KVSendTask, req_info: RecvReqInfo) -> WriteMeta:
-        peer_ri = self._registrar.get_peer_rank_info(req_info.instance_name, req_info.instance_rank)
-        self_ri = self._registrar.self_rank_info
-        token_range = task._chunk.token_range
-        # Only a piece short of the whole prompt runs the chunk projection below, and that is the
-        # part with no answer under CP; a sole piece covering everything takes the untouched path.
-        is_partial = token_range.start > 0 or token_range.end < task._prompt_len
-        if is_partial and (self_ri.cp_size > 1 or peer_ri.cp_size > 1):
-            raise ValueError(
-                "enable_pipelined_transfer is not supported with context parallelism "
-                f"(sender cp_size={self_ri.cp_size}, receiver cp_size={peer_ri.cp_size})"
-            )
-        timer = task._perf_timer
-        if timer:
-            timer.record_prepare_args_start(peer_ri.instance_rank)
-        targets = self._registrar.get_peer_overlap(peer_ri, peer_ri.dp_rank)
-        expected_transfers = len(targets.ranks)
-        # Recorded on the task as well: the count on the write meta settles the task, while the
-        # handle has to answer how many writes are still out after one of them has already failed.
-        task.expected_transfers = expected_transfers
+    @staticmethod
+    def _collect_pool_fragments(
+        registrar: PeerRegistrar,
+        peer_ri: RankInfo,
+        targets: PeerOverlap,
+        src_block_ids_per_groups: list[np.ndarray],
+        dst_block_ids_per_groups: list[np.ndarray],
+        excluded_pool_views,
+        dst_start_token: Optional[int],
+        token_range: TokenRange,
+        src_frag_parts: dict[tuple[str, str], list[np.ndarray]],
+        dst_frag_parts: dict[tuple[str, str], list[np.ndarray]],
+        size_specs: dict[tuple[str, str], list[tuple[int, int]]],
+    ) -> None:
+        """Append the fragments of every pool pair ``registrar`` matches with ``peer_ri``.
 
-        # Aggregate fragment pointers from all matching pool pairs.
-        # Each pool pair produces one or more region pairs (rp), each containing
-        # a numpy array of src/dst pointers and a uniform bytes_per_region.
-        src_frag_parts: dict[tuple[str, str], list[np.ndarray]] = defaultdict(list)
-        dst_frag_parts: dict[tuple[str, str], list[np.ndarray]] = defaultdict(list)
-        # Instead of calling np.full() per region pair to build a size array and
-        # then np.concatenate() all of them, we record (count, bytes_per_region)
-        # tuples and construct the final sizes array with a single np.repeat().
-        # For 48k+ items this avoids many small allocations in the hot loop.
-        size_specs: dict[tuple[str, str], list[tuple[int, int]]] = defaultdict(list)
-        dst_device_id = peer_ri.device_id
-        extractor = self._registrar.self_extractor
-        peer_extractor = self._registrar.peer_extractor(
-            peer_ri.instance_name, peer_ri.instance_rank
-        )
-        pool_mapping = self._registrar.get_pool_mapping(peer_ri)
-        dst_block_ids_per_groups = req_info.block_ids_per_layer_groups
-        src_block_ids_per_groups = task._chunk.block_ids_per_layer_groups
-
-        # Aggregate fragments from all matching pools using numpy concatenation.
-        # Send ownership is per pool: replicated pools elect one fan-in
-        # owner, sharded pools keep head-duplication routing.
+        Fragments are grouped by (source, destination) memory type. Send ownership is per pool:
+        replicated pools elect one fan-in owner, sharded pools keep head-duplication routing.
+        """
+        self_ri = registrar.self_rank_info
+        extractor = registrar.self_extractor
+        peer_extractor = registrar.peer_extractor(peer_ri.instance_name, peer_ri.instance_rank)
+        pool_mapping = registrar.get_pool_mapping(peer_ri)
         for (self_lg, self_pi), (peer_lg, peer_pi) in pool_mapping.items():
-            if (self_lg, self_pi) in task._chunk.excluded_pool_views:
+            if (self_lg, self_pi) in excluded_pool_views:
                 continue
-            if not self._registrar.should_send_pool(targets, peer_ri, self_lg, self_pi):
+            if not registrar.should_send_pool(targets, peer_ri, self_lg, self_pi):
                 continue
 
             lg_info = extractor.page_table.layer_groups[self_lg]
@@ -1740,7 +1983,7 @@ class Sender(SenderBase):
             if lg_info.kind == CacheKind.STATE:
                 if src_block_ids.size == 0 or dst_block_ids.size == 0:
                     continue
-                if not MambaPolicy.is_paired(self._registrar.self_rank_info, peer_ri):
+                if not MambaPolicy.is_paired(self_ri, peer_ri):
                     continue
                 src_region = extractor.extract_slot(int(src_block_ids[0]), self_lg, self_pi)
                 dst_region = peer_extractor.extract_slot(int(dst_block_ids[0]), peer_lg, peer_pi)
@@ -1755,9 +1998,7 @@ class Sender(SenderBase):
                     # rejected under helix.
                     src_block_ids = src_block_ids[peer_ri.cp_rank :: peer_ri.cp_size]
                 tpb = extractor.page_table.tokens_per_block
-                dst_start_block = (
-                    req_info.dst_start_token // tpb if req_info.dst_start_token is not None else 0
-                )
+                dst_start_block = dst_start_token // tpb if dst_start_token is not None else 0
                 # Both tables are positional (index == block ordinal, -1 == not
                 # held), so pairing is a plain intersection: SWA eviction, prefix
                 # reuse, and pipelined chunk bounds are all already encoded as
@@ -1772,7 +2013,7 @@ class Sender(SenderBase):
                 dst_region = peer_extractor.extract(dst_block_ids, peer_lg, peer_pi)
 
             # Map and collect fragments (same for all layer types)
-            mapper = self._registrar.get_kv_map(peer_ri, (self_lg, self_pi), (peer_lg, peer_pi))
+            mapper = registrar.get_kv_map(peer_ri, (self_lg, self_pi), (peer_lg, peer_pi))
             if isinstance(mapper, RingMapper):
                 # A ring holds positions, not a region: move the positions both
                 # rings retain at the end of this piece into each side's slots.
@@ -1808,6 +2049,168 @@ class Sender(SenderBase):
                 size_specs[memory_types].append(
                     (rp.src.memory.ptrs.size, rp.src.memory.bytes_per_region)
                 )
+
+    def _collect_draft_fragments(
+        self,
+        task: KVSendTask,
+        req_info: RecvReqInfo,
+        peer_ri: RankInfo,
+        targets: PeerOverlap,
+        src_frag_parts: dict[tuple[str, str], list[np.ndarray]],
+        dst_frag_parts: dict[tuple[str, str], list[np.ndarray]],
+        size_specs: dict[tuple[str, str], list[tuple[int, int]]],
+    ) -> None:
+        """Append the standalone drafter's context window to the same write, on the last piece.
+
+        The draft pool goes through its own registrar: its pools can share the target's role labels
+        and global layer ids, so one pool mapping would cross-match them.
+
+        A request whose window does not travel carries no draft table on the side that decided so
+        (the context side, signalled to the receiver ahead of its request in context-first). Any
+        other inconsistency also leaves the window out rather than failing the request: the target
+        write is unaffected and the generation side's drafter starts empty.
+        """
+        src_draft = getattr(task._chunk, "draft_block_ids_per_layer_groups", None)
+        dst_draft = getattr(req_info, "draft_block_ids_per_layer_groups", None)
+        draft_registrar = self._draft_registrar
+        counters = self._draft_kv_counters
+        disabled = (self._draft_disabled_peers or {}).get(
+            peer_ri.instance_name + str(peer_ri.instance_rank)
+        )
+        if draft_registrar is None:
+            # This rank does not engage the window. A peer that does (registration recorded it as
+            # peer_not_engaged) asks for none, so only the target set moves.
+            if not task._chunk.is_last:
+                return
+            if dst_draft is not None:
+                # The receiver disables the window toward this sender at registration, so this
+                # needs a peer that did not: leave the window out (its attestation then falls the
+                # window back) rather than fail the request.
+                logger.warning_once(
+                    f"rid={req_info.unique_rid}: the receiver asks for the drafter context window "
+                    "but this sender does not engage it; sending the target set only",
+                    key=f"draft-kv-unasked-{peer_ri.instance_name}",
+                )
+            if counters is not None and (disabled is not None or dst_draft is not None):
+                counters.record_fallback(
+                    disabled[0] if disabled is not None else _PEER_NOT_ENGAGED,
+                    f"rid={req_info.unique_rid}",
+                )
+            return
+        if not task._chunk.is_last:
+            return
+        if disabled is not None:
+            # Registration disabled the window toward this peer, and the receiver asked for none.
+            if src_draft is not None and counters is not None:
+                counters.record_fallback(disabled[0], f"rid={req_info.unique_rid} {disabled[1]}")
+            return
+        if src_draft is None or dst_draft is None:
+            if (src_draft is None) != (dst_draft is None) and counters is not None:
+                # Either this context rank decided otherwise than the rank whose response the
+                # receiver followed (it ships nothing the receiver asked for), or the receiver asked
+                # for none although this rank ships: its state never arrived (receiver_not_asked).
+                # No draft bytes move either way; the receiver's byte attestation catches the first.
+                counters.record_fallback(
+                    _RECEIVER_NOT_ASKED if src_draft is not None else _CTX_RANK_DIVERGENCE,
+                    f"rid={req_info.unique_rid} peer_rank={peer_ri.instance_rank} "
+                    f"sender_ships={src_draft is not None}",
+                )
+            return
+        peer_draft_ri = draft_registrar.get_peer_rank_info(
+            peer_ri.instance_name, peer_ri.instance_rank
+        )
+        draft_targets = draft_registrar.get_peer_overlap(peer_draft_ri, peer_draft_ri.dp_rank)
+        # Registration already compared the overlaps (draft_peer_mismatch); a cheap guard.
+        if list(draft_targets.ranks) != list(targets.ranks):
+            logger.warning_once(
+                f"draft overlap ranks {draft_targets.ranks} differ from target overlap ranks "
+                f"{targets.ranks} (rid={req_info.unique_rid}); leaving the drafter window out",
+                key=f"draft-kv-overlap-{peer_ri.instance_name}",
+            )
+            return
+        marks = {key: len(specs) for key, specs in size_specs.items()}
+        try:
+            Sender._collect_pool_fragments(
+                draft_registrar,
+                peer_draft_ri,
+                draft_targets,
+                src_draft,
+                dst_draft,
+                (),
+                None,
+                task._chunk.token_range,
+                src_frag_parts,
+                dst_frag_parts,
+                size_specs,
+            )
+        except Exception as error:  # noqa: BLE001 - only the drafter window may be lost here
+            # Drop whatever the draft set appended; the target fragments before it stay, and the
+            # receiver's byte attestation falls the window back on every generation rank.
+            for key in list(size_specs):
+                mark = marks.get(key, 0)
+                del src_frag_parts[key][mark:]
+                del dst_frag_parts[key][mark:]
+                del size_specs[key][mark:]
+                if mark == 0:
+                    del src_frag_parts[key], dst_frag_parts[key], size_specs[key]
+            logger.error(
+                f"rid={req_info.unique_rid}: drafter window fragments failed ({error}); "
+                "sending the target set only"
+            )
+            if counters is not None:
+                counters.record_fallback(_DRAFT_FRAGMENT_ERROR, f"rid={req_info.unique_rid}")
+
+    @nvtx_range("_build_kv_write_meta")
+    def _build_kv_write_meta(self, task: KVSendTask, req_info: RecvReqInfo) -> WriteMeta:
+        peer_ri = self._registrar.get_peer_rank_info(req_info.instance_name, req_info.instance_rank)
+        self_ri = self._registrar.self_rank_info
+        token_range = task._chunk.token_range
+        # Only a piece short of the whole prompt runs the chunk projection below, and that is the
+        # part with no answer under CP; a sole piece covering everything takes the untouched path.
+        is_partial = token_range.start > 0 or token_range.end < task._prompt_len
+        if is_partial and (self_ri.cp_size > 1 or peer_ri.cp_size > 1):
+            raise ValueError(
+                "enable_pipelined_transfer is not supported with context parallelism "
+                f"(sender cp_size={self_ri.cp_size}, receiver cp_size={peer_ri.cp_size})"
+            )
+        timer = task._perf_timer
+        if timer:
+            timer.record_prepare_args_start(peer_ri.instance_rank)
+        targets = self._registrar.get_peer_overlap(peer_ri, peer_ri.dp_rank)
+        expected_transfers = len(targets.ranks)
+        # Recorded on the task as well: the count on the write meta settles the task, while the
+        # handle has to answer how many writes are still out after one of them has already failed.
+        task.expected_transfers = expected_transfers
+
+        # Aggregate fragment pointers from all matching pool pairs.
+        # Each pool pair produces one or more region pairs (rp), each containing
+        # a numpy array of src/dst pointers and a uniform bytes_per_region.
+        src_frag_parts: dict[tuple[str, str], list[np.ndarray]] = defaultdict(list)
+        dst_frag_parts: dict[tuple[str, str], list[np.ndarray]] = defaultdict(list)
+        # Instead of calling np.full() per region pair to build a size array and
+        # then np.concatenate() all of them, we record (count, bytes_per_region)
+        # tuples and construct the final sizes array with a single np.repeat().
+        # For 48k+ items this avoids many small allocations in the hot loop.
+        size_specs: dict[tuple[str, str], list[tuple[int, int]]] = defaultdict(list)
+        dst_device_id = peer_ri.device_id
+
+        # Aggregate fragments from all matching pools using numpy concatenation.
+        Sender._collect_pool_fragments(
+            self._registrar,
+            peer_ri,
+            targets,
+            task._chunk.block_ids_per_layer_groups,
+            req_info.block_ids_per_layer_groups,
+            task._chunk.excluded_pool_views,
+            req_info.dst_start_token,
+            token_range,
+            src_frag_parts,
+            dst_frag_parts,
+            size_specs,
+        )
+        self._collect_draft_fragments(
+            task, req_info, peer_ri, targets, src_frag_parts, dst_frag_parts, size_specs
+        )
 
         transfer_groups = []
         if src_frag_parts:
@@ -1876,6 +2279,14 @@ class Sender(SenderBase):
                 peer_ri.instance_name, peer_ri.instance_rank
             )
             if layout is None:
+                # Toward a peer that does not engage the drafter window (or from a sender that
+                # does not), only the common buffers travel; the drafter-context slot is not read
+                # (the generation side's window is disabled toward this peer).
+                self_has = _peer_has_draft_kv(self._registrar.self_rank_info)
+                if self_has and not _peer_has_draft_kv(peer_ri):
+                    src_aux_meta = aux_meta_without_draft_ctx(src_aux_meta)
+                elif _peer_has_draft_kv(peer_ri) and not self_has:
+                    peer_aux_meta = aux_meta_without_draft_ctx(peer_aux_meta)
                 layout = build_aux_transfer_layout(src_aux_meta, peer_aux_meta)
                 self._registrar.cache_aux_transfer_layout(
                     peer_ri.instance_name, peer_ri.instance_rank, layout
@@ -2001,15 +2412,75 @@ class Sender(SenderBase):
         with self._loaded_remote_agents_lock:
             if self._shutdown_requested:
                 return
+            # The drafter window never refuses a peer: a geometry mismatch or a peer that engages
+            # it on one side only disables the window toward that peer (target set only).
+            peer_draft_ri = check_draft_kv_peer(self._draft_registrar, ri)
             self._registrar.register(ri.instance_name, ri.instance_rank, ri)
+            if peer_draft_ri is not None:
+                self._register_draft_peer(ri, peer_draft_ri)
+            else:
+                self._note_draft_peer_not_engaged(ri)
             self._agent.load_remote_agent(
                 agent_name,
                 ri.transfer_engine_info,
             )
             self._loaded_remote_agents.add(agent_name)
+            if self._fabric is not None:
+                self._fabric.add_peer(agent_name, ri.fabric_export)
         logger.debug(
             f"Completed handling REGISTER_RANK_INFO for instance='{ri.instance_name}', rank={ri.instance_rank}"
         )
+
+    def _note_draft_peer_not_engaged(self, ri: RankInfo) -> None:
+        """Disable the drafter window toward a peer when only one side engages it.
+
+        The receiver reaches the same verdict (``Receiver._check_draft_peer``) and asks for no
+        draft pages, so only the target set moves; counted per request as ``peer_not_engaged``.
+        """
+        why = draft_peer_not_engaged(self._draft_registrar, ri)
+        if why is None:
+            return
+        if self._draft_disabled_peers is None:
+            self._draft_disabled_peers = {}
+        self._draft_disabled_peers[ri.instance_name + str(ri.instance_rank)] = (
+            _PEER_NOT_ENGAGED,
+            why,
+        )
+        logger.warning(
+            f"Drafter context window disabled toward peer {ri.instance_name} "
+            f"(rank={ri.instance_rank}): {why}; transferring the target set only"
+        )
+
+    def _register_draft_peer(self, ri: RankInfo, peer_draft_ri: RankInfo) -> None:
+        """Register the peer's drafter window, or disable it toward this peer alone.
+
+        The receiver runs the same check (``draft_peer_mismatch``) and then asks for no draft
+        pages, so both sides agree and the byte accounting stays exact.
+        """
+        reason = _PEER_DRAFT_GEOMETRY
+        try:
+            why = draft_peer_mismatch(
+                self._draft_registrar.self_rank_info,
+                peer_draft_ri,
+                draft_overlaps(self._registrar, self._draft_registrar, ri, peer_draft_ri),
+            )
+            if why is None and getattr(ri, "draft_receive_disabled", None):
+                # The peer takes part but receives no window (e.g. its synchronous receive path
+                # cannot keep its TP ranks in step about it).
+                reason = ri.draft_receive_disabled
+                why = f"the peer receives no drafter window ({reason})"
+            if why is None:
+                self._draft_registrar.register(ri.instance_name, ri.instance_rank, peer_draft_ri)
+        except Exception as error:  # noqa: BLE001 - the target set must survive any draft issue
+            why = f"draft registration failed: {error}"
+        if why is not None:
+            if self._draft_disabled_peers is None:
+                self._draft_disabled_peers = {}
+            self._draft_disabled_peers[ri.instance_name + str(ri.instance_rank)] = (reason, why)
+            logger.warning(
+                f"Drafter context window disabled toward peer {ri.instance_name} "
+                f"(rank={ri.instance_rank}): {why}; transferring the target set only"
+            )
 
     def _handle_cancel_session(self, message: list[bytes]):
         unique_rid = int(message[1])
@@ -2399,7 +2870,20 @@ class Sender(SenderBase):
         for q in self._send_task_queues:
             q.put(None)
         for t in self._worker_threads:
-            t.join(timeout=5)
+            t.join(timeout=_SENDER_WORKER_JOIN_S)
+        if self._fabric is not None:
+            self._fabric.shutdown()
+            # A worker still waiting on a fabric write at the join above may, once the writer
+            # drained, fall back to the transfer agent: every worker must finish before the agents
+            # are invalidated and the registrations released. One that does not fail-stops.
+            deadline = time.monotonic() + _SENDER_FABRIC_WORKER_DRAIN_S
+            for t in self._worker_threads:
+                t.join(timeout=max(0.0, deadline - time.monotonic()))
+            alive = [t.name for t in self._worker_threads if t.is_alive()]
+            if alive:
+                fabric_writer.fail_stop(
+                    f"sender workers {alive} still running after the fabric writer drained"
+                )
 
         # Snapshot under lock as defense in depth.
         with self._loaded_remote_agents_lock:
@@ -2994,6 +3478,9 @@ class TxSession(TxSessionBase):
 
 
 class KVRecvTask(_LogicalTask):
+    # Why the drafter window was not asked for (set by Receiver.dispatch_task), else None.
+    draft_disabled_reason: Optional[str] = None
+
     def __init__(
         self,
         unique_rid: Optional[int],
@@ -3156,6 +3643,17 @@ class KVRecvTask(_LogicalTask):
 
 
 class Receiver(ReceiverBase):
+    # The standalone drafter's pool registrar (see TransferWorker); None receives the target set only.
+    _draft_registrar: Optional[PeerRegistrar] = None
+    # Context info endpoint -> (counter reason, why) the drafter window is disabled toward that peer.
+    _draft_disabled_peers: Optional[Dict[str, tuple]] = None
+    # draft_kv counters of the generation side, set by the transceiver on a rank that does not
+    # engage the window (an engaged rank counts in the transceiver as it seeds).
+    _draft_kv_counters = None
+
+    # Set once this rank's KV pool fabric export is attached to its RankInfo (or not wanted).
+    _fabric_export_done = True
+
     def __init__(
         self,
         peer_registrar: PeerRegistrar,
@@ -3165,8 +3663,10 @@ class Receiver(ReceiverBase):
         context_first_ownership: bool = False,
         rank_info_auth_key: Optional[bytes] = None,
         rank_info_timeout_s: float = _FALLBACK_TX_OVERALL_TIMEOUT_S,
+        draft_registrar: Optional[PeerRegistrar] = None,
     ):
         self._registrar = peer_registrar
+        self._draft_registrar = draft_registrar
         self._agent = agent
         self._enforce_physical_ownership = enforce_physical_ownership
         self._context_first_ownership = context_first_ownership
@@ -3194,9 +3694,22 @@ class Receiver(ReceiverBase):
         self._shutdown = False
         self._ownership_admission_lock = threading.Lock()
         self._ownership_poisoned: Optional[Exception] = None
+        self._fabric_export_lock = threading.Lock()
+        self._fabric_export_done = not fabric_writer.fabric_write_enabled()
 
         self._start_listener()
         logger.info(f"Receiver init with endpoint: {self._messenger.endpoint}")
+
+    def _ensure_fabric_export(self) -> None:
+        """Attach the KV pool fabric export to this rank's info before it first registers."""
+        if self._fabric_export_done:
+            return
+        with self._fabric_export_lock:
+            if self._fabric_export_done:
+                return
+            rank_info = self._registrar.self_rank_info
+            rank_info.fabric_export = fabric_writer.export_rank_pools(rank_info)
+            self._fabric_export_done = True
 
     @property
     def endpoint(self):
@@ -3338,6 +3851,9 @@ class Receiver(ReceiverBase):
             aux_slot=task._aux_slot,
             slice_id=task.slice_id,
             context_first=task._params.schedule_style != DisaggScheduleStyle.GENERATION_FIRST,
+            draft_block_ids_per_layer_groups=getattr(
+                task._chunk, "draft_block_ids_per_layer_groups", None
+            ),
         )
 
     def dispatch_task(self, task: KVRecvTask) -> None:
@@ -3425,6 +3941,7 @@ class Receiver(ReceiverBase):
             task.expected_transfers = len(peer_overlap.ranks)
         else:
             task.expected_transfers = len(dp0_overlap.ranks)
+        self._drop_disabled_draft_window(task, receiver_req, params)
         session = self._get_session(task._unique_rid)
         if session is None:
             raise RuntimeError(
@@ -3646,6 +4163,8 @@ class Receiver(ReceiverBase):
                 self._incompatible_peers[info_endpoint] = msg
                 raise PeerIncompatibleError(msg) from e
 
+            self._check_draft_peer(info_endpoint, sender_info)
+            self._ensure_fabric_export()
             for endpoint in sender_info.sender_endpoints:
                 dealer = self._get_or_connect_dealer(endpoint)
                 rank_info = self._registrar.self_rank_info
@@ -3656,6 +4175,84 @@ class Receiver(ReceiverBase):
 
         else:
             return self._sender_ep_instance_map[info_endpoint]
+
+    def _drop_disabled_draft_window(self, task: KVRecvTask, receiver_req: RecvReqInfo, params):
+        """The draft table this request asks for, after dropping a disabled window.
+
+        A window disabled toward the context peer (registration) or for this rank (it receives
+        none) is not asked for and its bytes are not expected, so the byte attestation stays exact;
+        the request then drafts from an empty window (the transceiver reads the reason back off
+        the task).
+        """
+        draft_ids = getattr(receiver_req, "draft_block_ids_per_layer_groups", None)
+        peer_disabled = None
+        if self._draft_disabled_peers:
+            # Only a registered (so endpoint-carrying) peer can be disabled. Every other receive,
+            # draft or not, never needs the endpoint here: gen-first and ADP dispatches carry none.
+            endpoint = getattr(params, "ctx_info_endpoint", None)
+            if isinstance(endpoint, list):
+                endpoint = endpoint[0] if endpoint else None
+            if endpoint is not None:
+                peer_disabled = self._draft_disabled_peers.get(endpoint)
+        if draft_ids is None:
+            if (
+                peer_disabled is not None
+                and self._draft_registrar is None
+                and self._draft_kv_counters is not None
+            ):
+                # This rank does not engage the window but the context peer does.
+                self._draft_kv_counters.record_fallback(
+                    peer_disabled[0], f"rid={receiver_req.unique_rid}"
+                )
+            return None
+        disabled = getattr(self._registrar.self_rank_info, "draft_receive_disabled", None)
+        if disabled is None and peer_disabled is not None:
+            disabled = peer_disabled[0]
+        if disabled is None:
+            return draft_ids
+        receiver_req.draft_block_ids_per_layer_groups = None
+        if task.expected_write_bytes is not None:
+            task.expected_write_bytes -= draft_window_bytes(
+                self._draft_registrar.self_extractor.page_table, draft_ids
+            )
+        task.draft_disabled_reason = disabled
+        return None
+
+    def _check_draft_peer(self, info_endpoint: str, sender_info: RankInfo) -> None:
+        """Disable the drafter window toward a context peer whose draft geometry does not match.
+
+        The same verdict as the sender's (``draft_peer_mismatch``): requests to that peer then ask
+        for no draft pages, so neither side moves or expects any.
+        """
+        not_engaged = draft_peer_not_engaged(self._draft_registrar, sender_info)
+        if not_engaged is not None:
+            if self._draft_disabled_peers is None:
+                self._draft_disabled_peers = {}
+            self._draft_disabled_peers[info_endpoint] = (_PEER_NOT_ENGAGED, not_engaged)
+            logger.warning(
+                f"Drafter context window disabled toward context peer '{info_endpoint}': "
+                f"{not_engaged}; receiving the target set only"
+            )
+            return
+        if self._draft_registrar is None:
+            return
+        try:
+            sender_draft = sender_info.draft_view()
+            why = draft_peer_mismatch(
+                self._draft_registrar.self_rank_info,
+                sender_draft,
+                draft_overlaps(self._registrar, self._draft_registrar, sender_info, sender_draft),
+            )
+        except Exception as error:  # noqa: BLE001 - the target set must survive any draft issue
+            why = f"draft geometry check failed: {error}"
+        if why is not None:
+            if self._draft_disabled_peers is None:
+                self._draft_disabled_peers = {}
+            self._draft_disabled_peers[info_endpoint] = (_PEER_DRAFT_GEOMETRY, why)
+            logger.warning(
+                f"Drafter context window disabled toward context peer '{info_endpoint}': "
+                f"{why}; receiving the target set only"
+            )
 
     def send_cancel_to_senders(self, unique_rid: int, sender_endpoints: set[str]) -> set[str]:
         """Notify senders and return the endpoints whose cancel message was sent."""
@@ -4152,6 +4749,30 @@ class RxSession(RxSessionBase):
                 self._logical_outcomes.seal()
             return task
 
+    def kv_write_byte_counts(self) -> tuple[int, Optional[int]]:
+        """(attested, expected) destination bytes over this session's KV tasks; expected is None
+        when a task published no expected total."""
+        with self.lock:
+            verified = sum(task.verified_write_bytes for task in self._kv_tasks)
+            expected = [task.expected_write_bytes for task in self._kv_tasks]
+        return verified, None if any(e is None for e in expected) else sum(expected)
+
+    def draft_disabled_reason(self) -> Optional[str]:
+        """Why this session asked its context peer for no drafter window, or None."""
+        with self.lock:
+            return next(
+                (t.draft_disabled_reason for t in self._kv_tasks if t.draft_disabled_reason),
+                None,
+            )
+
+    def peek_draft_ctx(self) -> Optional[tuple[int, int, bool]]:
+        """The drafter-context state in this session's aux slot, without consuming it."""
+        get_draft_ctx = getattr(self._aux_buffer, "get_slot_draft_ctx", None)
+        if not callable(get_draft_ctx) or self.aux_slot is None:
+            return None
+        state = get_draft_ctx(self.aux_slot)
+        return state if isinstance(state, tuple) else None
+
     def kv_write_verified(self) -> bool:
         """True when every KV task's published destination bytes are attested written.
 
@@ -4443,6 +5064,11 @@ class RxSession(RxSessionBase):
         )
         request.py_first_gen_tokens = first_gen_tokens  # type: ignore[attr-defined]
         request.py_draft_tokens = draft_tokens  # type: ignore[attr-defined]
+        # The context side's drafter (ctx_len, ctx_base, valid), present only with that aux slot.
+        get_draft_ctx = getattr(self._aux_buffer, "get_slot_draft_ctx", None)
+        draft_ctx = get_draft_ctx(self.aux_slot) if callable(get_draft_ctx) else None
+        if isinstance(draft_ctx, tuple):
+            request.py_draft_ctx_aux = draft_ctx  # type: ignore[attr-defined]
         if request.py_disaggregated_params is not None:
             request.py_disaggregated_params.ctx_usage = {
                 "prompt_tokens": prompt_tokens,
@@ -4849,17 +5475,22 @@ def _create_nixl_agent(
 
 
 def _make_aux_buffer(
-    kvm: KVCacheManagerV2, max_slots: int, max_draft_len: Optional[int] = None
+    kvm: KVCacheManagerV2,
+    max_slots: int,
+    max_draft_len: Optional[int] = None,
+    draft_ctx: bool = False,
 ) -> Optional[AuxBuffer]:
     if max_slots <= 0:
         return None
     if max_draft_len is None:
         max_draft_len = max(0, int(getattr(kvm, "max_draft_len", 0)))
+    kwargs = {"draft_ctx": True} if draft_ctx else {}
     return AuxBuffer(
         max_slot_num=max_slots,
         beam_width=max(1, int(getattr(kvm, "max_beam_width", 1))),
         max_draft_len=max_draft_len,
         device="cpu",
+        **kwargs,
     )
 
 
@@ -4885,9 +5516,18 @@ class TransferWorkerConfig:
     # agent_buffer_size_mb == 0.
     agent_bounce_params: Optional[Dict[str, str]] = None
     rank_info_auth_key: Optional[bytes] = field(default=None, repr=False)
+    # A standalone drafter's separate KV pool whose context window ships with the
+    # target's KV (disaggregation/draft_kv.py decides); None moves the target only.
+    draft_kv_cache_manager: Optional[KVCacheManagerV2] = None
+    # Why this rank takes part in the draft-window exchange but receives no window, or None.
+    draft_receive_disabled: Optional[str] = None
 
 
 class TransferWorker:
+    # Class-level defaults keep workers built without __init__ on the target-only path.
+    _draft_extractor: Optional[KVRegionExtractorV1] = None
+    _draft_registrar: Optional[PeerRegistrar] = None
+
     def __init__(self, config: TransferWorkerConfig):
         self._shutdown_prepared = False
         self._config = config
@@ -4903,16 +5543,24 @@ class TransferWorker:
             self._retirement_watchdog = RetirementWatchdog(self._on_quiescence_fatal)
         self._rank_info_auth_key = _validate_rank_info_auth_key(config.rank_info_auth_key)
         kvm = config.kv_cache_manager
+        draft_kvm = config.draft_kv_cache_manager
         self._aux_buffer = _make_aux_buffer(
-            kvm, config.max_concurrent_sessions, config.max_draft_len
+            kvm,
+            config.max_concurrent_sessions,
+            config.max_draft_len,
+            draft_ctx=draft_kvm is not None,
         )
         self._rank_info = RankInfo.from_kv_cache_manager(
             config.instance_name,
             kvm,
             config.device_id,
             self._aux_buffer.meta if self._aux_buffer is not None else None,
+            draft_kv_cache_manager=draft_kvm,
         )
         self._rank_info.context_first_ownership = config.context_first_ownership
+        if draft_kvm is not None and config.draft_receive_disabled:
+            self._rank_info.draft_receive_disabled = config.draft_receive_disabled
+        fabric_writer.note_worker_init()
         self._setup_peer_infrastructure(kvm)
         self._setup_transfer_engine()
         if self._retirement_watchdog is not None:
@@ -5014,6 +5662,12 @@ class TransferWorker:
         )
         self._kv_extractor = KVRegionExtractorV1(kvm)
         self._peer_registrar = PeerRegistrar(self._rank_info, self._kv_extractor)
+        draft_ri = self._rank_info.draft_view()
+        if draft_ri is not None:
+            # Separate from the target's: the draft pools can carry the same role labels and
+            # overlapping global layer ids, which one pool mapping would cross-match.
+            self._draft_extractor = KVRegionExtractorV1(draft_ri.page_table)
+            self._draft_registrar = PeerRegistrar(draft_ri, self._draft_extractor)
 
     def _setup_transfer_engine(self):
         torch.cuda.set_device(self._config.device_id)
@@ -5049,6 +5703,7 @@ class TransferWorker:
                 enforce_physical_ownership=self._config.enforce_physical_ownership,
                 retirement_watchdog=self._retirement_watchdog,
                 context_first_ownership=self._config.context_first_ownership,
+                draft_registrar=self._draft_registrar,
             )
             self._receiver = Receiver(
                 self._peer_registrar,
@@ -5058,6 +5713,7 @@ class TransferWorker:
                 context_first_ownership=self._config.context_first_ownership,
                 rank_info_auth_key=self._rank_info_auth_key,
                 rank_info_timeout_s=self._config.rx_timeout_s or _FALLBACK_TX_OVERALL_TIMEOUT_S,
+                draft_registrar=self._draft_registrar,
             )
             self._rank_info.transfer_engine_info = bytes(self._agent.get_local_agent_desc())
             self._rank_info.self_endpoint = self._receiver.endpoint
@@ -5080,6 +5736,16 @@ class TransferWorker:
                 self._agent.register_memory(reg_memory_desc)
                 logger.debug(f"Registered {memory_type} KV cache memory: {memory_descs}")
                 self._registered_mem.append(reg_memory_desc)
+        draft_page_table = getattr(self._rank_info, "draft_page_table", None)
+        if draft_page_table is not None:
+            draft_descs = get_unique_pool_memory_descs(
+                draft_page_table, self._rank_info.device_id, "VRAM"
+            )
+            if draft_descs:
+                reg_draft_desc = RegMemoryDescs("VRAM", draft_descs)
+                self._agent.register_memory(reg_draft_desc)
+                logger.debug(f"Registered draft KV cache memory with transfer agent: {draft_descs}")
+                self._registered_mem.append(reg_draft_desc)
 
     def _register_aux_buffer(self):
         assert self._aux_buffer is not None
@@ -5109,6 +5775,35 @@ class TransferWorker:
     def page_table(self):
         assert self._rank_info is not None
         return self._rank_info.page_table
+
+    @property
+    def draft_page_table(self) -> Optional[KVCachePageTable]:
+        """The draft pool's page table when the drafter context window ships, else None."""
+        rank_info = getattr(self, "_rank_info", None)
+        return getattr(rank_info, "draft_page_table", None)
+
+    def set_scatter_order_stream(self, stream_handle: int) -> bool:
+        """Order the transfer-agent bounce receive scatters on ``stream_handle`` (a cudaStream_t).
+
+        Only meaningful with the C++ transfer-agent bounce active; otherwise a no-op that returns
+        False. The scatter then runs between the model forwards enqueued on that stream instead of
+        concurrently with them.
+        """
+        agent = getattr(self, "_agent", None)
+        if (
+            agent is None
+            or self._config.agent_buffer_size_mb <= 0
+            or not getattr(agent, "bounce_enabled", False)
+            or not hasattr(agent, "set_scatter_order_stream")
+        ):
+            return False
+        armed = bool(agent.set_scatter_order_stream(int(stream_handle)))
+        logger.info(
+            f"TransferWorker: bounce receive scatters "
+            f"{'ordered on the execution stream' if armed else 'stay on private copy streams'} "
+            f"(agent={getattr(agent, 'name', '?')})"
+        )
+        return armed
 
     def prepare_shutdown(self) -> None:
         """Stop listeners and transfers, refusing active owners; retain registrations."""

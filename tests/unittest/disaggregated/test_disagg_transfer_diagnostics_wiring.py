@@ -1704,8 +1704,10 @@ def test_native_profile_diagnostics_do_not_affect_worker_setup(
 ) -> None:
     """Declare only native-path identity after successful worker setup."""
     rank_info = SimpleNamespace(instance_rank=0)
-    monkeypatch.setattr(transfer_module, "_make_aux_buffer", lambda *_args: None)
-    monkeypatch.setattr(transfer_module.RankInfo, "from_kv_cache_manager", lambda *_args: rank_info)
+    monkeypatch.setattr(transfer_module, "_make_aux_buffer", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        transfer_module.RankInfo, "from_kv_cache_manager", lambda *_args, **_kwargs: rank_info
+    )
     setup_peer = Mock()
     setup_engine = Mock()
     monkeypatch.setattr(transfer_module.TransferWorker, "_setup_peer_infrastructure", setup_peer)

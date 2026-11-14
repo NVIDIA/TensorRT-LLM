@@ -51,6 +51,8 @@ def _worker(lengths):
         _ctx_base_pages=torch.zeros(len(lengths), dtype=torch.long, device="cuda"),
         _ctx_base_host=[0] * len(lengths),
         _batch_to_slot_buffer=DeviceCopyBuffer(torch.zeros(8, dtype=torch.long, device="cuda")),
+        _disagg_draft_ctx_seeds=None,
+        _disagg_draft_ctx_seed_hooks=None,
     )
     w._write_ctx_len = partial(DFlashWorker._write_ctx_len, w)
     w._advance_ctx_len = partial(DFlashWorker._advance_ctx_len, w)

@@ -83,13 +83,15 @@ from ..moe.expert_statistic import ExpertStatistic
 from ..speculative.drafter import Drafter
 from ..speculative.spec_sampler_base import SpecSampler
 from ..speculative.speculation_gate import SpeculationGate
-from ..speculative.utils import get_static_draft_len, update_draft_len
+from ..speculative.utils import (disagg_gen_first_draft_tokens,
+                                 get_static_draft_len, update_draft_len)
 from .adp_iter_stats import ADPIterStatsBuffer
 from .config_utils import is_decode_only
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .connectors.kv_cache_layout import build_kv_cache_layout_v2
 from .cuda_graph_runner import ADPShapeAgreement
 from .disagg_adapter import PyExecutorEffects, PyExecutorRequestRegistry
+from .disagg_gen_prefetch import make_engagement
 from .dwdp import DwdpManager
 from .error_classification import ErrorBudget
 from .executor_request_queue import (PREFIX_LOAD_COMPLETION_REQUEST_ID,
@@ -608,13 +610,65 @@ class PendingEncoderStep:
     result: Optional[EncoderStepResult] = None
 
 
+class IterStatsMemInfo:
+    """``torch.cuda.mem_get_info()`` for the iteration stats, read at most once per ``refresh_s``.
+
+    The iteration stats only report ``gpu_mem_usage``; nothing on the token path reads it. The driver query costs
+    tens of microseconds of executor host time per sampled iteration, so between real reads the last reading is
+    reused (at most ``refresh_s`` old). ``refresh_s <= 0`` reads the device on every call, as
+    TRTLLM_ITER_STATS_MEMINFO_REFRESH_S=0 does."""
+
+    def __init__(self, refresh_s: float, read=None, clock=None) -> None:
+        self.refresh_ns = int(max(0.0, refresh_s) * 1e9)
+        self._read = read if read is not None else torch.cuda.mem_get_info
+        self._clock = clock if clock is not None else time.monotonic_ns
+        self._value = None
+        self._device = None
+        self._t_ns = 0
+
+    def __call__(self, device=None):
+        now = self._clock()
+        if (self.refresh_ns <= 0 or self._value is None
+                or device != self._device
+                or now - self._t_ns >= self.refresh_ns):
+            self._value = self._read()
+            self._device = device
+            self._t_ns = now
+        return self._value
+
+
+_ITERSTATS_MEMINFO_REFRESH_S = float(
+    os.environ.get("TRTLLM_ITER_STATS_MEMINFO_REFRESH_S", "1.0"))
+
+# Waiting context requests have their host-tier prefix prefetched to the GPU off
+# the execution stream and are admitted after a short, rank-agreed hold. A model
+# opt-in (RuntimeHooks.kv_gpu_prefetch) read by that model's executor
+# (_kv_gpu_prefetch_enabled); kill switch TRTLLM_DISABLE_KV_GPU_PREFETCH=1.
+_KV_GPU_PREFETCH_KILLED = os.environ.get("TRTLLM_DISABLE_KV_GPU_PREFETCH",
+                                         "0") == "1"
+# Candidates prefetched per step, bytes assumed to move per step, and the
+# longest hold.
+_KV_GPU_PREFETCH_MAX = int(os.environ.get("TRTLLM_KV_GPU_PREFETCH_MAX", "2"))
+_KV_GPU_PREFETCH_BYTES_PER_STEP = int(1.5e9)
+_KV_GPU_PREFETCH_MAX_HOLD = 8
+
+
+def _kv_gpu_prefetch_enabled(hooks: RuntimeHooks) -> bool:
+    """Whether an executor takes the host-tier KV prefix prefetch
+    (RuntimeHooks.kv_gpu_prefetch), unless killed."""
+    return bool(hooks.kv_gpu_prefetch) and not _KV_GPU_PREFETCH_KILLED
+
+
 def _arm_runtime_opt_ins(hooks: RuntimeHooks) -> bool:
     """Arm the process-wide features ``hooks`` opt into; return whether to arm
     the late-compile detector after warmup.
 
-    Both are off for a model that declares neither: the SM107 MXFP8 GEMM
-    tactic table (the GEMM runner does not know the model, so it is armed
-    here) and the late-compile detector.
+    All are off for a model that declares none: the SM107 MXFP8 GEMM tactic
+    table (the GEMM runner does not know the model, so it is armed here) and
+    the late-compile detector. Per-model opt-ins stay on their owners: the KV
+    prefix prefetch on the executor (_kv_gpu_prefetch_enabled), the one-hot
+    index_fill on the spec metadata and the DFlash host-side context
+    allocation on the spec worker (both set by the decoder runner).
     """
     if hooks.mxfp8_pinned_tactics:
         # Imported on use: only an opted-in model needs the table.
@@ -704,11 +758,17 @@ class PyExecutor:
     # Whether the model opted into running the overlap loop on the execution
     # stream (RuntimeHooks.loop_on_execution_stream); read once at construction.
     _execution_stream_loop_armed = False
+    # Whether this executor prefetches host-tier KV prefixes to the GPU
+    # (RuntimeHooks.kv_gpu_prefetch); read once at construction.
+    _kv_gpu_prefetch = False
     # The model's executor events (RuntimeHooks.executor_events); read once at
     # construction.
     _executor_events: Optional[ExecutorEvents] = None
     # Whether the KV cache manager is a KVCacheManagerV2; set at construction.
     _is_kv_manager_v2 = False
+    # Commit finished disaggregated-generation receives for reuse after the
+    # step's forward is launched (RuntimeHooks.defer_gen_reuse_commit).
+    _defer_gen_reuse_commit = False
     # Shutdown publication is leader-only, while join/finalize runs on every rank.
     shutdown_all_ranks = True
     # Defaults for executors built without __init__ (test stubs); __init__ sets
@@ -1020,6 +1080,10 @@ class PyExecutor:
         self._late_compile_detect = False
         if model_hooks.mxfp8_pinned_tactics or model_hooks.late_compile_detect:
             self._late_compile_detect = _arm_runtime_opt_ins(model_hooks)
+        if model_hooks.kv_gpu_prefetch:
+            self._kv_gpu_prefetch = _kv_gpu_prefetch_enabled(model_hooks)
+        if model_hooks.defer_gen_reuse_commit:
+            self._defer_gen_reuse_commit = True
         self.perf_manager = PerfMetricsManager(
             enabled=getattr(self.llm_args, 'return_perf_metrics', False))
         self.attention_dp_enable_balance = (
@@ -1213,6 +1277,22 @@ class PyExecutor:
                     f"{required_max_num_tokens} to run at the declared "
                     f"max_batch_size.")
             self.max_num_active_requests = derived_cap
+        # Generation-only requests admitted beyond max_num_active_requests so
+        # their KV transfer overlaps the running decode (disagg_gen_prefetch).
+        # The engine widened its sequence-slot pool by the same amount.
+        self.disagg_gen_prefetch_requests = (getattr(
+            model_engine, "disagg_gen_prefetch_requests",
+            0) if kv_cache_transceiver is not None else 0)
+        self._kvpf_engagement = make_engagement(
+            self.disagg_gen_prefetch_requests, self.max_num_active_requests,
+            self.dist.rank)
+        if self.disagg_gen_prefetch_requests > 0 and self.dist.rank == 0:
+            logger.info(
+                f"Disagg generation KV prefetch: admitting up to "
+                f"{self.disagg_gen_prefetch_requests} generation-only requests "
+                f"beyond max_num_active_requests={self.max_num_active_requests} "
+                f"to receive their KV while the batch decodes; the forward "
+                f"batch stays capped at max_batch_size.")
         self._enable_remote_tail_adp = False
         self._remote_tail_phase = RemoteTailPhase.NONE
         self._last_remote_tail_phase = RemoteTailPhase.DECODE
@@ -1402,6 +1482,7 @@ class PyExecutor:
                     self.encoder_launch_executor.submit(
                         self._warmup_encoder_cuda_graphs_enc_dec).result()
 
+        self._arm_kv_transfer_order_stream()
         if self._late_compile_detect:
             from tensorrt_llm._torch.late_compile import mark_server_ready
             mark_server_ready()
@@ -2027,6 +2108,20 @@ class PyExecutor:
                 self.stats.append(("per_rank_dict", d))
 
     # Performance metrics methods are in PerfMetricsManager (self.perf_manager)
+
+    def _arm_kv_transfer_order_stream(self) -> bool:
+        """Hand the execution stream to the KV transceiver once warmup is over.
+
+        GPU copies of received KV (the transfer agent's bounce scatters) are
+        then enqueued on the stream the forwards run on, so they never run
+        concurrently with a forward. Armed only after warmup: all CUDA graphs
+        are captured by then, and later capture is disabled.
+        """
+        transceiver = getattr(self, "kv_cache_transceiver", None)
+        arm = getattr(transceiver, "set_execution_stream", None)
+        if arm is None or self.is_warmup:
+            return False
+        return bool(arm(self.execution_stream))
 
     def _event_loop_wrapper(self) -> None:
         crashed = False
@@ -3348,7 +3443,11 @@ class PyExecutor:
         stats.num_completed_requests = num_completed_requests
         stats.max_num_active_requests = self.max_num_active_requests
 
-        end, total_gpu_memory = torch.cuda.mem_get_info()
+        mem_info = self.__dict__.get("_iter_stats_mem_info")
+        if mem_info is None:
+            mem_info = IterStatsMemInfo(_ITERSTATS_MEMINFO_REFRESH_S)
+            self._iter_stats_mem_info = mem_info
+        end, total_gpu_memory = mem_info()
         stats.gpu_mem_usage = total_gpu_memory - end
         stats.cpu_mem_usage = 0
         stats.pinned_mem_usage = 0
@@ -4157,6 +4256,7 @@ class PyExecutor:
                                     gpu_forward_start, gpu_forward_end):
                                 batch_outputs = self._forward_step(
                                     scheduled_batch)
+                            self.disagg.commit_deferred_gen_receives()
 
                             if batch_outputs is None:
                                 # _forward_step hit an exception; _handle_errors
@@ -5407,6 +5507,52 @@ class PyExecutor:
                 if self.enable_joint_kv_cache_reuse:
                     self.draft_kv_cache_manager.free_resources(req)
 
+    @nvtx_range("_prefetch_context_prefixes_to_gpu")
+    def _prefetch_context_prefixes_to_gpu(self) -> None:
+        """Move a waiting request's host-tier prefix to the GPU off the execution stream.
+
+        Admitting a request whose cached prefix sits in the host tier makes resume() put the
+        swap (evictions and onboarding) on the execution stream, so every request in that step
+        waits for it. Instead, the prefix is prefetched on the cache manager's temporary streams
+        when the request is fetched, and the request is held out of scheduling
+        (``py_kv_gpu_hold``, read by the scheduler) for a few steps while the copy runs. The
+        hold length is derived from the bytes to move. Tensor-parallel ranks share their
+        requests and agree on it (MAX), so admission stays the same on every rank;
+        attention-DP ranks schedule their own requests and keep their own holds. If the copy
+        is not done by then, resume() still waits for it.
+        """
+        for req in self.active_requests:
+            hold = getattr(req, "py_kv_gpu_hold", 0)
+            if type(hold) is int and hold > 0:
+                req.py_kv_gpu_hold = hold - 1
+        candidates = []
+        for req in self.active_requests:
+            if len(candidates) >= _KV_GPU_PREFETCH_MAX:
+                break
+            if (req.is_first_context_chunk and req.py_request_id
+                    not in self.kv_cache_manager.kv_cache_map and getattr(
+                        req, "py_kv_gpu_prefetched", False) is not True):
+                candidates.append(req)
+        if not candidates:
+            return
+        holds = []
+        for req in candidates:
+            req.py_kv_gpu_prefetched = True
+            nbytes = self.kv_cache_manager.prefetch_to_gpu(req)
+            holds.append(0 if nbytes <= 0 else min(
+                _KV_GPU_PREFETCH_MAX_HOLD,
+                max(1, -(-nbytes // _KV_GPU_PREFETCH_BYTES_PER_STEP))))
+        # Attention-DP ranks hold different requests (or none): a rank without a
+        # candidate returns above, so a gather here would leave its peers waiting.
+        if self.dist.tp_size > 1 and not self.enable_attention_dp:
+            gathered = self.dist.tp_allgather(holds)
+            holds = [
+                max(rank_holds[i] for rank_holds in gathered)
+                for i in range(len(holds))
+            ]
+        for req, hold in zip(candidates, holds):
+            req.py_kv_gpu_hold = hold
+
     @nvtx_range("_prefetch_for_context_requests")
     def _prefetch_for_context_requests(self) -> None:
         """Pre-stage disk blocks to host for upcoming context requests with block reuse."""
@@ -5414,6 +5560,8 @@ class PyExecutor:
             return
         if not self.kv_cache_manager.enable_block_reuse:
             return
+        if self._kv_gpu_prefetch:
+            self._prefetch_context_prefixes_to_gpu()
         if self.kv_cache_manager.disk_prefetch_num_reqs <= 0:
             return
         max_prefetch = self.kv_cache_manager.disk_prefetch_num_reqs
@@ -6770,6 +6918,7 @@ class PyExecutor:
                             self._prime_dwdp()
                             batch_outputs = self._forward_step(scheduled_batch)
                             guided_batch_id = self._capturable_guided_batch_id()
+                        self.disagg.commit_deferred_gen_receives()
 
                         # None: _forward_step hit an exception and
                         # _handle_errors already failed the affected requests
@@ -7875,6 +8024,7 @@ class PyExecutor:
                         with self._step_scope(scheduled_batch):
                             batch_outputs = self._forward_step(
                                 scheduled_batch, previous_tensors_device)
+                    self.disagg.commit_deferred_gen_receives()
 
                     self._stage_mark('forward')
                     if batch_outputs is None:
@@ -8668,7 +8818,44 @@ class PyExecutor:
         """Return the maximum number of distinct requests admitted at once."""
         if self.enable_attention_dp:
             return self.dist.tp_size * self.max_num_active_requests
-        return self.max_num_active_requests
+        return (self.max_num_active_requests +
+                getattr(self, "disagg_gen_prefetch_requests", 0))
+
+    def _limit_prefetch_admission(
+            self, waiting_queue: WaitingQueue,
+            new_requests: List[RequestQueueItem],
+            total_num_active_requests: int) -> List[RequestQueueItem]:
+        """Admit only generation-only requests into the KV prefetch slots.
+
+        Popped items (with their child requests) that fit within
+        ``max_num_active_requests - total_num_active_requests`` use the
+        regular slots. Later items use the prefetch slots and must be
+        generation-only requests without child requests; the first item that
+        is not, and everything after it, go back to the front of the waiting
+        queue so FCFS order is kept.
+        """
+        regular = self.max_num_active_requests - total_num_active_requests
+        cut = len(new_requests)
+        used = 0
+        prefetched = []
+        for idx, item in enumerate(new_requests):
+            used += 1 + len(item.child_req_ids or ())
+            if used <= regular:
+                continue
+            request = item.request
+            if (item.child_req_ids or request is None
+                    or getattr(request, "request_type", None)
+                    != RequestType.REQUEST_TYPE_GENERATION_ONLY):
+                cut = idx
+                break
+            prefetched.append(item)
+        if cut < len(new_requests):
+            waiting_queue.prepend_requests(new_requests[cut:])
+        engagement = getattr(self, "_kvpf_engagement", None)
+        if engagement is not None:
+            for item in prefetched:
+                engagement.note_admitted(item.id, total_num_active_requests)
+        return new_requests[:cut]
 
     def _configure_benchmark_req_queues_size(self) -> None:
         """Clamp the benchmark fill target to the request admission ceiling."""
@@ -8814,11 +9001,19 @@ class PyExecutor:
                                                 max_new_requests,
                                                 self.max_num_active_requests,
                                                 kv_balance=kv_balance)
+        prefetch = getattr(self, "disagg_gen_prefetch_requests", 0)
+        if prefetch > 0:
+            engagement = getattr(self, "_kvpf_engagement", None)
+            if engagement is not None:
+                engagement.observe(self.active_requests)
         new_requests = get_from_waiting_queue(
             waiting_queue,
             max_new_requests,
             enable_attention_dp=False,
             max_num_active_requests=self.max_num_active_requests)
+        if new_requests and prefetch > 0:
+            new_requests = self._limit_prefetch_admission(
+                waiting_queue, new_requests, total_num_active_requests)
         if (not new_requests or not getattr(
                 self, "_mm_encoder_item_scheduling_enabled", False)):
             return new_requests, {}
@@ -10495,6 +10690,8 @@ class PyExecutor:
 
     @nvtx_range("_prepare_disagg_gen_transmission_complete")
     def _prepare_disagg_gen_transmission_complete(self, scheduled_batch):
+        # Commits still deferred from a step whose loop did not run them.
+        self.disagg.commit_deferred_gen_receives()
         cache_trans_complete_requests = [
             req for req in self.disagg.completed_gen_receives(scheduled_batch)
             if getattr(req, "py_csa2_remote_tail_mode", None) != "destination"
@@ -10534,28 +10731,25 @@ class PyExecutor:
                 )
             # Re-checked per request: the sampler setup above may have failed
             # and terminated the request, leaving nothing to finish.
-            if not self.disagg.try_finish_gen_receive(req):
+            if not self.disagg.try_finish_gen_receive(
+                    req, defer_commit=self._defer_gen_reuse_commit):
                 continue
             req.decoding_iter = 1
             req.py_decoding_iter = 1
             first_gen_tokens = req.context_phase_params.first_gen_tokens
-            ctx_draft_tokens = req.context_phase_params.draft_tokens
-            if not ctx_draft_tokens and self.enable_spec_decode:
-                # CTX has no speculative decoding — fill dummy draft tokens
-                # so model_engine builds the correct input shape (1 + draft_len
-                # tokens per gen request). Dummies will be rejected on verify,
-                # and the draft model will produce real tokens for next step.
-                ctx_draft_tokens = [0
-                                    ] * self.model_engine.max_total_draft_tokens
-            elif (self.enable_spec_decode and len(ctx_draft_tokens)
-                  < self.model_engine.max_total_draft_tokens):
-                # A CTX with a smaller max_draft_len than this GEN: pad to the
-                # GEN's draft width; like the dummies above, the padding is
-                # rejected on verify.
-                ctx_draft_tokens = list(ctx_draft_tokens) + [0] * (
-                    self.model_engine.max_total_draft_tokens -
-                    len(ctx_draft_tokens))
-            req.py_draft_tokens = [] if ctx_draft_tokens is None else ctx_draft_tokens
+            # The context server's drafts, padded with dummies to this server's
+            # draft width (all dummies when it sent none) so model_engine builds
+            # the correct input shape; dummies are rejected on verify. Under
+            # rejection sampling always dummies, verified against the one-hot
+            # placeholder row: no proposal row was written on this server.
+            req.py_draft_tokens, needs_onehot = disagg_gen_first_draft_tokens(
+                req.context_phase_params.draft_tokens,
+                getattr(self.model_engine, "spec_config",
+                        None), self.enable_spec_decode,
+                self.model_engine.max_total_draft_tokens
+                if self.enable_spec_decode else 0)
+            if needs_onehot:
+                req.py_needs_onehot_draft_probs = True
             beam_width = req.py_beam_width
             if not self._update_sampler_state_for_disagg_gen_request(
                     req, beam_width, first_gen_tokens):

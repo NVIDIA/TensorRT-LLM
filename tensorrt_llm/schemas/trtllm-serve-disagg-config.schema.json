@@ -301,6 +301,17 @@
           "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
           "title": "Moe Backend"
         },
+        "rejection_sample_method": {
+          "default": "standard",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True): 'standard' is token-level rejection sampling; 'block' is block verification (Sun et al., 2024, arXiv:2403.10444), which is lossless and accepts at least as many tokens. Linear-chain one-model paths only; ragged (confidence-scheduled) steps use 'standard'.",
+          "enum": [
+            "standard",
+            "block"
+          ],
+          "status": "prototype",
+          "title": "Rejection Sample Method",
+          "type": "string"
+        },
         "spec_dec_variant": {
           "default": 1,
           "description": "Version of the algorithm within its decoding_type family (e.g. DFlash 1 vs. 2), for versions that share one decoding config. Resolved from the draft checkpoint where a family has versions. Do not set manually.",
@@ -935,6 +946,17 @@
           "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
           "title": "Moe Backend"
         },
+        "rejection_sample_method": {
+          "default": "standard",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True): 'standard' is token-level rejection sampling; 'block' is block verification (Sun et al., 2024, arXiv:2403.10444), which is lossless and accepts at least as many tokens. Linear-chain one-model paths only; ragged (confidence-scheduled) steps use 'standard'.",
+          "enum": [
+            "standard",
+            "block"
+          ],
+          "status": "prototype",
+          "title": "Rejection Sample Method",
+          "type": "string"
+        },
         "skip_ctx_buffer_budget_check": {
           "default": false,
           "description": "Skip the config-time check that the pooled-context K/V buffers fit in the memory left free after the KV-cache pool commits. The estimate is deliberately conservative; set this to proceed when you know the device has the headroom. The token-budget check is not affected.",
@@ -1290,6 +1312,17 @@
           "default": null,
           "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
           "title": "Moe Backend"
+        },
+        "rejection_sample_method": {
+          "default": "standard",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True): 'standard' is token-level rejection sampling; 'block' is block verification (Sun et al., 2024, arXiv:2403.10444), which is lossless and accepts at least as many tokens. Linear-chain one-model paths only; ragged (confidence-scheduled) steps use 'standard'.",
+          "enum": [
+            "standard",
+            "block"
+          ],
+          "status": "prototype",
+          "title": "Rejection Sample Method",
+          "type": "string"
         },
         "spec_dec_variant": {
           "default": 1,
@@ -3831,6 +3864,17 @@
           "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
           "title": "Moe Backend"
         },
+        "rejection_sample_method": {
+          "default": "standard",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True): 'standard' is token-level rejection sampling; 'block' is block verification (Sun et al., 2024, arXiv:2403.10444), which is lossless and accepts at least as many tokens. Linear-chain one-model paths only; ragged (confidence-scheduled) steps use 'standard'.",
+          "enum": [
+            "standard",
+            "block"
+          ],
+          "status": "prototype",
+          "title": "Rejection Sample Method",
+          "type": "string"
+        },
         "spec_dec_variant": {
           "default": 1,
           "description": "Version of the algorithm within its decoding_type family (e.g. DFlash 1 vs. 2), for versions that share one decoding config. Resolved from the draft checkpoint where a family has versions. Do not set manually.",
@@ -4329,6 +4373,17 @@
           "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
           "title": "Moe Backend"
         },
+        "rejection_sample_method": {
+          "default": "standard",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True): 'standard' is token-level rejection sampling; 'block' is block verification (Sun et al., 2024, arXiv:2403.10444), which is lossless and accepts at least as many tokens. Linear-chain one-model paths only; ragged (confidence-scheduled) steps use 'standard'.",
+          "enum": [
+            "standard",
+            "block"
+          ],
+          "status": "prototype",
+          "title": "Rejection Sample Method",
+          "type": "string"
+        },
         "sa_config": {
           "anyOf": [
             {
@@ -4613,6 +4668,17 @@
           "default": null,
           "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
           "title": "Moe Backend"
+        },
+        "rejection_sample_method": {
+          "default": "standard",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True): 'standard' is token-level rejection sampling; 'block' is block verification (Sun et al., 2024, arXiv:2403.10444), which is lossless and accepts at least as many tokens. Linear-chain one-model paths only; ragged (confidence-scheduled) steps use 'standard'.",
+          "enum": [
+            "standard",
+            "block"
+          ],
+          "status": "prototype",
+          "title": "Rejection Sample Method",
+          "type": "string"
         },
         "spec_dec_variant": {
           "default": 3,
@@ -5119,6 +5185,13 @@
           "default": true,
           "description": "Controls if KV cache blocks can be reused for different requests.",
           "title": "Enable Block Reuse",
+          "type": "boolean"
+        },
+        "enable_disagg_completion_reservation": {
+          "default": false,
+          "description": "Reserve the GPU KV cache pages each admitted request needs to finish on a disaggregated server. Applies only to KV cache manager v2 on a disaggregated server with no cache tier below GPU (host_cache_size=0 and no disk tier), beam width 1, a single pipeline stage and full attention on every layer; elsewhere it is ignored, and KV cache manager v2 logs a warning. A request is then admitted only while the completion bound of every admitted request still fits: a generation request through its output limit and, under a KV connector without source reservations, a context request the connector may serve through the end of its prompt. The bounds are logical; no page is allocated early. A KV connector can request the same through its worker's requires_completion_reservation declaration.",
+          "status": "prototype",
+          "title": "Enable Disagg Completion Reservation",
           "type": "boolean"
         },
         "enable_kv_pool_rebalance": {
@@ -5948,6 +6021,17 @@
           "default": null,
           "description": "Number of MTP layers in the model checkpoint. Auto-populated from the target pretrained config, or from speculative_model's config.json when MTP heads are loaded separately. Do not set manually.",
           "title": "Num Nextn Predict Layers"
+        },
+        "rejection_sample_method": {
+          "default": "standard",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True): 'standard' is token-level rejection sampling; 'block' is block verification (Sun et al., 2024, arXiv:2403.10444), which is lossless and accepts at least as many tokens. Linear-chain one-model paths only; ragged (confidence-scheduled) steps use 'standard'.",
+          "enum": [
+            "standard",
+            "block"
+          ],
+          "status": "prototype",
+          "title": "Rejection Sample Method",
+          "type": "string"
         },
         "relaxed_delta": {
           "default": 0.0,
@@ -6934,6 +7018,17 @@
           "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
           "title": "Moe Backend"
         },
+        "rejection_sample_method": {
+          "default": "standard",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True): 'standard' is token-level rejection sampling; 'block' is block verification (Sun et al., 2024, arXiv:2403.10444), which is lossless and accepts at least as many tokens. Linear-chain one-model paths only; ragged (confidence-scheduled) steps use 'standard'.",
+          "enum": [
+            "standard",
+            "block"
+          ],
+          "status": "prototype",
+          "title": "Rejection Sample Method",
+          "type": "string"
+        },
         "spec_dec_variant": {
           "default": 1,
           "description": "Version of the algorithm within its decoding_type family (e.g. DFlash 1 vs. 2), for versions that share one decoding config. Resolved from the draft checkpoint where a family has versions. Do not set manually.",
@@ -7177,6 +7272,17 @@
           "default": null,
           "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
           "title": "Moe Backend"
+        },
+        "rejection_sample_method": {
+          "default": "standard",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True): 'standard' is token-level rejection sampling; 'block' is block verification (Sun et al., 2024, arXiv:2403.10444), which is lossless and accepts at least as many tokens. Linear-chain one-model paths only; ragged (confidence-scheduled) steps use 'standard'.",
+          "enum": [
+            "standard",
+            "block"
+          ],
+          "status": "prototype",
+          "title": "Rejection Sample Method",
+          "type": "string"
         },
         "sa_config": {
           "anyOf": [
@@ -7899,6 +8005,17 @@
           "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
           "title": "Moe Backend"
         },
+        "rejection_sample_method": {
+          "default": "standard",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True): 'standard' is token-level rejection sampling; 'block' is block verification (Sun et al., 2024, arXiv:2403.10444), which is lossless and accepts at least as many tokens. Linear-chain one-model paths only; ragged (confidence-scheduled) steps use 'standard'.",
+          "enum": [
+            "standard",
+            "block"
+          ],
+          "status": "prototype",
+          "title": "Rejection Sample Method",
+          "type": "string"
+        },
         "spec_dec_variant": {
           "default": 1,
           "description": "Version of the algorithm within its decoding_type family (e.g. DFlash 1 vs. 2), for versions that share one decoding config. Resolved from the draft checkpoint where a family has versions. Do not set manually.",
@@ -8152,6 +8269,17 @@
         "output_directory": {
           "description": "Directory path where hidden states data files will be saved. The directory is created if it does not exist.",
           "title": "Output Directory",
+          "type": "string"
+        },
+        "rejection_sample_method": {
+          "default": "standard",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True): 'standard' is token-level rejection sampling; 'block' is block verification (Sun et al., 2024, arXiv:2403.10444), which is lossless and accepts at least as many tokens. Linear-chain one-model paths only; ragged (confidence-scheduled) steps use 'standard'.",
+          "enum": [
+            "standard",
+            "block"
+          ],
+          "status": "prototype",
+          "title": "Rejection Sample Method",
           "type": "string"
         },
         "spec_dec_variant": {
@@ -8712,6 +8840,17 @@
           "default": null,
           "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
           "title": "Moe Backend"
+        },
+        "rejection_sample_method": {
+          "default": "standard",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True): 'standard' is token-level rejection sampling; 'block' is block verification (Sun et al., 2024, arXiv:2403.10444), which is lossless and accepts at least as many tokens. Linear-chain one-model paths only; ragged (confidence-scheduled) steps use 'standard'.",
+          "enum": [
+            "standard",
+            "block"
+          ],
+          "status": "prototype",
+          "title": "Rejection Sample Method",
+          "type": "string"
         },
         "resource_manager": {
           "type": "null"

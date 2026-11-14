@@ -163,3 +163,83 @@ TEST(GatherScatterKernel, ZeroCopyPlanArgsRoundTrip)
 {
     runRoundTrip(/*mappedPlan=*/true);
 }
+
+namespace
+{
+// Scatter `n` pieces (mixed 16B-aligned and unaligned sizes) with the grid capped at `maxBlocks`;
+// the destination must be byte-exact and the gaps between pieces untouched.
+void runBoundedGrid(std::uint32_t n, std::uint32_t maxBlocks)
+{
+    std::vector<std::uint32_t> sizes(n);
+    std::vector<std::uint64_t> off(n);
+    std::uint64_t cur = 0;
+    for (std::uint32_t i = 0; i < n; ++i)
+    {
+        sizes[i] = (i % 3 == 0) ? 48U : (i % 3 == 1 ? 17U : 1U + (i % 61U));
+        off[i] = cur;
+        cur = alignUp(cur + sizes[i] + 16, 64);
+    }
+    std::uint64_t const total = cur;
+    std::vector<unsigned char> srcHost(total, 0);
+    for (std::uint32_t i = 0; i < n; ++i)
+        for (std::uint32_t j = 0; j < sizes[i]; ++j)
+            srcHost[off[i] + j] = pattern(i, j);
+
+    void *dSrc = nullptr, *dDst = nullptr;
+    CUDA_OK(cudaMalloc(&dSrc, total));
+    CUDA_OK(cudaMalloc(&dDst, total));
+    CUDA_OK(cudaMemcpy(dSrc, srcHost.data(), total, cudaMemcpyHostToDevice));
+    CUDA_OK(cudaMemset(dDst, 0xA5, total)); // canary in the gaps
+    std::vector<std::uint64_t> srcs(n), dsts(n);
+    for (std::uint32_t i = 0; i < n; ++i)
+    {
+        srcs[i] = reinterpret_cast<std::uint64_t>(static_cast<char*>(dSrc) + off[i]);
+        dsts[i] = reinterpret_cast<std::uint64_t>(static_cast<char*>(dDst) + off[i]);
+    }
+    std::uint64_t *dSrcs = nullptr, *dDsts = nullptr;
+    std::uint32_t* dSizes = nullptr;
+    CUDA_OK(cudaMalloc(reinterpret_cast<void**>(&dSrcs), n * sizeof(std::uint64_t)));
+    CUDA_OK(cudaMalloc(reinterpret_cast<void**>(&dDsts), n * sizeof(std::uint64_t)));
+    CUDA_OK(cudaMalloc(reinterpret_cast<void**>(&dSizes), n * sizeof(std::uint32_t)));
+    CUDA_OK(cudaMemcpy(dSrcs, srcs.data(), n * sizeof(std::uint64_t), cudaMemcpyHostToDevice));
+    CUDA_OK(cudaMemcpy(dDsts, dsts.data(), n * sizeof(std::uint64_t), cudaMemcpyHostToDevice));
+    CUDA_OK(cudaMemcpy(dSizes, sizes.data(), n * sizeof(std::uint32_t), cudaMemcpyHostToDevice));
+
+    cudaStream_t stream{};
+    CUDA_OK(cudaStreamCreate(&stream));
+    CUDA_OK(b::launchBatchedCopy(dSrcs, dDsts, dSizes, n, stream, maxBlocks));
+    CUDA_OK(cudaStreamSynchronize(stream));
+
+    std::vector<unsigned char> dstHost(total, 0);
+    CUDA_OK(cudaMemcpy(dstHost.data(), dDst, total, cudaMemcpyDeviceToHost));
+    std::vector<unsigned char> want(total, 0xA5);
+    for (std::uint32_t i = 0; i < n; ++i)
+        for (std::uint32_t j = 0; j < sizes[i]; ++j)
+            want[off[i] + j] = pattern(i, j);
+    EXPECT_TRUE(dstHost == want) << "n=" << n << " maxBlocks=" << maxBlocks;
+
+    cudaFree(dSrc);
+    cudaFree(dDst);
+    cudaFree(dSrcs);
+    cudaFree(dDsts);
+    cudaFree(dSizes);
+    cudaStreamDestroy(stream);
+}
+} // namespace
+
+// A capped grid (blocks loop over several pieces) writes exactly the same bytes as one block per
+// piece, for every piece count from 1 to 131072.
+TEST(GatherScatterKernel, BoundedGridIsByteExact)
+{
+    if (!hasCuda())
+    {
+        GTEST_SKIP() << "no CUDA device";
+    }
+    for (std::uint32_t n : {1U, 2U, 7U, 1000U, 4733U, 131072U})
+    {
+        for (std::uint32_t maxBlocks : {0U, 1U, 3U, 296U, n, n + 5U})
+        {
+            runBoundedGrid(n, maxBlocks);
+        }
+    }
+}

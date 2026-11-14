@@ -146,8 +146,10 @@ std::pair<std::string, std::uint64_t> splitKey(std::string const& key)
 // (gather or scatter); the data region (arena offset) is encoded into the srcs/dsts by the caller.
 // zeroCopy (default on) skips the H2D of the plan arrays — the kernel reads them straight from
 // pinned host via ctx->hostPinnedDev, removing the H2D-then-kernel serialization. Off stages them
-// in device scratch first (faster on machines where mapped-host reads are slow).
-cudaError_t launchPrepared(ExecCtx* ctx, std::size_t n, bool zeroCopy)
+// in device scratch first (faster on machines where mapped-host reads are slow). Every operation
+// goes to `stream` (ctx->stream, or the receiver's order stream for scatters); `maxBlocks` caps the
+// copy grid (0 = one block per piece).
+cudaError_t launchPrepared(ExecCtx* ctx, std::size_t n, bool zeroCopy, cudaStream_t stream, std::uint32_t maxBlocks)
 {
     if (n == 0)
     {
@@ -179,7 +181,7 @@ cudaError_t launchPrepared(ExecCtx* ctx, std::size_t n, bool zeroCopy)
             return cudaErrorInvalidValue;
         }
         base = static_cast<std::uint8_t*>(ctx->scratch);
-        cudaError_t const st = cudaMemcpyAsync(base, host, 2 * b64 + b32, cudaMemcpyHostToDevice, ctx->stream);
+        cudaError_t const st = cudaMemcpyAsync(base, host, 2 * b64 + b32, cudaMemcpyHostToDevice, stream);
         if (st != cudaSuccess)
         {
             return st;
@@ -189,7 +191,78 @@ cudaError_t launchPrepared(ExecCtx* ctx, std::size_t n, bool zeroCopy)
     auto* ddsts = reinterpret_cast<std::uint64_t*>(base + b64);
     auto* dsizes = reinterpret_cast<std::uint32_t*>(base + 2 * b64);
     auto const n32 = static_cast<std::uint32_t>(n); // n <= scratchBytes/20, far below u32 max
-    return launchBatchedCopy(dsrcs, ddsts, dsizes, n32, ctx->stream);
+    return launchBatchedCopy(dsrcs, ddsts, dsizes, n32, stream, maxBlocks);
+}
+
+// Copy-engine scatter (scatter_copy_engine): one cudaMemcpy3DBatchAsync per chunk with one 2D copy per coalesced
+// run (width = pieceSize, height = count, row lengths = the run's strides; pointer operands count bytes). The copy
+// engines use no SMs, so the scatter cannot take an SM that a running forward's persistent grid is waiting for.
+// Runs whose strides are shorter than the piece (never produced by the sender's coalescer) go piece by piece.
+// Returns cudaErrorNotSupported on runtimes without the batch API; the caller then uses the kernel path.
+cudaError_t launchCopyEngineScatter(
+    std::vector<BounceScatterRun> const& runs, std::uint64_t regionBase, cudaStream_t stream)
+{
+#if CUDART_VERSION >= 12080
+    thread_local std::vector<cudaMemcpy3DBatchOp> ops;
+    ops.clear();
+    ops.reserve(runs.size());
+    auto push = [&](std::uint64_t src, std::uint64_t dst, std::size_t width, std::size_t height, std::size_t srcPitch,
+                    std::size_t dstPitch)
+    {
+        cudaMemcpy3DBatchOp op{};
+        op.src.type = cudaMemcpyOperandTypePointer;
+        op.src.op.ptr.ptr = reinterpret_cast<void*>(src);
+        op.src.op.ptr.rowLength = srcPitch;
+        op.src.op.ptr.layerHeight = 0;
+        op.dst.type = cudaMemcpyOperandTypePointer;
+        op.dst.op.ptr.ptr = reinterpret_cast<void*>(dst);
+        op.dst.op.ptr.rowLength = dstPitch;
+        op.dst.op.ptr.layerHeight = 0;
+        op.extent = make_cudaExtent(width, height, 1);
+        op.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+        op.flags = cudaMemcpyFlagPreferOverlapWithCompute;
+        ops.push_back(op);
+    };
+    for (auto const& e : runs)
+    {
+        if (e.count == 0 || e.pieceSize == 0)
+        {
+            continue;
+        }
+        std::uint64_t const src = regionBase + e.bounceOffset;
+        if (e.count == 1)
+        {
+            push(src, e.dstAddr, e.pieceSize, 1, 0, 0);
+        }
+        else if (e.bounceStride >= e.pieceSize && e.dstStride >= e.pieceSize)
+        {
+            push(src, e.dstAddr, e.pieceSize, e.count, e.bounceStride, e.dstStride);
+        }
+        else
+        {
+            for (std::uint32_t p = 0; p < e.count; ++p)
+            {
+                push(src + static_cast<std::uint64_t>(p) * e.bounceStride,
+                    e.dstAddr + static_cast<std::uint64_t>(p) * e.dstStride, e.pieceSize, 1, 0, 0);
+            }
+        }
+    }
+    if (ops.empty())
+    {
+        return cudaSuccess;
+    }
+#if CUDART_VERSION >= 13000
+    return cudaMemcpy3DBatchAsync(ops.size(), ops.data(), 0, stream);
+#else
+    std::size_t failIdx = 0;
+    return cudaMemcpy3DBatchAsync(ops.size(), ops.data(), &failIdx, 0, stream);
+#endif
+#else
+    (void) runs;
+    (void) regionBase;
+    (void) stream;
+    return cudaErrorNotSupported;
+#endif
 }
 } // namespace
 
@@ -573,8 +646,114 @@ void BounceReceiver::checkTimeouts()
     }
 }
 
-void BounceReceiver::recoverScatterJob(
-    ScatterJob const& job, ExecCtx* ctx, bool acked, bool nackSent, bool donePushed, char const* what)
+bool BounceReceiver::setOrderStream(cudaStream_t stream)
+{
+    if (!mCtx.cfg.scatterOnOrderStream)
+    {
+        TLLM_LOG_INFO("BounceTransport(%s): scatter_on_order_stream is off -> scatters stay on private copy streams",
+            mCtx.selfName.c_str());
+        return false;
+    }
+#if CUDART_VERSION >= 12080
+    if (stream != nullptr)
+    {
+        int dev = -1;
+        cudaError_t const err = cudaStreamGetDevice(stream, &dev);
+        if (err != cudaSuccess)
+        {
+            (void) cudaGetLastError();
+            TLLM_LOG_WARNING("BounceTransport(%s): cannot query the order stream's device (%s) -> not set",
+                mCtx.selfName.c_str(), cudaGetErrorString(err));
+            return false;
+        }
+        if (dev != mCtx.deviceId)
+        {
+            TLLM_LOG_WARNING("BounceTransport(%s): order stream is on device %d, transport on device %d -> not set",
+                mCtx.selfName.c_str(), dev, mCtx.deviceId);
+            return false;
+        }
+    }
+#endif
+    {
+        std::lock_guard<std::mutex> lk(mOrderMu);
+        mOrderStream = stream;
+    }
+    TLLM_LOG_INFO("BounceTransport(%s): receive scatters %s", mCtx.selfName.c_str(),
+        stream != nullptr ? "ordered on the registered stream" : "on private copy streams");
+    return true;
+}
+
+cudaError_t BounceReceiver::launchScatter(
+    ExecCtx* ctx, std::size_t n, cudaStream_t& launchStream, bool& eventRecorded, bool* orderUnavailable)
+{
+    eventRecorded = false;
+    launchStream = ctx->stream;
+    std::unique_lock<std::mutex> lk(mOrderMu, std::defer_lock);
+    cudaStream_t order = nullptr;
+    if (mCtx.cfg.scatterOnOrderStream)
+    {
+        lk.lock();
+        order = mOrderStream;
+        if (order != nullptr)
+        {
+            // A copy enqueued on a capturing stream would become part of the captured graph (and be
+            // replayed later with stale plan arrays): keep it on the private stream instead.
+            cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+            cudaError_t const capErr = cudaStreamIsCapturing(order, &capture);
+            if (capErr != cudaSuccess || capture != cudaStreamCaptureStatusNone)
+            {
+                (void) cudaGetLastError();
+                if (!mWarnedCaptureFallback.exchange(true))
+                {
+                    TLLM_LOG_WARNING(
+                        "BounceTransport(%s): order stream is capturing (or not queryable: %s) -> this scatter "
+                        "runs on a private copy stream (warned once)",
+                        mCtx.selfName.c_str(), cudaGetErrorString(capErr));
+                }
+                order = nullptr;
+            }
+        }
+        if (order == nullptr)
+        {
+            lk.unlock();
+        }
+    }
+    if (order == nullptr)
+    {
+        if (orderUnavailable != nullptr)
+        {
+            // The caller covers this scatter with the copy engines instead of a kernel on ctx->stream.
+            *orderUnavailable = true;
+            return cudaErrorNotReady;
+        }
+        mPrivateScatters.fetch_add(1, std::memory_order_relaxed);
+        return launchPrepared(ctx, n, mCtx.cfg.useZeroCopyArguments, ctx->stream, mCtx.cfg.maxCopyBlocks);
+    }
+    launchStream = order;
+    cudaError_t err = launchPrepared(ctx, n, mCtx.cfg.useZeroCopyArguments, order, mCtx.cfg.maxCopyBlocks);
+    if (err == cudaSuccess)
+    {
+        // Completion is tracked with this context's own event, never by synchronizing the order
+        // stream: that would also wait for work enqueued there after the scatter.
+        err = cudaEventRecord(ctx->event, order);
+        eventRecorded = err == cudaSuccess;
+    }
+    lk.unlock();
+    if (err != cudaSuccess)
+    {
+        // Part of the plan (the H2D of the plan arrays, or the kernel) may already be queued and still
+        // reads the region / pinned plan buffers: drain before the caller releases them.
+        (void) cudaGetLastError();
+        (void) cudaStreamSynchronize(order);
+        (void) cudaGetLastError();
+        return err;
+    }
+    mOrderedScatters.fetch_add(1, std::memory_order_relaxed);
+    return cudaSuccess;
+}
+
+void BounceReceiver::recoverScatterJob(ScatterJob const& job, ExecCtx* ctx, cudaStream_t launchStream,
+    bool eventRecorded, bool acked, bool nackSent, bool donePushed, char const* what)
 {
     TLLM_LOG_WARNING(
         "BounceTransport(%s): scatter worker exception rid=%llu chunk=%u: %s (acked=%d nackSent=%d "
@@ -583,9 +762,17 @@ void BounceReceiver::recoverScatterJob(
         static_cast<int>(nackSent), static_cast<int>(donePushed));
     if (ctx != nullptr)
     {
-        // A scatter kernel may still be reading the region: drain the stream before the ScatterDone
-        // below lets the scheduler re-grant it. Best effort — the error (if any) is already logged.
-        (void) cudaStreamSynchronize(ctx->stream);
+        // A scatter kernel may still be reading the region: drain it before the ScatterDone below lets
+        // the scheduler re-grant it. Best effort — the error (if any) is already logged. A copy on the
+        // order stream is drained through its event (the private stream never saw it).
+        if (eventRecorded)
+        {
+            (void) cudaEventSynchronize(ctx->event);
+        }
+        else
+        {
+            (void) cudaStreamSynchronize(launchStream != nullptr ? launchStream : ctx->stream);
+        }
         (void) cudaGetLastError();
         mCtx.exec->release(ctx);
     }
@@ -637,6 +824,8 @@ void BounceReceiver::scatterWorkerLoop()
         // Declared outside the try so the handler can return a still-held context and knows which
         // completion steps already happened (no duplicate NACK after an ACK, no duplicate ScatterDone).
         ExecCtx* ctx = nullptr;
+        cudaStream_t launchStream = nullptr; // stream the scatter was enqueued on (private or order stream)
+        bool eventRecorded = false;          // ctx->event marks the scatter's completion on the order stream
         bool acked = false;      // set BEFORE the ACK send: an attempted ACK must never be followed by a NACK
         bool nackSent = false;   // set BEFORE the NACK send: never NACK twice
         bool donePushed = false; // set AFTER the push: the handler pushes iff the push did not happen
@@ -724,9 +913,48 @@ void BounceReceiver::scatterWorkerLoop()
                         static_cast<unsigned long long>(job.rid), job.chunkIdx);
                     srcInBounds = false;
                 }
+                bool copyEngineDone = false;
+                // A registered order stream keeps the kernel scatter between forwards (no SM sharing, and it
+                // is faster than the copy engines on small pieces); the copy engines cover every receiver
+                // without one, so no scatter ever needs an SM a persistent forward grid is holding.
+                bool orderRegistered = false;
+                if (mCtx.cfg.scatterOnOrderStream)
+                {
+                    std::lock_guard<std::mutex> olk(mOrderMu);
+                    orderRegistered = mOrderStream != nullptr;
+                }
+                // Scatter the job with the copy engines on ctx->stream; false (nothing left reading the
+                // region) when they fail, and the kernel path re-issues the chunk.
+                auto const tryCopyEngine = [&]() -> bool
+                {
+                    cudaError_t const ceErr = launchCopyEngineScatter(job.entries, regionBase, ctx->stream);
+                    if (ceErr == cudaSuccess)
+                    {
+                        launchErr = cudaSuccess;
+                        launchStream = ctx->stream;
+                        eventRecorded = false;
+                        mCopyEngineScatters.fetch_add(1, std::memory_order_relaxed);
+                        return true;
+                    }
+                    // Nothing may still read the region when the kernel path re-issues the chunk.
+                    (void) cudaGetLastError();
+                    (void) cudaStreamSynchronize(ctx->stream);
+                    (void) cudaGetLastError();
+                    if (!mWarnedCopyEngineFallback.exchange(true))
+                    {
+                        TLLM_LOG_WARNING(
+                            "BounceTransport(%s): copy-engine scatter failed (%s) -> kernel scatter (warned once)",
+                            mCtx.selfName.c_str(), cudaGetErrorString(ceErr));
+                    }
+                    return false;
+                };
+                if (srcInBounds && mCtx.cfg.scatterCopyEngine && !orderRegistered)
+                {
+                    copyEngineDone = tryCopyEngine();
+                }
                 std::size_t nTotal = 0;
                 std::uint64_t seen = 0;
-                for (std::uint32_t i = 0; i < n && srcInBounds; ++i)
+                for (std::uint32_t i = 0; i < n && srcInBounds && !copyEngineDone; ++i)
                 {
                     auto const& e = job.entries[i];
                     for (std::uint32_t p = 0; p < e.count; ++p)
@@ -736,7 +964,11 @@ void BounceReceiver::scatterWorkerLoop()
                             e.pieceSize, splitBudget(nTotal, static_cast<std::size_t>(rawPieces - seen), maxEntries));
                     }
                 }
-                if (srcInBounds && nTotal > 0 && nTotal <= maxEntries)
+                if (copyEngineDone)
+                {
+                    // launchErr already cudaSuccess; the sync leg below waits on ctx->stream.
+                }
+                else if (srcInBounds && nTotal > 0 && nTotal <= maxEntries)
                 {
                     auto const bufs = planBufs(ctx, nTotal);
                     std::size_t idx = 0;
@@ -753,7 +985,17 @@ void BounceReceiver::scatterWorkerLoop()
                                 splitBudget(idx, static_cast<std::size_t>(rawPieces - seen), maxEntries));
                         }
                     }
-                    launchErr = launchPrepared(ctx, nTotal, mCtx.cfg.useZeroCopyArguments);
+                    // With the copy engines on, a scatter routed to the order stream that finds it cleared or
+                    // capturing at launch takes the copy engines, not a kernel on ctx->stream that could wait
+                    // for SMs a persistent forward grid holds; the private kernel remains their fallback.
+                    bool orderUnavailable = false;
+                    bool const copyEngineFallback = mCtx.cfg.scatterCopyEngine && orderRegistered;
+                    launchErr = launchScatter(
+                        ctx, nTotal, launchStream, eventRecorded, copyEngineFallback ? &orderUnavailable : nullptr);
+                    if (orderUnavailable && !tryCopyEngine())
+                    {
+                        launchErr = launchScatter(ctx, nTotal, launchStream, eventRecorded);
+                    }
                 }
                 else if (srcInBounds && nTotal == 0)
                 {
@@ -763,10 +1005,12 @@ void BounceReceiver::scatterWorkerLoop()
             cudaError_t syncErr = cudaSuccess;
             if (launchErr == cudaSuccess)
             {
-                // Sync leg: the actual GPU wait (kernel queueing + run time on the exec stream).
+                // Sync leg: the actual GPU wait (kernel queueing + run time). On the order stream this
+                // includes the work queued there ahead of the scatter.
                 BounceNvtxScope syncScope(kNvtxScatterSync, "scatterSync rid=%llu chunk=%u",
                     static_cast<unsigned long long>(job.rid), job.chunkIdx);
-                syncErr = cudaStreamSynchronize(ctx->stream);
+                syncErr = eventRecorded ? cudaEventSynchronize(ctx->event)
+                                        : cudaStreamSynchronize(launchStream != nullptr ? launchStream : ctx->stream);
             }
             bool const ok = srcInBounds && launchErr == cudaSuccess && syncErr == cudaSuccess;
             if (!ok)
@@ -811,11 +1055,11 @@ void BounceReceiver::scatterWorkerLoop()
         }
         catch (std::exception const& e)
         {
-            recoverScatterJob(job, ctx, acked, nackSent, donePushed, e.what());
+            recoverScatterJob(job, ctx, launchStream, eventRecorded, acked, nackSent, donePushed, e.what());
         }
         catch (...)
         {
-            recoverScatterJob(job, ctx, acked, nackSent, donePushed, "non-std exception");
+            recoverScatterJob(job, ctx, launchStream, eventRecorded, acked, nackSent, donePushed, "non-std exception");
         }
     }
 }
@@ -1125,7 +1369,8 @@ void BounceSender::pumpRequest(std::uint64_t rid, Request& req)
                 splitBudget(idx, nDesc - 1 - i, maxEntries));
         }
         // gather into the region (cfg.useZeroCopyArguments selects the H2D-vs-zero-copy plan-argument path)
-        cudaError_t const gatherErr = launchPrepared(ctx, nTotal, mCtx.cfg.useZeroCopyArguments);
+        cudaError_t const gatherErr
+            = launchPrepared(ctx, nTotal, mCtx.cfg.useZeroCopyArguments, ctx->stream, mCtx.cfg.maxCopyBlocks);
         // Record an event for gather completion and DEFER the write. The gather must finish before
         // NIXL reads the region, but on a shared GPU the gather can be delayed behind model kernels
         // — blocking the IO thread on cudaStreamSynchronize here would stall the whole reactor

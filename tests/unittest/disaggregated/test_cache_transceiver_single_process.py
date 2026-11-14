@@ -181,6 +181,7 @@ class KvCacheConfigV2:
     # reads it unconditionally.
     kv_pool_rebalance_config: KvPoolRebalanceConfig = field(default_factory=KvPoolRebalanceConfig)
     enable_kv_pool_rebalance: bool = False
+    enable_disagg_completion_reservation: bool = False
 
 
 # ---------------------------------------------------------------------------

@@ -193,6 +193,19 @@ class BindingsNixlTransferAgent(BaseTransferAgent):
         """Whether the NIXL bounce v2 fast path is active on this agent."""
         return self._cpp_agent.bounce_enabled
 
+    def set_scatter_order_stream(self, stream_handle: int) -> bool:
+        """Order bounce receive scatters on the CUDA stream ``stream_handle`` (0 = private streams).
+
+        Returns whether the stream is in effect (False when bounce is inactive, the
+        ``scatter_on_order_stream`` knob is off, or the stream is on another device).
+        """
+        return bool(self._cpp_agent.set_scatter_order_stream(int(stream_handle)))
+
+    @property
+    def bounce_ordered_scatter_count(self) -> int:
+        """Number of bounce receive scatters that ran on the registered order stream."""
+        return self._cpp_agent.bounce_ordered_scatter_count
+
     @property
     def bounce_submit_count(self) -> int:
         """Number of transfer requests routed to the bounce fast path so far."""

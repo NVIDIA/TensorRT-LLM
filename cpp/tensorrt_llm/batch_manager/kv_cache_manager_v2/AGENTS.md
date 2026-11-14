@@ -635,6 +635,15 @@ readers a separate index rather than making the lock finer-grained.
   *while holding the GIL* deadlocks against a lock holder that is waiting for the
   GIL. A binding that blocks with the GIL held also stops every other Python
   thread for the duration of a `resize`, which is the opposite of the point.
+  The one exception never blocks: `callWithGilFastPath` (used by `probe_reuse`
+  and `KvCache.resize`) takes the lock with `tryLockExclusive()` while still
+  holding the GIL and runs the call there only if that succeeds; otherwise it
+  releases the GIL and blocks as above. It exists because a release costs a GIL
+  handoff (up to the interpreter switch interval) whenever another Python thread
+  is runnable, which dwarfs these short calls. Keep it to calls that are short
+  when uncontended: a `probe_reuse` longer than `kGilFastPathMaxProbeTokens`
+  releases the GIL and takes the shared lock as before.
+  `TRTLLM_KVCM2_DISABLE_GIL_FASTPATH=1` turns the fast path off.
 - Prefer `nb::call_guard<nb::gil_scoped_release>()` and bind the C++ method
   directly. The guard wraps only the registered function: nanobind converts the
   arguments before constructing it and the return value after destroying it, so
