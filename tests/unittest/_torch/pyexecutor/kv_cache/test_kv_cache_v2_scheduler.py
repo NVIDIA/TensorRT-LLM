@@ -2311,6 +2311,53 @@ class TestDeadlockDetection:
         with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
             sched.schedule_request(reqs, set())
 
+    @staticmethod
+    def _deadlock_message(sched, reqs) -> str:
+        sched._DEADLOCK_STALL_ITERS = 3
+        for _ in range(2):
+            sched.schedule_request(reqs, set())
+        with pytest.raises(RuntimeError, match="V2 scheduler deadlock") as excinfo:
+            sched.schedule_request(reqs, set())
+        return str(excinfo.value)
+
+    def test_names_a_context_that_cannot_fit_without_chunking(self):
+        """Without chunked prefill a context longer than max_num_tokens never fits,
+        so the error names it and adds chunked prefill to the pool remedy."""
+        mgr = make_kv_cache_manager(has_cache_tier_below_gpu=False)
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+
+        message = self._deadlock_message(
+            sched, [make_ctx_request(7, 1200, is_first_context_chunk=False)]
+        )
+
+        assert "Context request(s) [7] need more than max_num_tokens=1000" in message
+        assert "enable_chunked_prefill=True" in message
+        assert "host_cache_size" in message  # the pool remedy is kept
+
+    def test_a_context_that_fits_after_prefix_reuse_is_not_named(self):
+        """1200 prompt tokens with 400 reusable leave 800 to compute, which fits."""
+        mgr = make_kv_cache_manager(
+            resize_context_fn=lambda req, n: False, has_cache_tier_below_gpu=False
+        )
+        mgr.probe_context_reuse.side_effect = lambda req: 400
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+
+        message = self._deadlock_message(sched, [make_ctx_request(7, 1200)])
+
+        assert "The KV cache pool is likely exhausted." in message
+        assert "enable_chunked_prefill" not in message
+
+    def test_only_unchunked_context_init_requests_are_counted(self):
+        sched = make_scheduler(make_kv_cache_manager(), max_num_tokens=1000)
+        too_long = make_ctx_request(0, 1200, is_first_context_chunk=False)
+        encoder = make_encoder_request(1, 1200)
+
+        assert sched._contexts_over_token_budget([too_long, encoder]) == [0]
+        chunked = make_scheduler(
+            make_kv_cache_manager(), max_num_tokens=1000, ctx_chunk_config=(None, 64)
+        )
+        assert chunked._contexts_over_token_budget([too_long]) == []
+
     def test_raises_after_repeated_stalls_with_generation_candidates(self):
         mgr = make_kv_cache_manager(try_allocate_generation_fn=lambda req: False, can_evict=True)
         sched = make_scheduler(mgr, max_num_tokens=100)

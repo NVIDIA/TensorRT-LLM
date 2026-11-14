@@ -2475,20 +2475,49 @@ class KVCacheV2Scheduler(RequestScheduler):
                 "Configure kv_cache_config.host_cache_size, increase "
                 "kv_cache_config.max_tokens, or lower max_batch_size."
             )
+        cause = "The KV cache pool is likely exhausted."
+        too_long = self._contexts_over_token_budget(pending_ctx)
+        if too_long:
+            cause = (
+                f"Context request(s) {too_long[:8]} need more than "
+                f"max_num_tokens={self.max_num_tokens} uncached tokens in one "
+                "iteration and chunked prefill is off, so they can never be "
+                "scheduled. Otherwise the KV cache pool is likely exhausted."
+            )
+            remedy = (
+                f"{remedy} For the requests that cannot fit, enable chunked prefill "
+                "(enable_chunked_prefill=True) or increase max_num_tokens."
+            )
         # Logged before the raise so the diagnostic survives even if the
         # exception is caught or truncated upstream.
         logger.warning(
             f"[V2Scheduler] Declaring deadlock after {self._stalled_schedules} passes: "
             f"{self._summarize_stall(active_requests, pending_ctx, inflight_request_ids, preempted_ids)} "
-            f"{remedy}"
+            f"{cause} {remedy}"
         )
         raise RuntimeError(
             f"V2 scheduler deadlock: {num_gen_candidates} generation and "
             f"{num_ctx_candidates} context request(s) active but none could "
             f"be scheduled, suspended or preempted in "
-            f"{self._stalled_schedules} consecutive attempts. The KV cache "
-            f"pool is likely exhausted. {remedy}"
+            f"{self._stalled_schedules} consecutive attempts. {cause} {remedy}"
         )
+
+    def _contexts_over_token_budget(self, pending_ctx: RequestList) -> list[int]:
+        """IDs of pending context requests that no iteration can schedule.
+
+        Without chunked prefill a context runs whole, so one whose uncached
+        prompt (net of reusable cached blocks) plus draft tokens exceeds
+        ``max_num_tokens`` never fits. Encoder requests are budgeted by their
+        encoder output instead and are not counted.
+        """
+        if self.chunking_enabled or self.max_num_tokens is None:
+            return []
+        return [
+            req.py_request_id
+            for req in pending_ctx
+            if req.state_value == self._context_init_state_value
+            and self._uncached_tokens(req) + get_draft_token_length(req) > self.max_num_tokens
+        ]
 
     def _summarize_stall(
         self,
