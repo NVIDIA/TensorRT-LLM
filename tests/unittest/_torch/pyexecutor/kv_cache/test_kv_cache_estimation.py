@@ -2347,3 +2347,60 @@ def test_profiling_failure_releases_resources_and_restores_response_state():
     warmup_scope.__exit__.assert_called_once()
     assert executor.enable_iter_perf_stats is True
     assert executor.set_gather_responses.call_args.args == (False,)
+
+
+def _make_v2_field_creator(
+    manager_cls, kv_cache_config, *, disable_overlap_scheduler=False, pp_size=1
+):
+    model_engine = Mock()
+    model_engine.model.model_config.attn_backend = "TRTLLM"
+    llm_args = Mock(
+        cache_transceiver_config=None, disable_overlap_scheduler=disable_overlap_scheduler
+    )
+    with patch.object(KvCacheCreator, "_get_model_kv_cache_manager_cls", return_value=manager_cls):
+        return KvCacheCreator(
+            model_engine=model_engine,
+            mapping=Mapping(world_size=pp_size, pp_size=pp_size),
+            net_max_seq_len=128,
+            kv_connector_manager=None,
+            max_num_tokens=128,
+            max_beam_width=1,
+            tokens_per_block=32,
+            max_seq_len=128,
+            max_batch_size=1,
+            kv_cache_config=kv_cache_config,
+            llm_args=llm_args,
+            speculative_config=None,
+            sparse_attention_config=None,
+            profiling_stage_data=None,
+            is_disagg=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        {"remote_cache_config": {"directory": "/shared/dir", "donor": {"size": 1 << 30}}},
+        {"defer_generation_only_release": True},
+    ],
+)
+def test_v2_only_kv_cache_fields_reject_a_v1_manager(field) -> None:
+    """use_kv_cache_manager_v2='auto' may resolve to V1, which would silently ignore these fields."""
+    kv_cache_config = KvCacheConfig(**field)
+    with pytest.raises(ValueError, match="requires KVCacheManagerV2"):
+        _make_v2_field_creator(KVCacheManager, kv_cache_config)
+    _make_v2_field_creator(KVCacheManagerV2, kv_cache_config)
+
+
+@pytest.mark.parametrize("disable_overlap_scheduler, pp_size", [(True, 1), (False, 2)])
+def test_deferred_release_rejects_a_loop_that_ignores_it(
+    disable_overlap_scheduler, pp_size
+) -> None:
+    kv_cache_config = KvCacheConfig(defer_generation_only_release=True)
+    with pytest.raises(ValueError, match="overlap scheduler"):
+        _make_v2_field_creator(
+            KVCacheManagerV2,
+            kv_cache_config,
+            disable_overlap_scheduler=disable_overlap_scheduler,
+            pp_size=pp_size,
+        )

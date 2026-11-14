@@ -21,6 +21,7 @@
 #include "kv_cache_manager_v2/cudaVirtMem.h"
 #include "kv_cache_manager_v2/exceptions.h"
 #include "kv_cache_manager_v2/storage/config.h"
+#include "kv_cache_manager_v2/storage/remoteMem.h"
 #include "kv_cache_manager_v2/utils/cudaEvent.h"
 #include "kv_cache_manager_v2/utils/hostMem.h"
 #include "kv_cache_manager_v2/utils/math.h"
@@ -204,6 +205,10 @@ private:
 //! Granularity a disk pool is sized in. Disk has no allocation unit to match,
 //! so this is just a rounding quantum.
 inline constexpr size_t kDiskPoolSizeGranularity = size_t{2} << 20;
+
+//! Granularity a remote pool is sized in. Its slots come in whole donated chunks, which RemoteRange
+//! claims as needed, so this is only a rounding quantum.
+inline constexpr size_t kRemotePoolSizeGranularity = size_t{2} << 20;
 
 //! The grain a hot-level pool of `medium` rounds its bytes to, where
 //! `deviceGranularity` is the VMM allocation granularity device pools grow in.
@@ -394,6 +399,45 @@ private:
     // solely by this pool, so nothing else can grow or shrink it behind us. Held here because
     // slotAddress() bounds-checks against it on every call, and querying the file would make that
     // an lseek per page of a migration.
+    SlotCount mNumSlots{0};
+};
+
+// ---------------------------------------------------------------------------
+// RemoteSlotPool — slots in host memory other processes donate (remoteMem.h).
+// The GPU cannot address them: their pages move through the page-staging buffer.
+// ---------------------------------------------------------------------------
+class RemoteSlotPool : public SlotPoolBase
+{
+public:
+    RemoteSlotPool(SharedPtr<RemoteMemClient> client, size_t slotSize, SlotCount numSlots);
+    ~RemoteSlotPool() override;
+
+    SlotCount numSlots() const noexcept override
+    {
+        return mNumSlots;
+    }
+
+    [[nodiscard]] size_t sizeGranularity() const noexcept override
+    {
+        return kRemotePoolSizeGranularity;
+    }
+
+    void destroy() override;
+    //! Growing claims more chunks and throws without resizing if none can be had; shrinking keeps them.
+    void resize(SlotCount newNumSlots) override;
+    //! Remote slots have no local address: their pages move through remoteRange(). Throws LogicError.
+    Address slotAddress(SlotId slot) const override;
+
+    [[nodiscard]] CacheTier medium() const noexcept override
+    {
+        return CacheTier::REMOTE;
+    }
+
+    [[nodiscard]] RemoteRange& remoteRange() const;
+
+private:
+    std::unique_ptr<RemoteRange> mRange;
+    // The slots resize() asked for; the range may hold more (whole chunks).
     SlotCount mNumSlots{0};
 };
 
@@ -607,6 +651,21 @@ public:
     {
         return CacheTier::DISK;
     }
+};
+
+class RemotePoolGroup : public PoolGroupBase
+{
+public:
+    RemotePoolGroup(
+        SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, SharedPtr<RemoteMemClient> const& client);
+
+    [[nodiscard]] CacheTier cacheTier() const noexcept override
+    {
+        return CacheTier::REMOTE;
+    }
+
+    //! The remote slots of pool `poolIdx`.
+    [[nodiscard]] RemoteRange& remoteRange(PoolIndex poolIdx) const;
 };
 
 //! A second medium's budget over a disjoint subset of each pool group's pools.
@@ -969,11 +1028,36 @@ private:
     std::string mDirectory;
 };
 
+//! A level whose slots are memory other processes donate, reached through one client (remoteMem.h).
+class RemoteCacheLevelStorage : public CacheLevelStorage
+{
+public:
+    RemoteCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
+        TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, SharedPtr<RemoteMemClient> client);
+
+    CacheTier cacheTier() const noexcept override
+    {
+        return CacheTier::REMOTE;
+    }
+
+    [[nodiscard]] RemoteMemClient& client() const noexcept
+    {
+        return *mClient;
+    }
+
+    //! The remote slots of one pool.
+    [[nodiscard]] RemoteRange& remoteRange(PoolGroupIndex pgIdx, PoolIndex poolIdx) const;
+
+private:
+    SharedPtr<RemoteMemClient> mClient;
+};
+
 // Factory: create appropriate CacheLevelStorage for a given tier config.
-// `sparseReservation` applies to a GPU tier only; see GpuPoolGroup.
+// `sparseReservation` applies to a GPU tier only; see GpuPoolGroup. `remoteClient` is required by, and only used for,
+// a remote tier: the client of its rendezvous directory.
 std::unique_ptr<CacheLevelStorage> createCacheLevelStorage(CacheTierConfig const& tierCfg,
     TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList, TypedVec<PoolGroupIndex, SlotCount> const& slotCountList,
     PooledPhysMemAllocator* gpuPhysMemAllocator = nullptr, HostMemBackingOptions const& options = {},
-    std::optional<size_t> sparseReservation = std::nullopt);
+    std::optional<size_t> sparseReservation = std::nullopt, SharedPtr<RemoteMemClient> remoteClient = nullptr);
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

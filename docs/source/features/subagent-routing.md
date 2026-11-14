@@ -91,8 +91,22 @@ workers as well. Use `context` scope with conditional disaggregation, which requ
 a KV-cache-aware generation router.
 
 Placement follows the existing conversation routers' behavior. Affinity is best
-effort: a saturated ADP rank can overflow to another rank, and affinity bindings can
-be evicted. Cache reuse depends on matching prompt prefixes and cache availability.
+effort: affinity bindings can be evicted, and by default a request whose home ADP
+rank has no free request slot overflows at once to another rank chosen by
+`kv_cache_routing_new_conv_placement`. Cache reuse depends on matching prompt
+prefixes and cache availability.
+
+To trade queueing delay for reuse on the home rank, set
+`attention_dp_config.kv_cache_routing_home_wait_rounds` (prototype; requires
+`kv_cache_routing_conversation_affinity: true`). A returning conversation (or a
+sub-agent routed by its parent's key) whose home rank is full then stays in the
+waiting queue until a slot frees there, for up to that many scheduling rounds in
+which another rank had room. After that it overflows as above; its conversation
+stays bound to the home rank. While it waits, later requests can be admitted
+ahead of it. With `scheduler_config.waiting_queue_policy: priority`, later
+requests of the same priority can take any rank, and lower-priority requests
+can take other ranks but not the held request's home rank, so each rank still
+admits in priority order.
 
 ## Gateway trust boundary
 

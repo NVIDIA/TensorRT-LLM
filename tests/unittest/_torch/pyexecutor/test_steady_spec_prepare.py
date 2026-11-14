@@ -33,7 +33,8 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
 SLOTS, MAX_TOKENS, MAX_DRAFT, BATCH = 8, 64, 8, 4
 
 
-def _buffers():
+def _buffers(batch: int = BATCH) -> dict:
+    """The staging kernel's destination buffers, the per-request ones sized for ``batch`` requests."""
     i32 = dict(dtype=torch.int32, device="cuda")
     return dict(
         input_ids=torch.full((MAX_TOKENS,), -1, **i32),
@@ -41,11 +42,11 @@ def _buffers():
         prev_batch_idx=torch.full((MAX_TOKENS,), -1, **i32),
         prev_pos_idx=torch.full((MAX_TOKENS,), -1, **i32),
         prev_pos_offsets=torch.zeros((MAX_TOKENS,), **i32),
-        prev_kv_offsets=torch.zeros((BATCH,), **i32),
+        prev_kv_offsets=torch.zeros((batch,), **i32),
         positions=torch.full((MAX_TOKENS,), -1, **i32),
         mrope_positions=torch.full((3, 1, MAX_TOKENS), -1, **i32),
         gather_ids=torch.full((MAX_TOKENS,), -1, **i32),
-        kv_lens_cuda=torch.full((BATCH,), -1, **i32),
+        kv_lens_cuda=torch.full((batch,), -1, **i32),
     )
 
 
@@ -125,6 +126,142 @@ def test_staging_kernel_matches_full_pass(mrope, b, t, block, host_slab):
             else expected["positions"][:n].view(1, -1)
         )
         assert torch.equal(static_pos[..., :n], pos_ref)
+
+
+@pytest.mark.parametrize("host_slab", [False, True])
+@pytest.mark.parametrize("b,t", [(1, 7), (5, 7), (3, 2)])
+def test_staged_rng_matches_uploaded_rng(b, t, host_slab):
+    """With an RNG slab the kernel writes SpecMetadata's Philox buffers exactly as
+    _populate_request_rng_state uploads them: request_* per request, and row j of request r as
+    (seed_r, offset_r + j * _RNG_SLOT_SPAN)."""
+    from tensorrt_llm._torch.speculative.interface import _RNG_SLOT_SPAN
+
+    gen = torch.Generator().manual_seed(7 * b + t)
+    dev = _device_tensors(gen)
+    slots = torch.randperm(SLOTS, generator=gen)[:b].tolist()
+    positions = [p for base in range(b) for p in range(100 * base, 100 * base + t)]
+    seeds = torch.randint(0, 1 << 62, (b,), generator=gen, dtype=torch.int64).tolist()
+    offsets = torch.randint(0, 1 << 40, (b,), generator=gen, dtype=torch.int64).tolist()
+    expected_seeds = torch.tensor([s for s in seeds for _ in range(t)], dtype=torch.int64)
+    expected_offsets = torch.tensor(
+        [o + j * _RNG_SLOT_SPAN for o in offsets for j in range(t)], dtype=torch.int64
+    )
+
+    rng_buffers = tuple(
+        torch.full((MAX_TOKENS,), -1, dtype=torch.int64, device="cuda") for _ in range(4)
+    )
+    rng_slab = torch.tensor(seeds + offsets, dtype=torch.int64).pin_memory()
+    slab = torch.tensor(slots + positions, dtype=torch.int32).pin_memory()
+    stage_steady_inputs(
+        slab if host_slab else slab.cuda(),
+        b,
+        t,
+        dev,
+        # Sized for this case's requests (5 > BATCH).
+        **{
+            k: v
+            for k, v in _buffers(batch=b).items()
+            if k not in ("mrope_positions", "kv_lens_cuda")
+        },
+        mrope_positions=None,
+        rng_slab=rng_slab if host_slab else rng_slab.cuda(),
+        rng_buffers=rng_buffers,
+        rng_span=_RNG_SLOT_SPAN,
+    )
+    torch.cuda.synchronize()
+    request_seeds, request_offsets, row_seeds, row_offsets = (x.cpu() for x in rng_buffers)
+    assert request_seeds[:b].tolist() == seeds and request_offsets[:b].tolist() == offsets
+    assert torch.equal(row_seeds[: b * t], expected_seeds)
+    assert torch.equal(row_offsets[: b * t], expected_offsets)
+    # Nothing past the batch is written.
+    assert int(request_seeds[b]) == -1 and int(row_seeds[b * t]) == -1
+
+
+def _rng_meta():
+    """Just enough of SpecMetadata to run _populate_request_rng_state."""
+    from tensorrt_llm._torch.speculative.interface import SpecMetadata
+
+    meta = types.SimpleNamespace(
+        is_all_greedy_sample=False,
+        max_num_requests=BATCH,
+        request_seeds=None,
+        request_offsets=None,
+        seeds=None,
+        offsets=None,
+        temperatures=None,
+        pack_rng_uploads=False,
+        _rng_window_counter={},
+        _rng_slot_owner={},
+        rng_accept_slot=3,
+    )
+    meta._take_rng_window_offsets = lambda *args: SpecMetadata._take_rng_window_offsets(meta, *args)
+    return meta
+
+
+@pytest.mark.parametrize("uniform", [True, False], ids=["deferred", "uploaded"])
+def test_populate_before_stage_matches_the_upload(uniform):
+    """The steady MTP step populates the sampling parameters before staging (defer_rows = its rows per request) and
+    the staging kernel writes the Philox buffers from the deferred values: over consecutive steps of seeded and
+    unseeded requests, the same buffers and window counters as the uploads of the full pass. A batch whose requests'
+    rows differ is uploaded."""
+    from tensorrt_llm._torch.speculative.interface import _RNG_SLOT_SPAN, SpecMetadata
+
+    t = 4
+    seeds = [None, 123, None, (1 << 63) + 5]
+    requests = [
+        types.SimpleNamespace(
+            sampling_config=types.SimpleNamespace(seed=seed),
+            py_seq_slot=slot,
+            py_request_id=100 + slot,
+        )
+        for slot, seed in zip((5, 2, 7, 0), seeds)
+    ]
+    b = len(requests)
+    rows = [t] * b if uniform else [t, 1, t, t]
+    normalized = [(1.0, 0, 1.0, 0.0, n) for n in rows]
+    staged, uploaded = _rng_meta(), _rng_meta()
+    dev = _device_tensors(torch.Generator().manual_seed(3))
+    slab = torch.tensor([0, 1, 2, 3] + list(range(b * t)), dtype=torch.int32, device="cuda")
+    for step in range(3):
+        deferred = SpecMetadata._populate_request_rng_state(
+            staged, requests, normalized, defer_rows=t
+        )
+        assert SpecMetadata._populate_request_rng_state(uploaded, requests, normalized) is None
+        if uniform:
+            request_seeds, request_offsets = deferred
+            stage_steady_inputs(
+                slab,
+                b,
+                t,
+                dev,
+                **{
+                    k: v
+                    for k, v in _buffers().items()
+                    if k not in ("mrope_positions", "kv_lens_cuda")
+                },
+                mrope_positions=None,
+                rng_slab=torch.tensor(
+                    request_seeds + request_offsets, dtype=torch.int64, device="cuda"
+                ),
+                rng_buffers=(
+                    staged.request_seeds,
+                    staged.request_offsets,
+                    staged.seeds,
+                    staged.offsets,
+                ),
+                rng_span=_RNG_SLOT_SPAN,
+            )
+        else:
+            assert deferred is None
+        torch.cuda.synchronize()
+        for name, n in (
+            ("request_seeds", b),
+            ("request_offsets", b),
+            ("seeds", sum(rows)),
+            ("offsets", sum(rows)),
+        ):
+            assert torch.equal(getattr(staged, name)[:n], getattr(uploaded, name)[:n]), (step, name)
+        assert staged._rng_window_counter == uploaded._rng_window_counter
 
 
 def _manager(pools=2, rows=4, max_blocks=16):

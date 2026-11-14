@@ -169,8 +169,10 @@ public:
     //
     // `numTokensInBlock` records the page's token count. See
     // CommittedPage::numTokensInBlock for its attention and SSM interpretations.
-    SharedPtr<CommittedPage> convertToCommitted(
-        SharedPtr<Block> block, CachedCudaEvent readyEvent, int numTokensInBlock);
+    // An attention page takes the retention of `retentionSource` if given (the block's page it supersedes), else its
+    // own.
+    SharedPtr<CommittedPage> convertToCommitted(SharedPtr<Block> block, CachedCudaEvent readyEvent,
+        int numTokensInBlock, Page const* retentionSource = nullptr);
 };
 
 // ---------------------------------------------------------------------------

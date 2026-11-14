@@ -104,6 +104,12 @@ l0_gb300:
   - unittest/_torch/modules/test_mxfp8_draft_head.py
   - unittest/_torch/modules/test_q35_mtp_glue.py
   - unittest/_torch/pyexecutor/test_steady_spec_prepare.py
+  # KV cache manager v2 remote cache level: only the fabric transport cases (Grace host memory), which no other
+  # stage can run. The NIXL cases run with the whole unittest/kv_cache_manager_v2_tests directory in l0_a10 and
+  # l0_b200 (pre-merge) and l0_h100 (post-merge); the host-only (cpu_only) cases run in l0_cpu.
+  - unittest/kv_cache_manager_v2_tests/test_remote_fabric_available.py
+  - unittest/kv_cache_manager_v2_tests/test_remote_level.py -k "fabric"
+  - unittest/kv_cache_manager_v2_tests/test_remote_capacity.py -k "fabric"
   # Muse Spark Open decoder fast paths on one GPU: the fused Triton kernels and the
   # GB300 cluster boundary kernel, against their reference compositions.
   - unittest/_torch/modeling/test_musespark_open_router_projection.py
@@ -150,6 +156,11 @@ l0_gb300:
   # 3k-6k-token pass keys with their acceptance-length floor. The other layouts and KV dtypes
   # run post-merge (l0_gb300_multi_gpus).
   - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_mtp3_gsm8k_and_long_context TIMEOUT (60)
+  # Qwen3.5 TP decode: KV-replica FP8 decode (TP2 / TP4), the MNNVL all-reduce + RMSNorm kernels and the LL TP
+  # exchanges (sampling, RoPE gather, group merge) at group sizes 2 and 4.
+  - unittest/_torch/attention/multi_gpu/test_gqa_kv_replica.py
+  - unittest/_torch/multi_gpu/test_mnnvl_fused_allreduce_norm.py
+  - unittest/_torch/multi_gpu/test_ll_exchange.py
 
 # K3 collectives and decode-path exchanges, four ranks in one NVLink domain.
 - condition:

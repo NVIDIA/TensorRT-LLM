@@ -923,6 +923,10 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
                 raise NotImplementedError(
                     "the `trtllm::moe_custom_op` graph path cannot carry prerouted routing"
                 )
+            if kwargs.get("lamport_fc2_out") is not None:
+                raise NotImplementedError(
+                    "the `trtllm::moe_custom_op` graph path cannot carry a Lamport FC2 output"
+                )
             hidden_states = x.fp4_tensor if isinstance(
                 x, Fp4QuantizedTensor) else x
             x_sf = x.scaling_factor if isinstance(x,

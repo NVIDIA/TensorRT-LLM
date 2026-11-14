@@ -1,11 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
+import contextlib
 import copy
 import inspect
 import os
 from dataclasses import replace
-from typing import Dict, Generic, Iterator, List, Optional, Tuple
+from typing import ClassVar, Dict, Generic, Iterator, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -36,7 +37,7 @@ from ..pyexecutor.runtime_hooks import RuntimeHooks
 from ..speculative import (SpecMetadata, get_spec_worker,
                            should_use_separate_draft_kv_cache)
 from ..speculative.interface import SpeculativeDecodingMode
-from ..utils import AuxStreamType
+from ..utils import AuxStreamType, is_torch_compiling
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM, TModel,
@@ -1450,6 +1451,15 @@ class MTPForCausalLM(nn.Module):
                 raise ValueError(
                     f"Model type {model_type} not supported for MTP")
 
+        # Optional layer capabilities: whether its forward takes pass 0's
+        # ``kept_rows``, and whether the target's recurrent-state promotion
+        # may run beside the draft loop.
+        takes_kept_rows = getattr(mtp_layer, "takes_kept_rows",
+                                  lambda _: False)(model_config)
+        promotes_target_state_beside = getattr(mtp_layer,
+                                               "promotes_target_state_beside",
+                                               lambda _: False)(model_config)
+
         if (spec_config.uses_replacement_heads
                 and getattr(mtp_layer, "uses_shared_lm_head", True)):
             if model_config.quant_config_dict is not None:
@@ -1483,6 +1493,8 @@ class MTPForCausalLM(nn.Module):
             for layer_idx in range(mtp_num_layers)
         ])
         self.folds_kv_lens_increment = folds_kv_lens_increment
+        self.takes_kept_rows = takes_kept_rows
+        self.promotes_target_state_beside = promotes_target_state_beside
         dwdp_manager = get_global_dwdp_manager()
         if dwdp_manager is not None and mtp_repeat_count > 1:
             for layer_idx in range(mtp_num_layers):
@@ -1751,8 +1763,47 @@ def get_draft_model(model_config, draft_config, lm_head, model):
     return builder(model_config, draft_config, lm_head, model)
 
 
-# The step-loop hooks of a model with the one-engine speculative fast paths.
-_FAST_PATH_RUNTIME_HOOKS = RuntimeHooks(loop_on_execution_stream=True)
+def drafter_hidden_extra_attrs(
+        model_cls: type, spec_config: object,
+        draft_config: Optional[ModelConfig]) -> Tuple[str, ...]:
+    """The target's ``extra_attrs`` keys to hide while its drafter is built:
+    the model's ``target_only_extra_attrs`` when the drafter comes from
+    another checkpoint (an Eagle3 head, an external MTP or PARD /
+    draft-target drafter; its ``draft_config`` shares the target's
+    ``extra_attrs``), none for the target's own MTP layers (no
+    ``draft_config``, or replacement MTP heads of the same architecture).
+
+    Args:
+        model_cls: The target model class.
+        spec_config: The speculative config.
+        draft_config: The drafter's config, or None.
+
+    Returns:
+        The keys to hide (possibly empty).
+    """
+    if draft_config is None or spec_config.uses_replacement_heads:
+        return ()
+    return tuple(model_cls.target_only_extra_attrs)
+
+
+@contextlib.contextmanager
+def hidden_extra_attrs(extra_attrs: Dict, keys: Tuple[str,
+                                                      ...]) -> Iterator[None]:
+    """Remove ``keys`` from ``extra_attrs`` for the block and put back the
+    values they had (also when the block raises).
+
+    Args:
+        extra_attrs: A model config's ``extra_attrs``.
+        keys: The keys to hide; absent ones are skipped.
+
+    Yields:
+        None.
+    """
+    saved = {key: extra_attrs.pop(key) for key in keys if key in extra_attrs}
+    try:
+        yield
+    finally:
+        extra_attrs.update(saved)
 
 
 class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
@@ -1760,11 +1811,27 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
 
     # Set per instance from supports_spec_decode_fast_paths in __init__.
     spec_decode_fast_paths: bool = False
+    # Declared by the model: under the fast paths, temperature rows of the TP
+    # key exchange draw Gumbel noise four entries per Philox call (another
+    # noise stream; TPKeyExchange fast_gumbel).
+    spec_decode_fast_gumbel: ClassVar[bool] = False
+    # Declared by the model: under the fast paths, the TP key exchange's
+    # argmax splits rows by its row-split bounds (TPKeyExchange
+    # argmax_row_split; same tokens, another launch shape).
+    spec_decode_argmax_row_split: ClassVar[bool] = False
+    # Declared by the model: its step-loop hooks under the fast paths (None:
+    # the defaults).
+    spec_decode_fast_path_runtime_hooks: ClassVar[Optional[RuntimeHooks]] = None
+    # Declared by the model: ``extra_attrs`` keys its construction writes for
+    # its own modules, hidden while a drafter from another checkpoint is built
+    # (drafter_hidden_extra_attrs).
+    target_only_extra_attrs: ClassVar[Tuple[str, ...]] = ()
 
     @property
     def runtime_hooks(self) -> Optional[RuntimeHooks]:
-        """The fast paths run the overlap loop on the execution stream."""
-        return (_FAST_PATH_RUNTIME_HOOKS
+        """The model's ``spec_decode_fast_path_runtime_hooks`` under the fast
+        paths, else None."""
+        return (self.spec_decode_fast_path_runtime_hooks
                 if self.spec_decode_fast_paths else None)
 
     @classmethod
@@ -1811,7 +1878,10 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 # only; None elsewhere).
                 from ..distributed import ll_exchange
                 key_exchange = ll_exchange.create_tp_key_exchange(
-                    model_config.mapping, model_config.max_num_tokens)
+                    model_config.mapping,
+                    model_config.max_num_tokens,
+                    fast_gumbel=self.spec_decode_fast_gumbel,
+                    argmax_row_split=self.spec_decode_argmax_row_split)
             # Only create draft_model for modes MTP, Eagle3 (not SA)
             if not spec_config.spec_dec_mode.is_sa():
                 requested_draft_moe_backend = _get_requested_draft_moe_backend(
@@ -1890,9 +1960,15 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 self.use_separate_draft_kv_cache = should_use_separate_draft_kv_cache(
                     spec_config)
 
-                self.draft_model = get_draft_model(model_config,
-                                                   self.draft_config,
-                                                   self.lm_head, self.model)
+                # A drafter of another checkpoint shares extra_attrs: it must
+                # not build the target's declared decode kernels.
+                with hidden_extra_attrs(
+                        model_config.extra_attrs,
+                        drafter_hidden_extra_attrs(type(self), spec_config,
+                                                   self.draft_config)):
+                    self.draft_model = get_draft_model(model_config,
+                                                       self.draft_config,
+                                                       self.lm_head, self.model)
                 if spec_config.uses_replacement_heads:
                     self.draft_config = self.draft_model.model_config
                 if self.draft_model is not None:
@@ -1954,10 +2030,14 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         # copy here instead of one per attention layer that needs them dense.
         # Not with context requests: a breakable prefill CUDA graph replays its
         # body against the capture-time position tensor.
+        # Not under torch.compile: the inference-mode copy differs from the
+        # position-buffer view context batches pass, so every switch between
+        # them would recompile; the compiled graph makes its own dense copies.
         hoist_positions = (self.spec_decode_fast_paths
                            and self.spec_worker is not None
                            and position_ids is not None
-                           and attn_metadata.num_contexts == 0)
+                           and attn_metadata.num_contexts == 0
+                           and not is_torch_compiling())
         if hoist_positions:
             position_ids = position_ids.contiguous()
         hidden_states = self.model(

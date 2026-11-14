@@ -19,6 +19,7 @@ import types
 import pytest
 import torch
 
+from tensorrt_llm._torch.modules.mamba import gdn_inforward_split
 from tensorrt_llm._torch.modules.mamba.causal_conv1d import causal_conv1d_fn
 from tensorrt_llm._torch.modules.mamba.gdn_mixer import (
     _gdn_prefill_uses_flashinfer,
@@ -203,3 +204,221 @@ def test_split_conv_states_match_two_iterations():
     assert torch.equal(conv_states, expected_live)
     assert torch.equal(stage, expected_stage)
     assert torch.equal(out, expected_out)
+
+
+def _random_states(rows, seed):
+    torch.manual_seed(seed)
+    return torch.randn(rows, NUM_V_HEADS, HEAD_DIM, HEAD_DIM, device="cuda").to(torch.bfloat16)
+
+
+def test_split_kernels_match_index_ops():
+    """Each gdn_inforward_split launch writes exactly the bytes of the index ops it replaces."""
+    split = _split()
+    total = sum(length for _, _, length, _ in _BATCH)
+    q, k, v, g, beta = _inputs(total, seed=2)
+    # One final state per chunked-prefill sequence: a split request runs as two.
+    final = _random_states(split.gather.numel(), seed=3)
+    ssm_states = _random_states(NUM_SLOTS, seed=4)
+    assert gdn_inforward_split.split_core_ok(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        final,
+        ssm_states,
+        ssm_states[:4],
+        q.new_empty(1, total, NUM_V_HEADS, HEAD_DIM),
+    )
+
+    # Final states into the live slots, and the tails' initial states.
+    expected_ssm = ssm_states.clone()
+    expected_ssm.index_copy_(0, split.live, final.index_select(0, split.main_rows))
+    tail_init = gdn_inforward_split.split_state_rows(final, ssm_states, split)
+    assert torch.equal(ssm_states, expected_ssm)
+    assert torch.equal(tail_init, final.index_select(0, split.split_rows))
+
+    # Tail tokens.
+    gathered = gdn_inforward_split.gather_tail_tokens(q, k, v, g, beta, split)
+    for got, x in zip(gathered, (q, k, v, g, beta)):
+        assert torch.equal(got, x.index_select(1, split.tail_tok))
+
+    # Tail final states into the staging rows, tail outputs into the output.
+    tail_final = _random_states(split.k, seed=5)
+    tail_out = torch.randn(1, split.num_tail_tokens, NUM_V_HEADS, HEAD_DIM, device="cuda").to(
+        torch.bfloat16
+    )
+    stage = _random_states(4, seed=6)
+    core_out = torch.randn(1, total, NUM_V_HEADS, HEAD_DIM, device="cuda").to(torch.bfloat16)
+    expected_stage, expected_out = stage.clone(), core_out.clone()
+    expected_stage.index_copy_(0, split.stage_rows, tail_final)
+    expected_out[0].index_copy_(0, split.tail_tok, tail_out[0])
+    # Rows whose inner dims are not packed are refused, with nothing written.
+    wide = torch.zeros(1, total, NUM_V_HEADS, 2 * HEAD_DIM, dtype=core_out.dtype, device="cuda")
+    assert not gdn_inforward_split.scatter_tail(
+        tail_final, stage, tail_out, wide[..., :HEAD_DIM], split
+    )
+    strided_stage = stage.transpose(2, 3)
+    assert not gdn_inforward_split.scatter_tail(
+        tail_final, strided_stage, tail_out, core_out, split
+    )
+    assert not wide.any()
+    assert gdn_inforward_split.scatter_tail(tail_final, stage, tail_out, core_out, split)
+    assert torch.equal(stage, expected_stage)
+    assert torch.equal(core_out, expected_out)
+
+
+def test_split_conv_states_kernel_matches_index_ops():
+    split = _split()
+    total = sum(length for _, _, length, _ in _BATCH)
+    torch.manual_seed(7)
+    mixed_qkv = torch.randn(total, CONV_DIM, device="cuda").to(torch.bfloat16)
+    conv_states = torch.randn(NUM_SLOTS, CONV_DIM, D_CONV - 1, device="cuda").to(torch.bfloat16)
+    stage = torch.randn(4, CONV_DIM, D_CONV - 1, device="cuda").to(torch.bfloat16)
+    expected_states, expected_stage = conv_states.clone(), stage.clone()
+    _inforward_split_conv_states(
+        expected_states, mixed_qkv.index_select(0, split.conv_win), split, expected_stage
+    )
+    assert gdn_inforward_split.split_conv_states_ok(conv_states, mixed_qkv, stage)
+    gdn_inforward_split.split_conv_states(conv_states, mixed_qkv, split, stage)
+    assert torch.equal(conv_states, expected_states)
+    assert torch.equal(stage, expected_stage)
+
+
+def test_split_prefill_core_fused_copies_bitwise():
+    """fused_copies only changes how the states and tokens move: outputs and states are bit-identical."""
+    split = _split()
+    total = sum(length for _, _, length, _ in _BATCH)
+    q, k, v, g, beta = _inputs(total, seed=8)
+    results = []
+    for fused_copies in (False, True):
+        ssm_states = _random_states(NUM_SLOTS, seed=9) * 0.01
+        stage = torch.zeros(4, NUM_V_HEADS, HEAD_DIM, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+        out = _inforward_split_prefill_core(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            ssm_states,
+            split,
+            stage,
+            None,
+            g_is_linear=False,
+            fused_copies=fused_copies,
+        )
+        results.append((out, ssm_states, stage))
+    for reference, fused in zip(*results):
+        assert torch.equal(reference, fused)
+
+
+@pytest.mark.parametrize("fused_copies", [False, True])
+def test_split_prefill_core_alpha_bitwise(fused_copies):
+    """alpha = exp(g) as the gate (g_is_linear; the tails gather it in place of g) gives the bits of g alone."""
+    if not _gdn_prefill_uses_flashinfer():
+        pytest.skip("only the FlashInfer scan takes the linear-space gate")
+    split = _split()
+    total = sum(length for _, _, length, _ in _BATCH)
+    q, k, v, g, beta = _inputs(total, seed=10)
+    results = []
+    for linear_gate in (False, True):
+        ssm_states = _random_states(NUM_SLOTS, seed=11) * 0.01
+        stage = torch.zeros(4, NUM_V_HEADS, HEAD_DIM, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+        out = _inforward_split_prefill_core(
+            q,
+            k,
+            v,
+            torch.exp(g) if linear_gate else g,
+            beta,
+            ssm_states,
+            split,
+            stage,
+            None,
+            g_is_linear=linear_gate,
+            fused_copies=fused_copies,
+        )
+        results.append((out, ssm_states, stage))
+    for reference, with_alpha in zip(*results):
+        assert torch.equal(reference, with_alpha)
+
+
+def test_split_kernels_compile_once_for_every_batch():
+    """The state-row split and the tail scatter take the batch's live / split counts at run time: one compiled
+    variant each serves counts of 1, 2, 16 and 3 (no in-step compile for a new count class)."""
+    from _torch.helpers import triton_num_compiled
+
+    def states(rows, seed):
+        return _random_states(rows, seed)
+
+    def run(n_live, k):
+        cuda = torch.device("cuda")
+        split = types.SimpleNamespace(
+            live=torch.arange(n_live, dtype=torch.int32, device=cuda) % NUM_SLOTS,
+            main_rows=torch.arange(n_live, dtype=torch.int32, device=cuda),
+            split_rows=torch.arange(k, dtype=torch.int32, device=cuda),
+            k=k,
+            stage_rows=torch.arange(k, dtype=torch.int32, device=cuda),
+            tail_tok=torch.arange(2, dtype=torch.int32, device=cuda),
+        )
+        final = states(max(n_live, k), seed=n_live)
+        ssm = states(NUM_SLOTS, seed=k)
+        expected_ssm = ssm.clone()
+        expected_ssm.index_copy_(0, split.live.long(), final.index_select(0, split.main_rows))
+        tail_init = gdn_inforward_split.split_state_rows(final, ssm, split)
+        if n_live <= NUM_SLOTS:  # distinct live slots
+            assert torch.equal(ssm, expected_ssm)
+        assert torch.equal(tail_init, final.index_select(0, split.split_rows))
+        stage = states(k, seed=7)
+        tail_final = states(k, seed=8)
+        tail_out = torch.randn(1, 2, NUM_V_HEADS, HEAD_DIM, device=cuda).to(torch.bfloat16)
+        core_out = torch.zeros(1, 4, NUM_V_HEADS, HEAD_DIM, dtype=torch.bfloat16, device=cuda)
+        assert gdn_inforward_split.scatter_tail(tail_final, stage, tail_out, core_out, split)
+        assert torch.equal(stage, tail_final)
+
+    run(3, 3)
+    before = (
+        triton_num_compiled(gdn_inforward_split._split_state_rows_kernel),
+        triton_num_compiled(gdn_inforward_split._tail_scatter_kernel),
+    )
+    for n_live, k in ((1, 1), (2, 2), (16, 16), (8, 3)):
+        run(n_live, k)
+    assert (
+        triton_num_compiled(gdn_inforward_split._split_state_rows_kernel),
+        triton_num_compiled(gdn_inforward_split._tail_scatter_kernel),
+    ) == before
+
+
+def test_conv_state_and_tail_gather_kernels_compile_once_for_every_batch():
+    """The conv-state split and the tail-token gather take their counts as grid sizes and their strides from the
+    model's fixed widths: the variant compiled for the first split batch (the startup warmup's) serves every later
+    split count, so serving compiles none of the four split kernels."""
+    from _torch.helpers import triton_num_compiled
+
+    cuda = torch.device("cuda")
+    q, k, v, g, beta = _inputs(64, seed=3)
+
+    def run(num_splits, num_tail):
+        split = types.SimpleNamespace(
+            k=num_splits,
+            tail_slots=torch.arange(num_splits, dtype=torch.long, device=cuda) % NUM_SLOTS,
+            stage_rows=torch.arange(num_splits, dtype=torch.long, device=cuda),
+            conv_win=torch.arange(num_splits * (D_CONV - 1), dtype=torch.long, device=cuda) % 64,
+            tail_tok=torch.arange(num_tail, dtype=torch.long, device=cuda),
+        )
+        mixed_qkv = torch.randn(64, CONV_DIM, device=cuda).to(torch.bfloat16)
+        conv_states = torch.randn(NUM_SLOTS, CONV_DIM, D_CONV - 1, device=cuda).to(torch.bfloat16)
+        stage = torch.zeros(NUM_SLOTS, CONV_DIM, D_CONV - 1, dtype=torch.bfloat16, device=cuda)
+        gdn_inforward_split.split_conv_states(conv_states, mixed_qkv, split, stage)
+        outs = gdn_inforward_split.gather_tail_tokens(q, k, v, g, beta, split)
+        for x, o in zip((q, k, v, g, beta), outs):
+            assert torch.equal(o, x.index_select(1, split.tail_tok))
+
+    kernels = (
+        gdn_inforward_split._split_conv_state_kernel,
+        gdn_inforward_split._tail_token_gather_kernel,
+    )
+    run(2, 4)
+    before = tuple(triton_num_compiled(kernel) for kernel in kernels)
+    for num_splits, num_tail in ((1, 1), (3, 17), (8, 64), (5, 2)):
+        run(num_splits, num_tail)
+    assert tuple(triton_num_compiled(kernel) for kernel in kernels) == before

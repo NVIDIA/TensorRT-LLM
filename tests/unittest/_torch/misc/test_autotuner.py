@@ -1761,7 +1761,12 @@ def test_fp4_moe_tunes_on_dummy_topk_and_runs_on_runtime_topk(monkeypatch):
         seen["tuner"] = list(inputs)
         return runners[0], -1
 
-    def fake_forward(self, inputs, tactic, output=None, prerouted=None):
+    def fake_forward(self,
+                     inputs,
+                     tactic,
+                     output=None,
+                     prerouted=None,
+                     lamport_out=None):
         seen["kernel"] = list(inputs)
         return [torch.zeros(1, device="cuda")]
 

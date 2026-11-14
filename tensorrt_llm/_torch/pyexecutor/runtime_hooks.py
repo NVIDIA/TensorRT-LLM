@@ -237,8 +237,8 @@ class RuntimeHooks:
     # one-model speculative batches (the argmax path never reads them).
     skip_greedy_rng_upload: bool = False
     # Stage the one-model speculative sampler's per-step Philox seed and offset
-    # uploads into the step-input pack (pack_step_inputs), so they ride its one
-    # upload instead of each being a copy the next graph waits for.
+    # uploads into the step-input pack (pack_step_inputs), or into the steady MTP
+    # stager's slab on the steps it prepares, instead of four separate copies.
     pack_spec_rng_uploads: bool = False
     # The one-model speculative step's small per-step uploads: the accepted-draft
     # counts join the step-input pack, and the spec sampler keeps its slot ids in
@@ -253,6 +253,9 @@ class RuntimeHooks:
     # stream that waits for the current stream, instead of an end and a start event back to back on the
     # current stream (the same instant, with no GPU work between them). The reported step times are unchanged.
     iteration_timing_one_event: bool = False
+    # Record the per-request perf-metrics timing events (return_perf_metrics) on a side stream that waits for
+    # the current stream, so a timing record does not cost the current stream. The elapsed times are unchanged.
+    perf_metrics_timing_side_stream: bool = False
     # MiniMax-M3 MSA metadata preparation.
     msa: MsaRuntimePolicy = MsaRuntimePolicy()
 

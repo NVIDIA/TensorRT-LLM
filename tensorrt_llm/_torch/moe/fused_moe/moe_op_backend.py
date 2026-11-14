@@ -36,7 +36,7 @@ import torch
 
 from tensorrt_llm._torch.utils import ActType_TrtllmGen
 
-from .impl_contract import PreroutedRouting
+from .impl_contract import EngineRouting, PreroutedRouting
 
 # Global registry for MoE backends
 _MOE_OP_BACKEND_REGISTRY: Dict[str, Type["MoEOpBackend"]] = {}
@@ -169,10 +169,17 @@ class MoEOpBackend:
         use_dp: bool = False,
         prerouted: Optional[PreroutedRouting] = None,
         decode_tuning: bool = False,
+        decode_engine_state: Optional[torch.Tensor] = None,
+        lamport_fc2_out: Optional[torch.Tensor] = None,
+        decode_early_release_rows: int = 0,
+        decode_spare_sms: int = 0,
     ) -> List[torch.Tensor]:
         """Run FP4 block scale MoE computation. ``prerouted``: routing the caller
         computed (native op backend only). ``decode_tuning``: the native NVFP4 op
-        tunes for the model's decode steps (``FP4BlockScaleMoERunner``)."""
+        tunes for the model's decode steps and runs its decode kernels
+        (``FP4BlockScaleMoERunner``); ``decode_engine_state`` /
+        ``lamport_fc2_out`` / ``decode_early_release_rows`` /
+        ``decode_spare_sms``: see ``fp4_block_scale_moe_decode_runner``."""
         raise NotImplementedError
 
     def run_bf16_moe(
@@ -344,6 +351,10 @@ class TRTLLMOpBackend(MoEOpBackend):
         use_dp=False,
         prerouted=None,
         decode_tuning=False,
+        decode_engine_state=None,
+        lamport_fc2_out=None,
+        decode_early_release_rows=0,
+        decode_spare_sms=0,
     ):
         # The native runners take the block scales as one flat linear-layout
         # tensor (``fp4BlockScaleMoe.cpp`` checks ``dim() == 1``); the
@@ -418,8 +429,28 @@ class TRTLLMOpBackend(MoEOpBackend):
                 gemm1_weights_scale is not None
                 and gemm1_weights_scale.shape[-1] == hidden_size // 16
             ):
-                # nvfp4
-                outputs = torch.ops.trtllm.fp4_block_scale_moe_runner(
+                # nvfp4; calls that take the decode kernels' buffers go to the op that declares their writes
+                decode_call = (
+                    decode_tuning
+                    or decode_engine_state is not None
+                    or lamport_fc2_out is not None
+                    or isinstance(prerouted, EngineRouting)
+                )
+                if decode_call:
+                    fp4_op = torch.ops.trtllm.fp4_block_scale_moe_decode_runner
+                    decode_kwargs = dict(
+                        prerouted_candidates=(
+                            prerouted.candidates if isinstance(prerouted, EngineRouting) else None
+                        ),
+                        decode_engine_state=decode_engine_state,
+                        lamport_fc2_out=lamport_fc2_out,
+                        decode_early_release_rows=decode_early_release_rows,
+                        decode_spare_sms=decode_spare_sms,
+                    )
+                else:
+                    fp4_op = torch.ops.trtllm.fp4_block_scale_moe_runner
+                    decode_kwargs = {}
+                outputs = fp4_op(
                     router_logits,
                     routing_bias,
                     hidden_states,
@@ -459,8 +490,13 @@ class TRTLLMOpBackend(MoEOpBackend):
                     prerouted_weights=None if prerouted is None else prerouted.topk_weights,
                     prerouted_tactic=None if prerouted is None else prerouted.tactic,
                     decode_tuning=decode_tuning,
+                    **decode_kwargs,
                 )
                 if not do_finalize:
+                    if lamport_fc2_out is not None and outputs[0].numel() == 0:
+                        # The op's ABI for rows it wrote into the Lamport buffer
+                        # (decode_moe.rows_in_lamport): an empty first output.
+                        outputs = [lamport_fc2_out, *outputs[1:]]
                     if prerouted is not None:
                         # The op returns the FC2 rows; the top-k weights and the
                         # expanded -> permuted index (head of the tables) are ours.

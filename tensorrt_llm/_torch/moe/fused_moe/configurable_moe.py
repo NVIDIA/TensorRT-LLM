@@ -805,6 +805,7 @@ class ConfigurableMoE(MoE):
         lora_params: Optional[Dict] = None,
         input_ready_event: Optional[torch.cuda.Event] = None,
         prerouted: Optional[PreroutedRouting] = None,
+        lamport_fc2_out: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Forward entry point.
@@ -825,6 +826,9 @@ class ConfigurableMoE(MoE):
         ``prerouted``: the tokens' routing, computed by the caller for a backend
         that declares ``supports_prerouted_routing`` (one chunk, no
         communication).
+
+        ``lamport_fc2_out``: the un-finalized FC2 rows' buffer for a caller
+        whose MoE-output all-reduce polls them (``MoERunContext``).
         """
         input_ids = kwargs.get("input_ids")
         routing_aux = kwargs.get("routing_aux")
@@ -857,6 +861,7 @@ class ConfigurableMoE(MoE):
             routing_aux=routing_aux,
             input_ready_event=input_ready_event,
             prerouted=prerouted,
+            lamport_fc2_out=lamport_fc2_out,
         )
 
         # DWDP: record compute and trigger next prefetch (per-layer, not per-chunk).

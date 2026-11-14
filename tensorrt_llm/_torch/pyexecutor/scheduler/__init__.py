@@ -43,6 +43,7 @@ from .scheduler_v2 import KVCacheV2Scheduler
 
 # Re-export from waiting_queue.py
 from .waiting_queue import (
+    AgingPriorityWaitingQueue,
     FCFSWaitingQueue,
     PriorityWaitingQueue,
     WaitingQueue,
@@ -73,6 +74,7 @@ __all__ = [
     "KVCacheAwareADPRouter",
     "RankState",
     # Waiting queues
+    "AgingPriorityWaitingQueue",
     "FCFSWaitingQueue",
     "PriorityWaitingQueue",
     "WaitingQueue",

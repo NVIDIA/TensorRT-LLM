@@ -218,6 +218,33 @@ class DisaggClusterConfig:
                 "require an etcd:// cluster_uri")
 
 
+# The output-length predictors (serve/output_length_predictor.py implements them).
+OutputLengthPredictorName = Literal["ridge", "ridge_gbm"]
+
+
+class OutputLengthPredictionConfig(StrictBaseModel):
+    """Generation priority from an online prediction of each request's output length.
+
+    After the context phase the orchestrator predicts the reply's length from the
+    conversation's earlier replies (``conversation_params.conversation_id``) and the
+    prompt length, never from ``max_tokens``, and sets the generation request's
+    ``priority`` (higher for shorter replies). The predictor learns online in the
+    coordinator. Generation servers order by it with
+    ``scheduler_config.waiting_queue_policy: priority``. Requires
+    ``schedule_style: context_first``; a request served without a context
+    phase (conditional disaggregation) gets the prior's priority.
+    """
+
+    predictor: OutputLengthPredictorName = Field(
+        default="ridge",
+        description=(
+            "'ridge': a ridge regression on the request's history features, "
+            "refit every 120 s. 'ridge_gbm': also a gradient-boosted tree "
+            "ensemble refit every 300 s in a separate process, which needs "
+            "numpy and scikit-learn in the server's Python environment "
+            "(checked at startup)."))
+
+
 @dataclass
 class DisaggServerConfig():
     server_configs: List[CtxGenServerConfig]
@@ -270,6 +297,8 @@ class DisaggServerConfig():
     # servers when they expose per-frontend affinity ports: context requests
     # with a conversation id go to the port of one frontend.
     ctx_frontend_affinity: Optional[Tuple[int, int]] = None
+    # Generation priority from the predicted output length; None: off.
+    output_length_prediction: Optional[OutputLengthPredictionConfig] = None
 
 
 class MetadataServerConfig(StrictBaseModel):
@@ -408,6 +437,7 @@ def extract_disagg_cfg(
         internal_request_auth_key: Optional[str] = None,
         conversation_affinity_header_for_subagents: Optional[str] = None,
         subagent_affinity_scope: Literal['context', 'both'] = 'context',
+        output_length_prediction: Optional[OutputLengthPredictionConfig] = None,
         **kwargs: Any) -> DisaggServerConfig:
     context_servers = context_servers or {}
     generation_servers = generation_servers or {}
@@ -448,6 +478,21 @@ def extract_disagg_cfg(
     gen_router_config = extract_router_config(generation_servers)
     ctx_router_config.server_role = ServerRole.CONTEXT
     gen_router_config.server_role = ServerRole.GENERATION
+    if ctx_router_config.args.get("max_queue_wait_s") is not None:
+        raise ValueError(
+            "context_servers.router.max_queue_wait_s is a generation router "
+            "option (pooled generation dispatch); remove it, or set it on "
+            "generation_servers.router together with max_requests_per_server")
+    if (gen_router_config.args.get("max_queue_wait_s") is not None
+            and gen_router_config.args.get("max_requests_per_server") is None):
+        raise ValueError("generation_servers.router.max_queue_wait_s needs "
+                         "max_requests_per_server")
+    if gen_router_config.args.get("max_requests_per_server") is not None:
+        # The pooled generation router fails a request that waits for a seat past
+        # the context servers' KV transfer timeout. This is the fallback until the
+        # context servers report their own value in /server_info.
+        gen_router_config.args["kv_transfer_timeout_ms"] = (
+            _ctx_kv_transfer_timeout_ms(context_servers))
     if disagg_cluster:
         disagg_cluster_config = extract_disagg_cluster_config(disagg_cluster)
     else:
@@ -503,8 +548,26 @@ def extract_disagg_cfg(
             f"{subagent_affinity_scope!r}")
     config.subagent_affinity_scope = subagent_affinity_scope
     config.ctx_frontend_affinity = ctx_frontend_affinity
+    if output_length_prediction is not None:
+        config.output_length_prediction = (
+            OutputLengthPredictionConfig.model_validate(
+                output_length_prediction))
+        check_output_length_prediction_schedule(config)
     _warn_if_subagent_affinity_inactive(config)
     return config
+
+
+def check_output_length_prediction_schedule(config: DisaggServerConfig) -> None:
+    """Refuse output_length_prediction with schedule_style generation_first.
+
+    Runs again in OpenAIDisaggregatedService, after the CLI / env override of schedule_style.
+    """
+    if (config.output_length_prediction is not None
+            and config.schedule_style == "generation_first"):
+        # The prediction needs the context phase's prompt length; a
+        # generation_first request reaches its generation server without it.
+        raise ValueError("output_length_prediction requires schedule_style "
+                         "'context_first'")
 
 
 def _warn_if_subagent_affinity_inactive(config: DisaggServerConfig) -> None:
@@ -542,6 +605,19 @@ def _warn_if_subagent_affinity_inactive(config: DisaggServerConfig) -> None:
             "the 'conversation' router on the "
             f"{', '.join(non_conversation)} fleet(s), but they use a different "
             "router type; sub-agent instance affinity will be inactive there.")
+
+
+def _ctx_kv_transfer_timeout_ms(context_servers: dict) -> Optional[int]:
+    """``context_servers.cache_transceiver_config.kv_transfer_timeout_ms``, else its default.
+
+    The pooled generation router prefers the value the context servers report in
+    ``/server_info`` (their own ``--config``); this one applies until they do.
+    """
+    cfg = context_servers.get("cache_transceiver_config") or {}
+    if "kv_transfer_timeout_ms" in cfg:
+        return cfg["kv_transfer_timeout_ms"]
+    from .llm_args import CacheTransceiverConfig
+    return CacheTransceiverConfig.model_fields["kv_transfer_timeout_ms"].default
 
 
 def extract_ctx_gen_cfgs(type: Literal['ctx', 'gen'],

@@ -358,6 +358,147 @@ configured separately from `KvCacheConfig`; see
 [KV Cache Compression](kv-cache-compression.md) for the available methods and
 their activation points.
 
+### Remote Cache Level in Donated Host Memory (Prototype)
+
+KV cache manager V2 can add a cache level below the host tier whose pages live in
+host memory that other ranks of the same job donate. In disaggregated serving,
+generation ranks typically donate host memory they do not use, and context ranks
+use it to keep more reusable prefixes. `kv_cache_config.remote_cache_config`
+configures it; it requires `use_kv_cache_manager_v2: true`.
+
+Each rank takes one or both of two roles:
+
+- **Donor** (`donor`): at startup, before the KV cache estimation, the rank
+  allocates and registers `donor.size` bytes of host memory in whole 1 GiB
+  chunks (a remainder below one chunk is not donated; the rank logs the size it
+  donates) and publishes it in the rendezvous directory. The memory stays donated
+  for the lifetime of the process. The donor does no work after publishing; the
+  claiming ranks move pages themselves.
+- **Claimant** (`level`): the rank gets a remote cache level of `level.size`
+  bytes, and claims whole chunks of the donors' memory for it.
+
+For example, with eight generation ranks that donate 100 GiB each:
+
+```yaml
+kv_cache_config:
+  use_kv_cache_manager_v2: true
+  remote_cache_config:
+    directory: /shared/kv_rendezvous/${SLURM_JOB_ID}
+    donor:
+      size: 107374182400
+```
+
+and four context ranks with a 96 GiB remote level each below their host tier:
+
+```yaml
+kv_cache_config:
+  use_kv_cache_manager_v2: true
+  host_cache_size: 137438953472
+  remote_cache_config:
+    directory: /shared/kv_rendezvous/${SLURM_JOB_ID}
+    level:
+      size: 103079215104
+      expected:
+        num_donors: 8                     # donating ranks the job starts
+        claim_size: 412316860416          # level.size summed over all claimants
+```
+
+`transport` selects how pages move (below); it defaults to `{kind: nixl}`. The
+Slurm launcher in `examples/disaggregated/slurm/benchmark` fills in `directory`
+(when unset) and `level.expected` from the job's layout.
+
+**Rendezvous directory.** `directory` must be on a file system that every rank of
+the job sees; environment variables in it are expanded, and one that is not set
+is an error (every run without it would share one directory). Use a new
+directory for each job. Donor files hold NIXL memory registration keys or fabric
+handles, so the directory and its missing parents are created with mode 0700,
+every file in it is 0600, and a rank refuses a directory that another user owns,
+that group or others can write, or that is a symlink (also when the path ends in
+`/`). When it claims, a claimant opens the directory once, checks it, and reads
+every donor file through that handle, only from files the job's user owns. The
+capacity check that runs before the claim (with `level.expected.num_donors` set)
+does not: it checks the directory by path, then lists it and reads the donor
+`.meta` and `.failed` files by path every 2 s, with no owner, file-type or size
+check, so a non-regular file planted in the directory (for example a FIFO) can
+block it. Put the directory where only users you trust can rename or replace it
+or write into it: a user who can write one of its parent directories can move it
+aside before a rank opens it.
+
+**Transport.** `transport: {kind: nixl}` (the default) moves pages with one-sided
+NIXL RDMA; its `ucx_devices` selects the UCX devices of the agents.
+`transport: {kind: fabric}` donates CUDA fabric memory, which claimants in the
+same multi-node NVLink domain copy over NVLink. A fabric donation fills the GPU's
+host NUMA node first, then the other nodes, keeping `donor_reserve_size` bytes
+free on each node, and is published short when it does not fit; with
+`compact_host_memory: true` a node that refuses a chunk first gets
+reclaim-and-compact passes (one donor per node at a time), otherwise that is left
+to the job prolog. Every rank that shares a directory must use the same
+transport. Both move pages through a pinned host staging ring. A NIXL batch is
+waited for on the scheduling thread (up to `transfer_timeout_s`), so offloading
+to a NIXL level under host-memory pressure adds that wait to the step that
+evicts; fabric copies are queued on the caller's stream. The cost of the NIXL wait
+on decode step time has not been measured.
+
+**Sizing.** The donors' published memory must cover the claims. A claimant splits
+`level.size` across layer groups (by the hot tier's split, or `level.pool_ratio`)
+and rounds each up to whole chunks, so it can claim slightly more than
+`level.size`.
+Donated memory is host memory in addition to `host_cache_size`; include it in the
+host-memory budget of every donating node. Donors publish while their own servers
+start, so a claimant waits for them: up to `level.donor_wait_timeout_s` (default
+900 seconds) for each chunk claim. With `level.expected`, it first waits, within
+the same bound, until
+those donors have reported, and fails at once when they cannot cover the job's
+claims instead of after a claim wait.
+
+**Disk tier and pool rebalance.** The remote level takes the disk level's place:
+`level` cannot be combined with `disk_cache_size`. It cannot be combined with
+`enable_kv_pool_rebalance` either.
+
+**Failure behavior.**
+
+- At startup, a donor that cannot start publishes a failure marker that claimants
+  count as reported. A claimant that cannot claim its chunks fails KV cache
+  manager construction, so its server does not start; with `level.expected`, the
+  error names the failed and short donors.
+- At runtime, a NIXL transfer that fails or exceeds `transfer_timeout_s` (default
+  30 seconds), for example because its donor died, retires the remote level for
+  the rest of the process. Its pages leave the reuse tree, nothing more is written
+  to it, and the tiers above it keep serving. A NIXL request that NIXL reports as
+  failed is taken to have ended its access to the staging buffer, which is then
+  reused; one still in progress at the timeout keeps its staging out of use.
+- Donors send no heartbeat: a claimant treats a donor as live while its `.ready`
+  file exists, and notices that the donor went away only at its next transfer to
+  or from that donor's chunks. Every exit of a donor process takes its donated
+  memory with it. A graceful shutdown or scale-down withdraws its files and
+  deregisters the memory; a process killed by `SIGKILL` or `MPI_Abort` (such as a
+  lock-step rank stopped as described below) leaves its files in place. With NIXL,
+  the claimants' next transfer to the exited donor's chunks fails and retires
+  their level, and a claimant that starts later can still claim chunks from a
+  killed donor's leftover files and fails at its first transfer to them. With
+  `kind: fabric`, a claimant passes over a donor whose chunks it cannot
+  import, and what a copy from an already mapped chunk of an exited donor does is
+  up to the CUDA driver.
+- A request whose KV cache pages were on a retired level does not fail if its
+  pages can be recomputed. If it has not computed anything yet (including a
+  disaggregated generation request being admitted), it is matched against the
+  cache again. If it has started, it computes its context again when the
+  executor supports recompute pause; otherwise it fails with an error.
+- This per-request recovery applies where each rank schedules its own requests:
+  a single rank, or attention data parallelism. Ranks that schedule the same
+  requests in lock step (tensor parallelism without attention data parallelism,
+  context parallelism, pipeline parallelism) cannot recover a failure only some
+  of them saw: a rank whose remote level retires stops its executor with
+  `RemoteMemError`, whether or not a request lost pages, and the server fails.
+  A donor process that exits or restarts therefore stops every lock-step
+  claimant holding chunks from it, and, where those ranks donate too, their own
+  lock-step claimants in turn; claimants with per-request recovery keep serving
+  from the tiers above. Share a rendezvous directory only among workers that start
+  and stop together (no independent restarts or scale-down of donating workers),
+  or give the claimants a single-rank or attention-data-parallel layout.
+- A transfer that never completes keeps its staging buffers and chunk claims
+  until the process exits.
+
 ### Partial Reuse
 
 Partial reuse of a block can happen when some but not all tokens are matched. It is enabled by default. Set `enable_partial_reuse=False` to stop matching part of a cached block.

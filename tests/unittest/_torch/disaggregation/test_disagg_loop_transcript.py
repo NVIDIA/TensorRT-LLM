@@ -269,6 +269,76 @@ def test_executor_loop_overlap_transcript(monkeypatch) -> None:
     assert calls == idle_pass + _SHUTDOWN_PASS
 
 
+def _deferred_close_executor(monkeypatch, calls: list) -> PyExecutor:
+    """Idle overlap executor with kv_cache_config.defer_generation_only_release, recording the manager's
+    deferred-close calls among the coordinator calls."""
+    executor = _idle_executor(monkeypatch, calls)
+    executor.dist = Mock(tp_size=1, world_size=1)
+    executor._defer_generation_only_release = True
+    executor.kv_cache_manager = SimpleNamespace(
+        enable_deferred_close=lambda enabled: calls.append(("enable_deferred_close", enabled)),
+        flush_deferred_closes=lambda: calls.append(("flush_deferred_closes",)),
+    )
+    return executor
+
+
+def test_executor_loop_overlap_flushes_deferred_closes(monkeypatch) -> None:
+    """The overlap loop turns the deferred close on before its first iteration. An idle iteration closes what
+    earlier iterations left, then again once no request is active, and again after the timeout checks, so an idle
+    server holds no deferred pages while its next fetch may block."""
+    calls = []
+    PyExecutor._executor_loop_overlap(_deferred_close_executor(monkeypatch, calls))
+
+    idle_pass = _SCHEDULE_HEAD + [
+        ("flush_deferred_closes",),
+        ("flush_pending_transfer_responses",),
+        ("flush_deferred_closes",),
+        ("handle_timeouts_synced",),
+        ("check_transfer_timeouts", "only_with_context_sends=True"),
+        ("flush_deferred_closes",),
+        ("pace_idle",),
+    ]
+    assert calls == [("enable_deferred_close", True)] + idle_pass + _SHUTDOWN_PASS
+
+
+def test_executor_loop_overlap_flushes_deferred_closes_on_a_retried_iteration(monkeypatch) -> None:
+    """An iteration the benchmark gate retries skips the forward and the flushes after it, so it closes the
+    deferred caches before it starts over."""
+    calls = []
+    executor = _deferred_close_executor(monkeypatch, calls)
+    executor._check_benchmark_disagg_gate = Mock(return_value=(True, True))
+    executor._release_unused_connector_reservations = Mock()
+
+    PyExecutor._executor_loop_overlap(executor)
+
+    retried_pass = _SCHEDULE_HEAD + [
+        ("flush_pending_transfer_responses",),
+        ("flush_deferred_closes",),
+    ]
+    assert calls == [("enable_deferred_close", True)] + retried_pass + _SHUTDOWN_PASS
+
+
+@pytest.mark.parametrize("defer", [False, True], ids=["release_now", "defer_release"])
+def test_kv_pool_rebalance_flushes_deferred_closes_before_adjust(defer: bool) -> None:
+    """adjust() moves pages, so a deferred close must not hold any: the rebalance closes them before it suspends
+    the active requests and adjusts."""
+    executor = object.__new__(PyExecutor)
+    executor._defer_generation_only_release = defer
+    manager = Mock()
+    manager.is_request_active.return_value = True
+    executor.kv_cache_manager = manager
+    executor.active_requests = [SimpleNamespace(py_request_id=3)]
+    executor._suspend_padding_dummies_for_rebalance = Mock(return_value=[])
+    executor._resume_padding_dummies_after_rebalance = Mock()
+    executor._read_kv_cache_capacity = Mock(return_value=0)
+
+    PyExecutor._rebalance_kv_pools_now(executor)
+
+    names = [name for name, _, _ in manager.mock_calls]
+    head = ["is_request_active", "suspend_request", "impl.adjust", "resume_request"]
+    assert names == (["flush_deferred_closes"] if defer else []) + head
+
+
 @pytest.mark.parametrize(
     "states",
     [("absent", "processed"), ("processed", "deferred"), ("deferred", "absent")],

@@ -68,15 +68,24 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
     #: pre-routed entry point).
     supports_prerouted_routing: bool = False
 
+    #: The decode MoE engine's call state where the model declares its decode kernels (``decode_tuning``),
+    #: created with the weights (``cache_derived_state``).
+    decode_engine_state: torch.Tensor | None = None
+
+    #: SMs the decode MoE engine's persistent grid leaves free on the next ``run_moe`` calls
+    #: (``reserve_sms_for_concurrent_kernels``).
+    _concurrent_sm_reserve: int = 0
+
     def _intermediate_size_padded(self) -> int:
         act_type = to_trtllm_gen_act_type(self.activation_type)
         factor = 1 if act_type in [ActType_TrtllmGen.Relu2, ActType_TrtllmGen.Silu] else 2
         return self.w3_w1_weight.shape[-2] // factor
 
-    def decode_tactic(self, num_tokens: int) -> list[int] | None:
-        """The [tile, config] ``run_moe`` runs for ``num_tokens`` tokens with router logits (the tuned
-        choice of the FP4 MoE op), or None when the shape is not tuned. A caller that routes the tokens
-        itself builds the tables for this tactic's tile."""
+    def decode_tactic(self, num_tokens: int, do_finalize: bool) -> list[int] | None:
+        """The [tile, config] ``run_moe`` runs for ``num_tokens`` tokens with router logits and
+        ``do_finalize`` (the tuned choice of the FP4 MoE op, whose decode-tuning key carries
+        ``do_finalize``), or None when the shape is not tuned. A caller that routes the tokens itself
+        builds the tables for this tactic's tile."""
         from ....custom_ops.trtllm_gen_custom_ops import FP4BlockScaleMoERunner
 
         rp = extract_routing_params(self.routing_method)
@@ -90,7 +99,7 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
             self.expert_size_per_partition,
             rp.routed_scaling_factor,
             self.routing_method.routing_method_type,
-            True,
+            do_finalize,
             to_trtllm_gen_act_type(self.activation_type),
             tune_max_num_tokens=self.max_num_tokens,
             use_dp=self.use_dp,
@@ -167,7 +176,7 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
                 )
 
     def cache_derived_state(self) -> None:
-        """Refill the SiTu soft-caps after meta-device materialization.
+        """Create the decode engine's call state; refill the SiTu soft-caps after meta-device materialization.
 
         The model loader calls this on every module once storage is bound,
         because materialization wipes anything that is not a checkpoint tensor,
@@ -177,6 +186,10 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
         meta at that point, so a snapshot would carry no values.
         """
         super().cache_derived_state()
+        if self.decode_tuning and self.decode_engine_state is None:
+            from tensorrt_llm._torch.kernels.blackwell.moe_persistent_engine import new_state
+
+            self.decode_engine_state = new_state(self.w3_w1_weight.device)
         if not self.is_situ_activation:
             return
         params = materialize_activation_params(
@@ -189,6 +202,24 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
         self.act_alpha.data.copy_(params.alpha)
         self.act_beta.data.copy_(params.beta)
 
+    def sm_reserve_ceiling(self) -> int:
+        """Where the model declares the decode kernels (``decode_tuning``) of a pre-routed native call, the decode MoE
+        engine (``decode_moe.ENGINE``) sizes a persistent grid it can shrink by up to
+        ``decode_moe.ENGINE_SPARE_SMS`` SMs; 0 otherwise (the cubins' grids are fixed)."""
+        if not (self.decode_tuning and self.supports_prerouted_routing):
+            return 0
+        from .decode_moe import ENGINE_SPARE_SMS
+
+        return ENGINE_SPARE_SMS
+
+    def reserve_sms_for_concurrent_kernels(self, num_sms: int) -> int:
+        """The decode MoE engine launches its persistent grid ``num_sms`` SMs short (at most
+        ``sm_reserve_ceiling()``) until the next call; other kernels of the op keep their grids."""
+        if num_sms < 0:
+            raise ValueError(f"num_sms must be non-negative, got {num_sms}")
+        self._concurrent_sm_reserve = min(num_sms, self.sm_reserve_ceiling())
+        return self._concurrent_sm_reserve
+
     def run_moe(
         self,
         ctx: MoERunContext,
@@ -200,6 +231,8 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
         prerouted = ctx.prerouted
         if prerouted is not None and not self.supports_prerouted_routing:
             raise ValueError(f"{type(self).__name__} does not take prerouted routing")
+        if ctx.lamport_fc2_out is not None and not self.takes_lamport_fc2_out:
+            raise ValueError(f"{type(self).__name__} does not take a Lamport FC2 output")
 
         act_type = to_trtllm_gen_act_type(self.activation_type)
         intermediate_size_per_partition_padded = self._intermediate_size_padded()
@@ -251,6 +284,10 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
             use_dp=self.use_dp,
             prerouted=prerouted,
             decode_tuning=self.decode_tuning,
+            decode_engine_state=self.decode_engine_state,
+            lamport_fc2_out=ctx.lamport_fc2_out,
+            decode_early_release_rows=self.decode_early_release_rows,
+            decode_spare_sms=self._concurrent_sm_reserve,
         )
 
         if not k.do_finalize:

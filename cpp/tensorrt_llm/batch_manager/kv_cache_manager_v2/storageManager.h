@@ -43,6 +43,7 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 class Page;
 class KvCache;
 class CopyEngine;
+class StagingBuffer;
 class StagingBufferManager;
 
 using MigrationRecorder
@@ -101,7 +102,8 @@ public:
     CacheLevelManager(TypedVec<LifeCycleId, PoolGroupIndex> const& lifeCycleGrouping, CacheLevel cacheLevel,
         CacheTierConfig const& tierConfig, TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
         TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, PooledPhysMemAllocator* gpuPhysMemAllocator = nullptr,
-        HostMemBackingOptions const& options = {}, std::optional<size_t> sparseReservation = std::nullopt);
+        HostMemBackingOptions const& options = {}, std::optional<size_t> sparseReservation = std::nullopt,
+        SharedPtr<RemoteMemClient> remoteClient = nullptr);
 
     CacheLevel cacheLevel;
     CacheTier cacheTier;
@@ -177,9 +179,19 @@ public:
     // Check if a page is evictable (optionally at a target level).
     bool isEvictable(Page const& page, std::optional<CacheLevel> level = std::nullopt) const noexcept;
 
-    // Ensure the requested free slots exist at this level (evicting pages as needed).
+    // Ensure the requested free slots exist at this level (evicting pages as needed). A remote level that fails an
+    // eviction WRITE is retired and the eviction retried past it.
     void prepareFreeSlots(CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& requirements,
         MigrationRecorder const& migrationRecorder = {}, DropRecorder const& dropRecorder = {});
+
+    //! Remote levels that failed since the last call, each returned once, after their evictable pages are dropped.
+    //! The caller unlinks the pages still held there from the radix tree, so that reuse no longer finds them.
+    [[nodiscard]] std::vector<CacheLevel> takeNewlyFailedRemoteLevels();
+    //! Whether any remote level failed (a transfer, or a claim from a donor that went away). Cheap: one atomic flag
+    //! per client, read without the manager lock.
+    [[nodiscard]] bool anyRemoteLevelFailed() const noexcept;
+    //! How many remote clients have failed; only grows. Lock-free, like anyRemoteLevelFailed().
+    [[nodiscard]] size_t numFailedRemoteClients() const noexcept;
 
     // Force-evict pages from a level to free space.
     void forceEvict(CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& minNumPages,
@@ -201,7 +213,8 @@ public:
 
     // Best-effort migration of grouped pages to a destination cache level. Returns how many pages
     // it moved off the disk tier, counted per migrated batch rather than per page. A throw reports
-    // nothing, which in practice means slot preparation failed before anything moved.
+    // nothing, which in practice means slot preparation failed before anything moved. Pages moved
+    // off a remote level are not counted: the disk prefetch statistic stays disk-only.
     int64_t prefetch(
         CacheLevel dstLevel, TypedVec<LifeCycleId, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>> const& pages);
 
@@ -253,6 +266,22 @@ public:
     {
         return lvl == numCacheLevels() - 1;
     }
+
+    //! Whether evicted pages stop at `lvl`: the last level, or the last one above trailing failed remote levels.
+    bool isLastLiveLevel(CacheLevel lvl) const noexcept
+    {
+        return lvl >= mLastLiveLevel;
+    }
+
+    //! Whether a cold level keeps its slots in remote memory (RemoteCacheTierConfig).
+    [[nodiscard]] bool hasRemoteLevel() const noexcept
+    {
+        return mHasRemoteLevel;
+    }
+
+    //! Release the staging leases of remote transfers that have quiesced since their deadline; returns how many
+    //! remain out of use.
+    size_t reapQuiescedRemoteTransfers() noexcept;
 
     PoolGroupIndex getPoolGroupIndex(CacheLevel level, LifeCycleId lc) const;
     PoolGroupIndex getPoolGroupIndex(LifeCycleId lc) const;
@@ -450,9 +479,12 @@ private:
 
     void _prepareFreeSlots(CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& requirements,
         MigrationRecorder const& migrationRecorder, DropRecorder const& dropRecorder);
+    //! `keepAlive` collects the pages each level accepts for migration. A frame's own containers die as an exception
+    //! unwinds it, before the rollback guards of the frames above run; whoever owns `keepAlive` keeps those pages
+    //! alive until then, so that the guards can put them back.
     void _prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotCount>>& goals, CacheLevel lvlId,
-        PagesByLifeCycle& fallenPages, MigrationRecorder const& migrationRecorder = {},
-        DropRecorder const& dropRecorder = {});
+        PagesByLifeCycle& fallenPages, std::vector<SharedPtr<Page>>& keepAlive,
+        MigrationRecorder const& migrationRecorder = {}, DropRecorder const& dropRecorder = {});
 
     std::optional<std::vector<Slot>> _batchedMigrate(CacheLevel dstLevel, CacheLevel srcLevel,
         std::vector<SharedPtr<Page>> const& srcPages, bool updateSrc, MigrationRecorder const& migrationRecorder = {},
@@ -462,9 +494,41 @@ private:
     void submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLevel, LayerGroupId batchingLayerGroupId,
         PageIndexPair const* pageIndices, size_t numPages, CUstream stream);
 
+    //! The level's storage when it is a remote level (storage/remoteMem.h), else null.
+    [[nodiscard]] RemoteCacheLevelStorage* remoteLevel(CacheLevel level) const;
+    //! Whether `level` is a remote level whose client failed a transfer: it takes and gives up no pages.
+    [[nodiscard]] bool remoteLevelFailed(CacheLevel level) const;
+    //! Drop the evictable pages of every failed remote level, which could not be read back, so reuse no longer finds
+    //! them. Pages a request holds stay until it lets go of them (scheduleForEviction then drops them).
+    void dropPagesOfFailedRemoteLevels();
+    //! The pages of `level`'s eviction queues with `status`, collected before any leaves a queue.
+    [[nodiscard]] std::vector<SharedPtr<Page>> queuedPages(CacheLevel level, PageStatus status);
+    //! Run one remote transfer of a migration batch and act on its outcome: stream-ordered, the enqueue's; on the
+    //! host, waited for up to the transfer timeout, and a transfer not quiesced by then keeps `staging` out of use.
+    //! A fault or timeout fails the client (RemoteMemError).
+    void runRemoteTransfer(RemoteMemClient& client, bool write, std::vector<RemoteIo> const& ios, size_t bytes,
+        CUstream stream, std::unique_ptr<StagingBuffer>& staging);
+    //! The client of a remote tier's rendezvous directory, created on first use; null for any other tier.
+    SharedPtr<RemoteMemClient> remoteClientFor(CacheTierConfig const& tier);
+    //! A hot-to-remote or remote-to-hot migration: the cold-page codec runs against the page-staging buffer and the
+    //! remote level's client moves the bytes. Separate from the disk path.
+    void submitRemoteHotMigration(CacheLevel dstLevel, CacheLevel srcLevel, LayerGroupId batchingLayerGroupId,
+        PageIndexPair const* pageIndices, size_t numPages, CUstream stream);
+    //! A cold-to-cold migration where either side is a remote level, through the page-staging buffer. A failed
+    //! transfer on the host throws RemoteMemError before any page is pointed at its new slot.
+    void submitRemoteColdMigration(CacheLevel dstLevel, CacheLevel srcLevel, PoolGroupIndex dstPgIdx,
+        PoolGroupIndex srcPgIdx, PageIndexPair const* pageIndices, size_t numPages, CUstream stream);
+
     template <typename Submit>
     bool submitColdPageCodec(PageIndexLocation location, PageIndexPair const* pageIndices, size_t numPages,
         CUstream stream, Submit&& submit);
+    //! Encode hot pages (PageIndexPair::src) of `layerGroup` into cold pages at `dstBase` (PageIndexPair::dst), the
+    //! cold level's base or a staging buffer; false if the codec rejects the batch.
+    bool encodeColdPages(
+        LayerGroupId layerGroup, void* dstBase, PageIndexPair const* pageIndices, size_t numPages, CUstream stream);
+    //! The reverse of encodeColdPages: cold pages at `srcBase` (src) into hot pages (dst).
+    bool decodeColdPages(LayerGroupId layerGroup, void const* srcBase, PageIndexPair const* pageIndices,
+        size_t numPages, CUstream stream);
 
     PoolGroupBase& poolGroup(CacheLevel lvl, PoolGroupIndex pgIdx);
 
@@ -501,6 +565,26 @@ private:
     // Optional model-sized page staging is owned here and borrowed by CopyEngine.
     std::unique_ptr<StagingBufferManager> mPageStagingManager;
     std::unique_ptr<CopyEngine> mCopyEngine;
+    // One remote-memory client per rendezvous directory, shared by this manager's levels that name it. The page
+    // staging buffer is registered with each and deregistered before the staging is freed.
+    std::vector<SharedPtr<RemoteMemClient>> mRemoteClients;
+
+    //! A host-concluded remote transfer that had not quiesced by its deadline, and the staging lease it may still
+    //! access: kept out of use until it quiesces (reapQuiescedRemoteTransfers), leaked with its client at teardown
+    //! if it never does.
+    struct UnquiescedRemoteTransfer
+    {
+        std::unique_ptr<RemoteTransferAttempt> attempt;
+        std::unique_ptr<StagingBuffer> staging;
+        RemoteMemClient* client;
+    };
+
+    std::vector<UnquiescedRemoteTransfer> mUnquiescedRemoteTransfers;
+    bool mHasRemoteLevel = false;
+    // The deepest level that still takes pages: the last level, until trailing remote levels fail.
+    CacheLevel mLastLiveLevel{0};
+    // Failed remote levels takeNewlyFailedRemoteLevels() has returned.
+    std::vector<CacheLevel> mRetiredRemoteLevels;
 
     // Get buffer attributes for a (LayerId, DataRole) pair. Throws std::out_of_range if not found.
     // Mirrors Python's get_buffer_attr().

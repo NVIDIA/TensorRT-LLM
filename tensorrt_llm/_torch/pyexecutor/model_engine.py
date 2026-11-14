@@ -622,6 +622,11 @@ class ModelEngine:
         )
 
     @property
+    def uses_torch_compile(self) -> bool:
+        """Whether the model forward runs under torch.compile."""
+        return self._torch_compile_backend is not None
+
+    @property
     def attn_metadata(self) -> AttentionMetadata | None:
         if isinstance(self._runner, DecoderRunner):
             return self._runner.attn_metadata

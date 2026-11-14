@@ -52,7 +52,7 @@ from ..utils import (Fp4QuantizedTensor, Fp8PerTokenQuantizedTensor,
                      get_model_extra_attrs, is_torch_compiling,
                      replace_parameter_and_save_metadata, unswizzle_sf)
 from .low_m_gemm import (_should_apply_low_m_gemm, apply_low_m_gemm,
-                         low_m_gemm_dispatcher)
+                         low_m_gemm_dispatcher, low_m_gemm_takes_rows)
 
 
 class WeightMode(str, enum.Enum):
@@ -895,6 +895,17 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
                 module.dtype or torch.bfloat16) if dispatcher else None
             if output is not None:
                 return output
+        if (module.resident_fp8_min_rows > 0 and bias is None
+                and not torch.compiler.is_compiling()
+                and input.dtype == torch.float8_e4m3fn and input.dim() == 2
+                and input.shape[0] >= module.resident_fp8_min_rows
+                and (module.dtype or torch.bfloat16) == torch.bfloat16):
+            # Weights loaded before the PDL wait; bitwise equal to cublas_scaled_mm.
+            from ..kernels.blackwell import resident_fp8_gemm
+            if resident_fp8_gemm.supports(input, module.weight):
+                return resident_fp8_gemm.resident_fp8_gemm(
+                    input, module.weight, module.input_scale,
+                    module.weight_scale)
         # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden)
         # GEMM ops require 2D matrices
         original_shape = input.shape
@@ -972,8 +983,22 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         all_reduce_params: AllReduceParams
     ) -> Optional[Tuple[torch.Tensor, ...]]:
         """The MNNVL GEMM + all-reduce + residual RMSNorm kernel, where the low-M race picked the warp-MMA
-        GEMM for this projection (same summation order as the plain projection)."""
+        GEMM for this projection (same summation order as the plain projection), or, for an E4M3 or BF16 input of
+        the rows the two-shot kernel takes, the tcgen05 GEMM + two-shot all-reduce kernel (a BF16 input is quantized
+        as apply() would)."""
+        # Both kernels are CuTe DSL host launches that torch.compile cannot trace.
+        if torch.compiler.is_compiling():
+            return None
         static_input_scale = self.get_static_input_scale(module)
+        if (static_input_scale is not None and module.bias is None
+                and input.dim() == 2
+                and input.dtype in (torch.float8_e4m3fn, torch.bfloat16)
+                and module.all_reduce is not None):
+            fused = module.all_reduce.gemm_twoshot_allreduce_norm(
+                input, module.weight, module.weight_scale, static_input_scale,
+                all_reduce_params)
+            if fused is not None:
+                return fused
         dispatcher = low_m_gemm_dispatcher(module)
         if (static_input_scale is None or module.bias is not None
                 or dispatcher is None or input.dim() != 2
@@ -4251,6 +4276,12 @@ def get_quant_method(quant_config: Optional[QuantConfig] = None):
 
 class Linear(nn.Module):
 
+    # Rows from which an E4M3 input runs the resident-weight FP8 GEMM (0: never); the model sets it on projections
+    # fed by an all-reduce that releases its dependents early.
+    resident_fp8_min_rows: int = 0
+    # Set by modeling_utils.remove_weights (layer-wise benchmark): the parameters are gone.
+    _weights_removed: bool = False
+
     def __init__(
         self,
         in_features: int,
@@ -4731,6 +4762,19 @@ class Linear(nn.Module):
         assert self._weights_created
         return self.quant_config is not None and self.quant_config.layer_quant_mode.has_mxfp8(
         )
+
+    def static_fp8_input_scale(self, rows: int) -> Optional[torch.Tensor]:
+        """The static per-tensor scale with which a producer may hand this FP8 QDQ layer its E4M3 input for ``rows``
+        rows (the bytes apply() would quantize), or None: other quantization, LoRA, bias, or rows on the low-M
+        path, whose BF16- and E4M3-input runners are tuned apart."""
+        if (type(self.quant_method) is not FP8QDQLinearMethod
+                or self.lora is not None or self.bias is not None
+                or low_m_gemm_takes_rows(self, rows)):
+            return None
+        scale = self.quant_method.get_static_input_scale(self)
+        if scale is None or scale.dtype != torch.float32 or scale.numel() != 1:
+            return None
+        return scale
 
     def apply_linear(self,
                      input,

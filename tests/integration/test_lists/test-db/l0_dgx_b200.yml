@@ -32,6 +32,7 @@ l0_dgx_b200:
   # vs the single-GPU drafter.
   - unittest/_torch/multi_gpu/test_dspark_drafter_tp_fusion.py
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16[tp2-TRTLLM]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16_mtp_adp2
   - disaggregated/test_disaggregated_beam_search.py::test_disaggregated_beam_search_v2[beam2-reuse]
   - disaggregated/test_disaggregated_beam_search.py::test_disaggregated_beam_search_v2[beam4-no-reuse]
   - accuracy/test_disaggregated_serving.py::TestQwen3_8BDFlash::test_gsm8k_1p1d_unified_draft_kv

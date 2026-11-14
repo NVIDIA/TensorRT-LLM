@@ -155,6 +155,9 @@ class _DummyKvCacheCreator:
             _stream=self._execution_stream,
         )
 
+    def close_remote_donor(self, error=None):
+        """No remote donation is started (no-op)."""
+
 
 class _DummyModelEngine:
     """Mock model engine that exposes attention runtime features and model configuration."""

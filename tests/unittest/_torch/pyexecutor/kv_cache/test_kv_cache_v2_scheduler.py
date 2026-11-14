@@ -18,8 +18,9 @@ All KVCacheManagerV2, LlmRequest, and PeftCacheManager objects are mocked.
 No GPU required.
 """
 
+from collections import deque
 from types import SimpleNamespace
-from unittest.mock import Mock, call, patch
+from unittest.mock import Mock, PropertyMock, call, patch
 
 import pytest
 
@@ -39,8 +40,172 @@ from tensorrt_llm.llmapi.llm_args import (
     ContextChunkingPolicy,
     ContextSchedulingPolicy,
 )
+from tensorrt_llm.runtime.kv_cache_manager_v2 import RemoteMemError
 
 pytestmark = pytest.mark.cpu_only
+
+
+def _manager_for_release(request_id: int, is_draft: bool = False):
+    """A manager whose `free_resources` runs for real on one mock KvCache."""
+    manager = object.__new__(KVCacheManagerV2)
+    cache = Mock(beam_width=1)
+    manager.kv_cache_map = {request_id: cache}
+    manager.impl = Mock()
+    manager.index_mapper = Mock()
+    manager.num_pools = 1
+    manager.sparse_metadata_batch = None
+    manager.is_draft = is_draft
+    manager.kv_connector_manager = None
+    manager.conversation_manager = None
+    manager._early_freed_index_requests = set()
+    manager._deferred_closes = deque()
+    manager._pending_preemption = {}
+    manager._allocated_draft_lens = {}
+    manager._inflight_draft_lens = {}
+    manager._request_stats_enabled_ids = set()
+    manager._fresh_pages_filled = {}
+    manager._disagg_receive_ready = {}
+    manager._on_allocation_stream = set()
+    manager._allocation_ready = {}
+    return manager, cache
+
+
+def _finished_request(request_id: int, generation_only: bool = True) -> Mock:
+    return Mock(
+        py_request_id=request_id, is_generation_only_request=generation_only, is_dummy=False
+    )
+
+
+@pytest.mark.parametrize("generation_only", [False, True])
+def test_release_closes_immediately_by_default(generation_only: bool) -> None:
+    manager, cache = _manager_for_release(7)
+
+    manager.free_resources(_finished_request(7, generation_only))
+
+    cache.close.assert_called_once_with()
+    manager.impl.clear_stats_excluded.assert_called_once_with(7)
+    manager.index_mapper.remove_sequence.assert_called_once_with(7)
+    assert 7 not in manager.kv_cache_map
+    assert not manager._deferred_closes
+
+
+def test_deferred_release_closes_generation_only_request_on_flush() -> None:
+    manager, cache = _manager_for_release(7)
+    manager.enable_deferred_close(True)
+
+    manager.free_resources(_finished_request(7))
+
+    # Everything but the close happens now; the index slot is free already.
+    cache.close.assert_not_called()
+    manager.index_mapper.remove_sequence.assert_called_once_with(7)
+    assert 7 not in manager.kv_cache_map
+    assert len(manager._deferred_closes) == 1
+
+    assert manager.flush_deferred_closes() is True
+
+    cache.close.assert_called_once_with()
+    manager.impl.clear_stats_excluded.assert_called_once_with(7)
+    manager.index_mapper.remove_sequence.assert_called_once_with(7)
+    assert not manager._deferred_closes
+    assert not manager._early_freed_index_requests
+    assert manager.flush_deferred_closes() is False
+    cache.close.assert_called_once_with()
+
+
+def test_deferred_close_that_raises_still_forgets_its_request() -> None:
+    manager, cache = _manager_for_release(7)
+    manager.enable_deferred_close(True)
+    manager.free_resources(_finished_request(7))
+    later = Mock()
+    manager._deferred_closes.append((8, later))
+    cache.close.side_effect = RuntimeError("close failed")
+
+    with pytest.raises(RuntimeError, match="close failed"):
+        manager.flush_deferred_closes()
+
+    manager.impl.clear_stats_excluded.assert_called_once_with(7)
+    later.close.assert_not_called()
+    assert list(manager._deferred_closes) == [(8, later)]
+
+
+def test_an_id_reused_before_the_flush_keeps_its_own_early_free() -> None:
+    """The deferred request leaves nothing under its id, so a new request with the same id whose index slot was freed
+    early (a context-only worker) still skips the second slot release when it is removed."""
+    manager, _ = _manager_for_release(7)
+    manager.enable_deferred_close(True)
+    manager.free_resources(_finished_request(7))
+    assert 7 not in manager._early_freed_index_requests
+
+    manager._early_freed_index_requests.add(7)  # the new request's early free
+    manager.flush_deferred_closes()
+
+    assert 7 in manager._early_freed_index_requests
+
+
+@pytest.mark.parametrize("defer", [False, True])
+def test_lender_hears_of_the_free_right_before_the_close(defer: bool) -> None:
+    manager, cache = _manager_for_release(7)
+    order = Mock()
+    manager._sharing = order.sharing
+    order.attach_mock(cache.close, "close")
+    manager.enable_deferred_close(defer)
+
+    manager.free_resources(_finished_request(7))
+    if defer:
+        # The pages are still held, so the lender must not count them free yet.
+        assert order.mock_calls == []
+        manager.flush_deferred_closes()
+
+    assert order.mock_calls == [call.sharing._on_free(7, cache), call.close()]
+
+
+def test_deferred_release_keeps_other_requests_immediate() -> None:
+    manager, cache = _manager_for_release(7)
+    manager.enable_deferred_close(True)
+
+    manager.free_resources(_finished_request(7, generation_only=False))
+
+    cache.close.assert_called_once_with()
+    assert not manager._deferred_closes
+
+
+def test_disabling_deferred_release_flushes_pending_closes() -> None:
+    manager, cache = _manager_for_release(7)
+    manager.enable_deferred_close(True)
+    manager.free_resources(_finished_request(7))
+
+    manager.enable_deferred_close(False)
+
+    cache.close.assert_called_once_with()
+    assert not manager._defer_close_enabled
+    assert not manager._deferred_closes
+
+
+def test_draft_manager_never_defers_release() -> None:
+    manager, cache = _manager_for_release(7, is_draft=True)
+    manager.enable_deferred_close(True)
+
+    manager.free_resources(_finished_request(7))
+
+    assert not manager._defer_close_enabled
+    cache.close.assert_called_once_with()
+
+
+def test_reuse_reset_closes_deferred_caches_first() -> None:
+    # A close after the clear would commit the request's pages for reuse again.
+    manager, cache = _manager_for_release(7)
+    manager._sharing = None
+    manager.event_manager = None
+    manager.enable_deferred_close(True)
+    manager.free_resources(_finished_request(7))
+    order = Mock()
+    order.attach_mock(cache.close, "close")
+    order.attach_mock(manager.impl.clear_reusable_blocks, "clear")
+
+    manager.reset_reuse_state()
+
+    assert order.mock_calls == [call.close(), call.clear()]
+    assert not manager._deferred_closes
 
 
 # ---------------------------------------------------------------------------
@@ -407,6 +572,8 @@ def make_kv_cache_manager(
     mgr.preempt_request.side_effect = preempt_request
     # A bare Mock would answer truthily and suppress every stall check.
     mgr.has_pending_preemption.return_value = False
+    # No deferred close is pending unless a test queues one.
+    mgr.flush_deferred_closes.return_value = False
     return mgr
 
 
@@ -451,6 +618,7 @@ def make_scheduler(
     enable_recompute_pause: bool = True,
     context_scheduling_policy: ContextSchedulingPolicy = ContextSchedulingPolicy.FCFS,
     context_starvation_iterations: int | None = None,
+    recover_lost_kv_per_rank: bool = True,
 ) -> object:
     """Create KVCacheV2Scheduler, patching isinstance check for mock mgr."""
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
@@ -480,6 +648,7 @@ def make_scheduler(
             enable_recompute_pause=enable_recompute_pause,
             context_scheduling_policy=context_scheduling_policy,
             context_starvation_iterations=context_starvation_iterations,
+            recover_lost_kv_per_rank=recover_lost_kv_per_rank,
             **kwargs,
         )
 
@@ -1169,6 +1338,287 @@ class TestKVCacheFailuresGen:
         # → gen1 self-evicts, victim is not in paused list from eviction
         assert ids(out.generation_requests) == [0]
         assert 99 not in ids(out.paused_requests)
+
+
+def _remote_level_failed():
+    return RemoteMemError(
+        "KVCM2 remote level: a READ of 4 page(s) x 1048576 B timed out after 30000 ms"
+    )
+
+
+class TestKVPagesLostToAFailedRemoteLevel:
+    """A resume that raises RemoteMemError lost pages on a failed remote cache level: only that request is affected."""
+
+    @staticmethod
+    def _lose_pages_of(lost_id):
+        def alloc_fn(req):
+            if req.py_request_id == lost_id:
+                raise _remote_level_failed()
+            return True
+
+        return alloc_fn
+
+    def test_a_generation_request_recomputes(self):
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=self._lose_pages_of(1))
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        lost = make_gen_request(1)
+
+        out = sched.schedule_request([make_gen_request(0), lost, make_gen_request(2)], set())
+
+        assert ids(out.generation_requests) == [0, 2]
+        assert ids(out.recompute_paused_requests) == [1]
+        assert out.paused_requests == []
+        mgr.free_resources.assert_called_once_with(lost)
+        assert sched.take_lost_kv_requests() == []
+
+    def test_a_request_that_cannot_recompute_is_failed_by_the_executor(self):
+        """A disaggregated server cannot replay a prefill."""
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=self._lose_pages_of(1))
+        sched = make_scheduler(mgr, max_num_tokens=100, enable_recompute_pause=False)
+        lost = make_gen_request(1)
+
+        out = sched.schedule_request([make_gen_request(0), lost, make_gen_request(2)], set())
+
+        assert ids(out.generation_requests) == [0, 2]
+        assert out.recompute_paused_requests == []
+        [(failed, message)] = sched.take_lost_kv_requests()
+        assert failed is lost and "failed remote cache level" in message
+        assert sched.take_lost_kv_requests() == []
+
+    def test_no_further_victim_is_taken_once_the_pages_are_known_lost(self):
+        """The first resume found no room; the one after a victim made room read the dead level."""
+        calls = []
+
+        def alloc_fn(req):
+            calls.append(req.py_request_id)
+            if req.py_request_id == 1:
+                if calls.count(1) == 1:
+                    return False
+                raise _remote_level_failed()
+            return True
+
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn, can_evict=True)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        reqs = [make_gen_request(i) for i in (0, 1, 98, 99)]
+
+        out = sched.schedule_request(reqs, set())
+
+        assert ids(out.paused_requests) == [99]
+        assert ids(out.recompute_paused_requests) == [1]
+        assert ids(out.generation_requests) == [0, 98]
+
+    def test_a_first_context_chunk_matches_again(self):
+        """It computed nothing: its caches go, and the next pass matches without the failed level's pages."""
+        calls = [0]
+
+        def prepare_fn(req):
+            calls[0] += 1
+            if calls[0] == 1:
+                raise _remote_level_failed()
+            return True
+
+        mgr = make_kv_cache_manager(prepare_context_fn=prepare_fn)
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        lost = make_ctx_request(0, context_remaining_length=100)
+        mgr.kv_cache_map[0] = Mock()
+        # Where the failed match left it: past the reused prefix.
+        lost.context_current_position = 64
+        lost.estimated_reusable_tokens = 64
+
+        out = sched.schedule_request(
+            [lost, make_ctx_request(1, context_remaining_length=100)], set()
+        )
+
+        assert ids(out.context_requests) == [1]
+        assert out.recompute_paused_requests == []
+        mgr.free_resources.assert_called_once_with(lost)
+        assert lost.context_current_position == 0
+        assert lost.estimated_reusable_tokens == 0
+        lost.set_prepopulated_prompt_len.assert_called_once_with(0, mgr.tokens_per_block)
+        out = sched.schedule_request([lost], set())
+        assert ids(out.context_requests) == [0]
+
+    def test_a_started_context_request_recomputes(self):
+        def prepare_fn(req):
+            if req.py_request_id == 0:
+                raise _remote_level_failed()
+            return True
+
+        mgr = make_kv_cache_manager(prepare_context_fn=prepare_fn)
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        lost = make_ctx_request(0, context_remaining_length=100, is_first_context_chunk=False)
+
+        out = sched.schedule_request(
+            [lost, make_ctx_request(1, context_remaining_length=100)], set()
+        )
+
+        assert ids(out.context_requests) == [1]
+        assert ids(out.recompute_paused_requests) == [0]
+        mgr.free_resources.assert_called_once_with(lost)
+
+    def test_a_disagg_generation_init_request_matches_again(self):
+        """A generation-init admission whose prefix match resumed pages of a failed level costs only that request."""
+        calls = [0]
+
+        def prepare_fn(req):
+            calls[0] += 1
+            if calls[0] == 1:
+                raise _remote_level_failed()
+            return True
+
+        mgr = make_kv_cache_manager(prepare_disagg_gen_init_fn=prepare_fn)
+        sched = make_scheduler(mgr, max_num_tokens=1000, enable_recompute_pause=False)
+        lost = make_disagg_request(0)
+        mgr.kv_cache_map[0] = Mock()
+
+        out = sched.schedule_request([lost, make_gen_request(1)], set())
+
+        assert ids(out.generation_requests) == [1]
+        assert out.fitting_disagg_gen_init_requests == []
+        mgr.free_resources.assert_called_once_with(lost)
+        assert sched.take_lost_kv_requests() == []
+        out = sched.schedule_request([lost], set())
+        assert ids(out.fitting_disagg_gen_init_requests) == [0]
+
+    @pytest.mark.parametrize("path", ["generation", "context", "disagg_generation_init"])
+    def test_a_lockstep_rank_stops_instead_of_recovering_alone(self, path):
+        """TP/CP/PP peers did not see this rank's failure: recovering here alone would desynchronize them."""
+
+        def lose(req):
+            raise _remote_level_failed()
+
+        mgr = make_kv_cache_manager(
+            try_allocate_generation_fn=lose if path == "generation" else None,
+            prepare_context_fn=lose if path == "context" else None,
+            prepare_disagg_gen_init_fn=lose if path == "disagg_generation_init" else None,
+        )
+        mgr.has_remote_cache_level = True
+        mgr.any_remote_level_failed = False
+        sched = make_scheduler(mgr, max_num_tokens=1000, recover_lost_kv_per_rank=False)
+        request = {
+            "generation": lambda: make_gen_request(0),
+            "context": lambda: make_ctx_request(0, context_remaining_length=100),
+            "disagg_generation_init": lambda: make_disagg_request(0),
+        }[path]()
+
+        with pytest.raises(RemoteMemError, match="lock step"):
+            sched.schedule_request([request], set())
+        mgr.free_resources.assert_not_called()
+        assert sched.take_lost_kv_requests() == []
+
+    @pytest.mark.parametrize("fails_during_pass", [False, True])
+    def test_a_lockstep_rank_stops_once_its_level_failed(self, fails_during_pass):
+        """A level that failed in an eviction WRITE, which the manager retried past, still diverged the reuse tree."""
+        mgr = make_kv_cache_manager()
+        mgr.has_remote_cache_level = True
+        failed = [not fails_during_pass]
+
+        def alloc_fn(req):
+            failed[0] = True
+            return True
+
+        mgr.try_allocate_generation.side_effect = alloc_fn
+        type(mgr).any_remote_level_failed = PropertyMock(side_effect=lambda: failed[0])
+        sched = make_scheduler(mgr, max_num_tokens=1000, recover_lost_kv_per_rank=False)
+
+        with pytest.raises(RemoteMemError, match="lock step"):
+            sched.schedule_request([make_gen_request(0)], set())
+        assert mgr.try_allocate_generation.called == fails_during_pass
+
+    def test_a_per_rank_scheduler_never_polls_the_level(self):
+        """TP1 and attention DP recover per request: no per-pass query."""
+        mgr = make_kv_cache_manager()
+        mgr.has_remote_cache_level = True
+        polled = PropertyMock(return_value=False)
+        type(mgr).any_remote_level_failed = polled
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+
+        sched.schedule_request([make_gen_request(0)], set())
+
+        polled.assert_not_called()
+
+    def test_the_executor_fails_lost_requests_under_the_multimodal_scheduler(self):
+        """MultimodalScheduler forwards the wrapped scheduler's lost requests to PyExecutor._schedule."""
+        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+        from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import MultimodalScheduler
+
+        class StopAfterLost(RuntimeError):
+            pass
+
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=self._lose_pages_of(1))
+        inner = make_scheduler(mgr, max_num_tokens=100, enable_recompute_pause=False)
+        lost = make_gen_request(1)
+        requests = [make_gen_request(0), lost]
+        for request in requests:
+            request.py_mm_encoder_state = None
+        executor = object.__new__(PyExecutor)
+        executor.active_requests = requests
+        executor.inflight_req_ids = set()
+        executor.kv_cache_manager = mgr
+        executor._maybe_record_hang_diagnostic_phase = Mock()
+        executor._cancelled_disagg_model_request_ids = Mock(return_value=set())
+        executor.scheduler = MultimodalScheduler(
+            inner,
+            max_batch_size=8,
+            max_num_tokens=100,
+            encoder_cache=Mock(),
+            get_item_cache_keys=lambda request: None,
+            bytes_per_encoder_embedding=2,
+            retain_cache_entries=False,
+        )
+        executor._handle_errors = Mock(side_effect=StopAfterLost)
+
+        with pytest.raises(StopAfterLost):
+            PyExecutor._schedule(executor)
+
+        executor._handle_errors.assert_called_once()
+        (message,), kwargs = executor._handle_errors.call_args
+        assert kwargs == {"requests": [lost], "charge_budget": False}
+        assert "failed remote cache level" in message
+
+
+class TestDeferredClosesBeforeEviction:
+    """Deferred closes (defer_generation_only_release) are flushed before any running request pays for room."""
+
+    @pytest.mark.parametrize("enable_recompute_pause", [True, False])
+    def test_a_flush_that_makes_room_pauses_nobody(self, enable_recompute_pause):
+        pending = [True]
+        room = [False]
+
+        def flush():
+            had, pending[0] = pending[0], False
+            room[0] = room[0] or had
+            return had
+
+        def alloc_fn(req):
+            return req.py_request_id != 0 or room[0]
+
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn, can_evict=True)
+        mgr.flush_deferred_closes.side_effect = flush
+        sched = make_scheduler(
+            mgr, max_num_tokens=100, enable_recompute_pause=enable_recompute_pause
+        )
+        reqs = [make_gen_request(i) for i in (0, 1, 2)]
+
+        out = sched.schedule_request(reqs, set())
+
+        assert ids(out.generation_requests) == [0, 1, 2]
+        assert out.paused_requests == []
+        assert out.recompute_paused_requests == []
+        mgr.flush_deferred_closes.assert_called_once_with()
+
+    def test_without_pending_closes_the_ladder_runs_as_before(self):
+        def alloc_fn(req):
+            return req.py_request_id != 0 or mgr.kv_cache_map[2].is_active is False
+
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn, can_evict=True)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        reqs = [make_gen_request(i) for i in (0, 1, 2)]
+
+        out = sched.schedule_request(reqs, set())
+
+        assert ids(out.paused_requests) == [2]
+        assert ids(out.generation_requests) == [0, 1]
 
 
 class TestUnpairedDraftAdmission:

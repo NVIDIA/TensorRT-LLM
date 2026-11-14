@@ -189,6 +189,9 @@ class DecoderCudaGraphs:
     and ``_capture_additional_cuda_graphs``.
     """
 
+    # Whether a warmup batch already ran an in-forward Mamba snapshot split (its Triton copy kernels compiled).
+    _inforward_split_warmed: bool = False
+
     def __init__(
         self,
         *,
@@ -231,6 +234,7 @@ class DecoderCudaGraphs:
         # Promoted context rows carry no per-sequence extra model inputs.
         self._context_promotion_supported = context_promotion_supported
         self._force_lora_graph_for_capture: bool | None = None
+        self._inforward_split_warmed = False
 
     def forward_discarded_warmup(
         self,
@@ -361,6 +365,62 @@ class DecoderCudaGraphs:
             # serving timeouts. The warmup-only pass above keeps the warmup ones.
             with moe_comm_serving_timeouts():
                 self.run_cuda_graph_warmup(resource_manager)
+        self._warm_inforward_split(resource_manager)
+
+    def _plans_inforward_splits(self, resource_manager: ResourceManager) -> bool:
+        """Whether the KV cache manager plans in-forward Mamba snapshot splits of context chunks."""
+        kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
+        return (
+            isinstance(kv_cache_manager, KVCacheManagerV2)
+            and kv_cache_manager.inforward_snapshot_rows > 0
+        )
+
+    def _warm_inforward_split(self, resource_manager: ResourceManager) -> None:
+        """Run one eager context request with an in-forward Mamba snapshot split, so that the split's kernels
+        (gdn_inforward_split.py) compile before serving where no break-graph capture ran one (prefill CUDA graphs
+        disabled, or no bucket with graphable breaks). Their compiled variants depend only on the model's strides
+        and the persistent split-index buffer, so one batch covers every later split."""
+        if (
+            self._inforward_split_warmed
+            or self.mapping.has_cp_helix()
+            or is_decode_only(self.sparse_attention_config)
+            or not self._plans_inforward_splits(resource_manager)
+        ):
+            return
+        kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
+        # Room for the longest tail after the shortest main part (Mamba2Metadata._warmup_inforward_split_plan).
+        num_tokens = (
+            kv_cache_manager.inforward_snapshot_min_main
+            + kv_cache_manager.inforward_snapshot_max_tail
+        )
+        if num_tokens > self._config.max_num_tokens:
+            return
+        logger.info(f"Running in-forward Mamba snapshot split warmup ({num_tokens} tokens)")
+        with (
+            self.no_cuda_graph(),
+            resolve_mamba_metadata_cls(self.model).inforward_split_for_warmup(),
+        ):
+            warmup_request = self._dummy_requests.create_warmup_request(
+                resource_manager, num_tokens, 0, num_context_requests=1
+            )
+            with self._dummy_requests.release_batch_context(
+                warmup_request, resource_manager
+            ) as batch:
+                self._agreement.assert_all_tp_ranks_have_warmup_batch(batch, num_tokens)
+                if batch is None:
+                    return
+                self.forward_discarded_warmup(
+                    batch,
+                    resource_manager,
+                    enable_spec_decode=self._config.is_spec_decode,
+                    runtime_draft_len=get_static_draft_len(self._config.spec_config),
+                )
+                torch.cuda.synchronize()
+        self._inforward_split_warmed = True
 
     def _prepare_capture_batch(
         self,
@@ -977,15 +1037,11 @@ class DecoderCudaGraphs:
         eager_on_graph) on warmup batches of each _BREAK_GRAPH_NUM_CONTEXTS
         request count, with and without in-forward Mamba snapshot splits when
         the cache manager plans them."""
-        kv_cache_manager = resource_manager.get_resource_manager(
-            ResourceManagerType.KV_CACHE_MANAGER
-        )
         variants = [contextlib.nullcontext]
-        if (
-            isinstance(kv_cache_manager, KVCacheManagerV2)
-            and kv_cache_manager.inforward_snapshot_rows > 0
-        ):
-            variants.append(resolve_mamba_metadata_cls(self.model).inforward_split_for_warmup)
+        split_variant = None
+        if self._plans_inforward_splits(resource_manager):
+            split_variant = resolve_mamba_metadata_cls(self.model).inforward_split_for_warmup
+            variants.append(split_variant)
         for num_contexts in _BREAK_GRAPH_NUM_CONTEXTS:
             for variant in variants:
                 warmup_request = self._dummy_requests.create_warmup_request(
@@ -1007,6 +1063,8 @@ class DecoderCudaGraphs:
                             ),
                             self._warmup_inputs,
                         )
+                    if variant is split_variant:
+                        self._inforward_split_warmed = True
 
     def _capture_prefill_cuda_graphs(self, resource_manager: ResourceManager) -> None:
         """Warm up and capture prefill CUDA graphs, timing each phase separately.

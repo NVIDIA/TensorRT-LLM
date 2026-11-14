@@ -239,6 +239,7 @@ def test_cancelled_admission_releases_event() -> None:
     manager._request_stats_enabled_ids = set()
     manager._fresh_pages_filled = {}
     manager._early_freed_index_requests = set()
+    manager._defer_close_enabled = False  # the default: closes run in free_resources
     manager.impl = Mock()
     manager.index_mapper = Mock()
 

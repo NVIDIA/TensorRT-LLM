@@ -193,8 +193,100 @@ def _dwdp_launch_rules() -> list[dict]:
     ]
 
 
+def _is_set_to(name: str, schema: dict) -> dict:
+    """The mapping sets ``name`` (it is required) to a value that matches ``schema``."""
+    return {"properties": {name: schema}, "required": [name]}
+
+
+def _launch_rules() -> list[dict]:
+    """Top-level ``if``/``then`` rules: DWDP and ``validate_defer_generation_only_release()``.
+
+    ``_dwdp_launch_rules()``, plus ``TorchLlmArgs.validate_defer_generation_only_release()`` (the overlap loop
+    without pipeline parallelism). As there, values the YAML does not set are left to runtime validation.
+    """
+    defer = {"type": "object", **_is_set_to("defer_generation_only_release", {"const": True})}
+    return _dwdp_launch_rules() + [
+        {
+            "if": _is_set_to("kv_cache_config", defer),
+            "then": {
+                "properties": {
+                    "disable_overlap_scheduler": {"not": {"const": True}},
+                    "pipeline_parallel_size": {"maximum": 1},
+                }
+            },
+        }
+    ]
+
+
+def _cross_field_rules(definitions: dict) -> None:
+    """Mirror the model validators of the KV cache, scheduler and attention-DP options.
+
+    They hold only for values the YAML sets; defaults are taken from the models.
+    """
+    from tensorrt_llm.llmapi.llm_args import SchedulerConfig, WaitingQueuePolicy
+
+    def default(model: type, name: str) -> dict:
+        return {"const": model.model_fields[name].default}
+
+    def when(condition: dict, then: dict) -> dict:
+        return {"if": condition, "then": then}
+
+    # RemoteCacheConfig.validate_remote_cache().
+    definitions["RemoteCacheConfig"]["anyOf"] = [
+        {"required": ["donor"], "properties": {"donor": {"type": "object"}}},
+        {"required": ["level"], "properties": {"level": {"type": "object"}}},
+    ]
+    # KvCacheConfig.validate_remote_cache_config() and validate_defer_generation_only_release().
+    kv_v2 = {"properties": {"use_kv_cache_manager_v2": {"not": {"const": False}}}}
+    definitions["KvCacheConfig"].setdefault("allOf", []).extend(
+        [
+            when(_is_set_to("remote_cache_config", {"type": "object"}), kv_v2),
+            when(_is_set_to("defer_generation_only_release", {"const": True}), kv_v2),
+            when(
+                _is_set_to("remote_cache_config", _is_set_to("level", {"type": "object"})),
+                {
+                    "properties": {
+                        "disk_cache_size": {"enum": [0, None]},
+                        "enable_kv_pool_rebalance": {"not": {"const": True}},
+                    }
+                },
+            ),
+        ]
+    )
+    # AttentionDpConfig.validate_attention_dp_config().
+    definitions["AttentionDpConfig"].setdefault("allOf", []).append(
+        when(
+            _is_set_to("kv_cache_routing_home_wait_rounds", {"type": "integer"}),
+            _is_set_to("kv_cache_routing_conversation_affinity", {"const": True}),
+        )
+    )
+    # SchedulerConfig.validate_waiting_queue_max_wait_s().
+    definitions["SchedulerConfig"].setdefault("allOf", []).append(
+        when(
+            {
+                "not": _is_set_to(
+                    "waiting_queue_policy",
+                    {"const": WaitingQueuePolicy.PRIORITY.value},
+                )
+            },
+            {
+                "properties": {
+                    "waiting_queue_max_wait_s": default(SchedulerConfig, "waiting_queue_max_wait_s")
+                }
+            },
+        )
+    )
+
+
 def generate_serve_schema() -> dict:
     """Describe the YAML fragment merged with ordinary serving CLI arguments."""
+    schema = _serve_schema()
+    _cross_field_rules(schema["$defs"])
+    return schema
+
+
+def _serve_schema() -> dict:
+    """The serve schema without ``_cross_field_rules``, so that later merges see unmodified definitions."""
     from tensorrt_llm.llmapi.disagg_utils import DisaggClusterConfig, InternalRequestAuthKey
     from tensorrt_llm.llmapi.llm_args import (
         SERVE_CONFIG_ALIASES,
@@ -293,7 +385,7 @@ def generate_serve_schema() -> dict:
             "type": "null",
             "description": "Live objects require the Python LLM API.",
         }
-    schema["allOf"] = _dwdp_launch_rules()
+    schema["allOf"] = _launch_rules()
     schema["$defs"]["RayPlacementConfig"]["properties"]["placement_groups"] = {"type": "null"}
     user_draft = schema["$defs"]["UserProvidedDecodingConfig"]["properties"]
     user_draft["drafter"] = {"not": {}, "description": "A Drafter requires the Python LLM API."}
@@ -301,6 +393,53 @@ def generate_serve_schema() -> dict:
     # Update this mapping exception when the YAML loader changes legacy DecodingConfig support.
     properties["decoding_config"] = {"type": ["object", "null"]}
     return schema
+
+
+def _router_schema(router_type: dict) -> dict:
+    """A disaggregated server block's ``router`` mapping, with pooled generation dispatch's startup rules.
+
+    Mirrors extract_disagg_cfg() (``max_queue_wait_s`` needs ``max_requests_per_server``), create_router()
+    (pooling needs the ``load_balancing`` type, matched case-insensitively), PooledLoadBalancingRouter (no
+    ``use_tokens``) and SeatPool (seats an integer >= 1, wait > 0). A null value is unset, as at runtime.
+    """
+    pooled_type = "load_balancing"
+    any_case = "".join(f"[{c.lower()}{c.upper()}]" if c.isalpha() else c for c in pooled_type)
+    falsy = [False, None, 0, "", [], {}]
+    return {
+        "type": "object",
+        "properties": {
+            "type": router_type,
+            "max_requests_per_server": {
+                "type": ["integer", "null"],
+                "minimum": 1,
+                "description": "Pooled generation dispatch: requests each generation server runs at once "
+                "(load_balancing generation router only).",
+            },
+            "max_queue_wait_s": {
+                "type": ["number", "null"],
+                "exclusiveMinimum": 0,
+                "description": "Pooled generation dispatch: seconds after which a waiting request goes "
+                "first (needs max_requests_per_server).",
+            },
+        },
+        "additionalProperties": True,
+        "allOf": [
+            {
+                "if": _is_set_to("max_queue_wait_s", {"type": "number"}),
+                "then": _is_set_to("max_requests_per_server", {"type": "integer"}),
+            },
+            {
+                "if": _is_set_to("max_requests_per_server", {"type": "integer"}),
+                "then": {
+                    "properties": {
+                        "type": {"type": "string", "pattern": f"^{any_case}$"},
+                        "use_tokens": {"enum": falsy},
+                    },
+                    "required": ["type"],
+                },
+            },
+        ],
+    }
 
 
 def generate_disagg_schema() -> dict:
@@ -315,7 +454,7 @@ def generate_disagg_schema() -> dict:
     )
     from tensorrt_llm.llmapi.llm_args import SERVE_CLI_CONFIG_FIELDS, TorchLlmArgs
 
-    schema = generate_serve_schema()
+    schema = _serve_schema()
     properties = schema["properties"]
     for config_name, aliases in SERVE_CLI_CONFIG_FIELDS.items():
         config = _schema_for(TorchLlmArgs.model_fields[config_name].annotation, schema)
@@ -326,20 +465,30 @@ def generate_disagg_schema() -> dict:
     worker["properties"].pop("type")
     worker.pop("required", None)
     worker["properties"] = properties | worker["properties"]
-    # YAML flattens router-specific args alongside the shared type field.
-    worker["properties"]["router"] = {
-        "type": "object",
-        "properties": {"type": _schema_for(RouterConfig, schema)["properties"]["type"]},
-        "additionalProperties": True,
-    }
+    # YAML flattens router-specific args alongside the shared type field. Unknown args stay accepted;
+    # the pooled generation dispatch keys are typed.
+    worker["properties"]["router"] = _router_schema(
+        _schema_for(RouterConfig, schema)["properties"]["type"]
+    )
     worker["additionalProperties"] = False
-    worker["allOf"] = _dwdp_launch_rules()
+    worker["allOf"] = _launch_rules()
     schema["$defs"]["DisaggServerBlock"] = worker
 
     orchestrator = _schema_for(extract_disagg_cfg, schema)["properties"]
     # Update these refinements when extract_disagg_cfg() changes its untyped mapping inputs.
     for name in ("context_servers", "generation_servers"):
         orchestrator[name] = _nullable({"$ref": "#/$defs/DisaggServerBlock"})
+    # PooledLoadBalancingRouter refuses the context role.
+    orchestrator["context_servers"]["anyOf"][0] = {
+        "allOf": [
+            {"$ref": "#/$defs/DisaggServerBlock"},
+            {
+                "properties": {
+                    "router": {"properties": {"max_requests_per_server": {"type": "null"}}}
+                }
+            },
+        ]
+    }
     orchestrator["conditional_disagg_config"] = _nullable(
         _schema_for(ConditionalDisaggConfig, schema)
     )
@@ -353,6 +502,14 @@ def generate_disagg_schema() -> dict:
         "maximum": (1 << DISAGG_NODE_ID_BITS) - 1,
     }
     properties.update(orchestrator)
+    # Mirror extract_disagg_cfg(): output-length prediction needs the context-first schedule.
+    schema.setdefault("allOf", []).append(
+        {
+            "if": _is_set_to("output_length_prediction", {"type": "object"}),
+            "then": {"properties": {"schedule_style": {"not": {"const": "generation_first"}}}},
+        }
+    )
+    _cross_field_rules(schema["$defs"])
     return schema
 
 

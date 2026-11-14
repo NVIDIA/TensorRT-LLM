@@ -389,7 +389,7 @@ l0_h100:
   - llmapi/test_llm_api_pytorch_whisper.py::test_whisper_pytorch_feature_combinations[fp16-kv-v2-graphs-off-greedy]
   - examples/test_gpt.py::test_gpt_oss_20b_lora_torch[gpt-oss-20b-lora-adapter_NIM_r8-gpt-oss-20b]
   - unittest/bindings # 8 mins on H100
-  - unittest/kv_cache_manager_v2_tests # 4 min
+  - unittest/kv_cache_manager_v2_tests
   # ------------- KV Cache Iteration Stats ---------------
   - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_cold_start
   - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_partial_block_reuse

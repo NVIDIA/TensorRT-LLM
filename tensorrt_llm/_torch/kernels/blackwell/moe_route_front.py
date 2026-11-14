@@ -1,14 +1,21 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""MoE decode route front above 32 tokens (512 experts, top-10).
+"""MoE decode route front (512 experts, top-10) for DecodeFront's steps above the one-launch front
+(``decode_front.route_front_steps``: from ``ROUTER_MAX_TOKENS + 1`` rows, or from ``FUSED_FRONT_MAX_TOKENS + 1``
+where the model declares the TP decode kernels).
 
-After the stock router GEMM, routing + trtllm-gen pre-routed tables + NVFP4 quantization of the MoE input run in
-one launch of thread-block clusters. :mod:`moe_decode_front` covers M <= 32 with a single routing CTA. Outputs are
+After the router GEMM (the stock one; with the decode kernels, the CuTe router GEMM for ``ROUTER_MAX_TOKENS + 1`` to
+``ROUTER_GEMM_MAX_TOKENS`` rows; constants of ``decode_front``), routing +
+trtllm-gen pre-routed tables + NVFP4 quantization of the MoE input run in one launch of thread-block clusters.
+:mod:`moe_decode_front` covers the smaller steps with a single routing CTA. Outputs are
 bitwise: ids / BF16 weights as :mod:`moe_decode_front`, xq / xsf as ``fp4_quantize`` (linear scale layout), tables
-(``prerouted_table_sizes`` order) as the Triton route kernel's up to the row order inside an expert's block.
+(``prerouted_table_sizes`` order) as the Triton route kernel's up to the row order inside an expert's block. ``lean``
+builds the same tables with a cheaper count exchange and releases its dependent (FC1) at kernel start.
 """
 
 from __future__ import annotations
+
+from typing import Optional, Union
 
 import cutlass
 import cutlass.cute as cute
@@ -98,6 +105,34 @@ def _cluster_arrive_release(*, loc=None, ip=None) -> None:
 @dsl_user_op
 def _cluster_wait_acquire(*, loc=None, ip=None) -> None:
     _asm(None, [], "barrier.cluster.wait.acquire.aligned;", "~{memory}", loc=loc, ip=ip)
+
+
+@dsl_user_op
+def _bulk_push(
+    dst: Int32, mbar: Int32, src: Int32, rank: Int32, nbytes: Int32, *, loc=None, ip=None
+) -> None:
+    """cp.async.bulk of ``nbytes`` from this CTA's shared memory ``src`` to ``dst`` in cluster CTA ``rank``,
+    completing transaction bytes on that CTA's mbarrier ``mbar`` (dst / mbar are this CTA's offsets, mapped)."""
+    _asm(
+        None,
+        [
+            _i32(dst, loc, ip),
+            _i32(mbar, loc, ip),
+            _i32(src, loc, ip),
+            _i32(rank, loc, ip),
+            _i32(nbytes, loc, ip),
+        ],
+        "{\n\t.reg .b32 rd, rb;\n\tmapa.shared::cluster.u32 rd, $0, $3;\n\tmapa.shared::cluster.u32 rb, $1, $3;\n\t"
+        "cp.async.bulk.shared::cluster.shared::cta.mbarrier::complete_tx::bytes [rd], [$2], $4, [rb];\n\t}",
+        "r,r,r,r,r,~{memory}",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _bulk_commit(*, loc=None, ip=None) -> None:
+    _asm(None, [], "cp.async.bulk.commit_group;", "~{memory}", loc=loc, ip=ip)
 
 
 @dsl_user_op
@@ -191,6 +226,52 @@ def _top4of8(a, b):
     return (v0, v1, v2, v3)
 
 
+def _shape_error(
+    *,
+    num_rows: int,
+    k_extent: int,
+    num_experts: int,
+    top_k: int,
+    num_local: int,
+    tile: int,
+    a_stride: int,
+    quant_clusters: int = 7,
+    threads: int = ROUTE_THREADS,
+    cluster: int = ROUTE_CLUSTER,
+    lean: bool = False,
+) -> Optional[str]:
+    """Why :class:`MoeRouteFrontKernel` does not take these arguments, or None."""
+    if threads % 32 or not 256 <= threads <= 1024:
+        return f"threads={threads} must be a multiple of 32 in [256, 1024]"
+    if cluster not in (ROUTE_CLUSTER, ROUTE_CLUSTER_WIDE):
+        return f"cluster={cluster} must be {ROUTE_CLUSTER} or {ROUTE_CLUSTER_WIDE}"
+    max_tpc = 64 if cluster == ROUTE_CLUSTER_WIDE else 32  # token-mask words per expert: 2 / 1
+    if not 1 <= num_rows <= cluster * max_tpc:
+        return f"num_rows={num_rows} must be in [1, {cluster * max_tpc}] with clusters of {cluster}"
+    if top_k != 10:
+        return "the renormalization tree is the route kernel's top-10 tree"
+    if num_experts != 32 * 16:
+        return "one warp per token holds 16 logits per lane: 512 experts"
+    if num_local % 32 or not 32 <= num_local <= min(num_experts, threads):
+        return f"num_local={num_local} must be a multiple of 32 in [32, {threads}]"
+    if tile & (tile - 1) or not 8 <= tile <= 256:
+        return f"tile={tile} must be a power of two in [8, 256]"
+    if k_extent % 16 or a_stride % 8 or a_stride < k_extent:
+        return "x rows must be 16-byte aligned blocks of 16"
+    if quant_clusters < 1:
+        return "at least one quantization cluster"
+    tpc = -(-num_rows // cluster)
+    mw = -(-tpc // 32)
+    if num_local * mw > threads:
+        return "one thread per token-mask word: num_local * ceil(TPC / 32) <= threads"
+    tpw = -(-tpc // (threads // 32))
+    if tpw > 2:
+        return "at most two tokens per warp"
+    if lean and (cluster != ROUTE_CLUSTER or mw != 1 or tpw != 1):
+        return "the lean table build takes clusters of 8 with one token per warp (<= 256 rows)"
+    return None
+
+
 class MoeRouteFrontKernel:
     """Route-only big front: router logits [M, E] BF16 from the stock GEMM -> top-k ids / BF16 weights, the
     trtllm-gen pre-routed tables (``prerouted_table_sizes`` order, token order inside an expert's block) and the
@@ -207,7 +288,20 @@ class MoeRouteFrontKernel:
 
     No CTA waits for another cluster, so nothing needs the clusters co-resident. PDL: everything after
     ``griddepcontrol.wait``; every CTA releases its dependents after a barrier that follows its last global
-    access."""
+    access.
+
+    ``lean`` (clusters of 8, one token per warp): before the dependency wait one thread arms a receive mbarrier for
+    the cluster's count vectors; after routing each CTA bulk-copies its counts into every peer's receive buffer
+    (instead of the cluster barrier + 8 remote loads) and sums the 8 vectors in slot order, the same integer sums.
+    It releases its dependent (FC1) at kernel start: FC1's grid is resident while this kernel runs, and its
+    ``griddepcontrol.wait`` still waits for this grid's completion."""
+
+    @staticmethod
+    def supports(**kw: Union[int, bool]) -> bool:
+        """Whether the constructor takes these keyword arguments (``use_pdl`` aside): ``__init__``'s integer shape
+        arguments and its ``lean`` / ``use_pdl`` flags."""
+        kw.pop("use_pdl", None)
+        return _shape_error(**kw) is None
 
     def __init__(
         self,
@@ -223,28 +317,23 @@ class MoeRouteFrontKernel:
         quant_clusters: int = 7,
         threads: int = ROUTE_THREADS,
         cluster: int = ROUTE_CLUSTER,
+        lean: bool = False,
     ) -> None:
-        if threads % 32 or not 256 <= threads <= 1024:
-            raise ValueError(f"threads={threads} must be a multiple of 32 in [256, 1024]")
-        if cluster not in (ROUTE_CLUSTER, ROUTE_CLUSTER_WIDE):
-            raise ValueError(f"cluster={cluster} must be {ROUTE_CLUSTER} or {ROUTE_CLUSTER_WIDE}")
-        max_tpc = 64 if cluster == ROUTE_CLUSTER_WIDE else 32  # token-mask words per expert: 2 / 1
-        if not 1 <= num_rows <= cluster * max_tpc:
-            raise ValueError(
-                f"num_rows={num_rows} must be in [1, {cluster * max_tpc}] with clusters of {cluster}"
-            )
-        if top_k != 10:
-            raise ValueError("the renormalization tree is the route kernel's top-10 tree")
-        if num_experts != 32 * 16:
-            raise ValueError("one warp per token holds 16 logits per lane: 512 experts")
-        if num_local % 32 or not 32 <= num_local <= min(num_experts, threads):
-            raise ValueError(f"num_local={num_local} must be a multiple of 32 in [32, {threads}]")
-        if tile & (tile - 1) or not 8 <= tile <= 256:
-            raise ValueError(f"tile={tile} must be a power of two in [8, 256]")
-        if k_extent % 16 or a_stride % 8 or a_stride < k_extent:
-            raise ValueError("x rows must be 16-byte aligned blocks of 16")
-        if quant_clusters < 1:
-            raise ValueError("at least one quantization cluster")
+        err = _shape_error(
+            num_rows=num_rows,
+            k_extent=k_extent,
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local=num_local,
+            tile=tile,
+            a_stride=a_stride,
+            quant_clusters=quant_clusters,
+            threads=threads,
+            cluster=cluster,
+            lean=lean,
+        )
+        if err is not None:
+            raise ValueError(err)
         self.num_rows = num_rows
         self.k_extent = k_extent
         self.num_experts = num_experts
@@ -257,14 +346,8 @@ class MoeRouteFrontKernel:
         self.cluster = cluster
         self.tpc = -(-num_rows // cluster)
         self.mw = -(-self.tpc // 32)  # token-mask words per expert (TPC > 32: two)
-        if num_local * self.mw > threads:
-            raise ValueError(
-                "one thread per token-mask word: num_local * ceil(TPC / 32) <= threads"
-            )
         self.warps = threads // 32
         self.tpw = -(-self.tpc // self.warps)
-        if self.tpw > 2:
-            raise ValueError("at most two tokens per warp")
         self.quant_clusters = quant_clusters
         self.ctas = cluster * (1 + quant_clusters)
         self.q_ctas = cluster * quant_clusters
@@ -289,6 +372,13 @@ class MoeRouteFrontKernel:
         self.o_wsum = (mw + 4) * nl
         self.o_pick = (mw + 4) * nl + 32
         self.smem_words = self.o_pick + self.tpc * top_k + 16
+        self.lean = lean
+        if lean:
+            # receive buffer: cluster x num_local count words (16-byte aligned), then the mbarrier (8-byte aligned)
+            self.o_rbuf = -(-self.smem_words // 4) * 4
+            self.o_mbar = self.o_rbuf + self.cluster * self.num_local
+            self.smem_words = self.o_mbar + 4
+            self.cnt_bytes = self.num_local * 4
 
     @cute.jit
     def __call__(
@@ -339,13 +429,41 @@ class MoeRouteFrontKernel:
     ) -> None:
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
-        smem = _SmemAllocator()
-        buf = smem.allocate_tensor(Int32, cute.make_layout((self.smem_words,)), byte_alignment=16)
-        base = _smem_addr(buf.iterator)
-        if bidx < self.cluster:
-            self._route_cta(logits_ptr, ids_ptr, wts_ptr, tab_ptr, local_start, base, bidx, tidx)
+        if const_expr(self.lean):
+            if const_expr(self.use_pdl):
+                _gdc_launch()
+            smem = _SmemAllocator()
+            # the word buffer (everything up to o_mbar), then the mbarrier in its own 8-byte allocation; smem_words
+            # counts 4 words for it, so the launch's shared-memory size covers both
+            buf = smem.allocate_tensor(Int32, cute.make_layout((self.o_mbar,)), byte_alignment=16)
+            mbar = smem.allocate_tensor(Int64, cute.make_layout((1,)), byte_alignment=8)
+            base = _smem_addr(buf.iterator)
+            if bidx < self.cluster:
+                self._route_cta_lean(
+                    logits_ptr,
+                    ids_ptr,
+                    wts_ptr,
+                    tab_ptr,
+                    local_start,
+                    mbar.iterator,
+                    base,
+                    bidx,
+                    tidx,
+                )
+            else:
+                self._quant_cta(x_ptr, gs_ptr, xq_ptr, xsf_ptr, bidx - self.cluster, tidx)
         else:
-            self._quant_cta(x_ptr, gs_ptr, xq_ptr, xsf_ptr, bidx - self.cluster, tidx)
+            smem = _SmemAllocator()
+            buf = smem.allocate_tensor(
+                Int32, cute.make_layout((self.smem_words,)), byte_alignment=16
+            )
+            base = _smem_addr(buf.iterator)
+            if bidx < self.cluster:
+                self._route_cta(
+                    logits_ptr, ids_ptr, wts_ptr, tab_ptr, local_start, base, bidx, tidx
+                )
+            else:
+                self._quant_cta(x_ptr, gs_ptr, xq_ptr, xsf_ptr, bidx - self.cluster, tidx)
 
     @cute.jit
     def _quant_cta(
@@ -523,6 +641,148 @@ class MoeRouteFrontKernel:
                     tab_ptr + (Int64(tok) * Int64(top_k) + Int64(i - tl * top_k)) * Int64(4), perm
                 )
         _cluster_wait_acquire()  # every peer has read this CTA's counts
+        cute.arch.sync_threads()
+        if const_expr(self.use_pdl):
+            _gdc_launch()
+
+    @cute.jit
+    def _route_cta_lean(
+        self,
+        logits_ptr: Int64,
+        ids_ptr: Int64,
+        wts_ptr: Int64,
+        tab_ptr: Int64,
+        local_start: Int32,
+        mbar_ptr: cute.Pointer,
+        base: Int32,
+        c,
+        tidx,
+    ) -> None:
+        num_local: cutlass.Constexpr = self.num_local
+        top_k: cutlass.Constexpr = self.top_k
+        tile: cutlass.Constexpr = self.tile
+        tpc: cutlass.Constexpr = self.tpc
+        cluster: cutlass.Constexpr = self.cluster
+        cnt_bytes: cutlass.Constexpr = self.cnt_bytes
+        warp = tidx // 32
+        lane = tidx % 32
+        smask = base + Int32(self.o_mask * 4)
+        scnt = base + Int32(self.o_cnt * 4)
+        spre = base + Int32(self.o_pre * 4)
+        stot = base + Int32(self.o_tot * 4)
+        soffs = base + Int32(self.o_offs * 4)
+        swsum = base + Int32(self.o_wsum * 4)
+        spick = base + Int32(self.o_pick * 4)
+        srbuf = base + Int32(self.o_rbuf * 4)
+        smbar = _smem_addr(mbar_ptr)
+        if tidx < num_local:
+            _st_shared(smask + tidx * 4, Int32(0))
+        # The receive mbarrier, before the dependency wait: off the critical path while the router GEMM runs.
+        if warp == 0:
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_init(mbar_ptr, 1)
+                cute.arch.mbarrier_arrive_and_expect_tx(mbar_ptr, cluster * cnt_bytes)
+            cute.arch.mbarrier_init_fence()
+        _cluster_arrive_release()  # peers copy into this CTA only after the matching wait below
+        # this CTA's tokens [c TPC, c TPC + n_tok)
+        t_first = c * tpc
+        n_tok = cutlass.min(Int32(tpc), Int32(self.num_rows) - t_first)
+        if const_expr(self.use_pdl):
+            _gdc_wait()
+        cute.arch.sync_threads()
+        my_sel = Int32(0)
+        my_w = Int32(0)
+        if warp < n_tok:
+            my_sel, my_w = self._route_warp_fast(
+                logits_ptr, local_start, smask, spick, t_first, warp, lane
+            )
+        cute.arch.sync_threads()
+        if tidx < num_local:
+            _st_shared(scnt + tidx * 4, _popc(_ld_shared(smask + tidx * 4)))
+        # Every peer's mbarrier is initialized (they all arrived at their start); the counts are written by generic
+        # stores and read by the bulk-copy (async) proxy.
+        _cluster_wait_acquire()
+        cute.arch.fence_proxy("async.shared", space="cta")
+        cute.arch.sync_threads()
+        if warp == 0:
+            with cute.arch.elect_one():
+                for k in cutlass.range_constexpr(cluster):
+                    _bulk_push(
+                        srbuf + c * Int32(cnt_bytes), smbar, scnt, Int32(k), Int32(cnt_bytes)
+                    )
+                _bulk_commit()
+        if warp < n_tok:
+            if lane < top_k:
+                o = Int64(t_first + warp) * Int64(top_k) + Int64(lane)
+                _st_b32(ids_ptr + o * Int64(4), my_sel)
+                _st_b16(wts_ptr + o * Int64(2), my_w)
+        cute.arch.mbarrier_wait(mbar_ptr, 0)
+        _cluster_arrive_relaxed()  # this CTA's counts have arrived (waited at the end)
+        tot = Int32(0)
+        nct = Int32(0)
+        e = tidx
+        if e < num_local:
+            cnts = []
+            for k in cutlass.range_constexpr(cluster):
+                cnts.append(_ld_shared(srbuf + (Int32(k * num_local) + e) * 4))
+            pre = Int32(0)
+            for k in cutlass.range_constexpr(cluster):
+                tot = tot + cnts[k]
+                pre = pre + _sel_lt(Int32(k), c, cnts[k], Int32(0))
+            _st_shared(spre + e * 4, pre)
+            _st_shared(stot + e * 4, tot)
+            nct = (tot + Int32(tile - 1)) // Int32(tile)
+        # Exclusive scan of the per-expert CTA counts (one expert per thread): as _route_cta.
+        incl = nct
+        for d in cutlass.range_constexpr(5):
+            incl = _scan_add(incl, 1 << d)
+        if lane == 31:
+            _st_shared(swsum + warp * 4, incl)
+        cute.arch.sync_threads()
+        n_warps_exp: cutlass.Constexpr = -(-num_local // 32)
+        wpre = Int32(0)
+        total = Int32(0)
+        for w in cutlass.range_constexpr(n_warps_exp):
+            ws = _ld_shared(swsum + w * 4)
+            wpre = wpre + _sel_lt(Int32(w), warp, ws, Int32(0))
+            total = total + ws
+        offs = incl - nct + wpre
+        if e < num_local:
+            _st_shared(soffs + e * 4, offs)
+            if c == 0:
+                for cc in cutlass.range_constexpr(self.max_ctas_per_expert):
+                    if Int32(cc) < nct:
+                        cta_i = offs + Int32(cc)
+                        _st_b32(tab_ptr + Int64(self.off_cte + cta_i) * Int64(4), e)
+                        _st_b32(
+                            tab_ptr + Int64(self.off_ctl + cta_i) * Int64(4),
+                            cutlass.min((cta_i + 1) * Int32(tile), offs * Int32(tile) + tot),
+                        )
+        if c == 0:
+            if tidx == 0:
+                _st_b32(tab_ptr + Int64(self.off_nct) * Int64(4), total)
+                _st_b32(tab_ptr + Int64(self.off_npd) * Int64(4), total * Int32(tile))
+        cute.arch.sync_threads()
+        # This CTA's picks: expanded -> permuted, permuted -> token (token order inside a block): as _route_cta.
+        for u in cutlass.range_constexpr(-(-(tpc * top_k) // self.threads)):
+            i = tidx + u * self.threads
+            if i < n_tok * top_k:
+                tl = i // top_k
+                tok = t_first + tl
+                pick = _ld_shared(spick + i * 4)
+                perm = Int32(-1)
+                if pick >= Int32(0):
+                    rank = _ld_shared(spre + pick * 4) + _popc(
+                        _ld_shared(smask + pick * 4) & _below(tl)
+                    )
+                    perm = _ld_shared(soffs + pick * 4) * Int32(tile) + rank
+                    _st_b32(tab_ptr + Int64(self.off_p2t + perm) * Int64(4), tok)
+                _st_b32(
+                    tab_ptr + (Int64(tok) * Int64(top_k) + Int64(i - tl * top_k)) * Int64(4), perm
+                )
+        # Every peer received this CTA's counts, so no outgoing copy still reads them (the bulk wait_group does not
+        # track copies that complete on an mbarrier).
+        _cluster_wait_acquire()
         cute.arch.sync_threads()
         if const_expr(self.use_pdl):
             _gdc_launch()

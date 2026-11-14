@@ -35,6 +35,7 @@ aux_stream_name_list = [
     'MlaIndexerAux',
     'MlaCompressor',
     'MoeSharedGate',
+    'MoeExpertPrefetch',
 ]
 AuxStreamType = Enum(
     'AuxStreamType',

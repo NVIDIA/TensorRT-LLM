@@ -863,6 +863,9 @@ class DecoderInputPreparer:
             and self._steady_gen_cache_supported
             and not self.mapping.has_cp_helix()
         ):
+            stage_rng = False
+            if self.runtime_hooks.pack_spec_rng_uploads:
+                stage_rng = True
             self._steady_mtp = SteadyMtpPrepare(
                 max_batch_size=self._config.max_batch_size,
                 max_num_tokens=self._config.max_num_tokens,
@@ -871,6 +874,7 @@ class DecoderInputPreparer:
                 ),
                 use_mrope=self._config.use_mrope,
                 has_static_inputs=cuda_graph_runner is not None and cuda_graph_runner.enabled,
+                stage_rng=stage_rng,
             )
 
     def _can_use_steady_mtp_fast_prepare(
@@ -928,8 +932,32 @@ class DecoderInputPreparer:
         requests = scheduled_requests.generation_requests
         num_requests = len(requests)
         num_tokens = num_requests * record.tokens_per_step
+        rng_state = None
+        rng_rows = steady_mtp.rng_rows()
+        sampling_populated = False
+        if rng_rows is not None and scheduled_requests.num_context_requests == 0:
+            # Populate the sampling parameters before staging, so that the staging kernel writes this step's
+            # Philox state from the host's values instead of four uploads on the stream after it.
+            rng_state = spec_metadata.populate_sampling_params_for_one_model(
+                scheduled_requests.all_requests(), defer_rng_rows=rng_rows
+            )
+            sampling_populated = True
         num_cached_tokens_per_seq, kv_lens, static_inputs_staged = steady_mtp.stage(
-            requests, new_tensors_device, self._buffers, attn_metadata
+            requests,
+            new_tensors_device,
+            self._buffers,
+            attn_metadata,
+            rng_state=rng_state,
+            rng_buffers=(
+                (
+                    spec_metadata.request_seeds,
+                    spec_metadata.request_offsets,
+                    spec_metadata.seeds,
+                    spec_metadata.offsets,
+                )
+                if rng_state is not None
+                else None
+            ),
         )
 
         attn_metadata.beam_width = 1
@@ -959,7 +987,8 @@ class DecoderInputPreparer:
         spec_metadata.gather_ids = self._buffers.gather_ids_cuda[:num_tokens]
         # The positions are written on the device only.
         spec_metadata.host_position_ids = None
-        spec_metadata.populate_sampling_params_for_one_model(scheduled_requests.all_requests())
+        if not sampling_populated:
+            spec_metadata.populate_sampling_params_for_one_model(scheduled_requests.all_requests())
         spec_metadata.prepare()
 
         inputs = self.model_inputs(attn_metadata, resource_manager, virtual_num_tokens, [])

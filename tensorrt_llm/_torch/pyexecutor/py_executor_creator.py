@@ -1395,56 +1395,65 @@ def _create_py_executor(
     model_engine.set_warmup_purpose(
         "memory_profiling" if estimating_kv_cache else "final_executor")
 
-    with allocation_scope(
-            ExecutorMemoryType.INIT_EXTRA_RESOURCES
-            if estimating_kv_cache else ExecutorMemoryType.EXTRA_RESOURCES):
-        # Reclaim unreachable allocations before warmup.
-        gc.collect()
-        py_executor = create_py_executor_instance(
-            dist=dist,
-            resources=resources,
-            mapping=mapping,
-            llm_args=llm_args,
-            ctx_chunk_config=_branch_snapshot_ctx_chunk_config(
-                ctx_chunk_config,
-                resources.get(ResourceManagerType.KV_CACHE_MANAGER),
-                tokens_per_block, scheduler_config.context_chunking_policy),
-            model_engine=model_engine,
-            start_worker=False,
-            sampler=sampler,
-            drafter=drafter,
-            guided_decoder=guided_decoder,
-            capturable_guided_decoder=capturable_guided_decoder,
-            lora_config=lora_config,
-            garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
-            kv_connector_manager=kv_connector_manager
-            if not estimating_kv_cache else None,
-            resource_governor_queue=resource_governor_queue,
-            max_seq_len=net_max_seq_len,
-            max_batch_size=max_batch_size,
-            max_beam_width=max_beam_width,
-            max_num_tokens=max_num_tokens,
-            peft_cache_config=peft_cache_config,
-            scheduler_config=scheduler_config,
-            cache_transceiver_config=cache_transceiver_config,
-            transfer_budget_is_explicit=transfer_budget_is_explicit,
-            virtual_memory_pools=vm_pools if not estimating_kv_cache else None,
-            execution_stream=execution_stream,
-            # Without the KV-cache estimation the executor serves from its
-            # construction: it gets the DWDP manager or the standalone dense
-            # DWDP manager now, primes it and exits it at shutdown. With the
-            # estimation only the serving phase gets it (rebind_resources
-            # below), since release_resources() exits the managers the
-            # executor holds.
-            dwdp_manager=dwdp_manager if not estimating_kv_cache else None,
-            dense_dwdp_manager=dense_dwdp_manager
-            if not estimating_kv_cache else None,
-            max_num_sequences=max_num_seq_slots,
-        )
+    try:
+        with allocation_scope(
+                ExecutorMemoryType.INIT_EXTRA_RESOURCES
+                if estimating_kv_cache else ExecutorMemoryType.EXTRA_RESOURCES):
+            # Reclaim unreachable allocations before warmup.
+            gc.collect()
+            py_executor = create_py_executor_instance(
+                dist=dist,
+                resources=resources,
+                mapping=mapping,
+                llm_args=llm_args,
+                ctx_chunk_config=_branch_snapshot_ctx_chunk_config(
+                    ctx_chunk_config,
+                    resources.get(ResourceManagerType.KV_CACHE_MANAGER),
+                    tokens_per_block, scheduler_config.context_chunking_policy),
+                model_engine=model_engine,
+                start_worker=False,
+                sampler=sampler,
+                drafter=drafter,
+                guided_decoder=guided_decoder,
+                capturable_guided_decoder=capturable_guided_decoder,
+                lora_config=lora_config,
+                garbage_collection_gen0_threshold=
+                garbage_collection_gen0_threshold,
+                kv_connector_manager=kv_connector_manager
+                if not estimating_kv_cache else None,
+                resource_governor_queue=resource_governor_queue,
+                max_seq_len=net_max_seq_len,
+                max_batch_size=max_batch_size,
+                max_beam_width=max_beam_width,
+                max_num_tokens=max_num_tokens,
+                peft_cache_config=peft_cache_config,
+                scheduler_config=scheduler_config,
+                cache_transceiver_config=cache_transceiver_config,
+                transfer_budget_is_explicit=transfer_budget_is_explicit,
+                virtual_memory_pools=vm_pools
+                if not estimating_kv_cache else None,
+                execution_stream=execution_stream,
+                # Without the KV-cache estimation the executor serves from its
+                # construction: it gets the DWDP manager or the standalone dense
+                # DWDP manager now, primes it and exits it at shutdown. With the
+                # estimation only the serving phase gets it (rebind_resources
+                # below), since release_resources() exits the managers the
+                # executor holds.
+                dwdp_manager=dwdp_manager if not estimating_kv_cache else None,
+                dense_dwdp_manager=dense_dwdp_manager
+                if not estimating_kv_cache else None,
+                max_num_sequences=max_num_seq_slots,
+            )
 
-        # Originally, peft_cache_config might be mutated inside
-        # create_py_executor_instance. Restore it here.
-        peft_cache_config = py_executor.peft_cache_config
+            # Originally, peft_cache_config might be mutated inside
+            # create_py_executor_instance. Restore it here.
+            peft_cache_config = py_executor.peft_cache_config
+    except BaseException as error:
+        # A failed warmup or capture leaves the donation with no owner that
+        # would withdraw it before exit.
+        if kv_cache_creator is not None:
+            kv_cache_creator.close_remote_donor(error)
+        raise
 
     if estimating_kv_cache:
         try:
@@ -1501,7 +1510,9 @@ def _create_py_executor(
                     max_num_sequences=max_num_seq_slots,
                 )
                 py_executor.rebind_resources(execution_resources)
-        except BaseException:
+        except BaseException as error:
+            # Also past the final build, whose target manager's shutdown would withdraw the donation unmarked.
+            kv_cache_creator.close_remote_donor(error)
             py_executor.shutdown()
             raise
 

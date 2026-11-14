@@ -337,7 +337,10 @@ full arena capacity alongside the profiled peak: a decode arena may first be
 allocated after peak prefill, so its final retained bytes cannot safely be
 subtracted from that earlier peak.
 The attended-KV admission cap applies to the prefix gather, independently of
-the fixed graph arena. Projection, native/provider scratch and transient logits
+the fixed graph arena. The attention-DP minimum-KV-split scratch of
+`fmha/gqa_decode.py` needs no declaration: it is sized by the largest
+generation CUDA-graph batch, which graph warmup runs before KV-cache sizing,
+and larger eager batches keep FlashInfer's split heuristic. Projection, native/provider scratch and transient logits
 still require representative peak-memory profiling.
 
 ### 2.4 Capability reference
@@ -533,6 +536,28 @@ silently drop the routing semantics. Likewise a generation call whose
 QK-norm / RoPE / KV-append prologue the attention module deferred
 (`AttentionForwardArgs.kv_append.fold`, query = raw QKV projection) reaches only
 libraries that declare `supports_deferred_prologue`.
+
+Two per-forward arguments and one layer field let a library return less than
+a full BF16 `output`; callers that set them must read the result accordingly:
+
+- `output_gate`: a library that multiplies `sigmoid(gate)` into the output sets
+  `output_gate_applied`; otherwise the caller applies the gate.
+- `gated_out_scale` / `output_fp8` (offered only with `output_gate`): a library
+  that applies the gate may write the gated output as E4M3 at o_proj's static
+  input scale into `output_fp8` and leave `output` unwritten. The caller then
+  feeds `output_fp8` to o_proj; `output` holds stale data.
+- `context_last_rows_only` (a `TrtllmAttention` field the model sets, e.g. the
+  Qwen3.5 MTP layer): in a context-only step `FlashInferTrtllmGenFmha` computes
+  only each request's last output row, against the full KV, and writes zeros to
+  the other rows; every row's K / V is still appended. Mixed steps run the full
+  call.
+
+`trtllm::fmha_paged_context_fp8` (the stage-KV context path of
+`FlashInferTrtllmGenFmha`, `context_fmha_head_dim_per_stage_kv > 0`) runs only
+a precompiled kernel: when the config the runner selects for the call has no
+cubin, the op returns `False` without launching and the library runs
+FlashInfer's kernel, so no step compiles with NVRTC.
+
 For mixed non-MLA batches, the manager checks each active phase
 independently with `is_supported(..., phase=...)`; a phased library accepts only
 phases backed by its corresponding `run_*()` entry point.

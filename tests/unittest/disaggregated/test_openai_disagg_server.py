@@ -49,6 +49,7 @@ async def test_server_keep_alive_timeout_is_passed_to_uvicorn(
     )
     server = object.__new__(OpenAIDisaggServer)
     server._config = config
+    server._coordinator = None
     server.app = object()
 
     uvicorn_config = object()
@@ -63,6 +64,38 @@ async def test_server_keep_alive_timeout_is_passed_to_uvicorn(
     assert config_factory.call_args.kwargs["timeout_keep_alive"] == expected_timeout
     server_factory.assert_called_once_with(uvicorn_config)
     uvicorn_server.serve.assert_awaited_once_with(sockets=None)
+
+
+@pytest.mark.asyncio
+async def test_single_process_server_fails_seat_waiters_when_shutdown_begins(tmp_path, monkeypatch):
+    """Graceful shutdown waits for parked selects; they must fail at once, as in a fleet."""
+    import asyncio
+
+    from test_common.serve.app_factory import DisaggConfig, isolated_serve_env
+
+    with isolated_serve_env(tmp_path) as env:
+        server = env.build_disagg_server(DisaggConfig())
+        fail = AsyncMock()
+        monkeypatch.setattr(server._coordinator, "fail_seat_waiters", fail)
+        uvicorn_server = SimpleNamespace(should_exit=False)
+
+        async def serve(sockets=None):
+            await asyncio.sleep(0.3)
+            assert fail.await_count == 0
+            uvicorn_server.should_exit = True  # what SIGINT / SIGTERM do
+            # uvicorn now drains the requests in flight, parked selects included.
+            for _ in range(100):
+                if fail.await_count:
+                    break
+                await asyncio.sleep(0.02)
+
+        uvicorn_server.serve = serve
+        monkeypatch.setattr(openai_disagg_server.uvicorn, "Config", Mock())
+        monkeypatch.setattr(
+            openai_disagg_server, "create_uvicorn_server", Mock(return_value=uvicorn_server)
+        )
+        await asyncio.wait_for(server(host="127.0.0.1", port=0), timeout=10)
+        fail.assert_awaited_once()
 
 
 @pytest.mark.asyncio

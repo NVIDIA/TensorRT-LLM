@@ -52,8 +52,9 @@ l0_gb300_multi_gpus:
   # kernels/parallel_hw_agnostic/ run here too, although l0_b200 and l0_b300 ignore that
   # directory: an --ignore would change this entry's text, which agg_unit_mem_df.csv
   # matches to set its parallelism. This post_merge stage is the only Blackwell stage that
-  # runs them.
-  - unittest/_torch/attention TIMEOUT (120)
+  # runs them. multi_gpu/test_gqa_kv_replica.py runs in l0_gb300's pre_merge block instead;
+  # --ignore arguments do not change the CSV key (test_unittests.py _parallel_config_key).
+  - unittest/_torch/attention --ignore=unittest/_torch/attention/multi_gpu/test_gqa_kv_replica.py TIMEOUT (120)
   - unittest/_torch/moe/kernels/parallel
   - unittest/_torch/kernels/parallel
   - unittest/_torch/visual_gen/kernels/parallel
@@ -83,9 +84,6 @@ l0_gb300_multi_gpus:
   # ------------- MoE components tests ---------------
   - unittest/_torch/moe/test_moe_load_balancer.py
   - unittest/_torch/moe/test_moe_routing.py
-  # MNNVL all-reduce + residual RMSNorm kernels (slot / two-shot / MoE fold / GEMM) and the LL TP exchanges.
-  - unittest/_torch/multi_gpu/test_mnnvl_fused_allreduce_norm.py
-  - unittest/_torch/multi_gpu/test_ll_exchange.py
   - unittest/_torch/modeling -k "modeling_llama"
   - unittest/_torch/modeling -k "modeling_gpt_oss"
   # Muse Spark Open's fused expert finalize + TP4 all-reduce over CUDA IPC; each

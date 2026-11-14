@@ -723,20 +723,30 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<std::vector<L
             streamWaitEvents(reinterpret_cast<CudaStream>(cudaStream()), std::move(scratchReadyEvents));
     }
 
-    try
-    {
-        activate();
-    }
-    catch (OutOfPagesError const&)
+    auto const releaseDeferredSlots = [&]()
     {
         for (LifeCycleId lc{0}; lc < numLc; ++lc)
         {
             if (deferredSlots[lc].has_value())
                 storageMgr.releaseSlot(lc, kHotLevel, std::move(*deferredSlots[lc]));
         }
+    };
+    try
+    {
+        activate();
+    }
+    catch (OutOfPagesError const&)
+    {
+        releaseDeferredSlots();
         // Scratch slots stay in mScratchSlots — they'll be freed by close() inside
         // a recordEventScope, matching Python behavior.
         return false;
+    }
+    catch (...)
+    {
+        // E.g. a RemoteMemError reading pages back: the same rollback, then the error.
+        releaseDeferredSlots();
+        throw;
     }
 
     // Private recovery pages have no reusable source. Their contents are
@@ -1356,10 +1366,33 @@ CommittedPage* KvCache::_copyPageToTreeBlock(
         {
             continue;
         }
+        catch (RemoteMemError const&)
+        {
+            continue; // a failed remote level holds no snapshot either
+        }
 
         CUstream stream = cudaStream();
         newSlot.readyEvent.waitInStream(reinterpret_cast<CudaStream>(stream));
-        storageMgr.copySlotData(lcIdx, lvl, srcPage->cacheLevel, newSlot.slotId(), srcPage->slotId(), stream);
+        auto const releaseNewSlot = [&]()
+        {
+            // Whatever the copy enqueued finishes before the slot is reused.
+            newSlot.readyEvent = CachedCudaEvent(reinterpret_cast<CudaStream>(stream));
+            storageMgr.releaseSlot(lcIdx, lvl, std::move(newSlot));
+        };
+        try
+        {
+            storageMgr.copySlotData(lcIdx, lvl, srcPage->cacheLevel, newSlot.slotId(), srcPage->slotId(), stream);
+        }
+        catch (RemoteMemError const&)
+        {
+            releaseNewSlot();
+            continue; // the snapshot is optional: a failed remote level holds none, as for the allocation above
+        }
+        catch (...)
+        {
+            releaseNewSlot();
+            throw;
+        }
 
         newSlot.readyEvent = CachedCudaEvent(reinterpret_cast<CudaStream>(stream));
         auto committed = makeShared<CommittedPage>(
@@ -1743,6 +1776,13 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
                 _recoverExcessScratchSlots(excessScratchSlots);
                 _lockHeldBlocks(backupHolders);
                 return false;
+            }
+            catch (...)
+            {
+                // E.g. a RemoteMemError evicting to a remote level: the same rollback, then the error.
+                _recoverExcessScratchSlots(excessScratchSlots);
+                _lockHeldBlocks(backupHolders);
+                throw;
             }
         }
         else
@@ -2363,6 +2403,46 @@ void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
                 existingPage = nullptr;
             }
             bool isLocked = std::holds_alternative<SharedPageLock>(bp);
+            if (existingPage != nullptr && existingPage->cacheLevel != kHotLevel
+                && mManager->storage().hasRemoteLevel())
+            {
+                // The tree's copy is cold and ours, with the same tokens, is on the GPU: ours supersedes it. Moving the
+                // copy back would read it and take a GPU slot whose eviction can reach the remote level, synchronous
+                // transfers either way. A request still holding the cold copy keeps it until it lets go.
+                if (auto* lock = std::get_if<SharedPageLock>(&bp))
+                {
+                    auto up = dynamicPointerCast<UncommittedPage>(lock->page());
+                    if (up && up->cacheLevel == kHotLevel)
+                    {
+                        CacheLevel const coldLevel = existingPage->cacheLevel;
+                        auto* superseded = newBlock->unlinkPage(lc, existingPage);
+                        existingPage = nullptr;
+                        // Kept until ours took over its retention, as reusing it would have kept it.
+                        SharedPtr<Page> const supersededPage
+                            = superseded != nullptr ? superseded->sharedFromThis() : SharedPtr<Page>{};
+                        if (superseded != nullptr && superseded->scheduledForEviction())
+                        {
+                            superseded->manager->excludeFromEviction(*superseded);
+                        }
+                        bp = std::monostate{};
+                        auto committed
+                            = up->convertToCommitted(newBlock, finishEvent(), numTokens, supersededPage.get());
+                        if (newBlock->eventSink)
+                        {
+                            newBlock->eventSink->addCacheLevelUpdated(newBlock->key, coldLevel, kHotLevel, lc);
+                        }
+                        bp = BlockPage{committed->lock(*this, kDefaultBeamIndex, static_cast<BlockOrdinal>(ord), lc)};
+                        continue;
+                    }
+                }
+                else if (_getStaleRange(mHistoryLength, mManager->lifeCycles()[lc]).contains(BlockOrdinal{ord}))
+                {
+                    // A stale block's page is held only to be committed, and the tree has a copy: ours is dropped.
+                    // Locking that copy would read it back, a transfer the stale clear below then throws away.
+                    bp = std::monostate{};
+                    continue;
+                }
+            }
             if (existingPage == nullptr)
             {
                 // Existing page gone — put our uncommitted page into the tree block.
