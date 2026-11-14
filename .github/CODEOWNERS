@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # ============================================================================
 # PRECEDENCE: last matching pattern wins. In order: fallback, module rules,
-# file-level exceptions, disagg co-owns, compatibility forwarding modules,
-# governance/legal gates, then scoped exceptions.
+# file-level exceptions, disagg co-owns, governance/legal gates, then scoped
+# exceptions.
 #
 #   Domain (in file order)   Handle
 #   Engineering baseline/ fallback / untriaged     @NVIDIA/trt-llm-devs   (global `*`, declared FIRST; incl. deprecating TRT backend)
@@ -424,23 +424,6 @@
 /tensorrt_llm/_torch/pyexecutor/disagg_adapter.py @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-disagg-devs
 /tensorrt_llm/_torch/pyexecutor/model_engine.py @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-disagg-devs
 /tensorrt_llm/_torch/pyexecutor/engine/ @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-disagg-devs
-
-# ===== COMPATIBILITY FORWARDING MODULES =====
-# Definition-free re-export modules left at a retired import path so external
-# callers keep working through the migration window (Epic TRTLLM-14558).  Each
-# one is owned by the owners of the module it forwards to; a forwarding module
-# whose surrounding rules already give it those owners is not listed.  Removed
-# together with the modules themselves.
-/tensorrt_llm/_torch/attention_backend/__init__.py @NVIDIA/trt-llm-torch-attention-devs
-/tensorrt_llm/_torch/modules/attention.py @NVIDIA/trt-llm-torch-attention-devs
-/tensorrt_llm/_torch/visual_gen/attention_backend/__init__.py @NVIDIA/trt-llm-torch-attention-devs @NVIDIA/trt-llm-torch-visual-gen-devs
-/tensorrt_llm/_torch/visual_gen/modules/attention.py @NVIDIA/trt-llm-torch-attention-devs @NVIDIA/trt-llm-torch-visual-gen-devs
-/tensorrt_llm/_ray_utils.py @NVIDIA/trt-llm-runtime-devs
-/tensorrt_llm/lora_helper.py @NVIDIA/trt-llm-runtime-devs
-/tensorrt_llm/lora_manager.py @NVIDIA/trt-llm-runtime-devs
-/tensorrt_llm/prompt_adapter_manager.py @NVIDIA/trt-llm-runtime-devs
-/tensorrt_llm/ray_stub.py @NVIDIA/trt-llm-runtime-devs
-/tensorrt_llm/serialization.py @NVIDIA/trt-llm-runtime-devs
 
 # ===== GOVERNANCE / LEGAL GATES =====
 /.github/CODEOWNERS @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
