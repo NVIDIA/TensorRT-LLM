@@ -6,6 +6,7 @@ import collections
 import contextlib
 import unittest
 from collections.abc import Iterator
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, call, patch
 
@@ -407,6 +408,159 @@ def test_dynamic_warmup_graphs_match_replay_schedule(schedule: dict[int, int]) -
 
     assert set(graphs) == reachable_graphs
     assert len(graphs) == len(reachable_graphs)
+
+
+@pytest.fixture
+def lora_graph_warmup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[DecoderCudaGraphs, ResourceManager, list[str]]:
+    events: list[str] = []
+    requests = Mock()
+    requests.create_cuda_graph_warmup_request.return_value = ScheduledRequests()
+    requests.release_batch_context.side_effect = lambda request, resources: (
+        contextlib.nullcontext(request)
+    )
+    graphs = decoder_graphs(
+        decoder_config(cuda_graph_batch_sizes=[1, 2]),
+        mapping=Mapping(world_size=2, rank=0, pp_size=2),
+        cuda_graph_runner=Mock(
+            enabled=True, is_warmup_only=True, short_long_seq_len_threshold=None
+        ),
+        dummy_requests=requests,
+        metadata=SimpleNamespace(spec_metadata=None),
+        lora=SimpleNamespace(cuda_graph_manager=object()),
+        forward_warmup=Mock(side_effect=lambda *args, **kwargs: events.append("forward")),
+    )
+    tuner = SimpleNamespace(
+        cache_pp_recv=lambda: events.append("cache_pp_recv"),
+        cache_pp_send=lambda: events.append("cache_pp_send"),
+        clean_pp_flag=lambda: events.append("clean_pp_flag"),
+    )
+    module = "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs"
+    monkeypatch.delenv("TLLM_AUTOTUNER_CACHE_PATH", raising=False)
+    monkeypatch.setattr(f"{module}.AutoTuner.get", lambda: tuner)
+    monkeypatch.setattr(f"{module}.autotune", lambda **kwargs: contextlib.nullcontext())
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: events.append("synchronize"))
+    return graphs, ResourceManager({}), events
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("mode", ["lora", "disabled", "no_lora", "capture"])
+def test_lora_graph_warmup_hands_pp_cache_off_before_each_gpu_wait(
+    lora_graph_warmup: tuple[DecoderCudaGraphs, ResourceManager, list[str]], mode: str
+) -> None:
+    graphs, resources, events = lora_graph_warmup
+    if mode == "disabled":
+        graphs._config = replace(graphs._config, enable_autotuner=False)
+    elif mode == "no_lora":
+        graphs._lora.cuda_graph_manager = None
+    elif mode == "capture":
+        graphs.cuda_graph_runner.is_warmup_only = False
+
+    graphs.run_cuda_graph_warmup(resources)
+
+    if mode == "lora":
+        assert events == [
+            "forward",
+            "cache_pp_recv",
+            "cache_pp_send",
+            "clean_pp_flag",
+            "synchronize",
+        ] * 2 + ["clean_pp_flag"]
+    else:
+        assert events == ["forward", "synchronize"] * 2
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("graphs_enabled", [True, False])
+def test_lora_graph_warmup_without_a_forward_hands_pp_cache_off_once(
+    lora_graph_warmup: tuple[DecoderCudaGraphs, ResourceManager, list[str]],
+    graphs_enabled: bool,
+) -> None:
+    graphs, resources, events = lora_graph_warmup
+    graphs.cuda_graph_runner.enabled = graphs_enabled
+    graphs._dummy_requests.create_cuda_graph_warmup_request.return_value = None
+
+    graphs.run_cuda_graph_warmup(resources)
+
+    assert events == ["cache_pp_recv", "cache_pp_send", "clean_pp_flag"]
+
+
+@pytest.mark.cpu_only
+def test_lora_graph_warmup_failure_does_not_repeat_a_completed_handoff(
+    lora_graph_warmup: tuple[DecoderCudaGraphs, ResourceManager, list[str]],
+) -> None:
+    graphs, resources, events = lora_graph_warmup
+    graphs._forward_warmup.side_effect = [None, RuntimeError("warmup failed")]
+
+    with pytest.raises(RuntimeError, match="warmup failed"):
+        graphs.run_cuda_graph_warmup(resources)
+
+    assert events == [
+        "cache_pp_recv",
+        "cache_pp_send",
+        "clean_pp_flag",
+        "synchronize",
+        "clean_pp_flag",
+    ]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("graphs_enabled", [True, False])
+def test_lora_graph_warmup_failed_handoff_is_not_retried(
+    lora_graph_warmup: tuple[DecoderCudaGraphs, ResourceManager, list[str]],
+    monkeypatch: pytest.MonkeyPatch,
+    graphs_enabled: bool,
+) -> None:
+    graphs, resources, events = lora_graph_warmup
+    graphs.cuda_graph_runner.enabled = graphs_enabled
+    receive = Mock(side_effect=RuntimeError("cache receive failed"))
+    send = Mock()
+    tuner = SimpleNamespace(
+        cache_pp_recv=receive,
+        cache_pp_send=send,
+        clean_pp_flag=lambda: events.append("clean_pp_flag"),
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs.AutoTuner.get",
+        lambda: tuner,
+    )
+
+    with pytest.raises(RuntimeError, match="cache receive failed"):
+        graphs.run_cuda_graph_warmup(resources)
+
+    receive.assert_called_once_with()
+    send.assert_not_called()
+    assert events == (["forward"] if graphs_enabled else []) + ["clean_pp_flag"]
+
+
+@pytest.mark.cpu_only
+def test_lora_graph_handoff_covers_additional_warmup_forwards_only_in_scope(
+    lora_graph_warmup: tuple[DecoderCudaGraphs, ResourceManager, list[str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graphs, resources, events = lora_graph_warmup
+
+    def additional_warmup(resource_manager: ResourceManager) -> None:
+        graphs.forward_discarded_warmup(
+            ScheduledRequests(), resource_manager, enable_spec_decode=False, runtime_draft_len=0
+        )
+        torch.cuda.synchronize()
+
+    monkeypatch.setattr(graphs, "_capture_additional_cuda_graphs", additional_warmup)
+
+    graphs.run_cuda_graph_warmup(resources)
+    graphs.forward_discarded_warmup(
+        ScheduledRequests(), resources, enable_spec_decode=False, runtime_draft_len=0
+    )
+
+    assert events == [
+        "forward",
+        "cache_pp_recv",
+        "cache_pp_send",
+        "clean_pp_flag",
+        "synchronize",
+    ] * 3 + ["clean_pp_flag", "forward"]
 
 
 class TestWarmupCleanup(unittest.TestCase):
