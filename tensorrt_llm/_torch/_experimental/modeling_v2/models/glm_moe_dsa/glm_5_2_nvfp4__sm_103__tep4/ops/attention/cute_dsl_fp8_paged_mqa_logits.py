@@ -4,14 +4,24 @@
 
 from __future__ import annotations
 
+from typing import Mapping
+
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
+from tensorrt_llm import deep_gemm
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
 #: GLM-5.2's indexer: 32 heads of 128; the K cache holds 32 tokens per page,
 #: each as 128 fp8 bytes plus one fp32 scale (132 bytes).
 _GLM = dict(heads=32, head_dim=128, tokens_per_block=32)
+
+#: The schedule block the DSA indexer builds its decode schedule with.
+SCHEDULE_BLOCK_KV = 64
+
+#: `next_n -> atom`: a width the kernel spills at, scored instead as `next_n // atom`
+#: pseudo-sequences of `atom` tokens each (`split_metadata`). Only MTP5's 6 (3 + 3).
+ATOM_SPLIT: Mapping[int, int] = {6: 3}
 
 
 class CuteDslFp8PagedMqaLogits(OpWrapper):
@@ -37,9 +47,11 @@ class CuteDslFp8PagedMqaLogits(OpWrapper):
     ARCHS = frozenset({Arch.SM_103})
 
     # GLM scores every generation token of a decode step in one call: up to 32
-    # sequences x MTP 2. `max_context_len` is the engine's max sequence length,
-    # so most of each row is past the sequence's end. Context lengths are the
-    # sequences' KV lengths after this step.
+    # sequences x MTP 2 (x 4 / 6 at MTP3 / MTP5: one UMMA N of next_n x 32 heads,
+    # 128 / 192). `max_context_len` is the engine's max sequence length, so most
+    # of each row is past the sequence's end. Context lengths are the sequences'
+    # KV lengths after this step. MTP5's 6 rows go through the atom split
+    # (`split_metadata`): next_n 3 on twice the sequences, each length twice.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="one sequence, one token",
@@ -62,6 +74,61 @@ class CuteDslFp8PagedMqaLogits(OpWrapper):
             why="long contexts against a wide row, with a ragged page count",
             spec=dict(**_GLM, next_n=1, context_lens=[65536, 12345], max_context_len=65536),
         ),
+        Cell(
+            why="MTP3, the full decode batch: 32 sequences x 4",
+            spec=dict(
+                **_GLM,
+                next_n=4,
+                context_lens=[100 + 251 * i for i in range(32)],
+                max_context_len=8192,
+            ),
+        ),
+        Cell(
+            why="MTP5, the full decode batch: 32 sequences x 6",
+            spec=dict(
+                **_GLM,
+                next_n=6,
+                context_lens=[106 + 253 * i for i in range(32)],
+                max_context_len=8192,
+            ),
+        ),
+        Cell(
+            why="MTP5 at 3 sequences: a context of 6 keys and ragged pages, each token with "
+            "its own causal end",
+            spec=dict(**_GLM, next_n=6, context_lens=[6, 33, 1000], max_context_len=2048),
+        ),
+        Cell(
+            why="MTP3 at 5 sequences, long contexts against a wide row",
+            spec=dict(
+                **_GLM,
+                next_n=4,
+                context_lens=[4, 31, 4097, 20000, 40000],
+                max_context_len=65536,
+            ),
+        ),
+        Cell(
+            why="MTP5's atom split, the full decode batch: 32 sequences x 6 as 64 x 3",
+            spec=dict(
+                **_GLM,
+                next_n=3,
+                context_lens=[106 + 253 * (i // 2) for i in range(64)],
+                max_context_len=8192,
+            ),
+        ),
+        Cell(
+            why="MTP5's atom split at 11 sequences: contexts of 6 and 7 keys, ends around "
+            "top-k and long rows against a wide row, as 22 x 3",
+            spec=dict(
+                **_GLM,
+                next_n=3,
+                context_lens=[
+                    n
+                    for n in (6, 7, 33, 2047, 2048, 2053, 4097, 9001, 20000, 40000, 65536)
+                    for _ in range(2)
+                ],
+                max_context_len=65536,
+            ),
+        ),
     )
 
     note = """
@@ -73,9 +140,56 @@ class CuteDslFp8PagedMqaLogits(OpWrapper):
     inputs: the shapes are the caller's contract, and `is_valid` states the
     one a wrong value of which still returns plausible logits.
 
-    `next_n` above 2, `num_epi_subtiles` other than 1, and non-fp32
-    `epi_dtype` / `acc_dtype` / `output_dtype` are not certified.
+    At next_n 6 (MTP5) the kernel runs natively at UMMA N 192 and is correct,
+    but its weight register cache spills (ptxas for sm_103a: 56 registers,
+    1552 bytes spill stores and loads; none at next_n 1, 2 and 3, 16 bytes at
+    4). The target therefore scores MTP5's 6 rows as two pseudo-sequences of
+    3 (`ATOM_SPLIT`, `split_metadata`), the DSA indexer's atom split: next_n 3
+    (UMMA N 96) is a native instance with no spill (168 registers). The split
+    writes the native call's causal logits bit for bit. B300, 32 sequences of
+    3000-6000 keys, 8 indexer layers in one CUDA graph: 22.8 us per layer
+    native, 11.3 with the split's metadata built once per step (16.6 when
+    rebuilt every layer).
+
+    `next_n` other than 1, 2, 3, 4 and 6, `num_epi_subtiles` other than 1, and
+    non-fp32 `epi_dtype` / `acc_dtype` / `output_dtype` are not certified.
     """
+
+    @staticmethod
+    def split_metadata(
+        context_lens: torch.Tensor, block_table: torch.Tensor, factor: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """`(context_lens, block_table, schedule_meta)` for scoring every
+        sequence as `factor` consecutive pseudo-sequences.
+
+        With `q.reshape(B * factor, next_n // factor, H, D)` (a view) and the
+        same `weights`, pseudo-sequence `b * factor + i` holds tokens
+        `i * atom .. (i + 1) * atom - 1` of sequence `b` and writes rows
+        `b * next_n + t`, the rows the unsplit call writes. Each keeps its
+        sequence's full length, so its causal ends (`len - atom + t + 1`) cover
+        the unsplit ones (`len - next_n + i * atom + t + 1`): every causal
+        logit of the unsplit call is written, from the same keys, weights and
+        arithmetic. Lengths and block-table rows are repeated `factor` times
+        and the schedule is built over the repeated lengths, all on device
+        (three launches, no host sync: capturable). They depend only on the
+        step's lengths and table, so a caller builds them once per step for
+        every indexer layer.
+        """
+        batch = int(context_lens.shape[0])
+        width = int(block_table.shape[1])
+        # `contiguous`: the kernel reads both densely, and at one sequence the reshape of
+        # the expansion is a stride-0 view, not a copy.
+        lens = context_lens.unsqueeze(1).expand(batch, factor).reshape(batch * factor).contiguous()
+        table = (
+            block_table.unsqueeze(1)
+            .expand(batch, factor, width)
+            .reshape(batch * factor, width)
+            .contiguous()
+        )
+        schedule = deep_gemm.get_paged_mqa_logits_metadata(
+            lens.view(-1, 1), SCHEDULE_BLOCK_KV, deep_gemm.get_num_sms()
+        )
+        return lens, table, schedule
 
     def __call__(
         self,

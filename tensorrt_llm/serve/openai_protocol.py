@@ -531,6 +531,120 @@ class EmbeddingResponse(OpenAIBaseModel):
         description="Token usage for the request.")
 
 
+class RerankDocument(OpenAIBaseModel):
+    text: str = Field(description="The document text.")
+
+
+class RerankRequest(OpenAIBaseModel):
+    """Request accepted by /rerank and /v1/rerank."""
+
+    model: str | None = Field(default=None,
+                              description="The model to use for reranking.")
+    query: str = Field(min_length=1,
+                       description="The search query to compare documents to.")
+    documents: list[str | RerankDocument] = Field(
+        min_length=1, description="The documents to rerank.")
+    top_n: NonNegativeInt | None = Field(
+        default=None,
+        description="Maximum number of results to return; zero returns all.")
+    return_documents: bool = Field(
+        default=False,
+        description="Whether each result should include its document text.")
+    max_tokens_per_doc: PositiveInt | None = Field(
+        default=None,
+        description="Maximum number of document tokens included in each prompt."
+    )
+    instruction: str | None = Field(
+        default=None,
+        description="Optional task-specific instruction for Qwen3-Reranker.")
+
+
+class RerankResult(OpenAIBaseModel):
+    index: NonNegativeInt = Field(
+        description="Index of the document in the request.")
+    relevance_score: float = Field(ge=0.0,
+                                   le=1.0,
+                                   description="Document relevance score.")
+    document: RerankDocument | None = Field(
+        default=None, description="The document, when requested.")
+
+
+class RerankUsageInfo(OpenAIBaseModel):
+    prompt_tokens: NonNegativeInt = Field(
+        default=0, description="Number of input tokens processed.")
+    total_tokens: NonNegativeInt = Field(
+        default=0,
+        description="Total tokens processed, equal to prompt_tokens.")
+
+
+class RerankResponse(OpenAIBaseModel):
+    id: str = Field(default_factory=lambda: f"rerank-{uuid.uuid4().hex}")
+    model: str = Field(description="The model used for reranking.")
+    results: list[RerankResult] = Field(
+        description="Results ordered by descending relevance.")
+    usage: RerankUsageInfo = Field(description="Token usage for the request.")
+
+
+class RerankV2Request(OpenAIBaseModel):
+    """Cohere v2-compatible request accepted by /v2/rerank."""
+
+    model: str = Field(description="The model to use for reranking.")
+    query: str = Field(min_length=1,
+                       description="The search query to compare documents to.")
+    documents: list[str] = Field(min_length=1,
+                                 description="The documents to rerank.")
+    top_n: PositiveInt | None = Field(
+        default=None, description="Maximum number of results to return.")
+    max_tokens_per_doc: PositiveInt = Field(
+        default=4096,
+        description="Maximum number of document tokens included in each prompt."
+    )
+    priority: int = Field(
+        default=0,
+        ge=0,
+        le=999,
+        description=
+        "Request priority; TensorRT-LLM currently supports only zero.")
+    instruction: str | None = Field(
+        default=None,
+        description="TensorRT-LLM task-instruction extension for Qwen3-Reranker."
+    )
+
+
+class RerankV2Result(OpenAIBaseModel):
+    index: NonNegativeInt = Field(
+        description="Index of the document in the request.")
+    relevance_score: float = Field(ge=0.0,
+                                   le=1.0,
+                                   description="Document relevance score.")
+
+
+class RerankV2ApiVersion(OpenAIBaseModel):
+    version: Literal["2"] = Field(default="2", description="API version.")
+
+
+class RerankV2BilledUnits(OpenAIBaseModel):
+    search_units: PositiveInt = Field(
+        default=1, description="Number of billed search units.")
+
+
+class RerankV2Meta(OpenAIBaseModel):
+    api_version: RerankV2ApiVersion = Field(
+        default_factory=RerankV2ApiVersion,
+        description="Version metadata for the response.")
+    billed_units: RerankV2BilledUnits = Field(
+        default_factory=RerankV2BilledUnits,
+        description="Billing metadata for the response.")
+
+
+class RerankV2Response(OpenAIBaseModel):
+    id: str = Field(default_factory=lambda: f"rerank-{uuid.uuid4().hex}")
+    results: list[RerankV2Result] = Field(
+        description="Results ordered by descending relevance.")
+    meta: RerankV2Meta = Field(default_factory=RerankV2Meta,
+                               description="Response metadata.")
+
+
 def _response_format_to_guided_decoding_params(
     response_format: Optional[ResponseFormat],
     reasoning_parser: Optional[str] = None,
@@ -706,6 +820,13 @@ class CompletionRequest(OpenAIBaseModel):
     return_context_logits: bool = False
     detokenize: bool = True
     thinking_token_budget: Optional[int] = None
+    watermarking: Optional[bool] = Field(
+        default=None,
+        description=
+        ("Whether to watermark the generated text. Takes effect only when the "
+         "server is configured with `watermark_config`. None or true requests a "
+         "watermark; false opts out when the server allows it."),
+    )
     # doc: end-completion-sampling-params
 
     # doc: begin-completion-extra-params
@@ -790,6 +911,7 @@ class CompletionRequest(OpenAIBaseModel):
                 self.response_format),
             detokenize=self.detokenize,
             thinking_token_budget=self.thinking_token_budget,
+            watermarking=self.watermarking,
 
             # logits_bias
             embedding_bias=_logit_bias_to_embedding_bias(
@@ -946,6 +1068,12 @@ class ChatCompletionResponseChoice(_OmitsAbsentSpecDecodeStats):
     # TODO: progressivly add more info like input_ids, specific_token_ids, mrope, mm_hashes, etc
     # TODO: and use a JSON-safe handle to refer to the server-side output
     mm_embedding_handle: Optional[Dict[str, Any]] = None
+
+    # Ids of the generated tokens. RL rollouts need exactly what the engine
+    # sampled -- re-tokenizing the decoded text is lossy -- and these models are
+    # extra="forbid", so without a declared field the ids cannot survive the
+    # disaggregated server's re-validation of a worker's response.
+    token_ids: Optional[List[int]] = None
 
     disaggregated_params: Optional[DisaggregatedParams] = Field(default=None)
     avg_decoded_tokens_per_iter: Optional[float] = Field(default=None)
@@ -1155,19 +1283,28 @@ class ChatCompletionRequest(OpenAIBaseModel):
     parallel_tool_calls: Optional[bool] = None
     user: Optional[str] = None
     reasoning_effort: Optional[ReasoningEffort | Literal[
-        "low", "medium", "high", "max", "none"]] = Field(
+        "minimal", "low", "medium", "high", "xhigh", "max", "none"]] = Field(
             default=ReasoningEffort.LOW,
             description=(
                 "The level of reasoning effort to use. Controls how much "
                 "reasoning is shown in the model's response. Options: "
-                "'low', 'medium', 'high' (harmony/gpt-oss), plus 'max' and "
-                "'none' for models with Kimi-style thinking control."),
+                "'low', 'medium', 'high' (harmony/gpt-oss), 'max' and "
+                "'none' for models with Kimi-style thinking control, plus "
+                "'minimal' and 'xhigh' for models whose chat template "
+                "supports the extended effort scale."),
         )
     # Kimi/Moonshot extension: structured control of reasoning output. The
     # serving layer maps it into the chat-template kwargs for models whose
     # template understands it (e.g. kimi_k3); other models ignore it.
     thinking: Optional[ChatCompletionThinkingParam] = None
     thinking_token_budget: Optional[int] = None
+    watermarking: Optional[bool] = Field(
+        default=None,
+        description=
+        ("Whether to watermark the generated text. Takes effect only when the "
+         "server is configured with `watermark_config`. None or true requests a "
+         "watermark; false opts out when the server allows it."),
+    )
     prompt_ignore_length: Optional[int] = 0
     # Match Codex CLI's string-map contract; widen only for a client that needs
     # other value types, even though the metadata is otherwise ignored.
@@ -1355,6 +1492,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 reasoning_parser=reasoning_parser,
                 chat_template_kwargs=self.chat_template_kwargs),
             thinking_token_budget=self.thinking_token_budget,
+            watermarking=self.watermarking,
 
             # logits_bias
             embedding_bias=_logit_bias_to_embedding_bias(

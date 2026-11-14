@@ -139,6 +139,8 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
 
     x_static = torch.randn([tokens, width], generator=gen, device="cuda").to(torch.bfloat16)
     graph = None
+    h_static = None
+    outs_static = []
     if spec["capture"]:
         graph, h_static, outs_static = _capture(x_static, lambda x: _body(x, breaks, broken))
         assert graph.num_breaks == breaks and graph.num_segments == breaks + 1

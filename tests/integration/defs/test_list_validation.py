@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,29 +22,12 @@ from .perf.test_perf import PerfTestConfig
 from .test_list_parser import get_test_name_corrections, parse_test_list
 
 
-# A function to convert the mako test list or test-db to a list of test names.
+# A function to convert the test list or test-db to a list of test names.
 def parse_test_list_or_db(test_list, trt_config):
 
-    # For mako test list.
+    # For plain-text test lists.
     if test_list.endswith("txt"):
-        # Mako options that may not always be defined, but are required in test lists.
-        # Defined first so that values from `trt_config` can overwrite values.
-        mako_opts = {
-            "level": 4,
-            "idx": 0,
-            "priority": 0,
-            "host_mem_available_mib":
-            1e8,  # Set to very large to cover all tests.
-            "gpu_memory": 1e6,  # Set to very large to cover all tests.
-            "system_gpu_count": 128,  # Set to very large to cover all tests.
-        }
-        mako_opts.update(trt_config["mako_opts"])
-
-        test_names, _ = parse_test_list(test_list,
-                                        print_mako=False,
-                                        no_mako=False,
-                                        mako_opts=mako_opts,
-                                        test_prefix=trt_config["test_prefix"])
+        test_names, _ = parse_test_list(test_list, trt_config["test_prefix"])
 
     # For yaml-based test db.
     elif test_list.endswith("yml"):
@@ -53,8 +36,11 @@ def parse_test_list_or_db(test_list, trt_config):
 
         test_names = []
         context_name = os.path.basename(test_list).replace(".yml", "")
-        for condition in test_db_data[context_name]:
-            test_names.extend(condition["tests"])
+        if "tests" in test_db_data:
+            test_names = [entry["case"] for entry in test_db_data["tests"]]
+        else:
+            for condition in test_db_data[context_name]:
+                test_names.extend(condition["tests"])
 
     else:
         raise ValueError(f"Unexpected test list name: {test_list}")
@@ -87,16 +73,7 @@ def validate_perf_tests(perf_test_names) -> bool:
     return passed
 
 
-def test_list_validation(test_root, all_pytest_items, trt_config,
-                         is_trt_environment):
-
-    # Don't run test list validation in TRT environment because TRT uses
-    # YAML-based test-db for test lists.
-    if is_trt_environment:
-        print(
-            "Skipped TRT-LLM test list validation because the pipeline is running in TRT environment."
-        )
-        return
+def test_list_validation(test_root, all_pytest_items, trt_config):
 
     # Glob all the test list files.
     test_list_path = os.path.join(test_root, "test_lists", "*", "*.txt")

@@ -35,6 +35,7 @@ from tensorrt_llm.llmapi import (
 
 from .....conftest import llm_models_root
 from ....accuracy_core import GSM8K, LlmapiAccuracyTestHarness
+from ..._env import scoped_env_overrides
 from .._common import skip_not_sm103
 
 # On every rank: check the target's step contract on the first forward, and run the
@@ -52,7 +53,6 @@ class TestModelingV2Glm52Nvfp4Sm103Tp8(LlmapiAccuracyTestHarness):
     def _llm_kwargs(*, draft_len: int, kv_dtype: str, moe_backend: str, batch: int) -> dict:
         return dict(
             modeling_v2="require",
-            env_overrides=dict(_SM103_RANK_ENV),
             speculative_config=MTPDecodingConfig(max_draft_len=draft_len),
             kv_cache_config=KvCacheConfig(
                 dtype=kv_dtype, enable_block_reuse=False, free_gpu_memory_fraction=0.75
@@ -70,7 +70,10 @@ class TestModelingV2Glm52Nvfp4Sm103Tp8(LlmapiAccuracyTestHarness):
         )
 
     def _evaluate(self, **llm_kwargs) -> None:
-        with LLM(self.MODEL_PATH, **llm_kwargs) as llm:
+        with (
+            scoped_env_overrides(_SM103_RANK_ENV) as rank_env,
+            LLM(self.MODEL_PATH, env_overrides=rank_env, **llm_kwargs) as llm,
+        ):
             GSM8K(self.MODEL_NAME).evaluate(llm)
 
     @skip_not_sm103

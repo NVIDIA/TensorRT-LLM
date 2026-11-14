@@ -26,6 +26,7 @@ from tensorrt_llm._torch.weight_sharing import (
     QWEN3_5_DENSE_VL_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN3_DENSE_FP8_BLOCK128_FP32SCALE_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+    QWEN3_DENSE_TIED_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN3_MOE_CUTLASS_POST_TRANSFORM_LAYOUT_ABI_V1, ArtifactIdentity,
     IdentityCheckPolicy, LazyRootModelIdentity, PostTransformConfigIdentity,
     PostTransformFeature, PostTransformProfile, PostTransformProfileRegistry,
@@ -38,6 +39,7 @@ from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                           ExecutorMemoryType,
                                           ModelExpressConfig,
+                                          PrefillCudaGraphBackend,
                                           SparseAttentionConfig, TorchLlmArgs)
 from tensorrt_llm.llmapi.llm_utils import (_resolve_kv_cache_manager_v2_auto,
                                            _resolve_transceiver_runtime_auto,
@@ -112,6 +114,13 @@ _MX_BF16_DENSE_RUNTIME_CONSTRAINTS = PostTransformRuntimeConstraints(
 _MX_QWEN3_BF16_DENSE_RUNTIME_CONSTRAINTS = replace(
     _MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
     rope_fusion=frozenset({False}),
+)
+# Tied Qwen3 checkpoints alias `lm_head.weight` to `model.embed_tokens.weight`
+# at construction, so the shared table is transferred once and the tied profile
+# has its own layout ABI.
+_MX_QWEN3_BF16_DENSE_TIED_RUNTIME_CONSTRAINTS = replace(
+    _MX_QWEN3_BF16_DENSE_RUNTIME_CONSTRAINTS,
+    tied_word_embeddings=frozenset({True}),
 )
 # Mistral realizes a per-layer attention window from its checkpoint config.
 # The dense profile is qualified only when every layer runs full attention.
@@ -999,6 +1008,19 @@ class ModelLoader:
             runtime_constraints=_MX_QWEN3_BF16_DENSE_RUNTIME_CONSTRAINTS,
         ),
         PostTransformProfile(
+            profile_id="qwen3-for-causal-lm-bf16-tied-target-v1",
+            root_model_class=LazyRootModelIdentity(
+                "tensorrt_llm._torch.models.modeling_qwen3",
+                "Qwen3ForCausalLM"),
+            architecture="Qwen3ForCausalLM",
+            model_type="qwen3",
+            speculative_mode=None,
+            protocol_version=_MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+            transform_abi_id=QWEN3_DENSE_TIED_POST_TRANSFORM_LAYOUT_ABI_V1,
+            transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+            runtime_constraints=_MX_QWEN3_BF16_DENSE_TIED_RUNTIME_CONSTRAINTS,
+        ),
+        PostTransformProfile(
             profile_id="mistral-for-causal-lm-bf16-target-v1",
             root_model_class=LazyRootModelIdentity(
                 "tensorrt_llm._torch.models.modeling_mistral",
@@ -1124,6 +1146,8 @@ class ModelLoader:
             'trust_remote_code': llm_args.trust_remote_code,
             'mm_encoder_only': llm_args.mm_encoder_only,
         }
+        if llm_args.model_kwargs is not None:
+            config_kwargs['model_kwargs'] = llm_args.model_kwargs
         if llm_args.parallel_config:
             config_kwargs['mapping'] = llm_args.parallel_config.to_mapping()
 
@@ -1223,6 +1247,18 @@ class ModelLoader:
         strict gate), so default HF/AUTO paths should not even build one.
         """
         return load_format == LoadFormat.GMS or checkpoint_loader.checkpoint_format == CheckpointFormat.MX
+
+    def _megamoe_fuse_shared_expert(
+            self, checkpoint_loader: BaseCheckpointLoader) -> bool:
+        """The moe_config switch, off when the weights are shared: the fused copy is per process."""
+        requested = self.llm_args.moe_config.megamoe_fuse_shared_expert
+        if requested and self._needs_source_identity(checkpoint_loader,
+                                                     self.llm_args.load_format):
+            logger.warning(
+                "megamoe_fuse_shared_expert is off: shared weights (GMS / MX) "
+                "keep the separate shared expert")
+            return False
+        return requested
 
     @staticmethod
     def _build_source_identity(
@@ -2337,6 +2373,8 @@ class ModelLoader:
             moe_backend=self.llm_args.moe_config.backend,
             moe_disable_finalize_fusion=self.llm_args.moe_config.
             disable_finalize_fusion,
+            megamoe_fuse_shared_expert=self._megamoe_fuse_shared_expert(
+                checkpoint_loader),
             use_low_precision_moe_combine=self.llm_args.moe_config.
             use_low_precision_moe_combine,
             nvfp4_gemm_allowed_backends=self.llm_args.nvfp4_gemm_config.
@@ -2386,6 +2424,9 @@ class ModelLoader:
             'kv_cache_dtype'] = self.llm_args.kv_cache_config.dtype
         config.extra_attrs["bounded_replay_on_generation"] = (
             self.llm_args.bounded_replay_on_generation)
+        config.extra_attrs["breakable_prefill_cuda_graph"] = (
+            self.llm_args.prefill_cuda_graph_backend ==
+            PrefillCudaGraphBackend.BREAKABLE)
         # Store allreduce pre-allocation config for AllReduce module access.
         # Use get_text_config() so VLM wrapper configs (e.g. KimiK2VLConfig,
         # KimiK25Config) that store the text config under .text_config are

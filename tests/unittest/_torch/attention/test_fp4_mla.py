@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from _torch.helpers import triton_num_compiled
 
 import tensorrt_llm
 import tensorrt_llm._torch.attention.backends.fmha.fp4_mla as fp4_mla_fmha_backend
@@ -717,6 +718,37 @@ def test_recompute_helix_spec_buffers_matches_elementwise_reference(
     assert (metadata.kv_lens_cuda[1 + num_seqs :] == untouched).all()
     # Any group of the sequence that this rank does not own writes no slot.
     assert ((metadata.helix_local_slots[gen] == -1) == (owner != cp_rank)).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA tensors")
+def test_helix_spec_buffers_reuse_the_compiled_kernel_across_batches() -> None:
+    kernel = fp4_mla_metadata._helix_spec_buffers_kernel
+    tokens_per_seq = 4
+    positions, local_slots, kv_bounds, kv_lens = (
+        torch.zeros(64, dtype=torch.int32, device="cuda") for _ in range(4)
+    )
+
+    def populate(num_contexts: int, num_seqs: int) -> None:
+        # kv_lens is batch-indexed: the view starts at the first generation row.
+        fp4_mla_metadata.populate_helix_spec_buffers(
+            positions,
+            local_slots,
+            kv_bounds,
+            kv_lens[num_contexts : num_contexts + num_seqs],
+            num_tokens=num_seqs * tokens_per_seq,
+            tokens_per_seq=tokens_per_seq,
+            tokens_per_block=64,
+            cp_size=8,
+            cp_rank=3,
+        )
+
+    # Context counts 1-3 misalign the int32 kv_lens view.
+    batches = [(0, 4), (1, 16), (2, 5), (3, 1)]
+    populate(*batches[0])
+    compiled = triton_num_compiled(kernel)
+    for batch in batches[1:]:
+        populate(*batch)
+    assert triton_num_compiled(kernel) == compiled
 
 
 @pytest.mark.parametrize("layer_offset", [0, 1, 3])

@@ -636,6 +636,42 @@ def test_replacement_owns_quantized_mtp_head_across_architectures(
         assert draft.lm_head.weight.dtype == (torch.uint8 if packed else torch.float8_e4m3fn)
 
 
+@pytest.mark.cpu_only
+def test_mtp_drafter_builds_the_target_models_own_layer():
+    """A target model that names ``mtp_layer_cls`` gets that layer, whatever its model type."""
+    built = []
+
+    class OwnedMTPLayer(nn.Module):
+        def __init__(self, model_config, layer_idx, aux_stream_dict):
+            super().__init__()
+            built.append(layer_idx)
+
+    config = ModelConfig(
+        pretrained_config=SimpleNamespace(
+            model_type="deepseek_v3",
+            num_nextn_predict_layers=1,
+            hidden_size=16,
+            vocab_size=32,
+            torch_dtype=torch.bfloat16,
+            tie_word_embeddings=False,
+        ),
+        spec_config=SimpleNamespace(
+            uses_replacement_heads=False,
+            max_draft_len=3,
+            spec_dec_mode=SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL,
+        ),
+    )
+    with torch.device("cpu"):
+        target_head = nn.Linear(16, 32, bias=False)
+        target = SimpleNamespace(
+            aux_stream_dict={}, embed_tokens=nn.Embedding(32, 16), mtp_layer_cls=OwnedMTPLayer
+        )
+        draft = MTPForCausalLM(config, 2, target_head, target)
+    assert [type(layer) for layer in draft.mtp_layers] == [OwnedMTPLayer]
+    assert built == [2]
+    assert draft.lm_head is target_head
+
+
 @pytest.mark.parametrize("requested_backend", ["TRTLLM", "AUTO"])
 @pytest.mark.parametrize(
     "quant_config_key",
@@ -735,6 +771,10 @@ def test_dflash_workspace_counts_folded_queries_once(folded: bool) -> None:
         [(2048 * 4, 8), (2048, 8 * 4)] if folded else [(2048 * 4, 8)]
     )
     assert all(call.kwargs["num_tokens"] == call.kwargs["num_gen_tokens"] for call in calls)
+    counter_calls = wrapper._dflash_trtllm_gen_ops.get_multi_ctas_kv_counter_size.call_args_list
+    assert [call.args for call in counter_calls] == (
+        [(8 * 4, 2048, 148)] if folded else [(8, 2048, 148)]
+    )
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -774,3 +814,5 @@ def test_dflash_workspace_sizes_the_largest_folded_chunk(
         (3 * block, heads),
         (3, heads * chunk),
     ]
+    counter_calls = wrapper._dflash_trtllm_gen_ops.get_multi_ctas_kv_counter_size.call_args_list
+    assert [call.args for call in counter_calls] == [(heads * chunk, 3, 148)]

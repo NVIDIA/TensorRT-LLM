@@ -46,6 +46,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ...logger import logger
 from ..attention.backends import AttentionMetadata
+from ..attention.backends.interface import PredefinedAttentionMask
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            MoEAllReduceParams, allgather)
 from ..distributed.ops import MNNVLAllReduce
@@ -608,14 +609,18 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         assert hidden_states.shape[-1] == self.hidden_dim
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_dim)
+        routed_hidden_states = hidden_states
         use_dp_padding = False
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
 
         if self.enable_attention_dp and self.mapping.tp_size > 1 and is_sm_120f(
         ):
             use_dp_padding = True
-            hidden_states = torch.nn.functional.pad(
-                hidden_states,
+            # Padding improves context-phase MoE communication on SM120. Keep
+            # it local to the routed experts: the shared expert operates on
+            # this rank's real tokens and must retain the unpadded row count.
+            routed_hidden_states = torch.nn.functional.pad(
+                routed_hidden_states,
                 (0, 0, 0, max(all_rank_num_tokens) - hidden_states.shape[0]))
 
         if not do_finalize and not (self.can_defer_finalize
@@ -628,18 +633,18 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             out = self._decode_front(
                 self.gate,
                 experts,
-                hidden_states,
+                routed_hidden_states,
                 all_rank_num_tokens=all_rank_num_tokens,
                 use_dp_padding=use_dp_padding,
                 do_finalize=do_finalize,
             )
             if out is not None:
                 return out
-            router_logits = self.gate(hidden_states)
+            router_logits = self.gate(routed_hidden_states)
             return experts(
-                hidden_states,
+                routed_hidden_states,
                 router_logits,
-                output_dtype=hidden_states.dtype,
+                output_dtype=routed_hidden_states.dtype,
                 all_rank_num_tokens=all_rank_num_tokens,
                 use_dp_padding=use_dp_padding,
                 do_finalize=do_finalize,
@@ -931,6 +936,8 @@ class _Qwen3NextDecoderLayerBase(DecoderLayer):
 
 class Qwen3NextLinearDecoderLayer(_Qwen3NextDecoderLayerBase):
 
+    linear_attn_cls = Qwen3NextGatedDeltaNet
+
     def __init__(
         self,
         model_config: ModelConfig[Qwen3NextConfig],
@@ -939,7 +946,7 @@ class Qwen3NextLinearDecoderLayer(_Qwen3NextDecoderLayerBase):
         shared_gate_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
-        self.linear_attn = Qwen3NextGatedDeltaNet(
+        self.linear_attn = self.linear_attn_cls(
             model_config,
             aux_stream,
             layer_idx,
@@ -993,6 +1000,8 @@ class Qwen3NextAttention(Qwen3Attention):
 
 class Qwen3NextFullAttentionDecoderLayer(_Qwen3NextDecoderLayerBase):
 
+    attention_mask = PredefinedAttentionMask.CAUSAL
+
     def __init__(self,
                  model_config: ModelConfig[Qwen3NextConfig],
                  layer_idx: int,
@@ -1012,6 +1021,7 @@ class Qwen3NextFullAttentionDecoderLayer(_Qwen3NextDecoderLayerBase):
 
     def mixer_forward(self, position_ids, hidden_states, attn_metadata,
                       spec_metadata, lora_params, all_reduce_params, **kwargs):
+        kwargs.setdefault("attention_mask", self.attention_mask)
         return self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
@@ -1280,6 +1290,8 @@ ALL_DECODER_LAYER_TYPES = {
 
 class Qwen3NextModel(DecoderModel):
 
+    decoder_layer_types = ALL_DECODER_LAYER_TYPES
+
     def __init__(self, model_config: ModelConfig[Qwen3NextConfig]):
         super().__init__(model_config)
         config = self.model_config
@@ -1331,10 +1343,10 @@ class Qwen3NextModel(DecoderModel):
         shared_gate_stream = self.aux_stream_dict.get(
             AuxStreamType.MoeSharedGate)
         self.layers = nn.ModuleList([
-            ALL_DECODER_LAYER_TYPES[layer_types[layer_idx]](model_config,
-                                                            layer_idx,
-                                                            self.aux_stream,
-                                                            shared_gate_stream)
+            self.decoder_layer_types[layer_types[layer_idx]](model_config,
+                                                             layer_idx,
+                                                             self.aux_stream,
+                                                             shared_gate_stream)
             for layer_idx in range(pretrained_config.num_hidden_layers)
         ])
         self.num_hidden_layers = pretrained_config.num_hidden_layers
@@ -1418,8 +1430,6 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
     ):
         decode_kernels = _uses_decode_kernels(model_config)
         if decode_kernels:
-            # Every AllReduce this model builds: no NCCL_SYMMETRIC.
-            model_config.extra_attrs["allreduce_exclude_nccl_symmetric"] = True
             # Its FP4 MoE layers tune for the decode steps.
             model_config.extra_attrs["moe_decode_tuning"] = True
             # Its MNNVL all-reduces run the residual RMSNorm fusions on the CuTe DSL kernels.

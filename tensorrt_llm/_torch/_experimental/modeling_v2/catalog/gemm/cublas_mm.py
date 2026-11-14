@@ -20,8 +20,8 @@ class CublasMm(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
-    # Both targets use this for every dense projection. This entry's test
-    # carries their three argument shapes that differ in kind rather than in size: fused
+    # Targets use this for dense projections. This entry's test
+    # carries argument shapes that differ in kind rather than in size: fused
     # bias (gpt-oss carries one on qkv, o and the router), no bias (deepseek's
     # projections), and an out_dtype that is not the input's (deepseek's router
     # asks for fp32 logits).
@@ -34,7 +34,7 @@ class CublasMm(OpWrapper):
 
     note = """
     `output_buffer_kind` and `group` are the op's multi-stream and collective
-    arguments. Both shipped targets leave them at their defaults, so neither is
+    arguments. The covered targets leave them at their defaults, so neither is
     a cell axis and neither is certified here.
     """
 

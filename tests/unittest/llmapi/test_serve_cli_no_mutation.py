@@ -214,13 +214,17 @@ def test_launch_mm_encoder_server_does_not_mutate_encoder_args(monkeypatch):
     assert recorder.kwargs["model"] == "m"
 
 
-def test_launch_embedding_server_does_not_mutate_llm_args(monkeypatch):
+@pytest.mark.parametrize(
+    "server_type,architecture",
+    [("embedding", "FakeForTextEmbedding"), ("rerank", "Qwen3ForTextReranking")],
+)
+def test_launch_encode_only_server_does_not_mutate_llm_args(monkeypatch, server_type, architecture):
     recorder = _Recorder()
     monkeypatch.setattr(serve_module, "PyTorchLLM", recorder)
     monkeypatch.setattr(
         serve_module,
-        "_resolve_embedding_architecture_override",
-        lambda *args, **kwargs: {"architectures": ["FakeForTextEmbedding"]},
+        f"_resolve_{server_type}_architecture_override",
+        lambda *args, **kwargs: {"architectures": [architecture]},
     )
     llm_args = {
         "model": "m",
@@ -230,14 +234,14 @@ def test_launch_embedding_server_does_not_mutate_llm_args(monkeypatch):
     snapshot = copy.deepcopy(llm_args)
 
     with pytest.raises(_Stop):
-        serve_module.launch_embedding_server(
+        getattr(serve_module, f"launch_{server_type}_server")(
             host="127.0.0.1", port=12345, llm_args=llm_args, max_queue_delay=0.0, max_queue_size=1
         )
 
-    _assert_unchanged("launch_embedding_server", llm_args, snapshot)
+    _assert_unchanged(f"launch_{server_type}_server", llm_args, snapshot)
     assert "build_config" not in recorder.kwargs
     assert recorder.kwargs["encode_only"] is True
-    assert recorder.kwargs["model_kwargs"] == {"architectures": ["FakeForTextEmbedding"]}
+    assert recorder.kwargs["model_kwargs"] == {"architectures": [architecture]}
 
 
 def test_resolve_default_num_serve_frontends_does_not_mutate_llm_args():

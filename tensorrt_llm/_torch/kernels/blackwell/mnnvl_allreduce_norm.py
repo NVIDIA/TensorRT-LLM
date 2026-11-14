@@ -26,9 +26,9 @@ kernels in one graph; only the byte counts in the flags cross launches, its data
 
 Extensions: ``se_fold`` computes ``routed + sigmoid(gate) * shared`` in-kernel with
 ``fused_sigmoid_gate_mul_add``'s arithmetic; ``moe_topk`` finalizes ``routed`` from the un-finalized
-trtllm-gen MoE output with the finalize kernel's arithmetic; ``tpc`` > 1 gives each CTA ``tpc`` consecutive
-tokens, so a call larger than one wave of CTAs still runs as one wave, with every token's output bits those of
-the one-token kernel.
+trtllm-gen MoE output with the finalize kernel's arithmetic; ``tpc`` > 1 batches consecutive tokens per CTA
+with the one-token kernel's arithmetic. The grid targets two CTAs per SM; shared memory and registers
+can limit actual residency below that target.
 
 PDL: only the workspace table and the norm weight are read before ``griddepcontrol.wait``; never the
 input, the residual (the previous all-reduce's output) or the flags.
@@ -47,6 +47,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from .utils import griddepcontrol_launch_dependents, griddepcontrol_wait
 
 VEC = 8  # BF16 per thread (one 16-byte vector)
+_LAMPORT_FLAG_COUNT = 8
 _NEG_ZERO = -2147483648  # 0x80000000: Lamport "not written" word (+0.0, -0.0 as BF16 pair)
 
 
@@ -564,6 +565,15 @@ class MnnvlAllReduceNormKernel:
     every rank's unicast buffer).
     """
 
+    @staticmethod
+    def mt_smem_bytes(hidden: int, tpc: int) -> int:
+        """Shared memory for the multi-token kernel's warp sums, flags, and residual stash.
+
+        Supported hidden sizes keep every allocation aligned to 16 bytes.
+        """
+        num_warps = hidden // VEC // 32
+        return tpc * num_warps * 4 + _LAMPORT_FLAG_COUNT * 4 + tpc * hidden * 2
+
     def __init__(
         self,
         *,
@@ -592,8 +602,7 @@ class MnnvlAllReduceNormKernel:
         self.ctas = ctas
         self.threads = hidden // VEC // ctas
         self.num_warps = self.threads // 32
-        # 512-thread CTAs (one CTA per token) are bounded to two CTAs per SM (at most 64 registers), so one
-        # wave covers 2 x SMs tokens, the wave size tpc assumes.
+        # Bound 512-thread CTAs to at most 64 registers; shared memory can still prevent two-CTA residency.
         self.min_ctas_per_sm = 2 if self.threads == 512 else 0
         self.use_pdl = use_pdl
         self.se_fold = se_fold
@@ -627,7 +636,7 @@ class MnnvlAllReduceNormKernel:
     ) -> None:
         m = cute.size(gRes, mode=[0])
         if const_expr(self.tpc > 1):
-            # smem: the CTA's residual vectors (tpc x H BF16), per-token warp sums, the flags
+            # Infer shared memory from the residual stash, per-token warp sums, and flags.
             self.kernel_mt(
                 gX,
                 gRouted,
@@ -648,7 +657,6 @@ class MnnvlAllReduceNormKernel:
                 grid=[(m + self.tpc - 1) // self.tpc, 1, 1],
                 block=[self.threads, 1, 1],
                 cluster=[1, 1, 1],
-                smem=1024 + self.tpc * self.hidden * 2,
                 stream=stream,
                 use_pdl=self.use_pdl,
                 min_blocks_per_mp=self.min_ctas_per_sm,
@@ -717,7 +725,9 @@ class MnnvlAllReduceNormKernel:
         smem = cutlass.utils.SmemAllocator()
         red = smem.allocate_tensor(Float32, cute.make_layout((num_warps,)), byte_alignment=16)
         csum = smem.allocate_tensor(Float32, cute.make_layout((ctas,)), byte_alignment=16)
-        fl = smem.allocate_tensor(Int32, cute.make_layout((8,)), byte_alignment=16)
+        fl = smem.allocate_tensor(
+            Int32, cute.make_layout((_LAMPORT_FLAG_COUNT,)), byte_alignment=16
+        )
         red_addr = _smem_addr(red.iterator)
         csum_addr = _smem_addr(csum.iterator)
         if const_expr(ctas > 1):
@@ -1098,7 +1108,9 @@ class MnnvlAllReduceNormKernel:
 
         smem = cutlass.utils.SmemAllocator()
         red = smem.allocate_tensor(Float32, cute.make_layout((tpc * num_warps,)), byte_alignment=16)
-        fl = smem.allocate_tensor(Int32, cute.make_layout((8,)), byte_alignment=16)
+        fl = smem.allocate_tensor(
+            Int32, cute.make_layout((_LAMPORT_FLAG_COUNT,)), byte_alignment=16
+        )
         stash = smem.allocate_tensor(Int32, cute.make_layout((tpc * vecs * 4,)), byte_alignment=16)
         red_addr = _smem_addr(red.iterator)
         stash_addr = _smem_addr(stash.iterator) + vi * Int32(

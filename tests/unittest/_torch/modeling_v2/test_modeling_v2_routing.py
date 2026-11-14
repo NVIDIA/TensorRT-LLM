@@ -1472,8 +1472,11 @@ def test_glm52_tep4_matches(mode):
 
 
 @pytest.mark.usefixtures("_glm52_sm")
-def test_glm52_tep4_with_mtp_matches():
-    config = _model_config(_glm52_config(), spec_config=MTPDecodingConfig(max_draft_len=1), **_TEP4)
+@pytest.mark.parametrize("max_draft_len", [1, 3, 5], ids=["mtp1", "mtp3", "mtp5"])
+def test_glm52_tep4_with_mtp_matches(max_draft_len):
+    config = _model_config(
+        _glm52_config(), spec_config=MTPDecodingConfig(max_draft_len=max_draft_len), **_TEP4
+    )
     assert _qualified(modeling_v2_resolve(config, _llm_args("require"))) == _GLM52_TARGET
 
 
@@ -1482,18 +1485,45 @@ def test_glm52_tep4_with_mtp_matches():
     "spec_config, missed",
     [
         (MTPDecodingConfig(max_draft_len=2), r"max_draft_len=2, max_total_draft_tokens=2"),
-        (MTPDecodingConfig(max_draft_len=3), r"max_draft_len=3, max_total_draft_tokens=3"),
+        (MTPDecodingConfig(max_draft_len=4), r"max_draft_len=4, max_total_draft_tokens=4"),
         (
             MTPDecodingConfig(max_draft_len=1, use_dynamic_tree=True, dynamic_tree_max_topK=2),
-            r"max_draft_len=1, max_total_draft_tokens=2",
+            r"max_draft_len=1, max_total_draft_tokens=2, dynamic tree",
+        ),
+        # A dynamic tree capped at its chain length has the row count of a certified
+        # linear chain, but still carries tree masks and position offsets.
+        (
+            MTPDecodingConfig(
+                max_draft_len=3,
+                max_total_draft_tokens=3,
+                use_dynamic_tree=True,
+                dynamic_tree_max_topK=2,
+            ),
+            r"max_draft_len=3, max_total_draft_tokens=3, dynamic tree",
+        ),
+        (
+            MTPDecodingConfig(
+                max_draft_len=5,
+                max_total_draft_tokens=5,
+                use_dynamic_tree=True,
+                dynamic_tree_max_topK=2,
+            ),
+            r"max_draft_len=5, max_total_draft_tokens=5, dynamic tree",
         ),
     ],
-    ids=["draft2", "draft3", "dynamic_tree"],
+    ids=[
+        "draft2",
+        "draft4",
+        "dynamic_tree",
+        "capped_dynamic_tree_mtp3",
+        "capped_dynamic_tree_mtp5",
+    ],
 )
-def test_glm52_tep4_with_more_than_one_draft_token_does_not_match(spec_config, missed):
-    """The decode attention, the base-row index kind and the MLA rope kernel are
-    built for two query rows per sequence; a longer draft chain or a tree puts
-    more rows on a sequence and is a different forward."""
+def test_glm52_tep4_with_uncertified_draft_chain_does_not_match(spec_config, missed):
+    """The target is certified on linear chains of 1, 3 and 5 draft tokens (the decode
+    attention's grid is compiled for D + 1 rows per sequence); other chain lengths route
+    nowhere, and so does a dynamic tree, even one capped at a certified chain length:
+    the MLA / RoPE and top-k paths do not consume its tree masks or position offsets."""
     config = _model_config(_glm52_config(), spec_config=spec_config, **_TEP4)
     assert modeling_v2_resolve(config, _llm_args("auto")) is None
     with pytest.raises(ValueError, match=missed):

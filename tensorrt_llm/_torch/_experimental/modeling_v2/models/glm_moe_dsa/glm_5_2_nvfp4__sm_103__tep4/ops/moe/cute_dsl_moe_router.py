@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """GLM-5.2's MoE router GEMM, `[rows, 6144] x [256, 6144]` to fp32 logits, on three CuTe DSL
 kernels chosen by row count: SIMT (1..5), tensor-core split-K partials (6..64), and the
-prefill router (65..8192)."""
+prefill router (65..8192); plus the split-K partials over an M-tile grid for the MTP3 / MTP5
+decode widths (65..256)."""
 
 from __future__ import annotations
 
@@ -15,6 +16,7 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch.kernels.blackwell.utils import TRTLLM_ENABLE_PDL as _USE_PDL
 
+from ...kernels.moe import moe_decode_router_partials as _partials
 from ...kernels.moe import moe_frontend_router as _vec2
 from ...kernels.moe import moe_frontend_router_tc as _tc
 from ...kernels.moe import moe_prefill_frontend_schedule as _sched
@@ -32,6 +34,10 @@ DECODE_MAX_ROWS = 64
 PREFILL_MIN_ROWS = DECODE_MAX_ROWS + 1
 PREFILL_MAX_ROWS = 8192
 PREFILL_SPLIT_K = 1
+#: The wide decode router's row domain (MTP3 / MTP5 decode widths): the decode partials
+#: kernel's `[rows, 4, 256]` above 64 rows, one 64-row M tile per grid row.
+WIDE_MIN_ROWS = DECODE_MAX_ROWS + 1
+WIDE_MAX_ROWS = _partials.MAX_TOKENS
 
 
 def decode_splits(rows: int) -> int:
@@ -40,8 +46,10 @@ def decode_splits(rows: int) -> int:
     return 1 if rows <= SIMT_MAX_ROWS else SPLIT_K
 
 
-def output_shape(rows: int) -> tuple[int, ...]:
-    """The fp32 output a runner writes at `rows`."""
+def output_shape(rows: int, wide: bool = False) -> tuple[int, ...]:
+    """The fp32 output a runner writes at `rows` (`wide`: the wide decode router's)."""
+    if wide:
+        return (rows, SPLIT_K, EXPERTS)
     if rows > DECODE_MAX_ROWS:
         return (rows, PREFILL_SPLIT_K, EXPERTS)
     if rows <= SIMT_MAX_ROWS:
@@ -53,7 +61,8 @@ def output_shape(rows: int) -> tuple[int, ...]:
 class RouterRunner:
     """A compiled router kernel.
 
-    `kind` is "simt" or "tc_partials" (pinned to `rows`), or "prefill" (any row count in
+    `kind` is "simt" or "tc_partials" (pinned to `rows`), "tc_partials_wide" (any row count
+    in `WIDE_MIN_ROWS..WIDE_MAX_ROWS`, `rows` None), or "prefill" (any row count in
     `PREFILL_MIN_ROWS..PREFILL_MAX_ROWS`, `rows` None). `launch(x, weight, out)` is the
     kernel's call, already compiled.
     """
@@ -78,23 +87,15 @@ def _simt_launch(compiled) -> Callable[[torch.Tensor, torch.Tensor, torch.Tensor
     return launch
 
 
-def _tc_launch(gemm) -> Callable[[torch.Tensor, torch.Tensor, torch.Tensor], None]:
-    k_split = HIDDEN // SPLIT_K
+#: CTAs per multicast cluster of the decode partials router: 2 instead of the kernel's 8,
+#: so the router finds its SMs beside the shared expert's gate/up behind the pre-MoE
+#: all-reduce (same MMAs in the same order, bitwise partials).
+DECODE_CLUSTER = 2
 
+
+def _partials_launch(fn) -> Callable[[torch.Tensor, torch.Tensor, torch.Tensor], None]:
     def launch(x, weight, out):
-        gemm(
-            int(x.shape[0]),
-            EXPERTS,
-            k_split,
-            SPLIT_K,
-            x.data_ptr(),
-            weight.data_ptr(),
-            out.permute(0, 2, 1),
-            HIDDEN,
-            k_split,
-            HIDDEN,
-            k_split,
-        )
+        fn(x, weight, out, int(x.shape[0]))
 
     return launch
 
@@ -104,7 +105,10 @@ def build(rows: int, device) -> RouterRunner:
     zeros. Call at load.
 
     Rows 1..5 take the SIMT kernel (one expert per CTA), 6..64 the tensor-core split-K
-    kernel; both with PDL as the engine sets it. Costs one CuTe DSL compile per row
+    kernel that loads its weight slice before its PDL wait, multicasts each activation
+    tile over a `DECODE_CLUSTER`-CTA cluster and releases the top-k at entry (router +
+    top-k 7.78 -> 5.95 us per MoE layer at 64 rows on B300, the top-k ending 4.7 us
+    earlier behind the all-reduce in serving); both with PDL as the engine sets it. Costs one CuTe DSL compile per row
     count (cached per process by the kernel modules). Raises if `rows` is outside 1..64.
     """
     rows = int(rows)
@@ -122,7 +126,11 @@ def build(rows: int, device) -> RouterRunner:
             runner = RouterRunner(
                 "tc_partials",
                 rows,
-                _tc_launch(_tc.compile_router_tc_partials(x, w, out, use_pdl=_USE_PDL)),
+                _partials_launch(
+                    _partials.compile_router_partials(
+                        x, w, out, use_pdl=_USE_PDL, cluster=DECODE_CLUSTER
+                    )
+                ),
             )
         runner.launch(x, w, out)
     return runner
@@ -132,6 +140,31 @@ def build_all(device, rows=range(1, DECODE_MAX_ROWS + 1)) -> dict[int, RouterRun
     """`build` at every row count in `rows` (default 1..64); `{rows: runner}`. Raises on
     the first failure: the decode front end has no partial form."""
     return {int(r): build(r, device) for r in rows}
+
+
+def build_wide(device) -> RouterRunner:
+    """Compile the decode partials router for 65..256 rows (`[rows, 4, 256]` partials) and
+    launch it once on zeros at 256 rows. Call at load. The same kernel and handle as `build`'s
+    6..64 rows: its schedule repeated per 64-row M tile on grid y (weight slice loaded before
+    the PDL wait, `DECODE_CLUSTER`-CTA activation multicast, the top-k released at entry);
+    each M tile's partials are the 64-row ones of its rows, bit for bit. One compile serves
+    every row count (symbolic). Raises if the compile fails."""
+    rows = WIDE_MAX_ROWS
+    x = torch.zeros(rows, HIDDEN, dtype=torch.bfloat16, device=device)
+    w = torch.zeros(EXPERTS, HIDDEN, dtype=torch.bfloat16, device=device)
+    out = torch.zeros(output_shape(rows, wide=True), dtype=torch.float32, device=device)
+    with torch.cuda.device(device):
+        runner = RouterRunner(
+            "tc_partials_wide",
+            None,
+            _partials_launch(
+                _partials.compile_router_partials(
+                    x, w, out, use_pdl=_USE_PDL, cluster=DECODE_CLUSTER
+                )
+            ),
+        )
+        runner.launch(x, w, out)
+    return runner
 
 
 def build_prefill(device) -> RouterRunner:
@@ -179,9 +212,10 @@ class CuteDslMoeRouter(OpWrapper):
     `x` is bf16 `[rows, 6144]`, `weight` the row-major bf16 `[256, 6144]` gate weight,
     `out` a caller-owned fp32 buffer of `output_shape(rows)`:
 
-        simt         1..5 rows     [rows, 256]          the logits
-        tc_partials  6..64 rows    [rows, 4, 256]       four K-quarter partials
-        prefill      65..8192 rows [rows, 1, 256]       the logits, one plane
+        simt              1..5 rows     [rows, 256]          the logits
+        tc_partials       6..64 rows    [rows, 4, 256]       four K-quarter partials
+        tc_partials_wide  65..256 rows  [rows, 4, 256]       the same, per 64-row M tile
+        prefill           65..8192 rows [rows, 1, 256]       the logits, one plane
 
     The partials are not summed here: the fused top-k adds them in registers, in
     increasing split order, before the sigmoid.
@@ -194,6 +228,12 @@ class CuteDslMoeRouter(OpWrapper):
         Cell(why="5 rows, the SIMT router's ceiling", spec=dict(rows=5)),
         Cell(why="6 rows, the first tensor-core split-K row count", spec=dict(rows=6)),
         Cell(why="the full decode batch on split-K partials", spec=dict(rows=64)),
+        Cell(why="65 rows, the wide router's first: two M tiles", spec=dict(rows=65, wide=True)),
+        Cell(why="MTP3's 128 verify rows on the wide router", spec=dict(rows=128, wide=True)),
+        Cell(why="MTP5's 192 verify rows on the wide router", spec=dict(rows=192, wide=True)),
+        Cell(
+            why="256 rows, the wide router's ceiling: four M tiles", spec=dict(rows=256, wide=True)
+        ),
         Cell(why="65 rows, the first prefill row count: 64x64 tiles", spec=dict(rows=65)),
         Cell(why="4096 rows, the last of the 64x64 prefill geometry", spec=dict(rows=4096)),
         Cell(why="4097 rows, the first of the 128x128 prefill geometry", spec=dict(rows=4097)),
@@ -206,7 +246,9 @@ class CuteDslMoeRouter(OpWrapper):
     decode router; a context row count takes the prefill router when it built and
     otherwise the stock projection (`cute_dsl_projection` "router" prefill GEMM or
     cuBLAS) at the call site. The MTP layer runs this op only at its decode widths; its
-    context steps take the stock projection.
+    context steps take the stock projection. At MTP3 / MTP5 the target also builds the
+    wide router (`build_wide`), which a decode step of 65..256 rows takes, with the wide
+    decode top-k summing its partials; MTP1 builds none.
 
     The decode kernels' compiled handles skip the shape checks the kernel modules' own
     runners repeat per call; `is_valid` states them. The router reads x under PDL: the
@@ -252,9 +294,14 @@ class CuteDslMoeRouter(OpWrapper):
         # wrong output plane count or a misaligned buffer is read or written as if it
         # matched.
         rows = int(x.shape[0])
+        wide = runner.kind == "tc_partials_wide"
         if runner.kind == "prefill":
             assert PREFILL_MIN_ROWS <= rows <= PREFILL_MAX_ROWS, (
                 f"the prefill router serves {PREFILL_MIN_ROWS}..{PREFILL_MAX_ROWS} rows, got {rows}"
+            )
+        elif wide:
+            assert WIDE_MIN_ROWS <= rows <= WIDE_MAX_ROWS, (
+                f"the wide router serves {WIDE_MIN_ROWS}..{WIDE_MAX_ROWS} rows, got {rows}"
             )
         else:
             assert rows == runner.rows, f"this runner is compiled for {runner.rows} rows"
@@ -262,12 +309,13 @@ class CuteDslMoeRouter(OpWrapper):
         assert tuple(weight.shape) == (EXPERTS, HIDDEN) and weight.dtype == torch.bfloat16, (
             "weight must be the row-major bf16 [256, 6144] gate weight"
         )
-        assert tuple(out.shape) == output_shape(rows) and out.dtype == torch.float32, (
-            f"out must be fp32 {output_shape(rows)}, got {out.dtype} {tuple(out.shape)}"
+        shape = output_shape(rows, wide)
+        assert tuple(out.shape) == shape and out.dtype == torch.float32, (
+            f"out must be fp32 {shape}, got {out.dtype} {tuple(out.shape)}"
         )
         for name, t in (("x", x), ("weight", weight), ("out", out)):
             assert t.is_contiguous(), f"{name} must be contiguous"
-        out_align = 32 if runner.kind == "prefill" else 16
+        out_align = 32 if runner.kind in ("prefill", "tc_partials_wide") else 16
         for name, t, align in (("x", x, 16), ("weight", weight, 16), ("out", out, out_align)):
             assert t.data_ptr() % align == 0, f"{name} must be {align}-byte aligned"
 

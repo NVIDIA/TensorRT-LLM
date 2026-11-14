@@ -120,7 +120,7 @@ from tensorrt_llm._torch.moe.fused_moe.moe_resolution import (
 )
 from tensorrt_llm._torch.moe.fused_moe.routing import DeepSeekV4MoeRoutingMethod, RoutingMethodType
 from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import (
-    FlashinferTrtllmGenBf16Impl,
+    TrtllmTrtllmGenBf16Impl,
     TrtllmTrtllmGenNvfp4Impl,
     TrtllmTrtllmGenW4a8Nvfp4Fp8Impl,
     find_trtllm_gen_leaf,
@@ -542,8 +542,7 @@ def test_registering_megamoe_cutedsl_leaves_the_backend_literal_path_unchanged()
 
 # The full grid, written out rather than generated, so a leaf that silently
 # stops registering fails here instead of shrinking a computed expectation.
-# Six native leaves for the quantized formats; the FlashInfer wheel serves only
-# the unquantized one, which TRT-LLM's own cubins do not cover.
+# One native leaf per format, the unquantized one included.
 _TRTLLM_GEN_IDS = (
     "trtllm.trtllm_gen.fused_moe.nvfp4",
     "trtllm.trtllm_gen.fused_moe.fp8_block_scales",
@@ -551,16 +550,14 @@ _TRTLLM_GEN_IDS = (
     "trtllm.trtllm_gen.fused_moe.w4a8_mxfp4_mxfp8",
     "trtllm.trtllm_gen.fused_moe.w4a8_nvfp4_fp8",
     "trtllm.trtllm_gen.fused_moe.w4a8_mxfp4_fp8",
-    "flashinfer.trtllm_gen.fused_moe.none",
+    "trtllm.trtllm_gen.fused_moe.none",
 )
 
 
 def _trtllm_gen_environment(*, sm: int = 100, flashinfer: bool = False) -> MoEEnvironment:
     """An SM100 host, with the FlashInfer wheel optional."""
-    deps = []
-    if flashinfer:
-        deps = [MoEDep.FLASHINFER.value, MoEDep.FLASHINFER_BF16_MOE.value]
-    return MoEEnvironment(sm=sm, available_deps=tuple(sorted(deps)))
+    deps = (MoEDep.FLASHINFER.value,) if flashinfer else ()
+    return MoEEnvironment(sm=sm, available_deps=deps)
 
 
 def _single_rank_deployment(env: MoEEnvironment) -> MoEDeployment:
@@ -617,12 +614,10 @@ def test_trtllm_gen_leaf_provider_agrees_with_its_identity(impl_id):
     """
     impl = MOE_IMPL_REGISTRY.lookup(MoEImplId.parse(impl_id))
     assert impl.provider == impl.descriptor.identity.provider
-    assert impl.use_flashinfer == (impl.provider == "flashinfer")
-    # Only the native runners fill the all-to-all workspace output buffer,
-    # which is exactly the provider split. The class stands in for ``self``:
-    # the body reads only ``use_flashinfer``, and constructing a leaf needs a
-    # GPU.
-    assert impl.supports_moe_output_in_alltoall_workspace(impl) == (impl.provider == "trtllm")
+    # Every native runner fills the all-to-all workspace output buffer. The
+    # class stands in for ``self``: the body reads no instance state, and
+    # constructing a leaf needs a GPU.
+    assert impl.supports_moe_output_in_alltoall_workspace(impl)
 
 
 @pytest.mark.parametrize("impl_id", _TRTLLM_GEN_IDS)
@@ -630,7 +625,7 @@ def test_trtllm_gen_leaf_admits_only_its_own_format(impl_id: str) -> None:
     """Each leaf admits its own format and no other."""
     impl = MOE_IMPL_REGISTRY.lookup(MoEImplId.parse(impl_id))
     quant = impl.descriptor.identity.quant
-    deployment = _single_rank_deployment(_trtllm_gen_environment(flashinfer=True))
+    deployment = _single_rank_deployment(_trtllm_gen_environment())
     own = impl.can_implement(
         MoEProblem(quant=None if quant == "none" else quant.upper(), dtype_act=torch.bfloat16),
         deployment,
@@ -695,23 +690,58 @@ def test_deepseek_v4_routing_is_its_own_problem_but_keeps_v3s_kernel_encoding():
     assert canonical_routing(routing) == RoutingMethodType.DeepSeekV4.name
 
 
-def test_flashinfer_bf16_leaf_reports_dep_missing_without_the_wheel() -> None:
-    """On a host with no FlashInfer, the FlashInfer bf16 leaf declines for that reason."""
-    verdict = FlashinferTrtllmGenBf16Impl.can_implement(
-        MoEProblem(quant=None, dtype_act=torch.bfloat16),
+def test_trtllm_literal_picks_the_bf16_leaf_without_flashinfer() -> None:
+    """The unquantized format runs on TRT-LLM's own cubins, so FlashInfer is not a dependency."""
+    with override_moe_environment(_trtllm_gen_environment()):
+        report = resolve_moe_impl(_trtllm_gen_model_config(quant_algo=None))
+    assert impl_class_for(report) is TrtllmTrtllmGenBf16Impl
+
+
+def test_bf16_leaf_routes_on_the_host_while_its_top_k_is_read(monkeypatch) -> None:
+    """Router Replay and the other host top-k readers get a top-k to read.
+
+    The kernel routes from the logits, so without host routing they would see
+    nothing. The leaf stands in as a namespace: the hook reads no instance state.
+    """
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import trtllm_bf16
+
+    requires = TrtllmTrtllmGenBf16Impl._requires_separated_routing
+    leaf = SimpleNamespace()
+    monkeypatch.delenv("ENABLE_PERFECT_ROUTER", raising=False)
+    assert not requires(leaf)
+    monkeypatch.setenv("ENABLE_PERFECT_ROUTER", "expert_ids")
+    assert requires(leaf)
+    monkeypatch.delenv("ENABLE_PERFECT_ROUTER")
+    monkeypatch.setattr(trtllm_bf16, "get_active_route_capture", lambda: object())
+    assert requires(leaf)
+
+
+@pytest.mark.parametrize(
+    "shape, reason",
+    [
+        ({"hidden_size": 2112}, MoERejectReason.SHAPE_UNALIGNED),
+        ({"top_k": 33}, MoERejectReason.ROUTING_UNSUPPORTED),
+        # The deployment below has 8 slots.
+        ({"top_k": 8}, MoERejectReason.ROUTING_UNSUPPORTED),
+    ],
+    ids=["hidden_not_128_aligned", "top_k_above_32", "top_k_not_below_slots"],
+)
+def test_bf16_leaf_declines_shapes_no_cubin_or_routing_kernel_runs(shape, reason) -> None:
+    """Declined during selection, so the layer falls back instead of failing at warmup."""
+    verdict = TrtllmTrtllmGenBf16Impl.can_implement(
+        MoEProblem(quant=None, dtype_act=torch.bfloat16, **shape),
         _single_rank_deployment(_trtllm_gen_environment()),
     )
     assert not verdict.eligible
-    assert verdict.reject_reason is MoERejectReason.DEP_MISSING
+    assert verdict.reject_reason is reason
 
 
-# The leaves whose runner reads no expert bias: two because the fp8/fp4
-# activation cubins take none, and the unquantized one because its FlashInfer
-# runner takes none either.
+# The leaves whose runner reads no expert bias: the fp8/fp4 activation cubins
+# take none, and neither do the unquantized ones.
 _NO_EXPERT_BIAS_IDS = (
     "trtllm.trtllm_gen.fused_moe.fp8_block_scales",
     "trtllm.trtllm_gen.fused_moe.w4a8_nvfp4_fp8",
-    "flashinfer.trtllm_gen.fused_moe.none",
+    "trtllm.trtllm_gen.fused_moe.none",
 )
 
 
@@ -736,7 +766,7 @@ def test_trtllm_gen_leaves_without_a_bias_runner_decline_during_selection(impl_i
             dtype_act=torch.bfloat16,
             bias=True,
         ),
-        _single_rank_deployment(_trtllm_gen_environment(flashinfer=True)),
+        _single_rank_deployment(_trtllm_gen_environment()),
     )
 
     assert not verdict.eligible
@@ -761,7 +791,7 @@ def test_w4a8_nvfp4_fp8_leaf_is_pinned_to_its_arch_specific_cubins(sm, eligible)
 # parameter for alpha, beta or the clamp and pin ``act_type``.
 _NO_ACTIVATION_CONSTANT_LEAVES = (
     TrtllmTrtllmGenW4a8Nvfp4Fp8Impl,
-    FlashinferTrtllmGenBf16Impl,
+    TrtllmTrtllmGenBf16Impl,
 )
 
 
@@ -785,7 +815,7 @@ def test_leaves_without_constant_support_decline_during_selection(impl, constant
             dtype_act=torch.bfloat16,
             activation_constants=frozenset({constant}),
         ),
-        _single_rank_deployment(_trtllm_gen_environment(flashinfer=True)),
+        _single_rank_deployment(_trtllm_gen_environment()),
     )
 
     assert not verdict.eligible
@@ -810,14 +840,10 @@ def test_nvfp4_leaves_admit_the_calibration_aliases(alias):
 
 
 def test_trtllm_gen_lookup_finds_the_one_leaf_per_format() -> None:
-    """Each format has exactly one leaf, on whichever provider serves it.
-
-    The quantized formats land on the native provider and the unquantized one
-    on FlashInfer; a format no leaf publishes is an ordinary ``None``.
-    """
+    """Each format has exactly one leaf; a format no leaf publishes is an ordinary ``None``."""
     assert find_trtllm_gen_leaf(QuantAlgo.NVFP4) is TrtllmTrtllmGenNvfp4Impl
     assert find_trtllm_gen_leaf(QuantAlgo.W4A8_NVFP4_FP8) is TrtllmTrtllmGenW4a8Nvfp4Fp8Impl
-    assert find_trtllm_gen_leaf(None) is FlashinferTrtllmGenBf16Impl
+    assert find_trtllm_gen_leaf(None) is TrtllmTrtllmGenBf16Impl
     assert find_trtllm_gen_leaf(QuantAlgo.W8A16) is None
 
 
@@ -841,9 +867,6 @@ def test_trtllm_gen_situ_admitted_only_by_the_leaves_with_a_fused_cubin(impl_id)
     ``__init__`` means resolution hands back a winner and construction then
     raises, which reads as a crash rather than as a format that was never
     eligible.
-
-    The FlashInfer bf16 leaf is turned down too: SiTu is a native TRTLLM-Gen
-    cubin and is absent from FlashInfer's activation enum.
     """
     impl = MOE_IMPL_REGISTRY.lookup(MoEImplId.parse(impl_id))
     quant = impl.descriptor.identity.quant
@@ -853,7 +876,7 @@ def test_trtllm_gen_situ_admitted_only_by_the_leaves_with_a_fused_cubin(impl_id)
             dtype_act=torch.bfloat16,
             activation="SiTu",
         ),
-        _single_rank_deployment(_trtllm_gen_environment(flashinfer=True)),
+        _single_rank_deployment(_trtllm_gen_environment()),
     )
     if impl_id in _SITU_CAPABLE_IDS:
         assert verdict.eligible, verdict.detail
