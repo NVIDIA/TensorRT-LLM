@@ -16,6 +16,8 @@ import torch
 
 import tensorrt_llm._torch.models.modeling_qwen3_next as m
 
+pytestmark = pytest.mark.cpu_only
+
 
 class _FakeMapping:
     """Just enough of Mapping for the decoder-layer fusion logic."""

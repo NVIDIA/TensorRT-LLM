@@ -35,6 +35,8 @@ from tensorrt_llm._torch.weight_sharing import (
 )
 from tensorrt_llm.logger import logger
 
+pytestmark = pytest.mark.cpu_only
+
 
 class _Model(nn.Module):
     pass
