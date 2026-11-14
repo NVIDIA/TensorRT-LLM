@@ -25,6 +25,7 @@ to every process. Exits with the first non-zero pytest exit code, or 0.
 
 import argparse
 import os
+import shlex
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -103,15 +104,28 @@ def select_entries(cpu_list: Path = CPU_LIST) -> Tuple[List[Entry], List[str]]:
         entry = raw_entry.strip()
         if not entry.startswith("unittest/"):
             continue
-        target_part = entry.split("::")[0].split(" ")[0]
-        if entry != target_part and "::" not in entry:
-            # Entries with -k, -m, TIMEOUT or ISOLATION run with options this
-            # runner does not reproduce; run them through the CI stage instead.
+        args = shlex.split(entry)
+        ignored = []
+        index = 1
+        while index < len(args):
+            option = args[index]
+            if option.startswith("--ignore=") and option != "--ignore=":
+                ignored.append((tests_root / option.partition("=")[2]).resolve())
+            elif (
+                option == "--ignore"
+                and index + 1 < len(args)
+                and not args[index + 1].startswith("-")
+            ):
+                index += 1
+                ignored.append((tests_root / args[index]).resolve())
+            else:
+                break
+            index += 1
+        if index < len(args):
+            # Other options and test-list markers are not reproduced by this runner.
             notes.append(f"skipped (has options): {entry}")
             continue
-        if "::" in entry and " " in entry:
-            notes.append(f"skipped (has options): {entry}")
-            continue
+        entry = args[0]
         target = entry.split("::")[0].rstrip("/")
         path = tests_root / target
         if "::" in entry:
@@ -127,6 +141,7 @@ def select_entries(cpu_list: Path = CPU_LIST) -> Tuple[List[Entry], List[str]]:
             selected = tuple(
                 str(candidate.relative_to(tests_root))
                 for candidate in sorted(path.rglob("test_*.py"))
+                if not any(candidate.resolve().is_relative_to(skip) for skip in ignored)
                 if _is_serve_cpu_test(candidate)
             )
             if selected:
