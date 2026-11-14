@@ -1505,7 +1505,9 @@ def _create_py_executor(
             py_executor.shutdown()
             raise
 
-    _adjust_torch_mem_fraction()
+    _adjust_torch_mem_fraction(
+        use_reclaimable_memory=kv_cache_creator is not None
+        and kv_cache_creator._is_kv_cache_manager_v2)
 
     if mapping.rank == 0:
         logger.info(f"LLM Args:\n{llm_args}")

@@ -24,8 +24,9 @@ import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm._errors import ResourceError, UnsupportedError
 from tensorrt_llm._utils import (confidential_compute_enabled, get_sm_version,
-                                 is_sm_100f, prefer_pinned,
-                                 str_dtype_to_binding, torch_dtype_to_str)
+                                 is_device_integrated, is_sm_100f,
+                                 prefer_pinned, str_dtype_to_binding,
+                                 torch_dtype_to_str)
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 # isort: off
@@ -78,6 +79,7 @@ from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
                                            MambaHybridCacheManagerV2,
                                            MixedMambaHybridCacheManager,
                                            use_py_mamba_cache_manager)
+from .kv_cache.memory_utils import get_integrated_gpu_free_memory
 from .llm_request import ExecutorResponse, LlmRequestState
 from .model_engine import ModelEngine
 from .py_executor import PyExecutor, PyExecutorResources
@@ -1455,6 +1457,28 @@ class KvCacheCreator:
                         include_request_cost=include_request_cost))
         return None
 
+    def _get_device_free_memory(self) -> tuple[int, int]:
+        """Return ``(free, total)`` device bytes for KV cache sizing.
+
+        Equivalent to ``torch.cuda.mem_get_info()`` except for the V2 KV cache
+        manager on integrated GPUs, where free memory also counts reclaimable
+        page cache (see ``get_integrated_gpu_free_memory``). The V2 manager
+        fails at construction when its quota cannot hold the live recurrent
+        states, so counting page cache as consumed device memory makes hybrid
+        models fail to start on unified-memory systems after a cold image pull.
+        Discrete GPUs and the V1 manager are unchanged.
+        """
+        free, total = torch.cuda.mem_get_info()
+        if not (self._is_kv_cache_manager_v2 and is_device_integrated()):
+            return free, total
+        adjusted = get_integrated_gpu_free_memory(free, total)
+        if adjusted != free:
+            logger.info(
+                "Integrated GPU: sizing the V2 KV cache from "
+                f"{adjusted / GB:.2f} GiB of free memory including reclaimable "
+                f"page cache (CUDA reports {free / GB:.2f} GiB free).")
+        return adjusted, total
+
     def _cal_max_memory(self, peak_memory, total_gpu_memory, fraction,
                         allocated_bytes: int) -> int:
         """
@@ -1852,7 +1876,7 @@ class KvCacheCreator:
             ) if self._kv_cache_config.max_tokens is not None else estimate_max_tokens
             self._kv_cache_config.avg_seq_len = self._max_seq_len
             if self._is_kv_cache_manager_v2:
-                free_mem, _ = torch.cuda.mem_get_info()
+                free_mem, _ = self._get_device_free_memory()
                 max_gpu_total_bytes = int(
                     self._kv_cache_config.free_gpu_memory_fraction * free_mem)
                 if (self._max_gpu_total_bytes_in is not None
@@ -1936,7 +1960,7 @@ class KvCacheCreator:
 
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-        end, total_gpu_memory = torch.cuda.mem_get_info()
+        end, total_gpu_memory = self._get_device_free_memory()
         total_used_bytes = total_gpu_memory - end
         model_bytes = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         logger.info(
@@ -1985,7 +2009,7 @@ class KvCacheCreator:
 
                 # Clear the caching allocator before measuring the current memory usage
                 torch.cuda.empty_cache()
-                end, total_gpu_memory = torch.cuda.mem_get_info()
+                end, total_gpu_memory = self._get_device_free_memory()
                 torch_used_bytes = torch.cuda.memory_stats(
                 )["allocated_bytes.all.current"]
             finally:
@@ -5413,7 +5437,12 @@ def _try_infer_num_experts(model_config: ModelConfig) -> int:
     return num_experts
 
 
-def _adjust_torch_mem_fraction():
+def _adjust_torch_mem_fraction(*, use_reclaimable_memory: bool = False) -> None:
+    """Cap PyTorch allocations, counting shared page cache for V2 integrated GPUs.
+
+    Args:
+        use_reclaimable_memory: Whether the executor uses V2 memory accounting.
+    """
     # If true, adjust PyTorch CUDA memory fraction to correspond to the
     # total GPU memory minus the statically allocated engine memory.
     # If false, set the PyTorch CUDA memory fraction to 1.0.
@@ -5451,11 +5480,14 @@ def _adjust_torch_mem_fraction():
         return
     mem_reserved = torch.cuda.memory_reserved()
     mem_free, mem_total = torch.cuda.mem_get_info()
+    if use_reclaimable_memory and is_device_integrated():
+        mem_free = get_integrated_gpu_free_memory(mem_free, mem_total)
     # Keep room outside the PyTorch cap for driver allocations made after setup
     # (streams, events, copy launches in the KV cache manager and transfer agents),
     # up to the free memory, so the cap never drops below what PyTorch holds.
     safety_margin = min(1024**3, mem_free)
-    mem_torch_max = mem_free + mem_reserved - safety_margin
+    mem_torch_max = min(mem_total,
+                        max(0, mem_free + mem_reserved - safety_margin))
     mem_torch_fraction = mem_torch_max / mem_total
     logger.info(
         f"Setting PyTorch memory fraction to {mem_torch_fraction} ({mem_torch_max / 1024**3} GiB)"
