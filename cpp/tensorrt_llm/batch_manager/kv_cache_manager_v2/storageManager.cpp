@@ -23,6 +23,7 @@
 #include "kv_cache_manager_v2/exceptions.h"
 #include "kv_cache_manager_v2/page.h"
 #include "kv_cache_manager_v2/stagingBuffer.h"
+#include "kv_cache_manager_v2/utils/copyUtils.h"
 #include "kv_cache_manager_v2/utils/funcGuard.h"
 #include "kv_cache_manager_v2/utils/hostMem.h"
 #include "kv_cache_manager_v2/utils/math.h"
@@ -38,6 +39,7 @@
 #include <string>
 #include <tuple>
 #include <utility>
+#include <variant>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -183,6 +185,18 @@ void sortFallenPagesByPriority(TypedVec<LifeCycleId, std::deque<SharedPtr<Page>>
         std::stable_sort(pages.begin(), pages.end(),
             [](auto const& lhs, auto const& rhs) { return lhs->priority() < rhs->priority(); });
     }
+}
+
+//! Whether a page's bytes can no longer change, so a disk copy of it stays valid. A committed page is final only
+//! once its block is full: a request that commits a partial tail keeps decoding into the same slot.
+bool hasFinalContent(Page const& page) noexcept
+{
+    if (!page.isCommitted())
+    {
+        return false;
+    }
+    auto const& committed = static_cast<CommittedPage const&>(page);
+    return committed.block != nullptr && committed.numTokensInBlock >= committed.block->tokensPerBlock();
 }
 
 } // namespace
@@ -556,6 +570,56 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     }
 
     mCopyEngine = std::make_unique<CopyEngine>(mPageStagingManager.get());
+
+    mNumRetainedCopies.resize(numCacheLevels());
+    for (CacheLevel level{0}; level < mLevels.size(); ++level)
+    {
+        mNumRetainedCopies[level].resize(numPoolGroups(level), 0);
+    }
+    // The options are per disk tier: a tier that does not set them gets neither retained copies nor write-through.
+    mKeepCopyAfterRestoreAt = TypedVec<CacheLevel, bool>(numCacheLevels(), false);
+    mProtectedCopyFractionAt = TypedVec<CacheLevel, float>(numCacheLevels(), 1.0F);
+    mWriteThroughAt = TypedVec<CacheLevel, bool>(numCacheLevels(), false);
+    for (CacheLevel level{0}; level < config.cacheTiers.size(); ++level)
+    {
+        if (auto const* disk = std::get_if<DiskCacheTierConfig>(&config.cacheTiers[level]))
+        {
+            mKeepCopyAfterRestoreAt[level] = disk->keepCopyAfterRestore;
+            mProtectedCopyFractionAt[level] = disk->protectedCopyFraction;
+            // Write-through copies pages as they are evicted into the host tier right above this disk tier. Without
+            // one (no host cache, or a KV connector that takes the host tier's place) it would never run.
+            bool const hostAbove
+                = level.value() >= 1 && cacheTier(CacheLevel{level.value() - 1}) == CacheTier::HOST_MEM;
+            if (disk->writeThrough && !hostAbove)
+            {
+                TLLM_LOG_WARNING(
+                    "[kvCacheManagerV2] disk tier %d: write_through needs a host tier right above it; disabled",
+                    static_cast<int>(level.value()));
+            }
+            mWriteThroughAt[level] = disk->writeThrough && hostAbove;
+            mDiskWriteThrough = mDiskWriteThrough || mWriteThroughAt[level];
+            configureAsyncDiskIo(static_cast<size_t>(disk->numIoThreads)); // validate() rejects negative values
+        }
+    }
+    if (mDiskWriteThrough && !asyncDiskIoEnabled())
+    {
+        // Write-through copies are background writes; without the I/O pool they would run on the stream's host
+        // function, ahead of restores.
+        TLLM_LOG_WARNING("[kvCacheManagerV2] disk write_through needs async disk I/O (num_io_threads > 0); disabled");
+        mDiskWriteThrough = false;
+        mWriteThroughAt = TypedVec<CacheLevel, bool>(numCacheLevels(), false);
+    }
+    for (CacheLevel level{0}; level < numCacheLevels(); ++level)
+    {
+        if (mKeepCopyAfterRestoreAt[level] || mWriteThroughAt[level])
+        {
+            TLLM_LOG_INFO(
+                "[kvCacheManagerV2] disk tier %d: keep_copy_after_restore=%d write_through=%d "
+                "protected_copy_fraction=%g",
+                static_cast<int>(level.value()), static_cast<int>(mKeepCopyAfterRestoreAt[level]),
+                static_cast<int>(mWriteThroughAt[level]), static_cast<double>(mProtectedCopyFractionAt[level]));
+        }
+    }
 }
 
 StorageManager::~StorageManager()
@@ -565,6 +629,7 @@ StorageManager::~StorageManager()
 
 void StorageManager::destroy()
 {
+    releaseAllRetainedCopies(/*level=*/std::nullopt);
     for (auto& lvl : mLevels)
     {
         TLLM_CHECK_DEBUG(lvl.storage);
@@ -858,6 +923,296 @@ void StorageManager::releaseSlot(LifeCycleId lc, CacheLevel level, Slot slot)
     mLevels.at(level).storage->release(pg, std::move(slot));
 }
 
+StorageManager::DiskCopyCounters StorageManager::diskCopyCounters() const noexcept
+{
+    DiskCopyCounters counters = mDiskCopyCounters;
+    counters.retained = mRetainedCopies.size();
+    return counters;
+}
+
+SlotCount StorageManager::numRetainedCopies(CacheLevel level, std::optional<PoolGroupIndex> pgIdx) const
+{
+    auto const& counts = mNumRetainedCopies.at(level);
+    if (pgIdx.has_value())
+    {
+        return counts.at(*pgIdx);
+    }
+    return std::accumulate(counts.begin(), counts.end(), SlotCount{0});
+}
+
+SlotCount StorageManager::protectedCopyShare(CacheLevel level, PoolGroupIndex pgIdx) const
+{
+    float const fraction = mProtectedCopyFractionAt.at(level);
+    SlotCount const slots = numSlots(pgIdx, level);
+    return fraction >= 1.0F ? slots
+                            : static_cast<SlotCount>(static_cast<double>(fraction) * static_cast<double>(slots));
+}
+
+void StorageManager::addRetainedCopy(
+    Page& page, CacheLevel level, PoolGroupIndex pgIdx, Slot slot, std::shared_ptr<BackgroundDiskWrites const> write)
+{
+    // With several disk levels a page may still retain a copy at another level; keep only the newest.
+    if (auto it = mRetainedByPage.find(&page); it != mRetainedByPage.end())
+    {
+        eraseRetainedCopy(it->second);
+        ++mDiskCopyCounters.reclaimed;
+    }
+    mRetainedCopies.push_back(RetainedCopy{&page, level, pgIdx, std::move(slot), false, std::move(write)});
+    try
+    {
+        mRetainedByPage.emplace(&page, std::prev(mRetainedCopies.end()));
+    }
+    catch (...)
+    {
+        // Without its map entry the node would outlive the page; give the slot back instead.
+        mLevels.at(level).storage->release(pgIdx, std::move(mRetainedCopies.back().slot));
+        mRetainedCopies.pop_back();
+        throw;
+    }
+    ++mNumRetainedCopies.at(level).at(pgIdx);
+    ++mDiskCopyCounters.created;
+}
+
+bool StorageManager::validateRetainedCopy(Page const& page, CacheLevel level)
+{
+    auto it = mRetainedByPage.find(&page);
+    if (it == mRetainedByPage.end() || it->second->level != level)
+    {
+        return false;
+    }
+    auto& copy = *it->second;
+    // A copy whose write is still running can stand in for the page: whoever takes the slot back waits on its ready
+    // event, as for any slot. Once the write has finished, the copy is usable only if it did not fail. A failure is
+    // recorded before the transfer publishes completion, so a finished event means the record is in place.
+    bool const finished = copy.slot.readyEvent.isClosed() || copy.slot.readyEvent.queryComplete();
+    bool usable = true;
+    if (finished)
+    {
+        copy.write.reset();
+        Address const address = slotAddress(copy.level, copy.pgIdx, copy.slot.slotId(), PoolIndex{0});
+        if (auto const* disk = std::get_if<DiskAddress>(&address); disk && consumeFailedDiskWrite(disk->fd, disk->pos))
+        {
+            TLLM_LOG_WARNING("[kvCacheManagerV2] discarding a disk copy whose write failed; the page is written again");
+            usable = false;
+        }
+    }
+    if (!usable)
+    {
+        eraseRetainedCopy(it->second);
+        ++mDiskCopyCounters.reclaimed;
+    }
+    return usable;
+}
+
+std::optional<Slot> StorageManager::takeRetainedCopy(Page const& page, CacheLevel level)
+{
+    auto it = mRetainedByPage.find(&page);
+    if (it == mRetainedByPage.end() || it->second->level != level)
+    {
+        return std::nullopt;
+    }
+    // Check again even if reserved: the write may have finished, and failed, since. A failed copy's slot goes back to
+    // the pool, so the caller's room check still holds.
+    if (!validateRetainedCopy(page, level))
+    {
+        return std::nullopt;
+    }
+    it = mRetainedByPage.find(&page);
+    auto entry = it->second;
+    // The eviction now depends on this write, so it must not wait behind other background writes.
+    if (promoteIfPending(*entry))
+    {
+        ++mDiskCopyCounters.reusedPending;
+    }
+    Slot slot = std::move(entry->slot);
+    --mNumRetainedCopies.at(level).at(entry->pgIdx);
+    mRetainedByPage.erase(it);
+    mRetainedCopies.erase(entry);
+    return slot;
+}
+
+bool StorageManager::reserveRetainedCopy(Page const& page, CacheLevel level, bool reserve) noexcept
+{
+    auto it = mRetainedByPage.find(&page);
+    if (it == mRetainedByPage.end() || it->second->level != level)
+    {
+        return false;
+    }
+    it->second->reserved = reserve;
+    return true;
+}
+
+bool StorageManager::promoteIfPending(RetainedCopy const& copy) const
+{
+    if (copy.slot.readyEvent.isClosed() || copy.slot.readyEvent.queryComplete())
+    {
+        return false;
+    }
+    if (copy.write)
+    {
+        promoteBackgroundDiskWrites(*copy.write);
+    }
+    return true;
+}
+
+void StorageManager::eraseRetainedCopy(RetainedCopyList::iterator iter)
+{
+    // Whoever reuses the released disk slot (or the page's host slot, below) waits for a write still in flight, so it
+    // must not wait behind other background writes.
+    promoteIfPending(*iter);
+    // A write-through may still be reading the page's host slot, and its completion is tracked only here. Move it
+    // onto the page so whoever later releases the host slot waits for it.
+    if (mDiskWriteThrough)
+    {
+        Page& page = *iter->page;
+        if (page.cacheLevel != kHotLevel && cacheTier(page.cacheLevel) == CacheTier::HOST_MEM)
+        {
+            if (auto pending = pendingDiskWrite(page); !pending.isClosed())
+            {
+                std::vector<CachedCudaEvent> events{page.readyEvent, std::move(pending)};
+                page.readyEvent = mergeEvents(events);
+            }
+        }
+    }
+    mLevels.at(iter->level).storage->release(iter->pgIdx, std::move(iter->slot));
+    --mNumRetainedCopies.at(iter->level).at(iter->pgIdx);
+    mRetainedByPage.erase(iter->page);
+    mRetainedCopies.erase(iter);
+}
+
+void StorageManager::releaseRetainedCopies(CacheLevel level, PoolGroupIndex pgIdx, SlotCount count)
+{
+    for (auto it = mRetainedCopies.begin(); it != mRetainedCopies.end() && count > 0;)
+    {
+        auto next = std::next(it);
+        if (it->level == level && it->pgIdx == pgIdx && !it->reserved)
+        {
+            eraseRetainedCopy(it);
+            ++mDiskCopyCounters.reclaimed;
+            --count;
+        }
+        it = next;
+    }
+}
+
+void StorageManager::releaseAllRetainedCopies(std::optional<CacheLevel> level)
+{
+    for (auto it = mRetainedCopies.begin(); it != mRetainedCopies.end();)
+    {
+        auto next = std::next(it);
+        if (!level.has_value() || it->level == *level)
+        {
+            eraseRetainedCopy(it);
+            ++mDiskCopyCounters.reclaimed;
+        }
+        it = next;
+    }
+}
+
+void StorageManager::onPageDestroyed(Page& page) noexcept
+{
+    if (mRetainedByPage.empty())
+    {
+        return;
+    }
+    KVCM2_POISON_ON_EXCEPT(
+        [this, &page]()
+        {
+            auto it = mRetainedByPage.find(&page);
+            if (it != mRetainedByPage.end())
+            {
+                eraseRetainedCopy(it->second);
+                ++mDiskCopyCounters.dropped;
+            }
+        });
+}
+
+CachedCudaEvent StorageManager::pendingDiskWrite(Page const& page) const
+{
+    auto it = mRetainedByPage.find(&page);
+    if (it != mRetainedByPage.end() && promoteIfPending(*it->second))
+    {
+        return it->second->slot.readyEvent;
+    }
+    return CachedCudaEvent::makeNull();
+}
+
+void StorageManager::writeThroughToDisk(CacheLevel hostLevel, std::vector<SharedPtr<Page>> const& pages)
+{
+    CacheLevel const diskLevel = hostLevel + 1;
+    if (diskLevel >= numCacheLevels() || cacheTier(hostLevel) != CacheTier::HOST_MEM
+        || cacheTier(diskLevel) != CacheTier::DISK || !mWriteThroughAt.at(diskLevel))
+    {
+        return;
+    }
+    std::map<LayerGroupId, std::vector<SharedPtr<Page>>> batches;
+    for (auto const& page : pages)
+    {
+        if (page->cacheLevel == hostLevel && hasFinalContent(*page)
+            && mRetainedByPage.find(page.get()) == mRetainedByPage.end())
+        {
+            batches[getMigrationBatchingLayerGroupId(diskLevel, hostLevel, page->lifeCycle)].push_back(page);
+        }
+    }
+    for (auto& [batchingLayerGroupId, batch] : batches)
+    {
+        PoolGroupIndex const pgIdx = getPoolGroupIndex(diskLevel, batchingLayerGroupId);
+        // A write-through copy only saves a later write, so it never makes room: it takes free disk slots only,
+        // stays within the background write budget so it cannot build up a backlog, and stays within the tier's
+        // protected copy share, since a copy beyond it would be the first to go when the tier runs short.
+        SlotCount const free = poolGroup(diskLevel, pgIdx).numFreeSlots();
+        SlotCount const share = protectedCopyShare(diskLevel, pgIdx);
+        SlotCount const copies = numRetainedCopies(diskLevel, pgIdx);
+        size_t const pageBytes = slotSize(diskLevel, pgIdx).at(PoolIndex{0});
+        size_t const take = std::min({batch.size(), static_cast<size_t>(std::max<SlotCount>(free, 0)),
+            static_cast<size_t>(share > copies ? share - copies : SlotCount{0}),
+            pageBytes == 0 ? batch.size() : backgroundDiskWriteBudget() / pageBytes});
+        mDiskCopyCounters.writeThroughSkipped += batch.size() - take;
+        if (take == 0)
+        {
+            continue;
+        }
+        batch.resize(take);
+        // Copy without moving. The page's ready event is left alone, so host -> GPU restores don't wait for this
+        // write; its completion lives on the retained slot, and releases of the host slot merge it in
+        // (pendingDiskWrite).
+        // The required GPU -> host eviction has already succeeded, so a failure here only costs the early copy:
+        // give back the disk slots not yet retained and let these pages be written on their host -> disk eviction.
+        std::optional<std::vector<Slot>> slots;
+        size_t added = 0;
+        try
+        {
+            std::shared_ptr<BackgroundDiskWrites const> writes;
+            {
+                BackgroundDiskWriteScope background;
+                slots = _batchedMigrate(diskLevel, hostLevel, batch, /*updateSrc=*/false, MigrationRecorder{});
+                writes = background.takeWrites();
+            }
+            TLLM_CHECK(slots.has_value() && slots->size() == take);
+            for (; added < take; ++added)
+            {
+                addRetainedCopy(*batch[added], diskLevel, pgIdx, std::move(slots->at(added)), writes);
+            }
+        }
+        catch (std::exception const& e)
+        {
+            if (slots.has_value())
+            {
+                for (auto& slot : *slots)
+                {
+                    if (slot.hasValidSlot())
+                    {
+                        poolGroup(diskLevel, pgIdx).release(std::move(slot));
+                    }
+                }
+            }
+            mDiskCopyCounters.writeThroughSkipped += take - added;
+            TLLM_LOG_WARNING("[KVCacheManagerV2] Disk write-through of %zu pages skipped: %s", take - added, e.what());
+        }
+        mDiskCopyCounters.writeThroughPages += added;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // isEvictable
 // ---------------------------------------------------------------------------
@@ -1141,6 +1496,127 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
             { return count + slotCountValueFromSize(pagesByLifeCycle.at(lifeCycle).size()); });
     };
 
+    // Keep-disk-copy: a fallen page whose copy is retained at this level takes that slot back, so it needs no free
+    // slot here. Reserve those copies, then reclaim other retained copies only for what eviction cannot cover.
+    PagesByLifeCycle keptPages(numLifeCycles());
+    // Kept pages came out of the caller's fallenPages, which may hold their only references. If this frame fails
+    // before accepting them, hand them back so the caller's rollback reschedules them instead of dropping them.
+    bool keptPagesAccepted = false;
+    auto unreserveKeptPages = FuncGuard(
+        [&]()
+        {
+            for (LifeCycleId lifeCycle{0}; lifeCycle < keptPages.size(); ++lifeCycle)
+            {
+                for (auto& page : keptPages.at(lifeCycle))
+                {
+                    reserveRetainedCopy(*page, lvlId, /*reserve=*/false);
+                    if (!keptPagesAccepted)
+                    {
+                        try
+                        {
+                            fallenPages.at(lifeCycle).push_back(std::move(page));
+                        }
+                        catch (std::exception const&)
+                        {
+                            // Out of memory while unwinding: the page is dropped, as it would be without the guard.
+                        }
+                    }
+                }
+            }
+        });
+    if (numRetainedCopies(lvlId) > 0)
+    {
+        for (LifeCycleId lifeCycle{0}; lifeCycle < fallenPages.size(); ++lifeCycle)
+        {
+            auto& pages = fallenPages.at(lifeCycle);
+            PageQueue remaining;
+            while (!pages.empty())
+            {
+                auto page = std::move(pages.front());
+                pages.pop_front();
+                if (validateRetainedCopy(*page, lvlId) && reserveRetainedCopy(*page, lvlId, /*reserve=*/true))
+                {
+                    keptPages.at(lifeCycle).push_back(std::move(page));
+                }
+                else
+                {
+                    remaining.push_back(std::move(page));
+                }
+            }
+            pages = std::move(remaining);
+        }
+        for (PoolGroupIndex pgIdx{0}; pgIdx < numPoolGroups(lvlId); ++pgIdx)
+        {
+            SlotCount const required = goals.at(lvlId).at(pgIdx) + countPages(pgIdx, fallenPages);
+            // Copies beyond the tier's protected share give way first, before any page whose only copy is here.
+            if (SlotCount const free = storage.numFreeSlots(pgIdx); required > free)
+            {
+                SlotCount const copies = numRetainedCopies(lvlId, pgIdx);
+                if (SlotCount const share = protectedCopyShare(lvlId, pgIdx); copies > share)
+                {
+                    releaseRetainedCopies(lvlId, pgIdx, std::min(copies - share, required - free));
+                }
+            }
+            // Within the share: a retained copy belongs to a page that still lives in a hotter level, so it is more
+            // recently used than any page whose only copy is here. At the last level, evicting such a page drops it
+            // without any I/O, so evict those first (LRU) and reclaim retained copies only for the shortfall. At
+            // other levels evicting a page means migrating it down, which costs more than reclaiming a duplicate.
+            SlotCount const available
+                = storage.numFreeSlots(pgIdx) + (isLast ? ctrl.numEvictablePages(pgIdx) : SlotCount{0});
+            if (required > available)
+            {
+                releaseRetainedCopies(lvlId, pgIdx, required - available);
+            }
+        }
+        if (isLast)
+        {
+            // Held pages must fit at the last level. A reserved copy of a droppable page only saves that page a
+            // write, so when held pages need the room, give the copy up: the page then falls like any other
+            // droppable page and is placed only if a slot is left.
+            bool movedKeptPages = false;
+            for (PoolGroupIndex pgIdx{0}; pgIdx < numPoolGroups(lvlId); ++pgIdx)
+            {
+                SlotCount heldNeed = goals.at(lvlId).at(pgIdx);
+                for (LifeCycleId lifeCycle : grouping.lifeCycles(pgIdx))
+                {
+                    for (auto const& page : fallenPages.at(lifeCycle))
+                    {
+                        if (page->status() == PageStatus::HELD)
+                        {
+                            ++heldNeed;
+                        }
+                    }
+                }
+                SlotCount room = storage.numFreeSlots(pgIdx) + ctrl.numEvictablePages(pgIdx);
+                for (LifeCycleId lifeCycle : grouping.lifeCycles(pgIdx))
+                {
+                    auto& kept = keptPages.at(lifeCycle);
+                    for (auto it = kept.begin(); it != kept.end() && room < heldNeed;)
+                    {
+                        if ((*it)->status() == PageStatus::HELD)
+                        {
+                            ++it;
+                            continue;
+                        }
+                        if (auto found = mRetainedByPage.find(it->get()); found != mRetainedByPage.end())
+                        {
+                            eraseRetainedCopy(found->second);
+                            ++mDiskCopyCounters.reclaimed;
+                            ++room;
+                        }
+                        fallenPages.at(lifeCycle).push_back(std::move(*it));
+                        it = kept.erase(it);
+                        movedKeptPages = true;
+                    }
+                }
+            }
+            if (movedKeptPages)
+            {
+                sortFallenPagesByPriority(fallenPages);
+            }
+        }
+    }
+
     TypedVec<PoolGroupIndex, SlotCount> numToEvict(numPoolGroups(lvlId), 0);
     PagesByLifeCycle heldPages(numLifeCycles());
 
@@ -1294,6 +1770,13 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
         std::all_of(fallenPages.begin(), fallenPages.end(), [](auto const& fp) { return fp.empty(); }),
         "All fallen pages must be consumed after level loop");
 
+    for (LifeCycleId lifeCycle{0}; lifeCycle < keptPages.size(); ++lifeCycle)
+    {
+        auto& accepted = acceptedPages.at(lifeCycle);
+        accepted.insert(accepted.end(), keptPages.at(lifeCycle).begin(), keptPages.at(lifeCycle).end());
+    }
+    keptPagesAccepted = true;
+
     for (PoolGroupIndex pgIdx{0}; pgIdx < grouping.numPoolGroups(); ++pgIdx)
     {
         std::map<MigrationBatchKey, std::vector<SharedPtr<Page>>> migrationBatches;
@@ -1313,6 +1796,10 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
         {
             CacheLevel const srcLevel = batchKey.first;
             _batchedMigrate(lvlId, srcLevel, pages, /*updateSrc=*/true, migrationRecorder);
+            if (mDiskWriteThrough && srcLevel == kHotLevel)
+            {
+                writeThroughToDisk(lvlId, pages);
+            }
             for (auto const& page : pages)
             {
                 if (srcLevel == kHotLevel && page->status() == PageStatus::DROPPABLE)
@@ -1388,20 +1875,66 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
     auto& srcPoolGroup = poolGroup(srcLevel, srcPgIdx);
     auto& dstPoolGroup = poolGroup(dstLevel, dstPgIdx);
 
-    if (dstPoolGroup.numFreeSlots() < numSlots)
-        throw OutOfPagesError("Not enough free slots for migration");
-
-    auto dstSlots = dstPoolGroup.allocateMultiple(numSlots);
-    // A15: allocated slot count must match the request.
-    TLLM_CHECK_DEBUG_WITH_INFO(slotCountValueFromSize(dstSlots.size()) == numSlots, "dst_slots size mismatch");
+    // Keep-disk-copy: pages with a retained copy at dstLevel take that slot back and are not copied.
+    std::vector<Slot> dstSlots(srcPages.size());
+    std::vector<char> reusedCopy(srcPages.size(), 0);
+    SlotCount numNewSlots = numSlots;
     try
     {
+        if (updateSrc && !defrag && !mRetainedByPage.empty())
+        {
+            // Check for room before taking any copy: a failure after taking them would have to put them back.
+            SlotCount numUsable = 0;
+            for (auto const& page : srcPages)
+            {
+                auto it = mRetainedByPage.find(page.get());
+                if (it != mRetainedByPage.end() && it->second->level == dstLevel
+                    && (it->second->reserved || validateRetainedCopy(*page, dstLevel)))
+                {
+                    ++numUsable;
+                }
+            }
+            if (dstPoolGroup.numFreeSlots() < numSlots - numUsable)
+            {
+                throw OutOfPagesError("Not enough free slots for migration");
+            }
+            for (std::size_t i = 0; i < srcPages.size(); ++i)
+            {
+                if (auto kept = takeRetainedCopy(*srcPages.at(i), dstLevel))
+                {
+                    dstSlots.at(i) = std::move(*kept);
+                    reusedCopy.at(i) = 1;
+                    --numNewSlots;
+                }
+            }
+        }
+        if (dstPoolGroup.numFreeSlots() < numNewSlots)
+        {
+            throw OutOfPagesError("Not enough free slots for migration");
+        }
+        auto freshSlots = dstPoolGroup.allocateMultiple(numNewSlots);
+        // A15: allocated slot count must match the request.
+        TLLM_CHECK_DEBUG_WITH_INFO(slotCountValueFromSize(freshSlots.size()) == numNewSlots, "dst_slots size mismatch");
+        std::size_t nextFresh = 0;
+        for (std::size_t i = 0; i < srcPages.size(); ++i)
+        {
+            if (!reusedCopy.at(i))
+            {
+                dstSlots.at(i) = std::move(freshSlots.at(nextFresh++));
+            }
+        }
+        bool const retainSrcCopy = updateSrc && !defrag && dstLevel < srcLevel && cacheTier(srcLevel) == CacheTier::DISK
+            && mKeepCopyAfterRestoreAt.at(srcLevel);
         thread_local std::vector<PageIndexPair> pageIndices;
         pageIndices.clear();
         pageIndices.reserve(srcPages.size());
         for (std::size_t i = 0; i < srcPages.size(); ++i)
         {
             TLLM_CHECK_DEBUG(defrag || !srcPages.at(i)->scheduledForEviction());
+            if (reusedCopy.at(i))
+            {
+                continue;
+            }
             pageIndices.push_back(PageIndexPair{
                 slotIdToPageIndexValue(dstSlots.at(i).slotId()), slotIdToPageIndexValue(srcPages.at(i)->slotId())});
         }
@@ -1422,14 +1955,22 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
                 for (std::size_t i = 0; i < srcPages.size(); ++i)
                 {
                     dstSlots.at(i).readyEvent = finishEvent;
-                    srcPages.at(i)->readyEvent = finishEvent;
+                    // A copy that leaves the page in place (write-through) must not hold up the page; its completion
+                    // lives on the destination slot.
+                    if (updateSrc)
+                    {
+                        srcPages.at(i)->readyEvent = finishEvent;
+                    }
                 }
             });
         {
             auto scope = tempStream.enter();
             CUstream const stream = tempStream.get();
-            submitMigrationBatch(
-                dstLevel, srcLevel, batchingLayerGroupId, pageIndices.data(), pageIndices.size(), stream);
+            if (!pageIndices.empty())
+            {
+                submitMigrationBatch(
+                    dstLevel, srcLevel, batchingLayerGroupId, pageIndices.data(), pageIndices.size(), stream);
+            }
         }
         updateReadyEvents.run();
 
@@ -1445,6 +1986,8 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
         std::set<std::pair<std::string, int>> emittedCacheLevelUpdates;
         bool const emitCacheLevelUpdates
             = updateSrc && !defrag && srcLevel != dstLevel && static_cast<bool>(mEventSink);
+        // Source slot event merged with a pending write-through, per (source event, pending write).
+        std::vector<std::pair<std::pair<CUevent, CUevent>, CachedCudaEvent>> mergedPendingWrites;
         for (std::size_t i = 0; i < srcPages.size(); ++i)
         {
             if (updateSrc)
@@ -1452,10 +1995,42 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
                 bool wasScheduled = srcPages.at(i)->scheduledForEviction();
                 if (wasScheduled)
                     excludeFromEviction(*srcPages.at(i));
-                // Replace the page's source slot with its destination and release the source slot back to the pool.
+                // A write-through may still be reading the source host slot, so whoever reuses that slot must wait
+                // for it too. Merge before exchangeSlot, so nothing that can throw runs between the exchange and the
+                // level update. The pages of a batch share one finish event, so this merges once per pending write.
+                std::optional<CachedCudaEvent> srcSlotReady;
+                if (mDiskWriteThrough && cacheTier(srcLevel) == CacheTier::HOST_MEM)
+                {
+                    if (auto pending = pendingDiskWrite(*srcPages.at(i)); !pending.isClosed())
+                    {
+                        auto const key = std::make_pair(srcPages.at(i)->readyEvent.handle(), pending.handle());
+                        auto merged = std::find_if(mergedPendingWrites.begin(), mergedPendingWrites.end(),
+                            [&key](auto const& entry) { return entry.first == key; });
+                        if (merged == mergedPendingWrites.end())
+                        {
+                            std::vector<CachedCudaEvent> events{srcPages.at(i)->readyEvent, std::move(pending)};
+                            merged = mergedPendingWrites.emplace(mergedPendingWrites.end(), key, mergeEvents(events));
+                        }
+                        srcSlotReady = merged->second;
+                    }
+                }
+                // Replace the page's source slot with its destination. The source slot is released, or kept as a
+                // retained disk copy.
                 Slot srcSlot = srcPages.at(i)->exchangeSlot(std::move(dstSlots.at(i)));
-                srcPoolGroup.release(std::move(srcSlot));
                 srcPages.at(i)->cacheLevel = dstLevel;
+                if (srcSlotReady.has_value())
+                {
+                    srcSlot.readyEvent = std::move(*srcSlotReady);
+                }
+                if (retainSrcCopy && hasFinalContent(*srcPages.at(i)))
+                {
+                    // The page's bytes are final, so the disk data stays valid while the page lives above.
+                    addRetainedCopy(*srcPages.at(i), srcLevel, srcPgIdx, std::move(srcSlot));
+                }
+                else
+                {
+                    srcPoolGroup.release(std::move(srcSlot));
+                }
                 if (emitCacheLevelUpdates && srcPages.at(i)->isCommitted())
                 {
                     auto const& page = static_cast<CommittedPage const&>(*srcPages.at(i));
@@ -1473,12 +2048,18 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
                     scheduleForEviction(*srcPages.at(i));
             }
         }
+        mDiskCopyCounters.reused += static_cast<uint64_t>(numSlots - numNewSlots);
         return updateSrc ? std::nullopt : std::optional<std::vector<Slot>>{std::move(dstSlots)};
     }
     catch (...)
     {
         for (auto& s : dstSlots)
-            dstPoolGroup.release(std::move(s));
+        {
+            if (s.hasValidSlot())
+            {
+                dstPoolGroup.release(std::move(s));
+            }
+        }
         throw;
     }
 }
@@ -1681,8 +2262,11 @@ StorageStatistics StorageManager::getStatistics(CacheLevel level, PoolGroupIndex
     SlotCount freeSlots = lvl.storage->numFreeSlots(pgIdx);
     SlotCount totalSlots = lvl.storage->numSlots(pgIdx);
     SlotCount evictable = lvl.controller.numEvictablePages(pgIdx);
+    // Retained disk copies are duplicates the level releases when it needs the room. They are reported apart from
+    // evictable pages; available() counts both.
+    SlotCount retainedCopies = mNumRetainedCopies.at(level).at(pgIdx);
     auto sizes = lvl.storage->slotSize(pgIdx);
-    return StorageStatistics{sizes, totalSlots, freeSlots, evictable};
+    return StorageStatistics{sizes, totalSlots, freeSlots, evictable, retainedCopies};
 }
 
 TypedVec<PoolGroupIndex, float> StorageManager::getUtilization(CacheLevel level) const
@@ -1883,6 +2467,9 @@ void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> ne
     {
         if (newNumSlots[pgIdx] >= oldNumSlots[pgIdx])
             continue;
+        // Shrinking moves or frees this group's slots. Retained copies are duplicates, so drop them rather than
+        // relocate them; groups that keep or grow their size keep their copies.
+        releaseRetainedCopies(level, pgIdx, numRetainedCopies(level, pgIdx));
         std::vector<SharedPtr<Page>> pages;
         if (persistentPages)
             pages = (*persistentPages)[pgIdx];

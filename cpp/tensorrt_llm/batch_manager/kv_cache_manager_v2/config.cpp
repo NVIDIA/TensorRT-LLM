@@ -151,6 +151,18 @@ void DiskCacheTierConfig::validate() const
     {
         throw std::invalid_argument("DiskCacheTierConfig: path '" + path + "' is not a directory");
     }
+    if (numIoThreads < 0 || numIoThreads > kMaxIoThreads)
+    {
+        throw std::invalid_argument("DiskCacheTierConfig: numIoThreads must be between 0 and 256");
+    }
+    if (writeThrough && numIoThreads == 0)
+    {
+        throw std::invalid_argument("DiskCacheTierConfig: writeThrough requires numIoThreads > 0");
+    }
+    if (!(protectedCopyFraction >= 0.0F && protectedCopyFraction <= 1.0F)) // also rejects NaN
+    {
+        throw std::invalid_argument("DiskCacheTierConfig: protectedCopyFraction must be between 0 and 1");
+    }
 }
 
 namespace

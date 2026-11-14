@@ -3017,10 +3017,21 @@ class KVCacheManagerV2(BaseResourceManager):
             assert disk_cache_path is not None
             _check_disk_tier_space(disk_cache_path, int(disk_cache_size), mapping)
             cache_tiers.append(
-                DiskCacheTierConfig(quota=int(disk_cache_size), path=disk_cache_path)
+                DiskCacheTierConfig(
+                    quota=int(disk_cache_size),
+                    path=disk_cache_path,
+                    num_io_threads=kv_cache_config.disk_io_threads,
+                    keep_copy_after_restore=kv_cache_config.disk_keep_copy_after_restore,
+                    write_through=kv_cache_config.disk_write_through,
+                    protected_copy_fraction=kv_cache_config.disk_protected_copy_fraction,
+                )
             )
             logger.info(
-                f"KV cache manager v2 disk cache quota set to {disk_cache_size / (1 << 30):.2f}GiB at {disk_cache_path}"
+                f"KV cache manager v2 disk cache quota set to {disk_cache_size / (1 << 30):.2f}GiB "
+                f"at {disk_cache_path} (io_threads={kv_cache_config.disk_io_threads}, "
+                f"keep_copy_after_restore={kv_cache_config.disk_keep_copy_after_restore}, "
+                f"write_through={kv_cache_config.disk_write_through}, "
+                f"protected_copy_fraction={kv_cache_config.disk_protected_copy_fraction})"
             )
         if self._sparse_kv_offload is not None:
             self._warn_if_lower_tiers_cannot_take_history(cache_tiers)
@@ -7812,6 +7823,11 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         stats.secondary_evictable_num_blocks = sum(
             level_stats[pool_group_id].evictable
+            for level_stats, level_pool_group_ids in secondary_levels
+            for pool_group_id in level_pool_group_ids
+        )
+        stats.secondary_retained_copy_num_blocks = sum(
+            level_stats[pool_group_id].retained_copies
             for level_stats, level_pool_group_ids in secondary_levels
             for pool_group_id in level_pool_group_ids
         )
