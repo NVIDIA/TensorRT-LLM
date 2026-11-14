@@ -2218,63 +2218,80 @@ def serve_encoder(
 
 @click.command("embeddings")
 @click.argument("model", type=str)
-@click.option("--host",
-              type=str,
-              default="localhost",
-              help="Hostname of the server.")
-@click.option("--port", type=int, default=8000, help="Port of the server.")
-@click.option('--log_level',
-              type=click.Choice(severity_map.keys()),
-              default='info',
-              help="The logging level.")
-@click.option("--max_batch_size",
-              type=int,
-              default=_LLM_ARGS_FIELDS["max_batch_size"].default,
-              help="Maximum batch size coalesced into a single encode() call.")
-@click.option(
+@stability_option("--host",
+                  type=str,
+                  default="localhost",
+                  help="Hostname of the server.",
+                  status="beta")
+@stability_option("--port",
+                  type=int,
+                  default=8000,
+                  help="Port of the server.",
+                  status="beta")
+@stability_option('--log_level',
+                  type=click.Choice(severity_map.keys()),
+                  default='info',
+                  help="The logging level.",
+                  status="beta")
+@stability_option(
+    "--max_batch_size",
+    type=int,
+    default=_LLM_ARGS_FIELDS["max_batch_size"].default,
+    help="Maximum batch size coalesced into a single encode() call.",
+    status="beta")
+@stability_option(
     "--max_num_tokens",
     type=int,
     default=8192,
-    help="Maximum number of batched input tokens in each encode() call.")
-@click.option(
+    help="Maximum number of batched input tokens in each encode() call.",
+    status="beta")
+@stability_option(
     "--max_queue_delay",
     type=click.FloatRange(min=0.0),
     default=0.005,
     help="Dynamic-batching hold window in seconds: how long an incoming request "
     "waits for others to join its batch before being dispatched (mirrors Triton's "
-    "max_queue_delay_microseconds).")
-@click.option(
+    "max_queue_delay_microseconds).",
+    status="prototype")
+@stability_option(
     "--max_queue_size",
     type=click.IntRange(min=1),
     default=2048,
     help="Maximum number of in-flight queued requests; further requests are "
-    "rejected with HTTP 429 (mirrors Triton's max_queue_size).")
-@click.option("--trust_remote_code",
-              is_flag=True,
-              default=False,
-              help="Flag for HF transformers.")
-@click.option(
+    "rejected with HTTP 429 (mirrors Triton's max_queue_size).",
+    status="prototype")
+@stability_option("--trust_remote_code",
+                  is_flag=True,
+                  default=False,
+                  help="Flag for HF transformers.",
+                  status="beta")
+@stability_option(
     "--config",
     "--extra_llm_api_options",
     "extra_llm_api_options",
     type=str,
     default=None,
     help="Path to a YAML configuration file. Explicit CLI flags take precedence "
-    "over values in this file.")
-@click.option("--hf_revision",
-              "--revision",
-              "revision",
-              type=str,
-              default=None,
-              help="The revision to use for the HuggingFace model "
-              "(branch name, tag name, or commit id).")
-@click.option("--metadata_server_config_file",
-              type=str,
-              default=None,
-              help="Path to metadata server config file")
-@click.option("--telemetry/--no-telemetry",
-              default=True,
-              help="Enable or disable anonymous usage telemetry collection.")
+    "over values in this file.",
+    status="prototype")
+@stability_option("--hf_revision",
+                  "--revision",
+                  "revision",
+                  type=str,
+                  default=None,
+                  help="The revision to use for the HuggingFace model "
+                  "(branch name, tag name, or commit id).",
+                  status="beta")
+@stability_option("--metadata_server_config_file",
+                  type=str,
+                  default=None,
+                  help="Path to metadata server config file",
+                  status="prototype")
+@stability_option(
+    "--telemetry/--no-telemetry",
+    default=True,
+    help="Enable or disable anonymous usage telemetry collection.",
+    status="beta")
 def serve_embedding(
     model: str,
     host: str,
