@@ -23,6 +23,7 @@
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <initializer_list>
 #include <optional>
 #include <torch/extension.h>
 
@@ -99,6 +100,19 @@ void minimaxM3Sm107Tp8SparseDecodeLc8(torch::Tensor const& q, torch::Tensor cons
             "sparse_decode_lc8: q8 must hold contiguous T * 1024 bytes with num_sf_k_tiles=8");
         TORCH_CHECK(sf->is_contiguous() && sf->numel() >= ((tokens + 127) / 128) * 128 * 32,
             "sparse_decode_lc8: sf must hold the padded 128-row MXFP8 scale tiles");
+    }
+    // The kernel dereferences every operand on q's device.
+    for (torch::Tensor const* t : std::initializer_list<torch::Tensor const*>{
+             &k, &v, &kBlockScale, &vBlockScale, &kGlobalScale, &vGlobalScale, &topk, &blockTable, &seqLens, &out})
+    {
+        TORCH_CHECK(
+            t->device() == q.device(), "minimax_m3_sm107_tp8_sparse_decode_lc8: every operand must be on q's device");
+    }
+    for (std::optional<torch::Tensor> const* t : std::initializer_list<std::optional<torch::Tensor> const*>{
+             &q8, &sf, &prefetchA, &prefetchB, &n1Self, &n1Next, &n1K, &n1V, &n1KScale, &n1VScale})
+    {
+        TORCH_CHECK(!t->has_value() || (*t)->device() == q.device(),
+            "minimax_m3_sm107_tp8_sparse_decode_lc8: every optional operand must be on q's device");
     }
 
     TRTLLM_MV2_NS::kernels::minimaxM3Sm107Tp8::MinimaxM3Tp8SparseDecodeLc8Params prm{};

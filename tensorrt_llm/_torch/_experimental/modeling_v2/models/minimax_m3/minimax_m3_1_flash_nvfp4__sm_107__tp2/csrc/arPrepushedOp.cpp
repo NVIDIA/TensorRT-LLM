@@ -24,6 +24,7 @@
 #include <torch/extension.h>
 
 #include <initializer_list>
+#include <limits>
 #include <optional>
 
 TRTLLM_MV2_NAMESPACE_BEGIN
@@ -41,12 +42,33 @@ void m31ArPrepushed(int64_t rank, torch::Tensor const& workspace, torch::Tensor 
     double eps, bool trigger_completion_at_end, std::optional<torch::Tensor> mx_out, std::optional<torch::Tensor> mx_sf)
 {
     TORCH_CHECK(allreduce_in.is_cuda() && allreduce_in.scalar_type() == at::kBFloat16 && allreduce_in.is_contiguous());
+    TORCH_CHECK(allreduce_in.dim() >= 1 && allreduce_in.size(-1) > 0 && allreduce_in.size(-1) % 8 == 0
+            && allreduce_in.numel() <= std::numeric_limits<int32_t>::max(),
+        "minimax_m31_ar_prepushed: allreduce_in's hidden size must be a positive multiple of 8");
     TORCH_CHECK(rank >= 0 && rank < 2, "minimax_m31_ar_prepushed: rank ", rank, " outside [0, 2)");
     for (torch::Tensor const* t :
         std::initializer_list<torch::Tensor const*>{&workspace, &residual_in, &residual_out, &norm_out, &gamma})
     {
         TORCH_CHECK(t->is_cuda() && t->device() == allreduce_in.device(),
             "minimax_m31_ar_prepushed: every operand must be a CUDA tensor on allreduce_in's device");
+    }
+    // residual_in / residual_out / norm_out are read and written as packed BF16 vectors of allreduce_in's size;
+    // gamma as one packed BF16 row of the hidden size.
+    for (torch::Tensor const* t : std::initializer_list<torch::Tensor const*>{&residual_in, &residual_out, &norm_out})
+    {
+        TORCH_CHECK(t->scalar_type() == at::kBFloat16 && t->is_contiguous() && t->numel() == allreduce_in.numel()
+                && reinterpret_cast<uintptr_t>(t->data_ptr()) % 16 == 0,
+            "minimax_m31_ar_prepushed: residual_in, residual_out and norm_out must be contiguous 16-byte aligned "
+            "bfloat16 tensors of allreduce_in's size");
+    }
+    TORCH_CHECK(gamma.scalar_type() == at::kBFloat16 && gamma.is_contiguous() && gamma.numel() == allreduce_in.size(-1)
+            && reinterpret_cast<uintptr_t>(gamma.data_ptr()) % 16 == 0,
+        "minimax_m31_ar_prepushed: gamma must be a contiguous 16-byte aligned bfloat16 [hidden] tensor");
+    for (std::optional<torch::Tensor> const* t :
+        std::initializer_list<std::optional<torch::Tensor> const*>{&mx_out, &mx_sf})
+    {
+        TORCH_CHECK(!t->has_value() || ((*t)->is_cuda() && (*t)->device() == allreduce_in.device()),
+            "minimax_m31_ar_prepushed: mx_out and mx_sf must be CUDA tensors on allreduce_in's device");
     }
     TRTLLM_MV2_NS::kernels::minimaxM31Sm107::arPrepushed::Params p{};
     p.rank = static_cast<int>(rank);

@@ -21,6 +21,8 @@
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <initializer_list>
+#include <limits>
 #include <optional>
 #include <torch/extension.h>
 
@@ -91,6 +93,36 @@ void minimaxM31Tp4SparseDecodeLc(torch::Tensor const& q, torch::Tensor const& k,
     {
         checkBytes(*q8, "q8");
         checkBytes(*sf, "sf");
+    }
+    // The kernel dereferences every operand on q's device and indexes requests by tok / decode_query_len.
+    for (torch::Tensor const* t : std::initializer_list<torch::Tensor const*>{
+             &k, &v, &kBlockScale, &vBlockScale, &kGlobalScale, &vGlobalScale, &topk, &blockTable, &seqLens, &out})
+    {
+        TORCH_CHECK(t->device() == q.device(), "minimax_m31_tp4_sparse_decode_lc: every operand must be on q's device");
+    }
+    TORCH_CHECK(kGlobalScale.numel() >= 1 && vGlobalScale.numel() >= 1,
+        "minimax_m31_tp4_sparse_decode_lc: the global scales must hold one element");
+    TORCH_CHECK(decodeQueryLen > 0 && decodeQueryLen <= std::numeric_limits<int32_t>::max(),
+        "minimax_m31_tp4_sparse_decode_lc: decode_query_len must be a positive int32");
+    int64_t const tokens = q.size(0);
+    if (tokens > 0)
+    {
+        int64_t const requests = (tokens - 1) / decodeQueryLen + 1;
+        TORCH_CHECK(topk.size(0) >= tokens, "minimax_m31_tp4_sparse_decode_lc: topk has fewer rows than q");
+        TORCH_CHECK(blockTable.dim() == 2 && blockTable.size(0) >= requests && seqLens.numel() >= requests,
+            "minimax_m31_tp4_sparse_decode_lc: block_table / seq_lens have fewer rows than the requests of q");
+    }
+    if (mxfp8)
+    {
+        TORCH_CHECK(q8->device() == q.device() && sf->device() == q.device(),
+            "minimax_m31_tp4_sparse_decode_lc: q8 and sf must be on q's device");
+        // q8 rows are num_sf_k_tiles * 128 bytes apart; sf holds num_sf_k_tiles * 512 bytes per 128-row tile.
+        TORCH_CHECK(numSfKTiles * 128 >= kHeads * kHeadDim,
+            "minimax_m31_tp4_sparse_decode_lc: num_sf_k_tiles must cover the 2048-wide row");
+        TORCH_CHECK(q8->is_contiguous() && q8->numel() >= tokens * numSfKTiles * 128,
+            "minimax_m31_tp4_sparse_decode_lc: q8 must be contiguous with num_sf_k_tiles * 128 bytes per row");
+        TORCH_CHECK(sf->is_contiguous() && sf->numel() >= (tokens + 127) / 128 * numSfKTiles * 512,
+            "minimax_m31_tp4_sparse_decode_lc: sf must be contiguous with num_sf_k_tiles * 512 bytes per 128 rows");
     }
 
     TRTLLM_MV2_NS::kernels::MinimaxM31Tp4SparseDecodeLcParams prm{};
