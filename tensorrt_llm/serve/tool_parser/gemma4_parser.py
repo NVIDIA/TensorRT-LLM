@@ -14,7 +14,7 @@
 # limitations under the License.
 
 import json
-from typing import List, Optional, Tuple
+from typing import Iterator, List, Optional, Tuple
 
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.openai_protocol import ChatCompletionToolsParam as Tool
@@ -251,12 +251,13 @@ def _parse_gemma4_args(text: str) -> dict:
     return result
 
 
-def _extract_tool_calls(text: str) -> List[Tuple[str, str]]:
-    """Extract all tool call blocks from text.
+def _iter_tool_call_blocks(text: str) -> Iterator[Tuple[int, int, Optional[Tuple[str, str]]]]:
+    """Yield each block from a start token to the next end token.
 
-    Returns list of (function_name, args_string) tuples.
+    Yields (start, end, call) where text[start:end] is the block and call is
+    a (function_name, args_string) tuple, or None for a block without a
+    `call:` header. A start token with no end token after it ends the scan.
     """
-    calls = []
     search_from = 0
     while True:
         start = text.find(BOT_TOKEN, search_from)
@@ -266,6 +267,7 @@ def _extract_tool_calls(text: str) -> List[Tuple[str, str]]:
         if end == -1:
             break
 
+        call = None
         inner = text[start + len(BOT_TOKEN) : end].strip()
         if inner.startswith(CALL_PREFIX):
             inner = inner[len(CALL_PREFIX) :]
@@ -279,10 +281,18 @@ def _extract_tool_calls(text: str) -> List[Tuple[str, str]]:
                     args_str = inner[brace_pos + 1 : close]
                 else:
                     args_str = inner[brace_pos + 1 :]
-                calls.append((func_name, args_str))
+                call = (func_name, args_str)
 
         search_from = end + len(EOT_TOKEN)
-    return calls
+        yield start, search_from, call
+
+
+def _extract_tool_calls(text: str) -> List[Tuple[str, str]]:
+    """Extract all tool call blocks from text.
+
+    Returns list of (function_name, args_string) tuples.
+    """
+    return [call for _, _, call in _iter_tool_call_blocks(text) if call is not None]
 
 
 class Gemma4ToolParser(BaseToolParser):
@@ -314,7 +324,6 @@ class Gemma4ToolParser(BaseToolParser):
 
         # Streaming state
         self._is_inside_tool_call = False
-        self._current_func_name: Optional[str] = None
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a Gemma4 format tool call."""
@@ -326,13 +335,21 @@ class Gemma4ToolParser(BaseToolParser):
             return StreamingParseResult(normal_text=text, calls=[])
 
         tool_indices = self._get_tool_indices(tools)
-        raw_calls = _extract_tool_calls(text)
 
+        # Normal text is the text outside the call blocks, as the streaming
+        # path reports it. A block that is skipped contributes no text.
+        normal_parts = []
+        cursor = 0
         calls = []
-        for func_name, args_str in raw_calls:
+        for start, end, call in _iter_tool_call_blocks(text):
+            normal_parts.append(text[cursor:start])
+            cursor = end
+            if call is None:
+                continue
+            func_name, args_str = call
             try:
                 parsed_args = _parse_gemma4_args(args_str)
-            except (ValueError, IndexError, TypeError, KeyError) as e:
+            except (ValueError, IndexError, TypeError, KeyError, RecursionError) as e:
                 logger.warning(f"Failed to parse Gemma4 tool call args: {args_str}, error: {e}")
                 continue
 
@@ -348,9 +365,14 @@ class Gemma4ToolParser(BaseToolParser):
                 )
             )
 
-        # Normal text is everything before the first tool call
-        first_tc = text.find(BOT_TOKEN)
-        normal_text = text[:first_tc].strip() if first_tc > 0 else ""
+        # After the last block: text up to a call that never ends, otherwise
+        # all of it without stray end tokens.
+        tail = text[cursor:]
+        unterminated = tail.find(BOT_TOKEN)
+        normal_parts.append(
+            tail.replace(EOT_TOKEN, "") if unterminated == -1 else tail[:unterminated]
+        )
+        normal_text = "".join(normal_parts).strip()
 
         return StreamingParseResult(normal_text=normal_text, calls=calls)
 
@@ -358,9 +380,22 @@ class Gemma4ToolParser(BaseToolParser):
         """Streaming incremental parsing for Gemma4 tool calls.
 
         Maintains state across chunks to handle tool calls that span
-        multiple streaming increments.
+        multiple streaming increments. Every complete call in the buffer is
+        reported, so an increment that holds several calls reports all of them.
         """
         self._buffer += new_text
+        normal_parts, calls = [], []
+        while True:
+            state = (self._buffer, self._is_inside_tool_call)
+            result = self._parse_buffer_once(tools)
+            normal_parts.append(result.normal_text)
+            calls += result.calls
+            if (self._buffer, self._is_inside_tool_call) == state:
+                break
+        return StreamingParseResult(normal_text="".join(normal_parts), calls=calls)
+
+    def _parse_buffer_once(self, tools: List[Tool]) -> StreamingParseResult:
+        """Consume the text before the next call, or the next complete call."""
         current_text = self._buffer
 
         if not hasattr(self, "_tool_indices"):
@@ -392,7 +427,6 @@ class Gemma4ToolParser(BaseToolParser):
                 normal_text = current_text[:bot_pos]
                 self._buffer = current_text[bot_pos:]
                 self._is_inside_tool_call = True
-                self._current_func_name = None
 
                 if normal_text:
                     return StreamingParseResult(normal_text=normal_text)
@@ -405,57 +439,9 @@ class Gemma4ToolParser(BaseToolParser):
             eot_pos = current_text.find(EOT_TOKEN)
 
             if eot_pos == -1:
-                # Tool call not complete yet
-                # Try to extract function name if we haven't already
-                if self._current_func_name is None:
-                    prefix = BOT_TOKEN + CALL_PREFIX
-                    if current_text.startswith(prefix):
-                        rest = current_text[len(prefix) :]
-                        brace_pos = rest.find("{")
-                        if brace_pos != -1:
-                            func_name = rest[:brace_pos].strip()
-                            self._current_func_name = func_name
-
-                            # Initialize tool tracking
-                            if self.current_tool_id == -1:
-                                self.current_tool_id = 0
-                            self.streamed_args_for_tool.append("")
-                            while len(self.prev_tool_call_arr) <= self.current_tool_id:
-                                self.prev_tool_call_arr.append({})
-                            self.prev_tool_call_arr[self.current_tool_id] = {
-                                "name": func_name,
-                                "arguments": {},
-                            }
-                            self.current_tool_name_sent = True
-
-                            return StreamingParseResult(
-                                calls=[
-                                    ToolCallItem(
-                                        tool_index=self.current_tool_id,
-                                        name=func_name,
-                                        parameters="",
-                                    )
-                                ]
-                            )
-
-                # Stream raw argument text incrementally
-                if self._current_func_name is not None:
-                    prefix = BOT_TOKEN + CALL_PREFIX + self._current_func_name + "{"
-                    if current_text.startswith(prefix) and len(current_text) > len(prefix):
-                        args_so_far = current_text[len(prefix) :]
-                        already_sent = self.streamed_args_for_tool[self.current_tool_id]
-                        if len(args_so_far) > len(already_sent):
-                            diff = args_so_far[len(already_sent) :]
-                            self.streamed_args_for_tool[self.current_tool_id] += diff
-                            return StreamingParseResult(
-                                calls=[
-                                    ToolCallItem(
-                                        tool_index=self.current_tool_id,
-                                        parameters=diff,
-                                    )
-                                ]
-                            )
-
+                # Report nothing until the call is complete. A call whose
+                # arguments then fail to parse is skipped as a whole, as in
+                # detect_and_parse.
                 return StreamingParseResult()
 
             # Found end token - complete the tool call
@@ -475,35 +461,28 @@ class Gemma4ToolParser(BaseToolParser):
                     try:
                         parsed_args = _parse_gemma4_args(args_str)
                         args_json = json.dumps(parsed_args, ensure_ascii=False)
-                    except (ValueError, IndexError, TypeError, KeyError):
-                        args_json = "{}"
-
-                    calls = []
-
-                    if self._current_func_name is None:
-                        # We haven't sent the name yet (whole call in one chunk)
-                        if self.current_tool_id == -1:
-                            self.current_tool_id = 0
-                        while len(self.prev_tool_call_arr) <= self.current_tool_id:
-                            self.prev_tool_call_arr.append({})
-                        while len(self.streamed_args_for_tool) <= self.current_tool_id:
-                            self.streamed_args_for_tool.append("")
-
-                        calls.append(
-                            ToolCallItem(
-                                tool_index=self.current_tool_id,
-                                name=func_name,
-                                parameters=args_json,
-                            )
+                    except (ValueError, IndexError, TypeError, KeyError, RecursionError) as e:
+                        logger.warning(
+                            f"Failed to parse Gemma4 tool call args: {args_str}, error: {e}"
                         )
-                    else:
-                        # We already sent the name, now send final parsed JSON
-                        calls.append(
-                            ToolCallItem(
-                                tool_index=self.current_tool_id,
-                                parameters=args_json,
-                            )
+                        self._is_inside_tool_call = False
+                        self._buffer = remaining
+                        return StreamingParseResult()
+
+                    if self.current_tool_id == -1:
+                        self.current_tool_id = 0
+                    while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                        self.prev_tool_call_arr.append({})
+                    while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                        self.streamed_args_for_tool.append("")
+                    calls = [
+                        ToolCallItem(
+                            tool_index=self.current_tool_id,
+                            name=func_name,
+                            parameters=args_json,
                         )
+                    ]
+                    self.streamed_args_for_tool[self.current_tool_id] = args_json
 
                     # Store for serving layer
                     try:
@@ -516,7 +495,6 @@ class Gemma4ToolParser(BaseToolParser):
 
                     # Reset state for next tool call
                     self._is_inside_tool_call = False
-                    self._current_func_name = None
                     self._buffer = remaining
                     self.current_tool_id += 1
                     self.current_tool_name_sent = False
@@ -525,14 +503,12 @@ class Gemma4ToolParser(BaseToolParser):
 
             # Couldn't parse the tool call content
             self._is_inside_tool_call = False
-            self._current_func_name = None
             self._buffer = remaining
             return StreamingParseResult()
 
         except (ValueError, IndexError, TypeError, KeyError) as e:
             logger.error(f"Error in Gemma4 streaming parse: {e}")
             self._is_inside_tool_call = False
-            self._current_func_name = None
             self._buffer = ""
             return StreamingParseResult()
 
