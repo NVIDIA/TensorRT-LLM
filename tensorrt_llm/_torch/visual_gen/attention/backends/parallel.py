@@ -26,6 +26,7 @@ from weakref import WeakValueDictionary
 
 import torch
 import torch.distributed as dist
+import torch.distributed._functional_collectives as funcol
 import torch.nn.functional as F
 
 if TYPE_CHECKING:
@@ -899,6 +900,46 @@ class UlyssesAttention(AttentionBackend):
         self, tokens_per_page: int, dtype: Optional[torch.dtype] = None
     ) -> bool:
         return self.inner_backend.support_kv_cache_page_size(tokens_per_page, dtype)
+
+    def accepts_fp8_qkv(self) -> bool:
+        return self._async_side_stream is None and self.inner_backend.accepts_fp8_qkv()
+
+    def fp8_v_amax(self, qkv: torch.Tensor, num_heads: int, head_dim: int) -> torch.Tensor:
+        local_amax = torch.ops.trtllm.dit_v_amax(qkv, num_heads, head_dim)
+        return funcol.all_reduce(local_amax, "max", self.process_group)
+
+    def _fp8_all_to_all(self, t: torch.Tensor, scatter_dim: int, gather_dim: int) -> torch.Tensor:
+        # FP8 payloads move as int64 words (or bytes when the head dim is not a multiple of 8).
+        word = torch.int64 if t.shape[-1] % 8 == 0 else torch.uint8
+        out = all_to_all_4d(
+            t.contiguous().view(word),
+            scatter_dim=scatter_dim,
+            gather_dim=gather_dim,
+            process_group=self.process_group,
+        )
+        return out.view(t.dtype)
+
+    def forward_fp8(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        v_descale: torch.Tensor,
+        batch_size: int,
+        seq_len: int,
+        out_scale: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """[B, S/P, H, D] e4m3 Q/K/V to [B, S/P, H, D]; scales are equal on every rank."""
+        q, k, v = (self._fp8_all_to_all(t, scatter_dim=2, gather_dim=1) for t in (q, k, v))
+        seq_len_full = q.shape[1]
+        out = self.inner_backend.forward_fp8(
+            q, k, v, v_descale, batch_size, seq_len_full, out_scale=out_scale
+        )
+        if out.dtype == torch.float8_e4m3fn:
+            return self._fp8_all_to_all(out, scatter_dim=1, gather_dim=2)
+        return all_to_all_4d(
+            out.contiguous(), scatter_dim=1, gather_dim=2, process_group=self.process_group
+        )
 
 
 class Attention2DAttention(AttentionBackend):
