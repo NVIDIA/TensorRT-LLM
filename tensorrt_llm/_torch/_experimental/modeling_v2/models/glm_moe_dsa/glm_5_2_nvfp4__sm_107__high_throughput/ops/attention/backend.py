@@ -12,6 +12,9 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings
+from tensorrt_llm._torch.attention.backends.fmha.prims_ts_dsa_sparse_mla import (
+    prims_ts_reads_nvfp4_mla_records,
+)
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
@@ -237,6 +240,10 @@ class RubinDSATrtllmAttention(TrtllmAttention):
 
         worklist = None
         if kv_cache_dtype == tensorrt_llm.bindings.DataType.NVFP4 and is_generation:
+            if prims_ts_reads_nvfp4_mla_records(metadata, self):
+                forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr = None
+                return self._remap_topk_to_global(topk_indices, metadata, is_generation), None
+            metadata.ensure_nvfp4_mla_generation_buffers()
             worklist = getattr(metadata, "_glm_rubin_owner_worklist", None)
             signature = (
                 id(metadata.kv_cache_manager),

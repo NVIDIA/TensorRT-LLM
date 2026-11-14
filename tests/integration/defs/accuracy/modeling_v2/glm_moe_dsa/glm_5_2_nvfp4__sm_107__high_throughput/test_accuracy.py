@@ -67,6 +67,9 @@ _HIGH_THROUGHPUT_ENV = {
     "TLLM_METRICS_ALL_RANKS": "1",
     "TRTLLM_ENABLE_PDL": "1",
     "TRTLLM_MLA_Q_QUANT_GRID_USE_Q_LEN": "1",
+    "TRTLLM_NVFP4_MLA_KV_CACHE_LAYOUT": "fp8rope",
+    "TRTLLM_MLA_LATENT_SCALE": "auto",
+    "TLLM_FMHA_LIBS": "+prims_ts_dsa_sparse_mla",
 }
 
 
@@ -139,8 +142,15 @@ def _assert_high_throughput_paths(llm: LLM, batch_size: int, trace_dir: Path) ->
         assert len(rank_traces) == 1, f"Missing or duplicate trace for rank {rank}"
         events = json.loads(rank_traces[0].read_text())["traceEvents"]
         names = [event["name"] for event in events if event.get("cat") == "kernel"]
+        # PrimTS reads the NVFP4 records directly in its MLA dense_kernel;
+        # the residual-layout owner publisher must not run on this layout.
+        assert any("dense_kernel" in name for name in names), (
+            f"Rank {rank} did not execute the PrimTS MLA dense_kernel: {sorted(set(names))}"
+        )
+        assert not any("publishOwnerMembersKernel" in name for name in names), (
+            f"Rank {rank} used the residual-layout owner publisher with FP8 RoPE"
+        )
         for kernel in (
-            "publishOwnerMembersKernel",
             "glmRubinNoAuxTcFp4QuantKernel",
             "draftSampleGlueAdpKernel",
         ):

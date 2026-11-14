@@ -30,6 +30,8 @@
 
 """Checkpoint loading and weight layout conversion owned by the GLM-5.2 target."""
 
+import math
+import os
 from typing import Dict, List
 
 import torch
@@ -42,6 +44,58 @@ import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
 from tensorrt_llm._torch.models.modeling_utils import filter_weights
 from tensorrt_llm._torch.moe.fused_moe import is_moe_weight_owner
+from tensorrt_llm.logger import logger
+from tensorrt_llm.quantization import QuantMode
+
+
+def _mla_latent_scales(
+    weights: ConsumableWeightsDict,
+    quant_mode: QuantMode,
+    uses_dsa: bool,
+    dequantizes_kv_b_proj: bool,
+) -> dict[str, float]:
+    """Choose power-of-two scales for the cached NoPE latent in each attention layer.
+
+    Scaling the KV normalization weight and inversely scaling both KV projections
+    preserves the unquantized attention while avoiding tiny NVFP4 block scales.
+    A projection that remains quantized cannot absorb that factor exactly.
+    """
+    mode = os.environ.get("TRTLLM_MLA_LATENT_SCALE", "auto")
+    if mode == "off":
+        return {}
+    if mode == "auto":
+        target = 1.0
+        scaled = uses_dsa and quant_mode.has_fp4_kv_cache()
+    else:
+        try:
+            target = float(mode)
+        except ValueError:
+            target = math.nan
+        if not (target > 0 and math.isfinite(target)):
+            raise ValueError(
+                "TRTLLM_MLA_LATENT_SCALE must be 'auto', 'off' or a positive "
+                f"number, got {mode!r}"
+            )
+        scaled = quant_mode.has_kv_cache_quant()
+    if not scaled:
+        return {}
+
+    suffix = ".kv_a_layernorm.weight"
+    float_dtypes = (torch.bfloat16, torch.float16, torch.float32)
+    scales = {}
+    for key in list(weights.keys()):
+        if not key.endswith(suffix):
+            continue
+        module_name = key[: -len(suffix)]
+        projection = weights.get(f"{module_name}.kv_b_proj.weight")
+        if projection is None:
+            continue
+        if projection.dtype not in float_dtypes and not dequantizes_kv_b_proj:
+            continue
+        rms = weights[key][:].float().pow(2).mean().sqrt().item()
+        if rms > 0:
+            scales[module_name] = 2.0 ** round(math.log2(target / rms))
+    return scales
 
 
 @triton.jit
@@ -311,6 +365,17 @@ class Glm52WeightLoader:
             return model_nextn > (ckpt_num_nextn_predict_layers or 0) > 0
 
         has_shared_mtp_weights = detect_shared_mtp_weights()
+        latent_scales = _mla_latent_scales(
+            weights,
+            self.model_config.quant_config.layer_quant_mode,
+            uses_dsa=getattr(self.model_config.sparse_attention_config, "algorithm", None)
+            == "dsa",
+            dequantizes_kv_b_proj=self.model_config.quant_config.is_module_excluded_from_quantization(
+                "kv_b_proj"
+            ),
+        )
+        scaled_norms: set[str] = set()
+        scaled_projections: dict[str, float] = {}
 
         for name, module in tqdm(all_named_modules.items(), desc="Loading weights"):
             if len(module._parameters) <= 0 or name.startswith("draft_model"):
@@ -343,6 +408,10 @@ class Glm52WeightLoader:
                         kv_b_proj, k_b_proj_trans = load_kv_b_proj_and_k_b_proj_trans(
                             name, is_scale=False
                         )
+                    latent_scale = latent_scales.get(".".join(names[:-1]), 1.0)
+                    if latent_scale != 1.0:
+                        kv_b_proj = kv_b_proj / latent_scale
+                        k_b_proj_trans = k_b_proj_trans / latent_scale
                     module.weight.data.copy_(kv_b_proj.reshape(module.weight.shape))
 
                     attn_module = all_named_modules[parent_module_name]
@@ -352,6 +421,8 @@ class Glm52WeightLoader:
                     attn_module.k_b_proj_trans.data.copy_(
                         k_b_proj_trans.reshape(attn_module.k_b_proj_trans.shape)
                     )
+                    if latent_scale != 1.0:
+                        scaled_projections[parent_module_name] = latent_scale
 
                     if getattr(module, "weight_scale", None) is not None and not dequant_kv_b_proj:
                         kv_b_proj_scale, k_b_proj_trans_scale = load_kv_b_proj_and_k_b_proj_trans(
@@ -584,11 +655,25 @@ class Glm52WeightLoader:
                     continue
                 else:
                     module_weights = filter_weights(name, weights)
+                    if names[-1] == "kv_a_layernorm":
+                        latent_scale = latent_scales.get(".".join(names[:-1]), 1.0)
+                        if latent_scale != 1.0:
+                            module_weights["weight"] = module_weights["weight"][:] * latent_scale
                     if hasattr(module, "load_weights"):
                         module.load_weights(weights=[module_weights])
                     else:
                         for n, p in module.named_parameters():
                             p.data.copy_(module_weights[n][:])
+                    if names[-1] == "kv_a_layernorm" and latent_scale != 1.0:
+                        scaled_norms.add(parent_module_name)
                     # Mark consumed weights
                     if mark_consumed:
                         weights.mark_consumed(name)
+
+        applied_scales = ", ".join(
+            f"{name}:{scale:g}"
+            for name, scale in scaled_projections.items()
+            if name in scaled_norms
+        )
+        if applied_scales:
+            logger.info(f"GLM HIGH MLA latent scales applied (norm + K/V projections): {applied_scales}")
