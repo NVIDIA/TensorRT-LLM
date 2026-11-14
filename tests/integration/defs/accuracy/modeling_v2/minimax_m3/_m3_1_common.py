@@ -23,8 +23,12 @@ checkpoint (MXFP8 dense projections, packed NVFP4 routed experts) on sm_107 (Rub
 fused QKV/index projection and an FP8 indexer, an NVFP4 KV cache, and either no speculation or the checkpoint's
 standalone DSpark drafter. Each target subclass sets its parallel layout.
 
-GSM8K is scored against ``references/gsm8k.yaml`` under ``MODEL_NAME``; ``GSM8K.evaluate`` raises "Not registered
-specs" until a measured reference for these specs is registered there (see ``accuracy/README.md``).
+GSM8K runs under the InferenceX protocol (``GSM8KInferenceX``: the chat template with the five exemplars in one user
+turn, thinking as the checkpoint's template decides, the 12288-token generation budget and strict "#### N" extraction),
+as main scores MiniMax-M3 with thinking: MiniMax-M3.1-Flash is a chat-tuned reasoning checkpoint whose raw-prompt
+completions do not follow the plain few-shot format. It is scored against ``references/gsm8k_inferencex.yaml`` under
+``MODEL_NAME``; ``evaluate`` raises "Not registered specs" until a measured reference for these specs is registered
+there (see ``accuracy/README.md``).
 """
 
 from collections.abc import Iterator
@@ -45,7 +49,7 @@ from tensorrt_llm.llmapi import (
 from tensorrt_llm.quantization import QuantAlgo
 
 from ....conftest import llm_models_root
-from ...accuracy_core import GSM8K, LlmapiAccuracyTestHarness
+from ...accuracy_core import GSM8KInferenceX, LlmapiAccuracyTestHarness
 from .._env import scoped_env_overrides
 
 # The targets assert their own SM at construction: certification is per GPU architecture.
@@ -84,7 +88,8 @@ class _MiniMaxM31Target(LlmapiAccuracyTestHarness):
                     fuse_qkv_index_projection=True,
                     sparse_disable_index_value=True,
                 ),
-                max_seq_len=4096,
+                # The prompt plus the protocol's 12288-token generation budget.
+                max_seq_len=16384,
                 max_batch_size=64,
                 cuda_graph_config=CudaGraphConfig(enable_padding=True, max_batch_size=64),
                 speculative_config=spec,
@@ -99,5 +104,5 @@ class _MiniMaxM31Target(LlmapiAccuracyTestHarness):
         with self._llm(dspark) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.MXFP8
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
-            task = GSM8K(self.MODEL_NAME)
+            task = GSM8KInferenceX(self.MODEL_NAME)
             task.evaluate(llm)
