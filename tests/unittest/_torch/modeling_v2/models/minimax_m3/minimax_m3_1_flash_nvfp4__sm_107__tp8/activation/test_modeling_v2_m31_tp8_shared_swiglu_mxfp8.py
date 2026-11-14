@@ -65,7 +65,7 @@ def _scale_bytes(sf, m, nb):
 
 @pytest.mark.parametrize("m", [9, 48])
 def test_tiny_amax_blocks_stay_finite(m) -> None:
-    """A block whose scale code is 0 (amax / 448 <= 2^-127): native (since e627b3d880's cvt_warp_fp16_to_mxfp8
+    """A block whose scale code is 0 (amax / 448 <= 2^-127): native (with cvt_warp_fp16_to_mxfp8's
     code-0 guard; inf/NaN before it) quantizes it to zero; SWQ keeps native's scale byte, writes data quantized with
     the exact reciprocal 2^127, and stays bitwise to native on every other block."""
     g = torch.Generator(device="cuda").manual_seed(151 + m)

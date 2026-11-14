@@ -64,7 +64,7 @@ def test_the_copy_is_the_in_tree_module_but_for_its_specialization() -> None:
         and theirs.count(_IMPORT_OLD) == 1
     )
     ours = ours.replace(_JIT_NEW, _JIT_OLD).replace(_IMPORT_NEW, "")
-    # The in-tree module since perf2-vr e627b3d880 takes ``capability`` as a required argument in its five decode
+    # The in-tree module takes ``capability`` as a required argument in its five decode
     # policy helpers; the measured TP8 copy keeps the optional default (filled from the current device). Every caller
     # passes it, so the two are the same code there; this is the one delta allowed, at exactly five sites.
     if theirs.count(_CAP_REQUIRED) == 5:
