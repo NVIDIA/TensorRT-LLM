@@ -180,6 +180,7 @@ class OpenAIDisaggregatedService(OpenAIService):
         # context workers round-robin rather than going through the router,
         # which would charge the pick against KV-cache-aware load accounting.
         self._count_tokens_rr_counter = 0
+        self._models_rr_counter = 0
 
         match self._config.schedule_style:
             case "generation_first":
@@ -236,10 +237,15 @@ class OpenAIDisaggregatedService(OpenAIService):
         return server
 
     async def get_model(self) -> ModelList:
-        """Report the model as a worker serves it; the proxy holds none."""
-        return await self._ctx_client.get_json(
-            "v1/models", ModelList, await self._next_ctx_server()
-        )
+        """Report a generation worker's model and speculative decoding metadata."""
+        if not await self.is_ready():
+            raise RuntimeError("Cluster is not ready")
+        servers = self._gen_router.servers
+        if not servers:
+            raise RuntimeError("No generation servers are available")
+        server = servers[self._models_rr_counter % len(servers)]
+        self._models_rr_counter += 1
+        return await self._gen_client.get_json("v1/models", ModelList, server)
 
     async def anthropic_count_tokens(
         self, request: AnthropicCountTokensRequest

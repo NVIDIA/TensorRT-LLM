@@ -563,13 +563,13 @@ class _StubCtxClient:
 
 def _models_service(client, servers=("w0:8001", "w1:8001")):
     return _service(
-        _ctx_client=client,
-        _ctx_router=SimpleNamespace(servers=list(servers)),
-        _count_tokens_rr_counter=0,
+        _gen_client=client,
+        _gen_router=SimpleNamespace(servers=list(servers)),
+        _models_rr_counter=0,
     )
 
 
-def test_models_are_listed_by_a_context_worker_round_robin():
+def test_models_are_listed_by_a_generation_worker_round_robin():
     client = _StubCtxClient()
     service = _models_service(client)
     assert asyncio.run(service.get_model()).data[0].id == "served-name"
@@ -594,7 +594,7 @@ def test_models_are_listed_by_a_context_worker_round_robin():
             404,
         ),
     ],
-    ids=["no_context_worker", "worker_error"],
+    ids=["no_generation_worker", "worker_error"],
 )
 def test_a_models_failure_is_an_error_response(client, servers, status):
     server = OpenAIDisaggServer.__new__(OpenAIDisaggServer)
