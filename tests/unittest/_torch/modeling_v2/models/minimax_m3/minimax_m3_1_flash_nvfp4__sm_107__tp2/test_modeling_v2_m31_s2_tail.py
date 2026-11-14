@@ -139,6 +139,8 @@ def test_tail_mxfp8_of_another_tensor_is_not_taken(monkeypatch) -> None:
     monkeypatch.setattr(
         m, "m3_mxfp8_pinned_quantize", lambda x, t: (torch.zeros(1, dtype=torch.int8), None)
     )
-    m._S2_MX.publish(torch.zeros(64, 32, dtype=torch.bfloat16), torch.ones(64, 32), torch.ones(64))
+    # Keep the published tensor alive: the slot matches by address, and a freed temporary's address can be reused.
+    published = torch.zeros(64, 32, dtype=torch.bfloat16)
+    m._S2_MX.publish(published, torch.ones(64, 32), torch.ones(64))
     out, _ = m._linear(core, torch.zeros(64, 32, dtype=torch.bfloat16), "w", "s", True)
     assert out == ("gemm", torch.int8)

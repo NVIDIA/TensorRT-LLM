@@ -239,6 +239,7 @@ def test_tailbk_h_rewind_in_chain_launch(monkeypatch):
     ]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
 def test_tailbk_h_warmup_keeps_stock_path(monkeypatch):
     """The eager warmup of a graph batch (is_cuda_graph, not capturing): the stock method skips the rewind there, so
     the chain must not apply it either."""
