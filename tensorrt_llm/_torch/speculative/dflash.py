@@ -15,10 +15,11 @@
 
 import os
 import weakref
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
+import numpy as np
 import torch
 from torch import nn
 
@@ -603,6 +604,100 @@ def dflash_rebased_ctx_view(
     return dflash_rebased_ctx_rows(rows, rebase_pages), num_ctx
 
 
+def _dflash_mm_items(request) -> Optional[tuple]:
+    """``((hash, start), ...)`` for a request's multimodal items; None if unknown.
+
+    A prefix match must also match the images inside it: the prompt holds the
+    same placeholder ids for every image. The KV cache keys its blocks by these
+    hashes. A request with multimodal data but no hashes can't be matched safely.
+    """
+    hashes = getattr(request, "multimodal_hashes", None)
+    positions = getattr(request, "multimodal_positions", None)
+    if not hashes:
+        return None if getattr(request, "py_multimodal_data", None) else ()
+    if positions is None or len(positions) != len(hashes):
+        return None
+    return tuple((tuple(int(x) for x in h), int(p)) for h, p in zip(hashes, positions))
+
+
+def _dflash_mm_items_before(items: tuple, num_tokens: int) -> tuple:
+    return tuple(item for item in items if item[1] < num_tokens)
+
+
+class DFlashPromptTracker(BaseResourceManager):
+    """Records each request's tokens so DFlashWorker can match reused prefixes.
+
+    Holds no GPU memory. A prefix-cache hit lets the target skip the cached
+    prompt prefix, but the private dense drafter arena (VANILLA) has no K/V
+    for it. DFlashWorker keeps a finished request's arena slot and hands it to
+    a later request whose prompt starts with the tokens that slot holds; it
+    reads both token lists from here. Only the dense arena uses it.
+    """
+
+    def __init__(self, max_num_requests: int):
+        self.max_num_requests = max_num_requests
+        # request id -> [tokens (int32 ndarray), multimodal items or None]
+        self._live = {}
+        # Finished requests, LRU, kept until DFlashWorker retires their slot.
+        self._finished = OrderedDict()
+        self._finished_cap = max(2 * max_num_requests, 8)
+        # Cleared by DFlashWorker when the drafter context is paged: those pools
+        # either address a reused prefix themselves or can't take a slot over.
+        self._active = True
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
+    @active.setter
+    def active(self, value: bool) -> None:
+        self._active = bool(value)
+        if not self._active:
+            self.shutdown()
+
+    def prepare_resources(self, scheduled_batch):
+        if not self._active:
+            return
+        for req in scheduled_batch.context_requests:
+            rid = req.py_request_id
+            if rid in self._live or req.is_dummy:
+                continue
+            self._live[rid] = (
+                np.asarray(req.get_tokens(0), dtype=np.int32),
+                _dflash_mm_items(req),
+            )
+
+    def free_resources(self, request):
+        entry = self._live.pop(request.py_request_id, None)
+        if entry is None:
+            return
+        # Prompt plus generated tokens: the arena slot holds K/V for those too.
+        self._finished[request.py_request_id] = (
+            np.asarray(request.get_tokens(0), dtype=np.int32),
+            entry[1],
+        )
+        while len(self._finished) > self._finished_cap:
+            self._finished.popitem(last=False)
+
+    def lookup(self, request_id: int):
+        """(tokens, multimodal items) of a live or recently finished request, or None."""
+        entry = self._live.get(request_id)
+        return entry if entry is not None else self._finished.get(request_id)
+
+    def forget(self, request_id: int) -> None:
+        self._finished.pop(request_id, None)
+
+    def shutdown(self):
+        self._live.clear()
+        self._finished.clear()
+
+    def get_max_resource_count(self) -> int:
+        return self.max_num_requests
+
+    def get_needed_resource_to_completion(self, request) -> int:
+        return 0
+
+
 @dataclass
 class DFlashSpecMetadata(SpecMetadata):
     """Metadata for DFlash speculative decoding.
@@ -678,12 +773,19 @@ class DFlashSpecMetadata(SpecMetadata):
             # Slot lengths (and bases) written in one batch: evicted slots are
             # emptied, newly assigned ones seeded below.
             updates, bases = {}, {}
+            released = []
             for rid in list(worker._req_to_slot.keys()):
                 if rid not in current:
                     slot = worker._req_to_slot.pop(rid)
                     updates[slot] = 0
                     worker._req_ctx_pos.pop(rid, None)
-                    worker._free_slots.append(slot)
+                    released.append((rid, slot))
+            tracker = getattr(self, "spec_resource_manager", None)
+            if released and isinstance(tracker, DFlashPromptTracker) and tracker.active:
+                # Before the zeroing write below: keeping a slot reads its length.
+                worker._release_slots(released, tracker)
+            else:
+                worker._free_slots.extend(slot for _, slot in released)
 
             # A disagg generation worker receives prompt KV instead of
             # prefilling, so _store_prefill_context -- the only other assigner --
@@ -970,6 +1072,17 @@ class DFlashWorker(SpecWorkerBase):
         self._free_slots = deque()  # available slot indices
         self._dummy_slot = None  # for cudagraph padding or warmup dummy requests
         self._graph_dummy_id_floor = 1 << 62
+        # Prefix-cache hits on the dense arena (see _try_adopt_prefix_slot).
+        # Live slots whose column j holds token j of their request's sequence.
+        self._slot_owner = {}  # slot -> request id
+        # Freed slots whose contents are kept for a later request with the same
+        # prefix, least recently freed first. Every kept slot is also in
+        # _free_slots: kept = free, but not yet overwritten.
+        # slot -> (tokens, multimodal items, host lengths, index, event)
+        self._kept_slots = OrderedDict()
+        self._prefix_hits = 0
+        self._prefix_misses = 0
+        self._warned_prefix_miss = False
 
         # Opt-in acceptance-statistics recorder (None unless
         # TLLM_DFLASH_ACCEPT_STATS_DIR is set; see accept_stats.py). Only
@@ -1545,6 +1658,8 @@ class DFlashWorker(SpecWorkerBase):
         self._free_slots = deque(range(num_req_slots))
         self._req_to_slot = {}
         self._req_ctx_pos = {}
+        self._slot_owner = {}
+        self._kept_slots = OrderedDict()
 
         # +block_size slack lets each backend append the per-iteration noise
         # K/V after the accumulated request context.
@@ -1866,14 +1981,148 @@ class DFlashWorker(SpecWorkerBase):
         if reset and req_id in self._req_to_slot:
             old_slot = self._req_to_slot.pop(req_id)
             clear(old_slot)
-            self._free_slots.append(old_slot)
+            self._free_slot(old_slot)
         if req_id not in self._req_to_slot:
             if not self._free_slots:
                 return None
-            slot = self._free_slots.popleft()
+            slot = self._pop_free_slot()
             self._req_to_slot[req_id] = slot
             clear(slot)
         return self._req_to_slot[req_id]
+
+    def _free_slot(self, slot: int) -> None:
+        """Return a slot to the free list without keeping its contents."""
+        getattr(self, "_slot_owner", {}).pop(slot, None)
+        getattr(self, "_kept_slots", {}).pop(slot, None)
+        self._free_slots.append(slot)
+
+    def _pop_free_slot(self) -> int:
+        """Take a free slot: an empty one first, else the least recently kept one."""
+        if getattr(self, "_kept_slots", None):
+            for i, slot in enumerate(self._free_slots):
+                if slot not in self._kept_slots:
+                    del self._free_slots[i]
+                    return slot
+            slot, _ = self._kept_slots.popitem(last=False)
+            self._free_slots.remove(slot)
+            return slot
+        return self._free_slots.popleft()
+
+    def _release_slots(self, released, spec_resource_manager: "DFlashPromptTracker") -> None:
+        """Free the slots of requests that left the batch, keeping reusable contents.
+
+        A slot is kept when its columns are numbered from token 0 of its
+        request and the tracker still knows that request's tokens. How many
+        columns are valid lives on the device (generation advances _ctx_len
+        there), so it is copied to the host asynchronously and read only when a
+        later request asks for this slot.
+        """
+        tracker = spec_resource_manager
+        keep = []
+        for rid, slot in released:
+            owned = self._slot_owner.pop(slot, None) == rid
+            entry = tracker.lookup(rid) if owned else None
+            self._kept_slots.pop(slot, None)
+            self._free_slots.append(slot)
+            if entry is not None:
+                keep.append((rid, slot, entry))
+        if not keep or torch.cuda.is_current_stream_capturing():
+            return
+        idx = torch.tensor(
+            [slot for _, slot, _ in keep], dtype=torch.long, pin_memory=prefer_pinned()
+        )
+        host_len = torch.empty(len(keep), dtype=torch.long, pin_memory=prefer_pinned())
+        host_len.copy_(
+            self._ctx_len.index_select(0, idx.to("cuda", non_blocking=True)), non_blocking=True
+        )
+        event = torch.cuda.Event()
+        event.record()
+        for i, (rid, slot, (tokens, mm_items)) in enumerate(keep):
+            self._kept_slots[slot] = (tokens, mm_items, host_len, i, event)
+            tracker.forget(rid)
+
+    @staticmethod
+    def _kept_slot_len(entry) -> int:
+        _, _, host_len, i, event = entry
+        if not event.query():
+            event.synchronize()
+        return int(host_len[i])
+
+    def _try_adopt_prefix_slot(
+        self,
+        req_id: int,
+        first_pos: int,
+        tracker: "DFlashPromptTracker",
+        updates: dict,
+        bases: Optional[dict] = None,
+    ) -> Optional[int]:
+        """Give a request whose prefill starts at ``first_pos`` > 0 a slot holding that prefix.
+
+        On a prefix-cache hit the target skips tokens [0, first_pos), so their
+        hidden states never reach the dense arena. If a kept slot (or a live
+        one) holds K/V for exactly those tokens, the request resumes there at
+        column ``first_pos``: a kept slot is taken over in place, a live slot's
+        first ``first_pos`` columns are copied into a free slot. Drafts only
+        steer verification, so outputs are unchanged either way. Returns the
+        slot, or None when nothing matches (the caller then starts at 0).
+        """
+        entry = tracker.lookup(req_id)
+        if entry is None or entry[1] is None or len(entry[0]) < first_pos:
+            return None
+        prefix = entry[0][:first_pos]
+        mm_prefix = _dflash_mm_items_before(entry[1], first_pos)
+
+        def holds_prefix(tokens, mm_items, valid) -> bool:
+            return (
+                valid >= first_pos
+                and mm_items is not None
+                and _dflash_mm_items_before(mm_items, first_pos) == mm_prefix
+                and np.array_equal(tokens[:first_pos], prefix)
+            )
+
+        dst = None
+        for slot in reversed(self._kept_slots):  # most recently freed first
+            kept = self._kept_slots[slot]
+            if len(kept[0]) < first_pos:
+                continue
+            valid = min(self._kept_slot_len(kept), len(kept[0]), self._max_ctx)
+            if holds_prefix(kept[0], kept[1], valid):
+                del self._kept_slots[slot]
+                self._free_slots.remove(slot)
+                dst = slot
+                break
+        if dst is None:
+            # A running request with the same prefix, e.g. a shared system
+            # prompt. Its prefill columns are final; generation only appends.
+            for src, rid in self._slot_owner.items():
+                live = tracker.lookup(rid) if rid != req_id else None
+                if live is None or len(live[0]) < first_pos:
+                    continue
+                valid = min(updates.get(src, self._ctx_len_host[src]), len(live[0]), self._max_ctx)
+                if not holds_prefix(live[0], live[1], valid):
+                    continue
+                if not self._free_slots:
+                    return None
+                dst = self._pop_free_slot()
+                self._ctx_k_buf[dst, :, :first_pos].copy_(self._ctx_k_buf[src, :, :first_pos])
+                if self._ctx_v_buf is not None:
+                    self._ctx_v_buf[dst, :, :first_pos].copy_(self._ctx_v_buf[src, :, :first_pos])
+                break
+        if dst is None:
+            return None
+        self._req_to_slot[req_id] = dst
+        self._slot_owner[dst] = req_id
+        updates[dst] = first_pos
+        if bases is not None:
+            # The dense arena numbers the slot from token 0: no base pages.
+            bases[dst] = 0
+        self._prefix_hits += 1
+        if self._prefix_hits == 1:
+            logger.info(
+                f"DFlash: request {req_id} reuses {first_pos} cached prompt tokens; "
+                "resuming the drafter context from a slot that holds them."
+            )
+        return dst
 
     def _get_ctx_paged_append(self) -> Callable[..., None]:
         """flashinfer paged append, shared by the TRTLLM and FA4 backends."""
@@ -2076,6 +2325,15 @@ class DFlashWorker(SpecWorkerBase):
         ctx_base_updates = {}
         offset = 0
         num_contexts = attn_metadata.num_contexts
+        # A prefix hit leaves the dense private arena without the prefix K/V;
+        # paged pools that join block reuse still address it.
+        dense_unaddressable = not self._ctx_paged and not self._ctx_reuse_addressable
+        tracker = spec_metadata.spec_resource_manager
+        if not isinstance(tracker, DFlashPromptTracker):
+            tracker = None
+        elif not dense_unaddressable or not tracker.active:
+            tracker.active = False
+            tracker = None
         # A context write addresses pages through row i of the block table, so
         # it must fit that row's allocation as well as the arena's length.
         # One tolist() for the whole loop: the lengths themselves come from
@@ -2103,8 +2361,29 @@ class DFlashWorker(SpecWorkerBase):
             # request id reused after completion, a prefill restarted after
             # preemption -- has to start from a clean slot.
             reset = self._req_ctx_pos.get(req_id) != first_pos
+            adopted = None
+            prefix_hit = reset and first_pos > 0 and dense_unaddressable
+            if prefix_hit and tracker is not None:
+                if req_id in self._req_to_slot:
+                    old_slot = self._req_to_slot.pop(req_id)
+                    ctx_len_updates[old_slot] = 0
+                    ctx_base_updates[old_slot] = 0
+                    self._free_slot(old_slot)
+                adopted = self._try_adopt_prefix_slot(
+                    req_id, first_pos, tracker, ctx_len_updates, ctx_base_updates
+                )
+            if adopted is None and prefix_hit:
+                self._prefix_misses += 1
+                if not self._warned_prefix_miss:
+                    self._warned_prefix_miss = True
+                    logger.warning(
+                        f"DFlash: request {req_id} reuses {first_pos} cached prompt tokens, but "
+                        "no drafter context slot holds that prefix, so the drafter starts from "
+                        "the uncached tail and acceptance drops for this request. Logged once."
+                    )
             if (
-                self._assign_slot(
+                adopted is None
+                and self._assign_slot(
                     req_id, reset=reset, updates=ctx_len_updates, bases=ctx_base_updates
                 )
                 is None
@@ -2115,6 +2394,12 @@ class DFlashWorker(SpecWorkerBase):
                 continue
 
             slot = self._req_to_slot[req_id]
+            if reset and adopted is None and tracker is not None:
+                # Only a slot numbered from token 0 can serve a later prefix.
+                if first_pos == 0:
+                    self._slot_owner[slot] = req_id
+                else:
+                    self._slot_owner.pop(slot, None)
             cur = ctx_len_updates.get(slot, self._ctx_len_host[slot])
             cap = self._max_ctx if ctx_alloc is None else min(self._max_ctx, ctx_alloc[i])
             # A paired pool still holds the prefix K/V below the tail
@@ -2132,7 +2417,7 @@ class DFlashWorker(SpecWorkerBase):
                 self._req_to_slot.pop(req_id, None)
                 self._req_ctx_pos.pop(req_id, None)
                 ctx_len_updates[slot] = 0
-                self._free_slots.append(slot)
+                self._free_slot(slot)
                 offset += slen
                 continue
             base = self._ctx_base_for_store(cur, start)
@@ -2151,7 +2436,7 @@ class DFlashWorker(SpecWorkerBase):
                 self._req_to_slot.pop(req_id, None)
                 self._req_ctx_pos.pop(req_id, None)
                 ctx_len_updates[slot] = 0
-                self._free_slots.append(slot)
+                self._free_slot(slot)
                 offset += slen
                 continue
             end = cur + slen
