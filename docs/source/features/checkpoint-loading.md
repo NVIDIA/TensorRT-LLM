@@ -6,9 +6,10 @@ The PyTorch backend provides a flexible and extensible infrastructure for loadin
 1. [Overview](#overview)
 2. [Core Components](#core-components)
 3. [Built-in Checkpoint Formats](#built-in-checkpoint-formats)
-4. [Checkpoint I/O Policies](#checkpoint-io-policies)
-5. [Using Checkpoint Loaders](#using-checkpoint-loaders)
-6. [Creating Custom Checkpoint Loaders](#creating-custom-checkpoint-loaders)
+4. [Using Checkpoint Loaders](#using-checkpoint-loaders)
+5. [Creating Custom Checkpoint Loaders](#creating-custom-checkpoint-loaders)
+6. [Checkpoint I/O Policies](#checkpoint-io-policies)
+7. [Startup Telemetry](#startup-telemetry)
 
 ## Overview
 
@@ -76,6 +77,15 @@ Transforms weights between different naming conventions and applies model-specif
 
 ## Built-in Checkpoint Formats
 
+Select a format with `checkpoint_format` in the LLM API or the YAML config:
+
+| `checkpoint_format` | Checkpoint it loads |
+|---|---|
+| `HF` (default) | Hugging Face checkpoint |
+| `mistral` | Mistral native checkpoint |
+| `mistral_large_3` | Mistral Large 3 native checkpoint |
+| `MX` | ModelExpress peer-to-peer (P2P) weight transfer with Hugging Face checkpoint as fallback |
+
 ### HuggingFace Format
 
 Currently, HF checkpoint loader is the primary built-in format, supporting:
@@ -83,197 +93,27 @@ Currently, HF checkpoint loader is the primary built-in format, supporting:
 - **Weights loading** (`.safetensors/.bin/.pth`) - Loading HF compatible weights from disk
 - **Configuration parser** - Parsing HF stored configuration information to TRTLLM `ModelConfig` object
 - **Weights Mapping** - Converting HF weights into TRTLLM compatible representation
+- **Weights Streaming** - Support experimental weight streaming options (see [Checkpoint I/O Policies](#checkpoint-io-policies))
+
+### Mistral Native Format
+
+`checkpoint_format: mistral` loads checkpoints in Mistral's own layout: a
+`params.json` config and `consolidated*.safetensors` weights.
+
+### Mistral Large 3 Format
+
+`checkpoint_format: mistral_large_3` reads the same layout as `mistral`. It
+uses the Mistral Large 3 weight mapper for every architecture in the
+checkpoint, including the multimodal `PixtralForConditionalGeneration`
+wrapper.
 
 ### ModelExpress (MX) Loading Path
 
-The PyTorch backend can use ModelExpress (MX) for peer-to-peer weight transfer
-from a running TensorRT-LLM source instance before falling back to Hugging Face
-checkpoint loading. Selecting MX does not require an MX-specific on-disk
-checkpoint or conversion of the Hugging Face checkpoint. For installation, MX
-service deployment, and configuration details, see
-[ModelExpress (MX) Checkpoint Loading](./model-express.md).
-
-## Checkpoint I/O Policies
-
-Checkpoint format describes how weights are represented and mapped. The
-experimental `checkpoint_io_policy` independently controls how file-backed
-checkpoint bytes reach host memory:
-
-- `auto` (default) selects rank-striped read-ahead for compatible built-in
-  PyTorch/HF loads and selects native I/O for other configurations.
-- `native` always preserves the existing checkpoint loader and its synchronous
-  SafeTensors prefetch when the load group is eligible.
-- `rank_striped_read_ahead` divides SafeTensors files into fixed extents.
-  Node-local ranks issue disjoint background `pread` requests into the Linux
-  page cache while the existing mapping, transformation, and H2D path runs.
-  The page cache can drop those pages before materialization reads them (for
-  example, when a Lustre client cancels aged DLM locks); when the node then
-  takes major page faults during materialization, the readers re-read their
-  extents. After the first refresh, the minimum delay from a completed refresh
-  to the next refresh is 10 seconds, then 20, 40, and at most 60 seconds.
-  Faults are still sampled every 5 seconds during the cooldown; a qualifying
-  burst queues one refresh for when the cooldown ends. The delay limits
-  refresh frequency, not the total number of refreshes. A warning is logged
-  once when the delay reaches 60 seconds. Before each refresh, the reader
-  rechecks available host memory against the full checkpoint size and startup
-  headroom. If admission fails or the memory probe fails, the refresh remains
-  pending and the check is retried on later polls. A warning is logged once
-  per deferral episode. This is a conservative check, not a memory reservation:
-  resident pages charged to a cgroup can cause deferral even when only a small
-  part of the checkpoint is missing. Normal weight materialization continues
-  while refresh is deferred. After every rank finishes
-  materialization, speculative read-ahead work that is still queued or active
-  can no longer improve first-token latency and is stopped.
-  A worker already blocked in a synchronous `pread` must finish its
-  current 8 MiB read before shutdown, so degraded storage can delay the join.
-
-```yaml
-checkpoint_format: HF
-load_format: auto
-checkpoint_io_policy: rank_striped_read_ahead
-```
-
-The optimized path currently requires identical policy configuration across
-all ranks, the automatically constructed built-in HF loader
-(`checkpoint_loader` must be unset), `load_format: auto`, SafeTensors, and an
-active MPI model-load communicator for distributed jobs. Static incompatibility
-such as MX, a custom or explicitly provided loader, a non-automatic
-load format, or known partial-model loading selects native I/O before any
-rank-striped communicator or reader setup. An explicit incompatible
-`rank_striped_read_ahead` request emits a warning instead of failing startup;
-`auto` records the native selection at info level.
-
-Sessionless compatibility is a separate structural fallback:
-
-- Direct `load_weights()` calls use native I/O because they cannot keep
-  `open_weight_session()` alive through model materialization. Current callers
-  include separate draft/MTP checkpoint loading and the GMS restore path; the
-  primary built-in HF path remains eligible for rank-striped read-ahead. This
-  structural fallback is reported at info level even for an explicit
-  `rank_striped_read_ahead` request.
-
-Checkpoint-dependent eligibility remains a coordinated preflight. Lazy Kimi
-loading, raw-weight caching, layer overrides, insufficient host-memory
-headroom, and `.bin`/`.pth` select native materialization before readers start
-or the model is mutated. These pre-activation runtime fallbacks log at info
-level for `auto` and warn for an explicit `rank_striped_read_ahead` request.
-With a valid node communicator, fallback preserves native prefetch collectives
-on that load group; if communicator setup failed or its size did not match the
-model-load mapping, native loading safely skips prefetch.
-Memory admission reserves cgroup-aware startup headroom. Reader setup failures
-also clean up and fall back before mapping; mapping, transformation, or H2D
-failure after activation never retries a partially mutated model. A later
-advisory read failure keeps successfully materialized weights.
-
-Read-ahead is intentionally not TP/PP/CP/EP-selective: each active load group
-may warm one logical checkpoint copy per node, although the work stops when
-materialization completes. The 64-reader budget is per active load group per
-node, not a host-wide arbitration mechanism across colocated independent
-TRT-LLM instances. Policy logs distinguish requested, selected, activated, and
-effective policy, so `auto` selection and native fallback remain observable;
-activation logs also report the local reader assignment.
-
-### CI startup experiment
-
-Pre-merge perf-sanity runs that upload telemetry explicitly assign eligible
-built-in PyTorch/HF launches to the default `auto` policy, so merge decisions do
-not depend on an unrelated CI identifier. Post-merge telemetry runs use the
-numeric root Jenkins build number modulo 2 to assign `native` to even builds and
-`auto` to odd builds before generated server configs are written. This gives a
-50/50 assignment across consecutive root builds without adding CI stages or
-model launches; successful observations may not be evenly split. Every rank
-and node in one distributed startup receives the same concrete policy. The
-experiment version is `checkpoint-io-v4-postmerge-50-auto-50-native`, distinct
-from the previous 75/25 assignment.
-Non-telemetry runs, invalid or missing post-merge build identities,
-incompatible configurations, and purpose-built configs with an explicit
-`checkpoint_io_policy` are not assigned and retain their normal configuration,
-whose checkpoint I/O default remains `auto`.
-
-Set `TRTLLM_PERF_SANITY_CHECKPOINT_IO_POLICY=auto` or `native` to reproduce an
-experiment arm without bucket assignment. Uploaded rows record the experiment
-version, bucket, assigned arm, assignment source, PR number or root build
-number, actual checkpoint loader/source metadata,
-requested/selected/activated/effective policy, and a bounded fallback category
-and reason. The primary comparison is intent-to-treat across post-merge rows
-whose assignment source is `postmerge_build_number`: an `auto` assignment that
-executes native I/O remains an auto fallback, not a native control. Pre-merge
-rows use `premerge_default` and are excluded from that comparison.
-Multiple client rows can share one server startup; use
-`s_startup_observation_id` to group them and filter
-`b_startup_observation_primary_row:true` to count each startup once.
-
-To compare rank-striped loading against native loading, separately report
-confirmed effective `rank_striped_read_ahead` observations and native controls
-with matching runtime-image identity, GPU, model/checkpoint, and parallelism
-configuration. Keep auto fallbacks and unknown effective policies separate;
-do not infer activation from the assigned arm. Retain root build IDs when
-grouping repeated observations. This effective-policy comparison is
-observational, not a controlled head-to-head benchmark.
-
-Keep results from the old 75/25 split separate from the new 50/50 split using
-the experiment version, not bucket numbers alone. To check the split, use the
-assigned policy; to compare loading performance, use the loader that actually
-ran.
-
-Even builds use native loading, while odd builds use auto. Before comparing
-performance, check that both groups use comparable runtime images, hardware,
-CI configurations, and cache conditions—otherwise, those differences could be
-mistaken for a loader improvement.
-
-The primary model's finalized policy is also published as
-`startup_metrics.model_loader.checkpoint_io_policy` in `/server_info`.
-This detached snapshot is captured after weight-session finalization, before a
-separate draft checkpoint can reuse the loader. It preserves activation even
-when a subsequent advisory read failure makes the effective policy native.
-HF-derived formats such as Mistral and MX also report observed native disk
-loads; this does not enable rank-striped read-ahead for those formats.
-GMS writers using the built-in HF disk path capture the native policy after
-target materialization, before draft loading; GMS readers remain unknown.
-Unsupported, preloaded, or unobserved paths report an explicit unknown (`null`),
-not an inferred native policy. The collector prefers this structured primary
-status; only older runtimes without the field use `legacy_logs` fallback.
-Draft statuses do not override the structured primary status.
-
-Use the following fields to qualify a comparison (with `ctx_` or `gen_`
-prefixes for disaggregated server roles):
-
-- `s_checkpoint_io_policy_source`: `server_info`, `legacy_logs`, or `unknown`.
-- `b_checkpoint_io_policy_complete`: every expected server provided one valid
-  structured primary policy. Legacy log attribution is not considered complete.
-- `b_startup_metrics_timing_complete`: every expected server provided finite,
-  nonnegative preparation, population, finalization, and total model-loading
-  times. The existing collection-complete flag only checks successful fetches
-  and server counts; it does not imply these fields were present.
-
-CI records include image provenance so startup comparisons can account for
-runtime-environment differences instead of attributing them to the loader.
-This describes the benchmark environment, not which images customers deploy.
-
-The existing `s_runtime_image`, `s_runtime_image_source`,
-`s_runtime_image_digest`, and `s_runtime_image_identity_strength` fields
-describe the original OCI/base-image reference selected for the test
-container, not the Jenkins dispatcher image. A valid digest-pinned reference
-reports `digest_pinned` for that OCI reference only; a tagged reference reports
-`reference_only` with an unknown digest. Missing provenance remains `unknown`.
-
-Enroot may launch a derived fat `.sqsh` with dependencies and TRT-LLM already
-installed. These fields do not identify or verify that derived artifact or
-the environment after package installation. A tag hash or `.sqsh` cache
-filename is not a content digest. Group comparisons by the recorded base
-reference as well as model/configuration, GPU and parallelism, but do not
-treat matching base references as proof of identical runtime environments.
-Final launch-artifact provenance remains a separate follow-up.
-
-These additions do not change loader policy or add startup collectives. Timing
-remains rank-0-based per server, and failed launches are not comprehensively
-persisted. Native counterfactual eligibility, checkpoint fingerprints,
-slowest-rank timing, and process-launch-to-first-token measurement remain
-separate follow-ups.
-
-This policy remains separate from ModelStreamer, MX, GMS, or snapshot
-integrations. Those systems may change the source or bypass raw loading without
-requiring a new combined checkpoint format.
+ModelExpress (MX) is a P2P weight transfer service that lets one GPU transfer
+its loaded weights to another, skipping slow weight loading on the second GPU from storage.
+This checkpoint option checks for MX service first for P2P weight transfer, and
+falls back to loading from HuggingFace checkpoint if MX is not available.
+For MX service details, see [ModelExpress (MX) Checkpoint Loading](./model-express.md).
 
 ## Using Checkpoint Loaders
 
@@ -367,6 +207,8 @@ class CustomCheckpointLoader(BaseCheckpointLoader):
 
     def get_default_config_loader(self) -> BaseConfigLoader:
         return CustomConfigLoader()
+    
+    ...
 ```
 
 ### Step 2: Create the Checkpoint Weight Loader
@@ -517,3 +359,182 @@ class CustomWeightMapper(BaseWeightMapper)
 ```
 
 By setting the model name, the registered mapper will be associated with the specific model.
+
+## Checkpoint I/O Policies
+
+The experimental `checkpoint_io_policy` option controls how the built-in HF
+loader reads SafeTensors files from storage into GPU memory. It provides
+options to speed up weight loading via efficient streaming from storage.
+
+- `native`: It reads the checkpoint files into the OS page cache if there is
+  enough CPU memory. It then opens each tensor via mmap and loads them to GPU.
+  There could be many read contentions.
+- `rank_striped_read_ahead`: It divides the checkpoint files into pieces and
+  reads each piece into the OS page cache while copying tensors to GPU at the
+  same time. This assumes most tensors being copied are from the OS page cache.
+  It runs only when the whole checkpoint fits in the available host memory,
+  minus some headroom. Otherwise it falls back to `native`.
+- `auto` (default): use `rank_striped_read_ahead` when the load supports it,
+  and `native` I/O otherwise.
+- `model_streamer` (prototype): It streams the SafeTensors tensors that each
+  node needs to GPU with Run:ai Model Streamer, and the ranks of a node share
+  the reads. See [Model Streamer](#model-streamer).
+
+Apart from built-in HF checkpoint and built-in checkpoint loader, to enable
+non-native I/O policy, the following must all be true:
+- `load_format` is `auto`.
+- All of the model is set to be loaded (no partial model loading).
+- The checkpoint uses SafeTensors files.
+
+### Re-reads in `rank_striped_read_ahead`
+
+The OS can drop read-ahead pages from the page cache before their tensors are
+copied to GPU, for example when a Lustre client cancels its aged DLM locks.
+When the node then takes major page faults while copying tensors to GPU, the
+reader threads read their pieces into the page cache again. Each such re-read
+is a refresh.
+
+- Wait between refreshes: after the first refresh, the next refresh starts at
+  least 10 seconds after the previous one completes. The wait then grows to 20
+  and 40 seconds, up to 60 seconds. A warning is logged once when the wait
+  reaches 60 seconds. The wait limits how often refreshes run, not how many
+  refreshes run.
+- Fault checks during the wait: the reader still checks page faults every 5
+  seconds. A burst of faults queues one refresh, which starts when the wait
+  ends.
+- Memory check: before each refresh, the reader checks again that the
+  available host memory can hold the full checkpoint plus the startup
+  headroom. If the check fails, or the reader cannot read the memory status,
+  the refresh stays queued and the reader checks again at later polls. A
+  warning is logged once each time a refresh starts to wait on memory. This
+  check is conservative and does not reserve memory: pages that are already in
+  memory and charged to a cgroup can defer a refresh even when only a small
+  part of the checkpoint is missing from the page cache.
+- Tensor copies to GPU continue while a refresh waits.
+
+### Model Streamer
+
+With `model_streamer`, each node reads each checkpoint byte once and shares it
+among its ranks over `torch.distributed`, so a large checkpoint loads faster
+when storage bandwidth limits the load. Each node streams only the tensors
+that its own ranks need.
+
+In addition to the requirements above, it needs:
+- `runai-model-streamer` 0.17.0 or later. TensorRT-LLM does not install it.
+- A model that implements `plan_model_streamer_load()`, which names the
+  tensors that each rank needs and how to load them.
+- The other startup checks of the loader. The load fails before it streams
+  when one of them fails.
+
+Unlike `auto` and `rank_striped_read_ahead`, `model_streamer` never falls back
+to `native`: an unsupported configuration or a failed read raises an error.
+A separate draft checkpoint, for example of a speculative decoding draft
+model, is read with `native` I/O.
+
+These environment variables change how Model Streamer shares the reads:
+- `RUNAI_STREAMER_DIST`: Model Streamer shares reads by default only over a
+  process group whose backend is exactly `nccl`. When the existing group uses
+  `cuda:nccl,cpu:gloo`, for example under Ray, TensorRT-LLM sets
+  `RUNAI_STREAMER_DIST=1` during the load. Set it to `0` to turn off read
+  sharing; each rank then reads only its own tensors.
+- `RUNAI_STREAMER_DIST_GLOBAL`: Each node streams different tensors, so the
+  load raises an error when this variable is `1` and the ranks are on more
+  than one node.
+
+When the ranks of a node should share the reads but Model Streamer does not,
+the load raises an error. One cause is a rank whose free GPU memory is less
+than twice the largest tensor of a batch. Set `RUNAI_STREAMER_LOG_TO_STDERR=1`
+to see the reason that Model Streamer logs.
+
+### Logs
+
+Each rank logs one line per checkpoint read (draft checkpoint loading has
+its own line):
+
+```text
+Checkpoint I/O policy: requested=auto, selected=rank_striped_read_ahead, activated=True, effective=rank_striped_read_ahead, fallback_reason=none.
+```
+
+- `requested`: the configured policy.
+- `selected`: the policy chosen by TRTLLM before loading started. Various checks like
+config incompatibility could lead to `native` fallback.
+- `activated`: whether the background reader threads in `rank_striped_read_ahead`
+started.
+- `effective`: the final policy that read the checkpoint. If there is a runtime issue
+like communication error, it could fall back to `native`.
+- `fallback_reason`: why loading switched to native I/O.
+
+With `model_streamer`, each rank logs its Model Streamer metrics instead for
+the target checkpoint:
+
+```text
+Model Streamer metrics for rank <rank>: model_streamer_seconds=<seconds>, model_streamer_node_tensors=<count>, model_streamer_node_bytes=<bytes>, model_streamer_batches=<count>, model_streamer_rank_tensors=<count>
+```
+
+- `model_streamer_seconds`: the time to stream all batches.
+- `model_streamer_node_tensors` and `model_streamer_node_bytes`: what the node
+  streamed for all its ranks.
+- `model_streamer_batches`: the number of batches that the model's plan asked for.
+- `model_streamer_rank_tensors`: the tensors that this rank loads.
+
+The `/server_info` response also reports the five checkpoint I/O policy fields
+in `startup_metrics.model_loader`: `checkpoint_io_policy` for the target
+checkpoint read, and `draft_checkpoint_io_policy` for a separate draft
+checkpoint read. The value is `null` when the built-in HF weight loader did not
+read the checkpoint from storage, for example with `model_streamer`, preloaded
+weights, a custom weight loader, or a GMS reader.
+
+## Startup Telemetry
+
+CI perf-sanity runs that upload telemetry record how each server loaded its
+checkpoint, so startup comparisons can account for the loader that ran.
+
+The primary model's finalized policy is also published as
+`startup_metrics.model_loader.checkpoint_io_policy` in `/server_info`.
+This detached snapshot is captured after weight-session finalization, before a
+separate draft checkpoint can reuse the loader. It preserves activation even
+when a subsequent advisory read failure makes the effective policy native.
+HF-derived formats such as Mistral and MX also report observed native disk
+loads; this does not enable rank-striped read-ahead for those formats.
+GMS writers using the built-in HF disk path capture the native policy after
+target materialization, before draft loading; GMS readers remain unknown.
+Unsupported, preloaded, or unobserved paths report an explicit unknown (`null`),
+not an inferred native policy. The collector prefers this structured primary
+status; only older runtimes without the field use `legacy_logs` fallback.
+Draft statuses do not override the structured primary status.
+
+Use the following fields to qualify a comparison (with `ctx_` or `gen_`
+prefixes for disaggregated server roles):
+
+- `s_checkpoint_io_policy_source`: `server_info`, `legacy_logs`, or `unknown`.
+- `b_checkpoint_io_policy_complete`: every expected server provided one valid
+  structured primary policy. Legacy log attribution is not considered complete.
+- `b_startup_metrics_timing_complete`: every expected server provided finite,
+  nonnegative preparation, population, finalization, and total model-loading
+  times. The existing collection-complete flag only checks successful fetches
+  and server counts; it does not imply these fields were present.
+
+CI records include image provenance so startup comparisons can account for
+runtime-environment differences instead of attributing them to the loader.
+This describes the benchmark environment, not which images customers deploy.
+
+The existing `s_runtime_image`, `s_runtime_image_source`,
+`s_runtime_image_digest`, and `s_runtime_image_identity_strength` fields
+describe the original OCI/base-image reference selected for the test
+container, not the Jenkins dispatcher image. A valid digest-pinned reference
+reports `digest_pinned` for that OCI reference only; a tagged reference reports
+`reference_only` with an unknown digest. Missing provenance remains `unknown`.
+
+Enroot may launch a derived fat `.sqsh` with dependencies and TRT-LLM already
+installed. These fields do not identify or verify that derived artifact or
+the environment after package installation. A tag hash or `.sqsh` cache
+filename is not a content digest. Group comparisons by the recorded base
+reference as well as model/configuration, GPU and parallelism, but do not
+treat matching base references as proof of identical runtime environments.
+Final launch-artifact provenance remains a separate follow-up.
+
+These additions do not change loader policy or add startup collectives. Timing
+remains rank-0-based per server, and failed launches are not comprehensively
+persisted. Native counterfactual eligibility, checkpoint fingerprints,
+slowest-rank timing, and process-launch-to-first-token measurement remain
+separate follow-ups.

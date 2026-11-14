@@ -187,6 +187,7 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         (generator.SERVE_SCHEMA, {"checkpoint_loader": {}}, False),
         (generator.SERVE_SCHEMA, {"tokenizer": 42}, False),
         (generator.SERVE_SCHEMA, {"checkpoint_io_policy": "rank_striped_read_ahead"}, True),
+        (generator.SERVE_SCHEMA, {"checkpoint_io_policy": "model_streamer"}, True),
         (generator.SERVE_SCHEMA, {"checkpoint_io_policy": "unknown"}, False),
         (
             generator.SERVE_SCHEMA,
@@ -219,6 +220,11 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         (generator.DISAGG_SCHEMA, {"schedule_style": "invalid"}, False),
         (generator.DISAGG_SCHEMA, {"num_workers": 2, "server_keep_alive_timeout": 20}, True),
         (generator.DISAGG_SCHEMA, {"checkpoint_io_policy": "native"}, True),
+        (
+            generator.DISAGG_SCHEMA,
+            {"context_servers": {"checkpoint_io_policy": "model_streamer"}},
+            True,
+        ),
         (generator.DISAGG_SCHEMA, {"context_servers": {"checkpoint_io_policy": "unknown"}}, False),
         (generator.SERVE_SCHEMA, {"watermark_config": {"key": 2**64 - 1}}, True),
         (
