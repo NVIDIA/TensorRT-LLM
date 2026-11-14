@@ -745,7 +745,7 @@ def _run_one_rank(entry: str, expected_cells: int) -> int:
     from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
 
     if WORLD == 8:
-        assert MNNVLAllReduce.is_mnnvl(mapping, torch.bfloat16), (
+        assert MNNVLAllReduce.is_mnnvl(mapping, torch.bfloat16, explicitly_requested=True), (
             "TP8 requires the actual MNNVL capability"
         )
     assert _draft_exchange.ehproj_table_supports_tp(WORLD), (
