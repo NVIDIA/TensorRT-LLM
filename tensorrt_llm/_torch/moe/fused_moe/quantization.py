@@ -893,6 +893,7 @@ class BF16TRTLLMGenFusedMoEMethod(UnquantizedFusedMoEMethod):
     def create_weights(self, module: torch.nn.Module):
         super().create_weights(module)
         module._trtllm_gen_layout_transform_pending = True
+        module._trtllm_gen_inplace_refit = False
 
     def _get_w3_w1_permute_indices(
             self,
@@ -933,7 +934,100 @@ class BF16TRTLLMGenFusedMoEMethod(UnquantizedFusedMoEMethod):
         raise ValueError(
             f"Unsupported TRTLLM-Gen BF16 weight_layout={self.weight_layout}")
 
+    def _can_refit_in_kernel_layout(self, module: torch.nn.Module) -> bool:
+        """Whether a weight reload can convert each expert straight into the
+        kept kernel-layout tensors, instead of first re-creating every expert
+        of the layer in the checkpoint layout (a second copy of the layer).
+
+        The kernel layout (row shuffle, then BlockMajorK) is derived from each
+        expert on its own, so an expert can be converted as soon as its tensor
+        arrives. A gated activation also interleaves the w3 and w1 rows of one
+        expert, and a partial reload may deliver the two in different calls,
+        so gated layers keep the re-creating path. Setting
+        TLLM_TRTLLM_GEN_BF16_INPLACE_REFIT=0 forces that path everywhere.
+        An expert the reload does not deliver keeps its previous weights.
+        """
+        if os.environ.get("TLLM_TRTLLM_GEN_BF16_INPLACE_REFIT", "1") == "0":
+            return False
+        if getattr(module, "is_gated_activation", True):
+            return False
+        metadata = module.rebuild_tensor_metadata
+        return "w3_w1_weight" in metadata and "w2_weight" in metadata
+
+    def pre_reload_weights(self, module: torch.nn.Module):
+        module._trtllm_gen_inplace_refit = self._can_refit_in_kernel_layout(
+            module)
+        if not module._trtllm_gen_inplace_refit:
+            super().pre_reload_weights(module)
+            return
+        # Keep the kernel-layout tensors registered: CUDA graphs captured their
+        # addresses, and load_expert_* overwrite one expert slot at a time.
+        for param_name in ("w3_w1_weight", "w2_weight"):
+            module.register_parameter(
+                param_name, module.rebuild_tensor_metadata[param_name]['param'])
+
+    def _empty_expert_in_checkpoint_layout(
+            self, module: torch.nn.Module, param_name: str,
+            device: torch.device) -> torch.Tensor:
+        meta = module.rebuild_tensor_metadata[param_name]['meta']
+        return torch.empty(meta.shape[1:], dtype=meta.dtype, device=device)
+
+    def load_expert_w3_w1_weight(self,
+                                 module: torch.nn.Module,
+                                 w1_weight: torch.Tensor,
+                                 w3_weight: torch.Tensor,
+                                 dst_w3_w1_weight: torch.Tensor,
+                                 allow_partial_loading: bool = False):
+        if not getattr(module, "_trtllm_gen_inplace_refit", False):
+            super().load_expert_w3_w1_weight(module, w1_weight, w3_weight,
+                                             dst_w3_w1_weight,
+                                             allow_partial_loading)
+            return
+        if w1_weight is None:
+            # This reload chunk does not carry this expert's fc1.
+            return
+        expert = self._empty_expert_in_checkpoint_layout(
+            module, "w3_w1_weight", dst_w3_w1_weight.device)
+        super().load_expert_w3_w1_weight(module,
+                                         w1_weight,
+                                         w3_weight,
+                                         expert,
+                                         allow_partial_loading=True)
+        permute_indices = self._get_w3_w1_permute_indices(
+            expert,
+            is_gated_act_gemm=getattr(module, "is_gated_activation", True))
+        dst_w3_w1_weight.copy_(
+            self._prepare_bf16_weight_for_trtllm_gen(expert, permute_indices))
+
+    def load_expert_w2_weight(self,
+                              module: torch.nn.Module,
+                              w2_weight: torch.Tensor,
+                              dst_w2_weight: torch.Tensor,
+                              allow_partial_loading: bool = False):
+        if not getattr(module, "_trtllm_gen_inplace_refit", False):
+            super().load_expert_w2_weight(module, w2_weight, dst_w2_weight,
+                                          allow_partial_loading)
+            return
+        if w2_weight is None:
+            # This reload chunk does not carry this expert's fc2.
+            return
+        expert = self._empty_expert_in_checkpoint_layout(
+            module, "w2_weight", dst_w2_weight.device)
+        super().load_expert_w2_weight(module,
+                                      w2_weight,
+                                      expert,
+                                      allow_partial_loading=True)
+        permute_indices = self._get_w2_permute_indices(expert)
+        dst_w2_weight.copy_(
+            self._prepare_bf16_weight_for_trtllm_gen(expert, permute_indices))
+
     def process_weights_after_loading(self, module: torch.nn.Module):
+        if getattr(module, "_trtllm_gen_inplace_refit", False):
+            # The reload converted every expert into the kept kernel-layout
+            # tensors as it arrived; converting again would shuffle twice.
+            module._trtllm_gen_inplace_refit = False
+            module._trtllm_gen_layout_transform_pending = False
+            return
         if module.w3_w1_weight.numel() == 0 or module.w2_weight.numel() == 0:
             module._trtllm_gen_layout_transform_pending = False
             return
