@@ -321,6 +321,6 @@ A [Modeling V2](../../../tensorrt_llm/_torch/_experimental/modeling_v2/README.md
 
 | Target | EPLB modes | Layouts |
 |---|---|---|
-| DeepSeek-R1-0528 NVFP4 (`deepseek_v3/r1_0528_nvfp4__sm_10x__default`, SM100 and SM103) | static | attention DP with pure expert parallelism over 4 or 8 GPUs (dep4, dep8) |
+| DeepSeek-R1-0528 NVFP4 (`deepseek_v3/r1_0528_nvfp4__sm_10x__default`, SM100 and SM103) | static, online | attention DP with pure expert parallelism over 4 or 8 GPUs (dep4, dep8) |
 
 Every other target declines EPLB, so those deployments run the built-in model. To collect the expert statistics for `generate_eplb_config.py`, run the statistics pass with `modeling_v2: off`. The built-in model uses the same router, so its statistics describe the same load.

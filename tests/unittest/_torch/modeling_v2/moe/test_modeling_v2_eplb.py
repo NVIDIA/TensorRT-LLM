@@ -1,25 +1,35 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The eplb catalog entry: slot layouts, layer registration and the routing op.
+"""The eplb catalog entry: slot layouts, layer registration, the routing op and, under
+online EPLB, the layer's part in moving experts between slots.
 
-Slot layouts and registration are plain Python and run on the CPU. The routing op
-and the sum over EP ranks of a slot-routed MoE layer need a GPU.
+Slot layouts, registration and the online protocol a layer follows with the balancer
+are plain Python and run on the CPU. The routing op, the sum over EP ranks of a
+slot-routed MoE layer and a real online balancer moving experts need a GPU.
 """
 
 from __future__ import annotations
 
+import os
 import zlib
 from collections.abc import Iterator
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from torch import nn
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.eplb import EplbLayer, EplbSlots
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe import eplb as eplb_module
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.eplb import (
+    EplbLayer,
+    EplbSlots,
+    rows_within,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.eplb import eplb_route as op
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
+    MoeLoadBalancerIterContext,
     get_moe_load_balancer,
 )
 from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig
@@ -129,6 +139,223 @@ def test_registering_adds_the_layer_with_its_placement(mocked_runtime):
     finally:
         balancer.shutdown()
     assert get_moe_load_balancer() is None
+
+
+# --- online EPLB: what a layer tells the balancer (CPU) -----------------------------------------
+
+
+class _Layer:
+    """A balancer layer that records what `EplbLayer` asks of it, in order."""
+
+    def __init__(self, online: bool, load_expert_ids=()):
+        self.online = online
+        self.load_expert_ids = list(load_expert_ids)
+        self.calls: list = []
+        self.host_tensor_sharer = MagicMock()
+        self.slots: dict = {}
+
+    def is_dynamic_routing(self):
+        return self.online
+
+    def get_load_expert_ids(self):
+        return self.load_expert_ids
+
+    def start_wait_gpu_stage(self):
+        self.calls.append("wait")
+
+    def done_wait_gpu_stage(self):
+        self.calls.append("waited")
+
+    def update_statistic_with_global_ids(self, ids, is_first_stage, is_last_stage):
+        self.calls.append(("count", ids.tolist(), is_first_stage, is_last_stage))
+
+    def start_set_cpu_stage(self):
+        self.calls.append("set")
+
+    def done_set_cpu_stage(self):
+        self.calls.append("done")
+
+    def make_tensor_host_accessible(self, t):
+        # New storage with the same contents, as the engine's migration gives.
+        t.set_(t.clone())
+        self.calls.append(("migrate", t.data_ptr()))
+
+    def register_weight_slot(self, local, name, t):
+        self.slots[(local, name)] = t
+
+
+@pytest.fixture
+def no_route(monkeypatch):
+    """The routing op returns the ids it is given: the protocol is the subject here."""
+    monkeypatch.setattr(eplb_module, "eplb_route", lambda ids, layer, offset: ids)
+
+
+def _ids(*rows):
+    return torch.tensor(rows, dtype=torch.int32)
+
+
+def _online(**kwargs) -> tuple[EplbLayer, _Layer]:
+    layer = _Layer(online=True, **kwargs)
+    return EplbLayer(layer, EplbSlots.without_eplb(8, 2, 0)), layer
+
+
+@pytest.mark.cpu_only
+def test_a_layer_run_once_a_forward_counts_and_hands_back_once(no_route):
+    """A trunk layer: taken on its first chunk, every chunk counted, the statistic complete on
+    the last chunk, then handed back -- and the next forward takes it again."""
+    eplb, layer = _online()
+    eplb.route(_ids([0, 1], [2, 3]))
+    eplb.route(_ids([4, 5]), last=True)
+    eplb.close()
+    assert layer.calls == [
+        "wait",
+        "waited",
+        ("count", [[0, 1], [2, 3]], True, False),
+        ("count", [[4, 5]], False, True),
+        "set",
+        "done",
+    ]
+    layer.calls.clear()
+    eplb.route(_ids([6, 7]), last=True)
+    eplb.close()
+    assert layer.calls == ["wait", "waited", ("count", [[6, 7]], True, True), "set", "done"]
+
+
+@pytest.mark.cpu_only
+def test_a_layer_run_once_a_draft_step_completes_its_count_when_handed_back(no_route):
+    """The MTP layer runs once per draft step and does not know which step is the last, so
+    `close` completes the statistic with a row of ids no expert has."""
+    eplb, layer = _online()
+    for step in range(3):
+        eplb.route(_ids([step, 7]))
+    eplb.close()
+    assert layer.calls == [
+        "wait",
+        "waited",
+        ("count", [[0, 7]], True, False),
+        ("count", [[1, 7]], False, False),
+        ("count", [[2, 7]], False, False),
+        ("count", [[8, 8]], False, True),
+        "set",
+        "done",
+    ]
+
+
+@pytest.mark.cpu_only
+def test_a_layer_that_ran_no_tokens_is_still_taken_and_handed_back(no_route):
+    """A forward that drafted nothing: the balancer waits for every layer every forward."""
+    eplb, layer = _online()
+    eplb.close()
+    assert layer.calls == ["wait", "waited", "set", "done"]
+
+
+@pytest.mark.cpu_only
+def test_padding_rows_are_left_out_of_the_count(no_route):
+    """Rows `rows` does not name are padding: counted out, whatever their ids; a chunk of
+    padding alone is routed but not counted."""
+    eplb, layer = _online()
+    ids = _ids([0, 1], [2, 3], [7, 7], [4, 5], [7, 7])
+    assert torch.equal(eplb.route(ids, rows=((0, 2), (3, 4))), ids)
+    eplb.route(_ids([7, 7]), rows=(), last=True)
+    eplb.close()
+    assert layer.calls == [
+        "wait",
+        "waited",
+        ("count", [[0, 1], [2, 3], [4, 5]], True, False),
+        ("count", [[8, 8]], False, True),
+        "set",
+        "done",
+    ]
+
+
+@pytest.mark.cpu_only
+def test_rows_within_a_chunk():
+    tokens = ((0, 5), (8, 13), (16, 18))
+    assert rows_within(None, 0, 4) is None
+    assert rows_within(tokens, 0, 4) == ((0, 4),)
+    assert rows_within(tokens, 4, 12) == ((0, 1), (4, 8))
+    assert rows_within(tokens, 13, 16) == ()
+    assert rows_within(tokens, 12, 20) == ((0, 1), (4, 6))
+
+
+@pytest.mark.cpu_only
+def test_without_online_eplb_a_layer_only_routes(no_route):
+    """Static EPLB: no statistic, no hand-over, no host copies, no binding."""
+    layer = _Layer(online=False, load_expert_ids=range(8))
+    eplb = EplbLayer(layer, EplbSlots.without_eplb(8, 2, 0))
+    weight = nn.Parameter(torch.arange(8.0).reshape(4, 2), requires_grad=False)
+    before = weight.data_ptr()
+    eplb.route(_ids([0, 1]), last=True)
+    eplb.close()
+    eplb.share_experts({"w": weight}, lambda name, expert: pytest.fail("read an expert"))
+    eplb.bind_slots({"w": weight})
+    assert layer.calls == [] and layer.slots == {} and eplb.host_experts == ()
+    assert weight.data_ptr() == before
+    assert not layer.host_tensor_sharer.method_calls
+
+
+@pytest.mark.cpu_only
+def test_host_copies_are_this_ranks_share_of_the_experts():
+    """Each name: this rank's share of the experts handed over in the slot layout, every
+    other expert announced with a slot's shape and dtype; then the layer's copies go to
+    shared memory, once."""
+    eplb, layer = _online(load_expert_ids=(2, 3))
+    slot_weights = {"w": torch.zeros(4, 3, 2, dtype=torch.uint8), "s": torch.zeros(4)}
+    read = []
+
+    def expert_weight(name, expert):
+        read.append((name, expert))
+        return torch.full((3, 2), expert, dtype=torch.uint8) if name == "w" else torch.tensor(1.0)
+
+    eplb.share_experts(slot_weights, expert_weight)
+    assert eplb.host_experts == (2, 3)
+    assert read == [("w", 2), ("w", 3), ("s", 2), ("s", 3)]
+    calls = layer.host_tensor_sharer.method_calls
+    shared = [c.args[:2] for c in calls if c[0] == "share_host_tensor_with_shape"]
+    announced = [c.args for c in calls if c[0] == "pre_register_host_tensor_with_shape"]
+    assert shared == [(2, "w"), (3, "w"), (2, "s"), (3, "s")]
+    assert [a[:2] for a in announced] == [
+        (e, n) for n in ("w", "s") for e in range(8) if e not in (2, 3)
+    ]
+    assert {(a[1], a[2], tuple(a[3])) for a in announced} == {
+        ("w", torch.uint8, (3, 2)),
+        ("s", torch.float32, ()),
+    }
+    assert calls[-1][0] == "finalize_layer_weights"
+    assert [c[0] for c in calls].count("finalize_layer_weights") == 1
+
+
+@pytest.mark.cpu_only
+def test_a_copy_unlike_a_slot_is_refused():
+    eplb, _ = _online(load_expert_ids=(0,))
+    with pytest.raises(AssertionError, match="a slot is"):
+        eplb.share_experts({"w": torch.zeros(4, 3)}, lambda name, expert: torch.zeros(2))
+
+
+@pytest.mark.cpu_only
+def test_binding_moves_every_slot_weight_and_registers_each_slot():
+    """A parameter keeps its identity and takes the new storage; a plain tensor moves in
+    place; each slot is registered as a view of the new storage."""
+    eplb, layer = _online()
+    param = nn.Parameter(torch.arange(24.0).reshape(4, 6), requires_grad=False)
+    scale = torch.arange(4.0)
+    old = param.data_ptr(), scale.data_ptr()
+    eplb.bind_slots({"w": param, "s": scale})
+    assert (param.data_ptr(), scale.data_ptr()) != old
+    assert [c[1] for c in layer.calls] == [param.data_ptr(), scale.data_ptr()]
+    assert torch.equal(param, torch.arange(24.0).reshape(4, 6))
+    assert torch.equal(scale, torch.arange(4.0))
+    for local in range(4):
+        assert layer.slots[(local, "w")].data_ptr() == param[local].data_ptr()
+        assert layer.slots[(local, "s")].data_ptr() == scale[local].data_ptr()
+    assert len(layer.slots) == 8
+
+    # The loader may run a target's post-load hook twice: the slots stay as registered.
+    calls, ptrs = len(layer.calls), (param.data_ptr(), scale.data_ptr())
+    eplb.bind_slots({"w": param, "s": scale})
+    assert len(layer.calls) == calls and (param.data_ptr(), scale.data_ptr()) == ptrs
+    with pytest.raises(AssertionError, match="moved after the balancer registered them"):
+        eplb.bind_slots({"w": param, "s": torch.arange(4.0)})
 
 
 # --- the routing op (GPU) ---------------------------------------------------------------------
@@ -346,3 +573,60 @@ def test_slot_windows_sum_to_the_layer() -> None:
         )
     summed = sum(p.float() for p in parts).to(torch.bfloat16)
     _assert_moe_close(summed, want)
+
+
+# --- a real online balancer moves experts into slots (GPU) -----------------------------------
+
+
+@requires_gpu
+def test_an_online_balancer_moves_experts_into_slots() -> None:
+    """Rank 0 of two under online EPLB, through `EplbLayer` alone: host copies, binding, one
+    forward whose every token picks experts 6 and 7, then a forward without updates, which
+    waits for the move.
+
+    The default placement holds 6 and 7 only on rank 1. After the move rank 0 holds some of
+    their replicas, every one of its slots holds exactly the host copy of the expert the
+    balancer placed there -- the bytes and the scalar -- and the route sends each id to a
+    slot that holds it.
+    """
+    experts, ep_size, top_k = 8, 2, 2
+    config = MoeLoadBalancerConfig(num_slots=12, layer_updates_per_iter=1)
+    slots = EplbSlots.from_config(config, 3, experts, ep_size, 0)
+
+    def expert_weight(name: str, expert: int) -> torch.Tensor:
+        if name == "w":
+            return torch.full((4, 16), 10 + expert, dtype=torch.uint8, device="cuda")
+        return torch.tensor(0.5 + expert, dtype=torch.float32, device="cuda")
+
+    weights = {
+        "w": torch.stack([expert_weight("w", e) for e in slots.slot_experts]).contiguous(),
+        "s": torch.stack([expert_weight("s", e) for e in slots.slot_experts]).contiguous(),
+    }
+    balancer = MoeLoadBalancer(0, ep_size, 1, shared_memory_base_name=f"mv2_eplb_{os.getpid()}")
+    try:
+        with balancer:
+            eplb = EplbLayer.register(slots, top_k)
+        assert eplb.online and eplb.host_experts == tuple(range(experts))
+        eplb.share_experts(weights, expert_weight)
+        eplb.bind_slots(weights)
+        balancer.register_weight_slots_after_to_cuda()
+        balancer.finalize_model()
+
+        hot = torch.tensor([[6, 7]] * 64, dtype=torch.int32, device="cuda")
+        for updates in (True, False):
+            balancer.set_iter_info(enable_statistic=True, enable_update_weights=updates)
+            with MoeLoadBalancerIterContext(balancer):
+                routed = eplb.route(hot, last=True)
+                eplb.close()
+        torch.cuda.synchronize()
+
+        placement = eplb.balancer_layer.get_old_rank_expert_ids()
+        mine = list(placement[0])
+        assert {6, 7} & set(mine), placement
+        for local, expert in enumerate(mine):
+            assert torch.equal(weights["w"][local], expert_weight("w", expert)), (local, expert)
+            assert torch.equal(weights["s"][local], expert_weight("s", expert)), (local, expert)
+        slot_expert = torch.tensor(sum(placement, []), dtype=torch.int32, device="cuda")
+        assert torch.equal(slot_expert[routed.long()], hot)
+    finally:
+        balancer.shutdown()

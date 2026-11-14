@@ -26,10 +26,14 @@ forward:
   group's largest token count, `comm/allgather`, route and run this rank's experts over
   the gathered set, `comm/reducescatter` back.
 
-Under static EPLB (`moe_config.load_balancer`, attention DP at dep4 and dep8) every routed
-MoE layer registers with the engine's load balancer, its experts are loaded by slot rather than
-by a contiguous expert window (weights.py), and `_experts` routes the router's expert ids to
-slot ids before the runner, which then works in slots. See `catalog/moe/eplb.py`.
+Under EPLB (`moe_config.load_balancer`, attention DP at dep4 and dep8) every routed MoE layer
+registers with the engine's load balancer, its experts are loaded by slot rather than by a
+contiguous expert window (weights.py), and `_experts` routes the router's expert ids to slot ids
+before the runner, which then works in slots. Under online EPLB the balancer also moves experts
+between slots while serving: the layers' slot weights are bound to it before the targets take
+their views (`post_load_weights`), each routed call records which experts its tokens chose, and
+each layer is handed back to the balancer once per forward -- a trunk layer after its experts
+run, the MTP layer after the last draft step (`close_draft_eplb`). See `catalog/moe/eplb.py`.
 
 The MTP layer (one-model MTP-Eagle) is one more decoder layer, cut per rank like the others,
 and runs through the same two layout-dependent blocks: its two residual-norm slots are the
@@ -78,7 +82,11 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.reducescatter im
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.bmm_out import bmm_out
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.nvfp4_gemm import nvfp4_gemm
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.eplb import EplbLayer
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.eplb import (
+    EplbLayer,
+    Rows,
+    rows_within,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp4_block_scale_moe_runner import (  # noqa: E501
     fp4_block_scale_moe_runner,
 )
@@ -355,7 +363,9 @@ class DeepseekV3DefaultModelingV2(DecoderModel):
         # Under EPLB every routed MoE layer registers with the engine's load
         # balancer, in the order the layers run: the trunk's, then the MTP
         # layer's, which runs once per draft step.
-        assert self.dims.eplb in (None, "static"), f"{self.dims.eplb} EPLB is not implemented"
+        assert self.dims.eplb in (None, "static", "online"), (
+            f"{self.dims.eplb} EPLB is not implemented"
+        )
         self.eplb_layers: dict[int, EplbLayer] = {}
         if self.dims.eplb is not None:
             for i, slots in self.dims.slots.items():
@@ -422,6 +432,10 @@ class DeepseekV3DefaultModelingV2(DecoderModel):
         Named for the shell hook that drives it. Not an override: that hook lives on
         DecoderModelForCausalLM, and a core derives from DecoderModel, which has none.
 
+        Under online EPLB it first binds every MoE layer's slot weights to the engine's
+        load balancer, which gives them new storage: every view the targets take is
+        taken after that.
+
         The side stream is made here, once: a CUDA stream created inside a graph capture is
         not capturable. The residual-norm op is chosen here, once, for both targets and the
         MTP layer: under attention TP choosing it builds a communicator, which is
@@ -430,6 +444,10 @@ class DeepseekV3DefaultModelingV2(DecoderModel):
         """
         cfg = self.model_config.pretrained_config
         device = self.w["final_norm"].device
+        # Under online EPLB the slot weights move to storage the load balancer writes; the
+        # views below have to be taken of that storage, so this comes first.
+        for i, eplb in self.eplb_layers.items():
+            eplb.bind_slots(_weights.MODEL_WEIGHTS.slot_weights(self, i))
         self._rope_positions = cfg.max_position_embeddings
         self._rope = self._rope_tables(device, self._rope_positions)
         self._side_stream = torch.cuda.Stream(device=device)
@@ -483,19 +501,20 @@ class DeepseekV3DefaultModelingV2(DecoderModel):
             **kwargs,
         )
 
-    def _dp_pad_rows(self, md, num_tokens: int) -> int:
-        """Rows this rank pads its block with before the MoE round trip: up to the largest
-        per-rank token count in the group, so both collectives run in their uniform form.
-        Zero without attention DP."""
+    def _dp_rows(self, md, num_tokens: int) -> "_DpRows":
+        """Where this rank's rows sit in the MoE round trip (`_DpRows`): the rows it pads
+        its block with, up to the largest per-rank token count in the group, so both
+        collectives run in their uniform form, and the gathered rows that are tokens.
+        Nothing is padded without attention DP."""
         if self.dp_size == 1:
-            return 0
+            return _NO_DP
         counts = [int(n) for n in md.all_rank_num_tokens]
         assert len(counts) == self.dp_size, (counts, self.dp_size)
         assert counts[self.rank] == num_tokens, (
             f"rank {self.rank} holds {num_tokens} rows but all_rank_num_tokens "
             f"says {counts[self.rank]} ({counts}); the collectives would gather the wrong split"
         )
-        return max(counts) - num_tokens
+        return _DpRows.of(counts, num_tokens)
 
     def _mtp_kv_layer(self, md) -> int:
         """The MTP layer's index in the KV pool `md` addresses on this call.
@@ -514,20 +533,55 @@ class DeepseekV3DefaultModelingV2(DecoderModel):
         """
         return int(md.kv_cache_manager.layer_offsets[self.dims.num_layers])
 
-    def _mtp_pad_rows(self, all_rank_num_tokens, rows: int) -> int:
-        """The MTP layer's `_dp_pad_rows`, on the count list the spec worker hands it.
+    def _mtp_dp_rows(self, all_rank_num_tokens, rows: int) -> "_DpRows":
+        """The MTP layer's `_dp_rows`, on the count list the spec worker hands it.
 
         Callers must pass the worker's own basis, never `attn_metadata.all_rank_num_tokens`,
         which from draft step 1 onwards is still the trunk's list: at equal byte counts the
-        collectives diverge silently on every rank, with no hang. Zero without attention DP.
+        collectives diverge silently on every rank, with no hang. Nothing is padded without
+        attention DP.
         """
         if self.dp_size == 1:
-            return 0
+            return _NO_DP
         counts = [int(n) for n in all_rank_num_tokens]
         assert len(counts) == self.dp_size, (counts, self.dp_size)
-        pad = max(counts) - rows
-        assert pad >= 0, f"rank {self.rank} holds {rows} MTP rows, more than any rank in {counts}"
-        return pad
+        assert max(counts) >= rows, (
+            f"rank {self.rank} holds {rows} MTP rows, more than any rank in {counts}"
+        )
+        return _DpRows.of(counts, rows)
+
+    def close_draft_eplb(self) -> None:
+        """Hand the MTP layer back to the engine's load balancer for this forward, under
+        online EPLB (`EplbLayer.close`): after the last draft step, also when the spec
+        worker drafted none. The trunk's layers hand themselves back in `_experts`."""
+        eplb = self.eplb_layers.get(self.dims.num_layers)
+        if eplb is not None:
+            eplb.close()
+
+
+class _DpRows(NamedTuple):
+    """Where a rank's rows sit in the attention-DP round trip of the routed experts.
+
+    `pad`: the rows this rank pads its block with, up to the largest per-rank count, so
+    the collectives run in their uniform form. `tokens`: the rows of the gathered set
+    that are tokens, as `(start, stop)` ranges, or None when no rank pads -- what an
+    online EPLB statistic counts, padding left out.
+    """
+
+    pad: int
+    tokens: Rows | None
+
+    @classmethod
+    def of(cls, counts: list[int], rows: int) -> "_DpRows":
+        """This rank holding `rows` of a group whose ranks hold `counts`."""
+        block = max(counts)
+        if min(counts) == block:
+            return cls(0, None)
+        return cls(block - rows, tuple((r * block, r * block + n) for r, n in enumerate(counts)))
+
+
+#: Without attention DP: every rank holds every token and nothing is padded.
+_NO_DP = _DpRows(0, None)
 
 
 class _LayerWeights(NamedTuple):
@@ -605,11 +659,8 @@ def _layer_views(core: DeepseekV3DefaultModelingV2) -> list[_LayerWeights]:
             # routed FC1 activation scale has to be a single value and the same value on all
             # ranks, or the expert slots and intermediate slices no longer sum to the whole
             # layer; the shared expert's `input_scale` is the max over all routed ones, so it
-            # is the safe one. The per-expert scalars are held for every expert on every
-            # rank; each slot reads its own expert's.
-            held = torch.tensor(d.slots[i].slot_experts, device=isc1.device)
-            e_isc2 = w[f"l{i}_e_isc2"][held]
-            gate1 = (isc1[0] * w[f"l{i}_e_ws2_1"][held]).contiguous()
+            # is the safe one. The three output scales are slot weights, each slot's from its
+            # expert's scalars (weights.py), so they move with the expert under online EPLB.
             moe = dict(
                 router=w[f"l{i}_router"].t(),
                 router_bias=w[f"l{i}_router_bias"],
@@ -618,9 +669,9 @@ def _layer_views(core: DeepseekV3DefaultModelingV2) -> list[_LayerWeights]:
                 fc1_s=w[f"l{i}_fc1_s"].view(torch.float8_e4m3fn),
                 fc2_w=w[f"l{i}_fc2_w"],
                 fc2_s=w[f"l{i}_fc2_s"].view(torch.float8_e4m3fn),
-                out1_scale=(gate1 / e_isc2).contiguous(),
-                out1_gate_scale=gate1,
-                out2_scale=(e_isc2 * w[f"l{i}_e_ws2_2"][held]).contiguous(),
+                out1_scale=w[f"l{i}_out1_scale"],
+                out1_gate_scale=w[f"l{i}_out1_gate_scale"],
+                out2_scale=w[f"l{i}_out2_scale"],
                 eplb=core.eplb_layers.get(i),
             )
         layers.append(
@@ -661,7 +712,12 @@ def _dense_mlp(x: torch.Tensor, L: _LayerWeights, dt) -> torch.Tensor:
     return nvfp4_gemm(aq, L.mlp_dn_w, asf, L.mlp_dn_s, L.mlp_dn_alpha, dt)
 
 
-def _experts(core: DeepseekV3DefaultModelingV2, L: _LayerWeights, x: torch.Tensor) -> torch.Tensor:
+def _experts(
+    core: DeepseekV3DefaultModelingV2,
+    L: _LayerWeights,
+    x: torch.Tensor,
+    tokens: Rows | None = None,
+) -> torch.Tensor:
     """Route, quantize and run this rank's experts -- its expert slots at its moe_tp slice
     of the intermediate -- over `x`, at most `_MOE_MAX_T` rows a call. The result is this
     rank's partial sum.
@@ -669,11 +725,14 @@ def _experts(core: DeepseekV3DefaultModelingV2, L: _LayerWeights, x: torch.Tenso
     Under EPLB the router's expert ids are routed to slot ids first, and the runner works
     in slots: `num_slots` routing ids, of which this rank answers for its own window.
     Every rank routes the same gathered rows, so every rank picks the same slot for each
-    of a token's experts, and the slots' partial sums add up to the layer."""
+    of a token's experts, and the slots' partial sums add up to the layer. Under online
+    EPLB the routing also records the experts of the rows `tokens` names (None: every
+    row), and the layer goes back to the balancer once its last chunk has run."""
     cfg = core.model_config.pretrained_config
     d = core.dims
+    chunks = torch.split(x, _MOE_MAX_T, 0)
     parts = []
-    for chunk in torch.split(x, _MOE_MAX_T, 0):
+    for k, chunk in enumerate(chunks):
         logits = cublas_mm(chunk, L.router)
         topk_w, topk_ids = noaux_tc_op(
             logits,
@@ -684,7 +743,9 @@ def _experts(core: DeepseekV3DefaultModelingV2, L: _LayerWeights, x: torch.Tenso
             float(cfg.routed_scaling_factor),
         )
         if L.eplb is not None:
-            topk_ids = L.eplb.route(topk_ids)
+            start = k * _MOE_MAX_T
+            rows = rows_within(tokens, start, start + chunk.shape[0])
+            topk_ids = L.eplb.route(topk_ids, rows, last=k == len(chunks) - 1)
         xq, xsf = fp4_quantize(chunk, L.moe_gscale, _SF_VEC, False, _SF_LINEAR)
         parts.append(
             fp4_block_scale_moe_runner(
@@ -719,6 +780,8 @@ def _experts(core: DeepseekV3DefaultModelingV2, L: _LayerWeights, x: torch.Tenso
                 topk_ids=topk_ids,
             )[0]
         )
+    if L.eplb is not None:
+        L.eplb.close()
     return parts[0] if len(parts) == 1 else torch.cat(parts, 0)
 
 
@@ -797,12 +860,16 @@ def _mtp_shared(x: torch.Tensor, M: _MtpWeights) -> torch.Tensor:
 
 
 def _mtp_experts(
-    core: DeepseekV3DefaultModelingV2, M: _MtpWeights, x: torch.Tensor
+    core: DeepseekV3DefaultModelingV2,
+    M: _MtpWeights,
+    x: torch.Tensor,
+    tokens: Rows | None = None,
 ) -> torch.Tensor:
     """Route and run this rank's bf16 MTP experts -- its expert slots at its moe_tp slice
     of the intermediate -- over `x`, at most `_MOE_MAX_T` rows a call. The result is this
     rank's partial sum, the trunk's `_experts` at a different dtype, and under EPLB routed
-    to slots the same way.
+    to slots the same way. It runs once per draft step, so under online EPLB the layer
+    goes back to the balancer after the last of them, in `close_draft_eplb`, not here.
 
     `fused_moe` rather than the trtllm-gen runner: the checkpoint excludes
     `model.layers.61*` from NVFP4, and the runner takes NVFP4 operands only. It wants fp32
@@ -814,7 +881,7 @@ def _mtp_experts(
     cfg = core.model_config.pretrained_config
     d = core.dims
     parts = []
-    for chunk in torch.split(x, _MOE_MAX_T, 0):
+    for k, chunk in enumerate(torch.split(x, _MOE_MAX_T, 0)):
         topk_w, topk_ids = noaux_tc_op(
             cublas_mm(chunk, M.router, None, torch.float32),
             M.router_bias,
@@ -824,7 +891,8 @@ def _mtp_experts(
             float(cfg.routed_scaling_factor),
         )
         if M.eplb is not None:
-            topk_ids = M.eplb.route(topk_ids)
+            start = k * _MOE_MAX_T
+            topk_ids = M.eplb.route(topk_ids, rows_within(tokens, start, start + chunk.shape[0]))
         parts.append(
             fused_moe(
                 input=chunk,
@@ -846,9 +914,10 @@ def _mtp_experts(
     return parts[0] if len(parts) == 1 else torch.cat(parts, 0)
 
 
-#: The expert call a routed block wraps: `(core, weights, x) -> this rank's partial sum`.
-#: `_experts` for a trunk layer, `_mtp_experts` for the MTP layer.
-Experts = Callable[[DeepseekV3DefaultModelingV2, tuple, torch.Tensor], torch.Tensor]
+#: The expert call a routed block wraps: `(core, weights, x, tokens) -> this rank's partial
+#: sum`, `tokens` the rows of `x` that are tokens (None: every row). `_experts` for a trunk
+#: layer, `_mtp_experts` for the MTP layer.
+Experts = Callable[[DeepseekV3DefaultModelingV2, tuple, torch.Tensor, Rows | None], torch.Tensor]
 
 
 def _routed_on_every_token(
@@ -856,11 +925,11 @@ def _routed_on_every_token(
     experts: Experts,
     weights: tuple,
     o: torch.Tensor,
-    pad_rows: int,
+    dp_rows: _DpRows,
 ) -> torch.Tensor:
     """Every rank holds every token (attention TP): the result is this rank's partial sum
     for the allreduce in the next residual-norm slot to complete."""
-    return experts(core, weights, o)
+    return experts(core, weights, o, None)
 
 
 def _routed_attention_dp(
@@ -868,7 +937,7 @@ def _routed_attention_dp(
     experts: Experts,
     weights: tuple,
     o: torch.Tensor,
-    pad_rows: int,
+    dp_rows: _DpRows,
 ) -> torch.Tensor:
     """Each rank holds its own tokens: gather them, run this rank's experts over the whole
     set, and sum back to the rows this rank owns.
@@ -877,17 +946,18 @@ def _routed_attention_dp(
     top-8 ids fall in exactly one rank's slot window per moe_tp slice, and the
     reduce-scatter sums each contribution once."""
     num_tokens = o.shape[0]
+    pad_rows = dp_rows.pad
     o_pad = o if not pad_rows else nn.functional.pad(o, [0, 0, 0, pad_rows])
     group, pg = core.dp_group, core.dp_process_group
     routed_pad = reducescatter(
-        experts(core, weights, allgather(o_pad, None, group, pg)), None, group, pg
+        experts(core, weights, allgather(o_pad, None, group, pg), dp_rows.tokens), None, group, pg
     )
     return routed_pad if not pad_rows else routed_pad[:num_tokens]
 
 
-#: A routed-expert block: `(core, experts, weights, o, pad_rows) -> routed`.
+#: A routed-expert block: `(core, experts, weights, o, dp_rows) -> routed`.
 RoutedBlock = Callable[
-    [DeepseekV3DefaultModelingV2, Experts, tuple, torch.Tensor, int], torch.Tensor
+    [DeepseekV3DefaultModelingV2, Experts, tuple, torch.Tensor, _DpRows], torch.Tensor
 ]
 
 
@@ -988,7 +1058,7 @@ class PrefillTarget:
         gen_seqs = md.num_seqs - num_ctx
         gen_p = gen // gen_seqs if gen_seqs else 1
         ctx_kv_tokens = int(md.host_total_kv_lens[0])
-        pad_rows = core._dp_pad_rows(md, num_tokens)
+        dp_rows = core._dp_rows(md, num_tokens)
         cached_ctx = core._cached_ctx
 
         attn_out = torch.empty([num_tokens, heads * v_dim], dtype=dt, device=dev)
@@ -1201,7 +1271,7 @@ class PrefillTarget:
                 side.wait_stream(main)
                 with torch.cuda.stream(side):
                     shared = _dense_mlp(o, L, dt)
-                routed = self._routed(core, _experts, L, o, pad_rows)
+                routed = self._routed(core, _experts, L, o, dp_rows)
                 main.wait_stream(side)
                 mlp_out = torch.add(routed, shared)
             mlp_out, residual = self._residual_norm(mlp_out, residual, L.norm_next)
@@ -1261,7 +1331,7 @@ class PrefillTarget:
         pool_map = md.host_kv_cache_pool_mapping
         window = md.max_seq_len
         ctx_kv_tokens = int(md.host_total_kv_lens[0])
-        pad_rows = core._mtp_pad_rows(all_rank_num_tokens, rows)
+        dp_rows = core._mtp_dp_rows(all_rank_num_tokens, rows)
 
         e = nn.functional.embedding(input_ids, embed_tokens)
         en = flashinfer_rmsnorm(e, M.enorm, eps)
@@ -1459,7 +1529,7 @@ class PrefillTarget:
             attn_gen_t = torch.transpose(torch.reshape(attn_gen, [gen, heads, v_dim]), 0, 1)
             attn_gen_t = bmm_out(a=lat_out_t, b=M.v_b_t, out=attn_gen_t)
 
-        return _mtp_tail(self, M, attn_out, residual, pad_rows)
+        return _mtp_tail(self, M, attn_out, residual, dp_rows)
 
 
 class DecodeTarget:
@@ -1560,7 +1630,7 @@ class DecodeTarget:
         # query block is taller, and what aligns the bottom-right within-block causal mask.
         gen_seqs = md.num_seqs
         gen_p = gen // gen_seqs if gen_seqs else 1
-        pad_rows = core._dp_pad_rows(md, num_tokens)
+        dp_rows = core._dp_rows(md, num_tokens)
 
         attn_out = torch.empty([num_tokens, heads * v_dim], dtype=dt, device=dev)
         attn_gen = attn_out
@@ -1679,7 +1749,7 @@ class DecodeTarget:
                 side.wait_stream(main)
                 with torch.cuda.stream(side):
                     shared = _dense_mlp(o, L, dt)
-                routed = self._routed(core, _experts, L, o, pad_rows)
+                routed = self._routed(core, _experts, L, o, dp_rows)
                 main.wait_stream(side)
                 mlp_out = torch.add(routed, shared)
             mlp_out, residual = self._residual_norm(mlp_out, residual, L.norm_next)
@@ -1731,7 +1801,7 @@ class DecodeTarget:
         pool_ptrs = md.host_kv_cache_pool_pointers
         pool_map = md.host_kv_cache_pool_mapping
         window = md.max_seq_len
-        pad_rows = core._mtp_pad_rows(all_rank_num_tokens, rows)
+        dp_rows = core._mtp_dp_rows(all_rank_num_tokens, rows)
 
         e = nn.functional.embedding(input_ids, embed_tokens)
         en = flashinfer_rmsnorm(e, M.enorm, eps)
@@ -1839,7 +1909,7 @@ class DecodeTarget:
         attn_gen_t = torch.transpose(torch.reshape(attn_gen, [gen, heads, v_dim]), 0, 1)
         attn_gen_t = bmm_out(a=lat_out_t, b=M.v_b_t, out=attn_gen_t)
 
-        return _mtp_tail(self, M, attn_out, residual, pad_rows)
+        return _mtp_tail(self, M, attn_out, residual, dp_rows)
 
 
 def _mtp_tail(
@@ -1847,7 +1917,7 @@ def _mtp_tail(
     M: _MtpWeights,
     attn_out: torch.Tensor,
     residual: torch.Tensor,
-    pad_rows: int,
+    dp_rows: _DpRows,
 ) -> torch.Tensor:
     """The MTP layer from its attention output on: o_proj, the two residual-norm slots and
     the MLP between them, through the target's layout-dependent blocks.
@@ -1862,7 +1932,7 @@ def _mtp_tail(
     o = cublas_mm(attn_out, M.o)
     o, residual = target._residual_norm(o, residual, M.norm2)
     shared = _mtp_shared(o, M)
-    routed = target._routed(core, _mtp_experts, M, o, pad_rows)
+    routed = target._routed(core, _mtp_experts, M, o, dp_rows)
     _, residual = target._residual_norm(torch.add(routed, shared), residual, M.head_norm)
     return residual
 
@@ -1944,9 +2014,11 @@ class DraftModel:
 class ModelingV2DeepseekR10528Nvfp4Sm10xDefault(
     DecoderModelForCausalLM[DeepseekV3DefaultModelingV2, PretrainedConfig]
 ):
-    #: Static EPLB: the core registers its MoE layers with the engine's load balancer, loads
-    #: its experts by slot and routes expert ids to slots (`catalog/moe/eplb.py`).
-    EPLB_MODES = frozenset({"static"})
+    #: The core registers its MoE layers with the engine's load balancer, loads its experts
+    #: by slot and routes expert ids to slots; under online EPLB it also hands the balancer
+    #: host copies of its experts, binds its slot weights and hands every layer back once
+    #: per forward (`catalog/moe/eplb.py`).
+    EPLB_MODES = frozenset({"static", "online"})
 
     def __init__(self, model_config: ModelConfig):
         cfg = model_config.pretrained_config
@@ -2011,7 +2083,7 @@ class ModelingV2DeepseekR10528Nvfp4Sm10xDefault(
             attn_metadata,
             True,
         )
-        return self.spec_worker(
+        outputs = self.spec_worker(
             input_ids=input_ids,
             position_ids=position_ids,
             hidden_states=hidden,
@@ -2021,6 +2093,9 @@ class ModelingV2DeepseekR10528Nvfp4Sm10xDefault(
             draft_model=self.draft_model,
             resource_manager=kwargs.get("resource_manager"),
         )
+        # The worker decides how many draft steps this forward takes, none included.
+        self.model.close_draft_eplb()
+        return outputs
 
     def load_weights(self, weights, *args, **kwargs):
         _weights.MODEL_WEIGHTS.load(self, weights)

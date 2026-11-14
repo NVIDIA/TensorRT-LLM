@@ -1,16 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""What the default deepseek target registers with the engine's load balancer under static EPLB.
+"""What the default deepseek target registers with the engine's load balancer under EPLB.
 
-The target is built under meta init, so no weight is allocated, against a real static load
-balancer at one rank of dep4. The registrations are the target's half of the contract: the
-loader finalizes the balancer and the executor drives it per forward, and both rely on every
-routed MoE layer being registered once, in the order the layers run, with the placement the
-target loads its weights by.
+The target is built under meta init, so no weight is allocated, against a real load balancer,
+static or online, at one rank of dep4. The registrations are the target's half of the
+contract: the loader finalizes the balancer and the executor drives it per forward, and both
+rely on every routed MoE layer being registered once, in the order the layers run, with the
+placement the target loads its weights by.
 """
 
 from __future__ import annotations
 
+import os
 import random
 
 import pytest
@@ -83,11 +84,14 @@ def _placement(layer: int) -> list:
     return out
 
 
+@pytest.mark.parametrize("updates", [0, 2], ids=["static", "online"])
 @pytest.mark.parametrize("mtp", [False, True], ids=["no_spec", "mtp3"])
-def test_static_eplb_registers_every_routed_layer(mtp):
+def test_eplb_registers_every_routed_layer(mtp, updates):
     layers = range(3, 61 + int(mtp))
     assignments = {i: _placement(i) for i in layers}
-    load_balancer = MoeLoadBalancerConfig(num_slots=_SLOTS, initial_global_assignments=assignments)
+    load_balancer = MoeLoadBalancerConfig(
+        num_slots=_SLOTS, initial_global_assignments=assignments, layer_updates_per_iter=updates
+    )
     load_balancer.setup(ep_rank=_RANK, ep_size=_EP)
     model_config = ModelConfig(
         pretrained_config=DeepseekV3Config(**_R1),
@@ -104,7 +108,12 @@ def test_static_eplb_registers_every_routed_layer(mtp):
         spec_config=MTPDecodingConfig(max_draft_len=3) if mtp else None,
     )
 
-    balancer = MoeLoadBalancer(ep_rank=_RANK, ep_size=_EP, layer_updates_per_iter=0)
+    balancer = MoeLoadBalancer(
+        ep_rank=_RANK,
+        ep_size=_EP,
+        layer_updates_per_iter=updates,
+        shared_memory_base_name=f"mv2_ds_eplb_{os.getpid()}",
+    )
     try:
         with balancer, MetaInitMode():
             core = DeepseekV3DefaultModelingV2(model_config)
@@ -118,8 +127,10 @@ def test_static_eplb_registers_every_routed_layer(mtp):
             placement = layer.single_layer_load_balancer_impl.get_old_rank_expert_ids()
             assert sum(placement, []) == assignments[i], i
 
+        mode = "online" if updates else "static"
+        assert [eplb.online for eplb in core.eplb_layers.values()] == [bool(updates)] * len(layers)
         d = core.dims
-        assert (d.eplb, d.num_slots, d.local_slots, d.slot_offset) == ("static", 288, 72, 72)
+        assert (d.eplb, d.num_slots, d.local_slots, d.slot_offset) == (mode, 288, 72, 72)
         for i in layers:
             mine = tuple(assignments[i][72:144])
             assert d.slots[i].slot_experts == mine

@@ -1676,24 +1676,24 @@ def test_eplb_at_dep4_keeps_the_builtin_gpt_oss(eplb_mode):
 _R1_EPLB_LAYOUTS = {"dep4": _layout(4, True, 1, 4), "dep8": _layout(8, True, 1, 8)}
 
 
+@pytest.mark.parametrize("eplb_mode", ["static", "online"])
 @pytest.mark.parametrize("spec_config", [None, _MTP3], ids=["no_spec", "mtp3"])
 @pytest.mark.parametrize(
     "mapping_kwargs", list(_R1_EPLB_LAYOUTS.values()), ids=list(_R1_EPLB_LAYOUTS)
 )
-def test_r1_static_eplb_matches_at_dep4_and_dep8(mapping_kwargs, spec_config):
-    """The default target implements static EPLB, measured at dep4 and dep8, with and
-    without its MTP layer."""
+def test_r1_eplb_matches_at_dep4_and_dep8(mapping_kwargs, spec_config, eplb_mode):
+    """The default target implements static and online EPLB, measured at dep4 and dep8,
+    with and without its MTP layer."""
     config = _balanced(
-        _model_config(_r1_config(), spec_config=spec_config, **mapping_kwargs), "static"
+        _model_config(_r1_config(), spec_config=spec_config, **mapping_kwargs), eplb_mode
     )
     assert _qualified(modeling_v2_resolve(config, _llm_args("require"))) == _R1_DEFAULT_TARGET
 
 
-@pytest.mark.parametrize("eplb_mode", ["online", "per_layer_dynamic"])
-def test_r1_eplb_beyond_static_keeps_the_builtin_model(eplb_mode):
-    config = _balanced(_model_config(_r1_config(), **_DEP4), eplb_mode)
+def test_r1_per_layer_dynamic_eplb_keeps_the_builtin_model():
+    config = _balanced(_model_config(_r1_config(), **_DEP4), "per_layer_dynamic")
     assert modeling_v2_resolve(config, _llm_args("auto")) is None
-    with pytest.raises(ValueError, match=f"{eplb_mode} EPLB .* implements static"):
+    with pytest.raises(ValueError, match="per_layer_dynamic EPLB .* implements online, static"):
         modeling_v2_resolve(config, _llm_args("require"))
 
 
@@ -1706,12 +1706,13 @@ def test_r1_eplb_beyond_static_keeps_the_builtin_model(eplb_mode):
         pytest.param(_layout(16, True, 1, 16), id="dep16"),
     ],
 )
-def test_r1_static_eplb_is_refused_where_it_was_not_measured(mapping_kwargs):
+@pytest.mark.parametrize("eplb_mode", ["static", "online"])
+def test_r1_eplb_is_refused_where_it_was_not_measured(mapping_kwargs, eplb_mode):
     """EPLB balances attention DP over ranks that hold whole experts; the target runs it at
     the layouts it was measured at and declines the rest, which keep the built-in model."""
-    config = _balanced(_model_config(_r1_config(), **mapping_kwargs), "static")
+    config = _balanced(_model_config(_r1_config(), **mapping_kwargs), eplb_mode)
     assert modeling_v2_resolve(config, _llm_args("auto")) is None
-    with pytest.raises(ValueError, match="static EPLB at parallel layout"):
+    with pytest.raises(ValueError, match=f"{eplb_mode} EPLB at parallel layout"):
         modeling_v2_resolve(config, _llm_args("require"))
 
 

@@ -577,24 +577,42 @@ an EPLB deployment only if its class lists the mode in `EPLB_MODES`.
 - A target that gathers tokens before routing routes on every rank and must
   get the same slots on every rank: `EplbLayer.route` does
   (`offset_by_ep_rank=False`).
+- Online EPLB adds three duties, all through `EplbLayer`:
+  - While loading, `share_experts` hands the balancer host copies of this
+    rank's share of every routed layer's experts (`host_experts`), each slot
+    weight in the slot layout.
+  - After loading, `bind_slots` moves the slot weights to memory the balancer
+    writes, before any view of them is taken. Every per-slot scalar the
+    expert kernel reads is a bound slot weight, not a value recomputed in the
+    forward.
+  - Per forward, `route(ids, rows, last)` records the routed ids without the
+    padding rows, and `close()` hands each layer back once, after its last
+    expert kernel and before the next layer routes. A draft layer is closed
+    after the worker's last draft step, also when the worker drafts nothing.
 
 **Grep.** `EPLB_MODES`, `moe_eplb_mode`, `eplb_slots`, `EplbLayer`,
-`eplb_route`, `moe_load_balancer_mode`, `maybe_create_moe_load_balancer`,
-`MoeLoadBalancerConfig`, `initial_global_assignments`, `num_slots`.
+`eplb_route`, `share_experts`, `bind_slots`, `close_draft_eplb`,
+`moe_load_balancer_mode`, `maybe_create_moe_load_balancer`,
+`MoeLoadBalancerConfig`, `initial_global_assignments`, `num_slots`,
+`layer_updates_per_iter`.
 
 **Tests to imitate.**
 - `tests/unittest/_torch/modeling_v2/moe/test_modeling_v2_eplb.py`: the slots
-  and registration on the CPU; the route op's cells, where every EP rank must
-  route the same ids to the same slots; and a slot-routed layer whose windows
-  sum to the layer without EPLB.
+  and registration on the CPU; the online protocol a layer follows with the
+  balancer, its host copies and its binding, on the CPU; the route op's
+  cells, where every EP rank must route the same ids to the same slots; a
+  slot-routed layer whose windows sum to the layer without EPLB; and a real
+  online balancer moving experts into bound slots.
 - `tests/unittest/_torch/modeling_v2/models/deepseek_v3/r1_0528_nvfp4__sm_10x__default/test_modeling_v2_deepseek_default_shards.py`
-  (`test_eplb_*`): slots and `load` under a placement drawn per layer, with
-  copies of an expert across ranks and twice on one rank, against the
-  world-size-1 table without EPLB.
+  (`test_eplb_*`, `test_online_eplb_*`): slots and `load` under a placement
+  drawn per layer, with copies of an expert across ranks and twice on one
+  rank, and the host copies online EPLB hands over, against the world-size-1
+  table without EPLB.
 - `tests/unittest/_torch/modeling_v2/test_modeling_v2_routing.py`
   (`test_eplb_*`, `test_r1_*eplb*`): the resolver's decisions per mode and
   layout.
-- `accuracy/modeling_v2/deepseek_v3/r1_0528_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k_static_eplb`.
+- `accuracy/modeling_v2/deepseek_v3/r1_0528_nvfp4__sm_10x__default/test_accuracy.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k_static_eplb`
+  and `::test_gsm8k_online_eplb`.
 
 **Fast check.** quickstart or `trtllm-serve` at a dep layout with
 `moe_config.load_balancer` set and `modeling_v2: require`: the engine must
@@ -611,8 +629,16 @@ not report the registered layers, so the target's own tests carry that.
 - A slot loaded with the wrong expert, or an id routed to a slot that holds
   another expert, still produces fluent text. Use a placement that differs
   from the default in every layer, with an expert held twice on one rank.
-- Padding rows and attention-DP dummy requests count in the routing like
-  real tokens.
+- Attention-DP dummy requests count in the statistic like real tokens;
+  only the padding rows a target names in `route` are left out.
 - A layer that is registered but never runs, for example after the loader
   builds the model twice, changes nothing under static EPLB. Under online
-  EPLB the balancer waits for it.
+  EPLB the balancer waits for it, and so does every later forward: a missed
+  `close` hangs the engine rather than failing it.
+- Under online EPLB, a view of a slot weight taken before `bind_slots`, or a
+  per-slot scalar recomputed in the forward, reads stale values after the
+  first move -- the score drops only once the balancer has moved experts, so
+  the run has to be long enough for that.
+- Online EPLB needs host-accessible device memory: Grace's, or GDRCopy on x86
+  with a library that matches the node's `gdrdrv` driver. Without it the
+  balancer fails at creation.

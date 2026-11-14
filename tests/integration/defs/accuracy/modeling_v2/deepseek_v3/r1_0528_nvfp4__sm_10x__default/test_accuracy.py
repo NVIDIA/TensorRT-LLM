@@ -109,7 +109,7 @@ _MTP_LAYOUT_IDS = ("dep4", "tp4", "tp4_ep4", "dep4_moetp4", "tp8_moetp2_ep4", "d
 _MTP_LAYOUTS = [p for i in _MTP_LAYOUT_IDS for p in _LAYOUTS if p.id == i]
 
 
-# The layouts the target runs static EPLB at: attention DP over ranks holding whole experts.
+# The layouts the target runs EPLB at: attention DP over ranks holding whole experts.
 _EPLB_LAYOUTS = [p for i in ("dep4", "dep8") for p in _LAYOUTS if p.id == i]
 
 
@@ -347,6 +347,37 @@ class TestModelingV2DeepseekR10528Nvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
         load_balancer = MoeLoadBalancerConfig(
             num_slots=num_slots, initial_global_assignments=assignments
         )
+        spec = dict(speculative_config=self.MTP3, kv_cache_config=self.MTP3_KV) if mtp else {}
+
+        with (
+            scoped_env_overrides({MODELING_V2_VALIDATE_ENV: "1"}) as rank_env,
+            LLM(
+                self.MODEL_PATH,
+                moe_config=MoeConfig(load_balancer=load_balancer),
+                modeling_v2="require",
+                env_overrides=rank_env,
+                **spec,
+                **parallel,
+            ) as llm,
+        ):
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_not_sm10x
+    @pytest.mark.parametrize("mtp", [False, True], ids=["no_spec", "mtp3"])
+    @pytest.mark.parametrize("parallel", _EPLB_LAYOUTS)
+    def test_gsm8k_online_eplb(self, mocker, parallel, mtp):
+        """Online EPLB from the built-in default placement, the MTP layer included.
+
+        Two layers are rebalanced per forward. Every routed layer hands the engine's load
+        balancer host copies of its share of the experts and binds its slot weights to it,
+        every forward records which experts its tokens chose, and between forwards the
+        balancer copies experts into slots and reroutes to them. An expert copied wrong, a
+        statistic that stalls the balancer or a view left on the storage the balancer no
+        longer writes shows up here, against the same GSM8K reference as the identity cases.
+        """
+        mocker.patch.dict(GSM8K.EVALUATE_KWARGS, _SCORES_FILTER)
+        load_balancer = MoeLoadBalancerConfig(num_slots=288, layer_updates_per_iter=2)
         spec = dict(speculative_config=self.MTP3, kv_cache_config=self.MTP3_KV) if mtp else {}
 
         with (

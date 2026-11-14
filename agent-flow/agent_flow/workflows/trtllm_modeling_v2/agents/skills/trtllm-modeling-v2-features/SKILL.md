@@ -94,7 +94,7 @@ Climb only as far as the claim needs. Each rung says what it cannot see.
 | disaggregation | feature `disagg` + `accuracy.disagg.test` | a benchmark scored through `trtllm-serve disaggregated` | the tree's disaggregated-serving test |
 | multimodal | feature `multimodal` | an image prompt answered | boot image, image benchmark |
 | speculative | features `mtp`, `eagle3`, `dflash`, `dspark` | each rank's algorithm and depth; accepted tokens per iteration | acceptance gate |
-| EPLB | a variant setting `llm_api_options.moe_config.load_balancer` at a `dep` member, `modeling_v2: require` | the engine builds the target (a mode missing from its `EPLB_MODES` refuses it) | variant accuracy |
+| EPLB | a variant setting `llm_api_options.moe_config.load_balancer` at a `dep` member (`layer_updates_per_iter` > 0 for online), `modeling_v2: require` | the engine builds the target (a mode missing from its `EPLB_MODES` refuses it) | variant accuracy |
 
 ## Rules that save hours
 
