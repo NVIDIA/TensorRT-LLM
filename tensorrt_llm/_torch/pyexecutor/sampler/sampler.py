@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING, Any, Dict, Generic, List, Optional, TypeAlias,
 import torch
 
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
-from tensorrt_llm._utils import nvtx_range, prefer_pinned
+from tensorrt_llm._utils import async_tensor_h2d, nvtx_range, prefer_pinned
 from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.bindings.internal.batch_manager import add_new_tokens_to_requests
 from tensorrt_llm.executor.result import Logprob
@@ -2294,33 +2294,23 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     if proc_lp_temperature_cuda is not None:
                         proc_lp_temperature_cuda = proc_lp_temperature_cuda.unsqueeze(-1)
                 else:
-                    # Masked with an output size computed on the host, so that
-                    # selecting the rows does not sync with the device.
+                    # Build the kept row indices on the host and select the rows by index:
+                    # a device-side boolean mask would make the host wait to count the rows.
                     proc_lp_group_steps = req_num_generated_tokens[group_req_indices]
                     proc_lp_req_mask = torch.tensor(gather_processed_logprobs, dtype=torch.bool)
-                    proc_lp_step_mask_cuda = torch.repeat_interleave(
-                        proc_lp_req_mask.to(device=cuda_device, non_blocking=True),
-                        proc_lp_group_steps.to(device=cuda_device, non_blocking=True),
-                        output_size=cast(int, proc_lp_group_steps.sum().item()),
-                    ).unsqueeze(-1)
-                    proc_lp_steps_num_selected = cast(
-                        int,
-                        (proc_lp_req_mask.to(dtype=proc_lp_group_steps.dtype) * proc_lp_group_steps)
-                        .sum()
-                        .item(),
+                    proc_lp_rows_cuda = async_tensor_h2d(
+                        torch.repeat_interleave(proc_lp_req_mask, proc_lp_group_steps)
+                        .nonzero()
+                        .squeeze(-1),
+                        torch.int64,
+                        cuda_device,
                     )
-
-                    def _select_steps(t: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-                        selected = t.new_empty((proc_lp_steps_num_selected, *t.shape[1:]))
-                        torch.masked_select(t, mask, out=selected.view(-1))
-                        return selected
-
-                    proc_lp_logits_cuda = _select_steps(group_logits_cuda, proc_lp_step_mask_cuda)
-                    proc_lp_softmax_cuda = _select_steps(group_softmax_cuda, proc_lp_step_mask_cuda)
+                    proc_lp_logits_cuda = group_logits_cuda.index_select(0, proc_lp_rows_cuda)
+                    proc_lp_softmax_cuda = group_softmax_cuda.index_select(0, proc_lp_rows_cuda)
                     proc_lp_temperature_cuda = None
                     if group_temperature_cuda is not None:
-                        proc_lp_temperature_cuda = _select_steps(
-                            group_temperature_cuda, proc_lp_step_mask_cuda.squeeze(-1)
+                        proc_lp_temperature_cuda = group_temperature_cuda.index_select(
+                            0, proc_lp_rows_cuda
                         ).unsqueeze(-1)
 
                 # Apply temperature
