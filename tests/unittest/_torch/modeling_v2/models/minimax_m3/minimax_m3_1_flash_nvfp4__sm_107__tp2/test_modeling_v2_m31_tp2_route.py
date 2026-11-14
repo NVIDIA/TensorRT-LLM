@@ -25,6 +25,7 @@ pytestmark = pytest.mark.cpu_only
 _FAMILY = "tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3"
 _TARGETS = {
     "minimax_m3_1_flash_nvfp4__sm_107__tp2": "ModelingV2MiniMaxM31FlashNvfp4Sm107Tp2",
+    "minimax_m3_1_flash_nvfp4__sm_107__tp4": "ModelingV2MiniMaxM31FlashNvfp4Sm107Tp4",
     "minimax_m3_1_flash_nvfp4__sm_107__tp8": "ModelingV2MiniMaxM31FlashNvfp4Sm107Tp8",
     "minimax_m3_1_flash_nvfp4__sm_107__tp2ctx": "ModelingV2MiniMaxM31FlashNvfp4Sm107Tp2ctx",
     "minimax_m3_nvfp4__sm_107__tp2": "ModelingV2MiniMaxM3Nvfp4Sm107Tp2",
@@ -92,8 +93,10 @@ def test_tp8_lands_on_its_own_target(monkeypatch):
     assert _route(monkeypatch, mapping_kwargs).__name__ == "ModelingV2MiniMaxM31FlashNvfp4Sm107Tp8"
 
 
-def test_sm_103_has_no_m31_target(monkeypatch):
-    with pytest.raises(NoTarget, match="MiniMax-M3.1-Flash: not sm107"):
+def test_sm_103_has_no_m31_tp2_target(monkeypatch):
+    with pytest.raises(
+        NoTarget, match=r"MiniMax-M3.1-Flash: .*tp2 on sm103 \(GB300\), where only tp4 and tp8 run"
+    ):
         _route(monkeypatch, _DECODE, capability=(10, 3))
 
 
@@ -106,14 +109,18 @@ def test_a_bf16_kv_cache_has_no_m31_target(monkeypatch):
     "mapping_kwargs",
     [
         dict(world_size=4, tp_size=2, pp_size=2, moe_tp_size=2, moe_ep_size=1),
-        dict(world_size=4, tp_size=4, moe_tp_size=4, moe_ep_size=1),
         dict(world_size=4, tp_size=4, moe_tp_size=2, moe_ep_size=2),
     ],
-    ids=["tp2_pp2", "tp4", "tp4_moetp2_ep2"],
+    ids=["tp2_pp2", "tp4_moetp2_ep2"],
 )
 def test_other_layouts_never_land_on_the_tp2_target(monkeypatch, mapping_kwargs):
     with pytest.raises(NoTarget, match="a parallel layout no target runs"):
         _route(monkeypatch, mapping_kwargs)
+
+
+def test_tp4_lands_on_the_tp4_target_not_the_tp2_target(monkeypatch):
+    target = _route(monkeypatch, dict(world_size=4, tp_size=4, moe_tp_size=4, moe_ep_size=1))
+    assert target.__name__ == "ModelingV2MiniMaxM31FlashNvfp4Sm107Tp4"
 
 
 def test_the_minimax_m3_checkpoint_never_lands_on_the_m31_tp2_target(monkeypatch):

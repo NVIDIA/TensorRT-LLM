@@ -369,7 +369,9 @@ class _Deferred(*((_ENGINE_DEFERRED,) if _ENGINE_DEFERRED is not None else ())):
     calls = []
 
     def __init__(self, plane, scores):
-        self.plane, self.scores = plane, scores
+        # The deferred reduce may be a frozen dataclass.
+        object.__setattr__(self, "plane", plane)
+        object.__setattr__(self, "scores", scores)
 
     def add_into(self, shared):
         type(self).calls.append(shared)
