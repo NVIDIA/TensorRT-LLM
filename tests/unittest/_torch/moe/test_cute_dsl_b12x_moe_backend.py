@@ -16,6 +16,7 @@
 
 import dataclasses
 import inspect
+import math
 import sys
 import types
 from typing import NoReturn, Optional
@@ -305,18 +306,27 @@ def test_w4a16_applies_the_awq_pre_quant_scale(has_pre_quant_scale):
         assert out is x
 
 
-def test_w4a16_nvfp4_post_load_uses_modelopt_scale_contract(monkeypatch):
-    class _RoutingMethod:
-        experts_per_token = 4
+@pytest.fixture
+def fake_b12x_flashinfer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[dict[str, object]]:
+    """Capture ``B12xMoEWrapper`` kwargs without building the real wrapper."""
+    calls: list[dict[str, object]] = []
 
     class _FakeB12xWrapper:
-        calls = []
-
-        def __init__(self, **kwargs):
+        def __init__(self, **kwargs: object) -> None:
+            """Record the configuration the production code passes in."""
             self._moe_output = None
-            self.calls.append(kwargs)
+            calls.append(kwargs)
 
-    def _convert_sf_to_mma_layout(scales, *, m, k, num_groups):
+    def _convert_sf_to_mma_layout(
+        scales: torch.Tensor,
+        *,
+        m: int,
+        k: int,
+        num_groups: int,
+    ) -> torch.Tensor:
+        """Return ``scales`` unchanged; the real swizzle needs a GPU."""
         return scales
 
     flashinfer = types.ModuleType("flashinfer")
@@ -327,19 +337,32 @@ def test_w4a16_nvfp4_post_load_uses_modelopt_scale_contract(monkeypatch):
     monkeypatch.setitem(sys.modules, "flashinfer", flashinfer)
     monkeypatch.setitem(sys.modules, "flashinfer.cute_dsl", cute_dsl)
     monkeypatch.setitem(sys.modules, "flashinfer.cute_dsl.utils", utils)
+    return calls
 
-    num_experts = 2
-    hidden_size = 128
-    logical_intermediate_size = 1856
-    padded_intermediate_size = 1920
+
+def _b12x_module(
+    *,
+    quant_algo: QuantAlgo,
+    num_experts: int,
+    hidden_size: int,
+    logical_intermediate_size: int,
+    padded_intermediate_size: int,
+    w3_w1_weight_scale: torch.Tensor,
+    w2_weight_scale: torch.Tensor,
+    fc31_alpha: torch.Tensor,
+    fc2_alpha: torch.Tensor,
+    fc31_input_scale: torch.Tensor,
+    fc2_input_scale: torch.Tensor,
+) -> torch.nn.Module:
+    """Build the module attributes ``transform_weights`` reads."""
     module = torch.nn.Module()
     module.num_experts = num_experts
     module.hidden_size = hidden_size
     module.intermediate_size_per_partition = logical_intermediate_size
     module.moe_max_num_tokens = 8
-    module.routing_method = _RoutingMethod()
+    module.routing_method = types.SimpleNamespace(experts_per_token=4)
     module.activation_type = ActivationType.Swiglu
-    module.quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_NVFP4)
+    module.quant_config = QuantConfig(quant_algo=quant_algo)
     module.w3_w1_weight = torch.empty(
         num_experts,
         2 * padded_intermediate_size,
@@ -352,49 +375,186 @@ def test_w4a16_nvfp4_post_load_uses_modelopt_scale_contract(monkeypatch):
         padded_intermediate_size // 16,
         dtype=torch.int64,
     )
-    w3_w1_weight_scale = torch.ones(
-        num_experts,
-        2 * padded_intermediate_size,
-        hidden_size // 16,
-        dtype=torch.float8_e4m3fn,
+    module.w3_w1_weight_scale = w3_w1_weight_scale
+    module.w2_weight_scale = w2_weight_scale
+    module.fc31_alpha = fc31_alpha
+    module.fc2_alpha = fc2_alpha
+    module.fc31_input_scale = fc31_input_scale
+    module.fc2_input_scale = fc2_input_scale
+    return module
+
+
+def test_w4a16_nvfp4_post_load_uses_modelopt_scale_contract(
+    fake_b12x_flashinfer: list[dict[str, object]],
+) -> None:
+    """W4A16 keeps the ModelOpt alpha contract and no FC1 input grid."""
+    num_experts = 2
+    hidden_size = 128
+    logical_intermediate_size = 1856
+    padded_intermediate_size = 1920
+    module = _b12x_module(
+        quant_algo=QuantAlgo.W4A16_NVFP4,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        logical_intermediate_size=logical_intermediate_size,
+        padded_intermediate_size=padded_intermediate_size,
+        w3_w1_weight_scale=torch.ones(
+            num_experts,
+            2 * padded_intermediate_size,
+            hidden_size // 16,
+            dtype=torch.float8_e4m3fn,
+        ),
+        w2_weight_scale=torch.ones(
+            num_experts,
+            hidden_size,
+            padded_intermediate_size // 16,
+            dtype=torch.float8_e4m3fn,
+        ),
+        fc31_alpha=torch.tensor([0.25, 0.5], dtype=torch.float32),
+        fc2_alpha=torch.tensor([0.125, 0.25], dtype=torch.float32),
+        fc31_input_scale=torch.tensor(2.0, dtype=torch.float32),
+        fc2_input_scale=torch.tensor(4.0, dtype=torch.float32),
     )
-    w2_weight_scale = torch.ones(
-        num_experts,
-        hidden_size,
-        padded_intermediate_size // 16,
-        dtype=torch.float8_e4m3fn,
-    )
-    module.w3_w1_weight_scale = w3_w1_weight_scale.clone()
-    module.w2_weight_scale = w2_weight_scale.clone()
-    module.fc31_alpha = torch.tensor([0.25, 0.5], dtype=torch.float32)
-    module.fc2_alpha = torch.tensor([0.125, 0.25], dtype=torch.float32)
-    module.fc31_input_scale = torch.tensor(2.0, dtype=torch.float32)
-    module.fc2_input_scale = torch.tensor(4.0, dtype=torch.float32)
 
     with patch.object(NVFP4CutlassFusedMoEMethod, "transform_weights", return_value=None):
         NVFP4CuteDslB12xFusedMoEMethod().transform_weights(module)
 
-    assert _FakeB12xWrapper.calls
-    wrapper_kwargs = _FakeB12xWrapper.calls[0]
+    assert fake_b12x_flashinfer
+    wrapper_kwargs = fake_b12x_flashinfer[0]
     assert wrapper_kwargs.get("quant_mode") == "w4a16", wrapper_kwargs
     assert wrapper_kwargs["intermediate_size"] == padded_intermediate_size
-    assert module._b12x_weights["fc2_input_scale"] is None
+    weights = module._b12x_weights
+    assert weights is not None
+    assert weights["fc2_input_scale"] is None
+    assert weights["input_global_scale"] is None
     assert torch.equal(
-        module._b12x_weights["w1_weight_sf"].float(),
-        w3_w1_weight_scale.float(),
+        weights["w1_weight_sf"].float(),
+        module.w3_w1_weight_scale.float(),
     )
     assert torch.equal(
-        module._b12x_weights["w2_weight_sf"].float(),
-        w2_weight_scale.float(),
+        weights["w2_weight_sf"].float(),
+        module.w2_weight_scale.float(),
     )
-    assert torch.allclose(
-        module._b12x_weights["w1_alpha"],
+    torch.testing.assert_close(
+        weights["w1_alpha"],
         torch.tensor([0.5, 1.0], dtype=torch.float32),
+        rtol=1e-6,
+        atol=0,
     )
-    assert torch.allclose(
-        module._b12x_weights["w2_alpha"],
+    torch.testing.assert_close(
+        weights["w2_alpha"],
         torch.tensor([0.5, 1.0], dtype=torch.float32),
+        rtol=1e-6,
+        atol=0,
     )
+
+
+def _e4m3_block_scales(
+    shape: tuple[int, ...],
+    generator: torch.Generator,
+) -> torch.Tensor:
+    """Log-normal E4M3 block scales around the issue layer's median (180)."""
+    return (
+        (torch.randn(shape, generator=generator) * 0.55 + math.log(180.0))
+        .exp()
+        .clamp(2**-6, 448.0)
+        .to(torch.float8_e4m3fn)
+    )
+
+
+def test_nvfp4_post_load_uses_checkpoint_scale_contract(
+    fake_b12x_flashinfer: list[dict[str, object]],
+) -> None:
+    """FC1's grid stays separate from the E4M3 block scales.
+
+    The b12x kernel dequantizes a weight block as
+    ``fp4_code * stored_sf * alpha / input_global_scale``. Keeping the
+    checkpoint's normalized block scales and passing the FC1 grid as
+    ``input_global_scale`` makes ``stored_sf * w1_alpha`` reproduce
+    ``sf * weight_scale_2`` up to fp32 rounding.
+    """
+    num_experts = 2
+    hidden_size = 128
+    padded_intermediate_size = 1920
+    fc1_input_global_scale = torch.tensor(0.0020461310632526875, dtype=torch.float32)
+    fc2_input_global_scale = torch.tensor(0.0340401791036129, dtype=torch.float32)
+    fc31_input_scale = 1.0 / fc1_input_global_scale
+    fc2_input_scale = 1.0 / fc2_input_global_scale
+    w1_weight_scale_2 = torch.tensor([2e-5, 1.8e-5], dtype=torch.float32)
+    w2_weight_scale_2 = torch.tensor([2e-5, 1.9e-5], dtype=torch.float32)
+
+    generator = torch.Generator().manual_seed(0)
+    w1_sf = _e4m3_block_scales(
+        (num_experts, 2 * padded_intermediate_size, hidden_size // 16),
+        generator,
+    )
+    w2_sf = _e4m3_block_scales(
+        (num_experts, hidden_size, padded_intermediate_size // 16),
+        generator,
+    )
+
+    module = _b12x_module(
+        quant_algo=QuantAlgo.NVFP4,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        logical_intermediate_size=padded_intermediate_size,
+        padded_intermediate_size=padded_intermediate_size,
+        w3_w1_weight_scale=w1_sf.clone(),
+        w2_weight_scale=w2_sf.clone(),
+        fc31_alpha=w1_weight_scale_2 * fc1_input_global_scale,
+        fc2_alpha=w2_weight_scale_2 * fc2_input_global_scale,
+        fc31_input_scale=fc31_input_scale,
+        fc2_input_scale=fc2_input_scale,
+    )
+    # The checkpoint has two local experts out of four global experts.
+    module.num_experts = 4
+
+    with patch.object(NVFP4CutlassFusedMoEMethod, "transform_weights", return_value=None):
+        NVFP4CuteDslB12xFusedMoEMethod().transform_weights(module)
+
+    assert fake_b12x_flashinfer
+    wrapper_kwargs = fake_b12x_flashinfer[0]
+    assert wrapper_kwargs.get("quant_mode") == "nvfp4", wrapper_kwargs
+    assert wrapper_kwargs["num_experts"] == 4
+    assert wrapper_kwargs["intermediate_size"] == padded_intermediate_size
+    weights = module._b12x_weights
+    assert weights is not None
+    assert torch.equal(weights["w1_weight_sf"].float(), w1_sf.float())
+    assert torch.equal(weights["w2_weight_sf"].float(), w2_sf.float())
+    torch.testing.assert_close(
+        weights["input_global_scale"],
+        (1.0 / module.fc31_input_scale).expand(num_experts),
+        rtol=1e-6,
+        atol=0,
+    )
+    assert weights["input_global_scale"].shape == (num_experts,)
+    assert weights["input_global_scale"].dtype == torch.float32
+    assert weights["input_global_scale"].is_contiguous()
+    torch.testing.assert_close(
+        weights["fc2_input_scale"],
+        1.0 / module.fc2_input_scale,
+        rtol=1e-6,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        weights["w1_alpha"],
+        w1_weight_scale_2,
+        rtol=1e-6,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        weights["w2_alpha"],
+        w2_weight_scale_2 * (1.0 / module.fc2_input_scale),
+        rtol=1e-6,
+        atol=0,
+    )
+
+    assert weights["w1_weight_sf"].float().min() >= 2**-6
+    assert weights["w1_weight_sf"].float().max() <= 448.0
+    # Folding weight_scale_2 into the block scales would put every one below
+    # the E4M3 normal range.
+    folded = w1_sf.float() * w1_weight_scale_2.view(-1, 1, 1)
+    assert folded.max() < 2**-6
 
 
 def test_dispatch_rejects_non_tensor():
