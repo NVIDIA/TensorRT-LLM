@@ -85,6 +85,7 @@ class _FakeExecutor(PyExecutor):
         self._disagg_coordinator.reap_context_sends = lambda at_least=0: None
 
 
+@pytest.mark.cpu_only
 class TestSendKvAsyncReleasesIndexSlot:
     """Test that `_send_kv_async` releases the IndexMapper slot before the
     transfer is started, which is where the production code actually lives
@@ -142,6 +143,7 @@ class TestSendKvAsyncReleasesIndexSlot:
         kv_cache_manager.release_index_slot.assert_called_once_with(42)
 
 
+# Not cpu_only: the IndexMapper fixtures pin host buffers, which needs a CUDA device.
 class TestIndexMapperSlotReuse:
     """Test IndexMapper slot recycling after early release."""
 
@@ -305,6 +307,7 @@ class TestIndexMapperSlotReuse:
         assert manager._early_freed_index_requests == {1}
 
 
+# Not cpu_only: same pinned-host-buffer fixtures as above.
 class TestFreeResourcesDoubleReleaseSafety:
     """Test that free_resources handles already-released IndexMapper slots."""
 
@@ -341,6 +344,7 @@ class TestFreeResourcesDoubleReleaseSafety:
         assert not _has_sequence(index_mapper, 1)
 
 
+@pytest.mark.cpu_only
 class TestAuxBufferHigherCapacity:
     """Test that increased AuxBuffer capacity works correctly."""
 

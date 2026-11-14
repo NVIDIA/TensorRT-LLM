@@ -39,6 +39,8 @@ from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _make_manager(*, sanity_check_enabled: bool = False) -> tuple[FakeAttention, FmhaManager]:
     attn = FakeAttention()

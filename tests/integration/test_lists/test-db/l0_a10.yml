@@ -41,15 +41,12 @@ l0_a10:
   - unittest/_torch/sampler/test_token_ban.py
   - unittest/_torch/sampler/test_in_graph_sampling.py
   - unittest/_torch/disaggregation/test_disagg_index_mapper_early_release.py
-  - unittest/_torch/pyexecutor/kv_cache/test_kv_cache_compression_manager.py
-  - unittest/_torch/pyexecutor/kv_cache/test_kv_cache_v2_capacity_only.py
   - unittest/_torch/pyexecutor/kv_cache/sharing
   - unittest/_torch/pyexecutor/kv_cache/test_kv_cache_v2_branch_snapshot.py
   - unittest/_torch/pyexecutor/kv_cache/test_helix_agg_preemption.py
   - unittest/_torch/pyexecutor/kv_cache/test_kv_cache_v2_adp_dummy_draft_rollback.py
   - unittest/_torch/pyexecutor/connectors/test_kv_cache_layout.py
   - unittest/_torch/pyexecutor/kv_cache/test_kv_connector_v2_prefix_real_manager.py
-  - unittest/_torch/pyexecutor/test_error_classification.py
   - unittest/_torch/pyexecutor/test_resource_manager.py
   - unittest/_torch/pyexecutor/test_profile_endpoints.py
   # NOTE: this is a CPU-only test, but we do not have a dedicated job for this (and therefore no

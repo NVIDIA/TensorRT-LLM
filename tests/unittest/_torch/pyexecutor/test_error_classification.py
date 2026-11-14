@@ -19,6 +19,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.cpu_only
+
 _MODULE_PATH = (
     Path(__file__).resolve().parents[4] / "tensorrt_llm/_torch/pyexecutor/error_classification.py"
 )
