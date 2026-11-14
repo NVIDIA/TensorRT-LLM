@@ -674,6 +674,11 @@ class MiniMaxM3Gate(nn.Module):
                 w["e_score_correction_bias"][:].to(self.e_score_correction_bias.dtype)
             )
 
+    def initialize_dummy_state(self, low: float, high: float, seed: int) -> None:
+        """Split the dummy ``weight`` as ``load_weights`` splits a checkpoint's."""
+        del low, high, seed  # The dummy weight is already in place.
+        self.split_weight = split_router_weight_bf16(self.weight)
+
     @property
     def routing_method(self) -> MiniMaxM3MoeRoutingMethod:
         # Pass a callable so routing always sees the latest parameter

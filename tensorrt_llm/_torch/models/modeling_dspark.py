@@ -2944,6 +2944,21 @@ class _DSparkHeadMixin:
                 "always proposes the full K tokens)."
             )
 
+    def initialize_dummy_state(self, low: float, high: float, seed: int) -> None:
+        """Build the Markov head ``load_weights`` takes from the checkpoint, on dummy values,
+        then the DFlash modules (``DFlashForCausalLM.initialize_dummy_state``)."""
+        if self._dspark_markov_rank > 0 and self.markov_w1 is None:
+            generator = torch.Generator(device="cuda")
+            generator.manual_seed(seed)
+            shape = (self.config.vocab_size, self._dspark_markov_rank)
+            self.markov_w1, self.markov_w2 = (
+                torch.empty(shape, dtype=self.config.torch_dtype, device="cuda").uniform_(
+                    low, high, generator=generator
+                )
+                for _ in range(2)
+            )
+        super().initialize_dummy_state(low, high, seed)
+
     @property
     def has_markov_head(self) -> bool:
         return self._dspark_markov_rank > 0 and self.markov_w1 is not None

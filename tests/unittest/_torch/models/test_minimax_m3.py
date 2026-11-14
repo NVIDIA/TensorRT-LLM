@@ -2849,6 +2849,20 @@ def test_minimax_m3_fused_routing_cuda_graph_replay_tracks_inputs() -> None:
     torch.testing.assert_close(graph_weights, reference_weights, rtol=0, atol=0)
 
 
+@pytest.mark.cpu_only
+def test_minimax_m3_gate_dummy_state_splits_the_weight_as_a_load_does() -> None:
+    """Dummy weights give the router the BF16 split weight a checkpoint load gives it."""
+    loaded, dummy = (
+        modeling_minimaxm3.MiniMaxM3Gate(64, 8, top_k=2, routed_scaling_factor=1.0)
+        for _ in range(2)
+    )
+    weight = torch.randn(8, 64) * 0.02
+    loaded.load_weights([{"weight": weight}])
+    dummy.weight.data.copy_(weight)
+    dummy.initialize_dummy_state(low=-1e-3, high=1e-3, seed=0)
+    assert torch.equal(dummy.split_weight, loaded.split_weight)
+
+
 @pytest.mark.gpu
 @pytest.mark.skipif(not _has_cuda(), reason="MiniMax-M3 router gate needs CUDA")
 @pytest.mark.parametrize("num_tokens", [1, 64, 2048])

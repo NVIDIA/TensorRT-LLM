@@ -1181,18 +1181,8 @@ class DFlashForCausalLM(nn.Module):
 
         # Load DFlash-specific weights directly
         self._load_target_projection(remapped)
-
         if "hidden_norm.weight" in remapped:
-            rms_norm_eps = getattr(self.config, "rms_norm_eps", 1e-6)
-            self.hidden_norm = nn.RMSNorm(
-                remapped["hidden_norm.weight"].shape[0],
-                eps=rms_norm_eps,
-                device="cuda",
-                elementwise_affine=True,
-                dtype=remapped["hidden_norm.weight"].dtype,
-            )
-            self.hidden_norm.weight.data.copy_(remapped["hidden_norm.weight"])
-            del remapped["hidden_norm.weight"]
+            self._load_hidden_norm(remapped.pop("hidden_norm.weight"))
 
         # allow_partial_loading is what lets the shared modules below be absent.
         # It is also why a truncated checkpoint loads clean, so gate it on the
@@ -1226,6 +1216,52 @@ class DFlashForCausalLM(nn.Module):
             weight.shape[1], weight.shape[0], bias=False, device="cuda", dtype=weight.dtype
         )
         self.fc.weight.data.copy_(weight)
+
+    def _load_hidden_norm(self, weight: torch.Tensor) -> None:
+        self.hidden_norm = nn.RMSNorm(
+            weight.shape[0],
+            eps=getattr(self.config, "rms_norm_eps", 1e-6),
+            device="cuda",
+            elementwise_affine=True,
+            dtype=weight.dtype,
+        )
+        self.hidden_norm.weight.data.copy_(weight)
+
+    def initialize_dummy_state(self, low: float, high: float, seed: int) -> None:
+        """Build the modules ``load_weights`` builds from the checkpoint, on dummy values.
+
+        ``fc`` and ``hidden_norm`` take the shapes the draft config gives the checkpoint's:
+        ``fc`` projects the captured target layers' hidden states, concatenated, to the
+        drafter's hidden size.
+        """
+        generator = torch.Generator(device="cuda")
+        generator.manual_seed(seed)
+
+        def dummy(*shape: int) -> torch.Tensor:
+            tensor = torch.empty(shape, dtype=self.config.torch_dtype, device="cuda")
+            return tensor.uniform_(low, high, generator=generator)
+
+        hidden_size = self.config.hidden_size
+        if "fc" not in self._modules:
+            self._load_target_projection(
+                {"fc.weight": dummy(hidden_size, self._target_projection_width())}
+            )
+        if "hidden_norm" not in self._modules:
+            self._load_hidden_norm(dummy(hidden_size))
+
+    def _target_projection_width(self) -> int:
+        """``fc``'s input width as the draft config gives it: one target hidden state per
+        captured layer."""
+        layer_ids = self.target_layer_ids or getattr(self.config, "target_layer_ids", None)
+        num_layers = len(layer_ids) if layer_ids else getattr(self.config, "num_target_layers", 0)
+        target_hidden_size = getattr(self.config, "target_hidden_size", None)
+        if not num_layers or not target_hidden_size:
+            raise ValueError(
+                f"{type(self).__name__}: the draft config does not give the captured target "
+                "layers (target_layer_ids or num_target_layers) and target_hidden_size, so "
+                "the dummy fc cannot take the checkpoint's shape."
+            )
+        return num_layers * target_hidden_size
 
     def _load_dflash2_weights(self, weights: Dict, *, load_selector: bool = True) -> Dict:
         """Build the DFlash 2 convolutions and candidate selector.
