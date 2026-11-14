@@ -565,6 +565,8 @@ class TestExtensions:
         ("kwargs", "template", "expected"),
         [
             ({"reasoning_effort": "LOW"}, "{{ thinking_effort }}", "low"),
+            ({"reasoning_effort": "minimal"}, "{{ thinking_effort }}", "low"),
+            ({"reasoning_effort": "xhigh"}, "{{ thinking_effort }}", "max"),
             ({"reasoning_effort": "none"}, "{{ thinking }}", "False"),
             ({"enable_thinking": False}, "{{ thinking }}", "False"),
             (
