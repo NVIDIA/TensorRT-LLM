@@ -53,6 +53,10 @@ from tensorrt_llm.commands._config_overrides import (ConfigOverride,
                                                      parse_config_overrides)
 from tensorrt_llm.commands._serve_stability import stability_option
 from tensorrt_llm.commands.mooncake import mooncake_master, mooncake_pool_report
+from tensorrt_llm.commands.serve_cli._net import (_bind_listener,
+                                                  _diagnose_port_in_use,
+                                                  _listener_address_family,
+                                                  _publish_bound_address)
 from tensorrt_llm.commands.utils import (collect_explicit_cli_keys,
                                          get_is_diffusion_only_model)
 from tensorrt_llm.executor.utils import MAX_NUM_FRONTENDS, LlmLauncherEnvs
@@ -412,121 +416,6 @@ def _build_llm_args_from_disagg_server_cfg(other_args: Dict) -> Dict:
     return update_llm_args_with_extra_dict(llm_args, llm_args_extra_dict)
 
 
-def _publish_bound_address(report_addr: Optional[str], host: str,
-                           port: int) -> None:
-    """Write the address this server actually bound to ``report_addr``.
-
-    Lets a launcher pass ``--port 0`` and learn the kernel-assigned port
-    afterwards, instead of picking a port up front and racing whoever grabs it
-    before this process binds. The write is atomic (temp file in the same
-    directory, then rename) so a reader never observes a partial line, which
-    matters on the shared filesystems multi-node tests coordinate through.
-
-    The caller is responsible for making the path unique per run: a stale file
-    from an earlier run points at a dead server, which fails far less obviously
-    than a port conflict.
-
-    A wildcard bind host is replaced by this machine's hostname, since readers
-    use the published value as a URL authority and cannot dial 0.0.0.0 or ::.
-    """
-    if not report_addr:
-        return
-    if host in ("0.0.0.0", "::", ""):  # nosec B104 - reporting, not binding
-        resolved = socket.gethostname()
-        logger.info(f"Reporting hostname {resolved} instead of wildcard bind "
-                    f"address {host!r}, which a reader cannot dial")
-        host = resolved
-    report_addr = os.path.abspath(report_addr)
-    parent = os.path.dirname(report_addr)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(dir=parent or None,
-                                    prefix=os.path.basename(report_addr) + ".",
-                                    suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w") as f:
-            # Bracket IPv6 literals so the value is a usable URL authority:
-            # readers build "http://<reported>/..." from it verbatim.
-            reported_host = f"[{host}]" if ":" in host else host
-            f.write(f"{reported_host}:{port}\n")
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, report_addr)
-    finally:
-        # A successful replace already consumed tmp_path; this only cleans up
-        # after a failed write so a partial file is not left behind.
-        with contextlib.suppress(OSError):
-            os.unlink(tmp_path)
-    logger.info(f"Reported bound address {host}:{port} to {report_addr}")
-
-
-def _diagnose_port_in_use(port: int) -> str:
-    """Describe which process currently holds the given port, best effort."""
-    try:
-        import psutil
-    except ImportError:
-        return "psutil unavailable; cannot identify the process holding the port"
-
-    details = []
-    try:
-        for conn in psutil.net_connections(kind="inet"):
-            if conn.laddr and conn.laddr.port == port:
-                holder = ""
-                if conn.pid is not None:
-                    try:
-                        proc = psutil.Process(conn.pid)
-                        holder = (f" pid={conn.pid} name={proc.name()} "
-                                  f"cmdline={' '.join(proc.cmdline())}")
-                    except (psutil.NoSuchProcess, psutil.AccessDenied):
-                        holder = f" pid={conn.pid}"
-                details.append(
-                    f"{conn.laddr.ip}:{conn.laddr.port} status={conn.status}{holder}"
-                )
-    except (psutil.Error, OSError) as e:
-        return f"failed to inspect port holders: {e}"
-
-    if not details:
-        return ("no listening socket found for this port; it may have already "
-                "been released, indicating a transient race")
-    return "; ".join(details)
-
-
-def _bind_failure(kind: str, host: str, port: int,
-                  error: OSError) -> RuntimeError:
-    """Log a failed listener bind and return the exception to raise.
-
-    An address lookup failure (``socket.gaierror``) is an ``OSError`` too, but
-    no port was ever tried, so it is reported as such instead of being
-    diagnosed as a port conflict. It covers both a name that does not resolve
-    and an address of a family the socket cannot use, such as an IPv6 literal
-    on an IPv4-only listener.
-    """
-    if isinstance(error, socket.gaierror):
-        reason = f"address lookup failed for host {host!r}: {error}"
-        logger.error(f"Failed to bind {kind} socket to {host}:{port} "
-                     f"(pid={os.getpid()}): {reason}")
-        return RuntimeError(f"Failed to bind socket to {host}:{port}: {reason}")
-    holder = _diagnose_port_in_use(port)
-    logger.error(
-        f"Failed to bind {kind} socket to {host}:{port} (pid={os.getpid()}): "
-        f"{error}. Current port holder(s): {holder}")
-    return RuntimeError(f"Failed to bind socket to {host}:{port}: {error}. "
-                        f"Port holder(s): {holder}")
-
-
-def _listener_address_family(kind: str, host: str,
-                             port: int) -> socket.AddressFamily:
-    """The family to bind ``host`` with: IPv6 only if it resolves to nothing else."""
-    try:
-        addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC,
-                                       socket.SOCK_STREAM)
-    except socket.gaierror as e:
-        raise _bind_failure(kind, host, port, e) from e
-    if all(info[0] == socket.AF_INET6 for info in addr_info):
-        return socket.AF_INET6
-    return socket.AF_INET
-
-
 def _reserve_multi_frontend_port(host: str, port: int,
                                  family: socket.AddressFamily) -> socket.socket:
     """Refuse a port another server uses; return a lock to hold while serving.
@@ -853,30 +742,23 @@ def launch_server(
         os.environ["TRTLLM_RESPONSES_API_DISABLE_STORE"] = "1"
 
     address_family = _listener_address_family("server", host, port)
+    # port == 0 lets the kernel pick the port; the caller then needs a way
+    # to learn it, either by service discovery or by report_addr.
+    assert port > 0 or disagg_cluster_config is not None or report_addr, (
+        "Port must be specified unless disagg cluster config or "
+        "--report_addr is provided")
     port_lock = (_reserve_multi_frontend_port(host, port, address_family)
                  if multi_frontend.is_launcher else contextlib.nullcontext())
-    with port_lock, socket.socket(address_family, socket.SOCK_STREAM) as s:
-        # port == 0 lets the kernel pick the port; the caller then needs a way
-        # to learn it, either by service discovery or by report_addr.
-        assert port > 0 or disagg_cluster_config is not None or report_addr, (
-            "Port must be specified unless disagg cluster config or "
-            "--report_addr is provided")
-        # Without SO_REUSEADDR a restart is refused for the whole TIME_WAIT
-        # window (~60s) by the tombstones of connections this server accepted.
-        # The flag has to be set on the socket that owns the port first, since
-        # the TIME_WAIT entry inherits it -- setting it only on the later bind
-        # is not enough.
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        if multi_frontend.is_launcher or multi_frontend.is_attached_frontend:
-            # Every frontend process binds its own listening socket on the
-            # same port; the kernel load-balances accepts across them.
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-        try:
-            s.bind((host, port))
-            if port == 0:
-                port = s.getsockname()[1]
-        except OSError as e:
-            raise _bind_failure("server", host, port, e) from e
+    # Every frontend process binds its own listening socket on the same port;
+    # the kernel load-balances accepts across them.
+    reuse_port = multi_frontend.is_launcher or multi_frontend.is_attached_frontend
+    with port_lock, _bind_listener("server",
+                                   host,
+                                   port,
+                                   family=address_family,
+                                   reuse_port=reuse_port) as s:
+        if port == 0:
+            port = s.getsockname()[1]
 
         # Only now is the address final, and the socket stays bound from here
         # until uvicorn takes it over, so no one can steal the port in between.
@@ -1194,15 +1076,8 @@ def launch_visual_gen_server(
     # the bind until uvicorn started, anything else on the host could grab the
     # port in that window and trtllm-serve would die at bind() time.
     address_family = _listener_address_family("VisualGen server", host, port)
-    with socket.socket(address_family, socket.SOCK_STREAM) as s:
-        # See launch_server: without this, TIME_WAIT tombstones from the
-        # connections this server accepted refuse a restart for ~60s.
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            s.bind((host, port))
-        except OSError as e:
-            raise _bind_failure("VisualGen server", host, port, e) from e
-
+    with _bind_listener("VisualGen server", host, port,
+                        family=address_family) as s:
         logger.info(f"Initializing VisualGen ({model})")
 
         previous_sigterm_handler = signal.signal(signal.SIGTERM,
@@ -2499,17 +2374,16 @@ def disaggregated(
     # (c) num_workers==1, no external coordinator: a single disagg server with an
     # in-process (local) coordinator. Pre-bind the socket (validates port), serve.
     os.environ[DisaggLauncherEnvs.TLLM_DISAGG_ROLE] = "server_coordinator"
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        # See launch_server: without this, TIME_WAIT tombstones from the
-        # connections this server accepted refuse a restart for ~60s.
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            s.bind((disagg_cfg.hostname, disagg_cfg.port))
-            if disagg_cfg.port == 0:
-                disagg_cfg.port = s.getsockname()[1]
-        except OSError as e:
-            raise _bind_failure("disaggregated server", disagg_cfg.hostname,
-                                disagg_cfg.port, e) from e
+    address_family = _listener_address_family("disaggregated server",
+                                              disagg_cfg.hostname,
+                                              disagg_cfg.port,
+                                              policy="ipv4")
+    with _bind_listener("disaggregated server",
+                        disagg_cfg.hostname,
+                        disagg_cfg.port,
+                        family=address_family) as s:
+        if disagg_cfg.port == 0:
+            disagg_cfg.port = s.getsockname()[1]
 
         _publish_bound_address(report_addr, disagg_cfg.hostname,
                                disagg_cfg.port)
@@ -2724,14 +2598,14 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
         # the kernel always rejects with "invalid argument", because the scope id can
         # only be derived from an interface name. Binding AF_INET here also surfaces a
         # port conflict with the same diagnostics as the other two listeners.
-        coord_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        coord_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            coord_socket.bind((public_host, coord_port))
-        except OSError as e:
-            coord_socket.close()
-            raise _bind_failure("coordinator", public_host, coord_port,
-                                e) from e
+        coord_socket = _bind_listener("coordinator",
+                                      public_host,
+                                      coord_port,
+                                      family=_listener_address_family(
+                                          "coordinator",
+                                          public_host,
+                                          coord_port,
+                                          policy="ipv4"))
 
         # 1. Launch the delegating fleet pointed at the implicit coordinator we start
         #    below (port-1 for TCP; UDS for the hot path). Workers hold
@@ -2900,7 +2774,9 @@ def _run_fleet_worker_impl():
     server = _build_disagg_server_from_env()
     host, port = server._config.hostname, server._config.port
 
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s = socket.socket(
+        _listener_address_family("fleet worker", host, port, policy="ipv4"),
+        socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     # SO_REUSEPORT: every worker binds the same (host, port); the kernel spreads
     # connections across the workers' accept queues by 4-tuple hash.

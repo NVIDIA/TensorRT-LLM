@@ -418,6 +418,8 @@ l0_cpu:
   - unittest/llmapi/test_serve_multi_frontend_route_gate.py
   - unittest/llmapi/test_serve_tokenization_owners.py
   - unittest/llmapi/test_serve_num_frontends_default.py
+  - unittest/llmapi/test_serve_cli_net.py
+  - unittest/llmapi/test_serve_cli_wiring.py
   - unittest/llmapi/test_serve_report_addr.py
   - unittest/llmapi/test_serve_sleep_mode.py
   - unittest/llmapi/test_session_prefetcher.py
