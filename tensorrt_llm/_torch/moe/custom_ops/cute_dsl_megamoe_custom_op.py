@@ -150,7 +150,8 @@ _MEGAMOE_GRAPH_CAPTURE_SEEN: bool = False
 #   (mma_tiler_mnk,       # list[int] of length 3 (M decides use_2cta)
 #    cluster_shape_mnk,   # preferred list[int] of length 3
 #    fallback_cluster,    # optional fallback list[int] of length 3
-#    schedule_policy,     # ("grouped" | "phase_interleave", optional hint)
+#    schedule_policy,     # ("grouped" | "phase_interleave", optional hint) or, for the
+#                         # SM107 generation-phase kernel only, ("decode", optional FC1 lead >= 0)
 #    work_id_mode,        # "grid_stride" | "atomic_counter"
 #    token_back_mode,     # "epi_warps" | "standalone_warps" | "reuse_dispatch_warps"
 #    use_bulk_fc2_store,  # bool (epi -> peer UBLK; non-epi -> local TMA)
@@ -928,8 +929,31 @@ def _launch_cluster_configuration(
     )
 
 
+def _megamoe_ugpu_is_genphase(max_tokens_per_rank: int) -> bool:
+    """Localized launches use the same kernel family as the baseline bucket rule."""
+    bucket = _sm107_tactic_bucket(max_tokens_per_rank)
+    return bucket is not None and bucket not in _SM107_GENERIC_KERNEL_BUCKETS
+
+
+def _megamoe_ugpu_tactic() -> tuple:
+    """Genphase buckets of localized weights use a geometry both consumers support, without
+    the tuning cache; generic (prefill) buckets keep the default tactic."""
+    return (
+        [256, 128, 256],
+        [4, 1, 1],
+        None,
+        ("decode", None),
+        "atomic_counter",
+        "epi_warps",
+        True,
+        1,
+        1,
+        (1, 1),
+    )
+
+
 def _construct_megamoe_kernel(
-    *, sm_version: int, common: dict, combine_format: str
+    *, sm_version: int, common: dict, combine_format: str, ugpu_weight_layout: str = "none"
 ) -> Tuple[Any, Optional[Exception]]:
     """Construct the active architecture kernel and report a narrow gen rejection."""
     from cutlass.cute.nvgpu import OperandMajorMode
@@ -997,6 +1021,18 @@ def _construct_megamoe_kernel(
         )
     if common["fc2_tma_stages"] is not None:
         impl_values["fc2_tma_stages"] = int(common["fc2_tma_stages"])
+    ugpu_kernel_cls = None
+    if ugpu_weight_layout != "none":
+        if _megamoe_ugpu_is_genphase(common["max_tokens_per_rank"]):
+            impl_values["die_aware"] = "on" if ugpu_weight_layout == "n_split" else "expert_half"
+            ugpu_kernel_cls = RubinInferenceGenphaseMegaMoE
+        else:
+            # expert_half preserves standard indexing; n_split changes only
+            # the packed W/SF banks. Logical expert and feature sizes stay full.
+            impl_values["weight_layout"] = (
+                "n_split" if ugpu_weight_layout == "n_split" else "standard"
+            )
+            ugpu_kernel_cls = RubinInferenceMegaMoE
     impl_desc = ImplDesc(impl_values)
 
     def construct(kernel_cls):
@@ -1028,6 +1064,11 @@ def _construct_megamoe_kernel(
             )
         return kernel
 
+    if ugpu_kernel_cls is not None:
+        # Never retry with a consumer that may interpret the same bank differently.
+        if ugpu_kernel_cls is RubinInferenceGenphaseMegaMoE:
+            return construct_genphase(), None
+        return construct(ugpu_kernel_cls), None
     bucket = _sm107_tactic_bucket(int(common["max_tokens_per_rank"])) if sm_version == 107 else None
     rejection = None
     if bucket is not None and bucket not in _SM107_GENERIC_KERNEL_BUCKETS:
@@ -1184,11 +1225,23 @@ def validate_megamoe_tactic(tactic: Tuple, sm_version: int = 100) -> None:
     if (not isinstance(schedule_policy, (tuple, list))) or len(schedule_policy) != 2:
         raise ValueError(f"schedule_policy must be a (mode, hint) pair, got {schedule_policy!r}.")
     schedule_mode, schedule_hint = schedule_policy
-    if schedule_mode not in {"grouped", "phase_interleave"}:
+    if schedule_mode not in {"grouped", "phase_interleave", "decode"}:
         raise ValueError(
-            f"schedule_policy mode must be 'grouped' or 'phase_interleave', got {schedule_mode!r}."
+            "schedule_policy mode must be 'grouped', 'phase_interleave' or 'decode', "
+            f"got {schedule_mode!r}."
         )
-    if schedule_hint is not None and (
+    if schedule_mode == "decode":
+        # The generation-phase kernel's decode scheduler; the hint is its optional FC1 lead
+        # (0 <= lead < 65536, the scheduler's own bound).
+        if schedule_hint is not None and (
+            (not isinstance(schedule_hint, int))
+            or isinstance(schedule_hint, bool)
+            or not 0 <= schedule_hint < 65536
+        ):
+            raise ValueError(
+                f"decode schedule_policy lead must be None or an int in [0, 65536), got {schedule_hint!r}."
+            )
+    elif schedule_hint is not None and (
         (not isinstance(schedule_hint, int))
         or isinstance(schedule_hint, bool)
         or schedule_hint <= 0
@@ -1205,8 +1258,8 @@ def validate_megamoe_tactic(tactic: Tuple, sm_version: int = 100) -> None:
         raise ValueError(
             f"work_id_mode must be 'grid_stride' or 'atomic_counter', got {work_id_mode!r}."
         )
-    if schedule_mode == "phase_interleave" and work_id_mode != "atomic_counter":
-        raise ValueError("phase_interleave requires work_id_mode='atomic_counter'.")
+    if schedule_mode in {"phase_interleave", "decode"} and work_id_mode != "atomic_counter":
+        raise ValueError(f"{schedule_mode} requires work_id_mode='atomic_counter'.")
 
     if token_back_mode not in {"epi_warps", "standalone_warps", "reuse_dispatch_warps"}:
         raise ValueError(
@@ -1970,6 +2023,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
         output_dtype: torch.dtype,
         combine_format: str,
         shared_workspace_bytes: int,
+        ugpu_weight_layout: str = "none",
     ) -> MegaMoeSymmMemProvider:
         """Return a cached provider for (group, layout). The cache is
         keyed on the group ``group_name`` plus every layout knob that
@@ -1995,6 +2049,8 @@ if IS_MEGAMOE_OP_AVAILABLE:
             str(combine_format),
             int(shared_workspace_bytes),
         )
+        if ugpu_weight_layout != "none":
+            cache_key += (ugpu_weight_layout,)
         cached = _MEGAMOE_SYMM_PROVIDER_CACHE.get(cache_key)
         if cached is not None:
             return cached
@@ -2155,10 +2211,17 @@ if IS_MEGAMOE_OP_AVAILABLE:
         situ_linear_beta: Optional[float] = None,
         in_kernel_fc2_reduce: bool = False,
         combine_format: str = "bf16",
+        ugpu_weight_layout: str = "none",
     ) -> Tuple[int, bool]:
         """Probe workspace size and direct-input support of the default kernel."""
 
         sm_version = get_sm_version()
+        if ugpu_weight_layout != "none" and _megamoe_ugpu_is_genphase(max_tokens_per_rank):
+            if tactic is not None and _unpack_tactic(tactic) != _unpack_tactic(
+                _megamoe_ugpu_tactic()
+            ):
+                raise ValueError("Localized MegaMoE weights require the fixed uGPU tactic")
+            tactic = _megamoe_ugpu_tactic()
         use_default_tactic = tactic is None
         if use_default_tactic:
             problem_key = _megamoe_problem_key(
@@ -2216,7 +2279,11 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 mma_tiler_mnk=mma_tiler,
                 cluster_shape_mnk=tuple(cluster_shape),
                 use_2cta_instrs=bool(mma_tiler[0] == 256),
-                group_hint=512 if schedule_hint is None else int(schedule_hint),
+                group_hint=(
+                    512
+                    if schedule_hint is None or schedule_policy[0] == "decode"
+                    else int(schedule_hint)
+                ),
                 token_padding_block=64,
                 sf_padding_block=_SF_PADDING_BLOCK,
                 load_balance_mode=(
@@ -2259,12 +2326,13 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 sm_version=sm_version,
                 common=common,
                 combine_format=combine_format,
+                ugpu_weight_layout=ugpu_weight_layout,
             )
             return probe
 
         probe, _ = _resolve_megamoe_kernel_tactic(
             tactic,
-            allow_fallback=use_default_tactic,
+            allow_fallback=use_default_tactic and ugpu_weight_layout == "none",
             build=build,
         )
         # The probe MUST build the SAME kernel that runs (same combine_format):
@@ -2326,6 +2394,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             combine_format: str = "bf16",
             tactic_autotune: bool = False,
             helper_expert_count: int = 0,
+            ugpu_weight_layout: str = "none",
         ) -> None:
             super().__init__()
             if (sm_version := get_sm_version()) not in (100, 103, 107):
@@ -2340,6 +2409,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 raise ValueError(f"max_tokens_per_rank must be positive, got {max_tokens_per_rank}")
             if output_dtype != torch.bfloat16:
                 raise ValueError(f"MegaMoE NVFP4 only supports bfloat16 output; got {output_dtype}")
+            self.ugpu_weight_layout = ugpu_weight_layout
             self.sm_version = int(sm_version)
             self.world_size = int(world_size)
             self.local_rank = int(local_rank)
@@ -2421,7 +2491,12 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 in_kernel_fc2_reduce=self.in_kernel_fc2_reduce,
                 combine_format=self.combine_format,
                 helper_expert_count=self.helper_expert_count,
-            )
+            ) + ((self.ugpu_weight_layout,) if self.ugpu_weight_layout != "none" else ())
+
+        def _problem_key(self):
+            """``unique_id()`` without the localized layout, for the layout-independent default tactics."""
+            key = self.unique_id()
+            return key[:-1] if self.ugpu_weight_layout != "none" else key
 
         def get_valid_tactics(
             self,
@@ -2642,7 +2717,11 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 mma_tiler_mnk=tuple(mma_tiler),
                 cluster_shape_mnk=tuple(cluster_shape),
                 use_2cta_instrs=bool(mma_tiler[0] == 256),
-                group_hint=(512 if schedule_hint is None else int(schedule_hint)),
+                group_hint=(
+                    512
+                    if schedule_hint is None or schedule_policy[0] == "decode"
+                    else int(schedule_hint)
+                ),
                 token_padding_block=64,
                 sf_padding_block=_SF_PADDING_BLOCK,
                 load_balance_mode=(
@@ -2686,6 +2765,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 sm_version=self.sm_version,
                 common=common,
                 combine_format=self.combine_format,
+                ugpu_weight_layout=self.ugpu_weight_layout,
             )
             if rejection is not None:
                 logger.debug(
@@ -2763,10 +2843,16 @@ if IS_MEGAMOE_OP_AVAILABLE:
         ) -> None:
             del kwargs
             use_default_tactic = tactic == -1 or tactic is None
-            if use_default_tactic:
+            if self.ugpu_weight_layout != "none" and _megamoe_ugpu_is_genphase(
+                self.max_tokens_per_rank
+            ):
+                tactic_t = _megamoe_ugpu_tactic()
+                if not use_default_tactic and _unpack_tactic(tactic) != _unpack_tactic(tactic_t):
+                    raise ValueError("Localized MegaMoE weights require the fixed uGPU tactic")
+            elif use_default_tactic:
                 num_tokens = int(inputs[0].shape[0])
                 tactic_t = _default_megamoe_tactic_for_key(
-                    self.unique_id(),
+                    self._problem_key(),
                     num_tokens=num_tokens,
                 )
             elif isinstance(tactic, list):
@@ -2805,7 +2891,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
 
             kernel, tactic_t = self._resolve_kernel_descriptor(
                 tactic_t,
-                allow_fallback=use_default_tactic,
+                allow_fallback=use_default_tactic and self.ugpu_weight_layout == "none",
             )
 
             # form-B accumulates the top-k reduction into ``combine_output``,
@@ -3067,6 +3153,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
         combine_format,
         tactic_autotune,
         helper_expert_count,
+        ugpu_weight_layout="none",
     ):
         """Reuse a runner by its complete constructor key.
 
@@ -3092,6 +3179,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             combine_format,
             tactic_autotune,
             helper_expert_count,
+            ugpu_weight_layout,
         )
 
         def _make():
@@ -3115,6 +3203,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 combine_format=combine_format,
                 tactic_autotune=tactic_autotune,
                 helper_expert_count=helper_expert_count,
+                ugpu_weight_layout=ugpu_weight_layout,
             )
 
         # A runner that may profile owns profiling scratch, so tuning-mode calls
@@ -3175,6 +3264,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
         helper_expert_count: int = 0,
         hot_expert_weight_ready_flags: Optional[torch.Tensor] = None,
         hot_expert_weight_ready_generation: int = 0,
+        ugpu_weight_layout: str = "none",
     ) -> None:
         """Run the fused MegaMoE CuteDSL NVFP4 kernel.
 
@@ -3201,6 +3291,13 @@ if IS_MEGAMOE_OP_AVAILABLE:
         ``act_alpha`` / ``act_beta`` select the activation: both None
         runs SwiGLU, both set runs SiTU with the gate-side and linear-side
         soft-caps, respectively. They are codegen-time constants.
+
+        ``ugpu_weight_layout`` describes the localized weight allocation
+        (``none`` keeps the legacy dispatch and ABI). Genphase capacities (up
+        to 1024 tokens per rank) use the die-aware kernel, which reads each
+        SM's die in the kernel, with one fixed tactic; other capacities use the
+        generic kernel on the same allocation with the default tactic.
+        Localized runs have no fallback tactic.
         """
         sm_version = get_sm_version()
         if sm_version not in (100, 103, 107):
@@ -3236,6 +3333,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             combine_format,
             tactic_autotune,
             helper_expert_count,
+            ugpu_weight_layout,
         )
         # READY inputs belong to this launch. Never regenerate them or retain stale
         # values across calls, even when the runner itself is cached.
@@ -3381,5 +3479,6 @@ if IS_MEGAMOE_OP_AVAILABLE:
         helper_expert_count: int = 0,
         hot_expert_weight_ready_flags: Optional[torch.Tensor] = None,
         hot_expert_weight_ready_generation: int = 0,
+        ugpu_weight_layout: str = "none",
     ) -> None:
         return None
