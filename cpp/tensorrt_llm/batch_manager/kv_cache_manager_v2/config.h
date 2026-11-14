@@ -630,6 +630,10 @@ struct KVCacheManagerConfig
     // layer-group slot-count proportions while accounting for cold page sizes. The group of a region with a
     // fixed slot count keeps its entry, which the hot tier ignores.
     std::optional<std::vector<float>> initialPoolRatio; // overrides inferred sizing inputs
+    // Typical step that sizes the cold (host / disk) tiers' pool groups at cold page sizes. Unset, a cold
+    // tier keeps the hot tier's per-layer-group slot-count proportions. A cold tier holds released pages
+    // only, so its useful mix can differ (e.g. an idle hybrid conversation needs only its latest snapshot).
+    std::optional<BatchDesc> coldTypicalStep;
 
     // When set, SWA layers reuse physical pages for out-of-window blocks during prefill.
     // Scratch blocks share coalesced slot sub-pages across blocks for the currently executing

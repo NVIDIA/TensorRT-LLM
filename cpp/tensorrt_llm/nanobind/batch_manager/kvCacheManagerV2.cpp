@@ -1967,7 +1967,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 std::optional<kv::SwaScratchReuseConfig> swaScratchReuse, bool commitMinSnapshot, bool enableStats,
                 bool textOnly, bool enablePartialCommit, kv::PoolRebalanceConfig poolRebalance,
                 kv::Priority coldTierOffloadMinPriority, std::optional<size_t> hostSparsePoolQuota,
-                std::vector<kv::RegionConfig> regions, kv::HostMemBackingConfig hostMemBacking)
+                std::vector<kv::RegionConfig> regions, kv::HostMemBackingConfig hostMemBacking,
+                std::optional<kv::BatchDesc> coldTypicalStep)
             {
                 new (cfg) kv::KVCacheManagerConfig();
                 cfg->tokensPerBlock = tokensPerBlock;
@@ -1996,6 +1997,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 cfg->hostSparsePoolQuota = hostSparsePoolQuota;
                 cfg->regions = std::move(regions);
                 cfg->hostMemBacking = std::move(hostMemBacking);
+                cfg->coldTypicalStep = std::move(coldTypicalStep);
                 // Mirror Python's __post_init__: validate at construction. Config-integrity
                 // failures raise AssertionError (translated below).
                 cfg->validate();
@@ -2010,7 +2012,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("cold_tier_offload_min_priority") = tensorrt_llm::batch_manager::kDefaultColdTierOffloadMinPriority,
             nb::arg("host_sparse_pool_quota").none() = std::nullopt,
             nb::arg("regions") = std::vector<kv::RegionConfig>{},
-            nb::arg("host_mem_backing") = kv::HostMemBackingConfig{})
+            nb::arg("host_mem_backing") = kv::HostMemBackingConfig{},
+            nb::arg("cold_typical_step").none() = std::nullopt)
         .def_rw("tokens_per_block", &kv::KVCacheManagerConfig::tokensPerBlock)
         .def_rw("cache_tiers", &kv::KVCacheManagerConfig::cacheTiers)
         .def_rw("layers", &kv::KVCacheManagerConfig::layers)
@@ -2023,6 +2026,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("enable_partial_commit", &kv::KVCacheManagerConfig::enablePartialCommit)
         .def_rw("cold_tier_offload_min_priority", &kv::KVCacheManagerConfig::coldTierOffloadMinPriority)
         .def_rw("typical_step", &kv::KVCacheManagerConfig::typicalStep)
+        .def_rw("cold_typical_step", &kv::KVCacheManagerConfig::coldTypicalStep,
+            nb::for_setter(nb::arg("value").none()),
+            "Typical step that sizes the cold (host / disk) tiers' pool groups. None keeps the hot tier's "
+            "per-layer-group slot-count proportions at cold page sizes.")
         .def_rw("constraints", &kv::KVCacheManagerConfig::constraints)
         .def_rw("host_sparse_pool_quota", &kv::KVCacheManagerConfig::hostSparsePoolQuota,
             "Host bytes the GPU tier's host-backed pools may take. None has the storage manager set it "
@@ -3474,7 +3481,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                         }
                         nb::gil_scoped_release release;
                         return self->createKvCache(std::move(reuseScope), view, id, std::move(priorityCb), promptLen,
-                            textOnly, enableRequestStats, std::move(retentionConfig));
+                            textOnly, enableRequestStats, std::move(retentionConfig), knownNoDigest);
                     });
             },
             nb::arg("reuse_scope") = nb::none(), nb::arg("input_tokens") = nb::none(), nb::arg("id") = std::nullopt,

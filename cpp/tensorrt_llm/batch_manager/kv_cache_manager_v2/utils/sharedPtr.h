@@ -40,6 +40,7 @@
 
 #pragma once
 
+#include "kv_cache_manager_v2/utils/smallObjectPool.h"
 #include "tensorrt_llm/common/assert.h"
 #include <atomic>
 #include <cstddef>
@@ -123,9 +124,32 @@ struct InplaceControlBlock final : ControlBlockBase
         ptr()->~T();
     }
 
+    // Pages, page holders and page locks come and go by the thousand per claim and release, so their
+    // control blocks come from the small-object pool. Over-aligned ones (a tree block's digest key)
+    // and large ones come from the aligned heap.
+    static InplaceControlBlock* create()
+    {
+        void* mem = nullptr;
+        if constexpr (pooled())
+            mem = poolAllocate(sizeof(InplaceControlBlock));
+        else
+            mem = ::operator new(sizeof(InplaceControlBlock), std::align_val_t{alignof(InplaceControlBlock)});
+        return ::new (mem) InplaceControlBlock();
+    }
+
     void deallocate() noexcept override
     {
-        delete this;
+        this->~InplaceControlBlock();
+        if constexpr (pooled())
+            poolDeallocate(this, sizeof(InplaceControlBlock));
+        else
+            ::operator delete(this, std::align_val_t{alignof(InplaceControlBlock)});
+    }
+
+private:
+    static constexpr bool pooled() noexcept
+    {
+        return poolServes(sizeof(InplaceControlBlock), alignof(InplaceControlBlock));
     }
 };
 
@@ -600,16 +624,16 @@ private:
 template <typename T, typename... Args>
 SharedPtr<T> makeShared(Args&&... args)
 {
-    auto* cb = new detail::InplaceControlBlock<T>();
+    auto* cb = detail::InplaceControlBlock<T>::create();
     try
     {
         new (cb->storage) T(std::forward<Args>(args)...);
     }
     catch (...)
     {
-        // T's constructor threw — control block was never fully initialized.
-        // Release directly; destroyObject() must not run.
-        delete cb;
+        // T's constructor threw, so there is no T to destroy: free the control block only,
+        // without destroyObject().
+        cb->deallocate();
         throw;
     }
 

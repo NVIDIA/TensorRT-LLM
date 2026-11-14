@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import math
+import os
 import sys
 from dataclasses import replace
 from types import MappingProxyType
@@ -125,8 +126,20 @@ GB = 1 << 30
 # requests per batch that can take the path, at most max_batch_size and
 # _INFORWARD_SNAPSHOT_MAX_ROWS, within _INFORWARD_SNAPSHOT_STAGING_BYTES) are
 # allocated after the pools, outside the GPU cache quota.
+# TRTLLM_INFORWARD_SNAPSHOT_MAX_ROWS and TRTLLM_INFORWARD_SNAPSHOT_STAGING_MIB
+# override the two caps. Requests beyond the rows run their tails a step later.
 _INFORWARD_SNAPSHOT_MAX_ROWS = 8
 _INFORWARD_SNAPSHOT_STAGING_BYTES = 512 << 20
+_INFORWARD_SNAPSHOT_MAX_ROWS_ENV = "TRTLLM_INFORWARD_SNAPSHOT_MAX_ROWS"
+_INFORWARD_SNAPSHOT_STAGING_MIB_ENV = "TRTLLM_INFORWARD_SNAPSHOT_STAGING_MIB"
+
+
+def _env_positive_int(name: str, default: int) -> int:
+    """A positive int from the environment, or `default` when unset."""
+    value = int(os.environ.get(name) or default)
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer, got {value}")
+    return value
 
 
 def _insert_draft_pool_ratio(
@@ -188,6 +201,23 @@ def _uses_fp4_mla_cache_layout(
         and getattr(pretrained_config, "kv_lora_rank", None) is not None
         and getattr(pretrained_config, "qk_rope_head_dim", None) is not None
     )
+
+
+def _equal_state_slices(capacity: int, num_states: int) -> List[KVCacheDesc]:
+    """One typical request of ``capacity`` tokens holding ``num_states`` recurrent states.
+
+    Each state is modeled as an equal slice of the sequence, so the slices' attention pages
+    add up to the request's and each slice adds one recurrent-state slot.
+    """
+    capacity_per_state, capacity_remainder = divmod(capacity, num_states)
+    capacities = [capacity_per_state + int(i < capacity_remainder) for i in range(num_states)]
+    return [
+        KVCacheDesc(
+            capacity=state_capacity,
+            history_length=max(0, state_capacity - 1),
+        )
+        for state_capacity in capacities
+    ]
 
 
 class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
@@ -1032,15 +1062,28 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         Each retained state is modeled as an equal slice of the sequence.
         """
         num_states = self._num_ssm_states_per_typical_request(capacity, kv_cache_config)
-        capacity_per_state, capacity_remainder = divmod(capacity, num_states)
-        capacities = [capacity_per_state + int(i < capacity_remainder) for i in range(num_states)]
-        return [
-            KVCacheDesc(
-                capacity=state_capacity,
-                history_length=max(0, state_capacity - 1),
-            )
-            for state_capacity in capacities
-        ]
+        return _equal_state_slices(capacity, num_states)
+
+    def _cold_typical_step(
+        self, kv_cache_config: KvCacheConfig, num_cache_tiers: int
+    ) -> Optional[BatchDesc]:
+        """Typical step for the cold tiers' pool split, or None to keep the GPU tier's split.
+
+        One typical request with ``cold_tier_states_per_request`` states, instead of the GPU
+        split's live state plus every retained snapshot: a released conversation mostly comes
+        back through its latest endpoint, so the rest of the cold quota goes to attention pages.
+        """
+        if num_cache_tiers < 2:
+            return None
+        num_states = kv_cache_config.mamba_state_config.cold_tier_states_per_request
+        if num_states is None or not kv_cache_config.enable_block_reuse:
+            return None
+        capacity = self._get_typical_request_capacity(kv_cache_config)
+        logger.info(
+            f"[MambaHybridCacheManagerV2] cold cache tiers sized for {num_states} recurrent "
+            f"state(s) per {capacity}-token typical request"
+        )
+        return BatchDesc(_equal_state_slices(capacity, num_states))
 
     def _get_typical_request_capacity(
         self,
@@ -1183,6 +1226,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             config,
             layers=layers,
             typical_step=typical_step,
+            cold_typical_step=self._cold_typical_step(kv_cache_config, len(config.cache_tiers)),
             constraints=constraints,
             # SSM lifecycles require minimum-snapshot commit semantics. The
             # flag is harmless when reuse is disabled because no commits are
@@ -1401,14 +1445,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             and row_bytes > 0
         ):
             return 0, row_bytes
-        rows = max(
-            1,
-            min(
-                self.max_batch_size,
-                _INFORWARD_SNAPSHOT_MAX_ROWS,
-                _INFORWARD_SNAPSHOT_STAGING_BYTES // row_bytes,
-            ),
+        max_rows = _env_positive_int(_INFORWARD_SNAPSHOT_MAX_ROWS_ENV, _INFORWARD_SNAPSHOT_MAX_ROWS)
+        staging_mib = _env_positive_int(
+            _INFORWARD_SNAPSHOT_STAGING_MIB_ENV, _INFORWARD_SNAPSHOT_STAGING_BYTES >> 20
         )
+        rows = max(1, min(self.max_batch_size, max_rows, (staging_mib << 20) // row_bytes))
         return rows, row_bytes
 
     def _setup_inforward_snapshot(self) -> None:
@@ -1484,12 +1525,13 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         """Commit each planned request up to P from its live state, then copy its staged prompt-end state back.
 
         Called on the execution stream right after the forward, so the copies precede the batch's sampler event.
+        One index_copy_ per staged buffer covers every planned request.
         """
         plan = self.inforward_snapshot_plan
         if not plan:
             return
         self.inforward_snapshot_plan = {}
-        dst, src = [], []
+        slots, rows = [], []
         for request in scheduled_batch.context_requests:
             entry = plan.get(request.py_request_id)
             kv_cache = self.kv_cache_map.get(request.py_request_id)
@@ -1522,13 +1564,30 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 raise RuntimeError(
                     f"In-forward Mamba snapshot: request {request.py_request_id} lost its live SSM slot"
                 )
-            dst += [state[slot] for state in self.all_ssm_states]
-            dst += [state[slot] for state in self.all_conv_states]
-            src += list(self._inforward_stage_ssm[:, entry.row].unbind(0))
-            src += list(self._inforward_stage_conv[:, entry.row].unbind(0))
-        if dst:
-            with torch.cuda.stream(self._stream):
-                torch._foreach_copy_(dst, src, non_blocking=True)
+            slots.append(slot)
+            rows.append(entry.row)
+        if not slots:
+            return
+        # (live pool [slots, ...], staging [rows, ...]) of every buffer the snapshot staged.
+        buffers = list(zip(self.all_ssm_states, self._inforward_stage_ssm.unbind(0)))
+        buffers += list(zip(self.all_conv_states, self._inforward_stage_conv.unbind(0)))
+        buffers += self._inforward_extra_restore_buffers()
+        device = self._inforward_stage_ssm.device
+        with torch.cuda.stream(self._stream):
+            slot_index = _host_slots_to_device(slots, device)
+            # Rows follow batch order, so they are usually 0..n-1 and a slice replaces the gather.
+            leading = rows == list(range(len(rows)))
+            row_index = None if leading else _host_slots_to_device(rows, device)
+            for pool, stage in buffers:
+                src = stage[: len(rows)] if leading else stage.index_select(0, row_index)
+                pool.index_copy_(0, slot_index, src)
+
+    def _inforward_extra_restore_buffers(self) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+        """(live pool ``[slots, ...]``, staging ``[rows, ...]``) of model state that shares the GDN slot.
+
+        finish_inforward_snapshots restores these with the SSM and conv states; none by default.
+        """
+        return []
 
     def _setup_model_state(self) -> None:
         """Bind views only after layout, pool and slot capacity are final."""

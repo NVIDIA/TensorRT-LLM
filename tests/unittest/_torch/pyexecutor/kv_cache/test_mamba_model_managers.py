@@ -1895,3 +1895,41 @@ def test_legacy_kda_replay_retains_cpp_manager_gate(monkeypatch):
             False,
             False,
         ) == ("qwen3_next", False, expected)
+
+
+def test_qwen4_inforward_snapshot_stages_and_restores_ple_state(monkeypatch):
+    """Qwen4-Exp stages each local PLE layer's state beside the GDN rows and restores it.
+
+    The floor on chunk tokens before P is the larger of the model's request and the PLE windows.
+    """
+    manager = object.__new__(Qwen4ExpHybridCacheManager)
+
+    def base_setup(self):
+        self.inforward_snapshot_rows = 2
+        self.inforward_snapshot_min_main = 3
+        self._inforward_stage_ssm = torch.empty(1, 2, 1)
+
+    monkeypatch.setattr(MambaHybridCacheManagerV2, "_setup_inforward_snapshot", base_setup)
+    manager._inforward_min_main_request = 65
+    manager._inforward_stage_ple = {}
+    manager._ple_layer_ids = [5, 9]
+    manager.layer_offsets = {5: 0}  # layer 9 lives on another PP rank
+    manager._ple_conv_state_shape = [8, 9]
+    manager._ple_ngram_context_shape = [2]
+    manager._ple_conv_state_dtype = torch.bfloat16
+    manager._setup_inforward_snapshot()
+
+    assert set(manager._inforward_stage_ple) == {5}
+    stage_conv, stage_ngram = manager.inforward_ple_stage_views(5)
+    assert stage_conv.shape == (2, 8, 9) and stage_conv.dtype == torch.bfloat16
+    assert stage_ngram.shape == (2, 2) and stage_ngram.dtype == torch.long
+    assert manager.inforward_ple_stage_views(9) is None
+    assert manager.inforward_snapshot_min_main == 65
+
+    manager._ple_conv_states = {5: torch.zeros(4, 8, 9, dtype=torch.bfloat16)}
+    manager._ple_ngram_contexts = {5: torch.zeros(4, 2, dtype=torch.long)}
+    buffers = manager._inforward_extra_restore_buffers()
+    assert [(pool.data_ptr(), stage.data_ptr()) for pool, stage in buffers] == [
+        (manager._ple_conv_states[5].data_ptr(), stage_conv.data_ptr()),
+        (manager._ple_ngram_contexts[5].data_ptr(), stage_ngram.data_ptr()),
+    ]

@@ -67,15 +67,18 @@ struct ReuseScope
 //
 // SECURITY INVARIANT: the block hash MUST remain cryptographically
 // collision-resistant and >= 256-bit. The radix tree is a globally shared,
-// cross-request/cross-tenant cache index, prefix matching is decided purely by
-// digest equality with NO re-verification of the underlying tokens, and the
-// hashed input (tokens, the salt string in ReuseScope, multimodal
-// content bytes) is attacker-influenceable. A hash collision therefore silently
-// reuses another request's KV blocks (cross-request corruption / data leak),
-// and tenant isolation via cache_salt relies entirely on this hash's collision
-// resistance. Do NOT substitute a non-cryptographic hash (xxHash, HighwayHash,
-// City, ...) or truncate below 256 bits without first adding a token-content
-// equality check on match.
+// cross-request/cross-tenant cache index. A match finds its root by the reuse
+// scope's digest, and each block by digest equality with NO re-verification of
+// the underlying tokens; only a digest-free query at a node with at most
+// kTokenScanMaxChildren (8) children compares the children's tokens instead
+// (matchTokenPath, blockRadixTree.cpp). The hashed input
+// (tokens, the salt string in ReuseScope, multimodal content bytes) is
+// attacker-influenceable. A hash collision therefore silently reuses another
+// request's KV blocks (cross-request corruption / data leak), and tenant
+// isolation via cache_salt relies entirely on this hash's collision resistance.
+// Do NOT substitute a non-cryptographic hash (xxHash, HighwayHash, City, ...)
+// or truncate below 256 bits without first adding a scope and token-content
+// equality check to every digest match.
 // ---------------------------------------------------------------------------
 using BlockKey = Digest;
 static_assert(kDIGEST_LEN == CSHA256::OUTPUT_SIZE); // 32 bytes
@@ -123,8 +126,9 @@ struct BlockchainKeyStep
 // the first call yields the root (reuseScope digest, empty [0,0) range), then one
 // step per tokensPerBlock chunk chained on the previous digest. Mirrors Python's
 // sequence_to_blockchain_keys(). Lazy so a caller that stops early (e.g. on the
-// first mismatch) skips the remaining hashing. Inline so both the tree
-// (matchTokenPath) and the nanobind layer drive the same generator.
+// first mismatch) skips the remaining hashing. Inline so the nanobind key iterator
+// holds the closure type directly. matchTokenPath does not use it: it derives each
+// block's key with Block::makeKey only where it needs a keyed lookup.
 // knownNoDigest: from external text_only knowledge, never a scan (see Hasher::update).
 // ---------------------------------------------------------------------------
 inline auto sequenceToBlockchainKeys(

@@ -5365,6 +5365,20 @@ class MambaStateConfig(StrictBaseModel):
         "kv_cache_config.block_reuse_config.enable_branch_snapshot. It takes "
         "effect only when block reuse is enabled.")
 
+    cold_tier_states_per_request: Optional[_StrictPositiveInt] = Field(
+        default=None,
+        status="prototype",
+        telemetry=False,
+        description=
+        "Recurrent states that one typical request (kv_cache_config.avg_seq_len "
+        "tokens) keeps in the host and disk tiers of KV cache manager V2, which "
+        "split their quota between recurrent-state and attention pages by it. "
+        "None keeps the GPU tier's split, whose typical request counts the live "
+        "state and every retained snapshot. A cold tier holds released "
+        "conversations, which mostly come back through their latest endpoint, "
+        "so a small value (1 or 2) gives more of the tier to attention pages. "
+        "Takes effect only with block reuse and a host or disk tier.")
+
 
 class KVEventsConfig(StrictBaseModel):
     """Configuration for streaming (push-based) KV cache event publishing."""

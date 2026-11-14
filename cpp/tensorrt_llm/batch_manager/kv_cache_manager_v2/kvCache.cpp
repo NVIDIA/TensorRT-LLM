@@ -2948,6 +2948,7 @@ void KvCache::_setupForReuse(BlockRadixTree::ReuseMatch const& match, bool claim
 
     BlockOrdinal const numMatchedBlocks = matched.size();
     _resizePageIndexBuffers(numMatchedBlocks);
+    mBlocks.reserve(numMatchedBlocks);
 
     for (BlockOrdinal i{0}; i < numMatchedBlocks; ++i)
     {
@@ -3131,7 +3132,8 @@ void KvCache::_setupForReuse(BlockRadixTree::ReuseMatch const& match, bool claim
 std::vector<TokenIdExt> KvCache::_getMatchedTokens(BlockRadixTree::ReuseMatch const& match) const
 {
     std::vector<TokenIdExt> ret;
-    ret.reserve(static_cast<size_t>(match.numTokens));
+    // Room for the rest of the prompt, which commit() appends.
+    ret.reserve(static_cast<size_t>(std::max(match.numTokens, mExpectedPromptLength.value_or(0))));
     int remaining = match.numTokens;
     for (auto const* block : match.blocks)
     {

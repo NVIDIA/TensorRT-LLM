@@ -21,6 +21,7 @@
 #include "kv_cache_manager_v2/exceptions.h"
 #include "kv_cache_manager_v2/storage/config.h"
 #include "kv_cache_manager_v2/utils/sharedPtr.h"
+#include "kv_cache_manager_v2/utils/smallObjectPool.h"
 
 #include <cstddef>
 #include <list>
@@ -45,7 +46,7 @@ class Page;
 // IMPORTANT: A NodeRef is always tied to the specific list that issued it.
 // Never mix NodeRefs from different LRUEvictionPolicy instances.
 // ---------------------------------------------------------------------------
-using EvictionList = std::list<SharedPtr<Page>>;
+using EvictionList = std::list<SharedPtr<Page>, PoolAllocator<SharedPtr<Page>>>;
 using NodeRef = EvictionList::iterator;
 
 // ---------------------------------------------------------------------------
