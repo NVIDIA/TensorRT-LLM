@@ -71,9 +71,10 @@ from tensorrt_llm.runtime.kv_cache_hash import \
 from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
 from tensorrt_llm.serve._perf_metrics_config import resolve_perf_metrics_config
 from tensorrt_llm.serve.anthropic_adapter import (
-    AnthropicRequestError, AnthropicResponseError, anthropic_error_response,
+    AnthropicRequestError, AnthropicResponseError,
+    anthropic_chat_error_response, anthropic_error_response,
     convert_anthropic_count_tokens_request, convert_anthropic_request,
-    convert_chat_response, reframe_openai_stream)
+    convert_chat_response, reframe_openai_stream, wait_for_stream_start)
 from tensorrt_llm.serve.anthropic_batches import (AnthropicBatchStore,
                                                   BatchStoreFullError,
                                                   results_to_jsonl)
@@ -2602,8 +2603,13 @@ class OpenAIServer(_VideoRoutesMixin):
         executor_client_id = getattr(raw_request.state, "executor_client_id",
                                      None)
         if isinstance(response, StreamingResponse):
+            # A prompt the engine rejects as too long is answered with a 400,
+            # not with a stream (see wait_for_stream_start).
+            stream = await wait_for_stream_start(response.body_iterator)
+            if isinstance(stream, JSONResponse):
+                return stream
             return StreamingResponse(
-                content=reframe_openai_stream(response.body_iterator,
+                content=reframe_openai_stream(stream,
                                               model=self.model,
                                               request_id=executor_client_id),
                 media_type="text/event-stream",
@@ -2616,9 +2622,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 message = payload.get("message") or json.dumps(payload)
             except (json.JSONDecodeError, AttributeError):
                 message = "Internal server error"
-            err_type = ("invalid_request_error"
-                        if 400 <= status < 500 else "api_error")
-            return anthropic_error_response(message, err_type, status)
+            return anthropic_chat_error_response(message, status)
 
         try:
             chat_response = ChatCompletionResponse(**json.loads(response.body))

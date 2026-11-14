@@ -44,6 +44,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.serve._telemetry import create_uvicorn_server
 from tensorrt_llm.serve.anthropic_adapter import (AnthropicRequestError,
                                                   AnthropicResponseError,
+                                                  anthropic_chat_error_response,
                                                   anthropic_error_response,
                                                   convert_anthropic_request,
                                                   convert_chat_response,
@@ -492,10 +493,7 @@ class OpenAIDisaggServer:
             openai_response = await self._wrap_entry_point(
                 self._service.openai_chat_completion)(chat_request, raw_request)
         except HTTPException as e:
-            error_type = ("invalid_request_error"
-                          if 400 <= e.status_code < 500 else "api_error")
-            return anthropic_error_response(str(e.detail), error_type,
-                                            e.status_code)
+            return anthropic_chat_error_response(str(e.detail), e.status_code)
 
         # The reply is named after the disaggregated request rather than the
         # worker's own id for it (see anthropic_message_id).
@@ -517,9 +515,10 @@ class OpenAIDisaggServer:
                            or payload.get("error") or json.dumps(payload))
             except (json.JSONDecodeError, AttributeError, TypeError):
                 message = "Internal server error"
-            error_type = ("invalid_request_error"
-                          if 400 <= status < 500 else "api_error")
-            return anthropic_error_response(str(message), error_type, status)
+            # The context phase never streams, so a context worker's over-length
+            # rejection arrives here, before any stream, for a streamed request
+            # too.
+            return anthropic_chat_error_response(str(message), status)
 
         try:
             chat_response = ChatCompletionResponse(
