@@ -1790,39 +1790,49 @@ def test_executors_of_one_engine_share_the_execution_stream():
 
 def test_route_wait_occurs_after_independent_staging():
     source = _TORCH_ROOT / "moe/fused_moe/mega_moe/mega_moe_cute_dsl.py"
+    trace = []
+
+    def stage_routes(ids, weights, ids_out, weights_out, live_row_word=None):
+        trace.append(f"stage_routes:{ids_out.name},{weights_out.name}")
+
     impl = _extract_class(
         source,
         "TrtllmCutedslMegaMoeNvfp4Impl",
         {"_stage_inputs"},
-        {"torch": SimpleNamespace(uint8="uint8")},
+        {
+            "torch": SimpleNamespace(
+                uint8="uint8",
+                ops=SimpleNamespace(trtllm=SimpleNamespace(megamoe_stage_routes=stage_routes)),
+            )
+        },
     )
 
-    def run():
-        trace = []
-        owner = impl()
-        owner._wait_rebalance_routes = lambda replica_plan=None: trace.append("wait")
-        bufs = SimpleNamespace(
-            **{
-                key: _StageTensor(key, trace)
-                for key in ("topk_idx_local", "activation", "activation_sf", "topk_weights")
-            }
-        )
-        owner._stage_inputs(
-            bufs=bufs,
-            x=_StageTensor("x", trace),
-            x_sf=_StageTensor("sf", trace),
-            topk_idx=_StageTensor("routes", trace),
-            topk_weights=_StageTensor("weights", trace),
-            num_tokens=4,
-            top_k=6,
-            stage_activation=True,
-        )
-        return trace, owner
-
-    trace, owner = run()
-    assert trace.index("copy:activation") < trace.index("wait")
-    assert trace.index("copy:topk_weights") < trace.index("wait")
-    assert trace.index("wait") < trace.index("copy:topk_idx_local")
+    owner = impl()
+    owner._wait_rebalance_routes = lambda replica_plan=None: trace.append("wait")
+    bufs = SimpleNamespace(
+        **{
+            key: _StageTensor(key, trace)
+            for key in ("topk_idx_local", "activation", "activation_sf", "topk_weights")
+        }
+    )
+    owner._stage_inputs(
+        bufs=bufs,
+        x=_StageTensor("x", trace),
+        x_sf=_StageTensor("sf", trace),
+        topk_idx=_StageTensor("routes", trace, shape=(4, 6)),
+        topk_weights=_StageTensor("weights", trace, shape=(4, 6)),
+        num_tokens=4,
+        top_k=6,
+        stage_activation=True,
+    )
+    # The activation stages before the wait; one op after it writes the slot ids and
+    # gate weights of the whole bucket.
+    assert trace == [
+        "copy:activation",
+        "copy:activation_sf",
+        "wait",
+        "stage_routes:topk_idx_local,topk_weights",
+    ]
 
 
 @pytest.mark.parametrize("has_sm_budget", [True, False])
@@ -1831,6 +1841,8 @@ def test_megamoe_quantize_reserves_sms_only_for_a_replica_plan(has_sm_budget):
     calls = []
 
     class Activation:
+        device = "cpu"
+
         def __init__(self, rows, cols):
             self.shape = (rows, cols)
 
@@ -1866,6 +1878,8 @@ def test_megamoe_quantize_reserves_sms_only_for_a_replica_plan(has_sm_budget):
     impl = _extract_class(source, "TrtllmCutedslMegaMoeNvfp4Impl", {"quantize_input"}, namespace)
     owner = impl()
     owner.fc31_input_scale = "scale"
+    # A forward that run_moe does not stage.
+    owner._staging_of_next_run = lambda num_tokens, device: None
 
     owner.quantize_input(Activation(3, 64))
     owner.quantize_input(Activation(3, 64), reserved_sms=4)
@@ -1985,6 +1999,7 @@ def _autotune_helpers(torch):
         "validate_megamoe_tactic",
         "_epi_flag_batch_for_tokens",
         "_expand_megamoe_ready_tactics",
+        "_with_atomic_counter_work_ids",
         "enumerate_megamoe_candidate_tactics",
     }
     constants = {
@@ -1996,6 +2011,7 @@ def _autotune_helpers(torch):
         "_TOKEN_BACK_READY_GRANULARITIES",
         "_TACTIC_LEN",
         "_TACTIC_LEN_V4",
+        "_ATOMIC_COUNTER_TWIN_SM_VERSIONS",
         "_LEGACY_TACTIC_LEN",
         "_FLAG_BATCH_MAX",
         "_GEOMETRIES",
@@ -2447,6 +2463,7 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
         _load_balancer_update_statistic=lambda routes, *args, **kwargs: trace.append(
             ("update_statistic", routes.name)
         ),
+        _load_balancer_wait_for_statistic_allreduce=lambda: trace.append("wait_statistic"),
         _load_balancer_uses_replica_plan=lambda: mode == "per_layer_dynamic",
         _load_balancer_route=route,
         _load_balancer_start_set_cpu_stage=lambda is_last_call: trace.append("start_set_cpu"),
@@ -2470,7 +2487,9 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
     )
 
     assert out == "out"
-    tail = [("quantize", {}), ("bucket", 6)]
+    # The bucket hint precedes the quantization, which may write into that
+    # bucket's staging.
+    tail = [("bucket", 6), ("quantize", {})]
     if mode == "per_layer_dynamic":
         # The planner consumes the logical routes the calibrator records or
         # replays, and quantization leaves the plan's SMs to its copy kernel.
@@ -2480,8 +2499,8 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
             ("statistic", "logical"),
             ("calibrator", "logical"),
             ("route", "replayed logical"),
-            ("quantize", {"reserved_sms": 4}),
             ("bucket", 6),
+            ("quantize", {"reserved_sms": 4}),
             ("run_moe", "physical", plan),
             "start_set_cpu",
         ]
@@ -2494,6 +2513,9 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
             ("statistic", "slots"),
             ("calibrator", "slots"),
             *tail,
+            # The fused kernel must not run alongside the statistic allreduce;
+            # quantization and staging before it still overlap it.
+            "wait_statistic",
             ("run_moe", "replayed slots", None),
             "start_set_cpu",
             "done_set_cpu",

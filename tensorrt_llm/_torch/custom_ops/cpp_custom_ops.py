@@ -660,6 +660,25 @@ def _register_fake():
             return _fp4_quantize_fake(input, global_scale, sf_vec_size,
                                       sf_use_ue8m0, swizzled_layout)
 
+    if hasattr(torch.ops.trtllm.fp4_quantize, "into"):
+
+        @torch.library.register_fake("trtllm::fp4_quantize.into")
+        def _(input: torch.Tensor,
+              globalScale: Optional[torch.Tensor],
+              out: torch.Tensor,
+              out_sf: torch.Tensor,
+              isSfSwizzledLayout: bool = True,
+              reservedSms: int = 0) -> None:
+            return None
+
+    @torch.library.register_fake("trtllm::megamoe_stage_routes")
+    def _(ids: torch.Tensor,
+          weights: torch.Tensor,
+          ids_out: torch.Tensor,
+          weights_out: torch.Tensor,
+          live_row_word: Optional[torch.Tensor] = None) -> None:
+        return None
+
     @torch.library.register_fake("trtllm::fp4_quantize_with_reorder_residual")
     def _(
         X: torch.Tensor,

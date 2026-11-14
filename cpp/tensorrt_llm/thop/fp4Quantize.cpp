@@ -21,6 +21,7 @@
 #include "tensorrt_llm/thop/thUtils.h"
 
 #include <ATen/cuda/EmptyTensor.h>
+#include <c10/cuda/CUDAGuard.h>
 
 #include <cuda_fp16.h>
 
@@ -31,6 +32,9 @@ TRTLLM_NAMESPACE_BEGIN
 
 namespace torch_ext
 {
+namespace
+{
+// The checks and the launch of every fp4_quantize overload: writes into (out, outSf) when given, else new tensors.
 // self: [M, K], fp16/bf16/fp8_quantized
 // globalScale: [1] float, = (448 * 6) / self.abs().max(). Not used when sfUseUE8M0 is true.
 // nvfp4: sfVecSize = 16, sfUseUE8M0 = false
@@ -42,9 +46,9 @@ namespace torch_ext
 // returns self_fp4, self_block_scale_factors
 // self_fp4: [M, K / 2], FLOAT4_E2M1X2
 // self_block_scale_factors: ceil(M / 128) * 128 * ceil(K / sfVecSize / 4) * 4, SF_DTYPE (UE4M3 or UE8M0)
-std::tuple<at::Tensor, at::Tensor> fp4_quantize_sm_budget(at::Tensor const& self,
-    std::optional<at::Tensor> const& globalScale, int64_t sfVecSize, bool sfUseUE8M0, bool isSfSwizzledLayout,
-    int64_t reservedSms)
+std::tuple<at::Tensor, at::Tensor> fp4QuantizeImpl(at::Tensor const& self, std::optional<at::Tensor> const& globalScale,
+    int64_t sfVecSize, bool sfUseUE8M0, bool isSfSwizzledLayout, int64_t reservedSms,
+    std::optional<at::Tensor> const& out, std::optional<at::Tensor> const& outSf)
 {
     CHECK_TH_CUDA(self);
     CHECK_CONTIGUOUS(self);
@@ -77,16 +81,41 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize_sm_budget(at::Tensor const& self
     auto const k = inputShape[rank - 1];
     TORCH_CHECK(k % sfVecSize == 0);
 
-    std::vector<int64_t> outputShape(inputShape.begin(), inputShape.end());
-    outputShape[rank - 1] = k / 2;
-
-    at::Tensor valueE2M1 = at::detail::empty_cuda(outputShape, FLOAT4_E2M1X2, self.device(), /* stride */ std::nullopt);
-
     int64_t SFSize = isSfSwizzledLayout ? tensorrt_llm::computeSwizzledLayoutSFSize(m, k / sfVecSize)
                                         : tensorrt_llm::computeLinearLayoutSFSize(m, k / sfVecSize);
 
-    at::Tensor scaleFP8SF
-        = at::detail::empty_cuda({SFSize}, SF_DTYPE, self.device(), /* stride */ std::nullopt); // 1D tensor
+    at::Tensor valueE2M1;
+    at::Tensor scaleFP8SF;
+    if (out.has_value())
+    {
+        // The kernel reads 16-byte input vectors and writes 8-byte values and 4-byte scale factors. The linear layout
+        // writes K / sfVecSize bytes per row at that row stride; the swizzled one fills a padded block.
+        TORCH_CHECK(reinterpret_cast<uintptr_t>(self.data_ptr()) % 16 == 0, "input needs 16-byte alignment");
+        TORCH_CHECK(!globalScale.has_value() || globalScale->device() == self.device(),
+            "globalScale must be on the input's device");
+        TORCH_CHECK(out->is_contiguous() && out->scalar_type() == FLOAT4_E2M1X2 && out->device() == self.device()
+                && out->dim() == 2 && out->size(0) == m && out->size(1) == k / 2,
+            "out must be contiguous uint8 [M, K / 2] on the input's device");
+        bool const sfFits = isSfSwizzledLayout
+            ? outSf->numel() >= SFSize
+            : outSf->dim() == 2 && outSf->size(0) == m && outSf->size(1) == k / sfVecSize;
+        TORCH_CHECK(
+            outSf->is_contiguous() && outSf->scalar_type() == SF_DTYPE && outSf->device() == self.device() && sfFits,
+            "out_sf must be contiguous uint8 on the input's device: [M, K / 16] in the linear layout, at least the "
+            "swizzled layout's padded size otherwise");
+        TORCH_CHECK(reinterpret_cast<uintptr_t>(out->data_ptr()) % 8 == 0
+                && reinterpret_cast<uintptr_t>(outSf->data_ptr()) % 4 == 0,
+            "out needs 8-byte and out_sf 4-byte alignment");
+        valueE2M1 = *out;
+        scaleFP8SF = *outSf;
+    }
+    else
+    {
+        std::vector<int64_t> outputShape(inputShape.begin(), inputShape.end());
+        outputShape[rank - 1] = k / 2;
+        valueE2M1 = at::detail::empty_cuda(outputShape, FLOAT4_E2M1X2, self.device(), /* stride */ std::nullopt);
+        scaleFP8SF = at::detail::empty_cuda({SFSize}, SF_DTYPE, self.device(), /* stride */ std::nullopt); // 1D tensor
+    }
 
     const thread_local int mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
     TORCH_CHECK(reservedSms >= 0 && reservedSms < mMultiProcessorCount,
@@ -160,6 +189,24 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize_sm_budget(at::Tensor const& self
 #undef LAUNCH_FP4_QUANTIZE_KERNEL
 
     return {valueE2M1, scaleFP8SF};
+}
+} // namespace
+
+std::tuple<at::Tensor, at::Tensor> fp4_quantize_sm_budget(at::Tensor const& self,
+    std::optional<at::Tensor> const& globalScale, int64_t sfVecSize, bool sfUseUE8M0, bool isSfSwizzledLayout,
+    int64_t reservedSms)
+{
+    return fp4QuantizeImpl(
+        self, globalScale, sfVecSize, sfUseUE8M0, isSfSwizzledLayout, reservedSms, std::nullopt, std::nullopt);
+}
+
+// NVFP4 into caller-owned buffers, e.g. an MoE backend's activation staging, so the rows are not copied afterwards.
+void fp4_quantize_into(at::Tensor const& self, std::optional<at::Tensor> const& globalScale, at::Tensor& out,
+    at::Tensor& outSf, bool isSfSwizzledLayout, int64_t reservedSms)
+{
+    c10::cuda::CUDAGuard const deviceGuard(self.device());
+    fp4QuantizeImpl(
+        self, globalScale, /*sfVecSize=*/16, /*sfUseUE8M0=*/false, isSfSwizzledLayout, reservedSms, out, outSf);
 }
 
 std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self, std::optional<at::Tensor> const& globalScale,
@@ -390,6 +437,9 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "fp4_quantize.sm_budget(Tensor input, Tensor? globalScale, int sfVecSize, bool sfUseUE8M0=False, bool "
         "isSfSwizzledLayout=True, int reserved_sms=0) -> (Tensor, Tensor)");
+    m.def(
+        "fp4_quantize.into(Tensor input, Tensor? globalScale, Tensor(a!) out, Tensor(b!) out_sf, bool "
+        "isSfSwizzledLayout=True, int reservedSms=0) -> ()");
     m.def("calculate_nvfp4_global_scale(Tensor input, Tensor? tokensPerBatch) -> Tensor");
     m.def(
         "fp4_quantize_with_reorder_residual(Tensor X, Tensor input_scale, Tensor reorder_index, int KE, bool is_act) "
@@ -401,6 +451,7 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("fp4_quantize", TORCH_FN(tensorrt_llm::torch_ext::fp4_quantize));
     m.impl("fp4_quantize.sm_budget", TORCH_FN(tensorrt_llm::torch_ext::fp4_quantize_sm_budget));
+    m.impl("fp4_quantize.into", TORCH_FN(tensorrt_llm::torch_ext::fp4_quantize_into));
     m.impl("calculate_nvfp4_global_scale", TORCH_FN(tensorrt_llm::torch_ext::calculate_nvfp4_global_scale));
     m.impl("fp4_quantize_with_reorder_residual", TORCH_FN(tensorrt_llm::torch_ext::fp4_quantize_with_reorder_residual));
     m.impl("fp4_quantize_with_residual", TORCH_FN(tensorrt_llm::torch_ext::fp4_quantize_with_residual));

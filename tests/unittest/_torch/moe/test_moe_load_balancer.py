@@ -1,9 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import collections
+import contextlib
 import os
 import unittest
 from collections.abc import Iterator
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -561,6 +564,86 @@ def test_nemotron_vl_decoder_inherits_eplb_and_registers_moe(
         finally:
             balancer.shutdown()
     assert get_moe_load_balancer() is None
+
+
+def _statistic_layer(trace: list) -> SingleLayerMoeLoadBalancer:
+    layer = SingleLayerMoeLoadBalancer.__new__(SingleLayerMoeLoadBalancer)
+    layer.func_called_count = collections.defaultdict(int)
+    layer.func_called_count["done_wait_gpu_stage"] = 1
+    layer.updates_enabled = True
+    layer.aux_stream = "aux"
+    layer.local_statistic_tensor = "local_statistic"
+    layer.statistic_flag_tensor = "statistic_flag"
+    layer.single_layer_load_balancer_ptr = "balancer"
+    layer.statistic_allreduce_event = SimpleNamespace(
+        record=lambda: trace.append("record:statistic"),
+        wait=lambda: trace.append("wait:statistic"))
+    layer.update_local_statistic = lambda *args: trace.append("local")
+    return layer
+
+
+def _patch_streams(monkeypatch: pytest.MonkeyPatch, trace: list,
+                   capturing: bool) -> None:
+
+    @contextlib.contextmanager
+    def stream(name):
+        trace.append(f"enter:{name}")
+        yield
+        trace.append(f"exit:{name}")
+
+    current_stream = SimpleNamespace(
+        wait_stream=lambda name: trace.append(f"join:{name}"))
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.moe.fused_moe.moe_load_balancer.do_multi_stream",
+        lambda: True)
+    monkeypatch.setattr(torch.cuda, "stream", stream)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: current_stream)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing",
+                        lambda: capturing)
+    monkeypatch.setattr(torch.ops.trtllm,
+                        "moe_hierarchical_statistic_update",
+                        lambda *args: trace.append("update"),
+                        raising=False)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("capturing", [False, True], ids=["eager", "capturing"])
+def test_statistic_allreduce_overlaps_on_the_aux_stream_and_records_its_end(
+        monkeypatch: pytest.MonkeyPatch, capturing: bool) -> None:
+    """Under multi-stream the EP-wide statistic allreduce runs on the auxiliary
+    stream and records an event when it ends, the same way whether the stream
+    is being captured or not; update_statistic_with_local_ids does not join it,
+    so routing, quantization and staging overlap it."""
+    trace = []
+    layer = _statistic_layer(trace)
+    _patch_streams(monkeypatch, trace, capturing)
+
+    layer.update_statistic_with_local_ids(
+        "expert_ids",
+        is_first_stage=True,
+        is_last_stage=True,
+        allreduce=lambda tensor: trace.append("allreduce") or tensor)
+
+    assert trace == [
+        "local", "enter:aux", "allreduce", "update", "record:statistic",
+        "exit:aux"
+    ]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("capturing", [False, True], ids=["eager", "capturing"])
+def test_a_fused_moe_launch_waits_for_the_statistic_allreduce(
+        monkeypatch: pytest.MonkeyPatch, capturing: bool) -> None:
+    """wait_for_statistic_allreduce makes the current stream wait for the
+    event the allreduce recorded, in an eager forward and while capturing, so a
+    fused-communication kernel launched next never runs alongside it."""
+    trace = []
+    layer = _statistic_layer(trace)
+    _patch_streams(monkeypatch, trace, capturing)
+
+    layer.wait_for_statistic_allreduce()
+
+    assert trace == ["wait:statistic"]
 
 
 if __name__ == '__main__':

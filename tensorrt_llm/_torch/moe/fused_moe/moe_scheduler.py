@@ -42,12 +42,14 @@ exchange runs:
 
 from __future__ import annotations
 
+import contextlib
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
 
 from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
+from tensorrt_llm._torch.moe import live_rows
 from tensorrt_llm._torch.moe.expert_statistic import ExpertStatistic
 from tensorrt_llm._torch.route_capture import get_active_route_capture  # R3
 from tensorrt_llm._torch.utils import EventType, Fp4QuantizedTensor
@@ -1225,6 +1227,13 @@ class FusedCommMoEScheduler(MoEScheduler):
     9. No multi-stream chunk overlap.
     10. Reject a backend declaring ``input_requirement.run_moe_reuses_buffers``:
         chunk outputs are kept, never copied, so such a backend would alias.
+    11. A launch that reads the forward's live-row word (``moe/live_rows.py``;
+        the MegaMoE CuteDSL route staging does, for kernels whose top-k reduce
+        masks dropped routes) must cover the rank's whole forward, rows
+        request-major with padding last: launches over one
+        of several chunks run inside ``live_rows.part_of_the_forward()``, and
+        under Helix CP + attention DP the engine registers no word. EPLB
+        statistics still count the dropped rows.
 
     ``repeat_idx`` advancement is done by ``ConfigurableMoE.forward_impl``
     after this scheduler returns. The scheduler must not rotate
@@ -1304,19 +1313,22 @@ class FusedCommMoEScheduler(MoEScheduler):
             routing_aux_chunks = _split_rows(
                 _leading_rows(routing_aux, x_real.shape[0]), all_rank_chunk_size_list[ep_rank]
             )
-        outputs = self._run_chunks(
-            x_chunks,
-            rl_chunks,
-            input_ids_chunks,
-            num_chunks=num_chunks,
-            x_real=x_real,
-            rl_real=rl_real,
-            all_rank_chunk_size_list=all_rank_chunk_size_list,
-            had_meta=had_meta,
-            output_dtype=output_dtype,
-            do_finalize=do_finalize,
-            routing_aux_chunks=routing_aux_chunks,
-        )
+        # With more than one chunk, each chunk's launches cover part of the forward's rows.
+        part = live_rows.part_of_the_forward() if num_chunks > 1 else contextlib.nullcontext()
+        with part:
+            outputs = self._run_chunks(
+                x_chunks,
+                rl_chunks,
+                input_ids_chunks,
+                num_chunks=num_chunks,
+                x_real=x_real,
+                rl_real=rl_real,
+                all_rank_chunk_size_list=all_rank_chunk_size_list,
+                had_meta=had_meta,
+                output_dtype=output_dtype,
+                do_finalize=do_finalize,
+                routing_aux_chunks=routing_aux_chunks,
+            )
         if not outputs:
             cast_dtype = output_dtype if output_dtype is not None else x.dtype
             return x.new_empty((0, x.shape[1]), dtype=cast_dtype)
@@ -1615,12 +1627,14 @@ class FusedCommMoEScheduler(MoEScheduler):
         # as expert IDs; otherwise the recorded routes are the slots routed to.
         # With the load balancer off, slots are expert IDs, so one recording
         # drives both arms.
+        statistic_allreduce_pending = False
         if uses_replica_plan:
             token_selected_experts = _record_routes(moe, token_selected_experts, moe.num_experts)
             token_selected_slots = moe._load_balancer_route(token_selected_experts, moe.use_dp)
             replica_plan = moe.layer_load_balancer.require_replica_plan()
         else:
             if moe.layer_load_balancer:
+                statistic_allreduce_pending = True
                 moe._load_balancer_done_wait_gpu_stage(is_first_call)
                 # ignore_allreduce=False: the fused kernel has no side channel
                 # for an external stats gather. The base helper runs its own
@@ -1636,6 +1650,14 @@ class FusedCommMoEScheduler(MoEScheduler):
                 token_selected_slots = token_selected_experts
             token_selected_slots = _record_routes(moe, token_selected_slots, moe.num_slots)
             replica_plan = None
+
+        # CuteDSL needs the scheduler's rank-identical chunk maximum to select
+        # one adaptive bucket on every EP rank; using a local token count could
+        # diverge and deadlock its in-kernel NVLink barrier. Set before the
+        # input quantization, which may write into that bucket's staging.
+        set_adaptive = getattr(moe.backend, "set_adaptive_launch_tokens", None)
+        if set_adaptive is not None:
+            set_adaptive(max(all_rank_num_tokens) if all_rank_num_tokens else None)
 
         # ----- quantize / prepare -----
         if getattr(moe.backend, "supports_fused_prepare", lambda: False)():
@@ -1656,14 +1678,13 @@ class FusedCommMoEScheduler(MoEScheduler):
                 x_chunk_real, reserved_sms=replica_plan.reserved_sms
             )
 
-        # CuteDSL needs the scheduler's rank-identical chunk maximum to select
-        # one adaptive bucket on every EP rank; using a local token count could
-        # diverge and deadlock its in-kernel NVLink barrier.
-        set_adaptive = getattr(moe.backend, "set_adaptive_launch_tokens", None)
-        if set_adaptive is not None:
-            set_adaptive(max(all_rank_num_tokens) if all_rank_num_tokens else None)
-
         # ----- MoE compute -----
+        # The fused kernel waits for the other ranks inside the kernel, so it
+        # must not run alongside the statistic allreduce on the load
+        # balancer's auxiliary stream (eager or replayed); routing,
+        # quantization and staging above still overlap it.
+        if statistic_allreduce_pending:
+            moe._load_balancer_wait_for_statistic_allreduce()
         # ``token_selected_slots`` is in [0, num_slots), matching the kernel's
         # ``num_experts`` template parameter (SymmBuffer / weights sized to
         # num_slots in quantization.py).
