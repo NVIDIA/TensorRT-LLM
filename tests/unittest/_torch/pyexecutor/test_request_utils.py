@@ -763,6 +763,38 @@ def test_python_logprob_response_snapshots(streaming, beam_width, simple_format)
         assert first_response.result.cum_log_probs == [-0.5]
 
 
+def test_streaming_logprobs_survive_a_response_without_result() -> None:
+    request = LlmRequest(
+        request_id=42,
+        max_new_tokens=10,
+        input_tokens=[1, 2, 3],
+        sampling_config=trtllm.SamplingConfig(),
+        is_streaming=True,
+        return_log_probs=True,
+        logprobs_simple_format=True,
+    )
+    request.state = LlmRequestState.GENERATION_IN_PROGRESS
+    request.add_new_tokens([4])
+    request.py_result.append_log_probs([[-0.5]])
+    first_response = request.create_response()
+    assert first_response.result.get_result().output_token_ids == [[4]]
+    assert first_response.result.log_probs == [[-0.5]]
+
+    # A recompute pause can land after a step's token and logprob were added,
+    # so the response built in that step has no native result.
+    request.add_new_tokens([5])
+    request.py_result.append_log_probs([[-0.25]])
+    request.reset_for_recompute(20)
+    assert request.create_response() is None
+
+    request.state = LlmRequestState.GENERATION_IN_PROGRESS
+    request.add_new_tokens([6])
+    request.py_result.append_log_probs([[-0.125]])
+    response = request.create_response()
+    assert response.result.get_result().output_token_ids == [[5, 6]]
+    assert response.result.log_probs == [[-0.25, -0.125]]
+
+
 @pytest.mark.parametrize("streaming", [False, True])
 def test_optional_tensor_results_are_python_owned(streaming) -> None:
     executor_request = trtllm.Request(

@@ -1209,6 +1209,10 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             indicating no output was generated for this request iteration.
         """
         result, is_final = super().create_serialized_result()
+        # Return before the streaming logprobs below are moved out of
+        # py_result: without a result nothing carries them to the client.
+        if len(result) == 0:
+            return None
 
         # When using beam search we cannot incrementically update the logprobs in the result.
         # Instead we need to update all logprobs. In that case no deep copy is needed.
@@ -1265,8 +1269,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             if not time_breakdown_metrics:
                 time_breakdown_metrics = None
 
-        if len(result) == 0:
-            return None
         llm_result = LlmResult(
             result,
             py_result,
