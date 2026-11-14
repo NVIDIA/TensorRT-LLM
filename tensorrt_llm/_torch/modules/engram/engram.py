@@ -1569,8 +1569,9 @@ class ShardedFp8MultiHeadEmbedding(nn.Module):
         self.dtype = dtype if dtype is not None else torch.bfloat16
         self.tp_size = tp_size
         self.tp_rank = tp_rank
-        # The HF loader fills pinned allocations in place; other loaders may replace them.
-        self._requires_standard_hf_loading = True
+        # Regular checkpoint loading fills pinned allocations in place; other loaders may
+        # replace them.
+        self._requires_regular_checkpoint_loading = True
         # Rebuild UVA views when host addresses change to avoid stale pointers.
         self._views: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         self._views_src: Optional[Tuple[int, int]] = None
