@@ -19,6 +19,7 @@ import re
 import subprocess
 import sys
 from collections import defaultdict
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -37,6 +38,26 @@ DB_DIR = os.path.join(REPO_ROOT, 'tests', 'integration', 'test_lists',
 # Sampling configuration
 MAX_SAMPLES = 10  # Small number for efficient testing
 MIN_PATTERN_LENGTH = 3  # Minimum length for search patterns
+
+
+@pytest.mark.parametrize('suffix', ['', '-{split}_of_8'])
+def test_generated_stage_mapping(tmp_path: Path, suffix: str) -> None:
+    """The mapping follows the actual split count rather than the eight-build cadence."""
+    groovy = tmp_path / 'L0_Test.groovy'
+    groovy.write_text(
+        'SBSASlurmTestConfigs += buildStageConfigs(\n'
+        f'    "GB300-PerfSanity-Post-Merge{suffix}", "auto:gb300-x4", "perf_context",\n'
+        '    3, 4, 1, true, false\n'
+        ')\n'
+        '// SBSASlurmTestConfigs += buildStageConfigs("Disabled", "x", "disabled", 1, 4, 1)\n'
+    )
+    stages, contexts = StageQuery._parse_stage_mapping(groovy)
+    expected = [
+        f'GB300-PerfSanity-Post-Merge-{k}' + ('_of_8' if suffix else '')
+        for k in range(1, 4)
+    ]
+    assert stages == dict.fromkeys(expected, 'perf_context.yml')
+    assert contexts == {'perf_context.yml': expected}
 
 
 def _stage_backed_tests(stage_query: StageQuery) -> list[str]:

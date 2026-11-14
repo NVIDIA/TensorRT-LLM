@@ -445,13 +445,18 @@ JSON. To reproduce the uploaded numbers offline, run
 
 Test lists are defined in `tests/integration/test_lists/test-db/`.
 
-### YAML File Naming Convention
+### Test List Naming Convention
 
-| Test Type | File Pattern | Example |
-|-----------|--------------|---------|
-| Single-node aggregated | `l0_{gpu_type}_multi_gpus_perf_sanity.yml` | `l0_b200_multi_gpus_perf_sanity.yml` |
-| Multi-node aggregated | `l0_{gpu_type}_multi_nodes_perf_sanity_node{node count}_gpu{gpu count per test}.yml` | `l0_gb200_multi_nodes_perf_sanity_node2_gpu8.yml` |
-| Multi-node disaggregated | `l0_{gpu_type}_multi_gpus_perf_sanity_ctx{ctx worker count}node{node count per ctx worker}_gpu{gpu count per ctx worker}_gen{gen worker count}node{node count per gen worker}_gpu{gen gpus per gen worker}.yml` | `l0_b200_multi_gpus_perf_sanity_ctx1node1_gpu8_gen1node1_gpu8.yml` |
+A test list is a top-level key of a test-db YAML file, and a Jenkins stage names its list (`trt-test-db --context`). One file can hold several lists: the perf-sanity lists of a GPU type share one file for single-node and one for multi-node stages, so CODEOWNERS (`*multi_gpu*`, `*multi_node*`) still routes their reviews.
+
+| Test Type | File | Test list | Example list |
+|-----------|------|-----------|--------------|
+| Single-node | `l0_{gpu_type}_multi_gpus_perf_sanity.yml` | `l0_{gpu_type}_multi_gpus_perf_sanity[_key_models]` | `l0_gb300_multi_gpus_perf_sanity_key_models` |
+| Multi-node aggregated | `l0_{gpu_type}_multi_nodes_perf_sanity.yml` | `l0_{gpu_type}_multi_nodes_perf_sanity_node{node count}_gpu{gpu count}` | `l0_gb200_multi_nodes_perf_sanity_node4_gpu16` |
+| Multi-node gen_only_no_context | `l0_{gpu_type}_multi_nodes_perf_sanity.yml` | `l0_{gpu_type}_multi_nodes_perf_sanity_gen1_node{node count}_gpu{gpu count}[_key_models]` | `l0_gb300_multi_nodes_perf_sanity_gen1_node2_gpu8_key_models` |
+| Multi-node disaggregated | `l0_{gpu_type}_multi_nodes_perf_sanity.yml` | `l0_{gpu_type}_multi_nodes_perf_sanity_ctx{ctx workers}_node{nodes per ctx worker}_gpu{gpus per ctx worker}_gen{gen workers}_node{nodes per gen worker}_gpu{gpus per gen worker}[_key_models]` | `l0_gb300_multi_nodes_perf_sanity_ctx12_node1_gpu4_gen1_node2_gpu8` |
+
+The optional `_key_models` suffix holds the key-model cases of a topology that other cases share, because the two run at different post-merge frequencies (see below).
 
 ### Jenkins Pipeline Configuration
 
@@ -477,6 +482,21 @@ Tests are defined in `jenkins/L0_Test.groovy` under the `launchTestJobs` functio
 | Disaggregated e2e test | Any | 1 | Always one test per stage |
 
 **Important**: Pre-merge and post-merge tests must be in separate stages.
+
+### Post-merge Run Frequency
+
+The official post-merge pipeline runs every perf-sanity stage once every N builds:
+
+| Cases | N |
+|-------|---|
+| Key models: DeepSeek-V4.1-Flash, Kimi-K3, MiniMax-M3, GLM-5.3-Flash and Mistral Large 4 (all modes) | 2 |
+| Every other perf-sanity case | 4 |
+
+The cadence is encoded in the stage name: `Stage-k_of_N` runs when the parent `BUILD_NUMBER % N == k % N`. For example, `-1_of_4` runs at remainder 1, `-2_of_4` at remainder 2, and `-4_of_4` at remainder 0. Stages without this suffix are not filtered by build number.
+
+`buildStageConfigs()` accepts a name template such as `Stage-{split}_of_4`. With three actual pytest splits, it generates only `-1_of_4`, `-2_of_4`, and `-3_of_4`; the fourth slot launches no stage of that list. Shard IDs larger than N wrap modulo N, so `-3_of_2` runs with `-1_of_2`. A stage with a single split is a literal stage entry that names its slot `k`, chosen so that every build carries a similar GPU load; each DeepSeek-V4-Pro `e2e` stage takes the slot of the `gen_only_no_context` stage of the same config. A test list holds cases of one frequency: where key-model and other cases share a topology, the key-model cases are in a `_key_models` list with a `-KeyModels-` stage.
+
+A PR's `/bot run --post-merge` runs no post-merge perf-sanity stage (a stage whose name contains both `PerfSanity` and `Post-Merge`); only the official post-merge pipeline runs them. The pre-merge perf-sanity stages run as in a plain `/bot run`. To run a post-merge perf-sanity stage on a PR, name it with `--stage-list` or `--extra-stage`.
 
 ### Pre-merge vs Post-merge Perf-Regression Gating
 
@@ -670,25 +690,28 @@ Each disagg test line in the test-db file follows one of these formats:
 Open `jenkins/L0_Test.groovy` and search for the `multiNodesSBSAConfigs` section inside `launchTestJobs()`. Disaggregated perf sanity stages are added via `buildStageConfigs()`:
 
 ```groovy
-def buildStageConfigs(stageName, platform, testlist, testCount, gpuCount, nodeCount, runWithSbatch=false)
+def buildStageConfigs(stageName, platform, testlist, splitCount, gpuCount, nodeCount,
+                      runWithSbatch=false, useClusterDurations=false)
 ```
 
 | Parameter | Description |
 |-----------|-------------|
-| `stageName` | CI stage name prefix (see naming convention below) |
+| `stageName` | CI name template with a `{split}` placeholder and `_of_N` cadence suffix (see below) |
 | `platform` | Hardware platform, e.g., `"auto:gb200-flex"` |
-| `testlist` | Test-db filename **without** `.yml`, e.g., `"l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4"` |
-| `testCount` | Number of **active (uncommented)** tests in the test-db file. Each disagg test gets its own stage, so `testCount` must equal the number of active tests. |
+| `testlist` | Test-db context (top-level key), e.g., `"l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4"` |
+| `splitCount` | Number of **active (uncommented)** tests in the test-db context. Each disagg test gets its own stage, so `splitCount` must equal the number of active tests. |
 | `gpuCount` | Total GPUs from Step 2 (= `total_nodes * gpus_per_node`) |
 | `nodeCount` | Total nodes from Step 2 |
 
 **Stage naming convention:**
 
 ```
-GB200-{gpuCount}_GPUs-{nodeCount}_Nodes-PyTorch-Disagg-PerfSanity-CTX{num_ctx}-NODE{nodes_per_ctx}-GPU{ctx_tp}-GEN{num_gen}-NODE{nodes_per_gen}-GPU{gen_tp}-Post-Merge
+GB200-{gpuCount}_GPUs-{nodeCount}_Nodes-PyTorch-Disagg-PerfSanity-CTX{num_ctx}-NODE{nodes_per_ctx}-GPU{ctx_tp}-GEN{num_gen}-NODE{nodes_per_gen}-GPU{gen_tp}-Post-Merge-{split}_of_{N}
 ```
 
-**If a `buildStageConfigs` entry already exists** for the test-db file: update `testCount` to match the new total number of active tests.
+Use N = 2 for a key model and N = 4 otherwise (see Post-merge Run Frequency); keep `{split}` literal for the generator. A context with a single test can instead be a literal entry that names its build slot, e.g. `"<stage name>-3_of_4": ["auto:gb300-flex", "<testlist>", 1, 1, <gpuCount>, <nodeCount>]`.
+
+**If a `buildStageConfigs` entry already exists** for the test-db file: update `splitCount` to match the new total number of active tests.
 
 **If no entry exists** for the test-db file: add a new `buildStageConfigs` block. Insert it in the correct section sorted by node count (2 Nodes, 3 Nodes, 4 Nodes, etc.).
 
@@ -706,5 +729,5 @@ Checking the existing `qwen3-235b-fp4_8k1k_con64_ctx1_tp1_gen1_tep4_eplb0_mtp0_c
 4. Test-db file: `l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4.yml`
 5. Locate `perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb200_qwen3-235b-fp4_8k1k_con64_ctx1_tp1_gen1_tep4_eplb0_mtp0_ccb-NIXL]`. It is currently active with `TIMEOUT (30)`; do not add a duplicate. Uncomment it only if it has been disabled.
 6. Recount the active tests after any edits.
-7. In `L0_Test.groovy`, find the `buildStageConfigs` for `l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4` and set `testCount` to that count, preserving it if unchanged.
+7. In `L0_Test.groovy`, find the `buildStageConfigs` for `l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4` and set `splitCount` to that count, preserving it if unchanged.
 8. Check `waives.txt` for the exact test ID before enabling the test.

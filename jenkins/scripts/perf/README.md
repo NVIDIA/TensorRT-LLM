@@ -324,15 +324,19 @@ In `jenkins/L0_Test.groovy`, search for `launchTestJobs`. Perf sanity stages are
 Disaggregated and multi-node perf sanity stages use `buildStageConfigs()`:
 
 ```groovy
-def buildStageConfigs(stageName, platform, testlist, testCount, gpuCount, nodeCount, runWithSbatch=false)
+def buildStageConfigs(stageName, platform, testlist, splitCount, gpuCount, nodeCount,
+                      runWithSbatch=false, useClusterDurations=false)
 ```
 
-- `testlist`: test-db YAML filename without `.yml` extension
-- `testCount`: must equal the number of **active (uncommented)** tests in the test-db file (each disagg test gets its own CI stage)
+- `testlist`: test-db context (top-level YAML key); several contexts may share a file
+- `splitCount`: number of actual pytest splits and generated stages. For multi-node tests, it must equal the number of **active (uncommented)** tests in the context (one test per stage).
 - `gpuCount`: total GPUs allocated per stage = `total_nodes * gpus_per_node`
 - `nodeCount`: total SLURM nodes per stage
+- `stageName`: a prefix for legacy `Stage-1` names, or a template such as `Stage-{split}_of_4`. Only the actual `splitCount` stages are generated. The `_of_N` suffix encodes the official post-merge cadence; no scheduling fields are added to the job configuration.
 
-When adding a test, either increment `testCount` on an existing entry or add a new `buildStageConfigs` block. Stages are grouped by node count (2 Nodes, 3 Nodes, 4 Nodes, etc.).
+For three cases that run once every four builds, use `Stage-{split}_of_4` with `splitCount=3`. This generates only `Stage-1_of_4`, `Stage-2_of_4`, and `Stage-3_of_4`, which run when the parent `BUILD_NUMBER % 4` is 1, 2, or 3 respectively. The fourth slot launches no stage for this group. The general rule is `BUILD_NUMBER % N == k % N`, so `-4_of_4` runs at remainder 0 and shard IDs larger than N wrap around. A stage with a single test is a literal entry that names its slot instead, e.g. `"Stage-3_of_4": [platform, testlist, 1, 1, gpuCount, nodeCount]`. Explicit `--stage-list` / `--extra-stage` selectors bypass the cadence.
+
+When adding a multi-node test, either increment `splitCount` on an existing entry or add a new `buildStageConfigs` block. Stages are grouped by node count (2 Nodes, 3 Nodes, 4 Nodes, etc.).
 
 For the full step-by-step guide including how to derive test-db filenames and GPU/node counts from disaggregated config YAMLs, see [`tests/integration/defs/perf/README_test_perf_sanity.md`](../../../tests/integration/defs/perf/README_test_perf_sanity.md) ("Step-by-Step: Adding or Re-enabling Disaggregated Perf Sanity Tests").
 

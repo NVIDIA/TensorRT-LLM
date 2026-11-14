@@ -38,7 +38,7 @@ logger = logging.getLogger("report_cbts_decision")
 
 
 _MULTI_GPU_RE = re.compile(r"\d+_GPUs")
-_STAGE_SHARD_SUFFIX_RE = re.compile(r"-\d+$")
+_STAGE_SHARD_SUFFIX_RE = re.compile(r"-\d+(_of_\d+)?(-cbts)?$")
 _ON_DEMAND_MARKER = "-OnDemand-"
 _POST_MERGE_MARKER = "Post-Merge"
 _PERF_SANITY_MARKER = "PerfSanity"
