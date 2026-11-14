@@ -131,12 +131,19 @@ def create_workspace_mnnvl(mapping, rows_max: int, num_layers: int) -> IdxkWorks
         comm.Free()
         raise RuntimeError("IDXK_SPLIT workspace creation failed on another rank")
     handle = _make_mnnvl_mcast_buffer(comm, max(words * 8, 4096), mapping, mapping.is_multi_node())
-    uc = handle.get_uc_buffer(mapping.tp_rank, (words,), torch.int64, 0)
-    mc = handle.get_mc_buffer((words,), torch.int64, 0)
-    init_local(uc, rows_max, num_layers)
-    torch.cuda.synchronize()
-    if not _mnnvl_workspace_all_succeeded(comm, True):
-        raise RuntimeError("IDXK_SPLIT workspace creation failed on another rank")
+    err = None
+    try:  # rank-local: a failure here is agreed below, so no rank is left waiting in the collective
+        uc = handle.get_uc_buffer(mapping.tp_rank, (words,), torch.int64, 0)
+        mc = handle.get_mc_buffer((words,), torch.int64, 0)
+        init_local(uc, rows_max, num_layers)
+        torch.cuda.synchronize()
+    except Exception as e:  # noqa: BLE001 - re-raised on every rank after the agreement
+        err = e
+    if not _mnnvl_workspace_all_succeeded(comm, err is None):
+        raise RuntimeError(
+            "IDXK_SPLIT workspace creation failed on "
+            + (f"this rank ({type(err).__name__}: {err})" if err is not None else "another rank")
+        ) from err
     return IdxkWorkspace(
         local=uc,
         rank=mapping.tp_rank,
