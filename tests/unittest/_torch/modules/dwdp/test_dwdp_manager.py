@@ -1095,7 +1095,9 @@ class TestConfigurableMoEDwdpCommunication(unittest.TestCase):
         mapping = SimpleNamespace(dwdp_enabled=dwdp_enabled, enable_attention_dp=True, dp_size=4)
         return SimpleNamespace(
             backend=SimpleNamespace(
-                scheduler_kind=MoESchedulerKind.EXTERNAL_COMM, supports_alltoall=False
+                scheduler_kind=MoESchedulerKind.EXTERNAL_COMM,
+                supports_alltoall=False,
+                quant_config=None,
             ),
             enable_dwdp=enable_dwdp,
             model_config=SimpleNamespace(mapping=mapping),

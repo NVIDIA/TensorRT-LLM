@@ -48,11 +48,187 @@ All published functionality in the Release Notes has been fully tested and verif
 
 ## TensorRT-LLM Release 1.3
 
+### Key Features and Enhancements
+
+- **Rubin Support (Preview)**
+  - Added preview support for NVIDIA Rubin (SM107), validated on Vera Rubin.
+  - Added DeepSeek-V4 and Kimi K3 support on Vera Rubin.
+
+- **Model Support**
+  - Added DeepSeek-V4 support on Blackwell and Rubin (preview).
+  - Added Kimi K3 support on Blackwell and Rubin (preview), including multimodal and multi-node serving. Attention data parallelism (DEP16) requires GB300-class GPU memory.
+  - Added Qwen3.5 support on Hopper, Blackwell and Rubin (preview), including MTP and NVFP4 on Blackwell, and Qwen3.6 and Qwen3.8-Flash-Next support on Blackwell.
+  - Added MiniMax-M3 support on Blackwell and Rubin (preview).
+  - Added GLM-5, GLM-5.2, Kimi-K2.5 and Step-3.7-Flash support on Blackwell.
+  - Added Nemotron Nano Omni support on Hopper and Blackwell.
+  - Added Gemma 4 support on Blackwell, including multimodal.
+  - Added Laguna support on Hopper and Blackwell.
+  - Added prefix caching for Mamba hybrid models, such as Qwen3.5 and Nemotron Super V3.
+
+- **Features**
+  - **Performance:**
+    - Optimized DeepSeek-V4, DeepSeek-V3.2, Qwen3.5, Gemma 4, MiniMax-M3 and Kimi K3 with model-specific kernel fusions.
+    - Added locality domain (uGPU) localization for NVFP4 MoE on Rubin, which keeps memory traffic local to each GPU die. It is enabled by default; set `DISABLE_LOCALITY_DOMAINS=1` to disable it.
+    - Reduced host overhead with async preprocessing and sync-free beam search, and reduced startup time with checkpoint read-ahead.
+    - Added cascade attention and low-M BF16 GEMM dispatch for SM10x.
+  - **Disaggregated Serving:**
+    - Added gen-first scheduling, conversation affinity routing, beam search and hybrid model support.
+    - Added disaggregated serving for Qwen3.8-Flash-Next.
+  - **Speculative Decoding:**
+    - Added DSpark, DFlash, Suffix Automaton and PARD drafters.
+    - Added EAGLE3 dynamic trees, Eagle 3.1 draft models and speculative decoding with LoRA.
+    - Added rejection sampling for one-model paths and acceptance-rate-based auto-disable for dynamic speculation.
+    - Added loading MTP weights from standalone checkpoints.
+  - **Parallelism and MoE:**
+    - Added DWDP (Distributed Weight Data Parallelism), extended Helix context parallelism, and a KV cache-aware attention-DP router.
+    - Added the `DENSEGEMM`, `MEGAMOE_DEEPGEMM`, `MEGAMOE_CUTEDSL`, `CUTEDSL_FC12` (Rubin only) and `MARLIN` MoE backends.
+    - Added an NCCL-EP backend and support for up to 2048 experts.
+    - Added Router Replay (`return_routed_experts`) to return per-token MoE routing for RL training.
+  - **KV Cache:**
+    - KV Cache Manager V2 is selected per model and enabled by default for most model families.
+    - Added KV cache compression (TriAttention and NVFP4 cold-page compression), NVFP4 KV cache and disk cache.
+    - Added per-conversation block reuse and exact multimodal KV block hashing.
+    - Added FlexKV and LMCache connectors.
+  - **Quantization:**
+    - Added MXFP8 (W8A8) linear and MoE support, including MXFP8 checkpoints such as MiniMax-M3.
+    - Added W4A16 NVFP4 weight-only quantization through Marlin, so NVFP4 checkpoints run on Hopper and Ada Lovelace.
+    - Added tunable NVFP4 quantization.
+    - Added support for both legacy and ModelOpt 1.x quantization config formats.
+  - **Sparse Attention:** Added DSA FP4/FP8 decode kernels, GVR Top-K, Skip Softmax Attention (with optional 2:4 activation sparsity on Rubin) and MiniMax-M3 MSA.
+  - **Serving and APIs:**
+    - Added the Anthropic Messages API (`/v1/messages`) and extended the Responses API.
+    - Added a gRPC server and multi-process HTTP frontends.
+    - Added per-request `priority` and named-function `tool_choice` to the OpenAI-compatible APIs.
+    - Added `auto` tool and reasoning parser selection, and GLM-4.7, GLM-5 and Laguna tool parsers.
+    - Added Prometheus metrics and `/start_profile` and `/stop_profile` profiling endpoints.
+    - Added `trtllm-serve` options `--served_model_name`, `--kv_cache_dtype` and `--middleware`.
+    - Added Completions API logprobs and acceptance of `parallel_tool_calls`.
+  - **Sampling and LoRA:**
+    - Added `min_p`, `bad_words`, repetition/frequency/presence penalties, full beam search options and processed logprobs to TorchSampler.
+    - Added an experimental `thinking_token_budget` for reasoning models.
+    - Added multi-LoRA serving with CUDA graphs, per-expert MoE LoRA and dense FP8 LoRA.
+  - **Others:**
+    - Added prefix-aware scheduling, enabled by default, to avoid duplicate prefill of shared prefixes.
+    - Added prefill and breakable CUDA Graph support, and custom attention masks in the TRTLLM attention backend.
+    - Added a multimodal encoder cache and CUDA graphs for multimodal encoders.
+    - Added inflight weight updates for RL workflows.
+    - Added `/v1/embeddings` and an `llm.encode()` fast path for encoder-only models.
+    - Added prototype ModelExpress checkpoint loading.
+
+- **Documentation**
+  - **Migration Guide:** Added the [TensorRT Backend Removed migration guide](legacy/tensorrt-backend-removal.md).
+  - **Deployment Guides:** Added deployment guides for GLM-5, Kimi K3, MiniMax-M3, Nemotron 3, Qwen3.8-Flash-Next and Qwen3.8/Qwen3.5.
+  - **Feature Documentation:** Added guides for KV cache compression, embeddings, ModelExpress, sub-agent routing and encoder-decoder models, and restructured the installation guide.
+  - **Developer Guides:** Added guides for sparse attention, KV cache compression, telemetry and custom kernels.
+  - **Tech Blogs:** Published blogs on:
+    - "[Accelerating Long-Context Inference with Skip Softmax Attention](./blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.md)"
+    - "[Sparse Attention in TensorRT LLM](./blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.md)"
+    - "[Optimizing MoE Communication with One-Sided AlltoAll Over NVLink](./blogs/tech_blog/blog18_Optimizing_MoE_Communication_with_One_Sided_AlltoAll_Over_NVLink.md)"
+    - "[DWDP: Distributed Weight Data Parallelism for High-Performance LLM Inference on NVL72](./blogs/tech_blog/blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.md)"
+    - "[Tuning CUDA Graph Batch Sizes for Higher Output Throughput](./blogs/tech_blog/blog20_Tuning_CUDA_Graph_Batch_Sizes_for_Higher_Output_Throughput.md)"
+    - "[Temporal Correlation Meets Sparse Attention: Guess-Verify-Refine Top-K for Blackwell](./blogs/tech_blog/blog21_Temporal_Correlation_Meets_Sparse_Attention.md)"
+    - "[Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding](./blogs/tech_blog/blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.md)"
+    - "[Joint Optimization of Agent Applications and TensorRT-LLM](./blogs/tech_blog/blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.md)"
+    - "[MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell](./blogs/tech_blog/blog24_MoE_as_Dense_GEMM.md)"
+    - "[DeepSeek-V4 on NVIDIA Blackwell: Model-Specific and Agentic-Workload Optimizations in TensorRT LLM](./blogs/tech_blog/blog26_DeepSeek_V4_on_NVIDIA_Blackwell_Model_Specific_and_Agentic_Workload_Optimizations_in_TensorRT-LLM.md)"
+    - "[Evaluating Agentic Serving with Trace Replay and Job-Level Metrics](./blogs/tech_blog/blog27_Evaluating_Agentic_Serving_with_Trace_Replay_and_Job_Level_Metrics.md)"
+    - "[GVR V2: Self-Sampling and Multi-Thresholding for Faster Exact Top-K](./blogs/tech_blog/blog29_GVR_V2_Self_Sampling_Exact_TopK_for_Sparse_Attention.md)"
+  - Tech blogs 1–9 were renamed to `blog01`–`blog09`, and links to the old file names were updated.
+
+### VisualGen
+
+VisualGen is a new vertical solution in TensorRT-LLM for image and video generation models. It is served through `trtllm-serve` alongside LLM inference. See the [VisualGen documentation](models/visual-generation.md) for details.
+
+- **Models**
+  - Added image generation models: FLUX.1, FLUX.2, GLM-Image and Qwen-Image, including Qwen-Image-Edit and Qwen-Image-Layered.
+  - Added video generation models: Wan 2.2 (including 5B TI2V and FastWan), LTX-2, HunyuanVideo 1.5, Cosmos3 and MiniMax-H3.
+- **Features**
+  - Added image generation, image editing and video generation endpoints in `trtllm-serve`.
+  - Added tensor, context and CFG parallelism, NVFP4 and FP8 quantization, CUDA graphs and runtime LoRA.
+  - Added TeaCache and Cache-DiT caching, sparse attention, and FlashAttention 4, FlashInfer and cuDNN attention backends.
+  - Added a `trtllm-eval` pipeline for VisualGen models.
+- **Documentation**
+  - [VisualGen examples](https://nvidia.github.io/TensorRT-LLM/examples/visual_gen_examples.html)
+  - Published tech blogs on:
+    - "[Scaling Video Generation Across NVL72 rack with TensorRT-LLM](./blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.md)"
+    - "[Accelerating Video Generation with GEMM Quantization, Attention Quantization and Skip Softmax Attention in TensorRT-LLM](./blogs/tech_blog/blog28_Accelerating_Video_Generation_with_GEMM_Quantization_Attention_Quantization_and_Skip_Softmax_Attention_in_TensorRT-LLM.md)"
+- **Known Issues**
+  - FLUX.1 checkpoints statically quantized and exported by NVIDIA Model Optimizer may fail to initialize because the exported transformer config sets `out_channels` to null.
+
+### Infrastructure Changes
+
+- The base Docker image for TensorRT-LLM is updated to `nvcr.io/nvidia/pytorch:26.09-py3`.
+- The base Docker image for TensorRT-LLM Backend is updated to `nvcr.io/nvidia/tritonserver:26.09-py3`.
+- The dependent CUDA Toolkit version is updated to 13.4.1.
+- The dependent public PyTorch version is updated to 2.14.0.
+- Python 3.10 and 3.12 are supported.
+- TensorRT LLM now provides two sets of pre-built Python wheels, each compatible with a different PyTorch build:
+  - Upstream public PyTorch: wheels are hosted on PyPI.
+  - NGC PyTorch container: wheels are released through https://pypi.nvidia.com/trtllm_ngcpytorch/.
+- TensorRT, NVIDIA ModelOpt and ONNX are no longer dependencies of TensorRT-LLM.
+- The dependent transformers version is updated to 5.5.4.
+- The dependent flashinfer-python version is updated to 0.6.18.
+- The dependent triton version is updated to 3.8.0.
+- The dependent NCCL version is updated to 2.31.2.
+- The dependent NIXL version is updated to 1.4.0.
+- The dependent UCX version is updated to 1.22.
+- The dependent CUTLASS version is updated to 4.4.2.
+- The dependent xgrammar version is updated to 0.1.32.
+- The C++ standard is updated to C++20.
+
 ### API Changes
 
+- <span style="color: red">**[BREAKING CHANGE] TensorRT backend removed.**</span> PyTorch is the only backend. `trtllm-build`, `TrtLlmArgs`, `BuildConfig`, `MedusaDecodingConfig`, `LookaheadDecodingConfig`, `trtllm-bench build` and `trtllm-bench --engine_dir` are removed. See the [migration guide](legacy/tensorrt-backend-removal.md).
+- <span style="color: red">**[BREAKING CHANGE] Legacy C++ Executor and runtime APIs removed.**</span> The C++ `Executor` API, the legacy runtime and batch-manager APIs, and the `cpp_only` build option are removed.
+- <span style="color: red">**[BREAKING CHANGE] TensorRT-engine Triton backend models removed.**</span> Only the `llmapi` Triton model remains.
+- <span style="color: red">**[BREAKING CHANGE] TRTLLMSampler removed.**</span> `TorchSampler`, which requires FlashInfer, is the only sampler. The `sampler_type` argument is ignored with a warning, and `disable_flashinfer_sampling` is removed.
+- <span style="color: red">**[BREAKING CHANGE] Two-model speculative decoding removed.**</span> The `eagle3_one_model` and `mtp_eagle_one_model` fields are removed; use the one-model implementations.
+- <span style="color: red">**[BREAKING CHANGE] AutoDeploy, Star Attention and WIDEEP removed.**</span> AutoDeploy and Star Attention are removed, and the WIDEEP MoE backend can no longer be selected.
+- <span style="color: red">**[BREAKING CHANGE] CLI flags override YAML config.**</span> Explicit `trtllm-serve`, `trtllm-eval` and `trtllm-bench` flags now take precedence over YAML config values.
+- <span style="color: red">**[BREAKING CHANGE] KV cache transfer timeout defaults to 60 seconds.**</span> Previously there was no timeout; set it with `cache_transceiver_config.kv_transfer_timeout_ms`.
+- <span style="color: red">**[BREAKING CHANGE] Per-request chat templates are opt-in.**</span> Enable them with `trtllm-serve --allow_request_chat_template`.
+- <span style="color: red">**[BREAKING CHANGE] Logprobs capped at 100.**</span> Larger `logprobs` or `prompt_logprobs` values raise a `ValueError`.
+- <span style="color: red">**[BREAKING CHANGE] `/perf_metrics` endpoint removed.**</span> Use the `X-TRTLLM-return-metrics: 1` request header instead.
+- <span style="color: red">**[BREAKING CHANGE] Dynamic speculation fields renamed.**</span> Use `acceptance_rate_window_size` and `acceptance_rate_threshold`; the threshold is now an acceptance rate in [0, 1].
+- <span style="color: red">**[BREAKING CHANGE] Obsolete options removed.**</span> This includes Eagle `choices` and `trtllm-serve --fail_fast_on_attention_window_too_large`.
 - NVFP4 cold-page compression remains opt-in and disabled by default. When enabled for DeepSeek-V4, NoPE uses NVFP4 and RoPE now defaults to 2FP4 (`nvfp4_residual_dim=64`). Set `skip_rope_quantization=True` to keep RoPE at its original precision, as before, or `nvfp4_residual_dim=0` to use single NVFP4. The active GPU KV-cache dtype is unchanged. See the [NVFP4 cold-page compression example](source:examples/kv_cache_compression/nvfp4_cold_page.md#deepseek-v4).
-
 - **[DEPRECATION]** The TRITON MoE backend (`TritonFusedMoE`, `moe_config.backend="TRITON"`) is deprecated as of TensorRT-LLM 1.3 (2026-09) and will be removed after the 3-month migration period. Its only remaining role is a modest performance edge for GPT-OSS on Hopper with `W4A16_MXFP4` — the single configuration `AUTO` resolves to TRITON, and the format an MXFP4 GPT-OSS checkpoint takes on SM90. As the model set and the supported platforms keep growing, a single-scenario MoE path is no longer worth its maintenance cost. `moe_config.backend="CUTLASS"` replaces it functionally on Hopper: it serves `W4A16_MXFP4` on SM90 along with the unquantized BF16 and FP8 per-tensor paths, and MoE backend resolution already degrades to it automatically when TRITON declines a layer. During the migration period TRITON keeps working and logs a one-time warning. See the [deprecation policy](https://github.com/NVIDIA/TensorRT-LLM#deprecation-policy).
+- **[DEPRECATION]** The `trtllm-serve` options `--backend`, `--moe_cluster_parallel_size` and `--metrics-log-interval`, and the `trtllm-eval` option `--backend`, are deprecated.
+- **[DEPRECATION]** `TorchCompileConfig.enable_piecewise_cuda_graph` and `capture_num_tokens`, `MTPDecodingConfig.num_nextn_predict_layers`, and `perf_metrics_max_requests` are deprecated.
+- **[DEPRECATION]** Disaggregated serving without `internal_request_auth_key` is deprecated. Set the same key in the disaggregated server config and every worker config.
+- Usage telemetry is on by default. To opt out, set `TRTLLM_NO_USAGE_STATS=1` or `DO_NOT_TRACK=1`, pass `--no-telemetry` to the CLI, or set `telemetry_config=TelemetryConfig(disabled=True)` in the LLM API. See the [telemetry guide](developer-guide/telemetry.md).
+- GPT-OSS defaults to the TRTLLM MoE backend on Blackwell.
+- `TorchCompileConfig.max_num_streams` now defaults to 3 instead of 1.
+
+### Fixed Issues
+
+- **Disaggregated Serving:**
+  - Fixed a hang with context pipeline parallelism and generation tensor parallelism, a known issue in 1.2.
+  - Fixed hangs with block reuse after eviction and gen-only asynchronous KV transfer.
+  - Fixed an error on one rank crashing all generation ranks.
+- **Attention:**
+  - Fixed an illegal memory access when `max_seq_len` exceeds `max_position_embeddings`.
+  - Fixed an XQA race condition, attention sink accuracy and a sliding window illegal memory access.
+  - Fixed FP8 accuracy with Skip Softmax Attention.
+  - Fixed a DeepSeek-V3.2 illegal memory access with CUDA graphs and host KV cache offload.
+- **Speculative Decoding:** Fixed EAGLE3 crashes on Qwen3-235B-A22B NVFP4 and MTP crashes on Nemotron Super on Hopper.
+- **KV Cache:** Fixed accuracy loss with VSWA and block reuse, and free-block counter corruption with host offload.
+- **Pipeline Parallelism:** Fixed hangs with MTP, guided decoding and executor shutdown.
+- **MoE:** Fixed a DeepEP hang caused by non-deterministic garbage collection.
+- **Kernels:** Fixed Qwen2.5 mixed-precision accuracy, two-shot AllReduce accuracy and FP8 block-scale GEMM NaN outputs.
+- **Sampling:** Fixed `ignore_eos` suppressing the wrong token in TorchSampler, and NaN sampling parameters are now rejected.
+- **General:** Fixed encoder-decoder beam search corruption and out-of-memory errors with many LoRA adapters or during checkpoint prefetch.
+
+### Known Issues
+
+- Kimi-K3 NVFP4 may fail to load its tokenizer with the bundled transformers version.
+- In disaggregated serving with DSpark speculative decoding, the draft KV cache is not transferred to the generation worker, which lowers the acceptance rate. Aggregated serving is not affected.
+- GLM-5.2 NVFP4 on GB200 (TP=8, attention DP disabled) may segfault during warmup when `max_num_tokens` is greater than 4096. Keep `max_num_tokens` at 4096 or lower.
+- Disaggregated serving of Nemotron-3-Super-120B-A12B FP8 on B300 may fail when concurrency exceeds the maximum batch size.
+- Disaggregated serving of Qwen3-32B-FP8 on B300 may produce incorrect output.
+- The `/v1/responses` endpoint has compatibility gaps with some input formats, streaming events, conversation continuation and tool calls (Qwen3, GPT-OSS).
+- Encoder-decoder models with an FP8 KV cache can overrun the cross-attention KV cache pool, causing an illegal memory access or incorrect output.
+- Qwen3-32B with TP=4 on AWS p4d (A100) may segfault during autotuner warmup when the `aws-ofi-nccl` plugin is enabled.
 
 ## TensorRT-LLM Release 1.2
 
