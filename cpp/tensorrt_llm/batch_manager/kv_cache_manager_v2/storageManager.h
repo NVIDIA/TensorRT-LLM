@@ -28,8 +28,10 @@
 #include "kv_cache_manager_v2/storage/core.h"
 #include "tensorrt_llm/common/assert.h"
 
+#include <cstdint>
 #include <deque>
 #include <functional>
+#include <list>
 #include <map>
 #include <memory>
 #include <optional>
@@ -44,6 +46,7 @@ class Page;
 class KvCache;
 class CopyEngine;
 class StagingBufferManager;
+struct BackgroundDiskWrites; // utils/copyUtils.h
 
 using MigrationRecorder
     = std::function<void(std::vector<SharedPtr<Page>> const&, std::vector<Slot> const&, CacheLevel, CacheLevel)>;
@@ -80,10 +83,12 @@ struct StorageStatistics
     SlotCount total;     // total slots
     SlotCount free;      // free (unallocated) slots
     SlotCount evictable; // scheduled for eviction
+    // Retained disk copies: duplicates of pages that live in a hotter level, released when the level needs the room.
+    SlotCount retainedCopies{0};
 
     SlotCount available() const noexcept
     {
-        return free + evictable;
+        return free + evictable + retainedCopies;
     }
 
     SlotCount unavailable() const noexcept
@@ -347,6 +352,34 @@ public:
         return mSlotUtilFracMax.at(lcId);
     }
 
+    // Keep-disk-copy: a committed page restored from disk keeps its (immutable) disk slot as a retained copy and
+    // takes it back on its next eviction there, skipping the write. At the last level, pages whose only copy is there
+    // are evicted first (least recently used first): retained copies belong to more recently used pages. Retained
+    // copies are then reclaimed oldest first.
+
+    //! Called from Page::~Page: releases the page's retained copy, if any.
+    void onPageDestroyed(Page& page) noexcept;
+
+    [[nodiscard]] SlotCount numRetainedCopies(
+        CacheLevel level, std::optional<PoolGroupIndex> pgIdx = std::nullopt) const;
+
+    //! Retained disk copy counters. With one disk tier, retained == created - reused - reclaimed - dropped.
+    struct DiskCopyCounters
+    {
+        uint64_t retained{0};      //!< Retained copies held now.
+        uint64_t created{0};       //!< Copies created: kept after a restore or written through.
+        uint64_t reused{0};        //!< Evictions that took a copy's slot back instead of writing.
+        uint64_t reusedPending{0}; //!< Of `reused`, copies whose write-through was still running: the eviction waited
+                                   //!< for it instead of writing again. How much write-through and eviction overlap.
+        uint64_t reclaimed{0};     //!< Copies released to make room, on resize, or because their write failed.
+        uint64_t dropped{0};       //!< Copies released because their page was destroyed.
+        uint64_t writeThroughPages{0};   //!< Pages written through.
+        uint64_t writeThroughSkipped{0}; //!< Eligible pages not written through: no free disk slot, no background
+                                         //!< write budget, or the tier's protected copy share is full.
+    };
+
+    [[nodiscard]] DiskCopyCounters diskCopyCounters() const noexcept;
+
     friend class KvCacheManager;
     // White-box test introspection reaches computePoolGroupSlotsForBatch() via friendship
     // (mirrors Python's _compute_slots_for_batch).
@@ -541,6 +574,57 @@ private:
     static constexpr size_t kIndexStagingBytes = 256u << 10u;
     // Allocated only when a codec requests device indices; protected through codec completion.
     std::unique_ptr<StagingBufferManager> mIndexStagingManager;
+
+    struct RetainedCopy
+    {
+        Page* page;
+        CacheLevel level;
+        PoolGroupIndex pgIdx;
+        Slot slot;
+        // Set while a fallen page is about to take this slot back, so reclaiming skips it.
+        bool reserved;
+        // The write-through that made this copy, while it may still be running; promoted if an eviction takes the
+        // copy back before it finishes. Null for copies kept after a restore.
+        std::shared_ptr<BackgroundDiskWrites const> write;
+    };
+
+    using RetainedCopyList = std::list<RetainedCopy>;
+
+    void addRetainedCopy(Page& page, CacheLevel level, PoolGroupIndex pgIdx, Slot slot,
+        std::shared_ptr<BackgroundDiskWrites const> write = nullptr);
+    //! Takes \p page's retained copy at \p level back as its slot. If the copy's write is still running, it is
+    //! promoted to a required write; the slot's ready event orders the page after it.
+    [[nodiscard]] std::optional<Slot> takeRetainedCopy(Page const& page, CacheLevel level);
+    //! Whether \p page has a reusable retained copy at \p level: its write is still running, or has finished
+    //! without error. A copy whose write failed is released instead. A running write that later fails leaves the
+    //! page where a failed required write would.
+    bool validateRetainedCopy(Page const& page, CacheLevel level);
+    bool reserveRetainedCopy(Page const& page, CacheLevel level, bool reserve) noexcept;
+    void releaseRetainedCopies(CacheLevel level, PoolGroupIndex pgIdx, SlotCount count);
+    void releaseAllRetainedCopies(std::optional<CacheLevel> level);
+    void eraseRetainedCopy(RetainedCopyList::iterator iter);
+
+    TypedVec<CacheLevel, bool> mKeepCopyAfterRestoreAt;   // per level: keepCopyAfterRestore of that disk tier
+    TypedVec<CacheLevel, float> mProtectedCopyFractionAt; // per level: protectedCopyFraction of that disk tier
+    //! Retained copies the pool group may hold ahead of pages whose only copy is at \p level.
+    [[nodiscard]] SlotCount protectedCopyShare(CacheLevel level, PoolGroupIndex pgIdx) const;
+    // Oldest first.
+    RetainedCopyList mRetainedCopies;
+    std::unordered_map<Page const*, RetainedCopyList::iterator> mRetainedByPage;
+    TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotCount>> mNumRetainedCopies;
+    DiskCopyCounters mDiskCopyCounters; // `retained` is filled in by diskCopyCounters()
+
+    // Write-through: pages evicted GPU -> host are also copied to free disk slots as retained copies, as background
+    // writes. It never evicts or reclaims anything to make room.
+    void writeThroughToDisk(CacheLevel hostLevel, std::vector<SharedPtr<Page>> const& pages);
+    // Completion event of a write-through still reading this host page, or a null event. The caller waits for it,
+    // so a pending write is promoted to a required one.
+    [[nodiscard]] CachedCudaEvent pendingDiskWrite(Page const& page) const;
+    // If the copy's write is still in flight, promote it to a required write (something is about to wait for it) and
+    // return true.
+    bool promoteIfPending(RetainedCopy const& copy) const;
+    bool mDiskWriteThrough{false};              // any disk tier writes through
+    TypedVec<CacheLevel, bool> mWriteThroughAt; // per level: writeThrough of that disk tier
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

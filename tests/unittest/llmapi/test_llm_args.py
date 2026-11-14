@@ -2055,6 +2055,111 @@ def test_KvCacheConfig_disk_cache_validation(tmp_path):
 
 
 @pytest.mark.cpu_only
+def test_KvCacheConfig_disk_offload_options(tmp_path):
+    default = KvCacheConfig()
+    assert default.disk_io_threads == 0
+    assert default.disk_keep_copy_after_restore is False
+    assert default.disk_write_through is False
+    assert default.disk_protected_copy_fraction == 1.0
+
+    config = KvCacheConfig(disk_cache_size=2048,
+                           disk_cache_path=str(tmp_path),
+                           disk_io_threads=16,
+                           disk_keep_copy_after_restore=True,
+                           disk_write_through=True)
+    assert config.disk_io_threads == 16
+    assert config.disk_keep_copy_after_restore is True
+    assert config.disk_write_through is True
+
+    disk = {"disk_cache_size": 2048, "disk_cache_path": str(tmp_path)}
+    # Write-through does not need keep-copy, only the I/O pool.
+    config = KvCacheConfig(**disk, disk_io_threads=4, disk_write_through=True)
+    assert config.disk_write_through is True
+    assert config.disk_keep_copy_after_restore is False
+
+    with pytest.raises(ValidationError,
+                       match="disk_write_through requires disk_io_threads"):
+        KvCacheConfig(**disk, disk_write_through=True)
+
+    # The options do nothing without a disk tier or with KV cache manager v1.
+    with pytest.raises(ValidationError,
+                       match="disk_io_threads requires disk_cache_size"):
+        KvCacheConfig(disk_io_threads=4)
+    with pytest.raises(
+            ValidationError,
+            match="disk_keep_copy_after_restore requires disk_cache_size"):
+        KvCacheConfig(disk_keep_copy_after_restore=True)
+    with pytest.raises(ValidationError,
+                       match="requires use_kv_cache_manager_v2"):
+        KvCacheConfig(**disk, disk_io_threads=4, use_kv_cache_manager_v2=False)
+    with pytest.raises(ValidationError):
+        KvCacheConfig(**disk, disk_io_threads=257)
+    KvCacheConfig(**disk, disk_io_threads=256)
+    # Without block reuse they only warn: there is nothing for them to act on.
+    KvCacheConfig(**disk,
+                  disk_keep_copy_after_restore=True,
+                  enable_block_reuse=False)
+
+    with pytest.raises(ValidationError):
+        KvCacheConfig(disk_io_threads=-1)
+
+    config = KvCacheConfig(**disk,
+                           disk_io_threads=4,
+                           disk_write_through=True,
+                           disk_protected_copy_fraction=0.25)
+    assert config.disk_protected_copy_fraction == 0.25
+    for fraction in (-0.1, 1.5):
+        with pytest.raises(ValidationError):
+            KvCacheConfig(**disk, disk_protected_copy_fraction=fraction)
+    with pytest.raises(
+            ValidationError,
+            match="disk_protected_copy_fraction requires disk_cache_size"):
+        KvCacheConfig(disk_protected_copy_fraction=0.5)
+    # Without retained copies it only warns: there is nothing for it to limit.
+    KvCacheConfig(**disk, disk_protected_copy_fraction=0.5)
+
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import DiskCacheTierConfig
+
+    tier = DiskCacheTierConfig(2048, str(tmp_path))
+    assert tier.num_io_threads == 0
+    assert tier.keep_copy_after_restore is False
+    assert tier.write_through is False
+    assert tier.protected_copy_fraction == 1.0
+    tier.validate()
+
+    tier = DiskCacheTierConfig(2048,
+                               str(tmp_path),
+                               num_io_threads=16,
+                               keep_copy_after_restore=True,
+                               write_through=True)
+    tier.validate()
+    assert tier.num_io_threads == 16
+
+    DiskCacheTierConfig(2048,
+                        str(tmp_path),
+                        num_io_threads=4,
+                        write_through=True).validate()
+    with pytest.raises(ValueError, match="writeThrough requires numIoThreads"):
+        DiskCacheTierConfig(2048, str(tmp_path), write_through=True).validate()
+    with pytest.raises(ValueError,
+                       match="numIoThreads must be between 0 and 256"):
+        DiskCacheTierConfig(2048, str(tmp_path), num_io_threads=-1).validate()
+    with pytest.raises(ValueError,
+                       match="numIoThreads must be between 0 and 256"):
+        DiskCacheTierConfig(2048, str(tmp_path), num_io_threads=257).validate()
+    DiskCacheTierConfig(2048, str(tmp_path),
+                        protected_copy_fraction=0.0).validate()
+    for fraction in (-0.5, 1.5, float("nan")):
+        with pytest.raises(
+                ValueError,
+                match="protectedCopyFraction must be between 0 and 1"):
+            DiskCacheTierConfig(2048,
+                                str(tmp_path),
+                                protected_copy_fraction=fraction).validate()
+    DiskCacheTierConfig(2048, str(tmp_path), num_io_threads=256).validate()
+
+
+@pytest.mark.cpu_only
 class TestMultimodalEncoderCudaGraphConfig:
 
     def test_automatic_buckets_need_only_max_batch_size(self):

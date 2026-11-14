@@ -5088,12 +5088,44 @@
           "description": "Size of the disk cache in bytes. Only used by KV cache manager v2 in the PyTorch backend.",
           "title": "Disk Cache Size"
         },
+        "disk_io_threads": {
+          "default": 0,
+          "description": "Worker threads for asynchronous disk KV cache I/O. The pool is process-wide: the first KV cache manager that sets a nonzero value starts it for the life of the process, and later values, including 0, do not change it. Without a pool, each disk transfer is a blocking read/write loop in a CUDA host callback, and CUDA may run host callbacks one at a time, so disk transfers can serialize. Only used by KV cache manager v2 with a disk cache.",
+          "maximum": 256,
+          "minimum": 0,
+          "status": "prototype",
+          "title": "Disk Io Threads",
+          "type": "integer"
+        },
+        "disk_keep_copy_after_restore": {
+          "default": false,
+          "description": "Keep a reusable block's disk copy after restoring it from disk, so evicting it to disk again writes nothing. Only used by KV cache manager v2 with a disk cache.",
+          "status": "prototype",
+          "title": "Disk Keep Copy After Restore",
+          "type": "boolean"
+        },
         "disk_prefetch_num_reqs": {
           "default": 0,
           "description": "Number of queued context requests to prefetch disk-tier KV cache blocks to host for. Set to 0 to disable prefetch. Only effective with KV cache manager v2 and block reuse enabled.",
           "minimum": 0,
           "title": "Disk Prefetch Num Reqs",
           "type": "integer"
+        },
+        "disk_protected_copy_fraction": {
+          "default": 1.0,
+          "description": "Share of the disk cache that the copies kept by `disk_keep_copy_after_restore` and `disk_write_through` may hold ahead of blocks stored only on disk. When the disk is full, copies beyond this share are dropped before any of those blocks, and write-through makes no copy beyond it. 1.0 keeps copies ahead of all of them, which saves the most writes; lower values keep more distinct blocks on disk when disk capacity, not write bandwidth, limits reuse. Only used by KV cache manager v2 with a disk cache.",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "status": "prototype",
+          "title": "Disk Protected Copy Fraction",
+          "type": "number"
+        },
+        "disk_write_through": {
+          "default": false,
+          "description": "When a reusable block is evicted from GPU to host, also copy it to disk in the background, so its later host-to-disk eviction writes nothing. Copies use free disk space only and are written after restores and evictions. Requires `disk_io_threads` > 0. Only used by KV cache manager v2 with a disk cache.",
+          "status": "prototype",
+          "title": "Disk Write Through",
+          "type": "boolean"
         },
         "dtype": {
           "default": "auto",

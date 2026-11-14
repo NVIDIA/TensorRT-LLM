@@ -398,6 +398,35 @@ physically duplicate the whole prompt; ownership splits at the prompt tail:
 - CUDA virtual memory and copy operations use the driver/runtime APIs directly.
   Keep allocation granularity, stream ordering, and source/destination lifetime
   valid through asynchronous copies.
+- Retained disk copies (`disk_keep_copy_after_restore`, `disk_write_through`):
+  a disk slot can keep a copy of a page that lives in a hotter level. They are
+  tracked in `StorageManager` (`mRetainedCopies` oldest first, `mRetainedByPage`),
+  not by the eviction controller. Every path that frees, reuses, or resizes a
+  disk slot must account for them: an eviction to disk takes the copy's slot back
+  (`takeRetainedCopy`), a full last level drops LRU disk-only pages before
+  reclaiming copies, `adjustCacheLevel` releases only the copies of pool groups
+  that shrink, and `~Page` calls `onPageDestroyed` before its slot is released.
+  Copies beyond the tier's `protectedCopyFraction` share are released before
+  any disk-only page, and write-through creates none beyond it
+  (`protectedCopyShare`). Only full committed pages get copies
+  (`hasFinalContent`). A copy is reusable while its write is in flight or after
+  it completed without error (`validateRetainedCopy`); taking back an in-flight
+  copy promotes its write-through to a required write
+  (`promoteBackgroundDiskWrites`) and counts `reused_pending`. Storage
+  statistics report copies as `retainedCopies`, not as `evictable`.
+  `disk_copy_counters` keeps `retained == created - reused - reclaimed - dropped`
+  with one disk tier; tests assert it.
+- A write-through copy reads the host page while its write is in flight, and its
+  completion event lives only on the retained disk slot. Anything that releases
+  that host slot must merge `pendingDiskWrite()` into the slot's ready event.
+  Write-through takes free disk slots only, never evicts or reclaims, and a
+  failure skips the copy instead of failing the eviction that triggered it.
+- Async disk I/O (`utils/copyUtils.cpp`, `disk_io_threads`) is a process-wide
+  pool that starts at the first nonzero value and lives for the process. A
+  transfer is split into 4 MiB pieces; the stream waits on a completion flag in
+  device-mapped host memory with `cuStreamWaitValue64`, or in a host function
+  when that is unavailable or fails. Pieces are served reads first, then
+  required writes, then background writes, with aging so no queue starves.
 
 ## Testing a change here
 
@@ -668,6 +697,7 @@ Use extra review and tests for changes involving:
 - partial attention coverage, SSM checkpoints, SWA windows/sinks, or final
   snapshots;
 - CUDA stream/event lifetime or host-memory registration;
+- retained disk copies, write-through, or the disk I/O pool and its completion flags;
 - `KvCache` commit state, beam forks, reuse rebasing, or page-index buffers;
 - nanobind GIL release, callbacks, non-owning buffers, or exception translation.
 

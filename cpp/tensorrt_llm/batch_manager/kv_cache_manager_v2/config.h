@@ -100,6 +100,28 @@ struct DiskCacheTierConfig
     size_t quota = 0; // bytes
     std::string path; // directory for temp files
 
+    //! Upper bound of numIoThreads, matching KvCacheConfig.disk_io_threads.
+    static constexpr int kMaxIoThreads = 256;
+
+    //! Worker threads for asynchronous disk I/O, 0 to kMaxIoThreads. Process-wide: the first nonzero value starts the
+    //! pool for the life of the process, and later values, including 0, do not change it. Without a pool, disk I/O is
+    //! synchronous.
+    int numIoThreads = 0;
+
+    //! Keep a committed page's disk copy after a restore, so its next eviction to disk writes nothing.
+    bool keepCopyAfterRestore = false;
+
+    //! Also copy pages evicted GPU -> host to disk in the background, into free disk slots only and behind restores
+    //! and required writes. Requires numIoThreads > 0 and a host tier right above this disk tier.
+    bool writeThrough = false;
+
+    //! Share of this tier's slots, 0 to 1, that retained copies (from keepCopyAfterRestore or writeThrough) may hold
+    //! ahead of pages whose only copy is on disk. When the tier runs short, copies beyond the share are released
+    //! before any of those pages is evicted, and write-through creates no copy beyond it. Copies within the share are
+    //! released only for what evicting those pages cannot cover. 1 favors saving writes (write-bound deployments); a
+    //! lower value keeps more distinct pages on disk (capacity-bound deployments).
+    float protectedCopyFraction = 1.0F;
+
     [[nodiscard]] CacheTier tier() const noexcept
     {
         return CacheTier::DISK;

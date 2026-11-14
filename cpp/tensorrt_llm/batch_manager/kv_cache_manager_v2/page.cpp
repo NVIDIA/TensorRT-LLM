@@ -56,6 +56,7 @@ Page::~Page()
                 "Page destroyed while still held or scheduled for eviction");
             if (hasValidSlot())
             {
+                manager->onPageDestroyed(*this);
                 Slot s;
                 s.setSlotId(slotId());
                 s.readyEvent = std::move(readyEvent);

@@ -17,6 +17,7 @@
 
 #include "kv_cache_manager_v2/storage/core.h"
 
+#include "kv_cache_manager_v2/utils/copyUtils.h"
 #include "kv_cache_manager_v2/utils/funcGuard.h"
 
 #include "tensorrt_llm/common/assert.h"
@@ -470,6 +471,10 @@ void DiskSlotPool::destroy()
 {
     if (mFd != kBadFileDescriptor)
     {
+        // This file's transfers are normally done by now: the pool group synchronizes its slots' ready events, which
+        // are recorded after each transfer's completion wait, before destroying them. The wait guards the descriptor
+        // against any piece still in flight. It is process-wide, so it also waits for other managers' disk I/O.
+        waitForDiskIo();
         ::close(mFd);
         mFd = kBadFileDescriptor;
     }

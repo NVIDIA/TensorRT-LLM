@@ -352,6 +352,64 @@ When offloading is enabled, `KvCacheConfig.cold_tier_offload_min_priority` contr
 
 Here is an [example](../../../examples/llm-api/llm_kv_cache_offloading.py) to show how to enable host offloading.
 
+### Offloading to Disk (KV Cache Manager V2)
+
+KV cache manager V2 can add a disk tier below host memory. Blocks evicted from host memory are written to
+files in `disk_cache_path` and stay reusable until they are evicted from disk; reusing one copies it back
+through host memory. The disk tier is enabled with `disk_cache_size` (bytes, per rank) and
+`disk_cache_path`, and requires `use_kv_cache_manager_v2: true`. A disk tier without a host tier is
+allowed, but the options below that involve the host tier then have no effect.
+`disk_prefetch_num_reqs` starts copying the disk-resident prefix blocks of that many queued context
+requests to host memory ahead of time (0 disables it; it requires block reuse).
+
+Four prototype options reduce the cost of disk I/O. The first three are off by default:
+
+| Option | Effect |
+|---|---|
+| `disk_io_threads` | Runs disk reads and writes on this many worker threads instead of in a CUDA host callback, so several transfers proceed at once and a restore does not wait behind an eviction write. Reads are served first, then eviction writes, then background (write-through) writes; a write that has waited too long is served ahead of that order. Range 0-256. |
+| `disk_keep_copy_after_restore` | When a block is restored from disk, its disk copy is kept. If the block is evicted to disk again, it takes that copy back instead of being written again. |
+| `disk_write_through` | When a block is evicted from GPU to host memory, it is also copied to disk in the background, so its later host-to-disk eviction writes nothing. These copies use free disk space only: on a full disk the copy is skipped and the block is written when it is evicted, as without this option. If the block is evicted to disk while its copy is still being written, the eviction takes the copy and waits for that write, which then runs ahead of other background writes, instead of writing the block again. Requires `disk_io_threads` > 0 and a host tier (`host_cache_size` > 0); without a host tier it is turned off with a warning. |
+| `disk_protected_copy_fraction` | Share of the disk tier, 0.0-1.0 (default 1.0), that the copies kept by the two options above may hold ahead of blocks whose only copy is on disk. See below. |
+
+`disk_keep_copy_after_restore` and `disk_write_through` are independent; either can be used alone. They act
+only on blocks that are fully computed and reusable, so they have no effect when block reuse is disabled.
+A disk copy kept by either option is a duplicate of a block that lives in a hotter tier. It saves a disk
+write, but it takes disk space that could hold a block whose only copy is on disk, so the two compete
+when the disk tier is full. `disk_protected_copy_fraction` sets the balance:
+
+- Copies within the share (`disk_protected_copy_fraction` x the disk tier's blocks) come first. When the
+  disk tier is full, it drops the least recently used blocks whose only copy is on disk, and releases
+  these copies (oldest first) only when that is not enough.
+- Copies beyond the share are released first, before any of those blocks, and write-through makes no
+  copy beyond it.
+
+The default of 1.0 protects every copy, which saves the most writes and suits deployments limited by disk
+write bandwidth. A lower value keeps more distinct blocks on disk, which suits deployments whose reuse is
+limited by disk capacity. 0.0 keeps copies only while there is free disk space.
+
+Disk-tier storage statistics report the copies apart from evictable blocks (`retained_copies`, and
+`secondaryRetainedCopyNumBlocks` in the per-iteration KV cache statistics), and count them as available,
+since the tier releases them when it needs the room.
+
+The worker pool is shared by the whole process: the first KV cache manager that sets a nonzero
+`disk_io_threads` starts it, and later values, including 0, do not change it (a warning is logged when a
+value is ignored).
+
+Setting any of these options to a non-default value without `disk_cache_size` > 0, or with KV cache manager
+V1, is rejected, and `disk_write_through` without `disk_io_threads` > 0 is rejected.
+
+```yaml
+kv_cache_config:
+  use_kv_cache_manager_v2: true
+  enable_block_reuse: true
+  host_cache_size: 171798691840   # 160 GiB
+  disk_cache_size: 1099511627776  # 1 TiB
+  disk_cache_path: /raid/kv_cache
+  disk_io_threads: 16
+  disk_keep_copy_after_restore: true
+  disk_write_through: true
+```
+
 KV cache compression can reduce the storage and transfer cost of offloaded
 Pages, or reduce the amount of KV retained by an algorithm. Compression is
 configured separately from `KvCacheConfig`; see

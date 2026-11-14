@@ -703,7 +703,27 @@
     {
       "capture_policy": "int",
       "kind": "value",
+      "path": "kv_cache_config.disk_io_threads"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "kv_cache_config.disk_keep_copy_after_restore"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
       "path": "kv_cache_config.disk_prefetch_num_reqs"
+    },
+    {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "kv_cache_config.disk_protected_copy_fraction"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "kv_cache_config.disk_write_through"
     },
     {
       "allowed_values": [

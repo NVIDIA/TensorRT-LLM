@@ -5338,6 +5338,42 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description=
         "Directory used for disk KV cache files. Must be set when `disk_cache_size` is positive."
     )
+    disk_io_threads: NonNegativeInt = Field(
+        default=0,
+        le=256,
+        status="prototype",
+        description=
+        "Worker threads for asynchronous disk KV cache I/O. The pool is process-wide: the first KV cache manager "
+        "that sets a nonzero value starts it for the life of the process, and later values, including 0, do not "
+        "change it. Without a pool, each disk transfer is a blocking read/write loop in a CUDA host callback, "
+        "and CUDA may run host callbacks one at a time, so disk transfers can serialize. Only used by KV "
+        "cache manager v2 with a disk cache.")
+    disk_keep_copy_after_restore: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "Keep a reusable block's disk copy after restoring it from disk, so evicting it to disk again writes "
+        "nothing. Only used by KV cache manager v2 with a disk cache.")
+    disk_write_through: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "When a reusable block is evicted from GPU to host, also copy it to disk in the background, so its "
+        "later host-to-disk eviction writes nothing. Copies use free disk space only and are written after "
+        "restores and evictions. Requires `disk_io_threads` > 0. Only used by KV cache manager v2 with a disk "
+        "cache.")
+    disk_protected_copy_fraction: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        status="prototype",
+        description=
+        "Share of the disk cache that the copies kept by `disk_keep_copy_after_restore` and `disk_write_through` "
+        "may hold ahead of blocks stored only on disk. When the disk is full, copies beyond this share are dropped "
+        "before any of those blocks, and write-through makes no copy beyond it. 1.0 keeps copies ahead of all of "
+        "them, which saves the most writes; lower values keep more distinct blocks on disk when disk capacity, "
+        "not write bandwidth, limits reuse. Only used by KV cache manager v2 with a disk cache."
+    )
     cross_kv_cache_fraction: Optional[float] = Field(
         default=None,
         description=
@@ -5788,6 +5824,43 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             if not os.path.isdir(self.disk_cache_path):
                 raise ValueError(
                     f"kv_cache_config.disk_cache_path {self.disk_cache_path} does not exist or is not a directory"
+                )
+        if self.disk_write_through and self.disk_io_threads == 0:
+            raise ValueError(
+                "kv_cache_config.disk_write_through requires disk_io_threads > 0"
+            )
+        disk_options = [
+            name for name, value in (
+                ("disk_io_threads", self.disk_io_threads > 0),
+                ("disk_keep_copy_after_restore",
+                 self.disk_keep_copy_after_restore),
+                ("disk_write_through", self.disk_write_through),
+                ("disk_protected_copy_fraction",
+                 self.disk_protected_copy_fraction != 1.0),
+            ) if value
+        ]
+        if disk_options:
+            if not self.disk_cache_size:
+                raise ValueError(
+                    f"kv_cache_config.{', '.join(disk_options)} requires disk_cache_size > 0"
+                )
+            if self.use_kv_cache_manager_v2 is False:
+                raise ValueError(
+                    f"kv_cache_config.{', '.join(disk_options)} requires use_kv_cache_manager_v2"
+                )
+            if not self.enable_block_reuse and (
+                    self.disk_keep_copy_after_restore
+                    or self.disk_write_through):
+                logger.warning(
+                    "kv_cache_config.disk_keep_copy_after_restore and disk_write_through have no effect with "
+                    "enable_block_reuse=False: they act only on reusable blocks."
+                )
+            if (self.disk_protected_copy_fraction != 1.0
+                    and not (self.disk_keep_copy_after_restore
+                             or self.disk_write_through)):
+                logger.warning(
+                    "kv_cache_config.disk_protected_copy_fraction has no effect without "
+                    "disk_keep_copy_after_restore or disk_write_through: there are no disk copies to limit."
                 )
         return self
 
