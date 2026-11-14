@@ -1995,6 +1995,7 @@ def _autotune_helpers(torch):
         "_DEFAULT_TOKEN_BACK_READY_GRANULARITY",
         "_TOKEN_BACK_READY_GRANULARITIES",
         "_TACTIC_LEN",
+        "_TACTIC_LEN_V5",
         "_TACTIC_LEN_V4",
         "_LEGACY_TACTIC_LEN",
         "_FLAG_BATCH_MAX",

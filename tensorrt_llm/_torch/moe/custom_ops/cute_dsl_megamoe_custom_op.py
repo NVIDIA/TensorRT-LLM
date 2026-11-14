@@ -157,7 +157,9 @@ _MEGAMOE_GRAPH_CAPTURE_SEEN: bool = False
 #    fc2_tma_stages,      # optional staged-bulk depth
 #    flag_batch,          # int >= 1 (standalone_warps requires == 1)
 #    epi_flag_batch,      # (int, int) fc1/fc2 done-counter publish batch
-#    token_back_ready_granularity)  # "expert" | "token_tile"
+#    token_back_ready_granularity,  # "expert" | "token_tile"
+#    combine_dedup)       # bool: one reduced FC2 row per destination rank
+#                         # (SM107 generic kernel only; never a gen-phase bucket)
 #
 # Derived / out-of-tuple:
 #   use_2cta_instrs      = (mma_tiler_mnk[0] == 256), derived in _build_kernel.
@@ -166,7 +168,8 @@ _MEGAMOE_GRAPH_CAPTURE_SEEN: bool = False
 # Tuple wrapping makes the tactic hashable, which AutoTuner needs for the
 # tactics cache.
 
-_TACTIC_LEN = 11
+_TACTIC_LEN = 12
+_TACTIC_LEN_V5 = 11
 _TACTIC_LEN_V4 = 10
 _LEGACY_TACTIC_LEN = 8
 _DEFAULT_TOKEN_BACK_READY_GRANULARITY = "expert"  # nosec B105 -- scheduler mode name, not a credential
@@ -270,17 +273,19 @@ def _megamoe_tuning_op_name(helper_expert_count: int) -> str:
 
 
 def _unpack_tactic(tactic: Tuple) -> Tuple:
-    """Return the canonical 11 fields, accepting the v4 10- and v3 8-tuples.
+    """Return the canonical 12 fields, accepting the v5 11-, v4 10- and v3 8-tuples.
 
     Legacy tactics map ``static`` to grid-stride work IDs and preserve their
     grouped scheduling hint. Their single-stage bulk store is represented
     explicitly so old autotuner cache entries keep identical code generation.
     Pre-v5 tactics take ``token_back_ready_granularity="expert"`` -- the only
     value this op compiled before the field entered the tuple, so a cache
-    written by an older build keeps its exact meaning.
+    written by an older build keeps its exact meaning. Pre-v6 tactics take
+    ``combine_dedup=False`` for the same reason.
     Validation remains centralized in :func:`validate_megamoe_tactic`.
     """
     token_back_ready_granularity = _DEFAULT_TOKEN_BACK_READY_GRANULARITY
+    combine_dedup = False
     if len(tactic) == _LEGACY_TACTIC_LEN:
         (
             mma_tiler,
@@ -330,7 +335,9 @@ def _unpack_tactic(tactic: Tuple) -> Tuple:
             flag_batch,
             epi_flag_batch,
             token_back_ready_granularity,
-        ) = tactic
+        ) = tactic[:_TACTIC_LEN_V5]
+        if len(tactic) == _TACTIC_LEN:
+            combine_dedup = tactic[_TACTIC_LEN_V5]
 
     return (
         mma_tiler,
@@ -344,6 +351,7 @@ def _unpack_tactic(tactic: Tuple) -> Tuple:
         flag_batch,
         epi_flag_batch,
         token_back_ready_granularity,
+        combine_dedup,
     )
 
 
@@ -409,6 +417,7 @@ def default_megamoe_tactic(num_tokens: int) -> Tuple:
             1,
             (1, 1),
             _DEFAULT_TOKEN_BACK_READY_GRANULARITY,
+            False,
         )
     if num_tokens <= 8192:
         return (
@@ -423,6 +432,7 @@ def default_megamoe_tactic(num_tokens: int) -> Tuple:
             4,
             (1, 1),
             _DEFAULT_TOKEN_BACK_READY_GRANULARITY,
+            False,
         )
     # Use the atomic work distributor for the upper token bucket.
     return (
@@ -437,14 +447,17 @@ def default_megamoe_tactic(num_tokens: int) -> Tuple:
         8,
         (2, 4),
         _DEFAULT_TOKEN_BACK_READY_GRANULARITY,
+        False,
     )
 
 
 # Static defaults for the explicitly keyed SM107 configurations. Routing is not
 # rank-identical, so each bucket uses one deterministic tactic. The complete
 # runner key prevents applying an entry to a different shape or codegen mode.
-_SM107_DSV4_PRO_DEFAULT_TACTICS: dict[Tuple, Tuple] = {
-    (
+def _sm107_dsv4_pro_problem_key(
+    world_size: int, num_experts_per_rank: int, max_tokens_per_rank: int
+) -> Tuple:
+    return (
         107,
         world_size,
         6,
@@ -463,7 +476,11 @@ _SM107_DSV4_PRO_DEFAULT_TACTICS: dict[Tuple, Tuple] = {
         None,
         None,
         0,
-    ): (
+    )
+
+
+_SM107_DSV4_PRO_DEFAULT_TACTICS: dict[Tuple, Tuple] = {
+    _sm107_dsv4_pro_problem_key(world_size, num_experts_per_rank, max_tokens_per_rank): (
         list(mma_tiler),
         [4, 1, 1],
         [2, 1, 1],
@@ -498,6 +515,44 @@ _SM107_DSV4_PRO_DEFAULT_TACTICS: dict[Tuple, Tuple] = {
         flag_batch,
     ) in bucket_tactics.items()
 }
+
+# DSv4-Pro (world_size, num_experts_per_rank) -> inclusive max_tokens_per_rank range whose
+# default turns combine_dedup on. Only buckets measured faster are listed: dedup trims the
+# combine traffic by the duplicate-destination rate, which falls as the world size grows.
+# EP16 stays off: its best bucket gained ~4.5% but the dedup combine region holds 16 rows
+# per token instead of top-k's 6, about 1.2 GB more shared workspace per rank.
+_SM107_DSV4_PRO_COMBINE_DEDUP_TOKENS: dict[Tuple[int, int], Tuple[int, int]] = {
+    (4, 96): (8192, 32768),
+    (8, 48): (4096, 16384),
+}
+
+
+def _sm107_default_combine_dedup(problem_key: Tuple) -> bool:
+    tokens = _SM107_DSV4_PRO_COMBINE_DEDUP_TOKENS.get((problem_key[1], problem_key[3]))
+    return (
+        tokens is not None
+        and tokens[0] <= problem_key[7] <= tokens[1]
+        and _sm107_tactic_bucket(problem_key[7]) is None
+        and problem_key
+        == _sm107_dsv4_pro_problem_key(problem_key[1], problem_key[3], problem_key[7])
+    )
+
+
+def _with_combine_dedup(tactic: Tuple) -> Tuple:
+    """Return ``tactic`` with combine dedup and the token-back settings it needs.
+
+    Dedup pushes the reduced rows from the dispatch warps, which need the N256
+    tile and a bulk FC2 store; the remaining fields keep the shape default.
+    """
+    tactic = list(_unpack_tactic(tactic))
+    tactic[0] = [tactic[0][0], 256, tactic[0][2]]
+    tactic[5] = "reuse_dispatch_warps"
+    tactic[6] = True
+    if tactic[7] is None:
+        tactic[7] = 1
+    tactic[8] = 1
+    tactic[11] = True
+    return tuple(tactic)
 
 
 # Static default for the SM107 Kimi K3 NVFP4 generation-phase shape at EP4. The full runner
@@ -791,8 +846,11 @@ def _default_megamoe_tactic_for_problem(
     return default_megamoe_tactic(num_tokens)
 
 
-def _default_megamoe_tactic_for_key(problem_key: Tuple, *, num_tokens: int) -> Tuple:
-    return _default_megamoe_tactic_for_problem(
+def _default_megamoe_tactic_for_key(
+    problem_key: Tuple, *, num_tokens: int, combine_dedup: bool = True
+) -> Tuple:
+    """Default tactic for ``problem_key``; ``combine_dedup=False`` returns it without the dedup rule."""
+    tactic = _default_megamoe_tactic_for_problem(
         sm_version=problem_key[0],
         max_tokens_per_rank=problem_key[7],
         num_tokens=num_tokens,
@@ -802,6 +860,9 @@ def _default_megamoe_tactic_for_key(problem_key: Tuple, *, num_tokens: int) -> T
         shape_tuned_tactic=_SM107_DSV4_PRO_DEFAULT_TACTICS.get(problem_key),
         genphase_shape_tuned_tactic=_SM107_KIMI_K3_GENPHASE_TACTICS.get(problem_key),
     )
+    if combine_dedup and _sm107_default_combine_dedup(problem_key):
+        return _with_combine_dedup(tactic)
+    return tactic
 
 
 def _megamoe_default_tactic_candidates(tactic: Tuple) -> Tuple[Tuple, ...]:
@@ -997,6 +1058,14 @@ def _construct_megamoe_kernel(
         )
     if common["fc2_tma_stages"] is not None:
         impl_values["fc2_tma_stages"] = int(common["fc2_tma_stages"])
+    bucket = _sm107_tactic_bucket(int(common["max_tokens_per_rank"])) if sm_version == 107 else None
+    genphase = bucket is not None and bucket not in _SM107_GENERIC_KERNEL_BUCKETS
+    if common.get("combine_dedup", False):
+        # Only the SM107 generic kernel declares the option; ImplDesc drops undeclared keys,
+        # so any other kernel would silently build without it.
+        if sm_version != 107 or genphase:
+            raise ValueError("combine_dedup applies to the SM107 generic MegaMoE kernel only.")
+        impl_values["combine_dedup"] = True
     impl_desc = ImplDesc(impl_values)
 
     def construct(kernel_cls):
@@ -1028,9 +1097,8 @@ def _construct_megamoe_kernel(
             )
         return kernel
 
-    bucket = _sm107_tactic_bucket(int(common["max_tokens_per_rank"])) if sm_version == 107 else None
     rejection = None
-    if bucket is not None and bucket not in _SM107_GENERIC_KERNEL_BUCKETS:
+    if genphase:
         try:
             return construct_genphase(), None
         except (ValueError, TypeError, NotImplementedError) as exc:
@@ -1075,11 +1143,12 @@ def validate_megamoe_tactic(tactic: Tuple, sm_version: int = 100) -> None:
     """
     if (not isinstance(tactic, tuple)) or len(tactic) not in {
         _TACTIC_LEN,
+        _TACTIC_LEN_V5,
         _TACTIC_LEN_V4,
         _LEGACY_TACTIC_LEN,
     }:
         raise ValueError(
-            f"MegaMoE tactic must be a {_TACTIC_LEN}-tuple (or legacy "
+            f"MegaMoE tactic must be a {_TACTIC_LEN}-tuple (or legacy {_TACTIC_LEN_V5}- / "
             f"{_TACTIC_LEN_V4}- / {_LEGACY_TACTIC_LEN}-tuple), got "
             f"{type(tactic).__name__} len={len(tactic) if isinstance(tactic, tuple) else 'NA'}={tactic!r}"
         )
@@ -1096,6 +1165,7 @@ def validate_megamoe_tactic(tactic: Tuple, sm_version: int = 100) -> None:
         flag_batch,
         epi_flag_batch,
         token_back_ready_granularity,
+        combine_dedup,
     ) = _unpack_tactic(tactic)
 
     if (not isinstance(mma_tiler, (list, tuple))) or len(mma_tiler) != 3:
@@ -1292,6 +1362,27 @@ def validate_megamoe_tactic(tactic: Tuple, sm_version: int = 100) -> None:
                 "token_back_ready_granularity='token_tile' is unmet by: " + "; ".join(unmet)
             )
 
+    if not isinstance(combine_dedup, bool):
+        raise ValueError(f"combine_dedup must be bool, got {combine_dedup!r}.")
+    if combine_dedup:
+        # Tactic-local half of the kernel's combine_dedup guard; the problem-level
+        # half (top-k at FC1, BF16 combine, world size <= 32) raises at construction.
+        unmet = []
+        if sm_version != 107:
+            unmet.append(f"SM{sm_version} (need the SM107 generic kernel)")
+        if token_back_mode == "epi_warps":  # nosec B105 -- token-back mode name, not a credential
+            unmet.append(
+                "token_back_mode='epi_warps' (need 'standalone_warps' or 'reuse_dispatch_warps')"
+            )
+        if not use_bulk_fc2_store:
+            unmet.append("use_bulk_fc2_store=False (need True, FC2 staged in SMEM)")
+        if token_back_ready_granularity != "expert":  # nosec B105 -- scheduler mode name, not a credential
+            unmet.append(
+                f"token_back_ready_granularity={token_back_ready_granularity!r} (need 'expert')"
+            )
+        if unmet:
+            raise ValueError("combine_dedup=True is unmet by: " + "; ".join(unmet))
+
 
 def _expand_megamoe_ready_tactics(
     candidates: list[Tuple], sm_version: int, *, load_balance: bool
@@ -1324,7 +1415,7 @@ def _expand_megamoe_ready_tactics(
     expanded = []
     for base in candidates:
         for granularity in choices:
-            tactic = (*_unpack_tactic(base)[:_TACTIC_LEN_V4], granularity)
+            tactic = (*_unpack_tactic(base)[:_TACTIC_LEN_V4], granularity, False)
             try:
                 validate_megamoe_tactic(tactic, sm_version=sm_version)
             except ValueError:
@@ -2199,6 +2290,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 flag_batch,
                 epi_flag_batch,
                 token_back_ready_granularity,
+                combine_dedup,
             ) = _unpack_tactic(candidate)
             mma_tiler = tuple(mma_tiler)
             (
@@ -2244,6 +2336,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 in_kernel_fc2_reduce=bool(in_kernel_fc2_reduce),
                 token_back_mode=str(token_back_mode),
                 token_back_ready_granularity=str(token_back_ready_granularity),
+                combine_dedup=bool(combine_dedup),
                 non_ubulk_fc2_store=(not bool(use_bulk_fc2_store)),
                 flag_batch=int(flag_batch),
                 epi_flag_batch=tuple(epi_flag_batch),
@@ -2262,7 +2355,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             )
             return probe
 
-        probe, _ = _resolve_megamoe_kernel_tactic(
+        probe, resolved = _resolve_megamoe_kernel_tactic(
             tactic,
             allow_fallback=use_default_tactic,
             build=build,
@@ -2271,6 +2364,17 @@ if IS_MEGAMOE_OP_AVAILABLE:
         # otherwise the provider carves an undersized shared region and the
         # combine staging writes OOB (single-rank IMA; EP>1 looks like a hang).
         _, shared_bytes = probe.get_workspace_sizes()
+        if use_default_tactic and _unpack_tactic(resolved)[11]:
+            # A dedup default's combine region holds world_size rows per token, the
+            # non-dedup one top-k rows; autotuned tactics never dedup, so fit both.
+            plain, _ = _resolve_megamoe_kernel_tactic(
+                _default_megamoe_tactic_for_key(
+                    problem_key, num_tokens=max_tokens_per_rank, combine_dedup=False
+                ),
+                allow_fallback=True,
+                build=build,
+            )
+            shared_bytes = max(shared_bytes, plain.get_workspace_sizes()[1])
         return int(shared_bytes), isinstance(probe, RubinInferenceGenphaseMegaMoE)
 
     def _megamoe_autotune_num_tokens(shapes: List[torch.Size]) -> int:
@@ -2463,6 +2567,14 @@ if IS_MEGAMOE_OP_AVAILABLE:
                     default_tactic = _unpack_tactic(default_tactic)
                     if default_tactic not in candidates:
                         candidates.append(default_tactic)
+            # The provider fits a dedup default and its non-dedup base (see
+            # query_megamoe_kernel_properties); no other dedup tactic is sized for.
+            if _sm107_default_combine_dedup(self.unique_id()):
+                default_tactic = _default_megamoe_tactic_for_key(
+                    self.unique_id(), num_tokens=num_tokens
+                )
+                if default_tactic not in candidates:
+                    candidates.append(default_tactic)
             choices = _token_back_ready_granularity_choices(
                 load_balance=self.helper_expert_count > 0
             )
@@ -2626,6 +2738,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 flag_batch,
                 epi_flag_batch,
                 token_back_ready_granularity,
+                combine_dedup,
             ) = _unpack_tactic(tactic)
             (
                 launch_cluster_count,
@@ -2670,6 +2783,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 in_kernel_fc2_reduce=self.in_kernel_fc2_reduce,
                 token_back_mode=str(token_back_mode),
                 token_back_ready_granularity=str(token_back_ready_granularity),
+                combine_dedup=bool(combine_dedup),
                 non_ubulk_fc2_store=(not bool(use_bulk_fc2_store)),
                 flag_batch=int(flag_batch),
                 epi_flag_batch=tuple(epi_flag_batch),
@@ -2714,6 +2828,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 flag_batch,
                 epi_flag_batch,
                 token_back_ready_granularity,
+                combine_dedup,
             ) = _unpack_tactic(tactic)
             launch_config = _launch_cluster_configuration(
                 cluster_shape,
@@ -2733,6 +2848,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 int(flag_batch),
                 tuple(epi_flag_batch),
                 str(token_back_ready_granularity),
+                bool(combine_dedup),
                 launch_config,
             )
 
