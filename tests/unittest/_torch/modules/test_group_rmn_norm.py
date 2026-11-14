@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -129,7 +129,7 @@ def test_group_rms_norm_base(batch_size, hidden_dims, eps, dtype,
 
 @torch.inference_mode()
 @pytest.mark.parametrize("batch_size", [1, 4], ids=lambda x: f"batch:{x}")
-@pytest.mark.parametrize("hidden_dims", [[256, 512], [8448, 1024]],
+@pytest.mark.parametrize("hidden_dims", [[256, 256], [256, 512], [8448, 1024]],
                          ids=lambda x: f"dims:{'-'.join(str(d) for d in x)}")
 @pytest.mark.parametrize("eps", [1e-6, 1e-5], ids=lambda x: f"eps:{x}")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16],
