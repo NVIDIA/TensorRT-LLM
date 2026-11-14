@@ -2245,6 +2245,18 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "manager", [](kv::KvCache& self) -> kv::KvCacheManager& { return self.manager(); },
             nb::rv_policy::reference_internal)
         .def_prop_ro("committed_tokens", &committedTokensList)
+        .def("_get_committed_prefix_key",
+            [](kv::KvCache const& self, int numTokens) -> nb::object
+            {
+                std::optional<kv::BlockKey> key;
+                {
+                    nb::gil_scoped_release release;
+                    key = self.committedPrefixKey(numTokens);
+                }
+                if (!key)
+                    return nb::none();
+                return nb::bytes(reinterpret_cast<char const*>(key->data()), key->size());
+            })
         .def_prop_ro("reuse_scope", &kv::KvCache::reuseScope)
         .def(
             "plan_committed_block_drop", [](kv::KvCache& self) { return self.planCommittedBlockDrop(); },
