@@ -13,6 +13,30 @@
       "scenario": "Max Throughput"
     },
     {
+      "command": "trtllm-serve nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4 --config ${TRTLLM_DIR}/examples/configs/curated/nemotron-3.5-super-vl-hyperdrive-b200.yaml",
+      "config_filename": "nemotron-3.5-super-vl-hyperdrive-b200.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/nemotron-3.5-super-vl-hyperdrive-b200.yaml",
+      "config_path": "examples/configs/curated/nemotron-3.5-super-vl-hyperdrive-b200.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/curated/nemotron-3.5-super-vl-hyperdrive-b200.yaml",
+      "gpu_compatibility": "B200",
+      "model": "nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4",
+      "model_display_name": "Nemotron 3.5 Super VL (NVFP4)",
+      "model_url": "https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4",
+      "scenario": "Max Throughput (Hyperdrive, MTP3)"
+    },
+    {
+      "command": "trtllm-serve nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4 --config ${TRTLLM_DIR}/examples/configs/curated/nemotron-3.5-super-vl-hyperdrive-b300.yaml",
+      "config_filename": "nemotron-3.5-super-vl-hyperdrive-b300.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/nemotron-3.5-super-vl-hyperdrive-b300.yaml",
+      "config_path": "examples/configs/curated/nemotron-3.5-super-vl-hyperdrive-b300.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/curated/nemotron-3.5-super-vl-hyperdrive-b300.yaml",
+      "gpu_compatibility": "B300",
+      "model": "nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4",
+      "model_display_name": "Nemotron 3.5 Super VL (NVFP4)",
+      "model_url": "https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4",
+      "scenario": "Max Throughput (Hyperdrive, MTP3)"
+    },
+    {
       "command": "trtllm-serve nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4 --config ${TRTLLM_DIR}/examples/configs/curated/nemotron-3-ultra-throughput.yaml",
       "config_filename": "nemotron-3-ultra-throughput.yaml",
       "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/nemotron-3-ultra-throughput.yaml",
@@ -4341,6 +4365,10 @@
     "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4": {
       "display_name": "Nemotron v3 Ultra (NVFP4)",
       "url": "https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4"
+    },
+    "nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4": {
+      "display_name": "Nemotron 3.5 Super VL (NVFP4)",
+      "url": "https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4"
     },
     "nvidia/Qwen3.5-397B-A17B-NVFP4": {
       "display_name": "Qwen3.5-397B-A17B (NVFP4)",
