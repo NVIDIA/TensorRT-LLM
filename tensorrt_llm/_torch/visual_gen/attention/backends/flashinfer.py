@@ -4,15 +4,20 @@
 
 import hashlib
 import math
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 import flashinfer
 import torch
 
+from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
+from ....attention.backends.fmha.flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
 from ....attention.backends.interface import PredefinedAttentionMask
+from ....flashinfer_utils import get_env_enable_pdl
+from ...cache import ForwardPlan, PagedKVTables
 from .interface import AttentionBackend, AttentionTensorLayout
+from .paged_rollout import forward_over_paged_rollout
 
 _WORKSPACE_BYTES = 128 * 1024 * 1024
 _BlockScaledQKMode = Literal["mxfp8", "nvfp4"]
@@ -25,7 +30,19 @@ class FlashInferAttention(AttentionBackend):
     path uses FlashInfer's single-request or batched ragged prefill kernel. Block-scaled
     MXFP8 or NVFP4 Q/K dispatches to FlashInfer's SM100/SM103 FMHA with FP8 V. The
     SM120/SM121 path supports dense NVFP4 Q/K/V, according to the validated YAML recipe.
+
+    With a ``PagedRolloutKVCache`` plan as ``kv``, attention runs over the cache on FlashInfer's
+    TRTLLM-Gen paged context kernel (SM10x).
     """
+
+    # Per device, the zeroed workspace and multi-CTA counter buffer shared by every layer's paged
+    # K/V attention. Kernels on one stream run one after another, and each kernel resets the
+    # counters it used. Keep every counter allocation alive for captured graphs; geometric
+    # capacities bound their total storage to less than twice the largest allocation. The
+    # workspace is separate from the prefill wrappers' workspaces, which hold their plans.
+    _trtllm_gen_paged_buffers: ClassVar[
+        dict[torch.device, tuple[torch.Tensor, dict[int, torch.Tensor]]]
+    ] = {}
 
     def __init__(
         self,
@@ -494,8 +511,32 @@ class FlashInferAttention(AttentionBackend):
         *,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
         key_padding_mask: torch.Tensor | None = None,
+        kv: ForwardPlan | None = None,
         **kwargs: object,
     ) -> torch.Tensor:
+        """Run attention.
+
+        Args:
+            q: Query tensor ``[B, S_q, H, D]``.
+            k: Key tensor ``[B, S_kv, H_kv, D]``.
+            v: Value tensor ``[B, S_kv, H_kv, D]``.
+            attention_mask: ``CAUSAL`` or ``FULL``.
+            key_padding_mask: Optional ``[B, S_kv]`` mask of the keys to attend.
+            kv: A ``ForwardPlan`` from a ``PagedRolloutKVCache``. When given,
+                ``k``/``v`` are the new tokens only: they are written at
+                ``staging_offset`` and attention runs over everything cached before them
+                plus themselves, full within a causal block and causal across causal
+                blocks. The first ``kv.num_tokens`` rows are real; rows past them are
+                padding, neither written to the cache nor attended, and their output rows
+                are zero.
+
+        Returns:
+            Output tensor ``[B, S_q, H, D]``.
+        """
+        if kv is not None:
+            if key_padding_mask is not None:
+                raise NotImplementedError("K/V cache attention is full attention over the cache.")
+            return forward_over_paged_rollout(self, self.layer_idx, q, k, v, kv, attention_mask)
         output, _ = self.forward_with_lse(
             q,
             k,
@@ -574,3 +615,100 @@ class FlashInferAttention(AttentionBackend):
     @classmethod
     def support_lse(cls) -> bool:
         return True
+
+    def support_kv_cache(self) -> bool:
+        """Whether ``forward`` accepts a ``kv`` plan: on SM10x, where FlashInfer has the
+        TRTLLM-Gen paged context kernel, and without quantized attention."""
+        return self.quant_attention_config is None and torch.cuda.get_device_capability()[0] == 10
+
+    def support_kv_cache_page_size(
+        self, tokens_per_page: int, dtype: torch.dtype | None = None
+    ) -> bool:
+        """The TRTLLM-Gen paged context kernels take pages of 16, 32 or 64 tokens and bf16 or
+        fp16 K/V, and have no kernels for head dims 72, 80 and 96."""
+        return (
+            self.support_kv_cache()
+            and tokens_per_page in FlashInferTrtllmGenFmha.SUPPORTED_TOKENS_PER_BLOCK
+            and self.head_dim not in FlashInferTrtllmGenFmha.UNSUPPORTED_HEAD_SIZES_CONTEXT
+            and dtype in (None, torch.bfloat16, torch.float16)
+        )
+
+    @classmethod
+    def _trtllm_gen_buffers(
+        cls, q: torch.Tensor, batch_size: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The workspace and counter buffer for paged K/V attention of ``q``
+        (``[tokens, heads, head_dim]``) over ``batch_size`` sequences. They are allocated, or the
+        counters grown, on first need, which must not happen during CUDA graph capture: run the
+        forward eagerly once before capturing it."""
+        from flashinfer.utils import get_trtllm_gen_multi_ctas_kv_counter_bytes
+
+        device = q.device
+        num_tokens, num_heads, head_dim = q.shape
+        num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+        counter_bytes = get_trtllm_gen_multi_ctas_kv_counter_bytes(batch_size, num_heads, num_sms)
+        buffers = cls._trtllm_gen_paged_buffers.get(device)
+        counters = (
+            None
+            if buffers is None
+            else next(
+                (buf for size, buf in sorted(buffers[1].items()) if size >= counter_bytes), None
+            )
+        )
+        if counters is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "Paged K/V attention buffers first needed during CUDA graph capture; run "
+                    "the forward eagerly once before capturing."
+                )
+            if buffers is None:
+                # The kernel's scratch space: the part of its context workspace that the TRTLLM
+                # attention op reserves for this kernel.
+                workspace_bytes = thop.get_trtllm_gen_context_workspace_layout(
+                    q.dtype, batch_size, num_tokens, num_heads, head_dim, 0, True, False
+                )["trtllm_gen_workspace_size"]
+                workspace = torch.zeros(workspace_bytes, dtype=torch.uint8, device=device)
+                buffers = cls._trtllm_gen_paged_buffers[device] = (workspace, {})
+            capacity = 1 << (counter_bytes - 1).bit_length()
+            counters = torch.zeros(capacity, dtype=torch.uint8, device=device)
+            buffers[1][capacity] = counters
+        return buffers[0], counters
+
+    def forward_paged_kv(
+        self, q: torch.Tensor, kv_pool: torch.Tensor, tables: PagedKVTables
+    ) -> torch.Tensor:
+        """See ``AttentionBackend.forward_paged_kv``."""
+        if not self.support_kv_cache():
+            raise NotImplementedError(
+                "K/V cache attention needs an SM10x GPU and does not combine with quantized "
+                "attention."
+            )
+        batch, seq_len, num_heads, head_dim = q.shape
+        page_size = kv_pool.shape[3]
+        q = q.reshape(batch * seq_len, num_heads, head_dim).contiguous()
+        out = torch.empty_like(q)
+        workspace, counters = self._trtllm_gen_buffers(q, batch)
+        # kv_pool is [num_pages, 2, H_kv, page_size, D], with K at index 0 and V at index 1 of
+        # dim 1. The kernel reads it as one HND tensor, and one page id addresses both K and V.
+        flashinfer.prefill.trtllm_batch_context_with_kv_cache(
+            query=q,
+            kv_cache=kv_pool,
+            workspace_buffer=workspace,
+            block_tables=tables.page_table,
+            seq_lens=tables.seq_lens_kv,
+            max_q_len=seq_len,
+            # An upper bound fixed by the cache spec, so a captured CUDA graph stays valid.
+            max_kv_len=tables.page_table.shape[1] * page_size,
+            bmm1_scale=self.scale,
+            bmm2_scale=1.0,
+            batch_size=batch,
+            cum_seq_lens_q=tables.cu_seqlens_q,
+            cum_seq_lens_kv=tables.cu_seqlens_kv,
+            out=out,
+            kv_layout="HND",
+            enable_pdl=get_env_enable_pdl(),
+            uses_shared_paged_kv_idx=True,
+            causal=False,
+            multi_ctas_kv_counter_buffer=counters,
+        )
+        return out.view(batch, seq_len, num_heads, head_dim)

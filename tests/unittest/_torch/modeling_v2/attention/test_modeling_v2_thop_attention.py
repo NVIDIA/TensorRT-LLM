@@ -7141,8 +7141,8 @@ def test_encoder_no_kv_cache_workspace_high_water() -> None:
 def test_encoder_no_kv_cache_boundaries() -> None:
     """The two things that are not how to ask for the no-KV-cache mode.
 
-    `update_kv_cache=False` is rejected outright, so the mode is selected by
-    the absence of the three addressing tensors and nothing else. And
+    For fused self-attention, `update_kv_cache=False` is rejected, so the mode
+    is selected by the absence of the three addressing tensors. And
     head_size 72 exists only in the context phase: a context call over a paged
     pool computes it correctly (a fallback kernel takes it), while a
     generation-phase call raises. Both raises are host-side RuntimeErrors, not
@@ -7152,7 +7152,9 @@ def test_encoder_no_kv_cache_boundaries() -> None:
     workspace = torch.empty(0, dtype=torch.int8, device="cuda")
     seg_lens = [20]
     qkv = torch.randn(20, 48 * 72, dtype=torch.bfloat16, device="cuda")
-    with pytest.raises(RuntimeError, match="KV cache update cannot be disabled now"):
+    with pytest.raises(
+        RuntimeError, match="KV cache update can be disabled only for cross attention"
+    ):
         _encoder_call(qkv, seg_lens, 16, 16, 72, MASK_PADDING, workspace, update_kv_cache=False)
 
     env = _PagedAttnEnv(
