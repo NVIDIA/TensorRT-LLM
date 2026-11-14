@@ -7,7 +7,10 @@ layer profile. This module fans their combined payloads out to one group of
 worker subprocesses that call the public wrapper's ``plan()`` method. FlashInfer
 compiles different kernels concurrently and serializes artifact publication;
 the serving process loads every variant from disk before its first forward.
-The workers serve all profiles and exit before model execution and graph capture.
+During explicit executor construction, one group preloads PyTorch
+while model weights load, then compiles its single batch at warmup.
+It exits before KV-cache capacity profiling. Final warmup still loads every
+plan locally, including any newly encountered variants, without another group.
 
 Workers are plain interpreter subprocesses rather than ``multiprocessing``
 children: importing ``tensorrt_llm`` initializes MPI, so a worker must not
@@ -42,19 +45,44 @@ from __future__ import annotations
 
 import json
 import os
+import select
 import subprocess  # nosec B404 - runs sys.executable workers with a fixed argv, no shell
 import sys
 import tempfile
 import time
-from typing import Any, Sequence
+from contextlib import contextmanager, suppress
+from contextvars import ContextVar
+from typing import TYPE_CHECKING, Any, Iterator, Sequence
 
 from tensorrt_llm.logger import logger
 
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+    from tensorrt_llm.mapping import Mapping
+
 _WORKER_BOOTSTRAP = """
-import json, os, sys
+import json, os, runpy, sys
 _path = os.environ.get("TLLM_PRIMTS_PRECOMPILE_SYS_PATH")
 if _path:
     sys.path[:] = json.loads(_path)
+# Persistent bootstrap settings and sys.path are inherited from the parent.
+# Reuse the temporary allocator policy without importing the product tree.
+_bootstrap = runpy.run_path(os.environ.pop("TLLM_PRIMTS_PRECOMPILE_BOOTSTRAP"))
+with _bootstrap["_mimalloc_arenas_off_thp"]():
+    import torch
+# Signal CPU-preload completion; backend imports wait for the payload.
+_ready_fd = int(os.environ.pop("TLLM_PRIMTS_PRECOMPILE_READY_FD"))
+os.write(_ready_fd, b"1")
+os.close(_ready_fd)
+if not sys.stdin.buffer.read(1):
+    sys.exit(0)
+with open(os.environ.pop("TLLM_PRIMTS_PRECOMPILE_PAYLOAD")) as _payload_file:
+    sys.argv[1] = _payload_file.read()
+_payloads = json.loads(sys.argv[1])
+_slot, _slots = int(sys.argv[2]), int(sys.argv[3])
+if not _payloads[_slot::_slots]:
+    sys.exit(0)
+torch.cuda.set_device(int(_payloads[_slot]["device_index"]))
 from tensorrt_llm._torch.attention.backends.fmha.prims_ts_precompile import _main
 sys.exit(_main(sys.argv))
 """
@@ -63,6 +91,7 @@ sys.exit(_main(sys.argv))
 _MAX_DEFAULT_WORKERS = 4
 _HOST_COMPILE_BUDGET = 16  # default workers of all ranks on one host, together
 _LOCAL_RANK_ENV = ("OMPI_COMM_WORLD_LOCAL_SIZE", "RAY_LOCAL_WORLD_SIZE", "SLURM_NTASKS_PER_NODE")
+_session: ContextVar["PrecompileSession | None"] = ContextVar("prims_ts_precompile", default=None)
 
 
 def local_rank_count(mapping) -> int:
@@ -144,7 +173,14 @@ def precompile_payloads(payloads: Sequence[dict[str, Any]], *, local_ranks: int 
         return
     start = time.perf_counter()
     try:
-        ok = run_precompile_workers(payloads, workers)
+        session = _session.get()
+        if session is not None:
+            if session.group is None:
+                return
+            workers = len(session.group.procs)
+            ok = session.run(payloads)
+        else:
+            ok = run_precompile_workers(payloads, workers)
     except Exception as error:  # noqa: BLE001 -- helper failures fall back to local planning
         if strict():
             raise
@@ -161,6 +197,7 @@ def precompile_payloads(payloads: Sequence[dict[str, Any]], *, local_ranks: int 
 
 
 def _worker_env() -> dict[str, str]:
+    from tensorrt_llm import _bootstrap
     from tensorrt_llm.llmapi.mpi_session import split_mpi_env
 
     env, _ = split_mpi_env()
@@ -170,65 +207,189 @@ def _worker_env() -> dict[str, str]:
     # enumerated along sys.path; a worker must see the parent's sys.path
     # exactly (entries, order and duplicates) to write the same meta.json.
     env["TLLM_PRIMTS_PRECOMPILE_SYS_PATH"] = json.dumps(sys.path)
+    env["TLLM_PRIMTS_PRECOMPILE_BOOTSTRAP"] = _bootstrap.__file__
     return env
 
 
-def run_precompile_workers(payloads: Sequence[dict[str, Any]], workers: int) -> bool:
-    """Compile ``payloads`` with ``workers`` subprocesses; True iff every worker succeeded.
+class _WorkerGroup:
+    """One early import phase followed by one bounded compile batch."""
 
-    Worker output goes to temporary files (a pipe could fill while the worker
-    holds a kernel lock another worker waits on). The wait is bounded by
-    ``TLLM_PRIMTS_WARM_TIMEOUT``; on timeout or any error every worker is
-    killed and the caller compiles in-process.
-    """
+    def __init__(self, workers: int) -> None:
+        self.procs: list[tuple[int, subprocess.Popen, Any, int]] = []
+        self.timeout_s = float(os.environ.get("TLLM_PRIMTS_WARM_TIMEOUT", "1800"))
+        env = _worker_env()
+        self.payload_file = tempfile.NamedTemporaryFile(
+            mode="w+", prefix="prims_ts_precompile_", suffix=".json"
+        )
+        env["TLLM_PRIMTS_PRECOMPILE_PAYLOAD"] = self.payload_file.name
+        try:
+            for slot in range(workers):
+                out = tempfile.TemporaryFile(
+                    mode="w+", prefix="prims_ts_precompile_", suffix=".log"
+                )
+                ready_read, ready_write = os.pipe()
+                try:
+                    proc = subprocess.Popen(
+                        [sys.executable, "-c", _WORKER_BOOTSTRAP, "-", str(slot), str(workers)],
+                        env={**env, "TLLM_PRIMTS_PRECOMPILE_READY_FD": str(ready_write)},
+                        stdin=subprocess.PIPE,
+                        stdout=out,
+                        stderr=subprocess.STDOUT,
+                        text=False,
+                        bufsize=0,
+                        pass_fds=(ready_write,),
+                    )
+                except BaseException:
+                    os.close(ready_read)
+                    out.close()
+                    raise
+                finally:
+                    os.close(ready_write)
+                self.procs.append((slot, proc, out, ready_read))
+        except BaseException:
+            self.close()
+            raise
+
+    def run(self, payloads: Sequence[dict[str, Any]]) -> bool:
+        timeout_s = self.timeout_s
+        ok = True
+        try:
+            deadline = time.monotonic() + timeout_s
+            json.dump(list(payloads), self.payload_file)
+            self.payload_file.flush()
+            for slot, proc, out, ready in self.procs:
+                readable, _, _ = select.select(
+                    [ready], [], [], max(0.0, deadline - time.monotonic())
+                )
+                if not readable or os.read(ready, 1) != b"1":
+                    ok = False
+                    logger.warning(
+                        f"PrimTS precompile worker (slot {slot}) did not finish its CPU preload."
+                    )
+                    continue
+                assert proc.stdin is not None
+                # This is the pipe's only write; one byte fits even if the
+                # worker stalls immediately after signaling preload completion.
+                proc.stdin.write(b"\n")
+            for slot, proc, out, _ in self.procs:
+                try:
+                    proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+                except subprocess.TimeoutExpired:
+                    ok = False
+                    logger.warning(
+                        f"PrimTS precompile worker (slot {slot}) exceeded TLLM_PRIMTS_WARM_TIMEOUT="
+                        f"{timeout_s:g}s; the serving process compiles what is missing."
+                    )
+                    continue
+                if proc.returncode != 0:
+                    ok = False
+                    out.seek(0)
+                    tail = "\n".join(out.read().strip().splitlines()[-15:])
+                    logger.warning(
+                        f"PrimTS precompile worker (slot {slot}) exited with {proc.returncode}; "
+                        f"the serving process compiles what is missing.\n{tail}"
+                    )
+                else:
+                    logger.debug(f"PrimTS precompile worker (slot {slot}) finished")
+        finally:
+            self.close()
+        return ok
+
+    def close(self) -> None:
+        for _, proc, _, _ in self.procs:
+            if proc.poll() is None:
+                with suppress(ProcessLookupError):
+                    proc.kill()
+        for _, proc, _, _ in self.procs:
+            proc.wait()
+        for _, proc, out, ready in self.procs:
+            if proc.stdin is not None:
+                with suppress(OSError):
+                    proc.stdin.close()
+            with suppress(OSError):
+                os.close(ready)
+            with suppress(OSError):
+                out.close()
+        self.procs.clear()
+        self.payload_file.close()
+
+
+def run_precompile_workers(payloads: Sequence[dict[str, Any]], workers: int) -> bool:
+    """Compile one batch, with file-backed logs and a hard subprocess timeout."""
     if workers <= 1 or not payloads:
         return False
-    timeout_s = float(os.environ.get("TLLM_PRIMTS_WARM_TIMEOUT", "1800"))
-    env = _worker_env()
-    payload_json = json.dumps(list(payloads))
-    procs: list[tuple[int, subprocess.Popen, Any]] = []
-    ok = True
+    return _WorkerGroup(workers).run(payloads)
+
+
+class PrecompileSession:
+    """Own a single worker group across profiling and serving warmup passes.
+
+    Workers exit after their first batch. Subsequent passes use normal local
+    planning, including compilation of any profiles first encountered there.
+    No successful export is treated as a substitute for loading a parent plan.
+    """
+
+    def __init__(self) -> None:
+        self.group: _WorkerGroup | None = None
+
+    def start(self, llm_args: TorchLlmArgs, mapping: Mapping) -> None:
+        sparse = llm_args.sparse_attention_config
+        if llm_args.attn_backend != "TRTLLM" or getattr(sparse, "algorithm", None) != "deepseek_v4":
+            return
+        from tensorrt_llm._utils import get_sm_version
+
+        from .prims_ts_sparse_mla import PrimsTSSparseMlaFmha
+        from .registry import get_enabled_fmha_lib_classes
+
+        if get_sm_version() != 100 or PrimsTSSparseMlaFmha not in get_enabled_fmha_lib_classes():
+            return
+        workers = worker_count(sys.maxsize, local_ranks=local_rank_count(mapping))
+        if workers <= 1:
+            return
+        try:
+            self.group = _WorkerGroup(workers)
+        except Exception as error:  # noqa: BLE001 -- optional workers fall back to local planning
+            if strict():
+                raise
+            logger.warning(f"PrimTS sparse MLA early precompile skipped: {error!r}")
+
+    def run(self, payloads: Sequence[dict[str, Any]]) -> bool:
+        assert self.group is not None
+        try:
+            return self.group.run(payloads)
+        finally:
+            self.group = None
+
+    def close(self) -> None:
+        if self.group is not None:
+            self.group.close()
+            self.group = None
+
+
+@contextmanager
+def precompile_session() -> Iterator[PrecompileSession]:
+    """Keep worker ownership scoped to one explicit executor construction."""
+    session = PrecompileSession()
+    token = _session.set(session)
     try:
-        for slot in range(workers):
-            out = tempfile.TemporaryFile(mode="w+", prefix="prims_ts_precompile_", suffix=".log")
-            proc = subprocess.Popen(
-                [sys.executable, "-c", _WORKER_BOOTSTRAP, payload_json, str(slot), str(workers)],
-                env=env,
-                stdout=out,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
-            procs.append((slot, proc, out))
-        deadline = time.monotonic() + timeout_s
-        for slot, proc, out in procs:
-            remaining = deadline - time.monotonic()
-            try:
-                proc.wait(timeout=max(remaining, 0.0))
-            except subprocess.TimeoutExpired:
-                ok = False
-                logger.warning(
-                    f"PrimTS precompile worker (slot {slot}) exceeded TLLM_PRIMTS_WARM_TIMEOUT="
-                    f"{timeout_s:g}s; the serving process compiles what is missing."
-                )
-                continue
-            out.seek(0)
-            text = out.read()
-            if proc.returncode != 0:
-                ok = False
-                tail = "\n".join(text.strip().splitlines()[-15:])
-                logger.warning(
-                    f"PrimTS precompile worker (slot {slot}) exited with {proc.returncode}; "
-                    f"the serving process compiles what is missing.\n{tail}"
-                )
-                continue
-            logger.debug(f"PrimTS precompile worker (slot {slot}) finished")
+        yield session
     finally:
-        for _, proc, out in procs:
-            if proc.poll() is None:
-                proc.kill()
-                proc.wait()
-            out.close()
-    return ok
+        try:
+            session.close()
+        finally:
+            _session.reset(token)
+
+
+def start_precompile_workers(llm_args: TorchLlmArgs, mapping: Mapping) -> None:
+    session = _session.get()
+    if session is not None:
+        session.start(llm_args, mapping)
+
+
+def close_precompile_workers() -> None:
+    session = _session.get()
+    if session is not None:
+        session.close()
 
 
 def _plan(mla_decode, payload: dict[str, Any], torch) -> None:

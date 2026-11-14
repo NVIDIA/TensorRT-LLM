@@ -1278,9 +1278,19 @@ def test_warmup_loads_after_workers_and_falls_back_on_failure(monkeypatch) -> No
     monkeypatch.setattr(pp, "run_precompile_workers", fake_workers)
     attn, profile, eager = _attn_and_profile()
     lib = PrimsTSSparseMlaFmha(attn)
-    mod._warmup_profiles([mod._WarmupProfile(lib, extra=32, **profile)], eager)
-    assert planned == [(20, 32), (15, 32), (7, 32)]
-    assert mla_decode.BatchSparseMLADecodePagedTSWrapper.discovery_rows == list(range(1, 21))
+    with pp.precompile_session() as session:
+        session.group = SimpleNamespace(
+            procs=[None, None], run=lambda payloads: fake_workers(payloads, 2)
+        )
+        mod._warmup_profiles([mod._WarmupProfile(lib, extra=32, **profile)], eager)
+        assert planned == [(20, 32), (15, 32), (7, 32)]
+        # Replacing profiling metadata must load parent plans again without
+        # another subprocess group, including newly encountered profiles.
+        planned.clear()
+        fresh = SimpleNamespace(**{**vars(eager), "fmha_plan_caches": {}})
+        mod._warmup_profiles([mod._WarmupProfile(lib, extra=64, **profile)], fresh)
+        assert planned == [(20, 64), (15, 64), (7, 64)]
+    assert mla_decode.BatchSparseMLADecodePagedTSWrapper.discovery_rows == list(range(1, 21)) * 2
     assert len(fanned) == 1
     payloads, workers = fanned[0]
     assert workers == 2
@@ -1384,6 +1394,8 @@ def test_precompile_workers_compile_disjoint_shards(monkeypatch) -> None:
 def test_precompile_workers_get_a_clean_environment_and_bounded_wait(monkeypatch, tmp_path) -> None:
     """The runner strips the MPI launcher environment, forwards sys.path and the
     worker count 0, assigns one slot per worker, and kills workers on timeout."""
+    from pathlib import Path
+
     import tensorrt_llm._torch.attention.backends.fmha.prims_ts_precompile as pp
 
     spawned = []
@@ -1393,6 +1405,17 @@ def test_precompile_workers_get_a_clean_environment_and_bounded_wait(monkeypatch
             self.argv, self.env, self.returncode, self._hang = argv, env, returncode, hang
             stdout.write(text)
             self._done = False
+            self.stdin = SimpleNamespace(write=self.wake, close=self.close_stdin)
+
+        def wake(self, signal):
+            assert signal == b"\n"
+            with open(self.env["TLLM_PRIMTS_PRECOMPILE_PAYLOAD"]) as payload_file:
+                self.payload = payload_file.read()
+            return 1
+
+        def close_stdin(self):
+            if self._hang:
+                raise BrokenPipeError("worker stopped")
 
         def wait(self, timeout=None):
             if self._hang and not getattr(self, "killed", False):
@@ -1410,7 +1433,11 @@ def test_precompile_workers_get_a_clean_environment_and_bounded_wait(monkeypatch
     import subprocess
 
     def make_popen(**behaviour):
-        def fake_popen(argv, env, stdout, stderr, text):
+        def fake_popen(argv, env, stdin, stdout, stderr, text, bufsize, pass_fds):
+            import os
+
+            assert text is False and bufsize == 0
+            os.write(pass_fds[0], b"1")
             proc = _FakeProc(argv, env, stdout, **behaviour)
             spawned.append(proc)
             return proc
@@ -1433,7 +1460,8 @@ def test_precompile_workers_get_a_clean_environment_and_bounded_wait(monkeypatch
     assert json.loads(env["TLLM_PRIMTS_PRECOMPILE_SYS_PATH"]) == sys.path
     assert [p.argv[-2:] for p in spawned] == [["0", "2"], ["1", "2"]]
     assert spawned[0].argv[0] == sys.executable and spawned[0].argv[1] == "-c"
-    assert json.loads(spawned[0].argv[3]) == payloads
+    assert json.loads(spawned[0].payload) == payloads
+    assert not Path(env["TLLM_PRIMTS_PRECOMPILE_PAYLOAD"]).exists()
 
     spawned.clear()
     monkeypatch.setattr(subprocess, "Popen", make_popen(returncode=3, text="boom"))
