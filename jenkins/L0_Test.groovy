@@ -905,7 +905,7 @@ def getInfraDryRunPytestTargets(testListPath) {
     return targets
 }
 
-def processShardTestList(llmSrc, testDBList, splitId, splits, durationsPath="") {
+def processShardTestList(llmSrc, testDBList, splitId, splits, stageName, durationsPath="") {
     // Preprocess testDBList to extract ISOLATION markers
     echo "Preprocessing testDBList to extract ISOLATION markers..."
 
@@ -971,6 +971,9 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, durationsPath="") 
     ]
     if (durationsPath) {
         testListCmd += ["--durations-path=${durationsPath}"]
+    }
+    if (stageName.contains("-CPP-") && !isInfraDryRun()) {
+        testListCmd += ["${llmSrc}/tests/integration/defs/cpp"]
     }
     testListCmd += getInfraDryRunPytestTargets(cleanedTestDBList)
 
@@ -2235,6 +2238,9 @@ def getPytestBaseCommandLine(
     if (extraArgs) {
         testCmdLine += extraArgs
     }
+    if (stageName.contains("-CPP-") && !isInfraDryRun()) {
+        testCmdLine += ["${llmSrc}/tests/integration/defs/cpp"]
+    }
     return testCmdLine as String[]
 }
 
@@ -2397,6 +2403,14 @@ def fetchBuildArtifact(pipeline, String artifactPath, String dest, String mode =
     } finally {
         pipeline.sh(label: "Remove Artifactory netrc", script: "rm -f '${netrcPath}' '${statusPath}'")
     }
+}
+
+def cppTestArtifactPath(String config, String stageName)
+{
+    if (!stageName.contains("-CPP-") || !(config in [VANILLA_CONFIG, LINUX_AARCH64_CONFIG])) {
+        return ""
+    }
+    return "${ARTIFACT_PATH}/cpp-tests-${BUILD_CONFIGS[config][TARNAME]}"
 }
 
 // Which build of <tarName> this stage tests, as the artifact path to read it
@@ -2665,6 +2679,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 def makoOptsJson = transformMakoArgsToJson(["Mako options:"] + makoArgs)
                 String clusterNameForDurations = useClusterDurations ? partition.clusterName.replaceAll('[^a-zA-Z0-9]', '_') : null
                 def testListPathLocal = renderTestDB(pipeline, testList, llmSrcLocal, stageName, makoOptsJson, clusterNameForDurations)
+                def cppTestTarArtifactPath = cppTestArtifactPath(config, stageName)
                 // Copy the test list atomically. A retry that reuses a still-active job
                 // re-copies over ${testListPathNode} while that job may be reading it via
                 // --test-list; scp truncates-then-streams, so a concurrent read could see a
@@ -3010,6 +3025,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     export BASH_ENV="$scriptProfilerEnvPathNode"
                     export tarName=$tarName
                     export llmTarArtifactPath=$llmTarArtifactPath
+                    export cppTestTarArtifactPath="$cppTestTarArtifactPath"
                     export LLM_ARTIFACTS_PRIMARY=${llmArtifactsPrimary()}
                     export ARTIFACTORY_NETRC=$artifactoryNetrcPathNode
                     export ARTIFACTORY_CREDENTIAL_ID=$LLM_ARTIFACTS_CREDENTIALS_ID
@@ -6408,7 +6424,15 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         }
 
         // Process shard test list and create separate files for regular and isolate tests
-        def preprocessedLists = processShardTestList(llmSrc, testDBList, splitId, splits, clusterDurationsPath)
+        def preprocessedLists = processShardTestList(llmSrc, testDBList, splitId, splits, stageName, clusterDurationsPath)
+        def cppTestTarArtifactPath = cppTestArtifactPath(config, stageName)
+        if (cppTestTarArtifactPath) {
+            def cppTestArchive = "${llmPath}/cpp-tests.tar.gz"
+            timeout(time: 30, unit: 'MINUTES') {
+                fetchBuildArtifact(pipeline, cppTestTarArtifactPath, cppTestArchive)
+            }
+            sh "tar -zxf '${cppTestArchive}' -C '${llmSrc}'"
+        }
 
         // Test Coverage
         def TRTLLM_WHL_PATH = sh(returnStdout: true, script: "pip3 show tensorrt_llm | grep Location | cut -d ' ' -f 2").replaceAll("\\s","")
@@ -7463,8 +7487,6 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "A100X-PyTorch-1": ["a100x", "l0_a100", 1, 1],
         "L40S-PyTorch-1": ["l40s", "l0_l40s", 1, 2],
         "L40S-PyTorch-2": ["l40s", "l0_l40s", 2, 2],
-        "H100_PCIe-PyTorch-Ray-1": ["h100-cr", "l0_h100", 1, 1],
-        "H100_PCIe-CPP-1": ["h100-cr", "l0_h100", 1, 1],
         // platform, test DB, split, splits, GPU count, ModelExpress sidecars
         // In this Kubernetes map only, an optional 6th element `true` attaches the Redis +
         // ModelExpress server sidecars and the CI ModelExpress env to the pod
@@ -7475,7 +7497,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         // Post-merge only: the `stage: post_merge` rows of l0_model_express, i.e. the TP=1 smoke
         // rows of the non-representative families and the accuracy canaries.
         "DGX_H100-2_GPUs-PyTorch-ModelExpress-Post-Merge-1": ["dgx-h100-x4", "l0_model_express", 1, 1, 2, true],
-        "RTX5090-PyTorch-1": ["rtx-5090", "l0_gb202", 1, 1],
+        "RTX5090-CPP-1": ["rtx-5090", "l0_gb202", 1, 1],
         "RTX5080-PyTorch-1": ["rtx-5080", "l0_gb203", 1, 2],
         "RTX5080-PyTorch-2": ["rtx-5080", "l0_gb203", 2, 2],
         // Currently post-merge test stages only run tests with "stage: post_merge" mako
@@ -7492,7 +7514,6 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "A100X-PyTorch-Post-Merge-1": ["a100x", "l0_a100", 1, 1],
         "L40S-PyTorch-Post-Merge-1": ["l40s", "l0_l40s", 1, 1],
         "L40S-FMHA-Post-Merge-1": ["l40s", "l0_l40s", 1, 1],
-        "H100_PCIe-FMHA-Post-Merge-1": ["h100-cr", "l0_h100", 1, 1],
         "DGX_H200-8_GPUs-PyTorch-Post-Merge-1": ["dgx-h200-x8", "l0_dgx_h200", 1, 1, 8],
         "DGX_H200-4_GPUs-PyTorch-Post-Merge-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 1, 4],
         // Disable RTXPro6000 stages due to nodes will be offline temporarily.
@@ -7521,6 +7542,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     fullSet = parallelJobs.keySet()
 
     x86SlurmTestConfigs = [
+        "DGX_H100-CPP-1": ["auto:dgx-h100-x1", "l0_h100", 1, 1],
+        "DGX_H100-PyTorch-Ray-1": ["auto:dgx-h100-x1", "l0_h100", 1, 1],
         "DGX_H100-PyTorch-1": ["auto:dgx-h100-x1", "l0_h100", 1, 6],
         "DGX_H100-PyTorch-2": ["auto:dgx-h100-x1", "l0_h100", 2, 6],
         "DGX_H100-PyTorch-3": ["auto:dgx-h100-x1", "l0_h100", 3, 6],
@@ -7529,6 +7552,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "DGX_H100-PyTorch-6": ["auto:dgx-h100-x1", "l0_h100", 6, 6],
         "DGX_H100-PyTorch-Post-Merge-1": ["auto:dgx-h100-x1", "l0_h100", 1, 2],
         "DGX_H100-PyTorch-Post-Merge-2": ["auto:dgx-h100-x1", "l0_h100", 2, 2],
+        "DGX_H100-FMHA-Post-Merge-1": ["auto:dgx-h100-x1", "l0_h100", 1, 1],
         "DGX_A100-FMHA-Post-Merge-1": ["auto:dgx-a100-x1", "l0_a100", 1, 1],
         "DGX_H100-2_GPUs-PyTorch-Others-1": ["auto:dgx-h100-x2", "l0_dgx_h100", 1, 2, 2],
         "DGX_H100-2_GPUs-PyTorch-Others-2": ["auto:dgx-h100-x2", "l0_dgx_h100", 2, 2, 2],

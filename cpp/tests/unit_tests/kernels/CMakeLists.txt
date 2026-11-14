@@ -40,6 +40,7 @@ add_gtest(mixtureOfExpertsTest moe/mixtureOfExpertsTest.cu)
 
 # If we are using oss cutlass, build an explicit internal test
 if(USING_OSS_CUTLASS_MOE_GEMM)
+  target_link_libraries(mixtureOfExpertsTest PRIVATE moe_gemm_src)
   target_compile_definitions(mixtureOfExpertsTest
                              PUBLIC USING_OSS_CUTLASS_MOE_GEMM)
 
@@ -197,28 +198,39 @@ add_tllm_gtest(
   LABELS
   "unit;kernels;attention-mask;gpu")
 add_gtest(fmhaDsv4EpilogueFusionTest fmhaDsv4EpilogueFusionTest.cpp)
+set(fmha_test_sources ../../../tensorrt_llm/kernels/fmhaDispatcher.cpp)
+set(fmha_test_libraries context_attention_src trtllm_gen_fmha ${CUDA_DRV_LIB}
+                        tllm::common_environment tllm::common_logging)
+if(TRTLLM_BUILD_CPP_TEST_BUNDLE)
+  add_library(tllm_test_fmha SHARED EXCLUDE_FROM_ALL ${fmha_test_sources})
+  target_compile_features(tllm_test_fmha PRIVATE cxx_std_20)
+  target_link_libraries(
+    tllm_test_fmha
+    PRIVATE ${fmha_test_libraries}
+    PUBLIC trtllm_gen_fmha_interface CUDA::cudart)
+  set(fmha_test_sources)
+  set(fmha_test_libraries tllm_test_fmha)
+endif()
 add_tllm_gtest(
   fmhaHead104Test
   OWNER
   kernel
   SOURCES
   fmhaHead104Test.cpp
-  FULL_STACK
+  ${fmha_test_sources}
+  LINK_LIBRARIES
+  ${fmha_test_libraries}
   LABELS
-  "unit;kernels;fmha;full-stack;gpu")
+  "unit;kernels;fmha;gpu")
 add_tllm_gtest(
   fmhaDispatcherTest
   OWNER
   kernel
   SOURCES
   fmhaDispatcherTest.cpp
+  ${fmha_test_sources}
   LINK_LIBRARIES
-  kernels_src
-  context_attention_src
-  trtllm_gen_fmha
-  ${CUDA_DRV_LIB}
-  tllm::common_environment
-  tllm::common_logging
+  ${fmha_test_libraries}
   LABELS
   "unit;kernel;host")
 

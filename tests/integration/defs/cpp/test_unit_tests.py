@@ -1,5 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import os as _os
 import pathlib as _pl
@@ -18,7 +30,10 @@ _TEST_GROUP_DIRS = {
     "batch_manager", "common", "executor", "executor_bounce", "kernels",
     "runtime", "thop"
 ])
-def test_unit_tests(build_google_tests, test_group, build_dir, lora_setup):
+def test_unit_tests(build_google_tests, test_group, build_dir, request):
+
+    if test_group in ("batch_manager", "runtime"):
+        request.getfixturevalue("lora_setup")
 
     xml_name = f"results-unit-tests-{test_group}.xml"
     test_group_dir = _TEST_GROUP_DIRS.get(test_group, test_group)
