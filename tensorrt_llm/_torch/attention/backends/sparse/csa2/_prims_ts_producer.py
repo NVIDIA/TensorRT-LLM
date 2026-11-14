@@ -19,9 +19,11 @@ from dataclasses import dataclass
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import T
 from cutlass.experimental import primitives as prims
 from cutlass.experimental.task_scheduling.enums import SignalingThreads
-from cutlass.experimental.task_scheduling.resources import PipelineConfig, StageInfo
+from cutlass.experimental.task_scheduling.resources import PipelineConfig, StageInfo, producer_work
 
 from ...prims_ts.kernels.fmha_decode.fmha_decode_resources.smem_transformed_kv import (
     _cvt_e2m1_word_to_e4m3_words,
@@ -29,7 +31,10 @@ from ...prims_ts.kernels.fmha_decode.fmha_decode_resources.smem_transformed_kv i
     _cvt_e4m3x2_byte_to_bf16x2,
     _cvt_e4m3x2_word_to_bf16x2,
 )
-from ...prims_ts.kernels.mla_decode.helpers.layout import head_dim_cta_offset_v
+from ...prims_ts.kernels.mla_decode.helpers.layout import (
+    head_dim_cta_offset_v,
+    q_stage_smem_element_offset,
+)
 from ...prims_ts.kernels.mla_decode.helpers.math import fmul2
 from ...prims_ts.kernels.mla_decode.helpers.ops import pack_float4_to_fp8_e4m3
 from ...prims_ts.kernels.mla_decode.helpers.sparse_indices import (
@@ -40,11 +45,15 @@ from ...prims_ts.kernels.mla_decode.helpers.sparse_indices import (
 )
 from ...prims_ts.kernels.mla_decode.helpers.stage import MlaStage
 from ...prims_ts.kernels.mla_decode.helpers.tile import (
+    batch_idx_for_stage_cfg,
     cta_idx_head_dim_v_for_stage,
+    cta_idx_q_for_stage,
+    head_idx_for_stage,
     staged_kv_head_dim_call_idx,
 )
 from ...prims_ts.kernels.mla_decode.throughput_latency_1cta.resources.smem_resources import (
     SmemKvResource,
+    SmemQResource,
 )
 from .params import PrimsTSMainFormat, SwaCacheFormat
 from .quantization import row_bytes
@@ -59,6 +68,33 @@ def main_row_bytes(main_format: PrimsTSMainFormat) -> int:
     if main_format == "main_fp8":
         return 512
     raise ValueError("CSA2 PrimTS MAIN format must be 'main' or 'main_fp8'")
+
+
+@cutlass.dsl_user_op
+def _load_record_lane(payload: Int64, scale: Int64, live: Int32, *, loc=None, ip=None) -> tuple:
+    """A lane's two payload words at ``payload`` and scale byte at ``scale``, or zeros.
+
+    The loads are predicated on ``live`` rather than branched around, so a masked row reads
+    nothing (its pool need not be backed by any memory) and adds no control flow between the
+    loads a batch keeps in flight.
+    """
+    out = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32()] * 3),
+        [
+            Int64(payload).ir_value(loc=loc, ip=ip),
+            Int64(scale).ir_value(loc=loc, ip=ip),
+            Int32(live).ir_value(loc=loc, ip=ip),
+        ],
+        "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, $5, 0;\n\tmov.b32 $0, 0;\n\tmov.b32 $1, 0;\n\t"
+        "mov.b32 $2, 0;\n\t@p ld.global.v2.b32 {$0, $1}, [$3];\n\t@p ld.global.u8 $2, [$4];\n\t}",
+        "=r,=r,=r,l,l,r,~{memory}",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return tuple(Int32(llvm.extractvalue(T.i32(), out, [i], loc=loc, ip=ip)) for i in range(3))
 
 
 class _BoundedSourceTile(SparseSourceTile):
@@ -130,6 +166,227 @@ class _BoundedKVIndices(SparseKVIndices):
         if cutlass.const_expr(self.has_extra):
             rows = self.pool_rows[1] if tile_start >= row.primary_span else rows
         return _BoundedSourceTile(source.values, rows)
+
+
+_INVALID_ROW = 0x7FFFFFFF
+# Cache lines of the query row each load-warp thread prefetches at the kernel's start.
+_QUERY_PREFETCH_LINES_PER_THREAD = 3
+
+
+class _RawSourceTile(SparseSourceTile):
+    """One tile's uncompacted selections: INT64 SWA slots or INT32 logical MAIN positions.
+
+    SWA slots are physical rows of the SWA pool. A MAIN position resolves through its owner's
+    page-table row exactly as ``prepare_prims_ts_metadata`` resolves it: the position must lie
+    in the row's visible span, its page entry within the MAIN pool's pages and the row within
+    the pool. Rows that fail are masked where they stand instead of being compacted away.
+
+    The tile carries the row's owner request and visible length as loaded; they are first
+    used when a position resolves, after the list entries' loads are issued, so both reads
+    are in flight together.
+    """
+
+    def __init__(self, values: tuple) -> None:
+        self.values = values
+        (
+            self.address,
+            self.origin,
+            self.length,
+            self.tag,
+            self.extra,
+            self.pool_rows,
+            self.pages,
+            self.pages_stride,
+            self.pages_rows,
+            self.span_limit,
+            self.request,
+            self.visible,
+            self.page_size,
+            self.pool_pages,
+        ) = values
+        self.valid_prefix = False
+
+    def __extract_mlir_values__(self) -> list:
+        return cutlass.extract_mlir_values(self.values)
+
+    def __new_from_mlir_values__(self, values: list) -> "_RawSourceTile":
+        return _RawSourceTile(cutlass.new_from_mlir_values(self.values, values))
+
+    @cute.jit
+    def _main_row(self, logical: Int32) -> Int32:
+        """The MAIN pool row of a logical position, or -1.
+
+        SWA tiles carry a zero span, so they read entry 0 of table row 0 (an address known
+        before their selection) and discard it. Unowned rows read table row 0, which exists:
+        the host never binds an empty table.
+        """
+        owned = self.extra & (self.request >= Int64(0)) & (self.request < self.pages_rows)
+        # The visible prefix, the position limit and the table's columns bound one span.
+        span = cute.math.max(cute.math.min(self.visible, self.span_limit), Int64(0))
+        span = span if owned else Int64(0)
+        table = self.pages + (self.request if owned else Int64(0)) * self.pages_stride
+        inside = (Int64(logical) >= Int64(0)) & (Int64(logical) < span)
+        position = logical if inside else Int32(0)
+        page = position // self.page_size
+        entries = cute.make_tensor(
+            cute.make_ptr(Int32, table, assumed_align=4),
+            cute.make_layout((1 << 30,), stride=(1,)),
+        )
+        physical_page = Int32(entries[page])
+        backed = inside & (physical_page >= Int32(0)) & (physical_page < self.pool_pages)
+        row = (physical_page if backed else Int32(0)) * self.page_size + (
+            position - page * self.page_size
+        )
+        return row if backed & (row < self.pool_rows) else Int32(-1)
+
+    @cute.jit
+    def _entry_words(self, position: Int32) -> tuple:
+        """The two INT32 words of list entry ``position``.
+
+        Both list types are read as INT32 words, so no staged branch selects a type: an INT64
+        SWA slot is valid exactly when its high word is zero and its low word a pool row; a
+        MAIN entry's single word (read twice) is its logical position. Every load stays inside
+        the entry.
+        """
+        words = cute.make_tensor(
+            cute.make_ptr(Int32, self.address, assumed_align=4),
+            cute.make_layout((1 << 30,), stride=(1,)),
+        )
+        low_word = position if self.extra else position * Int32(2)
+        low = Int32(words[low_word])
+        high = Int32(words[low_word if self.extra else low_word + Int32(1)])
+        return low, high
+
+    @cute.jit
+    def _resolve(self, low: Int32, high: Int32) -> Int32:
+        """Pool row of an entry read as ``(low, high)``, or -1."""
+        slot = low if (high == Int32(0)) & (low >= Int32(0)) & (low < self.pool_rows) else Int32(-1)
+        main = self._main_row(low)
+        return main if self.extra else slot
+
+    @cute.jit
+    def _entry(self, position: Int32) -> Int32:
+        """Pool row of in-bounds list entry ``position``, or -1."""
+        low, high = self._entry_words(position)
+        return self._resolve(low, high)
+
+    @cute.jit
+    def _bounded_index(self, token: Int32) -> tuple:
+        position = token - self.origin
+        # Inactive entries read the list's first entry and are discarded, as the native
+        # bounded reader does.
+        safe = cute.math.min(
+            cute.math.max(position, Int32(0)),
+            cute.math.max(self.length - Int32(1), Int32(0)),
+        )
+        row = self._entry(safe)
+        valid = (position >= Int32(0)) & (position < self.length) & (row >= Int32(0))
+        return (row if valid else Int32(-1)), valid
+
+    @cute.jit
+    def load_full_quad(self, token: Int32) -> cutlass.Array:
+        position = token - self.origin
+        # Every entry's words are read before the first resolves, so the quad waits for one
+        # round trip to its entries and one to their page-table rows.
+        words = [self._entry_words(position + Int32(j)) for j in range(4)]
+        rows = cutlass.Array(Int32, 4, space=cutlass.AddressSpace.rmem)
+        for j in cutlass.range_constexpr(4):
+            row = self._resolve(words[j][0], words[j][1])
+            rows[j] = (row if row >= Int32(0) else Int32(_INVALID_ROW)) | self.tag
+        return rows
+
+
+class _RawKVIndices(SparseKVIndices):
+    """Uncompacted SWA slots and logical MAIN positions with the MAIN owner's page table.
+
+    ``mapping`` is ``(pages, requests, visible, max_positions, page_size, swa_rows,
+    main_rows)``: the INT32 page table, each query row's INT64 owner request and visible MAIN
+    length, the position limit, the page size and both pools' rows. A tile reads its row's
+    request and visible length when it is selected, alongside its own list entries, so binding
+    loads nothing and the warps that never select a tile never wait for these loads.
+    """
+
+    def __init__(self, source: SparseKVIndices, mapping: tuple, main_waits: bool = False) -> None:
+        super().__init__(source.values[:-1], source.capacity, False, source.has_extra)
+        self.mapping = mapping
+        # A MAIN tile waits for the preceding launch before its first selection read.
+        self.main_waits = main_waits
+        self._packed_values = (self.values, mapping)
+
+    def __extract_mlir_values__(self) -> list:
+        return cutlass.extract_mlir_values(self._packed_values)
+
+    def __new_from_mlir_values__(self, values: list) -> "_RawKVIndices":
+        source_values, mapping = cutlass.new_from_mlir_values(self._packed_values, values)
+        source = SparseKVIndices(source_values[:-1], source_values[-1], False, self.has_extra)
+        return _RawKVIndices(source, mapping, self.main_waits)
+
+    @cute.jit
+    def bind_query_row(
+        self, query_row: Int32, primary_length=None, extra_length=None
+    ) -> "_RawKVIndices":
+        if cutlass.const_expr(self.is_bound):
+            return self
+        source = SparseKVIndices.bind_query_row(self, query_row, primary_length, extra_length)
+        return _RawKVIndices(source, self.mapping, self.main_waits)
+
+    @cute.jit
+    def select_source_tile(
+        self, tile_start: Int32, query_row=None, *, for_mask: cutlass.Constexpr[bool] = False
+    ) -> _RawSourceTile:
+        # Holes need their selections even for masks (``for_mask`` changes nothing): there
+        # is no analytic prefix.
+        row = self.bind_query_row(query_row)
+        pages, requests, visible, max_positions, page_size, swa_rows, main_rows = row.mapping
+        primary = row.primary_indices.iterator.toint() + row.query_row * Int64(
+            row.primary_indices.stride[0]
+        ) * Int64(8)
+        if cutlass.const_expr(not self.has_extra):
+            # Without a page table, the discarded MAIN read targets the row's own SWA list.
+            return _RawSourceTile(
+                (
+                    primary,
+                    Int32(0),
+                    row.primary_length,
+                    Int32(0),
+                    cutlass.Boolean(False),
+                    swa_rows,
+                    primary,
+                    Int64(0),
+                    Int64(0),
+                    Int64(0),
+                    Int64(0),
+                    Int64(0),
+                    page_size,
+                    Int32(0),
+                )
+            )
+        use_extra = tile_start >= row.primary_span
+        if cutlass.const_expr(self.main_waits):
+            if use_extra:
+                # Producer and mask warps alike read the MAIN selections only after it.
+                prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
+        extra = row.extra_indices.iterator.toint() + row.query_row * Int64(
+            row.extra_indices.stride[0]
+        ) * Int64(4)
+        return _RawSourceTile(
+            (
+                extra if use_extra else primary,
+                row.primary_span if use_extra else Int32(0),
+                row.extra_length if use_extra else row.primary_length,
+                Int32(-2147483648) if use_extra else Int32(0),
+                use_extra,
+                main_rows if use_extra else swa_rows,
+                pages.iterator.toint(),
+                Int64(pages.stride[0]) * Int64(4),
+                Int64(pages.shape[0]),
+                cute.math.min(max_positions, Int64(pages.shape[1]) * Int64(page_size)),
+                Int64(requests[row.query_row]),
+                Int64(visible[row.query_row]),
+                page_size,
+                (main_rows + page_size - Int32(1)) // page_size,
+            )
+        )
 
 
 @cute.jit
@@ -221,6 +478,8 @@ class _PackedSmemKvResource(SmemKvResource):
     has_extra: bool = False
     swa_cache_format: SwaCacheFormat = "swa"
     main_cache_format: PrimsTSMainFormat = "main"
+    # A runahead kernel waits for its preceding launch before its first MAIN row reads.
+    main_after_wait: bool = False
     aligned_strides: bool = True
 
     # Fetches only issue a chunk's global loads and return its scale byte (-1
@@ -416,6 +675,35 @@ class _PackedSmemKvResource(SmemKvResource):
         Every copy of the warp is in flight before the first wait, and the loops
         stay rolled.
         """
+        self._issue_quads(
+            is_main,
+            words,
+            cached_page_ids,
+            base,
+            warp,
+            quads_per_warp,
+            row_in_quad,
+            chunk_in_row,
+            dimension,
+        )
+        self._finish_quads(
+            is_main, words, warp, quads_per_warp, row_in_quad, chunk_in_row, dimension, 0
+        )
+
+    @cute.jit
+    def _issue_quads(
+        self,
+        is_main: cutlass.Constexpr[bool],
+        words: cutlass.Array,
+        cached_page_ids,
+        base: int,
+        warp: Int32,
+        quads_per_warp: cutlass.Constexpr[int],
+        row_in_quad: Int32,
+        chunk_in_row: Int32,
+        dimension: Int32,
+    ) -> None:
+        """Start the copies of this warp's quads for one D128 slice as one cp.async group."""
         pool = self.main if is_main else self.swa
         decode = is_main and self.main_cache_format == "main"
         stride = Int64(pool.stride[0])
@@ -449,8 +737,158 @@ class _PackedSmemKvResource(SmemKvResource):
                     cp_size=Int32(16) if valid else Int32(0),
                 )
         prims.cp_async_commit_group()
-        prims.cp_async_wait_group(0)
-        if cutlass.const_expr(decode):
+
+    @cute.jit
+    def _issue_tile(
+        self,
+        is_main: cutlass.Constexpr[bool],
+        slots: tuple,
+        cached_page_ids,
+        base: int,
+        warp: Int32,
+        quads_per_warp: cutlass.Constexpr[int],
+        row_in_quad: Int32,
+        chunk_in_row: Int32,
+    ) -> None:
+        """Start every D128 slice's copies of this warp's quads, one cp.async group per slice.
+
+        Each quad's row is broadcast once and reused by all of its slices. The rows are unit
+        scale E4M3 (an FP8 SWA tile or a MAIN bank tile): packed MAIN tiles are read and
+        decoded by ``_load_main_tile_rows``.
+        """
+        pool = self.main if is_main else self.swa
+        stride = Int64(pool.stride[0])
+        width = self.cfg.head_dim_per_stage_kv
+        starts = []
+        for owner in cutlass.range_constexpr(quads_per_warp):
+            row = self._owner_row(cached_page_ids, base, owner, row_in_quad) & Int32(0x7FFFFFFF)
+            # Pools hold fewer than 0x7FFFFFFF rows, so this also rejects the sentinel.
+            valid = row < pool.shape[0]
+            starts.append((pool.iterator + Int64(row if valid else Int32(0)) * stride, valid))
+        for part in cutlass.range_constexpr(len(slots)):
+            dimension = Int32(part * width) + chunk_in_row * Int32(16)
+            for owner in cutlass.range_constexpr(quads_per_warp):
+                start, valid = starts[owner]
+                slot = self._chunk_offset(
+                    warp, quads_per_warp, Int32(owner), row_in_quad, chunk_in_row
+                )
+                prims.cp_async_shared_global(
+                    slots[part].data_ptr(slot // Int32(4)),
+                    start + Int64(dimension),
+                    16,
+                    "cg",
+                    cp_size=Int32(16) if valid else Int32(0),
+                )
+            prims.cp_async_commit_group()
+
+    @cute.jit
+    def _load_main_tile_rows(
+        self,
+        slots: tuple,
+        cached_page_ids,
+        base: int,
+        warp: Int32,
+        quads_per_warp: cutlass.Constexpr[int],
+    ) -> None:
+        """Read and decode a packed MAIN tile a record per warp step, into every slice's slot.
+
+        A warp step reads one of the warp's rows: lane ``l`` loads payload bytes ``8l`` to
+        ``8l + 7`` (channels ``16l`` to ``16l + 15``) and scale byte ``l`` with plain global
+        loads, so each step reads one contiguous record. A batch's loads are all in flight
+        before its first conversion; lane ``l`` then writes its 16 operand bytes to chunk
+        ``l % 8`` of the row in slice ``l // 8``. Masked rows write zeros.
+        """
+        pool = self.main
+        # A record's row stride is far below 4 GiB, so a row's byte offset is one wide product.
+        stride = cutlass.Uint32(pool.stride[0])
+        rows = 4 * quads_per_warp
+        batch = 4
+        lane = cute.arch.lane_idx()
+        # The addresses of this lane's payload word pair and scale byte in pool row 0.
+        payload_lane = pool.iterator.toint() + Int64(lane * Int32(8))
+        scale_lane = pool.iterator.toint() + Int64(Int32(256) + lane)
+        # Lane t holds the warp's row t, broadcast to the whole warp at its step.
+        own_row = self._owner_row(cached_page_ids, base, lane >> Int32(2), lane & Int32(3)) & Int32(
+            0x7FFFFFFF
+        )
+        part = lane >> Int32(3)
+        chunk = lane & Int32(7)
+        slot_base = slots[0].data_ptr().toint(Int64)
+        for other in cutlass.range_constexpr(1, len(slots)):
+            slot_base = slots[other].data_ptr().toint(Int64) if part == Int32(other) else slot_base
+        # Software pipeline over batches: the next batch's loads are in flight while the
+        # current batch converts, so only the first batch waits a full round trip.
+        fetched = []
+        for step in cutlass.range_constexpr(rows):
+            if cutlass.const_expr(step < batch):
+                fetched.append(
+                    self._fetch_main_record(own_row, step, payload_lane, scale_lane, stride)
+                )
+        for first in cutlass.range_constexpr(0, rows, batch):
+            for step in cutlass.range_constexpr(first + batch, first + 2 * batch):
+                if cutlass.const_expr(step < rows):
+                    fetched.append(
+                        self._fetch_main_record(own_row, step, payload_lane, scale_lane, stride)
+                    )
+            for step in cutlass.range_constexpr(first, first + batch):
+                payload, scale, valid = fetched[step]
+                values = cutlass.Array(Int32, 4, space=cutlass.AddressSpace.rmem)
+                values[0], values[1] = _cvt_e2m1_word_to_e4m3_words(Int32(payload[0]), scale)
+                values[2], values[3] = _cvt_e2m1_word_to_e4m3_words(Int32(payload[1]), scale)
+                for word in cutlass.range_constexpr(4):
+                    values[word] = values[word] if valid else Int32(0)
+                offset = self._chunk_offset(
+                    warp, quads_per_warp, Int32(step // 4), Int32(step % 4), chunk
+                )
+                cutlass.inttoptr(slot_base + Int64(offset), mem_space=3, dtype=Int32).store(
+                    values.load(0, 4), alignment=16
+                )
+
+    @cute.jit
+    def _fetch_main_record(
+        self,
+        own_row: Int32,
+        step: cutlass.Constexpr[int],
+        payload_lane,
+        scale_lane,
+        stride,
+    ):
+        """This lane's payload words and scale byte of the warp's row ``step``.
+
+        ``payload_lane`` and ``scale_lane`` are the addresses of the lane's bytes of pool
+        row 0. A masked row reads nothing and yields zeros.
+        """
+        pool = self.main
+        row = prims.shfl_sync(
+            thread_mask=0xFFFFFFFF,
+            val=own_row,
+            offset=Int32(step),
+            mask_and_clamp=0x1F,
+            kind=prims.Shfl.IDX,
+        )
+        # Pools hold fewer than 0x7FFFFFFF rows, so this also rejects the sentinel.
+        valid = row < pool.shape[0]
+        offset = Int64(cutlass.Uint64(cutlass.Uint32(row)) * cutlass.Uint64(stride))
+        low, high, scale = _load_record_lane(
+            payload_lane + offset, scale_lane + offset, Int32(1) if valid else Int32(0)
+        )
+        return (low, high), scale, valid
+
+    @cute.jit
+    def _finish_quads(
+        self,
+        is_main: cutlass.Constexpr[bool],
+        words: cutlass.Array,
+        warp: Int32,
+        quads_per_warp: cutlass.Constexpr[int],
+        row_in_quad: Int32,
+        chunk_in_row: Int32,
+        dimension: Int32,
+        pending: cutlass.Constexpr[int],
+    ) -> None:
+        """Wait until at most ``pending`` later groups are in flight, then decode in place."""
+        prims.cp_async_wait_group(pending)
+        if cutlass.const_expr(is_main and self.main_cache_format == "main"):
             self._decode_main_slots(
                 words, warp, quads_per_warp, row_in_quad, chunk_in_row, dimension
             )
@@ -473,14 +911,21 @@ class _PackedSmemKvResource(SmemKvResource):
         and NaN.
         """
         shift = ((dimension // Int32(16)) & Int32(3)) * Int32(8)
-        for owner in cutlass.range(quads_per_warp, unroll=1):
-            slot = self._chunk_offset(warp, quads_per_warp, owner, row_in_quad, chunk_in_row)
-            chunk = words.data_ptr(slot // Int32(4)).load(count=4, alignment=16)
+        # Every quad's chunk is read before any is converted, so the shared-memory reads and
+        # the conversion chains of the warp's quads overlap.
+        slots = []
+        chunks = []
+        for owner in cutlass.range_constexpr(quads_per_warp):
+            slot = self._chunk_offset(warp, quads_per_warp, Int32(owner), row_in_quad, chunk_in_row)
+            slots.append(slot)
+            chunks.append(words.data_ptr(slot // Int32(4)).load(count=4, alignment=16))
+        for owner in cutlass.range_constexpr(quads_per_warp):
+            chunk = chunks[owner]
             scale = Int32(chunk[2]) >> shift
             values = cutlass.Array(Int32, 4, space=cutlass.AddressSpace.rmem)
             values[0], values[1] = _cvt_e2m1_word_to_e4m3_words(Int32(chunk[0]), scale)
             values[2], values[3] = _cvt_e2m1_word_to_e4m3_words(Int32(chunk[1]), scale)
-            words.data_ptr(slot // Int32(4)).store(values.load(0, 4), alignment=16)
+            words.data_ptr(slots[owner] // Int32(4)).store(values.load(0, 4), alignment=16)
 
     @cute.jit
     def _swa_quads(self, *quads) -> None:
@@ -513,6 +958,191 @@ class _PackedSmemKvResource(SmemKvResource):
                 self._swa_quads(*quads)
         else:
             self._swa_quads(*quads)
+
+    @cute.jit
+    def _claim_tile_slots(self, stage_info: StageInfo, stages: cutlass.Constexpr[int]) -> tuple:
+        """Operand words of a K tile's ``stages`` consecutive ring slots, the acquired one first.
+
+        Each later slot's empty barrier is waited on here, as that slot's own acquire will.
+        """
+        cfg = self.cfg
+        slots = ()
+        for part in cutlass.range_constexpr(stages):
+            future = stage_info.stage_idx + part
+            slot = future - cfg.kv_stages if future >= cfg.kv_stages else future
+            if cutlass.const_expr(part > 0):
+                phase = self.producer_state.phase ^ Int32(future >= cfg.kv_stages)
+                self.pipeline.sync_object_empty.wait(slot, phase)
+            slots += (self._ring_slot_words(stage_info, part),)
+        return slots
+
+    @cute.jit
+    def _ring_slot_words(self, stage_info: StageInfo, ahead: cutlass.Constexpr[int]):
+        """Operand words of the ring slot ``ahead`` slots after the acquired one."""
+        cfg = self.cfg
+        future = stage_info.stage_idx + ahead
+        slot = future - cfg.kv_stages if future >= cfg.kv_stages else future
+        return cutlass.Array(
+            self._smem_kv.subview(self.kv_stage_offset(slot)).data_ptr(),
+            dtype=Int32,
+            shape=(cfg.kv_smem_tile_bytes // 4,),
+            addrspace=3,
+        )
+
+    @cute.jit
+    def _batched_async_slice(
+        self,
+        is_main: cutlass.Constexpr[bool],
+        stage_info: StageInfo,
+        head_stage: cutlass.Constexpr[int],
+        stages: cutlass.Constexpr[int],
+        words: cutlass.Array,
+        cached_page_ids,
+        base: int,
+        warp: Int32,
+        quads_per_warp: cutlass.Constexpr[int],
+        row_in_quad: Int32,
+        chunk_in_row: Int32,
+    ) -> None:
+        """Slice ``head_stage`` of a K tile whose slices' rows are all read with its first.
+
+        The first slice claims the tile's later ring slots. A packed MAIN tile is then read and
+        decoded into every slot at once (``_load_main_tile_rows``); other tiles issue every
+        slice's copies, one cp.async group per slice in slice order, and each slice waits for
+        its own group. A tile thus waits for one round trip to memory, not one per slice.
+        """
+        width = self.cfg.head_dim_per_stage_kv
+        if cutlass.const_expr(is_main and self.main_after_wait and head_stage == 0):
+            prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
+        if cutlass.const_expr(is_main and self.main_cache_format == "main"):
+            if cutlass.const_expr(head_stage == 0):
+                # Every slice's operand is final here; the later slices only publish theirs.
+                self._load_main_tile_rows(
+                    self._claim_tile_slots(stage_info, stages),
+                    cached_page_ids,
+                    base,
+                    warp,
+                    quads_per_warp,
+                )
+            return
+        if cutlass.const_expr(head_stage == 0):
+            self._issue_tile(
+                is_main,
+                self._claim_tile_slots(stage_info, stages),
+                cached_page_ids,
+                base,
+                warp,
+                quads_per_warp,
+                row_in_quad,
+                chunk_in_row,
+            )
+        self._finish_quads(
+            is_main,
+            words,
+            warp,
+            quads_per_warp,
+            row_in_quad,
+            chunk_in_row,
+            Int32(head_stage * width) + chunk_in_row * Int32(16),
+            stages - 1 - head_stage,
+        )
+
+    @cute.jit
+    def _batched_swa_slice(
+        self,
+        stage_info: StageInfo,
+        head_stage: cutlass.Constexpr[int],
+        stages: cutlass.Constexpr[int],
+        words: cutlass.Array,
+        cached_page_ids,
+        base: int,
+        warp: Int32,
+        quads_per_warp: cutlass.Constexpr[int],
+        row_in_quad: Int32,
+        chunk_in_row: Int32,
+        lane: Int32,
+    ) -> None:
+        if cutlass.const_expr(self.swa_cache_format == "swa_fp8"):
+            self._batched_async_slice(
+                False,
+                stage_info,
+                head_stage,
+                stages,
+                words,
+                cached_page_ids,
+                base,
+                warp,
+                quads_per_warp,
+                row_in_quad,
+                chunk_in_row,
+            )
+        else:
+            # Scaled legacy SWA rows keep one synchronous slice per stage.
+            if cutlass.const_expr(head_stage == 0):
+                self._prefetch_tile_rows(cached_page_ids, base, lane, quads_per_warp)
+            self._serial_quads(
+                words,
+                cached_page_ids,
+                base,
+                warp,
+                quads_per_warp,
+                row_in_quad,
+                chunk_in_row,
+                Int32(head_stage * self.cfg.head_dim_per_stage_kv) + chunk_in_row * Int32(16),
+            )
+
+    @cute.jit
+    def _batched_k_slice(
+        self,
+        stage_info: StageInfo,
+        head_stage: cutlass.Constexpr[int],
+        stages: cutlass.Constexpr[int],
+        words: cutlass.Array,
+        cached_page_ids,
+        base: int,
+        warp: Int32,
+        quads_per_warp: cutlass.Constexpr[int],
+        row_in_quad: Int32,
+        chunk_in_row: Int32,
+        lane: Int32,
+    ) -> None:
+        """Stage one D128 slice of a retained K tile, copying the whole tile at its first slice."""
+        args = (
+            stage_info,
+            head_stage,
+            stages,
+            words,
+            cached_page_ids,
+            base,
+            warp,
+            quads_per_warp,
+            row_in_quad,
+            chunk_in_row,
+        )
+        if cutlass.const_expr(self.has_extra):
+            first = prims.shfl_sync(
+                thread_mask=0xFFFFFFFF,
+                val=cached_page_ids[base],
+                offset=0,
+                mask_and_clamp=0x1F,
+                kind=prims.Shfl.IDX,
+            )
+            # As in _stage_quads, lane 0's tag selects the warp's (and tile's) source.
+            if first < Int32(0):
+                self._batched_async_slice(True, *args)
+            else:
+                self._wait_for_swa_rows(head_stage)
+                self._batched_swa_slice(*args, lane)
+        else:
+            self._wait_for_swa_rows(head_stage)
+            self._batched_swa_slice(*args, lane)
+
+    @cute.jit
+    def _wait_for_swa_rows(self, head_stage: cutlass.Constexpr[int]) -> None:
+        """Wait for the preceding grid before a tile's first SWA row read when the kernel runs
+        ahead of it: that grid may still write this step's SWA rows."""
+        if cutlass.const_expr(self.cfg.sparse_inputs_final and head_stage == 0):
+            prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
 
     @cute.jit
     def _producer_load_kv_stage(
@@ -548,21 +1178,163 @@ class _PackedSmemKvResource(SmemKvResource):
         row_in_quad = lane >> Int32(3)
         chunk_in_row = lane & Int32(7)
         dimension = dim_offset + chunk_in_row * Int32(16)
-        if cutlass.const_expr(not is_v and head_stage == 0):
-            # Later D128 slices of the same rows then hit L2.
-            self._prefetch_tile_rows(cached_page_ids, base, lane, quads_per_warp)
-        self._stage_quads(
-            words,
-            cached_page_ids,
-            base,
-            warp,
-            quads_per_warp,
-            row_in_quad,
-            chunk_in_row,
-            dimension,
-        )
+        if cutlass.const_expr(
+            not is_v and cfg.sparse_reuse_kv and self.aligned_strides and cfg.qk_head_dim_stages > 1
+        ):
+            # A retained K tile takes consecutive ring slots, so its first slice can claim the
+            # later ones and start every slice's copies.
+            self._batched_k_slice(
+                stage_info,
+                head_stage,
+                cfg.qk_head_dim_stages,
+                words,
+                cached_page_ids,
+                base,
+                warp,
+                quads_per_warp,
+                row_in_quad,
+                chunk_in_row,
+                lane,
+            )
+        else:
+            if cutlass.const_expr(self.cfg.sparse_inputs_final):
+                # Any stage may read SWA rows the preceding grid still writes.
+                prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
+            if cutlass.const_expr(not is_v and head_stage == 0):
+                # Later D128 slices of the same rows then hit L2.
+                self._prefetch_tile_rows(cached_page_ids, base, lane, quads_per_warp)
+            self._stage_quads(
+                words,
+                cached_page_ids,
+                base,
+                warp,
+                quads_per_warp,
+                row_in_quad,
+                chunk_in_row,
+                dimension,
+            )
         # The async/UMMA pipeline's commit publishes thread arrivals after all
         # generic SMEM stores are visible to tcgen05. There are no TMA bytes.
+        cute.arch.fence_view_async_shared()
+
+
+@cute.jit
+def _rope_bf16_pair(pair: Int32, cosine: Float32, sine: Float32) -> Int32:
+    """GPT-J rotation of one BF16 channel pair (low half x, high half y), rounded to BF16.
+
+    ``x * cos - y * sin`` and ``x * sin + y * cos`` with the rounding of ``mla_rope_inplace``:
+    each product into an FMA is rounded first, then the FMA, then the result to BF16.
+    """
+    x = prims.mov_b32(pair << Int32(16), target_type=Float32)
+    y = prims.mov_b32(pair & Int32(-65536), target_type=Float32)
+    return cute.arch.inline_ptx(
+        "{\n"
+        "  .reg .f32 t, u, a, b;\n"
+        "  mul.rn.f32 t, {$r3}, {$r1};\n"
+        "  neg.f32 t, t;\n"
+        "  fma.rn.f32 a, {$r2}, {$r0}, t;\n"
+        "  mul.rn.f32 u, {$r2}, {$r1};\n"
+        "  fma.rn.f32 b, {$r3}, {$r0}, u;\n"
+        "  cvt.rn.bf16x2.f32 {$w0}, b, a;\n"
+        "}",
+        write_only_types=[Int32],
+        read_only_args=[x, y, cosine, sine],
+    )
+
+
+@cute.jit
+def _bf16_pairs_to_e4m3(lo: Int32, hi: Int32) -> Int32:
+    """Four BF16 channels (two pairs) as RN/satfinite E4M3 bytes in channel order."""
+    return pack_float4_to_fp8_e4m3(
+        prims.mov_b32(lo << Int32(16), target_type=Float32),
+        prims.mov_b32(lo & Int32(-65536), target_type=Float32),
+        prims.mov_b32(hi << Int32(16), target_type=Float32),
+        prims.mov_b32(hi & Int32(-65536), target_type=Float32),
+    )
+
+
+@dataclass(kw_only=True)
+class _RopeSmemQResource(SmemQResource):
+    """Stage a tile's unit-scale E4M3 Q from the BF16 projection before its RoPE.
+
+    The load warps rotate the last 64 channels of each head (GPT-J pairs, with the angle's
+    FP32 ``cos_sin[position]`` entries), round to E4M3 RN/satfinite and write the 128B-swizzled
+    D128 panels the Q descriptors read, zeroing rows past the tile's heads. The bytes equal
+    ``gptj_rope_e4m3_small_m`` staged through the Q descriptors.
+    """
+
+    q_source: object = None
+    positions: object = None
+    cos_sin: object = None
+
+    @producer_work
+    @cute.jit
+    def load_q(self, stage_info: StageInfo):
+        cfg = self.cfg
+        stage = self._smem_q.subview(stage_info.stage_idx * Int32(cfg.q_smem_tile_elements))
+        words = cutlass.Array(
+            stage.data_ptr(), dtype=Int32, shape=(cfg.qk_smem_tile_bytes // 4,), addrspace=3
+        )
+        heads = Int32(self.q_source.shape[1])
+        batch = batch_idx_for_stage_cfg(self.batch_idx, cfg, stage_info)
+        first_head = cta_idx_q_for_stage(self.cta_idx_q, stage_info) * Int32(
+            cfg.num_heads_q
+        ) + head_idx_for_stage(self.head_idx, cfg, stage_info)
+        position = Int64(self.positions[Int64(batch)])
+        rope_start = cfg.head_dim_qk - 64
+        thread = cute.arch.thread_idx()[0] - Int32(cfg.load_warp_idx * 32)
+        # A tile row holds 512 channels: 32 chunks of 16, eight per D128 panel. Consecutive
+        # threads take consecutive chunks of a head, so each warp reads one head's row.
+        chunks = cfg.tile_size_q * (cfg.head_dim_qk // 16)
+        for step in cutlass.range_constexpr(chunks // (32 * cfg.load_num_warps)):
+            chunk = Int32(step * 32 * cfg.load_num_warps) + thread
+            row = chunk // Int32(32)
+            channel = (chunk % Int32(32)) * Int32(16)
+            head = first_head + row
+            values = cutlass.Array(Int32, 4, space=cutlass.AddressSpace.rmem)
+            for word in cutlass.range_constexpr(4):
+                values[word] = Int32(0)
+            if head < heads:
+                source = cutlass.Pointer(
+                    self.q_source.iterator
+                    + (Int64(batch) * Int64(heads) + Int64(head)) * Int64(cfg.head_dim_qk)
+                    + Int64(channel),
+                    dtype=Int32,
+                )
+                pairs = cutlass.Array(Int32, 8, space=cutlass.AddressSpace.rmem)
+                for half in cutlass.range_constexpr(2):
+                    loaded = (source + half * 4).load(count=4, alignment=16)
+                    for word in cutlass.range_constexpr(4):
+                        pairs[half * 4 + word] = Int32(loaded[word])
+                if channel >= Int32(rope_start):
+                    # Pair p of the rotated channels uses cos_sin[position, 0, p] and
+                    # cos_sin[position, 1, p].
+                    first_pair = (channel - Int32(rope_start)) // Int32(2)
+                    angles = cutlass.Pointer(
+                        self.cos_sin.iterator + position * Int64(64) + Int64(first_pair),
+                        dtype=Float32,
+                    )
+                    for half in cutlass.range_constexpr(2):
+                        cosines = (angles + half * 4).load(count=4, alignment=16)
+                        sines = (angles + 32 + half * 4).load(count=4, alignment=16)
+                        for word in cutlass.range_constexpr(4):
+                            pairs[half * 4 + word] = _rope_bf16_pair(
+                                pairs[half * 4 + word],
+                                Float32(cosines[word]),
+                                Float32(sines[word]),
+                            )
+                for word in cutlass.range_constexpr(4):
+                    values[word] = _bf16_pairs_to_e4m3(pairs[2 * word], pairs[2 * word + 1])
+            panel = channel // Int32(cfg.head_dim_per_stage_kv)
+            chunk_in_row = (channel % Int32(cfg.head_dim_per_stage_kv)) // Int32(16)
+            offset = (
+                panel * Int32(q_stage_smem_element_offset(cfg, 1))
+                + row * Int32(128)
+                + ((chunk_in_row ^ (row & Int32(7))) << Int32(4))
+            )
+            words.data_ptr(offset // Int32(4)).store(values.load(0, 4), alignment=16)
+        # The async/UMMA pipeline's commit publishes thread arrivals after all generic SMEM
+        # stores are visible to tcgen05.
         cute.arch.fence_view_async_shared()
 
 
@@ -575,12 +1347,21 @@ class PackedKvProducer:
     loads are compiled. Each kernel carries a single path to keep its code small.
     ``main_cache_format`` selects persistent NVFP4 MAIN records (``main``) or
     unit-scale E4M3 rows already decoded from them (``main_fp8``).
+    ``raw_selections`` reads the selections as the layer publishes them instead of
+    compacted INT32 physical rows: INT64 SWA slots and INT32 logical MAIN positions
+    resolved through the owner's page table (see :class:`_RawKVIndices`).
+    ``main_after_wait`` (a kernel running ahead of its preceding launch) defers every read
+    of the MAIN selections and rows to after the wait for that launch, which may still
+    produce them; the query, the SWA slots and the page table are read before it.
     """
 
     has_extra: bool
     swa_cache_format: SwaCacheFormat = "swa"
     aligned_strides: bool = True
     main_cache_format: PrimsTSMainFormat = "main"
+    raw_selections: bool = False
+    query_rope: bool = False
+    main_after_wait: bool = False
 
     def __post_init__(self) -> None:
         if self.swa_cache_format not in ("swa", "swa_fp8"):
@@ -608,6 +1389,8 @@ class PackedKvProducer:
             "dynamic_outer_byte_stride",
             self.has_extra,
             self.aligned_strides,
+            ("i64_slots", "i32_logical_paged") if self.raw_selections else ("i32_physical",),
+            ("bf16_gptj_rope_query",) if self.query_rope else ("e4m3_query",),
         )
 
     def pipeline_config(
@@ -628,16 +1411,16 @@ class PackedKvProducer:
             or cfg.tile_size_kv != 128
             or cfg.num_tokens_per_page != 1
             or cfg.load_num_warps not in (1, 2, 4, 8)
-            or cfg.q_stages != 2
+            or cfg.q_stages not in (1, 2)
             or cfg.kv_stages < 8
             # A single V owner reads V from its retained K stages; a V split may
             # read its slices there too or load them separately.
             or (cfg.head_dim_per_cta_v == 512 and not cfg.sparse_reuse_kv)
         ):
             raise ValueError(
-                "CSA2 packed KV requires E4M3 D512/D128 single-pipe Keep-AB "
-                "with M64/BK128/page1, Q2, at least eight KV stages and retained KV "
-                "whenever one CTA owns all of V"
+                "CSA2 packed KV requires E4M3 D512/D128 single-pipe Keep-AB with "
+                "M64/BK128/page1, one or two Q stages, at least eight KV stages and "
+                "retained KV whenever one CTA owns all of V"
             )
         return PipelineConfig.create_async_umma_pipeline_cfg(
             num_stages=cfg.kv_stages,
@@ -646,6 +1429,118 @@ class PackedKvProducer:
             cta_layout_vmnk=cta_layout_vmnk,
             consumer_signaling_threads=SignalingThreads.CtaLeader,
         )
+
+    @cute.jit
+    def prefetch_selections(self, indices: tuple, request, warp: cutlass.Constexpr[int]) -> None:
+        """Warm L1 with a query row's raw selection lists, its request and its visible length.
+
+        Issued at the kernel's start by ``warp``, the warp that resolves them once the task
+        graph runs, so its first selection reads hit L1 instead of waiting for L2.
+        """
+        if cutlass.const_expr(self.raw_selections and request is not None):
+            if cute.arch.make_warp_uniform(cute.arch.warp_idx()) == Int32(warp):
+                lane = cute.arch.lane_idx()
+                swa_indices, main_indices = indices[:2]
+                row = Int64(request)
+                swa_start = swa_indices.iterator.toint() + row * Int64(
+                    swa_indices.stride[0]
+                ) * Int64(8)
+                # One more line than the row spans covers an unaligned row start.
+                swa_lines = (Int32(swa_indices.shape[1]) * Int32(8) + Int32(127)) // Int32(
+                    128
+                ) + Int32(1)
+                if lane < swa_lines:
+                    cute.arch.inline_ptx(
+                        "prefetch.global.L1 [{$r0}];",
+                        read_only_args=[swa_start + Int64(lane) * Int64(128)],
+                    )
+                if cutlass.const_expr(self.has_extra):
+                    pages, requests, visible = indices[2:5]
+                    main_start = main_indices.iterator.toint() + row * Int64(
+                        main_indices.stride[0]
+                    ) * Int64(4)
+                    main_lines = (Int32(main_indices.shape[1]) * Int32(4) + Int32(127)) // Int32(
+                        128
+                    ) + Int32(1)
+                    main_lane = lane - swa_lines
+                    # A MAIN list the preceding launch may still write must not reach L1
+                    # before the wait for it: later reads could hit the stale lines.
+                    if cutlass.const_expr(not self.main_after_wait):
+                        if main_lane >= Int32(0) and main_lane < main_lines:
+                            cute.arch.inline_ptx(
+                                "prefetch.global.L1 [{$r0}];",
+                                read_only_args=[main_start + Int64(main_lane) * Int64(128)],
+                            )
+                    if lane == Int32(30):
+                        cute.arch.inline_ptx(
+                            "prefetch.global.L1 [{$r0}];",
+                            read_only_args=[requests.iterator.toint() + row * Int64(8)],
+                        )
+                    if lane == Int32(31):
+                        cute.arch.inline_ptx(
+                            "prefetch.global.L1 [{$r0}];",
+                            read_only_args=[visible.iterator.toint() + row * Int64(8)],
+                        )
+
+    def query_pipeline_config(
+        self, cfg: object, load_group: object, umma_group: object, cta_layout_vmnk: tuple
+    ) -> PipelineConfig:
+        """Q stages the load warps write themselves publish thread arrivals."""
+        if cfg.q_in_kv or cfg.q_tma_stage or cfg.q_nope_tmem or cfg.rope_dim:
+            raise ValueError("CSA2 query RoPE stages ordinary SMEM Q panels only")
+        return PipelineConfig.create_async_umma_pipeline_cfg(
+            num_stages=cfg.q_stages,
+            producer_group=load_group,
+            consumer_group=umma_group,
+            cta_layout_vmnk=cta_layout_vmnk,
+            consumer_signaling_threads=SignalingThreads.CtaLeader,
+        )
+
+    def query_args(self, lists: tuple):
+        """The BF16 query, its positions and cos/sin table after a query-RoPE plan's lists."""
+        return tuple(lists[7:10]) if self.query_rope else None
+
+    @cute.jit
+    def prefetch_query(
+        self,
+        query_args: tuple,
+        request,
+        first_warp: cutlass.Constexpr[int],
+        warps: cutlass.Constexpr[int],
+    ) -> None:
+        """Warm L1 with a query row's BF16 query and its position at the kernel's start.
+
+        Issued by the ``warps`` load warps from ``first_warp`` that stage the rotated Q, so
+        their Q reads hit L1 and only the position's cos/sin entries wait for L2.
+        """
+        if cutlass.const_expr(self.query_rope and request is not None):
+            q_source, positions, _ = query_args
+            warp = cute.arch.make_warp_uniform(cute.arch.warp_idx()) - Int32(first_warp)
+            if warp >= Int32(0) and warp < Int32(warps):
+                thread = warp * Int32(32) + cute.arch.lane_idx()
+                row_bytes = Int32(q_source.shape[1]) * Int32(q_source.shape[2]) * Int32(2)
+                start = q_source.iterator.toint() + Int64(request) * Int64(row_bytes)
+                # One more line than the row spans covers an unaligned row start.
+                lines = (row_bytes + Int32(127)) // Int32(128) + Int32(1)
+                for step in cutlass.range_constexpr(_QUERY_PREFETCH_LINES_PER_THREAD):
+                    line = thread + Int32(step * warps * 32)
+                    if line < lines:
+                        cute.arch.inline_ptx(
+                            "prefetch.global.L1 [{$r0}];",
+                            read_only_args=[start + Int64(line) * Int64(128)],
+                        )
+                if thread == Int32(0):
+                    cute.arch.inline_ptx(
+                        "prefetch.global.L1 [{$r0}];",
+                        read_only_args=[
+                            positions.iterator.toint()
+                            + Int64(request) * Int64(positions.element_type.width // 8)
+                        ],
+                    )
+
+    def make_query_resource(self, query_args: tuple, **kwargs: object) -> SmemQResource:
+        q_source, positions, cos_sin = query_args
+        return _RopeSmemQResource(q_source=q_source, positions=positions, cos_sin=cos_sin, **kwargs)
 
     def make_resource(self, sources: tuple, **kwargs: object) -> SmemKvResource:
         swa, main = sources
@@ -656,6 +1551,7 @@ class PackedKvProducer:
             swa_cache_format=self.swa_cache_format,
             main_cache_format=self.main_cache_format,
             aligned_strides=self.aligned_strides,
+            main_after_wait=self.main_after_wait,
             **kwargs,
         )
 
@@ -670,19 +1566,47 @@ class PackedKvProducer:
         *,
         request=None,
     ) -> tuple:
-        """Bind format-tagged UINT8 SWA/MAIN pools to both physical-row lists."""
-        # The first sparse-input slot carries both lists; the two source slots
-        # remain opaque packed UINT8 pools. Operands are decoded at unit tensor
-        # scale, so no FP8-primary tensor scale is bound.
-        swa_indices, main_indices = indices
+        """Bind format-tagged UINT8 SWA/MAIN pools to both selection lists."""
+        # The first sparse-input slot carries both lists (and, for raw selections, the MAIN
+        # owner's page-table mapping); the two source slots remain opaque packed UINT8 pools.
+        # Operands are decoded at unit tensor scale, so no FP8-primary tensor scale is bound.
+        swa_indices, main_indices = indices[:2]
         source = SparseKVIndices(
             (swa_indices, main_indices, swa_lengths, main_lengths, None, None, None, None),
             capacity,
             assume_valid_prefix=False,
             has_extra=self.has_extra,
         )
-        routes = _BoundedKVIndices(source, (Int32(sources[0].shape[0]), Int32(sources[1].shape[0])))
-        if cutlass.const_expr(request is not None):
+        pool_rows = (Int32(sources[0].shape[0]), Int32(sources[1].shape[0]))
+        if cutlass.const_expr(self.raw_selections):
+            pages, requests, visible, max_positions, page_size = indices[2:7]
+            # Scalar kernel arguments enter the routes as values computed here, at the kernel's
+            # top level: the tracer cannot thread a raw argument read inside its loops.
+            routes = _RawKVIndices(
+                source,
+                (
+                    pages,
+                    requests,
+                    visible,
+                    cute.math.max(Int64(max_positions), Int64(0)),
+                    cute.math.max(Int32(page_size), Int32(1)),
+                    *pool_rows,
+                ),
+                self.main_after_wait,
+            )
+        else:
+            routes = _BoundedKVIndices(source, pool_rows)
+        if cutlass.const_expr(request is not None and self.raw_selections):
+            # Every entry of a raw list is live: its lengths are the planned widths, so no
+            # length is loaded.
+            routes = routes.bind_query_row(
+                request,
+                Int32(swa_indices.shape[1]),
+                Int32(main_indices.shape[1]) if cutlass.const_expr(self.has_extra) else None,
+            )
+            length = _sparse_execution_length(routes.primary_length, routes.extra_length)
+            lengths = SparseKVLengths((None, None, length, swa_lengths.shape[0]), self.has_extra)
+        elif cutlass.const_expr(request is not None):
             routes = routes.bind_query_row(request)
             length = _sparse_execution_length(routes.primary_length, routes.extra_length)
             lengths = SparseKVLengths((None, None, length, swa_lengths.shape[0]), self.has_extra)

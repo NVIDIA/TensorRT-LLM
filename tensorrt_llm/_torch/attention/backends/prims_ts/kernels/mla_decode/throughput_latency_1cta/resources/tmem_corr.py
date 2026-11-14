@@ -157,6 +157,12 @@ class TmemCorrResource(MlaResource):
     # TMA descriptor of the public output, used by the WS TMA output stores.
     tma_o_desc: object = None
     _tail_sink: object = None
+    # Cluster split finisher: the first CTA's buffer that every split's partials are pushed
+    # into (cfg.cluster_split_push_bytes) and its transaction barrier.
+    _split_push_alloc: cutlass.Constexpr[Optional[SmemAllocation]] = None
+    _split_push_barrier_alloc: cutlass.Constexpr[Optional[SmemAllocation]] = None
+    _split_push_smem: object = None
+    _split_push_barrier: object = None
 
     def _prefetches_tail_sink(self):
         # Keep-AB fused epilogues read one sink per row-owning lane: one per
@@ -253,6 +259,21 @@ class TmemCorrResource(MlaResource):
 
     def get_smem_requirements(self):
         """Return correction/output SMEM scratch and optional cluster buffers."""
+        allocs = list(self._correction_smem_requirements())
+        if self.cfg.cluster_split_finisher:
+            if self._split_push_alloc is None:
+                self._split_push_alloc = SmemAllocation(
+                    name=f"{self.name}_splitPush",
+                    size_bytes=self.cfg.cluster_split_push_bytes,
+                    alignment=16,
+                )
+                self._split_push_barrier_alloc = SmemAllocation(
+                    name=f"{self.name}_splitPushBarrier", size_bytes=8, alignment=8
+                )
+            allocs += [self._split_push_alloc, self._split_push_barrier_alloc]
+        return allocs
+
+    def _correction_smem_requirements(self):
         if self.cfg.ws_pv and self.inst_id == 1:
             if self._ws_scale_alloc is None:
                 self._ws_scale_alloc = SmemAllocation(
@@ -399,8 +420,15 @@ class TmemCorrResource(MlaResource):
 
     @cute.jit
     def create_cluster_function_variables(self, context) -> None:
-        """Bind cluster correction SMEM and initialize its transaction barrier."""
+        """Bind cluster correction SMEM and initialize its transaction barriers.
 
+        The kernel entry calls this before the cluster arrival, so every barrier a peer
+        completes (the split push barrier, the reduction slice barriers) is armed before any
+        peer can publish into it.
+        """
+
+        if cutlass.const_expr(self._split_push_alloc is not None):
+            self._init_split_push(context)
         if cutlass.const_expr(self.cfg.use_cluster_reduction == 1):
             self._init_store_state_from_context(context)
 
@@ -487,6 +515,99 @@ class TmemCorrResource(MlaResource):
         if cutlass.const_expr(self.cfg.single_kv_pipe):
             return Int32(2 * self.cfg.tmem_s_cols)
         return Int32(2 * self.cfg.tmem_s_cols + 2 * self.cfg.tmem_stats_cols)
+
+    @cute.jit
+    def _init_split_push(self, context) -> None:
+        """Bind the split push buffer; the cluster's first CTA arms its transaction barrier.
+
+        The barrier expects every split's partial O and LSE of each covered row. It runs at
+        the kernel entry (``create_cluster_function_variables``), before the cluster arrival
+        that every pushing thread waits on: a push that reached the barrier before its
+        initialization would be lost and leave the first CTA waiting.
+        """
+        cfg = self.cfg
+        self._split_push_smem = smem_array(
+            context, self._split_push_alloc, Int8, cfg.cluster_split_push_bytes
+        )
+        self._split_push_barrier = smem_array(context, self._split_push_barrier_alloc, Int64, 1)
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        if warp_idx == Int32(cfg.correction_warp_idx) and rank == Int32(0):
+            with cute.arch.elect_one():
+                prims.mbarrier_init(self._split_push_barrier, 1)
+            prims.bar_warp_sync(cute.arch.FULL_MASK)
+            with cute.arch.elect_one():
+                prims.mbarrier_arrive_expect_tx(
+                    self._split_push_barrier,
+                    Int32(
+                        cfg.num_ctas_per_seq_kv
+                        * cfg.cluster_split_rows
+                        * (cfg.head_dim_per_cta_v * cfg.partial_o_dtype_bytes + 4)
+                    ),
+                )
+
+    @cute.jit
+    def _push_split_bytes(self, byte_offset, words: tuple) -> None:
+        """Store one or four words at ``byte_offset`` of the first cluster CTA's push buffer."""
+        remote = prims.mapa(
+            cutlass.inttoptr(
+                self._split_push_smem.data_ptr().toint(Int64) + Int64(byte_offset),
+                mem_space=3,
+                dtype=Int32,
+            ),
+            Int32(0),
+        )
+        barrier = prims.mapa(self._split_push_barrier, Int32(0))
+        if cutlass.const_expr(len(words) == 4):
+            cute.arch.inline_ptx(
+                "st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 "
+                "[{$r0}], {{$r1}, {$r2}, {$r3}, {$r4}}, [{$r5}];",
+                read_only_args=[remote.ir_value(), *words, barrier.ir_value()],
+            )
+        else:
+            cute.arch.inline_ptx(
+                "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 "
+                "[{$r0}], {$r1}, [{$r2}];",
+                read_only_args=[remote.ir_value(), words[0], barrier.ir_value()],
+            )
+
+    @cute.jit
+    def push_split_o(self, split, row, column, words: tuple) -> None:
+        """Push 8 BF16 partial-O values of ``row`` from ``column`` of this CTA's V slice."""
+        cfg = self.cfg
+        offset = (
+            (split * Int32(cfg.cluster_split_rows) + row) * Int32(cfg.head_dim_per_cta_v)
+            + column
+        ) * Int32(cfg.partial_o_dtype_bytes)
+        self._push_split_bytes(offset, words)
+
+    @cute.jit
+    def push_split_lse(self, split, row, lse_val) -> None:
+        """Push one row's partial LSE (log2 units, as the reducer reads it)."""
+        cfg = self.cfg
+        offset = Int32(
+            cfg.num_ctas_per_seq_kv
+            * cfg.cluster_split_rows
+            * cfg.head_dim_per_cta_v
+            * cfg.partial_o_dtype_bytes
+        ) + (split * Int32(cfg.cluster_split_rows) + row) * Int32(4)
+        self._push_split_bytes(offset, (lse_val.bitcast(Int32),))
+
+    @cute.jit
+    def push_neutral_split(self, split) -> None:
+        """Push ``(O = 0, LSE = -inf)`` for every covered row of a split without a task graph."""
+        cfg = self.cfg
+        thread_idx, _, _ = cute.arch.thread_idx()
+        vectors_per_row = cfg.head_dim_per_cta_v // 8
+        vectors = cfg.cluster_split_rows * vectors_per_row
+        for iteration in cutlass.range_constexpr(ceil_div(vectors, cfg.threads_per_cta)):
+            vector = thread_idx + Int32(iteration * cfg.threads_per_cta)
+            if vector < Int32(vectors):
+                row = vector // Int32(vectors_per_row)
+                column = (vector - row * Int32(vectors_per_row)) * Int32(8)
+                self.push_split_o(split, row, column, (Int32(0), Int32(0), Int32(0), Int32(0)))
+        if thread_idx < Int32(cfg.cluster_split_rows):
+            self.push_split_lse(split, thread_idx, Float32(-Float32.inf))
 
     @cute.jit
     def _init_cluster_reduction_barrier(self):
@@ -759,6 +880,7 @@ class TmemCorrResource(MlaResource):
         if cutlass.const_expr(
             (self.cfg.num_tokens_per_page == 1 and not self.cfg.sparse_d576_reload)
             and self.cfg.use_cluster_reduction != 1
+            and not self.cfg.cluster_split_finisher
         ):
             should_store_lse = should_store_lse and cta_idx_head_dim_v == Int32(0)
         if should_store_lse:
@@ -814,6 +936,9 @@ class TmemCorrResource(MlaResource):
                     self._store_partial_lse_to_cluster_smem(
                         local_row_idx, cta_idx_kv, lse_val
                     )
+                elif cutlass.const_expr(self.cfg.cluster_split_finisher):
+                    if valid_output_row:
+                        self.push_split_lse(cta_idx_kv, local_row_idx, lse_val)
                 elif cutlass.const_expr(self.acc_lse_tensor is not None):
                     if valid_output_row and cta_idx_head_dim_v == Int32(0):
                         split_kv = Int32(self.cfg.num_ctas_per_seq_kv)
@@ -2040,6 +2165,19 @@ class TmemCorrResource(MlaResource):
         # ``tcgen05.ld.sync.aligned`` must remain convergent across the warp.
         # Padded query rows still own valid physical TMEM rows, so load and
         # normalize every row and predicate only the externally visible store.
+        batched_loads = []
+        if cutlass.const_expr(not cfg.ws_pv):
+            # Every chunk's TMEM load is in flight before the one wait.
+            for chunk_idx in cutlass.range_constexpr(0, cfg.head_dim_per_stage_v // 2, 8):
+                batched_loads.append(
+                    tcgen05_ld_16x32bx2_f32(
+                        prims.make_tmem_ptr(base_addr0 + Int32(chunk_idx), Float32),
+                        num=8,
+                        offset=Int32(cfg.head_dim_per_stage_v // 2),
+                    )
+                )
+            prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
+            cute.arch.fence_view_async_tmem_load()
         for chunk_idx in cutlass.range_constexpr(
             0,
             128 if cfg.ws_pv else cfg.head_dim_per_stage_v // 2,
@@ -2051,14 +2189,10 @@ class TmemCorrResource(MlaResource):
                     prims.make_tmem_ptr(base_addr0 + Int32(chunk_idx), Float32),
                     num=32,
                 )
+                prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
+                cute.arch.fence_view_async_tmem_load()
             else:
-                o_loaded = tcgen05_ld_16x32bx2_f32(
-                    prims.make_tmem_ptr(base_addr0 + Int32(chunk_idx), Float32),
-                    num=8,
-                    offset=Int32(cfg.head_dim_per_stage_v // 2),
-                )
-            prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
-            cute.arch.fence_view_async_tmem_load()
+                o_loaded = batched_loads[chunk_idx // 8]
             # Load32 columns per lane, then retain the same aligned16B
             # stores and exact BF16 rounding in four8-value subchunks.
             for store_sub in cutlass.range_constexpr(0, 32 if cfg.ws_pv else 8, 8):
@@ -2122,6 +2256,14 @@ class TmemCorrResource(MlaResource):
                 ):
                     if valid_store:
                         dst_ptr.store(packed_o.load(0, 2), alignment=8)
+                elif cutlass.const_expr(cfg.cluster_split_finisher):
+                    if valid_store:
+                        self.push_split_o(
+                            cta_idx_kv,
+                            local_row_idx,
+                            store_col_base - head_dim_offset + Int32(chunk_idx + store_sub),
+                            (packed_o[0], packed_o[1], packed_o[2], packed_o[3]),
+                        )
                 else:
                     if valid_store:
                         dst_ptr.store(packed_o.load(0, 4), alignment=16)
@@ -2641,6 +2783,10 @@ class TmemCorrResource(MlaResource):
             inst1_new_max_arr=inst1_new_max_arr,
             inst1_sum_arr=inst1_sum_arr,
         )
+        if cutlass.const_expr(cfg.cluster_split_finisher):
+            # As in _normalize_and_store_tail_o: no partial is pushed before the cluster's
+            # first CTA armed its push barrier.
+            prims.barrier_cluster_wait()
         self._store_lse_to_gmem(stage_info, task_cache, final_max, reduced_sum)
         store_scale = final_scale0[0]
         warp_idx = task_cache[_TASK_CACHE_WARP_IDX]
@@ -3366,6 +3512,10 @@ class TmemCorrResource(MlaResource):
                     inst1_sum_arr=inst1_sum_arr,
                 )
             )
+            if cutlass.const_expr(cfg.cluster_split_finisher):
+                # Pairs the kernel's arrival after setup: the first CTA's push barrier is
+                # armed before any partial is pushed into it.
+                prims.barrier_cluster_wait()
             self._store_lse_to_gmem(stage_info, task_cache, final_max, reduced_sum)
 
             for v_stage_idx in cutlass.range_constexpr(cfg.v_head_dim_stages):

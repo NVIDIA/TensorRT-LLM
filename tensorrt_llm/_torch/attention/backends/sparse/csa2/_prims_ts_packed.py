@@ -67,6 +67,18 @@ __all__ = [
 ]
 
 _COMPILE_OPTIONS = "--enable-tvm-ffi --opt-level 2"
+# Split-KV producer plans merge their splits in the attention kernel's last CTA per query
+# tile instead of a separate reducer launch (the same arithmetic, so the same output).
+_FUSED_SPLIT_FINISH = False
+# Split-KV plans launch each query tile and V partition's splits as one cluster whose first CTA
+# merges them, instead of a reducer launch (the same arithmetic, so the same output).
+_CLUSTER_SPLIT_FINISH = True
+# Largest V partition count per query tile and split.
+_MAX_HEAD_DIM_CTAS = 4
+# The first CTA gathers every split's partials of its rows and V columns in shared memory
+# beside the kernel's own buffers (one Q stage, eight K/V slices, two P tiles and the page
+# offsets): this many bytes fit next to them.
+_CLUSTER_SPLIT_PUSH_LIMIT = 44 * 1024
 _HEAD_DIM = 512
 _QUERY_TILE = 64
 _KV_TILE = 128
@@ -87,6 +99,13 @@ class _CompileSpec:
     # O-A groups of an MXFP8 output kernel; None stores BF16.
     output_groups: int | None
     kernel: ThroughputLatencyMlaDecodeTs = field(compare=False, hash=False, repr=False)
+    # INT64 SWA slots and logical MAIN positions mapped in the kernel (PackedKvProducer).
+    raw_selections: bool = False
+    # The kernel rotates and rounds the BF16 query itself (PackedKvProducer.query_rope).
+    query_rope: bool = False
+    # A runahead kernel's MAIN selections and rows were final before its preceding launch;
+    # False waits for that launch before reading them (PackedKvProducer.main_after_wait).
+    main_ready: bool = True
 
 
 @dataclass(frozen=True)
@@ -133,6 +152,12 @@ class _Plan:
     valid_prefix: bool
     output_groups: int | None
     spec: _CompileSpec
+    raw_selections: bool
+    query_rope: bool
+    # The kernel runs ahead of its preceding launch (``plan``'s ``inputs_final``).
+    inputs_final: bool
+    # ... with its MAIN reads after the wait for that launch (``plan``'s ``main_ready``).
+    main_ready: bool
     # The packed producer kernel; a gather or NVFP4 plan compiles it only for a
     # pool whose rows are not dense records of their format.
     compiled: Callable[..., object] | None
@@ -163,9 +188,21 @@ def _validate_geometry(rows: int, heads: int, max_topk: int, max_extra_topk: int
     return capacity
 
 
+def _cluster_push_bytes(splits: int, heads: int, head_dim_ctas: int) -> int:
+    """Shared memory the cluster merge gathers: per row and split, the BF16 partial O of the
+    V columns and the FP32 LSE."""
+    return splits * min(heads, _QUERY_TILE) * (_HEAD_DIM // head_dim_ctas * 2 + 4)
+
+
 @cache
-def _select_packed_profile(rows: int, heads: int, capacity: int, sm_count: int) -> SparseMlaProfile:
-    """Choose only the producer-supported family, including padded narrow heads."""
+def _select_packed_profile(
+    rows: int, heads: int, capacity: int, sm_count: int, inputs_final: bool = False
+) -> SparseMlaProfile:
+    """Choose only the producer-supported family, including padded narrow heads.
+
+    ``inputs_final``: the query, selections, page table and MAIN rows were final before the
+    launch preceding this one (see ``SparseMlaProfile.inputs_final``).
+    """
     work_tiles = rows * ((heads + _QUERY_TILE - 1) // _QUERY_TILE)
     kv_tiles = (capacity + _KV_TILE - 1) // _KV_TILE
     partitions = min(kv_tiles, max(1, sm_count // work_tiles), 128)
@@ -175,13 +212,34 @@ def _select_packed_profile(rows: int, heads: int, capacity: int, sm_count: int) 
     # Split V over more CTAs while the grid still fits one wave. Each V owner
     # reads its own D128 slices of the retained K tile, so only the PV,
     # correction and output work divides; a second wave would cost more.
-    head_dim_ctas = next((v for v in (4, 2) if work_tiles * splits * v <= sm_count), 1)
+    head_dim_ctas = next(
+        (v for v in (4, 2) if v <= _MAX_HEAD_DIM_CTAS and work_tiles * splits * v <= sm_count), 1
+    )
+    if inputs_final:
+        # A plan that runs ahead of the preceding launch overlaps it only on free SMs (one CTA
+        # fills an SM), so its grid keeps to half of them where the cluster merge still fits.
+        head_dim_ctas = next(
+            (
+                v
+                for v in (4, 2, 1)
+                if v <= _MAX_HEAD_DIM_CTAS
+                and work_tiles * splits * v <= sm_count // 2
+                and _cluster_push_bytes(splits, heads, v) <= _CLUSTER_SPLIT_PUSH_LIMIT
+            ),
+            head_dim_ctas,
+        )
     # Beyond one resident wave (one CTA per SM), every tile has one split and one V
     # owner, and the static persistent scheduler overlaps each tile's prologue and
     # epilogue with its CTA's next tile. It also lifts the nonpersistent grid.z
     # limit of 65,535 rows. Persistent queues do not enumerate KV splits.
     persistent = splits == 1 and head_dim_ctas == 1 and work_tiles > sm_count
+    push_bytes = _cluster_push_bytes(splits, heads, head_dim_ctas)
     return SparseMlaProfile(
+        fused_split_finish=_FUSED_SPLIT_FINISH and splits > 1,
+        cluster_split_finish=_CLUSTER_SPLIT_FINISH
+        and splits > 1
+        and push_bytes <= _CLUSTER_SPLIT_PUSH_LIMIT,
+        inputs_final=inputs_final,
         family="keep",
         tile_size_q=_QUERY_TILE,
         split_kv=splits,
@@ -563,13 +621,21 @@ def _resolve_launch(
     main_cache_format: PrimsTSMainFormat = "main",
     valid_prefix: bool = False,
     output_groups: int | None = None,
+    raw_selections: bool = False,
+    query_rope: bool = False,
+    inputs_final: bool = False,
+    main_ready: bool = True,
 ) -> _Launch:
     capacity = _validate_geometry(rows, heads, max_topk, max_extra_topk)
+    if raw_selections and valid_prefix:
+        raise ValueError("raw selections keep their holes and cannot promise a valid prefix")
+    if query_rope and not raw_selections:
+        raise ValueError("an in-kernel query RoPE needs a raw-selection plan")
     device, _ = _resolve_cuda_device(device)
     if torch.cuda.get_device_capability(device) not in ((10, 0), (10, 3), (10, 7)):
         raise NotImplementedError("CSA2 packed PrimTS requires SM100, SM103 or SM107")
     sm_count = torch.cuda.get_device_properties(device).multi_processor_count
-    profile = _select_packed_profile(rows, heads, capacity, sm_count)
+    profile = _select_packed_profile(rows, heads, capacity, sm_count, inputs_final)
     output_quant = None
     if output_groups is not None:
         if not _quantizes_output(profile):
@@ -609,6 +675,9 @@ def _resolve_launch(
             swa_cache_format=swa_cache_format,
             aligned_strides=aligned_strides,
             main_cache_format=main_cache_format,
+            raw_selections=raw_selections,
+            query_rope=query_rope,
+            main_after_wait=inputs_final and not main_ready,
         ),
         # Compile the planned SWA + MAIN capacity; live lengths still arrive
         # with the metadata on every launch.
@@ -649,6 +718,10 @@ def _resolve_launch(
         # bind empty extra lists, and plans without sinks bind -inf logits.
         ("dummy_extra", (2, rows), torch.int32),
         ("no_sinks", (heads,), torch.float32),
+        # Raw-selection launches: both lists' constant live widths, and an INT32 stand-in
+        # for the page-offset operand the INT64 SWA slots cannot alias.
+        ("raw_lengths", (2, rows), torch.int32),
+        ("raw_offsets", (rows, max_topk), torch.int32),
     ):
         sections[name], byte_end = _append_workspace_section(byte_end, shape, dtype)
     if not (
@@ -677,17 +750,22 @@ def get_packed_sparse_mla_workspace_size(
     kernels; FP32
     LSE and unit-scale E4M3 Q; one dummy record, as wide as either MAIN format,
     for launches without a MAIN pool; and the gather kernel's empty extra lists
-    and -inf sinks. The size depends on neither the formats nor a prefix promise.
+    and -inf sinks. The size depends on neither the formats nor a prefix promise, and covers
+    plans that run ahead of their preceding launch.
     """
-    return _resolve_launch(
-        device,
-        rows,
-        heads,
-        max_topk,
-        max_extra_topk,
-        swa_cache_format,
-        main_cache_format=main_cache_format,
-    ).workspace_bytes
+    return max(
+        _resolve_launch(
+            device,
+            rows,
+            heads,
+            max_topk,
+            max_extra_topk,
+            swa_cache_format,
+            main_cache_format=main_cache_format,
+            inputs_final=inputs_final,
+        ).workspace_bytes
+        for inputs_final in (False, True)
+    )
 
 
 def _compile_spec(
@@ -698,6 +776,9 @@ def _compile_spec(
     has_sinks: bool,
     swa_cache_format: SwaCacheFormat,
     main_cache_format: PrimsTSMainFormat,
+    raw_selections: bool = False,
+    query_rope: bool = False,
+    main_ready: bool = True,
 ) -> _CompileSpec:
     return _CompileSpec(
         device_index=launch.device.index,
@@ -714,6 +795,9 @@ def _compile_spec(
             None if launch.kernel.output_quant is None else launch.kernel.output_quant.num_groups
         ),
         kernel=launch.kernel,
+        raw_selections=raw_selections,
+        query_rope=query_rope,
+        main_ready=main_ready,
     )
 
 
@@ -729,6 +813,10 @@ def precompile_packed_sparse_mla(
     main_cache_format: PrimsTSMainFormat = "main",
     valid_prefix: bool = False,
     output_groups: int | None = None,
+    raw_selections: bool = False,
+    query_rope: bool = False,
+    inputs_final: bool = False,
+    main_ready: bool = True,
 ) -> int:
     """Compile every kernel that plans of 1 to ``max_rows`` rows select for these pools.
 
@@ -764,7 +852,7 @@ def precompile_packed_sparse_mla(
     native_specs = {}
     previous = None
     for rows in range(1, max_rows + 1):
-        packed = _select_packed_profile(rows, heads, capacity, sm_count)
+        packed = _select_packed_profile(rows, heads, capacity, sm_count, inputs_final)
         gather = _select_gather_profile(rows, heads, capacity, sm_count) if gathers else None
         if output_groups is not None and not _quantizes_output(gather or packed):
             continue
@@ -790,6 +878,10 @@ def precompile_packed_sparse_mla(
             main_cache_format=main_cache_format,
             valid_prefix=valid_prefix,
             output_groups=output_groups,
+            raw_selections=raw_selections,
+            query_rope=query_rope,
+            inputs_final=inputs_final,
+            main_ready=main_ready,
         )
         native = launch.nvfp4 or launch.gather
         if native is not None:
@@ -804,6 +896,9 @@ def precompile_packed_sparse_mla(
                 has_sinks,
                 swa_cache_format,
                 main_cache_format,
+                raw_selections,
+                query_rope,
+                main_ready,
             )
         )
     for spec in specs:
@@ -845,12 +940,12 @@ def _compile_packed(spec: _CompileSpec) -> Callable[..., object]:
             assumed_align=16,
         )
 
-    def indices(width: int) -> cute.Tensor:
+    def indices(width: int, dtype: type = cutlass.Int32) -> cute.Tensor:
         return cute.runtime.make_fake_tensor(
-            cutlass.Int32,
+            dtype,
             (batch, width),
             stride=(cute.sym_int64(divisibility=1), 1),
-            assumed_align=4,
+            assumed_align=dtype.width // 8,
         )
 
     def lengths() -> cute.Tensor:
@@ -860,7 +955,8 @@ def _compile_packed(spec: _CompileSpec) -> Callable[..., object]:
 
     swa = raw_pool(row_bytes(_HEAD_DIM, spec.swa_cache_format))
     main = raw_pool(main_row_bytes(spec.main_cache_format))
-    si, sl = indices(spec.max_topk), lengths()
+    si = indices(spec.max_topk, cutlass.Int64 if spec.raw_selections else cutlass.Int32)
+    sl = lengths()
     ci = indices(spec.max_extra_topk) if spec.max_extra_topk else None
     cl = lengths() if spec.max_extra_topk else None
     sinks = (
@@ -871,8 +967,47 @@ def _compile_packed(spec: _CompileSpec) -> Callable[..., object]:
         else None
     )
     # Native six-slot sparse ABI: the producer-owned binder reads both lists from
-    # the first slot; no FP8-primary tensor scale is bound.
-    sparse_inputs = ((si, ci), None, sl, cl, sinks, None)
+    # the first slot; no FP8-primary tensor scale is bound. Raw selections add the
+    # MAIN owner's INT32 page table, INT64 requests and visible lengths, the position
+    # limit and the page size.
+    lists = (si, ci)
+    if spec.raw_selections:
+        mapping = (None, None, None)
+        if spec.max_extra_topk:
+            mapping = (
+                cute.runtime.make_fake_tensor(
+                    cutlass.Int32,
+                    (cute.sym_int(), cute.sym_int()),
+                    stride=(cute.sym_int64(divisibility=1), 1),
+                    assumed_align=4,
+                ),
+                cute.runtime.make_fake_compact_tensor(
+                    cutlass.Int64, (batch,), stride_order=(0,), assumed_align=8
+                ),
+                cute.runtime.make_fake_compact_tensor(
+                    cutlass.Int64, (batch,), stride_order=(0,), assumed_align=8
+                ),
+            )
+        lists = (si, ci, *mapping, cutlass.Int64(0), cutlass.Int32(1))
+        if spec.query_rope:
+            # The BF16 query before its RoPE, each row's INT32 position and the FP32
+            # [P, 2, 32] cos/sin table, flat.
+            lists = (
+                *lists,
+                cute.runtime.make_fake_compact_tensor(
+                    cutlass.BFloat16,
+                    (batch, spec.heads, _HEAD_DIM),
+                    stride_order=(2, 1, 0),
+                    assumed_align=16,
+                ),
+                cute.runtime.make_fake_compact_tensor(
+                    cutlass.Int32, (batch,), stride_order=(0,), assumed_align=4
+                ),
+                cute.runtime.make_fake_compact_tensor(
+                    cutlass.Float32, (cute.sym_int(),), stride_order=(0,), assumed_align=16
+                ),
+            )
+    sparse_inputs = (lists, None, sl, cl, sinks, None)
     page_offsets = cute.runtime.make_fake_tensor(
         cutlass.Int32,
         (spec.max_topk, batch),
@@ -975,6 +1110,10 @@ class PackedSparseMLA:
         main_cache_format: PrimsTSMainFormat = "main",
         valid_prefix: bool = False,
         output_groups: int | None = None,
+        raw_selections: bool = False,
+        query_rope: bool = False,
+        inputs_final: bool = False,
+        main_ready: bool = True,
     ) -> None:
         """Warm the format-specific uint8 ABI and reduction outside graph capture.
 
@@ -994,6 +1133,20 @@ class PackedSparseMLA:
         ``output_groups`` plans kernels that store, instead of the BF16 output, the
         grouped MXFP8 O-A input of that many groups (see ``run``'s ``output_quant``).
         Only geometries for which :func:`fuses_mxfp8_output` holds accept it.
+
+        ``raw_selections=True`` plans for the selections as a layer publishes them:
+        ``run`` then takes INT64 SWA slots and, with MAIN, INT32 logical positions with
+        their ``main_mapping``, and needs no live lengths (see ``run``).
+
+        ``query_rope=True`` (raw selections only) plans a kernel that takes the BF16 query
+        before its GPT-J RoPE and rotates and rounds it itself (see ``run``'s ``query_rope``).
+
+        ``inputs_final=True`` promises that the query, both selection lists, the page table
+        and the MAIN rows were final before the launch preceding this one on the stream; a
+        cluster-merged kernel then runs ahead of that launch and waits for it only before
+        its SWA rows and outputs. With ``main_ready=False`` only the query, the SWA slots and
+        the page table carry that promise: the kernel also waits before it reads the MAIN
+        selections, the MAIN owners' visible lengths and the MAIN rows.
         """
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("PackedSparseMLA.plan() must run before CUDA Graph capture")
@@ -1009,6 +1162,10 @@ class PackedSparseMLA:
             main_cache_format=main_cache_format,
             valid_prefix=valid_prefix,
             output_groups=output_groups,
+            raw_selections=raw_selections,
+            query_rope=query_rope,
+            inputs_final=inputs_final,
+            main_ready=main_ready,
         )
         _validate_workspace_buffer(
             self.workspace_buffer, device=launch.device, required_bytes=launch.workspace_bytes
@@ -1021,6 +1178,12 @@ class PackedSparseMLA:
         buffers["dummy_main"].zero_()
         buffers["dummy_extra"].zero_()
         buffers["no_sinks"].fill_(-math.inf)
+        # The split finisher's arrival counters follow the split partials and start at zero;
+        # every launch leaves them zero again.
+        buffers["core"].zero_()
+        buffers["raw_lengths"][0].fill_(max_topk)
+        buffers["raw_lengths"][1].fill_(max_extra_topk)
+        buffers["raw_offsets"].zero_()
         dummy_main = buffers["dummy_main"][:0, : main_row_bytes(main_cache_format)]
         spec = _compile_spec(
             launch,
@@ -1030,6 +1193,9 @@ class PackedSparseMLA:
             has_sinks,
             swa_cache_format,
             main_cache_format,
+            raw_selections,
+            query_rope,
+            main_ready,
         )
 
         def native_plan(native: _GatherLaunch | None) -> _GatherPlan | None:
@@ -1057,6 +1223,10 @@ class PackedSparseMLA:
             valid_prefix=valid_prefix,
             output_groups=output_groups,
             spec=spec,
+            raw_selections=raw_selections,
+            query_rope=query_rope,
+            inputs_final=inputs_final,
+            main_ready=main_ready,
             compiled=compiled,
             gather=gather,
             nvfp4=nvfp4,
@@ -1095,6 +1265,10 @@ class PackedSparseMLA:
                 aligned_strides=aligned,
                 main_cache_format=state.main_cache_format,
                 output_groups=state.output_groups,
+                raw_selections=state.raw_selections,
+                query_rope=state.query_rope,
+                inputs_final=state.inputs_final,
+                main_ready=state.main_ready,
             )
             kernel = _compile_packed(
                 replace(
@@ -1212,12 +1386,84 @@ class PackedSparseMLA:
         )
         return main
 
+    def _raw_sources(
+        self,
+        state: _Plan,
+        swa_cache: torch.Tensor,
+        swa_indices: torch.Tensor,
+        extra_kv_cache: torch.Tensor | None,
+        extra_sparse_indices: torch.Tensor | None,
+        main_mapping: tuple | None,
+    ) -> torch.Tensor:
+        """Check a raw-selection launch's lists and mapping; return the MAIN pool it reads."""
+        self._pool(
+            swa_cache, row_bytes(_HEAD_DIM, state.swa_cache_format), state.device, "swa_cache"
+        )
+
+        def check(indices, dtype, width, name):
+            if (
+                not isinstance(indices, torch.Tensor)
+                or indices.device != state.device
+                or indices.dtype != dtype
+                or indices.shape != (state.rows, width)
+                or indices.stride(1) != 1
+                or indices.stride(0) < width
+                or indices.data_ptr() % indices.element_size()
+            ):
+                raise ValueError(
+                    f"raw {name} selections must be CUDA {dtype}[rows,{width}] "
+                    "with unit inner stride"
+                )
+
+        check(swa_indices, torch.int64, state.max_topk, "SWA")
+        if not state.max_extra_topk:
+            if any(v is not None for v in (extra_kv_cache, extra_sparse_indices, main_mapping)):
+                raise ValueError("MAIN was not enabled by the plan")
+            return state.dummy_main
+        if extra_kv_cache is None or main_mapping is None:
+            raise ValueError("raw MAIN selections need their pool and main_mapping")
+        self._pool(
+            extra_kv_cache,
+            main_row_bytes(state.main_cache_format),
+            state.device,
+            "extra_kv_cache",
+        )
+        check(extra_sparse_indices, torch.int32, state.max_extra_topk, "MAIN")
+        pages, page_size, max_positions, requests, visible = main_mapping
+        if (
+            not isinstance(pages, torch.Tensor)
+            or pages.device != state.device
+            or pages.dtype != torch.int32
+            or pages.ndim != 2
+            or pages.numel() == 0
+            or pages.stride(1) != 1
+            or not isinstance(page_size, int)
+            or page_size <= 0
+            or not isinstance(max_positions, int)
+            or max_positions < 0
+            # Physical rows are formed in INT32 before their bound check.
+            or extra_kv_cache.shape[0] > 0x7FFFFFFF - page_size
+        ):
+            raise ValueError(
+                "raw MAIN selections need a nonempty CUDA INT32 page table and valid bounds"
+            )
+        for values in (requests, visible):
+            if (
+                not isinstance(values, torch.Tensor)
+                or values.device != state.device
+                or values.dtype != torch.int64
+                or values.shape != (state.rows,)
+                or not values.is_contiguous()
+            ):
+                raise ValueError("raw MAIN requests and visibility must be CUDA INT64[rows]")
+        return extra_kv_cache
+
     def run(
         self,
         q: torch.Tensor,
         swa_cache: torch.Tensor,
         swa_indices: torch.Tensor,
-        swa_lengths: torch.Tensor,
+        swa_lengths: torch.Tensor | None,
         *,
         extra_kv_cache: torch.Tensor | None = None,
         extra_sparse_indices: torch.Tensor | None = None,
@@ -1229,6 +1475,8 @@ class PackedSparseMLA:
         validate: bool = False,
         query_ready: torch.cuda.Event | None = None,
         output_quant: tuple[torch.Tensor, ...] | None = None,
+        main_mapping: tuple | None = None,
+        query_rope: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Launch joint sparse attention without compilation or device allocation.
 
@@ -1265,6 +1513,19 @@ class PackedSparseMLA:
         the host FP32 factors applied to Q.K and to the output; a captured CUDA
         Graph replays the values it was captured with.
         ``validate=True`` also checks input values on the host and is not graph-safe.
+
+        A ``raw_selections`` plan takes the lists as a layer publishes them and no
+        lengths: INT64 ``[rows, max_topk]`` SWA slots, and INT32 ``[rows, max_extra_topk]``
+        logical MAIN positions with ``main_mapping = (pages, page_size, max_positions,
+        requests, visible)``, the owner's INT32 page table and each row's INT64 request and
+        visible length. Every entry of both lists is live; an entry
+        ``prepare_prims_ts_metadata`` would drop is masked in place.
+
+        A ``query_rope`` plan takes ``q`` as the BF16 projection before its GPT-J RoPE and
+        ``query_rope = (positions, cos_sin)``: each row's INT32 position and the contiguous
+        FP32 ``[P, 2, 32]`` cos/sin table. The kernel rotates the last 64 channels of every
+        head and rounds the query to unit-scale E4M3, the bytes ``gptj_rope_e4m3_small_m``
+        writes.
         """
         state = self._state
         if state is None:
@@ -1291,16 +1552,28 @@ class PackedSparseMLA:
                     f"{name} must be aligned contiguous CUDA {'/'.join(map(str, dtypes))}"
                     "[rows,1,H,512]"
                 )
-        main = self._sources(
-            state,
-            swa_cache,
-            swa_indices,
-            swa_lengths,
-            extra_kv_cache,
-            extra_sparse_indices,
-            extra_sparse_lens,
-            validate,
-        )
+        if state.raw_selections:
+            if swa_lengths is not None or extra_sparse_lens is not None:
+                raise ValueError("raw selections take no live lengths")
+            main = self._raw_sources(
+                state, swa_cache, swa_indices, extra_kv_cache, extra_sparse_indices, main_mapping
+            )
+            swa_lengths = state.buffers["raw_lengths"][0]
+            if state.max_extra_topk:
+                extra_sparse_lens = state.buffers["raw_lengths"][1]
+        else:
+            if main_mapping is not None:
+                raise ValueError("main_mapping requires a raw_selections plan")
+            main = self._sources(
+                state,
+                swa_cache,
+                swa_indices,
+                swa_lengths,
+                extra_kv_cache,
+                extra_sparse_indices,
+                extra_sparse_lens,
+                validate,
+            )
         _validate_softmax_scale(softmax_scale)
         if not math.isfinite(output_scale) or output_scale <= 0:
             raise ValueError("output_scale must be positive and finite")
@@ -1319,10 +1592,33 @@ class PackedSparseMLA:
                 raise ValueError("sinks must be finite")
         kernel_shape = (state.heads, _HEAD_DIM, 1, state.rows)
         kernel_stride = (_HEAD_DIM, 1, state.heads * _HEAD_DIM, state.heads * _HEAD_DIM)
+        if state.query_rope != (query_rope is not None):
+            raise ValueError("query_rope is required exactly by query-RoPE plans")
         if query_ready is not None:
             query_ready.wait()
         q8 = q
-        if q.dtype == torch.bfloat16:
+        if query_rope is not None:
+            positions, cos_sin = query_rope
+            if q.dtype != torch.bfloat16:
+                raise ValueError("a query-RoPE plan takes the BF16 query before its RoPE")
+            if (
+                positions.dtype != torch.int32
+                or positions.shape != (state.rows,)
+                or not positions.is_contiguous()
+                or positions.device != state.device
+                or cos_sin.dtype != torch.float32
+                or cos_sin.dim() < 1
+                or cos_sin.numel() % 64
+                or not cos_sin.is_contiguous()
+                or cos_sin.device != state.device
+                or cos_sin.data_ptr() % 16
+            ):
+                raise ValueError(
+                    "query_rope needs contiguous INT32[rows] positions and FP32[P, 2, 32] cos/sin"
+                )
+            # The kernel stages Q itself; its unused descriptors still need a mapped tensor.
+            q8 = state.buffers["q8"]
+        elif q.dtype == torch.bfloat16:
             state.query.run(q, state.buffers["q8"])
             q8 = state.buffers["q8"]
         query = q8.as_strided(kernel_shape, kernel_stride)
@@ -1337,14 +1633,26 @@ class PackedSparseMLA:
             output = quant_args[0].as_strided(kernel_shape, kernel_stride)
         else:
             output = out.as_strided(kernel_shape, kernel_stride)
-        sparse_inputs = (
-            (swa_indices, extra_sparse_indices),
-            None,
-            swa_lengths,
-            extra_sparse_lens,
-            sinks,
-            None,
-        )
+        lists = (swa_indices, extra_sparse_indices)
+        page_offsets = swa_indices.transpose(0, 1)
+        if state.raw_selections:
+            pages, page_size, max_positions, requests, visible = main_mapping or (
+                None,
+                1,
+                0,
+                None,
+                None,
+            )
+            lists = (*lists, pages, requests, visible, max_positions, page_size)
+            if query_rope is not None:
+                lists = (
+                    *lists,
+                    q.view(state.rows, state.heads, _HEAD_DIM),
+                    query_rope[0],
+                    query_rope[1].view(-1),
+                )
+            page_offsets = state.buffers["raw_offsets"].transpose(0, 1)
+        sparse_inputs = (lists, None, swa_lengths, extra_sparse_lens, sinks, None)
         sinks_or_none = state.buffers["no_sinks"] if sinks is None else sinks
         nvfp4 = state.nvfp4
         # An empty or omitted MAIN pool has no live rows under the prefix promise;
@@ -1424,7 +1732,7 @@ class PackedSparseMLA:
             query,
             swa_cache,
             main,
-            swa_indices.transpose(0, 1),
+            page_offsets,
             output,
             state.lse_kernel,
             state.core,

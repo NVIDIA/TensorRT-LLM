@@ -46,6 +46,7 @@ from ..helpers.schedule import (
     work_tile_schedule_loop,
 )
 from ..helpers.stage import MlaStage
+from .resources.tmem_s import prefetches_sparse_mask
 from ..helpers.tile import (
     runtime_split_count,
     runtime_base_seq_len_kv,
@@ -280,6 +281,8 @@ def create_throughput_latency_softmax_task_impl(
                     s_arr,
                 ) = work_tile_state
             with domain_loop(0, domain, 1) as d:
+                if prefetches_sparse_mask(cfg):
+                    tmem_s.prefetch_sparse_mask()
                 tmem_s.wait()
                 (
                     old_max_arr,

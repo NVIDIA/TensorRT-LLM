@@ -4123,7 +4123,7 @@ def test_prims_ts_decode_unit_scale_query_matches_bf16(monkeypatch, module_cache
     model._fp8_q_min_tokens = 1
     # The BF16 comparison Q comes from the same MXFP8 GEMM, not the small-M kernel.
     monkeypatch.setattr(model, "_lowm_projects", lambda linear, rows: False)
-    # Keep this one-row step on PrimTS: by default steps of at most 16 rows take the direct decode.
+    # Keep this one-row step on PrimTS, as an eight-head Full layer's step is by default.
     serves_direct = model.backend.direct_decode_serves
     monkeypatch.setattr(model.backend, "direct_decode_serves", lambda *args: False)
     for linear in (model.wq_a, model.wq_b, model.wkv):
@@ -4180,9 +4180,14 @@ def test_prims_ts_decode_unit_scale_query_matches_bf16(monkeypatch, module_cache
             actual = captured.clone()
             expected = run(False)
             torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-        # The direct decode attends the same step with the BF16 query and no PrimTS query
-        # quantization, whichever Q projection is asked for; it agrees to the E4M3 rounding of Q.
+        # Admitted to the direct decode, the same step attends with the BF16 query and no PrimTS
+        # query quantization, whichever Q projection is asked for; it agrees to the E4M3
+        # rounding of Q.
+        from tensorrt_llm._torch.attention.backends.sparse.csa2 import backend as csa2_backend
+
         monkeypatch.setattr(model.backend, "direct_decode_serves", serves_direct)
+        monkeypatch.setattr(csa2_backend, "_prims_ts_takes_direct", lambda attention, rows: True)
+        monkeypatch.setattr(model, "_prims_ts_routes_direct", lambda rows: True)
         for fp8_query in (False, True):
             calls.clear()
             direct = run(fp8_query)
@@ -4190,6 +4195,39 @@ def test_prims_ts_decode_unit_scale_query_matches_bf16(monkeypatch, module_cache
             error = (direct.float() - expected.float()).abs().mean() / expected.float().abs().mean()
             assert error < 0.05
     torch.cuda.synchronize()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "compute_backend,heads,mode,rows,expected",
+    [
+        ("prims_ts", 8, CSA2Mode.SWA, 1, True),
+        ("prims_ts", 8, CSA2Mode.SWA, 12, True),
+        ("prims_ts", 8, CSA2Mode.REUSE, 1, True),
+        ("prims_ts", 8, CSA2Mode.REUSE, 7, True),
+        ("prims_ts", 8, CSA2Mode.REUSE, 8, False),
+        ("prims_ts", 8, CSA2Mode.FULL, 1, False),
+        ("prims_ts", 8, CSA2Mode.REINDEX, 6, False),
+        ("prims_ts", 16, CSA2Mode.SWA, 1, True),
+        ("prims_ts", 16, CSA2Mode.REUSE, 6, True),
+        ("prims_ts", 64, CSA2Mode.FULL, 4, True),
+        ("prims_ts", 64, CSA2Mode.REINDEX, 16, True),
+        ("trtllm", 8, CSA2Mode.SWA, 1, False),
+    ],
+)
+def test_prims_ts_routes_small_steps_to_direct_decode(
+    compute_backend: str, heads: int, mode: CSA2Mode, rows: int, expected: bool
+) -> None:
+    """At eight heads PrimTS hands SWA-only layers and short Reuse steps to the direct decode;
+    other head counts hand it every step the backend admits."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.module import DeepseekV41Attention
+
+    module = SimpleNamespace(
+        backend=SimpleNamespace(compute_backend=compute_backend),
+        num_heads_tp=heads,
+        layer=SimpleNamespace(mode=mode),
+    )
+    assert DeepseekV41Attention._prims_ts_routes_direct(module, rows) is expected
 
 
 @skip_pre_blackwell

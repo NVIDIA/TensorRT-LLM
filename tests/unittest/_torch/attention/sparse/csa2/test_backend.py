@@ -440,8 +440,11 @@ def test_prims_ts_early_selection_matches_serial(
 
     from tensorrt_llm._torch.attention.backends.sparse.csa2 import _prims_ts_metadata
     from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.prims_ts import CSA2PrimsTS
 
     _forbid_prims_ts_staging(monkeypatch)
+    # Only compacted plans prepare metadata; raw-selection plans have none to move.
+    monkeypatch.setattr(CSA2PrimsTS, "raw_selections", False)
     streams = []
     original = _prims_ts_metadata.prepare_prims_ts_metadata
 
@@ -783,6 +786,250 @@ def test_prims_ts_group_layers_share_main_compaction(
     replayed = [output.clone() for output in captured]
     for actual, reference in zip(replayed, references()):
         torch.testing.assert_close(actual, reference, atol=0, rtol=0)
+
+
+@skip_prims_ts_unsupported
+@pytest.mark.parametrize("holes", [False, True], ids=["dense", "holes"])
+@pytest.mark.parametrize("has_main", [True, False])
+@pytest.mark.parametrize("kv_dtype", ["fp8", "fp8_ds_mla"])
+@pytest.mark.parametrize("heads,count", [(8, 6), (64, 12)])
+@torch.inference_mode()
+def test_prims_ts_raw_selections_match_compacted(
+    heads: int,
+    count: int,
+    kv_dtype: str,
+    has_main: bool,
+    holes: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A generation tile reads its published selections without compacting them first.
+
+    INT64 SWA slots and INT32 logical MAIN positions resolve in the kernel exactly as
+    ``prepare_prims_ts_metadata`` resolves them: dense selections give the compacted plan's
+    output bit for bit, and holes (-1, out-of-pool slots, positions past the visible span,
+    the position limit or the table, unowned requests and unbacked pages) are masked. A tile
+    that a native kernel (NVFP4 MAIN or TMA gather) serves, or of more than 32 heads, keeps
+    its compacted lists.
+    """
+    from tensorrt_llm._torch.attention.backends.interface import (
+        AttentionForwardArgs,
+        AttentionInputType,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import (
+        _prims_ts_metadata,
+        _prims_ts_packed,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2BackendForwardArgs
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.prims_ts import (
+        CSA2PrimsTS,
+        _reads_raw_selections,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import (
+        pack_rows,
+        unpack_rows,
+    )
+
+    _forbid_prims_ts_staging(monkeypatch)
+    compactions, mappings = [], []
+    prepare = _prims_ts_metadata.prepare_prims_ts_metadata
+    run = _prims_ts_packed.PackedSparseMLA.run
+
+    def record_compaction(*args, **kwargs):
+        compactions.append(True)
+        return prepare(*args, **kwargs)
+
+    def record_run(self, *args, **kwargs):
+        mappings.append(kwargs.get("main_mapping"))
+        return run(self, *args, **kwargs)
+
+    monkeypatch.setattr(_prims_ts_metadata, "prepare_prims_ts_metadata", record_compaction)
+    monkeypatch.setattr(_prims_ts_packed.PackedSparseMLA, "run", record_run)
+    g = torch.Generator(device="cuda").manual_seed(4930 + heads + count)
+    attn = _backend(heads, compute_backend="prims_ts", kv_cache_dtype=kv_dtype)
+    q = torch.randn(count, heads, 512, device="cuda", dtype=torch.bfloat16, generator=g)
+    swa_rows = 3 * count + 160
+    swa_pool = pack_rows(
+        torch.randn(swa_rows, 512, device="cuda", generator=g).bfloat16(), attn.swa_cache_format
+    )
+    swa = torch.stack(
+        [torch.randperm(swa_rows, device="cuda", generator=g)[:128] for _ in range(count)]
+    )
+    main_pool = mapping = logical = None
+    if has_main:
+        # Two requests own shuffled 16-row pages of a paged MAIN cache; with holes, the pool
+        # stops one page short, so the table's last physical page is unbacked.
+        page, pages = 16, 40
+        table = torch.randperm(2 * pages, device="cuda", generator=g).view(2, pages).int()
+        pool_rows = 2 * pages * page - (page if holes else 0)
+        main_storage = torch.full((pool_rows, 320), 7, device="cuda", dtype=torch.uint8)
+        main_pool = main_storage[:, :288]
+        main_pool.copy_(
+            pack_rows(
+                torch.randn(main_pool.shape[0], 512, device="cuda", generator=g).bfloat16(), "main"
+            )
+        )
+        requests = (torch.arange(count, device="cuda") % 2).long()
+        visible = torch.full((count,), pages * page, device="cuda", dtype=torch.int64)
+        logical = torch.stack(
+            [torch.randperm(pages * page, device="cuda", generator=g)[:512] for _ in range(count)]
+        ).int()
+        mapping = (table, page, 600 if holes else pages * page, requests, visible)
+        if holes:
+            visible[1] = 300
+            requests[2] = 2
+            logical[:, 5::23] = -1
+            logical[3, :9] = pages * page + 5
+            logical[count // 2] = -1
+    if holes:
+        swa[:, 2::19] = -1
+        swa[0, :4] = swa_rows + torch.arange(4, device="cuda")
+        swa[count // 2] = -1
+    sink = torch.linspace(-1.25, 1.5, heads, device="cuda")
+    metadata = CSA2TrtllmMetadata.for_query_tile(q, 512 if has_main else 0, kv_input_mode="packed")
+
+    def forward(raw: bool) -> torch.Tensor:
+        monkeypatch.setattr(CSA2PrimsTS, "raw_selections", raw)
+        args = AttentionForwardArgs(
+            attention_input_type=AttentionInputType.generation_only,
+            attention_sinks=sink,
+            output=torch.full_like(q, torch.nan).flatten(1),
+            sparse_backend_args=CSA2BackendForwardArgs(
+                swa_cache_format=attn.swa_cache_format,
+                swa_pool=swa_pool,
+                swa_indices=swa.contiguous(),
+                main_pool=main_pool,
+                topk_indices=logical,
+                main_logical_indices=logical,
+                main_mapping=mapping,
+            ),
+        )
+        return _helper_forward(attn, q.flatten(1), metadata, args).view_as(q).clone()
+
+    compacted = forward(False)
+    assert compactions == [True] and mappings == [None]
+    raw = forward(True)
+    if not _reads_raw_selections(
+        q.device, count, heads, metadata.num_sparse_topk, attn.swa_cache_format, "main"
+    ):
+        assert compactions == [True, True] and mappings == [None, None]
+        torch.testing.assert_close(raw, compacted, atol=0, rtol=0)
+        return
+    assert compactions == [True], "raw selections must not compact"
+    assert len(mappings) == 2 and (mappings[1] is not None) == has_main
+    if not holes:
+        torch.testing.assert_close(raw, compacted, atol=0, rtol=0)
+        return
+    # Holes move rows across tiles, so the online softmax rounds differently.
+    torch.testing.assert_close(raw, compacted, atol=2e-2, rtol=2e-2)
+    # A row without a valid key attends only the sink.
+    torch.testing.assert_close(raw[count // 2], torch.zeros_like(q[0]), atol=0, rtol=0)
+    swa_valid = (swa >= 0) & (swa < swa_rows)
+    keys = unpack_rows(swa_pool, 512, attn.swa_cache_format)[swa.clamp(0, swa_rows - 1)]
+    main_keys = main_valid = None
+    if has_main:
+        table, page, limit, requests, visible = mapping
+        owned = (requests >= 0) & (requests < table.shape[0])
+        span = torch.minimum(visible.clamp(max=limit), torch.tensor(table.shape[1] * page))
+        span = torch.where(owned, span, 0)
+        inside = (logical >= 0) & (logical < span[:, None])
+        position = torch.where(inside, logical, 0).long()
+        entry = table[requests.clamp(0, table.shape[0] - 1)[:, None], position // page]
+        row = entry.long() * page + position % page
+        main_valid = inside & (entry >= 0) & (row < main_pool.shape[0])
+        main_keys = unpack_rows(main_pool, 512, "main")[torch.where(main_valid, row, 0)]
+    expected = _reference(q, keys, main_keys, swa_valid, main_valid, sink)
+    _assert_fp8_close(raw, expected)
+
+
+@skip_prims_ts_unsupported
+@pytest.mark.parametrize("has_main", [True, False], ids=["main", "swa-only"])
+@pytest.mark.parametrize("heads,count", [(8, 6), (16, 12)])
+@torch.inference_mode()
+def test_prims_ts_runahead_matches_ordered(
+    heads: int, count: int, has_main: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A raw-selection kernel that runs ahead of its preceding launch attends as an ordered one.
+
+    It rotates its BF16 Q before the wait, then reads SWA rows after it; its MAIN selections
+    and rows either before it (``main_ready``) or after it. Where it waits changes no
+    arithmetic, so both MAIN orders give the same bits, and both match a kernel that reads
+    a Q the projection rotated.
+    """
+    from tensorrt_llm._torch.attention.backends.interface import (
+        AttentionForwardArgs,
+        AttentionInputType,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2BackendForwardArgs
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.prims_ts import CSA2PrimsTS
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.projection import gptj_rope_small_m
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import pack_rows
+
+    _forbid_prims_ts_staging(monkeypatch)
+    monkeypatch.setattr(CSA2PrimsTS, "raw_selections", True)
+    g = torch.Generator(device="cuda").manual_seed(5110 + heads + count)
+    attn = _backend(heads, compute_backend="prims_ts", kv_cache_dtype="fp8")
+    q = torch.randn(count, heads, 512, device="cuda", dtype=torch.bfloat16, generator=g)
+    swa_rows = 3 * count + 160
+    swa_pool = pack_rows(
+        torch.randn(swa_rows, 512, device="cuda", generator=g).bfloat16(), attn.swa_cache_format
+    )
+    swa = torch.stack(
+        [torch.randperm(swa_rows, device="cuda", generator=g)[:128] for _ in range(count)]
+    )
+    main_pool = logical = mapping = None
+    if has_main:
+        page, pages = 16, 40
+        table = torch.randperm(pages, device="cuda", generator=g).view(1, pages).int()
+        main_pool = pack_rows(
+            torch.randn(pages * page, 512, device="cuda", generator=g).bfloat16(), "main"
+        )
+        logical = torch.stack(
+            [torch.randperm(pages * page, device="cuda", generator=g)[:512] for _ in range(count)]
+        ).int()
+        mapping = (
+            table,
+            page,
+            pages * page,
+            torch.zeros(count, device="cuda", dtype=torch.int64),
+            torch.full((count,), pages * page, device="cuda", dtype=torch.int64),
+        )
+    positions = torch.randint(0, 4096, (count,), device="cuda", generator=g, dtype=torch.int32)
+    angle = torch.rand(4096, 32, device="cuda", generator=g) * 6.2831853
+    cos_sin = torch.cat((angle.cos(), angle.sin()), 1).view(4096, 2, 32).contiguous()
+    sink = torch.linspace(-1.25, 1.5, heads, device="cuda")
+    metadata = CSA2TrtllmMetadata.for_query_tile(q, 512 if has_main else 0, kv_input_mode="packed")
+
+    def forward(kernel_rope: bool, inputs_final: bool = False, main_ready: bool = True):
+        monkeypatch.setattr(CSA2PrimsTS, "_inputs_final", lambda self, raw, rope: inputs_final)
+        monkeypatch.setattr(CSA2PrimsTS, "_main_ready", lambda self: main_ready)
+        query = q.clone()
+        if not kernel_rope:
+            gptj_rope_small_m(query, positions, cos_sin)
+        args = AttentionForwardArgs(
+            attention_input_type=AttentionInputType.generation_only,
+            attention_sinks=sink,
+            output=torch.full_like(q, torch.nan).flatten(1),
+            sparse_backend_args=CSA2BackendForwardArgs(
+                swa_cache_format=attn.swa_cache_format,
+                swa_pool=swa_pool,
+                swa_indices=swa.contiguous(),
+                main_pool=main_pool,
+                topk_indices=logical,
+                main_logical_indices=logical,
+                main_mapping=mapping,
+                query_rope=(positions, cos_sin) if kernel_rope else None,
+            ),
+        )
+        return _helper_forward(attn, query.flatten(1), metadata, args).view_as(q).clone()
+
+    rotated = forward(False)
+    runahead = forward(True, inputs_final=True)
+    torch.testing.assert_close(runahead, rotated, atol=2e-2, rtol=2e-2)
+    if has_main:
+        main_after_wait = forward(True, inputs_final=True, main_ready=False)
+        torch.testing.assert_close(main_after_wait, runahead, atol=0, rtol=0)
 
 
 @skip_prims_ts_unsupported
@@ -1418,6 +1665,10 @@ def test_prims_ts_precompiles_once_per_arena(monkeypatch: pytest.MonkeyPatch) ->
                 main_cache_format=main_cache_format,
                 valid_prefix=True,
                 output_groups=None,
+                raw_selections=False,
+                query_rope=False,
+                inputs_final=False,
+                main_ready=True,
             ),
         )
         for swa_cache_format, main_cache_format in (
@@ -2549,6 +2800,49 @@ def test_direct_decode_admission_by_swa_format_and_provider(
     assert not serves(attn, 0, 0, 512, device)
     assert not serves(attn, direct_decode.MAX_ROWS + 1, 0, 512, device)
     assert not serves(attn, 1, 1, 512, device)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("heads", "mode", "rows", "expected"),
+    [
+        (8, "SWA", 12, True),
+        (8, "REUSE", 7, True),
+        (8, "REUSE", 8, False),
+        (8, "FULL", 1, False),
+        (8, "REINDEX", 6, False),
+        (16, "SWA", 1, True),
+        (64, "FULL", 4, True),
+        (64, "REINDEX", 16, True),
+    ],
+)
+def test_prims_ts_direct_decode_serves_follows_layer_mode(
+    monkeypatch: pytest.MonkeyPatch, heads: int, mode: str, rows: int, expected: bool
+) -> None:
+    """A PrimTS layer's generation step takes the direct decode exactly as the module routes it."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import direct_decode
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.backend import CSA2TrtllmAttention
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Mode
+
+    monkeypatch.setattr(direct_decode, "direct_decode_device_supported", lambda device: True)
+    layout = SimpleNamespace(
+        compress_ratios=(0, 4), layer=lambda idx: SimpleNamespace(mode=getattr(CSA2Mode, mode))
+    )
+    attn = SimpleNamespace(
+        compute_backend="prims_ts",
+        native_fp8=False,
+        swa_cache_format="swa_fp8",
+        sparse_params=SimpleNamespace(layout=layout, use_packed_sparse_attention=False),
+        num_heads=heads,
+        layer_idx=1,
+    )
+    serves = CSA2TrtllmAttention.direct_decode_serves(attn, rows, 0, 512, torch.device("cpu"))
+    assert serves is expected
+    assert serves is direct_decode.prims_ts_takes_direct_decode(
+        heads, getattr(CSA2Mode, mode), rows
+    )
 
 
 @skip_pre_blackwell

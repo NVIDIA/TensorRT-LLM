@@ -58,6 +58,29 @@ _KEY_ROW = 2 * HEAD_DIM + 16  # bytes per BF16 key row in shared memory (16 B ba
 LOG2E = 1.4426950408889634
 
 
+# PrimTS generation steps the direct decode serves at eight heads per rank: SWA-only layers
+# and Reuse layers' steps below this many rows (see prims_ts_takes_direct_decode).
+PRIMS_TS_DIRECT_HEADS = 8
+PRIMS_TS_DIRECT_REUSE_ROWS = 8
+
+
+def prims_ts_takes_direct_decode(heads: int, mode: object, rows: int) -> bool:
+    """Whether a PrimTS layer's generation step of ``rows`` query rows runs the direct decode,
+    within the steps ``direct_decode_serves`` admits (at most ``MAX_ROWS`` rows that fit).
+
+    At eight heads per rank the direct decode's register-resident launch is the shorter one
+    where little work follows the dependent wait: SWA-only layers, and Reuse layers' steps of
+    fewer than eight rows, whose MAIN part runs before it; Full and Reindex layers, whose MAIN
+    part follows the wait, and wider steps keep PrimTS. Other head counts take it for every
+    admitted step. ``mode`` is the layer's ``CSA2Mode``.
+    """
+    from .params import CSA2Mode
+
+    if heads != PRIMS_TS_DIRECT_HEADS:
+        return True
+    return mode == CSA2Mode.SWA or (mode == CSA2Mode.REUSE and rows < PRIMS_TS_DIRECT_REUSE_ROWS)
+
+
 def direct_decode_device_supported(device: torch.device) -> bool:
     return torch.cuda.get_device_capability(device) in ((10, 0), (10, 3), (10, 7))
 

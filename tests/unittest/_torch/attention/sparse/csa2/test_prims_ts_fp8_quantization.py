@@ -197,3 +197,53 @@ def test_packed_fp8_quantization_waits_for_query(
     assert state.swa_cache_format == swa_cache_format
     # The Q written in the wait is the one quantized, saturated at unit scale.
     assert (state.buffers["q8"].float() == 448).all()
+
+
+@pytest.mark.parametrize("rows", [1, 6, 16, 24])
+@pytest.mark.parametrize("heads", [8, 16, 64])
+@torch.inference_mode()
+def test_small_m_rope_e4m3_query_matches_rope_then_staging(rows: int, heads: int) -> None:
+    """One launch writes the bytes of the query RoPE followed by PrimTS's query staging."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.projection import (
+        SMALL_M_ROWS,
+        gptj_rope_e4m3_small_m,
+        gptj_rope_small_m,
+    )
+
+    def rope(q, positions, cos_sin):
+        # The module's RoPE of a decode step: the small-M kernel up to 16 rows, else the CUDA one.
+        if q.shape[0] <= SMALL_M_ROWS:
+            gptj_rope_small_m(q, positions, cos_sin)
+        else:
+            torch.ops.trtllm.mla_rope_inplace(
+                q, positions, cos_sin, q.shape[1], 448, 64, False, False
+            )
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    g = torch.Generator(device=device).manual_seed(rows * 97 + heads)
+    q = (torch.randn(rows, heads, 512, device=device, generator=g) * 64).bfloat16()
+    # Saturating, subnormal and signed-zero magnitudes in the rotated channels too.
+    q[0, 0, -8:] = torch.tensor([900.0, -900.0, 2.0**-12, -(2.0**-12), 0.0, -0.0, 448.0, 1.0])
+    positions = torch.randint(0, 4096, (rows,), device=device, generator=g, dtype=torch.int32)
+    angle = torch.rand(4096, 32, device=device, generator=g) * 6.2831853
+    cos_sin = torch.cat((angle.cos(), angle.sin()), 1).view(4096, 2, 32).contiguous()
+    roped = q.clone()
+    rope(roped, positions, cos_sin)
+    plan, expected = _plan(roped.view(rows, 1, heads, 512))
+    plan.run(roped.view(rows, 1, heads, 512), expected)
+    q8 = torch.empty(rows, heads * 512, device=device, dtype=torch.float8_e4m3fn)
+    before = q.clone()
+    gptj_rope_e4m3_small_m(q, positions, cos_sin, q8)
+    assert torch.equal(q8.view(torch.uint8), expected.view(rows, -1).view(torch.uint8))
+    # The BF16 query stays as projected.
+    assert torch.equal(q.view(torch.int16), before.view(torch.int16))
+    # It replays in a CUDA Graph over new inputs.
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        gptj_rope_e4m3_small_m(q, positions, cos_sin, q8)
+    q.copy_(roped)
+    roped2 = q.clone()
+    rope(roped2, positions, cos_sin)
+    plan.run(roped2.view(rows, 1, heads, 512), expected)
+    graph.replay()
+    assert torch.equal(q8.view(torch.uint8), expected.view(rows, -1).view(torch.uint8))

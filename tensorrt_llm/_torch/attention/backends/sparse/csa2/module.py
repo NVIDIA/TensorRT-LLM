@@ -64,6 +64,12 @@ _DECODE_MAX_SPLITS = 8
 _LOWM_QUERY_TILES = 2
 _LOWM_TWO_TILE_MIN_ROWS = 16
 
+# PrimTS decode steps below the fused FP8 Q projection's size take the small-step query paths
+# (_prims_ts_small_step) up to this many heads per rank. Wider steps, such as 64-head DEP
+# steps, keep the RoPE and PrimTS's query staging, as the selection bank and native plans
+# they run read it.
+_PRIMS_TS_SMALL_STEP_HEADS = 32
+
 
 def _lowm_tiles(n: int, rows: int) -> int:
     if rows >= _LOWM_TWO_TILE_MIN_ROWS and n % (8 * _LOWM_QUERY_TILES) == 0:
@@ -931,6 +937,51 @@ class DeepseekV41Attention(nn.Module):
             table = self.rotary_emb.rotary_cos_sin.view(-1, self.qk_rope_head_dim)
             rope = (positions.reshape(-1).int(), table, self.qk_rope_head_dim)
         return RowTransform(norm=norm, rope=rope)
+
+    def _prims_ts_small_step(self, q: torch.Tensor, positions: torch.Tensor, attn_metadata) -> bool:
+        """Whether this forward is a PrimTS decode step below the fused FP8 Q projection's size,
+        of at most ``_PRIMS_TS_SMALL_STEP_HEADS`` heads per rank.
+
+        Such a step's attention reads either the BF16 Q before its RoPE, which its launch
+        rotates and rounds (``_prims_ts_kernel_rope``), or the unit-scale E4M3 Q that
+        ``gptj_rope_e4m3_small_m`` writes from it, in place of the RoPE and PrimTS's query
+        staging.
+        """
+        rows = q.shape[0]
+        return (
+            self.backend.compute_backend == "prims_ts"
+            and self._compute_helper is not None
+            and not self.backend.sparse_params.use_packed_sparse_attention
+            and attn_metadata.num_ctx_tokens == 0
+            and 0 < rows < getattr(self, "_fp8_q_min_tokens", 0)
+            and self.num_heads_tp <= _PRIMS_TS_SMALL_STEP_HEADS
+            and not self.rotary_emb.is_neox
+            and self.qk_rope_head_dim == 64
+            and self.qk_head_dim == 512
+            and q.dtype == torch.bfloat16
+            and q.is_contiguous()
+            and positions.dtype in (torch.int32, torch.int64)
+            and positions.is_contiguous()
+            and is_sm_100f()
+        )
+
+    def _prims_ts_kernel_rope(self, positions: torch.Tensor) -> bool:
+        """Whether a small PrimTS step's attention launch rotates its Q itself.
+
+        The launch's load warps rotate and round Q before its keys arrive; they read INT32
+        positions, so INT64 ones take the separate E4M3 launch.
+        """
+        return positions.dtype == torch.int32
+
+    def _prims_ts_routes_direct(self, rows: int) -> bool:
+        """Whether a PrimTS layer's generation step of ``rows`` query rows runs the direct decode
+        (``prims_ts_takes_direct_decode``, which the backend's ``direct_decode_serves`` applies
+        too)."""
+        from .direct_decode import prims_ts_takes_direct_decode
+
+        return self.backend.compute_backend == "prims_ts" and prims_ts_takes_direct_decode(
+            self.num_heads_tp, self.layer.mode, rows
+        )
 
     def _rope_query(
         self, q: torch.Tensor, positions: torch.Tensor, amax: torch.Tensor | None = None
@@ -1866,13 +1917,15 @@ class DeepseekV41Attention(nn.Module):
             and not torch.cuda.is_current_stream_capturing()
             and is_sm_100f()
         )
-        # A direct-decode forward leaves the query RoPE to its attention launch. Small PrimTS
-        # generation steps take it too: it attends the packed pools without compaction or a
-        # split-KV reduction.
+        # A direct-decode forward leaves the query RoPE to its attention launch. The small PrimTS
+        # generation steps prims_ts_takes_direct_decode admits take it too: it attends the
+        # packed pools without compaction or a split-KV reduction.
         extra_width = 0 if self.layer.mode == CSA2Mode.SWA else self.layout.index_topk
         direct = (
             attn_metadata.num_ctx_tokens == 0
-            and (self._compute_helper is None or self.backend.compute_backend == "prims_ts")
+            and (
+                self._compute_helper is None or self._prims_ts_routes_direct(hidden_states.shape[0])
+            )
             and not self.rotary_emb.is_neox
             and self.qk_rope_head_dim == 64
             and self.backend.direct_decode_serves(
@@ -1956,10 +2009,33 @@ class DeepseekV41Attention(nn.Module):
                 quant_q = fp8_query.quant_q
                 q_amax = fp8_query.word
                 q = torch.empty(quant_q.shape, dtype=self.dtype, device=quant_q.device)
+        # A small PrimTS decode step reads either the BF16 Q before its RoPE, rotated by its
+        # attention launch, or only the unit-scale E4M3 Q, which one launch rotates and
+        # converts; the BF16 Q stays as projected.
+        small_step = not (
+            fused_query or quant_q is not None or direct
+        ) and self._prims_ts_small_step(q, positions, attn_metadata)
+        kernel_rope = small_step and self._prims_ts_kernel_rope(positions)
+        small_q = (
+            torch.empty(
+                (q.shape[0], self.num_heads_tp * self.qk_head_dim),
+                dtype=torch.float8_e4m3fn,
+                device=q.device,
+            )
+            if small_step and not kernel_rope
+            else None
+        )
         # CSA2 never applies V4's projected-Q per-head normalization.
         with torch.cuda.stream(self.aux_stream if query_overlap or late_query else None):
             q = q.reshape(-1, self.num_heads_tp, self.qk_head_dim)
-            if not fused_query and quant_q is None and not direct:
+            if small_q is not None:
+                from .projection import gptj_rope_e4m3_small_m
+
+                gptj_rope_e4m3_small_m(
+                    q, positions.reshape(-1), self.rotary_emb.rotary_cos_sin, small_q
+                )
+                quant_q = small_q
+            elif not fused_query and quant_q is None and not direct and not kernel_rope:
                 word = (
                     self._q_amax_word(q.device)
                     if self._stages_native_fp8_generation(attn_metadata)
@@ -2170,6 +2246,11 @@ class DeepseekV41Attention(nn.Module):
                     ),
                     projected_q_unit_scale=unit_q,
                     projected_q_amax=q_amax,
+                    query_rope=(
+                        (positions.reshape(-1)[start:end], self.rotary_emb.rotary_cos_sin)
+                        if kernel_rope
+                        else None
+                    ),
                 ),
             )
             if fused:

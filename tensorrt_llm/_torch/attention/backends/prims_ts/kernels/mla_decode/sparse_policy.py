@@ -55,6 +55,19 @@ class SparseMlaProfile:
     # dedicated 32 KB stage (the MMA warp still copies it to TMEM), so the ring
     # can retain more K/V slices.
     ws_q_in_kv: bool = False
+    # Split-KV plans with a final sparse output: the last CTA of a query tile's
+    # splits merges them in the attention kernel instead of a separate reducer
+    # launch (same arithmetic, so the same output).
+    fused_split_finish: bool = False
+    # Split-KV plans with a final sparse output: the splits of each query tile and V
+    # partition form one thread-block cluster whose first CTA merges them after a cluster
+    # barrier, instead of a separate reducer launch (same arithmetic, so the same output).
+    cluster_split_finish: bool = False
+    # The query, both selection lists, the page table and the MAIN rows were final before
+    # the launch preceding this one; that launch may still write this step's SWA rows.
+    # With the cluster merge, the kernel then releases its dependents and runs the MAIN
+    # splits before waiting on the preceding grid: only SWA rows and the outputs wait.
+    inputs_final: bool = False
 
 
 def base_fp8_profile(rows, heads, capacity, sm_count, rope_dim):

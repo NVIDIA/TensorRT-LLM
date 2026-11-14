@@ -24,7 +24,10 @@ from ...separate_reduction import (
     normalized_lse_weight,
     attention_sink_scale,
 )
-from ..helpers.constants import SPLIT_REDUCTION_SCALE_BARRIER_ID
+from ..helpers.constants import (
+    SPLIT_REDUCTION_SCALE_BARRIER_ID,
+    WARP_REDUCTION_BFLY_DISTANCES,
+)
 from ..helpers.tile import runtime_split_count
 from ..helpers.math import ceil_div, final_lse, ffma2
 from ..helpers.ops import (
@@ -980,6 +983,423 @@ def _run_parallel_gmem_reduction_shared_stats(
     # Every peer remains alive until rank zero finishes all DSMEM O loads.
     prims.barrier_cluster_arrive_relaxed()
     prims.barrier_cluster_wait()
+
+
+FUSED_SPLIT_FINISH_ELEMENTS_PER_THREAD = 8
+
+
+@cute.jit
+def _fused_finish_row_stats(
+    lse,
+    acc_lse,
+    cu_seqlens_q,
+    cfg,
+    attention_sinks,
+    batch_idx: Int32,
+    q_idx: Int32,
+    scales,
+    stats_row: Int32,
+    lane_idx: Int32,
+    publish_lse=True,
+):
+    """One head row's split weights and public LSE, as the finalizing reducer forms them."""
+
+    splits = cfg.num_ctas_per_seq_kv
+    lse_per_lane = ceil_div(splits, GMEM_REDUCTION_WARP_LANES)
+    stats_query_row = flat_query_row_state(
+        stats_row,
+        q_idx,
+        cfg.tile_size_q,
+        cfg.logical_num_heads_q,
+        cfg.logical_seq_len_q,
+        cu_seqlens_q=cu_seqlens_q,
+        batch_idx=batch_idx,
+    )
+    valid_stats = (
+        stats_row < Int32(cfg.tile_size_q)
+        and stats_row < Int32(cfg.num_heads_q)
+        and stats_query_row[4]
+    )
+    if valid_stats:
+        row_lse = acc_lse[stats_row, None, q_idx, batch_idx]
+        lane_lse = cutlass.Array(Float32, lse_per_lane, space=cutlass.AddressSpace.rmem)
+        lse_max = Float32(-Float32.inf)
+        for lane_slot_i in cutlass.range_constexpr(lse_per_lane):
+            stats_split_idx = lane_idx + Int32(lane_slot_i * GMEM_REDUCTION_WARP_LANES)
+            lane_lse[lane_slot_i] = (
+                Float32(row_lse[stats_split_idx])
+                if stats_split_idx < Int32(splits)
+                else Float32(-Float32.inf)
+            )
+            lse_max = fmax_f32(lse_max, lane_lse[lane_slot_i])
+        lse_max = warp_reduce_max_f32(lse_max)
+        lse_max = lse_max if lse_max != Float32(-Float32.inf) else Float32(0.0)
+        lse_sum = Float32(0.0)
+        for lane_slot_i in cutlass.range_constexpr(lse_per_lane):
+            lse_sum += cute.math.exp2(lane_lse[lane_slot_i] - lse_max, fastmath=True)
+        lse_sum = warp_reduce_sum_f32(lse_sum)
+        global_lse = finalize_log2_sum_exp(lse_max, lse_sum)
+        stats_sink_scale = Float32(1)
+        if cutlass.const_expr(attention_sinks is not None):
+            stats_sink_scale = attention_sink_scale(
+                global_lse, Float32(attention_sinks[stats_query_row[1]])
+            )
+        if lane_idx == Int32(0) and publish_lse:
+            if cutlass.const_expr(lse is not None):
+                stats_output_query_row = public_query_flat_row(
+                    cfg, stats_query_row[0], batch_idx, cu_seqlens_q
+                )
+                (lse.iterator.raw_ptr() + stats_output_query_row).store(
+                    final_lse(global_lse, True)
+                )
+        for lane_slot_i in cutlass.range_constexpr(lse_per_lane):
+            weight_split_idx = lane_idx + Int32(lane_slot_i * GMEM_REDUCTION_WARP_LANES)
+            if weight_split_idx < Int32(splits):
+                stats_weight = normalized_lse_weight(lane_lse[lane_slot_i], global_lse)
+                stats_weight *= stats_sink_scale
+                scales[stats_row * Int32(splits) + weight_split_idx] = stats_weight
+
+
+@cute.jit
+def _fused_finish_prefetch(
+    acc_output,
+    cfg,
+    batch_idx: Int32,
+    q_idx: Int32,
+    flat_element: Int32,
+    dim_base: Int32,
+    dims: cutlass.Constexpr[int],
+):
+    """Every split's partial of one fragment, read before its weights are known.
+
+    Rows past the tile's heads read the always-mapped first element instead; the merge skips
+    them and every split whose weight is zero, so those values are never used.
+    """
+    splits = cfg.num_ctas_per_seq_kv
+    elements = FUSED_SPLIT_FINISH_ELEMENTS_PER_THREAD
+    head_idx = flat_element // Int32(dims)
+    dim_idx = dim_base + (flat_element - head_idx * Int32(dims))
+    valid = head_idx < Int32(cfg.tile_size_q) and head_idx < Int32(cfg.num_heads_q)
+    row_ptr = acc_output.iterator.raw_ptr() + (
+        _split_o_row_base_offset(cfg, batch_idx, q_idx, head_idx, dim_idx)
+        if valid
+        else Int64(0)
+    )
+    values = cutlass.Array(Float32, splits * elements, space=cutlass.AddressSpace.rmem)
+    for split_i in cutlass.range_constexpr(splits):
+        partial_o = (row_ptr + Int64(split_i * cfg.head_dim_v)).load(
+            count=elements, alignment=elements * cfg.partial_o_dtype_bytes
+        )
+        for elem_i in cutlass.range_constexpr(elements):
+            values[split_i * elements + elem_i] = Float32(partial_o[elem_i])
+    return values
+
+
+@cute.jit
+def _fused_finish_fragment(
+    output,
+    acc_output,
+    cu_seqlens_q,
+    cfg,
+    batch_idx: Int32,
+    q_idx: Int32,
+    scales,
+    flat_element: Int32,
+    dim_base: Int32,
+    dims: cutlass.Constexpr[int],
+    prefetched=None,
+):
+    """One 8-element output fragment summed over the splits in split order.
+
+    ``flat_element`` counts the ``dims`` channels from ``dim_base`` of consecutive heads;
+    ``prefetched`` holds its splits' partials when they were read ahead.
+    """
+
+    splits = cfg.num_ctas_per_seq_kv
+    elements = FUSED_SPLIT_FINISH_ELEMENTS_PER_THREAD
+    head_idx = flat_element // Int32(dims)
+    dim_idx = dim_base + (flat_element - head_idx * Int32(dims))
+    output_query_row_state = flat_query_row_state(
+        head_idx,
+        q_idx,
+        cfg.tile_size_q,
+        cfg.logical_num_heads_q,
+        cfg.logical_seq_len_q,
+        cu_seqlens_q=cu_seqlens_q,
+        batch_idx=batch_idx,
+    )
+    valid_output = (
+        head_idx < Int32(cfg.tile_size_q)
+        and head_idx < Int32(cfg.num_heads_q)
+        and output_query_row_state[4]
+    )
+    if valid_output:
+        acc_row_ptr = acc_output.iterator.raw_ptr() + _split_o_row_base_offset(
+            cfg, batch_idx, q_idx, head_idx, dim_idx
+        )
+        output_acc = cutlass.Array(Float32, elements, space=cutlass.AddressSpace.rmem)
+        for elem_i in cutlass.range_constexpr(elements):
+            output_acc[elem_i] = Float32(0.0)
+        for split_i in cutlass.range_constexpr(splits):
+            scale = Float32(scales[head_idx * Int32(splits) + Int32(split_i)])
+            # Sparse inactive splits may leave their O partial untouched.
+            if scale > Float32(0):
+                if cutlass.const_expr(prefetched is None):
+                    partial_o = (acc_row_ptr + Int64(split_i * cfg.head_dim_v)).load(
+                        count=elements, alignment=elements * cfg.partial_o_dtype_bytes
+                    ).to(Float32)
+                else:
+                    partial_o = cutlass.Array(
+                        Float32, elements, space=cutlass.AddressSpace.rmem
+                    )
+                    for elem_i in cutlass.range_constexpr(elements):
+                        partial_o[elem_i] = prefetched[split_i * elements + elem_i]
+                for elem_i in cutlass.range_constexpr(0, elements, 2):
+                    output_acc[elem_i], output_acc[elem_i + 1] = ffma2(
+                        (partial_o[elem_i], partial_o[elem_i + 1]),
+                        (scale, scale),
+                        (output_acc[elem_i], output_acc[elem_i + 1]),
+                    )
+        output_query_row = public_query_flat_row(
+            cfg, output_query_row_state[0], batch_idx, cu_seqlens_q
+        )
+        out_elem_offset = _output_element_offset(cfg, output_query_row, dim_idx)
+        output_regs = cutlass.Array(output.element_type, elements, space=cutlass.AddressSpace.rmem)
+        for elem_i in cutlass.range_constexpr(elements):
+            output_regs[elem_i] = output.element_type(output_acc[elem_i])
+        (output.iterator.raw_ptr() + out_elem_offset).store(
+            output_regs.data_ptr().load(count=elements, alignment=elements * cfg.o_dtype_bytes),
+            alignment=elements * cfg.o_dtype_bytes,
+        )
+
+
+@cute.jit
+def run_fused_split_finish(
+    output,
+    lse,
+    acc_output,
+    acc_lse,
+    cu_seqlens_q,
+    cfg,
+    attention_sinks,
+    batch_idx: Int32,
+    q_idx: Int32,
+    scales,
+    threads: cutlass.Constexpr[int],
+    barrier_id: cutlass.Constexpr[int],
+    dim_base=None,
+    dims: cutlass.Constexpr[int] = None,
+    publish_lse=True,
+):
+    """Merge one query tile's split partials in the CTA that finished them last.
+
+    ``cfg`` is the finalizing reducer's configuration (complete D heads per slice, see
+    ``_parallel_reduction_setup``). Head statistics and output elements are formed exactly as
+    ``_run_parallel_gmem_reduction_g1_shared_stats`` forms them with ``finalize_attention``,
+    so the output equals the standalone reducer's: warp ``w`` publishes the split weights of
+    rows ``w, w + warps, ...`` into ``scales`` (shared FP32, ``tile_size_q * splits``), then
+    each thread sums 8-element fragments over the splits in split order. All ``threads``
+    threads of the CTA call it. ``dim_base`` and ``dims`` restrict the merge to those output
+    channels; ``publish_lse`` gates the LSE stores.
+    """
+    if cutlass.const_expr(dims is None):
+        dims = cfg.head_dim_v
+        dim_base = Int32(0)
+
+    warps = threads // GMEM_REDUCTION_WARP_LANES
+    thread_idx, _, _ = cute.arch.thread_idx()
+    warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+    lane_idx = thread_idx % Int32(GMEM_REDUCTION_WARP_LANES)
+    rows = cfg.tile_size_q
+    if cutlass.const_expr(isinstance(cfg.logical_seq_len_q, int)):
+        # Later rows of a tile hold no logical query (every access of theirs is predicated
+        # off), so the merge's rounds cover the live rows only.
+        rows = min(rows, cfg.logical_num_heads_q * cfg.logical_seq_len_q)
+    elements = FUSED_SPLIT_FINISH_ELEMENTS_PER_THREAD
+    rounds = ceil_div(rows * dims, threads * elements)
+    prefetched = None
+    if cutlass.const_expr(rounds == 1):
+        # A single round's partials are read before the weights' round trip, so both
+        # reads overlap as in the standalone reducer.
+        prefetched = _fused_finish_prefetch(
+            acc_output, cfg, batch_idx, q_idx, thread_idx * Int32(elements), dim_base, dims
+        )
+    for row_i in cutlass.range_constexpr(ceil_div(rows, warps)):
+        _fused_finish_row_stats(
+            lse,
+            acc_lse,
+            cu_seqlens_q,
+            cfg,
+            attention_sinks,
+            batch_idx,
+            q_idx,
+            scales,
+            warp_idx + Int32(row_i * warps),
+            lane_idx,
+            publish_lse,
+        )
+    prims.barrier_cta_sync(barrier_id=barrier_id, thread_count=threads)
+    for chunk_i in cutlass.range_constexpr(rounds):
+        _fused_finish_fragment(
+            output,
+            acc_output,
+            cu_seqlens_q,
+            cfg,
+            batch_idx,
+            q_idx,
+            scales,
+            (Int32(chunk_i * threads) + thread_idx) * Int32(elements),
+            dim_base,
+            dims,
+            prefetched,
+        )
+
+
+def _butterfly_lane_sum(values):
+    """Sum ``values`` exactly as a warp butterfly sum forms it when lane ``i`` holds
+    ``values[i]`` and every other lane zero.
+
+    Each lane of such a reduction ends with the same total (addition is commutative), so
+    this evaluates lane 0's addition tree; a zero lane adds nothing because every value
+    here is a nonnegative ``exp2`` result.
+    """
+
+    def lane_value(lane, step):
+        if step == 0:
+            return values[lane] if lane < len(values) else None
+        own = lane_value(lane, step - 1)
+        peer = lane_value(lane ^ WARP_REDUCTION_BFLY_DISTANCES[step - 1], step - 1)
+        if own is None:
+            return peer
+        if peer is None:
+            return own
+        return Float32(own + peer)
+
+    return lane_value(0, len(WARP_REDUCTION_BFLY_DISTANCES))
+
+
+@cute.jit
+def run_cluster_push_finish(
+    output,
+    lse,
+    push_smem,
+    push_barrier,
+    cfg,
+    reducer_cfg,
+    attention_sinks,
+    batch_idx: Int32,
+    q_idx: Int32,
+    dim_base: Int32,
+    publish_lse,
+    threads: cutlass.Constexpr[int],
+):
+    """Merge the split partials pushed into this CTA's shared buffer, as the reducer would.
+
+    ``push_smem`` holds, for ``cfg.num_ctas_per_seq_kv`` splits and ``cfg.cluster_split_rows``
+    rows, the BF16 partial O of the CTA's ``cfg.head_dim_per_cta_v`` V columns, then each
+    split's FP32 LSE (``cfg.cluster_split_push_bytes``); ``push_barrier`` completes once every
+    byte has landed. Each thread
+    merges ``FUSED_SPLIT_FINISH_ELEMENTS_PER_THREAD`` columns of one row and forms that
+    row's statistics itself, in the order ``_run_parallel_gmem_reduction_g1_shared_stats``
+    reduces them across a warp, so the result matches the finalizing reducer bitwise. A
+    thread loads its sink before the wait and waits only if it owns columns. The first
+    column's thread stores the row's LSE when ``publish_lse``. All ``threads`` threads of
+    the CTA call it.
+    """
+    splits = cfg.num_ctas_per_seq_kv
+    rows = cfg.cluster_split_rows
+    dims = cfg.head_dim_per_cta_v
+    elements = FUSED_SPLIT_FINISH_ELEMENTS_PER_THREAD
+    o_bytes = splits * rows * dims * cfg.partial_o_dtype_bytes
+    base = push_smem.data_ptr().toint(Int64)
+    thread_idx, _, _ = cute.arch.thread_idx()
+
+    def word_ptr(byte_offset, dtype):
+        return cutlass.inttoptr(base + Int64(byte_offset), mem_space=3, dtype=dtype)
+
+    for chunk_i in cutlass.range_constexpr(ceil_div(rows * dims, threads * elements)):
+        flat_element = (Int32(chunk_i * threads) + thread_idx) * Int32(elements)
+        row = flat_element // Int32(dims)
+        column = flat_element - row * Int32(dims)
+        if row < Int32(rows):
+            state = flat_query_row_state(
+                row,
+                q_idx,
+                reducer_cfg.tile_size_q,
+                reducer_cfg.logical_num_heads_q,
+                reducer_cfg.logical_seq_len_q,
+                cu_seqlens_q=None,
+                batch_idx=batch_idx,
+            )
+            if row < Int32(reducer_cfg.num_heads_q) and state[4]:
+                sink = Float32(0)
+                if cutlass.const_expr(attention_sinks is not None):
+                    sink = Float32(attention_sinks[state[1]])
+                out_row = public_query_flat_row(reducer_cfg, state[0], batch_idx, None)
+                out_elem_offset = _output_element_offset(reducer_cfg, out_row, dim_base + column)
+                ready = prims.mbarrier_try_wait_parity(push_barrier, 0, time_limit=0)
+                while not ready:
+                    ready = prims.mbarrier_try_wait_parity(
+                        push_barrier, 0, time_limit=10_000_000
+                    )
+                split_lse = [
+                    word_ptr(Int32(o_bytes) + (Int32(split_i * rows) + row) * Int32(4), Float32).load()
+                    for split_i in range(splits)
+                ]
+                split_words = [
+                    word_ptr(
+                        ((Int32(split_i * rows) + row) * Int32(dims) + column)
+                        * Int32(cfg.partial_o_dtype_bytes),
+                        Int32,
+                    ).load(count=4, alignment=16)
+                    for split_i in range(splits)
+                ]
+                lse_max = Float32(-Float32.inf)
+                for split_i in cutlass.range_constexpr(splits):
+                    lse_max = fmax_f32(lse_max, split_lse[split_i])
+                lse_max = lse_max if lse_max != Float32(-Float32.inf) else Float32(0.0)
+                lse_sum = _butterfly_lane_sum(
+                    [
+                        Float32(cute.math.exp2(split_lse[split_i] - lse_max, fastmath=True))
+                        for split_i in range(splits)
+                    ]
+                )
+                global_lse = finalize_log2_sum_exp(lse_max, lse_sum)
+                sink_scale = Float32(1)
+                if cutlass.const_expr(attention_sinks is not None):
+                    sink_scale = attention_sink_scale(global_lse, sink)
+                if cutlass.const_expr(lse is not None):
+                    if publish_lse and column == Int32(0):
+                        (lse.iterator.raw_ptr() + out_row).store(final_lse(global_lse, True))
+                output_acc = cutlass.Array(Float32, elements, space=cutlass.AddressSpace.rmem)
+                for elem_i in cutlass.range_constexpr(elements):
+                    output_acc[elem_i] = Float32(0.0)
+                for split_i in cutlass.range_constexpr(splits):
+                    scale = normalized_lse_weight(split_lse[split_i], global_lse) * sink_scale
+                    # Sparse inactive splits push zero partials with a zero weight.
+                    if scale > Float32(0):
+                        words = split_words[split_i]
+                        for word in cutlass.range_constexpr(4):
+                            low = prims.mov_b32(Int32(words[word]) << Int32(16), target_type=Float32)
+                            high = prims.mov_b32(
+                                Int32(words[word]) & Int32(-65536), target_type=Float32
+                            )
+                            output_acc[2 * word], output_acc[2 * word + 1] = ffma2(
+                                (low, high),
+                                (scale, scale),
+                                (output_acc[2 * word], output_acc[2 * word + 1]),
+                            )
+                output_regs = cutlass.Array(
+                    output.element_type, elements, space=cutlass.AddressSpace.rmem
+                )
+                for elem_i in cutlass.range_constexpr(elements):
+                    output_regs[elem_i] = output.element_type(output_acc[elem_i])
+                (output.iterator.raw_ptr() + out_elem_offset).store(
+                    output_regs.data_ptr().load(
+                        count=elements, alignment=elements * reducer_cfg.o_dtype_bytes
+                    ),
+                    alignment=elements * reducer_cfg.o_dtype_bytes,
+                )
 
 
 @cute.jit

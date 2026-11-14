@@ -905,6 +905,109 @@ def gptj_rope_small_m(
     )
 
 
+@triton.jit
+def _gptj_rope_e4m3_small_m_kernel(
+    Q,
+    POS,
+    CS,
+    Q8,
+    HEADS: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    PDL: tl.constexpr,
+):
+    """One token's ``BLOCK_H`` heads: GPT-J RoPE of the last 64 channels, then unit-scale E4M3.
+
+    The rotated channels round to BF16 exactly as ``_gptj_rope_small_m_kernel`` stores them; every
+    BF16 value then converts with ``cvt.rn.satfinite.e4m3x2.f32``, the conversion PrimTS's own
+    query staging applies, so ``Q8`` holds the bytes that staging would write.
+    """
+    token = tl.program_id(0)
+    heads = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    valid = (heads < HEADS)[:, None]
+    trig = tl.load(POS + token).to(tl.int64) * 64 + tl.arange(0, 32)
+    cosine = tl.load(CS + trig)[None, :]
+    sine = tl.load(CS + trig + 32)[None, :]
+    base = (token * HEADS + heads[:, None]).to(tl.int64) * HEAD_DIM
+    if PDL:
+        tl.extra.cuda.gdc_wait()
+    plain = tl.load(Q + base + tl.arange(0, HEAD_DIM)[None, :], valid, 0.0).to(tl.float32)
+    rope = base + (HEAD_DIM - 64) + tl.arange(0, 64)[None, :]
+    x, y = tl.split(tl.reshape(tl.load(Q + rope, valid, 0.0).to(tl.float32), (BLOCK_H, 32, 2)))
+    if PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+    rotated = tl.join(tl.fma(cosine, x, -(sine * y)), tl.fma(sine, x, cosine * y))
+    rotated = tl.reshape(rotated, (BLOCK_H, 64)).to(tl.bfloat16).to(tl.float32)
+    # Pair p of a head holds channels 2p (low byte) and 2p + 1; the first HEAD_DIM / 2 - 32
+    # pairs come from the loaded row, the last 32 from the rotated channels.
+    pair_base = base // 2
+    _store_e4m3_pairs(Q8 + pair_base, plain, valid, BLOCK_H, HEAD_DIM, HEAD_DIM // 2 - 32)
+    _store_e4m3_pairs(Q8 + pair_base + (HEAD_DIM // 2 - 32), rotated, valid, BLOCK_H, 64, 32)
+
+
+@triton.jit
+def _store_e4m3_pairs(PAIRS, values, valid, BLOCK_H: tl.constexpr, WIDTH: tl.constexpr, LIMIT):
+    """Store the first ``LIMIT`` RN/satfinite E4M3 pairs of each ``[BLOCK_H, WIDTH]`` row."""
+    low, high = tl.split(tl.reshape(values, (BLOCK_H, WIDTH // 2, 2)))
+    packed = tl.inline_asm_elementwise(
+        "cvt.rn.satfinite.e4m3x2.f32 $0, $2, $1;",
+        "=h,r,r",
+        [low, high],
+        dtype=tl.int16,
+        is_pure=True,
+        pack=1,
+    )
+    pair = tl.arange(0, WIDTH // 2)[None, :]
+    tl.store(PAIRS + pair, packed, valid & (pair < LIMIT))
+
+
+def gptj_rope_e4m3_small_m(
+    q: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin: torch.Tensor,
+    q8: torch.Tensor,
+) -> None:
+    """Write the unit-scale E4M3 query of the RoPE'd ``q`` into ``q8``, leaving ``q`` as is.
+
+    ``q`` is the pre-RoPE BF16 ``[M, heads, D]`` projection output of a small decode step and
+    ``q8`` a contiguous ``[M, heads * D]`` E4M3 tensor viewed as int16 pairs. The bytes equal
+    ``gptj_rope_small_m`` (``mla_rope_inplace``) followed by PrimTS's RN/satfinite query staging,
+    in one PDL launch of one program per token and four heads.
+    """
+    rows, heads, depth = q.shape
+    if (
+        q.dtype != torch.bfloat16
+        or not q.is_contiguous()
+        or rows <= 0
+        or depth != 512
+        or positions.dtype not in (torch.int32, torch.int64)
+        or positions.numel() != rows
+        or not positions.is_contiguous()
+        or cos_sin.dtype != torch.float32
+        or not cos_sin.is_contiguous()
+        or q8.dtype != torch.float8_e4m3fn
+        or q8.shape != (rows, heads * depth)
+        or not q8.is_contiguous()
+        or q8.device != q.device
+    ):
+        raise ValueError("CSA2 small-M RoPE/E4M3 query got an unsupported input")
+    block_h = min(4, triton.next_power_of_2(heads))
+    pdl = _pdl()
+    _gptj_rope_e4m3_small_m_kernel[(rows, triton.cdiv(heads, block_h))](
+        q,
+        positions,
+        cos_sin,
+        q8.view(torch.int16),
+        heads,
+        block_h,
+        depth,
+        pdl,
+        num_warps=4,
+        enable_fp_fusion=False,
+        launch_pdl=pdl,
+    )
+
+
 def mxfp8_weight_scale(scale: torch.Tensor | None) -> torch.Tensor | None:
     """CUTLASS-swizzled UE8M0 ``[groups, R * D / 32]`` scales equal to power-of-two 128-block ones.
 

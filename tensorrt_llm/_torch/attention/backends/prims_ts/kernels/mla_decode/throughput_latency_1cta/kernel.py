@@ -87,11 +87,13 @@ from .tasks import (
     create_throughput_latency_softmax1_task,
 )
 from .parallel_reduction import (
+    run_cluster_push_finish,
     PARALLEL_GMEM_REDUCTION_ELEMENTS_PER_SLICE,
     PARALLEL_GMEM_REDUCTION_SWAPS_ELEMENTS_PER_SLICE,
     parallel_gmem_reduction_base_clusters,
     parallel_gmem_reduction_launch_shape,
     parallel_gmem_reduction_threads,
+    run_fused_split_finish,
     run_parallel_gmem_reduction_kernel,
     supports_parallel_gmem_reduction,
 )
@@ -506,6 +508,7 @@ def build_throughput_latency_mla_task_manager(
     kv_producer=None,
     kv_producer_args=None,
     tma_desc_o=None,
+    query_args=None,
 ) -> tuple[TaskManager, object]:
     """Build the throughput-latency 1CTA MLA TaskManager for validation or execution.
 
@@ -573,6 +576,7 @@ def build_throughput_latency_mla_task_manager(
             requested_splits=requested_splits,
             kv_producer=kv_producer,
             kv_producer_args=kv_producer_args,
+            query_args=query_args,
         )
 
     agent = pipeline.Agent
@@ -1238,6 +1242,7 @@ def _make_single_kv_pipe_task_graph(
     kv_producer=None,
     kv_producer_args=None,
     tma_desc_o=None,
+    query_args=None,
 ) -> tuple[TaskManager, object]:
     """Build the single-stream 1CTA task graph.
 
@@ -1333,6 +1338,11 @@ def _make_single_kv_pipe_task_graph(
         smem_kv_cfg = kv_producer.pipeline_config(
             cfg, load_group, umma_group, cta_layout_vmnk
         )
+    if query_args is not None:
+        # A producer that writes Q itself publishes thread arrivals too.
+        smem_q_cfg = kv_producer.query_pipeline_config(
+            cfg, load_group, umma_group, cta_layout_vmnk
+        )
     if cfg.sparse_reuse_kv:
         smem_kv_cfg = dataclass_replace(smem_kv_cfg, advance_on_wait=True)
     tmem_s_cfg = PipelineConfig.create_umma_async_pipeline_cfg(
@@ -1400,7 +1410,7 @@ def _make_single_kv_pipe_task_graph(
         cta_idx_kv=cta_idx_kv,
         name="ll_mla_q64_page_offsets",
     )
-    smem_q = SmemQResource(
+    smem_q_args = dict(
         cfg=cfg,
         pipeline_config=smem_q_cfg,
         tma_desc_q_latent=tma_desc_q_latent,
@@ -1411,6 +1421,11 @@ def _make_single_kv_pipe_task_graph(
         batch_idx=batch_idx,
         cta_idx_q=cta_idx_q,
         name="ll_mla_q64_smem_q",
+    )
+    smem_q = (
+        SmemQResource(**smem_q_args)
+        if query_args is None
+        else kv_producer.make_query_resource(query_args, **smem_q_args)
     )
     smem_kv_args = dict(
         cfg=cfg,
@@ -2614,7 +2629,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                 batch_size,
             )
         cluster_shape = None
-        if cutlass.const_expr(cfg.use_cluster_reduction == 1):
+        if cutlass.const_expr(cfg.use_cluster_reduction == 1 or cfg.cluster_split_finisher):
             cluster_shape = (cfg.num_ctas_per_seq_kv, 1, 1)
         requested_splits = None
         if cutlass.const_expr(self.runtime_split_kv):
@@ -2664,7 +2679,9 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             min_blocks_per_mp=1,
             use_pdl=acc_o is not None or cfg.use_pdl,
         )
-        if cutlass.const_expr(acc_o is not None):
+        if cutlass.const_expr(
+            acc_o is not None and not cfg.fuse_split_finisher and not cfg.cluster_split_finisher
+        ):
             if cutlass.const_expr(
                 self.use_parallel_reduction or cfg.fuse_sparse_reduction
             ):
@@ -2797,6 +2814,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         wait_after_prologue = cutlass.const_expr(
             cfg.use_pdl
             and cfg.pdl_wait_after_prologue
+            and not cfg.sparse_inputs_final
             and acc_o is None
             and tile_sched_params is not None
             and cfg.use_persistent_scheduler == 1
@@ -2805,7 +2823,14 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             and not isinstance(output_scale, cute.Tensor)
             and not (cfg.sparse_direct and isinstance(sparse_inputs[5], cute.Tensor))
         )
-        if cutlass.const_expr((cfg.use_pdl or acc_o is not None) and not wait_after_prologue):
+        if cutlass.const_expr(cfg.sparse_inputs_final):
+            # Only this step's SWA rows and the outputs depend on the preceding grid: the SWA
+            # loads and the first cluster CTA's merge wait for it there, and dependents may
+            # launch now (they wait for this whole grid before any read).
+            entry_thread_idx, _, _ = cute.arch.thread_idx()
+            if entry_thread_idx == Int32(0):
+                prims.griddepcontrol(kind=prims.GridDepAction.LAUNCH_DEPENDENTS)
+        elif cutlass.const_expr((cfg.use_pdl or acc_o is not None) and not wait_after_prologue):
             # A PDL launch can start before the preceding grid completes, so
             # every input read below (metadata, Q, KV, sinks) waits for it.
             prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
@@ -2848,6 +2873,8 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                     cfg.total_kv_tiles * cfg.tile_size_kv,
                     request=request,
                 )
+                if cutlass.const_expr(hasattr(self.kv_producer, "prefetch_selections")):
+                    self.kv_producer.prefetch_selections(si, request, cfg.page_offsets_warp_idx)
             else:
                 capacity = ((cutlass.Int32(si.shape[-1]) + 127) // 128) * 128
                 if cutlass.const_expr(cfg.sparse_direct_capacities[1] > 0):
@@ -2869,6 +2896,20 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             sparse_epilogue_params = sinks
         else:
             sparse_epilogue_params = None
+        query_args = None
+        if cutlass.const_expr(
+            cfg.sparse_direct
+            and self.kv_producer is not None
+            and hasattr(self.kv_producer, "query_args")
+        ):
+            # A producer can stage Q from its own sources instead of the Q descriptors.
+            query_args = self.kv_producer.query_args(si)
+            if cutlass.const_expr(
+                query_args is not None and hasattr(self.kv_producer, "prefetch_query")
+            ):
+                self.kv_producer.prefetch_query(
+                    query_args, request, cfg.load_warp_idx, cfg.load_num_warps
+                )
 
         # The grid is expressed in physical flat-Q tile coordinates. Decode it
         # once here; Q/O resources retain responsibility for logical-row
@@ -3030,6 +3071,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             requested_splits=requested_splits,
             kv_producer=self.kv_producer,
             kv_producer_args=kv_producer_args,
+            query_args=query_args,
         )
         if cutlass.const_expr(has_runtime_activity_guard):
             # Initialize resource containers outside runtime control flow; only
@@ -3044,7 +3086,8 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         assert tmem_ptr_alloc is not None
         tmem_ptr_i32 = smem_allocator.get(tmem_ptr_alloc)
 
-        if cutlass.const_expr(cfg.use_cluster_reduction == 1):
+        if cutlass.const_expr(cfg.use_cluster_reduction == 1 or cfg.cluster_split_finisher):
+            # Arm the barriers peers complete before this CTA's cluster arrival below.
             resource_context = ResourceContext(
                 smem_base=smem_allocator.smem_base,
                 tmem_ptr_i32=tmem_ptr_i32,
@@ -3055,6 +3098,10 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         if cutlass.const_expr(cfg.use_cluster_reduction == 1):
             prims.barrier_cluster_arrive_relaxed()
             prims.barrier_cluster_wait()
+        if cutlass.const_expr(cfg.cluster_split_finisher):
+            # Every thread waits on this arrival before its first push (correction tail) or
+            # at the end: the cluster's first CTA armed its push barrier above.
+            prims.barrier_cluster_arrive_relaxed()
         prims.barrier_cta_sync(
             barrier_id=TMEM_LIFECYCLE_BARRIER_ID,
             thread_count=cfg.threads_per_cta,
@@ -3107,7 +3154,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                         cta_idx_kv,
                         cta_idx_head_dim_v,
                     )
-                elif cutlass.const_expr(acc_o is not None):
+                elif cutlass.const_expr(acc_o is not None and not cfg.cluster_split_finisher):
                     # Standalone reducers retain configured split loops, so a
                     # pruned producer must overwrite its workspace slot before
                     # releasing the PDL-dependent reducer.
@@ -3136,7 +3183,36 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                 cfg.tmem_alloc_cols,
                 group=prims.CTAGroup.CTA_1,
             )
-        if cutlass.const_expr(acc_o is not None or cfg.use_pdl):
+        if cutlass.const_expr(cfg.cluster_split_finisher and acc_o is not None):
+            self._finish_cluster_splits(
+                cfg,
+                cluster_corr_resource,
+                o,
+                lse,
+                sparse_epilogue_params,
+                batch_idx,
+                cta_idx_q,
+                cta_idx_kv,
+                cta_idx_head_dim_v,
+                run_task_graph,
+                query_tile_is_active,
+            )
+        if cutlass.const_expr(cfg.fuse_split_finisher and acc_o is not None):
+            self._finish_splits(
+                cfg,
+                o,
+                lse,
+                acc_o,
+                acc_lse,
+                cu_seqlens_q,
+                sparse_epilogue_params,
+                batch_idx,
+                cta_idx_q,
+                smem_allocator.smem_base,
+            )
+        if cutlass.const_expr(
+            (acc_o is not None or cfg.use_pdl) and not cfg.sparse_inputs_final
+        ):
             # Every CTA in the producer grid must release the dependent
             # reducer or next PDL launch, including runtime-padded Q/split CTAs
             # that skipped the task graph. One elected thread emits the
@@ -3144,6 +3220,131 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             thread_idx, _, _ = cute.arch.thread_idx()
             if thread_idx == Int32(0):
                 prims.griddepcontrol(kind=prims.GridDepAction.LAUNCH_DEPENDENTS)
+
+    @cute.jit
+    def _finish_cluster_splits(
+        self,
+        cfg,
+        corr,
+        o: cute.Tensor,
+        lse: cute.Tensor,
+        attention_sinks,
+        batch_idx: Int32,
+        cta_idx_q: Int32,
+        cta_idx_kv: Int32,
+        cta_idx_head_dim_v: Int32,
+        run_task_graph,
+        query_tile_is_active,
+    ):
+        """Merge this query tile and V partition's splits in its cluster's first CTA.
+
+        The cluster is the tile's splits (grid X is query tile major, split minor). Each
+        split's correction tail pushed its partial O and LSE into the first CTA's shared
+        buffer, completing bytes on that CTA's transaction barrier; a split without a task
+        graph pushes the neutral partial here. The first CTA's threads that own output columns
+        wait for every byte and merge the partition's columns exactly as the finalizing
+        reducer does (the first V partition also stores the LSE).
+        """
+        reducer_cfg, _, _ = self._parallel_reduction_setup(cfg)
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        corrects = (warp_idx >= Int32(cfg.correction_warp_idx)) & (
+            warp_idx < Int32(cfg.correction_warp_idx + cfg.correction_num_warps)
+        )
+        if not (corrects and run_task_graph):
+            # The correction tail waited already wherever it ran.
+            prims.barrier_cluster_wait()
+        if query_tile_is_active:
+            if not run_task_graph:
+                corr.push_neutral_split(cta_idx_kv)
+            if cta_idx_kv == Int32(0):
+                if cutlass.const_expr(cfg.sparse_inputs_final):
+                    # The outputs may still be read or written by the preceding grid.
+                    prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
+                run_cluster_push_finish(
+                    o,
+                    lse,
+                    corr._split_push_smem,
+                    corr._split_push_barrier,
+                    cfg,
+                    reducer_cfg,
+                    attention_sinks,
+                    batch_idx,
+                    cta_idx_q,
+                    Int32(cta_idx_head_dim_v) * Int32(cfg.head_dim_per_cta_v),
+                    Int32(cta_idx_head_dim_v) == Int32(0),
+                    cfg.threads_per_cta,
+                )
+
+    @cute.jit
+    def _finish_splits(
+        self,
+        cfg,
+        o: cute.Tensor,
+        lse: cute.Tensor,
+        acc_o: cute.Tensor,
+        acc_lse: cute.Tensor,
+        cu_seqlens_q: cute.Tensor,
+        attention_sinks,
+        batch_idx: Int32,
+        cta_idx_q: Int32,
+        smem_base,
+    ):
+        """Count this CTA's arrival at its query tile; the last of the tile merges the splits.
+
+        Every CTA of the tile (each KV split and V partition) arrives once, after the CTA
+        barrier that follows its partial-O and LSE stores, through a GPU-scope release fence
+        and an acquire-release add on the tile's INT32 counter (after the LSE workspace). The
+        CTA that brings the count to the tile's CTA total acquires the others' partials, merges
+        them as the finalizing reducer would, and resets the counter for the next launch. The
+        task graph has finished, so shared memory holds only the arrival flag and split
+        weights.
+        """
+        reducer_cfg, _, _ = self._parallel_reduction_setup(cfg)
+        arrivals = cfg.num_ctas_per_seq_kv * cfg.num_ctas_per_head_dim
+        counters = cute.make_tensor(
+            cute.recast_ptr(acc_lse.iterator + cute.cosize(acc_lse.layout), dtype=cutlass.Int32),
+            cute.make_layout((1 << 30,), stride=(1,)),
+        )
+        group = batch_idx * Int32(cfg.seq_len_q) + cta_idx_q
+        flag = cutlass.Array(smem_base.data_ptr(), dtype=cutlass.Int32, shape=(4,), addrspace=3)
+        scales = cutlass.Array(
+            smem_base.data_ptr() + 16,
+            dtype=Float32,
+            shape=(cfg.tile_size_q * cfg.num_ctas_per_seq_kv,),
+            addrspace=3,
+        )
+        thread_idx, _, _ = cute.arch.thread_idx()
+        if thread_idx == Int32(0):
+            cute.arch.fence_acq_rel_gpu()
+            arrived = cute.arch.atomic_add(
+                ptr=(counters.iterator + group).llvm_ptr,
+                val=Int32(1),
+                sem="acq_rel",
+                scope="gpu",
+            )
+            flag[0] = Int32(1) if arrived == Int32(arrivals - 1) else Int32(0)
+        prims.barrier_cta_sync(
+            barrier_id=TMEM_LIFECYCLE_BARRIER_ID,
+            thread_count=cfg.threads_per_cta,
+        )
+        if flag[0] == Int32(1):
+            cute.arch.fence_acq_rel_gpu()
+            run_fused_split_finish(
+                o,
+                lse,
+                acc_o,
+                acc_lse,
+                cu_seqlens_q,
+                reducer_cfg,
+                attention_sinks,
+                batch_idx,
+                cta_idx_q,
+                scales,
+                cfg.threads_per_cta,
+                TMEM_LIFECYCLE_BARRIER_ID,
+            )
+            if thread_idx == Int32(0):
+                counters[group] = Int32(0)
 
     @cute.kernel
     def gmem_reduction_kernel(
