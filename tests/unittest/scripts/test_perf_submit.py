@@ -832,3 +832,28 @@ def test_local_submit_adds_eplb_shm_mount_to_launch_script(
     local_submit_module.main()
     content = launch.read_text()
     assert f'"--container-mounts=/a:/a,{REPO_ROOT}:{REPO_ROOT},tmpfs:/dev/shm:size=640G"' in content
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("ctx_transceiver", "expected"),
+    [
+        ({"kv_transfer_timeout_ms": None}, {"kv_transfer_timeout_ms": None}),
+        ({}, None),
+        (None, None),
+    ],
+    ids=["null", "unset", "no_transceiver"],
+)
+def test_example_server_config_copies_a_null_ctx_kv_transfer_timeout(
+    example_submit_module: ModuleType, ctx_transceiver, expected
+):
+    """An explicit null (no timeout) must reach the orchestrator, or it assumes the 60 s default."""
+    allocations = {
+        "CTX": {0: {"nodes": {"n0": [0]}, "port": 8001}},
+        "GEN": {0: {"nodes": {"n1": [0]}, "port": 8002}},
+    }
+    config = example_submit_module.convert_allocations_to_server_config(
+        allocations, ctx_cache_transceiver_config=ctx_transceiver
+    )
+    assert config["context_servers"].get("cache_transceiver_config") == expected
+    assert "cache_transceiver_config" not in config["generation_servers"]

@@ -68,9 +68,13 @@ add_th_common_family(
   dsv3RopeOp.cpp
   convertReqIndexToGlobalOp.cpp
   nvfp4MlaKvCacheGatherOp.cpp
+  pagedFp8ContextFmhaOp.cpp
   trtllmGenQKVProcessOp.cpp)
 target_include_directories(th_common_attention
                            PRIVATE ${TRTLLM_FMHA_PARAMS_GENERATED_INCLUDE_DIR})
+# pagedFp8ContextFmhaOp.cpp includes the trtllm-gen FMHA runner headers (see
+# th_common_visual_gen below).
+target_link_libraries(th_common_attention PRIVATE trtllm_gen_fmha_interface)
 
 # MiniMax-M3 torch ops live in minimaxM3/; that directory adds them to
 # th_common_attention with target_sources() so the list stays next to the files.

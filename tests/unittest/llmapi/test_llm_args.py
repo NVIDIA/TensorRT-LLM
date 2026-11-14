@@ -1647,6 +1647,21 @@ def test_KvCacheConfig_declaration(offload_field):
 
 
 @pytest.mark.cpu_only
+def test_KvCacheConfig_defer_generation_only_release():
+    assert KvCacheConfig().defer_generation_only_release is False
+    for v2 in (True, "auto"):
+        assert KvCacheConfig(
+            defer_generation_only_release=True,
+            use_kv_cache_manager_v2=v2).defer_generation_only_release is True
+    assert KvCacheConfig(use_kv_cache_manager_v2=False,
+                         defer_generation_only_release=False)
+    with pytest.raises(ValidationError,
+                       match="defer_generation_only_release requires"):
+        KvCacheConfig(defer_generation_only_release=True,
+                      use_kv_cache_manager_v2=False)
+
+
+@pytest.mark.cpu_only
 def test_KvCacheConfig_offload_priority_compatibility():
     assert KvCacheConfig().cold_tier_offload_min_priority is None
     for field in ("cold_tier_offload_min_priority",
@@ -2052,6 +2067,253 @@ def test_KvCacheConfig_disk_cache_validation(tmp_path):
     with pytest.raises(ValidationError) as exc_info:
         KvCacheConfig(disk_cache_size=2048)
     assert "disk_cache_path" in str(exc_info.value)
+
+
+@pytest.mark.cpu_only
+def test_KvCacheConfig_remote_cache_validation(tmp_path):
+    remote = llm_args_mod.RemoteCacheConfig
+    config = KvCacheConfig(
+        remote_cache_config={
+            "directory": str(tmp_path),
+            "transport": {
+                "kind": "fabric"
+            },
+            "level": {
+                "size": 200 << 30,
+                "pool_ratio": [0.02, 0.98],
+                "expected": {
+                    "num_donors": 8,
+                    "claim_size": 406 << 30
+                },
+            },
+        })
+    level = config.remote_cache_config.level
+    assert level.size == 200 << 30
+    assert level.donor_wait_timeout_s == 900.0
+    assert isinstance(config.remote_cache_config.transport,
+                      llm_args_mod.RemoteFabricTransportConfig)
+    assert config.remote_cache_config.donor is None
+    # The default transport is NIXL with its defaults.
+    nixl = remote(directory=str(tmp_path), donor={"size": 1 << 30}).transport
+    assert (nixl.kind, nixl.transfer_timeout_s,
+            nixl.ucx_devices) == ("nixl", 30.0, None)
+    assert KvCacheConfig().remote_cache_config is None
+
+    for bad in (
+        {},  # neither a donor nor a level
+        {
+            "level": {
+                "size": 1,
+                "expected": {
+                    "num_donors": 8
+                }
+            }
+        },
+            # Each transport's fields only on that transport.
+        {
+            "donor": {
+                "size": 1 << 30
+            },
+            "transport": {
+                "kind": "fabric",
+                "ucx_devices": "mlx5_0:1"
+            }
+        },
+        {
+            "level": {
+                "size": 1
+            },
+            "transport": {
+                "kind": "fabric",
+                "transfer_timeout_s": 10.0
+            }
+        },
+        {
+            "donor": {
+                "size": 1 << 30
+            },
+            "transport": {
+                "kind": "nixl",
+                "donor_reserve_size": 8 << 30
+            }
+        },
+        {
+            "donor": {
+                "size": 1 << 30
+            },
+            "transport": {
+                "kind": "rdma"
+            }
+        },
+        {
+            "level": {
+                "size": 1,
+                "pool_ratio": [0.5, 0.0]
+            }
+        },
+        {
+            "donor": {
+                "size": 1 << 30
+            },
+            "transport": {
+                "kind": "nixl",
+                "ucx_devices": "mlx5_0:2"  # NIXL's UCX backend uses port 1
+            }
+        },
+        {
+            "donor": {
+                "size": 1 << 30
+            },
+            "transport": {
+                "kind": "nixl",
+                "ucx_devices": "mlx5_0:1,,mlx5_1:1"
+            }
+        },
+        {
+            "donor": {
+                "size": (1 << 30) - 1  # below the donor's 1 GiB chunk
+            }
+        },
+        {
+            "level": {
+                "size": 0
+            }
+        },
+        {
+            "level": {
+                "size": 1,
+                "donor_wait_timeout_s": 0
+            }
+        },
+        {
+            "level": {
+                "size": 1
+            },
+            "transport": {
+                "kind": "nixl",
+                "transfer_timeout_s": float("inf")
+            }
+        },
+            # The old flat fields are gone.
+        {
+            "cache_size": 1
+        },
+        {
+            "donate_size": 1 << 30
+        },
+    ):
+        with pytest.raises(ValidationError):
+            remote(directory=str(tmp_path), **bad)
+    # A dumped config, defaults included, validates again.
+    for good in (
+            config.remote_cache_config,
+            remote(directory=str(tmp_path), donor={"size": 1 << 30}),
+            remote(directory=str(tmp_path),
+                   donor={"size": 1 << 30},
+                   transport={
+                       "kind": "fabric",
+                       "donor_reserve_size": 8 << 30
+                   }),
+    ):
+        assert remote(**good.model_dump()) == good
+    assert remote(directory=str(tmp_path),
+                  donor={
+                      "size": 1 << 30
+                  },
+                  transport={
+                      "kind": "fabric",
+                      "donor_reserve_size": 8 << 30
+                  }).transport.donor_reserve_size == 8 << 30
+    assert remote(directory=str(tmp_path),
+                  donor={
+                      "size": 1 << 30
+                  },
+                  transport={
+                      "kind": "nixl",
+                      "ucx_devices": "rdma_vf_rail{GPU}:1, mlx5_1"
+                  }).transport.ucx_devices
+    with pytest.raises(ValidationError):
+        KvCacheConfig(remote_cache_config={
+            "directory": str(tmp_path),
+            "donor": {
+                "size": 1 << 30
+            }
+        },
+                      use_kv_cache_manager_v2=False)
+    with pytest.raises(ValidationError):
+        KvCacheConfig(remote_cache_config={
+            "directory": str(tmp_path),
+            "level": {
+                "size": 1
+            }
+        },
+                      disk_cache_size=1,
+                      disk_cache_path=str(tmp_path))
+    # A rebalance would claim donor chunks inside adjust(), which holds every request.
+    with pytest.raises(ValidationError, match="enable_kv_pool_rebalance"):
+        KvCacheConfig(remote_cache_config={
+            "directory": str(tmp_path),
+            "level": {
+                "size": 1
+            }
+        },
+                      enable_kv_pool_rebalance=True)
+    assert KvCacheConfig(remote_cache_config={
+        "directory": str(tmp_path),
+        "donor": {
+            "size": 1 << 30
+        }
+    },
+                         enable_kv_pool_rebalance=True).enable_kv_pool_rebalance
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "remote_config",
+    [
+        # CTX style: a remote level and a donation.
+        {
+            "transport": {
+                "kind": "fabric"
+            },
+            "donor": {
+                "size": 8 << 30
+            },
+            "level": {
+                "size": 200 << 30,
+                "pool_ratio": [0.02, 0.98],
+                "expected": {
+                    "num_donors": 8,
+                    "claim_size": 406 << 30
+                },
+            },
+        },
+        # GEN style: donation only.
+        {
+            "transport": {
+                "kind": "fabric"
+            },
+            "donor": {
+                "size": 160 << 30
+            },
+        },
+    ],
+    ids=["ctx", "gen"])
+def test_remote_cache_config_survives_model_defaults(tmp_path, remote_config):
+    # apply_model_defaults_to_llm_args rebuilds the args from a full dump, defaults included.
+    remote_config = dict(remote_config, directory=str(tmp_path))
+    llm_args = TorchLlmArgs(
+        model=str(tmp_path),
+        kv_cache_config=KvCacheConfig(remote_cache_config=remote_config))
+    expected = llm_args.kv_cache_config.remote_cache_config
+    apply_model_defaults_to_llm_args(
+        llm_args, {"kv_cache_config": {
+            "enable_block_reuse": False
+        }})
+    assert llm_args.kv_cache_config.enable_block_reuse is False
+    assert llm_args.kv_cache_config.remote_cache_config == expected
+    rebuilt = TorchLlmArgs(**llm_args.model_dump())
+    assert rebuilt.kv_cache_config.remote_cache_config == expected
 
 
 @pytest.mark.cpu_only
@@ -2531,6 +2793,20 @@ def test_gen_preemption_rejects_pp_and_attention_dp(parallel) -> None:
     with pytest.raises(ValueError, match="does not support"):
         TorchLlmArgs(model=llama_model_path, scheduler_config=on, **parallel)
     TorchLlmArgs(model=llama_model_path, **parallel)  # off: no restriction
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("loop", [{
+    "pipeline_parallel_size": 2
+}, {
+    "disable_overlap_scheduler": True
+}])
+def test_defer_generation_only_release_needs_the_overlap_loop(loop) -> None:
+    """Rejected at parse time, before any rank loads the checkpoint."""
+    defer = KvCacheConfig(defer_generation_only_release=True)
+    with pytest.raises(ValueError, match="overlap scheduler loop"):
+        TorchLlmArgs(model=llama_model_path, kv_cache_config=defer, **loop)
+    TorchLlmArgs(model=llama_model_path, kv_cache_config=defer)
 
 
 @pytest.mark.cpu_only

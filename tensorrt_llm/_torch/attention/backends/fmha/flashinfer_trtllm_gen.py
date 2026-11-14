@@ -39,8 +39,9 @@ Example:
 """
 
 import math
+import re
 from functools import lru_cache
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
 
@@ -222,6 +223,120 @@ def _get_bmm1_scale_log2(bmm1_scale: torch.Tensor) -> torch.Tensor:
     if bmm1_scale.numel() < 2:
         raise RuntimeError("trtllm-gen bmm1_scale workspace must contain raw and log2 scales.")
     return bmm1_scale.narrow(0, 1, 1)
+
+
+# The typed signature of FlashInfer's private trtllm-gen decode op that trtllm_gen_paged_decode's positional call is
+# written for (FlashInfer 0.7), as the op's TVM-FFI wrapper reports it.
+_PAGED_DECODE_SIGNATURE = (
+    "trtllm_paged_attention_decode(0: DLTensor*, 1: Optional<DLTensor*>, 2: DLTensor*, 3: DLTensor*, 4: DLTensor*, "
+    "5: DLTensor*, 6: DLTensor*, 7: DLTensor*, 8: DLTensor*, 9: int, 10: int, 11: Variant<float, ffi.Tensor>, "
+    "12: Variant<float, ffi.Tensor>, 13: float, 14: int, 15: int, 16: int, 17: int, 18: int, 19: int, 20: bool, "
+    "21: int, 22: Optional<DLTensor*>, 23: Optional<DLTensor*>, 24: Optional<DLTensor*>, 25: Optional<DLTensor*>, "
+    "26: Optional<float>, 27: Optional<bool>, 28: Optional<DLTensor*>, 29: float, 30: int, 31: int, 32: bool, "
+    "33: Optional<DLTensor*>, 34: int, 35: Optional<bool>) -> void"
+)
+
+
+@lru_cache(maxsize=1)
+def trtllm_gen_paged_decode_supported() -> bool:
+    """Whether FlashInfer's private positional ``trtllm_paged_attention_decode`` has the signature
+    trtllm_gen_paged_decode passes its arguments for; callers decline otherwise (FlashInfer's public decode runs).
+
+    Probed once by calling the op without arguments: its TVM-FFI wrapper checks the argument count before running
+    anything and names its typed signature in the TypeError. Another signature, another error, or a module that
+    does not load all decline.
+    """
+    if not IS_FLASHINFER_AVAILABLE:
+        return False
+    try:
+        op = flashinfer.decode.get_trtllm_gen_fmha_module().trtllm_paged_attention_decode
+    except (AttributeError, ImportError, OSError, RuntimeError) as e:
+        logger.warning(
+            f"FlashInfer's trtllm-gen decode op is unavailable ({e}); its direct calls are declined"
+        )
+        return False
+    try:
+        op()
+    except TypeError as e:
+        found = re.search(r"`([^`]*)`", str(e))
+        if found is not None and found.group(1) == _PAGED_DECODE_SIGNATURE:
+            return True
+        logger.warning(
+            "FlashInfer's trtllm_paged_attention_decode does not have the signature trtllm_gen_paged_decode was "
+            f"written for ({e}); its direct calls are declined"
+        )
+        return False
+    except (RuntimeError, ValueError) as e:
+        logger.warning(
+            f"FlashInfer's trtllm_paged_attention_decode did not report its signature ({e}); its direct calls are "
+            "declined"
+        )
+        return False
+    return False
+
+
+def trtllm_gen_paged_decode(
+    out: torch.Tensor,
+    query: torch.Tensor,
+    kv_pool: torch.Tensor,
+    workspace: torch.Tensor,
+    counter: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_q_len: int,
+    max_kv_len: int,
+    bmm1_scale: Union[float, torch.Tensor],
+    bmm2_scale: Union[float, torch.Tensor],
+    batch_size: int,
+    window_left: int,
+    sm_count: int,
+    enable_pdl: bool,
+    sinks: Optional[torch.Tensor] = None,
+    cum_seq_lens_q: Optional[torch.Tensor] = None,
+    lse: Optional[torch.Tensor] = None,
+) -> None:
+    """FlashInfer's trtllm-gen paged decode op (behind ``trtllm_batch_decode_with_kv_cache``) with an explicit SM count,
+    from which the kernel derives its KV split. Query and KV of one dtype, HND pool, a [requests, 2, pages] page table;
+    bmm1_scale a float or the [raw, raw * log2e] tensor; lse (base 2) optional. Callers check
+    trtllm_gen_paged_decode_supported() first."""
+    flashinfer.decode.get_trtllm_gen_fmha_module().trtllm_paged_attention_decode(
+        out,
+        None,  # out_scale_factor
+        query,
+        kv_pool,
+        kv_pool,
+        workspace,
+        counter,
+        block_tables,
+        seq_lens,
+        max_q_len,
+        max_kv_len,
+        _get_bmm1_scale_log2(bmm1_scale) if isinstance(bmm1_scale, torch.Tensor) else bmm1_scale,
+        bmm2_scale,
+        -1.0,  # o_sf_scale
+        -1,  # o_sf_vec_size
+        0,  # o_sf_start_index
+        batch_size,
+        window_left,
+        0,  # sparse_mla_top_k
+        sm_count,
+        enable_pdl,
+        workspace.numel() * workspace.element_size(),
+        sinks,
+        cum_seq_lens_q,
+        None,  # k_block_scales
+        None,  # v_block_scales
+        None,  # skip_softmax_threshold_scale_factor
+        False,  # uses_shared_paged_kv_idx
+        lse,
+        1.0,  # lse_scale
+        lse.stride(0) if lse is not None else 0,
+        lse.stride(1) if lse is not None else 0,
+        False,  # enable_block_sparse_attention
+        None,  # sparse_mla_top_k_lens
+        0,  # bf16q_fp8kv_transform_mode (query and KV of one dtype)
+        None,  # use_fp16_softmax
+    )
 
 
 @lru_cache(maxsize=128)
@@ -938,6 +1053,41 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         )
         return [op for op in required_ops if not hasattr(thop, op)]
 
+    def _uses_paged_context_fp8(
+        self,
+        fp8_context_fmha: bool,
+        query: torch.Tensor,
+        kv_pool: torch.Tensor,
+        block_tables: torch.Tensor,
+        bmm1_scale: Optional[torch.Tensor],
+        kv_scale_pool: Optional[torch.Tensor],
+        causal: bool,
+        attention_sinks: Optional[torch.Tensor],
+        window_left: int,
+        output: torch.Tensor,
+    ) -> bool:
+        """Whether a context call offers trtllm::fmha_paged_context_fp8 the layer's declared
+        ``context_fmha_head_dim_per_stage_kv``: causal E4M3 Q / KV (no KV scale factors, sinks or window), BF16
+        output, TRT-LLM's contiguous paged KV pool with separate K / V page indices. The op declines a call whose
+        selected kernel has no precompiled cubin, which then runs FlashInfer's kernel."""
+        return (
+            self.attn.context_fmha_head_dim_per_stage_kv > 0
+            and fp8_context_fmha
+            and causal
+            and isinstance(bmm1_scale, torch.Tensor)
+            and kv_scale_pool is None
+            and attention_sinks is None
+            and window_left < 0
+            and query.dtype == torch.float8_e4m3fn
+            and kv_pool.dtype == torch.float8_e4m3fn
+            and kv_pool.dim() == 4
+            and kv_pool.is_contiguous()
+            and block_tables.dim() == 3
+            and block_tables.size(1) == 2
+            and output.dtype == torch.bfloat16
+            and output.is_contiguous()
+        )
+
     def run_context(
         self,
         params: FmhaParams,
@@ -1032,29 +1182,79 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             if params.is_cross
             else AttentionMaskType(fwd.mask_type) == AttentionMaskType.causal
         )
-        flashinfer.prefill.trtllm_batch_context_with_kv_cache(
-            query=q_processed,
-            kv_cache=(kv_pool, kv_pool),
-            workspace_buffer=fmha_workspace,
-            block_tables=block_tables,
-            seq_lens=params.sequence_lengths,
-            max_q_len=max_q_len,
-            max_kv_len=max_kv_len,
-            bmm1_scale=ctx_bmm1_scale,
-            bmm2_scale=ctx_bmm2_scale,
-            batch_size=params.batch_size,
-            cum_seq_lens_q=cu_q_seqlens,
-            cum_seq_lens_kv=cu_kv_seqlens,
-            window_left=window_left,
-            out=params.output,
-            kv_layout=self._layout,
-            enable_pdl=self._enable_pdl,
-            sinks=fwd.attention_sinks,
-            kv_cache_sf=(kv_scale_pool, kv_scale_pool) if kv_scale_pool is not None else None,
-            uses_shared_paged_kv_idx=self.USE_SHARED_PAGED_KV_IDX,
-            causal=causal,
-            multi_ctas_kv_counter_buffer=self._get_multi_ctas_kv_counter_buffer(),
+        paged_context_fp8 = self._uses_paged_context_fp8(
+            fp8_context_fmha,
+            q_processed,
+            kv_pool,
+            block_tables,
+            bmm1_scale,
+            kv_scale_pool,
+            causal,
+            fwd.attention_sinks,
+            window_left,
+            params.output,
         )
+
+        def fmha(query, out, cu_q, max_q):
+            if paged_context_fp8 and torch.ops.trtllm.fmha_paged_context_fp8(
+                query,
+                kv_pool,
+                block_tables,
+                params.sequence_lengths,
+                cu_q,
+                cu_kv_seqlens,
+                out,
+                bmm1_scale,
+                bmm2_scale,
+                max_q,
+                max_kv_len,
+                attn.context_fmha_head_dim_per_stage_kv,
+            ):
+                return
+            flashinfer.prefill.trtllm_batch_context_with_kv_cache(
+                query=query,
+                kv_cache=(kv_pool, kv_pool),
+                workspace_buffer=fmha_workspace,
+                block_tables=block_tables,
+                seq_lens=params.sequence_lengths,
+                max_q_len=max_q,
+                max_kv_len=max_kv_len,
+                bmm1_scale=ctx_bmm1_scale,
+                bmm2_scale=ctx_bmm2_scale,
+                batch_size=params.batch_size,
+                cum_seq_lens_q=cu_q,
+                cum_seq_lens_kv=cu_kv_seqlens,
+                window_left=window_left,
+                out=out,
+                kv_layout=self._layout,
+                enable_pdl=self._enable_pdl,
+                sinks=fwd.attention_sinks,
+                kv_cache_sf=(kv_scale_pool, kv_scale_pool) if kv_scale_pool is not None else None,
+                uses_shared_paged_kv_idx=self.USE_SHARED_PAGED_KV_IDX,
+                causal=causal,
+                multi_ctas_kv_counter_buffer=self._get_multi_ctas_kv_counter_buffer(),
+            )
+
+        if (
+            attn.context_last_rows_only
+            and not params.is_cross
+            and meta.num_generations == 0
+            and params.num_tokens > params.batch_size
+        ):
+            # Each request's last row only, against the full KV (preprocess appended every row's K / V).
+            # The PDL-launched FMHA may read its sequence offsets before its dependency wait, so they are not
+            # written by the kernel right before it (the query gather, which it reads after the wait).
+            cu_q_last = torch.arange(
+                params.batch_size + 1, dtype=cu_q_seqlens.dtype, device=cu_q_seqlens.device
+            )
+            last = (cu_q_seqlens[1 : params.batch_size + 1] - 1).long()
+            q_last = q_processed.index_select(0, last)
+            out_last = params.output.new_empty((params.batch_size, *params.output.shape[1:]))
+            fmha(q_last, out_last, cu_q_last, 1)
+            params.output.zero_()
+            params.output.index_copy_(0, last, out_last)
+        else:
+            fmha(q_processed, params.output, cu_q_seqlens, max_q_len)
 
         if params.is_cross:
             return

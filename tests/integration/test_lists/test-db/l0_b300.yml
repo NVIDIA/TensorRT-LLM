@@ -76,6 +76,15 @@ l0_b300:
   - unittest/_torch/modules/test_qwen4_exp_ple_offload.py
   - unittest/_torch/modules/mamba
   - unittest/_torch/modules/tests_lora_modules
+  # Qwen3.5 decode kernels: MoE engines and CuTe FC2; FP8 / BF16 GEMMs with weights loaded before
+  # the PDL wait (bitwise against SM103 cuBLAS).
+  - unittest/_torch/moe/test_moe_nvfp4_engine.py
+  - unittest/_torch/moe/test_moe_bf16_engine.py
+  - unittest/_torch/moe/test_moe_lowm_fc2.py
+  - unittest/_torch/modules/test_resident_fp8_gemm.py
+  - unittest/_torch/modules/test_expert_l2_prefetch.py
+  - unittest/_torch/modules/test_inproj_ba_splitk.py
+  - unittest/_torch/modules/test_gate_add_rmsnorm_fp8.py
   # ------------- MoE components tests ---------------
   - unittest/_torch/moe/test_moe_load_balancer.py
   - unittest/_torch/moe/test_moe_routing.py

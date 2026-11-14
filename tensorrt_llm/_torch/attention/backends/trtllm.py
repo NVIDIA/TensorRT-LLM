@@ -2147,6 +2147,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     cache_context_plan: bool = False
     # FMHA library classes this instance tries before the registry's libraries.
     prepended_fmha_lib_classes: tuple = ()
+    # Head dimension per K/V stage of FlashInferTrtllmGenFmha's FP8 paged causal context attention, run through
+    # trtllm::fmha_paged_context_fp8; 0 keeps FlashInfer's kernel.
+    context_fmha_head_dim_per_stage_kv: int = 0
+    # In a context-only step, FlashInferTrtllmGenFmha computes only each request's last output row (the others are
+    # zero); every row's K / V is still written.
+    context_last_rows_only: bool = False
 
     # Layer state the native attention op reads through FmhaParams.attn. The
     # generator (scripts/generate_fmha_params.py) collects these annotations;
@@ -2191,6 +2197,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         skip_correction_threshold: float = 0.0,
         gqa_decode: Optional["GqaDecodeSetup"] = None,
         cache_context_plan: bool = False,
+        context_fmha_head_dim_per_stage_kv: int = 0,
+        context_last_rows_only: bool = False,
         **kwargs,
     ) -> None:
         """
@@ -2220,6 +2228,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             cache_context_plan (bool): Plan a context-only forward once for the
                 layers that share its metadata and run the trtllm-gen context
                 kernel from that plan (dense, non-sparse layers only).
+            context_fmha_head_dim_per_stage_kv (int): See the class attribute.
+            context_last_rows_only (bool): See the class attribute.
         """
         super().__init__(layer_idx, num_heads, head_dim, num_kv_heads,
                          quant_config, **kwargs)
@@ -2293,6 +2303,15 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self.local_layer_idx: Optional[int] = None
         self._fmha_manager: Optional[FmhaManager] = None
         self.gqa_decode = gqa_decode
+        if context_fmha_head_dim_per_stage_kv < 0 or (
+                context_fmha_head_dim_per_stage_kv > 0
+                and head_dim % context_fmha_head_dim_per_stage_kv != 0):
+            raise ValueError(
+                f"context_fmha_head_dim_per_stage_kv="
+                f"{context_fmha_head_dim_per_stage_kv} must be 0 or divide "
+                f"head_dim={head_dim}.")
+        self.context_fmha_head_dim_per_stage_kv = context_fmha_head_dim_per_stage_kv
+        self.context_last_rows_only = context_last_rows_only
         # A GQA decode library of this layer, which plans the module's KV append and deferred prologue (set with
         # the FMHA manager).
         self.gqa_decode_fmha: Optional["GqaDecodeFmha"] = None

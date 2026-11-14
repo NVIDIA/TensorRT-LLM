@@ -63,6 +63,7 @@ from tensorrt_llm.llmapi.llm_args import (
     BlockReuseConfig,
     CacheTransceiverConfig,
     KvPoolRebalanceConfig,
+    RemoteCacheConfig,
 )
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.sampling_params import SamplingParams
@@ -120,6 +121,8 @@ class KvCacheConfigV2:
     # tensorrt_llm/llmapi/llm_args.py; KVCacheManagerV2._build_base_config()
     # reads it unconditionally.
     kv_pool_rebalance_config: KvPoolRebalanceConfig = field(default_factory=KvPoolRebalanceConfig)
+    # Mirrors KvCacheConfig.remote_cache_config; read by KVCacheManagerV2.__init__.
+    remote_cache_config: Optional[RemoteCacheConfig] = None
     enable_kv_pool_rebalance: bool = False
 
 

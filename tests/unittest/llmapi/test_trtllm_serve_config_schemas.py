@@ -585,6 +585,33 @@ def test_load_balancer_schema_matches_runtime(
             MoeConfig(load_balancer=load_balancer)
 
 
+@pytest.mark.parametrize(
+    ("config", "valid"),
+    [
+        ({"output_length_prediction": {}}, True),
+        ({"output_length_prediction": {"predictor": "ridge"}}, True),
+        ({"output_length_prediction": {"predictor": "ridge_gbm"}}, True),
+        ({"output_length_prediction": None, "schedule_style": "generation_first"}, True),
+        ({"output_length_prediction": {}, "schedule_style": "context_first"}, True),
+        ({"output_length_prediction": {"predictor": "ema"}}, False),
+        ({"output_length_prediction": {"unknown": 1}}, False),
+        ({"output_length_prediction": {}, "schedule_style": "generation_first"}, False),
+    ],
+)
+def test_output_length_prediction_schema_matches_runtime(
+    schemas: dict[str, dict], config: dict, valid: bool
+) -> None:
+    from tensorrt_llm.llmapi.disagg_utils import extract_disagg_cfg
+
+    errors = list(Draft202012Validator(schemas[generator.DISAGG_SCHEMA]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+    if valid:
+        extract_disagg_cfg(**config)
+    else:
+        with pytest.raises(ValueError):
+            extract_disagg_cfg(**config)
+
+
 @pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
 @pytest.mark.parametrize(
     ("settings", "valid"),
@@ -689,6 +716,246 @@ def test_dwdp_modes_match_runtime(
         if filename == generator.DISAGG_SCHEMA:
             for section in ("context_servers", "generation_servers"):
                 assert validator.is_valid({section: config}) == (error is None), section
+
+
+_GIB = 1 << 30
+
+
+@pytest.mark.parametrize(
+    ("section", "config", "valid"),
+    [
+        # RemoteCacheConfig
+        *(
+            ("kv_cache_config", {"remote_cache_config": {"directory": "d", **remote}}, valid)
+            for remote, valid in (
+                ({"level": {"size": _GIB}}, True),
+                ({"donor": {"size": _GIB}}, True),
+                ({}, False),
+                ({"donor": {"size": 1}}, False),
+                ({"level": {"size": 0}}, False),
+                ({"cache_size": _GIB}, False),
+                ({"level": {"size": 1, "expected": {"num_donors": 2}}}, False),
+                ({"level": {"size": 1, "expected": {"num_donors": 2, "claim_size": _GIB}}}, True),
+                (
+                    {"level": {"size": 1}, "transport": {"kind": "nixl", "transfer_timeout_s": 5}},
+                    True,
+                ),
+                (
+                    {
+                        "level": {"size": 1},
+                        "transport": {"kind": "fabric", "transfer_timeout_s": 5},
+                    },
+                    False,
+                ),
+                (
+                    {"level": {"size": 1}, "transport": {"kind": "fabric", "ucx_devices": "m:1"}},
+                    False,
+                ),
+                (
+                    {
+                        "donor": {"size": _GIB},
+                        "transport": {"kind": "nixl", "donor_reserve_size": 0},
+                    },
+                    False,
+                ),
+                (
+                    {
+                        "donor": {"size": _GIB},
+                        "transport": {"kind": "fabric", "donor_reserve_size": 0},
+                    },
+                    True,
+                ),
+                ({"donor": {"size": _GIB}, "transport": {"kind": "rdma"}}, False),
+            )
+        ),
+        # KvCacheConfig
+        (
+            "kv_cache_config",
+            {
+                "remote_cache_config": {"directory": "d", "level": {"size": 1}},
+                "disk_cache_size": 1,
+                "disk_cache_path": str(_REPO_ROOT),
+            },
+            False,
+        ),
+        (
+            "kv_cache_config",
+            {
+                "remote_cache_config": {"directory": "d", "donor": {"size": _GIB}},
+                "disk_cache_size": 1,
+                "disk_cache_path": str(_REPO_ROOT),
+            },
+            True,
+        ),
+        (
+            "kv_cache_config",
+            {
+                "remote_cache_config": {"directory": "d", "level": {"size": 1}},
+                "use_kv_cache_manager_v2": False,
+            },
+            False,
+        ),
+        (
+            "kv_cache_config",
+            {
+                "remote_cache_config": {"directory": "d", "level": {"size": 1}},
+                "enable_kv_pool_rebalance": True,
+            },
+            False,
+        ),
+        (
+            "kv_cache_config",
+            {
+                "remote_cache_config": {"directory": "d", "donor": {"size": _GIB}},
+                "enable_kv_pool_rebalance": True,
+            },
+            True,
+        ),
+        *(
+            (
+                "kv_cache_config",
+                {
+                    "remote_cache_config": {
+                        "directory": "d",
+                        "level": {"size": 1},
+                        "transport": {"kind": "nixl", "ucx_devices": devices},
+                    }
+                },
+                valid,
+            )
+            for devices, valid in (
+                ("mlx5_0", True),
+                ("mlx5_0:1, mlx5_{GPU}", True),
+                ("mlx5_0:", True),
+                ("mlx5_0:2", False),
+                ("mlx5_0::1", False),
+                ("mlx5_0,,mlx5_1", False),
+                (":1", False),
+                ("", False),
+            )
+        ),
+        ("kv_cache_config", {"defer_generation_only_release": True}, True),
+        (
+            "kv_cache_config",
+            {"defer_generation_only_release": True, "use_kv_cache_manager_v2": False},
+            False,
+        ),
+        # AttentionDpConfig
+        (
+            "attention_dp_config",
+            {
+                "kv_cache_routing_conversation_affinity": True,
+                "kv_cache_routing_home_wait_rounds": 4,
+            },
+            True,
+        ),
+        ("attention_dp_config", {"kv_cache_routing_home_wait_rounds": 4}, False),
+        # SchedulerConfig
+        (
+            "scheduler_config",
+            {"waiting_queue_policy": "priority", "waiting_queue_max_wait_s": 30},
+            True,
+        ),
+        (
+            "scheduler_config",
+            {"waiting_queue_policy": "priority", "waiting_queue_max_wait_s": None},
+            True,
+        ),
+        ("scheduler_config", {"waiting_queue_max_wait_s": None}, True),
+        ("scheduler_config", {"waiting_queue_max_wait_s": 30}, False),
+        (
+            "scheduler_config",
+            {"waiting_queue_policy": "fcfs", "waiting_queue_max_wait_s": 60},
+            False,
+        ),
+    ],
+)
+def test_cross_field_rules_match_runtime(
+    schemas: dict[str, dict], section: str, config: dict, valid: bool
+) -> None:
+    """Both schemas accept the remote cache, home-wait and waiting-queue options exactly when the models do."""
+    from tensorrt_llm.llmapi.llm_args import AttentionDpConfig, KvCacheConfig, SchedulerConfig
+
+    model = {
+        "kv_cache_config": KvCacheConfig,
+        "attention_dp_config": AttentionDpConfig,
+        "scheduler_config": SchedulerConfig,
+    }[section]
+    if valid:
+        model(**config)
+    else:
+        with pytest.raises(ValueError):
+            model(**config)
+
+    for filename in (generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA):
+        validator = Draft202012Validator(schemas[filename])
+        assert validator.is_valid({section: config}) == valid, filename
+        if filename == generator.DISAGG_SCHEMA:
+            assert validator.is_valid({"generation_servers": {section: config}}) == valid
+
+
+@pytest.mark.parametrize(
+    ("config", "valid"),
+    [
+        ({"kv_cache_config": {"defer_generation_only_release": True}}, True),
+        (
+            {
+                "kv_cache_config": {"defer_generation_only_release": True},
+                "disable_overlap_scheduler": False,
+                "pipeline_parallel_size": 1,
+            },
+            True,
+        ),
+        (
+            {
+                "kv_cache_config": {"defer_generation_only_release": True},
+                "disable_overlap_scheduler": True,
+            },
+            False,
+        ),
+        (
+            {
+                "kv_cache_config": {"defer_generation_only_release": True},
+                "pipeline_parallel_size": 2,
+            },
+            False,
+        ),
+        (
+            {
+                "kv_cache_config": {"defer_generation_only_release": False},
+                "disable_overlap_scheduler": True,
+            },
+            True,
+        ),
+        ({"disable_overlap_scheduler": True, "pipeline_parallel_size": 2}, True),
+    ],
+)
+def test_deferred_release_launch_rule_matches_runtime(
+    schemas: dict[str, dict], config: dict, valid: bool
+) -> None:
+    """Both schemas accept defer_generation_only_release with the overlap loop exactly when TorchLlmArgs does."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig, TorchLlmArgs
+
+    kv_cache_config = config.get("kv_cache_config") or {}
+    args = SimpleNamespace(
+        kv_cache_config=KvCacheConfig(**kv_cache_config),
+        disable_overlap_scheduler=config.get("disable_overlap_scheduler", False),
+        pipeline_parallel_size=config.get("pipeline_parallel_size", 1),
+    )
+    if valid:
+        TorchLlmArgs.validate_defer_generation_only_release(args)
+    else:
+        with pytest.raises(ValueError, match="defer_generation_only_release"):
+            TorchLlmArgs.validate_defer_generation_only_release(args)
+
+    for filename in (generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA):
+        validator = Draft202012Validator(schemas[filename])
+        assert validator.is_valid(config) == valid, filename
+        if filename == generator.DISAGG_SCHEMA:
+            for section in ("context_servers", "generation_servers"):
+                assert validator.is_valid({section: config}) == valid, section
 
 
 def _assert_serving_fields_in_schema(source: str, function_name: str, properties: dict) -> None:
@@ -1020,6 +1287,77 @@ def test_disagg_router_default_is_derived(monkeypatch: pytest.MonkeyPatch) -> No
     for config in ({}, {"router": {}}):
         assert disagg_utils.extract_router_config(config).type == router_type["default"]
     assert disagg_utils.extract_router_config({"router": {"type": "explicit"}}).type == "explicit"
+
+
+_LB = "load_balancing"
+
+
+@pytest.mark.parametrize(
+    ("section", "router", "valid"),
+    [
+        ("generation_servers", {"type": _LB, "max_requests_per_server": 64}, True),
+        (
+            "generation_servers",
+            {"type": _LB, "max_requests_per_server": 1, "max_queue_wait_s": 30},
+            True,
+        ),
+        ("generation_servers", {"type": "Load_Balancing", "max_requests_per_server": 2}, True),
+        (
+            "generation_servers",
+            {"type": _LB, "max_requests_per_server": 2, "use_tokens": False},
+            True,
+        ),
+        (
+            "generation_servers",
+            {"type": "round_robin", "max_requests_per_server": None, "max_queue_wait_s": None},
+            True,
+        ),
+        ("generation_servers", {"type": _LB, "max_requests_per_server": 0}, False),
+        ("generation_servers", {"type": _LB, "max_requests_per_server": 1.5}, False),
+        ("generation_servers", {"type": _LB, "max_requests_per_server": True}, False),
+        ("generation_servers", {"type": _LB, "max_requests_per_server": "4"}, False),
+        ("generation_servers", {"type": "round_robin", "max_requests_per_server": 4}, False),
+        ("generation_servers", {"max_requests_per_server": 4}, False),
+        (
+            "generation_servers",
+            {"type": _LB, "max_requests_per_server": 4, "use_tokens": True},
+            False,
+        ),
+        ("generation_servers", {"type": _LB, "max_queue_wait_s": 30}, False),
+        (
+            "generation_servers",
+            {"type": _LB, "max_requests_per_server": 4, "max_queue_wait_s": 0},
+            False,
+        ),
+        (
+            "generation_servers",
+            {"type": _LB, "max_requests_per_server": 4, "max_queue_wait_s": -1},
+            False,
+        ),
+        ("context_servers", {"type": _LB, "max_requests_per_server": None}, True),
+        ("context_servers", {"type": _LB, "max_requests_per_server": 64}, False),
+        ("context_servers", {"type": _LB, "max_queue_wait_s": 30}, False),
+    ],
+)
+def test_pooled_router_keys_match_runtime(
+    schemas: dict[str, dict], section: str, router: dict, valid: bool
+) -> None:
+    """The disagg schema accepts the pooled generation dispatch keys exactly when startup does."""
+    from tensorrt_llm.llmapi.disagg_utils import extract_disagg_cfg
+    from tensorrt_llm.serve.router import create_router
+
+    def start() -> None:
+        config = extract_disagg_cfg(**{section: {"router": copy.deepcopy(router)}})
+        for router_config in (config.ctx_router_config, config.gen_router_config):
+            create_router(router_config, ["s"])
+
+    if valid:
+        start()
+    else:
+        with pytest.raises((ValueError, TypeError)):
+            start()
+    validator = Draft202012Validator(schemas[generator.DISAGG_SCHEMA])
+    assert validator.is_valid({section: {"router": router}}) == valid
 
 
 def test_disagg_node_id_matches_runtime(schemas: dict[str, dict]) -> None:

@@ -13,6 +13,12 @@ Whether a full pass qualifies is decided when it is recorded (``DecoderInputPrep
 a later step matches when it runs the recorded requests on the recorded slots and metadata. Any other step
 (batch or slot change, context rows, dummies, multimodal, LoRA, guided decoding, beams, attention DP, helix
 CP, warmup) takes the full pass, which records again when it qualifies.
+
+With ``stage_rng`` (``RuntimeHooks.pack_spec_rng_uploads``) and zero-copy slabs the same kernel also writes the
+step's Philox state for sampling (``SpecMetadata.request_seeds`` / ``request_offsets`` / ``seeds`` /
+``offsets``) from a second pinned ring, instead of four host-to-device copies on the critical stream. The host
+computes the same values and advances the same offset windows (``SpecMetadata._populate_request_rng_state``); only
+the delivery changes.
 """
 
 import types
@@ -47,6 +53,7 @@ _STAGE_INT_ARGS = [
     "nd_slot_stride",
     "mrope_axis_stride",
     "static_pos_axis_stride",
+    "rng_span",
     "B",
 ]
 _STAGE_PTR_ARGS = [
@@ -66,6 +73,11 @@ _STAGE_PTR_ARGS = [
     "kv_lens_out",
     "static_ids",
     "static_pos",
+    "rng_slab",
+    "req_seeds_out",
+    "req_offsets_out",
+    "seeds_out",
+    "offsets_out",
 ]
 
 
@@ -100,12 +112,19 @@ def _steady_stage_kernel(
     static_ids,  # graph static input ids (HAS_STATIC)
     static_pos,  # graph static positions, [3, 1, M] (mrope) or [1, M]
     static_pos_axis_stride,
+    rng_slab,  # int64 [2 * B] (HAS_RNG): each request's Philox seed, then its offset-window base
+    req_seeds_out,  # int64 [B] SpecMetadata.request_seeds (HAS_RNG)
+    req_offsets_out,  # int64 [B] SpecMetadata.request_offsets (HAS_RNG)
+    seeds_out,  # int64 [B * T] SpecMetadata.seeds, one per logits row (HAS_RNG)
+    offsets_out,  # int64 [B * T] SpecMetadata.offsets (HAS_RNG)
+    rng_span,  # Philox offsets between a request's consecutive rows (_RNG_SLOT_SPAN)
     B,
     T: tl.constexpr,
     D: tl.constexpr,
     HAS_MROPE: tl.constexpr,
     HAS_KV: tl.constexpr,
     HAS_STATIC: tl.constexpr,
+    HAS_RNG: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     i = tl.arange(0, BLOCK)
@@ -140,6 +159,15 @@ def _steady_stage_kernel(
     tl.store(prev_kv_offsets + i, lens_r - T, mask=req)
     if HAS_KV:
         tl.store(kv_lens_out + i, tl.load(slab + B + B * T + i, mask=req, other=0), mask=req)
+    if HAS_RNG:
+        # The layout SpecMetadata._populate_request_rng_state uploads: request_* per request, and per logits
+        # row (request r = i // T, row j = i % T) the request's seed and offset_r + j * rng_span.
+        tl.store(req_seeds_out + i, tl.load(rng_slab + i, mask=req, other=0), mask=req)
+        tl.store(req_offsets_out + i, tl.load(rng_slab + B + i, mask=req, other=0), mask=req)
+        row_seed = tl.load(rng_slab + r, mask=tok, other=0)
+        row_off = tl.load(rng_slab + B + r, mask=tok, other=0)
+        tl.store(seeds_out + i, row_seed, mask=tok)
+        tl.store(offsets_out + i, row_off + j.to(tl.int64) * rng_span, mask=tok)
     # draft rows: request i // D, draft i % D
     drf = i < B * D
     slot_d = tl.load(slab + i // D, mask=drf, other=0)
@@ -166,6 +194,9 @@ def stage_steady_inputs(
     static_input_ids: torch.Tensor | None = None,
     static_position_ids: torch.Tensor | None = None,
     block: int | None = None,
+    rng_slab: torch.Tensor | None = None,
+    rng_buffers: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    rng_span: int = 0,
 ) -> None:
     """One launch of the steady staging kernel.
 
@@ -185,6 +216,11 @@ def stage_steady_inputs(
         static_input_ids, static_position_ids: The CUDA graph's static inputs, when staged here.
         block: The BLOCK of the launch when it covers the batch (one variant for all batch sizes),
             else the batch's own power of two.
+        rng_slab: int64 [2 * b]: each request's Philox seed, then its offset-window base (a pinned
+            host tensor read through its device mapping), or None to leave the Philox state alone.
+        rng_buffers: ``SpecMetadata``'s (request_seeds, request_offsets, seeds, offsets), written
+            when ``rng_slab`` is given.
+        rng_span: Philox offsets between consecutive rows of a request (``_RNG_SLOT_SPAN``).
     """
     d = t - 1
     n = b * t
@@ -194,6 +230,12 @@ def stage_steady_inputs(
     new_tokens = new_tensors_device.new_tokens
     next_drafts = new_tensors_device.next_draft_tokens
     has_mrope = mrope_positions is not None
+    has_rng = rng_slab is not None
+    if has_rng:
+        req_seeds_out, req_offsets_out, seeds_out, offsets_out = rng_buffers
+    else:
+        # Untouched without HAS_RNG; one dtype for every launch keeps a single variant.
+        rng_slab = req_seeds_out = req_offsets_out = seeds_out = offsets_out = gather_ids
     _steady_stage_kernel[(1,)](
         slab,
         new_tokens,
@@ -216,12 +258,19 @@ def stage_steady_inputs(
         static_input_ids if static_input_ids is not None else gather_ids,
         static_position_ids if static_position_ids is not None else gather_ids,
         static_position_ids.stride(0) if (static_position_ids is not None and has_mrope) else 0,
+        rng_slab,
+        req_seeds_out,
+        req_offsets_out,
+        seeds_out,
+        offsets_out,
+        rng_span,
         b,
         T=t,
         D=d,
         HAS_MROPE=has_mrope,
         HAS_KV=kv_lens_cuda is not None,
         HAS_STATIC=static_input_ids is not None,
+        HAS_RNG=has_rng,
         BLOCK=block,
     )
 
@@ -261,7 +310,14 @@ class SteadyMtpPrepare:
         use_mrope: Whether the model reads the [3, 1, N] mrope positions.
         has_static_inputs: Whether decode steps replay CUDA graphs (to compile the kernel variant
             that also writes their static inputs).
+        stage_rng: Whether the staging kernel also writes the step's Philox state.
     """
+
+    # With stage_rng: Philox offsets between a request's consecutive rows, and the pinned ring of the step's Philox
+    # state (fenced by the slab events); 0 / empty otherwise.
+    rng_span: int = 0
+    host_rng_slabs: tuple[torch.Tensor, ...] = ()
+    host_rng_views: tuple[np.ndarray, ...] = ()
 
     def __init__(
         self,
@@ -271,6 +327,7 @@ class SteadyMtpPrepare:
         max_tokens_per_step: int,
         use_mrope: bool,
         has_static_inputs: bool,
+        stage_rng: bool = False,
     ) -> None:
         self.record: SteadyMtpRecord | None = None
         self.use_mrope = use_mrope
@@ -291,6 +348,17 @@ class SteadyMtpPrepare:
             else torch.zeros(self.slab_capacity, dtype=torch.int32, device="cuda")
         )
         self.ring_pos = 0
+        # With stage_rng the step's Philox state rides in a second pinned ring (int64, fenced by the same
+        # events). Zero-copy only: the device-copy fallback has no mirror for this ring.
+        if stage_rng and self.zero_copy and max_tokens_per_step >= 2:
+            from ..speculative.interface import _RNG_SLOT_SPAN
+
+            self.rng_span = int(_RNG_SLOT_SPAN)
+            self.host_rng_slabs = tuple(
+                torch.zeros(2 * max_requests, dtype=torch.int64, pin_memory=self.zero_copy)
+                for _ in range(_RING)
+            )
+            self.host_rng_views = tuple(slab.numpy() for slab in self.host_rng_slabs)
         # One staging-kernel BLOCK for every batch size of this engine, and its variant compiled now.
         self.block: int | None = None
         if max_tokens_per_step >= 2:
@@ -299,37 +367,57 @@ class SteadyMtpPrepare:
 
     def _warm_stage_kernel(self, t: int, has_static_inputs: bool) -> None:
         """Compile the staging kernel variant the steady steps launch (same constexprs, unspecialized ints and
-        alignments) with a B = 0 launch, which reads and writes nothing."""
+        alignments) with a B = 0 launch, which reads and writes nothing; with the Philox ring, that variant
+        too."""
         if torch.cuda.is_current_stream_capturing():
             return
         dummy = torch.zeros(1, dtype=torch.int32, device="cuda")
-        stage_steady_inputs(
-            dummy,
-            0,
-            t,
-            types.SimpleNamespace(
-                new_tokens=dummy.view(1, 1, 1),
-                next_draft_tokens=dummy.view(1, 1),
-                new_tokens_lens=dummy,
-            ),
-            input_ids=dummy,
-            draft_tokens=dummy,
-            prev_batch_idx=dummy,
-            prev_pos_idx=dummy,
-            prev_pos_offsets=dummy,
-            prev_kv_offsets=dummy,
-            positions=dummy,
-            mrope_positions=dummy.view(1, 1, 1) if self.use_mrope else None,
-            gather_ids=dummy,
-            kv_lens_cuda=dummy,
-            static_input_ids=dummy if has_static_inputs else None,
-            static_position_ids=(
-                (dummy.view(1, 1, 1) if self.use_mrope else dummy.view(1, 1))
-                if has_static_inputs
-                else None
-            ),
-            block=self.block,
-        )
+        variants = [{}]
+        if self.rng_span:
+            dummy64 = torch.zeros(1, dtype=torch.int64, device="cuda")
+            variants.append(
+                dict(
+                    rng_slab=dummy64,
+                    rng_buffers=(dummy64, dummy64, dummy64, dummy64),
+                    rng_span=self.rng_span,
+                )
+            )
+        for rng_kwargs in variants:
+            stage_steady_inputs(
+                dummy,
+                0,
+                t,
+                types.SimpleNamespace(
+                    new_tokens=dummy.view(1, 1, 1),
+                    next_draft_tokens=dummy.view(1, 1),
+                    new_tokens_lens=dummy,
+                ),
+                input_ids=dummy,
+                draft_tokens=dummy,
+                prev_batch_idx=dummy,
+                prev_pos_idx=dummy,
+                prev_pos_offsets=dummy,
+                prev_kv_offsets=dummy,
+                positions=dummy,
+                mrope_positions=dummy.view(1, 1, 1) if self.use_mrope else None,
+                gather_ids=dummy,
+                kv_lens_cuda=dummy,
+                static_input_ids=dummy if has_static_inputs else None,
+                static_position_ids=(
+                    (dummy.view(1, 1, 1) if self.use_mrope else dummy.view(1, 1))
+                    if has_static_inputs
+                    else None
+                ),
+                block=self.block,
+                **rng_kwargs,
+            )
+
+    def rng_rows(self) -> int | None:
+        """Logits rows per request when this stager writes the step's Philox state (``stage_rng``),
+        else None. The caller hands it to ``SpecMetadata`` before populating the sampling parameters."""
+        if not self.rng_span or self.record is None:
+            return None
+        return self.record.tokens_per_step
 
     def invalidate(self) -> None:
         """Drop the record (every full pass does, before it may record again)."""
@@ -450,6 +538,8 @@ class SteadyMtpPrepare:
         new_tensors_device: Any,
         buffers: Any,
         attn_metadata: AttentionMetadata,
+        rng_state: tuple[list[int], list[int]] | None = None,
+        rng_buffers: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[list[int], list[int], int]:
         """Write this step's device inputs (one slab write, one kernel launch).
 
@@ -458,6 +548,10 @@ class SteadyMtpPrepare:
             new_tensors_device: The previous step's device sampler tensors.
             buffers: The preparer's DecoderInputBuffers.
             attn_metadata: The recorded attention metadata.
+            rng_state: What ``SpecMetadata.populate_sampling_params_for_one_model`` returns (each request's Philox
+                seed and offset-window base, in batch order), or None. Written only when this stager has the Philox
+                ring.
+            rng_buffers: ``SpecMetadata``'s (request_seeds, request_offsets, seeds, offsets).
 
         Returns:
             The cached-token counts (``KVCacheParams.num_cached_tokens_per_seq``), the KV lengths
@@ -488,6 +582,16 @@ class SteadyMtpPrepare:
         else:
             self.device_slab[:used].copy_(self.host_slabs[k][:used], non_blocking=True)
             slab = self.device_slab
+        rng_kwargs = {}
+        if rng_state is not None and self.rng_span:
+            seeds, offsets = rng_state
+            assert len(seeds) == b and len(offsets) == b and rng_buffers is not None
+            rng_view = self.host_rng_views[k]
+            rng_view[:b] = seeds
+            rng_view[b : 2 * b] = offsets
+            rng_kwargs = dict(
+                rng_slab=self.host_rng_slabs[k], rng_buffers=rng_buffers, rng_span=self.rng_span
+            )
 
         stage_steady_inputs(
             slab,
@@ -507,8 +611,10 @@ class SteadyMtpPrepare:
             static_input_ids=rec.static_ids,
             static_position_ids=rec.static_pos,
             block=self.block,
+            **rng_kwargs,
         )
-        # The host slot may be rewritten once its reader (the copy, or the kernel itself) has run.
+        # The host slots (and the Philox slot) may be rewritten once their reader (the copy, or the kernel
+        # itself) has run.
         event = self.slab_events[k]
         if event is None:
             event = self.slab_events[k] = torch.cuda.Event()

@@ -50,6 +50,30 @@
     },
     "AttentionDpConfig": {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kv_cache_routing_home_wait_rounds": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kv_cache_routing_home_wait_rounds"
+            ]
+          },
+          "then": {
+            "properties": {
+              "kv_cache_routing_conversation_affinity": {
+                "const": true
+              }
+            },
+            "required": [
+              "kv_cache_routing_conversation_affinity"
+            ]
+          }
+        }
+      ],
       "description": "Configuration for attention DP.",
       "properties": {
         "batching_wait_iters": {
@@ -106,6 +130,21 @@
           "description": "Loose per-rank active-request cap in KV cache-aware routing, expressed as a multiplier of the ceil fair-share (ceil((total_active + new) / tp_size)). Once a rank hits this cap within a scheduling batch it is removed from the eligible set for the remainder of the batch. Default 2.0 permits a 2x slack so cache affinity can dominate while preventing runaway concentration on a single rank. Set to 1.0 for strict fair share. Only used when enable_kv_cache_aware_routing is True.",
           "title": "Kv Cache Routing Fair Share Multiplier",
           "type": "number"
+        },
+        "kv_cache_routing_home_wait_rounds": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Conversation-affinity routing: a returning conversation whose home rank is full waits for a slot there for up to this many scheduling rounds in which another rank had room, then overflows by kv_cache_routing_new_conv_placement (keeping its home rank). Later requests of the same admission group (priority) may pass a waiting one on any rank; later groups may pass it on other ranks only, not into its home rank. None overflows at once. Requires kv_cache_routing_conversation_affinity=True.",
+          "status": "prototype",
+          "title": "Kv Cache Routing Home Wait Rounds"
         },
         "kv_cache_routing_load_balance_weight": {
           "default": 1.0,
@@ -3079,6 +3118,84 @@
     },
     "KvCacheConfig": {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "remote_cache_config": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "remote_cache_config"
+            ]
+          },
+          "then": {
+            "properties": {
+              "use_kv_cache_manager_v2": {
+                "not": {
+                  "const": false
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "defer_generation_only_release": {
+                "const": true
+              }
+            },
+            "required": [
+              "defer_generation_only_release"
+            ]
+          },
+          "then": {
+            "properties": {
+              "use_kv_cache_manager_v2": {
+                "not": {
+                  "const": false
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "remote_cache_config": {
+                "properties": {
+                  "level": {
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "level"
+                ]
+              }
+            },
+            "required": [
+              "remote_cache_config"
+            ]
+          },
+          "then": {
+            "properties": {
+              "disk_cache_size": {
+                "enum": [
+                  0,
+                  null
+                ]
+              },
+              "enable_kv_pool_rebalance": {
+                "not": {
+                  "const": true
+                }
+              }
+            }
+          }
+        }
+      ],
       "description": "Configuration for the KV cache.",
       "properties": {
         "attention_dp_events_gather_period_ms": {
@@ -3138,6 +3255,13 @@
           "default": null,
           "description": "The fraction of the KV Cache memory should be reserved for cross attention. If set to p, self attention will use 1-p of KV Cache memory and cross attention will use p of KV Cache memory. Defaults to None (unset); must be set when using an encoder-decoder model and must not be set otherwise.",
           "title": "Cross Kv Cache Fraction"
+        },
+        "defer_generation_only_release": {
+          "default": false,
+          "description": "Release the KV cache of a finished generation-only request (disaggregated generation server) after the next forward is enqueued, so that the host-side release overlaps GPU work. The pages return one iteration later, or as soon as the scheduler runs out of pages, before it suspends or recompute-pauses a running request. Their KV cache events are published one iteration later too, or in the same iteration when the server goes idle. Requires KV cache manager v2 and the overlap scheduler without pipeline parallelism.",
+          "status": "prototype",
+          "title": "Defer Generation Only Release",
+          "type": "boolean"
         },
         "disk_cache_path": {
           "anyOf": [
@@ -3431,6 +3555,19 @@
           "description": "Initial hot-tier byte ratios by layer group for KV cache manager v2. Values map to KVCacheManagerV2 layer-group ID order and must sum to 1.0. Cold tiers preserve the implied slot-count ratios. Hybrid Mamba models and DeepSeek-V4 use this directly, so avg_seq_len does not take effect when this is set.",
           "status": "prototype",
           "title": "Pool Ratio"
+        },
+        "remote_cache_config": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RemoteCacheConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "KV cache manager v2 remote cache level in host memory that other ranks donate (usually generation ranks to context ranks). None disables it.",
+          "status": "prototype"
         },
         "secondary_offload_min_priority": {
           "anyOf": [
@@ -5643,6 +5780,274 @@
       "title": "RayPlacementConfig",
       "type": "object"
     },
+    "RemoteCacheConfig": {
+      "additionalProperties": false,
+      "anyOf": [
+        {
+          "properties": {
+            "donor": {
+              "type": "object"
+            }
+          },
+          "required": [
+            "donor"
+          ]
+        },
+        {
+          "properties": {
+            "level": {
+              "type": "object"
+            }
+          },
+          "required": [
+            "level"
+          ]
+        }
+      ],
+      "description": "KV cache manager v2 remote cache level in host memory that other ranks donate.\n\nA rank with `level` gets a cache level below the host tier whose slots live\nin memory that ranks with `donor` publish in `directory`.",
+      "properties": {
+        "directory": {
+          "description": "Rendezvous directory, on a file system every rank of the job sees, where donors publish their memory and remote cache levels claim chunks of it. Environment variables are expanded, and one that is not set is an error; the directory is created if missing. Use one directory per job.",
+          "minLength": 1,
+          "status": "prototype",
+          "title": "Directory",
+          "type": "string"
+        },
+        "donor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RemoteDonorConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "This rank's donation; None donates nothing.",
+          "status": "prototype"
+        },
+        "level": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RemoteLevelConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "This rank's remote cache level; None gives it none.",
+          "status": "prototype"
+        },
+        "transport": {
+          "description": "How pages move: {kind: nixl} (one-sided NIXL RDMA, the default) or {kind: fabric} (CUDA fabric memory copied over NVLink).",
+          "discriminator": {
+            "mapping": {
+              "fabric": "#/$defs/RemoteFabricTransportConfig",
+              "nixl": "#/$defs/RemoteNixlTransportConfig"
+            },
+            "propertyName": "kind"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/RemoteNixlTransportConfig",
+              "required": [
+                "kind"
+              ]
+            },
+            {
+              "$ref": "#/$defs/RemoteFabricTransportConfig",
+              "required": [
+                "kind"
+              ]
+            }
+          ],
+          "status": "prototype",
+          "title": "Transport"
+        }
+      },
+      "required": [
+        "directory"
+      ],
+      "title": "RemoteCacheConfig",
+      "type": "object"
+    },
+    "RemoteDonorConfig": {
+      "additionalProperties": false,
+      "description": "Host memory this rank donates to remote cache levels.",
+      "properties": {
+        "size": {
+          "description": "Bytes donated for the lifetime of the process, in whole 1 GiB chunks (a remainder below one chunk is not donated; the rank logs the size it donates).",
+          "minimum": 1073741824,
+          "status": "prototype",
+          "title": "Size",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "size"
+      ],
+      "title": "RemoteDonorConfig",
+      "type": "object"
+    },
+    "RemoteExpectedDonorsConfig": {
+      "additionalProperties": false,
+      "description": "The job's donors and claims, which only the launcher can count.",
+      "properties": {
+        "claim_size": {
+          "description": "Bytes all ranks of the job claim from `directory` together.",
+          "exclusiveMinimum": 0,
+          "status": "prototype",
+          "title": "Claim Size",
+          "type": "integer"
+        },
+        "num_donors": {
+          "description": "Number of donating ranks the job starts.",
+          "exclusiveMinimum": 0,
+          "status": "prototype",
+          "title": "Num Donors",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "num_donors",
+        "claim_size"
+      ],
+      "title": "RemoteExpectedDonorsConfig",
+      "type": "object"
+    },
+    "RemoteFabricTransportConfig": {
+      "additionalProperties": false,
+      "description": "Remote cache transport over CUDA fabric memory.\n\nClaimants in the same multi-node NVLink domain copy it over NVLink.",
+      "properties": {
+        "compact_host_memory": {
+          "default": false,
+          "description": "Before a node that refuses a donated chunk is left, run up to 64 reclaim-and-compact passes on it (fault in and release node-bound huge pages under a per-node lock that donors on one host take in turn), so fragmented or page-cache-filled memory can still take the donation. False publishes what fits and leaves compaction to the job prolog.",
+          "status": "prototype",
+          "title": "Compact Host Memory",
+          "type": "boolean"
+        },
+        "donor_reserve_size": {
+          "default": 25769803776,
+          "description": "Bytes of free plus reclaimable memory each host NUMA node keeps for the processes on it while a donation is placed. Chunks go to the GPU's node first, then to the others; a donation that does not fit is published short.",
+          "minimum": 0,
+          "status": "prototype",
+          "title": "Donor Reserve Size",
+          "type": "integer"
+        },
+        "kind": {
+          "const": "fabric",
+          "description": "Selects this transport. Every rank sharing `directory` must use the same transport.",
+          "status": "prototype",
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "RemoteFabricTransportConfig",
+      "type": "object"
+    },
+    "RemoteLevelConfig": {
+      "additionalProperties": false,
+      "description": "This rank's remote cache level, in chunks of donated memory.",
+      "properties": {
+        "donor_wait_timeout_s": {
+          "default": 900.0,
+          "description": "Seconds the rank waits for donors, applied to each wait on its own: for the expected donors to report, and for each chunk claim. Donors publish while their own servers start, so this bounds the job's startup skew per wait, not in total. At most 1e6.",
+          "exclusiveMinimum": 0,
+          "maximum": 1000000.0,
+          "status": "prototype",
+          "title": "Donor Wait Timeout S",
+          "type": "number"
+        },
+        "expected": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RemoteExpectedDonorsConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "With it, the rank waits until these donors have reported and fails at once if they cannot cover the claims, instead of after a claim wait.",
+          "status": "prototype"
+        },
+        "pool_ratio": {
+          "anyOf": [
+            {
+              "items": {
+                "exclusiveMinimum": 0,
+                "type": "number"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Split of `size` across layer groups, one positive weight per layer group in KV cache manager v2 layer-group ID order (normalized). None follows the hot tier's split.",
+          "status": "prototype",
+          "title": "Pool Ratio"
+        },
+        "size": {
+          "description": "Bytes of the level. Pages are stored as the cold tiers store them: byte copies, or encoded by a lossy cold-page codec (kv_cache_compression_config) when one is set. It takes the disk level's place, so it cannot be combined with `disk_cache_size`.",
+          "exclusiveMinimum": 0,
+          "status": "prototype",
+          "title": "Size",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "size"
+      ],
+      "title": "RemoteLevelConfig",
+      "type": "object"
+    },
+    "RemoteNixlTransportConfig": {
+      "additionalProperties": false,
+      "description": "Remote cache transport over one-sided NIXL RDMA.",
+      "properties": {
+        "kind": {
+          "const": "nixl",
+          "default": "nixl",
+          "description": "Selects this transport. Every rank sharing `directory` must use the same transport.",
+          "status": "prototype",
+          "title": "Kind",
+          "type": "string"
+        },
+        "transfer_timeout_s": {
+          "default": 30.0,
+          "description": "Seconds one batch of page transfers of a remote level may take before the level fails, e.g. on a donor that died. At most 1e6.",
+          "exclusiveMinimum": 0,
+          "maximum": 1000000.0,
+          "status": "prototype",
+          "title": "Transfer Timeout S",
+          "type": "number"
+        },
+        "ucx_devices": {
+          "anyOf": [
+            {
+              "pattern": "^\\s*[^\\s,:][^,:]*(:1?)?\\s*(,\\s*[^\\s,:][^,:]*(:1?)?\\s*)*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Comma-separated UCX devices of the remote level's and the donor's NIXL agents (for example 'mlx5_0:1'), each '<device>' or '<device>:1' (NIXL's UCX backend uses port 1); '{GPU}' is replaced by the rank's physical GPU index. None uses the process's UCX environment.",
+          "status": "prototype",
+          "title": "Ucx Devices"
+        }
+      },
+      "title": "RemoteNixlTransportConfig",
+      "type": "object"
+    },
     "ReorderRequestPolicyConfig": {
       "additionalProperties": false,
       "description": "Configuration for request reordering policy.",
@@ -6295,6 +6700,29 @@
     },
     "SchedulerConfig": {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "not": {
+              "properties": {
+                "waiting_queue_policy": {
+                  "const": "priority"
+                }
+              },
+              "required": [
+                "waiting_queue_policy"
+              ]
+            }
+          },
+          "then": {
+            "properties": {
+              "waiting_queue_max_wait_s": {
+                "const": null
+              }
+            }
+          }
+        }
+      ],
       "properties": {
         "capacity_scheduler_policy": {
           "$ref": "#/$defs/CapacitySchedulerPolicy",
@@ -6362,6 +6790,21 @@
           "description": "Use pure-Python scheduler instead of C++ scheduler.",
           "title": "Use Python Scheduler",
           "type": "boolean"
+        },
+        "waiting_queue_max_wait_s": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "With waiting_queue_policy='priority': a request that has waited this many seconds since it reached the server (in disaggregated serving, the orchestrator) goes ahead of every request that has not, oldest first. None: no cap. Keep it at or below the context servers' cache_transceiver_config.kv_transfer_timeout_ms, whose clock starts later (after prefill).",
+          "status": "prototype",
+          "title": "Waiting Queue Max Wait S"
         },
         "waiting_queue_policy": {
           "$ref": "#/$defs/WaitingQueuePolicy",
@@ -7083,6 +7526,38 @@
           },
           "tensor_parallel_size": {
             "minimum": 2
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kv_cache_config": {
+            "properties": {
+              "defer_generation_only_release": {
+                "const": true
+              }
+            },
+            "required": [
+              "defer_generation_only_release"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "kv_cache_config"
+        ]
+      },
+      "then": {
+        "properties": {
+          "disable_overlap_scheduler": {
+            "not": {
+              "const": true
+            }
+          },
+          "pipeline_parallel_size": {
+            "maximum": 1
           }
         }
       }

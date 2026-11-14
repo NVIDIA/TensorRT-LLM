@@ -96,6 +96,20 @@ def test_attach_reaches_the_router_gate(monkeypatch) -> None:
     assert root.gate._low_m_gemm_name == "gate"
 
 
+def test_a_later_attach_keeps_the_models_own_dispatcher(monkeypatch) -> None:
+    """The loader's prepare_low_m_gemm after load must not replace a dispatcher the model attached itself
+    (Qwen3.5: limit_rows, whole_bucket_direct_tiles, per_rank_tuning); new modules still get the later one."""
+    monkeypatch.setattr(_mod, "LOW_M_GEMM_ACTIVE", True)
+    root = torch.nn.Module()
+    root.own = torch.nn.Linear(8, 8)
+    model_dispatcher = _mod.prepare_low_m_gemm(root, force=True, whole_bucket_direct_tiles=True)
+    root.later = torch.nn.Linear(8, 8)
+    loader_dispatcher = _mod.prepare_low_m_gemm(root)
+
+    assert root.own._low_m_gemm_dispatcher is model_dispatcher
+    assert root.later._low_m_gemm_dispatcher is loader_dispatcher
+
+
 # ---------------------------------------------------------------------------
 # linear.py fast pre-filter
 # ---------------------------------------------------------------------------
@@ -106,6 +120,52 @@ def test_linear_fast_rejects_m_above_max_m(monkeypatch) -> None:
 
     assert _mod._should_apply_low_m_gemm(torch.empty((32, 128)))
     assert not _mod._should_apply_low_m_gemm(torch.empty((33, 128)))
+
+
+def test_takes_rows_follows_the_module_ceiling(monkeypatch) -> None:
+    monkeypatch.setattr(_mod, "LOW_M_GEMM_ACTIVE", False)
+    dispatcher = LowMGemmDispatcher()
+    plain, limited = torch.nn.Linear(8, 8), torch.nn.Linear(8, 8)
+    for module in (plain, limited):
+        module._low_m_gemm_dispatcher = dispatcher
+    dispatcher.limit_rows(limited, 14)
+
+    assert not _mod.low_m_gemm_takes_rows(torch.nn.Linear(8, 8), 4)
+    assert _mod.low_m_gemm_takes_rows(plain, _mod._MAX_M)
+    assert not _mod.low_m_gemm_takes_rows(plain, _mod._MAX_M + 1)
+    assert _mod.low_m_gemm_takes_rows(limited, 14)
+    assert not _mod.low_m_gemm_takes_rows(limited, 15)
+
+
+def test_static_fp8_input_scale_is_one_decision(monkeypatch) -> None:
+    """Linear.static_fp8_input_scale: the scale where an FP8 QDQ layer takes an E4M3 input at these rows, else
+    None (another quantization, LoRA, bias, a non-scalar scale, or rows on the low-M path)."""
+    from tensorrt_llm._torch.modules.linear import FP8QDQLinearMethod, Linear, W8A16FP8LinearMethod
+
+    monkeypatch.setattr(_mod, "LOW_M_GEMM_ACTIVE", True)
+    scale = torch.tensor([0.5], dtype=torch.float32)
+
+    def layer(**overrides):
+        fields = dict(
+            quant_method=FP8QDQLinearMethod(),
+            lora=None,
+            bias=None,
+            input_scale=scale,
+            force_dynamic_quantization=False,
+        )
+        fields.update(overrides)
+        return MagicMock(
+            spec=[*fields, "_low_m_gemm_dispatcher"], _low_m_gemm_dispatcher=None, **fields
+        )
+
+    rows = _mod._MAX_M + 1
+    assert Linear.static_fp8_input_scale(layer(), rows) is scale
+    assert Linear.static_fp8_input_scale(layer(), _mod._MAX_M) is None
+    assert Linear.static_fp8_input_scale(layer(quant_method=W8A16FP8LinearMethod()), rows) is None
+    assert Linear.static_fp8_input_scale(layer(lora=object()), rows) is None
+    assert Linear.static_fp8_input_scale(layer(bias=torch.zeros(4)), rows) is None
+    assert Linear.static_fp8_input_scale(layer(force_dynamic_quantization=True), rows) is None
+    assert Linear.static_fp8_input_scale(layer(input_scale=scale.half()), rows) is None
 
 
 # ---------------------------------------------------------------------------

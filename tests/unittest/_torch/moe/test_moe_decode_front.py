@@ -15,13 +15,15 @@
 """TRTLLM-gen NVFP4 MoE decode front (trtllm_gen/decode_front.py): router GEMM, route + tables, the
 one-launch fused front and the route front against reference routing, and the pre-routed MoE output."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import triton
 import triton.language as tl
 
 from tensorrt_llm._torch.modules.low_m_mma_gemm import default_tactic, low_m_mma_gemm
-from tensorrt_llm._torch.moe.fused_moe.impl_contract import PreroutedRouting
+from tensorrt_llm._torch.moe.fused_moe.impl_contract import EngineRouting, PreroutedRouting
 from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import decode_front as df
 
 E, K, H = 512, 10, 4096
@@ -121,8 +123,8 @@ def _two_launch(x, w, gs, ls, nl, tile):
     return logits, out[8], out[9], out[0], out[1], flat
 
 
-def _route_front(x, w, gs, flat, ls, nl, tile):
-    front = df.RouteFront()
+def _route_front(x, w, gs, flat, ls, nl, tile, lean=False):
+    front = df.RouteFront(lean=lean)
     fn = front.compiled(x, E, tile, nl, K)
     assert fn is not None, "route front does not apply"
     logits = _cublas(x, w)
@@ -199,6 +201,120 @@ def _configs(runner, m, nl, inter):
     for tile, cfg in runner.get_runner().get_valid_configs(K, H, inter, nl, m):
         by_tile.setdefault(int(tile), []).append(int(cfg))
     return {t: sorted(c) for t, c in by_tile.items()}
+
+
+@pytest.mark.parametrize("m", [33, 40, 77, 96, 97, 128])
+def test_route_front_router_gemm(m):
+    """The route front steps' CuTe router GEMM (moe_router_gemm): as accurate as cuBLAS, and a token's logits do
+    not depend on the batch it runs in (fixed split-K order); declined above ROUTER_GEMM_MAX_TOKENS rows."""
+    x, w, _ = _inputs(m, seed=21 + m)
+    rg = df.RouteFrontRouterGemm()
+    a = rg(x, w)
+    assert a is not None and torch.equal(a, rg(x, w))
+    exact = x.float() @ w.float().t()
+    err = (a.float() - exact).abs().max().item()
+    err_ref = (_cublas(x, w).float() - exact).abs().max().item()
+    assert err <= 2 * err_ref + 1e-3, (err, err_ref)
+    head = rg(x[:33].contiguous(), w)
+    assert torch.equal(head, a[:33])
+    big, _, _ = _inputs(df.ROUTER_GEMM_MAX_TOKENS + 1, seed=21)
+    assert rg(big, w) is None
+
+
+def _ref_candidates(logits: torch.Tensor, top_k: int = K) -> torch.Tensor:
+    """trtllm-gen reduceTopK keys (twiddled BF16 << 16 | 65535 - expert) of each 128-expert tile, top ``top_k``
+    descending: equal logits go to the smaller expert."""
+    m, e = logits.shape
+    bits = logits.view(torch.int16).to(torch.int64) & 0xFFFF
+    tw = torch.where((bits & 0x8000) != 0, bits ^ 0xFFFF, bits | 0x8000)
+    keys = (tw << 16) | (65535 - torch.arange(e, device=logits.device))
+    top = keys.view(m, e // 128, 128).sort(dim=-1, descending=True).values[..., :top_k]
+    return torch.where(top >= 2**31, top - 2**32, top).to(torch.int32)
+
+
+def _engine_route_gemm(x, w, gs, poison: int, top_k: int = K):
+    """The engine-route router GEMM into outputs filled with ``poison`` (a missing store keeps it)."""
+    import cuda.bindings.driver as cuda
+    import cutlass
+    import cutlass.cute as cute
+
+    from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
+    from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
+
+    m, h = x.shape
+    fn = df._router_gemm_compile(m, h, E, x.stride(0), get_env_enable_pdl(), route_top_k=top_k)
+    assert fn is not None, "the engine-route router GEMM declined"
+    dev = x.device
+    logits = torch.full((m, E), poison, dtype=torch.int16, device=dev).view(torch.bfloat16)
+    cand = torch.full((m, E // 128, top_k), poison, dtype=torch.int32, device=dev)
+    xq = torch.full((m, h // 2), poison & 0xFF, dtype=torch.uint8, device=dev)
+    xsf = torch.full((m, h // 16), poison & 0xFF, dtype=torch.uint8, device=dev)
+
+    def bf(t):
+        return make_ptr(cutlass.BFloat16, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+
+    p64 = lambda t: cutlass.Int64(t.data_ptr())  # noqa: E731
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    fn(bf(x), bf(w), p64(logits), stream, p64(cand), p64(gs), p64(xq), p64(xsf))
+    return logits, cand, xq, xsf
+
+
+# Steps the MoE engine routes (above the router GEMM's 32 rows, up to the engine's 64): MTP-6 decode at CUDA-graph
+# batches 5..9 (35..63 rows) and the bounds.
+@pytest.mark.parametrize(
+    "m,dup", [(33, False), (35, False), (42, True), (49, False), (56, False), (63, False)]
+)
+def test_engine_route_router_gemm(m, dup):
+    """The router GEMM with the engine-route epilogue: logits bitwise the plain kernel's, each token's top-10 keys per
+    128-expert tile equal to reduceTopK's (tie order included), x bytes equal to fp4_quantize; every output written
+    (two runs over different poison)."""
+    x, w, gs = _inputs(m, seed=1900 + m, dup=dup)
+    plain = df.RouteFrontRouterGemm()(x, w)
+    assert plain is not None
+    q_ref, sf_ref = torch.ops.trtllm.fp4_quantize(x, gs, 16, False, False)
+    q_ref = q_ref.view(torch.uint8).view(m, H // 2)
+    sf_ref = sf_ref.view(torch.uint8).flatten()[: m * H // 16].view(m, H // 16)
+    cand_ref = _ref_candidates(plain)
+    for poison in (-1, 0x2AAA):
+        logits, cand, xq, xsf = _engine_route_gemm(x, w, gs, poison)
+        tag = (m, dup, poison)
+        assert torch.equal(_bits(logits), _bits(plain)), (tag, "logits")
+        assert torch.equal(cand, cand_ref), (tag, "candidates")
+        assert torch.equal(xq, q_ref) and torch.equal(xsf, sf_ref), (tag, "x quant")
+    out = df.RouteFrontRouterGemm(engine_route=True)(x, w, gs, K)
+    assert out is not None
+    for name, a, b in zip(("logits", "cand", "xq", "xsf"), out, (plain, cand_ref, q_ref, sf_ref)):
+        assert torch.equal(_bits(a), _bits(b)), (m, name)
+
+
+@pytest.mark.parametrize("m,top_k", [(35, 8), (56, 4)])
+def test_engine_route_router_gemm_top_k(m, top_k):
+    """The routing epilogue for another top-k: each token's top-``top_k`` keys per expert tile equal to reduceTopK's,
+    logits and x bytes as at top-10."""
+    x, w, gs = _inputs(m, seed=1950 + m)
+    plain = df.RouteFrontRouterGemm()(x, w)
+    ref = df.RouteFrontRouterGemm(engine_route=True)(x, w, gs, K)
+    logits, cand, xq, xsf = _engine_route_gemm(x, w, gs, -1, top_k)
+    assert torch.equal(_bits(logits), _bits(plain))
+    assert torch.equal(cand, _ref_candidates(plain, top_k))
+    assert torch.equal(xq, ref[2]) and torch.equal(xsf, ref[3])
+
+
+def test_engine_route_router_gemm_rejects():
+    """The routing epilogue takes 1..32 keys per tile and 8 token rows per expert tile in a 32- or 64-token tile:
+    256 experts (a 16-token tile) and 33 keys are declined (the caller keeps the route front)."""
+    from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
+    from tensorrt_llm._torch.kernels.blackwell.moe_router_gemm import MoeRouterGemmKernel
+
+    pdl = get_env_enable_pdl()
+    assert df._router_gemm_compile(35, H, 256, H, pdl, route_top_k=K) is None
+    assert df._router_gemm_compile(35, H, E, H, pdl, route_top_k=33) is None
+    shape = dict(num_rows=35, k_extent=H, num_experts=E, a_stride=H, token_tile=32)
+    assert MoeRouterGemmKernel.supports(**shape, route_top_k=K)
+    assert not MoeRouterGemmKernel.supports(**dict(shape, token_tile=64), route_top_k=K)
+    assert MoeRouterGemmKernel.supports(
+        **dict(shape, num_experts=1024, token_tile=64), route_top_k=K
+    )
 
 
 @pytest.mark.parametrize("m", [1, 7, 32])
@@ -296,29 +412,42 @@ def test_fused_front_parity(m, nl, ls, tile, dup):
 
 # M = 40 (odd split over the 8 routing CTAs), 112 / 224 (MTP-6 verify at batch 16 / 32), 256 (clusters of 8);
 # 257..1024 run on clusters of 16, above 512 with two-word token masks.
+_ROUTE_FRONT_CASES = [
+    (21, 64, 448, 8, False, False),
+    (40, 128, 0, 8, False, False),
+    (56, 512, 0, 16, False, False),
+    (224, 128, 384, 32, False, False),
+    (256, 256, 256, 8, False, False),
+    (112, 128, 128, 8, True, False),
+    (224, 128, 0, 8, False, True),
+    (280, 128, 128, 16, False, False),
+    (448, 64, 448, 16, False, False),
+    (448, 128, 0, 16, True, False),
+    (448, 128, 0, 16, False, True),
+    (513, 128, 0, 16, False, False),
+    (896, 256, 256, 32, True, False),
+    (1024, 128, 0, 16, False, True),
+]
+# The lean table build runs on clusters of 8 only; above 256 rows the route front takes the default kernel.
+_LEAN_MAX_M = 256
+
+
 @pytest.mark.parametrize(
-    "m,nl,ls,tile,dup,crowd",
+    "m,nl,ls,tile,dup,crowd,lean",
     [
-        (40, 128, 0, 8, False, False),
-        (224, 128, 384, 32, False, False),
-        (256, 256, 256, 8, False, False),
-        (112, 128, 128, 8, True, False),
-        (224, 128, 0, 8, False, True),
-        (280, 128, 128, 16, False, False),
-        (448, 64, 448, 16, False, False),
-        (448, 128, 0, 16, True, False),
-        (448, 128, 0, 16, False, True),
-        (513, 128, 0, 16, False, False),
-        (896, 256, 256, 32, True, False),
-        (1024, 128, 0, 16, False, True),
+        pytest.param(*c, lean, id="-".join(map(str, ("lean" if lean else "default", *c))))
+        for lean in (False, True)
+        for c in _ROUTE_FRONT_CASES
+        if not lean or c[0] <= _LEAN_MAX_M
     ],
 )
-def test_route_front_parity(m, nl, ls, tile, dup, crowd):
+def test_route_front_parity(m, nl, ls, tile, dup, crowd, lean):
     """The route front after the stock router GEMM equals the Triton route kernel and fp4_quantize bitwise,
-    tables in token order; a repeated launch gives the same result."""
+    tables in token order; a repeated launch gives the same result. ``lean`` (the decode kernels' table build, up
+    to 256 rows) gives the same bits."""
     x, w, gs = _inputs(m, seed=100 + m + nl + tile, dup=dup, crowd=crowd)
     flat = _flat(m, nl, tile)
-    lg, xq, xsf, ids, wts = _route_front(x, w, gs, flat, ls, nl, tile)
+    lg, xq, xsf, ids, wts = _route_front(x, w, gs, flat, ls, nl, tile, lean)
     ids_r, wts_r, flat_r, xq_r, xsf_r = _ref_route(_cublas(x, w), x, gs, ls, nl, tile)
     q_ref, sf_ref = torch.ops.trtllm.fp4_quantize(x, gs, 16, False, False)
     tag = (m, nl, ls, tile, dup, crowd)
@@ -335,7 +464,7 @@ def test_route_front_parity(m, nl, ls, tile, dup, crowd):
     if dup:
         _check_dup_ties(ids, tag)
     flat2 = torch.full_like(flat, -7)
-    again = _route_front(x, w, gs, flat2, ls, nl, tile)
+    again = _route_front(x, w, gs, flat2, ls, nl, tile, lean)
     for a, b in zip(again, (lg, xq, xsf, ids, wts)):
         assert torch.equal(_bits(a), _bits(b)), (tag, "repeat")
     _check_tables(_tables(flat2, m, nl, tile), _tables(flat, m, nl, tile), tile, (tag, "repeat"))
@@ -370,8 +499,9 @@ class _Gate:
         return _cublas(x, self.weight)
 
 
-def _front_runner(w, nl, ls, tile):
-    return df.FrontRunner(df.DecodeFront(frozenset()), _Gate(w), nl, ls, K, lambda m: tile)
+def _front_runner(w, nl, ls, tile, decode_kernels=False):
+    front = df.DecodeFront(frozenset(), decode_kernels=decode_kernels)
+    return df.FrontRunner(front, _Gate(w), nl, ls, K, lambda m: tile)
 
 
 @pytest.mark.parametrize("m,nl,ls", [(1, 64, 448), (7, 64, 448), (14, 128, 128)])
@@ -416,6 +546,34 @@ def test_front_runner_race():
             df.FrontRunner.OP, [runner], df.FrontRunner.TUNING_CONFIG, [x[:m], gs]
         )
         assert tactic in runner.get_valid_tactics([x[:m], gs], None), (m, tactic)
+    tuner.clear_cache()
+
+
+@pytest.mark.parametrize("nl,ls", [(32, 224), (64, 192)])
+def test_front_runner_fused_only(nl, ls, tile=8):
+    """A front declared with the decode kernels races only the one-launch front's warp splits wherever one takes
+    the step, so the AutoTuner caches the one-launch front at every row count; the two launches stay the only
+    tactic where none does (rows not 16-byte aligned). Undeclared fronts keep both."""
+    from tensorrt_llm._torch.autotuner import AutoTuner, autotune
+
+    x, w, gs = _inputs(df.FUSED_FRONT_MAX_TOKENS, seed=1650 + nl)
+    runner = _front_runner(w, nl, ls, tile, decode_kernels=True)
+    stock = _front_runner(w, nl, ls, tile)
+    for m in range(1, df.FUSED_FRONT_MAX_TOKENS + 1):
+        tactics = runner.get_valid_tactics([x[:m], gs], None)
+        assert tactics and 0 not in tactics, (m, tactics)
+        assert stock.get_valid_tactics([x[:m], gs], None) == [0, *tactics], m
+    padded = torch.zeros((7, H + 4), dtype=x.dtype, device=x.device)[:, :H]
+    assert runner.get_valid_tactics([padded, gs], None) == [0]
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    with autotune():
+        tuner.choose_one(df.FrontRunner.OP, [runner], df.FrontRunner.TUNING_CONFIG, [x[:7], gs])
+    for m in range(1, df.FUSED_FRONT_MAX_TOKENS + 1):
+        _, tactic = tuner.choose_one(
+            df.FrontRunner.OP, [runner], df.FrontRunner.TUNING_CONFIG, [x[:m], gs]
+        )
+        assert tactic > 0, (m, tactic)
     tuner.clear_cache()
 
 
@@ -636,7 +794,7 @@ class _RecordingMoe:
             "Backend",
             (),
             dict(
-                decode_tactic=lambda _, m: [8, 0],
+                decode_tactic=lambda _, m, do_finalize: [8, 0],
                 slot_start=0,
                 expert_size_per_partition=E,
                 fc31_input_scale=torch.ones(1),
@@ -755,3 +913,166 @@ def test_decode_front_hidden_size(
         assert out is None and calls == [], calls
     else:
         assert out == "front" and calls == path, calls
+
+
+def _engine_backend(
+    decode_tuning: bool = True, engine_state: bool = True, num_local: int = 128, inter: int = 512
+) -> SimpleNamespace:
+    """An NVFP4 TRTLLM-gen backend as ``decode_moe.engine_routes`` reads it (meta weights)."""
+    from tensorrt_llm._torch.utils import ActivationType
+
+    def meta(*shape, dtype=torch.uint8):
+        return torch.empty(shape, dtype=dtype, device="meta")
+
+    return SimpleNamespace(
+        decode_tactic=lambda m, do_finalize: [8, 0],
+        slot_start=0,
+        expert_size_per_partition=num_local,
+        fc31_input_scale=torch.ones(1),
+        decode_tuning=decode_tuning,
+        decode_engine_state=torch.zeros(1, dtype=torch.int32) if engine_state else None,
+        activation_type=ActivationType.Swiglu,
+        bias=False,
+        w3_w1_bias=None,
+        w2_bias=None,
+        act_alpha=None,
+        act_beta=None,
+        act_clamp=None,
+        w3_w1_weight=meta(num_local, 2 * inter, H // 2),
+        w2_weight=meta(num_local, H, inter // 2),
+        fc31_scale_c=meta(num_local, dtype=torch.float32),
+        fc31_alpha=meta(num_local, dtype=torch.float32),
+        fc2_alpha=meta(num_local, dtype=torch.float32),
+    )
+
+
+_TODAY = ["router_gemm", "route_front", "moe"]
+
+
+@pytest.mark.parametrize(
+    "top_k,num_experts,routes",
+    [
+        (10, 512, True),
+        (8, 512, True),
+        (9, 512, True),
+        (6, 1024, True),
+        (13, 512, False),  # 64 tokens x 52 keys: more than two 16-byte loads per engine thread
+        (7, 128, False),  # 7 keys of one list: not whole 16-byte vectors
+        (10, 1024, False),  # 80 keys per token: more than two loads per thread
+        (10, 256, False),  # two lists: the router epilogue's 16-token tile does not exist
+        (33, 512, False),  # the router epilogue stores at most 32 keys per tile
+    ],
+)
+def test_engine_routes_top_k_and_lists(top_k: int, num_experts: int, routes: bool) -> None:
+    """The routing engine and its router epilogue take top-k and the number of 128-expert lists as compile-time
+    parameters; ``engine_routes`` declines what either kernel cannot run."""
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import decode_moe as dm
+
+    assert dm.engine_routes(_engine_backend(), 35, top_k, num_experts) == routes
+    assert not dm.engine_routes(_engine_backend(), 65, top_k, num_experts)
+
+
+@pytest.mark.parametrize(
+    "engine_route,finalize,backend_kw,path",
+    [
+        (True, False, {}, ["engine_router", "moe"]),
+        (True, True, {}, _TODAY),
+        (False, False, {}, _TODAY),
+        (True, False, dict(engine_state=False), _TODAY),
+        (True, False, dict(decode_tuning=False), _TODAY),
+        (True, False, dict(num_local=256), _TODAY),
+    ],
+    ids=["engine", "finalized", "not_declared", "no_engine_state", "no_decode_tuning", "256_local"],
+)
+def test_decode_front_engine_route_gate(
+    monkeypatch: pytest.MonkeyPatch,
+    engine_route: bool,
+    finalize: bool,
+    backend_kw: dict,
+    path: list[str],
+) -> None:
+    """A step of 35 rows routes in the MoE engine (the epilogue router GEMM, then the MoE with the candidates and no
+    route launch) only where the front declares ``engine_route`` and the call is un-finalized and runs the engine;
+    otherwise the route front steps' CuTe router GEMM and the route front, without candidates."""
+    m = 35
+    calls: list[str] = []
+    seen: list[PreroutedRouting] = []
+    xq = torch.zeros((m, H // 2), dtype=torch.uint8)
+    xsf = torch.zeros((m, H // 16), dtype=torch.uint8)
+    ids, wts = torch.zeros((m, K), dtype=torch.int32), torch.zeros((m, K), dtype=torch.bfloat16)
+    logits = torch.zeros((m, E), dtype=torch.bfloat16)
+    cand = torch.zeros((m, E // 128, K), dtype=torch.int32)
+
+    class Gate:
+        out_dtype = torch.bfloat16
+        weight = torch.zeros((E, H), dtype=torch.bfloat16)
+
+        def __call__(self, x: torch.Tensor) -> torch.Tensor:
+            calls.append("gate")
+            return logits
+
+    class RouteFront:
+        def compiled(self, x, n, tile, num_local, top_k):
+            return "compiled"
+
+        def __call__(self, fn, lg, x, gs, flat, tile, local_start, num_local, top_k):
+            calls.append("route_front")
+            return xq, xsf, ids, wts
+
+    def launch(name: str, out):
+        def run(*args, **kwargs):
+            calls.append(name)
+            return out
+
+        return run
+
+    class Moe:
+        backend = _engine_backend(**backend_kw)
+        routing_method = SimpleNamespace(experts_per_token=K)
+
+        def __call__(self, x, lg, output_dtype, prerouted=None, **kwargs) -> str:
+            calls.append("moe")
+            seen.append(prerouted)
+            return "front"
+
+    monkeypatch.setattr(df, "front_eligible", lambda moe, x, max_tokens: True)
+    front = df.DecodeFront(frozenset({35, 42}), decode_kernels=True, engine_route=engine_route)
+    front.route_front = RouteFront()
+    front.route_front_router = launch("router_gemm", logits)
+    if engine_route:
+        front.engine_router = launch("engine_router", (logits, cand, xq, xsf))
+    x = torch.zeros((m, H), dtype=torch.bfloat16)
+    out = front(Gate(), Moe(), x, do_finalize=finalize)
+    assert out == "front" and calls == path, calls
+    engine = path[0] == "engine_router"
+    # The engine's hand-off is an EngineRouting carrying the candidates; otherwise a plain PreroutedRouting.
+    assert isinstance(seen[0], EngineRouting) == engine
+    assert not engine or seen[0].candidates is cand
+
+
+def test_engine_route_decision_is_kept_per_token_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``DecodeFront._engine_routes`` evaluates ``decode_moe.engine_routes`` once per token count after the backend's
+    engine state exists (everything else it reads is fixed per layer), and every call before that."""
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import decode_moe as dm
+
+    evaluated: list[int] = []
+    real = dm.engine_routes
+
+    def counted(backend, m, top_k, num_experts):
+        evaluated.append(m)
+        return real(backend, m, top_k, num_experts)
+
+    monkeypatch.setattr(dm, "engine_routes", counted)
+    front = df.DecodeFront(frozenset({35, 42}), decode_kernels=True, engine_route=True)
+    front.engine_router = object()
+    unfinalized = {"do_finalize": False}
+    backend = _engine_backend(engine_state=False)
+    assert not front._engine_routes(backend, 35, K, E, unfinalized)
+    assert not front._engine_routes(backend, 35, K, E, unfinalized)
+    assert evaluated == [35, 35]
+    backend.decode_engine_state = torch.zeros(1, dtype=torch.int32)
+    for _ in range(3):
+        assert front._engine_routes(backend, 35, K, E, unfinalized)
+        assert not front._engine_routes(backend, 65, K, E, unfinalized)
+    assert not front._engine_routes(backend, 35, K, E, {"do_finalize": True})
+    assert evaluated == [35, 35, 35, 65]

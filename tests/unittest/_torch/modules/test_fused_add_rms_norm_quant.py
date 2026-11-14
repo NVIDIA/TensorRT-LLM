@@ -12,11 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for fused_add_rms_norm_quant with/without output_hp_norm support."""
+"""Unit tests for fused_add_rms_norm_quant with/without output_hp_norm support, and for the NCCL allreduce
+fallback's fused residual + RMSNorm + FP8 quantize."""
 
 import pytest
 import torch
 from utils.util import getSMVersion
+
+from tensorrt_llm._torch.distributed import AllReduceFusionOp, AllReduceStrategy
 
 
 def fused_add_rms_norm_quant_available():
@@ -377,3 +380,76 @@ def test_fused_add_rms_norm_quant_non_power_of_2_hidden(m, n):
     sf_out_hp_valid = sf_out_hp[valid_sf_indices]
     sf_out_no_hp_valid = sf_out_no_hp[valid_sf_indices]
     torch.testing.assert_close(sf_out_hp_valid, sf_out_no_hp_valid, rtol=0, atol=0)
+
+
+# The NCCL / NCCL_SYMMETRIC allreduce fallback of every model fuses residual + RMSNorm + FP8 quantize after the
+# reduce. A one-rank group runs the same post-reduce path in one process, so these run on single-GPU stages,
+# Hopper included; they keep their own GPU gate and do not use skip_unsupported (SM100+).
+_FP8_FUSION_OPS = [
+    pytest.param(AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8, id="residual_rms_norm_quant_fp8"),
+    pytest.param(
+        AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_FP8, id="residual_rms_norm_out_quant_fp8"
+    ),
+]
+
+
+def _nccl_one_rank_allreduce(x, residual, norm_weight, scale, op):
+    return torch.ops.trtllm.allreduce(
+        input=x,
+        residual=residual,
+        norm_weight=norm_weight,
+        scale=scale,
+        bias=None,
+        workspace=None,
+        group=[0],
+        strategy=AllReduceStrategy.NCCL,
+        op=op,
+        eps=1e-5,
+        trigger_completion_at_end=True,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize("seq_len", [1, 7, 300], ids=lambda x: f"seqlen:{x}")
+@pytest.mark.parametrize("hidden_size", [128, 256, 4096, 7168, 8192], ids=lambda x: f"hidden:{x}")
+@pytest.mark.parametrize("fusion_op", _FP8_FUSION_OPS)
+@torch.inference_mode()
+def test_nccl_residual_rms_norm_quant_fp8_bitwise(seq_len, hidden_size, fusion_op):
+    """The NCCL fallback's fused residual + RMSNorm + FP8 quantize (one kernel where the hidden size allows it) is
+    bit for bit RESIDUAL_RMS_NORM followed by the static per-tensor quantize."""
+    torch.manual_seed(0)
+    x = torch.randn((seq_len, hidden_size), dtype=torch.bfloat16, device="cuda")
+    residual = torch.randn_like(x)
+    norm_weight = torch.randn((hidden_size,), dtype=torch.bfloat16, device="cuda")
+    scale = torch.tensor(0.37, dtype=torch.float32, device="cuda")
+
+    norm, residual_out = _nccl_one_rank_allreduce(
+        x, residual, norm_weight, scale, AllReduceFusionOp.RESIDUAL_RMS_NORM
+    )
+    ref_quant, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(norm, scale)
+    outputs = _nccl_one_rank_allreduce(x, residual, norm_weight, scale, fusion_op)
+    if fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_FP8:
+        assert torch.equal(outputs[0], norm)
+    assert torch.equal(outputs[-2].view(torch.uint8), ref_quant.view(torch.uint8))
+    assert torch.equal(outputs[-1], residual_out)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize("fusion_op", _FP8_FUSION_OPS)
+@torch.inference_mode()
+def test_nccl_residual_rms_norm_quant_fp8_no_tokens(fusion_op):
+    """The NCCL fallback's fused residual + RMSNorm + FP8 quantize returns empty outputs for an empty input."""
+    hidden_size = 4096
+    x = torch.empty((0, hidden_size), dtype=torch.bfloat16, device="cuda")
+    outputs = _nccl_one_rank_allreduce(
+        x,
+        torch.empty_like(x),
+        torch.ones((hidden_size,), dtype=torch.bfloat16, device="cuda"),
+        torch.tensor(1.0, dtype=torch.float32, device="cuda"),
+        fusion_op,
+    )
+    torch.cuda.synchronize()
+    expected = 3 if fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_FP8 else 2
+    assert len(outputs) == expected
+    assert all(o.shape == (0, hidden_size) for o in outputs)
+    assert outputs[-2].dtype == torch.float8_e4m3fn

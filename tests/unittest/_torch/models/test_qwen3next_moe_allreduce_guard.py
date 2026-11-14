@@ -46,6 +46,7 @@ def _fake_model_config(mapping: _FakeMapping) -> SimpleNamespace:
         mapping=mapping,
         allreduce_strategy=None,
         mnnvl_allreduce_fp8_payload=False,
+        extra_attrs={},
     )
 
 

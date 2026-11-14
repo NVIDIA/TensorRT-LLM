@@ -741,6 +741,8 @@ def test_deferred_lora_generation_resumes_from_harvested_host_token(executor: Py
     executor.scheduler.schedule_request.side_effect = lambda requests, _: SchedulerOutput(
         [], [], list(requests), [], [], len(requests)
     )
+    # As the base scheduler: no request lost its KV pages to a failed remote cache level.
+    executor.scheduler.take_lost_kv_requests.return_value = []
     _abort(executor, held)
 
     current_batch, _, _ = executor._schedule()

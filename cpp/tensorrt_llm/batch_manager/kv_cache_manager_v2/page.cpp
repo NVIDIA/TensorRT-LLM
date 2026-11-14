@@ -222,7 +222,7 @@ UncommittedPage::~UncommittedPage()
 }
 
 SharedPtr<CommittedPage> UncommittedPage::convertToCommitted(
-    SharedPtr<Block> blk, CachedCudaEvent readyEv, int numTokensInBlock)
+    SharedPtr<Block> blk, CachedCudaEvent readyEv, int numTokensInBlock, Page const* retentionSource)
 {
     TLLM_CHECK_DEBUG(!scheduledForEviction());
     // Check before building: replacePage() below drops the superseded page, so a failure
@@ -245,7 +245,7 @@ SharedPtr<CommittedPage> UncommittedPage::convertToCommitted(
     }
     else
     {
-        committed->inheritRetention(*this);
+        committed->inheritRetention(retentionSource != nullptr ? *retentionSource : *this);
     }
     // Move slot id to the committed page; invalidate our slot.
     committed->setSlotId(slotId()); // asserts valid

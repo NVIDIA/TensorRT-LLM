@@ -377,6 +377,15 @@ class RequestScheduler(ABC):
         to release; the default is a no-op.
         """
 
+    def take_lost_kv_requests(self) -> list[tuple[LlmRequest, str]]:
+        """Requests whose KV pages a failed remote cache level took, which the
+        executor must fail, with their error messages.
+
+        Only the KV cache manager V2 scheduler loses pages this way; the
+        default has none.
+        """
+        return []
+
     def set_disagg_transfer_admission_controller(self, controller) -> None:
         """Register the executor's disaggregated KV-transfer window
         (DisaggTransferAdmissionController), when it bounds admission.
@@ -749,6 +758,9 @@ class MultimodalScheduler(RequestScheduler):
 
     def set_disagg_transfer_admission_controller(self, controller) -> None:
         self.scheduler.set_disagg_transfer_admission_controller(controller)
+
+    def take_lost_kv_requests(self) -> list[tuple[LlmRequest, str]]:
+        return self.scheduler.take_lost_kv_requests()
 
     def set_retiring_gen_receives_probe(self, probe: Callable[[], bool]) -> None:
         """Forward the local retirement probe to the wrapped scheduler.

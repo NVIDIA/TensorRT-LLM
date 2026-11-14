@@ -19,6 +19,8 @@
 #include "tensorrt_llm/common/config.h"
 #include <cstdint>
 #include <cuda.h>
+#include <map>
+#include <string>
 #include <vector>
 
 #include "trtllmGen_bmm_export/trtllm/gen/DtypeDecl.h"
@@ -152,6 +154,11 @@ public:
 
     // Get the kernel name from the config index
     [[nodiscard]] std::string getKernelNameFromConfigIndex(int32_t configIndex) const;
+
+    // The options of the kernel a config index names that decide its arithmetic: "dtypeA", "dtypeB", "dtypeC",
+    // "dtypeAcc" (dtype names), "tileM", "tileN", "tileK", "mmaM", "mmaN", "mmaK", "clusterDimX", "clusterDimY",
+    // "clusterDimZ" and "numSlicesForSplitK" (decimal).
+    [[nodiscard]] std::map<std::string, std::string> getKernelOptionsFromConfigIndex(int32_t configIndex) const;
 
     // Get the list of config indices that are valid for the given problem shape
     [[nodiscard]] std::vector<int64_t> getValidConfigIndices(int32_t m, int32_t n, int32_t k,

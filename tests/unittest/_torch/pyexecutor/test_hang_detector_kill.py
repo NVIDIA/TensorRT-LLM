@@ -584,6 +584,28 @@ def test_event_loop_wrapper_kills_world_on_crash(monkeypatch):
     assert isinstance(ex._event_loop_error, ValueError)
 
 
+def test_event_loop_wrapper_runs_crash_protocol_when_dynamo_hook_raises(monkeypatch):
+    """The worker-thread Dynamo hook runs inside the wrapper's try, so its failure takes the crash path."""
+    from tensorrt_llm._torch.pyexecutor import py_executor as pe
+
+    events = []
+    _stub_kill_paths(pe, monkeypatch, events)
+    ex = _bare_executor(pe, monkeypatch, world_size=4, is_shutdown=False)
+    ex._executor_loop_cleanup = lambda: events.append("cleanup")
+    ex.event_loop = lambda: events.append("loop")
+
+    def hook():
+        raise ValueError("hook")
+
+    ex._apply_dynamo_recompile_limit = hook
+
+    with pytest.raises(ValueError, match="hook"):
+        ex._event_loop_wrapper()
+
+    assert events == [("watchdog", 4), "cleanup", "cancel", ("kill", 4, 1234.5)]
+    assert isinstance(ex._event_loop_error, ValueError)
+
+
 def test_event_loop_wrapper_hands_both_kill_paths_this_executors_gate(monkeypatch):
     """Both kill paths must receive THIS executor's delivery gate.
 

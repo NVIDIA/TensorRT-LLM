@@ -26,6 +26,7 @@ from .....utils import ActivationType, AuxStreamType, EventType
 from ...activation import DEFAULT_MOE_ACTIVATION, MoEActivation
 from ...cutlass.eligibility import BF16_ONLY, SmSupport
 from ...impl_base import MoEImplBase, apply_moe_impl_construction_state
+from ...impl_contract import MoEDecodeOptions
 from ...quantization import MoEWeightLoadingMode
 from ...routing import BaseMoeRoutingMethod
 
@@ -83,6 +84,10 @@ class CuteDslFusedMoEBase(MoEImplBase):
     #: Full-size scale parameters that ``_locality_domain_scale_shard``
     #: replaces with per-partition shards, released after the split.
     _locality_domain_full_scale_params: tuple[str, ...] = ()
+
+    #: Declared by the model (``MoEDecodeOptions.fc2_weights_evict_first_rows``): NVFP4 calls
+    #: of up to this many rows load the FC2 weights evict-first (0: none).
+    fc2_weights_evict_first_rows: int = 0
 
     def _has_moe_output_memset_aux_stream(self) -> bool:
         event_dict = getattr(self, "event_dict", None)
@@ -173,6 +178,9 @@ class CuteDslFusedMoEBase(MoEImplBase):
         self.use_fused_finalize = (
             not model_config.moe_disable_finalize_fusion and model_config.lora_config is None
         )
+        self.fc2_weights_evict_first_rows = MoEDecodeOptions.of(
+            model_config.extra_attrs
+        ).fc2_weights_evict_first_rows
 
         # Output-memset overlap is independent of MoE chunking, so ensure its
         # stream and events exist even if the parent creates no chunking event.

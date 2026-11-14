@@ -98,6 +98,9 @@ from .seq_slot_manager import SeqSlotManager
 if TYPE_CHECKING:
     from tensorrt_llm._torch.models.modeling_dflash import DFlashForCausalLM
 
+    from .kv_cache.remote_donor import RemoteMemDonor
+    from .resource_manager import BaseResourceManager
+
 GB = 1 << 30
 _DEFAULT_INDEX_MAPPER_RESERVED_SLOTS = 1
 _CONFIDENCE_INDEX_MAPPER_RESERVED_SLOTS = 2
@@ -1021,6 +1024,13 @@ class KvCacheCreator:
     _joint_kv_cache_reuse = False
     _gen_preemption_headroom: int = 0
 
+    # This rank's donation (remote_cache_config.donor), started before the
+    # estimation so that clients do not wait out the warmup; the final target
+    # manager takes it over.
+    _remote_donor: Optional["RemoteMemDonor"] = None
+    # The donation handed to the final target manager (close_remote_donor).
+    _handed_remote_donor: Optional["RemoteMemDonor"] = None
+
     def __init__(
         self,
         *,
@@ -1092,6 +1102,7 @@ class KvCacheCreator:
                     "ranks only in the chunked-context path. Set "
                     "enable_chunked_prefill=True on a GPU that supports it "
                     "for MLA.")
+        self._reject_unused_v2_only_fields(mapping, llm_args)
         self._disable_overlap_scheduler = llm_args.disable_overlap_scheduler
         self._draft_config = draft_config
         self._skip_est = skip_est
@@ -1102,6 +1113,37 @@ class KvCacheCreator:
         # covers, computed in configure_kv_cache_capacity and carried to the KV manager so the scheduler
         # reads it directly instead of re-deriving it from pool layout. None until reserved (or w == 0).
         self._fp8_ctx_mla_kv_len_cap = None
+
+    def _reject_unused_v2_only_fields(self, mapping: Mapping,
+                                      llm_args: TorchLlmArgs) -> None:
+        """Raise for KV cache fields the resolved manager or executor loop would ignore."""
+        kv_cache_config = self._kv_cache_config
+        used_fields = {
+            "remote_cache_config":
+            kv_cache_config.remote_cache_config is not None,
+            "defer_generation_only_release":
+            kv_cache_config.defer_generation_only_release,
+        }
+        for field, is_set in used_fields.items():
+            if is_set and not self._is_kv_cache_manager_v2:
+                raise ValueError(
+                    f"kv_cache_config.{field} requires KVCacheManagerV2, but "
+                    f"{self._kv_cache_manager_cls.__name__} was selected. Set "
+                    "kv_cache_config.use_kv_cache_manager_v2=True and disable "
+                    "features that fall back to V1.")
+        # TorchLlmArgs rejects the same at parse time; this sees the resolved values.
+        if kv_cache_config.defer_generation_only_release and (
+                llm_args.disable_overlap_scheduler or mapping.pp_size > 1):
+            raise ValueError(
+                "kv_cache_config.defer_generation_only_release is used only "
+                "by the overlap scheduler loop, which needs "
+                "disable_overlap_scheduler=False and pipeline parallel size 1.")
+        if kv_cache_config.defer_generation_only_release and not self._is_disagg:
+            logger.warning(
+                "kv_cache_config.defer_generation_only_release has no effect "
+                "without a cache transceiver: only the generation-only "
+                "requests of a disaggregated generation server are released "
+                "late.")
 
     def _get_model_kv_cache_manager_cls(
         self,
@@ -2207,6 +2249,7 @@ class KvCacheCreator:
         estimating_kv_cache: bool = False,
         kv_cache_config_override: Optional[KvCacheConfig] = None,
         cold_page_codec_provider: Optional[object] = None,
+        remote_donor: Optional["RemoteMemDonor"] = None,
     ) -> KVCacheManager:
         mapping = self._mapping
         assert self._model_engine.model.model_config.is_generation, "Only construct KV cache for generation models."
@@ -2273,6 +2316,7 @@ class KvCacheCreator:
             joint_kv_cache_reuse=self._joint_kv_cache_reuse,
             layer_specs=unified_layer_specs,
             shared_draft_block_width=shared_draft_block_width,
+            remote_donor=remote_donor,
         )
 
         if not self._skip_est:
@@ -2873,10 +2917,12 @@ class KvCacheCreator:
         estimating_kv_cache: bool = False,
         kv_cache_config_override: Optional[KvCacheConfig] = None,
         cold_page_codec_provider: Optional[object] = None,
+        remote_donor: Optional["RemoteMemDonor"] = None,
     ) -> Optional[KVCacheManager]:
         """
         Create a KV cache manager for draft model layers in one-model mode
-        when target and draft have different KV cache layouts.
+        when target and draft have different KV cache layouts. `remote_donor`
+        is the target's donation, which the draft waits for but does not own.
         """
         num_draft_layers = self._get_num_draft_layers()
         spec_dec_layer_mask = self._get_one_model_draft_layer_mask()
@@ -2965,6 +3011,7 @@ class KvCacheCreator:
             disable_overlap_scheduler=self._disable_overlap_scheduler,
             cold_page_codec_provider=cold_page_codec_provider,
             joint_kv_cache_reuse=self._joint_kv_cache_reuse,
+            remote_donor=remote_donor,
         )
 
     def _get_target_and_draft_cache_costs(
@@ -3462,7 +3509,9 @@ class KvCacheCreator:
                              "KV cache pool.")
 
         self_kv_cache_config = base_kv_cache_config.model_copy()
-        cross_kv_cache_config = base_kv_cache_config.model_copy()
+        # The self-attention manager owns the rank's remote level and donation.
+        cross_kv_cache_config = base_kv_cache_config.model_copy(
+            update={"remote_cache_config": None})
         split_any_budget = False
 
         free_fraction = base_kv_cache_config.free_gpu_memory_fraction
@@ -3616,7 +3665,9 @@ class KvCacheCreator:
         Host sizing then falls to the V2 auto host tier policy, which matches
         the tier to the manager's own device quota; V1 builds no secondary pool.
         The disk tier is V2 only and has no auto policy, so dropping its budget
-        leaves the tier out.
+        leaves the tier out; so does dropping the remote cache config: the
+        donation is placed before the probe (_start_remote_donation), the claim waits
+        for the final build.
         """
         if kv_cache_config is None:
             return kv_cache_config
@@ -3625,6 +3676,8 @@ class KvCacheCreator:
             for attr in cls._OFFLOAD_TIER_BUDGET_ATTRS
             if getattr(kv_cache_config, attr)
         }
+        if kv_cache_config.remote_cache_config is not None:
+            dropped["remote_cache_config"] = None
         if not dropped:
             return kv_cache_config
         return kv_cache_config.model_copy(update=dropped)
@@ -3687,6 +3740,8 @@ class KvCacheCreator:
                 self_kv_cache_config)
             cross_kv_cache_config = self._drop_explicit_offload_tier_budgets(
                 cross_kv_cache_config)
+            if not self._skip_est:
+                self._start_remote_donation()
 
         # Split combined KV cache budgets before creating managers.
         draft_kv_cache_config = None
@@ -3720,11 +3775,34 @@ class KvCacheCreator:
             compression_manager if compression_manager is not None
             and compression_manager.provides_cold_page_codec else None)
 
+        # The early donation goes to the final target, which owns it; a separate draft only waits for it.
+        early_donor = None if estimating_kv_cache else self._remote_donor
         kv_cache_manager = self._create_kv_cache_manager(
             estimating_kv_cache,
             kv_cache_config_override=self_kv_cache_config,
             cold_page_codec_provider=cold_page_codec_provider,
+            remote_donor=early_donor,
         )
+        if not estimating_kv_cache:
+            # The manager owns it now, or the donation it started itself when the estimation was skipped; kept only
+            # to mark it should startup fail after this. The draft waits for either and does not charge it again.
+            if early_donor is None:
+                early_donor = getattr(kv_cache_manager, "remote_donor", None)
+            self._handed_remote_donor, self._remote_donor = early_donor, None
+        try:
+            draft_kv_cache_manager, cross_kv_cache_manager = (
+                self._build_secondary_managers(
+                    has_separate_one_model_draft, original_max_seq_len,
+                    estimating_kv_cache, self_kv_cache_config,
+                    draft_kv_cache_config, cross_kv_cache_config,
+                    cold_page_codec_provider, early_donor))
+        except BaseException as error:
+            # Nothing holds the target manager yet: withdraw its donation with the failure marker, then shut it down.
+            if not estimating_kv_cache:
+                self.close_remote_donor(error)
+            if kv_cache_manager is not None:
+                kv_cache_manager.shutdown()
+            raise
 
         # Carry the fp8 context-MLA workspace admission cap (computed in configure_kv_cache_capacity) onto
         # the real KV manager so the scheduler reads it directly instead of re-deriving from pool layout.
@@ -3733,6 +3811,27 @@ class KvCacheCreator:
         if not estimating_kv_cache and kv_cache_manager is not None:
             kv_cache_manager.fp8_ctx_mla_kv_len_cap = self._fp8_ctx_mla_kv_len_cap
 
+        resources[ResourceManagerType.KV_CACHE_MANAGER] = kv_cache_manager
+        resources[
+            ResourceManagerType.DRAFT_KV_CACHE_MANAGER] = draft_kv_cache_manager
+        resources[
+            ResourceManagerType.CROSS_KV_CACHE_MANAGER] = cross_kv_cache_manager
+        if (compression_manager is not None
+                and compression_manager.uses_iteration_lifecycle):
+            resources[ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER] = (
+                compression_manager)
+
+    def _build_secondary_managers(
+        self, has_separate_one_model_draft: bool, original_max_seq_len: int,
+        estimating_kv_cache: bool, self_kv_cache_config: KvCacheConfig,
+        draft_kv_cache_config: Optional[KvCacheConfig],
+        cross_kv_cache_config: Optional[KvCacheConfig],
+        cold_page_codec_provider: Optional[object],
+        early_donor: Optional["RemoteMemDonor"]
+    ) -> tuple[Optional["BaseResourceManager"],
+               Optional["BaseResourceManager"]]:
+        """The one-model draft and encoder-decoder cross managers built beside the target; the draft waits for
+        `early_donor`, the target's donation, before measuring host memory."""
         draft_kv_cache_manager = None
         draft_build_kv_cache_config = (draft_kv_cache_config
                                        if draft_kv_cache_config is not None else
@@ -3744,24 +3843,42 @@ class KvCacheCreator:
                 original_max_seq_len,
                 estimating_kv_cache,
                 kv_cache_config_override=draft_build_kv_cache_config,
-                cold_page_codec_provider=cold_page_codec_provider)
+                cold_page_codec_provider=cold_page_codec_provider,
+                remote_donor=early_donor)
 
         # Encoder-decoder cross-attention pool
         cross_kv_cache_manager = None
         if cross_kv_cache_config is not None:
+            if early_donor is not None:
+                # Without the estimation, the target started its donation in the background. The cross manager
+                # does not own it (it gets no remote config) but sizes its automatic host tier from free host
+                # memory, so measure with the donation placed.
+                early_donor.wait_started()
             cross_kv_cache_manager = self._create_cross_kv_cache_manager(
                 cross_kv_cache_config, estimating_kv_cache,
                 original_max_seq_len)
+        return draft_kv_cache_manager, cross_kv_cache_manager
 
-        resources[ResourceManagerType.KV_CACHE_MANAGER] = kv_cache_manager
-        resources[
-            ResourceManagerType.DRAFT_KV_CACHE_MANAGER] = draft_kv_cache_manager
-        resources[
-            ResourceManagerType.CROSS_KV_CACHE_MANAGER] = cross_kv_cache_manager
-        if (compression_manager is not None
-                and compression_manager.uses_iteration_lifecycle):
-            resources[ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER] = (
-                compression_manager)
+    def _start_remote_donation(self) -> None:
+        """Start this rank's donation for the final target manager, once, and wait until it is placed or failed."""
+        remote_config = self._kv_cache_config.remote_cache_config
+        if (remote_config is None or remote_config.donor is None
+                or self._remote_donor is not None):
+            return
+        from .kv_cache.remote_donor import start_donation
+        self._remote_donor = start_donation(remote_config,
+                                            torch.cuda.current_device())
+        # Placed before the estimation probe and its warmup take host memory, which would leave the donation short.
+        self._remote_donor.wait_started()
+
+    def close_remote_donor(self, error: Optional[BaseException] = None) -> None:
+        """Withdraw a donation that no manager took over, leaving its failure marker when `error` is given. With `error`,
+        a donation already handed to the final target manager is withdrawn and marked too; its later close is a no-op."""
+        donor, self._remote_donor = self._remote_donor, None
+        if donor is None and error is not None:
+            donor, self._handed_remote_donor = self._handed_remote_donor, None
+        if donor is not None:
+            donor.close(error)
 
     def teardown_managers(self, resources: Dict) -> None:
         """Clean up KV caches for model, draft model, and cross pool."""
@@ -3890,6 +4007,7 @@ def _create_kv_cache_manager(
         max_cuda_graph_batch_size: Optional[int] = None,
         layer_specs: Optional[Sequence[KVCacheLayerSpec]] = None,
         shared_draft_block_width: Optional[int] = None,
+        remote_donor: Optional["RemoteMemDonor"] = None,
         gen_preemption_headroom: int = 0) -> KVCacheManager:
     """
     Returns:
@@ -4051,6 +4169,7 @@ def _create_kv_cache_manager(
         manager_extra_kwargs["layer_specs"] = layer_specs
         manager_extra_kwargs[
             "shared_draft_block_width"] = shared_draft_block_width
+        manager_extra_kwargs["remote_donor"] = remote_donor
         # Vocab size also enables multimodal event decoding and its per-block
         # digest scan. Leave it unset for text-only engines. Without an engine
         # (e.g. separate one-model draft caches), preserve config resolution:
@@ -4936,6 +5055,11 @@ def create_py_executor_resources(
             context_starvation_iterations=scheduler_config.
             context_starvation_iterations
             if scheduler_config is not None else None,
+            # Ranks that schedule the same requests in lock step cannot recover
+            # a remote cache level failure that only some of them saw.
+            recover_lost_kv_per_rank=not (
+                mapping.has_pp() or mapping.has_cp() or
+                (mapping.has_tp() and mapping.tp_group_shares_requests)),
         )
     elif (scheduler_config is not None
           and scheduler_config.use_python_scheduler):
@@ -5162,6 +5286,8 @@ def create_py_executor_instance(
         enable_kv_pool_rebalance,
         kv_pool_rebalance_check_interval=llm_args.kv_cache_config.
         kv_pool_rebalance_config.check_interval,
+        defer_generation_only_release=llm_args.kv_cache_config.
+        defer_generation_only_release,
         enable_adp_dummy_fixes=should_enable_adp_dummy_fixes(mapping),
         enable_scheduler_aware_adp_dummy=should_enable_scheduler_aware_adp_dummy(
             getattr(config, "model_type", None), mapping,

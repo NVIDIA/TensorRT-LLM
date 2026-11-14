@@ -278,7 +278,7 @@ def _populate_meta(mode, draft_len=1):
         prepare_penalty_buffers=lambda: None,
         prepare_watermark_buffers=lambda: None,
         watermark_ready=False,
-        _populate_request_rng_state=lambda requests, normalized: None,
+        _populate_request_rng_state=lambda requests, normalized, defer_rows=None: None,
         _populate_penalty_params=lambda requests: None,
         _populate_watermark_params=lambda requests: None,
     )

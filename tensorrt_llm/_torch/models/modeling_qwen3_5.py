@@ -694,6 +694,9 @@ class Qwen3_5MoeForCausalLM(Qwen3NextForCausalLM):
     class that serves the vanilla Qwen3NextForCausalLM architecture.
     """
 
+    prefill_kernels = True
+    decode_kernels = True
+
     @classmethod
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
         return _get_qwen35_moe_model_defaults(llm_args)
@@ -714,6 +717,8 @@ class Qwen3_5ForCausalLM(Qwen3NextForCausalLM):
     normalizer (Qwen35ConfigCompat) sets num_experts=0 so that
     Qwen3NextModel selects GatedMLP for the feed-forward layers.
     """
+
+    decode_kernels = True
 
     def __init__(self, model_config):
         keep_lm_head_quant = _lm_head_nvfp4_enabled(model_config)

@@ -23,8 +23,9 @@ l0_dgx_b300:
   # pre_merge). The GPU cases of kernels/parallel_hw_agnostic/, which do not depend on the
   # GPU architecture, run on H100 (pre_merge) and GB300 (post_merge). So of attention/,
   # this 4-GPU stage runs only multi_gpu/, whose cases need >= 2 GPUs;
-  # test_helix_zero_kv.py runs in this list's pre_merge block instead.
-  - unittest/_torch/attention/multi_gpu --ignore=unittest/_torch/attention/multi_gpu/test_helix_zero_kv.py
+  # test_helix_zero_kv.py runs in this list's pre_merge block instead, and
+  # test_gqa_kv_replica.py in l0_gb300's (same SM103 single-node CUDA-IPC exchange).
+  - unittest/_torch/attention/multi_gpu --ignore=unittest/_torch/attention/multi_gpu/test_helix_zero_kv.py --ignore=unittest/_torch/attention/multi_gpu/test_gqa_kv_replica.py
   - unittest/_torch/pyexecutor
   - unittest/_torch/disaggregation
   - unittest/_torch/modeling -k "modeling_llama"

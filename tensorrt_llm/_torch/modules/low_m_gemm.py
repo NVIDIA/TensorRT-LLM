@@ -3,7 +3,7 @@
 
 import functools
 import os
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -162,11 +162,16 @@ class _DirectGemmRunner(TunableRunner):
     inputs: ``[a [M,K] BF16, b_t [K,N] col-major BF16]``.
     """
 
-    def __init__(self, *, pdl: bool) -> None:
+    def __init__(self, *, pdl: bool, whole_bucket_tiles: bool = False) -> None:
         self.pdl = pdl
+        # Above the exact buckets, offer only 1-row tiles: a tactic timed at a coarse bucket's top must also serve
+        # every smaller row count of the bucket, or apply() falls back to cuBLAS where it does not.
+        self.whole_bucket_tiles = whole_bucket_tiles
 
     def unique_id(self) -> tuple:
-        return ("direct", bool(self.pdl))
+        return ("direct", bool(self.pdl)) + (
+            ("whole_bucket_tiles",) if self.whole_bucket_tiles else ()
+        )
 
     def is_tactic_compatible(
         self,
@@ -210,6 +215,8 @@ class _DirectGemmRunner(TunableRunner):
                 seen.setdefault(dataclasses.astuple(t), None)
         except ValueError:
             pass
+        if self.whole_bucket_tiles and m > _MAX_EXACT_DIRECT_M:
+            seen = dict.fromkeys((block, outputs, 1) for block, outputs, _ in seen)
         return list(seen)
 
     def forward(
@@ -460,15 +467,29 @@ class _WarpMmaFp8GemmRunner(TunableRunner):
 LOW_M_GEMM_ACTIVE = _parse_enabled()
 
 
-def _should_apply_low_m_gemm(input: torch.Tensor, module: Optional[torch.nn.Module] = None) -> bool:
-    """Fast pre-filter: the global enable flag (or a dispatcher attached to ``module``) and the M upper bound."""
-    if not LOW_M_GEMM_ACTIVE and getattr(module, "_low_m_gemm_dispatcher", None) is None:
+def low_m_gemm_takes_rows(module: Optional[torch.nn.Module], rows: int) -> bool:
+    """Whether a GEMM of ``rows`` rows takes the low-M path: the global enable flag (or a dispatcher attached to
+    ``module``) and the M upper bound (``_MAX_M``, or the module's own ceiling, ``LowMGemmDispatcher.limit_rows``)."""
+    dispatcher = getattr(module, "_low_m_gemm_dispatcher", None)
+    if not LOW_M_GEMM_ACTIVE and dispatcher is None:
         return False
     # The AutoTuner race is host code that torch.compile cannot trace.
+    if torch.compiler.is_compiling() or rows > _MAX_M:
+        return False
+    return dispatcher is None or dispatcher.takes_rows(module, rows)
+
+
+def _should_apply_low_m_gemm(input: torch.Tensor, module: Optional[torch.nn.Module] = None) -> bool:
+    """Fast pre-filter: :func:`low_m_gemm_takes_rows` for the rows of ``input``, after the enable flag (or a
+    dispatcher attached to ``module``) and the compile check, which cost no shape reads."""
+    if not LOW_M_GEMM_ACTIVE and getattr(module, "_low_m_gemm_dispatcher", None) is None:
+        return False
     if input.ndim < 1 or torch.compiler.is_compiling():
         return False
     k = int(input.shape[-1])
-    return k > 0 and input.numel() <= _MAX_M * k
+    if k <= 0:
+        return False
+    return low_m_gemm_takes_rows(module, input.numel() // k)
 
 
 class LowMGemmDispatcher:
@@ -490,6 +511,11 @@ class LowMGemmDispatcher:
        lazily on the first invocation.  The AutoTuner then profiles each
        (M-bucket, K, N) shape it encounters and caches the winner.
     """
+
+    # The direct kernel's coarse buckets offer only tactics that serve every row count of the bucket.
+    whole_bucket_direct_tiles: bool = False
+    # Per module: the most rows it takes on the low-M path (limit_rows); None: no limits.
+    _max_rows: Optional[Dict[torch.nn.Module, int]] = None
 
     def __init__(self) -> None:
         # _prepared: runners + TuningConfig have been created (set by _init_runners).
@@ -547,6 +573,10 @@ class LowMGemmDispatcher:
         if not LOW_M_GEMM_ACTIVE and not force:
             return
         for name, module in model.named_modules():
+            if getattr(module, "_low_m_gemm_dispatcher", None) is not None:
+                # A model that prepared its own dispatcher (e.g. Qwen3.5, with its row limits and tactics) keeps it:
+                # the loader's generic one must not replace it.
+                continue
             if module.__class__.__name__.endswith("Linear") or getattr(
                 module, LOW_M_GEMM_OPT_IN_ATTR, False
             ):
@@ -571,7 +601,7 @@ class LowMGemmDispatcher:
         self._runner_no_bias = _SplitKGemmRunner(has_bias=False, pdl=pdl)
         self._runner_with_bias = _SplitKGemmRunner(has_bias=True, pdl=pdl)
         # Direct SIMT runner: no-bias only; wins for M=1 with narrow N on K=8192.
-        self._direct = _DirectGemmRunner(pdl=pdl)
+        self._direct = _DirectGemmRunner(pdl=pdl, whole_bucket_tiles=self.whole_bucket_direct_tiles)
         self._warp_mma = _WarpMmaGemmRunner()
         # cuBLAS runners — always included as competitors so the AutoTuner can
         # fall back to cuBLAS for shapes where neither custom kernel is fastest.
@@ -616,6 +646,18 @@ class LowMGemmDispatcher:
             "Low-M BF16 GEMM dispatcher initialised "
             "(split-K tensor-core + SIMT direct vs cuBLAS AutoTuner; best kernel per shape)."
         )
+
+    def limit_rows(self, module: torch.nn.Module, max_rows: int) -> None:
+        """Keep ``module`` off the low-M path above ``max_rows`` rows."""
+        if self._max_rows is None:
+            self._max_rows = {}
+        self._max_rows[module] = max_rows
+
+    def takes_rows(self, module: torch.nn.Module, rows: int) -> bool:
+        """Whether ``module`` takes the low-M path at ``rows`` rows under its ``limit_rows`` ceiling."""
+        if self._max_rows is None:
+            return True
+        return rows <= self._max_rows.get(module, _MAX_M)
 
     def prepare(
         self,
@@ -906,6 +948,7 @@ def prepare_low_m_gemm(
     model: torch.nn.Module,
     force: bool = False,
     per_rank_tuning: bool = False,
+    whole_bucket_direct_tiles: bool = False,
 ) -> LowMGemmDispatcher:
     """Create a per-engine dispatcher and attach it to every eligible submodule.
 
@@ -926,12 +969,15 @@ def prepare_low_m_gemm(
             LLM arg).
         per_rank_tuning: Tune each rank on its own (attention DP: the ranks'
             projections see different token counts).
+        whole_bucket_direct_tiles: Race the direct kernel at the coarse M
+            buckets only with tactics that serve every row count of the bucket.
 
     Returns:
         The newly created :class:`LowMGemmDispatcher` for this engine.
     """
     dispatcher = LowMGemmDispatcher()
     dispatcher.per_rank_tuning = per_rank_tuning
+    dispatcher.whole_bucket_direct_tiles = whole_bucket_direct_tiles
     dispatcher.attach(model, force=force)
     return dispatcher
 

@@ -5427,7 +5427,11 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
                           extra_acc_spec=extra_acc_spec,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
-    def _run_bf16_mtp(self, mocker, acceptance_key):
+    def _run_bf16_mtp(self,
+                      mocker,
+                      acceptance_key,
+                      tp_size=1,
+                      attention_dp=False):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
                                         enable_block_reuse=False)
         cuda_graph_config = CudaGraphConfig(enable_padding=True,
@@ -5437,8 +5441,9 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
 
         with LLM(self.MODEL_PATH,
                  trust_remote_code=True,
-                 tensor_parallel_size=1,
+                 tensor_parallel_size=tp_size,
                  moe_expert_parallel_size=1,
+                 enable_attention_dp=attention_dp,
                  max_seq_len=4096,
                  max_batch_size=32,
                  enable_chunked_prefill=True,
@@ -5456,6 +5461,19 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
 
     def test_bf16_mtp(self, mocker):
         self._run_bf16_mtp(mocker, "TestQwen3_5_35B_A3B::test_bf16_mtp")
+
+    @pytest.mark.skip_less_device(2)
+    def test_bf16_mtp_adp2(self, mocker):
+        """MTP under attention DP across mixed and generation-only ranks.
+
+        One rank's new prompts meet the other's generation-only steps, and
+        both ranks' draft MoE collectives must agree on their sizes (rows
+        mixed up across ranks show as a lower acceptance length).
+        """
+        self._run_bf16_mtp(mocker,
+                           "TestQwen3_5_35B_A3B::test_bf16_mtp_adp2",
+                           tp_size=2,
+                           attention_dp=True)
 
     def test_bf16_mtp_flashinfer_ring_replay(self, mocker, monkeypatch):
         """Same as test_bf16_mtp with GDN replay on the FlashInfer ring kernel."""

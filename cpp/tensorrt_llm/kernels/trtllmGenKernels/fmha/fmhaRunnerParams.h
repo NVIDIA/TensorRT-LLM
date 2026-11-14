@@ -387,6 +387,9 @@ struct TllmGenFmhaRunnerParams
     bool mFp16Softmax{false};
     // Whether the kernel consumes 2:4 structured-sparse (compressed) inputs (Rubin FMHA feature).
     bool mUsesSpcompress{false};
+    // Head dimension per K/V shared-memory stage; 0 lets the autotuner choose. A caller-chosen value is kept; its
+    // kernel comes from the stage-KV cubin table (kernelMetaInfoStageKv.h) when one matches, else from NVRTC.
+    int mHeadDimPerStageKv{0};
 
     // set the attention mask type
     TllmGenFmhaRunnerParams& setAttentionMaskType(std::int8_t maskType)

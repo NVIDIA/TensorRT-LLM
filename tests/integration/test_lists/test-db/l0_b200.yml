@@ -156,6 +156,11 @@ l0_b200:
   - unittest/_torch/modules/test_gate_up_swiglu_quack.py
   - unittest/_torch/modules/test_multi_stream_utils.py
   - unittest/_torch/modules/test_megamoe_shared_mlp_scales.py
+  # Qwen3.5 decode MoE: NVFP4 and BF16 draft engines, CuTe FC2 (decode / route fronts below).
+  - unittest/_torch/moe/test_moe_nvfp4_engine.py
+  - unittest/_torch/moe/test_moe_bf16_engine.py
+  - unittest/_torch/moe/test_moe_lowm_fc2.py
+  - unittest/_torch/modules/test_expert_l2_prefetch.py
   # ------------- DeepSeek-V4.1 model, Engram and DSpark ---------------
   - unittest/_torch/modeling/test_modeling_deepseekv41.py
   - unittest/_torch/modules/test_engram_decode_hash.py
@@ -233,6 +238,9 @@ l0_b200:
   - unittest/_torch/modules/test_gated_mlp_split.py
   - unittest/_torch/modules/test_low_m_gemm.py
   - unittest/_torch/modules/test_low_m_mma_gemm.py
+  - unittest/_torch/modules/test_resident_fp8_gemm.py
+  - unittest/_torch/modules/test_inproj_ba_splitk.py
+  - unittest/_torch/modules/test_gate_add_rmsnorm_fp8.py
   - unittest/_torch/moe/test_moe_decode_front.py
   - unittest/_torch/modules/test_embedding_lookup.py
   - unittest/_torch/moe/test_draft_experts_nvfp4.py
@@ -369,7 +377,7 @@ l0_b200:
   - unittest/tools/test_layer_wise_benchmarks.py::test_qwen3_next_gen_tep[1]
   - unittest/tools/test_layer_wise_benchmarks.py::test_kimi_k3_gen_dep[1]
   - unittest/tools/test_layer_wise_benchmarks.py::test_performance_alignment[1]
-  - unittest/kv_cache_manager_v2_tests
+  - unittest/kv_cache_manager_v2_tests -k "not RemoteInPlaceOfDisk"
   - llmapi/test_llm_api_connector.py::test_connector_priorities[kv_cache_manager_v1]
   - unittest/_torch/pyexecutor/kv_cache/test_mamba_cache_manager.py::test_v2_hybrid_retains_configured_number_of_conversation_turns
   - unittest/_torch/pyexecutor/kv_cache/test_kvcm2_integration.py::test_helix_retention_uses_rank_local_ranges

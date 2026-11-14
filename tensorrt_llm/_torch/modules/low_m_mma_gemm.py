@@ -10,15 +10,24 @@ tactic that race picked.
 from __future__ import annotations
 
 import functools
-from typing import List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
 import torch
 
 from ..._utils import is_blackwell_datacenter
+from ..autotuner import (
+    AutoTuner,
+    DistributedTuningStrategy,
+    DynamicTensorSpec,
+    TunableRunner,
+    TuningConfig,
+)
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE, graph_safe_cute_tensor
 from ..flashinfer_utils import get_env_enable_pdl
 
 _NUM_SMS_DEFAULT = 148
+# SM100/SM103 opt-in shared memory per block; stands in for the device without CUDA (CPU-only test collection).
+_MAX_SMEM_BYTES_DEFAULT = 232448
 
 # Most rows of one launch.
 MAX_M = 32
@@ -35,6 +44,22 @@ def _num_sms() -> int:
     if not torch.cuda.is_available():
         return _NUM_SMS_DEFAULT
     return torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+
+
+@functools.lru_cache(maxsize=None)
+def _max_smem_bytes() -> int:
+    """A block's opt-in shared memory on the current device (no tactic fits without one)."""
+    if not torch.cuda.is_available():
+        return _MAX_SMEM_BYTES_DEFAULT
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    return props.shared_memory_per_block_optin
+
+
+def _smem_fits(m: int, k_warps: int, n_tiles: int, ksplit: int) -> bool:
+    """Whether the kernel's shared memory for ``m`` rows fits a block; mirrors ``LowMMmaGemmKernel.__call__``
+    ((k_warps [+ 1 with a K split]) x 16-row tiles x columns per CTA x 4 B)."""
+    row_tiles = -(-m // 16)
+    return (k_warps + (ksplit > 1)) * row_tiles * 16 * 8 * n_tiles * 4 <= _max_smem_bytes()
 
 
 Tactic = Tuple[int, int, int, int, int]  # (k_warps, n_tiles, ksplit, swap_ab, min_blocks)
@@ -80,7 +105,7 @@ def default_tactic(m: int, n: int, k: int, fp8: bool = True, even_tiles: bool = 
             continue
         ctas = n // (8 * n_tiles)
         for k_warps in (1, 2, 4, 8, 16):
-            if chunks % k_warps:
+            if chunks % k_warps or not _smem_fits(m, k_warps, n_tiles, 1):
                 continue
             per_warp = chunks // k_warps
             if per_warp * n_tiles * per_chunk > lane_budget:
@@ -92,6 +117,20 @@ def default_tactic(m: int, n: int, k: int, fp8: bool = True, even_tiles: bool = 
     if best is None:
         raise ValueError(f"no low-M tactic for N={n}, K={k}")
     return best[1]
+
+
+def tactic_fits(n: int, k: int, tactic: Tactic, even_tiles: bool = False, m: int = 1) -> bool:
+    """Whether ``tactic`` (k_warps, n_tiles[, ksplit[, ...]]) tiles an ``m x n x k`` launch (n = weight rows): K in
+    whole 64-wide chunks per warp and split (the kernel's K check), N in whole 8-row tiles per CTA, an even n_tiles for
+    a SwiGLU segment, and the shared memory of ``m`` rows within a block's."""
+    k_warps, n_tiles = tactic[0], tactic[1]
+    ksplit = tactic[2] if len(tactic) > 2 else 1
+    return (
+        k % (64 * k_warps * ksplit) == 0
+        and n % (8 * n_tiles) == 0
+        and not (even_tiles and n_tiles % 2)
+        and _smem_fits(m, k_warps, n_tiles, ksplit)
+    )
 
 
 def candidate_tactics(m: int, n: int, k: int, fp8: bool) -> List[Tactic]:
@@ -196,8 +235,9 @@ def _compiled(
     import cuda.bindings.driver as cuda
     import cutlass.cute as cute
 
-    from ..kernels.blackwell.low_m_mma_gemm import LowMMmaGemmKernel
+    from ..kernels.blackwell.low_m_mma_gemm import MAX_ROWS, LowMMmaGemmKernel
 
+    assert SHARED_EXPERT_MAX_M <= MAX_ROWS
     kernel = LowMMmaGemmKernel(
         num_rows=m,
         k_extent=k,
@@ -555,14 +595,161 @@ def fused_shared_expert(
     return out, gate_logits
 
 
+# Most rows of the shared expert's raced two-launch path: the kernel's row bound
+# (kernels/blackwell/low_m_mma_gemm.MAX_ROWS, checked where the kernel is built).
+SHARED_EXPERT_MAX_M = 128
+_SHARED_EXPERT_BUCKETS = (1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64, SHARED_EXPERT_MAX_M)
+
+
+def _shared_expert_bucket(m: int) -> int:
+    return next((b for b in _SHARED_EXPERT_BUCKETS if b >= m), SHARED_EXPERT_MAX_M)
+
+
+def _shared_expert_tuning_config() -> TuningConfig:
+    return TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=0,
+                dim_idx=0,
+                gen_tuning_buckets=_SHARED_EXPERT_BUCKETS,
+                map_to_tuning_buckets=_shared_expert_bucket,
+            ),
+        ),
+        use_cold_l2_cache=True,
+        use_cuda_graph=True,
+        # The ranks split the race and all run its winner, as the low-M GEMM race.
+        distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL,
+    )
+
+
+def _shared_expert_tactics(m: int, n: int, k: int, swiglu: bool) -> List[Tactic]:
+    """The low-M race's warp-MMA candidates for an ``m x n x k`` launch of the shared expert, with whole (gate, up)
+    tile pairs per CTA for the SwiGLU launch; only tactics that fit this shard and row count."""
+    out = {}
+    for t in candidate_tactics(min(m, MAX_M), n, k, fp8=True):
+        k_warps, n_tiles, ksplit, swap, min_blocks = t
+        if swiglu and n_tiles % 2:
+            n_tiles *= 2
+        if m > 8:
+            swap = 0
+        t = (k_warps, n_tiles, ksplit, swap, min_blocks)
+        if tactic_fits(n, k, t, even_tiles=swiglu, m=m):
+            out[t] = None
+    return list(out)
+
+
+class _SharedExpertLaunchRunner(TunableRunner):
+    """AutoTuner runner of one launch of ``raced_shared_expert``: the SwiGLU gate_up launch (inputs [x [M, K] BF16,
+    paired gate_up weight, gate rows, weight scale, input scale, down's input scale]) or the down launch (inputs
+    [E4M3 hidden [M, I], weight, weight scale, input scale]). Tactics: ``_shared_expert_tactics``."""
+
+    def __init__(self, swiglu: bool) -> None:
+        self.swiglu = swiglu
+
+    def unique_id(self) -> Tuple[str]:
+        return ("shared_expert_swiglu" if self.swiglu else "shared_expert_down",)
+
+    def get_valid_tactics(
+        self, inputs: List[torch.Tensor], profile: Any, **kwargs: Any
+    ) -> List[Any]:
+        x, w = inputs[0], inputs[1]
+        if not warp_mma_supported():
+            return []
+        return _shared_expert_tactics(
+            int(x.shape[0]), int(w.shape[0]), int(x.shape[1]), self.swiglu
+        )
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        *,
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        x, w = inputs[0], inputs[1]
+        m, k = int(x.shape[0]), int(x.shape[1])
+        if tactic == -1:
+            tactic = default_tactic(m, int(w.shape[0]), k, True, self.swiglu)
+        if self.swiglu:
+            _, gate_rows, weight_scale, input_scale, out_scale = inputs[1:]
+            inter = w.shape[0] // 2
+            return low_m_mma_gemm(
+                x16=x,
+                w_fp8=w,
+                weight_scale=weight_scale,
+                input_scale=input_scale,
+                swiglu_fp8=True,
+                w_bf16=gate_rows,
+                split_out=inter,
+                n_valid=inter + 1,
+                out_scale=out_scale,
+                out_dtype=torch.bfloat16,
+                tactic=tuple(tactic),
+            )
+        weight_scale, input_scale = inputs[2], inputs[3]
+        return low_m_mma_gemm(
+            x8=x,
+            w_fp8=w,
+            weight_scale=weight_scale,
+            input_scale=input_scale,
+            fp8_act="fp8",
+            out_dtype=torch.bfloat16,
+            tactic=tuple(tactic),
+        )
+
+
+def raced_shared_expert(
+    x: torch.Tensor,
+    weights: Tuple[torch.Tensor, torch.Tensor],
+    *,
+    gate_up_weight_scale: torch.Tensor,
+    gate_up_input_scale: torch.Tensor,
+    down_weight: torch.Tensor,
+    down_weight_scale: torch.Tensor,
+    down_input_scale: torch.Tensor,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """``fused_shared_expert``'s two launches for 1-``SHARED_EXPERT_MAX_M`` rows, each on the tactic of its own
+    AutoTuner race among the warp-MMA candidates (no cuBLAS fallback, so the fused path always runs). Tuning
+    mode times the races over every row bucket; a call of more rows than the kernel takes returns None."""
+    tuner = AutoTuner.get()
+    if x.shape[0] > SHARED_EXPERT_MAX_M and not tuner.is_tuning_mode:
+        return None
+    config = _shared_expert_tuning_config()
+    pairs, gate_rows = weights
+    x_in = x[:SHARED_EXPERT_MAX_M]
+    runner, tactic = tuner.choose_one(
+        "trtllm::low_m_shared_expert_swiglu",
+        [_SharedExpertLaunchRunner(swiglu=True)],
+        config,
+        [x_in, pairs, gate_rows, gate_up_weight_scale, gate_up_input_scale, down_input_scale],
+    )
+    hidden, gate_logits = runner(
+        [x_in, pairs, gate_rows, gate_up_weight_scale, gate_up_input_scale, down_input_scale],
+        tactic=tactic,
+    )
+    runner, tactic = tuner.choose_one(
+        "trtllm::low_m_shared_expert_down",
+        [_SharedExpertLaunchRunner(swiglu=False)],
+        config,
+        [hidden, down_weight, down_weight_scale, down_input_scale],
+    )
+    out = runner([hidden, down_weight, down_weight_scale, down_input_scale], tactic=tactic)
+    if x_in.shape[0] != x.shape[0]:
+        return None
+    return out, gate_logits
+
+
 __all__ = [
     "MAX_M",
+    "SHARED_EXPERT_MAX_M",
     "candidate_tactics",
     "conv_supported",
     "default_tactic",
     "fused_shared_expert",
     "fused_shared_expert_weights",
     "low_m_mma_gemm",
+    "raced_shared_expert",
     "swiglu_pairs",
     "warp_mma_supported",
 ]

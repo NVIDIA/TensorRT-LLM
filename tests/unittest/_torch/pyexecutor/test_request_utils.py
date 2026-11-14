@@ -942,7 +942,16 @@ class _SingleRoundDist:
     back on the root, ``received`` stands for what a non-root rank gets.
     """
 
-    def __init__(self, rank, *, world_size=2, has_pp=False, supports=True, received=None):
+    def __init__(
+        self,
+        rank,
+        *,
+        world_size=2,
+        has_pp=False,
+        supports=True,
+        received=None,
+        received_header=None,
+    ):
         self.rank = rank
         self.world_size = world_size
         self.tp_size = world_size
@@ -955,7 +964,10 @@ class _SingleRoundDist:
         self.is_last_pp_rank = True
         self.supports_single_round_broadcast = supports
         self._received = received
+        self._received_header = received_header
         self.calls = []
+        # Collectives the single-round transport spends: the size word, plus the payload when there is one.
+        self.collectives = 0
 
     def tp_cp_broadcast(self, obj, root=0, **kwargs):
         self.calls.append(("tp_cp_broadcast", obj))
@@ -969,7 +981,15 @@ class _SingleRoundDist:
 
     def broadcast_or_none(self, obj, root=0):
         self.calls.append(("broadcast_or_none", obj))
-        return obj if self.rank == root else self._received
+        received = obj if self.rank == root else self._received
+        self.collectives += 1 + (received is not None)
+        return received
+
+    def broadcast_or_none_with_header(self, obj, header, root=0):
+        self.calls.append(("broadcast_or_none_with_header", obj, list(header)))
+        received = obj if self.rank == root else self._received
+        self.collectives += 1 + (received is not None)
+        return (list(header) if self.rank == root else self._received_header), received
 
     def broadcast(self, obj, root=0, prefer_cpu=False):
         self.calls.append(("broadcast", obj, prefer_cpu))
@@ -1022,6 +1042,46 @@ def test_single_round_non_root_receives_payload_or_nothing():
 
     dist = _SingleRoundDist(rank=1, received=None)
     assert RequestBroadcaster(dist, MagicMock()).broadcast([]) == []
+
+
+def test_single_round_with_a_synchronized_clock_keeps_one_collective_per_empty_iteration():
+    """waiting_queue_max_wait_s (sync_clock) on a single-round transport: rank 0's clock and aux ride in the size
+    word's header, so an empty iteration still costs one collective and one with requests two."""
+    dist = _SingleRoundDist(rank=0)
+    broadcaster = RequestBroadcaster(dist, MagicMock(), sync_clock=True)
+    broadcaster.aux = 0.25
+    with patch("tensorrt_llm._torch.pyexecutor.request_utils.time.monotonic", return_value=12.5):
+        assert broadcaster.broadcast([]) == []
+    assert dist.collectives == 1
+    assert dist.calls == [("broadcast_or_none_with_header", None, [12_500_000, 250_000])]
+    assert (broadcaster.rank0_now, broadcaster.rank0_aux) == (12.5, 0.25)
+
+    items = [_make_broadcast_item(3)]
+    assert broadcaster.broadcast(items) == items
+    assert dist.collectives == 3
+
+    # A non-root rank reads the clock from the header, with or without requests.
+    peer = _SingleRoundDist(rank=1, received=None, received_header=[7_000_000, -1])
+    broadcaster = RequestBroadcaster(peer, MagicMock(), sync_clock=True)
+    assert broadcaster.broadcast([]) == []
+    assert (broadcaster.rank0_now, broadcaster.rank0_aux, peer.collectives) == (7.0, None, 1)
+
+
+def test_the_generic_header_broadcast_rides_with_the_payload_flag():
+    """Transports without a single round send the header with the "anything?" flag: no extra round."""
+    from tensorrt_llm._torch.distributed.communicator import Distributed
+
+    calls = []
+    fake = SimpleNamespace(
+        broadcast_int64=lambda values, root=0: calls.append(("int64", list(values)))
+        or np.asarray(values),
+        broadcast=lambda obj, root=0: calls.append(("object", obj)) or obj,
+    )
+    assert Distributed.broadcast_or_none_with_header(fake, None, [5, -1]) == ([5, -1], None)
+    assert calls == [("int64", [0, 5, -1])]
+    calls.clear()
+    assert Distributed.broadcast_or_none_with_header(fake, ["r"], [6, 2]) == ([6, 2], ["r"])
+    assert calls == [("int64", [1, 6, 2]), ("object", ["r"])]
 
 
 @pytest.mark.parametrize(
@@ -1687,7 +1747,7 @@ def test_executor_request_to_llm_request_adopts_return_routed_experts() -> None:
 
 class TestBroadcasterClock:
     """RequestBroadcaster(sync_clock=True): rank 0's clock and aux ride along
-    with the request count."""
+    with the request count, or in the single-round envelope."""
 
     def _dist(self, rank, world_size=2):
         dist = Mock()
@@ -1712,17 +1772,39 @@ class TestBroadcasterClock:
         assert list(values) == [0]
         assert b.rank0_now is None
 
-    def test_sync_clock_keeps_the_count_probe(self):
-        """The single-round broadcast has no room for the clock."""
-        for sync_clock, probes in ((False, 0), (True, 1)):
+    def test_sync_clock_rides_the_single_round(self):
+        """With the single-round transport, the clock and aux travel in the size word's header: one call, no count
+        probe, and no payload on an empty iteration."""
+        items = [_make_broadcast_item(3)]
+        for received, want in (
+            (([1_000_000, 170_000], None), []),
+            (([2_000_000, -1], items), items),
+        ):
             dist = self._dist(rank=1)
             dist.supports_single_round_broadcast = True
-            dist.broadcast_or_none = Mock(return_value=None)
-            dist.broadcast_int64 = Mock(return_value=[0, 1_000_000, -1])
-            b = RequestBroadcaster(dist, self._hang_detector(), sync_clock=sync_clock)
-            assert b.broadcast([]) == []
-            assert dist.broadcast_int64.call_count == probes
-            assert dist.broadcast_or_none.call_count == 1 - probes
+            dist.broadcast_or_none_with_header = Mock(return_value=received)
+            dist.broadcast_int64 = Mock()
+            b = RequestBroadcaster(dist, self._hang_detector(), sync_clock=True)
+            b.aux = 9.0  # ignored off rank 0
+            assert b.broadcast([]) == want
+            dist.broadcast_int64.assert_not_called()
+            assert dist.broadcast_or_none_with_header.call_count == 1
+            assert dist.broadcast_or_none_with_header.call_args.args[0] is None
+            header = received[0]
+            assert b.rank0_now == pytest.approx(header[0] / 1e6)
+            assert b.rank0_aux == (None if header[1] < 0 else pytest.approx(0.17))
+
+    def test_sync_clock_single_round_root_sends_clock_every_iteration(self):
+        items = [_make_broadcast_item(1)]
+        for new_requests, payload in (([], None), (items, items)):
+            dist = _SingleRoundDist(rank=0)
+            b = RequestBroadcaster(dist, MagicMock(), sync_clock=True)
+            b.aux = 0.25
+            assert b.broadcast(new_requests) == new_requests
+            assert len(dist.calls) == 1
+            kind, sent, (now_us, aux_us) = dist.calls[0]
+            assert kind == "broadcast_or_none_with_header" and aux_us == 250_000 and sent == payload
+            assert b.rank0_now == pytest.approx(now_us / 1e6) and b.rank0_aux == pytest.approx(0.25)
 
     def test_default_probe_pp_forwards_count(self):
         dist = self._dist(rank=4, world_size=8)

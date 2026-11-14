@@ -46,6 +46,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _swa_endpoint_priority,
     _sync_kv_cache_manager_init_status,
     _update_kv_cache_draft_token_location,
+    _withdraws_remote_donation_on_error,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.regions import RegionLayout
 from tensorrt_llm._torch.pyexecutor.kv_cache.sparse_offload_memory import (
@@ -419,6 +420,8 @@ def _make_manager_for_cache_tier_test(
     vocab_size: int | None = 16,
     dtype: DataType = DataType.HALF,
     layer_specs: list[KVCacheLayerSpec] | None = None,
+    remote_donor: object | None = None,
+    manager_cls: type = KVCacheManagerV2,
 ) -> tuple[KVCacheManagerV2, Mock]:
     impl_constructor = Mock(side_effect=impl_side_effect)
     if mapping is None:
@@ -469,7 +472,7 @@ def _make_manager_for_cache_tier_test(
         patch.object(KVCacheManagerV2, "_log_kv_cache_pool_lifecycle_mapping"),
         patch(f"{module}.get_pp_layers", return_value=([0], 1)),
     ):
-        manager = KVCacheManagerV2(
+        manager = manager_cls(
             kv_cache_config,
             CacheType.SELFKONLY,
             num_layers=1,
@@ -488,6 +491,7 @@ def _make_manager_for_cache_tier_test(
             vocab_size=vocab_size,
             execution_stream=Mock(),
             cold_page_codec_provider=cold_page_codec_provider,
+            remote_donor=remote_donor,
         )
     return manager, impl_constructor
 
@@ -1889,6 +1893,325 @@ def test_peer_init_failure_discards_local_candidate() -> None:
         )
 
     local_impl.shutdown.assert_called_once_with()
+
+
+class TestRemoteTierInitStatus:
+    """A remote tier's failure on one rank goes through the cross-rank init status, and the donation is withdrawn.
+
+    Without the sync, the rank raises alone and its peers wait in the first collective.
+    """
+
+    module = "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2"
+
+    @staticmethod
+    def _config(tmp_path, **remote) -> KvCacheConfig:
+        return KvCacheConfig(
+            max_gpu_total_bytes=16 << 20,
+            host_cache_size=0,
+            remote_cache_config={"directory": str(tmp_path), **remote},
+        )
+
+    @staticmethod
+    def _starting_donor(error=None):
+        """An _add_remote_level that starts a donor, then raises `error` if given."""
+        donor = Mock()
+
+        def add_remote_level(self, remote_config, cache_tiers):
+            self._remote_donor = donor
+            if error is not None:
+                raise error
+
+        return donor, add_remote_level
+
+    @pytest.mark.cpu_only
+    def test_the_manager_waits_for_its_donation_once_its_claims_are_done(self, tmp_path) -> None:
+        """Without the estimation the target starts the donation itself: it is placed before warmup and capture."""
+        donor, add_remote_level = self._starting_donor()
+        with (
+            patch.object(KVCacheManagerV2, "_add_remote_level", add_remote_level),
+            patch(
+                f"{self.module}._sync_kv_cache_manager_init_status",
+                side_effect=lambda status, mapping: status,
+            ),
+        ):
+            manager, _ = _make_manager_for_cache_tier_test(
+                self._config(tmp_path, donor={"size": 1 << 30}), [Mock()]
+            )
+        donor.wait_started.assert_called_once_with()
+        donor.close.assert_not_called()
+        assert manager.remote_donor is donor
+
+    @pytest.mark.cpu_only
+    def test_local_failure_aborts_every_rank_and_closes_the_donor(self, tmp_path) -> None:
+        donor, add_remote_level = self._starting_donor(RuntimeError("capacity check failed"))
+        with (
+            patch.object(KVCacheManagerV2, "_add_remote_level", add_remote_level),
+            patch(
+                f"{self.module}._sync_kv_cache_manager_init_status",
+                side_effect=lambda status, mapping: status,
+            ) as sync,
+            pytest.raises(RuntimeError, match="capacity check failed"),
+        ):
+            _make_manager_for_cache_tier_test(
+                self._config(tmp_path, level={"size": 1 << 30}, donor={"size": 1 << 30}), [Mock()]
+            )
+        assert sync.call_args.args[0] == _KVCacheManagerInitStatus.ABORT
+        # Closed with the error, which leaves the donation's failure marker for the peers.
+        assert str(donor.close.call_args.args[0]) == "capacity check failed"
+
+    @pytest.mark.cpu_only
+    def test_peer_failure_discards_the_cache_and_closes_the_donor(self, tmp_path) -> None:
+        donor, add_remote_level = self._starting_donor()
+        local_impl = Mock()
+        with (
+            patch.object(KVCacheManagerV2, "_add_remote_level", add_remote_level),
+            patch(
+                f"{self.module}._sync_kv_cache_manager_init_status",
+                return_value=_KVCacheManagerInitStatus.ABORT,
+            ) as sync,
+            pytest.raises(RuntimeError, match="failed on another rank"),
+        ):
+            _make_manager_for_cache_tier_test(
+                self._config(tmp_path, donor={"size": 1 << 30}), [local_impl]
+            )
+        assert sync.call_args.args[0] == _KVCacheManagerInitStatus.OK
+        local_impl.shutdown.assert_called_once_with()
+        donor.close.assert_called_once()
+        assert "another rank" in str(donor.close.call_args.args[0])
+
+    @pytest.mark.cpu_only
+    def test_donation_without_host_memory_left_aborts_through_the_sync(self, tmp_path) -> None:
+        config = KvCacheConfig(
+            max_gpu_total_bytes=16 << 20,
+            remote_cache_config={"directory": str(tmp_path), "donor": {"size": 1 << 50}},
+        )
+        add_remote_level = Mock()
+        with (
+            patch.object(KVCacheManagerV2, "_add_remote_level", add_remote_level),
+            patch(
+                f"{self.module}._sync_kv_cache_manager_init_status",
+                side_effect=lambda status, mapping: status,
+            ) as sync,
+            pytest.raises(ValueError, match="host_cache_size"),
+        ):
+            _make_manager_for_cache_tier_test(config, [Mock()])
+        assert sync.call_args.args[0] == _KVCacheManagerInitStatus.ABORT
+        add_remote_level.assert_not_called()
+        # The donation never started, yet its failure marker counts it as reported for the peers.
+        assert [p.name.endswith(".failed") for p in tmp_path.iterdir()] == [True]
+
+    @pytest.mark.cpu_only
+    def test_an_unstarted_donation_is_marked_before_the_sync(self, tmp_path) -> None:
+        """Peers waiting in check_remote_capacity for this donor stop at once only if the marker precedes the
+        init-status collective, which waits for them."""
+        config = KvCacheConfig(
+            max_gpu_total_bytes=16 << 20,
+            remote_cache_config={"directory": str(tmp_path), "donor": {"size": 1 << 50}},
+        )
+        markers_at_sync = []
+
+        def sync(status, mapping):
+            markers_at_sync.append(sorted(p.suffix for p in tmp_path.iterdir()))
+            return status
+
+        with (
+            patch.object(KVCacheManagerV2, "_add_remote_level", Mock()),
+            patch(f"{self.module}._sync_kv_cache_manager_init_status", side_effect=sync),
+            pytest.raises(ValueError, match="host_cache_size"),
+        ):
+            _make_manager_for_cache_tier_test(config, [Mock()])
+        assert markers_at_sync == [[".failed"]]
+        # One marker, not a second one from the construction guard.
+        assert len(list(tmp_path.iterdir())) == 1
+
+    @pytest.mark.cpu_only
+    def test_a_remote_setup_failure_before_the_donation_is_marked_before_the_sync(
+        self, tmp_path
+    ) -> None:
+        markers_at_sync = []
+
+        def sync(status, mapping):
+            markers_at_sync.append(sorted(p.suffix for p in tmp_path.iterdir()))
+            return status
+
+        with (
+            patch.object(
+                KVCacheManagerV2,
+                "_add_remote_level",
+                Mock(side_effect=ValueError("UCX devices: unknown token")),
+            ),
+            patch(f"{self.module}._sync_kv_cache_manager_init_status", side_effect=sync),
+            pytest.raises(ValueError, match="unknown token"),
+        ):
+            _make_manager_for_cache_tier_test(
+                self._config(tmp_path, level={"size": 1 << 30}, donor={"size": 1 << 30}), [Mock()]
+            )
+        assert markers_at_sync == [[".failed"]]
+        assert "unknown token" in (next(tmp_path.iterdir())).read_text()
+
+    @pytest.mark.cpu_only
+    def test_failure_after_the_sync_withdraws_the_donation(self, tmp_path) -> None:
+        donor, add_remote_level = self._starting_donor()
+        with (
+            patch.object(KVCacheManagerV2, "_add_remote_level", add_remote_level),
+            patch(
+                f"{self.module}._sync_kv_cache_manager_init_status",
+                side_effect=lambda status, mapping: status,
+            ),
+            patch.object(
+                KVCacheManagerV2, "_reserve_guard_page", side_effect=RuntimeError("late failure")
+            ),
+            pytest.raises(RuntimeError, match="late failure"),
+        ):
+            _make_manager_for_cache_tier_test(
+                self._config(tmp_path, donor={"size": 1 << 30}), [Mock()]
+            )
+        assert str(donor.close.call_args.args[0]) == "late failure"
+
+    @pytest.mark.cpu_only
+    def test_a_subclass_that_fails_after_the_base_init_withdraws_the_donation_with_its_error(
+        self, tmp_path
+    ) -> None:
+        """E.g. MambaHybridCacheManagerV2 whose state pool comes out too small: it shuts down and raises after
+        KVCacheManagerV2.__init__. The donation is withdrawn with that error, whose marker tells peers to stop
+        waiting for this donor, not closed quietly by the shutdown."""
+        donor, add_remote_level = self._starting_donor()
+
+        class FinalizesAfterTheBaseInit(KVCacheManagerV2):
+            @_withdraws_remote_donation_on_error
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                KVCacheManagerV2.shutdown(self)
+                raise ValueError("state pool too small")
+
+        with (
+            patch.object(KVCacheManagerV2, "_add_remote_level", add_remote_level),
+            patch(
+                f"{self.module}._sync_kv_cache_manager_init_status",
+                side_effect=lambda status, mapping: status,
+            ),
+            pytest.raises(ValueError, match="state pool too small"),
+        ):
+            _make_manager_for_cache_tier_test(
+                self._config(tmp_path, donor={"size": 1 << 30}),
+                [Mock()],
+                manager_cls=FinalizesAfterTheBaseInit,
+            )
+        donor.close.assert_called_once()
+        assert str(donor.close.call_args.args[0]) == "state pool too small"
+
+    @pytest.mark.cpu_only
+    def test_an_undecorated_subclass_that_fails_after_the_base_init_is_guarded_too(
+        self, tmp_path
+    ) -> None:
+        """E.g. DSACacheManagerV2, which raises after super().__init__(): every subclass's __init__ is guarded."""
+        donor, add_remote_level = self._starting_donor()
+
+        class RaisesAfterTheBaseInit(KVCacheManagerV2):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                raise ValueError("indexer cache too small")
+
+        with (
+            patch.object(KVCacheManagerV2, "_add_remote_level", add_remote_level),
+            patch(
+                f"{self.module}._sync_kv_cache_manager_init_status",
+                side_effect=lambda status, mapping: status,
+            ),
+            pytest.raises(ValueError, match="indexer cache too small"),
+        ):
+            _make_manager_for_cache_tier_test(
+                self._config(tmp_path, donor={"size": 1 << 30}),
+                [Mock()],
+                manager_cls=RaisesAfterTheBaseInit,
+            )
+        donor.close.assert_called_once()
+        assert str(donor.close.call_args.args[0]) == "indexer cache too small"
+
+    @pytest.mark.cpu_only
+    def test_a_failed_construction_closes_its_open_caches_before_the_shutdown(
+        self, tmp_path
+    ) -> None:
+        """The runtime's shutdown refuses while a cache is open, e.g. the guard page's (TRTLLM_KV_GUARD_PAGE)."""
+        donor, add_remote_level = self._starting_donor()
+        order = Mock()
+        guard_cache = order.guard_cache
+        impl = order.impl
+
+        class OpensACacheThenFails(KVCacheManagerV2):
+            @_withdraws_remote_donation_on_error
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.kv_cache_map[-1] = guard_cache
+                raise ValueError("late failure")
+
+        with (
+            patch.object(KVCacheManagerV2, "_add_remote_level", add_remote_level),
+            patch(
+                f"{self.module}._sync_kv_cache_manager_init_status",
+                side_effect=lambda status, mapping: status,
+            ),
+            pytest.raises(ValueError, match="late failure"),
+        ):
+            _make_manager_for_cache_tier_test(
+                self._config(tmp_path, donor={"size": 1 << 30}),
+                [impl],
+                manager_cls=OpensACacheThenFails,
+            )
+        calls = [name for name, _, _ in order.mock_calls]
+        assert calls.index("guard_cache.close") < calls.index("impl.shutdown")
+
+    @pytest.mark.cpu_only
+    def test_the_mamba_hybrid_manager_guards_its_own_finalization(self) -> None:
+        from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2 import (
+            MambaHybridCacheManagerV2,
+        )
+
+        assert hasattr(MambaHybridCacheManagerV2.__init__, "__wrapped__")
+
+    @pytest.mark.cpu_only
+    def test_shutdown_withdraws_the_donation_when_a_deferred_close_raises(self, tmp_path) -> None:
+        donor, add_remote_level = self._starting_donor()
+        with (
+            patch.object(KVCacheManagerV2, "_add_remote_level", add_remote_level),
+            patch(
+                f"{self.module}._sync_kv_cache_manager_init_status",
+                side_effect=lambda status, mapping: status,
+            ),
+        ):
+            manager, _ = _make_manager_for_cache_tier_test(
+                self._config(tmp_path, donor={"size": 1 << 30}), [Mock()]
+            )
+        with (
+            patch.object(manager, "flush_deferred_closes", side_effect=RuntimeError("close")),
+            pytest.raises(RuntimeError, match="close"),
+        ):
+            manager.shutdown()
+        donor.close.assert_called_once_with(None)
+
+    @pytest.mark.cpu_only
+    def test_draft_waits_for_the_targets_donation_instead_of_charging_it_again(
+        self, tmp_path
+    ) -> None:
+        """The target's donation is resident once the draft measures host memory: subtracting it again would leave the
+        draft's automatic host tier nothing (here: a donation larger than the host)."""
+        config = KvCacheConfig(
+            max_gpu_total_bytes=16 << 20,
+            remote_cache_config={"directory": str(tmp_path), "donor": {"size": 1 << 50}},
+        )
+        target_donor = Mock()
+        with patch(
+            f"{self.module}._sync_kv_cache_manager_init_status",
+            side_effect=lambda status, mapping: status,
+        ):
+            draft, _ = _make_manager_for_cache_tier_test(
+                config, [Mock()], is_draft=True, remote_donor=target_donor
+            )
+        target_donor.wait_started.assert_called_once_with()
+        assert draft._remote_donor is None  # the target owns it
+        draft._close_remote_donor(RuntimeError("draft failed"))
+        target_donor.close.assert_not_called()
+        assert list(tmp_path.iterdir()) == []  # nor does the draft mark a donation failed
 
 
 @pytest.mark.cpu_only
@@ -6066,6 +6389,33 @@ def test_sparse_offload_admits_by_current_need_with_a_cold_tier() -> None:
         assert manager.prepare_disagg_gen_init(_gen_init_request(1, 1024, 256))
         assert manager.prepare_disagg_gen_init(_gen_init_request(2, 1024, 256))
     assert prepare.call_count == 2
+
+
+@pytest.mark.cpu_only
+def test_a_remote_level_alone_below_the_gpu_reserves_history_and_stops_counting_once_failed() -> (
+    None
+):
+    # A remote level retires when its donor dies and then takes no more pages: as the only level
+    # below the GPU, admission reserves history as without one, and the eviction flags turn off.
+    manager = _offload_setup_manager([12, 10])
+    manager.impl = SimpleNamespace(
+        cache_tier_list=[CacheTier.GPU_MEM, CacheTier.REMOTE], any_remote_level_failed=False
+    )
+    manager._can_evict = manager._only_remote_below_gpu = True
+
+    with patch.object(KVCacheManagerV2, "_log_sparse_kv_offload_capacity"):
+        manager._setup_sparse_kv_offload(
+            KvCacheConfig(), max_seq_len=1024, num_reserved_index_slots=0
+        )
+
+    assert manager._host_history_reservations is not None
+    assert manager.has_cache_tier_below_gpu and manager.can_evict
+    manager.impl.any_remote_level_failed = True
+    assert not manager.has_cache_tier_below_gpu and not manager.can_evict
+    # A host level below keeps both whatever the remote level does.
+    manager.impl.cache_tier_list = [CacheTier.GPU_MEM, CacheTier.HOST_MEM, CacheTier.REMOTE]
+    manager._only_remote_below_gpu = False
+    assert manager.has_cache_tier_below_gpu and manager.can_evict
 
 
 @pytest.mark.cpu_only

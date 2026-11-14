@@ -104,6 +104,17 @@ std::pair<bool, std::string> TllmGenFmhaRunner::isSupportedWithInfo(TllmGenFmhaR
     return mKernel->checkIfKernelExist(runnerParams);
 }
 
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+bool TllmGenFmhaRunner::usesNvrtc(TllmGenFmhaRunnerParams const& runnerParams)
+{
+    if (mKernel == nullptr)
+    {
+        TLLM_THROW("TRTLLM-GEN: mKernel is null. Cannot select an FMHA kernel.");
+    }
+    return mKernel->usesNvrtc(runnerParams);
+}
+
 size_t TllmGenFmhaRunner::getTotalDeviceMemory() const
 {
     return mTotalDeviceMemory;

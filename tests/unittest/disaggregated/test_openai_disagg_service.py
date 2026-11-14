@@ -1049,6 +1049,51 @@ async def test_gen_request_carries_orig_elapsed(monkeypatch, schedule_style):
     assert ctx_req.disaggregated_params.orig_elapsed_s is None
 
 
+@pytest.mark.asyncio
+async def test_gen_placement_sees_orig_elapsed_after_the_context_phase(monkeypatch):
+    """The GEN router sees the time since arrival; the GEN request is stamped again after placement.
+
+    A pooled router ages the request by it and bounds the wait by the KV transfer timeout.
+    """
+    monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
+    service = _make_service("context_first")
+    service._ctx_client = AsyncMock()
+    service._gen_client = AsyncMock()
+    service._ctx_router.get_next_server = AsyncMock(return_value=("ctx:9000", {"server_info": {}}))
+    at_placement = []
+
+    async def _place(req, *_args, **_kwargs):
+        at_placement.append(req.disaggregated_params.orig_elapsed_s)
+        await asyncio.sleep(0.05)
+        return "gen:9001", {"server_info": {}}
+
+    service._gen_router.get_next_server = AsyncMock(side_effect=_place)
+    service._ctx_client.send_request = AsyncMock(
+        side_effect=lambda req, *a, **k: _make_completion_response(
+            "",
+            finish_reason="length",
+            disagg_request_id=req.disaggregated_params.disagg_request_id,
+            context_only=True,
+        )
+    )
+    service._gen_client.send_request = AsyncMock(
+        side_effect=lambda req, *a, **k: _make_completion_response(
+            "done",
+            finish_reason="stop",
+            disagg_request_id=req.disaggregated_params.disagg_request_id,
+            context_only=False,
+        )
+    )
+    hooks = mock.Mock()
+    hooks.request_arrival_time = get_global_steady_clock_now_in_seconds() - 5.0
+
+    await service._send_disagg_request(CompletionRequest(model="test-model", prompt="hello"), hooks)
+
+    assert len(at_placement) == 1 and 5.0 <= at_placement[0] < 60.0
+    sent = service._gen_client.send_request.call_args.args[0].disaggregated_params.orig_elapsed_s
+    assert sent > at_placement[0] + 0.04
+
+
 def test_orig_elapsed_arrival_fallback():
     before = get_global_steady_clock_now_in_seconds()
     assert OpenAIDisaggregatedService._get_arrival_time(None) >= before

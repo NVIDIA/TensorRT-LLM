@@ -53,10 +53,12 @@
 #include <nanobind/stl/unique_ptr.h>
 #include <nanobind/stl/variant.h>
 #include <nanobind/stl/vector.h>
+#include <numeric>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <type_traits>
 #include <unordered_set>
 #include <utility>
@@ -931,6 +933,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     static nb::object sOutOfPagesError = nb::exception<kv::OutOfPagesError>(m, "OutOfPagesError");
     static nb::object sCuError = nb::exception<kv::CuError>(m, "CuError");
     static nb::object sCorruptedError = nb::exception<kv::CorruptedError>(m, "CorruptedError");
+    static nb::object sRemoteMemError = nb::exception<kv::RemoteMemError>(m, "RemoteMemError");
     // Default attribute so the class mirrors the pure-Python CuError surface.
     sCuError.attr("error_code") = nb::none();
 
@@ -998,7 +1001,12 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .value("GPU_MEM", kv::CacheTier::GPU_MEM)
         .value("HOST_MEM", kv::CacheTier::HOST_MEM)
         .value("DISK", kv::CacheTier::DISK)
+        .value("REMOTE", kv::CacheTier::REMOTE)
         .export_values();
+
+    nb::enum_<kv::RemoteTransport>(m, "RemoteTransport")
+        .value("NIXL", kv::RemoteTransport::kNixl)
+        .value("FABRIC", kv::RemoteTransport::kFabric);
 
     // ---- KvCache::Status enum (also accessible as _KVCache.Status) ---------
     auto kvCacheStatus = nb::enum_<kv::KvCache::Status>(m, "KvCacheStatus")
@@ -1759,6 +1767,29 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("path", &kv::DiskCacheTierConfig::path)
         .def_prop_ro("tier", &kv::DiskCacheTierConfig::tier)
         .def("validate", &kv::DiskCacheTierConfig::validate) DEF_COPY(kv::DiskCacheTierConfig);
+
+    nb::class_<kv::RemoteTransferConfig>(m, "RemoteTransferConfig")
+        .def(nb::init<kv::RemoteTransport, int64_t, std::map<std::string, std::string>>(),
+            nb::arg("transport") = kv::RemoteTransport::kNixl,
+            nb::arg("timeout_ms") = kv::RemoteTransferConfig{}.timeoutMs,
+            nb::arg("backend_params") = std::map<std::string, std::string>{})
+        .def_rw("transport", &kv::RemoteTransferConfig::transport)
+        .def_rw("timeout_ms", &kv::RemoteTransferConfig::timeoutMs)
+        .def_rw("backend_params", &kv::RemoteTransferConfig::backendParams) DEF_COPY(kv::RemoteTransferConfig);
+
+    nb::class_<kv::RemoteCacheTierConfig>(m, "RemoteCacheTierConfig")
+        .def(nb::init<size_t, std::string, int64_t, uint32_t, std::vector<double>, kv::RemoteTransferConfig>(),
+            nb::arg("quota"), nb::arg("path"), nb::arg("wait_timeout_ms") = kv::RemoteCacheTierConfig{}.waitTimeoutMs,
+            nb::arg("expected_donors") = 0, nb::arg("pool_ratio") = std::vector<double>{},
+            nb::arg("transfer") = kv::RemoteTransferConfig{})
+        .def_rw("quota", &kv::RemoteCacheTierConfig::quota)
+        .def_rw("path", &kv::RemoteCacheTierConfig::path)
+        .def_rw("wait_timeout_ms", &kv::RemoteCacheTierConfig::waitTimeoutMs)
+        .def_rw("expected_donors", &kv::RemoteCacheTierConfig::expectedDonors)
+        .def_rw("pool_ratio", &kv::RemoteCacheTierConfig::poolRatio)
+        .def_rw("transfer", &kv::RemoteCacheTierConfig::transfer)
+        .def_prop_ro("tier", &kv::RemoteCacheTierConfig::tier)
+        .def("validate", &kv::RemoteCacheTierConfig::validate) DEF_COPY(kv::RemoteCacheTierConfig);
 
     nb::class_<kv::SparseCacheConfig>(m, "SparseCacheConfig")
         .def(nb::init<int, int, int, std::optional<int>>(), nb::arg("num_selected_blocks"), nb::arg("max_cached_units"),
@@ -2775,6 +2806,37 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         },
         nb::arg("manager"), nb::arg("cache_level") = kv::kHotLevel.value(), nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def(
+        "remote_unquiesced_transfers",
+        // Remote transfers past their deadline whose staging is still out of use, after releasing the quiesced ones.
+        [](kv::KvCacheManager& manager) { return manager.storage().reapQuiescedRemoteTransfers(); }, nb::arg("manager"),
+        nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
+        "level_pool_groups",
+        [](kv::KvCacheManager& manager, int cacheLevel)
+        {
+            // Per pool group of one cache level: slot count, bytes per slot, and the layer groups it holds.
+            auto const& storage = manager.storage();
+            kv::CacheLevel const level{cacheLevel};
+            TLLM_CHECK_WITH_INFO(
+                cacheLevel >= 0 && level < storage.numCacheLevels(), "cache_level %d is out of range", cacheLevel);
+            std::vector<std::tuple<int64_t, size_t, std::vector<int>>> groups(
+                static_cast<size_t>(storage.numPoolGroups(level).value()));
+            for (kv::PoolGroupIndex pg{0}; pg < storage.numPoolGroups(level); ++pg)
+            {
+                auto const& sizes = storage.slotSize(level, pg);
+                auto& group = groups[static_cast<size_t>(pg.value())];
+                std::get<0>(group) = static_cast<int64_t>(storage.numSlots(pg, level));
+                std::get<1>(group) = std::accumulate(sizes.begin(), sizes.end(), size_t{0});
+            }
+            for (kv::LifeCycleId lc{0}; lc < storage.numLifeCycles(); ++lc)
+            {
+                std::get<2>(groups[static_cast<size_t>(storage.getPoolGroupIndex(level, lc).value())])
+                    .push_back(lc.value());
+            }
+            return groups;
+        },
+        nb::arg("manager"), nb::arg("cache_level"), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
         "grains_for_slots",
         [](kv::SlotCount numSlots, std::vector<size_t> const& slotSizeList, size_t granularity,
             std::optional<std::vector<int32_t>> const& pools)
@@ -3689,6 +3751,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             { return std::dynamic_pointer_cast<kv::EventManager>(self.eventSink()); })
         .def_prop_ro("init_config", [](kv::KvCacheManager const& self) { return self.config(); })
         .def_prop_ro("cache_tier_list", [](kv::KvCacheManager const& self) { return self.cacheTierList().raw(); })
+        .def_prop_ro("any_remote_level_failed",
+            // A lock-step scheduler stops once any remote level failed on this rank. Lock-free (atomic flags).
+            [](kv::KvCacheManager& self) { return self.storage().anyRemoteLevelFailed(); })
         .def_prop_ro("all_buffer_ids", &kv::KvCacheManager::allBufferIds)
         .def_prop_ro("pool_group_descs",
             [](kv::KvCacheManager const& self)

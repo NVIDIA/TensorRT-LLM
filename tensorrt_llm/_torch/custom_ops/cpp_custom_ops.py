@@ -1931,6 +1931,26 @@ def _register_fake():
     ):
         return q.new_empty(q.shape, dtype=out_dtype)
 
+    @torch.library.register_fake("trtllm::fmha_paged_context_fp8")
+    def _(
+        q: torch.Tensor,
+        kv_pool: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens_kv: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_kv: torch.Tensor,
+        out: torch.Tensor,
+        scale_bmm1: torch.Tensor,
+        scale_out: torch.Tensor,
+        max_q_len: int,
+        max_kv_len: int,
+        head_dim_per_stage_kv: int,
+        allow_nvrtc: bool = False,
+    ) -> bool:
+        # The fail-safe answer: whether a cubin exists is known only at run
+        # time, and on False the caller runs FlashInfer, which is always valid.
+        return False
+
     @torch.library.register_fake("trtllm::dit_v_amax")
     def _(qkv: torch.Tensor, num_heads: int, head_dim: int):
         return qkv.new_empty((1, ), dtype=torch.float32)

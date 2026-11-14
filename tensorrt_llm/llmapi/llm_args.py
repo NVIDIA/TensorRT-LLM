@@ -2331,6 +2331,18 @@ class AttentionDpConfig(StrictBaseModel):
             "Active prompt tokens estimate work, not cached KV residency. Existing "
             "conversation->rank pins are unaffected. Only used when "
             "kv_cache_routing_conversation_affinity is True.")
+    kv_cache_routing_home_wait_rounds: Optional[PositiveInt] = Field(
+        default=None,
+        description=
+        "Conversation-affinity routing: a returning conversation whose home "
+        "rank is full waits for a slot there for up to this many scheduling "
+        "rounds in which another rank had room, then overflows by "
+        "kv_cache_routing_new_conv_placement (keeping its home rank). Later "
+        "requests of the same admission group (priority) may pass a waiting "
+        "one on any rank; later groups may pass it on other ranks only, not "
+        "into its home rank. None overflows at once. Requires "
+        "kv_cache_routing_conversation_affinity=True.",
+        status="prototype")
 
     @model_validator(mode='after')
     def validate_attention_dp_config(self) -> 'AttentionDpConfig':
@@ -2343,6 +2355,11 @@ class AttentionDpConfig(StrictBaseModel):
                 raise ValueError(
                     "attention_dp_config.timeout_iters must be greater or equal to 0 when enable_balance is true"
                 )
+        if (self.kv_cache_routing_home_wait_rounds is not None
+                and not self.kv_cache_routing_conversation_affinity):
+            raise ValueError(
+                "attention_dp_config.kv_cache_routing_home_wait_rounds requires "
+                "kv_cache_routing_conversation_affinity=True")
         return self
 
 
@@ -4640,6 +4657,14 @@ class DynamicBatchConfig(StrictBaseModel, PybindMirror):
             dynamic_batch_moving_average_window)
 
 
+_PositiveFiniteFloat = Annotated[float,
+                                 PydanticField(gt=0, allow_inf_nan=False)]
+# Remote cache timeouts become C++ millisecond deadlines; 1e6 s (11.6 days) is
+# far past any wait yet far inside their range.
+_RemoteTimeoutSeconds = Annotated[
+    float, PydanticField(gt=0, le=1e6, allow_inf_nan=False)]
+
+
 class GenPreemptionConfig(StrictBaseModel):
     """GEN slot preemption on a disaggregated generation worker.
 
@@ -4696,6 +4721,17 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
         default=WaitingQueuePolicy.FCFS,
         description="The waiting queue scheduling policy")
 
+    waiting_queue_max_wait_s: Optional[_PositiveFiniteFloat] = Field(
+        default=None,
+        description=(
+            "With waiting_queue_policy='priority': a request that has waited "
+            "this many seconds since it reached the server (in disaggregated "
+            "serving, the orchestrator) goes ahead of every request that has "
+            "not, oldest first. None: no cap. Keep it at or below the context "
+            "servers' cache_transceiver_config.kv_transfer_timeout_ms, whose "
+            "clock starts later (after prefill)."),
+        status="prototype")
+
     use_python_scheduler: bool = Field(
         default=False,
         description="Use pure-Python scheduler instead of C++ scheduler.")
@@ -4732,6 +4768,14 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
             "ahead of the shortest-first order, oldest first. None "
             "disables it."),
         status="prototype")
+
+    @model_validator(mode="after")
+    def validate_waiting_queue_max_wait_s(self) -> 'SchedulerConfig':
+        if (self.waiting_queue_max_wait_s is not None
+                and self.waiting_queue_policy != WaitingQueuePolicy.PRIORITY):
+            raise ValueError("scheduler_config.waiting_queue_max_wait_s "
+                             "requires waiting_queue_policy='priority'")
+        return self
 
     @model_validator(mode="after")
     def validate_context_starvation_iterations(self) -> 'SchedulerConfig':
@@ -5274,6 +5318,187 @@ class KvPoolRebalanceConfig(StrictBaseModel):
         "should be attempted.")
 
 
+# Donors publish host memory in chunks of this many bytes (remote_donor.py).
+REMOTE_CACHE_CHUNK_BYTES = 1 << 30
+# Default of RemoteCacheConfig.donor_reserve_size.
+REMOTE_CACHE_DONOR_RESERVE_BYTES = 24 << 30
+# One RemoteCacheConfig.ucx_devices entry, stripped: a name without ':' or ',',
+# then optionally ':' or ':1' (NIXL's UCX backend uses port 1 of each device).
+_UCX_DEVICE_ENTRY = r"\s*[^\s,:][^,:]*(:1?)?\s*"
+REMOTE_CACHE_UCX_DEVICES_PATTERN = (
+    rf"^{_UCX_DEVICE_ENTRY}(,{_UCX_DEVICE_ENTRY})*$")
+
+
+class RemoteNixlTransportConfig(StrictBaseModel):
+    """Remote cache transport over one-sided NIXL RDMA."""
+
+    kind: Literal["nixl"] = Field(
+        default="nixl",
+        status="prototype",
+        description="Selects this transport. Every rank sharing `directory` "
+        "must use the same transport.")
+
+    ucx_devices: Optional[str] = Field(
+        default=None,
+        pattern=REMOTE_CACHE_UCX_DEVICES_PATTERN,
+        status="prototype",
+        description=
+        "Comma-separated UCX devices of the remote level's and the donor's NIXL "
+        "agents (for example 'mlx5_0:1'), each '<device>' or '<device>:1' "
+        "(NIXL's UCX backend uses port 1); '{GPU}' is replaced by the rank's "
+        "physical GPU index. None uses the process's UCX environment.")
+
+    transfer_timeout_s: _RemoteTimeoutSeconds = Field(
+        default=30.0,
+        status="prototype",
+        description=
+        "Seconds one batch of page transfers of a remote level may take before "
+        "the level fails, e.g. on a donor that died. At most 1e6.")
+
+
+class RemoteFabricTransportConfig(StrictBaseModel):
+    """Remote cache transport over CUDA fabric memory.
+
+    Claimants in the same multi-node NVLink domain copy it over NVLink.
+    """
+
+    kind: Literal["fabric"] = Field(
+        status="prototype",
+        description="Selects this transport. Every rank sharing `directory` "
+        "must use the same transport.")
+
+    donor_reserve_size: NonNegativeInt = Field(
+        default=REMOTE_CACHE_DONOR_RESERVE_BYTES,
+        status="prototype",
+        description=
+        "Bytes of free plus reclaimable memory each host NUMA node keeps for "
+        "the processes on it while a donation is placed. Chunks go to the GPU's "
+        "node first, then to the others; a donation that does not fit is "
+        "published short.")
+
+    compact_host_memory: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "Before a node that refuses a donated chunk is left, run up to 64 "
+        "reclaim-and-compact passes on it (fault in and release node-bound "
+        "huge pages under a per-node lock that donors on one host take in "
+        "turn), so fragmented or page-cache-filled memory can still take the "
+        "donation. False publishes what fits and leaves compaction to the job "
+        "prolog.")
+
+
+RemoteTransportConfig: TypeAlias = Annotated[
+    Union[RemoteNixlTransportConfig, RemoteFabricTransportConfig],
+    Field(discriminator="kind"),
+]
+
+
+class RemoteDonorConfig(StrictBaseModel):
+    """Host memory this rank donates to remote cache levels."""
+
+    size: int = Field(
+        ge=REMOTE_CACHE_CHUNK_BYTES,
+        status="prototype",
+        description=
+        "Bytes donated for the lifetime of the process, in whole 1 GiB chunks "
+        "(a remainder below one chunk is not donated; the rank logs the size "
+        "it donates).")
+
+
+class RemoteExpectedDonorsConfig(StrictBaseModel):
+    """The job's donors and claims, which only the launcher can count."""
+
+    num_donors: PositiveInt = Field(
+        status="prototype",
+        description="Number of donating ranks the job starts.")
+
+    claim_size: PositiveInt = Field(
+        status="prototype",
+        description="Bytes all ranks of the job claim from `directory` together."
+    )
+
+
+class RemoteLevelConfig(StrictBaseModel):
+    """This rank's remote cache level, in chunks of donated memory."""
+
+    size: PositiveInt = Field(
+        status="prototype",
+        description=
+        "Bytes of the level. Pages are stored as the cold tiers store them: "
+        "byte copies, or encoded by a lossy cold-page codec "
+        "(kv_cache_compression_config) when one is set. It takes the disk "
+        "level's place, so it cannot be combined with `disk_cache_size`.")
+
+    pool_ratio: Optional[List[_PositiveFiniteFloat]] = Field(
+        default=None,
+        min_length=1,
+        status="prototype",
+        description=
+        "Split of `size` across layer groups, one positive weight per layer "
+        "group in KV cache manager v2 layer-group ID order (normalized). None "
+        "follows the hot tier's split.")
+
+    expected: Optional[RemoteExpectedDonorsConfig] = Field(
+        default=None,
+        status="prototype",
+        description=
+        "With it, the rank waits until these donors have reported and fails "
+        "at once if they cannot cover the claims, instead of after a claim "
+        "wait.")
+
+    donor_wait_timeout_s: _RemoteTimeoutSeconds = Field(
+        default=900.0,
+        status="prototype",
+        description=
+        "Seconds the rank waits for donors, applied to each wait on its own: "
+        "for the expected donors to report, and for each chunk claim. Donors "
+        "publish while their own servers start, so this bounds the job's "
+        "startup skew per wait, not in total. At most 1e6.")
+
+
+class RemoteCacheConfig(StrictBaseModel):
+    """KV cache manager v2 remote cache level in host memory that other ranks donate.
+
+    A rank with `level` gets a cache level below the host tier whose slots live
+    in memory that ranks with `donor` publish in `directory`.
+    """
+
+    directory: str = Field(
+        min_length=1,
+        status="prototype",
+        description=
+        "Rendezvous directory, on a file system every rank of the job sees, where "
+        "donors publish their memory and remote cache levels claim chunks of it. "
+        "Environment variables are expanded, and one that is not set is an "
+        "error; the directory is created if missing. Use one directory per job."
+    )
+
+    transport: RemoteTransportConfig = Field(
+        default_factory=RemoteNixlTransportConfig,
+        status="prototype",
+        description=
+        "How pages move: {kind: nixl} (one-sided NIXL RDMA, the default) or "
+        "{kind: fabric} (CUDA fabric memory copied over NVLink).")
+
+    donor: Optional[RemoteDonorConfig] = Field(
+        default=None,
+        status="prototype",
+        description="This rank's donation; None donates nothing.")
+
+    level: Optional[RemoteLevelConfig] = Field(
+        default=None,
+        status="prototype",
+        description="This rank's remote cache level; None gives it none.")
+
+    @model_validator(mode="after")
+    def validate_remote_cache(self) -> 'RemoteCacheConfig':
+        if self.donor is None and self.level is None:
+            raise ValueError(
+                "remote_cache_config needs a `donor`, a `level`, or both")
+        return self
+
+
 # Mixed-precision KV dtype: "mixed_<low dtype>_<high dtype>". The
 # first/last tokens and the attention inputs use the second dtype;
 # the full history is stored in the first. Requires KV cache manager V2.
@@ -5338,6 +5563,13 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description=
         "Directory used for disk KV cache files. Must be set when `disk_cache_size` is positive."
     )
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    remote_cache_config: Optional[RemoteCacheConfig] = Field(
+        default=None,
+        status="prototype",
+        description=
+        "KV cache manager v2 remote cache level in host memory that other ranks "
+        "donate (usually generation ranks to context ranks). None disables it.")
     cross_kv_cache_fraction: Optional[float] = Field(
         default=None,
         description=
@@ -5512,6 +5744,19 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description=
         "The maximum utilization of the KV cache for resume. Default is 95%. Only used when using KV cache manager v2 (experimental)."
     )
+
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    defer_generation_only_release: bool = Field(
+        default=False,
+        status="prototype",
+        description="Release the KV cache of a finished generation-only request "
+        "(disaggregated generation server) after the next forward is enqueued, "
+        "so that the host-side release overlaps GPU work. The pages return one "
+        "iteration later, or as soon as the scheduler runs out of pages, before "
+        "it suspends or recompute-pauses a running request. Their KV cache events "
+        "are published one iteration later too, "
+        "or in the same iteration when the server goes idle. Requires KV cache manager v2 and the overlap scheduler "
+        "without pipeline parallelism.")
 
     enable_kv_pool_rebalance: bool = Field(
         default=False,
@@ -5789,6 +6034,35 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
                 raise ValueError(
                     f"kv_cache_config.disk_cache_path {self.disk_cache_path} does not exist or is not a directory"
                 )
+        return self
+
+    @model_validator(mode='after')
+    def validate_remote_cache_config(self) -> 'KvCacheConfig':
+        remote = self.remote_cache_config
+        if remote is None:
+            return self
+        if self.use_kv_cache_manager_v2 is False:
+            raise ValueError("kv_cache_config.remote_cache_config requires "
+                             "use_kv_cache_manager_v2")
+        if remote.level is not None and self.disk_cache_size:
+            raise ValueError(
+                "kv_cache_config.remote_cache_config.level and "
+                "disk_cache_size cannot both be set: the remote level takes the "
+                "disk level's place")
+        if remote.level is not None and self.enable_kv_pool_rebalance:
+            raise ValueError(
+                "kv_cache_config.remote_cache_config.level and "
+                "enable_kv_pool_rebalance cannot both be set: a rebalance "
+                "would claim donor chunks while every request waits")
+        return self
+
+    @model_validator(mode='after')
+    def validate_defer_generation_only_release(self) -> 'KvCacheConfig':
+        if (self.defer_generation_only_release
+                and self.use_kv_cache_manager_v2 is False):
+            raise ValueError(
+                "kv_cache_config.defer_generation_only_release requires "
+                "kv_cache_config.use_kv_cache_manager_v2=True.")
         return self
 
     @model_validator(mode='after')
@@ -7882,6 +8156,35 @@ class TorchLlmArgs(BaseLlmArgs):
             raise ValueError(
                 "GEN slot preemption (scheduler_config.gen_preemption) does "
                 "not support pipeline parallelism or attention DP.")
+        return self
+
+    @model_validator(mode="after")
+    def warn_waiting_queue_max_wait_s(self) -> 'TorchLlmArgs':
+        scheduler = self.scheduler_config
+        transceiver = self.cache_transceiver_config
+        if (scheduler.waiting_queue_max_wait_s is not None
+                and transceiver is not None
+                and transceiver.kv_transfer_timeout_ms is not None
+                and scheduler.waiting_queue_max_wait_s * 1000
+                > transceiver.kv_transfer_timeout_ms):
+            logger.warning(
+                "scheduler_config.waiting_queue_max_wait_s "
+                f"({scheduler.waiting_queue_max_wait_s} s) exceeds "
+                "cache_transceiver_config.kv_transfer_timeout_ms "
+                f"({transceiver.kv_transfer_timeout_ms} ms): a request passed "
+                "over that long may find its context server's KV transfer "
+                "timed out.")
+        return self
+
+    @model_validator(mode="after")
+    def validate_defer_generation_only_release(self) -> 'TorchLlmArgs':
+        if self.kv_cache_config.defer_generation_only_release and (
+                self.disable_overlap_scheduler
+                or self.pipeline_parallel_size > 1):
+            raise ValueError(
+                "kv_cache_config.defer_generation_only_release is used only "
+                "by the overlap scheduler loop, which needs "
+                "disable_overlap_scheduler=False and pipeline_parallel_size=1.")
         return self
 
     @model_validator(mode="after")

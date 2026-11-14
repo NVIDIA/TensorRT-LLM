@@ -281,6 +281,7 @@ def test_rebind_resets_phase_state_and_profile_windows(executor, monkeypatch):
         resource_governor_queue=None,
         hang_detection_timeout=None,
         enable_kv_pool_rebalance=False,
+        defer_generation_only_release=True,
     )
     ex.model_engine.enable_attention_dp = False
     ex.model_engine.mm_encoder_item_scheduling_enabled = False
@@ -303,6 +304,7 @@ def test_rebind_resets_phase_state_and_profile_windows(executor, monkeypatch):
         enable_iter_req_stats=False,
         iter_perf_stats_interval=1,
         stream_interval=1,
+        return_perf_metrics=False,
         attention_dp_config=None,
         batch_wait_timeout_ms=0,
         batch_wait_timeout_iters=0,
@@ -370,13 +372,15 @@ def test_rebind_resets_phase_state_and_profile_windows(executor, monkeypatch):
         for name in bound_fields:
             assert getattr(ex, name) is getattr(resources, name), name
         create_waiting_queue.assert_called_once_with(
-            resources.waiting_queue_policy, gen_admission=ex._gen_admission
+            resources.waiting_queue_policy, gen_admission=ex._gen_admission, max_wait_s=None
         )
         engine.register_beam_histories_callable.assert_called_once_with(
             ex.sampler.start_beam_histories
         )
         assert ex.max_num_active_requests == engine.get_max_num_sequences.return_value
         assert ex.kv_cache_manager is cache
+        # Only KV cache manager V2 defers the close; this manager is not one.
+        assert ex._defer_generation_only_release is False
         assert ex.model_engine is engine and ex.execution_stream is stream
         assert ex.sample_stream is sample_stream
         assert ex.finish_sample_event is sample_event

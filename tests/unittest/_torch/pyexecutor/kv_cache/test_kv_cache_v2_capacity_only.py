@@ -85,6 +85,8 @@ def test_manager_initializes_capacity_only_policy_to_false() -> None:
         pass
 
     class StopAfterPolicyConfig:
+        remote_cache_config = None
+
         @property
         def enable_swa_scratch_reuse(self):
             raise StopInitialization

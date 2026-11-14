@@ -132,6 +132,7 @@ class MoEScheduler(ABC):
         routing_aux: Optional[torch.Tensor] = None,
         input_ready_event: Optional[torch.cuda.Event] = None,
         prerouted: Optional[PreroutedRouting] = None,
+        lamport_fc2_out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor: ...
 
 
@@ -176,10 +177,12 @@ class ExternalCommMoEScheduler(MoEScheduler):
         routing_aux: Optional[torch.Tensor] = None,
         input_ready_event: Optional[torch.cuda.Event] = None,
         prerouted: Optional[PreroutedRouting] = None,
+        lamport_fc2_out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """``input_ready_event``: ``x`` is written on another stream. The join
         is deferred to the first kernel that reads ``x`` so routing overlaps it.
         ``prerouted``: the routing of ``x`` (single chunk, no communication).
+        ``lamport_fc2_out``: see ``MoERunContext`` (single chunk).
         """
         moe = self.moe
 
@@ -244,6 +247,17 @@ class ExternalCommMoEScheduler(MoEScheduler):
         # ========== Step 3: Execute MoE computation ==========
         if prerouted is not None and (num_chunks > 1 or moe.comm is not None or use_dp_padding):
             raise ValueError("prerouted routing needs one chunk without communication or padding")
+        if lamport_fc2_out is not None and (
+            num_chunks > 1
+            or moe.comm is not None
+            or use_dp_padding
+            or do_finalize
+            or not moe.backend.takes_lamport_fc2_out
+        ):
+            raise ValueError(
+                "a Lamport FC2 output takes one un-finalized chunk without communication or padding, "
+                "of a backend that writes it"
+            )
         if num_chunks == 1:
             outputs = self._forward_single_chunk(
                 x,
@@ -257,6 +271,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 routing_aux=routing_aux,
                 input_ready_event=input_ready_event,
                 prerouted=prerouted,
+                lamport_fc2_out=lamport_fc2_out,
             )
         else:
             input_ready_event = _wait_input_ready(input_ready_event)
@@ -409,6 +424,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         routing_aux: Optional[torch.Tensor] = None,
         input_ready_event: Optional[torch.cuda.Event] = None,
         prerouted: Optional[PreroutedRouting] = None,
+        lamport_fc2_out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         moe = self.moe
         is_first_call = moe.repeat_idx == 0
@@ -431,6 +447,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
             routing_aux=routing_aux,
             input_ready_event=input_ready_event,
             prerouted=prerouted,
+            lamport_fc2_out=lamport_fc2_out,
         )
 
     def _forward_chunk_impl(
@@ -450,6 +467,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         routing_aux: Optional[torch.Tensor] = None,
         input_ready_event: Optional[torch.cuda.Event] = None,
         prerouted: Optional[PreroutedRouting] = None,
+        lamport_fc2_out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Unified per-chunk execution flow for all external-comm backends.
 
@@ -743,6 +761,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
             use_deep_ep_direct_metadata=use_deep_ep_direct_metadata,
             x_ready_event=x_ready_event,
             prerouted=prerouted,
+            lamport_fc2_out=lamport_fc2_out,
             sort_tables=sort_tables,
         )
         final_hidden_states = moe.backend.run_moe(
@@ -1126,6 +1145,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         use_deep_ep_direct_metadata: bool = False,
         x_ready_event: Optional[torch.cuda.Event] = None,
         prerouted: Optional[PreroutedRouting] = None,
+        lamport_fc2_out: Optional[torch.Tensor] = None,
         sort_tables: Optional[MoESortTables] = None,
     ) -> MoERunContext:
         """The single ``run_moe`` argument set, identical for every backend.
@@ -1153,6 +1173,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 use_deep_ep_direct_metadata=use_deep_ep_direct_metadata,
             ),
             prerouted=prerouted,
+            lamport_fc2_out=lamport_fc2_out,
             sort_tables=sort_tables,
         )
 
@@ -1245,6 +1266,7 @@ class FusedCommMoEScheduler(MoEScheduler):
         routing_aux: Optional[torch.Tensor] = None,
         input_ready_event: Optional[torch.cuda.Event] = None,
         prerouted: Optional[PreroutedRouting] = None,
+        lamport_fc2_out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Sequential multi-chunk path for MegaMoE-style backends.
 
@@ -1257,6 +1279,8 @@ class FusedCommMoEScheduler(MoEScheduler):
         del use_dp_padding  # MegaMoE has no host-side cross-rank shape alignment.
         if prerouted is not None:
             raise ValueError("fused-comm MoE backends route in-kernel")
+        if lamport_fc2_out is not None:
+            raise ValueError("fused-comm MoE backends finalize in-kernel")
         _wait_input_ready(input_ready_event)
 
         # Fused-comm (MegaMoE) backends cannot carry LoRA adapters; routed-expert

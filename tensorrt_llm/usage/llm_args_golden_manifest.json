@@ -62,6 +62,11 @@
       "path": "attention_dp_config.kv_cache_routing_fair_share_multiplier"
     },
     {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "attention_dp_config.kv_cache_routing_home_wait_rounds"
+    },
+    {
       "capture_policy": "float",
       "kind": "value",
       "path": "attention_dp_config.kv_cache_routing_load_balance_weight"
@@ -696,6 +701,11 @@
       "path": "kv_cache_config.cross_kv_cache_fraction"
     },
     {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "kv_cache_config.defer_generation_only_release"
+    },
+    {
       "capture_policy": "int|none",
       "kind": "value",
       "path": "kv_cache_config.disk_cache_size"
@@ -897,6 +907,60 @@
       "capture_policy": "list[float]|none",
       "kind": "value",
       "path": "kv_cache_config.pool_ratio"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.remote_cache_config.donor.size"
+    },
+    {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "kv_cache_config.remote_cache_config.level.donor_wait_timeout_s"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.remote_cache_config.level.expected.claim_size"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.remote_cache_config.level.expected.num_donors"
+    },
+    {
+      "capture_policy": "list[float]|none",
+      "kind": "value",
+      "path": "kv_cache_config.remote_cache_config.level.pool_ratio"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.remote_cache_config.level.size"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "kv_cache_config.remote_cache_config.transport.compact_host_memory"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_cache_config.remote_cache_config.transport.donor_reserve_size"
+    },
+    {
+      "allowed_values": [
+        "fabric",
+        "nixl"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "kv_cache_config.remote_cache_config.transport.kind"
+    },
+    {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "kv_cache_config.remote_cache_config.transport.transfer_timeout_s"
     },
     {
       "capture_policy": "int|none",
@@ -1518,6 +1582,11 @@
       "capture_policy": "bool",
       "kind": "value",
       "path": "scheduler_config.use_python_scheduler"
+    },
+    {
+      "capture_policy": "float|none",
+      "kind": "value",
+      "path": "scheduler_config.waiting_queue_max_wait_s"
     },
     {
       "allowed_values": [

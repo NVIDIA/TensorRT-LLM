@@ -666,6 +666,11 @@ std::string Runner::getKernelNameFromConfigIndex(int32_t configIndex) const
     return mRunner.getKernelNameFromConfigIndex(configIndex);
 }
 
+std::map<std::string, std::string> Runner::getKernelOptionsFromConfigIndex(int32_t configIndex) const
+{
+    return mRunner.getKernelOptionsFromConfigIndex(configIndex);
+}
+
 } // namespace Gemm2
 
 namespace MoE
@@ -825,6 +830,20 @@ int64_t Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize, int
     return std::distance(mPassingConfigs.begin(), it);
 }
 
+std::string Runner::getGemm2KernelName(int64_t configIndex) const
+{
+    TLLM_CHECK_WITH_INFO(configIndex >= 0 && configIndex < static_cast<int64_t>(mPassingConfigs.size()),
+        "Invalid MoE config index %ld.", static_cast<long>(configIndex));
+    return mGemm2.getKernelNameFromConfigIndex(static_cast<int32_t>(mPassingConfigs[configIndex].gemm2Config));
+}
+
+std::map<std::string, std::string> Runner::getGemm2KernelOptions(int64_t configIndex) const
+{
+    TLLM_CHECK_WITH_INFO(configIndex >= 0 && configIndex < static_cast<int64_t>(mPassingConfigs.size()),
+        "Invalid MoE config index %ld.", static_cast<long>(configIndex));
+    return mGemm2.getKernelOptionsFromConfigIndex(static_cast<int32_t>(mPassingConfigs[configIndex].gemm2Config));
+}
+
 void Runner::run(
     MoERunnerArgs const& args, MoEWorkspace const& workspace, int device, cudaStream_t stream, int64_t configIndex)
 {
@@ -853,6 +872,7 @@ void Runner::run(
         args.valid_intermediate_size.value_or(args.intermediate_size));
 
     // We do not fuse activation with FC1 for DeepSeek FP8 due to the weights shuffling constraint.
+    TLLM_CHECK_WITH_INFO(!args.skip_gemm2 || !args.do_finalize, "skip_gemm2 requires do_finalize == false.");
     void* gemm2_input = workspace.gemm1_output;
     void* gemm2_input_scale = workspace.gemm1_output_scale;
     // We do activation only for DeepSeek FP8, as cubins do not have fused activation.
@@ -862,6 +882,11 @@ void Runner::run(
         moe::dev::activation::run(activationData, stream);
         gemm2_input = workspace.activation_output;
         gemm2_input_scale = workspace.activation_output_scale;
+    }
+
+    if (args.skip_gemm2)
+    {
+        return;
     }
 
     // Run gemm2
