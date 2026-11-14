@@ -483,19 +483,21 @@ class RPCClient:
                              kwargs=kwargs,
                              need_response=need_response,
                              timeout=timeout)
-        await self._client_socket.put_async(request)
-        logger_debug(f"[client] RPC Client sent request: {request}")
-
         with self._call_lock:
             if self._closed:
                 raise RPCCancelled("RPC client closed")
-            if not need_response:
-                return None
-            loop = asyncio.get_running_loop()
-            future = loop.create_future()
-            self._pending_futures[request_id] = (future, loop)
+            # Sending can yield to the response reader. Publish the receiver
+            # before the request can reach the server.
+            if need_response:
+                loop = asyncio.get_running_loop()
+                future = loop.create_future()
+                self._pending_futures[request_id] = (future, loop)
 
         try:
+            await self._client_socket.put_async(request)
+            logger_debug(f"[client] RPC Client sent request: {request}")
+            if not need_response:
+                return None
             # If timeout, the remote call should return a timeout error timely,
             # so we add 1 second to the timeout to ensure the client can get
             # that result.
