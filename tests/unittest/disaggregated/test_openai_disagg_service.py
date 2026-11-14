@@ -229,6 +229,73 @@ async def test_conditional_disagg_bypass_strips_client_disagg_params(monkeypatch
     assert gen_req.disaggregated_params is None
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("with_handoff", [False, True])
+async def test_conditional_disagg_bypass_releases_local_generation_reservation(
+    monkeypatch, stream, with_handoff
+):
+    monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
+    service = _make_service("context_first")
+    service._config.conditional_disagg_config = ConditionalDisaggConfig(max_local_prefill_length=32)
+    service._coordinator.get_disagg_request_id = AsyncMock(side_effect=range(1, 4))
+    monkeypatch.setattr("tensorrt_llm.serve.openai_client.ClientMetricsCollector", mock.Mock())
+    handoff = DisaggregatedParams(
+        request_type="generation_only", ctx_info_endpoint="tcp://untrusted:5000"
+    )
+
+    async def handle(http_request: web.Request) -> web.Response:
+        body = msgspec.msgpack.decode(await http_request.read())
+        assert body.get("disaggregated_params") is None
+        assert state.num_active_requests() == 1
+        if stream:
+            return web.Response(body=b"data: [DONE]\n\n", content_type="text/event-stream")
+        return web.json_response(
+            _make_completion_response("ok", "stop", context_only=False).model_dump(mode="json")
+        )
+
+    async def handle_events(_request: web.Request) -> web.Response:
+        return web.json_response([])
+
+    app = web.Application()
+    app.router.add_post("/v1/completions", handle)
+    app.router.add_post("/kv_cache_events", handle_events)
+    async with TestServer(app) as worker, aiohttp.ClientSession() as session:
+        server = f"{worker.host}:{worker.port}"
+        router = KvCacheAwareRouter(
+            server_role=ServerRole.GENERATION, servers=[server], tokens_per_block=32
+        )
+        state = router._server_state[server]
+        service._gen_router = router
+        service._gen_client = OpenAIHttpClient(router, ServerRole.GENERATION, session=session)
+        # Keep native block hashing out of the test. The real router still looks up
+        # the cached prefix, reserves the worker and settles the resulting request.
+        monkeypatch.setattr(
+            router,
+            "_routing_key_sync",
+            lambda _request: {
+                "block_hashes_by_algo": {state.hash_algo: [[100, 200, 300]]},
+                "num_tokens": 96,
+            },
+        )
+        state.add_blocks([100, 200])
+        try:
+            for _ in range(3):
+                request = CompletionRequest(model="model", prompt=[1] * 96, stream=stream)
+                if with_handoff:
+                    request.disaggregated_params = handoff
+                result = await service._send_disagg_request(request)
+                if stream:
+                    assert [chunk async for chunk in result] == [b"data: [DONE]\n\n"]
+                else:
+                    assert result.choices[0].text == "ok"
+                assert state.num_active_requests() == 0
+                assert not router._req_routing_table
+                assert not router._pending_routed_blocks
+        finally:
+            await router.close()
+
+
 def _make_completion_response(
     text: str,
     finish_reason: str,
