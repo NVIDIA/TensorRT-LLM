@@ -18,10 +18,12 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from ..files import read_json
-from . import SPOOLCTL_PATH
+from . import GANG_PATH, SPOOLCTL_PATH
+from .gang import AGENT_PARAMS, NO_TREE_SPAWN
 from .scheduler import SpoolPaths
 from .server_runtime import MULTI_TASK_SLURM_VARS, rank_launch
 from .sessions import (
+    GATE_ROLES,
     MERGED_ENV_VARS,
     SessionSpec,
     describe_sessions,
@@ -53,6 +55,8 @@ MPI_SETTINGS_KEPT: tuple[str, ...] = (
 )
 #: The prefixes of MPI variables a run's environment may declare and keep through the scrub.
 _DECLARED_MPI_PREFIXES: tuple[str, ...] = ("OMPI_MCA_", "PMIX_MCA_", "OMPI_ALLOW_")
+#: What node 0 of a multi-node job sets for the remote launch (``gang.py``), kept the same way.
+GANG_AGENT_SETTINGS: tuple[str, ...] = (*AGENT_PARAMS, *NO_TREE_SPAWN)
 
 
 def single_task_scrub(keep: Sequence[str] = ()) -> str:
@@ -90,6 +94,11 @@ class RunEnvironment:
     sessions: tuple[SessionSpec, ...] = ()
     # ``perf.dev_spools``: the sessions the tuners submit to; no other prompt names them.
     dev_spools: tuple[str, ...] = ()
+    # The most devices one node holds (``environment.gpus_per_node``); ``None`` when undeclared.
+    gpus_per_node: int | None = None
+    # The nodes one engine's ranks span: more than one only for a member wider than a node,
+    # whose commands run in a multi-node job (:meth:`at_width`, ``gang.py``).
+    nodes: int = 1
 
     @property
     def ntasks(self) -> int:
@@ -100,6 +109,15 @@ class RunEnvironment:
     def needs_llmapi_launch(self) -> bool:
         """Whether the payload must be wrapped in ``trtllm-llmapi-launch``."""
         return self.ntasks > 1
+
+    def at_width(self, world_size: int) -> "RunEnvironment":
+        """This environment for one engine of ``world_size`` ranks, across as many nodes as it needs.
+
+        An engine wider than one node (``gpus_per_node``) spans ``ceil(world / per node)`` nodes:
+        its commands run in a multi-node job of that many nodes, launched by ``gang.py``.
+        """
+        size = max(1, int(world_size))
+        return replace(self, world_size=size, nodes=nodes_for_width(size, self.gpus_per_node))
 
     @property
     def launch_env(self) -> dict[str, str]:
@@ -143,12 +161,33 @@ class RunEnvironment:
             return f'PATH={shlex.quote(os.path.dirname(self.python))}:"$PATH" {launch}'
         return launch
 
+    def _gang_launch(self, argv: str, *, single_process: bool) -> str:
+        """``argv`` as one engine across the ``nodes`` of a multi-node job (``gang.py lead``).
+
+        The command runs on every node of the job. Node 0 runs ``argv``: under ``mpirun`` over
+        every node's devices when this is engine work, as one process (which may start the
+        ranks itself through ``server_runtime.rank_launch``) when ``single_process``. Every
+        other node lends its devices: it starts the daemons node 0's ``mpirun`` asks for, in the
+        environment this same command line gives it there.
+        """
+        lead = [self.python, str(GANG_PATH), "lead", "--nodes", str(self.nodes)]
+        if single_process:
+            # The launch agent node 0 sets is an MPI setting, kept like the declared ones.
+            kept = [k for k in self.env if str(k).startswith(_DECLARED_MPI_PREFIXES)]
+            scrub = single_task_scrub([*kept, *GANG_AGENT_SETTINGS])
+            payload = f"bash -c {shlex.quote(f'{scrub}; exec {argv}')}"
+            return f"{shlex.join(lead)} -- {payload}"
+        launch = f"{shlex.join([*lead, '--ranks', str(self.ntasks)])} -- {LLMAPI_LAUNCH} {argv}"
+        if os.path.isabs(self.python):
+            return f'PATH={shlex.quote(os.path.dirname(self.python))}:"$PATH" {launch}'
+        return launch
+
     def command(self, argv: str | Sequence[str], *, single_process: bool = False) -> str:
         """Return the command line ``argv`` prefixed for this environment.
 
         ``single_process`` is for work that is **not** engine work, such as a probe that imports
         the build and exits: one process whatever the world size, no launcher, the MPI
-        environment scrubbed.
+        environment scrubbed. Across ``nodes`` it runs on node 0 alone.
         """
         if not isinstance(argv, str):
             argv = " ".join(shlex.quote(str(part)) for part in argv)
@@ -156,7 +195,9 @@ class RunEnvironment:
             # Re-asked at one task: the launcher follows from the task count, and shrinking only
             # the payload would still start one copy of the probe per rank.
             return replace(self, world_size=1).command(argv, single_process=True)
-        if self.needs_llmapi_launch:
+        if self.nodes > 1:
+            argv = self._gang_launch(argv, single_process=single_process)
+        elif self.needs_llmapi_launch:
             argv = self._mpirun_launch(argv)
         elif single_process:
             # The process inherits a step's PMI variables: a spool script runs inside the
@@ -170,6 +211,48 @@ class RunEnvironment:
         if not isinstance(argv, str):
             argv = " ".join(shlex.quote(str(part)) for part in argv)
         return self.command(f"{shlex.quote(self.python)} {argv}", single_process=single_process)
+
+    @property
+    def _widest_nodes(self) -> int:
+        """The nodes this run's widest engine spans (``world_size`` is the widest member's)."""
+        return nodes_for_width(self.world_size, self.gpus_per_node)
+
+    def _describe_gang(self) -> str:
+        """How to run an engine wider than one node; empty when every engine fits one."""
+        nodes = self._widest_nodes
+        if nodes <= 1 or not self.gpus_per_node:
+            return ""
+        wide = self.at_width(self.world_size)
+        server = shlex.join([self.python, str(GANG_PATH), "lead", "--nodes", str(nodes)])
+        narrow = replace(self, world_size=self.gpus_per_node, nodes=1)
+        # Only a session of that many nodes ever starts the job: anywhere else it waits for ever.
+        holding = ", ".join(
+            f"`{s.name}`: `SPOOL={s.spool}`"
+            for s in self.sessions
+            if s.role in GATE_ROLES and s.nodes >= nodes
+        )
+        return (
+            f"This run has an engine **wider than one node** ({self.gpus_per_node} GPUs): "
+            f"{self.world_size} ranks span {nodes} nodes. Submit its work with "
+            f"`--nodes {nodes}` and no `--gpus` (it holds every device of each node) to a "
+            f"session of that many nodes{f' ({holding})' if holding else ''}; on any other "
+            "session the job waits for nodes that never come. Launch the engine with:\n"
+            "\n"
+            "```bash\n"
+            f"{wide._gang_launch('<your command>', single_process=False)}\n"
+            "```\n"
+            "\n"
+            "The same command runs on every node of the job: node 0 starts every rank with one "
+            "`mpirun`, and each other node starts what that `mpirun` asks of it, so never "
+            "branch on the node yourself. A process that starts its own ranks (a server) goes "
+            f"behind `{server} -- <command>` instead. An engine that fits one node is "
+            "launched on one node, with `-n` its own width:\n"
+            "\n"
+            "```bash\n"
+            f"{narrow._mpirun_launch('<your command>')}\n"
+            "```\n"
+            "\n"
+        )
 
     def describe(self) -> str:
         """The block injected verbatim into every agent's prompt."""
@@ -264,9 +347,10 @@ class RunEnvironment:
                 f"{self.ntasks} processes that each believe they are rank 0 of a world "
                 "of 1 and hang forever with no error.\n"
                 "\n"
-                if self.needs_llmapi_launch
+                if self.needs_llmapi_launch and self._widest_nodes == 1
                 else ""
             )
+            + self._describe_gang()
             + "**Do not construct a launcher command, do not probe for one, and do not call a "
             "test-runner skill.** The session was resolved before you started and it is not "
             "yours to rediscover. If this protocol does not fit what you need to run, that "
@@ -299,6 +383,27 @@ def shares_allocation_with_spool(env: "RunEnvironment") -> str | None:
     )
 
 
+def gpus_per_node(data: Mapping[str, Any]) -> int | None:
+    """The most devices one node of the run holds: ``environment`` or one of its sessions."""
+    env = data.get("environment") or {}
+    sizes = [env.get("gpus_per_node")] + [
+        s.get("gpus_per_node") for s in env.get("sessions") or () if isinstance(s, Mapping)
+    ]
+    sizes = [s for s in sizes if isinstance(s, int) and not isinstance(s, bool) and s > 0]
+    return max(sizes) if sizes else None
+
+
+def nodes_for_width(width: int | None, per_node: int | None) -> int:
+    """The nodes one engine of ``width`` ranks spans when a node holds ``per_node`` devices.
+
+    One while it fits a node or either is unknown: an undeclared ``gpus_per_node`` keeps every
+    engine on one node.
+    """
+    if not width or not per_node or width <= per_node:
+        return 1
+    return -(-width // per_node)
+
+
 def scheduler_owns_devices(kind: str) -> bool:
     """Whether a scheduler, not this process, decides the devices and the host.
 
@@ -329,6 +434,7 @@ def resolve_environment(
         spool=block.get("spool"),
         sessions=declared,
         dev_spools=_dev_spools(task_data.get("perf")),
+        gpus_per_node=gpus_per_node(task_data),
     )
 
 
@@ -409,6 +515,8 @@ __all__ = [
     "MULTI_TASK_SLURM_VARS",
     "RunEnvironment",
     "MPI_SETTINGS_KEPT",
+    "gpus_per_node",
+    "nodes_for_width",
     "SINGLE_TASK_MPI_SCRUB",
     "single_task_scrub",
     "resolve_environment",

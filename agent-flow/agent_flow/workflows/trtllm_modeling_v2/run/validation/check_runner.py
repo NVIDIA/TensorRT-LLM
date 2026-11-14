@@ -87,14 +87,16 @@ class CheckRunner:
         return list(features_through(self.task_data, unit))
 
     def _member_env(self, member: str | None) -> RunEnvironment:
-        """The run's environment at ``member``'s own world size.
+        """The run's environment at ``member``'s own world size, on as many nodes as it spans.
 
         Members of one unified target may differ in width (tp1 beside tep4)
-        when a scheduler hands each gate job its own devices.
+        when a scheduler hands each gate job its own devices. A member wider
+        than one node (``environment.gpus_per_node``) is one engine across
+        several: its checks run as multi-node jobs (:meth:`RunEnvironment.at_width`).
         """
         env = self.workflow._gate_env()
         size = parse_parallel_segment(member)[1] if member else None
-        return replace(env, world_size=size) if size else env
+        return env.at_width(size) if size else env
 
     def _member_runner(self, member: str | None, gpus: str | None = None, *, nodes: int = 1) -> Any:
         """The gate runner for ``member``: under a scheduler, a job asking for its world size.
@@ -365,9 +367,10 @@ class CheckRunner:
                 records=gate_records.records_for(self.workspace), **common(runner),
             )  # fmt: skip
         if gate == disagg.GATE_NAME:
+            # The test places its own engines, one node's worth each (`_gate_nodes`).
             return lambda runner: disagg.run_disagg_gate(
-                env, workdir=workdir, task_data=self._with_dataset(spec, gate), runner=runner,
-                unit=unit, member=member,
+                replace(env, nodes=1), workdir=workdir, task_data=self._with_dataset(spec, gate),
+                runner=runner, unit=unit, member=member,
             )  # fmt: skip
         if gate == serve.GATE_NAME:
             return lambda runner: serve.run_serve_gate(
@@ -519,16 +522,18 @@ class CheckRunner:
         count = spec.device_count(check.member) if spec else None
         return str(count) if count else None
 
+    def _gate_nodes(self, check: contract_mod.Check) -> int:
+        """The nodes ``check``'s job holds: the disaggregated test's, else its member's engine's."""
+        if check.gate == disagg.GATE_NAME:
+            spec = disagg.DisaggSpec.from_task(self._spec_for(check.unit)[0])
+            return spec.nodes if spec else 1
+        return self._member_env(check.member).nodes
+
     def _gate(self, check: contract_mod.Check, log) -> Any:
         """Run ``check``'s gate on the target this workflow sees, journal it, and return its result."""
         call = self._gate_call(check)
-        disagg_spec = (
-            disagg.DisaggSpec.from_task(self._spec_for(check.unit)[0])
-            if check.gate == disagg.GATE_NAME
-            else None
-        )
         runner = self._member_runner(
-            check.member, self._gate_gpus(check), nodes=disagg_spec.nodes if disagg_spec else 1
+            check.member, self._gate_gpus(check), nodes=self._gate_nodes(check)
         )
         result = self._gate_until_verdict(lambda: call(runner), log)
         self.gate_log.record(result)

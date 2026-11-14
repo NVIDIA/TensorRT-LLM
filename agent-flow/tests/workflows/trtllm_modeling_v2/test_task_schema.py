@@ -13,7 +13,7 @@ import yaml
 
 from agent_flow.workflows.trtllm_modeling_v2 import cli
 from agent_flow.workflows.trtllm_modeling_v2.operators import tree_anchors
-from agent_flow.workflows.trtllm_modeling_v2.spec import derive, task_schema
+from agent_flow.workflows.trtllm_modeling_v2.spec import derive, lint, task_schema
 from agent_flow.workflows.trtllm_modeling_v2.spec.task_schema import load_and_validate_task_yaml
 
 from .conftest import SCRATCH
@@ -248,3 +248,42 @@ def test_quantized_core_has_one_kv_dtype_source_and_structural_hybrid_hints(tmp_
         {"text_config": {"layer_types": ["linear_attention", "full_attention"]}}
     )
     assert derive.hybrid_marker({"architectures": ["Unseen"]}) is None
+
+
+def test_a_member_wider_than_a_node_takes_the_sites_devices_per_node_and_asks_for_a_session(
+    tmp_path,
+):
+    site = dict(device={"arch": "sm_100", "gpus_per_node": 4})
+    with pytest.raises(derive.DeriveError, match=r"tep8 \(2 nodes\) is wider than one node"):
+        _derive(tmp_path, "tep4 tep8", **site)
+    environment = {
+        "kind": "session_spool",
+        "python": "/opt/venv/bin/python",
+        "spool": str(tmp_path / "spool"),
+        "env": {"TMPDIR": SCRATCH, "CLAUDE_CODE_TMPDIR": SCRATCH},
+        "sessions": [
+            {"name": "gates", "spool": str(tmp_path / "spool"), "role": "gates", "nodes": 2}
+        ],
+    }
+    path = _derive(tmp_path, "tep4 tep8", clean=True, environment=environment, **site)
+    spec = load_and_validate_task_yaml(path)
+    assert spec["environment"]["gpus_per_node"] == 4
+    assert task_schema.member_nodes(spec, "tep8") == 2
+    report = (path.parent / derive.REPORT_FILENAME).read_text()
+    assert "tep8 (2 nodes)" in report
+
+    # The tune campaign runs on one node: it is given the members that fit one, and its keep
+    # gate the widest of them rather than the widest member.
+    site["environment"] = environment
+    path = _derive(tmp_path, "tp1 tep4 tep8 tune", clean=True, **site)
+    spec = load_and_validate_task_yaml(path)
+    assert [c["name"] for c in spec["perf"]["configs"]] == ["tp1", "tep4"]
+    assert spec["perf"]["campaign"]["accuracy"] == {"members": ["tep4"]}
+    assert "perf (left out: tep8)" in (path.parent / derive.REPORT_FILENAME).read_text()
+    assert "perf-member-spans-nodes" not in {f.rule for f in lint.lint_task(spec).findings}
+    # Members that all fit one node leave the campaign's defaults alone.
+    spec = load_and_validate_task_yaml(_derive(tmp_path, "tp1 tep4 tune", clean=True, **site))
+    assert [c["name"] for c in spec["perf"]["configs"]] == ["tp1", "tep4"]
+    assert "campaign" not in spec["perf"]
+    with pytest.raises(derive.DeriveError, match=r"every member \(tep8\) is wider than one node"):
+        _derive(tmp_path, "tep8 tune", clean=True, **site)

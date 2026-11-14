@@ -57,6 +57,7 @@ goal words cannot say.
 | the request says | the spec | why |
 |---|---|---|
 | members, e.g. "TP4, TEP4, ADP4" | `members: [tp4, tep4, dep4]` (ADP = attention DP + EP = `dep`) | |
+| a member wider than one node, e.g. "TEP8 on GB300" (4 GPUs a node) | `members: [tep8]`, `environment.gpus_per_node: 4` and a gates session of `nodes: 2`; a width that fills whole nodes | the member is **one engine across nodes**: each of its checks is a multi-node job whose node 0 starts every rank with one `mpirun` and whose other nodes start that `mpirun`'s daemons through the spool (`infra/compute/gang.py`), as the tree's multi-node tests run under `srun`. Preflight probes one MPI world and an NCCL all-reduce across the nodes first. The tune campaign runs on one node: `derive` gives it the members that fit one and the keep gate the widest of them, and the lint blocks a `perf.configs` entry or keep-gate member that spans nodes (`perf-member-spans-nodes`). The member's CI accuracy cases go on a test list whose stage has that many GPUs (the tree's multi-node lists): delivery checks it |
 | "X needs full validation" | X takes every unit and **one variant per feature axis** at X: the variant's `members: [X]`, `gates: [accuracy]` | a cross product of axes (KV dtype x chunking x reuse ...) multiplies the contract; add a combination only when the request names it |
 | "Y only aggregate / text-only" | Y in `members.default` for core alone; its variant and feature cells in `coverage.accept` | |
 | "<feature> smoke" | the feature in `features`, `profile: {<feature>: smoke}`, its members narrowed | |
@@ -166,6 +167,10 @@ benchmark you start by hand runs captured too.
   NVRTC checks.
 - A `session_spool` environment's spools exist once their sessions run. Until then lint with
   `--sessions-planned`; start the sessions before launch.
+- `environment.gpus_per_node` (or a session's) is what tells a member wider than one node from
+  one that fits: without it every engine is launched on one node. A member that spans nodes needs
+  a gates session of that many nodes of one allocation (`nodes: N`, a watcher on each); the lint
+  blocks one without it (`member-nodes-unavailable`).
 - Gate jobs go to `environment.spool` and every `gates` or `any` session; a `work` session gets
   only what a worker submits to it.
 

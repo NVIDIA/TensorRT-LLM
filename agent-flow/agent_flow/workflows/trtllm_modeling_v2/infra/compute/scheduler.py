@@ -37,15 +37,19 @@ MULTI-NODE JOBS
     <spool>/gangs/<name>/ready/<watcher>   a member drained for it
     <spool>/gangs/<name>/go.json           every node is drained: each starts its part
     <spool>/gangs/<name>/parts/<rank>.json how each node's part ended
+    <spool>/gangs/<name>/relay/            what the job's parts hand each other (``gang.py``)
 
 A job declaring ``nodes=N`` holds N whole nodes of one allocation: one watcher per node, all on
 this spool (a session of ``nodes: N``). The watcher that admits it leads: it picks N-1 live peers
 of its allocation and records them; each stops admitting GPU work and, once drained, says it is
 ready. When all are, the leader claims the job, writes ``go.json`` and every node runs the same
-script under ``MV2FLOW_JOB_NODES``, ``MV2FLOW_JOB_NODE_RANK``, ``MV2FLOW_JOB_HOSTS`` and
-``MV2FLOW_JOB_MASTER``, rank 0's log at ``logs/<name>.log``, rank r's at ``logs/<name>.node<r>.log``.
-A part that fails stops the others; the job's receipt waits for every part and carries the
-first that failed. One multi-node job holds a spool's nodes at a time.
+script under ``MV2FLOW_JOB_NODES``, ``MV2FLOW_JOB_NODE_RANK``, ``MV2FLOW_JOB_HOSTS``,
+``MV2FLOW_JOB_MASTER`` and ``MV2FLOW_JOB_GANG_DIR`` (``gangs/<name>``), rank 0's log at
+``logs/<name>.log``, rank r's at ``logs/<name>.node<r>.log``. A part that fails stops the others;
+the job's receipt waits for every part and carries the first that failed. What the processes of
+every part imported is judged together then (``logs/<name>.node<r>.resolve.jsonl`` beside node
+0's): one engine's ranks on another node are processes of the job like any other. One multi-node
+job holds a spool's nodes at a time. ``gang.py`` runs one engine across such a job's nodes.
 
 LOST ALLOCATIONS
 ================
@@ -371,6 +375,14 @@ def parse_header(text: str) -> tuple[dict[str, str], list[str]]:
                 continue
             values[key] = value
     return values, errors
+
+
+def part_name(name: str, rank: int) -> str:
+    """The name node ``rank``'s part of multi-node job ``name`` runs and logs under.
+
+    Node 0's part keeps the job's own name.
+    """
+    return name if rank == 0 else f"{name}.node{rank}"
 
 
 def stamp_rerun(script: str, reruns: int) -> str:
@@ -1347,7 +1359,7 @@ class Scheduler:
             if self.watcher_id not in members[1:]:
                 continue
             rank, name = members.index(self.watcher_id), root.name
-            part = f"{name}.node{rank}"
+            part = part_name(name, rank)
             if part in self.jobs or (root / GANG_PARTS / f"{rank}.json").exists():
                 continue
             live = self._live(now) if live is None else live
@@ -1534,6 +1546,7 @@ class Scheduler:
                     "MV2FLOW_JOB_NODE_RANK": str(gang["rank"]),
                     "MV2FLOW_JOB_HOSTS": ",".join(gang["hosts"]),
                     "MV2FLOW_JOB_MASTER": gang["hosts"][0],
+                    "MV2FLOW_JOB_GANG_DIR": str(self.paths.gangs / gang["name"]),
                 }
             )
         header = (
@@ -1816,8 +1829,19 @@ class Scheduler:
         return (self.paths.running / f"{name}.sh").exists()
 
     def _judge_provenance(self, job: RunningJob, verdict: Verdict) -> Verdict:
-        """Refuse a result whose processes imported from different checkouts."""
-        records = _provenance.read_records(self.paths.resolve_log(job.spec.name))
+        """Refuse a result whose processes imported from different checkouts.
+
+        A multi-node job's processes are those of every node: each part logs what its own
+        imported, under its own name, and the job's receipt answers for all of them.
+        """
+        nodes = int((job.gang or {}).get("nodes") or 1)
+        records = [
+            record
+            for rank in range(nodes)
+            for record in _provenance.read_records(
+                self.paths.resolve_log(part_name(job.spec.name, rank))
+            )
+        ]
         if not records:
             return verdict
         judged = _provenance.check(records, tree=job.spec.tree or None)
@@ -2173,6 +2197,7 @@ __all__ = [
     "job_spec_from_script",
     "parse_duration",
     "parse_header",
+    "part_name",
     "read_device_memory_mib",
     "read_environ",
     "read_proc_table",

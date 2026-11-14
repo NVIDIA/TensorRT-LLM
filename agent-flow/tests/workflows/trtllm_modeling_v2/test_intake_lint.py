@@ -338,3 +338,41 @@ def test_bad_queue_tiers_are_batched_as_vocabulary_errors(tier):
     )
     with pytest.raises(vocab.VocabularyError, match=r"queue\[0\].tier"):
         vocab.parse_vocabulary(doc)
+
+
+def test_a_member_wider_than_a_node_needs_a_session_of_its_nodes():
+    task = copy.deepcopy(_GOOD)
+    task["members"] = {"default": ["tp4", "tep4", "dep4", "tep8"]}
+    findings = {f.rule: f for f in lint.lint_task(task).findings}
+    spans = findings["member-spans-nodes"]
+    assert spans.severity == lint.INFO
+    assert "tep8 (2 nodes) is wider than one node of 4 GPUs" in spans.message
+    # The spec declares no multi-node gates session: preflight would stop.
+    unavailable = findings["member-nodes-unavailable"]
+    assert unavailable.severity == lint.BLOCK and "`nodes: 2`" in unavailable.fix
+    # The tune campaign's keep gate defaults to the widest member, which runs on one node:
+    # its jobs would be refused, so this is no choice the notes can accept.
+    tuned = findings["perf-member-spans-nodes"]
+    assert tuned.severity == lint.BLOCK and "keep-gate member tep8" in tuned.message
+    assert tuned.rule not in lint.ACCEPTABLE_BLOCKS
+
+    task["environment"]["sessions"] = [
+        {"name": "g", "spool": "/s/g", "role": "gates", "nodes": 2, "gpus_per_node": 4}
+    ]
+    task["perf"]["campaign"] = {"accuracy": {"members": ["dep4"]}}
+    rules = _rules(lint.lint_task(task))
+    assert "member-spans-nodes" in rules
+    assert (
+        not {"member-nodes-unavailable", "session-nodes-unneeded", "perf-member-spans-nodes"}
+        & rules
+    )
+
+    # A width that does not fill whole nodes leaves the last one's devices idle.
+    task["members"]["default"].append("tep6")
+    assert "tep6 does not fill whole 4-GPU nodes" in _finding("member-partial-node", task).message
+
+    # A multi-node session that no member and no disaggregated test needs is still said.
+    task["members"] = copy.deepcopy(_GOOD["members"])
+    unneeded = _finding("session-nodes-unneeded", task)
+    assert unneeded.severity == lint.INFO and "no check needs more than 1" in unneeded.message
+    assert "member-spans-nodes" not in _rules(lint.lint_task(task))

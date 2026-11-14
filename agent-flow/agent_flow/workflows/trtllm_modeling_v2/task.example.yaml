@@ -127,7 +127,7 @@ environment:
   # --- session_spool ------------------------------------------------------
   # REQUIRED with session_spool: the gate spool, a directory a running session watches.
   # spool: /path/to/scratch/spool
-  # gpus_per_node: 4
+  # gpus_per_node: 4                        # a member wider than this spans nodes (below)
   # gpu_memory_gib: 288                     # per device: the lint sizes engines and disagg by it
   # time_limit: "04:00:00"                  # the bare spool's own session
   # The image the GPU jobs run in, if any, and how host paths appear inside it: the intake lint
@@ -141,7 +141,9 @@ environment:
   # work. With a `time_limit` it is in hand-over `handover_lead` before its end: start the next
   # session on the same spool before then and it takes the jobs that no longer fit.
   # `nodes: N` runs the entry once on each of N nodes, each a watcher of the spool: a job submitted
-  # with `--nodes N` holds them all. No check of this workflow needs more than one node.
+  # with `--nodes N` holds them all. A member wider than `gpus_per_node` (tep8 on 4-GPU nodes) is
+  # one engine across ceil(width / gpus_per_node) nodes: its checks are such jobs, so a gates
+  # session must hold that many nodes. Without one, every member fits one node.
   # sessions:
   #   - name: a
   #     spool: /path/to/scratch/spool          # the gate spool above; absolute, one per session

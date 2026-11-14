@@ -32,7 +32,8 @@ The agent prepares the spec and launches the workflow; missing inputs must be re
 derive` writes a starting spec (no `site.yaml` needed), and `trtllm-modeling-v2 intake lint` checks
 it for slow or stalling choices (eager gates, a batch below the claimed concurrency, a perf
 config whose CUDA graphs stop below the live requests a rank holds, a member too
-narrow for one engine, disaggregation wider than a session, variant cross products, variants that
+narrow for one engine, disaggregation wider than a session, a member wider than a node without a
+session of that many nodes, variant cross products, variants that
 boot at every member, a feature proven
 at several members or again under another axis, unusable accuracy anchors, open-ended boot probes) and blocks an accuracy check that runs without CUDA graphs and
 what would stop preflight (uncovered requested cells, a KV-cache dtype the engine does not load),
@@ -89,7 +90,11 @@ a container runtime, a shell). The run needs:
 - a session with a `time_limit` to be followed before its end: from `handover_lead` before then it
   starts only jobs that fit, and the next session started on the same spool takes the rest;
 - one orchestrator per workspace (a new one resumes from it), on a host that sees the run
-  directory, checkout and checkpoints at the same paths as every session.
+  directory, checkout and checkpoints at the same paths as every session;
+- for a member wider than one node (`environment.gpus_per_node`), a gates session of that many
+  nodes: each of its checks is one engine across a multi-node job, whose node 0 starts every rank
+  with `mpirun` and whose other nodes start that `mpirun`'s daemons, handed to them through the
+  spool (`infra/compute/gang.py`); the nodes reach each other over TCP, as the engine's do.
 
 `trtllm-modeling-v2 monitor status` shows each session, and raises `SESSION_ENDING` while one is in
 hand-over with no newer session on its spool. A gate, substrate or regression job the run has

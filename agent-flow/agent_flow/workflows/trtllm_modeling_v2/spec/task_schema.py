@@ -23,7 +23,12 @@ from agent_flow.agent_runtime import AGENTS_FIELD, validate_agents
 
 from ..agents.roles import ROLES
 from ..checks import accuracy_policy
-from ..infra.compute.environment import EnvironmentError, check_tmpdir
+from ..infra.compute.environment import (
+    EnvironmentError,
+    check_tmpdir,
+    gpus_per_node,
+    nodes_for_width,
+)
 from ..infra.compute.sessions import validate_sessions
 from ..infra.git import COMMIT_POLICY_FIELD, validate_commit_policy_block
 from ..tune.schema import validate_perf_block
@@ -1470,14 +1475,23 @@ def _require_relative_on_variants(data: Mapping[str, Any], errors: list[str]) ->
             )
 
 
-def gpus_per_node(data: Mapping[str, Any]) -> int | None:
-    """The most devices one node of the run holds: ``environment`` or one of its sessions."""
-    env = data.get(ENVIRONMENT_FIELD) or {}
-    sizes = [env.get("gpus_per_node")] + [
-        s.get("gpus_per_node") for s in env.get("sessions") or () if isinstance(s, Mapping)
-    ]
-    sizes = [s for s in sizes if isinstance(s, int) and not isinstance(s, bool) and s > 0]
-    return max(sizes) if sizes else None
+def member_nodes(data: Mapping[str, Any], member: str | None) -> int:
+    """The nodes ``member``'s engine spans under the run's ``gpus_per_node`` (:func:`nodes_for_width`)."""
+    if not member:
+        return 1
+    try:
+        width = parse_parallel_segment(str(member))[1]
+    except TaskSchemaError:
+        return 1
+    return nodes_for_width(width, gpus_per_node(data))
+
+
+def widest_spanning_width(data: Mapping[str, Any]) -> int | None:
+    """The width of the widest gated member whose engine spans more than one node, else ``None``."""
+    world = widest_world_size(data, 1)
+    members = {m for unit in assembly_units(data) for m in members_for(data, unit, world)}
+    widths = [parse_parallel_segment(m)[1] or 0 for m in members if member_nodes(data, m) > 1]
+    return max(widths, default=0) or None
 
 
 def _require_disagg_test(data: Mapping[str, Any], errors: list[str]) -> None:
@@ -1754,6 +1768,9 @@ __all__ = [
     "ANCHOR_RELATIVE",
     "ANCHOR_STATES",
     "gpus_per_node",
+    "member_nodes",
+    "nodes_for_width",
+    "widest_spanning_width",
     "COVERAGE_FIELD",
     "COVERAGE_KEYS",
     "resolve_gate_timeout",

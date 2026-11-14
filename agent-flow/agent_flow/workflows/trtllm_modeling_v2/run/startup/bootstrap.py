@@ -101,6 +101,10 @@ def substrate_inputs(task_data: Mapping[str, Any], environment: RunEnvironment) 
         options_text = Path(str(options)).read_text(encoding="utf-8", errors="replace")
     block = dict(task_data.get("environment") or {})
     resolved = dataclasses.asdict(dataclasses.replace(environment, sessions=(), dev_spools=()))
+    # Devices per node is the spec block's (below), and the run's own environment spans one
+    # node: neither changes what a pass recorded before they were resolved proves.
+    for derived in ("gpus_per_node", "nodes"):
+        resolved.pop(derived, None)
     parts: dict[str, Any] = {
         "environment": {
             **resolved,
@@ -290,6 +294,24 @@ def _cpu_probe_runner(workflow, result: PreflightResult):
     )
 
 
+def _gang_runner(workflow, result: PreflightResult):
+    """A multi-node job's runner, by node count: how the substrate gate boots a member that spans."""
+    if workflow._shell_runner_override is not None:
+        return lambda nodes: workflow._shell_runner_override
+
+    def runner(nodes: int):
+        return shell_runner_for(
+            select_command_executor(
+                result.environment,
+                tree=workflow.task_data.get("trtllm_repo_path"),
+                nodes=nodes,
+                note=lambda said: workflow.journal.event("waiting", said),
+            )
+        )
+
+    return runner
+
+
 def _check_processor(workflow, result: PreflightResult, log) -> bool:
     """Load a multimodal checkpoint's processor under the run's interpreter; False on a missing import."""
     try:
@@ -339,6 +361,7 @@ def _prove_substrate(workflow, result, log) -> bool:
             shell_runner=workflow._shell_runner,
             notes=result.notes,
             workdir=record_path.parent,
+            gang_runner=_gang_runner(workflow, result),
         )
     except PreflightError as exc:
         record_path.unlink(missing_ok=True)

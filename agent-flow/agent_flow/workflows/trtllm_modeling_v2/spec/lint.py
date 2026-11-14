@@ -8,7 +8,7 @@ one for the request: settings that make every gate slow (eager graphs, a batch
 below the concurrency it claims), scope that multiplies the contract (variant
 cross products, a feature proven at several members or again under another
 axis, a member too narrow for one engine, a disaggregated member wider than a
-session), accuracy that
+session, a member wider than a node without a session of its nodes), accuracy that
 cannot judge anything (a placeholder anchor, a chat-template protocol cut off
 early), boot probes that fail on near ties, a launch the environment cannot
 start, a compute session no gate reaches, and notes that tell the roles what
@@ -46,7 +46,9 @@ from . import variants as variants_mod
 from .task_schema import (
     assembly_units,
     gpus_per_node,
+    member_nodes,
     members_for,
+    nodes_for_width,
     parse_parallel_segment,
     profile_of,
     widest_world_size,
@@ -489,15 +491,19 @@ def placement_rules(ctx: LintContext) -> Iterator[Finding]:
         return
     nodes = _session_nodes(task)
     disagg_spec = disagg_checks.DisaggSpec.from_task(task)
-    if nodes > 1 and not (disagg_spec and disagg_spec.nodes > 1):
+    spans = _spanning_members(ctx)
+    needed = max([*spans.values(), disagg_spec.nodes if disagg_spec else 1, 1])
+    if nodes > needed:
         yield Finding(
             "session-nodes-unneeded",
             INFO,
-            f"a gates session holds {nodes} nodes, but no check needs more than one (the "
-            "disaggregated-serving test runs on one node): a multi-node allocation waits "
-            "longer to start and to renew than single-node ones",
-            "use single-node sessions",
+            f"a gates session holds {nodes} nodes, but no check needs more than {needed} (no "
+            "member's engine spans more, and the disaggregated-serving test runs on "
+            f"{disagg_spec.nodes if disagg_spec else 1}): a multi-node allocation waits longer "
+            "to start and to renew than single-node ones",
+            f"use sessions of {needed} node{'s' if needed > 1 else ''}",
         )
+    yield from _spanning_member_findings(ctx, spans, per_node, nodes)
     if "disagg" not in assembly_units(task):
         return
     spec = disagg_checks.DisaggSpec.from_task(task) or disagg_checks.DisaggSpec(
@@ -537,6 +543,96 @@ def _width(member: str) -> int:
         return parse_parallel_segment(member)[1] or 1
     except Exception:
         return 1
+
+
+def _spanning_members(ctx: LintContext) -> dict[str, int]:
+    """Each gated member wider than one node, and the nodes its engine spans."""
+    if ctx.contract is not None:
+        members = {c.member for c in ctx.contract.required()}
+    else:
+        members = {
+            m for unit in assembly_units(ctx.task) for m in members_for(ctx.task, unit, ctx.world)
+        }
+    spans = {m: member_nodes(ctx.task, m) for m in members if m}
+    return {m: n for m, n in sorted(spans.items(), key=lambda kv: (_width(kv[0]), kv[0])) if n > 1}
+
+
+def _spanning_member_findings(
+    ctx: LintContext, spans: Mapping[str, int], per_node: int, session_nodes: int
+) -> Iterator[Finding]:
+    """A member wider than a node: one engine across a multi-node job, which needs its session."""
+    if not spans:
+        return
+    listed = ", ".join(f"{m} ({n} nodes)" for m, n in spans.items())
+    widest = max(spans.values())
+    yield Finding(
+        "member-spans-nodes",
+        INFO,
+        f"{listed} {'is' if len(spans) == 1 else 'are'} wider than one node of {per_node} GPUs: "
+        "each check there runs one engine across a multi-node job (node 0's `mpirun` starts "
+        "every rank; the other nodes start its daemons through the spool), so it waits for "
+        "that many whole nodes of one allocation",
+    )
+    if ctx.environment.get("kind") != "session_spool" or session_nodes < widest:
+        yield Finding(
+            "member-nodes-unavailable",
+            BLOCK,
+            f"{listed} need{'s' if len(spans) == 1 else ''} a gates session of {widest} nodes "
+            f"and the spec declares {session_nodes} (kind "
+            f"`{ctx.environment.get('kind') or 'local'}`): preflight stops on it, and the checks "
+            "would wait for nodes that never come",
+            f"declare a `session_spool` gates session with `nodes: {widest}` and "
+            f"`gpus_per_node: {per_node}`, or gate members that fit one node",
+        )
+    partial = [m for m in spans if _width(m) % per_node]
+    if partial:
+        yield Finding(
+            "member-partial-node",
+            WARN,
+            f"{', '.join(partial)} do{'es' if len(partial) == 1 else ''} not fill whole "
+            f"{per_node}-GPU nodes: the multi-node job holds every device of each node, and "
+            "the last node's spare devices sit idle for every check there",
+            f"gate members whose width is a multiple of {per_node}",
+        )
+    tuned = _tuned_across_nodes(ctx, per_node)
+    if tuned:
+        yield Finding(
+            "perf-member-spans-nodes",
+            BLOCK,
+            f"the tune campaign would run {', '.join(tuned)} across nodes, and it measures, "
+            "profiles and keep-gates on one node: those jobs are refused, so the campaign "
+            "ends `tune-failed` whatever the onboarding delivers",
+            "name `perf.configs` and `perf.campaign.accuracy.members` at members that fit one "
+            "node (the keep gate defaults to the widest member), or `gate: off`",
+        )
+
+
+def _tuned_across_nodes(ctx: LintContext, per_node: int) -> list[str]:
+    """What the tune campaign would run on more than one node: perf configs and keep-gate members."""
+    from ..tune.schema import keep_gate_off
+    from ..tune.spec import serving_options
+
+    perf = ctx.task.get("perf")
+    if not isinstance(perf, Mapping) or not perf.get("enabled"):
+        return []
+    found = []
+    for name, _, options in serving_options(ctx.task):
+        width = max(1, int(options.get("tensor_parallel_size") or 1)) * max(
+            1, int(options.get("pipeline_parallel_size") or 1)
+        )
+        if nodes_for_width(width, per_node) > 1:
+            found.append(f"perf config {name or 'default'} ({width} ranks)")
+    block = (perf.get("campaign") or {}).get("accuracy")
+    if keep_gate_off(block):
+        return found
+    block = block if isinstance(block, Mapping) else {}
+    members = [str(m) for m in block.get("members") or ()]
+    if not members:
+        unit = str(block.get("unit") or "core")
+        candidates = members_for(ctx.task, unit, ctx.world)
+        members = [max(candidates, key=_width)] if candidates else []
+    found += [f"keep-gate member {m}" for m in members if member_nodes(ctx.task, m) > 1]
+    return found
 
 
 def scope_rules(ctx: LintContext) -> Iterator[Finding]:
