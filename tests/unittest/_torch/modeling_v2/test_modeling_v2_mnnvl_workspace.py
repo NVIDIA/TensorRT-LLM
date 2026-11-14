@@ -11,12 +11,12 @@ calls. Plain arithmetic: no GPU, no workspace allocated.
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.mnnvl_allreduce import (
+from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
+from tensorrt_llm._torch.modeling_v2.catalog.comm.mnnvl_allreduce import (
     _ONE_SHOT_BYTES,
     workspace_bytes,
     workspace_bytes_up_to,
 )
-from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
 
 # (hidden, world): the two default targets at their MNNVL sizes.
 _SHAPES = [(2880, 8), (2880, 16), (7168, 8), (7168, 16)]

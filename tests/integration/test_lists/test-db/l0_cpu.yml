@@ -131,6 +131,7 @@ l0_cpu:
   - unittest/_torch/modeling_v2/test_modeling_v2_ci_selection.py
   - unittest/_torch/modeling_v2/test_modeling_v2_contracts.py
   - unittest/_torch/modeling_v2/test_modeling_v2_native_loader.py
+  - unittest/_torch/modeling_v2/test_modeling_v2_package_location.py
   - unittest/_torch/modeling_v2/test_modeling_v2_rank_agreement.py
   - unittest/_torch/modeling_v2/test_modeling_v2_env_scope.py
   - unittest/_torch/modeling_v2/test_modeling_v2_reference_precision.py

@@ -104,9 +104,7 @@ def _max_rel(a, b):
 
 
 def _q(ag, w_qa, w_qb, w_kb):
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_mla import (
-        op,  # noqa: F401
-    )
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_mla import op  # noqa: F401
 
     return torch.ops.trtllm.k3_mla_q(ag, w_qa, EPS, w_qb, w_kb, True)
 
@@ -181,9 +179,7 @@ def _kv_rows(page_table, page_offset, seq_len, tokens):
 
 
 def _qkv(ag, weights, pool, row_stride, page_table, page_offset, seq_len):
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_mla import (
-        op,  # noqa: F401
-    )
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_mla import op  # noqa: F401
 
     w_qa, w_qb, w_kb, w_kv = weights
     return torch.ops.trtllm.k3_mla_qkv(
@@ -262,7 +258,7 @@ def test_qkv_short_length():
 
 def test_q_rejects():
     """More than 64 tokens, or page-table rows / lengths that do not describe R requests of the call's tokens."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_mla import op
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_mla import op
 
     w_qa, w_qb, w_kb, w_kv = _weights(1)
     assert op.supports_q(_ag(1, 64), w_qa, w_qb, w_kb)

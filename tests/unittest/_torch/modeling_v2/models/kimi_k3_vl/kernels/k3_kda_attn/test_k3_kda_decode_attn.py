@@ -72,7 +72,7 @@ pytestmark = pytest.mark.skipif(not _sm100(), reason="needs SM100 (tcgen05, TMA,
 
 def _ops():
     import tensorrt_llm  # noqa: F401  (registers the trtllm ops)
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_kda_attn import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_kda_attn import (
         op,  # noqa: F401
     )
 
@@ -139,9 +139,7 @@ class Rows:
     """The projection rows the fused kernel computes for x: the stream alone, its Lamport buffers decoded."""
 
     def __init__(self, wt):
-        from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_kda_attn import (
-            op,
-        )
+        from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_kda_attn import op
 
         self.wt = wt
         self.bufs = op.make_buffers(torch.device("cuda"), op.CTAS)
@@ -165,9 +163,7 @@ class Rows:
 
 class FusedPath:
     def __init__(self, wt, pools):
-        from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_kda_attn import (
-            op,
-        )
+        from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_kda_attn import op
 
         self.wt, self.p = wt, pools
         self.bufs = op.make_buffers(torch.device("cuda"), op.FUSED_CTAS)
@@ -326,9 +322,7 @@ def test_epoch_wrap():
     layer): four launches write nothing outside the buffers (each inside guard bands), give the bits of a run from
     zero, and keep the counter in 0..2."""
     _ops()
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_kda_attn import (
-        op,
-    )
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_kda_attn import op
 
     with torch.inference_mode():
         wt = make_weights(13)
@@ -427,9 +421,7 @@ def test_shared_buffers_with_verify():
     same launches on a set of their own, one at a time. Both run the same stream role (all 8 token rows published,
     the same words re-armed) and advance every CTA's index once per launch, so either may follow the other."""
     _ops()
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_kda_attn import (
-        op,
-    )
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_kda_attn import op
 
     dev = torch.device("cuda")
     with torch.inference_mode():

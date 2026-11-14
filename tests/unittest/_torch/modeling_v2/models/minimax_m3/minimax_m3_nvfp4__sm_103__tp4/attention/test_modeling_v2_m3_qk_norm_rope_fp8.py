@@ -10,7 +10,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp4.ops.attention.m3_qk_norm_rope_fp8 import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp4.ops.attention.m3_qk_norm_rope_fp8 import (  # noqa: E501
     m3_qk_norm_rope_fp8 as op,
 )
 

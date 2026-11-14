@@ -25,7 +25,7 @@ from __future__ import annotations
 import ast
 from typing import Optional
 
-PACKAGE = "tensorrt_llm._torch._experimental.modeling_v2"
+PACKAGE = "tensorrt_llm._torch.modeling_v2"
 
 
 def resolve(name: str, level: int, package: str) -> Optional[str]:

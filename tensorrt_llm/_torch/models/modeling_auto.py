@@ -6,9 +6,8 @@ from typing import Generic, Optional, Type
 from tensorrt_llm.logger import logger
 
 from ..._errors import UnsupportedError
-from .._experimental.modeling_v2._router_index import (ModelingV2Mode, NoTarget,
-                                                       resolved_mode)
 from ..model_config import ModelConfig
+from ..modeling_v2._router_index import ModelingV2Mode, NoTarget, resolved_mode
 from ..utils import model_extra_attrs
 from .modeling_utils import (DecoderModelForCausalLM, TConfig, TModel,
                              get_registered_model_class,

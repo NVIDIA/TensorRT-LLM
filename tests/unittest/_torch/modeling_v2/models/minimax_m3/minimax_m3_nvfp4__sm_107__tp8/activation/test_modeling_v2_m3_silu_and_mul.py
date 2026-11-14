@@ -7,7 +7,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.activation.m3_silu_and_mul import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.activation.m3_silu_and_mul import (  # noqa: E501
     m3_silu_and_mul as op,
 )
 

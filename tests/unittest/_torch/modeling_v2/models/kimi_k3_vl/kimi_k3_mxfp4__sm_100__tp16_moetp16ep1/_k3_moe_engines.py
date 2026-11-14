@@ -98,7 +98,7 @@ def routed(m: int, seed: int, case: str = "random"):
     tokens, ``case`` "shared" gives both the same logits (the same 16 experts) and "disjoint" sets the second
     token's logits to -30 on the first token's raw-logit top 16, so their experts mostly differ."""
     import tensorrt_llm  # noqa: F401
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_route_quant import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_route_quant import (
         op as _rq,  # noqa: F401
     )
 
@@ -134,7 +134,7 @@ class Engine:
 
     def create(self, push=()):
         op = importlib.import_module(
-            "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl."
+            "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl."
             "kimi_k3_mxfp4__sm_100__tp16_moetp16ep1.kernels.k3_moe_engines.op"
         )
 
@@ -147,7 +147,7 @@ class Engine:
 
     def call(self, layer, tokens, out=None):
         prefix = (
-            "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl."
+            "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl."
             "kimi_k3_mxfp4__sm_100__tp16_moetp16ep1.ops.moe"
         )
         k3_moe_m1 = importlib.import_module(f"{prefix}.k3_moe_m1")
@@ -186,9 +186,7 @@ def _alone(engine):
 
 @functools.lru_cache(maxsize=None)
 def _k3_moe_state():
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import (
-        op,
-    )
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import op
 
     return op.K3MoeState(torch.device("cuda", torch.cuda.current_device()), I_PAD, NUM_EXPERTS)
 

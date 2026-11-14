@@ -200,7 +200,7 @@ def _assert_normed(out: torch.Tensor, ref: torch.Tensor, where: str) -> None:
 def _assert_quant(outs, ref, m: int, where: str) -> None:
     """The MXFP8 copy: bit-exact against the recipe applied to the op's own normed rows (a pure function of
     them), and equal to the reference's wherever the reference's normed 32-column block is the op's."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.comm.m3_mc_allreduce_norm import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.comm.m3_mc_allreduce_norm import (  # noqa: E501
         mxfp8_rows,
         sf_written,
     )
@@ -331,7 +331,7 @@ def _capture_reference(
     updated: torch.Tensor, weight: torch.Tensor, eps: float, out: torch.Tensor
 ) -> None:
     """The capture the boundary replaces: m3_spec_tail.capture_norm of the updated residual (no second addend)."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops import (  # noqa: E501
         m3_spec_tail,
     )
 
@@ -399,7 +399,7 @@ def check_capture_norm_in_boundary() -> None:
         for i, (a, b) in enumerate(zip(plain, capped)):
             if i == 3:
                 # The scale buffer is torch.empty: compare the bytes the kernel writes (the valid rows').
-                from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.comm.m3_mc_allreduce_norm import (  # noqa: E501
+                from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.comm.m3_mc_allreduce_norm import (  # noqa: E501
                     sf_written,
                 )
 
@@ -646,11 +646,11 @@ def _run_one_rank() -> int:
     RANK, WORLD = rank, world
     assert WORLD == 2, f"the entries are certified at 2 ranks, got {WORLD}"
 
-    import tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.m3_mc_allreduce as _ar  # noqa: E501
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.comm import (  # noqa: E501
+    import tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.m3_mc_allreduce as _ar  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.comm import (  # noqa: E501
         m3_mc_allreduce_norm as _plain,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.comm import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.comm import (  # noqa: E501
         m3_mc_finalize_allreduce_norm as _finalize,
     )
 

@@ -182,7 +182,7 @@ def test_a_shared_change_is_followed_by_a_regression_check_with_no_turn(
             assert "## Shared code" in prompt and TARGET_REL in prompt
             core = {
                 **unit_tasks(tmp_path / "ws")[0],
-                "touches": ["tensorrt_llm/_torch/_experimental/modeling_v2/catalog/norm/rms.py"],
+                "touches": ["tensorrt_llm/_torch/modeling_v2/catalog/norm/rms.py"],
             }
             write_graph(prompt, [core, *unit_tasks(tmp_path / "ws")[1:]])
             return {"decision": "GRAPH_UPDATED", "summary": "core changes a shared entry"}

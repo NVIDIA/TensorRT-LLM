@@ -6,7 +6,7 @@ draw (one draw per request at its own key, no shared counter)."""
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.spec.m3_force_vec import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.spec.m3_force_vec import (  # noqa: E501
     m3_force_vec_req as op,
 )
 from tensorrt_llm._torch.speculative.interface import (

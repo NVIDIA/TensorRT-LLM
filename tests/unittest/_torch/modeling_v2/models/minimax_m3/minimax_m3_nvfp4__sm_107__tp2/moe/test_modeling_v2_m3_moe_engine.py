@@ -13,14 +13,14 @@ from typing import Literal
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.moe.m3_moe_engine import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.moe.m3_moe_engine import (  # noqa: E501
     HIDDEN,
     INTER,
     SHARED_INTER,
     M3MoeState,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.moe.m3_moe_engine import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.moe.m3_moe_engine import (  # noqa: E501
     m3_moe_engine as op,
 )
 
@@ -68,7 +68,7 @@ def _state(m: int) -> M3MoeState:
 def test_a_module_built_with_other_trace_config_compiles_its_own_kernel(monkeypatch) -> None:
     """The compile cache keys on the config the kernel module was built with: a state whose module carries an extra
     trace-time option (``timing``, which only adds per-CTA stamps) compiles its own kernel, never the plain build's."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.m3_moe import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.m3_moe import (  # noqa: E501
         op as kop,
     )
 

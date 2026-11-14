@@ -14,10 +14,10 @@ if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
     # The CuTe DSL kernel uses tcgen05, TMA and clusters; it is certified on SM100 and SM103.
     pytest.skip("k3_drafter_attn is certified on sm_100 and sm_103", allow_module_level=True)
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.attention.k3_drafter_attn import (  # noqa: E402
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.attention.k3_drafter_attn import (  # noqa: E402
     k3_drafter_attn,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.attention.k3_drafter_attn_qknorm import (  # noqa: E402
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.attention.k3_drafter_attn_qknorm import (  # noqa: E402
     k3_drafter_attn_qknorm,
 )
 

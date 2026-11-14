@@ -12,10 +12,10 @@ if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3
     pytest.skip("the vendored CuTe DSL kernel is built for sm_103", allow_module_level=True)
 
 from tensorrt_llm import deep_gemm  # noqa: E402
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.attention.cute_dsl_fp8_paged_mqa_logits import (  # noqa: E402, E501
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.attention.cute_dsl_fp8_paged_mqa_logits import (  # noqa: E402, E501
     ATOM_SPLIT,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.attention.cute_dsl_fp8_paged_mqa_logits import (  # noqa: E402, E501
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.attention.cute_dsl_fp8_paged_mqa_logits import (  # noqa: E402, E501
     cute_dsl_fp8_paged_mqa_logits as op,
 )
 

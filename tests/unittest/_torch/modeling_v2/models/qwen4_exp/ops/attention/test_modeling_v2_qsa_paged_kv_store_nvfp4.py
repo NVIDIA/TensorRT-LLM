@@ -15,10 +15,10 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_kv_store_nvfp4 import (  # noqa: E501
+from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.attention.qsa_paged_kv_store_nvfp4 import (  # noqa: E501
     qsa_paged_kv_store_nvfp4 as op,
 )
-from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
 
 __extra_import_path__ = ["../../../.."]
 from _validating import certifying, validating  # noqa: E402,F401

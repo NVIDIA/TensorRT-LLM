@@ -160,7 +160,7 @@ try:
 except Exception as exc:
     out["error"] = "%s: %s" % (type(exc).__name__, exc)
 
-CATALOG_PKG = "tensorrt_llm._torch._experimental.modeling_v2.catalog"
+CATALOG_PKG = "tensorrt_llm._torch.modeling_v2.catalog"
 
 def resolves(dotted, entry_path=None):
     if not dotted:
@@ -262,7 +262,7 @@ def entry_certification(py_path):
     match = re.search(r"torch\.ops\.trtllm\.([A-Za-z0-9_]+)", text)
     return sorted(archs), cells, ("torch.ops.trtllm." + match.group(1)) if match else ""
 
-catalog = repo / "tensorrt_llm/_torch/_experimental/modeling_v2/catalog"
+catalog = repo / "tensorrt_llm/_torch/modeling_v2/catalog"
 # The shared vocabulary is the entry files themselves -- there is no index: one
 # OpWrapper per file under catalog/<category>/; underscore modules (_op.py) are
 # the catalog's own infrastructure.
@@ -274,7 +274,7 @@ for py in sorted(catalog.glob("*/*.py")) if catalog.is_dir() else ():
         "impl": entry_certification(py)[2],
     })
 # A target's own ops: certified for that target, prior art for another.
-models = repo / "tensorrt_llm/_torch/_experimental/modeling_v2/models"
+models = repo / "tensorrt_llm/_torch/modeling_v2/models"
 scoped_ops = sorted({*models.glob("*/*/ops/*/*.py"), *models.glob("*/ops/*/*.py")})
 for py in scoped_ops if models.is_dir() else ():
     if py.name == "__init__.py":
@@ -288,7 +288,7 @@ for py in scoped_ops if models.is_dir() else ():
 for entry in out["catalog"]:
     if entry.get("scope"):
         py = models / entry["scope"] / "ops" / entry["path"]
-        module = "tensorrt_llm._torch._experimental.modeling_v2.models.%s.ops.%s" % (
+        module = "tensorrt_llm._torch.modeling_v2.models.%s.ops.%s" % (
             entry["scope"].replace("/", "."), entry["path"][:-3].replace("/", "."))
     else:
         py = catalog / entry["path"]

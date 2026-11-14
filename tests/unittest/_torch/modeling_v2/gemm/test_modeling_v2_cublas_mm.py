@@ -7,8 +7,8 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm as op
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell
+from tensorrt_llm._torch.modeling_v2.catalog.gemm.cublas_mm import cublas_mm as op
 
 __extra_import_path__ = [".."]
 from _cells import certified_cells  # noqa: E402 — needs the path declared above

@@ -13,17 +13,17 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4 import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4 import (  # noqa: E501
     modeling as dispatch,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.attention.m3_dense_decode import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.attention.m3_dense_decode import (  # noqa: E501
     CAPPED,
     HEAD_DIM,
     HEADS,
     KV_HEADS,
     MODEL_MAX,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.attention.m3_dense_decode import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.attention.m3_dense_decode import (  # noqa: E501
     m3_dense_decode as op,
 )
 

@@ -7,7 +7,7 @@ on the call history, on the request's slot in the batch, or on the other request
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.spec.m3_force_vec import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.spec.m3_force_vec import (  # noqa: E501
     m3_force_vec_req,
 )
 from tensorrt_llm._torch.speculative.interface import (

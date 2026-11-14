@@ -6,7 +6,7 @@ launches both entries of the one kernel at 2 ranks."""
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.comm.m3_mc_finalize_allreduce_norm import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.comm.m3_mc_finalize_allreduce_norm import (  # noqa: E501
     finalize_partial,
     m3_mc_finalize_allreduce_norm,
 )

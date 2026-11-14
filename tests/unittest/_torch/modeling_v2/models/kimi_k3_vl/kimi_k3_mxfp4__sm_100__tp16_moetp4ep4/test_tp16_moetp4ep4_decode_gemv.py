@@ -22,27 +22,21 @@ import pytest
 import torch
 from torch import nn
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
     decode_gemv,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.activation.k3_situ_mul import (
-    k3_situ_mul,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.gemm.k3_ctm_gemv import (
-    k3_ctm_gemv,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.gemm.k3_ctm_gemv_long import (
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.activation.k3_situ_mul import k3_situ_mul
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.gemm.k3_ctm_gemv import k3_ctm_gemv
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.gemm.k3_ctm_gemv_long import (
     k3_ctm_gemv_long,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.gemm.k3_ctm_gemv_swiglu import (
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.gemm.k3_ctm_gemv_swiglu import (
     k3_ctm_gemv_swiglu,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.gemm.k3_ctm_gemv_wide import (
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.gemm.k3_ctm_gemv_wide import (
     k3_ctm_gemv_wide,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.gemm.k3_decode_gemv import (
-    k3_decode_gemv,
-)
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.gemm.k3_decode_gemv import k3_decode_gemv
 from tensorrt_llm._torch.modules.embedding import LMHead
 from tensorrt_llm._torch.modules.linear import TensorParallelMode
 from tensorrt_llm._torch.modules.logits_processor import LogitsProcessor

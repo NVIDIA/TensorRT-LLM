@@ -18,7 +18,7 @@ import _rank_job
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.comm.m3_mc_finalize_allreduce_norm import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.comm.m3_mc_finalize_allreduce_norm import (  # noqa: E501
     finalize_partial,
 )
 
@@ -35,7 +35,7 @@ def test_m3_mc_allreduce_norm_op_matrix(world_size) -> None:
 
 def test_the_cells_are_world_independent() -> None:
     """What lets a single-node job certify the tp8 entries: no cell's spec names a world size."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.comm import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.comm import (  # noqa: E501
         m3_mc_allreduce_norm,
         m3_mc_finalize_allreduce_norm,
     )

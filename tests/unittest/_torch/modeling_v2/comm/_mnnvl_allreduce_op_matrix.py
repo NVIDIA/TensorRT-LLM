@@ -226,7 +226,7 @@ def _run_one_rank(device: int) -> int:
     )
     RANK, WORLD = rank, world
 
-    from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import mnnvl_allreduce as entry
+    from tensorrt_llm._torch.modeling_v2.catalog.comm import mnnvl_allreduce as entry
     from tensorrt_llm.mapping import Mapping
 
     mapping = Mapping(world_size=world, rank=rank, gpus_per_node=GPUS_PER_NODE, tp_size=world)

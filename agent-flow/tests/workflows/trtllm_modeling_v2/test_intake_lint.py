@@ -162,9 +162,7 @@ def test_a_placeholder_anchor_is_named_with_the_floor_it_implies(tmp_path):
 
 def _tree(tmp_path):
     repo = tmp_path / "repo"
-    ops = (
-        repo / "tensorrt_llm/_torch/_experimental/modeling_v2/models/other/other_tp1/ops/attention"
-    )
+    ops = repo / "tensorrt_llm/_torch/modeling_v2/models/other/other_tp1/ops/attention"
     ops.mkdir(parents=True)
     (ops / "qsa_paged_sparse_gqa.py").write_text("class A: ...\n")
     (ops / "rms_norm_rows.py").write_text("class B: ...\n")

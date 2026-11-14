@@ -16,7 +16,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ple.ple_gate_conv_inject_norm import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.ple.ple_gate_conv_inject_norm import (  # noqa: E501
     CKPT_CLAMP_MIN,
     CKPT_DILATION,
     CKPT_HC_COUNT,
@@ -24,7 +24,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ple.ple_
     ENGINE_SLOTS,
     TEP4_SLOTS,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ple.ple_gate_conv_inject_norm import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.ple.ple_gate_conv_inject_norm import (  # noqa: E501
     ple_gate_conv_inject_norm as op,
 )
 

@@ -26,11 +26,9 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam._constants import (
-    ROUTER_EPS as NORM_EPS,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam._constants import SM as _SM
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.moe.beam_grouped_topk_router import (
+from tensorrt_llm._torch.modeling_v2.models.beam._constants import ROUTER_EPS as NORM_EPS
+from tensorrt_llm._torch.modeling_v2.models.beam._constants import SM as _SM
+from tensorrt_llm._torch.modeling_v2.models.beam.ops.moe.beam_grouped_topk_router import (
     beam_grouped_topk_router,
 )
 

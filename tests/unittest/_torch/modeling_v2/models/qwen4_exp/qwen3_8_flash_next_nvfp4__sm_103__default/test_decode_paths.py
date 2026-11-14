@@ -27,14 +27,14 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.gemm.fp8_gemv import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.gemm.fp8_gemv import (  # noqa: E501
     pack_from_bf16,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.gemm.nvfp4_gemv import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.gemm.nvfp4_gemv import (  # noqa: E501
     pack_split_from_bf16,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default import (  # noqa: E501
     modeling as M,
 )
 from tensorrt_llm._torch.modules.logits_processor import LogitsProcessor

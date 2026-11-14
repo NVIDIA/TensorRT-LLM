@@ -17,14 +17,14 @@ from typing import Sequence
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp4.ops.attention.m3_fused_decode_attn import (  # noqa: E501
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_scatter import (
+    fused_write_layer_caches_nvfp4,
+)
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp4.ops.attention.m3_fused_decode_attn import (  # noqa: E501
     attend_cached,
     nvfp4_dequantize,
     query_rows,
     v_scale_rows,
-)
-from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_scatter import (
-    fused_write_layer_caches_nvfp4,
 )
 
 NUM_HEADS = 16

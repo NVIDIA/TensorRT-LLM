@@ -31,8 +31,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget
-from tensorrt_llm._torch._experimental.modeling_v2.models.gpt_oss import routing
+from tensorrt_llm._torch.modeling_v2._router_index import NoTarget
+from tensorrt_llm._torch.modeling_v2.models.gpt_oss import routing
 from tensorrt_llm._torch.moe.fused_moe.quantization import (
     _get_weight_alignment,
     _requires_rank_local_tp_padding,
@@ -41,7 +41,7 @@ from tensorrt_llm.mapping import Mapping
 
 # Importing the target loads its family library, as routing does.
 try:
-    from tensorrt_llm._torch._experimental.modeling_v2.models.gpt_oss.gpt_oss_120b__sm_10x__default import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.gpt_oss.gpt_oss_120b__sm_10x__default import (  # noqa: E501
         weights as D,
     )
 except NoTarget as no_target:

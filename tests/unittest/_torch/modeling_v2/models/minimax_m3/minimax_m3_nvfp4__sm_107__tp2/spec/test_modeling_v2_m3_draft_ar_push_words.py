@@ -15,13 +15,13 @@ from flashinfer.gemm.kernels.dense_bf16_gemm_direct import run_direct_dense as f
 from flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk import SplitKTactic as FiSplitK
 from flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk import run_splitk_dense as fi_splitk
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.kernels.gemm import (
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.kernels.gemm import (
     m3_lowm_splitk as m3_lowm_splitk,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops import (
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops import (
     m3_lowm_direct,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.gemm.m3_draft_lowm import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.gemm.m3_draft_lowm import (  # noqa: E501
     ROWS,
     tactic_for,
 )

@@ -14,7 +14,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.gemm.bf16_gemv_pdl import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.gemm.bf16_gemv_pdl import (  # noqa: E501
     bf16_gemv_pdl as op,
 )
 

@@ -234,7 +234,7 @@ def raised_under_capture(fn) -> str:
 
 
 def check_exchange_is_armed_and_sized() -> None:
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import (
         k3_latent_reduce as kernel,
     )
 
@@ -259,9 +259,7 @@ def check_create_needs_only_the_tp_group() -> None:
     create() uses). With the job split into two TP groups of W / 2 (pipeline parallel 2), the first group's ranks make
     theirs while the second group's ranks do not call at all; each communicator holds exactly its group, in TP-rank
     order. The exchanges in use also hold their TP group's communicator."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm import (
-        mnnvl_workspace,
-    )
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.comm import mnnvl_workspace
     from tensorrt_llm.mapping import Mapping
 
     for ex in (EX_A, EX_B):
@@ -301,7 +299,7 @@ def check_capture_refusals() -> None:
     # Imported by the op's first call; imported here so that nothing is imported inside the capture.
     import cutlass.cute.runtime  # noqa: F401
 
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import (
         k3_latent_reduce,  # noqa: F401
     )
 
@@ -318,9 +316,7 @@ def check_capture_refusals() -> None:
             return str(exc)
         return ""
 
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm import (
-        mnnvl_workspace,
-    )
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.comm import mnnvl_workspace
 
     make = mnnvl_workspace.mnnvl_tp_group_comm
     comms = []
@@ -645,10 +641,10 @@ def _run_one_rank(args) -> int:
     global R, entry, validating, create_exchange, mnnvl, EX_A, EX_B, MNNVL_WS
     R = ls.Rank(args)
     assert R.world in WORLDS, f"k3_latent_reduce runs on TP groups of {WORLDS} ranks, not {R.world}"
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.comm import (
         k3_latent_reduce as module,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.comm import (
         mnnvl_fusion_allreduce as mnnvl_module,
     )
 

@@ -20,7 +20,7 @@ import pytest
 pytestmark = pytest.mark.cpu_only
 
 _HELPER = Path(__file__).with_name("_fp4_moe_test_utils.py")
-_CATALOG = "tensorrt_llm._torch._experimental.modeling_v2.catalog"
+_CATALOG = "tensorrt_llm._torch.modeling_v2.catalog"
 
 
 @pytest.fixture

@@ -8,10 +8,8 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_head_gemv import (
-    op as head_op,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.gemm.k3_head_gemv import (
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_head_gemv import op as head_op
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.gemm.k3_head_gemv import (
     K3HeadGemvWorkspace,
     k3_head_gemv,
 )

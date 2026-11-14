@@ -46,7 +46,7 @@ def _run_one_rank(args) -> int:
     import importlib
 
     modeling = importlib.import_module(
-        "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl."
+        "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl."
         "kimi_k3_mxfp4__sm_100__tp16_moetp16ep1.modeling"
     )
     return dc.run_matrix(

@@ -18,13 +18,13 @@ import math
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default.ops.attention import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default.ops.attention import (  # noqa: E501
     qsa_sparse_gqa_rowtile__prefill as _module,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default.ops.attention.qsa_sparse_gqa_rowtile__prefill import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default.ops.attention.qsa_sparse_gqa_rowtile__prefill import (  # noqa: E501
     qsa_sparse_gqa_rowtile as op,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default.ops.attention.qsa_sparse_gqa_rowtile__prefill import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default.ops.attention.qsa_sparse_gqa_rowtile__prefill import (  # noqa: E501
     rows_per_group,
 )
 

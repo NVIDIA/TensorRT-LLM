@@ -27,18 +27,19 @@ from pathlib import Path
 
 import pytest
 
-from tensorrt_llm._torch._experimental.modeling_v2 import _native
-from tensorrt_llm._torch._experimental.modeling_v2._native import (
+import tensorrt_llm
+from tensorrt_llm._torch.modeling_v2 import _native
+from tensorrt_llm._torch.modeling_v2._native import (
     NativeLoadError,
     load_family_ops,
     load_target_ops,
     namespace_of,
 )
-from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget
+from tensorrt_llm._torch.modeling_v2._router_index import NoTarget
 
 pytestmark = pytest.mark.cpu_only
 
-_FAMILY = "tensorrt_llm._torch._experimental.modeling_v2.models.gpt_oss"
+_FAMILY = "tensorrt_llm._torch.modeling_v2.models.gpt_oss"
 _TARGET = f"{_FAMILY}.gpt_oss_120b__sm_10x__default"
 _TARGET_NS = "mv2_gpt_oss_gpt_oss_120b_sm_10x_default"
 
@@ -145,7 +146,7 @@ _LOAD_ONE_FAMILY = textwrap.dedent(
     import json, sys
     import torch
     import tensorrt_llm  # noqa: F401 -- loads libth_common.so
-    from tensorrt_llm._torch._experimental.modeling_v2 import _native
+    from tensorrt_llm._torch.modeling_v2 import _native
 
     family = sys.argv[1]
     built = sorted(_native._load_family_library(family))
@@ -164,6 +165,11 @@ _LOAD_ONE_FAMILY = textwrap.dedent(
     print(json.dumps({"built": built, "unfaked": unfaked}))
     """
 )
+
+
+def test_libraries_are_looked_up_next_to_libth_common():
+    # The load test below skips when it finds no library, so a wrong directory would pass it.
+    assert _native._LIBS_DIR == Path(tensorrt_llm.__file__).resolve().parent / "libs"
 
 
 def test_every_installed_family_library_loads():

@@ -16,10 +16,10 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.moe.fp8_block_scale_moe_runner import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.fp8_block_scale_moe_runner import (  # noqa: E501
     BLOCK,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.moe.fp8_block_scale_moe_runner import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.moe.fp8_block_scale_moe_runner import (  # noqa: E501
     fp8_block_scale_moe_runner as op,
 )
 

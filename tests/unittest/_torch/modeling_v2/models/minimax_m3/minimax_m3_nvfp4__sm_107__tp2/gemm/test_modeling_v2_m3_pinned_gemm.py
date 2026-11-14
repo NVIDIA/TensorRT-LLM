@@ -7,11 +7,11 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.mxfp8_quantize
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.modeling import (  # noqa: E501
+from tensorrt_llm._torch.custom_ops.torch_custom_ops import FlashInferMXFP8GemmRunner
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.modeling import (  # noqa: E501
     _pinned_mxfp8_gemm,
     _pinned_mxfp8_quantize,
 )
-from tensorrt_llm._torch.custom_ops.torch_custom_ops import FlashInferMXFP8GemmRunner
 
 if not torch.cuda.is_available():
     pytest.skip("MX-TAC requires a CUDA device", allow_module_level=True)

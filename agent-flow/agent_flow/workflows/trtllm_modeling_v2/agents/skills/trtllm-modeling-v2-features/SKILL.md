@@ -15,7 +15,7 @@ field (`block_reuse`, `chunked_prefill`, `kv_cache_dtype`, `cuda_graph`,
 `speculative`) or the disagg test, or when a result moves only with a feature on.
 Open the feature's section in `references/features.md`, read the code it points
 to in the current tree, and imitate the tests it names. Read
-`tensorrt_llm/_torch/_experimental/modeling_v2/README.md` and
+`tensorrt_llm/_torch/modeling_v2/README.md` and
 `cpp/tensorrt_llm/modeling_v2/README.md` as the source of truth; follow the
 native guide before C++/CUDA edits, including its family build, namespace/
 registration macros, loaders, fakes and rebuild/install procedure. A default
@@ -44,7 +44,7 @@ scope that uses it; family sharing is allowed, sibling-target imports are not.
 | executor loop | admission, batching, context chunking, overlap loop, attention-DP router and dummy requests, cache-transceiver calls | `_torch/pyexecutor/py_executor.py`, `_torch/pyexecutor/scheduler/` |
 | resource managers | blocks: allocate, free, prefix reuse, snapshots, side buffers, and what disagg transfers | `_torch/pyexecutor/kv_cache/`, `resource_manager.py`, `get_kv_cache_manager_cls` in `_util.py` |
 | model engine | per-step attention/spec/multimodal metadata; CUDA-graph plan, capture, replay | `_torch/pyexecutor/model_engine.py` (`ModelEngine`), `_torch/pyexecutor/engine/` |
-| **the target** | model lifecycle; its forward reads metadata and writes into the pools it is handed | `_torch/_experimental/modeling_v2/` |
+| **the target** | model lifecycle; its forward reads metadata and writes into the pools it is handed | `_torch/modeling_v2/` |
 | sampler, speculative | tokens, draft verification, acceptance | `_torch/pyexecutor/sampler/`, `_torch/speculative/` |
 
 The target never schedules, allocates per-request storage, samples or

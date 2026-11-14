@@ -195,7 +195,7 @@ def test_codeowners_is_exact_path_noop() -> None:
 
 def test_documentation_does_not_trigger_backend_rules() -> None:
     assert not _is_agent_flow_claim("agent-flow/guide.rst")
-    assert not _is_mv2_claim("tensorrt_llm/_torch/_experimental/modeling_v2/guide.rst")
+    assert not _is_mv2_claim("tensorrt_llm/_torch/modeling_v2/guide.rst")
     assert not _is_openengine_claim("tensorrt_llm/grpc/openengine/guide.rst")
     assert not _is_spec_claim("examples/eagle/guide.rst")
     assert not _is_vg_claim("examples/visual_gen/guide.rst")

@@ -9,8 +9,8 @@ import pytest
 import torch
 from transformers import PretrainedConfig
 
-from tensorrt_llm._torch._experimental.modeling_v2._router_index import modeling_v2_resolve
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.modeling_v2._router_index import modeling_v2_resolve
 from tensorrt_llm.llmapi.llm_args import (
     KvCacheConfig,
     MTPDecodingConfig,
@@ -38,7 +38,7 @@ def _on_sm103(monkeypatch):
     """Route as if this were a GB300, wherever the test actually runs."""
     # Routing selects a class; these synthetic CPU configs do not construct it.
     module = ModuleType(
-        "tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa."
+        "tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa."
         "glm_5_2_nvfp4__sm_107__low_latency.modeling"
     )
     module.ModelingV2Glm52Nvfp4Sm107LowLatency = type(

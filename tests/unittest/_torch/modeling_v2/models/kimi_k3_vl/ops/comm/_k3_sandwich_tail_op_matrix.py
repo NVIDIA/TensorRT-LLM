@@ -251,7 +251,7 @@ CHECKS = [
 def _run_one_rank(args) -> int:
     global R, WORKSPACE, WS_A, WS_B, validating
     R = ls.Rank(args)
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm.k3_sandwich_tail import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.comm.k3_sandwich_tail import (
         K3SandwichWorkspace,
     )
 

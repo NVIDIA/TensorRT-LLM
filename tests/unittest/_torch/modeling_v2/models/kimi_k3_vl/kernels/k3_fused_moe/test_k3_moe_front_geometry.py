@@ -15,10 +15,10 @@ import pytest
 import torch
 
 kernel = pytest.importorskip(
-    "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe.k3_moe_front"
+    "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe.k3_moe_front"
 )
 front_op = pytest.importorskip(
-    "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe.front_op"
+    "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe.front_op"
 )
 
 pytestmark = pytest.mark.cpu_only

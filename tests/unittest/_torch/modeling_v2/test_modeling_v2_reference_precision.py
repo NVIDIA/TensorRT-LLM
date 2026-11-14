@@ -130,7 +130,7 @@ def test_moe_collection_does_not_assign_precision(relative_path: str) -> None:
     ],
 )
 def test_moe_reference_does_not_override_precision(relative_path: str) -> None:
-    root = Path(__file__).resolve().parents[4] / "tensorrt_llm/_torch/_experimental/modeling_v2"
+    root = Path(__file__).resolve().parents[4] / "tensorrt_llm/_torch/modeling_v2"
     tree = ast.parse((root / relative_path).read_text())
     references = [
         node

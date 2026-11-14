@@ -33,15 +33,13 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 -- registers the stock path's ops
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.moe.k3_moe import (
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.moe.k3_moe import (
     K3MoeState,
     K3MoeWideState,
     is_supported,
     k3_moe,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.moe.k3_route_quant import (
-    k3_route_quant,
-)
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.moe.k3_route_quant import k3_route_quant
 
 __extra_import_path__ = ["../../../.."]
 from _validating import validating
@@ -306,9 +304,7 @@ def _snapshot(state, layers):
 def _cold_k3_moe_cache():
     """trtllm::k3_moe's compile cache emptied for the duration (and restored after): the next call of every build is
     a first call."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import (
-        op,
-    )
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import op
 
     saved = dict(op._compiled)
     op._compiled.clear()

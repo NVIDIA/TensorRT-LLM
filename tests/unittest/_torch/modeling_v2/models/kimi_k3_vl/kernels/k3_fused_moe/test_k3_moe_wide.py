@@ -62,10 +62,10 @@ M_ALL = list(range(1, M_MAX + 1))
 
 def _ops():
     import tensorrt_llm  # noqa: F401
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import (
         op,  # noqa: F401
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_route_quant import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_route_quant import (
         op as _rq,  # noqa: F401
     )
 
@@ -130,9 +130,7 @@ def _experts(seed: int = 20260928):
 @functools.lru_cache(maxsize=None)
 def _wide():
     """One wide state and two layers on it (the same experts; two counter sets)."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import (
-        op,
-    )
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import op
 
     proc, _, _ = _experts()
     state = op.K3MoeWideState(torch.device("cuda", torch.cuda.current_device()), I_TP, E_LOCAL)
@@ -143,9 +141,7 @@ def _wide():
 @functools.lru_cache(maxsize=None)
 def _decode_layer():
     """The same experts as a layer of the M <= 8 decode build (K3MoeState)."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import (
-        op,
-    )
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import op
 
     proc, _, _ = _experts()
     state = op.K3MoeState(torch.device("cuda", torch.cuda.current_device()), I_TP, E_LOCAL)

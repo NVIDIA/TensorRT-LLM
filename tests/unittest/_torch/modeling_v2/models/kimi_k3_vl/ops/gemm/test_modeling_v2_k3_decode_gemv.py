@@ -8,12 +8,8 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_decode_gemv import (
-    op as decode_op,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.gemm.k3_decode_gemv import (
-    k3_decode_gemv,
-)
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_decode_gemv import op as decode_op
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.gemm.k3_decode_gemv import k3_decode_gemv
 
 __extra_import_path__ = ["../../../.."]
 from _validating import validating

@@ -955,28 +955,26 @@ def _run_one_rank() -> int:
     world = int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(rank)
 
-    from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization import (
-        fp4_quantize as _fp4_mod,
-    )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.kernels.common import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.catalog.quantization import fp4_quantize as _fp4_mod
+    from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.kernels.common import (  # noqa: E501
         self_attn_prefill_act_quant_mxf8 as _act_quant,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.comm import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.comm import (  # noqa: E501
         _lamport,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.comm.cute_dsl_allgather_widen import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.comm.cute_dsl_allgather_widen import (  # noqa: E501
         cute_dsl_allgather_widen,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.comm.cute_dsl_allreduce import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.comm.cute_dsl_allreduce import (  # noqa: E501
         cute_dsl_allreduce,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.comm.cute_dsl_allreduce_add_rmsnorm import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.comm.cute_dsl_allreduce_add_rmsnorm import (  # noqa: E501
         cute_dsl_allreduce_add_rmsnorm,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.comm.cute_dsl_allreduce_add_rmsnorm_quant_nvfp4 import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.comm.cute_dsl_allreduce_add_rmsnorm_quant_nvfp4 import (  # noqa: E501
         cute_dsl_allreduce_add_rmsnorm_quant_nvfp4,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.quantization import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.ops.quantization import (  # noqa: E501
         cute_dsl_moe_quantize_nvfp4 as _moe_quant_mod,
     )
 
