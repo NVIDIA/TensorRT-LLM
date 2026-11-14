@@ -25,6 +25,8 @@ from tensorrt_llm.llmapi.llm_args import (
 )
 from tensorrt_llm.quantization import QuantAlgo
 
+pytestmark = pytest.mark.cpu_only
+
 # ---------------------------------------------------------------------- #
 # Mock infra: in-memory managers / requests (avoid touching V2 / model).  #
 # ---------------------------------------------------------------------- #
@@ -333,7 +335,7 @@ class TestFactory:
         cfg.algorithm = "triattention"
         with (
             patch.object(util_mod, "is_sm_100f", return_value=False),
-            pytest.raises(RuntimeError, match="SM100-family"),
+            pytest.raises(ValueError, match="SM100-family"),
         ):
             util_mod.validate_kv_cache_compression_compatibility(
                 cfg,
@@ -372,7 +374,6 @@ class TestFactory:
         )
 
 
-@pytest.mark.cpu_only
 class TestKvCacheCreatorLifecycle:
     def test_estimation_still_creates_triattention_manager(self) -> None:
         config = SimpleNamespace(algorithm="triattention")
@@ -404,7 +405,6 @@ class TestKvCacheCreatorLifecycle:
             config,
             model_engine=creator._model_engine,
             kv_cache_config=creator._kv_cache_config,
-            estimating_kv_cache=True,
         )
         assert resources[ResourceManagerType.KV_CACHE_MANAGER] is target_manager
         assert resources[ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER] is expected_manager
@@ -425,7 +425,6 @@ class TestKvCacheCreatorLifecycle:
         assert ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER not in resources
 
 
-@pytest.mark.cpu_only
 def test_executor_binds_iteration_manager_after_extra_resource_registration() -> None:
     class _StopAfterBind(Exception):
         pass
@@ -468,7 +467,6 @@ def test_executor_binds_iteration_manager_after_extra_resource_registration() ->
     )
 
 
-@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "provides_cold_page_codec",
     (True, False),
@@ -525,7 +523,6 @@ def test_build_routes_compression_manager_by_capabilities(
         compression_config,
         model_engine=creator._model_engine,
         kv_cache_config=target_config,
-        estimating_kv_cache=False,
     )
     assert (
         creator._create_kv_cache_manager.call_args.kwargs["cold_page_codec_provider"]
@@ -578,7 +575,6 @@ class TestCanonicalImports:
 
 
 class TestCompressionCompatibility:
-    @pytest.mark.cpu_only
     @pytest.mark.parametrize(
         "config",
         (
@@ -602,7 +598,6 @@ class TestCompressionCompatibility:
                 kv_cache_config=SimpleNamespace(enable_block_reuse=False),
             )
 
-    @pytest.mark.cpu_only
     def test_helix_is_rejected_before_redundant_cold_quantization(self) -> None:
         model_engine = SimpleNamespace(
             mapping=SimpleNamespace(has_cp_helix=lambda: True),

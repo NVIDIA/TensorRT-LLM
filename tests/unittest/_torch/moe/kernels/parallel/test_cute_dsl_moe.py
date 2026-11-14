@@ -2989,6 +2989,7 @@ def test_fc12_warmup_preparation_does_not_call_the_fused_impl(monkeypatch):
         activation_type=ActivationType.SiTu,
         act_alpha=4.0,
         act_beta=25.0,
+        routing_method=None,
     )
     for name in ("_situ_betas", "_epilogue_identity"):
         setattr(backend, name, getattr(fc12.TrtllmCutedslFusedFc12Nvfp4Impl, name).__get__(backend))
@@ -3248,6 +3249,65 @@ def test_sm107_nvfp4_finalize_accepts_two_cta_n_tiling():
     runner_cls = cute_dsl_custom_ops.Sm107BlockScaledContiguousGroupedGemmFinalizeFusionRunner
 
     assert runner_cls._is_n_tiling_compatible(n=256, mma_n=128, cluster_n=2)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.skipif(
+    not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+    reason="This test requires the public Rubin CuTe DSL package",
+)
+def test_sm107_nvfp4_gather_act_fusion_cache_key_ignores_inplace_output_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cute_dsl_custom_ops, "get_sm_version", lambda: 107)
+    runner = cute_dsl_custom_ops.Sm107BlockScaledContiguousGatherGroupedGemmActFusionRunner(
+        num_experts=1, top_k=1, num_local_experts=1, local_expert_offset=0, tile_size=128
+    )
+    tuning_config = runner.get_tuning_config()
+    shard_n, packed_k, tile_size = 512, 128, 128
+
+    def input_shapes(m: int) -> tuple[torch.Size, ...]:
+        num_tiles, num_tokens, scale_k = m // tile_size, m // 2, packed_k * 2 // 16
+        return (
+            torch.Size((num_tokens, packed_k)),
+            torch.Size((1, shard_n, packed_k)),
+            torch.Size((num_tokens, scale_k)),
+            torch.Size((1, shard_n, scale_k)),
+            torch.Size((1,)),
+            torch.Size((num_tiles,)),
+            torch.Size((num_tiles,)),
+            torch.Size((m,)),
+            torch.Size((1,)),
+            torch.Size((1,)),
+            # Inplace output and output scale factors, sized from the actual m.
+            torch.Size((m, shard_n // 2)),
+            torch.Size((m * shard_n // 16,)),
+        )
+
+    def cache_key(m: int) -> tuple[tuple[int, ...], ...]:
+        return AutoTuner._find_nearest_profile(
+            input_shapes(m),
+            tuning_config.dynamic_tensor_specs,
+            tuning_config.constraint_specs,
+            tuning_config.tune_max_num_tokens,
+            True,
+        )
+
+    # Two permuted-token counts in one tuning bucket must share a cache entry.
+    bucket_map = tuning_config.dynamic_tensor_specs[0].map_to_tuning_buckets
+    assert bucket_map(1024) == bucket_map(1152)
+    assert cache_key(1024) == cache_key(1152)
+
+    # Profiling sizes the output and scale-factor buffers as the kernel asserts them.
+    # A shape-only tuner: constructing AutoTuner queries the CUDA device.
+    tuner = object.__new__(AutoTuner)
+    tuner.skip_dynamic_tuning_buckets = False
+    tuner._debug_logger = lambda *_: None
+    inputs = [torch.empty(shape, dtype=torch.uint8, device="meta") for shape in input_shapes(1152)]
+    for profile in tuner._optimization_profiles(tuning_config, inputs):
+        shapes = profile.get_opt_shapes()
+        assert shapes[10] == (shapes[7][0], shard_n // 2)
+        assert shapes[11] == (shapes[7][0] * shard_n // 16,)
 
 
 def _get_registered_rubin_moe_op(name: str):
@@ -4124,8 +4184,8 @@ def test_rubin_moe_locality_domain_composite_owns_concurrent_tuning(
         assert execution_order == ["tune", "launch"]
         assert not memset_calls
     if quantized:
-        assert leaf_calls[0][1]["weight_scale"] is weight_scale_0
-        assert leaf_calls[1][1]["weight_scale"] is weight_scale_1
+        assert leaf_calls[0][1]["weight_scale"] is call_kwargs["weight_scale_0"]
+        assert leaf_calls[1][1]["weight_scale"] is call_kwargs["weight_scale_1"]
         assert all(kwargs["input_scale"] is call_kwargs["input_scale"] for _, kwargs in leaf_calls)
         assert all(kwargs["alpha"] is alpha for _, kwargs in leaf_calls)
         assert all(kwargs["scaling_vector_size"] == 16 for _, kwargs in leaf_calls)

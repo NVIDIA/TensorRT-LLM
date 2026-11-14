@@ -238,6 +238,7 @@ def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabl
     graphs.preallocate_padding_dummies = Mock()
     warmup = object.__new__(DecoderWarmup)
     warmup.mapping = SimpleNamespace(cp_size=1, has_cp_helix=lambda: False)
+    warmup.sparse_attention_config = None
     warmup._inputs = SimpleNamespace(guided_decoder=None)
     warmup._metrics = {}
     warmup._config = SimpleNamespace(max_beam_width=1)
@@ -246,13 +247,14 @@ def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabl
     warmup._graphs = graphs
     warmup._metadata = SimpleNamespace(_warmup_dspark_ragged_compressor_metadata=Mock())
     warmup._context_warmups_supported = True
+    warmup._context_logits_heads = ()
     warmup._torch_compile_bypass = runner._bypass_torch_compile
     warmup._get_full_general_warmup_requests = Mock(return_value=[(4, 0)])
     warmup._get_max_shape_warmup_requests = Mock(return_value=[(8, 0)])
     observed = []
 
     def observe(phase):
-        def forward(*args):
+        def forward(*args, **kwargs):
             observed.append((phase, model.use_compiled_forward()))
 
         return forward
@@ -268,6 +270,11 @@ def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabl
         "_freeze_eager_workspace_floor",
     ):
         monkeypatch.setattr(warmup, method, Mock())
+    monkeypatch.setattr(
+        warmup,
+        "_prewarm_fmha_libraries",
+        lambda _: observed.append(("_prewarm_fmha_libraries", None)),
+    )
     for method in (
         "_run_attention_warmup",
         "_run_autotuner_warmup",
@@ -295,6 +302,7 @@ def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabl
         warmup._warmup_scheduled(Mock(), SimpleNamespace(context_swa_layer_limit=None))
 
     assert observed == [
+        ("_prewarm_fmha_libraries", None),
         ("_run_attention_warmup", not enabled),
         ("_general_warmup", True),
         ("_run_autotuner_warmup", not enabled),

@@ -4,7 +4,7 @@
 
 A measurement is a label dir written by ``bench.py`` (``summary.json`` + ``meta.json``), or, over
 several perf configs, a label dir holding one such dir per config plus ``parts.json`` (the config
-names and their latency constraints). Every measurement and decision is appended to the
+names and their constraints). Every measurement and decision is appended to the
 campaign's ``perf_ledger.jsonl``: a re-measured label is a new record, never an overwrite.
 
 A *site* is one perf config at one concurrency (``dep4.con256``; ``con1`` for a single config);
@@ -34,8 +34,13 @@ SECONDARY = (
     "tok_s_user_per_request",
 )
 PARTS_FILE = "parts.json"
-#: A perf config's latency constraints, each an upper bound on a summary metric.
-CONSTRAINT_METRICS = {"tpot_ms_max": "mean_tpot_ms", "ttft_ms_max": "mean_ttft_ms"}
+#: A perf config's constraints on a summary metric: an upper bound (``_max``), or a lower one
+#: (``_min``: the share of prompt tokens an AgentX point served from the KV cache).
+CONSTRAINT_METRICS = {
+    "tpot_ms_max": "mean_tpot_ms",
+    "ttft_ms_max": "mean_ttft_ms",
+    "kv_hit_pct_min": "kv_hit_pct",
+}
 #: The latency a keep must not lose: mean TTFT at concurrency 1, where it is one request's
 #: prefill rather than its wait in a queue. Lower is better, so it is judged for losses
 #: only, past a relative tolerance (``perf.campaign.ttft_tolerance``).
@@ -89,23 +94,27 @@ class Measurement:
     def violation_points(self) -> list[tuple[str, int, str, str]]:
         """Broken constraints: ``(config, concurrency, key, text)``.
 
-        The first three fields identify the constraint; the text includes the measured value.
+        The first three fields identify the constraint; the text includes the measured value. A
+        point that did not report a bound's metric breaks a floor (nothing shows it held) and is
+        not judged against a ceiling.
         """
         out = []
         for name, part in self.parts.items():
             for key, bound in (self.constraints.get(name) or {}).items():
                 metric = CONSTRAINT_METRICS[key]
+                floor = key.endswith("_min")
                 for con, row in sorted(part.points.items()):
                     value = row.get(metric)
-                    if value is not None and float(value) > float(bound):
-                        out.append(
-                            (
-                                name,
-                                con,
-                                key,
-                                f"{name}@con{con}: {metric} {float(value):.1f} > {bound}",
+                    if value is None:
+                        if floor:
+                            out.append(
+                                (name, con, key, f"{name}@con{con}: no {metric} (>= {bound})")
                             )
-                        )
+                        continue
+                    if (float(value) < float(bound)) if floor else (float(value) > float(bound)):
+                        sign = "<" if floor else ">"
+                        text = f"{name}@con{con}: {metric} {float(value):.1f} {sign} {bound}"
+                        out.append((name, con, key, text))
         return out
 
     def broken_constraints(self) -> set[tuple[str, int, str]]:

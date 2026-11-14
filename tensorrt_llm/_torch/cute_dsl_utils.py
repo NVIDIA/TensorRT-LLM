@@ -39,10 +39,8 @@ def _skip_legacy_cutlass_mlir_helpers() -> None:
 
 IS_CUTLASS_DSL_AVAILABLE = False
 
-# Whether the public CuTe DSL package provides the SM107/Rubin helper module.
-# Rubin kernels stay disabled when it is absent and callers retain their
-# existing fallback paths.
-# TODO: flips to True once a Rubin-capable CuTe DSL package ships in the image.
+# Whether the installed CuTe DSL provides ``cutlass.utils.rubin_helpers``; set
+# by the import probe below. Rubin kernels stay disabled when it is absent.
 IS_CUTLASS_DSL_RUBIN_AVAILABLE = False
 
 if platform.system() != "Windows":
@@ -195,3 +193,11 @@ def _install_sm_reserve() -> None:
 
 
 _install_sm_reserve()
+
+
+def graph_safe_from_dlpack(tensor, assumed_align: int = 16):
+    """``cutlass.cute.runtime.from_dlpack`` of ``tensor`` without the DLPack export's stream
+    synchronization, so it can run during CUDA-graph capture."""
+    from cutlass.cute.runtime import from_dlpack
+
+    return from_dlpack(_GraphSafeDlpack(tensor), assumed_align=assumed_align)

@@ -157,6 +157,12 @@ cache_transceiver_config:
 
 `kv_transfer_timeout_ms` bounds the KV transfer wait. The default is `60000`. In ownership-enabled configurations, expiry cancels logical work but does not itself authorize releasing memory that a transfer may still access.
 
+```{warning}
+The C++ cache transceiver (`transceiver_runtime: CPP`, or `null`) is deprecated as of TensorRT-LLM 1.4 (2026-11) and will be removed after the 3-month migration period. Use the Python transceiver, the default, with `backend: NIXL` and KV cache manager V2 on both the context and the generation worker.
+
+Experimental in-flight cancellation (`TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=1`) still requires a supported C++ transceiver configuration. Keep that configuration while the feature is required, or disable the flag when migrating to Python. The existing startup validation remains in effect.
+```
+
 The Python transceiver (`transceiver_runtime: PYTHON`, `KvCacheTransceiverV2`) requires `use_kv_cache_manager_v2: true` in `kv_cache_config` and the NIXL backend. Using it with KV cache manager V1 raises an error during initialization. To use KV cache manager V1, set `use_kv_cache_manager_v2: false` and select `transceiver_runtime: CPP` for a model that supports V1.
 
 `kv_cache_bounce_size_mb` (default `0`) sets the size, in MiB, of the KV-cache bounce buffer; `0` turns it off. Without the buffer, each KV fragment is a separate descriptor in the NIXL write. With it, the sender gathers an eligible write's fragments into the buffer and sends them in chunks, and the receiver scatters them into its KV cache. This helps when a write consists of many small fragments, which is typical when context and generation split attention heads differently (for example, context TP != generation TP, or attention DP).
@@ -414,6 +420,74 @@ safely replay or cancel the paired transfer. Context-first context requests and
 requests that bypass the handoff retain the configured retry policy. With
 remote-tail replay disabled, ordinary disaggregated requests retain their
 configured retry policy, including the transient TCP retry budget.
+
+### Generation slot preemption (prototype)
+
+GEN slot preemption pauses a resident decode request when all batch slots are
+occupied and a waiter risks missing its TTFT target. Configure exactly one bound
+(neither: disabled):
+
+```yaml
+scheduler_config:
+  gen_preemption:
+    tpot_budget: 0.10          # up to +10% mean TPOT from pauses
+    # target_output_tps: 35.0  # alternative: output-rate floor for ~80% of requests
+```
+
+Preemption requires the auto GEN admission policy
+(`0 < TLLM_GEN_ADMISSION_TTFT_PERCENTILE < 99`) and the V2 KV scheduler.
+Pipeline parallelism and attention DP are rejected. Startup checks these
+prerequisites before reserving paused-request headroom.
+
+Pauses free batch slots while retaining KV, recurrent, and drafter state. Cache
+sizing must cover active plus paused requests: SWA and NVFP4-MLA HP-ring
+reservations include the paused cap; full-attention demand depends on sequence
+lengths. Paused requests are excluded from KV eviction. Disaggregated GEN cannot
+recompute context locally, and Helix CP raises on decode allocation failure.
+Reduce concurrency or increase the KV budget when both slots and pages are full.
+
+Pool headroom belongs to each executor. Configuring preemption on a context
+worker also reserves headroom. `target_output_tps` has simulation coverage only;
+GPU validation is limited to `tpot_budget`.
+
+### Bounding the graceful stop of a server
+
+A server can still have request handlers running when it is told to stop, for
+example when a benchmark client leaves while its last requests are in flight. By
+default the OpenAI HTTP server waits for every one of them. The prototype setting
+`serve_graceful_shutdown_timeout_s: N` bounds that wait: after a shutdown signal,
+the server waits at most `N` seconds for running request handlers (uvicorn's
+`timeout_graceful_shutdown`), then cancels them and shuts down as usual. It
+applies to the LLM, embedding and multimodal-encoder servers of `trtllm-serve`,
+in every frontend process; the disaggregated router keeps its own
+`--request_timeout` for the requests it forwards. It is off by default.
+[Bounding the Graceful Stop](../commands/trtllm-serve/trtllm-serve.rst#bounding-the-graceful-stop)
+in the `trtllm-serve` reference describes it for every server.
+
+```yaml
+serve_graceful_shutdown_timeout_s: 30
+```
+
+### Generation server options
+
+Two prototype options of a generation server's configuration:
+
+* `scheduler_config.max_gen_init_admissions_per_pass` bounds how many
+  disaggregated generation requests a rank admits, allocating their KV cache, per
+  scheduling pass of the KV cache manager V2 scheduler; the others are admitted
+  in later passes, in order. A bound trades the start latency of a burst of
+  requests for shorter passes, which every attention-DP rank waits for. Unset,
+  the default, admits all that fit; KV cache manager V1 ignores it with a warning.
+* `gen_prompt_tail_tokens: N` (at least 256) sends a context-first
+  generation-only request to the generation workers with only its last `N`
+  prompt ids and the number of ids left out, since its KV cache comes from the
+  context server. Remote-tail, generation-first and multimodal requests keep
+  their full prompt, as do requests that read it (penalties, prompt logprobs,
+  logits processors, beams or several sequences, among others). The option is
+  rejected together with KV cache block reuse, KV cache events, a KV cache
+  connector, routed-expert capture, context parallelism, the SA, NGram or AUTO
+  drafters, KV cache manager V1, or a cache transceiver runtime other than
+  `PYTHON`.
 
 ## Environment Variables
 

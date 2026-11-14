@@ -30,6 +30,7 @@ from ..llm_request import (
     get_mm_items_for_chunk,
     get_mm_pending_items,
     make_mm_encoder_transient_cache_key,
+    release_consumed_mm_items,
 )
 
 RequestList = list[LlmRequest]
@@ -190,11 +191,12 @@ def _is_forced_context_chunk_boundary(req: LlmRequest, chunk_size: int) -> bool:
 
 
 class RemoteTailPhase(Enum):
-    """Fleet-wide GEN phase for conditional disaggregation with attention DP."""
+    """Fleet-wide GEN admission for remote-tail attention DP."""
 
     NONE = "none"
     CONTEXT = "context"
     DECODE = "decode"
+    MIXED = "mixed"
 
 
 class ScheduledRequests:
@@ -233,6 +235,9 @@ class ScheduledRequests:
     """Maps a request id to the prompt-ordered indices of its multimodal items
     selected for encoder execution this iteration (only items whose encoder
     outputs are still missing). ``None`` when no items were scheduled."""
+    paused_in_place_ids: frozenset[int]
+    """Generation requests paused in place or displaced by a forced resume:
+    left out of this batch, but their drafter state must be kept."""
 
     def __init__(self):
         self.attention_dp_phase: RemoteTailPhase | None = None
@@ -245,6 +250,7 @@ class ScheduledRequests:
         self.recompute_paused_requests: RequestList = []
         self.added_inflight_req_ids: list[int] = []
         self.scheduled_mm_encoder_items: dict[int, list[int]] | None = None
+        self.paused_in_place_ids: frozenset[int] = frozenset()
 
     @property
     def is_generation_only(self) -> bool:
@@ -380,6 +386,21 @@ class RequestScheduler(ABC):
         the generation-init requests the window would defer; the default is a
         no-op.
         """
+
+    def set_retiring_gen_receives_probe(self, probe: Callable[[], bool]) -> None:
+        """Register a live probe for rank-local receive resources being retired.
+
+        Only schedulers with transfer-aware deadlock detection use it; the
+        default is a no-op.
+
+        Args:
+            probe: Whether cancelled receives still retain local resources.
+        """
+
+    def take_decision_counters(self) -> tuple[int, int, int, int]:
+        """Return and reset the holds since the last call: gen-init cap, gen-init transfer budget,
+        decoder-tail hold passes, and requests whose final window was held."""
+        return (0, 0, 0, 0)
 
 
 @dataclass
@@ -734,6 +755,17 @@ class MultimodalScheduler(RequestScheduler):
 
     def set_disagg_transfer_admission_controller(self, controller) -> None:
         self.scheduler.set_disagg_transfer_admission_controller(controller)
+
+    def set_retiring_gen_receives_probe(self, probe: Callable[[], bool]) -> None:
+        """Forward the local retirement probe to the wrapped scheduler.
+
+        Args:
+            probe: Whether cancelled receives still retain local resources.
+        """
+        self.scheduler.set_retiring_gen_receives_probe(probe)
+
+    def take_decision_counters(self) -> tuple[int, int, int, int]:
+        return self.scheduler.take_decision_counters()
 
     def _new_encoder_step(self) -> _MultimodalEncoderStep:
         return _MultimodalEncoderStep(
@@ -1105,6 +1137,9 @@ class MultimodalScheduler(RequestScheduler):
         """
         ready_context_requests: RequestList = []
         protected_items: set[tuple[int, int]] = set()
+        # KV reuse can start a prefill past outputs that were bound while it was at zero.
+        for chunk in chunks:
+            release_consumed_mm_items(chunk.request, self.encoder_cache)
         for chunk in chunks:
             request = chunk.request
             state = request.py_mm_encoder_state

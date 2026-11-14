@@ -23,7 +23,9 @@ TP/PP/DP/MLA/sliding-window configurations for V2 cache managers.
 import gc
 import os
 import threading
+import time
 import uuid
+from contextlib import ExitStack
 from types import SimpleNamespace
 
 # Do not inherit a NIC pin from the host: the selected interface may not exist
@@ -46,11 +48,24 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.tensorrt_llm_transfer_agent_binding  # noqa: F401
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
+from tensorrt_llm._torch.disaggregation.orchestration.coordinator import DisaggTransferCoordinator
+from tensorrt_llm._torch.disaggregation.orchestration.transfer_manager import AsyncTransferManager
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.disaggregation.resource.utils import get_global_layer_ids
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
+from tensorrt_llm._torch.pyexecutor.disagg_adapter import (
+    PyExecutorEffects,
+    PyExecutorRequestRegistry,
+)
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    KVCacheLayerOwner,
+    KVCacheLayerSpec,
+    KVCacheManagerV2,
+    Role,
+)
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, LlmRequestType
+from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, get_size_in_bytes
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
@@ -154,8 +169,13 @@ class KvCacheConfigV2:
     sink_token_length: Optional[int] = None
     free_gpu_memory_fraction: Optional[float] = None
     host_cache_size: Optional[int] = None
+    host_cache_bind_to_gpu_numa_node: bool = False
     disk_cache_size: Optional[int] = None
     disk_cache_path: Optional[str] = None
+    disk_io_threads: int = 0
+    disk_keep_copy_after_restore: bool = False
+    disk_write_through: bool = False
+    disk_protected_copy_fraction: float = 1.0
     onboard_blocks: bool = True
     cross_kv_cache_fraction: Optional[float] = None
     cold_tier_offload_min_priority: Optional[int] = None
@@ -335,13 +355,34 @@ def _create_cache_manager(
     max_attention_window_vec: Optional[List[int]] = None,
     num_layers: int = NUM_LAYERS,
     max_batch_size: int = MAX_BATCH_SIZE,
+    num_draft_layers: int = 0,
 ) -> "KVCacheManagerV2":
-    """Create a KVCacheManagerV2 for the given mapping."""
+    """Create a KVCacheManagerV2 for the given mapping.
+
+    ``num_draft_layers`` K-only draft-owned layers follow the target's (MLA, pp 1),
+    as a standalone MLA drafter's unified draft KV cache lays them out.
+    """
     num_kv_heads = 1 if is_mla else NUM_KV_HEADS
     cache_type = CacheTypeCpp.SELFKONLY if is_mla else CacheTypeCpp.SELF
 
     if max_attention_window_vec is None:
         max_attention_window_vec = [MAX_SEQ_LEN]
+    layer_specs = None
+    if num_draft_layers:
+        assert is_mla and mapping.pp_size == 1
+        layer_specs = tuple(
+            KVCacheLayerSpec(
+                global_layer_id=layer_id,
+                owner=(
+                    KVCacheLayerOwner.TARGET if layer_id < num_layers else KVCacheLayerOwner.DRAFT
+                ),
+                dtype=DataType.FLOAT,
+                num_kv_heads=1,
+                head_dim=HEAD_DIM,
+                buffer_roles=(Role.KEY,),
+            )
+            for layer_id in range(num_layers + num_draft_layers)
+        )
 
     return KVCacheManagerV2(
         KvCacheConfigV2(
@@ -360,6 +401,7 @@ def _create_cache_manager(
         dtype=DataType.FLOAT,
         vocab_size=VOCAB_SIZE,
         is_disagg=True,
+        layer_specs=layer_specs,
     )
 
 
@@ -373,6 +415,7 @@ def _create_managers_for_instance(
     num_layers: int = NUM_LAYERS,
     max_batch_size: int = MAX_BATCH_SIZE,
     cp_size: int = 1,
+    num_draft_layers: int = 0,
 ) -> list[KVCacheManagerV2]:
     """Create cache managers for all ranks in an instance.
 
@@ -404,6 +447,7 @@ def _create_managers_for_instance(
                         max_attention_window_vec,
                         num_layers,
                         max_batch_size,
+                        num_draft_layers,
                     )
                 )
     return managers
@@ -987,8 +1031,12 @@ def run_transfer_test(
     gen_scratch_tokens: int = 0,
     gen_cp: int = 1,
     pipelined_piece_tokens: Optional[int] = None,
+    num_draft_layers: int = 0,
 ) -> None:
     """Run a full KV transfer test using KvCacheTransceiverV2.
+
+    num_draft_layers > 0 adds K-only draft-owned layers after the target's on
+    both sides (a unified draft KV cache); they must transfer like the target's.
 
     pipelined_piece_tokens enables enable_pipelined_transfer: the context sends each prompt in
     pieces of that many tokens instead of whole.
@@ -1027,6 +1075,7 @@ def run_transfer_test(
         max_attention_window_vec,
         num_layers,
         max_batch_size,
+        num_draft_layers=num_draft_layers,
     )
     gen_managers = _create_managers_for_instance(
         gen_tp,
@@ -1038,6 +1087,7 @@ def run_transfer_test(
         num_layers,
         max_batch_size,
         cp_size=gen_cp,
+        num_draft_layers=num_draft_layers,
     )
 
     # 2. Initialize data: random for ctx, zeros for gen
@@ -1216,7 +1266,7 @@ def run_transfer_test(
                 is_mla=is_mla,
                 gen_cp=gen_cp,
                 max_attention_window_vec=max_attention_window_vec,
-                num_layers=num_layers,
+                num_layers=num_layers + num_draft_layers,
             )
         else:
             verify_all_requests(
@@ -1234,7 +1284,9 @@ def run_transfer_test(
                 is_mla=is_mla,
                 use_v2=use_v2,
                 max_attention_window_vec=max_attention_window_vec,
-                num_layers=num_layers,
+                # Draft-owned layers appended after the target's must move like
+                # the target's; verify their contents outside helix too.
+                num_layers=num_layers + num_draft_layers,
                 gen_scratch_tokens=gen_scratch_tokens,
             )
 
@@ -1546,6 +1598,52 @@ def test_cache_transceiver_helix_cp(gen_cp, is_mla):
     print("PASSED")
 
 
+@pytest.mark.timeout(180)
+@pytest.mark.parametrize("gen_cp", [2, 4, 8], ids=["cp2", "cp4", "cp8"])
+def test_cache_transceiver_helix_cp_with_draft_layers(gen_cp):
+    """Unified draft KV cache under helix: draft pages move like the target's.
+
+    K-only draft layers after the MLA target's on both sides transfer with the
+    target's block stride, so each generation CP rank holds the drafter's
+    context pages [cp_rank::cp_size].
+    """
+    run_transfer_test(
+        ctx_tp=1,
+        ctx_pp=1,
+        gen_tp=1,
+        gen_pp=1,
+        ctx_enable_dp=False,
+        gen_enable_dp=False,
+        is_mla=True,
+        use_v2=True,
+        max_attention_window_vec=None,
+        gen_cp=gen_cp,
+        num_draft_layers=2,
+    )
+
+
+@pytest.mark.timeout(180)
+def test_cache_transceiver_with_draft_layers():
+    """Unified draft KV cache without helix: draft layers move like the target's.
+
+    K-only draft layers appended after the MLA target's on both sides transfer
+    with the target's blocks, and the verifier checks their contents at
+    gen_cp==1 (the only case the helix tests leave uncovered).
+    """
+    run_transfer_test(
+        ctx_tp=1,
+        ctx_pp=1,
+        gen_tp=1,
+        gen_pp=1,
+        ctx_enable_dp=False,
+        gen_enable_dp=False,
+        is_mla=True,
+        use_v2=True,
+        max_attention_window_vec=None,
+        num_draft_layers=2,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Boundary request-length tests
 # ---------------------------------------------------------------------------
@@ -1711,3 +1809,178 @@ def test_python_nixl_cache_transceiver_uses_cpp_bounce(
         expect_cpp_bounce=True,
         pipelined_piece_tokens=pipelined_piece_tokens,
     )
+
+
+def _offload_request_pair(
+    index: int, tokens: List[int], ctx_info_endpoint, gen_tracks_unique_tokens: bool = True
+):
+    """Context/generation request pair for one prompt (ids ``2*index`` and ``2*index + 1``)."""
+    disagg_request_id = uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF
+
+    def make(request_id, request_type, track_unique_tokens=True):
+        return LlmRequest(
+            request_id=request_id,
+            max_new_tokens=1,
+            input_tokens=list(tokens),
+            sampling_config=tensorrt_llm.bindings.SamplingConfig(
+                SamplingParams()._get_sampling_config()
+            ),
+            is_streaming=False,
+            llm_request_type=request_type,
+            track_unique_tokens=track_unique_tokens,
+        )
+
+    ctx = make(2 * index, LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY)
+    ctx.py_disaggregated_params = DisaggregatedParams(disagg_request_id=disagg_request_id)
+    gen = make(
+        2 * index + 1,
+        LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+        track_unique_tokens=gen_tracks_unique_tokens,
+    )
+    gen.py_disaggregated_params = DisaggregatedParams(
+        ctx_request_id=ctx.py_request_id,
+        ctx_dp_rank=0,
+        ctx_info_endpoint=ctx_info_endpoint,
+        disagg_request_id=disagg_request_id,
+    )
+    return ctx, gen
+
+
+def _offload_lifecycle_executor(
+    manager: KVCacheManagerV2, transceiver: KvCacheTransceiverV2
+) -> tuple[PyExecutor, list]:
+    """Real resource/response lifecycle, without model loading or response transport.
+
+    Metrics and response delivery are stubs; unexpected errors fail the test.
+    Termination, response staging, pin/unpin and resource preparation keep
+    their production bodies.
+    """
+    executor = object.__new__(PyExecutor)
+    executor.active_requests = []
+    executor.canceled_req_ids = set()
+    executor.dist = SimpleNamespace(rank=0, world_size=1, tp_size=1, pp_size=1)
+    executor.resource_manager = ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: manager})
+    executor.async_transfer_manager = AsyncTransferManager(executor.resource_manager)
+    executor._pending_transfer_responses = []
+    executor._pending_response_terminations = []
+    executor._prefetched_request_ids = set()
+    executor._disagg_pp_termination_handler = None
+    executor.result_wait_queues = {}
+    executor.gather_all_responses = False
+    executor.enable_attention_dp = False
+    # PP=1 with eager reuse: terminate the sequence after its response, while
+    # the transfer manager's pin continues to protect the source blocks.
+    executor.force_terminate_ctx_for_partial_reuse = True
+    executor.disable_overlap_scheduler = False
+    executor.iter_counter = 0
+    executor.stream_interval = 1
+    executor.model_engine = SimpleNamespace(route_capture=None)
+    executor.draft_model_engine = None
+    executor.perf_manager = SimpleNamespace(
+        get_timestamp=time.monotonic, append_step_metrics=lambda *args, **kwargs: None
+    )
+    responses = []
+    executor._enqueue_responses = responses.extend
+
+    def fail(error_msg: str, *args, **kwargs) -> None:
+        pytest.fail(error_msg)
+
+    executor._handle_errors = fail
+    executor._disagg_coordinator = DisaggTransferCoordinator(
+        transceiver=transceiver,
+        transfer_manager=executor.async_transfer_manager,
+        kv_cache_manager=manager,
+        dist=executor.dist,
+        effects=PyExecutorEffects(executor),
+        registry=PyExecutorRequestRegistry(executor),
+        enable_attention_dp=False,
+        is_kv_manager_v2=True,
+    )
+    return executor, responses
+
+
+@pytest.mark.timeout(180)
+def test_cache_transceiver_deferred_gen_receive(monkeypatch) -> None:
+    """A gen-init admission behind a step in flight does not block the host.
+
+    Real V2 managers, coordinator and Python/NIXL transfer: receive_gen_init(defer=True)
+    returns while a long kernel standing in for the forward step still runs ahead of the
+    admission work; start_deferred_gen_receives waits for it, posts the receive, and the
+    received KV equals the context KV. The generation request is built as a reuse-off
+    generation engine builds it, without unique tokens, and decodes after the receive.
+    """
+    for name in (
+        "TRTLLM_DISAGG_BENCHMARK_GEN_ONLY",
+        "TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP",
+        "TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
+    config = CacheTransceiverConfig(
+        backend="NIXL", transceiver_runtime="PYTHON", max_tokens_in_buffer=512
+    )
+    prompt_len = 3 * TOKENS_PER_BLOCK + 5
+    gen_stream = torch.cuda.Stream()
+
+    with ExitStack() as cleanup:
+        ctx_mgr = _create_cache_manager(mapping, is_mla=False, use_v2=True)
+        cleanup.callback(ctx_mgr.shutdown)
+        with torch.cuda.stream(gen_stream):
+            gen_mgr = _create_cache_manager(mapping, is_mla=False, use_v2=True)
+        cleanup.callback(gen_mgr.shutdown)
+        _init_pool_data_v2([ctx_mgr], 1, is_mla=False, fill_random=True)
+        _init_pool_data_v2([gen_mgr], 1, is_mla=False, fill_random=False)
+        torch.cuda.synchronize()
+        (ctx_tc,) = create_instance_transceivers(1, 1, False, [ctx_mgr], config, False)
+        cleanup.callback(ctx_tc.shutdown)
+        (gen_tc,) = create_instance_transceivers(1, 1, False, [gen_mgr], config, False)
+        cleanup.callback(gen_tc.shutdown)
+        cleanup.callback(torch.cuda.synchronize)
+        gen, _ = _offload_lifecycle_executor(gen_mgr, gen_tc)
+        assert not gen_tc.reads_unique_tokens and not gen_mgr.enable_block_reuse
+        ctx_req, gen_req = _offload_request_pair(
+            0, list(range(prompt_len)), ctx_tc._context_info_endpoint, False
+        )
+        assert ctx_req.tracks_unique_tokens() and not gen_req.tracks_unique_tokens()
+        with pytest.raises(RuntimeError, match="without unique tokens"):
+            gen_req.get_unique_tokens(0)
+        _add_sequence(ctx_mgr, ctx_req.py_request_id, prompt_len, use_v2=True)
+        ctx_tc.respond_and_send_async(ctx_req)
+
+        gen.active_requests.append(gen_req)
+        with torch.cuda.stream(gen_stream):
+            torch.cuda._sleep(1_000_000_000)
+            step_done = torch.cuda.Event()
+            step_done.record()
+            # The scheduler's admission queues its page work behind the step.
+            assert gen_mgr.prepare_disagg_gen_init(gen_req)
+            gen.disagg.receive_gen_init([gen_req], defer=True)
+        assert not step_done.query()
+        assert gen_req.state == LlmRequestState.DISAGG_GENERATION_INIT
+
+        gen.disagg.start_deferred_gen_receives()
+        assert step_done.query()
+        assert gen_req.state != LlmRequestState.DISAGG_GENERATION_INIT
+
+        ctx_tc.check_context_transfer_status(None, mark_complete=True)
+        gen_tc.check_gen_transfer_status(None)
+        assert gen_req.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+        assert gen.disagg.try_finish_gen_receive(gen_req)
+        for token in range(7):
+            gen_req.add_new_token(1000 + token, 0)
+        assert gen_req.get_tokens(0) == list(range(prompt_len)) + list(range(1000, 1007))
+        verify_all_requests(
+            request_lengths=[prompt_len],
+            ctx_managers=[ctx_mgr],
+            gen_managers=[gen_mgr],
+            ctx_tp=1,
+            ctx_pp=1,
+            gen_tp=1,
+            gen_pp=1,
+            ctx_enable_dp=False,
+            gen_enable_dp=False,
+            ctx_request_ids=[ctx_req.py_request_id],
+            gen_request_ids=[gen_req.py_request_id],
+            is_mla=False,
+            use_v2=True,
+        )

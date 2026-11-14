@@ -42,7 +42,7 @@ from __future__ import annotations
 
 import enum
 import os
-from typing import TYPE_CHECKING, Callable, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, Optional, Set, Tuple
 
 from tensorrt_llm.logger import logger
 
@@ -80,15 +80,19 @@ def registered_routes() -> Dict[str, Callable[..., type]]:
 #: construction, and a check that can only ever hold is a check whose failure
 #: mode is its own bug taking down a working deployment.
 #:
-#: An environment variable rather than an LLM arg while modeling_v2 is
-#: experimental; it has to reach the ranks, so a test passes it through
+#: Beam additionally enables checkpoint digests, per-layer metadata rechecks and per-step
+#: routing agreement (device-to-host copies, hashing and collectives). Keep it off for
+#: performance measurements; all Beam ranks must use the same setting.
+#:
+#: An environment variable while modeling_v2 is experimental. It must reach all ranks,
+#: so a test passes it through
 #: ``env_overrides``. When this stops being experimental it belongs in the
 #: LLM args, where a caller can set it per engine rather than per process.
 MODELING_V2_VALIDATE_ENV = "TRTLLM_MODELING_V2_VALIDATE"
 
 
 def step_contract_enabled() -> bool:
-    """Whether targets should check their step contract on the first forward.
+    """Whether contract diagnostics are enabled (Beam also checks every step).
 
     Read once per model instance at construction rather than per forward: the
     answer cannot change within a process, and the forward is the hot path.
@@ -122,6 +126,26 @@ class NoTarget(ValueError):
     (for a refusal at construction, ``AutoModelForCausalLM.from_config`` does);
     under ``require`` it becomes the error the user sees.
     """
+
+
+# Targets a deployment builds only when it sets ``modeling_v2`` itself, filled by ``@disable_v2_by_default``.
+_V2_DISABLED_BY_DEFAULT: Set[type] = set()
+
+
+def disable_v2_by_default(target: type) -> type:
+    """Keep the built-in implementation for the deployments ``target`` claims unless ``modeling_v2`` is set.
+
+    Under the default ``modeling_v2`` the resolver declines the decorated
+    target and the engine builds the built-in implementation. A deployment that
+    sets ``modeling_v2`` to ``auto`` or ``require`` itself gets the target as
+    the ``route`` decides.
+    """
+    _V2_DISABLED_BY_DEFAULT.add(target)
+    return target
+
+
+def _modeling_v2_set_explicitly(llm_args: "TorchLlmArgs") -> bool:
+    return "modeling_v2" in llm_args.model_fields_set
 
 
 # The mode each target class was last resolved under (the loader builds the class right after resolving it).
@@ -198,6 +222,8 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
     when ``llm_args.modeling_v2`` is ``off``, when no ``route`` is registered
     for the architecture, or when that ``route`` raises ``NoTarget``.
     In ``require`` every one of those but ``off`` raises ``ValueError`` instead.
+    It also returns None for a ``@disable_v2_by_default`` target when
+    ``modeling_v2`` was left at its default.
 
     """
     mode = ModelingV2Mode.of(llm_args)
@@ -220,6 +246,12 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
             raise ValueError(f"modeling_v2='require', but no target fits {arch!r}: {why}") from None
         logger.info(
             f"modeling_v2: no target fits {arch!r} ({why}); using the built-in implementation"
+        )
+        return None
+    if target in _V2_DISABLED_BY_DEFAULT and not _modeling_v2_set_explicitly(llm_args):
+        logger.info(
+            f"modeling_v2: {target.__name__} fits {arch!r} but is built only when modeling_v2 "
+            "is set; using the built-in implementation"
         )
         return None
     if target is not None:
