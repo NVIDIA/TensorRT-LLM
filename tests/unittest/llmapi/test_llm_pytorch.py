@@ -1325,12 +1325,13 @@ def test_llm_context_only_timed_out_kv_cache_exhausted(sender_future_timeout_ms,
     for output in llm.generate(prompts0, sampling_params=sampling_params):
         print(output)
 
-    # Get number of allocated blocks. The request's record can trail its
-    # response, and the idle engine reports heartbeats in the meantime.
+    # Get number of allocated blocks from the request's own iteration. Its
+    # record can trail the response; until then the engine reports idle
+    # heartbeats and zero-duration queue snapshots, which measure nothing.
     results = []
     for _ in range(max_retries):
-        results.extend(r for r in llm.get_stats(2) if not is_idle_heartbeat(r))
-        if results:
+        results.extend(r for r in llm.get_stats(2) if r["iterLatencyMS"] > 0)
+        if any(r["numCompletedRequests"] for r in results):
             break
     assert len(results) == 1
     final_used_num_blocks = results[0]["kvCacheStats"]["usedNumBlocks"]

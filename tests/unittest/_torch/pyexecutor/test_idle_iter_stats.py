@@ -335,21 +335,32 @@ def test_parked_rank_zero_publishes_heartbeats_through_the_request_queue(executo
 
     # Wall clock for this test: the queue wait is real.
     monkeypatch.setattr(py_executor, "time", time)
-    monkeypatch.setattr(py_executor, "IDLE_HEARTBEAT_PERIOD_S", 0.02)
+    monkeypatch.setattr(py_executor, "IDLE_HEARTBEAT_PERIOD_S", 0.01)
     request_queue = ExecutorRequestQueue(
         dist=executor.dist, max_batch_size=8, enable_iter_perf_stats=True, batch_wait_timeout_ms=0.0
     )
     measured = executor._append_iter_stats(_snapshot(), ["req"])
     timeout, idle_tick = executor._plan_idle_heartbeat_wait(None)
     assert timeout is None
-
     item = RequestQueueItem(7, Mock())
-    threading.Timer(0.2, request_queue.request_queue.put, args=(item,)).start()
-    assert request_queue.get_from_request_queue(timeout, idle_tick=idle_tick) == [item]
 
-    # Many heartbeats were published while parked; the buffer kept the newest
+    def tick_then_request_after_three_heartbeats():
+        # The request arrives after a fixed number of heartbeats, so the count
+        # below does not depend on how the threads are scheduled.
+        wait = idle_tick()
+        if executor._update_iter_stats.call_count == 3 and request_queue.request_queue.empty():
+            request_queue.request_queue.put(item)
+        return wait
+
+    # The timeout only keeps a broken wait from hanging the test.
+    items = request_queue.get_from_request_queue(
+        datetime.timedelta(seconds=60), idle_tick=tick_then_request_after_three_heartbeats
+    )
+
+    assert items == [item]
+    # Three heartbeats were published while parked; the buffer kept the newest
     # one and the measured record, and the loop never ran.
-    assert executor._update_iter_stats.call_count >= 3
+    assert executor._update_iter_stats.call_count == 3
     assert len(executor.stats) == 2 and executor.stats[0] is measured
     assert executor.stats[1][_ROW_STATS] is executor._update_iter_stats.call_args.args[0]
     assert executor.iter_counter == 7

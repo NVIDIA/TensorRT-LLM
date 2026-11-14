@@ -297,6 +297,8 @@ def idle_wait(executor_queue, monkeypatch):
     state = types.SimpleNamespace(now=100.0, waits=[], arrivals=[])
 
     def get(timeout=None):
+        # A wait that never ends must fail the test, not hang it.
+        assert len(state.waits) < 100, "the idle wait did not end"
         state.waits.append(timeout)
         if state.arrivals:
             return state.arrivals.pop(0)
