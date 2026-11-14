@@ -724,11 +724,83 @@ def _packed_logits_elem_budget(metadata: DSAtrtllmAttentionMetadata) -> int:
     reserves for the indexer logits workspace where it reserves one. Clamping
     the packed cap to it keeps a packed chunk within that reserve.
     """
-    single_request_tile = min(
-        _INDEXER_MQA_LOGITS_ELEM_BUDGET,
-        metadata.max_num_tokens * metadata.kv_cache_manager.max_seq_len,
+    return _packed_logits_cap(metadata.max_num_tokens, metadata.kv_cache_manager.max_seq_len)
+
+
+def _single_request_logits_tile(max_num_tokens: int, max_seq_len: int) -> int:
+    """Largest MQA-logits tile of one prefill request."""
+    return min(_INDEXER_MQA_LOGITS_ELEM_BUDGET, max_num_tokens * max_seq_len)
+
+
+def _packed_logits_cap(max_num_tokens: int, max_seq_len: int) -> int:
+    """Largest MQA-logits tile of a prefill chunk packing several requests."""
+    return min(
+        _INDEXER_PACKED_LOGITS_ELEM_BUDGET,
+        _single_request_logits_tile(max_num_tokens, max_seq_len),
     )
-    return min(_INDEXER_PACKED_LOGITS_ELEM_BUDGET, single_request_tile)
+
+
+# Column slack per decode row for the output padding of the paged MQA-logits kernels (DeepGEMM
+# rounds each row up to a multiple of 1024 bytes: 256 FP32 or 512 16-bit columns).
+_PAGED_LOGITS_COLUMN_SLACK = 1024
+
+
+def throwaway_unfused_logits_elem_bound(
+    model: nn.Module, max_num_tokens: int, max_seq_len: int, max_gen_tokens: int
+) -> Optional[int]:
+    """Largest MQA-logits tile the unfused path still allocates when the fused Top-K is active.
+
+    The fused throwaway Top-K takes every single-request prefill chunk with at least the
+    min-context of context, so under MLA chunked prefill the unfused path keeps only
+    multi-request chunks, packed to ``_packed_logits_elem_budget``, and shorter single-request
+    chunks: at most ``max_num_tokens`` query rows over ``(min_context + max_num_tokens) /
+    compress_ratio`` keys (under query splitting a rank gates on its own rows, while the gathered
+    keys cover the whole chunk). Decode is not tiled by the logits budget: its paged MQA logits
+    hold ``max_gen_tokens`` rows over ``max_seq_len / compress_ratio`` keys plus the kernels'
+    column padding. Only valid when MLA chunked prefill plans the prefill chunks.
+
+    Args:
+        model: Model whose DSA indexers are inspected.
+        max_num_tokens: Max tokens of one forward step.
+        max_seq_len: Max sequence length of the KV cache.
+        max_gen_tokens: Max decode query tokens of one step (requests x tokens per step).
+
+    Returns:
+        The tile bound in elements, or None if one of this rank's indexers does not use the fused
+        path or has no built runner covering ``max_seq_len`` (the unfused path may then take any
+        chunk).
+    """
+    # Under pipeline parallelism the layers of other stages keep their modules but not their
+    # parameters; only the indexers this rank runs allocate logits here.
+    indexers = [
+        m
+        for m in model.modules()
+        if isinstance(m, Indexer) and getattr(getattr(m, "wq_b", None), "weight", None) is not None
+    ]
+    if not indexers:
+        return None
+    single_request_tile = _single_request_logits_tile(max_num_tokens, max_seq_len)
+    bound = _packed_logits_cap(max_num_tokens, max_seq_len)
+    for indexer in indexers:
+        runner = indexer._throwaway_topk
+        if (
+            not indexer._use_throwaway_topk
+            or indexer._throwaway_topk_failed
+            or runner is None
+            or not runner.ready
+        ):
+            return None
+        ratio = runner.compress_ratio
+        if not runner.can_run(max_seq_len // ratio):
+            return None
+        short_keys = -(-(indexer._throwaway_topk_min_context + max_num_tokens) // ratio)
+        decode_keys = -(-max_seq_len // ratio) + _PAGED_LOGITS_COLUMN_SLACK
+        bound = max(
+            bound,
+            min(max_num_tokens * short_keys, single_request_tile),
+            max_gen_tokens * decode_keys,
+        )
+    return bound
 
 
 @maybe_compile(dynamic=True)
@@ -1060,6 +1132,9 @@ class Indexer(nn.Module):
         )
         self._throwaway_topk: Optional[ThrowawayPrefillTopK] = None
         self._throwaway_topk_failed = False
+        # Prefill chunking bounds that set the query rows a chunk hands the fused runner.
+        self._indexer_max_chunk_size = sparse_params.indexer_max_chunk_size
+        self._q_split_threshold = sparse_params.q_split_threshold
 
         # Fused wk + weights_proj weight for single FP32 cuBLAS GEMM
         # (populated in cache_derived_state; maps to TF32 tensor cores on Ampere+)
@@ -1707,8 +1782,25 @@ class Indexer(nn.Module):
             row_ends=row_ends,
         )
 
+    def _throwaway_query_rows(self, max_num_tokens: int, mapping: Optional[Mapping]) -> int:
+        """Query rows a full single-request prefill chunk hands the fused runner on this rank.
+
+        A request's chunks hold ``max_num_tokens`` tokens (at most the indexer chunk size) but
+        the last; chunks of at least the split threshold divide their queries over the
+        attention-TP ranks.
+        """
+        rows = max_num_tokens
+        if self._indexer_max_chunk_size:
+            rows = min(rows, self._indexer_max_chunk_size)
+        begin, end, _ = _split_prefill_queries(rows, mapping, self._q_split_threshold)
+        return end - begin
+
     def _build_throwaway_topk(
-        self, compress_ratio: int, max_seq_len: int, device: torch.device
+        self,
+        compress_ratio: int,
+        max_seq_len: int,
+        device: torch.device,
+        max_query_rows: Optional[int] = None,
     ) -> bool:
         """Gets the runner shared by the layers of this configuration; False if unavailable."""
         self._throwaway_topk = get_throwaway_prefill_topk(
@@ -1718,11 +1810,18 @@ class Indexer(nn.Module):
             max_context_length=max_seq_len,
             device=device,
             qkv_dtype="mxfp4" if self.use_fp4 else "fp8",
+            max_query_rows=max_query_rows,
         )
         self._throwaway_topk_failed = self._throwaway_topk is None
         return not self._throwaway_topk_failed
 
-    def prewarm_throwaway_topk(self, max_seq_len: int, device: torch.device) -> bool:
+    def prewarm_throwaway_topk(
+        self,
+        max_seq_len: int,
+        device: torch.device,
+        max_num_tokens: Optional[int] = None,
+        mapping: Optional[Mapping] = None,
+    ) -> bool:
         """Builds the fused indexer + Top-K runner and compiles its kernels before serving.
 
         Without this, the first prefill chunk that reaches the min-context gate compiles the
@@ -1732,6 +1831,9 @@ class Indexer(nn.Module):
         Args:
             max_seq_len: Max sequence length of the KV cache manager, as at run time.
             device: CUDA device the layer runs on.
+            max_num_tokens: Max tokens of a forward step, as at run time; None sizes the kernel
+                launch by ``TRTLLM_THROWAWAY_TOPK_MAX_CHUNK`` alone.
+            mapping: Parallel mapping of the layer, as at run time.
 
         Returns:
             True if the runner is ready; False if the fused path is off or unavailable.
@@ -1742,6 +1844,7 @@ class Indexer(nn.Module):
             _effective_compress_ratio_divisor(self.compress_ratio),
             max_seq_len,
             device,
+            None if max_num_tokens is None else self._throwaway_query_rows(max_num_tokens, mapping),
         ):
             return False
         return self._throwaway_topk.warmup()
@@ -1800,7 +1903,10 @@ class Indexer(nn.Module):
         )
         if self._throwaway_topk is None:
             if not self._build_throwaway_topk(
-                compress_ratio, metadata.kv_cache_manager.max_seq_len, q_fp8.device
+                compress_ratio,
+                metadata.kv_cache_manager.max_seq_len,
+                q_fp8.device,
+                self._throwaway_query_rows(metadata.max_num_tokens, metadata.mapping),
             ):
                 return False
         elif self._throwaway_topk.compress_ratio != compress_ratio:

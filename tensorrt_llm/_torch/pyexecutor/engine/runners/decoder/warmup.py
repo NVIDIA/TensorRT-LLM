@@ -884,7 +884,12 @@ class DecoderWarmup:
             for indexer in indexers:
                 try:
                     ready = (
-                        indexer.prewarm_throwaway_topk(kv_cache_manager.max_seq_len, device)
+                        indexer.prewarm_throwaway_topk(
+                            kv_cache_manager.max_seq_len,
+                            device,
+                            self._config.max_num_tokens,
+                            self.mapping,
+                        )
                         or ready
                     )
                 except Exception as e:

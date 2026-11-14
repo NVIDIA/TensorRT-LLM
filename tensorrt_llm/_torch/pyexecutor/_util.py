@@ -2074,8 +2074,28 @@ class KvCacheCreator:
 
         if getattr(self._sparse_attention_config, "algorithm",
                    None) == "deepseek_v4":
+            # With the fused throwaway Top-K active, its runner was built (and measured) by the
+            # profiling run's warmup, and the unfused path needs only a smaller logits tile.
+            elem_bound = None
+            features = self._model_engine.attn_runtime_features
+            if features is not None and features.chunked_prefill:
+                from ..attention.backends.sparse.dsa.indexer import \
+                    throwaway_unfused_logits_elem_bound
+                tokens_per_gen_step = (
+                    1 if self._speculative_config is None else
+                    self._speculative_config.tokens_per_gen_step)
+                elem_bound = throwaway_unfused_logits_elem_bound(
+                    self._model_engine.model, self._max_num_tokens,
+                    self._max_seq_len,
+                    min(self._max_num_tokens,
+                        self._max_batch_size * tokens_per_gen_step))
             workspace_memory = get_indexer_mqa_logits_workspace_bytes(
-                self._max_num_tokens, self._max_seq_len)
+                self._max_num_tokens, self._max_seq_len, elem_bound)
+            if elem_bound is not None:
+                logger.info(
+                    "The fused throwaway Top-K is active: the DeepSeek-V4 Indexer MQA-logits "
+                    f"workspace covers the unfused chunks only ({elem_bound} elements)."
+                )
             budget_before = kv_cache_max_memory
             workspace_reserve = get_indexer_mqa_logits_workspace_reserve(
                 budget_before, workspace_memory)
