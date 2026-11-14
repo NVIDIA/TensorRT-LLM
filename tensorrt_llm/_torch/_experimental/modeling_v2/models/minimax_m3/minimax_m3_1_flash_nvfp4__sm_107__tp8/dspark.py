@@ -778,14 +778,23 @@ class M3DSparkWorker(S4WorkerMixin, DSparkWorker):
         # DRAFTER_DOWN_SPLITK / DRAFTER_OPROJ_SPLITK: the drafter's down / o_proj projections on FlashInfer's BF16
         # split-K GEMM at a pinned tactic, on the 7-token draft passes whose all-reduce the fused drafter boundary
         # (DRAFT_AR_NORM_FUSED) defers; a projection the layout routing (DRAFTER_HISLAYOUT) took keeps that route.
+        # Not with DRAFT_AR_NORM_CLUSTER: its multicast all-reduce + norm takes the stock projection output.
         down = route_down_splitk(
             draft_model,
-            enabled=not his[1] and k == 7 and s9b and not m31_disabled("DRAFTER_DOWN_SPLITK"),
+            enabled=not his[1]
+            and k == 7
+            and s9b
+            and not S9B_MC
+            and not m31_disabled("DRAFTER_DOWN_SPLITK"),
         )
         logger.info(f"M3.1 DRAFTER_DOWN_SPLITK: armed {down}/5 projections on rank {rank}")
         oproj = route_oproj_splitk(
             draft_model,
-            enabled=not his[0] and k == 7 and s9b and not m31_disabled("DRAFTER_OPROJ_SPLITK"),
+            enabled=not his[0]
+            and k == 7
+            and s9b
+            and not S9B_MC
+            and not m31_disabled("DRAFTER_OPROJ_SPLITK"),
         )
         logger.info(f"M3.1 DRAFTER_OPROJ_SPLITK: armed {oproj}/5 projections on rank {rank}")
         self.prebuild_s4(lm_head, draft_model)
