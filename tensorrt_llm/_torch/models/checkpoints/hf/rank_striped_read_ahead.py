@@ -3,6 +3,7 @@
 
 """Private host read-ahead primitives for Hugging Face SafeTensors."""
 
+import math
 import os
 import threading
 import time
@@ -152,8 +153,77 @@ def _read_cgroup_value(path: Path, *, unlimited_threshold: int | None = None) ->
     return parsed
 
 
+def _reclaimable_file_cache(stat_path: Path, unified: bool) -> int:
+    """Return the file-backed page cache that a cgroup's `memory.stat` reports.
+
+    The kernel reclaims these pages before the cgroup runs out of memory, so they are as
+    available as the page cache that host memory accounting counts as available. cgroup v1
+    reports them for the whole subtree, like `memory.usage_in_bytes`, in its `total_*`
+    entries; cgroup v2 entries already cover the subtree.
+    """
+    try:
+        lines = stat_path.read_text().splitlines()
+    except (OSError, UnicodeError):
+        return 0
+    stats = {}
+    for line in lines:
+        name, _, value = line.partition(" ")
+        try:
+            stats[name] = int(value)
+        except ValueError:
+            continue
+    names = ("active_file", "inactive_file")
+    if not unified and all(f"total_{name}" in stats for name in names):
+        names = tuple(f"total_{name}" for name in names)
+    return sum(max(0, stats.get(name, 0)) for name in names)
+
+
+def _memory_protection(cgroup: Path) -> float:
+    """Return the larger of a cgroup v2's `memory.min` and `memory.low`, infinite for `max`."""
+    protection = 0.0
+    for name in ("memory.min", "memory.low"):
+        try:
+            value = (cgroup / name).read_text().strip()
+        except (OSError, UnicodeError):
+            continue
+        if value == "max":
+            return math.inf
+        try:
+            protection = max(protection, int(value))
+        except ValueError:
+            continue
+    return protection
+
+
+def _protected_file_cache(cgroup: Path) -> int:
+    """Return the page cache that a cgroup v2's children protect from its reclaim.
+
+    Reclaim for the cgroup's limit leaves each child's memory up to the child's `memory.min`, and
+    takes memory up to the child's `memory.low` only after all unprotected memory, such as the
+    pages this process reads. Up to that protection, a child's file-backed page cache, the cache
+    of the child on this process's path included, is not available under the cgroup's limit.
+    Reclaim for a cgroup's own limit does not apply that cgroup's protection, so each limit only
+    loses the protection of its cgroup's children.
+    """
+    try:
+        children = list(cgroup.iterdir())
+    except OSError:
+        return 0
+    protected = 0
+    for child in children:
+        protection = _memory_protection(child)
+        if protection > 0:
+            file_cache = _reclaimable_file_cache(child / "memory.stat", unified=True)
+            protected += int(min(protection, file_cache))
+    return protected
+
+
 def cgroup_available_host_memory() -> int | None:
-    """Return the tightest remaining cgroup limit, including ancestors."""
+    """Return the tightest remaining cgroup limit, including ancestors.
+
+    Reclaimable file-backed page cache charged to a cgroup counts as available, except, on cgroup
+    v2, the page cache that the cgroup's children protect.
+    """
     unified_path, memory_path = _cgroup_paths()
     candidates: list[tuple[Path, Path, bool]] = []
 
@@ -188,9 +258,14 @@ def cgroup_available_host_memory() -> int | None:
                 limits = (
                     _read_cgroup_value(path / "memory.limit_in_bytes", unlimited_threshold=1 << 60),
                 )
-            if current is None:
+            finite_limits = [limit for limit in limits if limit is not None]
+            if current is None or not finite_limits:
                 continue
-            available.extend(max(0, limit - current) for limit in limits if limit is not None)
+            reclaimable = _reclaimable_file_cache(path / "memory.stat", unified)
+            if unified:
+                reclaimable -= _protected_file_cache(path)
+            in_use = max(0, current - max(0, reclaimable))
+            available.extend(max(0, limit - in_use) for limit in finite_limits)
 
     return min(available) if available else None
 
