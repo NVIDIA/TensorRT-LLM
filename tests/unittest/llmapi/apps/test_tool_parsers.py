@@ -6771,6 +6771,148 @@ class TestKimiK3ToolParser(BaseToolParserTestClass):
         assert [call.name for call in result.calls] == ["a<b", "get_weather"]
         assert json.loads(result.calls[1].parameters) == {"k<ey": "v"}
 
+    # Pieces of a generation with a call whose close tags the model left out.
+    # The generation prompt ends inside `<|open|>think<|sep|>`.
+    PREFIX = ("Need the weather.<|close|>think<|sep|>"
+              "<|open|>response<|sep|>Checking.<|close|>response<|sep|>")
+    WEATHER = '<|open|>call tool="get_weather" index="1"<|sep|>'
+    LOCATION = '<|open|>argument key="location" type="string"<|sep|>'
+    LOCATION_LA = LOCATION + "LA<|close|>argument<|sep|>"
+    SEARCH = ('<|open|>call tool="search_web" index="2"<|sep|>'
+              '<|open|>argument key="query" type="string"<|sep|>AI'
+              "<|close|>argument<|sep|><|close|>call<|sep|>")
+    MESSAGE_END = "<|close|>message<|sep|><|end_of_msg|>"
+    LA_AND_AI = [(0, "get_weather", {
+        "location": "LA"
+    }), (1, "search_web", {
+        "query": "AI"
+    })]
+
+    @staticmethod
+    def _chunkings(text):
+        """Every way these tests split a generation into stream deltas."""
+        yield [text]
+        yield list(text)
+        for size in (2, 3, 5, 7, 11):
+            yield [text[i:i + size] for i in range(0, len(text), size)]
+        for cut in range(1, len(text)):
+            yield [text[:cut], text[cut:]]
+
+    def _read_chained(self, generation, tools):
+        """Read a generation as serving does: the K3 reasoning parser feeds this one.
+
+        Asserts that the stream, split every way, reads like the whole text, and
+        returns the whole-text reading: (text, [(tool_index, name, arguments)]).
+        """
+        from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
+
+        def reading(text, calls):
+            return text, [(call.tool_index, call.name,
+                           json.loads(call.parameters)) for call in calls]
+
+        content = ReasoningParserFactory.create_reasoning_parser(
+            "kimi_k3").parse(generation).content
+        whole = self.make_parser().detect_and_parse(content, tools)
+        expected = reading(whole.normal_text, whole.calls)
+        for chunks in self._chunkings(generation):
+            reasoning = ReasoningParserFactory.create_reasoning_parser(
+                "kimi_k3")
+            deltas = [reasoning.parse_delta(chunk).content for chunk in chunks]
+            deltas.append(reasoning.finish().content)
+            parser = self.make_parser()
+            results = [
+                parser.parse_streaming_increment(delta, tools)
+                for delta in deltas
+            ]
+            results.append(parser.finish(tools))
+            streamed = reading(
+                "".join(result.normal_text for result in results),
+                [call for result in results for call in result.calls])
+            assert streamed == expected, chunks
+        return expected
+
+    @pytest.mark.parametrize(
+        "left_open, ending, calls",
+        [
+            # A value followed straight by the call's close tag.
+            pytest.param(WEATHER + LOCATION + "LA",
+                         "<|close|>call<|sep|>" + SEARCH + EOT + MESSAGE_END,
+                         LA_AND_AI,
+                         id="value-call_close-next_call"),
+            pytest.param(WEATHER + LOCATION + "LA",
+                         "<|close|>call<|sep|>",
+                         LA_AND_AI[:1],
+                         id="value-call_close-end"),
+            # A call whose argument is complete, followed by the next call or
+            # the end of the section.
+            pytest.param(WEATHER + LOCATION_LA,
+                         SEARCH + EOT + MESSAGE_END,
+                         LA_AND_AI,
+                         id="call-next_call"),
+            pytest.param(WEATHER + LOCATION_LA,
+                         EOT + MESSAGE_END,
+                         LA_AND_AI[:1],
+                         id="call-section_close"),
+            # A call or a value left open by the response's close tag and the
+            # message framing.
+            pytest.param(WEATHER + LOCATION_LA,
+                         "<|close|>response<|sep|>" + MESSAGE_END,
+                         LA_AND_AI[:1],
+                         id="call-response_close"),
+            pytest.param(WEATHER + LOCATION + "LA",
+                         "<|close|>response<|sep|>" + MESSAGE_END,
+                         LA_AND_AI[:1],
+                         id="value-response_close"),
+        ])
+    def test_call_with_missing_close_tags_is_read(self, sample_tools, left_open,
+                                                  ending, calls):
+        """Read a call whose close tags the model left out where it ends.
+
+        ``left_open`` is the call up to where the model ended it without its
+        close tags, and ``ending`` what it wrote instead. A generation that
+        stops at ``left_open`` may have cut the call off, so it is not read.
+        """
+        generation = self.PREFIX + self.BOT + left_open
+
+        assert self._read_chained(generation + ending,
+                                  sample_tools) == ("Checking.", calls)
+        assert self._read_chained(generation, sample_tools) == ("Checking.", [])
+
+    def test_value_without_close_tag_is_read_only_where_the_call_ends(
+            self, sample_tools):
+        """Read a value without its close tag only up to tags that end the call.
+
+        The call's close tag ends it where a call can end, not before prose.
+        The section's close tag alone does not: a value may quote it, and the
+        section ends at the first one.
+        """
+        value = (self.PREFIX + self.BOT + self.WEATHER + self.LOCATION +
+                 "New York")
+
+        _, calls = self._read_chained(value + "<|close|>call<|sep|>",
+                                      sample_tools)
+        assert calls == [(0, "get_weather", {"location": "New York"})]
+        for tail in ("<|close|>call<|sep|> and Boston",
+                     self.EOT + self.MESSAGE_END):
+            _, calls = self._read_chained(value + tail, sample_tools)
+            assert all("location" not in arguments
+                       for _, _, arguments in calls), tail
+
+    def test_call_read_without_close_tags_is_logged(self, sample_tools, parser,
+                                                    monkeypatch):
+        """A call read without its close tags is logged with the tags it lacks."""
+        log = Mock()
+        monkeypatch.setattr(
+            "tensorrt_llm.serve.tool_parser.kimi_k3_tool_parser.logger", log)
+
+        result = parser.detect_and_parse(
+            self.BOT + self.WEATHER + self.LOCATION_LA + self.EOT, sample_tools)
+
+        assert [call.name for call in result.calls] == ["get_weather"]
+        warnings = [str(call.args[0]) for call in log.warning.call_args_list]
+        assert any("'get_weather' read without <|close|>call<|sep|>" in warning
+                   for warning in warnings)
+
 
 class TestForcedToolChoicePostprocessing:
     """Serve-level tests for named/forced ``tool_choice`` and stream flush.
