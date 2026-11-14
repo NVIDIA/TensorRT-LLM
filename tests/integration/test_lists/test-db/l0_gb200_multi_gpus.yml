@@ -28,6 +28,7 @@ l0_gb200_multi_gpus:
   - unittest/_torch/modules/test_engram_replay.py
   - unittest/_torch/speculative/hw_agnostic/test_dspark_v41.py
   # CSA2 kernel, indexer, chunked prefill and prefix-cache parity on Grace Blackwell.
+  - unittest/_torch/attention/sparse/csa2/test_kernel.py::test_cache_kernels_builds_and_reuses_namespace
   - unittest/_torch/attention/sparse/csa2/test_kernel.py::test_packed_attention_parity
   - unittest/_torch/attention/sparse/csa2/test_kernel.py::test_native_fp8_staging_exact_bytes
   - unittest/_torch/attention/sparse/csa2/test_indexer.py::test_native_paged_owner_indexer_and_graph

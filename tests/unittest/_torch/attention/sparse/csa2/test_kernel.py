@@ -11,6 +11,8 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.attention.backends.sparse.csa2.kernel import (
+    _cache_kernels,
+    dsl_available,
     packed_sparse_attention,
     quantize_scatter_rows,
 )
@@ -626,6 +628,35 @@ assert not torch.cuda.is_initialized()
 assert hasattr(torch.ops.trtllm, 'csa2_indexer_q_gemm_rope_fp4')
 """
     subprocess.run([sys.executable, "-c", program, str(kernel)], check=True, timeout=60)
+
+
+def test_cache_kernels_builds_and_reuses_namespace():
+    if not dsl_available():
+        pytest.skip("CUTLASS DSL is unavailable")
+
+    expected = (
+        "QuantizeScatterKernel",
+        "GatherDequantKernel",
+        "ScatterPackedKernel",
+        "StageCompactKernel",
+        "StageDequantKernel",
+        "SharedCompactKernel",
+        "SharedDecodeKernel",
+        "StageScaleKernel",
+        "StageScaleFinalizeKernel",
+    )
+
+    _cache_kernels.cache_clear()
+    namespace = _cache_kernels()
+    again = _cache_kernels()
+    assert again is namespace, "_cache_kernels must return the memoized namespace"
+    info = _cache_kernels.cache_info()
+    assert info.misses == 1 and info.hits == 1, f"unexpected cache behavior: {info}"
+
+    missing = [name for name in expected if not hasattr(namespace, name)]
+    assert not missing, f"cache kernel namespace is missing: {missing}"
+    not_callable = [name for name in expected if not callable(getattr(namespace, name))]
+    assert not not_callable, f"cache kernel namespace entries are not callable: {not_callable}"
 
 
 @pytest.mark.parametrize(

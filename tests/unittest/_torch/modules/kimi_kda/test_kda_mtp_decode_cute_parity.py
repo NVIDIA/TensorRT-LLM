@@ -275,6 +275,7 @@ def cpu_reference(data):
 def cute_run(
     data,
     zero_accepted_hint=False,
+    regular_metadata_hint=False,
     packed_token_layout=False,
     out=None,
     fuse_output_norm=False,
@@ -329,6 +330,7 @@ def cute_run(
         lower_bound=data["lower_bound"],
         scale=data["scale"],
         zero_accepted_hint=zero_accepted_hint,
+        regular_metadata_hint=regular_metadata_hint,
         packed_token_layout=packed_token_layout,
         onorm_g=data.get("onorm_g"),
         onorm_weight=data.get("onorm_weight"),
@@ -914,6 +916,31 @@ def test_zero_accepted_hint_variant(B, H):
         "cs_v",
     ):
         _assert_close(f"{name}(fast vs general)", fast[name], general[name], atol=1e-5)
+
+
+@pytest.mark.parametrize("B,H", [(32, 12)], ids=lambda v: str(v))
+def test_regular_metadata_hint_variant(B, H):
+    """The uniform-metadata specialization matches the general metadata path."""
+    data = make_conv_data(B, H, M=M, seed=19)
+    general = cute_run(data)
+    specialized = cute_run(data, regular_metadata_hint=True)
+    for name in (
+        "out",
+        "recurrent_state",
+        "k_cache",
+        "g_cache",
+        "v_cache",
+        "beta_cache",
+        "cs_q",
+        "cs_k",
+        "cs_v",
+    ):
+        _assert_close(
+            f"{name}(regular metadata vs general)",
+            specialized[name],
+            general[name],
+            atol=1e-5,
+        )
 
 
 def test_misaligned_state_indices_after_aligned_warmup():
