@@ -26,6 +26,7 @@ import struct
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import numpy as np
 import pytest
 
 from tensorrt_llm.executor.result import CompletionOutput
@@ -361,9 +362,9 @@ def _serve(
 
     def generate_async(*, inputs, disaggregated_params=None, **kwargs):
         if isinstance(inputs, dict):
-            ids = inputs.get("prompt_token_ids") or tokenize_prompt(
-                tokenizer, inputs["prompt"], add_special_tokens=False
-            )
+            ids = inputs.get("prompt_token_ids")
+            if ids is None:
+                ids = tokenize_prompt(tokenizer, inputs["prompt"], add_special_tokens=False)
         else:
             ids = list(inputs)
         prompts.append(ids)
@@ -529,6 +530,24 @@ def test_a_relayed_prompt_without_context_usage_is_counted_as_chat_counts_it(ser
     chat = _chat_usage(client, False, **relayed)
 
     assert responses[0] == chat[0] == 5
+
+
+def test_relayed_base64_prompt_reaches_both_routes_as_an_int32_array(serve):
+    client, prompts = serve("qwen3")
+    token_ids = np.arange(8192, dtype=np.int32)
+    relayed = {
+        "prompt_token_ids_b64": base64.b64encode(token_ids.tobytes()).decode(),
+        "disaggregated_params": {"request_type": "generation_only"},
+    }
+
+    _chat_usage(client, False, **relayed)
+    _responses_usage(client, False, store=False, **relayed)
+
+    assert len(prompts) == 2
+    for prompt in prompts:
+        assert isinstance(prompt, np.ndarray)
+        assert prompt.dtype == np.int32
+        np.testing.assert_array_equal(prompt, token_ids)
 
 
 def test_an_empty_relayed_prompt_is_rendered_and_leaves_out_the_opener(serve):

@@ -149,6 +149,12 @@ def _logit_bias_to_embedding_bias(
     return embedding_bias
 
 
+def _decode_prompt_token_ids_b64(value: str) -> Any:
+    import numpy as np
+
+    return np.frombuffer(base64.b64decode(value), dtype=np.int32)
+
+
 class OpenAIBaseModel(BaseModel):
     # OpenAI API does not allow extra fields & allow to initialize by both alias and field name
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
@@ -1773,9 +1779,7 @@ class ResponsesRequest(OpenAIBaseModel):
             return self.prompt_token_ids
         if not self.prompt_token_ids_b64:
             return None
-        import numpy as np
-        return np.frombuffer(base64.b64decode(self.prompt_token_ids_b64),
-                             dtype=np.int32).tolist()
+        return _decode_prompt_token_ids_b64(self.prompt_token_ids_b64).tolist()
 
     _DEFAULT_SAMPLING_PARAMS = {
         "temperature": 1.0,

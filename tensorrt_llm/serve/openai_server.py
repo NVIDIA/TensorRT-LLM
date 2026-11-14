@@ -113,8 +113,8 @@ from tensorrt_llm.serve.openai_protocol import (
     ResponseFormat, ResponsesRequest, ResponsesResponse,
     RuntimeMemoryUpdateRequest, StartProfileRequest, TokenizeRequest,
     TokenizeResponse, UpdateWeightsRequest, UsageInfo,
-    ensure_request_chat_template_allowed, to_llm_conversation_params,
-    to_llm_disaggregated_params)
+    _decode_prompt_token_ids_b64, ensure_request_chat_template_allowed,
+    to_llm_conversation_params, to_llm_disaggregated_params)
 from tensorrt_llm.serve.openai_video_routes import _VideoRoutesMixin
 from tensorrt_llm.serve.perf_metrics import (PerfMetricsJsonlWriter,
                                              PerfMetricsMiddleware,
@@ -1137,7 +1137,8 @@ class OpenAIServer(_VideoRoutesMixin):
         verbatim instead of rendering the template a second time.
         """
         prompt["multi_modal_data"] = mm_data
-        if request.prompt_token_ids is None:
+        if (request.prompt_token_ids is None
+                and not getattr(request, "prompt_token_ids_b64", None)):
             prompt["chat_template_applied"] = True
         if mm_item_order:
             prompt["mm_item_order"] = mm_item_order
@@ -2376,16 +2377,16 @@ class OpenAIServer(_VideoRoutesMixin):
                     resolve_media=resolve_media,
                 )
 
-            # Decode base64 int32 prompt_token_ids relayed by the orchestrator.
+            relayed_prompt_token_ids = None
             if request.prompt_token_ids is None and request.prompt_token_ids_b64:
-                import numpy as np
-                request.prompt_token_ids = np.frombuffer(
-                    base64.b64decode(request.prompt_token_ids_b64),
-                    dtype=np.int32).tolist()
+                relayed_prompt_token_ids = _decode_prompt_token_ids_b64(
+                    request.prompt_token_ids_b64)
 
             rendered_prompt = None
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
+            elif relayed_prompt_token_ids is not None:
+                prompt = {"prompt_token_ids": relayed_prompt_token_ids}
             else:
                 # Render (and append the forced named-tool prefix, see
                 # ``_build_forced_tool_call_decoding``) while the media loads.
@@ -2415,7 +2416,8 @@ class OpenAIServer(_VideoRoutesMixin):
                     rendered_prompt = rendered.template_text
             prompt = prompt_inputs(prompt)
 
-            if request.prompt_token_ids is not None:
+            if (request.prompt_token_ids is not None
+                    or relayed_prompt_token_ids is not None):
                 mm_data, mm_embeddings = await mm_coroutines
             if mm_data:
                 self._attach_multimodal_data(prompt, request, mm_data,
@@ -3395,7 +3397,11 @@ class OpenAIServer(_VideoRoutesMixin):
             return 0
         # A generation-only handoff runs the prompt the context worker relayed
         # instead of rendering one; asked as the render path asks it.
-        relayed = request.relayed_prompt_token_ids() is not None
+        params = request.disaggregated_params
+        relayed = (params is not None
+                   and params.request_type == "generation_only"
+                   and (request.prompt_token_ids is not None
+                        or bool(request.prompt_token_ids_b64)))
         render_resources = RenderResources.from_server(self)
         return render_resources.prompt_tokens_excluded_from_usage(
             add_generation_prompt=True,

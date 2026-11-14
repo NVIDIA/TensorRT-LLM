@@ -93,6 +93,7 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionMessageParam,
                                                 StreamingResponsesResponse,
                                                 UCompletionRequest,
                                                 UCompletionResponse,
+                                                _decode_prompt_token_ids_b64,
                                                 to_disaggregated_params)
 from tensorrt_llm.serve.render import RenderResources, render_conversation
 from tensorrt_llm.serve.responses_web_search import is_web_search_tool
@@ -1750,9 +1751,16 @@ async def request_preprocess(
 
     # A generation worker in disaggregated serving gets the context worker's
     # tokens: rendering again could produce a prompt that was never prefilled.
-    pretokenized = request.relayed_prompt_token_ids()
-    if pretokenized is not None:
-        input_tokens = pretokenized
+    is_generation_handoff = (request.disaggregated_params is not None
+                             and request.disaggregated_params.request_type
+                             == "generation_only")
+    if is_generation_handoff and request.prompt_token_ids is not None:
+        input_tokens = request.prompt_token_ids
+    elif is_generation_handoff and request.prompt_token_ids_b64:
+        input_tokens = {
+            "prompt_token_ids":
+            _decode_prompt_token_ids_b64(request.prompt_token_ids_b64)
+        }
     elif use_harmony:
         input_tokens = await _create_input_tokens_harmony(
             request=request,
@@ -1778,8 +1786,16 @@ async def request_preprocess(
 
     if ENABLE_RESPONSES_DEBUG_MSG:  # decoding is not free; skip it otherwise
         # A multimodal prompt is submitted as text; token ids are decoded.
-        prompt_text = (input_tokens.get("prompt") if isinstance(
-            input_tokens, dict) else _decode_tokens(input_tokens, tokenizer))
+        if isinstance(input_tokens, dict):
+            prompt_text = input_tokens.get("prompt")
+            if prompt_text is None:
+                token_ids = input_tokens.get("prompt_token_ids")
+                if token_ids is not None:
+                    if hasattr(token_ids, "tolist"):
+                        token_ids = token_ids.tolist()
+                    prompt_text = _decode_tokens(token_ids, tokenizer)
+        else:
+            prompt_text = _decode_tokens(input_tokens, tokenizer)
         _responses_debug_log("======= Complete Inputs to model =======")
         _responses_debug_log(prompt_text)
         _responses_debug_log("========================================")
