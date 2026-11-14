@@ -624,6 +624,46 @@ def test_a_control_that_cannot_answer_leaves_the_keeps_standing_until_more_arriv
     assert camp.state.checkpoint["retry_after"] == 4
 
 
+def test_a_checkpoints_suite_job_holds_as_many_devices_as_the_widest_member(tmp_path):
+    """The checkpoint's gate drops the members (accuracy runs on the final tree), not their width.
+
+    The target's suite carries multi-rank tests; on one device they fail at every checkpoint
+    and every keep since the last one is rolled back.
+    """
+    gates = FakeRunner(["g1"], "campg", _effect)
+    asked: dict[str, str] = {}
+    submit = gates.submit
+
+    def recording(spool, label, command, **kw):
+        asked[label] = kw.get("gpus", "all")
+        return submit(spool, label, command, **kw)
+
+    gates.submit = recording
+    camp = _campaign(tmp_path, gates, [])
+    assert camp.keep_gate.members == ("dep4",) and camp.keep_gate.suite_devices == 4
+    suite = camp.keep_gate.tests_only()
+    assert suite.members == () and not suite.ungated
+    assert suite.suite_devices == 4 and suite.needs("tests")[0] == 4
+    (ck,) = _run(camp)
+    (label,) = [label for label in asked if label.startswith("gate-ckpt-")]
+    assert label.endswith("-tests") and asked[label] == "4"
+    assert ck["correctness"] == "PASS" and camp.state.kept == ["fast-path"]
+
+
+def test_the_suite_width_leaves_the_campaigns_evidence_inputs_as_they_were(tmp_path):
+    """The suite's width restates the members' width and changes nothing the gate judges.
+
+    It stays out of the evidence inputs, so a campaign resumed across a change of that field
+    keeps its controls and measurements instead of measuring them all again.
+    """
+    camp = _campaign(tmp_path, FakeRunner(["g1"], "campg", _effect), [])
+    before = camp.state.inputs
+    assert before
+    camp.keep_gate = replace(camp.keep_gate, suite_width=camp.keep_gate.suite_devices)
+    camp.refresh_inputs()
+    assert camp.state.inputs == before
+
+
 HOUR = 3600.0
 
 
@@ -838,3 +878,35 @@ def test_a_split_candidate_gets_one_member_gated_variant_that_is_kept(tmp_path):
     assert "the requests this rank runs in the step >= 128" in request
     assert str(spec.workdir / "worktrees" / "fast-path-gated") in request
     assert f"--priority {TUNER}" in request
+
+
+def test_every_tuner_turn_queues_its_jobs_below_the_campaigns_measurement(tmp_path):
+    """A revise or a rebase turn's jobs queue at TUNER too, as a new candidate's do.
+
+    A tuner's job at the scheduler's default priority ranks ahead of the campaign's measurement,
+    which runs one candidate at a time, and holds back every candidate waiting behind it.
+    """
+    from agent_flow.workflows.trtllm_modeling_v2.tune.requests import (
+        CampaignContext,
+        render_rebase_request,
+        render_revise_request,
+        turn_prompt,
+    )
+
+    ctx = CampaignContext(
+        repo=tmp_path,
+        package=tmp_path,
+        campaign_dir=tmp_path / "campaign",
+        perf_root=tmp_path / "perf",
+        target_dir="t/",
+        target_tests="t/",
+        model="m",
+        dev_spools=[tmp_path / "s1"],
+        env_script=tmp_path / "env.sh",
+        workload="isl 8192, osl 1024",
+        standings_table="",
+    )
+    for render in (render_revise_request, render_rebase_request):
+        request = render(ctx, slug="x", worktree=tmp_path / "wt", best_branch="best", reason="r")
+        assert f"--priority {TUNER} --tree {tmp_path / 'wt'}" in request.read_text()
+        assert f"--priority {TUNER}" in turn_prompt(request)
