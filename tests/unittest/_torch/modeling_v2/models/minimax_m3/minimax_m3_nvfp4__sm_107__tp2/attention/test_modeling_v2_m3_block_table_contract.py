@@ -49,10 +49,14 @@ _ALLOWED = {
         "attention/backends/sparse/minimax_m3/msa_backend.py",
         "_build_msa_fields",
     ),  # the H2D copy in prepare()
-    # The MiniMax-M3.1 family's MSA backend (msa/msa_backend.py) re-creates the buffers; prepare()'s copy is main's.
+    # The MiniMax-M3.1 family's MSA backend (msa/msa_backend.py) writes it at the same two places.
     (
         "_experimental/modeling_v2/models/minimax_m3/msa/msa_backend.py",
         "_create_msa_buffers",
+    ),
+    (
+        "_experimental/modeling_v2/models/minimax_m3/msa/msa_backend.py",
+        "_build_msa_fields",
     ),
 }
 
