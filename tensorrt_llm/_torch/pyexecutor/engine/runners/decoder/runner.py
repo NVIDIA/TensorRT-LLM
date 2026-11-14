@@ -29,7 +29,11 @@ from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
 from tensorrt_llm._torch.pyexecutor import h2d_cache, step_inputs
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner
-from tensorrt_llm._torch.pyexecutor.context_logits_plan import ContextLogitsPlan
+from tensorrt_llm._torch.pyexecutor.context_logits_plan import (
+    ContextLogitsPlan,
+    context_logits_rows,
+    store_context_logits_from_full_rows,
+)
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     CUDAGraphRunner,
     CUDAGraphRunnerConfig,
@@ -149,6 +153,30 @@ class PrefillCompiledModel(torch.nn.Module):
             return super().__getattr__(name)
         except AttributeError:
             return getattr(super().__getattr__("eager_model"), name)
+
+
+def _holds_token_rows(logits: Any) -> bool:
+    """Whether ``logits`` is a plain ``[tokens, vocab]`` tensor.
+
+    Models that do not generate text, such as process reward models, return
+    other shapes, which the sampler handles as they are.
+    """
+    return isinstance(logits, torch.Tensor) and not logits.is_nested and logits.dim() == 2
+
+
+def _full_context_rows_need_storing(scheduled_requests: ScheduledRequests) -> bool:
+    """Whether every-token logits must be stored and dropped before post-processing.
+
+    They can stay for the sampler only when every row is a requested context
+    row (no other context request, whose single sampling row the sampler
+    expects) and no post-processor will edit one of them.
+    """
+    return any(
+        not request.py_return_context_logits for request in scheduled_requests.context_requests
+    ) or any(
+        getattr(request, "py_logits_post_processors", None)
+        for request in scheduled_requests.all_requests()
+    )
 
 
 class DecoderRunner(ScheduledModelRunner):
@@ -867,6 +895,28 @@ class DecoderRunner(ScheduledModelRunner):
             if self.forward_pass_callable is not None:
                 self.forward_pass_callable()
 
+            if (
+                gather_context_logits
+                # Earlier pipeline stages hold placeholder logits; the last
+                # stage's context logits reach them as a result diff.
+                and self._mapping.is_last_pp_rank()
+                and not (self._config.is_spec_decode or enable_spec_decode)
+                and isinstance(outputs, dict)
+                and _holds_token_rows(outputs.get("logits"))
+                and not outputs.get("context_logits_handled", False)
+                and _full_context_rows_need_storing(semantic_requests)
+            ):
+                # Without the plan the LM head projected every context token of
+                # every context request. Store the requested context logits
+                # before any post-processor edits a row, and leave the plan's
+                # layout: one sampling row per context request.
+                outputs = {
+                    **outputs,
+                    "logits": store_context_logits_from_full_rows(
+                        semantic_requests.context_requests, outputs["logits"]
+                    ),
+                    "context_logits_handled": True,
+                }
             if isinstance(outputs, dict) and outputs.get(GREEDY_TOKENS_KEY) is not None:
                 outputs = self._logits_for_greedy_tokens(semantic_requests, outputs)
             self._execute_logit_post_processors(semantic_requests, outputs, pending_beam_histories)
@@ -1112,6 +1162,7 @@ class DecoderRunner(ScheduledModelRunner):
                 id(request): histories for request, histories in zip(beam_requests, pending.wait())
             }
 
+        context_logits_handled = outputs.get("context_logits_handled", False)
         logits_row_offset = 0
         request_groups = (
             (scheduled_requests.context_requests, True),
@@ -1122,7 +1173,9 @@ class DecoderRunner(ScheduledModelRunner):
             for request in requests:
                 if is_context_request:
                     beam_width = 1
-                    row_stride = 1
+                    row_stride = context_logits_rows(
+                        request, context_logits_handled=context_logits_handled
+                    )
                 else:
                     # Generation rows are laid out at the static admission
                     # width, so that is the stride between requests, while
@@ -1152,8 +1205,11 @@ class DecoderRunner(ScheduledModelRunner):
                         token_ids = [prompt + history for history in histories]
                     else:
                         token_ids = [request.get_tokens(beam_idx) for beam_idx in range(beam_width)]
-                    if is_context_request and request.py_orig_prompt_len < len(token_ids[0]):
-                        # Skip as we only need to apply logit processor on the last context request
+                    if is_context_request and not request.is_last_context_chunk:
+                        # Only the last chunk's row is sampled from. get_tokens(0)
+                        # is the whole prompt during chunked prefill, and after a
+                        # pause the prompt also holds the tokens generated so far,
+                        # so the token count does not tell the chunks apart.
                         logits_row_offset += row_stride
                         continue
 
@@ -1163,7 +1219,10 @@ class DecoderRunner(ScheduledModelRunner):
                         logits_tensor,
                         beam_width,
                         token_ids,
-                        logits_row_offset,
+                        # A context request is sampled from the last of its rows.
+                        logits_row_offset + row_stride - 1
+                        if is_context_request
+                        else logits_row_offset,
                     )
                 logits_row_offset += row_stride
 

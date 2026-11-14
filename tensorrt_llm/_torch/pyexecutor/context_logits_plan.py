@@ -55,6 +55,68 @@ def store_context_logits(
         request.py_result.set_prompt_last_logprobs(_normalized_host_row(logits[-1:]))
 
 
+def context_logits_rows(request: LlmRequest, *, context_logits_handled: bool) -> int:
+    """Rows a context request occupies in a step's logits, as the sampler reads them.
+
+    A request that returns context logits keeps its whole chunk, unless the
+    context-logits plan already stored them; every other context request keeps
+    only its last row, the one sampled from.
+
+    Args:
+        request: A context request of the step.
+        context_logits_handled: Whether the step's context logits were already
+            stored, by the plan or from every-token rows.
+
+    Returns:
+        The number of rows.
+    """
+    if request.py_return_context_logits and not context_logits_handled:
+        return request.context_chunk_size
+    return 1
+
+
+def store_context_logits_from_full_rows(
+    context_requests: Sequence[LlmRequest], logits: torch.Tensor
+) -> torch.Tensor:
+    """Store context logits from logits that hold every context token; keep the sampling rows.
+
+    Without the context-logits plan, a step that gathers context logits projects
+    every scheduled context token, for every context request. Storing the
+    requested chunks here, before any logits post-processor runs, keeps them the
+    model's own scores, as the plan does; what remains is the plan's layout, one
+    row per context request followed by the other rows.
+
+    Args:
+        context_requests: The step's context requests, in row order.
+        logits: ``[context_tokens + other_rows, vocab]`` with all context rows
+            first; rows after the context tokens are kept as they are.
+
+    Returns:
+        A new ``[num_contexts + other_rows, vocab]`` tensor: the last row of
+        each context chunk, then the remaining rows.
+    """
+    num_context_tokens = sum(request.context_chunk_size for request in context_requests)
+    if num_context_tokens > logits.shape[0]:
+        raise ValueError(
+            f"logits have {logits.shape[0]} rows, fewer than the "
+            f"{num_context_tokens} scheduled context tokens"
+        )
+    kept: list[torch.Tensor] = []
+    start = 0
+    for request in context_requests:
+        end = start + request.context_chunk_size
+        if request.py_return_context_logits:
+            # Copied into the request's own storage before returning: logits
+            # may be a graph's static output that the next replay overwrites.
+            store_context_logits(request, logits[start:end], reusable=True)
+        kept.append(logits[end - 1 : end])
+        start = end
+    kept.append(logits[start:])
+    # Slices rather than an index tensor, whose host-to-device copy would wait
+    # for the forward to finish.
+    return torch.cat(kept)
+
+
 def _normalized_host_row(row: torch.Tensor) -> torch.Tensor:
     """Log-softmax ``row`` on its own device, like the other prompt rows, and copy it to host.
 
