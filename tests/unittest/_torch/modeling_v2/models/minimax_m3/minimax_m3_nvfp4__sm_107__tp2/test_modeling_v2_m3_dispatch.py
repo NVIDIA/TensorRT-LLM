@@ -13,13 +13,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2 import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2 import (  # noqa: E501
     modeling as dispatch,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops import (  # noqa: E501
     m3_draft_step as draft_step_kernel,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops import (  # noqa: E501
     triton_sparse_decode as tsd,
 )
 
@@ -338,7 +338,7 @@ def test_the_dense_layers_take_the_fullctx_decode_at_the_gen_workers_shapes() ->
 
 
 def test_the_fullctx_entry_cells_run_at_the_forward_plan_capacity() -> None:
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.attention import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.attention import (  # noqa: E501
         m3_fullctx_decode as entry,
     )
 
@@ -557,7 +557,7 @@ def test_the_moe_forward_reports_the_engine_taken(target) -> None:
 
 
 def test_draft_lowm_covers_exactly_the_certified_rows_of_its_tactic_table() -> None:
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.gemm import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.gemm import (  # noqa: E501
         m3_draft_lowm as entry,
     )
 

@@ -26,7 +26,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.ssm.k3_kda_buffers import (
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.ssm.k3_kda_buffers import (
     CTAS,
     K3KdaBuffers,
 )
@@ -36,12 +36,12 @@ import _kda_cells as kc
 from _validating import validating
 
 _attn = importlib.import_module(
-    "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl."
+    "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl."
     "kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.ops.ssm.k3_kda_attn"
 )
 k3_kda_attn, k3_kda_qkvg = _attn.k3_kda_attn, _attn.k3_kda_qkvg
 k3_kda_verify = importlib.import_module(
-    "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl."
+    "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl."
     "kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.ops.ssm.k3_kda_verify"
 ).k3_kda_verify
 

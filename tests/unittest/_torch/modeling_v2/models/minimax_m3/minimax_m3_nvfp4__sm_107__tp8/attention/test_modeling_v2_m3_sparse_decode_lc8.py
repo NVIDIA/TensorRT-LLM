@@ -12,13 +12,13 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.attention.m3_sparse_decode_lc8 import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.attention.m3_sparse_decode_lc8 import (  # noqa: E501
     NUM_HEADS,
     WIDTH,
     dequant_nvfp4_pages,
     mxfp8_handoff_reference,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.attention.m3_sparse_decode_lc8 import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.attention.m3_sparse_decode_lc8 import (  # noqa: E501
     m3_sparse_decode_lc8 as op,
 )
 

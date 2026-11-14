@@ -271,7 +271,7 @@ def warn_on_build_skew(precompiled_location: str) -> None:
         "scripts/build_wheel.py",
         "requirements.txt",
         # modeling_v2 families keep their native code with their Python code.
-        ":(glob)tensorrt_llm/_torch/_experimental/modeling_v2/models/**/csrc/**"
+        ":(glob)tensorrt_llm/_torch/modeling_v2/models/**/csrc/**"
     ]
 
     def head_of(checkout: str) -> str | None:

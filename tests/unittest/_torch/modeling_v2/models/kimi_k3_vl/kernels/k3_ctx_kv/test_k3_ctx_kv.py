@@ -63,7 +63,7 @@ pytestmark = pytest.mark.skipif(not _sm100(), reason="needs SM100 (tcgen05, TMA,
 
 def _op():
     import tensorrt_llm  # noqa: F401  (registers the trtllm ops)
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_ctx_kv import op
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_ctx_kv import op
 
     return op
 

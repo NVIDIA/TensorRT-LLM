@@ -318,7 +318,7 @@ def test_the_stage_runs_ground_campaign_and_wrap(tmp_path):
         },
     }
     spec = TuneSpec.from_task(
-        task, tmp_path / "ws", target="tensorrt_llm/_torch/_experimental/modeling_v2/models/f/t/"
+        task, tmp_path / "ws", target="tensorrt_llm/_torch/modeling_v2/models/f/t/"
     )
     turns = []
     asks = {}
@@ -480,7 +480,7 @@ def test_a_fixable_loss_is_revised_once_and_every_later_request_carries_what_was
         },
     }
     spec = TuneSpec.from_task(
-        task, tmp_path / "ws", target="tensorrt_llm/_torch/_experimental/modeling_v2/models/f/t/"
+        task, tmp_path / "ws", target="tensorrt_llm/_torch/modeling_v2/models/f/t/"
     )
     turns, asks = ([], {})
 

@@ -7,14 +7,14 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.ops.attention.m3_select_long import (  # noqa: E501
-    TOPK,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.ops.attention.m3_select_long import (  # noqa: E501
-    m3_select_long as op,
-)
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
     select_blocks_from_maxscore,
+)
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.ops.attention.m3_select_long import (  # noqa: E501
+    TOPK,
+)
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp8.ops.attention.m3_select_long import (  # noqa: E501
+    m3_select_long as op,
 )
 
 __extra_import_path__ = ["../../../.."]

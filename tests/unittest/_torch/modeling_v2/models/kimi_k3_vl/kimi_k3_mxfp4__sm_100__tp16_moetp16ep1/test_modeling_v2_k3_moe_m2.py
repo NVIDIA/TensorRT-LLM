@@ -16,7 +16,7 @@ __extra_import_path__ = ["../../.."]
 from _validating import validating
 
 k3_moe_m2 = importlib.import_module(
-    "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl."
+    "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl."
     "kimi_k3_mxfp4__sm_100__tp16_moetp16ep1.ops.moe.k3_moe_m2"
 ).k3_moe_m2
 
@@ -56,7 +56,7 @@ def test_refuses_wide_intermediate():
     """k3_moe_m2 is for an intermediate of at most 256 (its FC2 tiles of every expert slot stay in shared memory):
     m2_supported refuses the TP4 x EP4 slice (768, 224 local experts). Only metadata is read."""
     op = importlib.import_module(
-        "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl."
+        "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl."
         "kimi_k3_mxfp4__sm_100__tp16_moetp16ep1.kernels.k3_moe_engines.op"
     )
     i_tp, e_local, h, sv = 768, 224, engines.H, engines.SV

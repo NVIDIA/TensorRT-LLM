@@ -25,14 +25,14 @@ import torch
 if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
     pytest.skip("the GLM-5.2 target imports sm_103 CuTe DSL kernels", allow_module_level=True)
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4 import (  # noqa: E402, E501
-    spec_worker as op,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.kernels.spec import (  # noqa: E402, E501
-    draft_loop as K,
-)
 from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import (  # noqa: E402
     DSAtrtllmAttentionMetadata,
+)
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4 import (  # noqa: E402, E501
+    spec_worker as op,
+)
+from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.kernels.spec import (  # noqa: E402, E501
+    draft_loop as K,
 )
 from tensorrt_llm._torch.speculative.interface import SpecWorkerBase  # noqa: E402
 from tensorrt_llm.deep_gemm import get_paged_mqa_logits_metadata  # noqa: E402

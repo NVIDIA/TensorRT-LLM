@@ -352,7 +352,7 @@ def sonarScan()
 
                 // Generated and experimental Python code
                 "tensorrt_llm/_torch/cute_dsl_kernels/**",
-                "tensorrt_llm/_torch/_experimental/modeling_v2/**",
+                "tensorrt_llm/_torch/modeling_v2/**",
                 "tensorrt_llm/grpc/openengine/_generated/**",
                 "**/*_pb2*.py",
 

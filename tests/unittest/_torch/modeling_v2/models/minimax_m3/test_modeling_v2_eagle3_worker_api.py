@@ -19,7 +19,7 @@ import pytest
 pytestmark = pytest.mark.cpu_only
 
 ROOT = next(p for p in Path(__file__).resolve().parents if (p / "tensorrt_llm").is_dir())
-MODEL_ROOT = ROOT / "tensorrt_llm/_torch/_experimental/modeling_v2/models/minimax_m3"
+MODEL_ROOT = ROOT / "tensorrt_llm/_torch/modeling_v2/models/minimax_m3"
 PARENT_PATH = ROOT / "tensorrt_llm/_torch/speculative/eagle3.py"
 MODEL_PATHS = sorted(MODEL_ROOT.glob("minimax_m3_nvfp4__*/modeling.py"))
 assert MODEL_PATHS, f"No MiniMax-M3 NVFP4 modeling.py files found under {MODEL_ROOT}"

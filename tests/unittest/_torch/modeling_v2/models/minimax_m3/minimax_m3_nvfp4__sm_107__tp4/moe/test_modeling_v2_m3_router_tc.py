@@ -6,7 +6,7 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import true_fp32_matmul
+from tensorrt_llm._torch.modeling_v2.catalog._op import true_fp32_matmul
 
 __extra_import_path__ = ["../../../..", "."]
 from _m3_router import _build, _compare_logits, _seed, tc  # noqa: E402

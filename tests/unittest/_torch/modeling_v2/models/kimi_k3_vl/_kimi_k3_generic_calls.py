@@ -14,10 +14,10 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-PACKAGE = "tensorrt_llm._torch._experimental.modeling_v2"
+PACKAGE = "tensorrt_llm._torch.modeling_v2"
 FAMILY = "kimi_k3_vl"
 FAMILY_DIR = (
-    Path(__file__).resolve().parents[6] / "tensorrt_llm/_torch/_experimental/modeling_v2/models"
+    Path(__file__).resolve().parents[6] / "tensorrt_llm/_torch/modeling_v2/models"
 ) / FAMILY
 
 #: tensorrt_llm imports that compute nothing, so the generic path need not declare them: types and configs it

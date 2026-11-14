@@ -10,7 +10,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.activation.fused_sigmoid_mul_inplace import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.activation.fused_sigmoid_mul_inplace import (  # noqa: E501
     fused_sigmoid_mul_inplace as op,
 )
 

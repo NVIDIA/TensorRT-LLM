@@ -16,9 +16,7 @@ import _kda_cells as kc
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.ssm.kda_decode import (
-    kda_decode,
-)
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.ssm.kda_decode import kda_decode
 
 __extra_import_path__ = ["../../../.."]
 from _validating import validating

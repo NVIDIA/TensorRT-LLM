@@ -10,14 +10,12 @@ two launches (the split projection + `causal_conv1d_update` /
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import true_fp32_matmul
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.gemm import (  # noqa: E501
-    nvfp4_gemv as nv,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ssm.causal_conv1d_triton_update import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.catalog._op import true_fp32_matmul
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.gemm import nvfp4_gemv as nv  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.ssm.causal_conv1d_triton_update import (  # noqa: E501
     causal_conv1d_triton_update,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ssm.causal_conv1d_update import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.ssm.causal_conv1d_update import (  # noqa: E501
     causal_conv1d_update,
 )
 
@@ -285,7 +283,7 @@ def test_split_conv1d_verify_cells(cell) -> None:
 
 def test_split_precompile_covers_the_decode_variants() -> None:
     """After `precompile_split`, no projection / conv / verify call within its rows compiles."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.gemm import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.gemm import (  # noqa: E501
         fp8_gemv as f8,
     )
 

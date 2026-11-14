@@ -5,7 +5,7 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.moe.beam_dispatch_combine import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.beam.ops.moe.beam_dispatch_combine import (  # noqa: E501
     beam_dispatch_combine as op,
 )
 

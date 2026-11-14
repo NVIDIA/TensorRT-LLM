@@ -32,20 +32,14 @@ import torch
 from torch import nn
 
 from tensorrt_llm._device_copy import DeviceCopyBuffer
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_ctx_kv import (
-    op as ctx_op,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_markov import (
-    op as markov_op,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_spec_accept import (
-    op as accept_op,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.spec_worker import (  # noqa: E501
+from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_ctx_kv import op as ctx_op
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_markov import op as markov_op
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_spec_accept import op as accept_op
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.spec_worker import (  # noqa: E501
     KimiK3DFlashWorker,
     KimiK3DSparkWorker,
 )
-from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
 from tensorrt_llm._torch.models import modeling_dflash
 from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
     KDAReplayState,

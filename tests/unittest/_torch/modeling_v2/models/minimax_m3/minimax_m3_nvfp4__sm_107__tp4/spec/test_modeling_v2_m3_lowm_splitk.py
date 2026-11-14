@@ -9,11 +9,11 @@ import torch
 from flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk import SplitKTactic as FiTactic
 from flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk import run_splitk_dense as fi_run
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.kernels.gemm.m3_lowm_splitk import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.kernels.gemm.m3_lowm_splitk import (  # noqa: E501
     SplitKTactic,
     run_splitk_dense,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops.gemm.m3_draft_lowm import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops.gemm.m3_draft_lowm import (  # noqa: E501
     ROWS,
     tactic_for,
 )

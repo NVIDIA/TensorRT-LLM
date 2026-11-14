@@ -6,10 +6,10 @@ against the in-tree drafter's modules."""
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops import (  # noqa: E501
     m3_spec_tail,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.spec.m3_draft_input import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.spec.m3_draft_input import (  # noqa: E501
     m3_draft_input as op,
 )
 from tensorrt_llm._torch.modules.embedding import Embedding

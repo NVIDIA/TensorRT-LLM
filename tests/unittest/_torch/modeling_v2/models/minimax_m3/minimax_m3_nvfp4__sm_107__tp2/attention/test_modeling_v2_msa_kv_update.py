@@ -7,13 +7,13 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.attention.msa_kv_update import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.attention.msa_kv_update import (  # noqa: E501
     TOKENS_PER_BLOCK,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.attention.msa_kv_update import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.attention.msa_kv_update import (  # noqa: E501
     msa_kv_update as op,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.attention.msa_kv_update_hook import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.attention.msa_kv_update_hook import (  # noqa: E501
     msa_kv_update as hook,
 )
 

@@ -29,11 +29,9 @@ from typing import Mapping
 import torch
 from torch import nn
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam._constants import SM as _SM
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.activation.swiglu_fp32 import (
-    swiglu_fp32,
-)
+from tensorrt_llm._torch.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
+from tensorrt_llm._torch.modeling_v2.models.beam._constants import SM as _SM
+from tensorrt_llm._torch.modeling_v2.models.beam.ops.activation.swiglu_fp32 import swiglu_fp32
 
 HIDDEN_SIZE = 5120
 INTERMEDIATE_SIZE = 2560

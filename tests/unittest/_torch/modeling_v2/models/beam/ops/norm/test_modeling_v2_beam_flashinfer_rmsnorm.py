@@ -5,10 +5,8 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
-    flashinfer_rmsnorm as op,
-)
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell
+from tensorrt_llm._torch.modeling_v2.catalog.norm.flashinfer_rmsnorm import flashinfer_rmsnorm as op
 
 __extra_import_path__ = ["../../../../norm", "../../../.."]
 import test_modeling_v2_flashinfer_rmsnorm as shared  # noqa: E402

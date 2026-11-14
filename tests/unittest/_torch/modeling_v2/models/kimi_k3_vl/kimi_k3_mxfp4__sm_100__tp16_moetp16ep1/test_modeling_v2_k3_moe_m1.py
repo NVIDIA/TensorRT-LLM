@@ -15,7 +15,7 @@ __extra_import_path__ = ["../../.."]
 from _validating import validating
 
 k3_moe_m1 = importlib.import_module(
-    "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl."
+    "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl."
     "kimi_k3_mxfp4__sm_100__tp16_moetp16ep1.ops.moe.k3_moe_m1"
 ).k3_moe_m1
 
@@ -48,7 +48,7 @@ def test_two_tokens_refuse_wide_intermediate():
     both tokens do not fit, and the state refuses it when it loads the kernel module, before it allocates its
     workspace."""
     op = importlib.import_module(
-        "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl."
+        "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl."
         "kimi_k3_mxfp4__sm_100__tp16_moetp16ep1.kernels.k3_moe_engines.op"
     )
     device = torch.device("cuda", torch.cuda.current_device())

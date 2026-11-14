@@ -15,7 +15,7 @@ import torch
 from tensorrt_llm._device_copy import DeviceCopyBuffer
 
 spec_accept_op = import_module(
-    "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_spec_accept.op"
+    "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_spec_accept.op"
 )
 
 

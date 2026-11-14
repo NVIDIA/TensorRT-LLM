@@ -40,7 +40,7 @@ ACCURACY_TESTS_DIR = "tests/integration/defs/accuracy"
 TEST_DB_DIR = "tests/integration/test_lists/test-db"
 
 _MODEL_OPS_IMPORT = re.compile(
-    r"tensorrt_llm\._torch\._experimental\.modeling_v2\.models\.[a-z0-9_]+\."
+    r"tensorrt_llm\._torch\.modeling_v2\.models\.[a-z0-9_]+\."
     r"([a-z0-9_]+)\.ops\.([a-z_]+)\.([a-z0-9_]+)"
 )
 _RELATIVE_OPS_IMPORT = re.compile(r"^ops\.([a-z_]+)\.([a-z0-9_]+)")

@@ -168,12 +168,12 @@ class _Exchange:
     call count starting at ``count``."""
 
     def __init__(self, ctx, slots: int, count: int):
-        from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import (
-            k3_latent_reduce as kernel,
-        )
         from tensorrt_llm._torch.distributed.ops import (
             _get_mnnvl_workspace_comm,
             _make_mnnvl_mcast_buffer,
+        )
+        from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import (
+            k3_latent_reduce as kernel,
         )
 
         words = kernel.buffer_words(slots)
@@ -226,13 +226,13 @@ def _context():
     gpus = torch.cuda.device_count()
     torch.cuda.set_device(rank % gpus)
     import tensorrt_llm  # noqa: F401
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import (
         latent_op,  # noqa: F401  (registers the reduce)
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_route_quant import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_route_quant import (
         op as _rq,  # noqa: F401
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm.mnnvl_allreduce import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.comm.mnnvl_allreduce import (
         K3MnnvlAllReduce,
     )
     from tensorrt_llm.mapping import Mapping
@@ -267,7 +267,7 @@ def _layer(name: str, m: int, weights):
     import importlib
 
     op = importlib.import_module(
-        "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl."
+        "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl."
         "kimi_k3_mxfp4__sm_100__tp16_moetp16ep1.kernels.k3_moe_engines.op"
     )
 
@@ -320,12 +320,12 @@ def check_sequences(ctx):
     import time
 
     entry = importlib.import_module(
-        "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl."
+        "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl."
         "kimi_k3_mxfp4__sm_100__tp16_moetp16ep1.ops.moe.k3_moe_m1"
     )
     k3_moe_m1, k3_moe_m1_push = entry.k3_moe_m1, entry.k3_moe_m1_push
     op = importlib.import_module(
-        "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl."
+        "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl."
         "kimi_k3_mxfp4__sm_100__tp16_moetp16ep1.kernels.k3_moe_engines.op"
     )
 

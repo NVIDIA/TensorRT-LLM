@@ -64,9 +64,9 @@ def _trtllm():
 
 def _k3_native():
     """Resolve the family namespace inside each MPI worker."""
-    from tensorrt_llm._torch._experimental.modeling_v2._native import load_family_ops
+    from tensorrt_llm._torch.modeling_v2._native import load_family_ops
 
-    return load_family_ops("tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl")
+    return load_family_ops("tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl")
 
 
 WORLD = 4
@@ -113,7 +113,7 @@ def _context():
     gpus = torch.cuda.device_count()
     torch.cuda.set_device(rank % gpus)
     import tensorrt_llm  # noqa: F401
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm.mnnvl_allreduce import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.comm.mnnvl_allreduce import (
         K3MnnvlAllReduce,
     )
     from tensorrt_llm.mapping import Mapping

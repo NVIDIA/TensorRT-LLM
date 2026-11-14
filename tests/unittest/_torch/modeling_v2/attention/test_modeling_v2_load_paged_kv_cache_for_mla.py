@@ -34,11 +34,11 @@ from typing import List, Optional, Tuple
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.load_paged_kv_cache_for_mla import (  # noqa: E501
-    load_paged_kv_cache_for_mla as op,
-)
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
+from tensorrt_llm._torch.modeling_v2.catalog.attention.load_paged_kv_cache_for_mla import (  # noqa: E501
+    load_paged_kv_cache_for_mla as op,
+)
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType

@@ -7,11 +7,9 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.fused_qk_norm_rope import (
-    FusedQkNormRope,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.fused_qk_norm_rope import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell
+from tensorrt_llm._torch.modeling_v2.catalog.attention.fused_qk_norm_rope import FusedQkNormRope
+from tensorrt_llm._torch.modeling_v2.catalog.attention.fused_qk_norm_rope import (  # noqa: E501
     fused_qk_norm_rope as op,
 )
 

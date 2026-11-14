@@ -7,13 +7,11 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_ctm_gemv import (
-    op as ctm_op,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.gemm.k3_ctm_gemv_long import (
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_ctm_gemv import op as ctm_op
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.gemm.k3_ctm_gemv_long import (
     k3_ctm_gemv_long,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.gemm.k3_ctm_gemv_wide import (
+from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.gemm.k3_ctm_gemv_wide import (
     k3_ctm_gemv_wide,
 )
 
@@ -114,7 +112,7 @@ def test_projection_cells(cell) -> None:
 
 def test_rows_match_long_at_the_same_split() -> None:
     """A token's row is k3_ctm_gemv_long's for it (calls of up to 8 tokens) where the splits agree."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_ctm_gemv.k3_ctm_gemv_kernel import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_ctm_gemv.k3_ctm_gemv_kernel import (
         wide_tile,
     )
 

@@ -18,10 +18,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops import (  # noqa: E501
     m3_draft_step as draft_step_kernels,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.spec.m3_draft_step import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.spec.m3_draft_step import (  # noqa: E501
     DRAFT_LEN,
     DRAFT_SHARD,
     HIDDEN,
@@ -32,15 +32,15 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_
     max_tile_pieces,
     shard_logits,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.spec.m3_draft_step import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.spec.m3_draft_step import (  # noqa: E501
     m3_draft_step as op,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.spec.m3_shard_accept import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.spec.m3_shard_accept import (  # noqa: E501
     exchange_tokens,
     local_argmax,
     make_keys,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.gemm.m3_target_head import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.gemm.m3_target_head import (  # noqa: E501
     encode_chunked,
     round_trip_ok,
 )
@@ -711,7 +711,7 @@ def test_two_launches_per_domain_are_the_one_launch_pass(cell) -> None:
     """A pass split into two launches (tiles [0, split) and [split, n), one per locality domain stream, the exchange
     and bookkeeping by the last of both launches' CTAs) writes exactly what the one-launch pass writes: tokens,
     winning keys, draft columns, next positions, KV and sequence lengths, and re-arms the counters and keys."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.m3_locality import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.m3_locality import (  # noqa: E501
         LocalityMap,
     )
 

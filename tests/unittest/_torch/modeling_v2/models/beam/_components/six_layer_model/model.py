@@ -64,17 +64,15 @@ import numpy as np
 import torch
 from torch import nn
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
-    flashinfer_rmsnorm,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam import _attention
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam._constants import SM as _SM
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.activation.beam_logit_softcap import (
-    beam_logit_softcap,
-)
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
+from tensorrt_llm._torch.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
+from tensorrt_llm._torch.modeling_v2.catalog.norm.flashinfer_rmsnorm import flashinfer_rmsnorm
+from tensorrt_llm._torch.modeling_v2.models.beam import _attention
+from tensorrt_llm._torch.modeling_v2.models.beam._constants import SM as _SM
+from tensorrt_llm._torch.modeling_v2.models.beam.ops.activation.beam_logit_softcap import (
+    beam_logit_softcap,
+)
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp
 from tensorrt_llm.bindings import DataType

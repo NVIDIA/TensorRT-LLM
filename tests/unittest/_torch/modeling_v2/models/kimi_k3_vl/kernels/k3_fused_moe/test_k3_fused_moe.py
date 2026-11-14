@@ -54,10 +54,10 @@ M_ALL = list(range(1, 9))
 
 def _ops():
     import tensorrt_llm  # noqa: F401
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import (
         op,  # noqa: F401
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_route_quant import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_route_quant import (
         op as _rq,  # noqa: F401
     )
 
@@ -204,9 +204,7 @@ def _stock(proc, bias, x, logits):
 @functools.lru_cache(maxsize=None)
 def _layer():
     """One K3MoeState on this GPU and the layer of _experts()' buffers on it."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import (
-        op,
-    )
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import op
 
     _ops()
     proc, _, _ = _experts()
@@ -275,9 +273,7 @@ def test_k3_fused_moe(case, m):
     """Each M's rows against the 8-token call: the slice FC2 adds a token's expert terms in slices whose bounds
     follow the step's group count, so a row may round differently with other tokens present (at most 1 bf16 ulp);
     bit-identity is reported."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import (
-        op,
-    )
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import op
 
     _ops()
     proc, raw, bias = _experts()
@@ -335,9 +331,7 @@ def test_k3_fused_moe_partial_rows_past_m():
     """The combine loads the FC2 partial rows of all 8 token slots, and a call writes only its M tokens' rows: a
     fresh state's partials start zeroed, and each M's output is the same with the rows past M poisoned (NaN) as with
     them zeroed, so no output reads a row its call did not write."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import (
-        op,
-    )
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import op
 
     _ops()
     proc, _, bias = _experts()
@@ -367,9 +361,7 @@ def test_collective_workspaces_refuse_graph_capture():
     """The head all-gather's buffers (the front's) are created collectively (an MNNVL multicast allocation over the TP
     group): under CUDA-graph capture create() raises (the group's ranks agree first that each can allocate; a group of
     one here) instead of allocating. The per-rank state and a layer's counters refuse capture too (they allocate)."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import (
-        op,
-    )
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import op
     from tensorrt_llm.mapping import Mapping
 
     _ops()

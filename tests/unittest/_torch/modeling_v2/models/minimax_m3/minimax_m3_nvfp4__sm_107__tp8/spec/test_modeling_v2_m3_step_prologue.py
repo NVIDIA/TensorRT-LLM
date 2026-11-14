@@ -7,7 +7,7 @@ import random
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.spec.m3_step_prologue import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.spec.m3_step_prologue import (  # noqa: E501
     m3_step_prologue as op,
 )
 from tensorrt_llm._torch.pyexecutor import step_inputs

@@ -9,10 +9,10 @@ Its cells are certified, with ``m3_mc_allreduce_norm``'s (one kernel, one exchan
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp4.ops.comm.m3_mc_finalize_allreduce_norm import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp4.ops.comm.m3_mc_finalize_allreduce_norm import (  # noqa: E501
     finalize_partial,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp4.ops.comm.m3_mc_finalize_allreduce_norm import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_103__tp4.ops.comm.m3_mc_finalize_allreduce_norm import (  # noqa: E501
     m3_mc_finalize_allreduce_norm as op,
 )
 

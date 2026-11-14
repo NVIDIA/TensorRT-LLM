@@ -20,7 +20,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ssm.gdn_prefill_conv_post import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.ssm.gdn_prefill_conv_post import (  # noqa: E501
     A_LOG_RANGE,
     CONV_WIDTH,
     DT_BIAS_RANGE,
@@ -33,7 +33,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ssm.gdn_
     SOFTPLUS_THRESHOLD,
     _engine_slots,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ssm.gdn_prefill_conv_post import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.ssm.gdn_prefill_conv_post import (  # noqa: E501
     gdn_prefill_conv_post as op,
 )
 

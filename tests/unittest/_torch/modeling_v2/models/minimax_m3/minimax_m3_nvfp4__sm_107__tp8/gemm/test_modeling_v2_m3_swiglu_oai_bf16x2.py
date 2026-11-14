@@ -10,7 +10,7 @@ import pytest
 import torch
 from cutlass.cute.runtime import from_dlpack
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.kernels.gemm.m3_mx_gemv_kernel import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.kernels.gemm.m3_mx_gemv_kernel import (  # noqa: E501
     SWIGLU_OAI_ALPHA,
     SWIGLU_OAI_LIMIT,
     _swiglu_oai_bf16x2,
@@ -119,10 +119,10 @@ def test_random_pairs_are_bitwise_the_triton_kernel(seed: int) -> None:
 
 # The GEMV with the activation in its prologue against today's two launches (Triton silu_and_mul, then the bf16 GEMV):
 # bit for bit on the dense MLP's down projection at every decode row count.
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8 import (  # noqa: E402
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8 import (  # noqa: E402
     modeling,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.mx_gemv import (  # noqa: E402, E501
+from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.mx_gemv import (  # noqa: E402, E501
     op as gemv,
 )
 

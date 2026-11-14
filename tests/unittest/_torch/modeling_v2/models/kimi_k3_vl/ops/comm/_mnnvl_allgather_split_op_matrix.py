@@ -36,7 +36,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2._native import load_family_ops
+from tensorrt_llm._torch.modeling_v2._native import load_family_ops
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "comm"))
@@ -93,7 +93,7 @@ ROT = {}
 STATS = {"normed_err": 0.0, "attn_res_err": 0.0}
 
 
-_FAMILY = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl"
+_FAMILY = "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl"
 
 
 def buffer_bytes(world: int) -> int:
@@ -447,7 +447,7 @@ def check_unsupported_calls_raise_on_every_rank() -> None:
     expect_refusal(lambda: allgather_split(rows[:0], 8, WS_A), RuntimeError, "no rows")
     expect_refusal(
         lambda: load_family_ops(
-            "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl"
+            "tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl"
         ).mnnvl_allgather_split(
             rows, 8, R.world + 1, WS_A.comm_buffer(torch.bfloat16), WS_A.buffer_flags
         ),
@@ -708,13 +708,13 @@ def _run_one_rank(args) -> int:
     global validating
     R = ls.Rank(args)
     assert R.world in (2, 4, 8, 16), f"K3's shapes shard over 2, 4, 8 or 16 ranks, not {R.world}"
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.comm import (
         mnnvl_allgather_split as module,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.comm import (
         mnnvl_allreduce_attn_res as attn_res_module,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.comm import (
         mnnvl_fusion_allreduce as reduce_module,
     )
 

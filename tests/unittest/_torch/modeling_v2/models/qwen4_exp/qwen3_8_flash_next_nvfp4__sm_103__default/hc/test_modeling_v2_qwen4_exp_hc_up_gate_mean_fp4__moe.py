@@ -11,14 +11,14 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (
+from tensorrt_llm._torch.modeling_v2.catalog.quantization.fp4_quantize import (
     Fp4Quantize,
     fp4_quantize,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_hc_up_gate_mean import (
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_hc_up_gate_mean import (
     qwen4_exp_hc_up_gate_mean,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default.ops.hc.qwen4_exp_hc_up_gate_mean_fp4__moe import (  # noqa: E501
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default.ops.hc.qwen4_exp_hc_up_gate_mean_fp4__moe import (  # noqa: E501
     qwen4_exp_hc_up_gate_mean_fp4 as op,
 )
 

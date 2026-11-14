@@ -24,11 +24,11 @@ from unittest import mock
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default import (  # noqa: E501
-    modeling as M,
-)
 from tensorrt_llm._torch.configs import Qwen4ExpTextConfig, Qwen4ExpVisionConfig
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default import (  # noqa: E501
+    modeling as M,
+)
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.llmapi import QSASparseAttentionConfig
 from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig

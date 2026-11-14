@@ -18,9 +18,9 @@
 # Native code of modeling_v2 targets: one torch-op library per model family,
 # loaded only when routing picks one of its targets. A family keeps its native
 # code with its Python code, in
-# tensorrt_llm/_torch/_experimental/modeling_v2/models/<family>/csrc/ (declared
-# by the CMakeLists.txt there) and <family>/<target>/csrc/; this directory holds
-# only what every family shares. See cpp/cmake/modules/modeling_v2.cmake.
+# tensorrt_llm/_torch/modeling_v2/models/<family>/csrc/ (declared by the
+# CMakeLists.txt there) and <family>/<target>/csrc/; this directory holds only
+# what every family shares. See cpp/cmake/modules/modeling_v2.cmake.
 
 include(modeling_v2)
 
@@ -28,8 +28,7 @@ add_custom_target(modeling_v2_libs)
 
 get_filename_component(
   modeling_v2_models_dir
-  "${PROJECT_SOURCE_DIR}/../tensorrt_llm/_torch/_experimental/modeling_v2/models"
-  ABSOLUTE)
+  "${PROJECT_SOURCE_DIR}/../tensorrt_llm/_torch/modeling_v2/models" ABSOLUTE)
 file(
   GLOB family_lists
   LIST_DIRECTORIES false

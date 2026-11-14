@@ -249,7 +249,7 @@ def check_interleaved_with_the_builtin_all_reduce() -> None:
 
 def check_cuda_graph_replays() -> None:
     """Replay the production o_proj publish and current-workspace hops at full/partial batch."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.gemm.o_proj_publish import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.gemm.o_proj_publish import (  # noqa: E501
         o_proj_publish,
     )
 
@@ -445,7 +445,7 @@ CHECKS = (
 def _run_one_rank() -> None:
     global entry, ws, validating, fusion_op, RANK, WORLD, MAPPING
     RANK, WORLD, MAPPING = ranks.init_rank()
-    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.comm import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.comm import (  # noqa: E501
         _mnnvl_workspace,
         mnnvl_hop,
     )

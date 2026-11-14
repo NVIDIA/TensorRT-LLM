@@ -5,10 +5,10 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget
+from tensorrt_llm._torch.modeling_v2._router_index import NoTarget
 
 try:
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm.mnnvl_allreduce import (
+    from tensorrt_llm._torch.modeling_v2.models.kimi_k3_vl.ops.comm.mnnvl_allreduce import (
         K3MnnvlAllReduce,
     )
 except NoTarget as no_target:

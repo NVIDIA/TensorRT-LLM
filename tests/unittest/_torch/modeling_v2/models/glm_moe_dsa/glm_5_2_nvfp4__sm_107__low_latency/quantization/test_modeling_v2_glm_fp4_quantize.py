@@ -8,14 +8,14 @@ from collections.abc import Callable
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2._native import NoTarget
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell, OpWrapper
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (
+from tensorrt_llm._torch.modeling_v2._native import NoTarget
+from tensorrt_llm._torch.modeling_v2.catalog._op import Cell, OpWrapper
+from tensorrt_llm._torch.modeling_v2.catalog.quantization.fp4_quantize import (
     fp4_quantize as shared_op,
 )
 
 try:
-    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.quantization.fp4_quantize import (  # noqa: E501
+    from tensorrt_llm._torch.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.quantization.fp4_quantize import (  # noqa: E501
         fp4_quantize as op,
     )
 except NoTarget as exc:
