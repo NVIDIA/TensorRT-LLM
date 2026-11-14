@@ -30,6 +30,7 @@ from cutlass.cute import experimental as cute_ext
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass.experimental import primitives as prims
 
 #: Per-CTA SMEM capacity reported by CuTeDSL on SM100/SM103.
 _SMEM_CAPACITY_BYTES = utils.get_smem_capacity_in_bytes("sm_100")
@@ -921,6 +922,10 @@ class SplitKDenseGemmKernel:
 
         with cute.arch.elect_one():
             tcgen05.commit(bar_mma_epilog, None, self.cta_group)
+        # The release arrival must land in phase 1. Made while phase 0 is still
+        # open, it counts toward phase 0, and the parity-1 wait can then pass
+        # before the epilogue has read TMEM.
+        cute.arch.mbarrier_wait(bar_tmem_alloc, 0)
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
         cute.arch.mbarrier_wait(bar_tmem_alloc, 1)
         cute.arch.dealloc_tmem(tmem_ptr, num_tmem_cols, is_two_cta=False)
@@ -1049,7 +1054,20 @@ class SplitKDenseGemmKernel:
                     cute.arch.mbarrier_arrive_and_expect_tx(
                         bar_reduce, self.expected_transaction_bytes
                     )
-                cute.arch.mbarrier_wait(bar_reduce, 0)
+                # The peers' st.async complete-tx releases at cluster scope. A
+                # relaxed cluster-scope wait observes the completion, and the
+                # acquire fence restricted to shared::cluster orders the mailbox
+                # reads after it (PTX ISA memory model, acquire pattern). A
+                # cluster-scope acquire on the wait itself would also invalidate
+                # L1 for global data, which this reduction does not need.
+                while not prims.mbarrier_try_wait_parity(
+                    bar_reduce,
+                    0,
+                    scope=prims.MBarrierScope.CLUSTER,
+                    order=prims.MemOrder.RELAXED,
+                ):
+                    pass
+                prims.fence_sync_restrict(prims.MemOrder.ACQUIRE)
                 for peer in cutlass.range_constexpr(self.split_k - 1):
                     for value_idx in cutlass.range_constexpr(values_per_thread):
                         rAcc[value_idx] = (
