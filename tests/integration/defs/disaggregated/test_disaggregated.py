@@ -2406,7 +2406,8 @@ def run_disaggregated_benchmark(example_dir,
                                 max_concurrency=32,
                                 skip_warmup=False,
                                 model_path=None,
-                                cwd=None):
+                                cwd=None,
+                                server_start_timeout=300):
     """Run disaggregated test with given configuration."""
     run_env = env.copy() if env else os.environ.copy()
     run_env["UCX_TLS"] = get_ucx_tls()
@@ -2414,7 +2415,11 @@ def run_disaggregated_benchmark(example_dir,
     run_env["UCX_MM_ERROR_HANDLING"] = "y"
 
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
-        setup_disagg_cluster(config_file, model_name=model_path, env=run_env, cwd=cwd)
+        setup_disagg_cluster(config_file,
+                             model_name=model_path,
+                             env=run_env,
+                             cwd=cwd,
+                             server_start_timeout=server_start_timeout)
 
     server_host = config.get("hostname", "localhost")
 
@@ -3008,7 +3013,8 @@ def test_disaggregated_deepseek_v3_lite_bf16_empty_batch(
         random_output_len=1536,
         skip_warmup=True,
         model_path=benchmark_model_root,
-        cwd=llm_venv.get_working_directory())
+        cwd=llm_venv.get_working_directory(),
+        server_start_timeout=1200)
     print(f"E2EL: {e2el} ms, TTFT: {ttft} ms")
 
     assert e2el > 0 and ttft > 0
