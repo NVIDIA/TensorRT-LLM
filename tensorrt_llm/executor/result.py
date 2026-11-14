@@ -338,6 +338,11 @@ class GenerationResultBase:
         """Return the error message if this result completed with an error."""
         return self._error_msg
 
+    @property
+    def finished(self) -> bool:
+        """Whether the whole request has finished. A read-only view of ``_done``."""
+        return self._done
+
     def _maybe_fill_spec_dec_perf_metrics(
             self, perf_metrics: "tllm.RequestPerfMetrics") -> None:
         """Backfill RequestPerfMetrics.speculative_decoding in the PyTorch flow.
@@ -1222,10 +1227,6 @@ class GenerationResult(GenerationResultBase):
         assert self._executor is not None, "The executor is not set for this result."
         self._executor().abort_request(self.request_id)
         super().abort()
-
-    @property
-    def finished(self) -> bool:
-        return self._done
 
     def clear_logprob_params(self) -> None:
         # Remove temporary attribute used in executor

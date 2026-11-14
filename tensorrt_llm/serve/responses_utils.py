@@ -3324,7 +3324,7 @@ class ResponsesStreamingProcessor:
             event_generator = _generate_streaming_event(
                 output=output,
                 request=self.request,
-                finished_generation=res._done,
+                finished_generation=res.finished,
                 streaming_events_helper=self.streaming_events_helper,
                 reasoning_parser_id=self.reasoning_parser,
                 tool_parser_id=self.tool_parser,

@@ -116,7 +116,7 @@ def _make_mock_result(
 
     result = Mock()
     result.outputs = [output]
-    result._done = True
+    result.finished = True
     result.cached_tokens = cached_tokens
     return result
 
@@ -649,7 +649,7 @@ class TestStreamMetadata:
     def test_postprocessor_passes_cached_stream_metadata(self):
         mock_result = _make_mock_result(token_ids_diff=[1, 2, 3])
         mock_result.id = 456
-        mock_result._done = False
+        mock_result.finished = False
         args = ChatCompletionPostprocArgs(
             model="test-model",
             tools=[],

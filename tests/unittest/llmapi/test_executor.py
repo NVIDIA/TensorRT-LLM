@@ -110,10 +110,16 @@ def test_GenerationResultBase():
     )
     result._handle_response(create_rsp(2, finished=False))
     result._handle_response(create_rsp(3, finished=False))
+    assert not result.finished
     result._handle_response(create_rsp(4, finished=True))
     print(result.outputs[0])
     assert len(result.outputs[0].token_ids) == 3
     assert result._done
+    assert result.finished
+    # finished is a read-only view of the completion flag; only `_done` is
+    # ever written (by the response-handling paths), never the property.
+    with pytest.raises(AttributeError):
+        result.finished = False
 
 
 @pytest.mark.parametrize("pytorch", [False, True])

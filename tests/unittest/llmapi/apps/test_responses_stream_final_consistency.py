@@ -82,7 +82,9 @@ def _generation_chunk(accumulated, diff, done, finish_reason="stop"):
         token_ids=[1, 2, 3],
         disaggregated_params=None,
     )
-    return SimpleNamespace(outputs=[output], _done=done, prompt_token_ids=[1, 2], cached_tokens=0)
+    return SimpleNamespace(
+        outputs=[output], finished=done, prompt_token_ids=[1, 2], cached_tokens=0
+    )
 
 
 def _stream(processor, chunks):
