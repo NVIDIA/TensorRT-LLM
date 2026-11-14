@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+import re
 import struct
 import types
 from copy import deepcopy
@@ -10,7 +11,10 @@ from pathlib import Path
 import pytest
 import torch
 
-from tensorrt_llm._torch.model_config import _DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT, ModelConfig
+from tensorrt_llm._torch.model_config import (
+    _DEEPSEEK_V4_BLOCK_ROUTED_EXPERT_WEIGHT_TEMPLATE,
+    ModelConfig,
+)
 from tensorrt_llm._torch.pyexecutor.model_loader import (
     validate_and_set_kv_cache_quant,
     validate_encoder_decoder_kv_cache_config,
@@ -294,23 +298,35 @@ def test_validate_and_set_kv_cache_quant_sm107_downgrade_propagates_to_quant_con
         assert layer_quant_config.kv_cache_quant_algo == expected
 
 
-def _write_safetensors_header(checkpoint_dir, tensor_dtype, tensor_shape):
-    shard_name = "model-00001-of-00001.safetensors"
-    header = {
-        _DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT: {
-            "dtype": tensor_dtype,
-            "shape": tensor_shape,
-            "data_offsets": [0, 0],
-        }
-    }
-    encoded_header = json.dumps(header).encode("utf-8")
-
-    with open(checkpoint_dir / shard_name, "wb") as f:
-        f.write(struct.pack("<Q", len(encoded_header)))
-        f.write(encoded_header)
-
+def _write_routed_expert_blocks(
+    checkpoint_dir: Path, block_dtypes: dict[str, str], shape: list[int] | None = None
+) -> None:
+    """Write one shard per block holding its first routed expert weight, plus the index."""
+    weight_map = {}
+    for shard_idx, (block, dtype) in enumerate(block_dtypes.items()):
+        shard_name = f"model-{shard_idx + 1:05d}-of-{len(block_dtypes):05d}.safetensors"
+        tensor_name = _DEEPSEEK_V4_BLOCK_ROUTED_EXPERT_WEIGHT_TEMPLATE.format(block=block)
+        header = json.dumps(
+            {
+                tensor_name: {
+                    "dtype": dtype,
+                    "shape": shape or [3072, 3584],
+                    "data_offsets": [0, 0],
+                }
+            }
+        ).encode("utf-8")
+        with open(checkpoint_dir / shard_name, "wb") as f:
+            f.write(struct.pack("<Q", len(header)))
+            f.write(header)
+        weight_map[tensor_name] = shard_name
     with open(checkpoint_dir / "model.safetensors.index.json", "w") as f:
-        json.dump({"weight_map": {_DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT: shard_name}}, f)
+        json.dump({"weight_map": weight_map}, f)
+
+
+def _write_safetensors_header(
+    checkpoint_dir: Path, tensor_dtype: str, tensor_shape: list[int]
+) -> None:
+    _write_routed_expert_blocks(checkpoint_dir, {"layers.0": tensor_dtype}, tensor_shape)
 
 
 @pytest.mark.parametrize(
@@ -322,12 +338,15 @@ def _write_safetensors_header(checkpoint_dir, tensor_dtype, tensor_shape):
     ],
 )
 def test_deepseek_v4_base_checkpoint_detection(
-    tmp_path, tensor_dtype, tensor_shape, expected_layout, expected_is_base
+    tmp_path, monkeypatch, tensor_dtype, tensor_shape, expected_layout, expected_is_base
 ):
     _write_safetensors_header(tmp_path, tensor_dtype, tensor_shape)
 
     assert ModelConfig._detect_deepseek_v4_routed_moe_layout(str(tmp_path)) == expected_layout
+    # The base-checkpoint check reads the index and the layers.0 shard header once.
+    reads = _record_header_reads(monkeypatch)
     assert ModelConfig._is_deepseek_v4_base_checkpoint(str(tmp_path)) is expected_is_base
+    assert reads == ["model-00001-of-00001.safetensors"]
 
 
 def test_nvfp4_plus_override_selects_only_the_cutedsl_moe(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -359,6 +378,204 @@ def test_deepseek_v4_mxfp4_experts_take_the_nvfp4_plus_override(
         experts = layer_quant_config[f"model.layers.{layer_idx}.mlp.experts"]
         assert experts.quant_algo == QuantAlgo.NVFP4_PLUS
         assert experts.group_size == 32
+
+
+def _mtp_one_model_spec_config(num_nextn_predict_layers: int) -> types.SimpleNamespace:
+    return types.SimpleNamespace(
+        spec_dec_mode=types.SimpleNamespace(is_mtp_one_model=lambda: True),
+        num_nextn_predict_layers=num_nextn_predict_layers,
+    )
+
+
+@pytest.mark.parametrize("num_nextn_predict_layers", [1, 3])
+def test_deepseek_v4_mtp_layers_take_the_routed_moe_layout_of_the_mtp_block(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, num_nextn_predict_layers: int
+) -> None:
+    """An NVFP4 checkpoint whose MTP block stores MXFP4 experts configures each MoE
+    layer from the block it loads, so the MTP layers get MXFP4 and the others NVFP4."""
+    from tensorrt_llm._torch import model_config as model_config_module
+
+    monkeypatch.setattr(model_config_module, "get_sm_version", lambda: 100)
+    monkeypatch.delenv("OVERRIDE_QUANT_ALGO", raising=False)
+    num_hidden_layers = 3
+    _write_routed_expert_blocks(
+        tmp_path, {**{f"layers.{i}": "U8" for i in range(num_hidden_layers)}, "mtp.0": "I8"}
+    )
+
+    layer_quant_config = ModelConfig._set_deepseek_v4_routed_moe_quant_config(
+        types.SimpleNamespace(num_hidden_layers=num_hidden_layers, num_nextn_predict_layers=1),
+        str(tmp_path),
+        "MEGAMOE_CUTEDSL",
+        None,
+        _mtp_one_model_spec_config(num_nextn_predict_layers),
+    )
+
+    assert len(layer_quant_config) == num_hidden_layers + num_nextn_predict_layers
+    for layer_idx in range(num_hidden_layers):
+        experts = layer_quant_config[f"model.layers.{layer_idx}.mlp.experts"]
+        assert experts.quant_algo == QuantAlgo.NVFP4
+        assert experts.group_size == 16
+    for layer_idx in range(num_hidden_layers, num_hidden_layers + num_nextn_predict_layers):
+        experts = layer_quant_config[f"model.layers.{layer_idx}.mlp.experts"]
+        assert experts.quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8
+        assert experts.group_size == 32
+
+
+def test_deepseek_v4_mtp_blocks_take_their_own_routed_moe_layout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With two checkpoint MTP blocks of different formats, MTP layer j is
+    configured from block mtp.{j}."""
+    from tensorrt_llm._torch import model_config as model_config_module
+
+    monkeypatch.setattr(model_config_module, "get_sm_version", lambda: 100)
+    monkeypatch.delenv("OVERRIDE_QUANT_ALGO", raising=False)
+    num_hidden_layers = 3
+    _write_routed_expert_blocks(
+        tmp_path,
+        {**{f"layers.{i}": "U8" for i in range(num_hidden_layers)}, "mtp.0": "I8", "mtp.1": "U8"},
+    )
+
+    layer_quant_config = ModelConfig._set_deepseek_v4_routed_moe_quant_config(
+        types.SimpleNamespace(num_hidden_layers=num_hidden_layers, num_nextn_predict_layers=2),
+        str(tmp_path),
+        "MEGAMOE_CUTEDSL",
+        None,
+        _mtp_one_model_spec_config(2),
+    )
+
+    mtp0 = layer_quant_config[f"model.layers.{num_hidden_layers}.mlp.experts"]
+    mtp1 = layer_quant_config[f"model.layers.{num_hidden_layers + 1}.mlp.experts"]
+    assert (mtp0.quant_algo, mtp0.group_size) == (QuantAlgo.W4A8_MXFP4_MXFP8, 32)
+    assert (mtp1.quant_algo, mtp1.group_size) == (QuantAlgo.NVFP4, 16)
+
+
+def test_deepseek_v4_mtp_layer_without_its_own_block_keeps_the_layers0_layout(
+    tmp_path: Path,
+) -> None:
+    """A checkpoint that ships no MTP block configures the MTP layer as layers.0."""
+    _write_routed_expert_blocks(tmp_path, {"layers.0": "U8", "layers.1": "U8"})
+
+    layer_quant_config = ModelConfig._set_deepseek_v4_routed_moe_quant_config(
+        types.SimpleNamespace(num_hidden_layers=2, num_nextn_predict_layers=1),
+        str(tmp_path),
+        "MEGAMOE_CUTEDSL",
+        None,
+        _mtp_one_model_spec_config(1),
+    )
+
+    assert sorted(layer_quant_config) == [f"model.layers.{i}.mlp.experts" for i in range(3)]
+    for experts in layer_quant_config.values():
+        assert experts.quant_algo == QuantAlgo.NVFP4
+        assert experts.group_size == 16
+
+
+def test_safetensors_headers_are_read_once_per_shard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Looking up many tensors, some absent, reads each shard header at most once."""
+    _write_routed_expert_blocks(tmp_path, {f"layers.{i}": "U8" for i in range(4)})
+    reads = []
+    read_header = ModelConfig._read_safetensors_header
+    monkeypatch.setattr(
+        ModelConfig,
+        "_read_safetensors_header",
+        staticmethod(lambda path: reads.append(path.name) or read_header(path)),
+    )
+
+    names = [f"layers.{i}.ffn.experts.0.w1.weight" for i in range(4)]
+    headers = ModelConfig._get_safetensors_headers_for_tensors(
+        str(tmp_path), names + ["mtp.0.ffn.experts.0.w1.weight"]
+    )
+
+    assert sorted(headers) == sorted(names)
+    assert sorted(reads) == sorted(set(reads))
+    assert len(reads) == 4
+
+
+def _record_header_reads(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    reads = []
+    read_header = ModelConfig._read_safetensors_header
+    monkeypatch.setattr(
+        ModelConfig,
+        "_read_safetensors_header",
+        staticmethod(lambda path: reads.append(path.name) or read_header(path)),
+    )
+    return reads
+
+
+def test_deepseek_v4_routed_moe_probe_reads_only_the_layers0_and_mtp_shards(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every body layer takes the layers.0 format, so the probe opens the shards of
+    layers.0 and of the MTP block only, however many body blocks the checkpoint has."""
+    from tensorrt_llm._torch import model_config as model_config_module
+
+    monkeypatch.setattr(model_config_module, "get_sm_version", lambda: 100)
+    monkeypatch.delenv("OVERRIDE_QUANT_ALGO", raising=False)
+    _write_routed_expert_blocks(
+        tmp_path, {**{f"layers.{i}": "U8" for i in range(8)}, "mtp.0": "I8"}
+    )
+    reads = _record_header_reads(monkeypatch)
+
+    layer_quant_config = ModelConfig._set_deepseek_v4_routed_moe_quant_config(
+        types.SimpleNamespace(num_hidden_layers=8, num_nextn_predict_layers=1),
+        str(tmp_path),
+        "MEGAMOE_CUTEDSL",
+        None,
+        _mtp_one_model_spec_config(1),
+    )
+
+    assert sorted(reads) == ["model-00001-of-00009.safetensors", "model-00009-of-00009.safetensors"]
+    assert layer_quant_config["model.layers.7.mlp.experts"].quant_algo == QuantAlgo.NVFP4
+    assert layer_quant_config["model.layers.8.mlp.experts"].quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8
+
+
+@pytest.mark.parametrize("require_layout", [False, True], ids=["warn", "raise"])
+def test_deepseek_v4_mtp_block_in_another_dtype_is_named(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, require_layout: bool
+) -> None:
+    """An MTP block present in neither MXFP4 nor NVFP4 (e.g. left in BF16) is not
+    mistaken for an absent one: the warning or error names the block and its dtype."""
+    from tensorrt_llm._torch import model_config as model_config_module
+
+    _write_routed_expert_blocks(tmp_path, {"layers.0": "U8", "mtp.0": "BF16"})
+    warnings = []
+    monkeypatch.setattr(
+        model_config_module.logger, "warning", lambda msg, *args: warnings.append(msg % args)
+    )
+    call = lambda: ModelConfig._set_deepseek_v4_routed_moe_quant_config(  # noqa: E731
+        types.SimpleNamespace(num_hidden_layers=1, num_nextn_predict_layers=1),
+        str(tmp_path),
+        "MEGAMOE_CUTEDSL",
+        None,
+        _mtp_one_model_spec_config(1),
+        require_layout=require_layout,
+    )
+
+    named = r"block mtp\.0 stores its routed experts as BF16 \[3072, 3584\]"
+    if require_layout:
+        with pytest.raises(ValueError, match=named):
+            call()
+    else:
+        layer_quant_config = call()
+        assert len(warnings) == 1
+        assert re.search(named, warnings[0])
+        assert layer_quant_config["model.layers.1.mlp.experts"].quant_algo == QuantAlgo.NVFP4
+
+
+def test_safetensors_lookup_skips_a_dangling_shard_symlink(tmp_path: Path) -> None:
+    """A *.safetensors symlink whose target is gone is skipped, as the weight loader
+    never opens it, instead of failing the config with FileNotFoundError."""
+    _write_routed_expert_blocks(tmp_path, {"layers.0": "U8"})
+    (tmp_path / "consolidated.safetensors").symlink_to(tmp_path / "missing.safetensors")
+
+    headers = ModelConfig._get_safetensors_headers_for_tensors(
+        str(tmp_path),
+        ["layers.0.ffn.experts.0.w1.weight", "mtp.0.ffn.experts.0.w1.weight"],
+    )
+
+    assert sorted(headers) == ["layers.0.ffn.experts.0.w1.weight"]
 
 
 @pytest.mark.parametrize("sidecar", [True, False], ids=["modelopt-file", "modelopt-inline"])

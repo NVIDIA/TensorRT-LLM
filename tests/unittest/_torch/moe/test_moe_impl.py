@@ -32,6 +32,7 @@ import pytest
 import torch
 from _torch.moe.moe_test_utils import MoeBackendType
 
+from tensorrt_llm._errors import UnsupportedError
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.moe.fused_moe import moe_resolution
 from tensorrt_llm._torch.moe.fused_moe.activation import (
@@ -122,6 +123,7 @@ from tensorrt_llm._torch.moe.fused_moe.routing import DeepSeekV4MoeRoutingMethod
 from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import (
     TrtllmTrtllmGenBf16Impl,
     TrtllmTrtllmGenNvfp4Impl,
+    TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl,
     TrtllmTrtllmGenW4a8Nvfp4Fp8Impl,
     find_trtllm_gen_leaf,
 )
@@ -530,6 +532,54 @@ def test_registering_megamoe_cutedsl_leaves_the_backend_literal_path_unchanged()
     assert impl_class_for(report) is TrtllmCutedslMegaMoeNvfp4Impl
     assert report.selected_by == "pinned"
     assert report.requested == MoeBackendType.MEGAMOE_CUTEDSL.value
+
+
+def _mxfp4_mtp_layer_report(backend: str, eplb_mode: str = "disabled") -> MoEResolutionReport:
+    """Resolve the MTP layer of an NVFP4 DeepSeek-V4 checkpoint, whose experts are MXFP4."""
+    model_config = _megamoe_cutedsl_model_config()
+    model_config.moe_backend = backend
+    deployment = _megamoe_cutedsl_deployment()
+    if eplb_mode != "disabled":
+        deployment = dataclasses.replace(
+            deployment, eplb_enabled=True, eplb_mode=eplb_mode, num_slots=12
+        )
+    return resolve_moe_impl(
+        model_config,
+        problem=_megamoe_cutedsl_problem(QuantAlgo.W4A8_MXFP4_MXFP8),
+        deployment=deployment,
+        layer_idx=61,
+    )
+
+
+def test_megamoe_cutedsl_falls_back_to_cutlass_for_a_layer_of_another_format() -> None:
+    """MegaMoE CuteDSL serves NVFP4 only; a layer in another format reaches the Cutlass
+    fallback, and the report names the MegaMoE rejection."""
+    report = _mxfp4_mtp_layer_report(MoeBackendType.MEGAMOE_CUTEDSL.value)
+
+    assert impl_class_for(report) is TrtllmCutlassW4a8Mxfp4Mxfp8Impl
+    assert report.degraded
+    assert report.degraded_from.legacy_backend == TrtllmCutedslMegaMoeNvfp4Impl.__name__
+    assert report.degraded_from.reason is MoERejectReason.QUANT_UNSUPPORTED
+
+
+def test_trtllm_serves_the_mxfp4_mtp_layer_on_trtllm_gen() -> None:
+    """``speculative_config.moe_backend: AUTO`` resolves DeepSeek-V4's MTP layers to TRTLLM
+    on Blackwell; the TRTLLM family serves their MXFP4 experts on TRTLLM-Gen."""
+    report = _mxfp4_mtp_layer_report("TRTLLM")
+
+    assert impl_class_for(report) is TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl
+    assert not report.degraded
+
+
+@pytest.mark.parametrize("backend", [MoeBackendType.MEGAMOE_CUTEDSL.value, "TRTLLM"])
+def test_per_layer_dynamic_eplb_refuses_the_mxfp4_mtp_layer(backend: str) -> None:
+    """Only MegaMoE CuteDSL consumes per-layer dynamic EPLB plans, and it serves NVFP4 only,
+    so the MXFP4 MTP layer has no implementation under that load balancer."""
+    report = _mxfp4_mtp_layer_report(backend, eplb_mode="per_layer_dynamic")
+
+    assert report.winner is None
+    with pytest.raises(UnsupportedError, match="no MoE implementation can serve this layer"):
+        impl_class_for(report)
 
 
 # =====================================================================
