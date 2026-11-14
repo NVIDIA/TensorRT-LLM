@@ -19,13 +19,16 @@ worker is built; the engine keeps what lies outside the forward (input packing, 
 rewind). It computes what the stock MTP-Eagle worker computes for greedy and plain sampling; every other speculative
 feature, and running without speculation, is served by the sibling split target
 ``glm_5_3_flash_nvfp4__sm_100__default``. Routing declines them here, and the constructor checks again
-(``_check_speculation``).
+(``_check_speculation``). Routing also sends DWDP deployments to the split target, whose stock drafter declares the
+MTP layer to DWDP as a repeated layer; the constructor does not see DWDP.
 
 ``default`` is the built-in model's parallel coverage: the weight shapes are computed from the engine's ``Mapping``
 (tensor-parallel or expert-parallel MoE, attention DP), without pipeline or context parallelism.
 
 **Text only.** The checkpoint is the vision-language wrapper. This target builds and loads no vision tower: the
-weight mapper's audit allowlists the ``model.visual.*`` namespace.
+weight mapper's audit allowlists the ``model.visual.*`` namespace. A request that carries multimodal input is
+refused at admission (``validate_multimodal_request_data``), so a deployment that keeps the multimodal encoder
+serves text requests and fails each request that carries media alone.
 """
 
 from __future__ import annotations
@@ -90,9 +93,12 @@ from . import weights as _weights
 # and the certification is per arch.
 _SM = (10, 0)
 
+#: ``multimodal_data`` entries that carry media for an encoder, or encoder output in place of it.
+_MEDIA_KEYS = frozenset({"audio", "image", "video", "multimodal_embedding"})
+
 #: Stock code the generic path runs outside the catalog, declared so it is not consumed silently: every
-#: tensorrt_llm import of this module that computes (test_modeling_v2_claims.py checks the list both ways). An entry
-#: leaves the list when a catalog entry replaces it.
+#: tensorrt_llm import of this module that computes (this target's unit tests check the list both ways, with
+#: ``_glm5_next_generic_calls.py``). An entry leaves the list when a catalog entry replaces it.
 UNCERTIFIED_GENERIC_CALLS = (
     # The causal LM's and the text model's base classes and the checkpoint's weight mapper.
     "tensorrt_llm._torch.models.modeling_utils.DecoderModelForCausalLM",
@@ -2184,8 +2190,10 @@ class Glm5NextMtpStep:
             )
 
         original_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
-        self._save_metadata(attn_metadata, batch_size)
         try:
+            # Saved inside the ``try``: a save that fails partway, such as an out-of-memory copy during the engine's
+            # warmup, must not leave the lengths saved, or every later step fails in ``prepare_for_spec_dec``.
+            self._save_metadata(attn_metadata, batch_size)
             next_draft_tokens = self._draft(
                 input_ids,
                 position_ids,
@@ -2420,6 +2428,7 @@ class Glm5NextMtpStep:
         self._saved = saved
 
     def _restore_metadata(self, attn_metadata: AttentionMetadata) -> None:
+        """Undo :meth:`_save_metadata`, also after a save that failed partway: each field only if it was saved."""
         if attn_metadata.has_spec_dec_saved_state:
             attn_metadata.restore_from_spec_dec()
             attn_metadata.on_update()
@@ -2468,3 +2477,16 @@ class ModelingV2Glm53FlashNvfp4Sm100DefaultMtpFused(Glm5NextForCausalLM):
 
     def load_weights(self, weights: Any, weight_mapper: BaseWeightMapper | None = None) -> None:
         _weights.load(self, weights, weight_mapper)
+
+    def validate_multimodal_request_data(self, mm_data: dict) -> None:
+        """Refuse, at admission, a request whose multimodal payload carries media: this target runs no encoder.
+
+        Refusing here fails that request alone; the forward would otherwise serve its text without the media.
+        A payload without media is accepted.
+        """
+        media = sorted(key for key in _MEDIA_KEYS if mm_data.get(key) is not None)
+        if media:
+            raise ValueError(
+                f"{type(self).__name__} serves this checkpoint's language model only and does not accept "
+                f"multimodal input; the request carries {', '.join(media)}"
+            )

@@ -112,6 +112,13 @@ l0_cpu:
   # -m cpu_only, so the directory's GPU tests are left to l0_b300's modeling_v2 entry.
   - unittest/_torch/modeling_v2/models/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default
   - unittest/_torch/modeling_v2/models/glm5_next/test_glm5_next_routing.py
+  - unittest/_torch/modeling_v2/models/glm5_next/test_glm5_next_generic_calls_audit.py
+  # GLM-5.3-Flash targets' cpu_only checks: UNCERTIFIED_GENERIC_CALLS against the sources, and the text-only
+  # admission hook.
+  - unittest/_torch/modeling_v2/models/glm5_next/glm_5_3_flash_nvfp4__sm_100__default/test_glm53_flash_default_uncertified_generic_calls.py
+  - unittest/_torch/modeling_v2/models/glm5_next/glm_5_3_flash_nvfp4__sm_100__default/test_glm53_flash_default_text_only.py
+  - unittest/_torch/modeling_v2/models/glm5_next/glm_5_3_flash_nvfp4__sm_100__default_mtp_fused/test_glm53_flash_default_mtp_fused_uncertified_generic_calls.py
+  - unittest/_torch/modeling_v2/models/glm5_next/glm_5_3_flash_nvfp4__sm_100__default_mtp_fused/test_glm53_flash_default_mtp_fused_text_only.py
   - unittest/_torch/pyexecutor
   - unittest/_torch/executor/test_handle_responses_fast_path.py
   - unittest/_torch/modules/test_cuda_graph_gemm_tuning.py

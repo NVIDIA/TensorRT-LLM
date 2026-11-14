@@ -9,6 +9,7 @@ from transformers import PretrainedConfig
 from tensorrt_llm._torch._experimental.modeling_v2._router_index import modeling_v2_resolve
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm.llmapi.llm_args import (
+    DwdpConfig,
     Eagle3DecodingConfig,
     MTPDecodingConfig,
     NGramDecodingConfig,
@@ -109,6 +110,13 @@ def test_linear_mtp_eagle_routes_to_the_fused_target(mode, spec_config, mapping_
         (MTPDecodingConfig(max_draft_len=3, use_relaxed_acceptance_for_thinking=True), _TEP4, {}),
         (MTPDecodingConfig(max_draft_len=3), _TEP4, dict(guided_decoding_backend="xgrammar")),
         (SADecodingConfig(max_draft_len=3), _TEP4, {}),
+        (MTPDecodingConfig(max_draft_len=3, draft_lm_head_dtype="mxfp8"), _TEP4, {}),
+        (MTPDecodingConfig(max_draft_len=3, moe_backend="CUTLASS"), _TEP4, {}),
+        (
+            MTPDecodingConfig(max_draft_len=3),
+            _DEP4,
+            dict(dwdp_config=DwdpConfig(dwdp_size=4), cuda_graph_config=None),
+        ),
     ],
     ids=[
         "no-spec",
@@ -118,12 +126,31 @@ def test_linear_mtp_eagle_routes_to_the_fused_target(mode, spec_config, mapping_
         "relaxed-acceptance",
         "guided-decoding",
         "suffix-automaton",
+        "mxfp8-draft-head",
+        "draft-moe-backend",
+        "dwdp",
     ],
 )
 def test_other_deployments_route_to_the_split_target(mode, spec_config, mapping_kwargs, llm_kwargs):
     """What the fused target does not compute falls to the split target."""
     config = _model_config(_flash_config(), spec_config=spec_config, **mapping_kwargs)
     assert _qualified(modeling_v2_resolve(config, _llm_args(mode, **llm_kwargs))) == _SPLIT
+
+
+@pytest.mark.parametrize("mode", ["auto", "require"])
+@pytest.mark.parametrize(
+    "spec_config, target",
+    [(None, _SPLIT), (MTPDecodingConfig(max_draft_len=3), _FUSED)],
+    ids=["no-spec", "mtp3"],
+)
+@pytest.mark.parametrize("disable_mm_encoder", [False, True], ids=["mm-encoder", "text-only"])
+def test_flash_routes_with_or_without_the_multimodal_encoder(
+    mode, spec_config, target, disable_mm_encoder
+):
+    """Routing does not read the encoder setting: the targets refuse image and video requests at admission."""
+    config = _model_config(_flash_config(), spec_config=spec_config, **_TEP4)
+    llm_args = _llm_args(mode, disable_mm_encoder=disable_mm_encoder)
+    assert _qualified(modeling_v2_resolve(config, llm_args)) == target
 
 
 @pytest.mark.parametrize(
@@ -153,8 +180,23 @@ def test_other_deployments_route_to_the_split_target(mode, spec_config, mapping_
             dict(_DEP4, enable_lm_head_tp_in_adp=True),
             "LM head split",
         ),
+        (
+            dict(),
+            QuantAlgo.NVFP4,
+            MTPDecodingConfig(max_draft_len=3, use_dynamic_tree=True, dynamic_tree_max_topK=2),
+            _TEP4,
+            "a dynamic draft tree, draft trees",
+        ),
     ],
-    ids=["other-shape", "fp8-checkpoint", "pipeline-parallel", "ngram", "eagle3", "adp-split-head"],
+    ids=[
+        "other-shape",
+        "fp8-checkpoint",
+        "pipeline-parallel",
+        "ngram",
+        "eagle3",
+        "adp-split-head",
+        "dynamic-tree",
+    ],
 )
 def test_flash_near_misses_do_not_match(
     text_overrides, quant_algo, spec_config, mapping_kwargs, missed

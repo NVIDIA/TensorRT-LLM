@@ -19,7 +19,10 @@ speculative decoding runs:
 
 The checkpoint declares the vision-language wrapper, and the language model's
 shape lives in its ``text_config``, so that is what this tree reads. The
-targets are text-only: they load no vision tower.
+targets are text only: they load no vision tower, and each refuses a request
+that carries image or video input at admission
+(``validate_multimodal_request_data``). ``route`` therefore takes a deployment
+whether or not it disables the multimodal encoder.
 """
 
 from __future__ import annotations
@@ -82,7 +85,9 @@ def fused_speculation_refused(spec_config: Any) -> list[str]:
     """The speculative features the MTP-fused target does not compute; empty when it computes this config.
 
     The target runs the checkpoint's MTP layer as a linear one-model MTP-Eagle chain with strict acceptance (greedy or
-    plain sampling) inside its own forward. ``route`` declines these features so the split target takes the
+    plain sampling) inside its own forward. Its drafter projects the drafts through the target's LM head and runs the
+    MTP layer's MoE on the target's backend, so it also refuses the drafter options the stock drafter applies: an
+    MXFP8 draft head and a draft MoE backend. ``route`` declines these features so the split target takes the
     deployment, and the fused target's constructor refuses them against direct construction.
     """
     if spec_config is None:
@@ -99,6 +104,8 @@ def fused_speculation_refused(spec_config: Any) -> list[str]:
         "sa_config": spec_config.sa_config is not None,
         "a separate speculative checkpoint": spec_config.speculative_model is not None,
         "a draft-length schedule": spec_config.draft_len_schedule is not None,
+        "an MXFP8 draft LM head": spec_config.draft_lm_head_dtype != "auto",
+        "a draft MoE backend": spec_config.moe_backend is not None,
     }
     return [name for name, present in refused.items() if present]
 
@@ -116,6 +123,10 @@ def _fused_refused(
         refused.append("guided decoding")
     if _mtp_with_split_head(model_config, spec_config):
         refused.append("an LM head split across attention-DP ranks")
+    # The draft chain runs the MTP layer once per draft step, and only the stock drafter declares it to DWDP as a
+    # repeated layer (``add_repeated_layer``).
+    if llm_args.dwdp_config is not None:
+        refused.append("DWDP")
     return refused
 
 
@@ -125,7 +136,9 @@ def _split_refused(model_config: ModelConfig, spec_config: Any) -> list[str]:
     The engine's speculative worker drives the target. A mode is admitted when its worker commits the KDA recurrent
     state for the accepted tokens and it reads no hidden states captured from the decoder layers, which this model
     does not capture: one-model MTP (vanilla or MTP-Eagle, from the checkpoint's own MTP layer) and suffix-automaton
-    drafting.
+    drafting. The target verifies the drafts as a linear chain: KDA advances its recurrent state through the verify
+    tokens in order and the sparse layers place them at consecutive positions, neither reading a tree mask, so draft
+    trees are declined.
     """
     if spec_config is None:
         return []
@@ -134,6 +147,8 @@ def _split_refused(model_config: ModelConfig, spec_config: Any) -> list[str]:
     if not isinstance(spec_config, MTPDecodingConfig):
         return [f"{type(spec_config).__name__} (only MTP or SA)"]
     refused = {
+        "a dynamic draft tree": spec_config.use_dynamic_tree,
+        "draft trees": spec_config.max_total_draft_tokens not in (None, spec_config.max_draft_len),
         "a separate speculative checkpoint": spec_config.speculative_model is not None,
         "an LM head split across attention-DP ranks": _mtp_with_split_head(
             model_config, spec_config
@@ -196,6 +211,6 @@ def route(
     spec = spec_config.spec_dec_mode.name
     raise NoTarget(
         f"{deployment}, speculative decoding {spec} with {', '.join(split_refused)}; the glm5_next "
-        "targets run one-model MTP (vanilla or MTP-Eagle, from the checkpoint's MTP layer), "
-        "suffix-automaton drafting or no speculative decoding"
+        "targets run one-model MTP (vanilla or MTP-Eagle, from the checkpoint's MTP layer, as a "
+        "linear draft chain), suffix-automaton drafting or no speculative decoding"
     )
