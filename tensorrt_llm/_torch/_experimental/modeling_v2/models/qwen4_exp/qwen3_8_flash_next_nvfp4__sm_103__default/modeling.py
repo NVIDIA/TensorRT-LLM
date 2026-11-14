@@ -6923,6 +6923,13 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Default(
                 "which the target does not implement; 'breakable' runs the prefill step as a "
                 "breakable CUDA graph"
             )
+        mm_config = llm_args.multimodal_config
+        if mm_config is not None and mm_config.encoder_attention_backend:
+            raise NoTarget(
+                "multimodal_config.encoder_attention_backend="
+                f"{mm_config.encoder_attention_backend}; the target's vision tower runs its own "
+                "attention and does not apply it"
+            )
         if spec is None:
             return
         if not is_gdn_replay_enabled():

@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import contextlib
+import copy
 import errno
 import json
 import os
@@ -22,7 +23,7 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import (TYPE_CHECKING, Any, Callable, Dict, Generic, Iterator, List,
-                    Optional, Sequence, Tuple, TypeVar)
+                    Optional, Sequence, Tuple, TypeVar, get_args)
 
 import filelock
 import torch
@@ -40,14 +41,17 @@ from tensorrt_llm._utils import (get_sm_version, is_sm_100f, is_sm_120f,
                                  torch_dtype_to_binding)
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.functional import AllReduceStrategy
+# yapf: disable
 # Callers import MoeLoadBalancerConfig from this module.
 from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig  # noqa: F401
 from tensorrt_llm.llmapi.llm_args import (CSA2SparseAttentionConfig,
                                           DeepSeekSparseAttentionConfig,
                                           DeepSeekV4SparseAttentionConfig,
+                                          EncoderAttentionBackend,
                                           KvCacheConfig,
                                           MoeLoadBalancerConfigType,
                                           MultimodalConfig)
+# yapf: enable
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -370,6 +374,59 @@ class ModelConfig(Generic[TConfig]):
     # The modeling_v2 target class to build, or None for the built-in
     # implementation. Set by the model loader, read by `_resolve_class`.
     modeling_v2_target: Optional[type] = None
+
+    def get_encoder_attention_backend(self, encoder: str, default: str) -> str:
+        """Return the attention backend selected for a logical encoder.
+
+        Args:
+            encoder: Logical encoder name, such as ``"vision"`` or ``"audio"``.
+            default: Backend the model uses for this encoder when
+                ``multimodal_config.encoder_attention_backend`` omits it.
+
+        Returns:
+            The backend from ``multimodal_config.encoder_attention_backend``,
+            or ``default`` when the encoder has no entry.
+
+        Raises:
+            ValueError: If the selected backend is not a public encoder backend.
+        """
+        overrides = (self.multimodal_config.encoder_attention_backend
+                     if self.multimodal_config is not None else None)
+        if not overrides or encoder not in overrides:
+            return default
+        backend = overrides[encoder]
+        backends = get_args(EncoderAttentionBackend)
+        if backend not in backends:
+            raise ValueError(
+                f"Invalid attention backend {backend!r} for the {encoder} encoder; "
+                f"expected one of {', '.join(backends)}")
+        return backend
+
+    def with_encoder_attention_backend(self,
+                                       encoder: str,
+                                       default: str | None = None
+                                       ) -> "ModelConfig":
+        """Return a config whose ``attn_backend`` is the encoder's backend.
+
+        Args:
+            encoder: Logical encoder name, such as ``"vision"`` or ``"audio"``.
+            default: Backend the model uses for this encoder when no override
+                is set. ``None`` means the decoder's ``attn_backend``.
+
+        Returns:
+            ``self`` when the selected backend equals ``attn_backend``;
+            otherwise a shallow copy with only ``attn_backend`` changed, so the
+            decoder config is never modified.
+        """
+        backend = self.get_encoder_attention_backend(
+            encoder, self.attn_backend if default is None else default)
+        if backend == self.attn_backend:
+            return self
+        config = copy.copy(self)
+        # The copy keeps ``_frozen``, so ``setattr`` would raise on a config
+        # from ``from_pretrained``. ``object.__setattr__`` changes only the copy.
+        object.__setattr__(config, "attn_backend", backend)
+        return config
 
     @property
     def kv_cache_layer_specs(self) -> Optional[Tuple[KVCacheLayerSpec, ...]]:

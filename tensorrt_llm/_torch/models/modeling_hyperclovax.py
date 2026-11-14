@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import copy
 import math
 import os
@@ -1030,6 +1033,9 @@ class HCXVisionModel(nn.Module):
         content_format=ContentFormat.STRING,
     ))
 class HCXVisionForCausalLM(PreTrainedModel):
+
+    # The native vision path does not apply encoder overrides.
+    supported_encoder_attention_backends = {"vision": frozenset()}
 
     def __init__(self, model_config: ModelConfig):
         config = model_config.pretrained_config

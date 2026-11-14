@@ -38,7 +38,7 @@ from tensorrt_llm._utils import get_sm_version, str_dtype_to_torch
 from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                           ExecutorMemoryType,
-                                          ModelExpressConfig,
+                                          ModelExpressConfig, MultimodalConfig,
                                           SparseAttentionConfig, TorchLlmArgs)
 from tensorrt_llm.llmapi.llm_utils import (_resolve_kv_cache_manager_v2_auto,
                                            _resolve_transceiver_runtime_auto,
@@ -202,6 +202,56 @@ def _with_fp8_block_scale_weights(
 _MX_QWEN3_FP8_BLOCK_SM90_DENSE_RUNTIME_CONSTRAINTS = (
     _with_fp8_block_scale_weights(_MX_QWEN3_BF16_DENSE_RUNTIME_CONSTRAINTS,
                                   {90}))
+
+
+def _validate_encoder_attention_backend_support(
+        model_cls: type | None, mm_config: MultimodalConfig | None) -> None:
+    """Reject unsupported encoder selections before allocating model weights."""
+    if mm_config is None or not mm_config.encoder_attention_backend:
+        return
+    supported = getattr(model_cls, "supported_encoder_attention_backends", {})
+    model_name = model_cls.__name__ if model_cls is not None else "The model"
+    for encoder, backend in mm_config.encoder_attention_backend.items():
+        if not supported or encoder in supported and not supported[encoder]:
+            raise ValueError(
+                f"The {encoder} encoder's attention backend cannot be changed "
+                f"for {model_name}")
+        if encoder not in supported:
+            raise ValueError(f"Unknown encoder {encoder!r} for {model_name}; "
+                             f"available encoders: {sorted(supported)}")
+        if backend not in supported[encoder]:
+            raise ValueError(
+                f"The {encoder} encoder does not support attention backend {backend!r}; "
+                f"supported backends: {sorted(supported[encoder])}")
+        if backend == "FLASHINFER":
+            from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
+
+            if not IS_FLASHINFER_AVAILABLE:
+                raise ValueError(
+                    f"The {encoder} encoder requested FLASHINFER, but FlashInfer is unavailable"
+                )
+
+
+def _validate_encoder_attention_backend_enabled(
+        mm_config: MultimodalConfig | None,
+        pretrained_config: object,
+        *,
+        disable_mm_encoder: bool = False) -> None:
+    """Reject selections for encoders that the effective model config omits."""
+    if mm_config is None or not mm_config.encoder_attention_backend:
+        return
+    if disable_mm_encoder:
+        # Text-only runs, such as trtllm-bench without --modality, reuse
+        # serving configs. A skipped encoder never applies the selection, and
+        # models that ignore disable_mm_encoder still build it with the setting.
+        logger.info(
+            "multimodal_config.encoder_attention_backend is not applied "
+            "to encoders skipped by disable_mm_encoder=True")
+        return
+    for encoder in mm_config.encoder_attention_backend:
+        if getattr(pretrained_config, f"{encoder}_config", None) is None:
+            raise ValueError(
+                f"The {encoder} encoder is not enabled in the model config")
 
 
 def _validate_and_adjust_mamba_snapshot_config(config: ModelConfig,
@@ -1175,6 +1225,9 @@ class ModelLoader:
         if architectures:
             preference_cls = get_registered_model_class(
                 architectures[0]) or model_cls
+
+        _validate_encoder_attention_backend_support(preference_cls,
+                                                    llm_args.multimodal_config)
 
         # model_cls is None when the architecture is unknown/unsupported.
         model_defaults = {}
@@ -2385,6 +2438,11 @@ class ModelLoader:
             load_config_kwargs['model_kwargs'] = self.llm_args.model_kwargs
 
         config = checkpoint_loader.load_config(**load_config_kwargs)
+        # Check after model_kwargs, which can remove an encoder.
+        _validate_encoder_attention_backend_enabled(
+            self.llm_args.multimodal_config,
+            config.pretrained_config,
+            disable_mm_encoder=self.llm_args.disable_mm_encoder)
 
         # Decided here, after `load_config_and_apply_defaults` resolved the
         # built-in class and applied its model defaults to `llm_args`: a

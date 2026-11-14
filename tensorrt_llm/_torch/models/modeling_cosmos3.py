@@ -76,6 +76,8 @@ class Cosmos3InputProcessor(Qwen3VLInputProcessorBase):
     Cosmos3InputProcessor, model_type="cosmos3_omni", placeholder_metadata=PLACEHOLDER_METADATA
 )
 class Cosmos3Model(Qwen3VLModel):
+    supported_encoder_attention_backends = Qwen3VLModel.supported_encoder_attention_backends
+
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
         omni_config = model_config.pretrained_config
         if omni_config is None:

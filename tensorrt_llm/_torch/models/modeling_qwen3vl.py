@@ -1516,7 +1516,7 @@ class Qwen3VisionModelBase(nn.Module):
         model_class: Union[type[PreTrainedModel], type[torch.nn.Module]],
     ):
         super().__init__()
-        self.model_config = model_config
+        self.model_config = model_config.with_encoder_attention_backend("vision")
         self.model_dtype = self.model_config.pretrained_config.text_config.dtype
 
         # NOTE: Re-setting QuantConfig to exclude vision encoder from quantization,
@@ -1617,6 +1617,10 @@ class Qwen3VisionModelBase(nn.Module):
 
 
 class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
+    supported_encoder_attention_backends = {
+        "vision": frozenset({"VANILLA", "TRTLLM", "FLASHINFER"})
+    }
+
     supports_mm_encoder_item_scheduling = True
     supports_vision_gpu_normalize = True
 
@@ -2071,6 +2075,8 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
     ),
 )
 class Qwen3VLModel(Qwen3VLModelBase):
+    supported_encoder_attention_backends = Qwen3VLModelBase.supported_encoder_attention_backends
+
     supports_encoder_cache = True
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):

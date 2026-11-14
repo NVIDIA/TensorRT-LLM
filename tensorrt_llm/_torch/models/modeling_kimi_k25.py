@@ -798,9 +798,15 @@ class KimiK25VisionModel(nn.Module):
         self.model_config = copy.copy(model_config)
         self.model_config.extra_attrs = copy.copy(model_config.extra_attrs)
         self.model_config._frozen = False
-        self.model_config.quant_config = QuantConfig(
-            kv_cache_quant_algo=model_config.quant_config.kv_cache_quant_algo
+        self.model_config.attn_backend = model_config.get_encoder_attention_backend(
+            "vision", model_config.attn_backend
         )
+        kv_cache_quant_algo = model_config.quant_config.kv_cache_quant_algo
+        if self.model_config.attn_backend != model_config.attn_backend:
+            # The encoder keeps no KV cache, and FlashInfer rejects FP8
+            # KV-cache quantization without one.
+            kv_cache_quant_algo = None
+        self.model_config.quant_config = QuantConfig(kv_cache_quant_algo=kv_cache_quant_algo)
         self.model_config.pretrained_config = copy.copy(model_config.pretrained_config)
 
         # Extract vision config dict (num_heads is resolved here, with this
@@ -1574,6 +1580,10 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
         mm_encoder: KimiK25VisionModel (native MoonViT3d + PatchMergerMLP)
         llm: DeepseekV3ForCausalLM (MLA + MoE, 61 layers)
     """
+
+    supported_encoder_attention_backends = {
+        "vision": frozenset({"VANILLA", "TRTLLM", "FLASHINFER"})
+    }
 
     _LANG_PREFIX = "language_model."
     # Vision tower class. Subclasses (Kimi K3) override this so the shared

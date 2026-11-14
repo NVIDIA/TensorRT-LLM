@@ -1160,6 +1160,10 @@ class MuseSparkForConditionalGeneration(MultimodalModelMixin, PreTrainedModel):
     `get_multimodal_embeddings` applies as for any mixin model.
     """
 
+    # The vision tower derives its backend from the decoder's, and the audio
+    # tower is plain PyTorch; neither applies encoder overrides.
+    supported_encoder_attention_backends = {"vision": frozenset(), "audio": frozenset()}
+
     config_class = type(None)  # resolved from model_config, not from a HF class
 
     # -- class-level hooks -------------------------------------------------
