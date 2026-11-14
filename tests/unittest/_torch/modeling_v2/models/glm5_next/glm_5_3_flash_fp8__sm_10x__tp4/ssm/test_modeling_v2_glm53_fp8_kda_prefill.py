@@ -95,14 +95,15 @@ CELLS: tuple[Cell, ...] = op.CELLS + (
 
 
 def _schedule(lens) -> tuple[torch.Tensor, torch.Tensor]:
-    """``(seq_order, cu_chunks)`` as the scheduler's metadata builds them: rows of one int32 buffer."""
+    """``(seq_order, cu_chunks)`` as the scheduler's metadata builds them: rows of one int32 buffer, each row
+    padded to 16 bytes (the chunk-decomposed route reads them through 16-byte-aligned pointers)."""
     n = len(lens)
     order = sorted(range(n), key=lambda i: (-lens[i], i))
     chunks = [0, *itertools.accumulate((length + 15) // 16 for length in lens)]
-    schedule = torch.zeros(2, n + 1, dtype=torch.int32, device="cuda")
+    schedule = torch.zeros(2, (n + 1 + 3) // 4 * 4, dtype=torch.int32, device="cuda")
     schedule[0, :n] = torch.tensor(order, dtype=torch.int32, device="cuda")
-    schedule[1] = torch.tensor(chunks, dtype=torch.int32, device="cuda")
-    return schedule[0, :n], schedule[1]
+    schedule[1, : n + 1] = torch.tensor(chunks, dtype=torch.int32, device="cuda")
+    return schedule[0, :n], schedule[1, : n + 1]
 
 
 def _build(spec: dict, seed: int):
