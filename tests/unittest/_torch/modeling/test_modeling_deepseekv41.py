@@ -2141,7 +2141,7 @@ def test_adp_replay_counts_follow_final_execution(monkeypatch, mode, speculative
 
         gather = Mock(
             return_value=torch.tensor(
-                [[local_rows, decoder_rows, 6, 1, 1], [513, peer_rows, 9, 2, 2]]
+                [[local_rows, decoder_rows, 6, 1, 1, 3], [513, peer_rows, 9, 2, 2, 0]]
             )
         )
         inputs = SimpleNamespace(
@@ -2149,12 +2149,14 @@ def test_adp_replay_counts_follow_final_execution(monkeypatch, mode, speculative
             mapping=metadata.mapping,
             dist=SimpleNamespace(tp_cp_allgather_int64=gather),
         )
-        spec = SimpleNamespace(dp_num_tokens=lambda: 6, seq_lens=[6], num_generations=1)
+        spec = SimpleNamespace(
+            dp_num_tokens=lambda: 6, seq_lens=[6], num_generations=1, runtime_draft_len=3
+        )
         metadata.all_rank_num_tokens, spec_counts = (
             DecoderInputPreparer._get_all_rank_num_tokens_and_spec_counts(inputs, metadata, spec)
         )
-        assert spec_counts == [[6, 9], [1, 2], [1, 2]]
-        gather.assert_called_once_with([local_rows, decoder_rows, 6, 1, 1])
+        assert spec_counts == [[6, 9], [1, 2], [1, 2], [3, 0]]
+        gather.assert_called_once_with([local_rows, decoder_rows, 6, 1, 1, 3])
     else:
         gather = Mock(return_value=torch.tensor([[local_rows, decoder_rows], [513, peer_rows]]))
         metadata.all_rank_num_tokens = get_all_rank_num_tokens(

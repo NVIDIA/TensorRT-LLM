@@ -516,7 +516,8 @@ class SpeculativeDecodingMode(IntEnum):
     def support_dynamic_draft_len(self):
         return self.is_mtp_one_model() or self.is_eagle3_one_model(
         ) or self.is_mtp_eagle_one_model() or self.is_pard() or self.is_dflash(
-        ) or self.is_draft_target_one_model() or self.is_sa()
+        ) or self.is_dspark() or self.is_draft_target_one_model() or self.is_sa(
+        )
 
     def need_load_draft_weights(self):
         """
@@ -642,6 +643,9 @@ class SpecMetadata:
     # whose draft forward processes only generation requests and must size a
     # FUSED_COMM MoE (DeepGEMM MegaMoE) chunk loop identically across EP ranks.
     all_rank_num_gens: Optional[List[int]] = None
+    # The draft length each rank runs this step with. Attention-DP ranks pick
+    # it from their own batch, so it can differ across ranks.
+    all_rank_draft_lens: Optional[List[int]] = None
     # The number of extra kv tokens
     # Some speculative decoding methods need to use different kv lengths for the
     # draft/target layers. But KVCacheManager can only support kv caches with the

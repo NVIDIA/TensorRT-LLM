@@ -1013,6 +1013,7 @@ def test_dspark_forward_publishes_execution_not_confidence_flag(return_confidenc
     worker.write_context_onehot_draft_probs = lambda *_args: None
     worker._prepare_next_new_tokens = lambda *_args: torch.tensor([[12, 13]])
     metadata = types.SimpleNamespace(
+        runtime_draft_len=1,
         batch_indices_cuda=torch.tensor([0]),
         draft_probs_last_dim=8,
         verify_lens=None

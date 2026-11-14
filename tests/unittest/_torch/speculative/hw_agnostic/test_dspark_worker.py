@@ -692,6 +692,7 @@ def test_forward_mixed_batch_routes_through_base_entries(monkeypatch):
     batch_size = num_contexts + num_gens
 
     meta = _make_metadata(max_num_requests=8)
+    meta.runtime_draft_len = K
     meta.request_ids = [10, 11, 20, 21, 22]  # 2 context + 3 gen
     meta.prepare()
 
@@ -796,6 +797,7 @@ def test_forward_guided_batch_masks_and_advances_matcher_per_step(monkeypatch):
     FULL_VOCAB = 97  # post-TP-gather scatter width (wider than sharded `vocab`)
 
     meta = _make_metadata(max_num_requests=8)
+    meta.runtime_draft_len = K
     meta.request_ids = [10, 11, 20, 21, 22]  # 2 context + 3 gen
     meta.prepare()
 

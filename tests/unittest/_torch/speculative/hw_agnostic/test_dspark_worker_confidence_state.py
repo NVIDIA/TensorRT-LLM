@@ -190,6 +190,7 @@ def test_warmup_restores_confidence_logits_and_their_matching_stamps(monkeypatch
     saved_addresses = (worker._confidence_logits.data_ptr(), worker._confidence_stamp.data_ptr())
     metadata = SimpleNamespace(
         is_cuda_graph=True,
+        runtime_draft_len=3,
         qo_indptr=None,
         verify_lens=None,
         get_hidden_states=lambda _num_tokens: torch.zeros(4, 2),
