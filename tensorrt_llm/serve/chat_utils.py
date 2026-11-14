@@ -1,3 +1,4 @@
+import asyncio
 import json
 import uuid
 from functools import lru_cache, partial
@@ -220,6 +221,46 @@ def parse_chat_message_content_part(
     raise NotImplementedError(f"Unknown part type: {part_type}")
 
 
+def _no_input_reason(model_type: str, modality: str) -> str:
+    """Why a model of ``model_type`` cannot be given ``modality`` input."""
+    if MULTIMODAL_PLACEHOLDER_REGISTRY.get_registered_modalities(model_type):
+        return f"this model does not accept {modality} input"
+    return "this model accepts text only"
+
+
+def _media_or_note(role: str, media: MultimodalData,
+                   model_type: str) -> Union[MultimodalData, str]:
+    """Return ``media``, or a note in its place if the model cannot take it.
+
+    The modalities a model takes are those it registers a placeholder for.
+    In a tool result, media of any other modality is replaced by a note that
+    says what was left out: the client's tool attached it, and the client
+    sends the tool result again with every later request of the
+    conversation, so refusing it would fail each of those requests. Media in
+    any other message is refused.
+
+    Raises:
+        ValueError: The model cannot take the media's modality and ``role``
+            is not ``"tool"``.
+    """
+    modality = media["modality"]
+    if MULTIMODAL_PLACEHOLDER_REGISTRY.is_valid(model_type, modality):
+        return media
+    if asyncio.iscoroutine(media["data"]):
+        # Close the unstarted load so it is not reported as never awaited.
+        media["data"].close()
+    reason = _no_input_reason(model_type, modality)
+    if role != "tool":
+        raise ValueError(f"The request carries {modality} input, but {reason} "
+                         f"(model type {model_type!r}).")
+    logger.warning_once(
+        f"A tool result carries {modality} input, but {reason} (model type "
+        f"{model_type!r}); the model is shown a note in its place. Later "
+        "occurrences are not logged.",
+        key=f"tool_result_{modality}_omitted")
+    return f"[{modality} omitted: {reason}]"
+
+
 def parse_chat_message_content_parts(
     role: str,
     parts: Iterable[ChatCompletionContentPartParam],
@@ -229,6 +270,7 @@ def parse_chat_message_content_parts(
 
     Builds both the flattened text (`content`) for backward compatibility and an ordered
     `content_parts` list that preserves the interleaved positions of text and media items.
+    Media the model cannot take is handled by `_media_or_note`.
     """
     text_parts: list[str] = []
     media_parts: list[MultimodalData] = []
@@ -237,6 +279,9 @@ def parse_chat_message_content_parts(
     media_index = 0
     for part in parts:
         parse_res = parse_chat_message_content_part(part, mm_data_tracker)
+        if parse_res and not isinstance(parse_res, str):
+            parse_res = _media_or_note(role, parse_res,
+                                       mm_data_tracker._model_type)
         if parse_res:
             if isinstance(parse_res, str):
                 text_parts.append(parse_res)

@@ -619,6 +619,119 @@ class TestMmItemOrderReturn:
         assert item_order == expected
 
 
+_TEXT_ONLY_MODEL_TYPE = "glm_moe_dsa"
+_IMAGE_URL = "data:image/png;base64,iVBORw0KGgo="
+_IMAGE_PART = {"type": "image_url", "image_url": {"url": _IMAGE_URL}}
+
+
+def _parse_for(model_type: str, messages: list) -> tuple:
+    """Parse ``messages`` for ``model_type``, leaving any media unloaded."""
+    config = type("_StubConfig", (), {"model_type": model_type})()
+    conversation, mm_coroutine, placeholder_counts, item_order = parse_chat_messages_coroutines(
+        messages, config, None
+    )
+    mm_coroutine.close()
+    return conversation, placeholder_counts, item_order
+
+
+def _ending_in_tool_result(*parts) -> list:
+    """A conversation whose last message is a tool result made of ``parts``."""
+    return [
+        {"role": "user", "content": "Show me the plot."},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "view_image", "arguments": '{"path": "plot.png"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": list(parts)},
+    ]
+
+
+class TestMediaTheModelCannotTake:
+    """Media of a modality the model registers no placeholder for.
+
+    In a tool result it is replaced by a note, because the client sends the tool result again
+    with every later request of the conversation. Anywhere else it is refused with the reason.
+    """
+
+    def test_a_tool_result_image_becomes_a_note_for_a_text_only_model(self):
+        conversation, placeholder_counts, item_order = _parse_for(
+            _TEXT_ONLY_MODEL_TYPE,
+            _ending_in_tool_result({"type": "text", "text": "plot.png"}, _IMAGE_PART),
+        )
+        assert conversation[-1] == {
+            "role": "tool",
+            "content": "plot.png\n[image omitted: this model accepts text only]",
+            "media": [],
+            "tool_call_id": "call_1",
+        }
+        assert placeholder_counts == [{}, {}, {}]
+        assert item_order == []
+
+    @pytest.mark.parametrize(
+        "part, modality",
+        [
+            (_IMAGE_PART, "image"),
+            ({"type": "image_embeds", "image_embeds": {"data": "AAAA"}}, "image"),
+            ({"type": "video_url", "video_url": {"url": "http://x/clip.mp4"}}, "video"),
+            ({"type": "audio_url", "audio_url": {"url": "http://x/clip.wav"}}, "audio"),
+            ({"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}}, "audio"),
+        ],
+        ids=["image_url", "image_embeds", "video_url", "audio_url", "input_audio"],
+    )
+    def test_every_media_part_of_a_tool_result_becomes_a_note(self, part, modality):
+        conversation, _, _ = _parse_for(_TEXT_ONLY_MODEL_TYPE, _ending_in_tool_result(part))
+        assert conversation[-1]["content"] == f"[{modality} omitted: this model accepts text only]"
+        assert conversation[-1]["media"] == []
+
+    def test_a_tool_result_keeps_media_the_model_takes(self):
+        conversation, placeholder_counts, item_order = _parse_for(
+            _MM_MODEL_TYPE,
+            _ending_in_tool_result({"type": "text", "text": "plot.png"}, _IMAGE_PART),
+        )
+        assert [media["modality"] for media in conversation[-1]["media"]] == ["image"]
+        assert "omitted" not in conversation[-1]["content"]
+        assert placeholder_counts[-1] == {_IMG_PLACEHOLDER: 1}
+        assert item_order == [_expected_item("image", 0)]
+
+    def test_the_note_names_the_modality_a_multimodal_model_lacks(self):
+        audio = {"type": "audio_url", "audio_url": {"url": "http://x/clip.wav"}}
+        conversation, _, _ = _parse_for(_MM_MODEL_TYPE, _ending_in_tool_result(audio))
+        assert conversation[-1]["content"] == (
+            "[audio omitted: this model does not accept audio input]"
+        )
+
+    @pytest.mark.parametrize("role", ["user", "assistant"])
+    def test_media_outside_a_tool_result_is_refused_with_the_reason(self, role):
+        message = {
+            "role": role,
+            "content": [{"type": "text", "text": "What is this?"}, _IMAGE_PART],
+        }
+        with pytest.raises(
+            ValueError,
+            match=r"carries image input, but this model accepts text only "
+            r"\(model type 'glm_moe_dsa'\)",
+        ):
+            _parse_for(_TEXT_ONLY_MODEL_TYPE, [message])
+
+    def test_the_warning_is_logged_once_however_often_it_applies(self):
+        logger = _chat_utils.logger
+        with (
+            patch.object(logger, "_appeared_keys", set()),
+            patch.object(logger, "log") as log,
+        ):
+            for _ in range(3):
+                _parse_for(_TEXT_ONLY_MODEL_TYPE, _ending_in_tool_result(_IMAGE_PART, _IMAGE_PART))
+        emitted = [call for call in log.call_args_list if "tool result" in str(call)]
+        assert len(emitted) == 1
+
+
 class TestParseChatMessageContentPart:
     """Unit tests for parse_chat_message_content_part."""
 

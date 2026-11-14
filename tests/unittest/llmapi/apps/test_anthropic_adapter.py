@@ -28,6 +28,10 @@ import pytest
 from pydantic import ValidationError
 
 import tensorrt_llm.serve.anthropic_adapter as adapter
+from tensorrt_llm.inputs.registry import (
+    MULTIMODAL_PLACEHOLDER_REGISTRY,
+    MultimodalPlaceholderMetadata,
+)
 from tensorrt_llm.serve.anthropic_adapter import (
     AnthropicRequestError,
     AnthropicResponseError,
@@ -39,6 +43,7 @@ from tensorrt_llm.serve.anthropic_adapter import (
     reframe_openai_stream,
 )
 from tensorrt_llm.serve.anthropic_protocol import AnthropicMessagesRequest
+from tensorrt_llm.serve.chat_utils import parse_chat_messages_coroutines
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
@@ -451,10 +456,10 @@ def test_non_text_tool_result_rejected_instead_of_flattened():
                                 "tool_use_id": "toolu_1",
                                 "content": [
                                     {
-                                        "type": "image",
+                                        "type": "document",
                                         "source": {
                                             "type": "base64",
-                                            "media_type": "image/png",
+                                            "media_type": "application/pdf",
                                             "data": "abcd",
                                         },
                                     }
@@ -465,6 +470,95 @@ def test_non_text_tool_result_rejected_instead_of_flattened():
                 ]
             )
         )
+
+
+_PNG_BASE64 = "iVBORw0KGgo="
+_IMAGE_BLOCK = {
+    "type": "image",
+    "source": {"type": "base64", "media_type": "image/png", "data": _PNG_BASE64},
+}
+_IMAGE_PART = {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{_PNG_BASE64}"}}
+_VISION_MODEL_TYPE = "test_anthropic_tool_result_vlm"
+
+
+@pytest.fixture
+def vision_model_type():
+    MULTIMODAL_PLACEHOLDER_REGISTRY.set_placeholder_metadata(
+        _VISION_MODEL_TYPE, MultimodalPlaceholderMetadata(placeholder_map={"image": "<image>"})
+    )
+    yield _VISION_MODEL_TYPE
+    MULTIMODAL_PLACEHOLDER_REGISTRY.remove_placeholder_metadata(_VISION_MODEL_TYPE)
+
+
+def _read_image_request(*result_blocks, is_error=None):
+    """Claude Code's Read tool returns an image file inside the tool_result."""
+    tool_result = {"type": "tool_result", "tool_use_id": "toolu_1", "content": list(result_blocks)}
+    if is_error is not None:
+        tool_result["is_error"] = is_error
+    return make_request(
+        messages=[
+            {"role": "user", "content": "What does the plot show?"},
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "Read",
+                        "input": {"file_path": "plot.png"},
+                    }
+                ],
+            },
+            {"role": "user", "content": [tool_result]},
+        ]
+    )
+
+
+def _tool_message_as_rendered(request, model_type):
+    """The tool message the chat template is given for ``model_type``."""
+    config = type("_StubConfig", (), {"model_type": model_type})()
+    conversation, mm_coroutine, placeholder_counts, _ = parse_chat_messages_coroutines(
+        convert_anthropic_request(request).messages, config, None
+    )
+    mm_coroutine.close()
+    return conversation[2], placeholder_counts[2]
+
+
+def test_tool_result_image_stays_an_image_part():
+    chat = convert_anthropic_request(
+        _read_image_request({"type": "text", "text": "plot.png"}, _IMAGE_BLOCK)
+    )
+    assert chat.messages[2] == {
+        "role": "tool",
+        "tool_call_id": "toolu_1",
+        "content": [{"type": "text", "text": "plot.png"}, _IMAGE_PART],
+    }
+
+
+def test_failed_tool_result_with_an_image_is_still_marked_failed():
+    chat = convert_anthropic_request(_read_image_request(_IMAGE_BLOCK, is_error=True))
+    assert chat.messages[2]["content"] == [
+        {"type": "text", "text": "Tool execution failed:"},
+        _IMAGE_PART,
+    ]
+
+
+def test_tool_result_image_reaches_a_text_only_model_as_a_note():
+    """Claude Code sends the tool_result again with every later request of the conversation."""
+    tool, placeholder_counts = _tool_message_as_rendered(
+        _read_image_request(_IMAGE_BLOCK), "glm_moe_dsa"
+    )
+    assert tool["content"] == "[image omitted: this model accepts text only]"
+    assert tool["media"] == []
+    assert placeholder_counts == {}
+
+
+def test_tool_result_image_reaches_a_vision_model_as_an_image(vision_model_type):
+    tool, placeholder_counts = _tool_message_as_rendered(
+        _read_image_request(_IMAGE_BLOCK), vision_model_type
+    )
+    assert [media["modality"] for media in tool["media"]] == ["image"]
+    assert placeholder_counts == {"<image>": 1}
 
 
 def test_tool_result_ordering_preserved():
