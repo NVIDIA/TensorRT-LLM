@@ -190,8 +190,10 @@ are not supported. See the
   role `reference`. Audio requires an image or video reference. See the
   [Ref2VA example](../../../examples/visual_gen/README.md#minimax-h3-reference-to-video-and-audio)
   for input limits, ordering, and media dependencies.
-- MiniMax-H3 currently restricts TRTLLM attention to SM100 or SM103. This is a
-  model-specific restriction, not a general VisualGen backend requirement.
+- MiniMax-H3 currently restricts TRTLLM attention to SM90, SM100 or SM103. This is a
+  model-specific restriction, not a general VisualGen backend requirement. On SM90 the
+  backend runs dense BF16 attention and the INT8 Q/K SageAttention recipe
+  (`q_block_size: 2`, see [Quantized attention](../features/visualgen-quantized-attention.md)).
 - The published [MiniMax-H3 checkpoint license](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE)
   restricts use by territory. Obtain legal approval before downloading or running the weights.
 
