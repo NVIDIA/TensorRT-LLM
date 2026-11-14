@@ -541,7 +541,9 @@ class DecoderGraphForwardTestCase(unittest.TestCase):
         engine, runner, resource_manager, _, _ = _make_decoder_runner(
             key, cuda_graph_specialize_lora=True
         )
-        engine._lora = engine._graphs._lora = SimpleNamespace(cuda_graph_manager=object())
+        engine._lora = engine._graphs._lora = SimpleNamespace(
+            cuda_graph_manager=SimpleNamespace(fits_batch=lambda requests: True)
+        )
         generation = _make_request_stub(2)
         generation.lora_task_id = 42
         batch = ScheduledRequests()
