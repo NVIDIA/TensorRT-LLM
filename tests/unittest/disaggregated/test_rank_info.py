@@ -211,19 +211,27 @@ def test_rank_info_represents_cache_element_bytes(
 
 
 @pytest.mark.parametrize(
-    ("shares_draft_layers", "draft_layer_ids", "expected"),
+    ("shares_draft_layers", "draft_layer_ids", "hosts", "expected", "reshards"),
     [
-        (False, (), 0),
+        (False, (), False, 0, False),
         # Folded MTP/Eagle draft layers have no explicit storage and travel as
         # ordinary layers, so they are not advertised.
-        (False, (36,), 0),
+        (False, (36,), False, 0, False),
         # Explicit draft layers: a plain manager's layer specs or the layers a
         # hybrid manager appends.
-        (True, (36, 37), 2),
+        (True, (36, 37), False, 2, False),
+        # A manager hosting the draft layers reshards them across attention TP.
+        (True, (36, 37), True, 2, True),
+        (False, (36, 37), True, 0, False),
     ],
 )
 def test_from_kv_cache_manager_reports_unified_draft_layers(
-    monkeypatch, shares_draft_layers, draft_layer_ids, expected
+    monkeypatch: pytest.MonkeyPatch,
+    shares_draft_layers: bool,
+    draft_layer_ids: tuple,
+    hosts: bool,
+    expected: int,
+    reshards: bool,
 ) -> None:
     monkeypatch.setattr(rank_info_module, "build_page_table_from_manager", lambda _: None)
     manager = SimpleNamespace(
@@ -245,13 +253,20 @@ def test_from_kv_cache_manager_reports_unified_draft_layers(
         dtype=bindings.DataType.HALF,
         kv_factor=2,
         draft_layer_ids=draft_layer_ids,
+        hosts_unified_draft_layers=hosts,
     )
     manager.get_draft_kv_cache_view = lambda: manager if shares_draft_layers else None
 
     info = RankInfo.from_kv_cache_manager("ctx", manager, device_id=0)
 
     assert info.num_draft_layers == expected
-    assert RankInfo.from_bytes(info.to_bytes()).num_draft_layers == expected
+    restored = RankInfo.from_bytes(info.to_bytes())
+    assert restored.num_draft_layers == expected
+    assert info.draft_layers_reshard_across_tp is reshards
+    assert restored.draft_layers_reshard_across_tp is reshards
+    # Peers without draft layers that reshard keep the wire shape older releases read.
+    payload = msgpack.unpackb(info.to_bytes(), strict_map_key=False)
+    assert ("draft_layers_reshard_across_tp" in payload) is reshards
 
 
 def test_rank_info_from_bytes_defaults_missing_draft_layer_count() -> None:

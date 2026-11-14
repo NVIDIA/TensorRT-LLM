@@ -82,6 +82,10 @@ class RankInfo:
     # Layers a unified KV cache manager owns for the drafter (layer specs with
     # a DRAFT owner). They ride the target's pages, so both peers must agree.
     num_draft_layers: int = 0
+    # The draft layers come from a manager hosting them, whose share decision
+    # compares global KV heads; their views reshard like the target's at any
+    # attention TP.
+    draft_layers_reshard_across_tp: bool = False
 
     @property
     def tp_size_per_dp_group(self) -> int:
@@ -94,6 +98,9 @@ class RankInfo:
         if not self.context_first_ownership:
             # Preserve the legacy wire shape for endpoints outside this profile.
             data.pop("context_first_ownership")
+        if not self.draft_layers_reshard_across_tp:
+            # Only a hosting manager's peers need the field.
+            data.pop("draft_layers_reshard_across_tp")
         data["attention"] = self.attention.to_dict() if self.attention is not None else None
         data["aux_meta"] = self.aux_meta.to_dict() if self.aux_meta is not None else None
         data["page_table"] = self.page_table.to_dict() if self.page_table is not None else None
@@ -155,6 +162,8 @@ class RankInfo:
             page_table=build_page_table_from_manager(kvm),
             bounded_replay_on_generation=getattr(kvm, "bounded_replay_on_generation", False),
             num_draft_layers=len(kvm.draft_layer_ids) if shares_draft_layers else 0,
+            draft_layers_reshard_across_tp=shares_draft_layers
+            and getattr(kvm, "hosts_unified_draft_layers", False),
         )
 
     @classmethod
