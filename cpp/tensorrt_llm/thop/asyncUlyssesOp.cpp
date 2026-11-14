@@ -101,10 +101,13 @@ public:
     // Intra-layer hazard: V/Q/K must use distinct slots, otherwise (a) on the
     // default stream races (b) on the side stream — they touch the same
     // sendBuf and there is no stream sync between them until _join_async.
-    // Cross-layer hazard (Layer N+1 V reusing Layer N V's slot): safe because
-    // _join_async at end of Layer N waits the side stream's K barrier event,
-    // and SDPA on the default stream drains the recv read before Layer N+1
-    // starts. So kNumSlots = 3 is the tight minimum.
+    // Cross-layer hazard (Layer N+1 V reusing Layer N V's slot): _join_async
+    // orders local reads after incoming writes, but local stream order alone
+    // does not prevent a peer from overwriting a recv view. Peers' next pushes
+    // follow the same-group collective/wait ordering in UlyssesAttention::_output_a2a:
+    // every recv-view reader must finish before that collective, whose wait must
+    // precede the next _issue_async in eager and compiled execution.
+    // With this ordering, kNumSlots = 3 is the tight minimum.
     static constexpr int kNumSlots = 3;
 
     explicit AsyncUlyssesOp(c10::intrusive_ptr<c10d::ProcessGroup> pg)

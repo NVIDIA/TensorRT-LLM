@@ -234,6 +234,7 @@ l0_cpu:
   - unittest/_torch/kernels/parallel_hw_agnostic
   - unittest/_torch/visual_gen/multi_gpu/test_attn2d_attention.py
   - unittest/_torch/visual_gen/multi_gpu/test_token_sharded_tp_collectives.py
+  - unittest/_torch/visual_gen/multi_gpu/test_ulysses_async.py
   - unittest/_torch/visual_gen/multi_gpu/test_ulysses_replicated_kv.py
   - unittest/_torch/visual_gen/multi_gpu/test_visual_gen_mapping.py
   - unittest/_torch/visual_gen/multi_gpu/test_visual_gen_multinode.py
