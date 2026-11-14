@@ -3,10 +3,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+import netrc
 import os
 import sys
 import time
 import traceback
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field
 from typing import Optional, Union
 
@@ -16,6 +19,31 @@ from transformers import (AutoTokenizer, PreTrainedTokenizer,
                           PreTrainedTokenizerFast)
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
+
+
+def env_changes_request(api_url: str) -> bool:
+    """Return whether a proxy or a netrc entry from the environment applies.
+
+    With ``trust_env=True``, aiohttp looks up the netrc entry and the proxy
+    for every request, each in a worker thread. Under load, these lookups
+    delay each request before its headers go out, and the delay counts in
+    TTFT. So the benchmark trusts the environment only when the environment
+    changes the request.
+    """
+    url = urllib.parse.urlsplit(api_url)
+    host = url.hostname or ""
+    if (url.scheme in urllib.request.getproxies()
+            and not urllib.request.proxy_bypass(host)):
+        return True
+    # The netrc file that aiohttp reads.
+    path = os.environ.get("NETRC")
+    if path is None:
+        name = "_netrc" if os.name == "nt" else ".netrc"
+        path = os.path.join(os.path.expanduser("~"), name)
+    try:
+        return netrc.netrc(path).authenticators(host) is not None
+    except (OSError, netrc.NetrcParseError):
+        return False
 
 
 async def _iter_sse_data(response_content):
@@ -83,7 +111,7 @@ async def async_request_trt_llm(
         )
 
     request_session = aiohttp.ClientSession(
-        trust_env=True,
+        trust_env=env_changes_request(api_url),
         timeout=AIOHTTP_TIMEOUT,
         connector=aiohttp.TCPConnector(
             limit=0, limit_per_host=0)) if session is None else session
@@ -175,7 +203,7 @@ async def async_request_openai_completions(
         )
 
     request_session = aiohttp.ClientSession(
-        trust_env=True,
+        trust_env=env_changes_request(api_url),
         timeout=AIOHTTP_TIMEOUT,
         connector=aiohttp.TCPConnector(
             limit=0, limit_per_host=0)) if session is None else session
@@ -298,7 +326,7 @@ async def async_request_openai_chat_completions(
             "OpenAI Chat Completions API URL must end with 'chat/completions'.")
 
     request_session = aiohttp.ClientSession(
-        trust_env=True,
+        trust_env=env_changes_request(api_url),
         timeout=AIOHTTP_TIMEOUT,
         connector=aiohttp.TCPConnector(
             limit=0, limit_per_host=0)) if session is None else session
