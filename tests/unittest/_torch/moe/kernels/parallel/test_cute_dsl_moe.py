@@ -1196,7 +1196,60 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
     tile_size: int,
     activation_type: ActivationType,
 ) -> None:
+    _check_nvfp4_gather_grouped_gemm_act_fusion(
+        num_tokens, top_k, ep_size, tile_size, activation_type
+    )
+
+
+@pytest.mark.skipif(
+    get_sm_version() not in (100, 103),
+    reason="This test is only supported on SM 100 and SM 103 GPUs",
+)
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="cutlass-dsl is not available")
+@pytest.mark.parametrize(
+    "activation_type",
+    [ActivationType.Swiglu, ActivationType.Relu2, ActivationType.SiTu],
+    ids=["swiglu", "relu2", "situ"],
+)
+@pytest.mark.parametrize("raster_along_m", [True, False], ids=["raster_m", "raster_n"])
+@pytest.mark.parametrize("tile_size", [128, 256])
+@pytest.mark.parametrize("num_tokens", [1024, 8192])
+def test_nvfp4_gather_grouped_gemm_act_fusion_blackwell_mma_n256(
+    num_tokens: int,
+    tile_size: int,
+    raster_along_m: bool,
+    activation_type: ActivationType,
+) -> None:
+    """Run the gather kernel with a 256-wide MMA N tile.
+
+    Without the autotuner the op uses a 128-wide N tile. A 256-wide N tile
+    overlaps the two TMEM accumulator buffers (``overlapping_accum``), so
+    every other tile walks its epilogue subtiles in reverse and releases the
+    accumulator early. These shapes give each CTA many tiles, so reversed
+    tiles run.
+    """
+    _check_nvfp4_gather_grouped_gemm_act_fusion(
+        num_tokens,
+        top_k=8,
+        ep_size=8,
+        tile_size=tile_size,
+        activation_type=activation_type,
+        tactic=((tile_size, 256), (tile_size // 128, 1), raster_along_m),
+    )
+
+
+def _check_nvfp4_gather_grouped_gemm_act_fusion(
+    num_tokens: int,
+    top_k: int,
+    ep_size: int,
+    tile_size: int,
+    activation_type: ActivationType,
+    tactic=None,
+) -> None:
     """Test gather-based grouped GEMM with fused activation.
+
+    ``tactic`` runs the runner with that (mma_tiler_mn, cluster_shape_mn,
+    raster_along_m) instead of the op's default tactic.
 
     This test validates the gather kernel which:
     1. Uses LDGSTS for A/SFA loading with permuted_idx_to_expanded_idx
@@ -1340,7 +1393,7 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
     c_ref, c_sf_ref = torch.ops.trtllm.fp4_quantize(c_ref, 1 / global_sf, sf_vec_size, False)
 
     # Call gather kernel (single-B)
-    c, c_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
+    gemm_inputs = [
         a,
         b_kernel,
         a_sf_unswizzled,
@@ -1351,6 +1404,8 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
         permuted_idx_to_expanded_idx,
         num_non_exiting_tiles,
         torch.tensor([1 / global_sf], dtype=torch.float32, device="cuda"),
+    ]
+    gemm_kwargs = dict(
         num_experts=num_experts,
         top_k=top_k,
         num_local_experts=num_local_experts,
@@ -1362,6 +1417,17 @@ def test_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
         situ_beta=SITU_BETA if is_situ else None,
         situ_linear_beta=SITU_LINEAR_BETA if is_situ else None,
     )
+    if tactic is None:
+        c, c_sf = torch.ops.trtllm.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell(
+            *gemm_inputs, **gemm_kwargs
+        )
+    else:
+        from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
+            Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner,
+        )
+
+        runner = Sm100BlockScaledContiguousGatherGroupedGemmActFusionRunner(**gemm_kwargs)
+        c, c_sf = runner.forward(gemm_inputs, tactic=tactic)
 
     # Verify output (only compare valid tokens, skip padding tokens where permuted_idx_to_expanded_idx == -1)
     # Create mask for valid tokens
