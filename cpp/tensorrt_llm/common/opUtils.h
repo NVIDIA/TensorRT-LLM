@@ -156,8 +156,9 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group);
 
 #endif // ENABLE_MULTI_DEVICE
 
-//! To save GPU memory, all the plugins share the same cublas and cublasLt handle globally.
-//! Get cublas and cublasLt handle for current cuda context
+//! Get the cuBLAS / cuBLASLt handle of the calling thread in the current CUDA context. When the last copy of the
+//! returned std::shared_ptr is released, the handle is kept for the next thread that asks in the same CUDA context
+//! instead of being destroyed; a cuBLAS handle is reset to the default stream and workspace before it is reused.
 std::shared_ptr<cublasHandle_t> getCublasHandle();
 std::shared_ptr<cublasLtHandle_t> getCublasLtHandle();
 

@@ -31,6 +31,8 @@
 #include <functional>
 #include <mutex>
 #include <thread>
+#include <tuple>
+#include <vector>
 
 TRTLLM_NAMESPACE_BEGIN
 #if ENABLE_MULTI_DEVICE
@@ -255,96 +257,109 @@ inline CUcontext getCurrentCudaCtx()
     return ctx;
 }
 
-// Helper to create per-cuda-context and per-thread singleton managed by std::shared_ptr.
-// Unlike conventional singletons, singleton created with this will be released
-// when not needed, instead of on process exit.
-// Objects of this class shall always be declared static / global, and shall never own CUDA
-// resources.
+//! Pool of cuBLAS / cuBLASLt handles grouped by CUDA context, with the same rule as PyTorch's DeviceThreadHandlePool:
+//! - A thread gets the handle it already holds in the current CUDA context; otherwise an idle handle of that context;
+//!   otherwise a new one.
+//! - When a thread lets go of its handle (the last std::shared_ptr is released, usually when the thread exits), the
+//!   handle is not destroyed but goes back to the idle list of its CUDA context.
+//! So a thread that starts late, when the PyTorch caching allocator may hold nearly all device memory, takes over a
+//! handle instead of calling cublasCreate, which allocates its default workspace directly from the driver.
+//!
+//! Lifetime:
+//! - Idle handles are never destroyed, not even at process exit: CUDA may already be unloaded by then, and
+//!   cublasDestroy, which synchronizes the device, can crash or hang.
+//! - Per CUDA context, their number never exceeds the peak number of threads that held a handle of that context at
+//!   the same time.
+//! - A context that ever had a handle must stay alive until process exit: otherwise its idle handles would dangle,
+//!   and a context created later at the same address would be given them.
+//! - The pool is a leaked singleton (hence the deleted destructor): a handle may still be given back after static
+//!   destruction has started (by a static object or by a thread still running at exit), and giveBack() needs a live
+//!   pool.
 template <typename T>
-class PerCudaCtxPerThreadSingletonCreator
+class PerCudaCtxHandlePool
 {
 public:
-    using CreatorFunc = std::function<std::unique_ptr<T>()>;
-    using DeleterFunc = std::function<void(T*)>;
+    using CreateFunc = std::function<std::unique_ptr<T>()>;
+    using ResetFunc = std::function<void(T)>;
 
-    // creator returning std::unique_ptr is by design.
-    // It forces separation of memory for T and memory for control blocks.
-    // So when T is released, but we still have observer weak_ptr in mObservers, the T mem block can be released.
-    // creator itself must not own CUDA resources. Only the object it creates can.
-    PerCudaCtxPerThreadSingletonCreator(CreatorFunc creator, DeleterFunc deleter)
-        : mCreator{std::move(creator)}
-        , mDeleter{std::move(deleter)}
-        , mObservers{std::make_unique<CacheType>()}
+    //! \param create Creates a handle in the current CUDA context.
+    //! \param resetForNewThread Clears the state that the previous thread may have left on an idle handle.
+    PerCudaCtxHandlePool(CreateFunc create, ResetFunc resetForNewThread)
+        : mCreate{std::move(create)}
+        , mResetForNewThread{std::move(resetForNewThread)}
     {
     }
 
-    ~PerCudaCtxPerThreadSingletonCreator()
-    {
-        std::lock_guard<std::mutex> lk{mMutex};
-        mObservers.reset();
-    }
+    ~PerCudaCtxHandlePool() = delete;
 
-    std::shared_ptr<T> operator()()
+    std::shared_ptr<T> acquire()
     {
-        std::lock_guard<std::mutex> lk{mMutex};
-        CUcontext ctx{getCurrentCudaCtx()};
-        std::thread::id thread = std::this_thread::get_id();
-        auto const key = std::make_tuple(ctx, thread);
-        std::shared_ptr<T> result = (*mObservers)[key].lock();
-        if (result == nullptr)
+        CUcontext const ctx = getCurrentCudaCtx();
+        HolderKey const key{ctx, std::this_thread::get_id()};
+        std::unique_ptr<T> handle;
         {
-            TLLM_LOG_TRACE("creating singleton instance for CUDA context %lu and thread %lu", ctx, thread);
-            // Create the resource and register with an observer.
-            result = std::shared_ptr<T>{mCreator().release(),
-                [this, key](T* obj)
-                {
-                    if (obj == nullptr)
-                    {
-                        return;
-                    }
-                    mDeleter(obj);
-
-                    if (mObservers == nullptr)
-                    {
-                        return;
-                    }
-
-                    // Clears observer to avoid growth of mObservers, in case users creates/destroys cuda contexts
-                    // frequently.
-                    std::shared_ptr<T> observedObjHolder; // Delay destroy to avoid dead lock.
-                    std::lock_guard<std::mutex> lk{mMutex};
-                    // Must check observer again because another thread may created new instance for this ctx and this
-                    // thread just before we lock mMutex. We can't infer that the observer is stale from the fact that
-                    // obj is destroyed, because shared_ptr ref-count checking and observer removing are not in one
-                    // atomic operation, and the observer may be changed to observe another instance.
-                    auto it = mObservers->find(key);
-                    if (it == mObservers->end())
-                    {
-                        return;
-                    }
-                    observedObjHolder = it->second.lock();
-                    if (observedObjHolder == nullptr)
-                    {
-                        mObservers->erase(it);
-                    }
-                }};
-            (*mObservers)[key] = result;
+            std::lock_guard<std::mutex> lk{mMutex};
+            if (auto held = mHeldHandles[key].lock())
+            {
+                return held;
+            }
+            handle = takeIdleHandle(ctx);
+        }
+        // Outside mMutex: resetting or creating a handle calls into CUDA.
+        if (handle)
+        {
+            mResetForNewThread(*handle);
         }
         else
         {
-            TLLM_LOG_TRACE("singleton instance for CUDA context %d and thread %d is cached", ctx, thread);
+            handle = mCreate();
         }
+        std::shared_ptr<T> result{handle.release(), [this, key](T* released) { giveBack(key, released); }};
+        std::lock_guard<std::mutex> lk{mMutex};
+        mHeldHandles[key] = result;
         return result;
     }
 
 private:
-    CreatorFunc mCreator;
-    DeleterFunc mDeleter;
-    mutable std::mutex mMutex;
-    // CUDA resources are per-context and per-thread.
-    using CacheKey = std::tuple<CUcontext, std::thread::id>;
-    using CacheType = std::unordered_map<CacheKey, std::weak_ptr<T>, common::op::OpCustomHash<CacheKey>>;
-    std::unique_ptr<CacheType> mObservers;
+    using HolderKey = std::tuple<CUcontext, std::thread::id>;
+
+    // Requires mMutex.
+    std::unique_ptr<T> takeIdleHandle(CUcontext ctx)
+    {
+        auto& idleHandles = mIdleHandles[ctx];
+        if (idleHandles.empty())
+        {
+            return nullptr;
+        }
+        auto handle = std::move(idleHandles.back());
+        idleHandles.pop_back();
+        return handle;
+    }
+
+    // Deleter of the std::shared_ptr returned by acquire().
+    void giveBack(HolderKey const& key, T* handle)
+    {
+        std::lock_guard<std::mutex> lk{mMutex};
+        mIdleHandles[std::get<CUcontext>(key)].emplace_back(handle);
+        // Forget the holder so that mHeldHandles does not grow with exited threads. Keep the entry if it already
+        // observes a newer handle: when the last owner was another thread, the holder may have acquired again before
+        // this call took mMutex. expired() rather than lock(): a std::shared_ptr taken here could become the last
+        // owner and re-enter giveBack() while mMutex is held.
+        auto const it = mHeldHandles.find(key);
+        if (it != mHeldHandles.end() && it->second.expired())
+        {
+            mHeldHandles.erase(it);
+        }
+    }
+
+    CreateFunc mCreate;
+    ResetFunc mResetForNewThread;
+    // Guards only the two tables below; no CUDA call is made while holding it.
+    std::mutex mMutex;
+    std::unordered_map<HolderKey, std::weak_ptr<T>, common::op::OpCustomHash<HolderKey>> mHeldHandles;
+    // Each std::unique_ptr owns only the box that holds a handle value: freeing a box leaks the handle, it never
+    // destroys it.
+    std::unordered_map<CUcontext, std::vector<std::unique_ptr<T>>> mIdleHandles;
 };
 
 // Structure to hold memory information
@@ -391,7 +406,7 @@ void throwCublasErrorWithMemInfo(char const* operation, CUcontext ctx, cublasSta
 
 std::shared_ptr<cublasHandle_t> getCublasHandle()
 {
-    static PerCudaCtxPerThreadSingletonCreator<cublasHandle_t> creator(
+    static auto* const pool = new PerCudaCtxHandlePool<cublasHandle_t>(
         []() -> auto
         {
             CUcontext ctx = getCurrentCudaCtx();
@@ -407,22 +422,18 @@ std::shared_ptr<cublasHandle_t> getCublasHandle()
 
             return handle;
         },
-        [](cublasHandle_t* handle)
+        [](cublasHandle_t handle)
         {
-            auto status = cublasDestroy(*handle);
-            if (status != CUBLAS_STATUS_SUCCESS)
-            {
-                TLLM_LOG_WARNING("Failed to destroy cublas handle. Status: %d", status);
-            }
-            delete handle;
-            handle = nullptr;
+            // The previous thread may have left its stream and workspace on the handle (CublasMMWrapper sets both),
+            // and both may be gone with it. cublasSetStream also resets the workspace to the default one.
+            TLLM_CUDA_CHECK(cublasSetStream(handle, nullptr));
         });
-    return creator();
+    return pool->acquire();
 }
 
 std::shared_ptr<cublasLtHandle_t> getCublasLtHandle()
 {
-    static PerCudaCtxPerThreadSingletonCreator<cublasLtHandle_t> creator(
+    static auto* const pool = new PerCudaCtxHandlePool<cublasLtHandle_t>(
         []() -> auto
         {
             CUcontext ctx = getCurrentCudaCtx();
@@ -438,17 +449,9 @@ std::shared_ptr<cublasLtHandle_t> getCublasLtHandle()
 
             return handle;
         },
-        [](cublasLtHandle_t* handle)
-        {
-            auto status = cublasLtDestroy(*handle);
-            if (status != CUBLAS_STATUS_SUCCESS)
-            {
-                TLLM_LOG_WARNING("Failed to destroy cublasLt handle. Status: %d", status);
-            }
-            delete handle;
-            handle = nullptr;
-        });
-    return creator();
+        // cuBLASLt takes the stream and workspace with each call, so a handle keeps no state of the previous thread.
+        [](cublasLtHandle_t) {});
+    return pool->acquire();
 }
 
 TRTLLM_NAMESPACE_END
