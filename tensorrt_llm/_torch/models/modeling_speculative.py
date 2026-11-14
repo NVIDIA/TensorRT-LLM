@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import LlamaConfig, PretrainedConfig
 
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -29,7 +30,9 @@ from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import moe_load_balancer_set_repeated_for_next_layer
+from ..pyexecutor.dwdp import get_global_dwdp_manager
 from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
+from ..pyexecutor.runtime_hooks import RuntimeHooks
 from ..speculative import (SpecMetadata, get_spec_worker,
                            should_use_separate_draft_kv_cache)
 from ..speculative.interface import SpeculativeDecodingMode
@@ -84,7 +87,7 @@ def _replacement_mtp_model_config(model_config: ModelConfig) -> ModelConfig:
             quant_path, checkpoint_dir, model_config.moe_backend)
 
     mapper = AutoCheckpointMapper.get(
-        "HF", model_config.pretrained_config.architectures[0])
+        CheckpointFormat.HF, model_config.pretrained_config.architectures[0])
     start_layer_idx = model_config.pretrained_config.num_hidden_layers
     if layer_configs is not None:
         normalized = {}
@@ -271,31 +274,6 @@ def dspark_markov_chain(
             prev = next_token_fn(step_logits).long()
         sampled.append(prev)
     return torch.stack(sampled, dim=1), torch.cat(corrected, dim=1)
-
-
-def dspark_markov_chain_logits(base_logits: torch.Tensor,
-                               first_prev_tokens: torch.Tensor,
-                               markov_w1: torch.Tensor,
-                               markov_w2: torch.Tensor,
-                               argmax_fn=None) -> torch.Tensor:
-    """Raw-tensor entry to :func:`dspark_markov_chain`, corrected logits only.
-
-    For drafters that keep the Markov head as plain checkpoint tensors rather
-    than a :class:`VanillaMarkov` module (the DFlash path). ``markov_w2`` may
-    already be sliced down to this rank's TP vocab shard, in which case
-    ``argmax_fn`` must map a shard-local row back to a full-vocab token id.
-    """
-
-    def _step_bias(prev_tokens, step_hidden):
-        del step_hidden
-        return dspark_markov_step_bias(prev_tokens, markov_w1, markov_w2)
-
-    _, corrected = dspark_markov_chain(base_logits,
-                                       first_prev_tokens,
-                                       _step_bias,
-                                       next_token_fn=argmax_fn,
-                                       cast_bias_to_logits=True)
-    return corrected
 
 
 class VanillaMarkov(nn.Module):
@@ -578,6 +556,13 @@ class DSparkConfidenceHead(nn.Module):
     def load_weights(self, weights: list) -> None:
         """Load every confidence-head checkpoint parameter strictly."""
         (module_weights, ) = weights
+        self._validate_checkpoint_weights(module_weights)
+        for name, param in self.named_parameters():
+            param.data.copy_(module_weights[name][:])
+
+    def _validate_checkpoint_weights(
+            self, module_weights: dict[str, torch.Tensor]) -> None:
+        """Validate a head namespace before generic embedded parameter loading."""
         expected = dict(self.named_parameters())
         unexpected = [key for key in module_weights if key not in expected]
         missing = [key for key in expected if key not in module_weights]
@@ -592,7 +577,11 @@ class DSparkConfidenceHead(nn.Module):
                 f"DSpark confidence head checkpoint is missing key(s) {sorted(missing)}"
             )
         for name, param in expected.items():
-            param.data.copy_(module_weights[name][:])
+            actual_shape = tuple(module_weights[name].shape)
+            if actual_shape != tuple(param.shape):
+                raise ValueError(
+                    f"DSpark confidence head checkpoint {name} has shape {actual_shape}; "
+                    f"expected {tuple(param.shape)}")
 
 
 class Eagle3Attention(Attention):
@@ -785,7 +774,10 @@ class Eagle3DecoderLayer(DecoderLayer):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         spec_metadata: SpecMetadata,
+        pick_rows: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """With ``pick_rows`` the attention runs on every input row and the
+        rest of the layer on ``pick_rows`` only."""
         residual = hidden_states
 
         hidden_states = self.hidden_norm(hidden_states)
@@ -798,6 +790,9 @@ class Eagle3DecoderLayer(DecoderLayer):
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
         )
+        if pick_rows is not None:
+            hidden_states = hidden_states[pick_rows]
+            residual = residual[pick_rows]
 
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
@@ -898,6 +893,10 @@ class Eagle3DraftModel(DecoderModel):
                 use_mla=use_mla,
                 aux_stream=self.aux_stream,
             )
+        # forward takes ``pick_rows`` (see speculative.interface.
+        # draft_layer_picks_rows) with one decoder layer: a later layer's
+        # attention would need every row.
+        self.supports_pick_rows = self.num_layers == 1
 
         self.norm = RMSNorm(
             hidden_size=config.hidden_size,
@@ -954,7 +953,16 @@ class Eagle3DraftModel(DecoderModel):
         spec_metadata: Optional[SpecMetadata] = None,
         hidden_states: Optional[torch.Tensor] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
+        pick_rows: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """``pick_rows`` (single decoder layer only, see
+        ``supports_pick_rows``): the layer's attention runs on every input row,
+        everything after it on ``pick_rows`` only, so both outputs have
+        ``len(pick_rows)`` rows."""
+        # The worker passes pick_rows only when supports_pick_rows: a second
+        # decoder layer's attention would need every row.
+        assert pick_rows is None or self.supports_pick_rows, (
+            "pick_rows needs a single draft decoder layer")
         # When ``all_rank_num_tokens`` is supplied the caller wants this draft
         # forward to run with a different attention-DP token distribution
         # (e.g. the worker's per-step value); restore the original on exit so
@@ -1002,6 +1010,7 @@ class Eagle3DraftModel(DecoderModel):
                     hidden_states=hidden_states,
                     attn_metadata=attn_metadata,
                     spec_metadata=spec_metadata,
+                    pick_rows=pick_rows,
                 )
 
             hidden_states, hidden_states_to_save = self.norm(
@@ -1399,7 +1408,16 @@ class MTPForCausalLM(nn.Module):
         model_type = model_config.pretrained_config.model_type
         mtp_layer = None
         lm_head_quant_config = None
+        # Whether the MTP layer's forward takes the draft loop's deferred
+        # ``kv_lens_increment``.
+        folds_kv_lens_increment = False
+        # A target model that owns its MTP layer class (a Modeling V2
+        # target, for example) names it, and the drafter builds that class
+        # instead of the built-in one registered for the model type.
+        owned_mtp_layer = getattr(model, "mtp_layer_cls", None)
         match model_type:
+            case _ if owned_mtp_layer is not None:
+                mtp_layer = owned_mtp_layer
             case "glm4_moe":
                 from .modeling_glm import Glm4MTP
                 mtp_layer = Glm4MTP
@@ -1415,6 +1433,7 @@ class MTPForCausalLM(nn.Module):
             case "qwen3_next" | "qwen3_5_text" | "qwen3_5_moe_text":
                 from .modeling_qwen3_next import Qwen3NextMTP
                 mtp_layer = Qwen3NextMTP
+                folds_kv_lens_increment = True
             case "qwen4_exp_text":
                 from .modeling_qwen4_exp import Qwen4ExpMTP
                 mtp_layer = Qwen4ExpMTP
@@ -1463,6 +1482,11 @@ class MTPForCausalLM(nn.Module):
                       model.aux_stream_dict)
             for layer_idx in range(mtp_num_layers)
         ])
+        self.folds_kv_lens_increment = folds_kv_lens_increment
+        dwdp_manager = get_global_dwdp_manager()
+        if dwdp_manager is not None and mtp_repeat_count > 1:
+            for layer_idx in range(mtp_num_layers):
+                dwdp_manager.add_repeated_layer(layer_idx + start_layer_idx)
         self.owns_lm_head = lm_head_quant_config is not None
         if self.owns_lm_head:
             if getattr(model_config.pretrained_config, "tie_word_embeddings",
@@ -1595,14 +1619,24 @@ def external_drafter_config_kwargs(model_config, spec_config) -> dict:
         trust_remote_code=True,
         attn_backend=model_config.attn_backend,
         moe_backend=_get_requested_draft_moe_backend(model_config, spec_config),
-        mapping=model_config.mapping,
+        # The drafter runs on every row; keep it TP where the TP group shares
+        # requests (helix + attention DP at tp_size 1).
+        mapping=model_config.mapping.mapping_for_full_rows(),
         spec_config=None,  # Avoid recursive spec-dec
         max_num_tokens=model_config.max_num_tokens,
         moe_max_num_tokens=model_config.moe_max_num_tokens,
+        use_cute_dsl_blockscaling_mm=model_config.use_cute_dsl_blockscaling_mm,
         # The user's value, NOT the engine's: py_executor_creator raises it past
         # this and never writes back, so drafters read _runtime_position_ceiling.
         # None sizes position tables from max_position_embeddings: 1M for K3.
         max_seq_len=model_config.max_seq_len,
+        # The MoE combine wire format is an engine setting (moe_config), not a
+        # checkpoint property: a drafter's expert-parallel MoE communication uses
+        # the same format as the target's.
+        use_low_precision_moe_combine=model_config.
+        use_low_precision_moe_combine,
+        # A MEGAMOE_CUTEDSL drafter shares the target's bucket workspaces, so its kernels must match.
+        megamoe_fuse_shared_expert=model_config.megamoe_fuse_shared_expert,
     )
     # Only the embedded DSpark draft shares the target's EPLB namespace (its
     # stages are target decoder blocks registered into the target's balancer).
@@ -1724,8 +1758,32 @@ def get_draft_model(model_config, draft_config, lm_head, model):
     return builder(model_config, draft_config, lm_head, model)
 
 
+# The step-loop hooks of a model with the one-engine speculative fast paths.
+_FAST_PATH_RUNTIME_HOOKS = RuntimeHooks(loop_on_execution_stream=True)
+
+
 class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                                   Generic[TModel, TConfig]):
+
+    # Set per instance from supports_spec_decode_fast_paths in __init__.
+    spec_decode_fast_paths: bool = False
+
+    @property
+    def runtime_hooks(self) -> Optional[RuntimeHooks]:
+        """The fast paths run the overlap loop on the execution stream."""
+        return (_FAST_PATH_RUNTIME_HOOKS
+                if self.spec_decode_fast_paths else None)
+
+    @classmethod
+    def supports_spec_decode_fast_paths(cls, model_config: ModelConfig) -> bool:
+        """Whether one-engine speculative decoding of this model takes the
+        fast paths (``spec_decode_fast_paths``): greedy and temperature-only
+        tokens of vocabulary-sharded logits through the TP key exchange, the
+        temperature-only CUDA graph variant, the overlap loop on the execution
+        stream, the hoisted position ids, the MTP-Eagle draft loop's step-0
+        epilogue and the recorded steady decode-step prepare. A model enables
+        them where they are validated."""
+        return False
 
     def __init__(self,
                  model: TModel,
@@ -1749,7 +1807,18 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         self.use_separate_draft_kv_cache = False
         spec_config = getattr(model_config, 'spec_config', None)
         self.spec_config = spec_config
+        self.spec_decode_fast_paths = False
+        key_exchange = None
         if spec_config and spec_config.spec_dec_mode.use_one_engine():
+            self.spec_decode_fast_paths = self.supports_spec_decode_fast_paths(
+                model_config)
+            if self.spec_decode_fast_paths:
+                # Greedy tokens of vocabulary-sharded draft / target logits
+                # come from one peer-memory key exchange per step (TP groups
+                # only; None elsewhere).
+                from ..distributed import ll_exchange
+                key_exchange = ll_exchange.create_tp_key_exchange(
+                    model_config.mapping, model_config.max_num_tokens)
             # Only create draft_model for modes MTP, Eagle3 (not SA)
             if not spec_config.spec_dec_mode.is_sa():
                 requested_draft_moe_backend = _get_requested_draft_moe_backend(
@@ -1760,7 +1829,8 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                             MistralConfigLoader
                         self.draft_config = MistralConfigLoader().load(
                             spec_config.speculative_model,
-                            mapping=model_config.mapping,
+                            mapping=model_config.mapping.mapping_for_full_rows(
+                            ),
                             moe_backend=requested_draft_moe_backend,
                             moe_max_num_tokens=model_config.moe_max_num_tokens,
                             max_num_tokens=model_config.max_num_tokens,
@@ -1781,7 +1851,8 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                             trust_remote_code=True,
                             attn_backend=model_config.attn_backend,
                             moe_backend=requested_draft_moe_backend,
-                            mapping=model_config.mapping,
+                            mapping=model_config.mapping.mapping_for_full_rows(
+                            ),
                             spec_config=model_config.spec_config,
                             max_num_tokens=model_config.max_num_tokens,
                             moe_max_num_tokens=model_config.moe_max_num_tokens)
@@ -1799,7 +1870,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                         trust_remote_code=True,
                         attn_backend=model_config.attn_backend,
                         moe_backend=requested_draft_moe_backend,
-                        mapping=model_config.mapping,
+                        mapping=model_config.mapping.mapping_for_full_rows(),
                         spec_config=None,
                         max_num_tokens=model_config.max_num_tokens,
                         moe_max_num_tokens=model_config.moe_max_num_tokens)
@@ -1841,13 +1912,16 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             self.spec_worker = get_spec_worker(
                 model_config.spec_config,
                 model_config,
-                model_config.mapping,
-                use_separate_draft_kv_cache=self.use_separate_draft_kv_cache)
+                model_config.mapping.mapping_for_full_rows(),
+                use_separate_draft_kv_cache=self.use_separate_draft_kv_cache,
+                key_exchange=key_exchange,
+                spec_decode_fast_paths=self.spec_decode_fast_paths)
             if self.spec_worker is not None:
                 # Cache the static draft->target vocab map now that the draft
                 # model is loaded, so workers read self._d2t instead of probing
                 # draft_model.model.d2t on every forward.
                 self.spec_worker.set_draft_model(self.draft_model)
+                self.spec_worker.set_target_model(self)
                 self.epilogue.append(self.spec_worker)
         self.layer_idx = -1
 
@@ -1855,6 +1929,62 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         if (self.draft_model is not None
                 and getattr(self.draft_model, "shares_target_kv_cache", False)):
             self.draft_model.load_weights_from_target_model(self)
+
+    def cache_derived_state(self) -> None:
+        super().cache_derived_state()
+        spec_config = self.spec_config
+        if (self.spec_worker is not None and spec_config is not None
+                and spec_config.spec_dec_mode.is_mtp_eagle_one_model()
+                and spec_config.draft_lm_head_dtype == "mxfp8"):
+            from ..modules.mxfp8_draft_head import build_mxfp8_draft_head
+
+            # Rebuilt from the current BF16 weights (idempotent on reloads),
+            # from the LM head the draft passes project with.
+            draft_lm_head = getattr(self.draft_model, "lm_head", None)
+            self.spec_worker.draft_head = None
+            self.spec_worker.draft_head = build_mxfp8_draft_head(
+                self.lm_head if draft_lm_head is None else draft_lm_head,
+                self.model_config.mapping, self.spec_worker.key_exchange)
+
+    def post_load_weights(self) -> None:
+        super().post_load_weights()
+        if self.spec_worker is not None:
+            # Collective over the TP group; every rank loads in step.
+            self.spec_worker.prepare_vocab_sharded_sampling(self.lm_head)
+
+    @property
+    def samples_from_vocab_shards(self) -> bool:
+        return (self.spec_worker is not None
+                and self.spec_worker.samples_from_vocab_shards)
+
+    def _verify_logits(
+            self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata,
+            spec_metadata: SpecMetadata) -> Tuple[torch.Tensor, bool]:
+        """The target logits the worker verifies, and whether they are this rank's vocabulary
+        columns, which the worker samples without the head's gather."""
+        rows = hidden_states[spec_metadata.gather_ids]
+        worker = self.spec_worker
+        vocab_sharded = worker.takes_vocab_sharded_target_logits(
+            attn_metadata, spec_metadata)
+        if not vocab_sharded and not worker.reads_lm_head_dtype_logits:
+            # The target logits, in the layout the worker's acceptance reads.
+            return worker.target_logits(
+                rows,
+                self.lm_head,
+                self.logits_processor,
+                attn_metadata,
+                spec_metadata,
+                self.draft_model,
+            ), False
+        logits = self.logits_processor.forward(
+            rows,
+            worker.vocab_sharded_head(self.lm_head, spec_metadata)
+            if vocab_sharded else self.lm_head,
+            attn_metadata,
+            True,
+            keep_lm_head_dtype=worker.reads_lm_head_dtype_logits,
+        )
+        return logits, vocab_sharded
 
     def forward(
         self,
@@ -1867,6 +1997,16 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         resource_manager=None,
         **kwargs,
     ) -> torch.Tensor:
+        # A padded generation batch's (mrope) positions are a strided view; one
+        # copy here instead of one per attention layer that needs them dense.
+        # Not with context requests: a breakable prefill CUDA graph replays its
+        # body against the capture-time position tensor.
+        hoist_positions = (self.spec_decode_fast_paths
+                           and self.spec_worker is not None
+                           and position_ids is not None
+                           and attn_metadata.num_contexts == 0)
+        if hoist_positions:
+            position_ids = position_ids.contiguous()
         hidden_states = self.model(
             input_ids=input_ids,
             attn_metadata=attn_metadata,
@@ -1894,15 +2034,12 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             hidden_states = hidden_states[:attn_metadata.num_tokens]
 
         if self.spec_worker is not None:
-            # The target logits, in the layout the worker's acceptance reads.
-            logits = self.spec_worker.target_logits(
-                hidden_states[spec_metadata.gather_ids],
-                self.lm_head,
-                self.logits_processor,
-                attn_metadata,
-                spec_metadata,
-                self.draft_model,
-            )
+            logits, vocab_sharded = self._verify_logits(hidden_states,
+                                                        attn_metadata,
+                                                        spec_metadata)
+            worker_kwargs = {
+                "vocab_sharded_logits": True
+            } if vocab_sharded else {}
 
             # VLM wrappers (e.g. Qwen3VLModelBase) replace input_ids with
             # fused inputs_embeds; fall back to the pre-fusion token IDs
@@ -1918,6 +2055,9 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 if position_ids is not None:
                     spec_position_ids = _slice_spec_position_ids(
                         position_ids, attn_metadata.num_tokens)
+                    if hoist_positions:
+                        # The padded batch's slice is strided again.
+                        spec_position_ids = spec_position_ids.contiguous()
 
             # get accepted tokens and next draft tokens
             return self.spec_worker(input_ids=spec_input_ids,
@@ -1927,7 +2067,8 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                                     attn_metadata=attn_metadata,
                                     spec_metadata=spec_metadata,
                                     draft_model=self.draft_model,
-                                    resource_manager=resource_manager)
+                                    resource_manager=resource_manager,
+                                    **worker_kwargs)
         else:
             logits = self.logits_processor.forward(
                 hidden_states,

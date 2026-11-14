@@ -15,6 +15,6 @@
   },
   "runtime_floors": {
     "protobuf": "6.30.2",
-    "grpcio": "1.67.1"
+    "grpcio": "1.73.1"
   }
 }

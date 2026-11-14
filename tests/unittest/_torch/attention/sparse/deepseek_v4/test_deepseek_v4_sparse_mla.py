@@ -48,6 +48,12 @@ from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig, KvCach
 from tensorrt_llm.mapping import Mapping
 
 
+@pytest.fixture(autouse=True)
+def _strict_precompile_workers(monkeypatch):
+    """A PrimTS precompile worker failure is an error here, not a logged fallback."""
+    monkeypatch.setenv("TLLM_PRIMTS_WARM_STRICT", "1")
+
+
 @dataclass(kw_only=True, frozen=True)
 class Scenario:
     dtype: torch.dtype = torch.bfloat16
@@ -1252,6 +1258,7 @@ def test_deepseek_v4_sparse_mla(context_lengths: List[int], generation_seq_len_q
             k_pe = inp["gen_k_pe_list"][step]
             latent_cache = torch.cat([compressed_kv, k_pe], dim=-1)
 
+            uniform_q = uniform_q_pe = uniform_latent = None
             if uniform_metadata is not None:
                 uniform_q = fused_q.clone()
                 uniform_q_pe = q_pe.clone()
@@ -1780,4 +1787,4 @@ def test_deepseek_v4_sparse_mla_mixed_batch(context_lengths: List[int]):
 
 
 if __name__ == "__main__":
-    test_deepseek_v4_sparse_mla(context_lengths=[4399], num_generation_steps=2)
+    test_deepseek_v4_sparse_mla(context_lengths=[4399], generation_seq_len_q=1)

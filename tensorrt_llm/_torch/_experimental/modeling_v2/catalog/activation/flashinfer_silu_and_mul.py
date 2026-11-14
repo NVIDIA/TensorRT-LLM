@@ -21,9 +21,8 @@ class FlashinferSiluAndMul(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
-    # deepseek-r1 is the only shipped caller. It reaches this op from two
-    # widths -- the routed/shared expert intermediate and the dense layers'
-    # -- at decode and prefill token counts.
+    # Exercise decode and prefill across narrow and wide intermediates.
+    # Model-specific shapes live in the test driver.
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="decode-shaped, 2 x moe_intermediate (2048)",
@@ -36,10 +35,6 @@ class FlashinferSiluAndMul(OpWrapper):
         Cell(
             why="the dense layers' wider intermediate, 2 x 18432",
             spec=dict(shape=(16, 36864), dtype=torch.bfloat16),
-        ),
-        Cell(
-            why="deepseek default at attention TP8: the shared expert's gate+up, 2 x 2048/8",
-            spec=dict(shape=(16, 512), dtype=torch.bfloat16),
         ),
     )
 

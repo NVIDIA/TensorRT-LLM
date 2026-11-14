@@ -7,6 +7,7 @@ import tarfile
 from dataclasses import dataclass
 from importlib import import_module
 from pathlib import Path
+from threading import Lock
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -154,6 +155,9 @@ def _make_runtime(
     worker._runtime_model_config = None
     worker._lora_model_config = model_config
     worker._lora_manager = manager
+    worker._lora_adapter_identities = {}
+    worker._lora_adapter_id_locks = {}
+    worker._lora_adapter_id_locks_guard = Lock()
     return _Runtime(config, model_config, manager, worker, cache, transfer)
 
 
@@ -225,7 +229,11 @@ def _load(runtime: _Runtime, entrypoint: str, path: Path) -> None:
         )
     else:
         runtime.request = SimpleNamespace(
-            lora_task_id="7", py_lora_path=str(path), lora_weights=None, lora_config=None
+            lora_task_id="7",
+            py_lora_path=str(path),
+            lora_weights=None,
+            lora_config=None,
+            py_lora_ckpt_source=runtime.config.lora_ckpt_source,
         )
         runtime.cache.add_request_peft(runtime.request)
 

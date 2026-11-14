@@ -317,8 +317,9 @@ class KimiK3VisionModel(KimiK25VisionModel):
         # head count is not divisible by the attention-TP degree (e.g. Kimi K3's
         # 12 heads under TP16); run the whole tower replicated (tp=1) in that
         # case so module construction and weight loading agree. Attention-DP
-        # already replicates the vision tower via its own path, so leave it be.
-        if not model_config.mapping.enable_attention_dp:
+        # already replicates the vision tower via its own path, except under
+        # helix: the mapping still carries cp, which Attention would shard by.
+        if not model_config.mapping.enable_attention_dp or model_config.mapping.cp_size > 1:
             self.model_config.mapping = _get_vision_tp_mapping(model_config, num_heads)
         pretrained_config = self.model_config.pretrained_config
         # Normalize the checkpoint dtype once (covers both the modern `dtype`

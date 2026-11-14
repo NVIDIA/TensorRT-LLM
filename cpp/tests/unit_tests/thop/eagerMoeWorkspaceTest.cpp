@@ -16,6 +16,7 @@
 #include "tensorrt_llm/thop/moe/cutlass/eagerMoeWorkspace.h"
 #include "tensorrt_llm/thop/moe/cutlass/eagerMoeWorkspaceScope.h"
 
+#include <ATen/Context.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -153,6 +154,8 @@ TEST(EagerMoeWorkspace, ReclamationRetriesAfterReleasingScratchUnderMemoryPressu
         GTEST_SKIP() << "Uses native allocator quota and OOM counters";
     }
     constexpr int64_t kMiB = 1024 * 1024;
+    // Allocator quota queries require PyTorch's CUDA initialization.
+    at::globalContext().lazyInitDevice(c10::DeviceType::CUDA);
     auto const device = c10::cuda::current_device();
     auto const previousLimit = c10::cuda::CUDACachingAllocator::getMemoryFraction(device);
     auto restoreLimit
@@ -205,6 +208,8 @@ TEST(EagerMoeWorkspace, ConservativeReservationOomStillAllowsSmallerActualDemand
         GTEST_SKIP() << "Uses native allocator quota and OOM counters";
     }
     constexpr int64_t kMiB = 1024 * 1024;
+    // Allocator quota queries require PyTorch's CUDA initialization.
+    at::globalContext().lazyInitDevice(c10::DeviceType::CUDA);
     auto const device = c10::cuda::current_device();
     auto const previousLimit = c10::cuda::CUDACachingAllocator::getMemoryFraction(device);
     auto restoreLimit

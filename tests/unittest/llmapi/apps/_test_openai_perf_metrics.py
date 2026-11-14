@@ -19,6 +19,11 @@ from .openai_server import RemoteOpenAIServer
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# The streaming Responses tests cap the output at 2 tokens, so the stream
+# usually ends incomplete; either terminal event ends it.
+_RESPONSES_TERMINAL_EVENT = re.compile(
+    r"^event: response\.(completed|incomplete)$", re.MULTILINE)
+
 
 @pytest.fixture(scope="module", ids=["Qwen3-0.6B"])
 def model_name():
@@ -233,7 +238,7 @@ def test_responses_streaming_metrics_require_request_opt_in(
                              json=payload,
                              timeout=120)
     assert response.status_code == 200
-    assert "event: response.completed" in response.text
+    assert _RESPONSES_TERMINAL_EVENT.search(response.text)
     assert f"event: {perf_metrics.SSE_METRICS_EVENT}" not in response.text
     wait_for_perf_metrics_jsonl(perf_metrics_output_dir,
                                 expected_count=num_existing_records + 1)
@@ -245,7 +250,7 @@ def test_responses_streaming_metrics_require_request_opt_in(
         timeout=120,
     )
     assert response.status_code == 200
-    assert "event: response.completed" in response.text
+    assert _RESPONSES_TERMINAL_EVENT.search(response.text)
     assert f"event: {perf_metrics.SSE_METRICS_EVENT}" in response.text
     expected_count = num_existing_records + 2
     records = wait_for_perf_metrics_jsonl(perf_metrics_output_dir,

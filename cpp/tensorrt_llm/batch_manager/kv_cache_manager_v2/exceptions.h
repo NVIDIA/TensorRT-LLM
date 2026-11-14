@@ -61,7 +61,10 @@ void poisonOnExcept(char const* context, F&& func) noexcept
 }
 
 // ---------------------------------------------------------------------------
-// Exception hierarchy (mirrors _exceptions.py)
+// Exception hierarchy. The bindings make a Python class of each one
+// (nb::exception in nanobind/batch_manager/kvCacheManagerV2.cpp) and
+// runtime/kv_cache_manager_v2/__init__.py re-exports them, so the class a
+// Python caller catches is this one.
 // ---------------------------------------------------------------------------
 
 class OutOfMemoryError : public std::runtime_error

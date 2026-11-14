@@ -1,4 +1,18 @@
 #!/bin/bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 set -ex
 
@@ -9,7 +23,7 @@ if [ -n "${GITHUB_MIRROR}" ]; then
 fi
 
 if [ -n "${GITHUB_MIRROR}" ]; then
-  BOOST_URL="https://urm.nvidia.com/artifactory/sw-dl-triton-generic-local/triton/ci-cd/binaries/boost/1.80.0/boost_1_80_0.tar.gz"
+  BOOST_URL="https://artifactory.nvidia.com/artifactory/sw-dl-triton-generic-local/triton/ci-cd/binaries/boost/1.80.0/boost_1_80_0.tar.gz"
 else
   BOOST_URL="https://archives.boost.io/release/1.80.0/source/boost_1_80_0.tar.gz"
 fi
@@ -73,13 +87,11 @@ cleanup() {
 
 init_ubuntu() {
   apt-get update
-  # libibverbs-dev is installed but libmlx5.so is missing, reinstall the package
-  apt remove -y ibverbs-providers libibverbs1
-  apt-get --reinstall install -y libibverbs-dev
   apt-get install -y --no-install-recommends \
     libtool \
     autoconf \
     automake \
+    pkg-config \
     ccache \
     gdb \
     git-lfs \

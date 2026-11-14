@@ -204,6 +204,121 @@ def test_sync_receive_failure_under_multi_rank_adp_waits_for_the_synced_vote(syn
     assert ranks[1].effects.failed == [(_VOTE_MSG, [peer], False)]
 
 
+def _cp_dist(
+    peer_failed_ids, *, enable_attention_dp=False, tp_size=1, pp_size=1
+) -> SimpleNamespace:
+    """Dist stub for CP rank 0 of N = len(peer_failed_ids) + 1 CP ranks.
+
+    ``peer_failed_ids`` holds one id list per CP peer. ``cp_allgather`` records
+    each payload and returns it followed by those lists. Under attention DP,
+    ``world_size`` is tp x N x pp so errors wait for the synced vote, and
+    ``tp_allgather`` gathers this rank alone; otherwise ``world_size`` is 1 and
+    errors fail at once."""
+
+    def cp_allgather(ids, *, small_payload=False):
+        dist.gathered.append(list(ids))
+        return [ids, *peer_failed_ids]
+
+    cp_size = len(peer_failed_ids) + 1
+    world_size = tp_size * cp_size * pp_size if enable_attention_dp else 1
+    dist = SimpleNamespace(
+        rank=0,
+        tp_size=tp_size,
+        pp_size=pp_size,
+        cp_size=cp_size,
+        world_size=world_size,
+        gathered=[],
+    )
+    dist.cp_allgather = cp_allgather
+    dist.tp_allgather = lambda obj: [obj]
+    return dist
+
+
+def test_sync_receive_that_failed_on_a_cp_peer_fails_here_too(sync_mode) -> None:
+    """A blocking receive settles on its own rank. A request this CP rank
+    received but a CP peer failed is failed here as well, so the helix CP ranks
+    keep decoding the same batch; the rest keep their outcome."""
+    dist = _cp_dist([[2]])
+    h = CoordinatorHarness(dist=dist)
+    first, second = _gen_init(h, 1), _gen_init(h, 2)
+
+    h.coordinator.receive_gen_init([first, second])
+
+    assert dist.gathered == [[]]
+    assert first.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+    assert second.state == LlmRequestState.DISAGG_TRANS_ERROR
+    assert h.effects.failed == [(_GEN_ERROR_MSG, [second], False)]
+
+
+def test_sync_receive_failure_here_is_shared_with_cp_peers(sync_mode) -> None:
+    dist = _cp_dist([[]])
+    h = CoordinatorHarness(dist=dist)
+    failing, received = _gen_init(h, 1), _gen_init(h, 2)
+    h.transceiver.script_sync_recv(failing, "error")
+
+    h.coordinator.receive_gen_init([failing, received])
+
+    assert dist.gathered == [[1]]
+    assert received.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+    assert h.effects.failed == [(_GEN_ERROR_MSG, [failing], False)]
+
+
+def test_sync_receive_failed_on_a_cp_peer_under_adp_reaches_the_synced_vote(sync_mode) -> None:
+    """Under attention DP the error waits for the synced pass, whose vote spans
+    only the TP group; the CP gather already put it in error on this CP rank."""
+    dist = _cp_dist([[1]], enable_attention_dp=True)
+    h = CoordinatorHarness(dist=dist, enable_attention_dp=True)
+    req = _gen_init(h, 1)
+
+    h.coordinator.receive_gen_init([req])
+
+    assert req.state == LlmRequestState.DISAGG_TRANS_ERROR
+    assert h.effects.failed == []
+
+    h.coordinator.handle_errors_synced()
+
+    assert h.effects.failed == [(_VOTE_MSG, [req], False)]
+
+
+@pytest.mark.parametrize(
+    "tp_size,pp_size,gathers",
+    [
+        pytest.param(2, 2, False, id="tp2_pp2_skips"),
+        pytest.param(1, 2, True, id="tp1_pp2_gathers"),
+        pytest.param(2, 1, True, id="tp2_pp1_gathers"),
+    ],
+)
+def test_sync_receive_failure_gather_under_attention_dp_follows_pp_scheduling(
+    sync_mode, tp_size, pp_size, gathers
+) -> None:
+    """Under attention DP with tp_size > 1 the PP loop schedules on each first-stage
+    rank, so the CP ranks may hold different requests and cannot share one gather;
+    it is skipped there. Every other layout gives the CP ranks the same requests."""
+    dist = _cp_dist([[1]], enable_attention_dp=True, tp_size=tp_size, pp_size=pp_size)
+    h = CoordinatorHarness(dist=dist, enable_attention_dp=True)
+    req = _gen_init(h, 1)
+
+    h.coordinator.receive_gen_init([req])
+
+    assert dist.gathered == ([[]] if gathers else [])
+    assert req.state == (
+        LlmRequestState.DISAGG_TRANS_ERROR
+        if gathers
+        else LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+    )
+
+
+def test_sync_receive_without_cp_does_not_gather(sync_mode) -> None:
+    dist = _cp_dist([])
+    dist.cp_allgather = Mock(side_effect=AssertionError("no CP peer to gather with"))
+    h = CoordinatorHarness(dist=dist)
+    req = _gen_init(h, 1)
+
+    h.coordinator.receive_gen_init([req])
+
+    assert req.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+
+
 def test_gen_only_benchmark_marks_requests_complete_without_a_transceiver_call(
     gen_only_benchmark,
 ) -> None:
@@ -313,6 +428,27 @@ def test_deferred_receives_publish_independently_and_in_admission_order() -> Non
         "check_gen_transfer_status:0",
     ]
     assert [req.state for req in (first, second, unfenced)] == [_RECEIVING] * 3
+
+
+def test_deferred_receives_are_reported_from_admission_until_published() -> None:
+    """The transceiver learns the waiting count at admission, before any
+    receive starts, and again after each publication pass: its idle-poll skip
+    counts a waiting receive as a session on every rank."""
+    late = _ScriptedEvent(False, False, True)
+    h = _deferring_harness({1: _ScriptedEvent(True), 2: late})
+    first, second = _gen_init(h, 1), _gen_init(h, 2)
+
+    h.coordinator.receive_gen_init([first, second])
+
+    # admission (both waiting), then the publication pass that started 1
+    assert h.transceiver.deferred_receive_reports == [2, 1]
+    assert h.transceiver.call_log[0] == "request_and_receive_async:1"
+
+    h.coordinator.poll_gen_transfers()
+    assert h.transceiver.deferred_receive_reports == [2, 1, 1]
+    h.coordinator.poll_gen_transfers()
+    assert h.transceiver.deferred_receive_reports == [2, 1, 1, 0]
+    assert h.transceiver.call_log.count("request_and_receive_async:2") == 1
 
 
 def test_forgotten_deferred_receive_is_never_published() -> None:
@@ -435,15 +571,31 @@ def _batch(*generation_requests) -> ScheduledRequests:
     return batch
 
 
+def _received(h: CoordinatorHarness, *requests: "_GenRequest") -> None:
+    """Start the requests' receives through the coordinator and complete them."""
+    for req in requests:
+        req.state = LlmRequestState.DISAGG_GENERATION_INIT
+    h.coordinator.receive_gen_init(list(requests))
+    for req in requests:
+        h.transceiver.finish_recv(req)
+    h.coordinator.reap_gen_receives()
+
+
 def test_completed_gen_receives_reports_only_completed_requests_in_batch_order() -> None:
-    """The query picks the transmission-complete generation requests, keeps
-    the batch order and changes nothing."""
+    """The query picks the requests whose receive the coordinator started and
+    that completed, keeps the batch order and changes nothing; a decoding
+    request in the batch is not visited, and a finished receive is not
+    reported again."""
     h = CoordinatorHarness()
     done_a, done_b = _GenRequest(1), _GenRequest(3)
-    receiving = _GenRequest(2, state=_RECEIVING)
+    receiving = _GenRequest(2, state=LlmRequestState.DISAGG_GENERATION_INIT)
     running = _GenRequest(4, state=LlmRequestState.GENERATION_IN_PROGRESS)
+    h.coordinator.receive_gen_init([receiving])
+    _received(h, done_b, done_a)
+    h.transceiver.call_log.clear()
 
-    completed = h.coordinator.completed_gen_receives(_batch(done_a, receiving, done_b, running))
+    batch = _batch(done_a, receiving, done_b, running)
+    completed = h.coordinator.completed_gen_receives(batch)
 
     assert [req.py_request_id for req in completed] == [1, 3]
     assert [req.state for req in (done_a, receiving, done_b, running)] == [
@@ -453,6 +605,8 @@ def test_completed_gen_receives_reports_only_completed_requests_in_batch_order()
         LlmRequestState.GENERATION_IN_PROGRESS,
     ]
     assert h.transceiver.call_log == []
+    assert h.coordinator.try_finish_gen_receive(done_a)
+    assert [req.py_request_id for req in h.coordinator.completed_gen_receives(batch)] == [3]
 
 
 def test_try_finish_gen_receive_hands_a_completed_request_to_generation() -> None:
@@ -551,7 +705,10 @@ def test_receive_tail_prepares_the_batch_before_finishing_each_request() -> None
     events = []
     executor = _executor_over(h.coordinator, events)
     first, second = _GenRequest(1, events=events), _GenRequest(2, events=events)
-    receiving = _GenRequest(3, events=events, state=_RECEIVING)
+    receiving = _GenRequest(3, events=events, state=LlmRequestState.DISAGG_GENERATION_INIT)
+    h.coordinator.receive_gen_init([receiving])
+    _received(h, first, second)
+    h.transceiver.call_log.clear()
 
     executor._prepare_disagg_gen_transmission_complete(_batch(first, receiving, second))
 
@@ -561,7 +718,6 @@ def test_receive_tail_prepares_the_batch_before_finishing_each_request() -> None
         ("finish", 1, True),
         ("token", 1),
         ("logprobs", 1),
-        ("finish", 3, False),
         ("finish", 2, True),
         ("token", 2),
         ("logprobs", 2),
@@ -580,18 +736,23 @@ def test_receive_tail_prepares_the_batch_before_finishing_each_request() -> None
 @pytest.mark.parametrize("coordinator_kind", ["real", "noop"])
 def test_receive_tail_does_nothing_without_a_completed_receive(coordinator_kind) -> None:
     """With nothing to finish the batch-level preparation is skipped and no
-    request is asked; the no-op coordinator reports nothing to finish even
-    for a request that claims to be complete."""
+    request is asked: a receive still in flight is not finished, a request
+    that reports itself complete but whose receive this coordinator never
+    started is not visited, and the no-op coordinator reports nothing."""
     events = []
     if coordinator_kind == "real":
-        coordinator = CoordinatorHarness().coordinator
-        request = _GenRequest(1, events=events, state=_RECEIVING)
+        h = CoordinatorHarness()
+        coordinator = h.coordinator
+        receiving = _GenRequest(2, events=events, state=LlmRequestState.DISAGG_GENERATION_INIT)
+        coordinator.receive_gen_init([receiving])
+        request = _GenRequest(1, events=events)
     else:
         coordinator = NoopDisaggCoordinator()
         request = _GenRequest(1, events=events)
     executor = _executor_over(coordinator, events)
+    batch = _batch(request, receiving) if coordinator_kind == "real" else _batch(request)
 
-    executor._prepare_disagg_gen_transmission_complete(_batch(request))
+    executor._prepare_disagg_gen_transmission_complete(batch)
 
     assert events == []
     assert request.new_tokens == []
@@ -608,6 +769,8 @@ def test_receive_tail_does_not_finish_requests_that_sampler_setup_failed() -> No
     events = []
     executor = _executor_over(h.coordinator, events)
     first, second = _GenRequest(1, events=events), _GenRequest(2, events=events)
+    _received(h, first, second)
+    h.transceiver.call_log.clear()
     executor.active_requests = [first, second]
 
     def raise_in_sampler(_requests):
@@ -631,6 +794,7 @@ def test_receive_tail_does_not_finish_requests_that_sampler_setup_failed() -> No
         ("finish", 1, False),
         ("finish", 2, False),
     ]
+    assert h.coordinator.completed_gen_receives(_batch(first, second)) == []
     assert [req.state for req in (first, second)] == [LlmRequestState.GENERATION_COMPLETE] * 2
     assert h.transceiver.call_log == []
     assert [req.new_tokens for req in (first, second)] == [[], []]

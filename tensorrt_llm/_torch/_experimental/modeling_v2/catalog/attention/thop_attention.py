@@ -2,11 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fused attention core with fully explicit state: paged KV-cache append + masked FMHA.
 
-Wraps the pybind binding ``tensorrt_llm.bindings.internal.thop.attention``
-(approved policy exception to the ``torch.ops.trtllm.*`` entry shape): the same
-C++ attention op behind the TRTLLM backend, but every piece of batch state and
-layer config arrives as an explicit argument -- no registered layers, no
-thread-local metadata.
+Wraps ``FallbackFmha.attention``, which dispatches to the native
+``AttentionOp`` context and generation methods. Every piece of batch state
+and layer config arrives as an explicit argument; native runners are cached
+by static configuration, device, and thread.
 """
 
 from __future__ import annotations
@@ -15,7 +14,7 @@ from typing import Optional, Sequence
 
 import torch
 
-from tensorrt_llm.bindings.internal import thop
+from tensorrt_llm._torch.attention.backends.fmha.fallback import FallbackFmha
 
 from .._op import Arch, Cell, OpWrapper
 
@@ -35,7 +34,7 @@ QM_NVFP4_KV_CACHE = 8192
 #: the paged-context path on (the target serves with block reuse and chunked
 #: prefill). Pool sizes are chosen, not dumped: 128 pages of 32 tokens and 4
 #: block-offset rows, larger than any cell's batch.
-_QWEN4_DENSE = dict(
+QWEN4_DENSE = dict(
     input_type=STANDARD,
     num_heads=24,
     num_kv_heads=2,
@@ -54,7 +53,7 @@ _QWEN4_DENSE = dict(
 #: qwen4_exp's vision tower: the no-KV-cache mode, one context sequence per
 #: frame, MHA 16/16 at head_size 72 (hidden 1152 over 16 heads), padding mask.
 #: `max_num_requests` is the segment count, as the target passes it.
-_QWEN4_VISION = dict(
+QWEN4_VISION = dict(
     input_type=STANDARD,
     kv_cache="none",
     num_heads=16,
@@ -67,33 +66,8 @@ _QWEN4_VISION = dict(
     mask_type=0,
 )
 
-#: The qwen4_exp full-attention call over an fp8-e4m3 pool at the production kv
-#: scale 1.0 (fp32 [1] scale tensors, quant_mode 128): what the trunk layers and
-#: the MTP draft layer pass when the engine serves an fp8 KV cache. Same chosen
-#: pool sizes as `_QWEN4_DENSE`.
-_QWEN4_FP8 = dict(_QWEN4_DENSE, quant_mode=QM_FP8_KV_CACHE, kv_scale=1.0)
-
-#: The same call over an NVFP4 pool: e2m1 data and a second pool of e4m3 block
-#: scales, fp32 [3] unit kv scales, `[1, 2, 2]` pool pointers, bf16 output --
-#: what the trunk layers and the MTP draft layer pass when the engine serves an
-#: NVFP4 KV cache. Same chosen pool sizes as `_QWEN4_DENSE`.
-_QWEN4_NVFP4 = dict(_QWEN4_DENSE, quant_mode=QM_NVFP4_KV_CACHE, kv_scale=1.0)
-
-#: `_QWEN4_DENSE` and `_QWEN4_FP8` for a verify step of up to 32 requests, the captured-batch
-#: ceiling: one block-offset row per request and pages for 32 histories (the largest cell
-#: needs 133 of the 144).
-_QWEN4_DENSE_G32 = dict(_QWEN4_DENSE, max_num_requests=32, num_blocks=144)
-_QWEN4_FP8_G32 = dict(_QWEN4_FP8, max_num_requests=32, num_blocks=144)
-
-
-def _spread(batch: int, longest: int) -> tuple[int, ...]:
-    """`batch` histories rising evenly from 1 to `longest` tokens: one-page, page-boundary
-    and multi-page sequences in one verify step."""
-    return tuple(1 + (longest - 1) * i // (batch - 1) for i in range(batch))
-
-
 #: A GQA 24/4/256 full-attention layer (Qwen3.8-27B) over an fp8-e4m3 pool at
-#: the production kv scale 1.0. Same chosen pool sizes as `_QWEN4_DENSE`.
+#: the production kv scale 1.0. Same chosen pool sizes as `QWEN4_DENSE`.
 _FP8_24_4_256 = dict(
     input_type=STANDARD,
     num_heads=24,
@@ -114,14 +88,11 @@ _FP8_24_4_256 = dict(
 class ThopAttention(OpWrapper):
     """Append this step's K/V to the paged cache, then attend over it.
 
-    The most load-bearing entry in the catalog and the only one wrapping a
-    pybind binding rather than a registered torch op. Three targets go through
-    it, by different paths: gpt-oss on the standard path with attention sinks
-    and an alternating sliding window, deepseek on MLA's two phases, and
-    qwen4_exp on the standard path twice over -- its full-attention layers and
-    MTP module (GQA 24/2/256 over a bf16 or an fp8-e4m3 pool, a P-token draft
-    block per generation sequence, a two-pool hybrid mapping), and its vision
-    tower with no KV cache at all.
+    The shipped targets use the native phased ``AttentionOp`` through
+    ``FallbackFmha.attention``: gpt-oss uses attention sinks and an alternating
+    sliding window, deepseek uses MLA's two phases, and qwen4_exp uses packed
+    GQA over a bf16 or an fp8-e4m3 pool for its full-attention and MTP layers
+    and uncached MHA for vision.
 
     Writes rows `[:num_tokens]` of `output` and returns `output` -- the same
     buffer, mutated and handed back so a call site can show what it touched
@@ -130,300 +101,17 @@ class ThopAttention(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
-    # gpt-oss alternates its two window classes inside one engine, so both of
-    # its cells are live every step; deepseek runs context and generation
-    # against the same pool. qwen4_exp's cells give `cached` (tokens already in
-    # the pool) and `new` (this call's q rows) per sequence, contexts first.
+    # The shipped targets' cells are in this entry's test. gpt-oss alternates its
+    # two window classes inside one engine, so both of its cells are live every
+    # step; deepseek runs context and generation against the same pool. Cells
+    # with `cached` (tokens already in the pool) and `new` (this call's q rows)
+    # give them per sequence, contexts first.
     CELLS: tuple[Cell, ...] = (
-        Cell(
-            why="gpt-oss sliding layer: GQA 64q/8kv d64, sinks, window 128",
-            spec=dict(
-                input_type=STANDARD,
-                num_heads=64,
-                num_kv_heads=8,
-                head_size=64,
-                v_head_dim=64,
-                sinks=True,
-                window=128,
-                quant_mode=0,
-            ),
-        ),
-        Cell(
-            why="gpt-oss full layer: the same heads with no window",
-            spec=dict(
-                input_type=STANDARD,
-                num_heads=64,
-                num_kv_heads=8,
-                head_size=64,
-                v_head_dim=64,
-                sinks=True,
-                window=None,
-                quant_mode=0,
-            ),
-        ),
-        # The per-rank head counts the gpt-oss default target runs under
-        # attention TP: the same code path as the two cells above, at the
-        # head counts a rank holds after the split.
-        Cell(
-            why="gpt-oss default at attention TP8: 8q/1kv per rank, 128-token window",
-            spec=dict(
-                input_type=STANDARD,
-                num_heads=8,
-                num_kv_heads=1,
-                head_size=64,
-                v_head_dim=64,
-                sinks=True,
-                window=128,
-                quant_mode=0,
-            ),
-        ),
-        Cell(
-            why="deepseek MLA context: explicit k/v, qk 576 -> v 128, fp8 pool",
-            spec=dict(
-                input_type=MLA_CONTEXT,
-                num_heads=128,
-                num_kv_heads=128,
-                head_size=576,
-                v_head_dim=128,
-                sinks=False,
-                window=None,
-                quant_mode=QM_FP8_KV_CACHE,
-            ),
-        ),
-        Cell(
-            why="deepseek MLA generation: one kv head, latent 576 -> 512, fp8 pool",
-            spec=dict(
-                input_type=MLA_GENERATION,
-                num_heads=128,
-                num_kv_heads=1,
-                head_size=576,
-                v_head_dim=512,
-                sinks=False,
-                window=None,
-                quant_mode=QM_FP8_KV_CACHE,
-            ),
-        ),
-        # The per-rank head counts the deepseek default target runs under
-        # attention TP: the same two MLA code paths as the cells above, at the
-        # 128 heads split 2, 4 or 8 ways.
-        Cell(
-            why="deepseek default at attention TP8: MLA context, 16 heads per rank",
-            spec=dict(
-                input_type=MLA_CONTEXT,
-                num_heads=16,
-                num_kv_heads=16,
-                head_size=576,
-                v_head_dim=128,
-                sinks=False,
-                window=None,
-                quant_mode=QM_FP8_KV_CACHE,
-            ),
-        ),
-        Cell(
-            why="deepseek default at attention TP2: MLA generation, 64 heads per rank",
-            spec=dict(
-                input_type=MLA_GENERATION,
-                num_heads=64,
-                num_kv_heads=1,
-                head_size=576,
-                v_head_dim=512,
-                sinks=False,
-                window=None,
-                quant_mode=QM_FP8_KV_CACHE,
-            ),
-        ),
-        Cell(
-            why="deepseek default at attention TP8: MLA generation, 16 heads per rank",
-            spec=dict(
-                input_type=MLA_GENERATION,
-                num_heads=16,
-                num_kv_heads=1,
-                head_size=576,
-                v_head_dim=512,
-                sinks=False,
-                window=None,
-                quant_mode=QM_FP8_KV_CACHE,
-            ),
-        ),
-        # MTP3 under attention TP: the verify step's taller query block (draft
-        # length 3 + 1 rows per sequence) at a split head count. The P > 1 mask
-        # itself is pinned at 128 heads by the MTP cases in the test.
-        Cell(
-            why="deepseek default MTP3 at attention TP8: MLA generation, 16 heads, P=4",
-            spec=dict(
-                input_type=MLA_GENERATION,
-                num_heads=16,
-                num_kv_heads=1,
-                head_size=576,
-                v_head_dim=512,
-                sinks=False,
-                window=None,
-                quant_mode=QM_FP8_KV_CACHE,
-                predicted_tokens_per_seq=4,
-            ),
-        ),
-        Cell(
-            why="qwen4_exp prefill: GQA 24q/2kv d256, bf16 pool, paged context; "
-            "a fresh 70-row sequence beside 33 rows over a 48-token cached prefix",
-            spec=dict(
-                _QWEN4_DENSE,
-                cached=(0, 48),
-                new=(70, 33),
-                num_contexts=2,
-                predicted_tokens_per_seq=1,
-            ),
-        ),
-        Cell(
-            why="qwen4_exp decode P=1: one row per generation sequence over "
-            "page-crossing histories (70, 35)",
-            spec=dict(
-                _QWEN4_DENSE,
-                cached=(70, 35),
-                new=(1, 1),
-                num_contexts=0,
-                predicted_tokens_per_seq=1,
-            ),
-        ),
-        Cell(
-            why="qwen4_exp MTP verify P=2 (max_draft_len 1): draft row t attends "
-            "[0, L-P+t], bottom-right causal within the block",
-            spec=dict(
-                _QWEN4_DENSE,
-                cached=(70, 35),
-                new=(2, 2),
-                num_contexts=0,
-                predicted_tokens_per_seq=2,
-            ),
-        ),
-        Cell(
-            why="qwen4_exp MTP verify P=3 (max_draft_len 2): a separate decode "
-            "compile, P reaches the kernel as maxSeqLenQ",
-            spec=dict(
-                _QWEN4_DENSE,
-                cached=(70, 35),
-                new=(3, 3),
-                num_contexts=0,
-                predicted_tokens_per_seq=3,
-            ),
-        ),
-        Cell(
-            why="qwen4_exp MTP verify P=4 (max_draft_len 3)",
-            spec=dict(
-                _QWEN4_DENSE,
-                cached=(70, 35),
-                new=(4, 4),
-                num_contexts=0,
-                predicted_tokens_per_seq=4,
-            ),
-        ),
-        *(
-            Cell(
-                why=f"qwen4_exp MTP verify P={p} (max_draft_len {p - 1})"
-                + (": the target's ceiling" if p == 8 else ""),
-                spec=dict(
-                    _QWEN4_DENSE,
-                    cached=(70, 35),
-                    new=(p, p),
-                    num_contexts=0,
-                    predicted_tokens_per_seq=p,
-                ),
-            )
-            for p in (5, 6, 7, 8)
-        ),
-        Cell(
-            why="qwen4_exp P=8 G=1: one draft block from row 95, across the page edge at 96",
-            spec=dict(
-                _QWEN4_DENSE,
-                cached=(95,),
-                new=(8,),
-                num_contexts=0,
-                predicted_tokens_per_seq=8,
-            ),
-        ),
-        # The trtllm-gen launch picks its generation kernel by batch size at P 5..8, so each P
-        # is also driven at 32 requests and at one batch in 17..20, with histories of every
-        # page shape in the step.
-        *(
-            Cell(
-                why=f"qwen4_exp bf16 batch P={p} G=32: 32 blocks over histories 1..218, "
-                f"{32 * p} q rows",
-                spec=dict(
-                    _QWEN4_DENSE_G32,
-                    cached=_spread(32, 218),
-                    new=(p,) * 32,
-                    num_contexts=0,
-                    predicted_tokens_per_seq=p,
-                ),
-            )
-            for p in (5, 6, 7, 8)
-        ),
-        *(
-            Cell(
-                why=f"qwen4_exp bf16 batch P={p} G={g}: {g} blocks over histories 200..1, "
-                f"{g * p} q rows",
-                spec=dict(
-                    _QWEN4_DENSE_G32,
-                    cached=tuple(reversed(_spread(g, 200))),
-                    new=(p,) * g,
-                    num_contexts=0,
-                    predicted_tokens_per_seq=p,
-                ),
-            )
-            for p, g in ((5, 17), (6, 18), (7, 19), (8, 20))
-        ),
-        Cell(
-            why="qwen4_exp mixed step: a fresh 20-row context ahead of two P=2 "
-            "draft blocks, generation rows token-major after the context rows",
-            spec=dict(
-                _QWEN4_DENSE,
-                cached=(0, 70, 35),
-                new=(20, 2, 2),
-                num_contexts=1,
-                predicted_tokens_per_seq=2,
-            ),
-        ),
-        Cell(
-            why="qwen4_exp mixed step P=8: a fresh 20-row context ahead of two P=8 "
-            "draft blocks over histories 70 and 35",
-            spec=dict(
-                _QWEN4_DENSE,
-                cached=(0, 70, 35),
-                new=(20, 8, 8),
-                num_contexts=1,
-                predicted_tokens_per_seq=8,
-            ),
-        ),
-        Cell(
-            why="qwen4_exp hybrid pool: row 47 of the 48-row two-pool mapping "
-            "(pool 0, layer-in-pool 11), P=2 verify",
-            spec=dict(
-                _QWEN4_DENSE,
-                pool_layout="hybrid48",
-                local_layer_idx=47,
-                cached=(64, 25),
-                new=(2, 2),
-                num_contexts=0,
-                predicted_tokens_per_seq=2,
-            ),
-        ),
-        Cell(
-            why="qwen4_exp P=8 hybrid pool: row 47 of the 48-row two-pool mapping "
-            "(pool 0, layer-in-pool 11), P=8 verify",
-            spec=dict(
-                _QWEN4_DENSE,
-                pool_layout="hybrid48",
-                local_layer_idx=47,
-                cached=(64, 25),
-                new=(8, 8),
-                num_contexts=0,
-                predicted_tokens_per_seq=8,
-            ),
-        ),
         Cell(
             why="48-layer single pool, identity mapping: row 47 = layer-in-pool 47, "
             "24 rows over a 40-token cached prefix",
             spec=dict(
-                _QWEN4_DENSE,
+                QWEN4_DENSE,
                 pool_layout="identity48",
                 local_layer_idx=47,
                 cached=(40,),
@@ -433,70 +121,40 @@ class ThopAttention(OpWrapper):
             ),
         ),
         Cell(
-            why="qwen4_exp vision tower: no KV cache, MHA 16/16 d72, padding mask, "
-            "frames of 27/9/41 rows each attending only to itself",
-            spec=dict(_QWEN4_VISION, seg_lens=(27, 9, 41)),
-        ),
-        Cell(
             why="encoder-only, d72 causal: measured, not what the tower passes",
-            spec=dict(_QWEN4_VISION, mask_type=1, seg_lens=(27, 9, 41)),
+            spec=dict(QWEN4_VISION, mask_type=1, seg_lens=(27, 9, 41)),
         ),
         Cell(
             why="encoder-only, d128 padding: the tower's other admitted width",
-            spec=dict(_QWEN4_VISION, head_size=128, v_head_dim=128, seg_lens=(27, 9, 41)),
+            spec=dict(QWEN4_VISION, head_size=128, v_head_dim=128, seg_lens=(27, 9, 41)),
         ),
         Cell(
             why="encoder-only, d128 causal",
             spec=dict(
-                _QWEN4_VISION, head_size=128, v_head_dim=128, mask_type=1, seg_lens=(27, 9, 41)
+                QWEN4_VISION, head_size=128, v_head_dim=128, mask_type=1, seg_lens=(27, 9, 41)
             ),
         ),
         Cell(
             why="encoder-only, a single one-token frame",
-            spec=dict(_QWEN4_VISION, seg_lens=(1,)),
-        ),
-        Cell(
-            why="mmmu serving shape: one 5580-row frame, the 62x90 patch grid",
-            spec=dict(_QWEN4_VISION, seg_lens=(5580,)),
-        ),
-        Cell(
-            why="mmmu serving shape: one 8160-row frame, the largest single-segment call",
-            spec=dict(_QWEN4_VISION, seg_lens=(8160,)),
-        ),
-        Cell(
-            why="mmmu serving shape: 2204 rows in four frames",
-            spec=dict(_QWEN4_VISION, seg_lens=(728, 728, 460, 288)),
-        ),
-        Cell(
-            why="mmmu serving shape: 1892 rows in five frames, the most segments per call",
-            spec=dict(_QWEN4_VISION, seg_lens=(480, 480, 400, 352, 180)),
-        ),
-        Cell(
-            why="mmmu serving shape: 9008 rows in two frames",
-            spec=dict(_QWEN4_VISION, seg_lens=(8000, 1008)),
-        ),
-        Cell(
-            why="mmmu serving shape: 22144 rows in two frames, the largest call; its "
-            "12544-row frame is the longest segment",
-            spec=dict(_QWEN4_VISION, seg_lens=(12544, 9600)),
+            spec=dict(QWEN4_VISION, seg_lens=(1,)),
         ),
         # A vision-tower call is one frame per frame group, at most 32768 rows per call.
         Cell(
             why="video: 384 frame groups of 64 rows (8x8 patches), the untiled "
             "kernel's longest frame",
-            spec=dict(_QWEN4_VISION, seg_lens=(64,) * 384),
+            spec=dict(QWEN4_VISION, seg_lens=(64,) * 384),
         ),
         Cell(
             why="video: 256 frame groups of 128 rows, the 32768-row ceiling",
-            spec=dict(_QWEN4_VISION, seg_lens=(128,) * 256),
+            spec=dict(QWEN4_VISION, seg_lens=(128,) * 256),
         ),
         Cell(
             why="video: 2 frame groups of 16384 rows (128x128), the longest frame at the ceiling",
-            spec=dict(_QWEN4_VISION, seg_lens=(16384, 16384)),
+            spec=dict(QWEN4_VISION, seg_lens=(16384, 16384)),
         ),
         Cell(
             why="video: 8192 frame groups of 2x2 patches, the most a 32768-row call can carry",
-            spec=dict(_QWEN4_VISION, seg_lens=(4,) * 8192),
+            spec=dict(QWEN4_VISION, seg_lens=(4,) * 8192),
         ),
         Cell(
             why="fp8 pool packed prefill, GQA 24q/4kv d256: the FMHA reads the "
@@ -606,165 +264,6 @@ class ThopAttention(OpWrapper):
                 predicted_tokens_per_seq=3,
             ),
         ),
-        # qwen4_exp's own geometry over an fp8 pool: the kv head count changes the compiled
-        # decode kernel, so the 24/4/256 cells above do not cover it.
-        Cell(
-            why="qwen4_exp fp8 pool paged-context prefill, 24/2/256: a fresh 48-row "
-            "sequence beside 33 rows over a 48-token e4m3 prefix",
-            spec=dict(
-                _QWEN4_FP8,
-                cached=(0, 48),
-                new=(48, 33),
-                num_contexts=2,
-                predicted_tokens_per_seq=1,
-            ),
-        ),
-        Cell(
-            why="qwen4_exp fp8 pool decode P=1, 24/2/256: histories 200 and 48 span "
-            "pages and KV tiles",
-            spec=dict(
-                _QWEN4_FP8,
-                cached=(200, 48),
-                new=(1, 1),
-                num_contexts=0,
-                predicted_tokens_per_seq=1,
-            ),
-        ),
-        *(
-            Cell(
-                why=f"qwen4_exp fp8 pool MTP verify P={p}, 24/2/256 (max_draft_len {p - 1})",
-                spec=dict(
-                    _QWEN4_FP8,
-                    cached=(70, 35),
-                    new=(p, p),
-                    num_contexts=0,
-                    predicted_tokens_per_seq=p,
-                ),
-            )
-            for p in (2, 4, 5, 6, 7, 8)
-        ),
-        Cell(
-            why="qwen4_exp fp8 pool mixed step P=3, 24/2/256: a 20-row context ahead "
-            "of two P=3 blocks over histories 31 and 64",
-            spec=dict(
-                _QWEN4_FP8,
-                cached=(0, 31, 64),
-                new=(20, 3, 3),
-                num_contexts=1,
-                predicted_tokens_per_seq=3,
-            ),
-        ),
-        Cell(
-            why="qwen4_exp fp8 pool mixed step P=8, 24/2/256: a 20-row context ahead "
-            "of two P=8 blocks over histories 31 and 64",
-            spec=dict(
-                _QWEN4_FP8,
-                cached=(0, 31, 64),
-                new=(20, 8, 8),
-                num_contexts=1,
-                predicted_tokens_per_seq=8,
-            ),
-        ),
-        # KV stays within one 128-key tile (histories to 119 plus 8 rows), where the e4m3
-        # probability model of `reference` is the kernel's own at any batch.
-        Cell(
-            why="qwen4_exp fp8 batch P=8 G=32: 32 blocks over histories 1..119, 256 q rows",
-            spec=dict(
-                _QWEN4_FP8_G32,
-                cached=_spread(32, 119),
-                new=(8,) * 32,
-                num_contexts=0,
-                predicted_tokens_per_seq=8,
-            ),
-        ),
-        Cell(
-            why="qwen4_exp fp8 hybrid pool P=2: row 47 of the 48-row two-pool mapping "
-            "(pool 0, layer-in-pool 11) over e4m3 slabs",
-            spec=dict(
-                _QWEN4_FP8,
-                pool_layout="hybrid48",
-                local_layer_idx=47,
-                cached=(64, 25),
-                new=(2, 2),
-                num_contexts=0,
-                predicted_tokens_per_seq=2,
-            ),
-        ),
-        Cell(
-            why="qwen4_exp fp8 hybrid pool P=8: row 47 of the 48-row two-pool mapping "
-            "(pool 0, layer-in-pool 11) over e4m3 slabs",
-            spec=dict(
-                _QWEN4_FP8,
-                pool_layout="hybrid48",
-                local_layer_idx=47,
-                cached=(64, 25),
-                new=(8, 8),
-                num_contexts=0,
-                predicted_tokens_per_seq=8,
-            ),
-        ),
-        Cell(
-            why="qwen4_exp nvfp4 pool paged-context prefill, 24/2/256: a fresh 48-row "
-            "sequence beside 33 rows over a 48-token e2m1 prefix",
-            spec=dict(
-                _QWEN4_NVFP4,
-                cached=(0, 48),
-                new=(48, 33),
-                num_contexts=2,
-                predicted_tokens_per_seq=1,
-            ),
-        ),
-        Cell(
-            why="qwen4_exp nvfp4 pool decode P=1, 24/2/256: histories 200 and 48",
-            spec=dict(
-                _QWEN4_NVFP4,
-                cached=(200, 48),
-                new=(1, 1),
-                num_contexts=0,
-                predicted_tokens_per_seq=1,
-            ),
-        ),
-        Cell(
-            why="qwen4_exp nvfp4 pool MTP verify P=2, 24/2/256 (max_draft_len 1)",
-            spec=dict(
-                _QWEN4_NVFP4,
-                cached=(70, 35),
-                new=(2, 2),
-                num_contexts=0,
-                predicted_tokens_per_seq=2,
-            ),
-        ),
-        Cell(
-            why="qwen4_exp nvfp4 pool MTP verify P=4, 24/2/256 (max_draft_len 3)",
-            spec=dict(
-                _QWEN4_NVFP4,
-                cached=(70, 35),
-                new=(4, 4),
-                num_contexts=0,
-                predicted_tokens_per_seq=4,
-            ),
-        ),
-        Cell(
-            why="qwen4_exp nvfp4 pool mixed step P=1: a 20-row context ahead of two "
-            "1-row sequences over histories 31 and 64",
-            spec=dict(
-                _QWEN4_NVFP4,
-                cached=(0, 31, 64),
-                new=(20, 1, 1),
-                num_contexts=1,
-                predicted_tokens_per_seq=1,
-            ),
-        ),
-        Cell(
-            why="qwen4_exp nvfp4 pool mixed step P=4: a 20-row context ahead of two 4-row blocks",
-            spec=dict(
-                _QWEN4_NVFP4,
-                cached=(0, 31, 64),
-                new=(20, 4, 4),
-                num_contexts=1,
-                predicted_tokens_per_seq=4,
-            ),
-        ),
     )
 
     note = """
@@ -863,7 +362,7 @@ class ThopAttention(OpWrapper):
         v: Optional[torch.Tensor],
         output: torch.Tensor,
         output_sf: Optional[torch.Tensor],
-        workspace_: Optional[torch.Tensor],
+        workspace: Optional[torch.Tensor],
         sequence_length: torch.Tensor,
         host_past_key_value_lengths: torch.Tensor,
         host_total_kv_lens: torch.Tensor,
@@ -929,7 +428,7 @@ class ThopAttention(OpWrapper):
         use_spec_decoding: bool,
         is_spec_dec_tree: bool,
         spec_decoding_generation_lengths: Optional[torch.Tensor],
-        spec_decoding_position_offsets_for_cpp: Optional[torch.Tensor],
+        spec_decoding_position_offsets: Optional[torch.Tensor],
         spec_decoding_packed_mask: Optional[torch.Tensor],
         spec_decoding_bl_tree_mask_offset: Optional[torch.Tensor],
         spec_decoding_bl_tree_mask: Optional[torch.Tensor],
@@ -980,13 +479,15 @@ class ThopAttention(OpWrapper):
         """Writes `output` in place and returns it -- the op destroys its
         prior contents in rows `[:num_tokens]`, so a caller that wants them
         has to have kept its own copy beforehand."""
-        thop.attention(
+        if is_mla_enable and q_lora_rank is None:
+            raise ValueError("q_lora_rank must be an int for MLA; use 0 when there is no q-LoRA.")
+        FallbackFmha.attention(
             q=q,
             k=k,
             v=v,
             output=output,
             output_sf=output_sf,
-            workspace_=workspace_,
+            workspace=workspace,
             sequence_length=sequence_length,
             host_past_key_value_lengths=host_past_key_value_lengths,
             host_total_kv_lens=host_total_kv_lens,
@@ -1052,7 +553,7 @@ class ThopAttention(OpWrapper):
             use_spec_decoding=use_spec_decoding,
             is_spec_dec_tree=is_spec_dec_tree,
             spec_decoding_generation_lengths=spec_decoding_generation_lengths,
-            spec_decoding_position_offsets_for_cpp=spec_decoding_position_offsets_for_cpp,
+            spec_decoding_position_offsets=spec_decoding_position_offsets,
             spec_decoding_packed_mask=spec_decoding_packed_mask,
             spec_decoding_bl_tree_mask_offset=spec_decoding_bl_tree_mask_offset,
             spec_decoding_bl_tree_mask=spec_decoding_bl_tree_mask,

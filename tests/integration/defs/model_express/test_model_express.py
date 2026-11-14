@@ -21,13 +21,16 @@ from pathlib import Path
 
 import pytest
 
+from defs.conftest import skip_no_hopper
 from defs.model_express.mx_harness import (
     ROLES,
     MxE2ECase,
     MxRunLayout,
     archive_run_artifacts,
+    assert_moe_partition,
     assert_probe_payload,
     assert_transfer_evidence,
+    assert_transfer_within_manifests,
     assert_weight_manifests,
     build_canonical_snapshot,
     build_metadata_only_snapshot,
@@ -37,7 +40,9 @@ from defs.model_express.mx_harness import (
     donor_session,
     load_payload,
     log_tail,
+    moe_worker_args,
     mx_metadata_ports,
+    probe_worker_args,
     report_timings,
     require_mx_environment,
     resolve_model_path,
@@ -110,6 +115,46 @@ _MX_CASES = (
     ),
     pytest.param(
         MxE2ECase(
+            model_env="TRTLLM_MX_QWEN3_FP8_MODEL",
+            default_model_subdir="Qwen3/Qwen3-8B-FP8",
+            repository_cache_prefix="models--trtllm-mx-e2e--qwen3-fp8-block-tp1",
+            tp_size=1,
+        ),
+        id="qwen3-fp8-block-tp1",
+        marks=[pytest.mark.skip_less_device(2), skip_no_hopper],
+    ),
+    pytest.param(
+        MxE2ECase(
+            model_env="TRTLLM_MX_QWEN3_FP8_MODEL",
+            default_model_subdir="Qwen3/Qwen3-8B-FP8",
+            repository_cache_prefix="models--trtllm-mx-e2e--qwen3-fp8-block-tp2",
+            tp_size=2,
+        ),
+        id="qwen3-fp8-block-tp2",
+        marks=[pytest.mark.skip_less_device(4), skip_no_hopper],
+    ),
+    pytest.param(
+        MxE2ECase(
+            model_env="TRTLLM_MX_QWEN3_TIED_MODEL",
+            default_model_subdir="Qwen3/Qwen3-4B",
+            repository_cache_prefix="models--trtllm-mx-e2e--qwen3-tied-tp1",
+            tp_size=1,
+        ),
+        id="qwen3-tied-bf16-tp1",
+        marks=pytest.mark.skip_less_device(2),
+    ),
+    pytest.param(
+        MxE2ECase(
+            model_env="TRTLLM_MX_QWEN3_TIED_MODEL",
+            default_model_subdir="Qwen3/Qwen3-4B",
+            repository_cache_prefix="models--trtllm-mx-e2e--qwen3-tied-tp2",
+            tp_size=2,
+        ),
+        id="qwen3-tied-bf16-tp2",
+        marks=pytest.mark.skip_less_device(4),
+    ),
+    pytest.param(
+        MxE2ECase(
             model_env="TRTLLM_MX_MISTRAL_MODEL",
             default_model_subdir="Mistral-7B-Instruct-v0.3",
             repository_cache_prefix="models--trtllm-mx-e2e--mistral-tp1",
@@ -148,6 +193,63 @@ _MX_CASES = (
         id="phi3-bf16-tp2",
         marks=pytest.mark.skip_less_device(4),
     ),
+    pytest.param(
+        MxE2ECase(
+            model_env="TRTLLM_MX_QWEN3_5_MODEL",
+            default_model_subdir="Qwen3.5-9B",
+            repository_cache_prefix="models--trtllm-mx-e2e--qwen3_5-tp1",
+            tp_size=1,
+            probe="image",
+        ),
+        id="qwen3_5-bf16-tp1",
+        marks=pytest.mark.skip_less_device(2),
+    ),
+    pytest.param(
+        MxE2ECase(
+            model_env="TRTLLM_MX_QWEN3_5_MODEL",
+            default_model_subdir="Qwen3.5-9B",
+            repository_cache_prefix="models--trtllm-mx-e2e--qwen3_5-tp2",
+            tp_size=2,
+            probe="image",
+        ),
+        id="qwen3_5-bf16-tp2",
+        marks=pytest.mark.skip_less_device(4),
+    ),
+    pytest.param(
+        MxE2ECase(
+            model_env="TRTLLM_MX_QWEN3_MOE_MODEL",
+            default_model_subdir="Qwen3/Qwen3-30B-A3B",
+            repository_cache_prefix="models--trtllm-mx-e2e--qwen3-moe-tp1",
+            tp_size=1,
+            moe_disable_finalize_fusion=True,
+        ),
+        id="qwen3-moe-bf16-tp1",
+        # Each role holds all of the roughly 57 GiB of BF16 weights on one GPU.
+        marks=[pytest.mark.skip_less_device(2), pytest.mark.skip_less_device_memory(80000)],
+    ),
+    pytest.param(
+        MxE2ECase(
+            model_env="TRTLLM_MX_QWEN3_MOE_MODEL",
+            default_model_subdir="Qwen3/Qwen3-30B-A3B",
+            repository_cache_prefix="models--trtllm-mx-e2e--qwen3-moe-tp2",
+            tp_size=2,
+            moe_disable_finalize_fusion=True,
+        ),
+        id="qwen3-moe-bf16-tp2",
+        marks=pytest.mark.skip_less_device(4),
+    ),
+    pytest.param(
+        MxE2ECase(
+            model_env="TRTLLM_MX_QWEN3_MOE_MODEL",
+            default_model_subdir="Qwen3/Qwen3-30B-A3B",
+            repository_cache_prefix="models--trtllm-mx-e2e--qwen3-moe-tp2-ep2",
+            tp_size=2,
+            moe_ep_size=2,
+            moe_disable_finalize_fusion=True,
+        ),
+        id="qwen3-moe-bf16-tp2-ep2",
+        marks=pytest.mark.skip_less_device(4),
+    ),
 )
 
 
@@ -155,13 +257,19 @@ _MX_CASES = (
 def test_mx_donor_receiver(case: MxE2ECase, tmp_path: Path, output_dir, request) -> None:
     """Compare HF, MX donor, and no-weight-shards MX receiver outputs and weight manifests.
 
-    Three checks stack up: exact greedy token equality across the roles (the
+    Four checks stack up: exact greedy token equality across the roles (the
     behavioral probe), the receiver's per-rank RDMA completion records proving
-    its bytes arrived through P2P, and byte-exact weight manifests at the
-    transfer boundary and after finalization. The timing report and the
-    artifact archive are produced from the cleanup path, so `timing.json` and
-    everything under `output_dir` (when pytest runs with `--output-dir`, always
-    in CI) survive a failure with whatever the finished roles produced.
+    its bytes arrived through P2P, byte-exact weight manifests at the transfer
+    boundary and after finalization, and a bound on each RDMA record: it may
+    move no more than the distinct parameter views of its rank's transfer
+    manifest, so a storage shared by several parameters, such as a tied LM
+    head, crosses the wire once. For a MoE row, the final manifests must also
+    show the row's MoE partition in every routed-expert tensor shape, so the
+    comparisons cannot pass on an unrequested partition that all roles share.
+    The timing report and the artifact archive are produced from the cleanup
+    path, so `timing.json` and everything under `output_dir` (when pytest runs
+    with `--output-dir`, always in CI) survive a failure with whatever the
+    finished roles produced.
     """
     required_gpus = case.tp_size * 2
     mx_url, gpu_ids = require_mx_environment(required_gpus)
@@ -179,6 +287,8 @@ def test_mx_donor_receiver(case: MxE2ECase, tmp_path: Path, output_dir, request)
     donor_gpu_ids = gpu_ids[: case.tp_size]
     receiver_gpu_ids = gpu_ids[case.tp_size :]
     donor_port, receiver_port = mx_metadata_ports(case.tp_size)
+    # Every role of a row gets the same probe and MoE settings.
+    role_args = (*probe_worker_args(case), *moe_worker_args(case))
 
     try:
         # Leave donor GPUs untouched in case MPI worker teardown trails the baseline process.
@@ -188,6 +298,7 @@ def test_mx_donor_receiver(case: MxE2ECase, tmp_path: Path, output_dir, request)
                 model_path=donor_snapshot,
                 tp_size=case.tp_size,
                 output_path=layout.output("baseline"),
+                extra_args=role_args,
             ),
             worker_environment(
                 receiver_gpu_ids, layout.transfer_logs("baseline"), layout.manifest_dir
@@ -206,6 +317,7 @@ def test_mx_donor_receiver(case: MxE2ECase, tmp_path: Path, output_dir, request)
                 ready_file=layout.donor_ready,
                 stop_file=layout.donor_stop,
                 max_serve_seconds=timeout_s + 120,
+                extra_args=role_args,
             ),
             environment=worker_environment(
                 donor_gpu_ids,
@@ -225,6 +337,7 @@ def test_mx_donor_receiver(case: MxE2ECase, tmp_path: Path, output_dir, request)
                     tp_size=case.tp_size,
                     output_path=layout.output("receiver"),
                     mx_url=mx_url,
+                    extra_args=role_args,
                 ),
                 worker_environment(
                     receiver_gpu_ids,
@@ -253,6 +366,8 @@ def test_mx_donor_receiver(case: MxE2ECase, tmp_path: Path, output_dir, request)
         assert_transfer_evidence(case, layout.log("receiver"))
         manifests = collect_weight_manifests(layout.manifest_dir, case)
         assert_weight_manifests(case, manifests)
+        assert_moe_partition(case, manifests, model_path)
+        assert_transfer_within_manifests(case, layout.log("receiver"), manifests)
     finally:
         # Best-effort timing first so `timing.json` exists even after a worker
         # or assertion failure; then archive everything the run left behind.

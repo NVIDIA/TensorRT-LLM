@@ -39,7 +39,7 @@ from tensorrt_llm.serve.openai_protocol import (
     KVCacheTruncateTokensRequest,
     ensure_request_chat_template_allowed,
 )
-from tensorrt_llm.serve.render import RenderResources, legacy_render_enabled, render_conversation
+from tensorrt_llm.serve.render import RenderResources, render_conversation
 
 
 class ResourceGovernor:
@@ -128,7 +128,7 @@ class ResourceGovernor:
             processor=self.processor,
             default_chat_template=getattr(self, "chat_template", None),
         )
-        return resources.legacy_view() if legacy_render_enabled() else resources
+        return resources
 
     async def _convert_messages(
         self,

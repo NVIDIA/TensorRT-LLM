@@ -29,7 +29,7 @@ from tensorrt_llm._torch.modules.linear import (Linear, WeightMode,
                                                 WeightsLoadingConfig)
 from tensorrt_llm._torch.modules.swiglu import swiglu
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor, model_extra_attrs
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_version, is_sm_120f
 from tensorrt_llm.math_utils import pad_up
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
@@ -345,6 +345,7 @@ def nvfp4_gemm_perf_test(
     from tensorrt_llm._torch.autotuner import AutoTuner
     AutoTuner.get().print_statistics()
 
+    output_ref = None
     if test_ref:
         with nvtx.annotate(
                 f"ref tune, m={SEQ_LEN}, k={HIDDEN_SIZE}, n={OUTPUT_SIZE}",
@@ -771,8 +772,8 @@ def test_fp4_linear_cuda_core(dtype, mnk):
 
 
 @pytest.mark.skipif(
-    not (89 <= get_sm_version() < 100 or get_sm_version() in (120, 121)),
-    reason="Dense Marlin NVFP4 runs on SM89-99 and SM120/121",
+    not (89 <= get_sm_version() < 100 or is_sm_120f()),
+    reason="Dense Marlin NVFP4 runs on SM89-99 and SM12x family",
 )
 @pytest.mark.parametrize("quant_algo", [QuantAlgo.NVFP4, QuantAlgo.W4A16_NVFP4])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
@@ -797,7 +798,7 @@ def test_fp4_linear_cuda_core(dtype, mnk):
         (128, 928, 1360),
     ])
 def test_fp4_linear_marlin(quant_algo, dtype, mnk):
-    if quant_algo == QuantAlgo.NVFP4 and get_sm_version() in (120, 121):
+    if quant_algo == QuantAlgo.NVFP4 and is_sm_120f():
         pytest.skip(
             "Marlin backend shouldn't be used for NVFP4 quant on SM120/121")
     SEQ_LEN, OUTPUT_SIZE, HIDDEN_SIZE = mnk

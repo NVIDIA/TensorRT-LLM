@@ -14,7 +14,47 @@
 # the License.
 
 if(${BUILD_PYT})
-  add_gtest(thUtilsTest thUtilsTest.cpp eagerMoeWorkspaceTest.cpp)
-  target_link_libraries(thUtilsTest PUBLIC th_utils ${Python3_LIBRARIES}
-                                           ${TORCH_LIBRARIES})
+  add_tllm_gtest(
+    fmhaParamsTest
+    SOURCES
+    fmhaParamsTest.cpp
+    LINK_LIBRARIES
+    tllm::common_logging
+    trtllm_gen_fmha_interface
+    ${Python3_LIBRARIES}
+    ${TORCH_LIBRARIES}
+    OWNER
+    runtime
+    LABELS
+    "unit;runtime;host")
+  get_directory_property(
+    fmha_params_generated_include_dir
+    DIRECTORY "${PROJECT_SOURCE_DIR}/tensorrt_llm" DEFINITION
+              TRTLLM_FMHA_PARAMS_GENERATED_INCLUDE_DIR)
+  target_include_directories(fmhaParamsTest
+                             PRIVATE ${fmha_params_generated_include_dir})
+
+  add_tllm_gtest(
+    allreduceTacticCacheTest
+    OWNER
+    common
+    SOURCES
+    allreduceTacticCacheTest.cpp
+    LINK_LIBRARIES
+    tllm::common_logging
+    ${TORCH_LIBRARIES}
+    CUDA::cudart
+    LABELS
+    "unit;common;host")
+  add_tllm_gtest(
+    thUtilsTest
+    OWNER
+    runtime
+    SOURCES
+    thUtilsTest.cpp
+    eagerMoeWorkspaceTest.cpp
+    LINK_LIBRARIES
+    tllm::torch_utils
+    LABELS
+    "unit;runtime;thop;gpu")
 endif()

@@ -16,6 +16,11 @@ from typing import List, Optional, Union
 
 from typing_extensions import NotRequired, TypedDict
 
+# HTTP response header carrying server-side timings; the LLM and VisualGen
+# servers both set it. Defined here, in a module with no TensorRT-LLM imports,
+# so neither serving path has to import the other's metrics module.
+SERVER_TIMING_HEADER = "Server-Timing"
+
 
 class StepMetrics(TypedDict):
     forward_start_time: float

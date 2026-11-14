@@ -21,13 +21,54 @@ import pytest
 import torch
 from _torch.helpers import (calc_diff, per_block_cast_to_fp8,
                             per_block_cast_to_fp8_e8m0)
-from utils.util import getSMVersion, isSM100Family
+from utils.util import getSMVersion, isSM100Family, isSM120Family
 
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
 from tensorrt_llm._torch.cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
                                                 IS_CUTLASS_DSL_RUBIN_AVAILABLE)
+
+
+@pytest.mark.skipif(
+    getSMVersion() not in (100, 103, 107) or not IS_CUTLASS_DSL_AVAILABLE,
+    reason="The small-M kernel needs CuTe DSL on SM100/SM103/SM107",
+)
+@pytest.mark.parametrize("m", [1, 64])
+@pytest.mark.parametrize("k, n", [(5120, 2304), (1152, 5120), (5120, 4608),
+                                  (2304, 5120)])
+def test_fp8_block_scale_small_m_matches_reference(m, k, n):
+    """The small-M tactic equals the dequantized product; the race may pick either path."""
+    from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
+        FP8BlockScaleGemmRunner, fp8_block_scale_gemm_autotuned)
+
+    torch.random.manual_seed(0)
+    a = torch.randn((m, k), device='cuda', dtype=torch.bfloat16)
+    b = torch.randn((n, k), device='cuda', dtype=torch.bfloat16)
+    b_fp8, b_sf = per_block_cast_to_fp8_e8m0(b)
+    dequantized = b_fp8.float() * b_sf.repeat_interleave(
+        128, 0)[:n].repeat_interleave(128, 1)[:, :k]
+    reference = (a.double() @ dequantized.double().t()).float()
+    packed = fp8_utils.transform_sf_into_required_layout(b_sf,
+                                                         mn=n,
+                                                         k=k,
+                                                         recipe=(1, 128, 128),
+                                                         is_sfa=False)
+
+    runner = FP8BlockScaleGemmRunner(torch.bfloat16)
+    inputs = [a, b_fp8, packed, b_sf]
+    assert runner.small_m_applies(inputs)
+    torch.testing.assert_close(runner(inputs, tactic=0).float(),
+                               reference,
+                               rtol=1e-2,
+                               atol=1e-2)
+
+    AutoTuner.get().clear_cache()
+    with autotune():
+        tuned = fp8_block_scale_gemm_autotuned(*inputs)
+    served = fp8_block_scale_gemm_autotuned(*inputs)
+    torch.testing.assert_close(served, tuned, rtol=0, atol=0)
+    assert calc_diff(served, reference) < 1e-2
 
 
 @pytest.mark.skipif(
@@ -68,7 +109,7 @@ def test_fp8_block_scale_deep_gemm(dtype, m, k, n):
 
 
 @pytest.mark.skipif(
-    getSMVersion() not in (100, 107, 89, 120),
+    getSMVersion() not in (100, 107, 89, 120, 121),
     reason="The test is for Blackwell and Ada only. Current SM is %d." %
     getSMVersion(),
 )
@@ -91,7 +132,7 @@ def test_fp8_block_scale_gemm(dtype, m, k, n):
     a = torch.randn((m, k), device='cuda', dtype=dtype) / k
     b = torch.randn((n, k), device='cuda', dtype=dtype) / k
 
-    if getSMVersion() == 120:
+    if isSM120Family():
         act_a_fp8, act_a_sf = fp8_utils.per_token_quant_and_transform(a)
         act_b_fp8, act_b_sf = per_block_cast_to_fp8_e8m0(b)
         act_b_sf = fp8_utils.transform_sf_into_required_layout(
@@ -163,7 +204,7 @@ def test_cute_dsl_fp8_block_scale_gemm(dtype, m, k, n, use_tvm_ffi):
 
 
 @pytest.mark.skipif(
-    getSMVersion() != 90 and getSMVersion() != 89 and getSMVersion() != 120,
+    getSMVersion() not in (90, 89, 120, 121),
     reason="The test is for Hopper and Ada only. Current SM is %d." %
     getSMVersion(),
 )
@@ -189,7 +230,7 @@ def test_fp8_block_scale_bmm(dtype, m, k, n, num_groups):
     a = torch.randn((m, num_groups, k), device='cuda', dtype=dtype) / k
     b = torch.randn((num_groups, n, k), device='cuda', dtype=dtype) / k
 
-    if getSMVersion() == 120:
+    if isSM120Family():
         a_fp8, a_scales = fp8_utils.per_token_quant_and_transform(
             a, need_permute102=True)
         b_fp8, b_scales = per_block_cast_to_fp8_e8m0(b)
@@ -223,7 +264,7 @@ def test_fp8_block_scale_bmm(dtype, m, k, n, num_groups):
 
 
 @pytest.mark.skipif(
-    getSMVersion() != 120,
+    not isSM120Family(),
     reason="The test is for SM120 only. Current SM is %d." % getSMVersion(),
 )
 @pytest.mark.parametrize(

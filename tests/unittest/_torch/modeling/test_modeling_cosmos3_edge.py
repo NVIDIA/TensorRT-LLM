@@ -29,7 +29,13 @@ from tensorrt_llm._torch.models.modeling_cosmos3_edge import (
 )
 from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLVisionPatchMerger
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
-from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams, MultimodalRuntimeData
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MultimodalInput,
+    MultimodalItemMetadata,
+    MultimodalParams,
+    MultimodalRuntimeData,
+)
 from tensorrt_llm.llmapi.llm_args import MultimodalConfig
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -155,12 +161,12 @@ def test_edge_disagg_handoff_without_deepstack():
     )
     processor._tokenizer = _FakeTokenizer([11, vision_start, image_token_id, vision_end, 12])
 
-    handoff = processor.build_disagg_prefill_multimodal_inputs(
+    prompt_token_ids, params = processor.build_disagg_prefill_multimodal_inputs(
         {"prompt": "image prompt"},
         [{"tensor_size": (2, 16)}],
     )
 
-    assert handoff.prompt_token_ids == [
+    assert prompt_token_ids == [
         11,
         vision_start,
         image_token_id,
@@ -168,7 +174,7 @@ def test_edge_disagg_handoff_without_deepstack():
         vision_end,
         12,
     ]
-    assert handoff.multimodal_embedding_lengths == [2]
+    assert params.item_metadata.output_embedding_lengths == (2,)
 
 
 @pytest.mark.cpu_only
@@ -240,10 +246,7 @@ def _enable_encoder_cache(model, max_bytes: int):
     model.model_config._frozen = False
     model.model_config.multimodal_config = MultimodalConfig(encoder_cache_max_bytes=max_bytes)
     assert model.encoder_cache_active
-    if hasattr(model, "_initialize_multimodal_encoder_cache"):
-        cache = model._initialize_multimodal_encoder_cache(max_bytes)
-    else:
-        cache = model._get_multimodal_encoder_cache()
+    cache = model._initialize_multimodal_encoder_cache(max_bytes)
     assert cache is not None
     return cache
 
@@ -390,7 +393,9 @@ class TestCosmos3Edge(_qwen3vl.TestQwen3VL):
                     ),
                     multimodal_data={
                         "image": {"pixel_values": pixels, "image_grid_thw": grid},
-                        "multimodal_embedding_lengths": [rows],
+                        MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                            item_refs=[("image", 0)], output_embedding_lengths=[rows]
+                        ),
                         "mm_processor_kwargs_hash": "edge-review",
                     },
                     multimodal_runtime=MultimodalRuntimeData(
@@ -415,19 +420,20 @@ class TestCosmos3Edge(_qwen3vl.TestQwen3VL):
         processor = object.__new__(Cosmos3EdgeInputProcessor)
         processor._config = self.hf_config
         processor._tokenizer = _FakeTokenizer([11, vision_start, image_token_id, vision_end, 12])
-        handoff = processor.build_disagg_prefill_multimodal_inputs(
+        prompt_token_ids, params = processor.build_disagg_prefill_multimodal_inputs(
             {"prompt": "image"},
             [{"tensor_size": tuple(first.shape)}],
         )
-        self.assertEqual(handoff.multimodal_embedding_lengths, [rows])
-        input_ids = torch.tensor(handoff.prompt_token_ids, dtype=torch.long, device="cuda")
+        self.assertEqual(params.item_metadata.output_embedding_lengths, (rows,))
+        params.multimodal_data["multimodal_embedding"] = first
+        input_ids = torch.tensor(prompt_token_ids, dtype=torch.long, device="cuda")
         image_positions = torch.nonzero(input_ids == image_token_id, as_tuple=False).flatten()
         text_positions = torch.nonzero(input_ids != image_token_id, as_tuple=False).flatten()
         self.assertEqual(image_positions.numel(), rows)
         prepared = model.prepare_multimodal_inputs(
             input_ids=input_ids,
             positions=None,
-            multimodal_params=[MultimodalParams(multimodal_data={"multimodal_embedding": first})],
+            multimodal_params=[params],
             num_context_requests=1,
             text_token_indices=text_positions,
             mm_token_indices=image_positions,

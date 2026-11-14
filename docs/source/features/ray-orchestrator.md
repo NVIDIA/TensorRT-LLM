@@ -39,7 +39,7 @@ Currently available:
 ## Architecture
 This feature introduces new classes such as [RayExecutor](source:tensorrt_llm/executor/ray/executor.py) and [RayGPUWorker](source:tensorrt_llm/executor/ray/gpu_worker.py) for Ray actor lifecycle management and distributed inference. In Ray mode, collective ops run on [torch.distributed](https://docs.pytorch.org/tutorials/beginner/dist_overview.html) without MPI. We welcome contributions to improve and extend this support.
 
-![Ray orchestrator architecture](/docs/source/media/ray_orchestrator_architecture.jpg)
+![Ray orchestrator architecture](https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/media/ray_orchestrator_architecture.jpg)
 
 ## Environment Variables
 

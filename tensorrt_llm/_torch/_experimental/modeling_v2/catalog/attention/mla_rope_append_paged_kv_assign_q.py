@@ -31,7 +31,7 @@ class MlaRopeAppendPagedKvAssignQ(OpWrapper):
     # fixed by the checkpoint -- 512-wide compressed_kv, 64-wide k_pe, 128
     # heads -- so the cells vary what a step actually varies: how much of each
     # sequence was already cached, how many tokens are new, and the page size.
-    _R1 = dict(
+    R1 = dict(
         head_num=128,
         nope_size=128,
         rope_size=64,
@@ -43,24 +43,15 @@ class MlaRopeAppendPagedKvAssignQ(OpWrapper):
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="production context call: fp8 pool, page 32, mixed cached lengths",
-            spec=dict(cached=[0, 32, 100], new=[37, 64, 300], tokens_per_block=32, **_R1),
+            spec=dict(cached=[0, 32, 100], new=[37, 64, 300], tokens_per_block=32, **R1),
         ),
         Cell(
             why="page 64, the size a tuned MLA target opts into",
-            spec=dict(cached=[0, 32, 100], new=[37, 64, 300], tokens_per_block=64, **_R1),
+            spec=dict(cached=[0, 32, 100], new=[37, 64, 300], tokens_per_block=64, **R1),
         ),
         Cell(
             why="a single new token on top of a long cached prefix -- the decode-adjacent shape",
-            spec=dict(cached=[511], new=[1], tokens_per_block=64, **_R1),
-        ),
-        Cell(
-            why="deepseek default at attention TP8: 16 heads per rank, production context",
-            spec=dict(
-                cached=[0, 32, 100],
-                new=[37, 64, 300],
-                tokens_per_block=32,
-                **dict(_R1, head_num=16),
-            ),
+            spec=dict(cached=[511], new=[1], tokens_per_block=64, **R1),
         ),
     )
 

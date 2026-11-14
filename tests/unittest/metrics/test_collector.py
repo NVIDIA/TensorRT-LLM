@@ -19,6 +19,7 @@ from typing import Dict
 import pytest
 from prometheus_client import REGISTRY
 
+from tensorrt_llm.logger import logger
 from tensorrt_llm.metrics.collector import MAX_SPEC_DECODE_POSITION_LABELS, MetricsCollector
 from tensorrt_llm.metrics.enums import MetricNames, RequestEventTiming
 from tensorrt_llm.metrics.perf_utils import process_req_perf_metrics
@@ -47,16 +48,18 @@ def collector():
     return MetricsCollector(labels)
 
 
-def _get_gauge_value(collector, metric_name: str):
+def _get_gauge_value(collector, metric_name: str, dp_rank: int | None = None):
     """Get the current value of a Prometheus gauge."""
     metric = getattr(collector, metric_name)
-    return metric.labels(**collector.labels)._value.get()
+    rank_labels = {"dp_rank": str(dp_rank)} if dp_rank is not None else {}
+    return metric.labels(**collector.labels, **rank_labels)._value.get()
 
 
-def _get_counter_value(collector, metric_name: str):
+def _get_counter_value(collector, metric_name: str, dp_rank: int | None = None):
     """Get the current value of a Prometheus counter."""
     metric = getattr(collector, metric_name)
-    return metric.labels(**collector.labels)._value.get()
+    rank_labels = {"dp_rank": str(dp_rank)} if dp_rank is not None else {}
+    return metric.labels(**collector.labels, **rank_labels)._value.get()
 
 
 SAMPLE_ITERATION_STATS = {
@@ -143,18 +146,267 @@ class TestKVCacheStats:
     def test_kv_cache_block_gauges(self, collector):
         collector.log_iteration_stats(SAMPLE_ITERATION_STATS)
 
-        assert _get_gauge_value(collector, "kv_cache_max_blocks") == 1000
-        assert _get_gauge_value(collector, "kv_cache_free_blocks") == 400
-        assert _get_gauge_value(collector, "kv_cache_used_blocks") == 600
-        assert _get_gauge_value(collector, "kv_cache_tokens_per_block") == 64
+        assert _get_gauge_value(collector, "kv_cache_max_blocks", dp_rank=0) == 1000
+        assert _get_gauge_value(collector, "kv_cache_free_blocks", dp_rank=0) == 400
+        assert _get_gauge_value(collector, "kv_cache_used_blocks", dp_rank=0) == 600
+        assert _get_gauge_value(collector, "kv_cache_tokens_per_block", dp_rank=0) == 64
 
     def test_kv_cache_utilization(self, collector):
         collector.log_iteration_stats(SAMPLE_ITERATION_STATS)
-        assert _get_gauge_value(collector, "kv_cache_utilization") == pytest.approx(0.6)
+        assert _get_gauge_value(collector, "kv_cache_utilization", dp_rank=0) == pytest.approx(0.6)
 
     def test_kv_cache_hit_rate(self, collector):
         collector.log_iteration_stats(SAMPLE_ITERATION_STATS)
-        assert _get_gauge_value(collector, "kv_cache_hit_rate") == pytest.approx(0.85)
+        assert _get_gauge_value(collector, "kv_cache_hit_rate", dp_rank=0) == pytest.approx(0.85)
+
+
+class TestAttentionDpIterationMetrics:
+    """Keep independent rank histories and shared measurement ownership."""
+
+    @pytest.mark.parametrize("order", [(0, 1, 0, 1), (1, 0, 1, 0), (0, 0, 1, 1)])
+    def test_cumulative_counters_are_independent(
+        self, collector: MetricsCollector, order: tuple[int, ...]
+    ) -> None:
+        snapshots = {
+            0: iter([(32, 100), (32, 100)]),
+            1: iter([(5, 20), (6, 21)]),
+        }
+        for rank in order:
+            reused, missed = next(snapshots[rank])
+            collector.log_iteration_stats(
+                {
+                    "attentionDpRank": rank,
+                    "kvCacheStats": {
+                        "reusedBlocks": reused,
+                        "missedBlocks": missed,
+                    },
+                }
+            )
+
+        # The total is invariant under interleaving when each rank keeps FIFO order.
+        for metric, total in [
+            (collector.kv_cache_reused_blocks, 38),
+            (collector.kv_cache_missed_blocks, 121),
+        ]:
+            assert (
+                sum(
+                    sample.value
+                    for family in metric.collect()
+                    for sample in family.samples
+                    if sample.name.endswith("_total")
+                )
+                == total
+            )
+        for rank, reused, missed in [(0, 32, 100), (1, 6, 21)]:
+            assert _get_counter_value(collector, "kv_cache_reused_blocks", rank) == reused
+            assert _get_counter_value(collector, "kv_cache_missed_blocks", rank) == missed
+
+    @pytest.mark.parametrize("decreased_value", [0, 7])
+    def test_cumulative_decrease_drops_delta_and_rebaselines(
+        self, collector: MetricsCollector, decreased_value: int, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Drop a decrease without affecting another rank or later positive deltas."""
+        warnings = []
+        monkeypatch.setattr(logger, "warning", warnings.append)
+        for rank, value, expected, warning_count in [
+            (0, 100, 100, 0),
+            (1, 50, 50, 0),
+            (0, decreased_value, 100, 2),
+            (1, 52, 52, 2),
+            (0, 10, 110 - decreased_value, 2),
+            (0, 10, 110 - decreased_value, 2),
+        ]:
+            collector.log_iteration_stats(
+                {
+                    "attentionDpRank": rank,
+                    "kvCacheStats": {
+                        "reusedBlocks": value,
+                        "missedBlocks": value,
+                    },
+                }
+            )
+            for metric in ["kv_cache_reused_blocks", "kv_cache_missed_blocks"]:
+                assert _get_counter_value(collector, metric, rank) == expected
+            assert len(warnings) == warning_count
+        for metric in ["kv_cache_reused_blocks", "kv_cache_missed_blocks"]:
+            assert _get_counter_value(collector, metric, 0) == 110 - decreased_value
+            assert _get_counter_value(collector, metric, 1) == 52
+        for field, warning in zip(["reusedBlocks", "missedBlocks"], warnings):
+            assert field in warning
+            assert "dp_rank=0" in warning
+            assert f"from 100 to {decreased_value}" in warning
+
+    @pytest.mark.parametrize(
+        "identity, rank",
+        [
+            ({}, 0),
+            ({"rank": 2}, 2),
+            ({"attentionDpRank": "1"}, 1),
+            ({"attentionDpRank": 0, "rank": 2}, 0),
+        ],
+    )
+    def test_rank_identity_fallback_and_partial_snapshots(
+        self, collector: MetricsCollector, identity: dict, rank: int
+    ) -> None:
+        collector.log_iteration_stats({**identity, "kvCacheStats": {"reusedBlocks": 3}})
+        collector.log_iteration_stats({**identity, "kvCacheStats": {"missedBlocks": 2}})
+        collector.log_iteration_stats({**identity, "kvCacheStats": None})
+        collector.log_iteration_stats(
+            {"attentionDpRank": rank, "kvCacheStats": {"reusedBlocks": 4, "missedBlocks": 3}}
+        )
+        assert _get_counter_value(collector, "kv_cache_reused_blocks", rank) == 4
+        assert _get_counter_value(collector, "kv_cache_missed_blocks", rank) == 3
+
+    def test_local_gauges_and_histograms_keep_rank_values(
+        self, collector: MetricsCollector
+    ) -> None:
+        for rank, used, context in [(0, 3, 1), (1, 8, 4)]:
+            collector.log_iteration_stats(
+                {
+                    "attentionDpRank": rank,
+                    "maxNumActiveRequests": 8,
+                    "kvCacheStats": {
+                        "usedNumBlocks": used,
+                        "maxNumBlocks": 100,
+                        "freeNumBlocks": 100 - used,
+                        "tokensPerBlock": 32,
+                        "cacheHitRate": used / 10,
+                    },
+                    "inflightBatchingStats": {
+                        "numContextRequests": context,
+                        "numGenRequests": 2,
+                        "numPausedRequests": rank,
+                        "numScheduledRequests": context + 2,
+                        "numCtxTokens": 64 * context,
+                    },
+                }
+            )
+        for rank, used, context in [(0, 3, 1), (1, 8, 4)]:
+            collector.log_iteration_stats({"attentionDpRank": rank, "kvCacheStats": None})
+            expected = {
+                "kv_cache_used_blocks": used,
+                "kv_cache_free_blocks": 100 - used,
+                "kv_cache_max_blocks": 100,
+                "kv_cache_tokens_per_block": 32,
+                "kv_cache_utilization": used / 100,
+                "kv_cache_hit_rate": used / 10,
+                "num_context_requests": context,
+                "num_generation_requests": 2,
+                "num_paused_requests": rank,
+                "num_scheduled_requests": context + 2,
+                "total_context_tokens": 64 * context,
+                "gauge_prefill_batch_occupancy": context / 8,
+            }
+            for metric, value in expected.items():
+                assert _get_gauge_value(collector, metric, rank) == pytest.approx(value)
+            assert _get_histogram_count(collector, "histogram_prefill_batch_tokens", rank) == 1
+            assert (
+                _get_histogram_sum(collector, "histogram_prefill_batch_tokens", rank)
+                == 64 * context
+            )
+
+    def test_rank0_owned_fields_are_not_overwritten_or_counted_twice(
+        self, collector: MetricsCollector
+    ) -> None:
+        collector.log_iteration_stats({**SAMPLE_ITERATION_STATS, "attentionDpRank": 0})
+        collector.log_iteration_stats(
+            {
+                **SAMPLE_ITERATION_STATS,
+                "attentionDpRank": 1,
+                "numQueuedRequests": 0,
+                "gpuMemUsage": 123,
+                "numActiveRequests": 99,
+                "iterLatencyMS": 999,
+            }
+        )
+        expected = {
+            "num_requests_running": 5,
+            "num_requests_waiting": 3,
+            "max_num_active_requests": 10,
+            "iteration_latency_seconds": 0.0155,
+            "gpu_memory_usage_bytes": 4_000_000_000,
+            "cpu_memory_usage_bytes": 2_000_000_000,
+            "pinned_memory_usage_bytes": 500_000_000,
+            "max_batch_size_static": 64,
+            "max_batch_size_runtime": 32,
+            "max_num_tokens_runtime": 8192,
+            "avg_decoded_tokens_per_iter": 4.5,
+            "spec_decode_acceptance_length": 3.75,
+            "spec_decode_draft_overhead": 1.2,
+        }
+        for metric, value in expected.items():
+            assert _get_gauge_value(collector, metric) == pytest.approx(value)
+        assert _get_counter_value(collector, "counter_num_requests_completed") == 2
+        assert _get_counter_value(collector, "counter_spec_decode_num_draft_tokens") == 20
+        assert _get_counter_value(collector, "counter_spec_decode_num_accepted_tokens") == 15
+
+    def test_iteration_deltas_and_zero_cache_tiers_are_ranked(
+        self, collector: MetricsCollector
+    ) -> None:
+        for rank, tokens, reuse in [(0, [0, 0], 3), (1, [4, 0], 7), (1, [1, 2], 2)]:
+            collector.log_iteration_stats(
+                {
+                    "attentionDpRank": rank,
+                    "iterCachedTokensByLevel": tokens,
+                    "kvCacheLevelTiers": ["gpu", "host"],
+                    "iterConnectorCachedTokens": 0,
+                    "kvCacheIterationStats": {"16": {"iterReusedBlocks": reuse}},
+                }
+            )
+        assert _get_counter_value(collector, "kv_cache_iter_reused_blocks", 0) == 3
+        assert _get_counter_value(collector, "kv_cache_iter_reused_blocks", 1) == 9
+        for rank, tokens in [(0, [0, 0]), (1, [5, 2])]:
+            for level, tier in enumerate(["gpu", "host"]):
+                labels = {
+                    **collector.labels,
+                    "dp_rank": str(rank),
+                    "cache_level": str(level),
+                    "cache_tier": tier,
+                }
+                assert _has_series(collector.counter_tokens_cached_prompt_by_tier, labels)
+                assert (
+                    _counter_value_with_labels(
+                        collector.counter_tokens_cached_prompt_by_tier, labels
+                    )
+                    == tokens[level]
+                )
+            assert _has_series(
+                collector.counter_tokens_cached_prompt_by_tier,
+                {
+                    **collector.labels,
+                    "dp_rank": str(rank),
+                    "cache_level": "",
+                    "cache_tier": "connector",
+                },
+            )
+
+    def test_request_and_config_labels_remain_independent(
+        self, collector: MetricsCollector
+    ) -> None:
+        collector.log_iteration_stats({**SAMPLE_ITERATION_STATS, "attentionDpRank": 1})
+        collector.log_request_metrics_dict(SAMPLE_REQUEST_METRICS_FULL)
+        collector.log_request_error(400)
+        collector.log_config_info(model_config={"dtype": "bfloat16"})
+        assert collector.labels == {"model_name": "test_model"}
+        assert (
+            REGISTRY.get_sample_value(
+                "trtllm_request_success_total", {**collector.labels, "finished_reason": "end_id"}
+            )
+            == 1
+        )
+        assert REGISTRY.get_sample_value("trtllm_prompt_tokens_total", collector.labels) == 128
+        assert (
+            REGISTRY.get_sample_value(
+                "trtllm_request_error_total", {**collector.labels, "http_code": "400"}
+            )
+            == 1
+        )
+        assert (
+            REGISTRY.get_sample_value(
+                "trtllm_model_config_info", {**collector.labels, "dtype": "bfloat16"}
+            )
+            == 1
+        )
 
 
 class TestInflightBatchingStats:
@@ -163,11 +415,11 @@ class TestInflightBatchingStats:
     def test_inflight_batching_gauges(self, collector):
         collector.log_iteration_stats(SAMPLE_ITERATION_STATS)
 
-        assert _get_gauge_value(collector, "num_context_requests") == 2
-        assert _get_gauge_value(collector, "num_generation_requests") == 3
-        assert _get_gauge_value(collector, "num_paused_requests") == 1
-        assert _get_gauge_value(collector, "num_scheduled_requests") == 5
-        assert _get_gauge_value(collector, "total_context_tokens") == 256
+        assert _get_gauge_value(collector, "num_context_requests", dp_rank=0) == 2
+        assert _get_gauge_value(collector, "num_generation_requests", dp_rank=0) == 3
+        assert _get_gauge_value(collector, "num_paused_requests", dp_rank=0) == 1
+        assert _get_gauge_value(collector, "num_scheduled_requests", dp_rank=0) == 5
+        assert _get_gauge_value(collector, "total_context_tokens", dp_rank=0) == 256
         assert _get_gauge_value(collector, "avg_decoded_tokens_per_iter") == pytest.approx(4.5)
 
     def test_missing_inflight_batching_stats(self, collector):
@@ -208,8 +460,8 @@ class TestPartialStats:
                 }
             }
         )
-        assert _get_gauge_value(collector, "kv_cache_max_blocks") == 100
-        assert _get_gauge_value(collector, "kv_cache_used_blocks") == 50
+        assert _get_gauge_value(collector, "kv_cache_max_blocks", dp_rank=0) == 100
+        assert _get_gauge_value(collector, "kv_cache_used_blocks", dp_rank=0) == 50
 
 
 class TestConfigInfoMetrics:
@@ -402,24 +654,26 @@ class TestPerRequestTokenCounters:
         assert _get_counter_value(collector, "counter_generation_tokens") == 130  # 50 + 42 + 38
 
 
-def _get_histogram_sum(collector, metric_name: str):
+def _get_histogram_sum(collector, metric_name: str, dp_rank: int | None = None):
     """Return the sum of all observations in a Prometheus histogram."""
     histogram = getattr(collector, metric_name)
+    labels = {**collector.labels, **({"dp_rank": str(dp_rank)} if dp_rank is not None else {})}
     for metric in REGISTRY.collect():
         if metric.name == histogram._name:
             for sample in metric.samples:
-                if sample.name.endswith("_sum") and sample.labels == collector.labels:
+                if sample.name.endswith("_sum") and sample.labels == labels:
                     return sample.value
     return 0.0
 
 
-def _get_histogram_count(collector, metric_name: str):
+def _get_histogram_count(collector, metric_name: str, dp_rank: int | None = None):
     """Return the number of observations in a Prometheus histogram."""
     histogram = getattr(collector, metric_name)
+    labels = {**collector.labels, **({"dp_rank": str(dp_rank)} if dp_rank is not None else {})}
     for metric in REGISTRY.collect():
         if metric.name == histogram._name:
             for sample in metric.samples:
-                if sample.name.endswith("_count") and sample.labels == collector.labels:
+                if sample.name.endswith("_count") and sample.labels == labels:
                     return int(sample.value)
     return 0
 
@@ -738,26 +992,35 @@ class TestLogIterationStatsKvCacheIteration:
         collector.log_iteration_stats(stats)
 
         # Host utilization = 20/50 = 0.4
-        assert _get_gauge_value(collector, "kv_cache_host_utilization") == pytest.approx(0.4)
+        assert _get_gauge_value(collector, "kv_cache_host_utilization", dp_rank=0) == pytest.approx(
+            0.4
+        )
         # Iter reuse rate = 5/(5+3) = 0.625
-        assert _get_gauge_value(collector, "kv_cache_iter_reuse_rate") == pytest.approx(0.625)
-        assert _get_counter_value(collector, "kv_cache_disk_prefetch_blocks_total") == 7
+        assert _get_gauge_value(collector, "kv_cache_iter_reuse_rate", dp_rank=0) == pytest.approx(
+            0.625
+        )
+        assert _get_counter_value(collector, "kv_cache_disk_prefetch_blocks_total", dp_rank=0) == 7
         assert [
             _counter_value_with_labels(
                 collector.counter_tokens_cached_prompt_by_tier,
-                {**collector.labels, "cache_level": str(level), "cache_tier": tier},
+                {**collector.labels, "dp_rank": "0", "cache_level": str(level), "cache_tier": tier},
             )
             for level, tier in enumerate(["gpu", "gpu", "host"])
         ] == [5, 2, 1]
         # No connector serves tokens, so no connector series is reported.
         assert not _has_series(
             collector.counter_tokens_cached_prompt_by_tier,
-            {**collector.labels, "cache_level": "", "cache_tier": "connector"},
+            {**collector.labels, "dp_rank": "0", "cache_level": "", "cache_tier": "connector"},
         )
 
     def test_connector_cached_tokens_logged_as_connector_tier(self):
         collector = _make_kv_iter_collector()
-        connector_labels = {**collector.labels, "cache_level": "", "cache_tier": "connector"}
+        connector_labels = {
+            **collector.labels,
+            "dp_rank": "0",
+            "cache_level": "",
+            "cache_tier": "connector",
+        }
 
         # The series is visible before the connector serves its first token.
         collector.log_iteration_stats({"iterConnectorCachedTokens": 0})
@@ -809,41 +1072,41 @@ class TestLogIterationStatsKvCacheIteration:
         }
 
         # Read baseline counter values (may be non-zero from prior tests)
-        before_reused = _get_counter_value(collector, "kv_cache_iter_reused_blocks")
-        before_missed = _get_counter_value(collector, "kv_cache_iter_missed_blocks")
-        before_onboard = _get_counter_value(collector, "kv_cache_onboard_bytes_total")
+        before_reused = _get_counter_value(collector, "kv_cache_iter_reused_blocks", dp_rank=0)
+        before_missed = _get_counter_value(collector, "kv_cache_iter_missed_blocks", dp_rank=0)
+        before_onboard = _get_counter_value(collector, "kv_cache_onboard_bytes_total", dp_rank=0)
         before_intra_device = _get_counter_value(
-            collector, "kv_cache_intra_device_copy_bytes_total"
+            collector, "kv_cache_intra_device_copy_bytes_total", dp_rank=0
         )
 
         # First call
         collector.log_iteration_stats(stats)
         assert _get_counter_value(
-            collector, "kv_cache_iter_reused_blocks"
+            collector, "kv_cache_iter_reused_blocks", dp_rank=0
         ) - before_reused == pytest.approx(5)
         assert _get_counter_value(
-            collector, "kv_cache_iter_missed_blocks"
+            collector, "kv_cache_iter_missed_blocks", dp_rank=0
         ) - before_missed == pytest.approx(3)
         assert _get_counter_value(
-            collector, "kv_cache_onboard_bytes_total"
+            collector, "kv_cache_onboard_bytes_total", dp_rank=0
         ) - before_onboard == pytest.approx(4096)
         assert _get_counter_value(
-            collector, "kv_cache_intra_device_copy_bytes_total"
+            collector, "kv_cache_intra_device_copy_bytes_total", dp_rank=0
         ) - before_intra_device == pytest.approx(8192)
 
         # Second call — counters should accumulate further
         collector.log_iteration_stats(stats)
         assert _get_counter_value(
-            collector, "kv_cache_iter_reused_blocks"
+            collector, "kv_cache_iter_reused_blocks", dp_rank=0
         ) - before_reused == pytest.approx(10)
         assert _get_counter_value(
-            collector, "kv_cache_iter_missed_blocks"
+            collector, "kv_cache_iter_missed_blocks", dp_rank=0
         ) - before_missed == pytest.approx(6)
         assert _get_counter_value(
-            collector, "kv_cache_onboard_bytes_total"
+            collector, "kv_cache_onboard_bytes_total", dp_rank=0
         ) - before_onboard == pytest.approx(8192)
         assert _get_counter_value(
-            collector, "kv_cache_intra_device_copy_bytes_total"
+            collector, "kv_cache_intra_device_copy_bytes_total", dp_rank=0
         ) - before_intra_device == pytest.approx(16384)
 
     def test_v2_lifecycle_and_pool_group_stats_are_aggregated(self):
@@ -888,32 +1151,38 @@ class TestLogIterationStatsKvCacheIteration:
             },
         }
 
-        before_reused = _get_counter_value(collector, "kv_cache_iter_reused_blocks")
-        before_missed = _get_counter_value(collector, "kv_cache_iter_missed_blocks")
+        before_reused = _get_counter_value(collector, "kv_cache_iter_reused_blocks", dp_rank=0)
+        before_missed = _get_counter_value(collector, "kv_cache_iter_missed_blocks", dp_rank=0)
         before_connector_reused = _get_counter_value(
-            collector, "kv_cache_iter_connector_reused_blocks"
+            collector, "kv_cache_iter_connector_reused_blocks", dp_rank=0
         )
-        before_gen_alloc = _get_counter_value(collector, "kv_cache_gen_alloc_blocks_total")
-        before_onboard = _get_counter_value(collector, "kv_cache_onboard_bytes_total")
+        before_gen_alloc = _get_counter_value(
+            collector, "kv_cache_gen_alloc_blocks_total", dp_rank=0
+        )
+        before_onboard = _get_counter_value(collector, "kv_cache_onboard_bytes_total", dp_rank=0)
 
         collector.log_iteration_stats(stats)
 
-        assert _get_gauge_value(collector, "kv_cache_host_utilization") == pytest.approx(0.4)
-        assert _get_gauge_value(collector, "kv_cache_iter_reuse_rate") == pytest.approx(5 / 8)
+        assert _get_gauge_value(collector, "kv_cache_host_utilization", dp_rank=0) == pytest.approx(
+            0.4
+        )
+        assert _get_gauge_value(collector, "kv_cache_iter_reuse_rate", dp_rank=0) == pytest.approx(
+            5 / 8
+        )
         assert _get_counter_value(
-            collector, "kv_cache_iter_reused_blocks"
+            collector, "kv_cache_iter_reused_blocks", dp_rank=0
         ) - before_reused == pytest.approx(5)
         assert _get_counter_value(
-            collector, "kv_cache_iter_missed_blocks"
+            collector, "kv_cache_iter_missed_blocks", dp_rank=0
         ) - before_missed == pytest.approx(3)
         assert _get_counter_value(
-            collector, "kv_cache_iter_connector_reused_blocks"
+            collector, "kv_cache_iter_connector_reused_blocks", dp_rank=0
         ) - before_connector_reused == pytest.approx(2)
         assert _get_counter_value(
-            collector, "kv_cache_gen_alloc_blocks_total"
+            collector, "kv_cache_gen_alloc_blocks_total", dp_rank=0
         ) - before_gen_alloc == pytest.approx(2)
         assert _get_counter_value(
-            collector, "kv_cache_onboard_bytes_total"
+            collector, "kv_cache_onboard_bytes_total", dp_rank=0
         ) - before_onboard == pytest.approx(4096)
 
     def test_v2_cold_pool_group_stats_work_without_hot_views(self):
@@ -930,7 +1199,9 @@ class TestLogIterationStatsKvCacheIteration:
 
         collector.log_iteration_stats(stats)
 
-        assert _get_gauge_value(collector, "kv_cache_host_utilization") == pytest.approx(0.4)
+        assert _get_gauge_value(collector, "kv_cache_host_utilization", dp_rank=0) == pytest.approx(
+            0.4
+        )
 
     def test_v2_ssm_only_lifecycle_falls_back_to_attention_window_stats(self):
         """An SSM lifecycle entry must not hide attention's window aggregate."""
@@ -960,17 +1231,19 @@ class TestLogIterationStatsKvCacheIteration:
                 }
             },
         }
-        before_reused = _get_counter_value(collector, "kv_cache_iter_reused_blocks")
-        before_missed = _get_counter_value(collector, "kv_cache_iter_missed_blocks")
+        before_reused = _get_counter_value(collector, "kv_cache_iter_reused_blocks", dp_rank=0)
+        before_missed = _get_counter_value(collector, "kv_cache_iter_missed_blocks", dp_rank=0)
 
         collector.log_iteration_stats(stats)
 
-        assert _get_gauge_value(collector, "kv_cache_iter_reuse_rate") == pytest.approx(0.5)
+        assert _get_gauge_value(collector, "kv_cache_iter_reuse_rate", dp_rank=0) == pytest.approx(
+            0.5
+        )
         assert _get_counter_value(
-            collector, "kv_cache_iter_reused_blocks"
+            collector, "kv_cache_iter_reused_blocks", dp_rank=0
         ) - before_reused == pytest.approx(2)
         assert _get_counter_value(
-            collector, "kv_cache_iter_missed_blocks"
+            collector, "kv_cache_iter_missed_blocks", dp_rank=0
         ) - before_missed == pytest.approx(2)
 
     def test_multiple_windows_aggregated(self):
@@ -1019,17 +1292,21 @@ class TestLogIterationStatsKvCacheIteration:
         stats = {"kvCacheIterationStats": {"16": ws16, "64": ws64}}
 
         # Read baseline
-        before_reused = _get_counter_value(collector, "kv_cache_iter_reused_blocks")
+        before_reused = _get_counter_value(collector, "kv_cache_iter_reused_blocks", dp_rank=0)
 
         collector.log_iteration_stats(stats)
 
         # Host utilization = (5+8) / (10+10) = 13/20 = 0.65
-        assert _get_gauge_value(collector, "kv_cache_host_utilization") == pytest.approx(0.65)
+        assert _get_gauge_value(collector, "kv_cache_host_utilization", dp_rank=0) == pytest.approx(
+            0.65
+        )
         # Iter reuse rate = (2+3) / (2+3+2+2) = 5/9
-        assert _get_gauge_value(collector, "kv_cache_iter_reuse_rate") == pytest.approx(5 / 9)
+        assert _get_gauge_value(collector, "kv_cache_iter_reuse_rate", dp_rank=0) == pytest.approx(
+            5 / 9
+        )
         # Counters: delta should be 5 (2+3)
         assert _get_counter_value(
-            collector, "kv_cache_iter_reused_blocks"
+            collector, "kv_cache_iter_reused_blocks", dp_rank=0
         ) - before_reused == pytest.approx(5)
 
     def test_zero_deltas_no_counter_increment(self):
@@ -1059,15 +1336,15 @@ class TestLogIterationStatsKvCacheIteration:
                 }
             }
         }
-        before_reused = _get_counter_value(collector, "kv_cache_iter_reused_blocks")
-        before_missed = _get_counter_value(collector, "kv_cache_iter_missed_blocks")
+        before_reused = _get_counter_value(collector, "kv_cache_iter_reused_blocks", dp_rank=0)
+        before_missed = _get_counter_value(collector, "kv_cache_iter_missed_blocks", dp_rank=0)
         collector.log_iteration_stats(stats)
-        assert _get_counter_value(collector, "kv_cache_iter_reused_blocks") == pytest.approx(
-            before_reused
-        )
-        assert _get_counter_value(collector, "kv_cache_iter_missed_blocks") == pytest.approx(
-            before_missed
-        )
+        assert _get_counter_value(
+            collector, "kv_cache_iter_reused_blocks", dp_rank=0
+        ) == pytest.approx(before_reused)
+        assert _get_counter_value(
+            collector, "kv_cache_iter_missed_blocks", dp_rank=0
+        ) == pytest.approx(before_missed)
 
 
 # ---------------------------------------------------------------------------
@@ -1311,15 +1588,17 @@ class TestPrefillBatchOccupancy:
     def test_occupancy_computed(self, collector):
         # numContextRequests=2 / maxNumActiveRequests=10 = 0.2
         collector.log_iteration_stats(SAMPLE_ITERATION_STATS)
-        assert _get_gauge_value(collector, "gauge_prefill_batch_occupancy") == pytest.approx(0.2)
+        assert _get_gauge_value(
+            collector, "gauge_prefill_batch_occupancy", dp_rank=0
+        ) == pytest.approx(0.2)
 
     def test_prefill_batch_tokens_histogram(self, collector):
         # numCtxTokens=256 observed once
         collector.log_iteration_stats(SAMPLE_ITERATION_STATS)
-        assert _get_histogram_count(collector, "histogram_prefill_batch_tokens") == 1
-        assert _get_histogram_sum(collector, "histogram_prefill_batch_tokens") == pytest.approx(
-            256.0
-        )
+        assert _get_histogram_count(collector, "histogram_prefill_batch_tokens", dp_rank=0) == 1
+        assert _get_histogram_sum(
+            collector, "histogram_prefill_batch_tokens", dp_rank=0
+        ) == pytest.approx(256.0)
 
     def test_zero_ctx_tokens_no_histogram_observation(self, collector):
         stats = {
@@ -1330,14 +1609,14 @@ class TestPrefillBatchOccupancy:
             },
         }
         collector.log_iteration_stats(stats)
-        assert _get_histogram_count(collector, "histogram_prefill_batch_tokens") == 0
+        assert _get_histogram_count(collector, "histogram_prefill_batch_tokens", dp_rank=0) == 0
 
     def test_zero_max_active_no_divide_by_zero(self, collector):
         """maxNumActiveRequests=0 must not divide-by-zero or update the gauge."""
         stats = {**SAMPLE_ITERATION_STATS, "maxNumActiveRequests": 0}
         collector.log_iteration_stats(stats)
         # Gauge default is 0; the guard skips the update so the value stays 0.
-        assert _get_gauge_value(collector, "gauge_prefill_batch_occupancy") == 0
+        assert _get_gauge_value(collector, "gauge_prefill_batch_occupancy", dp_rank=0) == 0
 
     def test_occupancy_full(self, collector):
         """When numContextRequests == maxNumActiveRequests, occupancy = 1.0."""
@@ -1350,13 +1629,15 @@ class TestPrefillBatchOccupancy:
             },
         }
         collector.log_iteration_stats(stats)
-        assert _get_gauge_value(collector, "gauge_prefill_batch_occupancy") == pytest.approx(1.0)
+        assert _get_gauge_value(
+            collector, "gauge_prefill_batch_occupancy", dp_rank=0
+        ) == pytest.approx(1.0)
 
     def test_missing_ifb_stats_no_error(self, collector):
         """No inflightBatchingStats → no histogram observation and no gauge update."""
         stats = {k: v for k, v in SAMPLE_ITERATION_STATS.items() if k != "inflightBatchingStats"}
         collector.log_iteration_stats(stats)
-        assert _get_histogram_count(collector, "histogram_prefill_batch_tokens") == 0
+        assert _get_histogram_count(collector, "histogram_prefill_batch_tokens", dp_rank=0) == 0
 
 
 class TestRequestErrorCounter:

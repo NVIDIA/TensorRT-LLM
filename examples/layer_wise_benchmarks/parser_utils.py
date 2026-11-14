@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import re
 import subprocess
 import sys
@@ -52,18 +55,12 @@ parser_keywords = [
     ("cutlassGroupGemm", "cutlass::device_kernel<cutlass::gemm::kernel::GemmUniversal"),
     ("cutlassGemm", "GemmUniversal"),
     ("CuteDSLMoePermute", "cute_dsl::moePermuteKernel"),
-    (
-        "CuteDSLGemm",
-        ["cute_dsl_kernels", "blockscaled_gemm_persistent"],
-    ),
-    (
-        "CuteDSLGroupedGemmSwiglu",
-        ["cute_dsl_kernels", "blockscaled_contiguous_grouped_gemm_swiglu_fusion"],
-    ),
-    (
-        "CuteDSLGroupedGemmFinalize",
-        ["cute_dsl_kernels", "blockscaled_contiguous_grouped_gemm_finalize_fusion"],
-    ),
+    # A CuTe DSL kernel name embeds the repr of its kernel object, which carries
+    # the defining module path with the dots removed. Match the kernel-family
+    # module name alone, not the package it lives in or the kernel method name.
+    ("CuteDSLGemm", "blockscaled_gemm_persistent"),
+    ("CuteDSLGroupedGemmSwiglu", "blockscaled_contiguous_grouped_gemm_swiglu_fusion"),
+    ("CuteDSLGroupedGemmFinalize", "blockscaled_contiguous_grouped_gemm_finalize_fusion"),
     ("torchAdd", "at::native::CUDAFunctorOnSelf_add"),
     ("torchAdd", "CUDAFunctor_add"),
     ("torchClamp", "at::native::<unnamed>::launch_clamp_scalar("),

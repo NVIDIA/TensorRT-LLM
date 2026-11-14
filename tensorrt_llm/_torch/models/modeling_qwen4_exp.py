@@ -42,10 +42,11 @@ from ..modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
 from ..modules.mamba.layernorm_gated import rms_norm_gated_token_major
 from ..modules.mamba.mamba2_metadata import Mamba2Metadata
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
+from ..modules.qwen4_exp.cache_manager import get_qwen4_exp_ple_layer_mask
 from ..modules.qwen4_exp.hyper_connection import HCResidual, Qwen4ExpHyperConnection
 from ..modules.qwen4_exp.ple import PLEMetadata, Qwen4ExpPLE
 from ..modules.rms_norm import RMSNorm
-from ..pyexecutor.config_utils import get_qwen3_hybrid_layer_types, get_qwen4_exp_ple_layer_mask
+from ..pyexecutor.config_utils import get_qwen3_hybrid_layer_types
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, EventType, create_lm_head_tp_mapping
 from .checkpoints.base_weight_mapper import BaseWeightMapper
@@ -493,7 +494,7 @@ class Qwen4ExpModel(DecoderModel):
         # allocated to the cache slot count and carried in place across the
         # prefill->decode boundary, mirroring the GDN conv/ssm per-slot pools and
         # indexed by the SAME mamba ``state_indices`` (see ``_prepare_ple_state``).
-        # Shapes match ``config_utils.extract_qwen4_exp_ple_cache_params``
+        # Shapes match the model-owned ``extract_qwen4_exp_ple_cache_params``.
         # (conv_state_shape / ngram_context_len).
         self._ple_conv_state: Optional[torch.Tensor] = None
         self._ple_ngram_context: Optional[torch.Tensor] = None
@@ -911,16 +912,21 @@ class Qwen4ExpLogitsProcessor(nn.Module):
         lm_head: nn.Module,
         attn_metadata: AttentionMetadata,
         return_context_logits: bool = False,
+        *,
+        keep_lm_head_dtype: bool = False,
     ) -> torch.Tensor:
+        """Logits as fp32, or in the LM head's dtype with ``keep_lm_head_dtype``."""
         if not self.model_config.mapping.is_last_pp_rank():
-            return lm_head(hidden_states).float()
+            logits = lm_head(hidden_states)
+            return logits if keep_lm_head_dtype else logits.float()
         if not return_context_logits:
             if attn_metadata is not None:
                 last_tokens = torch.cumsum(attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
                 hidden_states = hidden_states[last_tokens]
             else:
                 hidden_states = hidden_states[-1]
-        return lm_head(self._collapse(hidden_states)).float()
+        logits = lm_head(self._collapse(hidden_states))
+        return logits if keep_lm_head_dtype else logits.float()
 
 
 class Qwen4ExpMTPHead(Qwen4ExpLogitsProcessor):

@@ -14,14 +14,17 @@
 # limitations under the License.
 """B12x MoE backend gating and dispatch tests."""
 
+import dataclasses
+import inspect
 import sys
 import types
-from typing import Optional
+from typing import NoReturn, Optional
 from unittest.mock import patch
 
 import pytest
 import torch
 
+from tensorrt_llm._torch.moe.fused_moe.cutlass import TrtllmCutlassNvfp4Impl
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import (
     CuteDslB12xFusedMoE,
     CuteDslB12xNvfp4FusedMoE,
@@ -29,10 +32,12 @@ from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import (
     _patch_flashinfer_w4a16_ultra_wide_fc2_tile_validation,
 )
 from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
+    MoECommPlan,
     MoEDeployment,
     MoEEnvironment,
     MoEProblem,
     MoERejectReason,
+    MoERunContext,
     canonical_quant,
 )
 from tensorrt_llm._torch.moe.fused_moe.impl_environment import MoEDep
@@ -40,6 +45,7 @@ from tensorrt_llm._torch.moe.fused_moe.quantization import (
     NVFP4CuteDslB12xFusedMoEMethod,
     NVFP4CutlassFusedMoEMethod,
 )
+from tensorrt_llm._torch.peft.lora.layer import LoraModuleType
 from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
@@ -70,6 +76,8 @@ def _deployment(
     use_dp: bool = False,
     parallel_size: Optional[int] = None,
     eplb: bool = False,
+    force_dynamic_quantization: bool = False,
+    oss_cutlass_moe: bool = True,
 ) -> MoEDeployment:
     """Declare the machine rather than patching the probes that read it."""
     return MoEDeployment(
@@ -79,8 +87,10 @@ def _deployment(
         use_dp=use_dp,
         num_slots=8,
         eplb_enabled=eplb,
+        force_dynamic_quantization=force_dynamic_quantization,
         env=MoEEnvironment(
             sm=sm,
+            oss_cutlass_moe=oss_cutlass_moe,
             available_deps=(MoEDep.FLASHINFER.value,) if flashinfer else (),
         ),
     )
@@ -161,9 +171,13 @@ def test_can_implement_rejects_swiglu_gptoss_style():
     assert verdict.reject_reason is MoERejectReason.ACTIVATION_UNSUPPORTED
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float8_e4m3fn])
-def test_can_implement_rejects_unsupported_activation_dtype(dtype):
-    verdict = NVFP4_LEAF.can_implement(_problem(dtype=dtype), _deployment(120))
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32, torch.float8_e4m3fn])
+@pytest.mark.parametrize("leaf,quant_algo", B12X_LEAVES, ids=LEAF_IDS)
+def test_can_implement_rejects_unsupported_activation_dtype(leaf, quant_algo, dtype):
+    """``B12xMoEWrapper`` reads and writes bfloat16 only, so float16 is turned
+    down too, on both leaves: the W4A16 kernel has a float16 path of its own,
+    but the wrapper hands it a bfloat16 output buffer."""
+    verdict = leaf.can_implement(_problem(quant_algo, dtype=dtype), _deployment(120))
     assert not verdict.eligible
     assert verdict.reject_reason is MoERejectReason.DTYPE_UNSUPPORTED
 
@@ -179,6 +193,29 @@ def test_can_implement_rejects_eplb():
     verdict = NVFP4_LEAF.can_implement(_problem(), _deployment(120, eplb=True))
     assert not verdict.eligible
     assert verdict.reject_reason is MoERejectReason.EPLB_UNSUPPORTED
+
+
+@pytest.mark.parametrize("oss_cutlass_moe", [True, False], ids=["oss", "internal"])
+@pytest.mark.parametrize(
+    "leaf,quant_algo,eligible",
+    [
+        pytest.param(CuteDslB12xNvfp4FusedMoE, QuantAlgo.NVFP4, False, id="nvfp4"),
+        pytest.param(CuteDslB12xW4a16Nvfp4FusedMoE, QuantAlgo.W4A16_NVFP4, True, id="w4a16"),
+    ],
+)
+def test_can_implement_declines_forced_dynamic_quantization(
+    leaf, quant_algo, eligible, oss_cutlass_moe
+):
+    """The NVFP4 decode kernel quantizes against load-time scales, so per-call
+    scales would reach only the CUTLASS prefill chunks. Declined on every build,
+    for that reason rather than the prefill build gate's. The W4A16 kernel
+    quantizes no activation, so the setting asks nothing of it."""
+    deployment = _deployment(120, force_dynamic_quantization=True, oss_cutlass_moe=oss_cutlass_moe)
+    verdict = leaf.can_implement(_problem(quant_algo), deployment)
+    assert verdict.eligible is eligible
+    if not eligible:
+        assert verdict.reject_reason is MoERejectReason.DYNAMIC_QUANT_UNSUPPORTED
+        assert "force_dynamic_quantization" in verdict.detail
 
 
 def test_can_implement_rejects_expert_parallelism():
@@ -368,14 +405,257 @@ def test_dispatch_rejects_non_tensor():
 
 
 # ---------------------------------------------------------------------------
+# run_moe call boundary: each MoERunContext field is honoured or refused
+# ---------------------------------------------------------------------------
+
+_DECODE_TOKENS = CuteDslB12xNvfp4FusedMoE._PREFILL_VIA_CUTLASS_THRESHOLD - 1
+_PREFILL_TOKENS = CuteDslB12xNvfp4FusedMoE._PREFILL_VIA_CUTLASS_THRESHOLD
+
+# (leaf, chunk size, the kernel that chunk reaches): both routes of the NVFP4
+# leaf, and the W4A16 leaf, which has only the b12x one.
+B12X_ROUTES = [
+    pytest.param(CuteDslB12xNvfp4FusedMoE, _DECODE_TOKENS, "b12x", id="nvfp4-decode"),
+    pytest.param(CuteDslB12xNvfp4FusedMoE, _PREFILL_TOKENS, "cutlass", id="nvfp4-prefill"),
+    pytest.param(CuteDslB12xW4a16Nvfp4FusedMoE, _PREFILL_TOKENS, "b12x", id="w4a16"),
+]
+B12X_KERNEL_ROUTES = [route for route in B12X_ROUTES if route.values[2] == "b12x"]
+
+_LAYER_IDX = 3
+
+
+def _moe_lora_params(layer_idx: int) -> dict:
+    """``lora_params`` carrying a routed-expert MoE LoRA module for
+    ``layer_idx``."""
+    module_id = int(LoraModuleType.from_string("moe_h_to_4h"))
+    return {
+        "num_seqs": 1,
+        layer_idx: {module_id: {"adapter_size": None, "weight_pointers": None}},
+    }
+
+
+class _B12xWrapperRecorder:
+    """Stands in for ``B12xMoEWrapper``, writing bfloat16 as its kernels do."""
+
+    def __init__(self, log: list) -> None:
+        self.log = log
+        self.output: Optional[torch.Tensor] = None
+
+    def run(self, *, x, token_selected_experts, token_final_scales, **weights) -> torch.Tensor:
+        self.log.append("b12x")
+        self.output = torch.zeros(x.shape, dtype=torch.bfloat16)
+        return self.output
+
+
+class _RecordingEvent:
+    def __init__(self, log: list) -> None:
+        self.log = log
+
+    def wait(self, stream=None) -> None:
+        self.log.append("wait")
+
+
+def _leaf_with_recorded_kernels(leaf_cls: type, log: list, monkeypatch) -> CuteDslB12xFusedMoE:
+    """A leaf whose two kernels -- b12x and the inherited CUTLASS NVFP4
+    ``run_moe`` -- only record that they ran.
+
+    ``__new__`` without ``__init__``: the real constructor wants a GPU, while
+    ``run_moe`` reads only the layer index, the wrapper and its weights.
+    """
+
+    def cutlass_run_moe(self, ctx: MoERunContext, *, workspace=None) -> torch.Tensor:
+        log.append("cutlass")
+        return torch.zeros(ctx.x.shape, dtype=ctx.output_dtype)
+
+    monkeypatch.setattr(TrtllmCutlassNvfp4Impl, "run_moe", cutlass_run_moe)
+    leaf = leaf_cls.__new__(leaf_cls)
+    leaf.layer_idx = _LAYER_IDX
+    leaf.b12x_wrapper = _B12xWrapperRecorder(log)
+    leaf._b12x_weights = {}
+    return leaf
+
+
+def _run_context(num_tokens: int, **overrides) -> MoERunContext:
+    """What the scheduler hands a served B12x layer: routing already applied,
+    no communication strategy, bfloat16 activations."""
+    ctx = MoERunContext(
+        token_selected_experts=torch.zeros((num_tokens, 2), dtype=torch.int32),
+        token_final_scales=torch.ones((num_tokens, 2), dtype=torch.float32),
+        x=torch.zeros((num_tokens, 8), dtype=torch.bfloat16),
+        x_sf=None,
+        output_dtype=torch.bfloat16,
+        comm_plan=MoECommPlan(
+            input_sf_swizzled=True,
+            enable_alltoall=False,
+            moe_output=None,
+            payload_in_workspace=False,
+        ),
+    )
+    return dataclasses.replace(ctx, **overrides)
+
+
+@pytest.mark.parametrize("leaf_cls,num_tokens,kernel", B12X_ROUTES)
+def test_run_moe_hands_back_the_kernel_output_untouched(leaf_cls, num_tokens, kernel, monkeypatch):
+    """The served configuration reaches its kernel, and the b12x output comes
+    back as the very tensor the wrapper wrote."""
+    log = []
+    leaf = _leaf_with_recorded_kernels(leaf_cls, log, monkeypatch)
+
+    out = leaf.run_moe(_run_context(num_tokens, all_rank_num_tokens=[num_tokens]))
+
+    assert log == [kernel]
+    if kernel == "b12x":
+        assert out is leaf.b12x_wrapper.output
+
+
+@pytest.mark.parametrize(
+    "overrides,error,match",
+    [
+        pytest.param(
+            dict(do_finalize=False), NotImplementedError, "do_finalize=False", id="unfinalized"
+        ),
+        pytest.param(
+            dict(lora_params=_moe_lora_params(_LAYER_IDX)), NotImplementedError, "LoRA", id="lora"
+        ),
+        pytest.param(
+            dict(
+                token_selected_experts=None,
+                token_final_scales=None,
+                router_logits=torch.zeros(1, 8),
+            ),
+            ValueError,
+            "router_logits",
+            id="router-logits-only",
+        ),
+        pytest.param(
+            dict(
+                comm_plan=MoECommPlan(
+                    input_sf_swizzled=True,
+                    enable_alltoall=True,
+                    moe_output=None,
+                    payload_in_workspace=False,
+                )
+            ),
+            NotImplementedError,
+            "all-to-all",
+            id="alltoall",
+        ),
+    ],
+)
+@pytest.mark.parametrize("leaf_cls,num_tokens,kernel", B12X_ROUTES)
+def test_run_moe_refuses_what_neither_route_honours(
+    leaf_cls, num_tokens, kernel, overrides, error, match, monkeypatch
+):
+    """Neither kernel the leaf runs returns the unfinalized triple, fuses LoRA,
+    routes from logits or holds only a slice of the experts, so asking for any
+    of these fails before a kernel launches instead of being ignored."""
+    log = []
+    leaf = _leaf_with_recorded_kernels(leaf_cls, log, monkeypatch)
+
+    with pytest.raises(error, match=match):
+        leaf.run_moe(_run_context(num_tokens, **overrides))
+    assert log == []
+
+
+@pytest.mark.parametrize(
+    "lora_params",
+    [
+        pytest.param({"num_seqs": 1}, id="no-layer-adapters"),
+        pytest.param(_moe_lora_params(_LAYER_IDX + 1), id="moe-lora-on-another-layer"),
+    ],
+)
+@pytest.mark.parametrize("leaf_cls,num_tokens,kernel", B12X_ROUTES)
+def test_run_moe_admits_lora_params_without_moe_lora_on_its_layer(
+    leaf_cls, num_tokens, kernel, lora_params, monkeypatch
+):
+    """``lora_params`` describes every adapter of the forward. Only
+    routed-expert LoRA on this layer asks the leaf for something it cannot
+    fuse; adapters elsewhere leave its output as it is."""
+    log = []
+    leaf = _leaf_with_recorded_kernels(leaf_cls, log, monkeypatch)
+
+    leaf.run_moe(_run_context(num_tokens, lora_params=lora_params))
+
+    assert log == [kernel]
+
+
+@pytest.mark.parametrize(
+    "lora_params",
+    [
+        pytest.param(_moe_lora_params(_LAYER_IDX), id="moe-lora"),
+        pytest.param({"num_seqs": 1}, id="no-layer-adapters"),
+    ],
+)
+@pytest.mark.parametrize("leaf_cls,num_tokens,kernel", B12X_ROUTES)
+def test_run_moe_refuses_lora_params_when_it_has_no_layer_index(
+    leaf_cls, num_tokens, kernel, lora_params, monkeypatch
+):
+    """``layer_idx`` is what picks this layer's adapters out of ``lora_params``,
+    and it defaults to None. A leaf without one cannot tell MoE LoRA from the
+    adapters it may ignore, so it refuses every ``lora_params`` -- including the
+    one the same leaf admits once it knows which layer it is."""
+    log = []
+    leaf = _leaf_with_recorded_kernels(leaf_cls, log, monkeypatch)
+    leaf.layer_idx = None
+
+    with pytest.raises(NotImplementedError, match="layer_idx"):
+        leaf.run_moe(_run_context(num_tokens, lora_params=lora_params))
+    assert log == []
+
+
+@pytest.mark.parametrize("output_dtype", [torch.float16, torch.float32])
+@pytest.mark.parametrize("leaf_cls,num_tokens,kernel", B12X_KERNEL_ROUTES)
+def test_b12x_route_refuses_an_output_dtype_it_cannot_write(
+    leaf_cls, num_tokens, kernel, output_dtype, monkeypatch
+):
+    """``B12xMoEWrapper`` writes bfloat16 and refuses any other
+    ``output_dtype`` at construction, so a chunk asking for another one fails
+    rather than receiving bfloat16."""
+    log = []
+    leaf = _leaf_with_recorded_kernels(leaf_cls, log, monkeypatch)
+
+    with pytest.raises(ValueError, match="bfloat16"):
+        leaf.run_moe(_run_context(num_tokens, output_dtype=output_dtype))
+    assert log == []
+
+
+def test_cutlass_route_writes_the_requested_output_dtype(monkeypatch):
+    """The NVFP4 prefill route is the CUTLASS op, which writes any
+    high-precision dtype; only the b12x route is bound to bfloat16."""
+    log = []
+    leaf = _leaf_with_recorded_kernels(CuteDslB12xNvfp4FusedMoE, log, monkeypatch)
+
+    out = leaf.run_moe(_run_context(_PREFILL_TOKENS, output_dtype=torch.float16))
+
+    assert log == ["cutlass"]
+    assert out.dtype == torch.float16
+
+
+@pytest.mark.parametrize("leaf_cls,num_tokens,kernel", B12X_ROUTES)
+def test_run_moe_joins_the_input_ready_event_before_its_kernel(
+    leaf_cls, num_tokens, kernel, monkeypatch
+):
+    """``x`` may still be written on another stream; no kernel reads it before
+    the event the scheduler handed over."""
+    log = []
+    leaf = _leaf_with_recorded_kernels(leaf_cls, log, monkeypatch)
+
+    leaf.run_moe(_run_context(num_tokens, x_ready_event=_RecordingEvent(log)))
+
+    assert log == ["wait", kernel]
+
+
+# ---------------------------------------------------------------------------
 # flashinfer W4A16 ultra-wide FC2 tile re-validation shim (nvbug 6721561)
 # ---------------------------------------------------------------------------
 
-# FC2 problem of Qwen3.6-35B-A3B (N=hidden_size, K=moe_intermediate_size) and
-# the RTX PRO 6000 opt-in shared memory minus flashinfer's 512-byte reserve:
-# the exact geometry the post-merge failure re-pinned.
+# FC2 problem of Qwen3.6-35B-A3B (N=hidden_size, K=moe_intermediate_size), the
+# SM count and opt-in shared memory of the RTX PRO 6000, and that memory minus
+# flashinfer's 512-byte reserve: the exact geometry the post-merge failure
+# re-pinned.
 _QWEN36_FC2 = dict(problem_n=2048, problem_k=512)
-_RTX_PRO_6000_SMEM = 101376 - 512
+_RTX_PRO_6000_SMS = 188
+_RTX_PRO_6000_OPTIN_SMEM = 101376
+_RTX_PRO_6000_SMEM = _RTX_PRO_6000_OPTIN_SMEM - 512
 _ULTRA_FC2 = dict(tile_n=512, tile_k=32, cta_threads=256)
 
 
@@ -395,6 +675,46 @@ def _reset_to_stock_validator(kernel, monkeypatch) -> None:
     )
 
 
+def _reset_to_pre_fix_validator(kernel: types.ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Start from a validator that applies the search floor to every tile, as
+    flashinfer 0.6.17 to 0.7.1 do, with their signature. Where the installed
+    validator exempts forced tiles through ``enforce_search_floor``, that
+    validator with the floor always on stands in for them."""
+    _reset_to_stock_validator(kernel, monkeypatch)
+    stock = kernel._candidate_tile_fits
+    if "enforce_search_floor" not in inspect.signature(stock).parameters:
+        return
+
+    def pre_fix_fits(
+        *,
+        problem_n: int,
+        problem_k: int,
+        cta_m_blocks: int,
+        tile_n: int,
+        tile_k: int,
+        cta_threads: int,
+        max_shared_mem: int,
+        scale_format: str = "e4m3_k16",
+        weight_layout: str = "packed",
+        allow_logical_tail: bool = False,
+    ) -> bool:
+        return stock(
+            problem_n=problem_n,
+            problem_k=problem_k,
+            cta_m_blocks=cta_m_blocks,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            cta_threads=cta_threads,
+            max_shared_mem=max_shared_mem,
+            scale_format=scale_format,
+            weight_layout=weight_layout,
+            allow_logical_tail=allow_logical_tail,
+            enforce_search_floor=True,
+        )
+
+    monkeypatch.setattr(kernel, "_candidate_tile_fits", pre_fix_fits)
+
+
 def _fits(kernel, **overrides) -> bool:
     kwargs = dict(cta_m_blocks=1, max_shared_mem=_RTX_PRO_6000_SMEM, **_QWEN36_FC2, **_ULTRA_FC2)
     kwargs.update(overrides)
@@ -403,7 +723,7 @@ def _fits(kernel, **overrides) -> bool:
 
 def test_w4a16_ultra_wide_fc2_shim_accepts_repinned_ultra_tile(monkeypatch):
     kernel = _flashinfer_w4a16_kernel()
-    _reset_to_stock_validator(kernel, monkeypatch)
+    _reset_to_pre_fix_validator(kernel, monkeypatch)
     assert not _fits(kernel), (
         "flashinfer's stock validator accepts the ultra-wide FC2 tile; the shim in "
         "fused_moe_cute_dsl_b12x.py is no longer needed"
@@ -427,7 +747,7 @@ def test_w4a16_ultra_wide_fc2_shim_accepts_repinned_ultra_tile(monkeypatch):
 
 def test_w4a16_ultra_wide_fc2_shim_is_idempotent(monkeypatch):
     kernel = _flashinfer_w4a16_kernel()
-    _reset_to_stock_validator(kernel, monkeypatch)
+    _reset_to_pre_fix_validator(kernel, monkeypatch)
     stock = kernel._candidate_tile_fits
 
     assert _patch_flashinfer_w4a16_ultra_wide_fc2_tile_validation() is True
@@ -440,9 +760,67 @@ def test_w4a16_ultra_wide_fc2_shim_is_idempotent(monkeypatch):
 
 def test_w4a16_ultra_wide_fc2_shim_yields_to_upstream_fix(monkeypatch):
     kernel = _flashinfer_w4a16_kernel()
-    _reset_to_stock_validator(kernel, monkeypatch)
+    _reset_to_pre_fix_validator(kernel, monkeypatch)
     stock = kernel._candidate_tile_fits
     monkeypatch.setattr(kernel, "_ultra_wide_fc2_tile_fits", lambda **_: True, raising=False)
 
     assert _patch_flashinfer_w4a16_ultra_wide_fc2_tile_validation() is False
     assert kernel._candidate_tile_fits is stock
+
+
+def test_w4a16_ultra_wide_fc2_shim_stands_aside_on_enforce_search_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """flashinfer 0.7.2 re-validates forced tiles with
+    ``_candidate_tile_fits(..., enforce_search_floor=False)``; the hook leaves
+    that validator in place."""
+    kernel = _flashinfer_w4a16_kernel()
+    _reset_to_stock_validator(kernel, monkeypatch)
+    stock = kernel._candidate_tile_fits
+    if "enforce_search_floor" not in inspect.signature(stock).parameters:
+        pytest.skip("installed flashinfer predates enforce_search_floor")
+
+    assert _patch_flashinfer_w4a16_ultra_wide_fc2_tile_validation() is False
+    assert kernel._candidate_tile_fits is stock
+
+
+def test_w4a16_forced_ultra_wide_fc2_tile_reaches_kernel_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The custom-op launch recompiles with the tiles the selector chose,
+    forced through ``force_tile_config``. After the hook every W4A16 B12x leaf
+    runs at construction, that re-pin of the ultra-wide FC2 tile gets past tile
+    validation to the kernel build, on the installed flashinfer."""
+    kernel = _flashinfer_w4a16_kernel()
+    _reset_to_stock_validator(kernel, monkeypatch)
+    _patch_flashinfer_w4a16_ultra_wide_fc2_tile_validation()
+
+    class KernelBuildReached(Exception):
+        pass
+
+    built: dict[str, object] = {}
+
+    def build_kernel(**kwargs: object) -> NoReturn:
+        built.update(kwargs)
+        raise KernelBuildReached
+
+    # The build compiles CuTe DSL code for a GPU; only the tiles it gets matter.
+    monkeypatch.setattr(kernel, "W4A16FusedMoeKernel", build_kernel)
+    with pytest.raises(KernelBuildReached):
+        kernel.compile_w4a16_fused_moe(
+            size_m=4,
+            hidden_size=_QWEN36_FC2["problem_n"],
+            intermediate_size=_QWEN36_FC2["problem_k"],
+            num_experts=8,
+            top_k=2,
+            activation="silu",
+            apply_router_weight_on_input=False,
+            zero_fc2_output=False,
+            moe_block_size=8,
+            max_m_blocks=1,
+            sms=_RTX_PRO_6000_SMS,
+            max_shared_mem=_RTX_PRO_6000_OPTIN_SMEM,
+            # (fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n), 256 threads each.
+            force_tile_config=(128, 128, 32, 512),
+        )
+    assert (built["fc2_tile_n"], built["fc2_tile_k"]) == (512, 32)

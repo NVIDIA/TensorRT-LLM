@@ -3,12 +3,15 @@
 
 import asyncio
 import datetime
+import pickle
 import tempfile
 import threading
 import time
 from concurrent.futures import ProcessPoolExecutor
+from contextlib import closing
 from pathlib import Path
 from queue import Empty, Queue
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -92,8 +95,6 @@ def test_FusedIpcQueue():
 def create_rsp(id, finished: bool = False):
     result = tllm.Result()
     result.output_token_ids = [[id]]
-    result.log_probs = None
-    result.cum_log_probs = None
     if finished:
         result.finish_reasons = [tllm.FinishReason.END_ID]
     result.is_final = finished
@@ -117,10 +118,15 @@ def test_GenerationResultBase():
 
 @pytest.mark.parametrize("pytorch", [False, True])
 @pytest.mark.parametrize("beam_search", [False, True])
-def test_result_stream_sequence_alignment(pytorch, beam_search):
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("postproc", [False, True])
+def test_result_stream_sequence_alignment(pytorch: bool, beam_search: bool,
+                                          streaming: bool,
+                                          postproc: bool) -> None:
     from tensorrt_llm._torch.pyexecutor.llm_request import (LlmResponse,
                                                             LlmResult, PyResult)
-    from tensorrt_llm.executor.result import Logprob
+    from tensorrt_llm.executor.result import (Logprob, LogProbsResult,
+                                              ResponseWrapper)
 
     result = GenerationResultBase(id=0,
                                   sampling_params=SamplingParams(
@@ -131,18 +137,20 @@ def test_result_stream_sequence_alignment(pytorch, beam_search):
                                       top_k=10,
                                       temperature=1.0,
                                       logprobs=1))
-    for step in (1, 2):
+    worker = SimpleNamespace(_records={},
+                             _record_creator=lambda inp, tokenizer: result,
+                             _tokenizer=None,
+                             _post_processor_hook=None)
+    prompt_logprobs = [{7: Logprob(-0.75, rank=1)}]
+    for step in ((1, 2) if streaming else (2, )):
         for sequence in ([0] if beam_search else [0, 1]):
             sequences = [0, 1] if beam_search else [sequence]
             native = tllm.Result()
             native.output_token_ids = [
                 [100 + seq * 10 + pos for pos in range(1, step + 1)]
-                if beam_search else [100 + seq * 10 + step] for seq in sequences
+                if beam_search or not streaming else [100 + seq * 10 + step]
+                for seq in sequences
             ]
-            probs = [[-0.25] * len(tokens)
-                     for tokens in native.output_token_ids]
-            native.log_probs = probs
-            native.cum_log_probs = [-0.25 * step] * len(sequences)
             native.sequence_index = sequence
             native.finish_reasons = [
                 tllm.FinishReason.LENGTH
@@ -157,7 +165,7 @@ def test_result_stream_sequence_alignment(pytorch, beam_search):
                 py_result.set_log_probs([[{
                     token: Logprob(logprob=-0.25, rank=1)
                 } for token in tokens] for tokens in native.output_token_ids],
-                                        native.cum_log_probs)
+                                        [-0.25 * step] * len(sequences))
                 wrapped = LlmResult(native,
                                     py_result,
                                     is_final=native.is_final,
@@ -169,19 +177,41 @@ def test_result_stream_sequence_alignment(pytorch, beam_search):
                 response = tllm.Response(request_id=0,
                                          result=native,
                                          client_id=0)
-            result._handle_response(response)
+            # Exercise the same response wrapper and pickle boundary used by IPC
+            # and postprocessing, keeping prompt logprobs independent of Result.
+            response = pickle.loads(
+                pickle.dumps(
+                    ResponseWrapper(
+                        response,
+                        logprobs=LogProbsResult(prompt=prompt_logprobs))))
+            if postproc:
+                with closing(asyncio.new_event_loop()) as loop:
+                    loop.run_until_complete(
+                        PostprocWorker._handle_input(
+                            worker,
+                            PostprocWorker.Input(
+                                rsp=response,
+                                sampling_params=result.sampling_params,
+                                streaming=streaming)))
+            else:
+                result._handle_response(response)
             for seq in sequences:
                 output = result._outputs[seq]
                 assert output.token_ids == [
                     100 + seq * 10 + pos for pos in range(1, step + 1)
                 ]
-                assert output.token_ids_diff == [100 + seq * 10 + step]
+                assert output.token_ids_diff == ([100 + seq * 10 +
+                                                  step] if streaming else
+                                                 output.token_ids)
                 expected_logprobs = ([{
                     token: Logprob(logprob=-0.25, rank=1)
-                } for token in output.token_ids] if pytorch else [-0.25] * step)
+                } for token in output.token_ids] if pytorch else [])
                 assert output.logprobs == expected_logprobs
-                assert output.logprobs_diff == expected_logprobs[-1:]
-                assert output.cumulative_logprob == -0.25 * step
+                assert output.logprobs_diff == (
+                    expected_logprobs[-1:] if streaming else expected_logprobs)
+                assert output.prompt_logprobs == prompt_logprobs
+                assert output.cumulative_logprob == (-0.25 *
+                                                     step if pytorch else None)
                 assert output.finish_reason == ("length" if step == 2 else None)
             if pytorch:
                 assert result.time_breakdown_metrics == {"step": step}

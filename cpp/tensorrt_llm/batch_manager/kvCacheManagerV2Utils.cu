@@ -30,14 +30,58 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 constexpr uint32_t copyBlockCtaSize = 128;
 constexpr uint32_t copyBlocknbBufs = 2;
+// Loads per thread of one block-offset copy CTA: each CTA copies 1024 entries of a row,
+// so a long row is read from host memory by many CTAs in parallel.
+constexpr uint32_t copyBlockItersPerCta = 2;
 
 __device__ __host__ inline uint32_t divUp(uint32_t a, uint32_t b)
 {
     return (a + b - 1) / b;
 }
 
+void copyBasePageRowsToDevice(ITensor const& input, ITensor& output, SizeType32 numRows, CUstream stream)
+{
+    using namespace tensorrt_llm::runtime;
+
+    auto const& srcShape = input.getShape();
+    auto const& dstShape = output.getShape();
+    constexpr SizeType32 kKvFactor = 2;
+    TLLM_CHECK_WITH_INFO(srcShape.nbDims == 4 && dstShape.nbDims == 4,
+        "Base-page copy expects 4-D input and output, got %d-D and %d-D tensors.", srcShape.nbDims, dstShape.nbDims);
+    TLLM_CHECK_WITH_INFO(srcShape.d[0] == dstShape.d[0],
+        "Base-page copy pool counts must match, got %d input pools and %d output pools.", srcShape.d[0], dstShape.d[0]);
+    TLLM_CHECK_WITH_INFO(srcShape.d[2] == kKvFactor && dstShape.d[2] == kKvFactor,
+        "Base-page copy expects K/V factor %d, got %d for input and %d for output.", kKvFactor, srcShape.d[2],
+        dstShape.d[2]);
+    TLLM_CHECK_WITH_INFO(srcShape.d[3] == dstShape.d[3],
+        "Base-page copy block widths must match, got %d for input and %d for output.", srcShape.d[3], dstShape.d[3]);
+    TLLM_CHECK_WITH_INFO(numRows >= 0 && numRows <= srcShape.d[1] && numRows <= dstShape.d[1],
+        "Base-page copy row count %d must fit input capacity %d and output capacity %d.", numRows, srcShape.d[1],
+        dstShape.d[1]);
+    if (numRows == 0)
+    {
+        return;
+    }
+
+    auto const* srcPtr = input.getBufferPtr<SizeType32 const>();
+    auto* dstPtr = output.getBufferPtr<SizeType32>();
+    auto const numPools = srcShape.d[0];
+    auto const numBlocks = srcShape.d[3];
+    auto const rowStride = static_cast<size_t>(kKvFactor) * static_cast<size_t>(numBlocks);
+    auto const srcPoolStride = static_cast<size_t>(srcShape.d[1]) * rowStride;
+    auto const dstPoolStride = static_cast<size_t>(dstShape.d[1]) * rowStride;
+    auto const rowBytes = static_cast<size_t>(numBlocks) * sizeof(SizeType32);
+    auto const pitchBytes = static_cast<size_t>(rowStride) * sizeof(SizeType32);
+    for (SizeType32 pool = 0; pool < numPools; ++pool)
+    {
+        TLLM_CUDA_CHECK(cudaMemcpy2DAsync(dstPtr + pool * dstPoolStride, pitchBytes, srcPtr + pool * srcPoolStride,
+            pitchBytes, rowBytes, numRows, cudaMemcpyHostToDevice, reinterpret_cast<cudaStream_t>(stream)));
+    }
+}
+
 // dst_tensor[:, :num_seqs, 0] = src_tensor[:, copy_idx]
 // dst_tensor[:, :num_seqs, 1] = dst_tensor[:, :num_seqs, 0] + 1
+// Grid: (pool, sequence, chunk of copyBlockItersPerCta loads per thread along the row).
 __global__ void copyBatchBlockOffsetsToDeviceKernel(SizeType32 const* __restrict__ srcPtr,
     SizeType32* __restrict__ dstPtr, SizeType32 const srcMaxNumSequences, SizeType32 const dstMaxNumSequences,
     SizeType32 numBlocksPerSeq, SizeType32 const* __restrict__ copyIndex, SizeType32 const* __restrict__ indexScales,
@@ -49,17 +93,21 @@ __global__ void copyBatchBlockOffsetsToDeviceKernel(SizeType32 const* __restrict
     __shared__ PackedInt data[copyBlocknbBufs][copyBlockCtaSize];
 
     auto const iterPerSeq = divUp(numBlocksPerSeq * sizeof(SizeType32), sizeof(PackedInt) * copyBlockCtaSize);
+    auto const iterBeg = blockIdx.z * copyBlockItersPerCta;
+    auto const numIters = min(copyBlockItersPerCta, iterPerSeq - iterBeg);
     auto const tid = threadIdx.x;
     auto const poolIdx = blockIdx.x;
     auto const seqIdx = blockIdx.y;
     auto const seqDimStride = kvFactor * numBlocksPerSeq;
-    uint32_t const srcIdxBeg = tid * elemPerAccess + (poolIdx * srcMaxNumSequences + copyIndex[seqIdx]) * seqDimStride;
-    uint32_t const dstIdxKBeg = tid * elemPerAccess + (poolIdx * dstMaxNumSequences + seqIdx) * seqDimStride;
+    uint32_t const chunkBeg = iterBeg * copyBlockCtaSize * elemPerAccess;
+    uint32_t const srcIdxBeg
+        = chunkBeg + tid * elemPerAccess + (poolIdx * srcMaxNumSequences + copyIndex[seqIdx]) * seqDimStride;
+    uint32_t const dstIdxKBeg = chunkBeg + tid * elemPerAccess + (poolIdx * dstMaxNumSequences + seqIdx) * seqDimStride;
     uint32_t const dstIdxVBeg = dstIdxKBeg + numBlocksPerSeq;
 
     uint32_t const srcIdxEnd = (poolIdx * srcMaxNumSequences + copyIndex[seqIdx]) * seqDimStride + numBlocksPerSeq;
 
-    for (uint32_t i = 0; i < iterPerSeq + copyBlocknbBufs; i++)
+    for (uint32_t i = 0; i < numIters + copyBlocknbBufs; i++)
     {
         uint32_t const idxBuf = i % copyBlocknbBufs;
         if (i >= copyBlocknbBufs)
@@ -89,7 +137,7 @@ __global__ void copyBatchBlockOffsetsToDeviceKernel(SizeType32 const* __restrict
         PackedInt* const dst = &data[idxBuf][tid];
         uint32_t const srcIdx = srcIdxBeg + copyBlockCtaSize * ldIter * elemPerAccess;
         PackedInt const* const src = reinterpret_cast<PackedInt const*>(srcPtr + srcIdx);
-        if (srcIdx < srcIdxEnd)
+        if (ldIter < numIters && srcIdx < srcIdxEnd)
         {
             uint32_t const size = sizeof(PackedInt);
             asm volatile("cp.async.cg.shared.global [%0], [%1], %2, %3;\n" ::"l"(__cvta_generic_to_shared(dst)),
@@ -134,7 +182,16 @@ void copyBatchBlockOffsetsToDevice(ITensor const& input, ITensor& output, ITenso
         "Not implemented case: numBlocksPerSeq * sizeof(SizeType32) = %zu must be a multiple of %zu.",
         static_cast<size_t>(numBlocksPerSeq * sizeof(SizeType32)), static_cast<size_t>(sizeof(PackedInt)));
 
-    dim3 gridDim(numPools, numSeqs, 1);
+    auto const iterPerSeq = divUp(static_cast<uint32_t>(numBlocksPerSeq * sizeof(SizeType32)),
+        static_cast<uint32_t>(sizeof(PackedInt) * copyBlockCtaSize));
+    auto const numChunks = divUp(iterPerSeq, copyBlockItersPerCta);
+    if (numChunks == 0)
+    {
+        return;
+    }
+    TLLM_CHECK_WITH_INFO(
+        numChunks <= 65535, "numBlocksPerSeq = %d needs %u CTAs per row, more than 65535.", numBlocksPerSeq, numChunks);
+    dim3 gridDim(numPools, numSeqs, numChunks);
     dim3 blockDim(copyBlockCtaSize);
 
     copyBatchBlockOffsetsToDeviceKernel<<<gridDim, blockDim, 0, stream>>>(srcPtr, dstPtr, srcMaxNumSequences,

@@ -34,6 +34,7 @@ from disagg_test_utils import (HEARTBEAT_INTERVAL, INACTIVE_TIMEOUT,
 from transformers import AutoTokenizer
 
 from tensorrt_llm import logger
+from tensorrt_llm.llmapi.disagg_utils import get_global_disagg_request_id
 from tensorrt_llm.serve.disagg_auth import build_internal_disagg_auth_headers
 from tensorrt_llm.serve.openai_client import OpenAIHttpClient
 from tensorrt_llm.serve.openai_protocol import (CompletionRequest,
@@ -186,7 +187,11 @@ class BasicWorkerTester:
         ctx_request = copy.deepcopy(request)
         gen_request = copy.deepcopy(request)
 
-        ctx_request["disaggregated_params"] = {"request_type": "context_only"}
+        # Context workers have independent local request ID sequences.
+        ctx_request["disaggregated_params"] = {
+            "request_type": "context_only",
+            "disagg_request_id": get_global_disagg_request_id(node_id=0),
+        }
         ctx_response = await self.send_request(session, ctx_url, ctx_request)
         assert len(ctx_response["choices"]) == 1
 
@@ -330,6 +335,9 @@ class KvCacheEventWorkerTester(BasicWorkerTester):
         tokens_per_block = 32  # TODO: read from config
         prev_ctx_match_count = 0
         prev_gen_match_count = 0
+        ctx_match_count = 0
+        gen_match_count = 0
+        gen_evicted = False
         assert len(self.ctx_servers) == 1 and len(self.gen_servers) == 1, \
             "This test assumes 1P1D"
         ctx_server = self.ctx_servers[0]
@@ -698,6 +706,7 @@ def test_workers_conditional_disaggregation(disaggregated_test_root,
         asyncio.run(tester.test_multi_round_request(prompts))
 
 
+@pytest.mark.skip_less_device(2)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
 def test_workers_conditional_disaggregation_deepseek_v3_lite_bf16(
@@ -769,6 +778,7 @@ def test_workers_kv_cache_aware_router(disaggregated_test_root,
         asyncio.run(tester.test_multi_round_request(prompts, 16, 4))
 
 
+@pytest.mark.skip_less_device(4)
 @skip_no_hopper
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)

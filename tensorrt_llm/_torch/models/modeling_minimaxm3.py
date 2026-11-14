@@ -55,7 +55,7 @@ from ..attention.backends.sparse.minimax_m3 import (
     _gather_paged_batched,
     _write_main_kv_slots_to_pool,
 )
-from ..attention.backends.sparse.minimax_m3.common import index_head_range
+from ..attention.backends.sparse.minimax_m3.common import get_sparse_layer_ids, index_head_range
 from ..attention.backends.sparse.params import SparseBackendForwardArgs
 from ..attention.backends.trtllm import TrtllmAttention
 from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams, MiniMaxAllReduceRMS
@@ -79,6 +79,7 @@ from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, EventType, get_model_extra_attrs, is_torch_compiling
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.minimaxm3_weight_mapper import MINIMAX_M3_PARAMS_MAP, MiniMaxM3HfWeightMapper
+from .checkpoints.hf.weight_mapper import convert_compressed_tensors_nvfp4_weights
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (
     DecoderModel,
@@ -347,6 +348,19 @@ def get_text_model_config(
     return cfg
 
 
+# Bound on MiniMaxM3Attention._fused_producer_plans; see _fused_producer_plan.
+_MAX_FUSED_PRODUCER_PLANS = 8
+
+
+def _tensor_view_key(
+    tensor: Optional[torch.Tensor],
+) -> Optional[Tuple[int, Tuple[int, ...], Tuple[int, ...], torch.dtype, torch.device]]:
+    """Address and layout of a tensor view, for caching what was validated on it."""
+    if tensor is None:
+        return None
+    return (tensor.data_ptr(), tuple(tensor.shape), tensor.stride(), tensor.dtype, tensor.device)
+
+
 def _nvfp4_cache_supports_fused_write(
     data: torch.Tensor, scales: torch.Tensor, num_heads: int
 ) -> bool:
@@ -437,26 +451,6 @@ def _validate_sparse_attention_runtime_config(
             raise ValueError(
                 "MiniMax-M3 fuse_qkv_index_projection=True requires an FP8 or NVFP4 main KV cache."
             )
-
-
-def get_sparse_layer_ids(text_config: PretrainedConfig) -> Tuple[List[int], List[int]]:
-    """Return ``(dense_layer_ids, sparse_layer_ids)`` for the M3 text model."""
-    sparse_cfg = getattr(text_config, "sparse_attention_config", None)
-    n_layers = int(text_config.num_hidden_layers)
-    if sparse_cfg is None:
-        return list(range(n_layers)), []
-    if not sparse_cfg.get("use_sparse_attention", True):
-        return list(range(n_layers)), []
-    freq = sparse_cfg.get("sparse_attention_freq")
-    if freq is None:
-        return list(range(n_layers)), []
-    if len(freq) != n_layers:
-        raise ValueError(
-            f"sparse_attention_freq length {len(freq)} does not match num_hidden_layers {n_layers}"
-        )
-    dense = [i for i, f in enumerate(freq) if int(f) == 0]
-    sparse = [i for i, f in enumerate(freq) if int(f) != 0]
-    return dense, sparse
 
 
 def get_sparse_disable_index_value_layer_ids(
@@ -1264,6 +1258,8 @@ class MiniMaxM3Attention(Attention):
                     dtype=config.torch_dtype,
                     mapping=self.qkv_proj.mapping,
                     tensor_parallel_mode=TensorParallelMode.COLUMN,
+                    # Unquantized unless the checkpoint declares per-layer
+                    # entries for the fused names below.
                     quant_config=None,
                     weights_loading_config=WeightsLoadingConfig(
                         weight_mode=WeightMode.FUSED_GATE_UP_LINEAR
@@ -1277,6 +1273,10 @@ class MiniMaxM3Attention(Attention):
                     },
                     skip_create_weights_in_init=model_config.skip_create_weights_in_init,
                 )
+                # The checkpoint's index_q_proj / index_k_proj load into this
+                # projection; the model's quantization passes match their
+                # per-layer entries and exclusions by these names.
+                self.index_qk_proj.fused_checkpoint_names = ("index_q_proj", "index_k_proj")
 
             self.index_q_size = self.sparse_num_index_heads * self.sparse_index_dim
             self.index_k_size = self.sparse_index_dim
@@ -1581,20 +1581,133 @@ class MiniMaxM3Attention(Attention):
             or not isinstance(self.attn, MiniMaxM3MsaSparseAttention)
             or not (self.main_kv_is_fp8 or self.main_kv_is_nvfp4)
             or self.attn.indexer_kv_dtype != "fp8"
+            or packed.dtype != torch.bfloat16
+            or position_ids is None
         ):
             return None
+        kv_cache_manager = attn_metadata.kv_cache_manager
+        if cache_tensors is None:
+            if kv_cache_manager is None:
+                return None
+            buffers = kv_cache_manager.get_buffers(self.layer_idx, kv_layout="HND")
+            index_k_cache = attn_metadata.msa_idx_k_cache(self.layer_idx)
+            scale_buffers = (
+                kv_cache_manager.get_block_scale_buffers(self.layer_idx, kv_layout="HND")
+                if kv_cache_manager.is_nvfp4_layer(self.layer_idx)
+                else None
+            )
+            out_cache_loc = getattr(attn_metadata, "msa_out_cache_loc", None)
+        else:
+            buffers, index_k_cache, scale_buffers, out_cache_loc = cache_tensors
+        if out_cache_loc is None:
+            return None
+        plan = self._fused_producer_plan(buffers, index_k_cache, scale_buffers, out_cache_loc)
+        if plan is None:
+            return None
+        num_tokens = int(packed.shape[0])
+        if out_cache_loc.numel() < num_tokens:
+            return None
+        kv_quant_scale, static_args = plan
+        positions = position_ids.reshape(-1).contiguous().to(torch.int32)
+        if scale_buffers is not None:
+            q, index_q = torch.ops.trtllm.minimax_m3_nvfp4_qkv_indexer_norm_rope_kv_insert(
+                packed.contiguous(),
+                buffers.view(torch.uint8),
+                scale_buffers,
+                index_k_cache,
+                out_cache_loc[:num_tokens],
+                kv_quant_scale,
+                *static_args,
+                positions,
+            )
+        else:
+            q, index_q = torch.ops.trtllm.minimax_m3_fp8_qkv_indexer_norm_rope_kv_insert(
+                packed.contiguous(),
+                buffers,
+                index_k_cache,
+                out_cache_loc[:num_tokens],
+                *static_args,
+                positions,
+            )
+        return q.flatten(1), index_q.flatten(1)
+
+    def _fused_producer_plan(
+        self,
+        buffers: Optional[torch.Tensor],
+        index_k_cache: torch.Tensor,
+        scale_buffers: Optional[torch.Tensor],
+        out_cache_loc: torch.Tensor,
+    ) -> Optional[Tuple[Optional[torch.Tensor], tuple]]:
+        """Resolve the horizontal producer's per-layer-invariant inputs once.
+
+        Everything the producer validates besides the step's tokens (the
+        geometry and strides of the paged caches, the RoPE table, the norm
+        weights and epsilons) is fixed for a given set of cache views and
+        parameters, so the checks run once per distinct set and the resolved
+        arguments are reused. The key is the address and layout (shape, strides,
+        dtype, device) of every tensor involved plus the norm epsilons: a
+        reloaded parameter or a new cache manager starts a fresh entry, even
+        when it reuses freed memory.
+        The plan holds the kernel's static arguments only; the cache views
+        themselves are passed per call. Returns ``None`` when the fused producer
+        does not apply.
+
+        Plans live in ``_fused_producer_plans`` for the layer's lifetime. An
+        entry references the norm weights, the RoPE table and the KV quant
+        scales, never the cache views, and a serving process sees only a handful
+        of distinct cache views and parameter sets per layer. A miss that would
+        exceed ``_MAX_FUSED_PRODUCER_PLANS`` entries clears the dict first, so
+        repeated buffer or parameter replacement cannot retain stale tensors.
+        """
+        rotary_cos_sin = self.rotary_emb.rotary_cos_sin if self.rotary_emb is not None else None
+        kv_quant_scale = (
+            getattr(self.qkv_proj, "inv_kv_scales", None) if scale_buffers is not None else None
+        )
+        key = (
+            _tensor_view_key(buffers),
+            _tensor_view_key(index_k_cache),
+            _tensor_view_key(scale_buffers),
+            _tensor_view_key(kv_quant_scale),
+            _tensor_view_key(out_cache_loc),
+            _tensor_view_key(rotary_cos_sin),
+            tuple(
+                (_tensor_view_key(module.weight), module.variance_epsilon)
+                for module in (self.q_norm, self.k_norm, self.index_q_norm, self.index_k_norm)
+            ),
+        )
+        cache = self.__dict__.get("_fused_producer_plans")
+        if cache is None:
+            cache = self.__dict__["_fused_producer_plans"] = {}
+        if key in cache:
+            return cache[key]
+        if len(cache) >= _MAX_FUSED_PRODUCER_PLANS:
+            cache.clear()
+        plan = self._resolve_fused_producer_plan(
+            buffers, index_k_cache, scale_buffers, out_cache_loc, rotary_cos_sin, kv_quant_scale
+        )
+        cache[key] = plan
+        return plan
+
+    def _resolve_fused_producer_plan(
+        self,
+        buffers: Optional[torch.Tensor],
+        index_k_cache: torch.Tensor,
+        scale_buffers: Optional[torch.Tensor],
+        out_cache_loc: torch.Tensor,
+        rotary_cos_sin: Optional[torch.Tensor],
+        kv_quant_scale: Optional[torch.Tensor],
+    ) -> Optional[Tuple[Optional[torch.Tensor], tuple]]:
+        """Validate the producer's static inputs; see :meth:`_fused_producer_plan`."""
         rope = self.pos_embd_params.rope if self.pos_embd_params is not None else None
         rotary_dim = int(rope.dim) if rope is not None else 0
         if (
-            packed.dtype != torch.bfloat16
-            or position_ids is None
-            or self.head_dim != 128
+            self.head_dim != 128
             or self.sparse_index_dim != 128
             or self.sparse_num_index_heads != self.num_key_value_heads
             or not self.use_gemma_norm
             or self.pos_embd_params is None
             or not self.pos_embd_params.is_neox
-            or self.rotary_emb is None
+            or rotary_cos_sin is None
             or rope is None
             or rotary_dim != 64
         ):
@@ -1614,23 +1727,7 @@ class MiniMaxM3Attention(Attention):
         if any(weight.dtype != torch.bfloat16 or not weight.is_cuda for weight in norm_weights):
             return None
 
-        kv_cache_manager = attn_metadata.kv_cache_manager
-        if cache_tensors is None:
-            if kv_cache_manager is None:
-                return None
-            buffers = kv_cache_manager.get_buffers(self.layer_idx, kv_layout="HND")
-            index_k_cache = attn_metadata.msa_idx_k_cache(self.layer_idx)
-            scale_buffers = (
-                kv_cache_manager.get_block_scale_buffers(self.layer_idx, kv_layout="HND")
-                if kv_cache_manager.is_nvfp4_layer(self.layer_idx)
-                else None
-            )
-            out_cache_loc = getattr(attn_metadata, "msa_out_cache_loc", None)
-        else:
-            buffers, index_k_cache, scale_buffers, out_cache_loc = cache_tensors
-        num_tokens = int(packed.shape[0])
         layer_uses_nvfp4 = scale_buffers is not None
-        kv_quant_scale = getattr(self.qkv_proj, "inv_kv_scales", None) if layer_uses_nvfp4 else None
         if layer_uses_nvfp4:
             supports_fused_layout = buffers is not None and _nvfp4_cache_supports_fused_write(
                 buffers, scale_buffers, self.num_key_value_heads
@@ -1675,7 +1772,6 @@ class MiniMaxM3Attention(Attention):
             and buffers is not None
             and index_k_cache.shape[0] == buffers.shape[0]
         )
-        rotary_cos_sin = self.rotary_emb.rotary_cos_sin
         supported_rope_cache = (
             rotary_cos_sin.is_cuda
             and rotary_cos_sin.dtype == torch.float32
@@ -1687,16 +1783,12 @@ class MiniMaxM3Attention(Attention):
             not supported_main_cache
             or not supported_index_cache
             or not supported_rope_cache
-            or out_cache_loc is None
             or not out_cache_loc.is_cuda
             or out_cache_loc.dtype != torch.int32
             or not out_cache_loc.is_contiguous()
-            or out_cache_loc.numel() < num_tokens
         ):
             return None
-
-        common_args = (
-            out_cache_loc[:num_tokens],
+        static_args = (
             self.num_heads,
             self.num_key_value_heads,
             self.sparse_num_index_heads,
@@ -1708,26 +1800,8 @@ class MiniMaxM3Attention(Attention):
             self.index_q_norm.weight,
             self.index_k_norm.weight,
             rotary_cos_sin,
-            position_ids.reshape(-1).contiguous().to(torch.int32),
         )
-        if layer_uses_nvfp4:
-            q, index_q = torch.ops.trtllm.minimax_m3_nvfp4_qkv_indexer_norm_rope_kv_insert(
-                packed.contiguous(),
-                buffers.view(torch.uint8),
-                scale_buffers,
-                index_k_cache,
-                common_args[0],
-                kv_quant_scale,
-                *common_args[1:],
-            )
-        else:
-            q, index_q = torch.ops.trtllm.minimax_m3_fp8_qkv_indexer_norm_rope_kv_insert(
-                packed.contiguous(),
-                buffers,
-                index_k_cache,
-                *common_args,
-            )
-        return q.flatten(1), index_q.flatten(1)
+        return kv_quant_scale, static_args
 
     def _expect_fused_qk_norm_rope(self, position_ids: Optional[torch.Tensor]) -> bool:
         """Whether the fused kernel is expected to run instead of the fallback.
@@ -1941,8 +2015,8 @@ class MiniMaxM3Attention(Attention):
             v_cache_view, m3_meta.req_to_token, m3_meta.slot_ids, max_k
         )
 
-        # SDPA expands KV heads to query heads for prefill. Decode processes
-        # one KV head at a time to bound the temporary GQA expansion.
+        # SDPA expands KV heads to query heads for prefill. Decode folds each
+        # GQA group into the query axis and reads K/V unexpanded.
         if self.num_heads % max(self.num_key_value_heads, 1) != 0:
             raise RuntimeError(
                 f"Dense GQA expects num_heads ({self.num_heads}) divisible "
@@ -2007,30 +2081,31 @@ class MiniMaxM3Attention(Attention):
         else:
             # Decode: one query token per request at position seq_lens - 1.
             valid = kv_positions < seq_lens_dev.unsqueeze(-1)  # [batch, max_k]
-            q_b = q_view.view(batch, 1, self.num_heads, self.head_dim).transpose(
-                1, 2
-            )  # [batch, H, 1, d]
             mask_b = valid.unsqueeze(1).unsqueeze(1)  # [batch, 1, 1, k]
-            # Expand K/V one KV head at a time: all heads at once needs an
-            # O(batch * max_k * num_heads) temporary that overflows the CUDA-graph
-            # pool under attention DP.
-            out_b = q.new_empty(batch, self.num_heads, 1, self.head_dim)
+            # Fold the GQA group into SDPA's query-length axis: the ``group`` Q
+            # heads sharing KV head h become ``group`` query rows of one SDPA
+            # head that reads KV head h unexpanded. Exact for decode (every
+            # query row sits at seq_lens - 1, so one key mask serves them all),
+            # and it needs neither an O(batch * max_k * num_heads)
+            # repeat_interleave temporary in the CUDA-graph pool nor one SDPA
+            # launch per KV head.
+            num_kv_heads = max(self.num_key_value_heads, 1)
+            q_b = q_view.view(batch, num_kv_heads, group, self.head_dim)  # [batch, KV, group, d]
+            k_b = k_padded.transpose(1, 2)  # [batch, KV, k, d]
+            v_b = v_padded.transpose(1, 2)  # [batch, KV, k, d]
             with sdpa_kernel(_DENSE_SDPA_BACKENDS):
-                for h in range(max(self.num_key_value_heads, 1)):
-                    qh = slice(h * group, (h + 1) * group)
-                    k_h = k_padded[:, :, h : h + 1].repeat_interleave(group, dim=2)
-                    v_h = v_padded[:, :, h : h + 1].repeat_interleave(group, dim=2)
-                    out_b[:, qh] = torch.nn.functional.scaled_dot_product_attention(
-                        q_b[:, qh].to(q.dtype),
-                        k_h.transpose(1, 2).to(q.dtype),
-                        v_h.transpose(1, 2).to(q.dtype),
-                        attn_mask=mask_b,
-                        dropout_p=0.0,
-                        is_causal=False,
-                    )  # [batch, group, 1, d]
-            # Drop the singleton query axis; a transpose(1, 2).reshape would
-            # scramble (head, head_dim) when H != head_dim.
-            output.view(batch, self.num_heads, self.head_dim).copy_(out_b.squeeze(2))
+                out_b = torch.nn.functional.scaled_dot_product_attention(
+                    q_b.to(q.dtype),
+                    k_b.to(q.dtype),
+                    v_b.to(q.dtype),
+                    attn_mask=mask_b,
+                    dropout_p=0.0,
+                    is_causal=False,
+                )  # [batch, KV, group, d]
+            # Q head h * group + g is query row g of SDPA head h, so viewing the
+            # output as [batch, KV, group, d] keeps (head, head_dim) ordering; a
+            # transpose(1, 2).reshape would scramble it when H != head_dim.
+            output.view(batch, num_kv_heads, group, self.head_dim).copy_(out_b)
 
         return output
 
@@ -2993,6 +3068,10 @@ class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, Pretraine
         params_map: Optional[Dict[str, str]] = None,
         allow_partial_loading: bool = False,
     ) -> None:
+        # Accept compressed-tensors NVFP4 names before any loader below reads
+        # the dict. Keyed on the tensor names, not on the global quant config:
+        # that is MIXED_PRECISION when NVFP4 covers only some modules.
+        weights = convert_compressed_tensors_nvfp4_weights(weights)
         # Pack the opt-in five-way projection with MiniMax-specific TP
         # sharding before the generic mapper handles the compatibility path.
         packed_projection_modules = _load_qkv_index_proj_weights(self, weights)

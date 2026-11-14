@@ -15,6 +15,7 @@
 """Fail-fast + log-tail-dump behavior of wait_for_endpoint_ready (no GPU, no server)."""
 
 import subprocess
+from pathlib import Path
 
 import pytest
 from test_common.error_utils import check_error, report_error
@@ -148,6 +149,76 @@ def test_autotuner_marker_does_not_hide_real_errors(tmp_path):
     with pytest.raises(RuntimeError) as e:
         report_error("wrapper", [log])
     assert "Error line 2" in str(e.value)
+
+
+PIP_READ_TIMEOUT_RETRY = (
+    "WARNING: Retrying (Retry(total=9, connect=None, read=None, redirect=None, status=None)) "
+    "after connection broken by 'ReadTimeoutError(\"HTTPSConnectionPool(host='pypi.nvidia.com', "
+    "port=443): Read timed out. (read timeout=100.0)\")': "
+    "/nvidia-cuda-cupti/nvidia_cuda_cupti-13.1.115-py3-none-manylinux_2_25_aarch64.whl\n"
+)
+
+
+PIP_CONNECT_TIMEOUT_RETRY = (
+    "WARNING: Retrying (Retry(total=4, connect=None, read=None, redirect=None, status=None)) "
+    "after connection broken by 'ConnectTimeoutError(<pip._vendor.urllib3.connection."
+    "HTTPSConnection object at 0x7f3a2c1d5e50>, 'Connection to pypi.nvidia.com timed out. "
+    "(connect timeout=15)')': /nvidia-cuda-cupti/\n"
+)
+
+
+@pytest.mark.parametrize(
+    "retry",
+    [PIP_READ_TIMEOUT_RETRY, PIP_CONNECT_TIMEOUT_RETRY],
+    ids=["read-timeout", "connect-timeout"],
+)
+def test_pip_download_retry_does_not_fail_the_server_log_scan(tmp_path: Path, retry: str) -> None:
+    log = _server_log(tmp_path, retry + "Application startup complete.\n")
+    assert check_error(log) == []
+
+
+@pytest.mark.parametrize(
+    "retry",
+    [PIP_READ_TIMEOUT_RETRY, PIP_CONNECT_TIMEOUT_RETRY],
+    ids=["read-timeout", "connect-timeout"],
+)
+def test_pip_download_retry_does_not_fail_the_readiness_wait(tmp_path: Path, retry: str) -> None:
+    log = _server_log(tmp_path, retry)
+    with pytest.raises(RuntimeError) as exc_info:
+        # The log is scanned on every poll, so a retry warning taken for an
+        # error would end the wait early instead of at its timeout.
+        wait_for_endpoint_ready(DEAD_URL, timeout=2, check_files=[log], check_interval=0.0)
+    msg = str(exc_info.value)
+    assert "did not become ready within" in msg
+    assert "Found error in server file" not in msg
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "pip._vendor.urllib3.exceptions.ReadTimeoutError: download retries exhausted\n",
+        "TimeoutError: model initialization timed out\n",
+        "RuntimeError: engine exploded\n",
+        "ERROR: " + PIP_READ_TIMEOUT_RETRY,
+        PIP_READ_TIMEOUT_RETRY.rstrip() + " RuntimeError: engine exploded\n",
+        PIP_READ_TIMEOUT_RETRY.replace("Read timed out.", "RuntimeError: read timed out."),
+    ],
+    ids=[
+        "download-failed",
+        "server-timeout",
+        "runtime-error",
+        "error-prefix",
+        "mixed-line",
+        "mixed-body",
+    ],
+)
+def test_pip_retry_warning_does_not_hide_terminal_errors(tmp_path: Path, failure: str) -> None:
+    log = _server_log(tmp_path, PIP_READ_TIMEOUT_RETRY + failure)
+    assert check_error(log) == [(2, failure.strip())]
+    with pytest.raises(RuntimeError) as exc_info:
+        report_error("server failed", [log])
+    assert "Error line 2:" in str(exc_info.value)
+    assert "Error line 1:" not in str(exc_info.value)
 
 
 def test_check_error_skips_the_waits_own_retry_messages(tmp_path):

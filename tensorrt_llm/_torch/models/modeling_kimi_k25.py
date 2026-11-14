@@ -49,7 +49,7 @@ from transformers import (
     PreTrainedTokenizerBase,
 )
 
-from tensorrt_llm.inputs.multimodal import DisaggPrefillMultimodalInputs, MultimodalParams
+from tensorrt_llm.inputs.multimodal import MultimodalItemMetadata, MultimodalParams
 from tensorrt_llm.mapping import Mapping
 
 from ..._utils import prefer_pinned
@@ -1469,18 +1469,20 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
         self,
         inputs: TextPrompt,
         mm_handles: List[Dict[str, Any]],
-    ) -> DisaggPrefillMultimodalInputs:
+        *,
+        mm_hashes: list[list[int]] | None = None,
+    ) -> tuple[list[int], MultimodalParams]:
         """Build disaggregated prefill inputs from multimodal embedding handles.
 
         Args:
             inputs: Text prompt input container.
-            mm_handles: List of multimodal embedding handles from the
-                context phase, each containing ``tensor_size``.
+            mm_handles: List of multimodal embedding handles, each
+                containing ``tensor_size``.
+            mm_hashes: Optional prompt-ordered hashes for KV-cache reuse.
 
         Returns:
-            DisaggPrefillMultimodalInputs containing expanded token IDs,
-            prompt-side MM positions/lengths, exact runs, and encoder-output
-            embedding lengths.
+            Expanded token IDs and common multimodal params containing
+            prompt layout, item metadata, and embedding handles.
         """
         text_prompt = inputs.get("prompt")
         if not text_prompt:
@@ -1528,11 +1530,15 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
                 expanded_ids[write_pos] = input_ids[read_pos]
                 write_pos += 1
 
-        return DisaggPrefillMultimodalInputs(
-            prompt_token_ids=expanded_ids.to(torch.int32).tolist(),
+        return expanded_ids.to(torch.int32).tolist(), MultimodalParams.from_embeddings(
+            mm_handles,
+            MultimodalItemMetadata(
+                [("image", i) for i in range(len(mm_handles))],
+                output_embedding_lengths=[handle["tensor_size"][0] for handle in mm_handles],
+            ),
+            multimodal_hashes=mm_hashes,
             multimodal_lengths=mm_token_length,
             multimodal_positions=mm_token_offsets,
-            multimodal_embedding_lengths=[mm_handle["tensor_size"][0] for mm_handle in mm_handles],
             multimodal_item_run_cu_offsets=list(range(len(mm_token_length) + 1)),
             multimodal_run_positions=mm_token_offsets,
             multimodal_run_lengths=mm_token_length,
@@ -1723,8 +1729,19 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
         """
         return self._mm_token_ids
 
-    def load_weights(self, weights) -> None:
-        """Load vision + projector + LLM weights from checkpoint."""
+    def load_weights(self, weights: Dict[str, torch.Tensor]) -> None:
+        """Load vision + projector + LLM weights from checkpoint.
+
+        Raises:
+            RuntimeError: Dense DWDP is active on the text model; nothing is loaded.
+        """
+        if getattr(getattr(self, "model", None), "_dense_dwdp_active", False):
+            # The text model's dense weights are views of dense DWDP staging slots that several
+            # layers share; refuse before the vision tower is rebuilt or loaded.
+            raise RuntimeError(
+                f"{type(self).__name__} load_weights is not supported while dense DWDP is "
+                "active: the dense weights live in staging slots shared across layers"
+            )
         # Create vision encoder if it was skipped during meta init.
         # Use the saved VLM config since model_config.pretrained_config
         # has been overwritten with text_config by __init__.

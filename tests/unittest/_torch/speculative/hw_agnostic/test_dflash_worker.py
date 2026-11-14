@@ -56,8 +56,9 @@ class _FakeDraftModel:
         return True, (-1, -1)
 
     def validate_block_attention_windows(self):
-        # Every layer is causal and unwindowed, so the TRTLLM check passes.
-        pass
+        # Every layer is causal and unwindowed: the lowering list carries no
+        # context-attention entry, so the TRTLLM runtime check passes.
+        return ["causal decode"] * 2
 
 
 def test_trtllm_backend_builds_private_paged_context_cache(monkeypatch):

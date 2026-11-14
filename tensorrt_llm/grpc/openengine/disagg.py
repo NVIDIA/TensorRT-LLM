@@ -8,6 +8,7 @@ a generation worker resumes it by echoing that session back on its request.
 """
 
 import base64
+import secrets
 from collections.abc import Mapping, Sequence
 from typing import Any, Optional
 from urllib.parse import urlsplit
@@ -17,6 +18,7 @@ from google.protobuf.json_format import MessageToDict
 
 from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
 from tensorrt_llm.executor.result import Logprob
+from tensorrt_llm.llmapi.disagg_utils import MIN_GLOBAL_ID
 
 from .bindings import generation_pb2, kv_pb2
 from .formatting import clamp_logprob
@@ -41,7 +43,12 @@ _EXTRA_REQUEST_TYPES = _DISAGG_REQUEST_TYPES - {"generation_only"}
 
 
 def _struct_to_dict(struct: struct_pb2.Struct) -> dict[str, Any]:
-    return MessageToDict(struct)
+    # Prepared media metadata is decoded separately, not as KV rendezvous state.
+    return {
+        key: MessageToDict(value)
+        for key, value in struct.fields.items()
+        if key != "trtllm_decode_preparation"
+    }
 
 
 def _endpoint_to_str(endpoints: Sequence[Any]) -> Optional[str]:
@@ -210,7 +217,11 @@ def disaggregated_params_from_request(
         )
     if request_type not in _EXTRA_REQUEST_TYPES:
         raise ValueError(f"extra.{_REQUEST_TYPE_KEY} must be one of {sorted(_EXTRA_REQUEST_TYPES)}")
-    return DisaggregatedParams(request_type=request_type)
+    params = DisaggregatedParams(request_type=request_type)
+    if request_type == "context_only":
+        # Local context IDs can collide across independent prefill engines.
+        params.disagg_request_id = MIN_GLOBAL_ID + secrets.randbelow((1 << 63) - MIN_GLOBAL_ID)
+    return params
 
 
 def prefill_ready_response(
@@ -218,6 +229,7 @@ def prefill_ready_response(
     disaggregated_params: Any,
     transfer_backend: str,
     usage: Optional[generation_pb2.Usage] = None,
+    decode_preparation: Optional[str] = None,
 ) -> generation_pb2.GenerateResponse:
     """Build the PrefillReady event a context worker returns after prefill.
 
@@ -239,6 +251,8 @@ def prefill_ready_response(
         dp_rank=disaggregated_params.ctx_dp_rank or 0,
     )
     attributes: dict[str, Any] = {}
+    if decode_preparation is not None:
+        attributes["trtllm_decode_preparation"] = decode_preparation
     endpoint = disaggregated_params.ctx_info_endpoint
     if endpoint:
         # Carried verbatim as well as split: the generation worker connects a

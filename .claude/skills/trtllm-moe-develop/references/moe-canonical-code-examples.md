@@ -79,7 +79,7 @@ only names the code that demonstrates them. Paths are relative to
   `MoEWeightOwnerMixin` (the default lifecycle hooks, delegating to
   `self.quant_method`), `MoEEplbWeightLayoutMixin`.
 - One class per identity: `fused_moe_deepgemm.py`
-  (`DeepgemmCudaFp8BlockScalesImpl`) and `fused_moe_densegemm.py`
+  (`DeepgemmCudaFp8BlockScalesImpl`) and `cutedsl/dense_gemm.py`
   (`TrtllmCutedslDenseGemmNvfp4Impl`).
 - Family root plus leaves:
   - `cutlass/`: `CutlassFusedMoEBase` in `base.py` (construction, the
@@ -89,10 +89,19 @@ only names the code that demonstrates them. Paths are relative to
     module per format, listed in `CUTLASS_LEAVES` in `__init__.py` next to
     `find_cutlass_leaf` / `cutlass_leaf`; gates composed in `eligibility.py`.
   - `trtllm_gen/`: per-kernel-ABI layers (`fp4_block_scale.py`,
-    `fp8_block_scale.py`) between `TrtllmGenFusedMoEBase` and the
-    `trtllm_<quant>.py` / `flashinfer_<quant>.py` leaves.
+    `fp8_block_scale.py`) between `TrtllmGenFusedMoEBase` and the nvfp4,
+    fp8_block_scales, w4a16_mxfp4 and w4a8_mxfp4_mxfp8 leaves;
+    `trtllm_bf16.py` and the two W4A8 FP8-activation leaves subclass the
+    base directly.
   - `marlin/`: one kernel ABI, so `MarlinFusedMoEBase` implements three of the
     four abstract methods and a leaf is an identity plus `can_implement`.
+  - `cutedsl/`: laid out like the id `trtllm.cutedsl.<kernel>.<quant>`.
+    `grouped_gemm/` holds `CuteDslFusedMoEBase` (construction, the
+    layer-format check in `create_weights`, the locality-domain plan, the
+    weight lifecycle) and its NVFP4 and BF16 leaves; the `_init_format_state`
+    and `_locality_domain_scale_shard` hooks and the leaf-declared
+    `_locality_domain_full_scale_params` carry what only one format needs.
+    The other kernels share only the package-level modules with it.
 - Inheriting another implementation: `fused_moe_cute_dsl_b12x.py`
   (`CuteDslB12xNvfp4FusedMoE`, `CuteDslB12xFusedMoEBase`); the guide's B12x
   note says what that inheritance costs.
@@ -237,8 +246,7 @@ routed/shared index spaces overlap on the same global expert IDs.
   behavior, feasibility checks, and fallback.
 - `communication/allgather_reducescatter.py`: baseline external strategy.
 - `communication/nvlink_two_sided.py`: pre-dispatch metadata/statistics.
-- `communication/nvlink_one_sided.py`: dispatch-time statistics/workspace, and
-  a `checkpoint_blocked_reason` override.
+- `communication/nvlink_one_sided.py`: dispatch-time statistics/workspace.
 - `communication/deep_ep.py` and `communication/deep_ep_low_latency.py`:
   DeepEP pre/post quant dispatch constraints.
 - `tests/unittest/_torch/moe/test_moe_comm.py`: focused communication tests.

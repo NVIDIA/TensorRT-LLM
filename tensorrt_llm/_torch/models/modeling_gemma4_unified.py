@@ -71,12 +71,13 @@ from transformers.video_utils import VideoInput
 
 from ...inputs import (
     BaseMultimodalDummyInputsBuilder,
+    BaseMultimodalInputProcessor,
     ContentFormat,
-    MultimodalEncoderItemMetadata,
     MultimodalPlaceholderMetadata,
     MultimodalPlaceholderPlacement,
     register_input_processor,
 )
+from ...inputs.multimodal import MultimodalItemMetadata
 from ..modules.layer_norm import LayerNorm
 from ..modules.linear import Linear
 from .modeling_gemma4 import Gemma4ForCausalLM
@@ -84,6 +85,7 @@ from .modeling_gemma4mm import (
     Gemma4InputProcessor,
     Gemma4MultimodalEmbedder,
     Gemma4MultimodalModelBase,
+    _gemma4_input_partitions,
 )
 from .modeling_utils import ModelConfig, filter_weights, register_auto_model
 
@@ -217,10 +219,19 @@ class Gemma4UnifiedInputProcessor(Gemma4InputProcessor):
             self, max_num_encoder_tokens
         )
 
-    def get_mm_encoder_item_metadata(
-        self, prompt_token_ids: list[int], multimodal_data: dict
-    ) -> MultimodalEncoderItemMetadata | None:
-        return None
+    def get_mm_item_metadata(
+        self,
+        prompt_token_ids: list[int],
+        multimodal_data: dict,
+        mm_item_order: list[dict] | None = None,
+    ) -> MultimodalItemMetadata | None:
+        """Keep request metadata without the tower-specific encoder costs."""
+        metadata = BaseMultimodalInputProcessor.get_mm_item_metadata(
+            self, prompt_token_ids, multimodal_data, mm_item_order
+        )
+        if metadata is not None:
+            metadata.input_partitions.update(_gemma4_input_partitions(multimodal_data, metadata))
+        return metadata
 
 
 @register_auto_model("Gemma4UnifiedForConditionalGeneration")
@@ -1194,6 +1205,7 @@ class Gemma4UnifiedProcessorShim:
         videos=None,
         return_tensors: str | TensorType | None = "pt",
         do_rescale: bool | None = None,
+        do_normalize: bool | None = None,
         **kwargs,
     ) -> BatchFeature:
         if videos is not None:
@@ -1217,6 +1229,8 @@ class Gemma4UnifiedProcessorShim:
             images_kwargs = {}
             if do_rescale is not None:
                 images_kwargs["do_rescale"] = do_rescale
+            if do_normalize is not None:
+                images_kwargs["do_normalize"] = do_normalize
             processed_images = self.image_processor(
                 images, return_tensors=return_tensors, **images_kwargs
             )

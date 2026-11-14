@@ -229,8 +229,155 @@ def _check_fork(gh: GitHub, repo: str, upstream: str) -> None:
 
 
 def _check_source_repo(gh: GitHub, repo: str) -> None:
-    if repo.lower() != gh.upstream_repo.lower():
+    try:
         _check_fork(gh, repo, gh.upstream_repo)
+    except Diagnostic as error:
+        raise Diagnostic(
+            error.problem,
+            "Create a temporary branch in an upstream fork from the latest canonical dev "
+            "branch and apply the intended source changes there. Push it, then use "
+            "`scripts/vendor/manage.py` to update the lock URL, branch, SHA, and vendored "
+            "snapshot. A broader upstream refresh requires the separate, explicitly "
+            "configured maintainer refresh workflow.",
+        ) from error
+
+
+def _is_upstream_main(gh: GitHub, reviewed: vendor.Vendor) -> bool:
+    return (
+        _repo_name(reviewed.url).lower() == gh.upstream_repo.lower()
+        and reviewed.branch == gh.upstream_branch
+    )
+
+
+def _check_selection(previous: vendor.Vendor, reviewed: vendor.Vendor) -> None:
+    if previous.source != reviewed.source or set(previous.include) != set(reviewed.include):
+        changed = (["source"] if previous.source != reviewed.source else []) + (
+            ["include"] if set(previous.include) != set(reviewed.include) else []
+        )
+        raise Diagnostic(
+            "Automatic attribution requires unchanged lock source/include selection. "
+            "Changed fields: " + ", ".join(f"`{name}`" for name in changed) + ".",
+            "Separate the selection change into a different PR. In this source-update PR, "
+            "restore the canonical `source`/`include` selection in "
+            "`3rdparty/vendor_sources.lock.yaml` and regenerate the vendor snapshot.",
+        )
+
+
+def _check_source(gh: GitHub, previous: vendor.Vendor, reviewed: vendor.Vendor) -> dict | None:
+    """Validate live source ancestry; return proof only for the configured upstream branch."""
+    repo = _repo_name(reviewed.url)
+    if repo.lower() != gh.upstream_repo.lower():
+        _check_source_repo(gh, repo)
+        _check_canonical_tip(gh, previous, reviewed)
+        return None
+    _check_selection(previous, reviewed)
+    tip = _canonical_tip(gh, previous, reviewed)
+    contains_tip = (
+        gh.compare(_repo_name(previous.url), tip, reviewed.commit)["merge_base_commit"]["sha"]
+        == tip
+    )
+    contains_previous = (
+        gh.compare(_repo_name(previous.url), previous.commit, reviewed.commit)["merge_base_commit"][
+            "sha"
+        ]
+        == previous.commit
+    )
+    upstream = _sha(gh.get(f"repos/{repo}/git/ref/heads/{gh.upstream_branch}")["object"]["sha"])
+    reachable = (
+        gh.compare(repo, reviewed.commit, upstream)["merge_base_commit"]["sha"] == reviewed.commit
+    )
+    branch_matches = _is_upstream_main(gh, reviewed)
+    if not (branch_matches and contains_tip and contains_previous and reachable):
+
+        def describe(dev_tip: str, upstream_tip: str) -> Diagnostic:
+            checks = [
+                f"- {'PASS' if branch_matches else 'FAIL'} — configured branch: "
+                f"expected {field(gh.upstream_branch)}, selected {field(reviewed.branch)}.",
+                f"- {'PASS' if contains_tip and contains_previous else 'FAIL'} — "
+                f"the pin {'contains' if contains_tip and contains_previous else 'does not contain'} "
+                f"the latest canonical branch tip and its history: {field(previous.branch)} "
+                f"at `{dev_tip}`. [Compare pin → dev](https://github.com/{_repo_name(previous.url)}"
+                f"/compare/{reviewed.commit}...{dev_tip}).",
+                f"- {'PASS' if reachable else 'FAIL'} — the pin "
+                f"{'is reachable' if reachable else 'is not reachable'} from "
+                f"{field(repo)} / {field(gh.upstream_branch)} at `{upstream_tip}`. "
+                f"[Compare pin → upstream](https://github.com/{repo}"
+                f"/compare/{reviewed.commit}...{upstream_tip}).",
+            ]
+            return Diagnostic(
+                "The upstream source cannot be promoted with the current lock.\n\n"
+                f"Selected source: {field(repo)} / {field(reviewed.branch)}, "
+                f"pin `{reviewed.commit}`.\n\n" + "\n".join(checks),
+                "Choose one of these paths:\n\n"
+                f"1. **Temporary fork branch:** Fetch {field(previous.url)} / "
+                f"{field(previous.branch)}, create or rebase your temporary branch onto its "
+                f"latest tip (observed `{dev_tip}`), and apply the intended changes. Test and push "
+                "that branch to your fork. Update the consumer lock URL, branch, and commit; "
+                "use `scripts/vendor/manage.py` to regenerate and verify the vendored snapshot, "
+                "then commit and push the consumer changes. Add the paired upstream PRs in the "
+                "PR description's vendor-promotion block (use `unpaired_reason` only when "
+                "there genuinely is no upstream PR).\n"
+                f"2. **Upstream branch:** Use {field(repo)} / {field(gh.upstream_branch)} "
+                "only with a pin that passes all three checks above, then regenerate and "
+                "verify the snapshot. This mode does not require an upstream PR list.\n\n"
+                "Changing only the branch field or PR metadata cannot fix failed ancestry "
+                "checks. Equivalent patches under different SHAs do not establish Git ancestry. "
+                "If preserving the dev history is not possible, ask a maintainer for an explicit "
+                "refresh rather than replacing the dev branch history. See the "
+                f"[vendor update guide](https://github.com/{gh.consumer_repo}/blob/"
+                f"{gh.base_branch}/3rdparty/vendor-sources.md).",
+            )
+
+        problem = describe(tip, upstream)
+        problem.notification_text = str(describe("LATEST_DEV_TIP", "UPSTREAM_TIP"))
+        raise problem
+    return {
+        "promoted": reviewed.commit,
+        "upstream_base": previous.commit,
+        "checked_canonical_tip": tip,
+        "upstream_observed_main": upstream,
+    }
+
+
+def _canonical_tip(gh: GitHub, previous: vendor.Vendor, reviewed: vendor.Vendor) -> str:
+    """Read the live dev tip without accepting a rewritten canonical history."""
+    repo = _repo_name(previous.url)
+    tip = _sha(gh.get(f"repos/{repo}/git/ref/heads/{previous.branch}")["object"]["sha"])
+    if tip in (previous.commit, reviewed.commit):
+        return tip
+    if gh.compare(repo, previous.commit, tip)["merge_base_commit"]["sha"] != previous.commit:
+        raise RuntimeError(
+            "Canonical branch no longer contains the consumer lock's revision; "
+            "a maintainer must inspect the branch history before promotion."
+        )
+    return tip
+
+
+def _check_canonical_tip(gh: GitHub, previous: vendor.Vendor, reviewed: vendor.Vendor) -> str:
+    """Require the immutable source pin to contain the live canonical branch tip."""
+    repo = _repo_name(previous.url)
+    tip = _canonical_tip(gh, previous, reviewed)
+    if tip in (previous.commit, reviewed.commit):
+        return tip
+    if gh.compare(repo, tip, reviewed.commit)["merge_base_commit"]["sha"] != tip:
+
+        def describe(dev_tip: str) -> Diagnostic:
+            return Diagnostic(
+                f"The pinned temporary source commit {field(reviewed.commit)} does not contain "
+                f"the latest canonical branch tip {field(dev_tip)}.",
+                f"Fetch {field(previous.url)} / {field(previous.branch)} and rebase the temporary "
+                f"source branch {field(reviewed.branch)} onto its latest tip (observed "
+                f"`{dev_tip}`). Push it, then use "
+                "`scripts/vendor/manage.py` to update the consumer lock and vendored snapshot "
+                "to the rebased SHA. The consumer lock's old pin alone is not a sufficient "
+                "base; updating only the PR metadata or temporary branch without its lock pin "
+                "will not fix this.",
+            )
+
+        problem = describe(tip)
+        problem.notification_text = str(describe("LATEST_DEV_TIP"))
+        raise problem
+    return tip
 
 
 def _record_from_message(message: str) -> dict:
@@ -239,10 +386,22 @@ def _record_from_message(message: str) -> dict:
         message = message.replace(legacy, _BEGIN).replace(
             "----- END PRIMTS PROMOTION V1 -----", _END
         )
-    if message.count(_BEGIN) != 1 or message.count(_END) != 1:
+    begins = re.findall(r"----- BEGIN VENDOR PROMOTION V(\d+) -----", message)
+    ends = re.findall(r"----- END VENDOR PROMOTION V(\d+) -----", message)
+    if len(begins) != 1 or ends != begins:
         raise ValueError("Missing or ambiguous Vendor promotion metadata in commit message.")
-    record = json.loads(message.split(_BEGIN, 1)[1].split(_END, 1)[0])
-    if not isinstance(record, dict) or record.get("version") != 1:
+    if begins[0] not in ("1", "2"):
+        raise ValueError("Unsupported Vendor promotion metadata version.")
+    version = int(begins[0])
+    begin, end = _BEGIN.replace("V1", f"V{version}"), _END.replace("V1", f"V{version}")
+    if message.index(end) < message.index(begin):
+        raise ValueError("Promotion metadata end marker precedes its begin marker.")
+    record = json.loads(message.split(begin, 1)[1].split(end, 1)[0])
+    if (
+        not isinstance(record, dict)
+        or type(record.get("version")) is not int
+        or record["version"] != version
+    ):
         raise ValueError("Unsupported Vendor promotion metadata version.")
     if "trtllm_pr" in record:
         record["consumer_pr"] = record.pop("trtllm_pr")
@@ -254,7 +413,9 @@ def _record_from_message(message: str) -> dict:
 
 
 def _record_text(record: dict) -> str:
-    return f"{_BEGIN}\n{json.dumps(record, indent=2, sort_keys=True)}\n{_END}"
+    version = record["version"]
+    begin, end = _BEGIN.replace("V1", f"V{version}"), _END.replace("V1", f"V{version}")
+    return f"{begin}\n{json.dumps(record, indent=2, sort_keys=True)}\n{end}"
 
 
 def _map_commits(
@@ -320,17 +481,17 @@ class Promotion:
         return result
 
 
-def _check_current(gh: GitHub, plan: Promotion) -> None:
+def _check_current(gh: GitHub, plan: Promotion) -> dict | None:
+    """Check the current consumer lock and return the live source ancestry proof."""
     current = _lock_at(gh, gh.consumer_repo, _main_sha(gh)).to_mapping()
     if current not in (plan.reviewed.to_mapping(), plan.promoted):
         raise ValueError(
             "Consumer branch's vendor lock has been superseded; do not promote this PR."
         )
-    ref = gh.get(f"repos/{plan.canonical_repo}/git/ref/heads/{plan.previous.branch}")
-    if ref["object"]["sha"] not in (plan.previous.commit, plan.reviewed.commit):
-        raise ValueError(
-            "Canonical branch moved unexpectedly; coordinate with the other maintainer."
-        )
+    upstream_proof = _check_source(gh, plan.previous, plan.reviewed)
+    if "checked_canonical_tip" in plan.record:
+        _verify_upstream_snapshot(gh, plan.record)
+    return upstream_proof
 
 
 def _plan_identity(args: argparse.Namespace, gh: GitHub) -> Promotion:
@@ -377,6 +538,8 @@ def _plan_identity(args: argparse.Namespace, gh: GitHub) -> Promotion:
         "source_url": reviewed.url,
         "source_branch": reviewed.branch,
     }
+    if _is_upstream_main(gh, reviewed):
+        record.update(version=2, source_mode="upstream-main")
     return Promotion(
         number,
         _main_sha(gh),
@@ -397,18 +560,9 @@ def _make_plan(
     auto_match: bool = False,
     resolutions: dict[str, dict] | None = None,
 ) -> Promotion:
-    if args.unpaired_reason is not None:
-        if not args.unpaired_reason.strip() or args.upstream_pr or args.map_upstream:
-            raise ValueError(
-                "--unpaired-reason requires a nonempty reason and cannot be combined "
-                "with --upstream-pr or --map-upstream."
-            )
-    elif not args.upstream_pr:
-        raise ValueError("Provide --upstream-pr or an explicit --unpaired-reason.")
     plan = _plan_identity(args, gh)
     previous, reviewed, record = plan.previous, plan.reviewed, plan.record
     canonical_repo, fork = plan.canonical_repo, plan.fork
-    source_repo = _repo_name(reviewed.url)
     # A completed operation is historical: later promotions, deleted temporary
     # forks, or changed upstream PR state must not make it run again or fail.
     existing = _find_followup(gh, plan)
@@ -419,8 +573,40 @@ def _make_plan(
             plan.completed_pr = existing
             return plan
     _check_source_repo(gh, canonical_repo)
-    _check_source_repo(gh, source_repo)
+    upstream_proof = _check_source(gh, previous, reviewed)
     _check_fork(gh, fork, gh.consumer_repo)
+    if upstream_proof is not None:
+        if args.upstream_pr or args.unpaired_reason is not None or args.map_upstream:
+            raise ValueError(
+                "Upstream-main promotion uses ancestry proof, not per-commit attribution. "
+                "Remove --upstream-pr, --unpaired-reason, and --map-upstream."
+            )
+        record.update(upstream_proof)
+        record["attribution_scope"] = {"source": reviewed.source, "include": list(reviewed.include)}
+        _check_current(gh, plan)
+        return plan
+    if getattr(args, "from_pr_description", False):
+        if __package__:
+            from . import metadata
+        else:
+            import metadata
+        pr = gh.get(f"repos/{gh.consumer_repo}/pulls/{plan.number}")
+        entry = metadata.parse(pr.get("body") or "", gh.vendor_name, gh.upstream_repo)
+        args.upstream_pr = [str(number) for number in entry["upstream_prs"]]
+        args.unpaired_reason = entry["unpaired_reason"]
+        resolutions = entry["resolutions"]
+        auto_match = True
+    if args.unpaired_reason is not None:
+        if not args.unpaired_reason.strip() or args.upstream_pr or args.map_upstream:
+            raise ValueError(
+                "--unpaired-reason requires a nonempty reason and cannot be combined "
+                "with --upstream-pr or --map-upstream."
+            )
+    elif not args.upstream_pr:
+        raise ValueError(
+            "Temporary-fork updates require --from-pr-description, --upstream-pr, "
+            "or an explicit --unpaired-reason."
+        )
     comparison = gh.compare(canonical_repo, previous.commit, reviewed.commit, all_commits=True)
     if comparison["merge_base_commit"]["sha"] != previous.commit:
         raise ValueError(
@@ -593,10 +779,10 @@ def _recover_plan(args: argparse.Namespace, gh: GitHub, plan: Promotion) -> bool
             )
             message = _git(args.repo, "show", "-s", "--format=%B", sha)
             _adopt_record(plan, message)
+            _verify_upstream_snapshot(gh, plan.record)
             if not re.search(r"^Signed-off-by: .+ <.+>$", message, re.MULTILINE):
                 raise ValueError("Local promotion commit has no DCO sign-off.")
     _check_source_repo(gh, plan.canonical_repo)
-    _check_source_repo(gh, _repo_name(plan.reviewed.url))
     _check_fork(gh, plan.fork, gh.consumer_repo)
     _check_current(gh, plan)
     return True
@@ -605,7 +791,12 @@ def _recover_plan(args: argparse.Namespace, gh: GitHub, plan: Promotion) -> bool
 def _adopt_record(plan: Promotion, message: str) -> None:
     """Keep the original upstream snapshot when resuming an already-published run."""
     existing = _record_from_message(message)
-    stable_keys = set(plan.record) - {"upstream_base", "upstream_observed_main", "changes"}
+    stable_keys = set(plan.record) - {
+        "upstream_base",
+        "upstream_observed_main",
+        "checked_canonical_tip",
+        "changes",
+    }
     if any(existing.get(key) != plan.record[key] for key in stable_keys):
         raise ValueError("Existing promotion metadata does not describe this source update.")
     _validate_snapshot(existing, plan.record["upstream_repository"])
@@ -648,6 +839,20 @@ def _validate_snapshot(record: dict, upstream_repo: str) -> None:
             raise ValueError("Invalid promotion attribution scope.")
         vendor._validate_relative_path(scope["source"], "Attribution source")
         vendor._validate_include(scope["include"], record["vendor"])
+    if record.get("version") == 2:
+        if (
+            record.get("source_mode") != "upstream-main"
+            or _repo_name(record["source_url"]).lower() != upstream_repo.lower()
+            or record["source_branch"] != record["upstream_branch"]
+            or record["upstream_base"] != record["previous"]
+            or "attribution_scope" not in record
+            or "changes" in record
+        ):
+            raise ValueError("Invalid upstream-main promotion provenance.")
+        _sha(record["checked_canonical_tip"])
+        _sha(record["previous"])
+        _sha(record["promoted"])
+        return
     commits = []
     if not isinstance(record["changes"], list) or not record["changes"]:
         raise ValueError("Promotion metadata must contain source changes.")
@@ -673,6 +878,19 @@ def _validate_snapshot(record: dict, upstream_repo: str) -> None:
         raise ValueError("Promotion metadata has duplicate or missing source commits.")
 
 
+def _verify_upstream_snapshot(gh: GitHub, record: dict) -> None:
+    """Verify recorded immutable ancestry, without consulting mutable branch tips."""
+    if record.get("version") != 2:
+        return
+    chain = [
+        record[key]
+        for key in ("previous", "checked_canonical_tip", "promoted", "upstream_observed_main")
+    ]
+    for base, head in zip(chain, chain[1:]):
+        if gh.compare(gh.upstream_repo, base, head)["merge_base_commit"]["sha"] != base:
+            raise ValueError("Recorded upstream-main promotion ancestry is invalid.")
+
+
 def _verify_remote_commit(gh: GitHub, plan: Promotion, repo: str, sha: str) -> str:
     commit = gh.get(f"repos/{repo}/commits/{_sha(sha)}")
     if len(commit["parents"]) != 1 or [item["filename"] for item in commit["files"]] != [_LOCK]:
@@ -688,6 +906,7 @@ def _verify_remote_commit(gh: GitHub, plan: Promotion, repo: str, sha: str) -> s
     _check_document_change(before, after, plan)
     message = commit["commit"]["message"]
     _adopt_record(plan, message)
+    _verify_upstream_snapshot(gh, plan.record)
     if not re.search(r"^Signed-off-by: .+ <.+>$", message, re.MULTILINE):
         raise ValueError("Promotion commit has no DCO sign-off.")
     return message
@@ -960,7 +1179,14 @@ def _arm_auto_merge(gh: GitHub, plan: Promotion, pr: dict, message: str) -> None
 
 def _pr_body(plan: Promotion, message: str) -> str:
     unpaired = ""
-    if any(group["upstream_pr"] is None for group in plan.record["changes"]):
+    if plan.record.get("source_mode") == "upstream-main":
+        unpaired = (
+            "This source pin is reachable from the configured upstream branch and contains "
+            "the checked canonical dev tip. Version 2 provenance records that immutable "
+            "ancestry instead of upstream PR mappings. A future refresh must verify that "
+            "its chosen upstream target contains this pin before omitting its commits.\n\n"
+        )
+    elif any(group["upstream_pr"] is None for group in plan.record["changes"]):
         unpaired = (
             "Some source commits have no paired upstream PR. Their provenance "
             "records an explicit reason and `refresh_policy: retain`, including commits "
@@ -1114,7 +1340,12 @@ def main(argv: list[str] | None = None) -> int:
     """Run the maintainer CLI; dry-run unless publication is explicitly requested."""
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    promote = commands.add_parser("promote", help="Promote a merged consumer source update.")
+    promote = commands.add_parser(
+        "promote",
+        help="Promote a merged consumer source update.",
+        epilog="Attribution options are required for temporary-fork updates, but not for a "
+        "pin on the configured upstream branch that contains the live canonical dev tip.",
+    )
     promote.add_argument("--source-pr", required=True)
     promote.add_argument("--vendor", required=True, help="Vendor key in the lock file.")
     promote.add_argument("--consumer-repo", default="NVIDIA/TensorRT-LLM")
@@ -1131,7 +1362,7 @@ def main(argv: list[str] | None = None) -> int:
         required=True,
         help="Expected canonical branch; specify a dated branch when applicable.",
     )
-    provenance = promote.add_mutually_exclusive_group(required=True)
+    provenance = promote.add_mutually_exclusive_group()
     provenance.add_argument("--upstream-pr", action="append", default=[])
     provenance.add_argument(
         "--from-pr-description",
@@ -1187,25 +1418,12 @@ def main(argv: list[str] | None = None) -> int:
             args.base_branch,
             args.upstream_branch,
         )
-        resolutions = None
-        if args.from_pr_description:
-            if __package__:
-                from . import metadata
-            else:
-                import metadata
-            number = _pr_number(args.source_pr, gh.consumer_repo)
-            pr = gh.get(f"repos/{gh.consumer_repo}/pulls/{number}")
-            entry = metadata.parse(pr.get("body") or "", gh.vendor_name, gh.upstream_repo)
-            args.upstream_pr = [str(number) for number in entry["upstream_prs"]]
-            args.unpaired_reason = entry["unpaired_reason"]
-            resolutions = entry["resolutions"]
         if args.map_upstream and (args.auto_match or args.from_pr_description):
             raise ValueError("Explicit --map-upstream cannot accompany automatic matching.")
         plan = _make_plan(
             args,
             gh,
             auto_match=args.auto_match or args.from_pr_description,
-            resolutions=resolutions,
         )
         mode = (
             "ALREADY COMPLETED" if plan.completed_pr else "PUBLISH" if args.publish else "DRY RUN"

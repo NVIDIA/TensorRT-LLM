@@ -9,6 +9,8 @@ import pytest
 
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.mark.parametrize("helix_spec_tokens_valid", [False, True])
 def test_mla_rope_generation_forwards_kernel_controls(helix_spec_tokens_valid: bool) -> None:

@@ -149,13 +149,22 @@ void compareResult(texec::Result res, texec::Result res2)
 {
     EXPECT_EQ(res.isFinal, res2.isFinal);
     EXPECT_EQ(res.outputTokenIds, res2.outputTokenIds);
-    EXPECT_EQ(res.cumLogProbs, res2.cumLogProbs);
-    EXPECT_EQ(res.logProbs, res2.logProbs);
     EXPECT_EQ(res.finishReasons, res2.finishReasons);
     EXPECT_EQ(res.decodingIter, res2.decodingIter);
     EXPECT_EQ(res.avgDecodedTokensPerIter, res2.avgDecodedTokensPerIter);
     EXPECT_EQ(res.sequenceIndex, res2.sequenceIndex);
     EXPECT_EQ(res.isSequenceFinal, res2.isSequenceFinal);
+    EXPECT_EQ(res.contextPhaseParams.has_value(), res2.contextPhaseParams.has_value());
+    if (res.contextPhaseParams.has_value())
+    {
+        EXPECT_EQ(res.contextPhaseParams->getFirstGenTokens(), res2.contextPhaseParams->getFirstGenTokens());
+        EXPECT_EQ(res.contextPhaseParams->getReqId(), res2.contextPhaseParams->getReqId());
+    }
+    EXPECT_EQ(res.requestPerfMetrics.has_value(), res2.requestPerfMetrics.has_value());
+    if (res.requestPerfMetrics.has_value())
+    {
+        compareRequestPerfMetrics(*res.requestPerfMetrics, *res2.requestPerfMetrics);
+    }
 }
 
 void compareResponse(texec::Response res, texec::Response res2)
@@ -413,10 +422,11 @@ TEST(SerializeUtilsTest, Nested)
 
 TEST(SerializeUtilsTest, ResultResponse)
 {
-    texec::Result res = texec::Result{false, {{1, 2, 3}}, texec::VecLogProbs{1.0, 2.0},
-        std::vector<texec::VecLogProbs>{{1.1, 2.2}, {3.3, 4.4}},
-        std::vector<texec::FinishReason>{texec::FinishReason::kLENGTH},
-        texec::ContextPhaseParams({9, 37}, 0, VecTokens{1, 2}), 3, 1.5f, 2, true};
+    texec::Result res
+        = texec::Result{false, {{1, 2, 3}}, std::vector<texec::FinishReason>{texec::FinishReason::kLENGTH},
+            texec::ContextPhaseParams({9, 37}, 0, VecTokens{1, 2}), 3, 1.5f, 2, true};
+    res.requestPerfMetrics = texec::RequestPerfMetrics{};
+    res.requestPerfMetrics->lastIter = 17;
     {
         testSerializeDeserialize(res);
     }
@@ -442,9 +452,8 @@ TEST(SerializeUtilsTest, VectorResponses)
     {
         if (i < 5)
         {
-            texec::Result res = texec::Result{false, {{i + 1, i + 2, i + 3}}, texec::VecLogProbs{1.0, 2.0},
-                std::vector<texec::VecLogProbs>{{1.1, 2.2}, {3.3, 4.4}},
-                std::vector<texec::FinishReason>{texec::FinishReason::kEND_ID}};
+            texec::Result res = texec::Result{
+                false, {{i + 1, i + 2, i + 3}}, std::vector<texec::FinishReason>{texec::FinishReason::kEND_ID}};
             responsesIn.emplace_back(i, res);
         }
         else if (i < 10)

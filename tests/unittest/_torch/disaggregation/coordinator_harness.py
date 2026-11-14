@@ -37,6 +37,12 @@ class TransferRequest(SimpleNamespace):
             is_finished_due_to_cancellation=False,
             is_disagg_generation_init_state=False,
             is_disagg_generation_transmission_in_progress=False,
+            is_attention_dp_dummy=False,
+            is_finished=False,
+            py_decoding_iter=1,
+            py_gen_first_emitted=True,
+            is_disagg_context_complete_state=False,
+            is_disagg_context_transmission_state=False,
             py_kv_transfer_start_time=None,
             py_kv_transfer_timed_out=False,
             py_disaggregated_params=None,
@@ -60,8 +66,9 @@ class CoordinatorHarness:
     """One coordinator with its rank-local collaborators.
 
     ``dist`` defaults to a ``Mock`` carrying ``rank`` / ``tp_size`` /
-    ``world_size`` for single-rank tests; multi-rank tests pass one FakeDist
-    rank per harness instead, and the rank object then defines those sizes.
+    ``world_size`` / ``pp_size`` / ``cp_size`` for single-rank tests;
+    multi-rank tests pass one FakeDist rank (or a stub of one CP rank) per
+    harness instead, and that object then defines those sizes.
     """
 
     def __init__(
@@ -74,7 +81,6 @@ class CoordinatorHarness:
         world_size=1,
         tp_size=1,
         pp_size=1,
-        force_terminate_ctx_for_partial_reuse=False,
         draft_kv_cache_manager=None,
         admission_controller=None,
         is_kv_manager_v2=False,
@@ -99,7 +105,7 @@ class CoordinatorHarness:
         self.dist = (
             dist
             if dist is not None
-            else Mock(rank=0, tp_size=tp_size, world_size=world_size, pp_size=pp_size)
+            else Mock(rank=0, tp_size=tp_size, world_size=world_size, pp_size=pp_size, cp_size=1)
         )
         self.coordinator = DisaggTransferCoordinator(
             transceiver=self.transceiver,
@@ -109,7 +115,6 @@ class CoordinatorHarness:
             effects=self.effects,
             registry=self.registry,
             enable_attention_dp=enable_attention_dp,
-            force_terminate_ctx_for_partial_reuse=force_terminate_ctx_for_partial_reuse,
             draft_kv_cache_manager=draft_kv_cache_manager,
             admission_controller=admission_controller,
             is_kv_manager_v2=is_kv_manager_v2,

@@ -23,6 +23,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
+
 pytestmark = pytest.mark.cpu_only
 
 
@@ -81,10 +83,19 @@ def test_get_request_id_zero_bug():
 # --------------------------------------------------------------------------- #
 # Receiver._build_recv_req_info: sender_req_id fallback (nvbugs/6482576)
 # --------------------------------------------------------------------------- #
-def _make_recv_task(ctx_request_id, disagg_request_id, unique_rid=123):
+def _make_recv_task(
+    ctx_request_id,
+    disagg_request_id,
+    unique_rid=123,
+    schedule_style=DisaggScheduleStyle.CONTEXT_FIRST,
+):
     """Minimal stand-in for KVRecvTask with only the fields the method reads."""
     return SimpleNamespace(
-        _params=SimpleNamespace(ctx_request_id=ctx_request_id, disagg_request_id=disagg_request_id),
+        _params=SimpleNamespace(
+            ctx_request_id=ctx_request_id,
+            disagg_request_id=disagg_request_id,
+            schedule_style=schedule_style,
+        ),
         _unique_rid=unique_rid,
         _chunk=SimpleNamespace(block_ids_per_layer_groups=[]),
         _aux_slot=None,
@@ -114,6 +125,23 @@ def test_build_recv_req_info_falls_back_to_disagg_request_id():
     tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
     info = _build_recv_req_info(tfr, _make_recv_task(ctx_request_id=None, disagg_request_id=99))
     assert info.sender_req_id == 99
+
+
+@pytest.mark.parametrize(
+    "schedule_style, expected_context_first",
+    [
+        (DisaggScheduleStyle.CONTEXT_FIRST, True),
+        (DisaggScheduleStyle.GENERATION_FIRST, False),
+    ],
+)
+def test_build_recv_req_info_context_first_follows_schedule_style(
+    schedule_style, expected_context_first
+):
+    """Only generation-first receivers may request data before the TxSession exists."""
+    tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
+    task = _make_recv_task(ctx_request_id=7, disagg_request_id=99, schedule_style=schedule_style)
+    info = _build_recv_req_info(tfr, task)
+    assert info.context_first is expected_context_first
 
 
 def test_build_recv_req_info_both_ids_none_raises():
