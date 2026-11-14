@@ -425,7 +425,9 @@ scales. Dense target layers and the shared Eagle3 draft layer keep FP8 caches.
 Prefill uses MSA kernels; decode uses TensorRT LLM's Triton sparse kernels
 within the MSA backend. This does not select `implementation: triton`.
 The optional `fuse_qkv_index_projection: true` supports FP8 and NVFP4 main
-caches with an FP8 indexer.
+caches with an FP8 indexer. The MiniMax-M3.1-Flash targets of the Modeling V2
+`minimax_m3` family also accept a standalone DSpark drafter; see the
+deployment guide.
 
 The sparse path has no dense fallback and does not support KV-cache reuse.
 Eagle3 supports one shared draft layer and linear drafting; other MTP/tree

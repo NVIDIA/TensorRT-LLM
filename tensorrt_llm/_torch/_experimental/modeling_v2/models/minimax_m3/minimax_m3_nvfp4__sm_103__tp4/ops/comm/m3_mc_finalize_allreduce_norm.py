@@ -10,6 +10,7 @@ import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.native import family_ops
 
 from .m3_mc_allreduce_norm import boundary
 
@@ -111,7 +112,7 @@ class M3McFinalizeAllreduceNorm(OpWrapper):
         quant: bool,
         opts: int,
     ) -> list[torch.Tensor]:
-        return torch.ops.trtllm.minimax_m3_mc_allreduce_norm(
+        return family_ops().minimax_m3_mc_allreduce_norm(
             fc2,
             shared,
             residual,

@@ -14,6 +14,20 @@ l0_gr100:
       backend: pytorch
   tests:
   - unittest/_torch/modeling_v2/models/minimax_m3/test_shared_kernel_contracts.py
+  # MiniMax-M3 family code shared with MiniMax-M3.1-Flash. The multi-rank matrices under ops/comm need 4 GPUs.
+  - unittest/_torch/modeling_v2/models/minimax_m3/test_m31_front_capfork.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/ops/attention
+  - unittest/_torch/modeling_v2/models/minimax_m3/ops/dspark
+  - unittest/_torch/modeling_v2/models/minimax_m3/ops/gemm
+  - unittest/_torch/modeling_v2/models/minimax_m3/ops/moe
+  - unittest/_torch/modeling_v2/models/minimax_m3/ops/test_m31_add_rmsnorm_gpu.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/ops/test_m31_dspark_draft_swiglu_gpu.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/ops/test_m31_idxk_split_gpu.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/ops/test_m31_markov_sampling_gpu.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/ops/test_m31_native_swiglu_gpu.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/ops/test_m31_tp_gumbel_draft_gpu.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/kernels/megamoe
+  - unittest/_torch/modeling_v2/models/minimax_m3/kernels/msa_kernels
   # MiniMax-M3 Rubin target unit tests.
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/activation
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/attention
@@ -48,6 +62,69 @@ l0_gr100:
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp8/test_modeling_v2_m3_capture_boundary.py
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp8/test_modeling_v2_m3_dispatch.py
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp8/test_modeling_v2_m3_rank_agreement.py
+  # MiniMax-M3.1-Flash Rubin dep, tp2ctx and dep2ctx target unit tests.
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__dep
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp2ctx
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__dep2ctx
+  # MiniMax-M3.1-Flash sm_107 tp8 target: one entry per op directory plus its top-level GPU tests. Its helpers
+  # share basenames with the MiniMax-M3 targets' (importlib import mode); its comm tests run 2 to 8 ranks.
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp8/activation --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp8/attention --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp8/embedding --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp8/gemm --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp8/moe --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp8/norm --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp8/sampling --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp8/spec --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp8/test_m31_tp8_ctxlen_fuse_gpu.py --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp8/test_m31_tp8_fsel_topk_gpu.py --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp8/test_m31_tp8_gvc8_rings_gpu.py --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp8/test_m31_tp8_layout_gpu.py --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp8/test_m31_tp8_ring_gpu.py --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp8/test_m31_tp8_served_class.py --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp8/test_modeling_v2_m3_capture_boundary.py --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp8/test_modeling_v2_m3_dispatch.py --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp8/test_modeling_v2_m3_rank_agreement.py --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp8/test_modeling_v2_m31_fc_shard.py --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp8/test_modeling_v2_m31_proxy_prebuild.py --import-mode=importlib
+  # MiniMax-M3.1-Flash sm_107 tp4 target: one entry per op directory plus its top-level GPU tests. Its helpers
+  # share basenames with the MiniMax-M3 targets' (importlib import mode); its comm tests run 4 ranks.
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp4/activation --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp4/attention --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp4/embedding --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp4/gemm --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp4/moe --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp4/norm --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp4/sampling --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp4/spec --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp4/test_m31_tp4_fsel_topk_gpu.py --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp4/test_m31_tp4_qkv_front_gpu.py --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp4/test_modeling_v2_m3_capture_boundary.py --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp4/test_modeling_v2_m3_dispatch.py --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp4/test_modeling_v2_m3_prebuild.py --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp4/test_modeling_v2_m3_rank_agreement.py --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp4/test_modeling_v2_m31_fc_shard.py --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp4/test_modeling_v2_m31_proxy_prebuild.py --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp4/test_modeling_v2_m31_tp4_dhead_mx4.py --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp4/test_modeling_v2_m31_tp4_drafter_hislayout.py --import-mode=importlib
+  # MiniMax-M3.1-Flash sm_107 tp2 target: one entry per op directory plus its top-level GPU tests. Its helpers
+  # share basenames with the MiniMax-M3 targets' (importlib import mode); its comm tests run 2 ranks.
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp2/activation --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp2/attention --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp2/embedding --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp2/gemm --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp2/moe --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp2/native --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp2/norm --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp2/sampling --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp2/spec --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp2/test_m31_tp2_w6_fsel_wide_gpu.py --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp2/test_m31_tp2_w8_his_wide_gpu.py --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp2/test_modeling_v2_m3_prebuild.py --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp2/test_modeling_v2_m31_proxy_prebuild.py --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp2/test_modeling_v2_m31_tp2wide_prefill_attn.py --import-mode=importlib
+  # The family MSA attention (msa/): backend, indexer, prefill, prewarm and the NVFP4 index-K reader.
+  - unittest/_torch/modeling_v2/models/minimax_m3/msa
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_flashinfer[enable_chunked_prefill=True]
   - unittest/_torch/attention/test_fp4_mla.py
   - unittest/_torch/attention/test_fp4_mla_packed.py

@@ -88,6 +88,11 @@ reviews:
   path_filters:
     # Vendored/adapted FlashInfer kernels; excluded from review.
     - "!tensorrt_llm/_torch/attention/backends/prims_ts/**"
+    # Vendored MSA kernel trees (3rdparty/vendor_sources.lock.yaml) and the rendered ahead-of-time variant sources.
+    - "!tensorrt_llm/_torch/_experimental/modeling_v2/models/minimax_m3/kernels/msa_kernels/fmha_sm100/**"
+    - "!tensorrt_llm/_torch/_experimental/modeling_v2/models/minimax_m3/kernels/msa_kernels/fmha_sm100_q8kv8/**"
+    - "!tensorrt_llm/_torch/_experimental/modeling_v2/models/minimax_m3/kernels/msa_kernels/prefill_bf16x/**"
+    - "!tensorrt_llm/_torch/_experimental/modeling_v2/models/minimax_m3/csrc/msa_aot/generated/**"
 
   path_instructions:
     - path: "**"

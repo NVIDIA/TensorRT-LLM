@@ -101,6 +101,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsno
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (
     fp4_quantize,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.native import family_ops
 from tensorrt_llm._torch.attention.backends import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.fmha.msa_prefill import _aligned_nvfp4_dequant_scales
 from tensorrt_llm._torch.attention.backends.interface import PositionalEmbeddingParams, RopeParams
@@ -4193,6 +4194,9 @@ class ModelingV2MiniMaxM3Nvfp4Sm103Tp8(
             f"this target is built for sm_{_SM[0]}{_SM[1]}, the device is sm_"
             f"{''.join(map(str, torch.cuda.get_device_capability()))}"
         )
+        # The fused all-reduces run the family library's fixed copies: an installation without the library
+        # refuses here (NoTarget), and modeling_v2='auto' keeps the built-in model.
+        family_ops()
         # Under modeling_v2='require' a covered decode shape that cannot take its fast path raises.
         set_require(resolved_mode(type(self)) is ModelingV2Mode.REQUIRE)
         model_config = _text_model_config(model_config)

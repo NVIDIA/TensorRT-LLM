@@ -19,6 +19,7 @@ l0_gb300:
       backend: pytorch
   tests:
   # MiniMax-M3 target unit tests.
+  - unittest/_torch/modeling_v2/models/minimax_m3/test_m3_fixed_e8m0.py
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/activation
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/attention
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/embedding
@@ -41,6 +42,16 @@ l0_gb300:
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/test_modeling_v2_m3_dispatch.py
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/test_modeling_v2_m3_prebuild.py
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/test_modeling_v2_m3_rank_agreement.py
+  # MiniMax-M3.1-Flash GB300 (sm_103) tp4 target unit tests and the family's sm_103 prefill router.
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_103__tp4/activation --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_103__tp4/attention --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_103__tp4/gemm --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_103__tp4/moe --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_103__tp4/norm --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_103__tp4/sampling --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_103__tp4/spec --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_103__tp4/test_modeling_v2_m31_hosttail.py --import-mode=importlib
+  - unittest/_torch/modeling_v2/models/minimax_m3/ops/moe/test_router_split.py
   # ------------- PyTorch tests ---------------
   # MLA context head slices, including FP8 scale-block boundaries.
   - unittest/_torch/modules/test_linear_output_slice.py

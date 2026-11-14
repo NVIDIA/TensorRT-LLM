@@ -119,6 +119,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.config impo
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.config import (
     _validate_runtime as _validate_runtime,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.native import family_ops
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.activation.m3_silu_and_mul import (
     m3_silu_and_mul,
 )
@@ -326,8 +327,8 @@ class DecodePlan:
 # tiny: every step up to 8 tokens (c1..c8 without speculation, the c1 verify, every draft pass); small: the c2
 # verify; verify: the c4 / c8 verifies. Each is one multicast all-reduce bucket (ops/m3_mc_allreduce.BUCKETS).
 # SM 10.7 TP4: one bucket. MC_AR_TP4 puts every decode boundary on the multicast all-reduce + residual + RMSNorm
-# (trtllm::minimax_m3_sm107_tp4_mc_allreduce_norm, its row kernel: bitwise to the stock TP4 oneshot all-reduce fusion
-# on the residual and the normed rows) with the MXFP8 copy for the next QKV; False = the built-in all-reduce.
+# (mv2_minimax_m3::minimax_m3_sm107_tp4_mc_allreduce_norm, its row kernel: bitwise to the stock TP4 oneshot all-reduce
+# fusion on the residual and the normed rows) with the MXFP8 copy for the next QKV; False = the built-in all-reduce.
 MC_AR_TP4 = True
 # Up to this many rows the decode all-reduces (not the MoE finalize) take the 8-CTA cluster kernel instead of the row
 # kernel: the same stock oneshot order (opts bit 32: per-column sum of squares, warp butterflies, 6-warp groups, 4 group
@@ -5576,6 +5577,9 @@ class ModelingV2MiniMaxM3Nvfp4Sm107Tp4(
             f"this target is built for sm_{_SM[0]}{_SM[1]}, the device is sm_"
             f"{''.join(map(str, torch.cuda.get_device_capability()))}"
         )
+        # The fused all-reduces run the family library's fixed copies: an installation without the library
+        # refuses here (NoTarget), and modeling_v2='auto' keeps the built-in model.
+        family_ops()
         # Under modeling_v2='require' a covered decode shape that cannot take its fast path raises.
         set_require(resolved_mode(type(self)) is ModelingV2Mode.REQUIRE)
         model_config = _text_model_config(model_config)

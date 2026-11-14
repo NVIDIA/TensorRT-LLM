@@ -213,6 +213,21 @@ package_data += [
     'grpc/openengine/proto/openengine/v1/*.proto',
 ]
 
+# Non-Python sources and notices of the MSA kernels the MiniMax-M3.1 targets compile at run time.
+_MSA_KERNELS = '_torch/_experimental/modeling_v2/models/minimax_m3/kernels/msa_kernels'
+package_data += [
+    f'{_MSA_KERNELS}/fmha_sm100/LICENSE',
+    f'{_MSA_KERNELS}/fmha_sm100/NOTICE',
+    f'{_MSA_KERNELS}/fmha_sm100/csrc/**/*',
+    f'{_MSA_KERNELS}/fmha_sm100/cute/src/**/*.cu',
+    f'{_MSA_KERNELS}/prefill_bf16x/LICENSE',
+    f'{_MSA_KERNELS}/prefill_bf16x/NOTICE',
+    f'{_MSA_KERNELS}/prefill_bf16x/README.md',
+    f'{_MSA_KERNELS}/prefill_bf16x/csrc/**/*',
+    f'{_MSA_KERNELS}/fmha_sm100_q8kv8/LICENSE',
+    f'{_MSA_KERNELS}/fmha_sm100_q8kv8/NOTICE',
+]
+
 
 def download_precompiled(workspace: str, version: str) -> str:
     import glob
@@ -239,9 +254,10 @@ def download_precompiled(workspace: str, version: str) -> str:
 def should_skip_precompiled_package_data(filename: str) -> bool:
     """Return True for source-owned package data kept from local checkout.
 
-    Precompiled wheels own native bits. Source owns configuration/telemetry schemas and the
-    OpenEngine contract. Skip those wheel files so Python-only edits layer over
-    old wheels and tracked bindings from the current checkout remain authoritative.
+    Precompiled wheels own native bits. Source owns configuration/telemetry schemas, the
+    OpenEngine contract and the kernel sources compiled at run time. Skip those wheel files so
+    Python-only edits layer over old wheels and tracked bindings from the current checkout
+    remain authoritative.
     """
     filename = filename.replace("\\", "/")
     if filename.startswith(
@@ -250,6 +266,7 @@ def should_skip_precompiled_package_data(filename: str) -> bool:
     return filename.startswith((
         "tensorrt_llm/grpc/openengine/_generated/",
         "tensorrt_llm/grpc/openengine/proto/",
+        "tensorrt_llm/_torch/_experimental/modeling_v2/models/minimax_m3/kernels/msa_kernels/",
     ))
 
 
