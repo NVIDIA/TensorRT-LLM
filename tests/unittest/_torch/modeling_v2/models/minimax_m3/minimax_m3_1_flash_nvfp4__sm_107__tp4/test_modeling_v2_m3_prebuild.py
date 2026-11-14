@@ -41,7 +41,8 @@ try:
     )
 except NoTarget as exc:
     pytest.skip(str(exc), allow_module_level=True)
-from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
+# The fmha_sm100 the target's attention runs (msa.engine): the family's vendored copy.
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.msa.engine import (
     require_msa_module,
 )
 
@@ -75,7 +76,7 @@ _CORE_METHODS = (
 @pytest.fixture(autouse=True)
 def _proxy_builds(monkeypatch):
     """The MSA indexer proxy's fmha_sm100 variants are recorded rather than compiled (an nvcc build each)."""
-    fmha_jit = require_msa_module().jit  # the packaged fmha_sm100 the target's prebuild resolves
+    fmha_jit = require_msa_module().jit  # the fmha_sm100 the target's prebuild resolves
 
     built = []
 
