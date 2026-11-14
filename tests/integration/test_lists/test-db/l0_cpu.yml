@@ -296,6 +296,7 @@ l0_cpu:
   - unittest/executor/test_rpc.py
   - unittest/executor/test_multi_frontend_routing.py
   - unittest/executor/test_proxy_request_sender.py
+  - unittest/executor/test_postprocessor_hook.py
   - unittest/executor/test_event_loop_error_broadcast.py
   - unittest/executor/test_forward_error_survival.py
   - unittest/executor/test_rpc_worker_mixin.py
@@ -304,6 +305,7 @@ l0_cpu:
   - unittest/executor/test_rpc_proxy_submit_order.py
   - unittest/executor/test_stats_serializer.py
   - unittest/executor/test_spec_dec_perf_metrics.py
+  - unittest/executor/test_spec_decode_serialization.py
   - unittest/executor/test_stop_word_side_output_trim.py
   - unittest/executor/test_stop_word_streaming_text.py
   - unittest/executor/test_ray_stub.py
@@ -332,6 +334,7 @@ l0_cpu:
   - unittest/kv_cache_manager_v2_tests
   - unittest/llmapi/test_deepseek_v32_encoding.py
   - unittest/llmapi/test_deepseek_v32_tokenizer.py
+  - unittest/llmapi/test_deepseek_v4_tokenizer.py
   - unittest/llmapi/test_deepseek_v41_tokenizer.py
   - unittest/llmapi/test_session_reuse.py
   - unittest/llmapi/apps/test_anthropic_adapter.py
@@ -410,6 +413,7 @@ l0_cpu:
   - unittest/llmapi/test_reasoning_parser.py
   - unittest/llmapi/test_request_priority.py
   - unittest/llmapi/test_rl_control_auth.py
+  - unittest/llmapi/test_rlhf_utils.py
   - unittest/llmapi/test_runtime_control.py
   - unittest/llmapi/test_runtime_memory_api.py
   - unittest/llmapi/test_sampling_params.py

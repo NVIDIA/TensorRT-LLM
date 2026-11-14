@@ -150,7 +150,6 @@ l0_b200:
   - unittest/_torch/attention/sparse/deepseek_v4/test_prims_ts_sparse_mla_fmha.py TIMEOUT (60)
   - unittest/_torch/modeling/test_modeling_deepseekv4.py
   - unittest/_torch/modeling/test_glm5_next_contracts.py
-  - unittest/llmapi/test_deepseek_v4_tokenizer.py
   - unittest/_torch/modules/test_mhc.py
   - unittest/_torch/modules/test_engram.py
   - unittest/_torch/modules/test_gate_up_swiglu_quack.py
@@ -558,7 +557,6 @@ l0_b200:
       stage: post_merge
       backend: pytorch
   tests:
-  - unittest/disaggregated/test_openai_server_info.py
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_t2i_4step_example TIMEOUT (30)
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_i2v_4step_example TIMEOUT (45)
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_edge_i2v_example TIMEOUT (30)

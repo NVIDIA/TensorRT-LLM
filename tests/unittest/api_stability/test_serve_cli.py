@@ -59,6 +59,8 @@ import yaml
 from tensorrt_llm.commands import serve as serve_cmd
 from tensorrt_llm.commands._serve_stability import ALLOWED_TAGS, collect_command_options
 
+pytestmark = pytest.mark.cpu_only
+
 REFERENCE_PATH = pathlib.Path(__file__).parent / "references" / "trtllm_serve_cli.yaml"
 
 # Subcommands we gate. Names must match the keys in `main.commands` in

@@ -33,12 +33,15 @@ from types import SimpleNamespace
 import aiohttp
 import pytest
 
+from tensorrt_llm.serve import openai_disagg_server
 from tensorrt_llm.serve.openai_disagg_server import (
     _CLOCK_SYNC_GOOD_DELAY_SECONDS,
     _CLOCK_SYNC_MAX_DELAY_SECONDS,
     _CLOCK_SYNC_PROBES,
     OpenAIDisaggServer,
 )
+
+pytestmark = pytest.mark.cpu_only
 
 # The stub sleeps this long between its own receive/transmit stamps, mirroring
 # the real `get_steady_clock_offset` handler. It cancels out of the NTP math.
@@ -144,12 +147,15 @@ async def test_fast_server_offset_is_applied_and_small():
 
 
 @pytest.mark.asyncio
-async def test_fast_server_stops_after_one_probe():
+async def test_fast_server_stops_after_one_probe(monkeypatch):
     """Probing stops as soon as a sample is conclusive.
 
     Each probe costs a full round trip and servers are prepared sequentially,
-    so a healthy server must not spend the whole probe budget.
+    so a healthy server must not spend the whole probe budget. The conclusive
+    threshold is widened so a loopback round trip counts as conclusive even on
+    a busy runner; the threshold itself is covered by the stalled-server test.
     """
+    monkeypatch.setattr(openai_disagg_server, "_CLOCK_SYNC_GOOD_DELAY_SECONDS", 1.0)
     async with _StubWorkerServer() as stub:
         await _run_handshake(stub)
 
