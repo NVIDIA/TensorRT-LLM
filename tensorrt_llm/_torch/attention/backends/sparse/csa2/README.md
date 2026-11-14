@@ -161,11 +161,11 @@ a generic NVFP4 KV-cache flag. Projection precision and the selected attention
 compute path do not change the persistent main-cache encoding.
 
 Long prefill uses scratch-aware page mappings. Partial groups retain raw FP32
-values and scores. CUDA BF16 cache publication on SM100 uses fused exact-byte
+values and scores. CUDA BF16 cache publication on SM90 and SM100 uses fused exact-byte
 CuTe DSL quantize/scatter kernels (`kernel.py`), including the split
 data/scale packing of index queries; other paths use the encoder and masked
 scatter. Invalid slots, including padding slot -1, never write a cache row.
-The default staged attention path uses CuTe DSL gather/dequantization on SM100
+The default staged attention path uses CuTe DSL gather/dequantization on SM90 and SM100
 to read selected packed rows directly into the BF16 or FP8 staging pools,
 including strided main/index views; the staging kernels resolve logical main
 selections through the owner's live page table. Invalid read slots produce
