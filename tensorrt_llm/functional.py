@@ -469,6 +469,7 @@ class RopeEmbeddingUtils:
         mscale_all_dim: float = 1.0,
         duplicate_data: bool = True,
         dtype=None,
+        truncate: bool = True,
     ):
         if dtype is None:
             dtype = torch.float32
@@ -484,12 +485,15 @@ class RopeEmbeddingUtils:
         # Find dim range bounds based on rotations
         def yarn_find_correction_range(low_rot, high_rot, dim, base,
                                        max_position_embeddings):
-            low = math.floor(
-                yarn_find_correction_dim(low_rot, dim, base,
-                                         max_position_embeddings))
-            high = math.ceil(
-                yarn_find_correction_dim(high_rot, dim, base,
-                                         max_position_embeddings))
+            low = yarn_find_correction_dim(low_rot, dim, base,
+                                           max_position_embeddings)
+            high = yarn_find_correction_dim(high_rot, dim, base,
+                                            max_position_embeddings)
+            # Hugging Face's `truncate` rope parameter (default True); GPT-OSS
+            # sets it to False and keeps the fractional bounds.
+            if truncate:
+                low = math.floor(low)
+                high = math.ceil(high)
             if low < 0:
                 low = 0
             if high > dim - 1:
