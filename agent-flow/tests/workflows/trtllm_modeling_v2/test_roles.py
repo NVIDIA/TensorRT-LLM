@@ -42,7 +42,9 @@ from agent_flow.workflows.trtllm_modeling_v2.agents.turns import (
     TurnTimeout,
 )
 from agent_flow.workflows.trtllm_modeling_v2.checks import check_config
+from agent_flow.workflows.trtllm_modeling_v2.operators import coverage as catalog_paths
 from agent_flow.workflows.trtllm_modeling_v2.operators.coverage import QueueItem
+from agent_flow.workflows.trtllm_modeling_v2.run.execution import kernel_task
 from agent_flow.workflows.trtllm_modeling_v2.run.execution.handoff import (
     current_decision,
     decision_path,
@@ -564,6 +566,55 @@ def test_kernel_sourcing_and_landing_branches(
     assert absent not in text
     assert ("Write the entry there" in text) is (mode == "onboard")
     assert ("Start the variant as a copy" in text) is (mode != "onboard")
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["fp4_block_scale_moe_runner", "mxe4m3_mxe2m1_block_scale_moe_runner", "noaux_tc_op"],
+)
+@pytest.mark.parametrize("tests_directory", ["moe", "moe/ops"])
+@pytest.mark.parametrize("shared_landing", [False, True])
+def test_kernel_prompt_protects_shared_tests_in_task_checkout(
+    tmp_path: Path, name: str, tests_directory: str, shared_landing: bool
+) -> None:
+    repo = tmp_path / "checkout"
+    source = f"{catalog_paths.CATALOG_DIR}/moe/{name}.py"
+    test = f"{catalog_paths.CATALOG_TESTS_DIR}/{tests_directory}/test_modeling_v2_{name}.py"
+    for relative in (source, test):
+        path = repo / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# Shared entry contract.\n", encoding="utf-8")
+
+    target = f"{catalog_paths.MODELING_V2_PACKAGE}/models/family/target"
+    ref = f"verify:moe/{name}"
+    item = catalog_paths.queue_item_from_ref(ref, "scope_probe")
+    assert item is not None
+    local_source = f"{target}/ops/moe/{name}__scope_probe.py"
+    task = Task(
+        id="scope_probe",
+        kind="kernel",
+        goal=f"Verify {name}",
+        ref=ref,
+        touches=[source if shared_landing else local_source],
+    )
+    execution = SimpleNamespace(
+        workflow=SimpleNamespace(
+            task_data={"trtllm_repo_path": str(repo), "arch": "sm_100"},
+            _preflight=SimpleNamespace(target_rel=target),
+            workspace=tmp_path / "run",
+            vocabulary_path=tmp_path / "run/vocabulary.yaml",
+        )
+    )
+    landing, paths = kernel_task._landing(execution, item, task)
+    text = kernel_task._kernel_writer_prompt(execution, item, task=task)
+    if shared_landing:
+        assert landing == item.target
+        assert paths == (source, test)
+        assert "Leave " not in text
+    else:
+        assert landing == item.variant
+        assert paths is not None and paths[0] == local_source
+        assert f"Leave `{source}` and `{test}`\nas they are:" in text
 
 
 def test_survey_capture_variants_and_tune_identity_files(tmp_path: Path, monkeypatch) -> None:

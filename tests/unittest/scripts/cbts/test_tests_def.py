@@ -24,9 +24,9 @@ from pathlib import Path
 import pytest
 
 __extra_import_path__ = ["~/jenkins/scripts/cbts"]
-from cbts.blocks import Stage, YAMLIndex
+from cbts.blocks import Stage, YAMLIndex, parse_stages_from_groovy
 from cbts.rules._helpers import strip_noop_diff_lines
-from cbts.rules.base import PRInputs
+from cbts.rules.base import PRInputs, RuleResult
 from cbts.rules.tests_def import (
     ACCURACY_DIR,
     ACCURACY_REFS_PREFIX,
@@ -276,6 +276,161 @@ def test_uncovered_import_consumers_keep_directory_fallback(tmp_path: Path) -> N
         ("l0_b200", 0),
         ("l0_gb200_multi_gpus_perf_sanity", 0),
     }
+
+
+@pytest.mark.parametrize(
+    ("helper", "select_family"),
+    [
+        pytest.param("_fp4_moe_test_utils.py", True, id="root-helper"),
+        pytest.param("moe/_fp4_moe_test_utils.py", True, id="shared-helper"),
+        pytest.param("moe/_other_test_utils.py", False, id="local-helper"),
+    ],
+)
+def test_shared_fp4_helper_keeps_modeling_v2_family_consumers(
+    tmp_path: Path, helper: str, select_family: bool
+) -> None:
+    modeling_v2 = "unittest/_torch/modeling_v2"
+    family_consumers = {
+        f"{modeling_v2}/models/qwen4_exp/ops/moe/{name}"
+        for name in (
+            "test_modeling_v2_fp4_block_scale_moe_renorm_routed.py",
+            "test_modeling_v2_fp4_block_scale_moe_renorm_permuted.py",
+            "test_modeling_v2_fp4_block_scale_moe_renorm_routed_windows.py",
+            "test_modeling_v2_fp4_moe_renorm_cute_dsl.py",
+        )
+    }
+    shared_test = f"{modeling_v2}/moe/ops/test_modeling_v2_fp4_block_scale_moe_runner.py"
+    unrelated_test = "unittest/_torch/moe/test_moe_module.py"
+    test_db_dir = tmp_path / "test-db"
+    test_db_dir.mkdir()
+    entries = sorted(family_consumers | {shared_test, unrelated_test})
+    (test_db_dir / "l0_b200.yml").write_text(
+        "l0_b200:\n- tests:\n" + "".join(f"  - {entry}\n" for entry in entries),
+        encoding="utf-8",
+    )
+    (test_db_dir / "l0_other.yml").write_text(
+        "l0_other:\n- tests:\n  - unittest/others/test_other.py\n", encoding="utf-8"
+    )
+    stage = Stage("DGX_B200-PyTorch-1", "l0_b200", "x86_64", 1, 1)
+    rule = CbtsTestsDefRule(YAMLIndex.load(test_db_dir), {stage.name: stage}, tmp_path)
+
+    result = rule.apply(PRInputs(changed_files=[f"tests/{modeling_v2}/{helper}"], diffs={}))
+
+    assert result is not None
+    assert result.scope == "testdefonly"
+    assert result.affected_stages == {stage.name}
+    expected = {shared_test} | (family_consumers if select_family else set())
+    prefix = modeling_v2 if select_family else f"{modeling_v2}/moe"
+    assert result.block_filters == {("l0_b200", 0): {prefix: expected}}
+
+
+@pytest.mark.parametrize(
+    ("tp_size", "helper", "select_sh_take"),
+    [
+        pytest.param(2, "_m3_moe_operands.py", True, id="tp2-operands"),
+        pytest.param(2, "_local_test_utils.py", False, id="tp2-local-helper"),
+        pytest.param(4, "_m3_moe_operands.py", False, id="tp4-operands"),
+        pytest.param(8, "_m3_moe_operands.py", False, id="tp8-operands"),
+    ],
+)
+def test_m3_tp2_operands_keep_sibling_sh_take_consumer(
+    tmp_path: Path, tp_size: int, helper: str, select_sh_take: bool
+) -> None:
+    targets = "unittest/_torch/modeling_v2/models/minimax_m3"
+    ops = f"{targets}/minimax_m3_nvfp4__sm_107__tp{tp_size}/ops"
+    sh_take_dir = f"{targets}/minimax_m3_nvfp4__sm_107__tp2/ops/m3_moe"
+    moe_tests = {f"{ops}/moe/test_modeling_v2_m3_moe_engine.py"}
+    if tp_size == 2:
+        moe_tests.add(f"{ops}/moe/test_modeling_v2_m3_moe_epoch_wrap.py")
+    comm_test = f"{ops}/comm/test_modeling_v2_m3_mc_allreduce_norm_op_matrix.py"
+    entries = sorted(moe_tests | {sh_take_dir, comm_test})
+    test_db_dir = tmp_path / "test-db"
+    test_db_dir.mkdir()
+    (test_db_dir / "l0_gr100.yml").write_text(
+        "l0_gr100:\n- condition:\n    terms:\n      stage: post_merge\n"
+        "  tests:\n" + "".join(f"  - {entry}\n" for entry in entries),
+        encoding="utf-8",
+    )
+    (test_db_dir / "l0_other.yml").write_text(
+        "l0_other:\n- tests:\n  - unittest/others/test_other.py\n", encoding="utf-8"
+    )
+    stages = {
+        name: Stage(name, "l0_gr100", "x86_64", 1, 1, {"stage": stage})
+        for name, stage in (
+            ("GR100-PyTorch-Post-Merge-1", "post_merge"),
+            ("GR100-PyTorch-1", "pre_merge"),
+        )
+    }
+    rule = CbtsTestsDefRule(YAMLIndex.load(test_db_dir), stages, tmp_path)
+
+    result = rule.apply(PRInputs(changed_files=[f"tests/{ops}/moe/{helper}"], diffs={}))
+
+    assert result is not None
+    assert result.scope == "testdefonly"
+    assert result.affected_stages == {"GR100-PyTorch-Post-Merge-1"}
+    expected = moe_tests | ({sh_take_dir} if select_sh_take else set())
+    assert _selected_entries(result) == {("l0_gr100", 0): expected}
+
+
+@pytest.mark.parametrize("tp_size", [4, 8])
+@pytest.mark.parametrize(
+    ("helper", "select_moved_consumer"),
+    [("_rank_job.py", True), ("_local_test_utils.py", False)],
+)
+def test_m3_rank_helper_keeps_moved_collective_consumer(
+    tmp_path: Path, tp_size: int, helper: str, select_moved_consumer: bool
+) -> None:
+    target = f"unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp{tp_size}"
+    comm_dir = f"{target}/comm"
+    moved_comm_dir = f"{target}/ops/comm"
+    unrelated_test = f"{target}/ops/moe/test_modeling_v2_m3_moe_engine.py"
+    test_db_dir = tmp_path / "test-db"
+    test_db_dir.mkdir()
+    (test_db_dir / "l0_gb300_multi_gpus.yml").write_text(
+        "l0_gb300_multi_gpus:\n- condition:\n"
+        "    ranges:\n      system_gpu_count:\n        gte: 4\n        lte: 4\n"
+        "    terms:\n      stage: post_merge\n  tests:\n"
+        f"  - {comm_dir}\n  - {moved_comm_dir}\n  - {unrelated_test}\n",
+        encoding="utf-8",
+    )
+    (test_db_dir / "l0_other.yml").write_text(
+        "l0_other:\n- tests:\n  - unittest/others/test_other.py\n", encoding="utf-8"
+    )
+    expected_stages = {f"GB300-4_GPUs-PyTorch-Post-Merge-{i}" for i in range(1, 4)}
+    stages = {
+        name: Stage(
+            name,
+            "l0_gb300_multi_gpus",
+            "aarch64",
+            i,
+            3,
+            {"stage": "post_merge", "system_gpu_count": "4"},
+        )
+        for i, name in enumerate(sorted(expected_stages), start=1)
+    }
+    for name, stage, gpu_count in (
+        ("GB300-4_GPUs-PyTorch-1", "pre_merge", "4"),
+        ("GB300-8_GPUs-PyTorch-Post-Merge-1", "post_merge", "8"),
+    ):
+        stages[name] = Stage(
+            name,
+            "l0_gb300_multi_gpus",
+            "aarch64",
+            1,
+            1,
+            {"stage": stage, "system_gpu_count": gpu_count},
+        )
+    rule = CbtsTestsDefRule(YAMLIndex.load(test_db_dir), stages, tmp_path)
+
+    result = rule.apply(PRInputs(changed_files=[f"tests/{comm_dir}/{helper}"], diffs={}))
+
+    assert result is not None
+    assert result.scope == "testdefonly"
+    assert result.affected_stages == expected_stages
+    expected = {comm_dir: {comm_dir}}
+    if select_moved_consumer:
+        expected[moved_comm_dir] = {moved_comm_dir}
+    assert result.block_filters == {("l0_gb300_multi_gpus", 0): expected}
 
 
 def test_scope_start_line_includes_decorators() -> None:
@@ -584,3 +739,369 @@ def test_mixed_known_and_unknown_reference_keys_keep_fallback(tmp_path: Path) ->
     assert _make_rule(tmp_path)._compute_anchors(
         f"{DEFS_GIT_PREFIX}{yaml_path}", yaml_path, diff
     ) == [yaml_path]
+
+
+_COHORT_MODELS = "unittest/_torch/modeling_v2/models"
+_COHORT_M3 = f"{_COHORT_MODELS}/minimax_m3"
+_COHORT_K3 = f"{_COHORT_MODELS}/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1"
+_COHORT_GLM = f"{_COHORT_MODELS}/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency"
+_COHORT_GLM_ROUTER = f"{_COHORT_GLM}/ops/gemm/test_modeling_v2_router_gemm.py"
+_COHORT_M3_MOE_FILES = {
+    2: (
+        "ops/moe/test_modeling_v2_m3_moe_engine.py",
+        "ops/moe/test_modeling_v2_m3_moe_epoch_wrap.py",
+        "ops/m3_moe/test_modeling_v2_m3_moe_flat_gate.py",
+        "ops/m3_moe/test_modeling_v2_m3_moe_sh_take.py",
+        "ops/moe/test_modeling_v2_m3_moe_triton_finalize.py",
+        "ops/moe/test_modeling_v2_m3_fp32_router_rows.py",
+        "ops/moe/test_modeling_v2_m3_moe_finalize_rows.py",
+    ),
+    4: (
+        "ops/moe/test_modeling_v2_m3_moe_engine.py",
+        "ops/moe/test_modeling_v2_m3_moe16_engine.py",
+        "ops/m3_moe/test_modeling_v2_m3_moe_flat_gate_tp4.py",
+    ),
+    8: ("ops/moe/test_modeling_v2_m3_moe_engine.py",),
+}
+
+
+def _selected_entries(result: RuleResult) -> dict[tuple[str, int], set[str]]:
+    return {
+        key: {entry for entries in prefixes.values() for entry in entries}
+        for key, prefixes in result.block_filters.items()
+    }
+
+
+def _make_cohort_rule(
+    tmp_path: Path,
+    entries_by_list: dict[str, set[str]],
+    post_merge_lists: frozenset[str] = frozenset(),
+) -> CbtsTestsDefRule:
+    test_db = tmp_path / "test-db"
+    test_db.mkdir()
+    stages: dict[str, Stage] = {}
+    for stem, entries in {
+        **entries_by_list,
+        "l0_other": {"unittest/others/test_other.py"},
+    }.items():
+        condition = (
+            "- condition:\n    terms:\n      stage: post_merge\n  tests:\n"
+            if stem in post_merge_lists
+            else "- tests:\n"
+        )
+        (test_db / f"{stem}.yml").write_text(
+            f"{stem}:\n{condition}" + "".join(f"  - {entry}\n" for entry in sorted(entries)),
+            encoding="utf-8",
+        )
+        for mode in ("pre_merge", "post_merge"):
+            name = f"{stem}-{mode}"
+            stages[name] = Stage(name, stem, "x86_64", 1, 1, {"stage": mode})
+    return CbtsTestsDefRule(YAMLIndex.load(test_db), stages, tmp_path)
+
+
+def _m3_target(tp_size: int, sm: int = 107) -> str:
+    return f"{_COHORT_M3}/minimax_m3_nvfp4__sm_{sm}__tp{tp_size}"
+
+
+def _m3_router_test(tp_size: int) -> str:
+    return f"{_COHORT_M3}/minimax_m3_nvfp4__sm_107__tp{tp_size}/ops/moe/test_modeling_v2_m3_router_tc.py"
+
+
+def _m3_moe_cohort(tp_size: int) -> set[str]:
+    return {f"{_m3_target(tp_size)}/{name}" for name in _COHORT_M3_MOE_FILES[tp_size]} | {
+        _m3_router_test(tp_size)
+    }
+
+
+def test_modeling_v2_cohort_k3_helper_keeps_target_checks(tmp_path: Path) -> None:
+    entries = {
+        f"{_COHORT_K3}/ops/moe/test_modeling_v2_k3_moe_m1.py",
+        f"{_COHORT_K3}/test_tp16_moetp16ep1_construction.py",
+        f"{_COHORT_K3}/kernels/k3_moe_engines/test_k3_moe_engines_source_checks.py",
+    }
+    foreign = f"{_COHORT_MODELS}/kimi_k3_vl/other_target/test_other.py"
+    rule = _make_cohort_rule(tmp_path, {"l0_b300": entries | {foreign}})
+    result = rule.apply(
+        PRInputs(changed_files=[f"tests/{_COHORT_K3}/ops/moe/_k3_moe_engines.py"], diffs={})
+    )
+    assert result is not None
+    assert result.scope == "testdefonly"
+    assert _selected_entries(result) == {("l0_b300", 0): entries}
+    assert result.affected_stages == {"l0_b300-pre_merge", "l0_b300-post_merge"}
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        pytest.param("ops/gemm/test_modeling_v2_router_gemm.py", id="router"),
+        *(
+            pytest.param(f"gemm/{name}", id=f"sibling-{name}")
+            for name in (
+                "test_modeling_v2_dense_mlp_small_m.py",
+                "test_modeling_v2_draft_hidden_half.py",
+                "test_modeling_v2_fused_a_gemm.py",
+                "test_modeling_v2_indexer_q_tail.py",
+                "test_modeling_v2_low_m_gemm.py",
+                "test_modeling_v2_o_proj_publish.py",
+                "test_modeling_v2_q_b_fp8_rope.py",
+            )
+        ),
+    ],
+)
+def test_modeling_v2_cohort_glm_keeps_stage_specific_gemm_scope(
+    tmp_path: Path, relative: str
+) -> None:
+    gemm = f"{_COHORT_GLM}/gemm"
+    moved_gemm = f"{_COHORT_GLM}/ops/gemm"
+    broad_target = f"{_COHORT_GLM} TIMEOUT (30)"
+    rule = _make_cohort_rule(
+        tmp_path,
+        {
+            "l0_b300": {broad_target},
+            "l0_gr100": {gemm, moved_gemm, f"{_COHORT_GLM}/ops/moe"},
+        },
+        frozenset({"l0_gr100"}),
+    )
+    result = rule.apply(PRInputs(changed_files=[f"tests/{_COHORT_GLM}/{relative}"], diffs={}))
+    assert result is not None
+    assert _selected_entries(result) == {
+        ("l0_b300", 0): {broad_target},
+        ("l0_gr100", 0): {gemm, moved_gemm},
+    }
+    assert result.affected_stages == {
+        "l0_b300-pre_merge",
+        "l0_b300-post_merge",
+        "l0_gr100-post_merge",
+    }
+
+
+@pytest.mark.parametrize("tp_size", [4, 8])
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "comm/_rank_job.py",
+        pytest.param("comm/_m3_allreduce_op_matrix.py", id="sibling-allreduce-helper"),
+        pytest.param("comm/test_modeling_v2_m3_allreduce.py", id="sibling-allreduce-test"),
+        "ops/comm/_m3_mc_allreduce_norm_op_matrix.py",
+        "ops/comm/test_modeling_v2_m3_mc_allreduce_norm_op_matrix.py",
+        "ops/comm/test_modeling_v2_m3_mc_finalize_allreduce_norm.py",
+    ],
+)
+def test_modeling_v2_cohort_sm103_collectives_keep_both_directories(
+    tmp_path: Path, tp_size: int, relative: str
+) -> None:
+    target = _m3_target(tp_size, sm=103)
+    expected = {f"{target}/comm", f"{target}/ops/comm"}
+    other_target = _m3_target(8 if tp_size == 4 else 4, sm=103)
+    rule = _make_cohort_rule(
+        tmp_path,
+        {
+            "l0_gb300_multi_gpus": expected
+            | {f"{target}/ops/moe", f"{other_target}/comm", f"{other_target}/ops/comm"}
+        },
+        frozenset({"l0_gb300_multi_gpus"}),
+    )
+    result = rule.apply(PRInputs(changed_files=[f"tests/{target}/{relative}"], diffs={}))
+    assert result is not None
+    assert _selected_entries(result) == {("l0_gb300_multi_gpus", 0): expected}
+    assert result.affected_stages == {"l0_gb300_multi_gpus-post_merge"}
+
+
+@pytest.mark.parametrize(
+    ("tp_size", "changed_path"),
+    [
+        pytest.param(tp_size, path, id=f"tp{tp_size}-{Path(path).name}")
+        for tp_size in (2, 4, 8)
+        for path in sorted(
+            _m3_moe_cohort(tp_size)
+            | {
+                f"{_m3_target(tp_size)}/ops/moe/_m3_moe_operands.py",
+                f"{_COHORT_M3}/minimax_m3_nvfp4__sm_107__tp{tp_size}/ops/moe/_m3_router.py",
+            }
+        )
+    ],
+)
+def test_modeling_v2_cohort_sm107_moe_keeps_siblings_without_comm(
+    tmp_path: Path, tp_size: int, changed_path: str
+) -> None:
+    target = _m3_target(tp_size)
+    entries = set().union(*(_m3_moe_cohort(tp) for tp in (2, 4, 8))) | {
+        f"{target}/ops/moe/test_modeling_v2_m3_moe_push_op_matrix.py",
+        f"{target}/ops/comm/test_modeling_v2_m3_mc_allreduce_norm_op_matrix.py",
+        f"{target}/norm/test_norm.py",
+    }
+    rule = _make_cohort_rule(tmp_path, {"l0_gr100": entries}, frozenset({"l0_gr100"}))
+    result = rule.apply(PRInputs(changed_files=[f"tests/{changed_path}"], diffs={}))
+    assert result is not None
+    assert _selected_entries(result) == {("l0_gr100", 0): _m3_moe_cohort(tp_size)}
+    assert result.affected_stages == {"l0_gr100-post_merge"}
+
+
+@pytest.mark.parametrize(
+    ("tp_size", "relative"),
+    [
+        pytest.param(
+            tp_size,
+            relative,
+            id=(
+                "sibling-"
+                if relative
+                in {
+                    "comm/_m3_allreduce_op_matrix.py",
+                    "comm/_m3_capture_in_boundary_op_matrix.py",
+                    "comm/_m3_draft_ar_norm_op_matrix.py",
+                    "comm/_sampled_accept_tp8.py",
+                }
+                else ""
+            )
+            + f"tp{tp_size}-{Path(relative).name}",
+        )
+        for tp_size in (2, 4, 8)
+        for relative in (
+            "comm/_rank_job.py",
+            "comm/_m3_allreduce_op_matrix.py",
+            "ops/comm/_m3_mc_allreduce_norm_op_matrix.py",
+            *(("ops/moe/_m3_moe_push_op_matrix.py",) if tp_size in (2, 8) else ()),
+            *(
+                ("comm/_m3_capture_in_boundary_op_matrix.py", "comm/_m3_draft_ar_norm_op_matrix.py")
+                if tp_size == 4
+                else ()
+            ),
+            *(("comm/_sampled_accept_tp8.py",) if tp_size == 8 else ()),
+        )
+    ],
+)
+def test_modeling_v2_cohort_sm107_comm_keeps_target_and_own_router(
+    tmp_path: Path, tp_size: int, relative: str
+) -> None:
+    all_entries: set[str] = set()
+    expected: set[str] = set()
+    for tp in (2, 4, 8):
+        target = _m3_target(tp)
+        entries = _m3_moe_cohort(tp) | {f"{target}/norm", f"{target}/spec"}
+        all_entries.update(entries)
+        if tp == tp_size:
+            expected = entries
+    rule = _make_cohort_rule(tmp_path, {"l0_gr100": all_entries}, frozenset({"l0_gr100"}))
+    result = rule.apply(
+        PRInputs(changed_files=[f"tests/{_m3_target(tp_size)}/{relative}"], diffs={})
+    )
+    assert result is not None
+    assert _selected_entries(result) == {("l0_gr100", 0): expected}
+    assert result.affected_stages == {"l0_gr100-post_merge"}
+
+
+@pytest.mark.parametrize(
+    ("change", "scoped"),
+    [
+        ("no-hunk", False),
+        ("module-add", False),
+        ("module-delete", False),
+        ("file-delete", False),
+        ("body-add", True),
+        ("body-delete", True),
+    ],
+)
+def test_modeling_v2_cohort_preserves_function_diff_narrowing(
+    tmp_path: Path, change: str, scoped: bool
+) -> None:
+    source = "VALUE = 1\n\ndef test_selected() -> None:\n    assert True\n"
+    before = source
+    after = source
+    if change == "module-add":
+        after = "OTHER = 2\n" + source
+    elif change == "module-delete":
+        after = source.replace("VALUE = 1\n", "")
+    elif change == "file-delete":
+        after = ""
+    elif change == "body-add":
+        after = source + "    assert 1 == 1\n"
+    elif change == "body-delete":
+        before = source + "    assert 1 == 1\n"
+    diff = "".join(difflib.unified_diff(before.splitlines(True), after.splitlines(True), n=3))
+    git_path = f"tests/{_COHORT_GLM_ROUTER}"
+    test_file = tmp_path / git_path
+    test_file.parent.mkdir(parents=True)
+    if change != "file-delete":
+        test_file.write_text(after, encoding="utf-8")
+    selected = f"{_COHORT_GLM_ROUTER}::test_selected"
+    untouched = f"{_COHORT_GLM_ROUTER}::test_untouched"
+    sibling = f"{_COHORT_GLM}/gemm/test_dense_gemm.py"
+    unrelated = f"{_COHORT_GLM}/ops/moe/test_experts.py"
+    rule = _make_cohort_rule(
+        tmp_path,
+        {"l0_gr100": {selected, untouched, sibling, unrelated}},
+        frozenset({"l0_gr100"}),
+    )
+    assert rule._compute_anchors(git_path, _COHORT_GLM_ROUTER, diff) == [
+        selected if scoped else _COHORT_GLM_ROUTER
+    ]
+    result = rule.apply(PRInputs(changed_files=[git_path], diffs={git_path: diff}))
+    assert result is not None
+    expected = {selected} if scoped else {selected, untouched, sibling}
+    assert _selected_entries(result) == {("l0_gr100", 0): expected}
+    assert result.affected_stages == {"l0_gr100-post_merge"}
+
+
+@pytest.fixture(scope="module")
+def modeling_v2_cohort_real_rule() -> CbtsTestsDefRule:
+    repo_root = Path(__file__).resolve().parents[4]
+    return CbtsTestsDefRule(
+        YAMLIndex.load(repo_root / "tests/integration/test_lists/test-db"),
+        parse_stages_from_groovy(repo_root / "jenkins/L0_Test.groovy", include_post_merge=True),
+        repo_root,
+    )
+
+
+def test_modeling_v2_cohort_real_glm_gemm_excludes_rubin_moe(
+    modeling_v2_cohort_real_rule: CbtsTestsDefRule,
+) -> None:
+    result = modeling_v2_cohort_real_rule.apply(
+        PRInputs(changed_files=[f"tests/{_COHORT_GLM_ROUTER}"], diffs={})
+    )
+    assert result is not None
+    entries = _selected_entries(result)
+    assert entries[("l0_b300", 0)] == {f"{_COHORT_GLM} TIMEOUT (30)"}
+    assert entries[("l0_gr100", 0)] == {
+        f"{_COHORT_GLM}/gemm",
+        f"{_COHORT_GLM}/ops/gemm",
+    }
+    assert result.affected_stages == {
+        "B300-PyTorch-1",
+        "B300-PyTorch-2",
+        "GR100-PyTorch-Post-Merge-1",
+    }
+
+
+def test_modeling_v2_cohort_real_k3_helper_keeps_root_checks(
+    modeling_v2_cohort_real_rule: CbtsTestsDefRule,
+) -> None:
+    result = modeling_v2_cohort_real_rule.apply(
+        PRInputs(changed_files=[f"tests/{_COHORT_K3}/ops/moe/_k3_moe_engines.py"], diffs={})
+    )
+    assert result is not None
+    entries = _selected_entries(result)
+    assert {
+        f"{_COHORT_K3}/ops/moe/test_modeling_v2_k3_moe_m1.py",
+        f"{_COHORT_K3}/test_tp16_moetp16ep1_construction.py",
+    } <= entries[("l0_b300", 0)]
+    assert any(stem == "l0_cpu" for stem, _ in entries)
+    assert any(stem == "l0_gb300" for stem, _ in entries)
+    assert all(
+        entry.startswith(_COHORT_K3 + "/") for selected in entries.values() for entry in selected
+    )
+
+
+def test_modeling_v2_cohort_real_tp2_moe_keeps_only_moe_group(
+    modeling_v2_cohort_real_rule: CbtsTestsDefRule,
+) -> None:
+    target = _m3_target(2)
+    result = modeling_v2_cohort_real_rule.apply(
+        PRInputs(changed_files=[f"tests/{target}/ops/moe/_m3_moe_operands.py"], diffs={})
+    )
+    assert result is not None
+    expected = {
+        path for path in _m3_moe_cohort(2) if not path.startswith(f"{target}/ops/m3_moe/")
+    } | {f"{target}/ops/m3_moe"}
+    assert _selected_entries(result) == {("l0_gr100", 0): expected}
+    assert result.affected_stages == {"GR100-PyTorch-Post-Merge-1"}

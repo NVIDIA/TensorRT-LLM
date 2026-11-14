@@ -390,7 +390,7 @@ test directory, the layout is up to the target.
 | Tests | Location |
 |---|---|
 | Routing, loader and CI selection | `tests/unittest/_torch/modeling_v2/test_modeling_v2_*.py` |
-| Catalog operations | `tests/unittest/_torch/modeling_v2/<category>/` |
+| Catalog operations | `tests/unittest/_torch/modeling_v2/<category>/`; MoE op contracts in `moe/ops/` |
 | Family routing | `tests/unittest/_torch/modeling_v2/models/<family>/` |
 | Family-shared code | `tests/unittest/_torch/modeling_v2/models/<family>/<path of the code>/` |
 | Target code | `tests/unittest/_torch/modeling_v2/models/<family>/<target>/` |
@@ -406,6 +406,10 @@ CI selects tests by the scope of the change:
 * A change to a catalog operation runs its category's tests and the tests of
   every target that imports it. A change to code every model shares runs all
   Modeling V2 tests.
+
+Exact source-to-test associations retain additional named family and component
+checks outside these prefixes. See the [CBTS selection rules](../../../../jenkins/scripts/cbts/cbts/rules/README.md)
+for these associations and shared-helper selection.
 
 A target is a directory under `models/<family>/` whose class the family's
 `route` returns. Give each target a mirrored unit test directory and an

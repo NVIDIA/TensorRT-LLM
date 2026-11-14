@@ -29,7 +29,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.moe.reno
     renorm_moe_routing_op,
 )
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = ["../../../../moe", "../../../.."]
 import _fp4_moe_test_utils as H  # noqa: E402
 from _fp4_moe_test_utils import many_expert_layer  # noqa: E402,F401 — fixture by name
 from _precision import true_fp32_matmul  # noqa: E402

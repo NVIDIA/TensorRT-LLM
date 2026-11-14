@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import hashlib
 import os
 import re
 import shlex
@@ -178,6 +179,12 @@ def _parallel_config_key(case: str) -> str:
     return re.sub(r'\s+--ignore=\S+', '', case).strip()
 
 
+def _junit_report_id(case: str, case_fn: str) -> str:
+    """Disambiguate truncated report labels using the complete test selector."""
+    digest = hashlib.sha256(case.encode("utf-8")).hexdigest()[:16]
+    return f"{case_fn}-{digest}"
+
+
 def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
     import pandas as pd
     import pynvml
@@ -257,6 +264,7 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
     case_fn = re.sub(r'[/\s"\']+', '-', case)
     if len(case_fn) > 80:
         case_fn = case_fn[:80]
+    report_id = _junit_report_id(case, case_fn)
     # MoE entries expand to too many sub-tests, which introduces noise into
     # the overall TRT-LLM test quality metrics. Skip per-sub-test reporting
     # for MoE by prefixing with "moe-" (CI only collects files starting
@@ -270,12 +278,12 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
     if case_path == "unittest/_torch/moe" or case_path.startswith(
             "unittest/_torch/moe/"):
         output_xml = os.path.join(output_dir,
-                                  f'moe-results-sub-unittests-{case_fn}.xml')
+                                  f'moe-results-sub-unittests-{report_id}.xml')
         unfinished_test_path = os.path.join(
             output_dir, f'moe-unfinished-sub-unittests-{case_fn}.txt')
     else:
         output_xml = os.path.join(output_dir,
-                                  f'results-sub-unittests-{case_fn}.xml')
+                                  f'results-sub-unittests-{report_id}.xml')
 
     command = [
         '-m',
@@ -427,7 +435,7 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
         # Avoid .xml extension to prevent CI from reading failures from it
         parallel_output_xml = os.path.join(
             output_dir,
-            f'parallel-sub-results-unittests-{case_fn}.xml.intermediate')
+            f'parallel-sub-results-unittests-{report_id}.xml.intermediate')
         parallel_command = command + [
             "-n", f"{num_workers}",
             f"--periodic-junit-xmlpath={parallel_output_xml}"
@@ -445,7 +453,7 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
             # Avoid .xml extension to prevent CI from reading failures from it
             retry_output_xml = os.path.join(
                 output_dir,
-                f'retry-sub-results-unittests-{case_fn}.xml.intermediate')
+                f'retry-sub-results-unittests-{report_id}.xml.intermediate')
             # Run failed case sequentially.
             retry_command = command + [
                 "-p", "no:xdist", '--lf',
