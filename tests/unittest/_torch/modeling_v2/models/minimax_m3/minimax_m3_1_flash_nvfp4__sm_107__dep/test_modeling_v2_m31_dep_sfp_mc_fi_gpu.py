@@ -68,7 +68,8 @@ def test_bitwise_flashinfer_at_deps_row_counts(rows, mode):
 
 @pytest.mark.parametrize("rows", [1, 12, 48])
 def test_bitwise_flashinfer_with_one_seed_and_offset_for_every_row(rows):
-    # FlashInfer 0.7.2 broadcasts a one-entry seed / offset tensor to every row (and indexes a per-row one by row).
+    # FlashInfer's sampling_from_probs broadcasts a one-entry seed / offset tensor to every row (and indexes a
+    # per-row one by row).
     for k in range(4):
         probs = _probs(rows, 900 + rows + k)
         s, o = _seeds(rows, 900 + k)

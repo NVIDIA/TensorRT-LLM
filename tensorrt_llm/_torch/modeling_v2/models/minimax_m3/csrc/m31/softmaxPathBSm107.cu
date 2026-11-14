@@ -33,10 +33,10 @@ namespace
 {
 namespace fi
 {
-// Helpers and ordered softmax arithmetic adapted from FlashInfer 0.7.2, Copyright (c) 2023-2026 FlashInfer team,
-// Apache-2.0. Float4 helpers are the same subset used by softmaxMcSm103.cu. Keep the source arithmetic form so the
-// denominator recurrence and final CUB sum preserve the reference's rounding. Only the chunk maximum is replaced
-// with unsigned hardware warp reductions and separate ping-pong shared storage.
+// Helpers and ordered softmax arithmetic adapted from FlashInfer (include/flashinfer/sampling.cuh), Copyright (c)
+// 2023-2026 FlashInfer team, Apache-2.0. Float4 helpers are the same subset used by softmaxMcSm103.cu. Keep the source
+// arithmetic form so the denominator recurrence and final CUB sum preserve the reference's rounding. Only the chunk
+// maximum is replaced with unsigned hardware warp reductions and separate ping-pong shared storage.
 // clang-format off
 #define FLASHINFER_INLINE inline __attribute__((always_inline)) __device__
 
@@ -152,7 +152,7 @@ __global__ M31_PATHB_LAUNCH_BOUNDS(BLOCK_THREADS) void PathBWarpMaxKernel(
 
 #pragma unroll
       for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-        // __fmul_rn, not *: it must not be contracted into an FMA (FlashInfer 0.7.2).
+        // __fmul_rn, not *: it must not be contracted into an FMA (FlashInfer's OnlineSoftmax arithmetic).
         logits_vec[j] = __fmul_rn(static_cast<float>(logits_vec[j]), inv_temp);
       }
 
@@ -215,7 +215,7 @@ __global__ M31_PATHB_LAUNCH_BOUNDS(BLOCK_THREADS) void PathBWarpMaxKernel(
 
 #pragma unroll
         for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-          // __fmul_rn, not *: it must not be contracted into an FMA (FlashInfer 0.7.2).
+          // __fmul_rn, not *: it must not be contracted into an FMA (FlashInfer's OnlineSoftmax arithmetic).
           logits_vec[j] = __fmul_rn(static_cast<float>(logits_vec[j]), inv_temp);
         }
       }

@@ -99,7 +99,7 @@ def test_an_input_inside_the_contract_reaches_the_op(fake_op, monkeypatch, log_l
 
 
 def test_a_one_entry_seed_and_offset_reach_the_op(fake_op, monkeypatch, log_lines):
-    # FlashInfer 0.7.2 broadcasts a one-entry seed / offset tensor to every row.
+    # FlashInfer's sampling_from_probs broadcasts a one-entry seed / offset tensor to every row.
     _as_cuda_tensors(monkeypatch)
     probs, seed, offset = _inputs()
     assert sfp_mc_fi.sampling_from_probs_mc_fi(probs, seed[:1], offset[:1]) == "tokens"

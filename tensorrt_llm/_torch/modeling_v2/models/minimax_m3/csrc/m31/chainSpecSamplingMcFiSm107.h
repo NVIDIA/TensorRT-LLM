@@ -31,7 +31,7 @@ namespace kernels
 namespace minimaxM31
 {
 
-//! REJ_MC_FI: FlashInfer 0.7.3's chain speculative sampling (include/flashinfer/sampling.cuh,
+//! REJ_MC_FI: FlashInfer's chain speculative sampling (include/flashinfer/sampling.cuh,
 //! ChainSpeculativeSampling<1024, BLOCK_SCAN_WARP_SCANS, BLOCK_REDUCE_WARP_REDUCTIONS, 4, DETERMINISTIC = true>, the
 //! kernel behind flashinfer.sampling.chain_speculative_sampling(deterministic=True) with tensor seed / offset) as ONE
 //! launch of batch x ctasPerRow CTAs (1024 threads each) instead of one CTA per request. Same inputs and outputs as
@@ -50,7 +50,7 @@ namespace minimaxM31
 //!      chunk's 32 warp sums in warp order (its chunk sums), takes u x total, walks the chunk prefix to the first
 //!      crossing with FlashInfer's fp32 adds, runs FlashInfer's DeterministicInclusiveSum (copied) in that chunk and
 //!      takes its first element over the threshold, else the last index with mass of the chunks visited (-1 when the
-//!      residual has no mass at all, as FlashInfer 0.7.3 returns).
+//!      residual has no mass at all, as FlashInfer's ChainSpeculativeSampling returns).
 //! Validated bitwise (tokens + counts) vs flashinfer.sampling.chain_speculative_sampling on VR (sm_107), K7, vocab
 //! 200064: served-like rows at batches 1 / 12 / 48, every rejection position and the bonus row, padding rows
 //! (uniform and one-hot), denormals, rows without residual mass, slot-indexed rows, ctasPerRow 1..32 and CUDA-graph
