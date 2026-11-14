@@ -1468,6 +1468,9 @@ class ModelLoader:
         self._checkpoint_loader = checkpoint_loader
         config: ModelConfig = self._load_and_validate_config(
             checkpoint_dir, checkpoint_loader)
+        from ..attention.backends.fmha.prims_ts_precompile import start_precompile_workers
+
+        start_precompile_workers(config, self.mapping)
         load_format = self.llm_args.load_format
         gms_loading.check_gms_locality_domain_compat(load_format, config)
         self._startup_metadata = _checkpoint_startup_metadata(
