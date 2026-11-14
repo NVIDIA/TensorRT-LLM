@@ -419,6 +419,28 @@ def test_guard_refuses_a_position_id_count_that_is_not_the_token_count() -> None
             op(qkv, **kwargs)
 
 
+@pytest.mark.parametrize("ramp", [8.0, 8.5, 8.9995], ids=["integer", "half", "below_integer"])
+@pytest.mark.parametrize("is_neox", [True, False], ids=["neox", "interleaved"])
+def test_yarn_degenerate_ramp(is_neox: bool, ramp: float, certifying) -> None:  # noqa: F811
+    """`low == high` takes the kernel's ramp-singularity guard (`high += 0.001F`).
+
+    No shipped target reaches it, and gpt-oss runs neox only, so this drives the
+    guard on both pairings. The reference mirrors the guard. At 8.0 and 8.5 the
+    guarded ramp is the same step the unguarded clamp produces; at 8.9995,
+    half-dimension 9 lies inside `[low, low + 0.001]` and gets a blended
+    frequency only when the guard runs.
+    """
+    certifying(op)
+    spec = dict(
+        tokens=37, **{**FusedQkNormRope.GPT_OSS, "is_neox": is_neox, "low": ramp, "high": ramp}
+    )
+    qkv, kwargs, compare_kwargs = _build(spec, seed=_seed(f"yarn low == high {is_neox} {ramp}"))
+    ref = op.reference(qkv, **kwargs)
+    out = op(qkv, **kwargs)
+    print(f"\n  low == high == {ramp}, is_neox={is_neox}: {_deviation(out, ref)}")
+    _compare(out, ref, **compare_kwargs)
+
+
 @pytest.mark.skipif(
     torch.cuda.get_device_capability() != (10, 0), reason="the Kimi K3 cell is certified on sm_100"
 )
