@@ -1,0 +1,31 @@
+{
+ "schema": "pi-kit/compat-preset@1",
+ "id": "glm-5.3",
+ "model_profile": "glm-5",
+ "checkpoints": ["GLM-5.3", "GLM-5.3-NVFP4", "GLM-5.3-Flash", "GLM-5.3-Flash-NVFP4"],
+ "api": "openai-completions",
+ "knob": "chat_template_kwargs.reasoning_effort, read by the chat template's first lines: 'low' and 'high' render as such, anything else (or nothing) renders Max. The Chat route passes a request's chat_template_kwargs to the template; it never passes the top-level reasoning_effort (no GLM serving extension).",
+ "compat": {
+  "thinkingFormat": "chat-template",
+  "chatTemplateKwargs": {"reasoning_effort": {"$var": "thinking.effort"}}
+ },
+ "thinkingLevelMap": {
+  "off": null,
+  "minimal": "low",
+  "low": "low",
+  "medium": "high",
+  "high": "high",
+  "xhigh": "max",
+  "max": "max"
+ },
+ "levels": {
+  "off": "not offered: GLM-5.3 always thinks; pi clamps off to minimal",
+  "minimal": "Reasoning Effort: Low",
+  "low": "Reasoning Effort: Low",
+  "medium": "Reasoning Effort: High (pi's default level)",
+  "high": "Reasoning Effort: High",
+  "xhigh": "Reasoning Effort: Max",
+  "max": "Reasoning Effort: Max (the model card's evaluation setting)"
+ },
+ "notes": "Only for templates that read reasoning_effort with the levels low/high/max (GLM-5.3, GLM-5.3-Flash). GLM-5.2's template knows only 'high' (low would render Max), and a template that does not read reasoning_effort makes trtllm-serve's unused-kwargs guard answer 400."
+}

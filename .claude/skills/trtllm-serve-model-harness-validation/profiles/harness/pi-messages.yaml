@@ -1,0 +1,158 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Harness profile: the pi coding agent with a custom provider of api "anthropic-messages".
+# pi also speaks openai-completions and openai-responses; each choice is a separate profile.
+# Derived from contracts/pi.md. Measured against fake_agent_server.py through
+# record_requests.py, pi 1.4.0 on node 26.9.0 with pi's default settings (contracts/pi.md
+# section 11). Source lines are in the installed packages' dist/ trees (@earendil-works/*, 1.4.0).
+schema: trtllm-serve-model-harness-validation/harness-profile@1
+id: pi-messages
+harness: pi
+version: "@earendil-works/pi-coding-agent 1.4.0"   # renamed from @mariozechner/pi-coding-agent
+configuration: "~/.pi/agent/models.json provider, api anthropic-messages; its baseUrl has no /v1
+  because pi appends /v1/messages"
+contract: contracts/pi.md
+status: measured            # outcomes, errors, retries and timeouts measured; compat flags
+                            # are pi's defaults for a custom base URL (a model entry's compat changes them)
+protocol: anthropic-messages
+routes:
+  - {method: POST, path: /v1/messages, stream: true}   # measured
+
+identity: {}                # measured: no session header or field over this API. Run one recorder
+                            # per session with --session TAG; the validator falls back to it.
+
+compat:                     # anthropic-messages flags (docs/models-configuration.md), pi's defaults
+  supportsEagerToolInputStreaming: true   # measured: tools[].eager_input_streaming sent
+  supportsCacheControlOnTools: true       # measured: cache_control on the last tool
+  allowEmptySignature: false              # measured against main: an unsigned thinking block
+                                          # is replayed as text (C-03 reports it); #20866 signs them
+  forceAdaptiveThinking: false            # thinking: {type: enabled, budget_tokens: ...}
+  supportsStrictTools: false              # no `strict` in tool definitions
+model_entry:
+  contextWindow: required            # pi defaults to 128000; set it to the served max_seq_len: a reply
+                                     # whose input exceeds it is read as an overflow (errors.overlength)
+  maxTokens: required                # default 16384; a final reply stopped at max_tokens below it is
+                                     # compacted and retried once (errors.length_stop)
+  reasoning: per model
+
+tools:
+  declared_in: [tools]
+  known: [read, write, edit, bash]   # grep, find and ls are optional
+  tolerated_payload: [pi_edit_normalize]   # pi prepares edit's arguments before it runs them
+                            # (pi-coding-agent 1.4.0 dist/core/tools/edit.js, prepareEditArguments):
+                            # `edits` as a JSON string or as one edit object, or a legacy top-level
+                            # oldText/newText pair. A call valid once so prepared runs; not serving's
+                            # to control, so not rated in M-01 (counted as tolerated)
+parallel_tool_calls: not sent      # measured
+
+outcomes:                   # tool_result blocks by tool_use_id; measured (the same strings
+                            # over all three APIs): every error carries is_error: true, so order matters,
+                            # and a result without it is the tool's output, whatever its text
+  aborted:                  # a call pi did not run. Measured: a reply with calls that stopped at
+                            # stop_reason "max_tokens" (pi-agent-core agent-loop.js:359). From source: a
+                            # run aborted mid-call (:444, :509, :528; not reachable with -p) and a
+                            # beforeToolCall hook's block (:514, extensions only)
+    regex: '^Tool call "[^"]+" was not executed: |Command aborted$'   # bash's own abort, tools/bash.js:271
+    prefix: ["Operation aborted", "Tool execution was blocked"]
+    is_error: true
+  unsupported: {regex: '^Tool \S+ not found$', is_error: true}   # agent-loop.js:492, an undeclared tool
+  arguments_rejected:       # pi-ai utils/validation.js:309 (schema) and :282 (arguments not a JSON object)
+    prefix: ['Validation failed for tool "', 'Invalid arguments for tool "']
+    is_error: true
+  tool_error: {is_error: true}   # the tool ran and failed, e.g. Node's ENOENT or bash's
+                                 # "Command exited with code N" (tools/bash.js:297)
+
+errors:
+  overlength:               # pi-ai utils/overflow.js isContextOverflow (:137): the error's text, whatever
+    shape: any_error        # its status or whether it came in the stream, matched against these
+    status: measured        # (:36-65), unless one of `unless` matches (:76-80). Measured:
+                            # a 400 saying "prompt is too long" and one in OpenAI's wording ("maximum
+                            # context length is N tokens") both led to one compaction (a summary
+                            # request without tools, then the turn resent with the summary); an
+                            # over-length FIRST request has nothing to compact and ends the run. One
+                            # compact-and-retry per run (agent-session.js:2445)
+    matches:
+      - 'prompt (?:is )?too long'
+      - 'prompt exceeds max length'
+      - 'request_too_large'
+      - 'input is too long for requested model'
+      - 'exceeds the context window'
+      - "exceeds (?:the )?(?:model'?s )?maximum context length(?: of [\\d,]+ tokens?|\\s*\\([\\d,]+\\))"
+      - 'input token count.*exceeds the maximum'
+      - 'maximum prompt length is \d+'
+      - 'reduce the length of the messages'
+      - 'maximum context length is \d+ tokens'
+      - 'exceeds (?:the )?maximum allowed input length of [\d,]+ tokens?'
+      - "input \\(\\d+ tokens\\) is longer than the model'?s context length \\(\\d+ tokens\\)"
+      - 'exceeds the limit of \d+'
+      - 'exceeds the available context size'
+      - 'greater than the context length'
+      - 'context window exceeds limit'
+      - 'exceeded model token limit'
+      - 'too large for model with \d+ maximum context length'
+      - 'prompt has [\d,]+ tokens?, but the configured context size is [\d,]+ tokens?'
+      - 'model_context_window_exceeded'
+      - 'prompt too long; exceeded (?:max )?context length'
+      - 'range of input length should be'
+      - 'context[_ ]length[_ ]exceeded'
+      - 'too many tokens'
+      - 'token limit exceeded'
+      - '^(?:[\w -]+ API error \(413\):|413(?:\s|:|$))'
+    unless: ['^(Throttling error|Service unavailable):', 'rate limit', 'too many requests']
+  length_stop: compact and retry once   # a final reply stopped at max_tokens with less output than
+                            # maxTokens (overflow.js:175 isRecoverableLength, agent-session.js:2437);
+                            # calls in a length-stopped reply are not run (outcomes.aborted)
+  silent_overflow: compact  # a completed reply whose usage input exceeds contextWindow (overflow.js:152)
+  retries:                  # agent level: pi-ai utils/retry.js isRetryableAssistantError, the error text
+                            # ("<status> <body>", the Anthropic SDK's message) against :26-106 (status
+                            # codes 429/500/502/503/504/520/524, overloaded, rate limit, timeout,
+                            # terminated, "ended without", ...). Measured: every retry resent the
+                            # identical body
+    max: 3                  # settings retry.maxRetries
+    delays_s: [2, 4, 8]     # retry.baseDelayMs 2000, doubling, capped at 60 s; retry-after is not read
+                            # (provider-level retries, which read it, are off: retry.provider.maxRetries 0)
+    http_400: not retried   # measured: the run ends with the error (stopReason error; -p still exits 0)
+    http_429: retried       # measured: resent after 2 s, then served
+    http_500: retried       # measured: 4 identical requests at 0, 2, 6, 14 s, then the run ends
+  stream_end:               # measured: each resent once after 2 s and then served
+    without_message_stop: retried    # "Anthropic stream ended before message_stop", also without
+                                     # message_delta, and what the recorder relays when the server
+                                     # cuts the connection
+    connection_cut: retried          # "terminated", the socket closed mid-stream (no recorder)
+  capability_retries: []    # none: pi does not drop a request field after a 400
+
+timeouts:                   # measured with the default httpIdleTimeoutMs (300000), against
+                            # fake_agent_server slow_first_event / silent_gap / silent_gap_pings
+  first_event_s: 300        # no headers for 330 s: cut at 299.99 s ("Request timed out.": undici
+                            # headersTimeout and the SDK timeout, http-dispatcher.js:81, sdk.js:200),
+                            # then resent; after the headers the idle timer below runs from the start
+  idle_s: 300               # silent for 330 s after message_start: cut at 300.7 s ("terminated":
+                            # undici bodyTimeout, http-dispatcher.js:77), then resent
+  keepalive: ping           # a ping every 5 s held a stream open for 330 s and 660 s
+  request_s: none           # no total cap: 660 s of pings survived (Claude Code drops at 600 s)
+  configure: settings.json httpIdleTimeoutMs (0 disables both timers)
+
+echo:                       # what the next request carries back of our reply (C-03)
+  text: exact               # 1.4.0 vs the fake servers: signed thinking, text and tool_use come back verbatim
+  reasoning: exact          # main sends no signature, and pi's allowEmptySignature=false then replays thinking as text, which C-03 reports
+  tool_input: [pi_edit_normalize, pi_json_reserialize]
+                            # pi_edit_normalize: edit's `edits` comes back as pi keeps it:
+                            # prepareEditArguments changes the history's own object, an `edits` JSON
+                            # string to what it parses to, one edit object to [edit] (edit.js,
+                            # pi-coding-agent 1.4.0; a GLM-5.3 smoke run: an object delivered,
+                            # [object] echoed). The legacy oldText/newText fold makes a new object,
+                            # so it is not echoed.
+                            # pi_json_reserialize: pi keeps a call's arguments as it parsed them
+                            # (pi-ai 1.4.0 dist/utils/json-parse.js parseToolCallArguments: JSON.parse,
+                            # a duplicate key keeping its last value; repairJson; {} when that fails)
+                            # and sends back JSON.stringify of that (api/openai-completions.js,
+                            # openai-responses-shared.js) or the object (anthropic-messages.js).
+                            # In a Kimi-K3 run, arguments with a duplicate key came back as the
+                            # last value's JSON
+
+reasoning:
+  request: {thinking: {type: enabled, budget_tokens: 3072, display: summarized}}   # measured, default level
+  carrier: thinking signature
+
+session_log: ~/.pi/agent/sessions/*.jsonl   # secondary harness-side signal
+non_interactive: [--print, "--mode json", "--mode rpc"]

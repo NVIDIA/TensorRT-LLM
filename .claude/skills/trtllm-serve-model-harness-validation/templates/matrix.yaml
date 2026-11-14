@@ -1,0 +1,60 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Run matrix: copy to a run directory OUTSIDE the repository and fill it in.
+# The loop reads it; the validator owns `thresholds`; the human owns `budget` and `scope`.
+# Cell status is never typed here: it is computed from cells/<cell>/**/verdict.json.
+schema: trtllm-serve-model-harness-validation/matrix@1
+run_id: null                       # e.g. <name>-<yyyymmdd>; reused across sessions, never reset
+run_dir: null                      # evidence lives in <run_dir>/cells/<cell>/<stage>/<iteration>/,
+                                   # <cell> = <model id>__<harness id> (e.g. glm-5__codex-default), and
+                                   # cells/<cell>/log.md has one line per iteration (SKILL.md 4a)
+integration_branch: null           # the code under test, e.g. a trial build (references/smoke.md 3d);
+                                   # every verdict binds a build_id from it
+
+scope:                             # human decisions, recorded verbatim with date
+  models: []                       # ids in profiles/model/, e.g. [glm-5, kimi-k3]
+  harnesses: []                    # ids in profiles/harness/, e.g. [codex-default, claude-code, pi-chat]
+  checkpoints: {}                  # model id -> checkpoint name and template hash actually served
+  support_means: conformance+model-behavior+harness-outcome   # task-outcome needs an oracle
+  decided_by: null
+
+cells: []                          # one entry per (model, harness); protocol comes from the harness.
+                                   # e.g. - {model: glm-5, harness: codex-default}
+                                   #      - {model: glm-5, harness: pi-chat}
+                                   # Record how the harness's effort setting reaches the model (for pi:
+                                   # its model entry and thinking level, contracts/pi.md section 12)
+
+thresholds:                        # validator-owned; unknown -> the claim is BLOCKED
+  # Conformance checks are hard: any confirmed violation fails, so they take no threshold.
+  # Each rate passes when the one-sided 95% Wilson upper bound of its rate is <= its threshold.
+  # A starting proposal for the human to accept or change: 0.02 for every rate below, counted per
+  # turn. With zero events a rate needs at least this many units to pass: 52 at 0.05, 133 at 0.02,
+  # 268 at 0.01, 539 at 0.005, 2703 at 0.001 (references/validate.md section 3).
+  model_behavior:
+    undeclared_call_rate: null     # calls to a tool the request did not declare (M-01)
+    payload_invalid_rate: null     # call arguments that break the tool's schema (M-01)
+    degenerate_rate: null          # degenerate runs, e.g. a repeated pad token (M-02)
+    markup_leak_rate: null         # the model's own markup in delivered text (M-03)
+    empty_turn_rate: null          # replies with nothing in them (M-06)
+  harness_outcome:
+    aborted_rate: null             # calls the harness cancelled (H-01)
+    arguments_rejected_rate: null  # calls the harness refused for their arguments (H-01)
+  unit_for_rates: turn             # turn | session: each check's own unit (a reply or a call), or
+                                   # whole sessions (references/validate.md section 3)
+
+budget:                            # human-owned; unknown is not unlimited
+  repair_cycles_per_finding_class: 3
+  gpu: {}                          # e.g. deepseek-v41: "1x4 GB300 node, 2 days"
+  wall_clock: null
+
+validator:
+  agent: null                      # a different session, ideally a different vendor
+  tree_sha256: null                # scripts/validate + validator-owned references
+  controls_receipt: null           # path to the passing control matrix for that tree
+
+escalation:                        # always to the human
+  - resources beyond budget
+  - pushes, PRs, upstream issues
+  - policy choices (e.g. serving behavior when the model breaks a constraint)
+  - thresholds
+  - exhausted budget or a repeated blocker
