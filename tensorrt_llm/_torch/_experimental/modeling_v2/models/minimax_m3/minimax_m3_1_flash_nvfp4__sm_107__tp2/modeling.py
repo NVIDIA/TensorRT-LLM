@@ -3970,12 +3970,17 @@ class _DeferredA1:
         index_q = torch.empty(
             rows, core.index_heads, core.head_dim, dtype=torch.float8_e4m3fn, device=device
         )
-        norms = _A1_NORMS.get(i)
+        # The four norm weights concatenated, cached on this model per layer and keyed on the weights' storages, so
+        # another model instance or a reload into new storages never reads a stale copy.
+        w = core.w
+        src = (w[f"l{i}_q_norm"], w[f"l{i}_k_norm"], w[f"l{i}_idx_q_norm"], w[f"l{i}_idx_k_norm"])
+        key = (i, *(t.data_ptr() for t in src))
+        cache = core.__dict__.setdefault("_a1_norms", {})
+        norms = cache.get(key)
         if norms is None:
-            w = core.w
-            norms = _A1_NORMS[i] = torch.cat(
-                [w[f"l{i}_q_norm"], w[f"l{i}_k_norm"], w[f"l{i}_idx_q_norm"], w[f"l{i}_idx_k_norm"]]
-            ).contiguous()
+            for old in [k for k in cache if k[0] == i]:
+                del cache[old]
+            norms = cache[key] = torch.cat(src).contiguous()
         act = self.act.view(torch.float8_e4m3fn).view(rows, -1)
         ovl = self.ovl
         parts = (
@@ -4030,7 +4035,6 @@ class _DeferredA1:
 
 
 _A1_RUNNERS: dict = {}
-_A1_NORMS: dict = {}
 _A1_COUNTS: dict = {}
 
 

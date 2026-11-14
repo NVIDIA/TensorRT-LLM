@@ -1019,28 +1019,34 @@ class M3DSparkWorker(TailBookkeepMixin, S4WorkerMixin, DSparkWorker):
             aux.wait_stream(torch.cuda.current_stream())
         else:
             aux.wait_event(after)
-        with torch.cuda.stream(aux):
-            # TAIL_DEFER_CAPTURE's kept captures, written before the fc reads the buffer (the same bytes).
-            if dc is not None:
-                self._dc_flush(dc, forked=True, captured=captured)
-            hs = spec.get_hidden_states(st.total)
-            gen = hs[0 : st.rows]
-            gen = gen.reshape(-1, gen.shape[-1])
-            proj, st.sharded = self._tf_project(draft, gen)
-            prep = None
-            kv_buf = getattr(self, "_ctx_kv_buf", None)
-            if self._tf_kv and kv_buf is not None:
-                first = kv_buf if isinstance(kv_buf, torch.Tensor) else kv_buf[0]
-                if proj.dtype == first.dtype:
-                    prep = ctx_store_prep(draft, proj)
-            attn = st.attn
-            tables = getattr(self, "_ctx_block_tables", None)
-            counts = getattr(self, "_ctx_block_counts", None)
-            if TAIL_FORK_REFRESH and attn is not None and tables is not None:
-                num_seqs = int(attn.num_seqs)
-                if super()._refresh_ctx_block_tables(attn, num_seqs):
-                    # Both written tensors held until the step-end join (see _TailStep.refreshed).
-                    st.refreshed = (tables, counts, num_seqs, attn)
+        try:
+            with torch.cuda.stream(aux):
+                # TAIL_DEFER_CAPTURE's kept captures, written before the fc reads the buffer (the same bytes).
+                if dc is not None:
+                    self._dc_flush(dc, forked=True, captured=captured)
+                hs = spec.get_hidden_states(st.total)
+                gen = hs[0 : st.rows]
+                gen = gen.reshape(-1, gen.shape[-1])
+                proj, st.sharded = self._tf_project(draft, gen)
+                prep = None
+                kv_buf = getattr(self, "_ctx_kv_buf", None)
+                if self._tf_kv and kv_buf is not None:
+                    first = kv_buf if isinstance(kv_buf, torch.Tensor) else kv_buf[0]
+                    if proj.dtype == first.dtype:
+                        prep = ctx_store_prep(draft, proj)
+                attn = st.attn
+                tables = getattr(self, "_ctx_block_tables", None)
+                counts = getattr(self, "_ctx_block_counts", None)
+                if TAIL_FORK_REFRESH and attn is not None and tables is not None:
+                    num_seqs = int(attn.num_seqs)
+                    if super()._refresh_ctx_block_tables(attn, num_seqs):
+                        # Both written tensors held until the step-end join (see _TailStep.refreshed).
+                        st.refreshed = (tables, counts, num_seqs, attn)
+        except BaseException:
+            # Work may already be queued on aux: mark the fork so the step-end cleanup joins it before the
+            # step's captures and buffers are released.
+            st.forked = True
+            raise
         st.forked = True
         st.point = point
         st.key = view_key(gen)

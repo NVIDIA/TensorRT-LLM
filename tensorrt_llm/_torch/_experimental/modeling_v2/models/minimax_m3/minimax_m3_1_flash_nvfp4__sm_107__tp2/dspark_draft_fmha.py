@@ -272,11 +272,15 @@ class SplitDecode:
         side = self._stream
         self._fork.record(main)
         side.wait_event(self._fork)
-        with torch.cuda.stream(side):
-            one(1, self._ws, self._counters)
-        one(0, kw["workspace_buffer"], kw["multi_ctas_kv_counter_buffer"])
-        self._join.record(side)
-        main.wait_event(self._join)
+        try:
+            with torch.cuda.stream(side):
+                one(1, self._ws, self._counters)
+            one(0, kw["workspace_buffer"], kw["multi_ctas_kv_counter_buffer"])
+        finally:
+            # Joined on every path: a failing request-0 call must not leave request 1's aux work reading q / the KV
+            # cache and writing out past the point the caller releases them.
+            self._join.record(side)
+            main.wait_event(self._join)
         self.taken += 1
         what = (
             f"batch-2 drafter window decode as {BATCH} per-request calls (q_len {qlen}, heads {int(q.shape[1])}, "
