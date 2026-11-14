@@ -411,8 +411,10 @@ def _force_chunk_ctx_chunk_config(
             "policy, although enable_chunked_prefill is False. Disable "
             f"{setting} to keep chunked prefill off.",
             key=f"{setting}_enables_chunking")
+    # An earlier override may have selected FORCE_CHUNK already; it warned then.
     elif (configured_policy is not None
-          and configured_policy != ContextChunkingPolicy.FORCE_CHUNK):
+          and configured_policy != ContextChunkingPolicy.FORCE_CHUNK
+          and ctx_chunk_config[0] != ContextChunkingPolicy.FORCE_CHUNK):
         logger.warning_once(
             f"{setting}{scope} replaces "
             f"scheduler_config.context_chunking_policy={configured_policy} "

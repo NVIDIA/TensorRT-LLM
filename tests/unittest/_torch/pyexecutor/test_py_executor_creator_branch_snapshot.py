@@ -89,6 +89,8 @@ def test_branch_snapshot_ctx_chunk_config_reports_overrides(
         ),
         ((FCFS, 256), None, None, None),
         ((FORCE, 32), FORCE, None, None),
+        # Already replaced by an earlier override, which warned.
+        ((FORCE, 32), FCFS, None, None),
     ],
 )
 def test_force_chunk_ctx_chunk_config_reports_overrides(
