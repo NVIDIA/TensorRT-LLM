@@ -1279,11 +1279,13 @@ def test_warmup_loads_after_workers_and_falls_back_on_failure(monkeypatch) -> No
     attn, profile, eager = _attn_and_profile()
     lib = PrimsTSSparseMlaFmha(attn)
     with pp.precompile_session() as session:
-        session.group = SimpleNamespace(
-            procs=[None, None], run=lambda payloads: fake_workers(payloads, 2)
-        )
+        # An early config without automatic sparse defaults must not suppress
+        # the first actual warmup's worker batch.
+        session.start(SimpleNamespace(attn_backend="TRTLLM", sparse_attention_config=None), None)
+        assert session.group is None and not session.consumed
         mod._warmup_profiles([mod._WarmupProfile(lib, extra=32, **profile)], eager)
         assert planned == [(20, 32), (15, 32), (7, 32)]
+        assert session.consumed and session.group is None
         # Replacing profiling metadata must load parent plans again without
         # another subprocess group, including newly encountered profiles.
         planned.clear()
