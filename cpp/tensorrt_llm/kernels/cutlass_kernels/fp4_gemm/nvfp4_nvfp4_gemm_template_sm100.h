@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,6 +25,7 @@
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 
 #include "cutlass/arch/arch.h"
+#include "cutlass/arch/grid_dependency_control.h"
 #include "cutlass/epilogue/collective/collective_builder.hpp"
 #include "cutlass/gemm/collective/collective_builder.hpp"
 #include "cutlass/gemm/gemm.h"
@@ -180,11 +181,19 @@ size_t genericFp4GemmKernelLauncher(void* D, void const* A, void const* B, void 
         struct Sm10xOnly : Base                                                                                        \
         {                                                                                                              \
             using typename Base::Params;                                                                               \
+            /** @brief Run the SM10x GEMM, waiting for producer grids on SM103. */                                     \
             CUTLASS_DEVICE                                                                                             \
             void operator()(Params const& params, char* smem_buf)                                                      \
             {                                                                                                          \
                 if constexpr (tensorrt_llm::kernels::arch::is_major_v<10>)                                             \
                 {                                                                                                      \
+                    if constexpr (std::is_same_v<Arch, cutlass::arch::Sm103>)                                          \
+                    {                                                                                                  \
+                        /* CUTLASS 4.4.2's SM103 scale-factor load warp does not wait for PDL producers. */            \
+                        /* Waiting here also protects the epilogue constructor's read of a produced alpha. */          \
+                        /* Revisit with CUTLASS >= 4.8: its scale-warp wait alone does not protect alpha. */           \
+                        cutlass::arch::wait_on_dependent_grids();                                                      \
+                    }                                                                                                  \
                     this->Base::operator()(params, smem_buf);                                                          \
                 }                                                                                                      \
                 else                                                                                                   \
@@ -203,6 +212,7 @@ size_t genericFp4GemmKernelLauncher(void* D, void const* A, void const* B, void 
         using Gemm = typename cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;                                 \
     };                                                                                                                 \
                                                                                                                        \
+    /** @brief Build FP4 GEMM tensor, scale-factor, and scheduling arguments. */                                       \
     template <typename Gemm>                                                                                           \
     typename Gemm::Arguments                                                                                           \
         prepareGemmArgs_##ARCH_##_##T##_##CTA_M_##_##CTA_N_##_##CTA_K_##_##CGA_M_##_##CGA_N_##_##CGA_K_##XSM_(void* D, \
@@ -261,6 +271,7 @@ size_t genericFp4GemmKernelLauncher(void* D, void const* A, void const* B, void 
         return operator_args;                                                                                          \
     }                                                                                                                  \
                                                                                                                        \
+    /** @brief Query workspace or validate, initialize, and launch the FP4 GEMM. */                                    \
     template <>                                                                                                        \
     size_t genericFp4GemmKernelLauncher<cutlass::arch::ARCH_, T, cute::Int<CTA_M_>, cute::Int<CTA_N_>,                 \
         cute::Int<CTA_K_>, cute::Int<CGA_M_>, cute::Int<CGA_N_>, cute::Int<CGA_K_>, XSM_>(void* D, void const* A,      \
