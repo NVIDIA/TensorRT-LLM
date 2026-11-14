@@ -72,3 +72,14 @@ def test_starlette_constraint_floor() -> None:
 
     assert _minimum_version(starlette) >= Version("1.3.1")
     assert Version("0.50.0") not in starlette.specifier
+
+
+def test_openai_floor_is_at_least_1_108_1() -> None:
+    # Checks the requirement floor only. tensorrt_llm/serve imports Responses API types from
+    # openai at module load. The newest, PartReasoningText (response_content_part_added_event /
+    # response_content_part_done_event), is in 1.108.1 and later; with 1.108.0 importing
+    # tensorrt_llm.serve.responses_utils fails.
+    openai = _requirement("openai")
+
+    assert _minimum_version(openai) >= Version("1.108.1")
+    assert Version("1.108.0") not in openai.specifier
