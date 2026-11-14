@@ -767,6 +767,13 @@ class LlmResult:
         result = object.__getattribute__(self, '_result')
         return getattr(result, item)
 
+    def __setstate__(self, state):
+        # Unpickling looks __setstate__ up on every LlmResult it rebuilds (each
+        # response on the RPC / IPC path). Without this definition the lookup
+        # falls into __getattr__ above, which raises AttributeError on the
+        # half-built object after a Python frame and a failed delegation.
+        self.__dict__.update(state)
+
     def deserialize(self):
         self._result = tensorrt_llm.bindings.executor.deserialize_result(
             self._result)
@@ -903,6 +910,10 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_request_id = self.request_id
         self.py_llm_request_type = self.llm_request_type
         self.py_min_length = self.sampling_config.min_tokens
+        # Whether the sampler's in-graph fast tier can sample this request;
+        # decided on first use (TorchSampler._can_use_fast_path) because it
+        # depends only on parameters that never change after admission.
+        self.py_fast_path_ok: Optional[bool] = None
         self.py_per_pos_drafted = [0] * MAX_SPEC_DECODE_POSITIONS
         self.py_per_pos_accepted = [0] * MAX_SPEC_DECODE_POSITIONS
         # Cumulative spec-decode counters backing

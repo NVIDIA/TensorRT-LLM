@@ -17,6 +17,15 @@ trtllm_repo_path:    /path/to/TensorRT-LLM
 # plan.md).
 completion_criteria:
   - "GSM8K score measured via `trtllm-eval` is greater than 95"
+  # To also qualify ModelExpress (MX) checkpoint loading, add this item. The
+  # doc it names defines eligibility and the qualification steps.
+  # - "If the model fits the ModelExpress constraints in
+  #    docs/source/features/model-express.md, MX checkpoint loading is qualified
+  #    as that doc describes, which includes a passing real donor/receiver test.
+  #    If that test cannot run here, final-report.md reports MX as pending until
+  #    the ModelExpress CI stages pass it. If the model does not fit,
+  #    final-report.md names the constraint that rules it out. Existing MX
+  #    profiles and constraints are not changed."
 
 # Optional: free-form guidance for the PlanDrafter and Coder. Not a QA
 # gate — use this for hints about which kernels to prefer, which

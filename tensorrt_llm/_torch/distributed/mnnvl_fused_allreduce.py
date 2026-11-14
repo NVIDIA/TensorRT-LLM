@@ -53,8 +53,10 @@ def _ctas_per_token(rows: int, hidden: int, sms: int) -> int:
 
 
 def _tokens_per_cta(rows: int, ctas: int, sms: int) -> int:
-    """Tokens per CTA that keep a call within one wave of CTAs (two 512-thread CTAs per SM, which the kernel's
-    <= 64 registers allow), so it never runs several back-to-back cross-rank latency chains."""
+    """Batch tokens to target a grid of twice the SM count.
+
+    Shared memory and registers can limit residency below two CTAs per SM.
+    """
     if ctas != 1:
         return 1
     wave = 2 * sms
@@ -297,6 +299,7 @@ class MnnvlAllReduceNorm:
         props = torch.cuda.get_device_properties(table.table.device)
         self._sms = props.multi_processor_count
         self._smem_bytes = props.shared_memory_per_block_optin
+        self._sm_smem_bytes = props.shared_memory_per_multiprocessor
         self.slot = _SlotWorkspace(mapping, comm, hidden_size, self.SLOT_CTAS, TWO_SHOT_ROWS)
         dev = table.table.device
         # Never-read operands of the compiled signature (gate, FP8 out, scale); rows are runtime values.
@@ -308,13 +311,25 @@ class MnnvlAllReduceNorm:
 
     def supports_rows(self, rows: int) -> bool:
         """Whether one launch takes ``rows`` tokens: below TWO_SHOT_ROWS the slot workspace holds them, above it
-        the shared memory of a CTA holds its tokens' residuals."""
+        the shared memory of a CTA holds its tokens' residuals and an SM holds both of its 512-thread CTAs."""
         if rows <= 0:
             return False
         if rows < TWO_SHOT_ROWS:
             return True
-        tpc = _tokens_per_cta(rows, _ctas_per_token(rows, self.hidden, self._sms), self._sms)
-        return tpc == 1 or 1024 + tpc * self.hidden * 2 <= self._smem_bytes
+        ctas = _ctas_per_token(rows, self.hidden, self._sms)
+        if self.hidden // 8 // ctas > 1024:
+            return False
+        tpc = _tokens_per_cta(rows, ctas, self._sms)
+        if tpc == 1:
+            return True
+        from ..kernels.blackwell.mnnvl_allreduce_norm import MnnvlAllReduceNormKernel
+
+        needed_bytes = MnnvlAllReduceNormKernel.mt_smem_bytes(self.hidden, tpc)
+        if needed_bytes > self._smem_bytes:
+            return False
+        # A 512-thread CTA an SM holds only once runs the grid as two rounds: with the MoE fold, 6-23 % slower
+        # than finalize + all-reduce + norm (hidden 4096, 15-28 tokens per CTA, GB200 / GB300, TP4 / TP8).
+        return self.hidden // 8 != 512 or 2 * needed_bytes <= self._sm_smem_bytes
 
     @staticmethod
     def moe_fold_supported(

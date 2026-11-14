@@ -14,12 +14,13 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.distributed.ops import warmup_named_allreduce_topologies
 from tensorrt_llm._torch.memory_buffer_utils import clear_memory_buffers
 from tensorrt_llm._torch.models.modeling_utils import timing_metric
+from tensorrt_llm._torch.modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from tensorrt_llm._torch.pyexecutor.config_utils import is_decode_only
@@ -437,8 +438,21 @@ class DecoderWarmup:
         generation_only = self.mapping.has_cp_helix() or is_decode_only(
             self.sparse_attention_config
         )
+        # A capturable guided decoder rules out the general warmup's generation
+        # requests only: the autotuner below runs its context step with the
+        # decoder installed. Run the context requests anyway, so that the
+        # autotuner's max-token step is not the engine's first forward (with
+        # the buffers it allocates lazily) and runs after the release below,
+        # as it does without guided decoding.
+        can_run_context_warmup = can_run_general_warmup or self._agreement.agree_flag(
+            self._context_warmups_supported
+            and not generation_only
+            and not isinstance(kv_cache_manager, MambaHybridCacheManager)
+        )
 
         log_mem_snapshot("warmup/before_warmup")
+        with self._warmup_timer.phase("fmha_module_prewarm"):
+            self._prewarm_fmha_libraries(kv_cache_manager)
         # Compile the DSv4 indexer-Q CuTe DSL kernels before the first
         # collective-bearing forward, so their JIT cost is not charged against the
         # MoE all-to-all completion-flag deadline.
@@ -462,7 +476,7 @@ class DecoderWarmup:
                     resource_manager, can_run_general_warmup and not generation_only
                 )
 
-        if can_run_general_warmup:
+        if can_run_context_warmup:
             # Specialize torch.compile graphs across the key input shapes before CUDA graph capture.
             with self._warmup_timer.phase(
                 "general", metrics=self._metrics, metric_name="general_warmup_seconds"
@@ -472,6 +486,12 @@ class DecoderWarmup:
                     warmup_requests_configs = self._generation_warmup_shapes(
                         warmup_requests_configs
                     )
+                elif not can_run_general_warmup:
+                    warmup_requests_configs = [
+                        (num_tokens, num_gen_tokens)
+                        for num_tokens, num_gen_tokens in warmup_requests_configs
+                        if num_gen_tokens == 0
+                    ]
                 warmup_requests_configs = self._agreement.agree_shapes(warmup_requests_configs)
                 # Currently graph has not been captured, disable cuda graph for this warmup.
                 with self._graphs.no_cuda_graph():
@@ -708,6 +728,50 @@ class DecoderWarmup:
                     f"skipping bucket. {type(e).__name__}: {e}"
                 )
         torch.cuda.synchronize()
+
+    def _prewarm_fmha_libraries(self, kv_cache_manager: KVCacheManager | KVCacheManagerV2) -> None:
+        """Build eligible FMHA modules before the first warmup forward.
+
+        flashinfer builds the module on first use, and MPI workers keep a
+        flashinfer workspace per process by default, so every rank builds its
+        own copy. Under pipeline parallelism the first warmup forward reaches
+        the ranks one after another, so builds left to that forward run in turn
+        and startup grows with the pipeline depth. Building here lets the ranks
+        build at the same time. Without pipeline parallelism there is nothing
+        to overlap. Library-specific hooks decide static layer eligibility.
+        """
+        if self.mapping.pp_size == 1:
+            return
+        from tensorrt_llm._torch.attention.backends.fmha.interface import Fmha, FmhaPrewarmConfig
+
+        config = FmhaPrewarmConfig(
+            dtype=self._config.dtype,
+            kv_cache_dtype=kv_cache_manager.dtype,
+            tokens_per_block=kv_cache_manager.tokens_per_block,
+            extra_tokens_per_block=frozenset(
+                getattr(kv_cache_manager, "trtllm_gen_extra_tokens_per_block", ())
+            ),
+            context=not self.mapping.has_cp_helix()
+            and not is_decode_only(self.sparse_attention_config),
+            generation=not is_context_only_kv_cache(kv_cache_manager),
+            helix=self.mapping.has_cp_helix(),
+        )
+        attempted: set[type[Fmha]] = set()
+        for module in self.model.modules():
+            # Locality follows retained projection weights, including models
+            # that do not set _weights_removed. Attention backends are plain
+            # attributes, so inspect them without assuming a wrapper or name
+            # (Attention.attn, MLA.mqa/mha, cross or custom attention).
+            if not any(True for _ in module.parameters()):
+                continue
+            for backend in vars(module).values():
+                if isinstance(backend, TrtllmAttention):
+                    backend.prewarm_fmha(config, attempted)
+
+        # Eligibility and build success may differ across TP peers. Every peer
+        # meets here before a forward can start a collective's timeout clock.
+        if self.mapping.tp_size > 1 and self.dist is not None:
+            self.dist.tp_allgather(1)
 
     def _prewarm_cute_dsl_indexer_q(self) -> None:
         """Pre-compile the DSv4 indexer-Q CuTe DSL kernels, then barrier.
@@ -987,6 +1051,10 @@ class DecoderWarmup:
                     # Peers are inside the same forward's collectives and
                     # cannot follow a rank-local skip.
                     raise
+                if self.guided_decoder is not None:
+                    # Input preparation enqueues the batch before model forward.
+                    # An OOM may leave it unconsumed, or leave callbacks pending.
+                    self.guided_decoder.reset_warmup_state()
                 logger.warning(
                     f"OOM during general warmup with {num_tokens} tokens, "
                     f"{num_gen_tokens} generation tokens. Skipping."
@@ -1418,6 +1486,16 @@ class DecoderWarmup:
            ``_state_passing_fwd_kernel``, ``_chunk_scan_fwd_kernel``, and
            ``_chunk_state_varlen_kernel``.
 
+        Additionally, covers the remaining Triton int-specialization families of the GDN
+        prefill elementwise kernels (``fuse_elementwise_ops.py``): Triton
+        specializes int args (packed prefill token count and the strides equal
+        to it) into ``==1`` / ``%16==0`` / other families, and
+        ``_fused_gdn_post_conv`` forks on the ``HAS_DECODE`` constexpr. The
+        two base shapes only ever compile the (``%16==0``,
+        ``HAS_DECODE=False``) family, so the first mixed ctx+gen batch or
+        non-16-aligned context length otherwise JIT-compiles mid-serving
+        (~0.2-1.5 s, lock-stepped across ranks under SPMD).
+
         Runs regardless of ``enable_autotuner``. Wraps in ``autotune()`` when
         the autotuner is enabled so op-level (M,N,K) caches also get primed
         for these shapes. Set ``TLLM_MAMBA_MULTISEQ_WARMUP=0`` to disable.
@@ -1479,6 +1557,67 @@ class DecoderWarmup:
             (capped_num_tokens, 0, False, False, False),
             (capped_num_tokens, 0, False, True, True),
         ]
+
+        # Extra shapes covering the remaining GDN prefill Triton
+        # specialization families (see docstring). Context-token counts assume
+        # capped_num_tokens % 16 == 0 (WARMUP_TOKEN_CAP is 16-aligned; only a
+        # near-exhausted KV pool breaks this, degrading a missed family to
+        # lazy compilation, i.e. the pre-fix behavior). The mixed ctx+gen
+        # entries derive their context token count as
+        # num_tokens - num_gen_requests * (1 + max_total_draft_tokens); with
+        # speculative decoding the "%16!=0" entry may land on an aligned
+        # count for some draft lengths -- acceptable, since the spec-dec
+        # target-verify kernel variants are not covered here anyway. None of
+        # these needs the chunk-aligned variant (the two base shapes cover
+        # both alignments).
+        # Rank-local capacity, so the gate is agreed like the phase entry above.
+        # Only models with GDN layers run those kernels; the odd token counts
+        # would otherwise add forward passes (and padding variants of the
+        # breakable prefill graph) that no other hybrid model needs.
+        has_gdn = any(isinstance(m, Qwen3NextGatedDeltaNet) for m in self.model.modules())
+        if self._agreement.agree_flag(capped_num_tokens >= 32 and has_gdn):
+            mamba_warmup_shapes += [
+                # Prefill %16!=0 family, HAS_DECODE=False.
+                (capped_num_tokens - 4, 0, False, False, False),
+                # Mixed ctx+gen (HAS_DECODE=True), ctx tokens %16==0.
+                (capped_num_tokens, 16, False, False, False),
+                # Mixed ctx+gen (HAS_DECODE=True), ctx tokens %16!=0.
+                (capped_num_tokens - 4, 2, False, False, False),
+                # ==1 specialization (1-token context chunk remainder).
+                (1, 0, False, False, False),
+            ]
+            # The two mixed entries above sample only the (%16==0, %16==0)
+            # and (other, other) diagonal of the Triton specialization key
+            # class(ctx_tokens) x class(gen_tokens), class in {==1, %16==0,
+            # other} -- the first serving batch of each remaining combination
+            # JIT-compiles mid-serving (~230 ms, in rank lockstep). Cover the
+            # cross-terms, plus the 1-token context chunk remainder alongside
+            # gens (reachable with chunked prefill). Gen token count is
+            # num_gen_requests * t; with speculative decoding some classes
+            # shift or become unreachable -- acceptable, as above.
+            t = 1 + self._config.max_total_draft_tokens
+            gen_odd = 2 if (2 * t) % 16 else 3
+            cross_term_shapes = [
+                # ctx %16==0, single gen token (==1 specialization).
+                (capped_num_tokens - 16 + t, 1, False, False, False),
+                # ctx %16!=0, single gen token.
+                (capped_num_tokens - 5 + t, 1, False, False, False),
+                # ctx %16==0, gen tokens %16!=0.
+                (capped_num_tokens - 16 + gen_odd * t, gen_odd, False, False, False),
+                # ctx %16!=0, gen tokens %16==0.
+                (capped_num_tokens - 21 + 16 * t, 16, False, False, False),
+                # ctx==1 chunk remainder x each gen-token class.
+                (1 + t, 1, False, False, False),
+                (1 + gen_odd * t, gen_odd, False, False, False),
+                (1 + 16 * t, 16, False, False, False),
+            ]
+            # With speculative decoding a cross-term can exceed the token
+            # budget; skip it on every rank or on none.
+            mamba_warmup_shapes += [
+                shape
+                for shape in cross_term_shapes
+                if self._agreement.agree_flag(shape[0] <= capped_num_tokens)
+            ]
 
         autotuner_enabled = self._config.enable_autotuner
         cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH", None)

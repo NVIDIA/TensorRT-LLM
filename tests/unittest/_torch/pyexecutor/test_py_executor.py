@@ -1219,6 +1219,8 @@ def _make_encoder_fallback_batch_wait_executor():
     executor.model_engine = object.__new__(ModelEngine)
     executor.model_engine._cleanup_done = True
     executor.model_engine._runner = None
+    executor.model_engine.encoder_batch_size = 8
+    executor.model_engine.encoder_max_num_tokens = 32
     executor.batch_wait_timeout_iters = 48
     executor.encoder_batch_wait_iters_count = 0
     executor.batch_wait_max_tokens_ratio = 0.5
@@ -1907,6 +1909,7 @@ def _make_executor_with_kv_cache_manager(kv_cache_manager: object | None) -> PyE
     executor.enable_attention_dp = False
     executor._kv_connector_deadlines = {}
     executor.adp_router = Mock(exclude_retiring_requests=False)
+    executor._fetch_hint_enabled = False
     executor._kv_cache_capacity = executor._read_kv_cache_capacity()
     executor._kv_load_tracker = KvLoadTracker(kv_cache_manager, rank=0, enabled=True)
     return executor
@@ -2017,7 +2020,7 @@ def test_idle_entry_refreshes_load_before_waiting():
     class ReachedIdleWait(Exception):
         pass
 
-    def idle_wait(waiting_queue, num_active):
+    def idle_wait(waiting_queue, num_active, **kwargs):
         assert num_active == 0
         assert executor.get_kv_cache_load()["usedKvBlocks"] == 0
         raise ReachedIdleWait
@@ -2103,7 +2106,7 @@ def test_adp_running_counts_update_without_a_new_block_sample():
     class ReachedWait(Exception):
         pass
 
-    def stop_at_wait(*args):
+    def stop_at_wait(*args, **kwargs):
         raise ReachedWait
 
     executor._fetch_and_enqueue_requests = stop_at_wait
@@ -3174,6 +3177,7 @@ class _StubADPExecutor:
         self.expected_num_active_requests = 1
         self.max_num_active_requests = 8
         self.max_total_draft_tokens = 0
+        self.enable_joint_kv_cache_reuse = False
         self.max_num_tokens = max_num_tokens
         self._adp_dummy_is_gen = True
         self._pending_adp_dummy_request = None
@@ -3590,7 +3594,7 @@ def _run_non_adp_fetch(active_requests, *, exclude_retiring_requests, max_num_ac
     stub._cancel_queued_context_requests = types.MethodType(
         PyExecutor._cancel_queued_context_requests, stub
     )
-    stub._fetch_and_enqueue_requests = lambda waiting_queue, live: seen.update(live=live)
+    stub._fetch_and_enqueue_requests = lambda waiting_queue, live, **kw: seen.update(live=live)
 
     def _pop(waiting_queue, total_num_active_requests, all_ranks_num_active_requests):
         seen["active"] = total_num_active_requests
@@ -3683,7 +3687,7 @@ def test_non_adp_fetch_pops_a_full_batch_beside_retiring_requests(
     ):
         setattr(stub, name, types.MethodType(getattr(PyExecutor, name), stub))
     live = []
-    stub._fetch_and_enqueue_requests = lambda queue, num_live: live.append(num_live)
+    stub._fetch_and_enqueue_requests = lambda queue, num_live, **kw: live.append(num_live)
 
     with patch(
         "tensorrt_llm._torch.pyexecutor.py_executor.merge_requests",
@@ -4596,6 +4600,8 @@ class TestPendingTransferResponseFlush:
         executor._mm_encoder_item_scheduling_enabled = False
         executor.is_benchmark_disagg = False
         executor._flush_pending_transfer_responses = Mock()
+        executor._packed_sync_enabled = False
+        executor._stage_timing = False
         return executor
 
     @staticmethod
@@ -4782,6 +4788,8 @@ class TestOneModelMTPDraftTokenScheduling:
         ex.enable_attention_dp = False
         ex.speculation_permanently_disabled = False
         ex.active_requests = active_requests
+        ex._packed_sync_enabled = False
+        ex._stage_timing = False
         ex.waiting_queue = []
 
         ex._fetch_and_activate_new_requests = Mock(return_value=[])

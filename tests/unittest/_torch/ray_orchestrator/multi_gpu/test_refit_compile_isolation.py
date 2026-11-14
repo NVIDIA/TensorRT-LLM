@@ -92,8 +92,8 @@ from transformers import AutoTokenizer
 from utils.util import skip_pre_rubin
 
 from tensorrt_llm import LLM
-from tensorrt_llm._ray_utils import control_action_decorator
 from tensorrt_llm._torch.utils import get_device_uuid
+from tensorrt_llm.executor.ray.utils import control_action_decorator
 from tensorrt_llm.llmapi import KvCacheConfig, MoeConfig, SamplingParams, TorchCompileConfig
 from tensorrt_llm.llmapi.rlhf_utils import WorkerExtension
 
