@@ -155,8 +155,8 @@ def _check_context_heads(rank, world_size, scenario, use_nccl_for_alltoall, fifo
         num_layers=1,
         kv_cache_dtype=torch.bfloat16,
     )
-    # A complete local cache on every rank intentionally isolates item 2 from
-    # owner-only writes (item 3) and remote cached-KV gathering (item 4).
+    # Complete local caches isolate head-layout checks from distributed KV
+    # ownership and gathering.
     manager, metadata = setup_kv_and_metadata(
         cache_scenario,
         Mapping(world_size=1, rank=0, tp_size=1),
@@ -233,7 +233,7 @@ def _check_context_heads(rank, world_size, scenario, use_nccl_for_alltoall, fifo
         )
         # The generation kernel emits CP softmax statistics only when its
         # Helix fields are present. Every rank appends to its full replica in
-        # this item 2 fixture; ownership is tested separately in item 3.
+        # this fixture; owner-only writes are checked separately.
         metadata.update_helix_param([context_length], [False])
         metadata.prepare()
         extra_attrs["attention_metadata"] = weakref.ref(metadata)

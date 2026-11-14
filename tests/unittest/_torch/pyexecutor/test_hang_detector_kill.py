@@ -1026,7 +1026,7 @@ def test_second_loop_run_still_kills_after_a_clean_first_run(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# The delivery gate (review: symmetric crashes must not become exit 137).
+# The delivery gate keeps reportable errors from becoming exit 137.
 # ---------------------------------------------------------------------------
 
 
@@ -1136,18 +1136,8 @@ def test_watchdog_threads_the_delivery_event_through(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Real 2-rank MPI: the kill and the gate, with propagate_hard_kill NOT mocked.
-#
-# Every other kill-path test in this file monkeypatches propagate_hard_kill,
-# so none of them exercises a real MPI_Abort (raised in review by @BowenFu).
-# These two do: they launch a real 2-rank MPI job and assert on the exit
-# status of the whole job.
-#
-# Scope, stated honestly: this proves the KILL MECHANISM and the delivery
-# gate over a real communicator. It is not a full 2-rank LLM crash -- there
-# is no engine here -- so it does not by itself prove the end-to-end claim
-# that a client sees the original exception. It does close the "nothing
-# exercises a real MPI_Abort" gap.
+# Real two-rank checks exercise communicator termination and delivery gating
+# without mocking propagate_hard_kill. They do not run an LLM.
 # ---------------------------------------------------------------------------
 
 _MPI_2RANK_SCRIPT = """
@@ -1218,8 +1208,8 @@ def test_real_mpi_abort_takes_down_both_ranks():
 def test_real_mpi_job_survives_when_the_error_was_delivered():
     """Delivered crash: no abort, so both ranks run to completion.
 
-    This is the review point -- a symmetric crash whose error already reached
-    the client must not have its tracebacks replaced by exit 137.
+    A symmetric crash already reported to the client must retain its traceback,
+    rather than becoming exit 137.
     """
     proc = _run_two_rank(delivered="1")
     out = (proc.stdout + proc.stderr).decode(errors="replace")
