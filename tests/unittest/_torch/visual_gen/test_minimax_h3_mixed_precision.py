@@ -305,6 +305,22 @@ class TestMixedPrecisionModel:
         # The census counts TRT-LLM Linears (a fused QKV is one), logged once at build.
         assert model.apply_layer_quant_configs() == {"NVFP4": 6, "FP8": 2, "BF16": 8}
 
+    @pytest.mark.parametrize(
+        "ulysses, async_ulysses, reason",
+        [(2, False, "Ulysses 1 and 4"), (8, False, "Ulysses 1 and 4"), (4, True, "async_ulysses")],
+    )
+    def test_other_ulysses_configurations_are_refused(self, ulysses, async_ulysses, reason):
+        model = _build(_mixed_precision_export(set(_FP8_LAYERS)))
+        model.model_config.visual_gen_mapping = SimpleNamespace(ulysses_size=ulysses)
+        model.model_config.parallel.async_ulysses = async_ulysses
+        with pytest.raises(NotImplementedError, match=reason):
+            model.apply_layer_quant_configs()
+
+    def test_ulysses_4_keeps_the_census(self):
+        model = _build(_mixed_precision_export(set(_FP8_LAYERS)))
+        model.model_config.visual_gen_mapping = SimpleNamespace(ulysses_size=4)
+        assert model.apply_layer_quant_configs() == {"NVFP4": 6, "FP8": 2, "BF16": 8}
+
     @pytest.mark.skipif(
         not torch.cuda.is_available() or tuple(torch.cuda.get_device_capability()) != (10, 7),
         reason="the scenario's kernels are SM 107 only",

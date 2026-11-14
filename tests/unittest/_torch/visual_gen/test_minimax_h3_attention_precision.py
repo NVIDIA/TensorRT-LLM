@@ -223,10 +223,22 @@ class TestValidation:
                 _LAYERS, **{**self._KWARGS, "model_dtype": torch.float16}
             )
 
-    @pytest.mark.parametrize("ulysses", [2, 4])
-    def test_ulysses_above_one_is_refused(self, ulysses):
-        with pytest.raises(NotImplementedError, match="Ulysses 1 only"):
+    def test_ulysses_4_is_valid(self):
+        ap.validate_attention_precision(_LAYERS, **{**self._KWARGS, "ulysses_size": 4})
+
+    @pytest.mark.parametrize("ulysses", [2, 3, 8])
+    def test_other_ulysses_sizes_are_refused(self, ulysses):
+        with pytest.raises(NotImplementedError, match="Ulysses 1 and 4"):
             ap.validate_attention_precision(_LAYERS, **{**self._KWARGS, "ulysses_size": ulysses})
+
+    def test_async_ulysses_is_refused(self):
+        with pytest.raises(NotImplementedError, match="async_ulysses"):
+            ap.validate_attention_precision(
+                _LAYERS, **{**self._KWARGS, "ulysses_size": 4, "async_ulysses": True}
+            )
+
+    def test_async_flag_at_ulysses_1_is_ignored(self):
+        ap.validate_attention_precision(_LAYERS, **{**self._KWARGS, "async_ulysses": True})
 
     def test_empty_mapping_skips_every_check(self):
         ap.validate_attention_precision({}, **{**self._KWARGS, "ulysses_size": 4})

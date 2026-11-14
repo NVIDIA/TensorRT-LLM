@@ -89,8 +89,8 @@ def route_nvfp4_sm_107_u1_u4(config: "DiffusionPipelineConfig") -> Type["BasePip
     the cuDNN attention backend with the per-tensor FP8 recipe, no tensor parallelism.
 
     A MIXED_PRECISION checkpoint whose Linears are all static NVFP4 or static per-tensor FP8 is
-    admitted explicitly, at Ulysses 1 only; the global algorithm of such a checkpoint (its largest
-    group) is not what admits it."""
+    admitted explicitly, at the same Ulysses sizes; the global algorithm of such a checkpoint (its
+    largest group) is not what admits it."""
     capability = _device_capability()
     if capability != (10, 7):
         raise NoScenario(f"needs an SM 107 device, found {capability}")
@@ -130,14 +130,11 @@ def route_nvfp4_sm_107_u1_u4(config: "DiffusionPipelineConfig") -> Type["BasePip
     ulysses = _ulysses_size(config)
     if ulysses not in (1, 4):
         raise NoScenario(f"serves Ulysses 1 or 4, found {ulysses}")
-    if mixed and ulysses != 1:
-        raise NoScenario(f"serves a MIXED_PRECISION checkpoint at Ulysses 1 only, found {ulysses}")
+    # Resolved here so that a malformed entry is refused before the scenario is selected.
     model_config = config.model_configs.get("transformer")
-    attention_precision = resolve_attention_precision(
+    resolve_attention_precision(
         getattr(model_config, "pretrained_config", None), config.extra_attrs
     )
-    if attention_precision and ulysses != 1:
-        raise NoScenario(f"serves attention_precision at Ulysses 1 only, found {ulysses}")
     if config.mapping.tp_size > 1:
         raise NoScenario("serves tp_size=1")
     if getattr(config.parallel, "async_ulysses", False):

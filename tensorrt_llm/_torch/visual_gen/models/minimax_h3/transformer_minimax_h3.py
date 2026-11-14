@@ -49,6 +49,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from .attention_precision import (
+    SUPPORTED_ULYSSES_SIZES,
     attention_module_names,
     resolve_attention_precision,
     validate_attention_precision,
@@ -970,6 +971,7 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             num_refiner_layers=num_refiner_layers,
             model_dtype=model_config.torch_dtype,
             ulysses_size=int(getattr(vgm, "ulysses_size", 1) or 1) if vgm is not None else 1,
+            async_ulysses=bool(model_config.parallel.async_ulysses),
         )
         unquantized_attention = frozenset(self.attention_precision)
         if unquantized_attention:
@@ -1112,6 +1114,18 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
         layered = self.model_config.quant_config_dict is not None
         if quant_config is None or (quant_config.exclude_modules is None and not layered):
             return census
+        if layered:
+            vgm = self.model_config.visual_gen_mapping
+            ulysses_size = int(getattr(vgm, "ulysses_size", 1) or 1) if vgm is not None else 1
+            if ulysses_size not in SUPPORTED_ULYSSES_SIZES:
+                raise NotImplementedError(
+                    "MiniMax-H3 MIXED_PRECISION is supported at Ulysses 1 and 4, "
+                    f"found Ulysses {ulysses_size}"
+                )
+            if ulysses_size > 1 and self.model_config.parallel.async_ulysses:
+                raise NotImplementedError(
+                    "MiniMax-H3 MIXED_PRECISION is not supported with async_ulysses"
+                )
 
         no_quant_config = QuantConfig(kv_cache_quant_algo=quant_config.kv_cache_quant_algo)
         for name, module in self.named_modules():

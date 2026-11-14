@@ -46,6 +46,8 @@ import torch
 SCHEMA_VERSION = 1
 CHECKPOINT_KEY = "attention_precision"
 RUNTIME_KEY = "minimax_h3_attention_precision"
+# Ulysses sizes at which BF16 attention modules and MIXED_PRECISION Linears are served.
+SUPPORTED_ULYSSES_SIZES = (1, 4)
 BF16 = "bf16"
 _ENTRY_KEYS = frozenset({"schema_version", "layers"})
 _PATTERN_CHARACTERS = frozenset("*?[]")
@@ -133,6 +135,7 @@ def validate_attention_precision(
     num_refiner_layers: int,
     model_dtype: torch.dtype,
     ulysses_size: int,
+    async_ulysses: bool = False,
 ) -> None:
     """Check a parsed mapping against the model it is applied to, before the model is built."""
     if not layers:
@@ -148,7 +151,9 @@ def validate_attention_precision(
         raise ValueError(
             f"attention_precision asks for {BF16!r} operands, but the model's dtype is {model_dtype}"
         )
-    if ulysses_size != 1:
+    if ulysses_size not in SUPPORTED_ULYSSES_SIZES:
         raise NotImplementedError(
-            f"attention_precision is supported at Ulysses 1 only, found Ulysses {ulysses_size}"
+            f"attention_precision is supported at Ulysses 1 and 4, found Ulysses {ulysses_size}"
         )
+    if async_ulysses and ulysses_size > 1:
+        raise NotImplementedError("attention_precision is not supported with async_ulysses")

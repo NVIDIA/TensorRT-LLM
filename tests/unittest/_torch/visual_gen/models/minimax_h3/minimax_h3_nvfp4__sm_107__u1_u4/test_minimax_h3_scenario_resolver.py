@@ -131,11 +131,16 @@ def _stub_scenario_package(monkeypatch):
 
 
 @pytest.mark.parametrize("global_algo", [QuantAlgo.NVFP4, QuantAlgo.FP8])
-def test_route_admits_a_mixed_nvfp4_fp8_checkpoint_at_ulysses_1(monkeypatch, global_algo):
+@pytest.mark.parametrize("ulysses", [1, 4])
+def test_route_admits_a_mixed_nvfp4_fp8_checkpoint(monkeypatch, global_algo, ulysses):
     """Admission reads the per-layer table, not the global algorithm (the largest group)."""
     monkeypatch.setattr(scenarios, "_device_capability", lambda: (10, 7))
     cls = _stub_scenario_package(monkeypatch)
-    config = _config(quant_algo=global_algo, layer_quant=_layers(QuantAlgo.NVFP4, QuantAlgo.FP8))
+    config = _config(
+        quant_algo=global_algo,
+        layer_quant=_layers(QuantAlgo.NVFP4, QuantAlgo.FP8),
+        ulysses=ulysses,
+    )
     assert scenarios.route_nvfp4_sm_107_u1_u4(config) is cls
 
 
@@ -148,7 +153,7 @@ def test_route_keeps_the_uniform_nvfp4_checkpoint_at_ulysses_4(monkeypatch):
 @pytest.mark.parametrize(
     "kwargs, reason",
     [
-        (dict(layer_quant=_layers(QuantAlgo.NVFP4, QuantAlgo.FP8), ulysses=4), "Ulysses 1 only"),
+        (dict(layer_quant=_layers(QuantAlgo.NVFP4, QuantAlgo.FP8), ulysses=2), "Ulysses 1 or 4"),
         (
             dict(layer_quant=_layers(QuantAlgo.NVFP4, QuantAlgo.FP8), dynamic=True),
             "dynamic_weight_quant",
@@ -159,6 +164,13 @@ def test_route_keeps_the_uniform_nvfp4_checkpoint_at_ulysses_4(monkeypatch):
         ),
         (dict(layer_quant=_layers(QuantAlgo.NVFP4, None)), "None"),
         (dict(layer_quant={}), "no layers"),
+        (dict(layer_quant=_layers(QuantAlgo.NVFP4, QuantAlgo.FP8), ulysses=8), "Ulysses 1 or 4"),
+        (
+            dict(
+                layer_quant=_layers(QuantAlgo.NVFP4, QuantAlgo.FP8), ulysses=4, async_ulysses=True
+            ),
+            "async_ulysses",
+        ),
     ],
 )
 def test_route_names_why_a_mixed_checkpoint_is_declined(monkeypatch, kwargs, reason):
@@ -170,11 +182,11 @@ def test_route_names_why_a_mixed_checkpoint_is_declined(monkeypatch, kwargs, rea
 @pytest.mark.parametrize("mode", ["auto", "require"])
 def test_declined_mixed_checkpoint_falls_to_the_family_or_raises(monkeypatch, mode):
     monkeypatch.setattr(scenarios, "_device_capability", lambda: (10, 7))
-    config = _config(mode=mode, layer_quant=_layers(QuantAlgo.NVFP4, QuantAlgo.FP8), ulysses=4)
+    config = _config(mode=mode, layer_quant=_layers(QuantAlgo.NVFP4, QuantAlgo.FP8), ulysses=8)
     if mode == "auto":
         assert scenarios.resolve_scenario(_Family, config) is _Family
     else:
-        with pytest.raises(RuntimeError, match="Ulysses 1 only"):
+        with pytest.raises(RuntimeError, match="Ulysses 1 or 4"):
             scenarios.resolve_scenario(_Family, config)
 
 
@@ -182,17 +194,29 @@ _ATTENTION_PRECISION = {"schema_version": 1, "layers": {"transformer_blocks.45.a
 
 
 @pytest.mark.parametrize("source", ["attention_precision", "runtime_attention_precision"])
-def test_route_admits_attention_precision_at_ulysses_1(monkeypatch, source):
+@pytest.mark.parametrize("ulysses", [1, 4])
+def test_route_admits_attention_precision(monkeypatch, source, ulysses):
     monkeypatch.setattr(scenarios, "_device_capability", lambda: (10, 7))
     cls = _stub_scenario_package(monkeypatch)
-    assert scenarios.route_nvfp4_sm_107_u1_u4(_config(**{source: _ATTENTION_PRECISION})) is cls
+    config = _config(ulysses=ulysses, **{source: _ATTENTION_PRECISION})
+    assert scenarios.route_nvfp4_sm_107_u1_u4(config) is cls
 
 
 @pytest.mark.parametrize("source", ["attention_precision", "runtime_attention_precision"])
-def test_route_declines_attention_precision_above_ulysses_1(monkeypatch, source):
+@pytest.mark.parametrize(
+    "kwargs, reason",
+    [
+        (dict(ulysses=2), "Ulysses 1 or 4"),
+        (dict(ulysses=8), "Ulysses 1 or 4"),
+        (dict(ulysses=4, async_ulysses=True), "async_ulysses"),
+    ],
+)
+def test_route_declines_attention_precision_outside_ulysses_1_and_4(
+    monkeypatch, source, kwargs, reason
+):
     monkeypatch.setattr(scenarios, "_device_capability", lambda: (10, 7))
-    with pytest.raises(scenarios.NoScenario, match="attention_precision at Ulysses 1 only"):
-        scenarios.route_nvfp4_sm_107_u1_u4(_config(ulysses=4, **{source: _ATTENTION_PRECISION}))
+    with pytest.raises(scenarios.NoScenario, match=reason):
+        scenarios.route_nvfp4_sm_107_u1_u4(_config(**kwargs, **{source: _ATTENTION_PRECISION}))
 
 
 def test_route_keeps_ulysses_4_for_an_empty_attention_precision(monkeypatch):
