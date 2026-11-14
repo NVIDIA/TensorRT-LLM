@@ -6056,6 +6056,10 @@ class KVCacheManagerV2(BaseResourceManager):
         """Radix-tree evidence for one context prefix. Raw prompt, so block hashes
         stay comparable with KV cache events, the cache-aware router and disagg peers.
         """
+        # Shared prefix reuse omits rows requested by context outputs. Both
+        # target and draft pools must compute the full original prompt.
+        if req.py_return_context_logits:
+            return []
         all_tokens = self._reuse_token_source(req)
         # The target must recompute the last prompt token, but a one-model draft
         # also reads D prompt tokens ahead. Include those tokens as match evidence;
@@ -6940,6 +6944,9 @@ class KVCacheManagerV2(BaseResourceManager):
     def _connector_may_serve(self, req: LlmRequest) -> bool:
         """Whether the connector is allowed to serve a prefix for ``req``."""
         if self.kv_connector_manager is None or self.is_draft:
+            return False
+        if req.py_return_context_logits:
+            # Publication and same-request resume remain eligible.
             return False
         if self.kv_connector_manager.capacity_only:
             # It can serve nothing, so both the reservation path and the

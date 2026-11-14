@@ -1579,6 +1579,7 @@ def test_one_model_prompt_lookahead_configures_reuse_backoff(
     assert manager.reuse_match_backoff == 1
     prompt = list(range(65))
     request = SimpleNamespace(
+        py_return_context_logits=False,
         multimodal_hashes=None,
         multimodal_positions=None,
         multimodal_lengths=None,

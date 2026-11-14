@@ -1697,8 +1697,11 @@ def _compute_pytorch_prompt_logprobs(
         cached = getattr(generation_result, '_cached_prompt_logprobs', None)
         if cached is not None:
             return LogProbsResult(prompt=cached)
-    context_logits = response.result.context_logits
-    compact_rows = response.result.context_prompt_logprob_rows
+    try:
+        context_logits = response.result.context_logits
+        compact_rows = response.result.context_prompt_logprob_rows
+    except ValueError as error:
+        raise IncompleteContextLogitsError(str(error)) from error
     result = response.result.get_result()
     assert result is not None, "result must not be None when prompt_logprobs is requested."
     if (context_logits is None and compact_rows is None
@@ -1710,6 +1713,19 @@ def _compute_pytorch_prompt_logprobs(
         return None
     assert context_logits is not None or compact_rows is not None, \
         "context_logits must not be None when prompt_logprobs is requested."
+    prompt_length = len(generation_result._generation_request.prompt_token_ids)
+    origins = response.result.context_logits_origins
+    if (not origins or len(origins) != 1
+            or origins[0].client_id != response.client_id
+            or origins[0].client_id != generation_result._generation_request.id
+            or origins[0].prompt_length != prompt_length
+            or (origins[0].start, origins[0].end) != (0, prompt_length)):
+        raise IncompleteContextLogitsError(
+            "prompt logprobs require complete original prompt-row origins")
+    if context_logits is not None and (context_logits.ndim != 2 or
+                                       context_logits.size(0) != prompt_length):
+        raise IncompleteContextLogitsError(
+            "prompt logprobs require one context-logit row per prompt token")
     # Single element list
     first_generation_token = result.output_token_ids[0][:1]
     assert first_generation_token, "first generation token must not be empty when prompt_logprobs is requested."

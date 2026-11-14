@@ -26,6 +26,7 @@ from utils.llm_data import llm_models_root
 from utils.util import skip_single_gpu
 # isort: on
 
+from tensorrt_llm._torch.pyexecutor.llm_request import ContextLogitsOrigin
 from tensorrt_llm.executor import base_worker
 from tensorrt_llm.executor.base_worker import BaseWorker
 from tensorrt_llm.executor.request import GenerationRequest, LoRARequest
@@ -46,7 +47,7 @@ model_path = llm_models_root() / default_model_name
 def test_prompt_logprobs_computation_and_streaming_cache(
         monkeypatch, streaming, drop_context_logits, simple):
     prompt_logprobs = [-0.5, -0.25, -0.125] if simple else [{11: "logprob"}]
-    logits = object()
+    logits = torch.zeros(3, 2)
     calls = []
 
     def compute(k, context_logits, prompt_token_ids, *, simple_prompt_logprobs):
@@ -60,7 +61,8 @@ def test_prompt_logprobs_computation_and_streaming_cache(
                                       drop_context_logits=drop_context_logits,
                                       prompt_logprobs_simple_format=simple),
         _streaming=streaming,
-        _generation_request=SimpleNamespace(prompt_token_ids=[10, 11, 12]))
+        _generation_request=SimpleNamespace(prompt_token_ids=[10, 11, 12],
+                                            id=1))
     generation_result.clear_logprob_params = lambda: delattr(
         generation_result, "_logprob_params")
     worker = SimpleNamespace(_results={1: generation_result})
@@ -68,6 +70,7 @@ def test_prompt_logprobs_computation_and_streaming_cache(
     def make_response(context_logits):
         result = SimpleNamespace(
             context_logits=context_logits,
+            context_logits_origins=(ContextLogitsOrigin(1, 3, 0, 3), ),
             context_prompt_logprob_rows=None,
             is_final=False,
             get_result=lambda: SimpleNamespace(output_token_ids=[[13]]))
@@ -756,7 +759,7 @@ def test_prompt_logprobs_preserve_token_alignment_and_streaming_cache(
 
     generation_result = SimpleNamespace(
         _streaming=streaming,
-        _generation_request=SimpleNamespace(prompt_token_ids=[0, 1, 2]),
+        _generation_request=SimpleNamespace(prompt_token_ids=[0, 1, 2], id=7),
         _logprob_params=LogprobParams(prompt_logprobs=top_k,
                                       drop_context_logits=drop_context_logits,
                                       prompt_logprobs_simple_format=simple),
@@ -765,6 +768,7 @@ def test_prompt_logprobs_preserve_token_alignment_and_streaming_cache(
     response_result = SimpleNamespace(
         is_final=False,
         context_logits=torch.tensor([[0., 1., 2., 3.]] * 3),
+        context_logits_origins=(ContextLogitsOrigin(7, 3, 0, 3), ),
         context_prompt_logprob_rows=None,
         get_result=lambda: SimpleNamespace(output_token_ids=[[0]]),
     )

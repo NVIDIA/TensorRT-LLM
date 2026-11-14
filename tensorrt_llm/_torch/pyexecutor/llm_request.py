@@ -219,6 +219,42 @@ class LogitsStorage:
                                                        or self._storage.is_cuda)
             self._logits_indices.append((position, new_position))
 
+    def write(self,
+              logits: torch.Tensor,
+              start: int,
+              *,
+              reusable: bool = False) -> None:
+        """Store rows at original positions, overwriting replayed intervals."""
+        if self.use_chunked_generation_logits:
+            raise ValueError(
+                "indexed writes are only supported for context logits")
+        if logits.ndim == 2:
+            logits = logits.unsqueeze(1)
+        if logits.ndim != 3:
+            raise ValueError(
+                "context logits must have shape [T, V] or [T, B, V]")
+        end = start + logits.size(0)
+        if start < 0 or end <= start or end > self.seq_length:
+            raise ValueError(
+                "context logits range is outside the original prompt")
+        if self.beam_width == -1:
+            self._init(logits)
+        if logits.size(1) != self.beam_width or logits.size(
+                2) != self.vocab_size:
+            raise ValueError("context logits beam or vocabulary size changed")
+        assert self._storage is not None
+        self._storage[start:end].copy_(logits,
+                                       non_blocking=not reusable
+                                       or self._storage.is_cuda)
+        intervals = sorted(self._logits_indices + [(start, end)])
+        merged: list[tuple[int, int]] = []
+        for left, right in intervals:
+            if merged and left <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], right))
+            else:
+                merged.append((left, right))
+        self._logits_indices = merged
+
     def get(self, all_logits: bool, exclude_last: bool) -> torch.Tensor | None:
         """Returns the used logits storage if there are any, otherwise, returns None.
 
@@ -326,6 +362,16 @@ class LogProbStorage:
         self.append(log_probs, cum_log_probs)
 
 
+@dataclass(frozen=True)
+class ContextLogitsOrigin:
+    """Original decoder prompt coordinates for one context fragment."""
+
+    client_id: int
+    prompt_length: int
+    start: int
+    end: int
+
+
 class PyResult:
     """PyResult reimplements some features of `bindings.executor.Result` in Python"""
 
@@ -338,8 +384,12 @@ class PyResult:
         """
         exclude_last_generation_logits: bool | None = None
         context_logits_list: list[torch.Tensor] = field(default_factory=list)
+        context_logits_origins: list[ContextLogitsOrigin
+                                     | None] = field(default_factory=list)
         context_logits_on_cpu: bool = False
         prompt_logprob_rows: list[torch.Tensor] = field(default_factory=list)
+        prompt_logprob_origins: list[ContextLogitsOrigin
+                                     | None] = field(default_factory=list)
         prompt_last_logprobs: torch.Tensor | None = None
         generation_logits_list: list[torch.Tensor] = field(default_factory=list)
         reset_log_probs: tuple[list[TokenLogprobs] | list[SimpleTokenLogprobs],
@@ -378,7 +428,11 @@ class PyResult:
         # Here we only use host memory for generation logits if in chunked model.
         # Prompt logprobs reduced on the executor (``reduce_prompt_logprobs``
         # rows); the worker builds the user-facing values from them.
-        self.context_prompt_logprob_rows: list[torch.Tensor] | None = None
+        self._original_prompt_len = prompt_len
+        self._context_logits_client_id: int | None = None
+        self._context_logits_ranges: list[tuple[int, int]] = []
+        self._prompt_logprob_storage: LogitsStorage | None = None
+        self._context_prompt_logprob_rows: list[torch.Tensor] | None = None
         self.context_prompt_last_logprobs: torch.Tensor | None = None
         self._context_logits = LogitsStorage(
             seq_length=prompt_len,
@@ -423,26 +477,32 @@ class PyResult:
         return self.diff
 
     def apply_diff(self, diff: Diff):
-        if diff.prompt_logprob_rows:
-            if self.context_prompt_logprob_rows is None:
-                self.context_prompt_logprob_rows = []
-            self.context_prompt_logprob_rows.extend(diff.prompt_logprob_rows)
+        if len(diff.context_logits_list) != len(diff.context_logits_origins):
+            raise ValueError("context logits and origin diff lengths differ")
+        if len(diff.prompt_logprob_rows) != len(diff.prompt_logprob_origins):
+            raise ValueError("prompt logprobs and origin diff lengths differ")
+        for rows, origin in zip(diff.prompt_logprob_rows,
+                                diff.prompt_logprob_origins):
+            self._store_prompt_logprobs(rows, origin, update_diff=False)
         if diff.prompt_last_logprobs is not None:
             self.context_prompt_last_logprobs = diff.prompt_last_logprobs
         if diff.exclude_last_generation_logits is not None:
             self._exclude_last_generation_logits = diff.exclude_last_generation_logits
-        if len(diff.context_logits_list) > 0:
+        if diff.context_logits_list:
+            if self._context_logits is None:
+                raise ValueError("context logits diff has no receiving storage")
             first = diff.context_logits_list[0]
-            # Preserve host fallback, including when only the receiving rank
-            # lacks space for the complete result.
             device = torch.device(
                 "cpu" if diff.context_logits_on_cpu else "cuda")
             self._context_logits.prepare(first.shape[-1],
                                          first.dtype,
                                          device,
                                          cpu_fallback=True)
-            for context_logits in diff.context_logits_list:
-                self._context_logits.append(context_logits)
+            for context_logits, origin in zip(diff.context_logits_list,
+                                              diff.context_logits_origins):
+                self._store_context_logits(context_logits,
+                                           origin,
+                                           update_diff=False)
         if len(diff.generation_logits_list) > 0:
             for generation_logits in diff.generation_logits_list:
                 self._generation_logits.append(generation_logits)
@@ -491,18 +551,82 @@ class PyResult:
         assert self._context_logits is not None and self._context_logits._storage is not None
         return self._context_logits._storage.device.type == "cpu"
 
-    def append_prompt_logprobs(self, rows: torch.Tensor) -> None:
-        """Record reduced prompt logprobs of consecutive prompt tokens.
+    def _validate_context_origin(self, origin: ContextLogitsOrigin) -> None:
+        values = (origin.client_id, origin.prompt_length, origin.start,
+                  origin.end)
+        if any(type(value) is not int for value in values):
+            raise ValueError("context logits origin fields must be integers")
+        if (origin.prompt_length != self._original_prompt_len
+                or not 0 <= origin.start < origin.end <= origin.prompt_length):
+            raise ValueError("context logits origin does not match its tensor")
+        if self._context_logits_client_id is None:
+            if ((self._context_logits is not None
+                 and self._context_logits._logits_indices)
+                    or self._context_prompt_logprob_rows is not None):
+                raise ValueError(
+                    "cannot mix unindexed and indexed context logits")
+        elif origin.client_id != self._context_logits_client_id:
+            raise ValueError("context logits client identity changed")
+
+    def _record_context_origin(self, origin: ContextLogitsOrigin) -> None:
+        self._context_logits_client_id = origin.client_id
+        intervals = sorted(self._context_logits_ranges +
+                           [(origin.start, origin.end)])
+        merged: list[tuple[int, int]] = []
+        for left, right in intervals:
+            if merged and left <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], right))
+            else:
+                merged.append((left, right))
+        self._context_logits_ranges = merged
+
+    def _store_prompt_logprobs(self, rows: torch.Tensor,
+                               origin: ContextLogitsOrigin | None, *,
+                               update_diff: bool) -> None:
+        if origin is None:
+            if self._context_logits_client_id is not None:
+                raise ValueError(
+                    "decoder prompt logprobs are missing their origin")
+            if self._context_prompt_logprob_rows is None:
+                self._context_prompt_logprob_rows = []
+            self._context_prompt_logprob_rows.append(rows)
+        else:
+            self._validate_context_origin(origin)
+            expected_rows = min(origin.end,
+                                origin.prompt_length - 1) - origin.start
+            if rows.ndim != 2 or rows.shape[0] != expected_rows:
+                raise ValueError(
+                    "prompt logprobs origin does not match its tensor")
+            if expected_rows:
+                if self._prompt_logprob_storage is None:
+                    self._prompt_logprob_storage = LogitsStorage(
+                        seq_length=origin.prompt_length - 1,
+                        use_device_memory=False)
+                self._prompt_logprob_storage.write(rows,
+                                                   origin.start,
+                                                   reusable=True)
+                storage = self._prompt_logprob_storage._storage
+                assert storage is not None
+                self._context_prompt_logprob_rows = [storage[:, 0]]
+            elif self._context_prompt_logprob_rows is None:
+                self._context_prompt_logprob_rows = [rows]
+            self._record_context_origin(origin)
+        if update_diff:
+            self.diff.prompt_logprob_rows.append(rows)
+            self.diff.prompt_logprob_origins.append(origin)
+
+    def append_prompt_logprobs(
+            self,
+            rows: torch.Tensor,
+            origin: ContextLogitsOrigin | None = None) -> None:
+        """Store compact rows at their original prompt positions.
 
         Args:
-            rows: ``[tokens, columns]`` FP64 host tensor from
-                ``reduce_prompt_logprobs``; row ``t`` scores the prompt token
-                that follows the ``t``-th consumed context position.
+            rows: ``[tokens, columns]`` FP64 host output of ``reduce_prompt_logprobs``.
+            origin: Original context positions, including the final prediction row
+                when present; compact rows exclude that final position.
         """
-        if self.context_prompt_logprob_rows is None:
-            self.context_prompt_logprob_rows = []
-        self.context_prompt_logprob_rows.append(rows)
-        self.diff.prompt_logprob_rows.append(rows)
+        self._store_prompt_logprobs(rows, origin, update_diff=True)
 
     def set_prompt_last_logprobs(self, logprobs: torch.Tensor) -> None:
         """Retain the last prompt position's normalized log probabilities.
@@ -517,17 +641,48 @@ class PyResult:
         self.context_prompt_last_logprobs = logprobs
         self.diff.prompt_last_logprobs = logprobs
 
+    def _store_context_logits(self,
+                              context_logits: torch.Tensor,
+                              origin: ContextLogitsOrigin | None,
+                              *,
+                              update_diff: bool,
+                              reusable: bool = False) -> None:
+        if self._context_logits is None:
+            return
+        if origin is None:
+            if self._context_logits_client_id is not None:
+                raise ValueError(
+                    "decoder context logits are missing their origin")
+            self._context_logits.append(context_logits, reusable=reusable)
+            begin, end = self._context_logits._logits_indices[-1]
+        else:
+            self._validate_context_origin(origin)
+            if (context_logits.ndim not in (2, 3)
+                    or origin.end - origin.start != context_logits.size(0)):
+                raise ValueError(
+                    "context logits origin does not match its tensor")
+            self._context_logits.write(context_logits,
+                                       origin.start,
+                                       reusable=reusable)
+            self._record_context_origin(origin)
+            begin, end = origin.start, origin.end
+        if update_diff:
+            if reusable:
+                storage = self._context_logits._storage
+                assert storage is not None
+                context_logits = storage[begin:end, 0]
+            self.diff.context_logits_list.append(context_logits)
+            self.diff.context_logits_origins.append(origin)
+
     def append_context_logits(self,
                               context_logits: torch.Tensor,
+                              origin: ContextLogitsOrigin | None = None,
                               *,
-                              reusable: bool = False):
-        if self._context_logits:
-            self._context_logits.append(context_logits, reusable=reusable)
-            if reusable:
-                # Retain the owned destination view, never the next chunk's scratch.
-                begin, end = self._context_logits._logits_indices[-1]
-                context_logits = self._context_logits._storage[begin:end, 0]
-            self.diff.context_logits_list.append(context_logits)
+                              reusable: bool = False) -> None:
+        self._store_context_logits(context_logits,
+                                   origin,
+                                   update_diff=True,
+                                   reusable=reusable)
 
     def append_generation_logits(self, generation_logits: torch.Tensor):
         if self._generation_logits:
@@ -625,7 +780,34 @@ class PyResult:
         self.diff.first_gen_log_probs = log_probs
 
     @property
+    def context_prompt_logprob_rows(self) -> list[torch.Tensor] | None:
+        if (self._prompt_logprob_storage is not None
+                and self._prompt_logprob_storage._logits_indices != [
+                    (0, self._original_prompt_len - 1)
+                ]):
+            raise ValueError(
+                "prompt logprobs do not cover the full original prompt")
+        return self._context_prompt_logprob_rows
+
+    @property
+    def context_logits_origins(self) -> tuple[ContextLogitsOrigin, ...] | None:
+        if self._context_logits_client_id is None:
+            return None
+        return tuple(
+            ContextLogitsOrigin(self._context_logits_client_id,
+                                self._original_prompt_len, start, end)
+            for start, end in self._context_logits_ranges)
+
+    @property
     def context_logits(self) -> torch.Tensor | None:
+        if (self._context_logits is not None
+                and self._context_logits._storage is not None
+                and self._context_logits_client_id is not None
+                and self._context_logits._logits_indices != [
+                    (0, self._original_prompt_len)
+                ]):
+            raise ValueError(
+                "context logits do not cover the full original prompt")
         if self._context_logits is None or (storage := self._context_logits.get(
                 all_logits=True, exclude_last=False)) is None:
             return None
@@ -727,9 +909,10 @@ class PyResult:
 class LlmResult:
     """LlmResult wraps `bindings.executor.Result` but detour some features to Python implementation"""
     py_result_properties = frozenset(
-        ('context_logits', 'context_prompt_logprob_rows',
-         'context_prompt_last_logprobs', 'generation_logits', 'log_probs',
-         'cum_log_probs', 'first_gen_log_probs', 'mm_embedding_handles',
+        ('context_logits', 'context_logits_origins',
+         'context_prompt_logprob_rows', 'context_prompt_last_logprobs',
+         'generation_logits', 'log_probs', 'cum_log_probs',
+         'first_gen_log_probs', 'mm_embedding_handles',
          'additional_context_outputs', 'additional_generation_outputs',
          'encoder_output', 'mrope_position_ids_handle',
          'mrope_position_deltas_handle'))
@@ -805,6 +988,11 @@ class LlmResponse:
             py_result = self.result._py_result
             if hasattr(py_result, '_context_logits'):
                 py_result._context_logits = None
+                py_result._context_logits_client_id = None
+                py_result._context_logits_ranges = []
+                py_result._prompt_logprob_storage = None
+                py_result._context_prompt_logprob_rows = None
+                py_result.context_prompt_last_logprobs = None
 
 
 class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):

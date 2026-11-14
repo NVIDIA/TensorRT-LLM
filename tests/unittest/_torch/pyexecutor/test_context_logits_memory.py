@@ -10,7 +10,7 @@ import torch
 
 from tensorrt_llm._torch.modules.context_logits import ContextLogitsWorkspace, context_logits_heads
 from tensorrt_llm._torch.pyexecutor.context_logits_plan import ContextLogitsPlan
-from tensorrt_llm._torch.pyexecutor.llm_request import PyResult
+from tensorrt_llm._torch.pyexecutor.llm_request import ContextLogitsOrigin, PyResult
 from tensorrt_llm.executor.result import compute_prompt_logprobs
 
 
@@ -42,6 +42,8 @@ def make_request(
         context_chunk_size=length,
         context_current_position=0,
         py_prompt_len=length,
+        orig_prompt_len=length,
+        py_client_id=0,
         py_return_context_logits=full or k is not None,
         py_context_logits_explicit=full,
         py_prompt_logprobs=k,
@@ -247,8 +249,10 @@ def test_prompt_logprobs_survive_batch_dependent_projection_switch(
     expected = compute_prompt_logprobs(3, reference.cpu(), targets).prompt
     response = SimpleNamespace(
         request_id=0,
+        client_id=0,
         result=SimpleNamespace(
             context_logits=None,
+            context_logits_origins=request.py_result.context_logits_origins,
             context_prompt_logprob_rows=request.py_result.context_prompt_logprob_rows,
             context_prompt_last_logprobs=request.py_result.context_prompt_last_logprobs,
             get_result=lambda: SimpleNamespace(output_token_ids=[[13]]),
@@ -257,12 +261,14 @@ def test_prompt_logprobs_survive_batch_dependent_projection_switch(
     generation = SimpleNamespace(
         _streaming=True,
         _logprob_params=SimpleNamespace(prompt_logprobs=3, prompt_logprobs_simple_format=False),
-        _generation_request=SimpleNamespace(prompt_token_ids=request.get_tokens(0)),
+        _generation_request=SimpleNamespace(prompt_token_ids=request.get_tokens(0), id=0),
     )
     actual = _compute_pytorch_prompt_logprobs(generation, response)
     assert_logprobs_equal(actual.prompt, expected)
     # Rows that skip a reused prefix cannot be aligned with the prompt.
-    response.result.context_prompt_logprob_rows = request.py_result.context_prompt_logprob_rows[1:]
+    response.result.context_prompt_logprob_rows = [
+        request.py_result.context_prompt_logprob_rows[0][1:]
+    ]
     generation._cached_prompt_logprobs = None
     with pytest.raises(IncompleteContextLogitsError, match="all 91 prompt tokens"):
         _compute_pytorch_prompt_logprobs(generation, response)
@@ -421,6 +427,7 @@ def test_short_compact_prompt_logprobs_fail_only_their_request() -> None:
             result=SimpleNamespace(
                 is_final=is_final,
                 context_logits=None,
+                context_logits_origins=(ContextLogitsOrigin(7, 4, 0, 4),),
                 # One row for a 4-token prompt: a 2-token prefix was reused.
                 context_prompt_logprob_rows=[torch.zeros(1, 2, dtype=torch.float64)],
                 context_prompt_last_logprobs=torch.zeros(1, 8),
@@ -433,7 +440,7 @@ def test_short_compact_prompt_logprobs_fail_only_their_request() -> None:
         _logprob_params=SimpleNamespace(
             prompt_logprobs=0, prompt_logprobs_simple_format=False, drop_context_logits=True
         ),
-        _generation_request=SimpleNamespace(prompt_token_ids=[1, 2, 3, 4]),
+        _generation_request=SimpleNamespace(prompt_token_ids=[1, 2, 3, 4], id=7),
         clear_logprob_params=Mock(),
     )
     worker = SimpleNamespace(
