@@ -1168,6 +1168,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
     # emits per turn, so parallel emission remains model behavior either way.
     parallel_tool_calls: Optional[bool] = None
     user: Optional[str] = None
+    # Standard OpenAI field, accepted for compatibility and otherwise ignored:
+    # the server does not use end-user identifiers for abuse detection.
+    safety_identifier: Optional[str] = None
     reasoning_effort: Optional[ReasoningEffort | Literal[
         "minimal", "low", "medium", "high", "xhigh", "max", "none"]] = Field(
             default=ReasoningEffort.LOW,
