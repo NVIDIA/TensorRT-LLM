@@ -23,7 +23,6 @@
 #include "tensorrt_llm/runtime/torchView.h"
 
 #include <memory>
-#include <vector>
 
 using namespace tensorrt_llm::runtime;
 namespace tc = tensorrt_llm::common;

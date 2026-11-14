@@ -26,7 +26,6 @@ Run under pytest (a pool of 4 MPI workers) or directly, one process per GPU:
 """
 
 import hashlib
-import os
 import pickle
 import sys
 import traceback
@@ -86,7 +85,6 @@ def _digest(t: torch.Tensor) -> str:
 
 
 def _context():
-    os.environ.setdefault("TRTLLM_FORCE_MNNVL_AR", "1")
     comm = MPI.COMM_WORLD
     rank, world = comm.Get_rank(), comm.Get_size()
     gpus = torch.cuda.device_count()

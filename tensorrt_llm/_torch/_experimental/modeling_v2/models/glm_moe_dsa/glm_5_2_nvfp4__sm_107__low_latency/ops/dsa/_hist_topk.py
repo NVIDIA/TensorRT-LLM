@@ -69,7 +69,7 @@ def hist_topk_supported(mapping: Mapping) -> bool:
         and mapping.world_size == mapping.tp_size
         and not mapping.has_cp()
         and not mapping.enable_attention_dp
-        and MNNVLAllReduce.is_mnnvl(mapping, torch.bfloat16)
+        and MNNVLAllReduce.is_mnnvl(mapping, torch.bfloat16, explicitly_requested=True)
     )
 
 

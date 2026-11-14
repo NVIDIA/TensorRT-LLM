@@ -15,12 +15,11 @@
  * limitations under the License.
  */
 #include "kimi_k3_vl/csrc/k3MnnvlAllreduce.h"
-#include "tensorrt_llm/common/mcastDevMemUtils.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
 #include "tensorrt_llm/kernels/quantization.h"
 #include "tensorrt_llm/modeling_v2/common/namespace.h"
 #include "tensorrt_llm/modeling_v2/common/torchLibrary.h"
-#include "tensorrt_llm/runtime/mcastDeviceMemory.h"
+#include "tensorrt_llm/runtime/mcastGPUBuffer.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
@@ -86,10 +85,12 @@ std::vector<torch::Tensor> k3MnnvlFusionAllReduce(torch::Tensor& input, torch::o
     torch::Tensor& buffer_flags, bool rmsnorm_fusion, torch::optional<torch::Tensor> const& scale, int64_t fusion_op_,
     int64_t one_shot_max_bytes, bool early_trigger)
 {
-    auto* mcast_mem = tensorrt_llm::common::findMcastDevMemBuffer(comm_buffer.data_ptr());
+    auto mcast_mem = tensorrt_llm::runtime::getMcastDevMemBuffer(comm_buffer);
     TORCH_CHECK(
         mcast_mem != nullptr, "[mnnvlFusionAllReduce] comm_buffer must be obtained from a mcastBuffer instance.");
     TORCH_CHECK(mcast_mem->isMapped(), "[mnnvlFusionAllReduce] MNNVL workspace handles are not attached.");
+    TORCH_CHECK(comm_buffer.data_ptr() == mcast_mem->getUnicastPtr(mcast_mem->getRank()),
+        "[mnnvlFusionAllReduce] comm_buffer must start at the local unicast allocation base.");
     TORCH_CHECK(input.is_contiguous(), "[mnnvlFusionAllReduce] input must be contiguous");
     TORCH_CHECK(input.dim() >= 2, "[mnnvlFusionAllReduce] input must have at least 2 dimensions");
 

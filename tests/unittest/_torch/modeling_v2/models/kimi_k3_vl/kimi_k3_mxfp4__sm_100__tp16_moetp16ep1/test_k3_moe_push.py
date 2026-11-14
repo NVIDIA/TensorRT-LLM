@@ -38,7 +38,6 @@ Run under pytest (a pool of 4 MPI workers) or directly, one process per GPU:
 
 import hashlib
 import math
-import os
 import pickle
 import sys
 import traceback
@@ -174,10 +173,11 @@ class _Exchange:
         from tensorrt_llm._torch.distributed.ops import (
             _get_mnnvl_workspace_comm,
             _make_mnnvl_mcast_buffer,
+            use_mnnvl_fabric_handle,
         )
 
         words = kernel.buffer_words(slots)
-        fabric = os.environ.get("TRTLLM_FORCE_MNNVL_AR", "0") == "1" or ctx.mapping.is_multi_node()
+        fabric = use_mnnvl_fabric_handle(ctx.mapping)
         self.handle = _make_mnnvl_mcast_buffer(
             _get_mnnvl_workspace_comm(ctx.mapping), words * 4, ctx.mapping, fabric
         )
@@ -220,7 +220,6 @@ def _order16(rows, copies):
 
 
 def _context():
-    os.environ.setdefault("TRTLLM_FORCE_MNNVL_AR", "1")
     comm = MPI.COMM_WORLD
     rank, world = comm.Get_rank(), comm.Get_size()
     gpus = torch.cuda.device_count()
