@@ -32,9 +32,13 @@ This feature is a prototype: its settings may change.
   and silently use the regular attention.
 - CUDA graphs. A step that also carries context requests runs the context phase on the regular
   attention and the generation rows on this library.
-- Batches or layers the library does not support use the regular attention automatically. Two
-  cases raise an error instead: the legacy KV cache manager, and a beam that generates more than
-  `TLLM_BEAM_SHARED_PREFIX_MAX_TAIL` tokens under CUDA graphs.
+- Batches or layers the library does not support use the regular attention automatically,
+  including models with variable sliding windows. The legacy KV cache manager raises an error
+  instead.
+- A step in which a beam has generated more than `TLLM_BEAM_SHARED_PREFIX_MAX_TAIL` tokens runs
+  without CUDA graphs (on this library), so long generations stay correct but those steps are slower.
+- The library allocates a float workspace (about 400 MB at 128 requests of 96 beams, 32 heads of
+  size 128) on the first beam step, after the KV cache is sized; leave that much GPU memory free.
 
 ## Usage
 
@@ -56,7 +60,7 @@ workload.
 | Variable | Default | Meaning |
 |---|---|---|
 | `TLLM_BEAM_SHARED_PREFIX_BACKEND` | `fa2` | Prefix kernel: FlashInfer `fa2`, `fa3` or `auto`, or `fa4` for the FlashAttention-4 kernels shared with the n-sample shared-prefix library (SM90, bf16, head size 64 or 128; otherwise the library declines with a warning). |
-| `TLLM_BEAM_SHARED_PREFIX_MAX_TAIL` | `8` | Most generated tokens per beam under CUDA graphs, where the length of each beam's own part must be fixed when the graph is captured. A longer generation fails at planning time instead of being truncated. Raise it for longer outputs; the per-step cost grows with it, so keep it close to the real output length. |
+| `TLLM_BEAM_SHARED_PREFIX_MAX_TAIL` | `8` | Most generated tokens per beam under CUDA graphs, where the length of each beam's own part must be fixed when the graph is captured. A step in which a beam has generated more tokens runs without CUDA graphs. Raise it for longer outputs to keep graphs for them; the per-step cost grows with it, so keep it close to the real output length. |
 | `TLLM_BEAM_SHARED_PREFIX_FUSED_TAIL` | `1` | Set to `0` to run the tail attention and merge as separate PyTorch ops (the numerical reference). |
 | `TLLM_BEAM_SHARED_PREFIX_CHECK` | `0` | Set to `1` to synchronize after every stage and compare the page table and prefix attention with dense references. Debugging aid; do not use for measurements. |
 
