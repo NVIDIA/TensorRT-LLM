@@ -279,10 +279,17 @@ __forceinline__ __device__ auto convert_type(Tensor<Engine, Layout> const& tenso
 {
     using From_type = typename Engine::value_type;
     constexpr int numel = decltype(size(tensor))::value;
+    static_assert(cosize_v<Layout> == numel, "convert_type requires a contiguous tensor");
     cutlass::NumericArrayConverter<To_type, From_type, numel> convert_op;
     // HACK: this requires tensor to be "contiguous"
     auto frag = convert_op(*reinterpret_cast<cutlass::Array<From_type, numel> const*>(tensor.data()));
-    return make_tensor(make_rmem_ptr<To_type>(&frag), tensor.layout());
+    auto converted = make_tensor<To_type>(tensor.layout());
+    CUTLASS_PRAGMA_UNROLL
+    for (int element_idx = 0; element_idx < numel; ++element_idx)
+    {
+        converted.data()[element_idx] = frag[element_idx];
+    }
+    return converted;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
