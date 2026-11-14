@@ -1605,9 +1605,13 @@ def _launch_mla_decode(
     lse_storage = workspace.lse if lse is None else lse
     if packed_query and int(runtime.query.shape[0]) == 0:
         return runtime.out
+    has_rope = runtime.query.shape[-1] != kv_lora_rank
+    query_latent = runtime.query[..., :kv_lora_rank] if has_rope else runtime.query
     if packed_query:
-        q_latent = runtime.query[..., :kv_lora_rank].permute(1, 2, 0)
-        q_rope = runtime.query[..., kv_lora_rank:].permute(1, 2, 0)
+        q_latent = query_latent.permute(1, 2, 0)
+        q_rope = (
+            runtime.query[..., kv_lora_rank:].permute(1, 2, 0) if has_rope else q_latent
+        )
         out_kernel = runtime.out.permute(1, 2, 0)
         total_q = int(runtime.query.shape[0])
         lse_kernel = (
@@ -1616,21 +1620,25 @@ def _launch_mla_decode(
             else None
         )
     else:
-        q_latent = runtime.query[..., :kv_lora_rank].permute(2, 3, 1, 0)
-        q_rope = runtime.query[..., kv_lora_rank:].permute(2, 3, 1, 0)
+        q_latent = query_latent.permute(2, 3, 1, 0)
+        q_rope = (
+            runtime.query[..., kv_lora_rank:].permute(2, 3, 1, 0)
+            if has_rope
+            else q_latent
+        )
         out_kernel = runtime.out.permute(2, 3, 1, 0)
         lse_kernel = lse_storage.permute(2, 1, 0) if lse_storage is not None else None
     c_latent = (
         runtime.normalized_cache
-        if runtime.normalized_cache.dtype == torch.uint8
+        if runtime.normalized_cache.dtype == torch.uint8 or not has_rope
         else runtime.normalized_cache[..., :kv_lora_rank]
     ).permute(1, 2, 0)
-    c_rope = runtime.normalized_cache[..., kv_lora_rank:].permute(1, 2, 0)
-    if runtime.query.shape[-1] == kv_lora_rank:
-        q_rope = q_latent
-        c_rope = c_latent
     if runtime.extra_cache is not None:
         c_rope = runtime.extra_cache.permute(1, 2, 0)
+    elif has_rope:
+        c_rope = runtime.normalized_cache[..., kv_lora_rank:].permute(1, 2, 0)
+    else:
+        c_rope = c_latent
     page_offsets = block_tables.transpose(0, 1)
     # Persisted FFI callables require positional arguments, including None.
     compiled(
