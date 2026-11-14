@@ -31,6 +31,7 @@ from tensorrt_llm._torch.models.modeling_speculative import (
     MTPForCausalLM,
     SpecDecOneEngineForCausalLM,
     _build_mtp_one_model_draft,
+    _check_d2t_matches_t2d,
     _copy_model_config_with_moe_backend,
     _set_draft_kv_cache_quant_algo,
     external_drafter_config_kwargs,
@@ -235,6 +236,177 @@ def test_apply_eagle3_fc_with_fc_norm(num_capture_layers):
         "fc_norm should apply per-chunk normalization which differs from "
         "whole-tensor normalization"
     )
+
+
+# ---------------------------------------------------------------------------
+# Eagle3 d2t / t2d consistency at load time
+# ---------------------------------------------------------------------------
+
+# Offsets reach past 256, beyond BF16's exact integer range, as in real drafts.
+_TARGET_VOCAB_SIZE = 1024
+_DRAFT_VOCAB_SIZE = 32
+
+
+def _make_vocab_maps() -> tuple[torch.Tensor, torch.Tensor]:
+    """Exact maps selecting 32 target ids spread over the target vocab."""
+    target_ids = torch.arange(5, _TARGET_VOCAB_SIZE, 32)
+    t2d = torch.zeros(_TARGET_VOCAB_SIZE, dtype=torch.bool)
+    t2d[target_ids] = True
+    d2t = target_ids - torch.arange(_DRAFT_VOCAB_SIZE)
+    return t2d, d2t
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("dtype", [torch.int64, torch.int32, torch.float32])
+def test_check_d2t_accepts_matching_maps(dtype: torch.dtype) -> None:
+    t2d, d2t = _make_vocab_maps()
+    assert d2t.max() > 256
+    _check_d2t_matches_t2d(t2d, d2t.to(dtype))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.int64])
+def test_check_d2t_accepts_integer_mask_t2d(dtype: torch.dtype) -> None:
+    """A 0/1 mask stored as integers is a mask, not an inverse map."""
+    t2d, d2t = _make_vocab_maps()
+    _check_d2t_matches_t2d(t2d.to(dtype), d2t)
+
+
+@pytest.mark.cpu_only
+def test_check_d2t_accepts_permuted_maps() -> None:
+    """Draft ids need not follow target id order, e.g. a frequency-ordered draft vocab."""
+    t2d, _ = _make_vocab_maps()
+    target_ids = t2d.nonzero().squeeze(-1)[
+        torch.randperm(_DRAFT_VOCAB_SIZE, generator=torch.Generator().manual_seed(0))
+    ]
+    d2t = target_ids - torch.arange(_DRAFT_VOCAB_SIZE)
+    assert not torch.equal(target_ids, target_ids.sort().values)
+    _check_d2t_matches_t2d(t2d, d2t)
+
+
+@pytest.mark.cpu_only
+def test_check_d2t_checks_index_map_t2d() -> None:
+    """Some drafts store t2d as the inverse map, t2d[i + d2t[i]] == i, not a mask."""
+    _, d2t = _make_vocab_maps()
+    draft_ids = torch.arange(_DRAFT_VOCAB_SIZE)
+    t2d = torch.zeros(_TARGET_VOCAB_SIZE, dtype=torch.int64)
+    t2d[draft_ids + d2t] = draft_ids
+    _check_d2t_matches_t2d(t2d, d2t)
+
+    swapped = d2t.clone()
+    swapped[[1, 2]] = d2t[[2, 1]] + torch.tensor([1, -1])  # Ids 1 and 2 swap targets.
+    with pytest.raises(ValueError, match=f"2 of {_DRAFT_VOCAB_SIZE} draft ids"):
+        _check_d2t_matches_t2d(t2d, swapped)
+
+
+@pytest.mark.cpu_only
+def test_check_d2t_rejects_bf16_rounded_d2t() -> None:
+    t2d, d2t = _make_vocab_maps()
+    rounded = d2t.to(torch.bfloat16).to(torch.int64)
+    marked = set(t2d.nonzero().squeeze(-1).tolist())
+    reached = set((torch.arange(_DRAFT_VOCAB_SIZE) + rounded).tolist()) & marked
+    num_wrong = _DRAFT_VOCAB_SIZE - len(reached)
+    assert num_wrong > 0
+
+    with pytest.raises(ValueError, match=f"{num_wrong} of {_DRAFT_VOCAB_SIZE} draft ids"):
+        _check_d2t_matches_t2d(t2d, rounded)
+    # The same map stored in BF16 is checked on the offsets it rounds to.
+    with pytest.raises(ValueError, match=f"{num_wrong} of {_DRAFT_VOCAB_SIZE} draft ids"):
+        _check_d2t_matches_t2d(t2d, d2t.to(torch.bfloat16))
+
+
+@pytest.mark.cpu_only
+def test_check_d2t_rejects_absolute_ids() -> None:
+    """A d2t holding absolute target ids instead of offsets is rejected."""
+    t2d = torch.zeros(_TARGET_VOCAB_SIZE, dtype=torch.bool)
+    t2d[:_DRAFT_VOCAB_SIZE] = True
+    absolute_ids = torch.arange(_DRAFT_VOCAB_SIZE)
+
+    # Draft id i maps to 2 * i, which t2d marks only for i < 16.
+    with pytest.raises(ValueError, match=f"16 of {_DRAFT_VOCAB_SIZE} draft ids"):
+        _check_d2t_matches_t2d(t2d, absolute_ids)
+
+
+@pytest.mark.cpu_only
+def test_check_d2t_rejects_duplicate_target_ids() -> None:
+    t2d, d2t = _make_vocab_maps()
+    duplicated = d2t.clone()
+    duplicated[1] = d2t[0] - 1  # Draft id 1 maps to draft id 0's target id.
+
+    with pytest.raises(ValueError, match=f"1 of {_DRAFT_VOCAB_SIZE} draft ids"):
+        _check_d2t_matches_t2d(t2d, duplicated)
+
+
+@pytest.mark.cpu_only
+def test_check_d2t_rejects_out_of_range_target_id() -> None:
+    t2d, d2t = _make_vocab_maps()
+    past_end = d2t.clone()
+    past_end[-1] = _TARGET_VOCAB_SIZE - (_DRAFT_VOCAB_SIZE - 1)  # One past the last target id.
+
+    with pytest.raises(ValueError, match=f"1 of {_DRAFT_VOCAB_SIZE} draft ids"):
+        _check_d2t_matches_t2d(t2d, past_end)
+
+
+@pytest.mark.cpu_only
+def test_check_d2t_rejects_negative_target_id() -> None:
+    t2d, d2t = _make_vocab_maps()
+    wrapped = d2t.clone()
+    # Maps to -27, which would index the same marked id as the correct target 997.
+    wrapped[-1] -= _TARGET_VOCAB_SIZE
+
+    with pytest.raises(ValueError, match=f"1 of {_DRAFT_VOCAB_SIZE} draft ids"):
+        _check_d2t_matches_t2d(t2d, wrapped)
+
+
+@pytest.mark.cpu_only
+def test_check_d2t_rejects_size_mismatch() -> None:
+    t2d, d2t = _make_vocab_maps()
+
+    with pytest.raises(ValueError, match="t2d marks 32 target ids but d2t has 31"):
+        _check_d2t_matches_t2d(t2d, d2t[:-1])
+
+
+@pytest.mark.cpu_only
+def test_check_d2t_skips_absent_maps() -> None:
+    t2d, d2t = _make_vocab_maps()
+    _check_d2t_matches_t2d(None, d2t)
+    _check_d2t_matches_t2d(t2d, None)
+
+
+@pytest.mark.cpu_only
+def test_check_d2t_rejects_all_zero_t2d() -> None:
+    _, d2t = _make_vocab_maps()
+    zeros = torch.zeros(_TARGET_VOCAB_SIZE, dtype=torch.bool)
+
+    with pytest.raises(ValueError, match=f"{_DRAFT_VOCAB_SIZE} of {_DRAFT_VOCAB_SIZE} draft ids"):
+        _check_d2t_matches_t2d(zeros, d2t)
+
+
+@pytest.mark.cpu_only
+def test_eagle3_load_weights_rejects_mismatched_d2t() -> None:
+    """The check runs before any weight is loaded into the model."""
+    t2d, d2t = _make_vocab_maps()
+    weights = {"t2d": t2d, "d2t": d2t.to(torch.bfloat16).to(torch.int64)}
+    draft = SimpleNamespace(model=SimpleNamespace(d2t=torch.empty(_DRAFT_VOCAB_SIZE)))
+
+    with pytest.raises(ValueError, match="d2t does not match t2d"):
+        Eagle3ForCausalLM.load_weights(draft, weights, MagicMock())
+
+
+@pytest.mark.cpu_only
+def test_eagle3_load_weights_skips_d2t_check_for_full_vocab_draft() -> None:
+    """A full-vocab draft holds no d2t, so stale maps in its checkpoint load as before."""
+    t2d, d2t = _make_vocab_maps()
+    weights = {"t2d": t2d, "d2t": d2t.to(torch.bfloat16).to(torch.int64)}
+    draft = Eagle3ForCausalLM.__new__(Eagle3ForCausalLM)
+    vars(draft).update(
+        model=SimpleNamespace(num_layers=1), _use_mla=False, load_lm_head_from_target=True
+    )
+
+    with patch(f"{_BASE_CLS}.load_weights") as base_load_weights:
+        Eagle3ForCausalLM.load_weights(draft, weights, MagicMock())
+
+    assert base_load_weights.call_args.kwargs["weights"]["model.d2t"] is weights["d2t"]
 
 
 # ---------------------------------------------------------------------------

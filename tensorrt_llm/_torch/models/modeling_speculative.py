@@ -61,6 +61,54 @@ def _ensure_draft_vocab_size(config: PretrainedConfig) -> None:
     config.draft_vocab_size = config.vocab_size
 
 
+def _check_d2t_matches_t2d(t2d: Optional[torch.Tensor],
+                           d2t: Optional[torch.Tensor]) -> None:
+    """Raise if ``arange + d2t`` does not map onto the target ids marked by ``t2d``.
+
+    Each draft id ``i`` must map to a distinct target id ``i + d2t[i]`` that
+    ``t2d`` marks, and every marked id must be reached; the order is free.
+    A ``t2d`` that holds draft ids instead of a 0/1 mask is an inverse map,
+    and then ``t2d[i + d2t[i]]`` must be ``i``.
+
+    Args:
+        t2d: The checkpoint's target-to-draft mask or inverse map, or None if
+            absent.
+        d2t: The checkpoint's draft-to-target offsets, or None if absent.
+
+    Nothing is checked when either map is absent.
+    """
+    if t2d is None or d2t is None:
+        return
+    # Maps may be lazy safetensors slices; [:] materializes them.
+    t2d, d2t = t2d[:], d2t[:]
+    # Use the integer offsets the int32 d2t parameter will hold, also for
+    # maps stored in floating point.
+    draft_ids = torch.arange(len(d2t), device=d2t.device)
+    mapped = draft_ids + d2t.long()
+    in_range = (mapped >= 0) & (mapped < len(t2d))
+    if t2d.dtype != torch.bool and t2d.max() > 1:
+        num_wrong = len(d2t) - int(
+            (t2d[mapped[in_range]].long() == draft_ids[in_range]).sum())
+        if num_wrong:
+            raise ValueError(
+                f"d2t does not match t2d: {num_wrong} of {len(d2t)} draft "
+                "ids map to an out-of-range target id or one that t2d maps "
+                "to another draft id.")
+        return
+    t2d, mapped = t2d.bool(), mapped[in_range]
+    num_reached = mapped[t2d[mapped]].unique().numel()
+    if num_reached != len(d2t):
+        raise ValueError(
+            f"d2t does not match t2d: {len(d2t) - num_reached} of {len(d2t)} "
+            "draft ids map to an unmarked, out-of-range or duplicate target id."
+        )
+    num_marked = int(t2d.count_nonzero())
+    if num_marked != len(d2t):
+        raise ValueError(
+            f"d2t does not match t2d: t2d marks {num_marked} target ids "
+            f"but d2t has {len(d2t)} entries.")
+
+
 def _set_draft_kv_cache_quant_algo(draft_config: ModelConfig,
                                    target_config: ModelConfig) -> None:
     """Inherit the target KV dtype unless the model requests a draft override."""
@@ -1085,6 +1133,9 @@ class Eagle3ForCausalLM(DecoderModelForCausalLM[Eagle3DraftModel,
         )
 
     def load_weights(self, weights: Dict, weight_mapper: BaseWeightMapper):
+        """Check the draft's vocab maps, then load the draft weights."""
+        if hasattr(self.model, "d2t"):
+            _check_d2t_matches_t2d(weights.get("t2d"), weights.get("d2t"))
         # Remap weight names: some Eagle3 checkpoints use "layers.X.*" naming convention
         # while the model expects "midlayer.*" naming. Handle both formats.
         import re
