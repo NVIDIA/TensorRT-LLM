@@ -306,7 +306,7 @@ class ServeTestEnv:
             ):
                 pool = getattr(server, pool_name, None)
                 if pool is not None:
-                    pool.shutdown(wait=False, cancel_futures=True)
+                    pool.shutdown(wait=True, cancel_futures=True)
         self._servers.clear()
 
 

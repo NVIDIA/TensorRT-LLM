@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import json
+from types import SimpleNamespace
 
 import click
 import pytest
@@ -98,7 +99,7 @@ def test_supported_user_architecture_override_wins(monkeypatch):
 
     def fake_llm(**kwargs):
         captured["llm_kwargs"] = kwargs
-        return object()
+        return SimpleNamespace(args=SimpleNamespace(serve_graceful_shutdown_timeout_s=None))
 
     class FakeServer:
         def __init__(self, **kwargs):
