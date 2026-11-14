@@ -57,7 +57,7 @@ from typing import TYPE_CHECKING, Any, Iterator, Sequence
 from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
-    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+    from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm.mapping import Mapping
 
 _WORKER_BOOTSTRAP = """
@@ -175,10 +175,11 @@ def precompile_payloads(payloads: Sequence[dict[str, Any]], *, local_ranks: int 
     try:
         session = _session.get()
         if session is not None:
-            if session.group is None:
+            if session.consumed:
                 return
-            workers = len(session.group.procs)
-            ok = session.run(payloads)
+            if session.group is not None:
+                workers = len(session.group.procs)
+            ok = session.run(payloads, workers)
         else:
             ok = run_precompile_workers(payloads, workers)
     except Exception as error:  # noqa: BLE001 -- helper failures fall back to local planning
@@ -324,17 +325,22 @@ def run_precompile_workers(payloads: Sequence[dict[str, Any]], workers: int) -> 
 class PrecompileSession:
     """Own a single worker group across profiling and serving warmup passes.
 
-    Workers exit after their first batch. Subsequent passes use normal local
-    planning, including compilation of any profiles first encountered there.
+    Workers start from the resolved model config, or from the first actual
+    payload if no group was started early. They exit after their first batch.
+    Subsequent passes use normal local planning, including compilation of any
+    profiles first encountered there.
     No successful export is treated as a substitute for loading a parent plan.
     """
 
     def __init__(self) -> None:
         self.group: _WorkerGroup | None = None
+        self.consumed = False
 
-    def start(self, llm_args: TorchLlmArgs, mapping: Mapping) -> None:
-        sparse = llm_args.sparse_attention_config
-        if llm_args.attn_backend != "TRTLLM" or getattr(sparse, "algorithm", None) != "deepseek_v4":
+    def start(self, config: ModelConfig, mapping: Mapping) -> None:
+        if self.group is not None or self.consumed:
+            return
+        sparse = config.sparse_attention_config
+        if config.attn_backend != "TRTLLM" or getattr(sparse, "algorithm", None) != "deepseek_v4":
             return
         from tensorrt_llm._utils import get_sm_version
 
@@ -353,9 +359,11 @@ class PrecompileSession:
                 raise
             logger.warning(f"PrimTS sparse MLA early precompile skipped: {error!r}")
 
-    def run(self, payloads: Sequence[dict[str, Any]]) -> bool:
-        assert self.group is not None
+    def run(self, payloads: Sequence[dict[str, Any]], workers: int) -> bool:
+        self.consumed = True
         try:
+            if self.group is None:
+                return run_precompile_workers(payloads, workers)
             return self.group.run(payloads)
         finally:
             self.group = None
@@ -380,16 +388,10 @@ def precompile_session() -> Iterator[PrecompileSession]:
             _session.reset(token)
 
 
-def start_precompile_workers(llm_args: TorchLlmArgs, mapping: Mapping) -> None:
+def start_precompile_workers(config: ModelConfig, mapping: Mapping) -> None:
     session = _session.get()
     if session is not None:
-        session.start(llm_args, mapping)
-
-
-def close_precompile_workers() -> None:
-    session = _session.get()
-    if session is not None:
-        session.close()
+        session.start(config, mapping)
 
 
 def _plan(mla_decode, payload: dict[str, Any], torch) -> None:
