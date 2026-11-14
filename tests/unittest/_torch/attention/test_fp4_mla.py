@@ -3289,7 +3289,9 @@ def test_fp4_mla_mtp_context_to_generation_refreshes_page_bound(
             ),
             kv_cache_manager=manager,
             request_ids=list(range(batch_size)),
-            prompt_lens=[length - 1 for length in final_lengths],
+            prompt_lens=[
+                cached + length for cached, length in zip(cached_lengths, sequence_lengths)
+            ],
             runtime_features=trtllm_backend.AttentionRuntimeFeatures(
                 has_speculative_draft_tokens=True
             ),
