@@ -115,14 +115,29 @@ def rgba_to_rgb(
     return converted
 
 
+def _has_transparency(image: Image.Image) -> bool:
+    """Whether *image* has an alpha channel, a transparent index / color key or an RGBA palette."""
+    if image.mode in ("RGBA", "LA", "PA") or "transparency" in image.info:
+        return True
+    # ``Image.apply_transparency`` moves a palette's transparency into an RGBA
+    # palette and drops ``info["transparency"]``; the image stays mode "P".
+    return image.mode == "P" and image.palette is not None and image.palette.mode == "RGBA"
+
+
 def convert_image_mode(image: Image.Image, to_mode: str) -> Image.Image:
-    """Convert image to specified mode with proper handling of RGBA to RGB conversion."""
+    """Convert image to specified mode with proper handling of RGBA to RGB conversion.
+
+    Every image with transparency is flattened onto the same white background
+    when converted to RGB, not only ``RGBA`` ones: ``LA``, palette images with a
+    transparent index (PNG, GIF), and grayscale or RGB images with a color key.
+    """
+    if to_mode == "RGB" and _has_transparency(image):
+        if image.mode != "RGBA":
+            image = image.convert("RGBA")
+        return rgba_to_rgb(image)
     if image.mode == to_mode:
         return image
-    elif image.mode == "RGBA" and to_mode == "RGB":
-        return rgba_to_rgb(image)
-    else:
-        return image.convert(to_mode)
+    return image.convert(to_mode)
 
 
 # Output representations supported by `ImageMediaIO`:
