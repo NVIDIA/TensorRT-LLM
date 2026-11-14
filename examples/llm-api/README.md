@@ -19,6 +19,13 @@ python3 quickstart_advanced.py --model_dir nvidia/Llama-3_1-Nemotron-Ultra-253B-
 python3 quickstart_advanced.py --model_dir nvidia/NVIDIA-Nemotron-Nano-9B-v2 --disable_kv_cache_reuse --max_batch_size 8
 ```
 
+## Run the startup time script:
+
+```bash
+# Run 32 random requests, then print the startup time metrics
+python3 llm_startup_time.py --model meta-llama/Llama-3.1-8B-Instruct --num_requests 32 --input_len 512 --output_len 128
+```
+
 ## Run the multimodal example script:
 
 ```bash
