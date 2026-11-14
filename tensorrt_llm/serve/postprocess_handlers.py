@@ -56,7 +56,8 @@ from .openai_protocol import (ChatCompletionLogProbs,
                               ResponsesResponse, SpeculativeDecodingStats,
                               StreamOptions, ToolCall, UsageInfo,
                               to_disaggregated_params)
-from .tool_parser.base_tool_parser import (BaseToolParser,
+from .tool_parser.base_tool_parser import (TRUNCATED_FINISH_REASONS,
+                                           BaseToolParser,
                                            warn_if_tool_call_unparsed)
 from .tool_parser.core_types import StreamingParseResult, ToolCallItem
 from .tool_parser.tool_parser_factory import ToolParserFactory
@@ -308,11 +309,20 @@ def apply_reasoning_parser(args: ChatPostprocArgs,
     return content, reasoning_content
 
 
-def apply_tool_parser(args: ChatPostprocArgs,
-                      output_index: int,
-                      text: str,
-                      streaming: bool,
-                      finished: bool = False) -> Tuple[str, List[ToolCallItem]]:
+def apply_tool_parser(
+        args: ChatPostprocArgs,
+        output_index: int,
+        text: str,
+        streaming: bool,
+        finished: bool = False,
+        truncated: Optional[bool] = None) -> Tuple[str, List[ToolCallItem]]:
+    """Run the tool parser over ``text``.
+
+    ``truncated`` applies to a whole-text parse (``streaming`` False): when it
+    is not None, ``text`` is a finished generation and ``truncated`` says
+    whether it was cut off, so the parser can recover a call the output ended
+    inside, as ``finish`` does for a stream.
+    """
     tool_parser = None
     tools = args.tools
     if args.tool_parser is not None and tools is not None:
@@ -325,7 +335,9 @@ def apply_tool_parser(args: ChatPostprocArgs,
 
     if tool_parser is not None and tools is not None:
         if not streaming:
-            result = tool_parser.detect_and_parse(text, tools)
+            result = (tool_parser.detect_and_parse(text, tools)
+                      if truncated is None else tool_parser.parse_finished(
+                          text, tools, truncated=truncated))
         else:
             result = tool_parser.parse_streaming_increment(text, tools)
             if finished:
@@ -735,8 +747,12 @@ def chat_response_post_processor(
             # The parser extracts the forced call from the model's native
             # markup; any free-text preamble becomes content per OpenAI
             # semantics.
-            text, calls = apply_tool_parser(args, output.index, text or "",
-                                            False)
+            text, calls = apply_tool_parser(args,
+                                            output.index,
+                                            text or "",
+                                            False,
+                                            truncated=output.finish_reason
+                                            in TRUNCATED_FINISH_REASONS)
             if calls:
                 forced_name = _forced_call_name(calls,
                                                 forced_tool.function.name)
@@ -761,7 +777,12 @@ def chat_response_post_processor(
                                       content=text,
                                       reasoning_content=reasoning_text)
         else:
-            text, calls = apply_tool_parser(args, output.index, text, False)
+            text, calls = apply_tool_parser(args,
+                                            output.index,
+                                            text,
+                                            False,
+                                            truncated=output.finish_reason
+                                            in TRUNCATED_FINISH_REASONS)
             tool_calls = [
                 ToolCall(function=FunctionCall(name=call.name or "",
                                                arguments=call.parameters))
