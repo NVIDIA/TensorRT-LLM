@@ -146,8 +146,8 @@ class ServingRender:
         except ValueError as error:
             raise RenderRequestError(400, str(error)) from error
         except RuntimeError as error:
-            # Harmony reports messages it cannot convert (a tool without a description,
-            # null content) as a RuntimeError; the chat route answers those with a 400.
+            # Harmony reports messages it cannot convert (tool-call arguments that are not a
+            # string, null content) as a RuntimeError; the chat route answers those with a 400.
             if not resources.use_harmony:
                 raise
             raise RenderRequestError(400, str(error)) from error

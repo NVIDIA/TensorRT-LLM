@@ -766,6 +766,11 @@ _WEATHER_TOOL = {
         "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
     },
 }
+_READ_PARAMETERS = {
+    "type": "object",
+    "properties": {"path": {"type": "string"}},
+    "required": ["path"],
+}
 
 
 class TestExtensionHooks:
@@ -787,7 +792,7 @@ class TestExtensionHooks:
         assert extension.render_prompt(request) is None
         assert extension.output_mode() is serving_extensions.OutputMode.TEXT
         assert extension.allows_required_tool_choice() is False
-        assert extension.serialize_tool(request.tools[0]) == request.tools[0].model_dump()
+        assert extension.serialize_tool(request.tools[0]) == _WEATHER_TOOL
         assert extension.dynamic_tools(request.messages) == []
         assert (
             extension.prompt_tokens_excluded_from_usage(
@@ -795,6 +800,83 @@ class TestExtensionHooks:
             )
             == 0
         )
+
+    @pytest.mark.parametrize("model_type", [None, "deepseek_v41", "kimi_k3", "nemotron_h"])
+    @pytest.mark.parametrize(
+        "function",
+        [
+            pytest.param(
+                {"name": "read", "description": "Read a file.", "parameters": _READ_PARAMETERS},
+                id="no_strict",
+            ),
+            pytest.param(
+                {"name": "read", "parameters": _READ_PARAMETERS, "strict": True}, id="strict"
+            ),
+            pytest.param(
+                {"name": "read", "parameters": _READ_PARAMETERS, "strict": False},
+                id="strict_false",
+            ),
+            pytest.param(
+                {
+                    "name": "find",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"limit": {"type": ["integer", "null"], "default": None}},
+                    },
+                },
+                id="null_inside_parameters",
+            ),
+        ],
+    )
+    def test_a_tool_is_dumped_with_only_the_fields_the_client_set(
+        self, model_type, function
+    ) -> None:
+        """No unset field reaches the template as ``null``; every set one does, as sent."""
+        tool = {"type": "function", "function": function}
+        extension = serving_extensions.get_serving_extension(model_type)
+
+        assert extension.serialize_tool(_chat_request(tools=[tool]).tools[0]) == tool
+
+    @pytest.mark.parametrize("model_type", [None, "deepseek_v41", "kimi_k3"])
+    def test_a_null_optional_field_is_left_out_like_an_unset_one(self, model_type) -> None:
+        sent = {
+            "type": "function",
+            "function": {
+                "name": "read",
+                "description": None,
+                "parameters": _READ_PARAMETERS,
+                "strict": None,
+            },
+        }
+        extension = serving_extensions.get_serving_extension(model_type)
+
+        assert extension.serialize_tool(_chat_request(tools=[sent]).tools[0]) == {
+            "type": "function",
+            "function": {"name": "read", "parameters": _READ_PARAMETERS},
+        }
+
+    @pytest.mark.parametrize(
+        "model_type, dumped_parameters",
+        [
+            # Chat templates read ``tool.function.parameters`` by name and fail when it is missing.
+            pytest.param(None, {"parameters": None}, id="generic"),
+            pytest.param("nemotron_h", {"parameters": None}, id="nemotron_h"),
+            # These checkpoints' own renderers print each tool as JSON, as the client declared it.
+            pytest.param("deepseek_v41", {}, id="deepseek_v41"),
+            pytest.param("kimi_k3", {}, id="kimi_k3"),
+        ],
+    )
+    @pytest.mark.parametrize("sent", [{}, {"parameters": None}], ids=["unset", "null"])
+    def test_a_tool_without_parameters_is_dumped_for_its_renderer(
+        self, model_type, dumped_parameters, sent
+    ) -> None:
+        tool = {"type": "function", "function": {"name": "noop", **sent}}
+        extension = serving_extensions.get_serving_extension(model_type)
+
+        assert extension.serialize_tool(_chat_request(tools=[tool]).tools[0]) == {
+            "type": "function",
+            "function": {"name": "noop", **dumped_parameters},
+        }
 
     def test_load_builtin_extensions_keeps_its_private_alias(self) -> None:
         assert (
@@ -851,7 +933,12 @@ class TestExtensionHooks:
         return serving_extensions.get_serving_extension("deepseek_v41")
 
     @staticmethod
-    def _namespaced_tool(namespace="multi_agent_v1", name="spawn_agent", description=None):
+    def _namespaced_tool(
+        namespace="multi_agent_v1",
+        name="spawn_agent",
+        description=None,
+        namespace_description="Sub-agents.",
+    ):
         from tensorrt_llm.serve.openai_protocol import (
             FunctionDefinition,
             NamespacedFunctionToolParam,
@@ -860,19 +947,20 @@ class TestExtensionHooks:
         return NamespacedFunctionToolParam(
             function=FunctionDefinition(
                 name=f"{namespace}.{name}",
-                description=description or "Sub-agents.",
+                description=description or namespace_description,
                 parameters={"type": "object", "properties": {}},
             ),
             namespace=namespace,
-            namespace_description="Sub-agents.",
+            namespace_description=namespace_description,
             declared_name=name,
             declared_description=description,
         )
 
     def test_deepseek_v41_dumps_a_tool_without_a_namespace_unchanged(self, deepseek_v41) -> None:
         tool = _chat_request(tools=[_WEATHER_TOOL]).tools[0]
+        generic = serving_extensions.get_serving_extension(None)
 
-        assert deepseek_v41.serialize_tool(tool) == tool.model_dump()
+        assert deepseek_v41.serialize_tool(tool) == generic.serialize_tool(tool)
 
     def test_other_models_get_a_namespaced_tool_as_a_plain_function(self) -> None:
         from tensorrt_llm.serve.openai_protocol import ChatCompletionToolsParam
@@ -885,22 +973,29 @@ class TestExtensionHooks:
             extension = serving_extensions.get_serving_extension(model_type)
             assert extension.serialize_tool(tool) == extension.serialize_tool(plain)
 
+    @pytest.mark.parametrize("namespace_description", ["Sub-agents.", None])
     @pytest.mark.parametrize("description", [None, "Spawn one."])
     def test_deepseek_v41_dumps_a_namespaced_tool_in_the_checkpoint_form(
-        self, deepseek_v41, description
+        self, deepseek_v41, description, namespace_description
     ) -> None:
-        """The namespace beside the function, as the checkpoint's encoder reads it."""
-        tool = self._namespaced_tool(description=description)
+        """The namespace beside the function, as the checkpoint's encoder reads it.
+
+        Only what was declared: no description the tool or its namespace left out.
+        """
+        tool = self._namespaced_tool(
+            description=description, namespace_description=namespace_description
+        )
+        namespace = {"name": "multi_agent_v1", "description": namespace_description}
+        function = {
+            "name": "spawn_agent",
+            "description": description,
+            "parameters": {"type": "object", "properties": {}},
+        }
 
         assert deepseek_v41.serialize_tool(tool) == {
             "type": "function",
-            "namespace": {"name": "multi_agent_v1", "description": "Sub-agents."},
-            "function": {
-                "name": "spawn_agent",
-                "description": description,
-                "parameters": {"type": "object", "properties": {}},
-                "strict": None,
-            },
+            "namespace": {key: value for key, value in namespace.items() if value is not None},
+            "function": {key: value for key, value in function.items() if value is not None},
         }
 
     @pytest.mark.parametrize("namespace, name", [("a::b", "tool"), ("ns", "a::tool")])
@@ -908,5 +1003,6 @@ class TestExtensionHooks:
         self, deepseek_v41, namespace, name
     ) -> None:
         tool = self._namespaced_tool(namespace=namespace, name=name)
+        generic = serving_extensions.get_serving_extension(None)
 
-        assert deepseek_v41.serialize_tool(tool) == tool.model_dump()
+        assert deepseek_v41.serialize_tool(tool) == generic.serialize_tool(tool)

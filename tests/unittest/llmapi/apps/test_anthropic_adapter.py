@@ -50,7 +50,7 @@ from tensorrt_llm.serve.openai_protocol import (
     UsageInfo,
     _response_format_to_guided_decoding_params,
 )
-from tensorrt_llm.serve.serving_extensions import apply_model_chat_extensions
+from tensorrt_llm.serve.serving_extensions import apply_model_chat_extensions, get_serving_extension
 
 # These tests are CPU-only (no GPU, engine or sockets) and run in the
 # CPU-Generic CI stage, which selects with `-m cpu_only`.
@@ -548,6 +548,37 @@ def test_client_tool_with_a_schema_is_converted(tool):
     assert chat.tools[0].function.parameters == tool["input_schema"]
     # tools present and no explicit tool_choice -> auto
     assert chat.tool_choice == "auto"
+
+
+_READ_SCHEMA = {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}
+
+
+@pytest.mark.parametrize("model_type", [None, "deepseek_v41"], ids=["generic", "deepseek_v41"])
+@pytest.mark.parametrize(
+    "declared",
+    [
+        pytest.param({"name": "read", "input_schema": _READ_SCHEMA}, id="schema_only"),
+        pytest.param(
+            {"name": "read", "description": "Read a file.", "input_schema": _READ_SCHEMA},
+            id="described",
+        ),
+        pytest.param({"name": "read", "input_schema": _READ_SCHEMA, "strict": True}, id="strict"),
+    ],
+)
+def test_a_converted_tool_reaches_the_template_with_only_the_declared_fields(declared, model_type):
+    """A field the client left out does not reach the chat template as ``null``."""
+    chat = convert_anthropic_request(make_request(tools=[declared]))
+    function = {"name": "read"}
+    if "description" in declared:
+        function["description"] = declared["description"]
+    function["parameters"] = _READ_SCHEMA
+    if "strict" in declared:
+        function["strict"] = declared["strict"]
+    extension = get_serving_extension(model_type)
+
+    assert [extension.serialize_tool(tool) for tool in chat.tools] == [
+        {"type": "function", "function": function}
+    ]
 
 
 @pytest.mark.parametrize(

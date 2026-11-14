@@ -30,15 +30,18 @@ class DeepseekV41ServingExtension(ServingExtension):
     """Tool namespaces in the form the DeepSeek-V4.1 checkpoint takes them."""
 
     def serialize_tool(self, tool) -> Dict[str, Any]:
-        """Dump a namespaced tool with its namespace, any other tool as usual.
+        """Dump a tool with only the fields the client set, a namespaced one with its namespace.
 
-        The checkpoint's encoder reads a ``namespace`` (name and description)
-        beside ``function``. It shows the tool as ``<namespace>::<name>``, the
-        name the model was trained to call it by, and puts the namespace
-        description in front of the tool's own. A tool without a namespace is
-        dumped exactly as on the generic path.
+        The checkpoint's encoder prints each tool as JSON and reads no field by
+        name, so unlike the generic dump, which is made for chat templates, a
+        tool declared without ``parameters`` is dumped without the key. The
+        encoder reads a ``namespace`` (name and description) beside
+        ``function``. It shows the tool as ``<namespace>::<name>``, the name
+        the model was trained to call it by, and puts the namespace description
+        in front of the tool's own. The namespaced form also leaves out a
+        description the tool or its namespace did not declare.
         """
-        dumped = tool.model_dump()
+        dumped = tool.model_dump(exclude_none=True)
         if not isinstance(tool, NamespacedFunctionToolParam):
             return dumped
         if "::" in tool.namespace or "::" in tool.declared_name:
@@ -46,12 +49,15 @@ class DeepseekV41ServingExtension(ServingExtension):
             return dumped
         function = dumped["function"]
         function["name"] = tool.declared_name
-        function["description"] = tool.declared_description
+        if tool.declared_description is None:
+            function.pop("description", None)
+        else:
+            function["description"] = tool.declared_description
+        namespace = {"name": tool.namespace}
+        if tool.namespace_description is not None:
+            namespace["description"] = tool.namespace_description
         return {
             "type": dumped["type"],
-            "namespace": {
-                "name": tool.namespace,
-                "description": tool.namespace_description,
-            },
+            "namespace": namespace,
             "function": function,
         }

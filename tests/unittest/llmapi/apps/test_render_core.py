@@ -21,6 +21,7 @@ import copy
 import dataclasses
 import gc
 import warnings
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -65,6 +66,15 @@ from .render_helpers import (
 
 pytestmark = pytest.mark.cpu_only
 
+# Shipped for ``trtllm-serve --chat_template``; it reads each tool's fields by name.
+_DEEPSEEK_V31_TOOL_TEMPLATE = (
+    Path(__file__).parents[4]
+    / "examples"
+    / "serve"
+    / "chat_templates"
+    / "tool_chat_template_deepseekv31.jinja"
+)
+
 
 @pytest.fixture(scope="module")
 def tokenizer():
@@ -93,14 +103,36 @@ class TestRenderChat:
         assert result.token_ids == ids
         assert result.prefix_applied is False
 
-    def test_tools_reach_the_template(self, tokenizer) -> None:
-        request = chat_request(tools=[WEATHER_TOOL])
-        text, ids = _expected_ids(tokenizer, request, tools=[t.model_dump() for t in request.tools])
+    @pytest.mark.parametrize("strict", [None, True], ids=["no_strict", "strict"])
+    def test_tools_reach_the_template_as_the_client_declared_them(self, tokenizer, strict) -> None:
+        tool = copy.deepcopy(WEATHER_TOOL)
+        if strict is not None:
+            tool["function"]["strict"] = strict
+        request = chat_request(tools=[tool])
+        text, ids = _expected_ids(tokenizer, request, tools=[tool])
 
         result = render_chat(request, resources(tokenizer))
 
-        assert "get_weather" in result.text  # the real template prints the tool schema
+        # The real template prints each tool as JSON: no field the client left out
+        # shows up as null, and one it set is printed.
+        assert "get_weather" in result.text
+        assert ('"strict"' in result.text) is (strict is not None)
+        assert result.text == text
         assert result.token_ids == ids
+
+    def test_a_tool_without_parameters_renders_with_a_template_that_reads_them(
+        self, tokenizer
+    ) -> None:
+        """The template prints ``tool.function.parameters | tojson``: it gets ``null``."""
+        tool = {
+            "type": "function",
+            "function": {"name": "get_time", "description": "Current UTC time"},
+        }
+        res = resources(tokenizer, default_chat_template=_DEEPSEEK_V31_TOOL_TEMPLATE.read_text())
+
+        result = render_chat(chat_request(tools=[tool]), res, tokenize=False)
+
+        assert "\n### get_time\nDescription: Current UTC time\n\nParameters: null\n" in result.text
 
     def test_tokenize_false_leaves_only_the_text(self, tokenizer) -> None:
         result = render_chat(chat_request(), resources(tokenizer), tokenize=False)
@@ -551,6 +583,26 @@ class TestExtensions:
 
         assert low.token_ids != high.token_ids
 
+    def test_harmony_renders_a_tool_without_a_description_like_an_empty_one(
+        self, harmony_vocab
+    ) -> None:
+        def ids(**function):
+            tool = {"type": "function", "function": {"name": "get_weather", **function}}
+            return render_chat(chat_request(tools=[tool]), harmony_resources()).token_ids
+
+        parameters = WEATHER_TOOL["function"]["parameters"]
+        assert ids(parameters=parameters) == ids(description="", parameters=parameters)
+
+    def test_harmony_renders_a_tool_declared_by_name_alone_as_taking_no_arguments(
+        self, harmony_vocab
+    ) -> None:
+        from tensorrt_llm.serve.harmony_adapter import get_harmony_adapter
+
+        tool = {"type": "function", "function": {"name": "get_time"}}
+        ids = render_chat(chat_request(tools=[tool]), harmony_resources()).token_ids
+
+        assert "type get_time = () => any;" in get_harmony_adapter().encoding.decode(ids)
+
     def test_a_gpt_oss_model_without_the_harmony_switch_uses_the_template(
         self, harmony_vocab, tokenizer
     ) -> None:
@@ -657,7 +709,8 @@ class TestRenderConversation:
                     conversation=conversation,
                     mm_placeholder_counts=counts,
                     add_generation_prompt=True,
-                    tools=[tool.model_dump() for tool in request.tools],
+                    # Serialized as the chat route serializes them.
+                    tools=[res.extension.serialize_tool(tool) for tool in request.tools],
                     tokenize=True,
                 ),
                 mm_coroutine,

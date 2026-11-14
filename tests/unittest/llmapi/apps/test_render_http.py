@@ -378,11 +378,20 @@ class TestHarmonyConversionErrors:
     """Harmony reports messages it cannot convert as a RuntimeError; the chat route answers 400."""
 
     def test_a_conversion_failure_is_a_400_not_a_500(self, harmony_vocab) -> None:
-        # A tool without a description: the real Harmony conversion rejects it.
-        body = {
-            **CHAT_BODY,
-            "tools": [{"type": "function", "function": {"name": "f", "parameters": {}}}],
+        # Tool-call arguments sent as an object, not a JSON string: the real Harmony conversion
+        # rejects them.
+        call = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": {"city": "paris"}},
+                }
+            ],
         }
+        body = {**CHAT_BODY, "messages": [*CHAT_BODY["messages"], call], "tools": [WEATHER_TOOL]}
 
         response = TestClient(build_render_app(harmony_resources())).post(
             "/v1/chat/completions/render", json=body
