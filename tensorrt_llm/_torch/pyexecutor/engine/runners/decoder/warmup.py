@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from tensorrt_llm._torch.attention.backends.fmha.prims_ts_mla_warmup import PrimsTSDenseMlaWarmup
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.distributed import Distributed
@@ -287,6 +288,7 @@ class DecoderWarmup:
         self._context_logits_heads = context_logits_heads
         # Token shape of the last autotuner warmup that ran a forward pass.
         self._completed_autotuner_warmup_num_tokens: int | None = None
+        self._prims_ts_dense_mla_warmup = PrimsTSDenseMlaWarmup()
 
     @property
     def guided_decoder(self) -> CapturableGuidedDecoder | None:
@@ -541,6 +543,14 @@ class DecoderWarmup:
         with self._warmup_timer.phase("cuda_graph_capture"):
             self._graphs.warmup_and_capture(resource_manager)
         log_mem_snapshot("warmup/after_cuda_graph_capture")
+        with self._warmup_timer.phase("prims_ts_dense_mla_prewarm"):
+            self._prims_ts_dense_mla_warmup.run(
+                self.model,
+                self._metadata.attn_metadata,
+                max_batch_size=self._config.max_batch_size,
+                max_num_tokens=self._config.max_num_tokens,
+                max_seq_len=self._config.max_seq_len,
+            )
         # Pre-compile DeepGEMM paged_mqa_logits_metadata for every 32-aligned
         # batch bucket the runtime can produce (max_batch_size scaled by the
         # MTP / DSL expansion factor when applicable). CUDA-graph warmup only

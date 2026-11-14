@@ -455,13 +455,16 @@ def _resolve_q_mode(
     qo_indptr: Optional[torch.Tensor],
     max_q_len: Optional[int],
     require_packed_max: bool,
+    validate: bool = True,
 ) -> tuple[bool, Optional[int]]:
     """Resolve fixed versus packed Q without exposing an internal mode knob."""
 
-    seq_len_q = _validate_seq_len_q(seq_len_q)
+    if validate:
+        seq_len_q = _validate_seq_len_q(seq_len_q)
     if qo_indptr is None:
         if max_q_len is not None:
-            max_q_len = _validate_seq_len_q(max_q_len)
+            if validate:
+                max_q_len = _validate_seq_len_q(max_q_len)
             if max_q_len != seq_len_q:
                 raise ValueError(
                     "fixed seq_len_q and max_q_len must agree: "
@@ -479,7 +482,8 @@ def _resolve_q_mode(
                 "workspace/JIT interface"
             )
         return True, None
-    max_q_len = _validate_seq_len_q(max_q_len)
+    if validate:
+        max_q_len = _validate_seq_len_q(max_q_len)
     if seq_len_q != 1 and seq_len_q != max_q_len:
         raise ValueError(
             "seq_len_q and max_q_len must agree when both provide the "
@@ -1229,11 +1233,14 @@ def _decode_scratch_shapes(
             head_ratio * seq_len_q,
             head_dim,
         )
-    partial_stats_shape = (
-        partial_o_shape[:-1]
-        if cfg.use_separate_reduction_kernel
-        else partial_o_shape[:-1] + (2,)
-    )
+    if cfg.use_separate_reduction_kernel:
+        partial_stats_shape = (
+            partial_o_shape[:-1] + (3,)
+            if cfg.store_softmax_stats
+            else partial_o_shape[:-1]
+        )
+    else:
+        partial_stats_shape = partial_o_shape[:-1] + (2,)
     counter_shape = (batch_size, num_kv_heads, num_q_groups)
     return partial_o_shape, partial_stats_shape, counter_shape
 
@@ -1300,6 +1307,7 @@ def _resolve_decode_launch_spec(
     split_kv: bool = True,
     share_pattern_across_kv_heads: bool = True,
     use_attention_sinks: bool = False,
+    store_softmax_stats: bool = False,
 ) -> _DecodeLaunchSpec:
     """Resolve automatic policy and workspace geometry without compiling."""
 
@@ -1503,6 +1511,7 @@ def _resolve_decode_launch_spec(
                     max_splits_kv=safe_splits,
                 )
 
+    cfg.store_softmax_stats = store_softmax_stats
     requested_splits = int(cfg.splits_kv)
     if cfg.use_split_kv and not use_q_token_kv_block_sparse_route:
         sm_count = get_device_sm_count(torch.device("cuda", device_index))
@@ -1675,6 +1684,8 @@ def _get_compiled_decode(
     v_dtype = _cutlass_dtype(v_dtype_key)
     out_dtype = _cutlass_dtype(out_dtype_key)
     cfg = FmhaDecodeConfig(**dict(compile_spec.config_items))
+    if cfg.store_softmax_stats and cfg.use_sage_attention:
+        raise ValueError("store_softmax_stats does not support Sage attention")
     k_storage_dtype = cutlass.Uint8 if k_dtype == cutlass.Float4E2M1FN else k_dtype
     v_storage_dtype = cutlass.Uint8 if v_dtype == cutlass.Float4E2M1FN else v_dtype
     storage_page_size = int(cfg.effective_storage_tokens_per_page)
@@ -1723,6 +1734,7 @@ def _get_compiled_decode(
         max_q_len: cutlass.Int32,
         direct_q1_inputs: tuple,
         runtime_max_kv_len: cutlass.Int32,
+        softmax_stats: cute.Tensor | None,
         stream: cuda_drv.CUstream,
         static_cfg: cutlass.Constexpr[FmhaDecodeConfig],
         static_num_qo_heads: cutlass.Constexpr[int],
@@ -1836,6 +1848,9 @@ def _get_compiled_decode(
                 if static_cfg.use_split_kv
                 else max_q_len * Int32(static_num_qo_heads // static_num_kv_heads)
             ),
+            softmax_stats_iter=(
+                softmax_stats.iterator if softmax_stats is not None else None
+            ),
         )
 
     reduction_tensor_adapter = None
@@ -1857,6 +1872,8 @@ def _get_compiled_decode(
             max_q_len: cutlass.Int32,
             direct_q1_inputs: tuple,
             runtime_max_kv_len: cutlass.Int32,
+            softmax_stats: cute.Tensor | None,
+            stats_scale: cutlass.Float32 | cute.Tensor | None,
             stream: cuda_drv.CUstream,
             static_cfg: cutlass.Constexpr[FmhaDecodeConfig],
             static_num_qo_heads: cutlass.Constexpr[int],
@@ -1914,6 +1931,14 @@ def _get_compiled_decode(
                 if static_cfg.runtime_split_kv
                 else None,
                 runtime_q_capacity_rows=Int32(partial_o.shape[-2]),
+                softmax_stats_iter=(
+                    softmax_stats.iterator if softmax_stats is not None else None
+                ),
+                softmax_scale=(
+                    stats_scale.iterator
+                    if isinstance(stats_scale, cute.Tensor)
+                    else stats_scale
+                ),
             )
 
     physical_pages = cute.sym_int()
@@ -2047,6 +2072,11 @@ def _get_compiled_decode(
     else:
         k_sf_fake = fake_compact(cutlass.Uint8, (1,), 1)
         v_sf_fake = fake_compact(cutlass.Uint8, (1,), 1)
+    softmax_stats_fake = (
+        fake_compact(Float32, out_shape[:-1] + (2,), 4)
+        if cfg.store_softmax_stats
+        else None
+    )
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     direct_q1_fake: tuple = ()
     if direct_q1_spec is not None:
@@ -2125,6 +2155,7 @@ def _get_compiled_decode(
                 Int32(0),
                 direct_q1_fake,
                 Int32(0),
+                softmax_stats_fake,
                 stream_fake,
                 cfg,
                 num_qo_heads,
@@ -2142,7 +2173,15 @@ def _get_compiled_decode(
             compiled_reducer = build_and_load_attention_kernel(
                 "decode",
                 "reducer",
-                replace(compile_spec, scale_types=(False, False)),
+                replace(
+                    compile_spec,
+                    scale_types=(
+                        compile_spec.scale_types[0]
+                        if cfg.store_softmax_stats
+                        else False,
+                        False,
+                    ),
+                ),
                 _COMPILE_OPTIONS,
                 lambda: cute.compile(
                     reduction_tensor_adapter,
@@ -2157,6 +2196,10 @@ def _get_compiled_decode(
                     Int32(0),
                     direct_q1_fake,
                     Int32(0),
+                    softmax_stats_fake,
+                    fake_scale(compile_spec.scale_types[0])
+                    if cfg.store_softmax_stats
+                    else None,
                     stream_fake,
                     cfg,
                     num_qo_heads,
@@ -2193,11 +2236,13 @@ def get_prims_ts_batch_decode_workspace_size(
     device: Optional[Union[int, str, torch.device]] = None,
     split_kv: bool = True,
     use_attention_sinks: bool = False,
+    store_softmax_stats: bool = False,
+    validate: bool = True,
 ) -> int:
     """Return caller-workspace bytes for one automatic FMHA policy.
 
     The arguments resolve the same policy and scratch layout as
-    :func:`batch_decode_with_paged_kv_cache`, without compiling a kernel.
+    :func:`batch_decode_with_paged_kv_cache`, without compiling attention kernels.
     Allocate at least the returned number of bytes as a contiguous
     ``torch.int8`` or ``torch.uint8`` CUDA tensor and zero it before its first
     FMHA launch. Re-zero a reused buffer whenever any workspace-layout input,
@@ -2215,9 +2260,9 @@ def get_prims_ts_batch_decode_workspace_size(
     ``storage_page_size`` defaults to the semantic ``page_size``. A larger
     physical page is supported only for semantic page size four and activates
     encoded ``(physical page, subpage)`` locators.
-    This sizing helper validates that every cumulative-offset delta is positive
-    and no larger than the bound. If ``device`` is omitted, it is inferred from
-    ``qo_indptr`` for a packed launch. ``k_dtype`` defaults to ``q_dtype`` and
+    By default, this sizing helper validates that every cumulative-offset delta
+    is positive and no larger than the bound. If ``device`` is omitted, it is
+    inferred from ``qo_indptr`` for a packed launch. ``k_dtype`` defaults to ``q_dtype`` and
     ``v_dtype`` to ``k_dtype``; pass ``v_dtype=torch.float8_e4m3fn`` with
     BF16 Q/K to size the QK-BF16/PV-FP8 launch. ``kv_dtype`` is a
     compatibility alias for both K and V and must agree with explicit dtypes.
@@ -2227,44 +2272,64 @@ def get_prims_ts_batch_decode_workspace_size(
     match the value supplied to attention planning/launch.
     ``use_attention_sinks`` must also match planning because it can affect
     the selected policy and scratch layout.
+    ``store_softmax_stats`` must also match the plan: enabled standalone
+    reducers reserve an additional FP32 maximum and denominator per split and
+    output row.
+
+    ``validate=False`` skips repeated input/device validation and packed-Q
+    offset readbacks. The caller must ensure supported hardware, valid geometry,
+    dtypes and metadata, and a static Q bound covering every request. Alias and
+    device resolution are retained, as is the shared automatic-policy cache;
+    a cold policy lookup may still query device properties or compile a hardware
+    occupancy probe. Warm up outside CUDA graph capture.
     """
 
-    batch_size = _validate_positive_int(batch_size, "batch_size")
+    if not isinstance(validate, bool):
+        raise TypeError("validate must be a bool")
+    if validate:
+        if not isinstance(store_softmax_stats, bool):
+            raise TypeError("store_softmax_stats must be a bool")
+        batch_size = _validate_positive_int(batch_size, "batch_size")
     packed_query, resolved_seq_len_q = _resolve_q_mode(
         seq_len_q=seq_len_q,
         qo_indptr=qo_indptr,
         max_q_len=max_q_len,
         require_packed_max=True,
+        validate=validate,
     )
     assert resolved_seq_len_q is not None
     seq_len_q = resolved_seq_len_q
-    _validate_head_geometry(num_qo_heads, num_kv_heads)
-    _validate_decode_query_head_extent(
-        batch_size=batch_size,
-        num_qo_heads=num_qo_heads,
-        max_q_len=seq_len_q,
-    )
-    head_dim = _validate_head_dim(head_dim)
-    page_size = _validate_page_size(page_size)
-    storage_page_size = _validate_storage_page_size(
-        page_size,
-        page_size if storage_page_size is None else storage_page_size,
-    )
-    max_kv_len = _validate_max_kv_len(max_kv_len, "max_kv_len")
-    _validate_layout(kv_layout)
-    _validate_mask(mask_type)
-    window_left = _validate_window_left(window_left, mask_type)
+    if validate:
+        _validate_head_geometry(num_qo_heads, num_kv_heads)
+        _validate_decode_query_head_extent(
+            batch_size=batch_size,
+            num_qo_heads=num_qo_heads,
+            max_q_len=seq_len_q,
+        )
+        head_dim = _validate_head_dim(head_dim)
+        page_size = _validate_page_size(page_size)
+        storage_page_size = _validate_storage_page_size(
+            page_size,
+            page_size if storage_page_size is None else storage_page_size,
+        )
+        max_kv_len = _validate_max_kv_len(max_kv_len, "max_kv_len")
+        _validate_layout(kv_layout)
+        _validate_mask(mask_type)
+        window_left = _validate_window_left(window_left, mask_type)
+    elif storage_page_size is None:
+        storage_page_size = page_size
     k_dtype, v_dtype = _resolve_kv_dtypes(q_dtype, k_dtype, v_dtype, kv_dtype)
     if out_dtype is None:
         out_dtype = q_dtype
-    _validate_dtype_pair(q_dtype, k_dtype, v_dtype, out_dtype)
+    if validate:
+        _validate_dtype_pair(q_dtype, k_dtype, v_dtype, out_dtype)
     inferred_device = (
         qo_indptr.device
         if device is None and isinstance(qo_indptr, torch.Tensor)
         else device
     )
     resolved_device, _ = _resolve_cuda_device(inferred_device)
-    if qo_indptr is not None:
+    if validate and qo_indptr is not None:
         _validate_qo_indptr(
             qo_indptr,
             expected_device=resolved_device,
@@ -2295,6 +2360,8 @@ def get_prims_ts_batch_decode_workspace_size(
         resolved_device,
         split_kv=split_kv,
         use_attention_sinks=use_attention_sinks,
+        store_softmax_stats=store_softmax_stats,
+        validate=validate,
     ).total_bytes
 
 
@@ -2413,6 +2480,32 @@ def _prepare_decode_runtime(
     )
 
 
+def _validate_decode_softmax_stats(
+    store_softmax_stats: bool,
+    softmax_stats: Optional[torch.Tensor],
+    q: torch.Tensor,
+    *,
+    validate: bool,
+) -> None:
+    """Enforce the compile-time binding contract without device synchronization."""
+    if store_softmax_stats != (softmax_stats is not None):
+        raise ValueError(
+            "softmax_stats must be supplied exactly when plan() sets "
+            "store_softmax_stats=True"
+        )
+    if validate and softmax_stats is not None:
+        if not isinstance(softmax_stats, torch.Tensor):
+            raise TypeError("softmax_stats must be a torch.Tensor")
+        if softmax_stats.dtype != torch.float32:
+            raise TypeError("softmax_stats must have dtype torch.float32")
+        if softmax_stats.device != q.device:
+            raise ValueError("softmax_stats must be on the query device")
+        if tuple(softmax_stats.shape) != tuple(q.shape[:-1]) + (2,):
+            raise ValueError("softmax_stats must have shape [*out.shape[:-1], 2]")
+        if not softmax_stats.is_contiguous():
+            raise ValueError("softmax_stats must be contiguous")
+
+
 def _launch_decode(
     runtime: _DecodeRuntime,
     *,
@@ -2427,6 +2520,7 @@ def _launch_decode(
     requested_splits: int = 1,
     max_kv_len: int,
     max_q_len: int,
+    softmax_stats: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Launch the compiled main kernel and its optional standalone reducer."""
 
@@ -2463,6 +2557,9 @@ def _launch_decode(
         max_q_len,
         (),
         max_kv_len,
+        None
+        if softmax_stats is None
+        else softmax_stats.view(-1, softmax_stats.shape[-2], 2),
     )
     if compiled_reducer is not None:
         compiled_reducer(
@@ -2477,6 +2574,10 @@ def _launch_decode(
             max_q_len,
             (),
             max_kv_len,
+            None
+            if softmax_stats is None
+            else softmax_stats.view(-1, softmax_stats.shape[-2], 2),
+            runtime.softmax_scale if softmax_stats is not None else None,
         )
     return runtime.out
 
@@ -2748,6 +2849,7 @@ class PrimsTSBatchDecodePlan:
     direct_model_capacity: int = 0
     direct_page_capacity: int = 0
     direct_fixed_query_len: int = 0
+    _store_softmax_stats: bool = False
 
     def run(
         self,
@@ -2760,6 +2862,7 @@ class PrimsTSBatchDecodePlan:
         return_lse: bool = False,
         attention_sinks: Optional[torch.Tensor] = None,
         validate: bool = True,
+        softmax_stats: Optional[torch.Tensor] = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Launch with lightweight checks against the validated plan.
         ``lse`` is a compact float32 output of shape ``query.shape[:-1]``
@@ -2777,6 +2880,9 @@ class PrimsTSBatchDecodePlan:
         natural-log sink logits after QK scaling, with zero V contribution.
         Values must be finite or ``-inf``; this is a caller precondition.
         Validation checks tensor metadata without reading the sink values.
+
+        ``softmax_stats`` is required exactly when preparation enables
+        ``store_softmax_stats``; see :meth:`BatchDecodePagedTSWrapper.run`.
         """
 
         if (
@@ -2806,6 +2912,9 @@ class PrimsTSBatchDecodePlan:
         output_scale = resolve_scale(
             output_scale, self._output_scale, "output_scale", self._device
         )
+        _validate_decode_softmax_stats(
+            self._store_softmax_stats, softmax_stats, query, validate=validate
+        )
         lse = prepare_lse(
             lse, q=query, mode=self._lse_mode, return_lse=return_lse, validate=validate
         )
@@ -2821,6 +2930,7 @@ class PrimsTSBatchDecodePlan:
             softmax_scale,
             output_scale,
             lse=lse,
+            softmax_stats=softmax_stats,
             attention_sinks=attention_sinks,
         )
         return (result, lse) if return_lse else result
@@ -2834,6 +2944,7 @@ class PrimsTSBatchDecodePlan:
         direct_q1_inputs: Optional[tuple[Optional[torch.Tensor], ...]] = None,
         lse: Optional[torch.Tensor] = None,
         attention_sinks: Optional[torch.Tensor] = None,
+        softmax_stats: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Launch state already proven by a framework-owned outer plan."""
 
@@ -2885,6 +2996,9 @@ class PrimsTSBatchDecodePlan:
             self.q_capacity,
             direct_inputs,
             self.kv_capacity,
+            None
+            if softmax_stats is None
+            else softmax_stats.view(-1, softmax_stats.shape[-2], 2),
         )
         if self._compiled_reducer is not None:
             self._compiled_reducer(
@@ -2901,6 +3015,10 @@ class PrimsTSBatchDecodePlan:
                 self.q_capacity,
                 direct_inputs,
                 self.kv_capacity,
+                None
+                if softmax_stats is None
+                else softmax_stats.view(-1, softmax_stats.shape[-2], 2),
+                softmax_scale if softmax_stats is not None else None,
             )
         return out
 
@@ -2928,11 +3046,14 @@ def _resolve_decode_workspace_layout(
     split_kv: bool = True,
     share_pattern_across_kv_heads: bool = True,
     use_attention_sinks: bool = False,
+    store_softmax_stats: bool = False,
+    validate: bool = True,
 ) -> _DecodeWorkspaceLayout:
     """Resolve the byte layout for one already-validated semantic key."""
 
     resolved_device, device_index = _resolve_cuda_device(device)
-    _validate_runtime_device(resolved_device)
+    if validate:
+        _validate_runtime_device(resolved_device)
     spec = _resolve_decode_launch_spec(
         device_index,
         batch_size,
@@ -2956,6 +3077,7 @@ def _resolve_decode_workspace_layout(
         split_kv,
         share_pattern_across_kv_heads,
         use_attention_sinks,
+        store_softmax_stats,
     )
     return _make_decode_workspace_layout(
         spec.scratch_shapes,
@@ -3699,10 +3821,13 @@ def _prepare_prims_ts_batch_decode_plan(
     lse_mode: Literal["none", "base2"] = "none",
     softmax_scale: Optional[GlobalScale] = None,
     output_scale: GlobalScale = 1.0,
+    store_softmax_stats: bool = False,
 ) -> tuple[PrimsTSBatchDecodePlan, torch.Tensor]:
     """Validate and freeze one dense-block-table PrimTS launch contract."""
 
     lse_mode = validate_lse_mode(lse_mode)
+    if not isinstance(store_softmax_stats, bool):
+        raise TypeError("store_softmax_stats must be a bool")
     _validate_layout(kv_layout)
     _validate_mask(mask_type)
     window_left = _validate_window_left(window_left, mask_type)
@@ -3821,6 +3946,7 @@ def _prepare_prims_ts_batch_decode_plan(
     spec = _resolve_decode_launch_spec(
         *policy_args,
         use_attention_sinks=use_attention_sinks,
+        store_softmax_stats=store_softmax_stats,
     )
     policy_config = replace(spec.config, fixed_seqlen=True)
     if query_major_memberships:
@@ -3965,6 +4091,7 @@ def _prepare_prims_ts_batch_decode_plan(
         direct_model_capacity=direct_q1_max_model_len or 0,
         direct_page_capacity=max_num_pages,
         direct_fixed_query_len=direct_q1_fixed_query_len,
+        _store_softmax_stats=store_softmax_stats,
     )
     return plan, out
 
@@ -3993,6 +4120,7 @@ def prepare_prims_ts_batch_decode_with_kv_cache(
     lse_mode: Literal["none", "base2"] = "none",
     softmax_scale: Optional[GlobalScale] = None,
     output_scale: GlobalScale = 1.0,
+    store_softmax_stats: bool = False,
 ) -> PrimsTSBatchDecodePlan:
     """Validate and prepare a reusable dense-block-table PrimTS launch.
 
@@ -4051,6 +4179,9 @@ def prepare_prims_ts_batch_decode_with_kv_cache(
         of shape () or (1,) on the query device. Types select the compiled signature;
         values are retained as run defaults. Softmax uses natural units. Tensor
         contents must stay finite and positive and may change during replay.
+    store_softmax_stats : bool
+        Compile statistics export, disabled by default. When enabled every
+        prepared ``run`` requires a caller-owned ``softmax_stats`` buffer.
 
     Returns
     -------
@@ -4092,6 +4223,7 @@ def prepare_prims_ts_batch_decode_with_kv_cache(
         output_scale=output_scale,
         lse_mode=lse_mode,
         use_attention_sinks=use_attention_sinks,
+        store_softmax_stats=store_softmax_stats,
     )
     return plan
 
@@ -4160,6 +4292,7 @@ class BatchDecodePagedTSWrapper:
         initialize_workspace: bool = True,
         softmax_scale: Optional[GlobalScale] = None,
         output_scale: GlobalScale = 1.0,
+        store_softmax_stats: bool = False,
     ) -> None:
         """Select/cache a bounded paged-decode execution and bind reusable scratch.
 
@@ -4180,7 +4313,9 @@ class BatchDecodePagedTSWrapper:
         the compiled signature; run() inherits these defaults. Device values
         must be finite and positive and may change in place during graph replay.
         Softmax scales use natural, not base-2, units.
-        """
+        store_softmax_stats independently
+        enables caller-owned maximum/denominator output at run time; it may be
+        combined with lse_mode="base2"."""
 
         if packed_query and max_q_len is None:
             raise ValueError("packed Q requires max_q_len in plan()")
@@ -4198,6 +4333,8 @@ class BatchDecodePagedTSWrapper:
             raise TypeError("use_attention_sinks must be a bool")
         if not isinstance(validate, bool):
             raise TypeError("validate must be a bool")
+        if not isinstance(store_softmax_stats, bool):
+            raise TypeError("store_softmax_stats must be a bool")
         if not isinstance(initialize_workspace, bool):
             raise TypeError("initialize_workspace must be a bool")
         if validate:
@@ -4280,7 +4417,10 @@ class BatchDecodePagedTSWrapper:
             storage_page_size,
         )
         spec = _resolve_decode_launch_spec(
-            *policy_args, split_kv=split_kv, use_attention_sinks=use_attention_sinks
+            *policy_args,
+            split_kv=split_kv,
+            use_attention_sinks=use_attention_sinks,
+            store_softmax_stats=store_softmax_stats,
         )
         kv_prefix_mode: Literal["dynamic", "planned_full"] = "dynamic"
         kv_lengths_mode: Literal["dynamic", "planned_uniform_max"] = "dynamic"
@@ -4473,6 +4613,7 @@ class BatchDecodePagedTSWrapper:
         return_lse: bool = False,
         attention_sinks: Optional[torch.Tensor] = None,
         validate: bool = True,
+        softmax_stats: Optional[torch.Tensor] = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Launch paged FMHA using live lengths and request metadata.
 
@@ -4520,7 +4661,16 @@ class BatchDecodePagedTSWrapper:
 
         Enabled attention_sinks requires compact CUDA FP32 [Hq] natural-log logits
         after QK scaling. Values must be finite or -inf and add zero V contribution;
-        validation checks metadata without reading sink values."""
+        validation checks metadata without reading sink values.
+
+        ``softmax_stats`` is caller-owned contiguous FP32
+        ``[*out.shape[:-1], 2]`` on the query device, disjoint from all other
+        buffers. It stores the token-logit maximum in natural-log units and
+        the unscaled sum(exp(logit - maximum)). Sinks contribute once to the
+        denominator, not the maximum. Its presence must match
+        ``store_softmax_stats`` even with validate=False. Inactive requests
+        leave output and statistics untouched, as with the output-only path.
+        """
 
         if not isinstance(validate, bool):
             raise TypeError("validate must be a bool")
@@ -4531,6 +4681,9 @@ class BatchDecodePagedTSWrapper:
         )
         output_scale = resolve_scale(
             output_scale, state.output_scale, "output_scale", state.device
+        )
+        _validate_decode_softmax_stats(
+            state.config.store_softmax_stats, softmax_stats, q, validate=validate
         )
         if state.planned_seq_lens_kv_device is not None:
             if seq_lens_kv is not None:
@@ -4661,6 +4814,7 @@ class BatchDecodePagedTSWrapper:
             requested_splits=state.requested_splits,
             max_kv_len=max_kv_len,
             max_q_len=max_q_len,
+            softmax_stats=softmax_stats,
         )
         return (result, lse) if return_lse else result
 
@@ -4692,6 +4846,8 @@ def batch_decode_with_paged_kv_cache(
     workspace_buffer: Optional[torch.Tensor] = None,
     max_kv_len: Optional[int] = None,
     validate: bool = True,
+    store_softmax_stats: bool = False,
+    softmax_stats: Optional[torch.Tensor] = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """One-shot fixed or packed-Q paged decode from fixed page tables.
 
@@ -4765,6 +4921,12 @@ def batch_decode_with_paged_kv_cache(
         Validate tensors and metadata values (may synchronize), default True.
         False trusts the caller and requires workspace and explicit bounds;
         skips tensor and metadata validation. Invalid inputs have undefined behavior.
+    store_softmax_stats : bool
+        Compile statistics export, disabled by default. Match workspace sizing.
+    softmax_stats : torch.Tensor, optional
+        Caller-owned statistics buffer with the same contract as
+        :meth:`BatchDecodePagedTSWrapper.run`. Required exactly when
+        ``store_softmax_stats=True`` and disjoint from all other buffers.
 
     Returns
     -------
@@ -4935,6 +5097,7 @@ def batch_decode_with_paged_kv_cache(
         initialize_workspace=allocate_workspace,
         softmax_scale=softmax_scale,
         output_scale=output_scale,
+        store_softmax_stats=store_softmax_stats,
     )
     return wrapper.run(
         q,
@@ -4950,6 +5113,7 @@ def batch_decode_with_paged_kv_cache(
         return_lse=return_lse,
         attention_sinks=attention_sinks,
         validate=validate,
+        softmax_stats=softmax_stats,
     )
 
 

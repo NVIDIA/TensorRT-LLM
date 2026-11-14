@@ -20,6 +20,7 @@ from cutlass.experimental import primitives as prims
 from cutlass import Float32, Int32, Int64
 
 from ..helpers.math import final_lse
+from ..helpers.softmax_stats import store_reduced_softmax_stats
 from .config import MlaConfig
 from ..helpers.math import ceil_div
 from ..helpers.ops import (
@@ -240,6 +241,8 @@ def run_gmem_reduction_kernel(
     cfg,
     num_reduction_ctas,
     requested_splits=None,
+    softmax_stats=None,
+    softmax_stats_scale=None,
 ):
     """Preserve inactive output and never consume stale split scratch."""
     prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
@@ -256,6 +259,8 @@ def run_gmem_reduction_kernel(
             cfg,
             num_reduction_ctas,
             requested_splits,
+            softmax_stats,
+            softmax_stats_scale,
         )
 
 
@@ -271,6 +276,8 @@ def _run_active_gmem_reduction_kernel(
     cfg,
     num_reduction_ctas,
     requested_splits=None,
+    softmax_stats=None,
+    softmax_stats_scale=None,
 ):
     """Reduce split-KV partial O/LSE rows written by the 1CTA main kernel.
 
@@ -400,6 +407,14 @@ def _run_active_gmem_reduction_kernel(
                         (lse.iterator.raw_ptr() + output_query_row).store(
                             final_lse(global_lse, cfg.lse_base_on_e)
                         )
+                    store_reduced_softmax_stats(
+                        softmax_stats,
+                        output_query_row,
+                        acc_lse,
+                        row_lse,
+                        split_limit,
+                        softmax_stats_scale,
+                    )
 
                 acc_vec = vector_from_scalars(
                     (
@@ -566,6 +581,14 @@ def _run_active_gmem_reduction_kernel(
                         (lse.iterator.raw_ptr() + output_query_row).store(
                             final_lse(global_lse, cfg.lse_base_on_e)
                         )
+                    store_reduced_softmax_stats(
+                        softmax_stats,
+                        output_query_row,
+                        acc_lse,
+                        row_lse,
+                        split_limit,
+                        softmax_stats_scale,
+                    )
                 for i in cutlass.range(
                     ceil_div(split_limit, GMEM_REDUCTION_WARP_LANES),
                     unroll_full=requested_splits is None,
@@ -757,6 +780,14 @@ def _run_active_gmem_reduction_kernel(
                         (lse.iterator.raw_ptr() + output_query_row).store(
                             final_lse(global_lse, cfg.lse_base_on_e)
                         )
+                    store_reduced_softmax_stats(
+                        softmax_stats,
+                        output_query_row,
+                        acc_lse,
+                        row_lse,
+                        split_limit,
+                        softmax_stats_scale,
+                    )
                 for i in cutlass.range(
                     ceil_div(split_limit, GMEM_REDUCTION_WARP_LANES),
                     unroll_full=requested_splits is None,
@@ -938,6 +969,14 @@ def _run_active_gmem_reduction_kernel(
                     (lse.iterator.raw_ptr() + output_query_row).store(
                         final_lse(global_lse, cfg.lse_base_on_e)
                     )
+                store_reduced_softmax_stats(
+                    softmax_stats,
+                    output_query_row,
+                    acc_lse,
+                    g_lse,
+                    split_limit,
+                    softmax_stats_scale,
+                )
         for i in cutlass.range(
             ceil_div(split_limit, GMEM_REDUCTION_WARP_LANES),
             unroll_full=requested_splits is None,
