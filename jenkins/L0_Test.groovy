@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@feature/TRTLLMINF-382-agent-loss-retry']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
@@ -4249,7 +4249,10 @@ boolean hasBudgetForInfraRetry(def pipeline, String stageName, String scope, Inf
 
 def classifyFailure(def pipeline, Throwable error, String scope, Map retryContext=null)
 {
-    if (error instanceof TrtllmCiException) return FailureClassifier.classify(error, scope)
+    // Interruptions carry their own reasons; do not collect step logs while cancelling.
+    if (error instanceof TrtllmCiException || FailureClassifier.hasInterruption(error)) {
+        return FailureClassifier.classify(error, scope)
+    }
 
     // Reuse evidence only when it was collected for this exact error and classification scope.
     boolean cachedForFailure = retryContext?.failureEvidence != null &&
@@ -4273,11 +4276,12 @@ def preservePrimaryFailure(Throwable primaryError, Closure actions)
 {
     try {
         actions()
-    } catch (InterruptedException e) {
-        throw e
     } catch (Exception e) {
         // Post-processing failures must not replace the failure that triggered them.
-        if (primaryError == null || FailureClassifier.classify(e, InfraFailure.BOTH) instanceof PipelineInterruption) throw e
+        // K8s node removal is secondary; control and unknown interruptions still win.
+        if (primaryError == null || FailureClassifier.classify(e, InfraFailure.K8S) instanceof PipelineInterruption) throw e
+        // Keep agent loss on the primary so outer handlers do not retry on a dead dispatcher.
+        FailureClassifier.attachAgentLoss(primaryError, e)
         echo "[INFRA-RETRY] Secondary failure while handling ${primaryError}:\n${Utils.getStackTrace(e)}"
     }
 }
@@ -7253,9 +7257,9 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
                     runner("", true, null)
                 })
                 return
-            } catch (InterruptedException e) {
-                throw e
             } catch (Exception e) {
+                def c = classifyFailure(pipeline, e, InfraFailure.K8S)
+                if (c instanceof PipelineInterruption) throw e
                 // Once the runner has started, this is an execution failure the
                 // inner retry owns -- honor singleAttempt and do not re-run. But if
                 // the dispatcher pod itself died mid-run, its in-pod cleanup could not
@@ -7263,16 +7267,14 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
                 // back on the parent context here, so reconcile them from a fresh
                 // cleanup pod before failing closed.
                 if (attemptPlacementContext.runnerStarted) {
-                    if (slurmDispatcher && isDispatcherPodFailure(e)) {
+                    if (slurmDispatcher && isDispatcherPodFailure(c)) {
                         // Pass this attempt's pod spec explicitly so the finalizer
                         // never depends on the registry entry's podSpec surviving a
                         // prior attempt's deregister.
                         finalizeOrphanedSlurmResource(pipeline, stageName, attemptPodSpec)
                     }
-                    throw e
+                    throw (c instanceof InfraFailure ? c : e)
                 }
-                def c = classifyFailure(pipeline, e, InfraFailure.K8S)
-                if (c instanceof PipelineInterruption) throw e
                 if (!(c instanceof InfraFailure)) {
                     // UserFailure -> don't retry, but leave a trace: a pod/agent
                     // launch exception missing from PATTERN_CATALOG (e.g. a
@@ -7348,14 +7350,15 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
             def effectiveMaxThisAttempt = (lastSeverity == InfraFailure.PERSISTENT) ? Math.min(1, k8sInfraRetryMax) : k8sInfraRetryMax
             boolean isFinalAttempt = (attempt > effectiveMaxThisAttempt)
             def attemptPodSpec = trtllm_utils.withKubernetesHostNodeExclusion(podSpec, avoidedKubernetesHostNodes)
+            // TEMP fault injection for PR validation -- drop before merge.
+            if (stageName == "CPU-Generic-x86-1" && attempt == 1) {
+                attemptPodSpec = attemptPodSpec + [yaml: attemptPodSpec.yaml.replaceFirst(/(?m)^(\s*image:\s*)(\S+)/, '$1$2-faultinject')]
+            }
             trtllm_utils.launchKubernetesPodWithPlacement(pipeline, attemptPodSpec, containerName, attemptPlacementContext, { runner(attemptTag, isFinalAttempt, retryContext) })
             if (attempt > 1) {
                 echo "[INFRA-RETRY] ${stageName}: Succeeded on attempt ${attempt}"
             }
             return
-        } catch (InterruptedException e) {
-            // User abort / pipeline timeout -- never retry
-            throw e
         } catch (Exception e) {
             // classifyFailure() handles FlowInterruptedException + exit-code-143 +
             // typed throws + originating-step evidence and cause-chain fallback, returning one of

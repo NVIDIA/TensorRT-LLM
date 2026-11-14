@@ -143,10 +143,15 @@ class InfraDryRunPipelineTest(unittest.TestCase):
         )
 
         self.assertIn("caughtError = e\n        stageIsInterrupted = true", result_handler)
-        self.assertIn("catch (InterruptedException e) {\n        throw e", preserve_primary)
+        self.assertIn("catch (Exception e)", preserve_primary)
+        self.assertNotIn("catch (InterruptedException e)", preserve_primary)
         self.assertIn(
-            "FailureClassifier.classify(e, InfraFailure.BOTH) instanceof PipelineInterruption",
+            "FailureClassifier.classify(e, InfraFailure.K8S) instanceof PipelineInterruption",
             preserve_primary,
+        )
+        self.assertLess(
+            preserve_primary.index("instanceof PipelineInterruption) throw e"),
+            preserve_primary.index("FailureClassifier.attachAgentLoss(primaryError, e)"),
         )
 
     def test_slurm_upload_skips_a_missing_result_directory(self) -> None:
