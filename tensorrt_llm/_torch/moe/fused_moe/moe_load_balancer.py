@@ -1107,6 +1107,45 @@ moe_model_arch_list = [
     'Qwen3_5MoeForConditionalGeneration',
 ]
 
+#: The EPLB modes ``moe_load_balancer_mode`` reports.
+MOE_LOAD_BALANCER_MODES = frozenset({"static", "online", "per_layer_dynamic"})
+
+
+def moe_load_balancer_mode(model_config,
+                           mapping: Optional[Mapping]) -> Optional[str]:
+    """Return the EPLB mode the engine runs this model with, or None.
+
+    ``maybe_create_moe_load_balancer`` creates a balancer exactly when this
+    returns a mode, so code that decides before the model is built, such as
+    the modeling_v2 resolver, agrees with the loader on whether EPLB runs.
+
+    Args:
+        model_config: The model's ``ModelConfig``. Its ``moe_load_balancer``
+            and the first of ``pretrained_config.architectures`` are read.
+        mapping: The mapping the model is built with.
+
+    Returns:
+        ``"static"`` for standard EPLB that keeps its initial placement
+        (``layer_updates_per_iter == 0``), ``"online"`` for standard EPLB
+        that updates layers, ``"per_layer_dynamic"`` for per-layer dynamic
+        EPLB, and None when no balancer is created: no ``moe_load_balancer``
+        config, an architecture outside ``moe_model_arch_list``, a single EP
+        rank, or smart routing (``moe_cluster_size > 1``).
+    """
+    config = model_config.moe_load_balancer
+    if config is None or mapping is None:
+        return None
+    architectures = getattr(model_config.pretrained_config, "architectures",
+                            None) or [None]
+    if architectures[0] not in moe_model_arch_list:
+        return None
+    if mapping.moe_ep_size <= 1 or mapping.moe_cluster_size > 1:
+        return None
+    mode = getattr(config, "mode", "standard")
+    if mode == "standard":
+        return "online" if config.layer_updates_per_iter > 0 else "static"
+    return mode
+
 
 def maybe_create_moe_load_balancer(
     model_config, mapping: Optional[Mapping]
@@ -1134,8 +1173,7 @@ def maybe_create_moe_load_balancer(
                 "per-layer dynamic EPLB is incompatible with smart routing "
                 "(moe_cluster_size > 1)")
 
-    if (in_supported_model_arch and using_ep and not using_smart_router
-            and config is not None):
+    if moe_load_balancer_mode(model_config, mapping) is not None:
         config.setup(ep_rank=ep_rank, ep_size=ep_size)
         if mode == "per_layer_dynamic":
             from .per_layer_dynamic_eplb import PerLayerDynamicMoeLoadBalancer
