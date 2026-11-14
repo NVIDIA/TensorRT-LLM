@@ -35,6 +35,7 @@ def _manager(
     manager._has_cp_helix = False
     manager.kv_compression_manages_history = kv_compression_manages_history
     manager._kv_reserve_draft_tokens = kv_reserve_draft_tokens
+    manager._retained_generation_allocations = {}
     manager._allocated_draft_lens = {}
     manager._inflight_draft_lens = {}
     manager.kv_cache_map = {}

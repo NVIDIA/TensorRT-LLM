@@ -523,3 +523,14 @@ Property ```use_uvm``` has been deprecated and will be removed in a future relea
 Property ```sink_token_length``` is deprecated and silently ignored on the PyTorch backend.
 The PyTorch attention kernels do not support StreamingLLM, so any non-``None`` value is
 dropped before reaching the executor.
+
+### Disaggregated completion reservation
+
+`kv_cache_config.enable_disagg_completion_reservation: true` reserves logical
+capacity for each admitted request to finish without allocating all pages early.
+It requires KV cache manager V2, `host_cache_size: 0`, no disk tier, beam width 1,
+one pipeline stage, and full attention on every layer. Context-only requests
+reserve prompt completion; full and generation-only requests also reserve decode
+growth. Later admissions wait behind a request deferred for capacity. See
+[KV connector completion reservation](kv-cache-connector.md) for connector
+declarations, eligibility diagnostics, and failure recovery restrictions.

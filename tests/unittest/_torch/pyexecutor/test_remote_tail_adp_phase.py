@@ -4,7 +4,7 @@
 
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 import torch
@@ -154,7 +154,7 @@ def test_eligible_generation_kv_exhaustion_still_raises(phase: RemoteTailPhase |
 
     with pytest.raises(
         RuntimeError,
-        match=r"V2 scheduler deadlock: 1 generation and 0 context request\(s\)",
+        match=r"V2 scheduler deadlock: 1 generation and 0 context and 0 generation-init request\(s\)",
     ):
         scheduler.schedule_request(active, set())
 
@@ -249,7 +249,7 @@ def test_category_changes_and_late_transfer_activation_wait_for_next_vote() -> N
         result = scheduler.schedule_request(active, set())
         assert not result.context_requests
         assert not result.generation_requests
-    assert not manager.mock_calls
+    assert manager.mock_calls == [call.begin_completion_admission(active)] * 2
 
 
 def test_disabled_phase_preserves_existing_request_selection() -> None:

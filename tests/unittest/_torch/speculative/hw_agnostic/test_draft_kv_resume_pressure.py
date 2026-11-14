@@ -95,6 +95,7 @@ def _manager(resume_ok: bool) -> tuple[KVCacheManagerV2, MagicMock]:
     manager.enable_joint_kv_cache_reuse = False
     manager.num_extra_kv_tokens = 0
     manager._mirror_uses_draft_view = False  # one-engine external drafter: target view
+    manager._retained_generation_allocations = {}
     manager._allocated_draft_lens = set()
     cache = MagicMock(name="kv_cache")
     cache.resize.return_value = True

@@ -5584,6 +5584,40 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description="KV cache manager v2 configuration for block reuse policies."
     )
 
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    enable_disagg_completion_reservation: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "Reserve logical GPU KV capacity for completion on a disaggregated "
+        "server using KV cache manager v2, no host or disk tier, beam width 1, "
+        "one pipeline stage, and full attention on every layer. Explicit V1 "
+        "or offload configurations are rejected; other unmet conditions are "
+        "logged and disable reservation. Context-only requests reserve their "
+        "remaining prompt; every decoding request also reserves output growth, "
+        "including local full requests. Bounds are capped at idle pool capacity. "
+        "A deferred request holds back later admissions while admitted work "
+        "continues. No pages are allocated early. A connector can enable this "
+        "policy through requires_completion_reservation.")
+
+    @model_validator(mode='after')
+    def validate_disagg_completion_reservation(self) -> 'KvCacheConfig':
+        """Reject configuration-only incompatibilities before loading the model."""
+        if self.enable_disagg_completion_reservation:
+            if self.use_kv_cache_manager_v2 is False:
+                raise ValueError(
+                    "enable_disagg_completion_reservation requires use_kv_cache_manager_v2=True"
+                )
+            if self.host_cache_size is not None and self.host_cache_size > 0:
+                raise ValueError(
+                    "enable_disagg_completion_reservation requires host_cache_size=0"
+                )
+            if self.disk_cache_size:
+                raise ValueError(
+                    "enable_disagg_completion_reservation requires no disk cache tier"
+                )
+        return self
+
     def _to_pybind(self):
         config = _KvCacheConfig(
             enable_block_reuse=self.enable_block_reuse,

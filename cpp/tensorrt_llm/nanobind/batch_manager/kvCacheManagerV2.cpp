@@ -1958,7 +1958,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 std::optional<kv::SwaScratchReuseConfig> swaScratchReuse, bool commitMinSnapshot, bool enableStats,
                 bool textOnly, bool enablePartialCommit, kv::PoolRebalanceConfig poolRebalance,
                 kv::Priority coldTierOffloadMinPriority, std::optional<size_t> hostSparsePoolQuota,
-                std::vector<kv::RegionConfig> regions)
+                std::vector<kv::RegionConfig> regions, int reuseMatchAlignment)
             {
                 new (cfg) kv::KVCacheManagerConfig();
                 cfg->tokensPerBlock = tokensPerBlock;
@@ -1974,6 +1974,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 cfg->maxUtilForResume = maxUtilForResume;
                 cfg->enablePartialReuse = enablePartialReuse;
                 cfg->reuseMatchBackoff = reuseMatchBackoff;
+                cfg->reuseMatchAlignment = reuseMatchAlignment;
                 cfg->typicalStep = std::move(typicalStep);
                 cfg->constraints = std::move(constraints);
                 cfg->initialPoolRatio = std::move(initialPoolRatio);
@@ -1999,7 +2000,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("pool_rebalance") = kv::PoolRebalanceConfig{},
             nb::arg("cold_tier_offload_min_priority") = tensorrt_llm::batch_manager::kDefaultColdTierOffloadMinPriority,
             nb::arg("host_sparse_pool_quota").none() = std::nullopt,
-            nb::arg("regions") = std::vector<kv::RegionConfig>{})
+            nb::arg("regions") = std::vector<kv::RegionConfig>{}, nb::arg("reuse_match_alignment") = 1)
         .def_rw("tokens_per_block", &kv::KVCacheManagerConfig::tokensPerBlock)
         .def_rw("cache_tiers", &kv::KVCacheManagerConfig::cacheTiers)
         .def_rw("layers", &kv::KVCacheManagerConfig::layers)
@@ -2009,6 +2010,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("max_util_for_resume", &kv::KVCacheManagerConfig::maxUtilForResume)
         .def_rw("enable_partial_reuse", &kv::KVCacheManagerConfig::enablePartialReuse)
         .def_rw("reuse_match_backoff", &kv::KVCacheManagerConfig::reuseMatchBackoff)
+        .def_rw("reuse_match_alignment", &kv::KVCacheManagerConfig::reuseMatchAlignment)
         .def_rw("enable_partial_commit", &kv::KVCacheManagerConfig::enablePartialCommit)
         .def_rw("cold_tier_offload_min_priority", &kv::KVCacheManagerConfig::coldTierOffloadMinPriority)
         .def_rw("typical_step", &kv::KVCacheManagerConfig::typicalStep)

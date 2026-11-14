@@ -65,6 +65,7 @@ def _executor(**kwargs: object) -> SimpleNamespace:
     defaults = dict(
         _pending_adp_dummy_request=None,
         _is_kv_manager_v2=True,
+        _kv_connector_moves_kv=False,
         enable_joint_kv_cache_reuse=False,
         active_requests=[],
     )

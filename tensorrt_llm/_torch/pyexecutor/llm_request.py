@@ -1011,6 +1011,10 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # allocation clears this flag so replay can report its new pages.
         self.py_connector_allocation_reported = False
 
+        # Survives allocation resets so a failed external read cannot keep
+        # restarting the request while the store still advertises its keys.
+        self.py_connector_load_failed: bool = False
+
         # End of the prefix served from outside the manager (a KV cache
         # connector's load, or a staging fetch the request resumes from) retained
         # by this allocation, or 0. This depth survives async parking; local reuse

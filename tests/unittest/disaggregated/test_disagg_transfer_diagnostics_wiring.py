@@ -1455,6 +1455,7 @@ def test_request_cleanup_continues_when_diagnostic_emission_fails(
         state=SimpleNamespace(name="DISAGG_CONTEXT_COMPLETE"),
     )
     executor = object.__new__(PyExecutor)
+    executor.kv_connector_manager = None
     executor.sampler = SimpleNamespace(release_request=Mock())
     executor.enable_attention_dp = False
     executor.resource_manager = SimpleNamespace(free_resources=Mock())
