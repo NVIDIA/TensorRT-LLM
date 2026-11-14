@@ -618,6 +618,15 @@ class GSM8K(AccuracyTask):
     EVALUATE_KWARGS = dict(scores_filter=None)
 
 
+# Evaluator settings of the aggregate Qwen3.5-4B runs that set its gsm8k.yaml
+# reference. Every Qwen3.5-4B GSM8K test uses them so its score is comparable.
+QWEN3_5_4B_GSM8K_EVALUATOR_KWARGS = dict(
+    apply_chat_template=True,
+    fewshot_as_multiturn=True,
+    chat_template_kwargs=dict(enable_thinking=False),
+)
+
+
 class GSM8KInferenceX(AccuracyTask):
     # InferenceX-protocol GSM8K, see tensorrt_llm.evaluate.GSM8KInferenceX.
     DATASET = "gsm8k_inferencex"

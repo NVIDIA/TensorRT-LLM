@@ -54,9 +54,9 @@ from ..conftest import (get_device_count, llm_models_root, parametrize_with_ids,
                         skip_no_hopper, skip_no_rubin, skip_pre_blackwell,
                         skip_pre_hopper)
 from ..trt_test_alternative import popen
-from .accuracy_core import (GSM8K, MMLU, GSM8KInferenceX,
-                            LlmapiAccuracyTestHarness, LongBenchV2,
-                            acceptance_length_from_iteration_stats,
+from .accuracy_core import (GSM8K, MMLU, QWEN3_5_4B_GSM8K_EVALUATOR_KWARGS,
+                            GSM8KInferenceX, LlmapiAccuracyTestHarness,
+                            LongBenchV2, acceptance_length_from_iteration_stats,
                             assert_acceptance_length, get_accuracy_task)
 from .sparse_offload_accuracy import (LONGBENCH_CASES, assert_host_fetches,
                                       assert_token_parity, read_fetch_events,
@@ -211,7 +211,7 @@ class MyThreadPoolExecutor(ThreadPoolExecutor):
 def run_accuracy_test(llm: "DuckLLM",
                       model_name: str,
                       test_sets: List[Union[str, type]] = ["MMLU", "GSM8K"],
-                      extra_evaluator_kwargs: Optional[Dict[Union[str, type],
+                      extra_evaluator_kwargs: Optional[Dict[type,
                                                             Dict[str,
                                                                  Any]]] = None,
                       extra_acc_spec: Optional[str] = None,
@@ -1056,7 +1056,10 @@ def run_parallel_test(model_name: str,
                       trust_remote_code: bool = False,
                       quant_algo: str = None,
                       kv_cache_quant_algo: str = None,
-                      max_batch_size: int = None):
+                      max_batch_size: int = None,
+                      extra_evaluator_kwargs: Optional[Dict[type,
+                                                            Dict[str,
+                                                                 Any]]] = None):
     total_ctx_gpus = ctx_tp * ctx_pp * ctx_instances
     total_gen_gpus = gen_tp * gen_pp * gen_instances
     if total_ctx_gpus + total_gen_gpus > get_device_count():
@@ -1114,7 +1117,10 @@ def run_parallel_test(model_name: str,
             llm.args.quant_config.quant_algo = quant_algo
         if kv_cache_quant_algo is not None:
             llm.args.quant_config.kv_cache_quant_algo = kv_cache_quant_algo
-        run_accuracy_test(llm, model_name, test_sets)
+        run_accuracy_test(llm,
+                          model_name,
+                          test_sets,
+                          extra_evaluator_kwargs=extra_evaluator_kwargs)
 
 
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
@@ -2140,6 +2146,10 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
     # fallback (_util.py's _validate_or_fallback_kv_cache_manager_v2).
     MODEL_NAME = "Qwen/Qwen3.5-4B"
     MODEL_PATH = f"{llm_models_root()}/Qwen3.5-4B-FP8"
+    # Evaluate GSM8K like the aggregate runs that set the gsm8k.yaml
+    # reference; on raw completion prompts this checkpoint scores several
+    # points lower.
+    GSM8K_EVALUATOR_KWARGS = QWEN3_5_4B_GSM8K_EVALUATOR_KWARGS
 
     @pytest.mark.skip_less_device(2)
     def test_mismatched_block_reuse(self, mocker):
@@ -2183,7 +2193,10 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
             # reference for this quant_algo differs from the unquantized one.
             llm.args.quant_config.quant_algo = "FP8_BLOCK_SCALES"
             llm.args.quant_config.kv_cache_quant_algo = "FP8"
-            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+            run_accuracy_test(
+                llm,
+                self.MODEL_NAME, [GSM8K],
+                extra_evaluator_kwargs={GSM8K: self.GSM8K_EVALUATOR_KWARGS})
 
     @pytest.mark.skip_less_device(4)
     def test_ctx_pp_gen_tp_asymmetric(self, mocker):
@@ -2211,7 +2224,8 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
             # ctx_pp=2 overflows the KV cache quota.
             # Other Qwen3.5-4B tests cap this at 32
             # (see test_llm_api_pytorch.py).
-            max_batch_size=32)
+            max_batch_size=32,
+            extra_evaluator_kwargs={GSM8K: self.GSM8K_EVALUATOR_KWARGS})
 
 
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
