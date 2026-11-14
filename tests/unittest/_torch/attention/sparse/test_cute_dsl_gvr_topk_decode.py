@@ -932,7 +932,7 @@ _r0_kernel_cache: dict = {}
 def _compile_gvr_direct(kernel):
     """Compile a ``GvrTopKKernel`` with symbolic shapes, mirroring the
     production runner's fake-tensor construction (128-bit loads, no
-    ``order_row`` / ``output_values``)."""
+    ``order_row``, optional ``output_values``)."""
     n_rows, n_cols, n_batch = cute.sym_int(), cute.sym_int(), cute.sym_int()
     in_f = _crt.make_fake_compact_tensor(
         kernel.dtype, (n_rows, n_cols), stride_order=(1, 0), assumed_align=16
@@ -944,10 +944,69 @@ def _compile_gvr_direct(kernel):
     oi_f = _crt.make_fake_compact_tensor(
         cutlass.Int32, (n_rows, kernel.top_k), stride_order=(1, 0), assumed_align=16
     )
+    output_values_fake = None
+    if kernel.return_output_values:
+        output_values_fake = _crt.make_fake_compact_tensor(
+            kernel.dtype, (n_rows, kernel.top_k), stride_order=(1, 0), assumed_align=16
+        )
     fs = _crt.make_fake_stream(use_tvm_ffi_env_stream=True)
     # __call__(input, pre_idx, seq_lens, output_values, output_indices, order_row, stream)
     return cute.compile(
-        kernel, in_f, pi_f, sl_f, None, oi_f, None, stream=fs, options="--enable-tvm-ffi"
+        kernel,
+        in_f,
+        pi_f,
+        sl_f,
+        output_values_fake,
+        oi_f,
+        None,
+        stream=fs,
+        options="--enable-tvm-ffi",
+    )
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("enable_r0,cluster_size", [(True, 1), (False, 1), (True, 4)])
+def test_cute_dsl_gvr_topk_decode_output_values(enable_r0, cluster_size, tie_aware_check):
+    """Value writeback matches indices for tied, short, and cooperative rows."""
+    top_k = 512
+    num_rows = 3
+    num_cols = 8192
+    seq_lens = torch.tensor([2048, 2049, num_cols], dtype=torch.int32, device="cuda")
+    logits, pre_idx, seq_lens = _make_inputs(
+        num_rows,
+        num_cols,
+        top_k,
+        torch.float32,
+        next_n=1,
+        seed=29,
+        preidx_hit_rate=0.5,
+        seq_lens=seq_lens,
+    )
+    logits[0, :2048] = 0.25
+    columns = torch.arange(num_cols, device="cuda")
+    logits.masked_fill_(columns[None, :] >= seq_lens[:, None], 1e6)
+    kernel = _GvrTopKKernel(
+        dtype=cutlass.Float32,
+        top_k=top_k,
+        num_threads=512,
+        use_256bit_load=False,
+        min_blocks_per_mp=1,
+        cluster_size=cluster_size,
+        return_output_values=True,
+        enable_r0=enable_r0,
+    )
+    compiled = _compile_gvr_direct(kernel)
+    out_indices = torch.full((num_rows, top_k), -1, dtype=torch.int32, device="cuda")
+    out_values = torch.full((num_rows, top_k), float("nan"), dtype=torch.float32, device="cuda")
+
+    compiled(logits, pre_idx, seq_lens, out_values, out_indices, None)
+    torch.cuda.synchronize()
+
+    tie_aware_check(out_indices, logits, seq_lens, top_k, 1)
+    selected_values = logits.gather(1, out_indices.long())
+    torch.testing.assert_close(out_values, selected_values, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(
+        out_values[0], torch.full_like(out_values[0], 0.25), rtol=0.0, atol=0.0
     )
 
 
