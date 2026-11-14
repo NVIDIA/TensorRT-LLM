@@ -42,6 +42,8 @@ All published functionality in the Release Notes has been fully tested and verif
 - **Unquantized TRTLLM-Gen MoE runs on native TRT-LLM kernels.** BF16 MoE with `moe_config.backend="TRTLLM"` now uses TRT-LLM's own BF16 TRTLLM-Gen kernels instead of FlashInfer's `trtllm_bf16_moe`, so FlashInfer is no longer needed for any TRTLLM-Gen MoE format. Hidden size and each rank's intermediate shard must be multiples of 128; other shapes fall back to the CUTLASS backend.
 - **Removed `TRTLLM_GEN_FUSED_MOE_USE_FLASHINFER`.** The opt-in that moved quantized TRTLLM-Gen MoE (`moe_config.backend="TRTLLM"` with NVFP4, FP8 block scales, W4A16_MXFP4 or W4A8_MXFP4_MXFP8) onto FlashInfer's TRTLLM-Gen wrappers has been removed together with those wrappers and the FlashInfer two-sided NVLink all-to-all. Quantized formats always run the native TRT-LLM kernels, which accept every configuration the FlashInfer path did. Setting the variable has no effect and logs a one-time warning; deployments should drop it.
 
+- A request body that fails validation is now answered with OpenAI's error object by `trtllm-serve` and the disaggregated server: HTTP 400 with `{"error": {"message", "type": "invalid_request_error", "param", "code": null}}`. The `message` names each rejected parameter by its place in the body (for example `Unknown parameter: 'stores'.`) and never quotes the rejected value, and `param` holds the place of the first one. The `error` field was a string before, pydantic's rendering of the failure, which repeated every rejected value; clients that read it as a string should read `error.message` instead. `/v1/messages` keeps the Anthropic error envelope, now with the same message, and visual generation keeps its HTTP 422 envelope.
+
 ### Fixed Issues
 
 ### Known Issues
