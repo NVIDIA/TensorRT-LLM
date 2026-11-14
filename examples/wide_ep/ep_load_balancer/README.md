@@ -314,3 +314,13 @@ Per-layer dynamic EPLB has the following constraints:
 * **Speculative decoding**: a one-model draft's MoE layers follow the same rule as the target's: every MoE layer that runs on `MEGAMOE_CUTEDSL` registers as one more per-layer dynamic layer after the target layers, is planned and load-balanced like them, and, with `per_layer_resident`, gets its own helper slots. DSpark drafters shipped inside an NVFP4 target checkpoint, such as `DeepSeek-V4-Pro-nvfp4-DSpark`, do so with NVFP4 draft experts. A draft layer only computes correctly if its checkpoint experts are NVFP4: the `mtp.*` routed experts of the `DeepSeek-V4-Pro-NVFP4` checkpoint are MXFP4, which `MEGAMOE_CUTEDSL` does not serve, so MTP on that checkpoint is not supported with or without this load balancer.
 * **DWDP**: not supported; `dwdp_config` must keep `dwdp_size` at 1.
 * **Fields**: only `mode`, `num_slots`, `auxiliary_sms` and `helper_slot_mode`. `num_slots` is required, must be greater than the expert count, and must be divisible by the EP size. `layer_updates_per_iter` and `initial_global_assignments` are `standard`-only and rejected in this mode.
+
+## Modeling V2 targets
+
+A [Modeling V2](../../../tensorrt_llm/_torch/_experimental/modeling_v2/README.md) target runs only the EPLB modes it implements. When a deployment sets `modeling_v2` (`auto` or `require`) together with `moe_config.load_balancer`, the engine builds a target only if the target implements the deployment's EPLB mode. Otherwise `auto` builds the built-in model, which implements every mode above, and `require` fails with the reason.
+
+| Target | EPLB modes | Layouts |
+|---|---|---|
+| DeepSeek-R1-0528 NVFP4 (`deepseek_v3/r1_0528_nvfp4__sm_10x__default`, SM100 and SM103) | static, online | attention DP with pure expert parallelism over 4 or 8 GPUs (dep4, dep8) |
+
+Every other target declines EPLB, so those deployments run the built-in model. To collect the expert statistics for `generate_eplb_config.py`, run the statistics pass with `modeling_v2: off`. The built-in model uses the same router, so its statistics describe the same load.

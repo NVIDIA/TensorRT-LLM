@@ -157,7 +157,9 @@ example that uses no Modeling V1 model code.
    for switches to it as soon as the target lands. To keep a target opt-in
    until it is validated, decorate its class with `@disable_v2_by_default`
    (from `tensorrt_llm._torch._experimental.modeling_v2`). Deployments then use
-   it only when they set `modeling_v2` to `auto` or `require` explicitly.
+   it only when they set `modeling_v2` to `auto` or `require` explicitly. A
+   target that implements expert load balancing lists its modes in
+   `EPLB_MODES`; see [Routing](#routing).
 4. Use catalog operations where they fit. Add new operations as `OpWrapper`s
    with tests. See [Writing operations](#writing-operations).
 5. For C++/CUDA code, follow the [native code guide](../../../../cpp/tensorrt_llm/modeling_v2/README.md).
@@ -206,6 +208,17 @@ batch composition or prefill versus decode are handled inside the target.
 Check in `route` every requirement the target has, not only in the target's
 constructor. A configuration that `route` declines falls back to Modeling V1
 under `auto`; one that the constructor rejects with an assertion fails.
+
+Expert load balancing (EPLB) is checked for every target. When a deployment
+runs EPLB (`moe_config.load_balancer` is set, the architecture is in
+`moe_model_arch_list` and the experts are split over more than one EP rank),
+the loader creates the load balancer whichever class it builds, but only a
+target that registers its MoE layers with it balances anything. After `route`
+returns a target, the resolver compares the deployment's EPLB mode (`static`,
+`online` or `per_layer_dynamic`) with the target class's `EPLB_MODES` and
+treats a target that does not list it as `NoTarget`: `auto` keeps Modeling V1
+for that deployment and `require` raises with the reason. `EPLB_MODES` is empty
+unless the target sets it.
 
 How the model loader resolves a target:
 
@@ -349,6 +362,118 @@ mode the target uses.
 * **CUDA graphs.** Make every shape depend only on the step's host integers
   (batch size, number of context requests, draft length), so the whole step is
   captured in one CUDA graph with the target.
+
+## Expert load balancing (EPLB)
+
+EPLB places a MoE layer's experts in slots split evenly over the EP ranks,
+with spare slots holding more copies of the hot experts, so a rank's load
+follows its share of the slots rather than of the experts. Deployments
+configure it with `moe_config.load_balancer`; see the
+[EPLB example](../../../../examples/wide_ep/ep_load_balancer/README.md).
+
+The engine owns the load balancer. A target that implements EPLB plugs its
+MoE layers into it:
+
+| Owner | What it does |
+|---|---|
+| Model loader | Creates the balancer around the model when the deployment runs EPLB (`moe_load_balancer_mode`), and registers weight slots and finalizes it after the weights load. |
+| Executor | Wraps every forward in a balancer iteration, turns statistics and updates off during warmup, and shuts the balancer down. |
+| Resolver | Builds a target for an EPLB deployment only if the target class lists the deployment's mode in `EPLB_MODES` (see [Routing](#routing)). |
+| Target | Registers its MoE layers, loads its experts by slot, routes expert ids to slot ids, and declines in `route` the layouts it has not measured EPLB at. Under online EPLB it also hands the balancer host copies of its experts, binds its slot weights to it, and hands every layer back once per forward. |
+
+A target reaches the balancer only through
+[`catalog/moe/eplb.py`](catalog/moe/eplb.py). The balancer
+(`_torch/moe/fused_moe/moe_load_balancer.py`) is engine runtime, like the KV
+cache managers, not Modeling V1 model code.
+
+### Static EPLB in a target
+
+Static EPLB keeps the placement it starts with (`layer_updates_per_iter: 0`).
+A target implements it in four steps. The
+[DeepSeek R1 target](models/deepseek_v3/r1_0528_nvfp4__sm_10x__default/) is
+the example.
+
+1. **Slots.** `eplb_slots(model_config, layer_idx, num_experts)` returns a
+   routed MoE layer's slots on this rank: `num_slots`, this rank's
+   `slot_offset` and `local_slots`, and `slot_experts`, the expert each local
+   slot holds. The placement can differ by layer. Without EPLB every expert
+   has one slot and a rank's slots are its contiguous expert window, so one
+   code path serves both.
+2. **Registration.** At construction, call
+   `EplbLayer.register(slots, top_k, repeat_count)` for every routed MoE
+   layer, in the order the layers run. That includes a draft layer from the
+   target's checkpoint, with `repeat_count` the number of times one forward
+   runs it (`max_draft_len` for one-model MTP). The loader builds the model
+   inside the balancer's context, so the registration reaches it.
+3. **Weights.** Size every expert weight and per-expert scale by
+   `local_slots`, and fill slot `j` from checkpoint expert `slot_experts[j]`.
+   An expert in two slots is loaded twice, and a rank reads only the experts
+   its slots hold.
+4. **Routing.** After the router's top-k, map the expert ids to slot ids
+   with `EplbLayer.route`, and call the expert kernels with `num_slots` as
+   the expert count and `[slot_offset, slot_offset + local_slots)` as this
+   rank's window. Every rank that routes the same tokens gets the same slots,
+   so a target that gathers its tokens before routing stays consistent.
+
+Then list the mode in the target class, `EPLB_MODES = frozenset({"static"})`,
+and gate the layouts in `route` on `moe_eplb_mode(model_config)`.
+
+### Online EPLB in a target
+
+Online EPLB (`layer_updates_per_iter > 0`) moves experts between slots while
+the engine serves. Each forward, every routed layer's statistic records which
+experts the tokens chose. Between forwards the balancer recomputes the
+placement of a few layers, copies the moved experts' weights from host memory
+into their new slots and reroutes to them. On top of the four static steps a
+target does three more, and lists `"online"` in `EPLB_MODES`:
+
+5. **Host copies.** While loading, call
+   `EplbLayer.share_experts(slot_weights, expert_weight)` once per routed
+   layer. `slot_weights` names every per-slot weight -- the operands, their
+   block scales and any per-slot scalar the expert kernel takes -- and
+   `expert_weight(name, expert)` reads one expert's weight in the slot layout,
+   through the same cut and transform as a slot. It is called for the experts
+   in `EplbLayer.host_experts`, this rank's share of its node, so the node
+   holds every expert once. Those experts' checkpoint tensors are then read,
+   which the target's coverage accounting has to expect.
+6. **Binding.** After loading, call `EplbLayer.bind_slots(slot_weights)`
+   before taking any view of those weights. Binding moves them to memory the
+   balancer can write and registers every slot, and a view taken earlier
+   keeps reading the old storage. Binding the same weights again does
+   nothing, as when the model loader runs a post-load hook twice. Every
+   per-slot value the expert kernel reads has to be a bound slot weight: a
+   value derived once from the slot's expert, such as an output scale
+   computed while taking the views, keeps the old expert's value after a
+   move. The balancer needs host-accessible device memory, which Grace
+   systems have and x86 systems get from GDRCopy.
+7. **The forward.** `EplbLayer.route(ids, rows, last)` takes the layer from
+   the balancer on its first call of a forward and records the router's expert ids.
+   `rows` names the rows that are tokens when the rest are padding, such as
+   the rows an attention-DP gather pads. `EplbLayer.close()` hands the layer
+   back after its last expert kernel of the forward. The balancer takes the
+   layers in their registration order every forward and waits for each to
+   come back, so call `close` once per forward per layer, before the next
+   layer routes. A layer the forward did not run is closed as well, such as a
+   draft layer when the worker drafts nothing. A layer that runs once per
+   draft step is closed after the last draft step.
+
+### Testing EPLB
+
+A target that implements EPLB adds:
+
+* **CPU:** its slots and weight manifest under a placement unlike the default
+  one, with copies of an expert on several ranks and twice on one rank, and
+  its routing decisions for each EPLB mode and layout. Under online EPLB,
+  also the host copies its load hands over, against what a slot holding the
+  same expert loads.
+* **GPU:** the cells of the catalog EPLB entry and of its expert kernel at
+  the shapes and slot windows the target calls them with (`TARGET_CELLS`),
+  and its registrations against a real balancer in each mode it implements.
+* **Accuracy:** its benchmark with EPLB at every layout it admits, with
+  `modeling_v2="require"`. A slot loaded with the wrong expert still produces
+  fluent text, so use a placement that differs from the default one in every
+  layer. Under online EPLB, a run long enough for the balancer to move
+  experts in every layer, the draft layer included.
 
 ## Writing operations
 

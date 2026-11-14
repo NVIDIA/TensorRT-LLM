@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import math
 import zlib
+from collections import Counter
 from types import SimpleNamespace
 
 import pytest
@@ -46,6 +47,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.deepseek_v3 import rou
 from tensorrt_llm._torch._experimental.modeling_v2.models.deepseek_v3.r1_0528_nvfp4__sm_10x__default import (  # noqa: E501
     weights as D,
 )
+from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig
 from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
@@ -343,8 +345,12 @@ def test_shares_tile_intermediates_and_experts(layout):
 
     for tp_slot in range(layout[2]):
         slot = [d for d in dims if d.moe_tp_rank == tp_slot]
-        experts = sorted(e for d in slot for e in _blocks(d.expert_offset, d.local_experts))
+        experts = sorted(e for d in slot for e in _blocks(d.slot_offset, d.local_slots))
         assert experts == list(range(cfg.n_routed_experts)), (tp_slot, experts[:8])
+        # Without EPLB every expert has one slot, so a rank's slots are its window.
+        for d in slot:
+            for slots in d.slots.values():
+                assert slots.slot_experts == tuple(_blocks(d.slot_offset, d.local_slots))
 
 
 @pytest.mark.parametrize("layout", _ATTN_LAYOUTS, ids=_layout_id)
@@ -446,7 +452,7 @@ def test_expert_operands_are_the_ws1_operands_of_the_rank_share(layout):
         d = core.dims
         share = _cfg(hidden_size=256, moe_intermediate_size=d.moe_inter)
         rows, cols2, cols16 = _intermediate_index(d.moe_tp_rank * d.moe_inter, d.moe_inter, True)
-        for local in (0, d.local_experts - 1):
+        for local in (0, d.local_slots - 1):
             ckpt = _Checkpoint(cfg)
             for name, index in (
                 ("fc1_w", (rows,)),
@@ -500,7 +506,7 @@ def test_mtp_expert_operands_are_the_ws1_operands_of_the_rank_share(layout):
         d = core.dims
         share = _cfg(hidden_size=256, moe_intermediate_size=d.moe_inter)
         rows, cols, _ = _intermediate_index(d.moe_tp_rank * d.moe_inter, d.moe_inter, False)
-        for local in (0, d.local_experts - 1):
+        for local in (0, d.local_slots - 1):
             ckpt = _Checkpoint(cfg)
             for name, index in (("fc1", (rows,)), ("fc2", (slice(None), cols))):
                 param = f"l{layer}_{name}"
@@ -514,7 +520,7 @@ def test_mtp_expert_operands_are_the_ws1_operands_of_the_rank_share(layout):
                 )
             # FC1 is [up ; gate], the order fused_moe reads, opposite to the dense
             # gate_up linear's.
-            q = f"model.layers.{layer}.mlp.experts.{d.expert_offset + local}"
+            q = f"model.layers.{layer}.mlp.experts.{d.slot_offset + local}"
             fc1, _, _ = _read_source(core, _Checkpoint(cfg), f"l{layer}_fc1", local)
             up, gate = _full(f"{q}.up_proj.weight", cfg), _full(f"{q}.gate_proj.weight", cfg)
             assert torch.equal(fc1, torch.cat([up[rows], gate[rows]])), (layout, rank, local)
@@ -698,6 +704,7 @@ def test_load_reads_only_the_rank_share(layout, mtp, monkeypatch):
         )
         ckpt = _Checkpoint(cfg, keys)
         D.MODEL_WEIGHTS.load(model, ckpt)
+        _assert_slot_scales_are_the_expert_products(core)
 
         seen = [k for k, _, _ in ckpt.reads]
         assert len(seen) == len(set(seen)), "a checkpoint key was read twice"
@@ -713,8 +720,8 @@ def test_load_reads_only_the_rank_share(layout, mtp, monkeypatch):
             assert not read_mtp, sorted(read_mtp)[:4]
             continue
         # Every lazy key of the layer (the 0-dim KV scales are not reads) but the two
-        # aliased ones and the off-window experts.
-        lo, hi = d.expert_offset, d.expert_offset + d.local_experts
+        # aliased ones and the experts this rank's slots do not hold.
+        lo, hi = d.slot_offset, d.slot_offset + d.local_slots
         want = {
             k
             for k in keys
@@ -724,3 +731,203 @@ def test_load_reads_only_the_rank_share(layout, mtp, monkeypatch):
             and not (".mlp.experts." in k and not lo <= int(k.split(".")[5]) < hi)
         }
         assert read_mtp == want, (sorted(want - read_mtp)[:4], sorted(read_mtp - want)[:4])
+
+
+# --- static EPLB: a rank's slots hold the experts the placement gives them ---
+
+_EPLB_LAYOUTS = sorted(routing._EPLB_LAYOUTS)
+
+
+def _placement(layer: int, num_experts: int, ep_size: int, spare: int) -> list[int]:
+    """A placement unlike the default one: the experts shuffled per layer, then `spare`
+    more slots a rank holding other experts again -- on rank 0 a second copy of an expert
+    it already holds."""
+    order = torch.randperm(num_experts, generator=torch.Generator().manual_seed(layer)).tolist()
+    per_rank = num_experts // ep_size
+    out = []
+    for rank in range(ep_size):
+        own = order[rank * per_rank : (rank + 1) * per_rank]
+        extra = [order[(rank * per_rank + per_rank + k) % num_experts] for k in range(spare)]
+        if rank == 0:
+            extra[0] = own[0]
+        out += own + extra
+    return out
+
+
+def _eplb_core(layout, rank: int, cfg, mtp: bool, spare: int = 2, updates: int = 0):
+    """`_default_core` under EPLB, static unless `updates` layers move per forward: the
+    config names the architecture the engine balances, and the load balancer config places
+    the experts of every routed layer."""
+    ep = layout[3]
+    layers = range(cfg.first_k_dense_replace, cfg.num_hidden_layers + int(mtp))
+    assignments = {i: _placement(i, cfg.n_routed_experts, ep, spare) for i in layers}
+    pretrained = SimpleNamespace(**vars(cfg), architectures=["DeepseekV3ForCausalLM"])
+    core = SimpleNamespace(
+        model_config=SimpleNamespace(
+            pretrained_config=pretrained,
+            mapping=_mapping(layout, rank),
+            torch_dtype=torch.bfloat16,
+            spec_config=object() if mtp else None,
+            moe_load_balancer=MoeLoadBalancerConfig(
+                num_slots=cfg.n_routed_experts + ep * spare,
+                initial_global_assignments=assignments,
+                layer_updates_per_iter=updates,
+            ),
+        )
+    )
+    core.dims = D.MODEL_WEIGHTS.dims(core)
+    return core, assignments
+
+
+@pytest.mark.parametrize("layout", _EPLB_LAYOUTS, ids=_layout_id)
+def test_eplb_slots_hold_the_placed_experts(layout):
+    """Rank r holds slots [r * S, (r + 1) * S) of every routed layer, S = num_slots / ep,
+    and each slot the expert the placement puts there; together the ranks hold every
+    expert of every layer, the MTP layer's included."""
+    cfg = SimpleNamespace(**_TINY)
+    ep = layout[3]
+    held: dict = {}
+    for rank in range(layout[0]):
+        core, assignments = _eplb_core(layout, rank, cfg, mtp=True)
+        d = core.dims
+        local = (cfg.n_routed_experts + 2 * ep) // ep
+        assert (d.eplb, d.num_slots, d.local_slots, d.slot_offset) == (
+            "static",
+            local * ep,
+            local,
+            rank * local,
+        )
+        for i, placement in assignments.items():
+            mine = tuple(placement[rank * local : (rank + 1) * local])
+            assert d.slots[i].slot_experts == mine, (layout, rank, i)
+            held.setdefault(i, set()).update(mine)
+    assert all(experts == set(range(cfg.n_routed_experts)) for experts in held.values())
+
+
+@pytest.mark.parametrize("mtp", [False, True], ids=["no_mtp", "mtp"])
+@pytest.mark.parametrize("layout", _EPLB_LAYOUTS, ids=_layout_id)
+def test_eplb_load_fills_every_slot_with_its_expert(layout, mtp, monkeypatch):
+    """`load` under static EPLB: coverage holds both ways, a rank reads each expert's
+    tensors once per slot that holds it and no expert it does not hold, and every slot
+    holds exactly what the world-size-1 table, which has no EPLB, loads for that slot's
+    expert."""
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda *a, **k: None)
+    cfg = SimpleNamespace(**_TINY)
+    keys = _tiny_keys(cfg)
+    oracle = _default_core(_WS1, 0, cfg, mtp)
+    oracle.manifest = D.MODEL_WEIGHTS.manifest(oracle)
+    for rank in range(layout[0]):
+        core, assignments = _eplb_core(layout, rank, cfg, mtp)
+        d = core.dims
+        core.w = D.MODEL_WEIGHTS.declare(d)
+        lm_head = nn.Parameter(torch.empty(cfg.vocab_size, cfg.hidden_size, dtype=torch.bfloat16))
+        params = [("lm_head.weight", lm_head)] + [(f"model.w.{k}", p) for k, p in core.w.items()]
+        model = SimpleNamespace(
+            model=core, lm_head=SimpleNamespace(weight=lm_head), named_parameters=lambda: params
+        )
+        ckpt = _Checkpoint(cfg, keys)
+        D.MODEL_WEIGHTS.load(model, ckpt)
+
+        _assert_slot_scales_are_the_expert_products(core)
+        reads = Counter(k for k, _, _ in ckpt.reads)
+        for i in assignments:
+            mine = d.slots[i].slot_experts
+            names = _slot_names(i, cfg)
+            assert tuple(D.MODEL_WEIGHTS.slot_weights(core, i)) == names, i
+            for e in range(cfg.n_routed_experts):
+                key = f"model.layers.{i}.mlp.experts.{e}.down_proj.weight"
+                assert reads[key] == mine.count(e), (layout, rank, i, e)
+            for slot, e in enumerate(mine):
+                for name in names:
+                    want = _ws1_expert(oracle, cfg, i, name, e)
+                    assert torch.equal(core.w[f"l{i}_{name}"][slot], want), (rank, i, slot, name)
+
+
+def _assert_slot_scales_are_the_expert_products(core) -> None:
+    """Each trunk layer's per-slot output scales are bitwise what the forward used to derive
+    from the per-expert scalars: the same products of the same fp32 values, in the same
+    order."""
+    d, w = core.dims, core.w
+    for i in range(d.dense_layers, d.num_layers):
+        held = torch.tensor(d.slots[i].slot_experts)
+        isc1, e_isc2 = w[f"l{i}_mlp_isc1"], w[f"l{i}_e_isc2"][held]
+        gate1 = isc1[0] * w[f"l{i}_e_ws2_1"][held]
+        assert torch.equal(w[f"l{i}_out1_gate_scale"], gate1), i
+        assert torch.equal(w[f"l{i}_out1_scale"], gate1 / e_isc2), i
+        assert torch.equal(w[f"l{i}_out2_scale"], e_isc2 * w[f"l{i}_e_ws2_2"][held]), i
+
+
+def _slot_names(layer: int, cfg) -> tuple[str, ...]:
+    """A routed layer's slot weights: the trunk's NVFP4 operands and output scales, the MTP
+    layer's bf16 operands."""
+    if layer < cfg.num_hidden_layers:
+        return ("fc1_w", "fc1_s", "fc2_w", "fc2_s", "out1_scale", "out1_gate_scale", "out2_scale")
+    return ("fc1", "fc2")
+
+
+def _ws1_expert(oracle, cfg, layer: int, name: str, expert: int) -> torch.Tensor:
+    """What the world-size-1 table, which has no EPLB, loads into expert `expert`'s slot."""
+    ckpt_key, _, cut, transform = oracle.manifest[f"l{layer}_{name}"][expert]
+    return D.MODEL_WEIGHTS.read(_Checkpoint(cfg), ckpt_key, cut, transform, oracle)
+
+
+class _Hosting:
+    """An online EPLB layer handle that keeps the host copies `load` hands it."""
+
+    online = True
+
+    def __init__(self, experts):
+        self.host_experts = tuple(experts)
+        self.copies: dict = {}
+        self.names: tuple = ()
+
+    def share_experts(self, slot_weights, expert_weight):
+        self.names = tuple(slot_weights)
+        for name, slot_weight in slot_weights.items():
+            for e in self.host_experts:
+                self.copies[(name, e)] = expert_weight(name, e)
+                assert self.copies[(name, e)].shape == slot_weight.shape[1:], (name, e)
+
+
+@pytest.mark.parametrize("mtp", [False, True], ids=["no_mtp", "mtp"])
+@pytest.mark.parametrize("layout", _EPLB_LAYOUTS, ids=_layout_id)
+def test_online_eplb_load_hands_over_this_ranks_experts(layout, mtp, monkeypatch):
+    """`load` under online EPLB, with the ranks on one node: each rank hands each routed
+    layer's balancer handle every slot weight of its share of the experts -- each one what
+    the world-size-1 table loads for that expert -- reads each of those experts' tensors once
+    more, whether or not a slot already did, and coverage still holds both ways."""
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda *a, **k: None)
+    cfg = SimpleNamespace(**_TINY)
+    keys = _tiny_keys(cfg)
+    oracle = _default_core(_WS1, 0, cfg, mtp)
+    oracle.manifest = D.MODEL_WEIGHTS.manifest(oracle)
+    experts, ranks = cfg.n_routed_experts, layout[0]
+    for rank in range(ranks):
+        core, assignments = _eplb_core(layout, rank, cfg, mtp, updates=2)
+        d = core.dims
+        assert d.eplb == "online"
+        share = range(rank * experts // ranks, (rank + 1) * experts // ranks)
+        core.eplb_layers = {i: _Hosting(share) for i in assignments}
+        core.w = D.MODEL_WEIGHTS.declare(d)
+        lm_head = nn.Parameter(torch.empty(cfg.vocab_size, cfg.hidden_size, dtype=torch.bfloat16))
+        params = [("lm_head.weight", lm_head)] + [(f"model.w.{k}", p) for k, p in core.w.items()]
+        model = SimpleNamespace(
+            model=core, lm_head=SimpleNamespace(weight=lm_head), named_parameters=lambda: params
+        )
+        ckpt = _Checkpoint(cfg, keys)
+        D.MODEL_WEIGHTS.load(model, ckpt)
+
+        reads = Counter(k for k, _, _ in ckpt.reads)
+        for i, hosting in core.eplb_layers.items():
+            names = _slot_names(i, cfg)
+            assert hosting.names == names, i
+            mine = d.slots[i].slot_experts
+            for e in range(experts):
+                key = f"model.layers.{i}.mlp.experts.{e}.down_proj.weight"
+                assert reads[key] == mine.count(e) + (e in share), (layout, rank, i, e)
+            for e in share:
+                for name in names:
+                    want = _ws1_expert(oracle, cfg, i, name, e)
+                    assert torch.equal(hosting.copies[(name, e)], want), (rank, i, e, name)

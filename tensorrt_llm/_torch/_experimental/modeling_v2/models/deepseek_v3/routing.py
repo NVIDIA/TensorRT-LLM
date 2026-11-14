@@ -16,7 +16,13 @@ from typing import TYPE_CHECKING, Tuple
 from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
-from ..._router_index import NoTarget, engine_kv_cache_quant_algo, routes, tp_reaches_across_nodes
+from ..._router_index import (
+    NoTarget,
+    engine_kv_cache_quant_algo,
+    moe_eplb_mode,
+    routes,
+    tp_reaches_across_nodes,
+)
 
 # The GPUs the target is certified on: sm_100 (B200, GB200) and sm_103 (B300,
 # GB300). They run the same kernels.
@@ -65,6 +71,16 @@ _MTP_LAYOUTS = frozenset(
         (4, False, 1, 4),  # tp4 + ep4
         (4, True, 4, 1),  # dep4, experts split by intermediate
         (8, False, 2, 4),  # tp8, experts tp2 x ep4
+        (8, True, 1, 8),  # dep8
+    }
+)
+
+# The layouts at which static EPLB was measured. EPLB balances attention DP over
+# expert-parallel ranks that each hold whole experts, which is the built-in
+# model's requirement too, so only attention-DP layouts with moe_tp 1 qualify.
+_EPLB_LAYOUTS = frozenset(
+    {
+        (4, True, 1, 4),  # dep4
         (8, True, 1, 8),  # dep8
     }
 )
@@ -154,6 +170,15 @@ def route(
             "dep2, tp4, tp4+ep4, tp4 with moe tp2 x ep2, dep4 with moe ep4, tp2 x ep2 "
             "or tp4, tp8, tp8+ep8, tp8 with moe tp4 x ep2 or tp2 x ep4, dep8 with moe "
             "ep8, tp8 or tp2 x ep4, and dep16"
+        )
+
+    # Under EPLB the target loads its experts by slot and routes ids to slots. Which EPLB
+    # modes it implements is the resolver's check (`EPLB_MODES`); where it was measured
+    # is this one.
+    eplb = moe_eplb_mode(model_config)
+    if eplb is not None and layout not in _EPLB_LAYOUTS:
+        raise NoTarget(
+            f"{eplb} EPLB at parallel layout {split}; the default target runs EPLB at dep4 and dep8"
         )
 
     # Attention TP across nodes reduces only over multi-node NVLink.

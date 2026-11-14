@@ -136,6 +136,7 @@ l0_cpu:
   - unittest/_torch/modeling_v2/test_modeling_v2_reference_precision.py
   - unittest/_torch/modeling_v2/test_modeling_v2_fp4_test_helpers.py
   - unittest/_torch/modeling_v2/test_modeling_v2_routing.py
+  - unittest/_torch/modeling_v2/moe/test_modeling_v2_eplb.py
   - unittest/_torch/modeling_v2/comm/test_modeling_v2_rank_equality.py
   - unittest/_torch/modeling_v2/comm/test_modeling_v2_rank_job.py
   # The GPU stages run with -m "not cpu_only", so this entry is what runs it.

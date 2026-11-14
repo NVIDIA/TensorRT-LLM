@@ -11,7 +11,9 @@ compared the generated manifest against it, per key and per source, with MTP on 
 -- green in CI job 1081689 -- and both the function and that test were deleted
 together. One renaming was deliberate: the hand-written manifest called the MTP
 module's rows `mtp_*`; the table addresses it as layer `num_hidden_layers`, which is
-what the checkpoint calls it, so they are `l61_*`.
+what the checkpoint calls it, so they are `l61_*`. And one addition: the runner's three
+per-slot output scales, which the block left to the forward to derive, are slot weights
+in the table, read per slot like the experts' other operands.
 
 No GPU: nothing here allocates, and `dims` reads `model_config` alone.
 """
@@ -55,8 +57,9 @@ def _core(mtp: bool):
     """The configuration surface the table reads, at the dep4 layout: attention DP over
     four ranks, the experts split four ways, this rank the second.
 
-    `dims` derives the expert window from the mapping; the reference below hard-codes
-    the hand-written `local_experts`, so the comparison also checks that the two agree.
+    `dims` derives the expert slots from the mapping; the reference below hard-codes
+    the hand-written expert count per rank, so the comparison also checks that the two
+    agree.
     """
     cfg = SimpleNamespace(**_CFG)
     mapping = SimpleNamespace(
@@ -159,6 +162,8 @@ def _reference_declaration(mtp: bool) -> dict:
         w[f"l{i}_fc1_s"] = P(local, 2 * mi, hidden // sf_vec, dtype=u8)
         w[f"l{i}_fc2_w"] = P(local, hidden, mi // 2, dtype=u8)
         w[f"l{i}_fc2_s"] = P(local, hidden, mi // sf_vec, dtype=u8)
+        for name in ("out1_scale", "out1_gate_scale", "out2_scale"):
+            w[f"l{i}_{name}"] = P(local, dtype=f32)
         for name in ("isc1", "isc1_up", "ws2_1", "ws2_1_up", "isc2", "ws2_2"):
             w[f"l{i}_e_{name}"] = P(c.n_routed_experts, dtype=f32)
     w["final_norm"] = P(hidden)

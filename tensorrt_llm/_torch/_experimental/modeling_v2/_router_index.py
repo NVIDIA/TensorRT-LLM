@@ -215,15 +215,57 @@ def engine_kv_cache_quant_algo(config: "ModelConfig", llm_args: "TorchLlmArgs"):
     return {"fp8": QuantAlgo.FP8, "nvfp4": QuantAlgo.NVFP4}.get(dtype, dtype)
 
 
+def moe_eplb_mode(config: "ModelConfig") -> Optional[str]:
+    """The EPLB mode the engine runs this deployment with, for a route to gate layouts on.
+
+    ``static``, ``online`` or ``per_layer_dynamic`` (see ``moe_load_balancer_mode``),
+    or None when the engine creates no MoE load balancer. Which modes a target
+    implements is not a route's check: the resolver compares this mode with the
+    target's ``EPLB_MODES``.
+    """
+    from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import moe_load_balancer_mode
+
+    return moe_load_balancer_mode(config, config.mapping)
+
+
+def _check_eplb_mode(target: type, config: "ModelConfig") -> None:
+    """Raise ``NoTarget`` unless ``target`` implements the EPLB mode this deployment runs.
+
+    The loader creates the MoE load balancer around whichever class it builds
+    (``maybe_create_moe_load_balancer``). A target takes part only by
+    registering its MoE layers with it, so a target that does not would run an
+    EPLB deployment on fixed expert windows: no replicas under static EPLB and
+    no layer to update under online EPLB. A target lists the modes it
+    implements in the class attribute ``EPLB_MODES``; without it, none.
+    """
+    from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import MOE_LOAD_BALANCER_MODES
+
+    implemented = frozenset(getattr(target, "EPLB_MODES", ()))
+    unknown = implemented - MOE_LOAD_BALANCER_MODES
+    if unknown:
+        raise ValueError(
+            f"{target.__qualname__}.EPLB_MODES names {sorted(unknown)}; the EPLB modes are "
+            f"{sorted(MOE_LOAD_BALANCER_MODES)}"
+        )
+    eplb = moe_eplb_mode(config)
+    if eplb is not None and eplb not in implemented:
+        raise NoTarget(
+            f"{eplb} EPLB (moe_config.load_balancer at moe_ep_size={config.mapping.moe_ep_size}); "
+            f"{target.__name__} implements {', '.join(sorted(implemented)) or 'no EPLB mode'}"
+        )
+
+
 def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Optional[type]:
     """Decide which modeling_v2 target, if any, this deployment builds.
 
     Returns the target class, or None for the built-in implementation:
     when ``llm_args.modeling_v2`` is ``off``, when no ``route`` is registered
-    for the architecture, or when that ``route`` raises ``NoTarget``.
-    In ``require`` every one of those but ``off`` raises ``ValueError`` instead.
-    It also returns None for a ``@disable_v2_by_default`` target when
-    ``modeling_v2`` was left at its default.
+    for the architecture, when that ``route`` raises ``NoTarget``, or when
+    the deployment runs EPLB in a mode the target does not list in
+    ``EPLB_MODES``. In ``require`` every one of those but ``off`` raises
+    ``ValueError`` instead. It also returns None for a
+    ``@disable_v2_by_default`` target when ``modeling_v2`` was left at its
+    default.
 
     """
     mode = ModelingV2Mode.of(llm_args)
@@ -241,6 +283,8 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
             known = ", ".join(sorted(registered_routes())) or "(none)"
             raise NoTarget(f"no route for this architecture; routed architectures: {known}")
         target = route(config, llm_args, _device_compute_capability())
+        if target is not None:
+            _check_eplb_mode(target, config)
     except NoTarget as why:
         if mode is ModelingV2Mode.REQUIRE:
             raise ValueError(f"modeling_v2='require', but no target fits {arch!r}: {why}") from None
