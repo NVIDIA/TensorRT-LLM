@@ -20,6 +20,7 @@ import zlib
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ssm.gdn_prefill_conv_post import (  # noqa: E501
     A_LOG_RANGE,
     CONV_WIDTH,
@@ -29,6 +30,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ssm.gdn_
     IN_PROJ_WIDTH,
     NUM_K_HEADS,
     NUM_V_HEADS,
+    PAGE_GDN_LAYERS,
     QKV_DIM,
     SOFTPLUS_THRESHOLD,
     _engine_slots,
@@ -38,6 +40,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ssm.gdn_
 )
 
 __extra_import_path__ = ["../../../.."]
+from _cells import certified_cells  # noqa: E402 — needs the path declared above
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "gdn_prefill_conv_post requires a CUDA device"
@@ -146,7 +149,43 @@ def _compare(out, pool, want, what=""):
     assert torch.equal(pool, pool_r), "conv pool differs"
 
 
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
+def _rank2_cell(lengths, initial, slots) -> dict:
+    """A tp2/tep2 rank of the FP8 target: 8 k / 24 v heads over its 8240-wide projection, on the
+    stock conv page at 8192 slots, a bound on every pool such a rank binds (its last slot past
+    2^32 elements, its middle past 2^31)."""
+    hk, hv = NUM_K_HEADS // 2, NUM_V_HEADS // 2
+    return dict(
+        num_k_heads=hk,
+        num_v_heads=hv,
+        head_dim=HEAD_K_DIM,
+        x_row_stride=(2 * hk + 2 * hv) * HEAD_K_DIM + 2 * hv,
+        lengths=lengths,
+        initial=initial,
+        pool_slots=8192,
+        page_layers=PAGE_GDN_LAYERS,
+        slots=slots,
+        linear_gate=True,
+    )
+
+
+#: The shapes each target calls this entry with beyond its own cells, by target directory.
+TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
+    "qwen4_exp/qwen3_8_flash_next_fp8__sm_103__unified": (
+        Cell(
+            why="fp8 tp2/tep2 rank: 37+1+128 tokens carry/fresh/carry at slots 8191, 0, 4096",
+            spec=_rank2_cell((37, 1, 128), (True, False, True), (8191, 0, 4096)),
+        ),
+        Cell(
+            why="fp8 tp2/tep2 rank at max_num_tokens: one carrying 8192-token chunk at slot 8191",
+            spec=_rank2_cell((8192,), (True,), (8191,)),
+        ),
+    ),
+}
+
+CELLS = certified_cells(op, TARGET_CELLS)
+
+
+@pytest.mark.parametrize("cell", CELLS, ids=[c.why[:44] for c in CELLS])
 def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest resolves the fixture by this name
     certifying(op)
     args = _build(cell.spec, seed=zlib.crc32(cell.why.encode()))

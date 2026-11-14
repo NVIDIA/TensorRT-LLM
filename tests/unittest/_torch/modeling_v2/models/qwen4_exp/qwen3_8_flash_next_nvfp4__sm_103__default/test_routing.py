@@ -16,7 +16,7 @@ import torch
 from transformers import PretrainedConfig
 
 from tensorrt_llm._torch._experimental.modeling_v2._router_index import modeling_v2_resolve
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp import routing
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp import ple_host_table, routing
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__default import (  # noqa: E501
     modeling as M,
 )
@@ -74,6 +74,7 @@ def _on_sm103(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 3))
     monkeypatch.delenv("TRTLLM_USE_GDN_REPLAY", raising=False)
+    monkeypatch.delenv(ple_host_table.PLE_HOST_TABLE_ENV, raising=False)
 
 
 def _llm_args(mode="auto", **kwargs) -> TorchLlmArgs:
@@ -535,3 +536,13 @@ def test_mtp_needs_the_cached_replay(monkeypatch, max_draft_len):
     _claimed(_model_config(**_LAYOUTS["tep4"]))
     monkeypatch.delenv("TRTLLM_USE_GDN_REPLAY")
     _claimed(config)
+
+
+def test_a_misspelled_ple_host_table_mode_fails_at_routing(monkeypatch):
+    """The n-gram table's storage mode is read at routing, so a misspelled value fails there,
+    under `auto` too, rather than at the build."""
+    monkeypatch.setenv(ple_host_table.PLE_HOST_TABLE_ENV, "nodes")
+    with pytest.raises(ValueError, match=f"{ple_host_table.PLE_HOST_TABLE_ENV}='nodes': expected"):
+        modeling_v2_resolve(_model_config(**_LAYOUTS["tep4"]), _llm_args("auto"))
+    monkeypatch.setenv(ple_host_table.PLE_HOST_TABLE_ENV, "Node")
+    _claimed(_model_config(**_LAYOUTS["tep4"]))

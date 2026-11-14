@@ -9,13 +9,18 @@ import triton
 import triton.language as tl
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.jit_variants import (
+    warm_variants,
+)
 
 # Approved exception: QSA's selection path is Triton called as Python, with no
 # torch.ops boundary. The engine's own sparse hook (`select_qsa_paged_tokens`
 # in `_torch/attention/backends/sparse/qsa/module.py`) calls this same callable.
+from tensorrt_llm._torch.attention.backends.sparse.qsa import kernels as _qsa_kernels
 from tensorrt_llm._torch.attention.backends.sparse.qsa.kernels import (
     triton_qsa_paged_index_scores as _triton_qsa_paged_index_scores,
 )
+from tensorrt_llm._torch.modules.fla.op import gdc_wait_with_memory_clobber
 
 _INTEGER_DTYPES = (torch.int32, torch.int64)
 
@@ -32,6 +37,10 @@ _SPLIT_BLOCK_N = 64
 #: 1024 tiles of a 262143-position window; wider batches stream several requests at once.
 _SPLIT_PROGRAMS_PER_SM = 16
 _SPLIT_PROGRAMS_PER_SM_ONE_TILE = 32
+#: With `wide_split`, from this many rows four times as many programs, so the longest windows'
+#: chains of column tiles do not set the launch's time. The scores do not depend on the split.
+_SPLIT_WIDE_MIN_ROWS = 32
+_SPLIT_PROGRAMS_PER_SM_WIDE = 64
 _SPLIT_NUM_WARPS = 2
 _SM_COUNT: dict = {}
 
@@ -82,7 +91,8 @@ def _qsa_index_scores_visible_split_kernel(
     row of their request in the row tile, and different requests run side by side.
     """
     if USE_PDL:
-        tl.extra.cuda.gdc_wait()
+        # The memory clobber keeps loads of the predecessor's outputs below the wait.
+        gdc_wait_with_memory_clobber()
         tl.extra.cuda.gdc_launch_dependents()
     row_base = tl.program_id(0) * ROWS_PER_TILE
     group_slot = tl.program_id(1)
@@ -211,6 +221,7 @@ def _qsa_index_scores_visible_split(
     programs_per_sm: int | None = None,
     num_warps: int = _SPLIT_NUM_WARPS,
     num_stages: int = 2,
+    wide: bool = False,
 ) -> torch.Tensor:
     """One launch of the visible-split kernel after the callable's own checks."""
     if index_cache.ndim != 4 or index_cache.shape[2] != 1:
@@ -243,7 +254,11 @@ def _qsa_index_scores_visible_split(
     row_tiles = triton.cdiv(rows, rows_per_tile)
     if programs_per_sm is None:
         programs_per_sm = (
-            _SPLIT_PROGRAMS_PER_SM_ONE_TILE if row_tiles == 1 else _SPLIT_PROGRAMS_PER_SM
+            _SPLIT_PROGRAMS_PER_SM_ONE_TILE
+            if row_tiles == 1
+            else _SPLIT_PROGRAMS_PER_SM_WIDE
+            if wide and rows >= _SPLIT_WIDE_MIN_ROWS
+            else _SPLIT_PROGRAMS_PER_SM
         )
     # Every (row tile, group slot) pair gets `split` programs; slots past a tile's request
     # count exit at once.
@@ -277,7 +292,9 @@ def _qsa_index_scores_visible_split(
         TOKENS_PER_BLOCK=tokens_per_block,
         COMPRESS_RATIO=compress_ratio,
         MAX_COMPRESSED_BLOCKS=max_compressed_blocks,
-        ROWS_PER_TILE=rows_per_tile,
+        # One row tile masks its rows by `num_rows` alone: compile it at the full tile so every
+        # row count up to `query_tile` shares one variant.
+        ROWS_PER_TILE=query_tile if row_tiles == 1 else rows_per_tile,
         QUERY_TILE=query_tile,
         BLOCK_H=dot_width,
         BLOCK_N=block_n,
@@ -289,7 +306,11 @@ def _qsa_index_scores_visible_split(
     return output
 
 
-@triton.jit
+# The row count follows the batch; the metadata views begin at any row of a mixed step.
+@triton.jit(
+    do_not_specialize=["rows"],
+    do_not_specialize_on_alignment=["query_positions", "request_indices"],
+)
 def _qsa_index_scores_group_kernel(
     q,
     index_cache,
@@ -328,7 +349,8 @@ def _qsa_index_scores_group_kernel(
     the row-wise kernel's, bit for bit."""
     BLOCK_H: tl.constexpr = BLOCK_G * NUM_INDEX_HEADS
     if USE_PDL:
-        tl.extra.cuda.gdc_wait()
+        # The memory clobber keeps loads of the predecessor's outputs below the wait.
+        gdc_wait_with_memory_clobber()
         tl.extra.cuda.gdc_launch_dependents()
     group = tl.program_id(0)
     slots = tl.arange(0, BLOCK_G)
@@ -454,7 +476,34 @@ def _takes_request_groups(
     )
 
 
-def _qsa_index_scores_request_groups(
+#: With `prefill_query_tile`, a prefill-sized, visible-only context-row call at 4 index heads of
+#: 128 runs the engine's query-tiled kernel at a deeper launch than the engine's (32 rows a dot
+#: tile, 8 column tiles a program): each gathered key tile serves twice the rows. Bitwise the
+#: engine launch's scores (a row's dot and head sum do not depend on the tile shape).
+_PREFILL_QUERY_TILE = 64
+_PREFILL_TILES_PER_PROGRAM = 16
+_PREFILL_BLOCK_N = 64
+_PREFILL_HEADS = 4
+_PREFILL_HEAD_DIM = 128
+
+
+def _takes_prefill_query_tile(
+    q: torch.Tensor, only_visible_blocks: bool, context_rows: bool, prefetch: bool
+) -> bool:
+    """A context-row call the deeper query-tiled launch serves (`_PREFILL_QUERY_TILE`)."""
+    return (
+        context_rows
+        and only_visible_blocks
+        and not prefetch
+        and q.ndim == 3
+        and q.shape[0] > _DECODE_ROW_LIMIT
+        and q.shape[1] == _PREFILL_HEADS
+        and q.shape[2] == _PREFILL_HEAD_DIM
+        and q.dtype == torch.bfloat16
+    )
+
+
+def _qsa_index_scores_prefill_query_tile(
     q: torch.Tensor,
     index_cache: torch.Tensor,
     block_table: torch.Tensor,
@@ -462,15 +511,77 @@ def _qsa_index_scores_request_groups(
     request_indices: torch.Tensor,
     tokens_per_block: int,
     compress_ratio: int,
-    use_pdl: bool,
-    rows_per_request: int,
 ) -> torch.Tensor:
-    """One launch of the request-group kernel after the callable's own checks."""
+    """The engine's query-tiled kernel at the deeper launch. Same contract as the engine's
+    launcher with `context_rows` and `only_visible_blocks`: columns at and past a row's
+    visible bound are unspecified."""
+    rows = q.shape[0]
+    max_blocks = _check_index_scores_operands(
+        q,
+        index_cache,
+        block_table,
+        query_positions,
+        request_indices,
+        tokens_per_block,
+        compress_ratio,
+    )
+    output = torch.empty((rows, max_blocks), dtype=torch.float32, device=q.device)
+    grid = (
+        triton.cdiv(rows, _PREFILL_QUERY_TILE),
+        triton.cdiv(max_blocks, _PREFILL_BLOCK_N * _PREFILL_TILES_PER_PROGRAM),
+    )
+    _qsa_kernels._qsa_paged_index_scores_qtile_kernel[grid](
+        q,
+        index_cache,
+        block_table,
+        query_positions,
+        request_indices,
+        output,
+        q.shape[2] ** -0.5,
+        rows,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        index_cache.stride(0),
+        index_cache.stride(1),
+        index_cache.stride(2),
+        index_cache.stride(3),
+        block_table.stride(0),
+        block_table.stride(1),
+        output.stride(0),
+        output.stride(1),
+        NUM_INDEX_HEADS=q.shape[1],
+        INDEX_HEAD_DIM=q.shape[2],
+        BLOCK_D=q.shape[2],
+        TOKENS_PER_BLOCK=tokens_per_block,
+        COMPRESS_RATIO=compress_ratio,
+        MAX_COMPRESSED_BLOCKS=max_blocks,
+        QUERY_TILE=_PREFILL_QUERY_TILE,
+        BLOCK_H=_PREFILL_QUERY_TILE * q.shape[1],
+        BLOCK_N=_PREFILL_BLOCK_N,
+        TILES_PER_PROGRAM=_PREFILL_TILES_PER_PROGRAM,
+        ONLY_VISIBLE_BLOCKS=True,
+        num_warps=4,
+    )
+    return output
+
+
+def _check_index_scores_operands(
+    q: torch.Tensor,
+    index_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    query_positions: torch.Tensor,
+    request_indices: torch.Tensor,
+    tokens_per_block: int,
+    compress_ratio: int,
+) -> int:
+    """The engine launcher's operand checks for a `[rows, heads, dim]` query; returns the
+    output's compressed-block count."""
     if index_cache.ndim != 4 or index_cache.shape[2] != 1:
         raise ValueError("QSA index cache must have shape [pages, tokens, 1, dim]")
     if block_table.ndim != 2 or block_table.dtype != torch.int32:
         raise ValueError("QSA index scoring requires a two-dimensional int32 block table")
-    rows, num_index_heads, index_head_dim = q.shape
+    rows, _, index_head_dim = q.shape
     if index_head_dim <= 0 or index_cache.shape[3] != index_head_dim:
         raise ValueError("QSA index query and cache dimensions do not match")
     if q.dtype != index_cache.dtype:
@@ -487,6 +598,31 @@ def _qsa_index_scores_request_groups(
     max_compressed_blocks = block_table.shape[1] * tokens_per_block // compress_ratio
     if max_compressed_blocks <= 0:
         raise ValueError("QSA index scoring requires a non-empty block table")
+    return max_compressed_blocks
+
+
+def _qsa_index_scores_request_groups(
+    q: torch.Tensor,
+    index_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    query_positions: torch.Tensor,
+    request_indices: torch.Tensor,
+    tokens_per_block: int,
+    compress_ratio: int,
+    use_pdl: bool,
+    rows_per_request: int,
+) -> torch.Tensor:
+    """One launch of the request-group kernel after the callable's own checks."""
+    rows, num_index_heads, index_head_dim = q.shape
+    max_compressed_blocks = _check_index_scores_operands(
+        q,
+        index_cache,
+        block_table,
+        query_positions,
+        request_indices,
+        tokens_per_block,
+        compress_ratio,
+    )
     output = torch.empty((rows, max_compressed_blocks), dtype=torch.float32, device=q.device)
     if rows == 0:
         return output
@@ -495,7 +631,7 @@ def _qsa_index_scores_request_groups(
     groups = triton.cdiv(rows, rows_per_request)
     tiles = 1 if groups <= 1 else 2 if groups <= 4 else 4
     grid = (groups, triton.cdiv(max_compressed_blocks, _GROUP_BLOCK_N * tiles))
-    _qsa_index_scores_group_kernel[grid](
+    args = (
         q,
         index_cache,
         block_table,
@@ -514,6 +650,8 @@ def _qsa_index_scores_request_groups(
         block_table.stride(1),
         output.stride(0),
         output.stride(1),
+    )
+    constexprs = dict(
         NUM_INDEX_HEADS=num_index_heads,
         INDEX_HEAD_DIM=index_head_dim,
         BLOCK_D=max(16, triton.next_power_of_2(index_head_dim)),
@@ -529,6 +667,28 @@ def _qsa_index_scores_request_groups(
         num_warps=4,
         launch_pdl=use_pdl,
     )
+    # `TILES_PER_PROGRAM` follows the request count: compile every depth at the first call.
+    warm_variants(
+        _qsa_index_scores_group_kernel,
+        (
+            args[8:18],  # the strides
+            q.dtype,
+            q.data_ptr() % 16 == 0,
+            query_positions.dtype,
+            request_indices.dtype,
+            num_index_heads,
+            index_head_dim,
+            tokens_per_block,
+            compress_ratio,
+            max_compressed_blocks,
+            rows_per_request,
+            use_pdl,
+        ),
+        args,
+        [{"TILES_PER_PROGRAM": t} for t in (1, 2, 4)],
+        **constexprs,
+    )
+    _qsa_index_scores_group_kernel[grid](*args, **constexprs)
     return output
 
 
@@ -646,9 +806,13 @@ class QsaPagedIndexScores(OpWrapper):
     from row 0 (a verify step's `predicted_tokens_per_seq`): with `only_visible_blocks`,
     no `prefetch` and 2, 4 or 8 index heads, the entry's request-group kernel shares one
     key gather across each run (a run whose rows name different requests is gathered
-    row by row). Each cell names the kernel it was
-    measured on. The request-group kernel is bitwise the row-wise one; the
-    visible-split and query-tiled kernels are not.
+    row by row). With `prefill_query_tile`, a visible-only context-row call of more
+    than 256 rows at 4 bf16 index heads of 128 runs the query-tiled kernel at a deeper
+    launch, bitwise the engine launch's scores. With `wide_split`, a visible-split call
+    of `_SPLIT_WIDE_MIN_ROWS` rows or more past one row tile takes more programs an SM,
+    bitwise the narrow split. Both default off. Each cell names the kernel it was
+    measured on. The request-group kernel is bitwise the row-wise one; the visible-split
+    and query-tiled kernels are not.
 
     Fusion boundary: the table walk, the gather, the dots, relu, head sum,
     scale and causal bound are inside. Producing `q` (norm, RoPE), writing and
@@ -1072,6 +1236,8 @@ class QsaPagedIndexScores(OpWrapper):
         use_pdl: bool = False,
         prefetch: bool = False,
         rows_per_request: int = 1,
+        prefill_query_tile: bool = False,
+        wide_split: bool = False,
     ) -> torch.Tensor:
         if rows_per_request < 1:
             raise ValueError("QSA index scoring requires rows_per_request >= 1")
@@ -1085,6 +1251,7 @@ class QsaPagedIndexScores(OpWrapper):
                 tokens_per_block,
                 compress_ratio,
                 use_pdl,
+                wide=wide_split,
             )
         if _takes_request_groups(q, only_visible_blocks, context_rows, prefetch, rows_per_request):
             return _qsa_index_scores_request_groups(
@@ -1097,6 +1264,18 @@ class QsaPagedIndexScores(OpWrapper):
                 compress_ratio,
                 use_pdl,
                 rows_per_request,
+            )
+        if prefill_query_tile and _takes_prefill_query_tile(
+            q, only_visible_blocks, context_rows, prefetch
+        ):
+            return _qsa_index_scores_prefill_query_tile(
+                q,
+                index_cache,
+                block_table,
+                query_positions,
+                request_indices,
+                tokens_per_block,
+                compress_ratio,
             )
         return _triton_qsa_paged_index_scores(
             q=q,
@@ -1126,10 +1305,13 @@ class QsaPagedIndexScores(OpWrapper):
         use_pdl: bool = False,
         prefetch: bool = False,
         rows_per_request: int = 1,
+        prefill_query_tile: bool = False,
+        wide_split: bool = False,
     ) -> torch.Tensor:
         """fp32 scores, `-inf` past each row's bound -- or NaN there, meaning
-        "unspecified", when `only_visible_blocks` is True. `context_rows` and
-        `rows_per_request` are ignored: they pick a kernel, not a result.
+        "unspecified", when `only_visible_blocks` is True. `context_rows`,
+        `rows_per_request`, `prefill_query_tile` and `wide_split` are ignored: they pick a
+        kernel or a launch, not a result.
 
         Walked in row chunks only to bound the gathered keys, which reach
         8.7 GiB in fp32 at 8191 rows x 2080 columns.

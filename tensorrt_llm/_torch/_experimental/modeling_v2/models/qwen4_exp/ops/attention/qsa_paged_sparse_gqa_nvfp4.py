@@ -16,6 +16,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell
 # surface; its row-count PDL policy is reached as Python. The split-K buckets are this
 # entry's own: an NVFP4 tile needs 16 tokens where the bf16 one takes 64.
 from tensorrt_llm._torch.attention.backends.sparse.qsa.kernels import _qsa_pdl_enabled
+from tensorrt_llm._torch.modules.fla.op import gdc_wait_with_memory_clobber
 
 #: Base-2 online softmax: scores are scaled by log2(e) once.
 _LOG2_E = tl.constexpr(1.4426950408889634)
@@ -500,7 +501,7 @@ def _nvfp4_sparse_gqa_splitk_kernel(
     kv_head = tl.program_id(1)
     split = tl.program_id(2)
     if USE_PDL:
-        tl.extra.cuda.gdc_wait()
+        gdc_wait_with_memory_clobber()
     request = tl.load(request_indices + row).to(tl.int64)
     valid_request = (request >= 0) & (request < num_requests)
     safe_request = tl.minimum(tl.maximum(request, 0), num_requests - 1)
@@ -619,7 +620,7 @@ def _nvfp4_merge_splitk_kernel(
     row = tl.program_id(0).to(tl.int64)
     head = tl.program_id(1)
     if USE_PDL:
-        tl.extra.cuda.gdc_wait()
+        gdc_wait_with_memory_clobber()
         tl.extra.cuda.gdc_launch_dependents()
     split_offsets = tl.arange(0, BLOCK_SPLITS)
     dim_offsets = tl.arange(0, HEAD_DIM)

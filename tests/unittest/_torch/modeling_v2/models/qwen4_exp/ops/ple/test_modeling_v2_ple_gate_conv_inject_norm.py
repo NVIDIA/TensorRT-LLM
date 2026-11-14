@@ -248,3 +248,90 @@ def test_cuda_graph_capture_and_replay(spec) -> None:
     assert torch.equal(args[7], eager[2])
     if xc is not None:
         assert torch.equal(xc, eager_xc)
+
+
+@pytest.mark.parametrize("rows_per_seq", (1, 3, 4))
+def test_inject_block_is_the_injection_then_the_op(rows_per_seq) -> None:
+    """`inject_block` is bitwise `qwen4_exp_hc_inject_norm` then the op over its `hc_out`, the
+    pool too; the gate is a strided column, as the target hands it."""
+    from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.hc.qwen4_exp_hc_inject_norm import (  # noqa: E501
+        qwen4_exp_hc_inject_norm,
+    )
+
+    args = _build(dict(lengths=(rows_per_seq,) * 2), seed=20 + rows_per_seq)
+    hc = args[0]
+    rows, width = hc.shape
+    g = torch.Generator(device=DEV).manual_seed(5)
+    routed = (0.5 * torch.randn(rows, CKPT_HIDDEN, device=DEV, generator=g)).to(hc.dtype)
+    shared = (0.5 * torch.randn(rows, CKPT_HIDDEN, device=DEV, generator=g)).to(hc.dtype)
+    gug = (2.0 * torch.randn(rows, 1288, device=DEV, generator=g)).to(hc.dtype)
+    gate = gug[:, 1280:1281]
+    inject = (2.0 * torch.sigmoid(torch.randn(rows, CKPT_HC_COUNT, device=DEV, generator=g))).to(
+        hc.dtype
+    )
+    hc_inj, _ = qwen4_exp_hc_inject_norm(
+        hc, routed, inject, args[10], EPS, CKPT_HC_COUNT, shared, gate
+    )
+    want = _run([hc_inj] + list(args[1:]))
+    args[7] = args[7].clone()
+    hc_out, normed = op(*args, inject_block=(routed, inject, shared, gate))
+    assert torch.equal(hc_out, want[0]) and torch.equal(normed, want[1])
+    assert torch.equal(args[7], want[2])
+    # Without a shared expert (a fresh pool: the call above advanced this one).
+    args = _build(dict(lengths=(rows_per_seq,) * 2), seed=20 + rows_per_seq)
+    hc_inj, _ = qwen4_exp_hc_inject_norm(args[0], routed, inject, args[10], EPS, CKPT_HC_COUNT)
+    want = _run([hc_inj] + list(args[1:]))
+    args[7] = args[7].clone()
+    hc_out, normed = op(*args, inject_block=(routed, inject, None, None))
+    assert torch.equal(hc_out, want[0]) and torch.equal(normed, want[1])
+    assert torch.equal(args[7], want[2])
+
+
+@pytest.mark.parametrize("rows_per_seq", (1, 3))
+def test_pdl_launches_are_the_plain_launches(rows_per_seq) -> None:
+    """`pdl=True` is bitwise the plain launches, eagerly and replayed from a CUDA graph."""
+    args = _build(dict(lengths=(rows_per_seq,) * 4), seed=30 + rows_per_seq)
+    want = _run(args)
+    args[7] = args[7].clone()
+    hc_out, normed = op(*args, pdl=True)
+    assert torch.equal(hc_out, want[0]) and torch.equal(normed, want[1])
+    assert torch.equal(args[7], want[2])
+    # Capture over other inputs, then refill every operand with `want`'s before the replay.
+    fresh = _build(dict(lengths=(rows_per_seq,) * 4), seed=40 + rows_per_seq)
+    pool = fresh[7].clone()
+    fresh[7] = pool
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        g_out, g_normed = op(*fresh, pdl=True)
+    for dst, src in zip(fresh, _build(dict(lengths=(rows_per_seq,) * 4), seed=30 + rows_per_seq)):
+        if isinstance(dst, torch.Tensor):
+            dst.copy_(src)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(g_out, want[0]) and torch.equal(g_normed, want[1])
+    assert torch.equal(pool, want[2])
+
+
+def test_rows_per_sequence_variants_compile_at_the_first_call() -> None:
+    """Every `MAX_P` variant and the rows kernel compile at a geometry's first call: later row
+    counts add no variant, and outputs match the reference."""
+    from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.ops.ple import (
+        ple_gate_conv_inject_norm as mod,
+    )
+
+    def variants():
+        dev = torch.cuda.current_device()
+        return [
+            len(k.device_caches[dev][0]) for k in (mod._ple_conv_kernel, mod._ple_conv_rows_kernel)
+        ]
+
+    for carries in (None, True):
+        first = _build(dict(lengths=[3], carries=None if carries is None else [True]), seed=1)
+        _run(first)
+        warmed = variants()
+        for lengths in ([1], [2], [4], [1] * 5, [2, 4], [17], [40, 3]):
+            spec = dict(lengths=lengths, carries=None if carries is None else [True] * len(lengths))
+            args = _build(spec, seed=len(lengths))
+            out = _run(args)
+            _compare(out, op.reference(*args))
+        assert variants() == warmed, (carries, warmed, variants())
