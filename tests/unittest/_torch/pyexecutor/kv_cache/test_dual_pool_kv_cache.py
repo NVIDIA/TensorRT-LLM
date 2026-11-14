@@ -27,6 +27,8 @@ from transformers import PretrainedConfig, WhisperConfig
 
 import tensorrt_llm
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
+from tensorrt_llm._torch.modules.embedding import Embedding
 from tensorrt_llm._torch.pyexecutor._util import CacheCost, KvCacheCreator
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BlockReusePolicy,
@@ -60,6 +62,33 @@ class _FakeCompiledModel:
     def __init__(self, original_model):
         self._orig_mod = original_model
         self.model_config = original_model.model_config
+
+
+class _FakeCacheSizingDecoder(DecoderModel):
+    """Replace decoder compute while keeping the real tied-head construction."""
+
+    def __init__(self, model_config: ModelConfig) -> None:
+        super().__init__(model_config)
+        self.layers = torch.nn.ModuleList()
+        self.embed_tokens = Embedding(
+            model_config.pretrained_config.vocab_size,
+            model_config.pretrained_config.hidden_size,
+            dtype=model_config.torch_dtype,
+            mapping=model_config.mapping,
+        )
+
+
+class _FakeCacheSizingEncoderDecoder(torch.nn.Module):
+    """Replace encoder/decoder compute while retaining T5's tied output head."""
+
+    def __init__(self, model_config: ModelConfig) -> None:
+        super().__init__()
+        self.shared_embedding = Embedding(
+            model_config.pretrained_config.vocab_size,
+            model_config.pretrained_config.d_model,
+            dtype=model_config.torch_dtype,
+            mapping=model_config.mapping,
+        )
 
 
 _DUMMY_MODEL = "/tmp/dummy_model_dual_pool_test"
@@ -104,6 +133,7 @@ def _make_model_config(
         "hidden_size": 512,
         "head_dim": 64,
         "vocab_size": 32000,
+        "torch_dtype": torch.bfloat16,
     }
     pretrained_kwargs.update(pretrained_overrides)
     pretrained_kwargs.setdefault(
@@ -125,9 +155,22 @@ def _make_model_config(
 
 def _make_mock_model_engine(model_config: ModelConfig) -> Mock:
     """Mock ModelEngine shell; a real engine needs GPU + loaded weights."""
-    engine = Mock(spec=ModelEngine, model=Mock())
-    engine.model.model_config = model_config
-    engine.model.config.torch_dtype = model_config.torch_dtype
+    engine = Mock(spec=ModelEngine)
+    if model_config.is_encoder_decoder:
+        from tensorrt_llm._torch.models.modeling_t5 import T5ForConditionalGeneration
+
+        with patch(
+            "tensorrt_llm._torch.models.modeling_t5.T5Model",
+            side_effect=_FakeCacheSizingEncoderDecoder,
+        ):
+            engine.model = T5ForConditionalGeneration(model_config)
+    else:
+        engine.model = DecoderModelForCausalLM(
+            _FakeCacheSizingDecoder(model_config),
+            config=model_config,
+            hidden_size=model_config.pretrained_config.hidden_size,
+            vocab_size=model_config.pretrained_config.vocab_size,
+        )
     engine.input_processor = SimpleNamespace(requires_encoder_features=False)
     engine.cuda_graph_batch_sizes = []
     engine.cuda_graph_padding_enabled = False
@@ -252,7 +295,12 @@ class TestSplitKvCacheBudgetForCross:
         configured_state = config.model_dump()
         self_config, cross_config = creator._split_kv_cache_budget_for_cross()
         cross_bytes_per_token = 12288  # 6 layers * K/V * 8 heads * 64 elements * 2 bytes
-        expected_budget = int(free_memory * 0.75)
+        logits_bytes = (
+            8
+            * model_config.pretrained_config.vocab_size
+            * (model_config.torch_dtype.itemsize + torch.float32.itemsize)
+        )
+        expected_budget = int((free_memory - logits_bytes) * 0.75)
         if user_max_tokens is not None:
             expected_budget = min(
                 expected_budget, (self_bytes_per_token + cross_bytes_per_token) * user_max_tokens

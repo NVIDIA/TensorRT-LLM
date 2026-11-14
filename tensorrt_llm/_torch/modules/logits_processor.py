@@ -1,17 +1,22 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import torch.nn as nn
 
+from tensorrt_llm._torch.modules.logits_memory import (LogitsMemoryFootprint,
+                                                       lm_head_memory_footprint)
 from tensorrt_llm._utils import nvtx_range
 
 from ..attention.backends import AttentionMetadata
 from .context_logits import project_context_logits
 from .embedding import LMHead
 from .linear import Linear
+
+if TYPE_CHECKING:
+    from .embedding import LMHead
 
 
 def scale_and_soft_cap_logits(logits: torch.Tensor, multiplier: float,
@@ -65,3 +70,9 @@ class LogitsProcessor(nn.Module):
         logits = lm_head(hidden_states)
         logits = logits.float()
         return logits
+
+    def logits_memory_footprint(self, lm_head: "LMHead",
+                                model_dtype: torch.dtype,
+                                is_last_pp_rank: bool) -> LogitsMemoryFootprint:
+        """Bound the output/cast phase through the constructed head's metadata."""
+        return lm_head_memory_footprint(lm_head, model_dtype, is_last_pp_rank)

@@ -43,6 +43,7 @@ from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..attention.backends import AttentionMetadata
 from ..model_config import ModelConfig
+from ..modules.logits_memory import LogitsMemoryWrapper
 from ..peft.lora.config import LoraConfig
 from ..peft.lora.ownership import DecoderLoraOwner
 from .modeling_auto import AutoModelForCausalLM
@@ -953,7 +954,7 @@ class Phi4MMInputProcessor(BaseMultimodalInputProcessor,
         placeholders_separator="",
         content_format=ContentFormat.STRING,
     ))
-class Phi4MMForCausalLM(transformers.PreTrainedModel):
+class Phi4MMForCausalLM(LogitsMemoryWrapper, transformers.PreTrainedModel):
 
     _supports_flash_attn = True
     lora_owner = DecoderLoraOwner(module_path="language_model")

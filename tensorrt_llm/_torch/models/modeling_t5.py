@@ -50,6 +50,7 @@ from ..model_config import ModelConfig
 from ..modules.embedding import Embedding, LMHead
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import TensorParallelMode
+from ..modules.logits_memory import LogitsMemoryFootprint
 from ..modules.logits_processor import LogitsProcessor
 from ..modules.mlp import MLP
 from ..modules.rms_norm import RMSNorm
@@ -874,6 +875,12 @@ class T5ForConditionalGeneration(nn.Module, metaclass=PostInitCaller):
         # T5 convention: scale logits by 1/sqrt(d_model)
         self.rescale_before_lm_head = True
         self.d_model = config.d_model
+
+    def get_logits_memory_footprint(self) -> LogitsMemoryFootprint:
+        """Account for this model's output head and logits processor."""
+        return self.logits_processor.logits_memory_footprint(
+            self.lm_head, self.model_config.torch_dtype, self.model_config.mapping.is_last_pp_rank()
+        )
 
     def __post_init__(self):
         for _, module in self.named_modules():

@@ -49,6 +49,7 @@ from tensorrt_llm.inputs.multimodal import (
 )
 from tensorrt_llm.logger import logger
 
+from ..modules.logits_memory import LogitsMemoryFootprint, logits_memory_footprint_of
 from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from ..pyexecutor.runtime_hooks import DEFAULT_RUNTIME_HOOKS, RuntimeHooks, runtime_hooks_of
 from .modeling_multimodal_utils import (
@@ -433,6 +434,7 @@ class MultimodalModelMixin:
     item scheduling."""
 
     model_config: ModelConfig
+    llm: torch.nn.Module
     _multimodal_encoder_cache: Optional[TensorLRUCache] = None
 
     @classmethod
@@ -706,6 +708,14 @@ class MultimodalModelMixin:
     def vocab_size_padded(self) -> int:
         """Return the inner language model's padded vocabulary size."""
         return self.language_model.vocab_size_padded
+
+    def get_logits_memory_footprint(self) -> Optional[LogitsMemoryFootprint]:
+        """Delegate sizing to the text decoder, including legacy llm wrappers."""
+        try:
+            language_model = self.language_model
+        except NotImplementedError:
+            language_model = self.llm
+        return logits_memory_footprint_of(language_model)
 
     def infer_max_seq_len(self) -> int:
         """Return the inner language model's maximum sequence length."""

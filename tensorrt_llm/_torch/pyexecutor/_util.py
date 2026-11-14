@@ -53,6 +53,7 @@ from ..hostfunc import set_low_latency_dispatch
 from ..model_config import ModelConfig, _get_kv_cache_layer_specs
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..modules.dwdp.dense.manager import DenseDwdpManager
+from ..modules.logits_memory import logits_memory_footprint_of
 from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from ..speculative import (draft_prompt_lookahead, get_draft_block_width,
                            get_num_extra_kv_tokens, get_num_spec_layers,
@@ -1677,6 +1678,48 @@ class KvCacheCreator:
             reserve += 2 * chunk_output_bytes
         return reserve
 
+    def _get_eager_logits_memory_reserve(self, profiled: bool) -> int:
+        """Return extra bytes for eager LM-head output, TP gather and FP32 cast.
+
+        All PP ranks materialize logits. Ordinary generation is bounded by
+        min(max_num_tokens, max_batch_size * beam * tokens_per_gen_step),
+        minus the single profiled output row. Non-one-engine speculation
+        produces all-token logits; a completed profile already covers those
+        max_num_tokens rows. Context-only handoffs have one row per sequence,
+        independent of beams and draft length. Without profiling no rows are
+        subtracted. This is an additive upper bound on the profiled peak, not
+        a bound on requested context logits or sampler/MTP temporary copies.
+        Models without an explicit footprint keep their profiling budget.
+        """
+        footprint = logits_memory_footprint_of(self._model_engine.model)
+        if footprint is None:
+            return 0
+        tokens_per_gen_step = (1 if self._speculative_config is None else
+                               self._speculative_config.tokens_per_gen_step)
+        batch_rows = self._max_batch_size * self._max_beam_width * tokens_per_gen_step
+        profiled_rows = int(profiled)
+        if footprint.context_only:
+            batch_rows = self._max_batch_size
+            num_rows = min(self._max_num_tokens, batch_rows)
+        elif (self._speculative_config is not None
+              and not self._speculative_config.spec_dec_mode.use_one_engine()):
+            num_rows = self._max_num_tokens
+            if profiled and self._speculative_config.max_concurrency is None:
+                profiled_rows = self._max_num_tokens
+        else:
+            num_rows = min(self._max_num_tokens, batch_rows)
+        unprofiled_rows = max(0, num_rows - profiled_rows)
+        reserve = unprofiled_rows * footprint.bytes_per_row
+        if reserve:
+            logger.info(
+                f"Reserving {reserve / GB:.2f} GiB for eager LM-head logits "
+                f"not covered by profiling: {unprofiled_rows} rows x "
+                f"{footprint.bytes_per_row} B (max_num_tokens={self._max_num_tokens}, "
+                f"batch row bound={batch_rows}, profiled rows={profiled_rows}). "
+                "Excludes requested context logits and sampler/MTP temporary copies."
+            )
+        return reserve
+
     def _get_penalty_workspace_reserve(self, py_executor) -> int:
         """Reserve the overlap-headroom seats' penalty workspace.
 
@@ -1919,6 +1962,8 @@ class KvCacheCreator:
         """
         mapping = self._mapping
 
+        profiled = py_executor is not None and not self._skip_est
+
         # TODO: support CP by generating dummy requests for it.
         if mapping.cp_config.get('cp_type') == CpType.HELIX:
             if not self._is_kv_cache_manager_v2:
@@ -1948,7 +1993,7 @@ class KvCacheCreator:
 
         profiled_output_bytes = 0
 
-        if py_executor is not None and not self._skip_est:
+        if profiled:
             # Run the MM encoder at its independent token budget, then keep the
             # equivalent runtime-owned embeddings resident while the text-only
             # LLM dummy fills max_num_tokens.
@@ -2037,6 +2082,10 @@ class KvCacheCreator:
                 f"Reserving {mem_gb:.2f} GiB for multimodal encoder memory "
                 "not materialized by the profiling run.")
 
+        logits_memory_reserve = self._get_eager_logits_memory_reserve(
+            profiled=profiled)
+        peak_memory += logits_memory_reserve
+
         fixed_workspace_reserve = get_attention_workspace_fixed_bytes(
             self._model_engine.model.model_config,
             self._mapping,
@@ -2066,6 +2115,12 @@ class KvCacheCreator:
         kv_cache_max_memory = self._cal_max_memory(peak_memory,
                                                    total_gpu_memory, fraction,
                                                    allocated_bytes)
+        if kv_cache_max_memory <= 0:
+            raise ValueError(
+                "No positive KV cache budget remains after the eager LM-head "
+                f"logits reserve ({logits_memory_reserve / GB:.2f} GiB). "
+                "Adjust max_batch_size, max_num_tokens and "
+                "kv_cache_config.free_gpu_memory_fraction.")
 
         # Estimation uses inferred pool sizing; the final manager uses the
         # user-provided configuration.

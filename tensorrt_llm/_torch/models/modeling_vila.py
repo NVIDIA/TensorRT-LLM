@@ -44,6 +44,7 @@ from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..attention.backends import AttentionMetadata
 from ..modules.embedding import Embedding, LMHead
+from ..modules.logits_memory import LogitsMemoryWrapper
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_encoder import (VisionTower, VisionTowerDynamicS2,
                                           VisionTowerS2)
@@ -635,6 +636,9 @@ def _resize_lm_head(old_lm_head: LMHead, new_num_tokens: int):
                             num_tokens_to_copy, :] = old_lm_head.weight.data[:
                                                                              num_tokens_to_copy, :]
     old_lm_head.weight.data = new_lm_head.weight.data
+    old_lm_head.out_features = new_lm_head.out_features
+    old_lm_head.num_embeddings = new_lm_head.num_embeddings
+    old_lm_head.padding_size = new_lm_head.padding_size
 
     return old_lm_head
 
@@ -1205,7 +1209,7 @@ class VilaInputProcessor(BaseMultimodalInputProcessor,
         # in VilaInputProcessor.
         content_format=ContentFormat.PASSTHROUGH,
     ))
-class VilaModel(PreTrainedModel):
+class VilaModel(LogitsMemoryWrapper, PreTrainedModel):
     config_class = VilaConfig
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,

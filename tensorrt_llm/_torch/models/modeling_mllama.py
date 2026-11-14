@@ -1,6 +1,6 @@
 # Adapted from https://github.com/huggingface/transformers/blob/a7f5479b45a8040392af80bf1107a2bdd796931c/src/transformers/models/mllama/modeling_mllama.py
 #
-# Copyright 2024 the NVIDIA Inc. team. All rights reserved.
+# Copyright 2024-2026 the NVIDIA Inc. team. All rights reserved.
 # Copyright 2024 the HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -31,6 +31,7 @@ from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding, LMHead
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import TensorParallelMode
+from ..modules.logits_memory import LogitsMemoryFootprint
 from ..modules.logits_processor import LogitsProcessor
 from ..modules.rms_norm import RMSNorm
 from .modeling_llama import LlamaAttention
@@ -297,6 +298,12 @@ class MllamaForConditionalGeneration(nn.Module):
             bias=True,
             dtype=config.pretrained_config.vision_config.torch_dtype)
         self.logits_processor = LogitsProcessor()
+
+    def get_logits_memory_footprint(self) -> LogitsMemoryFootprint:
+        """Account for the text head used by the outer logits processor."""
+        return self.logits_processor.logits_memory_footprint(
+            self.language_model.lm_head, self.language_model.config.torch_dtype,
+            self.model_config.mapping.is_last_pp_rank())
 
     def infer_max_seq_len(self) -> int:
         return self.language_model.infer_max_seq_len()

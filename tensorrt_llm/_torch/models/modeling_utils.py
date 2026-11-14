@@ -33,6 +33,7 @@ from ..distributed.communicator import pp_recv_tensors, pp_send_tensors
 from ..model_config import ModelConfig, TConfig
 from ..modules.embedding import Embedding, LMHead
 from ..modules.linear import Linear, TensorParallelMode, WeightMode
+from ..modules.logits_memory import LogitsMemoryFootprint, LogitsMemoryProcessor
 from ..modules.logits_processor import LogitsProcessor
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import MoE, VanillaMoE, is_moe_weight_owner
@@ -911,6 +912,15 @@ class DecoderModelForCausalLM(nn.Module,
     @property
     def vocab_size_padded(self) -> int:
         return self.lm_head.vocab_size_padded
+
+    def get_logits_memory_footprint(self) -> LogitsMemoryFootprint:
+        """Delegate LM-head memory accounting to the logits epilogue."""
+        processor = self.logits_processor
+        if not isinstance(processor, LogitsMemoryProcessor):
+            processor = LogitsProcessor()
+        return processor.logits_memory_footprint(
+            self.lm_head, self.model_config.torch_dtype,
+            self.model_config.mapping.is_last_pp_rank())
 
     def setup_aliases(self) -> None:
         """Wire structural Python references between modules.
