@@ -195,7 +195,7 @@ class PriorityWaitingQueue(WaitingQueue):
     Complexity:
         - add_request / add_requests: O(log n)
         - pop_request / peek_request: O(log n) / O(1)
-        - peek_requests(k): O(n log k), without copying or sorting the heap
+        - peek_requests(k): O(k log k) for a bounded peek
         - remove_by_ids: O(n) rebuild + O(n) heapify
         - __iter__: O(n log n) over a sorted copy (priority order)
     """
@@ -248,7 +248,28 @@ class PriorityWaitingQueue(WaitingQueue):
 
     def peek_requests(self, k: int) -> list[RequestQueueItem]:
         """Return up to ``k`` requests in priority order without removing them."""
-        return [e[2] for e in heapq.nsmallest(max(k, 0), self._heap)]
+        source = self._heap
+        count = min(max(k, 0), len(source))
+        if count == 0:
+            return []
+        # Keep nsmallest's efficient full-sort path for large result sets.
+        if count * 4 >= len(source):
+            return [e[2] for e in heapq.nsmallest(count, source)]
+
+        frontier = [(source[0][0], source[0][1], 0)]
+        requests = []
+        for _ in range(count):
+            _, _, index = heapq.heappop(frontier)
+            requests.append(source[index][2])
+            left = 2 * index + 1
+            right = left + 1
+            if left < len(source):
+                entry = source[left]
+                heapq.heappush(frontier, (entry[0], entry[1], left))
+            if right < len(source):
+                entry = source[right]
+                heapq.heappush(frontier, (entry[0], entry[1], right))
+        return requests
 
     def admission_groups(self, requests: list[RequestQueueItem]) -> list[int]:
         """One group per priority."""

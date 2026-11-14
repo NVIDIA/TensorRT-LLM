@@ -564,19 +564,45 @@ class TestPriorityWaitingQueue:
         assert len(q) == 6
         assert [q.pop_request().id for _ in range(6)] == [1, 4, 5, 2, 3, 0]
 
-    def test_peek_requests_does_not_sort_the_heap(self, monkeypatch):
-        """peek_requests does not go through __iter__, which sorts a copy of
-        the whole heap."""
+    @pytest.mark.parametrize("size,k", [(1, 1), (63, 16), (1000, 32), (1000, 250), (1000, 2000)])
+    def test_peek_requests_matches_sorted_snapshot(self, size, k):
+        q = PriorityWaitingQueue()
+        for i in range(size):
+            q.add_request(create_priority_request_item(i, priority=((i * 37) % 101) - 50))
+
+        heap_before = q._heap.copy()
+        expected = [item.id for item in q][:k]
+        assert [item.id for item in q.peek_requests(k)] == expected
+        assert q._heap == heap_before
+
+    def test_small_peek_does_not_scan_the_heap(self):
+        """A bounded peek does not sort, copy, or scan the full heap."""
+
+        class FrontierOnlyHeap(list):
+            def __init__(self, entries):
+                super().__init__(entries)
+                self.read_indices = set()
+
+            def __iter__(self):
+                raise AssertionError("a bounded peek must not iterate the heap")
+
+            def copy(self):
+                raise AssertionError("a bounded peek must not copy the heap")
+
+            def __getitem__(self, index):
+                assert isinstance(index, int), "a bounded peek must not slice the heap"
+                self.read_indices.add(index)
+                return super().__getitem__(index)
+
         q = PriorityWaitingQueue()
         for i in range(1000):
             q.add_request(create_priority_request_item(i, priority=(i % 7) / 10))
+        q._heap = FrontierOnlyHeap(q._heap)
 
-        def _no_full_sort(self):
-            raise AssertionError("peek_requests must not sort the whole heap")
-
-        monkeypatch.setattr(PriorityWaitingQueue, "__iter__", _no_full_sort)
-        peeked = [item.id for item in q.peek_requests(4)]
-        assert peeked == [6, 13, 20, 27]
+        peeked = [item.id for item in q.peek_requests(32)]
+        assert peeked == list(range(6, 230, 7))
+        # Only the root and the children of returned entries are read.
+        assert len(q._heap.read_indices) <= 1 + 2 * 32
 
     def test_iter_does_not_consume_items(self):
         """Iterating over the queue does not remove items."""
