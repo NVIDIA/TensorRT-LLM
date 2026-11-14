@@ -587,15 +587,15 @@ _QPIN_LOGGED: set = set()
 # HOSTTAIL: six exact host-side items between two decode graph replays, each a
 # RuntimeHooks field below (``_runtime_hooks``). Same bytes reach the device; only where / whether a copy is issued
 # changes. ``TRTLLM_M31_DISABLE_HOSTTAIL=1`` turns all six off; each also has its own kill switch:
-# * ``HOST_D2H_SIDE`` (KIMI-HO-04, sampler_d2h_side_stream): the spec sampler's store D2H copies go on its D2H side
+# * ``HOST_D2H_SIDE`` (sampler_d2h_side_stream): the spec sampler's store D2H copies go on its D2H side
 #   stream, so they no longer sit between graph N's stores and graph N+1 on the main stream.
-# * ``SMALL_H2D`` (KIMI-HO-12a, spec_small_h2d): the sampler's slot ids stay in a device buffer re-uploaded only on
+# * ``SMALL_H2D`` (spec_small_h2d): the sampler's slot ids stay in a device buffer re-uploaded only on
 #   change, and the accepted-draft counts ride the step-input pack.
-# * ``BATCH_CHANGED_ONLY`` (KIMI-HO-03 / ST-18(d), spec_batch_map_changed_only): the DFlash/DSpark drafter's
+# * ``BATCH_CHANGED_ONLY`` (spec_batch_map_changed_only): the DFlash/DSpark drafter's
 #   batch_indices and batch-to-slot map are uploaded only when they change (constant in steady decode).
-# * ``SKIP_ACCEPTED_UPLOAD`` (KIMI-HO-09, skip_accepted_draft_upload): the per-step accepted-draft-count upload is
+# * ``SKIP_ACCEPTED_UPLOAD`` (skip_accepted_draft_upload): the per-step accepted-draft-count upload is
 #   skipped; nothing on this target reads spec_metadata.num_accepted_draft_tokens (it is None).
-# * ``PHILOX_PACK`` (KIMI-ST-18(e), pack_spec_rng_uploads): a sampled step's four Philox seed / offset uploads ride the
+# * ``PHILOX_PACK`` (pack_spec_rng_uploads): a sampled step's four Philox seed / offset uploads ride the
 #   step-input pack instead of four copies between the graphs.
 # * ``KV_LENS_ONCE`` (kv_lens_update_once): a speculative overlap step re-derives the MSA KV-length metadata
 #   once, after the KV-length correction; the first pass at the head of the decode graph is rewritten in full.
