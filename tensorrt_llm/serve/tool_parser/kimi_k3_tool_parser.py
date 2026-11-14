@@ -24,19 +24,29 @@ Attribute values are escaped (``&`` -> ``&amp;``, ``"`` -> ``&quot;``).
 ``argument`` bodies are raw text for ``type="string"`` and JSON text for
 every other type. The section arrives after the response body, so streaming
 buffers the section and emits complete calls once ``<|close|>tools<|sep|>``
-is seen.
+is seen. A call whose close tags the model left out is still read where its
+end is not in doubt (see ``KimiK3ToolParser._read_calls``). A generation ended
+after its first call (``parallel_tool_calls=false``) stops on that call's own
+close tag with the section left open; the complete calls of an open section
+are delivered (see ``KimiK3ToolParser.single_call_stops``).
 """
 
 import json
 import os
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterator, List, Tuple
 
 from tensorrt_llm.logger import logger
 
 from ..openai_protocol import ChatCompletionToolsParam as Tool
 from .base_tool_parser import BaseToolParser
 from .core_types import StreamingParseResult, ToolCallItem, _GetInfoFunc
+
+# Close tags that can only end structure, and the end-of-message token. A run
+# of them that reaches the end of the tools section is the model closing its
+# message, whatever it left open.
+_CLOSE_TAG = r"<\|close\|>(?:argument|json|call|tools|response|message)<\|sep\|>"
+_CLOSE_RUN_TAG = r"(?:" + _CLOSE_TAG + r"|<\|end_of_msg\|>)"
 
 
 def _unescape_attr(value: str) -> str:
@@ -73,6 +83,8 @@ class KimiK3ToolParser(BaseToolParser):
     # serving layer must extract instead of passing raw text through.
     extracts_forced_tool_calls = True
 
+    _CALL_CLOSE = "<|close|>call<|sep|>"
+
     def __init__(self):
         super().__init__()
         self.bot_token = "<|open|>tools<|sep|>"  # nosec B105
@@ -93,11 +105,25 @@ class KimiK3ToolParser(BaseToolParser):
         # header, so headers match any text that doesn't contain ``<|``.
         attrs_pattern = r"(?:(?!<\|).)*?"
         self._call_open_regex = re.compile(r"<\|open\|>call(?![a-zA-Z])")
-        self._call_regex = re.compile(
-            r"<\|open\|>call(?P<attrs>" + attrs_pattern + r")<\|sep\|>"
-            r"(?P<body>.*?)<\|close\|>call<\|sep\|>",
+        self._call_header_regex = re.compile(
+            r"<\|open\|>call(?P<attrs>" + attrs_pattern + r")<\|sep\|>", re.DOTALL
+        )
+        # A complete argument or json block; a value ends at its first close tag.
+        self._element_regex = re.compile(
+            r"<\|open\|>(?P<kind>argument|json)" + attrs_pattern + r"<\|sep\|>"
+            r".*?<\|close\|>(?P=kind)<\|sep\|>",
             re.DOTALL,
         )
+        self._open_element_regex = re.compile(
+            r"\s*<\|open\|>(?P<kind>argument|json)" + attrs_pattern + r"<\|sep\|>", re.DOTALL
+        )
+        # Where a call can end: before the next call, or at the end of the
+        # section, close tags included.
+        self._call_end_regex = re.compile(
+            r"\s*(?:<\|open\|>call(?![a-zA-Z])|(?:" + _CLOSE_RUN_TAG + r"\s*)*\Z)"
+        )
+        # A run of close tags from a close tag to the end of the section.
+        self._close_run_regex = re.compile(_CLOSE_TAG + r"(?:\s*" + _CLOSE_RUN_TAG + r")*\s*\Z")
         self._argument_regex = re.compile(
             r"<\|open\|>argument(?P<attrs>" + attrs_pattern + r")<\|sep\|>"
             r"(?P<value>.*?)<\|close\|>argument<\|sep\|>",
@@ -111,6 +137,15 @@ class KimiK3ToolParser(BaseToolParser):
 
     def has_tool_call(self, text: str) -> bool:
         return self.bot_token in text
+
+    @property
+    def single_call_stops(self) -> tuple[str, ...]:
+        # Each call block ends with its own close tag, so stopping there
+        # completes exactly one call; the tools section stays open, and the
+        # complete calls of an open section are delivered. The K3 tokenizer
+        # writes the tag as the three tokens <|close|>, call and <|sep|>,
+        # which is how the stop text tokenizes, so this one form matches.
+        return (self._CALL_CLOSE,)
 
     def supports_structural_tag(self) -> bool:
         # XTML argument bodies are tag-structured text, not JSON — the
@@ -249,27 +284,104 @@ class KimiK3ToolParser(BaseToolParser):
             arguments[key] = self._coerce_value(match.group("value"), attrs.get("type", "string"))
         return json.dumps(arguments, ensure_ascii=False)
 
+    def _read_calls(self, section: str) -> Iterator[Tuple[str, str, str]]:
+        """Yield ``(attrs, body, missing)`` for each call block in ``section``.
+
+        A call ends at the first ``<|close|>call<|sep|>`` after its header.
+        Where the model left close tags out, a call is read only where its end
+        is not in doubt; ``missing`` names the tags it lacks, and ``body`` has
+        the value's close tag restored:
+
+        - a call whose last element is complete, followed straight by the
+          next call, or by close tags that end the section, the section's own
+          close tag included;
+        - a value followed straight by ``<|close|>call<|sep|>``, before the
+          next call or before close tags that end the section;
+        - a value followed by close tags that end the generation, such as
+          ``<|close|>response<|sep|>`` and the message framing.
+
+        A call that stops inside a value or after an element is not read,
+        since it may be cut off. Nor is a value that the section's close tag
+        follows: the value may quote that tag, and the section ends there.
+        """
+        pos = 0
+        while (header := self._call_header_regex.search(section, pos)) is not None:
+            attrs, start = header.group("attrs"), header.end()
+            close = section.find(self._CALL_CLOSE, start)
+            limit = len(section) if close == -1 else close
+            # The call's complete elements, up to a call header outside them.
+            last = start
+            next_call = None
+            for element in self._element_regex.finditer(section, start, limit):
+                next_call = self._call_open_regex.search(section, last, element.start())
+                if next_call is not None:
+                    break
+                last = element.end()
+            else:
+                next_call = self._call_open_regex.search(section, last, limit)
+            if (
+                next_call is not None
+                and last > start
+                and not section[last : next_call.start()].strip()
+            ):
+                # The model went straight on to the next call.
+                yield attrs, section[start:last], self._CALL_CLOSE
+                pos = next_call.start()
+                continue
+            value = None
+            if next_call is None:
+                value = self._open_element_regex.match(section, last, limit)
+            value_close = f"<|close|>{value.group('kind')}<|sep|>" if value else ""
+            if close != -1:
+                pos = close + len(self._CALL_CLOSE)
+                if value and self._call_end_regex.match(section, pos):
+                    yield attrs, section[start:close] + value_close, value_close
+                else:
+                    yield attrs, section[start:close], ""
+                continue
+            if next_call is not None:
+                # Not a call; the next one may be.
+                pos = next_call.start()
+                continue
+            # No close tag follows: the call is still open where the section ends.
+            if value:
+                run = None
+                if not section.endswith(self.eot_token):
+                    run = self._close_run_regex.search(section, value.end())
+                if run is not None:
+                    body = section[start : run.start()] + value_close
+                    yield attrs, body, f"{value_close} and {self._CALL_CLOSE}"
+            elif (
+                last > start
+                and section[last:].strip()
+                and self._call_end_regex.match(section, last)
+            ):
+                yield attrs, section[start:last], self._CALL_CLOSE
+            return
+
     def _parse_tools_section(self, section: str, tools: List[Tool]) -> List[ToolCallItem]:
         tool_indices = self._get_tool_indices(tools)
         calls: List[ToolCallItem] = []
         opened_calls = len(self._call_open_regex.findall(section))
         matched_calls = 0
-        for position, match in enumerate(self._call_regex.finditer(section)):
+        for position, (attrs_text, body, missing) in enumerate(self._read_calls(section)):
             matched_calls += 1
-            attrs = _parse_attrs(match.group("attrs"))
+            attrs = _parse_attrs(attrs_text)
             name = attrs.get("tool")
             if not name:
-                logger.warning(
-                    f"kimi_k3 tool parser: call without tool attribute: {match.group('attrs')}"
-                )
+                logger.warning(f"kimi_k3 tool parser: call without tool attribute: {attrs_text}")
                 continue
             if not _names_declared_tool(name, tool_indices):
                 logger.warning(f"Model attempted to call undefined function: {name}")
+            if missing:
+                logger.warning(
+                    f"kimi_k3 tool parser: delivering call {name!r} read without {missing}"
+                )
             calls.append(
                 ToolCallItem(
                     tool_index=position,
                     name=name,
-                    parameters=self._parse_call_arguments(match.group("body")),
+                    parameters=self._parse_call_arguments(body),
                 )
             )
         if matched_calls < opened_calls:
@@ -288,7 +400,8 @@ class KimiK3ToolParser(BaseToolParser):
         section = text[bot_idx + len(self.bot_token) :]
         eot_idx = section.find(self.eot_token)
         if eot_idx != -1:
-            section = section[:eot_idx]
+            # Keep the section's close tag: a call left open ends at it.
+            section = section[: eot_idx + len(self.eot_token)]
         calls = self._parse_tools_section(section, tools)
         self.prev_tool_call_arr = []
         for call in calls:
@@ -344,10 +457,11 @@ class KimiK3ToolParser(BaseToolParser):
         """Emit whatever the buffer holds when the stream ends early.
 
         ``parse_streaming_increment`` buffers the whole tools section until
-        ``<|close|>tools<|sep|>``; if generation stops first (length limit,
-        cancellation), the buffered content would otherwise be dropped.
-        Complete call blocks are salvaged; a call truncated mid-block is
-        reported by the malformed-call warning in ``_parse_tools_section``.
+        ``<|close|>tools<|sep|>``; if generation stops first (the stop that
+        ends the first call, a length limit, cancellation), the buffered
+        content would otherwise be dropped. Complete call blocks are salvaged;
+        a call truncated mid-block is reported by the malformed-call warning
+        in ``_parse_tools_section``.
         """
         buffer, self._buffer = self._buffer, ""
         if not buffer:
@@ -358,7 +472,11 @@ class KimiK3ToolParser(BaseToolParser):
             # stream is over, so it is plain text after stripping any
             # trailing structural tokens (matching detect_and_parse).
             return StreamingParseResult(normal_text=self._trailing_structural.sub("", buffer))
-        logger.warning(
+        # A generation stopped after its first call (``single_call_stops``)
+        # ends on the call's close tag with the section open by design; a
+        # section left open any other way may have lost a call, so it warns.
+        ended_on_a_call = buffer.rstrip().endswith(self._CALL_CLOSE)
+        (logger.debug if ended_on_a_call else logger.warning)(
             f"kimi_k3 tool parser: stream ended before {self.eot_token}; "
             "parsing the partial tools section"
         )
