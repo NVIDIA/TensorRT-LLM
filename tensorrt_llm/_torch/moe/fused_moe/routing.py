@@ -1042,6 +1042,11 @@ class SigmoidRenormMoeRoutingMethod(BaseMoeRoutingMethod):
         return topk_idx.to(torch.int32), topk_weights.to(self.output_dtype)
 
     @property
+    def requires_separated_routing(self) -> bool:
+        # The C++ SigmoidRenorm routing always renormalizes the top-k weights.
+        return not self.renormalize
+
+    @property
     def routing_method_type(self):
         return RoutingMethodType.SigmoidRenorm
 

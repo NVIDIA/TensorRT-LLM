@@ -18,8 +18,12 @@ from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     MultimodalModelMixin,
 )
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    KVCacheManagerV2,
+    _settle_context_cursor,
+)
 from tensorrt_llm._torch.pyexecutor.llm_request import (
+    LlmRequest,
     MultimodalEncoderRequestError,
     MultimodalEncoderRequestState,
     get_mm_items_for_chunk,
@@ -1135,6 +1139,34 @@ def test_terminate_request_releases_multimodal_cache_references_idempotently() -
     assert cache.stats() == stats
 
 
+def test_termination_between_chunks_releases_each_remaining_reference_once() -> None:
+    """Per-chunk release already returned the consumed item's reference, so a
+    request cancelled between two prefill chunks must not release it again."""
+    request = make_mm_request(1, [4, 4, 4], interleaved=True)
+    state = request.py_mm_encoder_state
+    cache = TensorLRUCache(16)
+    for item_idx in range(3):
+        cache_key = ("mm_transient", request.request_id, item_idx)
+        cache.acquire(cache_key, 4, retain_after_release=False)
+        # Item 2 is still being encoded, so its entry is only reserved.
+        if item_idx < 2:
+            cache.commit(cache_key, torch.ones(1))
+        state.set_item_cache_key(item_idx, cache_key, ready=item_idx < 2)
+
+    # The first chunk covered item 0, which sits at prompt position 1.
+    request.context_current_position = 2
+    release_consumed_mm_items(request, cache)
+    stats = cache.stats()
+    assert (stats.item_count, stats.in_use_bytes, stats.reserved_bytes) == (2, 4, 4)
+
+    executor = SimpleNamespace(model_engine=SimpleNamespace(mm_encoder_cache=cache))
+    PyExecutor._release_multimodal_resources(executor, request)
+    stats = cache.stats()
+    assert (stats.item_count, stats.in_use_bytes, stats.reserved_bytes) == (0, 0, 0)
+    PyExecutor._release_multimodal_resources(executor, request)
+    assert cache.stats() == stats
+
+
 def test_weight_invalidation_rejects_live_references():
     invalidations = []
     executor = object.__new__(PyExecutor)
@@ -1423,6 +1455,113 @@ def test_v2_prompt_windows_finish_when_whole_request_outputs_exceed_cache_budget
     assert state.item_cache_keys == [None, None, None]
     scheduler.scheduler.kv_cache_manager.free_resources(request)
     assert kv_allocated == {}
+
+
+def test_eager_item_behind_a_reused_prefix_does_not_block_the_first_chunk() -> None:
+    """EAGER binds a waiting request's items from prompt position zero. When KV
+    reuse then starts its prefill past such an item, that output must not keep
+    the cache space the first chunk's own item needs."""
+    scheduler, _ = _make_v2_multimodal_scheduler(
+        kv_capacity=100,
+        max_num_tokens=10,
+        encoder_max_num_tokens=4,
+        encoder_batch_size=1,
+        context_chunk_unit_size=10,
+        scheduler_cls=MultimodalEagerEncoderScheduler,
+    )
+    manager = scheduler.scheduler.kv_cache_manager
+    text_request = _make_v2_request(1, 10)
+    request = _make_v2_request(2, 30, [1, 1])
+    mask = torch.zeros(30, dtype=torch.int64)
+    mask[[5, 20]] = 1
+    request.py_multimodal_data["multimodal_embed_mask_cumsum"] = mask.cumsum(0)
+    initialize_multimodal_encoder_request(
+        request,
+        max_num_tokens=4,
+        max_output_bytes=4,
+        bytes_per_encoder_embedding=_BYTES_PER_ROW,
+        context_chunk_unit_size=10,
+    )
+
+    # The text request takes this pass's whole token budget, so the multimodal
+    # request gets encoder work only, with its prefill still at position zero.
+    output = scheduler.schedule_request([text_request, request], set())
+    assert output.context_requests == [text_request]
+    assert output.scheduled_mm_encoder_items == {2: [0]}
+    state = request.py_mm_encoder_state
+    scheduler.encoder_cache.commit(state.item_cache_keys[0], torch.zeros(1, 1))
+    state.mark_cache_key_ready(state.item_cache_keys[0])
+
+    # Its first prepare now finds two reusable KV blocks, which cover item 0.
+    prepare_context = manager.prepare_context.side_effect
+
+    def prepare_reused_context(req: LlmRequest) -> bool:
+        prepared = prepare_context(req)
+        if req is request and req.is_first_context_chunk:
+            _settle_context_cursor(req, 20, manager.tokens_per_block)
+        return prepared
+
+    manager.prepare_context.side_effect = prepare_reused_context
+
+    output = scheduler.schedule_request([request], set())
+    assert request.context_current_position == 20
+    assert output.context_requests == [request]
+    assert output.scheduled_mm_encoder_items == {2: [1]}
+
+
+def test_reused_prefix_item_of_a_later_chunk_does_not_hold_back_an_earlier_chunk() -> None:
+    """Items behind a reused prefix are released for every chunk before any
+    chunk selects, so an earlier chunk gets the cache space that a later
+    request's skipped item was holding."""
+    scheduler, _ = _make_v2_multimodal_scheduler(
+        kv_capacity=100,
+        max_num_tokens=40,
+        encoder_max_num_tokens=4,
+        encoder_batch_size=1,
+        context_chunk_unit_size=10,
+        scheduler_cls=MultimodalEagerEncoderScheduler,
+    )
+    manager = scheduler.scheduler.kv_cache_manager
+    text_requests = [_make_v2_request(1, 20), _make_v2_request(2, 20)]
+    earlier = _make_v2_request(3, 10, [1])
+    later = _make_v2_request(4, 30, [1, 1])
+    for request, positions in ((earlier, [5]), (later, [5, 20])):
+        mask = torch.zeros(request.prompt_len, dtype=torch.int64)
+        mask[positions] = 1
+        request.py_multimodal_data["multimodal_embed_mask_cumsum"] = mask.cumsum(0)
+        initialize_multimodal_encoder_request(
+            request,
+            max_num_tokens=4,
+            max_output_bytes=4,
+            bytes_per_encoder_embedding=_BYTES_PER_ROW,
+            context_chunk_unit_size=10,
+        )
+
+    # The text requests take this pass's whole token budget, so the later
+    # request gets encoder work only, with its prefill still at position zero.
+    output = scheduler.schedule_request([*text_requests, later], set())
+    assert output.context_requests == text_requests
+    assert output.scheduled_mm_encoder_items == {4: [0]}
+    state = later.py_mm_encoder_state
+    scheduler.encoder_cache.commit(state.item_cache_keys[0], torch.zeros(1, 1))
+    state.mark_cache_key_ready(state.item_cache_keys[0])
+
+    prepare_context = manager.prepare_context.side_effect
+    reused_prefix_of: list[LlmRequest] = []
+
+    def prepare_reused_context(req: LlmRequest) -> bool:
+        prepared = prepare_context(req)
+        if req is later and req.is_first_context_chunk:
+            _settle_context_cursor(req, 20, manager.tokens_per_block)
+            reused_prefix_of.append(req)
+        return prepared
+
+    manager.prepare_context.side_effect = prepare_reused_context
+
+    output = scheduler.schedule_request([earlier, later], set())
+    assert reused_prefix_of == [later]
+    assert output.context_requests == [earlier]
+    assert output.scheduled_mm_encoder_items == {3: [0]}
 
 
 @pytest.mark.parametrize("encoder_max_num_tokens", [4, 8])

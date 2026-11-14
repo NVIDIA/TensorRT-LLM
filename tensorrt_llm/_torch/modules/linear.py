@@ -3612,6 +3612,72 @@ def flashinfer_mxfp8_autotune() -> Iterator[None]:
         _FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.reset(token)
 
 
+CUDA_GRAPH_GEMM_TUNING_ENV = "TLLM_CUDA_GRAPH_GEMM_TUNING"
+"""Set to 1 to tune the dense GEMMs that run through PyTorch (``F.linear``/``matmul``: unquantized
+linear layers, the LM head) at the shapes of the generation CUDA graphs, with PyTorch TunableOp.
+cuBLASLt's heuristic picks one algorithm per shape; at some token counts it is far from the best
+one (H100, Qwen2.5-7B MLP down projection at 576 tokens: 174 us heuristic, 113 us tuned)."""
+
+CUDA_GRAPH_GEMM_TUNING_FILE_ENV = "TLLM_CUDA_GRAPH_GEMM_TUNING_FILE"
+"""Optional TunableOp results file (one per device, the ordinal is appended): read before tuning,
+so known shapes are not tuned again, and written at exit."""
+
+
+def cuda_graph_gemm_tuning_enabled() -> bool:
+    if os.environ.get(CUDA_GRAPH_GEMM_TUNING_ENV, "0") != "1":
+        return False
+    # A process that configures TunableOp itself keeps its own settings.
+    return "PYTORCH_TUNABLEOP_ENABLED" not in os.environ
+
+
+@contextmanager
+def cuda_graph_gemm_tuning(tune: bool, world_size: int = 1) -> Iterator[None]:
+    """PyTorch TunableOp around the generation CUDA-graph passes (``TLLM_CUDA_GRAPH_GEMM_TUNING``).
+
+    With ``tune`` (the warmup pass), every new GEMM shape is benchmarked over cuBLAS/cuBLASLt
+    candidates and the fastest is kept in memory; without it (the capture pass), known shapes
+    use their tuned algorithm, which the captured graph records, and other shapes cuBLASLt's
+    heuristic. TunableOp's enabled and tuning flags and its results filename are restored
+    afterwards, so eager steps keep the heuristic and pay no lookup.
+
+    Single-rank runs only: each rank tunes from its own timings, and unlike the AutoTuner
+    tactics the results cannot be merged across ranks, so ranks could pick different
+    algorithms, with different rounding, for a GEMM they all compute on the same input.
+    With ``world_size > 1`` the knob is ignored.
+    """
+    if not cuda_graph_gemm_tuning_enabled():
+        yield
+        return
+    if world_size > 1:
+        logger.warning_once(
+            f"{CUDA_GRAPH_GEMM_TUNING_ENV}=1 is ignored with world size {world_size}: "
+            "TunableOp results are tuned per rank and cannot be kept the same across ranks.",
+            key="cuda_graph_gemm_tuning_multi_rank")
+        yield
+        return
+    from torch.cuda import tunable
+
+    was_enabled, was_tuning = tunable.is_enabled(), tunable.tuning_is_enabled()
+    # get_filename() holds any device ordinal already, so it is restored without one.
+    was_filename = tunable.get_filename()
+    # TunableOp reads its results file when first used and writes it at exit, also after the
+    # filename below is restored. Without TLLM_CUDA_GRAPH_GEMM_TUNING_FILE the results stay
+    # in memory only.
+    results_file = os.environ.get(CUDA_GRAPH_GEMM_TUNING_FILE_ENV)
+    if results_file:
+        tunable.set_filename(results_file, True)
+    elif "PYTORCH_TUNABLEOP_FILENAME" not in os.environ:
+        tunable.set_filename(os.devnull, False)
+    tunable.enable(True)
+    tunable.tuning_enable(tune)
+    try:
+        yield
+    finally:
+        tunable.tuning_enable(was_tuning)
+        tunable.enable(was_enabled)
+        tunable.set_filename(was_filename, False)
+
+
 @contextmanager
 def flashinfer_mxfp8_decode_graph_capture() -> Iterator[None]:
     """Enable auto-dispatched FlashInfer calls only for decode graph capture."""

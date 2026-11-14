@@ -180,6 +180,7 @@ l0_b200:
   - unittest/_torch/modules/kimi_kda/test_kda_decode_op.py
   - unittest/_torch/modules/kimi_kda/test_kimi_kda_decode_state_parity.py
   - unittest/_torch/modules/kimi_kda/test_kda_prefill_state_parity.py
+  - unittest/_torch/modules/kimi_kda/test_kda_replay_acceptance.py
   # Shared catalog entries used by K3's generic path.
   - unittest/_torch/modeling_v2/moe/test_modeling_v2_noaux_tc_op.py::test_kimi_k3_config
   - unittest/_torch/modeling_v2/quantization/test_modeling_v2_mxfp8_quantize.py::test_kimi_k3_routed_hidden
@@ -254,6 +255,7 @@ l0_b200:
   # ------------- MoE: test_moe_backend (by backend) ---------------
   - unittest/_torch/moe/test_moe_backend.py::test_cutlass_moe_routing_round_trip
   - unittest/_torch/moe/test_moe_backend.py::test_cutlass_moe_public_activation_ids
+  - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_mxfp4_fp8_input_quantization
   - unittest/_torch/moe/test_kimi_k3_moe_gate.py::test_fused_route_quant_matches_unfused_chain
   - unittest/_torch/moe/test_kimi_k3_moe_gate.py::test_router_logits_kernel_matches_router_gemm
   - unittest/_torch/moe/test_megamoe_streaming_load.py
@@ -262,6 +264,7 @@ l0_b200:
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_minimax_m3_swiglu_bias_numerics
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_nvfp4_awq_matches_cutlass
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_bf16_unquantized_moe
+  - unittest/_torch/moe/test_moe_backend.py::test_trtllm_bf16_in_kernel_routing_256_experts
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fused_shared_experts
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fuse_shared_expert_layout
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_situ_selects_padded_quant_method
@@ -320,6 +323,8 @@ l0_b200:
   - unittest/_torch/kernels/test_spec_step_copies.py
   - unittest/_torch/pyexecutor/engine/runners/decoder/test_inputs.py -k "test_spec_decode_graph_step_gather_kernel"
   - unittest/_torch/speculative/test_fused_accept.py
+  # Draft step 0 runs the draft layer after attention only on the rows it drafts from.
+  - unittest/_torch/speculative/test_draft_row_pick.py
   - unittest/_torch/pyexecutor/test_steady_spec_prepare.py
   - unittest/_torch/modules/test_mxfp8_draft_head.py
   # Shared fused_qk_norm_rope cells used by the K3 drafter.
@@ -473,6 +478,7 @@ l0_b200:
   - unittest/_torch/visual_gen/test_cosmos3_transformer.py
   - unittest/_torch/visual_gen/test_attention_qkv_share.py
   - unittest/_torch/visual_gen/test_cosmos3_pipeline.py
+  - unittest/_torch/visual_gen/test_cosmos3_seacache.py
   - unittest/_torch/visual_gen/test_cosmos3_distilled.py
   - unittest/_torch/visual_gen/test_cosmos3_fp8.py
   - unittest/_torch/visual_gen/test_cosmos3_step_precision_component.py
@@ -533,6 +539,9 @@ l0_b200:
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_t2i_4step_example TIMEOUT (30)
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_i2v_4step_example TIMEOUT (45)
   - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_edge_i2v_example TIMEOUT (30)
+  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_edge_fp8_t2i_smoke TIMEOUT (20)
+  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_edge_fp8_t2v_smoke TIMEOUT (20)
+  - examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_edge_fp8_i2v_smoke TIMEOUT (20)
 - condition:
     ranges:
       system_gpu_count:

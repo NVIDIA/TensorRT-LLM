@@ -63,6 +63,7 @@ from tensorrt_llm.llmapi.disagg_utils import (
     parse_metadata_server_config_file, validate_config_bool,
     validate_internal_request_auth_key)
 from tensorrt_llm.llmapi.llm_args import (SERVE_CLI_CONFIG_FIELDS,
+                                          CacheTransceiverConfig,
                                           KvCacheConnectorConfig, SleepConfig,
                                           TorchLlmArgs, build_cli_config)
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
@@ -763,6 +764,19 @@ def _refuse_dense_dwdp_on_generation_servers(
                 "settings.")
 
 
+def _set_rank_info_auth_key(llm_args: dict, key: bytes) -> None:
+    """Provision native transfer authentication before executor workers are spawned."""
+    config = llm_args.get("cache_transceiver_config")
+    if config is None:
+        return
+    elif isinstance(config, dict):
+        config = CacheTransceiverConfig(**config)
+    else:
+        config = config.model_copy(deep=True)
+    config._rank_info_auth_key = key
+    llm_args["cache_transceiver_config"] = config
+
+
 def launch_server(
         host: str,
         port: int,
@@ -792,6 +806,9 @@ def launch_server(
 
     backend = llm_args["backend"]
     model = served_model_name or llm_args["model"]
+    if internal_disagg_auth_key is not None:
+        _set_rank_info_auth_key(llm_args,
+                                internal_disagg_auth_key.encode("utf-8"))
 
     multi_frontend = _init_multi_frontend_mode(llm_args, multi_frontend_enabled)
     _check_context_only_settings(llm_args,
@@ -805,7 +822,9 @@ def launch_server(
             multi_frontend_serving = MultiFrontendServing(
                 launcher_uds=attached_launcher_uds,
                 is_launcher=False,
-                launcher_pid=os.getppid())
+                launcher_pid=os.getppid(),
+                frontend_id=int(os.environ["TLLM_EXECUTOR_FRONTEND_ID"]),
+                num_frontends=multi_frontend.num_frontends)
     if enable_runtime_control_endpoints and multi_frontend.num_frontends > 1:
         raise click.BadParameter(
             "Runtime control endpoints require num_serve_frontends=1 because "
@@ -906,7 +925,9 @@ def launch_server(
                     stop_watching_frontends = _watch_attached_frontends(
                         frontend_children)
                     multi_frontend_serving = MultiFrontendServing(
-                        launcher_uds=launcher_uds_path, is_launcher=True)
+                        launcher_uds=launcher_uds_path,
+                        is_launcher=True,
+                        num_frontends=multi_frontend.num_frontends)
                     sockets.append(launcher_uds_sock)
 
                 server = OpenAIServer(
@@ -1922,9 +1943,6 @@ def serve(
                 "allow_request_chat_template":
                 allow_request_chat_template
                 if allow_request_chat_template else None,
-                "internal_request_auth_key":
-                internal_disagg_auth_key
-                if grpc_protocol != "openengine" else None,
                 "metadata_server_config_file":
                 metadata_server_config_file,
                 "server_role":
@@ -1938,6 +1956,9 @@ def serve(
                         f"Argument '{name}' is not supported when running in gRPC mode. "
                         f"The gRPC server is designed for use with external routers that handle "
                         f"these features (e.g., tool parsing, chat templates).")
+            if internal_disagg_auth_key is not None:
+                _set_rank_info_auth_key(
+                    llm_args, internal_disagg_auth_key.encode("utf-8"))
             if grpc_protocol == "smg":
                 if find_spec("smg_grpc_proto") is None:
                     raise ConfigInputError(
@@ -2910,45 +2931,92 @@ def set_cuda_device():
     torch.cuda.set_device(device_id)
 
 
+def _drafter_reads_helix_sharded_context(
+        decoding_type: Optional[str], attention_backend: Optional[str]) -> bool:
+    """Whether a speculative_config's drafter reads a helix-sharded context.
+
+    Only the standalone MLA DSpark drafter's CUTEDSL block decode does.
+    """
+    return decoding_type == "DSpark" and attention_backend == "CUTEDSL"
+
+
 def _shared_draft_kv_blocker(server_configs) -> Optional[str]:
-    """What keeps the context and generation servers from sharing draft KV, or None."""
-    with_spec = {
-        cfg.type
-        for cfg in server_configs if cfg.other_args.get("speculative_config")
-    }
-    if with_spec != {"ctx", "gen"}:
+    """What keeps the context and generation servers from sharing draft KV, or None.
+
+    A config may list only one side: a DWDP context MPI world launches its
+    context servers from a config without generation servers, which run as a
+    separate launch. Such a config is checked for its own side; the peer
+    handshake rejects a pair whose sides disagree.
+    """
+    if not server_configs or not all(
+            cfg.other_args.get("speculative_config") for cfg in server_configs):
         return ("speculative_config in both context_servers and "
                 "generation_servers")
-    if len({(cfg.other_args.get("tensor_parallel_size", 1),
-             bool(cfg.other_args.get("enable_attention_dp", False)))
-            for cfg in server_configs}) != 1:
-        return ("the same tensor_parallel_size and enable_attention_dp in "
-                "context_servers and generation_servers")
+    # Ranks hold the same KV heads when their attention TP matches: attention
+    # DP keeps every head on each rank.
+    if len({
+            1 if cfg.other_args.get("enable_attention_dp", False) else
+            cfg.other_args.get("tensor_parallel_size", 1)
+            for cfg in server_configs
+    }) != 1:
+        return ("the same attention tensor parallelism (tensor_parallel_size, "
+                "or 1 with enable_attention_dp) in context_servers and "
+                "generation_servers")
+    if any(
+            cfg.other_args.get("context_parallel_size", 1) != 1
+            for cfg in server_configs
+    ) and not all(
+            _drafter_reads_helix_sharded_context(
+                cfg.other_args["speculative_config"].get("decoding_type"),
+                cfg.other_args["speculative_config"].get("attention_backend"))
+            for cfg in server_configs):
+        return ("context_parallel_size 1, or DSpark with attention_backend "
+                "CUTEDSL, in both sections")
     for cfg in server_configs:
         spec = cfg.other_args["speculative_config"]
         backend = spec.get("attention_backend")
         if not ((spec.get("decoding_type") == "DFlash" and backend == "TRTLLM")
                 or (spec.get("decoding_type") == "DSpark"
-                    and backend in (None, "AUTO", "TRTLLM"))):
+                    and backend in (None, "AUTO", "TRTLLM", "CUTEDSL"))):
             return ("speculative_config to be DFlash with attention_backend "
-                    "TRTLLM, or DSpark with attention_backend AUTO or TRTLLM, "
-                    "in both sections")
+                    "TRTLLM, or DSpark with attention_backend AUTO, TRTLLM "
+                    "or CUTEDSL, in both sections")
         if (spec.get("draft_len_schedule") is not None
                 or spec.get("max_concurrency") is not None):
             return "draft_len_schedule and max_concurrency to be unset in both sections"
         if cfg.other_args.get("attn_backend", "TRTLLM") != "TRTLLM":
             return "attn_backend TRTLLM in both sections"
-        if (cfg.other_args.get("pipeline_parallel_size", 1) != 1
-                or cfg.other_args.get("context_parallel_size", 1) != 1):
-            return "pipeline_parallel_size and context_parallel_size to be 1 in both sections"
+        if cfg.other_args.get("pipeline_parallel_size", 1) != 1:
+            return "pipeline_parallel_size 1 in both sections"
         if cfg.other_args.get("kv_cache_compression_config") is not None:
             return "kv_cache_compression_config to be unset in both sections"
         kv_cache = cfg.other_args.get("kv_cache_config") or {}
         if str(kv_cache.get("dtype", "auto")).lower().startswith("mixed_"):
             return "a uniform KV cache dtype in both sections"
-        if kv_cache.get("tokens_per_block", 32) not in (16, 32, 64):
+        tokens_per_block = kv_cache.get("tokens_per_block", 32)
+        if spec.get("decoding_type") == "DSpark" and backend == "CUTEDSL":
+            # The CuTe DSL MLA block decode pages by any divisor of 128 above 1.
+            if tokens_per_block <= 1 or 128 % tokens_per_block:
+                return (
+                    "kv_cache_config.tokens_per_block to divide 128 for "
+                    "DSpark with attention_backend CUTEDSL in both sections")
+        elif tokens_per_block not in (16, 32, 64):
             return "kv_cache_config.tokens_per_block to be 16, 32, or 64 in both sections"
     return None
+
+
+def _shared_draft_kv_default(server_configs, blocker: Optional[str]) -> str:
+    """Default TRTLLM_DISAGG_SHARED_DRAFT_KV value set by the launcher.
+
+    The launcher sets it when the variable is unset or "auto". Only a config
+    that lists both sides and passes the check turns sharing on.
+    A one-sided config cannot see how the other side is launched, and a
+    generation server started with the variable unset keeps a separate draft
+    KV cache, so it gets "0"; sharing across separate launches needs the
+    variable set to "1" on both.
+    """
+    sides = {cfg.type for cfg in server_configs}
+    return "auto" if blocker is None and sides == {"ctx", "gen"} else "0"
 
 
 @click.command("disaggregated_mpi_worker")
@@ -3006,8 +3074,21 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
         raise click.UsageError(
             f"TRTLLM_DISAGG_SHARED_DRAFT_KV=1 requires {blocker}.")
     if os.environ.get("TRTLLM_DISAGG_SHARED_DRAFT_KV") in (None, "auto"):
-        os.environ["TRTLLM_DISAGG_SHARED_DRAFT_KV"] = ("0"
-                                                       if blocker else "auto")
+        resolved = _shared_draft_kv_default(disagg_cfg.server_configs, blocker)
+        os.environ["TRTLLM_DISAGG_SHARED_DRAFT_KV"] = resolved
+        if blocker is not None:
+            reason = blocker
+        elif resolved == "0":
+            reason = ("the configuration lists only context or only generation "
+                      "servers; sharing across separate launches needs the "
+                      "variable set to 1 on both")
+        else:
+            reason = (
+                "the context and generation configurations pass every check; "
+                "each worker logs its own shared-draft-KV decision")
+        logger.info(
+            f"TRTLLM_DISAGG_SHARED_DRAFT_KV unset or 'auto' resolved to "
+            f"'{resolved}': {reason}.")
 
     # Run a server with the underlying LLM invokes a RemoteMPISessionClient
     if os.environ.get(DisaggLauncherEnvs.

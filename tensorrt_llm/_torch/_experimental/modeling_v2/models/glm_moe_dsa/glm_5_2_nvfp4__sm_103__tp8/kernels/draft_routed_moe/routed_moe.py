@@ -15,15 +15,19 @@
 """Host side of package draft_routed_moe: the routed experts of the MTP draft layer.
 
 The MTP layer of the GLM-5.2 NVFP4 checkpoint is unquantized, so its routed
-experts run FlashInfer's TRT-LLM-Gen BF16 MoE (``FlashinferTrtllmGenBf16Impl``,
-``trtllm_bf16_moe``). ``routed_output`` replaces that call with
+experts run the TRT-LLM-Gen BF16 MoE (``TrtllmTrtllmGenBf16Impl``,
+``trtllm::bf16_moe_runner``). ``routed_output`` replaces that call with
 ``native_ops.draft_routed_moe`` on the leaf's own weight buffers (no
-copy, no re-layout) and returns the same finalized ``[R, 6144]`` BF16 tensor,
-bit for bit:
+copy, no re-layout) and returns the finalized ``[R, 6144]`` BF16 tensor. The
+kernels were written bit-exact against FlashInfer's JIT build of the same
+computation:
 
-* routing: FlashInfer's ``routingCustom`` with ``SigmoidBias`` preprocess and
-  ``ScaledSumNormalize`` postprocess (DeepSeek-V3 with ``n_group <= 1``),
-  including its fast-math instructions, tie order and FP32 sum order;
+* routing: ``routingCustom`` with ``SigmoidBias`` preprocess and
+  ``ScaledSumNormalize`` postprocess (DeepSeek-V3 with ``n_group <= 1``) as
+  that build compiles it: fast-math sigmoid and division, sum epsilon 1e-20,
+  its tie order and FP32 sum order. ``trtllm::bf16_moe_runner`` computes the
+  sigmoid and the division precisely, so routing weights can differ in the
+  last bits and near-tied scores can select different experts;
 * FC1/FC2: ``mma.sync`` over K in natural order with one FP32 accumulator per
   output element (the batched-GEMM cubins accumulate K sequentially and have
   no split-K), the cubin's SwiGLU epilogue and BF16 rounding;
@@ -232,15 +236,13 @@ def _routing_reason(rm) -> str:
 
 
 def _owner_reason(owner, device: torch.device) -> str:
-    """Leaf-level eligibility: FlashInfer TRT-LLM-Gen BF16 leaf, TP shard with every expert local."""
+    """Leaf-level eligibility: TRT-LLM-Gen BF16 leaf, TP shard with every expert local."""
     from tensorrt_llm._torch.moe.fused_moe.quantization import BF16TRTLLMGenFusedMoEMethod
-    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.flashinfer_bf16 import (
-        FlashinferTrtllmGenBf16Impl,
-    )
+    from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.trtllm_bf16 import TrtllmTrtllmGenBf16Impl
     from tensorrt_llm._torch.utils import ActivationType
 
-    if not isinstance(owner, FlashinferTrtllmGenBf16Impl):
-        return f"{type(owner).__name__} is not the FlashInfer TRT-LLM-Gen BF16 leaf"
+    if not isinstance(owner, TrtllmTrtllmGenBf16Impl):
+        return f"{type(owner).__name__} is not the TRT-LLM-Gen BF16 leaf"
     if getattr(owner, "use_dp", False):
         return "attention DP"
     routes_outside = getattr(owner, "_routes_outside_the_kernel", None)

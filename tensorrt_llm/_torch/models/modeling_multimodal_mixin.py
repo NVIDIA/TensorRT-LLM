@@ -411,8 +411,9 @@ class MultimodalModelMixin:
 
     Current limitations:
 
-    * For the time being, the persistent multimodal encoder cache stores per-item embeddings for
-      single-modality `MultimodalParams` objects. Mixed-modality objects bypass the cache.
+    * The persistent multimodal encoder cache stores per-item embeddings for the items in the
+      common item record, across modalities. A `MultimodalParams` object carrying a modality
+      payload that the record does not list bypasses the cache.
     * A partially cached `MultimodalParams` is handled by encoding only its miss items
       and interleaving cached items back in original per-item order. The default
       `build_multimodal_encoder_input` selects fields declared by
@@ -1661,8 +1662,8 @@ def _dispatch_cross_iter_prefetch(
 ) -> None:
     """H2D-copy MM data, run the encoder, and cache embeddings on `aux_stream`.
 
-    Stamps a CUDA event on every candidate's `py_mm_encoder_event` so the
-    next iteration's consume site waits on it before reading cached tensors.
+    Stamps a CUDA event on every candidate's `py_mm_encoder_event` so input
+    preparation waits on it for the first chunk that reads staged tensors.
     The event covers all work queued in the aux-stream block, so the same
     event object is shared across all candidates.
     """
@@ -1685,8 +1686,8 @@ def _dispatch_cross_iter_prefetch(
     # this after the iteration's LLM kernels so aux-stream H2D copies and
     # encoder work can overlap them.
     #
-    # Request-local ordering is handled by `encoder_event`; the consume path also `record_stream`s
-    # attached embeddings before gathering them so post-prefill request cleanup cannot release
+    # Request-local ordering is handled by `encoder_event`; input preparation waits on it and
+    # `record_stream`s the request's CUDA tensors so post-prefill request cleanup cannot release
     # storage while main-stream work is pending. Persistent-cache clones use their own producer
     # events and consumer `record_stream` calls inside `TensorLRUCache`.
     encoder_event = None
@@ -1782,8 +1783,7 @@ def maybe_prefetch_mm_encoder_for_next_iter(
     `_prepare_inputs` picks them up via the standard cache path, and a CUDA event is stamped on
     `request.py_mm_encoder_event` for `_prepare_inputs` to transfer onto the new `MultimodalParams`.
 
-    The mixin consume sites (e.g. `get_multimodal_embeddings)` need to wait on the event before
-    reading the cached tensors.
+    `_prepare_inputs` waits on the event before the main stream reads the staged tensors.
 
     While the current iteration's LLM kernels run on the main stream, this queues encoder work for
     an "admit-likely context" request on the aux stream.

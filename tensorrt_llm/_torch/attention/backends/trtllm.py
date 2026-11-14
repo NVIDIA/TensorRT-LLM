@@ -32,7 +32,7 @@ if TYPE_CHECKING:
     from ...speculative.interface import SpecMetadata
     from ...speculative.spec_tree_manager import SpecTreeManager
     from .fmha.gqa_decode import GqaDecodeFmha, GqaDecodeSetup
-    from .fmha.interface import Fmha
+    from .fmha.interface import Fmha, FmhaPrewarmConfig
     from .sparse.dsa.metadata import TokenMajorGenView
 
 from tensorrt_llm._utils import (get_sm_version, is_sm_100f, is_sm_120f,
@@ -70,6 +70,12 @@ from .sparse.skip_softmax import SkipSoftmaxParams
 from .utils import log_attention_failure_context
 
 _SKIP_CORRECTION_SUPPORTED_SMS = frozenset((100, 103))
+
+
+def _has_fp8_context_mla_fmha(sm_version: int) -> bool:
+    """Whether MLA context attention with an FP8 or NVFP4 KV cache runs the op's
+    FP8 context MLA FMHA on this SM (``mFP8ContextMLA`` in thop/attentionOp.cpp)."""
+    return sm_version == 90 or is_sm_100f(sm_version) or is_sm_120f(sm_version)
 
 
 def _resolve_skip_correction_threshold(threshold: float,
@@ -1553,6 +1559,88 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             host_request_types=self.host_request_types[:num_seqs],
         )
 
+    def support_steady_gen_step(self) -> bool:
+        """Whether ``prepare_steady_gen_step`` may advance this metadata.
+
+        True for the plain decode configuration whose per-step state is fully
+        described by the kv lengths and the KV block table: this class itself
+        (the sparse-attention subclasses keep per-step state in their own
+        ``prepare()``), no FP4-MLA state, no helix / cross attention / locality
+        domains / flash-MLA / MLA cached-kv prefill handling, no mixed-precision
+        KV staging, and a KV cache manager with a known block size.
+        """
+        return (type(self) is TrtllmAttentionMetadata
+                and self.fp4_mla_state is None
+                and self.kv_cache_manager is not None and getattr(
+                    self.kv_cache_manager, 'tokens_per_block', None) is not None
+                and not self.enable_helix and not self.has_cross_sub_metadata
+                and not getattr(self, 'locality_domain_enabled', False)
+                and not self.enable_flash_mla
+                and not self.enable_context_mla_with_cached_kv
+                and not self._has_mixed_precision_staging()
+                and self.kv_cache_params is not None
+                and self.kv_cache_params.use_cache)
+
+    def prepare_steady_gen_step(self, num_real: int, *,
+                                refresh_block_offsets: bool) -> None:
+        """Advance the state of the last ``prepare()`` by one decode step.
+
+        Valid only right after a ``prepare()`` (or a previous call of this
+        method) for a generation-only batch whose first ``num_real`` requests
+        each committed exactly one more token and whose remaining rows are
+        CUDA-graph padding dummies; ``kv_cache_params`` must already hold
+        this step's cached-token counts. Prompt lengths, request types, seq
+        lens and request ids are unchanged, so only the kv lengths move (one
+        in-place add on host and device instead of a rebuilt tensor and an
+        H2D copy). The KV block table is re-staged only when the caller saw a
+        real request start a new block (``refresh_block_offsets``); otherwise
+        the previously staged prefix still covers every block the kernels
+        read. The Mamba metadata, if any, skips its state-index staging the
+        same way.
+        """
+        if self.mamba_metadata:
+            self.mamba_metadata.prepare_steady_gen_step(self)
+        extra_attrs = get_model_extra_attrs()
+        if extra_attrs is None:
+            get_global_attrs().attention_metadata = weakref.ref(self)
+
+        num_seqs = self.num_seqs
+        self.kv_lens[:num_real].add_(1)
+        self.kv_lens_cuda[:num_real].add_(1)
+        # prepare() binds kv_lens_runtime (host_past_key_value_lengths in
+        # thop.attention, hence max_past_kv_length / mMaxSeqLenKv) to a tensor
+        # of its own without the extra kv tokens, not to self.kv_lens: move it
+        # with the others or eager attention launches keep the stale bound.
+        self.kv_lens_runtime[:num_real].add_(1)
+        self.host_total_kv_lens[1] += num_real
+
+        if refresh_block_offsets:
+            max_kv_len = int(self.kv_lens[:num_seqs].max())
+            spec_active = (self.draft_kv_cache_manager is not None
+                           or self.is_spec_decoding_enabled
+                           or bool(self.kv_cache_params.num_extra_kv_tokens) or
+                           (self.runtime_features is not None and
+                            self.runtime_features.has_speculative_draft_tokens))
+            max_blocks = None
+            if not spec_active and self.kv_cache_manager.tokens_per_block:
+                max_blocks = ceil_div(max_kv_len,
+                                      self.kv_cache_manager.tokens_per_block)
+            self.kv_cache_manager.copy_batch_block_offsets(
+                self.kv_cache_block_offsets,
+                self.request_ids,
+                self.beam_width,
+                self.num_contexts,
+                num_seqs,
+                max_blocks=max_blocks)
+            if self.draft_kv_cache_manager is not None:
+                self.draft_kv_cache_manager.copy_batch_block_offsets(
+                    self.draft_kv_cache_block_offsets,
+                    self.request_ids,
+                    self.beam_width,
+                    self.num_contexts,
+                    num_seqs,
+                    max_blocks=max_blocks)
+
     def prepare_encoder_only(self) -> None:
         """Fast path for encoder-only forward (eager + CUDA graph capture)."""
         extra_attrs = get_model_extra_attrs()
@@ -2227,6 +2315,20 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         return (self.is_mla_enable and self.has_fp4_kv_cache
                 and self.sparse_params is None)
 
+    @property
+    def has_fp8_context_mla(self) -> bool:
+        """Whether MLA context attention with an FP8 KV cache runs the op's FP8
+        context MLA FMHA, which reads FP8 Q, K and V."""
+        return (self.is_mla_enable and self.has_fp8_kv_cache
+                and _has_fp8_context_mla_fmha(get_sm_version()))
+
+    def prewarm_fmha(self, config: "FmhaPrewarmConfig",
+                     attempted: set[type["Fmha"]]) -> None:
+        """Prewarm the initialized manager's eligible libraries, once per library."""
+        manager = getattr(self, "_fmha_manager", None)
+        if manager is not None:
+            manager.prewarm(config, attempted)
+
     def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
         self.quant_config = new_quant_config or QuantConfig()
         self.quant_mode = self.quant_config.layer_quant_mode
@@ -2334,12 +2436,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             if fp8_fallback_layers and fp8_fallback_layers.intersection(
                     mapping.pp_layers(config.num_hidden_layers)):
                 nvfp4_uses_fp8_context = True
-        sm_version = get_sm_version()
         fp8_context_mla = (quant_mode is not None
                            and (quant_mode.has_fp8_kv_cache()
                                 or nvfp4_uses_fp8_context)
-                           and (sm_version == 90 or is_sm_100f(sm_version)
-                                or is_sm_120f(sm_version)))
+                           and _has_fp8_context_mla_fmha(get_sm_version()))
         if not fp8_context_mla:
             return 0
         # Attention-DP runs the full head set per rank; otherwise heads shard across TP (mirror

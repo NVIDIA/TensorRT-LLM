@@ -71,6 +71,11 @@ def _manager(offload: bool) -> Mock:
     impl = SimpleNamespace(
         init_config=SimpleNamespace(tokens_per_block=128, layers=layers),
         layer_grouping=((0, 1),),
+        buffer_grouping=(
+            tuple(
+                SimpleNamespace(layer_id=layer, role=role) for layer in range(2) for role in roles
+            ),
+        ),
         pool_group_descs=[
             SimpleNamespace(
                 pool_group_index=0,

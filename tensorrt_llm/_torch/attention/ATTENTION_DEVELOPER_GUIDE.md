@@ -480,6 +480,17 @@ starting with an empty selection cache. `TrtllmAttention` prepares the complete
 per-forward state, passes itself to the manager for selection, and then executes
 the selected library.
 
+Libraries with a shared JIT module can implement `Fmha.can_prewarm()` and
+`Fmha.prewarm()`. The first checks static layer, dtype and page-size eligibility
+from `FmhaPrewarmConfig`; it does not replace request-level selection.
+Under pipeline parallelism, decoder warmup finds backend attributes on modules
+with retained projection weights, including MLA's `mqa`/`mha` and cross-attention,
+and asks each manager to prewarm its eligible libraries. A shared set limits
+each library to one attempt across the rank's layers. Failures are logged and
+deferred to first use, and all TP peers synchronize before the first forward.
+FlashInfer's decode, prefill and MLA getters load the same `fmha_gen` JIT spec,
+so its prewarm invokes one getter to build the shared library.
+
 `FallbackFmha` hands the Python `FmhaParams` to `thop.run_context` or
 `thop.run_generation`; the native carrier behind them is per host thread and
 never visible to Python. Generated nanobind readers
@@ -666,7 +677,11 @@ The FMHA package is split by role:
   `gqa_split_kv` and `gqa_segmented` take the generation calls their
   `_is_supported` declares with dedicated kernels (`fmha/gqa_*.py`). Their
   size conditions are evaluated at the upper bound of the selection-cache
-  cell (`generation_selection_cell`).
+  cell (`generation_selection_cell`). The segment attention of
+  `gqa_kv_replica` and `gqa_segmented` requests the LSE, for which FlashInfer
+  takes softmax stats off the front of the FMHA workspace: these calls run on
+  the trtllm-gen slice extended in place, and `GqaDecodeFmha.prepare_workspace`
+  sizes the attention workspace for the layer's largest such call.
 - `fmha/flashinfer_trtllm_gen.py` implements the FlashInfer trtllm-gen FMHA
   library.
 - `fmha/fallback.py` implements the fallback library on the native phased

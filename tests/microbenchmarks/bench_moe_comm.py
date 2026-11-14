@@ -494,6 +494,7 @@ def _time_dispatch_and_combine(
         l2_flush_size = (l2_size * 2) // 4
         l2_buffer = torch.empty(l2_flush_size, dtype=torch.int32, device=device)
 
+    cupti = cupti_kernels = cupti_events = None
     if cupti_ctx is not None:
         cupti, cupti_kernels, cupti_events = cupti_ctx
 
@@ -605,6 +606,7 @@ def _time_dispatch_and_combine(
             backend.combine(static_moe_out, all_rank_max_num_tokens=max_tokens)
             _record_event(c_ends[i])
 
+    big_graph = None
     if use_cuda_graph:
         # Keep warmup and timed iterations in one replay to avoid a host-side gap.
         big_graph = torch.cuda.CUDAGraph()
@@ -816,6 +818,16 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Enable Programmatic Dependent Launch (sets TRTLLM_ENABLE_PDL=1).",
     )
+    parser.add_argument(
+        "--sync_protocol",
+        choices=["auto", "fence", "sentinel"],
+        default="auto",
+        help=(
+            "NVLINK_ONE_SIDED sync protocol (sets TRTLLM_NVLINK_ONE_SIDED_A2A_SYNC_PROTOCOL): "
+            "auto = sentinel for the steps it can carry where supported, fence = fence only, "
+            "sentinel = ask for it (warns when it stays off)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -944,6 +956,7 @@ def _run_benchmark_worker_under_current_mpi(
         "device_count": torch.cuda.device_count(),
         "cuda_graph": not args.no_cuda_graph,
         "pdl": bool(args.pdl),
+        "sync_protocol": args.sync_protocol,
         "payload_in_workspace": not bool(args.no_payload_in_workspace),
         "cupti_enabled": cupti_ctx is not None,
         "warning": cupti_warning,
@@ -1091,10 +1104,21 @@ def _run_benchmark_worker_under_current_mpi(
                 combine_times_us = detailed_stats["combine_us_kernel_span"]
 
             # Prepare output
+            uses_sentinel = getattr(backend, "use_sentinel_for_dispatch", None)
             output = {
                 "backend": backend_name,
                 "payload_in_workspace": payload_in_workspace,
                 "local_batch_size": int(local_num_tokens),
+                "sentinel": bool(
+                    uses_sentinel
+                    and uses_sentinel(
+                        max(all_rank_num_tokens),
+                        hidden_states,
+                        hidden_states_sf,
+                        token_final_scales,
+                        None,
+                    )
+                ),
                 "dispatch_us": _gather_per_rank(dispatch_times_us, iter_stats=iter_stats),
                 "combine_us": _gather_per_rank(combine_times_us, iter_stats=iter_stats),
             }
@@ -1219,6 +1243,7 @@ def main() -> None:
 
     _worker_env = dict(_WORKER_ENV)
     _worker_env["TRTLLM_ENABLE_PDL"] = "1" if args.pdl else "0"
+    _worker_env["TRTLLM_NVLINK_ONE_SIDED_A2A_SYNC_PROTOCOL"] = args.sync_protocol
 
     world_size = mpi_world_size()
     if world_size > 1:

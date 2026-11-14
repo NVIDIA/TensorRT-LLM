@@ -227,9 +227,6 @@ with LLM(
     backend="pytorch",
     attn_backend="TRTLLM",
     max_batch_size=4,
-    # Cross-KV pool capacity. The default (1024) is smaller than the 1500
-    # encoder positions that every Whisper request produces.
-    max_input_len=1500,
     max_num_tokens=3000,
     enable_chunked_prefill=False,
     kv_cache_config=KvCacheConfig(
@@ -247,8 +244,11 @@ with LLM(
     print(result.outputs[0].text)
 ```
 
-Set `max_input_len` to at least 1500. Every Whisper request produces 1500 encoder
-positions regardless of clip length, and the cross-KV pool is sized from `max_input_len`.
+Every Whisper request produces 1500 encoder positions (the checkpoint's
+`max_source_positions`) regardless of clip length, and the cross-KV pool is sized
+to hold them; `max_input_len` does not affect it. Leave `max_seq_len` unset, or
+set it to at least 1500, because the engine-level limit also covers the encoder
+pass; a smaller value is rejected at startup.
 
 Whisper automatically disables block reuse for both the decoder self-attention
 and cross-attention KV caches, even when `KvCacheConfig.enable_block_reuse=True`.
@@ -485,7 +485,12 @@ llm = LLM(
 ```
 
 `max_batch_size` controls the total decoder concurrency, while
-`encoder_max_batch_size` controls encoder microbatch admission. For better
+`encoder_max_batch_size` controls encoder microbatch admission. One encoder
+step runs at most `encoder_max_batch_size` requests and `encoder_max_num_tokens`
+encoder tokens; admitted encoder requests beyond either limit wait for later
+encoder steps, oldest first, so limits set too low reduce encoder throughput. A
+request whose encoder tokens alone exceed `encoder_max_num_tokens` is rejected
+at admission instead. For better
 performance, tune `encoder_max_batch_size`, `encoder_max_num_tokens`, and the
 encoder CUDA graph buckets together for the production workload. Start with
 `encoder_max_batch_size` smaller than `max_batch_size`, such as 2 versus 8,

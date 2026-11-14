@@ -860,9 +860,10 @@ class MultimodalConfig(StrictBaseModel):
          "still use the model-owned cache and its capacity is at least one legal "
          "encoder iteration; this value can make that cache larger. String values "
          "such as '512MB' and '1GiB' use binary units. Both inline encoding and "
-         "item scheduling cache individual items; inline caching supports only "
-         "single-modality parameters. "
-         "Compatible with side-stream prefetch."),
+         "item scheduling cache individual items, including those of "
+         "mixed-modality requests. "
+         "Compatible with side-stream prefetch, which requires inline encoding "
+         "(item scheduling rejects it)."),
         status="prototype",
     )
 
@@ -2204,6 +2205,15 @@ class AttentionDpConfig(StrictBaseModel):
     """Configuration for attention DP."""
     enable_balance: bool = Field(default=False,
                                  description="Whether to enable balance.")
+    enable_packed_sync: bool = Field(
+        default=False,
+        description="Pack the per-iteration attention-DP host collectives of "
+        "the disaggregated executor loops (error and KV-timeout votes, rank "
+        "state, can-queue and the CUDA-graph padding vector) into two "
+        "fixed-width all-gathers. Inactive, with an info log naming the "
+        "reason, in modes the packing does not cover (for example PP or CP, "
+        "speculative decoding, KV connectors, an aggregated executor). Every "
+        "rank must see the same value.")
     timeout_iters: int = Field(
         default=50, description="The number of iterations to timeout.")
     batching_wait_iters: int = Field(
@@ -5858,6 +5868,8 @@ _CACHE_TRANSCEIVER_BACKEND_ENV_VARS = (
 class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
     """Configuration for the cache transceiver."""
 
+    _rank_info_auth_key: Optional[bytes] = PrivateAttr(default=None)
+
     backend: Optional[Literal[
         "DEFAULT", "UCX", "NIXL", "MOONCAKE", "MPI"]] = Field(
             default=None,
@@ -7287,7 +7299,8 @@ class TorchLlmArgs(BaseLlmArgs):
         description=
         ("Maximum number of top-level encoder inputs processed in one "
          "iteration. For encoder-decoder models, each encoder request counts "
-         "as one input. For multimodal models, each atomic image, video, or "
+         "as one input, and encoder requests beyond it wait for later "
+         "iterations. For multimodal models, each atomic image, video, or "
          "other encoder item counts as one input, even if it expands into "
          "multiple internal attention sequences. For encoder-decoder models, "
          "it also limits encoder CUDA graph batch sizes. Falls back to "
@@ -7296,14 +7309,17 @@ class TorchLlmArgs(BaseLlmArgs):
 
     encoder_max_num_tokens: Optional[int] = Field(
         default=None,
-        description=(
-            "Maximum number of encoder tokens. For encoder-decoder models, this "
-            "limits encoder CUDA graph total-token buckets. For multimodal "
-            "models, it limits encoder attention tokens scheduled in one "
-            "iteration and is shared across all encoded modalities. It falls "
-            "back to `max_num_tokens` when unset. Because an atomic multimodal "
-            "item cannot be split, the effective budget is raised to the "
-            "model's largest atomic item when necessary."),
+        description=
+        ("Maximum number of encoder tokens. For encoder-decoder models, this "
+         "limits the total encoder tokens of the requests encoded in one "
+         "iteration: encoder requests beyond it wait for later iterations, "
+         "and a request whose encoder tokens alone exceed it is rejected. It "
+         "also limits encoder CUDA graph total-token buckets. For multimodal "
+         "models, it limits encoder attention tokens scheduled in one "
+         "iteration and is shared across all encoded modalities. It falls "
+         "back to `max_num_tokens` when unset. Because an atomic multimodal "
+         "item cannot be split, the effective budget is raised to the "
+         "model's largest atomic item when necessary."),
         status="prototype")
 
     @model_validator(mode="before")

@@ -19,6 +19,7 @@ These tests use mock objects and do NOT require GPU.
 
 from unittest.mock import MagicMock, Mock
 
+import numpy as np
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
@@ -133,7 +134,7 @@ class TestKVCacheAwareADPRouter:
             cached_tokens=0,
             state=LlmRequestState.GENERATION_TO_COMPLETE,
         )
-        dist.tp_allgather.side_effect = lambda payload: [payload]
+        dist.tp_allgather_int64.side_effect = lambda payload: np.asarray([payload])
 
         states = router.gather_all_rank_states([req1, req2])
 
@@ -165,7 +166,7 @@ class TestKVCacheAwareADPRouter:
             cached_tokens=0,
             state=LlmRequestState.GENERATION_TO_COMPLETE,
         )
-        dist.tp_allgather.side_effect = lambda payload: [payload]
+        dist.tp_allgather_int64.side_effect = lambda payload: np.asarray([payload])
 
         states = router.gather_all_rank_states([req1, req2])
 

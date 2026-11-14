@@ -258,9 +258,9 @@ mutually exclusive.
   example, `"512MiB"`), or `0` to disable cross-request reuse. The capacity applies per rank; ranks
   do not share a cache.
   - On the inline encoder path, a request whose items all hit the cache skips the encoder, and a
-    partially cached request encodes only its missing items. Inline caching supports only
-    single-modality requests. When combined with side-stream prefetch, peak memory is the cache
-    capacity plus any in-flight prefetched encoder inputs and outputs.
+    partially cached request encodes only its missing items. Mixed-modality requests are cached
+    per item. When combined with side-stream prefetch, peak memory is the cache capacity plus any
+    in-flight prefetched encoder inputs and outputs.
   - Models with item-level encoder scheduling use the item path unless
     `multimodal_config.encoder_scheduling_policy` is `DISABLED`. Cached items are reused before
     encoder work is selected, so they use none of the per-iteration encoder item or token budget.
@@ -305,6 +305,7 @@ For full documentation, see the [Visual Generation](./visual-generation.md) page
 | `nvidia/Cosmos3-Super-Text2Image-4Step` | Text-to-Image (DMD2-distilled, fixed 4-step schedule) |
 | `nvidia/Cosmos3-Super-Image2Video-4Step` | Image-to-Video (DMD2-distilled, fixed 4-step schedule) |
 | `nvidia/Cosmos3-Edge` | Text-to-Image, Text-to-Video, Image-to-Video (Nemotron-dense backbone, 480p-native) |
+| `nvidia/Cosmos3-Edge-FP8` | Text-to-Image, Text-to-Video, Image-to-Video (static ModelOpt FP8, W8A8/W8A16 step policy) |
 
 ### Feature Matrix
 

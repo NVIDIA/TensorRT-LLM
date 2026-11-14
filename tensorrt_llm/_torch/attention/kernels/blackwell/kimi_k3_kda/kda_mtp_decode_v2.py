@@ -20,16 +20,17 @@ recurrence, fp32 or bf16 state, K = V = 128, conv width 4, NUM_SPEC <= 7 -- with
 arithmetic in the same order, so outputs, committed state, conv pools and replay caches are
 bitwise identical. See that module for the math (replay of accepted drafts, chunk WY form,
 GEMM1/GEMM3/forward substitution/GEMM2, in-place state commit after the golden token, the
-cluster-pair ``SPLIT_V == 2`` form). The difference is the schedule of the latency-bound
-CTA:
+cluster-pair ``SPLIT_V == 2`` form). As there, the recurrent state rows are addressed by
+``ssm_state_indices`` and the conv and replay caches and the accepted-draft counts by
+``replay_state_indices``. The difference is the schedule of the latency-bound CTA:
 
-* **Load phase.** The state slot is the first load. The slot-independent operands (new-token
-  projections, conv weights, per-head constants, output-norm operands) are issued under it; the
-  slot-dependent ones (the S0 TMA, the committed conv windows and every pending replay entry,
-  accepted or not) as soon as it arrives. Each lane moves four consecutive channels of a row
-  (8 B / 16 B vector loads) and keeps the raw words in registers until the accepted count fixes
-  the row's smem position, so the CTA waits for one round trip per dependency level (slot, then
-  operands) instead of one per staging step.
+* **Load phase.** The state and replay slots are the first loads. The slot-independent operands
+  (new-token projections, conv weights, per-head constants, output-norm operands) are issued
+  under them; the slot-dependent ones (the S0 TMA, the committed conv windows and every pending
+  replay entry, accepted or not) as soon as they arrive. Each lane moves four consecutive
+  channels of a row (8 B / 16 B vector loads) and keeps the raw words in registers until the
+  accepted count fixes the row's smem position, so the CTA waits for one round trip per
+  dependency level (slots, then operands) instead of one per staging step.
 * **Precompute** works in smem only, with the q and k conv / SiLU / L2-norm chains of a token
   interleaved in one warp.
 * **Tensor-core ordering.** The GEMM3 operand rows lie clear of the S0 boxes, so GEMM3 is issued
@@ -246,6 +247,7 @@ def kda_decode_mtp_v2_kernel(
     v_cache: cute.Tensor,
     beta_cache: cute.Tensor,
     ssm_state_indices: cute.Tensor,
+    replay_state_indices: cute.Tensor,
     num_accepted_tokens: cute.Tensor,
     smem_qk_layout: cute.Layout,
     tiled_mma1: cute.TiledMma,
@@ -287,9 +289,10 @@ def kda_decode_mtp_v2_kernel(
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     i_hv, i_n, vh = cute.arch.block_idx()
     i_h = i_hv
-    # The request's state slot is the first load of the kernel; its round trip overlaps the
-    # slot-independent loads issued below.
+    # The request's state and replay slots are the first loads of the kernel; their round trip
+    # overlaps the slot-independent loads issued below.
     slot32 = ssm_state_indices[i_n]
+    replay_slot32 = replay_state_indices[i_n]
     hk_off = i_h * K
     hv_off = i_hv * V
     # Recurrent-state element type (fp32 or bf16). The TMA boxes have 128 B swizzled rows,
@@ -455,6 +458,7 @@ def kda_decode_mtp_v2_kernel(
     # V2 state views may place many layer pages between adjacent slots. Widen
     # the slot before indexing: slot * state stride can exceed INT32_MAX.
     slot = Int64(slot32)
+    replay_slot = Int64(replay_slot32)
     h0_idx = slot * HV + i_hv
     # (2) slot-dependent: replay entry r = warp - REPLAY_WARP0 (every pending entry, accepted or
     #     not), the committed conv windows (TMA warp: three columns of q, k and v)
@@ -462,20 +466,20 @@ def kda_decode_mtp_v2_kernel(
     r_rep = cute.make_rmem_tensor(cute.make_layout((6 * 4,)), cutlass.Int32)
     r_repb = cute.make_rmem_tensor(cute.make_layout((1,)), cutlass.Float32)
     if (warp_idx >= REPLAY_WARP0) & (rep < NUM_SPEC):
-        ld_row4(k_cache, (slot, rep, hk_off + k4), r_rep, 0)
-        ld_row4(g_cache, (slot, rep, hk_off + k4), r_rep, 4)
-        ld_row4(v_cache, (slot, rep, hv_off + k4), r_rep, 8)
-        ld_row4(cs_q, (slot, hk_off + k4, KERNEL_WIDTH - 1 + rep), r_rep, 12)
-        ld_row4(cs_k, (slot, hk_off + k4, KERNEL_WIDTH - 1 + rep), r_rep, 16)
-        ld_row4(cs_v, (slot, hv_off + k4, KERNEL_WIDTH - 1 + rep), r_rep, 20)
-        r_repb[0] = cutlass.Float32(beta_cache[slot, rep, i_hv])
+        ld_row4(k_cache, (replay_slot, rep, hk_off + k4), r_rep, 0)
+        ld_row4(g_cache, (replay_slot, rep, hk_off + k4), r_rep, 4)
+        ld_row4(v_cache, (replay_slot, rep, hv_off + k4), r_rep, 8)
+        ld_row4(cs_q, (replay_slot, hk_off + k4, KERNEL_WIDTH - 1 + rep), r_rep, 12)
+        ld_row4(cs_k, (replay_slot, hk_off + k4, KERNEL_WIDTH - 1 + rep), r_rep, 16)
+        ld_row4(cs_v, (replay_slot, hv_off + k4, KERNEL_WIDTH - 1 + rep), r_rep, 20)
+        r_repb[0] = cutlass.Float32(beta_cache[replay_slot, rep, i_hv])
     r_win = cute.make_rmem_tensor(cute.make_layout((3 * (KERNEL_WIDTH - 1) * 4,)), cutlass.Int32)
     if warp_idx == TMA_WARP:
         for w in cutlass.range_constexpr(KERNEL_WIDTH - 1):
-            ld_row4(cs_q, (slot, hk_off + k4, w), r_win, 4 * w)
-            ld_row4(cs_k, (slot, hk_off + k4, w), r_win, 4 * (KERNEL_WIDTH - 1 + w))
-            ld_row4(cs_v, (slot, hv_off + k4, w), r_win, 4 * (2 * (KERNEL_WIDTH - 1) + w))
-    commit_len = num_accepted_tokens[slot]
+            ld_row4(cs_q, (replay_slot, hk_off + k4, w), r_win, 4 * w)
+            ld_row4(cs_k, (replay_slot, hk_off + k4, w), r_win, 4 * (KERNEL_WIDTH - 1 + w))
+            ld_row4(cs_v, (replay_slot, hv_off + k4, w), r_win, 4 * (2 * (KERNEL_WIDTH - 1) + w))
+    commit_len = num_accepted_tokens[replay_slot]
     # ---- TMA bulk load of S0 into the boxes; completes under the token staging /
     #      precompute and is consumed (mbar_ld) at the start of the chunk stage.
     # Issued by the whole of one warp (a TMA load issued from a single thread never
@@ -971,45 +975,51 @@ def kda_decode_mtp_v2_kernel(
         if (warp_idx >= 1) & (warp_idx <= NUM_SPEC):
             p = warp_idx - 1
             t_c = commit_len + 1 + p
-            st_row4(k_cache, (slot, p, hk_off + k4), ld_shared_f32x4(saddr(sK, t_c * K + k4)))
-            st_row4(g_cache, (slot, p, hk_off + k4), ld_shared_f32x4(saddr(sG, t_c * K + k4)))
-            st_row4(v_cache, (slot, p, hv_off + k4), ld_shared_f32x4(saddr(sVall, t_c * V + k4)))
+            st_row4(
+                k_cache, (replay_slot, p, hk_off + k4), ld_shared_f32x4(saddr(sK, t_c * K + k4))
+            )
+            st_row4(
+                g_cache, (replay_slot, p, hk_off + k4), ld_shared_f32x4(saddr(sG, t_c * K + k4))
+            )
+            st_row4(
+                v_cache, (replay_slot, p, hv_off + k4), ld_shared_f32x4(saddr(sVall, t_c * V + k4))
+            )
             st_row4(
                 cs_q,
-                (slot, hk_off + k4, KERNEL_WIDTH - 1 + p),
+                (replay_slot, hk_off + k4, KERNEL_WIDTH - 1 + p),
                 ld_shared_f32x4(saddr(sXQ, (t_c + 3) * K + k4)),
             )
             st_row4(
                 cs_k,
-                (slot, hk_off + k4, KERNEL_WIDTH - 1 + p),
+                (replay_slot, hk_off + k4, KERNEL_WIDTH - 1 + p),
                 ld_shared_f32x4(saddr(sXK, (t_c + 3) * K + k4)),
             )
             st_row4(
                 cs_v,
-                (slot, hv_off + k4, KERNEL_WIDTH - 1 + p),
+                (replay_slot, hv_off + k4, KERNEL_WIDTH - 1 + p),
                 ld_shared_f32x4(saddr(sXV, (t_c + 3) * V + k4)),
             )
             if in_warp_tid == 0:
-                beta_cache[slot, p, i_hv] = sBeta[t_c].to(BETA_CACHE_DTYPE)
+                beta_cache[replay_slot, p, i_hv] = sBeta[t_c].to(BETA_CACHE_DTYPE)
         if warp_idx == REPLAY_WARP0:
             for w in cutlass.range_constexpr(KERNEL_WIDTH - 1):
                 st_row4(
                     cs_q,
-                    (slot, hk_off + k4, w),
+                    (replay_slot, hk_off + k4, w),
                     ld_shared_f32x4(saddr(sXQ, (commit_len + 1 + w) * K + k4)),
                 )
         if warp_idx == REPLAY_WARP0 + 1:
             for w in cutlass.range_constexpr(KERNEL_WIDTH - 1):
                 st_row4(
                     cs_k,
-                    (slot, hk_off + k4, w),
+                    (replay_slot, hk_off + k4, w),
                     ld_shared_f32x4(saddr(sXK, (commit_len + 1 + w) * K + k4)),
                 )
         if warp_idx == REPLAY_WARP0 + 2:
             for w in cutlass.range_constexpr(KERNEL_WIDTH - 1):
                 st_row4(
                     cs_v,
-                    (slot, hv_off + k4, w),
+                    (replay_slot, hv_off + k4, w),
                     ld_shared_f32x4(saddr(sXV, (commit_len + 1 + w) * V + k4)),
                 )
     # ---- wait for GEMM1/GEMM3

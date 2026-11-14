@@ -31,10 +31,6 @@ class MoEDep(str, Enum):
     #: ``import flashinfer`` succeeds. Gates the SM120/SM121 NVFP4 decode
     #: backend (``CuteDslB12xFusedMoE``).
     FLASHINFER = "flashinfer"
-    #: FlashInfer additionally exposes ``trtllm_bf16_moe`` /
-    #: ``trtllm_bf16_routed_moe``. Strictly stronger than :attr:`FLASHINFER`
-    #: and gates the TRTLLM-Gen unquantized BF16 path.
-    FLASHINFER_BF16_MOE = "flashinfer_bf16_moe"
     #: The bundled DeepGEMM build exposes the ``fp8_fp4_mega_moe`` kernel.
     DEEPGEMM_MEGAMOE = "deepgemm_megamoe"
     #: ``nvidia-cutlass-dsl[cu13]`` is new enough for the MegaMoE CuteDSL ABI.
@@ -73,21 +69,6 @@ def _probe_flashinfer() -> Tuple[bool, str]:
         import flashinfer  # noqa: F401
     except Exception as exc:  # noqa: BLE001 - any import failure means absent
         return False, f"import flashinfer failed: {exc}"
-    return True, ""
-
-
-def _probe_flashinfer_bf16_moe() -> Tuple[bool, str]:
-    try:
-        from flashinfer.fused_moe import core as _core
-    except Exception as exc:  # noqa: BLE001 - any import failure means absent
-        return False, f"import flashinfer.fused_moe.core failed: {exc}"
-    missing = [
-        symbol
-        for symbol in ("trtllm_bf16_moe", "trtllm_bf16_routed_moe")
-        if not hasattr(_core, symbol)
-    ]
-    if missing:
-        return False, f"flashinfer.fused_moe.core lacks {', '.join(missing)}"
     return True, ""
 
 
@@ -135,7 +116,6 @@ def _probe_megamoe_cutedsl_op() -> Tuple[bool, str]:
 
 _DEP_PROBES: Dict[MoEDep, DepProbe] = {
     MoEDep.FLASHINFER: _probe_flashinfer,
-    MoEDep.FLASHINFER_BF16_MOE: _probe_flashinfer_bf16_moe,
     MoEDep.DEEPGEMM_MEGAMOE: _probe_deepgemm_megamoe,
     MoEDep.MEGAMOE_CUTEDSL_RUNTIME: _probe_megamoe_cutedsl_runtime,
     MoEDep.MEGAMOE_CUTEDSL_OP: _probe_megamoe_cutedsl_op,
@@ -161,8 +141,7 @@ def _warn_on_removed_env_flags() -> None:
     if _REMOVED_TRTLLM_GEN_USE_FLASHINFER in os.environ:
         logger.warning_once(
             f"{_REMOVED_TRTLLM_GEN_USE_FLASHINFER} was removed and has no effect: "
-            "quantized TRTLLM-Gen MoE always runs the native TRT-LLM leaf, and the "
-            "unquantized FlashInfer leaf uses the native NVLinkTwoSided all-to-all.",
+            "TRTLLM-Gen MoE always runs the native TRT-LLM kernels.",
             key=f"removed_env_{_REMOVED_TRTLLM_GEN_USE_FLASHINFER}",
         )
 
