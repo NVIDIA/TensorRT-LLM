@@ -293,7 +293,7 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
                              and not pyt_kv_cache_dtype.startswith("mixed_"))
     if (effective_kv_cache_quant in (QuantAlgo.NVFP4, QuantAlgo.NVFP4.value)
             and not supports_fp4_mla_attention(model_config)
-            and not getattr(model_config.modeling_v2_target,
+            and not getattr(getattr(model_config, "modeling_v2_target", None),
                             "supports_nvfp4_kv_cache", False)
             and not uses_minimax_m3_msa and not uses_dsa_nvfp4_latent
             and torch.cuda.is_available() and get_sm_version() == 107):
