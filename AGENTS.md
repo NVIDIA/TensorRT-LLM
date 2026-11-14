@@ -174,9 +174,105 @@ Key files:
    - Target `main` unless fixing a release branch bug
    - See `CONTRIBUTING.md` for full PR policies
 
+### Branch and worktree hygiene
+
+As of Oct 29, 2026, a clean `git clone` TensorRT-LLM checkout contains 20k+ files.
+It can increase to 10+ GB and 80k+ files with generated .cu files, built C++ artifacts in `cpp/build*`,
+libraries staged in `tensorrt_llm/libs/`, wheel and related packages in `build/` and a venv holding
+the dependencies.
+Cluster Lustre file system has limited disk and file count space. Every extra worktree therefore
+costs a lot of resources plus rebuild time.
+
+Reduce creation of new branches and worktrees if you can. Record what you create in the cleanup list
+below, so that user can clean it up later. This includes items both on the local computer and on the
+remote cluster.
+
+- If user's conversation shows the work belongs to an existing branch, keep commits to that branch.
+- When reporting your work to user, also list the items you created (see the list below) to keep user
+  informed on resource usage.
+
+#### Cleanup list
+All agent sessions that use one clone share one cleanup list. Thus user gets at most one cleanup
+question a day, and that question covers the items of all sessions. The list is in the folder
+`$(git rev-parse --git-common-dir)/agent-cleanup/`, which is the same for all worktrees of the clone:
+
+- `items.jsonl`: one JSON line for each change to an item.
+- `last-question`: the local date (`YYYY-MM-DD`) of the last cleanup question.
+
+Add an item to the list when you create it. Then the list stays correct after your context is
+compacted. Add these items:
+
+- Local and remote branches.
+- New worktrees including build outputs: `cpp/build*`, `build/` and venvs inside them.
+- Container images: `.sqsh` files and Docker images.
+- Job folders, Slurm logs, run outputs and other temporary files.
+- Jobs that are still running.
+
+Do not add text files that you write, such as reports, notes, Markdown or HTML pages, scripts and
+configs, and do not list them in your reports. They are small. Logs are not in this group, so add them.
+
+Example line:
+
+```json
+{"time": "2026-11-10T14:03", "session": "fp8 gemm tuning", "host": "local", "kind": "worktree", "path": "/path/to/worktree", "status": "in-use", "keep": ""}
+```
+
+- `host`: `local` or the cluster name.
+- `status`: `in-use` while your task uses the item, `done` when it does not, `deleted` after the delete.
+- `keep`: the reason to keep the item, for example "branch of open PR #123". Empty if there is no reason.
+
+To change an item, append a new line with the same `host` and `path`. The last line for an item is its
+current state.
+
+#### Cleanup question
+When you report your task's results, first set each of your items to `done` if your task no longer uses
+it. Then read `last-question`. If it shows today's date, do not ask about cleanup. If not, write today's
+date into it and ask user a direct yes/no question about cleanup. Do not drop this question to make room
+for a question about the next step. A note such as "you can delete it later" does not count.
+
+In the question, list these items of all sessions, with the session of each item:
+
+- Items with status `done`. If an item has a `keep` reason, list it only when the reason no longer
+  applies, for example after the PR merges.
+- Items with status `in-use` that are 7+ days old. Their session possibly stopped.
+- Worktrees that are 30+ days old in `git worktree list`.
+- If you have visited container image folders during your work, container images that are 30+ days old.
+
+Before you list an item, make sure it still exists if you can do this quickly. Set missing items to
+`deleted`.
+
+If user says yes, delete the items you can reach, set them to `deleted` and tell user which items you
+could not delete. If user wants to keep an item, write the reason in `keep`.
+If user has not previously granted you the permission to delete, do not delete any item on the list
+until user says yes.
+
+If user asks for the cleanup question, ask it at any time, even if `last-question` shows today's date.
+
+#### Automatic Dev Loop
+If user tasks you with an automatic develop/optimization/debugging loop where each iteration involves trying
+some code changes:
+
+- Prefer rebuilding in place in a single base worktree across all iterations: files in venv are reused
+  and CMake recompiles only the changed files.
+  - If the entire loop only involves Python change, build once with an editable install; later Python edits
+    take effect without rebuilding.
+- If you must create a new worktree at each iteration to store code changes and build artifacts (e.g. a
+  breadth-first dynamic tree search on code design or requiring runtime comparisons against builds from prior
+  iterations):
+  - If the entire loop only involves Python change, build TRTLLM only once on a base worktree. At each
+    iteration, check out a new worktree from the commit the base worktree was built at, hard-link the base
+    worktree's build outputs (the files Git ignores under `tensorrt_llm/`) into it instead of rebuilding,
+    and use `PYTHONPATH` pointing at the new worktree during run time.
+  - Once you know the built artifacts of one worktree (its build directories and the container images built
+    only for it) will never be used again by any worktree or job, clean up that worktree if user has granted
+    you the permission to delete. If not, set its items to `done` in the cleanup list. To clean up, delete the built
+    artifacts. If the code needs to be kept, commit it and keep note of the branch name, then run
+    `git worktree remove`. Otherwise, delete the branch and worktree too.
+
 ### GitHub CLI authentication (`GH_CONFIG_DIR`)
 
-The `gh` CLI uses `~/.config/gh` by default for authentication. Different GitHub hosts or forks may require a different config directory. **Before running any `gh` command** (e.g., `gh pr create`, `gh api`, `gh pr comment`):
+The `gh` CLI uses `~/.config/gh` by default for authentication. Different GitHub hosts or forks may require a different config directory.
+**Before running any `gh` command** (e.g., `gh pr create`, `gh api`, `gh pr comment`):
 
 1. Check if the user has specified a custom `GH_CONFIG_DIR` (e.g., in `CLAUDE.local.md` or environment). If so, use it.
 2. If not explicitly set, default to `~/.config/gh`; do not ask for confirmation.
