@@ -524,10 +524,15 @@
 /tensorrt_llm/_torch/_experimental/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency @dongfengy @Tabrizian @xwang233
 /tests/unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency @dongfengy @Tabrizian @xwang233
 
-# GLM-5.3-Flash (glm5_next)
-/tensorrt_llm/_torch/_experimental/modeling_v2/models/glm5_next @zhaoyangwang-nvidia
-/tests/unittest/_torch/modeling_v2/models/glm5_next @zhaoyangwang-nvidia
-/tests/integration/defs/accuracy/modeling_v2/glm5_next/ @zhaoyangwang-nvidia
+# GLM-5.3-Flash family (glm5_next): routing and shared code are shared by its target owners.
+/tensorrt_llm/_torch/_experimental/modeling_v2/models/glm5_next @zhaoyangwang-nvidia @ruocheng-nv
+/tests/unittest/_torch/modeling_v2/models/glm5_next @zhaoyangwang-nvidia @ruocheng-nv
+/tests/integration/defs/accuracy/modeling_v2/glm5_next/ @zhaoyangwang-nvidia @ruocheng-nv
+
+# GLM-5.3-Flash block-FP8 sm_10x tp4 target: source, ops, native code, and tests.
+/tensorrt_llm/_torch/_experimental/modeling_v2/models/glm5_next/glm_5_3_flash_fp8__sm_10x__tp4 @ruocheng-nv
+/tests/unittest/_torch/modeling_v2/models/glm5_next/glm_5_3_flash_fp8__sm_10x__tp4 @ruocheng-nv
+/tests/integration/defs/accuracy/modeling_v2/glm5_next/glm_5_3_flash_fp8__sm_10x__tp4 @ruocheng-nv
 
 # Uncomment only on release branches (e.g. release/0.19):
 # * @NVIDIA/trt-llm-release-branch-approval

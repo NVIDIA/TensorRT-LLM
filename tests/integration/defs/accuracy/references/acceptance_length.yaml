@@ -143,6 +143,13 @@ TestGLM53FlashFP8::test_mtp:
 TestModelingV2Glm53FlashNvfp4Sm100DefaultMtpFused::test_gsm8k_mtp:
   ref_al: 3.396
   min_al: 3.226
+# GLM-5.3-Flash FP8, the modeling_v2 sm_10x tp4 target: the checkpoint's MTP layer chained for
+# 3 drafts, measured on this target on 4x B200 (TP4, FP8 KV cache), GSM8K under the harness
+# protocol (the built-in model measured 3.382 in the same setting). min_al is 95% of the
+# measured value.
+ModelingV2Glm53FlashFp8Sm10xTp4::mtp3:
+  ref_al: 3.380
+  min_al: 3.211
 # Measured on B200, 1P1D TP1 with target and draft KV in one manager.
 # min_al is 95% of the measured value.
 TestQwen3_8BDFlash::test_gsm8k_1p1d_unified_draft_kv:

@@ -1137,6 +1137,18 @@ class TestModelDefaults:
         applied = apply_model_defaults_to_llm_args(llm_args, model_defaults)
         assert applied == model_defaults
 
+    def test_applied_defaults_leave_other_fields_unset(self):
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model", max_batch_size=8)
+        before = set(llm_args.model_fields_set)
+        apply_model_defaults_to_llm_args(llm_args, {
+            "enable_chunked_prefill": False,
+            "max_batch_size": 4,
+        })
+        assert llm_args.max_batch_size == 8
+        assert not llm_args.enable_chunked_prefill
+        assert llm_args.model_fields_set == before | {"enable_chunked_prefill"}
+        assert "modeling_v2" not in llm_args.model_fields_set
+
     @pytest.mark.parametrize(
         "defaults_dict,should_raise,error_contains",
         [
