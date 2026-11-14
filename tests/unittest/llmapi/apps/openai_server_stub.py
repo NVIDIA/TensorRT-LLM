@@ -22,7 +22,12 @@ from tensorrt_llm.serve.openai_server import OpenAIServer
 
 
 def make_stub_openai_server(
-    tmp_path, model: str, model_config: Any, generate_async: Callable, tokenizer: Any = None
+    tmp_path,
+    model: str,
+    model_config: Any,
+    generate_async: Callable,
+    tokenizer: Any = None,
+    tool_parser: str | None = None,
 ) -> OpenAIServer:
     """Build the server through ``OpenAIServer.__init__`` on an engine stub.
 
@@ -30,7 +35,8 @@ def make_stub_openai_server(
     reads, a tokenizer (a vocab-size stub unless one is given), and
     ``generate_async`` recording what reaches the engine. ``tmp_path`` is the
     empty model directory, so the constructor loads no HF processor or config
-    and ``model_config`` is set to the given stub.
+    and ``model_config`` is set to the given stub. ``tool_parser`` is the
+    server's ``--tool_parser``.
     """
     if tokenizer is None:
         tokenizer = SimpleNamespace(tokenizer=SimpleNamespace(vocab_size=model_config.vocab_size))
@@ -63,7 +69,7 @@ def make_stub_openai_server(
     server = OpenAIServer(
         generator=generator,
         model=model,
-        tool_parser=None,
+        tool_parser=tool_parser,
         server_role=None,
         metadata_server_cfg=None,
     )
