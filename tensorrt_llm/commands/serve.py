@@ -58,10 +58,10 @@ from tensorrt_llm.commands.utils import (collect_explicit_cli_keys,
 from tensorrt_llm.executor.utils import MAX_NUM_FRONTENDS, LlmLauncherEnvs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.llmapi.disagg_utils import (
-    DisaggClusterConfig, DisaggServerConfig, MetadataServerConfig, ServerRole,
-    extract_disagg_cluster_config, parse_disagg_config_file,
-    parse_metadata_server_config_file, validate_config_bool,
-    validate_internal_request_auth_key)
+    CtxGenServerConfig, DisaggClusterConfig, DisaggServerConfig,
+    MetadataServerConfig, ServerRole, extract_disagg_cluster_config,
+    parse_disagg_config_file, parse_metadata_server_config_file,
+    validate_config_bool, validate_internal_request_auth_key)
 from tensorrt_llm.llmapi.llm_args import (SERVE_CLI_CONFIG_FIELDS,
                                           CacheTransceiverConfig,
                                           KvCacheConnectorConfig, SleepConfig,
@@ -2931,6 +2931,12 @@ def set_cuda_device():
     torch.cuda.set_device(device_id)
 
 
+_ATTENTION_TP_MISMATCH = (
+    "the same attention tensor parallelism (tensor_parallel_size, "
+    "or 1 with enable_attention_dp) in context_servers and "
+    "generation_servers")
+
+
 def _drafter_reads_helix_sharded_context(
         decoding_type: Optional[str], attention_backend: Optional[str]) -> bool:
     """Whether a speculative_config's drafter reads a helix-sharded context.
@@ -2940,7 +2946,9 @@ def _drafter_reads_helix_sharded_context(
     return decoding_type == "DSpark" and attention_backend == "CUTEDSL"
 
 
-def _shared_draft_kv_blocker(server_configs) -> Optional[str]:
+def _shared_draft_kv_blocker(server_configs: list[CtxGenServerConfig],
+                             *,
+                             check_attention_tp: bool = True) -> Optional[str]:
     """What keeps the context and generation servers from sharing draft KV, or None.
 
     A config may list only one side: a DWDP context MPI world launches its
@@ -2954,14 +2962,12 @@ def _shared_draft_kv_blocker(server_configs) -> Optional[str]:
                 "generation_servers")
     # Ranks hold the same KV heads when their attention TP matches: attention
     # DP keeps every head on each rank.
-    if len({
+    if check_attention_tp and len({
             1 if cfg.other_args.get("enable_attention_dp", False) else
             cfg.other_args.get("tensor_parallel_size", 1)
             for cfg in server_configs
     }) != 1:
-        return ("the same attention tensor parallelism (tensor_parallel_size, "
-                "or 1 with enable_attention_dp) in context_servers and "
-                "generation_servers")
+        return _ATTENTION_TP_MISMATCH
     if any(
             cfg.other_args.get("context_parallel_size", 1) != 1
             for cfg in server_configs
@@ -2994,14 +3000,27 @@ def _shared_draft_kv_blocker(server_configs) -> Optional[str]:
         if str(kv_cache.get("dtype", "auto")).lower().startswith("mixed_"):
             return "a uniform KV cache dtype in both sections"
         tokens_per_block = kv_cache.get("tokens_per_block", 32)
-        if spec.get("decoding_type") == "DSpark" and backend == "CUTEDSL":
+        if (spec.get("decoding_type") == "DSpark" and backend == "CUTEDSL"
+                and (tokens_per_block <= 1 or 128 % tokens_per_block)):
             # The CuTe DSL MLA block decode pages by any divisor of 128 above 1.
-            if tokens_per_block <= 1 or 128 % tokens_per_block:
-                return (
-                    "kv_cache_config.tokens_per_block to divide 128 for "
+            return ("kv_cache_config.tokens_per_block to divide 128 for "
                     "DSpark with attention_backend CUTEDSL in both sections")
-        elif tokens_per_block not in (16, 32, 64):
-            return "kv_cache_config.tokens_per_block to be 16, 32, or 64 in both sections"
+    # Each worker's gate decides which page sizes its drafter reads (a manager
+    # hosting draft layers also reads 128-token pages); equal pages, or pages
+    # every gate admits, keep both workers' decisions the same.
+    page_sizes = {(cfg.other_args.get("kv_cache_config")
+                   or {}).get("tokens_per_block", 32)
+                  for cfg in server_configs}
+    all_cutedsl = all(
+        _drafter_reads_helix_sharded_context(
+            cfg.other_args["speculative_config"].get("decoding_type"),
+            cfg.other_args["speculative_config"].get("attention_backend"))
+        for cfg in server_configs)
+    if len(page_sizes) > 1 and not all_cutedsl and not page_sizes <= {
+            16, 32, 64
+    }:
+        return ("kv_cache_config.tokens_per_block to be equal in both "
+                "sections, or 16, 32, or 64 in both")
     return None
 
 
@@ -3073,7 +3092,22 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
             "TRTLLM_DISAGG_SHARED_DRAFT_KV") == "1":
         raise click.UsageError(
             f"TRTLLM_DISAGG_SHARED_DRAFT_KV=1 requires {blocker}.")
-    if os.environ.get("TRTLLM_DISAGG_SHARED_DRAFT_KV") in (None, "auto"):
+    shared_draft_kv = os.environ.get("TRTLLM_DISAGG_SHARED_DRAFT_KV")
+    # Left unset, each worker decides: a manager hosting draft layers shares
+    # (its gate compares global KV heads and the peers reshard its views), and
+    # other managers keep a separate draft KV cache. That holds when the sides
+    # differ only in attention TP, and for a one-sided config, whose other side
+    # is launched separately and decides the same way.
+    sides = {cfg.type for cfg in disagg_cfg.server_configs}
+    attention_tp_only = (blocker == _ATTENTION_TP_MISMATCH
+                         and sides == {"ctx", "gen"}
+                         and _shared_draft_kv_blocker(
+                             disagg_cfg.server_configs,
+                             check_attention_tp=False) is None)
+    one_sided = blocker is None and sides != {"ctx", "gen"}
+    if shared_draft_kv == "auto" or (shared_draft_kv is None
+                                     and not attention_tp_only
+                                     and not one_sided):
         resolved = _shared_draft_kv_default(disagg_cfg.server_configs, blocker)
         os.environ["TRTLLM_DISAGG_SHARED_DRAFT_KV"] = resolved
         if blocker is not None:
@@ -3089,6 +3123,15 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
         logger.info(
             f"TRTLLM_DISAGG_SHARED_DRAFT_KV unset or 'auto' resolved to "
             f"'{resolved}': {reason}.")
+    elif shared_draft_kv is None:
+        why = ("the sections differ only in attention tensor parallelism"
+               if attention_tp_only else
+               "the configuration lists only context or only generation "
+               "servers")
+        logger.info(
+            f"TRTLLM_DISAGG_SHARED_DRAFT_KV left unset: {why}, so a manager "
+            "hosting draft layers shares draft KV and other managers keep a "
+            "separate draft KV cache.")
 
     # Run a server with the underlying LLM invokes a RemoteMPISessionClient
     if os.environ.get(DisaggLauncherEnvs.

@@ -24,6 +24,9 @@ import pytest
 import torch
 import yaml
 
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.cache_manager import (
+    MiniMaxM3KVCacheManagerV2,
+)
 from tensorrt_llm._torch.model_config import KVCacheLayerSpec
 from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
@@ -313,7 +316,10 @@ class _StopLauncher(Exception):
 
 
 def _launch_from_disagg_config(monkeypatch, tmp_path, context_servers, generation_servers):
-    """Run the real disaggregated_mpi_worker up to the rank-communicator split."""
+    """Run the real disaggregated_mpi_worker up to the rank-communicator split.
+
+    ``generation_servers=None`` writes a context-only config (no generation instances).
+    """
     from tensorrt_llm.commands import serve
 
     config = tmp_path / "disagg.yaml"
@@ -321,7 +327,11 @@ def _launch_from_disagg_config(monkeypatch, tmp_path, context_servers, generatio
         yaml.safe_dump(
             {
                 "context_servers": {"num_instances": 1, **context_servers},
-                "generation_servers": {"num_instances": 1, **generation_servers},
+                "generation_servers": (
+                    {"num_instances": 0}
+                    if generation_servers is None
+                    else {"num_instances": 1, **generation_servers}
+                ),
             }
         )
     )
@@ -759,6 +769,106 @@ def test_launcher_checks_all_peer_configs(
         draft=_model_config(kv_heads=8, head_dim=128),
     )
     assert creator._should_unify_dflash_kv_cache() is shared
+
+
+@pytest.mark.parametrize(
+    ("context_tokens_per_block", "generation_tokens_per_block", "shared"),
+    [(128, 128, True), (64, 128, False), (16, 64, True)],
+    ids=["equal-128", "mismatch-64-128", "mixed-16-64"],
+)
+def test_launcher_leaves_equal_page_sizes_to_the_worker_gates(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    context_tokens_per_block: int,
+    generation_tokens_per_block: int,
+    shared: bool,
+) -> None:
+    """Equal pages reach both worker gates; different pages outside 16/32/64 keep separate pools.
+
+    A manager hosting draft layers reads 128-token pages, so the launcher does not refuse them.
+    """
+    spec = {"decoding_type": "DSpark", "attention_backend": "TRTLLM"}
+    servers = [
+        {"speculative_config": spec, "kv_cache_config": {"tokens_per_block": tokens_per_block}}
+        for tokens_per_block in (context_tokens_per_block, generation_tokens_per_block)
+    ]
+    if not shared:
+        with pytest.raises(click.UsageError, match="tokens_per_block to be equal"):
+            _launch_from_disagg_config(monkeypatch, tmp_path, *servers)
+    monkeypatch.delenv(_SHARED_DRAFT_KV_ENV)
+    with pytest.raises(_StopLauncher):
+        _launch_from_disagg_config(monkeypatch, tmp_path, *servers)
+
+    assert os.environ[_SHARED_DRAFT_KV_ENV] == ("auto" if shared else "0")
+    if context_tokens_per_block == generation_tokens_per_block:
+        # A plain V2 manager refuses 128-token pages on both workers alike.
+        creator = _creator(
+            is_disagg=True,
+            target=_model_config(kv_heads=8, head_dim=128),
+            draft=_model_config(kv_heads=8, head_dim=128),
+        )
+        creator._tokens_per_block = context_tokens_per_block
+        assert "tokens_per_block=128" in creator._dflash_unify_blocker()
+        assert not creator._should_unify_dflash_kv_cache()
+
+
+@pytest.mark.parametrize("request_mode", [None, "auto"], ids=["unset", "auto"])
+def test_launcher_leaves_a_one_sided_config_to_the_worker_gates(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, request_mode: str | None
+) -> None:
+    """A context-only config (a DWDP context world) cannot see how generation is launched.
+
+    Unset, the switch stays unset so each worker decides as a separately launched generation
+    worker does; "auto" still resolves to "0".
+    """
+    if request_mode is None:
+        monkeypatch.delenv(_SHARED_DRAFT_KV_ENV, raising=False)
+    else:
+        monkeypatch.setenv(_SHARED_DRAFT_KV_ENV, request_mode)
+    spec = {"decoding_type": "DSpark", "attention_backend": "TRTLLM"}
+    with pytest.raises(_StopLauncher):
+        _launch_from_disagg_config(monkeypatch, tmp_path, {"speculative_config": spec}, None)
+
+    assert os.environ.get(_SHARED_DRAFT_KV_ENV) == ("0" if request_mode else None)
+
+
+@pytest.mark.parametrize("request_mode", [None, "auto"], ids=["unset", "auto"])
+def test_launcher_leaves_tp_and_attention_dp_to_hosting_managers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, request_mode: str | None
+) -> None:
+    """Peers differing only in TP or attention DP leave the switch unset unless it is "auto".
+
+    Unset, a manager hosting draft layers shares on both peers (its decision compares global KV
+    heads), and a plain V2 manager keeps the separate draft KV cache, as an explicit "0" would.
+    """
+    if request_mode is None:
+        monkeypatch.delenv(_SHARED_DRAFT_KV_ENV)
+    else:
+        monkeypatch.setenv(_SHARED_DRAFT_KV_ENV, request_mode)
+    spec = {"decoding_type": "DSpark", "attention_backend": "TRTLLM"}
+    with pytest.raises(_StopLauncher):
+        _launch_from_disagg_config(
+            monkeypatch,
+            tmp_path,
+            {"speculative_config": spec, "tensor_parallel_size": 2},
+            {"speculative_config": spec, "tensor_parallel_size": 2, "enable_attention_dp": True},
+        )
+
+    assert os.environ.get(_SHARED_DRAFT_KV_ENV) == ("0" if request_mode else None)
+    layout = _model_config(kv_heads=8, head_dim=128)
+    for enable_attention_dp in (False, True):
+        plain = _creator(is_disagg=True, target=layout, draft=layout, tp_size=2)
+        plain._mapping.enable_attention_dp = enable_attention_dp
+        assert not plain._should_unify_dflash_kv_cache()
+        draft = _model_config(kv_heads=8, head_dim=128)
+        draft.pretrained_config.sliding_window = 128
+        hosting = _creator(
+            is_disagg=True, target=layout, draft=draft, tp_size=2, draft_windows=[128]
+        )
+        hosting._mapping.enable_attention_dp = enable_attention_dp
+        hosting._kv_cache_manager_cls = MiniMaxM3KVCacheManagerV2
+        hosting._sparse_attention_config = SimpleNamespace(implementation="msa")
+        assert hosting._should_unify_dflash_kv_cache() is (request_mode is None)
 
 
 @pytest.mark.parametrize(

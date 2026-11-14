@@ -189,17 +189,23 @@ class PeerRegistrar:
             raise ValueError(
                 "PeerRegistrar: unified draft KV layer count differs "
                 f"(local={self._ri.num_draft_layers}, peer={peer_ri.num_draft_layers}); "
-                "both peers must use the same speculative decoding KV cache layout; "
-                "set TRTLLM_DISAGG_SHARED_DRAFT_KV identically on both workers, or "
-                "the 'auto' setting resolved differently on the two workers; "
-                "check the shared-draft-KV decision logged at startup."
+                "both peers must use the same speculative decoding KV cache layout: "
+                "give both workers the same speculative_config and set "
+                "TRTLLM_DISAGG_SHARED_DRAFT_KV identically on both "
+                "(TRTLLM_DISAGG_SHARED_DRAFT_KV=0 on every worker keeps a separate draft "
+                "KV cache); if the 'auto' setting resolved differently on the two "
+                "workers, check the shared-draft-KV decision logged at startup."
             )
-        # Draft layers carry the target's KV heads per rank, so they move with
-        # the target's head mapping only when both sides shard heads alike. A
-        # K-only (MLA) cache keeps the whole latent on every rank.
+        # Appended draft layers carry the target's KV heads per rank, so they
+        # move with the target's head mapping only when both sides shard heads
+        # alike. A K-only (MLA) cache keeps the whole latent on every rank, and
+        # a manager hosting draft layers reshards them by their own views.
         if (
             self._ri.num_draft_layers
             and not (self._ri.attention.is_mla and peer_ri.attention.is_mla)
+            and not (
+                self._ri.draft_layers_reshard_across_tp and peer_ri.draft_layers_reshard_across_tp
+            )
             and self._ri.tp_size_per_dp_group != peer_ri.tp_size_per_dp_group
         ):
             raise ValueError(

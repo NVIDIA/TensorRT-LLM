@@ -435,3 +435,31 @@ def test_dflash_windows_span_a_page(windows: list | None, expected: bool) -> Non
     from tensorrt_llm._torch.speculative.dflash import dflash_windows_span_a_page
 
     assert dflash_windows_span_a_page(windows, 128) is expected
+
+
+def test_warmup_reseeds_generation_slots_from_the_batch_positions() -> None:
+    """CUDA-graph warmup reuses dummy request ids across batches. A generation
+    row's slot that kept a longer batch's length is seeded from this batch's
+    position (capped at the context capacity); context rows, rows without a
+    slot and the attention-DP dummy keep their slots as they are."""
+    import torch
+
+    from tensorrt_llm._torch.pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
+    from tensorrt_llm._torch.speculative.dflash import DFlashWorker
+
+    worker = object.__new__(DFlashWorker)
+    worker._max_ctx = 1000
+    worker._req_to_slot = {5: 3, 7: 0, 8: 1, ATTENTION_DP_DUMMY_REQUEST_ID: 2}
+    worker._ctx_len = torch.tensor([900, 900, 900, 900, 0])
+    worker._ctx_len_host = [900, 900, 900, 900, 0]
+    worker._ctx_base_pages = torch.zeros(5, dtype=torch.long)
+    worker._ctx_base_host = [0] * 5
+    spec_metadata = SimpleNamespace(
+        request_ids=[5, 7, 8, ATTENTION_DP_DUMMY_REQUEST_ID, 9],
+        num_generations=4,
+        seq_lens=[3, 2, 2, 2, 2],
+        host_position_ids=torch.tensor([0, 1, 2, 40, 41, 2000, 2001, 10, 11, 60, 61]),
+    )
+    worker._reseed_warmup_generation_slots(spec_metadata)
+    assert worker._ctx_len.tolist() == [40, 1000, 900, 900, 0]
+    assert worker._ctx_len_host == [40, 1000, 900, 900, 0]

@@ -572,8 +572,10 @@ def test_shared_draft_kv_under_helix_needs_the_cutedsl_dspark_drafter(
 
 @pytest.mark.parametrize(
     "backend, tokens_per_block, blocked",
+    # Equal TRTLLM pages reach the worker gates: a manager hosting draft layers
+    # reads 128-token pages, other managers keep a separate draft KV cache.
     [("CUTEDSL", 128, False), ("CUTEDSL", 64, False), ("CUTEDSL", 96, True),
-     ("TRTLLM", 128, True), ("TRTLLM", 64, False)],
+     ("TRTLLM", 128, False), ("TRTLLM", 64, False)],
 )
 def test_shared_draft_kv_page_size_follows_the_dspark_drafter_backend(
         backend, tokens_per_block, blocked):

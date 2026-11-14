@@ -155,6 +155,30 @@ def get_dflash_trtllm_gen_ops() -> DFlashTrtllmGenOps:
     )
 
 
+# trtllm-gen's dynamic page-size kernels start here (kDynamicNumTokensPerPageThreshold).
+_TRTLLM_GEN_DYNAMIC_PAGE_MIN_TOKENS = 128
+
+
+def dflash_trtllm_supports_page_size(
+    tokens_per_block: int, *, has_context_attention: bool, has_folded_decode: bool = False
+) -> bool:
+    """Whether the DFlash TRTLLM ops serve ``tokens_per_block``-token context pages.
+
+    On power-of-two pages from 128 tokens, trtllm-gen's dynamic page-size kernels cover the
+    decode of causal and windowed non-causal layers. The context kernel is not covered, and
+    the folded decode of full non-causal layers is not validated on those pages, so either
+    keeps the fixed page sizes.
+    """
+    from ..attention.backends.fmha.flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
+
+    if tokens_per_block in FlashInferTrtllmGenFmha.SUPPORTED_TOKENS_PER_BLOCK:
+        return True
+    if has_context_attention or has_folded_decode:
+        return False
+    is_power_of_two = tokens_per_block > 0 and (tokens_per_block & (tokens_per_block - 1)) == 0
+    return is_power_of_two and tokens_per_block >= _TRTLLM_GEN_DYNAMIC_PAGE_MIN_TOKENS
+
+
 def get_dflash_folded_decode_chunk_size(block_size: int, num_heads: int, num_kv_heads: int) -> int:
     """Plan query chunks for matching-dtype, one-query GQA decode launches.
 
@@ -213,9 +237,16 @@ def validate_dflash_trtllm_gen_runtime(
         )
     if folded_block_size is not None:
         get_dflash_folded_decode_chunk_size(folded_block_size, num_heads, num_kv_heads)
-    if tokens_per_block not in FlashInferTrtllmGenFmha.SUPPORTED_TOKENS_PER_BLOCK:
+    # Every mask the drafter reports lowers to decode.
+    if not dflash_trtllm_supports_page_size(
+        tokens_per_block,
+        has_context_attention=False,
+        has_folded_decode=folded_block_size is not None,
+    ):
         supported = sorted(FlashInferTrtllmGenFmha.SUPPORTED_TOKENS_PER_BLOCK)
         raise RuntimeError(
             "DFlash TRTLLM attention does not support context-cache page size "
-            f"{tokens_per_block}; supported sizes are {supported}."
+            f"{tokens_per_block}; supported sizes are {supported}, plus powers of two "
+            f">= {_TRTLLM_GEN_DYNAMIC_PAGE_MIN_TOKENS} when every draft layer is causal "
+            "or windowed."
         )
