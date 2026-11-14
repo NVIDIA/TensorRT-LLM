@@ -96,6 +96,69 @@ _SECONDARY_FP8 = (QuantAlgo.FP8, ["blocks.1.*"], False, True)
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("backend", ["VANILLA", "CUDNN", "CUTEDSL", "FA4"])
+def test_linear_steps_create_metadata_for_every_backend(tmp_path, backend):
+    from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
+    from tensorrt_llm.visual_gen.args import VisualGenArgs
+
+    _write_dual_transformer_checkpoint(tmp_path, (None, None))
+    args = VisualGenArgs(
+        model=str(tmp_path),
+        quant_config={"quant_algo": "NVFP4", "dynamic": True, "ignored_steps": [0]},
+        attention_config={"backend": backend},
+    )
+    config = DiffusionPipelineConfig.from_pretrained(str(tmp_path), args=args, device="cpu")
+    for name in ("transformer", "transformer_2"):
+        assert config.model_configs[name].attention_metadata_state is not None
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("ignore", [[], ["blocks.0.attn1"]])
+def test_attention_block_exclusions_do_not_create_step_state(tmp_path, ignore):
+    from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
+    from tensorrt_llm.visual_gen.args import VisualGenArgs
+
+    _write_dual_transformer_checkpoint(tmp_path, (None, None))
+    args = VisualGenArgs(
+        model=str(tmp_path),
+        attention_config={
+            "backend": "CUTEDSL",
+            "quant_attention_config": {"qk_dtype": "nvfp4", "v_dtype": "fp8", "ignore": ignore},
+        },
+    )
+    config = DiffusionPipelineConfig.from_pretrained(str(tmp_path), args=args, device="cpu")
+    for name in ("transformer", "transformer_2"):
+        assert config.model_configs[name].attention_metadata_state is None
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("backend", ["CUTEDSL", "CUDNN"])
+def test_attention_only_steps_create_component_metadata(tmp_path, backend):
+    from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
+    from tensorrt_llm.visual_gen.args import VisualGenArgs
+
+    _write_dual_transformer_checkpoint(tmp_path, (None, None))
+    args = VisualGenArgs(
+        model=str(tmp_path),
+        attention_config={
+            "backend": backend,
+            "quant_attention_config": {
+                "qk_dtype": "fp8" if backend == "CUDNN" else "nvfp4",
+                "v_dtype": "fp8",
+                "ignored_steps": [0],
+            },
+        },
+    )
+    config = DiffusionPipelineConfig.from_pretrained(str(tmp_path), args=args, device="cpu")
+    primary = config.model_configs["transformer"]
+    secondary = config.model_configs["transformer_2"]
+    assert primary.attention_metadata_state is not None
+    assert secondary.attention_metadata_state is not None
+    assert primary.attention_metadata_state is not secondary.attention_metadata_state
+    assert not getattr(primary.quant_config, "ignored_steps", [])
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "quant_algos, user_quant, expected_quant",
     [

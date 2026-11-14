@@ -4675,6 +4675,7 @@ class Linear(nn.Module):
         return (self.use_cute_dsl_nvfp4_swiglu_blackwell
                 and self.use_cute_dsl_blockscaling_mm
                 and IS_CUTLASS_DSL_AVAILABLE
+                and not getattr(self.quant_config, "ignored_steps", [])
                 and self.has_nvfp4_activation_quantization
                 and get_sm_version() in (100, 103) and not self.has_bias
                 and not self.partition_plan.enabled)

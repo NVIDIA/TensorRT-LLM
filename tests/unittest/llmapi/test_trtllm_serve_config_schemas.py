@@ -414,6 +414,155 @@ def test_config_validation(
     assert (not errors) == valid, [error.message for error in errors]
 
 
+@pytest.mark.parametrize(
+    "steps,valid",
+    [
+        ([], True),
+        ([0, 19], True),
+        ([-1], False),
+        ([True], False),
+        ([1.5], False),
+        (["1"], False),
+        ("0,1", False),
+        (None, False),
+    ],
+)
+@pytest.mark.parametrize("attention", [False, True])
+def test_visual_gen_ignored_steps_schema(schemas, steps, valid, attention):
+    config = (
+        {
+            "attention_config": {
+                "backend": "CUTEDSL",
+                "quant_attention_config": {"ignored_steps": steps},
+            }
+        }
+        if attention
+        else {"quant_config": {"quant_algo": "NVFP4", "dynamic": True, "ignored_steps": steps}}
+    )
+    errors = list(Draft202012Validator(schemas[generator.VISUAL_GEN_SCHEMA]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+
+
+@pytest.mark.parametrize("linear_ignore", [[], ["blocks.0.ffn.*"], "blocks.0"])
+@pytest.mark.parametrize("attention_ignore", [[], ["blocks.0.attn1"]])
+@pytest.mark.parametrize("linear_steps", [[], [0]])
+@pytest.mark.parametrize("attention_steps", [[], [1]])
+@pytest.mark.parametrize("ignore_field", ["ignore", "exclude_modules"])
+def test_visual_gen_block_and_step_modes_are_globally_exclusive(
+    schemas, linear_ignore, attention_ignore, linear_steps, attention_steps, ignore_field
+):
+    config = {
+        "quant_config": {
+            "quant_algo": "NVFP4",
+            ignore_field: linear_ignore,
+            "ignored_steps": linear_steps,
+        },
+        "attention_config": {
+            "backend": "FLASHINFER",
+            "quant_attention_config": {
+                "qk_dtype": "nvfp4",
+                "v_dtype": "fp8",
+                "ignore": attention_ignore,
+                "ignored_steps": attention_steps,
+            },
+        },
+    }
+    valid = not ((linear_ignore or attention_ignore) and (linear_steps or attention_steps))
+    errors = list(Draft202012Validator(schemas[generator.VISUAL_GEN_SCHEMA]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+
+
+def test_visual_gen_attention_steps_allow_static_linear_weights_and_lora(schemas):
+    config = {
+        "quant_config": {"quant_algo": "FP8", "dynamic": False},
+        "runtime_lora_config": {"path": "adapter.safetensors"},
+        "attention_config": {
+            "backend": "FLASHINFER",
+            "quant_attention_config": {
+                "qk_dtype": "nvfp4",
+                "v_dtype": "fp8",
+                "ignored_steps": [0, 1],
+            },
+        },
+    }
+    assert Draft202012Validator(schemas[generator.VISUAL_GEN_SCHEMA]).is_valid(config)
+
+
+@pytest.mark.parametrize("steps,valid", [([], True), ([0], False)])
+@pytest.mark.parametrize("attention", [False, True])
+def test_visual_gen_quant_ignore_cache_combinations(schemas, steps, valid, attention):
+    config = {
+        "cache_config": {"cache_backend": "teacache"},
+        "quant_config": {"quant_algo": "NVFP4", "ignored_steps": steps},
+    }
+    if attention:
+        config.pop("quant_config")
+        config["attention_config"] = {
+            "backend": "CUTEDSL",
+            "quant_attention_config": {"ignored_steps": steps},
+        }
+    errors = list(Draft202012Validator(schemas[generator.VISUAL_GEN_SCHEMA]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+
+
+@pytest.mark.parametrize(
+    "quant,lora,valid",
+    [
+        ({"quant_algo": "NVFP4", "ignored_steps": []}, True, True),
+        ({"quant_algo": "NVFP4", "ignored_steps": [0]}, True, False),
+        ({"quant_algo": "NVFP4", "ignored_steps": [0]}, False, True),
+        ({"quant_algo": "NVFP4", "dynamic": False, "ignored_steps": [0]}, False, False),
+        ({"quant_algo": "NVFP4", "dynamic": True, "ignored_steps": [0]}, False, True),
+        ({"quant_algo": "W4A16_AWQ", "ignored_steps": [0]}, False, False),
+        ({"quant_algo": "FP8_BLOCK_SCALES", "ignored_steps": [0]}, False, True),
+        ({"quant_algo": "FP8_PER_CHANNEL_PER_TOKEN", "ignored_steps": [0]}, False, True),
+        (
+            {
+                "quant_algo": "FP8",
+                "dynamic": False,
+                "config_groups": {"group_0": {"weights": {"dynamic": True}}},
+                "ignored_steps": [0],
+            },
+            False,
+            True,
+        ),
+        ({"ignored_steps": [0]}, False, False),
+        ({"quant_algo": None, "ignored_steps": [0]}, False, False),
+    ],
+)
+def test_visual_gen_linear_steps_require_quant_and_reject_lora(schemas, quant, lora, valid):
+    config = {"quant_config": quant}
+    if lora:
+        config["runtime_lora_config"] = {"path": "adapter.safetensors"}
+    errors = list(Draft202012Validator(schemas[generator.VISUAL_GEN_SCHEMA]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+
+
+@pytest.mark.parametrize("steps", [[], [0]], ids=["no-step-exclusion", "step-exclusion"])
+@pytest.mark.parametrize(
+    ("group_config", "valid_with_steps"),
+    [
+        pytest.param({}, False, id="missing-weights"),
+        pytest.param({"weights": {}}, False, id="missing-dynamic"),
+        pytest.param({"weights": {"dynamic": False}}, False, id="static-weights"),
+        pytest.param({"weights": {"dynamic": True}}, True, id="dynamic-weights"),
+    ],
+)
+def test_visual_gen_grouped_linear_steps_require_dynamic_weights(
+    schemas: dict[str, dict], group_config: dict, valid_with_steps: bool, steps: list[int]
+) -> None:
+    config = {
+        "quant_config": {
+            "quant_algo": "FP8",
+            "dynamic": True,
+            "config_groups": {"group_0": group_config},
+            "ignored_steps": steps,
+        }
+    }
+    errors = list(Draft202012Validator(schemas[generator.VISUAL_GEN_SCHEMA]).iter_errors(config))
+    assert (not errors) == (not steps or valid_with_steps), [error.message for error in errors]
+
+
 def _tagged_unions(node: object):
     if isinstance(node, dict):
         if "discriminator" in node:

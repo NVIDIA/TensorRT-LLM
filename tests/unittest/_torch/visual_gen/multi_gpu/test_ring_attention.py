@@ -26,6 +26,7 @@ Run with:
     pytest tests/unittest/_torch/visual_gen/multi_gpu/test_ring_attention.py -v
 """
 
+import functools
 import math
 import os
 
@@ -49,6 +50,8 @@ from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import (
 from tensorrt_llm._torch.visual_gen.attention.backends.interface import AttentionTensorLayout
 
 from ._worker_pool import run_distributed
+
+__extra_import_path__ = [".."]
 
 _flash_attn4_available = _fa4_fwd is not None
 
@@ -478,6 +481,107 @@ class TestRingUlyssesAttentionFlashAttn4:
 class TestRingAttentionInitGuards:
     def test_inner_without_lse_raises(self):
         run_test_in_distributed(world_size=4, test_fn=_logic_ring_init_guard_no_lse, use_cuda=False)
+
+
+def _logic_attention_ignored_steps(rank: int, world_size: int, *, parallelism: str) -> None:
+    """L2: compare sharded attention output with same-input full-sequence FP32 SDPA.
+
+    BF16 steps are transparent apart from BF16 rounding and partial-softmax merges;
+    the NVFP4 step is lossy. Unequal K/V shard means exercise LSE merge weights.
+    """
+    from test_common.visual_gen_quantization import (
+        assert_quantization_routes,
+        observe_quantization_paths,
+    )
+
+    from tensorrt_llm._torch.visual_gen.attention.backends.utils import create_attention
+    from tensorrt_llm.visual_gen.args import AttentionConfig, QuantAttentionConfig
+
+    device = torch.device(f"cuda:{rank}")
+    torch.manual_seed(42)
+    heads, head_dim = 4, 128
+    shard_length = 128
+    full_values = [
+        torch.randn(
+            1, shard_length * world_size, heads, head_dim, dtype=torch.bfloat16, device=device
+        )
+        * 0.3
+        for _ in range(3)
+    ]
+    full_values[0].add_(0.25)
+    for shard in range(world_size):
+        start, end = shard * shard_length, (shard + 1) * shard_length
+        sign = -1 if shard == 0 else 1
+        full_values[1][:, start:end].add_(sign * 0.25)
+        full_values[2][:, start:end].add_(sign * 0.5)
+    start, end = rank * shard_length, (rank + 1) * shard_length
+    values = [value[:, start:end].contiguous() for value in full_values]
+    expected = F.scaled_dot_product_attention(
+        *(value.transpose(1, 2).float() for value in full_values)
+    ).transpose(1, 2)[:, start:end]
+    state = {}
+    selected = create_attention(
+        backend="CUTEDSL",
+        layer_idx=0,
+        head_dim=head_dim,
+        dtype=torch.bfloat16,
+        num_heads=heads // world_size if parallelism == "ulysses" else heads,
+        attention_metadata_state=state,
+        attention_config=AttentionConfig(
+            backend="CUTEDSL",
+            quant_attention_config=QuantAttentionConfig(
+                qk_dtype="nvfp4", v_dtype="fp8", ignored_steps=[0, 2]
+            ),
+        ),
+    )
+    wrapper = UlyssesAttention if parallelism == "ulysses" else RingAttention
+    holder = torch.nn.Module()
+    holder.attention = torch.nn.Module()
+    holder.attention.attn = wrapper(selected, process_group=dist.group.WORLD)
+    with observe_quantization_paths(holder) as trace:
+        for step in range(3):
+            trace.step = step
+            state["attention_quant_ignored"] = step in (0, 2)
+            actual = holder.attention.attn(*values).float()
+            difference = actual - expected
+            reference_norm = expected.norm().item()
+            assert reference_norm > 0
+            relative_l2 = difference.norm().item() / reference_norm
+            cosine = F.cosine_similarity(actual.flatten(), expected.flatten(), dim=0).item()
+            max_abs = difference.abs().max().item()
+            mean_shift = difference.mean(dim=(0, 1)).abs().max().item()
+            quantized = step == 1
+            metrics = (
+                f"{parallelism}, rank={rank}, step={step}, quantized={quantized}: "
+                f"relative_l2={relative_l2:.6g}, cosine={cosine:.6g}, "
+                f"max_abs={max_abs:.6g}, channel_mean_shift={mean_shift:.6g}"
+            )
+            print(metrics, flush=True)
+            assert relative_l2 <= (0.05 if quantized else 0.01), metrics
+            assert cosine >= (0.999 if quantized else 0.9999), metrics
+            torch.testing.assert_close(
+                actual,
+                expected,
+                rtol=0.08 if quantized else 0.01,
+                atol=0.02 if quantized else 0.002,
+                msg=metrics,
+            )
+    assert_quantization_routes(
+        trace,
+        {
+            (step, "attention", "attention"): "bf16" if step in (0, 2) else "quantized"
+            for step in range(3)
+        },
+    )
+
+
+@pytest.mark.parametrize("wrapper", ["ulysses", "ring"])
+def test_attention_ignored_steps_with_sequence_parallel(wrapper: str) -> None:
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("Quantized CuTe DSL attention requires Blackwell")
+    run_test_in_distributed(
+        2, functools.partial(_logic_attention_ignored_steps, parallelism=wrapper)
+    )
 
 
 if __name__ == "__main__":

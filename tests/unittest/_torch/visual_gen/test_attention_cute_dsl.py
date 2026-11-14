@@ -520,3 +520,47 @@ def test_cute_dsl_static_fp8_qkv_forward() -> None:
     assert out_prequantized.dtype == torch.bfloat16
     torch.testing.assert_close(out, out_ref, atol=8e-2, rtol=8e-2)
     torch.testing.assert_close(out_prequantized, out, atol=0, rtol=0)
+
+
+def test_native_attention_lse_uses_natural_log() -> None:
+    """The backend's LSE contract uses ln, as required by distributed softmax merging."""
+    _require_supported_gpu_arch()
+    torch.manual_seed(42)
+    q, k, v = [
+        torch.randn(1, 128, 2, 128, device="cuda", dtype=torch.bfloat16) * 0.2 for _ in range(3)
+    ]
+    backend = CuTeDSLAttention(num_heads=2, head_dim=128, dtype=torch.bfloat16)
+    _, lse = backend.forward_with_lse(q, k, v, batch_size=1, seq_len=128, seq_len_kv=128)
+    scores = q.transpose(1, 2).float() @ k.transpose(1, 2).float().transpose(-2, -1)
+    reference = (scores * 128**-0.5).logsumexp(-1)
+    torch.testing.assert_close(lse, reference, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("qk_dtype", ["mxfp8", "nvfp4"])
+def test_blockscaled_attention_lse_restores_key_mean(qk_dtype: str) -> None:
+    """L1: compare smoothed GQA LSE with an original-input FP32 logsumexp oracle (lossy)."""
+    _require_supported_gpu_arch()
+    torch.manual_seed(42)
+    q = torch.randn(2, 128, 4, 128, device="cuda", dtype=torch.bfloat16) * 0.2 + 0.25
+    k = torch.randn(2, 128, 2, 128, device="cuda", dtype=torch.bfloat16) * 0.2 + 0.5
+    v = torch.randn_like(k) * 0.2
+    backend = CuTeDSLAttention(
+        num_heads=4,
+        num_kv_heads=2,
+        head_dim=128,
+        dtype=torch.bfloat16,
+        quant_attention_config=QuantAttentionConfig(qk_dtype=qk_dtype, v_dtype="fp8"),
+    )
+    _, lse = backend.forward_with_lse(q, k, v)
+    scores = q.transpose(1, 2).float() @ k.repeat_interleave(2, dim=2).transpose(
+        1, 2
+    ).float().transpose(-2, -1)
+    reference = (scores * 128**-0.5).logsumexp(-1)
+    difference = lse - reference
+    relative_l2 = (difference.norm() / reference.norm()).item()
+    cosine = F.cosine_similarity(lse.flatten(), reference.flatten(), dim=0).item()
+    max_abs = difference.abs().max().item()
+    print(
+        f"{qk_dtype} LSE: relative_l2={relative_l2:.6g}, cosine={cosine:.6g}, max_abs={max_abs:.6g}"
+    )
+    torch.testing.assert_close(lse, reference, rtol=0.01, atol=0.01)

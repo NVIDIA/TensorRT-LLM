@@ -418,6 +418,14 @@ l0_b200:
   - unittest/_torch/visual_gen/test_warmup.py
   - unittest/_torch/visual_gen/test_cache_dit.py
   - unittest/_torch/visual_gen/test_quant_ops.py
+  - unittest/_torch/visual_gen/test_quant_ignore_runtime.py::test_execution_mode_preserves_quantization_routes
+  - visual_gen/test_quant_ignore.py::test_flux2_klein_bf16_reference TIMEOUT (20)
+  - visual_gen/test_quant_ignore.py::test_flux2_klein_quant_ignore[linear_fp8_block_layer] TIMEOUT (20)
+  - visual_gen/test_quant_ignore.py::test_flux2_klein_quant_ignore[linear_nvfp4_step] TIMEOUT (20)
+  - visual_gen/test_quant_ignore.py::test_flux2_klein_quant_ignore[attention_flashinfer_step] TIMEOUT (20)
+  - visual_gen/test_quant_ignore.py::test_flux2_klein_quant_ignore[attention_trtllm_sage_layer] TIMEOUT (20)
+  - visual_gen/test_quant_ignore.py::test_flux2_klein_quant_ignore[attention_cutedsl_step] TIMEOUT (20)
+  - visual_gen/test_quant_ignore.py::test_flux2_klein_quant_ignore[attention_cudnn_layer] TIMEOUT (20)
   - unittest/_torch/visual_gen/test_pertoken_adaln.py
   - unittest/_torch/visual_gen/test_attention_cute_dsl.py
   - unittest/_torch/visual_gen/test_fa4_cutlass_compatibility.py

@@ -178,10 +178,6 @@ class DynamicLinearWeightLoader:
         if quant_algo is None or self.dynamic_weight_quant:
             return
 
-        if self.quant_config is not None:
-            if self.quant_config.is_module_excluded_from_quantization(name):
-                return
-
         # Ask the destination buffer, not the module's name. ``quant_algo``
         # above falls back to the *global* recipe for any module that carries
         # no ``quant_config`` of its own, which includes modules that cannot be
@@ -223,17 +219,44 @@ class DynamicLinearWeightLoader:
             "quant_config."
         )
 
+    def _check_static_nvfp4_input_scale(
+        self,
+        module: Linear,
+        weight_dict: Dict[str, torch.Tensor],
+        quant_algo: Optional[QuantAlgo],
+        name: str,
+    ) -> None:
+        """Require calibration data when NVFP4 activations use a static scale."""
+        if (
+            quant_algo != QuantAlgo.NVFP4
+            or not getattr(
+                getattr(module, "quant_method", None), "quantizes_nvfp4_activations", False
+            )
+            or module.force_dynamic_quantization
+        ):
+            return
+
+        input_scale = weight_dict.get("input_scale")
+        if (
+            input_scale is None
+            or input_scale.numel() != 1
+            or not torch.isfinite(input_scale).all()
+            or not (input_scale > 0).all()
+        ):
+            raise ValueError(
+                f"Static NVFP4 activation quantization for module '{name}' requires a calibrated "
+                "'input_scale' tensor containing one finite, positive value in every checkpoint "
+                "weight entry. Load-time weight quantization does not calibrate activations. "
+                "Provide the calibrated scale or explicitly set "
+                "quant_config.config_groups.<group>.input_activations.dynamic: true."
+            )
+
     def _should_dynamic_quantize(
         self, weight_dict: Dict[str, torch.Tensor], quant_algo: Optional[QuantAlgo], name: str
     ) -> bool:
         """Decide if weight should be dynamically quantized at load time."""
         if not self.dynamic_weight_quant or quant_algo is None:
             return False
-
-        # Check if module is excluded
-        if self.quant_config is not None:
-            if self.quant_config.is_module_excluded_from_quantization(name):
-                return False
 
         weight = weight_dict.get("weight")
         if weight is None:
@@ -365,11 +388,20 @@ class DynamicLinearWeightLoader:
             quant_algo = module_quant_config.quant_algo
         else:
             quant_algo = self._get_quant_algo_for_layer(name)
+            if (
+                self.quant_config is not None
+                and self.quant_config.is_module_excluded_from_quantization(name)
+            ):
+                quant_algo = None
 
         # Static (pre-quantized) recipes must not be loaded from checkpoints
         # that do not carry the expected scale tensors.
         for weight_dict in weight_dicts:
             self._check_static_quant_scales(weight_dict, quant_algo, name, module)
+            self._check_static_nvfp4_input_scale(module, weight_dict, quant_algo, name)
+
+        if getattr(self.quant_config, "ignored_steps", []) and quant_algo is not None:
+            self._retain_unquantized_weight(module, name, weight_dicts)
 
         # Special handling for fused NVFP4 dynamic quantization
         # Fused weights (Q,K,V or gate,up) must be quantized TOGETHER
@@ -382,3 +414,36 @@ class DynamicLinearWeightLoader:
             ]
 
         module.load_weights(quantized_weight_dicts)
+
+    def _retain_unquantized_weight(self, module, name, weight_dicts) -> None:
+        """Load an unquantized local shard with the same fused/TP weight mapping."""
+        import copy
+
+        from tensorrt_llm._torch.modules.linear import UnquantizedLinearMethod
+        from tensorrt_llm.models.modeling_utils import QuantConfig
+
+        if not self.dynamic_weight_quant or any(
+            wd.get("weight") is None
+            or wd["weight"].dtype not in (torch.bfloat16, torch.float16, torch.float32)
+            for wd in weight_dicts
+        ):
+            raise ValueError(
+                f"quant_config.ignored_steps requires original BF16/FP16 weights for {name}; "
+                "a pre-quantized checkpoint cannot restore the original BF16 precision."
+            )
+        # Reuse the original module's TP sharding and fused-weight descriptors,
+        # but give the temporary loader its own parameter/module dictionaries.
+        shadow = copy.copy(module)
+        shadow._parameters = {}
+        shadow._buffers = {}
+        shadow._modules = {}
+        shadow.quant_config = QuantConfig()
+        shadow.quant_method = UnquantizedLinearMethod()
+        with torch.device(module.weight.device):
+            shadow.quant_method.create_weights(
+                shadow, module.in_features, module.out_features, module.has_bias, module.dtype
+            )
+        shadow.quant_method.load_weights(
+            shadow, weight_dicts, module.weights_loading_config.weight_mode
+        )
+        module.register_buffer("_unquantized_weight", shadow.weight.detach(), persistent=False)

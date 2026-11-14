@@ -24,12 +24,13 @@ from pathlib import Path
 from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple, Union
 
 import yaml
-from pydantic import model_validator
+from pydantic import field_validator, model_validator
 
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.llmapi.llm_args import Field
 from tensorrt_llm.llmapi.utils import StrictBaseModel, set_api_status
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 from .sparse_attention import (
     SkipSoftmaxAttentionConfig,
@@ -46,6 +47,40 @@ CacheBackendName = Literal["teacache", "cache_dit", "seacache"]
 # =============================================================================
 # Sub-configuration classes for VisualGenArgs
 # =============================================================================
+
+
+IgnoredStep = Annotated[int, Field(ge=0, strict=True)]
+_LOAD_TIME_QUANT_ALGOS = (
+    QuantAlgo.FP8,
+    QuantAlgo.FP8_BLOCK_SCALES,
+    QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN,
+    QuantAlgo.NVFP4,
+)
+
+
+class DiffusionQuantConfig(QuantConfig):
+    """Linear quantization configuration with per-step quantization exclusions."""
+
+    ignored_steps: List[IgnoredStep] = Field(
+        default_factory=list,
+        status="prototype",
+        description=(
+            "Zero-based denoising iterations that run Linear layers with the original BF16 "
+            "weights instead of quantization. Requires a high-precision checkpoint and "
+            "load-time weight quantization; retaining BF16 weights increases memory use. "
+            "Cannot be combined with nonempty Linear or attention ignore lists."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_step_quant_algo(self) -> "DiffusionQuantConfig":
+        if self.ignored_steps and self.quant_algo is None:
+            raise ValueError("ignored_steps requires an explicit quant_algo")
+        if self.ignored_steps and self.quant_algo not in _LOAD_TIME_QUANT_ALGOS:
+            raise ValueError(
+                f"ignored_steps requires load-time quantization; {self.quant_algo} is not supported"
+            )
+        return self
 
 
 class QuantAttentionConfig(StrictBaseModel):
@@ -130,6 +165,25 @@ class QuantAttentionConfig(StrictBaseModel):
             "Fraction of tokens VC-Attention appends as V repair rows instead of restoring "
             "tile means; 0 restores the means. 0.005 to 0.02 are the useful range, 0.005 is the "
             "fastest setting measured at unchanged quality. vc_attention only."
+        ),
+    )
+    ignore: List[str] = Field(
+        default_factory=list,
+        status="prototype",
+        description=(
+            "Attention module paths excluded from attention quantization at every step. "
+            "Uses the same glob and re: patterns as Linear exclude_modules; paths may be "
+            "relative to a transformer or qualified by its component name. Cannot be combined "
+            "with nonempty Linear or attention ignored_steps lists."
+        ),
+    )
+    ignored_steps: List[IgnoredStep] = Field(
+        default_factory=list,
+        status="prototype",
+        description=(
+            "Zero-based denoising iterations that use the selected backend's native "
+            "BF16/FP16 attention instead of this quantization recipe. Independent of Linear "
+            "ignored_steps; cannot be combined with nonempty Linear or attention ignore lists."
         ),
     )
 
@@ -929,7 +983,7 @@ class VisualGenArgs(StrictBaseModel):
         description="HuggingFace Hub revision (branch, tag, or commit SHA) to download.",
     )
 
-    quant_config: Union[QuantConfig, Dict[str, Any]] = Field(
+    quant_config: Union[DiffusionQuantConfig, QuantConfig, Dict[str, Any]] = Field(
         default_factory=QuantConfig,
         status="prototype",
         description=(
@@ -992,6 +1046,45 @@ class VisualGenArgs(StrictBaseModel):
             "If True, register per-layer NVTX hooks at load time for nsys profile readability."
         ),
     )
+
+    @field_validator("quant_config", mode="before")
+    @classmethod
+    def _validate_quant_ignored_steps(cls, value: Any) -> Any:
+        if isinstance(value, dict) and "ignored_steps" in value:
+            DiffusionQuantConfig(
+                quant_algo=value.get("quant_algo"), ignored_steps=value["ignored_steps"]
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _validate_quant_ignore_combinations(self) -> "VisualGenArgs":
+        linear_quant_ignored_steps = (
+            self.quant_config.get("ignored_steps", [])
+            if isinstance(self.quant_config, dict)
+            else getattr(self.quant_config, "ignored_steps", [])
+        )
+        recipe = self.attention_config.quant_attention_config
+        attention_quant_ignored_steps = recipe.ignored_steps if recipe is not None else []
+        linear_ignore = (
+            self.quant_config.get("ignore") or self.quant_config.get("exclude_modules")
+            if isinstance(self.quant_config, dict)
+            else getattr(self.quant_config, "exclude_modules", None)
+        )
+        attention_ignore = recipe.ignore if recipe is not None else []
+        if (linear_ignore or attention_ignore) and (
+            linear_quant_ignored_steps or attention_quant_ignored_steps
+        ):
+            raise ValueError(
+                "ignore and ignored_steps are mutually exclusive across Linear and attention "
+                "quantization; choose either layer or step quantization exclusions."
+            )
+        if (
+            linear_quant_ignored_steps or attention_quant_ignored_steps
+        ) and self.cache_config is not None:
+            raise ValueError("ignored_steps cannot be combined with diffusion step caching")
+        if linear_quant_ignored_steps and self.runtime_lora_config is not None:
+            raise ValueError("Linear ignored_steps cannot be combined with runtime LoRA fusion")
+        return self
 
     @model_validator(mode="before")
     @classmethod
@@ -1057,6 +1150,7 @@ class VisualGenArgs(StrictBaseModel):
 
 
 __all__ = [
+    "DiffusionQuantConfig",
     "QuantAttentionConfig",
     "SparseAttentionConfig",
     "SkipSoftmaxAttentionConfig",

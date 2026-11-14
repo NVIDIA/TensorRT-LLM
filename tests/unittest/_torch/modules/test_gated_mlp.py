@@ -117,15 +117,17 @@ def test_swiglu_limit_controls_gate_up_fusion_capability(
 
 
 @pytest.mark.parametrize(
-    ("activation", "expected"),
+    ("activation", "requires_unquantized_activation", "expected"),
     [
-        pytest.param(F.silu, True, id="plain-swiglu"),
-        pytest.param(lambda value: value, False, id="custom-swiglu-oai"),
+        pytest.param(F.silu, False, True, id="plain-swiglu"),
+        pytest.param(lambda value: value, False, False, id="custom-swiglu-oai"),
+        pytest.param(F.silu, True, False, id="bf16-ignored-step"),
     ],
 )
 def test_activation_controls_fp8_quant_fusion_capability(
     monkeypatch: pytest.MonkeyPatch,
     activation: Callable[[torch.Tensor], torch.Tensor],
+    requires_unquantized_activation: bool,
     expected: bool,
 ) -> None:
     mlp = GatedMLP(
@@ -136,6 +138,7 @@ def test_activation_controls_fp8_quant_fusion_capability(
     )
     down_proj = nn.Module()
     down_proj.has_fp8_block_scales = True
+    down_proj.requires_unquantized_activation = requires_unquantized_activation
     down_proj.use_cute_dsl_blockscaling_mm = True
     down_proj.disable_deep_gemm = False
     mlp.down_proj = down_proj
@@ -243,3 +246,78 @@ def test_deepseek_dense_layer_enables_locality_domain_bf16_mlp(
     call = gated_mlp_constructor.call_args
     assert call.kwargs["config"] is config
     assert call.kwargs["enable_locality_domain_bf16_linear"] is True
+
+
+@pytest.mark.cpu_only
+def test_ignored_steps_disable_incompatible_swiglu_layout():
+    from unittest.mock import patch
+
+    from tensorrt_llm._torch.modules.linear import Linear
+
+    layer = SimpleNamespace(
+        use_cute_dsl_nvfp4_swiglu_blackwell=True,
+        use_cute_dsl_blockscaling_mm=True,
+        quant_config=SimpleNamespace(ignored_steps=[0]),
+        has_nvfp4_activation_quantization=True,
+        has_bias=False,
+        partition_plan=SimpleNamespace(enabled=False),
+    )
+    with (
+        patch("tensorrt_llm._torch.modules.linear.IS_CUTLASS_DSL_AVAILABLE", True),
+        patch("tensorrt_llm._torch.modules.linear.get_sm_version", return_value=100),
+    ):
+        assert not Linear.can_use_cute_dsl_nvfp4_swiglu_blackwell(layer)
+        layer.quant_config.ignored_steps = []
+        assert Linear.can_use_cute_dsl_nvfp4_swiglu_blackwell(layer)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("split_gate_up", [False, True], ids=["fused-gate-up", "split-gate-up"])
+def test_linear_quant_ignore_keeps_activation_bf16(
+    monkeypatch: pytest.MonkeyPatch, split_gate_up: bool
+) -> None:
+    from unittest.mock import patch
+
+    from tensorrt_llm._torch.visual_gen.quantization.quant_dispatcher import (
+        install_linear_quant_dispatcher,
+    )
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+
+    mlp = GatedMLP(
+        hidden_size=8,
+        intermediate_size=16,
+        bias=False,
+        dtype=torch.bfloat16,
+        split_gate_up=split_gate_up,
+    )
+    with torch.no_grad():
+        for parameter in mlp.parameters():
+            parameter.normal_(0, 0.02)
+    down = mlp.down_proj
+    projections = [down] + ([mlp.gate_proj, mlp.up_proj] if split_gate_up else [mlp.gate_up_proj])
+    for projection in projections:
+        projection.quant_config = QuantConfig(quant_algo="FP8")
+        projection.input_scale = torch.ones(())
+        projection.register_buffer(
+            "_unquantized_weight", projection.weight.detach().clone(), persistent=False
+        )
+        install_linear_quant_dispatcher(projection, {"linear_quant_ignored": True})
+    mlp._maybe_share_gate_up_quantize = split_gate_up
+    swiglu = Mock(side_effect=lambda value, *args, **kwargs: value[..., :16])
+    monkeypatch.setattr(gated_mlp_module, "swiglu_2in" if split_gate_up else "swiglu", swiglu)
+    with (
+        patch.object(
+            down.quant_method.unquantized_method,
+            "apply",
+            wraps=down.quant_method.unquantized_method.apply,
+        ) as bf16,
+        patch(
+            "torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor",
+            side_effect=AssertionError("Shared activation quantization must be bypassed"),
+        ),
+    ):
+        mlp(torch.randn(2, 8, dtype=torch.bfloat16))
+    assert "quant_type" not in swiglu.call_args.kwargs
+    assert "quant_scale" not in swiglu.call_args.kwargs
+    bf16.assert_called_once()
+    assert bf16.call_args.args[1].dtype == torch.bfloat16
