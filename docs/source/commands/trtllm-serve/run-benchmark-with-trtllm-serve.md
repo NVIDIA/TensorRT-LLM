@@ -158,6 +158,7 @@ P99 E2EL (ms):                           1643.44
 
 #### Time to First Token (TTFT)
   * The typical time elapsed from when a request is sent until the first output token is generated.
+  * KV cache block reuse is enabled by default (see [KV Cache System](../../features/kvcache.md)). When a request shares a prefix with an earlier request, for example a common system prompt, a repeated prompt, or `--random-prefix-len` greater than 0, the matching blocks can be reused if they are still in the cache, so the measured TTFT can be lower than for a full prefill. In the script above, `--random-prefix-len 0` only means that no synthetic shared prefix is added. Runs that use the same `--seed` (default 0) start from the same sampled prompts, so later iterations of the loop can still reuse blocks cached by earlier iterations. To measure full-prefill TTFT, set `enable_block_reuse: false` under `kv_cache_config` in the `--config` file.
 
 #### Time Per Output Token (TPOT) and Inter-Token Latency (ITL)
   * TPOT is the typical time required to generate each token *after* the first one.
