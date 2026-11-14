@@ -30,6 +30,7 @@ The deployment guides below provide more detailed instructions for serving speci
    :maxdepth: 1
    :name: Deployment Guides
 
+   deployment-guide-for-beam-on-trtllm.md
    deployment-guide-for-nemotron-3-on-trtllm.md
    deployment-guide-for-gpt-oss-on-trtllm.md
    deployment-guide-for-qwen3-on-trtllm.md

@@ -7483,6 +7483,25 @@ _QWEN4_NVFP4 = dict(QWEN4_DENSE, quant_mode=QM_NVFP4_KV_CACHE, kv_scale=1.0)
 _QWEN4_DENSE_G32 = dict(QWEN4_DENSE, max_num_requests=32, num_blocks=144)
 _QWEN4_FP8_G32 = dict(_QWEN4_FP8, max_num_requests=32, num_blocks=144)
 
+# Beam TP4 splits 48 query / 8 KV heads into 12 / 2 per rank. Its NVFP4
+# weight format does not change this attention call's BF16 Q/K/V and KV pool.
+_BEAM_TP4 = dict(
+    input_type=STANDARD,
+    num_heads=12,
+    num_kv_heads=2,
+    head_size=128,
+    v_head_dim=128,
+    sinks=False,
+    quant_mode=0,
+    mask_type=MASK_CAUSAL,
+    tokens_per_block=32,
+    num_blocks=64,
+    max_num_requests=3,
+    max_blocks_per_seq=20,
+    use_paged_context_fmha=True,
+    predicted_tokens_per_seq=1,
+)
+
 
 def _spread(batch: int, longest: int) -> tuple[int, ...]:
     """`batch` histories rising evenly from 1 to `longest` tokens: one-page, page-boundary
@@ -7493,6 +7512,17 @@ def _spread(batch: int, longest: int) -> tuple[int, ...]:
 # The shapes each shipped target calls this entry with, by target directory
 # under `models/`. The entry's own `CELLS` are the op's whoever calls it.
 TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
+    "beam/full_model_nvfp4__sm_103__tp4": tuple(
+        Cell(
+            why=f"beam TP4 {layer} {phase}: GQA 12q/2kv d128, cached {cached}, new {new}",
+            spec=dict(_BEAM_TP4, window=window, cached=cached, new=new, num_contexts=num_contexts),
+        )
+        for layer, window in (("sliding", 512), ("full", None))
+        for phase, cached, new, num_contexts in (
+            ("paged context", (64,), (17,), 1),
+            ("decode", (511, 512, 513), (1, 1, 1), 0),
+        )
+    ),
     "deepseek_v3/r1_0528_nvfp4__sm_10x__default": (
         Cell(
             why="deepseek MLA context: explicit k/v, qk 576 -> v 128, fp8 pool",

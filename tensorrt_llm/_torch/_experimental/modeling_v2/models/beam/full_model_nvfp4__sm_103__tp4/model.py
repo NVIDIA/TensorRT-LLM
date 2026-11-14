@@ -51,14 +51,13 @@ from tensorrt_llm.mapping import Mapping as ParallelMapping
 
 from .. import _attention
 from .._constants import SUPPORTED_CONFIG
+from .limits import MAX_NUM_TOKENS
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 
 #: Logical decoder layers, all executed by every call.
 NUM_LAYERS = SUPPORTED_CONFIG["num_hidden_layers"]
-#: Tokens per call of the supported deployment (its native ``max_num_tokens``).
-MAX_NUM_TOKENS = 8192
 
 LogitRows = Literal["all"] | Sequence[int] | None
 
@@ -124,10 +123,9 @@ class BeamFullModelNvfp4Sm103Tp4(BeamCheckpointLayoutNvfp4Sm103Tp4):
             raise ValueError(f"the KV cache manager states {len(windows)} attention windows")
         for layer, window in enumerate(windows):
             if self.schedule.is_sliding(layer):
-                # The estimator uses a full-context pool, and short sequences
-                # normalize the sliding window to full context. The attention
-                # operator still applies self.window independently of retention.
-                ok = window is None or int(window) in (self.window, manager.max_seq_len)
+                # Retention may exceed the attention window, or cover a shorter
+                # whole sequence. The attention operator still applies self.window.
+                ok = window is None or int(window) >= min(self.window, manager.max_seq_len)
             else:
                 ok = window is None or int(window) >= manager.max_seq_len
             if not ok:

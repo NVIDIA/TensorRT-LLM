@@ -141,15 +141,26 @@ l0_b300:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_flashinfer[enable_chunked_prefill=True]
   # modeling_v2: one entry per GPU-run top-level file, catalog category and target, so CBTS
   # runs only what a change reaches. The cpu_only files run on the CPU stage; comm needs more
-  # GPUs. The whole set took 13m54s on one GB300 (3122 cases), so TIMEOUT (30) per entry is
-  # ample.
+  # GPUs. Each entry has its own timeout; no aggregate ModelingV2 timeout is shared.
   - unittest/_torch/modeling_v2/test_modeling_v2_mnnvl_workspace.py TIMEOUT (30)
   - unittest/_torch/modeling_v2/test_modeling_v2_no_stale_claims.py TIMEOUT (30)
   - unittest/_torch/modeling_v2/activation TIMEOUT (30)
+  # Beam: lightweight single-GPU entries. High-memory MoE, sparse-block and six-layer
+  # suites belong to manual_b300_beam_components.yml, not L0 or nightly/LR.
+  # Startup-inclusive measurements on one GB300 (ARM64, retained cache): operators
+  # 58s, GEMM/FP4 entries <=23s, expert 35s and router 26s. The B300 x86 operator
+  # entry measured 83s in CI. Each keeps an independent 30-minute ceiling.
   - unittest/_torch/modeling_v2/models/beam/ops TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/beam/test_modeling_v2_beam_cublas_mm.py TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/beam/test_modeling_v2_beam_nvfp4_gemm.py TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/beam/test_modeling_v2_beam_fp4_quantize.py TIMEOUT (30)
+  - unittest/_torch/modeling_v2/models/beam/test_dispatch_combine.py TIMEOUT (30)
+  - unittest/_torch/modeling_v2/models/beam/_components/dense_block TIMEOUT (30)
+  - unittest/_torch/modeling_v2/models/beam/_components/moe_expert TIMEOUT (30)
+  - unittest/_torch/modeling_v2/models/beam/_components/moe_router TIMEOUT (30)
+  - unittest/_torch/modeling_v2/models/beam/full_model_nvfp4__sm_103__tp4/test_checkpoint_layout.py TIMEOUT (30)
+  - unittest/_torch/modeling_v2/models/beam/full_model_nvfp4__sm_103__tp4/test_checkpoint_layout_nvfp4.py TIMEOUT (30)
+  - unittest/_torch/modeling_v2/models/beam/full_model_nvfp4__sm_103__tp4/test_batching.py TIMEOUT (30)
   - unittest/_torch/modeling_v2/attention TIMEOUT (30)
   - unittest/_torch/modeling_v2/gemm TIMEOUT (30)
   - unittest/_torch/modeling_v2/graph TIMEOUT (30)

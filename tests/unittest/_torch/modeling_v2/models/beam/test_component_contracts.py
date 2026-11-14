@@ -33,12 +33,12 @@ def config():
 
 
 @pytest.mark.parametrize("length", [128, 512, 8192])
-@pytest.mark.parametrize("retention", ["sliding", "full", "normalized"])
+@pytest.mark.parametrize("retention", ["sliding", "full", "normalized", "extended"])
 def test_cache_allows_estimator_and_short_sequence_geometry(length, retention):
     component = NS(
         head_dim=128, local_kv_heads=2, window=512, schedule=layout.check_config(config())
     )
-    window = {"sliding": 512, "full": length, "normalized": None}[retention]
+    window = {"sliding": 512, "full": length, "normalized": None, "extended": 1024}[retention]
     manager = NS(
         layer_offsets=dict(enumerate(range(52))),
         dtype=DataType.BF16,
@@ -52,8 +52,10 @@ def test_cache_allows_estimator_and_short_sequence_geometry(length, retention):
     assert Component.attention_windows(component, length) == [512] * 51 + [length]
 
 
-@pytest.mark.parametrize("layer,window", [(0, 256), (0, 1024), (51, 512)])
-def test_cache_rejects_incompatible_retention(layer, window):
+@pytest.mark.parametrize(
+    "length,layer,window", [(8192, 0, 256), (8192, 0, 511), (128, 0, 127), (8192, 51, 512)]
+)
+def test_cache_rejects_incompatible_retention(length, layer, window):
     component = NS(
         head_dim=128, local_kv_heads=2, window=512, schedule=layout.check_config(config())
     )
@@ -63,7 +65,7 @@ def test_cache_rejects_incompatible_retention(layer, window):
         head_dim=128,
         num_kv_heads_per_layer=[2] * 52,
         max_attention_window_vec=[512] * 51 + [None],
-        max_seq_len=8192,
+        max_seq_len=length,
     )
     manager.max_attention_window_vec[layer] = window
     with pytest.raises(ValueError, match="cache keeps a window"):
@@ -257,7 +259,8 @@ def test_components_do_not_import_full_model_internals():
     target = family / "full_model_nvfp4__sm_103__tp4"
     target_module = f"{beam.__name__}.{target.name}"
     for source in family.rglob("*.py"):
-        if source.is_relative_to(target):
+        # The family router selects and imports targets; component helpers must not.
+        if source.is_relative_to(target) or source == family / "routing.py":
             continue
         package = ".".join((beam.__name__, *source.parent.relative_to(family).parts))
         for node in ast.walk(ast.parse(source.read_text())):

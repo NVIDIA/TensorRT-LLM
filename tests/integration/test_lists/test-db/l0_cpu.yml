@@ -123,11 +123,17 @@ l0_cpu:
   - unittest/_torch/peft
   - unittest/_torch/memory
   - unittest/_torch/modeling
-  # modeling_v2 routing and routing-table checks: config shapes and a monkeypatched
-  # compute capability, no device. The default targets' shard tests: small CPU
-  # tensors and the CPU block_scale_interleave. The rest of unittest/_torch/modeling_v2
-  # needs a GPU.
+  - unittest/_torch/models/checkpoints/beam/test_checkpoint_loader.py
+  # ModelingV2 routing, sharding and Beam component, diagnostic and checkpoint-layout
+  # checks run on CPU. Mixed CPU/GPU modules select only cpu_only-marked cases here.
   - unittest/_torch/modeling_v2/models/beam/test_component_contracts.py
+  - unittest/_torch/modeling_v2/models/beam/full_model_nvfp4__sm_103__tp4/test_checkpoint_layout.py
+  - unittest/_torch/modeling_v2/models/beam/full_model_nvfp4__sm_103__tp4/test_checkpoint_layout_nvfp4.py
+  - unittest/_torch/modeling_v2/models/beam/test_engine_contracts.py
+  - unittest/tools/test_beam_baseline_accuracy_gate.py
+  - unittest/_torch/modeling_v2/models/beam/test_diagnostic_mode.py
+  - unittest/_torch/modeling_v2/models/beam/test_loading_contracts.py
+  - unittest/_torch/modeling_v2/models/beam/full_model_nvfp4__sm_103__tp4/test_serving.py
   - unittest/_torch/modeling_v2/test_modeling_v2_ci_selection.py
   - unittest/_torch/modeling_v2/test_modeling_v2_contracts.py
   - unittest/_torch/modeling_v2/test_modeling_v2_native_loader.py
