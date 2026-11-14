@@ -30,3 +30,14 @@ set_property(TARGET kimi_k3_attn_res_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS
                                                   ON)
 target_compile_options(kimi_k3_attn_res_src
                        PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)
+
+# The Kernel Factory attn_res + RMSNorm kernel (attnResKf.cu,
+# TRTLLM_K3_ATTN_RES_KF) has its own target because it is built as it was
+# validated: without --use_fast_math, whose approximate division would change
+# its softmax normalization and RMS factors.
+add_library(kimi_k3_attn_res_kf_src OBJECT attnResKf.cu)
+set_cuda_architectures(kimi_k3_attn_res_kf_src 100f)
+set_property(TARGET kimi_k3_attn_res_kf_src PROPERTY POSITION_INDEPENDENT_CODE
+                                                     ON)
+set_property(TARGET kimi_k3_attn_res_kf_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS
+                                                     ON)

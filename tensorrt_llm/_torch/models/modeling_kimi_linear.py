@@ -110,7 +110,7 @@ import torch
 from safetensors import safe_open
 from torch import nn
 
-from ..._utils import get_sm_version, is_sm_100f
+from ..._utils import get_env_flag, get_sm_version, is_sm_100f
 from ...logger import logger
 from ...mapping import Mapping
 from ...models.modeling_utils import QuantAlgo, QuantConfig
@@ -480,22 +480,41 @@ def _read_persistent_attn_res() -> bool:
     return raw != "per_token"
 
 
-def _read_fused_attn_res_max_tokens() -> int:
-    raw = os.environ.get(KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS_ENV, "64")
+def _read_token_limit(env: str, default: int) -> int:
+    raw = os.environ.get(env, str(default))
     try:
         value = int(raw)
     except ValueError:
         # Loudly, for the same reason as the topology above.
-        raise ValueError(
-            f"{KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS_ENV} must be a positive integer, got {raw!r}"
-        ) from None
+        raise ValueError(f"{env} must be a positive integer, got {raw!r}") from None
     if value < 1:
-        raise ValueError(f"{KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS_ENV} must be >= 1, got {value}")
+        raise ValueError(f"{env} must be >= 1, got {value}")
     return value
 
 
+TRTLLM_K3_ATTN_RES_KF_ENV = "TRTLLM_K3_ATTN_RES_KF"
+"""Set to ``1`` to run the mixes that the persistent kernel takes on the Kernel Factory attention-
+residual kernel (``trtllm::attn_res_kf_fwd``) up to ``TRTLLM_K3_ATTN_RES_KF_MAX_M`` tokens. Off by
+default. Needs ``KIMI_K3_ATTN_RES_TOPOLOGY=1``, an SM100-family GPU and a build with
+``cpp/tensorrt_llm/thop/attnResKfOp.cpp``.
+
+Up to 100 tokens the kernel splits each token row over a 7-CTA cluster, where the persistent kernel
+loops over the tokens on one CTA per SM: 1-2 us faster per mix at 36-84 tokens on VR200. It is
+not bit-identical to the persistent kernel: both keep the mix in FP32 and round once, in a
+different reduction order, so up to about 0.08% of the output elements differ, none by more than
+one BF16 ulp. The updated prefix sum is bit-identical.
+
+Read at import, so CUDA-graph capture and replay cannot disagree about it.
+"""
+
+TRTLLM_K3_ATTN_RES_KF_MAX_M_ENV = "TRTLLM_K3_ATTN_RES_KF_MAX_M"
+"""Largest token count of a mix that ``TRTLLM_K3_ATTN_RES_KF`` moves to the Kernel Factory
+kernel. A positive integer, default 84. Read at import."""
+
 _PERSISTENT_ATTN_RES_ENABLED = _read_persistent_attn_res()
-_FUSED_ATTN_RES_MAX_TOKENS = _read_fused_attn_res_max_tokens()
+_FUSED_ATTN_RES_MAX_TOKENS = _read_token_limit(KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS_ENV, 64)
+_ATTN_RES_KF_ENABLED = get_env_flag(TRTLLM_K3_ATTN_RES_KF_ENV, False)
+_ATTN_RES_KF_MAX_TOKENS = _read_token_limit(TRTLLM_K3_ATTN_RES_KF_MAX_M_ENV, 84)
 
 
 class _AttnResKernel(enum.Enum):
@@ -507,6 +526,9 @@ class _AttnResKernel(enum.Enum):
     PER_TOKEN = enum.auto()
     #: ``trtllm::attn_res_add_rmsnorm_persistent_fwd`` (one CTA per SM looping over tokens).
     PERSISTENT = enum.auto()
+    #: ``trtllm::attn_res_kf_fwd`` (Kernel Factory), in place of `PERSISTENT` up to
+    #: ``TRTLLM_K3_ATTN_RES_KF_MAX_M`` tokens.
+    KERNEL_FACTORY = enum.auto()
     #: ``_apply_attn_res`` and the module RMSNorm.
     UNFUSED = enum.auto()
 
@@ -548,6 +570,8 @@ def _select_attn_res_kernel(
         if hidden == 7168 and num_candidates <= 12 and _per_token_attn_res_on_device(device_index):
             return _AttnResKernel.PER_TOKEN
     if _PERSISTENT_ATTN_RES_ENABLED and hidden == 7168 and 2 <= num_candidates <= 9:
+        if _ATTN_RES_KF_ENABLED and num_tokens <= _ATTN_RES_KF_MAX_TOKENS:
+            return _AttnResKernel.KERNEL_FACTORY
         return _AttnResKernel.PERSISTENT
     return _AttnResKernel.UNFUSED
 
@@ -560,8 +584,10 @@ def _attn_res_kernel(prefix_sum: torch.Tensor, num_candidates: int) -> _AttnResK
     DSL decode kernel where it serves the shape (``kimi_k3_attn_res.supports``: up to 64 tokens,
     on a device ``kimi_k3_attn_res.is_supported_device`` accepts), else the C++ per-token ops
     (H == 7168, N <= 12). Otherwise the persistent kernel where ``KIMI_K3_ATTN_RES_TOPOLOGY=1``
-    and it serves the shape, else unfused. This is the only place that decides it: the fused
-    mixes and the MoE layers' residual deferral (``_defers_moe_residual``) both ask here.
+    and it serves the shape, else unfused; with ``TRTLLM_K3_ATTN_RES_KF=1`` the Kernel Factory
+    kernel takes the persistent kernel's mixes up to ``TRTLLM_K3_ATTN_RES_KF_MAX_M`` tokens.
+    This is the only place that decides it: the fused mixes and the MoE layers' residual
+    deferral (``_defers_moe_residual``) both ask here.
     """
     if prefix_sum.dtype is not torch.bfloat16 or not prefix_sum.is_cuda:
         return _AttnResKernel.UNFUSED
@@ -802,6 +828,64 @@ def _attn_res_persistent_kernel(
     return updated_prefix_sum.reshape(M, H), output.reshape(M, H)
 
 
+# trtllm::attn_res_kf_fwd reads and writes rows with 32-byte vector accesses.
+_ATTN_RES_KF_ALIGNMENT = 32
+
+
+def _attn_res_kf_rows(rows: torch.Tensor) -> torch.Tensor:
+    """`rows` as dense rows at a 32-byte aligned address, copied only where they are not."""
+    rows = rows.contiguous()
+    return rows.clone() if rows.data_ptr() % _ATTN_RES_KF_ALIGNMENT else rows
+
+
+def _attn_res_kf_kernel(
+    prefix_sum: torch.Tensor,
+    addend: Optional[torch.Tensor],
+    block_residual: torch.Tensor,
+    proj: nn.Linear,
+    norm: KimiK3RMSNorm,
+    output_norm: nn.Module,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """``(updated prefix sum, normed mix)`` from the Kernel Factory attention-residual kernel
+    (``TRTLLM_K3_ATTN_RES_KF``). Without an `addend` the updated prefix sum is a copy of
+    `prefix_sum`."""
+    # prefix_sum, addend: [M, H]; block_residual: [K, M, H]; all BF16.
+    M, H = prefix_sum.shape
+    K = int(block_residual.shape[0])
+    # updated_prefix_sum, output: [M, H] BF16.
+    updated_prefix_sum, output = torch.ops.trtllm.attn_res_kf_fwd(
+        _attn_res_kf_rows(prefix_sum),
+        None if addend is None else _attn_res_kf_rows(addend),
+        _attn_res_kf_rows(block_residual),
+        proj.weight.reshape(-1).to(torch.bfloat16).contiguous(),
+        norm.weight.to(torch.bfloat16).contiguous(),
+        output_norm.weight.to(torch.bfloat16).contiguous(),
+        float(norm.eps),
+        _rms_norm_eps(output_norm),
+    )
+    site = "attn_res+norm/kf" if addend is None else "add+attn_res+norm/kf"
+    _note_attn_res_fusion(site, True, M, H, K + 1)
+    return updated_prefix_sum, output
+
+
+def _check_attn_res_kf_flag() -> None:
+    """Fail at model build where ``TRTLLM_K3_ATTN_RES_KF=1`` could never apply."""
+    if not _ATTN_RES_KF_ENABLED:
+        return
+    if not _PERSISTENT_ATTN_RES_ENABLED:
+        raise ValueError(
+            f"{TRTLLM_K3_ATTN_RES_KF_ENV}=1 replaces the persistent attention-residual kernel, "
+            f"so it needs {KIMI_K3_ATTN_RES_TOPOLOGY_ENV}=1"
+        )
+    try:
+        torch.ops.trtllm.attn_res_kf_fwd
+    except (AttributeError, RuntimeError) as err:
+        raise RuntimeError(
+            f"{TRTLLM_K3_ATTN_RES_KF_ENV}=1 needs trtllm::attn_res_kf_fwd "
+            "(a build with cpp/tensorrt_llm/thop/attnResKfOp.cpp)"
+        ) from err
+
+
 def _attn_res_per_token_kernel(
     prefix_sum: torch.Tensor,
     addend: torch.Tensor | None,
@@ -878,6 +962,8 @@ def _apply_attn_res_rmsnorm_fused(
         return _attn_res_persistent_kernel(
             prefix_sum, None, block_residual, proj, norm, output_norm
         )[1]
+    if kernel is _AttnResKernel.KERNEL_FACTORY:
+        return _attn_res_kf_kernel(prefix_sum, None, block_residual, proj, norm, output_norm)[1]
     return None
 
 
@@ -912,6 +998,8 @@ def _apply_attn_res_add_rmsnorm_fused(
         return _attn_res_persistent_kernel(
             prefix_sum, addend, block_residual, proj, norm, output_norm
         )
+    if kernel is _AttnResKernel.KERNEL_FACTORY:
+        return _attn_res_kf_kernel(prefix_sum, addend, block_residual, proj, norm, output_norm)
     return None
 
 
@@ -3145,6 +3233,7 @@ class KimiLinearModel(DecoderModel):
         self.num_attn_res_snapshots = (
             cfg.num_hidden_layers + cfg.attn_res_block_size - 1
         ) // cfg.attn_res_block_size
+        _check_attn_res_kf_flag()
 
         # Which convention the drafter tap is on is not recoverable from the
         # served output -- a mismatch only lowers acceptance -- so state it once
