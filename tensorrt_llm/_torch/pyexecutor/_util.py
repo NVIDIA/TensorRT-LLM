@@ -254,6 +254,12 @@ def get_kv_cache_manager_cls(
     config = model_config.pretrained_config
     sparse_attn_config = model_config.sparse_attention_config
     sparse_attn_algorithm = getattr(sparse_attn_config, "algorithm", None)
+    # An algorithm that keeps the dense KV cache, such as Skip Softmax, takes
+    # the dense manager selection, including the V2 requirement for variable
+    # per-layer KV geometry.
+    uses_sparse_kv_cache_manager = (
+        sparse_attn_config is not None
+        and not getattr(sparse_attn_config, "uses_dense_kv_cache", False))
     quant_config = getattr(model_config, "quant_config", None)
     if (sparse_attn_config is None and is_mla(config)
             and quant_config is not None
@@ -296,7 +302,7 @@ def get_kv_cache_manager_cls(
         if model_config.get_num_mamba_layers() == 0:
             logger.info("Hybrid linear model has 0 mamba layers; using "
                         "KV cache manager without mamba caching")
-            if sparse_attn_config is not None:
+            if uses_sparse_kv_cache_manager:
                 return get_sparse_attn_kv_cache_manager(
                     sparse_attn_config, use_kv_cache_manager_v2=use_v2)
             return _non_hybrid_kv_cache_manager_cls(model_config,
@@ -306,8 +312,7 @@ def get_kv_cache_manager_cls(
             raise ValueError(
                 "QSA with hybrid Mamba / linear-attention models requires "
                 "use_kv_cache_manager_v2=True.")
-        if (sparse_attn_config is not None
-                and sparse_attn_algorithm not in ("qsa", "skip_softmax")):
+        if uses_sparse_kv_cache_manager and sparse_attn_algorithm != "qsa":
             raise ValueError(
                 f"Sparse attention algorithm {sparse_attn_algorithm!r} is not "
                 "supported with hybrid Mamba / linear-attention models.")
@@ -490,7 +495,7 @@ def get_kv_cache_manager_cls(
             return Qwen35HybridCacheManager
         from ..modules.mamba.cache_manager import NemotronHybridCacheManager
         return NemotronHybridCacheManager
-    elif sparse_attn_config is not None:
+    elif uses_sparse_kv_cache_manager:
         if sparse_attn_algorithm == "qsa":
             # The QSA manager extends the hybrid manager because it must retain
             # both paged attention data and recurrent GDN state.
@@ -1144,6 +1149,11 @@ class KvCacheCreator:
         # also go through the V2-incompatible-feature gate below.
         if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
             sparse_attn_config = model_config.sparse_attention_config
+            # An algorithm that keeps the dense KV cache, such as Skip Softmax,
+            # follows the dense V2 rules below.
+            uses_sparse_kv_cache_manager = (
+                sparse_attn_config is not None and
+                not getattr(sparse_attn_config, "uses_dense_kv_cache", False))
             quant_config = getattr(model_config, "quant_config", None)
             fp4_mla = (sparse_attn_config is None and is_mla(config)
                        and quant_config is not None
@@ -1151,17 +1161,19 @@ class KvCacheCreator:
             incompat = kv_cache_manager_v2_incompatible_features(
                 self._max_beam_width,
                 enable_sleep=self._llm_args.sleep_config is not None)
-            # Sparse attention: ModelEngine only forwards cache_indirection when
-            # the metadata type is exactly TrtllmAttentionMetadata, and every
-            # sparse backend uses a subclass, so beams would read beam 0's
-            # unmapped prompt rows. The sparse managers' own block tables
-            # (indexer K-cache, pool block indices) are beam-0 only as well.
+            # Sparse attention with its own KV cache manager: ModelEngine only
+            # forwards cache_indirection when the metadata type is exactly
+            # TrtllmAttentionMetadata, and these algorithms' backends use a
+            # subclass, so beams would read beam 0's unmapped prompt rows. Their
+            # managers' own block tables (indexer K-cache, pool block indices)
+            # are beam-0 only as well. Skip Softmax keeps the dense KV cache and
+            # runs plain TrtllmAttention, so it is not affected.
             # Disaggregated serving transfers the shared prompt in beam 0.
             # The C++ V2 cache expands beams after receive completion, copying
             # the prompt's partial tail before the first generation step.
             if (self._max_beam_width is not None and self._max_beam_width > 1
                     and (is_hybrid_linear(config)
-                         or sparse_attn_config is not None or fp4_mla)
+                         or uses_sparse_kv_cache_manager or fp4_mla)
                     and "max_beam_width > 1" not in incompat):
                 incompat.append("max_beam_width > 1")
             if incompat:
@@ -1170,7 +1182,7 @@ class KvCacheCreator:
                 # sparse models require V2 structurally; for models such as DSA
                 # that support both managers, fallback would ignore the user's
                 # explicit manager selection.
-                if sparse_attn_config is not None:
+                if uses_sparse_kv_cache_manager:
                     raise NotImplementedError(
                         f"KVCacheManagerV2 for sparse-attention models "
                         f"(algorithm={sparse_attn_config.algorithm!r}) is not "
@@ -1477,12 +1489,15 @@ class KvCacheCreator:
     def _get_mla_chunked_profile_length(self, input_seq_len: int) -> int | None:
         """Length needed to profile two full cached-KV chunks with a full query."""
         model_config = self._model_engine.model.model_config
-        # Skip-softmax preserves dense MLA. DSA-style hooks can switch to
-        # absorption before this request reaches a full cached-KV chunk.
         if (not is_mla(model_config.pretrained_config)
-                or model_config.attn_backend != "TRTLLM"
-                or getattr(model_config.sparse_attention_config, "algorithm",
-                           None) not in (None, "skip_softmax")):
+                or model_config.attn_backend != "TRTLLM"):
+            return None
+        # An algorithm that keeps the dense KV cache, such as Skip Softmax,
+        # preserves dense MLA. DSA-style hooks can switch to absorption before
+        # this request reaches a full cached-KV chunk.
+        sparse_attn_config = model_config.sparse_attention_config
+        if sparse_attn_config is not None and not getattr(
+                sparse_attn_config, "uses_dense_kv_cache", False):
             return None
         # Beam search and speculative decoding use this same dense context
         # path. Their extra KV capacity is accounted for by

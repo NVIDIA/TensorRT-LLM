@@ -581,9 +581,10 @@ def _resolve_kv_cache_manager_v2_auto(llm_args: 'TorchLlmArgs',
     auto setting must be resolved first.
 
     The fallback only reaches models whose manager class is selected by
-    ``use_kv_cache_manager_v2``. Models routed to a V2 manager unconditionally
-    -- sparse attention picks its class from the algorithm alone -- keep a V2
-    manager after the demotion, so the arm does not protect them.
+    ``use_kv_cache_manager_v2``, such as dense models and Skip Softmax. Models
+    whose manager class ignores the setting -- variable per-layer KV geometry
+    and sparse algorithms with a fixed manager -- keep that manager after the
+    demotion, so the arm does not protect them.
 
     A model whose ``requires_kv_cache_manager_v2`` hook returns True has no
     supported V1 route: the disaggregated-serving arm raises instead of
