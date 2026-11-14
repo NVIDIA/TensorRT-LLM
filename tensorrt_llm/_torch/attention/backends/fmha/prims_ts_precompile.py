@@ -7,10 +7,10 @@ layer profile. This module fans their combined payloads out to one group of
 worker subprocesses that call the public wrapper's ``plan()`` method. FlashInfer
 compiles different kernels concurrently and serializes artifact publication;
 the serving process loads every variant from disk before its first forward.
-During explicit executor construction, one group preloads PyTorch
-while model weights load, then compiles its single batch at warmup.
-It exits before KV-cache capacity profiling. Final warmup still loads every
-plan locally, including any newly encountered variants, without another group.
+During executor construction, one group preloads PyTorch while weights load.
+It stays CPU-only until its first warmup batch and exits when that batch finishes.
+Unused workers exit when construction ends. After a batch, later warmup passes
+load all plans locally, including new variants, without launching another group.
 
 Workers are plain interpreter subprocesses rather than ``multiprocessing``
 children: importing ``tensorrt_llm`` initializes MPI, so a worker must not
