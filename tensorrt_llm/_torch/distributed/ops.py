@@ -29,7 +29,8 @@ from tensorrt_llm._torch.distributed.mnnvl_memory import (HelixCpMnnvlMemory,
 from tensorrt_llm._torch.distributed.symm_mem_allreduce import \
     SymmetricMemoryAllReduce
 from tensorrt_llm._torch.utils import get_model_extra_attrs
-from tensorrt_llm._utils import mpi_comm, mpi_disabled, torch_pybind11_abi
+from tensorrt_llm._utils import (get_sm_version, mpi_comm, mpi_disabled,
+                                 torch_pybind11_abi)
 from tensorrt_llm.bindings import internal as _tllm_internal
 from tensorrt_llm.bindings.internal.runtime import McastGPUBuffer
 from tensorrt_llm.bindings.internal.thop import BufferKind
@@ -1542,6 +1543,31 @@ class AllReduce(nn.Module):
             output = input.clone()
             torch.distributed.all_reduce(output, group=self.mapping.tp_group_pg)
             return output
+
+        if (os.getenv("FORCE_DETERMINISTIC") == "1"
+                and allreduce_strategy == AllReduceStrategy.NCCL
+                and all_reduce_params.fusion_op
+                in (AllReduceFusionOp.NONE, AllReduceFusionOp.RMS_NORM,
+                    AllReduceFusionOp.RESIDUAL_RMS_NORM) and input.is_cuda and
+                input.dtype in (torch.bfloat16, torch.float16, torch.float32)
+                and get_sm_version() in (100, 103)):
+            # Rank-ordered FP32 sum: the same additions for every message
+            # size, unlike the ring/tree selection inside NCCL allreduce.
+            from .deterministic import (allreduce_rank_ordered,
+                                        rms_norm_after_allreduce)
+
+            output = allreduce_rank_ordered(input, self.mapping)
+            if all_reduce_params.fusion_op == AllReduceFusionOp.NONE:
+                return output
+            residual = (all_reduce_params.residual
+                        if all_reduce_params.fusion_op
+                        == AllReduceFusionOp.RESIDUAL_RMS_NORM else None)
+            norm_output, residual_output = rms_norm_after_allreduce(
+                output, residual, all_reduce_params.norm_weight,
+                all_reduce_params.bias, all_reduce_params.eps)
+            return (norm_output if all_reduce_params.fusion_op
+                    == AllReduceFusionOp.RMS_NORM else
+                    (norm_output, residual_output))
 
         # Try Symmetric Memory AllReduce first if available
         # Note: Currently only supports NONE fusion op (plain allreduce)
