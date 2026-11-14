@@ -15,14 +15,13 @@
 # Multi-stage Dockerfile
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch
 ARG TRITON_IMAGE=nvcr.io/nvidia/tritonserver
-ARG BASE_TAG=26.09-py3
-ARG TRITON_BASE_TAG=26.09-py3
+ARG BASE_TAG=26.10-py3
+ARG CUDA_TOOLKIT_VERSION=13.4.3
+ARG TRITON_BASE_TAG=26.10-py3
 ARG DEVEL_IMAGE=devel
-# Tag of ${BASE_IMAGE} whose CUDA forward-compatibility driver (/usr/local/cuda-<ver>/compat)
-# replaces the base image's own; it must ship the same CUDA toolkit version as BASE_TAG. The
-# 26.09-py3 compat driver (615.71.09) runs the trtllm-gen context FMHA kernels ~10% slower on
-# GB200 than the 26.08-py3 one (615.65.02). Set it equal to BASE_TAG to keep the base image's own.
-ARG CUDA_COMPAT_TAG=26.08-py3
+# Use the base image's CUDA forward-compatibility driver by default. Any override must
+# ship the same CUDA toolkit version as BASE_TAG.
+ARG CUDA_COMPAT_TAG=26.10-py3
 
 FROM ${BASE_IMAGE}:${CUDA_COMPAT_TAG} AS cuda_compat
 
@@ -60,6 +59,7 @@ FROM base AS devel
 # NB: PyTorch requires this to be < 1.0
 ENV PYTORCH_ALLOC_CONF="garbage_collection_threshold:0.99999"
 
+ARG CUDA_TOOLKIT_VERSION
 ARG CUDA_VER
 ARG CUDNN_VER
 ARG NCCL_VER
@@ -75,6 +75,7 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
     . /opt/docker/common/github_auth.sh && \
     GITHUB_MIRROR=${GITHUB_MIRROR} \
     PYTHON_VERSION=${PYTHON_VERSION} \
+    CUDA_TOOLKIT_VERSION=${CUDA_TOOLKIT_VERSION} \
     CUDA_VER=${CUDA_VER} CUDNN_VER=${CUDNN_VER} \
     NCCL_VER=${NCCL_VER} CUBLAS_VER=${CUBLAS_VER} \
     TORCH_INSTALL_TYPE=${TORCH_INSTALL_TYPE} \

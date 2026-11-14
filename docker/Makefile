@@ -44,6 +44,7 @@ BUILD_WHEEL_OPTS   ?=
 BUILD_WHEEL_ARGS   ?= $(shell grep '^ARG BUILD_WHEEL_ARGS=' Dockerfile.multi | grep -o '=.*' | tr -d '="')$(if $(CUDA_ARCHS), --cuda_architectures $(CUDA_ARCHS))$(if $(BUILD_WHEEL_OPTS), $(BUILD_WHEEL_OPTS))
 BUILD_WHEEL_SCRIPT ?=
 TORCH_INSTALL_TYPE ?= skip
+CUDA_TOOLKIT_VERSION ?= $(shell grep '^ARG CUDA_TOOLKIT_VERSION=' Dockerfile.multi | cut -d= -f2)
 CUDA_VERSION       ?=
 CUDNN_VERSION      ?=
 NCCL_VERSION       ?=
@@ -118,6 +119,7 @@ base_pull:
 		$(if $(LLM_ARTIFACTS_PRIMARY), --build-arg LLM_ARTIFACTS_PRIMARY="$(LLM_ARTIFACTS_PRIMARY)") \
 		$(if $(ARTIFACTORY_CREDENTIAL_ID), --build-arg ARTIFACTORY_CREDENTIAL_ID="$(ARTIFACTORY_CREDENTIAL_ID)") \
 		$(if $(TORCH_INSTALL_TYPE), --build-arg TORCH_INSTALL_TYPE="$(TORCH_INSTALL_TYPE)") \
+		--build-arg CUDA_TOOLKIT_VERSION="$(CUDA_TOOLKIT_VERSION)" \
 		$(if $(CUDA_VERSION), --build-arg CUDA_VER="$(CUDA_VERSION)") \
 		$(if $(CUDNN_VERSION), --build-arg CUDNN_VER="$(CUDNN_VERSION)") \
 		$(if $(NCCL_VERSION), --build-arg NCCL_VER="$(NCCL_VERSION)") \
@@ -222,24 +224,24 @@ jenkins-rockylinux8_%: PYTHON_VERSION_TAG_ID = $(if $(findstring 3.12,${PYTHON_V
 jenkins-rockylinux8_%: IMAGE_WITH_TAG = $(shell . ../jenkins/current_image_tags.properties && echo $$LLM_ROCKYLINUX8_${PYTHON_VERSION_TAG_ID}_DOCKER_IMAGE)
 jenkins-rockylinux8_%: STAGE = tritondevel
 jenkins-rockylinux8_%: BASE_IMAGE = nvcr.io/nvidia/cuda
-jenkins-rockylinux8_%: BASE_TAG = 13.4.1-devel-rockylinux8
+jenkins-rockylinux8_%: BASE_TAG = $(CUDA_TOOLKIT_VERSION)-devel-rockylinux8
 jenkins-rockylinux8_%: CUDA_COMPAT_TAG = $(BASE_TAG)
 
 rockylinux8_%: STAGE = tritondevel
 rockylinux8_%: BASE_IMAGE = nvcr.io/nvidia/cuda
-rockylinux8_%: BASE_TAG = 13.4.1-devel-rockylinux8
+rockylinux8_%: BASE_TAG = $(CUDA_TOOLKIT_VERSION)-devel-rockylinux8
 rockylinux8_%: CUDA_COMPAT_TAG = $(BASE_TAG)
 
 # For x86_64
 ubuntu22_%: STAGE = tritondevel
 ubuntu22_%: BASE_IMAGE = nvcr.io/nvidia/cuda
-ubuntu22_%: BASE_TAG = 13.4.1-devel-ubuntu22.04
+ubuntu22_%: BASE_TAG = $(CUDA_TOOLKIT_VERSION)-devel-ubuntu22.04
 ubuntu22_%: CUDA_COMPAT_TAG = $(BASE_TAG)
 
 # For x86_64 and aarch64
 ubuntu24_%: STAGE = tritondevel
 ubuntu24_%: BASE_IMAGE = nvcr.io/nvidia/cuda
-ubuntu24_%: BASE_TAG = 13.4.1-devel-ubuntu24.04
+ubuntu24_%: BASE_TAG = $(CUDA_TOOLKIT_VERSION)-devel-ubuntu24.04
 ubuntu24_%: CUDA_COMPAT_TAG = $(BASE_TAG)
 
 trtllm_%: STAGE = tritonrelease
