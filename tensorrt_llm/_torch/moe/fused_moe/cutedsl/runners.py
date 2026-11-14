@@ -15,7 +15,7 @@
 """Outer autotune runners for the CuteDSL MoE kernels.
 
 The NVFP4 runner serves the grouped-GEMM leaf and, with a narrower tile set, the
-fused-FC12 one.
+fused-FC12 one. The MXFP8 runner serves the MXFP8 fused-FC12 leaf.
 """
 
 from collections.abc import Callable
@@ -34,7 +34,11 @@ from ....autotuner import (
     TuningConfig,
 )
 from ....custom_ops.cute_dsl_custom_ops import GroupedGemmInputsHelper
-from ....cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE, IS_CUTLASS_DSL_RUBIN_AVAILABLE
+from ....cute_dsl_utils import (
+    IS_CUTLASS_DSL_AVAILABLE,
+    IS_CUTLASS_DSL_MXFP8_FUSED_FC12_AVAILABLE,
+    IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+)
 from ....locality_domain.autotune import (
     LocalityDomainConcurrentTunableRunner as _LocalityDomainConcurrentTunableRunner,
 )
@@ -500,5 +504,122 @@ class CuteDslFusedMoEBF16Runner(TunableRunner):
         return _runner_tactics_match_tile_size(
             comb,
             CuteDslFusedMoEBF16Runner,
+            tuple(checked_runner_types),
+        )
+
+
+class CuteDslFusedMoEMxfp8Runner(TunableRunner):
+    """Autotuner runner for the MXFP8 fused FC1+FC2 MoE on Rubin (SM107).
+
+    Selects the routing tile size from {128, 256} and delegates to
+    ``forward_impl``, which drives the single fused FC1+FC2 CuTe DSL kernel.
+    The fused kernel has no B-reuse geometry, so the routing tile is exactly
+    the MMA tile M: 128 (1-CTA MMA) or 256 (2-CTA MMA).
+    """
+
+    tuning_config_cache = dict()
+
+    def __init__(
+        self,
+        forward_impl: Callable,
+        num_experts: int,
+        top_k: int,
+        num_local_experts: int,
+        local_expert_offset: int,
+        enable_alltoall: bool = False,
+        output_dtype: torch.dtype = torch.bfloat16,
+    ) -> None:
+        super().__init__()
+        self.forward_impl = forward_impl
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.num_local_experts = num_local_experts
+        self.local_expert_offset = local_expert_offset
+        self.enable_alltoall = enable_alltoall
+        assert output_dtype == torch.bfloat16
+        self.output_dtype = output_dtype
+
+    def unique_id(self) -> tuple:
+        return (
+            self.num_experts,
+            self.top_k,
+            self.num_local_experts,
+            self.local_expert_offset,
+            self.enable_alltoall,
+            self.output_dtype,
+        )
+
+    def get_valid_tactics(
+        self,
+        inputs: list[torch.Tensor],
+        profile: OptimizationProfile,
+        **kwargs,
+    ) -> list[int]:
+        return self._tile_sizes()
+
+    @staticmethod
+    def _tile_sizes() -> list[int]:
+        return [128, 256]
+
+    def get_tuning_config(self) -> TuningConfig:
+        key = self.unique_id()
+        if key not in self.__class__.tuning_config_cache:
+            # The helper only regenerates token_selected_experts, so the NVFP4
+            # helper serves the MXFP8 inputs unchanged.
+            helper = CuteDslFusedMoENvfp4InputsHelper(
+                self.num_experts, self.top_k, self.num_local_experts, self.local_expert_offset
+            )
+            # MXFP8 inputs: [x, token_selected_experts, token_final_scales,
+            #                x_sf, moe_output]
+            self.__class__.tuning_config_cache[key] = TuningConfig(
+                dynamic_tensor_specs=(
+                    DynamicTensorSpec(
+                        0, 0, get_last_power_of_2_num_tokens_buckets, last_positive_power_of_2
+                    ),
+                ),
+                constraint_specs=(
+                    ConstraintSpec(1, 0, helper.infer_shape_num_tokens),
+                    ConstraintSpec(2, 0, helper.infer_shape_num_tokens),
+                    ConstraintSpec(3, 0, helper.infer_shape_num_tokens),
+                    ConstraintSpec(4, 0, helper.infer_shape_num_tokens),
+                ),
+                inputs_pre_hook=helper.inputs_pre_hook,
+                use_cold_l2_cache=True,
+            )
+        return self.__class__.tuning_config_cache[key]
+
+    def forward(
+        self, inputs: list[torch.Tensor], tactic: int | None, do_preparation: bool = False
+    ) -> torch.Tensor:
+        if do_preparation:
+            # The fused op tunes its own kernel tactic, and that nested tuning
+            # must complete before the outer tile is profiled under CUDA graph
+            # capture.
+            for tile_size in self._tile_sizes():
+                self.forward_impl(
+                    *inputs, enable_alltoall=self.enable_alltoall, tile_size=tile_size
+                )
+            return inputs[4]
+
+        if isinstance(tactic, int) and tactic > 0:
+            tile_size = tactic
+        else:
+            tile_size = 128
+        return self.forward_impl(*inputs, enable_alltoall=self.enable_alltoall, tile_size=tile_size)
+
+    @AutoTuner.TacticsCapture.register_runner_tactic_comb_checker
+    @staticmethod
+    def runner_tactic_comb_checker(comb: list[tuple[TunableRunner, Any]]) -> bool:
+        # The fused FC12 runner's tactic starts with mma_tiler, whose M must
+        # equal the outer routing tile.
+        checked_runner_types = []
+        if IS_CUTLASS_DSL_MXFP8_FUSED_FC12_AVAILABLE:
+            from ....custom_ops.cute_dsl_custom_ops import Sm107Mxfp8FusedFc12MoeRunner
+
+            checked_runner_types.append(Sm107Mxfp8FusedFc12MoeRunner)
+
+        return _runner_tactics_match_tile_size(
+            comb,
+            CuteDslFusedMoEMxfp8Runner,
             tuple(checked_runner_types),
         )

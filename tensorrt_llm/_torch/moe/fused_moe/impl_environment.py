@@ -40,6 +40,10 @@ class MoEDep(str, Enum):
     #: The installed CuTe DSL exposes the Rubin helpers the SM107 CuteDSL
     #: kernels are written against.
     CUTEDSL_RUBIN = "cutedsl_rubin"
+    #: The installed CuTe DSL also ships the ``cutlass.memory`` /
+    #: ``cutlass.tensor_utils`` submodules the Rubin MXFP8 fused FC12 kernel
+    #: needs; older Rubin builds miscompile its MXFP8 path.
+    CUTEDSL_MXFP8_FUSED_FC12 = "cutedsl_mxfp8_fused_fc12"
     #: Locality-domain execution is usable here: SM107, driver support, and
     #: ``DISABLE_LOCALITY_DOMAINS`` unset.
     LOCALITY_DOMAIN = "locality_domain"
@@ -92,6 +96,14 @@ def _probe_cutedsl_rubin() -> Tuple[bool, str]:
     return False, "installed CuTe DSL lacks Rubin helpers"
 
 
+def _probe_cutedsl_mxfp8_fused_fc12() -> Tuple[bool, str]:
+    from ...cute_dsl_utils import IS_CUTLASS_DSL_MXFP8_FUSED_FC12_AVAILABLE
+
+    if IS_CUTLASS_DSL_MXFP8_FUSED_FC12_AVAILABLE:
+        return True, ""
+    return False, "installed CuTe DSL lacks cutlass.memory / cutlass.tensor_utils"
+
+
 def _probe_locality_domain() -> Tuple[bool, str]:
     from ...locality_domain_utils import is_locality_domain_enabled
 
@@ -115,6 +127,7 @@ _DEP_PROBES: Dict[MoEDep, DepProbe] = {
     MoEDep.MEGAMOE_CUTEDSL_RUNTIME: _probe_megamoe_cutedsl_runtime,
     MoEDep.MEGAMOE_CUTEDSL_OP: _probe_megamoe_cutedsl_op,
     MoEDep.CUTEDSL_RUBIN: _probe_cutedsl_rubin,
+    MoEDep.CUTEDSL_MXFP8_FUSED_FC12: _probe_cutedsl_mxfp8_fused_fc12,
     MoEDep.LOCALITY_DOMAIN: _probe_locality_domain,
 }
 
