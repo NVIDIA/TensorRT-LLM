@@ -265,9 +265,11 @@ def test_a_paged_context_plans_every_fast_path_but_the_window_compaction(monkeyp
     # The half expert window's rule keeps it to max_batch_size 8; nothing builds on it.
     # The ported decode-stack levers are default off, and the ones that do carry a
     # default carry it at TP8 only, so on this TP4 context deployment none is armed.
+    # Context sequence parallelism is on only when its knob asks for it.
     assert off == {
         "drafter_window_compact",
         "half_window_experts",
+        "context_sequence_parallel",
         "drafter_fused_prep",
         "finalize_entry_trigger",
         "multi_request_combine_gate",

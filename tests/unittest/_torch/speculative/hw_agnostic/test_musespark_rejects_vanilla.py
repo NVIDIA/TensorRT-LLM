@@ -28,6 +28,8 @@ from tensorrt_llm._torch.pyexecutor.py_executor_creator import _reject_musespark
 from tensorrt_llm._torch.speculative import dflash_attention
 from tensorrt_llm.llmapi import DFlashDecodingConfig
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.fixture(params=["muse_spark", "musespark_open_omni"])
 def muse_dir(request, tmp_path):
