@@ -309,7 +309,12 @@ class BaseWeightMapper(ABC):
         return self._skip_modules
 
     def add_skip_modules(self, value: list[str]) -> None:
-        self._skip_modules.extend(value)
+        # Every load adds its skip list, and one mapper serves every load of
+        # an engine, including each bucket of an in-flight weight update, so
+        # keep each name once instead of growing the list on every load.
+        for module_name in value:
+            if module_name not in self._skip_modules:
+                self._skip_modules.append(module_name)
 
     def should_skip_module(self, module_name: str) -> bool:
         return any(skip_module in module_name

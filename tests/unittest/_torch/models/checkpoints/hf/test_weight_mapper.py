@@ -257,3 +257,21 @@ def test_compressed_tensors_nvfp4_conversion_keeps_consumable_weights() -> None:
     assert converted["model.layers.0.self_attn.o_proj.weight"] is packed
     # The converted dict owns the tensors, so consuming it can release them.
     assert len(source) == 0
+
+
+def test_add_skip_modules_keeps_each_name_once() -> None:
+    # One mapper serves every load of an engine, including each bucket of an
+    # in-flight weight update, and every load adds its skip list again.
+    mapper = _hf_mapper_with_config(SimpleNamespace(tie_word_embeddings=False))
+    for _ in range(3):
+        mapper.add_skip_modules(["draft_model", "model.layers.61"])
+    # A repeat within one call is dropped too, and a new name goes last.
+    mapper.add_skip_modules(["vision_tower", "draft_model", "vision_tower"])
+
+    assert mapper.skip_modules == ["draft_model", "model.layers.61", "vision_tower"]
+    # Matching is unchanged: a name skips every module whose name contains it.
+    assert mapper.should_skip_module("draft_model.mtp_layers.0.eh_proj")
+    assert mapper.should_skip_module("model.layers.61.mlp.experts")
+    assert mapper.should_skip_module("model.vision_tower.blocks.0.attn")
+    assert not mapper.should_skip_module("model.layers.6.mlp")
+    assert not mapper.should_skip_module("lm_head")
