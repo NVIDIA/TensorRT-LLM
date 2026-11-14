@@ -195,6 +195,7 @@ l0_cpu:
   # what runs it.
   - unittest/_torch/misc/test_xgrammar_structural_tag.py
   - unittest/_torch/misc/test_grammar_matcher.py
+  - unittest/_torch/misc/test_tekken_guided_decoding.py
   # MiniMax-M3 compressed-tensors NVFP4 MoE packaging: config expansion and
   # index-projection quantization.
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_index_projection_declares_its_checkpoint_names

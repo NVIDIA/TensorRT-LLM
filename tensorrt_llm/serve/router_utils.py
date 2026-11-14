@@ -24,6 +24,7 @@ from typing import Iterable, Optional, Union
 
 from tensorrt_llm.bindings.internal.batch_manager import BlockKey as _NativeBlockKey
 from tensorrt_llm.bindings.internal.batch_manager import BlockKeyHasher as _NativeBlockKeyHasher
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.inputs.prefix_token_cache import PrefixTokenCache, create_prefix_token_cache
 from tensorrt_llm.logger import logger
 from tensorrt_llm.runtime import kv_cache_hash
@@ -69,6 +70,11 @@ truncate_sha256_hash_to_int64 = kv_cache_hash.truncate_sha256_hash_to_int64
 
 OpenAIRequest = Union[CompletionRequest, ChatCompletionRequest, ResponsesRequest]
 BlockHash = Union[int, str]
+
+# Checkpoint formats whose servers take the tokenizer, the input processor and the model
+# configuration from the checkpoint's Mistral-native files (mistral-common's tekken.json and
+# params.json), not from its Hugging Face files.
+_MISTRAL_NATIVE_FORMATS = frozenset({CheckpointFormat.MISTRAL, CheckpointFormat.MISTRAL_LARGE_3})
 
 __all__ = [
     "KV_CACHE_HASH_ALGO_DEFAULT",
@@ -175,7 +181,15 @@ class BlockHashMixin:
         use_harmony: Optional[bool] = None,
         model_path: Optional[str] = None,
         enable_tokenization_cache: bool = False,
+        checkpoint_format: Optional[str] = None,
     ) -> None:
+        """Set up tokenization for block hashing.
+
+        ``checkpoint_format`` is the servers' checkpoint format. For a Mistral-native one
+        (``mistral``, ``mistral_large_3``) the router loads the tokenizer and the rendering
+        resources from the checkpoint as the servers do (``RenderResources.load``); for any
+        other it loads the Hugging Face tokenizer.
+        """
         env_tokens_per_block = os.environ.get("TRTLLM_KVCACHE_AWARE_ROUTER_HASH_TOKENS_PER_BLOCK")
         if env_tokens_per_block is not None:
             tokens_per_block = int(env_tokens_per_block)
@@ -187,6 +201,7 @@ class BlockHashMixin:
         self._tokenizer_dir = tokenizer_dir
         self._model_path = model_path
         self._use_harmony = use_harmony
+        self._checkpoint_format = checkpoint_format
         self._tok_prefix_cache: OrderedDict = OrderedDict()
         self._enable_tokenization_cache = enable_tokenization_cache
         # id(tokenizer) -> (tokenizer, its prefix token cache or None)
@@ -196,9 +211,15 @@ class BlockHashMixin:
             f"{' (auto, adopts worker)' if self._tpb_auto else ''}"
             f", custom_tokenizer={self._custom_tokenizer}"
             f", model_path={self._model_path}"
+            f", checkpoint_format={self._checkpoint_format}"
             f", use_harmony={self._use_harmony}"
             f", enable_tokenization_cache={self._enable_tokenization_cache}"
         )
+
+    @property
+    def _mistral_native(self) -> bool:
+        """Whether the servers load a Mistral-native checkpoint (see ``_init_block_hashing``)."""
+        return getattr(self, "_checkpoint_format", None) in _MISTRAL_NATIVE_FORMATS
 
     def _get_tokenizer(self, model: str):
         if model not in self._tokenizers:
@@ -206,7 +227,12 @@ class BlockHashMixin:
             # Only an operator-configured tokenizer directory may run remote
             # tokenizer code; request model values are client-controlled.
             trust_remote_code = self._tokenizer_dir is not None
-            if self._custom_tokenizer:
+            if self._mistral_native:
+                # The servers' own tokenizer wrapper (mistral-common's, for a Mistral-native
+                # checkpoint), which encodes as they do; its ``.tokenizer`` is not a
+                # Hugging Face tokenizer.
+                self._tokenizers[model] = self._render_resources(model).tokenizer
+            elif self._custom_tokenizer:
                 from tensorrt_llm.tokenizer import load_custom_tokenizer
 
                 self._tokenizers[model] = load_custom_tokenizer(
@@ -289,7 +315,8 @@ class BlockHashMixin:
         """Routing ids from :func:`render_chat_for_length`; never forwarded to a worker.
 
         A request the request model rejects, or Harmony cannot convert, gets no ids. One the chat
-        template rejects raises.
+        template rejects raises, except for a Mistral-native checkpoint: mistral-common's
+        rejection also gets no ids, and the worker answers the request.
         """
         try:
             return render_chat_for_length(
@@ -300,11 +327,28 @@ class BlockHashMixin:
         except (UnsupportedRenderError, HarmonyConversionError) as error:
             logger.debug(f"Router has no length for the request ({error}); routing on no ids.")
             return []
+        except ValueError as error:
+            if not self._mistral_native:
+                raise
+            logger.debug(f"Router could not render the request ({error}); routing on no ids.")
+            return []
 
     def _render_resources(self, model: str) -> RenderResources:
         """Rendering resources of this router for ``model``, built once."""
         cache = self.__dict__.setdefault("_render_resources_cache", {})
         resources = cache.get(model)
+        if resources is None and self._mistral_native:
+            # What a server of this checkpoint loads: the tokenizer and input processor of
+            # the checkpoint format, and the model type from its native configuration.
+            resources = cache[model] = RenderResources.load(
+                self._model_path or self._tokenizer_dir or model,
+                tokenizer=self._tokenizer_dir,
+                trust_remote_code=self._tokenizer_dir is not None,
+                custom_tokenizer=self._custom_tokenizer,
+                checkpoint_format=self._checkpoint_format,
+                # As for from_tokenizer: the worker polices request-level templates.
+                allow_request_chat_template=True,
+            )
         if resources is None:
             try:
                 model_type = self._get_model_type()
@@ -397,10 +441,13 @@ class BlockHashMixin:
         """Render a chat request with the shared core and decide on write-back."""
         if request.prompt_token_ids is not None:
             return list(request.prompt_token_ids)
+        # Outside the fallbacks below: resources that cannot be loaded are a configuration
+        # error, not a request the router cannot render.
+        resources = self._render_resources(request.model)
         try:
             rendered = render_chat(
                 request,
-                self._render_resources(request.model),
+                resources,
                 tokenize=True,
                 encode_rendered=self._make_encode_rendered(request),
             )

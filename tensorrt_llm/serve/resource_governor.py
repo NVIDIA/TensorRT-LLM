@@ -19,7 +19,6 @@ PyExecutor via a dedicated resource governor queue, bypassing the
 LLM/Proxy/Worker chain.
 """
 
-import asyncio
 import traceback
 from http import HTTPStatus
 from typing import Callable, List, Optional
@@ -39,7 +38,7 @@ from tensorrt_llm.serve.openai_protocol import (
     KVCacheTruncateTokensRequest,
     ensure_request_chat_template_allowed,
 )
-from tensorrt_llm.serve.render import RenderResources, render_conversation
+from tensorrt_llm.serve.render import RenderResources, render_conversation_with_media
 
 
 class ResourceGovernor:
@@ -144,8 +143,9 @@ class ResourceGovernor:
         conversation, mm_coroutines, mm_placeholder_counts, _ = parse_chat_messages_coroutines(
             messages, self.model_config, None
         )
-        render_task = render_conversation(
+        rendered, _ = await render_conversation_with_media(
             self._render_resources(),
+            mm_coroutines,
             conversation=conversation,
             mm_placeholder_counts=mm_placeholder_counts,
             add_generation_prompt=add_generation_prompt,
@@ -155,7 +155,6 @@ class ResourceGovernor:
             chat_template_kwargs=chat_template_kwargs,
             tokenize=True,
         )
-        rendered, _ = await asyncio.gather(render_task, mm_coroutines)
         return rendered.token_ids
 
     async def _truncate_kv_cache(self, request: KVCacheTruncateRequest) -> Response:

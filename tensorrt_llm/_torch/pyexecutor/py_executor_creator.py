@@ -494,7 +494,26 @@ def _extend_full_attention_windows_for_spec_decode(
 def get_guided_decoding_config(guided_decoding_backend: str,
                                tokenizer: Optional[TokenizerBase] = None):
     guided_decoding_config = None
-    if guided_decoding_backend == 'xgrammar':
+    if (guided_decoding_backend is not None and getattr(
+            type(tokenizer), "xgrammar_tokenizer_info", None) is not None):
+        # A tokenizer with no Hugging Face tokenizer JSON describes its own
+        # vocabulary (Mistral's Tekken: bytes, with separate control tokens).
+        # xgrammar takes it as the byte vocabulary; llguidance takes the
+        # tokenizer itself, which the guided decoder gets from
+        # `_llguidance_tokenizer`.
+        if guided_decoding_backend == 'xgrammar':
+            guided_decoding_config = GuidedDecodingConfig(
+                backend=GuidedDecodingConfig.GuidedDecodingBackend.XGRAMMAR,
+                **tokenizer.xgrammar_tokenizer_info())
+        elif guided_decoding_backend == 'llguidance':
+            guided_decoding_config = GuidedDecodingConfig(
+                backend=GuidedDecodingConfig.GuidedDecodingBackend.LLGUIDANCE,
+                stop_token_ids=[tokenizer.eos_token_id])
+        else:
+            raise ValueError(
+                f"Unsupported guided decoding backend {guided_decoding_backend}"
+            )
+    elif guided_decoding_backend == 'xgrammar':
         assert tokenizer is not None
         guided_decoding_config = GuidedDecodingConfig(
             backend=GuidedDecodingConfig.GuidedDecodingBackend.XGRAMMAR,
@@ -508,6 +527,31 @@ def get_guided_decoding_config(guided_decoding_backend: str,
         raise ValueError(
             f"Unsupported guided decoding backend {guided_decoding_backend}")
     return guided_decoding_config
+
+
+def _llguidance_tokenizer(guided_decoding_config: GuidedDecodingConfig,
+                          tokenizer: Optional[TokenizerBase],
+                          vocab_size_padded: int):
+    """The ready llguidance tokenizer of a vocabulary with no Hugging Face
+    tokenizer JSON (Mistral's Tekken), or None to build it from the config's
+    `tokenizer_str`."""
+    if (guided_decoding_config.backend
+            != GuidedDecodingConfig.GuidedDecodingBackend.LLGUIDANCE
+            or getattr(type(tokenizer), "llguidance_tokenizer", None) is None):
+        return None
+    return tokenizer.llguidance_tokenizer(vocab_size_padded)
+
+
+def _llguidance_json_schema_lark(guided_decoding_config: GuidedDecodingConfig,
+                                 tokenizer: Optional[TokenizerBase]):
+    """Renders the llguidance grammar of a JSON response for a tokenizer whose
+    structured responses may open with a reasoning section (Mistral's [THINK]),
+    or None to constrain a JSON response from its first token."""
+    if (guided_decoding_config.backend
+            != GuidedDecodingConfig.GuidedDecodingBackend.LLGUIDANCE
+            or getattr(tokenizer, "renders_grammars", False) is not True):
+        return None
+    return tokenizer.llguidance_json_schema_lark
 
 
 def _load_config_and_create_checkpoint_loader(
@@ -1130,6 +1174,12 @@ def _create_py_executor(
                     "vocab_size_padded": model_engine.model.vocab_size_padded,
                     "rank": mapping.rank,
                 }
+                kwargs["llguidance_tokenizer"] = _llguidance_tokenizer(
+                    guided_decoding_config, tokenizer,
+                    model_engine.model.vocab_size_padded)
+                kwargs[
+                    "llguidance_json_schema_lark"] = _llguidance_json_schema_lark(
+                        guided_decoding_config, tokenizer)
                 if spec_config is not None:
                     kwargs[
                         "max_num_draft_tokens"] = spec_config.tokens_per_gen_step - 1

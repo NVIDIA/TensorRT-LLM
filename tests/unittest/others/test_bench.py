@@ -22,7 +22,10 @@ from unittest import mock
 import pynvml
 import pytest
 
+from tensorrt_llm.bench.benchmark import get_general_cli_options
+from tensorrt_llm.bench.benchmark.utils.general import get_settings
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
+from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.dataclasses.reporting import PerfItemTuple, ReportUtility, StatsKeeper
 from tensorrt_llm.bench.dataclasses.statistics import PercentileStats
 from tensorrt_llm.bench.tuning import heuristics
@@ -505,3 +508,80 @@ def test_calc_engine_setting_sizes_unset_ssm_cache_dtype_from_model_dtype(monkey
     for unset in (None, "auto"):
         assert engine_setting(unset, "bfloat16") == bf16_setting
         assert engine_setting(unset, "float32") == fp32_setting
+
+
+def _llm_api_options(tmp_path, **llm_args):
+    options = tmp_path / "extra_llm_api_options.yaml"
+    options.write_text("".join(f"{k}: {v}\n" for k, v in llm_args.items()))
+    return str(options)
+
+
+@pytest.mark.parametrize("checkpoint_format", ["mistral", "mistral_large_3"])
+def test_cli_options_read_a_mistral_native_model_type(tmp_path, checkpoint_format):
+    # A Mistral-native checkpoint keeps its configuration in params.json: its model type
+    # (which selects the multimodal prompt rendering) comes from the native format.
+    env = BenchmarkEnvironment(model="mistral-native", checkpoint_path=tmp_path, workspace=tmp_path)
+    params = {
+        "extra_llm_api_options": _llm_api_options(tmp_path, checkpoint_format=checkpoint_format)
+    }
+    options = get_general_cli_options(params, env)
+    assert options.checkpoint_format == checkpoint_format
+    with mock.patch(
+        "tensorrt_llm.bench.benchmark.load_pretrained_config",
+        return_value=SimpleNamespace(model_type="mistral_common"),
+    ) as load:
+        assert options.model_type == "mistral_common"
+    load.assert_called_once_with(
+        tmp_path, trust_remote_code=True, checkpoint_format=checkpoint_format
+    )
+    assert get_general_cli_options({}, env).checkpoint_format is None
+
+
+@pytest.mark.parametrize("llm_args", [{}, {"checkpoint_format": "HF"}])
+def test_cli_options_of_other_formats_read_the_hf_config(tmp_path, llm_args):
+    env = BenchmarkEnvironment(model="hf-model", checkpoint_path=tmp_path, workspace=tmp_path)
+    params = {"extra_llm_api_options": _llm_api_options(tmp_path, **llm_args)} if llm_args else {}
+    options = get_general_cli_options(params, env)
+    with (
+        mock.patch("tensorrt_llm.bench.benchmark.load_pretrained_config") as load,
+        mock.patch(
+            "tensorrt_llm.bench.benchmark.get_model_config",
+            return_value=SimpleNamespace(model_type="llama"),
+        ),
+    ):
+        assert options.model_type == "llama"
+    load.assert_not_called()
+
+
+@pytest.mark.parametrize("limits", [{}, {"max_batch_size": 16}])
+def test_settings_need_explicit_limits_for_a_mistral_native_checkpoint(tmp_path, limits):
+    params = {
+        "tp": 4,
+        "pp": 1,
+        "ep": 4,
+        "extra_llm_api_options": _llm_api_options(tmp_path, checkpoint_format="mistral"),
+        **limits,
+    }
+    with pytest.raises(ValueError, match="--max_batch_size and --max_num_tokens"):
+        get_settings(params, SimpleNamespace(), "mistral-native", tmp_path)
+
+
+def test_settings_take_explicit_limits_for_a_mistral_native_checkpoint(tmp_path):
+    params = {
+        "tp": 4,
+        "pp": 1,
+        "ep": 4,
+        "max_batch_size": 16,
+        "max_num_tokens": 32768,
+        "extra_llm_api_options": _llm_api_options(
+            tmp_path, checkpoint_format="mistral", enable_chunked_prefill="false"
+        ),
+    }
+    metadata = SimpleNamespace(max_isl=4096, avg_isl=1024, avg_osl=256)
+    with mock.patch(
+        "tensorrt_llm.bench.benchmark.utils.general.get_model_config",
+        side_effect=AssertionError("the tuning heuristic must not read the checkpoint"),
+    ):
+        settings = get_settings(params, metadata, "mistral-native", tmp_path)
+    assert settings["settings_config"]["max_batch_size"] == 16
+    assert settings["settings_config"]["max_num_tokens"] == 32768

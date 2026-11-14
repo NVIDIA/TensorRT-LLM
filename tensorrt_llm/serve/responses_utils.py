@@ -94,7 +94,8 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionMessageParam,
                                                 UCompletionRequest,
                                                 UCompletionResponse,
                                                 to_disaggregated_params)
-from tensorrt_llm.serve.render import RenderResources, render_conversation
+from tensorrt_llm.serve.render import (RenderResources,
+                                       render_conversation_with_media)
 from tensorrt_llm.serve.responses_web_search import is_web_search_tool
 from tensorrt_llm.serve.serving_extensions import normalize_reasoning_effort
 from tensorrt_llm.serve.tool_parser.base_tool_parser import (
@@ -1659,8 +1660,9 @@ async def _create_input_tokens(
         model_type=model_type,
     )
 
-    render_task = render_conversation(
+    rendered, (mm_data, mm_embeddings) = await render_conversation_with_media(
         render_resources,
+        mm_coroutines,
         conversation=conversation,
         mm_placeholder_counts=mm_placeholder_counts,
         add_generation_prompt=True,
@@ -1668,11 +1670,10 @@ async def _create_input_tokens(
         chat_template_kwargs=chat_template_kwargs or None,
         injected_chat_template_kwargs=reasoning_injected_chat_template_keys(
             request),
-        # Media is rendered to text for the model's input processor to expand.
+        # Media is rendered to text for the model's input processor to expand,
+        # unless the renderer tokenizes it itself.
         tokenize=not has_media,
     )
-    rendered, (mm_data,
-               mm_embeddings) = await asyncio.gather(render_task, mm_coroutines)
     if not has_media:
         return rendered.token_ids
 
@@ -1680,7 +1681,8 @@ async def _create_input_tokens(
         raise ValueError(
             "Passing 'multi_modal_data' and 'multi_modal_embeddings' at the "
             "same time is not supported.")
-    inputs = prompt_inputs(rendered.text)
+    inputs = prompt_inputs(
+        rendered.text if rendered.text is not None else rendered.token_ids)
     if mm_data:
         inputs["multi_modal_data"] = mm_data
         if mm_item_order:
