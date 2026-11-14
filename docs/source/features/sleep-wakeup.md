@@ -355,7 +355,7 @@ Principal implementation locations are:
 - Workers: `tensorrt_llm/executor/base_worker.py` and
   `tensorrt_llm/executor/ray/gpu_worker.py`
 - Allocation tagging: `tensorrt_llm/_torch/pyexecutor/py_executor_creator.py`
-  and `tensorrt_llm/_torch/pyexecutor/model_loader.py`
+  and `tensorrt_llm/_torch/models/checkpoints/memory_init.py`
 - Python VMM wrapper: `tensorrt_llm/_torch/virtual_memory.py`
 - CUDA VMM: `cpp/tensorrt_llm/runtime/virtualMemory.cpp` and
   `cpp/include/tensorrt_llm/runtime/virtualMemory.h`

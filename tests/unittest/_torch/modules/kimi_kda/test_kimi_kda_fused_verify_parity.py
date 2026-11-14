@@ -643,14 +643,16 @@ def test_fused_verify_mxfp8_output_gating(allow, with_output):
 def test_fused_verify_mxfp8_output_matches_bf16_projection():
     """SM107: epilogue-quantized o_proj input matches the BF16 core path."""
     from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
-    from tensorrt_llm._torch.models.modeling_kimi_linear import _Fp8BlockScaleWeightReadLinear
+    from tensorrt_llm._torch.modules.fp8_block_scale_weight_read_linear import (
+        Fp8BlockScaleWeightReadLinear,
+    )
 
     if not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
         pytest.skip("needs the Rubin CuTe DSL")
     batch = 4
     runtime = _make_runtime(seed=11)
     runtime.finalize_decode_weights()
-    runtime.o_proj = _Fp8BlockScaleWeightReadLinear.from_linear(runtime.o_proj)
+    runtime.o_proj = Fp8BlockScaleWeightReadLinear.from_linear(runtime.o_proj)
     assert runtime.o_proj.supports_prequantized_input
     calls = _capture_mtp_verify(runtime)
     x = (torch.randn(batch * (M + 1), HIDDEN, device="cuda") * 0.5).to(torch.bfloat16)

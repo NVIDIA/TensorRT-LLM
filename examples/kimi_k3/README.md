@@ -162,6 +162,40 @@ sbatch --partition=PARTITION --account=ACCOUNT --time=04:00:00 \
     SCRIPT --model MODEL --image IMAGE
 ```
 
+### Optional Model Streamer weight loading
+
+Install runai-model-streamer 0.17.0 or later in the runtime used by every
+serving rank. Older versions do not have the `tensor_names` and `owned`
+arguments of `SafetensorsStreamer.stream_files()`, which TensorRT-LLM uses:
+
+```bash
+python -m pip install "runai-model-streamer>=0.17.0"
+```
+
+Set `checkpoint_io_policy: model_streamer` in the `trtllm-serve --config`
+YAML to use the Kimi K3 streamer. Keep `load_format: AUTO` and
+`checkpoint_format: HF` (their defaults). Use `checkpoint_io_policy: native`
+for the standard reader, or `auto` for TRT-LLM's default I/O policy. Automatic
+selection does not enable Model Streamer.
+
+```yaml
+checkpoint_io_policy: model_streamer
+load_format: AUTO
+checkpoint_format: HF
+disable_mm_encoder: true
+```
+
+The streamer reads only tensors needed by the ranks on each node and uses
+node-local distributed loading when multiple ranks share a node. Its current
+scope is local Hugging Face safetensors checkpoints for the text Kimi K3 model.
+Set `disable_mm_encoder: true` with either I/O policy to load only the
+language model from a multimodal Kimi K3 checkpoint and serve text requests.
+
+This experimental option requires a complete checkpoint. For multi-rank MPI
+launches, it initializes a PyTorch distributed group when needed. Rank 0
+selects a fresh rendezvous address and shares it through MPI; inherited
+`MASTER_ADDR` and `MASTER_PORT` values are not used.
+
 ## Troubleshooting
 
 ### The job reaches its time limit

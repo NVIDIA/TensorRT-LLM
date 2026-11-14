@@ -6943,6 +6943,7 @@ class CheckpointIOPolicy(StrEnum):
     AUTO = "auto"
     NATIVE = "native"
     RANK_STRIPED_READ_AHEAD = "rank_striped_read_ahead"
+    MODEL_STREAMER = "model_streamer"
 
 
 class LoadFormat(Enum):
@@ -7652,9 +7653,15 @@ class TorchLlmArgs(BaseLlmArgs):
         "'native' preserves the existing loader. "
         "'rank_striped_read_ahead' lets node-local ranks read disjoint "
         "SafeTensors extents while native mapping, materialization, and H2D "
-        "continue. Incompatible configurations select native I/O before "
-        "optimized reader or collective setup. Runtime-ineligible loads fall "
-        "back to native before model mutation.",
+        "continue. For 'auto' and 'rank_striped_read_ahead', incompatible "
+        "configurations select native I/O before optimized reader or "
+        "collective setup, and runtime-ineligible loads fall back to native "
+        "before model mutation. 'model_streamer' streams the SafeTensors "
+        "tensors that each node needs to GPU with Run:ai Model Streamer. It "
+        "requires a model that implements plan_model_streamer_load(), "
+        "load_format='AUTO', the built-in HF checkpoint loader, and "
+        "runai-model-streamer>=0.17.0, which TensorRT-LLM does not install. It "
+        "never falls back: an unsupported configuration raises an error.",
         status="prototype",
     )
 
@@ -7696,7 +7703,8 @@ class TorchLlmArgs(BaseLlmArgs):
         "encoder's GPU memory (enlarging the KV cache pool) for workloads "
         "that never send image/video/audio inputs; such requests are "
         "rejected. Only takes effect for model implementations that support "
-        "it (currently Mistral3 and the Qwen3-VL / Qwen3.5-VL family); a "
+        "it (currently Kimi K2.5/K3, Mistral3, and the Qwen3-VL / "
+        "Qwen3.5-VL family); a "
         "no-op otherwise. "
         "Defaults to False.",
         status="prototype")
@@ -8683,6 +8691,27 @@ class TorchLlmArgs(BaseLlmArgs):
                 "checkpoint_format will be set to HF.")
             self.checkpoint_format = CheckpointFormat.HF
 
+        return self
+
+    # NOTE: `validate_checkpoint_format()` must be placed before this function, as this
+    # function depends on the default checkpoint_format that it resolves.
+    # The order is enforced when Pydantic runs after-validators.
+    @model_validator(mode="after")
+    def validate_model_streamer_config(self) -> 'TorchLlmArgs':
+        if self.checkpoint_io_policy != CheckpointIOPolicy.MODEL_STREAMER:
+            return self
+        if self.load_format != LoadFormat.AUTO:
+            raise ValueError(
+                "checkpoint_io_policy='model_streamer' requires load_format='AUTO'"
+            )
+        if self.checkpoint_loader is not None or self.checkpoint_format != CheckpointFormat.HF:
+            raise ValueError(
+                "checkpoint_io_policy='model_streamer' requires the built-in HF "
+                "checkpoint loader (checkpoint_format='HF')")
+        if self.is_partial_model_loading:
+            raise ValueError(
+                "checkpoint_io_policy='model_streamer' does not support partial model loading"
+            )
         return self
 
     @model_validator(mode="after")
