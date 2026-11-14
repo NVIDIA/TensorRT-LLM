@@ -6247,6 +6247,362 @@
       "title": "SleepConfig",
       "type": "object"
     },
+    "StoreHostDonorConfig": {
+      "additionalProperties": false,
+      "description": "Plain host memory this server lends to a Mooncake store pool.\n\nThe worker itself registers the memory with the pool's master, so no KV\nconnector and no helper process is needed; a server that also runs the\n'mooncake-store' connector keeps its connector client separate. Each\nnode-level size is split evenly over the node's CPU NUMA nodes and one\nrank per NUMA node registers that share with its memory bound there.\nTLLM_DISABLE_STORE_HOST_DONOR=1 turns it off.",
+      "properties": {
+        "device_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "RDMA devices, comma separated. Defaults to every active InfiniBand device at the host's highest link rate.",
+          "status": "prototype",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Device Name"
+        },
+        "hbm_lend_size_per_gpu": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "default": 0,
+          "description": "GPU memory each rank lends to the pool, as a binary size ('64GiB') or a byte count. It is allocated after warmup and CUDA graph capture, from memory the KV cache left free, and needs a Mooncake release with MooncakeDistributedStore.mount_buffer; with an older release nothing is lent. Needs the rdma protocol, or the NVLink store under TLLM_MOONCAKE_STORE_EGM=1.",
+          "status": "prototype",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Hbm Lend Size Per Gpu"
+        },
+        "late_auto": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StoreHostDonorLateAutoConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Budget the late size is computed from when late_size_per_node is 'auto'.",
+          "status": "prototype",
+          "telemetry": {
+            "exclude": true
+          }
+        },
+        "late_delay_seconds": {
+          "default": 0.0,
+          "description": "0 registers the late size after warmup, before the executor starts serving. A positive value registers it that many seconds after the executor started, on a background thread.",
+          "minimum": 0,
+          "status": "prototype",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Late Delay Seconds",
+          "type": "number"
+        },
+        "late_mode": {
+          "default": "auto",
+          "description": "How the late size is registered: mounted on the startup client ('same_client'), through a second client ('new_client'), or the former when the Mooncake bindings support it ('auto').",
+          "enum": [
+            "auto",
+            "same_client",
+            "new_client"
+          ],
+          "status": "prototype",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Late Mode",
+          "type": "string"
+        },
+        "late_size_per_node": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "default": 0,
+          "description": "Host bytes per node registered after every rank has finished warmup and CUDA graph capture, when memory used only during startup has been released. 'auto' sizes it per GPU from the late_auto budget.",
+          "status": "prototype",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Late Size Per Node"
+        },
+        "local_buffer_size": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "default": "1GiB",
+          "description": "Transfer buffer of each donor client, on top of the lent sizes.",
+          "status": "prototype",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Local Buffer Size"
+        },
+        "local_hostname": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Address the segments are registered under. Defaults to the interface that routes to the master.",
+          "status": "prototype",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Local Hostname"
+        },
+        "master": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The pool master's 'host:port'. Defaults to $MOONCAKE_MASTER, then to master_server_address in $MOONCAKE_CONFIG_PATH.",
+          "status": "prototype",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Master"
+        },
+        "numa_nodes": {
+          "anyOf": [
+            {
+              "items": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "CPU NUMA nodes to split each node's sizes over. Defaults to every NUMA node with CPUs that this process may allocate on.",
+          "status": "prototype",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Numa Nodes"
+        },
+        "protocol": {
+          "default": "rdma",
+          "description": "Transport the pool reaches this memory over.",
+          "enum": [
+            "rdma",
+            "tcp"
+          ],
+          "status": "prototype",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Protocol",
+          "type": "string"
+        },
+        "startup_size_per_node": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "default": 0,
+          "description": "Host bytes per node registered while the model loads, as a binary size ('512GiB') or a byte count.",
+          "status": "prototype",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Startup Size Per Node"
+        }
+      },
+      "title": "StoreHostDonorConfig",
+      "type": "object"
+    },
+    "StoreHostDonorLateAutoConfig": {
+      "additionalProperties": false,
+      "description": "Size the late donation per GPU from a host-memory budget.\n\nAfter warmup each GPU (rank) lends\n``max(0, host_budget_per_gpu - store_per_gpu - peak - margin_per_gpu\n- startup)``, where ``peak`` is ``head_process_peak_per_gpu`` on the head\nnode (the node that runs the pool master and the frontend) and\n``process_peak_per_gpu`` elsewhere, and ``startup`` is the node's\n``startup_size_per_node`` over its ranks. The result is cut to the job's\nmemory limit and rounded down to ``granularity`` per NUMA node.",
+      "properties": {
+        "granularity": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "default": "1GiB",
+          "description": "Each NUMA node's late share is rounded down to a multiple of this.",
+          "status": "prototype",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Granularity"
+        },
+        "head_hosts": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Host names that count as head nodes. Default: the node the pool master runs on. A node whose role cannot be determined counts as a head node.",
+          "status": "prototype",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Head Hosts"
+        },
+        "head_process_peak_per_gpu": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "description": "Peak process memory per GPU on the head node, frontend included, measured over a full run.",
+          "status": "prototype",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Head Process Peak Per Gpu"
+        },
+        "host_budget_per_gpu": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "description": "Host memory one GPU may account for (store plus process), e.g. a quarter of the node's memory on a 4-GPU node.",
+          "status": "prototype",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Host Budget Per Gpu"
+        },
+        "job_memory_limit": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Memory limit of this job on the node. Default: the tightest cgroup v2 memory.max above this process.",
+          "status": "prototype",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Job Memory Limit"
+        },
+        "margin_per_gpu": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "default": "2560MiB",
+          "description": "Memory per GPU kept out of the donation.",
+          "status": "prototype",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Margin Per Gpu"
+        },
+        "process_peak_per_gpu": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "description": "Peak process memory per GPU on a node without the frontend, measured over a full run.",
+          "status": "prototype",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Process Peak Per Gpu"
+        },
+        "store_per_gpu": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "description": "Host store this GPU already holds outside the donor (the KV connector's global segment). Checked against global_segment_size in $MOONCAKE_CONFIG_PATH when that file is readable.",
+          "status": "prototype",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Store Per Gpu"
+        }
+      },
+      "required": [
+        "host_budget_per_gpu",
+        "store_per_gpu",
+        "process_peak_per_gpu",
+        "head_process_peak_per_gpu"
+      ],
+      "title": "StoreHostDonorLateAutoConfig",
+      "type": "object"
+    },
     "TelemetryConfig": {
       "additionalProperties": false,
       "description": "Telemetry configuration for usage data collection.\n\nControls opt-out behavior and tracks which entry point invoked TRT-LLM.",
@@ -8009,6 +8365,22 @@
       "default": null,
       "description": "Speculative decoding config.",
       "title": "Speculative Config"
+    },
+    "store_host_donor": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/StoreHostDonorConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Host memory this server lends to a Mooncake store pool, registered by the worker itself; needs no KV connector.",
+      "status": "prototype",
+      "telemetry": {
+        "exclude": true
+      }
     },
     "stream_interval": {
       "default": 1,

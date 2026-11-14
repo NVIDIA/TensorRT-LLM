@@ -546,6 +546,7 @@ def config(**fields):
         late_mode="auto",
         late_delay_seconds=0.0,
         late_auto=None,
+        hbm_lend_size_per_gpu=0,
     )
     base.update(fields)
     return SimpleNamespace(**base)
@@ -1193,6 +1194,8 @@ def test_fleet_vote_and_late_phase():
         wait_startup=lambda: calls.append("wait"),
         register_late=lambda: calls.append("late"),
         late_delay_seconds=0.0,
+        hbm_lend=None,
+        lend_hbm=lambda: calls.append("hbm"),
     )
     executor = SimpleNamespace()
     creator._register_store_host_donor_late(executor, donor, FakeDist(0, [None]))
@@ -1202,6 +1205,19 @@ def test_fleet_vote_and_late_phase():
     donor.late_delay_seconds = 5.0
     creator._register_store_host_donor_late(executor, donor, FakeDist(0, [None]))
     assert calls == ["wait"]
+
+    # The GPU memory lend runs after warmup even when the host late size waits.
+    calls.clear()
+    donor.hbm_lend = object()
+    creator._register_store_host_donor_late(executor, donor, FakeDist(0, [None]))
+    assert calls == ["wait", "hbm"]
+
+    # Another rank's failed lend fails this rank too.
+    calls.clear()
+    votes = ScriptedDist([[None, None], [None, "rank 1: lend failed"]])
+    with pytest.raises(RuntimeError, match="rank 1: lend failed"):
+        creator._register_store_host_donor_late(executor, donor, votes)
+    assert calls == ["wait", "hbm"]
 
     with pytest.raises(RuntimeError, match="other ranks"):
         creator._fleet_vote(FakeDist(0, ["rank 3: boom"]), lambda: None)

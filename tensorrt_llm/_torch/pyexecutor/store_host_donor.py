@@ -87,6 +87,8 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional, 
 
 from tensorrt_llm.logger import logger
 
+from .store_hbm_lend import StoreHbmLend
+
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import StoreHostDonorConfig
 
@@ -967,6 +969,7 @@ class StoreHostDonor:
         egm_max_clients: int = EGM_MAX_CLIENTS_DEFAULT,
         egm_spill: bool = True,
         egm_usable: Callable[[int], Optional[int]] = node_egm_usable_bytes,
+        hbm_lend: Optional[StoreHbmLend] = None,
     ) -> None:
         if late_mode not in ("auto", "same_client", "new_client"):
             raise ValueError(f"{LOG_TAG}: unknown late_mode {late_mode!r}")
@@ -1026,6 +1029,8 @@ class StoreHostDonor:
         #: {node: bytes failed setups left kept}], retried in the background.
         self._egm_late_short: List[List[Any]] = []
         self._egm_late_retry_thread: Optional[threading.Thread] = None
+        #: GPU memory this rank lends next to the host shares, or None.
+        self.hbm_lend = hbm_lend
         if self.egm:
             egm_wheel_check(None if store_factory is _default_store_factory else store_factory)
             latched = latch_egm_environment()
@@ -2051,6 +2056,11 @@ class StoreHostDonor:
         )
         self._late_thread.start()
 
+    def lend_hbm(self) -> None:
+        """Lend this rank's GPU memory (after warmup, before serving)."""
+        if self.hbm_lend is not None:
+            self.hbm_lend.mount(self._hostname())
+
     # -- shutdown -------------------------------------------------------------
 
     def close(self) -> bool:
@@ -2079,6 +2089,8 @@ class StoreHostDonor:
         with self._lock:
             pending = list(self._registrations)
         ok = True
+        if self.hbm_lend is not None:
+            ok = self.hbm_lend.close()
         # Segments mounted on another registration's client go first; a client
         # is closed only once nothing mounted on it is left.
         for reg in sorted(pending, key=lambda r: r.own_client):
@@ -2259,9 +2271,23 @@ def _build_donor(config, rank, local_rank, local_size, environ, numa_nodes, dono
             "egm_spill": egm_lend_spill(environ),
             **donor_kwargs,
         }
+    hbm = _parse(config.hbm_lend_size_per_gpu)
     device_name = config.device_name
     if device_name is None:
-        device_name = _default_device_name(config.protocol) if shares and not egm else ""
+        device_name = _default_device_name(config.protocol) if (shares or hbm) and not egm else ""
+    if hbm > 0:
+        donor_kwargs = {
+            "hbm_lend": StoreHbmLend(
+                size=hbm,
+                master=master,
+                protocol=EGM_PROTOCOL if egm else config.protocol,
+                device_name="" if egm else device_name,
+                metadata_server=METADATA_SERVER,
+                rank=rank,
+                store_factory=donor_kwargs.get("store_factory", _default_store_factory),
+            ),
+            **donor_kwargs,
+        }
     donor = StoreHostDonor(
         master=master,
         shares=shares,
@@ -2294,6 +2320,7 @@ def _build_donor(config, rank, local_rank, local_size, environ, numa_nodes, dono
         "master": master,
         "late_mode": config.late_mode,
         "late_delay_seconds": config.late_delay_seconds,
+        "hbm_lend_per_gpu": hbm,
     }
     if egm:
         plan.update(memory="egm", protocol=EGM_PROTOCOL, late_mode=donor.late_mode)

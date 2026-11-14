@@ -963,6 +963,7 @@ def test_start_from_config_with_the_knob(monkeypatch, logs):
         local_hostname="10.0.0.2",
         late_mode="auto",
         late_delay_seconds=0.0,
+        hbm_lend_size_per_gpu=0,
     )
     node = Node()
     donor = shd.start_store_host_donor(

@@ -1613,13 +1613,16 @@ def _register_store_host_donor_late(py_executor: PyExecutor,
     """Finish the donor once the final executor's warmup is done everywhere.
 
     The startup registrations are joined, then (with no late delay) the late
-    ones run, each step followed by a vote so that one rank's failure fails
-    all ranks instead of leaving them in a collective.
+    ones run, then the GPU memory lend, each step followed by a vote so that
+    one rank's failure fails all ranks instead of leaving them in a
+    collective.
     """
     py_executor.store_host_donor = donor
     _fleet_vote(dist, donor.wait_startup)
     if donor.late_delay_seconds == 0:
         _fleet_vote(dist, donor.register_late)
+    if donor.hbm_lend is not None:
+        _fleet_vote(dist, donor.lend_hbm)
 
 
 @functools.wraps(_create_py_executor_impl)

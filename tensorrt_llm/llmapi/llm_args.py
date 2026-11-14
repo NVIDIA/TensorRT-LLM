@@ -3152,10 +3152,21 @@ class StoreHostDonorConfig(StrictBaseModel):
         telemetry=False,
         description="Budget the late size is computed from when "
         "late_size_per_node is 'auto'.")
+    hbm_lend_size_per_gpu: Union[StrictInt, str] = Field(
+        0,
+        status="prototype",
+        telemetry=False,
+        description="GPU memory each rank lends to the pool, as a binary size "
+        "('64GiB') or a byte count. It is allocated after warmup and CUDA "
+        "graph capture, from memory the KV cache left free, and needs a "
+        "Mooncake release with MooncakeDistributedStore.mount_buffer; with an "
+        "older release nothing is lent. Needs the rdma protocol, or the NVLink "
+        "store under TLLM_MOONCAKE_STORE_EGM=1.")
 
     @field_validator("startup_size_per_node",
                      "late_size_per_node",
                      "local_buffer_size",
+                     "hbm_lend_size_per_gpu",
                      mode="after")
     @classmethod
     def _check_size(cls, value, info: ValidationInfo):
@@ -3193,11 +3204,14 @@ class StoreHostDonorConfig(StrictBaseModel):
                 "together; set both or neither.")
         if auto:
             return self
-        if (parse_size(self.startup_size_per_node, strict_units=True) == 0 and
-                parse_size(self.late_size_per_node, strict_units=True) == 0):
+        if (parse_size(self.startup_size_per_node, strict_units=True) == 0
+                and parse_size(self.late_size_per_node, strict_units=True) == 0
+                and parse_size(self.hbm_lend_size_per_gpu,
+                               strict_units=True) == 0):
             raise ValueError(
-                "store_host_donor lends nothing: set startup_size_per_node "
-                "and/or late_size_per_node, or drop store_host_donor.")
+                "store_host_donor lends nothing: set startup_size_per_node, "
+                "late_size_per_node and/or hbm_lend_size_per_gpu, or drop "
+                "store_host_donor.")
         return self
 
 
