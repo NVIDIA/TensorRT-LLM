@@ -17,6 +17,7 @@
 import asyncio
 import os
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -216,6 +217,180 @@ def test_watchdog_notices_a_gone_launcher_process(tmp_path) -> None:
 
     asyncio.run(run())
     assert len(deaths) == 1 and "exited" in str(deaths[0])
+
+
+@pytest.mark.parametrize("by_signal", [False, True], ids=["should_exit", "sigint"])
+def test_attached_frontends_reach_the_launcher_until_they_exit(
+    tmp_path, monkeypatch, by_signal
+) -> None:
+    """Check that the launcher serves its socket while its attached frontends drain.
+
+    Once uvicorn begins its shutdown, the launcher stops its attached frontends. Its /health
+    stays truthful until they exit, so their watchdogs still see an engine that fails during
+    the drain. Only then does the launcher shut the engine down. A SIGINT reaches the HTTP
+    server first and, once both servers stop, the handler installed before serving.
+    """
+    launcher_path = str(tmp_path / "launcher.sock")
+    engine = SimpleNamespace(healthy=True)
+    events, deaths, servers = [], [], []
+    create_uvicorn_server = openai_server.create_uvicorn_server
+
+    def create_server(config):
+        servers.append(create_uvicorn_server(config))
+        return servers[-1]
+
+    async def stop_attached_frontends(force_exit) -> None:
+        events.append("attached frontends stopping")
+        forwarder = LauncherForwarder(launcher_path)
+        watchdog = AttachedFrontendWatchdog(
+            forwarder,
+            os.getppid(),
+            deaths.append,
+            ppid_interval_s=0.01,
+            health_interval_s=0.02,
+            health_failures=2,
+        )
+        try:
+            assert await forwarder.get_status("/health") == 200
+            task = asyncio.create_task(watchdog.run())
+            await asyncio.sleep(0.2)
+            engine.healthy = False
+            await asyncio.wait_for(task, timeout=5)
+        finally:
+            await forwarder.close()
+        events.append("attached frontends exited")
+
+    monkeypatch.setattr(openai_server, "create_uvicorn_server", create_server)
+    monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path / "media"))
+    generator = SimpleNamespace(
+        _check_health=lambda: engine.healthy,
+        shutdown=lambda: events.append("engine shut down"),
+    )
+    # A VisualGen server needs no model to load.
+    with mock.patch.object(openai_server, "_is_visual_gen_instance", return_value=True):
+        server = OpenAIServer(
+            generator=generator,
+            model="dummy",
+            tool_parser=None,
+            server_role=ServerRole.VISUAL_GEN,
+            metadata_server_cfg=None,
+            stop_attached_frontends=stop_attached_frontends,
+        )
+    listeners = []
+    for path in (str(tmp_path / "http.sock"), launcher_path):
+        listeners.append(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM))
+        listeners[-1].bind(path)
+        listeners[-1].listen()
+    serve = server("localhost", 0, sockets=listeners)
+    if by_signal:
+        signals = []
+        previous_handler = signal.signal(signal.SIGINT, lambda sig, frame: signals.append(sig))
+
+        async def interrupt_once_started() -> None:
+            while not (servers and servers[0].started):
+                await asyncio.sleep(0.01)
+            signal.raise_signal(signal.SIGINT)
+
+        async def run() -> None:
+            interrupting = asyncio.create_task(interrupt_once_started())
+            await serve
+            await interrupting
+
+        try:
+            asyncio.run(asyncio.wait_for(run(), timeout=30))
+        finally:
+            signal.signal(signal.SIGINT, previous_handler)
+            for listener in listeners:
+                listener.close()
+        assert signals == [signal.SIGINT]
+    else:
+        # Off the main thread uvicorn installs no signal handlers.
+        serving = threading.Thread(target=asyncio.run, args=(serve,))
+        serving.start()
+        try:
+            deadline = time.monotonic() + 30
+            while not (servers and servers[0].started):
+                assert serving.is_alive() and time.monotonic() < deadline, (
+                    "the server did not start"
+                )
+                time.sleep(0.01)
+            assert not events
+            servers[0].should_exit = True
+            serving.join(30)
+        finally:
+            for listener in listeners:
+                listener.close()
+        assert not serving.is_alive()
+
+    assert len(deaths) == 1 and "failed 2 consecutive" in str(deaths[0])
+    assert events == [
+        "attached frontends stopping",
+        "attached frontends exited",
+        "engine shut down",
+    ]
+
+
+def test_launcher_socket_server_keeps_the_graceful_shutdown_timeout(tmp_path, monkeypatch) -> None:
+    """Check that the launcher's Unix socket server bounds its graceful shutdown too.
+
+    A request forwarded by an attached frontend must not keep the launcher waiting without
+    bound after the HTTP server stopped.
+    """
+    configs = []
+
+    class _RecordingServer:
+        def __init__(self, config) -> None:
+            configs.append(config)
+            self.started = True
+            self.should_exit = False
+            self.force_exit = False
+
+        async def serve(self, sockets=None) -> None:
+            self.should_exit = True
+
+    async def stop_attached_frontends(force_exit) -> None:
+        pass
+
+    monkeypatch.setattr(openai_server, "create_uvicorn_server", _RecordingServer)
+    monkeypatch.setattr(openai_server.uvicorn, "Server", _RecordingServer)
+    monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path / "media"))
+    # A VisualGen server needs no model to load.
+    with mock.patch.object(openai_server, "_is_visual_gen_instance", return_value=True):
+        server = OpenAIServer(
+            generator=SimpleNamespace(),
+            model="dummy",
+            tool_parser=None,
+            server_role=ServerRole.VISUAL_GEN,
+            metadata_server_cfg=None,
+            graceful_shutdown_timeout=7,
+            stop_attached_frontends=stop_attached_frontends,
+        )
+    sockets = [SimpleNamespace(family=socket.AF_INET), SimpleNamespace(family=socket.AF_UNIX)]
+    asyncio.run(server("localhost", 0, sockets=sockets))
+    assert [config.timeout_graceful_shutdown for config in configs] == [7, 7]
+
+
+def test_force_exit_kills_attached_frontends_that_still_drain() -> None:
+    """Check that a second Ctrl-C ends the wait for attached frontends without a deadline."""
+    ignores_sigterm = (
+        "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "print(flush=True); time.sleep(60)"
+    )
+    child = subprocess.Popen([sys.executable, "-c", ignores_sigterm], stdout=subprocess.PIPE)
+    try:
+        child.stdout.readline()
+        forced_at = time.monotonic() + 0.5
+
+        def force_exit() -> bool:
+            return time.monotonic() >= forced_at
+
+        asyncio.run(_frontend_processes._drain_attached_frontends([child], None, force_exit))
+        assert time.monotonic() - forced_at < 5
+        assert child.returncode == -signal.SIGKILL
+    finally:
+        child.kill()
+        child.wait()
+        child.stdout.close()
 
 
 def test_launcher_logs_an_attached_frontend_that_dies(monkeypatch) -> None:
