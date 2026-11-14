@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import importlib
 import os
 import tempfile
 
@@ -12,14 +11,14 @@ from ...api import Footprint, StageFn
 
 
 def knobs_table():
-    """The process-wide legacy knob table every sparse-layer _src copy reads as `_K`."""
+    """The process-wide knob table the hoist block's host modules read as `_K`."""
     from ...runtime.knobs import KNOBS
 
     return KNOBS
 
 
 def build_root(tag: str) -> str:
-    """Node-local build root for legacy torch-extension builds, never a shared filesystem."""
+    """Node-local build root for the host modules' torch-extension builds, never a shared filesystem."""
     d = os.path.join(tempfile.gettempdir(), "minimax_m3_tp4_front", tag)
     os.makedirs(d, exist_ok=True)
     return d
@@ -32,11 +31,6 @@ def bind(owner: str, values: dict) -> None:
     if unset:
         raise ValueError(f"{owner}: {unset} must be unset (bound {[K[k] for k in unset]})")
     K.bind({k: str(v) for k, v in values.items() if v is not None}, owner)
-
-
-def legacy(name: str):
-    """Import a legacy module; the core finder serves it from this preset's _src copies (Variant.legacy_modules)."""
-    return importlib.import_module(name)
 
 
 def g3_knobs(llk) -> dict:
@@ -57,4 +51,4 @@ def stage(variant, fn, *, reads, writes, pdl, footprint=Footprint(), keys=()):
     )
 
 
-__all__ = ["bind", "build_root", "g3_knobs", "knobs_table", "legacy", "stage"]
+__all__ = ["bind", "build_root", "g3_knobs", "knobs_table", "stage"]

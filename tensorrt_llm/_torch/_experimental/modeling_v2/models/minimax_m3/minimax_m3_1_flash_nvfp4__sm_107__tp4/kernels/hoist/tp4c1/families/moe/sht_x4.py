@@ -12,10 +12,6 @@ from ...api import CuteModule, Params, PdlSpec, Spin, Variant, params
 from . import _common as C
 
 NAME = "sht-x4"
-FACTORY = (
-    "tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3."
-    "minimax_m3_1_flash_nvfp4__sm_107__tp4.kernels.hoist.tp4c1.kernels.moe.engine.fused_shared_trigger_host:make_x4_sht"
-)
 
 
 @params
@@ -94,7 +90,10 @@ WRITES = ("ffn_out",)
 
 def make(blk, p: ShtX4Params):
     C.bind(VARIANT.id, runtime_knobs(p, blk.llk))
-    fn = C.legacy_attr(FACTORY)(blk)
+    # Imported after the bind: the host module reads its knobs at import.
+    from ...kernels.moe.engine.fused_shared_trigger_host import make_x4_sht
+
+    fn = make_x4_sht(blk)
     return C.stage(VARIANT, fn, reads=READS, writes=WRITES, pdl=PDL, footprint=C.UNMEASURED)
 
 

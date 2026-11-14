@@ -4,7 +4,7 @@
 
 Every seam replaces process plumbing, never arithmetic or launch order:
 
-1. ``load``: imports the ``tp4c1`` package (its modules import each other by absolute name and by dotted strings).
+1. ``load``: imports the ``tp4c1`` package (its modules import each other statically).
 2. ``toolchain.paths.csrc_root``: a path never read (seam 5 stands in for every source the reference would hash).
 3. ``dist``: the reference modules' ``torch.distributed`` is a facade over this target's TP MPI communicator
    (rank / world / barrier / all_gather_object); no torch.distributed or gloo group is created.

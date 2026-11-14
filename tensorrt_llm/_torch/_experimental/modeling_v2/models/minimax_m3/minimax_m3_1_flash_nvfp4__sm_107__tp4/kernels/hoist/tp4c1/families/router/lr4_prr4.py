@@ -12,14 +12,6 @@ from ...api import CuteModule, NvccModule, Params, PdlSpec, Spin, Variant, param
 from ..moe import _common as C
 
 NAME = "lr4-prr4"
-F_OPROJ = (
-    "tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3."
-    "minimax_m3_1_flash_nvfp4__sm_107__tp4.kernels.hoist.tp4c1.kernels.comm.allreduce_norm_quant.route_warp_tp4_host:make_oproj_ra4_p"
-)
-F_POST = (
-    "tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3."
-    "minimax_m3_1_flash_nvfp4__sm_107__tp4.kernels.hoist.tp4c1.kernels.comm.allreduce_norm_quant.route_warp_tp4_host:make_post_rh_x4_p"
-)
 HDR_HASH = "10d611694e7b"  # src_hash() of the host module that builds this post
 
 
@@ -110,8 +102,11 @@ WRITES = ("attn_partial", "residual_out", "moe_in", "moe_in_q", "route")
 
 def make(blk, p: Lr4Prr4Params):
     C.bind(VARIANT.id, runtime_knobs(p, blk.llk))
-    f_oproj = C.legacy_attr(F_OPROJ)(blk)
-    f_post = C.legacy_attr(F_POST)(blk)
+    # Imported after the bind: the host module reads its knobs at import.
+    from ...kernels.comm.allreduce_norm_quant import route_warp_tp4_host as rw4
+
+    f_oproj = rw4.make_oproj_ra4_p(blk)
+    f_post = rw4.make_post_rh_x4_p(blk)
     return C.stage(
         VARIANT,
         C.chain(f_oproj, f_post),

@@ -13,10 +13,6 @@ from . import _common as C
 from .sht_x4 import engine_pdl
 
 NAME = "sht4-n48"
-FACTORY = (
-    "tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3."
-    "minimax_m3_1_flash_nvfp4__sm_107__tp4.kernels.hoist.tp4c1.kernels.moe.engine.fused_tp4_host:make_x4_sht4_n48"
-)
 
 
 @params
@@ -73,10 +69,10 @@ WRITES = ("ffn_out",)
 
 def make(blk, p: Sht4N48Params):
     C.bind(VARIANT.id, runtime_knobs(p, blk.llk))
-    moe4 = C.legacy(
-        "tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp4.kernels.hoist.tp4c1.kernels.moe.engine.fused_tp4_host"
-    )
-    fn = moe4._sht_n(blk, p.nsh)
+    # Imported after the bind: the host module reads its knobs at import.
+    from ...kernels.moe.engine import fused_tp4_host
+
+    fn = fused_tp4_host._sht_n(blk, p.nsh)
     return C.stage(VARIANT, fn, reads=READS, writes=WRITES, pdl=PDL, footprint=C.UNMEASURED)
 
 

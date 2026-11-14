@@ -454,26 +454,9 @@ def _dynamic_import_problem(call: ast.Call, package: str, loaders: set[str]) -> 
 # Calls CBTS cannot read but that load only the caller's own target, keyed by
 # file and enclosing function. A change inside a target selects the whole target, so
 # these hide nothing from CBTS.
-# The MiniMax-M3.1-Flash sm_107 tp4 target's hoisted MoE-boundary block package.
-_TP4_HOIST = "models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp4/kernels/hoist/tp4c1"
 _CONFINED_DYNAMIC_IMPORTS = {
     "models/glm_moe_dsa/glm_5_2_nvfp4__sm_103__tp8/dispatch.py:get_impl": (
         "loads the target's own kernels package (KERNELS_PACKAGE, modeling._KERNEL_MODULES)"
-    ),
-    f"{_TP4_HOIST}/families/front/_bind.py:legacy": (
-        "loads a module of the target's own hoist block package by its dotted name"
-    ),
-    f"{_TP4_HOIST}/families/moe/_common.py:legacy": (
-        "loads a module of the target's own hoist block package by its dotted name"
-    ),
-    f"{_TP4_HOIST}/kernels/common/host_hooks.py:get": (
-        "loads the host hook the target's hoist block registered ('module:attribute')"
-    ),
-    f"{_TP4_HOIST}/kernels/common/stock_stages.py:resolve": (
-        "loads a stage factory of the target's own hoist block ('module:attribute')"
-    ),
-    f"{_TP4_HOIST}/kernels/moe/engine/router_hoist_host.py:_c2_build": (
-        "loads an engine factory of the target's own hoist block ('module:attribute')"
     ),
 }
 

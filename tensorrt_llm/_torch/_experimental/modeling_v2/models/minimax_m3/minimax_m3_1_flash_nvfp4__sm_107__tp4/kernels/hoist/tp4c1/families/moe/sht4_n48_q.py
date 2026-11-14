@@ -11,13 +11,6 @@ from . import _common as C
 from . import sht4_n48 as B
 
 NAME = "sht4-n48-q"
-PT4 = (
-    "tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3."
-    "minimax_m3_1_flash_nvfp4__sm_107__tp4.kernels.hoist.tp4c1.kernels.comm.allreduce_norm_quant.route_warp_tp4_fc1_per_token_host"
-)
-FACTORY = f"{PT4}:make_moe_pt"
-PREP = f"{PT4}:prep_mw"
-
 MODULES = (CuteModule("moe", NAME, "engine", "kernels/moe/engine/fused"),)
 
 
@@ -29,8 +22,11 @@ def make(blk, p: B.Sht4N48Params):
     if not p.sh_trig or not p.b2img:
         raise ValueError(f"{VARIANT.id}: the mode-Q engine needs sh_trig 1 and b2img 1")
     C.bind(VARIANT.id, runtime_knobs(p, blk.llk))
-    C.legacy_attr(PREP)(blk.mw)
-    fn = C.legacy_attr(FACTORY)(blk)
+    # Imported after the bind: the host module reads its knobs at import.
+    from ...kernels.comm.allreduce_norm_quant import route_warp_tp4_fc1_per_token_host as pt4
+
+    pt4.prep_mw(blk.mw)
+    fn = pt4.make_moe_pt(blk)
     return C.stage(VARIANT, fn, reads=B.READS, writes=B.WRITES, pdl=B.PDL, footprint=C.UNMEASURED)
 
 

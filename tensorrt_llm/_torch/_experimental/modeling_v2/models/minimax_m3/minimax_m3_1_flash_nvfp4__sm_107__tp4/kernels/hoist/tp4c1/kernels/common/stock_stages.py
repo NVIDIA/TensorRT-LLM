@@ -3,13 +3,12 @@
 """Stock stages of one M3 sparse/MoE decoder layer (vLLM fe1d68261 op sequence) and the swap registry.
 
 Every stage is built by a factory ``make(blk) -> fn`` and ``fn()`` takes no arguments: it reads its inputs from and
-writes its outputs to attributes of the per-layer state ``blk`` (see HARNESS.md for the buffer contract). A swap
-replaces a factory; the name ``none`` removes a stage (for a fused op that covers several stages).
+writes its outputs to attributes of the per-layer state ``blk``. A swap
+replaces a factory with another factory callable; the name ``none`` removes a stage (for a fused op that covers
+several stages).
 """
 
 from __future__ import annotations
-
-import importlib
 
 import torch
 
@@ -245,12 +244,13 @@ def join_aux(blk):
 STOCK = {n: globals()[f"make_{n}"] for n in ALL_STAGES}
 
 
-def resolve(spec: str):
-    """``module:attr`` -> factory; ``none`` -> stage removed; ``stock`` -> stock factory (caller handles)."""
+def resolve(spec):
+    """A factory callable -> itself; ``none`` -> stage removed; ``stock`` -> stock factory (caller handles)."""
     if spec == "none":
         return None
-    mod, attr = spec.split(":")
-    return getattr(importlib.import_module(mod), attr)
+    if not callable(spec):
+        raise TypeError(f"stage swap {spec!r} is neither 'none' nor a factory callable")
+    return spec
 
 
 class Stock_AR:
