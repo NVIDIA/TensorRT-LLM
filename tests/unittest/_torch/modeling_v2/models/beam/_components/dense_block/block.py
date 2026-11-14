@@ -33,7 +33,8 @@ RMSNorm and the dense activation follow their FlashInfer operator contracts.
 from __future__ import annotations
 
 from collections import OrderedDict
-from typing import Mapping
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Mapping
 
 import torch
 from torch import nn
@@ -52,6 +53,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.residual.beam
     depth_scales,
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+
+if TYPE_CHECKING:
+    from transformers import PretrainedConfig
 
 #: The configuration this component computes, as the checkpoint's config.json states it.
 #: Anything else is rejected at construction rather than computed approximately.
@@ -77,7 +81,9 @@ SUPPORTED_ROPE = {"rope_type": "default", "rope_theta": 10000.0}
 MAX_TOKENS = 1024
 
 
-def weight_shapes(config) -> "OrderedDict[str, tuple[int, ...]]":
+def weight_shapes(
+    config: PretrainedConfig | SimpleNamespace,
+) -> "OrderedDict[str, tuple[int, ...]]":
     """The block's fifteen tensors by checkpoint name, in checkpoint order, [out, in] for matrices."""
     hidden, inter = config.hidden_size, config.intermediate_size
     q_width = config.num_attention_heads * config.head_dim
