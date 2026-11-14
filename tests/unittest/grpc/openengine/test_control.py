@@ -128,7 +128,7 @@ def _llm(**overrides):
             supports_token_ids_input=overrides.get("_supports_token_ids_input", True)
         ),
         _executor=executor,
-        _check_health=lambda: executor.check_health(),
+        check_health=lambda: executor.check_health(),
     )
 
 
@@ -610,7 +610,7 @@ async def test_health_reports_not_ready_for_a_crashed_engine_that_is_not_shut_do
 async def test_health_survives_a_raising_health_check(error_type):
     """A probe reports state; it must not turn an engine fault into an RPC error."""
     llm = _llm()
-    llm._check_health = lambda: (_ for _ in ()).throw(error_type("engine gone"))
+    llm.check_health = lambda: (_ for _ in ()).throw(error_type("engine gone"))
     servicer = OpenEngineControlServicer(llm, MODEL, _inference(), kv_transfer_backend="")
 
     response = await servicer.Health(lifecycle_pb2.HealthRequest(), FakeServicerContext())

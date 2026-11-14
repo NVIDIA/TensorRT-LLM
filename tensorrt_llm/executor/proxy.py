@@ -485,6 +485,15 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         return True
 
+    @property
+    def engine_dead(self) -> bool:
+        """Whether the engine is known dead (a worker died or a fatal error was recorded).
+
+        ``_mark_engine_dead`` can set the sticky flag before the fatal error
+        is recorded, so check both.
+        """
+        return self._engine_dead or self._fatal_error is not None
+
     def _set_fatal_error(self, error: BaseException) -> None:
         """Record the fatal error, then unblock every pending request.
 

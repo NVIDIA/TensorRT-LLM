@@ -20,9 +20,11 @@ Tests cover:
 - GenerationExecutor.check_health(), _set_fatal_error(), is_shutdown()
 - GenerationExecutorProxy.check_health() with MPI worker liveness
 - GenerationExecutorProxy._error_monitor_loop() background detection
-- GrpcRequestManager.health_check() integration
-- OpenAIServer /health endpoint with fatal error shutdown
-- BaseLLM._check_health() delegation
+
+Frontend health is tested against production code in
+tests/unittest/llmapi/test_llm_public_runtime_api.py,
+tests/unittest/serve/test_serve_health.py and
+tests/unittest/grpc/smg/test_smg_health.py.
 """
 
 # Import classify_error directly from the source file to avoid triggering
@@ -30,14 +32,13 @@ Tests cover:
 import importlib.util
 import logging
 import pathlib
-import signal
 import subprocess
 import sys
 import threading
 import time
 from concurrent.futures import Future
 from queue import Empty, Queue
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -825,157 +826,6 @@ class TestErrorMonitorLoop:
         t.join(timeout=2.0)
 
         assert not t.is_alive()
-
-
-# ---------------------------------------------------------------------------
-# gRPC health check
-# ---------------------------------------------------------------------------
-class TestGrpcHealthCheck:
-    """Tests for gRPC health check integration with fatal error state."""
-
-    @staticmethod
-    async def _health_check(self):
-        """Mirrors GrpcRequestManager.health_check logic."""
-        try:
-            if self.llm is None:
-                return False, "LLM not initialized"
-            if hasattr(self.llm, "_executor"):
-                if self.llm._executor is None:
-                    return False, "Executor is not available"
-                if not self.llm._executor.check_health():
-                    error_msg = "Executor is unhealthy"
-                    if self.llm._executor._fatal_error is not None:
-                        exc = self.llm._executor._fatal_error
-                        short = str(exc).splitlines()[0][:200]
-                        error_msg = f"{type(exc).__name__}: {short}"
-                    return False, error_msg
-            return True, "OK"
-        except Exception as e:
-            return False, f"Error: {e}"
-
-    def _make_manager(self, executor=None):
-        """Create a mock gRPC manager with the given executor."""
-        m = MagicMock()
-        m.llm = MagicMock()
-        m.llm._executor = executor
-        m.health_check = self._health_check.__get__(m)
-        return m
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        "setup,expected_healthy,msg_substr",
-        [
-            ("healthy", True, "OK"),
-            ("fatal", False, "CUDA OOM"),
-            ("no_executor", False, "not available"),
-            ("no_llm", False, "not initialized"),
-            ("shutdown", False, "unhealthy"),
-        ],
-    )
-    async def test_health_check(self, setup, expected_healthy, msg_substr):
-        """Verify gRPC health check returns correct status and message."""
-        if setup == "no_llm":
-            m = MagicMock()
-            m.llm = None
-            m.health_check = self._health_check.__get__(m)
-        else:
-            ex = ConcreteExecutor()
-            if setup == "fatal":
-                ex._set_fatal_error(RuntimeError("CUDA OOM"))
-            elif setup == "no_executor":
-                ex = None
-            elif setup == "shutdown":
-                ex.doing_shutdown = True
-            m = self._make_manager(ex)
-
-        healthy, msg = await m.health_check()
-        assert healthy is expected_healthy
-        assert msg_substr in msg
-
-
-# ---------------------------------------------------------------------------
-# OpenAI /health endpoint
-# ---------------------------------------------------------------------------
-class TestOpenAIHealthEndpoint:
-    """Tests for OpenAI /health endpoint with fatal error shutdown."""
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        "check_healthy,fatal_error,expect_code,sigint",
-        [
-            (True, None, 200, False),
-            (False, None, 503, False),
-            (False, RuntimeError("CUDA OOM"), 503, True),
-        ],
-    )
-    async def test_health(self, check_healthy, fatal_error, expect_code, sigint):
-        """Verify status code and SIGINT behavior for different health states."""
-        from starlette.responses import Response
-
-        server = MagicMock()
-        server._check_health = Mock(return_value=check_healthy)
-        executor = Mock()
-        executor._fatal_error = fatal_error
-        executor.doing_shutdown = False
-        server.generator = Mock()
-        server.generator._executor = executor
-
-        with patch.object(signal, "raise_signal") as mock_sig:
-            if server._check_health():
-                response = Response(status_code=200)
-            else:
-                ex = getattr(server.generator, "_executor", None)
-                if (
-                    ex is not None
-                    and getattr(ex, "_fatal_error", None) is not None
-                    and not getattr(ex, "doing_shutdown", True)
-                ):
-                    signal.raise_signal(signal.SIGINT)
-                response = Response(status_code=503)
-
-            assert response.status_code == expect_code
-            if sigint:
-                mock_sig.assert_called_once_with(signal.SIGINT)
-            else:
-                mock_sig.assert_not_called()
-
-
-# ---------------------------------------------------------------------------
-# BaseLLM._check_health delegation
-# ---------------------------------------------------------------------------
-class TestBaseLLMCheckHealth:
-    """Tests for BaseLLM._check_health delegation to executor."""
-
-    @staticmethod
-    def _check_health(llm) -> bool:
-        """Mirrors BaseLLM._check_health logic."""
-        if hasattr(llm, "_executor") and llm._executor is not None:
-            return llm._executor.check_health()
-        return False
-
-    @pytest.mark.parametrize(
-        "has_executor,fatal,expected",
-        [
-            (True, False, True),
-            (True, True, False),
-            (False, False, False),
-        ],
-    )
-    def test_delegation(self, has_executor, fatal, expected):
-        """_check_health delegates to executor.check_health correctly."""
-        llm = Mock()
-        if has_executor:
-            ex = ConcreteExecutor()
-            if fatal:
-                ex._set_fatal_error(RuntimeError("x"))
-            llm._executor = ex
-        else:
-            llm._executor = None
-        assert self._check_health(llm) is expected
-
-    def test_no_executor_attr(self):
-        """Returns False when the object has no _executor attribute."""
-        assert self._check_health(object()) is False
 
 
 # ---------------------------------------------------------------------------

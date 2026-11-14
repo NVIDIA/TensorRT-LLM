@@ -320,6 +320,8 @@ l0_cpu:
   - unittest/grpc/openengine/test_openengine.py
   - unittest/grpc/openengine/test_metrics.py
   - unittest/grpc/openengine/test_servicer.py
+  - unittest/grpc/openengine/test_private_access_lint_openengine.py
+  - unittest/grpc/smg/test_smg_health.py
   - unittest/grpc/smg/test_smg.py::test_streaming_deltas_preserve_sequences_logprobs_and_final_tokens
   - unittest/grpc/smg/test_smg.py::test_streaming_empty_token_history
   - unittest/grpc/test_grpc_optional.py::test_protobuf_warning_in_fresh_process
@@ -391,6 +393,7 @@ l0_cpu:
   - unittest/llmapi/test_llm_args.py
   - unittest/llmapi/test_llm.py::test_startup_metrics_by_server_info
   - unittest/llmapi/test_gms_args.py
+  - unittest/llmapi/test_llm_public_runtime_api.py
   - unittest/llmapi/test_mx_args.py
   - unittest/llmapi/test_custom_tokenizer_aliases.py
   # Reads the Muse Spark Open tokenizer files from LLM_MODELS_ROOT.

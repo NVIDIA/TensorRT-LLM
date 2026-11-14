@@ -1248,9 +1248,11 @@ class OpenAIServer(_VideoRoutesMixin):
         batcher = self.embedding_batcher
         if batcher is not None and not batcher.is_alive():
             return False
-        if hasattr(self.generator, '_check_health'):
-            return self.generator._check_health()
-        return True
+        if self._is_visual_gen:
+            # VisualGen has no check_health(), so its /health always
+            # answers 200.
+            return True
+        return self.generator.check_health()
 
     def register_routes(self):
         self.app.add_api_route("/health", self.health, methods=["GET"])
@@ -1748,15 +1750,14 @@ class OpenAIServer(_VideoRoutesMixin):
             # its graceful shutdown sequence.  The doing_shutdown guard
             # ensures we only send SIGINT once — repeated health probes
             # won't stack signals during an in-progress teardown.
-            executor = getattr(self.generator, '_executor', None)
-            if executor is not None and getattr(executor, '_fatal_error',
-                                                None) is not None:
-                if not getattr(executor, 'doing_shutdown', True):
-                    logger.error(
-                        "Health check detected fatal engine error, initiating "
-                        f"server shutdown: {executor._fatal_error}")
-                    _record_generator_termination(self.generator)
-                    signal.raise_signal(signal.SIGINT)
+            fatal_error = (None if self._is_visual_gen else
+                           self.generator.fatal_error)
+            if fatal_error is not None and not self.generator.shutdown_started:
+                logger.error(
+                    "Health check detected fatal engine error, initiating "
+                    f"server shutdown: {fatal_error}")
+                _record_generator_termination(self.generator)
+                signal.raise_signal(signal.SIGINT)
             return Response(
                 status_code=503,
                 content=

@@ -544,6 +544,10 @@ methods:
         default: 2
     return_annotation: tensorrt_llm.executor.result.IterationResult
     status: beta
+  check_health:
+    parameters: {}
+    return_annotation: bool
+    status: prototype
   get_data_transceiver_state:
     parameters: {}
     return_annotation: bytes
@@ -600,3 +604,12 @@ properties:
   startup_metrics:
     annotation: dict
     default: None
+  fatal_error:
+    annotation: Optional[BaseException]
+    default: inspect._empty
+  shutdown_started:
+    annotation: bool
+    default: inspect._empty
+  engine_dead:
+    annotation: bool
+    default: inspect._empty

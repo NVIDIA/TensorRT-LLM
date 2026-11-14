@@ -140,23 +140,19 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
     def _engine_is_healthy(self) -> bool:
         """Readiness via the predicate the engine's own HTTP /health uses.
 
-        `_check_health` is stronger than the `is_shutdown()` guard generate_async
+        `check_health()` is stronger than the `is_shutdown()` guard generate_async
         raises on: it drains the executor's error queue, so a fatal error queued
         but not yet promoted is caught, and the proxy polls MPI worker liveness.
-        It also covers encode-only engines, where `_executor` is None.
+        It also covers encode-only engines, where there is no generation executor.
         """
-        check = getattr(self._llm, "_check_health", None)
-        if callable(check):
-            try:
-                return bool(check())
-            except (RuntimeError, ValueError, OSError) as error:
-                logger.warning(f"OpenEngine health check reported a failure: {error}")
-                return False
-            except (TypeError, AttributeError) as error:
-                logger.error(f"OpenEngine health check contract failed: {error}")
-                return False
-        executor = getattr(self._llm, "_executor", None)
-        return executor is not None and not executor.is_shutdown()
+        try:
+            return bool(self._llm.check_health())
+        except (RuntimeError, ValueError, OSError) as error:
+            logger.warning(f"OpenEngine health check reported a failure: {error}")
+            return False
+        except (TypeError, AttributeError) as error:
+            logger.error(f"OpenEngine health check contract failed: {error}")
+            return False
 
     # -- Runtime metadata ---------------------------------------------------
 
