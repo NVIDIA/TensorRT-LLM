@@ -649,6 +649,9 @@ def extract_disagg_cluster_config(
     Use the default value of DisaggClusterConfig and MinimalInstances if the corresponding fields are not provided.
     If cluster_uri is provided, it will override the cluster_uri in the cluster_config_dict.
     """
+    # Never write into the caller's mapping (it is nested in the user's YAML);
+    # replace minimal_instances on this copy only.
+    cluster_config_dict = dict(cluster_config_dict)
 
     def update_dataclass(obj, data_dict: Dict[str, Any]):
         for key, value in data_dict.items():

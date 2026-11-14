@@ -52,7 +52,7 @@ def test_default_falls_back_to_one_frontend(monkeypatch, llm_args, conflict, rea
         enable_sleep_mode=False,
     )
 
-    _resolve_default_num_serve_frontends(llm_args, **{**no_conflict, **conflict})
+    llm_args = _resolve_default_num_serve_frontends(llm_args, **{**no_conflict, **conflict})
 
     assert llm_args["num_serve_frontends"] == 1
     assert len(messages) == 1 and reason in messages[0] and "--num_serve_frontends" in messages[0]
@@ -83,7 +83,7 @@ def test_frontend_count_reaching_launch_server(
     ):
         serve_cmd.main(args=[str(tmp_path), *args], standalone_mode=False)
 
-    assert launch.call_args.args[2].get("num_serve_frontends", 1) == expected
+    assert launch.call_args.kwargs["llm_args"].get("num_serve_frontends", 1) == expected
 
 
 def test_port_used_by_another_server_is_refused() -> None:

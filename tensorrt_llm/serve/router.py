@@ -2235,8 +2235,11 @@ def create_router(
     if router_class is None:
         raise ValueError(f"Unsupported router type: {router_type}. "
                          f"Supported types are: {list(router_map.keys())}")
-    extra_args = router_config.args if router_config else {}
-    extra_args["disagg_node_id"] = disagg_node_id
+    extra_args = {
+        **(router_config.args if router_config else {}),
+        "disagg_node_id":
+        disagg_node_id,
+    }
 
     return router_class(router_config.server_role if router_config else None,
                         servers,

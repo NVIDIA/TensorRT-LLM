@@ -72,7 +72,7 @@ def test_sleep_mode_injects_default_config_and_server_auth(monkeypatch):
     ):
         _invoke_sleep_mode()
 
-    llm_args = launch.call_args.args[2]
+    llm_args = launch.call_args.kwargs["llm_args"]
     assert isinstance(llm_args["sleep_config"], SleepConfig)
     assert launch.call_args.kwargs["enable_runtime_control_endpoints"]
     assert launch.call_args.kwargs["runtime_control_api_key"] == "secret"
@@ -96,7 +96,7 @@ def test_sleep_mode_preserves_yaml_config(monkeypatch, tmp_path):
     ):
         _invoke_sleep_mode(["--config", str(config)])
 
-    sleep_config = launch.call_args.args[2]["sleep_config"]
+    sleep_config = launch.call_args.kwargs["llm_args"]["sleep_config"]
     if isinstance(sleep_config, SleepConfig):
         restore_modes = sleep_config.restore_modes
     else:

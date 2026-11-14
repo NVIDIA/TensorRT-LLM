@@ -4187,7 +4187,7 @@ class TestServeDefaults:
                       str(config_path)],
                 standalone_mode=False,
             )
-            assert mock_launch_server.call_args.args[2][
+            assert mock_launch_server.call_args.kwargs["llm_args"][
                 "generation_config"] == "auto"
 
             mock_launch_server.reset_mock()
@@ -4204,7 +4204,7 @@ class TestServeDefaults:
                 standalone_mode=False,
             )
 
-            assert mock_launch_server.call_args.args[2][
+            assert mock_launch_server.call_args.kwargs["llm_args"][
                 "generation_config"] == "auto"
 
     @pytest.mark.parametrize(
@@ -4239,7 +4239,7 @@ class TestServeDefaults:
                       str(config_path), *extra_args],
                 standalone_mode=False,
             )
-            multimodal_config = mock_launch_server.call_args.args[2][
+            multimodal_config = mock_launch_server.call_args.kwargs["llm_args"][
                 "multimodal_config"]
             if isinstance(multimodal_config, BaseModel):
                 multimodal_config = multimodal_config.model_dump()
@@ -4267,7 +4267,7 @@ class TestServeDefaults:
             serve_main(args=args, standalone_mode=False)
 
         mock_launch_server.assert_called_once()
-        llm_args = mock_launch_server.call_args.args[2]
+        llm_args = mock_launch_server.call_args.kwargs["llm_args"]
         assert field_name in llm_args
         assert llm_args[field_name] is None
 
@@ -4341,7 +4341,8 @@ class TestServeDefaults:
             )
 
         mock_launch_server.assert_called_once()
-        assert mock_launch_server.call_args.args[2]["num_serve_frontends"] == 2
+        assert mock_launch_server.call_args.kwargs["llm_args"][
+            "num_serve_frontends"] == 2
 
     def test_serve_set_does_not_capture_misspelled_options(self) -> None:
         with pytest.raises(click.NoSuchOption):

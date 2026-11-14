@@ -9005,7 +9005,9 @@ def update_llm_args_with_extra_dict(
                 base_tc = base_tc.model_dump(exclude_unset=True)
             if isinstance(yaml_tc, TelemetryConfig):
                 yaml_tc = yaml_tc.model_dump(exclude_unset=True)
-            yaml_tc.pop('usage_context', None)
+            # Drop on a copy: the dict branch aliases the caller's nested
+            # telemetry_config mapping.
+            yaml_tc = {k: v for k, v in yaml_tc.items() if k != 'usage_context'}
             merged = base_tc | yaml_tc
             if "telemetry" in explicit_cli_keys and 'disabled' in base_tc:
                 merged['disabled'] = base_tc['disabled']

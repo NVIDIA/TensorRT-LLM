@@ -352,6 +352,9 @@ def launch_server(
         metrics_host: HTTP bind address; defaults to the inference host.
         metrics_port: HTTP port when performance-metrics configuration enables Prometheus.
     """
+    # Never write into the caller's mapping; the nested serve() below edits
+    # this copy.
+    llm_args = dict(llm_args)
     _warn_if_python_protobuf()
 
     async def serve() -> None:

@@ -44,9 +44,12 @@ def _init_multi_frontend_mode(llm_args: dict, enabled: bool) -> MultiFrontendMod
     executor: the launcher (frontend 0) owns the engine and spawns K-1
     attached frontends (classic IPC executor path only). enabled=False
     entry points (e.g. disaggregated MPI workers) never honor the knob.
+
+    Never modifies ``llm_args``; a caller that disables multi-frontend mode
+    drops ``num_serve_frontends`` itself.
     """
     if not enabled:
-        if llm_args.pop("num_serve_frontends", 1) > 1:
+        if llm_args.get("num_serve_frontends", 1) > 1:
             logger.warning(
                 "num_serve_frontends is only supported on plain "
                 "trtllm-serve; ignored on this entry point."
