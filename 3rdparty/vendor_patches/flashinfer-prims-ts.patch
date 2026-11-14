@@ -187,7 +187,7 @@ index a6a4261ca8ad3aecf065f8a4c36fca327f307dbc..7b553b20c6d9c924a08db08235b0dbc5
  from .gather import _address, gather4, select_gather_map
  from ...fmha_decode.fmha_decode_resources.tmem_transformed_kv import (
 diff --git a/mla_decode.py b/mla_decode.py
-index c66498fb6c0eaa633d6beb823cc946a5ee8ef5a1..f665a997df0bb9cbaf03ee43623b835b5b05188a 100644
+index 6dd8ee9828efeeb091161fef88656ff5d1b04439..20558b80118fedc9a822b37d5622c1438ea29053 100644
 --- a/mla_decode.py
 +++ b/mla_decode.py
 @@ -1,3 +1,4 @@
@@ -227,7 +227,7 @@ index c66498fb6c0eaa633d6beb823cc946a5ee8ef5a1..f665a997df0bb9cbaf03ee43623b835b
  def batch_mla_decode_with_paged_kv_cache(
      query: torch.Tensor,
      kv_cache: torch.Tensor,
-@@ -2411,17 +2408,17 @@ def _resolve_sparse_mla_plan(
+@@ -2419,17 +2416,17 @@ def _resolve_sparse_mla_plan(
      affect geometry or workspace sizing.
      """
      import cutlass

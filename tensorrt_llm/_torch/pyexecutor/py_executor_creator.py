@@ -45,6 +45,8 @@ if TYPE_CHECKING:
 
     from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 
+from ..attention.backends.fmha.prims_ts_precompile import (
+    close_precompile_workers, precompile_session, start_precompile_workers)
 from ..attention.backends.interface import AttentionRuntimeFeatures
 from ..attention.backends.utils import get_attention_backend
 from ..distributed import Distributed
@@ -705,7 +707,8 @@ def _create_py_executor_impl(
         A fully initialized PyExecutor instance.
     """
     creation_metrics: dict[str, float] = {}
-    with timing_metric("total_py_executor_creation_seconds", creation_metrics):
+    with precompile_session(), timing_metric(
+            "total_py_executor_creation_seconds", creation_metrics):
         py_executor = _create_py_executor(
             llm_args=llm_args,
             _startup_timer=_startup_timer,
@@ -1023,6 +1026,8 @@ def _create_py_executor(
                 with virtual_memory_scope(stage, restore_mode) as memory_pool:
                     vm_pools[stage] = memory_pool
                     yield
+
+    start_precompile_workers(llm_args, mapping)
 
     with allocation_scope(ExecutorMemoryType.MODEL_ENGINE_MAIN):
         model_weights_memory_tag = None
@@ -1557,6 +1562,9 @@ def _create_py_executor(
         if kv_cache_creator is not None:
             kv_cache_creator.close_remote_donor(error)
         raise
+
+    # Workers must release their CUDA contexts before final KV capacity sizing.
+    close_precompile_workers()
 
     if estimating_kv_cache:
         try:
