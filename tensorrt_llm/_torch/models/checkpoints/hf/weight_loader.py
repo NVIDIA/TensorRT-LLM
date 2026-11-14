@@ -1087,8 +1087,7 @@ class HfWeightLoader(BaseWeightLoader):
                                       weights_only=True,
                                       map_location='cpu',
                                       mmap=False)
-        finally:
-            return part_weights
+        return part_weights
 
     def _prefetch_one_file(
             self,
