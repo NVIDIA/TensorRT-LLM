@@ -233,6 +233,9 @@ l0_b200:
   - unittest/_torch/modules/test_gated_mlp_split.py
   - unittest/_torch/modules/test_low_m_gemm.py
   - unittest/_torch/modules/test_low_m_mma_gemm.py
+  - unittest/_torch/test_deterministic_linear.py
+  - unittest/_torch/models/test_qwen3_next_gate_determinism.py
+  - unittest/_torch/models/test_deepseek_gate_determinism.py
   - unittest/_torch/moe/test_moe_decode_front.py
   - unittest/_torch/modules/test_embedding_lookup.py
   - unittest/_torch/moe/test_draft_experts_nvfp4.py
