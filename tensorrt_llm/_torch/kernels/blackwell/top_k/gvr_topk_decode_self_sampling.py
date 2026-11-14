@@ -57,6 +57,7 @@ from typing import Any
 import cutlass
 import cutlass.cute as cute
 import cutlass.cute.math as cmath
+import cutlass.experimental.primitives as prims
 from cutlass import Int32, Int64, Uint32
 from cutlass._mlir.dialects import arith as mlir_arith
 from cutlass._mlir.dialects import llvm, nvvm
@@ -8837,6 +8838,24 @@ def _crc_push_hist(hist, recv, mbar, rank, tid, blk: cutlass.Constexpr, cs: cutl
 
 
 @cute.jit
+def _crc_mbar_wait_cluster(mbar_addr, parity):
+    """Wait for the mbarrier phase of ``parity`` at ``mbar_addr`` and acquire the peers' stores.
+
+    The peers' ``st.async`` stores complete the barrier with a release at cluster scope; the
+    default (CTA-scope) wait does not synchronize with it, so the merge could read stale bins.
+    A relaxed cluster-scope wait followed by an acquire fence restricted to ``shared::cluster``
+    is the PTX ISA acquire pattern for this case; unlike an ``.acquire.cluster`` wait it does
+    not make ptxas invalidate L1 on every poll.
+    """
+    mbar = cute.make_ptr(Int64, mbar_addr, cute.AddressSpace.smem, assumed_align=8)
+    while not prims.mbarrier_try_wait_parity(
+        mbar, parity, scope=prims.MBarrierScope.CLUSTER, order=prims.MemOrder.RELAXED
+    ):
+        pass
+    prims.fence_sync_restrict(prims.MemOrder.ACQUIRE)
+
+
+@cute.jit
 def _crc_load_counts(recv):
     packed0, packed1, packed2, packed3 = _lds_v4_u32(recv)
     return (
@@ -14964,7 +14983,7 @@ class GvrTopkRegKernel:
                 else:
                     cute.arch.mbarrier_arrive_and_expect_tx(mb2, CS * 1028)
             if tid < Int32(32):
-                cute.arch.mbarrier_wait(mb1, 0)
+                _crc_mbar_wait_cluster(mb_addr, Int32(0))
                 _crc_merge1(rb1, s_h2, s_res, rank, k, lane, pad4, CS)
             cute.arch.barrier()
             B1 = s_res[RES_B]
@@ -15009,10 +15028,10 @@ class GvrTopkRegKernel:
                 cute.arch.barrier()
                 _crc_push_hist(hb2, rb2, mb_addr + Int32(8), rank, tid, BLK, CS)
                 if tid < Int32(32):
-                    cute.arch.mbarrier_wait(mb2, 0)
+                    _crc_mbar_wait_cluster(mb_addr + Int32(8), Int32(0))
                     _fp16.merge_cursors256_cluster(rb2, hb1, rank, above1, lane, CS)
                 if tid >= Int32(32) and tid < Int32(64):
-                    cute.arch.mbarrier_wait(mb2, 0)
+                    _crc_mbar_wait_cluster(mb_addr + Int32(8), Int32(0))
                     _fp16.scan_above_lane_cursors_cluster(hb3, rab, rank, lane)
                 cute.arch.barrier()
                 output_address = out[row, None].iterator.toint()
@@ -15056,10 +15075,10 @@ class GvrTopkRegKernel:
                 cute.arch.barrier()
                 _crc_push_hist(hb2, rb2, mb_addr + Int32(8), rank, tid, BLK, CS)
                 if tid < Int32(32):
-                    cute.arch.mbarrier_wait(mb2, 0)
+                    _crc_mbar_wait_cluster(mb_addr + Int32(8), Int32(0))
                     _crc_merge2(rb2, hb1, s_res, rank, need1, above1, lane, CS)
                 if tid >= Int32(32) and tid < Int32(64):
-                    cute.arch.mbarrier_wait(mb2, 0)
+                    _crc_mbar_wait_cluster(mb_addr + Int32(8), Int32(0))
                     _crc_scan_above(hb3, rab, rank, lane)
                 cute.arch.barrier()
                 kth = b1hi | Uint32(s_res[RES_B])
@@ -15331,12 +15350,12 @@ class GvrTopkRegKernel:
                     cute.arch.mbarrier_arrive_and_expect_tx(mb2, CS * 1028)
             if cutlass.const_expr(STAGED_MERGE):
                 if tid < Int32(128):
-                    cute.arch.mbarrier_wait(mb1, 0)
+                    _crc_mbar_wait_cluster(mb_addr, Int32(0))
                     _crc_stage_peers(rb1, rank, tid, CS, False)
                 cute.arch.barrier()
             if tid < Int32(32):
                 if cutlass.const_expr(not STAGED_MERGE):
-                    cute.arch.mbarrier_wait(mb1, 0)
+                    _crc_mbar_wait_cluster(mb_addr, Int32(0))
                 _crc_merge1(rb1, s_h2, s_res, rank, k, lane, Int32(0), CS, STAGED_MERGE)
             cute.arch.barrier()
             B1 = s_res[RES_B]
@@ -15400,16 +15419,16 @@ class GvrTopkRegKernel:
             _crc_push_hist(hb2, rb2, mb_addr + Int32(8), rank, tid, BLK, CS)
             if cutlass.const_expr(STAGED_MERGE):
                 if tid < Int32(128):
-                    cute.arch.mbarrier_wait(mb2, 0)
+                    _crc_mbar_wait_cluster(mb_addr + Int32(8), Int32(0))
                     _crc_stage_peers(rb2, rank, tid, CS, True)
                 cute.arch.barrier()
             if tid < Int32(32):
                 if cutlass.const_expr(not STAGED_MERGE):
-                    cute.arch.mbarrier_wait(mb2, 0)
+                    _crc_mbar_wait_cluster(mb_addr + Int32(8), Int32(0))
                 _crc_merge2(rb2, hb1, s_res, rank, need1, above1, lane, CS, STAGED_MERGE)
             if tid >= Int32(32) and tid < Int32(64):
                 if cutlass.const_expr(not STAGED_MERGE):
-                    cute.arch.mbarrier_wait(mb2, 0)
+                    _crc_mbar_wait_cluster(mb_addr + Int32(8), Int32(0))
                 peer_above = Int32(0)
                 if lane < rank:
                     peer_above = _lds_i32(rab + (lane << Int32(2)))

@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import cutlass
 import cutlass.cute as cute
+import cutlass.experimental.primitives as prims
 import cutlass.utils
 from cutlass import Float32, Int32, Int64, const_expr
 from cutlass._mlir.dialects import llvm
@@ -120,22 +121,21 @@ def _mbar_expect_tx(addr: Int32, nbytes: Int32, *, loc=None, ip=None) -> None:
     )
 
 
-@dsl_user_op
-def _mbar_try_wait(addr: Int32, parity: Int32, *, loc=None, ip=None) -> Int32:
-    return Int32(
-        llvm.inline_asm(
-            T.i32(),
-            [Int32(addr).ir_value(loc=loc, ip=ip), Int32(parity).ir_value(loc=loc, ip=ip)],
-            "{\n\t.reg .pred p;\n\tmbarrier.try_wait.parity.shared::cta.b64 p, [$1], $2;\n\t"
-            "selp.u32 $0, 1, 0, p;\n\t}",
-            "=r,r,r,~{memory}",
-            has_side_effects=True,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-            loc=loc,
-            ip=ip,
-        )
-    )
+@cute.jit
+def _mbar_wait_cluster_acquire(addr: Int32, parity: Int32):
+    """Wait for ``parity`` of the mbarrier at ``addr`` and acquire the peers' ``st.async`` stores.
+
+    The barrier is completed by the peers' ``st.async`` (a release at cluster scope), which the
+    default CTA-scope wait does not synchronize with. A relaxed cluster-scope wait followed by an
+    acquire fence restricted to ``shared::cluster`` is the PTX ISA acquire pattern for this case;
+    unlike an ``.acquire.cluster`` wait it does not make ptxas invalidate L1 on every poll.
+    """
+    mbar = cute.make_ptr(Int64, addr, cute.AddressSpace.smem, assumed_align=8)
+    while not prims.mbarrier_try_wait_parity(
+        mbar, parity, scope=prims.MBarrierScope.CLUSTER, order=prims.MemOrder.RELAXED
+    ):
+        pass
+    prims.fence_sync_restrict(prims.MemOrder.ACQUIRE)
 
 
 @dsl_user_op
@@ -473,9 +473,7 @@ class MnnvlSlotAllReduceNormKernel:
         if const_expr(ctas > 1):
             if tidx < ctas:
                 _st_async_f32(csum_addr + Int32(4) * part, mbar_addr, Int32(tidx), total)
-            ready = _mbar_try_wait(mbar_addr, Int32(0))
-            while ready == 0:
-                ready = _mbar_try_wait(mbar_addr, Int32(0))
+            _mbar_wait_cluster_acquire(mbar_addr, Int32(0))
             total = Float32(0.0)
             for p in cutlass.range_constexpr(ctas):
                 total = _add(total, _ld_shared_f32(csum_addr + Int32(4 * p)))

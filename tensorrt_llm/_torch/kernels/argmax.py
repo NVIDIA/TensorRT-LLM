@@ -30,6 +30,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
     import cuda.bindings.driver as cuda
     import cutlass
     import cutlass.cute as cute
+    import cutlass.experimental.primitives as prims
     from cutlass._mlir.dialects import llvm
     from cutlass.cute.arch.nvvm_wrappers import FULL_MASK
     from cutlass.cute.runtime import from_dlpack
@@ -114,6 +115,22 @@ if IS_CUTLASS_DSL_AVAILABLE:
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
         )
+
+    @cute.jit
+    def mbarrier_wait_cluster_acquire(mbar_ptr: cute.Pointer, phase: Int):
+        """Wait for ``phase`` of the mbarrier and acquire the peer CTAs' shared-memory stores.
+
+        ``store_shared_remote`` from a peer CTA completes the barrier with a release at
+        cluster scope, which the default (CTA-scope) wait does not synchronize with. A relaxed
+        cluster-scope wait followed by an acquire fence restricted to ``shared::cluster`` is
+        the PTX ISA acquire pattern for this case; unlike an ``.acquire.cluster`` wait it does
+        not make ptxas invalidate L1 on every poll.
+        """
+        while not prims.mbarrier_try_wait_parity(
+            mbar_ptr, phase, scope=prims.MBarrierScope.CLUSTER, order=prims.MemOrder.RELAXED
+        ):
+            pass
+        prims.fence_sync_restrict(prims.MemOrder.ACQUIRE)
 
     @cute.jit
     def predicate_k(tAcA: cute.Tensor, limit: cutlass.Int32) -> cute.Tensor:
@@ -525,7 +542,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         peer_cta_rank_in_cluster=lane_idx,
                     )
 
-                cute.arch.mbarrier_wait(mbar_ptr, phase=0)
+                # The peers' st.async complete the barrier with a cluster-scope release:
+                # wait, then acquire at cluster scope before reading their values.
+                mbarrier_wait_cluster_acquire(mbar_ptr, 0)
                 block_reduce_val = -tXsX.element_type.inf
                 block_reduce_argmax = Int32(0xFFFFFFFF)
                 num_iter = cute.ceil_div(warps_per_row * cluster_n, cute.arch.WARP_SIZE)
