@@ -799,6 +799,7 @@ def setup_disagg_cluster(
     share_gpu: bool = False,
     config_overrides: dict[str, Any] | None = None,
     log_output_dir: str | None = None,
+    prepare_fmha_metadata: bool = False,
 ) -> tuple[dict[str, Any], list[ProcessWrapper], list[ProcessWrapper],
            ProcessWrapper, int, str]:
     """Load config, launch the workers and the disagg server, wait for ready.
@@ -818,6 +819,8 @@ def setup_disagg_cluster(
             work_dir instead of the inherited stdout
         log_output_dir: With save_log, directory the logs are copied to if
             startup fails (CI's --output-dir, so they get uploaded)
+        prepare_fmha_metadata: Prepare shared FMHA artifacts before single-rank
+            Blackwell Python transceiver workers start.
 
     Returns:
         tuple: (config, ctx_workers, gen_workers, disagg_server, server_port, work_dir),
@@ -915,6 +918,47 @@ def setup_disagg_cluster(
     num_gpus = torch.cuda.device_count()
 
     try:
+        ctx_worker_config = build_worker_config(config, ctx_servers,
+                                                disagg_cluster)
+        gen_worker_config = build_worker_config(config, gen_servers,
+                                                disagg_cluster)
+        if prepare_fmha_metadata and get_sm_version() in (100, 103):
+            prepared_caches = set()
+            for worker_config, ranks, worker_env in (
+                (ctx_worker_config, gpus_per_ctx, ctx_env or env),
+                (gen_worker_config, gpus_per_gen, gen_env or env),
+            ):
+                worker_env = worker_env or os.environ
+                if (ranks != 1 or worker_config.get(
+                        "cache_transceiver_config",
+                    {}).get("transceiver_runtime") != "PYTHON"):
+                    continue
+                # Managed MPI workspaces select their cache after spawning.
+                if (not worker_env.get("FLASHINFER_CUBIN_DIR") and
+                    (worker_env.get("TRTLLM_CACHE_DIR")
+                     or worker_env.get("TRTLLM_FLASHINFER_WORKSPACE_MANAGED")
+                     == "1")):
+                    continue
+                cache_key = tuple(
+                    (key, value) for key, value in sorted(worker_env.items())
+                    if key.startswith("FLASHINFER_") or key in (
+                        "HOME", "PATH", "PYTHONPATH", "TRTLLM_CACHE_DIR"))
+                if cache_key in prepared_caches:
+                    continue
+                # Both single-rank workers must see verified metadata before
+                # either starts warming up against their shared cold cache.
+                check_call([
+                    "python3", "-c",
+                    "from flashinfer.jit.attention import gen_trtllm_gen_fmha_module; "
+                    "from flashinfer.jit.env import FLASHINFER_CUBIN_DIR; "
+                    "print(f'Preparing FMHA metadata in {FLASHINFER_CUBIN_DIR}', flush=True); "
+                    "gen_trtllm_gen_fmha_module()"
+                ],
+                           env=worker_env,
+                           cwd=cwd,
+                           timeout=server_start_timeout)
+                prepared_caches.add(cache_key)
+
         server_config = {
             "hostname":
             server_host,
@@ -962,10 +1006,9 @@ def setup_disagg_cluster(
                 cluster_uri=f"http://{server_host}:{server_port}")
 
         # Build worker configs and launch workers
-        ctx_worker_config = build_worker_config(config, ctx_servers,
-                                                disagg_cluster)
-        gen_worker_config = build_worker_config(config, gen_servers,
-                                                disagg_cluster)
+        # The server may have selected a port after metadata preparation.
+        ctx_worker_config["disagg_cluster"] = disagg_cluster
+        gen_worker_config["disagg_cluster"] = disagg_cluster
         ctx_worker_config[
             "internal_request_auth_key"] = internal_request_auth_key
         gen_worker_config[
@@ -1181,7 +1224,10 @@ def run_disaggregated_test(example_dir,
                              perf_metrics_output_dir=perf_metrics_output_dir,
                              ctx_env=ctx_run_env, gen_env=gen_run_env,
                              share_gpu=share_gpu,
-                             config_overrides=config_overrides)
+                             config_overrides=config_overrides,
+                             prepare_fmha_metadata=test_desc in (
+                                 "overlap_transceiver_runtime_python",
+                                 "overlap_transceiver_runtime_python_bounce"))
 
     server_host = config.get("hostname", "localhost")
 

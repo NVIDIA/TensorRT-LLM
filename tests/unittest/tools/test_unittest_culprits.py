@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for culprit attribution and parallel-config lookup in the unittest integration wrapper."""
+"""Tests for artifact names, culprit attribution and parallel-config lookup in the unittest wrapper."""
 
 import importlib.util
 import sys
@@ -61,10 +61,15 @@ _TEST_UNITTESTS = _load_test_unittests_module()
 _junit_culprits = _TEST_UNITTESTS._junit_culprits
 _fail_unittests = _TEST_UNITTESTS._fail_unittests
 _parallel_config_key = _TEST_UNITTESTS._parallel_config_key
+_unittest_case_filename = _TEST_UNITTESTS._unittest_case_filename
 
 
 def test_junit_culprits_reports_failures_and_errors(tmp_path: Path) -> None:
-    report = tmp_path / "results.xml"
+    prefix = "unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/norm/test_modeling_v2_attn_res"
+    case = f"{prefix}_fwd.py"
+    other_case = f"{prefix}_rmsnorm_fwd.py"
+    report = tmp_path / f"results-sub-unittests-{_unittest_case_filename(case)}.xml"
+    other_report = tmp_path / f"results-sub-unittests-{_unittest_case_filename(other_case)}.xml"
     report.write_text(
         """<testsuites>
   <testsuite>
@@ -78,6 +83,12 @@ def test_junit_culprits_reports_failures_and_errors(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
+    # Writing a second long-prefix case must not overwrite the first case's failures.
+    other_report.write_text(
+        '<testsuites><testsuite><testcase name="pass" /></testsuite></testsuites>'
+    )
+    assert len(_unittest_case_filename(case)) <= 80
+    assert _junit_culprits(str(other_report)) == []
     assert _junit_culprits(str(report)) == [
         "FAILED pkg.test_alpha::test_failure",
         "ERROR pkg.test_beta::test_error",

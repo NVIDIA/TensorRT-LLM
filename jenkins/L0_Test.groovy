@@ -905,7 +905,7 @@ def getInfraDryRunPytestTargets(testListPath) {
     return targets
 }
 
-def processShardTestList(llmSrc, testDBList, splitId, splits, durationsPath="") {
+def processShardTestList(llmSrc, testDBList, splitId, splits, collectionLogDir, durationsPath="") {
     // Preprocess testDBList to extract ISOLATION markers
     echo "Preprocessing testDBList to extract ISOLATION markers..."
 
@@ -961,7 +961,11 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, durationsPath="") 
     def testListCmd = [
         "LLM_ROOT=${llmSrc}",
         "LLM_BACKEND_ROOT=${llmSrc}/triton_backend",
-        "pytest",
+        "python3 '${llmSrc}/jenkins/scripts/collect_pytest.py'",
+        "--log-dir='${collectionLogDir}'",
+        "--timeout-seconds=1800",
+        "--retries=2",
+        "--",
         "--collect-only",
         "--splitting-algorithm least_duration",
         "--test-list=${cleanedTestDBList}",
@@ -976,10 +980,8 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, durationsPath="") 
 
     try {
         // First execute the pytest command and check if it succeeds
-        def pytestOutput = sh(
-            script: "cd ${llmSrc}/tests/integration/defs && ${testListCmd.join(' ')}",
-            returnStdout: true
-        ).trim()
+        sh(script: "cd ${llmSrc}/tests/integration/defs && ${testListCmd.join(' ')}")
+        def pytestOutput = readFile(file: "${collectionLogDir}/output.txt").trim()
 
         // Debug: Show the raw pytest output
         echo "<<<START_PYTEST_OUTPUT>>>"
@@ -1008,6 +1010,8 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, durationsPath="") 
             return shouldInclude
         }
         echo "Filtering complete. shardTestList size: ${shardTestList.size()}"
+    } catch (InterruptedException e) {
+        throw e
     } catch (Exception e) {
         echo "Error: Failed to execute pytest command for test collection: ${e.getMessage()}"
         error "Test collection failed for shard ${splitId}/${splits}. Cannot proceed without valid test list."
@@ -1017,6 +1021,11 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, durationsPath="") 
         // Split the shard test list into regular and isolate tests
         def shardRegularTests = []
         def shardIsolateTests = []
+
+        // Collection omits list markers; preserve options such as --ignore in the key.
+        def entryName = { line ->
+            line.replaceFirst(/\s+(?:XFAIL|SKIP|UNSTABLE|TIMEOUT)\b.*$/, '').trim()
+        }
 
         // Process each test from shardTestList
         shardTestList.each { test ->
@@ -1031,13 +1040,16 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, durationsPath="") 
                 }
 
                 // Check if this test is in the isolation list
-                def isolationTestLine = isolationTestLines.find { it.contains(trimmedTest) }
+                def isolationTestLine = isolationTestLines.find { entryName(it) == trimmedTest }
                 if (isolationTestLine) {
                     // This test needs isolation
                     shardIsolateTests.add(isolationTestLine)
                 } else {
                     // This test is a regular test - find the actual line from cleanedTestLines
-                    def cleanedTestLine = cleanedTestLines.find { it.contains(trimmedTest) }
+                    def cleanedTestLine = cleanedTestLines.find { entryName(it) == trimmedTest }
+                    if (cleanedTestLine == null) {
+                        error "Collected test has no matching list entry: ${trimmedTest}"
+                    }
                     shardRegularTests.add(cleanedTestLine)
                 }
             }
@@ -6407,8 +6419,12 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             }
         }
 
+        // Clear prior results after extracting reused passes, before collecting new logs.
+        sh "rm -rf '${stageName}/'"
+
         // Process shard test list and create separate files for regular and isolate tests
-        def preprocessedLists = processShardTestList(llmSrc, testDBList, splitId, splits, clusterDurationsPath)
+        def collectionLogDir = "${WORKSPACE}/${stageName}/collection${postTag}"
+        def preprocessedLists = processShardTestList(llmSrc, testDBList, splitId, splits, collectionLogDir, clusterDurationsPath)
 
         // Test Coverage
         def TRTLLM_WHL_PATH = sh(returnStdout: true, script: "pip3 show tensorrt_llm | grep Location | cut -d ' ' -f 2").replaceAll("\\s","")
@@ -6506,7 +6522,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                                         bash '${llmSrc}/jenkins/scripts/progress_upload_watcher.sh' &
                                         WATCHER_PID=\$!
                                         ${checkpointNetrcWait(watcher.netrcDir)}
-                                        rm -rf '${stageName}/'
                                         cd '${llmSrc}/tests/integration/defs'
                                         ${pytestCommand.join(" ")}
                                         rc=\$?
@@ -7451,8 +7466,10 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // may break the mapping functionality.
 
     x86TestConfigs = [
-        "CPU-Generic-x86-1": ["cpu", "l0_cpu", 1, 2],
-        "CPU-Generic-x86-2": ["cpu", "l0_cpu", 2, 2],
+        "CPU-Generic-x86-1": ["cpu", "l0_cpu", 1, 4],
+        "CPU-Generic-x86-2": ["cpu", "l0_cpu", 2, 4],
+        "CPU-Generic-x86-3": ["cpu", "l0_cpu", 3, 4],
+        "CPU-Generic-x86-4": ["cpu", "l0_cpu", 4, 4],
         "DGX_H100-4_GPUs-CPP-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "A10-PyTorch-1": ["a10", "l0_a10", 1, 3],
         "A10-PyTorch-2": ["a10", "l0_a10", 2, 3],
@@ -7567,9 +7584,11 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "DGX_B200-8_GPUs-PyTorch-4": ["auto:dgx-b200-flex", "l0_dgx_b200", 4, 4, 8, 1, true],
         // M3 CTX TP2/EP2 -> GEN TP4/EP1 C++ NIXL bounce accuracy (6 GPUs).
         "DGX_B200-6_GPUs-PyTorch-M3-Post-Merge-1": ["auto:dgx-b200-flex", "l0_dgx_b200_m3_6gpu", 1, 1, 6, 1, true],
-        "B300-PyTorch-1": ["auto:dgx-b300-flex", "l0_b300", 1, 2, 1, 1, true],
-        "B300-PyTorch-2": ["auto:dgx-b300-flex", "l0_b300", 2, 2, 1, 1, true],
-        "B300-PyTorch-Post-Merge-1": ["auto:dgx-b300-flex", "l0_b300", 1, 1, 1, 1, true],
+        "DGX_B300-PyTorch-1": ["auto:dgx-b300-flex", "l0_b300", 1, 4, 1, 1, true],
+        "DGX_B300-PyTorch-2": ["auto:dgx-b300-flex", "l0_b300", 2, 4, 1, 1, true],
+        "DGX_B300-PyTorch-3": ["auto:dgx-b300-flex", "l0_b300", 3, 4, 1, 1, true],
+        "DGX_B300-PyTorch-4": ["auto:dgx-b300-flex", "l0_b300", 4, 4, 1, 1, true],
+        "DGX_B300-PyTorch-Post-Merge-1": ["auto:dgx-b300-flex", "l0_b300", 1, 1, 1, 1, true],
         "DGX_B300-4_GPUs-PyTorch-1": ["auto:dgx-b300-flex", "l0_dgx_b300", 1, 1, 4, 1, true],
         // Keep this functional stage on AWS-PDX for EFA coverage.
         "DGX_B300-2_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-FUNCTIONAL-ONLY-1": ["b300-flex-aws-pdx", "l0_dgx_b300_efa_multi_nodes", 1, 1, 2, 2, true],
@@ -7614,8 +7633,10 @@ def launchTestJobs(pipeline, testFilter, globalVars)
 
     // SBSA machines from the Blossom machine pool
     SBSATestConfigs = [
-        "CPU-Generic-arm-1": ["cpu", "l0_cpu", 1, 2],
-        "CPU-Generic-arm-2": ["cpu", "l0_cpu", 2, 2],
+        "CPU-Generic-arm-1": ["cpu", "l0_cpu", 1, 4],
+        "CPU-Generic-arm-2": ["cpu", "l0_cpu", 2, 4],
+        "CPU-Generic-arm-3": ["cpu", "l0_cpu", 3, 4],
+        "CPU-Generic-arm-4": ["cpu", "l0_cpu", 4, 4],
         "GH200-PyTorch-Post-Merge-1": ["gh200", "l0_gh200", 1, 1],
         // DGX Spark is also named as GB10 Grace Blackwell Superchip.
         "GB10-PyTorch-1": ["gb10x", "l0_gb10", 1, 1],

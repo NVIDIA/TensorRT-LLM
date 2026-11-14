@@ -51,6 +51,7 @@ from tensorrt_llm.llmapi.disagg_utils import (
     RouterConfig,
     ServerRole,
 )
+from tensorrt_llm.serve import disagg_coordinator as coordinator_module
 from tensorrt_llm.serve.coordinator_server import CoordinatorServer
 from tensorrt_llm.serve.disagg_coordinator import (
     COORDINATOR_RESERVATION_TIMEOUT_ENV,
@@ -476,17 +477,52 @@ def test_coordinator_client_configures_empty_delegating_kv_router():
 
 @pytest.mark.asyncio
 async def test_coordinator_client_readiness_is_cached():
+    """Reuse ready state and keep a shared refresh alive across caller deadlines."""
     config = _make_config([], [], "round_robin", "round_robin")
     client = CoordinatorClient("http://coordinator", config)
-    client._is_ready = True
+    client.cluster_info = AsyncMock(side_effect=[{"is_ready": False}, {"is_ready": True}])
+
+    assert await client.is_ready() is False
+    assert await client.is_ready() is True
+    assert client.cluster_info.await_count == 2
+    client.cluster_info.reset_mock()
 
     assert await client.is_ready() is True
+    client.cluster_info.assert_not_awaited()
     assert client._session is None
-    await client.stop()
+
+    client._is_ready = False
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fetch_when_released() -> dict:
+        started.set()
+        await release.wait()
+        return {"is_ready": True}
+
+    client.cluster_info.side_effect = fetch_when_released
+    refresh = client._get_refresh_task()
+    try:
+        await asyncio.wait_for(started.wait(), timeout=30)
+        # The event stays blocked until after both deadlines, regardless of runner speed.
+        with patch.object(coordinator_module, "COORDINATOR_READINESS_TIMEOUT_S", 0.01):
+            assert await client.is_ready() is False
+            assert await client.is_ready() is False
+        assert client._refresh_task is refresh
+        assert not refresh.done()
+        client.cluster_info.assert_awaited_once()
+        release.set()
+        assert await asyncio.wait_for(asyncio.shield(refresh), timeout=30) is True
+        assert await client.is_ready() is True
+        client.cluster_info.assert_awaited_once()
+    finally:
+        release.set()
+        await client.stop()
 
 
 @pytest.mark.asyncio
 async def test_coordinator_state_sync_starts_in_background():
+    """Recover from refresh failures and drain owned work before closing routers."""
     config = _make_config([], [], "round_robin", "round_robin")
     client = CoordinatorClient("http://coordinator", config)
     client._state_sync_interval_s = 10
@@ -496,13 +532,59 @@ async def test_coordinator_state_sync_starts_in_background():
             "server_lists": {"context": [], "generation": []},
         }
     )
-    client._sync_coordinator_state = AsyncMock()
+    client.cluster_info = AsyncMock(
+        side_effect=[
+            RuntimeError("coordinator unavailable"),
+            {"is_ready": False},
+            {"is_ready": True},
+            {"is_ready": True},
+        ]
+    )
+    client._sync_router_server_lists = AsyncMock(
+        side_effect=[None, None, RuntimeError("router preparation failed"), None]
+    )
+    readiness = []
 
-    await client.start()
+    async def tick(interval_s: float) -> None:
+        """Observe each completed iteration and stop after the recovery sequence."""
+        assert interval_s == client._state_sync_interval_s
+        readiness.append(client._is_ready)
+        if len(readiness) == 5:
+            raise asyncio.CancelledError
 
-    assert client._is_ready is True
-    client._sync_coordinator_state.assert_called_once_with(10)
-    await client.stop()
+    # Control loop iterations without patching other tasks' asyncio.sleep.
+    controlled_asyncio = SimpleNamespace(**{**vars(asyncio), "sleep": tick})
+    with patch.object(coordinator_module, "asyncio", controlled_asyncio):
+        try:
+            await client.start()
+            assert client._is_ready is True
+            assert client._sync_task is not None
+            with pytest.raises(asyncio.CancelledError):
+                await client._sync_task
+            assert readiness == [True, False, False, False, True]
+
+            started = asyncio.Event()
+
+            async def unfinished_fetch() -> dict:
+                started.set()
+                await asyncio.Event().wait()
+                return {"is_ready": True}
+
+            client.cluster_info.side_effect = unfinished_fetch
+            refresh = client._get_refresh_task()
+            await asyncio.wait_for(started.wait(), timeout=30)
+            close_router = client.ctx_router.close
+
+            async def close_after_refresh() -> None:
+                assert refresh.cancelled()
+                await close_router()
+
+            client.ctx_router.close = close_after_refresh
+        finally:
+            await client.stop()
+    assert refresh.cancelled()
+    assert client._refresh_task is None
+    assert await client.is_ready() is False
 
 
 def test_service_discovery_sets_coordinator_state_sync_interval():
@@ -524,7 +606,13 @@ async def test_cluster_info_updates_readiness_and_local_servers():
     client.ctx_router.remove_server = AsyncMock(wraps=client.ctx_router.remove_server)
     client.ctx_router.add_server = AsyncMock(wraps=client.ctx_router.add_server)
     client.ctx_router.prepare_servers = AsyncMock()
-    client.ctx_router._fetch_server_info = AsyncMock(return_value={})
+
+    async def fetch_server_info(server: str, timeout: float) -> dict:
+        assert client._is_ready is False
+        return {}
+
+    client.ctx_router._fetch_server_info = AsyncMock(side_effect=fetch_server_info)
+    client._is_ready = True
 
     await client._apply_cluster_info(
         {

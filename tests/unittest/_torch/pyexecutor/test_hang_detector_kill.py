@@ -41,34 +41,80 @@ from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 pytestmark = pytest.mark.cpu_only
 
 
-def test_detector_fires_after_timeout():
+@pytest.fixture(autouse=True)
+def _isolate_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Clock patches must not change time.sleep/monotonic for other threads.
+    monkeypatch.setattr(
+        hang_detector_module,
+        "time",
+        SimpleNamespace(monotonic=time.monotonic, sleep=time.sleep),
+    )
+
+
+def test_detector_fires_after_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    started = 1000.0
+    now = started
+    timeout = 2
     fired = []
-    hd = HangDetector(timeout=2, on_detected=lambda: fired.append(time.monotonic()))
-    with hd:
-        hd.checkpoint()
-        time.sleep(1.0)
+
+    def on_detected() -> None:
+        fired.append(now)
+        hd.active = False
+
+    hd = HangDetector(timeout=timeout, on_detected=on_detected)
+    ticks = iter([started + timeout / 2, started + timeout])
+
+    async def advance_clock(_delay: float) -> None:
+        nonlocal now
         assert hd.detected() is False
         assert fired == []
-        # Poll up to a generous deadline rather than asserting at the exact
-        # timeout boundary -- the detector thread may wake a bit after the
-        # configured ``timeout`` and a fixed sleep flakes in CI.
-        deadline = time.monotonic() + 3.0
-        while time.monotonic() < deadline and not hd.detected():
-            time.sleep(0.05)
-        assert hd.detected() is True
-        assert len(fired) == 1
+        now = next(ticks)
+
+    monkeypatch.setattr(hang_detector_module.time, "monotonic", lambda: now)
+    monkeypatch.setattr(hang_detector_module, "asyncio", SimpleNamespace(sleep=advance_clock))
+    hd.active = True
+    hd.checkpoint()
+    try:
+        asyncio.run(hd._watch())
+    finally:
+        hd.stop()
+    assert hd.detected() is True
+    assert fired == [started + timeout]
 
 
-def test_checkpoint_resets_timer():
-    """Repeated checkpoints before the timeout keep the detector quiet."""
+def test_checkpoint_resets_timer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A checkpoint keeps the detector quiet past the original deadline."""
+    started = 1000.0
+    now = started
+    timeout = 2
+    renewed_at = started + timeout / 2
     fired = []
-    hd = HangDetector(timeout=2, on_detected=lambda: fired.append(1))
-    with hd:
-        for _ in range(6):
+
+    def on_detected() -> None:
+        fired.append(now)
+        hd.active = False
+
+    hd = HangDetector(timeout=timeout, on_detected=on_detected)
+    ticks = iter([renewed_at, started + timeout, renewed_at + timeout])
+
+    async def advance_clock(_delay: float) -> None:
+        nonlocal now
+        assert fired == []
+        assert hd.detected() is False
+        now = next(ticks)
+        if now == renewed_at:
             hd.checkpoint()
-            time.sleep(0.4)  # < timeout, so the timer keeps resetting
-        assert fired == []
-        assert hd.detected() is False
+
+    monkeypatch.setattr(hang_detector_module.time, "monotonic", lambda: now)
+    monkeypatch.setattr(hang_detector_module, "asyncio", SimpleNamespace(sleep=advance_clock))
+    hd.active = True
+    hd.checkpoint()
+    try:
+        asyncio.run(hd._watch())
+    finally:
+        hd.stop()
+    assert hd.detected() is True
+    assert fired == [renewed_at + timeout]
 
 
 def test_checkpoint_schedules_no_work_on_the_detector_loop(
@@ -158,27 +204,45 @@ def test_one_lapse_invokes_on_detected_once() -> None:
         assert len(fired) == 1, "the same lapse ran on_detected again"
 
 
-def test_pause_suppresses_detection():
+def test_pause_suppresses_detection(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = 1000.0
+    timeout = 1
     fired = []
-    hd = HangDetector(timeout=1, on_detected=lambda: fired.append(1))
-    with hd:
-        hd.checkpoint()
+    hd = HangDetector(timeout=timeout, on_detected=lambda: fired.append(1))
+
+    async def stop_after_poll(_delay: float) -> None:
+        raise asyncio.CancelledError
+
+    def poll() -> None:
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(hd._watch())
+
+    monkeypatch.setattr(hang_detector_module.time, "monotonic", lambda: now)
+    monkeypatch.setattr(hang_detector_module, "asyncio", SimpleNamespace(sleep=stop_after_poll))
+    hd.active = True
+    hd.checkpoint()
+    try:
         with hd.pause():
-            time.sleep(2.0)  # would have fired if not paused
+            now += 2 * timeout
+            poll()
+            assert fired == []
+            assert hd.detected() is False
+        poll()
         assert fired == []
-        assert hd.detected() is False
+        now += timeout
+        poll()
+        assert fired == [1]
+        assert hd.detected() is True
+    finally:
+        hd.stop()
 
 
 def test_status_provider_errors_are_logged(monkeypatch):
     events = []
 
-    async def no_sleep(_timeout):
-        pass
-
     def failing_provider():
         raise RuntimeError("provider failed")
 
-    monkeypatch.setattr(hang_detector_module.asyncio, "sleep", no_sleep)
     monkeypatch.setattr(
         hang_detector_module,
         "_best_effort_log_error",
@@ -204,7 +268,7 @@ def test_status_provider_errors_are_logged(monkeypatch):
 
 
 @pytest.mark.parametrize("with_dwdp", [False, True], ids=["no_dwdp", "dwdp"])
-def test_control_request_wait_pauses_detector(with_dwdp):
+def test_control_request_wait_pauses_detector(with_dwdp, monkeypatch: pytest.MonkeyPatch):
     fired = []
     executor = PyExecutor.__new__(PyExecutor)
     executor.control_requests = [SimpleNamespace(control_requires_drain=False, control_id=None)]
@@ -218,22 +282,35 @@ def test_control_request_wait_pauses_detector(with_dwdp):
     executor.dwdp_manager = Mock() if with_dwdp else None
     executor.hang_detector = HangDetector(timeout=1, on_detected=lambda: fired.append(1))
 
-    def complete_control_action():
-        # Bounded: if the control request fails before it sets the barrier, an unbounded wait
-        # would leave this thread alive and hang the test process.
-        if executor.control_request_barrier.wait(timeout=30):
-            time.sleep(2.0)
-            executor.control_action_done.set()
-            executor.control_request_barrier.clear()
+    now = 1000.0
 
-    completion_thread = threading.Thread(target=complete_control_action, daemon=True)
-    completion_thread.start()
+    async def stop_after_poll(_delay: float) -> None:
+        raise asyncio.CancelledError
+
+    def complete_control_action():
+        nonlocal now
+        assert executor.control_request_barrier.is_set()
+        now += 2 * executor.hang_detector.timeout
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(executor.hang_detector._watch())
+        executor.control_action_done.set()
+        executor.control_request_barrier.clear()
+
+    monkeypatch.setattr(hang_detector_module.time, "monotonic", lambda: now)
+    monkeypatch.setattr(hang_detector_module, "asyncio", SimpleNamespace(sleep=stop_after_poll))
+    executor.hang_detector.active = True
+    executor.hang_detector.checkpoint()
     try:
-        with patch("torch.cuda.synchronize"), executor.hang_detector:
-            executor.hang_detector.checkpoint()
+        with (
+            patch("torch.cuda.synchronize"),
+            patch.object(
+                executor.control_action_done, "wait", side_effect=complete_control_action
+            ) as wait,
+        ):
             executor._handle_control_request()
+        wait.assert_called_once_with()
     finally:
-        completion_thread.join(timeout=35)
+        executor.hang_detector.stop()
 
     assert fired == []
     assert executor.control_requests == []
@@ -286,28 +363,19 @@ def test_rank_crash_kill_fires_for_multi_rank(monkeypatch):
 
 
 def _assert_slept_then_killed(order, grace):
-    """Assert the grace was slept out EXACTLY ONCE before EXACTLY ONE kill.
-
-    Patching time.sleep is process-wide, so an unrelated background thread can
-    append its own ("sleep", x) while this runs; asserting exact list equality
-    would flake on that. But the counts must still be pinned: sleeping the
-    grace twice before killing (i.e. crash + 2*grace) is precisely the bug
-    class this PR series introduced with its two independent timers, and a
-    membership-only check accepts it.
-    """
-    assert order.count(("sleep", grace)) == 1, order
-    assert order.count("kill") == 1, order
-    assert order.index(("sleep", grace)) < order.index("kill"), order
+    """Assert exactly one grace wait followed by exactly one kill."""
+    assert order == [("sleep", grace), "kill"]
 
 
 def test_rank_crash_kill_sleeps_grace_before_kill(monkeypatch):
     """The grace must elapse BEFORE the kill so cleaner error paths win the race."""
+    grace = 2.5
     order = []
     monkeypatch.setattr(hang_detector_module, "propagate_hard_kill", lambda: order.append("kill"))
     monkeypatch.setattr(hang_detector_module.time, "sleep", lambda s: order.append(("sleep", s)))
-    monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, "2.5")
+    monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, str(grace))
     assert hard_kill_on_rank_crash(world_size=2) is True
-    _assert_slept_then_killed(order, 2.5)
+    _assert_slept_then_killed(order, grace)
 
 
 def test_rank_crash_kill_disabled_by_negative_grace(monkeypatch):
@@ -425,10 +493,12 @@ def test_watchdog_cancel_disarms_this_timer(monkeypatch):
         watchdog.join(timeout=60.0)
 
 
-def test_watchdog_deadline_is_grace_from_arming(monkeypatch):
-    monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, "5")
-    watchdog = hang_detector_module.RankCrashKillWatchdog(world_size=2, grace=5.0)
-    assert watchdog.deadline == pytest.approx(time.monotonic() + 5.0, abs=0.5)
+def test_watchdog_deadline_is_grace_from_arming(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = 1000.0
+    grace = 5.0
+    monkeypatch.setattr(hang_detector_module.time, "monotonic", lambda: now)
+    watchdog = hang_detector_module.RankCrashKillWatchdog(world_size=2, grace=grace)
+    assert watchdog.deadline == now + grace
 
 
 def test_kill_keeps_original_deadline_on_handover(monkeypatch):
@@ -440,18 +510,18 @@ def test_kill_keeps_original_deadline_on_handover(monkeypatch):
     (with monotonic pinned) rather than on wall-clock, so the margin does not
     depend on scheduling luck on a loaded CI node.
     """
+    now = 1000.0
+    grace = 30.0
+    elapsed = 29.5
+    remaining = grace - elapsed
     order = []
     monkeypatch.setattr(hang_detector_module, "propagate_hard_kill", lambda: order.append("kill"))
     monkeypatch.setattr(hang_detector_module.time, "sleep", lambda s: order.append(("sleep", s)))
-    monkeypatch.setattr(hang_detector_module.time, "monotonic", lambda: 1000.0)
-    monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, "30")
+    monkeypatch.setattr(hang_detector_module.time, "monotonic", lambda: now)
+    monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, str(grace))
 
-    # 29.5s of the 30s grace has already been burned by the watchdog.
-    assert hard_kill_on_rank_crash(world_size=2, deadline=1000.5) is True
-    # Exactly one 0.5s sleep, then exactly one kill -- never a second grace.
-    assert order.count(("sleep", 0.5)) == 1, order
-    assert not any(s == ("sleep", 30.0) for s in order), order
-    _assert_slept_then_killed(order, 0.5)
+    assert hard_kill_on_rank_crash(world_size=2, deadline=now + remaining) is True
+    _assert_slept_then_killed(order, remaining)
 
 
 def test_kill_fires_immediately_when_deadline_already_passed(monkeypatch):
@@ -461,15 +531,16 @@ def test_kill_fires_immediately_when_deadline_already_passed(monkeypatch):
     blanket except, which would return False and silently skip the kill --
     exactly in the case the watchdog exists for (cleanup outlasted the grace).
     """
+    now = 1000.0
+    overdue = 100.0
     order = []
     monkeypatch.setattr(hang_detector_module, "propagate_hard_kill", lambda: order.append("kill"))
     monkeypatch.setattr(hang_detector_module.time, "sleep", lambda s: order.append(("sleep", s)))
+    monkeypatch.setattr(hang_detector_module.time, "monotonic", lambda: now)
     monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, "30")
 
-    t0 = time.monotonic()
-    assert hard_kill_on_rank_crash(world_size=2, deadline=t0 - 100.0) is True
+    assert hard_kill_on_rank_crash(world_size=2, deadline=now - overdue) is True
     assert order == ["kill"], order
-    assert not [s for s in order if isinstance(s, tuple) and s[1] < 0], order
 
 
 def test_wait_out_kill_grace_never_sleeps_negative(monkeypatch):
@@ -927,24 +998,8 @@ def test_loop_terminating_break_sets_the_completion_sentinel():
         )
 
 
-def test_completion_sentinel_is_reset_per_event_loop_run():
-    """The reset in _event_loop_wrapper is load-bearing, not redundant with __init__.
-
-    PyExecutor outlives a single loop run; without the reset a second run
-    starts with the sentinel left True by the first, so a genuine crash in it
-    is misread as a clean shutdown and no kill is armed.
-    """
-    import inspect
-
-    from tensorrt_llm._torch.pyexecutor import py_executor as pe
-
-    assert "self._event_loop_completed = False" in inspect.getsource(
-        pe.PyExecutor._event_loop_wrapper
-    )
-
-
 def test_second_loop_run_still_kills_after_a_clean_first_run(monkeypatch):
-    """Behavioral guard for the reset above: run clean, then crash, on ONE executor."""
+    """A clean first run must not suppress crash handling on the same executor's next run."""
     from tensorrt_llm._torch.pyexecutor import py_executor as pe
 
     events = []
@@ -971,7 +1026,7 @@ def test_second_loop_run_still_kills_after_a_clean_first_run(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# The delivery gate (review: symmetric crashes must not become exit 137).
+# The delivery gate keeps reportable errors from becoming exit 137.
 # ---------------------------------------------------------------------------
 
 
@@ -1024,29 +1079,35 @@ def test_kill_fires_when_no_delivery_event_is_supplied(monkeypatch):
     assert calls == [1]
 
 
-def test_delivery_is_checked_after_the_grace_not_before(monkeypatch):
+def test_delivery_is_checked_after_the_grace_not_before(monkeypatch: pytest.MonkeyPatch) -> None:
     """The check must come after the wait, else it defeats its own purpose.
 
     The grace exists so the error can reach the client. Sampling the flag
     before waiting would read it while it is still False and kill anyway.
     """
+    grace = 0.5
     calls = []
     monkeypatch.setattr(
         hang_detector_module, "propagate_hard_kill", lambda *a, **k: calls.append(1)
     )
-    monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, "0.5")
+    monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, str(grace))
 
     delivered = threading.Event()
 
-    def deliver_during_grace():
-        time.sleep(0.15)
+    delivered_before_wait = []
+
+    def deliver_during_grace(remaining: float, cancelled: threading.Event | None) -> bool:
+        delivered_before_wait.append(delivered.is_set())
         delivered.set()
+        return True
 
-    t = threading.Thread(target=deliver_during_grace, daemon=True)
-    t.start()
+    wait = Mock(side_effect=deliver_during_grace)
+    monkeypatch.setattr(hang_detector_module, "_wait_out_kill_grace", wait)
     fired = hard_kill_on_rank_crash(4, error_delivered=delivered)
-    t.join(timeout=5)
 
+    wait.assert_called_once_with(grace, None)
+    assert delivered_before_wait == [False]
+    assert delivered.is_set()
     assert fired is False, "the flag was set during the grace window; the kill must observe it"
     assert calls == []
 
@@ -1057,33 +1118,30 @@ def test_watchdog_threads_the_delivery_event_through(monkeypatch):
         hang_detector_module, "propagate_hard_kill", lambda *a, **k: calls.append(1)
     )
     monkeypatch.setenv(RANK_CRASH_KILL_GRACE_ENV, "0")
+    monkeypatch.setattr(hang_detector_module.RankCrashKillWatchdog, "start", lambda self: None)
 
     delivered = threading.Event()
     delivered.set()
     wd = start_rank_crash_kill_watchdog(4, error_delivered=delivered)
     assert wd is not None
-    wd.join(timeout=5)
+    with patch.object(
+        hang_detector_module, "hard_kill_on_rank_crash", wraps=hard_kill_on_rank_crash
+    ) as kill:
+        wd.run()
+    kill.assert_called_once_with(
+        4, deadline=wd.deadline, cancelled=wd._cancelled, error_delivered=delivered
+    )
 
     assert calls == [], "watchdog killed despite a delivered error"
 
 
 # ---------------------------------------------------------------------------
-# Real 2-rank MPI: the kill and the gate, with propagate_hard_kill NOT mocked.
-#
-# Every other kill-path test in this file monkeypatches propagate_hard_kill,
-# so none of them exercises a real MPI_Abort (raised in review by @BowenFu).
-# These two do: they launch a real 2-rank MPI job and assert on the exit
-# status of the whole job.
-#
-# Scope, stated honestly: this proves the KILL MECHANISM and the delivery
-# gate over a real communicator. It is not a full 2-rank LLM crash -- there
-# is no engine here -- so it does not by itself prove the end-to-end claim
-# that a client sees the original exception. It does close the "nothing
-# exercises a real MPI_Abort" gap.
+# Real two-rank checks exercise communicator termination and delivery gating
+# without mocking propagate_hard_kill. They do not run an LLM.
 # ---------------------------------------------------------------------------
 
 _MPI_2RANK_SCRIPT = """
-import os, sys, time
+import os, sys
 from mpi4py import MPI
 from tensorrt_llm._torch.pyexecutor.hang_detector import hard_kill_on_rank_crash
 
@@ -1103,12 +1161,10 @@ if comm.Get_rank() == 0:
     hard_kill_on_rank_crash(comm.Get_size(), error_delivered=delivered)
     # Only reached when the kill is skipped.
     print("RANK0_SURVIVED", flush=True)
-else:
-    # A peer that would otherwise sit in a collective forever.
-    time.sleep(20)
-    print("RANK1_SURVIVED", flush=True)
-
+# The peer remains in the collective until rank 0 survives the gate.
 comm.Barrier()
+if comm.Get_rank() == 1:
+    print("RANK1_SURVIVED", flush=True)
 sys.exit(0)
 """
 
@@ -1152,8 +1208,8 @@ def test_real_mpi_abort_takes_down_both_ranks():
 def test_real_mpi_job_survives_when_the_error_was_delivered():
     """Delivered crash: no abort, so both ranks run to completion.
 
-    This is the review point -- a symmetric crash whose error already reached
-    the client must not have its tracebacks replaced by exit 137.
+    A symmetric crash already reported to the client must retain its traceback,
+    rather than becoming exit 137.
     """
     proc = _run_two_rank(delivered="1")
     out = (proc.stdout + proc.stderr).decode(errors="replace")
