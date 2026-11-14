@@ -1025,6 +1025,11 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, stageName, collect
         def shardRegularTests = []
         def shardIsolateTests = []
 
+        // Collection omits list markers; preserve options such as --ignore in the key.
+        def entryName = { line ->
+            line.replaceFirst(/\s+(?:XFAIL|SKIP|UNSTABLE|TIMEOUT)\b.*$/, '').trim()
+        }
+
         // Process each test from shardTestList
         shardTestList.each { test ->
             def trimmedTest = test.trim()
@@ -1038,13 +1043,16 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, stageName, collect
                 }
 
                 // Check if this test is in the isolation list
-                def isolationTestLine = isolationTestLines.find { it.contains(trimmedTest) }
+                def isolationTestLine = isolationTestLines.find { entryName(it) == trimmedTest }
                 if (isolationTestLine) {
                     // This test needs isolation
                     shardIsolateTests.add(isolationTestLine)
                 } else {
                     // This test is a regular test - find the actual line from cleanedTestLines
-                    def cleanedTestLine = cleanedTestLines.find { it.contains(trimmedTest) }
+                    def cleanedTestLine = cleanedTestLines.find { entryName(it) == trimmedTest }
+                    if (cleanedTestLine == null) {
+                        error "Collected test has no matching list entry: ${trimmedTest}"
+                    }
                     shardRegularTests.add(cleanedTestLine)
                 }
             }
