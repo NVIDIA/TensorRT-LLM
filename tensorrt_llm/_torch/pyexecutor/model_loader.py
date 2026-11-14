@@ -1301,6 +1301,10 @@ class ModelLoader:
         self._checkpoint_loader = checkpoint_loader
         config = self._load_and_validate_config(checkpoint_dir,
                                                 checkpoint_loader)
+        from ..attention.backends.fmha.prims_ts_precompile import \
+            start_precompile_workers
+
+        start_precompile_workers(config, self.mapping)
         # Some model constructors normalize or rewrite config fields. Capture
         # the registry identity from the resolved input before construction so
         # publication and reception qualify the architecture the user asked

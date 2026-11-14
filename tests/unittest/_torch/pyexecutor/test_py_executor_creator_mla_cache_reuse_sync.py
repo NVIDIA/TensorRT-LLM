@@ -476,7 +476,10 @@ def test_move_model_engine_metrics_moves_and_clears() -> None:
 
 def test_total_py_executor_creation_metric_finishes_on_success_and_error(monkeypatch) -> None:
     """Verify creation timing finishes on errors and completed metrics attach on success."""
+    from tensorrt_llm._torch.attention.backends.fmha import prims_ts_precompile as pp
+
     captured_metrics = None
+    closed = []
 
     @contextmanager
     def _timing_metric(metric_name, metrics):
@@ -488,6 +491,9 @@ def test_total_py_executor_creation_metric_finishes_on_success_and_error(monkeyp
             metrics[metric_name] = 1.5
 
     def _raise_during_creation(**kwargs):
+        session = pp._session.get()
+        assert session is not None
+        session.group = SimpleNamespace(close=lambda: closed.append("error"))
         raise RuntimeError("creation failed")
 
     monkeypatch.setattr(py_executor_creator, "timing_metric", _timing_metric)
@@ -497,18 +503,25 @@ def test_total_py_executor_creation_metric_finishes_on_success_and_error(monkeyp
         py_executor_creator.create_py_executor(SimpleNamespace())
 
     assert captured_metrics == {"total_py_executor_creation_seconds": 1.5}
+    assert closed == ["error"]
+    assert pp._session.get() is None
 
     py_executor = object.__new__(PyExecutor)
     py_executor._metrics = {"worker_start_seconds": 0.25}
 
     def _return_executor(*, creation_metrics: dict[str, float], **kwargs: object) -> PyExecutor:
         assert "total_py_executor_creation_seconds" not in creation_metrics
+        session = pp._session.get()
+        assert session is not None
+        session.group = SimpleNamespace(close=lambda: closed.append("success"))
         creation_metrics["model_engine_creation_seconds"] = 1.0
         return py_executor
 
     monkeypatch.setattr(py_executor_creator, "_create_py_executor", _return_executor)
     result = py_executor_creator.create_py_executor(SimpleNamespace())
 
+    assert closed == ["error", "success"]
+    assert pp._session.get() is None
     assert result is py_executor
     assert result.metrics == {
         "worker_start_seconds": 0.25,

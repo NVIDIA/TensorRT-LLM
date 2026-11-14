@@ -979,6 +979,50 @@ def test_decode_prewarm_failure_still_reaches_barrier() -> None:
     owner.dist.tp_allgather.assert_called_once_with(1)
 
 
+@pytest.mark.cpu_only
+def test_prims_ts_prewarm_prepares_metadata_and_barriers() -> None:
+    from tensorrt_llm._torch.attention.backends.fmha import prims_ts_sparse_mla
+    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.metadata import (
+        DeepseekV4TrtllmAttentionMetadata,
+    )
+
+    events = []
+    metadata = object()
+    owner = SimpleNamespace(
+        _config=SimpleNamespace(
+            attention_backend=SimpleNamespace(Metadata=DeepseekV4TrtllmAttentionMetadata),
+            spec_config=None,
+        ),
+        _metadata=SimpleNamespace(
+            setup_attention=Mock(side_effect=lambda *args: events.append("metadata") or metadata)
+        ),
+        model=object(),
+        mapping=SimpleNamespace(cp_size=1, tp_size=4),
+        dist=SimpleNamespace(tp_allgather=Mock(side_effect=lambda *args: events.append("barrier"))),
+    )
+    resources, manager = object(), SimpleNamespace(context_swa_layer_limit=None)
+    with (
+        patch.object(decoder_warmup_module, "get_draft_kv_cache_manager", return_value=None),
+        patch.object(
+            prims_ts_sparse_mla,
+            "warmup_prims_ts_sparse_mla",
+            side_effect=lambda *args: events.append("kernels"),
+        ) as warm,
+        patch.object(torch.cuda, "synchronize", side_effect=lambda: events.append("sync")),
+    ):
+        DecoderWarmup._prewarm_prims_ts_sparse_mla(owner, resources, manager)
+        assert events == ["metadata", "kernels", "sync", "barrier"]
+        warm.assert_called_once_with(owner.model, metadata)
+        owner._metadata.setup_attention.assert_called_once_with(manager, None)
+        events.clear()
+        manager.context_swa_layer_limit = 1
+        DecoderWarmup._prewarm_prims_ts_sparse_mla(owner, resources, manager)
+        owner._config.attention_backend.Metadata = TrtllmAttentionMetadata
+        manager.context_swa_layer_limit = None
+        DecoderWarmup._prewarm_prims_ts_sparse_mla(owner, resources, manager)
+        assert events == []  # Context-only workers and other backends do not precompile.
+
+
 class TestWarmupCleanup(unittest.TestCase):
     def test_empty_cache_fires_immediately_after_autotuner(self) -> None:
         """Change 1 placement: empty_cache must be the call right after

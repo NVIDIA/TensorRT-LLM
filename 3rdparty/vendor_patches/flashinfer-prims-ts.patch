@@ -1,5 +1,5 @@
 diff --git a/_compile_cache.py b/_compile_cache.py
-index b374a65311402982d818d80e9145ab40ed9727a1..cdfa76294f2d854117db62ad36724254006f8cb8 100644
+index b374a65311402982d818d80e9145ab40ed9727a1..db8416f07e37945a8e8764ac202e446f301d54d8 100644
 --- a/_compile_cache.py
 +++ b/_compile_cache.py
 @@ -1,3 +1,4 @@
@@ -7,150 +7,7 @@ index b374a65311402982d818d80e9145ab40ed9727a1..cdfa76294f2d854117db62ad36724254
  # Copyright (c) 2026 by FlashInfer team.
  #
  # Licensed under the Apache License, Version 2.0 (the "License");
-@@ -15,10 +16,13 @@
- """Persistent compilation shared by the PrimTS attention adapters."""
- 
- from collections.abc import Callable
-+import contextlib
-+import contextvars
- import dataclasses
- import enum
- import functools
- import hashlib
-+import os
- from pathlib import Path
- from typing import Any
- 
-@@ -64,6 +68,128 @@ def _compile_cache_key(spec: object, options: str, extra: tuple = ()) -> str | N
-     return hashlib.sha256(encoded.encode()).hexdigest()
- 
- 
-+# Warm-up precompile modes. Under ``precompile_only()`` the attention kernels
-+# are compiled through ``JitSpecCuteDsl.compile_and_persist()`` (the
-+# ``cute.compile`` runs outside the module-level file lock that
-+# ``build_and_load()`` holds for a whole build, so sibling processes compile
-+# different kernels concurrently), committed to disk, and not loaded: the
-+# serving process loads them afterwards. Under ``probe_cached()`` nothing is
-+# compiled; a kernel missing from the cache raises ``KernelNotCached``. Both
-+# modes return a placeholder in place of the kernel.
-+_PRECOMPILE_MODE: contextvars.ContextVar[str | None] = contextvars.ContextVar(
-+    "prims_ts_precompile_mode", default=None
-+)
-+_SKIP_BUSY: contextvars.ContextVar[bool] = contextvars.ContextVar(
-+    "prims_ts_precompile_skip_busy", default=False
-+)
-+
-+
-+class KernelNotCached(Exception):
-+    """Raised under ``probe_cached()`` for a kernel that is not on disk."""
-+
-+
-+class KernelBusy(Exception):
-+    """Raised under ``precompile_only(skip_busy=True)`` while another process compiles the kernel."""
-+
-+
-+@contextlib.contextmanager
-+def precompile_only(*, skip_busy: bool = False):
-+    """Compile and persist kernels without loading them (see module note).
-+
-+    With ``skip_busy`` a kernel whose per-kernel lock another process holds
-+    raises ``KernelBusy`` instead of waiting, so a worker can defer it and
-+    compile something else first.
-+    """
-+    token = _PRECOMPILE_MODE.set("persist")
-+    busy_token = _SKIP_BUSY.set(skip_busy)
-+    try:
-+        yield
-+    finally:
-+        _SKIP_BUSY.reset(busy_token)
-+        _PRECOMPILE_MODE.reset(token)
-+
-+
-+@contextlib.contextmanager
-+def probe_cached():
-+    """Report, without compiling, whether every kernel a plan needs is on disk."""
-+    token = _PRECOMPILE_MODE.set("probe")
-+    try:
-+        yield
-+    finally:
-+        _PRECOMPILE_MODE.reset(token)
-+
-+
-+def expected_cache_meta() -> dict:
-+    """The on-disk module metadata this process would write (arch, DSL version, source hash)."""
-+    from flashinfer.jit.cute_dsl_core import (
-+        _get_compile_arch,
-+        _get_cute_dsl_version,
-+        _hash_source_files,
-+    )
-+
-+    return {
-+        "arch": _get_compile_arch(),
-+        "cute_dsl_version": _get_cute_dsl_version(),
-+        "source_sha256": _hash_source_files(tuple(_kernel_source_files())),
-+    }
-+
-+
-+def _unloaded_kernel(*args, **kwargs):
-+    raise RuntimeError(
-+        "PrimTS kernel was compiled in precompile-only mode and never loaded; "
-+        "load it through a normal plan() outside precompile_only()."
-+    )
-+
-+
-+def is_placeholder(compiled) -> bool:
-+    """True for the stand-in returned under the precompile modes."""
-+    return compiled is _unloaded_kernel
-+
-+
-+def _make_spec(module_name: str, kernel_name: str, compile_fn, key_files):
-+    from flashinfer.jit.cute_dsl_core import JitSpecCuteDsl, _hash_source_files
-+
-+    return JitSpecCuteDsl(module_name, kernel_name, compile_fn, _hash_source_files(tuple(key_files)))
-+
-+
-+def _precompile_kernel(module_name: str, kernel_name: str, compile_fn, key_files) -> None:
-+    """Compile one kernel into the on-disk cache unless it is already there.
-+
-+    One compile per kernel per workspace: a sibling that wants the same kernel
-+    waits on the per-kernel lock (or raises ``KernelBusy`` under ``skip_busy``)
-+    and then finds it on disk. The lock lives in FlashInfer's tmp directory,
-+    not in the module directory: creating that directory before the first
-+    export would let ``compile_and_persist()`` of a sibling read a missing
-+    meta.json as a stale module and wipe the exports already there.
-+    """
-+    from filelock import FileLock, Timeout
-+    from flashinfer.jit.core import get_tmpdir
-+
-+    spec = _make_spec(module_name, kernel_name, compile_fn, key_files)
-+    if spec.is_compiled:
-+        return
-+    lock = FileLock(get_tmpdir() / f"{spec.module_dir_name}.{spec.kernel_name}.lock", thread_local=False)
-+    if _SKIP_BUSY.get():
-+        try:
-+            lock.acquire(timeout=0)
-+        except Timeout:
-+            raise KernelBusy(spec.name) from None
-+    else:
-+        lock.acquire()
-+    try:
-+        if spec.is_compiled:
-+            return
-+        spec.compile_and_persist()
-+    finally:
-+        lock.release()
-+
-+
-+def _probe_kernel(module_name: str, kernel_name: str, compile_fn, key_files) -> None:
-+    spec = _make_spec(module_name, kernel_name, compile_fn, key_files)
-+    if not spec.is_compiled:
-+        raise KernelNotCached(spec.name)
-+
-+
- @functools.cache
- def _kernel_source_files() -> tuple[str, ...]:
-     # Family adapters share masks, reductions, sparse/Sage preparation and
-@@ -82,16 +208,26 @@ def build_and_load_attention_kernel(
+@@ -82,7 +83,7 @@ def build_and_load_attention_kernel(
      extra: tuple = (),
  ) -> Any:
      """Build or load under the caller's selected CUDA device context."""
@@ -159,40 +16,6 @@ index b374a65311402982d818d80e9145ab40ed9727a1..cdfa76294f2d854117db62ad36724254
          build_and_load_cute_dsl_kernel,
          cute_dsl_cache_disabled,
      )
- 
-+    mode = _PRECOMPILE_MODE.get()
-+    if mode is not None and os.environ.get("FLASHINFER_DISABLE_JIT"):
-+        raise RuntimeError("PrimTS warm-up precompile cannot compile with FLASHINFER_DISABLE_JIT set.")
-     if cute_dsl_cache_disabled():
-+        if mode is not None:
-+            raise RuntimeError(
-+                "PrimTS warm-up precompile needs the on-disk CuTe DSL cache "
-+                "(FLASHINFER_CUTE_DSL_DISABLE_CACHE=1 is set)."
-+            )
-         return compile_fn()
- 
-     key = _compile_cache_key(spec, options, extra)
-     if key is None:
-+        if mode is not None:
-+            raise RuntimeError("PrimTS warm-up precompile cannot key this kernel for the on-disk cache.")
-         return compile_fn()
-     import torch
- 
-@@ -99,6 +235,14 @@ def build_and_load_attention_kernel(
-     # host-selected tuning defaults. The module metadata keys the target;
-     # the specialization must also distinguish the physical capability.
-     major, minor = torch.cuda.get_device_capability()
-+    if mode == "persist":
-+        _precompile_kernel(
-+            f"prims_ts_{family}", f"{kind}_sm{major}{minor}_{key}", compile_fn, _kernel_source_files()
-+        )
-+        return _unloaded_kernel
-+    if mode == "probe":
-+        _probe_kernel(f"prims_ts_{family}", f"{kind}_sm{major}{minor}_{key}", compile_fn, _kernel_source_files())
-+        return _unloaded_kernel
-     return build_and_load_cute_dsl_kernel(
-         f"prims_ts_{family}",
-         f"{kind}_sm{major}{minor}_{key}",
 diff --git a/block_sparse.py b/block_sparse.py
 index 4769d6b6a8c6009b22abf1850fb7f2df68216f8e..5ac63fcca05d8668e4367d0843c4c6d53e46175d 100644
 --- a/block_sparse.py
@@ -332,61 +155,6 @@ index d8b009efc5a9224b4c81e3b7fd51bdb27ae1cc7c..1cdad28f48e3d54758735b3dc905335a
  def batch_decode_with_paged_kv_cache(
      q: torch.Tensor,
      paged_kv_cache: PagedKVCache,
-diff --git a/kernels/fmha_context/fmha_resources.py b/kernels/fmha_context/fmha_resources.py
-index 17df005fcdb7bdd757e2dcd957b294d83b7cc41b..1b25383975ce5d5038748e57517819fd8317c22b 100644
---- a/kernels/fmha_context/fmha_resources.py
-+++ b/kernels/fmha_context/fmha_resources.py
-@@ -1,3 +1,4 @@
-+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
- # Copyright (c) 2026 by FlashInfer team.
- #
- # Licensed under the Apache License, Version 2.0 (the "License");
-@@ -1454,8 +1455,6 @@ class GmemQKVResource(MemoryResource):
-                 if cutlass.const_expr(self.cfg.has_uniform_varlen):
-                     seqlen_k = Int32(self.cfg.uniform_seq_len_k)
-                 else:
--                    from .helpers_paged import _load_runtime_seq_len_kv
--
-                     seqlen_k = _load_runtime_seq_len_kv(
-                         self.seqlens_kv, self.max_seq_len_kv, batch_coord
-                     )
-@@ -1478,8 +1477,6 @@ class GmemQKVResource(MemoryResource):
-                     kv_request_begin = batch_coord * Int32(self.block_table_row_stride)
-                     kv_page_idx_ub = Int32(self.cfg.max_num_pages_per_seq_kv - 1)
-                 else:
--                    from .helpers_paged import _load_block_table_row_bounds
--
-                     kv_request_begin, kv_page_idx_ub = _load_block_table_row_bounds(
-                         Int32(self.block_table_row_stride),
-                         self.cfg,
-@@ -1566,13 +1563,9 @@ class GmemQKVResource(MemoryResource):
-             kv_request_begin = batch_coord * Int32(self.block_table_row_stride)
-             kv_page_idx_ub = Int32(self.cfg.max_num_pages_per_seq_kv - 1)
-         else:
--            from .helpers_paged import _load_runtime_seq_len_kv
--
-             cached_seqlen_kv = _load_runtime_seq_len_kv(
-                 self.seqlens_kv, self.max_seq_len_kv, batch_coord
-             )
--            from .helpers_paged import _load_block_table_row_bounds
--
-             kv_request_begin, kv_page_idx_ub = _load_block_table_row_bounds(
-                 Int32(self.block_table_row_stride),
-                 self.cfg,
-@@ -7822,3 +7815,13 @@ class GmemOResource(MemoryResource):
-                 prims.cp_async_bulk_commit_group()
-                 if cutlass.const_expr(self.cfg.gmem_o_store_wait_after_write):
-                     prims.cp_async_bulk_wait_group(0, read=True)
-+
-+
-+# helpers_paged imports FmhaConfig from this module, so it is imported here,
-+# after FmhaConfig is defined. The methods above call these helpers while being
-+# traced inside the kernel's runtime loops, where the CuTe DSL rejects a first
-+# import of a module; importing at module scope keeps those calls import-free.
-+from .helpers_paged import (
-+    _load_block_table_row_bounds,
-+    _load_runtime_seq_len_kv,
-+)
 diff --git a/kernels/fmha_decode/fmha_decode_resources/tmem_transformed_kv.py b/kernels/fmha_decode/fmha_decode_resources/tmem_transformed_kv.py
 index 6787e8ab5b566849ccc5ba228da220ed55898ea7..c11e9d211020c646a5a71cd309074d6bb70da119 100644
 --- a/kernels/fmha_decode/fmha_decode_resources/tmem_transformed_kv.py
@@ -418,33 +186,8 @@ index 8b2e8a43e5553ed33b67603273e0cc1fbd3585ae..fd3f735ede1f723f66d76f45a6490921
  from ...tensor_map import create_tensor_map_tiled_from_view
  from .gather import _address, gather4, select_gather_map
  from ...fmha_decode.fmha_decode_resources.tmem_transformed_kv import (
-diff --git a/kernels/mla_decode/throughput_latency_1cta/parallel_reduction.py b/kernels/mla_decode/throughput_latency_1cta/parallel_reduction.py
-index 0f953c00ed9a42f2eba63de8923bd3a21951245e..fd825a70072c597511d37230198964e2788a2af7 100644
---- a/kernels/mla_decode/throughput_latency_1cta/parallel_reduction.py
-+++ b/kernels/mla_decode/throughput_latency_1cta/parallel_reduction.py
-@@ -353,17 +353,17 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
-                     cutlass.const_expr(lane_slot_i == 0)
-                     or Int32(lane_slot_i * GMEM_REDUCTION_WARP_LANES) < split_limit
-                 ):
--                    stats_split_idx = lane_idx + Int32(
-+                    weight_split_idx = lane_idx + Int32(
-                         lane_slot_i * GMEM_REDUCTION_WARP_LANES
-                     )
--                    if stats_split_idx < split_limit:
-+                    if weight_split_idx < split_limit:
-                         stats_weight = normalized_lse_weight(
-                             lane_lse[lane_slot_i], global_lse
-                         )
-                         if cutlass.const_expr(finalize_attention):
-                             stats_weight *= stats_sink_scale
-                         smem_scale[
--                            stats_row * Int32(cfg.num_ctas_per_seq_kv) + stats_split_idx
-+                            stats_row * Int32(cfg.num_ctas_per_seq_kv) + weight_split_idx
-                         ] = stats_weight
- 
-     prims.barrier_cta_sync(
 diff --git a/mla_decode.py b/mla_decode.py
-index 94547ed86f7365df3638215daa0762ff1344741f..d0916ceffe0839ff9dd5c26fcf380a7bf4e50862 100644
+index c66498fb6c0eaa633d6beb823cc946a5ee8ef5a1..f665a997df0bb9cbaf03ee43623b835b5b05188a 100644
 --- a/mla_decode.py
 +++ b/mla_decode.py
 @@ -1,3 +1,4 @@
@@ -466,44 +209,7 @@ index 94547ed86f7365df3638215daa0762ff1344741f..d0916ceffe0839ff9dd5c26fcf380a7b
  
  
  from .decode import (
-@@ -1196,8 +1193,34 @@ def _make_mla_decode_compile_spec(
- _cached_mla_decode_compile_spec = functools.cache(_make_mla_decode_compile_spec)
- 
- 
--@functools.cache
--def _get_compiled_mla_decode(
-+_COMPILED_MLA_DECODE: dict = {}
-+
-+
-+def _get_compiled_mla_decode(compile_spec: _MLADecodeCompileSpec):
-+    """Compile and cache one batch-dynamic TS MLA topology.
-+
-+    A manual memo rather than ``functools.cache``: under the warm-up precompile
-+    modes of ``_compile_cache`` the build returns a placeholder (probe / persist
-+    only), which must not be remembered for the serving launches that follow.
-+    """
-+    compiled = _COMPILED_MLA_DECODE.get(compile_spec)
-+    if compiled is None:
-+        compiled = _compile_mla_decode(compile_spec)
-+        if not _compile_cache_is_placeholder(compiled):
-+            _COMPILED_MLA_DECODE[compile_spec] = compiled
-+    return compiled
-+
-+
-+_get_compiled_mla_decode.cache_clear = _COMPILED_MLA_DECODE.clear  # type: ignore[attr-defined]
-+
-+
-+def _compile_cache_is_placeholder(compiled) -> bool:
-+    from ._compile_cache import is_placeholder
-+
-+    return is_placeholder(compiled)
-+
-+
-+def _compile_mla_decode(
-     compile_spec: _MLADecodeCompileSpec,
- ):
-     """Compile and cache one batch-dynamic TS MLA topology."""
-@@ -1897,7 +1920,7 @@ class BatchMLADecodePagedTSWrapper:
+@@ -1897,7 +1894,7 @@ class BatchMLADecodePagedTSWrapper:
              softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
          )
  
@@ -512,7 +218,7 @@ index 94547ed86f7365df3638215daa0762ff1344741f..d0916ceffe0839ff9dd5c26fcf380a7b
      def run(
          self,
          query: torch.Tensor,
-@@ -2013,7 +2036,7 @@ class BatchMLADecodePagedTSWrapper:
+@@ -2013,7 +2010,7 @@ class BatchMLADecodePagedTSWrapper:
          return (result, lse) if return_lse else result
  
  
@@ -521,15 +227,7 @@ index 94547ed86f7365df3638215daa0762ff1344741f..d0916ceffe0839ff9dd5c26fcf380a7b
  def batch_mla_decode_with_paged_kv_cache(
      query: torch.Tensor,
      kv_cache: torch.Tensor,
-@@ -2379,6 +2402,7 @@ def _prepare_sparse_output_quant(
-     )
- 
- 
-+@functools.lru_cache(maxsize=1024)
- def _resolve_sparse_mla_plan(
-     device,
-     batch_size,
-@@ -2411,17 +2435,17 @@ def _resolve_sparse_mla_plan(
+@@ -2411,17 +2408,17 @@ def _resolve_sparse_mla_plan(
      affect geometry or workspace sizing.
      """
      import cutlass
@@ -551,226 +249,6 @@ index 94547ed86f7365df3638215daa0762ff1344741f..d0916ceffe0839ff9dd5c26fcf380a7b
          MlaDecodeTs,
      )
  
-@@ -2809,6 +2833,9 @@ def resolve_sparse_d576_reload_plan(
-     return device, profile, spec, sections, byte_end, capacity, None
- 
- 
-+_PREPARED_LAUNCH_LIMIT = 256
-+
-+
- class BatchSparseMLADecodePagedTSWrapper:
-     """Plan native BF16/E4M3 attention, then bind one or two source index lists.
- 
-@@ -2859,6 +2886,7 @@ class BatchSparseMLADecodePagedTSWrapper:
-     def __init__(self, workspace_buffer=None):
-         self._workspace_buffer = workspace_buffer
-         self._state = None
-+        self._prepared: dict[tuple, dict] = {}
-         self.workspace_size_bytes = 0
- 
-     def plan(
-@@ -3041,6 +3069,7 @@ class BatchSparseMLADecodePagedTSWrapper:
-                 kernel_signature=_mla_kernel_compile_signature(kernel),
-             )
-         compiled = _get_compiled_mla_decode(spec)
-+        self._prepared.clear()
-         self._state = dict(
-             reload_d576=reload_d576,
-             device=device,
-@@ -3276,6 +3305,49 @@ class BatchSparseMLADecodePagedTSWrapper:
-         state = self._state
-         if state is None:
-             raise RuntimeError("plan() must be called before run()")
-+        softmax_scale = resolve_scale(
-+            softmax_scale, state["softmax_scale"], "softmax_scale", state["device"]
-+        )
-+        output_scale = resolve_scale(
-+            output_scale, state["output_scale"], "output_scale", state["device"]
-+        )
-+        kv_cache_scale = resolve_scale(
-+            kv_cache_scale, state["kv_cache_scale"], "kv_cache_scale", state["device"]
-+        )
-+        lse_arg = lse
-+        prepared_key = (
-+            kv_cache.data_ptr(),
-+            kv_cache.shape,
-+            kv_cache.stride(),
-+            kv_cache.dtype,
-+            None
-+            if extra_kv_cache is None
-+            else (
-+                extra_kv_cache.data_ptr(),
-+                extra_kv_cache.shape,
-+                extra_kv_cache.stride(),
-+                extra_kv_cache.dtype,
-+            ),
-+            None if attention_sinks is None else attention_sinks.data_ptr(),
-+            softmax_scale,
-+            output_scale,
-+        )
-+        if (
-+            not validate
-+            and out is not None
-+            and lse is None
-+            and qo_indptr is None
-+            and token_positions is None
-+            and cos_sin_cache is None
-+            and out_scale is None
-+            and type(kv_cache_scale) in (int, float)
-+            and kv_cache_scale == 1.0
-+        ):
-+            prepared = self._prepared.get(prepared_key)
-+            if prepared is not None:
-+                return self._run_prepared(
-+                    prepared, query, indices, lengths, extra_indices, extra_lengths, out
-+                )
-         _validate_query(
-             query,
-             packed_query=state["packed_query"],
-@@ -3344,15 +3416,6 @@ class BatchSparseMLADecodePagedTSWrapper:
-             raise ValueError("attention_sinks must be contiguous CUDA FP32[H]")
-         if validate and torch.isnan(attention_sinks).any().item():
-             raise ValueError("attention_sinks must not contain NaN")
--        softmax_scale = resolve_scale(
--            softmax_scale, state["softmax_scale"], "softmax_scale", state["device"]
--        )
--        output_scale = resolve_scale(
--            output_scale, state["output_scale"], "output_scale", state["device"]
--        )
--        kv_cache_scale = resolve_scale(
--            kv_cache_scale, state["kv_cache_scale"], "kv_cache_scale", state["device"]
--        )
-         if state["kv_cache_format"] != "fp8" and (
-             isinstance(kv_cache_scale, torch.Tensor) or kv_cache_scale != 1.0
-         ):
-@@ -3479,10 +3542,127 @@ class BatchSparseMLADecodePagedTSWrapper:
-                 compiled=state["compiled"],
-                 max_q_len=1,
-             )
-+        if (
-+            rows
-+            and quant is None
-+            and not state["packed_query"]
-+            and not state["return_lse"]
-+            and state["max_q_len"] == 1
-+            and state["query_dim"] == 512
-+            and state["kv_cache_format"] == "native"
-+            and state["extra_kv_cache_format"] == "native"
-+            and lse_arg is None
-+        ):
-+            # Static for this (plan, pools, scales): pool views, scalars, sinks, split,
-+            # workspace. The next validate=False launch with the same pools re-forms
-+            # only the query / index / output views (see _run_prepared).
-+            if len(self._prepared) >= _PREPARED_LAUNCH_LIMIT:
-+                self._prepared.clear()
-+            self._prepared[prepared_key] = dict(
-+                primary=primary,
-+                extra=extra,
-+                primary_rows=primary.shape[0],
-+                c_latent=primary.permute(1, 2, 0),
-+                c_rope=extra.permute(1, 2, 0),
-+                sinks=attention_sinks,
-+                bmm=(softmax_scale, output_scale),
-+                ks=state["max_topk"],
-+                kc=state["max_extra_topk"],
-+                dummy_indices=state["dummy_indices"],
-+                default_cl=state["default_cl"],
-+            )
-         if quant is not None:
-             return (out, out_scale, lse) if state["return_lse"] else (out, out_scale)
-         return (out, lse) if state["return_lse"] else out
- 
-+    def _run_prepared(self, prepared, query, indices, lengths, extra_indices, extra_lengths, out):
-+        """Launch with the static arguments recorded by the last full run().
-+
-+        Only the per-call tensors are checked and viewed: query and output
-+        geometry, index/length shapes, dtypes and strides. Pool geometry,
-+        scales and sinks were validated by the full path that prepared this
-+        launch, and the caller passed validate=False. Byte-identical to the
-+        full path for the same arguments.
-+        """
-+        state = self._state
-+        rows, heads, device = state["batch_size"], state["num_qo_heads"], state["device"]
-+        if (
-+            query.shape != (rows, 1, heads, 512)
-+            or query.dtype != state["q_dtype"]
-+            or query.device != device
-+            or not query.is_contiguous()
-+            or query.data_ptr() % 16
-+        ):
-+            raise ValueError(
-+                "prepared launch: query must be a contiguous, 16-byte aligned "
-+                "[batch, 1, heads, 512] tensor of the planned dtype on the planned device"
-+            )
-+        if (
-+            out.numel() != rows * heads * 512
-+            or out.dtype != torch.bfloat16
-+            or out.device != device
-+            or not out.is_contiguous()
-+            or out.data_ptr() % 16
-+        ):
-+            raise ValueError(
-+                "prepared launch: out must be a contiguous, 16-byte aligned BF16 tensor "
-+                "holding one 512-wide row per query head"
-+            )
-+        if (
-+            indices.shape != (rows, prepared["ks"])
-+            or indices.dtype != torch.int32
-+            or indices.device != device
-+            or indices.stride(-1) != 1
-+            or lengths.shape != (rows,)
-+            or lengths.dtype != torch.int32
-+            or lengths.device != device
-+            or not lengths.is_contiguous()
-+        ):
-+            raise ValueError("prepared launch: invalid primary indices/lengths")
-+        if prepared["kc"]:
-+            if (
-+                not isinstance(extra_indices, torch.Tensor)
-+                or not isinstance(extra_lengths, torch.Tensor)
-+                or extra_indices.shape != (rows, prepared["kc"])
-+                or extra_indices.dtype != torch.int32
-+                or extra_indices.device != device
-+                or extra_indices.stride(-1) != 1
-+                or extra_lengths.shape != (rows,)
-+                or extra_lengths.dtype != torch.int32
-+                or extra_lengths.device != device
-+                or not extra_lengths.is_contiguous()
-+            ):
-+                raise ValueError("prepared launch: invalid extra indices/lengths")
-+            ci, cl = extra_indices, extra_lengths
-+        else:
-+            if extra_indices is not None or extra_lengths is not None:
-+                raise ValueError("prepared launch: extra indices without a planned extra pool")
-+            ci, cl = prepared["dummy_indices"][:rows], prepared["default_cl"][:rows]
-+        buffers = state["buffers"]
-+        sinks = prepared["sinks"]
-+        q_kernel = query.permute(2, 3, 1, 0)
-+        lse_kernel = buffers["public_lse"][:rows].view(rows, 1, heads).permute(2, 1, 0)
-+        bmm1, bmm2 = prepared["bmm"]
-+        state["compiled"](
-+            q_kernel,
-+            q_kernel,
-+            prepared["c_latent"],
-+            prepared["c_rope"],
-+            indices.transpose(0, 1),
-+            out.view(rows, 1, heads, 512).permute(2, 3, 1, 0),
-+            lse_kernel,
-+            buffers["core"] if buffers["core"].numel() else None,
-+            state["requested_splits"],
-+            lengths,
-+            None,
-+            (indices, ci, lengths, cl, sinks, 1.0),
-+            bmm1,
-+            bmm2,
-+            None,
-+            1,
-+        )
-+        return out
-+
- 
- def get_prims_ts_sparse_mla_decode_workspace_size(*plan_args, **plan_kwargs):
-     """Return workspace bytes using the same arguments as wrapper.plan().
 diff --git a/q_token_kv_block_sparse_metadata.py b/q_token_kv_block_sparse_metadata.py
 index 8ca2ea99c7ccd323a1823df104b12a39de9bb25f..598d232c84cedae4bbb128f22d94c9421b654314 100644
 --- a/q_token_kv_block_sparse_metadata.py

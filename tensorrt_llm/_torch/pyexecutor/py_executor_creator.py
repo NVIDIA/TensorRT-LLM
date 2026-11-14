@@ -43,6 +43,7 @@ from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 if TYPE_CHECKING:
     from tensorrt_llm.executor.ipc import IpcQueue
 
+from ..attention.backends.fmha.prims_ts_precompile import precompile_session
 from ..attention.backends.interface import AttentionRuntimeFeatures
 from ..attention.backends.utils import get_attention_backend
 from ..distributed import Distributed
@@ -612,7 +613,8 @@ def _create_py_executor_impl(
         A fully initialized PyExecutor instance.
     """
     creation_metrics: dict[str, float] = {}
-    with timing_metric("total_py_executor_creation_seconds", creation_metrics):
+    with precompile_session(), timing_metric(
+            "total_py_executor_creation_seconds", creation_metrics):
         py_executor = _create_py_executor(
             llm_args=llm_args,
             _startup_timer=_startup_timer,

@@ -1193,34 +1193,8 @@ def _make_mla_decode_compile_spec(
 _cached_mla_decode_compile_spec = functools.cache(_make_mla_decode_compile_spec)
 
 
-_COMPILED_MLA_DECODE: dict = {}
-
-
-def _get_compiled_mla_decode(compile_spec: _MLADecodeCompileSpec):
-    """Compile and cache one batch-dynamic TS MLA topology.
-
-    A manual memo rather than ``functools.cache``: under the warm-up precompile
-    modes of ``_compile_cache`` the build returns a placeholder (probe / persist
-    only), which must not be remembered for the serving launches that follow.
-    """
-    compiled = _COMPILED_MLA_DECODE.get(compile_spec)
-    if compiled is None:
-        compiled = _compile_mla_decode(compile_spec)
-        if not _compile_cache_is_placeholder(compiled):
-            _COMPILED_MLA_DECODE[compile_spec] = compiled
-    return compiled
-
-
-_get_compiled_mla_decode.cache_clear = _COMPILED_MLA_DECODE.clear  # type: ignore[attr-defined]
-
-
-def _compile_cache_is_placeholder(compiled) -> bool:
-    from ._compile_cache import is_placeholder
-
-    return is_placeholder(compiled)
-
-
-def _compile_mla_decode(
+@functools.cache
+def _get_compiled_mla_decode(
     compile_spec: _MLADecodeCompileSpec,
 ):
     """Compile and cache one batch-dynamic TS MLA topology."""
@@ -1631,9 +1605,13 @@ def _launch_mla_decode(
     lse_storage = workspace.lse if lse is None else lse
     if packed_query and int(runtime.query.shape[0]) == 0:
         return runtime.out
+    has_rope = runtime.query.shape[-1] != kv_lora_rank
+    query_latent = runtime.query[..., :kv_lora_rank] if has_rope else runtime.query
     if packed_query:
-        q_latent = runtime.query[..., :kv_lora_rank].permute(1, 2, 0)
-        q_rope = runtime.query[..., kv_lora_rank:].permute(1, 2, 0)
+        q_latent = query_latent.permute(1, 2, 0)
+        q_rope = (
+            runtime.query[..., kv_lora_rank:].permute(1, 2, 0) if has_rope else q_latent
+        )
         out_kernel = runtime.out.permute(1, 2, 0)
         total_q = int(runtime.query.shape[0])
         lse_kernel = (
@@ -1642,21 +1620,25 @@ def _launch_mla_decode(
             else None
         )
     else:
-        q_latent = runtime.query[..., :kv_lora_rank].permute(2, 3, 1, 0)
-        q_rope = runtime.query[..., kv_lora_rank:].permute(2, 3, 1, 0)
+        q_latent = query_latent.permute(2, 3, 1, 0)
+        q_rope = (
+            runtime.query[..., kv_lora_rank:].permute(2, 3, 1, 0)
+            if has_rope
+            else q_latent
+        )
         out_kernel = runtime.out.permute(2, 3, 1, 0)
         lse_kernel = lse_storage.permute(2, 1, 0) if lse_storage is not None else None
     c_latent = (
         runtime.normalized_cache
-        if runtime.normalized_cache.dtype == torch.uint8
+        if runtime.normalized_cache.dtype == torch.uint8 or not has_rope
         else runtime.normalized_cache[..., :kv_lora_rank]
     ).permute(1, 2, 0)
-    c_rope = runtime.normalized_cache[..., kv_lora_rank:].permute(1, 2, 0)
-    if runtime.query.shape[-1] == kv_lora_rank:
-        q_rope = q_latent
-        c_rope = c_latent
     if runtime.extra_cache is not None:
         c_rope = runtime.extra_cache.permute(1, 2, 0)
+    elif has_rope:
+        c_rope = runtime.normalized_cache[..., kv_lora_rank:].permute(1, 2, 0)
+    else:
+        c_rope = c_latent
     page_offsets = block_tables.transpose(0, 1)
     # Persisted FFI callables require positional arguments, including None.
     compiled(
@@ -2315,23 +2297,29 @@ def _prepare_sparse_output_quant(
     padded_rows = (rows + 3) // 4 * 4
     if (
         positions is None
-        or positions.shape != prefix
-        or positions.dtype != torch.int32
-        or positions.device != device
-        or not positions.is_contiguous()
+        or validate
+        and (
+            positions.shape != prefix
+            or positions.dtype != torch.int32
+            or positions.device != device
+            or not positions.is_contiguous()
+        )
     ):
         raise ValueError(
             "token_positions must be contiguous CUDA INT32 matching the query prefix"
         )
     if (
         cos_sin is None
-        or cos_sin.ndim != 2
-        or cos_sin.shape[0] == 0
-        or cos_sin.shape[1] != 64
-        or cos_sin.dtype != torch.float32
-        or cos_sin.device != device
-        or not cos_sin.is_contiguous()
-        or cos_sin.data_ptr() % 16
+        or validate
+        and (
+            cos_sin.ndim != 2
+            or cos_sin.shape[0] == 0
+            or cos_sin.shape[1] != 64
+            or cos_sin.dtype != torch.float32
+            or cos_sin.device != device
+            or not cos_sin.is_contiguous()
+            or cos_sin.data_ptr() % 16
+        )
     ):
         raise ValueError(
             "cos_sin_cache must be 16-byte aligned contiguous CUDA FP32[P,64]"
@@ -2349,7 +2337,7 @@ def _prepare_sparse_output_quant(
         out = torch.empty(
             (quant.num_groups, rows, channels), dtype=torch.float8_e4m3fn, device=device
         ).transpose(0, 1)
-    if (
+    if validate and (
         out.shape != shape
         or out.dtype != torch.float8_e4m3fn
         or out.device != device
@@ -2363,7 +2351,9 @@ def _prepare_sparse_output_quant(
     if rows and quant.num_groups > 1:
         # A live prefix can retain a larger graph bucket's group stride.
         capacity, remainder = divmod(physical_out.stride(0), channels)
-        if remainder or capacity < rows or capacity * quant.num_heads >= 2**31:
+        if validate and (
+            remainder or capacity < rows or capacity * quant.num_heads >= 2**31
+        ):
             raise ValueError("out must have valid group-major token capacity")
         try:
             physical_out = physical_out.as_strided(
@@ -2373,7 +2363,7 @@ def _prepare_sparse_output_quant(
             raise ValueError(
                 "out must view complete group-major backing storage"
             ) from exc
-    if not physical_out.is_contiguous():
+    if validate and not physical_out.is_contiguous():
         raise ValueError("out must have contiguous physical group-major storage")
     scale_dtype = torch.int32 if quant.ue8m0 else torch.float32
     scale_shape = (rows, quant.num_groups, columns)
@@ -2384,7 +2374,7 @@ def _prepare_sparse_output_quant(
         ).permute(2, 0, 1)[:rows]
         if rows == 0:
             scales = scales.as_strided(scale_shape, scale_stride)
-    if (
+    if validate and (
         scales.shape != scale_shape
         or scales.stride() != scale_stride
         or scales.dtype != scale_dtype
@@ -2402,7 +2392,6 @@ def _prepare_sparse_output_quant(
     )
 
 
-@functools.lru_cache(maxsize=1024)
 def _resolve_sparse_mla_plan(
     device,
     batch_size,
@@ -2833,9 +2822,6 @@ def resolve_sparse_d576_reload_plan(
     return device, profile, spec, sections, byte_end, capacity, None
 
 
-_PREPARED_LAUNCH_LIMIT = 256
-
-
 class BatchSparseMLADecodePagedTSWrapper:
     """Plan native BF16/E4M3 attention, then bind one or two source index lists.
 
@@ -2886,7 +2872,6 @@ class BatchSparseMLADecodePagedTSWrapper:
     def __init__(self, workspace_buffer=None):
         self._workspace_buffer = workspace_buffer
         self._state = None
-        self._prepared: dict[tuple, dict] = {}
         self.workspace_size_bytes = 0
 
     def plan(
@@ -2915,8 +2900,13 @@ class BatchSparseMLADecodePagedTSWrapper:
         softmax_scale: GlobalScale | None = None,
         output_scale: GlobalScale = 1.0,
         kv_cache_scale: GlobalScale = 1.0,
+        compile: bool = True,
     ):
         """Plan D512/D576 attention over one primary and an optional extra pool.
+
+        With ``compile=False``, resolve the plan without compiling or loading a
+        kernel. ``_state["compile_spec"]`` identifies the finalized specialization;
+        call ``plan()`` with compilation enabled before ``run()``.
 
         ``kv_cache_format="nvfp4"`` uses the DS v4.1 D512 format: 256 packed
         E2M1 bytes followed by 32 E4M3 scales in linear block16 order. Every
@@ -3068,8 +3058,7 @@ class BatchSparseMLADecodePagedTSWrapper:
                 kernel=kernel,
                 kernel_signature=_mla_kernel_compile_signature(kernel),
             )
-        compiled = _get_compiled_mla_decode(spec)
-        self._prepared.clear()
+        compiled = _get_compiled_mla_decode(spec) if compile else None
         self._state = dict(
             reload_d576=reload_d576,
             device=device,
@@ -3095,6 +3084,7 @@ class BatchSparseMLADecodePagedTSWrapper:
             output_quant=output_quant,
             buffers=buffers,
             workspace=workspace,
+            compile_spec=spec,
             compiled=compiled,
             softmax_scale=softmax_scale,
             output_scale=output_scale,
@@ -3121,11 +3111,11 @@ class BatchSparseMLADecodePagedTSWrapper:
 
         self.workspace_size_bytes = byte_end
 
-    def _pool(self, cache, name):
-        """Validate one cache pool and expose its physical rows without repacking storage."""
+    def _pool(self, cache, name, *, validate):
+        """Expose physical pool rows without repacking, optionally checking metadata."""
         state = self._state
         dim = state["extra_cache_dim" if name == "extra_kv_cache" else "cache_dim"]
-        if not isinstance(cache, torch.Tensor):
+        if validate and not isinstance(cache, torch.Tensor):
             raise TypeError(f"{name} must be a tensor")
         fmt = state[
             "extra_kv_cache_format" if name == "extra_kv_cache" else "kv_cache_format"
@@ -3136,10 +3126,10 @@ class BatchSparseMLADecodePagedTSWrapper:
             cache = cache.unsqueeze(1)
         if cache.ndim == 4:
             axis = 1 if state["kv_layout"] == "HND" else 2
-            if cache.shape[axis] != 1:
+            if validate and cache.shape[axis] != 1:
                 raise ValueError(f"{name} requires one KV head")
             cache = cache.squeeze(axis)
-        if (
+        if validate and (
             cache.ndim != 3
             or cache.shape[1] <= 0
             or cache.shape[2] != dim
@@ -3149,9 +3139,11 @@ class BatchSparseMLADecodePagedTSWrapper:
                 f"{name} must have shape [pages,page_size,{dim}] with nonempty pages"
             )
         page_size = cache.shape[1]
-        if cache.device != state["device"] or cache.dtype != state["cache_dtype"]:
+        if validate and (
+            cache.device != state["device"] or cache.dtype != state["cache_dtype"]
+        ):
             raise ValueError(f"{name} must match the planned device and dtype")
-        if (
+        if validate and (
             cache.stride(-1) != 1
             or cache.stride(1) != dim
             or cache.stride(0) < page_size * dim
@@ -3163,7 +3155,7 @@ class BatchSparseMLADecodePagedTSWrapper:
             )
         row_stride = cache.stride(0) // dim
         rows = (cache.shape[0] - 1) * row_stride + page_size
-        if rows >= 0x7FFFFFFF:
+        if validate and rows >= 0x7FFFFFFF:
             raise ValueError(f"{name} exceeds signed gather coordinate range")
         return cache.as_strided((rows, 1, dim), (dim, dim, 1))
 
@@ -3175,21 +3167,21 @@ class BatchSparseMLADecodePagedTSWrapper:
             if indices is not None or lengths is not None:
                 raise ValueError(f"{name} metadata is not expected by the plan")
             return state["dummy_indices"][:rows], state["default_cl"][:rows]
-        if not isinstance(indices, torch.Tensor) or (
-            indices.shape != (rows, capacity)
-            or indices.dtype != torch.int32
-            or indices.device != state["device"]
-            or indices.stride(-1) != 1
-        ):
-            raise ValueError(f"invalid {name} indices shape/dtype/device/stride")
-        if not isinstance(lengths, torch.Tensor) or (
-            lengths.shape != (rows,)
-            or lengths.dtype != torch.int32
-            or lengths.device != state["device"]
-            or not lengths.is_contiguous()
-        ):
-            raise ValueError(f"invalid {name} lengths")
         if validate:
+            if not isinstance(indices, torch.Tensor) or (
+                indices.shape != (rows, capacity)
+                or indices.dtype != torch.int32
+                or indices.device != state["device"]
+                or indices.stride(-1) != 1
+            ):
+                raise ValueError(f"invalid {name} indices shape/dtype/device/stride")
+            if not isinstance(lengths, torch.Tensor) or (
+                lengths.shape != (rows,)
+                or lengths.dtype != torch.int32
+                or lengths.device != state["device"]
+                or not lengths.is_contiguous()
+            ):
+                raise ValueError(f"invalid {name} lengths")
             if ((lengths < 0) | (lengths > capacity)).any().item():
                 raise ValueError(f"{name} length exceeds capacity")
             active = (
@@ -3241,11 +3233,13 @@ class BatchSparseMLADecodePagedTSWrapper:
         and live lengths need no 128-entry padding: the kernel aligns source
         execution spans internally and bounds all source reads.
 
-        ``validate=True`` (default) checks CUDA metadata contents using host
-        reads, which synchronize the device. Serving should establish index,
-        length, offset and position bounds upstream and use ``validate=False``
-        on the hot path and during CUDA graph capture. Shape, dtype, device,
-        stride and alignment checks still run without reading CUDA values.
+        ``validate=True`` (default) checks tensor structure and CUDA metadata
+        contents; the content checks synchronize the device. ``validate=False``
+        is a trusted-input path: the caller must guarantee shape, dtype, device,
+        stride, alignment, and index/length/offset/position bounds on every launch
+        and graph replay. Planning-state, required-argument/mode, and scale-override
+        checks still run. Tensor normalization, view construction and allocation
+        of omitted outputs are performed in both modes.
         Q must already use the planned dtype and include the required query
         RoPE; run() performs neither Q quantization nor query rotation.
 
@@ -3305,65 +3299,26 @@ class BatchSparseMLADecodePagedTSWrapper:
         state = self._state
         if state is None:
             raise RuntimeError("plan() must be called before run()")
-        softmax_scale = resolve_scale(
-            softmax_scale, state["softmax_scale"], "softmax_scale", state["device"]
-        )
-        output_scale = resolve_scale(
-            output_scale, state["output_scale"], "output_scale", state["device"]
-        )
-        kv_cache_scale = resolve_scale(
-            kv_cache_scale, state["kv_cache_scale"], "kv_cache_scale", state["device"]
-        )
-        lse_arg = lse
-        prepared_key = (
-            kv_cache.data_ptr(),
-            kv_cache.shape,
-            kv_cache.stride(),
-            kv_cache.dtype,
-            None
-            if extra_kv_cache is None
-            else (
-                extra_kv_cache.data_ptr(),
-                extra_kv_cache.shape,
-                extra_kv_cache.stride(),
-                extra_kv_cache.dtype,
-            ),
-            None if attention_sinks is None else attention_sinks.data_ptr(),
-            softmax_scale,
-            output_scale,
-        )
-        if (
-            not validate
-            and out is not None
-            and lse is None
-            and qo_indptr is None
-            and token_positions is None
-            and cos_sin_cache is None
-            and out_scale is None
-            and type(kv_cache_scale) in (int, float)
-            and kv_cache_scale == 1.0
-        ):
-            prepared = self._prepared.get(prepared_key)
-            if prepared is not None:
-                return self._run_prepared(
-                    prepared, query, indices, lengths, extra_indices, extra_lengths, out
-                )
-        _validate_query(
-            query,
-            packed_query=state["packed_query"],
-            device=state["device"],
-            batch_size=state["batch_size"],
-            num_qo_heads=state["num_qo_heads"],
-            max_q_len=state["max_q_len"],
-            q_dtype=state["q_dtype"],
-            query_dim=state["query_dim"],
-        )
+        if state["compiled"] is None:
+            raise RuntimeError("plan(compile=True) must be called before run()")
+        if validate:
+            _validate_query(
+                query,
+                packed_query=state["packed_query"],
+                device=state["device"],
+                batch_size=state["batch_size"],
+                num_qo_heads=state["num_qo_heads"],
+                max_q_len=state["max_q_len"],
+                q_dtype=state["q_dtype"],
+                query_dim=state["query_dim"],
+            )
         prefix = tuple(query.shape[:-2])
         rows = math.prod(prefix)
         if state["packed_query"]:
-            _validate_qo_indptr(
-                qo_indptr, device=state["device"], batch_size=state["batch_size"]
-            )
+            if validate or qo_indptr is None:
+                _validate_qo_indptr(
+                    qo_indptr, device=state["device"], batch_size=state["batch_size"]
+                )
             if validate:
                 maximum, total, _ = _derive_max_seq_len_q(
                     qo_indptr, batch_size=state["batch_size"]
@@ -3373,7 +3328,7 @@ class BatchSparseMLADecodePagedTSWrapper:
         elif qo_indptr is not None:
             raise ValueError("fixed queries do not accept qo_indptr")
 
-        primary = self._pool(kv_cache, "kv_cache")
+        primary = self._pool(kv_cache, "kv_cache", validate=validate)
         if extra_kv_cache is None:
             if (
                 state["max_extra_topk"]
@@ -3383,7 +3338,7 @@ class BatchSparseMLADecodePagedTSWrapper:
                 raise ValueError("extra pool and indices are required by the plan")
             extra = state["dummy_cache"]
         else:
-            extra = self._pool(extra_kv_cache, "extra_kv_cache")
+            extra = self._pool(extra_kv_cache, "extra_kv_cache", validate=validate)
 
         si, sl = self._source_metadata(
             indices,
@@ -3407,7 +3362,7 @@ class BatchSparseMLADecodePagedTSWrapper:
             raise ValueError("attention_sinks presence must match the plan")
         if attention_sinks is None:
             attention_sinks = state["default_attention_sinks"]
-        if (
+        if validate and (
             attention_sinks.shape != (state["num_qo_heads"],)
             or attention_sinks.dtype != torch.float32
             or attention_sinks.device != state["device"]
@@ -3416,6 +3371,15 @@ class BatchSparseMLADecodePagedTSWrapper:
             raise ValueError("attention_sinks must be contiguous CUDA FP32[H]")
         if validate and torch.isnan(attention_sinks).any().item():
             raise ValueError("attention_sinks must not contain NaN")
+        softmax_scale = resolve_scale(
+            softmax_scale, state["softmax_scale"], "softmax_scale", state["device"]
+        )
+        output_scale = resolve_scale(
+            output_scale, state["output_scale"], "output_scale", state["device"]
+        )
+        kv_cache_scale = resolve_scale(
+            kv_cache_scale, state["kv_cache_scale"], "kv_cache_scale", state["device"]
+        )
         if state["kv_cache_format"] != "fp8" and (
             isinstance(kv_cache_scale, torch.Tensor) or kv_cache_scale != 1.0
         ):
@@ -3436,7 +3400,7 @@ class BatchSparseMLADecodePagedTSWrapper:
                 device=state["device"],
                 dtype=torch.bfloat16,
             )
-        if quant is None:
+        if quant is None and validate:
             _validate_out(
                 out,
                 device=state["device"],
@@ -3461,7 +3425,7 @@ class BatchSparseMLADecodePagedTSWrapper:
                     *prefix, state["num_qo_heads"]
                 )
             )
-        if (
+        if validate and (
             lse.shape != (*prefix, state["num_qo_heads"])
             or lse.dtype != torch.float32
             or lse.device != state["device"]
@@ -3542,126 +3506,9 @@ class BatchSparseMLADecodePagedTSWrapper:
                 compiled=state["compiled"],
                 max_q_len=1,
             )
-        if (
-            rows
-            and quant is None
-            and not state["packed_query"]
-            and not state["return_lse"]
-            and state["max_q_len"] == 1
-            and state["query_dim"] == 512
-            and state["kv_cache_format"] == "native"
-            and state["extra_kv_cache_format"] == "native"
-            and lse_arg is None
-        ):
-            # Static for this (plan, pools, scales): pool views, scalars, sinks, split,
-            # workspace. The next validate=False launch with the same pools re-forms
-            # only the query / index / output views (see _run_prepared).
-            if len(self._prepared) >= _PREPARED_LAUNCH_LIMIT:
-                self._prepared.clear()
-            self._prepared[prepared_key] = dict(
-                primary=primary,
-                extra=extra,
-                primary_rows=primary.shape[0],
-                c_latent=primary.permute(1, 2, 0),
-                c_rope=extra.permute(1, 2, 0),
-                sinks=attention_sinks,
-                bmm=(softmax_scale, output_scale),
-                ks=state["max_topk"],
-                kc=state["max_extra_topk"],
-                dummy_indices=state["dummy_indices"],
-                default_cl=state["default_cl"],
-            )
         if quant is not None:
             return (out, out_scale, lse) if state["return_lse"] else (out, out_scale)
         return (out, lse) if state["return_lse"] else out
-
-    def _run_prepared(self, prepared, query, indices, lengths, extra_indices, extra_lengths, out):
-        """Launch with the static arguments recorded by the last full run().
-
-        Only the per-call tensors are checked and viewed: query and output
-        geometry, index/length shapes, dtypes and strides. Pool geometry,
-        scales and sinks were validated by the full path that prepared this
-        launch, and the caller passed validate=False. Byte-identical to the
-        full path for the same arguments.
-        """
-        state = self._state
-        rows, heads, device = state["batch_size"], state["num_qo_heads"], state["device"]
-        if (
-            query.shape != (rows, 1, heads, 512)
-            or query.dtype != state["q_dtype"]
-            or query.device != device
-            or not query.is_contiguous()
-            or query.data_ptr() % 16
-        ):
-            raise ValueError(
-                "prepared launch: query must be a contiguous, 16-byte aligned "
-                "[batch, 1, heads, 512] tensor of the planned dtype on the planned device"
-            )
-        if (
-            out.numel() != rows * heads * 512
-            or out.dtype != torch.bfloat16
-            or out.device != device
-            or not out.is_contiguous()
-            or out.data_ptr() % 16
-        ):
-            raise ValueError(
-                "prepared launch: out must be a contiguous, 16-byte aligned BF16 tensor "
-                "holding one 512-wide row per query head"
-            )
-        if (
-            indices.shape != (rows, prepared["ks"])
-            or indices.dtype != torch.int32
-            or indices.device != device
-            or indices.stride(-1) != 1
-            or lengths.shape != (rows,)
-            or lengths.dtype != torch.int32
-            or lengths.device != device
-            or not lengths.is_contiguous()
-        ):
-            raise ValueError("prepared launch: invalid primary indices/lengths")
-        if prepared["kc"]:
-            if (
-                not isinstance(extra_indices, torch.Tensor)
-                or not isinstance(extra_lengths, torch.Tensor)
-                or extra_indices.shape != (rows, prepared["kc"])
-                or extra_indices.dtype != torch.int32
-                or extra_indices.device != device
-                or extra_indices.stride(-1) != 1
-                or extra_lengths.shape != (rows,)
-                or extra_lengths.dtype != torch.int32
-                or extra_lengths.device != device
-                or not extra_lengths.is_contiguous()
-            ):
-                raise ValueError("prepared launch: invalid extra indices/lengths")
-            ci, cl = extra_indices, extra_lengths
-        else:
-            if extra_indices is not None or extra_lengths is not None:
-                raise ValueError("prepared launch: extra indices without a planned extra pool")
-            ci, cl = prepared["dummy_indices"][:rows], prepared["default_cl"][:rows]
-        buffers = state["buffers"]
-        sinks = prepared["sinks"]
-        q_kernel = query.permute(2, 3, 1, 0)
-        lse_kernel = buffers["public_lse"][:rows].view(rows, 1, heads).permute(2, 1, 0)
-        bmm1, bmm2 = prepared["bmm"]
-        state["compiled"](
-            q_kernel,
-            q_kernel,
-            prepared["c_latent"],
-            prepared["c_rope"],
-            indices.transpose(0, 1),
-            out.view(rows, 1, heads, 512).permute(2, 3, 1, 0),
-            lse_kernel,
-            buffers["core"] if buffers["core"].numel() else None,
-            state["requested_splits"],
-            lengths,
-            None,
-            (indices, ci, lengths, cl, sinks, 1.0),
-            bmm1,
-            bmm2,
-            None,
-            1,
-        )
-        return out
 
 
 def get_prims_ts_sparse_mla_decode_workspace_size(*plan_args, **plan_kwargs):
