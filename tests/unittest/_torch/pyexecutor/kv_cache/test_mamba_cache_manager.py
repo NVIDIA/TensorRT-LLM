@@ -3914,6 +3914,8 @@ def _build_v2_hybrid_with_mamba_layer(
     mamba_d_state: int = 8,
     mamba_head_dim: int = 8,
     max_num_tokens: int = 8192,
+    is_draft: bool = False,
+    joint_kv_cache_reuse: bool = False,
 ) -> MambaHybridCacheManagerV2:
     """Construct a real MambaHybridCacheManagerV2."""
     # Draft layers of a combined speculative manager follow the model's layers in both masks.
@@ -4012,6 +4014,8 @@ def _build_v2_hybrid_with_mamba_layer(
         conv_state_layout=conv_state_layout,
         is_disagg=is_disagg,
         enable_stats=enable_stats,
+        is_draft=is_draft,
+        joint_kv_cache_reuse=joint_kv_cache_reuse,
         **(
             {"kda_draft_records": kda_draft_records}
             if issubclass(model_cls, KimiK3HybridCacheManager)
@@ -4097,6 +4101,34 @@ def _make_v2_prompt_request(request_id: int, tokens: list[int]) -> LlmRequest:
         sampling_config=SamplingConfig(),
         is_streaming=False,
     )
+
+
+@skip_no_cuda
+def test_v2_paired_draft_pool_publishes_its_blocks():
+    """A paired draft pool commits its context blocks, so a later request reuses them.
+
+    The draft pool holds no recurrent state, so it commits on the base class's
+    block cadence rather than at the target's snapshot points.
+    """
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        num_mamba_layers=0,
+        enable_block_reuse=True,
+        is_draft=True,
+        joint_kv_cache_reuse=True,
+    )
+    prompt_len = 2 * mgr.tokens_per_block
+    request = _make_v2_prompt_request(1, list(range(prompt_len)))
+    probe = _make_v2_prompt_request(2, list(range(prompt_len + 1)))
+    try:
+        _run_v2_hybrid_context(mgr, request)
+        mgr.free_resources(request)
+
+        mgr.prepare_expect_snapshot_points([probe])
+        assert mgr.prepare_context(probe)
+        assert probe.prepopulated_prompt_len == prompt_len
+        mgr.free_resources(probe)
+    finally:
+        mgr.shutdown()
 
 
 @skip_no_cuda
@@ -4842,6 +4874,7 @@ def _branch_snapshot_manager(
         ),
     )
     mgr._branch_snapshot_points = {}
+    mgr._context_fork_hints = {}
     mgr._snapshot_pruned_tokens_total = 0
     mgr._page_pruned_tokens_total = 0
     mgr._branch_snapshots_taken_total = 0
@@ -4933,6 +4966,44 @@ def test_branch_snapshot_skipped_when_reuse_already_reached_the_fork():
     assert mgr._branch_snapshots_skipped_total == {"already_reused": 1}
 
 
+def test_branch_snapshot_uses_a_paired_fork_hidden_by_the_claim():
+    """A paired claim at the last snapshot ends the lookup before the fork.
+
+    The capped lookup matched all 64 tokens it was given, which on its own
+    reads as no fork. The attention-only draft pool matched through 192, where
+    the prompt leaves the tree, so that is where a sibling can resume.
+    """
+    mgr = _branch_snapshot_manager()
+    request = _fake_context_request(prompt_len=256, context_current_position=64)
+    kv_cache = _fake_reuse_match(divergence=64, reused=64)
+
+    mgr.note_context_fork(request, 192)
+    mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=64)
+
+    assert mgr._branch_snapshot_points == {1: 192}
+    assert request.expect_snapshot_points == [192, 256]
+    assert mgr._context_fork_hints == {}
+    assert mgr._branch_snapshots_skipped_total == {}
+
+
+def test_branch_snapshot_ignores_a_paired_fork_within_a_block_of_the_reuse():
+    """An append resumes from the end-offset snapshot of the turn it extends.
+
+    Its fork, where that turn's prompt ended, lies less than a block past the
+    snapshot, so a point there would add a prefill chunk for almost no reuse.
+    """
+    mgr = _branch_snapshot_manager(tokens_per_block=64)
+    request = _fake_context_request(prompt_len=512, context_current_position=392)
+    kv_cache = _fake_reuse_match(divergence=392, reused=392)
+
+    mgr.note_context_fork(request, 450)
+    mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=392)
+
+    assert mgr._branch_snapshot_points == {}
+    assert mgr._context_fork_hints == {}
+    assert mgr._branch_snapshots_skipped_total == {"no_divergence": 1}
+
+
 def test_branch_snapshot_uses_cache_depth_before_request_cursor_is_rewound():
     """A shallower retry must apply points hidden by the stale request cursor."""
     mgr = _branch_snapshot_manager()
@@ -5006,10 +5077,12 @@ def test_branch_snapshot_is_inert_when_the_flag_is_off():
     request = _fake_context_request(prompt_len=256)
     kv_cache = _fake_reuse_match(divergence=192, hybrid=64, reused=64)
 
+    mgr.note_context_fork(request, 192)
     mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=255)
     mgr.prepare_expect_snapshot_points([request])
 
     assert mgr._branch_snapshot_points == {}
+    assert mgr._context_fork_hints == {}
     assert mgr._branch_snapshots_taken_total == 0
     assert mgr._branch_snapshots_skipped_total == {}
     assert mgr._snapshot_pruned_tokens_total == 0
