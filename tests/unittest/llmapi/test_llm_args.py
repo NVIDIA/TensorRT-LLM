@@ -47,6 +47,7 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, BlockReuseConfig,
                                           CudaGraphConfig,
                                           DecodeCudaGraphConfig,
                                           DecodingBaseConfig,
+                                          DeepSeekSparseAttentionConfig,
                                           DeepSeekV4SparseAttentionConfig,
                                           DFlashDecodingConfig,
                                           DSparkDecodingConfig, DwdpConfig,
@@ -1112,6 +1113,24 @@ def test_post_processor_hook_rejected_with_skip_tokenizer_init():
 class TestModelDefaults:
     """Test suite for model-specific default overrides functionality."""
 
+    @pytest.mark.parametrize("key", [None, b"deployment-key"])
+    def test_model_defaults_preserve_private_transceiver_key(self, key):
+        config = CacheTransceiverConfig(backend="NIXL",
+                                        transceiver_runtime="PYTHON")
+        config._rank_info_auth_key = key
+        args = TorchLlmArgs(model="/tmp/dummy_model",
+                            cache_transceiver_config=config)
+
+        applied = apply_model_defaults_to_llm_args(
+            args, {"enable_chunked_prefill": False})
+
+        assert applied == {"enable_chunked_prefill": False}
+        assert args.cache_transceiver_config._rank_info_auth_key == key
+        assert args.cache_transceiver_config.backend == "NIXL"
+        assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+        assert "_rank_info_auth_key" not in args.model_dump(
+        )["cache_transceiver_config"]
+
     def test_compute_applied_llm_defaults_simple_field(self):
         model_defaults = {"enable_chunked_prefill": False}
         llm_args = TorchLlmArgs(model="/tmp/dummy_model")
@@ -2036,6 +2055,111 @@ def test_KvCacheConfig_disk_cache_validation(tmp_path):
 
 
 @pytest.mark.cpu_only
+def test_KvCacheConfig_disk_offload_options(tmp_path):
+    default = KvCacheConfig()
+    assert default.disk_io_threads == 0
+    assert default.disk_keep_copy_after_restore is False
+    assert default.disk_write_through is False
+    assert default.disk_protected_copy_fraction == 1.0
+
+    config = KvCacheConfig(disk_cache_size=2048,
+                           disk_cache_path=str(tmp_path),
+                           disk_io_threads=16,
+                           disk_keep_copy_after_restore=True,
+                           disk_write_through=True)
+    assert config.disk_io_threads == 16
+    assert config.disk_keep_copy_after_restore is True
+    assert config.disk_write_through is True
+
+    disk = {"disk_cache_size": 2048, "disk_cache_path": str(tmp_path)}
+    # Write-through does not need keep-copy, only the I/O pool.
+    config = KvCacheConfig(**disk, disk_io_threads=4, disk_write_through=True)
+    assert config.disk_write_through is True
+    assert config.disk_keep_copy_after_restore is False
+
+    with pytest.raises(ValidationError,
+                       match="disk_write_through requires disk_io_threads"):
+        KvCacheConfig(**disk, disk_write_through=True)
+
+    # The options do nothing without a disk tier or with KV cache manager v1.
+    with pytest.raises(ValidationError,
+                       match="disk_io_threads requires disk_cache_size"):
+        KvCacheConfig(disk_io_threads=4)
+    with pytest.raises(
+            ValidationError,
+            match="disk_keep_copy_after_restore requires disk_cache_size"):
+        KvCacheConfig(disk_keep_copy_after_restore=True)
+    with pytest.raises(ValidationError,
+                       match="requires use_kv_cache_manager_v2"):
+        KvCacheConfig(**disk, disk_io_threads=4, use_kv_cache_manager_v2=False)
+    with pytest.raises(ValidationError):
+        KvCacheConfig(**disk, disk_io_threads=257)
+    KvCacheConfig(**disk, disk_io_threads=256)
+    # Without block reuse they only warn: there is nothing for them to act on.
+    KvCacheConfig(**disk,
+                  disk_keep_copy_after_restore=True,
+                  enable_block_reuse=False)
+
+    with pytest.raises(ValidationError):
+        KvCacheConfig(disk_io_threads=-1)
+
+    config = KvCacheConfig(**disk,
+                           disk_io_threads=4,
+                           disk_write_through=True,
+                           disk_protected_copy_fraction=0.25)
+    assert config.disk_protected_copy_fraction == 0.25
+    for fraction in (-0.1, 1.5):
+        with pytest.raises(ValidationError):
+            KvCacheConfig(**disk, disk_protected_copy_fraction=fraction)
+    with pytest.raises(
+            ValidationError,
+            match="disk_protected_copy_fraction requires disk_cache_size"):
+        KvCacheConfig(disk_protected_copy_fraction=0.5)
+    # Without retained copies it only warns: there is nothing for it to limit.
+    KvCacheConfig(**disk, disk_protected_copy_fraction=0.5)
+
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import DiskCacheTierConfig
+
+    tier = DiskCacheTierConfig(2048, str(tmp_path))
+    assert tier.num_io_threads == 0
+    assert tier.keep_copy_after_restore is False
+    assert tier.write_through is False
+    assert tier.protected_copy_fraction == 1.0
+    tier.validate()
+
+    tier = DiskCacheTierConfig(2048,
+                               str(tmp_path),
+                               num_io_threads=16,
+                               keep_copy_after_restore=True,
+                               write_through=True)
+    tier.validate()
+    assert tier.num_io_threads == 16
+
+    DiskCacheTierConfig(2048,
+                        str(tmp_path),
+                        num_io_threads=4,
+                        write_through=True).validate()
+    with pytest.raises(ValueError, match="writeThrough requires numIoThreads"):
+        DiskCacheTierConfig(2048, str(tmp_path), write_through=True).validate()
+    with pytest.raises(ValueError,
+                       match="numIoThreads must be between 0 and 256"):
+        DiskCacheTierConfig(2048, str(tmp_path), num_io_threads=-1).validate()
+    with pytest.raises(ValueError,
+                       match="numIoThreads must be between 0 and 256"):
+        DiskCacheTierConfig(2048, str(tmp_path), num_io_threads=257).validate()
+    DiskCacheTierConfig(2048, str(tmp_path),
+                        protected_copy_fraction=0.0).validate()
+    for fraction in (-0.5, 1.5, float("nan")):
+        with pytest.raises(
+                ValueError,
+                match="protectedCopyFraction must be between 0 and 1"):
+            DiskCacheTierConfig(2048,
+                                str(tmp_path),
+                                protected_copy_fraction=fraction).validate()
+    DiskCacheTierConfig(2048, str(tmp_path), num_io_threads=256).validate()
+
+
+@pytest.mark.cpu_only
 class TestMultimodalEncoderCudaGraphConfig:
 
     def test_automatic_buckets_need_only_max_batch_size(self):
@@ -2179,6 +2303,7 @@ class TestMultimodalConfig:
             multimodal_config=MultimodalConfig(vision_gpu_normalize=enabled),
             trust_remote_code=True,
             enable_tokenization_cache=False,
+            prompt_token_cache_config=None,
         )
         llm._hf_model_dir = "unused"
         for method in ("_try_load_tokenizer", "_try_load_hf_model_config",
@@ -3644,6 +3769,7 @@ class TestTorchLlmArgs:
     @pytest.mark.cpu_only
     def test_dynamic_setattr(self):
         with pytest.raises(pydantic_core._pydantic_core.ValidationError):
+            # pyrefly: ignore [unexpected-keyword]
             args = TorchLlmArgs(model=llama_model_path, invalid_arg=1)
 
         with pytest.raises(ValueError):
@@ -3974,8 +4100,10 @@ class TestStrictBaseModelArbitraryArgs:
         # Arbitrary arguments should be rejected
         with pytest.raises(
                 pydantic_core._pydantic_core.ValidationError) as exc_info:
-            TorchLlmArgs(model=llama_model_path,
-                         unsupported_option="should_fail")
+            TorchLlmArgs(
+                model=llama_model_path,
+                # pyrefly: ignore [unexpected-keyword]
+                unsupported_option="should_fail")
         assert "unsupported_option" in str(exc_info.value)
 
     def test_nested_config_arbitrary_args(self):
@@ -4823,7 +4951,10 @@ def test_kv_cache_compression_config_dispatches_by_algorithm():
         "skip_rope_quantization": False,
         "nvfp4_residual_dim": 64,
         "scale_checkpoint_path": None,
+        "mixed_precision_first_n": 0,
+        "mixed_precision_last_n": 0,
     }
+    assert cold_config.mixed_precision_high_window is None
     assert not cold_config.changes_physical_kv_length
     assert cold_config.supports_block_reuse()
     assert cold_config.supports_speculative_decoding()
@@ -4875,6 +5006,63 @@ def test_kv_cache_compression_config_dispatches_by_algorithm():
                 "quant": "fp8",
             },
         )
+
+    cold_window = {
+        "algorithm": "quantization_for_cold_page",
+        "mixed_precision_first_n": 64,
+        "mixed_precision_last_n": 256,
+    }
+
+    def cold(**overrides):
+        kwargs = dict(
+            model="/tmp/dummy_model",
+            kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True),
+            kv_cache_compression_config=cold_window)
+        return TorchLlmArgs(**{**kwargs, **overrides})
+
+    assert cold().kv_cache_compression_config.mixed_precision_high_window == (
+        64, 256)
+    # The limits of mixed-precision KV, narrowed to the TRTLLM backend.
+    for match, overrides in (
+        ("use_kv_cache_manager_v2",
+         dict(kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=False))),
+        ("TRTLLM attention backend;", dict(attn_backend="VANILLA")),
+        ("TRTLLM attention backend;", dict(attn_backend="FLASHINFER")),
+        ("kv_cache_compression_config",
+         dict(kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True,
+                                            dtype="mixed_nvfp4_fp8"))),
+        ("fp8_ds_mla",
+         dict(kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True,
+                                            dtype="fp8_ds_mla"))),
+        ("sparse KV cache offload",
+         dict(sparse_attention_config=DeepSeekSparseAttentionConfig(
+             index_head_dim=128, enable_kv_cache_offload=True))),
+        ("dynamic-tree",
+         dict(
+             speculative_config={
+                 "decoding_type": "MTP",
+                 "num_nextn_predict_layers": 1,
+                 "max_draft_len": 1,
+                 "use_dynamic_tree": True,
+                 "dynamic_tree_max_topK": 2
+             })),
+    ):
+        with pytest.raises(ValueError, match=match):
+            cold(**overrides)
+    cold(speculative_config={
+        "decoding_type": "MTP",
+        "num_nextn_predict_layers": 1
+    })
+    for sparse in (DeepSeekSparseAttentionConfig(index_head_dim=128),
+                   DeepSeekV4SparseAttentionConfig(index_head_dim=128,
+                                                   window_size=128,
+                                                   compress_ratios=[1, 4])):
+        cold(sparse_attention_config=sparse)
+    # Plain cold-page compression keeps its unrestricted backend choice.
+    TorchLlmArgs(
+        model="/tmp/dummy_model",
+        attn_backend="VANILLA",
+        kv_cache_compression_config={"algorithm": "quantization_for_cold_page"})
 
     config_dict = yaml.safe_load("""
 kv_cache_compression_config:

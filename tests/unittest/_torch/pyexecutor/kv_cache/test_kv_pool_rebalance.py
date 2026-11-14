@@ -546,6 +546,8 @@ class TestConsumePreviousBatch:
             exe.result_wait_queues = {}
             exe._pending_transfer_responses = []
             exe._pending_response_terminations = []
+            exe._merged_transfer_flush = None
+            exe._stage_responses = False
             exe._is_preemption_pending.return_value = False
             exe.enable_early_first_token_response = False
             exe.enable_iter_perf_stats = False
@@ -612,6 +614,10 @@ class TestConsumePreviousBatch:
             )
             exe._handle_responses = MethodType(PyExecutor._handle_responses, exe)
             exe._enqueue_responses = MethodType(PyExecutor._enqueue_responses, exe)
+            exe._gather_and_publish_responses = MethodType(
+                PyExecutor._gather_and_publish_responses, exe
+            )
+            exe._publish_responses = MethodType(PyExecutor._publish_responses, exe)
             exe._add_kv_cache_events = MethodType(PyExecutor._add_kv_cache_events, exe)
             return exe
 
@@ -1195,7 +1201,7 @@ def _make_pp_loop_executor(monkeypatch, *, num_micro_batches=2, agreement=(True,
     # No tentative attention-DP dummy is pending, so a skipped microbatch's
     # rollback (_finalize_adp_dummy_allocation(False)) is a no-op.
     exe._pending_adp_dummy_request = None
-    exe._revert_gen_alloc = MagicMock()
+    exe._revert_unexecuted_alloc = MagicMock()
     exe._add_inflight_ids = MagicMock()
     exe._handle_dynamic_draft_len = MagicMock()
     exe.resource_manager = MagicMock()
@@ -1346,7 +1352,7 @@ class TestPpLoopDrainWiring:
 
         # Two drain iterations queued nothing, the third one did.
         exe._forward_step_inter_pp.assert_called_once()
-        assert exe._revert_gen_alloc.call_count == 2
+        assert exe._revert_unexecuted_alloc.call_count == 2
         assert exe.micro_batches == [None, None]
 
         # And the rebalance ran exactly once, at the end of the drain.
@@ -1378,7 +1384,7 @@ class TestPpLoopDrainWiring:
         with pytest.raises(_ReachedForward):
             PyExecutor._executor_loop_pp(exe)
 
-        assert exe._revert_gen_alloc.call_count == 4
+        assert exe._revert_unexecuted_alloc.call_count == 4
         exe._rebalance_kv_pools_now.assert_called_once()
 
     def test_no_drain_is_started_while_one_is_pending(self, monkeypatch):

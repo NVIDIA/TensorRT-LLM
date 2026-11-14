@@ -142,6 +142,7 @@ def test_top_k_and_next_n_cannot_be_passed_positionally() -> None:
         dict(next_n=1, max_columns=8192, seq_lens=[3000], width=8192), seed=12
     )
     with pytest.raises(TypeError):
+        # pyrefly: ignore [unexpected-positional-argument]
         op(logits, seq_lens, indices, 1, TOP_K, _compiled(8192, 1))
 
 

@@ -19,7 +19,6 @@ from .trt_test_alternative import print_info, print_warning
 
 # from misc.reorder_venv_tests import reorder_tests
 
-kVALID_TEST_LIST_MARKERS = ["XFAIL", "SKIP", "UNSTABLE"]
 record_invalid_tests = True
 
 kSTRIP_PARENS_PAT = re.compile(r'\((.*?)\)')
@@ -82,90 +81,6 @@ def preprocess_test_list_lines(test_list, lines, mako_opts={}):
             test_list, traceback.format_exc()))
 
     return lines
-
-
-def parse_test_list_lines(test_list, lines, test_prefix):
-    """Parses the lines of a test list. Test names returned contain all values within square brackets. Does not process
-    each test id value.
-
-       Args:
-            test_list: Name of the test list, used for debugging
-            lines:  The lines of the test list file
-            test_prefix: The value of the --test-prefix option, or None if this option isn't set.
-       Returns:
-            A tuple (test_names, test_name_to_marker_dict).
-            test_names: List of test names parsed from the test list file,
-                        ordered by their appearance in the list.
-            test_name_to_marker_dict: Dictionary mapping test names to a tuple (parsed test marker, reason string).
-    """
-
-    def parse_test_name(s):
-        if s.startswith("full:"):
-            s = s.lstrip("full:")
-            if test_prefix:
-                # Check for SM version pattern (e.g., sm90, sm89, sm100)
-                sm_match = re.match(r'sm(\d+)/', s)
-                if sm_match:
-                    sm_version = int(sm_match.group(1))
-                    # Get current SM version
-                    try:
-                        from ..conftest import get_sm_version
-                        current_sm = get_sm_version()
-                        # If SM versions match, replace with test_prefix
-                        if sm_version == current_sm:
-                            s = s.replace(f'sm{sm_version}',
-                                          test_prefix.split('-')[0])
-                    except Exception:
-                        # If can't get SM version, skip SM-based filtering
-                        pass
-                elif test_prefix.split('-')[0] in s:
-                    s = s.replace(test_prefix.split('-')[0], test_prefix)
-            return s
-        elif test_prefix:
-            return "/".join([test_prefix, s])
-        else:
-            return s
-
-    def parse_test_line(enumerated_line):
-        lineno, line = enumerated_line
-        lineno += 1
-        # Strip comments and whitespace, then split into whitespace-separated tokens
-        tokens = line.partition("#")[0].strip().split()
-        test_name = parse_test_name(tokens[0]) if len(tokens) > 0 else None
-        test_marker = None
-        reason = None
-        if len(tokens) > 1:
-            test_marker = tokens[1]
-
-            if len(tokens) > 2:
-                reason_raw = " ".join(tokens[2:])
-                reason = strip_parens(reason_raw)
-                if not reason:
-                    raise error(('{}:{}: Invalid syntax for reason: "{}". '
-                                 "Did you forget to add parentheses?").format(
-                                     test_list, lineno, reason_raw))
-
-            if test_marker not in kVALID_TEST_LIST_MARKERS:
-                raise error(
-                    '{}:{}: Invalid test marker "{}" specified for test {}'.
-                    format(test_list, lineno, test_marker, test_name))
-        return (test_name, test_marker, reason)
-
-    parsed_test_list = map(parse_test_line, enumerate(lines))
-    parsed_test_list = list(filter(lambda x: x[0] is not None,
-                                   parsed_test_list))
-    test_names = [x[0] for x in parsed_test_list]
-    test_name_to_marker_dict = {x[0]: (x[1], x[2]) for x in parsed_test_list}
-
-    return (test_names, test_name_to_marker_dict)
-
-
-def parse_test_list(test_list, test_prefix):
-    with open(test_list, "r") as f:
-        lines = f.readlines()
-
-    lines = preprocess_test_list_lines(test_list, lines)
-    return parse_test_list_lines(test_list, lines, test_prefix)
 
 
 def split_test_name_into_components(test_name):
@@ -555,110 +470,6 @@ def record_invalid_tests(output_file, corrections):
     with open(output_file, "w") as f:
         invalid_tests = {"invalid": list(corrections.keys())}
         json.dump(invalid_tests, f)
-
-
-def parse_and_validate_test_list(
-    test_list,
-    config,
-    items,
-    check_for_corrections,
-):
-    test_prefix = config.getoption("--test-prefix")
-    apply_test_list_correction = config.getoption(
-        "--apply-test-list-correction")
-    test_names, test_name_to_marker_dict = parse_test_list(
-        test_list, test_prefix)
-
-    if check_for_corrections:
-        corrections = get_test_name_corrections_v2(
-            set(test_names),
-            set(it.nodeid for it in items),
-            CorrectionMode.EXACT_MATCH,
-        )
-
-        if apply_test_list_correction and corrections:
-            apply_test_list_corrections(test_list, corrections, test_prefix)
-
-        output_dir = config.getoption("--output-dir")
-        if record_invalid_tests and corrections:
-            record_invalid_tests(
-                os.path.join(output_dir, "invalid_tests.json"),
-                corrections,
-            )
-
-        handle_corrections(corrections, test_prefix)
-
-    return test_names, test_name_to_marker_dict
-
-
-def modify_by_test_list(test_list, items, config):
-    """Filter out tests based on the test names specified by the given test_list.  Also
-    ensure the test order matches the order specified by the test_list, and add any
-    custom markers specified by the test_list."""
-    all_test_names = []
-    full_test_name_to_marker_dict = {}
-
-    test_names, test_name_to_marker_dict = parse_and_validate_test_list(
-        test_list,
-        config,
-        items,
-        check_for_corrections=True,
-    )
-    all_test_names.extend(test_names)
-    full_test_name_to_marker_dict.update(test_name_to_marker_dict)
-
-    found_items = {}
-    deselected = []
-
-    # Figure out which items have names specified by the filter
-    for item in items:
-        if item.nodeid in full_test_name_to_marker_dict:
-            found_items[item.nodeid] = item
-        else:
-            deselected.append(item)
-
-    # Construct a list of tests based on the ordering given in the file
-    selected = []
-    for name in all_test_names:
-        if name in found_items:
-            item = found_items[name]
-            selected.append(item)
-            # Also update the item based on the marker specified in the file
-            marker, reason = full_test_name_to_marker_dict[name]
-            if marker:
-                mark_func = getattr(pytest.mark, marker.lower())
-                mark = mark_func(reason=reason)
-                item.add_marker(mark)
-
-    if deselected:
-        config.hook.pytest_deselected(items=deselected)
-    items[:] = selected
-
-
-def apply_waives(waives_file, items, config):
-    """Apply waives based on the waive state specified by the given waives_file."""
-
-    # Corrections don't make sense for the waives file as it specifies global negative
-    # filters that may or may not be applicable to the current platform (i.e., the test names
-    # being waived may not be generated on the current platform).
-    ret = parse_and_validate_test_list(
-        waives_file,
-        config,
-        items,
-        check_for_corrections=False,
-    )
-    if not ret:
-        return
-    _, test_name_to_marker_dict = ret
-
-    # For each item in the list, apply waives if a waive entry exists
-    for item in items:
-        if item.nodeid in test_name_to_marker_dict:
-            marker, reason = test_name_to_marker_dict[item.nodeid]
-            if marker:
-                mark_func = getattr(pytest.mark, marker.lower())
-                mark = mark_func(reason=reason)
-                item.add_marker(mark)
 
 
 def uniquify_test_items(items):

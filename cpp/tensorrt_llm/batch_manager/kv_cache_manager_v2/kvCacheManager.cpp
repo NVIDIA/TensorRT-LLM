@@ -73,7 +73,7 @@ std::vector<int> PageIndexConverter::operator()(std::vector<int> const& baseIndi
     for (BlockOrdinal ordinal{0}; ordinal < BlockOrdinal{static_cast<int>(baseIndices.size())}; ++ordinal)
     {
         int index;
-        if (scratchRange.contains(ordinal))
+        if (baseIndices[toSizeT(ordinal)] == kBadPageIndex.value() && scratchRange.contains(ordinal))
         {
             // Scratch block: its slot comes from the request's own scratch slots, not from
             // base_indices.
@@ -881,6 +881,11 @@ LayerGroupId KvCacheManager::getLayerGroupId(LayerId layerId) const
 CacheGroupId KvCacheManager::getBufferGroupId(LayerId layerId, DataRole const& role) const
 {
     return mStorage->getBufferAttr(layerId, role).lifeCycleId;
+}
+
+CacheGroupId KvCacheManager::getRegionGroupId(std::string const& name) const
+{
+    return mLifeCycles.regionLifeCycleId(name);
 }
 
 TypedVec<LayerGroupId, std::vector<LayerId>> KvCacheManager::layerGrouping() const

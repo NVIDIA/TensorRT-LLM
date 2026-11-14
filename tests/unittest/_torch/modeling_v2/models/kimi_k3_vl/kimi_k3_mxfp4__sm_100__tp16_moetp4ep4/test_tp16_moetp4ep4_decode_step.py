@@ -136,7 +136,12 @@ def test_kda_verify_keeps_builtin_fallback_dense(
     seen_inputs = []
 
     def verify_fused(
-        self, *args, output=None, allow_prequantized_output=False, prequantized_input=None
+        self,
+        *args,
+        output=None,
+        allow_prequantized_output=False,
+        replay_slot_indices=None,
+        prequantized_input=None,
     ):
         seen_inputs.append(prequantized_input)
         if allow_prequantized_output:

@@ -429,6 +429,7 @@ def verify_disaggregated(model: str,
                              } if gen_preemption else {})
                          }) as executor:
         futures = []
+        worker_arg = None
         try:
             for worker_arg in worker_args:
                 future = executor.submit(worker_entry_point, *worker_arg)
@@ -568,6 +569,7 @@ def test_disaggregated_llama_context_capacity(model, enable_cuda_graph,
                              "UCX_MM_ERROR_HANDLING": "y"
                          }) as executor:
         futures = []
+        worker_arg = None
         try:
             for worker_arg in worker_args:
                 future = executor.submit(worker_entry_point, *worker_arg)
@@ -678,6 +680,7 @@ def test_disaggregated_spec_dec_batch_slot_limit(model, spec_dec_model_path,
                          },
                          mpi_info=mpi_info) as executor:
         futures = []
+        worker_arg = None
         try:
             for worker_arg in worker_args:
                 future = executor.submit(worker_entry_point, *worker_arg)
@@ -768,6 +771,7 @@ def test_disaggregated_logprobs(model, generation_overlap):
                              "UCX_MM_ERROR_HANDLING": "y"
                          }) as executor:
         futures = []
+        worker_arg = None
         try:
             for worker_arg in worker_args:
                 future = executor.submit(worker_entry_point, *worker_arg)
@@ -983,6 +987,7 @@ def test_disaggregated_logits(model, generation_overlap):
                              "UCX_MM_ERROR_HANDLING": "y"
                          }) as executor:
         futures = []
+        worker_arg = None
         try:
             for worker_arg in worker_args:
                 future = executor.submit(worker_entry_point, *worker_arg)
@@ -1133,6 +1138,7 @@ def test_arbitrary_kv_cache_transfer(model, generation_overlap):
                              "UCX_MM_ERROR_HANDLING": "y"
                          }) as executor:
         futures = []
+        worker_arg = None
         try:
             for worker_arg in worker_args:
                 future = executor.submit(worker_entry_point, *worker_arg)
@@ -1294,6 +1300,7 @@ def test_arbitrary_kv_cache_transfer_missing_blocks(model, generation_overlap):
                              "UCX_MM_ERROR_HANDLING": "y"
                          }) as executor:
         futures = []
+        worker_arg = None
         try:
             for worker_arg in worker_args:
                 future = executor.submit(worker_entry_point, *worker_arg)
