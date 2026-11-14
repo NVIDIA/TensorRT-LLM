@@ -49,6 +49,7 @@ from tensorrt_llm.serve.tool_parser.poolside_v1_parser import \
 from tensorrt_llm.serve.tool_parser.qwen3_coder_parser import \
     Qwen3CoderToolParser
 from tensorrt_llm.serve.tool_parser.qwen3_tool_parser import Qwen3ToolParser
+from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
 from tensorrt_llm.tokenizer.deepseek_v32.encoding import encode_messages
 
 from tensorrt_llm.serve.tool_parser.gemma4_parser import (  # isort: skip
@@ -3677,6 +3678,209 @@ def test_deepseek_streaming_prefix_is_delta_independent(
 
         assert streamed == prefix, f"{deltas!r} streamed {streamed!r}"
         assert names == ["get_weather"], f"{deltas!r} called {names!r}"
+
+
+# ============================================================================
+# DeepSeek DSML: generation stopped after one call, calls block left open
+# ============================================================================
+
+# Each DSML generation: parser, calls tag, invoke tag, parameter tag.
+_SINGLE_CALL_DSML_FORMATS = [
+    (DeepSeekV32Parser, "function_calls", "invoke", "parameter"),
+    (DeepSeekV4Parser, "tool_calls", "invoke", "parameter"),
+    (DeepSeekV41Parser, " calls", " invoke", " parameter"),
+]
+_SINGLE_CALL_DSML_IDS = ["v32", "v4", "v41"]
+
+_WEATHER_CALL = ("get_weather", {"location": "NYC"})
+_SEARCH_CALL = ("search_web", {"query": "AI news"})
+
+
+def _encoder_invoke(invoke_tag: str, parameter_tag: str, name: str,
+                    arguments: dict[str, str]) -> str:
+    """One call as the checkpoints' encoders write it."""
+    parameters = "\n".join(
+        f'<｜DSML｜{parameter_tag} name="{key}" string="true">{value}'
+        f"</｜DSML｜{parameter_tag}>" for key, value in arguments.items())
+    return (f'<｜DSML｜{invoke_tag} name="{name}">\n{parameters}\n'
+            f"</｜DSML｜{invoke_tag}>")
+
+
+def _encoder_reply(calls_tag: str, invoke_tag: str, parameter_tag: str,
+                   content: str, calls: list) -> str:
+    """A reply with tool calls as the encoders write it, block closed."""
+    invokes = "\n".join(
+        _encoder_invoke(invoke_tag, parameter_tag, name, arguments)
+        for name, arguments in calls)
+    return (f"{content}\n\n<｜DSML｜{calls_tag}>\n{invokes}\n"
+            f"</｜DSML｜{calls_tag}>")
+
+
+def _delta_splits(text: str) -> Iterator[list[str]]:
+    """Ways the detokenizer may cut ``text`` into deltas, and more.
+
+    The DSML marker is one token, so it is never cut; other text is cut at
+    any character, which covers every token boundary. Yields the whole text,
+    one unit per delta, every cut into two deltas, and fixed-width deltas of
+    2 to 7 units.
+    """
+    marker = "｜DSML｜"
+    units, pos = [], 0
+    while pos < len(text):
+        step = len(marker) if text.startswith(marker, pos) else 1
+        units.append(text[pos:pos + step])
+        pos += step
+    yield [text]
+    yield units
+    for cut in range(1, len(units)):
+        yield ["".join(units[:cut]), "".join(units[cut:])]
+    for width in range(2, 8):
+        yield [
+            "".join(units[start:start + width])
+            for start in range(0, len(units), width)
+        ]
+
+
+def _whole_text_view(parser_cls, text, tools):
+    result = parser_cls().detect_and_parse(text, tools)
+    return result.normal_text.strip(), [(call.name, json.loads(call.parameters))
+                                        for call in result.calls]
+
+
+def _streamed_view(parser_cls, deltas, tools):
+    """What a streaming client receives, finish() included."""
+    parser = parser_cls()
+    normal, names, arguments = [], {}, {}
+    results = [parser.parse_streaming_increment(d, tools) for d in deltas]
+    for result in results + [parser.finish(tools)]:
+        normal.append(result.normal_text)
+        for call in result.calls:
+            if call.name:
+                names[call.tool_index] = call.name
+            arguments[call.tool_index] = (arguments.get(call.tool_index, "") +
+                                          call.parameters)
+    return "".join(normal).strip(), [
+        (names[index], json.loads(arguments[index])) for index in sorted(names)
+    ]
+
+
+def _assert_both_views(parser_cls, text, tools, expected):
+    """The whole-text parse and every streaming split read ``expected``."""
+    assert _whole_text_view(parser_cls, text, tools) == expected
+    for deltas in _delta_splits(text):
+        assert _streamed_view(parser_cls, deltas, tools) == expected, deltas
+
+
+@pytest.mark.parametrize("parser_cls, calls_tag, invoke_tag, parameter_tag",
+                         _SINGLE_CALL_DSML_FORMATS,
+                         ids=_SINGLE_CALL_DSML_IDS)
+def test_dsml_single_call_stops_are_the_invoke_close_tag(
+        parser_cls, calls_tag, invoke_tag, parameter_tag):
+    """The close tag with the newline the encoders write after it comes first.
+
+    '>' and that newline are one token, and stops match token ids, so the bare
+    tag alone would never match the encoders' layout.
+    """
+    close_tag = f"</｜DSML｜{invoke_tag}>"
+    assert parser_cls().single_call_stops == (close_tag + "\n", close_tag)
+
+
+@pytest.mark.parametrize("stop_index", [0, 1], ids=["with_newline", "bare"])
+@pytest.mark.parametrize("parser_cls, calls_tag, invoke_tag, parameter_tag",
+                         _SINGLE_CALL_DSML_FORMATS,
+                         ids=_SINGLE_CALL_DSML_IDS)
+def test_dsml_generation_stopped_after_its_first_call_delivers_that_call(
+        sample_tools, parser_cls, calls_tag, invoke_tag, parameter_tag,
+        stop_index):
+    """The output ends on the kept stop, inside a calls block never closed."""
+    reply = _encoder_reply(calls_tag, invoke_tag, parameter_tag,
+                           "Checking both.", [_WEATHER_CALL, _SEARCH_CALL])
+    stop = parser_cls().single_call_stops[stop_index]
+    stopped = reply[:reply.index(stop) + len(stop)]
+
+    _assert_both_views(parser_cls, stopped, sample_tools,
+                       ("Checking both.", [_WEATHER_CALL]))
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "",
+        "\n",
+        # Cut inside the next invoke: header, parameter, close tags.
+        "\n<",
+        "\n<｜DSML｜{invoke}",
+        '\n<｜DSML｜{invoke} name="search',
+        '\n<｜DSML｜{invoke} name="search_web">\n<｜DSML｜{parameter} name="query" '
+        'string="true">AI',
+        '\n<｜DSML｜{invoke} name="search_web">\n<｜DSML｜{parameter} name="query" '
+        'string="true">AI news</｜DSML｜{parameter}>\n</｜DSML｜{invoke}',
+        # Cut inside the block's closing tag.
+        "\n</｜DSML｜{calls_prefix}",
+    ],
+    ids=[
+        "after_close_tag", "after_newline", "next_tag_opened",
+        "next_invoke_tag", "next_invoke_name", "next_parameter_value",
+        "next_close_tag", "block_close_tag"
+    ],
+)
+@pytest.mark.parametrize("parser_cls, calls_tag, invoke_tag, parameter_tag",
+                         _SINGLE_CALL_DSML_FORMATS,
+                         ids=_SINGLE_CALL_DSML_IDS)
+def test_dsml_open_block_delivers_its_complete_invokes_only(
+        sample_tools, parser_cls, calls_tag, invoke_tag, parameter_tag, tail):
+    """A block left open, by a stop or a token limit, keeps its complete calls.
+
+    The unfinished invoke after them is not a call, and its markup is not
+    text, in the whole-text parse and the stream alike.
+    """
+    text = ("Checking.\n\n" + f"<｜DSML｜{calls_tag}>\n" +
+            _encoder_invoke(invoke_tag, parameter_tag, *_WEATHER_CALL) +
+            tail.format(invoke=invoke_tag,
+                        parameter=parameter_tag,
+                        calls_prefix=calls_tag[:-2]))
+
+    _assert_both_views(parser_cls, text, sample_tools,
+                       ("Checking.", [_WEATHER_CALL]))
+
+
+@pytest.mark.parametrize("parser_cls, calls_tag, invoke_tag, parameter_tag",
+                         _SINGLE_CALL_DSML_FORMATS,
+                         ids=_SINGLE_CALL_DSML_IDS)
+def test_dsml_open_block_delivers_every_complete_invoke(sample_tools,
+                                                        parser_cls, calls_tag,
+                                                        invoke_tag,
+                                                        parameter_tag):
+    """The parser does not limit the calls; only the stop does."""
+    reply = _encoder_reply(calls_tag, invoke_tag, parameter_tag, "Checking.",
+                           [_WEATHER_CALL, _SEARCH_CALL])
+    open_block = reply[:reply.rindex("\n</｜DSML｜")]
+
+    _assert_both_views(parser_cls, open_block, sample_tools,
+                       ("Checking.", [_WEATHER_CALL, _SEARCH_CALL]))
+
+
+@pytest.mark.parametrize("parser_cls, calls_tag, invoke_tag, parameter_tag",
+                         _SINGLE_CALL_DSML_FORMATS,
+                         ids=_SINGLE_CALL_DSML_IDS)
+def test_dsml_open_block_without_a_complete_invoke_has_no_call(
+        sample_tools, parser_cls, calls_tag, invoke_tag, parameter_tag):
+    invoke = _encoder_invoke(invoke_tag, parameter_tag, *_WEATHER_CALL)
+    text = "Checking.\n\n" + f"<｜DSML｜{calls_tag}>\n" + invoke[:-1]
+
+    _assert_both_views(parser_cls, text, sample_tools, ("Checking.", []))
+
+
+def test_only_the_dsml_and_glm_parsers_declare_single_call_stops():
+    """Other formats have no stop, so their requests keep every call."""
+    declaring = {
+        name
+        for name, parser_cls in ToolParserFactory.parsers.items()
+        if parser_cls().single_call_stops
+    }
+    assert declaring == {
+        "deepseek_v32", "deepseek_v4", "deepseek_v41", "glm4", "glm47"
+    }
 
 
 # ============================================================================
@@ -8479,6 +8683,101 @@ class TestGlmStreamingMatchesWholeParse:
 
         assert calls == [("f", dict(code="ls"))]
         assert time.monotonic() - start < 10
+
+
+# ============================================================================
+# GLM parsers: generation stopped after one call (parallel_tool_calls=false)
+# ============================================================================
+
+
+@pytest.mark.parametrize("parser_cls", [Glm4ToolParser, Glm47ToolParser])
+class TestGlmGenerationStoppedAfterItsFirstCall:
+    """The stop is the call's closing tag; what it leaves is that one call."""
+
+    def test_the_single_call_stop_is_the_closing_tag(self, parser_cls):
+        """One token in the GLM tokenizers, so the bare tag is the only form."""
+        assert parser_cls().single_call_stops == ("</tool_call>", )
+
+    def test_a_generation_cut_after_its_first_call_delivers_that_call(
+            self, parser_cls, sample_tools):
+        """Whole and streamed alike, with the text before the call."""
+        call = functools.partial(_glm_call, parser_cls)
+        reply = ("Checking both." + call("get_weather", ("location", "NYC")) +
+                 "\n" + call("search_web", ("query", "AI news")))
+        (stop, ) = parser_cls().single_call_stops
+        stopped = reply[:reply.index(stop) + len(stop)]
+
+        assert _glm_parity(parser_cls, stopped,
+                           sample_tools) == ("Checking both.", [
+                               ("get_weather", dict(location="NYC"))
+                           ])
+
+    def test_the_whole_reply_still_delivers_every_call(self, parser_cls,
+                                                       sample_tools):
+        """The parser does not limit the calls; only the stop does."""
+        call = functools.partial(_glm_call, parser_cls)
+        reply = ("Checking both." + call("get_weather", ("location", "NYC")) +
+                 "\n" + call("search_web", ("query", "AI news")))
+
+        assert _glm_parity(parser_cls, reply,
+                           sample_tools) == ("Checking both.", [
+                               ("get_weather", dict(location="NYC")),
+                               ("search_web", dict(query="AI news"))
+                           ])
+
+
+# One call in the GLM-4.5 layout, name and tags each on their own line; the
+# GLM-4.7 parser reads that layout too.
+_GLM_STOPPED_CALL = ("<tool_call>f\n<arg_key>k</arg_key>\n"
+                     "<arg_value>v</arg_value>\n</tool_call>")
+
+
+@pytest.mark.parametrize("streaming", [False, True], ids=["whole", "streamed"])
+@pytest.mark.parametrize("tool_parser", ["glm4", "glm47"])
+@pytest.mark.parametrize(
+    "reasoning_parser, text",
+    [
+        # GLM-4.5 and 4.6: the model opens the block itself.
+        ("glm45", "<think>plan</think>" + _GLM_STOPPED_CALL),
+        # GLM-4.7 and GLM-5: the template prefilled `<think>`.
+        ("glm47", "plan</think>" + _GLM_STOPPED_CALL),
+    ],
+    ids=["model_opens_the_block", "template_opened_the_block"])
+def test_glm_reasoning_then_a_generation_stopped_after_its_first_call(
+        reasoning_parser, text, tool_parser, streaming):
+    """The reasoning parser hands the call on whole; the tool parser reads it."""
+    from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+    from tensorrt_llm.serve.postprocess_handlers import (apply_reasoning_parser,
+                                                         apply_tool_parser)
+
+    request = ChatCompletionRequest(model="glm",
+                                    messages=[{
+                                        "role": "user",
+                                        "content": "Do it."
+                                    }],
+                                    tools=[_glm_typed_tool("f", k="string")])
+    args = ChatPostprocArgs.from_request(request)
+    args.reasoning_parser = reasoning_parser
+    args.tool_parser = tool_parser
+    deltas = [text[i:i + 3]
+              for i in range(0, len(text), 3)] if streaming else [text]
+
+    reasoning, normal, calls = "", "", []
+    for index, delta in enumerate(deltas):
+        finished = index == len(deltas) - 1
+        content, reasoning_delta = apply_reasoning_parser(
+            args, 0, delta, streaming, finished)
+        reasoning += reasoning_delta
+        normal_delta, delta_calls = apply_tool_parser(args, 0, content,
+                                                      streaming, finished)
+        normal += normal_delta
+        calls += delta_calls
+
+    assert reasoning == "plan"
+    assert normal.strip() == ""
+    assert [(c.name, json.loads(c.parameters))
+            for c in calls] == [("f", dict(k="v"))]
+    assert args.has_tool_call.get(0) is True
 
 
 # ============================================================================
