@@ -32,6 +32,8 @@ The deployment guides below provide more detailed instructions for serving speci
 
    deployment-guide-for-nemotron-3-on-trtllm.md
    deployment-guide-for-gpt-oss-on-trtllm.md
+   deployment-guide-for-musespark-open-on-trtllm.md
+   deployment-guide-for-musespark-open-speculative-decoding-on-trtllm.md
    deployment-guide-for-qwen3-on-trtllm.md
    deployment-guide-for-qwen3.8-qwen3.5-on-trtllm.md
    deployment-guide-for-qwen3.8-flash-next-on-trtllm.md
