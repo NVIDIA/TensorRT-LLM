@@ -106,6 +106,14 @@ class _Attn:
     layer_idx = 3
     q_scaling = 1.0
 
+    def out_head_size(self, is_gen_only: bool) -> int:
+        return D
+
+
+# GQAMIX rides MsaDecodeFmha.sparse_decode_hook, an engine hook main's MsaDecodeFmha does not have yet:
+# _gqamix_register leaves such a library alone and the in-tree decode runs.
+_HAS_SPARSE_DECODE_HOOK = "sparse_decode_hook" in inspect.getsource(MsaDecodeFmha)
+
 
 def _params(attn, num_tokens):
     return types.SimpleNamespace(
@@ -120,6 +128,10 @@ def _params(attn, num_tokens):
     )
 
 
+@pytest.mark.skipif(
+    not _HAS_SPARSE_DECODE_HOOK,
+    reason="needs the MsaDecodeFmha.sparse_decode_hook engine hook, which this TensorRT-LLM does not have",
+)
 @pytest.mark.parametrize("hooked", [False, True], ids=["unset", "registered"])
 def test_the_shared_decode_hook_is_inert_unset(monkeypatch, hooked) -> None:
     from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels import msa_utils
@@ -180,7 +192,11 @@ def _mixed_step(nreq, seq_len, row_first, seed):
     return args, kwargs, total_q
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in copy._SM100F_CAPABILITIES,
+    reason="needs a CUDA device with the NVFP4 sparse decode kernels",
+)
 @pytest.mark.parametrize("nreq,row_first", [(1, 0), (1, 1), (3, 2), (5, 3), (8, 1)])
 @pytest.mark.parametrize("seq_len", [16384, 131072])
 def test_the_copy_writes_the_in_tree_output_on_a_mixed_step(nreq, row_first, seq_len) -> None:
