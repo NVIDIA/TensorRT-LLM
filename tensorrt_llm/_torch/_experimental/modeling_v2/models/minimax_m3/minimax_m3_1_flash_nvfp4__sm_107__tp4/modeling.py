@@ -2764,6 +2764,8 @@ class MiniMaxM3Tp4ModelingV2(DecoderModel):
         # build.
         self.hoist_blocks: Dict[int, Optional[object]] = {}
         self._hoist_env = None
+        # TP4_MOE_ENGINE agreed across the TP group (prebuild_kernels).
+        self.tp4_moe_engine = TP4_MOE_ENGINE
         self.embed_owners: Dict[tuple, DecodeEmbedding] = {}
         # Whether the 9..16-row generation router (ROUTER_TC_GEN) runs; decided at prebuild.
         self.router_tc_cluster16 = False
@@ -3004,6 +3006,9 @@ class MiniMaxM3Tp4ModelingV2(DecoderModel):
         torch.cuda.synchronize()
         times["gemv_s"] = time.perf_counter() - start
         start = time.perf_counter()
+        # TP4_MOE_ENGINE's kill switch is read per process: agreed once, before the per-layer builds it gates, so the
+        # ranks never mix the reference engine and m3_moe.
+        self.tp4_moe_engine = m3_mc_allreduce.tp_agree(self.mapping, TP4_MOE_ENGINE)
         for i in sorted(self.moe_layers):
             self._prebuild_engines(i)
         torch.cuda.synchronize()
@@ -3150,7 +3155,7 @@ class MiniMaxM3Tp4ModelingV2(DecoderModel):
         """Layer ``i``'s 1..8-row engine with the shared expert folded in, agreed across the TP group: at
         ``TP4_MOE_ENGINE_ROWS`` the reference engine (TP4_MOE_ENGINE) when every rank built it, else m3_moe when every
         rank built that, else None (the generic MoE)."""
-        if TP4_MOE_ENGINE and num_tokens in TP4_MOE_ENGINE_ROWS:
+        if self.tp4_moe_engine and num_tokens in TP4_MOE_ENGINE_ROWS:
             built = m3_mc_allreduce.tp_agree_built(
                 self.mapping,
                 self._try_build(i, TP4_MOE_ENGINE_PATH, num_tokens, self._build_wc_engine),
@@ -3167,7 +3172,13 @@ class MiniMaxM3Tp4ModelingV2(DecoderModel):
     def _prebuild_hoist(self) -> None:
         """TP4WC_HOIST: every MoE layer's reference block, built (compiled, die shards placed, MNNVL exchanges
         allocated) before warmup and agreed across the TP group per layer. The reference closure loads only here."""
-        if not TP4WC_HOIST or self.mapping.tp_size != 4 or self.mapping.enable_attention_dp:
+        if self.mapping.tp_size != 4 or self.mapping.enable_attention_dp:
+            return
+        # The kill switch is read per process: agree on it first, so a rank with it set never skips the install and
+        # build collectives its peers enter.
+        if not m3_mc_allreduce.tp_agree(self.mapping, TP4WC_HOIST):
+            if TP4WC_HOIST:
+                logger.warning(f"[M3 dispatch] {TP4WC_HOIST_PATH}: off on another TP rank; off")
             return
         ok, err = True, None
         try:
@@ -3203,7 +3214,15 @@ class MiniMaxM3Tp4ModelingV2(DecoderModel):
 
         def build(i: int, num_tokens: int):
             try:
-                return tp4_hoist_block.build(self._hoist_env, self.w, self.moe[i], i, mx, locmap)
+                return tp4_hoist_block.build(
+                    self._hoist_env,
+                    self.w,
+                    self.moe[i],
+                    i,
+                    mx,
+                    locmap,
+                    agree=lambda ok: m3_mc_allreduce.tp_agree(self.mapping, ok),
+                )
             except (ImportError, RuntimeError, ValueError):
                 raise
             except (

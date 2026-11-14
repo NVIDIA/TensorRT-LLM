@@ -20,6 +20,8 @@ Every seam replaces process plumbing, never arithmetic or launch order:
    makes it return None, the reference shipped 5-8 row schedule (b2buf 1, stages 7, lag = fused_phase_lag).
 8. ``m3moe_dl.host._ENGINE_PATH``: the family's ``kernels/m3ll/moe_engine_kernel.py``, not a second copy.
 9. ``H9_RH_DEADLINE_NS``: the post's rx deadline is the hang cap (knob), not the reference 2 s.
+10. ``route_warp_tp4_host.ptrig_on``: False, the reference default (the o_proj's producer trigger after its push and
+    no end-of-CTA wait in the post), without the reference's os.environ read of its developer opt-in.
 """
 
 from __future__ import annotations
@@ -406,7 +408,7 @@ def no_jit(post: PostExt, lamport: LamportExt):
 
 # ------------------------------------------------------------------------------------------------ install
 def install(mapping, comm, hang_cap_ns: int = HANG_CAP_NS):
-    """Bind the process-wide reference knobs and apply seams 3, 5-9 (idempotent per process; one TP group). Returns the
+    """Bind the process-wide reference knobs and apply seams 3, 5-10 (idempotent per process; one TP group). Returns the
     state the block builder needs: (post ext, lamport ext, dist facade, Runtime)."""
     with _lock:
         if "installed" in _st:
@@ -447,6 +449,7 @@ def install(mapping, comm, hang_cap_ns: int = HANG_CAP_NS):
         dl._dev_b2lag = (
             (lambda: None) if B2LAG_OFF else (lambda: dict(B2LAG))
         )  # seam 7 (B2LAG kill switch)
+        dist_modules[1].ptrig_on = lambda: False  # seam 10
         if not os.path.isfile(ENGINE_KERNEL):
             raise ImportError(f"m31 tp4 hoist: the family engine kernel {ENGINE_KERNEL} is missing")
         op = dl._op_dl()
