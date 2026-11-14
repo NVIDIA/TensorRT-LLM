@@ -572,6 +572,7 @@ def configure_fp4_mla_device_page_table(
         max_kv_len = int(kv_lens[:num_sequences].max().item()) + max(
             0,
             generation_tokens_per_sequence - 1,
+            int(metadata.kv_cache_params.num_extra_kv_tokens or 0),
         )
         max_pages = min(
             max_page_capacity,

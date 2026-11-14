@@ -66,6 +66,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     Role,
 )
 from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelWorker
+from tensorrt_llm._torch.speculative.utils import get_num_extra_kv_tokens
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.llmapi.llm_args import (
     DecodingBaseConfig,
@@ -3242,14 +3243,30 @@ def test_fp4_mla_mixed_decode_scratch_uses_generation_lengths(
 
 
 @pytest.mark.skipif(_fp4_mla_triton_unavailable(), reason="requires Triton FP4 MLA")
-@pytest.mark.parametrize("mixed_batch", [False, True], ids=["all-context", "mixed"])
+@pytest.mark.parametrize(
+    "mixed_batch,context_kv_length,draft_length",
+    [
+        pytest.param(False, 131, 2, id="all-context"),
+        pytest.param(True, 4095, 2, id="mixed"),
+        pytest.param(False, 128, 2, id="immediate-page-crossing"),
+        pytest.param(False, 127, 3, id="later-page-crossing"),
+    ],
+)
 def test_fp4_mla_mtp_context_to_generation_refreshes_page_bound(
-    monkeypatch: pytest.MonkeyPatch, mixed_batch: bool
+    monkeypatch: pytest.MonkeyPatch,
+    mixed_batch: bool,
+    context_kv_length: int,
+    draft_length: int,
 ) -> None:
     monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
-    final_lengths = [4096, 132] if mixed_batch else [132]
-    sequence_lengths = [128, 3] if mixed_batch else [128]
-    cached_lengths = [3967, 128] if mixed_batch else [3]
+    final_lengths = [context_kv_length + draft_length - 1]
+    sequence_lengths = [min(128, context_kv_length)]
+    cached_lengths = [context_kv_length - sequence_lengths[0]]
+    if mixed_batch:
+        final_lengths.append(132)
+        sequence_lengths.append(3)
+        cached_lengths.append(128)
+    spec_config = MTPDecodingConfig(max_draft_len=draft_length)
     batch_size = len(final_lengths)
     manager, fixture_metadata, queries, kv_lora_rank, rope_dim = (
         _build_fp4_mla_attention_decode_case(
@@ -3265,7 +3282,11 @@ def test_fp4_mla_mtp_context_to_generation_refreshes_page_bound(
             max_num_tokens=sum(sequence_lengths),
             num_contexts=1,
             seq_lens=torch.tensor(sequence_lengths, dtype=torch.int32),
-            kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=cached_lengths),
+            kv_cache_params=KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=cached_lengths,
+                num_extra_kv_tokens=get_num_extra_kv_tokens(spec_config),
+            ),
             kv_cache_manager=manager,
             request_ids=list(range(batch_size)),
             prompt_lens=[length - 1 for length in final_lengths],
@@ -3273,9 +3294,9 @@ def test_fp4_mla_mtp_context_to_generation_refreshes_page_bound(
                 has_speculative_draft_tokens=True
             ),
         )
-        worker = Eagle3OneModelWorker(MTPDecodingConfig(max_draft_len=2))
+        worker = Eagle3OneModelWorker(spec_config)
         spec_metadata = SimpleNamespace(
-            runtime_draft_len=2,
+            runtime_draft_len=draft_length,
             batch_indices_cuda=torch.arange(batch_size - 1, dtype=torch.int32, device="cuda"),
             wants_advanced_draft_sampling=False,
         )
@@ -3298,7 +3319,7 @@ def test_fp4_mla_mtp_context_to_generation_refreshes_page_bound(
         ) -> tuple[torch.Tensor, torch.Tensor]:
             nonlocal decoded_substep
             active = cast(trtllm_backend.TrtllmAttentionMetadata, draft_inputs["attn_metadata"])
-            if step == 1:
+            if step > 0:
                 assert active.num_contexts == 0
                 output = torch.empty_like(queries[..., :kv_lora_rank])
                 run_fp4_mla_attention_decode(
@@ -3314,7 +3335,11 @@ def test_fp4_mla_mtp_context_to_generation_refreshes_page_bound(
                     prequantized_q_sf=fixture_metadata.fp4_mla_state.prequantized_q_sf,
                     q_batch_capacity=fixture_metadata.fp4_mla_state.q_batch_capacity,
                 )
-                required_pages = triton.cdiv(max(final_lengths), FP4_MLA_TOKENS_PER_BLOCK)
+                required_pages = triton.cdiv(
+                    int(active.kv_lens_cuda.max().item()), FP4_MLA_TOKENS_PER_BLOCK
+                )
+                assert active.fp4_mla_state.page_table_stride >= required_pages
+                assert active.fp4_mla_state.generation_max_pages >= required_pages
                 assert (
                     active.fp4_mla_state.workspaces["_fp4_mla_attention_page_max_buf"].shape[1]
                     >= required_pages
@@ -3328,11 +3353,15 @@ def test_fp4_mla_mtp_context_to_generation_refreshes_page_bound(
                     qk_rope_head_dim=rope_dim,
                 )
                 torch.testing.assert_close(output.float(), reference, rtol=0.15, atol=0.15)
-                decoded_substep = True
-                if fail_after_decode:
-                    assert active.fp4_mla_state.device_page_table_valid
-                    assert active.fp4_mla_state.generation_lengths_num_tokens == active.num_tokens
-                    raise RuntimeError("draft model failure after attention")
+                if step == draft_length - 1:
+                    assert active.kv_lens_cuda.cpu().tolist() == final_lengths
+                    decoded_substep = True
+                    if fail_after_decode:
+                        assert active.fp4_mla_state.device_page_table_valid
+                        assert (
+                            active.fp4_mla_state.generation_lengths_num_tokens == active.num_tokens
+                        )
+                        raise RuntimeError("draft model failure after attention")
             hidden = torch.zeros((active.num_tokens, 8), device="cuda")
             return hidden, hidden
 
