@@ -12,6 +12,7 @@ import pytest
 import torch
 from torch import nn
 
+from tensorrt_llm._errors import RuntimeInitError
 from tensorrt_llm._torch import memory as memory_mod
 from tensorrt_llm._torch.locality_domain.policy import LocalityDomainPolicy
 from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
@@ -783,3 +784,24 @@ def test_gms_rejects_localized_weights_before_model_init(monkeypatch):
 
     model_loader_mod.AutoModelForCausalLM.from_config.assert_not_called()
     checkpoint_loader.load_weights.assert_not_called()
+
+
+@pytest.mark.parametrize("distributed_failure", [True, False])
+def test_model_construction_retries_only_non_distributed_errors(
+    monkeypatch: pytest.MonkeyPatch, distributed_failure: bool
+) -> None:
+    """A distributed failure must not restart collectives through regular init."""
+    loader = _make_loader(monkeypatch, events=[])
+    failure = (
+        RuntimeInitError("NCCL bootstrap failed")
+        if distributed_failure
+        else RuntimeError("meta init failed")
+    )
+    regular_init = ValueError("regular init reached")
+    construct = model_loader_mod.AutoModelForCausalLM.from_config
+    construct.side_effect = [failure, regular_init]
+    expected = failure if distributed_failure else regular_init
+    with pytest.raises(type(expected)) as raised:
+        loader.load("/ckpt", MagicMock())
+    assert raised.value is expected
+    assert construct.call_count == (1 if distributed_failure else 2)

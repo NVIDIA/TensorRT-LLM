@@ -841,7 +841,7 @@ convention = "google"
 
 [tool.ruff.lint.isort]
 known-first-party = ["tensorrt_llm"]
-known-third-party = ["triton_kernels"]
+known-third-party = ["nccl", "triton_kernels"]
 split-on-trailing-comma = false
 
 

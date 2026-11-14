@@ -61,13 +61,14 @@ class NcclEP(Communication):
         top_k: int = 8,
         quant_config: Optional[QuantConfig] = None,
         use_low_precision_combine: bool = False,
-    ):
+    ) -> None:
         super().__init__(mapping)
 
-        from tensorrt_llm._torch.moe.fused_moe.nccl_ep_utils import is_nccl_ep_installed
-
-        if not is_nccl_ep_installed():
-            raise RuntimeError("nccl-ep is not installed.")
+        from tensorrt_llm._torch.moe.fused_moe.nccl_ep_utils import (
+            _ep_comm_key,
+            get_nccl_ep_unavailable_reason,
+            is_nccl_ep_installed,
+        )
 
         self.num_slots = num_slots
         self.num_experts = num_slots
@@ -114,6 +115,11 @@ class NcclEP(Communication):
         # subsequent dispatches are CUDA-graph-safe.
         self._handle = None  # nccl.ep.Handle | None
         self._dispatch_state: dict = {}
+
+        # Validate local arguments before retaining any native communicator.
+        self._comm_key = _ep_comm_key(mapping)
+        if not is_nccl_ep_installed(mapping):
+            raise RuntimeError(f"NCCL EP unavailable: {get_nccl_ep_unavailable_reason(mapping)}")
 
     @staticmethod
     def is_platform_supported() -> bool:
@@ -496,11 +502,12 @@ class NcclEP(Communication):
         self._dispatch_state = {}
         return combine_output
 
-    def destroy(self):
-        """Release per-instance NCCL EP resources (handle).
+    def destroy(self) -> None:
+        """Release resources during coordinated teardown on all EP ranks.
 
         NcclEpContext is shared across instances and released through a
-        refcounted cache.
+        refcounted cache. This also releases any pending communicator shared by
+        strategies with the same EP membership and CUDA device.
         """
         if self._handle is not None:
             try:
@@ -509,9 +516,13 @@ class NcclEP(Communication):
                 logger.warning(f"Handle.destroy error during destroy: {e}")
             self._handle = None
 
-        from tensorrt_llm._torch.moe.fused_moe.nccl_ep_utils import release_nccl_ep_context
+        from tensorrt_llm._torch.moe.fused_moe.nccl_ep_utils import (
+            release_nccl_ep_context,
+            release_pending_nccl_ep_comm,
+        )
 
         if self._ctx is not None:
             release_nccl_ep_context(self._ctx)
         self._ctx = None
+        release_pending_nccl_ep_comm(self._comm_key)
         self._dispatch_state = {}
