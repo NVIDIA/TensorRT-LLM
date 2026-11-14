@@ -3486,9 +3486,11 @@ def test_selfsampling_topk_varlen_fp16_main_clus_smoke(
     """Native FP16 on the streaming families: tie-aware exact
     top-K values, valid unique indices, -1 tails and the FP32 values output on random fp16
     rows whose windows cover the full row, a shortened row, the short path and an empty row. The FP16
-    code-radix routes are switched off so each shape keeps the streaming family under test."""
+    code-radix routes and the tall-batch engine are switched off so each shape keeps the streaming
+    family under test."""
     monkeypatch.setattr(ss_host, "_REG_CODE_RADIX_16BIT", False)
     monkeypatch.setattr(ss_host, "_VARLEN_CACHE_FP16", {})
+    _without_tall_ws(monkeypatch)  # it takes main_dense on 132-SM Hopper
     generator = torch.Generator(device=_DEV).manual_seed(rows + ncols + top_k)
     logits = torch.randn((rows, ncols), generator=generator, device=_DEV).to(torch.float16)
     kv_pattern = [ncols * compress_ratio, (ncols - 7) * compress_ratio, top_k - 3, 0]
@@ -3512,9 +3514,7 @@ def test_selfsampling_topk_varlen_fp16_main_clus_smoke(
         rows, ncols, top_k, ncols, 1, compress_ratio, torch.cuda.current_device()
     )
     if _routes_as_picked():
-        assert ss_host._VARLEN_CACHE_FP16[key][0] == _picked_family(
-            family, rows, ncols, top_k, torch.float16
-        )
+        assert ss_host._VARLEN_CACHE_FP16[key][0] == family
     _check_low_varlen_exact(logits, indices, lengths, values)
 
 
@@ -3746,11 +3746,15 @@ def test_selfsampling_topk_fp16_dense_window_geometry() -> None:
     ],
 )
 def test_selfsampling_topk_varlen_fp16_dense_window_exactness(
-    rows: int, ncols: int, top_k: int
+    rows: int, ncols: int, top_k: int, monkeypatch
 ) -> None:
     """fp16 K=2048 rows whose top values spread over several binades (the K-th sits
     hundreds to thousands of fp16 codes above the sampled rung) stay exact on every
-    dense-window build: SPLIT, 1024-thread, 256-thread packed-index and v16 staging."""
+    dense-window build: SPLIT, 1024-thread, 256-thread packed-index (a 512-thread slab on
+    132-SM Hopper) and v16 staging. The tall-batch engine is switched off so each shape keeps
+    the main family."""
+    monkeypatch.setattr(ss_host, "_VARLEN_CACHE_FP16", {})  # its key does not record the gate
+    _without_tall_ws(monkeypatch)  # it takes blk1024 and blk256_packed_idx on 132-SM Hopper
     generator = torch.Generator(device=_DEV).manual_seed(rows + ncols + top_k)
     # odd logical widths ride a 64-aligned row stride (the 16-bit host needs a multiple of 8);
     # the stride tail and every row's tail beyond its length carry the +inf pad
@@ -3774,9 +3778,7 @@ def test_selfsampling_topk_varlen_fp16_dense_window_exactness(
     torch.cuda.synchronize()
     key = _varlen_cache_key(rows, stride, top_k, ncols, 1, 1, torch.cuda.current_device())
     if _routes_as_picked():
-        assert ss_host._VARLEN_CACHE_FP16[key][0] == _picked_family(
-            "main", rows, ncols, top_k, torch.float16
-        )
+        assert ss_host._VARLEN_CACHE_FP16[key][0] == "main"
     _check_low_varlen_exact(logits, indices, lengths, values)
 
 
