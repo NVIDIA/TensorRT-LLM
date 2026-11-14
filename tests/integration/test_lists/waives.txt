@@ -59,7 +59,6 @@ full:B200/accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4[use_msa=Fa
 full:B200/accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_auto_dtype[forced_chunked_prefill] SKIP (https://nvbugs/6597570)
 full:B200/accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_auto_dtype[full_budget] SKIP (https://nvbugs/6597570)
 full:B200/disaggregated/test_disaggregated.py::test_disaggregated_stress_test[input8k-output1k-conc512-qwen3_32b_fp8_stress] SKIP (https://nvbugs/6621362)
-full:B300/accuracy/test_kimi3.py::TestKimiK3::test_gsm8k_nvfp4_kv_dep8 SKIP (https://nvbugs/7023200)
 full:B300/accuracy/test_kimi3.py::TestKimiK3DSpark::test_gsm8k_tep8 SKIP (https://nvbugs/6946611)
 full:B300/accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus[ep4-mtp_nextn=0-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=True] SKIP (https://nvbugs/6838022)
 full:B300/accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_python_scheduler[mtp_nextn=0-attention_dp=False-cuda_graph=False-overlap_scheduler=False-enable_chunked_prefill=False] SKIP (https://nvbugs/6838022)

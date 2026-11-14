@@ -191,6 +191,7 @@ def run_fp4_mla_splitkv(
             (capacity,),
             dtype=dtype,
             device=output.device,
+            shared=False,
         )[:count]
 
     repeated_q = workspace("q", tasks * heads * 320, task_capacity * heads * 320, torch.uint8)

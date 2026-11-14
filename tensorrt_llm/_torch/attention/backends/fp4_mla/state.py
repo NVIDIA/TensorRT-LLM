@@ -22,9 +22,11 @@ if TYPE_CHECKING:
 class Fp4MlaState:
     """State shared by RoPE/cache append and all FP4 FMHAs in one batch.
 
-    Allocate through the metadata buffer allocator so eager forwards and each
-    CUDA graph retain their existing storage/aliasing rules. This state is not
-    layer-local: MTP and metadata preparation update it before any FMHA runs.
+    Allocate through the metadata buffer allocator. CUDA graphs of one runner
+    share per-forward Triton decode scratch through metadata.forward_scratch_buffers;
+    CUDAGraphRunner.clear() releases it. Persistent caches remain metadata-local.
+    This state is not layer-local: MTP and metadata preparation update it before
+    any FMHA runs.
     """
 
     hp_pool: torch.Tensor | None = None
@@ -47,6 +49,7 @@ class Fp4MlaState:
     device_page_table: bool = False
     device_page_table_valid: bool = False
     page_table_stride: int = 0
+    generation_max_pages: int = 0
     context_repack_max_touched_pages: int = 1
     cache_pool_id: int = 0
     cache_page_index_scale: int = 0
@@ -61,12 +64,9 @@ class Fp4MlaState:
     paged_kv_indptr_decode: torch.Tensor | None = None
     _paged_kv_indices: torch.Tensor | None = None
     num_sequences: int = 0
-    num_blocks: list[int] | None = None
     num_context_blocks: int = 0
     num_generation_blocks: int = 0
-    full_pages_cache: tuple[tuple, bool] | None = None
     workspaces: dict[str, torch.Tensor] = field(default_factory=dict)
-    v_packed_cache_tags: dict[str, tuple] = field(default_factory=dict)
 
     @property
     def paged_kv_indices(self) -> torch.Tensor:
@@ -173,6 +173,9 @@ class Fp4MlaState:
         metadata.prompt_lens_cuda_runtime = metadata.seq_lens_kv_cuda[:num_seqs]
         if not torch.cuda.is_current_stream_capturing():
             metadata.prompt_lens_cpu_runtime = metadata.seq_lens_kv[:num_seqs]
+        self.generation_max_pages = (
+            self.page_table_stride if num_seqs > metadata.num_contexts else 0
+        )
         self.on_update_kv_lens(metadata)
 
     def restore_from_spec_dec(self, metadata: TrtllmAttentionMetadata) -> None:
@@ -183,6 +186,8 @@ class Fp4MlaState:
         metadata.prompt_lens_cuda_runtime = metadata.seq_lens_kv_cuda[:num_seqs]
         if not torch.cuda.is_current_stream_capturing():
             metadata.prompt_lens_cpu_runtime = metadata.seq_lens_kv[:num_seqs]
+        self.device_page_table_valid = False
+        self.invalidate_generation_lengths()
 
     def populate_append_metadata(self, metadata: TrtllmAttentionMetadata) -> None:
         num_seqs = metadata.num_contexts + metadata.num_generations

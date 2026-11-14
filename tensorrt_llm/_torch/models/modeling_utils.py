@@ -521,7 +521,9 @@ def apply_quant_config_exclude_modules(
     kv_cache_quant_algo takes precedence over exclude_modules.
     kv_cache_quant_algo, if not None, is set for non-Attention
     modules too, which is the same practice as when there's no
-    exclude_modules.
+    exclude_modules. An excluded module that sets
+    _preserve_kv_cache_quant_algo keeps its own kv_cache_quant_algo
+    instead of the global one.
     """
     quant_config = model_config.quant_config
     kv_cache_quant_algo = None
@@ -565,7 +567,12 @@ def apply_quant_config_exclude_modules(
                     for n in candidates) or any(fused_excluded)
                 if is_excluded and getattr(module, "quant_config",
                                            None) is not None:
-                    module.quant_config = new_config
+                    if getattr(module, '_preserve_kv_cache_quant_algo', False):
+                        module.quant_config = QuantConfig(
+                            kv_cache_quant_algo=module.quant_config.
+                            kv_cache_quant_algo)
+                    else:
+                        module.quant_config = new_config
                     # Reset _weights_created so create_weights() in
                     # __post_init__ will re-create this module's weights
                     # with the updated (non-quantized) config. Some

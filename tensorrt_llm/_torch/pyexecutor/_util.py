@@ -45,10 +45,12 @@ from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.runtime.kv_cache_manager_v2 import ReusePolicy
 
 from ..attention.backends import get_sparse_attn_kv_cache_manager
+from ..attention.backends.interface import AttentionRuntimeFeatures
 from ..attention.backends.sparse.params import \
     get_indexer_mqa_logits_workspace_bytes
 from ..disaggregation.kv_cache_transceiver import (AttentionTypeCpp,
                                                    create_kv_cache_transceiver)
+from ..distributed.communicator import Distributed, ReduceOp
 from ..hostfunc import set_low_latency_dispatch
 from ..model_config import ModelConfig, _get_kv_cache_layer_specs
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
@@ -601,6 +603,20 @@ def get_attention_workspace_is_chunked_prefill_bounded(model_config) -> bool:
             model_config)
 
 
+def get_attention_workspace_min_tokens(
+        model_config: ModelConfig, mapping: Mapping, *, max_num_tokens: int,
+        runtime_features: AttentionRuntimeFeatures) -> int:
+    """Minimum staging capacity declared by the model's selected backend."""
+    from ..attention.backends.utils import get_attention_backend
+
+    return get_attention_backend(
+        model_config.attn_backend).runtime_workspace_min_tokens(
+            model_config,
+            mapping,
+            max_num_tokens=max_num_tokens,
+            runtime_features=runtime_features)
+
+
 def get_attention_workspace_fixed_bytes(model_config, mapping,
                                         **capacities) -> int:
     """Capacity-sized reserve declared by the model's selected backend."""
@@ -613,6 +629,21 @@ def get_attention_workspace_fixed_bytes(model_config, mapping,
             GlmKpoolSparseAttention as backend
     return backend.runtime_workspace_fixed_bytes(model_config, mapping,
                                                  **capacities)
+
+
+def get_attention_workspace_profiled_tokens(model_config: ModelConfig, *,
+                                            profiled_prompt_len: int,
+                                            max_num_tokens: int,
+                                            max_batch_size: int) -> int:
+    """Staging actually executed by the selected backend during profiling."""
+    from ..attention.backends.utils import get_attention_backend
+
+    return get_attention_backend(
+        model_config.attn_backend).runtime_workspace_profiled_tokens(
+            model_config,
+            profiled_prompt_len=profiled_prompt_len,
+            max_num_tokens=max_num_tokens,
+            max_batch_size=max_batch_size)
 
 
 def get_overlap_headroom_penalty_workspace_bytes(
@@ -674,7 +705,8 @@ def get_mla_context_workspace_kv_len_cap(
     * max_seq_len``: at most that many context requests run in a step, each attending at most ``max_seq_len``
     KV, so reserving for it never defers a request. An explicit ``fp8_context_mla_kv_len_cap`` override
     reserves less workspace (freeing KV pool) and lets the scheduler defer over-cap requests; it is floored
-    at ``max_seq_len`` (one request must always fit) and capped at the worst case.
+    at ``max_seq_len`` and capped at the worst case. The reserve still covers the workspace floor of
+    ``get_mla_context_workspace_reserve``, while the admission cap never exceeds this value.
     """
     workspace_can_exceed_profile = (
         kv_cache_config.enable_block_reuse and not enable_chunked_prefill) or (
@@ -684,8 +716,16 @@ def get_mla_context_workspace_kv_len_cap(
               and not chunked_workspace_profiled)))
     if not workspace_can_exceed_profile:
         return None
+    return _resolve_mla_context_workspace_kv_len_cap(
+        max_batch_size, max_num_tokens, max_seq_len,
+        kv_cache_config.fp8_context_mla_kv_len_cap)
+
+
+def _resolve_mla_context_workspace_kv_len_cap(max_batch_size: int,
+                                              max_num_tokens: int,
+                                              max_seq_len: int,
+                                              override: Optional[int]) -> int:
     worst_case = min(max_batch_size, max_num_tokens) * max_seq_len
-    override = kv_cache_config.fp8_context_mla_kv_len_cap
     if override is None:
         return worst_case
     return min(max(int(override), max_seq_len), worst_case)
@@ -711,26 +751,84 @@ def get_indexer_mqa_logits_workspace_reserve(kv_cache_memory: int,
     return workspace_memory
 
 
-def get_mla_context_workspace_reserve(budget_bytes, k_bytes_per_token,
-                                      w_bytes_per_token, kv_len_cap):
-    """Bytes to reserve for the fp8 context-MLA workspace, and the token admission cap that reserve covers.
+def get_mla_context_workspace_reserve(
+    budget_bytes: int,
+    k_bytes_per_token: int,
+    w_bytes_per_token: int,
+    kv_len_cap: Optional[int],
+    *,
+    fixed_bytes: int,
+    min_workspace_tokens: int = 0,
+    profiled_workspace_tokens: int = 0,
+) -> tuple[float, Optional[int]]:
+    """Reserve FP8 context-MLA staging bytes and return the covered token count.
 
-    Reserve ``w * kv_len_cap`` (the worst-case summed attended KV), clamped to the per-token split
-    ``budget * w / (k + w)`` so a memory-constrained node shares the budget at a common token count rather
-    than starving the KV pool. The admission cap is ``reserve / w == min(kv_len_cap, budget / (k + w))``
-    tokens; the scheduler admits at most that much summed attended KV, so the fp8 dequant staging buffer
-    this reserve covers stays within it. This accounts for the fp8 staging term only -- the separate BF16
-    full-gather buffers on the reuse path are not yet charged here (tracked as a follow-up), so this bounds
-    but does not by itself guarantee the reuse-path peak. Returns ``(reserve_bytes, cap_tokens)``, or
-    ``(0, None)`` when any input is non-positive.
+    Split only the budget beyond ``fixed_bytes`` (``CacheCost.intercept``) between
+    KV tokens and workspace: ``(budget - fixed) * w / (k + w)``, capped at
+    ``w * kv_len_cap``. The workspace floor of ``min_workspace_tokens`` takes
+    precedence over that split, less the ``profiled_workspace_tokens`` of staging
+    that the measured peak already holds. Raise if the fixed cost or floor leaves
+    no variable KV budget, before allocating the pool. The chunked floor is controlled by
+    ``max_num_tokens``.
+
+    The admission cap is ``min(kv_len_cap, max(min_workspace_tokens, reserve / w))``,
+    so it never exceeds ``kv_len_cap``. This accounts only for FP8 staging;
+    separate BF16 full-gather buffers are not charged here. Return ``(0, None)``
+    when the budget, ``k``, ``w`` or ``kv_len_cap`` is not positive.
+
+    Args:
+        budget_bytes: KV-cache memory budget in bytes.
+        k_bytes_per_token: Variable KV-cache cost per token.
+        w_bytes_per_token: Backend staging cost per token.
+        kv_len_cap: Requested maximum summed attended KV length.
+        fixed_bytes: Token-independent KV-cache cost.
+        min_workspace_tokens: Minimum staging capacity declared by the backend.
+        profiled_workspace_tokens: Staging tokens already priced into profiling.
+
+    Returns:
+        Extra staging bytes and the covered admission cap, or (0, None) for
+        non-positive budget, rate, or admission-cap inputs.
+
+    Raises:
+        ResourceError: The fixed cost or workspace floor leaves no variable KV-cache budget.
     """
     if not (budget_bytes > 0 and k_bytes_per_token > 0 and w_bytes_per_token > 0
             and kv_len_cap and kv_len_cap > 0):
         return 0, None
-    reserve = min(
-        w_bytes_per_token * kv_len_cap, budget_bytes * w_bytes_per_token /
-        (k_bytes_per_token + w_bytes_per_token))
-    return reserve, int(reserve / w_bytes_per_token)
+    token_budget_bytes = budget_bytes - fixed_bytes
+    minimum_reserve = w_bytes_per_token * max(
+        0, min_workspace_tokens - profiled_workspace_tokens)
+    if token_budget_bytes <= minimum_reserve:
+        if minimum_reserve == 0:
+            raise ResourceError(
+                "The fixed KV cache cost leaves no variable KV cache budget: "
+                f"{budget_bytes} bytes of KV cache budget less {fixed_bytes} bytes of fixed cost "
+                f"leave {token_budget_bytes} bytes. Raise "
+                "kv_cache_config.free_gpu_memory_fraction or lower max_batch_size."
+            )
+        raise ResourceError(
+            "The context-MLA workspace floor leaves no variable KV cache budget: "
+            f"{budget_bytes} bytes of KV cache budget less {fixed_bytes} bytes of fixed cost "
+            f"leave {token_budget_bytes} bytes, and the floor of {min_workspace_tokens} tokens "
+            f"from max_num_tokens at {w_bytes_per_token} bytes/token needs {minimum_reserve} "
+            f"of them (the profiling forward staged {profiled_workspace_tokens} tokens). Raise "
+            "kv_cache_config.free_gpu_memory_fraction, lower max_batch_size to reduce "
+            "fixed KV cost, or lower max_num_tokens.")
+    reserve = max(
+        minimum_reserve,
+        min(
+            w_bytes_per_token * kv_len_cap, token_budget_bytes *
+            w_bytes_per_token / (k_bytes_per_token + w_bytes_per_token)))
+    return reserve, min(
+        kv_len_cap, max(min_workspace_tokens, int(reserve / w_bytes_per_token)))
+
+
+def _any_rank_failed(failed: bool, mapping: Mapping) -> bool:
+    """Whether ``failed`` holds on any rank; every rank gets the same answer."""
+    if mapping.world_size > 1:
+        return bool(
+            Distributed.get(mapping).allreduce(int(failed), op=ReduceOp.MAX))
+    return failed
 
 
 def _normalize_attention_windows(
@@ -1066,6 +1164,8 @@ class KvCacheCreator:
         self._net_max_seq_len = net_max_seq_len
         self._dummy_reqs = None
         self._mla_chunked_profile_length: int | None = None
+        # Prompt length of the fresh-prefill dummies the profiling forward runs.
+        self._profiled_prompt_len = 0
         self._dummy_encoder_inputs: List[MultimodalParams] = []
         self._profiling_stage_data = profiling_stage_data
         self._is_disagg = is_disagg
@@ -1531,6 +1631,7 @@ class KvCacheCreator:
         else:
             input_seq_len = min(max_num_tokens, input_seq_len)
             remaining_tokens = max_num_tokens
+            self._profiled_prompt_len = input_seq_len
         while remaining_tokens > 0:
             input_seq_len = min(input_seq_len, remaining_tokens)
             input_tokens = torch.randint(low=0,
@@ -2087,24 +2188,11 @@ class KvCacheCreator:
                     f"budget {budget_before / (GB):.2f} -> {kv_cache_max_memory / (GB):.2f} GiB."
                 )
 
-        # Reserve headroom for attention workspace the selected backend declares and the profiling forward
-        # under-measures. KV-cache reuse can push summed attended KV past the profiled floor. Chunked prefill
-        # usually bounds each attention launch by its chunk buffer, except for implementations such as the
-        # NVFP4 DSA context gather that consume the complete attended prefix. The backend declares that
-        # distinction through runtime_workspace_is_chunked_prefill_bounded. When a reserve applies,
-        # reserve w * L_cap bytes -- covering the worst-case summed attended KV the scheduler admits
-        # (get_mla_context_workspace_kv_len_cap) -- but clamp it to the per-token split budget * w / (k + w)
-        # so a memory-constrained node shares the budget at a common token count instead of starving the
-        # pool. Equivalently the pool keeps max((budget - w*L_cap)/k, budget/(k+w)) tokens. The reserve
-        # covers exactly reserve/w tokens of summed attended KV; that count is carried to the KV manager as
-        # the scheduler's admission cap so it never re-derives the cap from pool layout (which V2
-        # overstates). No cap or w == 0 -> no-op.
-        # A completed chunk-aware profiling run already prices the cached-KV
-        # staging buffers in the measured peak. Do not subtract an additional
-        # workspace reserve or install an attended-KV admission cap for it.
-        # A decode-only worker never runs the context-MLA gather at all.
-        profiled_mla_chunks = (py_executor is not None and not self._skip_est
+        profiled_forward = py_executor is not None and not self._skip_est
+        # Chunk-aware profiling already prices the backend's complete cached-KV staging peak.
+        profiled_mla_chunks = (profiled_forward
                                and self._mla_chunked_profile_length is not None)
+        # A decode-only worker never runs the context-MLA gather.
         w_bytes_per_token = (0 if profiled_mla_chunks
                              or is_decode_only(self._sparse_attention_config)
                              else get_attention_workspace_bytes_per_token(
@@ -2129,21 +2217,76 @@ class KvCacheCreator:
             require_chunked_workspace_profile=(
                 w_bytes_per_token > 0 and self._llm_args.enable_chunked_prefill
                 and get_sm_version() >= 100))
+        floor_error = None
         if w_bytes_per_token > 0 and kv_len_cap:
             budget_before = kv_cache_max_memory
-            workspace_reserve, self._fp8_ctx_mla_kv_len_cap = (
-                get_mla_context_workspace_reserve(
-                    budget_before,
-                    self._get_kv_size_per_token().slope, w_bytes_per_token,
-                    kv_len_cap))
+            kv_cost = self._get_kv_size_per_token()
+            # The common-token split already covers any single request that fits beside the
+            # fixed KV cost. Only the backend's staging layout can impose a larger floor.
+            model_config = self._model_engine.model.model_config
+            min_workspace_tokens = get_attention_workspace_min_tokens(
+                model_config,
+                self._mapping,
+                max_num_tokens=self._max_num_tokens,
+                runtime_features=self._model_engine.attn_runtime_features)
+            profiled_tokens = get_attention_workspace_profiled_tokens(
+                model_config,
+                profiled_prompt_len=self._profiled_prompt_len
+                if profiled_forward else 0,
+                max_num_tokens=self._max_num_tokens,
+                max_batch_size=self._max_batch_size)
+            try:
+                workspace_reserve, self._fp8_ctx_mla_kv_len_cap = (
+                    get_mla_context_workspace_reserve(
+                        budget_before,
+                        kv_cost.slope,
+                        w_bytes_per_token,
+                        kv_len_cap,
+                        fixed_bytes=kv_cost.intercept,
+                        min_workspace_tokens=min_workspace_tokens,
+                        profiled_workspace_tokens=profiled_tokens))
+            except ResourceError as error:
+                floor_error = error
+        if _any_rank_failed(floor_error is not None, self._mapping):
+            raise floor_error or ResourceError(
+                "The context-MLA workspace or fixed KV cost leaves no variable KV cache budget on another "
+                "rank; see that rank's error.")
+        if w_bytes_per_token > 0 and kv_len_cap:
             if workspace_reserve > 0:
                 kv_cache_max_memory = int(budget_before - workspace_reserve)
+                floor_description = (
+                    f", staging floor {min_workspace_tokens} tokens less "
+                    f"{profiled_tokens} tokens already in the measured peak"
+                    if min_workspace_tokens > 0 else "")
                 logger.info(
                     f"Reserving {workspace_reserve / (GB):.2f} GiB for the context-MLA attention "
-                    f"workspace (w={w_bytes_per_token} B/token, admitting up to "
-                    f"{self._fp8_ctx_mla_kv_len_cap} tokens of summed attended KV): KV cache budget "
-                    f"{budget_before / (GB):.2f} -> {kv_cache_max_memory / (GB):.2f} GiB."
-                )
+                    f"workspace (w={w_bytes_per_token} B/token{floor_description}, "
+                    f"admitting up to {self._fp8_ctx_mla_kv_len_cap} tokens of "
+                    f"summed attended KV): KV cache budget {budget_before / (GB):.2f} -> "
+                    f"{kv_cache_max_memory / (GB):.2f} GiB.")
+            cap_at_floor = _resolve_mla_context_workspace_kv_len_cap(
+                self._max_batch_size, self._max_num_tokens, self._max_seq_len,
+                min_workspace_tokens)
+            if (self._kv_cache_config.fp8_context_mla_kv_len_cap is not None
+                    and cap_at_floor > kv_len_cap):
+                reserve_at_floor, _ = get_mla_context_workspace_reserve(
+                    budget_before,
+                    kv_cost.slope,
+                    w_bytes_per_token,
+                    cap_at_floor,
+                    fixed_bytes=kv_cost.intercept,
+                    min_workspace_tokens=min_workspace_tokens,
+                    profiled_workspace_tokens=profiled_tokens)
+                additional_reserve = (int(budget_before - workspace_reserve) -
+                                      int(budget_before - reserve_at_floor))
+                logger.warning(
+                    "kv_cache_config.fp8_context_mla_kv_len_cap resolves to "
+                    f"{kv_len_cap} tokens, below the context-MLA workspace floor of "
+                    f"{min_workspace_tokens} tokens from max_num_tokens: the reserve covers the "
+                    f"floor, and the scheduler still admits at most {self._fp8_ctx_mla_kv_len_cap} tokens. "
+                    f"Raising the configured cap to {min_workspace_tokens} tokens would resolve to "
+                    f"{cap_at_floor} tokens and reserve "
+                    f"{additional_reserve} additional bytes on this rank.")
 
         # NOTE:
         # For KVCacheManager, KvCacheCreator currently controls capacity using two parameters in KVCacheConfig:

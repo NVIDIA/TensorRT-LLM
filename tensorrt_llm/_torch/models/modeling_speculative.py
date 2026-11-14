@@ -69,6 +69,7 @@ def _set_draft_kv_cache_quant_algo(draft_config: ModelConfig,
         "draft_kv_cache_quant_algo_override")
     if override is not None:
         algo = QuantAlgo(override)
+    draft_config._preserve_kv_cache_quant_algo = override is not None
     draft_config.quant_config.kv_cache_quant_algo = algo
     if override is not None and draft_config.quant_config_dict is not None:
         for layer_quant_config in draft_config.quant_config_dict.values():
@@ -1853,9 +1854,9 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                         raise ValueError(
                             f"Unsupported eagle3 model architecture for draft model: {spec_config.eagle3_model_arch}"
                         )
+                    self.draft_config.extra_attrs = model_config.extra_attrs
                     _set_draft_kv_cache_quant_algo(self.draft_config,
                                                    model_config)
-                    self.draft_config.extra_attrs = model_config.extra_attrs
 
                 elif spec_config.uses_external_draft_model:
                     self.draft_config = ModelConfig.from_pretrained(
@@ -1867,9 +1868,9 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                         spec_config=None,
                         max_num_tokens=model_config.max_num_tokens,
                         moe_max_num_tokens=model_config.moe_max_num_tokens)
+                    self.draft_config.extra_attrs = model_config.extra_attrs
                     _set_draft_kv_cache_quant_algo(self.draft_config,
                                                    model_config)
-                    self.draft_config.extra_attrs = model_config.extra_attrs
                     self.draft_config.extra_attrs[
                         _SPECULATIVE_POSITION_HEADROOM] = (
                             2 * spec_config.tokens_per_gen_step)
@@ -1879,9 +1880,9 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                         model_config.spec_config.speculative_model,
                         **external_drafter_config_kwargs(
                             model_config, spec_config))
+                    self.draft_config.extra_attrs = model_config.extra_attrs
                     _set_draft_kv_cache_quant_algo(self.draft_config,
                                                    model_config)
-                    self.draft_config.extra_attrs = model_config.extra_attrs
 
                 elif spec_config.uses_replacement_heads:
                     self.draft_config = _replacement_mtp_model_config(

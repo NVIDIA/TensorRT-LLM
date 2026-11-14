@@ -19,7 +19,10 @@ import pytest
 import torch
 
 import tensorrt_llm.bindings.internal.batch_manager as batch_manager
+from tensorrt_llm._errors import ResourceError
 from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
+from tensorrt_llm._torch.distributed.communicator import ReduceOp
 from tensorrt_llm._torch.model_config import KVCacheLayerSpec as ModelKVCacheLayerSpec
 from tensorrt_llm._torch.model_config import ModelConfig, _get_kv_cache_layer_specs
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
@@ -50,6 +53,7 @@ from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.llmapi.llm_args import (
+    DeepSeekSparseAttentionConfig,
     DSparkDecodingConfig,
     KvCacheConfig,
     MTPDecodingConfig,
@@ -139,6 +143,7 @@ def test_mla_profile_respects_context_limit(
         assert creator._mla_chunked_profile_length == 73728
     else:
         assert creator._mla_chunked_profile_length is None
+        assert creator._profiled_prompt_len == min(creator._max_num_tokens, input_seq_len)
         assert sum(len(req.input_token_ids) for req in requests) == 8192
 
 
@@ -1586,6 +1591,157 @@ def test_mla_branch_forwards_max_num_tokens_to_manager() -> None:
     )
 
 
+def _run_mla_workspace_estimation(
+    *,
+    sm: int,
+    chunked_workspace_profiled: bool,
+    chunked_prefill: bool,
+    bounded: bool,
+    kv_cost: CacheCost = CacheCost(slope=3),
+    max_num_tokens: int = 16,
+    max_seq_len: int = 128,
+    kv_len_cap_override: int | None = None,
+    mapping: Mapping | None = None,
+    sparse_algorithm: str | None = None,
+    fp4_kv_cache: bool = False,
+    max_batch_size: int = 8,
+    runtime_chunk_size: int | None = None,
+    real_backend_floor: bool = False,
+    workspace_bytes_per_token: int = 1,
+) -> tuple[KvCacheCreator, KvCacheConfig, Mock]:
+    """Run the estimation with a 512-byte KV budget and a 1 byte/token context-MLA workspace."""
+
+    pool_ratio = [0.2, 0.3, 0.5]
+    avg_seq_len = 128
+    user_max_tokens = 1024
+    estimation_max_tokens = 256
+    kv_cache_config = KvCacheConfig(
+        max_tokens=user_max_tokens,
+        enable_block_reuse=True,
+        pool_ratio=pool_ratio,
+        avg_seq_len=avg_seq_len,
+        fp8_context_mla_kv_len_cap=kv_len_cap_override,
+    )
+    model_engine = Mock()
+    model_engine.model.model_config.attn_backend = "TRTLLM"
+    sparse_config = (
+        DeepSeekSparseAttentionConfig(index_n_heads=64, index_head_dim=128, index_topk=2048)
+        if sparse_algorithm == "dsa"
+        else None
+    )
+    model_engine.model.model_config.sparse_attention_config = sparse_config
+    model_engine.model.model_config.pretrained_config = SimpleNamespace(
+        kv_lora_rank=512, qk_rope_head_dim=64
+    )
+    model_engine.model.model_config.quant_config = SimpleNamespace(
+        quant_mode=SimpleNamespace(
+            has_fp8_kv_cache=lambda: not fp4_kv_cache,
+            has_fp4_kv_cache=lambda: fp4_kv_cache,
+        )
+    )
+    # Explicit False: try_prepare_estimation skips estimation for
+    # encoder-decoder models, and a bare Mock attribute is truthy.
+    model_engine.model.model_config.is_encoder_decoder = False
+    # A bare Mock would auto-create the attribute; real engines set it to
+    # None unless the model opted into MM item scheduling.
+    model_engine.mm_encoder_output_budget_bytes = None
+    model_engine.mm_encoder_cache = None
+    model_engine.attn_runtime_features = AttentionRuntimeFeatures(
+        chunked_prefill=chunked_prefill,
+        chunk_size=max_num_tokens if runtime_chunk_size is None else runtime_chunk_size,
+    )
+    llm_args = Mock(cache_transceiver_config=None, enable_chunked_prefill=chunked_prefill)
+
+    with patch.object(
+        KvCacheCreator,
+        "_get_model_kv_cache_manager_cls",
+        return_value=KVCacheManagerV2,
+    ):
+        creator = KvCacheCreator(
+            model_engine=model_engine,
+            mapping=mapping or Mapping(),
+            net_max_seq_len=max_seq_len,
+            kv_connector_manager=None,
+            max_num_tokens=max_num_tokens,
+            max_beam_width=1,
+            tokens_per_block=128,
+            max_seq_len=max_seq_len,
+            max_batch_size=max_batch_size,
+            kv_cache_config=kv_cache_config,
+            llm_args=llm_args,
+            speculative_config=None,
+            sparse_attention_config=sparse_config,
+            profiling_stage_data=None,
+            is_disagg=False,
+        )
+
+    creator._mla_chunked_profile_length = 2304 if chunked_workspace_profiled else None
+    # The dummy prompt length _create_dummy_context_requests sets for net_max_seq_len - 1.
+    creator._profiled_prompt_len = min(max_num_tokens, max_seq_len - 1)
+    py_executor = Mock()
+    py_executor.warmup_scope.return_value = nullcontext()
+    py_executor.dist.mapping.rank = 0
+    py_executor.dist.broadcast.side_effect = lambda value, root: value
+    py_executor.enqueue_requests.return_value = [1]
+    py_executor.await_responses.return_value = []
+    kv_manager = Mock()
+    kv_manager.get_kv_cache_stats.return_value = SimpleNamespace(allocated_bytes=0)
+    py_executor.resource_manager.resource_managers.get.side_effect = [kv_manager, None]
+
+    with (
+        patch("tensorrt_llm._torch.pyexecutor._util.get_sm_version", return_value=sm),
+        patch("tensorrt_llm._torch.attention.backends.trtllm.get_sm_version", return_value=sm),
+        patch.object(
+            creator,
+            "_get_token_num_for_estimation",
+            return_value=estimation_max_tokens,
+        ),
+        patch.object(creator, "_cal_max_memory", return_value=512),
+        patch.object(torch.cuda, "mem_get_info", return_value=(768, 1024)),
+        patch.object(
+            torch.cuda,
+            "memory_stats",
+            return_value={"allocated_bytes.all.current": 128, "allocated_bytes.all.peak": 256},
+        ),
+        patch.object(creator, "_encode_dummy_inputs", return_value=None),
+        patch.object(creator, "_get_kv_size_per_token", return_value=kv_cost),
+        patch.object(torch.cuda, "empty_cache"),
+        patch.object(torch.cuda, "reset_peak_memory_stats"),
+        # Use a nonzero backend cost: the 512-byte budget splits into 384 bytes
+        # of KV and 128 bytes of workspace unless chunk profiling covered it.
+        patch(
+            "tensorrt_llm._torch.pyexecutor._util.get_attention_workspace_bytes_per_token",
+            return_value=workspace_bytes_per_token,
+        ),
+        patch(
+            "tensorrt_llm._torch.pyexecutor._util.get_attention_workspace_is_chunked_prefill_bounded",
+            return_value=bounded,
+        ),
+        patch(
+            "tensorrt_llm._torch.attention.backends.trtllm.TrtllmAttention.runtime_workspace_min_tokens",
+            **(
+                {"wraps": TrtllmAttention.runtime_workspace_min_tokens}
+                if real_backend_floor
+                else {"return_value": 4 * max_num_tokens if bounded and chunked_prefill else 0}
+            ),
+        ) as floor_call,
+    ):
+        assert creator.try_prepare_estimation()
+        assert kv_cache_config.max_tokens == estimation_max_tokens
+        assert kv_cache_config.pool_ratio is None
+        assert kv_cache_config.avg_seq_len == max_seq_len
+
+        creator.configure_kv_cache_capacity(py_executor)
+        if floor_call.called:
+            floor_call.assert_called_once_with(
+                model_engine.model.model_config,
+                creator._mapping,
+                max_num_tokens=max_num_tokens,
+                runtime_features=model_engine.attn_runtime_features,
+            )
+    return creator, kv_cache_config, py_executor
+
+
 @pytest.mark.parametrize(
     (
         "sm",
@@ -1612,98 +1768,13 @@ def test_estimation_temporarily_uses_inferred_pool_sizing(
     expected_cap: int | None,
 ) -> None:
     """Verify measured chunk capacity and preserve Hopper's existing reserve policy."""
-
-    pool_ratio = [0.2, 0.3, 0.5]
-    avg_seq_len = 128
-    max_seq_len = 4096
-    user_max_tokens = 1024
-    estimation_max_tokens = 256
-    kv_cache_config = KvCacheConfig(
-        max_tokens=user_max_tokens,
-        enable_block_reuse=True,
-        pool_ratio=pool_ratio,
-        avg_seq_len=avg_seq_len,
+    creator, kv_cache_config, py_executor = _run_mla_workspace_estimation(
+        sm=sm,
+        chunked_workspace_profiled=chunked_workspace_profiled,
+        chunked_prefill=chunked_prefill,
+        bounded=bounded,
+        max_seq_len=4096,
     )
-    model_engine = Mock()
-    model_engine.model.model_config.attn_backend = "TRTLLM"
-    # Explicit False: try_prepare_estimation skips estimation for
-    # encoder-decoder models, and a bare Mock attribute is truthy.
-    model_engine.model.model_config.is_encoder_decoder = False
-    # A bare Mock would auto-create the attribute; real engines set it to
-    # None unless the model opted into MM item scheduling.
-    model_engine.mm_encoder_output_budget_bytes = None
-    model_engine.mm_encoder_cache = None
-    llm_args = Mock(cache_transceiver_config=None, enable_chunked_prefill=chunked_prefill)
-
-    with patch.object(
-        KvCacheCreator,
-        "_get_model_kv_cache_manager_cls",
-        return_value=KVCacheManagerV2,
-    ):
-        creator = KvCacheCreator(
-            model_engine=model_engine,
-            mapping=Mapping(),
-            net_max_seq_len=max_seq_len,
-            kv_connector_manager=None,
-            max_num_tokens=256,
-            max_beam_width=1,
-            tokens_per_block=128,
-            max_seq_len=max_seq_len,
-            max_batch_size=8,
-            kv_cache_config=kv_cache_config,
-            llm_args=llm_args,
-            speculative_config=None,
-            sparse_attention_config=None,
-            profiling_stage_data=None,
-            is_disagg=False,
-        )
-
-    creator._mla_chunked_profile_length = 2304 if chunked_workspace_profiled else None
-    py_executor = Mock()
-    py_executor.warmup_scope.return_value = nullcontext()
-    py_executor.dist.mapping.rank = 0
-    py_executor.dist.broadcast.side_effect = lambda value, root: value
-    py_executor.enqueue_requests.return_value = [1]
-    py_executor.await_responses.return_value = []
-    kv_manager = Mock()
-    kv_manager.get_kv_cache_stats.return_value = SimpleNamespace(allocated_bytes=0)
-    py_executor.resource_manager.resource_managers.get.side_effect = [kv_manager, None]
-
-    with (
-        patch("tensorrt_llm._torch.pyexecutor._util.get_sm_version", return_value=sm),
-        patch.object(
-            creator,
-            "_get_token_num_for_estimation",
-            return_value=estimation_max_tokens,
-        ),
-        patch.object(creator, "_cal_max_memory", return_value=512),
-        patch.object(torch.cuda, "mem_get_info", return_value=(768, 1024)),
-        patch.object(
-            torch.cuda,
-            "memory_stats",
-            return_value={"allocated_bytes.all.current": 128, "allocated_bytes.all.peak": 256},
-        ),
-        patch.object(creator, "_encode_dummy_inputs", return_value=None),
-        patch.object(creator, "_get_kv_size_per_token", return_value=CacheCost(slope=3)),
-        patch.object(torch.cuda, "empty_cache"),
-        patch.object(torch.cuda, "reset_peak_memory_stats"),
-        # Use a nonzero backend cost: the 512-byte budget splits into 384 bytes
-        # of KV and 128 bytes of workspace unless chunk profiling covered it.
-        patch(
-            "tensorrt_llm._torch.pyexecutor._util.get_attention_workspace_bytes_per_token",
-            return_value=1,
-        ),
-        patch(
-            "tensorrt_llm._torch.pyexecutor._util.get_attention_workspace_is_chunked_prefill_bounded",
-            return_value=bounded,
-        ),
-    ):
-        assert creator.try_prepare_estimation()
-        assert kv_cache_config.max_tokens == estimation_max_tokens
-        assert kv_cache_config.pool_ratio is None
-        assert kv_cache_config.avg_seq_len == max_seq_len
-
-        creator.configure_kv_cache_capacity(py_executor)
 
     assert kv_cache_config.max_gpu_total_bytes == expected_budget
     assert creator._fp8_ctx_mla_kv_len_cap == expected_cap
@@ -1711,9 +1782,212 @@ def test_estimation_temporarily_uses_inferred_pool_sizing(
     py_executor.start_worker.assert_called_once()
     py_executor.release_resources.assert_called_once()
     py_executor.shutdown.assert_not_called()
-    assert kv_cache_config.max_tokens == user_max_tokens
-    assert kv_cache_config.pool_ratio == pool_ratio
-    assert kv_cache_config.avg_seq_len == avg_seq_len
+    assert kv_cache_config.max_tokens == 1024
+    assert kv_cache_config.pool_ratio == [0.2, 0.3, 0.5]
+    assert kv_cache_config.avg_seq_len == 128
+
+
+@pytest.mark.parametrize(
+    (
+        "chunked_prefill",
+        "bounded",
+        "fixed_bytes",
+        "max_num_tokens",
+        "max_seq_len",
+        "kv_len_cap_override",
+        "expected_budget",
+        "expected_cap",
+    ),
+    [
+        # The 256 bytes beyond the fixed part split at a common token count: 64 tokens
+        # of KV at 3 bytes and 64 tokens of workspace at 1 byte.
+        (True, True, 256, 16, 128, None, 448, 64),
+        # Four buffer slots times 48 query tokens is a 192-token floor; the profiled
+        # step already staged 48 of them.
+        (True, True, 0, 48, 4096, None, 368, 192),
+        # The admission cap stays at the configured cap below that floor.
+        (True, True, 0, 48, 128, 128, 368, 128),
+        # One request holds at most 512 // (3 + 1) = 128 tokens with its workspace:
+        # without a fixed cost that is the split itself.
+        (False, True, 0, 16, 192, None, 384, 128),
+        # The fixed cost cannot hold tokens; the split already covers one resident request.
+        (False, True, 256, 16, 192, None, 448, 64),
+        # An unbounded gather backend does not inherit the dense chunked-staging floor.
+        (True, False, 256, 48, 192, None, 448, 64),
+    ],
+    ids=[
+        "split_beyond_fixed",
+        "chunked_batch_floor",
+        "cap_below_floor",
+        "unchunked_without_fixed_cost",
+        "unchunked_with_fixed_cost",
+        "unbounded_chunked_floor",
+    ],
+)
+def test_estimation_mla_workspace_floor(
+    chunked_prefill: bool,
+    bounded: bool,
+    fixed_bytes: int,
+    max_num_tokens: int,
+    max_seq_len: int,
+    kv_len_cap_override: int | None,
+    expected_budget: int,
+    expected_cap: int,
+) -> None:
+    """The context-MLA workspace floor beside the split of the 512-byte budget.
+
+    A fixed part (``CacheCost.intercept``, as a hybrid model's recurrent states) does not
+    scale with tokens, so only the budget beyond it is shared with the workspace.
+    """
+    creator, kv_cache_config, _ = _run_mla_workspace_estimation(
+        sm=100,
+        chunked_workspace_profiled=False,
+        chunked_prefill=chunked_prefill,
+        bounded=bounded,
+        kv_cost=CacheCost(slope=3, intercept=fixed_bytes),
+        max_num_tokens=max_num_tokens,
+        max_seq_len=max_seq_len,
+        kv_len_cap_override=kv_len_cap_override,
+        sparse_algorithm="dsa" if not bounded else None,
+        fp4_kv_cache=not bounded,
+        real_backend_floor=not bounded,
+    )
+
+    assert kv_cache_config.max_gpu_total_bytes == expected_budget
+    assert creator._fp8_ctx_mla_kv_len_cap == expected_cap
+
+
+@pytest.mark.parametrize(
+    ("threshold", "expected_budget"),
+    [(32, 320), (48, 368)],
+    ids=["sparse_profile", "dense_profile"],
+)
+def test_estimation_fp8_dsa_credits_only_dense_profile_staging(
+    monkeypatch: pytest.MonkeyPatch, threshold: int, expected_budget: int
+) -> None:
+    monkeypatch.setenv("TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD", str(threshold))
+    creator, config, _ = _run_mla_workspace_estimation(
+        sm=100,
+        chunked_workspace_profiled=False,
+        chunked_prefill=True,
+        bounded=True,
+        sparse_algorithm="dsa",
+        max_num_tokens=48,
+        kv_len_cap_override=128,
+        real_backend_floor=True,
+    )
+    assert config.max_gpu_total_bytes == expected_budget
+    assert creator._fp8_ctx_mla_kv_len_cap == 128
+
+
+@pytest.mark.parametrize(
+    ("max_batch_size", "max_seq_len", "max_num_tokens", "override", "additional_bytes"),
+    [(8, 128, 48, 128, 48), (1, 16, 16, 8, None), (8, 128, 16, 8, None)],
+    ids=["credited_floor", "reachable_ceiling", "sequence_length_floor"],
+)
+def test_estimation_cap_warning_prices_the_uncredited_cap_term(
+    monkeypatch: pytest.MonkeyPatch,
+    max_batch_size: int,
+    max_seq_len: int,
+    max_num_tokens: int,
+    override: int,
+    additional_bytes: int | None,
+) -> None:
+    warnings = []
+    monkeypatch.setattr("tensorrt_llm._torch.pyexecutor._util.logger.warning", warnings.append)
+    _run_mla_workspace_estimation(
+        sm=103,
+        chunked_workspace_profiled=False,
+        chunked_prefill=True,
+        bounded=True,
+        kv_cost=CacheCost(slope=1),
+        max_batch_size=max_batch_size,
+        max_seq_len=max_seq_len,
+        max_num_tokens=max_num_tokens,
+        kv_len_cap_override=override,
+        real_backend_floor=True,
+    )
+    if additional_bytes is None:
+        assert not warnings
+    else:
+        assert len(warnings) == 1
+        assert f"{additional_bytes} additional bytes" in warnings[0]
+
+
+def test_estimation_dense_floor_uses_clamped_engine_token_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    warnings = []
+    monkeypatch.setattr("tensorrt_llm._torch.pyexecutor._util.logger.warning", warnings.append)
+    creator, config, _ = _run_mla_workspace_estimation(
+        sm=103,
+        chunked_workspace_profiled=False,
+        chunked_prefill=True,
+        bounded=True,
+        max_batch_size=1,
+        max_num_tokens=16,
+        max_seq_len=16,
+        runtime_chunk_size=48,
+        kv_len_cap_override=128,
+        real_backend_floor=True,
+    )
+    assert config.max_gpu_total_bytes == 463
+    assert creator._fp8_ctx_mla_kv_len_cap == 16
+    assert not warnings
+
+
+@pytest.mark.parametrize(
+    ("world_size", "fixed_bytes", "bounded", "local_floor_fits", "match"),
+    [
+        (1, 512, False, False, "fixed KV cache cost leaves"),
+        (2, 512, True, False, "workspace floor"),
+        (2, 0, True, True, "another rank"),
+    ],
+    ids=["budget_within_fixed", "this_rank", "another_rank"],
+)
+def test_estimation_mla_workspace_floor_fails_on_every_rank(
+    world_size: int, fixed_bytes: int, bounded: bool, local_floor_fits: bool, match: str
+) -> None:
+    """A floor that leaves no variable KV budget fails on every rank, before any manager collective."""
+    distributed = Mock()
+    distributed.get.return_value.allreduce.return_value = 1
+    with (
+        patch("tensorrt_llm._torch.pyexecutor._util.Distributed", distributed),
+        pytest.raises(ResourceError, match=match),
+    ):
+        _run_mla_workspace_estimation(
+            sm=100,
+            chunked_workspace_profiled=False,
+            chunked_prefill=True,
+            bounded=bounded,
+            kv_cost=CacheCost(slope=3, intercept=fixed_bytes),
+            mapping=Mapping(world_size=world_size, tp_size=world_size, rank=0),
+        )
+    if world_size > 1:
+        distributed.get.return_value.allreduce.assert_called_once_with(
+            int(not local_floor_fits), op=ReduceOp.MAX
+        )
+
+
+@pytest.mark.parametrize("workspace_bytes_per_token", [0, 1], ids=["no_workspace", "workspace"])
+def test_estimation_workspace_failure_vote_includes_zero_rate_ranks(
+    workspace_bytes_per_token: int,
+) -> None:
+    distributed = Mock()
+    distributed.get.return_value.allreduce.return_value = 1
+    with (
+        patch("tensorrt_llm._torch.pyexecutor._util.Distributed", distributed),
+        pytest.raises(ResourceError, match="another rank"),
+    ):
+        _run_mla_workspace_estimation(
+            sm=100,
+            chunked_workspace_profiled=False,
+            chunked_prefill=True,
+            bounded=True,
+            mapping=Mapping(world_size=2, tp_size=2, rank=0),
+            workspace_bytes_per_token=workspace_bytes_per_token,
+        )
+    distributed.get.return_value.allreduce.assert_called_once_with(0, op=ReduceOp.MAX)
 
 
 @pytest.mark.parametrize("estimating", [False, True])
@@ -2347,3 +2621,15 @@ def test_profiling_failure_releases_resources_and_restores_response_state():
     warmup_scope.__exit__.assert_called_once()
     assert executor.enable_iter_perf_stats is True
     assert executor.set_gather_responses.call_args.args == (False,)
+
+
+def test_estimation_original_chunk_dimensions_reject_unaffordable_floor() -> None:
+    with pytest.raises(ResourceError, match="workspace floor"):
+        _run_mla_workspace_estimation(
+            sm=100,
+            chunked_workspace_profiled=False,
+            chunked_prefill=True,
+            bounded=True,
+            max_num_tokens=256,
+            max_seq_len=4096,
+        )

@@ -358,7 +358,18 @@ def validate_fp4_mla_config(model_config: ModelConfig,
     if not supports_fp4_mla_attention(model_config):
         raise UnsupportedError(
             "Dense FP4 MLA requires the TRTLLM attention backend.")
+    from ..attention.backends.fp4_mla.cache_manager import \
+        is_fp4_mla_context_only_cache
+    from ..attention.backends.fp4_mla.config import validate_fp4_mla_backend
+    from ._util import is_disagg_enabled
+
+    sm_version = get_sm_version()
     mapping = model_config.mapping
+    context_only = is_fp4_mla_context_only_cache(
+        is_disagg_enabled(llm_args.cache_transceiver_config))
+    validate_fp4_mla_backend(sm_version,
+                             context_only=context_only,
+                             helix=mapping.has_cp_helix())
     if mapping.cp_size != 1 and not mapping.has_cp_helix():
         raise UnsupportedError(
             "FP4 MLA supports context parallelism only through Helix.")

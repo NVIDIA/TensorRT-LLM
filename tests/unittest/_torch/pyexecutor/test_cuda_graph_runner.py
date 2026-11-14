@@ -15,7 +15,7 @@ import torch
 from _torch.pyexecutor.engine_test_utils import _make_request_stub
 
 import tensorrt_llm._torch.pyexecutor.cuda_graph_runner as cuda_graph_runner_module
-from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
+from tensorrt_llm._torch.memory_buffer_utils import BufferBlock, Buffers, get_memory_buffers
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     CUDAGraphRunner,
     CUDAGraphRunnerConfig,
@@ -500,6 +500,26 @@ def _decoder_runner(
     return CUDAGraphRunner(config)
 
 
+def test_runner_can_clear_after_static_input_initialization_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+
+    config = replace(_decoder_runner().config, use_cuda_graph=True)
+    partially_built: list[CUDAGraphRunner] = []
+
+    def fail_initialization(runner: CUDAGraphRunner) -> None:
+        partially_built.append(runner)
+        raise ValueError("static inputs rejected")
+
+    monkeypatch.setattr(CUDAGraphRunner, "_create_shared_static_tensors", fail_initialization)
+    with pytest.raises(ValueError, match="static inputs rejected"):
+        CUDAGraphRunner(config)
+    runner = partially_built.pop()
+    runner.clear()
+    assert not runner.forward_scratch_buffers.buffers
+
+
 def _dsa_config(skip_indexer_for_short_seqs: bool) -> DeepSeekSparseAttentionConfig:
     return DeepSeekSparseAttentionConfig(
         index_topk=512, skip_indexer_for_short_seqs=skip_indexer_for_short_seqs
@@ -691,3 +711,32 @@ def test_replay_defers_copies_only_to_its_captured_pack(monkeypatch, same_pack, 
         captured.quiesce_graph_window.assert_not_called()
     else:
         captured.quiesce_graph_window.assert_called_once_with()
+
+
+@pytest.mark.cpu_only
+def test_forward_scratch_is_released_with_runner(monkeypatch: pytest.MonkeyPatch) -> None:
+    import weakref
+
+    from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
+
+    runner = object.__new__(CUDAGraphRunner)
+    runner.memory_pool = None
+    runner.graphs = {}
+    runner.graph_outputs = {}
+    runner._step_input_prologue_keys = {}
+    runner.forward_scratch_buffers = Buffers()
+    scratch = torch.empty(16)
+    reference = weakref.ref(scratch)
+    runner.forward_scratch_buffers.buffers["scratch"] = [
+        BufferBlock(buffer=scratch, is_reserved=True)
+    ]
+    runner.graph_metadata = {
+        0: {"attn_metadata": SimpleNamespace(forward_scratch={"scratch": scratch})}
+    }
+    runner.reset_padding_dummies = lambda: None
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    del scratch
+
+    runner.clear()
+    assert reference() is None
+    assert not runner.forward_scratch_buffers.buffers
