@@ -107,7 +107,7 @@ def _outside_contract(probs, seed, offset) -> Optional[tuple[str, str]]:
     """Why the inputs fall outside the kernel's contract, as (reason, the offending value), or None inside it: float32
     CUDA [rows, vocab] probs with a unit inner stride, a row stride divisible by 4 and 16-byte alignment (1..MAX_ROWS
     rows, vocab divisible by 4 and <= MAX_VOCAB), and contiguous 1-D int64 seed / offset on the probs' device with one
-    entry or one per row (FlashInfer 0.7.2 broadcasts the first and indexes the second by row)."""
+    entry or one per row (FlashInfer sampling broadcasts the first and indexes the second by row)."""
     for name, t in (("probs", probs), ("seed", seed), ("offset", offset)):
         if not isinstance(t, torch.Tensor):
             return "probs / seed / offset not all tensors", f"{name} is {type(t).__name__}"

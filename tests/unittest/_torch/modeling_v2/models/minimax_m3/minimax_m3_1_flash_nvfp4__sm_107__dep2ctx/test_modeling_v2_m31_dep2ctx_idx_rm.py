@@ -127,6 +127,7 @@ def _inputs(qo, prefix, heads=4, seed=0, shuffle=True):
 # ---- the zero-copy view ----------------------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
 def test_group_one_scores_are_a_zero_copy_view_equal_to_the_old_transpose(monkeypatch) -> None:
     _fake_module(monkeypatch)
     q, k, qo, kv, off, kv_indices = _inputs([300], [4096 + 77])
