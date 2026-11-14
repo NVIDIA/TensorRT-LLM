@@ -25,7 +25,7 @@ from enum import IntEnum
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal
-from unittest.mock import Mock
+from unittest.mock import Mock, PropertyMock
 
 import pytest
 import torch
@@ -57,15 +57,11 @@ class _UniqueId:
 def runtime(monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleNamespace]:
     ep_utils.destroy_all_nccl_ep_contexts()
     comm = Mock(device_api_support=True, n_lsa_teams=1, gin_type=_GIN.NONE)
-    comm.ptr = comm
     bindings = SimpleNamespace(
+        NCCLError=_NativeError,
         comm_query_properties=Mock(
-            side_effect=lambda ptr: SimpleNamespace(
-                device_api_support=ptr.device_api_support,
-                n_lsa_teams=ptr.n_lsa_teams,
-                gin_type=ptr.gin_type,
-            )
-        )
+            side_effect=AssertionError("use public communicator properties")
+        ),
     )
     core = SimpleNamespace(
         UniqueId=_UniqueId,
@@ -87,7 +83,13 @@ def runtime(monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleNamespace]:
     monkeypatch.setitem(sys.modules, "nccl", SimpleNamespace(core=core, ep=ep))
     monkeypatch.setitem(sys.modules, "nccl.core", core)
     monkeypatch.setitem(sys.modules, "nccl.bindings", SimpleNamespace(nccl=bindings))
-    monkeypatch.setitem(sys.modules, "nccl.core.typing", SimpleNamespace(NcclGinType=_GIN))
+    monkeypatch.setitem(sys.modules, "nccl.bindings.nccl", bindings)
+    monkeypatch.setitem(
+        sys.modules, "nccl.core.typing", SimpleNamespace(NcclGinType=_GIN, NcclInvalid=_NativeError)
+    )
+    mpi_module = SimpleNamespace(Exception=_NativeError)
+    monkeypatch.setitem(sys.modules, "mpi4py", SimpleNamespace(MPI=mpi_module))
+    monkeypatch.setitem(sys.modules, "mpi4py.MPI", mpi_module)
     monkeypatch.setitem(sys.modules, "nccl.ep", ep)
     mpi = Mock()
     mpi.Get_rank.return_value, mpi.Get_size.return_value = 0, 2
@@ -254,7 +256,8 @@ def test_local_validation_precedes_communicator_creation(
     )
     if failure == "version":
         runtime.ep.get_lib_version.return_value = "0.1.0"
-    with pytest.raises(RuntimeError, match="divisible by 256|requires libnccl_ep"):
+    match = "divisible by 256" if failure == "alignment" else "requires libnccl_ep"
+    with pytest.raises(RuntimeError, match=match):
         NcclEP(runtime.mapping, 4, 128 if failure == "alignment" else 512, quant_config=quant)
     runtime.core.Communicator.init.assert_not_called()
     runtime.session.Create_group.assert_not_called()
@@ -291,7 +294,7 @@ def test_pending_cleanup_uses_owning_device(
 
 def test_unsupported_gate_and_cache_reset(runtime: SimpleNamespace) -> None:
     runtime.comm.device_api_support = False
-    with pytest.raises(RuntimeError, match="Device API/GIN"):
+    with pytest.raises(RuntimeError, match="Device API unavailable"):
         NcclEP(runtime.mapping, 4, 512)
     runtime.comm.device_api_support = True
     assert not ep_utils.is_nccl_ep_installed(runtime.mapping)
@@ -307,7 +310,9 @@ def test_errors_are_not_cached_as_unsupported(
     if failure == "init":
         runtime.core.Communicator.init.side_effect = _NativeError("init failed")
     else:
-        del runtime.comm.device_api_support
+        type(runtime.comm).device_api_support = PropertyMock(
+            side_effect=_NativeError("query failed")
+        )
     with pytest.raises(RuntimeInitError, match="initialization/capability query failed"):
         ep_utils.is_nccl_ep_installed(runtime.mapping)
     runtime.comm.finalize.assert_not_called()
@@ -315,6 +320,8 @@ def test_errors_are_not_cached_as_unsupported(
     runtime.mpi.Free.assert_not_called()
     assert runtime.comm.abort.call_count == (0 if failure == "init" else 1)
     runtime.core.Communicator.init.side_effect = None
+    if failure == "query":
+        del type(runtime.comm).device_api_support
     runtime.comm.device_api_support = True
     assert ep_utils.is_nccl_ep_installed(runtime.mapping)
     assert runtime.core.Communicator.init.call_count == 2
@@ -338,6 +345,9 @@ def test_torch_bootstrap_uses_ep_group_without_capability_collectives(
     import torch.distributed as dist
 
     monkeypatch.setattr(trtllm_utils, "mpi_disabled", lambda: True)
+    monkeypatch.setattr(
+        trtllm_utils, "mpi_comm", Mock(side_effect=AssertionError("MPI used on Ray branch"))
+    )
     monkeypatch.setattr(dist, "get_rank", lambda _: 0)
     monkeypatch.setattr(dist, "get_backend", lambda _: "gloo")
     monkeypatch.setattr(dist, "get_process_group_ranks", lambda _: [4, 7])
@@ -347,21 +357,39 @@ def test_torch_bootstrap_uses_ep_group_without_capability_collectives(
     assert ep_utils.is_nccl_ep_installed(runtime.mapping)
     assert ep_utils._take_ep_nccl_comm(runtime.mapping) == (runtime.comm, None)
     ep_utils._release_ep_nccl_comm(runtime.comm, None)
+    assert runtime.core.Communicator.init.call_args.kwargs["unique_id"].as_bytes == b"x" * 128
     broadcast.assert_called_once()
     assert broadcast.call_args.kwargs == {"src": 4, "group": runtime.mapping.moe_ep_group_pg}
     reduce.assert_not_called()
     runtime.session.Create_group.assert_not_called()
 
 
-def test_raw_gin_property_accepts_transport_unknown_to_old_enum(
-    runtime: SimpleNamespace,
+@pytest.mark.parametrize("gin", [5, ValueError("5 is not a valid NcclGinType")])
+def test_gin_property_accepts_transport_unknown_to_old_enum(
+    runtime: SimpleNamespace, gin: int | ValueError
 ) -> None:
-    del runtime.comm.gin_type
-    runtime.bindings.comm_query_properties.side_effect = None
-    runtime.bindings.comm_query_properties.return_value = SimpleNamespace(
-        device_api_support=True, n_lsa_teams=2, gin_type=5
+    runtime.comm.n_lsa_teams = 2
+    prop = (
+        PropertyMock(side_effect=gin)
+        if isinstance(gin, ValueError)
+        else PropertyMock(return_value=gin)
     )
+    type(runtime.comm).gin_type = prop
     assert ep_utils.is_nccl_ep_installed(runtime.mapping)
+    prop.assert_called_once()
+    runtime.bindings.comm_query_properties.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "error", [_NativeError("GIN query failed"), RuntimeError("GIN query failed")]
+)
+def test_gin_query_failure_is_fatal(runtime: SimpleNamespace, error: Exception) -> None:
+    runtime.comm.n_lsa_teams = 2
+    type(runtime.comm).gin_type = PropertyMock(side_effect=error)
+    with pytest.raises(RuntimeInitError) as raised:
+        ep_utils.is_nccl_ep_installed(runtime.mapping)
+    assert raised.value.__cause__ is error
+    runtime.comm.abort.assert_called_once()
 
 
 def _check_ep_bootstrap(rank: int, rendezvous: str, scenario: str) -> None:
@@ -383,6 +411,9 @@ def _check_ep_bootstrap(rank: int, rendezvous: str, scenario: str) -> None:
     )
     try:
         patch.setattr(trtllm_utils, "mpi_disabled", lambda: True)
+        patch.setattr(
+            trtllm_utils, "mpi_comm", Mock(side_effect=AssertionError("MPI used on Ray branch"))
+        )
         state.mapping.moe_ep_group, state.mapping.moe_ep_group_pg = [0, 1], dist.group.WORLD
         state.mapping.moe_ep_rank = rank
         state.mapping.moe_tp_size, state.mapping.dp_size = 1, 2
@@ -408,12 +439,17 @@ def _check_ep_bootstrap(rank: int, rendezvous: str, scenario: str) -> None:
             state.core.get_unique_id.side_effect = _NativeError("unique ID failed")
         elif scenario == "unsupported":
             state.comm.device_api_support = False
+        elif scenario == "no_gin":
+            state.comm.n_lsa_teams = 2
         elif scenario == "query_failure":
-            state.bindings.comm_query_properties.side_effect = _NativeError("query failed")
+            type(state.comm).device_api_support = PropertyMock(
+                side_effect=_NativeError("query failed")
+            )
         elif scenario == "init_failure":
             state.core.Communicator.init.side_effect = _NativeError("init failed")
         elif scenario == "unknown_gin":
-            state.comm.n_lsa_teams, state.comm.gin_type = 2, 5
+            state.comm.n_lsa_teams = 2
+            type(state.comm).gin_type = PropertyMock(side_effect=ValueError("unknown GIN type 5"))
         broadcast, reduce = Mock(wraps=dist.broadcast), Mock(wraps=dist.all_reduce)
         patch.setattr(dist, "broadcast", broadcast)
         patch.setattr(dist, "all_reduce", reduce)
@@ -425,7 +461,7 @@ def _check_ep_bootstrap(rank: int, rendezvous: str, scenario: str) -> None:
                 strategy = factory.create_strategy(config, 4, 4, 2, 2)
                 expected = (
                     communication_factory.AllGatherReduceScatter
-                    if scenario == "unsupported"
+                    if scenario in ("unsupported", "no_gin")
                     else NcclEP
                 )
                 assert isinstance(strategy, expected)
@@ -444,6 +480,8 @@ def _check_ep_bootstrap(rank: int, rendezvous: str, scenario: str) -> None:
             state.comm.finalize.assert_called_once()
             state.comm.destroy.assert_called_once()
             state.comm.abort.assert_not_called()
+        if scenario != "root_id_failure":
+            assert state.core.Communicator.init.call_args.kwargs["unique_id"].as_bytes == b"x" * 128
         state.session.Create_group.assert_not_called()
     finally:
         dist.destroy_process_group()
@@ -452,7 +490,8 @@ def _check_ep_bootstrap(rank: int, rendezvous: str, scenario: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "scenario", ["root_id_failure", "unsupported", "query_failure", "init_failure", "unknown_gin"]
+    "scenario",
+    ["root_id_failure", "unsupported", "no_gin", "query_failure", "init_failure", "unknown_gin"],
 )
 def test_two_rank_ep_bootstrap(tmp_path: Path, scenario: str) -> None:
     """Uniform EP configurations bootstrap under MetaInitMode without a capability vote."""
@@ -474,3 +513,53 @@ def test_two_rank_ep_bootstrap(tmp_path: Path, scenario: str) -> None:
             if process.is_alive():
                 process.terminate()
                 process.join(5)
+
+
+@pytest.mark.parametrize("failure", [TypeError("bad argument"), AttributeError("missing field")])
+def test_programming_errors_abort_without_translation(
+    runtime: SimpleNamespace, failure: Exception
+) -> None:
+    class BrokenProperties(SimpleNamespace):
+        @property
+        def device_api_support(self) -> bool:
+            raise failure
+
+    runtime.core.Communicator.init.return_value = BrokenProperties(abort=runtime.comm.abort)
+    with pytest.raises(type(failure)) as raised:
+        ep_utils.is_nccl_ep_installed(runtime.mapping)
+    assert raised.value is failure
+    runtime.comm.abort.assert_called_once()
+    runtime.comm.finalize.assert_not_called()
+
+
+@pytest.mark.parametrize("device_api,teams", [(False, 1), (True, 2)])
+def test_strategy_reports_cached_rejection(
+    runtime: SimpleNamespace, device_api: bool, teams: int
+) -> None:
+    runtime.comm.device_api_support, runtime.comm.n_lsa_teams = device_api, teams
+    with pytest.raises(
+        RuntimeError, match="Device API unavailable" if not device_api else "requires GIN"
+    ):
+        NcclEP(runtime.mapping, 4, 512)
+    runtime.core.Communicator.init.assert_called_once()
+
+
+def test_ep_memberships_have_distinct_contexts(
+    runtime: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    empty = torch.empty
+    monkeypatch.setattr(
+        torch, "empty", lambda *args, **kwargs: empty(*args, **(kwargs | {"device": "cpu"}))
+    )
+    other_comm = Mock(device_api_support=True, n_lsa_teams=1, gin_type=_GIN.NONE)
+    runtime.core.Communicator.init.side_effect = [runtime.comm, other_comm]
+    other_mapping = SimpleNamespace(**(vars(runtime.mapping) | {"moe_ep_group": [4, 9]}))
+    first = NcclEP(runtime.mapping, 4, 512, max_num_tokens=8, top_k=2)
+    second = NcclEP(other_mapping, 4, 512, max_num_tokens=8, top_k=2)
+    assert first._get_context() is not second._get_context()
+    assert runtime.core.Communicator.init.call_count == 2
+    first.destroy()
+    runtime.comm.destroy.assert_called_once()
+    other_comm.destroy.assert_not_called()
+    second.destroy()
+    other_comm.destroy.assert_called_once()

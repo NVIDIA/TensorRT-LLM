@@ -66,6 +66,7 @@ class NcclEP(Communication):
 
         from tensorrt_llm._torch.moe.fused_moe.nccl_ep_utils import (
             _ep_comm_key,
+            get_nccl_ep_unavailable_reason,
             is_nccl_ep_installed,
         )
 
@@ -118,9 +119,7 @@ class NcclEP(Communication):
         # Validate local arguments before retaining any native communicator.
         self._comm_key = _ep_comm_key(mapping)
         if not is_nccl_ep_installed(mapping):
-            raise RuntimeError(
-                "nccl.ep is unavailable or its EP communicator lacks Device API/GIN support."
-            )
+            raise RuntimeError(f"NCCL EP unavailable: {get_nccl_ep_unavailable_reason(mapping)}")
 
     @staticmethod
     def is_platform_supported() -> bool:
@@ -504,10 +503,11 @@ class NcclEP(Communication):
         return combine_output
 
     def destroy(self) -> None:
-        """Release per-instance NCCL EP resources (handle).
+        """Release resources during coordinated teardown on all EP ranks.
 
         NcclEpContext is shared across instances and released through a
-        refcounted cache.
+        refcounted cache. This also releases any pending communicator shared by
+        strategies with the same EP membership and CUDA device.
         """
         if self._handle is not None:
             try:

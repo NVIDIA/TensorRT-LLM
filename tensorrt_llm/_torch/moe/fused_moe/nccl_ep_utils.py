@@ -106,11 +106,13 @@ def _broadcast_ep_unique_id(mapping: Mapping, ep_mpi_comm: "MpiComm | None") -> 
         try:
             unique_id = nccl_core.get_unique_id()
         except Exception as exc:
+            # Even a local programming error must send the sentinel before it escapes.
             error = exc
             logger.error(f"NCCL EP unique ID creation failed: {exc!r}")
     if ep_mpi_comm is not None:
         unique_id = ep_mpi_comm.bcast(unique_id, root=0)
     else:
+        # Ray actors have singleton MPI worlds; bootstrap from their torch EP group.
         import torch.distributed as dist
 
         pg = mapping.moe_ep_group_pg
@@ -128,22 +130,29 @@ def _broadcast_ep_unique_id(mapping: Mapping, ep_mpi_comm: "MpiComm | None") -> 
         payload = wire.cpu().numpy().tobytes()
         unique_id = nccl_core.UniqueId.from_bytes(payload[1:]) if payload[0] else None
     if unique_id is None:
-        raise ValueError("NCCL EP rank 0 could not create a communicator unique ID") from error
+        if error is not None:
+            raise error
+        raise RuntimeInitError("NCCL EP rank 0 could not create a communicator unique ID")
     return unique_id
 
 
 def _create_ep_nccl_comm(mapping: Mapping) -> _EpCommState:
     """Check and retain the real communicator using its advertised capabilities."""
     import nccl.core as nccl_core
-    from nccl.bindings import nccl as nccl_bindings
-    from nccl.core.typing import NcclGinType
+    from nccl.bindings.nccl import NCCLError
+    from nccl.core.typing import NcclGinType, NcclInvalid
 
     from tensorrt_llm._utils import mpi_comm, mpi_disabled
 
+    operational_errors = (NCCLError, NcclInvalid, RuntimeError, OSError)
+    if not mpi_disabled():
+        from mpi4py.MPI import Exception as MpiException
+
+        operational_errors += (MpiException,)
     ep_mpi_comm = comm = None
     try:
         if not mpi_disabled():
-            # Dense-only pipeline stages never enter this check; do not Split the world.
+            # Lazy recreation involves only dispatching EP members, not every pipeline stage.
             group = mpi_comm().Get_group()
             try:
                 ep_group = group.Incl(mapping.moe_ep_group)
@@ -157,22 +166,29 @@ def _create_ep_nccl_comm(mapping: Mapping) -> _EpCommState:
         comm = nccl_core.Communicator.init(
             nranks=mapping.moe_ep_size, rank=mapping.moe_ep_rank, unique_id=unique_id
         )
-        # Read the public bindings' raw GIN value: older nccl4py enums omit newer transports.
-        props = nccl_bindings.comm_query_properties(comm.ptr)
         # Rely on uniform NCCL configuration and platform capabilities across EP ranks;
         # under that contract, capability selection needs no additional collective.
         reason = None
-        if not props.device_api_support:
+        if not comm.device_api_support:
             reason = "EP communicator reports NCCL Device API unavailable"
-        elif props.n_lsa_teams > 1 and props.gin_type == NcclGinType.NONE:
-            reason = "low-latency NCCL EP requires GIN between LSA teams"
+        elif comm.n_lsa_teams > 1:
+            try:
+                no_gin = comm.gin_type == NcclGinType.NONE
+            except ValueError:
+                # Older nccl4py enums cannot decode newer nonzero GIN transport types.
+                no_gin = False
+            if no_gin:
+                reason = "low-latency NCCL EP requires GIN between LSA teams"
         if reason is not None:
             logger.info(f"NCCL EP disabled: {reason}")
             _release_ep_nccl_comm(comm, ep_mpi_comm)
             return _EpCommState(reason=reason)
         return _EpCommState(comm, ep_mpi_comm)
     except Exception as exc:
+        # Every failure needs rollback, but programming errors retain their original type.
         _abort_ep_nccl_comm(comm, ep_mpi_comm)
+        if not isinstance(exc, operational_errors):
+            raise
         raise RuntimeInitError(
             f"NCCL EP communicator initialization/capability query failed: {exc!r}"
         ) from exc
@@ -183,6 +199,8 @@ def is_nccl_ep_installed(mapping: Mapping | None = None) -> bool:
 
     A supported communicator is retained for NcclEpContext. Calls without a mapping
     only check the installed API and do not initialize CUDA or a communicator.
+    A pending communicator remains allocated until context creation or strategy
+    teardown, including on pipeline stages whose MoE layers are later skipped.
 
     Args:
         mapping: EP membership, or None for the module-only check. With a mapping,
@@ -192,7 +210,7 @@ def is_nccl_ep_installed(mapping: Mapping | None = None) -> bool:
         Whether the installed runtime and, when checked, communicator support EP.
 
     Raises:
-        RuntimeInitError: Communicator bootstrap or its capability query fails.
+        RuntimeInitError: An operational communicator bootstrap or capability-query error.
     """
     global _nccl_ep_installed
     if _nccl_ep_installed is None:
@@ -212,11 +230,17 @@ def is_nccl_ep_installed(mapping: Mapping | None = None) -> bool:
     return _ep_comm_cache[key].reason is None
 
 
+def get_nccl_ep_unavailable_reason(mapping: Mapping) -> str:
+    """Return the cached rejection reason without initializing a communicator."""
+    state = _ep_comm_cache.get(_ep_comm_key(mapping))
+    return state.reason if state is not None and state.reason else "nccl.ep is unavailable"
+
+
 def _take_ep_nccl_comm(mapping: Mapping) -> tuple["Communicator", "MpiComm | None"]:
     """Transfer a retained communicator, creating one only for another distinct context."""
     key = _ep_comm_key(mapping)
     if not is_nccl_ep_installed(mapping):
-        raise RuntimeError(f"NCCL EP unavailable: {_ep_comm_cache.get(key)}")
+        raise RuntimeError(f"NCCL EP unavailable: {get_nccl_ep_unavailable_reason(mapping)}")
     state = _ep_comm_cache[key]
     if state.comm is None:
         state = _create_ep_nccl_comm(mapping)
@@ -228,10 +252,10 @@ def _take_ep_nccl_comm(mapping: Mapping) -> tuple["Communicator", "MpiComm | Non
 
 
 def release_pending_nccl_ep_comm(key: _EpCommKey) -> None:
-    """Release a checked communicator using its original ownership key.
+    """Release the shared pending communicator during coordinated EP-rank teardown.
 
     Args:
-        key: EP membership and CUDA device captured by the owning strategy.
+        key: EP membership and CUDA device shared by participating strategies.
     """
     state = _ep_comm_cache.get(key)
     if state is not None and state.comm is not None:
@@ -584,7 +608,7 @@ class NcclEpContext:
         self._clear_buffers()
 
     def destroy(self) -> None:
-        """Release EP group, NCCL comm, and MPI sub-comm in LIFO order.
+        """Release EP group, NCCL comm, and MPI sub-comm collectively on all EP ranks.
 
         Avoids relying on Python GC ordering between the group, the comm it
         was built from, and the MPI sub-comm seeding it: the group must go
@@ -597,22 +621,9 @@ class NcclEpContext:
             try:
                 self.ep_group.destroy()
             except Exception as e:
+                # Native cleanup failures must not prevent communicator release.
                 logger.warning(f"NCCL EP group destroy error: {e}")
             self.ep_group = self._timeout_proxy = None
-
-        # Deregister windows before the comm goes away. close() is
-        # idempotent and local; the comm would auto-close any leftover
-        # windows on destroy, but explicit LIFO release matches the rest
-        # of this teardown path. Both dispatch-output and combine-input
-        # windows are registered only when zerocopy is on.
-        for attr in ("_combine_input_window",):
-            w = getattr(self, attr, None)
-            if w is not None:
-                try:
-                    w.close()
-                except Exception as e:
-                    logger.warning(f"NCCL EP window close error ({attr}): {e}")
-                setattr(self, attr, None)
 
         self._clear_buffers()
 

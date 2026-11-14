@@ -107,7 +107,7 @@ Default selection (`AUTO`)
 ├─ TRTLLM_FORCE_COMM_METHOD set              → that method
 │     (forced: no fallback if it fails to initialize)
 │
-└─ else, try in order — keep the first that initializes on this platform
+└─ else, try in order — keep the first supported strategy
        │
        ├─ NVLINK_ONE_SIDED     needs MNNVL, and moe_ep_size == world_size
        │
@@ -121,6 +121,8 @@ Default selection (`AUTO`)
        │
        └─ ALLGATHER            final fallback
 ```
+
+NCCL EP requires NCCL Device API support and, across multiple load/store-accessible (LSA) teams (NVLink load/store domains), GPU-Initiated Networking (GIN). Unsupported capabilities skip NCCL EP and log the reason at INFO as `NCCL EP disabled: ...`. A communicator initialization or capability-query error aborts AUTO selection; set `TRTLLM_FORCE_COMM_METHOD` to another method to skip NCCL EP. Capability selection assumes uniform NCCL configuration and platform capabilities across EP ranks.
 
 To override the default, set `TRTLLM_FORCE_COMM_METHOD` on every rank:
 
