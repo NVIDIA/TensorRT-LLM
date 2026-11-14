@@ -45,17 +45,17 @@ if not torch.cuda.is_available():
 if not IS_CUTLASS_DSL_AVAILABLE:
     pytest.skip("cutlass DSL is required for gvr_selfsampling_topk tests", allow_module_level=True)
 
-if getSMVersion() not in (100, 103):
-    pytest.skip(
-        "self-sampling GVR kernels target datacenter Blackwell (sm_100/103) "
-        "— same gate as the production dispatch; consumer Blackwell "
-        "(sm_120/121) lacks thread-block clusters",
-        allow_module_level=True,
-    )
-
 from tensorrt_llm._torch.kernels.blackwell.top_k import (
     gvr_topk_decode_self_sampling_host as ss_host,
 )
+
+if getSMVersion() not in ss_host.SUPPORTED_SM_VERSIONS:
+    pytest.skip(
+        "self-sampling GVR kernels target Hopper and datacenter Blackwell "
+        "(sm_90/100/103) — same gate as the production dispatch; consumer "
+        "Blackwell (sm_120/121) lacks thread-block clusters",
+        allow_module_level=True,
+    )
 
 _DEV = "cuda"
 
@@ -63,6 +63,15 @@ _DEV = "cuda"
 def _varlen_cache_key(*parts: int) -> tuple[int, ...]:
     device = torch.cuda.current_device()
     return (*parts, ss_host._device_profile_key(device))
+
+
+def _device_wave() -> int:
+    return ss_host._device_wave_sms(torch.cuda.current_device())
+
+
+def _prefill_key(*parts, **kwargs) -> tuple:
+    """Prefill launcher cache key on the current device (its wave budget)."""
+    return ss_host._prefill_cache_key(*parts, wave=_device_wave(), **kwargs)
 
 
 def _make_case(batch_size, n_valid, top_k, seed, hit_ratio=0.6):
@@ -842,6 +851,789 @@ def test_selfsampling_route_sm103_large_batch_k2048_register_rung() -> None:
             assert tuple(plan["tpl"][:3]) == expected, (n, sm_version, plan)
 
 
+def test_selfsampling_wave_budget_per_target() -> None:
+    """Blackwell keeps the 148-SM streaming and clustered wave budget on every SKU; Hopper
+    sizes those waves by its own SM count."""
+    assert ss_host.SUPPORTED_SM_VERSIONS == (90, 100, 103)
+    for num_sms in (132, 148, 160):
+        assert ss_host.wave_sms(num_sms, 100) == 148
+        assert ss_host.wave_sms(num_sms, 103) == 148
+        assert ss_host.wave_sms(num_sms, 90) == num_sms
+    # one deep single-row slab: a split CTA per SM of the target
+    assert ss_host.route(1, 1 << 20, 1 << 20, 1024, 132, 90)["rt"]["R"] == 132
+    assert ss_host.route(1, 1 << 20, 1 << 20, 1024, 160, 103)["rt"]["R"] == 148
+
+
+def test_selfsampling_hopper_split_plans_fit_one_wave() -> None:
+    """On a 132-SM Hopper every plan that splits a row over CTAs launches at most one CTA
+    per SM, and the factored route stays lossless."""
+    num_sms = 132
+    for b in (1, 2, 3, 4, 8, 15, 16, 31, 32, 33, 66, 67, 132):
+        for k in (512, 1024, 2048):
+            for n in (16400, 32768, 65536, 131072, 262144, 1 << 20):
+                plan = ss_host.route(b, n, n, k, num_sms, 90)
+                split = (
+                    plan["rt"]["R"]
+                    if plan["kernel"] == "main"
+                    else plan["cluster"]
+                    if plan["kernel"] in ("clus", "reg_clus")
+                    else 1
+                )
+                if split > 1:
+                    assert b * split <= num_sms, (b, n, k, plan)
+                assert ss_host.route_split(b, n, n, k, num_sms, 90) == plan
+
+
+def test_selfsampling_hopper_clusters_are_coresident() -> None:
+    """Hopper clustered plans launch no more clusters than the GPU co-schedules (H100 / H200 SXM:
+    132 SMs, H20: 78 SMs); Blackwell keeps its tuned cluster rungs (32 rows of 4-CTA clusters)."""
+    assert ss_host.cluster_fits(4, 30, 132, 90) and not ss_host.cluster_fits(4, 32, 132, 90)
+    assert ss_host.cluster_fits(4, 15, 78, 90) and not ss_host.cluster_fits(4, 16, 78, 90)
+    assert ss_host.cluster_fits(12, 1, 78, 90) and not ss_host.cluster_fits(16, 1, 78, 90)
+    # other Hopper SM counts scale the 132-SM row and launch no non-portable clusters
+    assert ss_host.cluster_fits(8, 12, 114, 90) and not ss_host.cluster_fits(8, 13, 114, 90)
+    assert not ss_host.cluster_fits(10, 1, 114, 90)
+    assert ss_host.cluster_fits(4, 32, 148, 100) and ss_host.cluster_fits(4, 32, 148, 103)
+    assert ss_host.cluster_fits(1, 1024, 132, 90)  # a single CTA is no cluster
+    for num_sms in (132, 78):
+        for b in (1, 2, 4, 8, 15, 16, 30, 31, 32, 33, 64):
+            for k in (512, 1024, 2048):
+                for n in (32771, 32783, 65539, 131075, 163775, 262127):
+                    for dtype in (None, torch.bfloat16, torch.float16):
+                        plan = (
+                            ss_host.route(b, n, n, k, num_sms, 90)
+                            if dtype is None
+                            else ss_host._route_16bit(b, n, n, k, num_sms, 90, dtype=dtype)
+                        )
+                        if plan["kernel"] in ("clus", "reg_clus"):
+                            assert ss_host.cluster_fits(plan["cluster"], b, num_sms, 90), (
+                                num_sms,
+                                b,
+                                n,
+                                k,
+                                plan,
+                            )
+    assert ss_host.route(32, 32771, 32832, 1024, 148, 100)["cluster"] == 4
+    # FP16 code-radix register clusters: Hopper takes the first geometry that fits, Blackwell its
+    # first preference (32 rows of 4-CTA clusters, 8 rows of 10-CTA clusters)
+    for num_sms in (132, 78):
+        for b in (1, 2, 4, 8, 16, 32, 64):
+            for k in (512, 1024, 2048):
+                for n in (8195, 16387, 32771, 65539, 131075, 163775, 262127):
+                    plan = ss_host._code_radix_cluster_plan_fp16(k, n, b, num_sms, 90)
+                    if plan is not None:
+                        assert ss_host.cluster_fits(plan[2], b, num_sms, 90), (
+                            num_sms,
+                            b,
+                            n,
+                            k,
+                            plan,
+                        )
+    for b in (1, 8, 16, 32, 64):
+        for k in (512, 1024, 2048):
+            for n in (8195, 16387, 32771, 65539, 131075, 163775, 262127):
+                first = next(ss_host._code_radix_cluster_plans_fp16(k, n, b, 148), None)
+                assert ss_host._code_radix_cluster_plan_fp16(k, n, b, 148, 100) == first
+    assert ss_host._code_radix_cluster_plan_fp16(1024, 32771, 32, 148, 100)[2] == 4
+    assert ss_host._code_radix_cluster_plan_fp16(1024, 32771, 32, 132, 90)[2] == 2
+    assert ss_host._code_radix_cluster_plan_fp16(2048, 163775, 8, 148, 100)[2] == 10
+    assert ss_host._code_radix_cluster_plan_fp16(2048, 163775, 8, 132, 90)[2] == 5
+    # K=2048: 32 rows of 4-CTA clusters do not co-reside on Hopper, so 16-bit rows that no 2-CTA
+    # register cluster holds stream through 3-CTA clusters on 132 SMs and 2-CTA ones on the H20;
+    # Blackwell keeps its plans
+    for dtype in (torch.bfloat16, torch.float16):
+        for n in (65551, 131087, 163775):
+            for num_sms, cs in ((132, 3), (78, 2)):
+                plan = ss_host._route_16bit(32, n, n, 2048, num_sms, 90, dtype=dtype)
+                assert (plan["kernel"], plan["cluster"]) == ("clus", cs), (dtype, n, plan)
+    for n in (65551, 131087, 163775):
+        plan = ss_host._route_16bit(32, n, n, 2048, 148, 100, dtype=torch.bfloat16)
+        assert plan["cluster"] == 4, (n, plan)
+
+
+def test_selfsampling_hopper_three_cta_clusters() -> None:
+    """132-SM Hopper parts co-schedule 39 three-CTA clusters but only 30 four-CTA ones, so 31- and
+    32-row batches split a row over three CTAs rather than two where the third rank pays for its
+    sample floor and merge: 16-bit K = 2048 rows, 16-bit K <= 1024 rows above 192K scores and FP32
+    rows whose U=8 chunks deal evenly; FP16 K = 2048 code-radix clusters take three CTAs at 31-39
+    rows. The H20 and Blackwell keep their clusters."""
+    for b in (31, 32):
+        for dtype in (torch.bfloat16, torch.float16):
+            for k, n, cs in (
+                (512, 131075, 2),
+                (512, 262127, 3),
+                (1024, 131075, 2),
+                (1024, 262127, 3),
+                (2048, 65551, 3),
+                (2048, 163775, 3),
+            ):
+                plan = ss_host._route_16bit(b, n, n, k, 132, 90, dtype=dtype)
+                assert (plan["kernel"], plan["cluster"]) == ("clus", cs), (b, dtype, k, n, plan)
+        for k, n, cs in ((1024, 131075, 2), (512, 262127, 3), (1024, 262127, 3)):
+            plan = ss_host.route(b, n, n, k, 132, 90)
+            assert (plan["kernel"], plan["cluster"]) == ("clus", cs), (b, k, n, plan)
+    assert (
+        ss_host._route_16bit(33, 262127, 262127, 1024, 132, 90, dtype=torch.bfloat16)["cluster"]
+        == 2
+    )
+    for b in (31, 39):
+        assert ss_host._code_radix_cluster_plan_fp16(2048, 32783, b, 132, 90)[1:3] == (3, 3), b
+        assert ss_host._code_radix_cluster_plan_fp16(2048, 65551, b, 132, 90)[1:3] == (6, 3), b
+    assert ss_host._code_radix_cluster_plan_fp16(2048, 65551, 40, 132, 90)[2] == 2
+    for num_sms, sm_version, cs in ((78, 90, 2), (148, 100, 4)):
+        plan = ss_host._route_16bit(
+            32, 163775, 163775, 2048, num_sms, sm_version, dtype=torch.bfloat16
+        )
+        assert plan["cluster"] == cs, (num_sms, plan)
+        assert ss_host.route(32, 262127, 262127, 1024, num_sms, sm_version)["cluster"] == cs
+
+
+def test_selfsampling_hopper_bf16_rows_past_coresident_register_clusters() -> None:
+    """BF16 rows whose register clusters a Hopper GPU does not co-schedule (H20: 8 rows of 8-CTA
+    clusters, any 16-CTA cluster) stream through 4-CTA clusters at K <= 1024 and take twice the
+    vectors on half the CTAs at K = 2048 rather than the split main slab; 132-SM Hopper and
+    Blackwell keep their 8-CTA register clusters."""
+    bf16 = torch.bfloat16
+    for k in (512, 1024):
+        for b, n in ((8, 131075), (4, 262127), (1, 262127)):
+            plan = ss_host._route_16bit(b, n, n, k, 78, 90, dtype=bf16)
+            assert (plan["kernel"], plan["cluster"]) == ("clus", 4), (k, b, n, plan)
+    for b, n, cs in ((8, 131087, 4), (4, 163775, 8), (1, 163775, 8)):
+        plan = ss_host._route_16bit(b, n, n, 2048, 78, 90, dtype=bf16)
+        assert (plan["kernel"], plan["tpl"]) == ("reg_clus", (ss_host.BLKC, 4, cs, 2048)), (b, n)
+    for k, n in ((512, 131075), (1024, 131075), (2048, 131087)):
+        for num_sms, sm_version in ((132, 90), (148, 100)):
+            plan = ss_host._route_16bit(8, n, n, k, num_sms, sm_version, dtype=bf16)
+            assert plan["tpl"] == (ss_host.BLKC, 2, 8, k), (k, num_sms, plan)
+
+
+def test_selfsampling_hopper_wide_slab_from_sm_count_threshold() -> None:
+    """Hopper streams the K = 512 rows of batches beyond two waves with 512-thread slabs from 64K
+    scores per row on 132 SMs and from 128K on the 78-SM H20 (BF16 K = 1024 batches that read
+    their survivors from registers start at 128K on both); Blackwell keeps 256 threads."""
+    assert ss_host._wide_slab(512, 65538, 512, 132, 90)
+    assert not ss_host._wide_slab(512, 65538, 512, 78, 90)
+    assert ss_host._wide_slab(512, 131075, 512, 78, 90)
+    assert ss_host._wide_slab(156, 65538, 512, 78, 90)  # two waves
+    assert not ss_host._wide_slab(512, 131075, 512, 148, 100)
+    for n, wide in ((65538, False), (131075, True), (262127, True)):
+        npad = (n + 63) // 64 * 64
+        for rows in (512, 1024):
+            plan = ss_host.route_streaming(rows, n, npad, 512, True, 78, 90)
+            assert (plan["tpl"][0] == 512) is wide, (n, rows, plan["tpl"])
+            for dtype in (torch.bfloat16, torch.float16):
+                plan = ss_host._route_streaming_16bit(rows, n, npad, 512, True, dtype, 78, 90)
+                assert (plan["tpl"][0] == 512) is wide, (n, rows, dtype, plan["tpl"])
+            assert ss_host.route_streaming(rows, n, npad, 512, True, 132, 90)["tpl"][0] == 512
+
+
+def _record_compile_requests(monkeypatch) -> list:
+    """Route the launchers' compile requests (device module and tall-batch engine) to a recorder
+    that returns no-op kernels."""
+    requests = []
+
+    def recording(real):
+        class Recording:
+            def __getattr__(self, name: str):
+                if not name.startswith("get_compiled"):
+                    return getattr(real, name)
+
+                def compile_request(*args: object, **kwargs: object):
+                    requests.append((name, kwargs))
+                    return lambda *launch_args: None
+
+                return compile_request
+
+        return Recording
+
+    monkeypatch.setattr(ss_host, "_device", recording(ss_host._device()))
+    monkeypatch.setattr(ss_host, "_tallws", recording(ss_host._tallws()))
+    for cache in ("_VARLEN_CACHE", "_VARLEN_CACHE_BF16", "_VARLEN_CACHE_FP16"):
+        monkeypatch.setattr(ss_host, cache, {})
+    return requests
+
+
+def _without_tall_ws(monkeypatch) -> None:
+    """Switch the tall-batch engine off, so the main-slab rules can be checked on the 132-SM
+    Hopper shapes it serves."""
+    monkeypatch.setattr(ss_host, "_tallws_gate", lambda *args: False)
+
+
+def _varlen_plan(rows, n, k, num_sms, sm_version, dtype=torch.float32):
+    npad = (n + 63) // 64 * 64
+    return ss_host._varlen_launcher(
+        rows, npad, k, n, 1, 4, num_sms, sm_version, dtype=dtype, device_index=0
+    )
+
+
+def test_selfsampling_bf16_partitioned_rows_cluster_on_blackwell_only(monkeypatch) -> None:
+    """BF16 rows split over CTAs launch each row's parts as one cluster on Blackwell; Hopper
+    launches them as plain CTAs (the cluster only co-schedules the parts, and 32 rows of 4-CTA
+    clusters would take two waves there)."""
+    requests = _record_compile_requests(monkeypatch)
+    for rows in (8, 32):
+        for (num_sms, sm_version), clustered in (((148, 100), True), ((132, 90), False)):
+            requests.clear()
+            _varlen_plan(rows, 8195, 1024, num_sms, sm_version, torch.bfloat16)
+            partitioned = [kwargs for _, kwargs in requests if kwargs.get("pcw")]
+            assert partitioned and partitioned[-1]["parts"] > 1, (rows, sm_version, requests)
+            assert partitioned[-1]["pcw_cluster"] is clustered, (rows, sm_version, partitioned[-1])
+
+
+def test_selfsampling_hopper_long_rows_sample_with_staging_headroom(monkeypatch) -> None:
+    """Hopper samples the long rows of tall batches with the full staging headroom (aim 4K, which
+    the kernel clamps to SCAP / 2): FP32 rows of 64K or more scores at K <= 1024 (2K below 128K
+    at K = 512) and 16-bit rows of 128K or more at K = 1024, or of 64K or more for BF16 batches
+    that read their survivors from registers, which keep the 256-thread slab below 128K.
+    Blackwell keeps its plans."""
+    _record_compile_requests(monkeypatch)
+    _without_tall_ws(monkeypatch)  # it serves some 132-SM K <= 1024 shapes below
+
+    def aim(rows, n, k, num_sms, sm_version, dtype):
+        launcher = _varlen_plan(rows, n, k, num_sms, sm_version, dtype)
+        assert launcher[0] == "main", (rows, n, k, dtype, launcher)
+        return launcher[3][0]
+
+    for rows in (256, 512, 1024):
+        for dtype in (torch.float32, torch.bfloat16, torch.float16):
+            for n in (131075, 262127):
+                assert aim(rows, n, 1024, 132, 90, dtype) == 4096, (rows, n, dtype)
+        assert aim(rows, 65539, 1024, 132, 90, torch.float32) == 4096
+        assert aim(rows, 131075, 512, 132, 90, torch.float32) == 2048
+        assert aim(rows, 65538, 512, 132, 90, torch.float32) == 1024
+        regsel = rows > 4 * 132
+        assert aim(rows, 65539, 1024, 132, 90, torch.bfloat16) == (4096 if regsel else 1408)
+        assert aim(rows, 65539, 1024, 132, 90, torch.float16) == 1408
+        for dtype in (torch.bfloat16, torch.float16):
+            assert aim(rows, 131075, 512, 132, 90, dtype) == 768, (rows, dtype)
+
+    def slab(rows, n, dtype, num_sms=132, sm_version=90):
+        plan = ss_host._route_streaming_16bit(rows, n, n, 1024, True, dtype, num_sms, sm_version)
+        return plan["tpl"][0]
+
+    assert slab(1024, 65539, torch.bfloat16) == 256
+    assert slab(1024, 65539, torch.float16) == slab(512, 65539, torch.bfloat16) == 512
+    assert slab(1024, 131075, torch.bfloat16) == 512
+    # Blackwell: only BF16 batches beyond two waves (256-thread slabs) raise the K=1024 target
+    for dtype, expected in ((torch.float32, 1408), (torch.bfloat16, 2048), (torch.float16, 1408)):
+        assert aim(512, 131075, 1024, 148, 100, dtype) == expected, dtype
+    assert aim(256, 131075, 1024, 148, 100, torch.bfloat16) == 1408
+    assert aim(512, 65538, 512, 148, 100, torch.float32) == 768
+    assert slab(1024, 65539, torch.bfloat16, 148, 100) == slab(1024, 65539, torch.float16, 148, 100)
+
+
+def test_selfsampling_split_k2048_rows_sample_with_one_factor(monkeypatch) -> None:
+    """FP32 rows above K = 1024 split over CTAs sample with the same factor at every split: 32-row
+    K=2048 batches split each row in two on the 78-SM H20 and in four on 132- and 148-SM GPUs."""
+    _record_compile_requests(monkeypatch)
+
+    def split_and_sfac(n, num_sms, sm_version):
+        launcher = _varlen_plan(32, n, 2048, num_sms, sm_version, torch.float32)
+        assert launcher[0] == "main", (n, num_sms, launcher)
+        return launcher[2][5], launcher[3][1]
+
+    for n in (32783, 65551, 131087, 163775):
+        assert split_and_sfac(n, 78, 90) == (2, 48), n
+    for n in (65551, 131087, 163775):
+        assert split_and_sfac(n, 132, 90) == split_and_sfac(n, 148, 100) == (4, 48), n
+
+
+def test_selfsampling_hopper_reads_shape_constants_at_run_time(monkeypatch) -> None:
+    """Kernels that compile a shape constant in keep it at run time on Hopper where that is
+    faster: the row stride of FP32 K=1024 register kernels in batches beyond two waves of rows
+    above 4K scores, and K in BF16 K=512 main slabs. Blackwell compiles both in."""
+    requests = _record_compile_requests(monkeypatch)
+
+    def request(kernel, rows, n, k, num_sms, sm_version, dtype):
+        for cache in ("_VARLEN_CACHE", "_VARLEN_CACHE_BF16"):
+            monkeypatch.setattr(ss_host, cache, {})
+        requests.clear()
+        _varlen_plan(rows, n, k, num_sms, sm_version, dtype)
+        matching = [kwargs for name, kwargs in requests if name == kernel]
+        assert matching, (kernel, rows, n, k, sm_version, requests)
+        return matching[-1]
+
+    def static_npad(rows, n, num_sms, sm_version):
+        kwargs = request("get_compiled__reg", rows, n, 1024, num_sms, sm_version, torch.float32)
+        return kwargs["static_npad"]
+
+    for rows, n in ((512, 4099), (1024, 4099), (512, 8195), (1024, 8195)):
+        assert static_npad(rows, n, 132, 90) is None, (rows, n)
+        assert static_npad(rows, n, 148, 100) == (n + 63) // 64 * 64, (rows, n)
+    for rows, n in ((256, 4099), (1024, 2051)):
+        assert static_npad(rows, n, 132, 90) == (n + 63) // 64 * 64, (rows, n)
+
+    def staged_k(rows, n, k, num_sms, sm_version):
+        kwargs = request("get_compiled", rows, n, k, num_sms, sm_version, torch.bfloat16)
+        return kwargs.get("staged_k", 0)
+
+    for rows, n in ((512, 16387), (1024, 16387), (1024, 32771)):
+        assert staged_k(rows, n, 512, 132, 90) == 0, (rows, n)
+        assert staged_k(rows, n, 512, 148, 100) == 512, (rows, n)
+        assert staged_k(rows, n, 1024, 132, 90) == 1024, (rows, n)
+
+
+def test_selfsampling_hopper_fp16_wide_slabs_issue_samples_first(monkeypatch) -> None:
+    """FP16 batches beyond two waves that Hopper streams on 512-thread slabs issue the sample
+    loads before the row prologue (env_first) up to 48M scores per batch, the bound of p2.
+    Blackwell keeps its rungs: 256-thread slabs, and 512-thread slabs of rows of 128K scores."""
+    requests = _record_compile_requests(monkeypatch)
+    _without_tall_ws(monkeypatch)  # it serves some 132-SM K <= 1024 shapes below
+
+    def env_first(rows, n, k, num_sms, sm_version):
+        monkeypatch.setattr(ss_host, "_VARLEN_CACHE_FP16", {})
+        requests.clear()
+        _varlen_plan(rows, n, k, num_sms, sm_version, torch.float16)
+        (kwargs,) = [kwargs for name, kwargs in requests if name == "get_compiled"]
+        return kwargs.get("env_first", False)
+
+    for k in (512, 1024):
+        assert env_first(512, 65539, k, 132, 90), k
+        assert not env_first(1024, 65539, k, 132, 90), k
+        for rows in (512, 1024):
+            assert not env_first(rows, 131075, k, 132, 90), (rows, k)
+        assert env_first(512, 65539, k, 148, 100), k
+        assert env_first(256, 131075, k, 148, 100), k
+
+
+def test_selfsampling_hopper_fp16_skips_survivor_rereads(monkeypatch) -> None:
+    """Hopper FP16 avoids re-reading staged survivors' values, which its L2 no longer holds:
+    K = 2048 rows of 64K or more scores in batches beyond two waves take the 512-thread slab
+    (which stages the values), and the 256-thread slabs of 132-SM parts skip the p2 pass. BF16,
+    the H20 (Blackwell's DRAM bandwidth per SM) and Blackwell keep the p2 pass."""
+    for n in (65551, 131087, 163775):
+        npad = (n + 63) // 64 * 64
+        for dtype, num_sms, sm_version, blk in (
+            (torch.float16, 132, 90, 512),
+            (torch.bfloat16, 132, 90, 256),
+            (torch.float16, 148, 100, 256),
+        ):
+            plan = ss_host._route_streaming_16bit(
+                512, n, npad, 2048, True, dtype, num_sms, sm_version
+            )
+            assert plan["tpl"][0] == blk, (n, dtype, sm_version, plan["tpl"])
+    requests = _record_compile_requests(monkeypatch)
+    _without_tall_ws(monkeypatch)  # it serves some 132-SM K = 2048 shapes below
+
+    def p2(rows, n, k, num_sms, sm_version):
+        monkeypatch.setattr(ss_host, "_VARLEN_CACHE_FP16", {})
+        requests.clear()
+        _varlen_plan(rows, n, k, num_sms, sm_version, torch.float16)
+        (kwargs,) = [kwargs for name, kwargs in requests if name == "get_compiled"]
+        return kwargs.get("p2", False)
+
+    for k, n in ((512, 32771), (1024, 32771), (2048, 32783)):
+        assert not p2(512, n, k, 132, 90), (k, n)
+        assert p2(512, n, k, 78, 90), (k, n)  # H20: Blackwell's bandwidth per SM
+        assert p2(512, n, k, 148, 100), (k, n)
+    assert p2(512, 65551, 2048, 132, 90)  # 512-thread slab, n x rows <= 48M scores
+
+
+def test_selfsampling_hopper_fp16_ranks_survivors_per_warp(monkeypatch) -> None:
+    """FP16 main slabs of 132-SM Hopper parts rank survivors per warp with a compile-time K and
+    an smem-staged output row, as BF16 does, except in batches beyond two waves that keep the p2
+    pass; one-wave batches of 16M scores or more on 512-thread slabs skip p2. The H20 and
+    Blackwell keep their options."""
+    requests = _record_compile_requests(monkeypatch)
+    _without_tall_ws(monkeypatch)  # it serves some 132-SM K = 2048 shapes below
+
+    def options(rows, n, k, num_sms, sm_version):
+        monkeypatch.setattr(ss_host, "_VARLEN_CACHE_FP16", {})
+        requests.clear()
+        _varlen_plan(rows, n, k, num_sms, sm_version, torch.float16)
+        (kwargs,) = [kwargs for name, kwargs in requests if name == "get_compiled"]
+        return kwargs.get("warp_rank", False), kwargs.get("staged_k", 0), kwargs.get("p2", False)
+
+    assert options(512, 32783, 2048, 132, 90) == (True, 2048, False)
+    assert options(128, 65551, 2048, 132, 90) == (True, 2048, True)  # below 16M scores
+    assert options(256, 131075, 1024, 132, 90) == (True, 1024, False)
+    for k, n in ((1024, 65539), (2048, 65551)):
+        assert options(512, n, k, 132, 90) == (False, 0, True), (k, n)
+    for num_sms, sm_version in ((78, 90), (148, 100)):
+        assert options(256, 131075, 1024, num_sms, sm_version) == (False, 0, True), num_sms
+
+
+def test_selfsampling_hopper_one_wave_row_pass_evicts_first(monkeypatch) -> None:
+    """Main slabs of Hopper parts other than the H20 load their row pass L2 evict_first when every
+    CTA of the batch is co-resident and the row holds 32 * K scores or more (128 * K at one CTA
+    per SM) and at most 768 KB at two or more CTAs per SM, except on 256-thread K = 2048 slabs;
+    BF16 rows that select from registers do so up to two waves. Other batches beyond one wave,
+    the H20 and Blackwell keep plain loads."""
+    requests = _record_compile_requests(monkeypatch)
+    _without_tall_ws(monkeypatch)  # it serves some 132-SM K = 2048 shapes below
+
+    def l2ef(rows, n, k, dtype, num_sms=132, sm_version=90):
+        for cache in ("_VARLEN_CACHE", "_VARLEN_CACHE_BF16", "_VARLEN_CACHE_FP16"):
+            monkeypatch.setattr(ss_host, cache, {})
+        requests.clear()
+        _varlen_plan(rows, n, k, num_sms, sm_version, dtype)
+        (kwargs,) = [kwargs for name, kwargs in requests if name == "get_compiled"]
+        return kwargs.get("l2ef", False)
+
+    for dtype in (torch.float32, torch.bfloat16, torch.float16):
+        assert l2ef(256, 32771, 1024, dtype), dtype  # 32 * K
+        assert l2ef(128, 131075, 1024, dtype), dtype  # one CTA per SM: 128 * K
+        assert not l2ef(128, 65539, 1024, dtype), dtype
+        assert not l2ef(256, 32783, 2048, dtype), dtype  # 16 * K
+        assert not l2ef(1024, 131075, 1024, dtype), dtype  # beyond two waves
+        for num_sms, sm_version in ((78, 90), (148, 100)):
+            assert not l2ef(256, 131075, 1024, dtype, num_sms, sm_version), (dtype, num_sms)
+    assert l2ef(512, 32771, 512, torch.float32)  # one wave of 256-thread slabs
+    assert not l2ef(256, 262127, 1024, torch.float32)  # 1 MB rows
+    assert l2ef(256, 262127, 1024, torch.bfloat16)  # 512 KB rows
+    for dtype in (torch.float32, torch.bfloat16):
+        assert not l2ef(512, 131087, 2048, dtype), dtype  # 256-thread K = 2048 slab
+    # two waves: BF16 rows that select from registers (256-thread slabs) take it, rows on
+    # 512-thread slabs re-read their survivors and do not
+    assert l2ef(1024, 65539, 1024, torch.bfloat16)
+    for dtype in (torch.bfloat16, torch.float16):
+        assert not l2ef(512, 65539, 1024, dtype), dtype
+
+
+def _succ_la(monkeypatch, requests, rows, n, k, dtype, num_sms=132, sm_version=90):
+    for cache in ("_VARLEN_CACHE", "_VARLEN_CACHE_BF16", "_VARLEN_CACHE_FP16"):
+        monkeypatch.setattr(ss_host, cache, {})
+    requests.clear()
+    _varlen_plan(rows, n, k, num_sms, sm_version, dtype)
+    reg = [kwargs for name, kwargs in requests if name == "get_compiled__reg"]
+    return reg[-1].get("succ_la", 0) if reg else None
+
+
+def test_selfsampling_hopper_multiwave_lookahead(monkeypatch) -> None:
+    """BF16 code-radix register plans of Hopper parts other than the H20 prefetch the row one wave
+    of co-resident CTAs (SMs x minb) ahead when the batch is taller than that wave, except plans
+    at the 32-register wall (blk x minb = 2048). One-wave batches, FP16, the H20 and Blackwell
+    keep it off."""
+    requests = _record_compile_requests(monkeypatch)
+    for rows, n, k, wave in (
+        (512, 16399, 2048, 264),
+        (1024, 16399, 2048, 264),
+        (1024, 8207, 2048, 528),
+        (1024, 8195, 1024, 528),
+        (1024, 8195, 512, 528),
+    ):
+        assert _succ_la(monkeypatch, requests, rows, n, k, torch.bfloat16) == wave, (rows, n, k)
+        assert not _succ_la(monkeypatch, requests, rows, n, k, torch.float16), (rows, n, k)
+        for num_sms, sm_version in ((78, 90), (148, 100)):
+            assert not _succ_la(
+                monkeypatch, requests, rows, n, k, torch.bfloat16, num_sms, sm_version
+            ), (rows, n, k, num_sms)
+    assert not _succ_la(monkeypatch, requests, 256, 16399, 2048, torch.bfloat16)  # one wave
+    assert not _succ_la(monkeypatch, requests, 1057, 3000, 512, torch.bfloat16)  # blk x minb 2048
+
+
+@pytest.mark.skipif(
+    getSMVersion() != 90 or torch.cuda.get_device_properties(0).multi_processor_count != 132,
+    reason="requires a 132-SM Hopper GPU (H100 / H200 SXM)",
+)
+@pytest.mark.parametrize(
+    "rows,ncols,top_k,next_n,compress_ratio",
+    [
+        pytest.param(300, 16399, 2048, 1, 1, id="k2048_partial_wave"),
+        pytest.param(600, 16399, 2048, 2, 1, id="k2048_mtp2"),
+        pytest.param(600, 8195, 512, 1, 4, id="k512_cr4"),
+        pytest.param(1024, 8195, 1024, 2, 4, id="k1024_mtp2"),
+    ],
+)
+def test_selfsampling_hopper_multiwave_lookahead_exact(
+    monkeypatch, rows: int, ncols: int, top_k: int, next_n: int, compress_ratio: int
+) -> None:
+    """Batches taller than one wave that prefetch the next wave's rows stay exact."""
+    real = ss_host._device()
+    requests = []
+
+    class RecordingDevice:
+        def __getattr__(self, name: str):
+            attr = getattr(real, name)
+            if not name.startswith("get_compiled"):
+                return attr
+
+            def compile_request(*args: object, **kwargs: object):
+                requests.append((name, kwargs))
+                return attr(*args, **kwargs)
+
+            return compile_request
+
+    monkeypatch.setattr(ss_host, "_device", RecordingDevice)
+    monkeypatch.setattr(ss_host, "_VARLEN_CACHE_BF16", {})
+    logits, kv_lens, lengths = _make_low_varlen_case(
+        rows, ncols, top_k, next_n, compress_ratio, "ties", torch.bfloat16
+    )
+    indices = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    ss_host.run_varlen(
+        logits,
+        kv_lens,
+        indices,
+        next_n=next_n,
+        compress_ratio=compress_ratio,
+        max_seq_len=ncols * compress_ratio,
+    )
+    torch.cuda.synchronize()
+    assert any(kwargs.get("succ_la") for name, kwargs in requests if name == "get_compiled__reg")
+    _check_low_varlen_exact(logits, indices, lengths)
+
+
+def test_selfsampling_hopper_tall_batches_run_ws_engine(monkeypatch) -> None:
+    """132-SM Hopper parts run tall decode batches on the persistent tall-batch engine: one launch
+    of G = ceil(rows / R) CTAs of R = ceil(rows / 132) rows with the sampling ladder of K. A band
+    of R, G and row length n (the envelope clamped to the row stride) admits it: at K = 2048 FP32
+    rows of 32,768 scores on 64 CTAs or more and 16-bit rows of 65,536 on 128; below K = 2048, on
+    128 CTAs or, with three or more rows per CTA, on 110: FP32 K = 1024 rows of 24,576, FP32 K = 512
+    rows of 24,576 to 196,607 with two or more rows per CTA, and 16-bit rows of 98,304 with two or
+    more rows per CTA or of 49,152 with four or more. Other K, deterministic mode, the H20 and
+    Blackwell keep their plans; the FP32 warmup launches the engine once for all its row counts and
+    the 16-bit warmup every requested row count."""
+    requests = _record_compile_requests(monkeypatch)
+
+    def launcher(rows, n, k, dtype, num_sms=132, sm_version=90, npad=None, det=False, next_n=1):
+        for cache in ("_VARLEN_CACHE", "_VARLEN_CACHE_BF16", "_VARLEN_CACHE_FP16"):
+            monkeypatch.setattr(ss_host, cache, {})
+        requests.clear()
+        npad = (n + 63) // 64 * 64 if npad is None else npad
+        return ss_host._varlen_launcher(
+            rows, npad, k, n, next_n, 4, num_sms, sm_version, dtype=dtype, device_index=0, det=det
+        )
+
+    ladder = {512: (1024, 32, 0), 1024: (2048, 64, 0), 2048: (4096, 64, 1)}
+    fp32, low = (torch.float32,), (torch.bfloat16, torch.float16)
+    # (dtypes, K, rows, n, routed) at every edge of the bands: n, the FP32 K = 512 bound, R (1 up
+    # to 132 rows, 2 from 133, 3 from 265, 4 from 397) and G (110 from 328 rows at R = 3 and from
+    # 437 at R = 4, 128 from 255 rows at R = 2 and from 382 at R = 3)
+    cases = [
+        (fp32, 2048, 64, 32768, True),
+        (fp32, 2048, 127, 32768, True),
+        (fp32, 2048, 133, 32768, True),
+        (fp32, 2048, 300, 32768, True),
+        (fp32, 2048, 1024, 163775, True),
+        (fp32, 2048, 128, 32767, False),
+        (fp32, 2048, 63, 262127, False),
+        (low, 2048, 128, 65536, True),
+        (low, 2048, 255, 65536, True),
+        (low, 2048, 382, 65536, True),
+        (low, 2048, 1024, 163775, True),
+        (low, 2048, 128, 65535, False),
+        (low, 2048, 127, 262127, False),
+        (low, 2048, 254, 262127, False),
+        (low, 2048, 381, 262127, False),
+        (fp32, 1024, 128, 24576, True),
+        (fp32, 1024, 255, 24576, True),
+        (fp32, 1024, 328, 24576, True),
+        (fp32, 1024, 1024, 262127, True),
+        (fp32, 1024, 127, 262127, False),
+        (fp32, 1024, 254, 262127, False),
+        (fp32, 1024, 327, 262127, False),
+        (fp32, 1024, 1024, 24575, False),
+        (fp32, 512, 255, 24576, True),
+        (fp32, 512, 437, 196607, True),
+        (fp32, 512, 1024, 196607, True),
+        (fp32, 512, 128, 65538, False),
+        (fp32, 512, 254, 65538, False),
+        (fp32, 512, 436, 65538, False),
+        (fp32, 512, 1024, 196608, False),
+        (fp32, 512, 255, 24575, False),
+    ]
+    for k in (512, 1024):
+        cases += [
+            (low, k, 255, 98304, True),
+            (low, k, 328, 98304, True),
+            (low, k, 396, 98304, True),
+            (low, k, 437, 49152, True),
+            (low, k, 1024, 262127, True),
+            (low, k, 128, 262127, False),
+            (low, k, 254, 262127, False),
+            (low, k, 255, 98303, False),
+            (low, k, 327, 262127, False),
+            (low, k, 396, 98303, False),
+            (low, k, 436, 262127, False),
+            (low, k, 437, 49151, False),
+        ]
+    for dtypes, k, rows, n, routed in cases:
+        for dtype in dtypes:
+            lc = launcher(rows, n, k, dtype)
+            assert (lc[0] == "tallws") is routed, (dtype, k, rows, n, lc[0])
+            if not routed:
+                assert all(name != "get_compiled__tallws" for name, _ in requests)
+                continue
+            npad, grid = (n + 63) // 64 * 64, -(-rows // -(-rows // 132))
+            assert lc[2] == (grid, npad, rows, *ladder[k]), (dtype, k, rows, n, lc[2])
+            assert requests == [("get_compiled__tallws", {"next_n": 1, "cr_shift": 2})]
+            assert launcher(rows, n, k, dtype, next_n=2)[0] == "tallws"
+            assert requests == [("get_compiled__tallws", {"next_n": 2, "cr_shift": 2})]
+            for profile in ((148, 100), (148, 103), (160, 103), (78, 90)):
+                assert launcher(rows, n, k, dtype, *profile)[0] != "tallws", (dtype, k, profile)
+                assert all(name != "get_compiled__tallws" for name, _ in requests)
+            if dtype is torch.float32:
+                assert launcher(rows, n, k, dtype, det=True)[0] != "tallws", (k, rows, n)
+    # the row stride bounds the envelope
+    assert launcher(512, 65551, 2048, torch.float32, npad=40000)[0] == "tallws"
+    assert launcher(512, 65551, 2048, torch.bfloat16, npad=40000)[0] != "tallws"
+    assert launcher(1024, 262127, 512, torch.float32, npad=196544)[0] == "tallws"
+
+    # FP32 warmup launches one row count per engine: the first one the tall-batch engine serves
+    profile = ss_host._pack_device_profile(132, 90)
+    monkeypatch.setattr(ss_host, "_device_profile_key", lambda device: profile)
+    monkeypatch.setattr(ss_host, "_VARLEN_WARMUP_DONE", set())
+    launched = []
+    monkeypatch.setattr(
+        ss_host, "run_varlen", lambda logits, *a, **kw: launched.append(len(logits))
+    )
+    for cache in ("_VARLEN_CACHE", "_VARLEN_CACHE_BF16", "_VARLEN_CACHE_FP16"):
+        monkeypatch.setattr(ss_host, cache, {})
+    for k, first in ((2048, 64), (512, 255)):
+        launched.clear()
+        ss_host.warmup_varlen(k, 65551, num_rows_list=(64, 264), row_stride=65600)
+        assert [rows for rows in launched if rows >= first] == [first], (k, launched)
+        for rows in (64, 264):
+            family = ss_host._VARLEN_CACHE[(rows, 65600, k, 65551, 1, 1, profile)][0]
+            assert (family == "tallws") is (rows >= first), (k, rows, family)
+    # the 16-bit warmup launches every requested row count
+    launched.clear()
+    ss_host.warmup_varlen(
+        1024, 65551, num_rows_list=(437, 512), row_stride=65600, dtype=torch.bfloat16
+    )
+    assert launched == [437, 512], launched
+
+
+@pytest.mark.parametrize(
+    "dtype,top_k,rows,ncols,next_n",
+    [
+        pytest.param(torch.float32, 2048, 400, 40000, 1, id="f32_r4"),
+        pytest.param(torch.float32, 2048, 96, 40000, 1, id="f32_g96"),
+        pytest.param(torch.bfloat16, 2048, 264, 65551, 2, id="bf16_mtp2"),
+        pytest.param(torch.float16, 2048, 396, 65551, 1, id="f16_r3"),
+        pytest.param(torch.float32, 1024, 330, 40000, 1, id="f32_k1024_r3"),
+        pytest.param(torch.float32, 512, 264, 40000, 2, id="f32_k512_mtp2"),
+        pytest.param(torch.bfloat16, 1024, 441, 65551, 1, id="bf16_k1024_r4_uneven"),
+        pytest.param(torch.float16, 512, 264, 100000, 2, id="f16_k512_mtp2"),
+        pytest.param(torch.float32, 1024, 128, 300007, 1, id="f32_k1024_long"),
+        pytest.param(torch.float16, 512, 257, 300007, 1, id="f16_k512_long_uneven"),
+        pytest.param(torch.bfloat16, 2048, 128, 300007, 1, id="bf16_long"),
+    ],
+)
+def test_selfsampling_hopper_tall_ws_exact(
+    monkeypatch, dtype: torch.dtype, top_k: int, rows: int, ncols: int, next_n: int
+) -> None:
+    """The tall-batch engine, with the 132-SM Hopper profile forced so any SM90 or SM100 GPU runs
+    it (its CTAs never wait on each other), is exact at K = 512, 1024 and 2048 on mixed rows:
+    random, ties, constant, more than K +inf, a -inf half, sparse high scores, high scores on
+    exactly the sampled positions (the first windows then hold fewer than K scores and the row
+    retries down to the floor), and a tie class at the sampled threshold (more survivors than
+    staging slots, so the selection re-reads the row), under per-request windows (full, shortened,
+    sampled and unsampled rows below the staging capacity, the short path, empty). Several rows
+    per CTA carry the ring across rows, also when the rows do not split evenly over the CTAs, and
+    rows of more than 262,144 scores gather their samples in several rounds. A warmed (16-bit) or
+    once-launched (FP32) batch captures into a CUDA graph and replays exactly on new rows and
+    lengths."""
+    profile = ss_host._pack_device_profile(132, 90)
+    monkeypatch.setattr(ss_host, "_device_profile_key", lambda device: profile)
+    for name in ("_VARLEN_CACHE", "_VARLEN_CACHE_BF16", "_VARLEN_CACHE_FP16"):
+        monkeypatch.setattr(ss_host, name, {})
+    for name in ("_VARLEN_WARMUP_DONE", "_VARLEN_WARMUP_DONE_BF16", "_VARLEN_WARMUP_DONE_FP16"):
+        monkeypatch.setattr(ss_host, name, set())
+    stride = (ncols + 63) // 64 * 64
+    arena = torch.empty((rows, stride), dtype=dtype, device=_DEV)
+    logits = arena[:, :ncols]
+    kv_lens = torch.empty((rows // next_n,), dtype=torch.int32, device=_DEV)
+    indices = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    # the sampling ladder of these rows reads 8 scores every 512 (K = 2048: aim 4096, factor 64)
+    # or every 256 (K = 1024: aim 2048, factor 64; K = 512: aim 1024, factor 32)
+    step = 512 if top_k == 2048 else 256
+    sampled = torch.arange(ncols // step, device=_DEV)[:, None] * step
+    sampled = (sampled + torch.arange(8, device=_DEV)).flatten()
+
+    def fill(seed: int) -> list[int]:
+        generator = torch.Generator(device=_DEV).manual_seed(seed)
+        data = torch.randn((rows, stride), generator=generator, device=_DEV)
+        kind = (torch.arange(rows, device=_DEV) // next_n // 6) % 8
+        positions = torch.randperm(ncols, generator=generator, device=_DEV)
+        for pattern in range(1, 8):
+            sel = (kind == pattern).nonzero().flatten()[:, None]
+            if pattern == 1:
+                data[sel] = (data[sel] * 2).round()
+            elif pattern == 2:
+                data[sel] = 0.5
+            elif pattern == 3:
+                data[sel, positions[: top_k + 5]] = float("inf")
+            elif pattern == 4:
+                data[sel, ncols // 2 :] = float("-inf")
+            elif pattern == 7:
+                data[sel] -= 5.0
+                data[sel, positions[:15000]] = 0.0
+                spread = torch.rand((sel.shape[0], 3000), generator=generator, device=_DEV)
+                data[sel, positions[15000:18000]] = spread
+            else:
+                data[sel] -= 8.0
+                spots = sampled if pattern == 5 else positions[: top_k + 10]
+                high = torch.rand((sel.shape[0], spots.numel()), generator=generator, device=_DEV)
+                data[sel, spots] = 20.0 + 30.0 * (pattern == 5) + 10.0 * high
+        arena.copy_(data)
+        windows = [ncols, ncols - 7, 5000, top_k + 1, top_k - 3, 0]
+        kv = [windows[(request + seed) % len(windows)] for request in range(rows // next_n)]
+        kv_lens.copy_(torch.tensor(kv, dtype=torch.int32, device=_DEV))
+        lengths = _bf16_varlen_lengths(kv, next_n, 1, ncols)
+        for row, valid in enumerate(lengths):
+            arena[row, valid:] = float("inf")
+        return lengths
+
+    options = {"next_n": next_n, "max_seq_len": ncols}
+    assert not ss_host.varlen_ready(logits, indices, **options)
+    if dtype is not torch.float32:
+        # FP32 warmup also compiles every smaller batch's engine; the routing test covers it
+        ss_host.warmup_varlen(
+            top_k, ncols, next_n=next_n, num_rows_list=(rows,), row_stride=stride, dtype=dtype
+        )
+        assert ss_host.varlen_ready(logits, indices, **options)
+    lengths = fill(0)
+    values = torch.full((rows, top_k + 13), 7.0, dtype=torch.float32, device=_DEV)
+    ss_host.run_varlen(logits, kv_lens, indices, values=values, **options)
+    torch.cuda.synchronize()
+    key = (rows, stride, top_k, ncols, next_n, 1)
+    if dtype is not torch.float32:
+        key += (torch.cuda.current_device(),)
+    assert ss_host._varlen_cache_for(dtype)[(*key, profile)][0] == "tallws"
+    _check_low_varlen_exact(logits, indices, lengths, values)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        ss_host.run_varlen(logits, kv_lens, indices, **options)
+    for seed in (1, 2):
+        lengths = fill(seed)
+        indices.fill_(-7)
+        graph.replay()
+        torch.cuda.synchronize()
+        _check_low_varlen_exact(logits, indices, lengths)
+
+
+@pytest.mark.skipif(
+    getSMVersion() != 90
+    or torch.cuda.get_device_properties(0).multi_processor_count
+    not in ss_host._HOPPER_CLUSTER_ROWS,
+    reason="requires a Hopper GPU of a measured SM count (H100 / H200 SXM, H20)",
+)
+def test_selfsampling_hopper_cluster_table_within_device_occupancy() -> None:
+    """The cluster rows of this GPU's SM count never exceed the clusters it co-schedules at one
+    CTA per SM."""
+    from cutlass.utils import HardwareInfo
+
+    hardware = HardwareInfo(torch.cuda.current_device())
+    num_sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    for cluster_size in range(2, 17):
+        rows = ss_host.hopper_cluster_rows(cluster_size, num_sms)
+        assert rows <= hardware.get_max_active_clusters(cluster_size), (cluster_size, rows)
+
+
+def test_selfsampling_prefill_tiers_follow_wave() -> None:
+    """Prefill tier bands and representative rows scale with the wave budget; Blackwell keys
+    are unchanged and other budgets get their own keys."""
+    assert ss_host._prefill_tier_rows(148) == (75, 149, 297)
+    assert ss_host._prefill_tier_rows(132) == (67, 133, 265)
+    for rows, tier in ((1, 0), (132, 0), (133, 1), (264, 1), (265, 2)):
+        assert ss_host._prefill_tier(rows, 2048, 512, 132) == tier
+    key = ss_host._prefill_cache_key(0, 512, 4096, "f32")
+    assert ss_host._prefill_cache_key(0, 512, 4096, "f32", wave=148) == key
+    assert ss_host._prefill_cache_key(0, 512, 4096, "f32", wave=132) != key
+
+
 @pytest.mark.skipif(getSMVersion() not in (100, 103), reason="requires an SM100 or SM103 GPU")
 def test_selfsampling_sm103_b512_k2048_cuda_graph() -> None:
     """Exercise the shared 148-SM SM100/SM103 plan through warmup and graph replay."""
@@ -1067,7 +1859,8 @@ def test_selfsampling_varlen_regclus_parity_and_oracle():
     out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
     ss_host.run_varlen(lg, kv, out, next_n=nn, compress_ratio=cr, max_seq_len=msl_c * cr)
     key = _varlen_cache_key(rows, npad, k, msl_c, nn, cr)
-    assert ss_host._VARLEN_CACHE[key][0] == "reg_clus", ss_host._VARLEN_CACHE[key][0]
+    if _routes_as_picked():
+        assert ss_host._VARLEN_CACHE[key][0] == "reg_clus", ss_host._VARLEN_CACHE[key][0]
     torch.cuda.synchronize()
     ref = _reference_varlen_indices(lg, kv, nn, cr, k)
     for r in range(rows):
@@ -1163,7 +1956,8 @@ def test_selfsampling_varlen_regclus_k2048_exact(b: int, n: int, pattern: str) -
     out = torch.full((b, k), -7, dtype=torch.int32, device=_DEV)
     ss_host.run_varlen(lg, kv, out, max_seq_len=n)
     torch.cuda.synchronize()
-    assert ss_host._VARLEN_CACHE[key][0] == "reg_clus"
+    if _routes_as_picked():
+        assert ss_host._VARLEN_CACHE[key][0] == "reg_clus"
     _check_exact(lg, out, n, torch.topk(lg[:, :n], k, dim=1).values)
 
 
@@ -1418,7 +2212,8 @@ def test_selfsampling_varlen_clus_parity_and_oracle():
         out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
         ss_host.run_varlen(lg, kv, out, next_n=nn, compress_ratio=cr, max_seq_len=msl_c * cr)
         key = _varlen_cache_key(rows, npad, k, msl_c, nn, cr)
-        assert ss_host._VARLEN_CACHE[key][0] == "clus", ss_host._VARLEN_CACHE[key][0]
+        if _routes_as_picked():
+            assert ss_host._VARLEN_CACHE[key][0] == "clus", ss_host._VARLEN_CACHE[key][0]
         torch.cuda.synchronize()
         ref = _reference_varlen_indices(lg, kv, nn, cr, k)
         for r in range(rows):
@@ -2174,24 +2969,21 @@ def test_prefill_warmup_idempotent_and_no_rejit(dtype):
     # Every row stride here fits 16-bit indices, so the 16-bit tier-2 key is the v16 one.
     lo = ss_host._prefill_bucket(k + 1)
     want = {
-        ss_host._prefill_cache_key(1, k, 0, tag),
-        ss_host._prefill_cache_key(2, k, 0, tag, v16=dtype is not torch.float32),
+        _prefill_key(1, k, 0, tag),
+        _prefill_key(2, k, 0, tag, v16=dtype is not torch.float32),
     }
     bk = lo
     while bk <= 32768:
         for n_env in (bk // 2 + 1, bk):
-            if ss_host._prefill_tier(1, n_env, k) == 0:
-                want.add(ss_host._prefill_cache_key(0, k, bk, tag))
+            if ss_host._prefill_tier(1, n_env, k, _device_wave()) == 0:
+                want.add(_prefill_key(0, k, bk, tag))
         bk <<= 1
     # deterministic prefill keys carry a fifth element (True); an earlier
     # deterministic test in the same process must not enter the comparison
     have = {
         kk
         for kk in ss_host._PREFILL_CACHE
-        if (len(kk) == 4 or kk[4] == "v16")
-        and kk[1] == k
-        and kk[3] == tag
-        and (kk[0] != 0 or kk[2] >= lo)
+        if kk[4:5] != (True,) and kk[1] == k and kk[3] == tag and (kk[0] != 0 or kk[2] >= lo)
     }
     assert have == want, (have, want)
     # the capture-time readiness query agrees with the cache: warmed shape
@@ -2212,7 +3004,7 @@ def test_prefill_16bit_tier2_staging_follows_row_stride(dtype, monkeypatch):
     tag = _DTYPE_IDS[dtype]
     ss_host.warmup_prefill(k, 65400, num_rows_list=(297,), dtype=dtype)
     for v16 in (True, False):
-        assert ss_host._prefill_cache_key(2, k, 0, tag, v16=v16) in ss_host._PREFILL_CACHE
+        assert _prefill_key(2, k, 0, tag, v16=v16) in ss_host._PREFILL_CACHE
     looked = []
 
     class _Recording(dict):
@@ -2232,7 +3024,7 @@ def test_prefill_16bit_tier2_staging_follows_row_stride(dtype, monkeypatch):
         looked.clear()
         ss_host.run_prefill(lg, rs, re, out)
         # one lookup and no launcher build: the warmed engine of this row stride ran
-        assert looked == [ss_host._prefill_cache_key(2, k, 0, tag, v16=ncols == 8192)], looked
+        assert looked == [_prefill_key(2, k, 0, tag, v16=ncols == 8192)], looked
         torch.cuda.synchronize()
         _check_prefill_exact(lg, out, rs, re, k)
 
@@ -2297,7 +3089,7 @@ def test_prefill_small_envelope_tier0_uses_sampled_plan(dtype):
     rows = 64
     for k in (512, 1024, 2048):
         for n in (4099, 8192, 16384, 32768):
-            tier = ss_host._prefill_tier(rows, n, k)
+            tier = ss_host._prefill_tier(rows, n, k, _device_wave())
             assert tier == (
                 1 if ss_host._prefill_scpb_tier1(k) + ss_host._PREFILL_T1_MARGIN < n <= 16384 else 0
             )
@@ -2308,10 +3100,7 @@ def test_prefill_small_envelope_tier0_uses_sampled_plan(dtype):
             ss_host.run_prefill(lg, rs, re, out, max_row_len=n)
             torch.cuda.synchronize()
             bucket = ss_host._prefill_bucket(n)
-            assert (
-                ss_host._prefill_cache_key(tier, k, bucket, _DTYPE_IDS[dtype])
-                in ss_host._PREFILL_CACHE
-            )
+            assert _prefill_key(tier, k, bucket, _DTYPE_IDS[dtype]) in ss_host._PREFILL_CACHE
             assert ss_host.prefill_ready(lg, out, max_row_len=n)
             _check_prefill_exact(lg, out, rs, re, k)
         # prefix-cache-hit window on the small-envelope tier-1 engine: ks % 4 == 1
@@ -2456,6 +3245,25 @@ def _check_low_varlen_exact(
             assert bool((output_values[row, count:] == torch.finfo(torch.float32).min).all())
 
 
+def _routes_as_picked() -> bool:
+    """Whether this GPU routes the fixed test shapes as the GPUs they were picked on (datacenter
+    Blackwell and 132-SM Hopper). A smaller Hopper part such as the 78-SM H20 routes some of them
+    to another kernel family; the tests still check the results there."""
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    return props.major * 10 + props.minor != 90 or props.multi_processor_count == 132
+
+
+def _picked_family(family: str, rows: int, n: int, top_k: int, dtype: torch.dtype) -> str:
+    """The family a fixed test shape picked for ``family`` runs on this GPU: 132-SM Hopper parts
+    run the tall batches the tall-batch engine takes (its routing test checks the bands)."""
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    sm_version = props.major * 10 + props.minor
+    tall = ss_host._tallws_gate(
+        rows, n, top_k, props.multi_processor_count, sm_version, dtype, False
+    )
+    return "tallws" if tall else family
+
+
 def _launcher_family(
     dtype: torch.dtype,
     logits: torch.Tensor,
@@ -2567,8 +3375,10 @@ def test_selfsampling_topk_varlen_16bit_edge_patterns(
         max_seq_len=ncols * compress_ratio,
     )
     torch.cuda.synchronize()
-    if family is not None:
-        assert _launcher_family(dtype, logits, top_k, ncols, 1, compress_ratio) == family
+    if family is not None and _routes_as_picked():
+        assert _launcher_family(dtype, logits, top_k, ncols, 1, compress_ratio) == _picked_family(
+            family, rows, ncols, top_k, dtype
+        )
     _check_low_varlen_exact(logits, indices, lengths, values)
 
 
@@ -2614,7 +3424,10 @@ def test_selfsampling_topk_varlen_fp16_main_clus_smoke(
     key = _varlen_cache_key(
         rows, ncols, top_k, ncols, 1, compress_ratio, torch.cuda.current_device()
     )
-    assert ss_host._VARLEN_CACHE_FP16[key][0] == family
+    if _routes_as_picked():
+        assert ss_host._VARLEN_CACHE_FP16[key][0] == _picked_family(
+            family, rows, ncols, top_k, torch.float16
+        )
     _check_low_varlen_exact(logits, indices, lengths, values)
 
 
@@ -2873,7 +3686,10 @@ def test_selfsampling_topk_varlen_fp16_dense_window_exactness(
     ss_host.run_varlen(logits, kv_lens, indices, values=values, max_seq_len=ncols)
     torch.cuda.synchronize()
     key = _varlen_cache_key(rows, stride, top_k, ncols, 1, 1, torch.cuda.current_device())
-    assert ss_host._VARLEN_CACHE_FP16[key][0] == "main"
+    if _routes_as_picked():
+        assert ss_host._VARLEN_CACHE_FP16[key][0] == _picked_family(
+            "main", rows, ncols, top_k, torch.float16
+        )
     _check_low_varlen_exact(logits, indices, lengths, values)
 
 
@@ -3029,7 +3845,8 @@ def test_selfsampling_topk_varlen_fp16_regclus_exactness(
     key = _varlen_cache_key(
         rows, npad, top_k, ncols, next_n, compress_ratio, torch.cuda.current_device()
     )
-    assert ss_host._VARLEN_CACHE_FP16[key][0] == "reg_clus"
+    if _routes_as_picked():
+        assert ss_host._VARLEN_CACHE_FP16[key][0] == "reg_clus"
     _check_low_varlen_exact(logits, indices, lengths, values)
 
 
