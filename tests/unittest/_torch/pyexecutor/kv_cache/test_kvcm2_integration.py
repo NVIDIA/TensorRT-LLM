@@ -419,7 +419,9 @@ def _make_manager_for_cache_tier_test(
     vocab_size: int | None = 16,
     dtype: DataType = DataType.HALF,
     layer_specs: list[KVCacheLayerSpec] | None = None,
+    available_tokens: int = MAX_SEQ_LEN,
 ) -> tuple[KVCacheManagerV2, Mock]:
+    """Construct a manager with mocked cache tiers and available token capacity."""
     impl_constructor = Mock(side_effect=impl_side_effect)
     if mapping is None:
         mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
@@ -464,7 +466,7 @@ def _make_manager_for_cache_tier_test(
         patch(f"{module}.KVCacheManagerPy", impl_constructor),
         patch.object(KVCacheManagerV2, "_build_base_config", build_base_config),
         patch.object(KVCacheManagerV2, "_build_cache_config", build_cache_config),
-        patch.object(KVCacheManagerV2, "get_num_available_tokens", return_value=MAX_SEQ_LEN),
+        patch.object(KVCacheManagerV2, "get_num_available_tokens", return_value=available_tokens),
         patch.object(KVCacheManagerV2, "_prepare_page_table_tensor"),
         patch.object(KVCacheManagerV2, "_log_kv_cache_pool_lifecycle_mapping"),
         patch(f"{module}.get_pp_layers", return_value=([0], 1)),
@@ -490,6 +492,25 @@ def _make_manager_for_cache_tier_test(
             cold_page_codec_provider=cold_page_codec_provider,
         )
     return manager, impl_constructor
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("available_tokens", [TOKENS_PER_BLOCK, MAX_SEQ_LEN])
+def test_page_index_capacity_tracks_allocatable_sequence_length(available_tokens: int) -> None:
+    """Bound aligned page-index staging by the pool's allocatable sequence length."""
+    manager, _ = _make_manager_for_cache_tier_test(
+        KvCacheConfig(max_gpu_total_bytes=16 << 20, host_cache_size=0),
+        [Mock()],
+        available_tokens=available_tokens,
+    )
+    try:
+        assert manager.max_seq_len == available_tokens
+        required_blocks = (
+            available_tokens + manager._generation_kv_capacity_headroom + TOKENS_PER_BLOCK - 1
+        ) // TOKENS_PER_BLOCK
+        assert manager.max_blocks_per_seq == ((required_blocks + 3) // 4) * 4
+    finally:
+        manager.shutdown()
 
 
 @pytest.mark.cpu_only
@@ -4029,6 +4050,105 @@ def _try_run_context(manager: KVCacheManagerV2, request: _ContextRequest) -> boo
     return True
 
 
+@pytest.mark.parametrize("is_disagg", [False, True])
+def test_context_larger_than_kv_pool_fails_admission_and_short_request_fits(
+    is_disagg: bool,
+) -> None:
+    """Check admission, guarded oversized resizing, and subsequent native allocation."""
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+    from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
+
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    max_seq_len = 8192
+    manager = KVCacheManagerV2(
+        KvCacheConfig(
+            enable_block_reuse=False,
+            host_cache_size=0,
+            max_gpu_total_bytes=4 << 20,
+        ),
+        CacheType.SELF,
+        num_layers=2,
+        num_kv_heads=2,
+        head_dim=128,
+        tokens_per_block=32,
+        max_seq_len=max_seq_len,
+        max_batch_size=1,
+        max_num_tokens=max_seq_len,
+        mapping=Mapping(),
+        dtype=DataType.HALF,
+        is_disagg=is_disagg,
+    )
+    request = _ContextRequest(1, list(range(max_seq_len)), max_seq_len, "small-pool")
+    try:
+        assert 0 < manager.max_seq_len < max_seq_len
+        budget_request = SimpleNamespace(
+            orig_prompt_len=max_seq_len, max_new_tokens=1, py_beam_width=1
+        )
+        executor = SimpleNamespace(
+            resource_manager=ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: manager}),
+            _validate_encoder_output_len=lambda _request: None,
+        )
+        if is_disagg:
+            assert manager.get_request_kv_block_budget(budget_request) is None
+            with pytest.raises(ValueError, match="fixed page-index capacity"):
+                PyExecutor._validate_request_budget(executor, budget_request)
+            capacity = (
+                manager.max_seq_len + manager.num_extra_kv_tokens
+            ) // manager.tokens_per_block
+        else:
+            required, capacity = manager.get_request_kv_block_budget(budget_request)
+            assert required > capacity
+            with pytest.raises(ValueError, match="exceeds its capacity"):
+                PyExecutor._validate_request_budget(executor, budget_request)
+
+        # Direct callers and configurations outside dense admission still get
+        # an allocation failure rather than a native page-index span exception.
+        assert manager.prepare_context(request)
+        cache = manager.kv_cache_map[request.py_request_id]
+        before = cache.capacity, cache.history_length
+        assert not manager.resize_context(request, max_seq_len)
+        assert (cache.capacity, cache.history_length) == before
+        assert not cache.is_active
+        assert manager.prepare_context(request)
+        assert manager.resize_context(request, 32)
+        assert cache.capacity == 32 + manager.num_extra_kv_tokens
+        manager.free_resources(request)
+
+        request = _ContextRequest(2, list(range(32)), 32, "short")
+        budget_request.orig_prompt_len = 32
+        PyExecutor._validate_request_budget(executor, budget_request)
+        assert manager.prepare_context(request)
+        assert manager.resize_context(request, 32)
+        cache = manager.kv_cache_map[request.py_request_id]
+        assert cache.capacity == manager.tokens_per_block + manager.num_extra_kv_tokens
+
+        manager.free_resources(request)
+        boundary = (
+            capacity * manager.tokens_per_block
+            - manager.num_extra_kv_tokens
+            - manager._kv_reserve_draft_tokens
+            - 1
+        )
+        budget_request.orig_prompt_len = boundary
+        if not is_disagg:
+            required, budget_capacity = manager.get_request_kv_block_budget(budget_request)
+            assert required == budget_capacity == capacity
+            assert required <= manager.max_blocks_per_seq
+        assert capacity <= manager.max_blocks_per_seq
+        request = _ContextRequest(3, list(range(boundary)), boundary, "boundary")
+        assert manager.prepare_context(request)
+        assert manager.resize_context(request, boundary)
+        budget_request.orig_prompt_len += 1
+        if not is_disagg:
+            required, capacity = manager.get_request_kv_block_budget(budget_request)
+            assert required > capacity
+    finally:
+        manager.free_resources(request)
+        manager.shutdown()
+
+
 def test_preempt_request_gives_a_full_pool_back_its_pages(
     manager: KVCacheManagerV2,
 ) -> None:
@@ -5885,6 +6005,12 @@ def test_page_table_holds_the_decode_step_and_pads_to_four_pages(
 
 def _gen_init_manager(host_capacity_blocks: int | None) -> KVCacheManagerV2:
     manager = object.__new__(KVCacheManagerV2)
+    manager.kv_cache_type = CacheType.SELF
+    manager.is_draft = False
+    manager.is_disagg = True
+    manager._ledger_tokens_per_block = 128
+    manager.max_blocks_per_seq = 1024
+    manager._kv_reserve_draft_tokens = 0
     if host_capacity_blocks is not None:
         manager._host_history_reservations = HostHistoryReservations(host_capacity_blocks)
     manager.num_extra_kv_tokens = 0
@@ -5980,6 +6106,9 @@ def _offload_setup_manager(
     history.
     """
     manager = object.__new__(KVCacheManagerV2)
+    manager.kv_cache_type = CacheType.SELF
+    manager.is_draft = False
+    manager.is_disagg = True
     tiers = [CacheTier.GPU_MEM, CacheTier.HOST_MEM] if cold_tier else [CacheTier.GPU_MEM]
     manager.impl = SimpleNamespace(cache_tier_list=tiers)
     manager.mapping = SimpleNamespace(

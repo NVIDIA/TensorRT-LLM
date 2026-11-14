@@ -8232,6 +8232,17 @@ class PyExecutor:
                     f"max_new_tokens={request.max_new_tokens}, "
                     f"beam_width={request.py_beam_width}).")
 
+        for resource_type, required, capacity in (
+                self.resource_manager.get_request_kv_page_index_budgets(request)
+        ):
+            if required > capacity:
+                raise ValueError(
+                    f"{resource_type.value} requires {required} per-beam KV "
+                    f"page-index entries for the requested sequence, which "
+                    f"exceeds its fixed page-index capacity of {capacity} "
+                    "entries; reduce the requested sequence length or "
+                    "increase KV cache capacity.")
+
     def _validate_encoder_output_len(self, request: LlmRequest) -> None:
         """Reject an encoder input that no iteration can serve.
 
