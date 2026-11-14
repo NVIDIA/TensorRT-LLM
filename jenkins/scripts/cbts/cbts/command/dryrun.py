@@ -19,7 +19,7 @@ Replays CBTS over historical commits and writes per-PR artifacts (summary
 be inspected without firing real CI.
 
 Each commit is replayed with its own snapshot of
-`tests/integration/test_lists/test-db/` and `jenkins/L0_Test.groovy`
+`tests/integration/test_lists/test-db/` and `jenkins/scripts/test_stage_configs.json`
 (extracted via `git show`), so the result reflects what CBTS would have
 decided at the time the PR landed.
 
@@ -75,7 +75,7 @@ CBTS_OUTER_DIR = THIS_FILE.parents[2]
 DEFAULT_REPO_ROOT = THIS_FILE.parents[5]  # repo root
 
 TEST_DB_REL = "tests/integration/test_lists/test-db"
-GROOVY_REL = "jenkins/L0_Test.groovy"
+STAGE_CONFIG_REL = "jenkins/scripts/test_stage_configs.json"
 PR_RE = re.compile(r"\(#(\d+)\)\s*$")
 
 
@@ -137,7 +137,7 @@ def _resolve_pr(subject: str, sha: str) -> tuple[str, str]:
 
 
 def _run_cbts(
-    payload: dict, test_db: Path, groovy: Path, repo: Path, coverage_db: Optional[str] = None
+    payload: dict, test_db: Path, stage_config: Path, repo: Path, coverage_db: Optional[str] = None
 ) -> dict:
     """Invoke `cbts.command main` as a subprocess against one payload and parse its decision JSON.
 
@@ -157,8 +157,8 @@ def _run_cbts(
         str(repo),
         "--test-db",
         str(test_db),
-        "--groovy-file",
-        str(groovy),
+        "--stage-config-file",
+        str(stage_config),
     ]
     env = dict(os.environ, PYTHONPATH=str(CBTS_OUTER_DIR))
     if coverage_db:
@@ -310,9 +310,9 @@ def _cbts_for_snapshot(
         _git(repo, "worktree", "add", "--detach", str(wt), tip_sha)
         try:
             test_db = wt / TEST_DB_REL
-            groovy = wt / GROOVY_REL
+            stage_config = wt / STAGE_CONFIG_REL
             shared_out = wt / "cbts_test_db"
-            result = _run_cbts(payload, test_db, groovy, wt, coverage_db)
+            result = _run_cbts(payload, test_db, stage_config, wt, coverage_db)
             if shared_out.exists():
                 for yml in shared_out.glob("*.yml"):
                     shutil.copy2(yml, pr_dir / yml.name)
@@ -543,7 +543,7 @@ def _run(
     keep_stale,
 ) -> int:
     repo = Path(repo_root).resolve()
-    if not (repo / GROOVY_REL).exists():
+    if not (repo / STAGE_CONFIG_REL).exists():
         print(f"error: --repo-root does not look like a TRT-LLM checkout: {repo}", file=sys.stderr)
         return 2
 
