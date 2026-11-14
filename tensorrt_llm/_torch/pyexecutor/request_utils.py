@@ -239,8 +239,9 @@ def merge_helix_requests(
 ) -> list[LlmRequest]:
     """Merge requests for Helix CP.
 
-    Note: Helix parallelism is a decode-only feature run with disaggregated serving.
-    This function gets called on gen server during initialization of a new request.
+    Called only for disaggregated Helix, on the generation server when a new
+    request is initialized; it slices the prompt across CP ranks. Aggregated
+    Helix keeps the full prompt on every rank (see ``merge_requests``).
 
     Args:
         new_requests: List of RequestQueueItem objects.

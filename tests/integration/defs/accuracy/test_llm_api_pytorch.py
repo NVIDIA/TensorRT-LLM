@@ -856,6 +856,47 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(60000)
+    def test_fp8_block_scales_agg_helix_tp2cp2(self) -> None:
+        """GSM8K on aggregated Helix (TP2 x CP2) with FP8 KV and chunked prefill.
+
+        Aggregated because no cache transceiver is configured: one executor
+        runs both the context and generation phases on the CP ranks.
+        The chunk-aware MLA profile needs a request of 9 x max_num_tokens
+        tokens below max_seq_len, which the model caps at 4096.
+        max_num_tokens=256 gives a 2304-token profile, so the KV estimation
+        measures cached-KV chunk staging instead of subtracting a context-MLA
+        workspace reserve.
+        """
+        with LLM(
+                f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
+                tensor_parallel_size=2,
+                context_parallel_size=2,
+                moe_expert_parallel_size=2,
+                cp_config={
+                    "cp_type": "HELIX",
+                    "tokens_per_block": 64
+                },
+                max_batch_size=32,
+                max_num_tokens=256,
+                max_seq_len=4096,
+                enable_chunked_prefill=True,
+                kv_cache_config=KvCacheConfig(
+                    dtype="fp8",
+                    enable_block_reuse=False,
+                    tokens_per_block=64,
+                    use_kv_cache_manager_v2=True,
+                ),
+        ) as llm:
+            transceiver = llm.args.cache_transceiver_config
+            assert transceiver is None or transceiver.backend is None
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
     @pytest.mark.skip_less_device(4)
     @skip_pre_hopper
     def test_fp8_block_scales_4gpus_static_eplb(self):

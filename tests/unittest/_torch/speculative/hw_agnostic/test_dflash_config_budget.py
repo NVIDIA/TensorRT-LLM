@@ -470,18 +470,20 @@ class TestLlmArgsWiring:
         args = self._args(tmp_path, max_batch_size=8, attn_backend="VANILLA")
         assert args._kv_cache_estimation_runs() is False
 
-    def test_estimation_skipped_for_context_parallelism(self, tmp_path, monkeypatch):
-        from tensorrt_llm.llmapi.llm_args import CpConfig
+    def test_estimation_skipped_for_disagg_helix(self, tmp_path, monkeypatch):
+        from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig, CpConfig
 
         monkeypatch.delenv(SKIP_EST_ENV, raising=False)
         # A cp_config counts as context parallelism only with more than
         # one CP rank; with one rank the Mapping drops it and estimation
-        # runs as without a cp_config.
+        # runs as without a cp_config. Aggregated Helix estimates;
+        # disaggregated Helix sizes the pool by fraction.
         args = self._args(
             tmp_path,
             max_batch_size=8,
             context_parallel_size=2,
             cp_config=CpConfig(cp_type="HELIX"),
+            cache_transceiver_config=CacheTransceiverConfig(backend="NIXL"),
         )
         assert args._kv_cache_estimation_runs() is False
 
