@@ -84,7 +84,7 @@ def module_consts(path, names):
 SEAMED = {
     "toolchain/paths.py": {"csrc_root"},
     "kernels/comm/allreduce_norm_quant/route_warp_tp4_fc1_per_token_host.py": {"src_hash", "dist"},
-    "kernels/comm/allreduce_norm_quant/route_warp_tp4_host.py": {"dist"},
+    "kernels/comm/allreduce_norm_quant/route_warp_tp4_host.py": {"dist", "ptrig_on"},
     "kernels/comm/allreduce_norm_quant/router_exchange.py": {"dist"},
     "kernels/comm/allreduce_norm_quant/lamport_allreduce_host.py": {"dist"},
     "kernels/moe/router/fused_o_proj_tp4_host.py": {"dist", "_rank"},
@@ -360,11 +360,80 @@ def test_every_relative_import_resolves_in_the_tree():
     assert n > 50 and not broken, broken
 
 
+def _load_hoist_block(monkeypatch):
+    """tp4_hoist_block (and the seams it imports) loaded from this tree without the target package's __init__: the
+    target's native ops and switch registry are stand-ins (no library, no environment read)."""
+    import importlib.util
+    import sys
+    import types
+
+    hoist_pkg = f"{TP4PKG}.kernels.hoist"
+    parts = hoist_pkg.split(".")
+    for k in range(1, len(parts) + 1):
+        name = ".".join(parts[:k])
+        if name not in sys.modules:
+            m = types.ModuleType(name)
+            m.__path__ = [os.path.join(ROOT, *name.split("."))]
+            monkeypatch.setitem(sys.modules, name, m)
+    monkeypatch.setattr(sys.modules[TP4PKG], "native_ops", types.SimpleNamespace(), raising=False)
+    switches = types.ModuleType(f"{TP4PKG}.m31_switches")
+    switches.m31_disabled = lambda item_id: False
+    monkeypatch.setitem(sys.modules, switches.__name__, switches)
+    try:
+        import torch  # noqa: F401
+    except ImportError:
+        monkeypatch.setitem(sys.modules, "torch", types.ModuleType("torch"))
+    for sub in ("seams", "tp4_hoist_block"):
+        name = f"{hoist_pkg}.{sub}"
+        spec = importlib.util.spec_from_file_location(name, os.path.join(HOIST, sub + ".py"))
+        mod = importlib.util.module_from_spec(spec)
+        monkeypatch.setitem(sys.modules, name, mod)
+        spec.loader.exec_module(mod)
+    return sys.modules[f"{hoist_pkg}.tp4_hoist_block"]
+
+
+@pytest.mark.parametrize("fails_here", [False, True])
+def test_block_preparation_is_agreed_before_its_collectives(monkeypatch, fails_here):
+    """build() agrees once on the rank-local preparation before any stage build: a preparation that fails on one rank
+    raises on every rank (here, and on a peer whose own preparation succeeded) without entering the collective half."""
+    import types
+
+    blk = _load_hoist_block(monkeypatch)
+    monkeypatch.setattr(
+        blk,
+        "torch",
+        types.SimpleNamespace(
+            cuda=types.SimpleNamespace(is_current_stream_capturing=lambda: False)
+        ),
+    )
+
+    def prepare(*args):
+        if fails_here:
+            raise ValueError("bad o_proj view")
+        return "blk", []
+
+    collective = []
+    monkeypatch.setattr(blk, "_prepare", prepare)
+    monkeypatch.setattr(blk, "_build_prepared", lambda *args: collective.append(args))
+    votes = []
+
+    def agree(ok):
+        votes.append(ok)
+        return False  # the preparation failed here or on a peer
+
+    with pytest.raises(RuntimeError, match="this rank" if fails_here else "another TP rank"):
+        blk.build(None, {}, None, 3, (None, None), None, agree=agree)
+    assert votes == [not fails_here] and collective == []
+    votes.clear()
+    monkeypatch.setattr(blk, "_prepare", lambda *args: ("blk", []))
+    blk.build(None, {}, None, 3, (None, None), None, agree=lambda ok: votes.append(ok) or ok)
+    assert votes == [True] and len(collective) == 1
+
+
 def test_domain_tensor_crosses_the_locality_import(monkeypatch):
     """The DL = 1 build path reaches the family locality module: tp4_hoist_block.domain_tensor with a non-None
     LocalityMap imports kernels/m3ll/locality (a stub here, keyed by the module's real dotted name, which must be a file
     of this tree) and calls its _Mapping."""
-    import importlib.util
     import sys
     import types
 
@@ -395,22 +464,7 @@ def test_domain_tensor_crosses_the_locality_import(monkeypatch):
             ensure_pkg(".".join(parts[:k]))
     monkeypatch.setitem(sys.modules, loc_name, loc)
     monkeypatch.setattr(sys.modules[loc_name.rsplit(".", 1)[0]], "locality", loc, raising=False)
-    # seams imports the target's native ops and switch registry: stand-ins (no library, no environment read).
-    monkeypatch.setattr(sys.modules[TP4PKG], "native_ops", types.SimpleNamespace(), raising=False)
-    switches = types.ModuleType(f"{TP4PKG}.m31_switches")
-    switches.m31_disabled = lambda item_id: False
-    monkeypatch.setitem(sys.modules, switches.__name__, switches)
-    try:
-        import torch  # noqa: F401
-    except ImportError:
-        monkeypatch.setitem(sys.modules, "torch", types.ModuleType("torch"))
-    for sub in ("seams", "tp4_hoist_block"):
-        name = f"{hoist_pkg}.{sub}"
-        spec = importlib.util.spec_from_file_location(name, os.path.join(HOIST, sub + ".py"))
-        mod = importlib.util.module_from_spec(spec)
-        monkeypatch.setitem(sys.modules, name, mod)
-        spec.loader.exec_module(mod)
-    blk = sys.modules[f"{hoist_pkg}.tp4_hoist_block"]
+    blk = _load_hoist_block(monkeypatch)
     src = types.SimpleNamespace(numel=lambda: 1000, element_size=lambda: 1)
     with pytest.raises(Reached) as got:
         blk.domain_tensor(types.SimpleNamespace(granularity=2 << 20, device=0), src, 1, [])
@@ -491,6 +545,19 @@ def test_b2lag_switch_reaches_seam_7():
         assert scope["B2LAG_OFF"] is disabled
     registry = open(os.path.join(TP4, "m31_switches.py")).read()
     assert '"TP4WC_B2LAG":' in registry
+
+
+def test_ptrig_seam_keeps_the_developer_opt_in_off():
+    """Seam 10: the routing-warp host's producer-trigger opt-in is pinned off, so the block never reads it from the
+    process environment."""
+    tree = ast.parse(open(os.path.join(HOIST, "seams.py")).read())
+    stmts = {ast.unparse(n) for n in ast.walk(tree) if isinstance(n, ast.Assign)}
+    assert "dist_modules[1].ptrig_on = lambda: False" in stmts
+    (fn,) = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_dist_modules"]
+    second = ast.unparse(fn).split("import_module(")[2]
+    assert second.startswith("'.tp4c1.kernels.comm.allreduce_norm_quant.route_warp_tp4_host'"), (
+        second
+    )
 
 
 def test_engine_check_follows_the_b2lag_switch():

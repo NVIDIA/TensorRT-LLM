@@ -389,6 +389,7 @@ def _served_core():
         },
         moe_engines={},
         moe16_engines={},
+        tp4_moe_engine=modeling.TP4_MOE_ENGINE,
     )
     cls = modeling.MiniMaxM3Tp4ModelingV2
     for name in (

@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Dict, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
 import torch
 
@@ -246,18 +246,41 @@ class HoistBlock:
 
 
 def build(
-    env, w: dict, moe, i: int, mx_buffers: Tuple[torch.Tensor, torch.Tensor], locmap=None
+    env,
+    w: dict,
+    moe,
+    i: int,
+    mx_buffers: Tuple[torch.Tensor, torch.Tensor],
+    locmap=None,
+    agree: Optional[Callable[[bool], bool]] = None,
 ) -> HoistBlock:
     """Layer i's block (compiles on first use of each peer kernel config; MNNVL allocations are collective: call on
-    every TP rank in the same layer order, outside graph capture). ``env`` is ``seams.install``'s state."""
+    every TP rank in the same layer order, outside graph capture). ``env`` is ``seams.install``'s state. ``agree``
+    (whether a flag holds on every TP rank, one host collective) is called once after the rank-local preparation
+    (views, die-shard placement, scratch buffers), before the first collective of the stage builds: a preparation
+    that fails on one rank then raises on every rank instead of leaving its peers in a collective it never enters."""
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError("m31 tp4 hoist: build during graph capture")
-    from .tp4c1.families.moe import sht4_n48, sht4_n48_q
-    from .tp4c1.families.router import lr4_prr4, lr4_prr4_q
+    try:
+        prepared = _prepare(w, moe, i, mx_buffers, locmap)
+        err = None
+    except Exception as e:  # rank-local: a wrong shape, an allocation, a locality placement
+        prepared, err = None, e
+    if agree is not None and not agree(err is None):
+        raise RuntimeError(
+            f"m31 tp4 hoist L{i}: the block's preparation failed on "
+            + (f"this rank ({type(err).__name__}: {err})" if err is not None else "another TP rank")
+        ) from err
+    if err is not None:
+        raise err
+    blk, keep = prepared
+    return _build_prepared(env, i, blk, keep, locmap)
+
+
+def _prepare(w: dict, moe, i: int, mx_buffers: Tuple[torch.Tensor, torch.Tensor], locmap):
+    """The rank-local half of ``build`` (no collective): layer i's views, die shards and scratch rows: (blk, keep)."""
     from .tp4c1.kernels.moe.engine import expert_shards
-    from .tp4c1.kernels.moe.engine import router_hoist_host as hoist
     from .tp4c1.kernels.moe.router import fused_o_proj_tp4_host as ra4
-    from .tp4c1.runtime.ctx import BuildContext
 
     if (ra4.H, ra4.KO) != (H, KO):
         raise RuntimeError(
@@ -310,6 +333,16 @@ def build(
     )
     blk.h10_oq, blk.h10_osf = mx_buffers  # seam X1: the o_proj reads the LC's MXFP8 output in place
     expert_shards._st[id(mw)] = mw.shards
+    return blk, keep
+
+
+def _build_prepared(env, i: int, blk, keep: list, locmap) -> HoistBlock:
+    """The collective half of ``build``: the stage builds (MNNVL / Lamport allocations, object gathers)."""
+    from .tp4c1.families.moe import sht4_n48, sht4_n48_q
+    from .tp4c1.families.router import lr4_prr4, lr4_prr4_q
+    from .tp4c1.kernels.moe.engine import router_hoist_host as hoist
+    from .tp4c1.runtime.ctx import BuildContext
+
     stages = []
     with seams.no_jit(env.post, env.lamport):
         for variant, params in (

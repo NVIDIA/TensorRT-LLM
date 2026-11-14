@@ -144,7 +144,12 @@ def test_tp_agree_built_two_ranks(two_rank_comm, oks):
 def _core(fail: bool) -> SimpleNamespace:
     """The engine-building half of the core (``MiniMaxM3Tp4ModelingV2``) on one of two simulated TP ranks, its
     engine builds stubbed (and failing on one rank)."""
-    core = SimpleNamespace(mapping=_mapping(2), moe_engines={}, moe16_engines={})
+    core = SimpleNamespace(
+        mapping=_mapping(2),
+        moe_engines={},
+        moe16_engines={},
+        tp4_moe_engine=modeling.TP4_MOE_ENGINE,
+    )
     cls = modeling.MiniMaxM3Tp4ModelingV2
 
     def build(i, num_tokens, shared=True):

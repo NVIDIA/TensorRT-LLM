@@ -128,6 +128,7 @@ def _core(num_layers: int = 3, indexer_kv_dtype: str = "fp8", built=None, fail=F
         ),
         moe_engines={},
         moe16_engines={},
+        tp4_moe_engine=modeling.TP4_MOE_ENGINE,
         hoist_blocks={},
         projections=lambda: [],
     )
