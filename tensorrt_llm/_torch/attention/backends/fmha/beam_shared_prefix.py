@@ -459,13 +459,11 @@ def plan_step(metadata: "TrtllmAttentionMetadata") -> None:
             num_pages=int(pool.size(0)),
         )
         metadata.fmha_plan_caches[LIB_NAME] = state
-        max_seq_len = getattr(metadata, "max_seq_len", None)
-        if state.is_cuda_graph and max_seq_len and max_seq_len - 2 > state.config.max_tail:
-            logger.warning_once(
-                f"{LIB_NAME}: CUDA graphs are captured for beams that generate at most "
-                f"{state.config.max_tail} tokens ({MAX_TAIL_ENV}); a longer generation fails "
-                f"the step. Set {MAX_TAIL_ENV} to the largest max_tokens you serve (each extra "
-                "position costs a little per step).",
+        if state.is_cuda_graph:
+            logger.info_once(
+                f"{LIB_NAME}: CUDA graphs cover beams that have generated up to "
+                f"{state.config.max_tail} tokens ({MAX_TAIL_ENV}); set it to the largest "
+                "max_tokens served (each extra position costs a little per step).",
                 key=f"{LIB_NAME}_max_tail",
             )
     state.step_counter += 1
@@ -491,11 +489,15 @@ def plan_step(metadata: "TrtllmAttentionMetadata") -> None:
     prompt_lens = prompt_lens.clamp(min=1)
     if state.is_cuda_graph:
         if max_tail > state.config.max_tail:
+            # A captured graph cannot fall back to another kernel, and a longer tail would be
+            # silently truncated, so the step fails and names the request that caused it.
+            ids = metadata.request_ids
+            worst = num_ctx + int(tail_lens.argmax()) // beam_width
+            who = f" (request {ids[worst]})" if ids is not None and worst < len(ids) else ""
             raise RuntimeError(
-                f"beam_shared_prefix: a beam carries {max_tail} generated positions but "
-                f"CUDA graphs were captured for at most {state.config.max_tail}. Raise "
-                f"{MAX_TAIL_ENV} to the maximum number of generated tokens, or remove "
-                f"{LIB_NAME} from TLLM_FMHA_LIBS."
+                f"{LIB_NAME}: a beam has generated {max_tail} tokens{who} but CUDA graphs cover "
+                f"at most {state.config.max_tail}. Set {MAX_TAIL_ENV} to the largest max_tokens "
+                f"served, or remove {LIB_NAME} from TLLM_FMHA_LIBS."
             )
         tail_len = state.config.max_tail
     else:
@@ -855,10 +857,8 @@ class BeamSharedPrefixFmha(PhasedFmha):
         *,
         phase: Optional[FmhaPhase] = None,
     ) -> bool:
-        """Whether this forward can use the library; the plan itself is built in ``prepare``."""
+        """Whether this forward can use the library (instance-invariant checks only)."""
         if phase == FmhaPhase.CONTEXT:
-            return False
-        if not metadata_eligible(metadata):
             return False
         if metadata.num_contexts > 0 and not self._context_impl.is_supported(
             q, k, v, metadata, forward_args, phase=FmhaPhase.CONTEXT
@@ -888,10 +888,8 @@ class BeamSharedPrefixFmha(PhasedFmha):
         # One query token per beam row.
         if q.shape[0] - metadata.num_ctx_tokens != metadata.num_generations:
             return False
-        state = metadata.fmha_plan_caches.get(LIB_NAME)
-        if state is None or state.plan is None:
-            # prepare() did not plan this step (see metadata_eligible).
-            return False
+        # Beam width and the step plan are not part of the manager's selection-cache key, so they
+        # must not decide the answer; ``run_generation`` runs the regular kernel on an unplanned step.
         return True
 
     def _refresh_manager(self, metadata: "TrtllmAttentionMetadata") -> None:
