@@ -121,20 +121,16 @@ l0_b200:
   - test_e2e.py::test_ptp_quickstart_advanced_mtp_eagle[DeepSeek-V3-Lite-BF16-DeepSeek-V3-Lite/bf16]
   - test_e2e.py::test_openai_chat_guided_decoding[openai/gpt-oss-120b]
   - test_e2e.py::test_openai_multi_frontend
-  # Covers the GPU cases of tests/unittest/_torch/attention/ on B200, except the paths
-  # ignored below; its cpu_only cases run on CPU (l0_cpu). kernels/ has no entry of its own
-  # on any list, so apart from kernels/parallel_hw_agnostic/ this entry is what runs it
-  # here. multi_gpu/ is excluded; distributed cases run on l0_gb300_multi_gpus
-  # (post_merge) and l0_dgx_b300, which runs test_helix_zero_kv.py in pre_merge and
-  # the rest in post_merge. Single-GPU Helix checks live directly under attention/.
-  # - kernels/parallel_hw_agnostic/ is ignored: its cases do not depend on the GPU
-  #   architecture, so its GPU cases run on H100 (l0_h100) and its cpu_only ones on CPU
-  #   (l0_cpu). GB300 (l0_gb300_multi_gpus, post_merge) also runs the GPU cases; it is
-  #   the only Blackwell stage that does.
-  # - The other files ignored here have their own entries below.
-  - unittest/_torch/attention --ignore=unittest/_torch/attention/multi_gpu --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py --ignore=unittest/_torch/attention/sparse/msa/test_minimax_m3_sparse_attn_decode.py --ignore=unittest/_torch/attention/sparse/msa/test_msa_proxy_split.py --ignore=unittest/_torch/attention/sparse/deepseek_v4/test_prims_ts_sparse_mla_fmha.py --ignore=unittest/_torch/attention/kernels/parallel_hw_agnostic TIMEOUT (90)
+  # Four disjoint attention batches use the default per-entry timeout.
+  # cpu_only cases run on CPU; distributed suites remain on the multi-GPU lists.
+  # kernels/parallel_hw_agnostic GPU cases run on H100 and GB300.
+  # The excluded sparse files have separate entries below.
+  - unittest/_torch/attention --ignore=unittest/_torch/attention/multi_gpu --ignore=unittest/_torch/attention/sparse --ignore=unittest/_torch/attention/kernels/parallel_hw_agnostic
+  - unittest/_torch/attention/sparse/dsa
+  - unittest/_torch/attention/sparse/deepseek_v4 --ignore=unittest/_torch/attention/sparse/deepseek_v4/test_prims_ts_sparse_mla_fmha.py
+  - unittest/_torch/attention/sparse --ignore=unittest/_torch/attention/sparse/dsa --ignore=unittest/_torch/attention/sparse/deepseek_v4 --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py --ignore=unittest/_torch/attention/sparse/msa/test_minimax_m3_sparse_attn_decode.py --ignore=unittest/_torch/attention/sparse/msa/test_msa_proxy_split.py
   - unittest/_torch/pyexecutor/kv_cache/test_mixed_precision_kv_cache.py
-  # Keep cold-JIT MSA coverage out of the 90-minute attention aggregate.
+  # Run cold-JIT MSA coverage separately from the other attention batches.
   # Cold-JIT runs take about 25 minutes; allow a 45-minute budget.
   - unittest/_torch/attention/sparse/msa/test_minimax_m3_sparse_attn_decode.py TIMEOUT (45)
   - unittest/_torch/attention/sparse/msa/test_msa_proxy_split.py
