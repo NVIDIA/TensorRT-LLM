@@ -1266,7 +1266,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         return not (req.context_current_position > 0 and req.context_remaining_length <= threshold)
 
     def _defer_long_context(self, pending_ctx: RequestList) -> tuple[RequestList, set[int]]:
-        """Move long requests to the tail of this iteration's context order.
+        """Move long requests to the tail of this iteration's context order,
+        and hold requests without an estimate behind started demoted prefills.
 
         Returns the new order and the ids demoted. With exact demotion also
         records which requests were kept on the estimate alone (see
@@ -1300,7 +1301,37 @@ class KVCacheV2Scheduler(RequestScheduler):
             ):
                 self._ctx_unverified_short.add(req.py_request_id)
             keep.append(req)
-        return keep + deferred, {req.py_request_id for req in deferred}
+        demoted = {req.py_request_id for req in deferred}
+        # A request without an estimate is of unknown length. Ahead of a
+        # demoted prefill that has started, it could start a prefill of any
+        # size; once the started one aged out and took the budget back, it
+        # would be parked mid-prefill with its pages held, and with a cache
+        # tier below the GPU neither can be preempted. So one that has not
+        # started yet waits behind the started demoted prefills that arrived
+        # before it, at most until they finish; requests known to be short
+        # still go first. The demoted requests keep their arrival order and
+        # the held ones go right after the last started one.
+        started = [i for i, req in enumerate(deferred) if self._started_context(req)]
+        if started:
+            arrival = {req.py_request_id: i for i, req in enumerate(pending_ctx)}
+            first = arrival[deferred[started[0]].py_request_id]
+            last = started[-1]
+            held = [
+                req
+                for req in keep
+                if req.py_uncached_prefill_tokens is None
+                and arrival[req.py_request_id] > first
+                and not self._started_context(req)
+            ]
+            if held:
+                held_ids = {req.py_request_id for req in held}
+                keep = [req for req in keep if req.py_request_id not in held_ids]
+                return keep + deferred[: last + 1] + held + deferred[last + 1 :], demoted
+        return keep + deferred, demoted
+
+    def _started_context(self, req: LlmRequest) -> bool:
+        """Whether *req* has begun its prefill, so that parking it would hold its pages."""
+        return req.context_current_position > 0 or self._holds_context_cache(req)
 
     # ---- Shortest-uncached-first context order ----
 

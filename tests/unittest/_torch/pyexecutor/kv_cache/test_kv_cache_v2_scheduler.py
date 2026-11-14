@@ -5972,6 +5972,79 @@ class TestLongContextDemotionExact:
         # Only the pass that kept it waiting counts a prefix wait.
         mgr.count_prefix_waits.assert_called_once_with(1)
 
+    @pytest.mark.parametrize("on_crumbs", [False, True])
+    @pytest.mark.parametrize("exact", [True, False])
+    def test_request_without_estimate_waits_behind_a_started_demoted_prefill(
+        self, exact, on_crumbs
+    ):
+        """A request without an estimate does not overtake a demoted prefill that
+        has started, alone or on the budget a short request left. Otherwise it
+        runs ahead, the started one ages out of the demotion and, being older,
+        takes the budget back, and the overtaker is left parked mid-prefill
+        holding its pages: two started prefills that the pool cannot hold
+        together, neither of which can be suspended or preempted, stall the
+        scheduler until the deadlock detector raises."""
+        sched, mgr = self._make(
+            exact=exact, context_demote_max_iters=8, enable_recompute_pause=False
+        )
+        capacity, held = 12_000, {}
+
+        def resize(req, num_tokens):
+            if sum(held.values()) + num_tokens > capacity:
+                return False  # out of pages; a started chunk is not suspended
+            held[req.py_request_id] = held.get(req.py_request_id, 0) + num_tokens
+            return True
+
+        def free(req):
+            held.pop(req.py_request_id, None)
+            mgr.kv_cache_map.pop(req.py_request_id, None)
+
+        mgr.resize_context.side_effect = resize
+        mgr.free_resources.side_effect = free
+        older = self._req(0, 8_000, 8_000)  # long by its estimate
+        newer = self._req(1, 8_000, None)  # no estimate: never long
+        for req in (older, newer):
+            req.is_last_context_chunk = False
+        short = self._req(2, 512, 512)  # known short: runs ahead of `older`
+        active = [older, short] if on_crumbs else [older]
+
+        def run_iteration():
+            out = sched.schedule_request(list(active), set())
+            for req in out.context_requests:
+                req.context_current_position += req.context_chunk_size
+                req.context_remaining_length -= req.context_chunk_size
+                req.is_first_context_chunk = False
+                req.is_last_context_chunk = req.context_remaining_length <= 1024
+                if req.context_remaining_length == 0:
+                    active.remove(req)
+                    free(req)
+            return ids(out.context_requests)
+
+        # `older` starts while demoted: alone, or on what the short request leaves.
+        assert sorted(run_iteration()) == ([0, 2] if on_crumbs else [0])
+        active.append(newer)
+        order = [run_iteration() for _ in range(64) if active]
+        assert not active, f"both prefills should finish; order {order}"
+        # The started prefill keeps its place: the newer request takes only the
+        # budget its last chunk leaves.
+        last_older = max(i for i, scheduled in enumerate(order) if 0 in scheduled)
+        assert order[:last_older] == [[0]] * last_older, order
+
+    @pytest.mark.parametrize("exact", [True, False])
+    def test_held_request_goes_after_the_last_started_demoted_prefill(self, exact):
+        """Known-short requests first, then the demoted ones in arrival order,
+        with a not-yet-started request without an estimate right after the last
+        started demoted prefill that arrived before it."""
+        sched, _ = self._make(exact=exact)
+        unstarted = self._req(0, 8_000, 8_000)
+        started = self._req(1, 8_000, 8_000)
+        started.context_current_position = 1024
+        no_estimate = self._req(2, 4_000, None)
+        short = self._req(3, 512, 512)
+        order, demoted = sched._defer_long_context([unstarted, started, no_estimate, short])
+        assert ids(order) == [3, 0, 1, 2]
+        assert demoted == {0, 1}  # the held request is not demoted: it does not age
+
 
 class TestLongContextDemotion:
     """TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS: a request whose router estimate of
