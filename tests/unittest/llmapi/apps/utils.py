@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,6 +21,8 @@ from typing import Any, Callable
 import pytest
 import requests
 import yaml
+from test_common.http_utils import \
+    wait_for_endpoint_down as wait_for_endpoint_down
 
 from ..test_llm import get_model_path
 from .openai_server import RemoteOpenAIServer
@@ -278,17 +280,3 @@ def wait_for_endpoint_ready(url: str, timeout: int = 300, interval: int = 3):
                 return
         except Exception as err:
             print(f"endpoint {url} is not ready, with exception: {err}")
-
-
-def wait_for_endpoint_down(url: str, timeout: int = 300):
-    start = time.monotonic()
-    while time.monotonic() - start < timeout:
-        try:
-            if requests.get(url).status_code >= 100:
-                print(
-                    f"endpoint {url} returned status code {requests.get(url).status_code}"
-                )
-                time.sleep(1)
-        except Exception as err:
-            print(f"endpoint {url} is down, with exception: {err}")
-            return
