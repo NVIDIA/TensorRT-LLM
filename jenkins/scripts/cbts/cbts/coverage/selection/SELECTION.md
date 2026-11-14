@@ -280,10 +280,10 @@ stages finish, it uploads `cbts_pystart_report_x86_64.tar.gz` and
 ```
 run Tier 1                                      → Tier-2 residual paths
 GitHub compare main...<PR head>                 → PR base commit
-GET Artifactory pin at <PR number>/<PR head>:
-   200                                           → reuse its coverage build
-   404                                           → resolve the newest build below
-   other / malformed                             → decline Tier 2
+read helper, pin at <PR number>/<PR head>:
+   read                                          → reuse its coverage build
+   absent from both locations                    → resolve the newest build below
+   refused / failed in transfer / malformed      → decline Tier 2
 when no pin:
    Jenkins REST lastBuild                        → newest build number N
    for b in N .. N-49:                            (_MAX_PROBE)
@@ -306,8 +306,10 @@ The pin lives under
 pin and therefore receives the freshest complete pair available at its first CBTS run. Repeated
 `/bot run` commands for the same head reuse that build even after newer post-merge DBs appear.
 `artifact.py --resolve-pin` owns pin lookup, schema validation, build selection, local pin
-creation, and fail-closed reasons. Groovy only supplies PR identity and uses Jenkins'
-authenticated artifact uploader when Python reports `pin_upload_required`. Lookup, validation,
+creation, and fail-closed reasons. It reads the pin with the read helper
+(`jenkins/scripts/fetch_build_artifact.sh`), as it reads the tarballs. Groovy only supplies PR
+identity and uses Jenkins' authenticated artifact uploader when Python reports
+`pin_upload_required`. Lookup, validation,
 and first-write upload fail closed; CBTS never silently substitutes a newer build when a pin
 cannot be read or written. Preparation also verifies that the pinned build's `build_info.txt`
 still names the commit recorded in the pin, so an overwritten or corrupted build cannot silently

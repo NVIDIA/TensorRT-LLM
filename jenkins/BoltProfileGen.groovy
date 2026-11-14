@@ -49,10 +49,8 @@ withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LL
 LLM_ROOT = "llm"
 
 // Input tarball location (passed from the parent via artifactPath, same as
-// Build/L0_Test). The promoted bundle goes to a stable BRANCH-keyed path on
-// URM_ARTIFACTORY_BASE (PROFILE_PROMOTE_DIR below).
+// Build/L0_Test).
 ARTIFACT_PATH = env.artifactPath ? env.artifactPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
-URM_ARTIFACTORY_BASE = "https://urm.nvidia.com/artifactory"
 
 // Build artifacts (build_info.txt, packaged builds, waive_list/) are published to the
 // primary location and read from it first; LLM_ARTIFACTS_PRIMARY ("aws", the default, or "urm")
@@ -103,6 +101,23 @@ def llmArtifactsUrl(String location, String legacyPath)
     return "${LLM_ARTIFACTS_LOCATIONS[location].root}/${llmArtifactsRepoPath(location, legacyPath)}"
 }
 
+// The host name of a location, as a netrc machine entry and curl name it.
+def llmArtifactsHost(String location)
+{
+    return LLM_ARTIFACTS_LOCATIONS[location].root.replaceFirst(/^[a-z]+:\/\//, "").replaceFirst(/[:\/].*$/, "")
+}
+
+// The link to an output that people open in a browser. artifactory.nvidia.com answers a direct
+// link from a browser with a password prompt, so its links open the native browser, which signs
+// people in with the company sign-in; urm serves direct links.
+def llmArtifactsBrowseUrl(String location, String legacyPath)
+{
+    if (location == "aws") {
+        return "https://${llmArtifactsHost('aws')}/ui/native/${llmArtifactsRepoPath('aws', legacyPath)}"
+    }
+    return llmArtifactsUrl(location, legacyPath)
+}
+
 X86_64_TRIPLE = "x86_64-linux-gnu"
 AARCH64_TRIPLE = "aarch64-linux-gnu"
 
@@ -129,10 +144,10 @@ BRANCH        = params.branch       ?: (env.gitlabTargetBranch ?: "main")
 SLURM_PLATFORM= params.slurmPlatform?: (TARGET_ARCH == AARCH64_TRIPLE ? "gb300-flex-oci-jhb" : "")
 BOLT_TARNAME  = params.boltTarName  ?: (TARGET_ARCH == AARCH64_TRIPLE ? "TensorRT-LLM-GH200.tar.gz" : "TensorRT-LLM.tar.gz")
 NUM_NODES     = params.numNodes     ?: "2"   // legacy single-workload wiring (unused by fan-out)
-// promote: publish the packaged bundle to the branch-keyed Artifactory path
-// (PROFILE_PROMOTE_DIR) as both a versioned copy and latest.tar.gz. Default OFF
-// (opt-in): the postmerge trigger sets promote=true; the premerge "generate +
-// consume without promoting" override leaves it false. See promoteBundle().
+// promote: publish the packaged bundle to the branch-keyed Artifactory path as
+// both a versioned copy and latest.tar.gz. Default OFF (opt-in): the postmerge
+// trigger sets promote=true; the premerge "generate + consume without
+// promoting" override leaves it false. See promoteBundle().
 PROMOTE       = (params.promote ?: "false").toString()
 // applyProfiles: after merge, re-BOLT the input tarball with the just-generated
 // bundle -> bolted tarball on the cluster ("consume immediately after generating").
@@ -156,15 +171,6 @@ PUBLISH_BOLTED_CANONICAL = (params.boltPublishCanonical ?: env.boltPublishCanoni
 BOLT_ITER_MULT = (params.boltIterMult ?: env.boltIterMult ?: "64").toString()
 
 TRIPLE = TARGET_ARCH
-
-// Branch-keyed Artifactory dir the packaged bundle is promoted to, and that
-// premerge consumption (apply_latest.sh -> artifactory.sh pull-latest) reads
-// back. MUST stay identical to promote_dir() in scripts/bolt/internal/
-// artifactory.sh -- "<REPO>/<PREFIX>/<branch>/<triple>" with the same defaults
-// (BOLT_ARTIFACTORY_REPO, BOLT_PROFILE_PREFIX) -- or promote writes somewhere
-// pull-latest never looks. Combined with URM_ARTIFACTORY_BASE above, this
-// reproduces the URL cmd_pull_latest builds.
-PROFILE_PROMOTE_DIR = "sw-tensorrt-generic/llm-artifacts/bolt-profiles/${BRANCH}/${TRIPLE}"
 
 // SLURM states in which the job is still alive, i.e. no terminal verdict yet.
 // COMPLETING (CG) is the one that bites: the tasks have exited but slurmctld is
@@ -339,7 +345,8 @@ def bashRemoteScriptFile(pipeline, remote, String script, String localPath, Stri
 def submitProfileGen(pipeline, String readHelper)
 {
     // The tarball to profile. The primary location is resolved once here and used
-    // both to read it and to publish the BOLTed build back.
+    // to read it, to promote the profile bundle, and to publish the BOLTed build
+    // back.
     def primary = llmArtifactsPrimary()
     pipeline.echo("Input tarball: ${llmArtifactsLayoutPath(ARTIFACT_PATH)}/${BOLT_TARNAME} (read from ${primary} first)")
 
@@ -403,6 +410,8 @@ def submitProfileGen(pipeline, String readHelper)
         // Credentials come only from FETCH_NETRC, which the tarball stage sets for
         // a URL on the aws location, so the llvm-bolt download stays anonymous. curl
         // applies a netrc entry only to the host it names, so the CDN never gets them.
+        // Each curl call starts with -q, which keeps curl from reading a curlrc: one
+        // could turn on output that shows the Authorization header or a signed URL.
         def boltFetchLib = '''
             _verify_txz() { tar -tJf "$1" >/dev/null 2>&1; }
             # _bolt_range_download URL DEST PARTS -> 0 if the whole file was fetched
@@ -413,7 +422,7 @@ def submitProfileGen(pipeline, String readHelper)
                 # HEAD (not a ranged GET) so a server that ignores Range can't make
                 # us stream the whole file just to probe; -L follows the redirect to
                 # the storage/CDN backend; || true so a probe miss doesn't trip set -e.
-                hdr=$(curl -fsSL -I --retry 5 --retry-all-errors ${FETCH_NETRC:+--netrc-file "$FETCH_NETRC"} \\
+                hdr=$(curl -q -fsSL -I --retry 5 --retry-all-errors ${FETCH_NETRC:+--netrc-file "$FETCH_NETRC"} \\
                           "$url" 2>/dev/null | tr -d '\\r' || true)
                 total=$(printf '%s\\n' "$hdr" | awk 'tolower($1)=="content-length:"{v=$2} END{print v}')
                 accept=$(printf '%s\\n' "$hdr" | awk 'tolower($1)=="accept-ranges:"{v=tolower($2)} END{print v}')
@@ -434,7 +443,7 @@ def submitProfileGen(pipeline, String readHelper)
                 # (xargs -n 3); URL/DEST/NETRC come from the inline-exported environment.
                 if ! BOLT_FETCH_URL="$url" BOLT_FETCH_DEST="$dest" BOLT_FETCH_NETRC="${FETCH_NETRC:-}" \\
                      xargs -P "$parts" -n 3 bash -c '
-                         curl -fsSL --retry 10 --retry-all-errors --retry-delay 5 \\
+                         curl -q -fsSL --retry 10 --retry-all-errors --retry-delay 5 \\
                               ${BOLT_FETCH_NETRC:+--netrc-file "$BOLT_FETCH_NETRC"} \\
                               -r "$1-$2" -o "$BOLT_FETCH_DEST.part.$0" "$BOLT_FETCH_URL"
                      ' < "$ranges"; then
@@ -472,7 +481,7 @@ def submitProfileGen(pipeline, String readHelper)
                 local url="$1" dest="$2" out rc=0
                 shift 2
                 rm -f "$dest"
-                out=$(curl -sSL --connect-timeout 60 --speed-time 120 --speed-limit 10000 \\
+                out=$(curl -q -sSL --connect-timeout 60 --speed-time 120 --speed-limit 10000 \\
                            ${FETCH_NETRC:+--netrc-file "$FETCH_NETRC"} "$@" \\
                            -w '%{http_code} %{url_effective}' -o "$dest" "$url") || rc=$?
                 BOLT_STATUS=${out%% *}
@@ -750,7 +759,7 @@ def submitProfileGen(pipeline, String readHelper)
         // retention delete below: promote first, then reclaim scratch.
         if (PROMOTE == "true") {
             stage("Promote") {
-                promoteBundle(pipeline, remote, bundle)
+                promoteBundle(pipeline, remote, bundle, primary, localScriptDir)
             }
         } else {
             pipeline.echo("PROMOTE=false: skipping Artifactory promote of ${bundle}")
@@ -942,67 +951,163 @@ def logSlurmJobTiming(pipeline, remote, String jobId, String label)
 }
 
 // ---------------------------------------------------------------------------
-// Promote the produced bundle to the branch-keyed Artifactory path so premerge
-// can pull `latest` (apply_latest.sh). Runs CLUSTER-SIDE: the frontend already
-// reaches Artifactory (it pulled the input tarball), and there is no BSL
-// remote->agent download primitive, so uploading in place avoids copying the
-// bundle back to the agent just to re-upload it.
+// Promote the produced bundle to the BOLT profile store, the branch-keyed path
+// that premerge pulls `latest` from (apply_latest.sh): the versioned bundle,
+// then latest.tar.gz. Runs CLUSTER-SIDE: the frontend already reaches
+// Artifactory (it pulled the input tarball), and there is no BSL remote->agent
+// download primitive, so uploading in place avoids copying the bundle back to
+// the agent just to re-upload it.
 //
-// Auth: the urm-artifactory-creds Jenkins credential (username/password). The
+// `primary` is the primary location ("aws" or "urm"). It gets the required copy:
+// a failed request there fails the promotion, and a 401 or 403 names the
+// credential. While aws is the primary, urm gets a replica afterwards; a failed
+// request there is logged with its HTTP status and changes nothing else, since
+// readers ask aws first.
+//
+// Auth: the publishing credential of each location (username/password). A
 // credential MUST NOT be Groovy-interpolated into the script: Utils.exec passes
 // the script to pipeline.sh (which echoes it) and, on any retryable failure,
-// hands the same string to _postExecNVDFEvent, which uploads it to NVDF. Jenkins
-// masks the literal secret in console output, but this script is base64'd for
-// the remote shell, and a base64 blob is not the literal -- so masking would not
-// apply and the value would be recoverable from the build log and the telemetry
-// record.
+// hands the same string to _postExecNVDFEvent, which uploads it to NVDF, and
+// the remote script stays on the cluster as a file.
 //
-// So the credential stays a SHELL variable: printf runs on the agent, where
-// withCredentials has bound $ART_USER/$ART_PASS, and only the rendered netrc
-// travels -- over ssh stdin, which the remote script reads with `cat`. The
-// script string therefore contains the literal text "$ART_PASS", never its
-// value. printf is a shell builtin and the values are %s arguments rather than
+// So the credentials stay SHELL variables: printf runs on the agent, where
+// withCredentials has bound them, and only the rendered netrc travels -- over
+// ssh stdin, which the remote script reads with `cat`. The netrc holds one
+// entry for each location's host, and curl applies an entry only to the host it
+// names. printf is a shell builtin and the values are %s arguments rather than
 // part of the format string, so there is no `ps` exposure and no risk of a `%`
 // in the password being read as a format specifier. noNVDFEvent is belt and
 // braces for the telemetry path.
 //
 // Note this relies on sshUserCmd forwarding stdin (it does not pass ssh -n);
 // the same "pipe into sshUserCmd" idiom is used inside the shared lib itself.
+// The script goes to the cluster as a file (bashRemoteScriptFile), written
+// first under localScriptDir on the agent.
 // ---------------------------------------------------------------------------
-def promoteBundle(pipeline, remote, String bundle)
+def promoteBundle(pipeline, remote, String bundle, String primary, String localScriptDir)
 {
     def bundleName = bundle.tokenize('/').last()
-    def base = "${URM_ARTIFACTORY_BASE}/${PROFILE_PROMOTE_DIR}"
-    def host = URM_ARTIFACTORY_BASE.replaceFirst(/^https?:\/\//, "").tokenize('/').first()
+    // The store's directory as a legacy path: urm's repository name and the path
+    // below it. No request carries it as written: llmArtifactsUrl maps it to each
+    // location by putting that location's repository in the name's place.
+    // pull-latest and resolve-latest in scripts/bolt/internal/artifactory.sh give
+    // the read helper the same path, so the two MUST stay identical, or promote
+    // writes somewhere the readers never look.
+    def promoteDir = "sw-tensorrt-generic/llm-artifacts/bolt-profiles/${BRANCH}/${TRIPLE}"
+    def layoutDir = llmArtifactsLayoutPath(promoteDir)
+    // The targets rule of the other pipeline files (llmArtifactsTargets there):
+    // the primary is the required copy, and urm is a replica while aws is the
+    // primary. A rollback to urm has no replica.
+    def locations = primary == "aws" ? ["aws", "urm"] : ["urm"]
     def netrc = "${bundle}.netrc"
-    pipeline.echo("Promoting ${bundleName} -> ${PROFILE_PROMOTE_DIR}/ (versioned + latest)")
-    // Remote side: no credential anywhere in here, just "read it from stdin".
-    // Clean up via trap, not a trailing rm: under `set -e` a failed curl exits
-    // before the rm and would leave the plaintext netrc on shared scratch until
-    // the 7-day retention purge. umask covers the window before the chmod.
+    def response = "${bundle}.response"
+    pipeline.echo("Promoting ${bundleName} -> ${layoutDir}/ (versioned + latest) on ${locations.join(' and ')}")
+
+    // For each location, the required copy first: its part of the remote script,
+    // its credential binding, and its netrc entry.
+    def uploads = ""
+    def bindings = []
+    def netrcEntries = []
+    for (location in locations) {
+        def base = llmArtifactsUrl(location, promoteDir)
+        def host = base.replaceFirst(/^https?:\/\//, "").tokenize('/').first()
+        def repo = LLM_ARTIFACTS_LOCATIONS[location].repo
+        def credentialId = LLM_ARTIFACTS_LOCATIONS[location].credential
+        def userVariable = "ART_USER_" + location.toUpperCase()
+        def passwordVariable = "ART_PASS_" + location.toUpperCase()
+        def binding = pipeline.usernamePassword(credentialsId: credentialId,
+            usernameVariable: userVariable, passwordVariable: passwordVariable)
+        if (location != primary) {
+            // A replica whose credential cannot be bound is left out, so that it cannot keep
+            // the required copy from being promoted.
+            try {
+                pipeline.withCredentials([binding]) {}
+            } catch (InterruptedException e) {
+                throw e
+            } catch (Exception e) {
+                pipeline.echo("[WARNING] credential '${credentialId}' could not be bound (${e}); " +
+                    "${host} holds a replica, so the promotion goes on without it.")
+                continue
+            }
+        }
+        // Only a failure of the required copy ends the script.
+        def onFailure = "echo \"[WARNING] \$PROMOTE_FAILURE ${host} holds a replica, so the promotion stands.\" >&2"
+        if (location == primary) {
+            onFailure = "echo \"[ERROR] \$PROMOTE_FAILURE\" >&2; exit 1"
+        }
+        uploads += """
+            if promote_to '${host}' '${repo}' '${credentialId}' '${base}'; then
+                echo "[INFO] promoted ${bundleName} and latest.tar.gz on ${host}"
+            else
+                ${onFailure}
+            fi
+        """.stripIndent()
+        bindings.add(binding)
+        // The two variables are left for the agent's shell to expand.
+        netrcEntries.add("printf 'machine %s login %s password %s\\n' '${host}' \"\$${userVariable}\" \"\$${passwordVariable}\"")
+    }
+
+    // Remote side: no credential anywhere in here, just "read the netrc from
+    // stdin". Clean up via trap, not a trailing rm: under `set -e` a failed
+    // command exits before the rm and would leave the plaintext netrc on shared
+    // scratch until the 7-day retention purge. umask covers the window before
+    // the chmod.
     def promote = """
         set -e
         umask 077
-        trap 'rm -f "${netrc}"' EXIT
+        trap 'rm -f "${netrc}" "${response}"' EXIT
+        test -f "${bundle}" || { echo "[ERROR] bundle missing: ${bundle}" >&2; exit 1; }
         cat > "${netrc}"
         chmod 600 "${netrc}"
-        curl -fsS --netrc-file "${netrc}" --retry 5 --retry-all-errors -T "${bundle}" "${base}/${bundleName}"
-        # Matrix parameters label latest.tar.gz with the ref it now points at, so a
-        # consumer can resolve "which bundle is current" with a small metadata GET
-        # instead of downloading the bundle to read its manifest. Set in the SAME
-        # request as the upload, so the label and the bytes can never disagree --
-        # a separate pointer object would leave a window where they do.
-        curl -fsS --netrc-file "${netrc}" --retry 5 --retry-all-errors -T "${bundle}" \\
-             "${base}/latest.tar.gz;bolt.ref=${BOLT_REF};bolt.branch=${BRANCH};bolt.triple=${TRIPLE}"
-    """.stripIndent()
-    pipeline.withCredentials([pipeline.usernamePassword(credentialsId: 'urm-artifactory-creds',
-            usernameVariable: 'ART_USER', passwordVariable: 'ART_PASS')]) {
-        // \$ART_USER / \$ART_PASS are left for the agent's shell to expand.
-        def feed = "printf 'machine ${host} login %s password %s\\n' \"\$ART_USER\" \"\$ART_PASS\" | "
+        # http_status CURL_ARGS...: print the final HTTP status of one request (000
+        # if no response arrived). -q comes first: it keeps curl from reading a
+        # curlrc, which could turn on output that shows the Authorization header.
+        # Without -f, curl retries connection errors and transient statuses (408,
+        # 429, 5xx) but returns a 401/403 at once. The body goes to a regular
+        # file: curl cannot retry a transfer whose output it cannot truncate,
+        # such as /dev/null.
+        http_status() {
+            curl -q -sS --netrc-file "${netrc}" --retry 5 --retry-all-errors --connect-timeout 30 \\
+                 -o "${response}" -w '%{http_code}' "\$@" || true
+        }
+        # upload TARGET PERMISSION: put the bundle at TARGET under PROMOTE_BASE.
+        # Returns 1 when the request fails, with the reason in PROMOTE_FAILURE; a
+        # 401 or 403 names the credential and PERMISSION, which the request needs.
+        upload() {
+            local name="\${1%%;*}" status
+            status=\$(http_status --speed-time 300 --speed-limit 1024 -T "${bundle}" "\$PROMOTE_BASE/\$1")
+            case "\$status" in
+                2??) return 0 ;;
+                401|403) PROMOTE_FAILURE="\$PROMOTE_HOST rejected the credentials for ${layoutDir}/\$name (HTTP \$status): the Artifactory access token in credential '\$PROMOTE_CREDENTIAL' needs renewal or lacks \$2 permission on \$PROMOTE_REPO." ;;
+                *) PROMOTE_FAILURE="The request for ${layoutDir}/\$name on \$PROMOTE_HOST failed (HTTP \$status)." ;;
+            esac
+            return 1
+        }
+        # promote_to HOST REPO CREDENTIAL BASE: upload the versioned bundle to the
+        # location, then latest.tar.gz, and stop at the first request that fails.
+        # Matrix parameters label latest.tar.gz with the ref it now points at, so
+        # a consumer can resolve "which bundle is current" with a small metadata
+        # GET instead of downloading the bundle to read its manifest. Set in the
+        # SAME request as the upload, so the label and the bytes can never
+        # disagree -- a separate pointer object would leave a window where they
+        # do. Either upload can replace a file, which takes delete permission.
+        promote_to() {
+            PROMOTE_HOST="\$1" PROMOTE_REPO="\$2" PROMOTE_CREDENTIAL="\$3" PROMOTE_BASE="\$4"
+            upload "${bundleName}" "deploy or delete" \\
+                && upload "latest.tar.gz;bolt.ref=${BOLT_REF};bolt.branch=${BRANCH};bolt.triple=${TRIPLE}" \\
+                          "deploy, annotate, or delete"
+        }
+    """.stripIndent() + uploads
+    def runPromote = bashRemoteScriptFile(pipeline, remote, promote,
+        "${localScriptDir}/promote_bundle.sh", "${bundle}.promote.sh")
+    pipeline.withCredentials(bindings) {
+        // set +x keeps the printf arguments out of the step's trace.
+        def feed = "set +x\n{ ${netrcEntries.join('; ')}; } | "
         Utils.exec(pipeline, timeout: false, numRetries: 2, noNVDFEvent: true,
-            script: feed + Utils.sshUserCmd(remote, b64BashRemoteCmdStdin(promote, "${bundle}.promote.sh")))
+            script: feed + Utils.sshUserCmd(remote, runPromote))
     }
-    pipeline.echo("Promoted. latest = ${base}/latest.tar.gz (bolt.ref=${BOLT_REF})")
+    def latestLink = llmArtifactsBrowseUrl(primary, "${promoteDir}/latest.tar.gz")
+    pipeline.echo("Promoted. latest = ${latestLink} (bolt.ref=${BOLT_REF})")
 }
 
 // ---------------------------------------------------------------------------
@@ -1049,12 +1154,14 @@ def publishBoltedCanonical(pipeline, remote, String boltedLocal, String unbolted
         cat > "${netrc}"
         chmod 600 "${netrc}"
         # http_status CURL_ARGS...: print the final HTTP status of one request (000
-        # if no response arrived). Without -f, curl retries connection errors and
-        # transient statuses (408, 429, 5xx) but returns a 401/403 at once. The
-        # body goes to a regular file: curl cannot retry a transfer whose output
-        # it cannot truncate, such as /dev/null.
+        # if no response arrived). -q comes first: it keeps curl from reading a
+        # curlrc, which could turn on output that shows the Authorization header.
+        # Without -f, curl retries connection errors and transient statuses (408,
+        # 429, 5xx) but returns a 401/403 at once. The body goes to a regular
+        # file: curl cannot retry a transfer whose output it cannot truncate,
+        # such as /dev/null.
         http_status() {
-            curl -sS --netrc-file "${netrc}" --retry 5 --retry-all-errors --connect-timeout 30 \\
+            curl -q -sS --netrc-file "${netrc}" --retry 5 --retry-all-errors --connect-timeout 30 \\
                  -o "${response}" -w '%{http_code}' "\$@" || true
         }
         # fail_status NAME STATUS: report the failed request for NAME and exit.

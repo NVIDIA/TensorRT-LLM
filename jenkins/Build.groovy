@@ -826,8 +826,9 @@ def applyLatestBolt(pipeline, tarName, is_linux_x86_64, artifacts=null)
     def branch = BOLT_PINNED_BRANCH ?: (env.gitlabTargetBranch ?: env.branch_name ?: "main")
     def triple = is_linux_x86_64 ? "x86_64-linux-gnu" : "aarch64-linux-gnu"
     // An architecture outside the parent's consume scope has nothing to apply, so
-    // stop before staging llvm-bolt and discovering that over a retried 404. Only
-    // aarch64 has a profile producer today, and this job runs for both.
+    // stop before staging llvm-bolt and asking the profile store for a bundle that
+    // is not there. Only aarch64 has a profile producer today, and this job runs
+    // for both.
     //
     // The scope is its own fact, not something read off the pin: an unresolvable
     // pin is deliberately non-fatal, so deciding the architecture from the pin
@@ -850,11 +851,9 @@ def applyLatestBolt(pipeline, tarName, is_linux_x86_64, artifacts=null)
     def boltRef = BOLT_PINNED_REF
     def llvmArch = is_linux_x86_64 ? "X64" : "ARM64"
     stage("BOLT consume") {
-        // apply_latest.sh exit codes: 3 = no promoted bundle for branch/triple,
-        // 2 = apply error, 0 = applied. Capture the code so a MISSING bundle (e.g.
-        // x86_64 before an x86 bundle is promoted) is a graceful SKIP rather than a
-        // hard build failure, while a real apply error still fails loudly.
-        def rc = sh(returnStatus: true, script: """
+        // Stage llvm-bolt first, so that the step below has only the bundle to read
+        // and apply while the credential is on the node.
+        sh """
             set -e
             export PATH="\$PWD/.bolt-llvm/bin:\$PATH"
             if ! command -v llvm-bolt >/dev/null 2>&1; then
@@ -867,21 +866,60 @@ def applyLatestBolt(pipeline, tarName, is_linux_x86_64, artifacts=null)
                 tar -xJf /tmp/\$tb -C .bolt-llvm --strip-components=1
                 rm -f /tmp/\$tb
             fi
-            export BOLT_PROFILE_REF='${boltRef}'
-            bash ${LLM_ROOT}/scripts/bolt/internal/apply_latest.sh \
-                 ${branch} ${triple} ${tarName} bolted-${tarName}
-        """)
-        if (rc == 3 && boltRef) {
-            // rc=3 means apply_latest.sh could not pull a bundle. Unpinned that
-            // legitimately means "this branch has nothing promoted" -- true for
-            // x86_64 today -- and skipping is right. Pinned it cannot mean that:
-            // the pipeline read this exact ref minutes ago, so absence is a real
-            // failure. Skipping would leave bolted-${tarName} unpublished, and
-            // the test stages fetch it by name, so an Artifactory blip here would
-            // surface as a pile of unexplained 404s in a different job.
-            error("[bolt-consume] pinned BOLT bundle ${boltRef} not found under ${branch}/${triple}. " +
+        """
+        // apply_latest.sh exit codes: 0 = applied, 2 = apply error, 3 = no promoted
+        // bundle for branch/triple, 4 = the profile store could not be read. Capture
+        // the code so a MISSING bundle (e.g. x86_64 before an x86 bundle is promoted)
+        // is a graceful SKIP rather than a hard build failure, while a real apply
+        // error still fails loudly. An unreadable store ends as a missing bundle
+        // does, with its reason logged.
+        //
+        // apply_latest.sh reads the bundle through the read helper, which takes the
+        // publishing credential for the aws location from a netrc. The netrc and the
+        // helper's environment exist around this call only.
+        def netrcPath = "${pwd(tmp: true)}/artifactory-netrc-${UUID.randomUUID().toString()}"
+        def rc = 0
+        try {
+            writeArtifactoryNetrc(netrcPath, "aws")
+            withEnv([
+                "LLM_ARTIFACTS_PRIMARY=${llmArtifactsPrimary()}",
+                "ARTIFACTORY_NETRC=${netrcPath}",
+                "ARTIFACTORY_CREDENTIAL_ID=${LLM_ARTIFACTS_LOCATIONS.aws.credential}",
+            ]) {
+                rc = sh(returnStatus: true, script: """
+                    set -e
+                    export PATH="\$PWD/.bolt-llvm/bin:\$PATH"
+                    export BOLT_PROFILE_REF='${boltRef}'
+                    bash ${LLM_ROOT}/scripts/bolt/internal/apply_latest.sh \
+                         ${branch} ${triple} ${tarName} bolted-${tarName}
+                """)
+            }
+        } finally {
+            sh(label: "Remove Artifactory netrc", script: "rm -f '${netrcPath}'")
+        }
+        def storeUnreadable = (rc == 4)
+        if (storeUnreadable) {
+            echo "[bolt-consume] the BOLT profile store could not be read for ${branch}/${triple}: a location " +
+                 "refused the request or the read failed. The messages above give the cause, and name the " +
+                 "credential if it was rejected."
+        }
+        if ((rc == 3 || storeUnreadable) && boltRef) {
+            // Unpinned, rc=3 legitimately means "this branch has nothing promoted"
+            // -- true for x86_64, which has no profile producer -- and skipping is
+            // right; an unreadable store is skipped the same way. Pinned, neither
+            // can pass: the pipeline read this exact ref minutes ago, so a bundle
+            // that is absent or cannot be read is a real failure. Skipping would
+            // leave bolted-${tarName} unpublished, and the test stages fetch it by
+            // name, so an Artifactory blip here would surface as a pile of
+            // unexplained 404s in a different job.
+            def problem = storeUnreadable ? "could not be read" : "not found"
+            error("[bolt-consume] pinned BOLT bundle ${boltRef} ${problem} under ${branch}/${triple}. " +
                   "The pipeline pinned a bundle this build cannot fetch; refusing to silently produce " +
                   "an un-BOLTed build that downstream stages expect to be optimized.")
+        }
+        if (storeUnreadable) {
+            echo "[bolt-consume] no bundle read for ${branch}/${triple}; skipping (build stays un-BOLTed)"
+            return
         }
         if (rc == 3) {
             echo "[bolt-consume] no promoted bundle for ${branch}/${triple}; skipping (build stays un-BOLTed)"

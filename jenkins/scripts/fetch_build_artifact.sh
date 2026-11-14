@@ -18,8 +18,10 @@
 # location only when the primary does not have it. CI reads a build's build_info.txt, packaged
 # builds, and waive_list/ with it, and it reads any other file there the same way. With --list, it
 # prints the files in one folder there on both locations, which is how CI finds a run's test
-# results. While urm is the primary, it asks urm alone about a run's test results. Run it with
-# --help for the interface and the exit codes.
+# results. With --secondary-optional, a failure of the secondary gets an exit code of its own, for
+# readers that go on without the secondary's answer. While urm is the primary, it asks urm alone
+# about a run's test results, so that a rollback to urm sends no request about them to aws. Run it
+# with --help for the interface and the exit codes.
 #
 # Credentials go to the aws location only, through curl's --netrc-file; urm is read anonymously.
 # The script turns off xtrace that a caller passes on, because a trace would show response URLs,
@@ -41,12 +43,15 @@ readonly URM_BASE_URL="https://urm.nvidia.com/artifactory/sw-tensorrt-generic"
 readonly FETCH_ABSENT=2
 readonly FETCH_REJECTED=3
 readonly FETCH_TRANSFER_FAILED=4
+readonly FETCH_SECONDARY_FAILED=5
 readonly FETCH_USAGE=64
 
 usage() {
     cat <<'EOF'
 Usage: fetch_build_artifact.sh [--properties | --exists] <artifact-path> [<dest-file>]
        fetch_build_artifact.sh --list <directory-path>
+       fetch_build_artifact.sh --secondary-optional [--exists] <artifact-path> [<dest-file>]
+       fetch_build_artifact.sh --secondary-optional --list <directory-path>
 
 Reads a build artifact from the primary Artifactory location, and from the secondary location
 only when the primary does not have it. A rejected request, a server or connection error, or a
@@ -67,6 +72,11 @@ Arguments:
                    primary's files, then the secondary's, so a name on both appears twice.
                    The secondary is not asked when the primary rejects the request, nor for a
                    run's test-results/ folder while urm is the primary.
+  --secondary-optional
+                   Report a failure or a rejection on the secondary, after the primary
+                   answered, with exit code 5 in place of 4, for a reader that goes on
+                   without the secondary's answer. Not allowed with --properties. It changes
+                   nothing where the secondary is not asked.
 
 Environment:
   LLM_ARTIFACTS_PRIMARY      aws (the default) or urm; the other location is the secondary.
@@ -82,15 +92,22 @@ Exit codes:
       ends with "fetch_build_artifact: listed <n> on <primary>, <m> on <secondary>
       path=<layout path>", or, for a run's test-results/ folder while urm is the primary,
       "fetch_build_artifact: listed <n> on urm, aws not asked while urm is the primary
-      path=<layout path>", as it does when --list exits 2 or 4.
+      path=<layout path>", as it does when --list exits 2, 4, or 5.
   2   Neither location has the artifact (with --properties: has properties for it; with
       --list: has the folder). For a run's test results while urm is the primary, urm alone
       does not have it.
   3   The primary rejected the request; the secondary was not contacted.
   4   The transfer failed after retries: a connection or server error, a persistent CDN
       rejection, a checksum mismatch, or a failure other than "absent" on the secondary.
+      A file that was deleted or replaced between its lookup and its download is looked up
+      again before the next attempt, and is absent on that location when it is gone.
       With --list, a listing failed after retries or the secondary rejected the request; the
       files listed on the other location are still printed.
+  5   Only with --secondary-optional, in place of 4: the primary does not have the artifact,
+      and the secondary failed after retries or rejected the request. With --list, the
+      primary listed the folder, or does not have it, and the secondary's listing failed or
+      was rejected; the primary's files are still printed. A message names the secondary's
+      host and says that its answer was not required.
   64  Usage error, unmappable path, bad LLM_ARTIFACTS_PRIMARY, missing ARTIFACTORY_NETRC,
       or a missing tool.
 EOF
@@ -266,7 +283,9 @@ lookup_step() {
     return 1
 }
 
-# Downloads the file to PART, and renames it to DEST when its SHA-1 matches SHA1.
+# Downloads the file to PART, and renames it to DEST when its SHA-1 matches SHA1. A 404 from the
+# location itself, or a SHA-1 that differs from the lookup's, sets STALE_LOOKUP: the file was
+# deleted or replaced after the lookup.
 download_step() {
     local rc cdn_host=""
     http_get "$PART" "$(file_url)"
@@ -294,6 +313,9 @@ download_step() {
         return "$FETCH_REJECTED"
     else
         FAILURE="the download answered HTTP $HTTP_STATUS from $FINAL_HOST"
+        if [[ "$FINAL_HOST" == "$LOC_HOST" && "$HTTP_STATUS" == 404 ]]; then
+            STALE_LOOKUP=true
+        fi
     fi
     return 1
 }
@@ -305,12 +327,29 @@ verify_download() {
     if [[ "$actual" != "$SHA1" ]]; then
         rm -f -- "$PART"
         FAILURE="checksum mismatch: the download has SHA-1 $actual, the storage API reports $SHA1"
+        STALE_LOOKUP=true
         return 1
     fi
     if ! mv -f -- "$PART" "$DEST"; then
         FAILURE="could not rename $PART to $DEST"
         return 1
     fi
+}
+
+# Downloads the file found by the lookup. After an attempt that set STALE_LOOKUP, it looks the
+# file up again first, so that a file deleted since the first lookup is absent, and a file
+# replaced since then is checked against its new SHA-1.
+fetch_step() {
+    local rc
+    if [[ "$STALE_LOOKUP" == true ]]; then
+        lookup_step
+        rc=$?
+        if (( rc != 0 )); then
+            return "$rc"
+        fi
+        STALE_LOOKUP=false
+    fi
+    download_step
 }
 
 # Writes the artifact's properties (storage API JSON) to DEST.
@@ -405,8 +444,9 @@ read_from() {
         return "$rc"
     fi
     # The lookup found the file here, so a failed download is a transfer failure and never
-    # sends the read to the other location.
-    with_retries download_step
+    # sends the read to the other location, unless a new lookup shows that the file is gone.
+    STALE_LOOKUP=false
+    with_retries fetch_step
 }
 
 # list_on <aws|urm>: lists the folder on one location and, once the listing is complete, prints
@@ -449,6 +489,18 @@ served() {
     exit 0
 }
 
+# Returns the exit code for a failure or a rejection on the secondary, the location in LOC, after
+# the primary answered: FETCH_TRANSFER_FAILED, or, with --secondary-optional,
+# FETCH_SECONDARY_FAILED after a message that the secondary's answer was not required.
+secondary_failure() {
+    if [[ "$SECONDARY_OPTIONAL" != true ]]; then
+        return "$FETCH_TRANSFER_FAILED"
+    fi
+    log "the secondary, $LOC ($LOC_HOST), gave no answer for $LAYOUT_PATH;" \
+        "its answer was not required."
+    return "$FETCH_SECONDARY_FAILED"
+}
+
 # Lists the folder on the primary and, unless the primary rejects the request or URM_ALONE holds,
 # on the secondary. Exits as usage() describes for --list.
 list_folder() {
@@ -478,8 +530,12 @@ list_folder() {
         report_rejection
         secondary_rc="$FETCH_TRANSFER_FAILED"
     fi
-    if (( primary_rc == FETCH_TRANSFER_FAILED || secondary_rc == FETCH_TRANSFER_FAILED )); then
+    if (( primary_rc == FETCH_TRANSFER_FAILED )); then
         status="$FETCH_TRANSFER_FAILED"
+    elif (( secondary_rc == FETCH_TRANSFER_FAILED )); then
+        # The primary listed the folder or does not have it.
+        secondary_failure
+        status=$?
     elif (( primary_rc == FETCH_ABSENT && secondary_rc == FETCH_ABSENT )); then
         status="$FETCH_ABSENT"
         log "neither $PRIMARY nor $SECONDARY has $LAYOUT_PATH."
@@ -496,6 +552,7 @@ cleanup() {
 }
 
 MODE=download
+SECONDARY_OPTIONAL=false
 ARGS=()
 while (( $# > 0 )); do
     case "$1" in
@@ -509,6 +566,7 @@ while (( $# > 0 )); do
             fi
             MODE="${1#--}"
             ;;
+        --secondary-optional) SECONDARY_OPTIONAL=true ;;
         --)
             shift
             ARGS+=("$@")
@@ -519,6 +577,10 @@ while (( $# > 0 )); do
     esac
     shift
 done
+
+if [[ "$MODE" == properties && "$SECONDARY_OPTIONAL" == true ]]; then
+    usage_error "--properties and --secondary-optional cannot be combined."
+fi
 
 case "$MODE:${#ARGS[@]}" in
     download:2 | properties:2 | exists:1 | exists:2 | list:1) ;;
@@ -557,10 +619,10 @@ case "$PRIMARY" in
 esac
 
 # While urm is the primary, a run's test results are asked of urm alone: --list lists a
-# test-results/ folder on urm only, and a file in one that urm does not have is absent. CI puts no
-# final archive on aws before urm has it, and a job whose primary is urm writes nothing to aws, so
-# aws could add only a checkpoint or the build-level rerun report whose upload to urm failed. A
-# rollback to urm, as an outage of aws calls for, then sends no request about test results to aws.
+# test-results/ folder on urm only, and a file in one that urm does not have is absent. A rollback
+# to urm, as an outage of aws calls for, then sends no request about test results to aws. A final
+# archive that only aws holds, from a stage that started before the rollback and whose upload to
+# urm failed, is then missed.
 URM_ALONE=false
 if [[ "$PRIMARY" == urm ]]; then
     case "$LAYOUT_PATH" in
@@ -589,6 +651,7 @@ fi
 
 LOC=""
 SHA1=""
+STALE_LOOKUP=false
 FAILURE=""
 REJECTED_STATUS=""
 HTTP_STATUS=""
@@ -640,7 +703,8 @@ case $? in
     "$FETCH_REJECTED")
         # A rejection by the secondary is reported like any other failure there.
         report_rejection
-        exit "$FETCH_TRANSFER_FAILED"
         ;;
-    *) exit "$FETCH_TRANSFER_FAILED" ;;
+    *) ;;
 esac
+secondary_failure
+exit $?

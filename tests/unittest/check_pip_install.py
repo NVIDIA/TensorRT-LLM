@@ -16,6 +16,7 @@
 import argparse
 import json
 import os
+import shlex
 import subprocess
 import sys
 import sysconfig
@@ -192,9 +193,21 @@ def get_cpython_version():
     return "cp{}{}".format(python_version[0], python_version[1])
 
 
+URL_SCHEMES = ("http://", "https://")
+
+
 def get_wheel_url(wheel_path, version_local, cpython_version):
-    """Get direct wheel URL from wheel_path (directory listing or direct URL)."""
-    if not wheel_path.startswith(("http://", "https://")):
+    """Get the wheel that wheel_path names.
+
+    Returns the absolute path of a local wheel file, or the direct wheel URL
+    for a wheel given by URL (directory listing or direct URL).
+    """
+    if not wheel_path.startswith(URL_SCHEMES):
+        if os.path.isfile(wheel_path):
+            return os.path.abspath(wheel_path)
+        if os.path.isabs(wheel_path):
+            print(f"Fail to find the wheel file {wheel_path}")
+            exit(1)
         wheel_path = "https://" + wheel_path
 
     if wheel_path.endswith(".whl"):
@@ -240,12 +253,29 @@ def get_wheel_url(wheel_path, version_local, cpython_version):
     return f"{wheel_path}/{wheel_name}"
 
 
+def is_local_wheel(wheel):
+    """Whether get_wheel_url returned a local file rather than a URL."""
+    return not wheel.startswith(URL_SCHEMES)
+
+
 def download_wheel(args):
+    """Download a wheel given by URL into the working directory.
+
+    A local wheel file is used where it is: nothing is downloaded, and no
+    wheel is removed from the working directory.
+
+    Returns:
+        The absolute path of the local wheel file, or None when the wheel was
+        downloaded.
+    """
     wheel_url = get_wheel_url(args.wheel_path, args.version_local,
                               args.cpython_version)
+    if is_local_wheel(wheel_url):
+        return wheel_url
     subprocess.check_call("rm *.whl || true", shell=True)
     subprocess.check_call(f"apt-get install -y wget && wget -q {wheel_url}",
                           shell=True)
+    return None
 
 
 def get_torch_constraint_file(constraint_dir="."):
@@ -288,11 +318,17 @@ def get_torch_constraint_file(constraint_dir="."):
     return None
 
 
-def install_tensorrt_llm():
-    """Install the tensorrt_llm wheel with torch version constraint."""
+def install_tensorrt_llm(wheel_file=None):
+    """Install the tensorrt_llm wheel with torch version constraint.
+
+    Args:
+        wheel_file: Absolute path of the wheel to install. When None, the
+            wheel downloaded into the working directory is installed.
+    """
     print("##########  Install tensorrt_llm package  ##########")
 
-    install_command = "pip3 install tensorrt_llm-*.whl"
+    wheel = shlex.quote(wheel_file) if wheel_file else "tensorrt_llm-*.whl"
+    install_command = f"pip3 install {wheel}"
     constraint_file = get_torch_constraint_file()
     if constraint_file:
         install_command += f" -c {constraint_file}"
@@ -353,8 +389,7 @@ def install_system_libs():
 def test_pip_install(args):
     install_system_libs()
 
-    download_wheel(args)
-    install_tensorrt_llm()
+    install_tensorrt_llm(download_wheel(args))
 
     verify_openengine_distribution()
     run_sanity_check()
@@ -365,7 +400,7 @@ def test_python_builds(args):
 
     This test verifies the TRTLLM_PRECOMPILED_LOCATION workflow:
     1. Install required system libs
-    2. Use precompiled wheel URL to extract C++ bindings
+    2. Use precompiled wheel (URL or local file) to extract C++ bindings
     3. Build Python-only wheel (editable install with torch constraint)
     4. Verify installation works correctly
     5. Run quickstart example
@@ -414,7 +449,8 @@ if __name__ == "__main__":
     parser.add_argument("--wheel_path",
                         type=str,
                         required=True,
-                        help="The wheel path")
+                        help="The wheel to check: a local wheel file, or the "
+                        "URL of a wheel or of a directory listing with it")
     parser.add_argument("--version_local",
                         type=str,
                         required=False,

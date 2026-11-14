@@ -51,6 +51,103 @@ def llmArtifactsPrimary()
     return primary
 }
 
+// The locations of outputs under llm-artifacts/, for the outputs this job publishes itself.
+LLM_ARTIFACTS_LOCATIONS = [
+    aws: [root: "https://artifactory.nvidia.com/artifactory", repo: "sw-tensorrt-llm-generic-local"],
+    urm: [root: "https://urm.nvidia.com/artifactory", repo: "sw-tensorrt-generic"],
+]
+
+def llmArtifactsLayoutPath(String legacyPath)
+{
+    def layoutPath = legacyPath.replaceFirst(/^sw-tensorrt-generic(-local)?\//, "")
+    if (!layoutPath.startsWith("llm-artifacts/")) {
+        error("Not an llm-artifacts path: ${legacyPath}")
+    }
+    return layoutPath
+}
+
+def llmArtifactsRepoPath(String location, String legacyPath)
+{
+    return "${LLM_ARTIFACTS_LOCATIONS[location].repo}/${llmArtifactsLayoutPath(legacyPath)}"
+}
+
+def llmArtifactsUrl(String location, String legacyPath)
+{
+    return "${LLM_ARTIFACTS_LOCATIONS[location].root}/${llmArtifactsRepoPath(location, legacyPath)}"
+}
+
+// The host name of a location.
+def llmArtifactsHost(String location)
+{
+    return LLM_ARTIFACTS_LOCATIONS[location].root.replaceFirst(/^[a-z]+:\/\//, "").replaceFirst(/[:\/].*$/, "")
+}
+
+// The link to an output that people open in a browser. artifactory.nvidia.com answers a direct
+// link from a browser with a password prompt, so its links open the native browser, which signs
+// people in with the company sign-in; urm serves direct links.
+def llmArtifactsBrowseUrl(String location, String legacyPath)
+{
+    if (location == "aws") {
+        return "https://${llmArtifactsHost('aws')}/ui/native/${llmArtifactsRepoPath('aws', legacyPath)}"
+    }
+    return llmArtifactsUrl(location, legacyPath)
+}
+
+// Where an output under llm-artifacts/ goes. Wheels, attribution reports, the image-tag map, the
+// guardwords scan log, the CBTS test-db archive, the coverage-selection pins, and everything under
+// test-results/ are published to the primary location, the required copy, and, while aws is the
+// primary, to urm as a replica; during a rollback to urm there is no replica. Build artifacts,
+// rerun_reports/, and cbts-coverage/ go to the primary alone. This function alone decides the
+// targets: the locations in upload order. A failed upload to the required copy fails the step
+// unless the caller says otherwise, and a failed upload to the replica is only logged.
+def llmArtifactsTargets(String primary)
+{
+    if (primary == "aws") {
+        return [[location: "aws", replica: false], [location: "urm", replica: true]]
+    }
+    return [[location: "urm", replica: false]]
+}
+
+// Uploads filePattern to legacyTarget, a folder in its legacy form
+// ("sw-tensorrt-generic/llm-artifacts/.../"), on each of targets in order (see
+// llmArtifactsTargets). The required target's upload fails the step when requiredFailureFails,
+// and then no replica is tried; otherwise its failure is logged. A replica's failure is logged
+// with its reason and the link to the required copy, when that upload succeeded, and marks
+// nothing. trtllm_utils.uploadArtifacts names the credential when an upload to aws fails. Returns
+// the locations that received the file.
+def uploadToTargets(String filePattern, String legacyTarget, List targets, boolean requiredFailureFails = true)
+{
+    def name = filePattern.tokenize("/")[-1]
+    def required = targets.find { !it.replica }
+    def uploaded = []
+    for (target in targets) {
+        def location = target.location
+        try {
+            def locationTarget = location == "aws" ? llmArtifactsRepoPath("aws", legacyTarget) : legacyTarget
+            trtllm_utils.uploadArtifacts(filePattern, locationTarget, location)
+            uploaded << location
+        } catch (InterruptedException e) {
+            throw e
+        } catch (Exception e) {
+            if (!target.replica && requiredFailureFails) {
+                throw e
+            }
+            if (target.replica) {
+                def requiredCopy = "the ${required.location} upload failed too"
+                if (required.location in uploaded) {
+                    // A pattern names no single file, so its link opens the folder.
+                    def copyPath = name.contains("*") ? legacyTarget : "${legacyTarget}${name}"
+                    requiredCopy = "${required.location} copy: ${llmArtifactsBrowseUrl(required.location, copyPath)}"
+                }
+                echo "[artifacts] replica upload of ${name} to ${llmArtifactsHost(location)} failed (${e}); ${requiredCopy}"
+            } else {
+                echo "[artifacts] upload of ${name} to ${location} failed (non-fatal): ${e}"
+            }
+        }
+    }
+    return uploaded
+}
+
 // Credential with which the read helper reads packaged builds on artifactory.nvidia.com: the
 // publishing credential, the one the pipelines publish build artifacts with. Image pushes also
 // use it.
@@ -402,8 +499,10 @@ def mayRetryWithoutBuildStageWheel(arch) {
 //
 // The bundle is arch-specific (only aarch64-linux-gnu today) but baked into every
 // variant by design -- on x86 the files are inert until an x86/merged bundle
-// exists. Fetched via anonymous curl (artifactory.sh pull-latest) WITH RETRIES, so
-// a transient miss isn't mistaken for "no bundle".
+// exists. Fetched with artifactory.sh pull-latest, which reads through
+// jenkins/scripts/fetch_build_artifact.sh with the netrc bound here. The helper
+// retries a transient failure itself and tells "nothing promoted" apart from "the
+// store could not be read", so a transient miss isn't mistaken for "no bundle".
 def overlayBoltBundle(pairs, arch, action) {
     if (!pairs) { return }
     def triple = "aarch64-linux-gnu"
@@ -429,10 +528,16 @@ def overlayBoltBundle(pairs, arch, action) {
         .findAll { it }
         .unique()
 
-    // 1) Try each candidate branch in order (with retries per branch so a transient
-    //    network/Artifactory blip isn't misread as "no bundle"). Verify non-empty
-    //    (manifest + >=1 profile) so "pulled but empty" is not accepted. First hit wins.
+    // 1) Try each candidate branch in order. Verify non-empty (manifest + >=1 profile)
+    //    so "pulled but empty" is not accepted. First hit wins.
+    //    Exit codes (artifactory.sh pull-latest): 3 = nothing promoted for the branch,
+    //    so the next candidate is tried at once; 4 = the profile store could not be
+    //    read after the read helper's own retries, which says nothing about what is
+    //    promoted, so the walk stops. Anything else is retried per branch.
     def haveBundle = false
+    def storeUnreadable = false
+    // The candidates that were asked: the walk stops early at a store that cannot be read.
+    def triedBranches = []
     def branch = null
     // The overlay is a consumer like any other, so it takes the pipeline's pin
     // rather than resolving `latest` when it happens to run. Without this the
@@ -444,38 +549,69 @@ def overlayBoltBundle(pairs, arch, action) {
         candidates = [BOLT_PINNED_BRANCH]
         echo "[BOLT] overlay pinned to bundle ${BOLT_PINNED_REF} on ${BOLT_PINNED_BRANCH}"
     }
-    for (cand in candidates) {
-        for (int attempt = 1; attempt <= 3 && !haveBundle; attempt++) {
-            def rc = sh(script: """
-                rm -rf ${ctxDir} && mkdir -p ${ctxDir}/${bundleSub} && \
-                export BOLT_PROFILE_REF='${BOLT_PINNED_REF}' && \
-                cd ${LLM_ROOT} && bash scripts/bolt/internal/artifactory.sh pull-latest ${cand} ${triple} ${ctxDir}/${bundleSub}
-            """, returnStatus: true)
-            if (rc == 0) {
-                def ok = sh(script: """
-                    test -f ${ctxDir}/${bundleSub}/manifest.json && \
-                    test -n "\$(find ${ctxDir}/${bundleSub} -type f \\( -name '*.yaml' -o -name '*.fdata' \\) 2>/dev/null | head -1)"
-                """, returnStatus: true)
-                if (ok == 0) { haveBundle = true; branch = cand; break }
-                echo "[BOLT] bundle for ${cand}/${triple} pulled but empty/invalid (attempt ${attempt})"
-            } else {
-                echo "[BOLT] pull-latest ${cand}/${triple} failed (attempt ${attempt}, rc=${rc})"
+    // The netrc sits under pwd(tmp: true), outside the source tree and the overlay's
+    // build context, and exists only around the reads.
+    def netrcPath = "${pwd(tmp: true)}/artifactory-netrc-${UUID.randomUUID().toString()}"
+    try {
+        writeArtifactoryNetrc(netrcPath)
+        withEnv([
+            "LLM_ARTIFACTS_PRIMARY=${llmArtifactsPrimary()}",
+            "ARTIFACTORY_NETRC=${netrcPath}",
+            "ARTIFACTORY_CREDENTIAL_ID=${LLM_ARTIFACTS_CREDENTIALS_ID}",
+        ]) {
+            for (cand in candidates) {
+                triedBranches << cand
+                for (int attempt = 1; attempt <= 3 && !haveBundle; attempt++) {
+                    def rc = sh(script: """
+                        rm -rf ${ctxDir} && mkdir -p ${ctxDir}/${bundleSub} && \
+                        export BOLT_PROFILE_REF='${BOLT_PINNED_REF}' && \
+                        cd ${LLM_ROOT} && bash scripts/bolt/internal/artifactory.sh pull-latest ${cand} ${triple} ${ctxDir}/${bundleSub}
+                    """, returnStatus: true)
+                    if (rc == 0) {
+                        def ok = sh(script: """
+                            test -f ${ctxDir}/${bundleSub}/manifest.json && \
+                            test -n "\$(find ${ctxDir}/${bundleSub} -type f \\( -name '*.yaml' -o -name '*.fdata' \\) 2>/dev/null | head -1)"
+                        """, returnStatus: true)
+                        if (ok == 0) { haveBundle = true; branch = cand; break }
+                        echo "[BOLT] bundle for ${cand}/${triple} pulled but empty/invalid (attempt ${attempt})"
+                    } else if (rc == 3) {
+                        echo "[BOLT] nothing promoted for ${cand}/${triple}"
+                        break
+                    } else if (rc == 4) {
+                        echo "[BOLT] the profile store could not be read for ${cand}/${triple} (see the message of artifactory.sh above)"
+                        storeUnreadable = true
+                        break
+                    } else {
+                        echo "[BOLT] pull-latest ${cand}/${triple} failed (attempt ${attempt}, rc=${rc})"
+                    }
+                }
+                if (haveBundle || storeUnreadable) { break }
+                echo "[BOLT] no usable bundle for ${cand}/${triple}; trying next candidate branch"
             }
         }
-        if (haveBundle) { break }
-        echo "[BOLT] no usable bundle for ${cand}/${triple}; trying next candidate branch"
+    } finally {
+        sh(label: "Remove Artifactory netrc", script: "rm -f '${netrcPath}'")
     }
 
-    // 2) No usable bundle from ANY candidate: fail-closed when required, else retag
-    //    raw -> canonical (so a canonical image still exists; expected pre-enable /
-    //    when BOLT off / dev-PR with no promoted profiles anywhere).
+    // 2) No usable bundle from ANY candidate, or a store that could not be read:
+    //    fail-closed when required, else retag raw -> canonical (so a canonical image
+    //    still exists; expected pre-enable / when BOLT off / dev-PR with no promoted
+    //    profiles anywhere).
     if (!haveBundle) {
-        def tried = candidates.join(", ")
+        def tried = triedBranches.join(", ")
+        if (BOLT_PROFILES_REQUIRED && storeUnreadable) {
+            error("[BOLT] the profile store could not be read for ${triple} (tried branches: ${tried}) -- refusing to publish a profile-less canonical image " +
+                  "(the message of artifactory.sh above says why; set boltProfilesRequired=false to allow a plain canonical)")
+        }
         if (BOLT_PROFILES_REQUIRED) {
             error("[BOLT] required profile bundle missing for ${triple} (tried branches: ${tried}) -- refusing to publish a profile-less canonical image " +
                   "(promote a bundle via BoltProfileGen, or set boltProfilesRequired=false to allow a plain canonical)")
         }
-        echo "[BOLT] no bundle for ${triple} (tried: ${tried}); profiles not required -> canonical = plain build"
+        if (storeUnreadable) {
+            echo "[BOLT] the profile store could not be read for ${triple} (tried: ${tried}); profiles not required -> canonical = plain build"
+        } else {
+            echo "[BOLT] no bundle for ${triple} (tried: ${tried}); profiles not required -> canonical = plain build"
+        }
         pairs.each { p ->
             stage ("BOLT retag (no bundle) (${arch}): ${p.canon}") {
                 def retagCmd = "docker tag ${p.raw} ${p.canon}"
@@ -558,7 +694,9 @@ def buildImage(config, imageKeyToTag, versionOverride)
         sh(label: "Validate Docker bridge MTU", script: "/usr/local/bin/dind-mtu validate")
         sh "pwd && ls -alh"
         sh "env | sort"
-        sh "apk add make git"
+        // curl and bash are for jenkins/scripts/fetch_build_artifact.sh, which reads the BOLT
+        // profile bundle.
+        sh "apk add make git curl bash"
         sh "git config --global --add safe.directory '*'"
     }
     // resourceLedger.withResource registers the docker-login lifecycle *before*
@@ -1047,7 +1185,7 @@ pipeline {
                     echo "imageKeyToTag is: ${imageKeyToTagJson}"
                     writeFile file: "imageKeyToTag.json", text: imageKeyToTagJson
                     archiveArtifacts artifacts: 'imageKeyToTag.json', fingerprint: true
-                    trtllm_utils.uploadArtifacts("imageKeyToTag.json", "${UPLOAD_PATH}/")
+                    uploadToTargets("imageKeyToTag.json", "${UPLOAD_PATH}/", llmArtifactsTargets(llmArtifactsPrimary()), true)
                 }
             }
         }
