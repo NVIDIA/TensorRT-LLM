@@ -154,6 +154,8 @@ Another example uses ``curl``:
     :language: bash
     :linenos:
 
+A reply's ``id`` is ``resp_<request id>_<16 hex digits>``, streamed or not, so a reply can be matched with the server's records of its request: the request id is the ``request_id`` of the request's per-request perf metrics and of the chunks a ``--post_processor_hook`` receives, and the id the server logs when the client disconnects before the reply is finished. The hex digits keep reply ids unique across server restarts, which start the request ids over. A ``request_id`` set by the client is used as the reply id unchanged. On ``trtllm-serve disaggregated`` the request id is the disaggregated request id; see the Responses API section of :doc:`Disaggregated Serving <../../features/disagg-serving>`.
+
 
 More openai compatible examples can be found in the `compatibility examples <https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/serve/compatibility>`_ directory.
 

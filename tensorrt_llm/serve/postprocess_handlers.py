@@ -21,6 +21,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.responses_utils import ResponsesStreamingProcessor
 from tensorrt_llm.serve.responses_utils import \
     create_response_non_store as responses_api_create_response_non_store
+from tensorrt_llm.serve.responses_utils import name_responses_reply
 
 from .._utils import nvtx_range_debug
 from ..executor import (DetokenizedGenerationResultBase, GenerationResult,
@@ -1126,6 +1127,10 @@ class ResponsesAPIPostprocArgs(PostprocArgs):
 def responses_api_post_processor(
         rsp: GenerationResult,
         args: ResponsesAPIPostprocArgs) -> ResponsesResponse:
+    # A postprocessing worker holds a copy of the request made before the
+    # executor gave it its id, so it names the reply itself, as the server
+    # names its own copy (see name_responses_reply).
+    name_responses_reply(args.request, rsp.id)
     return responses_api_create_response_non_store(
         generation_result=rsp,
         request=args.request,
@@ -1145,6 +1150,9 @@ def responses_api_streaming_post_processor(
     if args.streaming_processor is None:
         raise ValueError(
             "streaming_processor is required for streaming post-processing")
+    # As in responses_api_post_processor. The streaming processor holds the
+    # same request object, also in a postprocessing worker's copy.
+    name_responses_reply(args.request, rsp.id)
     outputs = args.streaming_processor.process_single_output(rsp)
     if rsp._done:
         outputs.append(

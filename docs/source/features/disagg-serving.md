@@ -269,6 +269,8 @@ The disaggregated server also serves `/v1/responses`, with both `context_first` 
 - A request with `previous_response_id` is rejected with a 400, because a stored response lives in one worker's memory and a later request may reach another worker. Send the earlier turns in `input` instead.
 - `store` is ignored: nothing is persisted, and the server logs a warning once when a client asks for it.
 
+A reply's `id` is `resp_<disagg_request_id>_<16 hex digits>`. Its first part is the [disaggregated request ID](#unique-global-request-id) the server gives the request, which the server's per-request perf metrics record as `disagg_request_id`, so the two can be matched. If a context request is retried under a new disaggregated request ID, which the perf metrics then record, the reply is renamed after the new one; only that part of the id changes. A `request_id` set by the client is used as the reply id unchanged.
+
 One limitation applies to `/v1/responses` on every server, disaggregated or not:
 
 - `parallel_tool_calls: false`, and a `tool_choice` other than `auto` or `none` on non-Harmony models, are accepted but not enforced. The server logs a warning once.

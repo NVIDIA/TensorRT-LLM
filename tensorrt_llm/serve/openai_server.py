@@ -139,7 +139,8 @@ from tensorrt_llm.serve.responses_utils import (ClosingStreamingResponse,
 from tensorrt_llm.serve.responses_utils import \
     create_response as responses_api_create_response
 from tensorrt_llm.serve.responses_utils import (guard_responses_stream,
-                                                keep_responses_stream_alive)
+                                                keep_responses_stream_alive,
+                                                name_responses_reply)
 from tensorrt_llm.serve.responses_utils import \
     request_preprocess as responses_api_request_preprocess
 from tensorrt_llm.serve.responses_web_search import web_search_rejection_reason
@@ -3603,6 +3604,14 @@ class OpenAIServer(_VideoRoutesMixin):
                 _postproc_params=postproc_params
                 if self.postproc_worker_enabled else None,
             )
+            # The reply carries the executor client id (see
+            # name_responses_reply). The input messages were stored under the
+            # request's id before it was named.
+            stored_under = request.request_id
+            if (name_responses_reply(request, promise.request_id)
+                    and self.enable_store and request.store):
+                await self.conversation_store.rename_response(
+                    stored_under, request.request_id)
             if not self.postproc_worker_enabled:
                 # Set by the executor only for postprocessing it runs itself.
                 postproc_args.num_prompt_tokens = len(promise.prompt_token_ids)

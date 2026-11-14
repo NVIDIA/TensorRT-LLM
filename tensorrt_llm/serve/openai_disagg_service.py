@@ -49,6 +49,8 @@ from tensorrt_llm.serve.responses_utils import (
     ResponseHooks,
     UCompletionResponseOrGenerator,
     done_generator,
+    name_responses_reply,
+    rename_responses_reply,
     responses_done_generator,
 )
 from tensorrt_llm.serve.router import CoordinatorDelegatingRouter, KvCacheAwareRouter, Router
@@ -97,6 +99,32 @@ def _drop_ctx_handoff(response: UCompletionResponse) -> None:
         response.prompt_token_ids = None
         response.prompt_token_ids_b64 = None
         response.finish_reason = None
+
+
+def _name_responses_reply(request: UCompletionRequest, disagg_request_id: int) -> bool:
+    """Name the reply to a Responses request ``resp_<disagg_request_id>_<16 hex>``.
+
+    A worker answers a Responses request under the request's ``request_id``
+    (see ``name_responses_reply``). Each worker numbers its own engine requests,
+    so an engine request id can name different requests on different workers;
+    the disaggregated request id is unique across the deployment, and both
+    workers and this server record it with the request.
+
+    The name is given before any worker sees the request. The workers get it
+    only because assigning a field adds it to pydantic's ``model_fields_set``:
+    ``_encode_request_body`` forwards set fields only (``exclude_unset=True``),
+    and a worker names a reply whose ``request_id`` is unset after its own
+    engine request id.
+
+    A ``request_id`` the client set is kept, and other requests are left alone.
+
+    Returns:
+        Whether the reply was named here. Only such a reply is renamed when a
+        retried context request gets a new disaggregated request id.
+    """
+    return isinstance(request, ResponsesRequest) and name_responses_reply(
+        request, disagg_request_id
+    )
 
 
 class _SseErrorObserver:
@@ -300,6 +328,7 @@ class OpenAIDisaggregatedService(OpenAIService):
         disagg_request_id = await self._coordinator.get_disagg_request_id()
         if hooks:
             hooks.on_disagg_request_id(disagg_request_id)
+        reply_named = _name_responses_reply(request, disagg_request_id)
         # reserve a gen_server if conditional disagg is needed
         gen_server, need_ctx = await self._check_conditional_disagg(request, disagg_request_id)
         # Context retries may replace disagg_request_id for the KV-transfer
@@ -332,6 +361,13 @@ class OpenAIDisaggregatedService(OpenAIService):
                     disagg_request_id = ctx_response_disagg_params.disagg_request_id
                     if hooks:
                         hooks.on_disagg_request_id(disagg_request_id)
+                    if reply_named:
+                        # A retried context request has a new disaggregated
+                        # request id, which the perf metrics record from then
+                        # on. The reply follows it, so the generation worker
+                        # is sent the new name; without a retry the name stays
+                        # as it is.
+                        rename_responses_reply(request, disagg_request_id)
                 gen_req = self._get_gen_request(request, ctx_response, disagg_request_id)
             except Exception:
                 if gen_server:
@@ -358,6 +394,10 @@ class OpenAIDisaggregatedService(OpenAIService):
             )
             return gen_response
         else:
+            if reply_named:
+                # The context worker answered under the name it was sent,
+                # which a retried context request leaves behind.
+                ctx_response.id = request.request_id
             if gen_server:
                 await self._gen_router.finish_request(request, req_id=gen_reservation_id)
             if hooks:
@@ -604,6 +644,7 @@ class OpenAIDisaggregatedService(OpenAIService):
         disagg_request_id = await self._coordinator.get_disagg_request_id()
         if hooks:
             hooks.on_disagg_request_id(disagg_request_id)
+        _name_responses_reply(request, disagg_request_id)
         if need_ctx:
             # arrival->here = pre-ctx wait in the orchestrator/fleet.
             if hooks:
