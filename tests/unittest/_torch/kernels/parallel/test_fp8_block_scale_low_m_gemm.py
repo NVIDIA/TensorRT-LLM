@@ -522,12 +522,14 @@ def test_sm107_selected_only_with_rubin_cute_dsl(monkeypatch, rubin_dsl):
 @pytest.mark.parametrize("n, k", [(3072, 7168), (2112, 7168)])
 @pytest.mark.parametrize("m", [1, 28, 64, 65, 224, 225, 256, 257])
 def test_weight_read_linear_selects_low_m_gemm(m, n, k):
-    """``_Fp8BlockScaleWeightReadLinear`` runs this GEMM up to ``max_m_for(N, K)`` rows and
+    """``Fp8BlockScaleWeightReadLinear`` runs this GEMM up to ``max_m_for(N, K)`` rows and
     ``fp8_swap_ab_gemm`` above, on the same operands."""
-    from tensorrt_llm._torch.models.modeling_kimi_linear import _Fp8BlockScaleWeightReadLinear
+    from tensorrt_llm._torch.modules.fp8_block_scale_weight_read_linear import (
+        Fp8BlockScaleWeightReadLinear,
+    )
 
     w_pad, scale = _make_weight(n, k, seed=41)
-    linear = _Fp8BlockScaleWeightReadLinear(w_pad[:n].contiguous(), scale.clone(), n)
+    linear = Fp8BlockScaleWeightReadLinear(w_pad[:n].contiguous(), scale.clone(), n)
     linear._weights_transformed = False
     linear.post_load_weights()
     x = _make_activation(m, k, seed=m)
@@ -596,10 +598,12 @@ def _k3_weight(n, k):
 
 
 def _loaded_weight_read_linear(w_fp8, scale):
-    """``_Fp8BlockScaleWeightReadLinear`` loaded like the checkpoint path."""
-    from tensorrt_llm._torch.models.modeling_kimi_linear import _Fp8BlockScaleWeightReadLinear
+    """``Fp8BlockScaleWeightReadLinear`` loaded like the checkpoint path."""
+    from tensorrt_llm._torch.modules.fp8_block_scale_weight_read_linear import (
+        Fp8BlockScaleWeightReadLinear,
+    )
 
-    linear = _Fp8BlockScaleWeightReadLinear(w_fp8.clone(), scale.clone(), w_fp8.shape[0])
+    linear = Fp8BlockScaleWeightReadLinear(w_fp8.clone(), scale.clone(), w_fp8.shape[0])
     linear._weights_transformed = False
     linear.post_load_weights()
     return linear
@@ -832,12 +836,14 @@ def test_sigmoid_matches_torch(m, n, k):
 
 
 def _bf16_weight_read_linear(n, k):
-    from tensorrt_llm._torch.models.modeling_kimi_linear import _Fp8BlockScaleWeightReadLinear
+    from tensorrt_llm._torch.modules.fp8_block_scale_weight_read_linear import (
+        Fp8BlockScaleWeightReadLinear,
+    )
 
     torch.manual_seed(0)
     weight = (torch.randn((n, k), device="cuda") * 0.02).to(torch.bfloat16)
-    linear = _Fp8BlockScaleWeightReadLinear(
-        *_Fp8BlockScaleWeightReadLinear.quantize_weight(weight), n
+    linear = Fp8BlockScaleWeightReadLinear(
+        *Fp8BlockScaleWeightReadLinear.quantize_weight(weight), n
     )
     linear.post_load_weights()
     return linear

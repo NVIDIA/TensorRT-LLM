@@ -4142,7 +4142,7 @@ def test_kimi_k3_nvfp4_expert_spec_covers_the_awq_recipes() -> None:
     ``pre_quant_scale`` must stay OPTIONAL: ``nvidia/Kimi-K3-NVFP4`` stores
     none, and requiring it would reject the one checkpoint on this path today.
     """
-    from tensorrt_llm._torch.models.modeling_kimi_linear import _k3_expert_ckpt_spec
+    from tensorrt_llm._torch.models.modeling_kimi_k3_loader import _k3_expert_ckpt_spec
 
     nvfp4 = _k3_expert_ckpt_spec(QuantAlgo.NVFP4)
     for quant_algo in (QuantAlgo.NVFP4_AWQ, QuantAlgo.NVFP4_ARC):
@@ -4164,7 +4164,7 @@ def test_kimi_k3_nvfp4_expert_loader_forwards_pre_quant_scale(
     must still load, which is why ``None`` has to reach the quant method
     rather than the key being demanded.
     """
-    from tensorrt_llm._torch.models.modeling_kimi_linear import _load_nvfp4_expert
+    from tensorrt_llm._torch.models.modeling_kimi_k3_loader import _load_nvfp4_expert
 
     pre_quant_scale = torch.linspace(0.5, 2.0, 8)
     stored = (

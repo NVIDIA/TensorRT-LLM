@@ -784,7 +784,9 @@ def test_kimi_k3_trtllm_accepts_nvfp4_routed_experts():
         aux_stream_dict={stream_type: torch.cuda.Stream() for stream_type in AuxStreamType},
     )
 
-    assert runtime.expert_ckpt_spec is modeling_kimi_linear._K3_EXPERT_CKPT_SPECS[QuantAlgo.NVFP4]
+    from tensorrt_llm._torch.models.modeling_kimi_k3_loader import _K3_EXPERT_CKPT_SPECS
+
+    assert runtime.expert_ckpt_spec is _K3_EXPERT_CKPT_SPECS[QuantAlgo.NVFP4]
     assert isinstance(
         runtime.routed_experts.backend._get_quant_method(),
         NVFP4TRTLLMGenFusedMoEMethod,
@@ -1646,7 +1648,7 @@ def test_nvfp4_streaming_expert_load_rejects_duplicate_slot():
 
 def test_kimi_k3_expert_ckpt_spec_selection():
     """The three loader call sites share one layout decision."""
-    from tensorrt_llm._torch.models.modeling_kimi_linear import _k3_expert_ckpt_spec
+    from tensorrt_llm._torch.models.modeling_kimi_k3_loader import _k3_expert_ckpt_spec
 
     mxfp4 = _k3_expert_ckpt_spec(QuantAlgo.W4A8_MXFP4_MXFP8)
     assert mxfp4.kinds == ("weight_packed", "weight_scale")
@@ -1670,7 +1672,7 @@ def test_materialize_handles_scalar_lazy_safetensors(tmp_path):
     import safetensors.torch
     from safetensors import safe_open
 
-    from tensorrt_llm._torch.models.modeling_kimi_linear import _materialize
+    from tensorrt_llm._torch.models.modeling_kimi_k3_loader import _materialize
 
     scalar = torch.tensor(0.00012207, dtype=torch.float32)
     matrix = torch.arange(6, dtype=torch.float32).reshape(2, 3)
@@ -2291,7 +2293,7 @@ def test_fp8_block_scaled_dequantization():
     loader's shape check passed and src.to(param.dtype) reinterpreted the
     quantized values as real ones, silently dropping the scale.
     """
-    from tensorrt_llm._torch.models.modeling_kimi_linear import _dequantize_fp8_block_scaled
+    from tensorrt_llm._torch.models.modeling_kimi_k3_loader import _dequantize_fp8_block_scaled
 
     n, k = 256, 384
     torch.manual_seed(3)
