@@ -4,6 +4,7 @@
 per TP group."""
 
 import os
+import tempfile
 
 import torch
 import torch.distributed as dist
@@ -19,7 +20,7 @@ def ext():
     if "ext" not in _st:
         from torch.utils.cpp_extension import load
 
-        bd = os.path.join(_K.get("TMPDIR", "/tmp"), "h9lb-build")
+        bd = os.path.join(_K.get("TMPDIR", tempfile.gettempdir()), "h9lb-build")
         os.makedirs(bd, exist_ok=True)
 
         def _load():

@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import tempfile
 
 import torch.distributed as dist
 
@@ -28,7 +29,7 @@ _st = {}
 
 
 def src_hash() -> str:
-    h = hashlib.sha1()
+    h = hashlib.sha1(usedforsecurity=False)
     for f in HDRS:
         with open(os.path.join(_HERE, f), "rb") as fh:
             h.update(fh.read())
@@ -65,7 +66,7 @@ def install():
     from torch.utils.cpp_extension import load
 
     hh = src_hash()
-    bd = os.path.join(_K.get("TMPDIR", "/tmp"), "h9prr4-build-" + hh)
+    bd = os.path.join(_K.get("TMPDIR", tempfile.gettempdir()), "h9prr4-build-" + hh)
     os.makedirs(bd, exist_ok=True)
 
     def _load():
