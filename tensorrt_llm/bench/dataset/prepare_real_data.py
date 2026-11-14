@@ -10,6 +10,7 @@ from datasets import load_dataset
 from PIL import Image
 from pydantic import BaseModel, model_validator
 
+from tensorrt_llm.bench.dataset.prepare_synthetic_data import _generate_task_ids_and_lora_config
 from tensorrt_llm.bench.dataset.utils import (
     generate_multi_turn_dataset,
     generate_multimodal_dataset,
@@ -232,7 +233,6 @@ def real_dataset(root_args, **kwargs):
     input_ids = []
     input_lens = []
     output_lens = []
-    task_ids = []
     req_cnt = 0
     modality = None
     multi_turn = False
@@ -307,13 +307,6 @@ def real_dataset(root_args, **kwargs):
                         len(root_args.tokenizer.encode(dataset_config.get_output(req)))
                     )
 
-        # lora task id
-        task_id = root_args.task_id
-        if root_args.rand_task_id is not None:
-            min_id, max_id = root_args.rand_task_id
-            task_id = random.randint(min_id, max_id)
-        task_ids.append(task_id)
-
         req_cnt += 1
         if kwargs["num_requests"] and req_cnt >= kwargs["num_requests"]:
             break
@@ -346,5 +339,12 @@ def real_dataset(root_args, **kwargs):
     elif multi_turn:
         dataset_generator = partial(generate_multi_turn_dataset, all_turns, input_ids, all_metadata)
     else:
-        dataset_generator = partial(generate_text_dataset, input_ids)
+        # LoRA task ids and the --lora-dir apply to the text rows, as for the synthetic datasets.
+        random.seed(root_args.random_seed)
+        _, print_task_ids, lora_config = _generate_task_ids_and_lora_config(
+            root_args, num_collected
+        )
+        dataset_generator = partial(
+            generate_text_dataset, input_ids, task_ids=print_task_ids, lora_config=lora_config
+        )
     write_dataset_to_file(dataset_generator(output_lens), root_args.output)
