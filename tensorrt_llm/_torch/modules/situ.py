@@ -64,8 +64,16 @@ def situ_and_mul_kernel(
     BLOCK_SIZE: tl.constexpr,
     HAS_LINEAR_BETA: tl.constexpr,
     LAUNCH_WITH_PDL: tl.constexpr,
+    GATE_UP_INTERLEAVE: tl.constexpr = 0,
 ) -> None:
-    """Fused :class:`SituAndMul` on a packed ``[gate | up]`` row layout."""
+    """SiTU on packed ``[gate | up]`` rows or interleaved gate/up blocks.
+
+    With ``GATE_UP_INTERLEAVE == 0`` each input row is ``[g0 .. g(d-1), u0 .. u(d-1)]``.
+    With ``GATE_UP_INTERLEAVE == G`` it alternates blocks of ``G`` gate and ``G`` up
+    columns, ``[g0 .. g(G-1), u0 .. u(G-1), gG .. g(2G-1), uG .. u(2G-1), ...]``, and
+    ``d`` must be a multiple of ``G`` (the launcher checks it). The output row is
+    ``d`` wide either way.
+    """
     i = tl.program_id(axis=0).to(tl.int64)
     j = tl.program_id(axis=1)
 
@@ -78,8 +86,16 @@ def situ_and_mul_kernel(
     offsets = j * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < d
 
-    gate = tl.load(x_row_ptr + offsets, mask=mask).to(tl.float32)
-    up = tl.load(x_row_ptr + offsets + d, mask=mask).to(tl.float32)
+    if GATE_UP_INTERLEAVE:
+        gate_offsets = (offsets // GATE_UP_INTERLEAVE) * (
+            2 * GATE_UP_INTERLEAVE
+        ) + offsets % GATE_UP_INTERLEAVE
+        up_offsets = gate_offsets + GATE_UP_INTERLEAVE
+    else:
+        gate_offsets = offsets
+        up_offsets = offsets + d
+    gate = tl.load(x_row_ptr + gate_offsets, mask=mask).to(tl.float32)
+    up = tl.load(x_row_ptr + up_offsets, mask=mask).to(tl.float32)
 
     situ_a = beta * tldevice.tanh(gate / beta) * tl.sigmoid(gate)
     if HAS_LINEAR_BETA:
