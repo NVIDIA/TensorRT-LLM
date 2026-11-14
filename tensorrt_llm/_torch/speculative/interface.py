@@ -26,6 +26,7 @@ from packaging.version import Version
 from torch import nn
 
 from tensorrt_llm.logger import logger
+from tensorrt_llm.mapping import Mapping
 
 from ..._utils import get_sm_version, prefer_pinned
 from ..attention.backends.interface import AttentionMetadata
@@ -355,6 +356,65 @@ def get_force_num_accepted_tokens_float() -> float:
             f"{FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR} must be a valid number "
             f"(int or float), got '{env_value}'. Using default value 0.0.")
         return 0.0
+
+
+DISABLE_DRAFT_ROW_PICK_ENV_VAR = "TLLM_SPEC_DISABLE_DRAFT_ROW_PICK"
+
+
+def draft_layer_picks_rows(layer: nn.Module | None,
+                           mapping: Mapping | None = None) -> bool:
+    """Whether ``layer`` is fed the rows to keep after its attention.
+
+    A draft layer opts in with ``supports_pick_rows = True`` and a
+    ``pick_rows`` forward argument (``[n]`` indices into its input rows).
+    Given ``pick_rows``, the layer's attention still runs on every input row
+    (writing the draft KV of each of them), and the rest of the layer (the
+    residual, norms, MLP / MoE and final norm, all per-token) runs on those
+    ``n`` rows only, so it returns ``n`` rows: the input rows ``pick_rows``
+    would have selected from the full output. Under attention DP the caller
+    passes the per-rank picked row counts as ``all_rank_num_tokens``, which a
+    supporting layer uses only after the pick.
+
+    Declined: context parallelism (sharded attention outputs) and layers
+    without the attribute. A subclass of a supporting layer that overrides
+    ``forward`` without ``pick_rows``, or keeps its own row selection, sets
+    ``supports_pick_rows = False``. ``TLLM_SPEC_DISABLE_DRAFT_ROW_PICK=1``
+    turns picking off.
+    """
+    if layer is None or not getattr(layer, "supports_pick_rows", False):
+        return False
+    if mapping is not None and mapping.cp_size > 1:
+        return False
+    return os.environ.get(DISABLE_DRAFT_ROW_PICK_ENV_VAR, "0") != "1"
+
+
+class DraftRowPick:
+    """A worker's ``draft_layer_picks_rows`` decision for its draft layers,
+    resolved again (and logged) whenever their classes or the decline reason
+    change: a model may re-class its draft layers after the worker is built."""
+
+    def __init__(self, layers_name: str) -> None:
+        self._layers_name = layers_name
+        self._key: tuple[tuple[type, ...], str | None] | None = None
+        self._picks_rows = False
+
+    def resolve(self,
+                layers: list[nn.Module | None],
+                mapping: Mapping | None = None,
+                decline: str | None = None) -> bool:
+        """``decline``: the reason this worker cannot pick (None: it can)."""
+        layer_classes = tuple(type(layer) for layer in layers)
+        if (layer_classes, decline) != self._key:
+            self._key = (layer_classes, decline)
+            self._picks_rows = (decline is None and len(layers) > 0 and all(
+                draft_layer_picks_rows(layer, mapping) for layer in layers))
+            names = ", ".join(sorted({c.__name__
+                                      for c in layer_classes})) or "none"
+            logger.info(
+                f"{self._layers_name} ({names}) run after attention on " +
+                ("one row per request" if self._picks_rows else "every row") +
+                (f" ({decline})" if decline is not None else ""))
+        return self._picks_rows
 
 
 class SpeculativeDecodingMode(IntEnum):
