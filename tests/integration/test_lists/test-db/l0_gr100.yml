@@ -74,6 +74,8 @@ l0_gr100:
   - unittest/_torch/moe/test_moe_sorted_routing.py::test_backend_runs_on_sorted_routing[200-CUTEDSL_FC12]
   - unittest/_torch/moe/test_moe_sorted_routing.py::test_shared_expert_runs_beside_fc12_on_reserved_sms[8]
   - unittest/_torch/moe/test_moe_sorted_routing.py::test_shared_expert_runs_beside_fc12_on_reserved_sms[64]
+  # The Rubin fused FC1+FC2 kernel at tile 256 runs its 2-CTA scheduler handoff only on SM107.
+  - unittest/_torch/moe/kernels/parallel/test_cute_dsl_moe.py::test_nvfp4_fc12_fused_rubin_matches_two_op_path
   - unittest/_torch/moe/test_moe_backend.py::test_moe_backend[e60_k4_h2048_i1408-seq=1-dtype=torch.bfloat16-backend=CUTEDSL-quant=NVFP4_PLUS-routing=Renormalize]
   - unittest/_torch/moe/test_moe_backend.py::test_moe_backend[e60_k4_h2048_i1408-seq=8-dtype=torch.bfloat16-backend=CUTEDSL-quant=NVFP4_PLUS-routing=Renormalize]
   - unittest/_torch/moe/test_moe_backend.py::test_fc1_prologue_wait_preserves_exhaustion

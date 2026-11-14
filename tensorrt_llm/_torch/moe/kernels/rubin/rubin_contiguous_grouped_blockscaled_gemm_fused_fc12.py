@@ -45,6 +45,12 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.nvgpu.tcgen05.mma import CollectorOp
 from cutlass.cute.testing import assert_ as runtime_assert
 from . import manual_mma_128dp  # packaging: bare `import manual_mma_128dp` -> relative for trtllm package (kernel logic unchanged)
+from ..cutedsl_megamoe.helpers.cluster_pipeline import (
+    consumer_release_cluster,
+    consumer_wait_cluster,
+    producer_acquire_cluster,
+    producer_tail_cluster,
+)
 from cutlass.cutlass_dsl import (
     T,
     dsl_user_op,
@@ -3496,8 +3502,11 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                     if cutlass.const_expr(self.use_l2_atomic_scheduler):
                         if cutlass.const_expr(self.use_cluster_scheduler_response):
                             if is_scheduler_leader_cta:
-                                fc1_scheduler_pipeline.producer_acquire(
-                                    fc1_scheduler_producer_state
+                                # Peers release the response slot at cluster scope:
+                                # acquire it at cluster scope before the next publish
+                                # overwrites it.
+                                producer_acquire_cluster(
+                                    fc1_scheduler_pipeline, fc1_scheduler_producer_state
                                 )
                                 fc1_tile_sched.publish_next_work(
                                     fc1_scheduler_pipeline.producer_get_barrier(
@@ -3505,12 +3514,15 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                                     )
                                 )
                                 fc1_scheduler_producer_state.advance()
-                            fc1_scheduler_pipeline.consumer_wait(
-                                fc1_scheduler_consumer_state
+                            # The leader's st.async releases at cluster scope:
+                            # acquire at cluster scope before reading the response,
+                            # and release the slot at cluster scope afterwards.
+                            consumer_wait_cluster(
+                                fc1_scheduler_pipeline, fc1_scheduler_consumer_state
                             )
                             work_tile = fc1_tile_sched.get_published_work()
-                            fc1_scheduler_pipeline.consumer_release(
-                                fc1_scheduler_consumer_state
+                            consumer_release_cluster(
+                                fc1_scheduler_pipeline, fc1_scheduler_consumer_state
                             )
                             fc1_scheduler_consumer_state.advance()
                         else:
@@ -3524,8 +3536,8 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                 and self.use_cluster_scheduler_response
             ):
                 if is_scheduler_leader_cta:
-                    fc1_scheduler_pipeline.producer_tail(
-                        fc1_scheduler_producer_state
+                    producer_tail_cluster(
+                        fc1_scheduler_pipeline, fc1_scheduler_producer_state
                     )
 
             # FC2 owns an independent work-ID stream. There is deliberately no
@@ -3595,8 +3607,11 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                     if cutlass.const_expr(self.use_l2_atomic_scheduler):
                         if cutlass.const_expr(self.use_cluster_scheduler_response):
                             if is_scheduler_leader_cta:
-                                fc2_scheduler_pipeline.producer_acquire(
-                                    fc2_scheduler_producer_state
+                                # Peers release the response slot at cluster scope:
+                                # acquire it at cluster scope before the next publish
+                                # overwrites it.
+                                producer_acquire_cluster(
+                                    fc2_scheduler_pipeline, fc2_scheduler_producer_state
                                 )
                                 fc2_tile_sched.publish_next_work(
                                     fc2_scheduler_pipeline.producer_get_barrier(
@@ -3604,12 +3619,15 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                                     )
                                 )
                                 fc2_scheduler_producer_state.advance()
-                            fc2_scheduler_pipeline.consumer_wait(
-                                fc2_scheduler_consumer_state
+                            # The leader's st.async releases at cluster scope:
+                            # acquire at cluster scope before reading the response,
+                            # and release the slot at cluster scope afterwards.
+                            consumer_wait_cluster(
+                                fc2_scheduler_pipeline, fc2_scheduler_consumer_state
                             )
                             fc2_work_tile = fc2_tile_sched.get_published_work()
-                            fc2_scheduler_pipeline.consumer_release(
-                                fc2_scheduler_consumer_state
+                            consumer_release_cluster(
+                                fc2_scheduler_pipeline, fc2_scheduler_consumer_state
                             )
                             fc2_scheduler_consumer_state.advance()
                         else:
@@ -3623,8 +3641,8 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                 and self.use_cluster_scheduler_response
             ):
                 if is_scheduler_leader_cta:
-                    fc2_scheduler_pipeline.producer_tail(
-                        fc2_scheduler_producer_state
+                    producer_tail_cluster(
+                        fc2_scheduler_pipeline, fc2_scheduler_producer_state
                     )
 
             tile_info_pipeline.producer_acquire(tile_info_producer_state)
