@@ -64,6 +64,7 @@ def test_the_kill_switch_registers_nothing(monkeypatch):
         ((2, 64, 512), torch.bfloat16, "not float32"),
     ],
 )
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
 def test_select_declines_outside_its_range(monkeypatch, shape, dtype, why):
     monkeypatch.setattr(
         tile_select, "_op", lambda: pytest.fail(f"the op was reached for a step with {why}")
@@ -72,6 +73,7 @@ def test_select_declines_outside_its_range(monkeypatch, shape, dtype, why):
     assert tile_select.select(scores, torch.ones(shape[2], dtype=torch.int32), 1, 2) is None
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
 def test_select_declines_without_the_op(monkeypatch):
     monkeypatch.setattr(tile_select, "_op", lambda: None)
     scores = torch.zeros((2, 64, 512), dtype=torch.float32)

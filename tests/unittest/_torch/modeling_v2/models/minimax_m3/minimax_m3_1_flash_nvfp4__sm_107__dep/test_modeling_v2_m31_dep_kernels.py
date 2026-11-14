@@ -284,6 +284,7 @@ def test_install_again_counts_the_hooks_it_set(monkeypatch):
     assert lc2_decode.install(layers) == 2
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
 def test_the_model_hooks_the_layers_once_their_fmha_managers_exist(monkeypatch):
     from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__dep import (  # noqa: E501
         modeling,
