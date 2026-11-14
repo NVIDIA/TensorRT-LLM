@@ -446,9 +446,8 @@ class SessionPrefetcher:
         add latency when the size prediction is wrong, but avoids two MPI
         bootstraps contending on the same allocation.
 
-        ``env_overlay``: extra env vars to freeze into the WORKERS at spawn
-        (session_reuse restocks shadows with its worker-side weight cache
-        on). Passed through the library's worker-env channel, so the parent
+        ``env_overlay``: extra env vars to freeze into the WORKERS at spawn.
+        Passed through the library's worker-env channel, so the parent
         process environment — and therefore the take()-time snapshot
         comparison — is never touched.
         """

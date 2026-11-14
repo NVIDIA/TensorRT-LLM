@@ -71,14 +71,6 @@ _PATCH_TARGETS = (
 _RPC_PATCH_TARGET = "tensorrt_llm.executor.rpc_proxy"
 _ALL_PATCH_TARGETS = _PATCH_TARGETS + (_RPC_PATCH_TARGET,)
 
-# Worker-side HF weight cache for cache-managed pools only: set (if absent)
-# around the spawn so the workers freeze it, then restored — private/RPC
-# pools keep the production default (cache off).
-_WEIGHT_CACHE_ENV = {
-    "TRTLLM_HF_WEIGHT_CACHE": "1",
-    "TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES": "1",
-}
-
 
 _RETIRE_THREADS: list[threading.Thread] = []
 _RETIRE_LOCK = threading.Lock()
@@ -417,16 +409,12 @@ class SessionReuseCache:
         the prefetch layer (or on a shadow miss) the synchronous spawn is
         unchanged.
 
-        The worker-side HF weight cache env is frozen into the workers via
-        the library's ``env_overrides`` channel (parent env untouched, so
-        acquire-time snapshot comparisons still match); an explicit user
-        setting of either var is respected and left untouched. Prefetched
-        shadows were armed with the same overlay. wait_shutdown: shutdown of
-        this pool blocks until its workers exited, so a successor cannot
-        race the GPU-memory release.
+        Workers load checkpoints with the environment they inherit, so the
+        production checkpoint I/O defaults apply. wait_shutdown: shutdown of
+        this pool blocks until its workers exited, so a successor cannot race
+        the GPU-memory release.
         """
         snapshot = _spawn_snapshot()
-        overrides = {k: v for k, v in _WEIGHT_CACHE_ENV.items() if k not in os.environ}
         real = None
         prefetcher = _prefetcher()
         if prefetcher is not None:
@@ -440,13 +428,13 @@ class SessionReuseCache:
             # collection still fails, unidentified workers may remain alive;
             # an immediate retry would overlap another MPI bootstrap with
             # them, so propagate the fail-closed error.
-            real = real_cls(n_workers=n_workers, wait_shutdown=True, env_overrides=overrides)
+            real = real_cls(n_workers=n_workers, wait_shutdown=True)
         if prefetcher is not None:
             try:
                 # Restock only after the current pool is ready. On a shadow
                 # miss, scheduling before the synchronous spawn would make
                 # two MPI pools bootstrap concurrently on the same GPUs.
-                prefetcher.schedule_shadow(n_workers, env_overlay=overrides)
+                prefetcher.schedule_shadow(n_workers)
             except Exception:
                 pass
         real._reuse_uses = 0

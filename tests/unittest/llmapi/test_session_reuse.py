@@ -115,14 +115,13 @@ def test_cached_handover_reaps_in_flight_retires(reuse_cache):
 def test_cache_miss_takes_prefetched_shadow(reuse_cache):
     # A shadow armed at the PREVIOUS miss is consumed instantly on this one
     # (no synchronous spawn), and a replacement is restocked for the next
-    # miss with the worker-side weight-cache overlay.
-    shadow = _FakePool(2, wait_shutdown=True, env_overrides={"TRTLLM_HF_WEIGHT_CACHE": "1"})
+    # miss without a worker env overlay.
+    shadow = _FakePool(2, wait_shutdown=True)
     reuse_cache.prefetch.shadow = shadow
     s = reuse_cache.acquire(_FakePool, 2)
     assert s._real is shadow
     assert s._real._reuse_uses == 0  # adopted as a cache-managed pool
-    n, overlay = reuse_cache.prefetch.restocks[-1]
-    assert n == 2 and overlay.get("TRTLLM_HF_WEIGHT_CACHE") == "1"
+    assert reuse_cache.prefetch.restocks[-1] == (2, None)
 
 
 def test_cache_miss_falls_back_to_sync_spawn_and_restocks(reuse_cache):
@@ -142,7 +141,7 @@ def test_cache_miss_falls_back_to_sync_spawn_and_restocks(reuse_cache):
     reuse_cache.prefetch.schedule_shadow = _record_schedule
     s = reuse_cache.acquire(_OrderedPool, 2)  # nothing armed: sync spawn
     assert isinstance(s._real, _FakePool) and s._real.wait_shutdown
-    assert s._real.env_overrides.get("TRTLLM_HF_WEIGHT_CACHE") == "1"
+    assert s._real.env_overrides == {}
     assert reuse_cache.prefetch.restocks  # shadow armed for the NEXT miss
     assert events == ["sync pool ready", "shadow scheduled"]
 
@@ -280,21 +279,20 @@ def test_disabled_under_xdist(monkeypatch):
     assert not SessionReuseCache().enabled
 
 
-def test_weight_cache_env_scoped_to_spawn(reuse_cache, monkeypatch):
-    import os
-
+def test_pools_keep_the_production_weight_cache_default(reuse_cache, monkeypatch):
     monkeypatch.delenv("TRTLLM_HF_WEIGHT_CACHE", raising=False)
     s = reuse_cache.acquire(_FakePool, 2)
-    # Workers froze the cache env at spawn...
-    assert s._real.spawn_env_weight_cache == "1"
-    # ...but the suite's environment is untouched afterwards.
-    assert "TRTLLM_HF_WEIGHT_CACHE" not in os.environ
+    # Workers spawn with the default (cache off), so `auto` checkpoint I/O can
+    # select rank-striped read-ahead as it does outside the test suite.
+    assert s._real.env_overrides == {}
+    assert s._real.spawn_env_weight_cache is None
 
 
-def test_weight_cache_env_respects_user_setting(reuse_cache, monkeypatch):
-    monkeypatch.setenv("TRTLLM_HF_WEIGHT_CACHE", "0")
+@pytest.mark.parametrize("value", ["0", "1"])
+def test_weight_cache_env_respects_user_setting(reuse_cache, monkeypatch, value):
+    monkeypatch.setenv("TRTLLM_HF_WEIGHT_CACHE", value)
     s = reuse_cache.acquire(_FakePool, 2)
-    assert s._real.spawn_env_weight_cache == "0"  # explicit user value wins
+    assert s._real.spawn_env_weight_cache == value  # an explicit user value reaches workers
 
 
 def test_abort_after_release_never_kills_cached_pool(reuse_cache):
