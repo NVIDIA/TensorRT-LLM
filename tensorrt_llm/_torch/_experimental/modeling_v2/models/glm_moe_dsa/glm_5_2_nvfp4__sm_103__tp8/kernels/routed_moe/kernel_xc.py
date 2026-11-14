@@ -58,6 +58,7 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.cutlass_dsl import Float32, Int32, Int64, Uint32
+from cutlass.experimental import primitives as prims
 
 from . import ptx
 from .kernel import (
@@ -1181,7 +1182,19 @@ class RoutedMoeExpertClusterKernel(RoutedMoeKernel):
                 tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
                 kb = Int32(0)
                 while kb < FC1_KB:
-                    cute.arch.mbarrier_wait(b_mbar + kb, 0)
+                    # the peers' bulk copies of B / SFB complete this barrier with a
+                    # cluster-scope release; the plain wait acquires at CTA scope and does
+                    # not order the async-proxy reads below. A relaxed cluster-scope wait
+                    # followed by an acquire fence restricted to shared::cluster orders them
+                    # without the L1 invalidation an acquire-qualified try_wait incurs.
+                    while not prims.mbarrier_try_wait_parity(
+                        b_mbar + kb,
+                        0,
+                        scope=prims.MBarrierScope.CLUSTER,
+                        order=prims.MemOrder.RELAXED,
+                    ):
+                        pass
+                    prims.fence_sync_restrict(prims.MemOrder.ACQUIRE)
                     ring.consumer_wait(ring_state)
                     cute.copy(
                         copy_s2t_sfa,
@@ -1213,11 +1226,16 @@ class RoutedMoeExpertClusterKernel(RoutedMoeKernel):
 
         for rho in cutlass.range_constexpr(MAX_ROUNDS):
             if rho < rounds:
-                # this round's FC2 operand: the four FC1 tiles of the cluster
-                bar = Int32((b_mbar + B2_BAR + rho).toint())
-                done = ptx.mbar_try_wait_cluster(bar, Int32(0))
-                while done == 0:
-                    done = ptx.mbar_try_wait_cluster(bar, Int32(0))
+                # this round's FC2 operand: the four FC1 tiles of the cluster, released by
+                # the peers' cluster-scope arrivals (same wait form as the FC1 operand)
+                while not prims.mbarrier_try_wait_parity(
+                    b_mbar + B2_BAR + rho,
+                    0,
+                    scope=prims.MBarrierScope.CLUSTER,
+                    order=prims.MemOrder.RELAXED,
+                ):
+                    pass
+                prims.fence_sync_restrict(prims.MemOrder.ACQUIRE)
                 ptx.fence_proxy_async_shared()
                 if cutlass.const_expr(rho == 0):
                     if lane0:
@@ -1319,7 +1337,15 @@ class RoutedMoeExpertClusterKernel(RoutedMoeKernel):
             # debug only: wait for every k-block (local and peers'), then CTA 0
             # dumps B / SFB
             for k2 in cutlass.range_constexpr(FC1_KB):
-                cute.arch.mbarrier_wait(b_mbar + k2, 0)
+                # peers' bulk copies complete these barriers (same wait form as above)
+                while not prims.mbarrier_try_wait_parity(
+                    b_mbar + k2,
+                    0,
+                    scope=prims.MBarrierScope.CLUSTER,
+                    order=prims.MemOrder.RELAXED,
+                ):
+                    pass
+                prims.fence_sync_restrict(prims.MemOrder.ACQUIRE)
             qt = warp_idx * 32 + lane
             if warp_idx > TMA_WARP:
                 qt = qt - 64
