@@ -29,9 +29,10 @@ process boundary.
 """
 
 import dataclasses
+import enum
 import errno
 import re
-from typing import Optional
+from typing import Optional, Union
 
 from tensorrt_llm._errors import DEFAULT_REASONS, ERROR_CATEGORIES, ERROR_HINTS
 from tensorrt_llm.logger import logger
@@ -53,8 +54,27 @@ _UNSUPPORTED_RE = re.compile(
     r"|\bnot included in this TensorRT-LLM build\b",
     re.IGNORECASE,
 )
-_OOM_RE = re.compile(
-    r"out of memory|cudaErrorMemoryAllocation|CUDA_ERROR_OUT_OF_MEMORY", re.IGNORECASE
+# An allocation failed: CUDA, the driver, PyTorch, cuBLAS, NCCL's report of a
+# failed cudaMalloc, the KV cache manager and the C library (ENOMEM).
+_ANY_OOM_RE = re.compile(
+    r"out of memory|OUT_OF_MEMORY|cudaErrorMemoryAllocation|OutOfMemoryError|OOMError"
+    r"|Cannot allocate memory|CUBLAS_STATUS_ALLOC_FAILED|Failed to create cublas handle\. Status: 3\b"
+    r"|unhandled cuda error",
+    re.IGNORECASE,
+)
+# The failed allocation was host memory: the call or the error names it.
+_HOST_OOM_RE = re.compile(
+    r"HostOOMError|DiskOOMError|Host out of memory|Cannot allocate memory|pinned memory"
+    r"|cuMemHostRegister|cuMemHostAlloc|cudaHostRegister|cudaHostAlloc|cudaMallocHost",
+    re.IGNORECASE,
+)
+# Failures that name neither the device nor the host: CUDA's generic error,
+# raised by PyTorch's pinned host allocator and raw device allocations alike,
+# the KV cache manager's CuOOMError for any CUDA_ERROR_OUT_OF_MEMORY, and NCCL's
+# report of a failed cudaMalloc.
+_UNSURE_OOM_RE = re.compile(
+    r"CUDA error: out of memory|(?:^|: )CUDA out of memory\s*$|unhandled cuda error",
+    re.IGNORECASE | re.MULTILINE,
 )
 _WORKER_DIED_RE = re.compile(r"died during initialization|exited unexpectedly", re.IGNORECASE)
 # C++ kernel compilation: DeepGEMM's NVRTC JIT and the trtllm-gen FMHA nvcc probe.
@@ -105,13 +125,77 @@ _CUDA_NO_KERNEL_IMAGE_CODES = {209}
 # C++, CUDA, NCCL and third-party code, and TensorRT-LLM errors raised as plain
 # builtins. New TensorRT-LLM errors declare their category instead.
 _MESSAGE_RULES = (
-    (_OOM_RE, "resource", "gpu_oom"),
     (_GPU_BUSY_RE, "resource", "gpu_busy"),
     (_NCCL_RE, "runtime_init", "distributed"),
     (_WORKER_DIED_RE, "runtime_init", "worker_died"),
     (_CPP_JIT_RE, "runtime_init", "jit"),
     (_UNSUPPORTED_RE, "unsupported", "unsupported"),
 )
+
+
+class OomKind(str, enum.Enum):
+    """What an out-of-memory error ran out of (:func:`out_of_memory_kind`)."""
+
+    DEVICE = "device"
+    HOST = "host"
+    #: An allocation failed, but the error does not say whether it was device
+    #: or host memory.
+    UNSURE = "unsure"
+
+
+def _message_oom_kind(message: str) -> Optional[OomKind]:
+    if not _ANY_OOM_RE.search(message):
+        return None
+    if _HOST_OOM_RE.search(message):
+        return OomKind.HOST
+    if _UNSURE_OOM_RE.search(message):
+        return OomKind.UNSURE
+    return OomKind.DEVICE
+
+
+def _exception_oom_kind(exc: BaseException) -> Optional[OomKind]:
+    # PyTorch raises OutOfMemoryError only from its device allocators.
+    if _has_class(exc, ("OutOfMemoryError",), "torch"):
+        return OomKind.DEVICE
+    if isinstance(exc, MemoryError) or _has_class(exc, ("HostOOMError", "DiskOOMError")):
+        return OomKind.HOST
+    kind = _message_oom_kind(_message(exc))
+    if kind is not None:
+        return kind
+    if _has_class(exc, ("CuOOMError",)) or (
+        _has_class(exc, ("AcceleratorError",), "torch")
+        and getattr(exc, "error_code", None) in _CUDA_OOM_CODES
+    ):
+        return OomKind.UNSURE
+    return None
+
+
+def out_of_memory_kind(error: Union[BaseException, str]) -> Optional[OomKind]:
+    """Whether ``error`` is an allocation failure, and of which memory.
+
+    TensorRT-LLM's one test for out-of-memory errors, shared by startup
+    classification, the executor's startup explanation and the GPU memory
+    monitor. An exception is read by type where its type decides --
+    PyTorch's ``OutOfMemoryError`` comes only from its device allocators,
+    ``MemoryError`` and the KV cache manager's ``HostOOMError`` are host
+    memory -- and by message otherwise, along its cause chain. A definite
+    answer anywhere in the chain wins over :attr:`OomKind.UNSURE`. A string,
+    such as a logged message, is read by its text alone.
+
+    Returns:
+        The kind, or ``None`` when ``error`` is not an allocation failure.
+    """
+    if isinstance(error, str):
+        return _message_oom_kind(error)
+    unsure = False
+    for exc in _exception_chain(error):
+        kind = _exception_oom_kind(exc)
+        if kind is OomKind.UNSURE:
+            unsure = True
+        elif kind is not None:
+            return kind
+    return OomKind.UNSURE if unsure else None
+
 
 # Set once an LLM in this process has finished initializing.
 _llm_initialized = False
@@ -284,9 +368,11 @@ def _declared_rule(exc: BaseException) -> Optional[_Hit]:
 
 def _typed_rule(exc: BaseException) -> Optional[_Hit]:
     # Resources.
-    if _has_class(exc, ("OutOfMemoryError",), "torch"):
+    if _has_class(exc, ("OutOfMemoryError",), "torch") or _has_class(exc, ("CuOOMError",)):
         return _hit("resource", "gpu_oom")
-    if isinstance(exc, MemoryError):
+    if _has_class(exc, ("DiskOOMError",)):
+        return _hit("resource", "disk")
+    if isinstance(exc, MemoryError) or _has_class(exc, ("HostOOMError",)):
         return _hit("resource", "host_memory")
     if _has_class(exc, ("gaierror",), "socket"):
         return _hit("config_input", "host_name")
@@ -366,6 +452,12 @@ def _typed_rule(exc: BaseException) -> Optional[_Hit]:
 
 def _phrase_rule(exc: BaseException) -> Optional[_Hit]:
     message = _message(exc)
+    kind = _message_oom_kind(message)
+    if kind is OomKind.HOST:
+        return _hit("resource", "host_memory")
+    # NCCL's generic CUDA error is classified as an NCCL failure below.
+    if kind is OomKind.DEVICE or (kind is OomKind.UNSURE and not _NCCL_RE.search(message)):
+        return _hit("resource", "gpu_oom")
     for pattern, category, reason in _MESSAGE_RULES:
         if pattern.search(message):
             return _hit(category, reason)

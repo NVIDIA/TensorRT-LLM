@@ -245,6 +245,8 @@ l0_b200:
   - unittest/_torch/modules/dwdp/test_dense_attached_gpu.py
   # Real ConfigurableMoE layers sized and registered for DWDP while the model is built.
   - unittest/_torch/modules/dwdp/test_dwdp_moe_construction_gpu.py
+  # PagePool occupancy on the real VMM path, read by the memory monitor.
+  - unittest/_torch/modules/dwdp/test_page_pool_statistics.py
   # ------------- MoE components tests ---------------
   - unittest/_torch/moe/test_cutedsl_fc1_weight_layout.py
   - unittest/_torch/moe/test_moe_load_balancer.py

@@ -521,6 +521,56 @@ def test_connector_timeout_constraints(
 
 
 @pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+def test_memory_monitor_config_matches_runtime(schemas: dict[str, dict], filename: str) -> None:
+    from pydantic import ValidationError
+
+    from tensorrt_llm.llmapi import MemoryMonitorConfig
+
+    cases = [
+        ({"mode": "full", "ranks": [0, 3], "periodic_report_interval_s": 30}, True),
+        ({"mode": "full", "record_stacks": True, "report_dir": "/tmp/reports"}, True),
+        ({"oom_report_interval_s": 0}, True),
+        ({"oom_report_interval_s": 7 * 24 * 3600}, True),
+        ({"mode": "on"}, False),
+        ({"mode": 2}, False),
+        ({"ranks": []}, False),
+        ({"ranks": [-1]}, False),
+        ({"periodic_report_interval_s": 0.5}, False),
+        ({"periodic_report_interval_s": 1e10}, False),
+        ({"oom_report_interval_s": -1}, False),
+        ({"oom_report_interval_s": 7 * 24 * 3600 + 1}, False),
+        ({"report_dir": ""}, False),
+        ({"interval": 5}, False),
+        ({"periodic_report_interval": 30}, False),
+    ]
+    # As a trtllm-serve --config file is read: yaml.safe_load turns unquoted
+    # off/on into booleans and .inf into an infinite float.
+    for text, valid in [
+        ("mode: off", True),
+        ("mode: on", True),
+        ("mode: 0", True),
+        ("mode: 1", True),
+        ("mode: '1'", True),
+        ("mode: full", True),
+        ("oom_report_interval_s: .inf", False),
+        ("periodic_report_interval_s: .inf", False),
+    ]:
+        cases.append((yaml.safe_load(text), valid))
+    for value, valid in cases:
+        config = {"memory_monitor_config": value}
+        if filename == generator.DISAGG_SCHEMA:
+            config = {"context_servers": config}
+        errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
+        assert (not errors) == valid, (value, [error.message for error in errors])
+        try:
+            MemoryMonitorConfig(**value)
+            runtime_valid = True
+        except ValidationError:
+            runtime_valid = False
+        assert runtime_valid == valid, value
+
+
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
 @pytest.mark.parametrize("section", ["block_reuse_config", "mamba_state_config"])
 @pytest.mark.parametrize(("value", "valid"), [(True, True), (False, True), ("invalid", False)])
 def test_branch_snapshot_field_types(

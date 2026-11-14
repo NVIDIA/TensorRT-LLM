@@ -35,6 +35,8 @@ except Exception:
     MPI = None  # deferred; functions will error if used when ENABLE_MULTI_DEVICE is True
 
 from tensorrt_llm._torch.distributed.mnnvl_memory import init_helix_cp_comm
+from tensorrt_llm._torch.memory.monitor import names as monitor_names
+from tensorrt_llm._torch.memory.monitor import startup as monitor_startup
 from tensorrt_llm._utils import (local_mpi_size, mpi_allgather, mpi_barrier,
                                  mpi_comm, mpi_disabled, mpi_isend,
                                  mpi_isend_object, mpi_recv, mpi_recv_object,
@@ -1102,8 +1104,10 @@ class TorchDist(Distributed):
                     self._cuda_obj_pgs[dim] = pg
         # First collective per communicator: allocates its GPU buffers now
         # (before KV sizing) and validates the path end to end.
-        for pg in dict.fromkeys(self._cuda_obj_pgs.values()):
-            self._cuda_allgather_object(0, pg)
+        with monitor_startup.region(
+                monitor_names.REGION_TORCH_DISTRIBUTED_NCCL):
+            for pg in dict.fromkeys(self._cuda_obj_pgs.values()):
+                self._cuda_allgather_object(0, pg)
         logger.info(f"TorchDist: CUDA object-collective groups ready for "
                     f"{sorted(self._cuda_obj_pgs)} (max_ctas=4)")
 

@@ -22,6 +22,7 @@ import zmq
 
 from tensorrt_llm._torch.distributed.initialization import init_torch_distributed
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
+from tensorrt_llm._torch.visual_gen.memory_monitor import WorkerMemoryMonitor
 from tensorrt_llm._torch.visual_gen.output import PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.bindings.BuildInfo import check_cuda_architecture_supported
@@ -476,6 +477,7 @@ class DiffusionExecutor:
         self.world_size = dist.get_world_size()
         self.response_queue = queue.Queue()
         self.sender_thread = None
+        self.memory_monitor = WorkerMemoryMonitor(device_id, self.rank, self.world_size)
 
         # Only rank 0 handles IPC
         if self.rank == 0:
@@ -522,16 +524,19 @@ class DiffusionExecutor:
         logger.info(f"Worker {self.device_id}: Loading pipeline")
 
         try:
-            args = self.visual_gen_args
-            loader = PipelineLoader(args, device=f"cuda:{self.device_id}")
-            self.pipeline = loader.load(
-                skip_warmup=args.compilation_config.skip_warmup,
-            )
+            with self.memory_monitor.startup():
+                args = self.visual_gen_args
+                loader = PipelineLoader(args, device=f"cuda:{self.device_id}")
+                self.pipeline = loader.load(
+                    skip_warmup=args.compilation_config.skip_warmup,
+                )
+                self.memory_monitor.claim_weights(self.pipeline)
 
         except Exception as e:
             logger.error(f"Worker {self.device_id}: Failed to load pipeline: {e}")
             raise
 
+        self.memory_monitor.arm()
         logger.info(f"Worker {self.device_id}: Pipeline ready")
 
         # Sync all workers
@@ -715,6 +720,8 @@ class DiffusionExecutor:
                         error_type=self.pipeline.classify_request_failure(e),
                     )
                 )
+            # After the error response is queued: the report takes a while.
+            self.memory_monitor.report_error(e)
 
     def _reset_cuda_peak_memory_stats(self) -> None:
         """Reset CUDA peak memory stats for this worker if CUDA is available."""
@@ -833,7 +840,10 @@ def run_diffusion_worker(
             resp_hmac_key=resp_hmac_key,
             in_client_process=in_client_process,
         )
-        executor.serve_forever()
+        try:
+            executor.serve_forever()
+        finally:
+            executor.memory_monitor.release()
         if executor.pipeline is not None:
             executor.pipeline.cleanup()
         dist.destroy_process_group()

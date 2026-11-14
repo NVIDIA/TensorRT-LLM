@@ -74,6 +74,11 @@ from ..disaggregation.orchestration.pp_termination import \
 from ..disaggregation.orchestration.transfer_manager import AsyncTransferManager
 from ..distributed import Distributed
 from ..distributed.communicator import ReduceOp
+from ..distributed.mpi_polling import recv_until
+from ..memory.monitor import providers as monitor_providers
+from ..memory.monitor import settings as monitor_settings
+from ..memory.monitor import triggers as monitor_triggers
+from ..memory.monitor.ranks import RankReporter
 from ..models.modeling_multimodal_mixin import \
     maybe_prefetch_mm_encoder_for_next_iter
 from ..models.modeling_utils import DecoderModelForCausalLM
@@ -403,6 +408,33 @@ def _resolve_pp_mpi_progress_interval_us() -> int:
     return interval_us
 
 
+#: Serialises releasing an executor's part of the GPU memory monitor.
+_MONITOR_RELEASE_LOCK = threading.Lock()
+
+
+def _rank_reports_wanted(memory_monitor_config) -> bool:
+    """Whether every rank of the executor being built answers memory reports.
+
+    Only for the executor the monitor follows, in full mode, and only when
+    MPI allows calls from several threads: each rank's listener polls MPI
+    next to the executor's collectives. Every rank decides the same way:
+    ``memory_monitor_config`` comes with the arguments, the environment's
+    overrides folded in, and every rank initialised MPI the same way.
+    """
+    if not (monitor_settings.full_mode_in(memory_monitor_config)
+            and monitor_providers.executor_monitored()):
+        return False
+    from mpi4py import MPI
+
+    if MPI.Query_thread() < MPI.THREAD_MULTIPLE:
+        logger.warning_once(
+            "memory monitor: MPI does not provide MPI_THREAD_MULTIPLE, so "
+            "ranks other than 0 do not answer memory report requests",
+            key="memory_monitor_rank_reports_thread_level")
+        return False
+    return True
+
+
 class _SleepWakeupTag(IntEnum):
     """MPI message tags for the dedicated sleep/wakeup communicator.
 
@@ -439,45 +471,39 @@ _SLEEP_WAKEUP_ACK_POLL_INTERVAL_S = 0.01
 KV_POOL_REBALANCE_CHECK_INTERVAL = 10
 
 
-def _sleep_wakeup_ack_ready(comm, source: int, tag: _SleepWakeupTag) -> bool:
-    """Return whether an ACK is ready without blocking on recv."""
-    if hasattr(comm, "iprobe"):
-        return comm.iprobe(source=source, tag=tag)
-    if hasattr(comm, "Iprobe"):
-        return comm.Iprobe(source=source, tag=tag)
-    raise RuntimeError(
-        "_sleep_wakeup_comm does not support nonblocking ACK probe")
-
-
 def _recv_sleep_wakeup_ack_until(comm,
                                  source: int,
                                  deadline: float,
                                  expected_op_id: Optional[str] = None,
                                  expected_phase: Optional[str] = None) -> dict:
-    """Receive a sleep/wakeup ACK before an absolute monotonic deadline."""
-    while True:
-        if _sleep_wakeup_ack_ready(comm, source, _SleepWakeupTag.ACK):
-            ack = comm.recv(source=source, tag=_SleepWakeupTag.ACK)
-            if (expected_op_id is not None
-                    and ack.get("op_id") != expected_op_id):
-                logger.warning(
-                    f"Ignoring stale sleep/wakeup ACK from rank {source} for "
-                    f"op_id={ack.get('op_id')} (expected op_id={expected_op_id})."
-                )
-                continue
-            ack_phase = ack.get("phase")
-            if (expected_phase is not None and ack_phase is not None
-                    and ack_phase != expected_phase):
-                logger.warning(
-                    f"Ignoring stale sleep/wakeup ACK from rank {source} for "
-                    f"phase={ack_phase} (expected phase={expected_phase}).")
-                continue
-            return ack
-        if time.monotonic() >= deadline:
-            raise TimeoutError(
-                f"timed out waiting for sleep/wakeup ACK from rank {source} "
-                f"by deadline {deadline:.6f}")
-        time.sleep(_SLEEP_WAKEUP_ACK_POLL_INTERVAL_S)
+    """Receive a sleep/wakeup ACK before an absolute monotonic deadline.
+
+    ACKs for another operation or phase are stale: they are logged and
+    dropped, and the wait continues.
+    """
+
+    def accept(ack: dict) -> bool:
+        if expected_op_id is not None and ack.get("op_id") != expected_op_id:
+            logger.warning(
+                f"Ignoring stale sleep/wakeup ACK from rank {source} for "
+                f"op_id={ack.get('op_id')} (expected op_id={expected_op_id}).")
+            return False
+        ack_phase = ack.get("phase")
+        if (expected_phase is not None and ack_phase is not None
+                and ack_phase != expected_phase):
+            logger.warning(
+                f"Ignoring stale sleep/wakeup ACK from rank {source} for "
+                f"phase={ack_phase} (expected phase={expected_phase}).")
+            return False
+        return True
+
+    return recv_until(comm,
+                      source,
+                      _SleepWakeupTag.ACK,
+                      deadline,
+                      poll_interval_s=_SLEEP_WAKEUP_ACK_POLL_INTERVAL_S,
+                      accept=accept,
+                      what="sleep/wakeup ACK")
 
 
 def _recv_sleep_wakeup_ack(comm, source: int, timeout_s: float) -> dict:
@@ -1660,6 +1686,17 @@ class PyExecutor:
         # calls Dup() (a collective) on the main thread.
         self._sleep_wakeup_comm = None
         self._sleep_wakeup_listener_thread: Optional[threading.Thread] = None
+        # Gathers GPU memory reports from every rank for rank 0; set up in
+        # start_worker() in the monitor's full mode when ranks span MPI.
+        self._rank_reporter: Optional[RankReporter] = None
+        # Whether shutdown stopped the rank reporter, so that a late report
+        # request says the ranks are shutting down.
+        self._memory_monitor_released = False
+        # This executor's registration with the memory monitor, released at
+        # shutdown: its OOM reporting, startup record and providers. Set by
+        # the executor's creator.
+        self._memory_monitor_token: Optional[
+            monitor_providers.ExecutorToken] = None
         # Serialises concurrent sleep/wakeup calls so that the control_action
         # + _sleep_wakeup_comm send/recv sequence is never interleaved.  Without
         # this, two concurrent RPC calls could both pass control_request_barrier
@@ -2030,6 +2067,7 @@ class PyExecutor:
 
     def _event_loop_wrapper(self) -> None:
         crashed = False
+        watchdog = None
         self._event_loop_completed = False
         try:
             # Skip line profiler during warmup/memory estimation phase to avoid
@@ -2060,6 +2098,23 @@ class PyExecutor:
                 # A callback can fail outside the synchronized start/poll gates.
                 # Mark retention before cleanup wakes shutdown callers.
                 self._kv_connector_failed = True
+            if crashed:
+                # Armed BEFORE the error is reported and logged and before
+                # cleanup: cleanup can block without bound on a send handle
+                # wedged by the crash. A kill placed after it could be
+                # delayed or never fire.
+                watchdog = start_rank_crash_kill_watchdog(
+                    self.dist.world_size,
+                    error_delivered=self._event_loop_error_delivered,
+                )
+                # One of the executor's own error exits: an out-of-memory
+                # crash is reported in every monitor mode but off, on its own
+                # thread so the error still reaches the waiters first.
+                monitor_triggers.notify_error(error=e,
+                                              owner=getattr(
+                                                  self, "_memory_monitor_token",
+                                                  None),
+                                              background=True)
             logger.error(f"Error in event loop: {e}")
             logger.error(traceback.format_exc())
             # Stash the original error so local consumers
@@ -2082,13 +2137,6 @@ class PyExecutor:
             # enforces, not this one.
             raise
         finally:
-            # Armed BEFORE cleanup: cleanup can block without bound on a
-            # send handle wedged by the crash, and a kill placed only after
-            # it would never fire.
-            watchdog = start_rank_crash_kill_watchdog(
-                self.dist.world_size,
-                error_delivered=self._event_loop_error_delivered,
-            ) if crashed else None
             try:
                 node_server = getattr(self, "_openengine_node_server", None)
                 if node_server is not None:
@@ -2096,6 +2144,12 @@ class PyExecutor:
                     self._openengine_node_server = None
                 self._executor_loop_cleanup()
             finally:
+                if not crashed:
+                    # A rank whose loop ends without its own shutdown() -- a
+                    # follower under the RPC orchestrator's rank-local
+                    # shutdown -- still leaves the monitor. A crashed rank is
+                    # about to be killed and skips it.
+                    self._release_memory_monitor()
                 if crashed:
                     # Peers cannot make progress without this rank's loop:
                     # they would block in their next collective until their
@@ -2253,6 +2307,7 @@ class PyExecutor:
                             name="sleep_wakeup_listener_thread",
                         )
                         self._sleep_wakeup_listener_thread.start()
+                self._start_rank_reporter()
                 if self.dist.pp_size > 1 and not self._disable_mpi:
                     self._start_mpi_progress_thread()
                 self.worker_thread = threading.Thread(
@@ -2304,6 +2359,76 @@ class PyExecutor:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.shutdown()
+
+    def _start_rank_reporter(self) -> None:
+        """Let rank 0 ask every rank for its GPU memory report.
+
+        A report request reaches rank 0 only; rank 0 asks the others over
+        their own communicator. ``Dup()`` is collective, and every rank makes
+        the same decision (:func:`_rank_reports_wanted`). No report can be
+        requested from the KV-sizing pass, which runs as warmup on every
+        rank, so it gets no reporter. Call on the main thread before the
+        worker thread starts.
+        """
+        if (self.dist.world_size <= 1 or self._disable_mpi or self.is_warmup or
+                not _rank_reports_wanted(self.llm_args.memory_monitor_config)):
+            return
+        self._rank_reporter = RankReporter(mpi_comm().Dup(), self.dist.rank,
+                                           self.dist.world_size, self.device_id)
+
+    def gather_memory_reports(self) -> list[str]:
+        """GPU memory reports of ranks 1..N-1, gathered by rank 0.
+
+        Only rank 0 answers report requests under MPI. Without the monitor's
+        full mode the other ranks have no listener, and each gets a line
+        saying so; with Ray every worker answers for itself and this is
+        empty.
+        """
+        rank_reporter = self._rank_reporter
+        if rank_reporter is not None:
+            return rank_reporter.gather()
+        dist = self.dist
+        if dist.world_size <= 1 or dist.rank != 0 or self._disable_mpi:
+            return []
+        if self._memory_monitor_released:
+            return [
+                f"rank {rank}: {RankReporter.SHUTTING_DOWN}"
+                for rank in range(1, dist.world_size)
+            ]
+        token = self._memory_monitor_token
+        if token is not None and not token.monitored:
+            return [
+                f"rank {rank}: {monitor_providers.NOT_MONITORED}"
+                for rank in range(1, dist.world_size)
+            ]
+        return [
+            f"rank {rank}: not gathered; run with memory_monitor_config.mode='full' "
+            "(or TLLM_MEM_MONITOR=1) to get every rank's report"
+            for rank in range(1, dist.world_size)
+        ]
+
+    def _release_memory_monitor(self) -> None:
+        """Stop this executor's part of the GPU memory monitor.
+
+        Called by shutdown and by the executor thread when its loop ends,
+        possibly at the same time; each step clears its attribute, under a
+        lock, before it runs, so no step runs twice. Like the rest of
+        shutdown, it reads attributes with defaults, so it also works on an
+        executor built without ``__init__``.
+        """
+        with _MONITOR_RELEASE_LOCK:
+            self._release_memory_monitor_locked()
+
+    def _release_memory_monitor_locked(self) -> None:
+        rank_reporter = getattr(self, "_rank_reporter", None)
+        self._rank_reporter = None
+        if rank_reporter is not None:
+            self._memory_monitor_released = True
+            rank_reporter.stop()
+        token = getattr(self, "_memory_monitor_token", None)
+        self._memory_monitor_token = None
+        if token is not None:
+            monitor_providers.end_executor(token)
 
     def _shutdown_sleep_wakeup_listeners(self) -> None:
         """Signal sleep/wakeup listener threads to exit and drain bounded ACKs."""
@@ -2574,6 +2699,7 @@ class PyExecutor:
         self.hang_detector = None
         self._sleep_wakeup_comm = None
         self._sleep_wakeup_listener_thread = None
+        self._rank_reporter = None
         self.request_broadcaster = None
         self._disagg_coordinator = None
         self._disagg_pp_termination_handler = None
@@ -2630,60 +2756,68 @@ class PyExecutor:
         """Stop execution and release GPU resources; retain model ownership."""
         if getattr(self, "_shutdown_runtime_complete", False):
             return self._release_execution_pools()
-        node_server = getattr(self, "_openengine_node_server", None)
-        if node_server is not None:
-            node_server.close()
-            self._openengine_node_server = None
-        if self.worker_started:
-            self.executor_request_queue.enqueue_shutdown_request()
-            self.shutdown_event.wait()
-        if (self.enable_attention_dp and self.kv_connector_manager is not None
-                and self.kv_connector_manager.get_pending_transfer_requests()):
-            self._kv_connector_failed = True
-        if self._kv_connector_failed:
-            _failed_kv_connector_executors[id(self)] = self
-            logger.error("KV connector failed; retaining DMA resources until "
-                         "process exit. Process restart is required.")
-        # Tear down any profile window an HTTP caller left open (i.e.
-        # /start_profile without a matching /stop_profile).  Runs before the
-        # hang-detector early return below so the leaked window is closed on
-        # every shutdown path.  A no-op when the executor loop already
-        # unwound its own profiling state.
-        self._profile_manager.cleanup()
-        if self.hang_detector is not None and self.hang_detector.detected():
-            # Early return here to avoid waiting for hanging threads.
-            # Since `on_detected` has sent the error message as response,
-            # this worker will be asked to shutdown immediately.
-            # Since the whole process will shutdown after this `shutdown` call,
-            # All threads and memory pools will be freed properly.
-            logger.error("Hang detected, shutting down immediately.")
-            # Stop the relay thread and the native progress thread from
-            # probing while the hang detector aborts MPI. A relay-thread probe
-            # already in flight is not interrupted. Do not let the outer worker
-            # enter model collectives on a broken rank set.
-            self._pp_mpi_progress_stop.set()
-            self._stop_mpi_progress_thread()
-            self._terminal_model_engines = ()
-            return False
-        if self.worker_started:
-            self.worker_thread.join()
-        if self.kv_connector_manager is not None and not self._kv_connector_failed:
-            self.kv_connector_manager.shutdown()
-        if self.dist.pp_size > 1 and self.worker_started:
-            # The worker thread has exited, so no PP traffic needs progress.
-            self._pp_mpi_progress_stop.set()
-            self.executed_batch_queue.put(None)
-            self.broadcast_sample_state_handler.join()
-            # The relay thread exits through the sentinel without another
-            # pump tick, so acknowledge the quiesce here; otherwise the exit
-            # hook would wait out its full timeout.
-            self._pp_mpi_progress_quiesced.set()
-            self._stop_mpi_progress_thread()
-        # Signal non-rank-0 sleep/wakeup listener threads to exit.  This runs
-        # after the worker thread has joined, which guarantees that the non-rank-0
-        # executor loops have already processed the shutdown broadcast and are
-        # no longer driving NCCL, so the send cannot deadlock.
-        self._shutdown_sleep_wakeup_listeners()
+        # Released whichever step below raises or returns early: a live
+        # registration would keep the next executor in this process from
+        # being monitored.
+        try:
+            node_server = getattr(self, "_openengine_node_server", None)
+            if node_server is not None:
+                node_server.close()
+                self._openengine_node_server = None
+            if self.worker_started:
+                self.executor_request_queue.enqueue_shutdown_request()
+                self.shutdown_event.wait()
+            if (self.enable_attention_dp
+                    and self.kv_connector_manager is not None and
+                    self.kv_connector_manager.get_pending_transfer_requests()):
+                self._kv_connector_failed = True
+            if self._kv_connector_failed:
+                _failed_kv_connector_executors[id(self)] = self
+                logger.error(
+                    "KV connector failed; retaining DMA resources until "
+                    "process exit. Process restart is required.")
+            # Tear down any profile window an HTTP caller left open (i.e.
+            # /start_profile without a matching /stop_profile).  Runs before the
+            # hang-detector early return below so the leaked window is closed on
+            # every shutdown path.  A no-op when the executor loop already
+            # unwound its own profiling state.
+            self._profile_manager.cleanup()
+            if self.hang_detector is not None and self.hang_detector.detected():
+                # Early return here to avoid waiting for hanging threads.
+                # Since `on_detected` has sent the error message as response,
+                # this worker will be asked to shutdown immediately.
+                # Since the whole process will shutdown after this `shutdown` call,
+                # All threads and memory pools will be freed properly.
+                logger.error("Hang detected, shutting down immediately.")
+                # Stop the relay thread and the native progress thread from
+                # probing while the hang detector aborts MPI. A relay-thread probe
+                # already in flight is not interrupted. Do not let the outer worker
+                # enter model collectives on a broken rank set.
+                self._pp_mpi_progress_stop.set()
+                self._stop_mpi_progress_thread()
+                self._terminal_model_engines = ()
+                return False
+            if self.worker_started:
+                self.worker_thread.join()
+            if self.kv_connector_manager is not None and not self._kv_connector_failed:
+                self.kv_connector_manager.shutdown()
+            if self.dist.pp_size > 1 and self.worker_started:
+                # The worker thread has exited, so no PP traffic needs progress.
+                self._pp_mpi_progress_stop.set()
+                self.executed_batch_queue.put(None)
+                self.broadcast_sample_state_handler.join()
+                # The relay thread exits through the sentinel without another
+                # pump tick, so acknowledge the quiesce here; otherwise the exit
+                # hook would wait out its full timeout.
+                self._pp_mpi_progress_quiesced.set()
+                self._stop_mpi_progress_thread()
+            # Signal non-rank-0 sleep/wakeup listener threads to exit.  This runs
+            # after the worker thread has joined, which guarantees that the non-rank-0
+            # executor loops have already processed the shutdown broadcast and are
+            # no longer driving NCCL, so the send cannot deadlock.
+            self._shutdown_sleep_wakeup_listeners()
+        finally:
+            self._release_memory_monitor()
         encoder_launch_executor = getattr(self, "encoder_launch_executor", None)
         if encoder_launch_executor is not None:
             encoder_launch_executor.shutdown(wait=True)
@@ -2731,9 +2865,8 @@ class PyExecutor:
         if self.kv_cache_transceiver is not None:
             self.kv_cache_transceiver.prepare_shutdown()
         if self.resource_manager is not None:
-            for manager in self.resource_manager.resource_managers.values():
-                if manager:
-                    manager.shutdown()
+            self._shutdown_resource_managers(
+                self.resource_manager.resource_managers.values())
         if self.kv_cache_transceiver is not None:
             # Backends that defer deregistration release it after the pools.
             self.kv_cache_transceiver.shutdown()
@@ -2741,6 +2874,20 @@ class PyExecutor:
         # release, or resource-manager shutdown.
         self._shutdown_runtime_complete = True
         return self._release_execution_pools()
+
+    @staticmethod
+    def _shutdown_resource_managers(managers) -> None:
+        """Shut the resource managers down, out of the memory monitor first.
+
+        A manager is dropped from the monitor before it frees its memory, so
+        the reading that closes the startup step doing the release (the KV
+        sizing pass's, for its temporary pool) no longer counts it. A KV cache
+        manager V1 keeps reporting the bytes it allocated after its shutdown.
+        """
+        for manager in managers:
+            if manager:
+                monitor_providers.unregister_providers_of(manager)
+                manager.shutdown()
 
     def _release_execution_pools(self) -> bool:
         if self.virtual_memory_pools is not None:
@@ -11482,7 +11629,20 @@ class PyExecutor:
                 # Only a novel rank-local fatal raises to force local teardown;
                 # a synchronized fatal has already published in lockstep and
                 # tears down every rank together via is_shutdown.
+                # _event_loop_wrapper arms the crash watchdog and then
+                # reports it if it is an out-of-memory error.
                 raise self._fatal_error
+
+        # Built only now, after the error responses are out: a report takes
+        # time, and the clients must not wait for it. An out-of-memory error
+        # that reaches here escaped its caller, whether PyTorch or native
+        # code (cuBLAS, NCCL, C++ pools) failed to allocate. A no-op when the
+        # monitor is off, the error is unrelated, or the monitor follows
+        # another executor.
+        monitor_triggers.notify_error(error_msg,
+                                      owner=getattr(self,
+                                                    "_memory_monitor_token",
+                                                    None))
 
     def _terminate_request(self, request: LlmRequest) -> None:
         if self.disagg.defer_gen_termination(request) is True:

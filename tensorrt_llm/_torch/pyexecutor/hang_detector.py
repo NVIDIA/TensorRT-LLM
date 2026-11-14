@@ -19,6 +19,7 @@ import signal
 import sys
 import threading
 import time
+import weakref
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -376,6 +377,16 @@ class RankCrashKillWatchdog(threading.Thread):
         )
 
 
+#: Watchdogs armed in this process, so work that would delay the error the
+#: grace period exists to deliver can tell that a kill is pending.
+_armed_watchdogs: "weakref.WeakSet[RankCrashKillWatchdog]" = weakref.WeakSet()
+
+
+def rank_crash_kill_pending() -> bool:
+    """Whether an armed rank-crash watchdog may still kill this process."""
+    return any(w.is_alive() and not w.cancelled for w in list(_armed_watchdogs))
+
+
 def start_rank_crash_kill_watchdog(
     world_size: int,
     error_delivered: Optional[threading.Event] = None,
@@ -407,6 +418,7 @@ def start_rank_crash_kill_watchdog(
             return None
         watchdog = RankCrashKillWatchdog(world_size, grace, error_delivered)
         watchdog.start()
+        _armed_watchdogs.add(watchdog)
         return watchdog
     except Exception as e:  # noqa: BLE001 - must not mask the loop's original error
         _best_effort_log_error(f"failed to arm rank-crash kill watchdog (ignored): {e!r}")

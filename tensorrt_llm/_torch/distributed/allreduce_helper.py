@@ -98,14 +98,12 @@ class CustomAllReduceHelper:
         # Force pull mode and disable lamport when force deterministic is enabled, for reducing device memory usage.
         is_p2p_supported = can_access_peer(mapping)
         ipc_buffers_size = size
-        ipc_buffers_ping = IpcMemory(mapping, ipc_buffers_size, is_p2p_supported)
-        ipc_buffers_pong = IpcMemory(mapping, ipc_buffers_size, is_p2p_supported)
-        ipc_barriers_in = IpcMemory(
-            mapping, IpcMemory.IPC_BARRIERS_SIZE_PER_GPU * mapping.tp_size * 2, is_p2p_supported
-        )
-        ipc_barriers_out = IpcMemory(
-            mapping, IpcMemory.IPC_BARRIERS_SIZE_PER_GPU * mapping.tp_size * 2, is_p2p_supported
-        )
+        label = "low-precision allreduce workspace"
+        ipc_buffers_ping = IpcMemory(mapping, ipc_buffers_size, is_p2p_supported, label)
+        ipc_buffers_pong = IpcMemory(mapping, ipc_buffers_size, is_p2p_supported, label)
+        barriers_size = IpcMemory.IPC_BARRIERS_SIZE_PER_GPU * mapping.tp_size * 2
+        ipc_barriers_in = IpcMemory(mapping, barriers_size, is_p2p_supported, label)
+        ipc_barriers_out = IpcMemory(mapping, barriers_size, is_p2p_supported, label)
         buffers = [ipc_buffers_ping, ipc_buffers_pong, ipc_barriers_in, ipc_barriers_out]
 
         return buffers, torch.tensor(
@@ -124,11 +122,12 @@ class CustomAllReduceHelper:
         mapping: Mapping, size: int
     ) -> Tuple[List[IpcMemory], "torch.tensor"]:
         is_p2p_supported = can_access_peer(mapping)
+        label = "custom allreduce workspace"
         ipc_buffers_size = size * mapping.tp_size
-        ipc_buffers = IpcMemory(mapping, ipc_buffers_size, is_p2p_supported)
-        ipc_barriers = IpcMemory(mapping, 256 * mapping.tp_size, is_p2p_supported)
+        ipc_buffers = IpcMemory(mapping, ipc_buffers_size, is_p2p_supported, label)
+        ipc_barriers = IpcMemory(mapping, 256 * mapping.tp_size, is_p2p_supported, label)
         lamport_buffers_size = size * mapping.tp_size
-        lamport_buffers = IpcMemory(mapping, 3 * lamport_buffers_size, is_p2p_supported)
+        lamport_buffers = IpcMemory(mapping, 3 * lamport_buffers_size, is_p2p_supported, label)
         if is_p2p_supported:
             lamport_initialize(
                 lamport_buffers.local_ptr,

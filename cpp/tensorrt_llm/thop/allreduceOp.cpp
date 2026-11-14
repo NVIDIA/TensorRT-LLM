@@ -2543,6 +2543,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def("release_nccl_window_graph_owner(int owner) -> ()");
     m.def("set_nccl_window_allocation_suppressed(bool suppressed) -> bool");
     m.def("get_nccl_window_buffer_release_epoch() -> int");
+    m.def("get_nccl_window_usage(int device) -> int[]");
     m.def("promote_nccl_window_buffer_releases(int device, int release_epoch) -> ()");
     m.def(
         "minimax_allreduce_rms("
@@ -2619,6 +2620,14 @@ TORCH_LIBRARY_IMPL(trtllm, CatchAll, m)
             return static_cast<int64_t>(
                 tensorrt_llm::common::nccl_util::NCCLWindowAllocator::getInstance().getBufferReleaseEpoch());
         });
+    m.impl("get_nccl_window_usage",
+        [](int64_t device)
+        {
+            auto const usage = tensorrt_llm::common::nccl_util::NCCLWindowAllocator::getInstance().getDeviceUsage(
+                static_cast<int>(device));
+            return std::vector<int64_t>{static_cast<int64_t>(usage.bufferCount), static_cast<int64_t>(usage.totalBytes),
+                static_cast<int64_t>(usage.inUseBytes)};
+        });
     m.impl("promote_nccl_window_buffer_releases",
         [](int64_t device, int64_t releaseEpoch)
         {
@@ -2631,6 +2640,7 @@ TORCH_LIBRARY_IMPL(trtllm, CatchAll, m)
     m.impl("release_nccl_window_graph_owner", [](int64_t) {});
     m.impl("set_nccl_window_allocation_suppressed", [](bool) { return false; });
     m.impl("get_nccl_window_buffer_release_epoch", []() { return int64_t{0}; });
+    m.impl("get_nccl_window_usage", [](int64_t) { return std::vector<int64_t>{0, 0, 0}; });
     m.impl("promote_nccl_window_buffer_releases", [](int64_t, int64_t) {});
 #endif
 }

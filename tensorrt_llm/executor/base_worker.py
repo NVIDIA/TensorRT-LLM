@@ -962,6 +962,46 @@ class BaseWorker(GenerationExecutor):
         self._check_sleep_wakeup_preconditions("get_memory_status")
         return self.engine.get_memory_status()
 
+    def get_memory_report(self) -> list[str]:
+        """Explain where GPU memory is going, as readable reports.
+
+        Built by the GPU memory monitor (``tensorrt_llm._torch.memory.monitor``)
+        in every monitor mode, including ``off``. This worker's own report comes
+        first. Under the MPI executor only rank 0 is asked; it adds the other
+        ranks' reports in the monitor's full mode, and otherwise one line per
+        rank saying they were not gathered. A report that could not be built
+        is replaced by a line saying so.
+        """
+        from tensorrt_llm._torch.memory.monitor import current_rank
+        from tensorrt_llm._torch.memory.monitor.providers import NOT_MONITORED
+        from tensorrt_llm._torch.memory.monitor.triggers import report_now
+
+        token = getattr(self.engine, "_memory_monitor_token", None)
+        if token is not None and not token.monitored:
+            # Another executor in this process holds the monitor; a report
+            # would describe that executor's memory.
+            dist = getattr(self.engine, "dist", None)
+            world_size = dist.world_size if dist is not None else 1
+            return [
+                f"rank {rank}: {NOT_MONITORED}" for rank in range(world_size)
+            ]
+        # Answered on an RPC thread, whose current device is not necessarily
+        # the one this worker serves on; report_now selects it.
+        own = report_now(tag="on_demand",
+                         force=True,
+                         device_index=getattr(self.engine, "device_id", None),
+                         save=False)
+        if own is None:
+            dist = getattr(self.engine, "dist", None)
+            rank = dist.rank if dist is not None else current_rank()
+            own = (f"rank {rank}: the report could not be built; "
+                   "see this rank's log")
+        reports = [own]
+        gather = getattr(self.engine, "gather_memory_reports", None)
+        if gather is not None:
+            reports.extend(gather())
+        return reports
+
     def _prepare_sleep_tags(
         self,
         tags: list[ExecutorMemoryType],

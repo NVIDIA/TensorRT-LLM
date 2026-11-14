@@ -24,7 +24,8 @@ add_library(userbuffers_src STATIC ${USERBUFFERS_SRCS})
 add_library(tllm::kernel_userbuffers ALIAS userbuffers_src)
 target_link_libraries(
   userbuffers_src
-  PUBLIC tllm::common_cuda tllm::runtime_distributed CUDA::cuda_driver
+  PUBLIC tllm::common_cuda tllm::common_native_memory tllm::runtime_distributed
+         CUDA::cuda_driver
   PRIVATE tllm::common_environment Threads::Threads)
 if(ENABLE_MULTI_DEVICE)
   target_link_libraries(userbuffers_src PUBLIC ${NCCL_LIB})

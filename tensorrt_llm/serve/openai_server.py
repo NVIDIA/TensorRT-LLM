@@ -696,6 +696,8 @@ class OpenAIServer(_VideoRoutesMixin):
         self._enable_runtime_control_endpoints = enable_runtime_control_endpoints
         self._runtime_control_api_key = runtime_control_api_key
         self._runtime_control_replay_cache = RuntimeControlReplayCache()
+        # The gather in flight for GET /memory_report, shared by concurrent requests.
+        self._memory_report_task: Optional[asyncio.Future] = None
         self.server_role = server_role
         # Will be set in __call__
         self.binding_addr = None
@@ -1369,6 +1371,7 @@ class OpenAIServer(_VideoRoutesMixin):
                                methods=["POST"])
 
         self._register_runtime_control_routes()
+        self._register_memory_report_route()
         self._register_rl_control_routes()
         self.app.add_api_route("/server_info",
                                self.get_server_info,
@@ -1443,6 +1446,47 @@ class OpenAIServer(_VideoRoutesMixin):
                 status_code=HTTPStatus.UNAUTHORIZED,
                 detail=str(error),
             ) from error
+
+    def _register_memory_report_route(self) -> None:
+        """Serve ``GET /memory_report`` in the GPU memory monitor's full mode.
+
+        A report exposes process IDs, other processes' device usage and, in
+        stack mode, source paths, and each request makes every rank build a
+        report next to its executor loop. The route therefore takes the
+        runtime-control request signing, like ``/memory_status``, and exists
+        only when ``memory_monitor_config`` selects full mode (the
+        arguments fold ``TLLM_MEM_MONITOR`` into it) and a runtime-control
+        key is set. Sleep mode is not needed. The key is the
+        server's ``runtime_control_api_key`` or, failing that,
+        ``TRTLLM_RUNTIME_CONTROL_API_KEY``. With several frontends the route
+        is not served, since each frontend keeps its own replay cache. The
+        frontend is rank 0 and serves every rank's report, so
+        ``TLLM_MEM_MONITOR_RANKS`` does not decide whether it exists.
+        """
+        from tensorrt_llm._torch.memory.monitor.settings import full_mode_in
+
+        args = self.generator.args
+        if not full_mode_in(args.memory_monitor_config):
+            return
+        api_key = (self._runtime_control_api_key
+                   or os.getenv("TRTLLM_RUNTIME_CONTROL_API_KEY"))
+        if not api_key:
+            logger.info(
+                "GET /memory_report is not served: set "
+                "TRTLLM_RUNTIME_CONTROL_API_KEY to serve it with signed "
+                "requests. LLM.get_memory_report() returns the same reports.")
+            return
+        if args.num_serve_frontends > 1:
+            logger.info(
+                "GET /memory_report is not served with num_serve_frontends > "
+                "1: request signing keeps its replay cache per frontend.")
+            return
+        self._runtime_control_api_key = api_key
+        self.app.add_api_route(
+            "/memory_report",
+            self.memory_report,
+            methods=["GET"],
+            dependencies=[Depends(self._require_runtime_control_auth)])
 
     def _register_runtime_control_routes(self) -> None:
         if not self._enable_runtime_control_endpoints:
@@ -3807,12 +3851,12 @@ class OpenAIServer(_VideoRoutesMixin):
                                 "message": str(error)
                             }})
 
-    async def _call_runtime_memory_method(self, method: str,
-                                          tags: Optional[List[str]]) -> object:
+    async def _call_runtime_memory_method(self, method: str, *args:
+                                          object) -> object:
         operation = getattr(self.generator, method)
         if isinstance(self.generator, AsyncLLM):
-            return await operation(tags)
-        return await asyncio.to_thread(operation, tags)
+            return await operation(*args)
+        return await asyncio.to_thread(operation, *args)
 
     async def runtime_release_memory(
         self,
@@ -3842,17 +3886,35 @@ class OpenAIServer(_VideoRoutesMixin):
 
     async def runtime_memory_status(self) -> JSONResponse:
         try:
-            if isinstance(self.generator, AsyncLLM):
-                status = await self.generator.get_memory_status()
-            else:
-                status = await asyncio.to_thread(
-                    self.generator.get_memory_status)
+            status = await self._call_runtime_memory_method("get_memory_status")
         except Exception as error:
             return JSONResponse(status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                                 content={"error": {
                                     "message": str(error)
                                 }})
         return JSONResponse(content=status.model_dump(mode="json"))
+
+    async def memory_report(self) -> JSONResponse:
+        """Where each GPU worker's memory is going, as readable reports.
+
+        See ``LLM.get_memory_report``. Concurrent requests share one
+        in-flight gather rather than each asking every rank again.
+        """
+        task = self._memory_report_task
+        if task is None or task.done():
+            task = asyncio.ensure_future(
+                self._call_runtime_memory_method("get_memory_report"))
+            self._memory_report_task = task
+        try:
+            # Shielded: a client that disconnects must not cancel the
+            # gather other requests are waiting on.
+            reports = await asyncio.shield(task)
+        except Exception as error:
+            return JSONResponse(status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                                content={"error": {
+                                    "message": str(error)
+                                }})
+        return JSONResponse(content={"reports": reports})
 
     async def release_memory(self,
                              request: MemoryUpdateRequest) -> JSONResponse:

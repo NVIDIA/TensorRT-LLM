@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/nativeMemory.h"
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/runtime/ipcNvlsMemory.h"
 #include "tensorrt_llm/runtime/utils/multiDeviceUtils.h"
@@ -143,7 +144,8 @@ void NcclCommunicator::receive(
 #endif // ENABLE_MULTI_DEVICE
 }
 
-ncclComm_t NcclCommunicator::createComm(int worldSize, int rank, mpi::MpiComm const& mpiComm)
+ncclComm_t NcclCommunicator::createComm(
+    int worldSize, int rank, mpi::MpiComm const& mpiComm, common::NativeMemoryRecord& nativeMemory)
 {
 #if ENABLE_MULTI_DEVICE
 
@@ -176,7 +178,10 @@ ncclComm_t NcclCommunicator::createComm(int worldSize, int rank, mpi::MpiComm co
     }
     mpiComm.bcastValue(id, 0);
     ncclComm_t comm;
+    auto const freeBefore = tensorrt_llm::common::currentDeviceFreeBytes();
     TLLM_NCCL_CHECK(ncclCommInitRank(&comm, worldSize, id, rank));
+    nativeMemory = tensorrt_llm::common::recordNativeAllocationMeasured(
+        tensorrt_llm::common::nativeMemoryLabels::kNcclCommunicators, freeBefore);
     return comm;
 #else
     // Python runtime requires instantiation of a communicator even though it may never be used to enable
@@ -192,5 +197,6 @@ NcclCommunicator::~NcclCommunicator()
     {
         TLLM_LOG_WARNING("Failed to destroy NCCL communicator.");
     }
+    tensorrt_llm::common::recordNativeRelease(mNativeMemory);
 #endif // ENABLE_MULTI_DEVICE
 }

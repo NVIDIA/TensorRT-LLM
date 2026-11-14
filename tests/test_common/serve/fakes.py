@@ -143,6 +143,7 @@ class FakeLlmArgs:
     iter_stats_max_iterations: Optional[int] = None
     encode_only: bool = False
     sleep_config: Any = None
+    memory_monitor_config: Any = None  # the /memory_report route reads it
     num_serve_frontends: int = 1
     max_beam_width: int = 1
     reasoning_parser: Optional[str] = None  # chat, completions, Responses
