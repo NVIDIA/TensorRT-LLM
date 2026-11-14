@@ -288,12 +288,8 @@ def test_wire_connects_only_blocks_that_take_a_mask(capturing):
     assert layers[1].block_sparse_moe.pad_rows_hand_over is None
 
 
-@pytest.mark.skip(
-    reason="needs the MegaMoE-local backend's pad-mask seat (set_pad_mask / _take_pad_mask), which this engine's "
-    "MegaMoE backend does not have"
-)
 def test_a_megamoe_local_leaf_takes_the_handed_view(capturing):
-    from tensorrt_llm._torch.moe.fused_moe.mega_moe import (
+    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.moe.megamoe_local.local_impl import (
         TrtllmCutedslMegaMoeLocalNvfp4Impl as Local,
     )
 
