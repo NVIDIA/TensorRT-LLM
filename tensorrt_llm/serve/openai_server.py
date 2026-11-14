@@ -316,6 +316,25 @@ def _configure_parser_special_token_decoding(
         sampling_params.spaces_between_special_tokens = False
 
 
+def _stream_error_events(error: Exception) -> List[str]:
+    """Return the SSE events that end a stream whose request failed.
+
+    The client receives an OpenAI error object with the exception's message,
+    then [DONE]. A streaming completion reports a failure the same way once
+    HTTP 200 has been sent.
+    """
+    message = str(error)
+    error_data = json.dumps({
+        "error": {
+            "message": message,
+            "type": "server_error",
+            "code": None,
+            "param": None,
+        }
+    })
+    return [f"data: {error_data}\n\n", "data: [DONE]\n\n"]
+
+
 def _record_generator_termination(generator) -> None:
     """Classify a fatal generator error without exposing exception details."""
     component = "llm"
@@ -2285,15 +2304,19 @@ class OpenAIServer(_VideoRoutesMixin):
                             res, args)
                     for pp_res in pp_results:
                         yield pp_res
+            except Exception as e:
+                # Only failures are handled here. A consumer that stops reading
+                # closes the stream with GeneratorExit and a client that
+                # disconnects cancels it. Neither is an Exception.
+                logger.error(traceback.format_exc())
+                # StreamingResponse commits HTTP 200 before the first chunk, so
+                # the error ends the stream as an SSE error event.
+                for event in _stream_error_events(e):
+                    yield event
+            else:
                 yield "data: [DONE]\n\n"
                 await self._extract_metrics(res, raw_request)
                 nvtx_mark("generation ends")
-            except Exception:
-                # Only failures are logged: a consumer that stops reading closes
-                # the stream with GeneratorExit, and a client that disconnects
-                # cancels it, and neither is an error of this stream.
-                logger.error(traceback.format_exc())
-                raise
 
         input_started = _start_input_processing()
         try:
@@ -3252,16 +3275,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 # chunk, so we cannot change the status code.  Yield
                 # an SSE error event so the stream terminates cleanly
                 # instead of breaking the HTTP connection.
-                error_data = json.dumps({
-                    "error": {
-                        "message": str(e),
-                        "type": "server_error",
-                        "code": None,
-                        "param": None,
-                    }
-                })
-                yield f"data: {error_data}\n\n"
-                yield "data: [DONE]\n\n"
+                for event in _stream_error_events(e):
+                    yield event
 
         async def merge_generators(generators: List[AsyncIterator[Any]]):
             result_queue = asyncio.Queue()
@@ -3442,13 +3457,17 @@ class OpenAIServer(_VideoRoutesMixin):
                                   post_processor(res, args))
                     for pp_res in pp_results:
                         yield pp_res
-                yield "data: [DONE]\n\n"
-                await self._extract_metrics(res, raw_request)
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as e:
                 logger.error(traceback.format_exc())
-                raise
+                # StreamingResponse commits HTTP 200 before the first chunk, so
+                # the error ends the stream as an SSE error event.
+                for event in _stream_error_events(e):
+                    yield event
+            else:
+                yield "data: [DONE]\n\n"
+                await self._extract_metrics(res, raw_request)
 
         input_started = _start_input_processing()
         try:
