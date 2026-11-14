@@ -104,6 +104,8 @@ def _set_temperature_only(spec_metadata, temperature_capable: bool,
     ``is_all_greedy_sample`` already holds the group-synchronized value."""
     spec_metadata.temperature_only = _temperature_only(spec_metadata,
                                                        temperature_capable)
+    all_temperature_only = (all_temperature_only
+                            and spec_metadata.shard_temperature_only_graphs)
     spec_metadata.local_all_temperature_only = all_temperature_only
     if spec_metadata.group_all_temperature_only is not None:
         all_temperature_only = spec_metadata.group_all_temperature_only
@@ -672,11 +674,12 @@ class OneModelSamplingParams:
         )
 
 
-def one_model_sampling_mode(requests) -> int:
+def one_model_sampling_mode(requests, spec_metadata: "SpecMetadata") -> int:
     """A batch's sampling mode as attention-DP ranks exchange it: bit 0 when every request is greedy, bit 1
     when every request is greedy or unseeded temperature-only (the two flags of
-    ``_scan_one_model_sampling``)."""
-    greedy = temperature_only = True
+    ``_scan_one_model_sampling``, with its sampling_variants gates)."""
+    greedy = spec_metadata.greedy_graphs
+    temperature_only = spec_metadata.shard_temperature_only_graphs
     for request in requests:
         params = OneModelSamplingParams.of_request(request)
         greedy &= params.is_greedy
@@ -837,6 +840,9 @@ class SpecMetadata:
     temperature_only: bool = False
     # Whether all-greedy batches have CUDA graphs of their own; without them they take the sampled path.
     greedy_graphs: bool = True
+    # Whether the vocabulary-shard sampler's temperature-only batches (is_all_temperature_only) have
+    # CUDA graphs of their own; without them they take the advanced path.
+    shard_temperature_only_graphs: bool = True
     # Skip the Philox seed and offset uploads on all-greedy batches (deploy-time;
     # from the model's RuntimeHooks). The argmax path never reads them, and the
     # next sampled batch rewrites every row it reads.

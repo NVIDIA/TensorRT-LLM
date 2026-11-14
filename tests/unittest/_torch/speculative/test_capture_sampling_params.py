@@ -125,6 +125,7 @@ def _fake_meta():
         samples_from_vocab_shards=False,
         temperature_only_graphs=False,
         greedy_graphs=True,
+        shard_temperature_only_graphs=True,
         _sampling_scan_cache=None,
     )
 
@@ -262,6 +263,7 @@ def _populate_meta(mode, draft_len=1):
         samples_from_vocab_shards=False,
         temperature_only_graphs=False,
         greedy_graphs=True,
+        shard_temperature_only_graphs=True,
         _sampling_scan_cache=None,
         max_num_requests=4,
         max_draft_len=draft_len,

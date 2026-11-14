@@ -51,6 +51,7 @@ def _fake_meta(group_all_greedy_sample=None):
         samples_from_vocab_shards=False,
         temperature_only_graphs=False,
         greedy_graphs=True,
+        shard_temperature_only_graphs=True,
         _sampling_scan_cache=None,
     )
     # update_is_all_greedy_sample dispatches through self, so the stand-in needs the

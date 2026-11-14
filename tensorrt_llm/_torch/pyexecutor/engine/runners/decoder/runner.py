@@ -697,7 +697,7 @@ class DecoderRunner(ScheduledModelRunner):
         # through the padding exchange (sync_group_all_greedy_sample).
         sampling_mode = None
         if samples_from_adp_head_shards(spec_metadata, self._mapping):
-            sampling_mode = one_model_sampling_mode(graph_requests.all_requests())
+            sampling_mode = one_model_sampling_mode(graph_requests.all_requests(), spec_metadata)
         with self._graphs.pad_batch(
             graph_requests, resource_manager, runtime_draft_len, sampling_mode=sampling_mode
         ) as padded_graph_requests:
