@@ -1269,7 +1269,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # Per-step host planning of the opt-in wide-beam generation library.
         # It must run here, ahead of every forward of the step, so that under
         # CUDA graphs it precedes both capture and replay.
-        if self.beam_shared_prefix_enabled and self.beam_width > 1:
+        # Also runs for single-beam steps, where it only drops the previous step's plan.
+        if self.beam_shared_prefix_enabled:
             from .fmha.beam_shared_prefix import plan_step
             plan_step(self)
 

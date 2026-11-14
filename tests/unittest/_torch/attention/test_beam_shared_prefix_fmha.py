@@ -55,6 +55,10 @@ from tensorrt_llm._torch.attention.backends.fmha.shared_prefix_fa4 import (
     PrefixGroups,
     prefix_request_tables,
 )
+from tensorrt_llm._torch.attention.backends.interface import (
+    AttentionInputType,
+    PredefinedAttentionMask,
+)
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm.functional import PositionEmbeddingType
 
@@ -429,10 +433,51 @@ def test_plan_step_drops_the_previous_plan_when_a_step_is_not_planned(monkeypatc
     plan_step(meta)
     state = meta.fmha_plan_caches[LIB_NAME]
     assert state.plan is not None
-    declined = _beam_meta(manager, beam_width=1, request_ids=(7,), kv_lens=(11,), prompt_lens=(10,))
+    # Four single-beam requests: the same number of rows as the planned 2 x 4 beam step.
+    declined = _beam_meta(
+        manager,
+        beam_width=1,
+        request_ids=(7, 9, 11, 13),
+        kv_lens=(11, 7, 5, 3),
+        prompt_lens=(10, 6, 4, 2),
+    )
     declined.fmha_plan_caches = meta.fmha_plan_caches
     plan_step(declined)
     assert state.plan is None
+
+
+def test_library_selection_does_not_depend_on_per_step_state():
+    """The manager caches a selection by batch shape, so beam width and the step plan must not
+    change the answer."""
+    lib = object.__new__(BeamSharedPrefixFmha)
+    lib._context_impl = SimpleNamespace()
+    forward_args = SimpleNamespace(
+        attention_input_type=AttentionInputType.mixed,
+        is_fused_qkv=True,
+        update_kv_cache=True,
+        attention_mask=PredefinedAttentionMask.CAUSAL,
+        attention_mask_data=None,
+        attention_sinks=None,
+        relative_attention_bias=None,
+        out_scale=None,
+        output_sf=None,
+        attention_window_size=None,
+    )
+    q = torch.zeros(4, 8, dtype=torch.bfloat16)
+    manager = _ManagerV2({})
+    planned = _beam_meta(
+        manager, beam_width=2, request_ids=(7, 9), kv_lens=(5, 5), prompt_lens=(4, 4)
+    )
+    planned.num_ctx_tokens = 0
+    planned.max_seq_len = 64
+    planned.fmha_plan_caches[LIB_NAME] = SimpleNamespace(plan=object())
+    unplanned = _beam_meta(
+        manager, beam_width=1, request_ids=(1, 2, 3, 4), kv_lens=(5,) * 4, prompt_lens=(4,) * 4
+    )
+    unplanned.num_ctx_tokens = 0
+    unplanned.max_seq_len = 64
+    assert lib._is_supported(q, None, None, planned, forward_args)
+    assert lib._is_supported(q, None, None, unplanned, forward_args)
 
 
 def test_prefix_request_tables_chunk_skip_empty_groups_and_size_the_last_page():
