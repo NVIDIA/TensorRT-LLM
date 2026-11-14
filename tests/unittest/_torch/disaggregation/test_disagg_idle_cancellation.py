@@ -1772,6 +1772,7 @@ def test_pending_receive_retirement_keeps_idle_fetch_and_shutdown_live(
     """
     request = _request(1)
     executor.active_requests = [request]
+    session = ready = None
     if published:
         session, _ = _published_receive(executor, request)
     else:

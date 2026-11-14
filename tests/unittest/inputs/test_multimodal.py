@@ -201,7 +201,7 @@ class _ItemMetadataFakeProcessor:
 def test_mm_item_metadata_is_materialized_when_embedding_lengths_match():
     input_processor = create_input_processor_with_hash(_ItemMetadataFakeProcessor([2]))
 
-    _, extra = input_processor({"prompt": "unused"}, sampling_params=None)
+    _, extra = input_processor({"prompt": "unused"}, None)
 
     multimodal_data = extra["multimodal_data"]
     item_metadata = multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY]
@@ -226,8 +226,7 @@ def test_mm_item_metadata_rejects_mismatched_embedding_lengths():
     input_processor = create_input_processor_with_hash(_ItemMetadataFakeProcessor([1]))
 
     with pytest.raises(ValueError, match="do not match"):
-        # pyrefly: ignore [unexpected-keyword]
-        input_processor({"prompt": "unused"}, sampling_params=None)
+        input_processor({"prompt": "unused"}, None)
 
 
 def test_removed_encoder_metadata_hook_fails_before_processing() -> None:
@@ -250,7 +249,7 @@ def test_mm_item_metadata_none_falls_back_to_non_item_path():
 
     input_processor = create_input_processor_with_hash(NoMetadataProcessor([2]))
 
-    _, extra = input_processor({"prompt": "unused"}, sampling_params=None)
+    _, extra = input_processor({"prompt": "unused"}, None)
 
     metadata = extra["multimodal_data"][MULTIMODAL_ENCODER_ITEM_METADATA_KEY]
     assert metadata.item_refs == (("image", 0),)
@@ -267,8 +266,7 @@ def test_mm_item_metadata_rejects_wrong_return_type():
     input_processor = create_input_processor_with_hash(BadMetadataProcessor([2]))
 
     with pytest.raises(TypeError, match="must return a"):
-        # pyrefly: ignore [unexpected-keyword]
-        input_processor({"prompt": "unused"}, sampling_params=None)
+        input_processor({"prompt": "unused"}, None)
 
 
 @pytest.mark.parametrize(
@@ -530,7 +528,7 @@ def test_tokenized_multimodal_builds_metadata_from_final_embedding_slots():
             "prompt_token_ids": [10, 98, 20],
             "multi_modal_data": {"image": [torch.tensor([1])]},
         },
-        sampling_params=None,
+        None,
     )
 
     assert prompt_token_ids == [10, 101, 102, 200, 103, 20]
@@ -896,7 +894,7 @@ def test_mm_processor_kwargs_hash_is_stable_for_canonical_values():
                 "a": torch.tensor([1]),
             },
         },
-        sampling_params=None,
+        None,
     )
     _, second = input_processor(
         {
@@ -907,7 +905,7 @@ def test_mm_processor_kwargs_hash_is_stable_for_canonical_values():
                 "b": [2, 3],
             },
         },
-        sampling_params=None,
+        None,
     )
 
     assert first["multimodal_data"]["mm_processor_kwargs_hash"] is not None
@@ -929,7 +927,7 @@ def test_unserializable_mm_processor_kwargs_disable_persistent_cache_keying():
             "multi_modal_data": {"image": [torch.tensor([1])]},
             "mm_processor_kwargs": {"custom": object()},
         },
-        sampling_params=None,
+        None,
     )
 
     assert extra["multimodal_data"]["mm_processor_kwargs_hash"] is None
@@ -945,7 +943,7 @@ def test_disabled_encoder_cache_skips_mm_processor_kwargs_hash():
                 "multi_modal_data": {"image": [torch.tensor([1])]},
                 "mm_processor_kwargs": {"image_sizes": torch.tensor([1, 2])},
             },
-            sampling_params=None,
+            None,
         )
 
     kwargs_hash.assert_not_called()

@@ -170,4 +170,6 @@ def test_row_linear_residual_norm_fusion(seq_len, hidden_size, fused_add_norm):
 
 
 if __name__ == "__main__":
-    test_row_linear_residual_norm_fusion(256, True)
+    test_row_linear_residual_norm_fusion(seq_len=8,
+                                         hidden_size=256,
+                                         fused_add_norm=True)

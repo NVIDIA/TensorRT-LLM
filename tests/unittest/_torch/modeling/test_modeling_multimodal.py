@@ -351,9 +351,7 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
         multimodal_params_list = []
         for input in inputs:
             input_processor_with_hash = create_input_processor_with_hash(processor)
-            prompt_token_ids, extra_processed_inputs = input_processor_with_hash(
-                input, sampling_params=None
-            )
+            prompt_token_ids, extra_processed_inputs = input_processor_with_hash(input, None)
             input_ids.extend(prompt_token_ids)
             multimodal_params = MultimodalParams(
                 multimodal_data=extra_processed_inputs.get("multimodal_data"),

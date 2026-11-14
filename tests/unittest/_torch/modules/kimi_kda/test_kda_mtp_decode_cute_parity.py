@@ -38,6 +38,9 @@ Requires: 1 GPU (sm100/sm103/sm107), fla-core, nvidia-cutlass-dsl,
 cuda-bindings. Skips cleanly otherwise.
 """
 
+from collections.abc import Callable
+from typing import cast
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -426,6 +429,10 @@ def _fla_sequential_reference(data, num_accepted):
     """
     from fla.ops.kda import fused_recurrent_kda
 
+    kda_reference = cast(
+        Callable[..., tuple[torch.Tensor, torch.Tensor | None]], fused_recurrent_kda
+    )
+
     B, H, K, V, W = data["B"], data["H"], data["K"], data["V"], data["W"]
     M, T = data["M"], data["T"]
     dim = H * K
@@ -491,7 +498,7 @@ def _fla_sequential_reference(data, num_accepted):
                 q_in = _silu(cq).view(1, 1, H, K)
                 k_in = _silu(ck).view(1, 1, H, K)
                 v_in = _silu(cv).view(1, 1, H, V)
-                o_t, state = fused_recurrent_kda(
+                o_t, state = kda_reference(
                     q=q_in,
                     k=k_in,
                     v=v_in,
@@ -1406,8 +1413,12 @@ def test_triton_replay_conv_window_copy_with_separate_replay_slots():
         for cache in pools["cs"]:
             cache.zero_()
 
-    copy_kda_replay_conv_window(coupled["conv"], *coupled["cs"], identity)
-    copy_kda_replay_conv_window(separate["conv"], *separate["cs"], state_slots, replay_slots)
+    call_q_cache, call_k_cache, call_v_cache = coupled["cs"]
+    copy_kda_replay_conv_window(coupled["conv"], call_q_cache, call_k_cache, call_v_cache, identity)
+    call_q_cache, call_k_cache, call_v_cache = separate["cs"]
+    copy_kda_replay_conv_window(
+        separate["conv"], call_q_cache, call_k_cache, call_v_cache, state_slots, replay_slots
+    )
 
     assert torch.equal(separate["conv"][state_slots.long()], coupled["conv"])
     for actual, expected in zip(separate["cs"], coupled["cs"]):

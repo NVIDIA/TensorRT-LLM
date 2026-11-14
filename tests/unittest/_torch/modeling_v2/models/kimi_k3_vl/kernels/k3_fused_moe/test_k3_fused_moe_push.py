@@ -362,7 +362,17 @@ def check_k3_moe_push(ctx, route_a: bool = False):
                     # TP16's receive side: this rank's partial in slots 4 r .. 4 r + 3, one push each.
                     for c in range(copies16):
                         *routed, pushed = _k3_moe_routed(producer, inputs, front)
-                        k3_moe_push(*routed, offset, layer, ex16, ctx.rank * copies16 + c)
+                        call_x_fp8, call_x_sf, call_topk_ids, call_topk_weights = routed
+                        k3_moe_push(
+                            call_x_fp8,
+                            call_x_sf,
+                            call_topk_ids,
+                            call_topk_weights,
+                            offset,
+                            layer,
+                            ex16,
+                            ctx.rank * copies16 + c,
+                        )
                         pushed_shared.append(pushed)
                     got16 = ex16.reduce(m)
                     state16 = ex16.state_ok(ctx)

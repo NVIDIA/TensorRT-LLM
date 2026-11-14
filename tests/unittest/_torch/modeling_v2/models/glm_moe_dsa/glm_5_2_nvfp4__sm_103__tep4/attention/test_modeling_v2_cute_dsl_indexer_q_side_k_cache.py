@@ -159,7 +159,8 @@ def test_certified_cells(cell) -> None:
     torch.cuda.synchronize()
     assert _same(got, want), f"{spec}: differs from the served q-side + K-update launches"
     q8, w, pool = got
-    ref_q8, ref_w, ref_cache = op.reference(*_args(x, *_outputs(spec["tokens"]), x["pool"]),
+    call_q8, call_w = _outputs(spec["tokens"])
+    ref_q8, ref_w, ref_cache = op.reference(*_args(x, call_q8, call_w, x["pool"]),
                                             is_neox=False, compiled=None)  # fmt: skip
     assert torch.equal(q8.view(torch.uint8), ref_q8.view(torch.uint8)) and torch.equal(w, ref_w)
     tokens, live = spec["tokens"], x["fp8"][: spec["tokens"]] >= 0

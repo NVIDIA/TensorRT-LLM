@@ -95,11 +95,11 @@ class PgOpTest:
 
         assert self.mapping.tp_group_name
         if op_name == "allreduce":
-            collective = AllReduce(self.mapping,
-                                   strategy=AllReduceStrategy.NCCL)
+            allreduce_op = AllReduce(self.mapping,
+                                     strategy=AllReduceStrategy.NCCL)
 
             def run(value):
-                return collective(value)
+                return allreduce_op(value)
         else:
             collective = allgather if op_name == "allgather" else reducescatter
 

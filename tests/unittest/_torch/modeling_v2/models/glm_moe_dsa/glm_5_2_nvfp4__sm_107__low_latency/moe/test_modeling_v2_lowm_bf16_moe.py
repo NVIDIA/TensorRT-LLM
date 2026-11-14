@@ -85,9 +85,30 @@ def _build(spec, seed):
 def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by name
     args = _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % 2**31)
     certifying(op)
-    out = op(*args, TOP_K, ROUTED_SCALING_FACTOR)
+    call_x, call_router_logits, call_e_score_correction_bias, call_w3_w1, call_w2 = args
+    out = op(
+        call_x,
+        call_router_logits,
+        call_e_score_correction_bias,
+        call_w3_w1,
+        call_w2,
+        TOP_K,
+        ROUTED_SCALING_FACTOR,
+    )
     torch.cuda.synchronize()
-    _compare(out, op.reference(*args, TOP_K, ROUTED_SCALING_FACTOR))
+    call_x, call_router_logits, call_e_score_correction_bias, call_w3_w1, call_w2 = args
+    _compare(
+        out,
+        op.reference(
+            call_x,
+            call_router_logits,
+            call_e_score_correction_bias,
+            call_w3_w1,
+            call_w2,
+            TOP_K,
+            ROUTED_SCALING_FACTOR,
+        ),
+    )
 
 
 @pytest.mark.parametrize("tokens,inter", [(1, 128), (2, 512), (3, 512), (1, 256), (2, 256)])
@@ -128,20 +149,51 @@ def test_refuses_more_than_six_tokens() -> None:
     """Verify rows need another MoE path; no silent token-zero-only result."""
     with pytest.raises(RuntimeError, match="takes 1 to 6 tokens"):
         with validating(op):
-            op(*_small(tokens=7), TOP_K, ROUTED_SCALING_FACTOR)
+            call_x, call_router_logits, call_e_score_correction_bias, call_w3_w1, call_w2 = _small(
+                tokens=7
+            )
+            op(
+                call_x,
+                call_router_logits,
+                call_e_score_correction_bias,
+                call_w3_w1,
+                call_w2,
+                TOP_K,
+                ROUTED_SCALING_FACTOR,
+            )
 
 
 def test_refuses_an_expert_slice_it_does_not_serve() -> None:
     """The FC2 kernel walks the expert slice in 64-element K steps."""
     with pytest.raises(RuntimeError, match="unsupported hidden size"):
         with validating(op):
-            op(*_small(inter=96), TOP_K, ROUTED_SCALING_FACTOR)
+            call_x, call_router_logits, call_e_score_correction_bias, call_w3_w1, call_w2 = _small(
+                inter=96
+            )
+            op(
+                call_x,
+                call_router_logits,
+                call_e_score_correction_bias,
+                call_w3_w1,
+                call_w2,
+                TOP_K,
+                ROUTED_SCALING_FACTOR,
+            )
 
 
 def test_refuses_another_top_k() -> None:
     with pytest.raises(RuntimeError, match="top-8"):
         with validating(op):
-            op(*_small(), 6, ROUTED_SCALING_FACTOR)
+            call_x, call_router_logits, call_e_score_correction_bias, call_w3_w1, call_w2 = _small()
+            op(
+                call_x,
+                call_router_logits,
+                call_e_score_correction_bias,
+                call_w3_w1,
+                call_w2,
+                6,
+                ROUTED_SCALING_FACTOR,
+            )
 
 
 def test_refuses_a_misaligned_token() -> None:
@@ -159,7 +211,16 @@ def test_refuses_a_misaligned_token() -> None:
 def test_multi_matches_single_rows_bitwise(tokens, inter) -> None:
     args = _build(dict(tokens=tokens, hidden=6144, inter=inter, routing="random"), seed=32 + tokens)
     x, logits, bias, w3_w1, w2 = args
-    multi = op(*args, TOP_K, ROUTED_SCALING_FACTOR)
+    call_x, call_router_logits, call_e_score_correction_bias, call_w3_w1, call_w2 = args
+    multi = op(
+        call_x,
+        call_router_logits,
+        call_e_score_correction_bias,
+        call_w3_w1,
+        call_w2,
+        TOP_K,
+        ROUTED_SCALING_FACTOR,
+    )
     single = torch.cat(
         [
             op(x[r : r + 1], logits[r : r + 1], bias, w3_w1, w2, TOP_K, ROUTED_SCALING_FACTOR)

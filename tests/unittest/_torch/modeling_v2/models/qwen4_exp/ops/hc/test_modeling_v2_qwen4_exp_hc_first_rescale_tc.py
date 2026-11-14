@@ -87,8 +87,14 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by
 
 def test_stack_final_low_is_the_injecting_form_bitwise() -> None:
     args = _build(dict(rows=300), seed=7)
-    low, inject = op(*args[:6], True)
-    low_f, none = op(*args[:6], False)
+    call_hc_out, call_rstd, call_norm_weight, call_first, call_hc_count, call_rank = args[:6]
+    low, inject = op(
+        call_hc_out, call_rstd, call_norm_weight, call_first, call_hc_count, call_rank, True
+    )
+    call_hc_out, call_rstd, call_norm_weight, call_first, call_hc_count, call_rank = args[:6]
+    low_f, none = op(
+        call_hc_out, call_rstd, call_norm_weight, call_first, call_hc_count, call_rank, False
+    )
     assert none is None and inject.shape == (300, HC_COUNT)
     assert torch.equal(low, low_f)
 

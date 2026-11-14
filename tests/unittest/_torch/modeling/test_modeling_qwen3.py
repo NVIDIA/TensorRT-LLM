@@ -50,6 +50,7 @@ def test_qwen3_for_causal_lm_forward():
 
     with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
         torch.manual_seed(42)
+        # pyrefly: ignore [missing-argument]
         reference = HFQwen3ForCausalLM(config).to(device="cuda", dtype=torch.bfloat16).eval()
         model = (
             model_class(

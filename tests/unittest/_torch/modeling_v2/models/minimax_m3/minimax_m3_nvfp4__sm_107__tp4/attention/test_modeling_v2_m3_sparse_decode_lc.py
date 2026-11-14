@@ -495,7 +495,8 @@ def test_bt_prewait_is_bitwise(seq_lens, decode_query_len) -> None:
     for linear in (False, True):
         for one_div in (False, True):
             base = _buffers(total_q, True)
-            run(*base, linear, one_div, False, False)
+            call_out, call_q8, call_sf = base
+            run(call_out, call_q8, call_sf, linear, one_div, False, False)
             arms = []
             for bt, use_pdl, hints in (
                 (True, False, False),
@@ -503,7 +504,8 @@ def test_bt_prewait_is_bitwise(seq_lens, decode_query_len) -> None:
                 (True, True, True),
             ):
                 bufs = _buffers(total_q, True)
-                run(*bufs, linear, one_div, bt, use_pdl, hints)
+                call_out, call_q8, call_sf = bufs
+                run(call_out, call_q8, call_sf, linear, one_div, bt, use_pdl, hints)
                 arms.append(bufs)
             torch.cuda.synchronize()
             a, aq, asf = base

@@ -368,10 +368,15 @@ def test_layers_by_steps_eager_then_graph(cell):
             for layer in range(LAYERS):
                 q = _inputs(1000 * step + 10 * layer + seed, m, heads)[0]
                 view = cache.view(md, layer)
-                y = _vb(view, q, *weights[layer], shared)
+                call_w_vb, call_gate = weights[layer]
+                y = _vb(view, q, call_w_vb, call_gate, shared)
                 launches += 1
-                fresh = _vb(view, q, *weights[layer], K3MlaAttnWorkspace.create("cuda", groups))
-                ref = _vb_reference(cache, layer, q, *weights[layer], shared)
+                call_w_vb, call_gate = weights[layer]
+                fresh = _vb(
+                    view, q, call_w_vb, call_gate, K3MlaAttnWorkspace.create("cuda", groups)
+                )
+                call_w_vb, call_gate = weights[layer]
+                ref = _vb_reference(cache, layer, q, call_w_vb, call_gate, shared)
                 torch.cuda.synchronize()
                 assert torch.equal(_bits(y), _bits(fresh)), (step, layer)
                 assert _max_rel(y, ref, tokens) <= 1e-2, (step, layer)
@@ -406,9 +411,11 @@ def test_layers_by_steps_eager_then_graph(cell):
             graph.replay()
             launches += LAYERS
             for layer in range(LAYERS):
-                fresh = _vb(views[layer], qs[layer], *weights[layer],
+                call_w_vb, call_gate = weights[layer]
+                fresh = _vb(views[layer], qs[layer], call_w_vb, call_gate,
                             K3MlaAttnWorkspace.create("cuda", groups))  # fmt: skip
-                ref = _vb_reference(cache, layer, qs[layer], *weights[layer], shared)
+                call_w_vb, call_gate = weights[layer]
+                ref = _vb_reference(cache, layer, qs[layer], call_w_vb, call_gate, shared)
                 torch.cuda.synchronize()
                 assert torch.equal(_bits(static_y[layer]), _bits(fresh)), (step, layer)
                 assert _max_rel(static_y[layer], ref, tokens) <= 1e-2, (step, layer)
@@ -437,9 +444,11 @@ def test_two_workspaces_interleaved():
                 k = (step * LAYERS + layer) % 2
                 q = _inputs(100 * step + layer, num_requests, H)[0]
                 view = cache.view(md, layer)
-                y = _vb(view, q, *weights, pair[k])
+                call_w_vb, call_gate = weights
+                y = _vb(view, q, call_w_vb, call_gate, pair[k])
                 launches[k] += 1
-                fresh = _vb(view, q, *weights, K3MlaAttnWorkspace.create("cuda", 1))
+                call_w_vb, call_gate = weights
+                fresh = _vb(view, q, call_w_vb, call_gate, K3MlaAttnWorkspace.create("cuda", 1))
                 torch.cuda.synchronize()
                 assert torch.equal(_bits(y), _bits(fresh)), (step, layer)
             cache.advance()

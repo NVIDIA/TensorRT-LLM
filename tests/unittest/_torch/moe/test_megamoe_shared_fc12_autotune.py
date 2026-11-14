@@ -15,6 +15,7 @@ from itertools import product
 from pathlib import Path
 from threading import Condition, Event, RLock, Thread
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -115,7 +116,7 @@ class CpuContractTests(unittest.TestCase):
             empty_like=lambda x: Tensor(x.shape, x.dtype),
             _C=SimpleNamespace(_cuda_getCurrentRawStream=lambda device_index: 17),
         )
-        self.ns = dict(
+        self.ns: dict[str, Any] = dict(
             torch=torch,
             AutoTuner=SimpleNamespace(get=lambda: self.tuner),
             DynamicTensorSpec=SimpleNamespace,
@@ -470,7 +471,7 @@ class CpuContractTests(unittest.TestCase):
                 if isinstance(n, ast.FunctionDef) and n.name == "_prime_cached_tactics"
             )
         )
-        namespace = dict(
+        namespace: dict[str, Any] = dict(
             os=os,
             inspect=inspect,
             nvtx_range=lambda name: nullcontext(),

@@ -16,11 +16,13 @@
 """Report and diff helpers used by the Pyrefly shell workflow."""
 
 import argparse
+import ast
 import glob
 import json
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 try:
@@ -64,6 +66,54 @@ def toml_value(value: object) -> str:
     return json.dumps(value)
 
 
+def extra_test_import_paths(project_root: Path, *, skip_ancestor_paths: bool = False) -> list[str]:
+    """Collect literal module-level import paths without executing test code."""
+    paths = []
+    for source_path in sorted((project_root / "tests").rglob("*.py")):
+        try:
+            source = source_path.read_text(encoding="utf-8")
+            if "__extra_import_path__" not in source:
+                continue
+            module = ast.parse(source)
+        except (OSError, UnicodeError, SyntaxError):
+            continue
+        for node in module.body:
+            if isinstance(node, ast.Assign):
+                targets = node.targets
+            elif isinstance(node, ast.AnnAssign):
+                targets = [node.target]
+            else:
+                continue
+            if not any(
+                isinstance(target, ast.Name) and target.id == "__extra_import_path__"
+                for target in targets
+            ):
+                continue
+            try:
+                entries = ast.literal_eval(node.value)
+            except (ValueError, TypeError):
+                entries = None
+            if not isinstance(entries, list) or not all(isinstance(p, str) for p in entries):
+                print(
+                    f"Skipping non-literal __extra_import_path__ at {source_path}:{node.lineno}",
+                    file=sys.stderr,
+                )
+                continue
+            for entry in entries:
+                if entry == "~" or entry.startswith("~/"):
+                    path = project_root / entry[2:]
+                else:
+                    path = source_path.parent / entry
+                path = path.resolve()
+                # Fallback already searches ancestors per file; adding them globally can
+                # make a sibling regular package shadow another root's namespace package.
+                if skip_ancestor_paths and path in source_path.resolve().parents:
+                    continue
+                if path.is_dir():
+                    paths.append(str(path))
+    return list(dict.fromkeys(paths))
+
+
 def write_test_config(source_path: Path, destination_path: Path) -> None:
     """Generate an isolated native test config from the wrapper's custom section."""
     source_path = source_path.resolve()
@@ -72,6 +122,18 @@ def write_test_config(source_path: Path, destination_path: Path) -> None:
     for key in ("project-includes", "project-excludes", "search-path"):
         if key in config:
             config[key] = [str(source_path.parent / path) for path in config[key]]
+    config["search-path"] = list(
+        dict.fromkeys(
+            str(Path(path).resolve())
+            for path in [
+                *config.get("search-path", [str(source_path.parent)]),
+                *extra_test_import_paths(
+                    source_path.parent,
+                    skip_ancestor_paths=config.get("enable-fallback-search-path", False),
+                ),
+            ]
+        )
+    )
     destination_path.write_text(
         "".join(f"{key} = {toml_value(value)}\n" for key, value in config.items())
     )
@@ -122,9 +184,11 @@ def print_summary(report_path: Path, *, all_diagnostics: bool = False) -> None:
                 kind = error.get("name", "error")
                 message = (
                     error.get("description") or error.get("concise_description", "")
-                    if all_diagnostics
+                    if all_diagnostics and kind != "missing-import"
                     else error.get("concise_description") or error.get("description", "")
                 )
+                if kind == "missing-import":
+                    message = str(message).split("Looked in these locations", 1)[0].rstrip()
                 if not all_diagnostics:
                     message = str(message).replace("\n", " ")
                 print(f"{location}: [{kind}] {message}")

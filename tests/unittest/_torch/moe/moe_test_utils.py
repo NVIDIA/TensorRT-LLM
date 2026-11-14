@@ -28,7 +28,6 @@ import torch
 from tensorrt_llm._torch.autotuner import AutoTuner
 from tensorrt_llm._torch.moe.fused_moe import CuteDslFc12FusedMoE
 from tensorrt_llm._torch.moe.fused_moe.activation import (
-    ACTIVATION_PAYLOAD,
     SimpleActivation,
     SiTuActivation,
     SwigluActivation,
@@ -1079,11 +1078,7 @@ def build_test_activation(
         )
     if kind in (ActivationType.Swiglu, ActivationType.SwigluBias):
         return SwigluActivation(clamp=swiglu_limit)
-    # Through the table, not a literal ``SimpleActivation``: the branches above
-    # cover the kinds this sweep supplies constants for, and a kind added to
-    # ``ACTIVATION_PAYLOAD`` with a carrier of its own has to get that carrier.
-    payload = ACTIVATION_PAYLOAD[kind]
-    return SimpleActivation(kind=kind) if payload is SimpleActivation else payload()
+    return SimpleActivation(kind=kind)
 
 
 def get_quick_skip_reason(

@@ -122,7 +122,8 @@ def test_integer_data_is_the_bf16_head_bit_for_bit(m) -> None:
     x = torch.randint(-2, 3, (m, k), generator=g, device="cuda").to(torch.bfloat16)
     coded = encode_chunked(w)
     assert coded[3].numel() > 0
-    assert round_trip_ok(*coded, w)
+    call_packed, call_base, call_exc_off, call_exc_pos, call_exc_w = coded
+    assert round_trip_ok(call_packed, call_base, call_exc_off, call_exc_pos, call_exc_w, w)
     with validating(op):
         out = op(*_args(coded, x, n, _num_sms()))
     assert torch.equal(out, torch.nn.functional.linear(x, w))
@@ -138,7 +139,8 @@ def test_the_head_writes_only_the_shards_columns() -> None:
     w[::7, ::5] = 96.0  # exceptions, including in the partial tile
     x = torch.randint(-2, 3, (m, k), generator=g, device="cuda").to(torch.bfloat16)
     coded = encode_chunked(w)
-    assert round_trip_ok(*coded, w)
+    call_packed, call_base, call_exc_off, call_exc_pos, call_exc_w = coded
+    assert round_trip_ok(call_packed, call_base, call_exc_off, call_exc_pos, call_exc_w, w)
     args = list(_args(coded, x, n, _num_sms()))
     args[2] = torch.full((m, n + 16), float("nan"), dtype=torch.bfloat16, device="cuda")
     with validating(op):
@@ -161,8 +163,15 @@ def test_a_shard_of_partial_tiles_keeps_the_bf16_head() -> None:
 def test_round_trip_is_bitwise(n, k) -> None:
     w, coded = _coded(n, k, 1, True)
     assert coded[3].numel() > 0
-    assert round_trip_ok(*coded, w)
-    assert torch.equal(decode(*coded, n, k).view(torch.int16), w.view(torch.int16))
+    call_packed, call_base, call_exc_off, call_exc_pos, call_exc_w = coded
+    assert round_trip_ok(call_packed, call_base, call_exc_off, call_exc_pos, call_exc_w, w)
+    call_packed, call_base, call_exc_off, call_exc_pos, call_exc_w = coded
+    assert torch.equal(
+        decode(call_packed, call_base, call_exc_off, call_exc_pos, call_exc_w, n, k).view(
+            torch.int16
+        ),
+        w.view(torch.int16),
+    )
 
 
 def test_a_corrupted_coding_fails_closed() -> None:
@@ -227,7 +236,10 @@ def test_tiny_exception_products_are_exact(m) -> None:
     for bit as the BF16 head's, and row 1 wins (a correction against a non-zero placeholder cancels them to 0)."""
     w = _tiny_exceptions_head()
     coded = encode_chunked(w)
-    assert coded[1] == 113 and round_trip_ok(*coded, w)
+    call_packed, call_base, call_exc_off, call_exc_pos, call_exc_w = coded
+    assert coded[1] == 113 and round_trip_ok(
+        call_packed, call_base, call_exc_off, call_exc_pos, call_exc_w, w
+    )
     x = torch.zeros((m, w.shape[1]), dtype=torch.bfloat16, device="cuda")
     x[:, 0] = 1.0
     with validating(op):

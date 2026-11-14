@@ -106,7 +106,19 @@ def test_reads_the_selection_after_the_wait_under_graph_replay() -> None:
 
     def step():
         sel = qsa_topk_expand_decode(scores, ends, pos, seqlen, topk, CR, TOKEN_TOPK)
-        return op(*args[:4], sel, *args[5:])
+        call_q, call_k_cache, call_v_cache, call_block_table = args[:4]
+        call_request_indices, call_tokens_per_block, call_softmax_scale, call_output_gate = args[5:]
+        return op(
+            call_q,
+            call_k_cache,
+            call_v_cache,
+            call_block_table,
+            sel,
+            call_request_indices,
+            call_tokens_per_block,
+            call_softmax_scale,
+            call_output_gate,
+        )
 
     _replays_like_eager(step, lambda: scores.copy_(torch.rand(scores.shape, device=DEV)))
 
@@ -115,4 +127,23 @@ def test_guard_refuses_rows_past_max_rows() -> None:
     args = _build(dict(pos=(8700,), gated=True), seed=5)
     many = [a.expand(300, *a.shape[1:]) if i in (0, 4, 5) else a for i, a in enumerate(args[:6])]
     with validating(op), pytest.raises(AssertionError):
-        op(*many, *args[6:8], None)  # 300 rows: past MAX_ROWS
+        (
+            call_q,
+            call_k_cache,
+            call_v_cache,
+            call_block_table,
+            call_selected_tokens,
+            call_request_indices,
+        ) = many
+        call_tokens_per_block, call_softmax_scale = args[6:8]
+        op(
+            call_q,
+            call_k_cache,
+            call_v_cache,
+            call_block_table,
+            call_selected_tokens,
+            call_request_indices,
+            call_tokens_per_block,
+            call_softmax_scale,
+            None,
+        )  # 300 rows: past MAX_ROWS

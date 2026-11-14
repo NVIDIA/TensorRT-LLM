@@ -570,13 +570,11 @@ exclude = [
     "tests/integration/defs/test_e2e.py",
     "tests/integration/defs/test_fmha.py",
     "tests/integration/defs/test_list_parser.py",
-    "tests/integration/defs/test_list_validation.py",
     "tests/integration/defs/test_sanity.py",
     "tests/integration/defs/test_unittests.py",
     "tests/integration/defs/triton_server/__init__.py",
     "tests/integration/defs/triton_server/common.py",
     "tests/integration/defs/triton_server/conftest.py",
-    "tests/integration/defs/triton_server/test_list_parser.py",
     "tests/integration/defs/triton_server/trt_test_alternative.py",
     "tests/integration/defs/trt_test_alternative.py",
     "tests/integration/defs/utils/__init__.py",
@@ -944,6 +942,8 @@ unexpected-positional-argument = "error"
 [tool.pyrefly-tests]
 project-includes = ["tests"]
 # Paths are relative to the repository root and apply only to the test pass.
+# The wrapper appends literal __extra_import_path__ directories found under tests/.
+# Ancestor directories use fallback resolution instead of becoming global roots.
 search-path = [
     ".",
     "tests",
@@ -966,11 +966,6 @@ search-path = [
     "tests/scripts/perf-sanity/cache_transceiver_precheck",
 ]
 enable-fallback-search-path = true
-
-[tool.pyrefly-tests.errors]
-missing-argument = "ignore"
-unexpected-keyword = "ignore"
-bad-argument-count = "ignore"
 
 # Diagnostics for dynamically loaded modules and unresolved names.
 [tool.pyrefly-exclusions]

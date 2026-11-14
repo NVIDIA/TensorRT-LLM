@@ -3611,7 +3611,10 @@ def test_phi3_runtime_max_seq_len_reaches_model_fingerprint() -> None:
             )
         )
 
-    decision = check_weight_sharing_compatibility(*identities, IdentityCheckPolicy.WARN_FALLBACK)
+    call_local, call_source = identities
+    decision = check_weight_sharing_compatibility(
+        call_local, call_source, IdentityCheckPolicy.WARN_FALLBACK
+    )
 
     assert decision.match_result.mismatched_fields == ["model_fingerprint"]
 

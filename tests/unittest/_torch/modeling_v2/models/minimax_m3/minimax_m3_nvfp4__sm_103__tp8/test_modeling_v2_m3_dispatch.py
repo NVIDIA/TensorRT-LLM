@@ -180,7 +180,8 @@ def test_the_shared_expert_projections_take_no_gemv(nk, push) -> None:
     """At TP8 the shared expert (768 x 6144 gate_up, 6144 x 384 down) runs inside the MoE engine on decode rows and on
     the generic GEMM otherwise: the GEMV has no config for it and the dispatch never routes a call there."""
     assert mx_gemv.get_config(*nk) is None
-    assert dispatch._gemv_variants(*nk, push, 8) == []
+    call_n, call_k = nk
+    assert dispatch._gemv_variants(call_n, call_k, push, 8) == []
 
 
 def test_the_plans_are_the_all_reduce_buckets() -> None:

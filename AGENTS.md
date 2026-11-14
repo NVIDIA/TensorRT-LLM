@@ -221,11 +221,11 @@ PyTorch, generated bindings, and configured third-party libraries. In test file-
 mode, missing imports of declared dependencies that are not installed are also
 filtered; full-project scans retain them. Release-Check installs pytest so that
 `pytest.skip()` remains recognizable as a terminating call.
-The test configuration disables `missing-argument`, `unexpected-keyword`, and
-`bad-argument-count`; these diagnostics remain enabled for product code. Other
-configured diagnostics, including `unbound-name` and `missing-import`, remain
-enabled for tests. Product import resolution uses only the project root as its
-search path, with fallback resolution disabled. The broader helper search paths
+Tests use the same diagnostics as product code, including `missing-argument`,
+`unexpected-keyword`, and `bad-argument-count`. The wrapper reads literal
+`__extra_import_path__` lists under `tests/` without running test code and adds
+existing directories to the test search path. Product checks use only the project
+root, with fallback disabled. The broader helper search paths
 and fallback resolution apply only to the test pass. `--no-path-module-filter`
 disables exclusions in both passes while preserving their separate search paths
 and diagnostic settings.
