@@ -123,6 +123,7 @@ PUBLIC_MODEL_ARCHITECTURES = frozenset(
         "SiglipVisionModel",
         "SkyworkR1V2ForConditionalGeneration",
         "SmolLM3ForCausalLM",
+        "Spark2_5ForCausalLM",
         "Starcoder2ForCausalLM",
         "Step3p5ForCausalLM",
         "Step3p7ForConditionalGeneration",

@@ -55,6 +55,7 @@ The following is a table of supported models for the PyTorch backend:
 | `Qwen3_5MoeForCausalLM`              | Qwen3.8-MoE, Qwen3.5-MoE           | `Qwen/Qwen3.8-2.4T-A95B`, `Qwen/Qwen3.5-397B-A17B` |
 | `Qwen4ExpForCausalLM`                | Qwen3.8-Flash-Next (text)          | `Qwen/Qwen3.8-Flash-Next`                    |
 | `Qwen4ExpForConditionalGeneration`   | Qwen3.8-Flash-Next                 | `Qwen/Qwen3.8-Flash-Next`                    |
+| `Spark2_5ForCausalLM`                | Spark-X2.5, Spark-X2.6             | `XHToken/Spark-X2.6-4B`                      |
 | `Step3p7ForConditionalGeneration` [^8]| Step-3.7-Flash                    | `stepfun-ai/Step-3.7-Flash`                  |
 | `T5ForConditionalGeneration`         | T5, Flan-T5, ByT5                  | `google/flan-t5-small`                       |
 | `WhisperForConditionalGeneration`    | Whisper                            | `openai/whisper-large-v3`                    |

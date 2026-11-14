@@ -824,6 +824,7 @@ _CONFIG_REGISTRY: dict[str, type[transformers.PretrainedConfig]] = LazyConfigDic
     glm_moe_dsa="DeepseekV3Config",
     k3_dspark="K3DsparkConfig",
     laguna="LagunaConfig",
+    spark2_5="Spark2_5Config",
 )  # NOTE: HF config.json uses deepseek_v32 as model_type but with same DSV3 config class
 
 _NEMOTRON_H_LEGACY_LAYER_TYPES = {
