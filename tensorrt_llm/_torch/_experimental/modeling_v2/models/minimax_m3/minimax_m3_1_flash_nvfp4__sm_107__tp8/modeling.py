@@ -63,8 +63,6 @@ from __future__ import annotations
 
 import copy
 import dataclasses
-import importlib
-import importlib.util
 import os
 import sys
 import threading
@@ -280,11 +278,14 @@ R6_DENSE_PREQUANT = m31_enabled("R6_DENSE_PREQUANT")
 # PrimTS (the full-context decode) and FA4 trace in one process: scope task scheduling's WorkTileInfo rebind to the
 # PrimTS traces where the engine has that scope (attention/backends/prims_ts/_worktile_scope.py; its kill switch is
 # TRTLLM_PRIMS_TS_SCOPED_WORKTILE=0).
-if (
-    importlib.util.find_spec("tensorrt_llm._torch.attention.backends.prims_ts._worktile_scope")
-    is not None
-):
-    importlib.import_module("tensorrt_llm._torch.attention.backends.prims_ts._worktile_scope").arm()
+try:
+    from tensorrt_llm._torch.attention.backends.prims_ts import (
+        _worktile_scope as _prims_ts_worktile_scope,
+    )
+except ImportError:  # an engine without the scope: nothing changes
+    _prims_ts_worktile_scope = None
+if _prims_ts_worktile_scope is not None:
+    _prims_ts_worktile_scope.arm()
 
 CTXNORMQ = not m31_disabled("CTXNORMQ")
 # GQAMIX: a mixed ctx+gen step's sparse generation rows (MsaDecodeFmha) run the Triton block-sparse decode
