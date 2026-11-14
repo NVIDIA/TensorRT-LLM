@@ -191,6 +191,55 @@ def test_create_kv_cache_swa_endpoint_priority(
         assert kwargs["custom_priority_callback"](255, AttnLifeCycle(4096, 0)) == 70
 
 
+@pytest.mark.parametrize("rewind", [0, 1024])
+def test_create_kv_cache_forwards_custom_priority_callback(rewind: int) -> None:
+    """A caller's priority callback (a subclass's _context_priority_callback) reaches the backend.
+
+    With SWA endpoint priorities on, attention pages keep them and every other
+    page takes the caller's priority.
+    """
+    manager = object.__new__(KVCacheManagerV2)
+    manager._swa_endpoint_rewind = rewind
+    manager.block_reuse_policy = BlockReusePolicy.ALL_REUSABLE
+    manager.enable_block_reuse = True
+    manager.is_draft = False
+    manager.tokens_per_block = 32
+    manager.kv_cache_map = {}
+    manager.index_mapper = Mock()
+    manager.index_mapper.num_free_slots.return_value = 1
+    manager.max_beam_width = 1
+    manager.num_pools = 0
+    manager.impl = Mock()
+    manager.impl.create_kv_cache.return_value.beam_width = 1
+    manager.impl.create_kv_cache.return_value.batch_row = None
+
+    def callback(_ordinal, _life_cycle):
+        return 3
+
+    manager._create_kv_cache(
+        0,
+        None,
+        None,
+        is_dummy=False,
+        expected_prompt_length=8192,
+        custom_priority_callback=callback,
+    )
+
+    kwargs = manager.impl.create_kv_cache.call_args.kwargs
+    if rewind == 0:
+        assert kwargs["custom_priority_callback"] is callback
+    else:
+        priority = kwargs["custom_priority_callback"]
+        assert priority(255, AttnLifeCycle(4096, 0)) == 70
+        assert priority(255, object()) == 3
+
+
+def test_context_priority_callback_defaults_to_none() -> None:
+    """The base manager keeps the backend's default page priorities."""
+    manager = object.__new__(KVCacheManagerV2)
+    assert manager._context_priority_callback(Mock()) is None
+
+
 def _commit_released_prompt(core: KVCacheManager, prompt: list[int], priority_callback) -> None:
     """Run a prompt through a real cache and release it, leaving its pages reusable."""
     cache = core.create_kv_cache(None, prompt, custom_priority_callback=priority_callback)
@@ -2952,7 +3001,7 @@ def test_disagg_generation_drafter_writes_stay_on_its_own_draft_pages(
         )
         worker._lazy_init_ctx_buffers(
             draft_model,
-            SimpleNamespace(max_num_requests=2),
+            SimpleNamespace(max_num_requests=2, num_seq_slots=2),
             attn_metadata,
             draft_kv_cache_manager=draft,
         )
@@ -3100,7 +3149,7 @@ def test_slot_from_zero_worker_refuses_a_disagg_windowed_draft_pool(
             """Bind the drafter's ctx cache to the draft pool."""
             worker._lazy_init_ctx_buffers(
                 draft_model,
-                SimpleNamespace(max_num_requests=2),
+                SimpleNamespace(max_num_requests=2, num_seq_slots=2),
                 attn_metadata,
                 draft_kv_cache_manager=draft,
             )
@@ -3174,7 +3223,7 @@ def test_trailing_drafter_slot_reads_only_pages_its_request_holds(
         )
         worker._lazy_init_ctx_buffers(
             draft_model,
-            SimpleNamespace(max_num_requests=2),
+            SimpleNamespace(max_num_requests=2, num_seq_slots=2),
             attn_metadata,
             draft_kv_cache_manager=draft,
         )

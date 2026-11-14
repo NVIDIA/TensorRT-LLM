@@ -65,8 +65,16 @@ def _supported() -> bool:
     return torch.cuda.is_available() and _op().is_supported()
 
 
+def _scatter_supported() -> bool:
+    return torch.cuda.is_available() and _op().slot_scatter_supported()
+
+
 pytestmark = pytest.mark.skipif(
-    not _supported(), reason="the step-copy kernels run on SM 100 / SM 103 with the CuTe DSL"
+    not _scatter_supported(),
+    reason="the slot scatter runs on SM 100 / SM 103 / SM 107 with the CuTe DSL",
+)
+needs_gather = pytest.mark.skipif(
+    not _supported(), reason="the step-input gather runs on SM 100 / SM 103 with the CuTe DSL"
 )
 
 
@@ -455,12 +463,14 @@ def test_scatter(rows, tokens):
     assert not bad, bad
 
 
+@needs_gather
 @pytest.mark.parametrize("rows,tokens", SPLITS, ids=[f"{r}x{t}" for r, t in SPLITS])
 def test_gather(rows, tokens):
     bad = [r for r in measure_gather(rows, tokens) if not r["ok"]]
     assert not bad, bad
 
 
+@needs_gather
 @pytest.mark.parametrize("tokens", TOKENS, ids=[f"Rx{t}" for t in TOKENS])
 def test_graph_replay(tokens):
     bad = [r for r in measure_graph(tokens) if not r["ok"]]
@@ -542,6 +552,7 @@ def test_scatter_token_buffer_views(rows, tokens):
     assert not any(bad.values()), bad
 
 
+@needs_gather
 def test_contract():
     """rows == 0 launches nothing; every call the kernels do not cover returns False and launches nothing, so the
     caller keeps its torch path."""

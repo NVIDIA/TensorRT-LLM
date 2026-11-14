@@ -214,6 +214,9 @@ class DSparkSpecMetadata(SpecMetadata):
     captured_hidden_states: Optional[torch.Tensor] = None
 
     def __post_init__(self):
+        # Keep the full slot capacity across CUDA graph copies, whose
+        # max_num_requests is narrowed to the captured graph bucket.
+        self.num_seq_slots = self.num_seq_slots or self.max_num_requests
         self.batch_indices_cuda = torch.empty(
             [self.max_num_requests],
             dtype=torch.int,
@@ -589,22 +592,25 @@ class DSv4DSparkWorker(SpecWorkerBase):
         self._publish_position_ceiling(draft_model, attn_metadata, block_size)
 
         if not self._win_inited:
-            max_batch = spec_metadata.max_num_requests
-            self._output_verify_lens = torch.empty(max_batch, dtype=torch.int32, device="cuda")
+            # Allocated once and reused for every later batch shape, so the
+            # slots span the executor's whole seq-slot pool, which already
+            # counts requests paused in place by GEN slot preemption and, under
+            # pipeline parallelism or overlap headroom, more than one
+            # micro-batch. max_num_requests is no bound: it is the captured
+            # bucket on CUDA graph metadata.
+            num_slots = spec_metadata.num_seq_slots
+            self._output_verify_lens = torch.empty(num_slots, dtype=torch.int32, device="cuda")
             num_stages = draft_model.num_stages
             self._win = int(draft_model._attn_params["window_size"])
             head_dim = int(draft_model._attn_params["head_dim"])
 
-            # Real requests occupy slots ``[0, num_slots)`` (``max_batch`` plus
-            # requests paused in place by GEN slot preemption); one extra "scratch"
+            # Real requests occupy slots ``[0, num_slots)``; one extra "scratch"
             # row at index ``num_slots`` absorbs padded / unknown request IDs (CUDA-graph
             # padding, ADP idle requests, or disagg seed forwards that arrive without
             # a real request id) so they can never overwrite a live request's rolling
             # window. Previously such IDs aliased to slot 0 and corrupted whichever
             # real request occupied it. The scratch row is never handed out through
             # ``_free_slots`` and its contents are throwaway.
-            cache_manager = getattr(attn_metadata, "kv_cache_manager", None)
-            num_slots = max_batch + getattr(cache_manager, "gen_preemption_headroom", 0)
             self._scratch_slot = num_slots
             num_rows = num_slots + 1
 
@@ -631,7 +637,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
             self._valid_len = torch.zeros(num_rows, dtype=torch.long, device="cuda")
             self._position_initialized = torch.zeros(num_rows, dtype=torch.bool, device="cuda")
             self._batch_to_slot = torch.full(
-                (max_batch,), self._scratch_slot, dtype=torch.long, device="cuda"
+                (num_slots,), self._scratch_slot, dtype=torch.long, device="cuda"
             )
             if self.return_confidence:
                 # Neutral fill = large positive logit (sigmoid ~ 1.0):
@@ -768,7 +774,8 @@ class DSv4DSparkWorker(SpecWorkerBase):
             if not self._free_slots:
                 raise RuntimeError(
                     "DSpark has no free rolling-window slots for request "
-                    f"{req_id}; increase max_num_requests"
+                    f"{req_id}: all {len(self._req_to_slot)} slots of the executor's "
+                    "seq-slot pool are in use; increase max_batch_size"
                 )
             slot = self._free_slots.popleft()
             self._req_to_slot[req_id] = slot

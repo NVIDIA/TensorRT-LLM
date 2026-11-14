@@ -686,8 +686,15 @@ def _estimate_mamba_hybrid_cache_cost(
     use_separate_draft_kv_cache: bool = False,
     attention_slope_override: Optional[int] = None,
     attention_page_bytes_override: int = 0,
+    draft_scratch_tokens: int = 0,
     **kwargs,
 ) -> Tuple[int, int]:
+    """Return the hybrid cache's (bytes per token, fixed bytes) estimate.
+
+    ``draft_scratch_tokens`` is the capacity each request holds beyond its
+    history for a drafter whose layers share the manager; it is charged to the
+    attention layers here, and the caller charges the draft layers.
+    """
     spec_config = kwargs.get("spec_config")
     params, local_mamba_layers, local_attention_layers = _get_local_mamba_cache_layout(
         model_config,
@@ -748,6 +755,7 @@ def _estimate_mamba_hybrid_cache_cost(
         regular_slope = math.ceil(state_bytes_per_rank / interval)
         if has_unaligned_periodic_snapshot and not cap_partial_attention_snapshots:
             regular_slope += math.ceil(attention_block_bytes / interval)
+    intercept += max_batch_size * draft_scratch_tokens * attention_slope
     return attention_slope + regular_slope, intercept
 
 

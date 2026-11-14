@@ -532,6 +532,8 @@ class TestSplitGpuBudgetForDraft:
         c._get_effective_draft_config = Mock(return_value=effective_draft_config)
         c._get_num_draft_layers = Mock(return_value=2)
         c._model_engine.model.model_config.pretrained_config.num_hidden_layers = 40
+        # The drafter declares no KV pool dtype (a bare Mock attribute is not a torch.dtype).
+        c._model_engine.model.draft_model.draft_kv_dtype = None
         c._fallback_if_unsupported_kv_cache_manager_v2 = Mock(
             side_effect=lambda manager_cls, *_: manager_cls
         )

@@ -359,10 +359,38 @@ public:
     // This is a terminal-memory contract: callers must not perform later writes
     // to this KvCache's memory. The final live pages may be moved into the radix
     // tree instead of copied (SSM state and the last partial block).
-    void commit(TokenSpan tokens, bool isEnd = false);
+    // ssmFromPending: take the SSM snapshot of this commit from the page reserved by
+    // acquireSsmSnapshotSlot() (moved into the radix tree, no copy) instead of copying
+    // the live SSM page. The pending page is released whenever this commit does not
+    // record an SSM snapshot (no SSM snapshot point, block already covered, committing
+    // stopped, or an exception). Cannot be combined with isEnd.
+    void commit(TokenSpan tokens, bool isEnd = false, bool ssmFromPending = false);
 
     // Stop committing (called by close() automatically).
     void stopCommitting();
+
+    // ---- Pending SSM snapshot page ------------------------------------------
+
+    // Reserve a GPU SSM page for a snapshot written by the next forward step.
+    //
+    // The step writes the recurrent state at a commit point inside the step into this
+    // page, and the following commit(..., ssmFromPending=true) that ends at that point
+    // moves the page into the radix tree instead of copying the live SSM page there.
+    // The page is released by that commit if it records no SSM snapshot, by
+    // releaseSsmSnapshotSlot(), and on suspend(), stopCommitting() and close().
+    //
+    // Returns the slot id (the index space of getSsmBlockBaseIndex()), or nullopt if
+    // committing has stopped or no GPU page is available, even after eviction.
+    // Throws LogicError if the cache is not active, a page is already pending, or the
+    // manager has no SSM life cycle.
+    std::optional<int> acquireSsmSnapshotSlot();
+
+    // Slot id of the pending SSM snapshot page, if any.
+    std::optional<int> pendingSsmSnapshotSlot() const;
+
+    // Release the pending SSM snapshot page, if any, once the work queued so far on
+    // the cache stream is done. No-op without a pending page.
+    void releaseSsmSnapshotSlot();
 
     // ---- Page index queries ------------------------------------------------
 
@@ -678,15 +706,19 @@ private:
     CommittedPage* _copyPageToTreeBlock(
         SharedPtr<Block> const& treeBlock, LifeCycleId lcIdx, SharedPtr<Page> const& srcPage, int numTokensInBlock);
 
-    // Snapshot live SSM state to `treeBlock` reusable at `numTokens` committed tokens.
-    // If `move`, the live SSM page is moved (not copied) into the tree — the caller
-    // must guarantee no later writes to this KvCache's memory.
-    void _snapshotSsmToTreeBlock(
-        SharedPtr<Block> const& treeBlock, LifeCycleId ssmLcId, int numTokens, bool move = false);
+    // Snapshot SSM state to `treeBlock` reusable at `numTokens` committed tokens.
+    // The source is the live SSM page. If `move`, the live SSM page is moved (not
+    // copied) into the tree — the caller must guarantee no later writes to this
+    // KvCache's memory. If `fromPending`, the source is the pending snapshot page,
+    // which is moved into the tree; a pending page that the tree block does not take
+    // (it already covers `numTokens`) stays pending.
+    void _snapshotSsmToTreeBlock(SharedPtr<Block> const& treeBlock, LifeCycleId ssmLcId, int numTokens,
+        bool move = false, bool fromPending = false);
 
     // Snapshot a partial (non-full) final block at `ordinal` into the radix tree,
-    // copying partial attention pages and optionally the SSM snapshot.
-    void _snapshotPartialBlockToTree(BlockOrdinal ordinal, bool commitSsm);
+    // copying partial attention pages and optionally the SSM snapshot (from the
+    // pending snapshot page if `ssmFromPending`).
+    void _snapshotPartialBlockToTree(BlockOrdinal ordinal, bool commitSsm, bool ssmFromPending = false);
     // Returns [stale_begin, stale_end) block ordinal range for a SWA lifecycle.
     HalfOpenRange<BlockOrdinal> _getStaleRange(int historyLength, LifeCycle const& lc) const;
 
@@ -749,8 +781,18 @@ private:
     // Caller must have recordEventScope() open so finishEvent() works.
     // `commitSsm` snapshots the current SSM state for this block; `moveSsm`
     // moves (vs copies) the live SSM page into the tree (caller must guarantee
-    // no later writes to this KvCache's memory). Mirrors Python's _commit_block.
-    void _commitBlock(int ord, bool isLast, bool commitSsm = false, bool moveSsm = false);
+    // no later writes to this KvCache's memory); `ssmFromPending` takes the
+    // snapshot from the pending SSM snapshot page instead of the live page.
+    // Mirrors Python's _commit_block.
+    void _commitBlock(int ord, bool isLast, bool commitSsm = false, bool moveSsm = false, bool ssmFromPending = false);
+
+    // Body of commit(); `ssmFromPending` is forwarded to the SSM snapshot of this commit.
+    // The caller holds the API lock.
+    void _commit(TokenSpan tokens, bool isEnd, bool ssmFromPending);
+
+    // Release the pending SSM snapshot page, if any. Its lock records the cache's finish
+    // event: the current one inside a recordEventScope(), else a new one on the cache stream.
+    void _dropPendingSsmSnapshot();
 
     // Re-attach committed tree blocks of ours that the tail-prune walk detached while we
     // still referenced them (triggered by evicting an unheld SSM snapshot). Relinks the
@@ -856,6 +898,12 @@ private:
 
     // SSM pages: [beamIdx][lcId] — always initialized (empty entries = monostate).
     BeamBlockPages mSsmBlocks;
+    // A locked GPU SSM page (UncommittedPage at kBadBlockOrdinal), reserved by
+    // acquireSsmSnapshotSlot(), that the next forward step fills with the recurrent
+    // state at a commit point inside that step. commit(..., ssmFromPending=true) moves
+    // it into the radix tree. Exists only while the cache is active and committing is
+    // allowed.
+    std::optional<SharedPageLock> mPendingSsmSnapshot;
     bool mNeverResumed = true;
 
     PendingStats mPendingStats;

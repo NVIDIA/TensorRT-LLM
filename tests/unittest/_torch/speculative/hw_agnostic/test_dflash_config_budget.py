@@ -144,6 +144,14 @@ class TestCtxBufferBudget:
         assert "resident_headroom" in str(excinfo.value)
         assert f"{12 * PER_SLOT_BYTES_MSL / GIB:.2f} GiB" in str(excinfo.value)
 
+    def test_pipeline_parallel_pool_spans_every_micro_batch(self):
+        budget = 9 * PER_SLOT_BYTES_MSL  # batch 8 plus scratch at one micro-batch
+        _validate(max_batch_size=8, memory_budget_bytes=budget)
+        with pytest.raises(ValueError, match="max_batch_size estimated to fit is 4") as excinfo:
+            _validate(max_batch_size=8, memory_budget_bytes=budget, seq_slot_micro_batches=2)
+        assert "2 x max_batch_size + 1 slots" in str(excinfo.value)
+        assert f"{17 * PER_SLOT_BYTES_MSL / GIB:.2f} GiB" in str(excinfo.value)
+
     def test_unset_max_seq_len_skips_the_buffer_check(self):
         # max_seq_len is unset at config time and resolved later from the model
         # config; falling back to the drafter's 1M positions would refuse every
@@ -491,6 +499,15 @@ class TestLlmArgsWiring:
         args = self._args(tmp_path, max_batch_size=32)
         with pytest.raises(ValueError, match="max_batch_size estimated to fit"):
             args._validate_dflash_ctx_budget(memory_budget_bytes=10 * PER_SLOT_BYTES_MSL)
+
+    def test_pipeline_parallel_pool_is_counted_through_llm_args(self, tmp_path):
+        budget = 9 * PER_SLOT_BYTES_MSL
+        self._args(tmp_path, max_batch_size=8)._validate_dflash_ctx_budget(
+            memory_budget_bytes=budget
+        )
+        args = self._args(tmp_path, max_batch_size=8, pipeline_parallel_size=2)
+        with pytest.raises(ValueError, match="2 x max_batch_size"):
+            args._validate_dflash_ctx_budget(memory_budget_bytes=budget)
 
     @pytest.mark.parametrize("percentile", [None, "0", "99", "90"])
     @pytest.mark.parametrize(

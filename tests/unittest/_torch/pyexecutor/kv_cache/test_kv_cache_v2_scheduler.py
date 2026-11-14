@@ -451,6 +451,7 @@ def make_scheduler(
     enable_recompute_pause: bool = True,
     context_scheduling_policy: ContextSchedulingPolicy = ContextSchedulingPolicy.FCFS,
     context_starvation_iterations: int | None = None,
+    **scheduler_kwargs,
 ) -> object:
     """Create KVCacheV2Scheduler, patching isinstance check for mock mgr."""
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
@@ -459,7 +460,7 @@ def make_scheduler(
         "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2.KVCacheManagerV2",
         new=type(kv_cache_manager),
     ):
-        kwargs = {}
+        kwargs = dict(scheduler_kwargs)
         if no_schedule_until_state is not None:
             kwargs["no_schedule_until_state"] = no_schedule_until_state
         if no_schedule_after_state is not None:
@@ -3298,6 +3299,45 @@ class TestDisagg:
 # ===========================================================================
 
 
+class TestMidchunkSnapshotBudget:
+    """A budget-capped FORCE_CHUNK step of a request whose cache manager takes snapshots
+    inside the step (py_midchunk_snapshot_alignment / py_midchunk_pass_point): the cap
+    is rounded down to the 128-token unit and ends before the next point it may not pass.
+    An aligned point inside the step is the manager's to snapshot."""
+
+    @pytest.mark.parametrize(
+        "budget,prompt_len,points,branch,expected",
+        [
+            # The last point merges into the final step; the cap ends before it.
+            (512, 1000, [896], None, 512),
+            # A point that is not a multiple of the unit: the capped step passes the
+            # aligned point 192 and the manager snapshots it inside the step.
+            (256, 300, [192], None, 256),
+            # A branch point is passed; the cap ends before the following point.
+            (1536, 2100, [1024, 2048], 1024, 1536),
+            # Enough budget: the step ends at the following point.
+            (4096, 2100, [1024, 2048], 1024, 2048),
+        ],
+    )
+    def test_capped_step(self, budget, prompt_len, points, branch, expected):
+        sched = make_scheduler(
+            make_kv_cache_manager(tokens_per_block=64),
+            max_num_tokens=budget,
+            ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 128),
+        )
+        req = make_ctx_request(0, context_remaining_length=prompt_len, is_last_context_chunk=False)
+        req.expect_snapshot_points = points
+        req.py_midchunk_snapshot_alignment = 64
+        req.py_midchunk_pass_point = branch
+
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.context_requests) == [0]
+        assert req.context_chunk_size == expected
+        # Every point strictly inside the step is aligned, so the manager can take it.
+        assert all(p % 64 == 0 for p in points if 0 < p < expected)
+
+
 class TestChunkedContext:
     def test_budget_enough_for_all(self):
         mgr = make_kv_cache_manager(tokens_per_block=64)
@@ -5274,6 +5314,209 @@ class TestPregrownContextCapacity:
 # ===========================================================================
 # Long-prefill Demotion
 # ===========================================================================
+
+
+class TestLongContextDemotionExact:
+    """RuntimeHooks.exact_context_demotion: the demotion classifies by the prefix
+    cache. An estimate above the threshold is probed once against the radix
+    tree, a request whose cache is held is judged by its exact remainder, and
+    one ordered as short whose first prepare shows a long remainder is deferred."""
+
+    def _make(self, exact=True, reused=None, prepared_remaining=None, **demote):
+        """`reused`: probe result per request id. `prepared_remaining`: the exact
+        remainder prepare_context leaves per request id (its claimed reuse)."""
+        mgr = make_kv_cache_manager(tokens_per_block=64, enable_block_reuse=True)
+        reused = reused or {}
+        prepared_remaining = prepared_remaining or {}
+
+        def prepare(req, reuse_limit=None):
+            mgr.kv_cache_map[req.py_request_id]  # the request now holds a cache
+            if req.py_request_id in prepared_remaining:
+                req.context_remaining_length = prepared_remaining[req.py_request_id]
+            return True
+
+        mgr.prepare_context.side_effect = prepare
+        mgr.probe_context_reuse.side_effect = lambda req: reused.get(req.py_request_id)
+        demote.setdefault("context_demote_uncached_tokens", 1024)
+        demote.setdefault("context_demote_max_iters", 0)
+        with patch.dict("os.environ", {"TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS": "0"}):
+            sched = make_scheduler(
+                mgr,
+                max_num_tokens=1024,
+                ctx_chunk_config=(None, 64),
+                exact_context_demotion=exact,
+                **demote,
+            )
+        return sched, mgr
+
+    def _req(self, request_id, remaining, estimate, prompt_len=None):
+        req = make_ctx_request(
+            request_id, context_remaining_length=remaining, prompt_len=prompt_len
+        )
+        req.py_uncached_prefill_tokens = estimate
+        req.py_uncached_prefill_probed = False
+        return req
+
+    def test_constructor_arguments_win_over_the_environment(self):
+        env = {"TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS": "4096", "TLLM_V2_CTX_DEMOTE_MAX_ITERS": "3"}
+        with patch.dict("os.environ", env):
+            from_env = make_scheduler(make_kv_cache_manager(), ctx_chunk_config=(None, 64))
+            from_fields = make_scheduler(
+                make_kv_cache_manager(),
+                ctx_chunk_config=(None, 64),
+                context_demote_uncached_tokens=16384,
+                context_demote_max_iters=8,
+            )
+            off = make_scheduler(
+                make_kv_cache_manager(),
+                ctx_chunk_config=(None, 64),
+                context_demote_uncached_tokens=0,
+                exact_context_demotion=True,
+            )
+        assert (from_env._ctx_demote_uncached_tokens, from_env._ctx_demote_max_iters) == (4096, 3)
+        assert (from_fields._ctx_demote_uncached_tokens, from_fields._ctx_demote_max_iters) == (
+            16384,
+            8,
+        )
+        assert not from_env._ctx_demote_exact
+        # Exact mode only refines a demotion that is on.
+        assert off._ctx_demote_uncached_tokens == 0 and not off._ctx_demote_exact
+
+    def test_off_without_the_declaration(self):
+        sched, mgr = self._make(exact=False, reused={1: 9_800})
+        long_req, forked = self._req(0, 10_000, 10_000), self._req(1, 10_000, 10_000)
+        out = sched.schedule_request([long_req, forked], set())
+        assert ids(out.context_requests) == [0]
+        mgr.probe_context_reuse.assert_not_called()
+
+    def test_probe_releases_a_request_over_a_cached_prefix(self):
+        """A forked sub-agent: unseen conversation, so the router estimates the
+        whole prompt, but 9800 of its 10000 tokens are cached."""
+        sched, mgr = self._make(reused={0: 0, 1: 9_800}, prepared_remaining={1: 200})
+        long_req, forked = self._req(0, 10_000, 10_000), self._req(1, 10_000, 10_000)
+        out = sched.schedule_request([long_req, forked], set())
+        assert ids(out.context_requests) == [1, 0]
+        assert forked.py_uncached_prefill_tokens == 200
+        assert forked.context_chunk_size == 200
+        assert long_req.context_chunk_size == 768  # leftover 824, rounded to the chunk unit
+        # One probe per request: the second iteration reuses the refined estimates.
+        sched.schedule_request([long_req], set())
+        assert mgr.probe_context_reuse.call_count == 2
+
+    def test_held_cache_is_judged_by_its_exact_remainder(self):
+        """A continuing turn whose prefix was evicted: the router estimates 256,
+        but the cache it holds leaves 10000 tokens to prefill."""
+        sched, mgr = self._make()
+        lost, short = self._req(0, 10_000, 256), self._req(1, 256, 256)
+        mgr.kv_cache_map[0]
+        out = sched.schedule_request([lost, short], set())
+        assert ids(out.context_requests) == [1, 0]
+        assert lost.context_chunk_size == 768
+        mgr.probe_context_reuse.assert_not_called()
+
+    def test_first_prepare_defers_a_request_found_long(self):
+        """Deferred to the tail of the iteration's context order; its released
+        first-chunk admission is prepared again there."""
+        sched, mgr = self._make(prepared_remaining={0: 10_000})
+        lost, short = self._req(0, 10_000, 256), self._req(1, 256, 256)
+        out = sched.schedule_request([lost, short], set())
+        assert ids(out.context_requests) == [1, 0]
+        assert short.context_chunk_size == 256
+        assert lost.context_chunk_size == 768
+        assert sched._ctx_demote_skips == {0: 1}  # counted as demoted for aging
+        assert mgr.prepare_context.call_count == 3  # lost twice (deferred, retried), short once
+        # The deferral released the first-chunk admission before the retry.
+        mgr.free_resources.assert_called_once_with(lost)
+
+    def test_starved_requests_found_long_run_on_their_shares(self):
+        """Starved requests ordered as short are not deferred when their first
+        prepare shows a long remainder: a deferral would not move them, and
+        every iteration would order and defer them again."""
+        sched, _ = self._make(
+            prepared_remaining={0: 10_000, 1: 10_000},
+            context_scheduling_policy=ContextSchedulingPolicy.SHORTEST_UNCACHED_FIRST,
+            context_starvation_iterations=8,
+        )
+        sched._sched_iter = 100
+        first, second = self._req(0, 10_000, 256), self._req(1, 10_000, 256)
+        for req in (first, second):
+            req.py_ctx_sched_since_iter = 0
+        for _ in range(2):
+            for req in (first, second):
+                req.py_uncached_prefill_tokens = 256
+            out = sched.schedule_request([first, second], set())
+            assert sorted(ids(out.context_requests)) == [0, 1]
+            # Each holds 1024 // 4 = 256 tokens; the oldest takes the leftover.
+            assert first.context_chunk_size + second.context_chunk_size == 1024
+            assert min(first.context_chunk_size, second.context_chunk_size) >= 256
+
+    def _run_behind_full_budgets(self, sched, mgr, lost, iterations):
+        """Schedule *lost* first in arrival order, each iteration behind a new
+        short request that takes the whole token budget. A first chunk that
+        is not scheduled releases its cache. Returns the iteration (1-based)
+        that scheduled *lost*, or None."""
+        mgr.free_resources.side_effect = lambda req: mgr.kv_cache_map.pop(req.py_request_id, None)
+        for iteration in range(1, iterations + 1):
+            short = self._req(100 + iteration, 1024, 1024)
+            out = sched.schedule_request([lost, short], set())
+            if lost.py_request_id in ids(out.context_requests):
+                return iteration
+        return None
+
+    def test_request_found_long_at_first_prepare_ages_out(self):
+        """Found long only by its first prepare, behind short requests that fill
+        the budget: demoted at most context_demote_max_iters iterations, then
+        let through. Its exact remainder demotes it at the door from the second
+        iteration on, so it is not prepared again until it runs."""
+        sched, mgr = self._make(prepared_remaining={0: 10_000}, context_demote_max_iters=2)
+        lost = self._req(0, 10_000, 256)
+        assert self._run_behind_full_budgets(sched, mgr, lost, 5) == 3
+        assert lost.py_uncached_prefill_tokens is None  # let through for good
+        prepared = [c.args[0] for c in mgr.prepare_context.call_args_list]
+        assert prepared.count(lost) == 2  # found long, then scheduled
+
+    def test_request_found_long_at_first_prepare_without_bound(self):
+        """context_demote_max_iters=0 sets no bound: the request stays demoted
+        while short requests fill the budget, demoted at the door after its
+        first prepare."""
+        sched, mgr = self._make(prepared_remaining={0: 10_000})
+        lost = self._req(0, 10_000, 256)
+        assert self._run_behind_full_budgets(sched, mgr, lost, 5) is None
+        assert lost.py_uncached_prefill_tokens == 10_000
+        assert sched._ctx_demote_skips == {0: 5}
+        prepared = [c.args[0] for c in mgr.prepare_context.call_args_list]
+        assert prepared.count(lost) == 1
+
+    def test_request_found_short_is_not_deferred(self):
+        sched, _ = self._make(prepared_remaining={0: 512})
+        first, second = self._req(0, 512, 512), self._req(1, 256, 256)
+        out = sched.schedule_request([first, second], set())
+        assert ids(out.context_requests) == [0, 1]
+        assert sched._ctx_demote_skips == {}
+
+    def test_waiting_request_is_probed_again(self):
+        """A request waiting for a prefix another request prefills (PrefixWaitPlanner)
+        is probed again once it stops waiting: its first probe predates that prefix."""
+        reused = {1: 0}
+        sched, mgr = self._make(reused=reused, prepared_remaining={1: 200})
+        waits = {1: None}
+        sched._prefix_wait_planner = Mock()
+        sched._prefix_wait_planner.plan.side_effect = lambda reqs: dict(waits)
+        waiting = self._req(1, 10_000, 10_000)
+        out = sched.schedule_request([waiting], set())
+        assert ids(out.context_requests) == []
+        assert waiting.py_uncached_prefill_tokens == 10_000
+        assert not waiting.py_uncached_prefill_probed
+        # The prefix owner committed 9800 shared tokens; the waiter is released.
+        reused[1] = 9_800
+        waits.clear()
+        out = sched.schedule_request([waiting], set())
+        assert ids(out.context_requests) == [1]
+        assert waiting.py_uncached_prefill_tokens == 200
+        assert waiting.context_chunk_size == 200
+        assert mgr.probe_context_reuse.call_count == 2
+        # Only the pass that kept it waiting counts a prefix wait.
+        mgr.count_prefix_waits.assert_called_once_with(1)
 
 
 class TestLongContextDemotion:
