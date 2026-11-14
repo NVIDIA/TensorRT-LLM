@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 import math
+import os
 from dataclasses import replace
 from typing import Dict, Optional
 
@@ -1953,6 +1954,15 @@ class DFlashForCausalLM(nn.Module):
         # Flatten query positions once for the fused QK-norm-RoPE kernel.
         query_positions_flat_i32 = query_positions.reshape(-1).to(torch.int32)
 
+        k3_drafter_op = None
+        if (
+            self.dflash_attention_backend == "TRTLLM"
+            and os.environ.get("TLLM_K3_DRAFTER_SPLITKV") == "1"
+        ):
+            from .._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_drafter import (
+                op as k3_drafter_op,
+            )
+
         residual = None
         has_block_conv = self.has_block_conv
 
@@ -2051,7 +2061,44 @@ class DFlashForCausalLM(nn.Module):
 
             # Per-layer view into the pooled ctx cache.
             causal, window_size = self._resolve_block_attention(layer_idx)
-            if self.dflash_attention_backend == "TRTLLM":
+            if (
+                k3_drafter_op is not None
+                and not causal
+                and window_size == (-1, -1)
+                and head_dim == 64
+                and B > 0
+                and all(
+                    k3_drafter_op.supports_attn(
+                        qkv_query[g * block_size : min(g + 8, B) * block_size].contiguous(),
+                        ctx_kv_cache[layer_idx],
+                        num_heads_per_rank,
+                        num_kv_heads_per_rank,
+                        min(8, B - g),
+                    )
+                    for g in range(0, B, 8)
+                )
+            ):
+                qkv_block = torch.cat(
+                    (
+                        Q_bshd.reshape(B * block_size, q_size),
+                        k_noise_bshd.reshape(B * block_size, kv_size),
+                        v_noise_bshd.reshape(B * block_size, kv_size),
+                    ),
+                    dim=-1,
+                )
+                out = Q_bshd.new_empty((B, block_size, num_heads_per_rank, head_dim))
+                for g in range(0, B, 8):
+                    e = min(8, B - g)
+                    k3_drafter_op.k3_drafter_attn(
+                        qkv_block[g * block_size : (g + e) * block_size].contiguous(),
+                        ctx_kv_cache[layer_idx],
+                        block_tables[g : g + e],
+                        cache_seqlens_i32[g : g + e],
+                        num_heads_per_rank,
+                        num_kv_heads_per_rank,
+                        out.view(-1, q_size)[g * block_size : (g + e) * block_size],
+                    )
+            elif self.dflash_attention_backend == "TRTLLM":
                 layer_cache = ctx_kv_cache[layer_idx]
                 trtllm_gen_ops.append_paged_kv_cache(
                     append_key=k_noise_bshd.reshape(
