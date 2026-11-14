@@ -26,6 +26,11 @@ forward:
   group's largest token count, `comm/allgather`, route and run this rank's experts over
   the gathered set, `comm/reducescatter` back.
 
+Under static EPLB (`moe_config.load_balancer`, attention DP at dep4 and dep8) every routed
+MoE layer registers with the engine's load balancer, its experts are loaded by slot rather than
+by a contiguous expert window (weights.py), and `_experts` routes the router's expert ids to
+slot ids before the runner, which then works in slots. See `catalog/moe/eplb.py`.
+
 The MTP layer (one-model MTP-Eagle) is one more decoder layer, cut per rank like the others,
 and runs through the same two layout-dependent blocks: its two residual-norm slots are the
 same op, and its routed experts the same round trip around a bf16 expert call. Its
@@ -73,6 +78,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.reducescatter im
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.bmm_out import bmm_out
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.nvfp4_gemm import nvfp4_gemm
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.eplb import EplbLayer
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp4_block_scale_moe_runner import (  # noqa: E501
     fp4_block_scale_moe_runner,
 )
@@ -346,6 +352,16 @@ class DeepseekV3DefaultModelingV2(DecoderModel):
         self.dims = _weights.MODEL_WEIGHTS.dims(self)
         self.w = _weights.MODEL_WEIGHTS.declare(self.dims)
 
+        # Under EPLB every routed MoE layer registers with the engine's load
+        # balancer, in the order the layers run: the trunk's, then the MTP
+        # layer's, which runs once per draft step.
+        assert self.dims.eplb in (None, "static"), f"{self.dims.eplb} EPLB is not implemented"
+        self.eplb_layers: dict[int, EplbLayer] = {}
+        if self.dims.eplb is not None:
+            for i, slots in self.dims.slots.items():
+                repeat = model_config.spec_config.max_draft_len if i == self.dims.num_layers else 1
+                self.eplb_layers[i] = EplbLayer.register(slots, cfg.num_experts_per_tok, repeat)
+
         self._rope: dict | None = None
         self._rope_positions = 0
         self._side_stream: torch.cuda.Stream | None = None
@@ -520,7 +536,8 @@ class _LayerWeights(NamedTuple):
     GEMM operands are `.t()` views; `k_b` / `v_b_t` are the two halves of this rank's
     `kv_b` in the shapes the absorbed-q and expand BMMs take; `norm_next` is the *next*
     layer's input norm (the final norm on the last layer). The MoE fields are None on the
-    dense layers.
+    dense layers. The per-expert scales are this rank's slots' (`dims.slots`), and `eplb`
+    is the layer's handle in the engine's load balancer under EPLB, None otherwise.
     """
 
     qa: torch.Tensor
@@ -552,6 +569,7 @@ class _LayerWeights(NamedTuple):
     out1_scale: torch.Tensor | None
     out1_gate_scale: torch.Tensor | None
     out2_scale: torch.Tensor | None
+    eplb: EplbLayer | None
 
 
 def _layer_views(core: DeepseekV3DefaultModelingV2) -> list[_LayerWeights]:
@@ -559,7 +577,6 @@ def _layer_views(core: DeepseekV3DefaultModelingV2) -> list[_LayerWeights]:
     d = core.dims
     w = core.w
     hn = d.heads * d.nope
-    window = slice(d.expert_offset, d.expert_offset + d.local_experts)
 
     layers = []
     for i in range(d.num_layers):
@@ -581,15 +598,18 @@ def _layer_views(core: DeepseekV3DefaultModelingV2) -> list[_LayerWeights]:
             out1_scale=None,
             out1_gate_scale=None,
             out2_scale=None,
+            eplb=None,
         )
         if i >= d.dense_layers:
             # One quantization of the hidden states feeds every expert on every rank, so the
             # routed FC1 activation scale has to be a single value and the same value on all
-            # ranks, or the expert windows and intermediate slices no longer sum to the whole
+            # ranks, or the expert slots and intermediate slices no longer sum to the whole
             # layer; the shared expert's `input_scale` is the max over all routed ones, so it
-            # is the safe one.
-            e_isc2 = w[f"l{i}_e_isc2"][window]
-            gate1 = (isc1[0] * w[f"l{i}_e_ws2_1"][window]).contiguous()
+            # is the safe one. The per-expert scalars are held for every expert on every
+            # rank; each slot reads its own expert's.
+            held = torch.tensor(d.slots[i].slot_experts, device=isc1.device)
+            e_isc2 = w[f"l{i}_e_isc2"][held]
+            gate1 = (isc1[0] * w[f"l{i}_e_ws2_1"][held]).contiguous()
             moe = dict(
                 router=w[f"l{i}_router"].t(),
                 router_bias=w[f"l{i}_router_bias"],
@@ -600,7 +620,8 @@ def _layer_views(core: DeepseekV3DefaultModelingV2) -> list[_LayerWeights]:
                 fc2_s=w[f"l{i}_fc2_s"].view(torch.float8_e4m3fn),
                 out1_scale=(gate1 / e_isc2).contiguous(),
                 out1_gate_scale=gate1,
-                out2_scale=(e_isc2 * w[f"l{i}_e_ws2_2"][window]).contiguous(),
+                out2_scale=(e_isc2 * w[f"l{i}_e_ws2_2"][held]).contiguous(),
+                eplb=core.eplb_layers.get(i),
             )
         layers.append(
             _LayerWeights(
@@ -641,9 +662,14 @@ def _dense_mlp(x: torch.Tensor, L: _LayerWeights, dt) -> torch.Tensor:
 
 
 def _experts(core: DeepseekV3DefaultModelingV2, L: _LayerWeights, x: torch.Tensor) -> torch.Tensor:
-    """Route, quantize and run this rank's experts -- its EP window at its moe_tp slice of
-    the intermediate -- over `x`, at most `_MOE_MAX_T` rows a call. The result is this
-    rank's partial sum."""
+    """Route, quantize and run this rank's experts -- its expert slots at its moe_tp slice
+    of the intermediate -- over `x`, at most `_MOE_MAX_T` rows a call. The result is this
+    rank's partial sum.
+
+    Under EPLB the router's expert ids are routed to slot ids first, and the runner works
+    in slots: `num_slots` routing ids, of which this rank answers for its own window.
+    Every rank routes the same gathered rows, so every rank picks the same slot for each
+    of a token's experts, and the slots' partial sums add up to the layer."""
     cfg = core.model_config.pretrained_config
     d = core.dims
     parts = []
@@ -657,6 +683,8 @@ def _experts(core: DeepseekV3DefaultModelingV2, L: _LayerWeights, x: torch.Tenso
             cfg.num_experts_per_tok,
             float(cfg.routed_scaling_factor),
         )
+        if L.eplb is not None:
+            topk_ids = L.eplb.route(topk_ids)
         xq, xsf = fp4_quantize(chunk, L.moe_gscale, _SF_VEC, False, _SF_LINEAR)
         parts.append(
             fp4_block_scale_moe_runner(
@@ -676,13 +704,13 @@ def _experts(core: DeepseekV3DefaultModelingV2, L: _LayerWeights, x: torch.Tenso
                 output1_scale_scalar=L.out1_scale,
                 output1_scale_gate_scalar=L.out1_gate_scale,
                 output2_scale_scalar=L.out2_scale,
-                num_experts=d.num_experts,
+                num_experts=d.num_slots,
                 top_k=cfg.num_experts_per_tok,
                 n_group=None,
                 topk_group=None,
                 intermediate_size=d.moe_inter,
-                local_expert_offset=d.expert_offset,
-                local_num_experts=d.local_experts,
+                local_expert_offset=d.slot_offset,
+                local_num_experts=d.local_slots,
                 routed_scaling_factor=None,
                 routing_method_type=_ROUTING_METHOD_INERT,
                 do_finalize=True,
@@ -699,7 +727,8 @@ class _MtpWeights(NamedTuple):
 
     The attention fields are a trunk layer's, at layer `num_hidden_layers`; the experts
     (`fc1`, `fc2`) and the shared expert (`sh_gu`, `sh_dn`) are bf16, `enorm`, `hnorm`,
-    `eh` and `head_norm` are the module's own.
+    `eh` and `head_norm` are the module's own. `eplb` is the layer's handle in the engine's
+    load balancer under EPLB, None otherwise.
     """
 
     enorm: torch.Tensor
@@ -723,6 +752,7 @@ class _MtpWeights(NamedTuple):
     sh_gu: torch.Tensor
     sh_dn: torch.Tensor
     head_norm: torch.Tensor
+    eplb: EplbLayer | None
 
 
 def _mtp_views(core: DeepseekV3DefaultModelingV2) -> _MtpWeights:
@@ -755,6 +785,7 @@ def _mtp_views(core: DeepseekV3DefaultModelingV2) -> _MtpWeights:
         sh_gu=w[f"l{j}_sh_gu"].t(),
         sh_dn=w[f"l{j}_sh_dn"].t(),
         head_norm=w[f"l{j}_head_norm"],
+        eplb=core.eplb_layers.get(j),
     )
 
 
@@ -768,9 +799,10 @@ def _mtp_shared(x: torch.Tensor, M: _MtpWeights) -> torch.Tensor:
 def _mtp_experts(
     core: DeepseekV3DefaultModelingV2, M: _MtpWeights, x: torch.Tensor
 ) -> torch.Tensor:
-    """Route and run this rank's bf16 MTP experts -- its EP window at its moe_tp slice of
-    the intermediate -- over `x`, at most `_MOE_MAX_T` rows a call. The result is this
-    rank's partial sum, the trunk's `_experts` at a different dtype.
+    """Route and run this rank's bf16 MTP experts -- its expert slots at its moe_tp slice
+    of the intermediate -- over `x`, at most `_MOE_MAX_T` rows a call. The result is this
+    rank's partial sum, the trunk's `_experts` at a different dtype, and under EPLB routed
+    to slots the same way.
 
     `fused_moe` rather than the trtllm-gen runner: the checkpoint excludes
     `model.layers.61*` from NVFP4, and the runner takes NVFP4 operands only. It wants fp32
@@ -791,6 +823,8 @@ def _mtp_experts(
             cfg.num_experts_per_tok,
             float(cfg.routed_scaling_factor),
         )
+        if M.eplb is not None:
+            topk_ids = M.eplb.route(topk_ids)
         parts.append(
             fused_moe(
                 input=chunk,
@@ -840,8 +874,8 @@ def _routed_attention_dp(
     set, and sum back to the rows this rank owns.
 
     Gathering before the router keeps the routing identical on every rank, so each token's
-    top-8 ids fall in exactly one expert window per moe_tp slice, and the reduce-scatter
-    sums each contribution once."""
+    top-8 ids fall in exactly one rank's slot window per moe_tp slice, and the
+    reduce-scatter sums each contribution once."""
     num_tokens = o.shape[0]
     o_pad = o if not pad_rows else nn.functional.pad(o, [0, 0, 0, pad_rows])
     group, pg = core.dp_group, core.dp_process_group
@@ -1910,6 +1944,10 @@ class DraftModel:
 class ModelingV2DeepseekR10528Nvfp4Sm10xDefault(
     DecoderModelForCausalLM[DeepseekV3DefaultModelingV2, PretrainedConfig]
 ):
+    #: Static EPLB: the core registers its MoE layers with the engine's load balancer, loads
+    #: its experts by slot and routes expert ids to slots (`catalog/moe/eplb.py`).
+    EPLB_MODES = frozenset({"static"})
+
     def __init__(self, model_config: ModelConfig):
         cfg = model_config.pretrained_config
         super().__init__(

@@ -17,8 +17,13 @@ is computed once, in `dims`, from the engine's `Mapping`:
   same group along their intermediate: a rank holds a slice of the gate and up
   rows and the matching down columns, and its output is a partial sum.
 
-* **Experts** are split over the MoE EP group: a rank holds the contiguous id
-  window `[expert_offset, expert_offset + local_experts)`.
+* **Experts** sit in slots, split evenly over the MoE EP group: a rank holds
+  `local_slots` slots from global slot `slot_offset` on, and `slots[i]` names
+  the expert each of them holds at layer `i`. Without EPLB each expert has one
+  slot and a rank's slots are the contiguous window of experts
+  `[slot_offset, slot_offset + local_slots)`; under EPLB
+  (`moe_config.load_balancer`) the placement is the load balancer's, and a
+  hot expert can sit in several slots, on one rank or on several.
 
 * **The expert intermediate** is split over the MoE TP group, along the FC1
   output rows and the FC2 input columns. At this geometry (I=2048, one e4m3
@@ -65,8 +70,9 @@ Loading contract: `load(model, weights)` consumes the engine-provided
 checkpoint dict, fills every declared parameter exactly once, and asserts
 bidirectional coverage -- every target parameter written, and every checkpoint
 key either consumed (a key read through a cut is consumed) or in the two
-predicted non-load sets (this rank's off-window experts, and what the MTP
-layer leaves: all of it without MTP, its two aliased keys with it).
+predicted non-load sets (the experts none of this rank's slots holds, and
+what the MTP layer leaves: all of it without MTP, its two aliased keys with
+it).
 """
 
 from dataclasses import dataclass
@@ -75,6 +81,8 @@ from typing import Any, Callable
 
 import torch
 import torch.nn as nn
+
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.eplb import eplb_mode, eplb_slots
 
 #: `layers=ALL_LAYERS` is the common case and the default. A sentinel rather
 #: than a lambda so the table reads as data, and rather than `True` so the
@@ -382,16 +390,17 @@ def _pair(a, b):
 
 
 def _expert_window(suffix, *, pair_with=None):
-    """This rank's EP window of the routed experts, one source per local expert.
+    """This rank's slots of the routed experts, one source per slot.
 
-    The checkpoint key depends on the rank -- `expert_offset` is this rank's first
-    expert -- which is why the source is computed rather than templated.
+    Slot `local` of layer `i` holds expert `d.slots[i].slot_experts[local]`. The
+    checkpoint key depends on the rank and, under EPLB, on the layer, which is
+    why the source is computed rather than templated.
     """
 
     def build(d, i):
         out = []
-        for local in range(d.local_experts):
-            q = f"model.layers.{i}.mlp.experts.{d.expert_offset + local}"
+        for local, expert in enumerate(d.slots[i].slot_experts):
+            q = f"model.layers.{i}.mlp.experts.{expert}"
             if pair_with is None:
                 out.append((f"{q}.{suffix}", (local,)))
             else:
@@ -594,7 +603,7 @@ class DeepseekV3DefaultWeights:
         # --- this rank's routed experts, NVFP4, at its moe_tp slice ---
         W(
             "fc1_w",
-            shape=lambda d: (d.local_experts, 2 * d.moe_inter, d.hidden // 2),
+            shape=lambda d: (d.local_slots, 2 * d.moe_inter, d.hidden // 2),
             dtype=torch.uint8,
             src=_expert_window("gate_proj.weight", pair_with="up_proj.weight"),
             cut=_rows(_expert_rows),
@@ -603,7 +612,7 @@ class DeepseekV3DefaultWeights:
         ),
         W(
             "fc1_s",
-            shape=lambda d: (d.local_experts, 2 * d.moe_inter, d.hidden // SF_BLOCK),
+            shape=lambda d: (d.local_slots, 2 * d.moe_inter, d.hidden // SF_BLOCK),
             dtype=torch.uint8,
             src=_expert_window("gate_proj.weight_scale", pair_with="up_proj.weight_scale"),
             cut=_rows(_expert_rows),
@@ -612,7 +621,7 @@ class DeepseekV3DefaultWeights:
         ),
         W(
             "fc2_w",
-            shape=lambda d: (d.local_experts, d.hidden, d.moe_inter // 2),
+            shape=lambda d: (d.local_slots, d.hidden, d.moe_inter // 2),
             dtype=torch.uint8,
             src=_expert_window("down_proj.weight"),
             cut=_cols(_expert_cols_w),
@@ -621,7 +630,7 @@ class DeepseekV3DefaultWeights:
         ),
         W(
             "fc2_s",
-            shape=lambda d: (d.local_experts, d.hidden, d.moe_inter // SF_BLOCK),
+            shape=lambda d: (d.local_slots, d.hidden, d.moe_inter // SF_BLOCK),
             dtype=torch.uint8,
             src=_expert_window("down_proj.weight_scale"),
             cut=_cols(_expert_cols_s),
@@ -688,7 +697,7 @@ class DeepseekV3DefaultWeights:
         # This rank's EP window of the bf16 routed experts, at its moe_tp slice.
         W(
             "fc1",
-            shape=lambda d: (d.local_experts, 2 * d.moe_inter, d.hidden),
+            shape=lambda d: (d.local_slots, 2 * d.moe_inter, d.hidden),
             src=_expert_window("gate_proj.weight", pair_with="up_proj.weight"),
             cut=_rows(_expert_rows),
             transform=_mtp_fc1,
@@ -696,7 +705,7 @@ class DeepseekV3DefaultWeights:
         ),
         W(
             "fc2",
-            shape=lambda d: (d.local_experts, d.hidden, d.moe_inter),
+            shape=lambda d: (d.local_slots, d.hidden, d.moe_inter),
             src=_expert_window("down_proj.weight"),
             cut=_cols(_expert_cols_bf16),
             layers=_mtp_only,
@@ -769,7 +778,7 @@ class DeepseekV3DefaultWeights:
         return src_all[0]
 
     def expected_unconsumed(self, core, weights) -> set:
-        return _offwindow_expert_keys(core) | _mtp_keys(core, weights)
+        return _unheld_expert_keys(core) | _mtp_keys(core, weights)
 
     def load(self, model, weights) -> None:
         """Fill every declared weight from the checkpoint. Each source is read through
@@ -816,7 +825,7 @@ class DeepseekV3DefaultWeights:
         expected = self.expected_unconsumed(core, weights)
         assert leftover == expected, (
             "checkpoint coverage: leftover keys are not exactly this rank's "
-            f"off-window experts plus what the MTP layer leaves; unexpected "
+            f"unheld experts plus what the MTP layer leaves; unexpected "
             f"{sorted(leftover - expected)[:8]}, missed {sorted(expected - leftover)[:8]}"
         )
 
@@ -833,8 +842,12 @@ class DeepseekV3DefaultWeights:
         attn_tp_rank = 0 if attention_dp else m.tp_rank
         heads_total = cfg.num_attention_heads
         assert heads_total % attn_tp == 0, (heads_total, attn_tp)
-        assert cfg.n_routed_experts % m.moe_ep_size == 0, (cfg.n_routed_experts, m.moe_ep_size)
-        local_experts = cfg.n_routed_experts // m.moe_ep_size
+        # Each routed MoE layer's slots on this rank, in the order the layers run:
+        # the trunk's, then the MTP layer's. Every layer has the same number of
+        # slots; under EPLB the expert each slot holds differs by layer.
+        moe_layers = range(cfg.first_k_dense_replace, cfg.num_hidden_layers + int(mtp_enabled))
+        slots = {i: eplb_slots(core.model_config, i, cfg.n_routed_experts) for i in moe_layers}
+        layout = slots[cfg.first_k_dense_replace]
         shared_full = cfg.moe_intermediate_size * cfg.n_shared_experts
         # The built-in model sizes the dense MLP's TP down when it would cross
         # nodes (`_compute_mlp_tp_size`); this target splits it over the whole
@@ -877,8 +890,11 @@ class DeepseekV3DefaultWeights:
             moe_inter=cfg.moe_intermediate_size // m.moe_tp_size,
             moe_ep=m.moe_ep_size,
             moe_ep_rank=m.moe_ep_rank,
-            local_experts=local_experts,
-            expert_offset=local_experts * m.moe_ep_rank,
+            eplb=eplb_mode(core.model_config),
+            slots=slots,
+            num_slots=layout.num_slots,
+            local_slots=layout.local_slots,
+            slot_offset=layout.slot_offset,
             mtp_enabled=mtp_enabled,
             dtype=core.model_config.torch_dtype,
         )
@@ -909,21 +925,21 @@ def lm_head_share(rows: int, vocab: int, tp_rank: int) -> tuple[Cut, Callable]:
     return (slice(start, stop),), pad
 
 
-def _offwindow_expert_keys(core) -> set:
+def _unheld_expert_keys(core) -> set:
     """The first predicted non-load: the weight/scale tensors of every routed
-    expert outside this rank's EP window. Their per-tensor scalars are consumed
-    on every rank, so nothing else of theirs is left over.
+    expert that none of this rank's slots holds. Their per-tensor scalars are
+    consumed on every rank, so nothing else of theirs is left over.
 
     The trunk's MoE layers store six such tensors per expert (NVFP4 data plus
-    block scales); the MTP layer's are bf16, so when it is live its off-window
+    block scales); the MTP layer's are bf16, so when it is live its unheld
     experts leave three each and no `weight_scale`."""
     d = core.dims
-    lo, hi = d.expert_offset, d.expert_offset + d.local_experts
     keys = set()
     for i in _router_layers(d):
         quantized = i < d.num_layers
+        held = set(d.slots[i].slot_experts)
         for e in range(d.num_experts):
-            if lo <= e < hi:
+            if e in held:
                 continue
             q = f"model.layers.{i}.mlp.experts.{e}"
             for proj in ("gate_proj", "up_proj", "down_proj"):
@@ -940,8 +956,8 @@ def _mtp_keys(core, weights) -> set:
     land here.
 
     Without MTP that is those layers whole -- on this checkpoint layer 61's 790
-    keys. With MTP the table consumes all but two per rank (and this rank's
-    off-window experts, which the family above names): `embed_tokens` and
+    keys. With MTP the table consumes all but two per rank (and the experts
+    this rank's slots do not hold, which the family above names): `embed_tokens` and
     `shared_head.head` are bitwise copies of the trunk's embedding and
     `lm_head`, which the draft model reads instead of loading them twice."""
     cfg = core.model_config.pretrained_config

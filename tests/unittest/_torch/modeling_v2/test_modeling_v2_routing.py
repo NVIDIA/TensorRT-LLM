@@ -46,9 +46,13 @@ from tensorrt_llm._torch.configs.kimi_k3 import KimiK3Config
 from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_auto import AutoModelForCausalLM
+from tensorrt_llm._torch.moe.fused_moe import moe_load_balancer
+from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import MOE_LOAD_BALANCER_MODES
 from tensorrt_llm.llmapi.llm_args import (
     CacheTransceiverConfig,
     KvCacheConfig,
+    MoeLoadBalancerConfig,
+    MoePerLayerDynamicLoadBalancerConfig,
     MTPDecodingConfig,
     NGramDecodingConfig,
     TorchLlmArgs,
@@ -234,11 +238,13 @@ class _TargetDisabledByDefault:
     """A target the default mode declines."""
 
 
-def _claimed_by(monkeypatch, target):
+_CLAIMED_ARCH = "ModelingV2TestForCausalLM"
+
+
+def _claimed_by(monkeypatch, target, **mapping_kwargs):
     """A config whose architecture's ``route`` claims every deployment for ``target``."""
-    arch = "ModelingV2TestForCausalLM"
-    monkeypatch.setitem(_ROUTES, arch, lambda *_: target)
-    return _model_config(PretrainedConfig(architectures=[arch]))
+    monkeypatch.setitem(_ROUTES, _CLAIMED_ARCH, lambda *_: target)
+    return _model_config(PretrainedConfig(architectures=[_CLAIMED_ARCH]), **mapping_kwargs)
 
 
 def test_the_default_mode_builds_a_claiming_target(monkeypatch):
@@ -256,6 +262,89 @@ def test_a_set_mode_builds_a_target_disabled_by_default(monkeypatch, mode):
     """Setting ``modeling_v2`` is the opt-in, including to the value it defaults to."""
     config = _claimed_by(monkeypatch, _TargetDisabledByDefault)
     assert modeling_v2_resolve(config, _llm_args(mode)) is _TargetDisabledByDefault
+
+
+# --- Expert load balancing: a target runs only the EPLB modes it lists -----------------------
+
+
+class _TargetWithStaticEplb:
+    """A target that implements static EPLB and no other mode."""
+
+    EPLB_MODES = frozenset({"static"})
+
+
+def _eplb_config(eplb_mode, num_slots=288):
+    """A ``moe_config.load_balancer`` that runs ``eplb_mode``."""
+    if eplb_mode == "per_layer_dynamic":
+        return MoePerLayerDynamicLoadBalancerConfig(num_slots=num_slots)
+    updates = 2 if eplb_mode == "online" else 0
+    return MoeLoadBalancerConfig(num_slots=num_slots, layer_updates_per_iter=updates)
+
+
+def _balanced(config, eplb_mode, num_slots=288):
+    """``config`` deployed with ``eplb_mode``, as the loader hands it to routing."""
+    return replace(config, moe_load_balancer=_eplb_config(eplb_mode, num_slots))
+
+
+def _balance_the_claimed_arch(monkeypatch):
+    """Have the engine balance ``_CLAIMED_ARCH``, as it balances the architectures in moe_model_arch_list."""
+    monkeypatch.setattr(
+        moe_load_balancer,
+        "moe_model_arch_list",
+        [*moe_load_balancer.moe_model_arch_list, _CLAIMED_ARCH],
+    )
+
+
+@pytest.mark.parametrize("eplb_mode", sorted(MOE_LOAD_BALANCER_MODES))
+def test_eplb_declines_a_target_that_lists_no_mode(monkeypatch, eplb_mode):
+    """The loader creates the load balancer around whatever class it builds. A target that registers no
+    layer with it would serve the deployment on fixed expert windows, so ``auto`` keeps the built-in
+    model and ``require`` says why."""
+    _balance_the_claimed_arch(monkeypatch)
+    config = _balanced(_claimed_by(monkeypatch, _TargetUsedByDefault, **_DEP4), eplb_mode)
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+    with pytest.raises(ValueError, match=f"{eplb_mode} EPLB .* implements no EPLB mode"):
+        modeling_v2_resolve(config, _llm_args("require"))
+
+
+@pytest.mark.parametrize("eplb_mode", sorted(MOE_LOAD_BALANCER_MODES))
+def test_eplb_builds_a_target_for_the_modes_it_lists(monkeypatch, eplb_mode):
+    _balance_the_claimed_arch(monkeypatch)
+    config = _balanced(_claimed_by(monkeypatch, _TargetWithStaticEplb, **_DEP4), eplb_mode)
+    expected = _TargetWithStaticEplb if eplb_mode == "static" else None
+    assert modeling_v2_resolve(config, _llm_args("auto")) is expected
+
+
+@pytest.mark.parametrize(
+    "arch_balanced, mapping_kwargs, eplb_mode",
+    [
+        pytest.param(True, _DEP4, None, id="no-load-balancer-config"),
+        pytest.param(True, {}, "static", id="one-ep-rank"),
+        pytest.param(False, _DEP4, "static", id="architecture-not-balanced"),
+    ],
+)
+def test_eplb_config_without_a_balancer_changes_nothing(
+    monkeypatch, arch_balanced, mapping_kwargs, eplb_mode
+):
+    """Where the engine creates no balancer, the load-balancer config is inert, and a target that lists no
+    EPLB mode is built as before."""
+    if arch_balanced:
+        _balance_the_claimed_arch(monkeypatch)
+    config = _claimed_by(monkeypatch, _TargetUsedByDefault, **mapping_kwargs)
+    if eplb_mode is not None:
+        config = _balanced(config, eplb_mode)
+    assert modeling_v2_resolve(config, _llm_args("require")) is _TargetUsedByDefault
+
+
+def test_an_unknown_eplb_mode_name_is_an_error(monkeypatch):
+    """A misspelled mode never matches, so the target would decline every EPLB deployment without a word."""
+
+    class _TargetWithMisspelledMode:
+        EPLB_MODES = frozenset({"Static"})
+
+    config = _claimed_by(monkeypatch, _TargetWithMisspelledMode)
+    with pytest.raises(ValueError, match=r"EPLB_MODES names \['Static'\]"):
+        modeling_v2_resolve(config, _llm_args("auto"))
 
 
 @pytest.mark.parametrize(
@@ -1567,4 +1656,69 @@ def test_glm52_without_an_fp8_kv_cache_does_not_match():
     config = _model_config(_glm52_config(), kv_cache_quant_algo=None, **_TEP4)
     assert modeling_v2_resolve(config, _llm_args("auto")) is None
     with pytest.raises(ValueError, match="KV cache bf16"):
+        modeling_v2_resolve(config, _llm_args("require"))
+
+
+# --- EPLB on the targets that do not implement it -------------------------------------------
+
+
+@pytest.mark.parametrize("eplb_mode", ["static", "online"])
+def test_eplb_at_dep4_keeps_the_builtin_gpt_oss(eplb_mode):
+    """The built-in gpt-oss model balances its experts; the default target registers no MoE
+    layer with the balancer, so an EPLB deployment that sets modeling_v2 keeps the built-in
+    model."""
+    config = _balanced(_model_config(_gpt_oss_config(), **_DEP4), eplb_mode, num_slots=160)
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+    with pytest.raises(ValueError, match=f"{eplb_mode} EPLB .* implements no EPLB mode"):
+        modeling_v2_resolve(config, _llm_args("require"))
+
+
+_R1_EPLB_LAYOUTS = {"dep4": _layout(4, True, 1, 4), "dep8": _layout(8, True, 1, 8)}
+
+
+@pytest.mark.parametrize("spec_config", [None, _MTP3], ids=["no_spec", "mtp3"])
+@pytest.mark.parametrize(
+    "mapping_kwargs", list(_R1_EPLB_LAYOUTS.values()), ids=list(_R1_EPLB_LAYOUTS)
+)
+def test_r1_static_eplb_matches_at_dep4_and_dep8(mapping_kwargs, spec_config):
+    """The default target implements static EPLB, measured at dep4 and dep8, with and
+    without its MTP layer."""
+    config = _balanced(
+        _model_config(_r1_config(), spec_config=spec_config, **mapping_kwargs), "static"
+    )
+    assert _qualified(modeling_v2_resolve(config, _llm_args("require"))) == _R1_DEFAULT_TARGET
+
+
+@pytest.mark.parametrize("eplb_mode", ["online", "per_layer_dynamic"])
+def test_r1_eplb_beyond_static_keeps_the_builtin_model(eplb_mode):
+    config = _balanced(_model_config(_r1_config(), **_DEP4), eplb_mode)
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+    with pytest.raises(ValueError, match=f"{eplb_mode} EPLB .* implements static"):
+        modeling_v2_resolve(config, _llm_args("require"))
+
+
+@pytest.mark.parametrize(
+    "mapping_kwargs",
+    [
+        pytest.param(_layout(4, False, 1, 4), id="tp4_ep4"),
+        pytest.param(_layout(4, True, 2, 2), id="dep4_moetp2_ep2"),
+        pytest.param(_layout(2, True, 1, 2), id="dep2"),
+        pytest.param(_layout(16, True, 1, 16), id="dep16"),
+    ],
+)
+def test_r1_static_eplb_is_refused_where_it_was_not_measured(mapping_kwargs):
+    """EPLB balances attention DP over ranks that hold whole experts; the target runs it at
+    the layouts it was measured at and declines the rest, which keep the built-in model."""
+    config = _balanced(_model_config(_r1_config(), **mapping_kwargs), "static")
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+    with pytest.raises(ValueError, match="static EPLB at parallel layout"):
+        modeling_v2_resolve(config, _llm_args("require"))
+
+
+@pytest.mark.usefixtures("_glm52_sm")
+def test_glm52_tep4_with_eplb_keeps_the_builtin_model():
+    """The tep4 target is built by default; it must not serve an EPLB deployment on fixed expert windows."""
+    config = _balanced(_model_config(_glm52_config(), **_TEP4), "static")
+    assert modeling_v2_resolve(config, TorchLlmArgs(model=_DUMMY_MODEL)) is None
+    with pytest.raises(ValueError, match="static EPLB .* implements no EPLB mode"):
         modeling_v2_resolve(config, _llm_args("require"))
