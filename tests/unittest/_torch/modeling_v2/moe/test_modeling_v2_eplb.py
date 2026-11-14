@@ -19,6 +19,7 @@ import pytest
 import torch
 from torch import nn
 
+import tensorrt_llm.bindings.internal.runtime as _tbr
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe import eplb as eplb_module
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.eplb import (
@@ -39,6 +40,10 @@ from _cells import certified_cells  # noqa: E402 — needs the path declared abo
 from _validating import validating  # noqa: E402 — needs the path declared above
 
 requires_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+requires_host_accessible = pytest.mark.skipif(
+    not torch.cuda.is_available() or not _tbr.is_host_accessible_device_memory_supported(),
+    reason="online EPLB needs host-accessible device memory",
+)
 
 
 # --- slot layouts (CPU) ---------------------------------------------------------------------
@@ -578,7 +583,7 @@ def test_slot_windows_sum_to_the_layer() -> None:
 # --- a real online balancer moves experts into slots (GPU) -----------------------------------
 
 
-@requires_gpu
+@requires_host_accessible
 def test_an_online_balancer_moves_experts_into_slots() -> None:
     """Rank 0 of two under online EPLB, through `EplbLayer` alone: host copies, binding, one
     forward whose every token picks experts 6 and 7, then a forward without updates, which

@@ -18,6 +18,7 @@ import pytest
 import torch
 from transformers import DeepseekV3Config
 
+import tensorrt_llm.bindings.internal.runtime as _tbr
 from tensorrt_llm._torch._experimental.modeling_v2.models.deepseek_v3.r1_0528_nvfp4__sm_10x__default.modeling import (  # noqa: E501
     DeepseekV3DefaultModelingV2,
 )
@@ -84,7 +85,21 @@ def _placement(layer: int) -> list:
     return out
 
 
-@pytest.mark.parametrize("updates", [0, 2], ids=["static", "online"])
+@pytest.mark.parametrize(
+    "updates",
+    [
+        0,
+        pytest.param(
+            2,
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available()
+                or not _tbr.is_host_accessible_device_memory_supported(),
+                reason="online EPLB needs host-accessible device memory",
+            ),
+        ),
+    ],
+    ids=["static", "online"],
+)
 @pytest.mark.parametrize("mtp", [False, True], ids=["no_spec", "mtp3"])
 def test_eplb_registers_every_routed_layer(mtp, updates):
     layers = range(3, 61 + int(mtp))

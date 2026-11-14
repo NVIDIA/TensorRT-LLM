@@ -585,8 +585,8 @@ an EPLB deployment only if its class lists the mode in `EPLB_MODES`.
     writes, before any view of them is taken. Every per-slot scalar the
     expert kernel reads is a bound slot weight, not a value recomputed in the
     forward.
-  - Per forward, `route(ids, rows, last)` records the routed ids without the
-    padding rows, and `close()` hands each layer back once, after its last
+  - Per forward, `route(ids, rows, last)` records the router's expert ids without
+    the padding rows, and `close()` hands each layer back once, after its last
     expert kernel and before the next layer routes. A draft layer is closed
     after the worker's last draft step, also when the worker drafts nothing.
 

@@ -300,6 +300,10 @@ class EplbLayer:
         self._counted = False
         self._count_closed = False
         self._no_tokens: Optional[torch.Tensor] = None
+        # The ids each statistic of this forward read. The balancer may count them on its
+        # own stream, which joins the forward's stream only in `close`, so they must
+        # outlive the caller's references until then.
+        self._counted_ids: list[torch.Tensor] = []
         self._bound: Optional[dict[str, int]] = None
 
     @classmethod
@@ -355,6 +359,7 @@ class EplbLayer:
             ids = _token_rows(token_selected_experts, rows)
             if ids is not None:
                 self.balancer_layer.update_statistic_with_global_ids(ids, not self._counted, last)
+                self._counted_ids.append(ids)
                 self._counted = True
                 self._count_closed = last
                 if self._no_tokens is None:
@@ -375,6 +380,7 @@ class EplbLayer:
         self.balancer_layer.start_set_cpu_stage()
         self.balancer_layer.done_set_cpu_stage()
         self._taken = self._counted = self._count_closed = False
+        self._counted_ids.clear()
 
     def _take(self) -> None:
         """Wait, once per forward, until the balancer hands the layer to the GPU."""

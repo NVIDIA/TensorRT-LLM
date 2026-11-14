@@ -896,7 +896,7 @@ def test_online_eplb_load_hands_over_this_ranks_experts(layout, mtp, monkeypatch
     """`load` under online EPLB, with the ranks on one node: each rank hands each routed
     layer's balancer handle every slot weight of its share of the experts -- each one what
     the world-size-1 table loads for that expert -- reads each of those experts' tensors once
-    more unless a slot already did, and coverage still holds both ways."""
+    more, whether or not a slot already did, and coverage still holds both ways."""
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda *a, **k: None)
     cfg = SimpleNamespace(**_TINY)

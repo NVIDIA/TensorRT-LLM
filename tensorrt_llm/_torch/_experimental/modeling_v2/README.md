@@ -447,7 +447,7 @@ target does three more, and lists `"online"` in `EPLB_MODES`:
    move. The balancer needs host-accessible device memory, which Grace
    systems have and x86 systems get from GDRCopy.
 7. **The forward.** `EplbLayer.route(ids, rows, last)` takes the layer from
-   the balancer on its first call of a forward and records the routed ids.
+   the balancer on its first call of a forward and records the router's expert ids.
    `rows` names the rows that are tokens when the rest are padding, such as
    the rows an attention-DP gather pads. `EplbLayer.close()` hands the layer
    back after its last expert kernel of the forward. The balancer takes the
