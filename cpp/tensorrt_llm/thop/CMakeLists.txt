@@ -57,6 +57,7 @@ add_th_common_family(
   deepseekV4BlockTableOp.cpp
   inverseRopeFp8QuantOp.cpp
   kdaDecodeOp.cpp
+  kimiK3KdaMtpVerifyOp.cpp
   attnResOp.cpp
   fusedQKNormRopeOp.cpp
   IndexerKCacheGatherOp.cpp
