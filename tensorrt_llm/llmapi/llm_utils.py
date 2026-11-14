@@ -555,7 +555,9 @@ def apply_model_defaults_to_llm_args(
                 if isinstance(user_override, dict):
                     nested_applied = _compute_applied(default_value,
                                                       user_override)
-                    if nested_applied:
+                    # A default for a key the user left unset constructs that
+                    # config even when it sets nothing inside it.
+                    if nested_applied or key not in overrides:
                         applied[key] = nested_applied
                 elif key not in overrides:
                     applied[key] = default_value

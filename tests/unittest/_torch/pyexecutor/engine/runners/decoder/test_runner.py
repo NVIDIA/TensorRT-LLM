@@ -569,6 +569,8 @@ class DecoderGraphForwardTestCase(unittest.TestCase):
             "nested_ple_recurrent_state",
             "declared_recurrent_state",
             "declared_recurrent_state_on_the_wrapper",
+            "declared_recurrent_state_on_the_multimodal_llm",
+            "declared_recurrent_state_on_the_multimodal_decoder",
             "context_parallel",
             "context_only_cache",
         )
@@ -605,6 +607,16 @@ class DecoderGraphForwardTestCase(unittest.TestCase):
                     # A causal-LM wrapper declares it; the decoder inside it does not.
                     engine._model.model = torch.nn.Identity()
                     engine._model.resets_recurrent_state_in_context = True
+                elif case == "declared_recurrent_state_on_the_multimodal_llm":
+                    engine._model.model = SimpleNamespace(
+                        llm=SimpleNamespace(resets_recurrent_state_in_context=True)
+                    )
+                elif case == "declared_recurrent_state_on_the_multimodal_decoder":
+                    engine._model.model = SimpleNamespace(
+                        llm=SimpleNamespace(
+                            model=SimpleNamespace(resets_recurrent_state_in_context=True)
+                        )
+                    )
                 elif case == "context_parallel":
                     engine._mapping.cp_size = 2
                 elif case == "context_only_cache":

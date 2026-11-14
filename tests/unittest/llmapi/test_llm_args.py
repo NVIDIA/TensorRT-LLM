@@ -1131,6 +1131,29 @@ class TestModelDefaults:
         assert llm_args.model_fields_set == before | {"enable_chunked_prefill"}
         assert "modeling_v2" not in llm_args.model_fields_set
 
+    def test_empty_nested_default_counts_as_set(self):
+        """An empty nested default still counts as set.
+
+        It constructs the config, so the field must survive
+        ``model_dump(exclude_unset=True)``.
+        """
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model")
+        assert llm_args.attention_dp_config is None
+        applied = apply_model_defaults_to_llm_args(llm_args,
+                                                   {"attention_dp_config": {}})
+        assert applied == {"attention_dp_config": {}}
+        assert llm_args.attention_dp_config is not None
+        assert "attention_dp_config" in llm_args.model_fields_set
+        assert "attention_dp_config" in llm_args.model_dump(exclude_unset=True)
+
+    def test_empty_nested_default_under_a_user_setting_applies_nothing(self):
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model",
+                                attention_dp_config={"enable_balance": True})
+        applied = apply_model_defaults_to_llm_args(llm_args,
+                                                   {"attention_dp_config": {}})
+        assert applied == {}
+        assert llm_args.attention_dp_config.enable_balance
+
     @pytest.mark.parametrize(
         "defaults_dict,should_raise,error_contains",
         [

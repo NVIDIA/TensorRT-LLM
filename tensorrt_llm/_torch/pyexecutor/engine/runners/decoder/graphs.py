@@ -491,13 +491,16 @@ class DecoderCudaGraphs:
 
         A model sets ``resets_recurrent_state_in_context = True`` when a fresh
         cache slot is reset by its context forward and not by its decode forward.
-        The declaration may sit on the causal-LM wrapper the engine holds or on
-        the decoder inside it.
+        The declaration may sit on the causal-LM wrapper the engine holds, on
+        the decoder inside it, or, for a multimodal wrapper, on its ``llm`` or
+        that model's decoder (``llm.model``), as the PLE check below reads it.
         """
         wrapper = getattr(self.model, "_orig_mod", self.model)
+        top_level_model = get_top_level_model(self.model)
+        llm = getattr(top_level_model, "llm", None)
         return any(
             bool(getattr(model, "resets_recurrent_state_in_context", False))
-            for model in (wrapper, get_top_level_model(self.model))
+            for model in (wrapper, top_level_model, llm, getattr(llm, "model", None))
         )
 
     @functools.cached_property
