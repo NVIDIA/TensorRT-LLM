@@ -2,12 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for the trtllm-serve post-processing hook."""
 
+import logging
+
 import pytest
 
 from tensorrt_llm.executor.postprocessor_hook import (
     PostProcessorHookChunk,
     apply_post_processor_hook,
     emit,
+    end_post_processor_hook,
     load_post_processor_hook,
     suppress,
     terminate,
@@ -318,3 +321,44 @@ def test_harmony_model_rejects_post_processor_hook():
     guard(use_harmony=False, post_processor_hook="my_pkg.guardrail.Hook")
     guard(use_harmony=True, post_processor_hook=None)
     guard(use_harmony=False, post_processor_hook=None)
+
+
+class _EndingHook:
+    """A hook that records the requests it is told ended without a final chunk."""
+
+    def __init__(self, fail=False):
+        self.ended = []
+        self.fail = fail
+
+    def __call__(self, chunk):
+        return emit(chunk.text_diff)
+
+    def on_request_end(self, request_id, reason):
+        if self.fail:
+            raise RuntimeError("cleanup failed")
+        self.ended.append((request_id, reason))
+
+
+def test_end_hook_calls_on_request_end_when_the_hook_defines_it():
+    hook = _EndingHook()
+
+    end_post_processor_hook(hook, 7, "error")
+
+    assert hook.ended == [(7, "error")]
+
+
+def test_end_hook_leaves_hooks_without_it_and_no_hook_alone():
+    """The method is optional: a hook without it, or no hook, is not an error."""
+    end_post_processor_hook(lambda chunk: emit(chunk.text_diff), 7, "error")
+    end_post_processor_hook(None, 7, "error")
+
+
+def test_end_hook_never_raises(caplog):
+    """A failing on_request_end is logged, never raised as a second error."""
+    with caplog.at_level(logging.ERROR, logger="tensorrt_llm.executor.postprocessor_hook"):
+        end_post_processor_hook(_EndingHook(fail=True), 7, "error")
+
+    assert any(
+        "on_request_end" in record.getMessage() and "7" in record.getMessage()
+        for record in caplog.records
+    )
