@@ -1263,9 +1263,9 @@ class TestVsaVsVanillaWan22T2v14bModulePerformance:
 # SageAttention performance tests
 # ============================================================================
 
-_sm100_only = pytest.mark.skipif(
+_sage_sm10x_only = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
-    reason="SageAttention cubins require SM100 (Blackwell).",
+    reason="SageAttention performance tests require SM100, SM103, or SM107.",
 )
 
 # All five supported (qk_dtype, v_dtype, (q_block_size, k_block_size, v_block_size)) recipes.
@@ -1281,7 +1281,7 @@ _QUANT_CONFIGS = [
 _QUANT_CONFIG_IDS = ["fp8_k1", "fp8_k4", "int8_k1", "int8_k4", "int8_k16"]
 
 
-@_sm100_only
+@_sage_sm10x_only
 class TestSageAttentionPerformance:
     """Performance benchmarks comparing VANILLA, TRTLLM, and TRTLLM+SageAttention.
 
@@ -1351,10 +1351,10 @@ class TestSageAttentionPerformance:
         desc: str,
         quant_cfg: QuantAttentionConfig,
         cfg_id: str,
+        require_sage_recipe,
     ):
         """Verify every sage config produces a valid timing result at quick sizes."""
-        if quant_cfg.qk_dtype == "int8" and torch.cuda.get_device_capability()[1] == 3:
-            pytest.skip("SM103 does not have Int8 Tensor Cores.")
+        require_sage_recipe(quant_cfg)
 
         result = self._bench(batch, num_heads, seq_len, head_dim, quant_cfg)
         assert result is not None, f"sage {cfg_id} failed for {desc}"
@@ -1367,14 +1367,15 @@ class TestSageAttentionPerformance:
     @pytest.mark.parametrize(
         "quant_cfg,cfg_id", zip(_QUANT_CONFIGS, _QUANT_CONFIG_IDS, strict=True)
     )
-    def test_sage_vs_vanilla_quick(self, quant_cfg: QuantAttentionConfig, cfg_id: str):
+    def test_sage_vs_vanilla_quick(
+        self, quant_cfg: QuantAttentionConfig, cfg_id: str, require_sage_recipe
+    ):
         """Compare SageAttention timing against VANILLA at a quick size.
 
         Does not assert a minimum speedup — the goal is to catch regressions
         where sage unexpectedly becomes much slower than plain SDPA.
         """
-        if quant_cfg.qk_dtype == "int8" and torch.cuda.get_device_capability()[1] == 3:
-            pytest.skip("SM103 does not have Int8 Tensor Cores.")
+        require_sage_recipe(quant_cfg)
 
         batch, num_heads, seq_len, head_dim = 1, 12, 4096, 128
 
@@ -1420,10 +1421,10 @@ class TestSageAttentionPerformance:
         model_name: str,
         quant_cfg: QuantAttentionConfig,
         cfg_id: str,
+        require_sage_recipe,
     ):
         """SageAttention vs TRTLLM on real WAN model sequence lengths."""
-        if quant_cfg.qk_dtype == "int8" and torch.cuda.get_device_capability()[1] == 3:
-            pytest.skip("SM103 does not have Int8 Tensor Cores.")
+        require_sage_recipe(quant_cfg)
 
         trtllm = self.benchmark.benchmark_single(
             batch, num_heads, seq_len, head_dim, backend="TRTLLM", verbose=False

@@ -175,8 +175,9 @@ def _test_attention_trtllm_sage(
         pytest.param(True, 2, 16, 5e-1, 5e-1, (90,), id="sm90-int8-q2k16"),
         pytest.param(True, 1, 4, 1e-1, 4e-2, (100,), id="sm100-int8-q1k4"),
         pytest.param(True, 1, 16, 5e-1, 5e-1, (100,), id="sm100-int8-q1k16"),
-        pytest.param(False, 1, 1, 3e-1, 2e-1, (100, 103), id="sm10x-fp8-q1k1"),
-        pytest.param(False, 1, 16, 3e-1, 2e-1, (100, 103), id="sm10x-fp8-q1k16"),
+        pytest.param(False, 1, 1, 3e-1, 2e-1, (100, 103, 107), id="sm10x-fp8-q1k1"),
+        pytest.param(False, 1, 4, 3e-1, 2e-1, (100, 103, 107), id="sm10x-fp8-q1k4"),
+        pytest.param(False, 1, 16, 3e-1, 2e-1, (100, 103, 107), id="sm10x-fp8-q1k16"),
     ],
 )
 def test_attention_trtllm_sage(
@@ -193,6 +194,7 @@ def test_attention_trtllm_sage(
     rtol: float,
     supported_sms: Tuple[int, ...],
 ):
+    """Compare supported SageAttention recipes with SDPA across shapes and options."""
     # Skip-softmax is unavailable on SM90.
     sm_version = get_sm_version()
     if sm_version not in supported_sms or (skip_softmax and sm_version == 90):
@@ -225,3 +227,23 @@ def test_attention_trtllm_sage(
 
     assert cos_sim > 0.990, f"Cosine similarity {cos_sim:.6f} below threshold"
     torch.testing.assert_close(out_tllm, out_native, atol=atol, rtol=rtol)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for TRTLLM attention.")
+def test_attention_trtllm_sage_rejects_unsupported_int8():
+    """Unsupported INT8 must raise in the native path before any unfused fallback."""
+    if get_sm_version() not in (103, 107):
+        pytest.skip("This test requires an SM103 or SM107 device without INT8 SageAttention.")
+
+    with pytest.raises(
+        RuntimeError, match="Sage Attention requires contextFMHA with no unfused fallback"
+    ):
+        _test_attention_trtllm_sage(
+            num_heads=4,
+            num_kv_heads=4,
+            seq_len=128,
+            sage_attn_qk_int8=True,
+            sage_attn_num_elts_per_blk_q=1,
+            sage_attn_num_elts_per_blk_k=4,
+        )
+    torch.cuda.synchronize()
