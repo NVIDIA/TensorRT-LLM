@@ -20,12 +20,14 @@ unbound against a minimal fake ``self`` and check that:
 
 from __future__ import annotations
 
+import threading
 import types
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.py_executor import BatchState, PyExecutor
+from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 from tensorrt_llm.bindings.executor import InflightBatchingStats, IterationStats
 
 pytestmark = pytest.mark.cpu_only
@@ -216,6 +218,28 @@ def test_interval_one_never_flushes_unsampled_batch():
     fake._append_iter_stats.assert_not_called()
 
 
+def test_overlap_record_excludes_the_batch_already_running():
+    """The running batch reaches the queued-work scan through both hops."""
+    current_batch = MagicMock()
+    current_batch.all_requests.return_value = []
+
+    fake = _build_fake_self(interval=1)
+    fake.previous_batch = MagicMock()
+    PyExecutor._process_previous_batch(fake, current_batch)
+    assert fake._process_iter_stats.call_args.kwargs == {"current_batch": current_batch}
+
+    fake = _build_fake_self(interval=1)
+    batch_state = BatchState(
+        scheduled_requests=MagicMock(),
+        sample_state=MagicMock(),
+        iter_start_time=0.0,
+        iter_stats=_run_iteration(fake, 0, num_new=0),
+        iter_id=0,
+    )
+    PyExecutor._process_iter_stats(fake, [], [], batch_state, current_batch=current_batch)
+    assert fake._update_iter_stats.call_args.kwargs == {"current_batch": current_batch}
+
+
 # ---------------------------------------------------------------------------
 # _update_iter_stats: KV-cache iteration stats interval
 # ---------------------------------------------------------------------------
@@ -241,6 +265,7 @@ def _kv_update_fake(kv_interval: int):
     fake.enable_attention_dp = False
     fake.executor_request_queue.get_request_queue_size.return_value = 0
     fake.executor_request_queue.get_request_queue.return_value.queue = []
+    fake.waiting_queue = FCFSWaitingQueue()
     fake.resource_manager.resource_managers.get.return_value = kv_cache_manager
     fake._kv_iter_stats_interval = kv_interval
     fake._last_kv_iter_stats_fetch_iter = None
@@ -248,7 +273,7 @@ def _kv_update_fake(kv_interval: int):
     return fake, kv_cache_manager
 
 
-def _update(fake, stats_iter: int):
+def _update(fake, stats_iter: int, **kwargs):
     stats = IterationStats()
     stats.inflight_batching_stats = InflightBatchingStats()
     stats.iter = stats_iter
@@ -271,6 +296,7 @@ def _update(fake, stats_iter: int):
             num_completed_requests=0,
             scheduled_batch=scheduled_batch,
             micro_batch_id=0,
+            **kwargs,
         )
     return fake._latest_kv_iter_stats
 
@@ -295,3 +321,47 @@ def test_kv_iteration_stats_skip_non_interval_records_and_duplicates():
     # A second record for the same iteration must not drain the deltas again.
     assert _update(fake, 8) is None
     assert kv_cache_manager.get_iteration_stats.call_count == 1
+
+
+def test_queue_snapshot_leaves_kv_iteration_stats_to_measured_records():
+    """A snapshot neither fetches the KV deltas nor clears or advances the fetch state."""
+    fake, kv_cache_manager = _kv_update_fake(kv_interval=4)
+    fake.iter_counter = 100
+    assert _update(fake, 4) == {32: "deltas"}
+
+    # On an interval iteration a snapshot must not fetch (fetching resets the
+    # native deltas); off the interval it must not clear the latest stats.
+    for stats_iter in (8, 9):
+        assert _update(fake, stats_iter, collect_kv_iteration_stats=False) == {32: "deltas"}
+    assert kv_cache_manager.get_iteration_stats.call_count == 1
+    assert fake._last_kv_iter_stats_fetch_iter == 4
+
+    # The measured record of iteration 8 still gets its fetch.
+    assert _update(fake, 8) == {32: "deltas"}
+    assert kv_cache_manager.get_iteration_stats.call_count == 2
+    assert fake._last_kv_iter_stats_fetch_iter == 8
+
+
+@pytest.mark.parametrize("use_latest_kv_iter_stats", [True, False])
+def test_appended_row_carries_latest_kv_iteration_stats_only_on_request(use_latest_kv_iter_stats):
+    """A queue snapshot must not repeat the KV deltas of the last measured record."""
+    fake = types.SimpleNamespace(
+        enable_attention_dp=False,
+        enable_iter_perf_stats=True,
+        disable_overlap_scheduler=True,
+        dist=types.SimpleNamespace(pp_size=1, tp_size=1),
+        max_stats_len=1000,
+        stats=[],
+        stats_lock=threading.Lock(),
+        _latest_kv_iter_stats={32: "deltas"},
+        _latest_host_step_time_ms=None,
+        _latest_prev_device_step_time_ms=None,
+    )
+    stats = IterationStats()
+
+    row = PyExecutor._append_iter_stats(
+        fake, stats, use_latest_kv_iter_stats=use_latest_kv_iter_stats
+    )
+
+    assert fake.stats == [row] and row[0] is stats
+    assert row[2] == ({32: "deltas"} if use_latest_kv_iter_stats else None)

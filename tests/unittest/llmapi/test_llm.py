@@ -816,6 +816,22 @@ def llm_return_logprobs_test_harness(prompt_logprobs: Optional[int],
             asyncio.run(main())
 
 
+def is_idle_heartbeat(stats: dict) -> bool:
+    """Whether a stats record is the zero-duration record of an idle engine.
+
+    With iteration stats enabled an idle engine keeps reporting such a
+    record, so a test that waits for the stats to run dry has to skip them.
+    """
+    ifb = stats.get("inflightBatchingStats") or {}
+    return (stats.get("iterLatencyMS") == 0
+            and not ifb.get("numScheduledRequests")
+            and not ifb.get("numQueuedContextRequests")
+            and not ifb.get("numQueuedGenRequests")
+            and not stats.get("numActiveRequests")
+            and not stats.get("numCompletedRequests")
+            and not stats.get("numNewActiveRequests"))
+
+
 def validate_stats(
     *,
     results,
@@ -1014,11 +1030,11 @@ def llm_get_stats_test_harness(tp_size: int = 1,
                        enable_chunked_prefill=enable_chunked_prefill,
                        enable_iter_req_stats=enable_iter_req_stats)
 
-        assert not llm.get_stats(0.5)
+        assert not [r for r in llm.get_stats(0.5) if not is_idle_heartbeat(r)]
 
         # test that IterationResult()._done is properly set
         _ = llm.generate(prompts, sampling_params=sampling_params)
-        assert llm.get_stats(2)
+        assert [r for r in llm.get_stats(2) if not is_idle_heartbeat(r)]
 
 
 def test_llm_get_queued_stats():
