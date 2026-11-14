@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Decoder input preparation state."""
 
+import functools
 import math
 import os
 from collections.abc import Callable, Sequence
@@ -17,7 +18,10 @@ from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadat
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.kernels.spec_step_copies import op as spec_step_copies
 from tensorrt_llm._torch.metadata import KVCacheParams
-from tensorrt_llm._torch.models.modeling_multimodal_mixin import _build_request_multimodal_input
+from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
+    _build_request_multimodal_input,
+    request_device_paths,
+)
 from tensorrt_llm._torch.pyexecutor import step_inputs
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
@@ -1398,6 +1402,11 @@ class DecoderInputPreparer:
         host.text_token_indices_ctx = text_token_indices_ctx
         host.mm_token_indices = mm_token_indices
 
+    @functools.cached_property
+    def _mm_request_device_paths(self) -> list[str] | None:
+        """`request_device_paths` of the model, computed once (encoder groups are properties)."""
+        return request_device_paths(self.model)
+
     def _pack_context_multimodal(
         self,
         host: HostInputs,
@@ -1458,14 +1467,15 @@ class DecoderInputPreparer:
                         leaf.record_stream(consumer_stream)
                 request.py_mm_encoder_event = None
         if multimodal_params.has_content():
-            # TODO(TRTLLM-14726): Check the persistent MM encoder cache before H2D and avoid
-            # transferring raw encoder inputs for full hits in both regular and
-            # side-stream-prefetched paths.
+            # Raw media of models on the default encoder builder goes to the GPU in the encoder
+            # call, after the encoder-cache lookup and only for the encoded items, so the request
+            # keeps only its host payload. TODO(TRTLLM-14726): other models still move it here,
+            # before the cache lookup.
             multimodal_params.to_device(
                 "multimodal_data",
                 "cuda",
                 pin_memory=prefer_pinned(),
-                target_keywords=getattr(self.model, "multimodal_data_device_paths", None),
+                target_keywords=self._mm_request_device_paths,
             )
             if _use_mrope:
                 # A request may carry multimodal content but no MRoPE

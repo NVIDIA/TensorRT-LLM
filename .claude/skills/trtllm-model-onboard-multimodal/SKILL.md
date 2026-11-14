@@ -76,6 +76,11 @@ the implementation steps below.
                 not a combined embedding buffer.
                 Full-request models stage the request payload here. H2D obeys
                 multimodal_data_device_paths and uses pinned, non-blocking copies.
+                Models on the default encoder builder leave raw media keys to the
+                encoder call in [5] and stage only the other paths here.
+    Between chunks: once a request holds its whole encoder output and no item
+                scheduler can encode its items again, raw media still on the host
+                is dropped (`release_encoded_media`).
     Generation (mRoPE only): strip everything except mrope_position_deltas.
     Post-prefill / termination: release request-held cache references, then strip
                 raw MM fields so they don't ride along in decode.
@@ -99,7 +104,7 @@ the implementation steps below.
 **Key invariants:**
 - [1] and [2] both run off the API event loop. [1] fans media decode out across one request's items with `asyncio.gather`; [2] is single-threaded per request because the HF processor is request-scoped.
 - The producer hands off as **handles** at the end of [2], so the broadcast in [3] stays small (Contract 3).
-- [4] is the only per-iteration GPU staging; H2D is `non_blocking=True` from pinned host memory.
+- [4] and the encoder call in [5] are the only per-iteration GPU staging; H2D is `non_blocking=True` from pinned host memory. With the default encoder builder, raw media goes to the GPU once per encoder call, only for the items encoded, on the device's copy stream (`host_staging.staged_uploader`), and never stays on the request.
 - [5] runs on the compute stream and must be sync-free (Contract 1).
 - Item-scheduled encoder outputs live only in the model-owned `TensorLRUCache`.
   Each request remembers the cache entry for every item, in prompt order, but
@@ -211,7 +216,7 @@ CPU-bound work (decode / resize / normalize / mel-spectrogram / frame extraction
 - HF AutoProcessor + image_processor + tokenizer run inside the input processor's `call_with_text_prompt` (dispatched from `__call__`) — *not* in the model worker.
 - URL/bytes media goes through `async_load_image` / `async_load_video` / `async_load_audio` (all wrap blocking decode in `asyncio.to_thread`). Never call `PIL.Image.open(...).load()` / `cv2.VideoCapture` / `soundfile.read` synchronously on the request hot path.
 - Pin host tensors before H2D with `prefer_pinned()` (False under Confidential Compute (CC), True otherwise). The engine pins `multimodal_data` automatically via `to_device(..., pin_memory=prefer_pinned())`.
-- **Declare `multimodal_data_device_paths`** on the model — list of dotted paths (e.g. `["image.pixel_values", "image.image_grid_thw", "video.pixel_values_videos", "video.video_grid_thw", "multimodal_embedding"]`) telling the engine which fields go to CUDA. Anything not listed stays on CPU.
+- **Declare `multimodal_data_device_paths`** on the model — list of dotted paths (e.g. `["image.pixel_values", "image.image_grid_thw", "video.pixel_values_videos", "video.video_grid_thw", "multimodal_embedding"]`) telling the engine which fields go to CUDA. Anything not listed stays on CPU. On the default encoder builder, pass them to `encode_multimodal_by_groups` (`device_paths`): it makes the listed raw media keys on the GPU in the encoder call, and the executor moves only the other paths per request.
 - Optional tokenized+MM fast path: set `supports_token_id_mm_expansion = True` (a `ClassVar`, default `False`) and implement `get_text_with_mm_placeholders` + `expand_prompt_token_ids_for_mm`. The base-class `__call__` then routes `prompt_token_ids + multi_modal_data` (no `prompt`) requests through `call_with_token_ids`, skipping redundant detokenization. When the flag is `False` (most VLMs), the base class detokenizes `prompt_token_ids → prompt` and re-runs `call_with_text_prompt`, so token-ID inputs still work — just less efficiently. Only LlavaNext + Nemotron H multimodal opt in today.
 - Forward `mm_processor_kwargs` from `inputs.get("mm_processor_kwargs", {})` to the HF processor (callers tune things like video sample rate via this).
 

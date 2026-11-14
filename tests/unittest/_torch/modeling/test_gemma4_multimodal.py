@@ -37,6 +37,7 @@ from __future__ import annotations
 import os
 import unittest
 from copy import deepcopy
+from itertools import groupby
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List, Type
@@ -76,6 +77,9 @@ from tensorrt_llm._torch.models.modeling_gemma4mm import (  # noqa: E402
     Gemma4InputProcessor,
     Gemma4MultimodalEmbedder,
     Gemma4MultimodalModelBase,
+    _fill_gemma4_implicit_inputs,
+    _gemma4_input_partitions,
+    _normalize_vision_patches,
 )
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin  # noqa: E402
 from tensorrt_llm._torch.models.modeling_multimodal_utils import (  # noqa: E402
@@ -88,6 +92,7 @@ from tensorrt_llm.inputs.multimodal import (  # noqa: E402
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalInput,
     MultimodalItemMetadata,
+    MultimodalItemPartition,
     MultimodalParams,
     MultimodalRuntimeData,
 )
@@ -155,6 +160,8 @@ class _Gemma4EncoderCacheHarness(Gemma4MultimodalModelBase):
 
     supports_encoder_cache = True
     encode_multimodal_inputs = Gemma4ForConditionalGeneration.encode_multimodal_inputs
+    # The stub encoders run on the host, so the encoder call moves nothing to the GPU.
+    multimodal_data_device_paths = None
 
     def __init__(self, embedding_dim: int = 12) -> None:
         self.model_config = ModelConfig(
@@ -203,83 +210,98 @@ def _make_keyed_image_param(
     embedding_lengths = [2] * item_count
     pixel_values = torch.arange(item_count, dtype=torch.float32).reshape(item_count, 1, 1)
     image_position_ids = torch.arange(item_count * 2).reshape(item_count, 1, 2)
-    return MultimodalParams(
-        multimodal_input=MultimodalInput(
-            multimodal_hashes=item_hashes,
-            multimodal_positions=[0] * item_count,
-            multimodal_lengths=embedding_lengths,
-        ),
-        multimodal_data={
-            "image": {
-                "pixel_values": pixel_values,
-                "image_position_ids": image_position_ids,
-                "image_seq_lens": [1] * item_count,
-            },
-            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
-                [("image", i) for i in range(len(embedding_lengths))],
-                output_embedding_lengths=embedding_lengths,
+    return _declare_gemma4_partitions(
+        MultimodalParams(
+            multimodal_input=MultimodalInput(
+                multimodal_hashes=item_hashes,
+                multimodal_positions=[0] * item_count,
+                multimodal_lengths=embedding_lengths,
             ),
-            "mm_processor_kwargs_hash": "kwargs-a",
-        },
-        multimodal_runtime=MultimodalRuntimeData(
-            embed_mask_cumsum=torch.arange(1, sum(embedding_lengths) + 1, dtype=torch.int64),
-            past_seen_token_num=0,
-            chunk_end_pos=sum(embedding_lengths),
-        ),
+            multimodal_data={
+                "image": {
+                    "pixel_values": pixel_values,
+                    "image_position_ids": image_position_ids,
+                    "image_seq_lens": [1] * item_count,
+                },
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                    [("image", i) for i in range(len(embedding_lengths))],
+                    output_embedding_lengths=embedding_lengths,
+                ),
+                "mm_processor_kwargs_hash": "kwargs-a",
+            },
+            multimodal_runtime=MultimodalRuntimeData(
+                embed_mask_cumsum=torch.arange(1, sum(embedding_lengths) + 1, dtype=torch.int64),
+                past_seen_token_num=0,
+                chunk_end_pos=sum(embedding_lengths),
+            ),
+        )
     )
 
 
 def _make_keyed_video_param(item_hashes: list[list[int]]) -> MultimodalParams:
     item_count = len(item_hashes)
     embedding_lengths = [2] * item_count
-    return MultimodalParams(
-        multimodal_input=MultimodalInput(
-            multimodal_hashes=item_hashes,
-            multimodal_positions=[0] * item_count,
-            multimodal_lengths=embedding_lengths,
-        ),
-        multimodal_data={
-            "video": {"pixel_values": torch.arange(item_count).reshape(item_count, 1, 1)},
-            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
-                [("video", i) for i in range(len(embedding_lengths))],
-                output_embedding_lengths=embedding_lengths,
+    return _declare_gemma4_partitions(
+        MultimodalParams(
+            multimodal_input=MultimodalInput(
+                multimodal_hashes=item_hashes,
+                multimodal_positions=[0] * item_count,
+                multimodal_lengths=embedding_lengths,
             ),
-            "mm_processor_kwargs_hash": "kwargs-a",
-        },
-        multimodal_runtime=MultimodalRuntimeData(
-            embed_mask_cumsum=torch.arange(1, sum(embedding_lengths) + 1, dtype=torch.int64),
-            past_seen_token_num=0,
-            chunk_end_pos=sum(embedding_lengths),
-        ),
+            multimodal_data={
+                "video": {"pixel_values": torch.arange(item_count).reshape(item_count, 1, 1)},
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                    [("video", i) for i in range(len(embedding_lengths))],
+                    output_embedding_lengths=embedding_lengths,
+                ),
+                "mm_processor_kwargs_hash": "kwargs-a",
+            },
+            multimodal_runtime=MultimodalRuntimeData(
+                embed_mask_cumsum=torch.arange(1, sum(embedding_lengths) + 1, dtype=torch.int64),
+                past_seen_token_num=0,
+                chunk_end_pos=sum(embedding_lengths),
+            ),
+        )
     )
 
 
 def _make_keyed_audio_param(item_hashes: list[list[int]]) -> MultimodalParams:
     item_count = len(item_hashes)
     embedding_lengths = [2] * item_count
-    return MultimodalParams(
-        multimodal_input=MultimodalInput(
-            multimodal_hashes=item_hashes,
-            multimodal_positions=[0] * item_count,
-            multimodal_lengths=embedding_lengths,
-        ),
-        multimodal_data={
-            "audio": {
-                "audio_features": torch.arange(item_count * 2).reshape(item_count, 1, 2),
-                "audio_features_mask": torch.ones(item_count, 1),
-            },
-            MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
-                [("audio", i) for i in range(len(embedding_lengths))],
-                output_embedding_lengths=embedding_lengths,
+    return _declare_gemma4_partitions(
+        MultimodalParams(
+            multimodal_input=MultimodalInput(
+                multimodal_hashes=item_hashes,
+                multimodal_positions=[0] * item_count,
+                multimodal_lengths=embedding_lengths,
             ),
-            "mm_processor_kwargs_hash": "kwargs-a",
-        },
-        multimodal_runtime=MultimodalRuntimeData(
-            embed_mask_cumsum=torch.arange(1, sum(embedding_lengths) + 1, dtype=torch.int64),
-            past_seen_token_num=0,
-            chunk_end_pos=sum(embedding_lengths),
-        ),
+            multimodal_data={
+                "audio": {
+                    "audio_features": torch.arange(item_count * 2).reshape(item_count, 1, 2),
+                    "audio_features_mask": torch.ones(item_count, 1),
+                },
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                    [("audio", i) for i in range(len(embedding_lengths))],
+                    output_embedding_lengths=embedding_lengths,
+                ),
+                "mm_processor_kwargs_hash": "kwargs-a",
+            },
+            multimodal_runtime=MultimodalRuntimeData(
+                embed_mask_cumsum=torch.arange(1, sum(embedding_lengths) + 1, dtype=torch.int64),
+                past_seen_token_num=0,
+                chunk_end_pos=sum(embedding_lengths),
+            ),
+        )
     )
+
+
+def _declare_gemma4_partitions(param):
+    """Fill implicit inputs and declare partitions, as the Gemma4 processors do."""
+    _fill_gemma4_implicit_inputs(param.multimodal_data, param.item_metadata)
+    param.item_metadata.input_partitions.update(
+        _gemma4_input_partitions(param.multimodal_data, param.item_metadata)
+    )
+    return param
 
 
 def _make_item_input_processor(
@@ -336,11 +358,27 @@ def _make_normalization_processor(image_processor, dtype=torch.bfloat16, *, manu
 def _encode_normalization_buckets(buckets, modality="image"):
     model = SimpleNamespace(
         _get_image_features=lambda **kwargs: kwargs["pixel_values"].flatten(0, 1),
-        embed_audio=None,
+        _get_audio_features=None,
     )
-    return Gemma4MultimodalModelBase.encode_multimodal_inputs(
-        model, [MultimodalParams(multimodal_data={modality: bucket}) for bucket in buckets]
-    )
+    model._encode_vision = Gemma4MultimodalModelBase._encode_vision.__get__(model)
+    model.mm_encoder_groups = Gemma4MultimodalModelBase.mm_encoder_groups.__get__(model)
+    params = []
+    for bucket in buckets:
+        count, patches = bucket["pixel_values"].shape[:2]
+        metadata = MultimodalItemMetadata(
+            [(modality, i) for i in range(count)], output_embedding_lengths=[patches] * count
+        )
+        params.append(
+            _declare_gemma4_partitions(
+                MultimodalParams(
+                    multimodal_data={
+                        modality: bucket,
+                        MULTIMODAL_ENCODER_ITEM_METADATA_KEY: metadata,
+                    }
+                )
+            )
+        )
+    return Gemma4MultimodalModelBase.encode_multimodal_inputs(model, params)
 
 
 def _make_vision_normalization() -> VisionNormalization:
@@ -1517,8 +1555,9 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
                 self.assertEqual(partition.miss_indices, [0, 1])
                 warning_once.assert_called_once()
 
-    def test_encoder_cache_reuses_full_video_hits_and_reencodes_partial_hits(self):
-        """Gemma4 video reuses full hits and re-encodes complete partial-hit requests."""
+    @pytest.mark.cpu_only
+    def test_encoder_cache_reuses_video_hits_and_encodes_only_missed_videos(self):
+        """Gemma4 video reuses full and partial hits; a partial hit encodes the missed video."""
         model = _Gemma4EncoderCacheHarness()
         shared_hash = [1] * 8
         first = model._get_or_encode_multimodal_embeddings([_make_keyed_video_param([shared_hash])])
@@ -1535,13 +1574,40 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
             [_make_keyed_video_param([shared_hash, [2] * 8])]
         )
 
-        warning_once.assert_called_once()
+        warning_once.assert_not_called()
         self.assertEqual(model.encoder_calls, 2)
         torch.testing.assert_close(full_hit, first)
         torch.testing.assert_close(first, torch.ones(2, model.embedding_dim))
-        torch.testing.assert_close(partial_hit, torch.full((4, model.embedding_dim), 2.0))
+        # The cached first video, then the missed one encoded alone (one frame, two rows).
+        torch.testing.assert_close(
+            partial_hit,
+            torch.cat(
+                [torch.ones(2, model.embedding_dim), torch.full((2, model.embedding_dim), 2.0)]
+            ),
+        )
         torch.testing.assert_close(repeated, partial_hit)
         self.assertEqual(len(model._multimodal_encoder_cache), 2)
+
+    @pytest.mark.cpu_only
+    def test_encoder_cache_video_partial_hit_without_partitions_becomes_full_miss(self):
+        """A video payload that declares no frame partitions still re-encodes the request."""
+        model = _Gemma4EncoderCacheHarness()
+        shared_hash = [1] * 8
+        model._get_or_encode_multimodal_embeddings([_make_keyed_video_param([shared_hash])])
+        param = _make_keyed_video_param([shared_hash, [2] * 8])
+        video = param.multimodal_data["video"]
+        # Three frames for two videos and no frame counts: no item axis to select by.
+        video["pixel_values"] = torch.arange(3).reshape(3, 1, 1)
+        param.item_metadata.input_partitions.clear()
+
+        with unittest.mock.patch(
+            "tensorrt_llm._torch.models.modeling_gemma4mm.logger.warning_once"
+        ) as warning_once:
+            partition = model.partition_encoder_cache(param, model._multimodal_encoder_cache)
+
+        self.assertTrue(partition.is_full_miss)
+        self.assertEqual(partition.miss_indices, [0, 1])
+        warning_once.assert_called_once()
 
     def test_chunked_prefill_reuses_cached_vision_embeddings(self):
         """Later active chunks slice cached features without rerunning vision."""
@@ -1551,7 +1617,12 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
             multimodal_data={
                 "image": {
                     "pixel_values": torch.zeros(1, 1, 1, device="cuda"),
-                }
+                },
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                    [("image", 0)],
+                    output_embedding_lengths=[4],
+                    input_partitions={"image": {"pixel_values": MultimodalItemPartition()}},
+                ),
             },
             multimodal_runtime=MultimodalRuntimeData(
                 past_seen_token_num=0,
@@ -1628,6 +1699,14 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
             ),
         ]
 
+        for param in params:
+            modality = next(iter(param.multimodal_data))
+            param.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(
+                [(modality, 0)],
+                output_embedding_lengths=[1],
+                input_partitions={modality: {"pixel_values": MultimodalItemPartition()}},
+            )
+
         with unittest.mock.patch.object(
             model,
             "_get_image_features",
@@ -1635,12 +1714,15 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
         ):
             embeddings = get_multimodal_embeddings(model.encode_multimodal_inputs, params)
 
-        expected = torch.tensor([[2.0], [1.0], [3.0]])
+        # The encoder call moves the listed pixel keys to the GPU; the payloads stay on the host.
+        expected = torch.tensor([[2.0], [1.0], [3.0]], device="cuda")
         torch.testing.assert_close(embeddings[0], expected)
         for param, expected_embedding in zip(params, expected, strict=True):
             torch.testing.assert_close(
                 param.multimodal_data["multimodal_embedding"], expected_embedding.unsqueeze(0)
             )
+            modality = next(iter(param.multimodal_data))
+            assert param.multimodal_data[modality]["pixel_values"].device.type == "cpu"
 
     def test_single_request_with_multiple_modalities_raises(self):
         """Mixed-modality requests are rejected until prompt-order handling is supported."""
@@ -1870,6 +1952,547 @@ class TestGemma4EncoderItems(unittest.TestCase):
         self.assertIsNone(
             unified.get_mm_item_metadata([], {"image": {"pixel_values": torch.zeros(1)}})
         )
+
+
+# ---------------------------------------------------------------------------
+# Partition-driven encoder groups (CPU)
+# ---------------------------------------------------------------------------
+
+
+def _legacy_gemma4_encode(self, multimodal_params: list[MultimodalParams]) -> torch.Tensor:
+    """Copy of the `Gemma4MultimodalModelBase.encode_multimodal_inputs` body this change replaced."""
+    modality_inputs = (
+        ("image", "pixel_values"),
+        ("video", "pixel_values"),
+        ("audio", "audio_features"),
+    )
+    param_modalities = [
+        [
+            modality
+            for modality, input_field in modality_inputs
+            if multimodal_param.multimodal_data.get(modality, {}).get(input_field) is not None
+        ]
+        for multimodal_param in multimodal_params
+    ]
+
+    if any(len(modalities) > 1 for modalities in param_modalities):
+        raise ValueError(
+            "Gemma4 requests containing multiple multimodal input types are not supported."
+        )
+
+    # The cache helper splits this tensor by request. Preserve that order while still batching
+    # consecutive requests with the same modality.
+    if (
+        all(len(modalities) == 1 for modalities in param_modalities)
+        and len({modalities[0] for modalities in param_modalities}) > 1
+    ):
+        embeddings = []
+        for _, param_group in groupby(
+            zip(param_modalities, multimodal_params), key=lambda item: item[0][0]
+        ):
+            embeddings.append(
+                _legacy_gemma4_encode(
+                    self, [multimodal_param for _, multimodal_param in param_group]
+                )
+            )
+        return torch.cat(embeddings, dim=0)
+
+    pixel_values_list = []
+    image_position_ids_list = []
+    image_seq_lens_extended: list[int] = []
+    audio_features_list = []
+    audio_features_mask_list: list[torch.Tensor | None] = []
+    video_pixel_values_list = []
+    video_position_ids_list = []
+    video_seq_lens_extended: list[int] = []
+
+    for multimodal_param in multimodal_params:
+        multimodal_data = multimodal_param.multimodal_data
+        image_data = multimodal_data.get("image", {})
+        pixel_values = image_data.get("pixel_values")
+        if pixel_values is not None:
+            image_position_ids = image_data.get("image_position_ids")
+            if "vision_normalization" in image_data:
+                pixel_values = _normalize_vision_patches(
+                    pixel_values, image_position_ids, image_data["vision_normalization"]
+                )
+            pixel_values_list.append(pixel_values)
+            if image_position_ids is not None:
+                image_position_ids_list.append(image_position_ids)
+            image_seq_lens = image_data.get("image_seq_lens")
+            if image_seq_lens is not None:
+                image_seq_lens_extended.extend(image_seq_lens)
+
+        audio_data = multimodal_data.get("audio", {})
+        audio_features = audio_data.get("audio_features")
+        if audio_features is not None:
+            audio_features_list.append(audio_features)
+            audio_features_mask_list.append(audio_data.get("audio_features_mask"))
+
+        video_data = multimodal_data.get("video", {})
+        video_pixel_values = video_data.get("pixel_values")
+        if video_pixel_values is not None:
+            video_position_ids = video_data.get("image_position_ids")
+            if "vision_normalization" in video_data:
+                video_pixel_values = _normalize_vision_patches(
+                    video_pixel_values, video_position_ids, video_data["vision_normalization"]
+                )
+            video_pixel_values_list.append(video_pixel_values)
+            if video_position_ids is not None:
+                video_position_ids_list.append(video_position_ids)
+            video_seq_lens = video_data.get("image_seq_lens")
+            if video_seq_lens is not None:
+                video_seq_lens_extended.extend(video_seq_lens)
+
+    multimodal_embeddings = []
+    if pixel_values_list:
+        pixel_values = torch.cat(pixel_values_list)
+        image_position_ids = (
+            torch.cat(image_position_ids_list)
+            if len(image_position_ids_list) == len(pixel_values_list)
+            else None
+        )
+        multimodal_embeddings.append(
+            self._get_image_features(
+                pixel_values=pixel_values,
+                image_position_ids=image_position_ids,
+                image_seq_lens=(
+                    image_seq_lens_extended
+                    if len(image_seq_lens_extended) == pixel_values.shape[0]
+                    else None
+                ),
+            )
+        )
+
+    if video_pixel_values_list:
+        video_pixel_values = torch.cat(video_pixel_values_list)
+        video_position_ids = (
+            torch.cat(video_position_ids_list)
+            if len(video_position_ids_list) == len(video_pixel_values_list)
+            else None
+        )
+        multimodal_embeddings.append(
+            self._get_image_features(
+                pixel_values=video_pixel_values,
+                image_position_ids=video_position_ids,
+                image_seq_lens=(
+                    video_seq_lens_extended
+                    if len(video_seq_lens_extended) == video_pixel_values.shape[0]
+                    else None
+                ),
+            )
+        )
+
+    if audio_features_list and self.embed_audio is not None:
+        per_audio_embeddings = [
+            self._get_audio_features(audio_features, audio_features_mask_list[index])
+            for index, audio_features in enumerate(audio_features_list)
+        ]
+        multimodal_embeddings.append(torch.cat(per_audio_embeddings, dim=0))
+
+    if not multimodal_embeddings:
+        raise ValueError("Gemma4 received active multimodal parameters without encoder inputs")
+    return torch.cat(multimodal_embeddings, dim=0)
+
+
+_PATCH_DIM = 3 * 16**2  # The patch width of `_make_item_input_processor`'s 16-pixel patches.
+_MEL_BINS = 128  # The feature size of `_make_item_input_processor`'s feature extractor.
+
+
+class _StubVisionTower:
+    """Per-image stand-in for the vision tower: averages each run of 9 valid patches."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def __call__(self, pixel_values, pixel_position_ids, output_length=None, image_seq_lens=None):
+        self.calls += 1
+        valid = ~(pixel_position_ids == -1).all(dim=-1)
+        # Valid-patch counts come as a CPU tensor, so the tower needs no device sync.
+        image_seq_lens = torch.as_tensor(image_seq_lens)
+        assert image_seq_lens.device.type == "cpu"
+        assert image_seq_lens.tolist() == valid.sum(dim=-1).tolist()
+        rows = [
+            image[mask].reshape(-1, 9, image.shape[-1]).mean(dim=1)
+            for image, mask in zip(pixel_values, valid)
+        ]
+        return SimpleNamespace(last_hidden_state=torch.cat(rows))
+
+
+class _Gemma4CpuEncoder:
+    """Gemma4's encoder flow on CPU modules: a stub vision tower and a tiny random audio tower."""
+
+    mm_encoder_groups = Gemma4MultimodalModelBase.mm_encoder_groups
+    encode_multimodal_inputs = Gemma4MultimodalModelBase.encode_multimodal_inputs
+    _encode_vision = Gemma4MultimodalModelBase._encode_vision
+    _get_image_features = Gemma4ForConditionalGeneration._get_image_features
+    _get_audio_features = Gemma4ForConditionalGeneration._get_audio_features
+
+    def __init__(self):
+        from transformers import Gemma4AudioConfig
+
+        from tensorrt_llm._torch.models.modeling_gemma4_audio import Gemma4AudioModel
+
+        torch.manual_seed(0)
+        self.model_dtype = torch.float32
+        self._top_config = SimpleNamespace(vision_config=SimpleNamespace(pooling_kernel_size=3))
+        self.vision_tower = _StubVisionTower()
+        self.embed_vision = Gemma4MultimodalEmbedder(_PATCH_DIM, 32, dtype=torch.float32)
+        audio_config = Gemma4AudioConfig(
+            hidden_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            subsampling_conv_channels=[_MEL_BINS, 4],
+            output_proj_dims=16,
+        )
+        audio_config.torch_dtype = torch.float32
+        self.audio_tower = Gemma4AudioModel(ModelConfig(pretrained_config=audio_config))
+        self.embed_audio = Gemma4MultimodalEmbedder(16, 32, dtype=torch.float32)
+        for module in (self.embed_vision, self.audio_tower, self.embed_audio):
+            for parameter in module.parameters():
+                torch.nn.init.normal_(parameter, std=0.1)
+        self.audio_calls = []
+        get_audio_features = self._get_audio_features
+
+        def counted_audio_features(audio_features, audio_features_mask=None):
+            self.audio_calls.append(tuple(audio_features.shape[:2]))
+            return get_audio_features(audio_features, audio_features_mask)
+
+        self._get_audio_features = counted_audio_features
+
+    def encode_like_legacy(self, param: MultimodalParams) -> torch.Tensor:
+        """One request alone, encoded the way the per-request encode path called the towers."""
+        return _legacy_gemma4_encode(self, [param])
+
+
+def _vision_request(modality, valid_patches, num_frames=None, seed=0):
+    """A processed image or video request whose frames hold `valid_patches` real patches each."""
+    generator = torch.Generator().manual_seed(seed)
+    num_patches = 36
+    pixel_values = torch.rand(len(valid_patches), num_patches, _PATCH_DIM, generator=generator)
+    y, x = torch.meshgrid(torch.arange(6), torch.arange(6), indexing="ij")
+    grid = torch.stack((x, y), dim=-1).reshape(num_patches, 2)
+    position_ids = grid.repeat(len(valid_patches), 1, 1)
+    for frame, valid in enumerate(valid_patches):
+        position_ids[frame, valid:] = -1
+        pixel_values[frame, valid:] = 0
+    data = {
+        "pixel_values": pixel_values,
+        "image_position_ids": position_ids,
+        "image_seq_lens": (position_ids != -1).all(dim=-1).sum(dim=-1),
+    }
+    if num_frames is not None:
+        data["num_frames"] = num_frames
+    return _with_item_metadata({modality: data}, _make_item_input_processor())
+
+
+def _audio_request(clip_frames, seed=0):
+    """A processed audio request whose clips are padded to its longest clip."""
+    generator = torch.Generator().manual_seed(seed)
+    features = torch.rand(len(clip_frames), max(clip_frames), _MEL_BINS, generator=generator)
+    mask = torch.zeros(len(clip_frames), max(clip_frames), dtype=torch.bool)
+    for clip, frames in enumerate(clip_frames):
+        mask[clip, :frames] = True
+        features[clip, frames:] = 0
+    return _with_item_metadata(
+        {"audio": {"audio_features": features, "audio_features_mask": mask}},
+        _make_item_input_processor(audio_seq_length=750),
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "requests,vision_calls",
+    [
+        pytest.param([("image", [36])], 1, id="one_request"),
+        pytest.param(
+            [("image", [36, 18]), ("image", [27]), ("image", [9, 36, 36])], 1, id="image_only"
+        ),
+        pytest.param([("video", [36, 18, 27], [2, 1]), ("video", [9, 9], [2])], 1, id="video_only"),
+        pytest.param(
+            [("audio", [37, 5]), ("audio", [16]), ("audio", [64, 64, 3])], 0, id="audio_only"
+        ),
+        pytest.param(
+            [("image", [36]), ("audio", [21, 40]), ("image", [18, 9])], 1, id="image_audio"
+        ),
+        pytest.param(
+            [
+                ("image", [18]),
+                ("video", [36, 9], [2]),
+                ("audio", [12]),
+                ("image", [27, 36]),
+                ("video", [18], [1]),
+                ("audio", [33, 8]),
+            ],
+            2,
+            id="non_adjacent",
+        ),
+    ],
+)
+def test_gemma4_groups_match_per_request_encoding(requests, vision_calls):
+    """Each modality makes one call across requests; rows equal the per-request encode."""
+    model = _Gemma4CpuEncoder()
+    params = [
+        _audio_request(spec[1], seed=index)
+        if spec[0] == "audio"
+        else _vision_request(*spec, seed=index)
+        for index, spec in enumerate(requests)
+    ]
+    expected = [model.encode_like_legacy(param) for param in params]
+    model.vision_tower.calls = 0
+    model.audio_calls.clear()
+
+    actual = model.encode_multimodal_inputs(params)
+
+    assert model.vision_tower.calls == vision_calls
+    # The group pads features with zeros and masks with False before one audio call.
+    audio_frames = [frames for spec in requests if spec[0] == "audio" for frames in spec[1]]
+    assert len(model.audio_calls) == (1 if audio_frames else 0)
+    if audio_frames:
+        assert model.audio_calls == [(len(audio_frames), max(audio_frames))]
+    if audio_frames:
+        torch.testing.assert_close(actual, torch.cat(expected), rtol=1e-5, atol=1e-5)
+    else:
+        assert torch.equal(actual, torch.cat(expected))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("modality", ["image", "audio"])
+def test_gemma4_groups_encode_selected_items_like_the_full_request(modality):
+    """Partial cache hits encode residual items next to other requests, in selection order."""
+    model = _Gemma4CpuEncoder()
+    if modality == "image":
+        param, other = _vision_request("image", [36, 18, 27], seed=1), _vision_request("image", [9])
+    else:
+        param, other = _audio_request([40, 7, 22], seed=1), _audio_request([13])
+    full = model.encode_multimodal_inputs([param])
+    item_rows = torch.split(full, list(param.get_item_layout()[1]))
+    residual = _Gemma4EncoderCacheHarness().build_multimodal_encoder_input(param, [2, 0])
+    MultimodalModelMixin._apply_metadata_slice(residual, param, [2, 0])
+
+    actual = model.encode_multimodal_inputs([residual, other])
+
+    expected = torch.cat([item_rows[2], item_rows[0], model.encode_multimodal_inputs([other])])
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("modality", ["image", "video", "audio"])
+def test_gemma4_dummy_carries_item_metadata_for_grouped_encoding(modality):
+    processor = _make_item_input_processor(
+        image_soft_tokens=70, video_soft_tokens=70, audio_seq_length=16
+    )
+    budget = {"image": 1260, "video": 1260, "audio": 32}[modality]
+    tokens = processor.get_mm_max_tokens_per_item(max_num_encoder_tokens=budget)[modality]
+    data = processor.get_dummy_mm_data(
+        max_num_encoder_tokens=budget, mm_counts={modality: budget // tokens}, dtype=torch.float32
+    )
+    param = MultimodalParams(multimodal_data=data)
+    param.item_metadata.validate()
+    output = _Gemma4CpuEncoder().encode_multimodal_inputs([param])
+    assert output.shape[0] == sum(param.item_metadata.output_embedding_lengths)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("missing_mask", [False, True])
+def test_gemma4_audio_padding_matches_legacy(missing_mask):
+    model = _Gemma4CpuEncoder()
+    params = [_audio_request([13, 7]), _audio_request([37], seed=1)]
+    if missing_mask:
+        # The legacy path accepted maskless clips; the producers fill True masks for batching.
+        params = [_audio_request([13]), _audio_request([37], seed=1)]
+        for param in params:
+            param.multimodal_data["audio"].pop("audio_features_mask")
+    expected = torch.cat([_legacy_gemma4_encode(model, [param]) for param in params])
+    for param in params:
+        _declare_gemma4_partitions(param)
+    model.audio_calls.clear()
+    actual = model.encode_multimodal_inputs(params)
+    assert model.audio_calls == [(3 if not missing_mask else 2, 37)]
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("split", ["dtype", "normalization", "compatible"])
+def test_gemma4_vision_partitions_match_legacy_packing(split):
+    model = _Gemma4CpuEncoder()
+    params = [_vision_request("image", [36, 18]), _vision_request("image", [27], seed=1)]
+    normalization = _make_vision_normalization()
+    for index, param in enumerate(params):
+        bucket = param.multimodal_data["image"]
+        if split != "dtype" or index == 0:
+            bucket["pixel_values"] = (bucket["pixel_values"] * 255).to(torch.uint8)
+            bucket["vision_normalization"] = (
+                normalization._replace(rescale_factor=normalization.rescale_factor / 2)
+                if split == "normalization" and index == 1
+                else normalization
+            )
+        _declare_gemma4_partitions(param)
+    inputs = []
+    original = model._get_image_features
+
+    def capture(**kwargs):
+        inputs.append(kwargs)
+        return original(**kwargs)
+
+    model._get_image_features = capture
+    if split == "compatible":
+        expected = _legacy_gemma4_encode(model, params)
+    else:
+        expected = torch.cat([_legacy_gemma4_encode(model, [param]) for param in params])
+    legacy_inputs = inputs[:]
+    inputs.clear()
+    actual = model.encode_multimodal_inputs(params)
+    assert len(inputs) == (1 if split == "compatible" else 2)
+    for actual_input, legacy_input in zip(inputs, legacy_inputs):
+        for field in ("pixel_values", "image_position_ids"):
+            assert torch.equal(actual_input[field], legacy_input[field])
+            assert actual_input[field].dtype == legacy_input[field].dtype
+            assert actual_input[field].device == legacy_input[field].device
+        assert torch.equal(
+            torch.as_tensor(actual_input["image_seq_lens"]),
+            torch.as_tensor(legacy_input["image_seq_lens"]),
+        )
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("unified", [False, True])
+@pytest.mark.parametrize("missing_positions", [False, True])
+def test_gemma4_ragged_vision_pads_positions_with_sentinels(
+    unified, missing_positions, record_property
+):
+    params = [_vision_request("image", [36]), _vision_request("image", [9], seed=1)]
+    second = params[1].multimodal_data["image"]
+    second["pixel_values"] = second["pixel_values"][:, :9]
+    second["image_position_ids"] = second["image_position_ids"][:, :9]
+    if missing_positions:
+        for param in params:
+            bucket = param.multimodal_data["image"]
+            bucket.pop("image_position_ids")
+            bucket.pop("image_seq_lens")
+    model = _Gemma4CpuEncoder()
+    if unified:
+        processor = Gemma4UnifiedInputProcessor.__new__(Gemma4UnifiedInputProcessor)
+        for param in params:
+            data = {"image": param.multimodal_data["image"]}
+            param.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = (
+                processor.get_mm_item_metadata([], data)
+            )
+        model.embed_vision = lambda pixels, positions: pixels
+        model._get_image_features = (
+            Gemma4UnifiedForConditionalGeneration._get_image_features.__get__(model)
+        )
+    else:
+        for param in params:
+            param.multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = (
+                _make_item_input_processor().get_mm_item_metadata(
+                    [], {"image": param.multimodal_data["image"]}
+                )
+            )
+    # The producer materializes implicit positions; batching pads them with -1.
+    expected = torch.cat([_legacy_gemma4_encode(model, [param]) for param in params])
+    actual = model.encode_multimodal_inputs(params)
+    if not unified:
+        # Changing projection GEMM from 4+1 rows to 5 changes fp32 accumulation order.
+        record_property("projection_max_absolute_error", float((actual - expected).abs().max()))
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+        # Remove the reduction to check padding and valid tower rows bitwise.
+        model.embed_vision.forward = lambda features: features
+        expected = torch.cat([_legacy_gemma4_encode(model, [param]) for param in params])
+        actual = model.encode_multimodal_inputs(params)
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.cpu_only
+def test_gemma4_unified_fills_metadata_without_hashing_and_keeps_rejection():
+    processor = Gemma4UnifiedInputProcessor.__new__(Gemma4UnifiedInputProcessor)
+    image = {
+        "pixel_values": torch.zeros(3, 4, 6),
+        "image_position_ids": torch.zeros(3, 4, 2, dtype=torch.long),
+    }
+    image["image_position_ids"][1, 2:] = -1
+    image["image_position_ids"][2, 1:] = -1
+    metadata = processor.get_mm_item_metadata([], {"image": image})
+    assert metadata.output_embedding_lengths == (4, 2, 1)
+    assert metadata.encoder_token_lengths is None
+    assert "image_seq_lens" in metadata.input_partitions["image"]
+    partial = MultimodalItemMetadata([("image", 2), ("image", 0), ("image", 1)])
+    completed = processor.get_mm_item_metadata(
+        [], {"image": image, MULTIMODAL_ENCODER_ITEM_METADATA_KEY: partial}
+    )
+    assert completed.item_refs == partial.item_refs
+    assert completed.output_embedding_lengths == (1, 4, 2)
+    passthrough = processor.get_mm_item_metadata(
+        [], {"image": image, MULTIMODAL_ENCODER_ITEM_METADATA_KEY: completed}
+    )
+    assert passthrough is completed
+    video = dict(image, num_frames=[2, 1])
+    order = [{"modality": "video", "index": 1}, {"modality": "video", "index": 0}]
+    assert processor.get_mm_item_metadata([], {"video": video}, order).output_embedding_lengths == (
+        1,
+        6,
+    )
+    audio = {
+        "audio_features": torch.zeros(2, 3, 5),
+        "audio_features_mask": torch.tensor([[True, True, False], [True, False, False]]),
+    }
+    assert processor.get_mm_item_metadata([], {"audio": audio}).output_embedding_lengths == (2, 1)
+    model = _Gemma4CpuEncoder()
+    with pytest.raises(ValueError, match="multiple multimodal input types"):
+        model.encode_multimodal_inputs(
+            [MultimodalParams(multimodal_data={"image": image, "audio": audio})]
+        )
+
+
+@pytest.mark.cpu_only
+def test_gemma4_unified_audio_groups_pad_masks():
+    processor = Gemma4UnifiedInputProcessor.__new__(Gemma4UnifiedInputProcessor)
+    params = []
+    for frames in (3, 5):
+        data = {"audio": {"audio_features": torch.ones(1, frames, 5)}}
+        data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = processor.get_mm_item_metadata([], data)
+        params.append(MultimodalParams(multimodal_data=data))
+    model = _Gemma4CpuEncoder()
+    model.embed_audio = Gemma4MultimodalEmbedder(5, 32, dtype=torch.float32)
+    torch.nn.init.normal_(model.embed_audio.embedding_projection.weight, std=0.1)
+    model._get_audio_features = Gemma4UnifiedForConditionalGeneration._get_audio_features.__get__(
+        model
+    )
+    expected = torch.cat([_legacy_gemma4_encode(model, [param]) for param in params])
+    actual = model.encode_multimodal_inputs(params)
+    assert actual.shape == (8, 32)
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "modality,payload,filled",
+    [
+        (
+            "image",
+            {"pixel_values": torch.zeros(2, 16, 3)},
+            {"image_position_ids", "image_seq_lens"},
+        ),
+        ("audio", {"audio_features": torch.zeros(2, 8, 4)}, {"audio_features_mask"}),
+    ],
+)
+def test_gemma4_partition_lookup_leaves_the_payload_unchanged(modality, payload, filled):
+    """Runtime partition lookups only declare inputs; the processors fill the omitted ones."""
+    metadata = MultimodalItemMetadata(
+        [(modality, 0), (modality, 1)], output_embedding_lengths=[1, 1]
+    )
+    data = dict(payload)
+    param = MultimodalParams(
+        multimodal_data={modality: data, MULTIMODAL_ENCODER_ITEM_METADATA_KEY: metadata}
+    )
+
+    partitions = _Gemma4EncoderCacheHarness().get_multimodal_item_partitions(param, modality)
+
+    assert set(partitions) == set(payload)
+    assert data.keys() == payload.keys()
+    _fill_gemma4_implicit_inputs(param.multimodal_data, metadata)
+    assert data.keys() - payload.keys() == filled
 
 
 # ---------------------------------------------------------------------------

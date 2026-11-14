@@ -49,9 +49,11 @@ from ..attention.backends.sparse.params import \
     get_indexer_mqa_logits_workspace_bytes
 from ..disaggregation.kv_cache_transceiver import (AttentionTypeCpp,
                                                    create_kv_cache_transceiver)
+from ..host_staging import staged_uploader
 from ..hostfunc import set_low_latency_dispatch
 from ..model_config import ModelConfig, _get_kv_cache_layer_specs
-from ..models.modeling_multimodal_mixin import MultimodalModelMixin
+from ..models.modeling_multimodal_mixin import (MultimodalModelMixin,
+                                                request_device_paths)
 from ..modules.dwdp.dense.manager import DenseDwdpManager
 from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from ..speculative import (draft_prompt_lookahead, get_draft_block_width,
@@ -1631,16 +1633,14 @@ class KvCacheCreator:
         encoder_inputs = self._dummy_encoder_inputs
         try:
             with torch.inference_mode():
+                # As at runtime, raw media goes to the GPU in the encoder call.
+                device_paths = request_device_paths(self._model_engine.model)
                 for encoder_input in encoder_inputs:
                     encoder_input.to_device(
                         "multimodal_data",
                         "cuda",
                         pin_memory=prefer_pinned(),
-                        target_keywords=getattr(
-                            self._model_engine.model,
-                            "multimodal_data_device_paths",
-                            None,
-                        ),
+                        target_keywords=device_paths,
                     )
                 # The clone is retained only for memory accounting; no tensor
                 # data is consumed after this profiling forward returns.
@@ -1953,9 +1953,25 @@ class KvCacheCreator:
             # equivalent runtime-owned embeddings resident while the text-only
             # LLM dummy fills max_num_tokens.
             encoder_profile_output = self._encode_dummy_inputs()
+            # With the native allocator, the encoder batch is made in the copy
+            # stream's allocator pool (`staged_uploader`), which the LLM
+            # forward cannot reuse: the encoder step counts with its own peak,
+            # the LLM step with that pool beside it. cudaMallocAsync shares
+            # one pool across streams, and the pool size there is 0.
+            encoder_peak_memory, copy_pool_bytes = 0, 0
             if encoder_profile_output is not None:
                 profiled_output_bytes = (encoder_profile_output.numel() *
                                          encoder_profile_output.element_size())
+                copy_pool_bytes = staged_uploader(
+                    torch.cuda.current_device()).reserved_bytes()
+            if copy_pool_bytes:
+                encoder_peak_memory = torch.cuda.memory_stats(
+                )["allocated_bytes.all.peak"]
+                logger.info(
+                    f"Multimodal encoder copy-stream pool in memory usage profiling: {copy_pool_bytes / (GB):.2f} GiB"
+                )
+                torch.cuda.empty_cache()
+                torch.cuda.reset_peak_memory_stats()
             py_executor.set_gather_responses(True)
             origin_iter_stats = py_executor.enable_iter_perf_stats
             py_executor.enable_iter_perf_stats = False
@@ -1976,8 +1992,10 @@ class KvCacheCreator:
                         if response.has_error():
                             raise RuntimeError(response.error_msg)
 
-                torch_peak_memory = torch.cuda.memory_stats(
-                )["allocated_bytes.all.peak"]
+                torch_peak_memory = max(
+                    encoder_peak_memory,
+                    torch.cuda.memory_stats()["allocated_bytes.all.peak"] +
+                    copy_pool_bytes)
 
                 # Release before measuring current usage so the retained
                 # embeddings count toward the peak but not the steady state.

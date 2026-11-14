@@ -16,8 +16,9 @@
 
 import contextlib
 import copy
+import functools
 import itertools
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -28,6 +29,7 @@ from typing import (
     Iterable,
     Iterator,
     List,
+    Mapping,
     Optional,
     Sequence,
     Tuple,
@@ -45,7 +47,10 @@ from tensorrt_llm.inputs.multimodal import (
     MultimodalItemPartition,
     MultimodalParams,
     MultimodalRuntimeData,
+    _batch_item_values,
+    _move_to_device,
     select_multimodal_fields,
+    strip_mm_encoder_inputs,
 )
 from tensorrt_llm.logger import logger
 
@@ -93,6 +98,12 @@ class EncoderGroup:
     splits the output back per-modality and reorders it into prompt order
     via each request's `MultimodalItemMetadata.item_refs` manifest.
 
+    By default the group batches the payload keys that each request declares
+    in `MultimodalItemMetadata.input_partitions`
+    (`build_batched_input_by_partitions`), so `encoder_fn` takes those keys
+    as kwargs. A model passes its own `build_batched_input` only when its
+    packing differs.
+
     Contract between `build_batched_input` and `encoder_fn`:
 
     * `build_batched_input` must concatenate items across requests in
@@ -113,18 +124,387 @@ class EncoderGroup:
     `modalities[0]`, then all items of `modalities[1]`, etc."""
 
     encoder_fn: Callable[..., torch.Tensor]
-    """Encoder call invoked as `encoder_fn(**build_batched_input(params))`.
-    Returns a single tensor with one row per embedding, laid out per the
+    """Encoder call invoked as `encoder_fn(**build_batched_input(params))`,
+    normally once per group (see `encode_multimodal_by_groups`). Returns a
+    single tensor with one row per embedding, laid out per the
     contract above. When those rows are already in prompt order, the
     framework may return a row slice of this tensor without a copy, so it
     must not alias storage that a later call overwrites (for example, a CUDA
     graph's static output buffer); clone such outputs before returning
     them."""
 
-    build_batched_input: Callable[[List[MultimodalParams]], Dict[str, Any]]
+    build_batched_input: Optional[Callable[[List[MultimodalParams]], Dict[str, Any]]] = None
     """Builds the kwargs dict passed to `encoder_fn`. Responsible for
     concatenating raw per-item tensors from `multimodal_data` across
-    requests in the order described in the class docstring."""
+    requests in the order described in the class docstring. None binds
+    `build_batched_input_by_partitions` for this group's modalities."""
+
+    batch_as: Mapping[str, str] = field(default_factory=dict)
+    """Payload keys of another modality that the default builder batches
+    under the key they map to, after that key's items in modality order.
+    For example, `{"pixel_values_videos": "pixel_values"}` makes one
+    `pixel_values` batch of image rows then video rows, so the encoder needs
+    no device concatenation of the two."""
+
+    def __post_init__(self) -> None:
+        if self.build_batched_input is None:
+            # Frozen dataclasses require object.__setattr__ during construction.
+            object.__setattr__(
+                self,
+                "build_batched_input",
+                functools.partial(
+                    build_batched_input_by_partitions, self.modalities, batch_as=self.batch_as
+                ),
+            )
+
+
+def build_batched_input_by_partitions(
+    modalities: Sequence[str],
+    multimodal_params: Sequence[MultimodalParams],
+    batch_as: Optional[Mapping[str, str]] = None,
+) -> Dict[str, Any]:
+    """Batch each declared payload key across requests (default builder).
+
+    Visits payloads in `modalities` order, then request order, and batches each
+    key declared in the request's `MultimodalItemMetadata.input_partitions`
+    as `batch_by_item_partitions` does. Only declared keys reach the encoder;
+    a key that several modalities declare (for example `pixel_values` for
+    image and video), or that `batch_as` maps to another, batches their items
+    in modality order. Values stay on the device the payloads hold them on;
+    `encode_multimodal_by_groups` makes the owner's device keys on the GPU.
+    """
+    return _batch_fields(_gather_fields(modalities, multimodal_params, batch_as)[0])
+
+
+# Marks a key whose payloads declare different item axes or padding values.
+_MIXED_POLICY = object()
+
+
+def _gather_fields(
+    modalities: Sequence[str],
+    multimodal_params: Sequence[MultimodalParams],
+    batch_as: Optional[Mapping[str, str]] = None,
+) -> Tuple[Dict[str, List[Any]], bool]:
+    """Collect every declared key's values in one pass, modality then request order.
+
+    Returns `{key: [item_axis, padding_value, values, sources]}` and whether
+    the payloads of each modality provide the same keys; `sources` lists the
+    `(modality, payload key)` pairs batched under `key` (see
+    `EncoderGroup.batch_as`). Each key's partition, declared by the input
+    processor, says how to batch it, so batching needs no per-item inspection.
+    """
+    fields: Dict[str, List[Any]] = {}
+    same_keys = True
+    for modality in modalities:
+        modality_fields: Dict[str, List[Any]] = {}
+        payloads = 0
+        for param in multimodal_params:
+            data = param.multimodal_data.get(modality)
+            if data is None:
+                continue
+            metadata = param.multimodal_data.get(MULTIMODAL_ENCODER_ITEM_METADATA_KEY)
+            partitions = (
+                metadata.input_partitions.get(modality)
+                if isinstance(metadata, MultimodalItemMetadata)
+                else None
+            )
+            if partitions is None:
+                # No record, a record of the wrong type or no partitions: raises its error.
+                partitions = _declared_partitions(param, modality)
+            payloads += 1
+            for key, value in data.items():  # Present keys; only declared ones are kept.
+                partition = partitions.get(key)
+                if partition is None or value is None:
+                    continue
+                axis, lengths = partition.item_axis, partition.item_lengths
+                if (
+                    lengths is not None
+                    and axis is not None
+                    and sum(lengths)
+                    != (len(value) if isinstance(value, (list, tuple)) else value.shape[axis])
+                ):
+                    raise ValueError("Packed field size does not match its item lengths")
+                field = modality_fields.get(key)
+                if field is None:
+                    modality_fields[key] = [axis, partition.padding_value, [value]]
+                    continue
+                if field[0] != axis or field[1] != partition.padding_value:
+                    field[0] = _MIXED_POLICY
+                field[2].append(value)
+        for key, (axis, padding_value, values) in modality_fields.items():
+            same_keys = same_keys and len(values) == payloads
+            name = batch_as.get(key, key) if batch_as else key
+            field = fields.get(name)
+            if field is None:
+                fields[name] = [axis, padding_value, values, [(modality, key)]]
+                continue
+            if field[0] != axis or field[1] != padding_value:
+                field[0] = _MIXED_POLICY
+            field[2].extend(values)
+            field[3].append((modality, key))
+    return fields, same_keys
+
+
+def _batch_fields(
+    fields: Dict[str, List[Any]], device_keys: Optional[Mapping[str, Mapping[str, bool]]] = None
+) -> Dict[str, Any]:
+    """Batch each gathered key once: a shared value as is, item values in one pass.
+
+    A key with a payload key that the call makes on the GPU (`_device_keys`
+    of the owner's device paths) is made on the GPU here, for this call only;
+    the other keys stay on the device the payloads hold them on.
+    """
+    batch = {}
+    for key, (axis, padding_value, values, sources) in fields.items():
+        if axis is _MIXED_POLICY:
+            raise ValueError("Pieces of one field must share their item axis and padding value")
+        device = None
+        if device_keys and any(_device_policy(*source, device_keys) for source in sources):
+            device = "cuda"
+        if axis is None:
+            batch[key] = values[0] if device is None else _move_to_device(values[0], device)
+        else:
+            batch[key] = _batch_item_values(values, axis, padding_value, device)
+    return batch
+
+
+def _device_keys(device_paths: Optional[Sequence[str]]) -> Dict[str, Dict[str, bool]]:
+    """The raw input payload keys that device paths name, as `{modality: {key: in_call}}`.
+
+    A payload key (`image.pixel_values`) is made on the GPU in the encoder
+    call (True). A whole modality (`image`, key "") or a nested key
+    (`image.a.b`, key `a`) is not a key the builder batches: the executor
+    keeps moving it per request (False), and the call uses it as placed.
+    """
+    keys: Dict[str, Dict[str, bool]] = {}
+    for path in device_paths or ():
+        modality, _, rest = path.partition(".")
+        if modality in _MM_DATA_INPUT_MODALITY_KEYS:
+            key, _, nested = rest.partition(".")
+            named = keys.setdefault(modality, {})
+            named[key] = named.get(key, False) or bool(key and not nested)
+    return keys
+
+
+def _device_policy(
+    modality: str, key: str, device_keys: Mapping[str, Mapping[str, bool]]
+) -> Optional[bool]:
+    """True: made on the GPU in the call; False: moved per request; None: kept on the host."""
+    named = device_keys.get(modality, {})
+    return named.get(key, named.get(""))
+
+
+def _share_one_call(
+    fields: Dict[str, List[Any]],
+    same_keys: bool,
+    device_keys: Optional[Mapping[str, Mapping[str, bool]]] = None,
+) -> bool:
+    """Whether gathered payloads can share one encoder call, the usual case.
+
+    One check per key: its payloads share an item axis and padding value,
+    shared values are one object or equal records, and item values are
+    tensors of one dtype or all lists, all bound for the GPU or all kept on
+    the host (`_device_policy`). Otherwise `_call_units` decides how to
+    split, which also covers shared tensors that are not one object.
+    """
+    if not same_keys:
+        return False
+    for axis, _, values, sources in fields.values():
+        first = values[0]
+        if axis is _MIXED_POLICY:
+            return False
+        if axis is None:
+            for value in values:
+                if value is not first and (
+                    isinstance(value, torch.Tensor)
+                    or isinstance(first, torch.Tensor)
+                    or not first == value
+                ):
+                    return False
+        elif len({getattr(value, "dtype", None) for value in values}) > 1:
+            return False
+        elif (
+            device_keys
+            and isinstance(first, torch.Tensor)
+            and len({_device_policy(*source, device_keys) is None for source in sources}) > 1
+        ):
+            return False
+    return True
+
+
+def _declared_partitions(
+    param: MultimodalParams, modality: str
+) -> Dict[str, MultimodalItemPartition]:
+    """Read the input partitions a request declares for one modality."""
+    metadata = param.item_metadata
+    partitions = None if metadata is None else metadata.input_partitions.get(modality)
+    if partitions is None:
+        raise MultimodalEncoderContractError(
+            f"The {modality} payload declares no input partitions; declare them in its "
+            "MultimodalItemMetadata or give the EncoderGroup a build_batched_input"
+        )
+    return partitions
+
+
+def _payload_signature(
+    param: MultimodalParams,
+    modality: str,
+    batch_as: Optional[Mapping[str, str]] = None,
+    device_keys: Optional[Mapping[str, Mapping[str, bool]]] = None,
+) -> Dict[str, Tuple[Any, ...]]:
+    """What payloads in one encoder call must share, per present declared key.
+
+    Item tensors of one call share their dtype and whether the device paths
+    send them to the GPU (`_device_policy`), so a key batched for the GPU
+    never takes a value the owner keeps on the host.
+    """
+    data = param.multimodal_data[modality]
+    signature = {}
+    for key, partition in _declared_partitions(param, modality).items():
+        value = data.get(key)
+        if value is None:
+            continue
+        name = batch_as.get(key, key) if batch_as else key
+        if partition.item_axis is None:
+            signature[name] = ("shared", value)
+        elif isinstance(value, torch.Tensor):
+            on_host = _device_policy(modality, key, device_keys or {}) is None
+            signature[name] = ("tensor", value.dtype, on_host)
+        else:
+            signature[name] = ("items",)
+    return signature
+
+
+def _same_signature_entry(first: Tuple[Any, ...], second: Tuple[Any, ...]) -> bool:
+    """Compare signature entries; shared tensors compare by content."""
+    if first[0] != "shared" or second[0] != "shared":
+        return first == second
+    a, b = first[1], second[1]
+    if a is b:
+        return True
+    if isinstance(a, torch.Tensor) or isinstance(b, torch.Tensor):
+        return (
+            isinstance(a, torch.Tensor)
+            and isinstance(b, torch.Tensor)
+            and a.dtype == b.dtype
+            and a.device == b.device
+            and a.shape == b.shape
+            and torch.equal(a, b)
+        )
+    return bool(a == b)
+
+
+def _uses_default_builder(group: EncoderGroup) -> bool:
+    """Own builders may not read partitions, so only the default builder's calls are split."""
+    builder = group.build_batched_input
+    return (
+        isinstance(builder, functools.partial) and builder.func is build_batched_input_by_partitions
+    )
+
+
+def _call_units(
+    group: EncoderGroup,
+    params: List[MultimodalParams],
+    device_keys: Optional[Mapping[str, Mapping[str, bool]]] = None,
+) -> List[Tuple[List[MultimodalParams], List[Tuple[str, int]]]]:
+    """Split a group's payloads into encoder calls that can share one batch.
+
+    Returns `(params, payloads)` per call, payloads being `(modality, request
+    index)` in the group layout. Payloads of one call agree on every shared
+    value and tensor dtype of a key, and payloads of one modality provide the
+    same keys. If they all agree, there is one call over `params` unchanged;
+    otherwise each call gets views of the requests that hold only its
+    payloads. Only groups with the default builder are split.
+    """
+    # Each unit: one signature per modality, one entry per key, its payloads.
+    units: List[Tuple[Dict[str, Dict[str, Any]], Dict[str, Any], List[Tuple[str, int]]]] = []
+    for modality in group.modalities:
+        for index, param in enumerate(params):
+            if param.multimodal_data.get(modality) is None:
+                continue
+            signature = _payload_signature(param, modality, group.batch_as, device_keys)
+            for unit in units:  # First unit the payload fits, else a new one.
+                by_modality, by_key, _ = unit
+                known = by_modality.get(modality)
+                if (known is None or known.keys() == signature.keys()) and all(
+                    key not in by_key or _same_signature_entry(by_key[key], entry)
+                    for key, entry in signature.items()
+                ):
+                    break
+            else:
+                unit = ({}, {}, [])
+                units.append(unit)
+            unit[0].setdefault(modality, signature)
+            unit[1].update(signature)
+            unit[2].append((modality, index))
+    if len(units) == 1:
+        return [(params, units[0][2])]
+    calls = []
+    for _, _, payloads in units:
+        kept: Dict[int, set] = {}
+        for modality, index in payloads:
+            kept.setdefault(index, set()).add(modality)
+        views = [
+            MultimodalParams(
+                multimodal_data={
+                    key: value
+                    for key, value in params[index].multimodal_data.items()
+                    if key not in group.modalities or key in modalities
+                }
+            )
+            for index, modalities in sorted(kept.items())
+        ]
+        calls.append((views, payloads))
+    return calls
+
+
+def _check_encoder_rows(out: torch.Tensor, expected: int) -> None:
+    """Encoder rows must match the item metadata, or slicing would hide the error."""
+    if out.shape[0] != expected:
+        raise MultimodalEncoderContractError(
+            f"MM encoder returned {out.shape[0]} rows, item metadata expects {expected}"
+        )
+
+
+def _encode_group(
+    group: EncoderGroup,
+    params: List[MultimodalParams],
+    item_layouts: Sequence[tuple[Sequence[tuple[str, int]], Sequence[int]]],
+    device_keys: Optional[Mapping[str, Mapping[str, bool]]] = None,
+) -> torch.Tensor:
+    """Batch and encode one group's payloads; return rows in the group layout.
+
+    Groups with their own `build_batched_input` make one call. With the
+    default builder, one gather finds whether all payloads fit one call;
+    only when they do not does `_call_units` look at each payload. Each
+    call makes its `device_keys` inputs on the GPU (`_batch_fields`).
+    """
+    if not _uses_default_builder(group):
+        return group.encoder_fn(**group.build_batched_input(params))
+    fields, same_keys = _gather_fields(group.modalities, params, group.batch_as)
+    if _share_one_call(fields, same_keys, device_keys):
+        return group.encoder_fn(**_batch_fields(fields, device_keys))
+    calls = _call_units(group, params, device_keys)
+    outputs = [
+        group.encoder_fn(
+            **_batch_fields(_gather_fields(group.modalities, views, group.batch_as)[0], device_keys)
+        )
+        for views, _ in calls
+    ]
+    if len(outputs) == 1:
+        return outputs[0]
+    # Split each call's rows per payload and put them back in the group layout.
+    rows: Dict[Tuple[str, int], int] = {}
+    for index, (item_refs, lengths) in enumerate(item_layouts):
+        for (modality, _), length in zip(item_refs, lengths, strict=True):
+            rows[modality, index] = rows.get((modality, index), 0) + length
+    pieces: Dict[Tuple[str, int], torch.Tensor] = {}
+    for (_, payloads), out in zip(calls, outputs, strict=True):
+        payload_rows = [rows.get(payload, 0) for payload in payloads]
+        _check_encoder_rows(out, sum(payload_rows))
+        pieces.update(zip(payloads, out.split(payload_rows)))
+    order = {modality: position for position, modality in enumerate(group.modalities)}
+    return torch.cat([pieces[p] for p in sorted(pieces, key=lambda p: (order[p[0]], p[1]))])
 
 
 def _lengths_by_modality(
@@ -154,16 +534,14 @@ def _lengths_by_modality(
         if not item_refs:
             continue
         modality = item_refs[0][0]
-        if (
-            len(item_refs) == len(lengths)
-            and modality in by_modality
-            and all(
-                item_modality == modality and index == expected
-                for expected, (item_modality, index) in enumerate(item_refs)
-            )
-        ):
-            by_modality[modality].extend(lengths)
-            continue
+        if len(item_refs) == len(lengths) and modality in by_modality:
+            # The usual request: one modality in local order (a plain loop, no call per item).
+            for expected, (item_modality, index) in enumerate(item_refs):
+                if item_modality != modality or index != expected:
+                    break
+            else:
+                by_modality[modality].extend(lengths)
+                continue
         request_lengths: dict[str, list[tuple[int, int]]] = {m: [] for m in modalities}
         for (modality, index), length in zip(item_refs, lengths, strict=True):
             if modality in request_lengths:
@@ -234,45 +612,88 @@ def _reorder_embeds_by_manifest(
 def encode_multimodal_by_groups(
     mm_encoder_groups: Sequence["EncoderGroup"],
     multimodal_params: List[MultimodalParams],
+    device_paths: Optional[Sequence[str]] = None,
 ) -> torch.Tensor:
     """Run each group's encoder over its batched items and reorder into
     per-request prompt order.
 
-    For each group present in the batch, one encoder call is issued over all
-    items across all requests belonging to that group's modalities
-    (arithmetic-intensity win). The output is split back per-modality using
-    the prompt-ordered output lengths in `MultimodalItemMetadata`,
-    then reordered by the same metadata's `item_refs`.
+    For each group present in the batch: collect the requests that hold its
+    modalities, batch their items across requests (`build_batched_input`),
+    run `encoder_fn` once over the batch (arithmetic-intensity win), check
+    that the encoder rows match the item metadata, split the rows back
+    per-modality using the prompt-ordered output lengths in
+    `MultimodalItemMetadata`, and reorder them by the same metadata's
+    `item_refs`. With the default builder, payloads whose shared values or
+    tensor dtypes differ are encoded in separate calls, and their rows are
+    put back in the group layout first.
 
     Shared entry point for both the aggregated (`MultimodalModelMixin`) and
     mm-encoder-only (`Qwen3VisionModelBase.forward`) paths so the ordering
     contract lives in one place.
+
+    It is also the one place raw media inputs go to the GPU: the owner passes
+    its `multimodal_data_device_paths`, and each default-builder call makes the
+    payload keys they list on the GPU (`_batch_fields`), for that call only,
+    copying each host byte once into its place on the device's copy stream
+    (`host_staging.staged_uploader`). The request payloads are only read and
+    stay on the host. Groups with their own
+    builder read payloads as the executor moved them (`request_device_paths`).
     """
+    device_keys = _device_keys(device_paths)
     per_modality_embeds: Dict[str, torch.Tensor] = {}
     per_modality_lengths: Dict[str, List[int]] = {}
-    item_layouts = [mp.get_item_layout() for mp in multimodal_params]
+    item_layouts = _item_layouts(multimodal_params)
     for group in mm_encoder_groups:
         group_params = []
         group_layouts = []
         for mp, layout in zip(multimodal_params, item_layouts, strict=True):
-            if any(mp.multimodal_data.get(m) is not None for m in group.modalities):
-                if not layout[0]:
-                    raise MultimodalEncoderContractError(
-                        "MM item metadata with output lengths is required for grouped encoding"
-                    )
-                group_params.append(mp)
-                group_layouts.append(layout)
+            data = mp.multimodal_data
+            for m in group.modalities:
+                if data.get(m) is not None:
+                    if not layout[0]:
+                        raise MultimodalEncoderContractError(
+                            "MM item metadata with output lengths is required for grouped encoding"
+                        )
+                    group_params.append(mp)
+                    group_layouts.append(layout)
+                    break
         if not group_params:
             continue
-        out = group.encoder_fn(**group.build_batched_input(group_params))
+        out = _encode_group(group, group_params, group_layouts, device_keys)
         lengths = _lengths_by_modality(group_layouts, group.modalities)
+        rows = out.shape[0]
         cursor = 0
         for m in group.modalities:
+            if rows and not lengths[m]:
+                # No items: nothing reads this modality's rows, so skip the empty view.
+                continue
             total = sum(lengths[m])
-            per_modality_embeds[m] = out[cursor : cursor + total]
+            per_modality_embeds[m] = out if total == rows else out[cursor : cursor + total]
             cursor += total
+        _check_encoder_rows(out, cursor)
         per_modality_lengths.update(lengths)
     return _reorder_embeds_by_manifest(item_layouts, per_modality_embeds, per_modality_lengths)
+
+
+def _item_layouts(
+    multimodal_params: Sequence[MultimodalParams],
+) -> List[tuple[Sequence[tuple[str, int]], Sequence[int]]]:
+    """`MultimodalParams.get_item_layout` of every request, read in one pass."""
+    layouts = []
+    for param in multimodal_params:
+        data = param.multimodal_data
+        metadata = (
+            data.get(MULTIMODAL_ENCODER_ITEM_METADATA_KEY) if isinstance(data, dict) else None
+        )
+        if (
+            isinstance(metadata, MultimodalItemMetadata)
+            and metadata.output_embedding_lengths is not None
+        ):
+            layouts.append((metadata.item_refs, metadata.output_embedding_lengths))
+        else:
+            # No record, or one the getter rejects: its empty layout or its error.
+            layouts.append(param.get_item_layout())
+    return layouts
 
 
 if TYPE_CHECKING:
@@ -283,6 +704,72 @@ if TYPE_CHECKING:
 _MM_DATA_INPUT_MODALITY_KEYS = frozenset({"audio", "image", "video"})
 _MM_AUX_STREAM: Optional[tuple[int, torch.cuda.Stream]] = None
 _MM_ENCODER_CACHE_LOG_NAME = "mm_encoder_cache"
+
+
+def request_device_paths(model: Any) -> Optional[List[str]]:
+    """Paths of `multimodal_data` that the executor moves to the GPU per request.
+
+    When every encoder group of the model uses the default builder, the raw
+    media keys of its `multimodal_data_device_paths` go to the GPU in the
+    encoder call instead (`encode_multimodal_by_groups`): after the encoder
+    cache lookup, once per call, only for the items encoded, and not kept on
+    the request. So only the other paths move per request (MRoPE positions,
+    attached embeddings, and whole-modality or nested media paths, which the
+    builder does not batch; the call uses those values as placed). Other
+    models move every path, as before. None (no path list) moves every tensor.
+    """
+    paths = getattr(model, "multimodal_data_device_paths", None)
+    if not isinstance(paths, (list, tuple)):
+        return None
+    groups = getattr(model, "mm_encoder_groups", ())
+    if (
+        not isinstance(groups, (list, tuple))
+        or not groups
+        or not all(isinstance(g, EncoderGroup) and _uses_default_builder(g) for g in groups)
+    ):
+        return list(paths)
+    covered = {modality for group in groups for modality in group.modalities}
+    in_call = _device_keys(paths)
+    kept = []
+    for path in paths:
+        modality, _, key = path.partition(".")
+        if modality not in covered or not in_call.get(modality, {}).get(key):
+            kept.append(path)
+    return kept
+
+
+def _has_device_tensor(value: Any) -> bool:
+    if isinstance(value, torch.Tensor):
+        return value.device.type != "cpu"
+    if isinstance(value, dict):
+        return any(_has_device_tensor(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_has_device_tensor(item) for item in value)
+    return False
+
+
+def release_encoded_media(request: "LlmRequest") -> None:
+    """Drop a request's raw media from the host once no encoder call can read it again.
+
+    That is when the request holds its whole encoder output (`multimodal_embedding`,
+    not an item-scheduling chunk) and no item scheduler can release outputs and
+    encode items again (`py_mm_encoder_state` is None): later chunks and a recompute
+    replay of the prefill use the held output. Only media still on the host goes
+    (models on the default encoder builder copy it only in the encoder call); media
+    the executor moved per request is cleared at prefill completion with the rest
+    (`strip_mm_data_for_generation`). MRoPE data, item metadata and the embedding stay.
+    """
+    mm_data = getattr(request, "py_multimodal_data", None)
+    if (
+        not mm_data
+        or getattr(request, "py_mm_encoder_state", None) is not None
+        or mm_data.get("multimodal_embedding") is None
+        or mm_data.get("multimodal_embedding_is_chunk", False)
+    ):
+        return
+    media = [mm_data[key] for key in _MM_DATA_INPUT_MODALITY_KEYS if key in mm_data]
+    if media and not _has_device_tensor(media):
+        strip_mm_encoder_inputs(mm_data)
 
 
 def _build_request_multimodal_input(
@@ -967,9 +1454,8 @@ class MultimodalModelMixin:
             # `pixel_values` was padded to the request-wide max H/W by the input
             # processor. After keeping only the miss subset, crop the trailing H/W back
             # down to that subset's own max true size -- otherwise a downstream re-batch
-            # step (e.g. Mistral 3's `batch_pixel_values`) that pads to
-            # `max(residual.image_sizes)` would compute a negative pad amount whenever
-            # the omitted items were the largest in the original request.
+            # step that pads to `max(residual.image_sizes)` would compute a negative pad
+            # amount whenever the omitted items were the largest in the original request.
             if miss_sizes and miss_pixel.dim() >= 4:
                 max_h = max(int(s[0]) for s in miss_sizes)
                 max_w = max(int(s[1]) for s in miss_sizes)
@@ -1100,10 +1586,11 @@ class MultimodalModelMixin:
         If item scheduling supplies current-chunk rows, the gather selects
         current-chunk rows for every request before concatenating the batch.
 
-        During side-stream prefetch, this runs with the auxiliary stream current, so the H2D copies,
-        the encoder, and every persistent-cache `put()` are issued on that stream. `TensorLRUCache`
-        records each entry's producer event on the issuing (aux) stream; the next iteration's
-        main-stream consumer waits on the request-level `encoder_event` for ordering.
+        During side-stream prefetch, this runs with the auxiliary stream current, so the H2D copies
+        (raw inputs go to the GPU inside the encoder call), the encoder, and every persistent-cache
+        `put()` are issued on that stream. `TensorLRUCache` records each entry's producer event on
+        the issuing (aux) stream; the next iteration's main-stream consumer waits on the
+        request-level `encoder_event` for ordering.
         """
         encoder_cache = self._multimodal_encoder_cache
         cache_misses: list[MultimodalParams] = []
@@ -1422,11 +1909,12 @@ class MultimodalModelMixin:
         if not partials:
             return
 
-        # Cross-iter prefetch may have staged some params' raw MM tensors on the aux
-        # stream. If a prefetch encoder call then raised, the request reaches this
-        # iteration with an `encoder_event` but no `multimodal_embedding`; slicing
-        # those tensors on the main stream before the event would race the aux-stream
-        # H2D copy. Wait per param up front, before any raw-tensor read.
+        # Cross-iter prefetch may have staged some params' tensors on the aux stream
+        # (MRoPE, and raw MM inputs of models that move them per request). If a prefetch
+        # encoder call then raised, the request reaches this iteration with an
+        # `encoder_event` but no `multimodal_embedding`; reading those tensors on the
+        # main stream before the event would race the aux-stream H2D copy. Wait per
+        # param up front, before any tensor read.
         for param, _ in partials:
             if param.encoder_event is not None:
                 torch.cuda.current_stream().wait_event(param.encoder_event)
@@ -1660,7 +2148,7 @@ def _dispatch_cross_iter_prefetch(
     candidates: Sequence[tuple["LlmRequest", Dict[str, Any], torch.Tensor]],
     aux_stream: "torch.cuda.Stream",
 ) -> None:
-    """H2D-copy MM data, run the encoder, and cache embeddings on `aux_stream`.
+    """Run the encoder and cache embeddings on `aux_stream`, with its H2D copies.
 
     Stamps a CUDA event on every candidate's `py_mm_encoder_event` so input
     preparation waits on it for the first chunk that reads staged tensors.
@@ -1713,12 +2201,15 @@ def _dispatch_cross_iter_prefetch(
                         partial_hits.append((param, partition))
 
             params_to_transfer = cache_misses + [param for param, _ in partial_hits]
+            # Raw media of default-builder models goes to the GPU in the encoder call below,
+            # only for the encoded items; here only the other device paths move.
+            device_paths = request_device_paths(model) if params_to_transfer else None
             for param in params_to_transfer:
                 param.to_device(
                     "multimodal_data",
                     "cuda",
                     pin_memory=prefer_pinned(),
-                    target_keywords=getattr(model, "multimodal_data_device_paths", None),
+                    target_keywords=device_paths,
                 )
             # `to_device` may replace `multimodal_data` with a new dict; reattach
             # the (possibly new) dict to each request so the next iteration's
@@ -1748,6 +2239,8 @@ def _dispatch_cross_iter_prefetch(
                 if not isinstance(embedding, torch.Tensor):
                     raise ValueError("Multimodal encoder prefetch did not produce an embedding.")
                 model._validate_embeddings([embedding], [param])
+            for req, _, _ in candidates:
+                release_encoded_media(req)
     finally:
         # Stash the event on every candidate's durable LlmRequest (not the
         # per-iter `MultimodalParams`), since `_prepare_inputs` rebuilds the

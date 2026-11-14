@@ -2,11 +2,14 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
+import inspect
+import math
 import os
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -18,11 +21,15 @@ from test_modeling_multimodal import MultimodalScenario, TestModelingMultimodal
 from test_modeling_qwen2vl import _make_vision_attention
 from transformers import Qwen3VLConfig
 from transformers import Qwen3VLForConditionalGeneration as HFQwen3VLForConditionalLM
+from transformers.modeling_outputs import BaseModelOutputWithPooling
+from transformers.models.qwen2_vl.configuration_qwen2_vl import Qwen2VLVisionConfig
+from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VisionTransformerPretrainedModel
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models import modeling_multimodal_utils, modeling_qwen2vl, modeling_qwen3vl
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
+from tensorrt_llm._torch.models.modeling_multimodal_mixin import EncoderGroup, MultimodalModelMixin
 from tensorrt_llm._torch.models.modeling_multimodal_utils import (
     VisionNormalization,
     normalize_vision_pixels,
@@ -30,13 +37,14 @@ from tensorrt_llm._torch.models.modeling_multimodal_utils import (
 )
 from tensorrt_llm._torch.models.modeling_qwen3vl import (
     Qwen3VisionModel,
+    Qwen3VisionModelBase,
     Qwen3VLInputProcessorBase,
     Qwen3VLModel,
     _triton_pos_embed_interpolate,
 )
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
 from tensorrt_llm._utils import get_sm_version
-from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.multimodal import MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalParams
 from tensorrt_llm.llmapi.llm_args import MultimodalConfig, MultimodalEncoderCudaGraphConfig
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -725,6 +733,624 @@ def test_qwen3_vision_cuda_graph_replay_matches_eager(
     assert vision.attn_metadata.max_num_requests == 1
     assert captured.metadata.max_num_tokens == 257
     assert captured.metadata.max_num_requests == 2
+
+
+# Partition-driven encoder batching. The `_legacy_*` oracles copy the Qwen3-VL packing
+# that the encoder group's default builder replaced.
+
+# Requests with the item metadata the Qwen processor produces, shared by the Qwen-VL
+# encoder-group tests here and in test_modeling_cosmos3_edge.py.
+
+_QWEN_TEST_ROW_WIDTH = 6
+_QWEN_TEST_NORMALIZATION = VisionNormalization(
+    1 / 255, (0.25, 0.5, 0.75), (0.5, 0.25, 0.125), torch.float32
+)
+_QWEN_VISION_BATCHES = {
+    "one_image": [[("image", 1, (1, 2, 2))]],
+    "images": [[("image", 1, (1, 2, 2))], [("image", 2, (1, 2, 4)), ("image", 3, (1, 4, 2))]],
+    "videos": [[("video", 1, (2, 2, 2))], [("video", 2, (1, 2, 4))]],
+    "mixed": [
+        [("image", 1, (1, 2, 2)), ("video", 2, (2, 2, 2)), ("image", 3, (1, 2, 4))],
+        [("video", 4, (1, 2, 2))],
+        [("image", 5, (1, 4, 2))],
+    ],
+    "video_first": [
+        [("video", 1, (2, 2, 2)), ("image", 2, (1, 2, 4)), ("video", 3, (1, 2, 2))],
+        [("image", 4, (1, 4, 2))],
+    ],
+}
+
+
+def _qwen_test_processor() -> modeling_qwen2vl.Qwen2VLInputProcessorBase:
+    """A Qwen processor with only the config its item metadata producer reads."""
+    processor = object.__new__(modeling_qwen2vl.Qwen2VLInputProcessorBase)
+    processor._config = SimpleNamespace(
+        image_token_id=10,
+        video_token_id=11,
+        vision_start_token_id=12,
+        vision_end_token_id=13,
+        vision_config=SimpleNamespace(spatial_merge_size=2),
+    )
+    return processor
+
+
+def _qwen_attach_item_metadata(data: Dict[str, Any], modalities: List[str]) -> MultimodalParams:
+    """Attach the item metadata the Qwen processor produces for this prompt order."""
+    tokens = {"image": 10, "video": 11}
+    prompt = [token for modality in modalities for token in (12, tokens[modality], 13)]
+    metadata = _qwen_test_processor().get_mm_item_metadata(prompt, data)
+    metadata.validate()
+    data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = metadata
+    return MultimodalParams(multimodal_data=data)
+
+
+def _qwen_vision_request(items: list, raw: bool = False) -> MultimodalParams:
+    """One request from prompt-ordered `(modality, marker, (t, h, w))` items.
+
+    Patch rows are a fixed function of the marker and hold integers in
+    [0, 255], so a raw request carries the same values as uint8 with the
+    normalization record.
+    """
+    data: Dict[str, Any] = {}
+    for modality, pixel_key, grid_key in (
+        ("image", "pixel_values", "image_grid_thw"),
+        ("video", "pixel_values_videos", "video_grid_thw"),
+    ):
+        mine = [(marker, grid) for m, marker, grid in items if m == modality]
+        if not mine:
+            continue
+        pixels = torch.cat(
+            [
+                (marker * 37 + torch.arange(math.prod(grid) * _QWEN_TEST_ROW_WIDTH))
+                .remainder(256)
+                .reshape(-1, _QWEN_TEST_ROW_WIDTH)
+                for marker, grid in mine
+            ]
+        )
+        data[modality] = {
+            pixel_key: pixels.to(torch.uint8 if raw else torch.float32),
+            grid_key: torch.tensor([grid for _, grid in mine]),
+        }
+        if raw:
+            data[modality]["vision_normalization"] = _QWEN_TEST_NORMALIZATION
+    return _qwen_attach_item_metadata(data, [modality for modality, _, _ in items])
+
+
+def _assert_same_tensors(actual: tuple, expected: tuple) -> None:
+    assert len(actual) == len(expected)
+    for a, b in zip(actual, expected):
+        assert torch.equal(a, b)
+        assert a.dtype == b.dtype and a.device == b.device
+
+
+def _legacy_qwen3vl_build_batched_input(
+    multimodal_params: List[MultimodalParams],
+) -> Dict[str, Any]:
+    """Copy of `_qwen3vl_build_batched_input`, the packing this change replaced."""
+    pixels: list[torch.Tensor] = []
+    grids: list[torch.Tensor] = []
+    for m, pv_key, thw_key in (
+        ("image", "pixel_values", "image_grid_thw"),
+        ("video", "pixel_values_videos", "video_grid_thw"),
+    ):
+        for mp in multimodal_params:
+            bucket = mp.multimodal_data.get(m)
+            if bucket is not None:
+                if bucket[pv_key].dtype not in (
+                    torch.uint8,
+                    torch.float16,
+                    torch.bfloat16,
+                    torch.float32,
+                ):
+                    raise ValueError(f"Unsupported pixel dtype: {bucket[pv_key].dtype}")
+                pixel_values = bucket[pv_key]
+                if pixel_values.dtype == torch.uint8:
+                    # Normalize each raw bucket before concatenation can promote its dtype.
+                    shape = pixel_values.shape
+                    pixel_values = normalize_vision_pixels(
+                        pixel_values.view(-1, 3, shape[-1] // 3), bucket["vision_normalization"]
+                    ).view(shape)
+                pixels.append(pixel_values)
+                grids.append(bucket[thw_key])
+    return {
+        "pixel_values": torch.cat(pixels, dim=0),
+        "grid_thw": torch.cat(grids, dim=0),
+    }
+
+
+def _legacy_qwen3vl_encode_batched(
+    self, pixel_values: torch.Tensor, grid_thw: torch.Tensor
+) -> torch.Tensor:
+    """Copy of the `Qwen3VisionModelBase.encode_batched` body this change replaced."""
+    if pixel_values.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise ValueError(f"Unsupported pixel dtype: {pixel_values.dtype}")
+    pixel_values = pixel_values.to(self.model_dtype)
+    embeds, deepstack = self.visual(pixel_values, grid_thw=grid_thw)
+    # Shape: [seq_len, hidden_dim * (num_deepstack_layers + 1)]
+    return torch.cat([embeds] + deepstack, dim=1)
+
+
+class _Qwen3StubVisual:
+    """Stands in for the ViT and records its inputs. Each output row sums one
+    block of 4 patch rows (merge size 2), so a row depends only on its item."""
+
+    def __init__(self) -> None:
+        self.inputs: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def __call__(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor):
+        self.inputs.append((pixel_values, grid_thw))
+        assert int(grid_thw.prod(dim=-1).sum()) == pixel_values.shape[0]
+        merged = pixel_values.reshape(-1, 4, pixel_values.shape[-1]).sum(dim=1)
+        return merged, [merged.flip(-1)]
+
+
+def _qwen3_vision_encoders(model_dtype: torch.dtype = torch.float32):
+    """The real Qwen3-VL group and encoder on a CPU object, next to the legacy packing."""
+    new = SimpleNamespace(model_dtype=model_dtype, visual=_Qwen3StubVisual(), calls=[])
+
+    def encode_batched(**inputs):
+        new.calls.append(inputs)
+        return Qwen3VisionModelBase.encode_batched(new, **inputs)
+
+    new.encode_batched = encode_batched
+    new.mm_encoder_groups = Qwen3VisionModelBase.mm_encoder_groups.fget(new)
+    legacy = SimpleNamespace(model_dtype=model_dtype, visual=_Qwen3StubVisual())
+    legacy.mm_encoder_groups = (
+        EncoderGroup(
+            ("image", "video"),
+            partial(_legacy_qwen3vl_encode_batched, legacy),
+            _legacy_qwen3vl_build_batched_input,
+        ),
+    )
+    return new, legacy
+
+
+def _qwen3_encode(vision, params: List[MultimodalParams]) -> torch.Tensor:
+    with torch.inference_mode():
+        (out,) = Qwen3VisionModelBase.forward(vision, params)
+    return out
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("raw", [False, True], ids=["normalized", "raw_uint8"])
+@pytest.mark.parametrize("batch", list(_QWEN_VISION_BATCHES))
+def test_qwen3_vision_group_matches_legacy_packing(batch: str, raw: bool) -> None:
+    params = [_qwen_vision_request(items, raw=raw) for items in _QWEN_VISION_BATCHES[batch]]
+    new, legacy = _qwen3_vision_encoders()
+
+    batched = _qwen3_encode(new, params)
+    expected = _qwen3_encode(legacy, params)
+
+    # One ViT call with the legacy input: image rows, then video rows, normalized.
+    assert len(new.calls) == len(new.visual.inputs) == len(legacy.visual.inputs) == 1
+    _assert_same_tensors(new.visual.inputs[0], legacy.visual.inputs[0])
+    assert new.calls[0].get("vision_normalization") == (_QWEN_TEST_NORMALIZATION if raw else None)
+    assert torch.equal(batched, expected)
+    per_request = torch.cat([_qwen3_encode(new, [param]) for param in params])
+    assert torch.equal(batched, per_request)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("raw", [False, True], ids=["normalized", "raw_uint8"])
+def test_qwen3_vision_group_encodes_selected_items(raw: bool) -> None:
+    # Item scheduling and partial cache hits encode views of selected items.
+    request = _qwen_vision_request(
+        [
+            ("image", 1, (1, 2, 2)),
+            ("video", 2, (2, 2, 2)),
+            ("image", 3, (1, 2, 4)),
+            ("image", 4, (1, 4, 2)),
+        ],
+        raw=raw,
+    )
+    other = _qwen_vision_request([("image", 5, (1, 2, 2))], raw=raw)
+    selected = [(request, 3), (request, 2), (request, 1), (other, 0)]
+    residuals = [
+        residual
+        for residual, _, _ in MultimodalModelMixin().prepare_multimodal_encoder_inputs(selected)
+    ]
+    new, legacy = _qwen3_vision_encoders()
+
+    batched = _qwen3_encode(new, residuals)
+    expected = _qwen3_encode(legacy, residuals)
+
+    assert len(new.visual.inputs) == len(legacy.visual.inputs) == 1
+    _assert_same_tensors(new.visual.inputs[0], legacy.visual.inputs[0])
+    assert torch.equal(batched, expected)
+    # The selected items get the rows they get inside their full requests.
+    full = {}
+    for param in (request, other):
+        rows = _qwen3_encode(new, [param]).split(param.item_metadata.output_embedding_lengths)
+        full[id(param)] = rows
+    assert torch.equal(batched, torch.cat([full[id(param)][i] for param, i in selected]))
+
+
+@pytest.mark.cpu_only
+def test_qwen3_vision_group_splits_different_normalization_records() -> None:
+    other_record = _QWEN_TEST_NORMALIZATION._replace(image_mean=(0.5, 0.5, 0.5))
+    params = [
+        _qwen_vision_request([("image", 1, (1, 2, 2))], raw=True),
+        _qwen_vision_request([("image", 2, (1, 2, 4)), ("video", 3, (2, 2, 2))], raw=True),
+    ]
+    params[1].multimodal_data["image"]["vision_normalization"] = other_record
+    new, legacy = _qwen3_vision_encoders()
+
+    batched = _qwen3_encode(new, params)
+    expected = _qwen3_encode(legacy, params)
+
+    # Payloads with different records are encoded apart, then put back in order.
+    assert [call["vision_normalization"] for call in new.calls] == [
+        _QWEN_TEST_NORMALIZATION,
+        other_record,
+    ]
+    assert len(legacy.visual.inputs) == 1
+    assert torch.equal(batched, expected)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "mm_counts", [{"image": 2}, {"video": 2}, {"video": 1, "image": 2}], ids=str
+)
+def test_qwen3_vision_profiling_dummy_encodes_through_the_group(mm_counts: dict) -> None:
+    class Processor(Qwen3VLInputProcessorBase):
+        def _get_dummy_grid_for_modality(self, modality: str, max_num_encoder_tokens: int):
+            return {"image": (1, 2, 4), "video": (2, 2, 4)}[modality]
+
+    processor = object.__new__(Processor)
+    processor._config = SimpleNamespace(
+        vision_config=SimpleNamespace(
+            spatial_merge_size=2, patch_size=1, in_channels=_QWEN_TEST_ROW_WIDTH
+        )
+    )
+    params = [
+        MultimodalParams(
+            multimodal_data=processor.get_dummy_mm_data(
+                max_num_encoder_tokens=64, mm_counts=mm_counts, dtype=torch.float32
+            )
+        )
+    ]
+    new, legacy = _qwen3_vision_encoders()
+
+    batched = _qwen3_encode(new, params)
+
+    assert batched.shape[0] == sum(params[0].item_metadata.output_embedding_lengths)
+    assert torch.equal(batched, _qwen3_encode(legacy, params))
+    assert len(new.visual.inputs) == 1
+
+
+@pytest.mark.cpu_only
+def test_qwen3_vision_encoders_take_the_declared_keys() -> None:
+    from tensorrt_llm._torch.models.modeling_cosmos3_edge import Cosmos3EdgeVisionEncoder
+
+    metadata = _qwen_vision_request(
+        [("image", 1, (1, 2, 2)), ("video", 2, (2, 2, 2))]
+    ).item_metadata
+    declared = set(metadata.input_partitions["image"]) | set(metadata.input_partitions["video"])
+    for encoder in (Qwen3VisionModelBase, Cosmos3EdgeVisionEncoder):
+        parameters = inspect.signature(encoder.encode_batched).parameters
+        assert set(parameters) - {"self"} == declared, encoder.__name__
+
+
+# Qwen2-VL and Qwen2.5-VL (also Exaone4.5) use the same requests; the
+# `_legacy_qwen2vl_*` oracles copy the packing and forward that their encoder group
+# replaced.
+
+
+def _legacy_qwen2vl_parse_and_batch_multimodal_data(
+    multimodal_params: List[MultimodalParams],
+) -> Tuple[Dict[str, Any], Dict[str, List[Any]]]:
+    """Copy of the `Qwen2VisionModelBase._parse_and_batch_multimodal_data` body this change
+    replaced."""
+    pixel_values_list = []
+    pixel_values_videos_list = []
+    image_grid_thw_list = []
+    video_grid_thw_list = []
+
+    for multimodal_param in multimodal_params:
+        # Process images if present
+        if multimodal_param.multimodal_data.get("image") is not None:
+            pixel_values_list.append(multimodal_param.multimodal_data["image"]["pixel_values"])
+            image_grid_thw_list.append(multimodal_param.multimodal_data["image"]["image_grid_thw"])
+
+        # Process videos if present
+        if multimodal_param.multimodal_data.get("video") is not None:
+            pixel_values_videos_list.append(
+                multimodal_param.multimodal_data["video"]["pixel_values_videos"]
+            )
+            video_grid_thw_list.append(multimodal_param.multimodal_data["video"]["video_grid_thw"])
+
+    # Concatenate tensors
+    mm_content_dict = {}
+    if pixel_values_list:
+        mm_content_dict["pixel_values"] = (
+            torch.cat(pixel_values_list, dim=0)
+            if len(pixel_values_list) > 1
+            else pixel_values_list[0]
+        )
+    if pixel_values_videos_list:
+        mm_content_dict["pixel_values_videos"] = (
+            torch.cat(pixel_values_videos_list, dim=0)
+            if len(pixel_values_videos_list) > 1
+            else pixel_values_videos_list[0]
+        )
+
+    # Prepare extra data
+    mm_extra_data = {}
+    if image_grid_thw_list:
+        mm_extra_data["image_grid_thw"] = (
+            torch.cat(image_grid_thw_list, dim=0)
+            if len(image_grid_thw_list) > 1
+            else image_grid_thw_list[0]
+        )
+    if video_grid_thw_list:
+        mm_extra_data["video_grid_thw"] = (
+            torch.cat(video_grid_thw_list, dim=0)
+            if len(video_grid_thw_list) > 1
+            else video_grid_thw_list[0]
+        )
+
+    return mm_content_dict, mm_extra_data
+
+
+def _legacy_qwen2vl_vision_forward(
+    visual, multimodal_params: List[MultimodalParams]
+) -> List[torch.Tensor]:
+    """Copy of the `Qwen2VisionModelBase.forward` body this change replaced: one ViT
+    call per modality, image rows then video rows."""
+    mm_content_data, mm_extra_data = _legacy_qwen2vl_parse_and_batch_multimodal_data(
+        multimodal_params
+    )
+    pixel_values = mm_content_data.get("pixel_values", None)
+    pixel_values_videos = mm_content_data.get("pixel_values_videos", None)
+
+    image_grid_thw = mm_extra_data.get("image_grid_thw", None)
+    video_grid_thw = mm_extra_data.get("video_grid_thw", None)
+
+    embeds = []
+    if pixel_values is not None:
+        embed = visual(pixel_values, grid_thw=image_grid_thw)
+        if isinstance(embed, BaseModelOutputWithPooling):
+            embed = embed.pooler_output
+        embeds.append(embed)
+
+    if pixel_values_videos is not None:
+        embed = visual(pixel_values_videos, grid_thw=video_grid_thw)
+        if isinstance(embed, BaseModelOutputWithPooling):
+            embed = embed.pooler_output
+        embeds.append(embed)
+    return embeds
+
+
+class _Qwen2StubVisual:
+    """Stands in for the Qwen2-VL ViT and records its inputs. Each output row
+    sums one block of 4 patch rows, so a row depends only on its item."""
+
+    def __init__(self) -> None:
+        self.inputs: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def __call__(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor):
+        self.inputs.append((pixel_values, grid_thw))
+        assert int(grid_thw.prod(dim=-1).sum()) == pixel_values.shape[0]
+        merged = pixel_values.reshape(-1, 4, pixel_values.shape[-1]).sum(dim=1)
+        return BaseModelOutputWithPooling(last_hidden_state=pixel_values, pooler_output=merged)
+
+
+def _qwen2_tiny_hf_visual() -> Qwen2VisionTransformerPretrainedModel:
+    """A random-weight HF Qwen2-VL ViT, small enough for the CPU (fp32, eager attention)."""
+    config = Qwen2VLVisionConfig(
+        depth=2,
+        embed_dim=32,
+        hidden_size=16,
+        mlp_ratio=2,
+        num_heads=2,
+        in_channels=3,
+        patch_size=1,
+        spatial_merge_size=2,
+        temporal_patch_size=_QWEN_TEST_ROW_WIDTH // 3,
+    )
+    config._attn_implementation = "eager"
+    torch.manual_seed(0)
+    return Qwen2VisionTransformerPretrainedModel(config).eval()
+
+
+def _qwen2_vision_encoder(visual) -> SimpleNamespace:
+    """The real Qwen2-VL group and encoder bound to `visual` on a CPU object."""
+    vision = SimpleNamespace(visual=visual, calls=[])
+
+    def encode_batched(**inputs):
+        vision.calls.append(inputs)
+        return modeling_qwen2vl.Qwen2VisionModelBase.encode_batched(vision, **inputs)
+
+    vision.encode_batched = encode_batched
+    vision.mm_encoder_groups = modeling_qwen2vl.Qwen2VisionModelBase.mm_encoder_groups.fget(vision)
+    return vision
+
+
+def _qwen2_encode(vision: SimpleNamespace, params: List[MultimodalParams]) -> List[torch.Tensor]:
+    with torch.inference_mode():
+        return modeling_qwen2vl.Qwen2VisionModelBase.forward(vision, params)
+
+
+def _legacy_qwen2_encode(visual, params: List[MultimodalParams]) -> List[torch.Tensor]:
+    with torch.inference_mode():
+        return _legacy_qwen2vl_vision_forward(visual, params)
+
+
+def _qwen2_per_item_rows(visual, requests: list) -> torch.Tensor:
+    """The legacy encoder on one item at a time; a request's rows are its items in prompt order."""
+    return torch.cat(
+        [
+            _legacy_qwen2_encode(visual, [_qwen_vision_request([item])])[0]
+            for items in requests
+            for item in items
+        ]
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("batch", list(_QWEN_VISION_BATCHES))
+def test_qwen2_vision_group_matches_legacy_packer(batch: str) -> None:
+    requests = _QWEN_VISION_BATCHES[batch]
+    params = [_qwen_vision_request(items) for items in requests]
+    visual, legacy_visual = _Qwen2StubVisual(), _Qwen2StubVisual()
+
+    batched = _qwen2_encode(_qwen2_vision_encoder(visual), params)
+    legacy = _legacy_qwen2_encode(legacy_visual, params)
+
+    # The legacy forward called the ViT once per modality, image rows first. The group concatenates
+    # the same tensors for one call and returns one tensor.
+    assert len(batched) == 1 and len(visual.inputs) == 1
+    _assert_same_tensors(
+        visual.inputs[0], tuple(torch.cat(parts) for parts in zip(*legacy_visual.inputs))
+    )
+    if len(legacy) == 1:
+        # With one modality, the legacy rows were already in request, then prompt order.
+        assert torch.equal(batched[0], legacy[0])
+    assert torch.equal(batched[0], _qwen2_per_item_rows(_Qwen2StubVisual(), requests))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("batch", list(_QWEN_VISION_BATCHES))
+def test_qwen2_vision_hf_tower_batched_matches_per_item(batch: str) -> None:
+    requests = _QWEN_VISION_BATCHES[batch]
+    params = [_qwen_vision_request(items) for items in requests]
+    visual = _qwen2_tiny_hf_visual()
+    vision = _qwen2_vision_encoder(visual)
+
+    (batched,) = _qwen2_encode(vision, params)
+    legacy = _legacy_qwen2_encode(visual, params)
+
+    assert len(vision.calls) == 1
+    if len(legacy) == 1:
+        # Same ViT input as the legacy forward in one call, so the same rows.
+        assert torch.equal(batched, legacy[0])
+    # Batching changes only the GEMM shapes, so only the floating-point order differs.
+    torch.testing.assert_close(
+        batched, _qwen2_per_item_rows(visual, requests), rtol=1e-5, atol=1e-5
+    )
+
+
+@pytest.mark.cpu_only
+def test_qwen2_vision_group_encodes_selected_items() -> None:
+    # Item scheduling and partial cache hits encode views of selected items.
+    request = _qwen_vision_request(
+        [
+            ("image", 1, (1, 2, 2)),
+            ("video", 2, (2, 2, 2)),
+            ("image", 3, (1, 2, 4)),
+            ("image", 4, (1, 4, 2)),
+        ]
+    )
+    other = _qwen_vision_request([("image", 5, (1, 2, 2))])
+    selected = [(request, 3), (request, 2), (request, 1), (other, 0)]
+    residuals = [
+        residual
+        for residual, _, _ in MultimodalModelMixin().prepare_multimodal_encoder_inputs(selected)
+    ]
+    visual, legacy_visual = _Qwen2StubVisual(), _Qwen2StubVisual()
+
+    (batched,) = _qwen2_encode(_qwen2_vision_encoder(visual), residuals)
+    _legacy_qwen2_encode(legacy_visual, residuals)
+
+    assert len(visual.inputs) == 1
+    _assert_same_tensors(
+        visual.inputs[0], tuple(torch.cat(parts) for parts in zip(*legacy_visual.inputs))
+    )
+    # The selected items get the rows they get inside their full requests.
+    vision = _qwen2_vision_encoder(_Qwen2StubVisual())
+    full = {
+        id(param): _qwen2_encode(vision, [param])[0].split(
+            param.item_metadata.output_embedding_lengths
+        )
+        for param in (request, other)
+    }
+    assert torch.equal(batched, torch.cat([full[id(param)][i] for param, i in selected]))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "mm_counts", [{"image": 2}, {"video": 2}, {"video": 1, "image": 2}], ids=str
+)
+def test_qwen2_vision_profiling_dummy_encodes_through_the_group(mm_counts: dict) -> None:
+    class Processor(modeling_qwen2vl.Qwen2_5VLInputProcessorBase):
+        def _get_dummy_grid_for_modality(self, modality: str, max_num_encoder_tokens: int):
+            return {"image": (1, 2, 4), "video": (2, 2, 4)}[modality]
+
+    processor = object.__new__(Processor)
+    processor._config = SimpleNamespace(
+        vision_config=SimpleNamespace(
+            spatial_merge_size=2, patch_size=1, in_channels=_QWEN_TEST_ROW_WIDTH
+        )
+    )
+    params = [
+        MultimodalParams(
+            multimodal_data=processor.get_dummy_mm_data(
+                max_num_encoder_tokens=64, mm_counts=mm_counts, dtype=torch.float32
+            )
+        )
+    ]
+    visual = _Qwen2StubVisual()
+
+    (batched,) = _qwen2_encode(_qwen2_vision_encoder(visual), params)
+
+    assert len(visual.inputs) == 1
+    assert batched.shape[0] == sum(params[0].item_metadata.output_embedding_lengths)
+
+
+@pytest.mark.cpu_only
+def test_qwen2_vision_encoders_take_the_declared_keys() -> None:
+    from tensorrt_llm._torch.models.modeling_exaone4_5 import Exaone4_5_VisionModel
+
+    metadata = _qwen_vision_request(
+        [("image", 1, (1, 2, 2)), ("video", 2, (2, 2, 2))]
+    ).item_metadata
+    declared = set(metadata.input_partitions["image"]) | set(metadata.input_partitions["video"])
+    for encoder in (modeling_qwen2vl.Qwen2VisionModelBase, Exaone4_5_VisionModel):
+        parameters = inspect.signature(encoder.encode_batched).parameters
+        assert set(parameters) - {"self"} == declared, encoder.__name__
+        assert encoder.mm_encoder_groups is modeling_qwen2vl.Qwen2VisionModelBase.mm_encoder_groups
+
+
+@pytest.mark.cpu_only
+def test_qwen_vision_encoders_move_the_media_their_model_lists() -> None:
+    """Each Qwen encoder moves in its call exactly the media paths its model leaves to it."""
+    from tensorrt_llm._torch.models.modeling_cosmos3_edge import Cosmos3EdgeModel
+    from tensorrt_llm._torch.models.modeling_exaone4_5 import Exaone4_5_ForConditionalGeneration
+    from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
+    from tensorrt_llm._torch.models.modeling_qwen3vl_moe import Qwen3MoeVLModel
+
+    class _NativeTower(torch.nn.Module, MultimodalEncoderMixin):
+        pass
+
+    native = modeling_qwen2vl._qwen_encoder_device_paths(_NativeTower())
+    hf = modeling_qwen2vl._qwen_encoder_device_paths(torch.nn.Module())
+    assert set(hf) - set(native) == {"image.image_grid_thw", "video.video_grid_thw"}
+
+    def media(paths):
+        return {path for path in paths if path.split(".")[0] in ("image", "video")}
+
+    # (model, its tower type): Qwen2-VL keeps the HF tower; the others are native.
+    for model, encoder_paths in (
+        (modeling_qwen2vl.Qwen2VLModel, hf),
+        (modeling_qwen2vl.Qwen2_5_VLModel, native),
+        (Exaone4_5_ForConditionalGeneration, native),
+        (modeling_qwen3vl.Qwen3VLModel, native),
+        (Qwen3MoeVLModel, native),
+        (Cosmos3EdgeModel, native),
+    ):
+        model_paths = model.multimodal_data_device_paths.fget(None)
+        assert media(model_paths) == media(encoder_paths), model.__name__
+    for encoder in (
+        modeling_qwen2vl.Qwen2VisionModelBase,
+        modeling_qwen3vl.Qwen3VisionModelBase,
+    ):
+        vision = SimpleNamespace(visual=_NativeTower())
+        assert encoder.multimodal_data_device_paths.fget(vision) == native
+        (group,) = encoder.mm_encoder_groups.fget(SimpleNamespace(encode_batched=None))
+        assert group.batch_as == {
+            "pixel_values_videos": "pixel_values",
+            "video_grid_thw": "image_grid_thw",
+        }
 
 
 @pytest.mark.cpu_only
@@ -1950,34 +2576,46 @@ def test_normalization_mixed_raw_and_float_batches(dtype: torch.dtype) -> None:
         "all_values", "video", dtype, False
     )
     grid = torch.tensor([[1, 2, 2]])
+
+    def request(image, video) -> MultimodalParams:
+        data = {
+            "image": {"pixel_values": image[0], "image_grid_thw": grid},
+            "video": {"pixel_values_videos": video[0], "video_grid_thw": grid},
+        }
+        for modality, (_, normalization) in (("image", image), ("video", video)):
+            if normalization is not None:
+                data[modality]["vision_normalization"] = normalization
+        return _qwen_attach_item_metadata(data, ["image", "video"])
+
     params = [
-        MultimodalParams(
-            multimodal_data={
-                "image": {
-                    "pixel_values": raw,
-                    "image_grid_thw": grid,
-                    "vision_normalization": spec,
-                },
-                "video": {"pixel_values_videos": expected_video, "video_grid_thw": grid},
-            }
-        ),
-        MultimodalParams(
-            multimodal_data={
-                "image": {"pixel_values": expected, "image_grid_thw": grid},
-                "video": {
-                    "pixel_values_videos": raw_video,
-                    "video_grid_thw": grid,
-                    "vision_normalization": video_spec,
-                },
-            }
-        ),
+        request((raw, spec), (expected_video, None)),
+        request((expected, None), (raw_video, video_spec)),
     ]
-    batched = modeling_qwen3vl._qwen3vl_build_batched_input(params)
-    assert batched["pixel_values"].dtype == dtype
+    new, legacy = _qwen3_vision_encoders(model_dtype=dtype)
+
+    batched = _qwen3_encode(new, params)
+
+    # The legacy builder normalized each raw payload with its own record before concatenating them.
+    legacy_input = _legacy_qwen3vl_build_batched_input(params)["pixel_values"]
     assert torch.equal(
-        batched["pixel_values"], torch.cat([expected, expected, expected_video, expected_video])
+        legacy_input, torch.cat([expected, expected, expected_video, expected_video])
     )
-    assert torch.equal(batched["grid_thw"], grid.repeat(4, 1))
+    assert legacy_input.dtype == dtype
+    # Video rows are batched after the image rows under one key, so raw and normalized
+    # pixels, and different records, encode apart; each call holds one record, and the
+    # rows return in prompt order.
+    assert [call.get("vision_normalization") for call in new.calls] == [spec, None, video_spec]
+    assert [call["pixel_values"].dtype for call in new.calls] == [torch.uint8, dtype, torch.uint8]
+    assert all("pixel_values_videos" not in call for call in new.calls)
+    expected_inputs = [expected, torch.cat([expected, expected_video]), expected_video]
+    assert len(new.visual.inputs) == len(expected_inputs)
+    for (pixels, _), expected_pixels in zip(new.visual.inputs, expected_inputs):
+        assert torch.equal(pixels, expected_pixels)
+    assert batched.dtype == dtype
+    assert torch.equal(batched, _qwen3_encode(legacy, params))
+    assert torch.equal(batched, torch.cat([_qwen3_encode(new, [param]) for param in params]))
+    with pytest.raises(ValueError, match="need the processor's vision_normalization"):
+        Qwen3VisionModelBase.encode_batched(new, pixel_values=raw, image_grid_thw=grid)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

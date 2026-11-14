@@ -70,9 +70,12 @@ from .modeling_multimodal_mixin import (
     encode_multimodal_by_groups,
 )
 from .modeling_qwen2vl import (
+    _QWEN_VIDEO_BATCH_AS,
     Qwen2_5_VLVisionAttention,
     Qwen2VLInputProcessorBase,
+    _concat_qwen_vision_inputs,
     _prepare_qwen_vl_mrope_config,
+    _qwen_encoder_device_paths,
     _qwen_vision_item_partitions,
 )
 from .modeling_utils import (
@@ -1473,40 +1476,39 @@ class _Qwen3VisionEncoderMetadataProvider(EncoderMetadataProvider[AttentionMetad
         self._vision.prepare_attn_metadata(list(padded_seq_lengths), metadata)
 
 
-def _qwen3vl_build_batched_input(
-    multimodal_params: list[MultimodalParams],
-) -> dict[str, Any]:
-    """Cat image items then video items across requests (matching the
-    ``EncoderGroup.modalities`` order) into one ViT input."""
-    pixels: list[torch.Tensor] = []
-    grids: list[torch.Tensor] = []
-    for m, pv_key, thw_key in (
-        ("image", "pixel_values", "image_grid_thw"),
-        ("video", "pixel_values_videos", "video_grid_thw"),
-    ):
-        for mp in multimodal_params:
-            bucket = mp.multimodal_data.get(m)
-            if bucket is not None:
-                if bucket[pv_key].dtype not in (
-                    torch.uint8,
-                    torch.float16,
-                    torch.bfloat16,
-                    torch.float32,
-                ):
-                    raise ValueError(f"Unsupported pixel dtype: {bucket[pv_key].dtype}")
-                pixel_values = bucket[pv_key]
-                if pixel_values.dtype == torch.uint8:
-                    # Normalize each raw bucket before concatenation can promote its dtype.
-                    shape = pixel_values.shape
-                    pixel_values = normalize_vision_pixels(
-                        pixel_values.view(-1, 3, shape[-1] // 3), bucket["vision_normalization"]
-                    ).view(shape)
-                pixels.append(pixel_values)
-                grids.append(bucket[thw_key])
-    return {
-        "pixel_values": torch.cat(pixels, dim=0),
-        "grid_thw": torch.cat(grids, dim=0),
-    }
+def _qwen3vl_vision_input(
+    pixel_values: Optional[torch.Tensor] = None,
+    image_grid_thw: Optional[torch.Tensor] = None,
+    pixel_values_videos: Optional[torch.Tensor] = None,
+    video_grid_thw: Optional[torch.Tensor] = None,
+    vision_normalization: Optional[VisionNormalization] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Build one ViT input from the encoder group's batched payload keys.
+
+    The encoder group batches video rows after the image rows (``batch_as``),
+    so a call normally passes only the image keys. Raw uint8 rows are
+    normalized with the processor's record; the group encodes payloads apart
+    when their pixel dtype or record differs, so one record serves every raw
+    row of a call, and image and video rows cannot promote each other's dtype.
+    """
+
+    def prepare(pixels: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if pixels is None:
+            return None
+        if pixels.dtype not in (torch.uint8, torch.float16, torch.bfloat16, torch.float32):
+            raise ValueError(f"Unsupported pixel dtype: {pixels.dtype}")
+        if pixels.dtype != torch.uint8:
+            return pixels
+        if vision_normalization is None:
+            raise ValueError("Raw uint8 pixels need the processor's vision_normalization")
+        shape = pixels.shape
+        return normalize_vision_pixels(
+            pixels.view(-1, 3, shape[-1] // 3), vision_normalization
+        ).view(shape)
+
+    return _concat_qwen_vision_inputs(
+        prepare(pixel_values), image_grid_thw, prepare(pixel_values_videos), video_grid_thw
+    )
 
 
 class Qwen3VisionModelBase(nn.Module):
@@ -1572,15 +1574,24 @@ class Qwen3VisionModelBase(nn.Module):
     @torch.inference_mode()
     def encode_batched(
         self,
-        pixel_values: torch.Tensor,
-        grid_thw: torch.Tensor,
+        pixel_values: Optional[torch.Tensor] = None,
+        image_grid_thw: Optional[torch.Tensor] = None,
+        pixel_values_videos: Optional[torch.Tensor] = None,
+        video_grid_thw: Optional[torch.Tensor] = None,
+        vision_normalization: Optional[VisionNormalization] = None,
+        second_per_grid_ts: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Run the ViT on one concat'd batch and fold deepstack streams into
-        the hidden dim. Modality-agnostic — image and video items are
-        distinguished only by ``grid_thw`` rows (image ``t=1``, video ``t>1``).
+        """Run the ViT on one batch and fold deepstack streams into the hidden
+        dim.
+
+        Takes the payload keys the encoder group batched across requests.
+        Image rows come first, then video rows; the ViT tells them apart only
+        by their grid rows (image ``t=1``, video ``t>1``).
+        ``second_per_grid_ts`` is declared for item scheduling and unused here.
         """
-        if pixel_values.dtype not in (torch.float16, torch.bfloat16, torch.float32):
-            raise ValueError(f"Unsupported pixel dtype: {pixel_values.dtype}")
+        pixel_values, grid_thw = _qwen3vl_vision_input(
+            pixel_values, image_grid_thw, pixel_values_videos, video_grid_thw, vision_normalization
+        )
         pixel_values = pixel_values.to(self.model_dtype)
         embeds, deepstack = self.visual(pixel_values, grid_thw=grid_thw)
         # Shape: [seq_len, hidden_dim * (num_deepstack_layers + 1)]
@@ -1592,16 +1603,22 @@ class Qwen3VisionModelBase(nn.Module):
 
         One modality-blind ViT handles both image and video (image has
         `grid_thw.t==1`, video `t>1`), so both modalities share one call.
-        Both the aggregated path (via `Qwen3VLModelBase.mm_encoder_groups`,
-        which delegates here) and the mm-encoder-only `forward` consume this.
+        The group batches the payload keys the processor declares in the item
+        metadata. Both the aggregated path (via
+        `Qwen3VLModelBase.mm_encoder_groups`, which delegates here) and the
+        mm-encoder-only `forward` consume this.
         """
         return (
             EncoderGroup(
                 modalities=("image", "video"),
                 encoder_fn=self.encode_batched,
-                build_batched_input=_qwen3vl_build_batched_input,
+                batch_as=_QWEN_VIDEO_BATCH_AS,
             ),
         )
+
+    @property
+    def multimodal_data_device_paths(self) -> List[str]:
+        return _qwen_encoder_device_paths(self.visual)
 
     def forward(self, multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
         """Standalone mm-encoder-only executor entry.
@@ -1613,7 +1630,13 @@ class Qwen3VisionModelBase(nn.Module):
         modality-batched ViT the aggregated path uses and applies the
         per-request `item_metadata.item_refs` reorder before returning.
         """
-        return [encode_multimodal_by_groups(self.mm_encoder_groups, multimodal_params)]
+        return [
+            encode_multimodal_by_groups(
+                self.mm_encoder_groups,
+                multimodal_params,
+                getattr(self, "multimodal_data_device_paths", None),
+            )
+        ]
 
 
 class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):

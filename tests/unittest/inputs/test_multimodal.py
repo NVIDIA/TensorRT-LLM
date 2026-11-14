@@ -19,6 +19,7 @@ from tensorrt_llm.inputs.multimodal import (
     MultimodalParams,
     MultimodalRuntimeData,
     _find_mm_embedding_lengths_from_masks,
+    batch_by_item_partitions,
     find_mm_token_lengths,
     select_multimodal_fields,
 )
@@ -155,6 +156,230 @@ def test_item_partition_rejects_out_of_bounds_indices(index: int, packed: bool) 
     values = torch.zeros(6 if packed else 3, 2)
     with pytest.raises(IndexError):
         MultimodalItemPartition(item_lengths=lengths).select(values, [index])
+
+
+def _rows(*markers_and_rows, dtype=torch.float32):
+    """A packed payload: ``rows`` rows holding ``marker`` per item."""
+    return torch.cat(
+        [torch.full((rows, 1), float(marker)) for marker, rows in markers_and_rows]
+    ).to(dtype)
+
+
+class TestBatchByItemPartitions:
+    def test_shared_value_is_returned_once(self):
+        record = ("mean", 0.5)
+        shared = MultimodalItemPartition(item_axis=None)
+        value, partition = batch_by_item_partitions([(record, shared), (("mean", 0.5), shared)])
+        assert value is record
+        assert partition == shared
+
+    def test_one_row_per_item(self):
+        first, second = torch.arange(6.0).reshape(2, 3), torch.arange(3.0).reshape(1, 3) + 10
+        value, partition = batch_by_item_partitions(
+            [(first, MultimodalItemPartition()), (second, MultimodalItemPartition())]
+        )
+        assert torch.equal(value, torch.cat([first, second]))
+        assert partition == MultimodalItemPartition(0, None)
+        assert torch.equal(partition.select(value, [2]), second)
+
+    def test_packed_lengths_are_concatenated(self):
+        first, second = _rows((1, 2), (2, 3)), _rows((3, 4))
+        value, partition = batch_by_item_partitions(
+            [
+                (first, MultimodalItemPartition(item_lengths=(2, 3))),
+                (second, MultimodalItemPartition(item_lengths=(4,))),
+            ]
+        )
+        assert torch.equal(value, torch.cat([first, second]))
+        assert partition == MultimodalItemPartition(0, (2, 3, 4))
+        assert torch.equal(partition.select(value, [1]), _rows((2, 3)))
+
+    def test_ragged_item_dims_are_zero_padded_at_their_end(self):
+        first = torch.arange(30, dtype=torch.float32).reshape(2, 5, 3) + 1
+        second = torch.arange(9, dtype=torch.float32).reshape(1, 3, 3) + 100
+        value, _ = batch_by_item_partitions(
+            [(first, MultimodalItemPartition()), (second, MultimodalItemPartition())]
+        )
+        assert value.shape == (3, 5, 3) and value.dtype == torch.float32
+        assert torch.equal(value[:2], first)
+        assert torch.equal(value[2, :3], second[0])
+        assert torch.equal(value[2, 3:], torch.zeros(2, 3))
+
+    def test_bool_values_are_padded_with_false(self):
+        value, _ = batch_by_item_partitions(
+            [
+                (torch.ones(2, 5, dtype=torch.bool), MultimodalItemPartition()),
+                (torch.ones(1, 3, dtype=torch.bool), MultimodalItemPartition()),
+            ]
+        )
+        assert value.dtype == torch.bool
+        assert value.tolist() == [[True] * 5, [True] * 5, [True] * 3 + [False] * 2]
+
+    def test_ragged_middle_piece_is_padded(self):
+        # The first and last pieces agree, so batching tries a plain concatenation first.
+        value, _ = batch_by_item_partitions(
+            [
+                (torch.full((1, 3), 1.0), MultimodalItemPartition()),
+                (torch.full((1, 2), 2.0), MultimodalItemPartition()),
+                (torch.full((1, 3), 3.0), MultimodalItemPartition()),
+            ]
+        )
+        assert value.tolist() == [[1.0, 1.0, 1.0], [2.0, 2.0, 0.0], [3.0, 3.0, 3.0]]
+
+    def test_padding_value_fills_the_added_entries(self):
+        # Position ids whose -1 marks padding pad with -1, not zero.
+        first = torch.arange(6).reshape(1, 3, 2)
+        second = torch.tensor([[[7, 7], [-1, -1]]])
+        partition = MultimodalItemPartition(padding_value=-1)
+        value, batched = batch_by_item_partitions([(first, partition), (second, partition)])
+        assert value.tolist() == [
+            [[0, 1], [2, 3], [4, 5]],
+            [[7, 7], [-1, -1], [-1, -1]],
+        ]
+        assert batched == MultimodalItemPartition(0, None, -1)
+
+    def test_other_dims_of_a_non_leading_item_axis_are_padded(self):
+        # Audio-like features [mel, frames] packed along the frame axis.
+        first = torch.ones(2, 3)
+        second = torch.full((4, 2), 2.0)
+        value, partition = batch_by_item_partitions(
+            [
+                (first, MultimodalItemPartition(1, (3,))),
+                (second, MultimodalItemPartition(1, (1, 1))),
+            ]
+        )
+        assert value.shape == (4, 5)
+        assert partition == MultimodalItemPartition(1, (3, 1, 1))
+        assert torch.equal(partition.select(value, [0])[:2], first)
+        assert torch.equal(partition.select(value, [0])[2:], torch.zeros(2, 3))
+        assert torch.equal(partition.select(value, [1, 2]), second)
+
+    def test_single_piece(self):
+        piece = _rows((1, 2), (2, 1))
+        value, partition = batch_by_item_partitions(
+            [(piece, MultimodalItemPartition(item_lengths=(2, 1)))]
+        )
+        assert torch.equal(value, piece)
+        assert partition == MultimodalItemPartition(0, (2, 1))
+
+    def test_lists_are_batched_on_item_axis_zero(self):
+        value, partition = batch_by_item_partitions(
+            [([(4, 6), (2, 2)], MultimodalItemPartition()), ([(8, 8)], MultimodalItemPartition())]
+        )
+        assert value == [(4, 6), (2, 2), (8, 8)]
+        assert partition.select(value, [2, 0]) == [(8, 8), (4, 6)]
+
+    @pytest.mark.parametrize(
+        "pieces",
+        [
+            pytest.param(
+                [
+                    (_rows((1, 2), (2, 3)), MultimodalItemPartition(item_lengths=(2, 3))),
+                    (_rows((3, 1)), MultimodalItemPartition(item_lengths=(1,))),
+                    (_rows((4, 2), (5, 2)), MultimodalItemPartition(item_lengths=(2, 2))),
+                ],
+                id="packed",
+            ),
+            pytest.param(
+                [
+                    (torch.arange(4.0).reshape(2, 2), MultimodalItemPartition()),
+                    (torch.arange(6.0).reshape(3, 2), MultimodalItemPartition()),
+                ],
+                id="one_row_per_item",
+            ),
+            pytest.param(
+                [
+                    (torch.arange(6.0).reshape(1, 6), MultimodalItemPartition(1, (2, 4))),
+                    (torch.arange(3.0).reshape(1, 3), MultimodalItemPartition(1, (3,))),
+                ],
+                id="packed_axis_1",
+            ),
+            pytest.param(
+                [(["a", "b"], MultimodalItemPartition()), (("c",), MultimodalItemPartition())],
+                id="list",
+            ),
+        ],
+    )
+    def test_select_returns_each_piece(self, pieces):
+        value, partition = batch_by_item_partitions(pieces)
+        start = 0
+        for piece, piece_partition in pieces:
+            if piece_partition.item_lengths is not None:
+                count = len(piece_partition.item_lengths)
+            elif isinstance(piece, torch.Tensor):
+                count = piece.shape[0]
+            else:
+                count = len(piece)
+            selected = partition.select(value, range(start, start + count))
+            if isinstance(piece, torch.Tensor):
+                assert torch.equal(selected, piece)
+            else:
+                assert list(selected) == list(piece)
+            start += count
+
+    def test_whole_requests_and_single_items_mix(self):
+        # A later item-level cache batches single items next to whole requests.
+        request = _rows((1, 2), (2, 3))
+        other = _rows((3, 1), (4, 2), (5, 3))
+        metadata = MultimodalItemMetadata(
+            [("image", 0), ("image", 1), ("image", 2)],
+            input_partitions={"image": {"pixels": MultimodalItemPartition(item_lengths=(1, 2, 3))}},
+        )
+        item = metadata.select([2])
+        item_partition = item.input_partitions["image"]["pixels"]
+        item_value = metadata.input_partitions["image"]["pixels"].select(other, [2])
+        value, partition = batch_by_item_partitions(
+            [
+                (request, MultimodalItemPartition(item_lengths=(2, 3))),
+                (item_value, item_partition),
+            ]
+        )
+        assert partition == MultimodalItemPartition(0, (2, 3, 3))
+        assert torch.equal(partition.select(value, [2]), _rows((5, 3)))
+        assert torch.equal(partition.select(value, [0, 1]), request)
+
+    def test_pieces_must_share_item_axis_and_dtype(self):
+        with pytest.raises(ValueError, match="share their item axis"):
+            batch_by_item_partitions(
+                [
+                    (torch.zeros(1, 2), MultimodalItemPartition()),
+                    (torch.zeros(1, 2), MultimodalItemPartition(item_axis=None)),
+                ]
+            )
+        with pytest.raises(ValueError, match="share their item axis and padding value"):
+            batch_by_item_partitions(
+                [
+                    (torch.zeros(1, 2), MultimodalItemPartition()),
+                    (torch.zeros(1, 2), MultimodalItemPartition(padding_value=-1)),
+                ]
+            )
+        with pytest.raises(ValueError, match="share dtype and rank"):
+            batch_by_item_partitions(
+                [
+                    (torch.zeros(1, 2), MultimodalItemPartition()),
+                    (torch.zeros(1, 2, dtype=torch.bfloat16), MultimodalItemPartition()),
+                ]
+            )
+        with pytest.raises(ValueError, match="share dtype and rank"):
+            batch_by_item_partitions(
+                [
+                    (torch.zeros(1, 2), MultimodalItemPartition()),
+                    (torch.zeros(1, 2, 1), MultimodalItemPartition()),
+                ]
+            )
+        with pytest.raises(ValueError, match="share dtype and rank"):
+            # torch.cat alone would accept the empty 1-D piece and return two rows.
+            batch_by_item_partitions(
+                [
+                    (torch.ones(1, 2), MultimodalItemPartition()),
+                    (torch.empty(0), MultimodalItemPartition()),
+                    (torch.ones(1, 2), MultimodalItemPartition()),
+                ]
+            )
+        with pytest.raises(ValueError, match="does not match its item lengths"):
+            batch_by_item_partitions([(torch.zeros(3, 2), MultimodalItemPartition(0, (1, 1)))])
+        with pytest.raises(ValueError, match="at least one piece"):
+            batch_by_item_partitions([])
 
 
 def test_media_modalities_match_io_and_validation_contract() -> None:
@@ -295,6 +520,18 @@ def test_mm_item_metadata_selection_rebases_refs_without_mutating_source(
     assert metadata.encoder_token_lengths == (20, 50, 30, 40)
     assert metadata.output_embedding_lengths == (2, 5, 3, 4)
     assert subset is not metadata
+
+
+@pytest.mark.parametrize("indices", [[1], [1, 0]], ids=["one_item", "items"])
+def test_item_metadata_selection_keeps_padding_values(indices) -> None:
+    padded = MultimodalItemPartition(item_lengths=(2, 3), padding_value=-1)
+    metadata = MultimodalItemMetadata(
+        [("image", 0), ("image", 1)],
+        input_partitions={"image": {"positions": padded}},
+    )
+    selected = metadata.select(indices).input_partitions["image"]["positions"]
+    assert selected.padding_value == -1
+    assert selected.item_lengths == tuple(padded.item_lengths[i] for i in indices)
 
 
 @pytest.mark.parametrize("indices", [[3, 0, 2], [2, 0], [-1, 0], [], [1, 1]])

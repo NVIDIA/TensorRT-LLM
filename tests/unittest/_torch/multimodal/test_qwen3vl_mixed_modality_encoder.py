@@ -2,23 +2,23 @@
 # SPDX-License-Identifier: Apache-2.0
 """Encoder-level tests for Qwen3-VL through the generic mm-encoder-group path.
 
-Wires an `EncoderGroup` around a stub `encode_batched` marker function and
-drives the shared `encode_multimodal_by_groups` helper directly. Asserts that
+Binds the real Qwen3-VL `EncoderGroup` to a stub `encode_batched` marker
+function and drives the shared `encode_multimodal_by_groups` helper directly.
+Requests declare their input partitions as the Qwen processor does. Asserts that
 mixed image+video requests, heterogeneous single-modality batches, and
 cross-request batching all produce prompt-order embeddings via one ViT call.
 The same helper is what `Qwen3VisionModelBase.forward` (the mm-encoder-only
 disagg entrypoint) delegates to, so this suite covers both paths.
 """
 
+from types import SimpleNamespace
 from typing import Optional
 
 import torch
 
-from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
-    EncoderGroup,
-    encode_multimodal_by_groups,
-)
-from tensorrt_llm._torch.models.modeling_qwen3vl import _qwen3vl_build_batched_input
+from tensorrt_llm._torch.models.modeling_multimodal_mixin import encode_multimodal_by_groups
+from tensorrt_llm._torch.models.modeling_qwen2vl import _qwen_vision_input_partitions
+from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VisionModelBase, _qwen3vl_vision_input
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalItemMetadata,
@@ -26,18 +26,20 @@ from tensorrt_llm.inputs.multimodal import (
 )
 
 
-def _encode_batched(pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
+def _encode_batched(**inputs) -> torch.Tensor:
     """Marker encoder: one output row per input patch, marker propagates via
     column 0. Emulates a modality-blind ViT with no compression."""
+    pixel_values, _ = _qwen3vl_vision_input(
+        inputs.get("pixel_values"),
+        inputs.get("image_grid_thw"),
+        inputs.get("pixel_values_videos"),
+        inputs.get("video_grid_thw"),
+    )
     return pixel_values.clone().repeat(1, 2)  # widen to hidden=marker_dim*2
 
 
-_QWEN3VL_ENCODER_GROUPS = (
-    EncoderGroup(
-        modalities=("image", "video"),
-        encoder_fn=_encode_batched,
-        build_batched_input=_qwen3vl_build_batched_input,
-    ),
+_QWEN3VL_ENCODER_GROUPS = Qwen3VisionModelBase.mm_encoder_groups.fget(
+    SimpleNamespace(encode_batched=_encode_batched)
 )
 
 
@@ -58,9 +60,13 @@ def _param(
             if order
             else [(next(iter(data)), i) for i in range(len(lengths))]
         )
-        data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(
-            refs, output_embedding_lengths=lengths
-        )
+        metadata = MultimodalItemMetadata(refs, output_embedding_lengths=lengths)
+        for modality in ("image", "video"):
+            if modality in data:
+                metadata.input_partitions[modality] = _qwen_vision_input_partitions(
+                    data, modality, metadata
+                )
+        data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = metadata
     return MultimodalParams(multimodal_data=data)
 
 
@@ -166,7 +172,7 @@ def test_heterogeneous_batch_image_only_and_video_only() -> None:
 
 def test_heterogeneous_batch_video_first_then_image() -> None:
     """Reviewer's mm-encoder-only regression case: `[video-only req0,
-    image-only req1]`. `_qwen3vl_build_batched_input` concatenates images
+    image-only req1]`. The Qwen3-VL encoder group concatenates images
     across requests first, then videos, so without prompt-order reordering
     the encoder output would be `[img(req1), vid(req0)]` — request-ordered
     downstream splits would then hand each request the other's rows.

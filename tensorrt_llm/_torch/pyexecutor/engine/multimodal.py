@@ -19,6 +19,7 @@ from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEnc
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     MultimodalEncoderContractError,
     MultimodalModelMixin,
+    request_device_paths,
 )
 from tensorrt_llm._torch.models.modeling_multimodal_utils import _join_embeddings
 from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
@@ -574,12 +575,15 @@ class MultimodalItemScheduler:
             raise MultimodalEncoderRequestError(
                 str(error), request_ids=producer_request_ids
             ) from error
+        # Raw media of default-builder models goes to the GPU in the encoder call, as one
+        # batch of the selected items; only the other device paths move per input here.
+        device_paths = request_device_paths(self.model) if encoder_inputs else None
         for encoder_input, _, _ in encoder_inputs:
             encoder_input.to_device(
                 "multimodal_data",
                 "cuda",
                 pin_memory=prefer_pinned(),
-                target_keywords=getattr(self.model, "multimodal_data_device_paths", None),
+                target_keywords=device_paths,
             )
 
         # The vision tower runs outside ModelCaller, so its TP all-reduces can

@@ -74,8 +74,9 @@ from ..disaggregation.orchestration.pp_termination import \
 from ..disaggregation.orchestration.transfer_manager import AsyncTransferManager
 from ..distributed import Distributed
 from ..distributed.communicator import ReduceOp
-from ..models.modeling_multimodal_mixin import \
-    maybe_prefetch_mm_encoder_for_next_iter
+from ..host_staging import reclaim_staged_uploads
+from ..models.modeling_multimodal_mixin import (
+    maybe_prefetch_mm_encoder_for_next_iter, release_encoded_media)
 from ..models.modeling_utils import DecoderModelForCausalLM
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.dwdp.dense.manager import DenseDwdpManager
@@ -11063,6 +11064,9 @@ class PyExecutor:
                     request.state = LlmRequestState.GENERATION_TO_COMPLETE
                 else:
                     request.state = LlmRequestState.GENERATION_IN_PROGRESS
+            else:
+                # More chunks follow: drop raw media that no encoder call can read again.
+                release_encoded_media(request)
 
     @nvtx_range("_update_request_states")
     def _update_request_states(self, scheduled_requests: ScheduledRequests):
@@ -11158,6 +11162,9 @@ class PyExecutor:
                          resource_manager: Optional[ResourceManager] = None):
         try:
             self.sampler.update_requests(sample_state, resource_manager)
+            # After the sampler wait: drop pinned media whose copies are done, also when no
+            # later upload comes.
+            reclaim_staged_uploads()
             self._accumulate_spec_dec_stats(sample_state)
         except Exception as e:
             traceback.print_exc()
