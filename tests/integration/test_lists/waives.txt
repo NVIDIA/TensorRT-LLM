@@ -72,7 +72,6 @@ full:B300/accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8_mxfp4[m
 full:B300/accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_auto_dtype[forced_chunked_prefill] SKIP (https://nvbugs/6597570)
 full:B300/accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_auto_dtype[full_budget] SKIP (https://nvbugs/6597570)
 full:B300/disaggregated/test_disaggregated.py::test_disaggregated_ctxpp4_gentp4 SKIP (https://nvbugs/7023201)
-full:B300/disaggregated/test_disaggregated.py::test_disaggregated_mamba_conc_greater_than_mbs[NVIDIA-Nemotron-3-Super-120B-A12B-FP8] SKIP (https://nvbugs/6770978)
 full:B300/disaggregated/test_disaggregated.py::test_disaggregated_overlap_gen_first[ctx_pp4] SKIP (https://nvbugs/7023197)
 full:CPU/unittest/scripts/test_subprocess_timeouts.py::test_every_subprocess_run_call_in_test_code_must_set_timeout SKIP (https://nvbugs/6929769)
 full:CPU/unittest/serve/test_no_object_new.py::test_no_new_object_new_sites SKIP (https://nvbugs/7081838)
