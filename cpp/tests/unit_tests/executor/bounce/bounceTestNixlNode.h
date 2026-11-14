@@ -41,6 +41,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace bounce_test
@@ -165,6 +166,16 @@ struct Node
     }
 };
 
+// Config for every agent the bounce tests create: no NIXL listen thread, because the tests exchange
+// AgentDescs directly. With the listen thread on, the agent locks /tmp/trtllm_nixl_port.lock to pick a
+// port; on a shared machine that file may belong to another user, so the agent fails to build and
+// every transport test silently SKIPs.
+inline kvc::BaseAgentConfig makeAgentConfig(std::string name)
+{
+    return kvc::BaseAgentConfig{
+        std::move(name), /*useProgThread=*/true, /*multiThread=*/false, /*useListenThread=*/false};
+}
+
 // Build one full bounce node (agent+arena+exec+channel+transport). Returns nullptr if the NIXL
 // agent/backend can't init or the arena can't be registered (caller GTEST_SKIPs). `cfg` supplies
 // arenaSizeBytes/arenaAllocationGranularityBytes/maxInflightChunksPerRequest etc., so callers
@@ -177,7 +188,7 @@ inline std::unique_ptr<Node> makeNode(std::string const& name, b::BounceConfig c
     n->name = name;
     try
     {
-        kvc::BaseAgentConfig c{name, /*useProgThread=*/true, /*multiThread=*/false, /*useListenThread=*/true};
+        auto const c = makeAgentConfig(name);
         n->agent = makeAgent ? makeAgent(c) : std::make_unique<kvc::NixlTransferAgent>(c);
     }
     catch (std::exception const&)
