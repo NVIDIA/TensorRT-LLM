@@ -24,9 +24,13 @@ probe, on every rank) is covered over a real two-rank group in
 """
 
 import datetime
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
+from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
+    CONTROL_REQUEST_ID,
+    RequestQueueItem,
+)
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 
@@ -36,6 +40,7 @@ def _make_stub_executor(rank=0, queued_items=None):
     stub = SimpleNamespace()
     stub.control_requests = []
     stub.request_accumulated = []
+    stub.active_requests = []
     stub.canceled_req_ids = []
     stub._disable_mpi = False
     stub.is_shutdown = False
@@ -50,14 +55,20 @@ def _make_stub_executor(rank=0, queued_items=None):
     # No KV-cache transceiver: the idle wait is unbounded (MPI) or the Ray
     # heartbeat; tests for the transfer-bounded idle wait set these.
     stub.kv_cache_transceiver = None
-    stub.async_transfer_manager = None
+    stub.async_transfer_manager = SimpleNamespace(requests_in_transfer=lambda: {})
     stub.enable_attention_dp = False
     stub._idle_kv_transfer_poll_timeout = lambda: PyExecutor._idle_kv_transfer_poll_timeout(stub)
     # No KV connector attached.
     stub.kv_connector_manager = None
     stub._has_pending_connector_transfers = lambda: False
+    stub._has_pending_context_retirement = MethodType(
+        PyExecutor._has_pending_context_retirement, stub
+    )
+    stub._fetch_drain_cancellations = MethodType(PyExecutor._fetch_drain_cancellations, stub)
     # No generation-side receive is retiring.
-    stub.disagg = SimpleNamespace(has_retiring_gen_receives=False)
+    stub.disagg = SimpleNamespace(
+        has_retiring_gen_receives=False, supports_logical_context_cancellation=lambda req: False
+    )
     return stub
 
 
@@ -84,15 +95,15 @@ def test_idle_ignores_hint_and_keeps_blocking_probe():
     assert stub.request_broadcaster.broadcast.call_args.kwargs.get("known_nonempty", False) is False
 
 
-def test_pending_control_requests_block_fetch():
+def test_non_draining_control_blocks_fetch_without_trusting_hint():
     stub = _make_stub_executor(queued_items=[Mock()])
-    stub.control_requests = [Mock()]
+    stub.control_requests = [RequestQueueItem(CONTROL_REQUEST_ID, control_requires_drain=False)]
     waiting_queue = FCFSWaitingQueue()
 
     _fetch(stub, waiting_queue, total_num_active_requests=4, new_requests_hint=3)
 
     stub.executor_request_queue.get_from_request_queue.assert_not_called()
-    stub.request_broadcaster.broadcast.assert_not_called()
+    stub.request_broadcaster.broadcast.assert_called_once_with([], prefer_cpu=False)
 
 
 def _with_connector(stub, draining_loads=False):
@@ -121,23 +132,34 @@ def test_busy_zero_hint_with_connector_still_fetches():
 
 def test_pending_control_with_draining_connector_ignores_hint():
     # A draining control request still receives prefix-load completions: the
-    # fetch runs without new requests and without trusting the hint.
-    stub = _with_connector(_make_stub_executor(queued_items=[Mock()]), draining_loads=True)
-    stub.control_requests = [Mock()]
+    # fetch admits only existing-work cancellations, without trusting the hint.
+    cancel = RequestQueueItem(11, is_canceled_request=True)
+    future = RequestQueueItem(12, Mock())
+    stub = _with_connector(_make_stub_executor(queued_items=[cancel, future]), draining_loads=True)
+    stub.control_requests = [RequestQueueItem(CONTROL_REQUEST_ID)]
+    stub.active_requests = [SimpleNamespace(py_request_id=11, is_child=False)]
+    stub._handle_special_queue_items = MethodType(PyExecutor._handle_special_queue_items, stub)
     waiting_queue = FCFSWaitingQueue()
 
     _fetch(stub, waiting_queue, total_num_active_requests=4, new_requests_hint=3)
 
-    stub.executor_request_queue.get_from_request_queue.assert_not_called()
+    stub.executor_request_queue.get_from_request_queue.assert_called_once_with(
+        datetime.timedelta(0), wait_for_batch=False
+    )
     stub.kv_connector_manager.take_finished_prefix_loads.assert_called_once_with()
-    stub.request_broadcaster.broadcast.assert_called_once()
-    assert stub.request_broadcaster.broadcast.call_args.kwargs.get("known_nonempty", False) is False
+    stub.request_broadcaster.broadcast.assert_called_once_with([cancel], prefer_cpu=False)
+    assert stub.canceled_req_ids == [11]
+    assert stub.request_accumulated == [future]
+    assert not waiting_queue
 
 
 def _with_tracked_transfers(stub, local_inflight, poll_interval_ms=5000):
     stub.kv_cache_transceiver = SimpleNamespace(kv_transfer_poll_interval_ms=poll_interval_ms)
     stub.async_transfer_manager = Mock()
     stub.async_transfer_manager.has_any_inflight_requests = Mock(return_value=local_inflight)
+    stub.async_transfer_manager.requests_in_transfer.return_value = (
+        {1: Mock()} if local_inflight else {}
+    )
     return stub
 
 
