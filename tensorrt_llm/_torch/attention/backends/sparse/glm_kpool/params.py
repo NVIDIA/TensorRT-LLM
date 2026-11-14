@@ -88,10 +88,9 @@ class GlmKpoolSparseParams(SparseParams):
         """Number of pools a query selects."""
         return self.index_topk // self.index_kpool
 
-    @property
-    def kernel_output_width(self) -> int:
-        """``output_width`` padded to the FlashMLA top-k tile (64)."""
-        return -(-self.output_width // 64) * 64
+    def kernel_output_width(self, topk_align: int) -> int:
+        """``output_width`` padded to the sparse kernel's top-k alignment."""
+        return -(-self.output_width // topk_align) * topk_align
 
     @property
     def output_width(self) -> int:
@@ -103,7 +102,7 @@ class GlmKpoolSparseParams(SparseParams):
 class GlmKpoolBackendForwardArgs(SparseBackendForwardArgs):
     """Global latent-cache row selection produced by expand_selection.
 
-    topk_rows is int32 [tokens, kernel_output_width], with -1 marking invalid
+    topk_rows is int32 [tokens, kernel_output_width(align)], with -1 marking invalid
     entries. Request-local topk_indices from the base carrier are unsupported.
     """
 
