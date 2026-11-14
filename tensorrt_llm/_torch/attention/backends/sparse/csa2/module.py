@@ -38,6 +38,19 @@ from .params import (
 )
 
 
+def _is_native_mxfp8_sm() -> bool:
+    return torch.cuda.is_available() and torch.cuda.get_device_capability() in (
+        (10, 0),
+        (10, 3),
+        (12, 0),
+    )
+
+
+def supports_native_mxfp8() -> bool:
+    """Whether native MXFP8 projections can be built on the current device."""
+    return _is_native_mxfp8_sm() and hasattr(torch.ops.trtllm, "mxfp8_mxfp8_gemm")
+
+
 class DeepseekV41Attention(nn.Module):
     """Attention component with explicit CED and paged-cache inputs.
 
@@ -114,16 +127,12 @@ class DeepseekV41Attention(nn.Module):
         quant_config = None
         self._o_a_flashinfer = False
         if projection_quantization == "mxfp8":
-            if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
-                (10, 0),
-                (10, 3),
-                (12, 0),
-            ):
+            if not _is_native_mxfp8_sm():
                 raise ValueError(
                     "CSA2 native MXFP8 projections require SM100/SM103/SM120; "
                     "SM121 has no FP8 block-scale BMM for the output projection"
                 )
-            if not hasattr(torch.ops.trtllm, "mxfp8_mxfp8_gemm"):
+            if not supports_native_mxfp8():
                 raise RuntimeError("CSA2 native MXFP8 GEMM is not compiled")
             quant_config = QuantConfig(quant_algo=QuantAlgo.MXFP8)
             self._o_a_flashinfer = mxfp8_gemm_backend_override() == "flashinfer"
