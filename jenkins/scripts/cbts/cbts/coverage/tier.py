@@ -238,10 +238,8 @@ def apply_coverage_tier(
     removed, dropped, must_run_reasons = _build_narrowing(
         cov, stages, yaml_index, rule_block_filters, known, untrusted
     )
-    # exclude multi-GPU and post-merge stages from the drop set (not coverage's to decide)
+    # Multi-GPU stages are outside coverage selection; Groovy controls stage scheduling.
     dropped = {s for s in dropped if not _is_multi_gpu(s)}
-    if not pr.post_merge:
-        dropped = {s for s in dropped if "Post-Merge" not in s}
 
     n_impacted = sum(len(v) for v in cov.impacted.values())
     n_removed = sum(len(v) for v in removed.values())

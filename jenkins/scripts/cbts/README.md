@@ -130,7 +130,7 @@ jenkins/scripts/cbts/                  outer vendor dir — put on PYTHONPATH fo
 │   │   │   └── touch_db.py   read-only accessor over cbts_touchmap.sqlite + the untrusted-capture signals
 │   │   └── collection/    post-merge collection that produces the touch DB (see its README / COLLECTION.md)
 │   └── command/           unified CLI, `python -m cbts.command ...`
-│       ├── main.py        `main` — CLI entry + Selector + SelectionResult + scope combine + trigger-mode filter
+│       ├── main.py        `main` — CLI entry + Selector + SelectionResult + scope combine
 │       ├── dryrun.py       `dryrun` — replay CBTS over historical commits → per-PR summary.txt + filtered YAMLs + INDEX.md (debug only)
 │       ├── report_decision.py  `report-decision` — post the decision (hit-stage count, case-level skip rate, fallback) to OpenSearch for CI-health monitoring
 │       └── coverage/
@@ -192,31 +192,61 @@ integration conftest, helper modules in dirs no YAML mentions).
 
 ## When CBTS activates
 
-CBTS activates on bare `/bot run` and `/bot run --post-merge`. Any
-stage-selection flag (`--stage-list`, `--extra-stage`, `--gpu-type`,
-`--test-backend`, `--skip-test`, `--add-multi-gpu-test`, `--only-multi-gpu-test`,
-`--disable-multi-gpu-test`) makes `getCbtsResult` return null.
+CBTS activates for `/bot run` with any stage-selection or orthogonal flags.
+The command first determines the eligible stage scope (`--stage-list`,
+`--extra-stage`, GPU/backend filters, multi-GPU flags, and `--skip-test`).
+CBTS then selects affected cases and stages within that scope. Sanity and
+coverage-tier multi-GPU stages are retained only if they are in that scope.
+Explicitly selected OnDemand and Post-Merge stages are eligible as well.
 
-`--disable-cbts` is an explicit kill switch: `getCbtsResult` returns null
-before any narrowing, so the pipeline runs the full test set. The opt-out is
-recorded in OpenSearch with `s_cbts_status=disabled`.
+`--disable-cbts` remains the explicit kill switch. Official post-merge jobs
+and infrastructure dry runs retain their existing bypasses. Coverage rollout
+and auto-trigger retention policies remain in effect within the selected scope.
 
-Orthogonal flags (`--reuse-test`, `--disable-reuse-test`, `--debug`,
-`--detailed-log`, `--disable-fail-fast`, `--high-priority`) do not affect CBTS.
+A null decision or selector failure runs the full command-selected scope.
+Fallback never expands to stages outside that scope. Narrowed test-db artifact
+failures likewise use the source test-db within the selected stages.
 
-## Trigger-mode filter
+Stage patterns match original stage names even when narrowed stages have a
+`-cbts` suffix. With `--stage-list` or `--extra-stage`, stages retain their
+original shard IDs and split counts. Pytest collects and splits the full source
+test list using the original durations, then intersects each shard with CBTS's
+selected cases. A successful collection that removes every case from a nonempty
+original shard is a successful no-op. The ordinary/agent runner records a skipped
+CBTS control testcase so normal JUnit reporting still has a result; unexpected
+empty collections and collection failures remain errors. Cases never move
+from an unselected shard into a selected shard.
 
-`pr.post_merge` (carried in INPUT_JSON) selects which stages survive:
+## Stage scheduling
 
-- `post_merge=False` (default for `/bot run`): drop every stage whose name
-  contains `Post-Merge`.
-- `post_merge=True` (`/bot run --post-merge`): keep all affected stages —
-  pre-merge plus `Post-Merge` (Post-Merge runs on top of pre-merge, matching
-  the non-CBTS baseline).
+The Python selector returns affected candidates across pre-merge and Post-Merge
+stages without filtering by trigger mode. Jenkins does not pass `post_merge` to
+the selector. Groovy alone applies the command-selected stage scope, including
+explicit `--stage-list` / `--extra-stage` requests and `--post-merge`.
 
-Applied after rules union; rules see all stages so reasons report the
-pre-filter narrow. `_log_decision_to_stderr` prints the dropped set for
-Jenkins console diagnostics.
+The selector input has no `post_merge` field. VisualGen public API changes still
+require runnable CPU and serving validation among the candidate stages. Dryrun
+also reports all candidates; it has no `--post-merge` selector mode and does not
+simulate downstream scheduling or shard intersections.
+
+### Multi-GPU scope and approval
+
+On bare `/bot run`, the normal pre-merge file-change rules and auto-trigger tags
+first establish the eligible stage scope. CBTS narrows that scope; a Tier 1 hit
+alone no longer adds a multi-GPU stage excluded by the baseline. This differs
+from the old CBTS filter, which selected affected stages from the full inventory.
+The `ci: full pre-merge approved` label authorizes multi-GPU dispatch; it does
+not itself add stages to the scope. Dispatch also requires eligible multi-GPU
+work and the normal single-GPU prerequisite checks.
+
+Tier 2 only narrows single-GPU coverage. Its `enable_multi_gpu=true` means
+“retain baseline multi-GPU work”, not that coverage proved a multi-GPU impact.
+Coverage decisions retain all multi-GPU stages already in the command scope,
+including Post-Merge PerfSanity stages selected by `--post-merge` or an explicit
+stage flag. These run the original case lists without coverage narrowing.
+Post-Merge multi-GPU stages are intentionally not excluded by the retention
+clause. Auto-trigger retention in coverage mode also remains within the command
+scope. Null decisions use the full command-selected baseline.
 
 ## How it's invoked (CI)
 
@@ -235,8 +265,7 @@ INPUT_JSON:
 ```json
 {
   "changed_files": ["tests/..."],
-  "diffs": {"tests/...": "@@ ..."},
-  "post_merge": false
+  "diffs": {"tests/...": "@@ ..."}
 }
 ```
 
@@ -300,8 +329,12 @@ a successful shadow candidate.
 `k = clamp(ceil(est_seconds / 2h), 1, stage.total_splits)` (cap parsed from
 `L0_Test.groovy`). `est_seconds` sums the `.test_durations` cache over the
 stage's kept entries (exact node-id, else subtree-sum, else average — over-counts
-toward the cap, never under-sizes). `launchTestJobs::cbtsResizeSplits` keeps only
-shards `1..k`; pytest-split then balances within them via `least_duration`.
+toward the cap, never under-sizes). Without explicit stage-list/extra-stage
+selection, `filterCbtsStageJobs` keeps at most `k` shards per stage family;
+pytest-split balances the narrowed list within them via `least_duration`.
+Explicit stage selection instead preserves the original shard assignment and
+applies `--cbts-test-list` after splitting. This applies to both ordinary and
+sbatch execution.
 
 `cbtsResizeSplits` also renames each narrowed stage with a `-cbts` suffix so its
 narrowed result is never reused (whole-stage `REUSE_STAGE_LIST` or per-test

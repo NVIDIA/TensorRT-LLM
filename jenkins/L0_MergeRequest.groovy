@@ -1492,18 +1492,6 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         return null
     }
 
-    // CBTS only activates on bare `/bot run`. If the user specified any
-    // stage-selection flag, defer entirely to their explicit choice.
-    def triggeredFlags = _cbtsTriggeredUserFlags(testFilter)
-    if (!triggeredFlags.isEmpty()) {
-        pipeline.echo("CBTS: deferring — user-specified /bot run flag(s): ${triggeredFlags.join(', ')}")
-        if (_cbtsEnsureCliDependencies(pipeline)) {
-            _cbtsReportDecision(pipeline, globalVars, "deferred",
-                                "user flags: ${triggeredFlags.join(', ')}", null)
-        }
-        return null
-    }
-
     def changedFiles = getMergeRequestChangedFileList(pipeline, globalVars).unique()
     if (!changedFiles) {
         pipeline.echo("CBTS: deferring — no changed files detected")
@@ -1512,7 +1500,7 @@ def getCbtsResult(pipeline, testFilter, globalVars)
 
     try {
         if (!_cbtsEnsureCliDependencies(pipeline)) {
-            pipeline.echo("CBTS: falling back to full run because CLI dependencies are unavailable")
+            pipeline.echo("CBTS: falling back to command-selected stages because CLI dependencies are unavailable")
             return null
         }
         def coveragePilotEligible = false
@@ -1539,7 +1527,6 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         def inputJson = groovy.json.JsonOutput.toJson([
             changed_files: changedFiles,
             diffs: diffs,
-            post_merge: testFilter[(IS_POST_MERGE)] ?: false,
         ])
         def inputPath = "${LLM_ROOT}/cbts_input.json"
         writeFile file: inputPath, text: inputJson
@@ -1638,7 +1625,7 @@ def getCbtsResult(pipeline, testFilter, globalVars)
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
-        pipeline.echo("CBTS failed, falling back to full run: ${e}")
+        pipeline.echo("CBTS failed, falling back to command-selected stages: ${e}")
         return null
     }
 }
@@ -1887,19 +1874,6 @@ def _cbtsGlobToRegex(String glob)
 def _cbtsMatchesAnyPattern(String filePath, List patterns)
 {
     return patterns.any { filePath ==~ _cbtsGlobToRegex(it) }
-}
-
-// Returns user-set stage-selection flags that should force CBTS to defer.
-// IS_POST_MERGE and orthogonal flags (REUSE_*, DEBUG_MODE, DETAILED_LOG, ...)
-// are intentionally absent.
-def _cbtsTriggeredUserFlags(testFilter)
-{
-    def deferFlags = [
-        ENABLE_SKIP_TEST, TEST_STAGE_LIST, EXTRA_STAGE_LIST, GPU_TYPE_LIST,
-        TEST_BACKEND, ADD_MULTI_GPU_TEST, ONLY_MULTI_GPU_TEST, DISABLE_MULTI_GPU_TEST,
-    ]
-    return deferFlags.findAll { testFilter[it] }
-                     .collect { "${it}=${testFilter[it]}" }
 }
 
 // Parse CBTS JSON stdout into a map. `scope == null` → no decision; caller
