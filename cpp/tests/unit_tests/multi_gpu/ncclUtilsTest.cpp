@@ -54,6 +54,11 @@ public:
         allocator.recordSymmetricFailureLocked(comm, size);
     }
 
+    static bool exchangeBufferRequested(NCCLWindowAllocator& allocator, bool requested)
+    {
+        return allocator.mBufferRequested.exchange(requested);
+    }
+
     static cudaError_t clearCudaErrorIfSymmetricAllocationFailed(
         int localAllocOk, NCCLWindowAllocator::CudaGetLastErrorFunc getLastError = cudaGetLastError)
     {
@@ -498,6 +503,44 @@ TEST_F(NCCLWindowAllocatorTest, BasicAllocation)
 
     // Release the buffer
     allocator.releaseBuffer(*mComm, buffer.ptr);
+}
+
+TEST_F(NCCLWindowAllocatorTest, RequestedBuffersFollowUnsuppressedRequests)
+{
+    using Access = nccl_util::NCCLWindowAllocatorTestAccess;
+    auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
+    auto const testComm = createWindowComm(*mComm, 0, mRank);
+    size_t constexpr kBufferSize = 4 * 1024;
+
+    // The flag is process-wide: start from an unrequested state and restore it on every exit.
+    struct RestoreRequested
+    {
+        nccl_util::NCCLWindowAllocator& allocator;
+        bool requested;
+
+        ~RestoreRequested()
+        {
+            Access::exchangeBufferRequested(allocator, requested);
+        }
+    } const restore{allocator, Access::exchangeBufferRequested(allocator, false)};
+
+    // Suppressed sections are not SPMD, so their requests are not recorded.
+    bool const previouslySuppressed = allocator.setWindowAllocationSuppressed(true);
+    EXPECT_FALSE(allocator.requestBuffer(*testComm, kBufferSize).isValid());
+    allocator.setWindowAllocationSuppressed(previouslySuppressed);
+    EXPECT_FALSE(allocator.hasRequestedBuffers());
+
+    auto const buffer = allocator.requestBuffer(*testComm, kBufferSize);
+    ASSERT_TRUE(buffer.isValid());
+    EXPECT_TRUE(allocator.hasRequestedBuffers());
+    allocator.releaseBuffer(*testComm, buffer.ptr);
+    EXPECT_TRUE(allocator.hasRequestedBuffers());
+
+    // A request that gets no buffer is recorded too: every rank makes it.
+    Access::exchangeBufferRequested(allocator, false);
+    Access::recordSymmetricFailure(allocator, *testComm, 2 * kBufferSize);
+    EXPECT_FALSE(allocator.requestBuffer(*testComm, 2 * kBufferSize).isValid());
+    EXPECT_TRUE(allocator.hasRequestedBuffers());
 }
 
 TEST_F(NCCLWindowAllocatorTest, ExplicitStreamAllocationAndCapture)
@@ -1385,6 +1428,61 @@ TEST_F(CreateNCCLWindowTensorTest, TensorLeaseScopeReleasesTemporariesAndEscapes
     EXPECT_TRUE(
         nccl_util::NCCLWindowAllocatorTestAccess::isReusableOnStream(allocator, *mComm, temporaryBuffer.ptr, stream));
     EXPECT_TRUE(allocator.releaseTensorBuffer(output.storage().unsafeGetStorageImpl(), stream));
+}
+
+TEST_F(CreateNCCLWindowTensorTest, ScopeLeaseReleaseKeepsScopeAndKeptStorages)
+{
+    using nccl_util::createNCCLWindowTensor;
+
+    auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
+    int const device = at::cuda::current_device();
+    cudaStream_t const stream = at::cuda::getCurrentCUDAStream();
+    std::vector<int64_t> shape = {16, 16};
+
+    allocator.beginTensorLeaseScope({}, device);
+    nccl_util::NCCLWindowBuffer temporaryBuffer;
+    {
+        auto [temporary, buffer] = createNCCLWindowTensor(mComm, shape, torch::kFloat32);
+        temporaryBuffer = buffer;
+        ASSERT_TRUE(temporaryBuffer.isValid());
+    }
+    auto [live, liveBuffer] = createNCCLWindowTensor(mComm, shape, torch::kFloat32);
+    auto [output, outputBuffer] = createNCCLWindowTensor(mComm, shape, torch::kFloat32);
+    ASSERT_TRUE(liveBuffer.isValid());
+    ASSERT_TRUE(outputBuffer.isValid());
+    EXPECT_EQ(allocator.getBufferInUseCount(*mComm), 3);
+
+    // As at a successful scope exit, the dead temporary and the live tensor that is not kept become
+    // reusable on the stream. The kept output stays with the scope, which stays open.
+    allocator.releaseTensorLeaseScopeLeases({output.storage().unsafeGetStorageImpl()}, device, stream);
+    EXPECT_EQ(allocator.getBufferInUseCount(*mComm), 1);
+    EXPECT_TRUE(
+        nccl_util::NCCLWindowAllocatorTestAccess::isReusableOnStream(allocator, *mComm, temporaryBuffer.ptr, stream));
+    EXPECT_TRUE(
+        nccl_util::NCCLWindowAllocatorTestAccess::isReusableOnStream(allocator, *mComm, liveBuffer.ptr, stream));
+
+    allocator.endTensorLeaseScope({}, device, stream, false);
+    EXPECT_EQ(allocator.getBufferInUseCount(*mComm), 0);
+    EXPECT_TRUE(
+        nccl_util::NCCLWindowAllocatorTestAccess::isReusableOnStream(allocator, *mComm, outputBuffer.ptr, stream));
+}
+
+TEST_F(CreateNCCLWindowTensorTest, ScopeLeaseReleaseWithoutScopeReleasesNothing)
+{
+    using nccl_util::createNCCLWindowTensor;
+
+    auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
+    int const device = at::cuda::current_device();
+    cudaStream_t const stream = at::cuda::getCurrentCUDAStream();
+    auto [tensor, buffer] = createNCCLWindowTensor(mComm, {16, 16}, torch::kFloat32);
+    ASSERT_TRUE(buffer.isValid());
+    EXPECT_EQ(allocator.getBufferInUseCount(*mComm), 1);
+
+    // No scope is open, so the unscoped lease stays in use.
+    allocator.releaseTensorLeaseScopeLeases({}, device, stream);
+    EXPECT_EQ(allocator.getBufferInUseCount(*mComm), 1);
+    releaseTensor(tensor);
+    EXPECT_EQ(allocator.getBufferInUseCount(*mComm), 0);
 }
 
 TEST_F(CreateNCCLWindowTensorTest, AuxiliaryStreamTensorJoinsCurrentThreadScope)

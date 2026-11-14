@@ -271,14 +271,47 @@ class _ForwardScopeHandle:
             module.forward = self._previous
 
 
+def _release_first_request_leases(args: tuple, kwargs: dict[str, Any], output: Any) -> None:
+    """Release what an unscoped call that made the first window request leased, but its outputs.
+
+    No tensor holds a window lease before the process's first request, so every lease of the
+    innermost scope comes from that call. Releasing them is what a scope around the call would
+    have done at its exit.
+    """
+    inputs = _module_call_cuda_tensors(args, kwargs)
+    if not inputs:
+        # A call without CUDA inputs would not have entered a scope either.
+        return
+    outputs: list[torch.Tensor] = []
+    _output_cuda_tensors(output, outputs)
+    torch.ops.trtllm.release_nccl_window_tensor_scope_leases(inputs, outputs)
+
+
 def _install_forward_scope(module: torch.nn.Module) -> _ForwardScopeHandle:
     # A per-instance forward keeps nn.Module calls on their hook-free fast path; eager
     # decoder layers run once per layer per iteration.
     previous = module.__dict__.get("forward")
     forward = module.forward
+    window_buffers_requested = False
 
     @wraps(forward)
     def forward_in_scope(*args: Any, **kwargs: Any) -> Any:
+        nonlocal window_buffers_requested
+        # Before the process requests an NCCL window buffer, no input carries a window lease
+        # and a layer scope has nothing to adopt or release. Every rank makes these requests
+        # from the same operations, so all ranks start scoping at the same call and scope
+        # every call after it.
+        if not window_buffers_requested:
+            window_buffers_requested = torch.ops.trtllm.has_requested_nccl_window_buffers()
+            if not window_buffers_requested:
+                output = forward(*args, **kwargs)
+                window_buffers_requested = torch.ops.trtllm.has_requested_nccl_window_buffers()
+                if window_buffers_requested:
+                    # This call made the first request. Its window temporaries are released
+                    # now, as its layer scope would have released them, so the next layers
+                    # reuse their buffers.
+                    _release_first_request_leases(args, kwargs, output)
+                return output
         scope = _NCCLWindowTensorScope._for_module_call(args, kwargs)
         with scope:
             return scope.escape(forward(*args, **kwargs))
@@ -290,7 +323,12 @@ def _install_forward_scope(module: torch.nn.Module) -> _ForwardScopeHandle:
 def install_eager_nccl_window_tensor_scopes(
     model: torch.nn.Module,
 ) -> list[_ForwardScopeHandle]:
-    """Install eager model scopes without exposing Python hooks to Dynamo."""
+    """Install eager model scopes without exposing Python hooks to Dynamo.
+
+    Run the model inside ``nccl_window_tensor_scope``, as ``ModelCaller`` does. Layer calls run
+    unscoped until the process's first window request, and the call that makes it releases its
+    window temporaries from that enclosing scope.
+    """
     return [
         _install_forward_scope(module)
         for module in model.modules()
