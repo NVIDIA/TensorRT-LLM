@@ -1548,7 +1548,7 @@ class DecoderWarmup:
         # variants, for free since alignment is independent of HAS_INITSTATES.
         # Resolved the same way the runtime does, so warmup can't prime the
         # alignment variant of a class the runtime never instantiates.
-        metadata_cls = resolve_mamba_metadata_cls(self.model)
+        metadata_cls = resolve_mamba_metadata_cls(self.model, kv_cache_manager)
         chunk_alignment = metadata_cls.prefill_chunk_alignment
 
         # (num_tokens, num_gen_requests, least_requests, force_initstates,

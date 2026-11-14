@@ -36,7 +36,6 @@ from transformers import Qwen3NextConfig
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
-from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.moe.fused_shared_expert import \
     fused_sigmoid_gate_mul_add
 from tensorrt_llm._torch.pyexecutor.config_utils import \
@@ -1390,7 +1389,7 @@ class Qwen3NextModel(DecoderModel):
 
         mamba_metadata = attn_metadata.mamba_metadata
         if mamba_metadata.max_batch_size != attn_metadata.max_num_requests:
-            attn_metadata.mamba_metadata = Mamba2Metadata(
+            attn_metadata.mamba_metadata = type(mamba_metadata)(
                 attn_metadata.max_num_requests, chunk_size=128)
 
         if inputs_embeds is None:

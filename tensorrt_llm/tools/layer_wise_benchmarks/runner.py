@@ -826,7 +826,11 @@ class Runner:
             )
 
         if is_nemotron_hybrid(pretrained_config) or is_qwen3_hybrid(pretrained_config):
-            mamba_metadata = Mamba2Metadata(
+            mamba_metadata_cls = (
+                getattr(attn_metadata.kv_cache_manager, "mamba_metadata_cls", None)
+                or Mamba2Metadata
+            )
+            mamba_metadata = mamba_metadata_cls(
                 attn_metadata.max_num_requests,
                 chunk_size=128
                 if is_qwen3_hybrid(pretrained_config)

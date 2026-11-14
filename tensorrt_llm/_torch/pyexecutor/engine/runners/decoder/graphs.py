@@ -985,7 +985,9 @@ class DecoderCudaGraphs:
             isinstance(kv_cache_manager, KVCacheManagerV2)
             and kv_cache_manager.inforward_snapshot_rows > 0
         ):
-            variants.append(resolve_mamba_metadata_cls(self.model).inforward_split_for_warmup)
+            variants.append(
+                resolve_mamba_metadata_cls(self.model, kv_cache_manager).inforward_split_for_warmup
+            )
         for num_contexts in _BREAK_GRAPH_NUM_CONTEXTS:
             for variant in variants:
                 warmup_request = self._dummy_requests.create_warmup_request(
