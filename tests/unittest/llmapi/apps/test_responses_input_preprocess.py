@@ -23,6 +23,7 @@ question into an assistant turn.
 import asyncio
 
 import pytest
+from openai_harmony import Role
 
 from tensorrt_llm.inputs.utils import MultimodalDataTracker
 from tensorrt_llm.serve.chat_utils import parse_chat_message_content
@@ -30,6 +31,7 @@ from tensorrt_llm.serve.openai_protocol import ResponsesRequest
 from tensorrt_llm.serve.responses_utils import (
     _create_input_messages,
     _get_chat_completion_function_tools,
+    _parse_response_input,
     _render_developer_as_system,
     _response_output_item_to_chat_completion_message,
     _tool_resolution,
@@ -863,3 +865,30 @@ def test_image_request_reaches_the_chat_messages(image_part):
             ],
         }
     ]
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        {"type": "reasoning", "id": "rs_1"},
+        {"type": "reasoning", "id": "rs_1", "content": []},
+        {"type": "reasoning", "id": "rs_1", "content": None, "encrypted_content": "gAAAAA"},
+    ],
+)
+def test_harmony_reasoning_item_without_content_is_skipped(item):
+    # A replayed reasoning item may omit its text; it used to hit a KeyError or
+    # a bare assert and fail the whole request.
+    assert _parse_response_input(item, []) is None
+
+
+def test_harmony_reasoning_item_with_one_content_element():
+    item = {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "thinking"}]}
+    msg = _parse_response_input(item, [])
+    assert msg.author.role == Role.ASSISTANT
+    assert msg.content[0].text == "thinking"
+
+
+def test_harmony_reasoning_item_with_many_content_elements_is_rejected():
+    text = {"type": "reasoning_text", "text": "x"}
+    with pytest.raises(ValueError, match="at most one 'content' element, got 2"):
+        _parse_response_input({"type": "reasoning", "content": [text, text]}, [])
