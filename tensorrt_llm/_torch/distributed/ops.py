@@ -100,8 +100,13 @@ class _MnnvlUnavailableError(RuntimeError):
 def _get_mnnvl_dispatch_plan(
     mapping: Mapping,
     dtype: Optional[torch.dtype],
+    *,
+    explicitly_requested: bool = False,
 ) -> _MnnvlDispatchPlan:
-    """Resolve dispatch policy; allocation collectively qualifies local hardware."""
+    """AUTO requires a multi-node mapping; explicit MNNVL also permits a single node.
+
+    Allocation collectively qualifies local hardware.
+    """
     if dtype not in _MNNVL_SUPPORTED_DTYPES:
         return _MnnvlDispatchPlan(
             unsupported_reason=
@@ -123,6 +128,10 @@ def _get_mnnvl_dispatch_plan(
             unsupported_reason=
             f"TP group {tp_group} is inconsistent with TP size {mapping.tp_size} and rank {mapping.rank}"
         )
+
+    if not explicitly_requested and not mapping.is_multi_node():
+        return _MnnvlDispatchPlan(
+            unsupported_reason="AUTO requires a multi-node mapping for MNNVL")
 
     transport = (MnnvlTransport.FABRIC if use_mnnvl_fabric_handle(mapping) else
                  MnnvlTransport.POSIX_FD)
@@ -1034,7 +1043,7 @@ class MNNVLAllReduce(nn.Module):
         self.mapping = mapping
         self.dtype = dtype
         dispatch_plan = dispatch_plan or _get_mnnvl_dispatch_plan(
-            mapping, dtype)
+            mapping, dtype, explicitly_requested=True)
         if not dispatch_plan.is_supported:
             raise ValueError(
                 f"[MNNVL] Unsupported dispatch: {dispatch_plan.unsupported_reason}"
@@ -1105,9 +1114,8 @@ class MNNVLAllReduce(nn.Module):
         native preflight. Callers querying eligibility must not use a local failure to skip
         a collective workspace construction on only one rank.
         """
-        # Retain the keyword for callers; AUTO and explicit MNNVL share eligibility.
-        del explicitly_requested
-        plan = _get_mnnvl_dispatch_plan(mapping, dtype)
+        plan = _get_mnnvl_dispatch_plan(
+            mapping, dtype, explicitly_requested=explicitly_requested)
         return plan.is_supported and _mnnvl_hardware_supported()
 
     @staticmethod
@@ -1342,6 +1350,9 @@ class MNNVLAllReduce(nn.Module):
                          num_tokens: int) -> Optional[Tuple[torch.Tensor, ...]]:
         """The CuTe DSL kernel's outputs for a residual RMSNorm fusion the library would run one-shot, or
         None (the library op runs it)."""
+        # CuTe's Python/DLPack launch path is not traceable. Compiled models use the native MNNVL op.
+        if torch.compiler.is_compiling():
+            return None
         fused = self.fused_norm
         outputs = self._FUSED_NORM_OUTPUTS.get(params.fusion_op)
         if (fused is None or outputs is None or input.dim() != 2
@@ -1361,7 +1372,8 @@ class MNNVLAllReduce(nn.Module):
     def supports_moe_fold(self, num_tokens: int, hidden_size: int) -> bool:
         """Whether ``forward`` takes MoEAllReduceParams (shared-expert gate combine, optionally with the
         in-kernel MoE finalize) for ``num_tokens`` tokens."""
-        return (self.fused_norm is not None
+        return (not torch.compiler.is_compiling()
+                and self.fused_norm is not None
                 and hidden_size == self.fused_norm.hidden
                 and self.fused_norm.supports_rows(num_tokens))
 
@@ -1394,6 +1406,8 @@ class MNNVLAllReduce(nn.Module):
                             gemm_tactic) -> Optional[Tuple[torch.Tensor, ...]]:
         """Row-parallel FP8 GEMM ``input @ weight.T`` + this all-reduce + ``params``' residual RMSNorm fusion in
         one launch, or None. ``gemm_tactic``: the low-M GEMM tactic of the projection (k_warps, n_tiles, ksplit)."""
+        if torch.compiler.is_compiling():
+            return None
         gemm = self.gemm_norm
         outputs = self._FUSED_NORM_OUTPUTS.get(params.fusion_op)
         if (gemm is None or outputs is None or input.dim() != 2
@@ -1440,8 +1454,8 @@ class AllReduce(nn.Module):
                 - MIN_LATENCY: AllReduce uses MIN_LATENCY mode kernel.
 
                 - AUTO: AUTO chooses the best available strategy. Tries MNNVL for
-                  both node-local and cross-node TP groups on supported hardware, then chooses
-                  between NCCL and MIN_LATENCY based on a heuristic policy.
+                  multi-node mappings on supported hardware, then chooses between NCCL
+                  and MIN_LATENCY based on a heuristic policy.
 
                 - LOWPRECISION: AllReduce quantizes data to lower precision for transmission.
                   Should only be used on topologies with PCIe switches and without NVLink.
@@ -1553,7 +1567,8 @@ class AllReduce(nn.Module):
                 AllReduceStrategy.AUTO, AllReduceStrategy.MNNVL):
             is_explicit_mnnvl = self.strategy == AllReduceStrategy.MNNVL
             log_fallback = logger.warning if is_explicit_mnnvl else logger.debug
-            dispatch_plan = _get_mnnvl_dispatch_plan(self.mapping, dtype)
+            dispatch_plan = _get_mnnvl_dispatch_plan(
+                self.mapping, dtype, explicitly_requested=is_explicit_mnnvl)
             if not dispatch_plan.is_supported:
                 log_fallback(
                     f"MNNVL AllReduce dispatch is unsupported: {dispatch_plan.unsupported_reason}. "

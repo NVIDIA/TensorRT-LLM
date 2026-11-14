@@ -259,12 +259,12 @@ def mnnvl_capable_hardware(monkeypatch):
     monkeypatch.setattr(mnnvl_utils.MnnvlMemory, "supports_mnnvl", staticmethod(lambda: True))
 
 
-def test_auto_picks_mnnvl_on_a_single_node(mnnvl_capable_hardware):
+def test_auto_skips_mnnvl_on_a_single_node(mnnvl_capable_hardware):
     import torch
 
     mapping = _FakeMapping()
     mapping.multi_node = False
-    assert ops.MNNVLAllReduce.is_mnnvl(mapping, torch.bfloat16)
+    assert not ops.MNNVLAllReduce.is_mnnvl(mapping, torch.bfloat16)
 
 
 def test_explicit_request_enables_mnnvl_on_a_single_node(mnnvl_capable_hardware):
@@ -425,13 +425,13 @@ def test_dispatch_plan_supports_both_orchestrators(monkeypatch, use_ray, mnnvl_c
 
     mapping = Mapping(world_size=2, tp_size=2, rank=0)
     assert isinstance(mapping, DeviceMeshTopology if use_ray else MpiTopology)
-    plan = ops._get_mnnvl_dispatch_plan(mapping, torch.bfloat16)
+    plan = ops._get_mnnvl_dispatch_plan(mapping, torch.bfloat16, explicitly_requested=True)
     assert plan.is_supported
     assert plan.transport == ops.MnnvlTransport.POSIX_FD
 
 
 @pytest.mark.parametrize("arch", ["aarch64", "x86_64"])
-def test_single_node_auto_constructs_mnnvl(monkeypatch, mnnvl_capable_hardware, arch):
+def test_single_node_auto_skips_mnnvl(monkeypatch, mnnvl_capable_hardware, arch):
     from tensorrt_llm.mapping import Mapping
 
     monkeypatch.setattr(platform, "machine", lambda: arch)
@@ -446,10 +446,8 @@ def test_single_node_auto_constructs_mnnvl(monkeypatch, mnnvl_capable_hardware, 
         strategy=ops.AllReduceStrategy.AUTO,
         dtype=torch.bfloat16,
     )
-    assert module.mnnvl_allreduce is construct.return_value
-    construct.assert_called_once()
-    expected = ops.MnnvlTransport.POSIX_FD
-    assert construct.call_args.kwargs["dispatch_plan"].transport == expected
+    assert module.mnnvl_allreduce is None
+    construct.assert_not_called()
 
 
 @pytest.mark.parametrize("explicit", [False, True])
@@ -461,12 +459,18 @@ def test_dispatch_and_eligibility_share_policy(
     mapping = _FakeMapping()
     mapping.multi_node = cross_node
     monkeypatch.setattr(platform, "machine", lambda: arch)
-    assert ops._get_mnnvl_dispatch_plan(mapping, torch.bfloat16).is_supported
-    assert ops.MNNVLAllReduce.is_mnnvl(mapping, torch.bfloat16, explicitly_requested=explicit)
+    expected = explicit or cross_node
+    plan = ops._get_mnnvl_dispatch_plan(mapping, torch.bfloat16, explicitly_requested=explicit)
+    assert plan.is_supported == expected
+    assert (
+        ops.MNNVLAllReduce.is_mnnvl(mapping, torch.bfloat16, explicitly_requested=explicit)
+        == expected
+    )
 
 
 def test_eligibility_requires_hardware_and_structural_checks(monkeypatch):
     mapping = _FakeMapping()
+    mapping.multi_node = True
     monkeypatch.setattr(ops.MnnvlMemory, "supports_mnnvl", lambda: False)
     assert not ops.MNNVLAllReduce.is_mnnvl(mapping, torch.bfloat16)
     monkeypatch.setattr(ops.MnnvlMemory, "supports_mnnvl", lambda: True)
@@ -611,8 +615,10 @@ def test_router_uses_shared_mnnvl_eligibility(monkeypatch, mnnvl_capable_hardwar
     assert not router.tp_reaches_across_nodes(mapping)
 
 
-@pytest.mark.parametrize("transport", [ops.MnnvlTransport.POSIX_FD, ops.MnnvlTransport.FABRIC])
-def test_explicit_transport_is_used_for_allocation_and_forward(monkeypatch, transport):
+@pytest.mark.parametrize(
+    "transport", [None, ops.MnnvlTransport.POSIX_FD, ops.MnnvlTransport.FABRIC]
+)
+def test_direct_mnnvl_construction_uses_selected_transport(monkeypatch, transport):
     import sys
     from types import ModuleType
 
@@ -628,11 +634,16 @@ def test_explicit_transport_is_used_for_allocation_and_forward(monkeypatch, tran
     )
     monkeypatch.setattr(ops, "get_or_scale_allreduce_mnnvl_workspace", allocate)
     module = ops.MNNVLAllReduce(
-        _FakeMapping(), torch.bfloat16, dispatch_plan=ops._MnnvlDispatchPlan(transport=transport)
+        _FakeMapping(),
+        torch.bfloat16,
+        dispatch_plan=ops._MnnvlDispatchPlan(transport=transport)
+        if transport is not None
+        else None,
     )
     x = torch.zeros((2, 128), dtype=torch.bfloat16)
     kernel = Mock(return_value=[x])
     monkeypatch.setattr(torch.ops.trtllm, "mnnvl_fusion_allreduce", kernel, raising=False)
     module(x, ops.AllReduceParams())
     assert allocate.call_count == 2
-    assert all(call.kwargs["transport"] == transport for call in allocate.call_args_list)
+    expected = ops.MnnvlTransport.POSIX_FD if transport is None else transport
+    assert all(call.kwargs["transport"] == expected for call in allocate.call_args_list)

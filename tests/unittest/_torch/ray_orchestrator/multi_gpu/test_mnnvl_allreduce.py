@@ -107,11 +107,55 @@ class MnnvlAllReduceWorker:
         return MnnvlMemory.supports_mnnvl()
 
     def run(self, fusion: bool, strategy: AllReduceStrategy) -> bool:
-        from tensorrt_llm._torch.distributed import AllReduce, AllReduceParams
+        import torch
 
-        # AUTO and explicit MNNVL both qualify node-local TP on any host architecture.
-        # Exercise the normal capability checks and native collective preflight.
+        from tensorrt_llm._torch.distributed import AllReduce, AllReduceParams
+        from tensorrt_llm._torch.distributed.ops import get_or_scale_allreduce_mnnvl_workspace
+
+        # Explicit MNNVL exercises node-local TP on either host architecture
+        # through the normal capability checks and native collective preflight.
         torch.distributed.barrier()
+
+        from unittest.mock import patch
+
+        from tensorrt_llm._torch.distributed import ops as ops_module
+
+        # A local capability failure must be agreed before peers enter native allocation.
+        with patch.object(ops_module, "_mnnvl_hardware_supported", return_value=self.rank != 0):
+            with pytest.raises(ops_module._MnnvlUnavailableError, match="qualification failed"):
+                get_or_scale_allreduce_mnnvl_workspace(self.mapping, DTYPE)
+        assert self.mapping not in ops_module.MNNVLAllReduce.allreduce_mnnvl_workspaces
+
+        # Fail locally after every rank completed the handle exchange. No candidate may be published.
+        allocate = ops_module._make_mnnvl_workspace
+
+        def fail_after_allocation(*args, **kwargs):
+            workspace = allocate(*args, **kwargs)
+            if self.rank == 0:
+                raise RuntimeError("injected post-allocation failure")
+            return workspace
+
+        with patch.object(ops_module, "_make_mnnvl_workspace", side_effect=fail_after_allocation):
+            with pytest.raises(RuntimeError, match="construction failed on at least one rank"):
+                get_or_scale_allreduce_mnnvl_workspace(self.mapping, DTYPE)
+        assert self.mapping not in ops_module.MNNVLAllReduce.allreduce_mnnvl_workspaces
+
+        get_or_scale_allreduce_mnnvl_workspace(self.mapping, DTYPE)
+        from tensorrt_llm._torch.distributed import mnnvl_fused_allreduce as fused_module
+
+        if fused_module.MnnvlAllReduceNorm.is_supported(self.mapping, DTYPE, 4096):
+            cute_ar = ops_module.MNNVLAllReduce(
+                self.mapping, DTYPE, max_num_tokens=128, hidden_size=4096
+            )
+            assert cute_ar.fused_norm is not None
+            for rows in (7, 65):
+                x = torch.full((rows, 4096), self.rank + 1, dtype=DTYPE, device="cuda")
+                residual = torch.ones_like(x)
+                weight = torch.ones((4096,), dtype=DTYPE, device="cuda")
+                norm, res = cute_ar.fused_norm(residual, weight, 1e-5, x=x)
+                expected = self.world_size * (self.world_size + 1) // 2 + 1
+                torch.testing.assert_close(res, torch.full_like(res, expected))
+                torch.testing.assert_close(norm, torch.ones_like(norm), rtol=RTOL, atol=ATOL)
 
         allreduce = AllReduce(mapping=self.mapping, strategy=strategy, dtype=DTYPE)
         assert allreduce.mnnvl_allreduce is not None, (
@@ -193,12 +237,11 @@ def _spawn_workers(world_size: int):
 @pytest.mark.gpu2
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs to run this test")
 @pytest.mark.parametrize("fusion", [True, False], ids=["fusion", "no_fusion"])
-@pytest.mark.parametrize("strategy", [AllReduceStrategy.AUTO, AllReduceStrategy.MNNVL])
-def test_mnnvl_allreduce_over_process_group(setup_ray_cluster, fusion, strategy):
+def test_mnnvl_allreduce_over_process_group(setup_ray_cluster, fusion):
     world_size = 2
     workers = _spawn_workers(world_size)
 
     if not all(ray.get([w.mnnvl_supported.remote() for w in workers])):
         pytest.skip("MNNVL is not supported on this machine")
 
-    assert all(ray.get([w.run.remote(fusion, strategy) for w in workers]))
+    assert all(ray.get([w.run.remote(fusion, AllReduceStrategy.MNNVL) for w in workers]))

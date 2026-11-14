@@ -1153,11 +1153,9 @@ def run_early_pdl_release_single_rank(tensor_parallel_size, input, residual,
                                       norm_weight):
     rank = tensorrt_llm.mpi_rank()
     torch.cuda.set_device(rank)
-    previous_mnnvl = os.environ.get("TLLM_TEST_MNNVL")
     try:
         input, residual = input.cuda(), residual.cuda()
         norm_weight = norm_weight.cuda()
-        os.environ["TLLM_TEST_MNNVL"] = "1"
         MPI.COMM_WORLD.barrier()
         mapping = Mapping(world_size=tensor_parallel_size,
                           tp_size=tensor_parallel_size,
@@ -1198,12 +1196,6 @@ def run_early_pdl_release_single_rank(tensor_parallel_size, input, residual,
     except Exception:
         traceback.print_exc()
         raise
-    finally:
-        # The pool worker is reused: later tests see the setting they had before.
-        if previous_mnnvl is None:
-            os.environ.pop("TLLM_TEST_MNNVL", None)
-        else:
-            os.environ["TLLM_TEST_MNNVL"] = previous_mnnvl
     return True
 
 
