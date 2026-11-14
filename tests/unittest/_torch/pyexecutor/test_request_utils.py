@@ -197,6 +197,19 @@ def test_request_broadcast_preserves_python_inputs(enabled, original_end_id) -> 
     assert metrics.timing_metrics.arrival_time == datetime.timedelta(seconds=123)
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_request_broadcast_carries_the_batched_logits_processor_flag(enabled) -> None:
+    # Pipeline stages other than the first rebuild requests from the broadcast
+    # envelope, so the flag must travel inside PythonRequestInputs.
+    request = trtllm.Request(input_token_ids=[1, 2, 3], max_tokens=10)
+    if enabled:
+        request.py_apply_batched_logits_processor = True
+    restored = _broadcast_round_trip(request)
+    assert restored.inputs.apply_batched_logits_processor is enabled
+    translated = executor_request_to_llm_request(42, restored, [], False)
+    assert translated.py_apply_batched_logits_processor is enabled
+
+
 def test_request_broadcast_preserves_absent_python_input_defaults() -> None:
     restored = _broadcast_round_trip(
         trtllm.Request(input_token_ids=[1, 2, 3], max_tokens=10, end_id=7)
@@ -435,6 +448,23 @@ def test_child_factory_copies_processor_list_and_preserves_callables(processor_c
     child_processors.append(StatefulProcessor())
     assert len(processors) == processor_count
     assert len(sibling_processors) == processor_count
+
+
+def test_child_factory_copies_the_batched_logits_processor_flag() -> None:
+    # Only the opted-in parent tells a copy apart from the False default.
+    parent = LlmRequest(
+        request_id=42,
+        input_tokens=[1, 2, 3],
+        max_new_tokens=10,
+        sampling_config=trtllm.SamplingConfig(num_return_sequences=3),
+        is_streaming=False,
+        py_apply_batched_logits_processor=True,
+    )
+    parent.create_child_request(43)
+    parent.create_child_request(44)
+
+    assert all(child.py_apply_batched_logits_processor for child in parent.child_requests)
+    assert len(parent.child_requests) == 2
 
 
 @pytest.mark.parametrize("runtime_field", ["py_mm_encoder_state", "py_mm_encoder_event"])
