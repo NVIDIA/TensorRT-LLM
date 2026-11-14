@@ -77,16 +77,41 @@ class LogProbsStateList:
     sampled_rank: _LogProbsIntState
     topk_vals: _LogProbsFloatState
     topk_indices: _LogProbsIntState
+    _slot_to_row: dict[int, int] | None = None
 
     @staticmethod
-    def from_logprobs_state(logprobs_state: LogProbsState) -> "LogProbsStateList":
+    def from_logprobs_state(
+        logprobs_state: LogProbsState,
+        active_slots: list[int] | None = None,
+    ) -> "LogProbsStateList":
+        num_slots = logprobs_state.sampled_vals.size(0)
+        # Keep dense batches on the direct tolist path; index_select only pays
+        # off when it removes a substantial part of the preallocated store.
+        use_sparse_rows = active_slots is not None and len(active_slots) * 2 < num_slots
+        slot_to_row = None
+        if use_sparse_rows:
+            assert active_slots is not None
+            slot_indices = torch.tensor(active_slots, dtype=torch.long)
+            slot_to_row = {slot: row for row, slot in enumerate(active_slots)}
+            logprobs_state = LogProbsState(
+                sampled_vals=logprobs_state.sampled_vals.index_select(0, slot_indices),
+                sampled_indices=logprobs_state.sampled_indices.index_select(0, slot_indices),
+                sampled_rank=logprobs_state.sampled_rank.index_select(0, slot_indices),
+                topk_vals=logprobs_state.topk_vals.index_select(0, slot_indices),
+                topk_indices=logprobs_state.topk_indices.index_select(0, slot_indices),
+            )
+
         return LogProbsStateList(
             sampled_vals=logprobs_state.sampled_vals.tolist(),
             sampled_indices=logprobs_state.sampled_indices.tolist(),
             topk_vals=logprobs_state.topk_vals.tolist(),
             topk_indices=logprobs_state.topk_indices.tolist(),
             sampled_rank=logprobs_state.sampled_rank.tolist(),
+            _slot_to_row=slot_to_row,
         )
+
+    def _row_for_slot(self, slot: int) -> int:
+        return slot if self._slot_to_row is None else self._slot_to_row[slot]
 
 
 @dataclass(kw_only=True)
@@ -139,9 +164,10 @@ def store_logprobs_list_to_request(
         Shape: (beam_width, count)
     """
 
-    sampled_log_probs_indices_list = logprobs_state_list.sampled_indices[req_seq_slot]
-    sampled_log_probs_vals_list = logprobs_state_list.sampled_vals[req_seq_slot]
-    sampled_log_probs_rank_list = logprobs_state_list.sampled_rank[req_seq_slot]
+    row = logprobs_state_list._row_for_slot(req_seq_slot)
+    sampled_log_probs_indices_list = logprobs_state_list.sampled_indices[row]
+    sampled_log_probs_vals_list = logprobs_state_list.sampled_vals[row]
+    sampled_log_probs_rank_list = logprobs_state_list.sampled_rank[row]
 
     if num_topk_logprobs == 0:
         if simple_format:
@@ -164,8 +190,8 @@ def store_logprobs_list_to_request(
             for beam_idx in range(beam_width)
         ]
     else:
-        token_list = logprobs_state_list.topk_indices[req_seq_slot]
-        logprobs_list = logprobs_state_list.topk_vals[req_seq_slot]
+        token_list = logprobs_state_list.topk_indices[row]
+        logprobs_list = logprobs_state_list.topk_vals[row]
         token_log_probs = [[] for _ in range(beam_width)]
         for step_idx in range(count):
             topk_tokens = token_list[step_idx][:num_topk_logprobs]

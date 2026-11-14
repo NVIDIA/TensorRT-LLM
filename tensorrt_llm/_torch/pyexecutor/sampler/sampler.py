@@ -1652,7 +1652,18 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         logprobs_state_list: LogProbsStateList | None = None
         if state.host.logprobs_state is not None:
-            logprobs_state_list = LogProbsStateList.from_logprobs_state(state.host.logprobs_state)
+            active_logprobs_slots = []
+            for request in state.requests:
+                if (
+                    request.py_return_log_probs
+                    and request.state != LlmRequestState.GENERATION_COMPLETE
+                ):
+                    assert request.py_seq_slot is not None
+                    active_logprobs_slots.append(request.py_seq_slot)
+            logprobs_state_list = LogProbsStateList.from_logprobs_state(
+                state.host.logprobs_state,
+                active_slots=active_logprobs_slots,
+            )
 
         # Beam-search requests read their finish reasons from
         # first_finish_reasons; only single-beam requests (and the batched
