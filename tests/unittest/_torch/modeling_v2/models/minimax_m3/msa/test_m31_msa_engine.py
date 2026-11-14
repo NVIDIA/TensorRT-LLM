@@ -88,14 +88,10 @@ def test_an_engine_with_the_hook_takes_the_family_classes(monkeypatch):
 
 
 def _keep_stock_lookups(monkeypatch):
-    import importlib
-
     monkeypatch.setattr(engine, "_stock_routed", False)
-    modules = []
-    for module_name, attr in engine._STOCK_MSA_LOOKUPS:
-        module = importlib.import_module(module_name)
+    modules = engine.stock_msa_lookups()
+    for module, attr in modules:
         monkeypatch.setattr(module, attr, getattr(module, attr))
-        modules.append((module, attr))
     return modules
 
 

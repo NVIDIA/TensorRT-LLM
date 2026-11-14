@@ -17,7 +17,6 @@ correctness fixes the packaged module lacks: the forward kernel waits on its gri
 from __future__ import annotations
 
 import contextlib
-import importlib
 import os
 from typing import Any, Optional
 
@@ -34,6 +33,7 @@ __all__ = [
     "indexer_prewarm",
     "require_msa_module",
     "route_stock_msa_to_vendored",
+    "stock_msa_lookups",
     "sparse_attention_classes",
     "use_family_backend",
     "warmup_scope",
@@ -43,16 +43,6 @@ __all__ = [
 _DISABLE_ENV = "TRTLLM_M31_DISABLE_FAMILY_MSA"
 
 
-# main's modules that resolve fmha_sm100 for its MiniMax-M3 MSA classes, and the attribute each resolves it through.
-_STOCK_MSA_LOOKUPS = (
-    (
-        "tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils",
-        "require_msa_module",
-    ),
-    ("tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_backend", "require_msa_module"),
-    ("tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_indexer", "require_msa_module"),
-    ("tensorrt_llm._torch.attention.backends.fmha.msa_prefill", "_msa_sparse_api"),
-)
 _stock_routed = False
 
 
@@ -65,6 +55,28 @@ def family_msa_enabled() -> bool:
     if _switch_off():
         return False
     return runtime_hooks_compat.has_hook("sparse_attention")
+
+
+def stock_msa_lookups() -> tuple:
+    """main's modules that resolve fmha_sm100 for its MiniMax-M3 MSA classes, each with the attribute it resolves it
+    through: ``(module, attribute)`` pairs."""
+    from tensorrt_llm._torch.attention.backends.fmha import msa_prefill as stock_prefill
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import (
+        msa_backend as stock_backend,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import (
+        msa_indexer as stock_indexer,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels import (
+        msa_utils as stock_utils,
+    )
+
+    return (
+        (stock_utils, "require_msa_module"),
+        (stock_backend, "require_msa_module"),
+        (stock_indexer, "require_msa_module"),
+        (stock_prefill, "_msa_sparse_api"),
+    )
 
 
 def route_stock_msa_to_vendored() -> bool:
@@ -85,8 +97,7 @@ def route_stock_msa_to_vendored() -> bool:
         "require_msa_module": family_utils.require_msa_module,
         "_msa_sparse_api": family_prefill._msa_sparse_api,
     }
-    for module_name, attr in _STOCK_MSA_LOOKUPS:
-        module = importlib.import_module(module_name)
+    for module, attr in stock_msa_lookups():
         if hasattr(module, attr):
             setattr(module, attr, vendored[attr])
     _stock_routed = True
@@ -98,7 +109,10 @@ def sparse_attention_classes() -> Optional[Any]:
     """The ``RuntimeHooks.sparse_attention`` value naming the family's classes, or None on an engine without it."""
     if not family_msa_enabled():
         return None
-    from tensorrt_llm._torch.pyexecutor.runtime_hooks import SparseAttentionClasses
+    try:
+        from tensorrt_llm._torch.pyexecutor.runtime_hooks import SparseAttentionClasses
+    except ImportError:
+        return None
 
     from .cache_manager import MiniMaxM31KVCacheManagerV2
     from .msa_backend import MiniMaxM31MsaSparseAttention
