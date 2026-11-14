@@ -25,13 +25,12 @@ try:
 except ImportError:
     pynvml = None
 
-from tensorrt_llm._torch.pyexecutor.model_loader import \
-    validate_and_set_kv_cache_quant
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.general import DatasetMetadata
 from tensorrt_llm.bench.dataclasses.statistics import (BenchmarkStatistics,
                                                        PercentileStats,
                                                        RequestRecord)
+from tensorrt_llm.bench.tuning.settings import resolve_benchmark_kv_cache_quant
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.logger import Logger
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
@@ -474,7 +473,9 @@ class ReportUtility:
         model_config = ModelConfig.from_pretrained(model,
                                                    trust_remote_code=True)
 
-        validate_and_set_kv_cache_quant(model_config, kv_cache_dtype)
+        model_config = resolve_benchmark_kv_cache_quant(model_config, model,
+                                                        kv_cache_dtype,
+                                                        self.kwargs)
 
         stats_dict["engine"] |= {
             "backend":

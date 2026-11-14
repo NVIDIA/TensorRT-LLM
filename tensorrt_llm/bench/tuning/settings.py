@@ -1,23 +1,39 @@
 from __future__ import annotations
 
+import os
+from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
-from typing import Tuple
+from typing import TYPE_CHECKING, Tuple
 
+import torch
+from pydantic import BaseModel
+
+from tensorrt_llm._torch._experimental.modeling_v2 import modeling_v2_resolve
 from tensorrt_llm._torch.pyexecutor.config_utils import (
     is_nemotron_hybrid,
     is_qwen3_hybrid,
     load_pretrained_config,
 )
+from tensorrt_llm._torch.pyexecutor.model_loader import (
+    ModelLoader,
+    construct_checkpoint_loader,
+    validate_and_set_kv_cache_quant,
+)
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bench.tuning.dataclasses import (
     ModelConfig,
     NemotronHybridConfig,
     Qwen3HybridConfig,
 )
 from tensorrt_llm.bench.tuning.heuristics import calc_engine_setting
-from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+from tensorrt_llm.llmapi.llm_args import TorchLlmArgs, update_llm_args_with_extra_dict
 from tensorrt_llm.llmapi.llm_utils import QuantConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.model_config import ModelConfig as TorchModelConfig
 
 TUNED_QUANTS = {
     QuantAlgo.NVFP4,
@@ -30,6 +46,87 @@ TUNED_QUANTS = {
 # defaults and can't drift.
 DEFAULT_MAX_BATCH_SIZE = TorchLlmArgs.model_fields["max_batch_size"].default
 DEFAULT_MAX_NUM_TOKENS = TorchLlmArgs.model_fields["max_num_tokens"].default
+
+
+@contextmanager
+def _routing_environment(overrides: dict[str, str] | None):
+    """Make the LLM's environment overrides visible to the bench router."""
+    overrides = overrides or {}
+    previous = {name: os.environ.get(name) for name in overrides}
+    try:
+        os.environ.update({name: str(value) for name, value in overrides.items()})
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def resolve_benchmark_kv_cache_quant(
+    config: TorchModelConfig,
+    model: str | Path,
+    kv_cache_dtype: str,
+    llm_options: dict,
+    *,
+    extra_options: dict | None = None,
+    explicit_cli_keys: set[str] | None = None,
+) -> TorchModelConfig:
+    """Resolve target-dependent cache quantization without loading model weights."""
+    requests_nvfp4 = kv_cache_dtype == "nvfp4" or (
+        kv_cache_dtype == "auto" and config.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
+    )
+    # Only SM107's NVFP4 fallback depends on the target implementation.
+    if requests_nvfp4 and torch.cuda.is_available() and get_sm_version() == 107:
+        if extra_options:
+            llm_options = update_llm_args_with_extra_dict(
+                llm_options, extra_options, explicit_cli_keys=explicit_cli_keys
+            )
+        if llm_options.get("modeling_v2") != "off":
+            # Model defaults mutate nested configs; keep the caller's options intact.
+            llm_args = TorchLlmArgs(
+                **{
+                    name: value.model_copy(deep=True) if isinstance(value, BaseModel) else value
+                    for name, value in llm_options.items()
+                }
+            )
+            checkpoint_loader = construct_checkpoint_loader(
+                llm_args.checkpoint_loader,
+                llm_args.checkpoint_format,
+                mx_config=llm_args.mx_config,
+                checkpoint_io_policy=llm_args.checkpoint_io_policy,
+                load_format=llm_args.load_format,
+                partial_model_loading=llm_args.is_partial_model_loading,
+            )
+            checkpoint_dir = str(model)
+            try:
+                llm_args = ModelLoader.load_config_and_apply_defaults(
+                    checkpoint_dir, llm_args, checkpoint_loader
+                )
+                routing_config = checkpoint_loader.load_config(
+                    checkpoint_dir,
+                    trust_remote_code=llm_args.trust_remote_code,
+                    mapping=llm_args.parallel_config.to_mapping(),
+                    spec_config=llm_args.speculative_config,
+                    mm_encoder_only=llm_args.mm_encoder_only,
+                    attn_backend=llm_args.attn_backend,
+                    sparse_attention_config=llm_args.sparse_attention_config,
+                    moe_backend=llm_args.moe_config.backend,
+                    moe_load_balancer=llm_args.moe_config.load_balancer,
+                    model_kwargs=llm_args.model_kwargs,
+                )
+            finally:
+                checkpoint_loader.cleanup()
+            # Bench runs on the driver; the engine checks agreement across workers.
+            with _routing_environment(llm_args.env_overrides):
+                target = modeling_v2_resolve(routing_config, llm_args)
+            if target is not None:
+                config = replace(routing_config, modeling_v2_target=target)
+                kv_cache_dtype = llm_args.kv_cache_config.dtype
+
+    validate_and_set_kv_cache_quant(config, kv_cache_dtype)
+    return config
 
 
 def get_benchmark_engine_settings(
