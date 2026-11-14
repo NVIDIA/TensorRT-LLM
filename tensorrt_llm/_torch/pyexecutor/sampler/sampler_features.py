@@ -599,7 +599,7 @@ class _SideStreamCopier:
                 src.record_stream(self._side_stream)
                 dst.copy_(src, non_blocking=True)
         self._tasks.clear()
-        event = torch.cuda.Event()
+        event = torch.cuda.Event(blocking=True)
         event.record(self._side_stream)
         self.event = event
         return event
@@ -687,7 +687,7 @@ class AsyncWorkerMixin:
 
             # Record an event on the main thread/stream that we will
             # synchronize with on the worker thread/stream
-            copy_ready = torch.cuda.Event()
+            copy_ready = torch.cuda.Event(blocking=True)
             copy_ready.record()
 
             # Submit the copy to the async worker thread
@@ -723,7 +723,7 @@ class AsyncWorkerMixin:
         side_stream_event, if given, is forwarded so SamplerEvent.synchronize
         also awaits the side-stream copies host-side.
         """
-        cuda_event = torch.cuda.Event()
+        cuda_event = torch.cuda.Event(blocking=True)
         cuda_event.record()
 
         # Transfer ownership to worker_futures and re-initialize
