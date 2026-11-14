@@ -284,7 +284,9 @@ def check_back_to_back() -> None:
     for i, (kind, block, batch) in enumerate(plan):
         full, prev0 = _inputs(5000 + i, batch, block, sh.vocab, "ties" if i % 3 == 0 else "random")
         inputs.append((sh.base(full, RANK), prev0))
-    for kind, block, batch in set(plan):  # compile outside the sequence
+    # Compile outside the sequence, in plan order on every rank: each call is a collective, and a set's iteration
+    # order follows the per-process string hash seed, so ranks would launch different shapes against each other.
+    for kind, block, batch in dict.fromkeys(plan):
         base, prev0 = inputs[plan.index((kind, block, batch))]
         (sh.wide if kind == "wide" else sh.catalog)(base, prev0)
     torch.cuda.synchronize()
