@@ -1553,6 +1553,14 @@ repos:
         additional_dependencies: [jinja2]
         always_run: true
         pass_filenames: false
+    -   id: serve-ci-coverage
+        name: check trtllm-serve CI coverage (multi-GPU list, CBTS VisualGen prefixes, CODEOWNERS)
+        entry: python scripts/check_serve_ci_coverage.py
+        language: python
+        additional_dependencies: [PyYAML]
+        pass_filenames: false
+        # Deleted paths are absent from pre-commit's file selection.
+        always_run: true
     -   id: vendor-sources-check
         name: verify vendored sources are in sync
         entry: python scripts/vendor/manage.py check

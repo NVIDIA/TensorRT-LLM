@@ -434,6 +434,8 @@ l0_cpu:
   - unittest/quantization/test_nvfp4_plus_format.py
   - unittest/scaffolding
   - unittest/scripts
+  # Also collected by unittest/scripts; listed on its own so CBTS keeps it for VisualGen-only PRs.
+  - unittest/scripts/visual_gen/test_serve_ci_coverage_visual_gen.py
   - unittest/serve
   # VisualGen serve tests are also collected by the entry above. This entry keeps
   # them for VisualGen-only PRs, where CBTS keeps only entries containing visual_gen/
