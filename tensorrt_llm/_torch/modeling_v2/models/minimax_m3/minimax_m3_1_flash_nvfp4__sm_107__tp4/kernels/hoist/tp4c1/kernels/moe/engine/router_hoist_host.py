@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import atexit
 import contextlib
-import importlib
 import inspect
 import json
 import os
@@ -243,11 +242,10 @@ def _c2_classes(mod, port):
 
 
 def _c2_build(blk, reg, cfg, *, factory, port, **route):
-    """An expert_local engine factory ("module:attr") built with cfg over expert_local_extra_cfg, and the route bindings
-    on the state classes of its engine package dir `port`."""
-    mname, attr = factory.split(":")
+    """An expert_local engine factory (a callable of its host module) built with cfg over expert_local_extra_cfg, and
+    the route bindings on the state classes of its engine package dir `port`."""
     _itp(blk)
-    mod = importlib.import_module(mname)
+    mod = sys.modules[factory.__module__]
     classes = _c2_classes(mod, port) if route else []
     if route and not classes:
         raise RuntimeError(f"h9 hoist C2: no engine state class loaded from {port}")
@@ -255,7 +253,7 @@ def _c2_build(blk, reg, cfg, *, factory, port, **route):
     with contextlib.ExitStack() as es:
         for c in classes:
             es.enter_context(_route_kwargs(c, **route))
-        return getattr(mod, attr)(blk, extra_cfg=extra)
+        return factory(blk, extra_cfg=extra)
 
 
 def _state_c1(blk):
@@ -595,7 +593,7 @@ def _rh_cfg(rh_w=None):
 
 def _l_cfg(over):
     """K-OPROJ rev 7 passthrough (L-ATTN / L-HBM / L-CODE): H9_RH_PTRIG (0|1), H9_RH_XPOLL (0|1), H9_RH_XPNS (>= 0),
-    H9_RH_SHP (0|1|2), H9_RH_UNROLL (>= 0); explicit factory kwargs (over) win. shp needs shp_ranges_fn (lhbm)."""
+    H9_RH_SHP (0|1|2), H9_RH_UNROLL (>= 0); explicit factory kwargs (over) win. shp needs a shp_ranges_fn kwarg."""
     env = {
         "ptrig": ("H9_RH_PTRIG", "0"),
         "xpoll": ("H9_RH_XPOLL", "0"),
@@ -617,7 +615,7 @@ def _l_cfg(over):
         )
     if k["shp"] and k.get("shp_ranges_fn") is None:
         raise RuntimeError(
-            "h9 hoist: shp needs shp_ranges_fn: use plugins.h9.lhbm:make_oproj_rh_shp1 / _shp2"
+            "h9 hoist: shp needs a shp_ranges_fn factory kwarg (none is configured in this block)"
         )
     return {n: v for n, v in k.items() if v or n == "shp_ranges_fn"}
 

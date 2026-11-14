@@ -15,7 +15,7 @@ def _over():
 
 
 @contextlib.contextmanager
-def _patched():  # compat: comm's TP4 per-token factory still wraps hoist._c1_build with this (REQUESTS-moe.md R4)
+def _patched():  # compat: comm's TP4 per-token factory still wraps hoist._c1_build with this
     from . import router_hoist_host as hoist
 
     orig = hoist._c1_build

@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import importlib
 import json
 import os
 import tempfile
@@ -31,7 +30,7 @@ def bind(owner: str, values: dict) -> None:
 
 
 def base_knobs(llk) -> dict:
-    """Knobs every legacy module in this layer reads from the process env: the build root (TMPDIR) and RANK."""
+    """Knobs every host module in this layer reads from the process env: the build root (TMPDIR) and RANK."""
     return {"TMPDIR": tempfile.gettempdir(), "RANK": str(llk.rank)}
 
 
@@ -42,22 +41,12 @@ def g3_knobs(llk) -> dict:
     return _g3(llk)
 
 
-def legacy(name: str):
-    """Import a legacy module by its dotted name (served from the _src copies by toolchain.legacy)."""
-    return importlib.import_module(name)
-
-
-def legacy_attr(spec: str):
-    mod, attr = spec.split(":")
-    return getattr(legacy(mod), attr)
-
-
 def jdump(d: dict, compact: bool) -> str:
-    """The exact json spelling the legacy modules expect for a knob value."""
+    """The exact json spelling the host modules expect for a knob value."""
     return json.dumps(d, separators=(",", ":")) if compact else json.dumps(d)
 
 
-# legacy factories allocate their own tensors outside the arenas; size not measured yet
+# host-module factories allocate their own tensors outside the arenas; size not measured yet
 UNMEASURED = Footprint(measured=False, in_arena=False)
 
 
@@ -76,7 +65,7 @@ def stage(variant, fn, *, reads, writes, pdl, footprint=UNMEASURED, keys=(), ker
 
 
 def chain(*fns):
-    """One Stage that launches several legacy slot callables in order (o_proj then post)."""
+    """One Stage that launches several host-module slot callables in order (o_proj then post)."""
     fns = tuple(fns)
 
     def fn():
@@ -105,8 +94,6 @@ __all__ = [
     "jdump",
     "knobs",
     "engine_dir",
-    "legacy",
-    "legacy_attr",
     "stage",
 ]
 
