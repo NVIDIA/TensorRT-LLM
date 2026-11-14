@@ -25,7 +25,7 @@ serves linear one-model MTP-Eagle with the step fused into its forward.
 **Text only.** The checkpoint is the vision-language wrapper. This target builds and loads no vision tower: the
 weight mapper's audit allowlists the ``model.visual.*`` namespace. A request that carries multimodal input is
 refused at admission (``validate_multimodal_request_data``), so a deployment that keeps the multimodal encoder
-serves text requests and fails image and video requests alone.
+serves text requests and fails each request that carries media alone.
 """
 
 from __future__ import annotations
@@ -83,6 +83,9 @@ from . import weights as _weights
 # The GPU architecture this target IS. Routing will not send another one here, but a direct instantiation could,
 # and the certification is per arch.
 _SM = (10, 0)
+
+#: ``multimodal_data`` entries that carry media for an encoder, or encoder output in place of it.
+_MEDIA_KEYS = frozenset({"audio", "image", "video", "multimodal_embedding"})
 
 #: Stock code the generic path runs outside the catalog, declared so it is not consumed silently: every
 #: tensorrt_llm import of this module that computes (this target's unit tests check the list both ways, with
@@ -2084,13 +2087,14 @@ class ModelingV2Glm53FlashNvfp4Sm100Default(Glm5NextForCausalLM):
         _weights.load(self, weights, weight_mapper)
 
     def validate_multimodal_request_data(self, mm_data: dict) -> None:
-        """Refuse, at admission, a request that carries multimodal input: this target runs no vision tower.
+        """Refuse, at admission, a request whose multimodal payload carries media: this target runs no encoder.
 
-        The executor calls this only for a request with multimodal data. Refusing here fails that request alone;
-        the forward would otherwise serve its text without the image or video.
+        Refusing here fails that request alone; the forward would otherwise serve its text without the media.
+        A payload without media is accepted.
         """
-        del mm_data
-        raise ValueError(
-            "the GLM-5.3-Flash modeling_v2 target serves text only and runs no vision tower; the request carries "
-            "multimodal input"
-        )
+        media = sorted(key for key in _MEDIA_KEYS if mm_data.get(key) is not None)
+        if media:
+            raise ValueError(
+                f"{type(self).__name__} serves this checkpoint's language model only and does not accept "
+                f"multimodal input; the request carries {', '.join(media)}"
+            )
