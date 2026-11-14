@@ -28,6 +28,7 @@ from tensorrt_llm.serve.responses_utils import (
     _create_output_messages,
     request_preprocess,
 )
+from tensorrt_llm.serve.serving_extensions import ServingExtension
 
 pytestmark = pytest.mark.cpu_only
 
@@ -209,7 +210,8 @@ async def _preprocess(monkeypatch, store_flag):
     async def fake_render(resources, **kwargs):
         return SimpleNamespace(token_ids=[1, 2, 3], text=None)
 
-    resources = SimpleNamespace(extension=SimpleNamespace(serialize_tool=lambda tool: tool))
+    # The default extension: the generic replay of stored turns, no tool dumps needed.
+    resources = SimpleNamespace(extension=ServingExtension())
     monkeypatch.setattr(ru, "parse_chat_messages_coroutines", fake_parse)
     monkeypatch.setattr(ru, "RenderResources", SimpleNamespace(from_parts=lambda **kw: resources))
     monkeypatch.setattr(ru, "render_conversation", fake_render)
