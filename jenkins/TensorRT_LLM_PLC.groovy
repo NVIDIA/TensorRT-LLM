@@ -132,7 +132,7 @@ def createKubernetesPodConfig()
                 qosClass: Guaranteed
         """.stripIndent(),
     ]
-    return podConfig
+    return ciNodePolicy.apply(podConfig, [pipeline: "TensorRT_LLM_PLC"])
 }
 
 boolean isValidGithubUser(String owner) {

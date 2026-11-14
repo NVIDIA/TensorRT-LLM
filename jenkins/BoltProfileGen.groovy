@@ -288,7 +288,7 @@ def createKubernetesPodConfig(image, arch = "amd64")
                     claimName: sw-tensorrt-pvc
         """.stripIndent(),
     ]
-    return podConfig
+    return ciNodePolicy.apply(podConfig, [pipeline: "BoltProfileGen"])
 }
 
 
