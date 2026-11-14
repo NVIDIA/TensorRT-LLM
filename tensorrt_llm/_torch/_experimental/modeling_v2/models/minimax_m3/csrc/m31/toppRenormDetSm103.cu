@@ -44,7 +44,7 @@ namespace
 {
 
 // ---------------------------------------------------------------------------------------------------------------------
-// Vendored from FlashInfer, include/flashinfer/air_top_p.cuh (FlashInfer v0.6.15; identical in v0.6.18), namespace
+// Vendored from FlashInfer, include/flashinfer/air_top_p.cuh, namespace
 // flashinfer::sampling::air_top_p. Copyright (c) 2026 by FlashInfer team, licensed under the Apache License,
 // Version 2.0. Copied verbatim (only the pieces this kernel uses; formatting kept) so that the bucket keys, masks
 // and the deterministic histogram -> float conversion are FlashInfer's own; FlashInfer's headers are not on the

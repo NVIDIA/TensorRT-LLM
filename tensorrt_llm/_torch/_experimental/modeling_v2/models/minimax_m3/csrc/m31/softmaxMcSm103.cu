@@ -43,7 +43,7 @@ namespace
 {
 
 // ---------------------------------------------------------------------------------------------------------------------
-// Vendored from FlashInfer (v0.7.2): include/flashinfer/utils.cuh (ceil_div, round_up),
+// Vendored from FlashInfer: include/flashinfer/utils.cuh (ceil_div, round_up),
 // include/flashinfer/sampling.cuh (MaxReduceOp, Float2SoftmaxReduceOp, PartialSoftmaxResult) and
 // include/flashinfer/vec_dtypes.cuh (vec_t<float, vec_size>: only the members the kernels below use; cast_load /
 // cast_store are the same-type branch of FlashInfer's cast_load_impl / cast_store_impl, i.e. load / store).
@@ -165,7 +165,7 @@ __global__ void __launch_bounds__(kThreads) softmaxMcMapKernel(float const* logi
     float thread_max = -cuda::std::numeric_limits<float>::infinity();
 #pragma unroll
     for (uint32_t j = 0; j < kVec; ++j) {
-      // __fmul_rn, not *: it must not be contracted into an FMA (FlashInfer 0.7.2).
+      // __fmul_rn, not *: it must not be contracted into an FMA (FlashInfer's OnlineSoftmax arithmetic).
       logits_vec[j] = __fmul_rn(static_cast<float>(logits_vec[j]), inv_temp);
       thread_max = max(thread_max, logits_vec[j]);
     }
@@ -235,7 +235,7 @@ __global__ void __launch_bounds__(kThreads)
     }
 #pragma unroll
     for (uint32_t j = 0; j < kVec; ++j) {
-      // __fmul_rn, not *: it must not be contracted into an FMA (FlashInfer 0.7.2).
+      // __fmul_rn, not *: it must not be contracted into an FMA (FlashInfer's OnlineSoftmax arithmetic).
       logits_vec[j] = __fmul_rn(static_cast<float>(logits_vec[j]), inv_temp);
       float p = __expf(static_cast<float>(logits_vec[j]) - final_max) * inv_denominator;
       prob_vec[j] = static_cast<float>(p);

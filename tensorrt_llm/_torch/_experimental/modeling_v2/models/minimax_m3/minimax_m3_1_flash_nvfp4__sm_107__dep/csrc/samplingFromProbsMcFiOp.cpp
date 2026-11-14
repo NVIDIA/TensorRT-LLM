@@ -34,7 +34,7 @@ namespace torch_ext
 //! flashinfer.sampling.sampling_from_probs's int32 tokens [rows] (deterministic, tensor seed / offset), bitwise, on
 //! rows x ctas_per_row CTAs. probs: float32 [rows, vocab] on the device, 16-byte aligned, with a row stride divisible
 //! by 4 floats. seed / offset: 1-D int64 CUDA tensors of one entry (broadcast to every row) or one entry per row, as
-//! FlashInfer 0.7.2 reads them.
+//! FlashInfer's sampling_from_probs reads them.
 //! workspace: a zero-initialized byte buffer of at least rows x minimax_m31_sampling_from_probs_mc_fi_ws_bytes(),
 //! reused across calls; ctas_per_row divides 1024 (no co-residency limit).
 torch::Tensor minimaxM31SamplingFromProbsMcFi(torch::Tensor const& probs, torch::Tensor const& seed,

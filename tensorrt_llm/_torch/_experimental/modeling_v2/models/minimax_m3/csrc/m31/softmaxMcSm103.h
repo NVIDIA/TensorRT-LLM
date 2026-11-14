@@ -41,7 +41,7 @@ constexpr int kSoftmaxMcSliceSize = 8192;
 //! out[r, i] = softmax(logits[r,:] / T_r)[i] with T_r = temperatureArr[r] when temperatureArr is not null, else
 //! temperatureVal (inverse temperature 0 when T_r == 0, as FlashInfer).
 //!
-//! Bitwise contract vs flashinfer.sampling.softmax(logits, temperature) (FlashInfer 0.7.2, Path A):
+//! Bitwise contract vs flashinfer.sampling.softmax(logits, temperature) (FlashInfer's OnlineSoftmax path, Path A):
 //!   - the Map kernel is FlashInfer's OnlineSoftmaxMapKernel<1024, 4, float> (same grid, same cub BlockReduce calls,
 //!     same per-element source form), writing the same per-slice partials;
 //!   - every one of a row's writeCtas CTAs runs FlashInfer's Reduce prologue unchanged (the same cub

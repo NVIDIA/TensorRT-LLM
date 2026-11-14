@@ -6,10 +6,11 @@
 (``speculative/interface.set_chain_speculative_sampling_override`` and its slot-indexed form
 ``set_chain_speculative_sampling_slot_override``).
 
-``mv2_minimax_m3::minimax_m31_chain_speculative_sampling_mc_fi`` (kernels/minimaxM31/chainSpecSamplingMcFiSm107.cu) on
+``mv2_minimax_m3::minimax_m31_chain_speculative_sampling_mc_fi`` (family csrc/m31/chainSpecSamplingMcFiSm107.cu) on
 ``ctas_per_row`` CTAs per request (FlashInfer: one CTA per request). The slot-indexed form reads the draft rows in place
 from the spec metadata's [slots, maxDraft, vocab] buffer, so the gather the stock path copies first is skipped (the
-same floats). A rejected row whose residual has no mass at all gets token -1, as FlashInfer (0.7.3) returns.
+same floats). A rejected row whose residual has no mass at all gets token -1, as FlashInfer's
+chain_speculative_sampling returns.
 
 The overrides return None, and the sampler keeps the stock gather and FlashInfer call, on a build without the op, past
 MAX_BATCH requests, for an input outside the kernel's contract, or when the workspace is first needed inside a

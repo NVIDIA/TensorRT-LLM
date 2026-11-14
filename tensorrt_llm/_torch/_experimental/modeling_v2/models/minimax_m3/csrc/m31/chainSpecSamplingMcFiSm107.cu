@@ -97,7 +97,7 @@ __device__ __forceinline__ void loadResidual(
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// FlashInfer's DeterministicInclusiveSum (include/flashinfer/sampling.cuh, FlashInfer v0.7.3). Copyright (c) 2024 by
+// FlashInfer's DeterministicInclusiveSum (include/flashinfer/sampling.cuh). Copyright (c) 2024 by
 // FlashInfer team, licensed under the Apache License, Version 2.0. Copied with its template parameters fixed
 // (VEC_SIZE 4, BLOCK_THREADS 1024) and its shared array passed in; formatting kept. FlashInfer's headers are not on
 // the TensorRT-LLM C++ include path.
