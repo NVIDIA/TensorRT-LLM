@@ -611,7 +611,7 @@ def _k_tile(rank, i: int, split: int, my_tiles: int, contig: bool):
     return rank + cutlass.Int32(i * split)
 
 
-# ---- LROUTER2 (w6/v2/bnd/LROUTER2.md): P-RALT option A, `ra` dedicated router CTAs at bx 0 .. ra - 1 of the grid ----
+# ---- LROUTER2: P-RALT option A, `ra` dedicated router CTAs at bx 0 .. ra - 1 of the grid ----
 RA_TAB_WORDS = 10  # ra_tab int64: blob_a, blob_r, residual_mid, xq, xsf, rx bases (int64[world]), oep, rxc, dbg, stamps
 RA_E = 8  # experts per router CTA
 # TP4-PORT (lr4): TP4 shapes. a-part K = 2048 (8 E4M3 per thread, 2 chunks of 1024); r-part 1536 residual columns
@@ -941,7 +941,7 @@ def _ra_exit(*, loc=None, ip=None):
     _asm(None, [], "exit;", "~{memory}", loc=loc, ip=ip)
 
 
-# ---- LROUTER3 (w6/v2/er/ER-A2.md): router CTAs hold W'' and W' in smem (one bulk burst at entry), one FMA pass each
+# ---- LROUTER3: router CTAs hold W'' and W' in smem (one bulk burst at entry), one FMA pass each
 # ----
 RA_R_OFF = RA_A_BYTES  # W' slice after the W'' slice
 RA_W_BYTES = RA_A_BYTES + RA_R_BYTES  # 229376: all router weights of one router CTA
@@ -1334,7 +1334,7 @@ def m3_mx_gemv_kernel(
             _rc_entry(
                 tx, ra_sb, ra_mb, ra_mb + cutlass.Int32(8), ra_mb + cutlass.Int32(16), ra_br, ra_ba
             )
-            # residual_mid (final at launch, schema v2 §4.4): 4 bf16 per (token, m), all loads in one round
+            # residual_mid (final at launch): 4 bf16 per (token, m), all loads in one round
             ra_res = _ld_global_s64(ra_tab + cutlass.Int64(16))
             ra_rv = []
             for t in cutlass.range_constexpr(ra_tok):

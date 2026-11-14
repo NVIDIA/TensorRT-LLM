@@ -30,7 +30,7 @@ ROWS = 8
 H = 6144
 KO = 2048  # o_proj K per TP4 rank: 16 q heads x 128 (weights.py q_width; the reference fused_o_proj_tp4_host.KO)
 E = 128
-# passB preflight P3_HYB_engine_push (every rank): the engine module the HYB arm ran.
+# The engine module configuration the HYB arm runs (every rank).
 HYB_ENGINE = {
     "AR_G3": 0,
     "AR_V3": 0,
