@@ -216,13 +216,18 @@ def find_replicated_role_mismatch(
 def get_replicated_role_layer_bytes(
     page_table: KVCachePageTable, kind: CacheKind
 ) -> Dict[Tuple[FrozenSet[str], int], int]:
-    """``{(pool_role, global_layer_id): bytes_per_layer}`` of every REPLICATED view of *kind*."""
+    """``{(pool_role, global_layer_id): bytes_per_layer}`` of every REPLICATED view of *kind*.
+
+    Ring views (``ring_slot_bytes`` set) are left out: their region holds as many token slots as
+    that side keeps, so its size may differ between peers; the transfer moves them position by
+    position and checks only the slot size.
+    """
     sizes: Dict[Tuple[FrozenSet[str], int], int] = {}
     for layer_group in page_table.layer_groups:
         if layer_group.kind != kind:
             continue
         for pool_view in layer_group.pool_views:
-            if pool_view.mapper_kind != MapperKind.REPLICATED:
+            if pool_view.mapper_kind != MapperKind.REPLICATED or pool_view.ring_slot_bytes:
                 continue
             _, bytes_per_layer = get_layer_byte_ranges(pool_view)
             for global_layer_id in get_pool_view_global_layer_ids(pool_view, layer_group):

@@ -15,6 +15,7 @@
 import copy
 import dataclasses
 import os
+import types
 from contextlib import ExitStack
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Union
 
@@ -1049,6 +1050,9 @@ class KvCacheCreator:
     # it to both constructors; the managers must not re-derive it.
     _joint_kv_cache_reuse = False
     _gen_preemption_headroom: int = 0
+    # The model's standalone-drafter KV-cache opt-ins (``_draft_kv_opt_ins``);
+    # none without a drafter.
+    _draft_kv_opt_ins: types.MappingProxyType = types.MappingProxyType({})
 
     def __init__(
         self,
@@ -1074,9 +1078,11 @@ class KvCacheCreator:
         gen_preemption_headroom: int = 0,
     ):
         self._model_engine = model_engine
-        # Per-creator, applied to the draft manager it builds only.
-        self._draft_kv_opt_ins = _draft_kv_opt_ins(
-            runtime_hooks_of(model_engine.model))
+        # Per-creator, applied to the draft manager it builds only; only a
+        # speculative engine builds one.
+        if speculative_config is not None:
+            self._draft_kv_opt_ins = _draft_kv_opt_ins(
+                runtime_hooks_of(model_engine.model))
         self._mapping = mapping
         self._kv_cache_config = kv_cache_config
         self._max_kv_tokens_in = self._kv_cache_config.max_tokens

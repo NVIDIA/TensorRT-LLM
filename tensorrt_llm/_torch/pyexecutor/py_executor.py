@@ -3447,7 +3447,7 @@ class PyExecutor:
         if mem_info is None:
             mem_info = IterStatsMemInfo(_ITERSTATS_MEMINFO_REFRESH_S)
             self._iter_stats_mem_info = mem_info
-        end, total_gpu_memory = mem_info(torch.cuda.current_device())
+        end, total_gpu_memory = mem_info()
         stats.gpu_mem_usage = total_gpu_memory - end
         stats.cpu_mem_usage = 0
         stats.pinned_mem_usage = 0

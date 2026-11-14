@@ -57,22 +57,30 @@ def frozen() -> bool:
     return os.environ.get(FROZEN_ENV, "0") == "1"
 
 
-def autotune(tune_mode: bool = True, cache: Optional[str] = None, *args, **kwargs):
-    """``flashinfer.autotune`` with this rank's cache file filled in when none is given."""
+def autotune(*args, **kwargs):
+    """``flashinfer.autotune`` with this rank's cache file filled in when none is given.
+
+    Takes FlashInfer's arguments (``tune_mode=True, cache=None, ...``). Without a file to serve, or
+    with an explicit ``cache``, FlashInfer's own ``autotune`` is called exactly as this one was.
+    """
     from flashinfer import autotune as _autotune
 
+    cache = args[1] if len(args) > 1 else kwargs.get("cache")
     path = cache_file() if cache is None else None
-    if path is not None:
-        if frozen():
-            tune_mode = False
-            if _STATE["loaded"]:
-                return _autotune(tune_mode, None, *args, **kwargs)
-            _STATE["loaded"] = True
-        cache = path
-        if not _STATE["logged"]:
-            _STATE["logged"] = True
-            logger.info(
-                f"FlashInfer autotune cache: rank={mpi_rank()} file={path} "
-                f"exists={os.path.isfile(path)} frozen={frozen()}"
-            )
-    return _autotune(tune_mode, cache, *args, **kwargs)
+    if path is None:
+        return _autotune(*args, **kwargs)
+    tune_mode = args[0] if args else kwargs.pop("tune_mode", True)
+    kwargs.pop("cache", None)
+    args = args[2:]
+    if frozen():
+        tune_mode = False
+        if _STATE["loaded"]:
+            return _autotune(tune_mode, None, *args, **kwargs)
+        _STATE["loaded"] = True
+    if not _STATE["logged"]:
+        _STATE["logged"] = True
+        logger.info(
+            f"FlashInfer autotune cache: rank={mpi_rank()} file={path} "
+            f"exists={os.path.isfile(path)} frozen={frozen()}"
+        )
+    return _autotune(tune_mode, path, *args, **kwargs)

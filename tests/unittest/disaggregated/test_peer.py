@@ -1247,6 +1247,22 @@ def test_peer_registrar_rejects_replicated_role_of_another_size(peer_block_bytes
         reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
 
 
+def test_peer_registrar_accepts_a_ring_of_another_slot_count():
+    """A ring keeps as many token slots as its side needs (more on a generation side that drafts)."""
+    self_pt = make_page_table(global_layer_ids=[0])
+    peer_pt = make_page_table(global_layer_ids=[0], block_bytes=[512])
+    for page_table in (self_pt, peer_pt):
+        view = page_table.layer_groups[0].pool_views[0]
+        view.pool_role = frozenset({"hp_tail"})
+        view.mapper_kind = MapperKind.REPLICATED
+        view.ring_slot_bytes = 64
+    reg = _make_peer_registrar(make_rankinfo(instance_name="local", page_table=self_pt))
+    peer_ri = make_rankinfo(
+        instance_name="peer", instance_rank=3, layer_num_per_pp=[1], page_table=peer_pt
+    )
+    reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+
+
 @pytest.mark.parametrize("peer_dp_rank", [0, 1, 3, 7])
 def test_replicated_pool_owner_rotates_by_destination_dp_rank(peer_dp_rank):
     """Exactly one owner per fan-in group, rotated by destination DP rank.

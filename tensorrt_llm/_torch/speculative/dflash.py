@@ -1024,6 +1024,23 @@ class DFlashWorker(SpecWorkerBase):
 
     # Context arena sized by num_seq_slots (enable_full_slot_arena) instead of max_num_requests.
     _full_slot_arena = False
+    # A model's opt-ins (the enable_* methods): lean glue, and its one-launch
+    # replacements of stock steps (None keeps the stock lines). Class-level so
+    # workers built without __init__ take the stock lines.
+    _lean_glue = False
+    _fused_ctx_store = None
+    _fused_prefill_store = None
+    _fused_block_refresh = None
+    _fused_drafter_inputs = None
+    _fused_ctx_advance = None
+    _fused_kv_rewind = None
+    # The arming model's log tag while its fused store / advance take the int32 accept counts (None: int64).
+    _int32_accept_counts = None
+    # Width of the draft block table last decoded, and whether every row of
+    # it counts full (see _ctx_alloc_tokens): then the per-request allocation
+    # the prefill store caps at is known on the host, with no device sync.
+    _ctx_table_width = 0
+    _ctx_counts_full_row = False
 
     def __init__(
         self,
@@ -1052,17 +1069,6 @@ class DFlashWorker(SpecWorkerBase):
         self._saved_ctx_len_host = None
         self._saved_req_ctx_pos = None
         self._ctx_len_restore_pending = False
-        # A model's opt-ins (the enable_* methods): lean glue, and its one-launch
-        # replacements of stock steps (None keeps the stock lines).
-        self._lean_glue = False
-        self._fused_ctx_store = None
-        self._fused_prefill_store = None
-        self._fused_block_refresh = None
-        self._fused_drafter_inputs = None
-        self._fused_ctx_advance = None
-        self._fused_kv_rewind = None
-        # The arming model's log tag while its fused store / advance take the int32 accept counts (None: int64).
-        self._int32_accept_counts = None
         # Deferred kv_lens_cuda rewind state (see _prepare_kv_for_draft_forward,
         # _apply_kv_rewind_after_draft, _ensure_spec_dec_state_restored).
         self._kv_rewind_pending = False
@@ -1107,11 +1113,6 @@ class DFlashWorker(SpecWorkerBase):
         # last backed entry), per batch row. Saturates at the table width on
         # the default backend -- dflash_allocated_ctx_limit.
         self._ctx_block_counts = None
-        # Width of the draft block table last decoded, and whether every row of
-        # it counts full (see _ctx_alloc_tokens): then the per-request allocation
-        # the prefill store caps at is known on the host, with no device sync.
-        self._ctx_table_width = 0
-        self._ctx_counts_full_row = False
         self._ctx_pool_idx = 0
         self._ctx_layer_ids = None
         self._ctx_unified_cache = False
@@ -2650,10 +2651,11 @@ class DFlashWorker(SpecWorkerBase):
         self, draft_model, spec_metadata, attn_metadata, num_contexts: int
     ) -> Optional[List[int]]:
         """Per context request, the leading chunk rows CTXDRAFT_WIN skips; None when it skips nothing this step."""
-        if num_contexts == 0 or torch.cuda.is_current_stream_capturing():
+        if num_contexts == 0:
             return None
+        # Resolved first: a worker that does not take it never queries the device.
         reach = self._ctxdraft_win_resolve(draft_model)
-        if reach <= 0:
+        if reach <= 0 or torch.cuda.is_current_stream_capturing():
             return None
         host_pos = spec_metadata.host_position_ids
         keyed = getattr(spec_metadata, "ctx_prompt_lens", None)

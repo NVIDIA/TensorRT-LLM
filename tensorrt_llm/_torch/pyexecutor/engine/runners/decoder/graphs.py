@@ -35,7 +35,11 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     ResourceManager,
     ResourceManagerType,
 )
-from tensorrt_llm._torch.pyexecutor.runtime_hooks import runtime_hooks_of
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import (
+    DEFAULT_RUNTIME_HOOKS,
+    RuntimeHooks,
+    runtime_hooks_of,
+)
 from tensorrt_llm._torch.pyexecutor.sampler import SampleStateTensors
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import SampleType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -189,6 +193,9 @@ class DecoderCudaGraphs:
     and ``_capture_additional_cuda_graphs``.
     """
 
+    # The model's hooks, resolved at construction (all off until then).
+    runtime_hooks: RuntimeHooks = DEFAULT_RUNTIME_HOOKS
+
     def __init__(
         self,
         *,
@@ -217,6 +224,7 @@ class DecoderCudaGraphs:
         self._config = config
         self.mapping = mapping
         self.model = model
+        self.runtime_hooks = runtime_hooks_of(model)
         self.sparse_attention_config = sparse_attention_config
         self._metrics = metrics
         self._dummy_requests = dummy_requests
@@ -1163,7 +1171,7 @@ class DecoderCudaGraphs:
                 release_nccl_window_owners=release_nccl_window_owners
             )
             # The model's per-graph state (RuntimeHooks.prefill_graphs_released) ends with the graphs.
-            released = runtime_hooks_of(self.model).prefill_graphs_released
+            released = self.runtime_hooks.prefill_graphs_released
             if released is not None:
                 released(self.model)
 
