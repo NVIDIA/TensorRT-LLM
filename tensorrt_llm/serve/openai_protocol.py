@@ -58,10 +58,10 @@ from tensorrt_llm.kv_hints import KvHintsEnvelope
 from tensorrt_llm.kv_hints.protocol import admit_kv_hints
 from tensorrt_llm.llmapi import ConversationParams as LlmConversationParams
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
-from tensorrt_llm.llmapi import (DisaggScheduleStyle, GuidedDecodingParams,
-                                 SamplingParams)
+from tensorrt_llm.llmapi import DisaggScheduleStyle, GuidedDecodingParams
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
-from tensorrt_llm.sampling_params import (check_logprobs_limit,
+from tensorrt_llm.sampling_params import (EmbeddingBias, SamplingParams,
+                                          check_logprobs_limit,
                                           validate_thinking_token_budget)
 from tensorrt_llm.scheduling_params import AgentHierarchy
 from tensorrt_llm.serve.serving_extensions import structured_output_format_for
@@ -101,8 +101,8 @@ def ensure_request_chat_template_allowed(request: Any,
 
 def _logit_bias_to_embedding_bias(
         logit_bias: Optional[Dict[str, float]],
-        vocab_size: Optional[int]) -> Optional[torch.Tensor]:
-    """Convert OpenAI logit_bias dict to embedding_bias tensor for sampling."""
+        vocab_size: Optional[int]) -> Optional[EmbeddingBias]:
+    """Convert OpenAI logit_bias dict to sparse embedding_bias for sampling."""
     if logit_bias is None:
         return None
     if vocab_size is None:
@@ -115,7 +115,7 @@ def _logit_bias_to_embedding_bias(
         raise ValueError("vocab_size must be positive when logit_bias is used")
 
     # Create 1D zeros tensor as expected by executor API (will be unsqueezed to [1, vocab_size] internally)
-    embedding_bias = torch.zeros(vocab_size, dtype=torch.float32)
+    embedding_bias_list = []
 
     # Apply biases for specified token IDs
     for token_str, bias in logit_bias.items():
@@ -144,9 +144,10 @@ def _logit_bias_to_embedding_bias(
             raise ValueError(
                 f"logit_bias value for token ID {token_id} must be in "
                 f"[{_LOGIT_BIAS_MIN:g}, {_LOGIT_BIAS_MAX:g}]")
-        embedding_bias[token_id] = bias_value
+        embedding_bias_list.append((token_id, bias_value))
 
-    return embedding_bias
+    return tuple(
+        sorted(embedding_bias_list, key=lambda idx_and_val: idx_and_val[0]))
 
 
 class OpenAIBaseModel(BaseModel):
