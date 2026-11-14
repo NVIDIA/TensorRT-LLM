@@ -29,6 +29,7 @@ __all__ = [
     "suppress",
     "terminate",
     "apply_post_processor_hook",
+    "end_post_processor_hook",
     "load_post_processor_hook",
 ]
 
@@ -85,6 +86,10 @@ class PostProcessorHookChunk:
             detok process). Output-side observation only; do not rely on it to
             detect every upstream client cancellation.
         streaming: True for streaming requests.
+        disagg_request_id: The id the disaggregated server assigned the
+            request, or None when it carries none (serving is not
+            disaggregated). Its context and generation phases share this id,
+            while ``request_id`` is local to each worker process.
     """
 
     request_id: int
@@ -95,6 +100,7 @@ class PostProcessorHookChunk:
     is_final: bool
     aborted: bool
     streaming: bool
+    disagg_request_id: Optional[int] = None
 
 
 class PostProcessorHookAction(str, enum.Enum):
@@ -144,9 +150,42 @@ class PostProcessorHook(Protocol):
     The instance is built once per owner (its ``__init__`` is the one-time
     setup) and called once per output, per chunk. It owns any per-request state
     and is responsible for releasing it on ``chunk.is_final``.
+
+    In a post-processing worker, a request that ends in an error (the executor
+    reports one, or post-processing its response raises) gets no final chunk. A
+    hook that keeps per-request state can also define
+    ``on_request_end(request_id, reason)``. It is optional; the worker calls it
+    through :func:`end_post_processor_hook` when it drops such a request, so the
+    hook can release (or record) what it holds for that request. Without the
+    worker pool, it is called when the executor reports an error for a request.
     """
 
     def __call__(self, chunk: PostProcessorHookChunk) -> PostProcessorHookVerdict: ...
+
+
+def end_post_processor_hook(
+    hook: Optional[PostProcessorHook], request_id: int, reason: str
+) -> None:
+    """Tell ``hook`` that ``request_id`` ended without a final chunk.
+
+    Calls the hook's optional ``on_request_end(request_id, reason)``; a hook
+    without one, or no hook at all, is left alone. Never raises: the request has
+    already failed, and a failing cleanup must not become a second error for it.
+
+    Args:
+        hook: The post-processor hook, or None when none is configured.
+        request_id: The request's id, as the hook saw it in ``chunk.request_id``.
+        reason: Why the request ended: ``"error"`` when the executor reported an
+            error, ``"postprocessing_error"`` when post-processing its response
+            raised.
+    """
+    end = getattr(hook, "on_request_end", None)
+    if not callable(end):
+        return
+    try:
+        end(request_id, reason)
+    except Exception:  # noqa: BLE001 - cleanup of a request that already failed
+        logger.exception("Post-processor hook cleanup failed for request %s.", request_id)
 
 
 def _withhold_token_channel(output, streaming: bool) -> None:
@@ -186,6 +225,8 @@ def apply_post_processor_hook(hook: PostProcessorHook, result, streaming: bool) 
     # request is the unit of cancellation. Hooks needing per-sequence state
     # should key on (request_id, output_index).
     is_final = result._done
+    disaggregated_params = getattr(result, "disaggregated_params", None)
+    disagg_request_id = getattr(disaggregated_params, "disagg_request_id", None)
     for output in result.outputs:
         chunk = PostProcessorHookChunk(
             request_id=result.id,
@@ -196,6 +237,7 @@ def apply_post_processor_hook(hook: PostProcessorHook, result, streaming: bool) 
             is_final=is_final,
             aborted=result._aborted,
             streaming=streaming,
+            disagg_request_id=disagg_request_id,
         )
         try:
             verdict = hook(chunk)
