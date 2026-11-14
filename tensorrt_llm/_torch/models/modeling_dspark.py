@@ -3621,8 +3621,10 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         out = torch.empty_like(latent)
         for layer_idx in range(num_layers):
             # 3D throughout: the eager fallback's rotary indexes [G, s, rd].
+            # latent[:, layer_idx] has row stride num_layers * head_dim; the
+            # fused kernel reads it in place.
             out[:, layer_idx] = _rmsnorm_rope_batched(
-                latent[:, layer_idx].unsqueeze(0).contiguous(),
+                latent[:, layer_idx].unsqueeze(0),
                 self._kv_a_norm_stacked[layer_idx],
                 self._kv_a_norm_eps,
                 self.qk_rope_head_dim,
