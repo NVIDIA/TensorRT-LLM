@@ -1076,6 +1076,45 @@ def test_disaggregated_logits(model, generation_overlap):
                 ("First streaming chunk should have generation_logits "
                  "(first_gen_logits from prefill), but got None")
 
+            # --- generation_only that its first token ends (max_tokens=1) ---
+            # No decode step runs, so the response carries exactly the
+            # transferred first token and its logits.
+            ctx_responses3 = send_requests_to_worker(ctx_requests, 0, intercomm)
+            dp3 = ctx_responses3[0][0].disaggregated_params
+            dp3.request_type = "generation_only"
+            single_sp = SamplingParams(max_tokens=1,
+                                       ignore_eos=True,
+                                       return_generation_logits=True)
+            single_responses = send_requests_to_worker(
+                [(prompt, single_sp, dp3)], 1, intercomm)
+            single_output = single_responses[0][0]
+            assert list(single_output.token_ids) == list(dp3.first_gen_tokens)
+            assert single_output.finish_reason == "length"
+            assert single_output.generation_logits is not None, \
+                "max_tokens=1 generation_only should return the first token's logits"
+            assert single_output.generation_logits.shape[0] == 1
+
+            # --- generation_only whose first token is a stop token ---
+            # The request stops by STOP_WORDS at that token, as aggregated
+            # serving does: the stop token and its logits are trimmed, and no
+            # decode step adds a token after it. ignore_eos would also drop
+            # the stop words.
+            ctx_responses4 = send_requests_to_worker(ctx_requests, 0, intercomm)
+            dp4 = ctx_responses4[0][0].disaggregated_params
+            dp4.request_type = "generation_only"
+            first_token = dp4.first_gen_tokens[0]
+            stop_sp = SamplingParams(max_tokens=max_tokens,
+                                     ignore_eos=False,
+                                     stop_token_ids=[first_token],
+                                     return_generation_logits=True)
+            stop_responses = send_requests_to_worker([(prompt, stop_sp, dp4)],
+                                                     1, intercomm)
+            stop_output = stop_responses[0][0]
+            assert list(stop_output.token_ids) == []
+            assert stop_output.finish_reason == "stop"
+            assert stop_output.stop_reason == first_token
+            assert stop_output.generation_logits.shape[0] == 0
+
         except Exception as e:
             print(f"Exception encountered: {e}", flush=True)
             raise e
@@ -1173,8 +1212,10 @@ def test_arbitrary_kv_cache_transfer(model, generation_overlap):
             print(f"Got data_transceiver_state: {len(state)} bytes", flush=True)
 
             # generation_only on worker 1 using state from worker 0.
-            # max_tokens=1 ensures only one decode step runs, so the test
-            # relies on the KV cache transfer delivering all prompt tokens.
+            # max_tokens=2 makes exactly one decode step run on the transferred
+            # KV, so the test relies on the transfer delivering all prompt
+            # tokens; with max_tokens=1 the first token alone ends the request
+            # and no decode step reads the KV.
             print("Sending generation_only to worker 1", flush=True)
             DISAGG_REQ_ID = 42
             disagg_params = DisaggregatedParams(
@@ -1183,15 +1224,15 @@ def test_arbitrary_kv_cache_transfer(model, generation_overlap):
                 first_gen_tokens=[0],
                 disagg_request_id=DISAGG_REQ_ID,
             )
-            requests = [(prompt, SamplingParams(max_tokens=1, ignore_eos=True),
+            requests = [(prompt, SamplingParams(max_tokens=2, ignore_eos=True),
                          disagg_params)]
             responses = send_requests_to_worker(requests, 1, intercomm)
             assert len(responses) == 1
             output = responses[0][0]
             print(f"Worker 1 output: {output.text}", flush=True)
             print(f"Worker 1 token_ids: {output.token_ids}", flush=True)
-            assert len(output.token_ids) > 0, \
-                "generation_only request should produce output tokens"
+            assert len(output.token_ids) == 2, \
+                "generation_only request should return max_tokens tokens"
 
             # Send a normal (non-disagg) request to worker 1 to verify
             # it still works properly after the KV cache transfer.

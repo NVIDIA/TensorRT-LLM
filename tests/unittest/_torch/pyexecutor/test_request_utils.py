@@ -1207,6 +1207,40 @@ def test_merge_helix_requests_empty_ranks():
         assert llm_request.seqlen_this_rank_cp == len(expected_tokens[rank])
 
 
+@pytest.mark.parametrize(
+    ("stop_words", "prompt_tail"),
+    [
+        pytest.param([[11, 12, 99], [7]], [11, 12], id="multi_token_stop_word"),
+        pytest.param([[99], [7]], [], id="single_token_stop_words"),
+        pytest.param(None, [], id="no_stop_words"),
+    ],
+)
+def test_merge_helix_requests_keeps_the_prompt_tail_on_every_rank(stop_words, prompt_tail) -> None:
+    """A multi-token stop word that the first generated token completes can
+    span prompt tokens a rank's slice does not hold, so every rank, including
+    an empty one, keeps the tail it can span."""
+    input_tokens = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    request_item = RequestQueueItem(
+        id=1,
+        request=trtllm.Request(
+            input_token_ids=input_tokens,
+            max_tokens=4,
+            stop_words=stop_words,
+        ),
+    )
+
+    for rank in range(4):
+        (llm_request,) = merge_helix_requests(
+            [request_item],
+            cp_rank=rank,
+            cp_size=4,
+            tokens_per_block=4,
+            exclude_last_generation_logits=False,
+        )
+
+        assert llm_request.py_helix_prompt_tail == prompt_tail
+
+
 def test_merge_helix_requests_empty_ranks_with_padding():
     """Exercise padding-strip-on-last-owner and empty ranks together.
 

@@ -39,7 +39,7 @@ from concurrent import futures
 from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import repeat
-from typing import Any, Iterator, Optional, cast
+from typing import Any, Callable, Iterator, Optional, cast
 
 import torch
 
@@ -64,6 +64,7 @@ __all__ = [
     "apply_embedding_bias",
     "check_stop_words_length",
     "fast_greedy_sample_kernel",
+    "first_stop_reason",
     "handle_stop_criteria",
     "meet_max_token_stop_criteria",
     "meet_stop_token_criteria",
@@ -384,6 +385,55 @@ def handle_stop_criteria(
         return True
 
     return False
+
+
+def first_stop_reason(
+    request: LlmRequest,
+    new_token: int,
+    *,
+    num_generated_tokens: int,
+    num_tokens: int,
+    max_seq_len: Optional[int],
+    stop_word_history: Callable[[int], list[int]],
+) -> Optional[FinishReason]:
+    """The reason ``new_token`` ends ``request``, without appending it.
+
+    Applies the checks of ``handle_stop_criteria`` in its order: END_ID,
+    LENGTH, STOP_WORDS. Meant for a token checked outside the per-step
+    sampler path, which keeps its own inlined checks.
+
+    Args:
+        request: The request ``new_token`` would extend.
+        new_token: The token to check.
+        num_generated_tokens: Generated tokens, ``new_token`` included.
+        num_tokens: Sequence length, ``new_token`` included.
+        max_seq_len: The engine's sequence length limit; None leaves it
+            unchecked.
+        stop_word_history: Returns the last ``n`` tokens before
+            ``new_token``; called only when a multi-token stop word needs
+            them.
+
+    Returns:
+        The finish reason, or None if ``new_token`` does not end the request.
+    """
+    if new_token == request.py_end_id:
+        return FinishReason.END_ID
+    if num_generated_tokens >= request.py_max_new_tokens or (
+        max_seq_len is not None and num_tokens >= max_seq_len
+    ):
+        return FinishReason.LENGTH
+    stop_words = request.py_stop_words_list
+    if not stop_words:
+        return None
+    if all(len(word) == 1 for word in stop_words):
+        matched = any(word[0] == new_token for word in stop_words)
+    else:
+        tokens = list(stop_word_history(max(len(word) for word in stop_words) - 1))
+        tokens.append(new_token)
+        matched = any(
+            len(word) <= len(tokens) and tokens[-len(word) :] == word for word in stop_words
+        )
+    return FinishReason.STOP_WORDS if matched else None
 
 
 def check_stop_words_length(request: LlmRequest) -> bool:

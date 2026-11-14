@@ -225,6 +225,23 @@ class ADPIterStatsBuffer:
             return None
         return self._payloads[self._oldest_iter]
 
+    @staticmethod
+    def rank0_sent_payload(all_rank_states: List[RankState]) -> bool:
+        """Whether rank 0 piggybacked a payload on the exchange behind these states.
+
+        Rank 0 may then hold more pending iterations, and the one it sent may
+        still wait for a peer's payload. Rank 0 is the TP group's first rank,
+        and every rank of the group gets the same answer; under helix CP
+        another TP group may get a different one.
+
+        Args:
+            all_rank_states: Rank states gathered by one TP-group exchange.
+
+        Returns:
+            True if another exchange can make progress on rank 0's stats.
+        """
+        return any(s.rank == 0 and s.iter_stats.has_iter_stats for s in all_rank_states)
+
     def _note_payload_insert(self, iter_id: int) -> None:
         if self._oldest_iter is None or iter_id < self._oldest_iter:
             self._oldest_iter = iter_id
