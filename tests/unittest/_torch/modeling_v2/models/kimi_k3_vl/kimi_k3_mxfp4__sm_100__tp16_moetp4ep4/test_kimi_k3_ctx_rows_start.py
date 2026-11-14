@@ -12,10 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""``ctx_rows_start``: the Kimi K3 target's DFlash / DSpark worker's start of the gen requests' page-table rows, and
+"""``ctx_rows_start``: the Kimi K3 target's DSpark worker's start of the gen requests' page-table rows, and
 who receives it (host-side).
 
-* ``KimiK3DFlashWorker._ctx_rows_start`` is the number of context requests where the drafter reads the manager's block
+* ``KimiK3DSparkWorker._ctx_rows_start`` is the number of context requests where the drafter reads the manager's block
   table (keyed by batch position, so the gen requests' rows are one run), and None for the private arena (keyed by
   slot) or a step without gen requests.
 * ``dflash_ctx_rows_kwargs`` hands it only to a drafter whose ``dflash_forward`` takes it (the Kimi K3 target's
@@ -30,7 +30,6 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxf
     K3DSparkDrafter,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.spec_worker import (  # noqa: E501
-    KimiK3DFlashWorker,
     KimiK3DSparkWorker,
     dflash_ctx_rows_kwargs,
 )
@@ -47,17 +46,15 @@ def _bare(cls):
     return obj
 
 
-@pytest.mark.parametrize("cls", [KimiK3DFlashWorker, KimiK3DSparkWorker])
 @pytest.mark.parametrize("num_contexts,num_gens", [(0, 1), (0, 8), (3, 2), (5, 1)])
-def test_rows_start_where_the_manager_table_is_read(cls, num_contexts, num_gens):
-    worker = _bare(cls)
+def test_rows_start_where_the_manager_table_is_read(num_contexts, num_gens):
+    worker = _bare(KimiK3DSparkWorker)
     worker._ctx_block_tables = torch.zeros(num_contexts + num_gens + 1, 4, dtype=torch.int32)
     assert worker._ctx_rows_start(num_contexts, num_gens) == num_contexts
 
 
-@pytest.mark.parametrize("cls", [KimiK3DFlashWorker, KimiK3DSparkWorker])
-def test_no_rows_start_for_the_private_arena_or_without_gen_requests(cls):
-    worker = _bare(cls)
+def test_no_rows_start_for_the_private_arena_or_without_gen_requests():
+    worker = _bare(KimiK3DSparkWorker)
     worker._ctx_block_tables = None
     assert worker._ctx_rows_start(0, 4) is None
     worker._ctx_block_tables = torch.zeros(4, 4, dtype=torch.int32)

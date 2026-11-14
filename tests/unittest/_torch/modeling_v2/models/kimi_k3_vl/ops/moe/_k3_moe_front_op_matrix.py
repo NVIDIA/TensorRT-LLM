@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU certification matrix for the ``moe/k3_moe_front`` catalog entry and its ``K3MoeHeadWorkspace``, with the cells
+"""GPU certification matrix for the ``moe/k3_moe_front`` op and its ``K3MoeHeadWorkspace``, with the cells
 of ``moe/k3_moe`` behind the front: ``trtllm::k3_moe_front``, then the ``k3_moe`` entry on a plain and on a head_flags
 ``K3MoeState`` (the head_flags pair: the front with ``publish=True`` releasing the workspace's ready words, k3_moe
 acquiring them).
@@ -726,9 +726,7 @@ def check_create_and_first_compile_refuse_capture() -> None:
     raises RuntimeError under capture before any launch. The workspace keeps its bits and the next call returns the
     bits of the same call made alone.
     """
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm import (
-        mnnvl_workspace,
-    )
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl import mnnvl_workspace
 
     nxt = Call(7500, 4, layer=1, kind="front")
     want = alone_results([nxt], WS_A, "before the capture refusals")[0]

@@ -1,11 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU certification matrix for the ``comm/mnnvl_fusion_allreduce`` catalog entry on its ``MnnvlWorkspace``.
+"""GPU certification matrix for the ``comm/mnnvl_fusion_allreduce`` op on its ``MnnvlWorkspace``.
 
 The op's correctness depends on state that outlives a call: the workspace's Lamport rotation, which every MNNVL op of
 the TP group advances (this op on either path, ``comm/mnnvl_allgather_split`` and ``comm/mnnvl_allreduce_attn_res``).
-So beyond single calls (every certified shape sent one-shot and two-shot back to back, the path chosen per call by
-``one_shot_max_bytes`` at the exact boundary) this drives call *sequences*: decode steps whose token count dips and
+So beyond single calls (every certified shape and fusion, plain sum, RMSNorm and residual + RMSNorm, with early
+trigger off and on, sent one-shot and two-shot back to back, the path chosen per call by ``one_shot_max_bytes`` at
+the exact boundary) this drives call *sequences*: decode steps whose token count dips and
 grows back with Kimi K3's one-shot ceilings flipping the path inside the sequence, a random rank late at every call;
 two workspaces interleaved; the three MNNVL ops interleaved on one workspace; the same mix queued with no host
 synchronization between calls while ranks run ahead of one another; CUDA-graph capture and replay mixed with eager
@@ -24,8 +25,8 @@ rotations). The collected entry point is ``test_modeling_v2_mnnvl_fusion_allredu
 Every rank draws every rank's inputs from one seed, so each rank holds the whole reference. The inputs of the sums
 are small multiples of 1/16 (``_lockstep.exact_bf16``), so every sum over the ranks is exact in fp32 and in bf16
 whatever the summation order, and the residual add is one bf16 rounding of an exact fp32 value in the op and in the
-reference alike: the sum and ``updated`` are compared bit for bit, ``normed`` (an RMSNorm) against the fp32 reference
-within ``TOL``. Every output is also compared bitwise across the ranks.
+reference alike: the sum and ``updated`` are compared bit for bit, ``normed`` (an RMSNorm, of the sum or of
+``updated``) against the fp32 reference within ``TOL``. Every output is also compared bitwise across the ranks.
 """
 
 import copy
@@ -53,7 +54,7 @@ TOKENS = (1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64)
 EXPERTS = 896  # the router logits the MoE head all-gather carries beside the latent
 DECODE_MAX_TOKENS = 8
 # Kimi K3's one-shot ceilings: DECODE_AR_ONE_SHOT_MAX_BYTES on decode steps (at most 8 tokens),
-# WIDE_AR_ONE_SHOT_MAX_BYTES (main's default) on wide decode steps.
+# WIDE_AR_ONE_SHOT_MAX_BYTES (the stock MNNVL all-reduce's 1 MiB) on wide decode steps.
 DECODE_ONE_SHOT_MAX_BYTES = 4 << 20
 WIDE_ONE_SHOT_MAX_BYTES = 1 << 20
 EPS = 1e-5
@@ -89,6 +90,7 @@ required_buffer_bytes = None
 allgather_split = None
 allreduce_attn_res = None
 validating = None
+NONE = RMS_NORM = RESIDUAL_RMS_NORM = None  # the entry's fusion ops
 MnnvlWorkspace = None
 BUFFER_BYTES = None
 WS_A = None
@@ -162,14 +164,29 @@ def rot(ws) -> Rotation:
 
 class AR:
     """One mnnvl_fusion_allreduce call's arguments on every rank and its reference. ``residual``: a tensor (chained
-    from an earlier call), True (drawn) or None (the plain sum). ``path``: see ``ceiling``. Every rank's input holds
-    -0.0 in every NEG_ZERO_STRIDE-th column."""
+    from an earlier call), True (drawn) or None. ``fusion``: the call's fusion op; None names it from ``residual``
+    (``RESIDUAL_RMS_NORM`` with one, else the plain sum); ``RMS_NORM`` takes no residual. ``path``: see ``ceiling``.
+    ``early_trigger``: passed to the call. Every rank's input holds -0.0 in every NEG_ZERO_STRIDE-th column."""
 
-    def __init__(self, seed, tokens, hidden, residual=None, path="k3", eps=EPS):
+    def __init__(
+        self,
+        seed,
+        tokens,
+        hidden,
+        residual=None,
+        path="k3",
+        eps=EPS,
+        fusion=None,
+        early_trigger=True,
+    ):
         g = torch.Generator(device="cuda").manual_seed(seed)
         self.tokens, self.hidden, self.path = tokens, hidden, path
         self.one_shot_max_bytes = ceiling(tokens, hidden, path)
         self.eps = eps
+        if fusion is None:
+            fusion = RESIDUAL_RMS_NORM if residual is not None else NONE
+        assert (residual is not None) == (fusion == RESIDUAL_RMS_NORM), (fusion, residual)
+        self.fusion, self.early_trigger = fusion, early_trigger
         self.inputs = []
         for _ in range(R.world):
             x = ls.exact_bf16(g, (tokens, hidden), -4, 5, 1 / 16)
@@ -179,12 +196,13 @@ class AR:
             residual = ls.exact_bf16(g, (tokens, hidden), -32, 33, 1 / 16)
         self.residual = residual
         self.gamma = None
-        if residual is not None:
+        if fusion != NONE:
             self.gamma = (1.0 + 0.1 * torch.randn(hidden, generator=g, device="cuda")).bfloat16()
 
     @property
     def fused(self) -> bool:
-        return self.residual is not None
+        """The residual + RMSNorm fusion: two outputs, ``(normed, updated)``."""
+        return self.fusion == RESIDUAL_RMS_NORM
 
     @property
     def one_shot(self) -> bool:
@@ -199,6 +217,8 @@ class AR:
             residual=True if self.fused else None,
             path=self.path,
             eps=self.eps,
+            fusion=self.fusion,
+            early_trigger=self.early_trigger,
         )
 
     def chain_from(self, updated: torch.Tensor) -> None:
@@ -208,20 +228,39 @@ class AR:
 
     def run(self, ws, x=None, residual=None):
         x = self.inputs[R.rank] if x is None else x
-        if not self.fused:
-            return fusion_allreduce(x, ws, self.one_shot_max_bytes)
+        kwargs = dict(fusion_op=self.fusion, early_trigger=self.early_trigger)
+        if self.fusion == NONE:
+            return fusion_allreduce(x, ws, self.one_shot_max_bytes, **kwargs)
+        if self.fusion == RMS_NORM:
+            return fusion_allreduce(
+                x, ws, self.one_shot_max_bytes, None, self.gamma, self.eps, **kwargs
+            )
         residual = self.residual if residual is None else residual
-        return fusion_allreduce(x, ws, self.one_shot_max_bytes, residual, self.gamma, self.eps)
+        return fusion_allreduce(
+            x, ws, self.one_shot_max_bytes, residual, self.gamma, self.eps, **kwargs
+        )
 
     def ref(self):
         return fusion_allreduce.reference(
-            self.inputs, self.residual, self.gamma, self.eps if self.fused else None
+            self.inputs,
+            self.residual,
+            self.gamma,
+            None if self.fusion == NONE else self.eps,
+            fusion_op=self.fusion,
+            early_trigger=self.early_trigger,
         )
 
     def verify(self, got, where: str) -> None:
         want = self.ref()
-        if not self.fused:
+        if self.fusion == NONE:
             assert bits_equal(got, want), f"{where}: the sum differs from the exact reference"
+            assert R.same_on_ranks(got), f"{where}: ranks disagree"
+            return
+        if self.fusion == RMS_NORM:
+            assert isinstance(got, torch.Tensor), f"{where}: RMS_NORM returns one tensor"
+            err = ls.rel_err(got, want)
+            STATS["normed_err"] = max(STATS["normed_err"], err)
+            assert err <= TOL, f"{where}: normed rel err {err:.3e} > {TOL}"
             assert R.same_on_ranks(got), f"{where}: ranks disagree"
             return
         (normed, updated), (want_normed, want_updated) = got, want
@@ -436,42 +475,66 @@ def check_workspaces_are_armed_and_sized() -> None:
 
 
 def check_single_calls_both_paths() -> None:
-    """Every certified shape, plain and fused, sent one-shot with one_shot_max_bytes = its one-shot footprint (the
-    boundary is inclusive) and right after two-shot with one byte less, on one workspace, the same inputs both
-    times: each against the reference, the flags after each recording the path and the bytes the formula says, and
-    required_buffer_bytes equal to the space the call's stages take."""
+    """Every certified shape and fusion (plain sum, RMSNorm, residual + RMSNorm), with early trigger off and on, sent
+    one-shot with one_shot_max_bytes = its one-shot footprint (the boundary is inclusive) and right after two-shot
+    with one byte less, on one workspace, the same inputs both times: each against the reference, the flags after
+    each recording the path and the bytes the formula says, and required_buffer_bytes equal to the space the call's
+    stages take. Every (fusion, early trigger) pair of the cells runs: the calls are counted per pair and the count
+    checked against the cells, so a pair the loop skipped fails the check."""
+    ran, expected = {}, {}
     for cell in fusion_allreduce.CELLS:
         spec = cell.spec
         if R.world < spec.get("min_world", 2):
             continue
-        hidden, fused = spec["hidden"], spec["fused"]
+        hidden, fusion = spec["hidden"], spec["fusion_op"]
+        for early_trigger in spec["early_triggers"]:
+            key = (fusion, early_trigger)
+            expected[key] = expected.get(key, 0) + len(spec["tokens"]) * len(spec["paths"])
         seed = zlib.crc32(cell.why.encode())
-        for t in spec["tokens"]:
-            outs = []
-            for path in spec["paths"]:
-                call = AR(seed + t, t, hidden, residual=fused or None, path=path, eps=spec["eps"])
-                where = f"{cell.why}: T {t} {path}-shot"
-                assert call.one_shot == (path == "one"), where
-                with validating(fusion_allreduce):
-                    outs.append(call_and_check(call, WS_A, where))
-                stages, written = call.record()
-                need = required_buffer_bytes(
-                    t, hidden, R.world, spec["dtype"], call.one_shot_max_bytes
-                )
-                assert need == (written[0] if stages == 1 else 2 * written[0]), (
-                    f"{where}: needs {need}"
-                )
-            if fused and len(outs) == 2:
-                STATS["normed_paths"] = max(
-                    STATS["normed_paths"], ls.rel_err(outs[0][0], outs[1][0])
-                )
+        for early_trigger in spec["early_triggers"]:
+            for t in spec["tokens"]:
+                outs = []
+                for path in spec["paths"]:
+                    call = AR(
+                        seed + t,
+                        t,
+                        hidden,
+                        residual=True if fusion == RESIDUAL_RMS_NORM else None,
+                        path=path,
+                        eps=spec["eps"],
+                        fusion=fusion,
+                        early_trigger=early_trigger,
+                    )
+                    where = f"{cell.why}: T {t} {path}-shot, early trigger {early_trigger}"
+                    assert call.one_shot == (path == "one"), where
+                    with validating(fusion_allreduce):
+                        outs.append(call_and_check(call, WS_A, where))
+                    ran[(fusion, early_trigger)] = ran.get((fusion, early_trigger), 0) + 1
+                    stages, written = call.record()
+                    need = required_buffer_bytes(
+                        t, hidden, R.world, spec["dtype"], call.one_shot_max_bytes
+                    )
+                    assert need == (written[0] if stages == 1 else 2 * written[0]), (
+                        f"{where}: needs {need}"
+                    )
+                if fusion != NONE and len(outs) == 2:
+                    a, b = (outs[0][0], outs[1][0]) if fusion == RESIDUAL_RMS_NORM else outs
+                    STATS["normed_paths"] = max(STATS["normed_paths"], ls.rel_err(a, b))
+    assert ran == expected, f"calls per (fusion, early trigger): ran {ran}, cells {expected}"
+    assert {f for f, _ in ran} == {NONE, RMS_NORM, RESIDUAL_RMS_NORM} and {e for _, e in ran} == {
+        False,
+        True,
+    }
+    if R.rank == 0:
+        print(f"[rank 0] single calls per (fusion, early trigger): {ran}", flush=True)
 
 
 def check_unsupported_calls_raise_on_every_rank() -> None:
     """Refused on every rank before the workspace is touched (its flags do not move), and the next call is correct:
     more tokens than one Lamport buffer holds one-shot (the wrapper's ValueError; the same rows sent two-shot fit,
-    above 2 ranks), a residual without norm_weight and eps (the wrapper's ValueError), a hidden size not a multiple
-    of 8 (the op's RuntimeError)."""
+    above 2 ranks), a residual without norm_weight and eps, RMS_NORM with a residual or without norm_weight, a plain
+    sum with norm_weight, a fusion the entry does not run (a quantizing one) (all the wrapper's ValueError), a hidden
+    size not a multiple of 8 (the op's RuntimeError)."""
     t = max(TOKENS) + 1
     over = AR(2000, t, H_MODEL, path="one")
     expect_refusal(lambda: over.run(WS_A), ValueError, f"T {t} one-shot over one buffer")
@@ -483,6 +546,36 @@ def check_unsupported_calls_raise_on_every_rank() -> None:
         lambda: fusion_allreduce(pair.inputs[R.rank], WS_A, pair.one_shot_max_bytes, pair.residual),
         ValueError,
         "a residual without norm_weight and eps",
+    )
+    x, osmb, gamma = pair.inputs[R.rank], pair.one_shot_max_bytes, pair.gamma
+    for where, kwargs in (
+        ("RMS_NORM with a residual", dict(residual=pair.residual, norm_weight=gamma, eps=EPS)),
+        ("RMS_NORM without norm_weight", dict(eps=EPS)),
+    ):
+        expect_refusal(
+            lambda kwargs=kwargs: fusion_allreduce(x, WS_A, osmb, fusion_op=RMS_NORM, **kwargs),
+            ValueError,
+            where,
+        )
+    expect_refusal(
+        lambda: fusion_allreduce(x, WS_A, osmb, None, gamma, EPS, fusion_op=NONE),
+        ValueError,
+        "a plain sum with norm_weight",
+    )
+    from tensorrt_llm.functional import AllReduceFusionOp
+
+    expect_refusal(
+        lambda: fusion_allreduce(
+            x,
+            WS_A,
+            osmb,
+            pair.residual,
+            gamma,
+            EPS,
+            fusion_op=int(AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8),
+        ),
+        ValueError,
+        "a quantizing fusion",
     )
     odd = AR(2002, 2, H_LATENT - 4)
     expect_refusal(lambda: odd.run(WS_A), RuntimeError, f"hidden {H_LATENT - 4}")
@@ -777,7 +870,7 @@ CHECKS = [
 def _run_one_rank(args) -> int:
     global R, fusion_allreduce, required_buffer_bytes, allgather_split, allreduce_attn_res
     global MnnvlWorkspace, BUFFER_BYTES, WS_A, WS_B
-    global validating
+    global validating, NONE, RMS_NORM, RESIDUAL_RMS_NORM
     R = ls.Rank(args)
     assert R.world in (2, 4, 8, 16), f"K3's shapes shard over 2, 4, 8 or 16 ranks, not {R.world}"
     from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm import (
@@ -796,6 +889,7 @@ def _run_one_rank(args) -> int:
     validating = validating_cm
 
     fusion_allreduce = module.mnnvl_fusion_allreduce
+    NONE, RMS_NORM, RESIDUAL_RMS_NORM = module.NONE, module.RMS_NORM, module.RESIDUAL_RMS_NORM
     required_buffer_bytes = module.required_buffer_bytes
     allgather_split = gather_module.mnnvl_allgather_split
     allreduce_attn_res = attn_res_module.mnnvl_allreduce_attn_res

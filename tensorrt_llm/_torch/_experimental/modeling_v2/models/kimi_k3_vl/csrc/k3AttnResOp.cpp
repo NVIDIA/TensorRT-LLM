@@ -24,6 +24,7 @@
 #include <cuda_runtime.h>
 #include <torch/library.h>
 
+#include <limits>
 #include <optional>
 #include <tuple>
 
@@ -63,6 +64,65 @@ void check_attn_res_contract(int N, int T, int B, int H)
     TORCH_CHECK(T >= 1 && T <= 16384, "attn_res_fwd: unsupported T=", T, " (must be in [1, 16384])");
     TORCH_CHECK(H >= 4096 && H <= 8192 && H % 1024 == 0, "attn_res_fwd: unsupported H=", H,
         " (must be a multiple of 1024 in [4096, 8192])");
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> k3_attn_res_fwd(
+    at::Tensor layer_residual, at::Tensor block_residual, at::Tensor res_weight, at::Tensor rms_weight, double rms_eps)
+{
+    TORCH_CHECK(layer_residual.dim() == 3, "k3_attn_res_fwd: layer_residual must be [T, B, H]");
+    TORCH_CHECK(block_residual.dim() == 4, "k3_attn_res_fwd: block_residual must be [K, T, B, H]");
+
+    int const T = static_cast<int>(layer_residual.size(0));
+    int const B = static_cast<int>(layer_residual.size(1));
+    int const H = static_cast<int>(layer_residual.size(2));
+    int const N = static_cast<int>(block_residual.size(0)) + 1;
+    TORCH_CHECK(layer_residual.is_cuda() && block_residual.is_cuda() && res_weight.is_cuda() && rms_weight.is_cuda(),
+        "k3_attn_res_fwd: all input tensors must be CUDA tensors");
+    // Set the device before check_attn_res_contract: is_sm100_family() reads
+    // the current device, which must match the tensors' device.
+    c10::cuda::CUDAGuard device_guard(layer_residual.device());
+    check_attn_res_contract(N, T, B, H);
+    // Only the H=7168 kernels of the shared op are carried by the family.
+    TORCH_CHECK(H == 7168, "k3_attn_res_fwd: requires H=7168, got H=", H);
+
+    TORCH_CHECK(layer_residual.scalar_type() == at::kBFloat16, "k3_attn_res_fwd: layer_residual must be bf16");
+    TORCH_CHECK(block_residual.scalar_type() == at::kBFloat16, "k3_attn_res_fwd: block_residual must be bf16");
+    TORCH_CHECK(res_weight.scalar_type() == at::kBFloat16, "k3_attn_res_fwd: res_weight must be bf16");
+    TORCH_CHECK(rms_weight.scalar_type() == at::kBFloat16, "k3_attn_res_fwd: rms_weight must be bf16");
+    TORCH_CHECK(layer_residual.is_contiguous() && block_residual.is_contiguous() && res_weight.is_contiguous()
+            && rms_weight.is_contiguous(),
+        "k3_attn_res_fwd: inputs must be contiguous");
+    TORCH_CHECK(block_residual.sizes() == at::IntArrayRef({N - 1, T, B, H}),
+        "k3_attn_res_fwd: block_residual shape must match layer_residual");
+    TORCH_CHECK(res_weight.numel() == H, "k3_attn_res_fwd: res_weight must have H elements");
+    TORCH_CHECK(rms_weight.numel() == H, "k3_attn_res_fwd: rms_weight must have H elements");
+
+    auto output = at::empty_like(layer_residual);
+    auto float_options = layer_residual.options().dtype(at::kFloat);
+    auto rsigma = at::empty({N, T, B}, float_options);
+    auto probs = at::empty({N, T, B}, float_options);
+    auto logits = at::empty({N, T, B}, float_options);
+
+    kernels::kimiK3DecodeAttnRes::AttnResFwdParams params{};
+    params.blockResidual = N > 1 ? reinterpret_cast<__nv_bfloat16 const*>(block_residual.const_data_ptr()) : nullptr;
+    params.layerResidual = reinterpret_cast<__nv_bfloat16 const*>(layer_residual.const_data_ptr());
+    params.resWeight = reinterpret_cast<__nv_bfloat16 const*>(res_weight.const_data_ptr());
+    params.rmsWeight = reinterpret_cast<__nv_bfloat16 const*>(rms_weight.const_data_ptr());
+    params.output = reinterpret_cast<__nv_bfloat16*>(output.data_ptr());
+    params.rsigma = rsigma.data_ptr<float>();
+    params.probs = probs.data_ptr<float>();
+    params.logits = logits.data_ptr<float>();
+    params.numCandidates = N;
+    params.seqLen = T;
+    params.batchSize = B;
+    params.hiddenSize = H;
+    params.rmsEps = static_cast<float>(rms_eps);
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    kernels::kimiK3DecodeAttnRes::invokeAttnResFwd(params, stream);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    return {output, rsigma, probs, logits};
 }
 
 at::Tensor k3_attn_res_rmsnorm_fwd(at::Tensor layer_residual, at::Tensor block_residual, at::Tensor res_weight,
@@ -198,6 +258,105 @@ std::tuple<at::Tensor, at::Tensor> k3_attn_res_add_rmsnorm_fwd(at::Tensor layer_
     return {updated_layer_residual, output};
 }
 
+//! Same contract as k3_attn_res_add_rmsnorm_fwd, different kernel topology:
+//! persistent grid rather than one CTA (or cluster) per token, and the addend
+//! is optional.
+std::tuple<at::Tensor, at::Tensor> k3_attn_res_add_rmsnorm_persistent_fwd(at::Tensor layer_residual,
+    std::optional<at::Tensor> layer_residual_add, at::Tensor block_residual, at::Tensor res_weight,
+    at::Tensor rms_weight, at::Tensor output_rms_weight, double rms_eps, double output_rms_eps, int64_t sm_reserve)
+{
+    TORCH_CHECK(layer_residual.dim() == 3, "k3_attn_res_add_rmsnorm_persistent_fwd: layer_residual must be [T, B, H]");
+    // The addend is optional: the pre-attention mix and the post-attention mix
+    // on snapshot-write layers have none, and that is 95 of ~180 call sites.
+    bool const has_add = layer_residual_add.has_value();
+    TORCH_CHECK(!has_add || layer_residual_add->sizes() == layer_residual.sizes(),
+        "k3_attn_res_add_rmsnorm_persistent_fwd: layer_residual_add must match layer_residual");
+    TORCH_CHECK(
+        block_residual.dim() == 4, "k3_attn_res_add_rmsnorm_persistent_fwd: block_residual must be [K, T, B, H]");
+    TORCH_CHECK(layer_residual.is_cuda() && (!has_add || layer_residual_add->is_cuda()) && block_residual.is_cuda()
+            && res_weight.is_cuda() && rms_weight.is_cuda() && output_rms_weight.is_cuda(),
+        "k3_attn_res_add_rmsnorm_persistent_fwd: all input tensors must be CUDA tensors");
+
+    TORCH_CHECK(block_residual.device() == layer_residual.device()
+            && (!has_add || layer_residual_add->device() == layer_residual.device())
+            && res_weight.device() == layer_residual.device() && rms_weight.device() == layer_residual.device()
+            && output_rms_weight.device() == layer_residual.device(),
+        "k3_attn_res_add_rmsnorm_persistent_fwd: all input tensors must be on the same CUDA device");
+    // Set the device before is_sm100_family(): it reads the current device,
+    // which must match the tensors' device.
+    c10::cuda::CUDAGuard device_guard(layer_residual.device());
+    TORCH_CHECK(is_sm100_family(),
+        "k3_attn_res_add_rmsnorm_persistent_fwd requires an sm_100-family (datacenter Blackwell) GPU");
+    // Same bound as cute_dsl_utils.set_sm_reserve: the grid keeps at least one SM.
+    int const sm_count = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+    TORCH_CHECK(sm_reserve >= 0 && sm_reserve < sm_count,
+        "k3_attn_res_add_rmsnorm_persistent_fwd: sm_reserve=", sm_reserve, " must be in [0, ", sm_count,
+        ") (the SM count of the device)");
+
+    int64_t const T = layer_residual.size(0);
+    int64_t const B = layer_residual.size(1);
+    int64_t const H = layer_residual.size(2);
+    int64_t const N = block_residual.size(0) + 1;
+    TORCH_CHECK(
+        B == 1 && H == 7168, "k3_attn_res_add_rmsnorm_persistent_fwd: requires B=1 and H=7168, got B=", B, " H=", H);
+    // Unlike the per-token kernels there is no N == 1 form: the persistent
+    // kernel always mixes at least one snapshot with the layer residual.
+    TORCH_CHECK(N >= 2 && N <= 9, "k3_attn_res_add_rmsnorm_persistent_fwd: supported N values are [2, 9], got ", N);
+    // AttnResFwdParams carries T as int; the launcher bounds it further by its grid size.
+    TORCH_CHECK(T <= std::numeric_limits<int>::max(), "k3_attn_res_add_rmsnorm_persistent_fwd: T=", T,
+        " does not fit the kernel's int token count");
+    TORCH_CHECK(layer_residual.scalar_type() == at::kBFloat16
+            && (!has_add || layer_residual_add->scalar_type() == at::kBFloat16)
+            && block_residual.scalar_type() == at::kBFloat16 && res_weight.scalar_type() == at::kBFloat16
+            && rms_weight.scalar_type() == at::kBFloat16 && output_rms_weight.scalar_type() == at::kBFloat16,
+        "k3_attn_res_add_rmsnorm_persistent_fwd: all inputs must be bf16");
+    TORCH_CHECK(layer_residual.is_contiguous() && (!has_add || layer_residual_add->is_contiguous())
+            && block_residual.is_contiguous() && res_weight.is_contiguous() && rms_weight.is_contiguous()
+            && output_rms_weight.is_contiguous(),
+        "k3_attn_res_add_rmsnorm_persistent_fwd: inputs must be contiguous");
+    TORCH_CHECK(block_residual.sizes() == at::IntArrayRef({N - 1, T, B, H}),
+        "k3_attn_res_add_rmsnorm_persistent_fwd: block_residual shape must match layer_residual");
+    TORCH_CHECK(res_weight.numel() == H && rms_weight.numel() == H && output_rms_weight.numel() == H,
+        "k3_attn_res_add_rmsnorm_persistent_fwd: weights must have H elements");
+
+    // Without an addend there is no updated prefix sum to materialize; return
+    // the input so the Python contract (updated_prefix, output) is uniform.
+    //
+    // NOTE: on this branch the first result aliases layer_residual's storage,
+    // which the unannotated Tensor return type does not advertise. That is
+    // deliberate. Cloning to break the alias would copy [T, B, H] bf16 on a
+    // path whose only caller discards the value (``_, output = persistent_op``
+    // in the targets' attn_res.py), and the persistent kernel has no token
+    // ceiling by design -- at prefill lengths that is hundreds of MB of pure
+    // waste. Do not consume the first result when layer_residual_add is None.
+    // The aliasing is conditional and cannot be expressed in the schema; the
+    // operator's fake (fake_ops.py) returns a fresh tensor for the first result.
+    auto updated_layer_residual = has_add ? at::empty_like(layer_residual) : layer_residual;
+    auto output = at::empty_like(layer_residual);
+    kernels::kimiK3DecodeAttnRes::AttnResFwdParams params{};
+    params.blockResidual = reinterpret_cast<__nv_bfloat16 const*>(block_residual.const_data_ptr());
+    params.layerResidual = reinterpret_cast<__nv_bfloat16 const*>(layer_residual.const_data_ptr());
+    params.layerResidualAdd
+        = has_add ? reinterpret_cast<__nv_bfloat16 const*>(layer_residual_add->const_data_ptr()) : nullptr;
+    params.resWeight = reinterpret_cast<__nv_bfloat16 const*>(res_weight.const_data_ptr());
+    params.rmsWeight = reinterpret_cast<__nv_bfloat16 const*>(rms_weight.const_data_ptr());
+    params.outputRmsWeight = reinterpret_cast<__nv_bfloat16 const*>(output_rms_weight.const_data_ptr());
+    params.updatedLayerResidual
+        = has_add ? reinterpret_cast<__nv_bfloat16*>(updated_layer_residual.data_ptr()) : nullptr;
+    params.output = reinterpret_cast<__nv_bfloat16*>(output.data_ptr());
+    params.numCandidates = static_cast<int>(N);
+    params.seqLen = static_cast<int>(T);
+    params.batchSize = static_cast<int>(B);
+    params.hiddenSize = static_cast<int>(H);
+    params.rmsEps = static_cast<float>(rms_eps);
+    params.outputRmsEps = static_cast<float>(output_rms_eps);
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    kernels::kimiK3DecodeAttnRes::invokeAttnResPersistentFusedFwd(params, static_cast<int>(sm_reserve), stream);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return {updated_layer_residual, output};
+}
+
 }
 
 }
@@ -207,6 +366,10 @@ TRTLLM_MV2_NAMESPACE_END
 TRTLLM_MV2_LIBRARY_FRAGMENT(m)
 {
     m.def(
+        "k3_attn_res_fwd(Tensor layer_residual, Tensor block_residual, "
+        "Tensor res_weight, Tensor rms_weight, float rms_eps) "
+        "-> (Tensor, Tensor, Tensor, Tensor)");
+    m.def(
         "k3_attn_res_rmsnorm_fwd(Tensor layer_residual, Tensor block_residual, "
         "Tensor res_weight, Tensor rms_weight, Tensor output_rms_weight, "
         "float rms_eps, float output_rms_eps, bool early_trigger=False) -> Tensor");
@@ -214,10 +377,16 @@ TRTLLM_MV2_LIBRARY_FRAGMENT(m)
         "k3_attn_res_add_rmsnorm_fwd(Tensor layer_residual, Tensor layer_residual_add, "
         "Tensor block_residual, Tensor res_weight, Tensor rms_weight, Tensor output_rms_weight, "
         "float rms_eps, float output_rms_eps, bool early_trigger=False) -> (Tensor, Tensor)");
+    m.def(
+        "k3_attn_res_add_rmsnorm_persistent_fwd(Tensor layer_residual, Tensor? layer_residual_add, "
+        "Tensor block_residual, Tensor res_weight, Tensor rms_weight, Tensor output_rms_weight, "
+        "float rms_eps, float output_rms_eps, int sm_reserve=0) -> (Tensor, Tensor)");
 }
 
 TRTLLM_MV2_LIBRARY_IMPL(CUDA, m)
 {
+    m.impl("k3_attn_res_fwd", &TRTLLM_MV2_NS::torch_ext::k3_attn_res_fwd);
     m.impl("k3_attn_res_rmsnorm_fwd", &TRTLLM_MV2_NS::torch_ext::k3_attn_res_rmsnorm_fwd);
     m.impl("k3_attn_res_add_rmsnorm_fwd", &TRTLLM_MV2_NS::torch_ext::k3_attn_res_add_rmsnorm_fwd);
+    m.impl("k3_attn_res_add_rmsnorm_persistent_fwd", &TRTLLM_MV2_NS::torch_ext::k3_attn_res_add_rmsnorm_persistent_fwd);
 }

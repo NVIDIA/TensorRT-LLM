@@ -10,15 +10,22 @@ uses the built-in Kimi K3 implementation; in ``require`` it raises that error.
 The checkpoint declares the vision-language wrapper, and the language model's
 shape lives in its ``text_config``, so that is what this tree reads. The
 targets are text-only: they load no vision tower and refuse image input.
+
+This module and the family modules it reads (``drafter_config``,
+``environment``) import no target package: declining a deployment loads no
+modeling code and no native library.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Optional, Tuple
+import os
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 from tensorrt_llm.quantization.mode import QuantAlgo
 
-from ..._router_index import NoTarget, routes
+from ..._router_index import NoTarget, engine_kv_cache_quant_algo, routes
+from . import drafter_config as _drafter_config
+from . import environment as _environment
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.model_config import ModelConfig
@@ -34,9 +41,28 @@ _SM = (10, 0)
 #
 # (num_hidden_layers, hidden_size, num_experts, routed_expert_hidden_size), all
 # read from ``text_config``. The NVFP4 requant of the same checkpoint has this
-# shape too; the quantization criterion below reads only what ``config.json``
-# declares, since ``route`` does not see ``hf_quant_config.json``.
+# shape too; the quantization in ``config.json`` tells the two apart, and
+# ``_unmet_settings`` also checks the quantization the engine resolved.
 _SHAPE = (93, 7168, 896, 3584)
+
+# The KV-cache block size the targets' MLA kernels are built for.
+_TOKENS_PER_BLOCK = 64
+
+# The routed-expert backend the targets' MoE runs. The engine resolves AUTO to
+# TRTLLM for Kimi K3 before it routes.
+_MOE_BACKENDS = frozenset({"AUTO", "TRTLLM"})
+
+# Environment switches the built-in implementation reads and the targets do
+# not: the name and the values that leave the built-in on the path the targets
+# run (None: unset). The switches the targets read are in ``environment.py``.
+_ENV_SWITCHES = (
+    ("ENABLE_PERFECT_ROUTER", (None, "0")),
+    ("EXPERT_STATISTIC_ITER_RANGE", (None,)),
+    ("TRTLLM_LOW_M_GEMM_BACKEND", (None, "off")),
+    ("TLLM_KDA_ENABLE_OPT_PREFILL", (None, "1")),
+    ("TLLM_KDA_ENABLE_INDEXED_STATE_POOL", (None, "1")),
+    ("FLA_CONV_BACKEND", (None, "triton")),
+)
 
 
 def _field(config: Any, name: str) -> Any:
@@ -93,14 +119,130 @@ def _parallel(m) -> Optional[str]:
     return None
 
 
+def _unmet_settings(
+    model_config: ModelConfig,
+    llm_args: TorchLlmArgs,
+    parallel: str,
+    compute_capability: Tuple[int, int],
+) -> List[str]:
+    """The settings the ``parallel`` target needs that this deployment does not have.
+
+    The targets check the same settings when they are built or on their first
+    step. Checking them here first lets ``auto`` fall back to the built-in
+    implementation instead of failing after the target is chosen.
+    """
+    import torch
+
+    from tensorrt_llm.functional import AllReduceStrategy
+
+    unmet = []
+
+    spec_config = model_config.spec_config
+    if spec_config is not None:
+        mode = spec_config.spec_dec_mode
+        if parallel == "tp16_moetp16ep1":
+            unmet.append(
+                f"speculative decoding {mode.name}: the tp16_moetp16ep1 target decodes without "
+                "speculation"
+            )
+        elif not (mode.is_sa() or mode.is_dspark()):
+            unmet.append(
+                f"speculative decoding {mode.name}: the tp16_moetp4ep4 target supports SA and "
+                "DSpark with a standalone drafter"
+            )
+        elif mode.is_dspark() and spec_config.draft_is_embedded_in_target:
+            unmet.append(
+                "speculative decoding DSPARK with the draft embedded in the target: the "
+                "tp16_moetp4ep4 target supports DSpark with a standalone drafter"
+            )
+        elif mode.is_dspark():
+            # The drafter checkpoint's config, read by the functions the target's drafters apply when they are
+            # built.
+            sm = compute_capability[0] * 10 + compute_capability[1]
+            reason = _drafter_config.standalone_drafter_declines(model_config, spec_config, sm)
+            if reason is not None:
+                unmet.append(
+                    f"speculative decoding DSPARK: the tp16_moetp4ep4 target does not build this drafter: {reason}"
+                )
+
+    if model_config.torch_dtype != torch.bfloat16:
+        unmet.append(f"dtype {model_config.torch_dtype}: the targets compute in bf16")
+
+    kv_cache_quant_algo = engine_kv_cache_quant_algo(model_config, llm_args)
+    if kv_cache_quant_algo is not None:
+        unmet.append(
+            f"KV cache {getattr(kv_cache_quant_algo, 'name', kv_cache_quant_algo)}: the targets' "
+            "MLA kernels read a bf16 KV cache"
+        )
+
+    quant_algo = model_config.quant_config.quant_algo
+    layer_quant = model_config.quant_config_dict
+    if quant_algo != QuantAlgo.W4A16_MXFP4 or layer_quant:
+        unmet.append(
+            f"resolved quantization {quant_algo} with {len(layer_quant or {})} per-layer "
+            "declarations: the targets load the MXFP4 checkpoint, W4A16_MXFP4 with no "
+            "per-layer declarations"
+        )
+
+    strategy = model_config.allreduce_strategy
+    if strategy not in (AllReduceStrategy.AUTO, AllReduceStrategy.MNNVL):
+        unmet.append(f"allreduce_strategy {strategy.name}: the targets take AUTO or MNNVL")
+
+    kv_cache_config = llm_args.kv_cache_config
+    if kv_cache_config.tokens_per_block != _TOKENS_PER_BLOCK:
+        unmet.append(
+            f"kv_cache_config.tokens_per_block {kv_cache_config.tokens_per_block}: the targets "
+            f"need {_TOKENS_PER_BLOCK}"
+        )
+    if kv_cache_config.enable_block_reuse:
+        unmet.append("kv_cache_config.enable_block_reuse true: the targets need it false")
+    if kv_cache_config.use_kv_cache_manager_v2 is not True:
+        unmet.append(
+            f"kv_cache_config.use_kv_cache_manager_v2 {kv_cache_config.use_kv_cache_manager_v2}: "
+            "the targets keep the KDA states in the V2 hybrid cache manager"
+        )
+    if kv_cache_config.mamba_ssm_cache_dtype not in ("auto", "float32"):
+        unmet.append(
+            f"kv_cache_config.mamba_ssm_cache_dtype {kv_cache_config.mamba_ssm_cache_dtype}: "
+            "the targets' KDA kernels keep fp32 recurrent states"
+        )
+
+    moe_backend = str(model_config.moe_backend).upper()
+    if moe_backend not in _MOE_BACKENDS:
+        unmet.append(
+            f"moe_config.backend {moe_backend}: the targets' routed experts run on "
+            f"{', '.join(sorted(_MOE_BACKENDS))}"
+        )
+    if model_config.moe_load_balancer is not None:
+        unmet.append("moe_config.load_balancer set: the targets do not support EPLB")
+    if getattr(llm_args, "enable_return_routed_experts", False):
+        unmet.append(
+            "enable_return_routed_experts true: the targets' MoE does not record routed experts"
+        )
+    for name in ("use_cute_dsl_bf16_gemm", "use_cute_dsl_bf16_bmm"):
+        if getattr(llm_args, name, False):
+            unmet.append(f"{name} true: the targets run their bf16 projections on cuBLAS")
+
+    for name, built_for in _ENV_SWITCHES:
+        value = os.environ.get(name)
+        if value not in built_for:
+            unmet.append(f"environment {name}={value}: the targets do not read this switch")
+    for reason in _environment.declines():
+        unmet.append(f"environment: {reason}")
+
+    return unmet
+
+
 @routes("KimiK3ForConditionalGeneration")
 def route(
     model_config: ModelConfig, llm_args: TorchLlmArgs, compute_capability: Tuple[int, int]
 ) -> type:
     """Return the target class for this deployment, or raise ``NoTarget`` saying why none fits.
 
-    Each target is imported where it is returned, so declining costs no import
-    of modeling code.
+    Each target is imported where it is returned, so declining imports no
+    target package. With a standalone DSpark drafter, the tp16_moetp4ep4 check
+    loads the drafter checkpoint's config.json through the family's
+    ``drafter_config``.
     """
     pretrained_config = model_config.pretrained_config
     mapping = model_config.mapping
@@ -123,6 +265,11 @@ def route(
     mxfp4_on_sm100 = (
         compute_capability == _SM and shape == _SHAPE and quant_algo == QuantAlgo.W4A16_MXFP4
     )
+
+    if mxfp4_on_sm100 and parallel is not None:
+        unmet = _unmet_settings(model_config, llm_args, parallel, compute_capability)
+        if unmet:
+            raise NoTarget(f"the {parallel} target needs other settings: " + "; ".join(unmet))
 
     if mxfp4_on_sm100 and parallel == "tp16_moetp4ep4":
         from .kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.modeling import (

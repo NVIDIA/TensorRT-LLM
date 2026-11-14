@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 
@@ -57,6 +57,23 @@ def _(
     return [torch.empty_like(input)]
 
 
+@torch.library.register_fake(f"{_NS}::k3_attn_res_fwd")
+def _(
+    layer_residual: torch.Tensor,
+    block_residual: torch.Tensor,
+    res_weight: torch.Tensor,
+    rms_weight: torch.Tensor,
+    rms_eps: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    stats_shape = (block_residual.shape[0] + 1, layer_residual.shape[0], layer_residual.shape[1])
+    return (
+        torch.empty_like(layer_residual),
+        layer_residual.new_empty(stats_shape, dtype=torch.float32),
+        layer_residual.new_empty(stats_shape, dtype=torch.float32),
+        layer_residual.new_empty(stats_shape, dtype=torch.float32),
+    )
+
+
 @torch.library.register_fake(f"{_NS}::k3_attn_res_rmsnorm_fwd")
 def _(
     layer_residual: torch.Tensor,
@@ -82,6 +99,21 @@ def _(
     rms_eps: float,
     output_rms_eps: float,
     early_trigger: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(layer_residual), torch.empty_like(layer_residual)
+
+
+@torch.library.register_fake(f"{_NS}::k3_attn_res_add_rmsnorm_persistent_fwd")
+def _(
+    layer_residual: torch.Tensor,
+    layer_residual_add: Optional[torch.Tensor],
+    block_residual: torch.Tensor,
+    res_weight: torch.Tensor,
+    rms_weight: torch.Tensor,
+    output_rms_weight: torch.Tensor,
+    rms_eps: float,
+    output_rms_eps: float,
+    sm_reserve: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     return torch.empty_like(layer_residual), torch.empty_like(layer_residual)
 

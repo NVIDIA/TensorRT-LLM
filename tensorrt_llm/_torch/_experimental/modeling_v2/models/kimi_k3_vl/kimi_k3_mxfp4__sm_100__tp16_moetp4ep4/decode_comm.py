@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The decode path's residual-update collectives on the catalog's Kimi K3 MNNVL and sandwich entries.
+"""The decode path's residual-update collectives on the Kimi K3 MNNVL and sandwich ops.
 
 A layer's post-attention step adds the attention output to the running prefix sum, selects the attention residual
 and applies the post-attention RMSNorm. Under TP the attention output is a sum over the TP group, so the step is that
@@ -31,8 +31,9 @@ over the group and eager, built by the target in `post_load_weights` before any 
 make the same calls on each in the same order. Which call a step takes is decided from its token count and kind and
 from the load-time layout alone, which every rank of the group shares.
 
-The plain MNNVL all-reduces the decode path keeps (the stock modules') send one-shot up to
-`DECODE_AR_ONE_SHOT_MAX_BYTES` (`use_decode_one_shot`), except a wide decode step's (`wide_all_reduce`).
+The plain MNNVL all-reduces the decode path keeps (the layers' all-reduce modules, `ops/comm/k3_allreduce.K3AllReduce`)
+send one-shot up to `DECODE_AR_ONE_SHOT_MAX_BYTES` (`use_decode_one_shot`), except a wide decode step's
+(`wide_all_reduce`).
 """
 
 from __future__ import annotations
@@ -47,12 +48,12 @@ from torch import nn
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_sandwich import (
     op as _sandwich_op,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.mnnvl_workspace import (
+    MnnvlWorkspace,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm.k3_sandwich_oproj import (
     K3SandwichWorkspace,
     k3_sandwich_oproj,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm.k3_sandwich_plain import (
-    k3_sandwich_plain,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm.k3_sandwich_tail import (
     k3_sandwich_tail,
@@ -67,10 +68,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm.mn
     mnnvl_fusion_allreduce,
     required_buffer_bytes,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm.mnnvl_workspace import (
-    MnnvlWorkspace,
-)
-from tensorrt_llm._torch.distributed import AllReduceParams
+from tensorrt_llm.functional import AllReduceParams
+
+from .ops.comm.k3_sandwich_plain import k3_sandwich_plain
 
 # The most tokens of a step whose post-attention all-reduce runs one-shot with the residual update in its epilogue.
 AR_ATTN_RES_MAX_TOKENS = 16
@@ -81,8 +81,8 @@ SANDWICH_MAX_TOKENS = _sandwich_op.MAX_TOKENS
 # The MNNVL workspace's buffer size: a one-shot call pushes T x 7168 bf16 from each of 16 ranks, 3.5 MiB at T = 16.
 MNNVL_BUFFER_BYTES = 4 << 20
 
-# The one-shot ceiling of the stock MNNVL all-reduces on the decode path: 8 tokens x 7168 x 16 ranks x 2 B is
-# 1.75 MiB, which the stock 1 MiB ceiling would send two-shot.
+# The one-shot ceiling of the layers' MNNVL all-reduces on the decode path: 8 tokens x 7168 x 16 ranks x 2 B is
+# 1.75 MiB, which the default 1 MiB ceiling would send two-shot.
 DECODE_AR_ONE_SHOT_MAX_BYTES = 4 << 20
 
 # A wide decode step's ceiling: the stock 1 MiB. At 16 ranks two-shot is faster for every wide step's rows.
@@ -90,8 +90,10 @@ WIDE_AR_ONE_SHOT_MAX_BYTES = 1 << 20
 
 
 def use_decode_one_shot(model: nn.Module) -> None:
-    """Every stock MNNVL all-reduce of ``model`` sends one-shot up to `DECODE_AR_ONE_SHOT_MAX_BYTES`. Each grows its
-    workspace on its first eager call of a larger size, before the capture of that size."""
+    """Every MNNVL all-reduce of ``model`` (the ``mnnvl_allreduce`` of a ``K3AllReduce``) sends one-shot up to
+    `DECODE_AR_ONE_SHOT_MAX_BYTES`, with early trigger. Each grows its workspace on its first eager call of a larger
+    size, before the capture of that size. A module whose ``mnnvl_allreduce`` is another MNNVL all-reduce of the same
+    call signature (a built-in ``AllReduce``'s) gets a ``K3MnnvlAllReduce`` of its mapping and dtype in its place."""
     for module in model.modules():
         mnnvl = getattr(module, "mnnvl_allreduce", None)
         if mnnvl is not None:
@@ -104,13 +106,14 @@ def use_decode_one_shot(model: nn.Module) -> None:
 
 def skip_all_reduce() -> AllReduceParams:
     """All-reduce parameters under which a row-parallel module returns this rank's unreduced output (its projection
-    without its all-reduce): a ``Linear``'s ``all_reduce_params``, a ``GatedMLP``'s ``final_all_reduce_params``."""
+    without its all-reduce): a ``Linear``'s ``all_reduce_params``, a ``GatedMLP``'s ``final_all_reduce_params``; a
+    ``K3AllReduce`` returns its input under them."""
     return AllReduceParams(enable_allreduce=False)
 
 
 def wide_all_reduce(all_reduce: nn.Module, x: torch.Tensor) -> torch.Tensor:
-    """``all_reduce(x)`` of a wide decode step (a stock ``AllReduce`` module, no fusion): its MNNVL all-reduce with
-    the `WIDE_AR_ONE_SHOT_MAX_BYTES` ceiling, else the module itself."""
+    """``all_reduce(x)`` of a wide decode step (a ``K3AllReduce``, no fusion): its MNNVL all-reduce with the
+    `WIDE_AR_ONE_SHOT_MAX_BYTES` ceiling, else the module itself."""
     mnnvl = getattr(all_reduce, "mnnvl_allreduce", None)
     if isinstance(mnnvl, K3MnnvlAllReduce):
         out = mnnvl(

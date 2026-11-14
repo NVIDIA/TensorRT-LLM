@@ -26,11 +26,11 @@
 * ``_gate_drafter_comm`` hands the state to a ``K3DSparkDrafter`` only, and only where the target built it.
 * ``K3DecodeComm.takes_allreduce_norm`` / ``allreduce_norm``: which calls the TP16 MNNVL workspace holds, and the
   catalog call's arguments.
-* The fused norms: ``_k3_norms_take_comm`` holds for plain bf16 RMSNorms of the hidden width and row-parallel output
-  and down projections with their all-reduce, and for nothing else; ``use_decode_comm`` compiles each
+* The fused norms: ``_k3_norms_take_comm`` holds for bf16 RMSNorms of the hidden width and output and down
+  projections with their all-reduce, and for nothing else; ``use_decode_comm`` compiles each
   ``comm/k3_sandwich_plain`` form whose shape every layer shares (one zero-row call each, on the group's sandwich
   workspace), and none without the fused norms; ``K3DecodeComm.compile_plain`` / ``takes_plain`` /
-  ``sandwich_plain`` hand the catalog entry its arguments; ``skip_all_reduce`` turns a module's all-reduce off.
+  ``sandwich_plain`` hand the op its arguments; ``skip_all_reduce`` turns a module's all-reduce off.
 """
 
 from types import SimpleNamespace
@@ -43,7 +43,10 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxf
     decode_comm,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
-    modeling as target,
+    drafter as target,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
+    modeling as target_modeling,
 )
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 
@@ -128,8 +131,6 @@ def _drafter(tp_size=1, tp_rank=0, comm=None, fc=None, all_reduce=True, row_para
         layers=[_layer(all_reduce, row_parallel) for _ in range(2)], norm=_norm()
     )
     drafter.fc = _fc() if fc is None else fc
-    drafter._fc_input_slice = None
-    drafter._fc_all_reduce = None
     drafter.hidden_norm = _hidden_norm()
     drafter.decode_comm = comm
     drafter._k3_zero_rows = None
@@ -252,7 +253,7 @@ def test_fc_splits_only_on_the_collective_state():
 
 @pytest.mark.parametrize(
     "case",
-    ["bias", "fp32 weight", "uneven columns", "no TP all-reduce", "column-parallel o_proj"],
+    ["bias", "fp32 weight", "uneven columns", "no TP all-reduce"],
 )
 def test_fc_stays_replicated_where_it_does_not_split(case):
     kwargs = dict(tp_size=4, tp_rank=0, comm=_comm(world=4))
@@ -262,10 +263,8 @@ def test_fc_stays_replicated_where_it_does_not_split(case):
         kwargs["fc"] = _fc(dtype=torch.float32)
     elif case == "uneven columns":
         kwargs["tp_size"], kwargs["comm"] = 3, _comm(world=3)
-    elif case == "no TP all-reduce":
-        kwargs["all_reduce"] = False
     else:
-        kwargs["row_parallel"] = False
+        kwargs["all_reduce"] = False
     drafter = _drafter(**kwargs)
     fc = drafter.fc
     drafter._k3_split_fc()
@@ -273,15 +272,20 @@ def test_fc_stays_replicated_where_it_does_not_split(case):
 
 
 def test_reload_splits_fc_again(monkeypatch):
+    """A reload builds the replicated ``fc`` from the checkpoint, then splits it again on the collective state."""
     drafter = _drafter(tp_size=2, tp_rank=1, comm=_comm(world=2))
     drafter._k3_split_fc()
     reloaded = _fc(seed=9)
-
-    def stock_load(self, weights, weight_mapper=None, **kwargs):
-        self.fc = reloaded
-
-    monkeypatch.setattr(target.GQADSparkForCausalLM, "load_weights", stock_load)
-    drafter.load_weights({})
+    monkeypatch.setattr(target.K3DSparkDrafter, "_load_backbone", lambda self, weights: None)
+    monkeypatch.setattr(
+        target.K3DSparkDrafter, "_take_head_weights", lambda self, weights, device: weights
+    )
+    drafter.load_weights(
+        {
+            "fc.weight": reloaded.weight.detach(),
+            "hidden_norm.weight": torch.ones(OUT, dtype=torch.bfloat16),
+        }
+    )
     assert isinstance(drafter.fc, target.K3FcSlice)
     assert torch.equal(drafter.fc.weight, reloaded.weight[:, IN // 2 :])
 
@@ -360,16 +364,16 @@ def test_gate_hands_the_state_to_the_k3_drafter_only():
     taken = []
     drafter = _drafter()
     drafter.use_decode_comm = taken.append
-    assert target.ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4._gate_drafter_comm(
+    assert target_modeling.ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4._gate_drafter_comm(
         SimpleNamespace(draft_model=drafter), comm
     )
     assert taken == [comm]
-    assert not target.ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4._gate_drafter_comm(
+    assert not target_modeling.ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4._gate_drafter_comm(
         SimpleNamespace(draft_model=drafter), None
     )
     assert taken == [comm]
     for other in (None, SimpleNamespace(use_decode_comm=taken.append)):
-        assert not target.ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4._gate_drafter_comm(
+        assert not target_modeling.ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4._gate_drafter_comm(
             SimpleNamespace(draft_model=other), comm
         )
     assert taken == [comm]
@@ -421,35 +425,26 @@ def test_norms_take_the_fused_all_reduces():
 @pytest.mark.parametrize(
     "case",
     [
-        "gemma input norm",
+        "fp32 input norm",
         "fp32 post-attention norm",
         "final norm of another width",
-        "nvfp4 norm output",
-        "high-precision norm output",
         "o_proj without its all-reduce",
-        "column-parallel o_proj",
-        "down projection that does not reduce",
+        "down projection without its all-reduce",
     ],
 )
 def test_norms_do_not_take_the_fused_all_reduces(case):
     drafter = _drafter()
     layer = drafter.model.layers[1]
-    if case == "gemma input norm":
-        layer.input_layernorm = _norm(use_gemma=True)
+    if case == "fp32 input norm":
+        layer.input_layernorm = _norm(dtype=torch.float32)
     elif case == "fp32 post-attention norm":
         layer.post_attention_layernorm = _norm(dtype=torch.float32)
     elif case == "final norm of another width":
         drafter.model.norm = _norm(hidden_size=OUT + 8)
-    elif case == "nvfp4 norm output":
-        layer.input_layernorm.is_nvfp4 = True
-    elif case == "high-precision norm output":
-        layer.post_attention_layernorm.return_hp_output = True
     elif case == "o_proj without its all-reduce":
         layer.self_attn.o_proj = _projection(K_O, all_reduce=False)
-    elif case == "column-parallel o_proj":
-        layer.self_attn.o_proj = _projection(K_O, row_parallel=False)
     else:
-        layer.mlp.down_proj = _projection(K_DOWN, reduce_output=False)
+        layer.mlp.down_proj = _projection(K_DOWN, all_reduce=False)
     assert not drafter._k3_norms_take_comm()
 
 
@@ -490,7 +485,7 @@ def test_use_decode_comm_skips_a_form_the_kernel_does_not_take(sandwich_calls):
 
 def test_use_decode_comm_without_the_fused_norms_compiles_nothing(sandwich_calls):
     drafter = _drafter()
-    drafter.model.norm = _norm(use_gemma=True)
+    drafter.model.norm = _norm(dtype=torch.float32)
     drafter.use_decode_comm(_comm())
     assert not drafter._k3_norms_fuse and drafter._k3_sandwich_forms == frozenset()
     assert sandwich_calls.calls == []

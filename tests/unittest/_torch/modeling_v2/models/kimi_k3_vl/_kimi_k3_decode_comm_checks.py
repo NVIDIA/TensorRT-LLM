@@ -355,7 +355,7 @@ def expected_call(layer, step):
 
 def check_decode_one_shot():
     """use_decode_one_shot raises every stock MNNVL all-reduce's ceiling; the check then restores the stock one, so
-    the built-in reference keeps main's choice."""
+    the built-in reference keeps the stock ceiling."""
     modules = [
         m
         for layer in LAYERS_BUILT.values()

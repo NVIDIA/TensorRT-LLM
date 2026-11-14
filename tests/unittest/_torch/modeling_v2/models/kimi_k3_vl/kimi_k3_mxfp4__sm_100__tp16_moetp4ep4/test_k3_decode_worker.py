@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The Kimi K3 target's DFlash / DSpark worker's decode kernels behind ``k3_decode`` (host-side, fakes only).
+"""The Kimi K3 target's DSpark worker's decode kernels behind ``k3_decode`` (host-side, fakes only).
 
 * Off by default: the target logits are the logits processor's, the draft logits the drafter's processor's, and no
   kernel predicate reads past the gate.
@@ -32,21 +32,25 @@ import torch
 from torch import nn
 
 from tensorrt_llm._device_copy import DeviceCopyBuffer
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_ctx_kv import (
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl import mnnvl_workspace
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.kernels.k3_ctx_kv import (  # noqa: E501
     op as ctx_op,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_markov import (
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.kernels.k3_markov import (  # noqa: E501
     op as markov_op,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_spec_accept import (
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.kernels.k3_spec_accept import (  # noqa: E501
     op as accept_op,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.ops.attention import (  # noqa: E501
+    k3_draft_rope,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.ops.spec.k3_markov import (  # noqa: E501
+    K3Markov,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.spec_worker import (  # noqa: E501
-    KimiK3DFlashWorker,
     KimiK3DSparkWorker,
 )
-from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
-from tensorrt_llm._torch.models import modeling_dflash
 from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
     KDAReplayState,
     KimiK3HybridCacheManager,
@@ -85,11 +89,15 @@ def eager(monkeypatch):
 def mnnvl(monkeypatch):
     """The model's all-reduces own an MNNVL workspace for TP4."""
     workspaces = {TP4: object()}
-    monkeypatch.setattr(MNNVLAllReduce, "allreduce_mnnvl_workspaces", workspaces)
+    monkeypatch.setattr(
+        mnnvl_workspace,
+        "has_shared_lamport_workspace",
+        lambda mapping: workspaces.get(mapping) is not None,
+    )
     return workspaces
 
 
-def _worker(cls=KimiK3DFlashWorker, **attrs):
+def _worker(cls=KimiK3DSparkWorker, **attrs):
     """A worker without ``__init__`` (it needs flashinfer and a drafter): the attributes a test sets."""
     worker = cls.__new__(cls)
     nn.Module.__init__(worker)
@@ -171,10 +179,8 @@ def _accept_applies(case, monkeypatch):
 
 
 def test_k3_decode_is_off_by_default():
-    assert KimiK3DFlashWorker.k3_decode is False
     assert KimiK3DSparkWorker.k3_decode is False
     assert _worker().k3_decode is False
-    assert _worker(KimiK3DSparkWorker).k3_decode is False
     assert not hasattr(DFlashWorker, "k3_decode") and not hasattr(DSparkWorker, "k3_decode")
 
 
@@ -447,7 +453,7 @@ def _ctx_case(monkeypatch, split=8):
     splits = []
     monkeypatch.setattr(ctx_op, "pool_view", lambda layers: POOL_VIEW)
     monkeypatch.setattr(ctx_op, "pick_split", lambda *args: splits.append(args) or split)
-    monkeypatch.setattr(modeling_dflash, "_flashinfer_rope", object())
+    monkeypatch.setattr(k3_draft_rope, "_rope_kernel", object())
     worker = _worker(
         k3_decode=True,
         spec_config=SimpleNamespace(max_draft_len=K),
@@ -510,7 +516,7 @@ def test_k3_ctx_kv_declines(monkeypatch, mutate):
 def test_k3_ctx_kv_declines_where_its_helpers_do(monkeypatch, decline):
     case = _ctx_case(monkeypatch, split=0 if decline == "split" else 8)
     if decline == "rope":
-        monkeypatch.setattr(modeling_dflash, "_flashinfer_rope", None)
+        monkeypatch.setattr(k3_draft_rope, "_rope_kernel", None)
     if decline == "view":
         monkeypatch.setattr(ctx_op, "pool_view", lambda layers: None)
     assert not case.worker._k3_ctx_kv_applies(case.drafter, case.projected)
@@ -733,9 +739,13 @@ def test_k3_markov_chain_drafts_and_next_new_tokens(monkeypatch, pending):
         torch.zeros(NUM_GENS, K, dtype=torch.int32),
         torch.zeros(NUM_GENS, K + 1, dtype=torch.int32),
     )
-    calls = []
+    calls, workspaces = [], []
+    workspace = object()
     monkeypatch.setattr(
-        markov_op, "markov_chain", lambda *args, **kwargs: calls.append((args, kwargs)) or outputs
+        markov_op, "markov_workspace", lambda mapping: workspaces.append(mapping) or workspace
+    )
+    monkeypatch.setattr(
+        K3Markov, "__call__", lambda self, *args, **kwargs: calls.append((args, kwargs)) or outputs
     )
     drafter = _markov_drafter()
     logits = torch.zeros(NUM_GENS, K, SHARD, dtype=torch.bfloat16)
@@ -746,12 +756,11 @@ def test_k3_markov_chain_drafts_and_next_new_tokens(monkeypatch, pending):
 
     assert corrected is outputs[0]
     ((args, kwargs),) = calls
-    assert (
-        args[0] is TP4 and args[1] is logits and args[2] is first and args[3] is drafter.markov_w1
-    )
-    assert torch.equal(args[4], drafter.markov_w2[vocab_slice]) and args[5] == vocab_slice.start
-    assert args[6] is accepted and torch.equal(args[7], num_accepted)
-    assert torch.equal(args[8], spec.batch_indices_cuda[:NUM_GENS])
+    assert workspaces == [TP4]
+    assert args[0] is logits and args[1] is first and args[2] is drafter.markov_w1
+    assert torch.equal(args[3], drafter.markov_w2[vocab_slice]) and args[4] == vocab_slice.start
+    assert args[5] is accepted and torch.equal(args[6], num_accepted)
+    assert torch.equal(args[7], spec.batch_indices_cuda[:NUM_GENS]) and args[8] is workspace
     if pending:
         assert kwargs["kv_lens"] is attn.kv_lens_cuda and kwargs["rewind"] is rewind
         assert worker._kv_rewind_amount is None and not worker._kv_rewind_pending
@@ -795,7 +804,8 @@ def test_k3_markov_step_state_is_released_after_next_new_tokens(monkeypatch, ker
     )
     sampled = torch.zeros(NUM_GENS, K, dtype=torch.int32)
     assembled = torch.zeros(NUM_GENS, K + 1, dtype=torch.int32)
-    monkeypatch.setattr(markov_op, "markov_chain", lambda *args, **kwargs: outputs)
+    monkeypatch.setattr(markov_op, "markov_workspace", lambda mapping: object())
+    monkeypatch.setattr(K3Markov, "__call__", lambda self, *args, **kwargs: outputs)
     monkeypatch.setattr(
         SpecWorkerBase, "sample_draft_tokens", lambda self, *args, **kwargs: sampled
     )

@@ -4,8 +4,10 @@
 
 import torch
 
-import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
+from tensorrt_llm._torch._experimental.modeling_v2._native import load_family_ops
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+
+native_ops = load_family_ops(__name__)
 
 
 class AttnResFwd(OpWrapper):
@@ -68,7 +70,9 @@ class AttnResFwd(OpWrapper):
     an eight-CTA split-K cluster. Other calls use a persistent 288-thread
     online kernel per SM, except (T,N)=(1024,12), which uses SM count minus one.
     Online processing streams candidates, holds fp32 rows in Tensor Memory,
-    and softmaxes chunks of four. Other hidden sizes/tilings are not certified.
+    and softmaxes chunks of four. Only H=7168 is built; other hidden sizes are
+    rejected. The kernels are the family's copies of the H=7168 path of
+    trtllm::attn_res_fwd, compiled with the same flags; both give the same bits.
     Kernels target 100f, using f32x2, tcgen05, bulk copies or distributed shared
     memory; online H=7168 uses 115040 bytes of dynamic shared memory per CTA.
 
@@ -90,7 +94,7 @@ class AttnResFwd(OpWrapper):
         rms_weight: torch.Tensor,
         rms_eps: float,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        return torch.ops.trtllm.attn_res_fwd(
+        return native_ops.k3_attn_res_fwd(
             layer_residual, block_residual, res_weight, rms_weight, rms_eps
         )
 

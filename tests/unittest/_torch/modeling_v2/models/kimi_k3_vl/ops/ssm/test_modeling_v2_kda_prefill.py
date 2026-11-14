@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the kda_prefill catalog entry."""
+"""GPU test for the kda_prefill op."""
 
 import math
 import zlib
@@ -270,3 +270,24 @@ def test_preplanned_metadata_matches_automatic() -> None:
         )
     kr.assert_scaled_close(planned, automatic, atol=2e-2)
     _assert_state_close(planned_pool, inp.pool)
+
+
+def test_sm_reserve_changes_only_the_schedule() -> None:
+    # Kimi K3's layer passes the engine's sm_reserve(). Auto mode gives the same bits with any reserve; the forced
+    # Small-BH grid shrinks by it and still matches the reference; a reserve of every SM is refused.
+    inp = _Inputs(6, [37, 300], seed=11)
+    slots, fresh = [2, 5], [True, False]
+    plain_pool = inp.pool.clone()
+    plain = inp.call(slots, fresh, pool=plain_pool)
+    with validating(kda_prefill):
+        reserved = inp.call(slots, fresh, sm_reserve=8)
+    assert torch.equal(reserved, plain) and torch.equal(inp.pool, plain_pool)
+    small = _Inputs(6, [37, 300], seed=12, state_dtype=torch.bfloat16)
+    ref_pool = small.pool.clone()
+    ref_o = small.call(slots, fresh, reference=True, pool=ref_pool)
+    with validating(kda_prefill):
+        o = small.call(slots, fresh, mode="small-bh", sm_reserve=8)
+    kr.assert_scaled_close(o, ref_o, atol=2e-2)
+    sm_count = torch.cuda.get_device_properties(0).multi_processor_count
+    with pytest.raises(ValueError, match="sm_reserve"):
+        inp.call(slots, fresh, sm_reserve=sm_count)

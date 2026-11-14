@@ -1789,6 +1789,38 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             ),
         ),
     ),
+    # Kimi K3, one rank of 16: moe TP 4 x EP 4 holds 224 experts (rank 8's window
+    # at 448) at 768 intermediate columns; moe TP 16 x EP 1 holds all 896 experts
+    # at 192 columns zero-padded to 256. Both pass their own top-16.
+    "kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp4ep4": tuple(
+        Cell(
+            why=f"K3 moe tp4 x ep4: window of 224 at 448, I=768, SiTU, {tokens} tokens",
+            spec=dict(
+                tokens=tokens,
+                routed_by_kernel=False,
+                local_expert_offset=448,
+                local_num_experts=224,
+                intermediate=768,
+                **Mxe4m3Mxe2m1BlockScaleMoeRunner.KIMI_K3,
+            ),
+        )
+        for tokens in (1, 64, 65, 2048)
+    ),
+    "kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1": tuple(
+        Cell(
+            why=f"K3 moe tp16 x ep1: all 896 experts, I=192 padded to 256, SiTU, {tokens} tokens",
+            spec=dict(
+                tokens=tokens,
+                routed_by_kernel=False,
+                local_expert_offset=0,
+                local_num_experts=896,
+                intermediate=192,
+                intermediate_pad=256,
+                **Mxe4m3Mxe2m1BlockScaleMoeRunner.KIMI_K3,
+            ),
+        )
+        for tokens in (1, 8, 64, 65, 2048)
+    ),
 }
 
 CELLS = certified_cells(moe, TARGET_CELLS)
@@ -1816,6 +1848,9 @@ def test_certified_cells(cell):
     at all.
     """
     spec = cell.spec
+    if spec.get("act") == "situ":
+        _check_situ_cell(cell)
+        return
     if spec["intermediate"] == 2880 and "intermediate_pad" not in spec:
         args, ref = _gpt_oss()
     else:
@@ -1879,3 +1914,66 @@ def test_certified_cells(cell):
     )
     assert y.shape == (spec["tokens"], hidden), y.shape
     _compare(y, entry_ref.to(torch.bfloat16))
+
+
+def _check_situ_cell(cell):
+    """A SiTU cell (act_type 3, Kimi K3): pre-routed global top-k ids, only the
+    rank's window of experts built (local operands, global ids), the soft caps
+    per local expert in `gemm1_alpha` / `gemm1_beta`, no biases, no clamp, and
+    the routing arguments the K3 targets pass (routing_method_type 2, one
+    group). The entry's reference against this file's, then against the kernel."""
+    if torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("the SiTU cells are certified on sm_100")
+    spec = cell.spec
+    off, n = spec["local_expert_offset"], spec["local_num_experts"]
+    num_experts, hidden, top_k = spec["num_experts"], spec["hidden"], spec["top_k"]
+    gate_cap, linear_cap = spec["caps"]
+    args, ref = _build(
+        n, hidden, spec["intermediate"], seed=303, i_pad=spec.get("intermediate_pad")
+    )
+    args = dict(args, gemm1_bias=None, gemm2_bias=None)
+    for role in ("up", "gate", "down"):
+        codes, scales, bias = ref[role]
+        ref[role] = (codes, scales, torch.zeros_like(bias))
+    gen = torch.Generator(device=DEV).manual_seed(zlib.crc32(cell.why.encode()) % 2**31)
+    data, sf, xv = _rand_mxfp8(spec["tokens"], hidden, ref["h1_pad"], gen)
+    ids, wts = _routing(spec["tokens"], num_experts, top_k, gen)
+    alpha = torch.full((n,), gate_cap, dtype=torch.float32, device=DEV)
+    beta = torch.full((n,), linear_cap, dtype=torch.float32, device=DEV)
+
+    with true_fp32_matmul():
+        entry_ref = moe.reference(
+            xv,
+            ids,
+            wts,
+            ref["up"],
+            ref["gate"],
+            ref["down"],
+            alpha=alpha,
+            beta=beta,
+            local_expert_offset=off,
+            local_num_experts=n,
+            act_type=3,
+        )
+    local_ref = _ref_moe(xv, ids, wts, ref, alpha, beta, offset=off, num_local=n, act="situ")
+    torch.testing.assert_close(entry_ref, local_ref, rtol=0.0, atol=0.0)
+
+    y = _call(
+        data,
+        sf,
+        args,
+        num_experts,
+        top_k,
+        topk_ids=ids,
+        topk_weights=wts,
+        n_group=1,
+        topk_group=1,
+        local_expert_offset=off,
+        local_num_experts=n,
+        routing_method_type=2,
+        act_type=3,
+        gemm1_alpha=alpha,
+        gemm1_beta=beta,
+    )
+    assert y.shape == (spec["tokens"], hidden), y.shape
+    _assert_moe_close(y, entry_ref.to(torch.bfloat16))

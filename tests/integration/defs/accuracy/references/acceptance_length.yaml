@@ -280,3 +280,28 @@ ModelingV2Qwen38FlashNextNvfp4Sm103Default::mtp3_long_context:
   # 2.5% below ref_al, as for tp1_mtp3_long_context, whose deliberately wrong
   # reused selection scores 3.760.
   min_al: 3.9
+# Read by both legs (modeling_v2 and stock) of TestModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4::
+# test_dspark7_gsm8k_and_acceptance, ::test_dspark7_mla_gsm8k_and_acceptance and
+# ::test_sa2_gsm8k_and_acceptance, on 16 GB200 at TP16 with MoE TP4/EP4. Keyed by target and variant
+# for the same reason as the ModelingV2DeepseekR10528Nvfp4Sm10xDefault::mtp3 entry above. Measured with
+# the tests' own settings (16 GB200, full gsm8k); min_al is 95% of ref_al unless its comment says otherwise.
+ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4::dspark7:
+  # The STOCK leg (modeling_v2 "off", eager) on this layout: full gsm8k 96.967. The modeling_v2 leg
+  # read 4.358 on the same code.
+  ref_al: 4.369
+  min_al: 4.151
+ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4::dspark7_mla:
+  # No STOCK reading on this layout yet. This is the modeling_v2 leg on this layout: full gsm8k
+  # 96.285. Replace it with a STOCK reading (TRTLLM_POPULATE_ACCEPTANCE_LENGTH=1 on the stock leg)
+  # when one is measured.
+  ref_al: 4.315
+  min_al: 4.099
+ModelingV2KimiK3Mxfp4Sm100Tp16Moetp4ep4::sa2:
+  # The STOCK leg (modeling_v2 "off", eager) on this layout: full gsm8k 96.740. The modeling_v2 leg
+  # read 1.336 twice.
+  ref_al: 1.337
+  # Hand-set at 97.5% of ref_al, not the automatic 95%. Acceptance length is 1 plus the drafts
+  # accepted per step, so at this low value 95% (1.270) would pass with a fifth of the accepted
+  # drafts gone; 1.304 trips at a tenth, as 95% does for a reading near 2. The three readings
+  # above lie within 0.001 of each other.
+  min_al: 1.304

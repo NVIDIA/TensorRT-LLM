@@ -10,7 +10,7 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2._native import load_family_ops
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
-from .mnnvl_workspace import MnnvlWorkspace
+from ...mnnvl_workspace import MnnvlWorkspace
 
 native_ops = load_family_ops(__name__)
 
@@ -106,8 +106,8 @@ class MnnvlAllgatherSplit(OpWrapper):
     workspaces with 20 irregularly interleaved calls, mixed K3-order calls
     at T=8,2,16,64,1,7,32,8,3,16, and three rounds of 52 mixed calls queued
     without host synchronization. Randomly late ranks expose stale words.
-    Clearing only the current call's rows previously passed single-call
-    tests but failed dip/regrow sequences. A five-call captured mix is
+    Clearing only the current call's rows would pass single-call tests
+    but fail dip/regrow sequences. A five-call captured mix is
     replayed eight times with fresh inputs and eager calls between replays;
     every result and rotation is checked, including negative controls.
 

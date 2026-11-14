@@ -163,6 +163,13 @@ def check_certified_cells() -> None:
         seed = 4000 + 17 * i
         x = _payload(RANK, spec["rows"], spec["hidden"], seed)
         residual, weight = _residual_and_weight(spec["rows"], spec["hidden"], seed)
+        # The operands a caller of each fusion passes: no residual without one, no weight for the plain sum.
+        if spec["op"] != entry.RESIDUAL_RMS_NORM:
+            residual = None
+        if spec["op"] == entry.NONE:
+            weight = None
+        if RANK == 0:
+            print(f"[rank 0] cell: {cell.why}", flush=True)
         with validating(entry.allreduce):
             out = _call(x, residual, weight, spec["eps"], spec["op"])
         ref = _reference(

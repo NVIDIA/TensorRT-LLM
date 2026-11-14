@@ -1,8 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """MXFP4-weight / MXFP8-activation mixture-of-experts layer: routing (or given
-top-k) + grouped FC1 GEMM + clamped gated activation + MXFP8 requantization +
-grouped FC2 GEMM + routing-weighted combine, in one trtllm-gen call."""
+top-k) + grouped FC1 GEMM + gated activation (clamped SwiGlu or SiTU) + MXFP8
+requantization + grouped FC2 GEMM + routing-weighted combine, in one trtllm-gen
+call."""
 
 from __future__ import annotations
 
@@ -22,6 +23,10 @@ _ROUTING_BIAS_IGNORED = (0, 1, 4, 6)
 #: routing_method_type the gpt-oss target passes, and `act_type` for SwiGlu.
 ROUTING_METHOD_RENORMALIZE = 1
 ACT_TYPE_SWIGLU = 0
+#: routing_method_type the Kimi K3 targets pass with their own top-k (DeepSeek-V3:
+#: the kernel reads only the routing arguments), and `act_type` for SiTU.
+ROUTING_METHOD_DEEPSEEK_V3 = 2
+ACT_TYPE_SITU = 3
 
 #: The clamped gated activation's fixed constants: `(up + beta) * gate *
 #: sigmoid(alpha * gate)` after `gate.clamp(max=limit)`, `up.clamp(+-limit)`.
@@ -149,7 +154,8 @@ def glu_vectors(
 
 class Mxe4m3Mxe2m1BlockScaleMoeRunner(OpWrapper):
     """One MXFP4-weight MoE layer over MXFP8 (e4m3 + UE8M0) activations, with
-    gpt-oss's clamped gated activation.
+    gpt-oss's clamped gated activation (`act_type` 0) or Kimi K3's SiTU
+    (`act_type` 3).
 
     Unlike its NVFP4 sibling this op will route for you: given `routing_logits`
     it computes top-k itself, and given `topk_ids` / `topk_weights` it takes the
@@ -175,6 +181,12 @@ class Mxe4m3Mxe2m1BlockScaleMoeRunner(OpWrapper):
     # declares (see the default target's weights.py).
     GPT_OSS = dict(hidden=2880, intermediate=2880, num_experts=128, top_k=4)
 
+    # Kimi K3's routed experts: 896 experts, top-16, the latent hidden 3584, SiTU
+    # with the checkpoint's caps (gate 4.0, linear 25.0), no biases, no clamp, and
+    # the top-16 computed by the caller. Its targets hold an expert window and an
+    # intermediate slice per rank; those cells are in this entry's test.
+    KIMI_K3 = dict(hidden=3584, num_experts=896, top_k=16, act="situ", caps=(4.0, 25.0))
+
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="one token -- the decode row count, where the routing has a single row to place",
@@ -196,13 +208,29 @@ class Mxe4m3Mxe2m1BlockScaleMoeRunner(OpWrapper):
                 **GPT_OSS,
             ),
         ),
+        Cell(
+            why="SiTU (act_type 3): pre-routed top-16 of 896, an expert window of 224, soft caps per expert",
+            spec=dict(
+                tokens=8,
+                routed_by_kernel=False,
+                local_expert_offset=448,
+                local_num_experts=224,
+                intermediate=768,
+                **KIMI_K3,
+            ),
+        ),
     )
 
     note = """
-    `act_type` 0 (SwiGlu) only, with the clamp: `gemm1_alpha`, `gemm1_beta` and
-    `gemm1_clamp_limit` are per-local-expert fp32 vectors, and gpt-oss sets them
-    to 1.702 / 1.0 / 7.0. Passing `None` for all three is the unclamped form,
-    which this entry does not certify against the target.
+    Two activations. `act_type` 0 (SwiGlu) with the clamp: `gemm1_alpha`,
+    `gemm1_beta` and `gemm1_clamp_limit` are per-local-expert fp32 vectors, and
+    gpt-oss sets them to 1.702 / 1.0 / 7.0. Passing `None` for all three is the
+    unclamped form, which this entry does not certify against the target.
+    `act_type` 3 (SiTU, Kimi K3): `beta * tanh(up / beta) * alpha * tanh(gate /
+    alpha) * sigmoid(gate)` with `gemm1_alpha` the gate's soft cap and
+    `gemm1_beta` the linear branch's (per local expert, fp32, positive), no
+    clamp (`gemm1_clamp_limit` None) and no biases; the SiTU cells are certified
+    on sm_100 only. Kimi K3 passes its own top-k with routing_method_type 2.
 
     The FC1 epilogue's requantization recipe is per architecture and the
     difference is bit-exact, not a tolerance -- see `scale_recipe`. That is the
@@ -298,6 +326,7 @@ class Mxe4m3Mxe2m1BlockScaleMoeRunner(OpWrapper):
         clamp_limit: Optional[torch.Tensor] = None,
         local_expert_offset: int = 0,
         local_num_experts: Optional[int] = None,
+        act_type: int = ACT_TYPE_SWIGLU,
     ) -> torch.Tensor:
         """The layer, in plain torch over dequantized weights, fp32 throughout.
 
@@ -312,12 +341,16 @@ class Mxe4m3Mxe2m1BlockScaleMoeRunner(OpWrapper):
         its window owns and zero elsewhere, which is what makes an
         expert-parallel split summable.
 
-        The activation is gpt-oss's clamped GLU:
+        `act_type` 0 is gpt-oss's clamped GLU:
         `(up + beta) * gate * sigmoid(alpha * gate)`, with `gate` clamped above
         at `clamp_limit` and `up` clamped to both sides -- an asymmetry, not a
-        typo. Its output is requantized to MXFP8 before FC2 because the kernel
-        does; skipping that is ~10 ulp RMS away from a correct kernel.
+        typo. `act_type` 3 is SiTU: `beta * tanh(up / beta) * (alpha *
+        tanh(gate / alpha) * sigmoid(gate))`, `alpha` the gate's soft cap and
+        `beta` the linear branch's. Either output is requantized to MXFP8
+        before FC2 because the kernel does; skipping that is ~10 ulp RMS away
+        from a correct kernel.
         """
+        assert act_type in (ACT_TYPE_SWIGLU, ACT_TYPE_SITU), act_type
         num_tokens, hidden = hidden_states.shape
         up_c, up_s, up_b = up
         gt_c, gt_s, gt_b = gate
@@ -339,7 +372,12 @@ class Mxe4m3Mxe2m1BlockScaleMoeRunner(OpWrapper):
                 u = u.clamp(-lim, lim)
             a = 1.0 if alpha is None else float(alpha[local_e])
             b = 0.0 if beta is None else float(beta[local_e])
-            act = quantize_mxfp8((u + b) * g * torch.sigmoid(a * g))
+            if act_type == ACT_TYPE_SITU:
+                act = quantize_mxfp8(
+                    b * torch.tanh(u / b) * (a * torch.tanh(g / a) * torch.sigmoid(g))
+                )
+            else:
+                act = quantize_mxfp8((u + b) * g * torch.sigmoid(a * g))
             y = act @ dequantize_mxfp4(dn_c[local_e], dn_s[local_e]).t() + dn_b[local_e]
             out.index_add_(0, tok, y * topk_weights[tok, slot].float().unsqueeze(1))
         return out

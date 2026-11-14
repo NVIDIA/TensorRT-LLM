@@ -4,8 +4,6 @@
 attention-residual epilogue ceiling it sets, which steps the MoE layers push on, the KDA verify's dense output, the one
 path the text model runs for a step, and the DSpark worker reading the current batch-to-slot buffer."""
 
-import types
-
 import pytest
 import torch
 
@@ -14,7 +12,6 @@ from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
     KDAIntermediateLayerCache,
     KDAReplayLayerCache,
 )
-from tensorrt_llm._torch.modules.kimi_kda.kimi_kda_mixer import _KdaPrequantizedCore
 
 __extra_import_path__ = [".."]
 from _kimi_k3_decode_step import (  # noqa: E402
@@ -36,6 +33,9 @@ from _kimi_k3_decode_step import (  # noqa: E402
 )
 
 try:
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
+        kda as target_kda,
+    )
     from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 import (  # noqa: E501
         modeling as target,
     )
@@ -74,105 +74,86 @@ def test_latent_push(step, given, pushes):
     check_latent_push(target, step, given, pushes)
 
 
-def _kda_verify_module(monkeypatch):
-    module = object.__new__(target.K3DecodeKDA)
+def _kda_verify_module(monkeypatch, seen):
+    """A K3DecodeKDA shell whose three verify paths record their call and store a known core."""
+    module = object.__new__(target_kda.K3DecodeKDA)
     torch.nn.Module.__init__(module)
     module.num_heads = 2
     module.head_dim = 128
-    module.k3_proj_weight = torch.empty(1)
-    monkeypatch.setattr(module, "k3_buffers", object(), raising=False)
-    return module
-
-
-@pytest.mark.parametrize("allow_prequantized_output", [False, True])
-@pytest.mark.parametrize("use_output_buffer", [False, True])
-def test_kda_verify_accepts_prequantized_permission_with_dense_replay_output(
-    monkeypatch, allow_prequantized_output, use_output_buffer
-):
-    module = _kda_verify_module(monkeypatch)
+    module.layer_idx = 0
+    module._decode_weights_built = True
+    module.k3_buffers = object()
     core = torch.arange(8 * 2 * 128, dtype=torch.float32).to(torch.bfloat16).reshape(8, 2, 128)
-    output = torch.empty_like(core) if use_output_buffer else None
-    cache = types.SimpleNamespace(has_kda_replay_caches=True, kda_state_tok=torch.empty(1))
-    monkeypatch.setattr(module, "_k3_verify", lambda *args: core)
-    result = module.forward_verify(
-        torch.empty(8, 16),
-        8,
-        cache,
-        None,
-        None,
-        torch.tensor([0]),
-        output=output,
-        allow_prequantized_output=allow_prequantized_output,
-    )
-    assert isinstance(result, torch.Tensor)
-    torch.testing.assert_close(result, core, rtol=0, atol=0)
-    if output is not None:
-        assert result is output
+
+    def k3_verify(x, num_steps, layer_cache, ssm_pool, slots):
+        seen.append("_k3_verify")
+        return core.reshape(8, -1)
+
+    def path(name):
+        def run(x, num_steps, layer_cache, slots, output, replay_slots=None):
+            seen.append(name)
+            return module._store_core(core.reshape(8, -1), output)
+
+        return run
+
+    monkeypatch.setattr(module, "_k3_verify", k3_verify)
+    monkeypatch.setattr(module, "_verify_replay", path("_verify_replay"))
+    monkeypatch.setattr(module, "_verify_sequential", path("_verify_sequential"))
+    return module, core
 
 
-@pytest.mark.parametrize("allow_prequantized_output", [False, True])
-@pytest.mark.parametrize("use_output_buffer", [False, True])
-@pytest.mark.parametrize("has_replay_caches", [False, True])
-def test_kda_verify_keeps_builtin_fallback_dense(
-    monkeypatch, allow_prequantized_output, use_output_buffer, has_replay_caches
-):
-    module = _kda_verify_module(monkeypatch)
-    monkeypatch.setattr(
-        module, "_dispatch", types.SimpleNamespace(verify_kernel_path="optimized"), raising=False
-    )
-    core = torch.arange(8 * 2 * 128, dtype=torch.float32).to(torch.bfloat16).reshape(8, 2, 128)
-    output = torch.empty_like(core) if use_output_buffer else None
-    cache = (
-        KDAReplayLayerCache(
-            conv=torch.empty(0),
-            temporal=torch.empty(0),
-            kda_conv_q=torch.empty(0),
+def _verify_cache(kind):
+    empty = torch.empty(0)
+    if kind == "records":
+        return KDAReplayLayerCache(
+            conv=empty, temporal=empty, kda_conv_q=empty, kda_state_tok=torch.empty(1)
         )
-        if has_replay_caches
-        else KDAIntermediateLayerCache(conv=torch.empty(0), temporal=torch.empty(0))
-    )
+    if kind == "replay":
+        return KDAReplayLayerCache(conv=empty, temporal=empty, kda_conv_q=empty)
+    return KDAIntermediateLayerCache(conv=empty, temporal=empty)
 
-    mxfp8_input = (torch.empty(8, 16, dtype=torch.uint8), torch.empty(4, dtype=torch.uint8))
-    seen_inputs = []
 
-    def verify_fused(
-        self,
-        *args,
-        output=None,
-        allow_prequantized_output=False,
-        replay_slot_indices=None,
-        prequantized_input=None,
-    ):
-        seen_inputs.append(prequantized_input)
-        if allow_prequantized_output:
-            return _KdaPrequantizedCore(core.reshape(8, -1), torch.ones(1, dtype=torch.uint8))
-        return self._store_core(core, output)
-
-    monkeypatch.setattr(target.KimiKDALinearAttention, "forward_verify_fused", verify_fused)
-    monkeypatch.setattr(
-        target.KimiKDALinearAttention,
-        "forward_verify_sequential",
-        lambda self, *args, output=None, prequantized_input=None: (
-            seen_inputs.append(prequantized_input) or self._store_core(core, output)
-        ),
+@pytest.mark.parametrize("use_output_buffer", [False, True])
+@pytest.mark.parametrize(
+    "kind,path",
+    [
+        ("records", "_k3_verify"),  # the per-draft records: k3_kda_attn / k3_kda_verify
+        ("replay", "_verify_replay"),  # the replay caches alone: kda_mtp_decode
+        ("sequential", "_verify_sequential"),  # the sequential-verify buffers: FLA token by token
+    ],
+)
+def test_kda_verify_takes_the_path_of_the_managers_state(
+    monkeypatch, kind, path, use_output_buffer
+):
+    """The KDA verify path follows the manager's speculative state, and every path returns the dense core
+    [N T, H, 128], in the breakable CUDA graph's buffer when one is given."""
+    seen = []
+    module, core = _kda_verify_module(monkeypatch, seen)
+    output = torch.empty_like(core) if use_output_buffer else None
+    result = module._verify(
+        torch.empty(8, 16), 8, _verify_cache(kind), torch.tensor([0], dtype=torch.int32), output
     )
-    result = module.forward_verify(
-        torch.empty(8, 16),
-        8,
-        cache,
-        None,
-        None,
-        torch.tensor([0]),
-        output=output,
-        allow_prequantized_output=allow_prequantized_output,
-        prequantized_input=mxfp8_input,
-    )
-    assert isinstance(result, torch.Tensor)
+    assert seen == [path]
     torch.testing.assert_close(result, core, rtol=0, atol=0)
     if output is not None:
         assert result is output
-    # The MXFP8 input reaches the built-in verify path.
-    assert len(seen_inputs) == 1 and seen_inputs[0] is mxfp8_input
+
+
+def test_kda_verify_records_need_the_decode_kernels(monkeypatch):
+    """A manager keeping the per-draft records, which only the K3 kernels write, with a layer whose decode weights
+    are not built: refused, not run on another path."""
+    seen = []
+    module, _ = _kda_verify_module(monkeypatch, seen)
+    module._decode_weights_built = False
+    with pytest.raises(AssertionError, match="per-token verify states"):
+        module._verify(
+            torch.empty(8, 16),
+            8,
+            _verify_cache("records"),
+            torch.tensor([0], dtype=torch.int32),
+            None,
+        )
+    assert seen == []
 
 
 @pytest.mark.parametrize("seq_lens,num_contexts,rows,path", STEP_PATHS)

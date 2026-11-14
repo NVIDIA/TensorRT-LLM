@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the k3_ctm_gemv_wide catalog entry."""
+"""GPU test for the k3_ctm_gemv_wide op."""
 
 import zlib
 
@@ -21,7 +21,7 @@ __extra_import_path__ = ["../../../.."]
 from _validating import validating
 
 assert torch.cuda.is_available(), "k3_ctm_gemv_wide requires a CUDA device"
-# The receipts are sm_100 ones; CI's other architectures skip this file.
+# Runs on sm_100 and sm_103 (the architectures the op is certified on); other architectures skip this file.
 pytestmark = pytest.mark.skipif(
     torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
     reason="certified on sm_100 and sm_103",

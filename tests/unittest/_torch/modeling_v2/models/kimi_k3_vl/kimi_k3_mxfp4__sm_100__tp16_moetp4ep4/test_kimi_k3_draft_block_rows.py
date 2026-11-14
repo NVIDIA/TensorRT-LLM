@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""``KimiK3DFlashWorker._draft_block_hidden_states``: the block-output rows that produce the draft logits (host-side).
+"""``KimiK3DSparkWorker._draft_block_hidden_states``: the block-output rows that produce the draft logits (host-side).
 
 For every (num_gens, block, K, shift_label) shape the rows equal the stock gather of the clamped slot ids
 (``dflash_draft_slot_ids``). Where those ids are one run of rows (one request, or DSpark's shift_label convention
@@ -27,7 +27,6 @@ import torch
 from torch import nn
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxfp4__sm_100__tp16_moetp4ep4.spec_worker import (  # noqa: E501
-    KimiK3DFlashWorker,
     KimiK3DSparkWorker,
 )
 from tensorrt_llm._torch.speculative import dflash as dflash_module
@@ -52,9 +51,9 @@ def host_ids(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
 
 
-def _worker(cls=KimiK3DSparkWorker):
+def _worker():
     """A worker without ``__init__`` (it needs flashinfer and a drafter)."""
-    worker = cls.__new__(cls)
+    worker = KimiK3DSparkWorker.__new__(KimiK3DSparkWorker)
     nn.Module.__init__(worker)
     return worker
 
@@ -116,8 +115,9 @@ def test_dspark_decode_shape_is_a_view():
 
 
 def test_dflash_slots_of_several_requests_are_gathered():
-    """Plain DFlash reads slots 1..K of each block of K + 1: a gap per request, so the rows are gathered."""
-    worker = _worker(KimiK3DFlashWorker)
+    """A drafter without the shift_label convention reads DFlash's slots 1..K of each block of K + 1: a gap per
+    request, so the rows are gathered."""
+    worker = _worker()
     out = _block(3, 8)
     rows = worker._draft_block_hidden_states(object(), out, 3, 8, 7)
     assert not _is_view(rows, out)

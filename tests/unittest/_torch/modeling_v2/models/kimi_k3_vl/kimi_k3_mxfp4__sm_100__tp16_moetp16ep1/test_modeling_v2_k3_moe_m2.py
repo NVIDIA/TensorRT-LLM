@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the k3_moe_m2 catalog entry (one GPU): single calls against the fp32 reference and trtllm::k3_moe,
+"""GPU test for the k3_moe_m2 op (one GPU): single calls against the fp32 reference and trtllm::k3_moe,
 with the two tokens' experts overlapping as random routing does, fully shared and mostly disjoint, the call sequences
 over its caller-owned K3MoeM2State that its contract certifies, and the refusal of an intermediate wider than 256.
 The checks are in ``_k3_moe_engines.py`` beside this file."""

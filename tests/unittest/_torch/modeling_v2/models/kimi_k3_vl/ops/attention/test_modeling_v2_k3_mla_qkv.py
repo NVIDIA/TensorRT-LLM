@@ -1,11 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the k3_mla_qkv catalog entry (and its k3_mla_q / k3_mla_qkv_out forms).
+"""GPU test for the k3_mla_qkv op (and its k3_mla_q / k3_mla_qkv_out forms).
 
 The op writes the paged latent cache through addressing tensors the runtime derives from a KVCacheManager and a
 prepared TrtllmAttentionMetadata. The test builds that state for real: an MLA (SELFKONLY, kv_factor 1) KVCacheManager
 of three layers at Kimi K3's latent width (576 = 512 + 64) and page size (64), a prepared TrtllmAttentionMetadata of R
-generation requests of T tokens, and one TRTLLM MLA attention object per layer, whose k3_mla_decode_view gives the
+generation requests of T tokens, and one K3MlaGeometry per layer, whose k3_mla_decode_view gives the
 op's pool, row stride, page table, layer slot (page offset) and lengths. Every pool of the manager starts filled with
 a sentinel; the expected image of each layer is kept from the manager's own block ids (get_batch_cache_indices), not
 from the op's addressing, and compared with the whole pool after every step.
@@ -27,6 +27,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_mla.decode_view import (
+    K3MlaGeometry,
     k3_mla_decode_view,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.attention.k3_mla_qkv import (
@@ -37,7 +38,6 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.attenti
     k3_mla_qkv as op,
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
-from tensorrt_llm._torch.attention.backends.utils import create_attention
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings import DataType
@@ -95,7 +95,7 @@ def _max_rel(a, b) -> float:
 
 class _MlaCache:
     """Real op state: an MLA (SELFKONLY) paged KV cache manager of LAYERS layers holding R requests that grow by T
-    tokens per decode step, a TrtllmAttentionMetadata over it, one TRTLLM MLA attention object per layer for
+    tokens per decode step, a TrtllmAttentionMetadata over it, one K3MlaGeometry per layer for
     k3_mla_decode_view, and the expected image of every layer's pool."""
 
     def __init__(self, num_requests: int, tokens: int, steps: int, heads: int, seed: int):
@@ -118,18 +118,13 @@ class _MlaCache:
         )
         self.mgr.add_dummy_requests(self.request_ids, token_nums=final)
         self.attn = [
-            create_attention(
-                "TRTLLM",
-                layer_idx=layer,
+            K3MlaGeometry(
                 num_heads=heads,
-                head_dim=DQK,
-                num_kv_heads=1,
-                is_mla_enable=True,
-                q_lora_rank=QL,
                 kv_lora_rank=LAT,
                 qk_nope_head_dim=NOPE,
                 qk_rope_head_dim=PE,
-                v_head_dim=V,
+                q_scaling=1.0,
+                layer_idx=layer,
             )
             for layer in range(LAYERS)
         ]

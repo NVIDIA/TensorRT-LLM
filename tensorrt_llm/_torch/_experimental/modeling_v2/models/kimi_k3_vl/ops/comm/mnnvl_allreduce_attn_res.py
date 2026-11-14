@@ -10,7 +10,7 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2._native import load_family_ops
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
-from .mnnvl_workspace import MnnvlWorkspace
+from ...mnnvl_workspace import MnnvlWorkspace
 
 native_ops = load_family_ops(__name__)
 
