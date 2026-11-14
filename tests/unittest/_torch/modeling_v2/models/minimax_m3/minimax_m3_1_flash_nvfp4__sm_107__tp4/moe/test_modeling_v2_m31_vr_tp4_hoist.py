@@ -46,6 +46,13 @@ pytestmark = pytest.mark.skipif(
 _S = {}
 
 
+def _all_ranks_ok(ok: bool, what: str) -> None:
+    """Share every rank's verdict before the next collective: a rank-local failure then fails
+    every rank instead of leaving the others blocked in a barrier."""
+    failed = [r for r, good in enumerate(COMM.allgather(bool(ok))) if not good]
+    assert not failed, f"{what}: failed on rank(s) {failed}"
+
+
 def _env():
     if "env" in _S:
         return _S["env"]
@@ -190,11 +197,14 @@ def test_build_on_mnnvl_and_the_engine_is_hyb():
     block = _block()
     bm = _S["blockmod"]
     # B2LAG is default on: HYB_ENGINE; TRTLLM_M31_DISABLE_TP4WC_B2LAG=1 (seams.B2LAG_OFF) builds the shipped engine.
-    assert block.engine_config == (
-        bm.HYB_ENGINE_B2LAG_OFF if _S["seams"].B2LAG_OFF else bm.HYB_ENGINE
+    want = bm.HYB_ENGINE_B2LAG_OFF if _S["seams"].B2LAG_OFF else bm.HYB_ENGINE
+    ok = (
+        block.engine_config == want
+        and block.engine_config["DL"] == 1
+        and bool(block.placed)
+        and bool(block.armed)
     )
-    assert block.engine_config["DL"] == 1 and block.placed
-    assert block.armed
+    _all_ranks_ok(ok, f"engine {block.engine_config} placed {block.placed} armed {block.armed}")
     COMM.Barrier()
 
 
@@ -203,7 +213,8 @@ def test_engagement_line_says_dl_1_placed_1():
     bm = _S["blockmod"]
     bm._ENGAGED.clear()
     line = bm.log_engaged(COMM.Get_rank(), block, _S["seams"].HANG_CAP_NS)
-    assert line.startswith("[M31_TP4WC_HOIST] engaged:") and " dl 1 placed 1 " in line, line
+    ok = line.startswith("[M31_TP4WC_HOIST] engaged:") and " dl 1 placed 1 " in line
+    _all_ranks_ok(ok, line)
     COMM.Barrier()
 
 
@@ -280,12 +291,13 @@ def test_graph_replay_is_the_eager_bits():
     with torch.cuda.stream(s), torch.cuda.graph(graph, stream=s):
         block(xq, xsf)
     torch.cuda.current_stream().wait_stream(s)
-    for _ in range(32):
+    for i in range(32):
         _rearm()
         graph.replay()
         torch.cuda.synchronize()
         got = (block.residual_out, block.blk.normed2, block.ffn_out)
-        assert all(torch.equal(a.view(torch.int16), b.view(torch.int16)) for a, b in zip(got, want))
+        same = all(torch.equal(a.view(torch.int16), b.view(torch.int16)) for a, b in zip(got, want))
+        _all_ranks_ok(same, f"graph replay {i} differs from the eager bits")
     _rearm()
 
 
@@ -302,7 +314,8 @@ def test_late_rank_does_not_trap():
         time.sleep(3.0)
     block(xq, xsf)
     torch.cuda.synchronize()
-    assert torch.equal(block.residual_out.view(torch.int16), want.view(torch.int16))
+    same = torch.equal(block.residual_out.view(torch.int16), want.view(torch.int16))
+    _all_ranks_ok(same, "the late call differs from the on-time bits")
     _rearm()
 
 
@@ -315,16 +328,21 @@ def test_kill_switch_env_reaches_the_target():
         "sys.exit(0 if m.TP4WC_HOIST is False else 1)"
     )
     for env in ("TRTLLM_M31_DISABLE_TP4WC_HOIST", "TRTLLM_M31_DISABLE_TP4_WHOLECHAIN"):
+        ok = True
         if COMM.Get_rank() == 0:
             # a fresh, non-MPI interpreter: a child that inherits this mpirun rank's OMPI / PMIx env blocks in MPI init
-            # (build_cut26_v1: TimeoutExpired after 600 s)
+            # until the 600 s timeout
             base = {
                 k: v for k, v in os.environ.items() if not k.startswith(("OMPI_", "PMIX_", "PMI_"))
             }
-            r = subprocess.run(
-                [sys.executable, "-c", code],
-                env={**base, env: "1", "TLLM_DISABLE_MPI": "1"},
-                timeout=600,
-            )
-            assert r.returncode == 0, env
+            try:
+                r = subprocess.run(
+                    [sys.executable, "-c", code],
+                    env={**base, env: "1", "TLLM_DISABLE_MPI": "1"},
+                    timeout=600,
+                )
+                ok = r.returncode == 0
+            except (subprocess.TimeoutExpired, OSError):
+                ok = False
+        _all_ranks_ok(ok, env)
     COMM.Barrier()

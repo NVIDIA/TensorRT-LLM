@@ -176,10 +176,15 @@ def _fake_flashinfer(monkeypatch):
         top_k_mask_logits=mock.Mock(side_effect=lambda logits, top_k: logits),
     )
     monkeypatch.setattr(fi_ops, "flashinfer", types.SimpleNamespace(sampling=sampling))
+    previous_softmax = fi_ops._SOFTMAX_OVERRIDE
+    previous_top_p = fi_ops._TOP_P_RENORM_OVERRIDE
     fi_ops.set_softmax_override(None)
     fi_ops.set_top_p_renorm_override(None)
-    yield sampling, stock
-    fi_ops.set_softmax_override(None)
+    try:
+        yield sampling, stock
+    finally:
+        fi_ops.set_softmax_override(previous_softmax)
+        fi_ops.set_top_p_renorm_override(previous_top_p)
 
 
 def test_hook_unset_is_stock(_fake_flashinfer) -> None:
@@ -232,13 +237,15 @@ def test_the_target_installs_the_override() -> None:
     if not modeling.SOFTMAX_MC:
         pytest.skip("SOFTMAX_MC is switched off in this environment")
     saved = dict(modeling._SOFTMAX_MC_STATE)
+    saved_hook = fi_ops._SOFTMAX_OVERRIDE
     modeling._SOFTMAX_MC_STATE.clear()
+    fi_ops.set_softmax_override(None)
     try:
         modeling._install_softmax_mc()
         assert fi_ops._SOFTMAX_OVERRIDE is entry.softmax_mc
         assert modeling._SOFTMAX_MC_STATE["installed"] is True
     finally:
-        fi_ops.set_softmax_override(None)
+        fi_ops.set_softmax_override(saved_hook)
         modeling._SOFTMAX_MC_STATE.clear()
         modeling._SOFTMAX_MC_STATE.update(saved)
 

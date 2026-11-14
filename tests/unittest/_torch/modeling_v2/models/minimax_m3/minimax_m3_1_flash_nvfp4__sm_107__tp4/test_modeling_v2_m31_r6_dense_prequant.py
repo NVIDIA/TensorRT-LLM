@@ -6,6 +6,7 @@ The engagement itself ("[M3 dispatch] r6_dense_prequant taken" /
 "off") is checked in-model."""
 
 import importlib
+import os
 
 import pytest
 
@@ -28,13 +29,18 @@ def test_r6_is_off_by_default_on_vr() -> None:
 def test_r6_switches(
     monkeypatch: pytest.MonkeyPatch, enable: str, disable: str, expected: bool
 ) -> None:
+    names = ("TRTLLM_M31_ENABLE_R6", "TRTLLM_M31_DISABLE_R6")
+    original = {name: os.environ.get(name) for name in names}
     monkeypatch.setenv("TRTLLM_M31_ENABLE_R6", enable)
     monkeypatch.setenv("TRTLLM_M31_DISABLE_R6", disable)
     try:
         importlib.reload(m31_switches)  # the switches are read once, at its import
         assert importlib.reload(modeling).R6_DENSE_PREQUANT is expected
     finally:
-        monkeypatch.delenv("TRTLLM_M31_ENABLE_R6", raising=False)
-        monkeypatch.delenv("TRTLLM_M31_DISABLE_R6", raising=False)
+        for name, value in original.items():
+            if value is None:
+                monkeypatch.delenv(name, raising=False)
+            else:
+                monkeypatch.setenv(name, value)
         importlib.reload(m31_switches)
         importlib.reload(modeling)

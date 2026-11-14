@@ -158,6 +158,8 @@ def test_unsupported_shapes_fall_back_on_the_shards(monkeypatch):
 
 def test_switch_reads_any_value_but_empty_or_zero(monkeypatch):
     """Read at import, like the targets' m31_switches: "true" turns S4 off, not only "1"."""
+    original = os.environ.get(w1.DISABLE_ENV)
+    original_off = w1.disabled()
     try:
         for value, off in (
             ("1", True),
@@ -171,9 +173,12 @@ def test_switch_reads_any_value_but_empty_or_zero(monkeypatch):
             importlib.reload(w1)
             assert w1.disabled() is off, value
     finally:
-        monkeypatch.delenv(w1.DISABLE_ENV, raising=False)
+        if original is None:
+            monkeypatch.delenv(w1.DISABLE_ENV, raising=False)
+        else:
+            monkeypatch.setenv(w1.DISABLE_ENV, original)
         importlib.reload(w1)
-    assert not w1.disabled()
+    assert w1.disabled() is original_off
 
 
 def test_markov_ll_engagement_logged_once_per_rank(monkeypatch):

@@ -12,7 +12,16 @@ import _rank_job
 import pytest
 import torch
 
-assert torch.cuda.is_available(), "the multicast all-reduce requires CUDA devices"
+pytestmark = [
+    pytest.mark.skipif(
+        not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7),
+        reason="the sm_107 TP4 target runs on SM107 only",
+    ),
+    pytest.mark.skipif(
+        torch.cuda.device_count() < _rank_job.WORLD_SIZE,
+        reason=f"certified at world size {_rank_job.WORLD_SIZE}",
+    ),
+]
 
 
 # Spawns 4 rank processes over the visible devices; under xdist workers would fight for them.

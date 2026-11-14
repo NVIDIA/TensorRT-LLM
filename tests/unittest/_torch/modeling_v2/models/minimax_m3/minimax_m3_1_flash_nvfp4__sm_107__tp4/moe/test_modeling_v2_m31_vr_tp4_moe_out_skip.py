@@ -97,7 +97,10 @@ def test_push_bits_unchanged_and_out_store_skipped(
     _check_push(m3_moe_engine, _state(monkeypatch, num_tokens, killed), num_tokens, 8, killed)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="the engine state compiles the kernel")
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7),
+    reason="the engine state compiles the kernel",
+)
 @pytest.mark.parametrize("num_tokens", [9, 16])
 @pytest.mark.parametrize("killed", [False, True])
 def test_moe16_push_bits_unchanged_and_out_store_skipped(
