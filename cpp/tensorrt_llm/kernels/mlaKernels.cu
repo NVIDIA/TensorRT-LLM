@@ -1906,6 +1906,27 @@ void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, cudaStr
                         params.quant_scale_o, params.dequant_scale_q, params.dequant_scale_kv, params.host_bmm1_scale);
             }
         }
+        else if (params.fp8_kv_input)
+        {
+            // K and V are FP8 already: quantize Q only, or nothing when it is FP8 too. Block 0 still
+            // writes the BMM scales.
+            constexpr int threads_per_block = 384;
+            constexpr int num_tokens_per_block = threads_per_block * 16 / 192 * sizeof(T);
+            int const q_len = params.fp8_q_input ? 0 : params.acc_q_len;
+            dim3 grid(std::max(1, int(tensorrt_llm::common::divUp(q_len, num_tokens_per_block))), 1,
+                params.fp8_q_input ? 1 : params.head_num);
+
+            TLLM_LOG_DEBUG(
+                "Launching quantizeCopyInputToFp8Kernel (FP8 K/V input) with grid_size: (%d, %d, %d), "
+                "threads_per_block: %d, acc_q_len: %d, fp8_q_input: %d",
+                grid.x, grid.y, grid.z, threads_per_block, params.acc_q_len, params.fp8_q_input);
+
+            quantizeCopyInputToFp8Kernel<T, threads_per_block, 128, 64, 128, false>
+                <<<grid, threads_per_block, 0, stream>>>(params.q_buf, static_cast<__nv_fp8_e4m3*>(params.quant_q_buf),
+                    /*k_buf=*/nullptr, /*quant_k_buf=*/nullptr, /*v_buf=*/nullptr, /*quant_v_buf=*/nullptr, q_len,
+                    /*total_kv_len=*/0, srcVTokenStride, params.quant_scale_qkv, params.bmm1_scale, params.bmm2_scale,
+                    params.quant_scale_o, params.dequant_scale_q, params.dequant_scale_kv, params.host_bmm1_scale);
+        }
         else
         {
             // The Q or K tensor has layout of [num_tokens, head_num, 192] in the non-absorption mode.
@@ -2313,6 +2334,78 @@ void invokeMLARoPEInplace(T* data, int32_t const* position_ids, float const* cos
 
 INSTANTIATE_MLA_ROPE_INPLACE(__nv_bfloat16);
 INSTANTIATE_MLA_ROPE_INPLACE(half);
+
+template <typename T>
+__global__ void reorderHelixMlaKVKernel(T const* gathered, T* compressedKv, T* kPe, int64_t const* cuGlobal,
+    int64_t const* globalOffsets, int64_t const* cuLocal, int64_t const* localOffsets, int64_t const* rankOffsets,
+    int numTokens, int numContexts, int cpSize, int tokensPerBlock, int loraSize, int ropeSize)
+{
+    constexpr int kWarpSize = 32;
+    constexpr int kWarpsPerBlock = 4;
+    constexpr int kElementsPerVector = sizeof(uint4) / sizeof(T);
+    int const token = blockIdx.x * kWarpsPerBlock + threadIdx.x / kWarpSize;
+    if (token >= numTokens)
+    {
+        return;
+    }
+    // Repeated boundaries represent requests with no history in this chunk.
+    int left = 0;
+    int right = numContexts;
+    while (left < right)
+    {
+        int const mid = (left + right) / 2;
+        if (cuGlobal[mid + 1] <= token)
+        {
+            left = mid + 1;
+        }
+        else
+        {
+            right = mid;
+        }
+    }
+    int const request = left;
+    int64_t const position = globalOffsets[request] + token - cuGlobal[request];
+    int const owner = (position / tokensPerBlock) % cpSize;
+    int64_t const slot
+        = position / (static_cast<int64_t>(tokensPerBlock) * cpSize) * tokensPerBlock + position % tokensPerBlock;
+    int64_t const sourceRow = rankOffsets[owner] + cuLocal[owner * (numContexts + 1) + request] + slot
+        - localOffsets[owner * numContexts + request];
+    int const kvVectors = loraSize / kElementsPerVector;
+    int const peVectors = ropeSize / kElementsPerVector;
+    auto const* source = reinterpret_cast<uint4 const*>(gathered) + sourceRow * (kvVectors + peVectors);
+    int const lane = threadIdx.x % kWarpSize;
+    for (int column = lane; column < kvVectors; column += kWarpSize)
+    {
+        reinterpret_cast<uint4*>(compressedKv)[static_cast<int64_t>(token) * kvVectors + column] = source[column];
+    }
+    for (int column = lane; column < peVectors; column += kWarpSize)
+    {
+        reinterpret_cast<uint4*>(kPe)[static_cast<int64_t>(token) * peVectors + column] = source[kvVectors + column];
+    }
+}
+
+template <typename T>
+void invokeReorderHelixMlaKV(T const* gathered, T* compressedKv, T* kPe, int64_t const* cuGlobal,
+    int64_t const* globalOffsets, int64_t const* cuLocal, int64_t const* localOffsets, int64_t const* rankOffsets,
+    int numTokens, int numContexts, int cpSize, int tokensPerBlock, int loraSize, int ropeSize, cudaStream_t stream)
+{
+    constexpr int kWarpsPerBlock = 4;
+    constexpr int kThreadsPerBlock = 128;
+    if (numTokens > 0)
+    {
+        reorderHelixMlaKVKernel<T><<<divUp(numTokens, kWarpsPerBlock), kThreadsPerBlock, 0, stream>>>(gathered,
+            compressedKv, kPe, cuGlobal, globalOffsets, cuLocal, localOffsets, rankOffsets, numTokens, numContexts,
+            cpSize, tokensPerBlock, loraSize, ropeSize);
+    }
+}
+
+template void invokeReorderHelixMlaKV<half>(half const*, half*, half*, int64_t const*, int64_t const*, int64_t const*,
+    int64_t const*, int64_t const*, int, int, int, int, int, int, cudaStream_t);
+template void invokeReorderHelixMlaKV<__nv_bfloat16>(__nv_bfloat16 const*, __nv_bfloat16*, __nv_bfloat16*,
+    int64_t const*, int64_t const*, int64_t const*, int64_t const*, int64_t const*, int, int, int, int, int, int,
+    cudaStream_t);
+template void invokeReorderHelixMlaKV<float>(float const*, float*, float*, int64_t const*, int64_t const*,
+    int64_t const*, int64_t const*, int64_t const*, int, int, int, int, int, int, cudaStream_t);
 
 } // namespace kernels
 

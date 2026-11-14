@@ -55,6 +55,13 @@ target_link_libraries(
 set_target_properties(tllm_common_logging PROPERTIES POSITION_INDEPENDENT_CODE
                                                      ON)
 
+add_library(tllm_common_profiler STATIC cudaProfilerUtils.cpp)
+add_library(tllm::common_profiler ALIAS tllm_common_profiler)
+target_link_libraries(tllm_common_profiler PUBLIC tllm::common_logging)
+target_compile_features(tllm_common_profiler PUBLIC cxx_std_20)
+set_target_properties(tllm_common_profiler PROPERTIES POSITION_INDEPENDENT_CODE
+                                                      ON)
+
 add_library(tllm_common_cuda STATIC cudaDriverWrapper.cpp memoryUtils.cu
                                     nvmlWrapper.cpp)
 add_library(tllm::common_cuda ALIAS tllm_common_cuda)
@@ -79,7 +86,6 @@ add_library(
   cublasMMWrapper.cpp
   cudaArchitectures.cpp
   cudaFp8Utils.cu
-  cudaProfilerUtils.cpp
   mcastDevMemUtils.cpp
   ncclUtils.cpp
   opUtils.cpp

@@ -25,6 +25,7 @@ from tensorrt_llm._torch.models.modeling_qwen3_next import (
     Qwen3NextForCausalLM,
     Qwen3NextFullAttentionDecoderLayer,
     Qwen3NextMTP,
+    Qwen3NextSparseMoeBlock,
     _DeferredSharedExpertFinalize,
     _eager_fusion_enabled,
     _Qwen3NextDecoderLayerBase,
@@ -39,6 +40,45 @@ def _new_causal_lm() -> Qwen3NextForCausalLM:
     model.spec_config = None
     model.spec_worker = None
     return model
+
+
+@pytest.mark.cpu_only
+def test_sparse_moe_keeps_shared_expert_tokens_unpadded(monkeypatch) -> None:
+    block = Qwen3NextSparseMoeBlock.__new__(Qwen3NextSparseMoeBlock)
+    nn.Module.__init__(block)
+    block.hidden_dim = 2
+    block.enable_attention_dp = True
+    block.mapping = SimpleNamespace(tp_size=2)
+    block.event_dict = {EventType.Main: None, EventType.MoeShared: None}
+    block.aux_stream = None
+    block._shared_gate_aux = None
+    block._decode_front = MagicMock(return_value=None)
+    block._shared_expert_low_m_forward = MagicMock(return_value=None)
+    block.gate = MagicMock(return_value=torch.zeros(4, 2))
+    block.experts = MagicMock(side_effect=lambda x, *args, **kwargs: x[:2] + 3)
+    block.shared_expert = MagicMock(side_effect=lambda x, **kwargs: x * 2)
+    block.shared_expert_gate = MagicMock(side_effect=lambda x: x.new_zeros((x.shape[0], 1)))
+
+    module = "tensorrt_llm._torch.models.modeling_qwen3_next"
+    monkeypatch.setattr(f"{module}.is_sm_120f", lambda: True)
+    monkeypatch.setattr(
+        f"{module}.fused_sigmoid_gate_mul_add",
+        lambda routed, gate, shared: routed + torch.sigmoid(gate) * shared,
+    )
+    hidden_states = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    output = block(hidden_states, SimpleNamespace(all_rank_num_tokens=[2, 4]))
+
+    routed_input = block.experts.call_args.args[0]
+    assert routed_input.shape == (4, 2)
+    torch.testing.assert_close(routed_input[:2], hidden_states)
+    assert torch.count_nonzero(routed_input[2:]) == 0
+    assert block.gate.call_args.args[0].shape == (4, 2)
+    assert block._decode_front.call_args.args[2].shape == (4, 2)
+    assert block.experts.call_args.kwargs["use_dp_padding"]
+    assert block.shared_expert.call_args.args[0].shape == (2, 2)
+    assert block.shared_expert_gate.call_args.args[0].shape == (2, 2)
+    assert output.shape == (2, 2)
+    torch.testing.assert_close(output, hidden_states * 2 + 3)
 
 
 def _new_mtp() -> Qwen3NextMTP:
@@ -136,12 +176,16 @@ def test_setup_aliases_does_not_read_meta_weights() -> None:
 
     assert model.model.layers[0].next_layer_layernorm is model.model.layers[1].input_layernorm
     assert model.model.layers[1].next_layer_layernorm is model.model.norm
-    assert not hasattr(model.model.norm, "_fused_norm_weight")
+    assert model.model.norm._fused_norm_weight is None
 
 
 @torch.no_grad()
 def test_cache_derived_state_refreshes_gemma_norm_weight() -> None:
     model = _new_causal_lm()
+    # No decoder layers: only the norm weight precompute runs.
+    model.model = nn.Module()
+    model.model.layers = nn.ModuleList()
+    model.model_config = SimpleNamespace(pretrained_config=SimpleNamespace(num_hidden_layers=0))
     model.gemma_norm = RMSNorm(hidden_size=4, eps=1e-6, dtype=torch.bfloat16, use_gemma=True)
     model.standard_norm = RMSNorm(hidden_size=4, eps=1e-6, dtype=torch.bfloat16)
     model.gemma_norm.weight.copy_(torch.tensor([-0.5, 0.0, 0.5, 1.0], dtype=torch.bfloat16))
@@ -152,7 +196,7 @@ def test_cache_derived_state_refreshes_gemma_norm_weight() -> None:
     # Exact: cache_derived_state bakes (1+weight) with the same fp32-add-then-
     # cast recomputed here, so the result must be bitwise-identical.
     torch.testing.assert_close(model.gemma_norm._fused_norm_weight, expected, atol=0.0, rtol=0.0)
-    assert not hasattr(model.standard_norm, "_fused_norm_weight")
+    assert model.standard_norm._fused_norm_weight is None
 
     model.gemma_norm.weight.add_(1.0)
     model.cache_derived_state()

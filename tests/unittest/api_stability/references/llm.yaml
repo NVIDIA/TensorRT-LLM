@@ -83,6 +83,10 @@ methods:
         annotation: Optional[int]
         default: null
         status: prototype
+      serve_graceful_shutdown_timeout_s:
+        annotation: Optional[int]
+        default: null
+        status: prototype
       custom_tokenizer:
         annotation: Optional[str]
         default: null
@@ -112,7 +116,7 @@ methods:
         status: deprecated
       modeling_v2:
         annotation: Literal['off', 'auto', 'require']
-        default: 'off'
+        default: auto
         status: prototype
       cuda_graph_config:
         annotation: Union[tensorrt_llm.llmapi.llm_args.DecodeCudaGraphConfig, tensorrt_llm.llmapi.llm_args.EncodeCudaGraphConfig, NoneType]
@@ -143,11 +147,11 @@ methods:
         default: null
         status: prototype
       checkpoint_format:
-        annotation: Optional[str]
+        annotation: Union[tensorrt_llm.checkpoint_format.CheckpointFormat, str, NoneType]
         default: null
         status: prototype
       checkpoint_io_policy:
-        annotation: Literal['auto', 'native', 'rank_striped_read_ahead']
+        annotation: tensorrt_llm.llmapi.llm_args.CheckpointIOPolicy
         default: auto
         status: prototype
       mx_config:
@@ -186,6 +190,10 @@ methods:
         annotation: bool
         default: False
         status: beta
+      watermark_config:
+        annotation: Optional[WatermarkConfig]
+        default: null
+        status: prototype
       lm_head_output_dtype:
         annotation: Literal['auto', 'float32']
         default: auto
@@ -238,6 +246,10 @@ methods:
         annotation: bool
         default: False
         status: prototype
+      prompt_token_cache_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.PromptTokenCacheConfig]
+        default: null
+        status: prototype
       enable_iter_req_stats:
         annotation: bool
         default: False
@@ -262,6 +274,14 @@ methods:
         annotation: bool
         default: False
         status: beta
+      enable_client_io_during_gpu_wait:
+        annotation: bool
+        default: False
+        status: prototype
+      gen_prompt_tail_tokens:
+        annotation: Optional[int]
+        default: null
+        status: prototype
       perf_metrics_max_requests:
         annotation: int
         default: 0

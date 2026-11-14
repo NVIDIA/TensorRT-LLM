@@ -17,7 +17,7 @@
 :class:`.TRTLLMGenFp4BlockScaleBase` owns the kernel call; NVFP4, W4A16_MXFP4
 and W4A8_MXFP4_MXFP8 differ in how weights and inputs are prepared and not at
 all in how the kernel is called, so each subclass supplies only the
-preparation. Two leaves land here per format, one per provider.
+preparation. One leaf lands here per format.
 
 A format's class also answers whatever the family base would otherwise switch
 on ``quant_config`` for: the SiTu weight alignment and scale group size are
@@ -27,7 +27,12 @@ per-format, so they are settled here rather than branched on above.
 import torch
 from torch import nn
 
-from tensorrt_llm._torch.utils import ActType_TrtllmGen, Fp4QuantizedTensor, MxFp8QuantizedTensor
+from tensorrt_llm._torch.utils import (
+    ActivationType,
+    ActType_TrtllmGen,
+    Fp4QuantizedTensor,
+    MxFp8QuantizedTensor,
+)
 
 from ..activation import materialize_activation_params, resolve_activation_support
 from ..impl_contract import MoERunContext
@@ -38,7 +43,6 @@ from ..quantization import (
     W4A16MXFP4TRTLLMGenFusedMoEMethod,
 )
 from .base import TrtllmGenFusedMoEBase
-from .eligibility import nvfp4_needs_padded_method
 from .kernel_inputs import (
     extract_routing_params,
     get_data_or_none,
@@ -185,6 +189,10 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
         self.act_alpha.data.copy_(params.alpha)
         self.act_beta.data.copy_(params.beta)
 
+    def ran_on_routing_tables(self, rows: int, tile: int | None) -> None:
+        """A run of ``rows`` tokens given routing tables used the table of ``tile`` (None: the
+        runner routed itself)."""
+
     def run_moe(
         self,
         ctx: MoERunContext,
@@ -247,9 +255,28 @@ class TRTLLMGenFp4BlockScaleBase(TrtllmGenFusedMoEBase):
             use_dp=self.use_dp,
             prerouted=prerouted,
             decode_tuning=self.decode_tuning,
+            routing_tables=ctx.routing_tables,
         )
 
         if not k.do_finalize:
+            if k.token_final_scales is not None and prerouted is None:
+                # With routing weights passed in, the runner combines with those and leaves its
+                # own expert_weights output unwritten: hand the caller the ones it used.
+                outputs = [outputs[0], k.token_final_scales, outputs[2]]
+            if ctx.routing_tables is not None:
+                # The runner ran on the tables when its permutation is an empty [0, tile]
+                # placeholder naming the tile whose table holds it; else it routed itself.
+                used = outputs[2].shape[1] if outputs[2].numel() == 0 else None
+                self.ran_on_routing_tables(k.x.shape[0], used)
+                if used is not None:
+                    tables = ctx.routing_tables
+                    permutation = tables.tables[tables.tiles.index(used), 0]
+                    weights = outputs[1]
+                    outputs = [
+                        outputs[0],
+                        weights,
+                        permutation[: weights.numel()].view(weights.shape),
+                    ]
             return self._unfinalized(outputs)
 
         # When output is provided, use it directly as the result
@@ -266,7 +293,7 @@ class TRTLLMGenNvfp4Base(TRTLLMGenFp4BlockScaleBase):
     supports_gptoss_style = True
 
     def supports_unfinalized_output(self) -> bool:
-        """Both providers' NVFP4 runners honor ``do_finalize=False``.
+        """The NVFP4 runner honors ``do_finalize=False``.
 
         Declared here rather than on the family base: the MXFP4 siblings call
         runners without a ``do_finalize`` parameter, which finalize regardless.
@@ -274,8 +301,8 @@ class TRTLLMGenNvfp4Base(TRTLLMGenFp4BlockScaleBase):
         return True
 
     # Group size of the ``Bmm_E2m1_E2m1E2m1_..._siTuGlu_*`` cubins. Whether a
-    # leaf may reach them is ``supports_situ``, declared per leaf because only
-    # the native op backend calls them.
+    # leaf may reach them is ``supports_situ``, declared on the leaf because it
+    # also depends on the op backend calling them.
     situ_scaling_vector_size = 16
 
     def _situ_tp_weight_alignment(self) -> int:
@@ -291,8 +318,17 @@ class TRTLLMGenNvfp4Base(TRTLLMGenFp4BlockScaleBase):
         # SiTu fills the act_alpha/act_beta slots from create_weights, which
         # runs after this, so keying off the tensor would make the method
         # depend on *when* it is asked for.
-        needs_padded_method = nvfp4_needs_padded_method(
-            self.activation_type, self.act_alpha is not None
+        # The gate and up shards fill each 128-row scale-shuffle tile half and half, and the down
+        # projection's K takes whole 4-column scale atoms: 64 rows per shard serve both.
+        needs_padded_method = (
+            self.intermediate_size_per_partition % 64 != 0
+            or self.act_alpha is not None
+            or self.activation_type
+            in (
+                ActivationType.SiTu,
+                ActivationType.Relu2,
+                ActivationType.Silu,
+            )
         )
         return (
             NVFP4TRTLLMGenFusedMoEMethod()

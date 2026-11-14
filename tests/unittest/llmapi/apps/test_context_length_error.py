@@ -33,7 +33,9 @@ CLI act on.
 """
 
 import json
+from collections.abc import Callable, Iterator
 from http import HTTPStatus
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -41,6 +43,12 @@ import aiohttp
 import pytest
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from test_common.serve.app_factory import (
+    AggConfig,
+    ServeTestEnv,
+    _make_disagg_server_config,
+    isolated_serve_env,
+)
 
 import tensorrt_llm.serve.openai_server as openai_server_module
 from tensorrt_llm.executor.executor import GenerationExecutor
@@ -54,6 +62,7 @@ from tensorrt_llm.executor.utils import (
     is_context_length_exceeded_message,
 )
 from tensorrt_llm.llmapi.llm import RequestOutput
+from tensorrt_llm.sampling_params import SamplingParams
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
 from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest, ResponsesRequest
 from tensorrt_llm.serve.openai_server import OpenAIServer
@@ -61,6 +70,12 @@ from tensorrt_llm.serve.openai_server import OpenAIServer
 # The CPU stage collects with `-m cpu_only`; unittest/conftest.py also skips
 # collecting any file that does not contain the cpu_only marker.
 pytestmark = pytest.mark.cpu_only
+
+
+@pytest.fixture(autouse=True)
+def _serve_env(tmp_path: Path) -> Iterator[ServeTestEnv]:
+    with isolated_serve_env(tmp_path) as env:
+        yield env
 
 
 def test_message_matches_openai_wording():
@@ -139,13 +154,10 @@ def _upstream_error(worker_body: str, status: int = 400) -> aiohttp.ClientRespon
     )
 
 
-def _disagg_server(cls: type = OpenAIDisaggServer) -> OpenAIDisaggServer:
-    server = object.__new__(cls)
-    server._perf_metrics_collector = SimpleNamespace(
-        http_exceptions=SimpleNamespace(inc=Mock()),
-        internal_errors=SimpleNamespace(inc=Mock()),
-    )
-    return server
+def _disagg_server(
+    cls: type[OpenAIDisaggServer] = OpenAIDisaggServer,
+) -> OpenAIDisaggServer:
+    return cls(_make_disagg_server_config())
 
 
 def test_disagg_route_preserves_machine_readable_code():
@@ -227,26 +239,28 @@ class _RejectingEngine:
         return RequestOutput._from_generation_result(result)
 
 
-def _responses_server(engine: _RejectingEngine, monkeypatch) -> OpenAIServer:
-    async def preprocess(**kwargs):
-        return [1, 2, 3], kwargs["request"].to_sampling_params()
+@pytest.fixture
+def _responses_server(
+    _serve_env: ServeTestEnv, monkeypatch: pytest.MonkeyPatch
+) -> Callable[[_RejectingEngine], OpenAIServer]:
+    async def preprocess(
+        *, request: ResponsesRequest, **_kwargs: object
+    ) -> tuple[list[int], SamplingParams]:
+        return [1, 2, 3], request.to_sampling_params()
 
     monkeypatch.setattr(openai_server_module, "responses_api_request_preprocess", preprocess)
-    server = object.__new__(OpenAIServer)
-    server.generator = engine
-    server.model = "served-model"
-    server.enable_store = False
-    server._is_visual_gen = False
-    server.use_harmony = False
-    server.tokenizer = None
-    server.model_config = None
-    server.processor = None
-    server.multimodal_server_config = None
-    server.chat_template = None
-    server.tool_parser = None
-    server.conversation_store = None
-    server._validate_internal_disagg_request = lambda *args: None
-    return server
+
+    def build_server(engine: _RejectingEngine) -> OpenAIServer:
+        server = _serve_env.build_openai_server(
+            AggConfig(
+                model_name="served-model",
+                env=(("TRTLLM_RESPONSES_API_DISABLE_STORE", "1"),),
+            )
+        )
+        monkeypatch.setattr(server.generator, "generate_async", engine.generate_async)
+        return server
+
+    return build_server
 
 
 def _event(frame):
@@ -281,8 +295,10 @@ def _assert_failed_in_stream(events, request: ResponsesRequest) -> None:
 
 @pytest.mark.parametrize("in_worker", [True, False], ids=["in_worker", "in_process"])
 @pytest.mark.asyncio
-async def test_a_streamed_responses_request_fails_in_stream(in_worker, monkeypatch):
-    server = _responses_server(_RejectingEngine(_MSG, in_worker), monkeypatch)
+async def test_a_streamed_responses_request_fails_in_stream(
+    in_worker: bool, _responses_server: Callable[[_RejectingEngine], OpenAIServer]
+) -> None:
+    server = _responses_server(_RejectingEngine(_MSG, in_worker))
     request = ResponsesRequest(model="client-model", input="hi", stream=True)
 
     response = await server.openai_responses(request, _RAW_REQUEST)
@@ -293,8 +309,10 @@ async def test_a_streamed_responses_request_fails_in_stream(in_worker, monkeypat
 
 @pytest.mark.parametrize("in_worker", [True, False], ids=["in_worker", "in_process"])
 @pytest.mark.asyncio
-async def test_a_non_streamed_responses_request_keeps_the_400(in_worker, monkeypatch):
-    server = _responses_server(_RejectingEngine(_MSG, in_worker), monkeypatch)
+async def test_a_non_streamed_responses_request_keeps_the_400(
+    in_worker: bool, _responses_server: Callable[[_RejectingEngine], OpenAIServer]
+) -> None:
+    server = _responses_server(_RejectingEngine(_MSG, in_worker))
     request = ResponsesRequest(model="client-model", input="hi", stream=False)
 
     response = await server.openai_responses(request, _RAW_REQUEST)
@@ -308,8 +326,10 @@ async def test_a_non_streamed_responses_request_keeps_the_400(in_worker, monkeyp
 
 @pytest.mark.parametrize("in_worker", [True, False], ids=["in_worker", "in_process"])
 @pytest.mark.asyncio
-async def test_other_rejections_of_a_streamed_request_are_unchanged(in_worker, monkeypatch):
-    server = _responses_server(_RejectingEngine("Insufficient KV cache", in_worker), monkeypatch)
+async def test_other_rejections_of_a_streamed_request_are_unchanged(
+    in_worker: bool, _responses_server: Callable[[_RejectingEngine], OpenAIServer]
+) -> None:
+    server = _responses_server(_RejectingEngine("Insufficient KV cache", in_worker))
     request = ResponsesRequest(model="client-model", input="hi", stream=True)
 
     response = await server.openai_responses(request, _RAW_REQUEST)
