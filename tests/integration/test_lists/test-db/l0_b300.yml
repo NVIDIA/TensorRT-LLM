@@ -30,8 +30,9 @@ l0_b300:
   # Four disjoint attention batches use the default per-entry timeout.
   # cpu_only cases run on CPU. kernels/parallel_hw_agnostic GPU cases run on
   # H100 and GB300; the six excluded sparse files have separate entries below.
-  # Keep multi_gpu/: it also contains cases that run on a single GPU.
-  - unittest/_torch/attention --ignore=unittest/_torch/attention/sparse --ignore=unittest/_torch/attention/kernels/parallel_hw_agnostic
+  # Single-GPU Helix checks live directly under attention/; distributed suites
+  # remain on the multi-GPU lists.
+  - unittest/_torch/attention --ignore=unittest/_torch/attention/multi_gpu --ignore=unittest/_torch/attention/sparse --ignore=unittest/_torch/attention/kernels/parallel_hw_agnostic
   - unittest/_torch/attention/sparse/dsa --ignore=unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp8_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp4_paged_mqa_logits.py
   - unittest/_torch/attention/sparse/deepseek_v4
   - unittest/_torch/attention/sparse --ignore=unittest/_torch/attention/sparse/dsa --ignore=unittest/_torch/attention/sparse/deepseek_v4 --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_tiers.py --ignore=unittest/_torch/attention/sparse/msa/test_minimax_m3_sparse_attn_decode.py --ignore=unittest/_torch/attention/sparse/msa/test_msa_proxy_split.py
