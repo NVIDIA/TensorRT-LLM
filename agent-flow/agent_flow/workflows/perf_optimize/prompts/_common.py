@@ -56,6 +56,7 @@ __all__ = [
     "KERNEL_COVERAGE_REPORTER_GUIDANCE",
     "KERNEL_REUSE",
     "MEASUREMENT_PROTOCOL",
+    "NATIVE_RUNTIME_REUSE",
     "OPTIMIZE_HTML_COMPANION",
     "PROFILE_FINDINGS_CONTRACT",
     "PROFILING_KNOB_VERIFICATION",
@@ -75,6 +76,20 @@ __all__ = [
     "approach_restriction_note",
     "kernel_coverage_analyzer_note",
 ]
+
+
+NATIVE_RUNTIME_REUSE = """\
+## Wheel runtime reuse
+
+The supplied SQSH contains a normal wheel installation of TensorRT-LLM in
+`site-packages`. For a Python-only source overlay, locate that installed package
+before setting `PYTHONPATH`, link its missing compiled entries (such as
+`bindings*.so` and `libs/`) into the active checkout's `tensorrt_llm/`, then put
+the checkout first on `PYTHONPATH`; `PYTHONPATH` alone does not supply missing
+native files. If this turn changes native code, or the turn instructions report
+historical accepted native changes, the installed native files are stale: build
+the active checkout before launching, profiling, or measuring it.
+"""
 
 
 # --------------------------------------------------------------------------- #
