@@ -68,10 +68,11 @@ def _ref_layernorm_plain(x, eps):
     return (xf - mean) / (var + eps).sqrt()
 
 
-def _make_inputs(M, B, has_ln_affine, has_modulation, seed=42):
+def _make_inputs(M, B, has_ln_affine, has_modulation, seed=42, x=None):
     torch.manual_seed(seed)
     device = torch.device("cuda")
-    x = torch.randn(M, D, device=device).to(torch.bfloat16)
+    if x is None:
+        x = torch.randn(M, D, device=device).to(torch.bfloat16)
     ln_weight = ln_bias = scale_msa = shift_msa = None
     seq_len_per_batch = M  # default (B=1 case)
     if has_ln_affine:
@@ -182,6 +183,80 @@ def test_affine_fp32_weight_matches_eager():
     out = torch.ops.trtllm.fused_adaptive_layernorm(x, ln_weight, ln_bias, None, None, M, EPS)
     ref = _ref_layernorm_affine(x, ln_weight, ln_bias, EPS)
     torch.testing.assert_close(out.float(), ref.float(), rtol=1e-2, atol=1e-2)
+
+
+# ---------------------------------------------------------------------------
+# Large mean, small spread: the variance must not be lost to FP32 cancellation.
+# The row below has an exact variance of about 1.53e-6.
+# ---------------------------------------------------------------------------
+
+
+def _large_mean_small_variance_row():
+    x = torch.full((1, D), 15.75, dtype=torch.bfloat16, device="cuda")
+    x[:, :2] = 15.6875
+    return x
+
+
+@pytest.mark.parametrize(
+    "has_ln_affine,has_modulation",
+    [
+        (False, False),
+        (True, False),
+        (False, True),
+    ],
+)
+def test_bf16_large_mean_small_variance(has_ln_affine, has_modulation):
+    """BF16 output is finite and matches the reference in every mode."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    x, ln_w, ln_b, scale_msa, shift_msa, seq_len, ref = _make_inputs(
+        1, 1, has_ln_affine, has_modulation, x=_large_mean_small_variance_row()
+    )
+
+    out = torch.ops.trtllm.fused_adaptive_layernorm(
+        x, ln_w, ln_b, scale_msa, shift_msa, seq_len, EPS
+    )
+
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out.float(), ref.float(), rtol=1e-2, atol=1e-2)
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize(
+    "has_ln_affine,has_modulation",
+    [
+        (False, False),
+        (True, False),
+        (False, True),
+    ],
+)
+def test_fp4_large_mean_small_variance(has_ln_affine, has_modulation):
+    """FP4 output through nvfp4_gemm is finite and matches the reference in every mode."""
+    device = torch.device("cuda")
+    out_dim = 1024
+    x, ln_w, ln_b, scale_msa, shift_msa, seq_len, ref = _make_inputs(
+        1, 1, has_ln_affine, has_modulation, x=_large_mean_small_variance_row()
+    )
+    W = torch.randn(out_dim, D, dtype=torch.bfloat16, device=device) * 0.05
+    D_ref = F.linear(ref.to(torch.bfloat16), W)
+
+    sf_scale_x = (448.0 * 6.0) / ref.abs().max().float()
+    sf_scale_w = (448.0 * 6.0) / W.abs().max().float()
+
+    y_fp4, y_sf = torch.ops.trtllm.fused_adaptive_layernorm_quant(
+        x, ln_w, ln_b, scale_msa, shift_msa, sf_scale_x, seq_len, EPS
+    )
+
+    W_fp4, W_sf = torch.ops.trtllm.fp4_quantize(W, sf_scale_w, 16)
+    alpha = 1.0 / (sf_scale_x * sf_scale_w).float()
+    C = torch.ops.trtllm.nvfp4_gemm(y_fp4, W_fp4, y_sf, W_sf, alpha, torch.bfloat16)
+
+    assert torch.isfinite(C).all()
+    cos_sim = F.cosine_similarity(C.flatten().float(), D_ref.flatten().float(), dim=0).item()
+    assert cos_sim > 0.98, (
+        f"FP4 GEMM cosine {cos_sim:.4f} < 0.98 "
+        f"(has_ln_affine={has_ln_affine} has_modulation={has_modulation})"
+    )
 
 
 # ---------------------------------------------------------------------------
