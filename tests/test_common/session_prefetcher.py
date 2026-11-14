@@ -437,7 +437,7 @@ class SessionPrefetcher:
         except Exception as e:  # warming must never break the tests
             _log(f"[session-prefetch] page-cache warm failed (harmless): {e}")
 
-    def schedule_shadow(self, spec: int, env_overlay=None) -> None:
+    def schedule_shadow(self, spec: int) -> None:
         """Start building a spare ``spec``-worker pool in the background.
 
         Heuristic: the next test most likely needs a pool of the same size as
@@ -445,12 +445,6 @@ class SessionPrefetcher:
         synchronous miss to preserve allocation-wide single-flight. This can
         add latency when the size prediction is wrong, but avoids two MPI
         bootstraps contending on the same allocation.
-
-        ``env_overlay``: extra env vars to freeze into the WORKERS at spawn
-        (session_reuse restocks shadows with its worker-side weight cache
-        on). Passed through the library's worker-env channel, so the parent
-        process environment — and therefore the take()-time snapshot
-        comparison — is never touched.
         """
         if not self.enabled or spec < 1:
             return
@@ -461,13 +455,13 @@ class SessionPrefetcher:
             self._build_timed_out = False
             self._thread = threading.Thread(
                 target=self._build,
-                args=(spec, self._build_gen, env_overlay),
+                args=(spec, self._build_gen),
                 daemon=True,
                 name="session-prefetch-build",
             )
             self._thread.start()
 
-    def _build(self, spec: int, gen: int, env_overlay=None) -> None:
+    def _build(self, spec: int, gen: int) -> None:
         try:
             from tensorrt_llm._utils import mpi_disabled
 
@@ -478,7 +472,7 @@ class SessionPrefetcher:
             snapshot = _spawn_snapshot()  # workers freeze env+sys.path at spawn
             # wait_shutdown: see _make_factory — every pool this layer hands
             # out blocks its shutdown on actual worker exit.
-            session = MpiPoolSession(n_workers=spec, wait_shutdown=True, env_overrides=env_overlay)
+            session = MpiPoolSession(n_workers=spec, wait_shutdown=True)
             if any(session.submit_sync(_worker_import_report_cuda)):
                 _log(
                     "[session-prefetch] note: tensorrt_llm import initialized an idle "
