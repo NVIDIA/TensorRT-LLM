@@ -107,7 +107,6 @@ from typing import (
 )
 
 import torch
-from safetensors import safe_open
 from torch import nn
 
 from ..._utils import get_sm_version, is_sm_100f
@@ -146,6 +145,7 @@ from ..moe.fused_moe.interface import MoESchedulerKind
 from ..moe.fused_moe.routing import DeepSeekV3MoeRoutingMethod
 from ..nccl_window_tensor_scope import nccl_window_tensor_scoped_module
 from ..utils import AuxStreamType, Fp4QuantizedTensor
+from .checkpoints.hf.pinned_safetensors import PinnedSafetensorsFile
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, register_auto_model, run_concurrently
 
@@ -4006,6 +4006,14 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
             # Lazy source mappings are load-scoped; finish nonblocking H2D
             # work before the caller can release the weights container.
             torch.cuda.synchronize(device)
+            # With the copies done, return the expert stream's cached pinned
+            # blocks to the OS so the rank does not keep its peak page-locked
+            # footprint after load.
+            hec = getattr(torch.cuda, "host_empty_cache", None) or getattr(
+                torch._C, "_host_emptyCache", None
+            )
+            if hec is not None:
+                hec()
 
     def _validate_checkpoint_keys(
         self, weights: Dict[str, torch.Tensor], expected_keys: Set[str], prefix: str
@@ -4355,7 +4363,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         # cgroup and OOM-kills the step (observed repeatedly on GB300
         # trays). Instead, group the rank-local expert tensors by shard file
         # and stream each file through a short-lived handle:
-        # open -> copy -> close (unmap) -> fadvise(DONTNEED).
+        # open -> read -> copy -> close -> fadvise(DONTNEED).
         # The lazy loader records the directory it opened; prefer it over
         # ``_name_or_path``, which transformers no longer populates (it is
         # empty on transformers 5.x, which silently sent the whole load down
@@ -4416,7 +4424,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 if device.type == "cuda":
                     torch.cuda.set_device(device)
                 path = os.path.join(ckpt_dir, file_name)
-                with safe_open(path, framework="pt", device="cpu") as fh:
+                with PinnedSafetensorsFile(path) as fh:
                     # A job lands here only when every key it needs -- optional
                     # ones included, see the grouping above -- is in this file,
                     # so presence in this file is the whole question.
@@ -4434,7 +4442,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                                 else None
                             ),
                         )
-                # Handle closed -> pages unmapped -> the drop takes effect.
+                # Drop this shard's page cache now that all of its reads are done.
                 drop_file_pages(file_name)
 
             def load_split_file_expert(job, files):
@@ -4443,9 +4451,7 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                 with ExitStack() as stack:
                     handles = {
                         file_name: stack.enter_context(
-                            safe_open(
-                                os.path.join(ckpt_dir, file_name), framework="pt", device="cpu"
-                            )
+                            PinnedSafetensorsFile(os.path.join(ckpt_dir, file_name))
                         )
                         for file_name in files
                     }
