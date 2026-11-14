@@ -363,7 +363,7 @@ def test_plan_step_under_cuda_graphs_fixes_the_tail_and_rejects_a_longer_one(mon
     monkeypatch.setenv("TLLM_BEAM_SHARED_PREFIX_MAX_TAIL", "2")
     longer = _beam_meta(manager, kv_lens=(15, 7))  # request 7 carries 4 generated positions
     longer.is_cuda_graph = True
-    with pytest.raises(RuntimeError, match="CUDA graphs were captured"):
+    with pytest.raises(RuntimeError, match="CUDA graphs cover at most 2"):
         plan_step(longer)
 
 
