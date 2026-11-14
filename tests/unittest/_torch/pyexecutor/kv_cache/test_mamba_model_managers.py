@@ -311,10 +311,9 @@ def test_k3_initializes_only_the_selected_state(
     num_spec = requested_num_spec if requested_num_spec is not None else selected_num_spec
     if num_spec is not None:
         intermediate_factory.assert_not_called()
-        replay_kwargs = {"stochastic_rounding": False}
-        if manager_cls is KimiK3HybridCacheManager:
-            replay_kwargs["draft_records"] = False
-        replay_factory.assert_called_once_with(num_spec, **replay_kwargs)
+        replay_factory.assert_called_once_with(
+            num_spec, stochastic_rounding=False, draft_records=False
+        )
         assert manager._speculative_state is manager._kda_replay
         state = manager._kda_replay
     else:
@@ -354,6 +353,26 @@ def test_k3_initializes_only_the_selected_state(
     assert shutdown.call_count == 2
     if num_spec is not None:
         assert manager._speculative_state is manager._kda_replay
+
+
+def test_glm5_next_hands_the_models_draft_records_to_kda_replay(monkeypatch):
+    manager = object.__new__(Glm5NextCacheManager)
+    manager._requested_num_spec = 2
+    manager._requested_draft_records = True
+    manager._kda_replay = None
+    manager.spec_config = SimpleNamespace(decoding_type="MTP", tokens_per_gen_step=3)
+    _prepare_model_layout(manager)
+    replay_factory = Mock(wraps=KDAReplayState)
+    monkeypatch.setitem(
+        Glm5NextCacheManager._initialize_spec_state.__globals__, "KDAReplayState", replay_factory
+    )
+
+    state = manager._initialize_spec_state()
+
+    replay_factory.assert_called_once_with(2, stochastic_rounding=False, draft_records=True)
+    assert state is manager._kda_replay
+    assert state.draft_records
+    assert state.replay_shares_state_slot
 
 
 def test_base_manager_without_model_state(monkeypatch):
@@ -1148,6 +1167,7 @@ def test_kda_affine_estimator_includes_replay_scratch(
     config = SimpleNamespace(
         pretrained_config=SimpleNamespace(index_head_dim=128),
         quant_config=SimpleNamespace(mamba_ssm_stochastic_rounding=stochastic_rounding),
+        extra_attrs={},
     )
     monkeypatch.setattr(glm_module, "unwrap_glm5_next_text_config", lambda config: config)
     kv_config = KvCacheConfig(

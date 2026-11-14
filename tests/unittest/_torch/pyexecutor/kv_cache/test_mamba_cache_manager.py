@@ -6103,6 +6103,7 @@ def _kda_replay_slot(mgr, slot):
         (KimiK3HybridCacheManager, False),
         (KimiK3HybridCacheManager, True),
         (Glm5NextCacheManager, False),
+        (Glm5NextCacheManager, True),
     ],
 )
 def test_v2_kda_replay_suspend_leaves_the_replay_state_to_the_request(manager_cls, draft_records):
@@ -6463,8 +6464,9 @@ def test_v2_kda_replay_suspend_resume_matches_an_unsuspended_run(slot_taken):
         (KimiK3HybridCacheManager, {}),
         (KimiK3HybridCacheManager, {"kda_draft_records": True}),
         (Glm5NextCacheManager, {}),
+        (Glm5NextCacheManager, {"kda_draft_records": True}),
     ],
-    ids=["kimi_k3", "kimi_k3_draft_records", "glm5_next"],
+    ids=["kimi_k3", "kimi_k3_draft_records", "glm5_next", "glm5_next_draft_records"],
 )
 def test_v2_kda_replay_state_follows_a_suspended_request(monkeypatch, manager_cls, kwargs):
     """While a request is suspended, another cache takes its SSM slot and the runtime moves its SSM page to the host

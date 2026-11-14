@@ -280,3 +280,14 @@ ModelingV2Qwen38FlashNextNvfp4Sm103Default::mtp3_long_context:
   # 2.5% below ref_al, as for tp1_mtp3_long_context, whose deliberately wrong
   # reused selection scores 3.760.
   min_al: 3.9
+
+# Read by TestModelingV2Glm53FlashNvfp4Sm10xTp4::test_gsm8k_identity_vs_mtp3_and_acceptance at
+# both of its tp4 layouts. Keyed by target and variant for the same reason as the
+# ModelingV2DeepseekR10528Nvfp4Sm10xDefault::mtp3 entry above. max_draft_len is 3, so
+# acceptance length lives in [1.0, 4.0].
+ModelingV2Glm53FlashNvfp4Sm10xTp4::mtp3:
+  # Full gsm8k on B200 under the test's MTP3 config: stock (modeling_v2="off") 3.3897 at tp4
+  # and 3.3992 at tp4_ep4, modeling_v2 3.392 and 3.389. ref_al is the STOCK tp4 reading, so the
+  # gate is not self-referential; min_al is 95% of it.
+  ref_al: 3.3897
+  min_al: 3.2202
