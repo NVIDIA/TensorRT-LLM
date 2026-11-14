@@ -183,7 +183,7 @@ def test_flashinfer_generation_uses_phase_batch_size_for_padded_cross_batch(
             False,
         )
 
-    decode_calls: list[dict[str, object]] = []
+    decode_calls: list[tuple[object, ...]] = []
     monkeypatch.setattr(
         flashinfer_trtllm_gen_module.thop,
         "trtllm_gen_generation_preprocess",
@@ -191,13 +191,8 @@ def test_flashinfer_generation_uses_phase_batch_size_for_padded_cross_batch(
     )
     monkeypatch.setattr(
         flashinfer_trtllm_gen_module,
-        "flashinfer",
-        SimpleNamespace(
-            decode=SimpleNamespace(
-                trtllm_batch_decode_with_kv_cache=lambda **kwargs: decode_calls.append(kwargs)
-            )
-        ),
-        raising=False,
+        "_trtllm_gen_batch_decode_with_kv_cache",
+        lambda *args: decode_calls.append(args),
     )
 
     attn = SimpleNamespace(
