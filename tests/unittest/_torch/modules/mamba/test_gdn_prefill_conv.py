@@ -177,8 +177,9 @@ def test_matches_stock_pipeline(num_k_heads, num_v_heads, lens, pad_seqs, extra_
 
 
 # libdevice expf vs the stock kernel's tl.exp (ex2.approx of g * log2(e), whose error grows with |g|) on the gates
-# of these inputs: at most 25 ulp measured on GB300, a relative difference below 3e-6.
-_ALPHA_MAX_ULPS = 32
+# of these inputs: at most 25 ulp measured on GB300, 50 on B200 / B300 and 41 on H100 (CI 70254); 128 ulp is a
+# relative difference below 1.6e-5.
+_ALPHA_MAX_ULPS = 128
 
 
 @pytest.mark.parametrize("lens,pad_seqs", [([700, 3, 0, 1, 1300], (2,)), ([1, 65], ())])

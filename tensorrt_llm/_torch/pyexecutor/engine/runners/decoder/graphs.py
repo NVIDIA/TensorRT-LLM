@@ -189,6 +189,9 @@ class DecoderCudaGraphs:
     and ``_capture_additional_cuda_graphs``.
     """
 
+    # Whether a warmup batch already ran an in-forward Mamba snapshot split (its Triton copy kernels compiled).
+    _inforward_split_warmed: bool = False
+
     def __init__(
         self,
         *,
@@ -231,7 +234,6 @@ class DecoderCudaGraphs:
         # Promoted context rows carry no per-sequence extra model inputs.
         self._context_promotion_supported = context_promotion_supported
         self._force_lora_graph_for_capture: bool | None = None
-        # Whether a warmup batch already ran an in-forward Mamba snapshot split (its Triton copy kernels compiled).
         self._inforward_split_warmed = False
 
     def forward_discarded_warmup(
