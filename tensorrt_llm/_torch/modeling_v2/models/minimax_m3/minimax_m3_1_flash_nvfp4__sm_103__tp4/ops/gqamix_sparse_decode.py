@@ -1152,8 +1152,8 @@ def minimax_m3_sparse_attn_decode(
             if measured_chunks is not None
             else resolve_num_topk_chunks(total_q, num_kv_heads, max_topk)
         )
-    elif num_topk_chunks < 1 or num_topk_chunks & (num_topk_chunks - 1):
-        raise ValueError(f"num_topk_chunks must be a positive power of two; got {num_topk_chunks}.")
+    elif num_topk_chunks & (num_topk_chunks - 1):
+        raise ValueError(f"num_topk_chunks must be a power of two; got {num_topk_chunks}.")
 
     direct_output = num_topk_chunks == 1
     if direct_output:
