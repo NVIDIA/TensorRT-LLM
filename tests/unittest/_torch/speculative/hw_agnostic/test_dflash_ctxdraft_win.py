@@ -36,6 +36,12 @@ REACH = WINDOW_LEFT + 1 + MARGIN
 PAGE = 16
 
 
+@pytest.fixture(autouse=True)
+def _eager_store(monkeypatch):
+    """The stores here run eagerly; answer the capture query without a device so they run on CPU."""
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+
 @pytest.mark.cpu_only
 def test_skip_rows():
     # prompt 300, reach 96: rows below 204 are skipped.

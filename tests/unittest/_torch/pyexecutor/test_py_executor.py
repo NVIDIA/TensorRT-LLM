@@ -901,6 +901,7 @@ def test_disagg_generation_model_state_is_prepared_after_first_token(accepted: b
         ),
         kv_cache_transceiver=None,
         disagg=types.SimpleNamespace(
+            commit_deferred_gen_receives=lambda: None,
             completed_gen_receives=lambda batch: batch.generation_requests,
             try_finish_gen_receive=lambda req: True,
         ),
@@ -952,6 +953,7 @@ def test_disagg_generation_rebuilds_imported_cache_before_first_forward() -> Non
             }
         ),
         disagg=types.SimpleNamespace(
+            commit_deferred_gen_receives=lambda: None,
             completed_gen_receives=lambda batch: batch.generation_requests,
             try_finish_gen_receive=finish_gen_receive,
         ),

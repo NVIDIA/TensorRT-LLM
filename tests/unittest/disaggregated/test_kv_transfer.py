@@ -114,6 +114,7 @@ class KvCacheConfigV2:
     # reads it unconditionally.
     kv_pool_rebalance_config: KvPoolRebalanceConfig = field(default_factory=KvPoolRebalanceConfig)
     enable_kv_pool_rebalance: bool = False
+    enable_disagg_completion_reservation: bool = False
 
 
 _THIS_DIR = Path(__file__).resolve().parent
@@ -2265,6 +2266,13 @@ def _single_vram_pool_page_table(tpb, kind):
     )
 
 
+def _sender(registrar):
+    """A sender bound to ``registrar`` only: no drafter context window travels."""
+    sender = object.__new__(transfer_mod.Sender)
+    sender._registrar = registrar
+    return sender
+
+
 def _helix_kv_write_meta_block_pairs(src_table, dst_table, cp_rank, cp_size, prompt_len, tpb):
     """Run Sender._build_kv_write_meta for one Helix receiver; return (src, dst) block pairs.
 
@@ -2326,9 +2334,7 @@ def _helix_kv_write_meta_block_pairs(src_table, dst_table, cp_rank, cp_size, pro
         slice_id=0,
         kv_result_report_token=b"",
     )
-    meta = transfer_mod.Sender._build_kv_write_meta(
-        SimpleNamespace(_registrar=registrar), task, req_info
-    )
+    meta = _sender(registrar)._build_kv_write_meta(task, req_info)
     return list(zip(meta.src_ptrs.tolist(), meta.dst_ptrs.tolist()))
 
 
@@ -2422,9 +2428,7 @@ def _helix_ring_write_meta(
         slice_id=0,
         kv_result_report_token=b"",
     )
-    return transfer_mod.Sender._build_kv_write_meta(
-        SimpleNamespace(_registrar=registrar), task, req_info
-    )
+    return _sender(registrar)._build_kv_write_meta(task, req_info)
 
 
 @pytest.mark.cpu_only

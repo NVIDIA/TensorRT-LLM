@@ -84,6 +84,7 @@ def _worker():
             "ctx_cache_batch_idx",
             "ctx_kv_cache",
             "ctx_page_table",
+            "block_placement",
         )
     )
     w._draft_slot_ids = lambda draft_model, num_gens, block_size, k: torch.arange(
