@@ -7,9 +7,13 @@ attribute). Every field defaults to off, and a model that declares nothing gets
 ``RuntimeHooks()``: the step loop, the samplers and the attention metadata then
 run exactly as they do without this module.
 
-The hooks change *where* and *how* the step loop moves data, never what a
-forward computes. Each one is armed only by a model that has measured it on its
-own deployment; none is a general default.
+The hooks change *where* and *how* the step loop moves data, or how the engine
+sizes and manages its resources (device memory, cache pages, scheduling), never
+what a forward computes. Each one is armed only by a model that has measured it
+on its own deployment; none is a general default.
+
+A modeling-v2 target declares them on the registered (outer) model class, the
+class the loader resolves and the engine holds as ``model_engine.model``.
 """
 
 from __future__ import annotations
@@ -146,6 +150,56 @@ class MsaRuntimePolicy:
     reuse_pool_views: bool = False
 
 
+@dataclass(frozen=True)
+class HybridCachePolicy:
+    """Recurrent-state cache policies a hybrid (recurrent + attention) model may opt into.
+
+    The engine passes them to the model's V2 hybrid cache manager
+    (``MambaHybridCacheManagerV2``) when it builds it. They change how
+    recurrent-state pages are kept and uploaded, never what a forward computes.
+    """
+
+    # Context requests whose prompt is shorter than this many tokens commit their
+    # recurrent-state pages (live state and snapshots) at the lowest eviction
+    # priority; attention pages keep theirs. A snapshot is reusable only at its exact
+    # token boundary and takes a whole state slot whatever the prompt length, while a
+    # short prompt is cheap to recompute. 0: off. Needs block reuse.
+    low_priority_snapshot_prompt_len: int = 0
+    # When the batch's recurrent-state indices or dummy-request mask change, write
+    # both device buffers with one SM kernel from pinned snapshots instead of two
+    # copy-engine copies, whose engine hand-offs delay the execution stream in front
+    # of the next step's inputs. Unchanged buffers are not written either way.
+    state_index_upload_kernel: bool = False
+
+
+class KvBalancedAdmissionPlanner(Protocol):
+    """Chooses the requests attention-DP KV-balanced admission admits, and their ranks.
+
+    Used by ``DefaultADPRouter`` in place of its own window and planner when
+    ``attention_dp_config.enable_kv_balanced_admission`` is on. Every rank calls it
+    with the same all-gathered inputs, so it must be deterministic.
+    """
+
+    def window(self, max_new_requests: int, free_slots: int) -> int:
+        """Number of requests at the head of the queue to choose among."""
+
+    def plan(
+        self,
+        *,
+        candidate_tokens: list[int],
+        candidate_forced: list[bool],
+        rank_tokens: list[int],
+        rank_num_requests: list[int],
+        max_requests_per_rank: int,
+        max_new_requests: int,
+        candidate_groups: list[int],
+    ) -> list[tuple[int, int]]:
+        """``(candidate_index, rank)`` pairs in admission order.
+
+        The arguments are those of ``adp_router.plan_kv_balanced_admission``.
+        """
+
+
 class DecodePrologue(Protocol):
     """Replaces the decode step's input prologue with one launch.
 
@@ -255,6 +309,28 @@ class RuntimeHooks:
     iteration_timing_one_event: bool = False
     # MiniMax-M3 MSA metadata preparation.
     msa: MsaRuntimePolicy = MsaRuntimePolicy()
+    # Device memory, in bytes, the executor leaves outside the PyTorch cap for driver allocations made after
+    # setup (streams, events, copy launches of the KV cache manager and transfer agents, CUDA IPC mappings of
+    # peer buffers, kernel attribute and module loads), up to the memory free at that point. None keeps the
+    # engine's default margin (1 GiB). The KV cache budget does not change.
+    torch_mem_safety_margin: Optional[int] = None
+    # Recurrent-state cache policies of a hybrid model (see HybridCachePolicy).
+    hybrid_cache: HybridCachePolicy = HybridCachePolicy()
+    # With long-prefill demotion on (TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS > 0), the
+    # KV cache manager V2 scheduler classifies context requests by the prefix cache rather than
+    # the router's estimate alone: an estimate above the threshold is checked once against the
+    # radix tree (read-only probe), a request that already holds its cache is judged by its exact
+    # remainder, and a request ordered as short whose first preparation shows a long remainder is
+    # retried after the rest of the iteration. Without demotion it does nothing.
+    exact_context_demotion: bool = False
+    # Replaces the attention-DP KV-balanced admission's window and planner
+    # (attention_dp_config.enable_kv_balanced_admission); None keeps the engine's.
+    kv_balanced_admission_planner: Optional[KvBalancedAdmissionPlanner] = None
+    # A subclass of the KV cache manager class the engine resolves for the model's own KV cache; the
+    # engine builds this subclass instead (KvCacheCreator rejects a class that is not a subclass). A
+    # separate draft model's KV cache manager is resolved from the draft model and does not use it.
+    # None keeps the resolved class.
+    kv_cache_manager_cls: Optional[type] = None
 
     @property
     def skips_unchanged_metadata_uploads(self) -> bool:

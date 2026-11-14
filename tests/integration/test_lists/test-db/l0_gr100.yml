@@ -93,3 +93,48 @@ l0_gr100:
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/spec
   - unittest/_torch/visual_gen/kernels/parallel/test_fmha_dense_fp8.py
   - unittest/_torch/visual_gen/kernels/parallel/test_fused_dit_qk_norm_rope_fp8.py
+  # The Kimi K3 Rubin target's unit tests, one entry per op directory plus its
+  # top-level files; core/ and ops/gemm/ are listed per file because their
+  # all-reduce and GEMM-push tests run several ranks. The multi-rank tests
+  # (comm/, core all-reduce, ops/gemm push) are in l0_gb300_multi_gpus until
+  # there is a multi-GPU GR100 stage. Its cpu_only cases are in l0_cpu.
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/common/test_k3_kda_metadata.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/dspark
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3r_common
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3r_fp4_mla
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3r_helix
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3r_kda
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3r_mla_ctx
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3r_mla_q
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3r_moe
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3r_spec
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/cache/test_k3_sm107_cache_manager.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/attention/test_k3_fp4_mla_decode.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/attention/test_k3_mla_latent_row.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/attention/test_rmsnorm_release_at_launch.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/gemm/test_k3_fp8w_gemm_cells.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/gemm/test_k3_mxfp8_gemm_fp8_out.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/moe/test_k3_moe_entry_cells.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/moe/test_modeling_v2_k3r_experts.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/norm/test_k3_attn_res_norm.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/spec/test_dspark_mla_rope.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/spec/test_k3_markov_entries.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/spec/test_k3_spec_tail_entries.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/spec/test_k3_vocab_parallel_entries.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/ssm/test_fused_kda_conv_prefill.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/ssm/test_fused_kda_post_conv.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/ssm/test_k3_kda_fab.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/ssm/test_k3_l2_prefetch.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/ssm/test_kda_decode_fused_fab.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/ssm/test_kda_mtp_decode.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/ssm/test_kda_prefill.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3r_rms_norm_gated/test_k3r_rms_norm_gated.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3r_situ/test_k3r_situ.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/gemm/test_core_linear.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/gemm/test_core_mxfp8_gemm.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/common/test_core_norm_mlp_embedding.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/common/test_k3_engine_probes.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__dep16
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix8_moeep8
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__helix8_moetp2ep4
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_nvfp4__sm_107__tp1

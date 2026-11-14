@@ -452,6 +452,15 @@ class KVCacheLayerSpec:
         return 2 if Role.VALUE in self.buffer_roles else 1
 
 
+# Page eviction priorities of the V2 cache backend: [0, 100], default 35. Lower values are
+# evicted first; pages of one priority are evicted least recently used first.
+PAGE_PRIORITY_MIN = 0
+PAGE_PRIORITY_DEFAULT = 35
+
+PagePriorityCallback = Callable[[int, object], int]
+"""Maps (block ordinal, life cycle) to the eviction priority of a page created by one cache."""
+
+
 def _swa_endpoint_priority(
     prompt_length: int, tokens_per_block: int, rewind_tokens: int
 ) -> Callable[[int, object], int]:
@@ -2091,6 +2100,12 @@ class KVCacheManagerV2(BaseResourceManager):
     _waiter_snapshot_points: Optional[Dict[int, set[int]]] = None
     # Declared regions and, once laid out, the ownership of their buffers; see region_layout.
     _region_layout: Optional[RegionLayout] = None
+    # In-flight prefix sharing counters, logged by managers that report them:
+    # scheduler passes a request waited for a prefix (count_prefix_waits),
+    # distinct snapshot points asked of prefix owners, and those committed.
+    _inflight_prefix_deferrals_total = 0
+    _inflight_prefix_points_requested_total = 0
+    _inflight_prefix_points_taken_total = 0
     # Sizing of sparse attention history offloaded to host memory; None without
     # offload. Declared on the class so it is present even when an instance is
     # built without running __init__.
@@ -5360,9 +5375,11 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def get_layer_dtype(self, global_layer_id: int) -> DataType:
         if self.layer_specs is None:
-            if global_layer_id not in self.layer_offsets:
+            local_layer_id = self.layer_offsets.get(global_layer_id)
+            if local_layer_id is None:
                 raise KeyError(f"global layer {global_layer_id} is not local to this rank")
-            return self.dtype
+            appended = self._appended_draft_layer_specs.get(local_layer_id)
+            return appended.dtype if appended is not None else self.dtype
         return self.get_layer_cache_spec(global_layer_id).dtype
 
     def get_layer_buffer_roles(self, global_layer_id: int) -> tuple[DataRole, ...]:
@@ -6168,9 +6185,23 @@ class KVCacheManagerV2(BaseResourceManager):
             return False
         if self._waiter_snapshot_points is None:
             self._waiter_snapshot_points = {}
-        self._waiter_snapshot_points.setdefault(owner.py_request_id, set()).add(point)
+        points = self._waiter_snapshot_points.setdefault(owner.py_request_id, set())
+        if point not in points:
+            points.add(point)
+            self._inflight_prefix_points_requested_total += 1
         self._merge_waiter_snapshot_points(owner)
         return True
+
+    def count_prefix_waits(self, num_waiting: int) -> None:
+        """Count the context requests a scheduler pass keeps waiting for a prefix."""
+        self._inflight_prefix_deferrals_total += num_waiting
+
+    def _format_inflight_prefix_counters(self) -> str:
+        return (
+            f"inflight_prefix_deferrals={self._inflight_prefix_deferrals_total} "
+            f"inflight_prefix_points_requested={self._inflight_prefix_points_requested_total} "
+            f"inflight_prefix_points_taken={self._inflight_prefix_points_taken_total}"
+        )
 
     def _merge_waiter_snapshot_points(self, request: LlmRequest) -> None:
         """Merge into ``request``'s snapshot points the waiters' points it has not passed yet."""
@@ -6184,6 +6215,10 @@ class KVCacheManagerV2(BaseResourceManager):
             del points_by_id[request.py_request_id]
             return
         request.expect_snapshot_points = sorted({*request.expect_snapshot_points, *points})
+
+    def _context_priority_callback(self, req: LlmRequest) -> PagePriorityCallback | None:
+        """Page priority callback for a context request's new cache; None keeps the default."""
+        return None
 
     def probe_context_reuse(self, req: LlmRequest) -> int | None:
         """Reusable prefix depth for this pool, without claiming pages.
@@ -6275,6 +6310,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     expected_prompt_length=(
                         req.total_input_len_cp if self._has_cp_helix else req.prompt_len
                     ),
+                    custom_priority_callback=self._context_priority_callback(req),
                 )
                 if kv_cache is None:
                     return None
@@ -9727,7 +9763,14 @@ class KVCacheManagerV2(BaseResourceManager):
         enable_request_stats: bool = False,
         expected_prompt_length: int | None = None,
         kv_cache_retention_config: KvCacheRetentionConfig | None = None,
+        custom_priority_callback: PagePriorityCallback | None = None,
     ):
+        """Create the cache of one request.
+
+        ``custom_priority_callback`` sets the eviction priority of the pages
+        this cache creates (see :meth:`_context_priority_callback`); the SWA
+        endpoint priorities still decide the sliding-window attention pages.
+        """
         assert request_id not in self.kv_cache_map, (
             f"KV cache for request {request_id} already exists"
         )
@@ -9761,6 +9804,18 @@ class KVCacheManagerV2(BaseResourceManager):
             priority_kwargs["custom_priority_callback"] = _swa_endpoint_priority(
                 expected_prompt_length, self.tokens_per_block, self._swa_endpoint_rewind
             )
+        if custom_priority_callback is not None and not is_dummy:
+            swa_priority = priority_kwargs.get("custom_priority_callback")
+            if swa_priority is None:
+                priority_kwargs["custom_priority_callback"] = custom_priority_callback
+            else:
+
+                def priority(ordinal: int, life_cycle: object) -> int:
+                    if isinstance(life_cycle, AttnLifeCycle):
+                        return swa_priority(ordinal, life_cycle)
+                    return custom_priority_callback(ordinal, life_cycle)
+
+                priority_kwargs["custom_priority_callback"] = priority
         kv_cache = self.impl.create_kv_cache(
             ReuseScope(lora_id=lora_task_id, salt=reuse_salt),
             input_tokens,

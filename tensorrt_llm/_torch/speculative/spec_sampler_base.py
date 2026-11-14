@@ -346,7 +346,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         self.max_accepted_path_len = args.max_draft_len + 1
         self._store_scatter: Optional[spec_step_copies.SlotScatter] = None
         self._slot_table_buffer: Optional[DeviceCopyBuffer] = None
-        if spec_step_copies.is_supported():
+        if spec_step_copies.slot_scatter_supported():
             self._store_scatter = spec_step_copies.SlotScatter()
             self._slot_table_buffer = DeviceCopyBuffer(
                 torch.zeros((seq_slots,), dtype=torch.int32, device="cuda"),
