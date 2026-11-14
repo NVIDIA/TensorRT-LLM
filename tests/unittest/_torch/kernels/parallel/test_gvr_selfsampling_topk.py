@@ -128,6 +128,16 @@ def test_selfsampling_topk_exactness(batch_size, top_k, n_valid):
     _check_exact(logits, indices, n_valid, ref_vals)
 
 
+def test_selfsampling_topk_main_sampling_exactness():
+    batch_size, top_k, n_valid = 128, 512, 16391
+    logits, pre_idx, indices, ref_vals = _make_case(
+        batch_size, n_valid, top_k, seed=n_valid * 31 + top_k + batch_size
+    )
+    ss_host.run(logits, pre_idx, n_valid, indices)
+    torch.cuda.synchronize()
+    _check_exact(logits, indices, n_valid, ref_vals)
+
+
 # n_valid <= top_k: every valid position is in the top-K. Production short
 # path convention: identity indices + -1 tail padding.
 _SHORT_CASES = [

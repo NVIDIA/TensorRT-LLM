@@ -208,6 +208,30 @@ def _sm100():
         pytest.skip("Fused CSA2 store is enabled only after SM100-family validation")
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_cache_kernel_namespace_is_cached():
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import kernel
+
+    if not kernel.dsl_available():
+        pytest.skip("CuTe DSL required")
+    kernel._cache_kernels.cache_clear()
+    kernels = kernel._cache_kernels()
+    expected_kernels = {
+        "QuantizeScatterKernel",
+        "GatherDequantKernel",
+        "ScatterPackedKernel",
+        "StageCompactKernel",
+        "StageDequantKernel",
+        "SharedCompactKernel",
+        "SharedDecodeKernel",
+        "StageScaleKernel",
+        "StageScaleFinalizeKernel",
+    }
+    assert all(isinstance(getattr(kernels, name), type) for name in expected_kernels)
+    assert kernel._cache_kernels() is kernels
+    assert kernel._cache_kernels.cache_info().currsize == 1
+
+
 def _values(rows, dim, cache_format):
     storage = torch.randn(rows, dim + 17, dtype=torch.bfloat16, device="cuda")
     x = storage[:, :dim]
