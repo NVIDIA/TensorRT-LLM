@@ -34,7 +34,7 @@ class GdnDecodeT1(OpWrapper):
     quantized pool. Row `n` uses slot `s = slots[n]`, value head `i` key head `i // (HV // H)`:
 
         g = -exp(A_log) * softplus(a + dt_bias);  beta = sigmoid(b)
-        q = q / (|q| + 1e-6) * K^-0.5;  k = k / (|k| + 1e-6)
+        q = q / sqrt(|q|^2 + 1e-6) * K^-0.5;  k = k / sqrt(|k|^2 + 1e-6)
         h = deq(pool[s]) * exp(g);  u = (v - h k) * beta;  h += u k^T;  o = h q
         pool[s] = quant(h)
 
@@ -91,10 +91,8 @@ class GdnDecodeT1(OpWrapper):
 
     Numerics: fp32 inside, the state rounded once per step to int8 rows (absolute
     rounding <= 1/254 of the row maximum), `o` from the unrounded state and rounded
-    once to bf16. The q/k L2 norm is `x / (sqrt(sum x^2) + 1e-6)` -- the generic decode
-    kernel's form before upstream aligned it with the prefill front end
-    (`x / sqrt(sum x^2 + 1e-6)`); kept so decode reproduces the target's reference run.
-    Not bitwise to the current generic kernel for that reason.
+    once to bf16. The q/k L2 norm is `x / sqrt(sum x^2 + 1e-6)`, the generic decode
+    kernel's and the prefill front end's form.
 
     Not checked by the op (is_valid covers it): pool format, operand strides, slots
     distinct and in range (two rows naming one slot race; an out-of-range slot is an

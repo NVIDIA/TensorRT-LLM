@@ -128,11 +128,11 @@ def test_gate_up_permutation_is_the_epilogue_map() -> None:
     assert torch.equal(torch.sort(perm).values, torch.arange(n))
     # Row c of tile t holds gate (p = 0) or up (p = 1) of output
     # j = 64t + 32nw + 16(a // 2) + 4lq + 2(a % 2) + b for c = 32a + 16nw + 8b + 2lq + p.
-    for r in (0, 1, 2, 9, 31, 32, 77, 127, 128, 4095, n - 1):
-        t, c = divmod(r, 128)
-        a, nw, b, lq, p = c // 32, (c % 32) // 16, (c % 16) // 8, (c % 8) // 2, c % 2
-        j = 64 * t + 32 * nw + 16 * (a // 2) + 4 * lq + 2 * (a % 2) + b
-        assert perm[r].item() == (j if p == 0 else d + j), r
+    r = torch.arange(n)
+    t, c = r // 128, r % 128
+    a, nw, b, lq, p = c // 32, (c % 32) // 16, (c % 16) // 8, (c % 8) // 2, c % 2
+    j = 64 * t + 32 * nw + 16 * (a // 2) + 4 * lq + 2 * (a % 2) + b
+    assert torch.equal(perm.cpu(), torch.where(p == 0, j, d + j)), "every row of the map"
 
     g = torch.Generator(device=DEV).manual_seed(10)
     w = (torch.randn(n, k, generator=g, device=DEV) * 0.05).to(torch.bfloat16)

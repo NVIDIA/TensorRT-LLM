@@ -142,21 +142,26 @@ _QWEN35 = dict(
 # table, as block reuse leaves them.
 CELLS = (
     Cell(
-        why="qwen3_5 decode, one sequence over 2047 keys: the one-wave multi-block cap",
+        why="qwen3_5 decode batch 8, one sequence over 2047 keys: the one-wave multi-block "
+        "cap (11 blocks per sequence by the history rule, capped at 188 // (8 * 4) = 5), "
+        "two steps on one set of semaphores",
         spec=dict(
             _QWEN35,
-            cached=(2047,),
-            new=(1,),
+            cached=(2047, 300, 31, 128, 512, 7, 200, 96),
+            new=(1,) * 8,
             num_contexts=0,
+            decode_steps=2,
         ),
     ),
     Cell(
-        why="qwen3_5 decode, 4 sequences over 1500 to 31 keys: multi-block per sequence",
+        why="qwen3_5 decode, 4 sequences over 1500 to 31 keys: multi-block per sequence, "
+        "two steps on one set of semaphores",
         spec=dict(
             _QWEN35,
             cached=(1500, 900, 300, 31),
             new=(1, 1, 1, 1),
             num_contexts=0,
+            decode_steps=2,
         ),
     ),
     Cell(
@@ -237,12 +242,12 @@ CELLS = (
         ),
     ),
     Cell(
-        why="qwen3_5 last layer, a mixed step: contexts of 130 and 150 rows over a "
-        "cached 64 and a decode row, leading q-tiles skipped",
+        why="qwen3_5 last layer, a mixed step: contexts of 2048 and 2016 rows (the second "
+        "over a cached 64) and a decode row, leading q-tiles skipped",
         spec=dict(
             _QWEN35,
             cached=(0, 64, 300),
-            new=(130, 150, 1),
+            new=(2048, 2016, 1),
             num_contexts=2,
             skip_leading_q_tiles=True,
         ),
@@ -286,8 +291,9 @@ def test_attention_sm120(cell, monkeypatch) -> None:
     """A first, unchecked context call fills each sequence's `cached` tokens (with
     `shared_prefix`, the first sequence's history first, then its leading pages become
     every other sequence's prefix); the checked call then appends `new` rows per
-    sequence. With `skip_leading_q_tiles`, the context rows before the batch's last
-    q-tile are left undefined and not compared."""
+    sequence (`decode_steps` times, on one set of the op's buffers and semaphores). With
+    `skip_leading_q_tiles`, the context rows before the batch's last q-tile must stay
+    unwritten (the output starts as a sentinel) and are not compared."""
     spec = cell.spec
     _seed(cell)
     skip = spec.get("skip_leading_q_tiles", False)
@@ -320,27 +326,38 @@ def test_attention_sm120(cell, monkeypatch) -> None:
         if prior:
             _fill_history(env, prior, [cached[rid] for rid in prior])
     monkeypatch.setattr(harness, "op", _AsTargetOp(skip_leading_q_tiles=skip))
-    qkv = env.random_qkv(sum(new))
-    out = env.call_op(
-        qkv,
-        list(new),
-        nc,
-        rids,
-        spec["mask_type"],
-        ctx_lens_override=[new[i] if i < nc else env.prompt_lens[i] for i in rids],
-        use_paged_context_fmha=True,
-    )
-    ref = _op_reference(env, qkv, list(new), rids, causal=True, e4m3=True)
-    defined = torch.ones(out.shape[0], dtype=torch.bool, device=out.device)
-    if skip:
-        first_kept = FMHA_Q_TILE * ((max(new[:nc]) + FMHA_Q_TILE - 1) // FMHA_Q_TILE - 1)
-        start = 0
-        for n in new[:nc]:
-            defined[start : start + min(first_kept, n)] = False
-            start += n
-    longest = max(c + n for c, n in zip(cached, new))
-    compare = _compare_fp8_long_history if longest > FP8_ROW_MAX_MODEL_KEYS else _compare
-    compare(out[defined], ref[defined])
-    for rid in rids:
-        env.check_cache(rid)
-    env.check_unwritten_pool_zero()
+    steps = spec.get("decode_steps", 1)
+    assert steps == 1 or nc == 0, "repeated steps are decode steps"
+    for step in range(steps):
+        qkv = env.random_qkv(sum(new))
+        sentinel = torch.full(
+            (sum(new), spec["num_heads"] * spec["head_size"]), -7.0, dtype=qkv.dtype,
+            device=qkv.device,
+        )  # fmt: skip
+        out = env.call_op(
+            qkv,
+            list(new),
+            nc,
+            rids,
+            spec["mask_type"],
+            ctx_lens_override=[new[i] if i < nc else env.prompt_lens[i] for i in rids],
+            use_paged_context_fmha=True,
+            op_overrides=dict(output=sentinel),
+        )
+        out = sentinel
+        ref = _op_reference(env, qkv, list(new), rids, causal=True, e4m3=True)
+        defined = torch.ones(out.shape[0], dtype=torch.bool, device=out.device)
+        if skip:
+            first_kept = FMHA_Q_TILE * ((max(new[:nc]) + FMHA_Q_TILE - 1) // FMHA_Q_TILE - 1)
+            start = 0
+            for n in new[:nc]:
+                defined[start : start + min(first_kept, n)] = False
+                start += n
+            # The split ran: the rows it may skip were left as they were.
+            assert (out[~defined] == -7.0).all(), "a skipped leading q-tile row was written"
+        longest = max(c + n * (step + 1) for c, n in zip(cached, new))
+        compare = _compare_fp8_long_history if longest > FP8_ROW_MAX_MODEL_KEYS else _compare
+        compare(out[defined], ref[defined])
+        for rid in rids:
+            env.check_cache(rid)
+        env.check_unwritten_pool_zero()

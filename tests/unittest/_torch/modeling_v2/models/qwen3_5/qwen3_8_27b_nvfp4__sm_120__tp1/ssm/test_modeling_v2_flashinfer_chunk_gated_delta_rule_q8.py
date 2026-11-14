@@ -93,7 +93,9 @@ def _build(spec, seed):
     step_out = torch.full((1, total + 3, HV, V), -7.0, dtype=torch.bfloat16, device=DEV)
     out = step_out[:, :total]
     args = [q, k, v, g, beta, pool, slot_t, cu, n, out]
-    return args, dict(backing=backing, step_out=step_out, slots=slots)
+    return args, dict(
+        backing=backing, neighbors=backing[:, 1:].clone(), step_out=step_out, slots=slots
+    )
 
 
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
@@ -120,7 +122,9 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by
     assert_q8_rows_close(pool, ref_pool, extras["slots"], row_rel=1.5e-2, abs_slack=1e-5)
     assert_untouched(pool, pool_before, extras["slots"])
     if cell.spec.get("pool") == "coalesced":
-        assert not extras["backing"][:, 1:].any(), "another layer's states were written"
+        assert torch.equal(extras["backing"][:, 1:], extras["neighbors"]), (
+            "another layer's states were written"
+        )
 
 
 @pytest.mark.parametrize("seqlens", [(2048,), (100,)], ids=["1x2048", "1x100"])
@@ -134,6 +138,7 @@ def test_vsplit_is_bitwise_the_fully_fused_kernel(seqlens) -> None:
     vsplit_o = op(*args).clone()
     vsplit_pool = pool.clone()
     pool.copy_(pristine)
+    args[9].fill_(-7.0)  # rows the fully fused kernel leaves unwritten cannot pass as V-split's
     args[8] = 0
     fused_o = op(*args)
     assert torch.equal(vsplit_o.view(torch.int16), fused_o.view(torch.int16)), "o differs"

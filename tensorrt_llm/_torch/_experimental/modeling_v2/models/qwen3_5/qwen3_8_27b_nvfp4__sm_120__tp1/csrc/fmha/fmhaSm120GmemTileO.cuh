@@ -102,7 +102,7 @@ struct Gmem_tile_o_16bit_from_regs
         // The amount of bytes per row without padding (runtime).
         int const valid_bytes_per_row = params.dv * BYTES_PER_ELEMENT;
         // Take the batch/head offset into account.
-        row_offset += block_info.bidx * valid_bytes_per_row;
+        row_offset += (int64_t) block_info.bidx * valid_bytes_per_row;
         // Assemble the final pointer.
         o_ptr_ += row_offset + col_in_bytes;
 

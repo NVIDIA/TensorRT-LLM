@@ -976,7 +976,7 @@ __device__ inline void preExit()
 __device__ inline void acqBulk()
 {
 #if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
-    asm volatile("griddepcontrol.wait;\n");
+    asm volatile("griddepcontrol.wait;\n" ::: "memory");
 #endif
 }
 

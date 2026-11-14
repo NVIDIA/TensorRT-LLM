@@ -25,13 +25,20 @@ if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 # (layers, hidden, MLP intermediate, attention heads, KV heads, head dim, linear key
-# heads, linear value heads, vocab). Shape-sniffing also matches fine-tunes; the
+# heads, linear value heads, linear key head dim, linear value head dim, conv width,
+# full-attention interval, vocab). Shape-sniffing also matches fine-tunes; the
 # accuracy gate pins identity.
-_TEXT_SHAPE = (64, 5120, 17408, 24, 4, 256, 16, 48, 248320)
+_TEXT_SHAPE = (64, 5120, 17408, 24, 4, 256, 16, 48, 128, 128, 4, 4, 248320)
 
-# The recurrent-state pool the target reads and writes: e4m3 rows with one fp32 scale
-# per row (`kv_cache_config.mamba_ssm_cache_dtype="int8"`).
+# The recurrent-state pool the target reads and writes: int16 row codes with one fp32
+# scale per row, in an int8-typed pool (`kv_cache_config.mamba_ssm_cache_dtype="int8"`).
 _SSM_STATE_DTYPES = (torch.int8,)
+
+# Which quantization each module group of the MIXED_PRECISION export carries.
+_MODULE_ALGOS = (
+    (("self_attn.", "linear_attn."), QuantAlgo.FP8),
+    ((".mlp.", "lm_head"), QuantAlgo.NVFP4),
+)
 
 
 class EngineChoices(NamedTuple):
@@ -54,6 +61,28 @@ def engine_choices(model_config: ModelConfig, llm_args: TorchLlmArgs) -> EngineC
         ),
         prefill_cuda_graph_backend=str(llm_args.prefill_cuda_graph_backend.value),
     )
+
+
+def _check_runtime(llm_args: TorchLlmArgs) -> None:
+    """Decline engine features the target does not implement, so ``auto`` falls back."""
+    if llm_args.attn_backend != "TRTLLM":
+        raise NoTarget(
+            f"attn_backend={llm_args.attn_backend!r}; the target's attention reads "
+            "TrtllmAttentionMetadata (attn_backend='TRTLLM')"
+        )
+    if llm_args.lora_config is not None:
+        raise NoTarget("LoRA is configured; the target implements no LoRA")
+    transceiver = llm_args.cache_transceiver_config
+    if transceiver is not None and transceiver.backend is not None:
+        raise NoTarget(
+            "disaggregated serving (cache_transceiver_config.backend is set); the target's "
+            "recurrent-state pool is not transferable"
+        )
+    if llm_args.kv_cache_config.use_kv_cache_manager_v2 is False:
+        raise NoTarget(
+            "use_kv_cache_manager_v2=False; the target's recurrent-state pool exists only on "
+            "the V2 hybrid cache manager"
+        )
 
 
 def _check_engine(kv_cache_quant_algo, engine: EngineChoices) -> None:
@@ -87,13 +116,36 @@ def _mixed_precision_recipe(model_config: ModelConfig) -> bool:
     quant_config = model_config.quant_config
     if quant_config is None or quant_config.quant_algo != QuantAlgo.MIXED_PRECISION:
         return False
-    algos = {
-        algo
-        for name, cfg in (model_config.quant_config_dict or {}).items()
-        for algo in (getattr(cfg, "quant_algo", None),)
-        if algo is not None
-    }
-    return algos == {QuantAlgo.FP8, QuantAlgo.NVFP4}
+    seen = set()
+    for name, cfg in (model_config.quant_config_dict or {}).items():
+        algo = getattr(cfg, "quant_algo", None)
+        if algo is None:
+            continue
+        for patterns, want in _MODULE_ALGOS:
+            if any(p in name for p in patterns):
+                if algo != want:
+                    return False
+                seen.add(want)
+                break
+        else:
+            return False
+    return seen == {QuantAlgo.FP8, QuantAlgo.NVFP4}
+
+
+def _check_layer_pattern(text) -> None:
+    """Every ``full_attention_interval``-th layer is full attention, the rest Gated-DeltaNet:
+    the layout the target's constructor builds."""
+    interval = text.full_attention_interval
+    expected = [
+        "full_attention" if i % interval == interval - 1 else "linear_attention"
+        for i in range(text.num_hidden_layers)
+    ]
+    layer_types = list(getattr(text, "layer_types", None) or expected)
+    if layer_types != expected:
+        raise NoTarget(
+            "layer_types is not one full-attention layer per "
+            f"{interval} layers ending on full attention"
+        )
 
 
 @routes("Qwen3_5ForConditionalGeneration")
@@ -125,6 +177,10 @@ def route(
         text.head_dim,
         text.linear_num_key_heads,
         text.linear_num_value_heads,
+        getattr(text, "linear_key_head_dim", None),
+        getattr(text, "linear_value_head_dim", None),
+        getattr(text, "linear_conv_kernel_dim", None),
+        getattr(text, "full_attention_interval", None),
         text.vocab_size,
     )
     recipe = _mixed_precision_recipe(model_config)
@@ -145,6 +201,8 @@ def route(
         # isort: on
         # fmt: on
 
+        _check_layer_pattern(text)
+        _check_runtime(llm_args)
         _check_engine(kv_cache_quant_algo, engine_choices(model_config, llm_args))
         return ModelingV2Qwen3827BNvfp4Sm120Tp1
 

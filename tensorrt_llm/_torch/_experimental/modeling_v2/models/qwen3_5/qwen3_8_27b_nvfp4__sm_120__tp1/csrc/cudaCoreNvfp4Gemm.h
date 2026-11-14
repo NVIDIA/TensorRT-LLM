@@ -36,7 +36,7 @@ namespace kernels
 // alpha: device FP32 scalar
 // out:   [m, n] BF16
 // Weights stream with L1 no-allocate loads; with PDL, the first K step's weight loads are issued before
-// griddepcontrol.wait. Returns false (no launch) unless n is even and k % 16 == 0.
+// griddepcontrol.wait. Returns false (no launch) unless n is even and k % 32 == 0.
 constexpr int kCudaCoreNvfp4GemmMaxRows = 8;
 
 bool cudaCoreNvfp4Gemm(void const* a, void const* w, void const* sfA, void const* sfW, float const* alpha, void* out,

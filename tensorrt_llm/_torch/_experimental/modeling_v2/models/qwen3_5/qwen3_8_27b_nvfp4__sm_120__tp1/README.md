@@ -4,8 +4,8 @@ Qwen3.8-27B (family `qwen3_5`, architecture `Qwen3_5ForConditionalGeneration`), 
 Qwen3.5 Gated-DeltaNet hybrid on one RTX PRO 6000 Blackwell, tuned for long shared-prefix
 serving from concurrency 1 to 128. It claims the ModelOpt MIXED_PRECISION checkpoint (FP8
 attention and Gated-DeltaNet projections, NVFP4 MLP and lm_head) with an fp8 KV cache
-(`kv_cache_config.dtype='fp8'`) and the 8-bit recurrent-state pool
-(`kv_cache_config.mamba_ssm_cache_dtype='int8'`, which only a target that claims the model may
+(`kv_cache_config.dtype='fp8'`) and the quantized recurrent-state pool (int16 row codes with
+fp32 row scales in an int8-typed pool, `kv_cache_config.mamba_ssm_cache_dtype='int8'`, which only a target that claims the model may
 ask for), without speculative decoding and with eager prefill steps. The vision half of the
 composite checkpoint is not part of it: it serves text, and a request carrying images or video
 fails with an error that names `modeling_v2='off'`.
@@ -26,7 +26,7 @@ Where it differs from the built-in `Qwen3_5VLModel` at the same settings:
 |---|---|---|
 | FP8 projections | FP8 x FP8 (static input scales) | NVFP4 copies: W4A16 at decode rows, W4A4 above |
 | lm_head | NVFP4 entry dequantized to a bf16 weight | the checkpoint's NVFP4: W4A16 Marlin below 56 rows, W4A4 (fp32 logits) from 56 |
-| recurrent state | bf16 | 8-bit rows with fp32 row scales |
+| recurrent state | bf16 | int16 rows with fp32 row scales |
 | context softmax | `expf` | base-2 `ex2.approx` |
 | shared-prefix decode | each request's KV walked alone | one prefix pass over all requests (FP8 Q/P), each suffix alone |
 | final layer of a long prefill step | every row | gate, o_proj, MLP and final norm on the read rows only |

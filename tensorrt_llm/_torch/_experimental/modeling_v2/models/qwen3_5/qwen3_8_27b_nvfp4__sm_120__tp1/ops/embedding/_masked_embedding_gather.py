@@ -43,7 +43,7 @@ def masked_embedding_gather(
     Bitwise equal to get_masked_input_and_mask + F.embedding + masked_fill_: valid rows
     are copied unchanged and invalid ids give +0.0 rows.
     """
-    ids = input_.reshape(-1)
+    ids = input_.reshape(-1).contiguous()  # the kernel reads `ids_ptr + token`
     num_tokens = ids.numel()
     embedding_dim = weight.shape[1]
     output = torch.empty((num_tokens, embedding_dim), dtype=weight.dtype, device=weight.device)

@@ -102,7 +102,7 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811
     else:
         assert "fi_cutlass" not in backends and "cutlass" in backends, backends
         assert ("cuda_core" in backends) == (s["m"] <= nvfp4_runner.CUDA_CORE_MAX_M), backends
-    ran = 0
+    ran = set()
     for tactic in tactics:
         try:
             got = runner(inputs, tactic=tactic)
@@ -111,8 +111,33 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811
             torch.cuda.synchronize()
             continue
         _compare(got, ref)
-        ran += 1
-    assert ran > 0, "no candidate tactic ran"
+        ran.add(tactic[0])
+    assert ran, "no candidate tactic ran"
+    # The fixed-shape kernels must run whenever offered; only cutlass/cuBLASLt configs may
+    # fail for a shape.
+    assert backends & {"cuda_core", "fi_cutlass"} <= ran, (backends, ran)
+
+
+def test_cached_flashinfer_tactic_falls_back_when_flashinfer_is_missing(monkeypatch) -> None:
+    """A `fi_cutlass` tactic cached by a process whose FlashInfer module built still runs
+    (as the stock CUTLASS kernel) in one where it did not."""
+    inputs, _ = _operands(5120, 6144, 64, seed_of("fi-fallback"))
+    runner = nvfp4_runner.runner_for(torch.bfloat16)
+    want = runner(inputs, tactic=("cutlass", -1))
+    monkeypatch.setattr(nvfp4_runner._FlashInferSm120, "get", classmethod(lambda cls: None))
+    assert torch.equal(runner(inputs, tactic=("fi_cutlass", 0)), want)
+
+
+def test_cuda_core_refuses_k_not_a_multiple_of_32(monkeypatch) -> None:
+    """The cuda-core kernel steps K by 32 with no tail: K=48 is not offered and the native
+    op refuses it instead of reading past the row. (cuBLASLt has no heuristic at all for
+    this K, so it is left out of the tactic listing here.)"""
+    monkeypatch.setattr(nvfp4_runner, "IS_CUBLASLT_AVAILABLE", False)
+    inputs, _ = _operands(256, 48, 4, seed_of("k48"))
+    tactics = nvfp4_runner.runner_for(torch.bfloat16).get_valid_tactics(inputs, None)
+    assert "cuda_core" not in {t[0] for t in tactics}
+    with pytest.raises(RuntimeError, match="unsupported shape"):
+        nvfp4_runner.native_ops.cuda_core_nvfp4_gemm(*inputs)
 
 
 def test_a_row_slice_takes_the_unsliced_tactic_and_bytes() -> None:

@@ -146,15 +146,24 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by
     _check_against_reference(fp4, sf, y, ref, y_ref, gs)
 
 
-def test_outputs_from_a_poisoned_allocator() -> None:
-    """Every output byte is written, SF padding rows included: outputs carved from memory
-    the caching allocator last held as 0xAB come back equal to the composition."""
+def test_outputs_from_poisoned_storage(monkeypatch) -> None:
+    """Every output byte is written, SF padding rows included: with both outputs handed
+    out pre-filled with 0xAB, they come back equal to the composition."""
     x, z, weight, eps, gs = _build(op.CELLS[0].spec, seed=_seed("poison"))
     _, want_fp4, want_sf = _composition(x, z, weight, eps, gs)
-    junk = torch.full((want_fp4.numel() + want_sf.numel() + (1 << 20),), 0xAB, dtype=torch.uint8,
-                      device=DEV)  # fmt: skip
-    del junk
+    empty, handed = torch.empty, []
+
+    def poisoned_empty(*args, **kwargs):
+        t = empty(*args, **kwargs)
+        if t.dtype == torch.uint8 and t.is_cuda:
+            t.fill_(0xAB)
+            handed.append(t)
+        return t
+
+    monkeypatch.setattr(torch, "empty", poisoned_empty)
     fp4, sf = op(x, z, weight, eps, gs)
+    monkeypatch.undo()
+    assert any(t is fp4 for t in handed) and any(t is sf for t in handed), "outputs not poisoned"
     assert torch.equal(fp4, want_fp4) and torch.equal(sf, want_sf)
 
 
@@ -166,7 +175,14 @@ def test_pdl_waits_for_a_late_producer() -> None:
     x, z, weight, eps, gs = _build(op.CELLS[0].spec, seed=_seed("pdl"))
     _, want_fp4, want_sf = _composition(x, z, weight, eps, gs)
     late_x = torch.full_like(x, float("nan"))
+    # Compile both kernels first, so the timed launch is a host dispatch of a few
+    # microseconds and the producer, spinning 2 ms, is still running when the consumer
+    # launches.
     late_producer(x, late_x)
+    op(late_x, z, weight, eps, gs, True)
+    torch.cuda.synchronize()
+    late_x.fill_(float("nan"))
+    late_producer(x, late_x, delay_us=2000)
     fp4, sf = op(late_x, z, weight, eps, gs, True)
     torch.cuda.synchronize()
     assert torch.equal(fp4, want_fp4) and torch.equal(sf, want_sf)
