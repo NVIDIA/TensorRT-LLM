@@ -5,7 +5,7 @@ description = ""
 authors = [
     {name = "TensorRT LLM [90828364+tensorrt-cicd@users.noreply.github.com]"}
 ]
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.12,<3.13"
 dependencies = [
     "latex2sympy2 (>=1.9.1,<2.0.0)",
     "word2number (>=1.1,<2.0)"

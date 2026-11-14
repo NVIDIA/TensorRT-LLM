@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.distributed.ops import warmup_named_allreduce_topologies
@@ -451,6 +451,8 @@ class DecoderWarmup:
         )
 
         log_mem_snapshot("warmup/before_warmup")
+        with self._warmup_timer.phase("fmha_module_prewarm"):
+            self._prewarm_fmha_libraries(kv_cache_manager)
         # Compile the DSv4 indexer-Q CuTe DSL kernels before the first
         # collective-bearing forward, so their JIT cost is not charged against the
         # MoE all-to-all completion-flag deadline.
@@ -726,6 +728,50 @@ class DecoderWarmup:
                     f"skipping bucket. {type(e).__name__}: {e}"
                 )
         torch.cuda.synchronize()
+
+    def _prewarm_fmha_libraries(self, kv_cache_manager: KVCacheManager | KVCacheManagerV2) -> None:
+        """Build eligible FMHA modules before the first warmup forward.
+
+        flashinfer builds the module on first use, and MPI workers keep a
+        flashinfer workspace per process by default, so every rank builds its
+        own copy. Under pipeline parallelism the first warmup forward reaches
+        the ranks one after another, so builds left to that forward run in turn
+        and startup grows with the pipeline depth. Building here lets the ranks
+        build at the same time. Without pipeline parallelism there is nothing
+        to overlap. Library-specific hooks decide static layer eligibility.
+        """
+        if self.mapping.pp_size == 1:
+            return
+        from tensorrt_llm._torch.attention.backends.fmha.interface import Fmha, FmhaPrewarmConfig
+
+        config = FmhaPrewarmConfig(
+            dtype=self._config.dtype,
+            kv_cache_dtype=kv_cache_manager.dtype,
+            tokens_per_block=kv_cache_manager.tokens_per_block,
+            extra_tokens_per_block=frozenset(
+                getattr(kv_cache_manager, "trtllm_gen_extra_tokens_per_block", ())
+            ),
+            context=not self.mapping.has_cp_helix()
+            and not is_decode_only(self.sparse_attention_config),
+            generation=not is_context_only_kv_cache(kv_cache_manager),
+            helix=self.mapping.has_cp_helix(),
+        )
+        attempted: set[type[Fmha]] = set()
+        for module in self.model.modules():
+            # Locality follows retained projection weights, including models
+            # that do not set _weights_removed. Attention backends are plain
+            # attributes, so inspect them without assuming a wrapper or name
+            # (Attention.attn, MLA.mqa/mha, cross or custom attention).
+            if not any(True for _ in module.parameters()):
+                continue
+            for backend in vars(module).values():
+                if isinstance(backend, TrtllmAttention):
+                    backend.prewarm_fmha(config, attempted)
+
+        # Eligibility and build success may differ across TP peers. Every peer
+        # meets here before a forward can start a collective's timeout clock.
+        if self.mapping.tp_size > 1 and self.dist is not None:
+            self.dist.tp_allgather(1)
 
     def _prewarm_cute_dsl_indexer_q(self) -> None:
         """Pre-compile the DSv4 indexer-Q CuTe DSL kernels, then barrier.

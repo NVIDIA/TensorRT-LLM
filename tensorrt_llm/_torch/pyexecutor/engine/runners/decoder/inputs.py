@@ -9,6 +9,7 @@ from dataclasses import dataclass, field, fields, replace
 from typing import Any
 
 import torch
+from torch.utils._pytree import tree_flatten
 
 from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
@@ -121,6 +122,23 @@ def _get_context_prompt_lookahead_token(request: LlmRequest, chunk_end: int) -> 
     if request.is_last_context_chunk:
         return INVALID_PROMPT_LOOKAHEAD_TOKEN
     return request.get_token(0, chunk_end)
+
+
+def _chunk_reads_prefetched_tensors(multimodal_params: MultimodalParams, use_mrope: bool) -> bool:
+    """Whether this chunk reads device tensors that a cross-iter prefetch stages: its
+    multimodal rows or its MRoPE delta in the model forward, or its MRoPE positions during
+    preparation.
+    """
+    if not multimodal_params.has_content():
+        return False
+    runtime = multimodal_params.multimodal_runtime
+    if runtime is None or runtime.num_mm_tokens_in_chunk != 0:
+        return True
+    mrope_config = multimodal_params.multimodal_data.get("mrope_config") or {}
+    return use_mrope and (
+        mrope_config.get("mrope_position_ids") is not None
+        or mrope_config.get("mrope_position_deltas") is not None
+    )
 
 
 def _zero_fill_row_spans(buffer: torch.Tensor, spans: list[tuple[int, int]]) -> None:
@@ -1426,14 +1444,19 @@ class DecoderInputPreparer:
         # Transfer any cross-iter MM encoder prefetch event stamped on the request onto the
         # freshly-built MultimodalParams. The downstream consume site reads it from the wrapper,
         # not from the request.
-        # NOTE: the prefetch producer always writes the cached embedding into
-        # `py_multimodal_data` before stamping the event, so whenever the event is present,
-        # `has_content()` below is `True` and the wrapper reaches the consume site that waits on
-        # it.
+        # The prefetch staged this request's tensors on its side stream. The first chunk that
+        # reads them orders this stream after the prefetch and keeps their storage until this
+        # stream is done with it; a chunk that reads none leaves the event on the request.
         mm_encoder_event = request.py_mm_encoder_event
         if mm_encoder_event is not None:
             multimodal_params.encoder_event = mm_encoder_event
-            request.py_mm_encoder_event = None
+            if _chunk_reads_prefetched_tensors(multimodal_params, _use_mrope):
+                consumer_stream = torch.cuda.current_stream()
+                consumer_stream.wait_event(mm_encoder_event)
+                for leaf in tree_flatten(request.py_multimodal_data)[0]:
+                    if isinstance(leaf, torch.Tensor) and leaf.is_cuda:
+                        leaf.record_stream(consumer_stream)
+                request.py_mm_encoder_event = None
         if multimodal_params.has_content():
             # TODO(TRTLLM-14726): Check the persistent MM encoder cache before H2D and avoid
             # transferring raw encoder inputs for full hits in both regular and

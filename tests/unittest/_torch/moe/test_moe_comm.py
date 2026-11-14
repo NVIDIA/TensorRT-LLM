@@ -47,6 +47,7 @@ Run with: mpirun -np 8 pytest test_moe_comm.py -x -v
 """
 
 import atexit
+import contextlib
 import os
 import pickle
 import sys
@@ -55,7 +56,7 @@ import traceback
 from dataclasses import dataclass
 from functools import lru_cache
 from types import SimpleNamespace
-from typing import Dict, List, Optional, Set, Tuple
+from typing import ContextManager, Dict, List, Optional, Set, Tuple
 from unittest.mock import MagicMock
 
 import cloudpickle
@@ -73,7 +74,8 @@ from tensorrt_llm._torch.moe.fused_moe.communication.deep_ep import DeepEP
 from tensorrt_llm._torch.moe.fused_moe.communication.deep_ep_low_latency import DeepEPLowLatency
 from tensorrt_llm._torch.moe.fused_moe.communication.nccl_ep import NcclEP
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_one_sided import (
-    FORCE_CFT_ENV,
+    SENTINEL_MAX_TOKENS_ENV,
+    SYNC_PROTOCOL_ENV,
     NVLinkOneSided,
 )
 from tensorrt_llm._torch.moe.fused_moe.communication.nvlink_two_sided import (
@@ -296,8 +298,8 @@ def _run_nvlink_rank_mask_dispatch(
         comm.top_k,
         comm.num_experts,
         None,  # eplb_local_stats
-        enable_rank_mask,
-        active_rank_mask,
+        enable_rank_mask=enable_rank_mask,
+        active_rank_mask=active_rank_mask,
     )
 
     topk_target_ranks = _read_nvlink_topk_target_ranks(
@@ -335,8 +337,8 @@ def _run_nvlink_rank_mask_combine(
         combine_payload_offset,
         False,  # payload_in_workspace
         False,  # use_low_precision
-        enable_rank_mask,
-        active_rank_mask,
+        enable_rank_mask=enable_rank_mask,
+        active_rank_mask=active_rank_mask,
     )
 
 
@@ -1192,8 +1194,7 @@ def _worker_full_pipeline(config: CommTestConfig) -> dict:
         traceback.print_exc()
         raise
     finally:
-        # A CFT workspace holds a process-global binding only destroy() frees,
-        # and the cache does not survive to the next pool task.
+        # The cache does not survive to the next pool task.
         _destroy_cached_worker_comm()
 
 
@@ -2584,6 +2585,29 @@ def _run_rank_mask_one_rank_masked_test(
     assert saw_dead, f"dead rank {dead_rank} did not appear in results"
 
 
+# These two use torch only through a local import: this module is pickled by value, and a function
+# that names torch.ops next to the global torch makes cloudpickle serialize the ops namespace.
+def _sentinel_available() -> bool:
+    import torch as _torch
+
+    return bool(_torch.ops.trtllm.moe_a2a_sentinel_available())
+
+
+def _record_sentinel_steps(steps: List[bool]) -> ContextManager:
+    """Patch moe_a2a_dispatch to append whether each launch takes the sentinel transport."""
+    from unittest import mock
+
+    import torch as _torch
+
+    dispatch_op = _torch.ops.trtllm.moe_a2a_dispatch
+
+    def record_dispatch(*args, **kwargs):
+        steps.append(bool(kwargs.get("use_sentinel", False)))
+        return dispatch_op(*args, **kwargs)
+
+    return mock.patch.object(_torch.ops.trtllm, "moe_a2a_dispatch", record_dispatch)
+
+
 def _exercise_mnnvl_checkpoint_graph_replay(
     config: CommTestConfig, rank: int, communication
 ) -> bool:
@@ -2650,6 +2674,11 @@ def _exercise_mnnvl_checkpoint_graph_replay(
         def any_allocation_is_mapped() -> bool:
             return communication.mnnvl_mem.mapped
 
+    sentinel_steps: List[bool] = []
+    if config.comm_type == COMM_NVLINK_ONE_SIDED and _sentinel_available():
+        # The default policy carries these small steps on the sentinel transport.
+        assert communication.sentinel_max_tokens >= max(config.all_num_tokens)
+
     for cycle in range(3):
         free_before_prepare = torch.cuda.mem_get_info()[0]
         communication.checkpoint_prepare()
@@ -2672,9 +2701,20 @@ def _exercise_mnnvl_checkpoint_graph_replay(
             )
         assert restored_addresses == stable_addresses
 
-        with torch.inference_mode():
+        sentinel_steps.clear()
+        record = (
+            _record_sentinel_steps(sentinel_steps)
+            if config.comm_type == COMM_NVLINK_ONE_SIDED
+            else contextlib.nullcontext()
+        )
+        with torch.inference_mode(), record:
             worker_inputs.hs.add_(cycle + 1)
             expected = forward().clone()
+        if config.comm_type == COMM_NVLINK_ONE_SIDED:
+            # The step after restore takes the transport the instance selects for it.
+            assert sentinel_steps == [
+                communication.sentinel_max_tokens >= max(config.all_num_tokens)
+            ]
         graph.replay()
         torch.cuda.synchronize()
         torch.testing.assert_close(graph_output, expected)
@@ -2693,9 +2733,9 @@ def _worker_mnnvl_checkpoint_graph_replay(config: CommTestConfig) -> bool:
         world_size=config.ep_size,
     )
     with pytest.MonkeyPatch.context() as patch:
-        # Pin worker-side policy: CFT binds the workspace for the life of the
-        # process, so checkpointing is refused while it is on.
-        patch.setenv(FORCE_CFT_ENV, "0")
+        # Pin worker-side policy: the default transport selection, with sentinel on.
+        patch.delenv(SYNC_PROTOCOL_ENV, raising=False)
+        patch.delenv(SENTINEL_MAX_TOKENS_ENV, raising=False)
         communication = create_comm_object(config.comm_type, mapping, config)
     try:
         return _exercise_mnnvl_checkpoint_graph_replay(config, rank, communication)
@@ -2730,9 +2770,9 @@ def _worker_mnnvl_engine_checkpoint_coordination(config: CommTestConfig) -> bool
         world_size=world_size,
     )
     with pytest.MonkeyPatch.context() as patch:
-        # Pin worker-side policy: CFT binds the workspace for the life of the
-        # process, so checkpointing is refused while it is on.
-        patch.setenv(FORCE_CFT_ENV, "0")
+        # Pin worker-side policy: the default transport selection, with sentinel on.
+        patch.delenv(SYNC_PROTOCOL_ENV, raising=False)
+        patch.delenv(SENTINEL_MAX_TOKENS_ENV, raising=False)
         communication = create_comm_object(config.comm_type, mapping, config)
     sleep_wakeup_comm = MPI.COMM_WORLD.Dup()
     control_comm = MPI.COMM_WORLD.Dup()

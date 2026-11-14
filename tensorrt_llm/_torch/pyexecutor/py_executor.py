@@ -6024,6 +6024,16 @@ class PyExecutor:
             return False
         return self.kv_cache_manager.is_preemption_pending(request)
 
+    def _has_pending_preemption(self) -> bool:
+        """True while any victim is parked mid-preemption (V2 only).
+
+        Lets per-request loops skip `_is_preemption_pending` in the common
+        case where nothing is parked.
+        """
+        if not getattr(self, "_is_kv_manager_v2", False):
+            return False
+        return self.kv_cache_manager.has_pending_preemption()
+
     def _resume_preempted_request(self, request: LlmRequest) -> bool:
         """Complete a preemption whose connector saves have now retired.
 
@@ -10811,8 +10821,8 @@ class PyExecutor:
         outstanding-ahead cap in `maybe_prefetch_mm_encoder_for_next_iter`.
         That helper runs the encoder on a side CUDA stream and stashes
         results back into `request.py_multimodal_data`. The next iteration's
-        `_prepare_inputs` then picks up the cached embedding and the mixin
-        consume site waits on the recorded CUDA event.
+        `_prepare_inputs` then waits on the recorded CUDA event and picks
+        up the cached embedding.
 
         Shared between `_executor_loop` (non-overlap) and
         `_executor_loop_overlap`. `self.previous_batch` is always None in
@@ -12082,6 +12092,8 @@ class PyExecutor:
 
         batch_token_time = self.perf_manager.get_timestamp()
         gpu_times_cache = {}
+        check_preemption = self._has_pending_preemption()
+        perf_metrics_enabled = self.perf_manager.enabled
 
         for request in self.active_requests:
             req_id = request.py_request_id
@@ -12094,7 +12106,7 @@ class PyExecutor:
             # Responding would hand the client a final response for a request
             # about to re-prefill, and dropping it from active_requests would
             # leave _resume_preempted_request nothing to put back.
-            if self._is_preemption_pending(request):
+            if check_preemption and self._is_preemption_pending(request):
                 new_active_requests.append(request)
                 continue
 
@@ -12150,8 +12162,12 @@ class PyExecutor:
             request.draft_tokens = request.py_draft_tokens or []
             request.decoding_iter = request.py_decoding_iter
 
-            self.perf_manager.append_step_metrics(
-                request, self.iter_counter, batch_token_time=batch_token_time)
+            # append_step_metrics returns immediately while metrics are off.
+            if perf_metrics_enabled:
+                self.perf_manager.append_step_metrics(
+                    request,
+                    self.iter_counter,
+                    batch_token_time=batch_token_time)
 
             # Ensure C++ perf metrics (lastTokenTime, etc.) are always updated
             # independently of whether append_step_metrics early-returned.
@@ -12171,8 +12187,18 @@ class PyExecutor:
             # for stream_interval after the context-side first token.
             first_gen_emit = (request.is_generation_only_request
                               and not request.py_gen_first_emitted)
-            if self._should_emit_response(request, emit_first_iter,
-                                          first_gen_emit):
+            should_emit = self._should_emit_response(request, emit_first_iter,
+                                                     first_gen_emit)
+            # A non-streaming request yields no result until it finishes
+            # (LlmRequest::createResult), so creating a response for it on
+            # every earlier step only costs a native call. Requests that
+            # return perf metrics keep the call: it finalizes their ctx GPU
+            # totals.
+            if (should_emit and not request.is_finished
+                    and not request.streaming
+                    and not request.return_perf_metrics):
+                should_emit = False
+            if should_emit:
                 if request.return_perf_metrics:
                     # Response creation may finalize and copy scalar ctx GPU totals.
                     self.perf_manager.compute_batch_gpu_times(

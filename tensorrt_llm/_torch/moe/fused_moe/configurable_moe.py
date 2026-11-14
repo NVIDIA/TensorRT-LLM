@@ -790,6 +790,7 @@ class ConfigurableMoE(MoE):
             hidden_size=self.hidden_size,
             communication_method=self.communication_method,
             allow_alltoall=self.backend.supports_alltoall,
+            layer_quant_config=getattr(self, "_override_quant_config", None),
         )
 
     def forward_impl(

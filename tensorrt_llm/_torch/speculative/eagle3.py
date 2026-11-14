@@ -12,6 +12,7 @@ from torch import nn
 from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.custom_ops import inplace_slice_copy
 from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..attention.backends import AttentionMetadata
@@ -23,8 +24,9 @@ from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.scheduler import ScheduledRequests
 from .fused_accept import step0_epilogue
-from .interface import (INVALID_PROMPT_LOOKAHEAD_TOKEN, SpecMetadata,
-                        SpecWorkerBase, supports_sharded_target_sampling)
+from .interface import (INVALID_PROMPT_LOOKAHEAD_TOKEN, DraftRowPick,
+                        SpecMetadata, SpecWorkerBase,
+                        supports_sharded_target_sampling)
 from .mtp import _select_mtp_position_ids
 from .sa_enhancer import SADraftEnhancer
 from .spec_tree_manager import SpecTreeManager
@@ -498,6 +500,9 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         # Set by set_draft_model: the MTP layer applies the draft loop's
         # deferred kv_lens increment itself.
         self._draft_folds_kv_lens_increment = False
+        # Whether the draft layer runs its post-attention part on step 0 only
+        # on the rows the loop reads (see draft_layer_picks_rows).
+        self._step0_row_pick = DraftRowPick("Draft step 0 layer")
         # MXFP8 copy of the LM head for greedy draft tokens (MTP Eagle), set
         # by the model once its weights are loaded.
         self.draft_head = None
@@ -512,6 +517,21 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         self._draft_folds_kv_lens_increment = (
             self.is_mtp_eagle and isinstance(draft_model, MTPForCausalLM)
             and draft_model.folds_kv_lens_increment)
+
+    def _step0_draft_layer_picks_rows(self, draft_model: nn.Module,
+                                      use_epilogue: bool) -> bool:
+        """Whether the draft layer of step 0 takes ``pick_rows`` (see
+        draft_layer_picks_rows). Not with the step-0 epilogue, which gathers
+        the rows from the full output itself."""
+        if self.is_mtp_eagle:
+            mtp_layers = getattr(draft_model, "mtp_layers", None)
+            draft_layer = mtp_layers[0] if mtp_layers else None
+        else:
+            draft_layer = getattr(draft_model, "model", None)
+        return self._step0_row_pick.resolve(
+            [draft_layer],
+            self.mapping,
+            decline="spec-decode fast paths" if use_epilogue else None)
 
     @property
     def max_draft_len(self) -> int:
@@ -906,6 +926,29 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             for i in range(runtime_draft_len):
                 if uses_mtp_index_share:
                     attn_metadata.set_skip_topk(i > 0)
+                # Step 0 with a row-picking draft layer: the rows the loop
+                # reads (step 0's gather ids) are known before the forward, and
+                # the layer runs everything after its attention on them only.
+                # Under attention DP every rank makes the same decision (it
+                # depends on the model and config only), and the
+                # post-attention collectives get the per-request counts the
+                # later steps use.
+                pick_rows = None
+                if i == 0 and self._step0_draft_layer_picks_rows(
+                        draft_model, use_epilogue):
+                    # set_spec_metadata_all_rank_num_tokens sets both.
+                    assert (spec_metadata.all_rank_num_tokens is None
+                            or spec_metadata.subseq_all_rank_num_tokens
+                            is not None)
+                    pick_rows = self._step0_gather_ids(
+                        step0_seq_lens, num_accepted_tokens, spec_metadata,
+                        num_contexts, num_gens, runtime_draft_len,
+                        attn_metadata.num_ctx_tokens)
+                    inputs["pick_rows"] = pick_rows
+                    logger.info_once(
+                        f"Draft step 0 picks {batch_size} of "
+                        f"{inputs['input_ids'].shape[0]} rows after attention",
+                        key="spec_draft_step0_pick_rows")
                 # Run draft model (mode-specific via helper). The helper
                 # passes ``all_rank_num_tokens`` as a kwarg so the draft model
                 # handles save/restore internally (Eagle3DraftModel.forward
@@ -920,7 +963,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 # request, in request order, so every per-request row
                 # selection is the prefix slice [0, batch_size); each
                 # ``[gather_ids]`` site below takes a slice as readily as an
-                # index tensor.
+                # index tensor. A picked step-0 output already holds just
+                # those rows, in request order.
                 if i == 0 and use_epilogue:
                     step0 = step0_epilogue(pre_draft_seq_lens,
                                            num_accepted_tokens,
@@ -940,25 +984,24 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                         token_buffer = None  # needs the epilogue's row 0
                 if i == 0 and step0 is not None:
                     gather_ids = step0.gather_ids
+                elif i == 0 and pick_rows is not None:
+                    gather_ids = pick_rows
                 elif i == 0:
-                    last_tokens_idx = torch.cumsum(
-                        step0_seq_lens, dim=0, dtype=torch.long) - 1
-                    start_ids_gen = (
-                        spec_metadata.batch_indices_cuda[:num_gens] *
-                        (runtime_draft_len + 1)).long()
-                    gather_ids_gen = (start_ids_gen +
-                                      num_accepted_tokens[num_contexts:] - 1 +
-                                      attn_metadata.num_ctx_tokens)
-                    gather_ids = torch.concat(
-                        [last_tokens_idx[:num_contexts], gather_ids_gen], dim=0)
+                    gather_ids = self._step0_gather_ids(
+                        step0_seq_lens, num_accepted_tokens, spec_metadata,
+                        num_contexts, num_gens, runtime_draft_len,
+                        attn_metadata.num_ctx_tokens)
                 else:
                     gather_ids = slice(0, batch_size)
+                # The output rows of this step's requests, in request order.
+                output_rows = (slice(0, batch_size)
+                               if pick_rows is not None else gather_ids)
                 # MTP Eagle: one row per request, the LM-head input on this
                 # step and the draft input on the next.
                 if i == 0 and step0 is not None:
                     request_hidden_states = step0.hidden
                 elif self.is_mtp_eagle:
-                    request_hidden_states = hidden_states[gather_ids]
+                    request_hidden_states = hidden_states[output_rows]
                 else:
                     request_hidden_states = None
 
@@ -1065,7 +1108,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                             attn_metadata, True)
                 else:
                     logits = draft_model.logits_processor(
-                        hidden_states[gather_ids], draft_model.lm_head,
+                        hidden_states[output_rows], draft_model.lm_head,
                         attn_metadata, True)
 
                 if draft_head is None:
@@ -1115,7 +1158,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     if self.is_mtp_eagle:
                         hidden_states = request_hidden_states
                     else:
-                        hidden_states = hidden_states_to_save[gather_ids]
+                        hidden_states = hidden_states_to_save[output_rows]
                     if step0 is not None:
                         position_ids = step0.positions(i + 1)
                     else:
@@ -1188,15 +1231,39 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
         return next_draft_tokens, next_new_tokens
 
-    def _get_step_all_rank_num_tokens(self, spec_metadata, step_idx: int):
+    @staticmethod
+    def _step0_gather_ids(seq_lens: torch.Tensor,
+                          num_accepted_tokens: torch.Tensor,
+                          spec_metadata: Eagle3OneModelSpecMetadata,
+                          num_contexts: int, num_gens: int,
+                          runtime_draft_len: int,
+                          num_ctx_tokens: int) -> torch.Tensor:
+        """Step 0's row of each request: a context request's last prompt row,
+        a generation request's last accepted row."""
+        last_tokens_idx = torch.cumsum(seq_lens, dim=0, dtype=torch.long) - 1
+        start_ids_gen = (spec_metadata.batch_indices_cuda[:num_gens] *
+                         (runtime_draft_len + 1)).long()
+        gather_ids_gen = (start_ids_gen + num_accepted_tokens[num_contexts:] -
+                          1 + num_ctx_tokens)
+        return torch.concat([last_tokens_idx[:num_contexts], gather_ids_gen],
+                            dim=0)
+
+    def _get_step_all_rank_num_tokens(self,
+                                      spec_metadata,
+                                      step_idx: int,
+                                      picks_rows: bool = False):
         """Pick the right ``all_rank_num_tokens`` for this draft iteration.
 
         Step 0 uses ``spec_metadata.all_rank_num_tokens``; subsequent steps
         use ``spec_metadata.subseq_all_rank_num_tokens`` since every sequence
-        contributes a single token per iteration.
+        contributes a single token per iteration. A step-0 forward that picks
+        one row per request after attention (``picks_rows``) also uses the
+        per-sequence counts: they are the token counts of its post-attention
+        part, the only part that reads them.
         """
         return (spec_metadata.all_rank_num_tokens
-                if step_idx == 0 else spec_metadata.subseq_all_rank_num_tokens)
+                if step_idx == 0 and not picks_rows else
+                spec_metadata.subseq_all_rank_num_tokens)
 
     def _run_draft_forward(self, draft_model, inputs, spec_metadata,
                            step_idx: int):
@@ -1205,10 +1272,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         ``all_rank_num_tokens`` is passed as a kwarg in both modes. For MTP
         Eagle it goes directly to ``mtp_layers[0]``; for Eagle3 it goes to
         ``Eagle3DraftModel.forward`` which guards it with a try/finally so
-        attn_metadata sees the original value on return.
+        attn_metadata sees the original value on return. ``inputs`` carries
+        ``pick_rows`` only on a step 0 whose draft layer supports it.
         """
         all_rank_num_tokens = self._get_step_all_rank_num_tokens(
-            spec_metadata, step_idx)
+            spec_metadata, step_idx, picks_rows="pick_rows" in inputs)
 
         if self.is_mtp_eagle:
             hidden_states = draft_model.mtp_layers[0](

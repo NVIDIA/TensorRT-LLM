@@ -132,6 +132,27 @@ TRTLLM_FORCE_COMM_METHOD=DEEPEPLOWLATENCY \
 
 The value must be one of the strategy names in the table above.
 
+##### `NVLINK_ONE_SIDED`: how arrival is detected
+
+`NVLINK_ONE_SIDED` has two ways for a rank to learn that a step's rows have arrived, selected per step:
+
+| Protocol | Mechanism | Used for |
+|---|---|---|
+| `fence` | Completion flags behind a system-scope fence | Every step it is selected for; always available |
+| `sentinel` | Landing rows are pre-filled with a sentinel word; receivers poll the data itself, so neither dispatch nor combine waits on a flag or fence | Small steps on SM100, SM103 and SM107 |
+
+`TRTLLM_NVLINK_ONE_SIDED_A2A_SYNC_PROTOCOL` chooses the policy on every rank:
+
+- `auto` (default): sentinel for each step it can carry, fence for the others.
+- `fence`: fence only.
+- `sentinel`: same as `auto`, but logs a warning naming the reason when sentinel cannot be used.
+
+A step is carried by sentinel when its busiest rank sends at most `sentinel_max_tokens` tokens, it gathers no EPLB statistics, and its payload matches the layer's format (BF16, MXFP8 or NVFP4 rows). Sentinel is off for FP8 low-precision combine (`use_low_precision_moe_combine`), for communicators with the AlltoAll watchdog or EP-group health, for more than 64 EP ranks, and for the FP8 per-tensor, `W4A8_MXFP4_FP8` and `W4A8_NVFP4_FP8` activation formats.
+
+The default `sentinel_max_tokens` is between 159 and 512 tokens per rank (capped at `max_num_tokens_per_rank`); `TRTLLM_NVLINK_ONE_SIDED_A2A_SENTINEL_MAX_TOKENS` overrides it. The sentinel landing rows are added to the workspace, `ep_size × sentinel_max_tokens` of them per rank: for hidden 7168, top-8 BF16 rows this is about 52 / 105 / 210 / 419 MiB per rank at EP 8 / 16 / 32 / 64. If a `TRTLLM_NVLINK_ONE_SIDED_A2A_WORKSPACE_MB` override cannot hold them, sentinel is turned off with a warning.
+
+The settings must be the same on every rank; an invalid or mismatched value raises an error at model construction on every rank. `TRTLLM_NVLINK_ONE_SIDED_A2A_FORCE_CFT`, `..._CFT_MAX_BATCH_FOR_DISPATCH` and `..._CFT_MAX_BATCH_FOR_COMBINE` are no longer read and log a warning; `FORCE_CFT=0` still selects `fence` for one release.
+
 Implementation Notes: [`MOE_DEVELOPER_GUIDE.md`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md).
 
 #### Backend
