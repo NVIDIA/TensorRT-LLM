@@ -26,7 +26,7 @@ from tensorrt_llm._torch.modules.dwdp.dense.manager import (
 from tensorrt_llm._torch.modules.dwdp.dense.types import DenseMode
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseResourceManager, ResourceManagerType)
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_version, mpi_disabled
 from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
                                           ContextChunkingPolicy,
                                           ExecutorMemoryType,
@@ -398,6 +398,61 @@ def _rank_dspark_on_host_without_overlap(
         logger.info("DSpark device re-ranking needs the overlap scheduler; "
                     "ranking draft positions on the host.")
         spec_config.enable_fused_confidence_scheduler = False
+
+
+CUDA_OBJECT_COLLECTIVES_ENV_VAR = "TLLM_CUDA_OBJECT_COLLECTIVES"
+
+
+def _keep_votes_off_sms_for_megamoe_overlap(llm_args, dist) -> None:
+    """Keep the executor's host votes from needing the SMs MegaMoE holds.
+
+    Under the Ray orchestrator the communicator is TorchDist, which runs the
+    executor's per-step host collectives (votes) as NCCL collectives on a side
+    stream that does not wait for the compute stream. With the overlap
+    scheduler they run beside the next step's forward, and the MegaMoE kernels
+    are persistent: their grid fills every SM and spins until the peer ranks
+    arrive. A rank whose vote kernel cannot get an SM and a peer waiting in
+    that vote for it wait on each other forever (seen at engine startup, in
+    KV-cache estimation). For that combination the votes move to TorchDist's
+    SM-free transport (``TorchDist.use_sm_free_object_collectives``); where the
+    stack cannot run it, they take the CPU backend, and an explicit
+    TLLM_CUDA_OBJECT_COLLECTIVES=1 is refused. Every rank holds the same
+    arguments and TorchDist decides by world consensus, so every rank takes the
+    same path.
+    """
+    if not mpi_disabled() or llm_args.disable_overlap_scheduler:
+        return
+    backend = str(getattr(llm_args.moe_config, "backend", "")).upper()
+    if not backend.startswith("MEGAMOE"):
+        return
+    if not dist.cuda_object_collectives_enabled:
+        return  # CPU backend already (TLLM_CUDA_OBJECT_COLLECTIVES=0)
+    if dist.use_sm_free_object_collectives():
+        logger.info(
+            f"moe_config.backend={backend} with the overlap scheduler under "
+            "the Ray orchestrator: the executor's host votes run on the SM-free "
+            "transport, beside MegaMoE's persistent kernel.")
+        return
+    # A world consensus, like TorchDist's own kill switch: ranks that disagree
+    # here would part ways (one raising, the others building the model).
+    requested_nccl = os.environ.get(CUDA_OBJECT_COLLECTIVES_ENV_VAR) == "1"
+    if any(dist.allgather(requested_nccl)):
+        raise ValueError(
+            f"moe_config.backend={backend} with the overlap scheduler under "
+            f"the Ray orchestrator deadlocks with "
+            f"{CUDA_OBJECT_COLLECTIVES_ENV_VAR}=1 unless the votes run on the "
+            "SM-free transport, which this stack cannot "
+            f"({dist.sm_free_object_collectives_status}): the votes' NCCL "
+            "kernels run beside MegaMoE's persistent kernel, which holds every "
+            "SM while it waits for its peers. Unset the variable (the votes "
+            "then use the CPU backend) or pass disable_overlap_scheduler=True.")
+    logger.warning(
+        f"moe_config.backend={backend} with the overlap scheduler under the "
+        "Ray orchestrator: the executor's host votes use the CPU backend; this "
+        f"stack cannot run the SM-free transport "
+        f"({dist.sm_free_object_collectives_status}), and on NCCL kernels they "
+        "can deadlock against MegaMoE's persistent kernel.")
+    dist.disable_cuda_object_collectives()
 
 
 def _branch_snapshot_ctx_chunk_config(
@@ -791,6 +846,7 @@ def _create_py_executor(
         })
 
     dist = Distributed.get(mapping)
+    _keep_votes_off_sms_for_megamoe_overlap(llm_args, dist)
 
     vm_pools = {}
     sleep_config = llm_args.sleep_config

@@ -35,6 +35,10 @@ except Exception:
     MPI = None  # deferred; functions will error if used when ENABLE_MULTI_DEVICE is True
 
 from tensorrt_llm._torch.distributed.mnnvl_memory import init_helix_cp_comm
+from tensorrt_llm._torch.distributed.sm_free_votes import (SmFreeVoteStaging,
+                                                           SmSaturator, drain,
+                                                           host_reduce,
+                                                           verify_sm_free)
 from tensorrt_llm._utils import (local_mpi_size, mpi_allgather, mpi_barrier,
                                  mpi_comm, mpi_disabled, mpi_isend,
                                  mpi_isend_object, mpi_recv, mpi_recv_object,
@@ -993,6 +997,11 @@ class TorchDist(Distributed):
         # time per process (see _cuda_obj_pg).
         self._cuda_obj_lock = threading.Lock()
         self._cuda_obj_staging = {}
+        # SM-free transport per vote group, once
+        # use_sm_free_object_collectives switched to it (see sm_free_votes).
+        self._cuda_obj_sm_free = {}
+        self._cpu_vote_pg = None
+        self._sm_free_status = "not requested"
 
         from tensorrt_llm._utils import set_torch_comm
         set_torch_comm(self)  # Set as global instance
@@ -1088,6 +1097,125 @@ class TorchDist(Distributed):
             self._cuda_allgather_object(0, pg)
         logger.info(f"TorchDist: CUDA object-collective groups ready for "
                     f"{sorted(self._cuda_obj_pgs)} (max_ctas=4)")
+
+    @property
+    def cuda_object_collectives_enabled(self) -> bool:
+        """Whether object collectives may take the NCCL path (rank-consistent:
+        the groups dict is built and changed by world consensus only)."""
+        return bool(self._cuda_obj_pgs)
+
+    def disable_cuda_object_collectives(self) -> None:
+        """Send every object collective down the CPU path from now on.
+
+        Callers decide from rank-consistent data (configuration, a consensus),
+        so every rank switches at the same point."""
+        self._cuda_obj_pgs = {}
+        self._cuda_obj_sm_free = {}
+
+    def _cpu_vote_group(self):
+        """A gloo group over the world for consensus and barriers that must
+        not touch the GPU (created on first use: collective)."""
+        if self._cpu_vote_pg is None:
+            self._cpu_vote_pg = dist.new_group(backend="gloo")
+        return self._cpu_vote_pg
+
+    def _world_agrees(self, local_ok: bool) -> bool:
+        gathered = [None] * dist.get_world_size()
+        dist.all_gather_object(gathered,
+                               bool(local_ok),
+                               group=self._cpu_vote_group())
+        return all(gathered)
+
+    @property
+    def sm_free_object_collectives_status(self) -> str:
+        """What ``use_sm_free_object_collectives`` decided on this rank, and why."""
+        return self._sm_free_status
+
+    def _sm_free_unavailable(self, reason: str) -> bool:
+        self._sm_free_status = f"off: {reason}"
+        logger.warning(f"TorchDist: no SM-free object collectives: {reason}")
+        return False
+
+    def use_sm_free_object_collectives(self) -> bool:
+        """Move the object collectives onto a transport that needs no SM.
+
+        For callers whose GPU work can hold every SM while it waits for its
+        peer ranks -- a persistent MegaMoE grid under the overlap scheduler --
+        beside which a vote's NCCL kernel on the side stream deadlocks (see
+        ``sm_free_votes``). Maps a symmetric buffer per vote group, and switches
+        the groups' object collectives to it only after ``verify_sm_free`` saw
+        every kind of round finish while a kernel held every SM.
+
+        Collective over the world; idempotent. Returns True when the object
+        collectives now need no SM; False when they keep their NCCL kernels
+        (no NCCL object path, or this stack cannot run the transport). Every
+        step is decided by world consensus, so every rank returns the same
+        value; ``sm_free_object_collectives_status`` says why on this rank.
+        """
+        if not self._cuda_obj_pgs:
+            self._sm_free_status = "off: object collectives on the CPU path"
+            return False
+        if self._cuda_obj_sm_free:
+            return True
+        device = torch.device("cuda", torch.cuda.current_device())
+        # Rank-local checks first, so a rank that cannot take part only votes
+        # "no" instead of leaving its peers in a collective step.
+        saturator, local_reason = None, SmFreeVoteStaging.local_problem(device)
+        if local_reason is None:
+            try:
+                saturator = SmSaturator(device)
+            except Exception as e:  # noqa: BLE001 -- any failure to build the
+                # Triton self-test kernel (no Triton, no compiler, ...) leaves
+                # the transport unprovable; the reason is reported.
+                local_reason = f"cannot build the self-test kernel: {e!r}"
+        if not self._world_agrees(saturator is not None):
+            return self._sm_free_unavailable(
+                local_reason or "another rank cannot run the transport")
+        groups = list(dict.fromkeys(self._cuda_obj_pgs.values()))
+        staging, local_reason = {}, ""
+        try:
+            # Rank-local allocations only (e.g. an OOM on one rank)...
+            for pg in groups:
+                staging[pg] = SmFreeVoteStaging(pg, device)
+        except RuntimeError as e:
+            local_reason = f"cannot allocate the vote buffers: {e!r}"
+        if not self._world_agrees(not local_reason):
+            return self._sm_free_unavailable(
+                local_reason or "another rank cannot allocate the vote buffers")
+        try:
+            # ...then the collective mapping, group by group in the same order
+            # on every rank: configuration-driven, so every rank hits a failure.
+            for pg in groups:
+                staging[pg].connect()
+        except RuntimeError as e:
+            local_reason = f"cannot map the symmetric vote buffers: {e!r}"
+        if not self._world_agrees(not local_reason):
+            return self._sm_free_unavailable(
+                local_reason or "another rank cannot map the vote buffers")
+        rounds = [
+            issue for pg in groups for issue in staging[pg].self_test_rounds()
+        ]
+        with self._cuda_obj_stream_ctx():
+            # Unsaturated first: lazy setup is not under test.
+            for issue in rounds:
+                issue()
+        drain(self._cuda_obj_stream,
+              "the SM-free vote transport's first rounds")
+        cpu_pg = self._cpu_vote_group()
+        sm_free, detail = verify_sm_free(rounds, self._cuda_obj_stream,
+                                         saturator,
+                                         lambda: dist.barrier(group=cpu_pg))
+        if not self._world_agrees(sm_free):
+            return self._sm_free_unavailable(
+                f"the self-test failed (this rank: {detail})")
+        self._cuda_obj_sm_free = staging
+        multicast = all(s.multicast for s in staging.values())
+        self._sm_free_status = (f"on: {'multicast' if multicast else 'unicast'}"
+                                f" puts, self-test {detail}")
+        logger.info(f"TorchDist: object collectives for "
+                    f"{sorted(self._cuda_obj_pgs)} on the SM-free transport "
+                    f"({self._sm_free_status})")
+        return True
 
     def setup_local_comm(self):
         self._get_cluster_info()
@@ -1303,29 +1431,43 @@ class TorchDist(Distributed):
                                      dtype=torch.uint8)
             local_size = local.numel()
         with self._cuda_obj_guard(), self._cuda_obj_stream_ctx():
-            staging = self._cuda_obj_staging_for(pg)
-            size_in = staging["size_in"]
-            size_out = staging["size_out"]
-            staging["pinned_size"][0] = local_size
-            size_in.copy_(staging["pinned_size"], non_blocking=True)
-            dist.all_gather_into_tensor(size_out, size_in, group=pg)
-            sizes = size_out.cpu()  # synchronizes the side stream
+            sm_free = self._cuda_obj_sm_free.get(pg)
+            if sm_free is not None:
+                sizes = sm_free.allgather_words(local_size, torch.int64)
+            else:
+                staging = self._cuda_obj_staging_for(pg)
+                size_in = staging["size_in"]
+                size_out = staging["size_out"]
+                staging["pinned_size"][0] = local_size
+                size_in.copy_(staging["pinned_size"], non_blocking=True)
+                dist.all_gather_into_tensor(size_out, size_in, group=pg)
+                sizes = size_out.cpu()  # synchronizes the side stream
             max_size = int(sizes.max())
             if max_size == 0:
                 # Every rank sent the sentinel.  Decided by the gathered
                 # sizes, so the skipped payload round is rank-consistent.
                 return [[] for _ in range(group_size)] if decode else None
-            send = torch.empty(max_size, dtype=torch.uint8, device="cuda")
-            if local_size:
-                send[:local_size].copy_(local)
-            recv = torch.empty(group_size * max_size,
-                               dtype=torch.uint8,
-                               device="cuda")
-            dist.all_gather_into_tensor(recv, send, group=pg)
-            if not decode:
-                # Buffers are freed stream-ordered; no host sync needed.
-                return None
-            flat = recv.cpu()
+            if sm_free is not None:
+                # Persistent buffers, rewritten stream-ordered by the next
+                # call: no host sync needed without decode either.
+                flat = sm_free.allgather_bytes(local,
+                                               local_size,
+                                               max_size,
+                                               read_back=decode)
+                if not decode:
+                    return None
+            else:
+                send = torch.empty(max_size, dtype=torch.uint8, device="cuda")
+                if local_size:
+                    send[:local_size].copy_(local)
+                recv = torch.empty(group_size * max_size,
+                                   dtype=torch.uint8,
+                                   device="cuda")
+                dist.all_gather_into_tensor(recv, send, group=pg)
+                if not decode:
+                    # Buffers are freed stream-ordered; no host sync needed.
+                    return None
+                flat = recv.cpu()
         return [
             [] if int(sizes[i]) == 0 else pickle.loads(  # nosec B301
                 flat[i * max_size:i * max_size +
@@ -1351,6 +1493,18 @@ class TorchDist(Distributed):
         """
         group_size = pg.size()
         with self._cuda_obj_guard(), self._cuda_obj_stream_ctx():
+            sm_free = self._cuda_obj_sm_free.get(pg)
+            if sm_free is not None:
+                # Equal shapes on every rank (the contract), so the byte
+                # count doubles as the gathered maximum.
+                nbytes = tensor.numel() * tensor.element_size()
+                if nbytes == 0:
+                    return [torch.empty_like(tensor) for _ in range(group_size)]
+                local = tensor.contiguous().view(-1).view(torch.uint8)
+                flat = sm_free.allgather_bytes(local, nbytes, nbytes)
+                host = flat.view(tensor.dtype).view((group_size, ) +
+                                                    tuple(tensor.shape))
+                return list(host.unbind(0))
             # Pinned staging: a pageable .cuda() blocks the host for the
             # whole copy; from pinned memory it is asynchronous on the side
             # stream, and the .cpu() below fences it before the buffer can
@@ -1398,6 +1552,10 @@ class TorchDist(Distributed):
         """
         is_root = torch.distributed.get_rank() == root
         with self._cuda_obj_guard(), self._cuda_obj_stream_ctx():
+            sm_free = self._cuda_obj_sm_free.get(pg)
+            if sm_free is not None:
+                return self._sm_free_broadcast_object(sm_free, obj, pg, root,
+                                                      is_root, allow_none)
             staging = self._cuda_obj_staging_for(pg)
             size = staging["bcast_size"]
             if is_root:
@@ -1445,6 +1603,27 @@ class TorchDist(Distributed):
             dist.broadcast(buf, src=root, group=pg)
             data = buf.cpu()
         return pickle.loads(data.numpy().tobytes())  # nosec B301
+
+    def _sm_free_broadcast_object(self, sm_free: SmFreeVoteStaging, obj, pg,
+                                  root: int, is_root: bool, allow_none: bool):
+        """``_cuda_broadcast_object`` on the SM-free transport (lock held).
+
+        The root keeps the default path's contract: it never waits on the call
+        it is issuing (``SmFreeVoteStaging.broadcast_bytes``). A size-0 payload
+        is the ``allow_none`` sentinel, as on the default path.
+        """
+        root_index = dist.get_group_rank(pg, root)
+        if is_root:
+            if allow_none and obj is None:
+                data = b""
+            else:
+                data = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+            sm_free.broadcast_bytes(data, root_index)
+            return obj
+        data = sm_free.broadcast_bytes(None, root_index)
+        if not data:
+            return None
+        return pickle.loads(data)  # nosec B301
 
     @log_op
     def broadcast(self, obj, root=0, prefer_cpu=False):
@@ -1587,11 +1766,19 @@ class TorchDist(Distributed):
         # reduce in float64 regardless of the local python type -- exact
         # for ints up to 2**53, far beyond these scalar votes.
         with self._cuda_obj_guard(), self._cuda_obj_stream_ctx():
-            reduced = torch.tensor([float(obj)],
-                                   dtype=torch.float64,
-                                   device="cuda")
-            dist.all_reduce(reduced, op=reduce_op_to_torch(op), group=pg)
-            result = reduced.cpu().item()
+            sm_free = self._cuda_obj_sm_free.get(pg)
+            if sm_free is not None:
+                # No SM-free all-reduce: gather the scalars, reduce on the
+                # host (every rank in the same order, so they agree).
+                _check_reduce_op(op)
+                gathered = sm_free.allgather_words(float(obj), torch.float64)
+                result = host_reduce(gathered.tolist(), op.name)
+            else:
+                reduced = torch.tensor([float(obj)],
+                                       dtype=torch.float64,
+                                       device="cuda")
+                dist.all_reduce(reduced, op=reduce_op_to_torch(op), group=pg)
+                result = reduced.cpu().item()
         return int(result) if isinstance(obj, int) else result
 
     @log_op
