@@ -11088,11 +11088,12 @@ class PyExecutor:
         Returns:
             Executor request IDs excluded from further model scheduling.
         """
-        replicated_gen_cancel = self.disagg.requires_gen_cancellation_consensus
         if (not getattr(self, "canceled_req_ids", None)
-                or self.kv_cache_transceiver is None or self.dist.pp_size != 1
-                or (getattr(self, "kv_connector_manager", None) is not None
-                    and not replicated_gen_cancel)):
+                or self.kv_cache_transceiver is None or self.dist.pp_size != 1):
+            return set()
+        replicated_gen_cancel = self.disagg.requires_gen_cancellation_consensus
+        if (getattr(self, "kv_connector_manager", None) is not None
+                and not replicated_gen_cancel):
             return set()
         restricted_model = (
             getattr(self, "is_encoder_decoder", False)
@@ -11134,10 +11135,11 @@ class PyExecutor:
         Returns:
             Newly activated requests that were not retired by cancellation.
         """
+        if self.kv_cache_transceiver is None:
+            return new_requests
         replicated_gen_cancel = self.disagg.requires_gen_cancellation_consensus
-        if (self.kv_cache_transceiver is None
-                or (getattr(self, "kv_connector_manager", None) is not None
-                    and not replicated_gen_cancel)):
+        if (getattr(self, "kv_connector_manager", None) is not None
+                and not replicated_gen_cancel):
             # A connector owns its requests' cancellation, except where the
             # replicated GEN consensus runs: those requests retire only through
             # the rank vote, which this rank must join even with a connector.
@@ -11331,7 +11333,12 @@ class PyExecutor:
         self.waiting_queue.remove_by_ids(canceled_req_ids_set)
 
         still_pending_canceled_ids = []
-        if self.disagg.requires_gen_cancellation_consensus:
+        # The consensus vote needs a transceiver to retire against. Without one no
+        # transfer can outlive the local request, so the local finish below is
+        # the complete cancellation path (fixture and connector-only executors).
+        consensus = (self.kv_cache_transceiver is not None
+                     and self.disagg.requires_gen_cancellation_consensus)
+        if consensus:
             # Keep cancellation IDs even without a local request until the
             # loop-head vote has checked the other ranks.
             still_pending_canceled_ids.extend(canceled_req_ids_set)
@@ -11341,8 +11348,8 @@ class PyExecutor:
             if req_id not in canceled_req_ids_set:
                 continue
 
-            if (request.is_generation_only_request
-                    and self.disagg.requires_gen_cancellation_consensus):
+            if (getattr(request, "is_generation_only_request", False)
+                    and consensus):
                 still_pending_canceled_ids.append(req_id)
                 continue
 
@@ -11382,7 +11389,7 @@ class PyExecutor:
 
         # Clear list of requests marked for cancellation and add back those that failed to cancel.
         self.canceled_req_ids.clear()
-        if self.disagg.requires_gen_cancellation_consensus:
+        if consensus:
             self.canceled_req_ids.extend(sorted(
                 set(still_pending_canceled_ids)))
         else:

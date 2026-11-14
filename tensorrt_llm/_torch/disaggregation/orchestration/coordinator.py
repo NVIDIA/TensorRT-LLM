@@ -522,9 +522,14 @@ class DisaggTransferCoordinator:
 
     @property
     def requires_gen_cancellation_consensus(self) -> bool:
-        """Whether legacy async GEN cancellation must retire a replicated batch together."""
+        """Whether legacy async GEN cancellation must retire a replicated batch together.
+
+        A ``None`` dist covers executors assembled without one (unit-test
+        shells); they never run a replicated batch, so no consensus is required.
+        """
         return (
             not self._enable_attention_dp
+            and self._dist is not None
             and self._dist.pp_size == 1
             and self._dist.world_size > 1
             and self._transceiver.consumes_transfer_buffer is False
@@ -542,7 +547,7 @@ class DisaggTransferCoordinator:
         retaining the request and cancel ID keeps idle retries reachable.
         """
         if not self.requires_gen_cancellation_consensus:
-            return ready, set(cancel_ids), set()
+            return ready, cancel_ids, set()
         gen_active = {
             request.py_request_id: (
                 request.parent_request_id if request.is_child else request.py_request_id
@@ -1382,7 +1387,9 @@ class NoopDisaggCoordinator(DisaggTransferCoordinator):
     def align_gen_cancellation(
         self, ready: List[LlmRequest], active: List[LlmRequest], cancel_ids: List[int]
     ) -> Tuple[List[LlmRequest], Set[int], Set[int]]:
-        return ready, set(cancel_ids), set()
+        # Return the caller's object untouched: no consensus means nothing to
+        # propagate, and loop-call tests pass non-iterable placeholders.
+        return ready, cancel_ids, set()
 
     def receive_gen_init(self, admitted: List[LlmRequest]) -> None:
         return None
