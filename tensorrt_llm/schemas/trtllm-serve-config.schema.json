@@ -357,6 +357,13 @@
       "additionalProperties": false,
       "description": "Configuration for KV cache block reuse policies.",
       "properties": {
+        "drop_extended_turns": {
+          "default": false,
+          "description": "With policy 'per_conversation', drop a retained turn as soon as a later turn of the same conversation extends it (its committed tokens are a prefix of the later turn's), instead of waiting for it to age out of `max_num_turns`. Turns that are not extended keep their state until the `max_num_turns` cap drops the oldest. This helps when one conversation id carries several branches, such as subagents that share their parent's id: a subagent's turns no longer push out the parent's state. Set `max_num_turns` to at least the number of branches to keep.",
+          "status": "prototype",
+          "title": "Drop Extended Turns",
+          "type": "boolean"
+        },
         "enable_branch_snapshot": {
           "default": false,
           "description": "Keep reusable state where a request's prompt diverges from the prefix cache, so later requests sharing that prefix can reuse up to the fork. For sliding-window attention (SWA), the SWA window at the fork is committed. This helps when only the SWA window at a chunk end is kept: policy 'per_request' or 'per_conversation', or SWA scratch reuse. The fork is aligned down to a block boundary and becomes a forced context chunk boundary. SWA layers skip this with joint target/draft KV cache reuse. For hybrid Mamba models, the recurrent state is snapshotted at the fork. If no periodic or additional snapshot point applies to the prompt, the prompt end is snapshotted as a fallback. Requires KV cache manager v2 and block reuse.",

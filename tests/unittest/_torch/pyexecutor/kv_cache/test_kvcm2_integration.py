@@ -3938,7 +3938,13 @@ def max_num_turns() -> int:
 
 
 @pytest.fixture
-def manager(max_num_turns: int) -> KVCacheManagerV2:
+def drop_extended_turns() -> bool:
+    """BlockReuseConfig.drop_extended_turns for the ``manager`` fixture."""
+    return False
+
+
+@pytest.fixture
+def manager(max_num_turns: int, drop_extended_turns: bool) -> KVCacheManagerV2:
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     torch.cuda.init()
@@ -3952,6 +3958,7 @@ def manager(max_num_turns: int) -> KVCacheManagerV2:
             block_reuse_config=BlockReuseConfig(
                 policy="per_conversation",
                 max_num_turns=max_num_turns,
+                drop_extended_turns=drop_extended_turns,
             ),
         ),
         CacheType.SELF,
@@ -4282,6 +4289,135 @@ def test_per_conversation_policy_retains_configured_number_of_turns(
         _free_if_active(manager, request_a_probe)
         _free_if_active(manager, request_b)
         _free_if_active(manager, request_a)
+
+
+@pytest.mark.parametrize("max_num_turns", [2])
+@pytest.mark.parametrize(
+    ("drop_extended_turns", "main_reuse", "subagent_reuse"),
+    [
+        # Oldest first: the subagent's two turns push out the main turn.
+        (False, 0, 7),
+        # Drop on extension: the subagent's second turn drops its first,
+        # and the main turn, which nothing extended, stays.
+        (True, 7, 0),
+    ],
+)
+def test_per_conversation_policy_drop_extended_turns_keeps_unextended_branch(
+    manager: KVCacheManagerV2,
+    drop_extended_turns: bool,
+    main_reuse: int,
+    subagent_reuse: int,
+) -> None:
+    """A subagent that shares its parent's conversation id must not evict the parent."""
+    main = _ContextRequest(1, list(range(8)), 8, "conv-1")
+    subagent_turn_1 = _ContextRequest(2, list(range(100, 108)), 8, "conv-1")
+    subagent_turn_2 = _ContextRequest(3, list(range(100, 112)), 12, "conv-1")
+    main_probe = _ContextRequest(4, list(range(8)), 8, "conv-2")
+    subagent_probe = _ContextRequest(5, list(range(100, 108)), 8, "conv-3")
+
+    try:
+        for request in (main, subagent_turn_1, subagent_turn_2):
+            _run_context(manager, request)
+            _free_if_active(manager, request)
+
+        assert manager.prepare_context(main_probe)
+        assert main_probe.prepopulated_prompt_len == main_reuse
+        _free_if_active(manager, main_probe)
+
+        assert manager.prepare_context(subagent_probe)
+        assert subagent_probe.prepopulated_prompt_len == subagent_reuse
+    finally:
+        _free_if_active(manager, subagent_probe)
+        _free_if_active(manager, main_probe)
+        _free_if_active(manager, subagent_turn_2)
+        _free_if_active(manager, subagent_turn_1)
+        _free_if_active(manager, main)
+
+
+@pytest.mark.parametrize("max_num_turns", [2])
+@pytest.mark.parametrize("drop_extended_turns", [True])
+@pytest.mark.parametrize(
+    ("second_salt", "first_reuse"),
+    [
+        # Same reuse scope: the second turn extends the first, which is dropped.
+        ("a", 0),
+        # Different reuse scope: matching tokens alone do not make it an extension.
+        ("b", 7),
+    ],
+)
+def test_per_conversation_policy_drop_extended_turns_respects_reuse_scope(
+    manager: KVCacheManagerV2,
+    second_salt: str,
+    first_reuse: int,
+) -> None:
+    """Only a later turn in the same reuse scope can drop an earlier turn."""
+    first = _ContextRequest(1, list(range(8)), 8, "conv-1", cache_salt="a")
+    second = _ContextRequest(2, list(range(12)), 12, "conv-1", cache_salt=second_salt)
+    first_probe = _ContextRequest(3, list(range(8)), 8, "conv-2", cache_salt="a")
+
+    try:
+        for request in (first, second):
+            _run_context(manager, request)
+            _free_if_active(manager, request)
+
+        assert manager.prepare_context(first_probe)
+        assert first_probe.prepopulated_prompt_len == first_reuse
+    finally:
+        _free_if_active(manager, first_probe)
+        _free_if_active(manager, second)
+        _free_if_active(manager, first)
+
+
+@pytest.mark.parametrize("max_num_turns", [3])
+@pytest.mark.parametrize("drop_extended_turns", [True])
+def test_per_conversation_policy_drop_extended_turns_drops_every_extended_turn(
+    manager: KVCacheManagerV2,
+) -> None:
+    """A turn that extends several retained turns drops all of them at once."""
+    main = _ContextRequest(1, list(range(500, 508)), 8, "conv-1")
+    longer = _ContextRequest(2, list(range(12)), 12, "conv-1")
+    shorter = _ContextRequest(3, list(range(8)), 8, "conv-1")
+    extending = _ContextRequest(4, list(range(16)), 16, "conv-1")
+    main_probe = _ContextRequest(5, list(range(500, 508)), 8, "conv-2")
+    shorter_probe = _ContextRequest(6, list(range(8)), 8, "conv-3")
+
+    try:
+        for request in (main, longer, shorter, extending):
+            _run_context(manager, request)
+            _free_if_active(manager, request)
+
+        # The main turn and the extending turn remain; both prefixes are gone.
+        state = manager.conversation_manager._conversation_states["conv-1"]
+        assert [turn.num_committed_tokens for turn in state.retained_turns] == [8, 16]
+
+        assert manager.prepare_context(main_probe)
+        assert main_probe.prepopulated_prompt_len == 7
+        _free_if_active(manager, main_probe)
+
+        assert manager.prepare_context(shorter_probe)
+        assert shorter_probe.prepopulated_prompt_len == 0
+    finally:
+        _free_if_active(manager, shorter_probe)
+        _free_if_active(manager, main_probe)
+        _free_if_active(manager, extending)
+        _free_if_active(manager, shorter)
+        _free_if_active(manager, longer)
+        _free_if_active(manager, main)
+
+
+def test_prefix_digests_match_across_token_types() -> None:
+    """Integer prefixes digest the same whether or not later tokens are multimodal."""
+    text = [5, 6, 7, 8]
+    mixed = [*text, b"image-key", 9]
+    text_digests = kv_cache_v2_module._prefix_digests(kv_cache_v2_module._token_words(text), [2, 4])
+    mixed_digests = kv_cache_v2_module._prefix_digests(
+        kv_cache_v2_module._token_words(mixed), [2, 4, 6]
+    )
+    assert text_digests[2] == mixed_digests[2]
+    assert text_digests[4] == mixed_digests[4]
+    assert mixed_digests[4] != mixed_digests[6]
+    other = kv_cache_v2_module._prefix_digests(kv_cache_v2_module._token_words([5, 6, 7, 0]), [4])
+    assert other[4] != text_digests[4]
 
 
 def test_per_conversation_policy_ignores_overlapping_request(

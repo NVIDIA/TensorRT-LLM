@@ -12,6 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import array
+import hashlib
 import math
 import os
 import sys
@@ -486,17 +488,60 @@ def _request_conversation_id(request: LlmRequest) -> Optional[str]:
     return conversation_id or None
 
 
+_TOKEN_WORD_BYTES = 8
+
+
+def _token_word(token: TokenIdExt) -> int:
+    """Map one token to a signed 64-bit word; integer tokens map to themselves."""
+    if isinstance(token, int):
+        return token
+    payload = token if isinstance(token, bytes) else token.digest
+    return int.from_bytes(hashlib.blake2b(payload, digest_size=8).digest(), "little", signed=True)
+
+
+def _token_words(tokens: Sequence[TokenIdExt]) -> bytes:
+    """Encode tokens as fixed-width 64-bit words so prefixes can be sliced."""
+    try:
+        return array.array("q", tokens).tobytes()
+    except TypeError:
+        return array.array("q", (_token_word(token) for token in tokens)).tobytes()
+
+
+def _prefix_digests(words: bytes, prefix_lengths: Iterable[int]) -> Dict[int, bytes]:
+    """Digest ``words`` truncated to each prefix length (in tokens) in one pass."""
+    hasher = hashlib.blake2b(digest_size=16)
+    digests: Dict[int, bytes] = {}
+    position = 0
+    for length in sorted(set(prefix_lengths)):
+        hasher.update(words[position * _TOKEN_WORD_BYTES : length * _TOKEN_WORD_BYTES])
+        position = length
+        digests[length] = hasher.copy().digest()
+    return digests
+
+
+@dataclass(slots=True)
+class _RetainedTurn:
+    """A completed conversation turn whose committed state is still retained."""
+
+    drop_handle: PlannedDropHandle
+    # Set only with drop_extended_turns: identifies the turn's committed tokens.
+    num_committed_tokens: int = 0
+    reuse_scope: Optional[ReuseScope] = None
+    committed_digest: bytes = b""
+
+
 @dataclass(slots=True)
 class _ConversationState:
     current_request_id: Optional[int] = None
-    planned_drop_handles: deque[PlannedDropHandle] = field(default_factory=deque)
+    retained_turns: deque[_RetainedTurn] = field(default_factory=deque)
 
 
 class ConversationManager:
     """Track the current request and drop plan for each conversation."""
 
-    def __init__(self, max_num_turns: int) -> None:
+    def __init__(self, max_num_turns: int, drop_extended_turns: bool = False) -> None:
         self._max_num_turns = max_num_turns
+        self._drop_extended_turns = drop_extended_turns
         self._conversation_states: Dict[str, _ConversationState] = {}
 
     def save_drop_plan(self, request: LlmRequest, kv_cache: _KVCache) -> None:
@@ -517,11 +562,53 @@ class ConversationManager:
                 f"{conversation_id} have been dropped."
             )
         else:
-            state.planned_drop_handles.append(drop_handle)
-            if len(state.planned_drop_handles) > self._max_num_turns:
-                state.planned_drop_handles.popleft().drop()
+            # Plan the new turn before dropping older ones: pages the turns
+            # share keep a planned drop and stay reusable.
+            if self._drop_extended_turns:
+                turn = self._retain_and_drop_extended(state, drop_handle, kv_cache)
+            else:
+                turn = _RetainedTurn(drop_handle)
+            state.retained_turns.append(turn)
+            if len(state.retained_turns) > self._max_num_turns:
+                state.retained_turns.popleft().drop_handle.drop()
 
         self.finish_request(request)
+
+    @staticmethod
+    def _retain_and_drop_extended(
+        state: _ConversationState, drop_handle: PlannedDropHandle, kv_cache: _KVCache
+    ) -> _RetainedTurn:
+        """Drop the retained turns the new turn extends and describe the new turn."""
+        num_committed_tokens = kv_cache.num_committed_tokens
+        reuse_scope = kv_cache.reuse_scope
+        words = _token_words(kv_cache.committed_tokens)
+        candidates = [
+            turn
+            for turn in state.retained_turns
+            if turn.reuse_scope == reuse_scope and turn.num_committed_tokens <= num_committed_tokens
+        ]
+        digests = _prefix_digests(
+            words, [turn.num_committed_tokens for turn in candidates] + [num_committed_tokens]
+        )
+        extended = {
+            id(turn)
+            for turn in candidates
+            if digests[turn.num_committed_tokens] == turn.committed_digest
+        }
+        if extended:
+            kept: deque[_RetainedTurn] = deque()
+            for turn in state.retained_turns:
+                if id(turn) in extended:
+                    turn.drop_handle.drop()
+                else:
+                    kept.append(turn)
+            state.retained_turns = kept
+        return _RetainedTurn(
+            drop_handle,
+            num_committed_tokens=num_committed_tokens,
+            reuse_scope=reuse_scope,
+            committed_digest=digests[num_committed_tokens],
+        )
 
     def prepare_request(self, request: LlmRequest) -> None:
         """Register a context request unless its conversation has another active one."""
@@ -551,7 +638,7 @@ class ConversationManager:
             return
 
         state.current_request_id = None
-        if not state.planned_drop_handles:
+        if not state.retained_turns:
             self._conversation_states.pop(conversation_id)
 
     def clear(self) -> None:
@@ -3092,7 +3179,10 @@ class KVCacheManagerV2(BaseResourceManager):
             and self._can_publish_block_reuse
         )
         self.conversation_manager = (
-            ConversationManager(block_reuse_config.max_num_turns)
+            ConversationManager(
+                block_reuse_config.max_num_turns,
+                drop_extended_turns=block_reuse_config.drop_extended_turns,
+            )
             if enable_conversation_manager
             else None
         )
