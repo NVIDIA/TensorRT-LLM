@@ -35,6 +35,8 @@ if TYPE_CHECKING:
 
 _HEAD_DIM = 512
 _SWA_TILE = 128
+# Row 0 of a shared context bank holds no selection; stage_shared_rows zeroes it.
+_SHARED_BANK_ZERO_ROW = 0
 # The main pool's structural ceiling is 6 * 448 = 2688, which 448 * 2**3 already
 # covers, so three binades de-saturate it outright. Context spends that exponent
 # out of Q's low end (see ``_prepare_native_fp8`` below), and this caps what it
@@ -71,6 +73,39 @@ def _csa2_parent_quant_config(quant_config, native_fp8: bool):
         return quant_config
     # Rebuild rather than copy: the quantization modes are cached properties.
     return QuantConfig(**{**quant_config.model_dump(), "kv_cache_quant_algo": algo})
+
+
+def _point_padding_at_staged_rows(metadata: CSA2TrtllmMetadata) -> None:
+    """Point the -1 padding past ``prepared_lens`` at zero-filled rows of the staging pools.
+
+    The dynamic-token-sparse trtllm-gen MLA kernels still load the index entries
+    past ``sparse_attn_kv_lens`` inside the last partial KV tile (their scores
+    are masked), so a -1 entry is an address before the staging pool. Per-token
+    staging gives every token its own rows (``t * 128 + p`` in the SWA pool,
+    ``t * E + p - 128`` in the extra pool) and zero-fills the ones past its
+    selection, so each padding slot addresses its own token's row for that slot.
+    A shared context bank has no per-token rows; its row 0 is reserved and
+    zeroed by every staging, so the padding addresses that row. Native per-token
+    staging (``stage_selected_rows``) publishes this padding itself, so only the
+    shared bank and the PyTorch staging need it here.
+    """
+    indices = metadata.prepared_indices[: metadata.num_tokens]
+    if metadata.shared_plan is not None:
+        indices.masked_fill_(indices < 0, _SHARED_BANK_ZERO_ROW)
+        return
+    rows = getattr(metadata, "_csa2_padding_rows", None)
+    if rows is None:
+        capacity, width = metadata.prepared_indices.shape
+        slot = torch.arange(width, dtype=torch.int32, device=indices.device)[None, :]
+        swa = slot < _SWA_TILE
+        rows = metadata._csa2_padding_rows = (
+            torch.arange(capacity, dtype=torch.int32, device=indices.device)[:, None],
+            torch.where(swa, _SWA_TILE, max(width - _SWA_TILE, 1)).to(torch.int32),
+            torch.where(swa, slot, slot - _SWA_TILE),
+        )
+    token, stride, offset = rows
+    natural = token[: metadata.num_tokens] * stride + offset
+    torch.where(indices < 0, natural, indices, out=indices)
 
 
 class CSA2TrtllmAttention(TrtllmAttention):
@@ -478,7 +513,7 @@ class CSA2TrtllmAttention(TrtllmAttention):
                 # Q's pair is the staging pair read backwards: dequant_q = 1 / dequant_kv.
                 forward_args.kv_scale_orig_quant = stage_quant_orig
                 forward_args.kv_scale_quant_orig = stage_orig_quant
-            metadata.stage_selected(
+            padded_in_pool = metadata.stage_selected(
                 inputs,
                 kv_scale_orig_quant=stage_orig_quant,
                 kv_scale_quant_orig=stage_quant_orig,
@@ -502,7 +537,9 @@ class CSA2TrtllmAttention(TrtllmAttention):
             elif forward_args.attention_input_type == AttentionInputType.context_only:
                 forward_args.quant_scale_qkv = forward_args.kv_scale_orig_quant
         else:
-            metadata.stage_selected(inputs, main_logical=inputs.main_logical_indices)
+            padded_in_pool = metadata.stage_selected(
+                inputs, main_logical=inputs.main_logical_indices
+            )
         sparse = forward_args.sparse_runtime_params
         sparse.sparse_attn_kv_lens = metadata.prepared_lens
         sparse.aux_kv_cache_pool_ptr = (
@@ -522,6 +559,8 @@ class CSA2TrtllmAttention(TrtllmAttention):
             else metadata.swa_pool[:, 0]
         )
         forward_args.q_pe = q.view(metadata.num_tokens, self.num_heads, _HEAD_DIM)[..., 448:]
+        if not padded_in_pool:
+            _point_padding_at_staged_rows(metadata)
         return metadata.prepared_indices, None
 
     def _supports_packed(self, q, inputs, forward_args) -> bool:
