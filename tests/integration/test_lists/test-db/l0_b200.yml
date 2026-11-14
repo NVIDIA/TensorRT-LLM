@@ -100,6 +100,8 @@ l0_b200:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_prims_ts_bfloat16[bf16-kv]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_prims_ts_bfloat16[fp8-kv]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_dspark[TRTLLM] # SM100+ only; l0_h100 runs [VANILLA]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_dspark_rejection_sampling[standard-fused_chain]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_dspark_rejection_sampling[block-per_position]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_trtllm-torch_compile=True]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8_mxfp4[fp8-latency-TRTLLM]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8_mxfp4[mxfp8-latency-TRTLLM]

@@ -420,11 +420,8 @@ class CachedModelLoader:
             # repo id had no readable config.json at validation time; a local
             # path was already resolved back then.
             if was_hub_model:
-                resolve_from_checkpoint = getattr(
-                    self.llm_args.speculative_config, 'resolve_from_checkpoint',
-                    None)
-                if resolve_from_checkpoint is not None:
-                    resolve_from_checkpoint()
+                self.llm_args.speculative_config.resolve_from_checkpoint(
+                    trust_remote_code=self.llm_args.trust_remote_code)
                 # The DFlash buffer-fit check reads the drafter geometry from
                 # the same config.json, so for a hub repo id the validation
                 # pass only covered the token budget. Re-run it now that the

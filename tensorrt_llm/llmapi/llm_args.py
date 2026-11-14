@@ -98,6 +98,8 @@ SERVE_CLI_CONFIG_FIELDS = {
 if TYPE_CHECKING:
     # Runtime methods import QSA params locally to avoid loading the sparse
     # backend while llm_args is defining its public configuration models.
+    from transformers import PretrainedConfig
+
     from tensorrt_llm._torch.attention.backends.sparse.qsa import (
         QSASparseMetadataParams, QSASparseParams)
     from tensorrt_llm._torch.virtual_memory import \
@@ -2516,6 +2518,9 @@ class _MTPDraftCheckpointType(StrEnum):
     EXTERNAL_DRAFT_MODEL = "external_draft_model"
 
 
+RejectionSampleMethod = Literal["standard", "block"]
+
+
 class DecodingBaseConfig(StrictBaseModel):
     max_draft_len: Optional[NonNegativeInt] = Field(
         default=None, description="The maximum number of draft tokens.")
@@ -2605,6 +2610,17 @@ class DecodingBaseConfig(StrictBaseModel):
         "always take the argmax fast path regardless of this flag. Set to false "
         "(default) to use exact-match verification on non-greedy batches. "
         "The non-dynamic-tree one-model path requires FlashInfer.")
+
+    rejection_sample_method: RejectionSampleMethod = Field(
+        default="standard",
+        status="prototype",
+        description=
+        "Verification rule of rejection sampling (use_rejection_sampling=True). "
+        "'standard': token-level rejection sampling. 'block': block "
+        "verification (Sun et al., 2024), which judges the drafted block "
+        "jointly; lossless, and accepts at least as many tokens in expectation. "
+        "Linear-chain one-model paths only: not supported with the dynamic "
+        "tree, relaxed thinking acceptance or DSpark confidence scheduling.")
 
     allow_advanced_sampling: bool = Field(
         default=False,
@@ -2710,6 +2726,43 @@ class DecodingBaseConfig(StrictBaseModel):
                                                    None) is not None:
             if "use_rejection_sampling" not in self.model_fields_set:
                 self.use_rejection_sampling = False
+        return self
+
+    def resolve_from_checkpoint(self, trust_remote_code: bool = False) -> None:
+        """Fill checkpoint-derived fields once ``speculative_model`` is local.
+
+        Called by ``CachedModelLoader`` after it downloads a hub drafter, whose
+        ``config.json`` validation could not read. A no-op unless a config
+        reads defaults from the drafter checkpoint. ``trust_remote_code`` is
+        the user's setting for loading the drafter config.
+        """
+
+    def _rejection_options_set(self) -> List[str]:
+        """The rejection-sampling options set away from their defaults."""
+        options = []
+        if self.rejection_sample_method != "standard":
+            options.append(
+                f"rejection_sample_method={self.rejection_sample_method!r}")
+        return options
+
+    def _reject_rejection_options_with(self, setting: str) -> None:
+        """Raise when a rejection-sampling option is set with ``setting``=True.
+
+        The setting takes the drafts or their acceptance off the linear-chain
+        rejection rule the options act on.
+        """
+        options = self._rejection_options_set()
+        if options:
+            raise ValueError(f"{' and '.join(options)} is not supported with "
+                             f"{setting}=True.")
+
+    @model_validator(mode='after')
+    def validate_rejection_sampling_options(self) -> "DecodingBaseConfig":
+        """The options act only through the rejection path."""
+        options = self._rejection_options_set()
+        if options and not self.use_rejection_sampling:
+            raise ValueError(f"{' and '.join(options)} require(s) "
+                             "use_rejection_sampling=True.")
         return self
 
     @model_validator(mode='before')
@@ -3075,6 +3128,7 @@ class EagleDecodingConfig(DecodingBaseConfig):
 
         # Dynamic tree logic
         if self.use_dynamic_tree:
+            self._reject_rejection_options_with("use_dynamic_tree")
             if self.max_draft_len is None or self.max_draft_len <= 0:
                 raise ValueError(
                     "max_draft_len should be provided, which indicates the number of drafter layers"
@@ -3497,8 +3551,12 @@ class MTPDecodingConfig(DecodingBaseConfig):
             )
             self.dynamic_tree_max_topK = None
 
+        if self.use_relaxed_acceptance_for_thinking:
+            self._reject_rejection_options_with(
+                "use_relaxed_acceptance_for_thinking")
         # Dynamic tree defaults max_total_draft_tokens to topK * max_draft_len.
         if self.use_dynamic_tree:
+            self._reject_rejection_options_with("use_dynamic_tree")
             if self.max_draft_len is None:
                 raise ValueError(
                     "max_draft_len must be set when use_dynamic_tree is True")
@@ -3710,6 +3768,56 @@ def translate_speculators_dspark_config(config_dict: dict) -> dict:
     return translated
 
 
+def dflash_context_attention_window(
+        draft_config: "PretrainedConfig") -> Optional[int]:
+    """Widest context-attention window over a DFlash/DSpark drafter's layers.
+
+    Layers resolve as in ``DFlashForCausalLM``: the ``dflash_config`` SWA
+    window by ``dspark_layer_window_size``, then the HF fields. None when any
+    layer attends to its whole context, or when no layers are declared.
+    """
+    from tensorrt_llm._torch.pyexecutor.config_utils import (
+        dspark_layer_window_size, get_layer_attention_window)
+    dflash_cfg = getattr(draft_config, "dflash_config", None) or {}
+    swa_window = int(dflash_cfg.get("swa_window_size", 0) or 0)
+    use_swa = bool(dflash_cfg.get("use_swa", False)) and swa_window > 0
+    layer_types = getattr(draft_config, "layer_types", None)
+    num_layers = int(getattr(draft_config, "num_hidden_layers", 0) or 0)
+    windows = []
+    for layer_idx in range(num_layers):
+        left, _ = dspark_layer_window_size(use_swa, swa_window, layer_types,
+                                           layer_idx)
+        if left >= 0:
+            window = left + 1
+        else:
+            window = get_layer_attention_window(draft_config, layer_idx)
+        if window is None:
+            return None
+        windows.append(window)
+    return max(windows) if windows else None
+
+
+def dspark_context_attention_window(model_dir: str,
+                                    trust_remote_code: bool = False
+                                    ) -> Optional[int]:
+    """Widest context-attention window of a standalone DSpark drafter.
+
+    Reads the config the drafter is built from (``load_pretrained_config``), so
+    checkpoint formats normalize as at runtime. ``trust_remote_code`` is the
+    user's setting: a checkpoint whose config needs remote code raises without
+    it. An MLA-shaped drafter attends to its whole context, so it has no window.
+    """
+    from tensorrt_llm._torch.model_config import hf_remote_code_lock
+    from tensorrt_llm._torch.pyexecutor.config_utils import (
+        is_mla_dspark_drafter, load_pretrained_config)
+    with hf_remote_code_lock():
+        config = load_pretrained_config(model_dir,
+                                        trust_remote_code=trust_remote_code)
+    if is_mla_dspark_drafter(config):
+        return None
+    return dflash_context_attention_window(config)
+
+
 def is_lilicorr_checkpoint(architectures: Optional[List[str]],
                            dflash_config: dict) -> bool:
     """Whether a DFlash drafter checkpoint requires the LiLiCorr candidate scorer."""
@@ -3810,13 +3918,14 @@ class DFlashDecodingConfig(DecodingBaseConfig):
         self.max_total_draft_tokens = self.max_draft_len
         return self
 
-    def resolve_from_checkpoint(self) -> None:
+    def resolve_from_checkpoint(self, trust_remote_code: bool = False) -> None:
         """Fill unset fields from the draft checkpoint's ``config.json``.
 
         Must run once ``speculative_model`` names a local directory:
         ``target_layer_ids`` has no usable default, and without it no target
         hidden states are captured. Called from validation for a local path,
         and again from model loading once a HF repo id has been downloaded.
+        Reads the JSON directly, so ``trust_remote_code`` is unused here.
         """
         if self.speculative_model is None:
             return
@@ -3943,6 +4052,43 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         "read from the draft model config (dspark_markov_head_type), "
         "defaulting to \"vanilla\".")
 
+    context_recompute_tail: Optional[int] = Field(
+        default=0,
+        ge=-1,
+        status="prototype",
+        description=
+        "Prompt-tail tokens to recompute through the target forward when a "
+        "request takes a KV-cache prefix hit, so a standalone DSpark drafter "
+        "gets context K/V for reused tokens. Acceptance drops on hits with "
+        "or without a draft KV pool paired with the target's block reuse, so "
+        "the tail trades TTFT for acceptance in either layout. 0 "
+        "(default) disables it; -1 forces a full re-prefill on a hit; None "
+        "resolves from the draft model config to the drafter's attention "
+        "window when every layer's context attention is windowed, else -1 (0 "
+        "for the embedded drafter). A disaggregated context server recomputes "
+        "only when the draft layers share the target's KV cache manager, the "
+        "one layout whose draft pages reach the generation server. A smaller tail trades acceptance length for TTFT. The V2 "
+        "KV cache manager requires the all_reusable block-reuse policy; the "
+        "V1 manager requires chunked prefill and no sliding-window target "
+        "layers; otherwise the managers disable it with a warning. On "
+        "recurrent-state targets a positive tail becomes -1 (full re-prefill).")
+
+    ancestral_draft_sampling: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "Sampled drafts of a standalone drafter with a Markov head are drawn "
+        "ancestrally when the deployment drops the sampling filters "
+        "(advanced_sampling_mode='no_topk_no_topp'): each position is sampled "
+        "given the token drawn before it by a fused Triton chain, so the stored "
+        "proposals are the drafter's joint distribution, which raises "
+        "acceptance. If true, all other sampled drafts are drawn ancestrally "
+        "too, at one sampler call per draft position. False (default) chains "
+        "the Markov bias of the other sampled drafts through the greedy argmax "
+        "and samples every position at once. "
+        "Requires use_rejection_sampling=True; standalone drafters only, not "
+        "supported with confidence scheduling.")
+
     enable_confidence_scheduling: bool = Field(
         default=False,
         description=
@@ -4012,6 +4158,14 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         "kernel each name selects: MLADSparkForCausalLM.")
 
     @model_validator(mode="after")
+    def validate_ancestral_draft_sampling(self) -> "DSparkDecodingConfig":
+        """Ancestral drafting acts only on rejection-sampled drafts."""
+        if self.ancestral_draft_sampling and not self.use_rejection_sampling:
+            raise ValueError("ancestral_draft_sampling=True requires "
+                             "use_rejection_sampling=True.")
+        return self
+
+    @model_validator(mode="after")
     def validate_confidence_scheduling(self):
         if not self.enable_confidence_scheduling:
             # A static config copied from a dynamic one may keep the
@@ -4035,6 +4189,12 @@ class DSparkDecodingConfig(DecodingBaseConfig):
                 "tensorrt_llm.tools.dspark_profile_costs` or point to an "
                 "existing one; graph coverage and K are checked at engine "
                 "start.")
+        # Confidence scheduling admits greedy requests only under rejection
+        # sampling, so none of these options would ever act.
+        self._reject_rejection_options_with("enable_confidence_scheduling")
+        if self.ancestral_draft_sampling:
+            raise ValueError("ancestral_draft_sampling=True is not supported "
+                             "with enable_confidence_scheduling=True.")
         return self
 
     @model_validator(mode="after")
@@ -4053,6 +4213,65 @@ class DSparkDecodingConfig(DecodingBaseConfig):
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
+
+    def resolve_context_recompute_tail(self,
+                                       trust_remote_code: bool = False) -> None:
+        """Resolve ``context_recompute_tail: None`` from the drafter's window.
+
+        The drafter's context K/V are per-token projections of target hidden
+        states, so recomputing its attention window restores exactly its
+        inputs; an unwindowed drafter resolves to -1, the embedded one to 0.
+        Stays None until a hub drafter's ``config.json`` is downloaded
+        (``resolve_from_checkpoint`` retries). ``trust_remote_code`` is the
+        user's setting for reading the drafter config.
+        """
+        if self.context_recompute_tail is not None:
+            return
+        if self.speculative_model is None or self.draft_is_embedded_in_target:
+            self.context_recompute_tail = 0
+            return
+        draft_config_path = os.path.join(str(self.speculative_model),
+                                         "config.json")
+        if not os.path.exists(draft_config_path):
+            return
+        try:
+            window = dspark_context_attention_window(
+                str(self.speculative_model), trust_remote_code)
+        except Exception as error:
+            raise ValueError(
+                "context_recompute_tail=None resolves from the DSpark drafter "
+                f"config at {self.speculative_model}, which failed to load "
+                f"({error}). Set an explicit integer context_recompute_tail, or "
+                "trust_remote_code=True if the config needs remote code."
+            ) from error
+        self.context_recompute_tail = int(window) if window else -1
+        if window:
+            reason = f"the drafter's {window}-token attention window"
+        else:
+            reason = ("the drafter has an unwindowed layer, so a prefix-cache "
+                      "hit re-prefills the whole prompt")
+        logger.info(f"DSpark context_recompute_tail resolved to "
+                    f"{self.context_recompute_tail} ({reason}).")
+
+    def resolve_from_checkpoint(self, trust_remote_code: bool = False) -> None:
+        """Resolve ``context_recompute_tail`` once a hub repo id is downloaded.
+
+        Called by ``CachedModelLoader`` after it swaps the repo id for the
+        local directory. The embedded-vs-standalone probe was memoized against
+        the repo id, which it cannot read, so it is dropped and re-probed.
+        Only the tail is resolved here: the other checkpoint fields
+        (``target_layer_ids`` and the rest) are read from a local
+        ``config.json`` during validation, and the model loader reads them for
+        a downloaded drafter.
+        """
+        self.__dict__.pop("draft_is_embedded_in_target", None)
+        self.resolve_context_recompute_tail(trust_remote_code)
+        if self.context_recompute_tail is None:
+            logger.warning(
+                f"DSpark drafter {self.speculative_model} has no readable "
+                "config.json, so context_recompute_tail=None cannot resolve "
+                "from its attention window; the KV cache managers treat it as "
+                "-1 (a full re-prefill on every prefix-cache hit).")
 
     @functools.cached_property
     def draft_is_embedded_in_target(self) -> bool:
@@ -7372,6 +7591,13 @@ class TorchLlmArgs(BaseLlmArgs):
                 "decoding: its ragged verification windows cannot be "
                 "watermarked. Use another speculation mode or drop "
                 "watermark_config.")
+        if (self.watermark_config is not None and spec is not None and getattr(
+                spec, "rejection_sample_method", "standard") == "block"):
+            raise ValueError(
+                "watermark_config is not supported with "
+                "rejection_sample_method='block': the watermark redraws the "
+                "token after the accepted drafts from the token-level "
+                "rejection residual, which block verification does not use.")
         return self
 
     attn_backend: str = Field(
@@ -8590,6 +8816,10 @@ class TorchLlmArgs(BaseLlmArgs):
                         "DSpark block_size must equal max_draft_len; got "
                         f"block_size={spec_cfg.block_size} and "
                         f"max_draft_len={spec_cfg.max_draft_len}")
+                # Before the KV cache managers read it: an unresolved None
+                # means a full re-prefill there. A hub repo id resolves after
+                # download (resolve_from_checkpoint).
+                spec_cfg.resolve_context_recompute_tail(self.trust_remote_code)
                 if spec_cfg.enable_confidence_scheduling:
                     self._validate_dspark_confidence_environment()
 

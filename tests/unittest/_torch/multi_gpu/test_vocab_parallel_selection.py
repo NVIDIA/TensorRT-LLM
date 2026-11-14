@@ -40,6 +40,7 @@ import tensorrt_llm
 from tensorrt_llm._torch.distributed import AllReduce, AllReduceStrategy
 from tensorrt_llm._torch.distributed.allreduce_helper import CustomAllReduceHelper
 from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
+from tensorrt_llm._torch.distributed.ops import allgather
 from tensorrt_llm._torch.modules.embedding import LMHead
 from tensorrt_llm._torch.modules.linear import TensorParallelMode
 from tensorrt_llm._torch.nccl_window_graph import nccl_window_graph_capture
@@ -51,6 +52,7 @@ from tensorrt_llm._torch.speculative.vocab_parallel import (
     _PairExchange,
     _select_tokens,
     markov_chain_logits,
+    markov_sampled_chain,
     tp_pair_exchange,
 )
 from tensorrt_llm.mapping import Mapping
@@ -280,6 +282,53 @@ def _markov_check(rank, tp, mnnvl):
 
 
 @torch.inference_mode()
+def _markov_sampled_check(rank, tp, mnnvl):
+    """The sampled Markov chain draws the same tokens and stores the same proposals on every
+    rank, from the TP-gathered FP32 draft logits and BF16 Markov weights, as one GPU does
+    from the full logits."""
+    del mnnvl  # The chain runs on the gathered logits; no pair exchange is involved.
+    vocab = SHARD * tp
+    mapping = Mapping(world_size=tp, tp_size=tp, rank=rank)
+    gen = torch.Generator(device="cuda").manual_seed(13)
+    w1 = torch.randn(vocab, 256, device="cuda", generator=gen).to(torch.bfloat16)
+    w2 = (torch.randn(vocab, 256, device="cuda", generator=gen) * 0.1).to(torch.bfloat16)
+    num_reqs, block = 8, 7
+    full = torch.randn(num_reqs, block, vocab, device="cuda", generator=gen) * 3
+    anchors = torch.randint(0, vocab, (num_reqs,), device="cuda", generator=gen)
+    anchors[0] = -1  # out-of-vocab anchor: zero bias
+    temperatures = torch.tensor([0.0, 0.6, 1.0, 1.0, 1.5, 0.3, 1.0, 2.0], device="cuda")
+    seeds = torch.randint(0, 2**31, (num_reqs,), device="cuda", generator=gen)
+    offsets = torch.randint(0, 2**20, (block, num_reqs), device="cuda", generator=gen)
+    slots = torch.randperm(num_reqs + 2, device="cuda", generator=gen)[:num_reqs]
+
+    def chain(logits):
+        probs = torch.zeros(num_reqs + 2, block, vocab + 64, device="cuda")
+        tokens = markov_sampled_chain(
+            logits, anchors, w1, w2, temperatures, seeds, offsets, probs, slots
+        )
+        return tokens, probs[slots, :, :vocab]
+
+    # The worker gathers the TP-sharded draft logits before the chain.
+    gathered = allgather(_shard(full, rank).view(-1, SHARD), mapping, dim=-1)
+    tokens, probs = chain(gathered.view(num_reqs, block, vocab))
+    ref_tokens, ref_probs = chain(full)
+    assert torch.equal(tokens, ref_tokens)
+    assert torch.equal(probs.view(torch.int32), ref_probs.view(torch.int32))
+    # Every rank holds the same draws and proposals.
+    all_tokens = MPI.COMM_WORLD.allgather(tokens.cpu())
+    all_probs = MPI.COMM_WORLD.allgather(probs.cpu())
+    for other_tokens, other_probs in zip(all_tokens, all_probs):
+        assert torch.equal(other_tokens, all_tokens[0])
+        assert torch.equal(other_probs.view(torch.int32), all_probs[0].view(torch.int32))
+    # The greedy row stores its one-hot; sampled rows are normalized and hold their draws.
+    assert torch.equal(
+        probs[0], torch.nn.functional.one_hot(tokens[0].long(), vocab).to(probs.dtype)
+    )
+    torch.testing.assert_close(probs.sum(-1), torch.ones(num_reqs, block, device="cuda"))
+    assert (probs.gather(-1, tokens.long().unsqueeze(-1)) > 0).all()
+
+
+@torch.inference_mode()
 def _worker_accept_check(rank, tp, mnnvl):
     """Strict acceptance on shard logits equals acceptance on gathered logits."""
 
@@ -320,6 +369,7 @@ _CHECKS = {
     "argmax": _argmax_check,
     "sample": _sample_check,
     "markov": _markov_check,
+    "markov_sampled": _markov_sampled_check,
     "worker_accept": _worker_accept_check,
 }
 

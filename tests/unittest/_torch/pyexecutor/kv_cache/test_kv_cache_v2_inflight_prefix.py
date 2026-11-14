@@ -80,6 +80,9 @@ class _CacheManager:
     def probe_context_reuse(self, req):
         return self.reusable
 
+    def context_reuse_claim_limit(self, req):
+        return None
+
     def request_prefix_snapshot(self, owner, num_tokens):
         self.requested.append((owner.py_request_id, num_tokens))
         return self.snapshot_ok

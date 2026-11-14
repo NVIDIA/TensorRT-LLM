@@ -267,6 +267,44 @@ spec_config = MTPDecodingConfig(
 )
 ```
 
+### Rejection sampling options
+
+With `use_rejection_sampling=True`, a one-model speculative config verifies the drafts of a
+non-greedy batch by rejection sampling, which keeps the output distribution of the target with
+the request's sampling parameters. The prototype option `rejection_sample_method` on
+`DecodingBaseConfig` chooses how the drafts are judged and requires `use_rejection_sampling=True`:
+`standard` (default) is token-level rejection sampling, and `block` is block verification
+([Sun et al., 2024](https://arxiv.org/abs/2403.10444)), which judges the drafted block jointly. It
+is also lossless and accepts at least as many tokens in expectation, at the cost of a few more
+kernels per verification step.
+
+`block` is not supported with the dynamic tree (`use_dynamic_tree=True`), with relaxed
+thinking-phase acceptance (`use_relaxed_acceptance_for_thinking=True`, which accepts drafts
+without the rejection rule) or with DSpark confidence scheduling (which admits only greedy
+requests under rejection sampling); those combinations are rejected when the config is built.
+
+With a standalone DSpark drafter that has a Markov head, sampled drafts are drawn ancestrally
+when the deployment drops the sampling filters with
+`advanced_sampling_mode="no_topk_no_topp"`: each position is sampled from the drafter's
+distribution given the token drawn before it, so the stored proposals are the drafter's own
+joint distribution. A fused Triton chain draws the block with three launches per position and one
+normalization at the end; on GB300 its sampler time stayed below the block sampler's at every
+batch size measured, so the acceptance gain comes without extra per-step cost. The choice is made per deployment, not per request: under the default
+`advanced_sampling_mode="full"`, a request that sets no top-k/top-p still takes the existing
+path. `DSparkDecodingConfig.ancestral_draft_sampling=True` (prototype, off by default) extends
+ancestral drawing to all other sampled drafts, which cost one sampler call per draft position; at
+low concurrency that outweighs the acceptance gain.
+
+```python
+from tensorrt_llm.llmapi import MTPDecodingConfig
+
+spec_config = MTPDecodingConfig(
+    max_draft_len=3,
+    use_rejection_sampling=True,
+    rejection_sample_method="block",
+)
+```
+
 ## Beam search
 
 Beam search is a decoding strategy that maintains multiple candidate sequences (beams) during text generation, exploring different possible continuations to find higher quality outputs. Unlike greedy decoding or sampling, beam search considers multiple hypotheses simultaneously.

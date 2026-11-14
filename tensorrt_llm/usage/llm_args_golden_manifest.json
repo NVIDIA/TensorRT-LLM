@@ -1823,6 +1823,11 @@
       "path": "speculative_config.allow_advanced_sampling"
     },
     {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "speculative_config.ancestral_draft_sampling"
+    },
+    {
       "allowed_values": [
         "VANILLA",
         "TRTLLM",
@@ -2023,6 +2028,15 @@
       "capture_policy": "int|none",
       "kind": "value",
       "path": "speculative_config.num_nextn_predict_layers"
+    },
+    {
+      "allowed_values": [
+        "standard",
+        "block"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "speculative_config.rejection_sample_method"
     },
     {
       "capture_policy": "float",

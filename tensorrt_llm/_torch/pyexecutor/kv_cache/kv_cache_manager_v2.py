@@ -2045,6 +2045,12 @@ class KVCacheManagerV2(BaseResourceManager):
         return cls is KVCacheManagerV2
 
     @property
+    def spec_recompute_tail(self) -> int:
+        """Prompt-tail tokens recomputed on a prefix hit for a hidden-state
+        drafter: 0 off, -1 the whole prompt."""
+        return self._spec_recompute_tail
+
+    @property
     def _kv_alloc_extra_tokens(self) -> int:
         """Tokens a request is allocated beyond its history for spec decoding.
 
@@ -6325,28 +6331,38 @@ class KVCacheManagerV2(BaseResourceManager):
         """Pending recovery rows fixed at resume; None keeps ordinary budgeting."""
         return None
 
+    def context_reuse_claim_limit(self, req: LlmRequest) -> int | None:
+        """Reuse-claim cap that leaves ``req`` its spec recompute tail, or None.
+
+        The claim is capped rather than the cursor rewound afterwards: a capped
+        claim is a shorter match, so the core materializes every page the
+        recompute needs (SWA life cycles onboard only the sink and live-window
+        pages at the matched endpoint). The tail check runs first: partially
+        constructed managers carry only the class-level zero tail.
+
+        A context-only (disaggregated) request is not capped unless the
+        drafter's layers share this manager: only then are its draft pages
+        transferred with the target's; otherwise the generation worker's
+        drafter starts from an empty context whatever the context server
+        recomputes.
+        """
+        if not self._spec_recompute_tail:
+            return None
+        if req.is_context_only_request and not self._shared_draft_block_width:
+            return None
+        return _spec_recompute_claim_limit(
+            req,
+            tail=self._spec_recompute_tail,
+            tokens_per_block=self.tokens_per_block,
+            is_draft=self.is_draft,
+        )
+
     def prepare_context(self, req: LlmRequest) -> bool:
         """Create/resume the cache and expose local or reserved reuse before budgeting."""
         assert not req.is_disagg_generation_init_state, (
             f"req {req.py_request_id}: use prepare_disagg_gen_init"
         )
-        # Hidden-state drafters need a recomputed prompt tail: cap the reuse
-        # CLAIM rather than rewinding the cursor afterwards. A capped claim is
-        # just a shorter match, so the core materializes every page the
-        # recompute needs (for SWA life cycles only sink and live-window pages
-        # at the matched endpoint are onboarded; a cursor rewound below that
-        # endpoint would read and write spans with no pages behind them). The
-        # tail check runs first: partially constructed managers carry only the
-        # class-level zero tail.
-        limit = None
-        if self._spec_recompute_tail:
-            limit = _spec_recompute_claim_limit(
-                req,
-                tail=self._spec_recompute_tail,
-                tokens_per_block=self.tokens_per_block,
-                is_draft=self.is_draft,
-            )
-        reused = self.prepare_context_cache(req, limit)
+        reused = self.prepare_context_cache(req, self.context_reuse_claim_limit(req))
         if reused is None:
             return False
         # First chunk only: num_committed_tokens holds at the initial prefix
@@ -6878,12 +6894,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # local reuse does. Cap the reservation at the same claim limit, so
         # the recomputed tail stays local by construction; a full-re-prefill
         # tail (-1) caps to zero and releases the reservation below.
-        limit = _spec_recompute_claim_limit(
-            req,
-            tail=self._spec_recompute_tail,
-            tokens_per_block=self.tokens_per_block,
-            is_draft=self.is_draft,
-        )
+        limit = self.context_reuse_claim_limit(req)
         if limit is not None:
             end = min(end, limit)
         if end <= local_end:
@@ -6976,6 +6987,14 @@ class KVCacheManagerV2(BaseResourceManager):
             req, local_end
         )
         offered_end = min(local_end + num_tokens, req.prompt_len - 1)
+        # A connector-served prefix starves a hidden-state drafter like local
+        # reuse does: leave the spec recompute tail to the forward pass.
+        # Defensive today: startup rejects a KV connector with speculative
+        # decoding on this manager (py_executor.py), so a tail never meets a
+        # connector offer until that guard is lifted.
+        limit = self.context_reuse_claim_limit(req)
+        if limit is not None:
+            offered_end = min(offered_end, max(limit, local_end))
 
         position = local_end
         if offered_end > local_end:

@@ -1070,7 +1070,8 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         A first-chunk request has not claimed its reusable prefix yet, so its
         remaining length still counts it; the prefix is probed once per
-        scheduling pass, without claiming pages.
+        scheduling pass, without claiming pages, and capped like the claim
+        (``context_reuse_claim_limit``).
         """
         remaining = req.context_remaining_length
         if not req.is_first_context_chunk:
@@ -1080,6 +1081,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         reusable = self._reuse_probes[req.py_request_id]
         if reusable is None:
             return remaining
+        limit = self.kv_cache_manager.context_reuse_claim_limit(req)
+        if limit is not None:
+            reusable = min(reusable, limit)
         return remaining - min(max(reusable - req.context_current_position, 0), remaining)
 
     def _order_ctx_shortest_first(self, pending_ctx: RequestList) -> RequestList:
@@ -1731,15 +1735,21 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         Doing this up front rather than claim-then-reconcile keeps the mismatch
         path (free the draft pages and re-claim shallower) off the common case.
+
+        The target's spec recompute tail (``context_reuse_claim_limit``) caps the
+        common depth too: the unpaired path applies it in ``prepare_context``,
+        which a paired first chunk does not go through.
         """
         draft_manager = self._joint_draft_manager
         if draft_manager is None:
             return None
+        tail_limit = self.kv_cache_manager.context_reuse_claim_limit(req)
         draft_match = draft_manager.probe_context_reuse(req)
         target_match = self.kv_cache_manager.probe_context_reuse(req)
         if draft_match is None or target_match is None:
-            return None
-        return min(draft_match, target_match)
+            return tail_limit
+        common = min(draft_match, target_match)
+        return common if tail_limit is None else min(common, tail_limit)
 
     def _admit_unpaired_draft(self, req: LlmRequest) -> bool:
         """Create and resume an unpaired draft mirror as part of admitting *req*.

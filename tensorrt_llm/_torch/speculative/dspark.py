@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 
 from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -37,7 +38,7 @@ from ..pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
 from .dflash import DFlashWorker, VocabParallelDraftTokens, dflash_draft_slot_ids
 from .dspark_schedule import NEUTRAL_CONFIDENCE_LOGIT
 from .interface import SpecMetadata, SpecWorkerBase
-from .vocab_parallel import tp_pair_exchange
+from .vocab_parallel import markov_sampled_chain, tp_pair_exchange
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import DSparkDecodingConfig
@@ -1342,6 +1343,141 @@ class DSparkWorker(DFlashWorker):
             local_block, inputs["first_prev_tokens"], draft_model.markov_w1, draft_model.markov_w2
         )
 
+    def _sample_block_draft_tokens(
+        self,
+        draft_model: torch.nn.Module,
+        gen_logits: torch.Tensor,
+        gen_hidden_states: torch.Tensor,
+        inputs: dict,
+        spec_metadata: SpecMetadata,
+        num_contexts: int,
+        batch_size: int,
+    ) -> tuple[torch.Tensor, int]:
+        """Draw sampled drafts ancestrally through the Markov head.
+
+        Position k is drawn by the seeded draft sampler from
+        ``base_k + bias(d_{k-1})`` under the request's draft sampling
+        parameters (:meth:`_draft_sampling_params`), ``d_{k-1}`` being the
+        token drawn before it (the anchor for k = 0), and that distribution is
+        stored as the position's proposal in ``draft_probs``. ``gen_logits`` are the
+        raw ``[num_gens, K, vocab]`` block logits. Returns the ``[num_gens, K]``
+        int32 draft tokens and the stored vocab width. When the deployment drops
+        the sampling filters (the ``NO_TOPK_NO_TOPP`` sampling mode) drafts take the fused
+        :func:`markov_sampled_chain`; other sampled drafts take a per-position
+        sampler loop and only with ``ancestral_draft_sampling``. Otherwise,
+        without a Markov head, for argmax drafts, or for a drafter that also
+        carries a DFlash 2 candidate scorer (LiLiCorr or the selector), the DFlash path
+        (greedy-chained :meth:`_refine_block_logits`, then the scorer and the
+        block sampler) applies.
+        """
+        has_candidate_scorer = getattr(draft_model, "lilicorr", None) is not None or getattr(
+            draft_model, "has_candidate_selector", False
+        )
+        # Deploy-time unfiltered drafts take the fused chain, which costs no more
+        # than the block sampler, so they are drawn ancestrally without the option.
+        fused_chain = (
+            gen_logits.is_cuda
+            and spec_metadata.advanced_sampling_mode is AdvancedSamplingMode.NO_TOPK_NO_TOPP
+        )
+        if not (
+            (self.spec_config.ancestral_draft_sampling or fused_chain)
+            and getattr(draft_model, "has_markov_head", False)
+            and spec_metadata.wants_advanced_draft_sampling
+            and not has_candidate_scorer
+        ):
+            return super()._sample_block_draft_tokens(
+                draft_model,
+                gen_logits,
+                gen_hidden_states,
+                inputs,
+                spec_metadata,
+                num_contexts,
+                batch_size,
+            )
+        from ..models.modeling_speculative import markov_prev_embeddings
+
+        num_gens, num_drafts, _ = gen_logits.shape
+        # The chain indexes the full Markov table, and verification reads
+        # full-vocab proposals.
+        gen_logits = self.maybe_gather_sharded_draft_logits(gen_logits, spec_metadata)
+        vocab = gen_logits.shape[-1]
+        # CUDA-graph padding requests decode from uninitialized state; zero their
+        # rows, as advanced_sample_draft_block does, so every draw is legal.
+        gen_logits = self._zero_padding_rows(
+            gen_logits.reshape(num_gens * num_drafts, vocab),
+            spec_metadata,
+            num_contexts,
+            batch_size,
+            num_drafts,
+        ).reshape(num_gens, num_drafts, vocab)
+        sampling_params = self._draft_sampling_params(spec_metadata, num_contexts, batch_size)
+        draft_probs = spec_metadata.draft_probs
+        slots = (
+            None if draft_probs is None else spec_metadata.batch_slot_ids[num_contexts:batch_size]
+        )
+
+        markov_w1, markov_w2 = draft_model.markov_w1, draft_model.markov_w2
+        # The K positions draw from consecutive RNG slots (rng_draft_slot(k)):
+        # one RNG-state call returns all K offsets, laid out [K, num_gens],
+        # rather than one call per step.
+        seed = spec_metadata.request_seeds[num_contexts:batch_size]
+        offsets = self._rng_state_per_request(
+            spec_metadata,
+            num_contexts,
+            batch_size,
+            repeat=num_drafts,
+            slot=spec_metadata.rng_draft_slot(0),
+        )[1]
+        offsets = offsets.view(num_gens, num_drafts).t().contiguous()
+        if fused_chain:
+            # No filter applies: the fused Gumbel-max chain draws every
+            # position and stores its softmax in a few launches per position.
+            probs_out = (
+                gen_logits.new_empty((num_gens, num_drafts, vocab), dtype=torch.float32)
+                if draft_probs is None
+                else draft_probs
+            )
+            tokens = markov_sampled_chain(
+                gen_logits,
+                inputs["first_prev_tokens"],
+                markov_w1,
+                markov_w2,
+                sampling_params[0],
+                seed,
+                offsets,
+                probs_out,
+                slots,
+            )
+            if draft_probs is not None:
+                spec_metadata.draft_probs_last_dim = vocab
+            return tokens, vocab
+        # Only the anchor can be out of vocab (-1 for a row with no accepted
+        # token); every token drawn below is a valid row of the table.
+        emb = markov_prev_embeddings(inputs["first_prev_tokens"], markov_w1)
+        drawn = []
+        for step in range(num_drafts):
+            # The add promotes the Markov head's (bf16) bias to the float32
+            # logits itself; the trailing cast only acts on a head wider than
+            # the logits, so no separate cast kernel runs otherwise.
+            step_logits = (gen_logits[:, step] + torch.nn.functional.linear(emb, markov_w2)).to(
+                gen_logits.dtype
+            )
+            tokens, probs = self._sample_from_logits_with_probs(
+                spec_metadata.advanced_sampling_mode,
+                step_logits,
+                *sampling_params,
+                seed=seed,
+                offset=offsets[step],
+            )
+            if slots is not None:
+                draft_probs[slots, step, :vocab] = probs
+            drawn.append(tokens)
+            if step + 1 < num_drafts:
+                emb = torch.nn.functional.embedding(tokens, markov_w1)
+        if draft_probs is not None:
+            spec_metadata.draft_probs_last_dim = vocab
+        return torch.stack(drawn, dim=1).to(torch.int32), vocab
+
     def _refine_block_logits(
         self,
         draft_model,
@@ -1372,8 +1508,7 @@ class DSparkWorker(DFlashWorker):
         logits, where prev_0 is the anchor (last accepted) token and prev_{i>0}
         is the greedy token from step i-1's biased logits. Greedy per-position
         argmax of the returned logits therefore reproduces the reference
-        sampled chain; the rejection-sampling path samples from the same
-        biased distributions (proposal conditioned on the greedy chain).
+        chain.
 
         A TP vocab-sharded draft lm_head yields this rank's vocab shard of the
         logits; the chain then takes each step's global argmax over the TP

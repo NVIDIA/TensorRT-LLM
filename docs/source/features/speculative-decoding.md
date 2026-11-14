@@ -221,6 +221,43 @@ that cannot be transferred with the target's. When the layers are shared, the
 worker log reports `target and draft KV layers share one KV cache manager` at
 startup.
 
+#### Prefix-cache hits (`context_recompute_tail`)
+
+DFlash and standalone DSpark drafters attend to K/V projected from target hidden states, and
+the target only produces hidden states for tokens it runs a forward on. With KV-cache block
+reuse on, a request that hits a cached prefix skips those tokens, so the drafter sees only the
+uncached tail of its prompt and the acceptance length drops on every hit. A draft KV pool paired
+with the target's block reuse, separate or sharing the target's KV cache manager (above), hands
+the reused prefix's draft K/V back with the target's pages, but acceptance still drops on hits:
+on MiniMax-M3.1-Flash with 8000-token prompts, cold AL 4.56 fell to 4.10 on repeats at tail `0`
+and to 4.35 at the drafter's window, the same for both pool layouts. The tail trades TTFT for
+acceptance in either layout.
+
+`context_recompute_tail` (on `DFlashDecodingConfig` and `DSparkDecodingConfig`) caps the reuse
+claim so the target recomputes the last tokens of the prompt:
+
+* `0` (default): no recompute; the full cached prefix is reused.
+* a positive `N`: the last `N` prompt tokens are recomputed, rounded so the reused prefix ends on
+  a block boundary. A tail of the drafter's attention window gives the drafter the inputs it
+  would see without reuse; the recomputed target K/V can still differ numerically from a cold
+  prefill, so the output need not match it token for token.
+* `-1`: a prefix hit re-prefills the whole prompt.
+* `null`: resolved from the drafter config, differently per drafter:
+  * DSpark checks each layer: the tail is the widest attention window over the layers, or `-1`
+    when any layer uses full attention or the drafter is MLA-shaped (`0` for the embedded
+    DeepSeek-V4 drafter).
+  * DFlash reads only the drafter-wide `dflash_config.use_swa` and `swa_window_size`: the tail is
+    `swa_window_size` when `use_swa` is set, else `-1`. Per-layer `layer_types` are not
+    consulted, so a DFlash drafter that mixes sliding-window and full-attention layers resolves to
+    the window; set `-1` explicitly for it.
+
+The recomputed tokens cost TTFT and prefill throughput on every hit and are not loaded from a
+KV connector. A disaggregated context server recomputes only when the draft layers share the
+target's KV cache manager, since only then do its draft pages reach the generation server. The
+`KVCacheManagerV2` requires the `all_reusable` block-reuse policy; the V1 manager requires
+chunked prefill and no sliding-window target layers. Otherwise the managers disable the tail with
+a warning.
+
 [DFlash 2](https://inco.ai/blog/dflash2/) is also supported. The same `DFlashDecodingConfig` can be used for DFlash 2; no extra arguments are required.
 
 [LiLiCorr](https://arxiv.org/abs/2608.20530) checkpoints use the same

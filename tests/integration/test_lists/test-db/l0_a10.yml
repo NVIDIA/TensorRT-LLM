@@ -49,6 +49,7 @@ l0_a10:
   - unittest/_torch/pyexecutor/kv_cache/test_kv_cache_v2_adp_dummy_draft_rollback.py
   - unittest/_torch/pyexecutor/connectors/test_kv_cache_layout.py
   - unittest/_torch/pyexecutor/kv_cache/test_kv_connector_v2_prefix_real_manager.py
+  - unittest/_torch/speculative/test_dspark_recompute_tail_claim.py
   - unittest/_torch/pyexecutor/test_error_classification.py
   - unittest/_torch/pyexecutor/test_resource_manager.py
   - unittest/_torch/pyexecutor/test_profile_endpoints.py
