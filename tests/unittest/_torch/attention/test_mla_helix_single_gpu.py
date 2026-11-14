@@ -209,8 +209,11 @@ def test_helix_v_up_commutes_with_combine(num_tokens: int):
         reference = torch.empty(
             num_tokens, heads_per_rank, v_head_dim, device="cuda", dtype=torch.bfloat16
         )
+        # Keep the reference input dense for the SM120/121 cuBLAS path.
         torch.ops.trtllm.bmm_out(
-            latent.transpose(0, 1), v_shard.transpose(1, 2), reference.transpose(0, 1)
+            latent.transpose(0, 1).contiguous(),
+            v_shard.transpose(1, 2),
+            reference.transpose(0, 1),
         )
         result = torch.ops.trtllm.helix_post_process_native(
             gather(projected, rank, v_head_dim).contiguous(), gathered_stats.contiguous(), 1.0, 1
