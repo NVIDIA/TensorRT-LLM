@@ -3,6 +3,7 @@
 """Checkpoint naming, weight sharding, and FP8 loading for the Kimi Linear model."""
 
 import copy
+import itertools
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -23,6 +24,7 @@ from tensorrt_llm._torch.models.modeling_kimi_linear import (  # noqa: E402
 )
 from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention
 from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.pyexecutor.model_loader import initialize_dummy_weights  # noqa: E402
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
@@ -418,6 +420,33 @@ def test_kda_load_preserves_checkpoint_shards_and_fused_outputs(tp_size, tp_rank
             getattr(attention, name).weight.untyped_storage().data_ptr()
             == attention.qkvg_proj.weight.untyped_storage().data_ptr()
         )
+
+
+def _structure(model: nn.Module) -> dict:
+    """Each module's type, and the shape and dtype of each tensor by name: parameters,
+    buffers, and the tensors a module keeps as plain attributes (the KDA's fused decode
+    and convolution weights)."""
+    structure = {}
+    for name, module in model.named_modules():
+        structure[name] = type(module)
+        for attr, value in vars(module).items():
+            tensors = value if isinstance(value, tuple) else (value,)
+            if tensors and all(isinstance(tensor, torch.Tensor) for tensor in tensors):
+                structure[f"{name}.{attr}"] = [(tensor.shape, tensor.dtype) for tensor in tensors]
+    for name, tensor in itertools.chain(model.named_parameters(), model.named_buffers()):
+        structure[name] = (tensor.shape, tensor.dtype)
+    return structure
+
+
+@_requires_fp8_gpu
+@pytest.mark.parametrize("kda", [True, False])
+def test_dummy_weights_finalize_as_a_checkpoint_load(kda):
+    """Dummy weights leave the modules and derived tensors a checkpoint load leaves."""
+    loaded = _model(kda=kda)
+    loaded.load_weights(_checkpoint(loaded))
+    dummy = _model(kda=kda)
+    initialize_dummy_weights(dummy)
+    assert _structure(dummy) == _structure(loaded)
 
 
 @_requires_fp8_gpu

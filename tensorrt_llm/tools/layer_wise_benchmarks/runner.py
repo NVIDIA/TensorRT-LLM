@@ -495,15 +495,6 @@ class Runner:
                 checkpoint_dir=pretrained_model_name_or_path, checkpoint_loader=checkpoint_loader
             )
 
-        finalize_weight_load = getattr(model, "_finalize_weight_load", None)
-        if load_format == "DUMMY" and finalize_weight_load is not None:
-            # Models that build decode fast-path constants at the end of
-            # `load_weights` never get them under DUMMY, and then silently run a
-            # reference path instead (Kimi K3's KDA decode: ~70 us/layer of glue
-            # around a ~5 us kernel). Run the hook so DUMMY measures the same
-            # kernels as a real load. The arguments only feed a log line.
-            finalize_weight_load(0, 0)
-
         def forward(position_ids, hidden_states, attn_metadata, residual, **kwargs):
             # TODO: to be more general, we should call DecoderModel.forward
             for layer_idx in layer_indices:
