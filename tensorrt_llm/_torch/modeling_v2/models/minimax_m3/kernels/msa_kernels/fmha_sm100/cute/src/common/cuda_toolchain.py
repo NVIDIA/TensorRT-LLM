@@ -27,7 +27,7 @@ that may turn out to be wrong.
 import functools
 import os
 import shutil
-import subprocess
+import subprocess  # nosec B404
 import tempfile
 
 __all__ = [

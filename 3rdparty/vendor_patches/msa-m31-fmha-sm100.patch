@@ -3684,7 +3684,7 @@ index 52e6a198a8fb8ed0a31d0910a1edf7590159dc01..ceef6a36e081c83bfdc42a6be303db77
  @dataclass(frozen=True)
 diff --git a/cute/src/common/cuda_toolchain.py b/cute/src/common/cuda_toolchain.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..e7a7cc113dbabc4855d95bc1b1991a7274cc6025
+index 0000000000000000000000000000000000000000..5c76253230c1eafd07792ec319aeee751a87aead
 --- /dev/null
 +++ b/cute/src/common/cuda_toolchain.py
 @@ -0,0 +1,170 @@
@@ -3717,7 +3717,7 @@ index 0000000000000000000000000000000000000000..e7a7cc113dbabc4855d95bc1b1991a72
 +import functools
 +import os
 +import shutil
-+import subprocess
++import subprocess  # nosec B404
 +import tempfile
 +
 +__all__ = [
@@ -8881,7 +8881,7 @@ index 6d13fa9804b58f797f8849784784bc91e9475e69..1d79fcbaa09bfb8e68dc3f8ce192ffd8
          loaded = try_load_aot(key)
          if loaded is not None:
 diff --git a/jit.py b/jit.py
-index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..807546650e790b0265761f1eb11ff8a6085b2d88 100644
+index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..c7345b0dcec7d8958288f46a6ea348746181b6fa 100644
 --- a/jit.py
 +++ b/jit.py
 @@ -1,4 +1,5 @@
@@ -8890,7 +8890,7 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..807546650e790b0265761f1eb11ff8a6
  # SPDX-License-Identifier: MIT
  
  """Per-variant lazy JIT compilation for FMHA varlen kernels.
-@@ -6,13 +7,16 @@
+@@ -6,15 +7,18 @@
  Each FMHA variant (dtype x tile x sparse x page x split_kv x pack_factor) is compiled
  independently on first use and cached to ~/.cache/minfer/fmha_sm100/.
  
@@ -8906,8 +8906,11 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..807546650e790b0265761f1eb11ff8a6
  import os
 +import re
  import shutil
- import subprocess
+-import subprocess
++import subprocess  # nosec B404
  import threading
+ from pathlib import Path
+ 
 @@ -22,11 +26,115 @@ import jinja2
  
  logger = logging.getLogger(__name__)
@@ -9296,11 +9299,13 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..807546650e790b0265761f1eb11ff8a6
          so_path = cache_dir / f"{variant_name}.so"
  
          if so_path.exists():
-@@ -363,7 +625,7 @@ build {so_path}: nvcc_link {inst_obj} {run_obj}
+@@ -362,8 +624,8 @@ build {so_path}: nvcc_link {inst_obj} {run_obj}
+         (cache_dir / "build.ninja").write_text(ninja_content)
  
      def _run_ninja(self, cache_dir):
-         result = subprocess.run(
+-        result = subprocess.run(
 -            ["ninja", "-j1"],
++        result = subprocess.run(  # nosec B607
 +            ["ninja", "-j2"],
              cwd=str(cache_dir),
              capture_output=True,
@@ -9320,6 +9325,15 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..807546650e790b0265761f1eb11ff8a6
      so_path = cache_dir / "fmha_sm100_plan.so"
  
      if so_path.exists():
+@@ -434,7 +698,7 @@ build {so_path}: nvcc_link {obj}
+ """
+     (cache_dir / "build.ninja").write_text(ninja_content)
+ 
+-    result = subprocess.run(
++    result = subprocess.run(  # nosec B607
+         ["ninja", "-j1"],
+         cwd=str(cache_dir),
+         capture_output=True,
 @@ -455,11 +719,14 @@ def _compile_plan_only():
  
  def _compile_plan_module():
@@ -9362,6 +9376,15 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..807546650e790b0265761f1eb11ff8a6
      so_path = cache_dir / "sparse_topk_select.so"
  
      if so_path.exists():
+@@ -530,7 +803,7 @@ build {so_path}: nvcc_link {obj}
+ """
+     (cache_dir / "build.ninja").write_text(ninja_content)
+ 
+-    result = subprocess.run(
++    result = subprocess.run(  # nosec B607
+         ["ninja", "-j1"],
+         cwd=str(cache_dir),
+         capture_output=True,
 @@ -553,11 +826,19 @@ def get_sparse_topk_module():
      with _sparse_topk_lock:
          if _sparse_topk_module is not None:
@@ -9397,6 +9420,15 @@ index fa63a02628c20e1ab1324ba52cc4497adcbfe7cd..807546650e790b0265761f1eb11ff8a6
      so_path = cache_dir / "fmha_sm100_reduction.so"
  
      if so_path.exists():
+@@ -615,7 +897,7 @@ build {so_path}: nvcc_link {obj}
+ """
+     (cache_dir / "build.ninja").write_text(ninja_content)
+ 
+-    result = subprocess.run(
++    result = subprocess.run(  # nosec B607
+         ["ninja", "-j1"],
+         cwd=str(cache_dir),
+         capture_output=True,
 @@ -638,11 +920,19 @@ def get_reduction_module():
      with _reduction_lock:
          if _reduction_module is not None:

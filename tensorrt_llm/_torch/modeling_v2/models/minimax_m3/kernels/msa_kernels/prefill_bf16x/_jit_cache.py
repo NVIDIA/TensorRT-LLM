@@ -37,7 +37,7 @@ import logging
 import os
 import platform
 import shutil
-import subprocess
+import subprocess  # nosec B404
 import tempfile
 import threading
 from functools import cached_property
@@ -289,7 +289,7 @@ class Recipe:
 def ninja_deps(build_dir: Path) -> dict[str, list[str]]:
     """``{object relative to build_dir: [absolute real paths it was compiled from]}``, from the
     deps ninja recorded for the rules declared with ``deps = gcc``."""
-    result = subprocess.run(["ninja", "-t", "deps"], cwd=build_dir, capture_output=True,
+    result = subprocess.run(["ninja", "-t", "deps"], cwd=build_dir, capture_output=True,  # nosec B607
                             text=True, check=True)
     deps: dict[str, list[str]] = {}
     current = None
@@ -305,7 +305,7 @@ def ninja_deps(build_dir: Path) -> dict[str, list[str]]:
 
 
 def run_ninja(build_dir: Path, label: str, jobs: int = 1) -> None:
-    result = subprocess.run(["ninja", f"-j{jobs}"], cwd=build_dir, capture_output=True,
+    result = subprocess.run(["ninja", f"-j{jobs}"], cwd=build_dir, capture_output=True,  # nosec B607
                             text=True, check=False)
     if result.returncode != 0:
         raise RuntimeError(f"{label} compilation failed:\n"
