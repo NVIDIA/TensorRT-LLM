@@ -536,6 +536,11 @@ class DecoderCudaGraphs:
             return "LoRA CUDA graphs tune their kernels in the warmup-only pass"
         if self._flashinfer_mxfp8_autotune_methods():
             return "FlashInfer MXFP8 decode GEMMs tune their tactics in the warmup-only pass"
+        from tensorrt_llm._torch.modules.linear import cuda_graph_gemm_tuning_enabled
+
+        # cuda_graph_gemm_tuning ignores the knob on more than one rank.
+        if cuda_graph_gemm_tuning_enabled() and self.mapping.world_size == 1:
+            return "TLLM_CUDA_GRAPH_GEMM_TUNING tunes the GEMMs in the warmup-only pass"
         if not self.supports_single_pass_capture:
             return f"{type(self).__name__} relies on the warmup-only pass"
         if self._agreement.is_distributed_forward() and self._agreement.allgather() is None:
