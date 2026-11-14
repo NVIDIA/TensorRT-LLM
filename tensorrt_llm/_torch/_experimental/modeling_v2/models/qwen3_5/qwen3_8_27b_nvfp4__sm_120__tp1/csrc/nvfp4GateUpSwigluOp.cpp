@@ -54,6 +54,8 @@ std::vector<at::Tensor> nvfp4_gate_up_swiglu_nvfp4(at::Tensor const& mat1, at::T
     CHECK_INPUT(outScale, at::ScalarType::Float);
     TORCH_CHECK(mat1.dim() == 2 && mat2.dim() == 2, "mat1 and mat2 must be matrices");
     TORCH_CHECK(mat1.sizes()[1] == mat2.sizes()[1], "K mismatch");
+    // Select the operands' device first: getSMVersion() reads the current device.
+    at::cuda::OptionalCUDAGuard const deviceGuard(device_of(mat1));
     TORCH_CHECK(tensorrt_llm::common::getSMVersion() / 10 == 12, "nvfp4_gate_up_swiglu_nvfp4 requires SM12x");
     TORCH_CHECK(tile >= 0 && tile <= 2, "tile must be 0, 1 or 2, got ", tile);
     int64_t const m = mat1.sizes()[0];
@@ -63,7 +65,6 @@ std::vector<at::Tensor> nvfp4_gate_up_swiglu_nvfp4(at::Tensor const& mat1, at::T
     int64_t const d = n / 2;
     int64_t const mPad = (m + 127) / 128 * 128;
     int64_t const numKTiles = (d / 16 + 3) / 4;
-    at::cuda::OptionalCUDAGuard const deviceGuard(device_of(mat1));
     at::Tensor fp4 = at::detail::empty_cuda({m, d / 2}, at::ScalarType::Byte, mat1.device(), std::nullopt);
     at::Tensor sf = at::detail::empty_cuda({mPad * numKTiles * 4}, at::ScalarType::Byte, mat1.device(), std::nullopt);
     if (m == 0)

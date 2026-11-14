@@ -40,9 +40,9 @@ rows are the ones an unsliced step computes.
 
 Numerics relative to the built-in model: the FP8 projections run NVFP4 copies of their
 weights; attention reads an fp8 KV cache; the recurrent state is int16 rows; the context
-softmax is base-2 `ex2.approx`; the cascade prefix pass runs FP8 Q/P; the GDN decode
-normalizes q/k as `x / (sqrt(sum x^2) + 1e-6)`. The accuracy gate in
-`tests/integration/defs/accuracy/modeling_v2/test_qwen3_5.py` certifies the whole.
+softmax is base-2 `ex2.approx`; the cascade prefix pass runs FP8 Q/P. The accuracy gate in
+`tests/integration/defs/accuracy/modeling_v2/qwen3_5/qwen3_8_27b_nvfp4__sm_120__tp1/test_accuracy.py`
+certifies the whole.
 """
 
 from __future__ import annotations
@@ -1034,10 +1034,16 @@ class _LMHead(nn.Module):
         return _marlin(core.copies["lm_mw"], hidden_states, rows, launch_hint=0)
 
 
-def _carries_media(params) -> bool:
-    """A request's multimodal params hold pixels or encoder embeddings, not only the mRoPE
+_TEXT_ONLY = (
+    "the qwen3_5 modeling_v2 target serves text only; image and video requests need "
+    "modeling_v2='off'"
+)
+
+
+def _carries_media(data) -> bool:
+    """A request's multimodal data holds pixels or encoder embeddings, not only the mRoPE
     bookkeeping a text request of a vision-language checkpoint can carry."""
-    data = getattr(params, "multimodal_data", None) or {}
+    data = data or {}
     return (
         data.get("image", {}).get("pixel_values") is not None
         or data.get("video", {}).get("pixel_values_videos") is not None
@@ -1075,6 +1081,12 @@ class ModelingV2Qwen3827BNvfp4Sm120Tp1(
         self.lm_head = _LMHead(self.model)
         self.logits_processor = LogitsProcessor()
 
+    def validate_request(self, request) -> None:
+        """Admission check, run by the executor on every new request: an image or video
+        request fails here as its own error; a text request returns at once."""
+        if _carries_media(getattr(request, "py_multimodal_data", None)):
+            raise ValueError(_TEXT_ONLY)
+
     def forward(
         self,
         attn_metadata: AttentionMetadata,
@@ -1087,11 +1099,13 @@ class ModelingV2Qwen3827BNvfp4Sm120Tp1(
         **kwargs,
     ):
         assert spec_metadata is None, "this target implements no speculative decoding"
-        if any(_carries_media(p) for p in kwargs.get("multimodal_params") or ()):
-            raise ValueError(
-                "the qwen3_5 modeling_v2 target serves text only; image and video requests "
-                "need modeling_v2='off'"
-            )
+        # Backstop only: `validate_request` refuses media at admission, where the error
+        # fails that one request instead of the whole step.
+        if any(
+            _carries_media(getattr(p, "multimodal_data", None))
+            for p in kwargs.get("multimodal_params") or ()
+        ):
+            raise ValueError(_TEXT_ONLY)
         self.model.begin_step(
             attn_metadata,
             input_ids,

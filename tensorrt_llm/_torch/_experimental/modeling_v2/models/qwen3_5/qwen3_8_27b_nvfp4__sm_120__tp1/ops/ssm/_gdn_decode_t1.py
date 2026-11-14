@@ -7,8 +7,8 @@ Both are specializations of the generic ``fused_sigmoid_gating_delta_rule_update
 for pure decode: the same math in the same order (sigmoid / softplus gating, in-kernel
 q/k L2 norm, fp32 delta-rule update), the state dequantized from the pool once and
 requantized once (see ``_gdn_state_q8``), without the per-token time loop and with a
-flat grid. The q/k L2 norm is ``x / (sqrt(sum(x^2)) + 1e-6)``, the form the generic
-decode kernel had before it adopted the prefill form ``x / sqrt(sum(x^2) + 1e-6)``.
+flat grid. The q/k L2 norm is ``x / sqrt(sum(x^2) + 1e-6)``, the generic decode
+kernel's and the prefill front end's form.
 """
 
 from __future__ import annotations
@@ -92,8 +92,8 @@ def _gdn_decode_t1_kernel(
     # beta = sigmoid(b)
     b_beta = 1.0 / (1.0 + tl.exp(-b_b))
 
-    b_q = b_q / (tl.sqrt(tl.sum(b_q * b_q)) + 1e-6)
-    b_k = b_k / (tl.sqrt(tl.sum(b_k * b_k)) + 1e-6)
+    b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
+    b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
     b_q = b_q * scale
 
     # h *= exp(g)
@@ -215,8 +215,8 @@ def _gdn_decode_t1_gated_norm_kernel(
     b_g = -tl.exp(b_A_log) * softplus_x
     b_beta = 1.0 / (1.0 + tl.exp(-b_b))
 
-    b_q = b_q / (tl.sqrt(_warp32x4_sum_sq(b_q)) + 1e-6)
-    b_k = b_k / (tl.sqrt(_warp32x4_sum_sq(b_k)) + 1e-6)
+    b_q = b_q / tl.sqrt(_warp32x4_sum_sq(b_q) + 1e-6)
+    b_k = b_k / tl.sqrt(_warp32x4_sum_sq(b_k) + 1e-6)
     b_q = b_q * scale
 
     b_h *= tl.exp(b_g)
@@ -376,7 +376,7 @@ def check_operands(q, k, v, a, b, A_log, dt_bias, pool, slots) -> None:
 def reference_step(q, k, v, a, b, A_log, dt_bias, h):
     """``(o fp64 [N, HV, V], h_after fp64 [N, HV, V, K])`` of one decode step from the
     fp32 states ``h`` ``[N, HV, V, K]``, in float64: the gates, the q/k L2 norm in the
-    ``x / (|x| + 1e-6)`` form, then ``h *= exp(g); u = (v - h k) beta; h += u k^T;
+    ``x / sqrt(|x|^2 + 1e-6)`` form, then ``h *= exp(g); u = (v - h k) beta; h += u k^T;
     o = h q``. Value head ``i`` reads key head ``i // (HV // H)``."""
     dt = torch.float64
     hk, kd = q.shape[2], q.shape[3]
@@ -384,8 +384,8 @@ def reference_step(q, k, v, a, b, A_log, dt_bias, h):
     rep = hv // hk
     qf = q[0].to(dt)
     kf = k[0].to(dt)
-    qf = qf / (qf.pow(2).sum(-1, keepdim=True).sqrt() + 1e-6)
-    kf = kf / (kf.pow(2).sum(-1, keepdim=True).sqrt() + 1e-6)
+    qf = qf / (qf.pow(2).sum(-1, keepdim=True) + 1e-6).sqrt()
+    kf = kf / (kf.pow(2).sum(-1, keepdim=True) + 1e-6).sqrt()
     qf = (qf * kd**-0.5).repeat_interleave(rep, dim=1)
     kf = kf.repeat_interleave(rep, dim=1)
     x = a.to(dt) + dt_bias.to(dt)

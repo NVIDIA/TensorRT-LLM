@@ -277,7 +277,7 @@ bool dispatchRows(void const* a, void const* w, void const* sfA, void const* sfW
 bool cudaCoreNvfp4Gemm(void const* a, void const* w, void const* sfA, void const* sfW, float const* alpha, void* out,
     int m, int n, int k, bool enablePdl, cudaStream_t stream)
 {
-    if (m < 1 || n % kTileN != 0 || k % kSfVec != 0)
+    if (m < 1 || n % kTileN != 0 || k % kStepK != 0)
     {
         return false;
     }

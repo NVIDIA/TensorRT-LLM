@@ -110,8 +110,9 @@ l0_cpu:
   # -m cpu_only, so the directory's GPU tests are left to l0_b300's modeling_v2 entry.
   - unittest/_torch/modeling_v2/models/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default
   - unittest/_torch/modeling_v2/models/glm5_next/test_glm5_next_routing.py
-  # Qwen3.8-27B routing uses synthetic configs on the CPU.
+  # Qwen3.8-27B routing and checkpoint mapping use synthetic configs and tensors on the CPU.
   - unittest/_torch/modeling_v2/models/qwen3_5/test_routing.py
+  - unittest/_torch/modeling_v2/models/qwen3_5/test_weight_transforms.py
   - unittest/_torch/pyexecutor
   - unittest/_torch/test_connector.py::test_a_partial_grouped_scheduler_is_rejected_at_bring_up
   - unittest/_torch/test_connector.py::test_a_grouped_scheduler_and_a_single_group_cache_are_accepted

@@ -1657,17 +1657,18 @@ __global__ void Marlin(int4 const* __restrict__ A0, // fp16 input matrix of shap
                 {
                     if (!first)
                     {
-                        c_scalar_t* c_red_f16;
+                        // The partial sums stay alive through the conversion loop below.
+                        int4 red;
                         if constexpr (is_a_8bit)
                         {
-                            int2 tmp = reinterpret_cast<int2*>(sh_red)[c_sh_wr + i * c_sh_wr_delta];
-                            c_red_f16 = reinterpret_cast<c_scalar_t*>(&tmp);
+                            *reinterpret_cast<int2*>(&red)
+                                = reinterpret_cast<int2*>(sh_red)[c_sh_wr + i * c_sh_wr_delta];
                         }
                         else
                         {
-                            int4 tmp = sh_red[c_sh_wr + i * c_sh_wr_delta];
-                            c_red_f16 = reinterpret_cast<c_scalar_t*>(&tmp);
+                            red = sh_red[c_sh_wr + i * c_sh_wr_delta];
                         }
+                        c_scalar_t const* c_red_f16 = reinterpret_cast<c_scalar_t const*>(&red);
 #pragma unroll
                         for (int j = 0; j < 2 * (is_a_8bit ? 2 : 4); j++)
                         {

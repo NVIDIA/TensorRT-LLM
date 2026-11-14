@@ -72,7 +72,9 @@ def _build(spec, seed):
     slot_t = torch.tensor(slots, dtype=torch.int32, device=DEV)
     args = [inp["q"], inp["k"], inp["v"], inp["a"], inp["b"], inp["A_log"], inp["dt_bias"],
             pool, slot_t, out]  # fmt: skip
-    return args, dict(backing=backing, step_out=step_out, slots=slots)
+    return args, dict(
+        backing=backing, neighbors=backing[:, 1:].clone(), step_out=step_out, slots=slots
+    )
 
 
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
@@ -97,10 +99,26 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by
     assert_q8_states_close(pool, ref_pool, extras["slots"])
     assert_untouched(pool, pool_before, extras["slots"])
     if cell.spec.get("pool") == "coalesced":
-        assert not extras["backing"][:, 1:].any(), "another layer's states were written"
+        assert torch.equal(extras["backing"][:, 1:], extras["neighbors"]), (
+            "another layer's states were written"
+        )
     for s in extras["slots"]:
         if s >= 0:  # non-vacuity: every named slot moved
             assert not torch.equal(pool[s], pool_before[s]), s
+
+
+def test_small_norm_heads_use_the_model_epsilon_form() -> None:
+    """q/k heads with norm ~1e-3: the model's `x / sqrt(sum x^2 + 1e-6)` and the
+    `x / (sqrt(sum x^2) + 1e-6)` form differ by ~30% there, so this cell pins the form."""
+    args, extras = _build(dict(rows=2), seed=11)
+    q, k = args[0], args[1]
+    for t in (q, k):
+        head = t[0, 0].float()
+        t[0, 0] = (head * (1e-3 / head.norm(dim=-1, keepdim=True))).to(t.dtype)
+    ref_o, ref_pool = op.reference(*args)
+    o = op(*args)
+    torch.testing.assert_close(o, ref_o)
+    assert_q8_states_close(args[7], ref_pool, extras["slots"])
 
 
 def test_cuda_graph_replay_of_chained_steps() -> None:

@@ -113,6 +113,14 @@ def test_cuda_graph_replay_reads_the_ids_at_replay(table) -> None:
         _compare(captured, op.reference(ids, table))
 
 
+def test_strided_ids_are_read_by_element(table) -> None:
+    """A strided 1-D id view (every other id) gathers those ids, not their neighbours."""
+    base = _ids(dict(tokens=24, ids="edges"), seed=_seed("strided"))
+    ids = base[::2]
+    assert ids.stride(0) == 2
+    _compare(op(ids, table), op.reference(ids.contiguous(), table))
+
+
 def test_the_output_follows_the_id_shape(table) -> None:
     """Any id shape gives `ids.shape + (hidden,)`; no ids give an empty result without a
     launch."""

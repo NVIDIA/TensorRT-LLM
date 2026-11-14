@@ -104,6 +104,17 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811
     _compare(out, op.reference(*args), s["workspace_mode"])
 
 
+@pytest.mark.parametrize("m", [4, 8])
+def test_full_k_out_proj_is_bitwise_the_split_k_launch(m) -> None:
+    """At n=5120, k=6144 and up to 8 rows `launch_hint=1` runs one CTA per column that
+    replays the split-K launch's BF16 reduction chain: the stock launch's bits."""
+    c = _copy(5120, 6144)
+    x = _x(m, 6144, seed=6144 + m)
+    tuned = op(*_args(c, x, 0, 1))
+    stock = op(*_args(c, x, 0, 0))
+    assert torch.equal(tuned.view(torch.int16), stock.view(torch.int16))
+
+
 @pytest.mark.parametrize(
     "n,k,m,mode",
     [(16384, 5120, 8, 0), (14336, 5120, 16, 0), (14336, 5120, 32, 2), (5120, 6144, 8, 0)],

@@ -71,6 +71,18 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
     torch.testing.assert_close(out, op.reference(*args))
 
 
+def test_prefill_multirow_dispatch_at_its_threshold() -> None:
+    """683 tokens x 48 heads = 32784 rows takes the eight-row prefill kernel; with a strided
+    weight view it still matches the reference (the launch reads a contiguous copy)."""
+    spec = dict(op.CELLS[0].spec, tokens=683, heads=48, z="in_proj")
+    x, z, weight, eps, _, act = _build(spec, seed=_seed("prefill-threshold"))
+    assert x.shape[0] >= 32768
+    strided = torch.stack([weight, torch.zeros_like(weight)], dim=1)[:, 0]
+    assert strided.stride(0) == 2
+    out = op(x, z, strided, eps, None, act)
+    torch.testing.assert_close(out, op.reference(x, z, weight, eps, None, act))
+
+
 def test_guard_refuses_a_weight_of_the_wrong_length() -> None:
     """Unguarded, a length-192 weight is silently truncated to weight[:128]."""
     x, z, weight, eps, _, act = _build(_PACKED, seed=12)

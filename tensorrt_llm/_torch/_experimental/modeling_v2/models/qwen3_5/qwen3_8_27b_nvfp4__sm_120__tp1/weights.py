@@ -541,8 +541,8 @@ class Qwen3827BTp1Weights:
     def derive(self, core) -> None:
         """Build the copies the forward runs on, then drop the FP8 bytes no path reads.
 
-        Registered as new parameters of `core.w` (after materialization, so they take
-        device storage directly). Per FP8 projection: `<tag>_mw` (Marlin W4A16), `<tag>_gv`
+        Stored in `core.copies` (built after materialization, so they take device storage
+        directly). Per FP8 projection: `<tag>_mw` (Marlin W4A16), `<tag>_gv`
         (CUDA-core GEMV layout of the same NVFP4 values) and `<tag>_a4` (W4A4 copy).
         """
         d = self.dims(core)

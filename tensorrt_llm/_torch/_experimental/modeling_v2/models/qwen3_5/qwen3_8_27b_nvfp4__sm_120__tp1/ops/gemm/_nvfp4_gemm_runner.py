@@ -207,7 +207,11 @@ class Nvfp4GemmSm120Runner(TunableRunner):
         if fi_cutlass_offered(act_fp4, weight, self.output_dtype):
             return [("fi_cutlass", t) for t in FI_TACTICS]
         tactics: List[Tuple[str, int]] = []
-        if act_fp4.shape[0] <= CUDA_CORE_MAX_M and self.output_dtype == torch.bfloat16:
+        if (
+            act_fp4.shape[0] <= CUDA_CORE_MAX_M
+            and self.output_dtype == torch.bfloat16
+            and (act_fp4.shape[1] * 2) % 32 == 0  # the kernel steps K by 32
+        ):
             tactics.append(("cuda_core", 0))
         tactics.extend(("cutlass", t) for t in range(_cutlass(self.output_dtype).get_num_configs()))
         if IS_CUBLASLT_AVAILABLE:
@@ -221,6 +225,10 @@ class Nvfp4GemmSm120Runner(TunableRunner):
         if tactic == -1:
             tactic = ("cutlass", -1)
         backend, sub_tactic = tactic
+        if backend == "fi_cutlass" and _FlashInferSm120.get() is None:
+            # A tactic cached by an earlier process whose FlashInfer module built; this one
+            # did not, so the stock CUTLASS kernel serves the call.
+            backend, sub_tactic = "cutlass", -1
         if backend == "cutlass":
             return _cutlass(self.output_dtype).run_gemm(
                 act_fp4, weight, act_sf, weight_scale, alpha, 0, sub_tactic, None, None

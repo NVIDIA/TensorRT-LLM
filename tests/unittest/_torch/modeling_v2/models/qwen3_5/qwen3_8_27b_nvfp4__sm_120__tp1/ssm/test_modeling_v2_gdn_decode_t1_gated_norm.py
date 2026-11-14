@@ -71,7 +71,7 @@ def _build(spec, seed):
     slot_t = torch.tensor(slots, dtype=torch.int32, device=DEV)
     args = [inp["q"], inp["k"], inp["v"], inp["a"], inp["b"], inp["A_log"], inp["dt_bias"],
             pool, slot_t, inp["z"], inp["norm_weight"], EPS]  # fmt: skip
-    return args, dict(backing=backing, slots=slots)
+    return args, dict(backing=backing, neighbors=backing[:, 1:].clone(), slots=slots)
 
 
 def _composition(args):
@@ -105,7 +105,9 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by
     assert_q8_states_close(pool, ref_pool, extras["slots"])
     assert_untouched(pool, pool_before, extras["slots"])
     if cell.spec.get("pool") == "coalesced":
-        assert not extras["backing"][:, 1:].any(), "another layer's states were written"
+        assert torch.equal(extras["backing"][:, 1:], extras["neighbors"]), (
+            "another layer's states were written"
+        )
 
 
 def test_guard_refuses_a_packed_z_of_the_wrong_head_stride() -> None:

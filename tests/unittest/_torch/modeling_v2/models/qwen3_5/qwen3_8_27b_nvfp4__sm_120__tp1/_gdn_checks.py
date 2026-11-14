@@ -42,9 +42,13 @@ Q8_ELEM_BOUND = 0.5
 def q8_pool(slots: int, layout: str, filled, gen: torch.Generator, std: float = 0.2):
     """`(backing, pool)`: an int8-typed pool view `[slots, 48, 260, 128]` (`layout` "compact"
     or "coalesced") whose `filled` slots hold quantized `std * randn` states; every other
-    byte is zero (a zero state)."""
+    byte of the pool is zero (a zero state). In the coalesced layout the other layers hold
+    random bytes, so a stray write of any value there changes them."""
     if layout == "coalesced":
         backing = torch.zeros(slots, LAYERS, HV, ROWS8, K, dtype=torch.int8, device=DEV)
+        backing[:, 1:] = torch.randint(
+            -128, 128, backing[:, 1:].shape, generator=gen, device=DEV, dtype=torch.int8
+        )
         pool = backing[:, 0]
     else:
         assert layout == "compact", layout

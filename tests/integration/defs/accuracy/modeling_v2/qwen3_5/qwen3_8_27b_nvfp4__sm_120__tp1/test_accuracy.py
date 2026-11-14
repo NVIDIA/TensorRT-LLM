@@ -114,7 +114,7 @@ class TestModelingV2Qwen3827BNvfp4Sm120Tp1(LlmapiAccuracyTestHarness):
         chat_template_kwargs=dict(enable_thinking=False),
     )
 
-    # The engine settings the target serves: an fp8 KV pool and the 8-bit recurrent state,
+    # The engine settings the target serves: an fp8 KV pool and the int16-row recurrent state,
     # with block reuse and a recurrent-state snapshot where the shared prefix ends.
     KV_CACHE = KvCacheConfig(
         dtype="fp8",
@@ -164,6 +164,16 @@ class TestModelingV2Qwen3827BNvfp4Sm120Tp1(LlmapiAccuracyTestHarness):
             # Prime the shared prefix, then send every question at once.
             llm.generate([prompts[0][0]], params)
             outputs = llm.generate([prompt for prompt, _ in prompts], params)
+        # The questions reuse the cached document: a hybrid model reuses KV blocks only
+        # where it can restore the Gated-DeltaNet state, so a reuse or snapshot-restore
+        # regression shows as no cached tokens. Measured: 32512 per request (the reuse
+        # stops a 256-token tile short of the snapshot), and one request of the batch
+        # reports none; allow that one.
+        reused = sorted(o.cached_tokens for o in outputs)
+        assert reused[1] >= _PREFIX_TOKENS - 768, (
+            f"cached tokens per request {reused[:8]}...; expected the {_PREFIX_TOKENS}-token "
+            "shared document reused by every request but at most one"
+        )
         missed = [
             (code, output.outputs[0].text)
             for (_, code), output in zip(prompts, outputs)

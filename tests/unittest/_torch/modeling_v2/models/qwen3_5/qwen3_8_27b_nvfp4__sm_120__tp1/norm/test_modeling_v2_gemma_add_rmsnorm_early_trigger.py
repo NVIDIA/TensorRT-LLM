@@ -88,6 +88,16 @@ def test_pdl_dependents_read_the_finished_outputs_under_graph_replay() -> None:
         op(x2, residual, weight, eps)
         return y
 
+    def serial_chain(x, residual, x2):
+        """The oracle: each stage complete before the next starts, so no PDL overlap."""
+        op(x, residual, weight, eps)
+        torch.cuda.synchronize()
+        y = torch.ops.trtllm.flashinfer_gemma_rmsnorm(x, weight, eps)
+        torch.cuda.synchronize()
+        op(x2, residual, weight, eps)
+        torch.cuda.synchronize()
+        return y
+
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
@@ -101,7 +111,7 @@ def test_pdl_dependents_read_the_finished_outputs_under_graph_replay() -> None:
         fresh = _build(spec, seed=_seed(f"replay {replay}"))
         fresh_x2 = _build(spec, seed=_seed(f"replay {replay} x2"))[0]
         want_x, want_residual, want_x2 = fresh[0].clone(), fresh[1].clone(), fresh_x2.clone()
-        want_y = chain(want_x, want_residual, want_x2)
+        want_y = serial_chain(want_x, want_residual, want_x2)
         y.fill_(float("nan"))
         x.copy_(fresh[0])
         residual.copy_(fresh[1])

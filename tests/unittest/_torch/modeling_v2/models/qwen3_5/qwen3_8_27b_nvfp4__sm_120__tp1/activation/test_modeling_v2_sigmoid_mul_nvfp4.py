@@ -22,7 +22,12 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_nv
 from tensorrt_llm._utils import get_sm_version
 
 __extra_import_path__ = ["../../../..", ".."]
-from _nvfp4_checks import assert_nvfp4_matches_reference, capture, seed_of  # noqa: E402
+from _nvfp4_checks import (  # noqa: E402
+    assert_nvfp4_matches_reference,
+    capture,
+    corrupt_a_rescaled_block,
+    seed_of,
+)
 from _validating import certifying, validating  # noqa: E402,F401
 
 pytestmark = pytest.mark.skipif(
@@ -68,6 +73,17 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811
     assert out[0].shape == (s["m"], HIDDEN // 2)
     ref = op.reference(attn, gate, gs)
     assert_nvfp4_matches_reference(out, ref, s["m"], HIDDEN, max_sf_frac=MAX_SF_FRAC)
+
+
+def test_the_check_rejects_corrupt_codes_in_a_rescaled_block() -> None:
+    """The NVFP4 check exempts a block whose scale moved from its code gates; its value
+    gate must still catch codes that moved with it."""
+    attn, gate, gs = _operands(33, seed=3)
+    ref = op.reference(attn, gate, gs)
+    assert_nvfp4_matches_reference(ref, ref, 33, HIDDEN, max_sf_frac=1.0)
+    bad = corrupt_a_rescaled_block(ref, 33, HIDDEN)
+    with pytest.raises(AssertionError, match="two-scale bound"):
+        assert_nvfp4_matches_reference(bad, ref, 33, HIDDEN, max_sf_frac=1.0)
 
 
 @pytest.mark.parametrize("t", [33, 129, 2048], ids=lambda t: f"t{t}")

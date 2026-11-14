@@ -21,6 +21,9 @@ import triton.language as tl  # type: ignore[import]
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen3_5.qwen3_8_27b_nvfp4__sm_120__tp1.ops.quantization._nvfp4_reference import (  # noqa: E501
     SF_VEC,
+    e2m1_to_float,
+    e4m3_to_float,
+    swizzle_sf,
     swizzled_sf_index,
     unpack_codes,
     unswizzle_sf,
@@ -55,6 +58,9 @@ def assert_nvfp4_matches_reference(
       0.24% of elements inside its reciprocal tie window and bounds them at 1%; a moved
       intermediate adds far fewer. A differing code is the neighbouring magnitude with
       the same sign; at most ``max_code_frac`` of the elements.
+    * values (blocks whose scales differ): each side is within one E2M1 step of the same
+      intermediate at its own scale (a half step is at most one scale unit), so the
+      dequantized values differ by at most the sum of the two scales.
 
     A wrong column order, scale, or SwiGLU pairing moves a large fraction of codes by
     more than one step and fails the last two gates.
@@ -87,6 +93,33 @@ def assert_nvfp4_matches_reference(
     same_sign = ((codes ^ ref_codes) & 8) == 0
     neighbour = ((mag - ref_mag).abs() <= 1) & (same_sign | ((mag == 0) & (ref_mag == 0)))
     assert bool(neighbour[diff].all()), "a code differs by more than one E2M1 step"
+
+    if bool(sf_diff.any()):
+        block = sf_diff.repeat_interleave(SF_VEC, dim=1)
+        scale = e4m3_to_float(lin).repeat_interleave(SF_VEC, dim=1)
+        ref_scale = e4m3_to_float(ref_lin).repeat_interleave(SF_VEC, dim=1)
+        value = e2m1_to_float(codes) * scale
+        ref_value = e2m1_to_float(ref_codes) * ref_scale
+        err = (value - ref_value).abs()[block]
+        bound = (scale + ref_scale)[block] * (1 + 2**-10)
+        assert bool((err <= bound).all()), (
+            "a block whose scale moved by one code dequantizes away from the reference: "
+            f"{int((err > bound).sum())} elements past the two-scale bound"
+        )
+
+
+def corrupt_a_rescaled_block(
+    ref: tuple[torch.Tensor, torch.Tensor], rows: int, cols: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``ref`` with block 0 of row 0 moved one E4M3 scale code and its codes' signs flipped:
+    an output the code gates exempt (its scale differs) that the value gate must reject."""
+    fp4, sf = ref[0].clone(), ref[1]
+    lin = unswizzle_sf(sf, rows, cols // SF_VEC).clone()
+    lin[0, 0] += 1
+    codes = unpack_codes(fp4)
+    codes[0, :SF_VEC] ^= 8
+    fp4 = (codes[:, 0::2] | (codes[:, 1::2] << 4)).to(torch.uint8)
+    return fp4, swizzle_sf(lin).view(sf.dtype).reshape(sf.shape)
 
 
 @triton.jit

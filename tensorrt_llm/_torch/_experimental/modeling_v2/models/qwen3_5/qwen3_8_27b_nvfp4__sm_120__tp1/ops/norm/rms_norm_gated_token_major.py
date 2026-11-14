@@ -47,11 +47,14 @@ def _prefill_launch(x, z, weight, eps, gate_activation):
     """The multi-row kernel at `_PREFILL_ROWS` rows a program (no PDL: the grid covers every SM)."""
     rows, n = x.shape
     out = torch.empty_like(x)
-    _layernorm_gated._rms_norm_gated_fwd_multirow_kernel[(triton.cdiv(rows, _PREFILL_ROWS),)](
-        x, out, weight, z, None, None, x.stride(0), out.stride(0), z.stride(0), rows, eps,
-        N=n, ROWS=_PREFILL_ROWS, HEADS_PER_TOK=z.shape[1], GATE_SIGMOID=gate_activation == "sigmoid",
-        WEIGHT_IS_DELTA=False, LAUNCH_WITH_PDL=False, num_warps=4,
-    )  # fmt: skip
+    weight = weight.contiguous()  # the kernel reads `W + cols`
+    with torch.cuda.device(x.device):  # Triton launches on the current device
+        _layernorm_gated._rms_norm_gated_fwd_multirow_kernel[(triton.cdiv(rows, _PREFILL_ROWS),)](
+            x, out, weight, z, None, None, x.stride(0), out.stride(0), z.stride(0), rows, eps,
+            N=n, ROWS=_PREFILL_ROWS, HEADS_PER_TOK=z.shape[1],
+            GATE_SIGMOID=gate_activation == "sigmoid", WEIGHT_IS_DELTA=False,
+            LAUNCH_WITH_PDL=False, num_warps=4,
+        )  # fmt: skip
     return out
 
 
