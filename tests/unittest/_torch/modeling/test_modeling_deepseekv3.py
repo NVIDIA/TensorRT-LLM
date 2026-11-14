@@ -540,3 +540,155 @@ def test_glm_moe_dsa_context_forward():
         normalized = normalized.to(embeddings.dtype) * model.model.norm.weight
         bypass_logits = torch.nn.functional.linear(normalized, model.lm_head.weight)
         assert not torch.allclose(logits, bypass_logits.float(), rtol=2e-2, atol=2e-3)
+
+
+def _tiny_dense_deepseek_v3(tp_size: int = 1, rank: int = 0):
+    """Build a one-layer dense DeepSeek-V3-Lite model on CUDA with the real MLA geometry."""
+    from transformers import PretrainedConfig
+
+    import tensorrt_llm.mapping as mapping_mod
+    from tensorrt_llm._torch.models.modeling_deepseekv3 import DeepseekV3ForCausalLM
+
+    config = PretrainedConfig(
+        architectures=["DeepseekV3ForCausalLM"],
+        model_type="deepseek_v3",
+        vocab_size=64,
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        q_lora_rank=None,
+        kv_lora_rank=512,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
+        max_position_embeddings=64,
+        rope_theta=10000.0,
+        rope_scaling=None,
+        rms_norm_eps=1e-6,
+        hidden_act="silu",
+        moe_intermediate_size=128,
+        n_routed_experts=None,
+        n_shared_experts=1,
+        num_experts_per_tok=1,
+        first_k_dense_replace=1,
+        moe_layer_freq=1,
+        tie_word_embeddings=False,
+        bos_token_id=1,
+        eos_token_id=2,
+        pad_token_id=None,
+        num_nextn_predict_layers=0,
+        torch_dtype=torch.bfloat16,
+    )
+    model_config = ModelConfig(
+        pretrained_config=config,
+        mapping=mapping_mod.Mapping(world_size=tp_size, rank=rank, tp_size=tp_size),
+        attn_backend="TRTLLM",
+        max_num_tokens=32,
+        max_seq_len=64,
+    )
+    # Built on the CPU because the attention backend creates rotary tables with NumPy.
+    return DeepseekV3ForCausalLM(model_config).cuda().eval()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the MLA module needs CUDA")
+def test_mla_v_b_proj_alias_is_restored_structurally_and_idempotently():
+    """`setup_aliases()` binds `v_b_proj` to the V rows of `kv_b_proj.weight` without copying."""
+    model = _tiny_dense_deepseek_v3()
+    attention = model.model.layers[0].self_attn
+    assert attention.kv_b_proj.weight.untyped_storage().data_ptr() != (
+        attention.v_b_proj.untyped_storage().data_ptr()
+    )
+    attention._weights_transformed = False
+
+    model.setup_aliases()
+    bound = attention.v_b_proj
+    model.setup_aliases()
+
+    assert attention.v_b_proj is bound
+    assert not attention._weights_transformed
+    heads, nope, kv_lora = (
+        attention.num_heads_tp,
+        attention.qk_nope_head_dim,
+        attention.kv_lora_rank,
+    )
+    k_rows = heads * nope
+    assert bound.shape == (heads, attention.v_head_dim, kv_lora)
+    assert (
+        bound.untyped_storage().data_ptr()
+        == attention.kv_b_proj.weight.untyped_storage().data_ptr()
+    )
+    assert bound.data_ptr() == attention.kv_b_proj.weight.data_ptr() + k_rows * kv_lora * 2
+    # A write through `kv_b_proj.weight` is visible through `v_b_proj`: no data was copied.
+    with torch.no_grad():
+        attention.kv_b_proj.weight[k_rows:].fill_(3.0)
+    assert bool((bound == 3.0).all())
+
+
+def _break_dtype(attention, _monkeypatch):
+    attention.v_b_proj = torch.nn.Parameter(
+        attention.v_b_proj.detach().to(torch.float8_e4m3fn), requires_grad=False
+    )
+
+
+def _break_shape(attention, _monkeypatch):
+    attention.kv_b_proj.weight = torch.nn.Parameter(
+        attention.kv_b_proj.weight[:-1].contiguous(), requires_grad=False
+    )
+
+
+def _break_meta(attention, _monkeypatch):
+    attention.kv_b_proj.weight = torch.nn.Parameter(
+        torch.empty_like(attention.kv_b_proj.weight, device="meta"), requires_grad=False
+    )
+
+
+def _break_contiguity(attention, _monkeypatch):
+    weight = attention.kv_b_proj.weight
+    attention.kv_b_proj.weight = torch.nn.Parameter(
+        weight.t().contiguous().t(), requires_grad=False
+    )
+    assert not attention.kv_b_proj.weight.is_contiguous()
+
+
+def _break_quantization(attention, monkeypatch):
+    monkeypatch.setattr(type(attention.kv_b_proj), "has_any_quant", property(lambda _self: True))
+
+
+def _break_locality_domain_plan(attention, _monkeypatch):
+    attention.kv_b_proj.partition_plan = SimpleNamespace(enabled=True)
+
+
+def _break_context_parallel(attention, _monkeypatch):
+    attention.num_heads_tp_cp = attention.num_heads_tp // 2
+
+
+def _break_weights_created(attention, _monkeypatch):
+    attention.kv_b_proj._weights_created = False
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the MLA module needs CUDA")
+@pytest.mark.parametrize(
+    "break_eligibility",
+    [
+        pytest.param(_break_dtype, id="dtype-mismatch"),
+        pytest.param(_break_shape, id="foreign-shape"),
+        pytest.param(_break_meta, id="meta-weight"),
+        pytest.param(_break_contiguity, id="non-contiguous-weight"),
+        pytest.param(_break_quantization, id="quantized-kv-b-proj"),
+        pytest.param(_break_locality_domain_plan, id="locality-domain-plan"),
+        pytest.param(_break_context_parallel, id="context-parallel-heads"),
+        pytest.param(_break_weights_created, id="weights-not-created"),
+    ],
+)
+def test_mla_v_b_proj_alias_skips_ineligible_layouts(monkeypatch, break_eligibility):
+    """Each layout that the alias does not cover keeps its own `v_b_proj` and raises nothing."""
+    model = _tiny_dense_deepseek_v3()
+    attention = model.model.layers[0].self_attn
+    break_eligibility(attention, monkeypatch)
+    original = attention.v_b_proj
+
+    model.setup_aliases()
+
+    assert attention.v_b_proj is original
