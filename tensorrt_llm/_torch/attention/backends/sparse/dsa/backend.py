@@ -22,6 +22,7 @@ from tensorrt_llm._torch.attention.backends.trtllm import MlaLatentWriteTarget, 
 from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+from ...fmha.prims_ts_dsa_sparse_mla import prims_ts_reads_nvfp4_mla_records
 from ..mixed_precision_high_rows import (
     mixed_precision_high_row_indices,
     overlay_mixed_precision_high_rows,
@@ -126,6 +127,8 @@ class DSATrtllmAttention(TrtllmAttention):
         # quantization path in TRTLLMGen. Keep those at their default value and
         # use separate scales for the E2M1 x E4M3 KV representation: its global
         # scale contains an extra factor of six that would otherwise saturate Q.
+        # The cache ops apply it to the residual layout only: the records of the
+        # fp8rope layout keep real-valued block scales and E4M3 RoPE.
         self._nvfp4_mla_kv_scale_quant_orig = self.kv_scale_quant_orig
         self._nvfp4_mla_kv_scale_orig_quant = self.kv_scale_orig_quant
         if quant_config is not None and quant_config.layer_quant_mode.has_fp4_kv_cache():
@@ -277,6 +280,11 @@ class DSATrtllmAttention(TrtllmAttention):
             )
 
         if kv_cache_dtype == tensorrt_llm.bindings.DataType.NVFP4:
+            if prims_ts_reads_nvfp4_mla_records(metadata, self):
+                # PrimTS dequantizes the selected records itself; it takes the global rows.
+                return topk_indices_global, None
+            # Metadata leaves these rows out when it expects PrimTS to read the records.
+            metadata.ensure_nvfp4_mla_generation_buffers()
             scratch = metadata.nvfp4_mla_fp8_scratch
             compact_indices = metadata.nvfp4_mla_compact_indices
             if scratch is None or compact_indices is None:

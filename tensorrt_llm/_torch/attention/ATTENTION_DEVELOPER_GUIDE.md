@@ -656,6 +656,31 @@ The FMHA package is split by role:
   it is in the default library set and `TLLM_FMHA_LIBS=-prims_ts_sparse_mla`
   removes it. For compress-ratio-4 layers under KV-cache offload, its extra
   source is the layer's sparse cache arena (§3.2.5).
+- `fmha/prims_ts_dsa_sparse_mla.py` runs DSA generation on the vendored PrimTS
+  D576 sparse MLA kernel (SM100/SM103, and SM107 with the Rubin helpers of the
+  CuTe DSL), which reads the NVFP4 KV records of the
+  `fp8rope` layout in place. Its `prims_ts_reads_nvfp4_mla_records()` is the
+  one decision behind both gather skips:
+  `DSATrtllmAttention.sparse_attn_predict` skips the NVFP4-to-FP8 gather and
+  DSA metadata leaves out the gather's FP8 rows. Where it does not hold (Helix,
+  beam search, a layer without the library, e.g. with skip-correction), the
+  layer gathers and TRTLLM-Gen serves generation. It is in the default library
+  set and `TLLM_FMHA_LIBS=-prims_ts_dsa_sparse_mla` removes it.
+  The cache manager settles the layout of an NVFP4 DSA cache and publishes it
+  as `mla_kv_cache_layout`. `TRTLLM_NVFP4_MLA_KV_CACHE_LAYOUT` defaults to
+  `auto`: `DSACacheManagerV2` stores `fp8rope` records where generation reads
+  them in place. It keeps the `residual` layout, as `DSACacheManager` always
+  does, when the cache cannot hold records (a latent other than 512 + 64, a
+  mixed-precision KV cache, or KV-cache offload, whose arena reads NVFP4
+  latents with a block-scale pool) and when
+  `get_nvfp4_mla_record_reader_unsupported_reason()` names a reason known
+  before the layers exist: the library is disabled, the GPU or the CuTe DSL
+  toolchain cannot run it, or the mapping uses Helix. `fp8rope` stores records
+  whether or not they are read in place and raises for a cache that cannot
+  hold them; `residual` selects that layout everywhere. Records carry no
+  global scale: the native cache ops take the
+  layer's NVFP4 scale for the `residual` layout only, so a layer needs no
+  knowledge of the layout.
 - `fmha/prims_ts_block_sparse.py` adapts generic block-sparse requests to the
   vendored PrimTS contiguous and paged wrappers. Paged generation passes a
   live, zero-copy 2D K-page-table view with its TRT-LLM padded row stride; it

@@ -68,7 +68,9 @@ void nvFp4MlaKvCacheGather(th::Tensor const& hostPoolPointers, th::Tensor const&
     TORCH_CHECK(poolIdx >= 0 && poolIdx < hostPoolPointers.size(0), "mapped pool index is out of range");
     auto const dataPtr = hostPoolPointers.index({poolIdx, 0, 0}).item<int64_t>();
     auto const scalePtr = hostPoolPointers.index({poolIdx, 0, 1}).item<int64_t>();
-    TORCH_CHECK(dataPtr != 0 && scalePtr != 0, "NVFP4 data and scale pool pointers must be non-null");
+    bool const recordLayout
+        = tk::isNvFp4MlaRecordLayout(static_cast<int32_t>(output.size(2)), static_cast<int32_t>(residualDim));
+    TORCH_CHECK(dataPtr != 0 && (scalePtr != 0 || recordLayout), "NVFP4 data and scale pool pointers must be non-null");
 
     auto stream = at::cuda::getCurrentCUDAStream(globalIndices.get_device()).stream();
     tk::invokeNvFp4MlaKvCacheGather(reinterpret_cast<uint8_t const*>(dataPtr),
@@ -137,7 +139,9 @@ void nvFp4MlaContextKvCacheGather(th::Tensor const& hostPoolPointers, th::Tensor
     TORCH_CHECK(poolIdx >= 0 && poolIdx < hostPoolPointers.size(0), "mapped pool index is out of range");
     auto const dataPtr = hostPoolPointers.index({poolIdx, 0, 0}).item<int64_t>();
     auto const scalePtr = hostPoolPointers.index({poolIdx, 0, 1}).item<int64_t>();
-    TORCH_CHECK(dataPtr != 0 && scalePtr != 0, "NVFP4 data and scale pool pointers must be non-null");
+    bool const recordLayout
+        = tk::isNvFp4MlaRecordLayout(static_cast<int32_t>(output.size(2)), static_cast<int32_t>(residualDim));
+    TORCH_CHECK(dataPtr != 0 && (scalePtr != 0 || recordLayout), "NVFP4 data and scale pool pointers must be non-null");
 
     auto stream = at::cuda::getCurrentCUDAStream(localTopKIndices.get_device()).stream();
     int32_t const totalKvTokens32 = static_cast<int32_t>(totalKvTokens);

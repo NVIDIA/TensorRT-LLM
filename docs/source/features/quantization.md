@@ -75,6 +75,58 @@ This configures an active NVFP4 KV cache on the GPU. To keep the active GPU KV
 cache in its normal runtime type and use NVFP4 only while Pages reside in Host
 or Disk storage, see [KV Cache Compression](kv-cache-compression.md).
 
+#### NVFP4 KV Cache Layout of DSA Models
+
+Models with DeepSeek sparse attention (DSA) and a 512 + 64 MLA latent
+(DeepSeek-V3.2, GLM-5) can store each token of an NVFP4 KV cache as one 352-byte
+record per layer: the 512 compressed values as E2M1 with one E4M3 scale per 16
+values, and the 64 rotary values as E4M3. On SM100, SM103 and SM107 the
+generation attention reads these records in place; the context phase expands
+the selected tokens to FP8 rows first.
+
+`TRTLLM_NVFP4_MLA_KV_CACHE_LAYOUT` selects the layout. `auto` (default) stores
+records where the generation attention reads them in place, and uses the
+`residual` layout everywhere else: with a mixed-precision KV cache
+(`kv_cache_config.dtype="mixed_*"`), with sparse KV cache offload, with KV cache
+manager V1, on other GPUs, without `nvidia-cutlass-dsl>=4.7` (on SM107, a version
+with the Rubin helpers), with Helix parallelism, and when `TLLM_FMHA_LIBS`
+removes `prims_ts_dsa_sparse_mla`. `residual` stores all 576 values as E2M1
+under one global scale, with a second E2M1 code for the rotary values; its
+generation attention expands the selected tokens to FP8 rows. `fp8rope` requests
+records, which are expanded to FP8 rows where they cannot be read in place, and
+fails with a cache that does not support them.
+Servers that exchange KV caches, such as the context and generation servers of a
+disaggregated deployment, must use the same layout. `auto` follows the GPU, the
+installed CuTe DSL and `TLLM_FMHA_LIBS` of each server, so select `residual` or
+`fp8rope` explicitly when these differ between the servers.
+
+#### MLA Latent Scale for Quantized KV Caches
+
+MLA models (DeepSeek-V3 family, GLM) store one latent per token in the KV cache.
+Its magnitude is set by `kv_a_layernorm.weight`, which some checkpoints train far
+below one in a few layers: GLM-5.3 has an RMS of 0.003 to 0.01 in its first eight
+layers. Such values fall under the smallest normal E4M3 number (2^-6), so an FP8
+latent, and the block scales of an NVFP4 latent, keep almost no precision there.
+
+For models with DeepSeek sparse attention (DSA) and an NVFP4 KV cache, the PyTorch
+backend therefore multiplies `kv_a_layernorm.weight` of each layer by a power of
+two that brings the latent to an RMS of about one, and divides `kv_b_proj` by the
+same factor while loading the weights. The model output is unchanged; only the
+values the cache stores move into the range the quantized formats resolve. This
+needs a floating-point `kv_b_proj`: a checkpoint whose FP8 `kv_b_proj` is
+dequantized while loading (the DeepSeek FP8 checkpoints) is scaled, and layers
+whose `kv_b_proj` stays quantized in the model are left as they are. Dense MLA is not
+scaled by default: it multiplies the NVFP4 latent as block-scaled operands, which
+a power-of-two scale leaves unchanged.
+
+`TRTLLM_MLA_LATENT_SCALE` controls this: `auto` (default) brings the latent of an
+NVFP4 KV cache of a DSA model to an RMS of 1.0, a positive number brings the
+latent of any quantized KV cache (FP8 and dense MLA included) to that RMS, and
+`off` loads the weights unchanged.
+The setting changes the values stored in the KV cache, so servers that exchange
+KV caches, such as the context and generation servers of a disaggregated
+deployment, must use the same one.
+
 #### NVFP4_PLUS MoE from MXFP4 Checkpoints
 
 On Rubin (SM107), the routed experts of an MXFP4 checkpoint can run as NVFP4_PLUS:

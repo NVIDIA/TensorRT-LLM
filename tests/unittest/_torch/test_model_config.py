@@ -15,7 +15,10 @@ from tensorrt_llm._torch.pyexecutor.model_loader import (
     validate_and_set_kv_cache_quant,
     validate_encoder_decoder_kv_cache_config,
 )
-from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
+from tensorrt_llm.llmapi.llm_args import (
+    DeepSeekSparseAttentionConfig,
+    MiniMaxM3SparseAttentionConfig,
+)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 from tensorrt_llm.quantization.modelopt_config import read_modelopt_quant_config
@@ -234,6 +237,26 @@ def test_validate_and_set_kv_cache_quant_downgrades_nvfp4_on_sm107(
     model_config = _make_model_config_with_kv_quant(QuantAlgo.FP8)
     validate_and_set_kv_cache_quant(model_config, "nvfp4")
     assert model_config.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+
+
+@pytest.mark.parametrize("requested_dtype", ["nvfp4", "auto"])
+def test_validate_and_set_kv_cache_quant_keeps_dsa_nvfp4_on_sm107(
+    monkeypatch: pytest.MonkeyPatch,
+    requested_dtype: str,
+) -> None:
+    """DSA attends over FP8 rows gathered from its NVFP4 latent cache, or reads its records
+    with PrimTS, so the cache stays NVFP4 on SM107."""
+    _mock_sm107(monkeypatch)
+    kv_cache_quant_algo = QuantAlgo.NVFP4 if requested_dtype == "auto" else QuantAlgo.FP8
+    model_config = _make_model_config_with_kv_quant(kv_cache_quant_algo)
+    model_config.sparse_attention_config = DeepSeekSparseAttentionConfig()
+    model_config.quant_config_dict = {
+        "model.layers.0.attention": QuantConfig(kv_cache_quant_algo=kv_cache_quant_algo)
+    }
+    validate_and_set_kv_cache_quant(model_config, requested_dtype)
+    assert model_config.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
+    for layer_quant_config in model_config.quant_config_dict.values():
+        assert layer_quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
 
 
 def _make_mixed_precision_model_config():

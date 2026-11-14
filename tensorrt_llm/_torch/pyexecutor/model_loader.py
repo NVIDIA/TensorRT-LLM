@@ -286,10 +286,15 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
     sparse_config = model_config.sparse_attention_config
     uses_minimax_m3_msa = (is_minimax_m3(sparse_config)
                            and sparse_config.implementation == "msa")
+    # DSA never hands trtllm-gen its NVFP4 latent cache: attention reads FP8
+    # rows gathered from it, or PrimTS reads its records in place.
+    uses_dsa_nvfp4_latent = (sparse_config is not None
+                             and sparse_config.algorithm == "dsa"
+                             and not pyt_kv_cache_dtype.startswith("mixed_"))
     if (effective_kv_cache_quant in (QuantAlgo.NVFP4, QuantAlgo.NVFP4.value)
             and not supports_fp4_mla_attention(model_config)
-            and not uses_minimax_m3_msa and torch.cuda.is_available()
-            and get_sm_version() == 107):
+            and not uses_minimax_m3_msa and not uses_dsa_nvfp4_latent
+            and torch.cuda.is_available() and get_sm_version() == 107):
         if pyt_kv_cache_dtype.startswith("mixed_"):
             raise ValueError(
                 f'kv_cache_config.dtype="{pyt_kv_cache_dtype}" keeps the history '
