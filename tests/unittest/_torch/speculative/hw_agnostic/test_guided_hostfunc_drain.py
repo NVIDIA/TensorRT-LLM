@@ -30,12 +30,18 @@ runs its build inline and enqueues no callback. They also pin that every
 worker-side guided-decoding path goes through the drained methods.
 """
 
+from queue import Queue
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
-from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder, GuidedDecoder
+from tensorrt_llm._torch.pyexecutor.guided_decoder import (
+    CapturableGuidedDecoder,
+    GuidedDecoder,
+    GuidedRequests,
+)
 from tensorrt_llm._torch.speculative.interface import SpecWorkerBase
 
 
@@ -73,6 +79,14 @@ def _decoder(cls):
     decoder.bitmask_event = MagicMock(name="bitmask_event")
     decoder.requests = []
     decoder.max_num_draft_tokens = 1
+    decoder.queue = Queue()
+    # Skip state as __init__ / add_batch leave it: a batch with a guided
+    # request, so the drain tests exercise the normal path.
+    decoder._no_guided_requests = False
+    decoder._step_skip = None
+    decoder._cur_step_eager = False
+    decoder._prev_step_eager = False
+    decoder._num_added_batches = 0
     for name in (
         "fetch_batch",
         "init_disagg_gen_requests",
@@ -148,6 +162,195 @@ def test_no_drain_for_the_non_capturable_decoder():
     _run(lambda: decoder.execute(MagicMock(name="logits")), capturing=False)
 
     decoder.bitmask_event.synchronize.assert_not_called()
+
+
+def _unguided_eager_step(decoder, *, prev_step_eager=True):
+    """State after ``add_batch`` for a batch without guided requests."""
+    decoder._no_guided_requests = True
+    decoder._step_skip = None
+    decoder._cur_step_eager = False
+    decoder._prev_step_eager = prev_step_eager
+
+
+@pytest.mark.parametrize("method", _ENQUEUE_METHODS)
+def test_unguided_eager_step_after_eager_step_skips(method):
+    """No guided request and nothing pending from a graph step: no grammar work, no drain."""
+    decoder = _decoder(CapturableGuidedDecoder)
+    _unguided_eager_step(decoder)
+    _run(_call(decoder, method), capturing=False)
+
+    decoder.bitmask_event.synchronize.assert_not_called()
+    decoder.build.assert_not_called()
+    decoder.apply_bitmask.assert_not_called()
+    decoder.add_accepted_batch.assert_not_called()
+    decoder.fetch_accepted_batch.assert_not_called()
+    decoder.rollback_rejected_tokens.assert_not_called()
+
+
+@pytest.mark.parametrize("method", _ENQUEUE_METHODS)
+def test_first_eager_step_after_graph_step_still_drains(method):
+    """Host nodes of the previous (captured) step may still be pending, so keep the drain."""
+    decoder = _decoder(CapturableGuidedDecoder)
+    _unguided_eager_step(decoder, prev_step_eager=False)
+    _run(_call(decoder, method), capturing=False)
+
+    decoder.bitmask_event.synchronize.assert_called_once_with()
+
+
+_CAPTURED_CALLS = {
+    "execute": (
+        "fetch_batch",
+        "init_disagg_gen_requests",
+        "build",
+        "copy_bitmask",
+        "apply_bitmask",
+    ),
+    "execute_draft_batch": (
+        "fetch_draft_batch",
+        "rollback_rejected_tokens",
+        "build",
+        "rollback_draft_tokens",
+        "copy_bitmask",
+        "apply_bitmask",
+    ),
+    "rollback_rejected_batch": (
+        "add_accepted_batch",
+        "fetch_accepted_batch",
+        "rollback_rejected_tokens",
+    ),
+}
+
+
+@pytest.mark.parametrize("method", _ENQUEUE_METHODS)
+def test_no_skip_while_capturing(method):
+    """A captured step never skips: its host nodes run at replay and need their queue entry."""
+    decoder = _decoder(CapturableGuidedDecoder)
+    decoder.queue.put("captured-step")
+    _unguided_eager_step(decoder)
+    _run(_call(decoder, method), capturing=True)
+
+    assert decoder._step_skip is None
+    assert decoder._cur_step_eager is False
+    assert list(decoder.queue.queue) == ["captured-step"]
+    for name in _CAPTURED_CALLS[method]:
+        getattr(decoder, name).assert_called_once()
+    decoder.bitmask_event.record.assert_called_once_with()
+
+
+def _add_batch(decoder, *, guided):
+    """Submit one batch through the real ``add_batch``; only the request snapshot is stubbed."""
+    params = object() if guided else None
+    requests = SimpleNamespace(requests=[SimpleNamespace(guided_decoding_params=params)])
+    with patch.object(GuidedRequests, "from_scheduled_requests", return_value=requests):
+        decoder.add_batch(MagicMock(name="scheduled_requests"))
+
+
+def _eager_execute(decoder):
+    _run(_call(decoder, "execute"), capturing=False)
+
+
+def _decoder_after_an_eager_step():
+    decoder = _decoder(CapturableGuidedDecoder)
+    _add_batch(decoder, guided=False)
+    _eager_execute(decoder)
+    # The first eager step follows a step that wasn't eager, so it keeps the normal path.
+    decoder.build.assert_called_once()
+    decoder.apply_bitmask.assert_called_once()
+    decoder.bitmask_event.synchronize.assert_called_once_with()
+    decoder.build.reset_mock()
+    decoder.apply_bitmask.reset_mock()
+    decoder.bitmask_event.synchronize.reset_mock()
+    return decoder
+
+
+def test_add_batch_unguided_batch_after_eager_step_skips():
+    decoder = _decoder_after_an_eager_step()
+    _add_batch(decoder, guided=False)
+    _eager_execute(decoder)
+
+    decoder.build.assert_not_called()
+    decoder.apply_bitmask.assert_not_called()
+    decoder.bitmask_event.synchronize.assert_not_called()
+
+
+def test_add_batch_guided_batch_after_eager_step_runs_the_grammar():
+    decoder = _decoder_after_an_eager_step()
+    _add_batch(decoder, guided=True)
+    _eager_execute(decoder)
+
+    decoder.build.assert_called_once()
+    decoder.apply_bitmask.assert_called_once()
+    decoder.bitmask_event.synchronize.assert_called_once_with()
+
+
+_BATCH_ADD_METHODS = {
+    "add_draft_batch": lambda decoder: CapturableGuidedDecoder.add_draft_batch(
+        decoder, torch.zeros(1), torch.ones(1), draft_step=0
+    ),
+    # The fixture mocks ``add_accepted_batch`` for the rollback tests, so call the real one.
+    "add_accepted_batch": lambda decoder: CapturableGuidedDecoder.add_accepted_batch(
+        decoder, torch.ones(1)
+    ),
+}
+
+
+def _batch_add_decoder():
+    decoder = _decoder(CapturableGuidedDecoder)
+    decoder.requests = [object()]
+    decoder.new_tokens = MagicMock(name="new_tokens")
+    decoder.num_accepted_tokens = MagicMock(name="num_accepted_tokens")
+    return decoder
+
+
+@pytest.mark.parametrize("method", _BATCH_ADD_METHODS)
+def test_batch_add_on_a_skipped_step_copies_nothing(method):
+    decoder = _batch_add_decoder()
+    _unguided_eager_step(decoder)
+    _run(lambda: _BATCH_ADD_METHODS[method](decoder), capturing=False)
+
+    decoder.new_tokens.__getitem__.assert_not_called()
+    decoder.num_accepted_tokens.__getitem__.assert_not_called()
+    decoder.token_event.record.assert_not_called()
+
+
+@pytest.mark.parametrize("method", _BATCH_ADD_METHODS)
+def test_batch_add_while_capturing_copies_and_records(method):
+    """A captured step never skips, even when its batch is unguided."""
+    decoder = _batch_add_decoder()
+    _unguided_eager_step(decoder)
+    _run(lambda: _BATCH_ADD_METHODS[method](decoder), capturing=True)
+
+    decoder.num_accepted_tokens.__getitem__.return_value.copy_.assert_called_once()
+    if method == "add_draft_batch":
+        decoder.new_tokens.__getitem__.return_value.copy_.assert_called_once()
+    decoder.token_event.record.assert_called_once_with()
+    assert decoder._step_skip is None
+
+
+@pytest.mark.parametrize("method", _BATCH_ADD_METHODS)
+def test_batch_add_on_a_guided_step_copies_and_records(method):
+    decoder = _batch_add_decoder()
+    _run(lambda: _BATCH_ADD_METHODS[method](decoder), capturing=False)
+
+    decoder.num_accepted_tokens.__getitem__.return_value.copy_.assert_called_once()
+    if method == "add_draft_batch":
+        decoder.new_tokens.__getitem__.return_value.copy_.assert_called_once()
+    decoder.token_event.record.assert_called_once_with()
+
+
+def test_skipped_step_consumes_only_its_own_queue_entry():
+    """A skipped step drops the newest entry; older ones belong to pending graph host nodes."""
+    decoder = _decoder(CapturableGuidedDecoder)
+    decoder.queue.put("graph-step")
+    decoder.queue.put("this-step")
+    _unguided_eager_step(decoder)
+
+    _run(lambda: decoder.execute(MagicMock(name="logits")), capturing=False)
+    _run(
+        lambda: decoder.execute_draft_batch(MagicMock(name="logits"), draft_step=0), capturing=False
+    )
+
+    assert list(decoder.queue.queue) == ["graph-step"]
 
 
 def test_worker_executes_the_guided_decoder():
