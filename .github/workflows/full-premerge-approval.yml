@@ -20,7 +20,7 @@ on:
   # out or executes PR code; it uses GitHub APIs to validate membership and
   # manage this PR's approval label/comment.
   pull_request_target:
-    types: [labeled]
+    types: [labeled, synchronize]
   workflow_run:
     workflows: [Full Pre-Merge Approval Signal]
     types: [completed]
@@ -41,6 +41,9 @@ jobs:
     if: >-
       github.repository == 'NVIDIA/TensorRT-LLM' &&
       (github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'pull_request_target' &&
+        github.event.action == 'synchronize' &&
+        !contains(github.event.pull_request.labels.*.name, 'ci: full pre-merge approved')) ||
        (github.event_name == 'workflow_run' &&
         github.event.workflow_run.conclusion == 'success' &&
         startsWith(github.event.workflow_run.display_title,
@@ -63,7 +66,7 @@ jobs:
         uses: actions/github-script@v8
         env:
           AGENT_TOKEN: ${{ secrets.TRTLLM_AGENT_SHARED_TOKEN }}
-          DISPATCH_PULL_NUMBER: ${{ inputs.pull_number }}
+          DISPATCH_PULL_NUMBER: ${{ github.event.pull_request.number || inputs.pull_number }}
           SIGNAL_PATH: ${{ runner.temp }}/full-premerge-approval/pr-number.txt
         with:
           github-token: ${{ secrets.TRTLLM_AGENT_SHARED_TOKEN }}
