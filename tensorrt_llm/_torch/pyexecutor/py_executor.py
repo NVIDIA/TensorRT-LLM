@@ -4677,7 +4677,11 @@ class PyExecutor:
         sample_state = executed_batch.sample_state
         requests = sample_state.requests
 
-        if not self.dist.is_last_pp_rank:
+        if self.dist.is_last_pp_rank:
+            # The other ranks only get the host part of the state; the sampler
+            # completes it with what they need of the step before it leaves.
+            self.sampler.prepare_handoff(sample_state)
+        else:
             # Receive tokens from previous pp rank (w.r.t model forward direction)
             with nvtx_range("recv_sample_state"):
                 sample_state.host, py_result_diffs = self.dist.recv_object(
