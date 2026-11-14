@@ -23,6 +23,7 @@ import functools
 import gc
 import math
 import os
+import weakref
 from types import SimpleNamespace
 
 import numpy as np
@@ -81,6 +82,7 @@ def _reference_prefix_state(
 
 @pytest.mark.parametrize("tail_len, with_mask, group", [(4, True, 2), (1, False, 4), (3, False, 1)])
 def test_merge_prefix_and_tail_matches_dense_attention(tail_len, with_mask, group):
+    """Merge prefix and tail matches dense attention."""
     gen = torch.Generator().manual_seed(1234)
     rows, num_kv_heads, head_dim, prefix_len = 6, 2, 64, 37
     num_heads = num_kv_heads * group
@@ -127,6 +129,7 @@ class _ManagerV2:
     """The KV cache manager V2 surface the library reads, with the page tables of beam 0."""
 
     def __init__(self, beam0_pages, *, page_scale=2, num_pages=256, **overrides):
+        """Record the fake manager's page tables."""
         self.beam0_pages = beam0_pages  # request id -> pages of the layer's get_buffers view
         self.page_scale = page_scale
         self.num_pages = num_pages
@@ -139,12 +142,15 @@ class _ManagerV2:
         self.__dict__.update(overrides)
 
     def get_buffers(self, layer_idx, kv_layout="NHD"):
+        """A pool of the fake manager's size (only its page count is read)."""
         return torch.empty(self.num_pages, 2, 1, self.tokens_per_block, 8)
 
     def get_layer_page_index_scale(self, layer_idx):
+        """Page-index scale of the fake pool."""
         return self.page_scale
 
     def get_batch_cache_indices(self, request_ids, layer_idx=None, num_blocks_per_seq=None):
+        """Pages of each request's prompt."""
         return [self.beam0_pages[rid][:n] for rid, n in zip(request_ids, num_blocks_per_seq)]
 
 
@@ -430,6 +436,7 @@ def test_plan_step_drops_the_previous_plan_when_a_step_is_not_planned(monkeypatc
 
 
 def test_prefix_request_tables_chunk_skip_empty_groups_and_size_the_last_page():
+    """Prefix request tables chunk skip empty groups and size the last page."""
     i32 = lambda *v: np.array(v, dtype=np.int32)  # noqa: E731
     # Group 0: 200 queries over 3 pages (last holds 1 token); group 1: empty; group 2: 4 queries.
     groups = PrefixGroups(
@@ -452,7 +459,11 @@ def test_prefix_request_tables_chunk_skip_empty_groups_and_size_the_last_page():
 
 
 def test_float_workspace_is_owned_per_kv_cache_manager_and_released_with_it():
+    """Float workspace is owned per kv cache manager and released with it."""
+
     class Manager:
+        """A stand-in KV cache manager."""
+
         pass
 
     cpu = torch.device("cpu")
@@ -460,9 +471,11 @@ def test_float_workspace_is_owned_per_kv_cache_manager_and_released_with_it():
     a = _get_float_workspace(first, cpu, 1024)
     assert _get_float_workspace(first, cpu, 1024) is a
     assert _get_float_workspace(second, cpu, 1024) is not a
+    second_ref = weakref.ref(second)
     del second
     gc.collect()
-    assert len(_float_workspace) == 1
+    assert second_ref() is None
+    assert first in _float_workspace
 
 
 @needs_flashinfer
@@ -472,6 +485,8 @@ def test_replanning_a_cuda_graph_wrapper_does_not_wait_for_the_gpu():
     (it would serialize the host with the previous step and defeat the overlap scheduler)."""
 
     class Manager:
+        """A stand-in KV cache manager."""
+
         max_blocks_per_seq = 8
         max_batch_size = 2
         max_beam_width = 4
@@ -527,6 +542,7 @@ def test_run_generation_without_a_step_plan_runs_the_regular_kernel():
 
 @needs_flashinfer
 def test_plan_step_rejects_an_invalid_prompt_page_index(monkeypatch):
+    """Plan step rejects an invalid prompt page index."""
     monkeypatch.setenv("TLLM_FMHA_LIBS", f"+{LIB_NAME}")
     manager = _ManagerV2({7: [40, 41, -1, 43], 9: [50, 51, 52]})
     with pytest.raises(RuntimeError, match="invalid page index"):
@@ -562,6 +578,7 @@ def test_library_serves_only_models_that_apply_position_embeddings_themselves(
 
 
 def _qwen3_small_path():
+    """The local Qwen3-0.6B checkpoint, or None when it is not available."""
     root = llm_models_root(check=False)
     if root is None:
         return None
@@ -592,12 +609,14 @@ def _run_beam_search(
         iterations.update(mixed=0, planned=0, served=0)
 
         def counting_run_generation(self, params):
+            """Count served generation calls."""
             iterations["served"] += 1
             return run_generation(self, params)
 
         lib.BeamSharedPrefixFmha.run_generation = counting_run_generation
 
         def counting_plan_step(metadata):
+            """Count planned steps."""
             plan_step(metadata)
             iterations["mixed"] += int(metadata.num_contexts > 0 and metadata.num_generations > 0)
             state = metadata.fmha_plan_caches.get(LIB_NAME)
@@ -643,6 +662,7 @@ def _run_beam_search(
 
 
 def _assert_beams_match(reference, candidate, beam_width, min_overlap=0.85):
+    """Compare the candidate's beams with the default kernel's."""
     for ref_beams, cand_beams in zip(reference, candidate):
         assert len(cand_beams) == beam_width
         ref_tokens = [tokens for tokens, _ in ref_beams]
@@ -669,6 +689,7 @@ _BOUNDARY_MAX_TOKENS = 5
 
 
 def _e2e_prompts(lengths):
+    """Deterministic prompts of the given lengths."""
     vocab = 150000
     return [
         [1024 + ((17 * i + 13 * p) % (vocab - 1024)) for p in range(n)]
@@ -740,6 +761,7 @@ def test_beam_shared_prefix_tails_cross_a_kv_block_boundary_e2e():
 
 
 def _fa4_prefix_available() -> bool:
+    """Whether the FA4 prefix backend can run here."""
     if not torch.cuda.is_available():
         return False
     from tensorrt_llm._torch.attention.backends.fmha.beam_shared_prefix import _fa4_supported

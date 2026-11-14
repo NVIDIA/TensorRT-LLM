@@ -107,6 +107,7 @@ _float_workspace: "weakref.WeakKeyDictionary[Any, torch.Tensor]" = weakref.WeakK
 
 
 def _backend_from_env() -> str:
+    """The backend the environment selects (the default when unset)."""
     value = os.environ.get(BACKEND_ENV, "").strip()
     return value or DEFAULT_BACKEND
 
@@ -136,6 +137,7 @@ class _Config:
 
     @classmethod
     def from_env(cls) -> "_Config":
+        """Read the environment settings."""
         value = os.environ.get(MAX_TAIL_ENV)
         max_tail = DEFAULT_MAX_TAIL if value is None or not value.strip() else int(value)
         if max_tail < 0:
@@ -149,6 +151,7 @@ class _Config:
 
     @property
     def fa4(self) -> bool:
+        """Whether the FA4 prefix backend is selected."""
         return self.backend == FA4_BACKEND
 
 
@@ -177,9 +180,10 @@ def _float_workspace_bytes(
 
 @functools.lru_cache(maxsize=8)
 def _enabled_for(libs_env: Optional[str]) -> bool:
-    from .registry import get_enabled_fmha_lib_classes
+    """Whether this ``TLLM_FMHA_LIBS`` value enables the library."""
+    from .registry import is_fmha_lib_enabled
 
-    return BeamSharedPrefixFmha in get_enabled_fmha_lib_classes()
+    return is_fmha_lib_enabled(LIB_NAME)
 
 
 def _lib_enabled() -> bool:
@@ -196,6 +200,7 @@ class _PlanKey:
     def __init__(
         self, num_heads: int, num_kv_heads: int, head_dim: int, dtype: torch.dtype, sm_scale: float
     ):
+        """Shape family of one layer's prefix call."""
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
@@ -203,12 +208,15 @@ class _PlanKey:
         self.sm_scale = sm_scale
 
     def _tuple(self):
+        """The fields that identify the shape family."""
         return (self.num_heads, self.num_kv_heads, self.head_dim, self.dtype, self.sm_scale)
 
     def __eq__(self, other) -> bool:
+        """Equal when the shape families are equal."""
         return isinstance(other, _PlanKey) and self._tuple() == other._tuple()
 
     def __hash__(self) -> int:
+        """Hash of the shape family."""
         return hash(self._tuple())
 
 
@@ -283,6 +291,7 @@ class _Fa4Slot:
         tokens_per_block: int,
         device: torch.device,
     ) -> "_Fa4Slot":
+        """Allocate the slot's device buffers."""
         from .shared_prefix_fa4 import Fa4Prefix
 
         prefix = Fa4Prefix(
@@ -303,6 +312,7 @@ class _Fa4Slot:
         return cls(prefix=prefix, rows=rows, staging=staging, copied=torch.cuda.Event())
 
     def upload(self, groups: PrefixGroups) -> None:
+        """Upload the step's prefix request tables."""
         if self.pending:
             # The previous copies out of the staging buffers must have run.
             self.copied.synchronize()
@@ -554,6 +564,7 @@ def _prefix_groups(plan: _HostPlan) -> PrefixGroups:
 
 
 def _plan_fa4_slot(state: _BeamStepState, key: _PlanKey) -> None:
+    """Upload this step's prefix tables to a layer's FA4 slot."""
     plan = state.plan
     assert plan is not None
     slot = state.fa4_slots[key]
@@ -569,6 +580,7 @@ def _plan_fa4_slot(state: _BeamStepState, key: _PlanKey) -> None:
 def _create_fa4_slot(
     state: _BeamStepState, key: _PlanKey, metadata: "TrtllmAttentionMetadata"
 ) -> _Fa4Slot:
+    """Allocate an FA4 slot sized for the current plan."""
     plan = state.plan
     assert plan is not None
     return _Fa4Slot.create(
@@ -584,6 +596,7 @@ def _create_fa4_slot(
 def _plan_wrapper(
     state: _BeamStepState, key: _PlanKey, wrapper: Any, metadata: "TrtllmAttentionMetadata"
 ) -> None:
+    """Re-plan a layer's FlashInfer wrapper for the current step."""
     plan = state.plan
     assert plan is not None
     qo_indptr = plan.qo_indptr
@@ -620,6 +633,7 @@ def _plan_wrapper(
 def _create_wrapper(
     state: _BeamStepState, key: _PlanKey, metadata: "TrtllmAttentionMetadata"
 ) -> Any:
+    """Build a layer's FlashInfer wrapper (static buffers under CUDA graphs)."""
     device = metadata.kv_cache_block_offsets.device
     kwargs: Dict[str, Any] = {}
     if state.is_cuda_graph:
@@ -783,6 +797,7 @@ class BeamSharedPrefixFmha(PhasedFmha):
     supports_workspace_reclamation = False
 
     def __init__(self, attn: "TrtllmAttention"):
+        """Create the library for one attention layer."""
         super().__init__(attn)
         # Context requests that share a step with the beams run on the regular library.
         self._context_impl = FallbackFmha(attn)
@@ -794,6 +809,7 @@ class BeamSharedPrefixFmha(PhasedFmha):
 
     @classmethod
     def _is_available(cls, attn: "TrtllmAttention") -> bool:
+        """Whether this layer's attention module can use the library."""
         if not IS_FLASHINFER_AVAILABLE:
             return False
         if (
@@ -839,6 +855,7 @@ class BeamSharedPrefixFmha(PhasedFmha):
         *,
         phase: Optional[FmhaPhase] = None,
     ) -> bool:
+        """Whether this forward can use the library; the plan itself is built in ``prepare``."""
         if phase == FmhaPhase.CONTEXT:
             return False
         if not metadata_eligible(metadata):
@@ -887,6 +904,7 @@ class BeamSharedPrefixFmha(PhasedFmha):
             self._pool_manager = manager
 
     def _pool_view(self, metadata: "TrtllmAttentionMetadata") -> torch.Tensor:
+        """This layer's KV pool in HND layout, cached per KV cache manager."""
         layer_idx = self.attn.layer_idx
         pool = self._pool_views.get(layer_idx)
         if pool is None:
@@ -905,12 +923,15 @@ class BeamSharedPrefixFmha(PhasedFmha):
         forward_args: AttentionForwardArgs,
         workspace: torch.Tensor,
     ) -> None:
+        """Context rows use the regular library's workspace."""
         self._context_impl.prepare_workspace(q, k, v, metadata, forward_args, workspace)
 
     def run_context(self, params: FmhaParams) -> None:
+        """Context rows run on the regular library."""
         self._context_impl.run_context(params)
 
     def run_generation(self, params: FmhaParams) -> None:
+        """Generation rows: shared prefix, tail and merge, or the regular kernel when unplanned."""
         attn = params.attn
         metadata = params.meta
         qkv = params.qkv_input
@@ -1092,6 +1113,7 @@ class BeamSharedPrefixFmha(PhasedFmha):
         num_kv_heads: int,
         sm_scale: float,
     ) -> torch.Tensor:
+        """Reference tail attention and merge, used when the fused tail is disabled."""
         rows = q.shape[0]
         if plan.tail_len > 0:
             assert indices.tail_page is not None and indices.tail_slot is not None
@@ -1176,6 +1198,7 @@ def _check_plan(
 
 
 def _check_indices(indices: _StepIndices, pool: torch.Tensor, tokens_per_block: int) -> None:
+    """Debug check of the step's page and slot indices."""
     num_pages = pool.size(0)
     for name, tensor, bound in (
         ("write_page", indices.write_page, num_pages),
