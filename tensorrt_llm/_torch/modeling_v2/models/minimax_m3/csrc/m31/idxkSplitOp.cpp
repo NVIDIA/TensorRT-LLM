@@ -44,6 +44,12 @@ void checkLaunch(cudaError_t err, char const* op)
     }
 }
 
+//! The kernels read every tensor argument on the launch device (the peer addresses of Dest are separate).
+void checkDevice(torch::Tensor const& t, c10::Device device, char const* op, char const* name)
+{
+    TORCH_CHECK(t.device() == device, op, ": ", name, " must be on the launch device ", device, ", not ", t.device());
+}
+
 void checkEpoch(torch::Tensor const& epoch, char const* op)
 {
     TORCH_CHECK(epoch.is_cuda() && epoch.scalar_type() == torch::kInt32 && epoch.numel() >= 1, op,
@@ -65,8 +71,10 @@ ks::Dest makeDest(int64_t mcPtr, torch::Tensor const& dstPtrs, char const* op)
     d.world = 0;
     if (mcPtr == 0)
     {
-        TORCH_CHECK(!dstPtrs.is_cuda() && dstPtrs.scalar_type() == torch::kInt64 && dstPtrs.numel() == ks::kWorld, op,
-            ": without a multicast address, dst_ptrs must be a CPU int64 tensor of 8 workspace addresses");
+        TORCH_CHECK(!dstPtrs.is_cuda() && dstPtrs.scalar_type() == torch::kInt64 && dstPtrs.numel() == ks::kWorld
+                && dstPtrs.is_contiguous(),
+            op,
+            ": without a multicast address, dst_ptrs must be a contiguous CPU int64 tensor of 8 workspace addresses");
         auto const* p = dstPtrs.data_ptr<int64_t>();
         for (int r = 0; r < ks::kWorld; ++r)
         {
@@ -100,6 +108,10 @@ void minimaxM3Sm107Tp8IdxkCompact(torch::Tensor const& blockTable, torch::Tensor
             && scoreLens.numel() >= batch,
         op, ": score_lens must be contiguous int32 CUDA with at least B elements");
     checkEpoch(epoch, op);
+    checkDevice(seqLens, blockTable.device(), op, "seq_lens");
+    checkDevice(cbt, blockTable.device(), op, "cbt");
+    checkDevice(scoreLens, blockTable.device(), op, "score_lens");
+    checkDevice(epoch, blockTable.device(), op, "epoch");
     c10::cuda::CUDAGuard const guard{blockTable.device()};
     auto const stream = at::cuda::getCurrentCUDAStream(blockTable.get_device());
     checkLaunch(
@@ -125,8 +137,12 @@ void minimaxM3Sm107Tp8IdxkQx(torch::Tensor const& idxQ, torch::Tensor const& wor
     TORCH_CHECK(qTile.is_cuda() && qTile.element_size() == 1 && qTile.is_contiguous() && qTile.dim() == 3
             && qTile.size(0) >= rows && qTile.size(1) == ks::kHeads && qTile.size(2) == ks::kHeadDim,
         op, ": q_tile must be a contiguous 1-byte CUDA tensor [>= rows, 4, 128]");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(qTile.data_ptr()) % 4 == 0, op, ": q_tile must be 4-byte aligned");
     checkWorkspace(workspace, rowsMax, op);
     checkEpoch(epoch, op);
+    checkDevice(workspace, idxQ.device(), op, "workspace");
+    checkDevice(qTile, idxQ.device(), op, "q_tile");
+    checkDevice(epoch, idxQ.device(), op, "epoch");
     ks::Dest const dest = makeDest(mcPtr, dstPtrs, op);
     c10::cuda::CUDAGuard const guard{idxQ.device()};
     auto const stream = at::cuda::getCurrentCUDAStream(idxQ.get_device());
@@ -158,6 +174,8 @@ void minimaxM3Sm107Tp8IdxkTopk(torch::Tensor const& scores, torch::Tensor const&
         numCols >= 1 && scores.size(2) >= (std::min<int64_t>(numCols, ks::kMaxBlocks) + ks::kWorld - 1) / ks::kWorld,
         op, ": the score buffer is narrower than the rank's compact blocks at num_cols");
     checkEpoch(epoch, op);
+    checkDevice(nValidBlocks, scores.device(), op, "n_valid_blocks");
+    checkDevice(epoch, scores.device(), op, "epoch");
     ks::Dest const dest = makeDest(mcPtr, dstPtrs, op);
     c10::cuda::CUDAGuard const guard{scores.device()};
     auto const stream = at::cuda::getCurrentCUDAStream(scores.get_device());
@@ -184,6 +202,9 @@ void minimaxM3Sm107Tp8IdxkMerge(torch::Tensor& workspace, torch::Tensor const& n
     TORCH_CHECK(localBlocks >= 1 && initBlocks >= 0, op, ": local_blocks must be >= 1 and init_blocks >= 0");
     checkWorkspace(workspace, rowsMax, op);
     checkEpoch(epoch, op);
+    checkDevice(workspace, out.device(), op, "workspace");
+    checkDevice(nValidBlocks, out.device(), op, "n_valid_blocks");
+    checkDevice(epoch, out.device(), op, "epoch");
     c10::cuda::CUDAGuard const guard{out.device()};
     auto const stream = at::cuda::getCurrentCUDAStream(out.get_device());
     checkLaunch(ks::invokeMerge(reinterpret_cast<unsigned long long*>(workspace.data_ptr<int64_t>()),
