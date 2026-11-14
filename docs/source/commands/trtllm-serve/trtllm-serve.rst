@@ -154,6 +154,8 @@ Another example uses ``curl``:
     :language: bash
     :linenos:
 
+A request that sets no ``max_output_tokens`` is uncapped and may generate until the context is full. ``TRTLLM_RESPONSES_DEFAULT_MAX_OUTPUT_TOKENS`` sets a server-wide cap (a positive integer) for such requests; a request's own ``max_output_tokens`` always wins, and the response reports the applied default. A value that is not a positive integer is reported with a warning at the first request and ignored. In disaggregated serving, set it on the generation (and context) workers; the frontend does not preprocess requests.
+
 
 More openai compatible examples can be found in the `compatibility examples <https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/serve/compatibility>`_ directory.
 
