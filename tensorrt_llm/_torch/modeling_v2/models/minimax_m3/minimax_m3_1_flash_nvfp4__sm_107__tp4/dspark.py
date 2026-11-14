@@ -184,31 +184,24 @@ def install_draft_oneshot_allreduce(draft: nn.Module, max_rows: int) -> int:
     return n
 
 
-# BUNDLE_OFF_NOTE: S2 (prebuild below) stays OFF by default with the draft length 3 set {S9b, S5, S2, FUSED_CAPTURE}:
-# its powered K7 natural-acceptance gate (n 1,776) failed (mean d -0.032 AL, CI [-0.059, -0.005], median -0.022, sign p
-# 0.037 against) (this applies to the sm_107 target too), pending the per-member bisect. S9b and S5 passed their own
-# per-member gates (below); S5 is on by default at this target (batch 1 at K7, see S5_MAX_BATCH_BY_K), S9b stays opt-in
-# (drafter-only precision, not bitwise vs the default path). Opt in with TRTLLM_M31_ENABLE_<ID>=1;
-# TRTLLM_M31_DISABLE_<ID>=1 still wins. FUSED_CAPTURE does not exist in this target.
+# Drafter items' defaults: S2 (prebuild below) stays off by default, because the draft length 3 set {S9b, S5, S2,
+# FUSED_CAPTURE} lowered the K7 natural acceptance length measurably (mean -0.032, 95% CI [-0.059, -0.005]); S9b and
+# S5 passed their own acceptance checks (below). S5 is on by default at this target (batch 1 at K7, see
+# S5_MAX_BATCH_BY_K); S9b stays opt-in (drafter-only precision, not bitwise vs the default path). Opt in with
+# TRTLLM_M31_ENABLE_<ID>=1; TRTLLM_M31_DISABLE_<ID>=1 still wins. FUSED_CAPTURE does not exist in this target.
 
 # S9b (fused drafter all-reduce + norm): opt-in at this TP (TRTLLM_M31_ENABLE_DRAFT_AR_NORM_FUSED=1;
-# TRTLLM_M31_DISABLE_DRAFT_AR_NORM_FUSED wins). Its fused all-reduce now runs the one-shot path (S9b-VR-a's
-# DraftOneshotAllReduce at the decode rows) instead of the untuned AUTO path that cost TP4 +0.5% / step. SM107 TP4 K7
-# b1, deployed GEN wheel: decode step -11.6 us median (-11.4 / -11.7 at 131-134K, -11.4 at 400-403K); its own powered K7
-# natural-acceptance gate passed (1,658 greedy request pairs, mean d -0.0012 AL of 3.604, 95% CI [-0.0047, +0.0024],
-# line -1% = -0.036). Stays opt-in: on the current TP4 stack (one-node in-model comparison against the default path,
-# same node, K7, 1,400+ decode steps per cell) it was -51 us at b1 128K but +66..+98 us at b1 512K and +44 us at b2 128K
-# (b2 512K flat).
+# TRTLLM_M31_DISABLE_DRAFT_AR_NORM_FUSED wins). Its fused all-reduce runs the one-shot path (S9b-VR-a's
+# DraftOneshotAllReduce at the decode rows) instead of the untuned AUTO path. Its acceptance length matches the default
+# path (mean -0.0012 of 3.604, 95% CI [-0.0047, +0.0024]). It stays opt-in because its decode-step gain on SM107 TP4 K7
+# depends on the batch and context: faster at batch 1 and 128K, slower at batch 1 and 512K and at batch 2.
 S9B_DEFAULT_ON = False
 
 # S5 (window-capped drafter attention max_seq_len, prebuild below): on by default at this TP; kill switch
-# TRTLLM_M31_DISABLE_S5=1 (TRTLLM_M31_ENABLE_S5=1 is accepted and changes nothing). SM107 TP4 K7 b1, deployed GEN
-# wheel: decode step -28.1 us median (-28.9 / -28.1 at 131-134K, -27.3 at 400-403K; the cap is against the
-# served max_seq_len, so the saving does not depend on the context); its own powered K7 natural-acceptance gate
-# passed (1,658 greedy request pairs, mean d -0.0012 AL of 3.604, 95% CI [-0.0042, +0.0019], line -1% = -0.036).
-# Current TP4 stack, one-node in-model comparison against the default path (same node, K7, 1,400+ decode steps per
-# cell): b1 -37.7 us at 128K, -15.3 / -27.2 us at 512K (two reads); b2 +39.2 us at 128K, +49.4 us at 512K -> the K7
-# bound is batch 1 (S5_MAX_BATCH_BY_K).
+# TRTLLM_M31_DISABLE_S5=1 (TRTLLM_M31_ENABLE_S5=1 is accepted and changes nothing). The cap is against the served
+# max_seq_len, so its decode-step saving at SM107 TP4 K7 batch 1 does not depend on the context; its acceptance length
+# matches the default path (mean -0.0012 of 3.604, 95% CI [-0.0042, +0.0019]). At batch 2 it is slower, so the K7 bound
+# is batch 1 (S5_MAX_BATCH_BY_K).
 S5_DEFAULT_ON = True
 
 
