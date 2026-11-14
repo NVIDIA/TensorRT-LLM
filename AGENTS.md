@@ -235,6 +235,29 @@ New C++ unit tests should use `add_tllm_gtest` with explicit `SOURCES`,
 for integration tests and include `gpu` in `LABELS` for tests that need a GPU.
 CI controls test concurrency through `parallel_run_ctest`. `google-tests`
 continues to build all C++ tests; component aggregate targets build migrated tests.
+C++ integration fixtures build the collected tests with incremental native targets.
+`cpp-tests-<directory>` targets (for example `cpp-tests-common` or
+`cpp-tests-executor-bounce`) mirror recursive CTest directory coverage, including
+legacy and full-stack executables. OWNER aggregates are component subsets and
+are not interchangeable with these directory targets.
+The Linux Release source-build fixture reuses the installed CI library for the
+RNN formatter test. CI source and wheel use the same commit and image per
+architecture. Link/load errors fail the tests. Direct CMake builds use source
+libraries unless explicitly configured otherwise.
+`CONFIG_LINUX_X86_64_VANILLA` and `CONFIG_LINUX_AARCH64` also build `google-tests`
+and publish the `cpp_test_bundle` CMake component as a separate
+`cpp-tests-<main-tar-name>` artifact. The main package does not include the test
+programs. Only `-CPP-` stages using these two build configurations fetch and unpack
+the companion into `src/cpp/build`, including fat-image consumers. Build reuse
+requires both artifacts. Linux Release integration fixtures use this bundle
+directly, retaining CTest selection and retries. The two FMHA tests share a
+test-only library packaged next to their executables; other runtime libraries
+come from the matching installed wheel. Test artifacts keep symbols but omit
+BOLT's extra relocation records.
+CPP stages collect only `tests/integration/defs/cpp` and use the standard test
+environment setup. CTest discovers cases on the test node, so the build stage
+does not need a GPU. Without a bundle, or with
+an explicit `TRTLLM_BUILD_ROOT`, fixtures retain the incremental build path.
 
 ### Vendor source tools and promotion
 

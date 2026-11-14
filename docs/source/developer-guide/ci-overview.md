@@ -200,21 +200,21 @@ inner unittest name; platform scope does not change its matching rules.
 | --- | --- |
 | `<test>` | All platforms where the test matches and the waive file is supplied. The current prefix is added if set; unprefixed integration waives also work locally without `--test-prefix`. |
 | `full:DGX_H100/<test>` | `DGX_H100` stages, e.g. `DGX_H100-PyTorch-1`. |
-| `full:H100_PCIe/<test>` | `H100_PCIe` stages, e.g. `H100_PCIe-CPP-1`. |
+| `full:GH200/<test>` | `GH200` stages, e.g. `GH200-PyTorch-Post-Merge-1`. |
 | `full:A100X/<test>` | `A100X` stages, e.g. `A100X-PyTorch-1`. |
 | `full:CPU/<test>` | Standard `CPU-Generic-x86-*` and `CPU-Generic-arm-*` stages (`l0_cpu.yml`, zero GPUs), without GPU detection. |
-| `full:sm90/<test>` | Exact SM90 detected by the collecting pytest process; can cover both `DGX_H100` and `H100_PCIe`. See detection limits below. |
+| `full:sm90/<test>` | Exact SM90 detected by the collecting pytest process; can cover both `DGX_H100` and `GH200`. See detection limits below. |
 
 `full:` supplies a prefix instead of having one prepended. For a matching
 platform, the parser expands the part before the first `-` in `--test-prefix`
 to that full prefix. Names are case-sensitive: `H100` is not an alias for
-`DGX_H100` or `H100_PCIe`, nor is `A100` an alias for `A100X`. Copy the name from
+`DGX_H100`, nor is `A100` an alias for `A100X`. Copy the name from
 the actual invocation or [stage definitions](source:jenkins/L0_Test.groovy),
 not the GPU model or test-db filename. A bare `DGX_H100/<test>` without `full:`
 gets the current prefix prepended again.
 
 For several platforms, use one line each, such as `full:A100X/<test>` and
-`full:DGX_H100/<test>`; these exclude `H100_PCIe`. Comma lists and `*` are not
+`full:DGX_H100/<test>`; these exclude `GH200`. Comma lists and `*` are not
 expanded. Remove any unprefixed `SKIP` for that test when narrowing its scope,
 or it will still skip on other platforms.
 

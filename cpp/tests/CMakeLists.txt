@@ -33,7 +33,20 @@ if(ENABLE_MULTI_DEVICE)
   include_directories(${MPI_C_INCLUDE_DIRS})
 endif()
 
+option(TRTLLM_BUILD_CPP_TEST_BUNDLE "Package runnable C++ tests for CI" OFF)
 set(TOP_LEVEL_DIR "${PROJECT_SOURCE_DIR}/..")
+set(test_working_directory)
+if(TRTLLM_BUILD_CPP_TEST_BUNDLE)
+  # BOLT consumes wheel libraries; test binaries retain symbols without the
+  # extra static relocation records needed by the optimizer.
+  get_directory_property(test_link_options LINK_OPTIONS)
+  list(REMOVE_ITEM test_link_options "-Wl,--emit-relocs")
+  set_property(DIRECTORY PROPERTY LINK_OPTIONS "${test_link_options}")
+  set(TOP_LEVEL_DIR ".")
+  get_filename_component(cpp_test_source_root "${PROJECT_SOURCE_DIR}/.."
+                         ABSOLUTE)
+  set(test_working_directory WORKING_DIRECTORY "${cpp_test_source_root}")
+endif()
 
 add_custom_target(google-tests)
 foreach(owner common runtime executor batch-manager kernel)
@@ -122,7 +135,13 @@ function(add_tllm_gtest test_name)
     list(APPEND discovery_args TEST_PREFIX "${ARG_TEST_PREFIX}")
   endif()
   gtest_discover_tests(
-    ${test_name} ${discovery_args} DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 30
+    ${test_name}
+    ${discovery_args}
+    ${test_working_directory}
+    DISCOVERY_MODE
+    PRE_TEST
+    DISCOVERY_TIMEOUT
+    30
     PROPERTIES LABELS "${ARG_LABELS}" ${test_properties})
 
   add_dependencies(google-tests ${test_name})
@@ -166,7 +185,7 @@ function(add_gtest test_name test_src)
     list(APPEND discovery_args TEST_PREFIX "${ARGS_TEST_PREFIX}")
   endif()
   gtest_discover_tests(
-    ${test_name} ${discovery_args}
+    ${test_name} ${discovery_args} ${test_working_directory}
     PROPERTIES ${test_properties}
                DISCOVERY_MODE
                PRE_TEST # WAR for DLL discovery on windows.
@@ -177,3 +196,71 @@ function(add_gtest test_name test_src)
 endfunction()
 
 add_subdirectory(unit_tests)
+
+# Directory groups mirror recursive CTest discovery, including legacy and
+# full-stack tests that are not part of an OWNER aggregate.
+function(add_tllm_test_directory_group directory)
+  file(RELATIVE_PATH group "${PROJECT_SOURCE_DIR}/tests/unit_tests"
+       "${directory}")
+  string(REPLACE "/" "-" group "${group}")
+  set(group_target "cpp-tests-${group}")
+  add_custom_target(${group_target})
+  get_property(
+    targets
+    DIRECTORY "${directory}"
+    PROPERTY BUILDSYSTEM_TARGETS)
+  foreach(target IN LISTS targets)
+    get_target_property(type ${target} TYPE)
+    if(type STREQUAL "EXECUTABLE")
+      add_dependencies(${group_target} ${target})
+    endif()
+    if(TRTLLM_BUILD_CPP_TEST_BUNDLE AND (type STREQUAL "EXECUTABLE"
+                                         OR type STREQUAL "SHARED_LIBRARY"))
+      get_target_property(binary_dir ${target} BINARY_DIR)
+      file(RELATIVE_PATH destination "${CMAKE_BINARY_DIR}" "${binary_dir}")
+      file(RELATIVE_PATH library_path "${binary_dir}" "${CMAKE_BINARY_DIR}/lib")
+      set_target_properties(
+        ${target}
+        PROPERTIES
+          INSTALL_RPATH
+          "$ORIGIN;$ORIGIN/${library_path};$ORIGIN/${library_path}/nixl;$ORIGIN/${library_path}/ucx"
+          INSTALL_RPATH_USE_LINK_PATH TRUE)
+      target_link_options(${target} PRIVATE "LINKER:--disable-new-dtags")
+      install(
+        TARGETS ${target}
+        RUNTIME DESTINATION "${destination}"
+                COMPONENT cpp_test_bundle
+                EXCLUDE_FROM_ALL
+        LIBRARY DESTINATION "${destination}"
+                COMPONENT cpp_test_bundle
+                EXCLUDE_FROM_ALL)
+    endif()
+  endforeach()
+  get_property(
+    children
+    DIRECTORY "${directory}"
+    PROPERTY SUBDIRECTORIES)
+  foreach(child IN LISTS children)
+    add_tllm_test_directory_group("${child}")
+    add_dependencies(${group_target} ${TLLM_TEST_DIRECTORY_TARGET})
+  endforeach()
+  set(TLLM_TEST_DIRECTORY_TARGET
+      ${group_target}
+      PARENT_SCOPE)
+endfunction()
+
+get_property(
+  test_directories
+  DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/unit_tests"
+  PROPERTY SUBDIRECTORIES)
+foreach(directory IN LISTS test_directories)
+  add_tllm_test_directory_group("${directory}")
+endforeach()
+
+if(TRTLLM_BUILD_CPP_TEST_BUNDLE)
+  configure_file(InstallCppTestBundle.cmake.in InstallCppTestBundle.cmake @ONLY)
+  install(
+    SCRIPT "${CMAKE_CURRENT_BINARY_DIR}/InstallCppTestBundle.cmake"
+    COMPONENT cpp_test_bundle
+    EXCLUDE_FROM_ALL)
+endif()

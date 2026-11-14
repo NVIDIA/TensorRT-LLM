@@ -33,9 +33,9 @@ fetchHelperPath="$(dirname "${BASH_SOURCE[0]}")/$(basename "${BASH_SOURCE[0]}" |
 FETCH_TRANSFER_FAILED=4
 
 # ARTIFACTORY_NETRC holds the token of the credential that publishes build artifacts to
-# artifactory.nvidia.com and pushes CI's container images, and the package download is its only
-# reader, so it is deleted once every node of this step has finished its download, before any rank
-# starts the tests; on one node, before the package is extracted. The nodes of a multi-node step
+# artifactory.nvidia.com and pushes CI's container images, and package downloads are its only
+# readers, so it is deleted once every node has downloaded the main and optional C++ test
+# archives, before any rank starts the tests; on one node, before the package is extracted. The nodes of a multi-node step
 # share the one file in the job workspace: each marks its download finished beside it and goes on to
 # install the package, and the node that finds every node of this run of the step finished deletes
 # it. No later step of the job downloads the package again. A run that Slurm requeues after the
@@ -62,6 +62,20 @@ remove_artifactory_netrc() {
         fi
     fi
     rm -f "$netrc"
+}
+
+download_cpp_tests() {
+    cppTestArchive=""
+    if [[ -z "${cppTestTarArtifactPath:-}" ]]; then
+        return 0
+    fi
+    cppTestArchive="$resourcePathNode/cpp-tests-$tarName"
+    if ! retry_command --timeout 1800 --retry-on "$FETCH_TRANSFER_FAILED,124" \
+        bash "$fetchHelperPath" "$cppTestTarArtifactPath" "$cppTestArchive"; then
+        remove_artifactory_netrc
+        echo "C++ test artifact download failed: $cppTestTarArtifactPath"
+        return 1
+    fi
 }
 
 slurm_install_setup() {
@@ -99,9 +113,9 @@ slurm_install_setup() {
         nvidia-smi && nvidia-smi -q && nvidia-smi topo -m
         if [[ "${SKIP_INSTALL:-0}" == "1" ]]; then
             # Fat sqsh: source tree and packages are already in the container at /tmp/TensorRT-LLM/.
-            echo "SKIP_INSTALL=1: skipping wget, tar, apt, and pip installs (pre-baked in fat sqsh at /tmp/TensorRT-LLM/)"
+            echo "SKIP_INSTALL=1: using the source and wheel pre-baked in fat sqsh at /tmp/TensorRT-LLM/"
             resourcePathNode=/tmp
-            # The fat sqsh needs no download, so the netrc the job delivered is not read.
+            download_cpp_tests
             remove_artifactory_netrc
             # mamba-ssm and causal-conv1d are compiled here rather than baked into the fat
             # sqsh, as on the agent path in L0_Test.groovy: only Ray jobs pay for the build,
@@ -124,6 +138,7 @@ slurm_install_setup() {
                 echo "Artifact download failed: $llmTarArtifactPath"
                 return 1
             fi
+            download_cpp_tests
             remove_artifactory_netrc
             if [ ! -f "$archive_path" ]; then
                 rm -f "$archive_tmp"
@@ -146,6 +161,9 @@ slurm_install_setup() {
             retry_command --timeout 2700 bash -c "cd $resourcePathNode && pip3 install --retries 10 --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl"
         fi
         llmSrcNode=$resourcePathNode/TensorRT-LLM/src
+        if [[ -n "${cppTestArchive:-}" ]]; then
+            tar -zxf "$cppTestArchive" -C "$llmSrcNode"
+        fi
         cd $resourcePathNode
         gpuUuids=$(nvidia-smi -q | grep "GPU UUID" | awk '{print $4}' | tr '\n' ',' || true)
         hostNodeName="${HOST_NODE_NAME:-$(hostname -f || hostname)}"

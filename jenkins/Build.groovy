@@ -163,6 +163,9 @@ def WHEEL_ARCHS = "wheelArchs"
 def BUILD_JOBS_FOR_CONFIG = "buildJobsForConfig"
 
 @Field
+def CPP_TEST_BUNDLE = "cppTestBundle"
+
+@Field
 def CONFIG_LINUX_X86_64_VANILLA = "linux_x86_64_Vanilla"
 
 @Field
@@ -183,6 +186,7 @@ def BUILD_CONFIGS = [
   // Vanilla TARNAME is used for packaging in runLLMPackage
   // cmake-vars cannot be empty, so passing (default) multi-device configuration.
   (CONFIG_LINUX_X86_64_VANILLA) : [
+    (CPP_TEST_BUNDLE): true,
     (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars ENABLE_MULTI_DEVICE=1 --extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars NIXL_ROOT=/opt/nvidia/nvda_nixl --extra-cmake-vars MOONCAKE_ROOT=/usr/local/Mooncake --extra-cmake-vars ENABLE_BOLT_COMPATIBLE=ON --micro_benchmarks",
     (TARNAME) : "TensorRT-LLM.tar.gz",
     (WHEEL_ARCHS): "80;86;89;90;100;103;107;120",
@@ -198,6 +202,7 @@ def BUILD_CONFIGS = [
     (WHEEL_ARCHS): "80;86;89;90;100;103;107;120",
   ],
   (CONFIG_LINUX_AARCH64): [
+    (CPP_TEST_BUNDLE): true,
     (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars NIXL_ROOT=/opt/nvidia/nvda_nixl --extra-cmake-vars MOONCAKE_ROOT=/usr/local/Mooncake --extra-cmake-vars ENABLE_BOLT_COMPATIBLE=ON",
     (TARNAME) : "TensorRT-LLM-GH200.tar.gz",
     (WHEEL_ARCHS): "90;100;103;107;120;121",
@@ -663,6 +668,9 @@ def prepareLLMBuild(pipeline, config, versionOverride)
     // on the x86_64 vanilla build only, rather than in every build config.
     def typeCheck = (config == CONFIG_LINUX_X86_64_VANILLA)
     def artifacts = ["${tarName}": tarName]
+    if (buildFlags[CPP_TEST_BUNDLE]) {
+        artifacts["cpp-tests-${tarName}"] = "cpp-tests-${tarName}"
+    }
     def runner = {
         runLLMBuild(
             pipeline, buildFlags, tarName, is_linux_x86_64, versionOverride, typeCheck, artifacts)
@@ -726,6 +734,7 @@ def runLLMBuild(
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && pip3 install -r requirements-dev.txt ${pipArgs}")
 
     int buildJobs = (buildFlags[BUILD_JOBS_FOR_CONFIG] ?: BUILD_JOBS) as int
+    def cppTestArgs = buildFlags[CPP_TEST_BUNDLE] ? "--extra-cmake-vars TRTLLM_BUILD_CPP_TEST_BUNDLE=ON --extra-make-targets google-tests" : ""
 
     withEnv([
         "TRTLLM_BUILD_SOURCE_COMMIT=${env.gitlabCommit}",
@@ -736,7 +745,7 @@ def runLLMBuild(
                 // cmake will download third-party sources, so we add retry.
                 trtllm_utils.llmExecStepWithRetry(
                     pipeline,
-                    script: "cd ${LLM_ROOT} && python3 scripts/build_wheel.py --clean --use_ccache -G Ninja -j ${buildJobs} -a '${buildFlags[WHEEL_ARCHS]}' ${buildFlags[WHEEL_EXTRA_ARGS]}"
+                    script: "cd ${LLM_ROOT} && python3 scripts/build_wheel.py --clean --use_ccache -G Ninja -j ${buildJobs} -a '${buildFlags[WHEEL_ARCHS]}' ${buildFlags[WHEEL_EXTRA_ARGS]} ${cppTestArgs}"
                 )
                 break
             } catch (InterruptedException e) {
@@ -771,6 +780,15 @@ def runLLMBuild(
 
     // Step 3: packaging wheels into tarfile
     sh "cp ${LLM_ROOT}/build/tensorrt_llm-*.whl TensorRT-LLM/"
+    if (buildFlags[CPP_TEST_BUNDLE]) {
+        def cppTestTarName = "cpp-tests-${tarName}"
+        sh "cmake --install ${LLM_ROOT}/cpp/build --component cpp_test_bundle --prefix '${pwd()}/cpp-test-bundle/cpp/build'"
+        if (is_linux_x86_64) {
+            sh "tar --use-compress-program='pigz -k' -cf '${cppTestTarName}' -C cpp-test-bundle cpp"
+        } else {
+            sh "tar -czf '${cppTestTarName}' -C cpp-test-bundle cpp"
+        }
+    }
 
     // Step 4: packaging attribution files into tarfile when they exist
     sh "mkdir -p TensorRT-LLM/attribution"

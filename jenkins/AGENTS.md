@@ -29,7 +29,7 @@ Scope: this directory and its descendants. Supplements the repository-root
 
   ```text
   Reason: The affected H100 resource is temporarily unavailable.
-  H100_PCIe-PyTorch-1
+  DGX_H100-PyTorch-1
   ```
 
 - The following DGX B200 names and patterns are illustrative examples, not
