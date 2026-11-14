@@ -562,6 +562,7 @@ def finish(runner, run=True):
     except Exception as exc:  # noqa: BLE001
         log("sparse-decode prewarm: restore failed: %s: %s" % (type(exc).__name__, exc), warn=True)
     if not run:
+        _S["classes"] = {}  # a failed warmup drops the recorded K/V/scale views too
         return
     try:
         if _S["classes"]:

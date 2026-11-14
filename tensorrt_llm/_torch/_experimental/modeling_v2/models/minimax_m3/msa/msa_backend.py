@@ -1756,7 +1756,10 @@ class MiniMaxM31MsaSparseAttention(_StockMsaAttention):
         refuses it. Checking as they are built reports it once per layer rather
         than on the first step that happens to carry those rows.
         """
-        present = {type(fmha).__name__ for fmha in self._fmha_manager.fmha_libs}
+        # By class and base class: the family's M31MsaPrefillFmha / M31MsaDecodeFmha are the stock pair's subclasses.
+        present = {
+            cls.__name__ for fmha in self._fmha_manager.fmha_libs for cls in type(fmha).__mro__
+        }
         missing = sorted({"MsaPrefillFmha", "MsaDecodeFmha"} - present)
         if missing:
             raise RuntimeError(
