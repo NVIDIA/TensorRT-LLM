@@ -56,6 +56,8 @@ l0_dgx_b200:
   - examples/visual_gen/test_visual_gen_multi_gpu.py::test_minimax_h3_ulysses_parallel_vae_lpips[2-2-TRTLLM] TIMEOUT (30)
   - examples/visual_gen/test_visual_gen_multi_gpu.py::test_minimax_h3_ulysses_parallel_vae_lpips[2-2-FLASHINFER] TIMEOUT (30)
   - unittest/_torch/visual_gen/test_flux_pipeline.py::TestFluxParallelism::test_ulysses_2gpu_correctness
+  - visual_gen/test_dynamic_batching.py::test_dynamic_batching_multi_gpu[flux1-ulysses2] TIMEOUT (15)
+  - visual_gen/test_dynamic_batching.py::test_dynamic_batching_multi_gpu[flux2-tp2] TIMEOUT (20)
   - unittest/_torch/visual_gen/test_flux_pipeline.py::TestFluxCombinedOptimizations::test_all_optimizations_combined
 - condition:
     ranges:

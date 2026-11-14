@@ -31,6 +31,52 @@ requires_cuda = pytest.mark.skipif(
 
 
 @requires_cuda
+def test_qwen_layered_block_singleton_attention_parity() -> None:
+    """L2/T1: Layered block image/text outputs match the ordinary unmasked Qwen block.
+
+    The same weights and inputs isolate the Layered attention substitution. A
+    singleton must preserve the attention call contract without batch metadata.
+    """
+    from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+    from tensorrt_llm._torch.visual_gen.models.qwen_image.transformer_qwen_image import (
+        QwenImageTransformerBlock,
+    )
+    from tensorrt_llm._torch.visual_gen.models.qwen_image_layered.transformer_qwen_image_layered import (
+        QwenImageLayeredJointAttention,
+    )
+
+    torch.manual_seed(0)
+    config = DiffusionModelConfig(attention={"backend": "VANILLA"})
+    kwargs = dict(dim=32, num_attention_heads=2, attention_head_dim=16, config=config)
+    block = QwenImageTransformerBlock(**kwargs, dtype=torch.bfloat16).cuda().eval()
+    with torch.no_grad():
+        for parameter in block.parameters():
+            parameter.normal_(std=0.1)
+    image = torch.randn(1, 8, 32, device="cuda", dtype=torch.bfloat16)
+    text = torch.randn(1, 3, 32, device="cuda", dtype=torch.bfloat16)
+    temb = torch.randn(1, 32, device="cuda", dtype=torch.bfloat16)
+    with torch.inference_mode():
+        expected = block(image, text, temb)
+    attention = QwenImageLayeredJointAttention(**kwargs).cuda().eval()
+    attention.load_state_dict(block.attn.state_dict(), strict=True)
+    block.attn = attention
+    assert isinstance(block.attn, QwenImageLayeredJointAttention)
+    with torch.inference_mode():
+        actual = block(image, text, temb)
+    for stream, output, reference in zip(("text", "image"), actual, expected):
+        delta = (output.float() - reference.float()).flatten()
+        reference_norm = reference.float().norm().item()
+        assert reference_norm > 0, f"{stream}: zero-norm reference"
+        relative_l2 = delta.norm().item() / reference_norm
+        cosine = _cosine(output, reference)
+        max_abs = delta.abs().max().item()
+        metrics = f"{stream}: relative_l2={relative_l2}, cosine={cosine}, max_abs={max_abs}"
+        print(metrics)
+        assert relative_l2 <= 1e-2 and cosine >= 0.9999, metrics
+        torch.testing.assert_close(output, reference, rtol=1e-3, atol=1e-3, msg=metrics)
+
+
+@requires_cuda
 def test_qwen_layered_timestep_proj_embedding_additional_cond_parity():
     transformer_qwenimage = pytest.importorskip(
         "diffusers.models.transformers.transformer_qwenimage"
