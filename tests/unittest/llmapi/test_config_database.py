@@ -332,6 +332,24 @@ def test_serve_cli_enable_visual_gen_routes_to_visual_gen():
     )
 
 
+def test_serve_cli_forwards_the_media_load_pool_size_to_visual_gen():
+    with (
+        mock.patch(
+            "tensorrt_llm.commands.serve.get_is_diffusion_only_model",
+            return_value=False,
+        ),
+        mock.patch(
+            "tensorrt_llm.commands.serve.launch_visual_gen_server"
+        ) as mock_launch_visual_gen_server,
+    ):
+        serve_main(
+            args=["dummy/model", "--enable_visual_gen", "--num_media_load_workers", "3"],
+            standalone_mode=False,
+        )
+
+    assert mock_launch_visual_gen_server.call_args.kwargs["media_load_workers"] == 3
+
+
 def test_serve_cli_rejects_middleware_with_grpc():
     with (
         mock.patch("tensorrt_llm.commands.serve.get_is_diffusion_only_model", return_value=False),

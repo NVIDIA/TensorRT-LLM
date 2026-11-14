@@ -140,6 +140,15 @@ and reach the result. One `--find` row means the words were unambiguous in this 
 they were the words you wanted: where a single checkpoint carries `fp8`, `wan fp8` resolves to it
 whichever mode the user meant.
 
+**Reference media.** A workload with `format: path` references has the server open those files, and
+the server reads only files under `TRTLLM_MEDIA_ALLOWED_INPUT_DIR`. Set it to `<run dir>`, the parent
+of every `vg-bench-*` run, so a server you reuse also reads the media of later runs. A `--workload`
+run where it sits keeps its media beside it; name that directory instead.
+
+```bash
+export TRTLLM_MEDIA_ALLOWED_INPUT_DIR=$(readlink -f <run dir>)
+```
+
 **Single node — one process, any `n_workers` including 8 GPUs.** Do not wrap in `torchrun` or `srun --ntasks=N`.
 
 `parallel_config` decides how many GPUs; `CUDA_VISIBLE_DEVICES` decides which. On a node you have to yourself, leave it unset. To run **several servers on one node**, set both it and `--port` per server — otherwise the second server answers on the first one's port and every measurement lands on the wrong model.

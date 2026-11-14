@@ -116,7 +116,7 @@ async def _load_request_media(media_io: BaseMediaIO, url: str) -> Any:
     """Load one media URL taken from a request.
 
     A local reference (`file://` URI or bare path) is read only from the
-    directory allowed by `TRTLLM_MEDIA_ALLOWED_LOCAL_PATH`, through
+    directory allowed by `TRTLLM_MEDIA_ALLOWED_INPUT_DIR`, through
     `BaseMediaIO.async_load_allowed_local_file`: the file is opened once on
     the media executor and decoded through that open descriptor. The check
     runs when the load is awaited, so a request whose media is discarded

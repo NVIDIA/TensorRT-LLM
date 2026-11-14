@@ -93,7 +93,7 @@ sed -i "s#\.\./media/#$RUN/reference_media/#g; s#\.\./#$(dirname $WORKLOADS)/#g"
 
 Step 3 runs the copy, so the run records the workload as it ran rather than a path that may since have changed. Rewrite every `../` in it, not only the media: a workload may also name a `prompt_file` or an `action_file`, and one that gets half its paths rewritten fails at load — hence the second rule, which points whatever the first left alone back at the skill.
 
-Only the media is copied in. The client reads a prompt or action file into the request before sending, so those two need only to be readable by the client; a `format: path` reference is a path the **server** opens, and `reference_media/` is what keeps it beside the numbers it produced.
+Only the media is copied in. The client reads a prompt or action file into the request before sending, so those two need only to be readable by the client; a `format: path` reference is a path the **server** opens (under its `TRTLLM_MEDIA_ALLOWED_INPUT_DIR`), and `reference_media/` is what keeps it beside the numbers it produced.
 
 Reusing a server leaves out `serve/`, and with it the record of what produced the numbers.
 

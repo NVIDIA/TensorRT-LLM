@@ -36,6 +36,16 @@ All published functionality in the Release Notes has been fully tested and verif
   Grouped encoders must also include item metadata with exact output row counts
   in `get_dummy_mm_data()` results used for startup profiling. See the
   [multimodal developer guide](developer-guide/multimodal.md).
+- <span style="color: red">**[BREAKING CHANGE] One local media input policy for chat and VisualGen, and renamed variables.**</span>
+  A VisualGen reference sent over HTTP with `format="path"` is now read only when the server is
+  started with `TRTLLM_MEDIA_ALLOWED_INPUT_DIR=<directory>`, and only if it is a regular file inside
+  that directory, of at most 200 MiB, with at most 512 MiB across the `path` references of one
+  request; send a larger file as a multipart upload. Chat requests follow the same variable.
+  `TRTLLM_MEDIA_ALLOWED_LOCAL_PATH` is renamed to `TRTLLM_MEDIA_ALLOWED_INPUT_DIR`; the former
+  name is no longer read, so local paths are refused until the new one is set.
+  `TRTLLM_DISALLOW_LOCAL_MEDIA_PATH` is renamed to `TRTLLM_MEDIA_DISABLE_PATH_RESPONSE`, which
+  accepts only `1`, `0` or empty. A VisualGen server refuses to start while `TRTLLM_DISALLOW_LOCAL_MEDIA_PATH`
+  is set to anything other than `0` or empty; set `TRTLLM_MEDIA_DISABLE_PATH_RESPONSE=1` instead.
 - **[DEPRECATION]** KV cache manager V1 (`kv_cache_config.use_kv_cache_manager_v2=False`) is deprecated as of TensorRT-LLM 1.4 (2026-11) and will be removed after the 3-month migration period. KV cache manager V2 is the default (`use_kv_cache_manager_v2=True`). During the migration period V1 keeps working and logs a one-time warning when it is constructed, including when `use_kv_cache_manager_v2="auto"` resolves to it and when sleep mode (`sleep_config`), which V2 does not support yet, falls back to it. See the [deprecation policy](https://github.com/NVIDIA/TensorRT-LLM#deprecation-policy).
 - **[DEPRECATION]** The C++ cache transceiver (`cache_transceiver_config.transceiver_runtime="CPP"`, or `None`) is deprecated as of TensorRT-LLM 1.4 (2026-11) and will be removed after the 3-month migration period. The Python transceiver is the default (`transceiver_runtime="PYTHON"`); it runs on the NIXL backend with KV cache manager V2, so deployments on the UCX, MPI or MOONCAKE backend must move to NIXL. The C++ NIXL transfer agent that the Python transceiver uses is not affected. During the migration period the C++ transceiver keeps working and logs a one-time warning when it is constructed, including when `transceiver_runtime="auto"` resolves or falls back to it. See the [deprecation policy](https://github.com/NVIDIA/TensorRT-LLM#deprecation-policy).
 - **Migration prerequisites:** Sleep mode, RocketKV, and skip-softmax still require KV cache manager V1. Experimental in-flight cancellation (`TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=1`) still requires a supported C++ transceiver configuration. Keep those implementations for these features during migration.

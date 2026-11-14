@@ -1087,12 +1087,15 @@ def _normalize_file_uri(uri: str) -> str:
 
 
 # Directory from which request-supplied local media paths may be read.
-# Media parts of a server request may name a `file://` URI or a bare path; such
-# a reference is read from the server's own filesystem, so it is accepted only
-# when TRTLLM_MEDIA_ALLOWED_LOCAL_PATH names a directory and the resolved path
-# lies inside it. Unset (the default) refuses every local reference. The
-# offline Python API does not go through this check.
-_ALLOWED_LOCAL_MEDIA_PATH_ENV = "TRTLLM_MEDIA_ALLOWED_LOCAL_PATH"
+# A server request may name a `file://` URI or a bare path (a chat media part,
+# or a VisualGen reference with format='path'); such a reference is read from
+# the server's own filesystem, so it is accepted only when
+# TRTLLM_MEDIA_ALLOWED_INPUT_DIR names a directory and the resolved path lies
+# inside it. Unset (the default) refuses every local reference. The offline
+# Python API does not go through this check.
+_MEDIA_ALLOWED_INPUT_DIR_ENV = "TRTLLM_MEDIA_ALLOWED_INPUT_DIR"
+# The variable's former name, no longer read; see `log_allowed_local_media_path`.
+_FORMER_MEDIA_ALLOWED_INPUT_DIR_ENV = "TRTLLM_MEDIA_ALLOWED_LOCAL_PATH"
 
 # Flags for the single open of a request-supplied local file. Each is left
 # out on a platform that lacks it; the fstat checks on the open descriptor
@@ -1114,11 +1117,16 @@ def is_local_media_url(url: str) -> bool:
 # memory and decoded from bytes.
 _DESCRIPTOR_DIR = next((d for d in ("/proc/self/fd", "/dev/fd") if os.path.isdir(d)), None)
 
+# A directory where ``readlink`` on a descriptor's entry gives the location of
+# the open file. ``None`` where the platform has none; `open_allowed_local_media`
+# then skips its post-open location check.
+_FD_LINK_DIR = "/proc/self/fd" if os.path.isdir("/proc/self/fd") else None
+
 
 def open_allowed_local_media(url: str) -> int:
     """Open a request-supplied local media reference; return its read-only descriptor.
 
-    Raises ``ValueError`` unless ``TRTLLM_MEDIA_ALLOWED_LOCAL_PATH`` names a
+    Raises ``ValueError`` unless ``TRTLLM_MEDIA_ALLOWED_INPUT_DIR`` names a
     directory, the reference resolves (symlinks and ``..`` included) to a path
     inside it, and that path is a regular file within the media size limit. A
     reference refused for its location gets the same message whether or not it
@@ -1128,16 +1136,19 @@ def open_allowed_local_media(url: str) -> int:
     The file is opened once, without following a symlink in its final
     component, and the regular-file and size checks run on the open descriptor.
     An entry swapped for a symlink, FIFO or device after the path was resolved
-    is therefore refused instead of opened. The caller owns the descriptor and
-    closes it. Blocking; call it on an executor.
+    is therefore refused instead of opened. Where ``/proc/self/fd`` reports the
+    location of an open file, that location is checked against the directory
+    as well, so a directory on the path swapped for a symlink after resolution
+    is refused too. The caller owns the descriptor and closes it. Blocking;
+    call it on an executor.
     """
     refused = ValueError(
         "Local media paths are not accepted by this server. Send the media as "
         "an http(s) or base64 data URL, or start the server with "
-        f"{_ALLOWED_LOCAL_MEDIA_PATH_ENV}=<directory> to allow files under "
+        f"{_MEDIA_ALLOWED_INPUT_DIR_ENV}=<directory> to allow files under "
         "that directory."
     )
-    allowed_root = os.environ.get(_ALLOWED_LOCAL_MEDIA_PATH_ENV, "")
+    allowed_root = os.environ.get(_MEDIA_ALLOWED_INPUT_DIR_ENV, "")
     if not allowed_root:
         raise refused
     parsed = urlparse(url)
@@ -1148,7 +1159,7 @@ def open_allowed_local_media(url: str) -> int:
         # Operator configuration: report it in the server log, not to the client.
         logger.warning(
             "%s=%r is not a directory; refusing the local media reference.",
-            _ALLOWED_LOCAL_MEDIA_PATH_ENV,
+            _MEDIA_ALLOWED_INPUT_DIR_ENV,
             allowed_root,
         )
         raise refused
@@ -1165,6 +1176,16 @@ def open_allowed_local_media(url: str) -> int:
         raise ValueError(f"Local media file could not be read: {url!r}") from exc
     try:
         stat = os.fstat(fd)
+        # The containment check above looked at the path; this one looks at
+        # the file that was opened. O_NOFOLLOW guards only the last component,
+        # so a directory on the path that became a symlink in between was
+        # followed, and the open file then lies outside the root. It runs
+        # before the type and size checks, so a file outside the root gets the
+        # same refusal whatever it is.
+        if _FD_LINK_DIR is not None:
+            opened = os.readlink(f"{_FD_LINK_DIR}/{fd}")
+            if not os.path.isabs(opened) or os.path.commonpath([root, opened]) != root:
+                raise refused
         if not S_ISREG(stat.st_mode):
             raise ValueError(f"Local media path is not a regular file: {url!r}")
         _check_media_size(stat.st_size, _MAX_RESPONSE_BYTES)
@@ -1199,27 +1220,48 @@ def _read_open_media(fd: int, url: str) -> bytes:
     return data
 
 
+def read_allowed_local_media(url: str) -> bytes:
+    """Read a request-supplied local media file under the allowed-directory policy.
+
+    `open_allowed_local_media` followed by a bounded read of the open file, for
+    a caller that wants the bytes rather than a decoded object. Blocking; call
+    it on an executor.
+    """
+    fd = open_allowed_local_media(url)
+    try:
+        return _read_open_media(fd, url)
+    finally:
+        os.close(fd)
+
+
 def log_allowed_local_media_path() -> None:
     """Log the local media policy once, at server start.
 
-    Unset ``TRTLLM_MEDIA_ALLOWED_LOCAL_PATH`` is the default and is not
+    Unset ``TRTLLM_MEDIA_ALLOWED_INPUT_DIR`` is the default and is not
     logged. A value that is not a directory is reported here, since every
     request naming a local file would otherwise fail with a generic error
-    while the operator sees nothing at startup.
+    while the operator sees nothing at startup. So is a set
+    ``TRTLLM_MEDIA_ALLOWED_LOCAL_PATH``, which is not read.
     """
-    allowed_root = os.environ.get(_ALLOWED_LOCAL_MEDIA_PATH_ENV, "")
+    if os.environ.get(_FORMER_MEDIA_ALLOWED_INPUT_DIR_ENV):
+        logger.warning(
+            "%s is no longer read; set %s instead.",
+            _FORMER_MEDIA_ALLOWED_INPUT_DIR_ENV,
+            _MEDIA_ALLOWED_INPUT_DIR_ENV,
+        )
+    allowed_root = os.environ.get(_MEDIA_ALLOWED_INPUT_DIR_ENV, "")
     if not allowed_root:
         return
     if os.path.isdir(os.path.realpath(allowed_root)):
         logger.info(
             "Request media may name local files under %r (%s).",
             allowed_root,
-            _ALLOWED_LOCAL_MEDIA_PATH_ENV,
+            _MEDIA_ALLOWED_INPUT_DIR_ENV,
         )
     else:
         logger.warning(
             "%s=%r is not a directory; every request naming a local media file will be refused.",
-            _ALLOWED_LOCAL_MEDIA_PATH_ENV,
+            _MEDIA_ALLOWED_INPUT_DIR_ENV,
             allowed_root,
         )
 
@@ -1354,6 +1396,16 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
         BaseMediaIO._executor = executor
 
     @classmethod
+    def clear_executor(cls, executor: Executor) -> None:
+        """Stop publishing ``executor``; later decode work uses the loop's default.
+
+        Does nothing when another executor has been published since, as
+        another server in the same process may have done.
+        """
+        if BaseMediaIO._executor is executor:
+            BaseMediaIO._executor = None
+
+    @classmethod
     @contextmanager
     def use_executor(
         cls,
@@ -1444,7 +1496,7 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
             # No path policy here: this branch serves the offline API, which
             # reads the caller's own files. A URL taken from a server request
             # must go through `async_load_allowed_local_file` instead, which
-            # confines it to TRTLLM_MEDIA_ALLOWED_LOCAL_PATH and never looks
+            # confines it to TRTLLM_MEDIA_ALLOWED_INPUT_DIR and never looks
             # the request's path up again.
             return await self._run_in_executor(self.load_file, url)
         else:
