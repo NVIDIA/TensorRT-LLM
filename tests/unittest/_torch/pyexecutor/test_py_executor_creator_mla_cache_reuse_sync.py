@@ -234,6 +234,7 @@ def _make_llm_args():
     )
 
     return SimpleNamespace(
+        env_overrides=None,
         garbage_collection_gen0_threshold=0,
         lora_config=None,
         kv_connector_config=None,

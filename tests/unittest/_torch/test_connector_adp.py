@@ -1389,7 +1389,6 @@ def test_control_drain_keeps_owner_collectives_aligned(loading_rank: int) -> Non
         executor.control_requests = [SimpleNamespace(control_requires_drain=True)]
         executor.control_request_barrier = MagicMock()
         executor.control_action_done = MagicMock()
-        executor._pop_sleep_wakeup_abort = MagicMock(return_value=None)
         executor.request_accumulated = []
         executor._disable_mpi = False
         executor.waiting_queue = MagicMock()

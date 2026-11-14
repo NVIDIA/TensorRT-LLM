@@ -32,6 +32,10 @@ pytestmark = pytest.mark.cpu_only
 
 _ARRIVAL_WITH_CLOCK = {"class": "ServerArrivalTimeMiddleware", "kwargs": ["adjusted_clock"]}
 _ARRIVAL_PLAIN = {"class": "ServerArrivalTimeMiddleware", "kwargs": []}
+_CHECKPOINT = {
+    "class": "CheckpointAdmissionMiddleware",
+    "kwargs": ["ingress", "lifecycle", "passive_paths", "passive_prefixes"],
+}
 
 
 def _perf(kwargs, expose_headers):
@@ -45,6 +49,15 @@ def _perf(kwargs, expose_headers):
 # Outermost first, matching middleware_snapshot.
 EXPECTED = {
     "llm": (AggConfig(), [_ARRIVAL_WITH_CLOCK]),
+    "llm_checkpoint": (AggConfig(checkpoint=True), [_ARRIVAL_WITH_CLOCK, _CHECKPOINT]),
+    "llm_checkpoint_perf_metrics": (
+        AggConfig(checkpoint=True, return_perf_metrics=True),
+        [
+            _ARRIVAL_WITH_CLOCK,
+            _perf(["adjusted_clock", "expose_headers", "writer"], True),
+            _CHECKPOINT,
+        ],
+    ),
     "mm_encoder": (AggConfig(role=ServerRole.MM_ENCODER), [_ARRIVAL_WITH_CLOCK]),
     "embedding": (AggConfig(role=ServerRole.EMBEDDING), [_ARRIVAL_WITH_CLOCK]),
     "llm_perf_metrics": (

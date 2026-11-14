@@ -449,6 +449,10 @@ class BaseLLM:
                                      **kwargs)
             self.args._enable_routing_load = enable_routing_load
             self.args._openengine_discovery = openengine_discovery
+            from tensorrt_llm.executor.checkpoint import (
+                checkpoint_enabled, validate_checkpoint_config)
+            if checkpoint_enabled(self.args.env_overrides):
+                validate_checkpoint_config(self.args)
 
             self._capture_usage_startup(llm_args=self.args)
 

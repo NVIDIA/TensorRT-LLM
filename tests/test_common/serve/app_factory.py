@@ -63,6 +63,7 @@ from tensorrt_llm.serve.openai_server import OpenAIServer
 from tensorrt_llm.usage import usage_lib
 from test_common.serve.fakes import (
     FakeAsyncLLM,
+    FakeCheckpointExecutor,
     FakeEncodeOnlyLLM,
     FakeLLM,
     FakeLlmArgs,
@@ -100,6 +101,7 @@ class AggConfig:
     governor_queue: bool = False  # FakeExecutor(resource_governor_queue=object())
     rl_control: bool = False  # FakeAsyncLLM + enable_rl_control_endpoints
     runtime_control: bool = False  # sleep_config + enable_runtime_control_endpoints
+    checkpoint: bool = False  # authenticated resident checkpoint lifecycle
     return_perf_metrics: bool = False
     perf_metrics_output_dir: bool = False  # sets args.perf_metrics_output_dir=<tmp>/perf
     env: tuple = ()  # (name, value) pairs applied before construction
@@ -207,8 +209,13 @@ class ServeTestEnv:
             encode_only=config.role is ServerRole.EMBEDDING,
             reasoning_parser=config.reasoning_parser,
             num_postprocess_workers=config.num_postprocess_workers,
+            env_overrides={"TRTLLM_ENABLE_CHECKPOINT_LIFECYCLE": "1"}
+            if config.checkpoint
+            else None,
         )
         executor = FakeExecutor(resource_governor_queue=object() if config.governor_queue else None)
+        if config.checkpoint:
+            executor = FakeCheckpointExecutor()
         if config.role is ServerRole.VISUAL_GEN:
             # Lazy import: only VisualGen tests pay the visual_gen import cost,
             # and importing it is what lets _is_visual_gen_instance say yes.
@@ -243,7 +250,10 @@ class ServeTestEnv:
             enable_rl_control_endpoints=config.rl_control,
             rl_control_api_key="test-key" if config.rl_control else None,
             enable_runtime_control_endpoints=config.runtime_control,
-            runtime_control_api_key="test-key" if config.runtime_control else None,
+            runtime_control_api_key="test-key"
+            if config.runtime_control or config.checkpoint
+            else None,
+            enable_checkpoint_mode=config.checkpoint,
             multi_frontend_serving=multi_frontend_serving,
         )
         self._servers.append(server)
@@ -306,7 +316,7 @@ class ServeTestEnv:
             ):
                 pool = getattr(server, pool_name, None)
                 if pool is not None:
-                    pool.shutdown(wait=False, cancel_futures=True)
+                    pool.shutdown(wait=True, cancel_futures=True)
         self._servers.clear()
 
 

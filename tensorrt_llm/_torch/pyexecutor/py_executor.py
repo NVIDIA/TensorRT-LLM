@@ -148,6 +148,7 @@ if TYPE_CHECKING:
     from tensorrt_llm.bindings import MpiProgressThread
 
     from ..moe.fused_moe.communication.base import CheckpointableCommunication
+    from .checkpoint import NativeCheckpoint
 
 _UNBOUNDED_STATS_MAX_LEN = -1
 
@@ -1660,11 +1661,11 @@ class PyExecutor:
         # calls Dup() (a collective) on the main thread.
         self._sleep_wakeup_comm = None
         self._sleep_wakeup_listener_thread: Optional[threading.Thread] = None
-        # Serialises concurrent sleep/wakeup calls so that the control_action
-        # + _sleep_wakeup_comm send/recv sequence is never interleaved.  Without
-        # this, two concurrent RPC calls could both pass control_request_barrier
-        # and race on the shared communicator, consuming the wrong ACKs.
+        # Serialize the group protocol independently of the local scheduler
+        # boundary, which a checkpoint can retain across multiple RPC calls.
         self._sleep_wakeup_lock = threading.Lock()
+        self._control_action_lock = threading.Lock()
+        self.checkpoint: Optional["NativeCheckpoint"] = None
 
         # enable_packed_sync: pack the per-iteration attention-DP votes of
         # the disaggregated loops into two fixed-width int64 tensor
@@ -2179,6 +2180,8 @@ class PyExecutor:
     def start_worker(self):
         with self.worker_lock:
             if not self.worker_started:
+                if self.checkpoint is not None:
+                    self.checkpoint.start()
                 # Model/KV-cache/transceiver construction can create threads
                 # after configure_cpu_affinity(). Refresh the existing-thread
                 # snapshot immediately before launching executor threads.
@@ -2363,27 +2366,42 @@ class PyExecutor:
                     f"{_SLEEP_WAKEUP_LISTENER_JOIN_TIMEOUT_S:.1f} seconds on "
                     f"rank {self.dist.rank}.")
 
-    def _record_sleep_wakeup_abort(self, control_id: str,
-                                   error_msg: str) -> None:
+    def _record_sleep_wakeup_abort(self,
+                                   control_id: str,
+                                   error_msg: str,
+                                   *,
+                                   release_active: bool = False) -> None:
         """Remember an early ABORT until the matching control request fires."""
         if not hasattr(self, "_sleep_wakeup_pending_abort_lock"):
             self._sleep_wakeup_pending_abort_lock = threading.Lock()
         if not hasattr(self, "_sleep_wakeup_pending_aborts"):
             self._sleep_wakeup_pending_aborts = {}
         with self._sleep_wakeup_pending_abort_lock:
-            self._sleep_wakeup_pending_aborts[control_id] = error_msg
+            if (release_active and self.control_request_barrier.is_set()
+                    and self._active_control_id == control_id):
+                self.control_request_barrier.clear()
+                self.control_action_done.set()
+            else:
+                self._sleep_wakeup_pending_aborts[control_id] = error_msg
 
     def _pop_sleep_wakeup_abort(self,
-                                control_id: Optional[str]) -> Optional[str]:
+                                control_id: Optional[str],
+                                *,
+                                acknowledge: bool = False) -> Optional[str]:
         """Pop a pending ABORT for a control request, if one arrived early."""
-        if control_id is None:
+        if control_id is None and not acknowledge:
             return None
         if not hasattr(self, "_sleep_wakeup_pending_abort_lock"):
             self._sleep_wakeup_pending_abort_lock = threading.Lock()
         if not hasattr(self, "_sleep_wakeup_pending_aborts"):
             self._sleep_wakeup_pending_aborts = {}
         with self._sleep_wakeup_pending_abort_lock:
-            return self._sleep_wakeup_pending_aborts.pop(control_id, None)
+            error = self._sleep_wakeup_pending_aborts.pop(
+                control_id, None) if control_id is not None else None
+            # Publish readiness atomically with the early-cancellation check.
+            if acknowledge and error is None:
+                self.control_request_barrier.set()
+            return error
 
     def enqueue_requests(
             self,
@@ -2635,6 +2653,16 @@ class PyExecutor:
             node_server.close()
             self._openengine_node_server = None
         if self.worker_started:
+            checkpoint = getattr(self, "checkpoint", None)
+            if checkpoint is not None:
+                try:
+                    checkpoint.close()
+                except TimeoutError:
+                    logger.error(
+                        "Checkpoint control has not retired; retaining engine "
+                        "resources. The external supervisor must terminate the "
+                        "entire worker job before retrying startup.")
+                    raise
             self.executor_request_queue.enqueue_shutdown_request()
             self.shutdown_event.wait()
         if (self.enable_attention_dp and self.kv_connector_manager is not None
@@ -7124,16 +7152,14 @@ class PyExecutor:
         self.control_requests.pop(0)
         control_id = getattr(pending, "control_id", None)
         self._active_control_id = control_id
-        pending_abort = self._pop_sleep_wakeup_abort(control_id)
+        pending_abort = self._pop_sleep_wakeup_abort(control_id,
+                                                     acknowledge=True)
         if pending_abort is not None:
             logger.warning(
                 f"[control_action] skipping aborted control request {control_id}: "
                 f"{pending_abort}")
-            self.control_request_barrier.set()
-            self.control_request_barrier.clear()
             self._active_control_id = None
             return
-        self.control_request_barrier.set()
         with self.hang_detector.pause():
             self.control_action_done.wait()
         self.control_action_done.clear()
@@ -7640,10 +7666,13 @@ class PyExecutor:
             runner.release_padding_dummy(self.resource_manager, draft_len)
 
     @contextmanager
-    def control_action(self,
-                       *,
-                       drain: bool = True,
-                       control_id: Optional[str] = None):
+    def control_action(
+            self,
+            *,
+            drain: bool = True,
+            control_id: Optional[str] = None,
+            checkpoint_owner: Optional["NativeCheckpoint"] = None,
+            timeout: Optional[float] = None) -> Iterator["PyExecutor"]:
         """Run an action at a scheduler step boundary.
 
         drain=True  (default): block until ``active_requests`` and
@@ -7652,19 +7681,63 @@ class PyExecutor:
                      In-flight requests keep their KV caches across the
                      action; same-batch requests fetched after the sentinel
                      are parked until the ``with`` block exits.
+
+        Args:
+            drain: Whether all requests must retire before the action starts.
+            control_id: Identity used to reject a late, cancelled sentinel.
+            checkpoint_owner: Native checkpoint authority, if it owns the gate.
+            timeout: Optional total budget for control ownership and scheduler drain.
+
+        Yields:
+            The protected executor. The admission gate is not released on exit.
+
+        Raises:
+            RuntimeError: If checkpoint ownership excludes this caller.
+            TimeoutError: If ownership or scheduler acknowledgement exceeds the budget.
+            ValueError: If a timed control has no identity for late cancellation.
         """
 
-        if self.dist.rank == 0:
-            self.executor_request_queue.enqueue_control_request(
-                drain=drain, control_id=control_id)
-
-        self.control_request_barrier.wait()
-
+        if timeout is not None and control_id is None:
+            raise ValueError("Timed scheduler control requires a control ID.")
+        owner = checkpoint_owner is not None and checkpoint_owner is self.checkpoint
+        if self.executor_request_queue.checkpoint_admission_closed(
+        ) and not owner:
+            raise RuntimeError(
+                "Checkpoint owns the scheduler control boundary.")
+        deadline = None if timeout is None else time.monotonic() + timeout
+        if not self._control_action_lock.acquire(
+                timeout=-1 if timeout is None else timeout):
+            raise TimeoutError(
+                "Timed out waiting for scheduler control ownership.")
         try:
-            yield self
+            if self.executor_request_queue.checkpoint_admission_closed(
+            ) and not owner:
+                raise RuntimeError(
+                    "Checkpoint owns the scheduler control boundary.")
+            if self.dist.rank == 0:
+                self.executor_request_queue.enqueue_control_request(
+                    drain=drain,
+                    control_id=control_id,
+                    checkpoint_session=self.checkpoint.session_id
+                    if owner else None)
+            remaining = None if deadline is None else max(
+                0, deadline - time.monotonic())
+            if not self.control_request_barrier.wait(timeout=remaining):
+                if control_id is not None:
+                    self._record_sleep_wakeup_abort(
+                        control_id,
+                        "Scheduler drain timed out.",
+                        release_active=True)
+                self.executor_request_queue.fail_sleep_wakeup_transition()
+                raise TimeoutError(
+                    "Timed out draining the scheduler for control.")
+            try:
+                yield self
+            finally:
+                self.control_request_barrier.clear()
+                self.control_action_done.set()
         finally:
-            self.control_action_done.set()
-            self.control_request_barrier.clear()
+            self._control_action_lock.release()
 
     def _wait_for_model_engine_input_copy(self):
         self.model_engine.wait_for_input_copy()

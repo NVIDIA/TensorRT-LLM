@@ -468,7 +468,9 @@ def test_legacy_and_generic_controls_are_mutually_exclusive():
 @pytest.mark.parametrize("generator_cls", [LLM, AsyncLLM])
 def test_runtime_control_rejects_multiple_frontends(generator_cls):
     generator = object.__new__(generator_cls)
-    generator.args = SimpleNamespace(sleep_config=SleepConfig(), num_serve_frontends=2)
+    generator.args = SimpleNamespace(
+        sleep_config=SleepConfig(), num_serve_frontends=2, env_overrides=None
+    )
 
     with pytest.raises(ValueError, match="require num_serve_frontends=1"):
         OpenAIServer(

@@ -298,6 +298,10 @@ l0_cpu:
   - unittest/executor/test_forward_error_survival.py
   - unittest/executor/test_rpc_worker_mixin.py
   - unittest/executor/test_sleep_collective_rpc_guards.py
+  - unittest/executor/test_checkpoint_lifecycle.py
+  - unittest/llmapi/test_checkpoint_serving.py
+  - unittest/_torch/pyexecutor/test_executor_request_queue.py
+  - unittest/_torch/pyexecutor/test_checkpoint_control.py
   - unittest/executor/test_shutdown_retry_contracts.py
   - unittest/executor/test_rpc_proxy_submit_order.py
   - unittest/executor/test_stats_serializer.py

@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from test_common.serve.fakes import FakeAsyncLLM, FakeLlmArgs
 
 from tensorrt_llm._torch.async_llm import AsyncLLM
 from tensorrt_llm.serve.openai_server import OpenAIServer
@@ -47,7 +48,7 @@ def _post_signed(client: TestClient, endpoint: str, payload: dict, key: str = "s
 def test_rl_control_routes_require_key():
     with pytest.raises(ValueError, match="rl_control_api_key is required"):
         OpenAIServer(
-            generator=object.__new__(AsyncLLM),
+            generator=FakeAsyncLLM(args=FakeLlmArgs(model="model")),
             model="model",
             tool_parser=None,
             server_role=None,
