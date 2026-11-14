@@ -774,8 +774,8 @@ MX_GEMV_TP2 = True
 # AutoTuner's per-start choice (whose L2-hot profiling left c2 bimodal at +-6%): FlashInfer's CuTe DSL quantize and
 # CuTe DSL GEMM. Stock's candidates per bucket are quantize {TRT-LLM, CuTe DSL} x GEMM {CUTLASS, CuTe DSL}; on SM107
 # every TP2 projection at 1..16 rows runs fastest on this pair, cold and L2-hot (graph us, cold: 4.7..10.3 against
-# 5.0..11.5 with the TRT-LLM quantize and 9.7..58 with CUTLASS), and all four candidates give the same bits (quantize
-# bytes and scales, GEMM outputs). A constant is rank-agreed and start-independent by construction.
+# 5.0..11.5 with the TRT-LLM quantize and 9.7..58 with CUTLASS). The quantizers match bitwise; GEMM outputs from
+# different tactics can differ. A constant is rank-agreed and start-independent by construction.
 # False returns these projections to the AutoTuner.
 MXFP8_DECODE_QUANT_TACTIC = 0  # MXFP8QuantizeRunner.CUTE_DSL
 MXFP8_DECODE_GEMM_TACTIC = 0  # FlashInferMXFP8GemmRunner.CUTE_DSL
@@ -1494,8 +1494,8 @@ def _linear(
     (``MXFP8_DECODE_QUANT_TACTIC`` / ``MXFP8_DECODE_GEMM_TACTIC``: FlashInfer's CuTe DSL quantize and CuTe DSL GEMM)
     instead of the AutoTuner's per-start choice (whose L2-hot profiling left c2 bimodal at +-6%). On SM107 every TP2
     projection at 1..16 rows runs fastest on this pair, cold and L2-hot (graph us, cold: 4.7..10.3 against 5.0..11.5
-    with the TRT-LLM quantize and 9.7..58 with CUTLASS), and all four candidates give the same bits (quantize bytes
-    and scales, GEMM outputs). A constant is rank-agreed and start-independent by construction.
+    with the TRT-LLM quantize and 9.7..58 with CUTLASS). The quantizers match bitwise; GEMM outputs from different
+    tactics can differ. A constant is rank-agreed and start-independent by construction.
 
     A kernel declining rows its path covers is a miss; the chain then continues down the list. ``push`` (an
     ``m3_mx_gemv`` ``ar`` tuple) is the boundary all-reduce exchange the GEMV writes its rows into. ``low_m_gemm``
