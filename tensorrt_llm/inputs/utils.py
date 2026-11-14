@@ -83,7 +83,7 @@ def load_image(image: Union[str, Image.Image],
     elif parsed_url.scheme == "data":
         image = load_base64_image(parsed_url)
     elif parsed_url.scheme in ("", "file"):
-        image = _load_and_convert_image(image)
+        image = _load_and_convert_image(Path(_normalize_file_uri(image)))
     else:
         raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme!r}")
 
@@ -112,7 +112,7 @@ async def async_load_image(
         image = await asyncio.to_thread(load_base64_image, parsed_url)
     elif parsed_url.scheme in ("", "file"):
         image = await asyncio.to_thread(_load_and_convert_image,
-                                        Path(parsed_url.path))
+                                        Path(_normalize_file_uri(image)))
     else:
         raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme!r}")
 
