@@ -215,6 +215,19 @@ def engine_kv_cache_quant_algo(config: "ModelConfig", llm_args: "TorchLlmArgs"):
     return {"fp8": QuantAlgo.FP8, "nvfp4": QuantAlgo.NVFP4}.get(dtype, dtype)
 
 
+def moe_eplb_mode(config: "ModelConfig") -> Optional[str]:
+    """The EPLB mode the engine runs this deployment with, for a route to gate layouts on.
+
+    ``static``, ``online`` or ``per_layer_dynamic`` (see ``moe_load_balancer_mode``),
+    or None when the engine creates no MoE load balancer. Which modes a target
+    implements is not a route's check: the resolver compares this mode with the
+    target's ``EPLB_MODES``.
+    """
+    from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import moe_load_balancer_mode
+
+    return moe_load_balancer_mode(config, config.mapping)
+
+
 def _check_eplb_mode(target: type, config: "ModelConfig") -> None:
     """Raise ``NoTarget`` unless ``target`` implements the EPLB mode this deployment runs.
 
@@ -225,10 +238,7 @@ def _check_eplb_mode(target: type, config: "ModelConfig") -> None:
     no layer to update under online EPLB. A target lists the modes it
     implements in the class attribute ``EPLB_MODES``; without it, none.
     """
-    from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
-        MOE_LOAD_BALANCER_MODES,
-        moe_load_balancer_mode,
-    )
+    from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import MOE_LOAD_BALANCER_MODES
 
     implemented = frozenset(getattr(target, "EPLB_MODES", ()))
     unknown = implemented - MOE_LOAD_BALANCER_MODES
@@ -237,7 +247,7 @@ def _check_eplb_mode(target: type, config: "ModelConfig") -> None:
             f"{target.__qualname__}.EPLB_MODES names {sorted(unknown)}; the EPLB modes are "
             f"{sorted(MOE_LOAD_BALANCER_MODES)}"
         )
-    eplb = moe_load_balancer_mode(config, config.mapping)
+    eplb = moe_eplb_mode(config)
     if eplb is not None and eplb not in implemented:
         raise NoTarget(
             f"{eplb} EPLB (moe_config.load_balancer at moe_ep_size={config.mapping.moe_ep_size}); "

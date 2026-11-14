@@ -363,6 +363,75 @@ mode the target uses.
   (batch size, number of context requests, draft length), so the whole step is
   captured in one CUDA graph with the target.
 
+## Expert load balancing (EPLB)
+
+EPLB places a MoE layer's experts in slots split evenly over the EP ranks,
+with spare slots holding more copies of the hot experts, so a rank's load
+follows its share of the slots rather than of the experts. Deployments
+configure it with `moe_config.load_balancer`; see the
+[EPLB example](../../../../examples/wide_ep/ep_load_balancer/README.md).
+
+The engine owns the load balancer. A target that implements EPLB plugs its
+MoE layers into it:
+
+| Owner | What it does |
+|---|---|
+| Model loader | Creates the balancer around the model when the deployment runs EPLB (`moe_load_balancer_mode`), and registers weight slots and finalizes it after the weights load. |
+| Executor | Wraps every forward in a balancer iteration, turns statistics and updates off during warmup, and shuts the balancer down. |
+| Resolver | Builds a target for an EPLB deployment only if the target class lists the deployment's mode in `EPLB_MODES` (see [Routing](#routing)). |
+| Target | Registers its MoE layers, loads its experts by slot, routes expert ids to slot ids, and declines in `route` the layouts it has not measured EPLB at. |
+
+A target reaches the balancer only through
+[`catalog/moe/eplb.py`](catalog/moe/eplb.py). The balancer
+(`_torch/moe/fused_moe/moe_load_balancer.py`) is engine runtime, like the KV
+cache managers, not Modeling V1 model code.
+
+### Static EPLB in a target
+
+Static EPLB keeps the placement it starts with (`layer_updates_per_iter: 0`).
+A target implements it in four steps. The
+[DeepSeek R1 target](models/deepseek_v3/r1_0528_nvfp4__sm_10x__default/) is
+the example.
+
+1. **Slots.** `eplb_slots(model_config, layer_idx, num_experts)` returns a
+   routed MoE layer's slots on this rank: `num_slots`, this rank's
+   `slot_offset` and `local_slots`, and `slot_experts`, the expert each local
+   slot holds. The placement can differ by layer. Without EPLB every expert
+   has one slot and a rank's slots are its contiguous expert window, so one
+   code path serves both.
+2. **Registration.** At construction, call
+   `EplbLayer.register(slots, top_k, repeat_count)` for every routed MoE
+   layer, in the order the layers run. That includes a draft layer from the
+   target's checkpoint, with `repeat_count` the number of times one forward
+   runs it (`max_draft_len` for one-model MTP). The loader builds the model
+   inside the balancer's context, so the registration reaches it.
+3. **Weights.** Size every expert weight and per-expert scale by
+   `local_slots`, and fill slot `j` from checkpoint expert `slot_experts[j]`.
+   An expert in two slots is loaded twice, and a rank reads only the experts
+   its slots hold.
+4. **Routing.** After the router's top-k, map the expert ids to slot ids
+   with `EplbLayer.route`, and call the expert kernels with `num_slots` as
+   the expert count and `[slot_offset, slot_offset + local_slots)` as this
+   rank's window. Every rank that routes the same tokens gets the same slots,
+   so a target that gathers its tokens before routing stays consistent.
+
+Then list the mode in the target class, `EPLB_MODES = frozenset({"static"})`,
+and gate the layouts in `route` on `moe_eplb_mode(model_config)`.
+
+### Testing EPLB
+
+A target that implements EPLB adds:
+
+* **CPU:** its slots and weight manifest under a placement unlike the default
+  one, with copies of an expert on several ranks and twice on one rank, and
+  its routing decisions for each EPLB mode and layout.
+* **GPU:** the cells of the catalog EPLB entry and of its expert kernel at
+  the shapes and slot windows the target calls them with (`TARGET_CELLS`).
+* **Accuracy:** its benchmark with EPLB at every layout it admits, with
+  `modeling_v2="require"`. A slot loaded with the wrong expert still produces
+  fluent text, so use a placement that differs from the default one in every
+  layer.
+
 ## Writing operations
 
 Wrap each kernel call in a thin, stateless operation class that makes its
