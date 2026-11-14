@@ -565,14 +565,16 @@ def test_round1_zero_accepted(B, H):
 
 @pytest.mark.parametrize(
     "B,H,M",
-    [(128, 2, 2), (32, 12, 2), (32, 6, 2), (2, 12, 7), (16, 12, 7)],
+    [(128, 2, 2), (32, 12, 2), (32, 6, 2), (2, 12, 7), (16, 12, 7), (8, 8, 7), (9, 8, 7)],
     ids=lambda v: str(v),
 )
 def test_round2_replay(B, H, M):
     """Replay round: mixed num_accepted per request, chained from a CPU-
     golden round 1. Validates the kernel's cache-replay state math (the
     path the drop's own self-check never exercised). ``M=7`` covers the
-    production MTP7 verify (T_loop up to 15) at the TEP8 shape."""
+    production MTP7 verify (T_loop up to 15) at the TEP8 shape. The H=8
+    cases exercise every acceptance count at the 64-tile cluster boundary
+    and just above it, where the kernel uses a single CTA per tile."""
     data = make_conv_data(B, H, M=M, seed=7)
     T = data["T"]
 
@@ -610,6 +612,10 @@ def test_round2_replay(B, H, M):
     _assert_close(
         "state2(cute vs cpu)", cute2["recurrent_state"], cpu2["recurrent_state"], atol=1e-4
     )
+    for name in ("k_cache", "g_cache", "v_cache", "beta_cache"):
+        _assert_close(f"{name}2(cute vs cpu)", cute2[name], cpu2[name], atol=2e-2, rtol=4e-3)
+    for name in ("cs_q", "cs_k", "cs_v"):
+        torch.testing.assert_close(cute2[name], cpu2[name], rtol=0, atol=0)
     _assert_close(
         "out2(cute vs fla)", cute2["out"][0, rows].float(), fla_out2[0, rows], atol=5e-2, rtol=5e-2
     )

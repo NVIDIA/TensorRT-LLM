@@ -258,3 +258,9 @@ l0_b300:
   - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_tp1_mtp3_cutedsl_fp8_kv_bf16_state
   - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_tp1_mtp7_long_context_passkey
   - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_tp1_breakable_prefill_matches_eager
+
+# Coverage-guided tests
+  - unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_deterministic.py::test_prefill_mixed_short_and_unaligned_windows
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_fused_moe/test_k3_fused_moe.py::test_k3_fused_moe_zero_weights_reused_output
+  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_103__tep4/attention/test_modeling_v2_cute_dsl_sparse_mla_prefill.py::test_full_topk_specializations
+  - unittest/_torch/modules/kimi_kda/test_kda_mtp_decode_cute_parity.py::test_round2_replay
