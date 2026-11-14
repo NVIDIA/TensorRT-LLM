@@ -158,6 +158,7 @@ l0_b300:
   - unittest/_torch/modeling_v2/quantization TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/deepseek_v3/r1_0528_nvfp4__sm_10x__default TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_103__tep4 TIMEOUT (30)
+  - unittest/_torch/modeling_v2/models/glm_moe_dsa/test_draft_front.py
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/gpt_oss/gpt_oss_120b__sm_10x__default TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/qwen4_exp/ops TIMEOUT (30)
