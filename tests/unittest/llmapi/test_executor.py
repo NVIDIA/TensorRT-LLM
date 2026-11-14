@@ -429,6 +429,7 @@ def test_handle_response_propagates_should_abort():
     result._handle_response(output)
     assert result.aborted()
     assert result._outputs[0]._postprocess_result == "mock_sse_data"
+    assert result._outputs[0].postprocess_result == "mock_sse_data"
 
 
 def test_PostprocWorker_Output_tracing_fields():

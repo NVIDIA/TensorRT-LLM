@@ -452,7 +452,7 @@ class _StreamedGeneration:
             frames = self._steps.pop(0)
             return SimpleNamespace(
                 finished=not self._steps,
-                outputs=[SimpleNamespace(_postprocess_result=frames)],
+                outputs=[SimpleNamespace(postprocess_result=frames)],
             )
         if self._then is not None:
             raise self._then

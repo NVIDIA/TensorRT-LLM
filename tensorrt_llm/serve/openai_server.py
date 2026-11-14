@@ -121,11 +121,11 @@ from tensorrt_llm.serve.perf_metrics import (PerfMetricsJsonlWriter,
                                              build_request_metrics_record)
 from tensorrt_llm.serve.postprocess_handlers import (
     ChatCompletionPostprocArgs, ChatPostprocArgs, CompletionPostprocArgs,
-    ResponsesAPIPostprocArgs, chat_harmony_post_processor,
+    PostprocStrategy, ResponsesAPIPostprocArgs, chat_harmony_post_processor,
     chat_harmony_streaming_post_processor, chat_response_post_processor,
     chat_stream_post_processor, completion_response_post_processor,
     completion_stream_post_processor, responses_api_post_processor,
-    responses_api_streaming_post_processor)
+    responses_api_streaming_post_processor, select_postproc_strategy)
 from tensorrt_llm.serve.render import (HarmonyConversionError, RenderResources,
                                        UnsupportedRenderError,
                                        mount_render_endpoints,
@@ -665,6 +665,7 @@ class OpenAIServer(_VideoRoutesMixin):
         load_builtin_extensions()
         self.generator = generator
         self._is_visual_gen = _is_visual_gen_instance(generator)
+        self._postproc = select_postproc_strategy(self.postproc_worker_enabled)
         self._embedding_max_queue_delay = embedding_max_queue_delay
         self._embedding_max_queue_size = embedding_max_queue_size
         self.embedding_batcher: Optional[EncodeBatcher] = None
@@ -1172,6 +1173,13 @@ class OpenAIServer(_VideoRoutesMixin):
             return False
 
         return True if self.generator.args.num_postprocess_workers > 0 else False
+
+    @functools.cached_property
+    def _postproc(self) -> PostprocStrategy:
+        # __init__ pre-caches this; computing on demand keeps instances
+        # built without __init__ (unit tests use OpenAIServer.__new__)
+        # working.
+        return select_postproc_strategy(self.postproc_worker_enabled)
 
     @staticmethod
     def create_error_response(
@@ -1981,11 +1989,7 @@ class OpenAIServer(_VideoRoutesMixin):
         await promise.aresult()
         if promise.error is not None:
             raise RuntimeError(f"Generation failed: {promise.error}")
-        if self.postproc_worker_enabled:
-            chat_response = promise.outputs[0]._postprocess_result
-        else:
-            post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
-            chat_response = post_processor(promise, args)
+        chat_response = self._postproc.apply(promise, postproc_params)
 
         if disaggregated_params is not None and disaggregated_params.request_type == "context_only":
             chat_response.prompt_token_ids = promise.prompt_token_ids
@@ -2098,22 +2102,17 @@ class OpenAIServer(_VideoRoutesMixin):
                 promise: RequestOutput,
                 postproc_params: PostprocParams) -> AsyncGenerator[str, None]:
             try:
-                if not self.postproc_worker_enabled:
-                    post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
                 first_response = await anext(promise)
                 raw_request.state.server_first_token_time = self._adjusted_steady_clock.now(
                 )
-                pp_results = first_response.outputs[
-                    0]._postprocess_result if self.postproc_worker_enabled else post_processor(
-                        first_response, args)
+                pp_results = self._postproc.apply(first_response,
+                                                  postproc_params)
                 for pp_res in pp_results:
                     yield pp_res
                 # Making sure we can handle the situation where there is only one response
                 res = first_response
                 async for res in promise:
-                    pp_results = res.outputs[
-                        0]._postprocess_result if self.postproc_worker_enabled else post_processor(
-                            res, args)
+                    pp_results = self._postproc.apply(res, postproc_params)
                     for pp_res in pp_results:
                         yield pp_res
                 yield "data: [DONE]\n\n"
@@ -3004,11 +3003,7 @@ class OpenAIServer(_VideoRoutesMixin):
             response = await promise
             if response.error is not None:
                 raise RuntimeError(f"Generation failed: {response.error}")
-            if not self.postproc_worker_enabled:
-                post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
-                pp_result = post_processor(response, args)
-            else:
-                pp_result = response.outputs[0]._postprocess_result
+            pp_result = self._postproc.apply(response, postproc_params)
             if disaggregated_params and disaggregated_params.request_type and disaggregated_params.request_type == "context_only":
                 # Include prompt token ids for context-only requests
                 pp_result.prompt_token_ids = response.prompt_token_ids
@@ -3049,11 +3044,7 @@ class OpenAIServer(_VideoRoutesMixin):
                                        params: Optional[PostprocParams]):
             try:
                 async for output in promise:
-                    if not self.postproc_worker_enabled:
-                        post_processor, args = params.post_processor, params.postproc_args
-                        pp_result = post_processor(output, args)
-                    else:
-                        pp_result = output.outputs[0]._postprocess_result
+                    pp_result = self._postproc.apply(output, params)
                     for pp_res in pp_result:
                         yield pp_res
                 await self._extract_metrics(output, raw_request)
@@ -3232,21 +3223,16 @@ class OpenAIServer(_VideoRoutesMixin):
         async def create_streaming_generator(promise: RequestOutput,
                                              postproc_params: PostprocParams):
             try:
-                if not self.postproc_worker_enabled:
-                    post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
                 first_response = await anext(promise)
                 raw_request.state.server_first_token_time = (
                     self._adjusted_steady_clock.now())
-                pp_results = (first_response.outputs[0]._postprocess_result if
-                              self.postproc_worker_enabled else post_processor(
-                                  first_response, args))
+                pp_results = self._postproc.apply(first_response,
+                                                  postproc_params)
                 for pp_res in pp_results:
                     yield pp_res
                 res = first_response
                 async for res in promise:
-                    pp_results = (res.outputs[0]._postprocess_result
-                                  if self.postproc_worker_enabled else
-                                  post_processor(res, args))
+                    pp_results = self._postproc.apply(res, postproc_params)
                     for pp_res in pp_results:
                         yield pp_res
                 yield "data: [DONE]\n\n"
@@ -3416,11 +3402,10 @@ class OpenAIServer(_VideoRoutesMixin):
                 promise: RequestOutput,
                 postproc_params: PostprocParams) -> ResponsesResponse:
             await promise.aresult()
-            if self.postproc_worker_enabled:
-                response = promise.outputs[0]._postprocess_result
-            else:
-                args = postproc_params.postproc_args
-                response = await responses_api_create_response(
+            args = postproc_params.postproc_args
+            response = await self._postproc.apply_async(
+                promise,
+                lambda: responses_api_create_response(
                     generator=promise,
                     request=request,
                     sampling_params=args.sampling_params,
@@ -3434,7 +3419,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     tool_parser=args.tool_parser,
                     num_prompt_tokens=args.usage_num_prompt_tokens(),
                     tokenizer=self.tokenizer,
-                )
+                ))
             # A postprocessing worker's result has no prompt token ids, and the
             # context-only handoff needs them, so take them from the promise as
             # the chat path does.
@@ -3448,16 +3433,14 @@ class OpenAIServer(_VideoRoutesMixin):
 
         async def create_streaming_generator(promise: RequestOutput,
                                              postproc_params: PostprocParams):
-            post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
+            args = postproc_params.postproc_args
             streaming_processor = args.streaming_processor
             initial_responses = streaming_processor.get_initial_responses()
             for initial_response in initial_responses:
                 yield initial_response
 
             async for res in promise:
-                pp_results = res.outputs[
-                    0]._postprocess_result if self.postproc_worker_enabled else post_processor(
-                        res, args)
+                pp_results = self._postproc.apply(res, postproc_params)
                 for pp_res in pp_results:
                     yield pp_res
             await self._extract_metrics(res, raw_request)
