@@ -3005,6 +3005,14 @@ def _shared_draft_kv_blocker(server_configs: list[CtxGenServerConfig],
             # The CuTe DSL MLA block decode pages by any divisor of 128 above 1.
             return ("kv_cache_config.tokens_per_block to divide 128 for "
                     "DSpark with attention_backend CUTEDSL in both sections")
+    # Each worker's gate reads its drafter's backend, so sections naming
+    # different backends could decide differently (unset is AUTO).
+    if len({(cfg.other_args["speculative_config"].get("decoding_type"),
+             cfg.other_args["speculative_config"].get("attention_backend")
+             or "AUTO")
+            for cfg in server_configs}) != 1:
+        return ("the same speculative_config decoding_type and "
+                "attention_backend in both sections")
     # Each worker's gate decides which page sizes its drafter reads (a manager
     # hosting draft layers also reads 128-token pages); equal pages, or pages
     # every gate admits, keep both workers' decisions the same.
