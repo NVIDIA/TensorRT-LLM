@@ -59,6 +59,9 @@ from flashinfer.gemm.kernels.dense_blockscaled_gemm_sm100_common import _Sm100Bl
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import cute_aot
 
+# ``per_token_alpha`` value for one alpha per row of C (``"n"``: per column).
+_ALPHA_PER_ROW = "m"
+
 
 def _per_token_fragment_plan(shape, stride, token_axis):
     """Static analysis of a t2r fragment of the identity tensor over C.
@@ -1416,10 +1419,10 @@ class LamportPushGemmKernel(_Sm100BlockScaledGemmCommon):
                 )
                 alpha_extent = (
                     mC_mnl.shape[0]
-                    if cutlass.const_expr(self.per_token_alpha == "m")
+                    if cutlass.const_expr(self.per_token_alpha == _ALPHA_PER_ROW)
                     else mC_mnl.shape[1]
                 )
-                token_axis = 0 if self.per_token_alpha == "m" else 1
+                token_axis = 0 if self.per_token_alpha == _ALPHA_PER_ROW else 1
                 # Static plan: which fragment elements share a token, and
                 # whether the token is constant across the epilogue subtiles.
                 _frag_layout = tTR_cC_partitioned.layout

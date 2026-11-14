@@ -12,7 +12,7 @@ import logging
 import os
 import re
 import shutil
-import subprocess
+import subprocess  # nosec B404
 from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path

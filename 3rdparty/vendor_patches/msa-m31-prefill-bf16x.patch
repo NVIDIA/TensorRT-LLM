@@ -295,7 +295,7 @@ index 63b1593519f0c32cbbc4dbd57b57441b1944de26..d7bc0fed20f78776e17b305e4ede6838
  ## Data contract
 diff --git a/_build_utils.py b/_build_utils.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..9b00e6ef3ff4918e91de3875086c44dd61ce1617
+index 0000000000000000000000000000000000000000..2a5ba869823a608636e8ee09e890abad1371e86d
 --- /dev/null
 +++ b/_build_utils.py
 @@ -0,0 +1,318 @@
@@ -313,7 +313,7 @@ index 0000000000000000000000000000000000000000..9b00e6ef3ff4918e91de3875086c44dd
 +import os
 +import re
 +import shutil
-+import subprocess
++import subprocess  # nosec B404
 +from contextlib import contextmanager
 +from functools import lru_cache
 +from pathlib import Path
@@ -619,7 +619,7 @@ index 0000000000000000000000000000000000000000..9b00e6ef3ff4918e91de3875086c44dd
 +]
 diff --git a/_jit_cache.py b/_jit_cache.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..df1af67407fa3ee9b4a1cec34aa80b7a1de97258
+index 0000000000000000000000000000000000000000..fc88195fc2e57ab23ab58efe857433d0e8be8fb9
 --- /dev/null
 +++ b/_jit_cache.py
 @@ -0,0 +1,312 @@
@@ -662,7 +662,7 @@ index 0000000000000000000000000000000000000000..df1af67407fa3ee9b4a1cec34aa80b7a
 +import os
 +import platform
 +import shutil
-+import subprocess
++import subprocess  # nosec B404
 +import tempfile
 +import threading
 +from functools import cached_property
@@ -914,7 +914,7 @@ index 0000000000000000000000000000000000000000..df1af67407fa3ee9b4a1cec34aa80b7a
 +def ninja_deps(build_dir: Path) -> dict[str, list[str]]:
 +    """``{object relative to build_dir: [absolute real paths it was compiled from]}``, from the
 +    deps ninja recorded for the rules declared with ``deps = gcc``."""
-+    result = subprocess.run(["ninja", "-t", "deps"], cwd=build_dir, capture_output=True,
++    result = subprocess.run(["ninja", "-t", "deps"], cwd=build_dir, capture_output=True,  # nosec B607
 +                            text=True, check=True)
 +    deps: dict[str, list[str]] = {}
 +    current = None
@@ -930,7 +930,7 @@ index 0000000000000000000000000000000000000000..df1af67407fa3ee9b4a1cec34aa80b7a
 +
 +
 +def run_ninja(build_dir: Path, label: str, jobs: int = 1) -> None:
-+    result = subprocess.run(["ninja", f"-j{jobs}"], cwd=build_dir, capture_output=True,
++    result = subprocess.run(["ninja", f"-j{jobs}"], cwd=build_dir, capture_output=True,  # nosec B607
 +                            text=True, check=False)
 +    if result.returncode != 0:
 +        raise RuntimeError(f"{label} compilation failed:\n"
