@@ -138,6 +138,12 @@ def bp_tail(ctl, src, store, engine, t: int, gather: bool, block: int) -> None:
     d_nnew = store.next_new_tokens.squeeze(-1).T
     d_lens, d_draft = store.new_tokens_lens, store.next_draft_tokens
     ids, draft, pos_off, kv_off = engine
+    if gather and (t > d_nnew.shape[1] or t - 1 > d_draft.shape[1]):
+        # The gather reads back what the store keeps: every gathered token must fit its destination row.
+        raise ValueError(
+            f"bp_tail: {t} tokens per request do not fit the store's next_new_tokens width {d_nnew.shape[1]} "
+            f"/ next_draft_tokens width {d_draft.shape[1]}"
+        )
     n_pos, n_kv = pos_off.numel(), kv_off.numel()
     grid = (max(1, triton.cdiv(max(n_pos, n_kv), ZBLOCK)) if gather else 1,)
     _bp_tail_kernel[grid](
