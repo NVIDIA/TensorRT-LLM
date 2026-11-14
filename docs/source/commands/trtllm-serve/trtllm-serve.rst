@@ -154,6 +154,8 @@ Another example uses ``curl``:
     :language: bash
     :linenos:
 
+A streamed response that stays silent (while the request waits for its first token, or while the model writes a tool call, which is sent only once complete) repeats its ``response.in_progress`` event every 15 seconds so that clients and proxies do not cut the connection. ``TRTLLM_RESPONSES_STREAM_KEEPALIVE_S`` sets how often, in seconds, that keepalive frame is sent while the stream is silent; ``0`` turns the keepalive off, and a negative value or one that is not a number is reported with a warning when the first stream starts and the default kept. In disaggregated serving, set it where the Responses stream is produced, which is on the generation workers. With the default ``context_first`` schedule, that stream starts only once the context phase is done, so no keepalive is sent while the context worker runs the prefill; client and proxy timeouts must allow for that wait.
+
 
 More openai compatible examples can be found in the `compatibility examples <https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/serve/compatibility>`_ directory.
 
