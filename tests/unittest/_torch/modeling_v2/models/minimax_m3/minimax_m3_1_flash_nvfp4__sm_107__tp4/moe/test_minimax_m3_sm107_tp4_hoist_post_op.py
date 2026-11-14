@@ -22,8 +22,8 @@ def _sm107():
     return torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 7)
 
 
-# The skipif below reads torch.ops.trtllm: load the TRT-LLM op library first (without this import every case skipped,
-# 15/15, in build_cut26_v1).
+# The skipif below reads torch.ops.trtllm: load the TRT-LLM op library first (without this import every case
+# skips).
 import tensorrt_llm  # noqa: E402,F401
 
 pytestmark = pytest.mark.skipif(

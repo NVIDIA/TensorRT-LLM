@@ -174,9 +174,12 @@ def _fake_stock_op(monkeypatch):
     )
     monkeypatch.setattr(spec_interface, "flashinfer", fake_fi, raising=False)
     monkeypatch.setattr(spec_interface, "IS_FLASHINFER_AVAILABLE", True)
+    previous = spec_interface._CHAIN_SPEC_OVERRIDE
     spec_interface.set_chain_speculative_sampling_override(None)
-    yield fake_op, stock
-    spec_interface.set_chain_speculative_sampling_override(None)
+    try:
+        yield fake_op, stock
+    finally:
+        spec_interface.set_chain_speculative_sampling_override(previous)
 
 
 def _cpu_args():
@@ -263,13 +266,15 @@ def test_the_target_installs_the_override() -> None:
     if not modeling.REJ_MC:
         pytest.skip("REJ_MC is switched off in this environment")
     saved = dict(modeling._REJ_MC_STATE)
+    saved_hook = spec_interface._CHAIN_SPEC_OVERRIDE
     modeling._REJ_MC_STATE.clear()
+    spec_interface.set_chain_speculative_sampling_override(None)
     try:
         modeling._install_rej_mc()
         assert spec_interface._CHAIN_SPEC_OVERRIDE is entry.chain_spec_mc
         assert modeling._REJ_MC_STATE["installed"] is True
     finally:
-        spec_interface.set_chain_speculative_sampling_override(None)
+        spec_interface.set_chain_speculative_sampling_override(saved_hook)
         modeling._REJ_MC_STATE.clear()
         modeling._REJ_MC_STATE.update(saved)
 

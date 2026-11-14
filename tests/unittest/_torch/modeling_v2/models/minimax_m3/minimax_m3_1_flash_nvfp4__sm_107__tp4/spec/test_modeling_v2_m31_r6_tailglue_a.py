@@ -158,12 +158,21 @@ class _State:
         self.base = base.to(torch.int64).to(dev)
         self.nacc = torch.randint(1, KP1 + 1, (n,), generator=g).to(torch.int64).to(dev)
         self.projected = (torch.randn(n * KP1, hidden, generator=g) * 2).to(torch.bfloat16).to(dev)
+        # Each request row's first `writable_cols` columns (every column its store can write) get
+        # physical pages of their own: a page shared by two written columns would leave bytes that
+        # depend on which store lands last. The other entries are only read and may repeat.
+        self.writable_cols = min(width, pages // n)
+        own = torch.randperm(pages, generator=g)[: n * self.writable_cols]
+        own = own.view(n, self.writable_cols).to(torch.int32).to(dev)
+        self.tables[:n, : self.writable_cols] = own
         self.refresh_positions()
 
     def refresh_positions(self):
         ctx = self.ctx_len[self.slots]
         j = torch.arange(KP1, device=ctx.device)
         self.positions = (ctx.unsqueeze(1) + j.unsqueeze(0)).reshape(-1).contiguous()
+        last_col = int(self.positions.max()) // self.ps
+        assert last_col < self.writable_cols, "a store column would share a physical page"
         now = torch.minimum(ctx + self.nacc, torch.full_like(ctx, self.max_ctx))
         q = torch.arange(BLOCK, device=ctx.device)
         self.qpos = (now.unsqueeze(1) + q.unsqueeze(0)).contiguous()

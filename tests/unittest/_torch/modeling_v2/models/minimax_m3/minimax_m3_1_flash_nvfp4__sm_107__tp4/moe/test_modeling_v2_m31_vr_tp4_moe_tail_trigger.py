@@ -66,7 +66,10 @@ def _check(engine, state, num_tokens: int, bucket: int, killed: bool) -> None:
     assert torch.equal(again.view(torch.int16), ref.view(torch.int16))
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="the engine state compiles the kernel")
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7),
+    reason="the engine state compiles the kernel",
+)
 @pytest.mark.parametrize("num_tokens", [1, 2, 4, 8])
 @pytest.mark.parametrize("killed", [False, True])
 def test_push_bits_and_epochs_unchanged(
@@ -83,7 +86,10 @@ def test_push_bits_and_epochs_unchanged(
     _check(m3_moe_engine, state, num_tokens, 8, killed)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="the engine state compiles the kernel")
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7),
+    reason="the engine state compiles the kernel",
+)
 @pytest.mark.parametrize("num_tokens", [9, 16])
 @pytest.mark.parametrize("killed", [False, True])
 def test_moe16_push_bits_and_epochs_unchanged(

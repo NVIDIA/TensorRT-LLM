@@ -9,6 +9,7 @@ wrapper takes a shard only for the fc it was built from and the checked row coun
 project_target_hidden takes it only within those rows. Default on; TRTLLM_M31_DISABLE_FC_SHARD=1 turns it off."""
 
 import importlib
+import os
 from types import MethodType, SimpleNamespace
 
 import pytest
@@ -23,9 +24,13 @@ K, N, TP = 30720, 6144, 4
 COLS = N // TP
 
 
-def _op_or_skip():
+def _skip_unless_sm107():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
         pytest.skip("the sm_107 TP4 target runs on SM107 only")
+
+
+def _op_or_skip():
+    _skip_unless_sm107()
     op = m31_fc_shard.fc_shard_op()
     assert op is not None, "this build has no mv2_minimax_m3::minimax_m31_fc_shard_gemm"
     return op
@@ -33,6 +38,7 @@ def _op_or_skip():
 
 @pytest.fixture(scope="module")
 def weight():
+    _skip_unless_sm107()
     g = torch.Generator(device="cpu").manual_seed(2026)
     return (torch.randn(N, K, generator=g) * 0.02).to(torch.bfloat16).cuda()
 
@@ -169,6 +175,8 @@ def test_fc_shard_default_on_and_kill_switch(monkeypatch, env, expected):
         m31_switches,
     )
 
+    original = os.environ.get("TRTLLM_M31_DISABLE_FC_SHARD")
+    original_flag = dspark.FC_SHARD
     monkeypatch.delenv("TRTLLM_M31_DISABLE_FC_SHARD", raising=False)
     for name, value in env.items():
         monkeypatch.setenv(name, value)
@@ -176,7 +184,10 @@ def test_fc_shard_default_on_and_kill_switch(monkeypatch, env, expected):
     try:
         assert importlib.reload(dspark).FC_SHARD is expected
     finally:
-        monkeypatch.delenv("TRTLLM_M31_DISABLE_FC_SHARD", raising=False)
+        if original is None:
+            monkeypatch.delenv("TRTLLM_M31_DISABLE_FC_SHARD", raising=False)
+        else:
+            monkeypatch.setenv("TRTLLM_M31_DISABLE_FC_SHARD", original)
         importlib.reload(m31_switches)
         importlib.reload(dspark)
-    assert dspark.FC_SHARD is True
+    assert dspark.FC_SHARD is original_flag

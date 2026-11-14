@@ -12,6 +12,7 @@ import math
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2._native import NoTarget
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.dspark import dflash_merge
 from tensorrt_llm._torch.models import modeling_dflash
 
@@ -21,7 +22,7 @@ def _op_built() -> bool:
         return False
     try:
         return hasattr(dflash_merge.family_ops(), "minimax_m31_dflash_merge_later_keys")
-    except Exception:  # noqa: BLE001 - no family library, no op
+    except NoTarget:  # this installation carries no family library; a broken one fails
         return False
 
 
