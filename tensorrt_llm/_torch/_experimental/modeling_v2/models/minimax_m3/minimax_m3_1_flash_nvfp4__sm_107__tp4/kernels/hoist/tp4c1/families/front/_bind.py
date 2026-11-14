@@ -20,7 +20,7 @@ def knobs_table():
 
 def build_root(tag: str) -> str:
     """Node-local build root for legacy torch-extension builds, never a shared filesystem."""
-    d = os.path.join(tempfile.gettempdir(), "m3llk-legacy", tag)
+    d = os.path.join(tempfile.gettempdir(), "minimax_m3_tp4_front", tag)
     os.makedirs(d, exist_ok=True)
     return d
 

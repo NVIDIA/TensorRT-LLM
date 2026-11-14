@@ -310,7 +310,7 @@ def _check_pairing(blk, who):
 
 
 def _check_dl_grid(st):
-    """R11 (ROUTING-SCHEMA-V2 §7): roles by SM (C1 dl, C2 XL die roles) need one CTA per SM: grid == SM count, and the
+    """R11: roles by SM (C1 dl, C2 XL die roles) need one CTA per SM: grid == SM count, and the
     die split needs SM count % 4 == 0."""
     cfg = getattr(st, "config", {}) or {}
     if not (cfg.get("dl") or cfg.get("xl_smid") or cfg.get("xl_s0")):
@@ -457,7 +457,7 @@ def _ext(blk, arm, build, state_of, extra=None):
 
     if hasattr(
         lbh, "check_x4_pair"
-    ):  # K-POST §0e: an X4 post needs a b1_x4 engine and back (b1x4.py checks the tensors)
+    ):  # K-POST: an X4 post needs a b1_x4 engine and back (b1x4.py checks the tensors)
         lbh.check_x4_pair(blk, bool(getattr(sb, "b1_x4", 0)))
     _TRACK.append((arm, blk.layer_idx, blk.t, sb, rh.tdbg))
     if fa is None:
@@ -623,7 +623,7 @@ def _l_cfg(over):
 
 
 def _oproj_rh(blk, solo, rh_w=None, **over):
-    """rx v2 (MOE-V2-PLAN.md §3a): this blk's rx slot (allocated here, first, in the same factory order on every rank;
+    """rx v2: this blk's rx slot (allocated here, first, in the same factory order on every rank;
     the post reuses it), a per-layer oep call counter registered for lbh.rx_reset_all, then K-OPROJ's core with the
     slot's rxc for its R8 check (calls == consumes; traps, or counts with H9_RH_CKDBG / HANG_DBG; compiled out for tier
     C). The first eager call of the first rh o_proj of every build (R13) is an arm boundary: lbh.rx_reset_all() there
@@ -640,7 +640,7 @@ def _oproj_rh(blk, solo, rh_w=None, **over):
     lk = _l_cfg(over)
     hang = _K.get("H9_RH_HANG_DBG", "0") == "1"
     # R8 (calls == consumes): compiled in for every matched arm (rh_ck 1; H9_RH_CKDBG 0 traps, 1 records, default 1 in
-    # HANG_DBG smokes per ROUTING-SCHEMA-V2 §7); tier C has no consuming post, so it is compiled out there (rh_ck 0)
+    # HANG_DBG smokes); tier C has no consuming post, so it is compiled out there (rh_ck 0)
     rh_ck = 0 if solo else 1
     ckdbg = 0 if solo else int(_K.get("H9_RH_CKDBG", "1" if hang else "0"))
     if ckdbg not in (0, 1):

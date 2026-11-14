@@ -23,8 +23,8 @@ TP4C1 = os.path.join(HOIST, "tp4c1")
 PKG = f"{TP4PKG}.kernels.hoist.tp4c1"
 KDIR = os.path.join(TP4, "csrc")
 OP = os.path.join(KDIR, "hoistPostTp4Op.cpp")
-# passB preflight P3_HYB_engine_push (every rank)
-PASSB_HYB_ENGINE = {
+# The engine module configuration the HYB arm runs (every rank).
+HYB_ENGINE_EXPECTED = {
     "AR_G3": 0,
     "AR_V3": 0,
     "AR_CL": 8,
@@ -215,7 +215,7 @@ def test_block_engine_is_the_measured_hyb_engine():
     c = module_consts(
         os.path.join(HOIST, "tp4_hoist_block.py"), {"HYB_ENGINE", "HYB_ENGINE_OVERLAY", "ROWS"}
     )
-    assert c["HYB_ENGINE"] == PASSB_HYB_ENGINE
+    assert c["HYB_ENGINE"] == HYB_ENGINE_EXPECTED
     assert c["HYB_ENGINE_OVERLAY"] == {"ar_v3": 0, "ar_cl": 8}
     assert c["ROWS"] == 8
 
@@ -501,7 +501,7 @@ def test_engine_check_follows_the_b2lag_switch():
     path = os.path.join(HOIST, "tp4_hoist_block.py")
     c = module_consts(path, {"HYB_ENGINE", "HYB_ENGINE_B2LAG_LAG", "HYB_ENGINE_B2LAG_OFF"})
     assert c["HYB_ENGINE_B2LAG_LAG"] == 6 == c["HYB_ENGINE"]["LAG"]
-    assert c["HYB_ENGINE_B2LAG_OFF"] == dict(PASSB_HYB_ENGINE, LAG=2, FC1D=4)
+    assert c["HYB_ENGINE_B2LAG_OFF"] == dict(HYB_ENGINE_EXPECTED, LAG=2, FC1D=4)
     for off in (False, True):
         env = {
             "Dict": dict,

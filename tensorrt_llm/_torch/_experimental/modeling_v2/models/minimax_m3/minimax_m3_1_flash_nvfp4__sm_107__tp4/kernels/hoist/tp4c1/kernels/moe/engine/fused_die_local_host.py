@@ -41,11 +41,11 @@ def _build(blk, over, reg, shared_ctas_le4=None):
 # DEV (opt-in, M3LL_DEV_MOE_B2LAG=1, or "b2buf,stages,lag"): the 5-8 row engine with a double-buffered FC2 B image
 # and the kernel's FC2 six phases behind FC1 (b2buf 2, stages 6, lag 6) instead of b2buf 1, stages 7, lag 2; the
 # host's phase plan stays at lag 2 (M3_MOE_LAG untouched: a plan built for lag 6 measured slower at D >= 20).
-# Scheduling only (same MMAs, same reduction order): outputs bitwise equal to the shipped config (bench/moefix,
+# Scheduling only (same MMAs, same reduction order): outputs bitwise equal to the shipped config (a microbenchmark,
 # rows 5..8, D 4..32). With one B2 buffer the FC2 B loader of group g waits until the epilogue has drained FC2 of
 # group g - 1, so every FC2 phase exposes the image wait + bulk copy + TMEM copy and the weight ring backs up behind
 # it. Standalone (cold L2, 8 rows): -2.4 / -2.7 / -3.2 / -2.7 us per layer at D 16 / 20 / 24 / 32 distinct experts,
-# 0 at D 4..8 (bench/moefix/README.md). Same smem footprint as the shipped config (stages 7 with b2buf 2 adds 18 KB
+# 0 at D 4..8. Same smem footprint as the shipped config (stages 7 with b2buf 2 adds 18 KB
 # and lost 0.5 us at D 4).
 _B2LAG_ENV = "M3LL_DEV_MOE_B2LAG"
 
