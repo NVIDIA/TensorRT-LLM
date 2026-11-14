@@ -667,7 +667,20 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         )
 
     def _any_rank_has_recv_sessions(self) -> bool:
-        counts = self._dist.tp_cp_allgather_int64([len(self._recv_sessions)])
+        """Whether any rank of the group has a receive in progress.
+
+        Counts what the full consensus would act on, as the idle-poll skip does
+        (_consensus_outcome's local_session_count): sessions, receives admitted
+        but not started yet, RankInfo admissions that start their session only
+        inside _poll_rank_info_admissions, and coordinated start failures.
+        """
+        local = (
+            len(self._recv_sessions)
+            + self._gen_deferred_receives
+            + len(self._pending_rank_info_admissions or {})
+            + len(self._rank_info_start_failures or {})
+        )
+        counts = self._dist.tp_cp_allgather_int64([local])
         return bool(counts.any())
 
     def _dp_group_allgather(self, obj):

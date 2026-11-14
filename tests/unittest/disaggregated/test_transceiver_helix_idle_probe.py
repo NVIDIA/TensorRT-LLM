@@ -118,6 +118,47 @@ def test_probe_reads_the_live_session_count() -> None:
     assert seen == [[2]]
 
 
+def test_probe_counts_receives_that_have_no_session_yet() -> None:
+    """Receives without a session yet keep the poll in the full consensus.
+
+    A receive admitted but not started, a RankInfo admission and a coordinated start
+    failure each count.
+    """
+    group = _Group(2)
+    transceiver = _make_transceiver(0, group, probe=True)
+    transceiver._gen_deferred_receives = 1
+    transceiver._pending_rank_info_admissions = {5: (Mock(), None)}
+    transceiver._rank_info_start_failures = {6: Mock()}
+    seen = []
+
+    def _gather(values):
+        seen.append(list(values))
+        return np.zeros((group.size, 1), dtype=np.int64)
+
+    transceiver._dist.tp_cp_allgather_int64 = _gather
+    transceiver._any_rank_has_recv_sessions()
+    assert seen == [[3]]
+
+
+def test_pending_rank_info_admission_is_polled_while_no_rank_has_a_session() -> None:
+    """A pending RankInfo admission is polled even when no rank holds a session.
+
+    With a RankInfo auth key, a receive waits in _pending_rank_info_admissions and its
+    session is created only inside _poll_rank_info_admissions, after the probe. An idle
+    non-blocking poll that skipped on zero sessions would never admit it.
+    """
+    group = _Group(2)
+    transceiver = _make_transceiver(0, group, probe=True)
+    transceiver._pending_rank_info_admissions = {5: (Mock(), None)}
+    transceiver._poll_rank_info_admissions = Mock(return_value=([], []))
+    # This rank contributes its own count; the other rank has nothing in progress.
+    transceiver._dist.tp_cp_allgather_int64 = lambda values: np.asarray(
+        [list(values), [0]], dtype=np.int64
+    )
+    transceiver.check_gen_transfer_status(0)
+    transceiver._poll_rank_info_admissions.assert_called_once()
+
+
 def _policy(**mapping) -> bool:
     fields = dict(tp_size=1, cp_size=8, pp_size=1, world_size=8, enable_attention_dp=False)
     fields.update(mapping)
