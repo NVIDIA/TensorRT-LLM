@@ -439,6 +439,14 @@ class SamplingParams:
                 f"under the greedy decoding."
             )
 
+        # An empty stop string tokenizes to no tokens, and the sampler rejects a
+        # stop word without tokens while setting up the request, which fails
+        # every request in flight with it instead of just this one.
+        if self.stop is not None:
+            stop_strings = [self.stop] if isinstance(self.stop, str) else self.stop
+            if any(stop_string == "" for stop_string in stop_strings):
+                raise ValueError("stop must not contain an empty string")
+
         self.logprobs_mode = LogprobMode(self.logprobs_mode)
 
         if self.truncate_prompt_tokens is not None and self.truncate_prompt_tokens < 1:
