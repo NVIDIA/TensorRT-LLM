@@ -204,15 +204,37 @@ def test_one_lapse_invokes_on_detected_once() -> None:
         assert len(fired) == 1, "the same lapse ran on_detected again"
 
 
-def test_pause_suppresses_detection():
+def test_pause_suppresses_detection(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = 1000.0
+    timeout = 1
     fired = []
-    hd = HangDetector(timeout=1, on_detected=lambda: fired.append(1))
-    with hd:
-        hd.checkpoint()
+    hd = HangDetector(timeout=timeout, on_detected=lambda: fired.append(1))
+
+    async def stop_after_poll(_delay: float) -> None:
+        raise asyncio.CancelledError
+
+    def poll() -> None:
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(hd._watch())
+
+    monkeypatch.setattr(hang_detector_module.time, "monotonic", lambda: now)
+    monkeypatch.setattr(hang_detector_module, "asyncio", SimpleNamespace(sleep=stop_after_poll))
+    hd.active = True
+    hd.checkpoint()
+    try:
         with hd.pause():
-            time.sleep(2.0)  # would have fired if not paused
+            now += 2 * timeout
+            poll()
+            assert fired == []
+            assert hd.detected() is False
+        poll()
         assert fired == []
-        assert hd.detected() is False
+        now += timeout
+        poll()
+        assert fired == [1]
+        assert hd.detected() is True
+    finally:
+        hd.stop()
 
 
 def test_status_provider_errors_are_logged(monkeypatch):
@@ -246,7 +268,7 @@ def test_status_provider_errors_are_logged(monkeypatch):
 
 
 @pytest.mark.parametrize("with_dwdp", [False, True], ids=["no_dwdp", "dwdp"])
-def test_control_request_wait_pauses_detector(with_dwdp):
+def test_control_request_wait_pauses_detector(with_dwdp, monkeypatch: pytest.MonkeyPatch):
     fired = []
     executor = PyExecutor.__new__(PyExecutor)
     executor.control_requests = [SimpleNamespace(control_requires_drain=False, control_id=None)]
@@ -260,22 +282,35 @@ def test_control_request_wait_pauses_detector(with_dwdp):
     executor.dwdp_manager = Mock() if with_dwdp else None
     executor.hang_detector = HangDetector(timeout=1, on_detected=lambda: fired.append(1))
 
-    def complete_control_action():
-        # Bounded: if the control request fails before it sets the barrier, an unbounded wait
-        # would leave this thread alive and hang the test process.
-        if executor.control_request_barrier.wait(timeout=30):
-            time.sleep(2.0)
-            executor.control_action_done.set()
-            executor.control_request_barrier.clear()
+    now = 1000.0
 
-    completion_thread = threading.Thread(target=complete_control_action, daemon=True)
-    completion_thread.start()
+    async def stop_after_poll(_delay: float) -> None:
+        raise asyncio.CancelledError
+
+    def complete_control_action():
+        nonlocal now
+        assert executor.control_request_barrier.is_set()
+        now += 2 * executor.hang_detector.timeout
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(executor.hang_detector._watch())
+        executor.control_action_done.set()
+        executor.control_request_barrier.clear()
+
+    monkeypatch.setattr(hang_detector_module.time, "monotonic", lambda: now)
+    monkeypatch.setattr(hang_detector_module, "asyncio", SimpleNamespace(sleep=stop_after_poll))
+    executor.hang_detector.active = True
+    executor.hang_detector.checkpoint()
     try:
-        with patch("torch.cuda.synchronize"), executor.hang_detector:
-            executor.hang_detector.checkpoint()
+        with (
+            patch("torch.cuda.synchronize"),
+            patch.object(
+                executor.control_action_done, "wait", side_effect=complete_control_action
+            ) as wait,
+        ):
             executor._handle_control_request()
+        wait.assert_called_once_with()
     finally:
-        completion_thread.join(timeout=35)
+        executor.hang_detector.stop()
 
     assert fired == []
     assert executor.control_requests == []
@@ -1116,7 +1151,7 @@ def test_watchdog_threads_the_delivery_event_through(monkeypatch):
 # ---------------------------------------------------------------------------
 
 _MPI_2RANK_SCRIPT = """
-import os, sys, time
+import os, sys
 from mpi4py import MPI
 from tensorrt_llm._torch.pyexecutor.hang_detector import hard_kill_on_rank_crash
 
@@ -1136,12 +1171,10 @@ if comm.Get_rank() == 0:
     hard_kill_on_rank_crash(comm.Get_size(), error_delivered=delivered)
     # Only reached when the kill is skipped.
     print("RANK0_SURVIVED", flush=True)
-else:
-    # A peer that would otherwise sit in a collective forever.
-    time.sleep(20)
-    print("RANK1_SURVIVED", flush=True)
-
+# The peer remains in the collective until rank 0 survives the gate.
 comm.Barrier()
+if comm.Get_rank() == 1:
+    print("RANK1_SURVIVED", flush=True)
 sys.exit(0)
 """
 
