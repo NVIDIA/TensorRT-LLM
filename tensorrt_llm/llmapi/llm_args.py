@@ -100,6 +100,7 @@ if TYPE_CHECKING:
     # backend while llm_args is defining its public configuration models.
     from tensorrt_llm._torch.attention.backends.sparse.qsa import (
         QSASparseMetadataParams, QSASparseParams)
+    from tensorrt_llm._torch.moe.fused_moe.moe_resolution import MoEImplRequest
     from tensorrt_llm._torch.virtual_memory import \
         RestoreMode as _VirtualMemoryRestoreMode
 else:
@@ -2134,12 +2135,96 @@ _MoeBackend = Literal["AUTO", "CUTLASS", "CUTEDSL", "CUTEDSL_FC12", "TRTLLM",
                       "MEGAMOE_DEEPGEMM", "MEGAMOE_CUTEDSL"]
 
 
+def auto_moe_backend_for_load_balancer(
+    load_balancer: Optional[Union[MoeLoadBalancerConfigType, str]]
+) -> Literal["AUTO", "MEGAMOE_CUTEDSL"]:
+    """The backend an ``AUTO`` MoE selection runs under ``load_balancer``.
+
+    Only MegaMoE CuteDSL consumes per-layer dynamic EPLB plans, so ``AUTO``
+    means ``MEGAMOE_CUTEDSL`` under that mode and stays ``AUTO`` otherwise.
+    The target (``MoeConfig``) and drafts registered into the target's
+    balancer resolve ``AUTO`` through this one rule.
+
+    Args:
+        load_balancer: The EPLB config the MoE layers register into, or None.
+    """
+    if getattr(load_balancer, "mode", None) == "per_layer_dynamic":
+        return "MEGAMOE_CUTEDSL"
+    return "AUTO"
+
+
+_MOE_IMPL_CATALOG = (
+    "the MoE implementation catalog of the MoE performance guide "
+    "(https://nvidia.github.io/TensorRT-LLM/developer-guide/moe-perf-guide.html, "
+    "docs/source/developer-guide/moe-perf-guide.md in the source tree)")
+
+
+def _moe_tactic_request(tactic: str, field_name: str) -> "MoEImplRequest":
+    """The implementations ``tactic`` names, read as MoE resolution reads it.
+
+    Args:
+        tactic: The tactic, stripped and lowercased.
+        field_name: The config field, for error messages.
+
+    Raises:
+        ValueError: MoE resolution would refuse the tactic for any checkpoint.
+    """
+    # Imported on use: the registry fills only as the MoE implementations are
+    # imported, and they import this module through ModelConfig, so a
+    # module-level import would be circular.
+    from tensorrt_llm._torch.moe.fused_moe.moe_resolution import \
+        moe_impl_request
+    try:
+        return moe_impl_request(tactic=tactic)
+    except ValueError as error:
+        raise ValueError(
+            f"{field_name}={tactic!r}: {error} (the implementation ids and "
+            f"segment values are listed in {_MOE_IMPL_CATALOG})") from error
+
+
+def _normalize_moe_tactic(tactic: Optional[str],
+                          field_name: str) -> Optional[str]:
+    """Check a MoE tactic and return it stripped and lowercased.
+
+    Refuses what MoE resolution would refuse for any checkpoint; whether a
+    match can serve the layers is known only once the model is loaded.
+    """
+    if tactic is None:
+        return None
+    normalized = tactic.strip().lower()
+    _moe_tactic_request(normalized, field_name)
+    return normalized
+
+
 class MoeConfig(StrictBaseModel):
     """Configuration for MoE."""
     backend: _MoeBackend = Field(
         default='AUTO',
         description="MoE backend to use. "
+        "Choosing a backend other than AUTO is planned for deprecation where tactic can "
+        "replace it; which tactic does depends on the checkpoint's format (see tactic). "
         "AUTO selects default backend based on model. It currently doesn\'t always give the best choice for all scenarios. The capabilities of auto selection will be improved in future releases."
+    )
+
+    tactic: Optional[str] = Field(
+        default=None,
+        status="prototype",
+        description=
+        "MoE implementation to run for the target model; unrelated to "
+        "the autotuner's kernel tactics. The recommended interface for choosing it. "
+        "Takes an id 'provider.technique.kernel_name.quant' (e.g. "
+        "'trtllm.cutlass.grouped_gemm.nvfp4') or any dotted subset of its segments "
+        "(e.g. 'cutlass', 'mega_moe'); case-insensitive. The first match in catalog "
+        "order that can serve a layer of the checkpoint's expert format runs, with no "
+        "fallback; the matches must belong to one backend family. Requires backend "
+        "AUTO. A backend family can span several techniques, so the tactic that "
+        "replaces a backend depends on the format (CUTLASS also covers the "
+        "hopper_grouped_gemm and triton FP8 block-scale implementations); VANILLA has "
+        "none. Drafts and MTP layers are selected by speculative_config.moe_tactic; "
+        "with both draft fields unset, a target tactic makes a draft resolve AUTO for "
+        "its own weights instead of inheriting the target's backend. The ids, the "
+        "shortest tactic naming each, and the segment values are listed in "
+        f"{_MOE_IMPL_CATALOG}; a run logs the id of each MoE implementation it builds."
     )
 
     max_num_tokens: Optional[int] = Field(
@@ -2169,16 +2254,53 @@ class MoeConfig(StrictBaseModel):
     def resolve_load_balancer_config(cls, value: Any) -> Any:
         return _resolve_load_balancer_config(value)
 
+    @field_validator("tactic")
+    @classmethod
+    def validate_tactic_syntax(cls, tactic: Optional[str]) -> Optional[str]:
+        """Check that ``tactic`` names an implementation; lowercase it."""
+        return _normalize_moe_tactic(tactic, "moe_config.tactic")
+
+    @model_validator(mode="after")
+    def validate_tactic_excludes_backend(self) -> "MoeConfig":
+        # AUTO doubles as "no backend chosen" here. The check reads the value
+        # rather than ``model_fields_set``: model defaults are applied by
+        # rebuilding the config from a full ``model_dump()``, which marks every
+        # field as set. It goes with backend (see MoEImplRequest.backend_for).
+        if self.tactic is not None and self.backend != "AUTO":
+            raise ValueError(
+                f"moe_config.backend={self.backend!r} and moe_config.tactic="
+                f"{self.tactic!r} both choose the MoE implementation. Set only "
+                "one: drop tactic to select by backend, or leave backend at "
+                "AUTO to pin by tactic.")
+        return self
+
     @model_validator(mode="after")
     def resolve_load_balancer_compatibility(self) -> "MoeConfig":
         """Resolve the backend required by per-layer dynamic EPLB."""
-        if getattr(self.load_balancer, "mode", None) != "per_layer_dynamic":
+        required_backend = auto_moe_backend_for_load_balancer(
+            self.load_balancer)
+        if required_backend == "AUTO":
+            return self
+        if self.tactic is not None:
+            # A tactic stays the whole request, and MoE resolution refuses
+            # every match that does not consume per-layer dynamic EPLB plans.
+            request = _moe_tactic_request(self.tactic, "moe_config.tactic")
+            if not any(impl_cls.capabilities.supports_per_layer_dynamic_eplb
+                       for impl_cls in request.impls):
+                matched = [
+                    impl_cls.descriptor.impl_id for impl_cls in request.impls
+                ]
+                raise ValueError(
+                    "per-layer dynamic EPLB requires a moe_config.tactic that "
+                    "matches an implementation consuming per-layer dynamic "
+                    f"EPLB plans, such as one of backend {required_backend!r}; "
+                    f"{self.tactic!r} matches {matched}, none of which does.")
             return self
         if self.backend == "AUTO":
-            self.backend = "MEGAMOE_CUTEDSL"
-        elif self.backend != "MEGAMOE_CUTEDSL":
+            self.backend = required_backend
+        elif self.backend != required_backend:
             raise ValueError("per-layer dynamic EPLB requires "
-                             "backend='MEGAMOE_CUTEDSL'")
+                             f"backend={required_backend!r}")
         return self
 
 
@@ -2541,18 +2663,32 @@ class DecodingBaseConfig(StrictBaseModel):
 
     moe_backend: Optional[_MoeBackend] = Field(
         default=None,
+        description=
+        ("MoE backend for a neural draft model or embedded MTP layers "
+         "(PyTorch backend); ignored without a neural draft model. Values "
+         "other than AUTO are planned for deprecation where moe_tactic can "
+         "replace them. "
+         "With this and moe_tactic unset, the draft inherits the target's "
+         "backend, or resolves AUTO for its own weights when "
+         "moe_config.tactic pins the target; set this to the target's "
+         "former backend to keep the draft on that family. AUTO is MEGAMOE_CUTEDSL when "
+         "the draft shares the target's per-layer dynamic EPLB. Nemotron-H "
+         "embedded MTP layers must run VANILLA exactly when the target "
+         "does."))
+
+    moe_tactic: Optional[str] = Field(
+        default=None,
+        status="prototype",
         description=(
-            "MoE backend override for a neural draft model or embedded MTP "
-            "layers on the PyTorch backend. None inherits the target model's "
-            "backend. AUTO resolves from the draft checkpoint or embedded MTP "
-            "layer quantization, and a concrete backend applies only to the "
-            "draft model or layers. Resolution may fall back based on model, "
-            "quantization, and hardware support. Replacement-head MTP "
-            "checkpoints must inherit the target model's MoE backend; leave "
-            "this option unset. Nemotron-H embedded MTP "
-            "layers must inherit the target backend because their checkpoint "
-            "mapper uses a shared backend-dependent layout. Decoding methods "
-            "without a neural draft model ignore this option."))
+            "MoE implementation to run for a neural draft model or embedded "
+            "MTP layers (PyTorch backend); ignored without a neural draft "
+            "model. The recommended interface for choosing it. Takes the "
+            "values of "
+            "moe_config.tactic: an id 'provider.technique.kernel_name.quant' "
+            "or any dotted subset of its segments. The ids, the shortest "
+            "tactic naming each, and the segment values are listed in "
+            f"{_MOE_IMPL_CATALOG}. Requires moe_backend unset or AUTO. Unset, "
+            "the draft selects as moe_backend describes."))
 
     max_concurrency: Optional[PositiveInt] = Field(
         default=None,
@@ -2763,18 +2899,28 @@ class DecodingBaseConfig(StrictBaseModel):
         """
         return True
 
-    def _validate_moe_backend_compatibility(self,
-                                            *,
-                                            model_config_resolved: bool = False
-                                            ) -> None:
-        if (self.moe_backend is None or not model_config_resolved
-                or not self.uses_replacement_heads):
-            return
-        raise ValueError(
-            "speculative_config.moe_backend cannot be set for replacement-head "
-            "MTP checkpoints. Replacement heads inherit the target model's "
-            "MoE backend. Leave moe_backend unset, or use a full external "
-            "draft-model checkpoint.")
+    @field_validator("moe_tactic")
+    @classmethod
+    def validate_moe_tactic_syntax(cls,
+                                   moe_tactic: Optional[str]) -> Optional[str]:
+        """Check that ``moe_tactic`` names an implementation; lowercase it."""
+        return _normalize_moe_tactic(moe_tactic,
+                                     "speculative_config.moe_tactic")
+
+    @model_validator(mode="after")
+    def validate_moe_tactic_excludes_moe_backend(self) -> "DecodingBaseConfig":
+        # None is this field's "no backend chosen". AUTO is accepted only to
+        # mirror MoeConfig.validate_tactic_excludes_backend, a transitional
+        # rule that goes when moe_backend is removed.
+        names_no_implementation = self.moe_backend in (None, "AUTO")
+        if self.moe_tactic is not None and not names_no_implementation:
+            raise ValueError(
+                f"speculative_config.moe_backend={self.moe_backend!r} and "
+                f"speculative_config.moe_tactic={self.moe_tactic!r} both choose "
+                "the draft MoE implementation. Set only one: drop moe_tactic to "
+                "select by moe_backend, or leave moe_backend unset to pin by "
+                "moe_tactic.")
+        return self
 
     @property
     def uses_replacement_heads(self) -> bool:
@@ -8326,8 +8472,6 @@ class TorchLlmArgs(BaseLlmArgs):
                 eagle_data = self.speculative_config.model_dump(
                     exclude={"decoding_type"})
                 self.speculative_config = Eagle3DecodingConfig(**eagle_data)
-
-            self.speculative_config._validate_moe_backend_compatibility()
 
             if self.speculative_config.use_rejection_sampling:
                 # Supported paths: Eagle3 one-model, MTP-Eagle one-model,

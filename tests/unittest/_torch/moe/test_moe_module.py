@@ -114,7 +114,7 @@ from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm._utils import get_sm_version, mpi_comm, mpi_rank
 from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models.modeling_utils import QuantAlgo
+from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 G_LOGGER = logging.getLogger(__name__)
 
@@ -1624,6 +1624,30 @@ def test_configurable_moe_single_gpu(
         swiglu_beta=swiglu_beta,
         swiglu_limit=swiglu_limit,
     )
+
+
+@pytest.mark.parametrize(
+    "moe_tactic", ["cutlass", "cutlass.none", "trtllm.cutlass.grouped_gemm.none"]
+)
+def test_a_tactic_builds_the_implementation_it_names(moe_tactic: str):
+    """Model code builds MoE layers through create_moe; under a tactic the layer runs the
+    implementation the tactic names on the layer's format, here CUTLASS over BF16 weights."""
+    model_cfg = _create_model_config(
+        num_experts=8,
+        hidden_size=256,
+        intermediate_size=512,
+        dtype=torch.bfloat16,
+        mapping=Mapping(),
+        quant_config=QuantConfig(),
+        moe_backend="CUTLASS",
+    ).copy_with(moe_backend="CUTLASS", moe_tactic=moe_tactic)
+
+    with create_moe(
+        routing_method=RenormalizeMoeRoutingMethod(top_k=2),
+        reduce_results=True,
+        model_config=model_cfg,
+    ) as moe:
+        assert type(moe.backend).descriptor.impl_id == "trtllm.cutlass.grouped_gemm.none"
 
 
 # ============================================================================

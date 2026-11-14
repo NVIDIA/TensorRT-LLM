@@ -31,7 +31,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ...models.modeling_utils import QuantConfig
-from ..model_config import ModelConfig
+from ..model_config import ModelConfig, MoESelection
 from ..utils import AuxStreamType
 from .modeling_deepseekv41 import (
     DeepseekV41DecoderLayer,
@@ -156,7 +156,7 @@ class DSv41DSparkDraftModel(DSv4DSparkDraftModel):
         aux_stream_dict: dict[AuxStreamType, torch.cuda.Stream] | None,
         num_stages: int | None = None,
         block_size: int | None = None,
-        draft_moe_backend: str | None = None,
+        draft_moe_selection: MoESelection | None = None,
     ) -> None:
         draft_config = copy.copy(model_config)
         config = copy.deepcopy(model_config.pretrained_config)
@@ -217,7 +217,7 @@ class DSv41DSparkDraftModel(DSv4DSparkDraftModel):
             aux_stream_dict,
             num_stages,
             block_size,
-            draft_moe_backend=draft_moe_backend,
+            draft_moe_selection=draft_moe_selection,
         )
         self._attn_params["q_b_norm_enabled"] = False
 
@@ -242,6 +242,8 @@ class DSv41DSparkDraftModel(DSv4DSparkDraftModel):
                 continue
             dtype = tensor_info.get("dtype")
             if dtype == "I8" and len(tensor_info.get("shape", [])) == 2:
+                # The format the loaded config's literal picks; a draft tactic
+                # picks again in _derive_draft_model_config.
                 quant_algo = ModelConfig.get_mxfp4_quant_algo(model_config.moe_backend)
                 group_size = 32
             elif dtype == "U8":

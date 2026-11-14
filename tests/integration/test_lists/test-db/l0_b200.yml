@@ -279,6 +279,7 @@ l0_b200:
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "DENSEGEMM"
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "MEGAMOE_CUTEDSL"
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "MEGAMOE_DEEPGEMM"
+  - unittest/_torch/moe/test_moe_module.py::test_a_tactic_builds_the_implementation_it_names
   # ------------- MoE: FlashInfer & TRTLLM symbol collision tests ---------------
   - unittest/_torch/flashinfer/test_trtllm_flashinfer_symbol_collision.py
   # --- MoE end

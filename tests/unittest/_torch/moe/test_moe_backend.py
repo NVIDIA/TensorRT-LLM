@@ -93,8 +93,8 @@ from tensorrt_llm._torch.moe.fused_moe.cutlass import (
     TrtllmTritonFp8BlockScalesImpl,
 )
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import (
-    CuteDslB12xNvfp4FusedMoE,
-    CuteDslB12xW4a16Nvfp4FusedMoE,
+    FlashinferCutedslNvfp4Impl,
+    FlashinferCutedslW4a16Nvfp4Impl,
 )
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_fc12 import CuteDslFc12FusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
@@ -3477,7 +3477,7 @@ def test_apply_router_weight_on_input_support_is_not_inherited():
     wrapper."""
     assert TrtllmCutlassNvfp4Impl.capabilities.supports_apply_router_weight_on_input
     assert MarlinFusedMoE.capabilities.supports_apply_router_weight_on_input
-    for b12x_leaf in (CuteDslB12xNvfp4FusedMoE, CuteDslB12xW4a16Nvfp4FusedMoE):
+    for b12x_leaf in (FlashinferCutedslNvfp4Impl, FlashinferCutedslW4a16Nvfp4Impl):
         assert not b12x_leaf.capabilities.supports_apply_router_weight_on_input
     assert not TRTLLMGenFusedMoE.capabilities.supports_apply_router_weight_on_input
 
@@ -7019,12 +7019,12 @@ _B12X_PREFILL_THRESHOLD = 64
 @pytest.mark.parametrize(
     "leaf_cls, num_tokens, reaches_cutlass",
     [
-        pytest.param(CuteDslB12xNvfp4FusedMoE, _B12X_PREFILL_THRESHOLD, True, id="nvfp4-prefill"),
+        pytest.param(FlashinferCutedslNvfp4Impl, _B12X_PREFILL_THRESHOLD, True, id="nvfp4-prefill"),
         pytest.param(
-            CuteDslB12xNvfp4FusedMoE, _B12X_PREFILL_THRESHOLD - 1, False, id="nvfp4-decode"
+            FlashinferCutedslNvfp4Impl, _B12X_PREFILL_THRESHOLD - 1, False, id="nvfp4-decode"
         ),
         pytest.param(
-            CuteDslB12xW4a16Nvfp4FusedMoE, _B12X_PREFILL_THRESHOLD, False, id="w4a16-prefill"
+            FlashinferCutedslW4a16Nvfp4Impl, _B12X_PREFILL_THRESHOLD, False, id="w4a16-prefill"
         ),
     ],
 )
@@ -7172,7 +7172,9 @@ def _forward_in_two_chunks(backend) -> Tuple[torch.Tensor, torch.Tensor]:
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "leaf_cls", [CuteDslB12xNvfp4FusedMoE, CuteDslB12xW4a16Nvfp4FusedMoE], ids=["nvfp4", "w4a16"]
+    "leaf_cls",
+    [FlashinferCutedslNvfp4Impl, FlashinferCutedslW4a16Nvfp4Impl],
+    ids=["nvfp4", "w4a16"],
 )
 def test_b12x_multi_chunk_forward_keeps_every_chunk(leaf_cls, monkeypatch):
     """Every b12x call returns the same storage, so a two-chunk forward has to

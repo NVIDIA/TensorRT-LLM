@@ -189,6 +189,7 @@ def _create(
     real_dense_manager: bool = False,
     copy_mode: str | None = None,
     moe_backend: str = "CUTEDSL",
+    moe_tactic: str | None = None,
 ) -> tuple[list, object]:
     """Run ``create_py_executor`` with DWDP in ``mode``, start a forward of the executor it returns.
 
@@ -299,7 +300,7 @@ def _create(
         monkeypatch.setattr(py_executor_creator.torch.cuda, name, fake)
 
     llm_args = _make_llm_args()
-    llm_args.moe_config = SimpleNamespace(backend=moe_backend)
+    llm_args.moe_config = SimpleNamespace(backend=moe_backend, tactic=moe_tactic)
     if mode == "standalone":
         llm_args.dwdp_config = DwdpConfig(
             enable_experts=False, enable_dense=True, copy_mode=copy_mode
@@ -364,6 +365,24 @@ def test_expert_dwdp_refuses_an_moe_backend_without_dwdp(
     DWDP serves: the launch is refused before the model is built, with the setting to use."""
     with pytest.raises(ValueError, match="set moe_config.backend: CUTEDSL"):
         _create(monkeypatch, mode, "estimated", moe_backend=backend)
+
+
+@pytest.mark.parametrize("tactic", ["cutedsl.grouped_gemm.nvfp4", "fused_fc12", "b12x"])
+def test_expert_dwdp_accepts_a_tactic_naming_an_implementation_with_dwdp(
+    monkeypatch: pytest.MonkeyPatch, tactic: str
+) -> None:
+    """A tactic leaves moe_config.backend at AUTO, so the tactic is what the launch checks."""
+    log, _ = _create(monkeypatch, "expert", "none", moe_backend="AUTO", moe_tactic=tactic)
+
+    assert "setup" in log
+
+
+@pytest.mark.parametrize("tactic", ["cutlass", "trtllm_gen", "mega_moe"])
+def test_expert_dwdp_refuses_a_tactic_without_dwdp(
+    monkeypatch: pytest.MonkeyPatch, tactic: str
+) -> None:
+    with pytest.raises(ValueError, match=rf"moe_config.tactic='{tactic}' matches .* none of which"):
+        _create(monkeypatch, "expert", "estimated", moe_backend="AUTO", moe_tactic=tactic)
 
 
 def test_a_standalone_gather_reserves_its_sms_before_the_model_is_built(

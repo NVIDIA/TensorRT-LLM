@@ -37,6 +37,7 @@ from ..moe.fused_moe import (BaseMoeRoutingMethod, ConfigurableMoE,
                              FusedMoEQuantScalesFP8,
                              Llama4RenormalizeMoeRoutingMethod,
                              MoEWeightLoadingMode, cutlass_leaf)
+from ..moe.fused_moe.moe_resolution import moe_impl_request
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, Fp4QuantizedTensor
 from .modeling_llama import Llama4Attention, Llama4DecoderLayer, Llama4MoE
@@ -477,9 +478,20 @@ class Llama4MinLatencyFusedMoE(ConfigurableMoE):
         experts_quant_config = override_quant_config or model_config.quant_config
         quant_algo = (experts_quant_config.quant_algo
                       if experts_quant_config is not None else None)
+        moe_cls = cutlass_leaf(quant_algo)
+        # ``moe_cls`` bypasses MoE resolution, so a tactic is checked here: it
+        # must name the CUTLASS leaf this layer runs, since it never falls back.
+        if (model_config.moe_tactic is not None and moe_cls
+                not in moe_impl_request(tactic=model_config.moe_tactic).impls):
+            raise ValueError(
+                "enable_min_latency builds the Llama4 MoE layers on "
+                f"{moe_cls.descriptor.impl_id}, which moe_config.tactic="
+                f"{model_config.moe_tactic!r} does not name. Use a tactic "
+                "that names it, such as 'cutlass', or disable "
+                "enable_min_latency.")
 
         super().__init__(
-            moe_cls=cutlass_leaf(quant_algo),
+            moe_cls=moe_cls,
             override_quant_config=override_quant_config,
             routing_method=routing_method,
             num_experts=num_experts,

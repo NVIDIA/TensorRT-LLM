@@ -1006,6 +1006,114 @@ def test_disagg_cluster_etcd_settings_schema_matches_runtime(
         assert Draft202012Validator(schemas[filename]).is_valid(config) == valid
 
 
+# Tactic rules a schema cannot express. A row carrying one is refused by the
+# runtime and accepted by the schema.
+_NO_ID_COMBINES_THEM = "runtime-only: no implementation id combines these segments"
+_NO_MATCH_CONSUMES_THE_PLANS = "runtime-only: no match consumes per-layer dynamic EPLB plans"
+_PER_LAYER_DYNAMIC = {"mode": "per_layer_dynamic", "num_slots": 72}
+
+
+def _schema_verdict(runtime_valid: bool, runtime_only: str | None) -> bool:
+    if runtime_only is None:
+        return runtime_valid
+    assert not runtime_valid, f"the runtime accepts a row marked {runtime_only!r}"
+    return True
+
+
+@pytest.mark.parametrize(
+    ("moe_config", "runtime_only"),
+    [
+        ({"tactic": "Grouped_GEMM.NVFP4"}, None),
+        ({"tactic": " cutlass "}, None),
+        # str.strip() removes U+001C and U+0085 and keeps U+FEFF; a \s pattern does the opposite.
+        ({"tactic": "\x1ccutlass\x85"}, None),
+        ({"tactic": "\ufeffcutlass"}, None),
+        ({"tactic": "*.cutlass.*.nvfp4"}, None),
+        ({"tactic": "nosuchprovider"}, None),
+        ({"tactic": "cutlas"}, None),
+        ({"tactic": "Auto"}, None),
+        ({"tactic": "*"}, None),
+        ({"tactic": " *.*.*.* "}, None),
+        ({"tactic": None}, None),
+        ({"tactic": ""}, None),
+        ({"tactic": "cutlass."}, None),
+        ({"tactic": "cut-lass"}, None),
+        ({"tactic": "_cutlass"}, None),
+        ({"tactic": "cutlass\n.nvfp4"}, None),
+        ({"tactic": "a.b.c.d.e"}, None),
+        ({"tactic": "cutlass.mega_moe"}, _NO_ID_COMBINES_THEM),
+        ({"tactic": "nvfp4.fp8"}, _NO_ID_COMBINES_THEM),
+        ({"tactic": "mega_moe", "load_balancer": _PER_LAYER_DYNAMIC}, None),
+        ({"tactic": "cutlass", "load_balancer": _PER_LAYER_DYNAMIC}, _NO_MATCH_CONSUMES_THE_PLANS),
+        ({"backend": "AUTO", "tactic": "cutlass"}, None),
+        ({"backend": "CUTLASS", "tactic": "cutlass"}, None),
+        ({"backend": "CUTLASS", "tactic": None}, None),
+    ],
+)
+def test_moe_tactic_schema_matches_runtime(
+    schemas: dict[str, dict], moe_config: dict, runtime_only: str | None
+) -> None:
+    from pydantic import ValidationError
+
+    from tensorrt_llm.llmapi.llm_args import MoeConfig
+
+    try:
+        MoeConfig(**moe_config)
+    except ValidationError:
+        valid = False
+    else:
+        valid = True
+    schema_valid = _schema_verdict(valid, runtime_only)
+
+    config = {"moe_config": moe_config}
+    for filename in (generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA):
+        validator = Draft202012Validator(schemas[filename])
+        assert validator.is_valid(config) == schema_valid
+        if filename == generator.DISAGG_SCHEMA:
+            for section in ("context_servers", "generation_servers"):
+                assert validator.is_valid({section: config}) == schema_valid
+
+
+@pytest.mark.parametrize("decoding_type", ["MTP", "NGram"])
+@pytest.mark.parametrize(
+    ("moe_selection", "runtime_only"),
+    [
+        ({"moe_tactic": "Grouped_GEMM.NVFP4"}, None),
+        ({"moe_tactic": " cutlass "}, None),
+        ({"moe_tactic": "cutlas"}, None),
+        ({"moe_tactic": "*"}, None),
+        ({"moe_tactic": None}, None),
+        ({"moe_tactic": "cutlass."}, None),
+        ({"moe_tactic": "a.b.c.d.e"}, None),
+        ({"moe_tactic": "cutlass.mega_moe"}, _NO_ID_COMBINES_THEM),
+        ({"moe_backend": None, "moe_tactic": "cutlass"}, None),
+        ({"moe_backend": "AUTO", "moe_tactic": "cutlass"}, None),
+        ({"moe_backend": "CUTLASS", "moe_tactic": "cutlass"}, None),
+        ({"moe_backend": "CUTLASS", "moe_tactic": None}, None),
+    ],
+)
+def test_draft_moe_tactic_schema_matches_runtime(
+    schemas: dict[str, dict], decoding_type: str, moe_selection: dict, runtime_only: str | None
+) -> None:
+    from pydantic import TypeAdapter, ValidationError
+
+    from tensorrt_llm.llmapi.llm_args import SpeculativeConfig
+
+    speculative_config = {"decoding_type": decoding_type, "max_draft_len": 1, **moe_selection}
+    try:
+        TypeAdapter(SpeculativeConfig).validate_python(speculative_config)
+    except ValidationError:
+        valid = False
+    else:
+        valid = True
+    schema_valid = _schema_verdict(valid, runtime_only)
+
+    config = {"speculative_config": speculative_config}
+    for filename in (generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA):
+        validator = Draft202012Validator(schemas[filename])
+        assert validator.is_valid(config) == schema_valid
+
+
 def test_disagg_router_default_is_derived(monkeypatch: pytest.MonkeyPatch) -> None:
     from tensorrt_llm.llmapi import disagg_utils
 

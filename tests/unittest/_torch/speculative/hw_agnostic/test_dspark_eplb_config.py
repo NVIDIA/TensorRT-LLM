@@ -23,10 +23,11 @@ Covers the three P0 guarantees:
 """
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch, sentinel
 
 import pytest
 
+from tensorrt_llm._torch.model_config import ModelConfig, MoESelection
 from tensorrt_llm._torch.models import modeling_dspark
 from tensorrt_llm._torch.models.modeling_dspark import (
     validate_dspark_eplb_layer_base,
@@ -34,8 +35,10 @@ from tensorrt_llm._torch.models.modeling_dspark import (
 )
 from tensorrt_llm._torch.models.modeling_speculative import external_drafter_config_kwargs
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
-from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig
+from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig, MoePerLayerDynamicLoadBalancerConfig
 from tensorrt_llm.mapping import Mapping
+
+pytestmark = pytest.mark.cpu_only
 
 NUM_HIDDEN_LAYERS = 61
 NUM_STAGES = 3
@@ -62,6 +65,7 @@ def _model_config(lb_config=None, num_hidden_layers=NUM_HIDDEN_LAYERS):
         moe_load_balancer=lb_config,
         attn_backend="TRTLLM",
         moe_backend="CUTLASS",
+        moe_tactic=None,
         mapping=Mapping(),
         max_num_tokens=8192,
         moe_max_num_tokens=8192,
@@ -157,7 +161,7 @@ def test_external_drafter_kwargs_are_stable_across_modes():
 
 def test_dspark_draft_backend_auto_resolves_on_isolated_copy():
     quant_config = SimpleNamespace(quant_algo=None)
-    model_config = SimpleNamespace(
+    model_config = ModelConfig(
         pretrained_config=SimpleNamespace(architectures=["DeepseekV4ForCausalLM"]),
         sparse_attention_config=None,
         quant_config_dict=None,
@@ -169,7 +173,7 @@ def test_dspark_draft_backend_auto_resolves_on_isolated_copy():
         modeling_dspark.ModelConfig, "resolve_moe_backend", return_value="TRTLLM"
     ) as resolve_backend:
         draft_config = modeling_dspark.DSv4DSparkDraftModel._derive_draft_model_config(
-            model_config, NUM_HIDDEN_LAYERS, NUM_STAGES, "AUTO"
+            model_config, NUM_HIDDEN_LAYERS, NUM_STAGES, MoESelection(backend="AUTO")
         )
 
     assert draft_config is not model_config
@@ -177,6 +181,96 @@ def test_dspark_draft_backend_auto_resolves_on_isolated_copy():
     assert model_config.moe_backend == "CUTLASS"
     resolve_backend.assert_called_once_with(
         "AUTO", "DeepseekV4ForCausalLM", quant_config=quant_config
+    )
+
+
+def _per_layer_dynamic_model_config(moe_tactic=None):
+    model_config = _model_config(MoePerLayerDynamicLoadBalancerConfig(num_slots=NUM_EXPERTS + 8))
+    model_config.moe_backend = "MEGAMOE_CUTEDSL"
+    model_config.moe_tactic = moe_tactic
+    return model_config
+
+
+@pytest.mark.parametrize(
+    "moe_tactic, spec_moe_backend",
+    [("trtllm.cutedsl.mega_moe.nvfp4", None), (None, "AUTO")],
+    ids=["pinned_target", "explicit_auto"],
+)
+def test_embedded_dspark_draft_auto_follows_per_layer_dynamic_eplb(moe_tactic, spec_moe_backend):
+    # The embedded stages register into the target's balancer, and only
+    # MegaMoE CuteDSL consumes per-layer dynamic EPLB plans.
+    spec_config = _spec_config(SpeculativeDecodingMode.DSPARK)
+    spec_config.moe_backend = spec_moe_backend
+    kwargs = external_drafter_config_kwargs(
+        _per_layer_dynamic_model_config(moe_tactic), spec_config
+    )
+
+    assert kwargs["moe_backend"] == "MEGAMOE_CUTEDSL"
+    assert kwargs["moe_tactic"] is None
+
+
+def test_standalone_dspark_draft_auto_ignores_the_targets_eplb():
+    kwargs = external_drafter_config_kwargs(
+        _per_layer_dynamic_model_config("trtllm.cutedsl.mega_moe.nvfp4"),
+        _spec_config(SpeculativeDecodingMode.DSPARK, embedded=False),
+    )
+
+    assert kwargs["moe_backend"] == "AUTO"
+
+
+@pytest.mark.parametrize(
+    "lb_config, moe_backend",
+    [
+        (None, "AUTO"),
+        (MoePerLayerDynamicLoadBalancerConfig(num_slots=NUM_EXPERTS + 8), "MEGAMOE_CUTEDSL"),
+    ],
+    ids=["no_eplb", "per_layer_dynamic"],
+)
+def test_embedded_dspark_loads_the_target_checkpoint_without_the_draft_tactic(
+    lb_config, moe_backend
+):
+    # That checkpoint's expert map describes the main layers. The draft model
+    # resolves the tactic against its stages (test_dspark_v41.py).
+    spec_config = _spec_config(SpeculativeDecodingMode.DSPARK)
+    spec_config.moe_backend = None
+    spec_config.moe_tactic = "grouped_gemm"
+
+    kwargs = external_drafter_config_kwargs(_model_config(lb_config), spec_config)
+
+    assert (kwargs["moe_backend"], kwargs["moe_tactic"]) == (moe_backend, None)
+
+
+def test_standalone_dspark_drafter_loads_its_own_checkpoint_with_the_draft_tactic():
+    spec_config = _spec_config(SpeculativeDecodingMode.DSPARK, embedded=False)
+    spec_config.moe_backend = None
+    spec_config.moe_tactic = "grouped_gemm"
+
+    kwargs = external_drafter_config_kwargs(_model_config(), spec_config)
+
+    assert (kwargs["moe_backend"], kwargs["moe_tactic"]) == ("AUTO", "grouped_gemm")
+
+
+def test_embedded_dspark_builder_selects_under_the_targets_eplb(monkeypatch):
+    model_config = _per_layer_dynamic_model_config("trtllm.cutedsl.mega_moe.nvfp4")
+    model_config.spec_config = SimpleNamespace(
+        spec_dec_mode=SpeculativeDecodingMode.DSPARK,
+        draft_is_embedded_in_target=True,
+        speculative_model="/unused",
+        block_size=4,
+        moe_backend=None,
+        moe_tactic=None,
+    )
+    draft_config = SimpleNamespace(pretrained_config=SimpleNamespace(model_type="deepseek_v4"))
+    draft_cls = Mock(return_value=sentinel.draft)
+    monkeypatch.setattr(modeling_dspark, "count_dspark_stages", lambda checkpoint_dir: NUM_STAGES)
+    monkeypatch.setattr(modeling_dspark, "validate_dspark_eplb_layer_base", lambda *args: None)
+    monkeypatch.setattr(modeling_dspark, "DSv4DSparkForCausalLM", draft_cls)
+
+    draft = modeling_dspark._build_dspark_draft(model_config, draft_config, None, SimpleNamespace())
+
+    assert draft is sentinel.draft
+    assert draft_cls.call_args.kwargs["draft_moe_selection"] == MoESelection(
+        backend="MEGAMOE_CUTEDSL"
     )
 
 

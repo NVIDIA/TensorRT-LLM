@@ -184,6 +184,91 @@ moe_config:
 
 The *Backend Capability Matrix* and *Quantization Support* tables: [`MOE_DEVELOPER_GUIDE.md`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md).
 
+##### How to pin an implementation with `tactic`? (prototype)
+
+A backend names a family of implementations, picks one of them per layer, and falls back to CUTLASS when none of them can serve the layer. `moe_config.tactic` names the implementations themselves, by their id `provider.technique.kernel_name.quant`, and never falls back: a layer it applies to runs one of them or fails to build. (A MoE tactic selects implementations; it is unrelated to the autotuner's kernel tactics, which are still tuned inside the chosen implementation.)
+
+A tactic is the recommended way to pin an implementation, and choosing a `backend` other than `AUTO` is planned for deprecation where a tactic can replace it. Which tactic replaces a backend depends on the checkpoint's format, so read it from the *Family* column of the catalog below: the `CUTLASS` family also covers the `hopper_grouped_gemm` and `triton` FP8 block-scale implementations, so on an FP8 block-scale checkpoint `tactic: cutlass` names none of them; the deprecated `TRITON` backend maps to `cutlass`; `VANILLA` has no tactic; and `DEEPGEMM` on SM90 relies on falling back to the `hopper_grouped_gemm` implementation, which a tactic does not do.
+
+```yaml
+moe_config:
+  tactic: cutedsl.grouped_gemm   # leave backend at AUTO, the default
+```
+
+How a value is matched:
+
+- Write the full id, or any of its four segments joined by `.`, in any order and in any case. Every segment value belongs to one field only, so `mega_moe` alone is a valid tactic. `*` leaves a field open; quote a value that starts with it (`tactic: '*.nvfp4'`), since YAML reads a leading `*` as an alias.
+- Every implementation the segments match is a candidate. The candidates are narrowed to the format of the checkpoint's MoE experts, and the first of them in catalog order (*Priority* 1 is tried first) that can serve the layer runs. Its own requirements still apply: SM, activation, EPLB, LoRA, and optional packages such as FlashInfer for `flashinfer.cutedsl.b12x.nvfp4`.
+- After that narrowing the candidates must belong to one `backend` family, because the rest of the model is built for one family. `grouped_gemm.nvfp4` matches a CUTLASS and a CuteDSL implementation and is refused when the model is loaded; `cutlass.grouped_gemm.nvfp4` is not. A tactic with no implementation of the experts' format fails every MoE layer of that format: if its matches belong to one family, such as `trtllm.mega_moe`, the model is built for that family; if they span several, such as `mega_moe` on a BF16 model, it is built for the family `AUTO` resolves to, with a warning.
+- A layer no candidate can serve fails to build, and the error lists each candidate's reason.
+- A tactic applies to every MoE layer of the target model, including layers whose experts the checkpoint excludes from quantization, which run as BF16. For such a checkpoint, name a tactic whose family covers both formats, such as `trtllm_gen` or `trtllm.cutlass.grouped_gemm` for NVFP4 and BF16 on SM100, or `cutlass` for W4A16_NVFP4 and BF16 on SM90; if none exists on the GPU, select by `backend`. The error names the tactics that would. Qwen3-Next and MuseSpark Open are exceptions: their model code builds those target layers on CUTLASS, and on the model's backend or on TRTLLM under a MegaMoE family, and logs a warning that names the tactic. An MTP layer is a draft layer: `speculative_config.moe_tactic` pins it, excluded or not.
+- `tactic` cannot be combined with a `backend` other than `AUTO`. It governs the target model only; `speculative_config.moe_tactic` pins draft models and MTP layers, replacement-head MTP checkpoints included. With both draft fields unset, a draft inherits the target's backend, or resolves `AUTO` for its own weights when `tactic` pins the target. Replacing `backend: X` by a tactic therefore also changes the draft's default; to keep the draft on the same family, also set `speculative_config.moe_backend: X` or a `speculative_config.moe_tactic`. Nemotron-H embedded MTP layers must run `VANILLA` exactly when the target does.
+
+| `tactic` | Runs |
+|---|---|
+| `trtllm.cutlass.grouped_gemm.nvfp4` | exactly that implementation |
+| `cutedsl.grouped_gemm` | the CuteDSL grouped GEMM of the checkpoint's expert format |
+| `trtllm_gen` | the TRTLLM-Gen fused MoE of the checkpoint's expert format |
+| `mega_moe` | `trtllm.cutedsl.mega_moe.nvfp4` on an NVFP4 checkpoint, `deepgemm.cuda.mega_moe.w4a8_mxfp4_mxfp8` on an MXFP4 one |
+
+How a partial tactic resolves, step by step, for `tactic: trtllm_gen` on an NVFP4 checkpoint and an SM100 GPU:
+
+1. When the configuration is validated, each segment finds its field by value: `trtllm_gen` is a `technique`, and it matches every `trtllm_gen` implementation in the catalog below, one per format. A mistyped segment, or a tactic that matches nothing, fails here, before the model loads.
+2. When the model loads, the matches are narrowed to the format the checkpoint declares for its MoE experts. NVFP4 leaves `trtllm.trtllm_gen.fused_moe.nvfp4`, of the `TRTLLM` family, so the model is built for `TRTLLM`.
+3. When each MoE layer is built, the candidates left are tried in catalog order and the first that can serve the layer runs; here that is `trtllm.trtllm_gen.fused_moe.nvfp4`, the only one.
+4. If no candidate can serve the layer, for example on an SM90 GPU, the layer fails to build and the error lists each candidate's reason. Nothing falls back to CUTLASS.
+
+`tactic: cutedsl` on the same checkpoint stops at step 2 instead: narrowed to NVFP4 it still matches implementations of four families (`CUTEDSL`, `CUTEDSL_FC12`, `DENSEGEMM` and `MEGAMOE_CUTEDSL`), and the error lists them by family. Adding a segment that leaves one family, such as `cutedsl.grouped_gemm`, resolves it.
+
+To find the id of what a run uses today, run it once without a tactic: the log reports each MoE implementation it builds, once, as `MoE layers run <class>, MoE implementation id <id> (moe_backend <family>)`.
+
+Every implementation a tactic can pin, generated from the implementation registry by `scripts/generate_moe_impl_catalog.py`. *Shortest tactic* is the fewest segments that match that implementation and no other, ties going to the earlier fields of the id, so it pins the implementation whatever the checkpoint. On a given checkpoint fewer segments can do, since the matches are narrowed to its expert format first: `mega_moe` runs `trtllm.cutedsl.mega_moe.nvfp4` on an NVFP4 checkpoint. An implementation added in a later release can match a shortest tactic too, so a configuration that must keep its kernel across releases gives the full id.
+
+<!-- BEGIN GENERATED MOE IMPL CATALOG: scripts/generate_moe_impl_catalog.py -->
+
+| Implementation id | Shortest tactic | `backend` family | Priority | Description |
+|---|---|---|---|---|
+| `deepgemm.cuda.hopper_grouped_gemm.fp8_block_scales` | `hopper_grouped_gemm` | `CUTLASS` | 20 | DeepGEMM grouped GEMM over FP8 block scales, driven by CutlassMoeFCRunner, SM90. |
+| `trtllm.triton.grouped_gemm.fp8_block_scales` | `triton` | `CUTLASS` | 21 | Internal Triton FP8 block-scale grouped GEMM, SM120/121. |
+| `trtllm.cutlass.grouped_gemm.nvfp4` | `cutlass.nvfp4` | `CUTLASS` | 22 | CUTLASS grouped GEMM over NVFP4 weights and activations, Blackwell. |
+| `trtllm.cutlass.grouped_gemm.w4a16_nvfp4` | `trtllm.w4a16_nvfp4` | `CUTLASS` | 23 | NVFP4 weights dequantized to the activation dtype every forward, SM80+. |
+| `trtllm.cutlass.grouped_gemm.mxfp8` | `mxfp8` | `CUTLASS` | 24 | CUTLASS grouped GEMM over MXFP8 weights and dynamic MXFP8 activations. |
+| `trtllm.cutlass.grouped_gemm.w4a8_mxfp4_fp8` | `cutlass.w4a8_mxfp4_fp8` | `CUTLASS` | 25 | CUTLASS grouped GEMM over MXFP4 weights with static FP8 activations. |
+| `trtllm.cutlass.grouped_gemm.w4a8_mxfp4_mxfp8` | `cutlass.w4a8_mxfp4_mxfp8` | `CUTLASS` | 26 | CUTLASS grouped GEMM over MXFP4 weights with dynamic MXFP8 activations. |
+| `trtllm.cutlass.grouped_gemm.w4a16_mxfp4` | `cutlass.w4a16_mxfp4` | `CUTLASS` | 27 | CUTLASS grouped GEMM over MXFP4 weights with high-precision activations, SM90. |
+| `trtllm.cutlass.grouped_gemm.w4a8_awq` | `w4a8_awq` | `CUTLASS` | 28 | CUTLASS grouped GEMM over INT4 group-scaled weights with FP8 activations. |
+| `trtllm.cutlass.grouped_gemm.w8a16` | `w8a16` | `CUTLASS` | 29 | CUTLASS grouped GEMM over INT8 per-channel weight-only, SM80+. |
+| `trtllm.cutlass.grouped_gemm.fp8` | `fp8` | `CUTLASS` | 30 | CUTLASS grouped GEMM over per-tensor FP8 (qdq) weights, SM89+. |
+| `trtllm.cutlass.grouped_gemm.none` | `cutlass.none` | `CUTLASS` | 31 | CUTLASS grouped GEMM over unquantized fp16/bf16 weights, SM80+. |
+| `marlin.cuda.fused_moe.nvfp4` | `marlin.nvfp4` | `MARLIN` | 18 | Marlin fused W4A16 MoE GEMM over NVFP4 weights, SM89-SM99 (Ada/Hopper). |
+| `marlin.cuda.fused_moe.w4a16_nvfp4` | `marlin.w4a16_nvfp4` | `MARLIN` | 19 | Marlin fused W4A16 MoE GEMM over W4A16-NVFP4 weights, SM89-SM99 (Ada/Hopper). |
+| `flashinfer.cutedsl.b12x.nvfp4` | `flashinfer.nvfp4` | `CUTEDSL` | 1 | FlashInfer CuTe DSL SM12x fused MoE for decode, CUTLASS NVFP4 grouped GEMM for prefill; SM120/SM121. |
+| `flashinfer.cutedsl.b12x.w4a16_nvfp4` | `flashinfer.w4a16_nvfp4` | `CUTEDSL` | 2 | FlashInfer CuTe DSL SM12x fused MoE, BF16 activations and NVFP4 weights; SM120/SM121. |
+| `trtllm.cutedsl.grouped_gemm.nvfp4` | `cutedsl.grouped_gemm.nvfp4` | `CUTEDSL` | 5 | CuTe DSL NVFP4 grouped GEMM: gather + FC1 + fused activation, then FC2 + finalize; SM100/SM103/SM107. |
+| `trtllm.cutedsl.grouped_gemm.nvfp4_plus` | `nvfp4_plus` | `CUTEDSL` | 6 | CuTe DSL NVFP4_PLUS (E2M1 with UE5M3 scales per 32 values) grouped GEMM: gather + FC1 + fused SwiGLU, then FC2 + finalize; SM107. |
+| `trtllm.cutedsl.grouped_gemm.none` | `cutedsl.none` | `CUTEDSL` | 7 | CuTe DSL BF16 grouped GEMM on Rubin (SM107): gather + FC1 + fused SwiGLU, then FC2 + fused finalize. |
+| `trtllm.cutedsl.fused_fc12.nvfp4` | `fused_fc12` | `CUTEDSL_FC12` | 8 | Rubin (SM107) NVFP4 fused FC1 + SwiGLU/SiTU + FC2 + finalize persistent CuTe DSL grouped GEMM. |
+| `deepgemm.cuda.grouped_gemm.fp8_block_scales` | `deepgemm.grouped_gemm` | `DEEPGEMM` | 16 | DeepGEMM masked grouped GEMM over FP8 block scales, SM100/SM103/SM107. |
+| `trtllm.cutedsl.dense_gemm.nvfp4` | `dense_gemm` | `DENSEGEMM` | 17 | CuTe DSL dense GEMM with fused SwiGLU over NVFP4, SM100/SM103 min-latency. |
+| `trtllm.trtllm_gen.fused_moe.none` | `trtllm_gen.none` | `TRTLLM` | 9 | TRTLLM-Gen batched-GEMM cubins, BF16 activations and weights, SM100 family. |
+| `trtllm.trtllm_gen.fused_moe.nvfp4` | `trtllm_gen.nvfp4` | `TRTLLM` | 10 | TRTLLM-Gen batched-GEMM cubins over NVFP4, SM100 family. |
+| `trtllm.trtllm_gen.fused_moe.fp8_block_scales` | `trtllm_gen.fp8_block_scales` | `TRTLLM` | 11 | TRTLLM-Gen batched-GEMM cubins over FP8 1x128 block scales, SM100 family. |
+| `trtllm.trtllm_gen.fused_moe.w4a16_mxfp4` | `trtllm_gen.w4a16_mxfp4` | `TRTLLM` | 12 | TRTLLM-Gen batched-GEMM cubins over MXFP4 weights with bf16 activations. |
+| `trtllm.trtllm_gen.fused_moe.w4a8_mxfp4_mxfp8` | `trtllm_gen.w4a8_mxfp4_mxfp8` | `TRTLLM` | 13 | TRTLLM-Gen batched-GEMM cubins over MXFP4 weights with MXFP8 activations. |
+| `trtllm.trtllm_gen.fused_moe.w4a8_nvfp4_fp8` | `w4a8_nvfp4_fp8` | `TRTLLM` | 14 | TRTLLM-Gen fp8_fp4 block-scale runner: NVFP4 weights, FP8 activations. |
+| `trtllm.trtllm_gen.fused_moe.w4a8_mxfp4_fp8` | `trtllm_gen.w4a8_mxfp4_fp8` | `TRTLLM` | 15 | TRTLLM-Gen e4m3_mxe2m1 block-scale runner: MXFP4 weights, FP8 activations. |
+| `deepgemm.cuda.mega_moe.w4a8_mxfp4_mxfp8` | `deepgemm.mega_moe` | `MEGAMOE_DEEPGEMM` | 3 | DeepGEMM fused fp8_fp4_mega_moe: MXFP4 weights, MXFP8 activations, SM100/SM103/SM107. |
+| `trtllm.cutedsl.mega_moe.nvfp4` | `trtllm.mega_moe` | `MEGAMOE_CUTEDSL` | 4 | MegaMoE CuteDSL fused NVFP4 kernels: NVFP4 weights and activations, SM100/103/107. |
+
+Segment values a tactic can use, by field:
+
+- `provider`: `deepgemm`, `flashinfer`, `marlin`, `trtllm`
+- `technique`: `cuda`, `cutedsl`, `cutlass`, `triton`, `trtllm_gen`
+- `kernel_name`: `b12x`, `dense_gemm`, `fused_fc12`, `fused_moe`, `grouped_gemm`, `hopper_grouped_gemm`, `mega_moe`
+- `quant`: `fp8`, `fp8_block_scales`, `mxfp8`, `none`, `nvfp4`, `nvfp4_plus`, `w4a16_mxfp4`, `w4a16_nvfp4`, `w4a8_awq`, `w4a8_mxfp4_fp8`, `w4a8_mxfp4_mxfp8`, `w4a8_nvfp4_fp8`, `w8a16`
+
+<!-- END GENERATED MOE IMPL CATALOG -->
+
 ### Terminology
 
 - **`world_size`**: number of ranks (GPUs) the model is served on.
@@ -315,7 +400,7 @@ All three options switch for the same reason. Every configuration pays two kinds
 
 **We prefer `TRTLLM` over `CUTEDSL` when `world_size <= 8`.** A small world size leaves many experts on each rank (`num_experts / world_size` can be 32 to 224), so the grouped GEMM has many groups with a small `M` dimension. In these cases, TRTLLM-Gen's tuned kernels fit that shape better than the generic CuteDSL grouped GEMM.
 
-**The crossover moves out much further with CUDA graph off.** A CUDA graph replays a recorded launch sequence and reduces the kernel launch overhead during forward. Without CUDA graph, `TRTLLM` drives its whole MoE from one host-side call that issues its kernels internally, while the fused path is a chain of separate host-side steps, including quantize, staging copies, the fused kernel, and a separate top-k reduce, each carrying its own dispatch and tactic lookup. With CUDA graph off, the host overhead dominates the execution of the MoE module. The fused path's expert-GEMM advantage therefore stays out of the comparison until `TRTLLM`'s GPU work has grown past that dispatch cost, which moves the crossover point much further out. In a disaggregated deployment, CUDA graph off maps to the prefill phase.
+**The crossover moves out much further with CUDA graph off.** A CUDA graph replays a recorded launch sequence and reduces the kernel launch overhead during forward. Without CUDA graph, `TRTLLM` drives its whole MoE from one host-side call that issues its kernels internally, while the fused path is a chain of separate host-side steps, including quantize, staging copies, the fused kernel, and a separate top-k reduce, each carrying its own dispatch and autotuner lookup. With CUDA graph off, the host overhead dominates the execution of the MoE module. The fused path's expert-GEMM advantage therefore stays out of the comparison until `TRTLLM`'s GPU work has grown past that dispatch cost, which moves the crossover point much further out. In a disaggregated deployment, CUDA graph off maps to the prefill phase.
 
 **Attention TP always uses `TRTLLM`.** Attention TP is a low-latency choice, and the MoE forward never gets a large batch: across the disaggregated-serving workloads behind this guide, attention TP appears only in the decode phase and `activated_tokens_per_rank` never exceeds 64. `CUTEDSL` does overtake `TRTLLM` once the expert GEMM becomes compute bound, but that only happens above roughly 24576 activated tokens per rank, which attention TP does not reach in a disaggregated deployment.
 
@@ -433,7 +518,7 @@ Each worker of a DWDP group stores a contiguous range of the routed experts and 
 
 Any other combination raises on every rank when the model is built, since the expert count comes from the model.
 
-DWDP needs `moe_config.backend: CUTEDSL` (or `CUTEDSL_FC12`), and the launch is refused with any other backend: it manages the MoE layers that run it with NVFP4 weights and no locality domains. Any other MoE layer, such as a BF16 MTP layer, keeps every expert on every rank, in memory the KV cache would otherwise get; the first such layer of each backend and reason logs a warning, and DWDP setup logs how many layers each reason covers.
+DWDP needs `moe_config.backend: CUTEDSL` (or `CUTEDSL_FC12`), or a tactic that names a CuteDSL NVFP4 implementation such as `cutedsl.grouped_gemm.nvfp4` or `fused_fc12`, and the launch is refused otherwise: it manages the MoE layers that run it with NVFP4 weights and no locality domains. Any other MoE layer, such as a BF16 MTP layer, keeps every expert on every rank, in memory the KV cache would otherwise get; the first such layer of each backend and reason logs a warning, and DWDP setup logs how many layers each reason covers.
 
 Usage: [`examples/dwdp/README.md`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/dwdp/README.md) and [blog19](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.md).
 
