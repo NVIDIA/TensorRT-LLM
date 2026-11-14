@@ -45,7 +45,7 @@ _PACKAGE = __name__.rpartition(".")[0]
 _MODELS_PACKAGE = f"{_PACKAGE}.models"
 
 # tensorrt_llm/libs, where build_wheel.py installs libth_common.so and the family libraries.
-_LIBS_DIR = Path(__file__).resolve().parents[3] / "libs"
+_LIBS_DIR = Path(__file__).resolve().parents[2] / "libs"
 
 _built_targets: Dict[str, FrozenSet[str]] = {}
 _family_ops: Dict[str, Any] = {}

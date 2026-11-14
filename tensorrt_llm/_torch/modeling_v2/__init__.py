@@ -15,7 +15,7 @@ Entry is a single LLM API argument::
     LLM(model, modeling_v2="require")
 
 ``off`` is byte-for-byte the built-in behaviour: the resolver returns
-immediately and nothing in this package is imported. ``auto`` (the default)
+immediately and no target is imported. ``auto`` (the default)
 uses a target when one claims the configuration and falls back to the built-in
 implementation otherwise. A target decorated ``@disable_v2_by_default`` is used
 only when the caller sets ``modeling_v2`` itself. ``require`` raises instead of
@@ -25,6 +25,13 @@ This package sits *beside* ``_torch/models/`` rather than inside it. Targets
 are not registered in the model zoo at all: ``route`` returns the class and the
 loader builds it, so nothing here competes for an architecture slot and the
 zoo's static index never has to know these classes exist.
+
+Nothing in this package is public API. The API stability tests do not cover
+it, and any module here may change shape or be removed without a deprecation
+cycle. Reach it through ``TorchLlmArgs.modeling_v2``; import it from outside
+``tensorrt_llm`` at your own risk. ``_torch/pyexecutor/model_loader.py`` and
+``_torch/models/modeling_auto.py`` import this package and ``_router_index``
+whatever the mode; a target is imported only when routing returns it.
 """
 
 from ._router_index import (

@@ -27,6 +27,7 @@ from pathlib import Path
 
 import pytest
 
+import tensorrt_llm
 from tensorrt_llm._torch.modeling_v2 import _native
 from tensorrt_llm._torch.modeling_v2._native import (
     NativeLoadError,
@@ -164,6 +165,11 @@ _LOAD_ONE_FAMILY = textwrap.dedent(
     print(json.dumps({"built": built, "unfaked": unfaked}))
     """
 )
+
+
+def test_libraries_are_looked_up_next_to_libth_common():
+    # The load test below skips when it finds no library, so a wrong directory would pass it.
+    assert _native._LIBS_DIR == Path(tensorrt_llm.__file__).resolve().parent / "libs"
 
 
 def test_every_installed_family_library_loads():

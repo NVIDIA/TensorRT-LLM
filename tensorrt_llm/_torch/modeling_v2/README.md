@@ -113,7 +113,7 @@ The layout inside a family is a convention that the existing families follow,
 not a requirement. Organize a family's files in whatever way suits its
 implementation. Native code is the exception: the build looks for it in fixed
 locations, described in the
-[native code guide](../../../../cpp/tensorrt_llm/modeling_v2/README.md).
+[native code guide](../../../cpp/tensorrt_llm/modeling_v2/README.md).
 
 Put code at the narrowest scope that uses it:
 
@@ -162,10 +162,10 @@ example that uses no Modeling V1 model code.
    [Routing](#routing).
 4. Use catalog operations where they fit. Add new operations as `OpWrapper`s
    with tests. See [Writing operations](#writing-operations).
-5. For C++/CUDA code, follow the [native code guide](../../../../cpp/tensorrt_llm/modeling_v2/README.md).
+5. For C++/CUDA code, follow the [native code guide](../../../cpp/tensorrt_llm/modeling_v2/README.md).
 6. Add unit tests and a whole-model accuracy test, and add them to the CI test
    lists. See [Testing and validation](#testing-and-validation).
-7. Add the new paths to [CODEOWNERS](../../../../.github/CODEOWNERS). Families
+7. Add the new paths to [CODEOWNERS](../../../.github/CODEOWNERS). Families
    with their own owners list three paths: the package directory, the unit
    test directory and the accuracy test directory.
 
@@ -391,7 +391,7 @@ dtypes, add those cases to the operation's tests. The existing
 C++/CUDA code for a family or target lives in its `csrc/` directory and builds
 into one library per family. Do not put it under `cpp/tensorrt_llm/kernels/`
 or `cpp/tensorrt_llm/thop/`. See the
-[native code guide](../../../../cpp/tensorrt_llm/modeling_v2/README.md) for
+[native code guide](../../../cpp/tensorrt_llm/modeling_v2/README.md) for
 build declarations, namespaces, op and fake registration, loading and errors.
 
 ## Testing and validation
@@ -502,7 +502,7 @@ measurements that show it is correct and fast.
 ### Who owns and reviews a family or target?
 
 The people who contribute a family or target maintain it, including its
-kernels and tests. Record them in [CODEOWNERS](../../../../.github/CODEOWNERS).
+kernels and tests. Record them in [CODEOWNERS](../../../.github/CODEOWNERS).
 
 Model owners review the model code. Modeling V2 maintainers review the shared
 design, interfaces and layout. Changes to shared runtime code or catalog
