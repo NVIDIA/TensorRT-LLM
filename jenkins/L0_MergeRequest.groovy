@@ -801,6 +801,7 @@ def mergeWaiveList(pipeline, globalVars)
         }
         return [targetBranch: targetBranch, targetCommit: targetBranchTOTCommit]
     }
+    def snapshotTime = new Date().format("yyyy-MM-dd'T'HH:mm:ss.SSSXXX", TimeZone.getTimeZone('UTC'))
 
     try {
         // Get waive list diff in current MR
@@ -817,6 +818,10 @@ def mergeWaiveList(pipeline, globalVars)
             --diff-file=diff_content.txt \
             --output-file=waives.txt
         """
+        // Failed stages only trust waives recorded after this TOT download.
+        writeFile file: "waives_TOT_initial_${env.gitlabCommit}.txt",
+            text: "# snapshot-time: ${snapshotTime}\n" +
+                "# target-branch-commit: ${targetBranchTOTCommit ?: 'unknown'}\n" + readFile(waiveTot)
         def primary = llmArtifactsPrimary()
         def waiveListTarget = primary == "aws" ?
             "${llmArtifactsRepoPath('aws', UPLOAD_PATH)}/waive_list/" : "${UPLOAD_PATH}/waive_list/"
@@ -2391,7 +2396,7 @@ def collectTestResults(pipeline, testFilter, globalVars)
             sh "find . -name results-\\*.tar.gz -type f -exec tar -zxvf {} \\; || true"
             trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
 
-            junit(testResults: '**/results*.xml', allowEmptyResults : true)
+            junit(testResults: '**/results*.xml', allowEmptyResults : true, keepProperties: true)
 
             // Pre-install shared dependencies for parallel tasks
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add py3-pip")

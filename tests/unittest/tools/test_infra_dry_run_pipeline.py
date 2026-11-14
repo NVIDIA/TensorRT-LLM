@@ -130,8 +130,10 @@ class InfraDryRunPipelineTest(unittest.TestCase):
             platform,
         )
         self.assertLess(
-            platform.index("throw unrerunInfraFailure"),
-            platform.rindex('error "Some tests failed and were not eligible for rerun'),
+            platform.index("throw infraFailure"),
+            platform.rindex(
+                'throw new UserFailure("Some tests failed and were not eligible for rerun'
+            ),
         )
 
     def test_post_actions_keep_interruptions_higher_priority_than_primary_failures(self) -> None:

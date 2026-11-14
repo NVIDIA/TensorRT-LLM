@@ -168,5 +168,13 @@ if [ "${SLURM_PROCID:-0}" -eq 0 ]; then
         --drain-spool "$jobWorkspace" || true
 fi
 
+# Only single-task pytest failures are eligible for a TOT waive check. The refresh
+# also verifies report completeness; this file carries the compute-node GPU SM.
+if [ "${SLURM_PROCID:-0}" -eq 0 ] && [ "$pytest_exit_code" -eq 1 ] && \
+        [ "${SLURM_NTASKS:-1}" -eq 1 ]; then
+    timeout 10s nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n 1 \
+        > "$jobWorkspace/tot_waive_eligible.txt" || true
+fi
+
 echo "Rank${SLURM_PROCID} Final Slurm run finished execution with exit code $pytest_exit_code"
 exit $pytest_exit_code

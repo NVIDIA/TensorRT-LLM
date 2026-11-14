@@ -329,6 +329,24 @@ def generate_rerun_tests_list(outdir,
             os.remove(filename)
 
 
+def update_junit_counts(root: ET.Element) -> None:
+    """Update suite counts, counting each test case's outcome once."""
+    for node in root.iter():
+        if node.tag not in {'testsuites', 'testsuite'}:
+            continue
+        counts = {'tests': 0, 'failures': 0, 'errors': 0, 'skipped': 0}
+        for case in node.iter('testcase'):
+            counts['tests'] += 1
+            if case.find('failure') is not None:
+                counts['failures'] += 1
+            elif case.find('error') is not None:
+                counts['errors'] += 1
+            elif case.find('skipped') is not None:
+                counts['skipped'] += 1
+        for attribute, value in counts.items():
+            node.set(attribute, str(value))
+
+
 def merge_junit_xmls(merged_xml_filename, xml_filenames, deduplicate=False):
     # Merge xml files into one.
     # If deduplicate is true, remove duplicate test cases.
@@ -377,17 +395,7 @@ def merge_junit_xmls(merged_xml_filename, xml_filenames, deduplicate=False):
                 if latest[key] is not case:
                     suite.remove(case)
 
-        attribs = {'errors': 0, 'failures': 0, 'skipped': 0, 'tests': 0}
-        for case in suite.findall('testcase'):
-            attribs['tests'] += 1
-            if case.find('failure') is not None:
-                attribs['failures'] += 1
-            elif case.find('error') is not None:
-                attribs['errors'] += 1
-            elif case.find('skipped') is not None:
-                attribs['skipped'] += 1
-        for key, value in attribs.items():
-            suite.set(key, str(value))
+        update_junit_counts(suite)
 
         # add suite to merged_root
         merged_root.append(suite)

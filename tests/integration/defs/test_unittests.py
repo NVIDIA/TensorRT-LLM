@@ -15,6 +15,7 @@
 import os
 import re
 import shlex
+import uuid
 import warnings
 from subprocess import CalledProcessError
 from typing import NoReturn, Optional
@@ -43,6 +44,25 @@ def merge_report(base_file, extra_file, output_file, is_retry=False):
     merge_attr("time", type_=float)
 
     if is_retry:
+        properties = base_suite.find('properties')
+        if properties is not None:
+            complete = properties.find(
+                "property[@name='pytest_session_complete']")
+            retry_complete = extra_suite.find(
+                "properties/property[@name='pytest_session_complete']")
+            report_id = properties.find("property[@name='unittest_report_id']")
+            retry_id = extra_suite.find(
+                "properties/property[@name='unittest_report_id']")
+            if complete is not None:
+                complete.set(
+                    'value',
+                    str(
+                        complete.get('value') == 'true'
+                        and retry_complete is not None
+                        and retry_complete.get('value') == 'true'
+                        and report_id is not None and retry_id is not None
+                        and report_id.get('value')
+                        == retry_id.get('value')).lower())
         base_suite.attrib['failures'] = extra_suite.attrib['failures']
         # pytest may generate testcase node without classname or name attribute when worker crashed catastrophically.
         # Simply ignore these nodes since they are not meaningful.
@@ -56,6 +76,8 @@ def merge_report(base_file, extra_file, output_file, is_retry=False):
             if (element.attrib['classname'],
                 element.attrib['name']) not in case_names
         ] + extra_suite_nodes
+        if properties is not None:
+            base_suite.insert(0, properties)
     else:
         merge_attr("errors")
         merge_attr("failures")
@@ -276,6 +298,11 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
     else:
         output_xml = os.path.join(output_dir,
                                   f'results-sub-unittests-{case_fn}.xml')
+    report_id = str(uuid.uuid4())
+    request.node.user_properties.extend([
+        ("unittest_report", os.path.basename(output_xml)),
+        ("unittest_report_id", report_id),
+    ])
 
     command = [
         '-m',
@@ -374,9 +401,15 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
             pythonpath_entries.append(pythonpath)
         return os.pathsep.join(pythonpath_entries)
 
+    exit_code = 0
+
     def run_command(cmd, num_workers=1):
+        nonlocal exit_code
+        exit_code = 0
         try:
             env = {'PYTHONPATH': build_pythonpath()}
+            env['TRTLLM_UNITTEST_ENTRY'] = case
+            env['TRTLLM_UNITTEST_REPORT_ID'] = report_id
             # This batch runs without -p cbts_plugin, so name the role for the CBTS coverage
             # bootstrap instead of leaving it to guess. Ignored when coverage is not enabled;
             # the bootstrap consumes the variable, so the pools this batch spawns do not
@@ -392,6 +425,7 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
                 env=env,
             )
         except CalledProcessError as e:
+            exit_code = e.returncode
             print(f"\n{'='*60}")
             print(f"UNITTEST FAILED with exit code: {e.returncode}")
             print(f"Command: {' '.join(cmd)}")
@@ -462,6 +496,7 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
                     "no report generated, fatal failure in unittests (retry phase)",
                     output_xml, output_dir, case, unfinished_test_path)
 
+    request.node.user_properties.append(("unittest_exit_code", str(exit_code)))
     if not passed:
         _fail_unittests("failure reported in unittests", output_xml, output_dir,
                         case, unfinished_test_path)
