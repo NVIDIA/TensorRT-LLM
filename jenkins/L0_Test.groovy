@@ -3539,8 +3539,13 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                             # and perf folders for the final snapshot. The watcher first finishes any
                             # checkpoint under way and then starts no other, so that the copy and a
                             # checkpoint never write the results at the same time. The copies are
-                            # best-effort, and each logs its own failure.
-                            touch "\$PROGRESS_STOP_FILE"
+                            # best-effort, and each logs its own failure. If the stop file cannot
+                            # be created, the watcher cannot be asked to pause, so a signal ends
+                            # it here: its final snapshot then comes before the copies.
+                            if ! touch "\$PROGRESS_STOP_FILE"; then
+                                kill -s USR1 \$WATCHER_PID 2>/dev/null
+                                wait \$WATCHER_PID
+                            fi
                             while [ -e "\$PROGRESS_STOP_FILE.busy" ] && kill -0 \$WATCHER_PID 2>/dev/null; do
                                 sleep 1
                             done
@@ -3568,8 +3573,10 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                                 done
                                 [ "\$_perf_ok" -eq 0 ] && echo "[PROGRESS-UPLOAD] ${stageName}: scp perf \$perf_folder failed after 3 attempts"
                             done < <(eval '${sshListPerfCmd}' 2>/dev/null || true)
-                            touch "\$PROGRESS_DONE_FILE"
-                            wait \$WATCHER_PID
+                            # A signal stands in for a done file that cannot be created. The
+                            # watcher is already gone if the stop file could not be created.
+                            touch "\$PROGRESS_DONE_FILE" || kill -s USR1 \$WATCHER_PID 2>/dev/null
+                            wait \$WATCHER_PID 2>/dev/null
                             exit \$rc
                         """
                     }
@@ -5614,7 +5621,9 @@ def rerunFailedTests(pipeline, stageName, llmSrc, testCmdLine, resultFileName="r
                         cd ${llmSrc}/tests/integration/defs && \\
                         ${newTestCmdLine.join(" ")}
                         rc=\$?
-                        touch "\$PROGRESS_DONE_FILE"
+                        # As in the first run: a signal stands in for a done file that cannot
+                        # be created.
+                        touch "\$PROGRESS_DONE_FILE" || kill -s USR1 \$WATCHER_PID 2>/dev/null
                         wait \$WATCHER_PID
                         exit \$rc
                     """)
@@ -6510,7 +6519,10 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                                         cd '${llmSrc}/tests/integration/defs'
                                         ${pytestCommand.join(" ")}
                                         rc=\$?
-                                        touch "\$PROGRESS_DONE_FILE"
+                                        # The watcher exits only once it learns that the tests
+                                        # have ended. If the done file cannot be created, a
+                                        # signal tells it instead.
+                                        touch "\$PROGRESS_DONE_FILE" || kill -s USR1 \$WATCHER_PID 2>/dev/null
                                         wait \$WATCHER_PID
                                         exit \$rc
                                     """)

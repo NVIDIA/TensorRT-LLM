@@ -36,6 +36,7 @@ from __future__ import annotations
 import os
 import re
 import shlex
+import signal
 import subprocess
 import tarfile
 from dataclasses import dataclass
@@ -652,3 +653,162 @@ def test_a_batch_stage_takes_no_checkpoint_once_its_step_asks_it_to_stop(
     assert not Path(f"{stop}.busy").exists()
     # The final snapshot still comes with the done file.
     assert "sbatch final snapshot content unchanged, skipping upload" in result.output
+
+
+def _ticks(watcher: Watcher) -> int:
+    """Return how many times the watcher waited for its next checkpoint."""
+    return int((watcher.state / "tick.count").read_text())
+
+
+def test_a_signal_brings_the_final_snapshot_as_the_done_file_does(watcher: Watcher) -> None:
+    """USR1, from a step that cannot create the done file, brings the final snapshot and the exit."""
+    _write_xml(watcher.xml, mtime=1000)
+    # The step signals in place of the watcher's first checkpoint. The done file never appears.
+    watcher.tick(1, "kill -s USR1 $PPID")
+
+    result = watcher.run(FINAL_REQUIRES=str(watcher.xml))
+
+    assert result.returncode == 0, result.output
+    assert not watcher.done.exists()
+    assert _ticks(watcher) == 1
+    assert [request.location for request in result.requests] == ["urm", "aws"]
+    lines = result.output.splitlines()
+    signalled = lines.index(
+        f"[PROGRESS-UPLOAD] {STAGE}: the step signalled the end of the tests without the done file"
+    )
+    uploaded = f"[PROGRESS-UPLOAD] {STAGE}: run1 final snapshot uploaded to aws"
+    assert uploaded in lines[signalled + 1 :]
+    assert lines[-1] == f"[PROGRESS-UPLOAD] {STAGE}: watcher exiting"
+
+
+def test_a_signal_during_a_checkpoint_lets_it_finish(watcher: Watcher) -> None:
+    """A signal that arrives while a checkpoint is under way does not cut the checkpoint short."""
+    remote = watcher.tmp_path / "remote"
+    _write_xml(remote / "results.xml", tests=3)
+    pid_file = shlex.quote(str(watcher.state / "watcher.pid"))
+    stop = watcher.workspace / f".checkpoint-stop-{STAGE}"
+    watcher.tick(1, f"echo $PPID > {pid_file}")
+
+    # The signal arrives while the first checkpoint asks the job for its results.
+    result = watcher.run(
+        PROGRESS_STOP_FILE=str(stop),
+        **watcher.batch_env(
+            SLURM_SSH_STAT_CMD=f"kill -s USR1 $(cat {pid_file}); echo 5000",
+            SLURM_SCP_XML_CMD=f"cp {shlex.quote(str(remote))}/results*.xml {STAGE}/",
+        ),
+    )
+
+    assert result.returncode == 0, result.output
+    assert _ticks(watcher) == 1
+    # That checkpoint still copied the results back and reached both targets, under its mark.
+    assert [request.location for request in result.requests] == ["urm", "aws"]
+    assert [request.checkpoint_mark for request in result.requests] == ["busy", "busy"]
+    assert [_suite_tests(request.tarball) for request in result.requests] == ["3", "3"]
+    assert not Path(f"{stop}.busy").exists()
+    # The final snapshot follows it, with neither the stop file nor the done file.
+    assert not stop.exists()
+    assert not watcher.done.exists()
+    assert "sbatch final snapshot content unchanged, skipping upload" in result.output
+    assert result.output.splitlines()[-1] == f"[PROGRESS-UPLOAD] {STAGE}: watcher exiting"
+
+
+L0_TEST = REPO_ROOT / "jenkins" / "L0_Test.groovy"
+
+
+def _step_lines(first: str, last: str) -> list[str]:
+    r"""Return each run of lines from ``first`` to ``last`` in a step of L0_Test.groovy.
+
+    The lines come back as the shell gets them, without the ``\`` that keeps Groovy from expanding
+    a ``$``.
+    """
+    pattern = rf"^[ \t]*{re.escape(first)}.*?^[ \t]*{re.escape(last)}$"
+    found = re.findall(pattern, L0_TEST.read_text(encoding="utf-8"), re.M | re.S)
+    return [lines.replace("\\$", "$") for lines in found]
+
+
+def _run_beside_the_watcher(watcher: Watcher, lines: str, **env: str) -> tuple[int, str]:
+    """Run ``lines`` in a step that has the watcher in its background, as ``sh`` does.
+
+    Returns the step's exit code and output. A step that does not return is killed, and so is a
+    watcher that outlives its step.
+    """
+    script = "\n".join(
+        [
+            "set +e",
+            f"bash {shlex.quote(str(WATCHER))} &",
+            "WATCHER_PID=$!",
+            # As in the steps, the tests start only once the watcher has removed its netrc.
+            'while [ -e "$CHECKPOINT_NETRC_FILE" ]; do :; done',
+            "rc=7",
+            lines,
+        ]
+    )
+    proc = subprocess.Popen(
+        ["sh", "-c", script],
+        env={**watcher.env, **env},
+        cwd=watcher.cwd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        output, _ = proc.communicate(timeout=60)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        output, _ = proc.communicate()
+        pytest.fail(f"the step did not return:\n{output}")
+    finally:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    return proc.returncode, output
+
+
+@pytest.mark.parametrize("step", range(3), ids=["batch", "rerun", "first run"])
+def test_a_step_that_cannot_create_the_done_file_still_returns(watcher: Watcher, step: int) -> None:
+    """Each step returns the tests' exit code although its done file cannot be created.
+
+    The watcher exits only once it learns that the tests have ended, and the step waits for it, so
+    a step that could only signal through the done file would never return.
+    """
+    endings = _step_lines('touch "\\$PROGRESS_DONE_FILE"', "exit \\$rc")
+    assert len(endings) == 3
+    _write_xml(watcher.xml, mtime=1000)
+
+    returncode, output = _run_beside_the_watcher(
+        watcher,
+        endings[step],
+        PROGRESS_DONE_FILE=str(watcher.workspace / "missing" / "done"),
+        FINAL_REQUIRES=str(watcher.xml),
+    )
+
+    assert returncode == 7, output
+    assert "the step signalled the end of the tests without the done file" in output
+    assert "run1 final snapshot" in output
+    assert output.splitlines()[-1] == f"[PROGRESS-UPLOAD] {STAGE}: watcher exiting"
+
+
+def test_a_batch_step_that_cannot_create_the_stop_file_ends_the_watcher_first(
+    watcher: Watcher,
+) -> None:
+    """Without the stop file, the batch step ends the watcher before it copies the last results.
+
+    The watcher cannot be asked to pause then, and a mark of a checkpoint under way that could not
+    be removed would otherwise keep the step waiting.
+    """
+    (stop_block,) = _step_lines('if ! touch "\\$PROGRESS_STOP_FILE"; then', "done")
+    _write_xml(watcher.xml, mtime=1000)
+
+    returncode, output = _run_beside_the_watcher(
+        watcher,
+        f'{stop_block}\nkill -0 $WATCHER_PID 2>/dev/null && echo "the watcher still runs"\nexit $rc',
+        PROGRESS_STOP_FILE=str(watcher.workspace / "missing" / "stop"),
+        FINAL_REQUIRES=str(watcher.xml),
+    )
+
+    assert returncode == 7, output
+    assert "the watcher still runs" not in output
+    assert f"[PROGRESS-UPLOAD] {STAGE}: watcher exiting" in output
