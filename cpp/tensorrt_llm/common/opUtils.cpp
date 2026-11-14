@@ -105,11 +105,16 @@ ncclUniqueId getUniqueId(std::set<int> const& group)
 
 std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
 {
+    return getComm(group, 0);
+}
+
+std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group, int minCtas)
+{
     auto const hostPg = useMPI() ? nullptr : pg_utils::get_world_pg();
     TLLM_CHECK_WITH_INFO(useMPI() || hostPg != nullptr, "Host process group is not initialized");
     auto const rank = useMPI() ? COMM_SESSION.getRank() : hostPg->getRank();
     TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, rank);
-    static std::map<std::set<int>, std::shared_ptr<ncclComm_t>> commMap;
+    static std::map<std::pair<std::set<int>, int>, std::shared_ptr<ncclComm_t>> commMap;
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
     std::ostringstream oss;
@@ -124,7 +129,8 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
         index++;
     }
     auto groupStr = oss.str();
-    auto it = commMap.find(group);
+    auto const cacheKey = std::make_pair(group, minCtas);
+    auto it = commMap.find(cacheKey);
     if (it != commMap.end())
     {
         auto ncclComm = it->second;
@@ -205,6 +211,10 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 29, 0)
     ncclConfig_t config = NCCL_CONFIG_INITIALIZER;
     config.graphUsageMode = 1;
+    if (minCtas > 0)
+    {
+        config.minCTAs = minCtas;
+    }
     NCCLCHECK_THROW(ncclCommInitRankConfig(ncclComm.get(), group.size(), id, groupRank, &config));
 #else
     NCCLCHECK_THROW(ncclCommInitRank(ncclComm.get(), group.size(), id, groupRank));
@@ -223,7 +233,7 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
         }
     }
 #endif
-    commMap[group] = ncclComm;
+    commMap[cacheKey] = ncclComm;
     TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, rank);
     return ncclComm;
 }
