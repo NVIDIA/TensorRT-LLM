@@ -22,10 +22,20 @@
 
 #include "bounceTestNixlNode.h"
 
+#include "tensorrt_llm/runtime/cudaStream.h"
+
 #include <gtest/gtest.h>
 
+#include <cuda.h>
+
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 
 namespace kvc = tensorrt_llm::executor::kv_cache;
 namespace b = tensorrt_llm::executor::kv_cache::bounce;
@@ -239,3 +249,163 @@ TEST(BounceTransport, SenderArenaBackpressureParksCredits)
     // the granted credits must park and retry.
     runTransfer("btPark", /*nDescs=*/32, /*descBytes=*/4096, small, big, /*seed=*/11);
 }
+
+namespace
+{
+// A device-side wait keeps legacy work pending without occupying an SM. Release before joining
+// transport workers or freeing CUDA allocations, including when an ASSERT returns from the test.
+class LegacyDefaultGate
+{
+public:
+    LegacyDefaultGate() = default;
+    LegacyDefaultGate(LegacyDefaultGate const&) = delete;
+    LegacyDefaultGate& operator=(LegacyDefaultGate const&) = delete;
+
+    void hold()
+    {
+        ASSERT_EQ(cudaHostAlloc(&mFlag, sizeof(*mFlag), cudaHostAllocMapped), cudaSuccess);
+        *mFlag = 0;
+        void* deviceFlag = nullptr;
+        ASSERT_EQ(cudaHostGetDevicePointer(&deviceFlag, mFlag, 0), cudaSuccess);
+        ASSERT_EQ(cudaEventCreateWithFlags(&mDone, cudaEventDisableTiming), cudaSuccess);
+        // Materialize the event before the gate so first-record setup cannot synchronize the hold.
+        ASSERT_EQ(cudaEventRecord(mDone, cudaStreamLegacy), cudaSuccess);
+        ASSERT_EQ(cudaEventSynchronize(mDone), cudaSuccess);
+        mWatchdog = std::thread(
+            [this]
+            {
+                std::unique_lock<std::mutex> lock(mMutex);
+                if (!mReleased.wait_for(lock, std::chrono::seconds(120), [this] { return mRelease; }))
+                {
+                    mWatchdogFired.store(true);
+                    *static_cast<std::uint32_t volatile*>(mFlag) = 1;
+                }
+            });
+        ASSERT_EQ(cuStreamWaitValue32(
+                      CU_STREAM_LEGACY, reinterpret_cast<CUdeviceptr>(deviceFlag), 1, CU_STREAM_WAIT_VALUE_GEQ),
+            CUDA_SUCCESS);
+        mHeld = true;
+        ASSERT_EQ(cudaEventRecord(mDone, cudaStreamLegacy), cudaSuccess);
+        expectPending();
+    }
+
+    void expectPending() const
+    {
+        EXPECT_FALSE(mWatchdogFired.load()) << "cleanup watchdog released unrelated legacy work";
+        EXPECT_EQ(cudaEventQuery(mDone), cudaErrorNotReady) << "unrelated legacy work completed";
+    }
+
+    ~LegacyDefaultGate()
+    {
+        {
+            std::lock_guard<std::mutex> lock(mMutex);
+            if (mFlag)
+            {
+                *static_cast<std::uint32_t volatile*>(mFlag) = 1;
+            }
+            mRelease = true;
+        }
+        mReleased.notify_one();
+        if (mWatchdog.joinable())
+        {
+            mWatchdog.join();
+        }
+        // The mapped flag must stay alive until the device wait has retired.
+        if (mHeld)
+        {
+            EXPECT_EQ(cudaStreamSynchronize(cudaStreamLegacy), cudaSuccess);
+        }
+        if (mDone)
+        {
+            EXPECT_EQ(cudaEventDestroy(mDone), cudaSuccess);
+        }
+        if (mFlag)
+        {
+            EXPECT_EQ(cudaFreeHost(mFlag), cudaSuccess);
+        }
+        EXPECT_FALSE(mWatchdogFired.load()) << "cleanup watchdog released unrelated legacy work";
+    }
+
+private:
+    std::uint32_t* mFlag{nullptr};
+    cudaEvent_t mDone{};
+    bool mHeld{false};
+    bool mRelease{false};
+    std::atomic<bool> mWatchdogFired{false};
+    std::mutex mMutex;
+    std::condition_variable mReleased;
+    std::thread mWatchdog;
+};
+
+class BounceStreamDependencies : public ::testing::TestWithParam<std::uint32_t>
+{
+};
+} // namespace
+
+TEST_P(BounceStreamDependencies, RoundTripSettlesWhileUnrelatedLegacyWorkIsPending)
+{
+    if (!bounce_test::hasCuda())
+    {
+        GTEST_SKIP() << "no CUDA device";
+    }
+    b::BounceConfig cfg;
+    cfg.arenaSizeBytes = 1ULL << 20;
+    cfg.maxChunkSizeBytes = 4096;
+    cfg.arenaAllocationGranularityBytes = 256;
+    cfg.maxInflightChunksPerRequest = 2;
+    cfg.scatterWorkerCount = 1;
+    auto const freeBuffers = [](bounce_test::XferBufs* buffers)
+    {
+        bounce_test::freeXferBufs(*buffers);
+        delete buffers;
+    };
+    using Buffers = std::unique_ptr<bounce_test::XferBufs, decltype(freeBuffers)>;
+    // Separate buffers and payloads ensure the warmup cannot satisfy the gated transfer's check.
+    Buffers warmup(new bounce_test::XferBufs(bounce_test::makeXferBufs(4, GetParam(), 1)), freeBuffers);
+    Buffers payload(new bounce_test::XferBufs(bounce_test::makeXferBufs(4, GetParam(), 2)), freeBuffers);
+    std::unique_ptr<void, decltype(&cudaFreeHost)> readback(nullptr, cudaFreeHost);
+    void* pinned = nullptr;
+    ASSERT_EQ(cudaHostAlloc(&pinned, payload->total, cudaHostAllocDefault), cudaSuccess);
+    readback.reset(pinned);
+    tensorrt_llm::runtime::CudaStream reader(cudaStreamNonBlocking);
+
+    // Destroy the transports before their buffers on every return, including timeout failures.
+    auto sender = bounce_test::makeNode("btStreamSender", cfg, 1024);
+    auto receiver = bounce_test::makeNode("btStreamReceiver", cfg, 1024);
+    // The H100 executor_bounce CI group requires the real NIXL tier; losing its backend must fail.
+    ASSERT_NE(sender, nullptr) << "NIXL agent/backend unavailable";
+    ASSERT_NE(receiver, nullptr) << "NIXL agent/backend unavailable";
+    bounce_test::wirePair(*sender, *receiver);
+
+    auto warmupDone = sender->tx->submit(warmup->srcDescs, warmup->dstDescs, receiver->name);
+    ASSERT_EQ(warmupDone.wait_for(std::chrono::seconds(30)), std::future_status::ready);
+    ASSERT_EQ(warmupDone.get().state, kvc::TransferState::kSUCCESS);
+    ASSERT_EQ(
+        cudaMemcpyAsync(readback.get(), warmup->dst, warmup->total, cudaMemcpyDeviceToHost, reader.get()), cudaSuccess);
+    reader.synchronize();
+
+    // Declared last: fatal assertions release the gate before other CUDA resources are destroyed.
+    LegacyDefaultGate gate;
+    gate.hold();
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    auto done = sender->tx->submit(payload->srcDescs, payload->dstDescs, receiver->name);
+    ASSERT_EQ(done.wait_for(std::chrono::seconds(30)), std::future_status::ready) << "bounce transfer hung";
+    ASSERT_EQ(done.get().state, kvc::TransferState::kSUCCESS);
+    gate.expectPending();
+    ASSERT_EQ(cudaMemcpyAsync(readback.get(), payload->dst, payload->total, cudaMemcpyDeviceToHost, reader.get()),
+        cudaSuccess);
+    reader.synchronize();
+    gate.expectPending();
+    auto const* actual = static_cast<unsigned char const*>(readback.get());
+    for (std::uint32_t fragment = 0; fragment < payload->nDescs; ++fragment)
+    {
+        for (std::uint32_t byte = 0; byte < payload->descBytes; ++byte)
+        {
+            ASSERT_EQ(actual[payload->off[fragment] + byte], bounce_test::patSeed(2, fragment, byte))
+                << "fragment=" << fragment << " byte=" << byte;
+        }
+    }
+    gate.expectPending();
+}
+
+INSTANTIATE_TEST_SUITE_P(AlignedAndUnaligned, BounceStreamDependencies, ::testing::Values(32U, 19U));
