@@ -1656,26 +1656,40 @@ def test_selfsampling_warmup_band_enumeration_bounded():
     assert len(ss_host._VARLEN_WARMUP_DONE) == before + 1
 
 
-def test_selfsampling_varlen_heterogeneous_lengths_main():
+@pytest.mark.parametrize("distribution", ["random", "ties", "constant"])
+def test_selfsampling_varlen_heterogeneous_lengths_main(distribution):
     """Row-independence contract at throughput scale on the streaming main
     family: rows are naturally independent tasks — per-row data AND length
     (random kv_lens spanning long / mid / short / n<=k / zero-window rows in
     one 304-row batch, MTP row windows via next_n=4). Every row must match
     its own per-prefix torch.topk value multiset; short rows must be
-    identity + (-1) tail; zero-window rows all -1."""
+    identity + (-1) tail; zero-window rows all -1. Quantized and constant
+    scores exercise boundary plateaus; poisoned tails must never win."""
     k, msl_c, cr, nn = 1024, 65536, 4, 4
     batch = 76
     rows = batch * nn  # 304 -> route_streaming main family
     torch.manual_seed(5)
     lg = torch.randn(rows, msl_c, dtype=torch.float32, device=_DEV)
+    if distribution == "ties":
+        lg = (lg * 4.0).round() * 0.25
+    elif distribution == "constant":
+        lg.fill_(-2.0)
     kv = torch.randint(1, msl_c * cr, (batch,), dtype=torch.int32, device=_DEV)
     kv[0] = msl_c * cr  # full length
     kv[1] = 900  # short (n <= k)
     kv[2] = nn - 1  # zero-window (every row of the request empty)
     kv[3] = k * cr + nn  # just above the short path
+    row_ids = torch.arange(rows, device=_DEV)
+    valid_lengths = ((kv[row_ids // nn] - nn + row_ids % nn + 1).clamp_min(0) // cr).clamp(
+        max=msl_c
+    )
+    columns = torch.arange(msl_c, device=_DEV)
+    lg.masked_fill_(columns[None, :] >= valid_lengths[:, None], 3e38)
     out = torch.full((rows, k), -7, dtype=torch.int32, device=_DEV)
     ss_host.run_varlen(lg, kv, out, next_n=nn, compress_ratio=cr, max_seq_len=msl_c * cr)
     torch.cuda.synchronize()
+    key = _varlen_cache_key(rows, msl_c, k, msl_c, nn, cr)
+    assert ss_host._VARLEN_CACHE[key][0] == "main"
     kl = kv.tolist()
     for r in range(rows):
         n_r = max(kl[r // nn] - nn + (r % nn) + 1, 0) // cr
@@ -1687,6 +1701,8 @@ def test_selfsampling_varlen_heterogeneous_lengths_main():
             want = list(range(n_r)) + [-1] * (k - n_r)
             assert out[r].tolist() == want, f"row {r}: short path identity+pad"
             continue
+        assert ((out[r] >= 0) & (out[r] < n_r)).all(), f"row {r}: out-of-range indices"
+        assert torch.unique(out[r]).numel() == k, f"row {r}: duplicate indices"
         row = lg[r].float()[:n_r]
         ref_v = torch.topk(row, k).values.sort().values
         got = row[out[r].long()].sort().values

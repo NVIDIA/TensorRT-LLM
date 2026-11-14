@@ -1456,11 +1456,11 @@ def _pack_seed_row(logits_f32, n_eff, lines, block_max=None):
 
 
 @skip_not_sm100
-# One K only: the four modes exercise count-based admission, which is
+# One K only: the modes exercise count-based admission, which is
 # K-independent, while K is a compile-time parameter - sweeping it cost
 # two extra kernel compiles (~43s) for no extra coverage.
 @pytest.mark.parametrize("top_k", [2048])
-@pytest.mark.parametrize("mode", ["band", "fat", "miss", "inf"])
+@pytest.mark.parametrize("mode", ["band", "fat", "miss", "inf", "mixed_invalid"])
 def test_cute_dsl_gvr_topk_decode_ext_counts(top_k, mode, tie_aware_check):
     """Packed seed row ([rows, 8]: lines + exact counts) consumption.
 
@@ -1468,12 +1468,17 @@ def test_cute_dsl_gvr_topk_decode_ext_counts(top_k, mode, tie_aware_check):
     fat:  every count overshoots the candidate capacity -> full fallback.
     miss: lines above the row max (count 0) -> seed rejected.
     inf:  non-finite lines (production cold start) -> validity guard.
+    mixed_invalid: valid row alongside NaN middle/upper and unordered lines.
     """
     N, batch = 131072, 4
     logits, pre_idx, seq_lens = _make_inputs(batch, N, top_k, torch.float32, 1, seed=7, varlen=True)
     n_eff = seq_lens.to(device=logits.device, dtype=torch.long)
-    if mode == "band":
+    if mode in ("band", "mixed_invalid"):
         lines = _lines_at_counts(logits, n_eff, (4 * top_k, 2 * top_k, top_k + top_k // 4))
+        if mode == "mixed_invalid":
+            lines[1, 1] = float("nan")
+            lines[2, 2] = float("nan")
+            lines[3] = lines[3].flip(0)
     elif mode == "fat":
         lines = _lines_at_counts(logits, n_eff, (32768, 24576, 16384))
     elif mode == "miss":
