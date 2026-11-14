@@ -2239,6 +2239,14 @@ class KVCacheManagerV2(BaseResourceManager):
     # Read by KvCacheCreator: a subclass that overrides the context
     # commit/history protocol opts out of generic reuse-match backoff.
     _supports_reuse_match_backoff = True
+    # The same question for a separate one-model draft pool, which holds only
+    # the speculation layers and may therefore support the protocol when the
+    # pool holding the model's own layers does not.
+    _supports_draft_reuse_match_backoff = True
+    # Set by a subclass whose target truncates reuse to a coarse grid, where the
+    # draft's one-token backoff costs it a whole interval. Takes effect only
+    # with TLLM_DRAFT_REUSE_SKIP_BACKOFF=1; see _skips_draft_reuse_backoff.
+    _drop_advisory_draft_lookahead = False
     # A subclass whose pools are not all addressed at `tokens_per_block` token
     # granularity opts out of *partial*-block reuse. Full-block reuse stays on.
     #
@@ -2643,8 +2651,15 @@ class KVCacheManagerV2(BaseResourceManager):
         # a block's reuse key covers no token past its end.
         self._draft_prompt_lookahead = draft_prompt_lookahead(spec_config) or 0
         # Unsupported adapters keep their main-like reuse endpoint.
+        supports_backoff = (
+            self._supports_draft_reuse_match_backoff
+            if self.is_draft
+            else self._supports_reuse_match_backoff
+        )
         self.reuse_match_backoff = self._draft_prompt_lookahead
-        if not self._supports_reuse_match_backoff:
+        if not supports_backoff:
+            self.reuse_match_backoff = 0
+        elif self._skips_draft_reuse_backoff(spec_config, joint_kv_cache_reuse):
             self.reuse_match_backoff = 0
         self.enable_partial_reuse = _effective_partial_reuse(
             kv_cache_config.enable_partial_reuse,
@@ -3105,10 +3120,21 @@ class KVCacheManagerV2(BaseResourceManager):
             assert disk_cache_path is not None
             _check_disk_tier_space(disk_cache_path, int(disk_cache_size), mapping)
             cache_tiers.append(
-                DiskCacheTierConfig(quota=int(disk_cache_size), path=disk_cache_path)
+                DiskCacheTierConfig(
+                    quota=int(disk_cache_size),
+                    path=disk_cache_path,
+                    num_io_threads=kv_cache_config.disk_io_threads,
+                    keep_copy_after_restore=kv_cache_config.disk_keep_copy_after_restore,
+                    write_through=kv_cache_config.disk_write_through,
+                    protected_copy_fraction=kv_cache_config.disk_protected_copy_fraction,
+                )
             )
             logger.info(
-                f"KV cache manager v2 disk cache quota set to {disk_cache_size / (1 << 30):.2f}GiB at {disk_cache_path}"
+                f"KV cache manager v2 disk cache quota set to {disk_cache_size / (1 << 30):.2f}GiB "
+                f"at {disk_cache_path} (io_threads={kv_cache_config.disk_io_threads}, "
+                f"keep_copy_after_restore={kv_cache_config.disk_keep_copy_after_restore}, "
+                f"write_through={kv_cache_config.disk_write_through}, "
+                f"protected_copy_fraction={kv_cache_config.disk_protected_copy_fraction})"
             )
         if kv_cache_config.remote_cache_config is not None and remote_init_error is None:
             try:
@@ -6489,6 +6515,26 @@ class KVCacheManagerV2(BaseResourceManager):
             return
         request.expect_snapshot_points = sorted({*request.expect_snapshot_points, *points})
 
+    def _skips_draft_reuse_backoff(self, spec_config, joint_kv_cache_reuse: bool) -> bool:
+        """Whether a paired draft pool drops its one-token reuse-match backoff.
+
+        The scheduler caps the target at the draft's claim, so on a snapshot-grid
+        target the trim costs a whole interval. Dropping it reuses draft KV that
+        may have been computed with a different next token, which can lower
+        acceptance, so it requires ``TLLM_DRAFT_REUSE_SKIP_BACKOFF=1``. Relaxed
+        acceptance does not reject a bad draft token, so it always keeps the trim.
+        """
+        return (
+            self.is_draft
+            and joint_kv_cache_reuse
+            and self._drop_advisory_draft_lookahead
+            and os.environ.get("TLLM_DRAFT_REUSE_SKIP_BACKOFF", "0") == "1"
+            and not getattr(spec_config, "use_relaxed_acceptance_for_thinking", False)
+        )
+
+    def note_context_fork(self, req: LlmRequest, fork: int) -> None:
+        """Hook for recurrent-state managers; the attention-only base ignores the hint."""
+
     def probe_context_reuse(self, req: LlmRequest) -> int | None:
         """Reusable prefix depth for this pool, without claiming pages.
 
@@ -7938,6 +7984,11 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         stats.secondary_evictable_num_blocks = sum(
             level_stats[pool_group_id].evictable
+            for level_stats, level_pool_group_ids in secondary_levels
+            for pool_group_id in level_pool_group_ids
+        )
+        stats.secondary_retained_copy_num_blocks = sum(
+            level_stats[pool_group_id].retained_copies
             for level_stats, level_pool_group_ids in secondary_levels
             for pool_group_id in level_pool_group_ids
         )
