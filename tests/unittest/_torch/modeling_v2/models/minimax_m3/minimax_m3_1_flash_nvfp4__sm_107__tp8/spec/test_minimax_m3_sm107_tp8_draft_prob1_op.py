@@ -7,7 +7,6 @@ world 8 kernel takes 4 rows) and refuses 0 / 5, and the op refuses what its kern
 import pytest
 import torch
 
-from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import fake_ops
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.native import family_ops
 
 pytestmark = pytest.mark.skipif(
@@ -24,6 +23,9 @@ def _op():
 
 def test_fake_is_registered():
     _op()
+    # The family fakes register when family_ops() loads the library; importing them before that fails.
+    from tensorrt_llm._torch.modeling_v2.models.minimax_m3 import fake_ops
+
     assert torch._C._dispatch_has_kernel_for_dispatch_key(f"{fake_ops._NS}::{OP}", "Meta")
 
 
