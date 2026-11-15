@@ -4375,7 +4375,7 @@ class KVCacheManagerV2(BaseResourceManager):
         num_contexts: int,
         num_seqs: int,
     ) -> None:
-        device_copy_idx = self._copy_idx_to_device(copy_idx)
+        device_copy_idx = self._copy_idx_to_device(copy_idx)[:num_seqs]
         self._device_kv_cache_block_offsets_input.copy_(
             self.host_kv_cache_block_offsets,
             non_blocking=True,
@@ -4393,11 +4393,11 @@ class KVCacheManagerV2(BaseResourceManager):
             self._device_attention_op_layer_offsets,
             self._device_attention_op_scratch_pages,
             self._device_block_positions,
-            scratch_begs,
-            scratch_ends,
-            scratch_slots,
+            scratch_begs[:, :num_seqs],
+            scratch_ends[:, :num_seqs],
+            scratch_slots[:, :num_seqs],
             self._device_num_contexts,
-            self._device_attention_op_block_offsets_staging,
+            self._device_attention_op_block_offsets_staging[:, :num_seqs],
         )
         dst_tensor[: self.num_attention_op_pools, :num_seqs].copy_(
             self._device_attention_op_block_offsets_staging[
