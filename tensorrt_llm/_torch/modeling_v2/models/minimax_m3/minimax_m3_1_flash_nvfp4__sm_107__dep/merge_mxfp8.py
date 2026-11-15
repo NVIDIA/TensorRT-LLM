@@ -155,18 +155,15 @@ class DepMergeMxfp8LinearMethod(MXFP8LinearMethod):
         )
         if output is not None:
             return output if bias is None else output + bias
-        if (
-            self.tune_mxfp8_backends
-            and not is_torch_compiling()
-            and _linear._FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get()
-        ):
+        if self.uses_mxfp8_backend_autotune:
+            # Profiling is controlled by flashinfer_mxfp8_autotune.
             output = mxfp8_gemm_autotuned(
                 act_e4m3,
                 act_sf,
                 module.weight,
                 module.weight_scale,
                 module.dtype,
-                tune=_linear._FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get(),
+                module.mxfp8_allowed_backends,
             )
         else:
             use_flashinfer = self.backend == "flashinfer" or (

@@ -385,4 +385,4 @@ def _method_md5(module, class_name, method):
 def test_the_stock_forward_the_wrapper_mirrors_is_unchanged():
     """``_shared_forward`` is this forward's unfused branch (gate_up_proj, ``_apply_activation``, down_proj); a change
     here must be made there too."""
-    assert _method_md5(gated_mlp, "GatedMLP", "forward") == "a9eb05defbe85dda73308c70fc55caa2"
+    assert _method_md5(gated_mlp, "GatedMLP", "forward") == "07e556852486130d8c582f39d018dcdd"

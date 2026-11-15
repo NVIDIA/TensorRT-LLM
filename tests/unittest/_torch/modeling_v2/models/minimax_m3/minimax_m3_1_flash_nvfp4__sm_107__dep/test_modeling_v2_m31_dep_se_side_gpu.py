@@ -27,6 +27,7 @@ from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops import green_partitio
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.gemm import (
     mxfp8_cute_pinned_tactics as pin,
 )
+from tensorrt_llm._torch.custom_ops.mxfp8_gemm import MXFP8_DEFAULT_BACKENDS
 from tensorrt_llm._torch.modules import linear as _linear
 from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod
 
@@ -100,7 +101,7 @@ def _method(cls):
     method = MXFP8LinearMethod()
     method.__class__ = cls
     method.use_cutlass = True
-    method.backend = "trtllm"
+    method.backend = "auto"
     method.use_native_autotuner = False
     method._flashinfer_autotuned = False
     method.tune_mxfp8_backends = True
@@ -142,7 +143,12 @@ def test_the_partition_is_184_and_28_disjoint_and_cached(part):
 def test_the_side_stream_writes_the_main_streams_bits(part, name, rows, monkeypatch):
     (n, k), cls, slot = GEMMS[name]
     a_mx, a_sf, w_mx, w_sf = _operands(n, k, rows, seed=rows + n % 7)
-    module = types.SimpleNamespace(weight=w_mx, weight_scale=w_sf, dtype=torch.bfloat16)
+    module = types.SimpleNamespace(
+        weight=w_mx,
+        weight_scale=w_sf,
+        dtype=torch.bfloat16,
+        mxfp8_allowed_backends=MXFP8_DEFAULT_BACKENDS,
+    )
     x = torch.empty(rows, k, device="cuda", dtype=torch.bfloat16)
     seen = []
     real = pin.tactic_for
@@ -173,7 +179,12 @@ def test_a_graph_forks_the_shared_gemms_onto_the_side_and_replays_them(part, row
     for name in ("gate_up", "down"):
         (n, k), cls, slot = GEMMS[name]
         a_mx, a_sf, w_mx, w_sf = _operands(n, k, rows, seed=300 + rows + n % 5)
-        module = types.SimpleNamespace(weight=w_mx, weight_scale=w_sf, dtype=torch.bfloat16)
+        module = types.SimpleNamespace(
+            weight=w_mx,
+            weight_scale=w_sf,
+            dtype=torch.bfloat16,
+            mxfp8_allowed_backends=MXFP8_DEFAULT_BACKENDS,
+        )
         x = torch.empty(rows, k, device="cuda", dtype=torch.bfloat16)
         ops.append((cls, slot, module, x, a_mx, a_sf))
 
@@ -260,7 +271,12 @@ def test_the_routed_grid_stays_co_resident_beside_the_side_stream(part):
     for name in ("gate_up", "down"):
         (n, k), cls, slot = GEMMS[name]
         a_mx, a_sf, w_mx, w_sf = _operands(n, k, rows, seed=500 + n % 3)
-        module = types.SimpleNamespace(weight=w_mx, weight_scale=w_sf, dtype=torch.bfloat16)
+        module = types.SimpleNamespace(
+            weight=w_mx,
+            weight_scale=w_sf,
+            dtype=torch.bfloat16,
+            mxfp8_allowed_backends=MXFP8_DEFAULT_BACKENDS,
+        )
         x = torch.empty(rows, k, device="cuda", dtype=torch.bfloat16)
         ops.append((cls, slot, module, x, a_mx, a_sf))
     barrier.timed_out.zero_()

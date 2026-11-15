@@ -20,6 +20,7 @@ from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4_
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.gemm import (
     mxfp8_cute_pinned_tactics as pin,
 )
+from tensorrt_llm._torch.custom_ops.mxfp8_gemm import MXFP8_DEFAULT_BACKENDS
 from tensorrt_llm._torch.modules import linear as _linear
 from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod
 
@@ -64,7 +65,7 @@ def _method(cls):
     method = MXFP8LinearMethod()
     method.__class__ = cls
     method.use_cutlass = True
-    method.backend = "trtllm"
+    method.backend = "auto"
     method.use_native_autotuner = False
     method._flashinfer_autotuned = False
     method.tune_mxfp8_backends = True
@@ -86,7 +87,12 @@ def _apply(cls, slot, module, x, a_mx, a_sf):
 def test_on_and_off_write_the_same_bits(name, rows, monkeypatch):
     (n, k), cls, slot = GEMMS[name]
     a_mx, a_sf, w_mx, w_sf = _operands(n, k, rows, seed=rows + n % 7)
-    module = types.SimpleNamespace(weight=w_mx, weight_scale=w_sf, dtype=torch.bfloat16)
+    module = types.SimpleNamespace(
+        weight=w_mx,
+        weight_scale=w_sf,
+        dtype=torch.bfloat16,
+        mxfp8_allowed_backends=MXFP8_DEFAULT_BACKENDS,
+    )
     x = torch.empty(rows, k, device="cuda", dtype=torch.bfloat16)
     seen = []
     real = pin.tactic_for
@@ -118,7 +124,12 @@ def test_on_and_off_write_the_same_bits(name, rows, monkeypatch):
 def test_a_graph_replays_the_engaged_gemm_bit_for_bit(name, rows, monkeypatch):
     (n, k), cls, slot = GEMMS[name]
     a_mx, a_sf, w_mx, w_sf = _operands(n, k, rows, seed=100 + rows)
-    module = types.SimpleNamespace(weight=w_mx, weight_scale=w_sf, dtype=torch.bfloat16)
+    module = types.SimpleNamespace(
+        weight=w_mx,
+        weight_scale=w_sf,
+        dtype=torch.bfloat16,
+        mxfp8_allowed_backends=MXFP8_DEFAULT_BACKENDS,
+    )
     x = torch.empty(rows, k, device="cuda", dtype=torch.bfloat16)
     monkeypatch.setattr(shared_mxfp8, "DEP_SHARED_PIN", True)
     eager = _apply(cls, slot, module, x, a_mx, a_sf).clone()

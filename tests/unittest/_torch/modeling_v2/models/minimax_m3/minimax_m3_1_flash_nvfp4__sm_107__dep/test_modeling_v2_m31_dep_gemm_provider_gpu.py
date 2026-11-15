@@ -23,6 +23,7 @@ from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4_
 from tensorrt_llm._torch.modeling_v2.models.minimax_m3.ops.gemm import (
     mxfp8_cute_pinned_tactics as pin,
 )
+from tensorrt_llm._torch.custom_ops.mxfp8_gemm import MXFP8_DEFAULT_BACKENDS
 from tensorrt_llm._torch.modules import linear as _linear
 from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod
 
@@ -118,7 +119,7 @@ def _method():
     method = MXFP8LinearMethod()
     method.__class__ = merge_mxfp8.DepMergeMxfp8LinearMethod
     method.use_cutlass = True
-    method.backend = "trtllm"
+    method.backend = "auto"
     method.use_native_autotuner = False
     method._flashinfer_autotuned = False
     method.tune_mxfp8_backends = True
@@ -133,7 +134,12 @@ def test_the_hand_off_gemm_takes_the_provider_where_it_routes(rows, provider, mo
     monkeypatch.setattr(merge_mxfp8, "DEP_PROJ_CUTE", True)
     (n, k), _ = ROUTED["o_proj"]
     a_mx, a_sf, w_mx, w_sf = _operands(n, k, rows, seed=11)
-    module = types.SimpleNamespace(weight=w_mx, weight_scale=w_sf, dtype=torch.bfloat16)
+    module = types.SimpleNamespace(
+        weight=w_mx,
+        weight_scale=w_sf,
+        dtype=torch.bfloat16,
+        mxfp8_allowed_backends=MXFP8_DEFAULT_BACKENDS,
+    )
     x = torch.empty(rows, k, device="cuda", dtype=torch.bfloat16)
     # The slot's previous hand-off comes back at teardown even if setup or apply raises before consuming this one.
     monkeypatch.setattr(merge_mxfp8.SLOT, "pending", None)

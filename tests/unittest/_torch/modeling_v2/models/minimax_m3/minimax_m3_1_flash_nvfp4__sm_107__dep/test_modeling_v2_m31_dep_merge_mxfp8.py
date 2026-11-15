@@ -220,6 +220,7 @@ _MODULE = types.SimpleNamespace(
     weight_scale=torch.empty(512, dtype=torch.uint8),
     dtype=torch.bfloat16,
     _mxfp8_alpha=torch.ones(1),
+    mxfp8_allowed_backends=("cutlass", "cute-dsl"),
 )
 
 
@@ -239,12 +240,13 @@ def test_apply_in_decode_graphs_runs_the_tuned_gemm_half_on_the_hand_off(monkeyp
     x, (q8, sf) = _published()
     token = _linear._FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.set(True)
     try:
-        out = _method(tune_mxfp8_backends=True).apply(_MODULE, x, None)
+        out = _method(tune_mxfp8_backends=True, backend="auto").apply(_MODULE, x, None)
     finally:
         _linear._FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.reset(token)
     ((a, kw),) = seen
     assert a[0] is q8 and a[1] is sf and a[2] is _MODULE.weight and a[3] is _MODULE.weight_scale
-    assert a[4] is torch.bfloat16 and kw == dict(tune=False) and out.shape == (1,)
+    assert a[4] is torch.bfloat16 and a[5] is _MODULE.mxfp8_allowed_backends and kw == {}
+    assert out.shape == (1,)
     assert merge_mxfp8.SLOT.pending is None
 
 
@@ -264,7 +266,7 @@ def test_where_the_pin_engages_the_hand_off_runs_the_pinned_cute_tactic(monkeypa
     monkeypatch.setattr(merge_mxfp8, "mxfp8_gemm_autotuned", lambda *a, **kw: tuned.append(a))
     x, (q8, sf) = _published()
     bias = torch.full((2,), 3.0)
-    out = _decode_graph_apply(_method(tune_mxfp8_backends=True), _MODULE, x, bias)
+    out = _decode_graph_apply(_method(tune_mxfp8_backends=True, backend="auto"), _MODULE, x, bias)
     ((a),) = pinned
     assert a == (q8, sf, _MODULE.weight, _MODULE.weight_scale, torch.bfloat16)
     assert tuned == [] and torch.equal(out, torch.full((2,), 4.0))
@@ -281,7 +283,7 @@ def test_unengaged_or_killed_the_hand_off_keeps_the_tuned_gemm(monkeypatch, kill
         merge_mxfp8, "mxfp8_gemm_autotuned", lambda *a, **kw: tuned.append(a) or torch.zeros(1)
     )
     x, (q8, sf) = _published()
-    _decode_graph_apply(_method(tune_mxfp8_backends=True), _MODULE, x)
+    _decode_graph_apply(_method(tune_mxfp8_backends=True, backend="auto"), _MODULE, x)
     assert len(pinned) == (0 if killed else 1) and len(tuned) == 1 and tuned[0][0] is q8
 
 
@@ -354,4 +356,4 @@ def _source_md5(cls, name):
 
 def test_the_stock_apply_the_hand_off_mirrors_is_unchanged():
     """DepMergeMxfp8LinearMethod.apply copies this apply's GEMM half; a change here must be made there too."""
-    assert _source_md5(MXFP8LinearMethod, "apply") == "075a5b9401835cbb6e0f5b52cf0535dd"
+    assert _source_md5(MXFP8LinearMethod, "apply") == "c64903a375fbee30523137cc5e543f72"
