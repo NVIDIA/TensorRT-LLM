@@ -26,7 +26,7 @@ POLL_NS = int(_K.get("H9_RH_POLL_NS", "64"))
 DELAY_NS = int(_K.get("H9_RH_DELAY_NS", "150"))  # read at import; lbh reads the same env
 EPS = 1e-6
 BF16_QUARTER = 0x3E80  # bf16(0.25): seed weight of the placeholder routes
-C1_PORTS = ("fused", "port_h9r1", "port_h9r2", "port_h9r3", "port_h9r4")  # r4: G-PF (r0 + pf_l2)
+C1_PORTS = ("fused",)
 _st = {}
 _TRACK = []  # (arm, layer_idx, t, engine state, post tdbg or None)
 _VALID = []  # verify results of the learning arms
@@ -202,7 +202,7 @@ def _c1_port(want=C1_PORTS):
     name = os.path.basename(os.path.normpath(dl.DL_PORT))
     if name not in want:
         raise RuntimeError(
-            f"h9 hoist: needs H4_DL_PORT=$C/H9-megakernel/w6/{'|'.join(want)} (got {dl.DL_PORT})"
+            f"hoist: the fused engine directory must be one of {'|'.join(want)} (got {dl.DL_PORT})"
         )
     return dl
 

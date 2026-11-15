@@ -4,7 +4,6 @@
 uGPU expert shards."""
 
 import importlib
-import importlib.util
 import os
 import sys
 
@@ -15,16 +14,17 @@ DL_PORT = require("fused_engine_dir")
 _st = {}
 
 
+_FUSED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fused")
+
+
 def _op_dl():
+    """The fused engine's host module, imported as the in-tree ``fused`` package (its modules import relative to it)."""
     if "op" not in _st:
-        pkg = DL_PORT
-        spec = importlib.util.spec_from_file_location(
-            "m3moe_dl", os.path.join(pkg, "__init__.py"), submodule_search_locations=[pkg]
-        )
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules["m3moe_dl"] = mod
-        spec.loader.exec_module(mod)
-        _st["op"] = importlib.import_module("m3moe_dl.host")
+        if os.path.realpath(DL_PORT) != os.path.realpath(_FUSED_DIR):
+            raise ValueError(
+                f"fused_engine_dir must be the in-tree fused engine package {_FUSED_DIR} (got {DL_PORT})"
+            )
+        _st["op"] = importlib.import_module(f"{__package__}.fused.host")
     return _st["op"]
 
 

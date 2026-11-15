@@ -42,7 +42,7 @@ def _check(blk, arm):
     if not hasattr(mod, "SH_TRIG") or int(mod.SH_TRIG) != int(_cfg()["sh_trig"]):
         raise RuntimeError(
             f"h9 shtrig {arm} L{blk.layer_idx}: engine module SH_TRIG={getattr(mod, 'SH_TRIG', None)}: "
-            "H4_DL_PORT is not w6/shtrig/port_h9r0?"
+            "the fused engine directory does not carry the shared-trigger build"
         )
 
 

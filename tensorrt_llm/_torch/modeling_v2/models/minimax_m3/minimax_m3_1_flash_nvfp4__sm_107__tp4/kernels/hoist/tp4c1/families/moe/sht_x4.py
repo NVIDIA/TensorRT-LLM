@@ -70,7 +70,7 @@ def runtime_knobs(p: ShtX4Params, llk) -> dict:
     return {
         **C.base_knobs(llk),
         **C.g3_knobs(llk),
-        "H4_DL_PORT": C.engine_dir("fused"),  # hoist checks the basename (port_h9r0)
+        "H4_DL_PORT": C.engine_dir("fused"),  # the hoist checks the directory basename
         "H9_SHT_CFG": C.jdump({"sh_trig": p.sh_trig}, compact=True),
     }
 

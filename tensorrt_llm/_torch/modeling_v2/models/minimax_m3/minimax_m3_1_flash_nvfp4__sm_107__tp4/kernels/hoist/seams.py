@@ -18,7 +18,7 @@ Every seam replaces process plumbing, never arithmetic or launch order:
 7. ``fused_die_local_host._dev_b2lag``: by default (B2LAG, default ON) the measured HYB setting
    (M3LL_DEV_MOE_B2LAG=1: b2buf 2, stages 6, lag 6), without an os.environ read. TRTLLM_M31_DISABLE_TP4WC_B2LAG=1
    makes it return None, the reference shipped 5-8 row schedule (b2buf 1, stages 7, lag = fused_phase_lag).
-8. ``m3moe_dl.host._ENGINE_PATH``: the family's ``kernels/m3ll/moe_engine_kernel.py``, not a second copy.
+8. the fused engine host's ``_ENGINE_PATH``: the family's ``kernels/m3ll/moe_engine_kernel.py``, not a second copy.
 9. ``H9_RH_DEADLINE_NS``: the post's rx deadline is the hang cap (knob), not the reference 2 s.
 10. ``route_warp_tp4_host.ptrig_on``: False, the reference default (the o_proj's producer trigger after its push and
     no end-of-CTA wait in the post), without the reference's os.environ read of its developer opt-in.
