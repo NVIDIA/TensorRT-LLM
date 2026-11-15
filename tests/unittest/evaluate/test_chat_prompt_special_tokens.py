@@ -20,6 +20,7 @@ chat prompt with ``add_special_tokens=False``; the evaluators must do the same,
 or the tokenizer puts a second BOS in front of the template's.
 """
 
+import json
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -27,7 +28,7 @@ import datasets
 import pytest
 
 from tensorrt_llm.evaluate.interface import Evaluator
-from tensorrt_llm.evaluate.lm_eval import LmEvalEvaluator, LmEvalWrapper
+from tensorrt_llm.evaluate.lm_eval import LmEvalEvaluator, LmEvalWrapper, LongBenchV1
 from tensorrt_llm.evaluate.nemo_skills_eval import NemoSkillsEvaluator
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -41,7 +42,16 @@ class _ChatTemplateTokenizer:
 
     chat_template = "{{ bos_token }}{% for message in messages %}...{% endfor %}"
     name_or_path = "test/chat-model"
+    bos_token_id = 1
     eos_token_id = 2
+
+    def encode(self, text, add_special_tokens=True):
+        """One id per character, with BOS as id 1; adds BOS like the Llama tokenizers."""
+        ids = [self.bos_token_id] if add_special_tokens else []
+        if text.startswith(_BOS):
+            ids.append(self.bos_token_id)
+            text = text[len(_BOS) :]
+        return ids + [ord(c) for c in text]
 
     def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, **kwargs):
         assert not tokenize
@@ -61,6 +71,9 @@ class _RecordingLLM:
         self.requests.append((prompt, sampling_params))
         output = SimpleNamespace(
             prompt=prompt,
+            prompt_token_ids=self.tokenizer.encode(
+                prompt, add_special_tokens=sampling_params.add_special_tokens
+            ),
             outputs=[SimpleNamespace(text=next(self._responses, ""), token_ids=[1, 2])],
         )
         return SimpleNamespace(result=lambda: output)
@@ -90,6 +103,24 @@ def test_evaluator_tokenizes_chat_prompts_without_special_tokens(apply_chat_temp
     assert [params.max_tokens for _, params in llm.requests] == [4, 16]
     assert sampling_params.add_special_tokens is True
     assert sampling_params.max_tokens == 16
+
+
+def test_evaluator_dumps_the_token_ids_the_engine_ran(tmp_path):
+    llm = _RecordingLLM()
+
+    _ToyEvaluator(apply_chat_template=True, output_dir=str(tmp_path)).evaluate(
+        llm, SamplingParams(max_tokens=16)
+    )
+
+    with open(tmp_path / "dumped_ids.json") as f:
+        dumped = [json.loads(line)["input_ids"] for line in f]
+    engine_ids = [
+        llm.tokenizer.encode(prompt, add_special_tokens=params.add_special_tokens)
+        for prompt, params in llm.requests
+    ]
+    assert dumped == engine_ids
+    # One BOS, written by the chat template.
+    assert all(ids[:2] == [1, ord("[")] for ids in dumped)
 
 
 _DOCS = [
@@ -181,6 +212,43 @@ def test_lm_eval_evaluator_passes_chat_template_setting_to_wrapper(apply_chat_te
     ):
         evaluator.evaluate(_RecordingLLM())
 
+    assert len(wrappers) == 1
+    assert wrappers[0].add_special_tokens is not apply_chat_template
+
+
+@pytest.mark.parametrize("apply_chat_template", [False, True])
+def test_longbench_v1_passes_chat_template_setting_to_wrapper(apply_chat_template):
+    evaluator = LongBenchV1.__new__(LongBenchV1)
+    evaluator.__dict__.update(
+        MULTIMODAL=False,
+        task_name="longbench",
+        task_dict={},
+        num_samples=None,
+        apply_chat_template=apply_chat_template,
+        fewshot_as_multiturn=False,
+        system_prompt=None,
+        chat_template_kwargs=None,
+        log_samples=False,
+        output_path=None,
+        output_dir=None,
+    )
+    wrappers = []
+
+    def fake_evaluate(lm, **kwargs):
+        wrappers.append(lm)
+        return {
+            "results": {},
+            "groups": {"longbench_single": {"score,none": 0.5}},
+            "group_subtasks": {"longbench": ["longbench_single"]},
+        }
+
+    with (
+        patch("lm_eval.evaluate", fake_evaluate),
+        patch("lm_eval.utils.make_table", return_value=""),
+    ):
+        score = evaluator.evaluate(_RecordingLLM())
+
+    assert score == pytest.approx(50.0)
     assert len(wrappers) == 1
     assert wrappers[0].add_special_tokens is not apply_chat_template
 

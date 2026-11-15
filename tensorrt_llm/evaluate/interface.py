@@ -183,7 +183,11 @@ def dump_inference_results(output_dir: str, results: List[dict],
         output_ids = result.outputs[0].token_ids
         output_text = result.outputs[0].text.strip()
         input_text = result.prompt.strip()
-        input_ids = tokenizer.encode(input_text)
+        # The ids the engine ran. Re-encoding the prompt text can give other
+        # ids, e.g. an extra BOS when the request set add_special_tokens=False.
+        input_ids = result.prompt_token_ids
+        if input_ids is None:
+            input_ids = tokenizer.encode(input_text)
         results_list.append({
             "task_id": task_id,
             "input_ids": input_ids,
