@@ -550,6 +550,8 @@ MpiComm& MpiComm::mutableSession()
 MpiComm& MpiComm::mutableLocalSession()
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+    // Runtime initialization can request the local session; finish it before taking the static initializer's guard.
+    initialize();
     static MpiComm localSession = initLocalSession();
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return localSession;
