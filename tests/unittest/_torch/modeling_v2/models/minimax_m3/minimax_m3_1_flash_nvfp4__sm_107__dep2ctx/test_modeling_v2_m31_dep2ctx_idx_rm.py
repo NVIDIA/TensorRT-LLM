@@ -91,14 +91,16 @@ class _Wrapper:
     def run_scores(self, q, k):
         H = self.num_heads
         qf, kf = q.float(), k.float()
+        rows = self.scores.unflatten(0, (self.total_q, H))  # [T, H, cols] view
         for r, kv in enumerate(self.seq_lens):
             q0, q1 = self.cu_q[r], self.cu_q[r + 1]
-            for t in range(q0, q1):
-                pos = kv - (q1 - q0) + (t - q0)
-                for p in range(pos // PAGE):  # historical pages: all their tokens precede pos
-                    page = int(self.block_table[r, p])
-                    s = (qf[t] @ kf[page].T).amax(dim=1)  # [H]
-                    self.scores[t * H : (t + 1) * H, p] = s
+            # Token t scores its historical pages p < pos // PAGE: all their tokens precede its position pos.
+            historical = (kv - (q1 - q0) + torch.arange(q1 - q0)) // PAGE
+            for p in range(int(historical.max()) if q1 > q0 else 0):
+                page = int(self.block_table[r, p])
+                takes = historical > p
+                s = (qf[q0:q1][takes] @ kf[page].T).amax(dim=-1)  # [tokens, H]
+                rows[q0:q1][takes, :, p] = s
         return self.scores
 
 
