@@ -162,6 +162,7 @@ disable_ubi_repos_rockylinux() {
 }
 
 install_python_rockylinux() {
+  enable_ubi_baseos_rockylinux
   PYTHON_VERSION=$1
   PYTHON_MAJOR="3"
   PYTHON_URL="https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tgz"
