@@ -14,11 +14,10 @@
 # limitations under the License.
 
 import os
-import subprocess
 
 import pytest
 
-from .openai_server import RemoteOpenAIServer
+from .openai_server import RemoteOpenAIServer, run_command_with_output
 
 __extra_import_path__ = ["..", "~/tests/unittest"]
 from test_llm import get_model_path
@@ -86,12 +85,6 @@ def test_trtllm_serve_benchmark(server: RemoteOpenAIServer, benchmark_root: str,
         "1.0",
     ]
 
-    # CalledProcessError will be raised if any errors occur
-    result = subprocess.run(benchmark_cmd,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            text=True,
-                            check=True,
-                            timeout=3600)
+    result = run_command_with_output(benchmark_cmd, timeout=3600)
     assert result.returncode == 0
-    assert "Serving Benchmark Result" in result.stdout
+    assert "Serving Benchmark Result" in result.stdout, result.stdout

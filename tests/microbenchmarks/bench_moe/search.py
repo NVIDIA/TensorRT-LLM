@@ -154,9 +154,6 @@ def _check_backend_can_implement(
             )
         if verdict.eligible:
             return True, None
-        # The last candidate's reason, not the first: without the opt-in flag
-        # every FlashInfer leaf rejects for the flag alone, which says nothing
-        # about why the configuration is unrunnable.
         reason = f"{verdict.reject_reason.value}: {verdict.detail}"
     return False, reason
 

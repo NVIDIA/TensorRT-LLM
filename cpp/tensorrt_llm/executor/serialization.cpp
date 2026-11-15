@@ -1418,8 +1418,14 @@ KvCacheStats Serialization::deserializeKvCacheStats(std::istream& is)
     auto missedBlocks = su::deserialize<SizeType32>(is);
     auto cacheHitRate = su::deserialize<float>(is);
 
+    auto hostSlabBytes = su::deserialize<size_t>(is);
+    auto numPageTableReuses = su::deserialize<SizeType32>(is);
+    auto numPageTableRowUpdates = su::deserialize<SizeType32>(is);
+    auto numPageTableFullBuilds = su::deserialize<SizeType32>(is);
+    auto pageTableFullBuildMs = su::deserialize<double>(is);
     return KvCacheStats{maxNumBlocks, freeNumBlocks, usedNumBlocks, tokensPerBlock, allocTotalBlocks, allocNewBlocks,
-        reusedBlocks, missedBlocks, cacheHitRate};
+        reusedBlocks, missedBlocks, cacheHitRate, hostSlabBytes, numPageTableReuses, numPageTableRowUpdates,
+        numPageTableFullBuilds, pageTableFullBuildMs};
 }
 
 void Serialization::serialize(KvCacheStats const& kvCacheStats, std::ostream& os)
@@ -1433,6 +1439,11 @@ void Serialization::serialize(KvCacheStats const& kvCacheStats, std::ostream& os
     su::serialize(kvCacheStats.reusedBlocks, os);
     su::serialize(kvCacheStats.missedBlocks, os);
     su::serialize(kvCacheStats.cacheHitRate, os);
+    su::serialize(kvCacheStats.hostSlabBytes, os);
+    su::serialize(kvCacheStats.numPageTableReuses, os);
+    su::serialize(kvCacheStats.numPageTableRowUpdates, os);
+    su::serialize(kvCacheStats.numPageTableFullBuilds, os);
+    su::serialize(kvCacheStats.pageTableFullBuildMs, os);
 }
 
 size_t Serialization::serializedSize(KvCacheStats const& kvCacheStats)
@@ -1447,6 +1458,11 @@ size_t Serialization::serializedSize(KvCacheStats const& kvCacheStats)
     totalSize += su::serializedSize(kvCacheStats.reusedBlocks);
     totalSize += su::serializedSize(kvCacheStats.missedBlocks);
     totalSize += su::serializedSize(kvCacheStats.cacheHitRate);
+    totalSize += su::serializedSize(kvCacheStats.hostSlabBytes);
+    totalSize += su::serializedSize(kvCacheStats.numPageTableReuses);
+    totalSize += su::serializedSize(kvCacheStats.numPageTableRowUpdates);
+    totalSize += su::serializedSize(kvCacheStats.numPageTableFullBuilds);
+    totalSize += su::serializedSize(kvCacheStats.pageTableFullBuildMs);
     return totalSize;
 }
 
@@ -1498,9 +1514,21 @@ InflightBatchingStats Serialization::deserializeInflightBatchingStats(std::istre
     auto numQueuedGenRequests = su::deserialize<SizeType32>(is);
     auto numQueuedGenKvTokens = su::deserialize<SizeType32>(is);
     auto numPausedKvTokens = su::deserialize<SizeType32>(is);
+    auto numSkippedForwardCtxChunks = su::deserialize<SizeType32>(is);
+    auto numDroppedCtxChunks = su::deserialize<SizeType32>(is);
+    auto numRevertedCtxTokens = su::deserialize<SizeType32>(is);
+    auto numDeferredGenReceives = su::deserialize<SizeType32>(is);
+    auto genReceiveReadyWaitMs = su::deserialize<double>(is);
+    auto numGenInitCapHolds = su::deserialize<SizeType32>(is);
+    auto numGenInitTransferBudgetHolds = su::deserialize<SizeType32>(is);
+    auto numCtxDecoderHoldPasses = su::deserialize<SizeType32>(is);
+    auto numCtxDecoderHeldRequests = su::deserialize<SizeType32>(is);
     return InflightBatchingStats{numScheduledRequests, numContextRequests, numGenRequests, numPausedRequests,
         numCtxTokens, microBatchId, avgNumDecodedTokensPerIter, numCtxKvTokens, numGenKvTokens,
-        numQueuedContextRequests, numQueuedCtxTokens, numQueuedGenRequests, numQueuedGenKvTokens, numPausedKvTokens};
+        numQueuedContextRequests, numQueuedCtxTokens, numQueuedGenRequests, numQueuedGenKvTokens, numPausedKvTokens,
+        numSkippedForwardCtxChunks, numDroppedCtxChunks, numRevertedCtxTokens, numDeferredGenReceives,
+        genReceiveReadyWaitMs, numGenInitCapHolds, numGenInitTransferBudgetHolds, numCtxDecoderHoldPasses,
+        numCtxDecoderHeldRequests};
 }
 
 void Serialization::serialize(InflightBatchingStats const& inflightBatchingStats, std::ostream& os)
@@ -1519,6 +1547,15 @@ void Serialization::serialize(InflightBatchingStats const& inflightBatchingStats
     su::serialize(inflightBatchingStats.numQueuedGenRequests, os);
     su::serialize(inflightBatchingStats.numQueuedGenKvTokens, os);
     su::serialize(inflightBatchingStats.numPausedKvTokens, os);
+    su::serialize(inflightBatchingStats.numSkippedForwardCtxChunks, os);
+    su::serialize(inflightBatchingStats.numDroppedCtxChunks, os);
+    su::serialize(inflightBatchingStats.numRevertedCtxTokens, os);
+    su::serialize(inflightBatchingStats.numDeferredGenReceives, os);
+    su::serialize(inflightBatchingStats.genReceiveReadyWaitMs, os);
+    su::serialize(inflightBatchingStats.numGenInitCapHolds, os);
+    su::serialize(inflightBatchingStats.numGenInitTransferBudgetHolds, os);
+    su::serialize(inflightBatchingStats.numCtxDecoderHoldPasses, os);
+    su::serialize(inflightBatchingStats.numCtxDecoderHeldRequests, os);
 }
 
 size_t Serialization::serializedSize(InflightBatchingStats const& inflightBatchingStats)
@@ -1538,6 +1575,15 @@ size_t Serialization::serializedSize(InflightBatchingStats const& inflightBatchi
     totalSize += su::serializedSize(inflightBatchingStats.numQueuedGenRequests);
     totalSize += su::serializedSize(inflightBatchingStats.numQueuedGenKvTokens);
     totalSize += su::serializedSize(inflightBatchingStats.numPausedKvTokens);
+    totalSize += su::serializedSize(inflightBatchingStats.numSkippedForwardCtxChunks);
+    totalSize += su::serializedSize(inflightBatchingStats.numDroppedCtxChunks);
+    totalSize += su::serializedSize(inflightBatchingStats.numRevertedCtxTokens);
+    totalSize += su::serializedSize(inflightBatchingStats.numDeferredGenReceives);
+    totalSize += su::serializedSize(inflightBatchingStats.genReceiveReadyWaitMs);
+    totalSize += su::serializedSize(inflightBatchingStats.numGenInitCapHolds);
+    totalSize += su::serializedSize(inflightBatchingStats.numGenInitTransferBudgetHolds);
+    totalSize += su::serializedSize(inflightBatchingStats.numCtxDecoderHoldPasses);
+    totalSize += su::serializedSize(inflightBatchingStats.numCtxDecoderHeldRequests);
     return totalSize;
 }
 

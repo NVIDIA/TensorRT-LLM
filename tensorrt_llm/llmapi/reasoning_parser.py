@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
 import json
 from abc import ABC, abstractmethod
 from collections.abc import KeysView
@@ -723,6 +724,7 @@ MODEL_TYPE_TO_REASONING_PARSER: dict[str, str] = {
     "kimi_k3": "kimi_k3",
     "minimax_m3": "minimax_m3",
     "minimax_m3_vl": "minimax_m3",
+    "muse_spark": "musespark",
 }
 
 _QWEN3_MODEL_TYPES = frozenset({
@@ -1390,3 +1392,23 @@ class KimiK3ReasoningParser(BaseReasoningParser):
                 return ReasoningParserResult(content=remaining)
         # Header fragments and structural-gap text are dropped.
         return ReasoningParserResult()
+
+
+# Model-specific parsers live in tensorrt_llm.llmapi.reasoning; importing a
+# module runs its register_reasoning_parser decorators. It is imported by
+# module rather than by name: a model module imported first imports this one,
+# and a from-import would then ask the half-initialized model module for a
+# class it has not defined yet. The classes are re-exported lazily below so
+# callers can import every parser from this module.
+_MODEL_REASONING_PARSERS = {
+    "MuseSparkReasoningParser": "tensorrt_llm.llmapi.reasoning.musespark",
+}
+for _module in set(_MODEL_REASONING_PARSERS.values()):
+    importlib.import_module(_module)
+
+
+def __getattr__(name: str) -> Any:
+    module = _MODEL_REASONING_PARSERS.get(name)
+    if module is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    return getattr(importlib.import_module(module), name)

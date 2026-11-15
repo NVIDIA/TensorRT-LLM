@@ -159,6 +159,8 @@ class Cosmos3TransferConfig:
     control_guidance: float = 1.0
     control_guidance_interval: tuple[float, float] | None = None
     flow_shift: float | None = None
+    # Whether ``flow_shift`` was set by the request rather than a hint preset.
+    flow_shift_explicit: bool = False
     num_video_frames_per_chunk: int = 93
     num_conditional_frames: int = 1
     max_frames: int = 5000
@@ -298,6 +300,7 @@ def resolve_transfer_config(
             _extra_or_default(extra_params, "control_guidance_interval", None)
         ),
         flow_shift=_extra_or_default(extra_params, "flow_shift", None),
+        flow_shift_explicit=extra_params.get("flow_shift") is not None,
         num_video_frames_per_chunk=_extra_or_default(
             extra_params,
             "num_video_frames_per_chunk",

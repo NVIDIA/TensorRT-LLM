@@ -13,6 +13,9 @@ context_servers:
   pipeline_parallel_size: 1
   enable_attention_dp: true
   disable_overlap_scheduler: true
+  attention_dp_config:
+    kv_cache_routing_new_conv_placement: least_prefill
+    kv_cache_routing_conversation_affinity: true
   kv_cache_config:
     use_kv_cache_manager_v2: true
   cache_transceiver_config:
@@ -24,8 +27,13 @@ generation_servers:
   pipeline_parallel_size: 1
   enable_attention_dp: true
   disable_overlap_scheduler: false
+  enable_client_io_during_gpu_wait: true
+  gen_prompt_tail_tokens: 256
+  scheduler_config:
+    max_gen_init_admissions_per_pass: 1
   kv_cache_config:
     use_kv_cache_manager_v2: true
+    enable_block_reuse: false
   cache_transceiver_config:
     backend: NIXL
     transceiver_runtime: PYTHON

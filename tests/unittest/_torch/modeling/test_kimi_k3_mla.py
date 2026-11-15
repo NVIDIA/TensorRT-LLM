@@ -58,17 +58,22 @@ def _checkpoint_weights(reference: KimiMLAAttention, fp8: bool) -> dict:
     return projections
 
 
-def _assert_matches_reference(actual: torch.Tensor, expected: torch.Tensor, fp8: bool) -> None:
+def _assert_matches_reference(
+    actual: torch.Tensor, expected: torch.Tensor, fp8: bool, fp8_cache: bool = False
+) -> None:
     # DeepGEMM weight resmoothing and activation rounding compound across the
     # A/B projections and absorption (about 7% relative L2 on this fixture).
     # Bound both elementwise outliers and the overall error relative to the signal.
-    atol, rtol = (0.1, 0.1) if fp8 else (0.005, 0.03)
+    atol, rtol = (0.1, 0.1) if fp8 or fp8_cache else (0.005, 0.03)
     torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
     relative_l2 = (
         torch.linalg.vector_norm(actual.float() - expected.float())
         / torch.linalg.vector_norm(expected.float()).clamp_min(1e-8)
     ).item()
-    assert relative_l2 < (0.08 if fp8 else 0.01), f"relative L2 error: {relative_l2}"
+    # Combining FP8 projections with FP8 KV reaches 8.03% even without CP
+    # on the six-head fixture. Keep the weight-only bound unchanged.
+    limit = 0.09 if fp8 and fp8_cache else (0.08 if fp8 or fp8_cache else 0.01)
+    assert relative_l2 < limit, f"relative L2 error: {relative_l2}"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

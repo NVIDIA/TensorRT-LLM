@@ -345,6 +345,7 @@ def nvfp4_gemm_perf_test(
     from tensorrt_llm._torch.autotuner import AutoTuner
     AutoTuner.get().print_statistics()
 
+    output_ref = None
     if test_ref:
         with nvtx.annotate(
                 f"ref tune, m={SEQ_LEN}, k={HIDDEN_SIZE}, n={OUTPUT_SIZE}",
