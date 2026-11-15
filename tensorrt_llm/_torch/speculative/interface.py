@@ -57,6 +57,7 @@ from ..pyexecutor.sampler.ops.vanilla import (GREEDY_TEMPERATURE_THRESHOLD,
                                               greedy_search_sampling_batch)
 from ..pyexecutor.sampler.sampler_common import request_random_seed
 from ..pyexecutor.sampler.watermark import WatermarkSpecState
+from . import minimum_length as minimum_length_ops
 from .block_verification import block_verify, counter_uniforms
 from .fused_accept import (MAX_DRAFT_LEN, fused_strict_accept,
                            sample_and_strict_accept)
@@ -869,6 +870,8 @@ class SpecMetadata:
     # Whether the occurrence penalties are enabled (deploy-time; from
     # DecodingBaseConfig.enable_penalty). Gates the occurrence workspace allocation.
     enable_penalty: bool = False
+    supports_min_tokens: bool = False
+    minimum_length_state: Optional[minimum_length_ops.MinimumLengthState] = None
     # Text watermarking: set from TorchLlmArgs.watermark_config, None when it is off. Its device
     # state is allocated by prepare_watermark_buffers.
     watermark: Optional[WatermarkSpecState] = None
@@ -1554,6 +1557,7 @@ class SpecMetadata:
         self.prepare_rejection_sampling_buffers()
         self.prepare_penalty_buffers()
         self.prepare_watermark_buffers()
+        minimum_length_ops.prepare(self)
         cuda_graph_metadata = copy.copy(self)
         cuda_graph_metadata.is_cuda_graph = True
         cuda_graph_metadata.max_num_requests = max_batch_size
@@ -1648,8 +1652,10 @@ class SpecMetadata:
             # buffer's real last row), not max_num_requests, which a graph copy
             # shrinks to the bucket size and would alias a real request's slot.
             per_request_slot_ids.append(
-                request.py_seq_slot if request.
-                py_seq_slot is not None else self.dummy_slot_row)
+                minimum_length_ops.request_slot(request, self.dummy_slot_row)
+                if minimum_length_ops.enabled(self) else (
+                    request.py_seq_slot if request.
+                    py_seq_slot is not None else self.dummy_slot_row))
 
         # Used in the CUDA graph key to pick the argmax / advanced variant.
         # All-greedy iff EVERY request is greedy -- note a non-greedy request
@@ -1737,6 +1743,7 @@ class SpecMetadata:
         self.prepare_penalty_buffers()
         # And the watermark's per-slot context state. No-op unless watermark_config is set.
         self.prepare_watermark_buffers()
+        minimum_length_ops.prepare(self)
 
         if self.temperatures is None:
             # Ensures determinism across ranks.
@@ -1793,7 +1800,8 @@ class SpecMetadata:
         # draft-sampler time to scatter draft probs by slot. The penalties need the
         # same table to map logits rows back to their slot, so they enable it too.
         if (self.use_rejection_sampling or self.enable_penalty
-                or self.watermark_ready) and self.batch_slot_ids is not None:
+                or self.watermark_ready or minimum_length_ops.enabled(self)
+            ) and self.batch_slot_ids is not None:
             self.batch_slot_ids[:len(per_request_slot_ids)].copy_(
                 torch.tensor(per_request_slot_ids,
                              dtype=torch.long,
@@ -1807,6 +1815,7 @@ class SpecMetadata:
         self._populate_penalty_params(requests)
         # Likewise the watermark: a greedy request is simply not flagged.
         self._populate_watermark_params(requests)
+        minimum_length_ops.populate(self, requests)
 
         # All-greedy: sampler takes the argmax branch (and rejection sampling
         # is also bypassed for all-greedy), so the per-token buffers are never
@@ -2413,13 +2422,26 @@ class SpecWorkerBase(nn.Module, ABC):
 
         self._execute_guided_decoder_if_present(logits)
 
-        if _watermark_active(spec_metadata):
-            target_tokens, watermark_plans = self._sample_tokens_and_watermark_plans(
-                logits, spec_metadata, num_contexts, batch_size)
-        else:
-            watermark_plans = None
-            target_tokens = self._sample_tokens_for_batch(
-                logits, spec_metadata, num_contexts, batch_size)
+        minimum_saved = None
+        if minimum_length_ops.enabled(spec_metadata):
+            no_drafts = torch.empty((batch_size - num_contexts, 0),
+                                    dtype=torch.int32,
+                                    device=logits.device)
+            _, minimum_saved = minimum_length_ops.apply(logits, no_drafts,
+                                                        num_contexts,
+                                                        batch_size,
+                                                        spec_metadata)
+        try:
+            if _watermark_active(spec_metadata):
+                target_tokens, watermark_plans = self._sample_tokens_and_watermark_plans(
+                    logits, spec_metadata, num_contexts, batch_size)
+            else:
+                watermark_plans = None
+                target_tokens = self._sample_tokens_for_batch(
+                    logits, spec_metadata, num_contexts, batch_size)
+
+        finally:
+            minimum_length_ops.restore(logits, minimum_saved)
 
         accepted_tokens = torch.zeros((batch_size, 1),
                                       dtype=torch.int,
@@ -2429,6 +2451,8 @@ class SpecWorkerBase(nn.Module, ABC):
         num_accepted_tokens = torch.ones(batch_size,
                                          dtype=torch.int,
                                          device=logits.device)
+        minimum_length_ops.commit((accepted_tokens, num_accepted_tokens),
+                                  batch_size, spec_metadata)
         if watermark_plans is not None:
             self._commit_watermark(spec_metadata,
                                    watermark_plans,
@@ -2886,33 +2910,47 @@ class SpecWorkerBase(nn.Module, ABC):
         logits = self._apply_occurrence_penalties(logits, draft_tokens,
                                                   num_contexts, batch_size,
                                                   spec_metadata)
-        num_gens = batch_size - num_contexts
-        if num_gens > 0 and self._can_use_rejection_sampling(spec_metadata):
-            draft_len = draft_tokens.shape[1]
-            stored_vocab = (spec_metadata.draft_probs_last_dim
-                            if spec_metadata.draft_probs_last_dim > 0 else
-                            spec_metadata.draft_probs_vocab_size)
-            # Fail closed: run the rejection kernel only when every buffer is
-            # present and correctly shaped; otherwise fall back to strict
-            # acceptance.
-            if self._rejection_buffers_valid(draft_tokens, draft_len,
-                                             stored_vocab, num_contexts,
-                                             batch_size, logits, spec_metadata):
-                # Gather the gen subset's slot rows, filled at the previous draft
-                # step indexed by py_seq_slot.
-                gen_slot_ids = spec_metadata.batch_slot_ids[
-                    num_contexts:batch_size]
-                draft_probs = spec_metadata.draft_probs[
-                    gen_slot_ids, :draft_len, :stored_vocab]
-                accepted = self._sample_and_accept_draft_tokens_rejection(
-                    logits, draft_tokens, draft_probs, num_contexts, batch_size,
-                    spec_metadata)
-                return self._commit_occurrence_counts(accepted, batch_size,
-                                                      spec_metadata)
-        accepted = self._sample_and_accept_draft_tokens_base(
-            logits, draft_tokens, num_contexts, batch_size, spec_metadata)
-        return self._commit_occurrence_counts(accepted, batch_size,
-                                              spec_metadata)
+        minimum_logits = logits.local if isinstance(
+            logits, VocabShardedLogits) else logits
+        offset = logits.head.col_base if isinstance(logits,
+                                                    VocabShardedLogits) else 0
+        _, minimum_saved = minimum_length_ops.apply(minimum_logits,
+                                                    draft_tokens,
+                                                    num_contexts,
+                                                    batch_size,
+                                                    spec_metadata,
+                                                    vocab_offset=offset)
+        try:
+            num_gens = batch_size - num_contexts
+            if num_gens > 0 and self._can_use_rejection_sampling(spec_metadata):
+                draft_len = draft_tokens.shape[1]
+                stored_vocab = (spec_metadata.draft_probs_last_dim
+                                if spec_metadata.draft_probs_last_dim > 0 else
+                                spec_metadata.draft_probs_vocab_size)
+                # Fail closed: run the rejection kernel only when every buffer is
+                # present and correctly shaped; otherwise fall back to strict
+                # acceptance.
+                if self._rejection_buffers_valid(draft_tokens, draft_len,
+                                                 stored_vocab, num_contexts,
+                                                 batch_size, logits,
+                                                 spec_metadata):
+                    # Gather the gen subset's slot rows, filled at the previous draft
+                    # step indexed by py_seq_slot.
+                    gen_slot_ids = spec_metadata.batch_slot_ids[
+                        num_contexts:batch_size]
+                    draft_probs = spec_metadata.draft_probs[
+                        gen_slot_ids, :draft_len, :stored_vocab]
+                    accepted = self._sample_and_accept_draft_tokens_rejection(
+                        logits, draft_tokens, draft_probs, num_contexts,
+                        batch_size, spec_metadata)
+                    return self._commit_occurrence_counts(
+                        accepted, batch_size, spec_metadata)
+            accepted = self._sample_and_accept_draft_tokens_base(
+                logits, draft_tokens, num_contexts, batch_size, spec_metadata)
+            return self._commit_occurrence_counts(accepted, batch_size,
+                                                  spec_metadata)
+        finally:
+            minimum_length_ops.restore(minimum_logits, minimum_saved)
 
     def _commit_occurrence_counts(
             self, accepted: tuple[torch.Tensor, torch.Tensor], batch_size: int,
@@ -2923,6 +2961,8 @@ class SpecWorkerBase(nn.Module, ABC):
         ``num_accepted_tokens``. Passes ``accepted`` straight through so callers can
         keep returning in one expression.
         """
+        accepted = minimum_length_ops.commit(accepted, batch_size,
+                                             spec_metadata)
         if not getattr(spec_metadata, "enable_penalty", False):
             return accepted
         accepted_tokens, num_accepted_tokens = accepted

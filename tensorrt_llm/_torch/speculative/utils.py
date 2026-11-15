@@ -21,6 +21,7 @@ from ..pyexecutor.config_utils import (is_glm5_next, is_nemotron_hybrid,
 from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.sampler.watermark import WatermarkSpecState
 from ..speculative.interface import SpecMetadata
+from . import minimum_length as minimum_length_ops
 from .dflash import DFlashSpecMetadata, DFlashWorker
 from .draft_target import (DraftTargetOneModelSpecMetadata,
                            DraftTargetOneModelWorker)
@@ -464,6 +465,7 @@ def _build_spec_metadata(spec_config,
             use_rejection_sampling=use_rejection_sampling,
             vocab_size=vocab_size,
             draft_vocab_size=draft_vocab_size,
+            supports_min_tokens=minimum_length_ops.supports_config(spec_config),
         )
     if spec_config.spec_dec_mode.is_dspark():
         target_layer_ids = getattr(spec_config, 'target_layer_ids', None)
@@ -722,6 +724,7 @@ def get_spec_decoder(
             enable_penalty=spec_config.enable_penalty,
             penalty_supported=penalty_supported,
             fused_sampling=fused_sampling,
+            supports_min_tokens=minimum_length_ops.supports_config(spec_config),
             watermark_unsupported_reason=_watermark_unsupported_reason(
                 spec_config, sampler_args.watermark_config))
     raise ValueError(

@@ -1660,13 +1660,15 @@ class BaseLLM:
         # 94 columns here, which isort (line_length 80) wraps with a backslash
         # and ruff (line-length 100) then reports as I001. Importing the module
         # is short enough that both leave it alone.
-        from .._torch.speculative import spec_sampler_base
+        from .._torch.speculative import minimum_length, spec_sampler_base
 
         mode = getattr(self.args.speculative_config, "advanced_sampling_mode",
                        None)
         reason = spec_sampler_base.one_model_sampling_rejection_reason(
             sampling_params,
-            fused_sampling=bool(mode is not None and mode.is_fused))
+            fused_sampling=bool(mode is not None and mode.is_fused),
+            supports_min_tokens=minimum_length.supports_config(
+                self.args.speculative_config))
         if reason is not None:
             raise RequestError(reason)
 

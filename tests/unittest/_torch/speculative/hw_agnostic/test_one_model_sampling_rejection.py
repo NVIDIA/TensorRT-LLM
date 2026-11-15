@@ -1,20 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""CPU unit tests for admission-time rejection of sampling features the
-one-model speculative path cannot honor.
+"""CPU tests for early and executor-side one-model sampling admission.
 
-``SpecSampler.validate_request`` has always rejected min_length, bad_words,
-no_repeat_ngram_size, embedding_bias and top_p_decay, but it runs on the
-executor's admission path. For a streaming OpenAI request that is too late: the
-frontend has already answered 200 and opened the response stream, so the client
-receives a truncated stream (``ClientPayloadError`` / ``TransferEncodingError``)
-that is indistinguishable from a network fault rather than a status code.
-
-``LLM._check_arguments`` now runs the same rules while ``generate_async`` is
-still synchronous, so the request gets a structured 4xx instead. These tests pin
-three things: the frontend predicate fires on each feature, it stays silent for
-modes that keep TorchSampler (which implements them), and both sides raise the
-identical message so they cannot drift apart.
+Unsupported features retain matching frontend and executor errors. Neutral
+parameters remain accepted, and minimum length requires the explicit standalone
+DSpark worker capability on both paths.
 """
 
 import types
@@ -301,3 +291,69 @@ def test_executor_side_check_rejects_a_post_processor_on_the_full_path():
     with pytest.raises(ValueError) as excinfo:
         _validate_on_executor(request)
     assert str(excinfo.value) == UNSUPPORTED_LOGITS_POST_PROCESSOR_MSG
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("embedded", [False, True])
+def test_dspark_minimum_length_admission_is_scoped_to_the_supported_worker(embedded):
+    from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
+    from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode
+
+    config = types.SimpleNamespace(
+        spec_dec_mode=SpeculativeDecodingMode.DSPARK,
+        draft_is_embedded_in_target=embedded,
+        advanced_sampling_mode=AdvancedSamplingMode.FULL,
+    )
+    params = SamplingParams(min_tokens=16, max_tokens=32)
+    if embedded:
+        with pytest.raises(RequestError, match="min_length"):
+            _check_arguments(config, params)
+    else:
+        _check_arguments(config, params)
+
+
+@pytest.mark.cpu_only
+def test_minimum_length_support_does_not_admit_other_logits_features():
+    assert (
+        one_model_sampling_rejection_reason(
+            SamplingParams(min_tokens=16, max_tokens=32), supports_min_tokens=True
+        )
+        is None
+    )
+    for _, kwargs, expected in UNSUPPORTED_CASES[1:]:
+        assert (
+            one_model_sampling_rejection_reason(SamplingParams(**kwargs), supports_min_tokens=True)
+            == expected
+        )
+
+
+@pytest.mark.cpu_only
+def test_executor_minimum_length_checks_stop_ids_and_keeps_fold_paths_closed():
+    request = types.SimpleNamespace(
+        py_min_length=2,
+        py_end_id=-1,
+        py_original_end_id=3,
+        py_stop_words_list=[[4], [5, 6]],
+        py_bad_words=None,
+        py_no_repeat_ngram_size=None,
+        py_embedding_bias=None,
+        py_logits_post_processors=None,
+        sampling_config=None,
+    )
+    SpecSampler._validate_unsupported_logits_processors(request, supports_min_tokens=True)
+    with pytest.raises(ValueError, match="min_length"):
+        SpecSampler._validate_unsupported_logits_processors(request)
+    sampler = object.__new__(SpecSampler)
+    sampler._supports_min_tokens = True
+    sampler._fused_sampling = False
+    sampler._watermark_unsupported_reason = None
+    sampler.spec_step_fold = object()
+    request.py_return_context_logits = request.py_return_generation_logits = (
+        request.py_return_log_probs
+    ) = False
+    request.sampling_config = types.SimpleNamespace(min_p=0)
+    with pytest.raises(ValueError, match="min_length"):
+        sampler.validate_request(request)
+    request.py_stop_words_list = [[i] for i in range(65)]
+    with pytest.raises(ValueError, match="at most"):
+        SpecSampler._validate_unsupported_logits_processors(request, supports_min_tokens=True)

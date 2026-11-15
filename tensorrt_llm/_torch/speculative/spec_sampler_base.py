@@ -50,6 +50,7 @@ from ..pyexecutor.sampler.sampler_common import _request_get_sampling_params, to
 from ..pyexecutor.sampler.sampler_features import max_token_room, meet_stop_token_criteria
 from ..pyexecutor.sampler.watermark import request_carries_watermark
 from ..pyexecutor.scheduler import ScheduledRequests
+from . import minimum_length as minimum_length_ops
 from .spec_store_scatter import spec_store_scatter
 
 # Rejection messages for the sampling features the one-model speculative path
@@ -92,7 +93,10 @@ UNSUPPORTED_MIN_P_MSG = (
 
 
 def one_model_sampling_rejection_reason(
-    sampling_params: Optional[SamplingParams], *, fused_sampling: bool = False
+    sampling_params: Optional[SamplingParams],
+    *,
+    fused_sampling: bool = False,
+    supports_min_tokens: bool = False,
 ) -> Optional[str]:
     """Why ``sampling_params`` cannot be served by the one-model speculative path.
 
@@ -114,7 +118,7 @@ def one_model_sampling_rejection_reason(
     # value rather than on its presence -- same reasoning as the LlmRequest
     # check below.
     min_tokens = sampling_params.min_tokens
-    if min_tokens and min_tokens > 0:
+    if min_tokens and min_tokens > 0 and not supports_min_tokens:
         return UNSUPPORTED_MIN_LENGTH_MSG
     # Either form populates py_bad_words; the string form needs a tokenizer to
     # resolve, so test the raw fields rather than _get_bad_words().
@@ -183,6 +187,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
 
     # The model's speculative step-input staging, when it opted into one (bind_spec_step_fold).
     spec_step_fold: Optional[SpecStepFold] = None
+    _supports_min_tokens: bool = False
     # Copy the store on the D2H side stream also on the steps a step fold's forward stored the rows, when the fold
     # awaits the copies through its store_copies_done (RuntimeHooks.sampler_d2h_side_stream).
     d2h_side_stream_copies: bool = False
@@ -229,7 +234,13 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         min_p = sampling_config.min_p
         if min_p and min_p > 0.0 and not self._fused_sampling:
             raise ValueError(UNSUPPORTED_MIN_P_MSG)
-        self._validate_unsupported_logits_processors(request)
+        self._validate_unsupported_logits_processors(
+            request,
+            supports_min_tokens=(
+                getattr(self, "_supports_min_tokens", False)
+                and getattr(self, "spec_step_fold", None) is None
+            ),
+        )
         # The occurrence penalties need a [slots, vocab_size] workspace that is only
         # allocated when the deploy opted in, so a request asking for them while the
         # flag is off cannot be honored. Reject instead of silently decoding from an
@@ -256,13 +267,15 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             )
 
     @staticmethod
-    def _validate_unsupported_logits_processors(request: LlmRequest) -> None:
+    def _validate_unsupported_logits_processors(
+        request: LlmRequest, *, supports_min_tokens: bool = False
+    ) -> None:
         """Reject logits-side sampling features the one-model path cannot apply.
 
-        TorchSampler implements min_length, bad_words, no_repeat_ngram_size,
+        TorchSampler implements bad_words, no_repeat_ngram_size,
         embedding_bias, top_p_decay and logits post-processor callbacks by editing
-        the target logits before sampling. The one-model path has no logits-editing hook, so each is
-        rejected here instead of being silently dropped.
+        the target logits before sampling. These are rejected instead of silently
+        dropped. Minimum length is enabled only for workers that implement its bans.
 
         Each check gates on a non-neutral value rather than on presence, since a
         frontend may forward a default explicitly.
@@ -273,7 +286,9 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         # value, not on its presence.
         min_length = getattr(request, "py_min_length", None)
         if min_length and min_length > 0:
-            raise ValueError(UNSUPPORTED_MIN_LENGTH_MSG)
+            if not supports_min_tokens:
+                raise ValueError(UNSUPPORTED_MIN_LENGTH_MSG)
+            minimum_length_ops.termination_ids(request)
         if getattr(request, "py_bad_words", None):
             raise ValueError(UNSUPPORTED_BAD_WORDS_MSG)
         if getattr(request, "py_no_repeat_ngram_size", None):
@@ -360,6 +375,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         enable_penalty: bool = False,
         penalty_supported: bool = True,
         fused_sampling: bool = False,
+        supports_min_tokens: bool = False,
         watermark_unsupported_reason: Optional[str] = None,
     ):
         """
@@ -373,6 +389,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             penalty_supported: whether this speculation mode's row layout is one
                 the penalties can map (linear modes yes, tree modes not yet).
             fused_sampling: whether the configured sampler supports min_p.
+            supports_min_tokens: whether the standard worker enforces minimum output length.
             watermark_unsupported_reason: why this speculation mode cannot serve watermarked
                 requests (None when it can). Such requests are rejected at admission.
         """
@@ -381,6 +398,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         self._watermark_config = args.watermark_config
         self._watermark_unsupported_reason = watermark_unsupported_reason
         self._fused_sampling = fused_sampling
+        self._supports_min_tokens = supports_min_tokens
         self._async_worker_init(args.enable_async_worker)
         self.mapping = None
         self.max_seq_len = args.max_seq_len
