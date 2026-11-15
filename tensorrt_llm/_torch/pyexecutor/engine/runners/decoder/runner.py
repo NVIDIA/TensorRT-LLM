@@ -1263,6 +1263,8 @@ class DecoderRunner(ScheduledModelRunner):
             # Helix CP does not support warmup with context requests.
             if self.mapping.has_cp_helix() and num_tokens != num_gen_tokens:
                 continue
+            if num_gen_tokens and self._config.context_only:
+                continue
             try:
                 with self._release_batch_context(
                     self._create_warmup_request(resource_manager, num_tokens, num_gen_tokens),
@@ -1374,6 +1376,8 @@ class DecoderRunner(ScheduledModelRunner):
             )
 
         for num_tokens, num_gen_requests in warmup_requests_configs:
+            if num_gen_requests and self._config.context_only:
+                continue
             warmup_request = self._create_warmup_request(
                 resource_manager, num_tokens=num_tokens, num_gen_requests=num_gen_requests
             )
@@ -1528,7 +1532,11 @@ class DecoderRunner(ScheduledModelRunner):
         )
 
         warmup_configs = [(curr_max_num_tokens, 0)]
-        if self.guided_decoder is None and not self.mapping.has_pp():
+        if (
+            self.guided_decoder is None
+            and not self.mapping.has_pp()
+            and not self._config.context_only
+        ):
             # Add generation request to warmup the autotuner cache.
             warmup_configs.append((1 + self._config.max_total_draft_tokens, 1))
 

@@ -79,12 +79,12 @@ Executor construction
   → after weight loading: create VMM transport + composite VA + page pool
 
 PyExecutor forward start
-  → DwdpManager.prefetch_first_layers() for the first two MoE layers
+  → DwdpManager.prefetch_first_layers() for the free buffer slots
   → ConfigurableMoE.wait_and_bind(composite VA)
   → MoEScheduler.forward(... ordinary CuTeDSL kernel ...)
   → main stream joins scheduler auxiliary work
   → DwdpManager records current-slot consumption
-  → prefetch the MoE layer two positions ahead
+  → prefetch, in order, the MoE layers whose slots are now free
 
 Executor shutdown or construction rollback
   → detach model references

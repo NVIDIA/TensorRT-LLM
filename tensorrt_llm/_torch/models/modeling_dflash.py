@@ -30,7 +30,12 @@ from ..speculative.dflash_attention import (
 )
 from ..speculative.interface import SpeculativeDecodingMode
 from ..utils import maybe_compile
-from .modeling_utils import FUSED_MODULE_COMPONENTS, get_model_architecture, register_draft_model
+from .modeling_utils import (
+    FUSED_MODULE_COMPONENTS,
+    get_model_architecture,
+    register_draft_model,
+    remove_weights,
+)
 
 
 def dspark_layer_window_size(
@@ -404,6 +409,12 @@ def block_upper_triangle_fixup(
     out_later = torch.einsum("bihgj,bjhd->bihgd", probs, v)
     weight = torch.sigmoid(scores.logsumexp(-1) - lse_log2.float() * math.log(2.0))
     return torch.lerp(out.float(), out_later.float(), weight.unsqueeze(-1)).to(out.dtype)
+
+
+def _context_only_draft(*args, **kwargs):
+    raise RuntimeError(
+        "A context-only server's DFlash drafter keeps only its context store and cannot draft."
+    )
 
 
 class DFlashForCausalLM(nn.Module):
@@ -1142,6 +1153,31 @@ class DFlashForCausalLM(nn.Module):
         self.draft_model_full.model.embed_tokens = target_model.model.embed_tokens
         self.draft_model_full.lm_head = target_model.lm_head
         self.lm_head = target_model.lm_head
+
+    def prune_for_context_only(self) -> int:
+        """Drop the weights a context-only server's drafter never reads; return the bytes freed.
+
+        Its context pass only fills the drafter's context store, so the stacked K/V projection and
+        the RoPE cache are built and kept, while the drafter layers, the DFlash 2 block
+        convolutions and the candidate selector go. A draft step raises afterwards.
+        """
+        self._build_fused_kv_buffers()
+        self._get_cos_sin_cache()
+        modules = [self.model.layers] + [
+            getattr(self, name, None)
+            for name in ("attention_convs", "mlp_convs", "candidate_selector")
+        ]
+        modules = [m for m in modules if isinstance(m, nn.Module)]
+        freed = sum(
+            t.numel() * t.element_size()
+            for m in modules
+            for t in (*m.parameters(), *m.buffers())
+            if t.is_cuda
+        )
+        for m in modules:
+            remove_weights(m)
+        self.dflash_forward = _context_only_draft
+        return freed
 
     def precompute_context_kv(
         self,

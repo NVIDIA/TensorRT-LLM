@@ -244,6 +244,9 @@ class DwdpManager:
             num_experts_per_worker=self.num_experts_per_worker,
             num_prefetch_experts=self.num_prefetch_experts,
             contention_opt=self.config.contention_opt,
+            num_prefetch_slots=self.config.num_prefetch_slots,
+            num_copy_streams=self.config.num_copy_streams,
+            num_dense_slots=self.config.num_dense_slots,
         )
         self._model_ref = weakref.ref(model)
         return self._weight_manager
@@ -253,14 +256,10 @@ class DwdpManager:
     # ------------------------------------------------------------------
 
     def prefetch_first_layers(self) -> None:
-        """Warm-up: kick off prefetch for the first MoE layers (double-buffer depth)."""
+        """Prefetch the first MoE layers unless the previous forward pass already did."""
         if self._weight_manager is None:
             raise RuntimeError("DwdpManager.setup() has not been called yet")
-        first = self._weight_manager.first_moe_layer()
-        self._weight_manager.prefetch_layer(first)
-        second = self._weight_manager.next_moe_layer(first)
-        if second is not None:
-            self._weight_manager.prefetch_layer(second)
+        self._weight_manager.start_forward()
 
     def wait_and_bind(self, backend_module: nn.Module, layer_idx: int) -> None:
         """Wait for prefetch and bind full-tensor views onto backend weights."""
@@ -269,19 +268,11 @@ class DwdpManager:
         self._weight_manager.wait_and_bind(backend_module, layer_idx)
 
     def record_compute_and_prefetch_next(self, layer_idx: int) -> None:
-        """Record compute and maintain the two-layer prefetch window.
+        """Release the layer's buffer slot and prefetch the layers it unblocks.
 
-        ``prefetch_first_layers`` warms the first two MoE layers. After each
-        layer's kernel has been enqueued, record consumption of its current
-        buffer slot and prefetch the layer two positions ahead. This avoids
-        duplicate prefetch of the second layer and prevents reuse of a slot
-        before the current kernel has finished reading it.
+        Called after the layer's kernel has been enqueued, so the slot is not reused before the
+        kernel has finished reading it. The last layers prefetch the next pass's first layers.
         """
         if self._weight_manager is None:
             raise RuntimeError("DwdpManager.setup() has not been called yet")
         self._weight_manager.record_compute(layer_idx)
-        next_idx = self._weight_manager.next_moe_layer(layer_idx)
-        if next_idx is not None:
-            next_next_idx = self._weight_manager.next_moe_layer(next_idx)
-            if next_next_idx is not None:
-                self._weight_manager.prefetch_layer(next_next_idx)

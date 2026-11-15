@@ -182,6 +182,11 @@
       "path": "checkpoint_io_policy"
     },
     {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "context_only"
+    },
+    {
       "capture_policy": "int",
       "kind": "value",
       "path": "context_parallel_size"
@@ -298,6 +303,16 @@
     {
       "capture_policy": "int",
       "kind": "value",
+      "path": "dwdp_config.num_copy_streams"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "dwdp_config.num_dense_slots"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
       "path": "dwdp_config.num_experts_per_worker"
     },
     {
@@ -309,6 +324,11 @@
       "capture_policy": "int",
       "kind": "value",
       "path": "dwdp_config.num_prefetch_experts"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "dwdp_config.num_prefetch_slots"
     },
     {
       "capture_policy": "bool",

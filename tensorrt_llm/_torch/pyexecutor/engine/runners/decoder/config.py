@@ -48,3 +48,5 @@ class DecoderRunnerConfig(RunnerConfig):
     mm_encoder_cache_enabled: bool
     enable_autotuner: bool
     cuda_graph_specialize_lora: bool
+    # A disaggregated context server: warmup skips generation shapes.
+    context_only: bool

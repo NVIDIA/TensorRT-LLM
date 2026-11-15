@@ -1176,6 +1176,12 @@ def _create_py_executor(
     logger.info(
         f"[create_py_executor] Created execution_stream: {execution_stream}")
 
+    # DWDP setup: MNNVL handle exchange + composite VA weight buffer +
+    # weight manager + MoE backend fixup (single entry point).
+    # Before the KV cache, which without estimation is sized from free memory.
+    if dwdp_manager is not None:
+        dwdp_manager.setup(model_engine.model)
+
     if model_engine.model.model_config.is_generation:
         #NOTE: non-generation models do not have kv cache
 
@@ -1198,6 +1204,19 @@ def _create_py_executor(
 
         # Get draft config for one-engine speculative decoding if available
         draft_config = getattr(model_engine.model, 'draft_config', None)
+
+        # A context-only server's drafter only fills its context store; the
+        # weights it drops go to the KV cache sized below.
+        if llm_args.context_only:
+            from ..models.modeling_dflash import DFlashForCausalLM
+            freed = sum(module.prune_for_context_only()
+                        for module in model_engine.model.modules()
+                        if isinstance(module, DFlashForCausalLM))
+            if freed:
+                gc.collect()
+                torch.cuda.empty_cache()
+                logger.info(f"context_only: dropped {freed / 2**30:.2f} GiB "
+                            "of drafter weights")
 
         kv_cache_creator = KvCacheCreator(
             model_engine=model_engine,
@@ -1235,11 +1254,6 @@ def _create_py_executor(
                 ExecutorMemoryType.INIT_KV_CACHE
                 if estimating_kv_cache else ExecutorMemoryType.KV_CACHE):
             kv_cache_creator.build_managers(resources, estimating_kv_cache)
-
-    # DWDP setup: MNNVL handle exchange + composite VA weight buffer +
-    # weight manager + MoE backend fixup (single entry point).
-    if dwdp_manager is not None:
-        dwdp_manager.setup(model_engine.model)
 
     # Resource managers for speculative decoding
     # For user-specified drafters, use extra_resource_managers in PyTorchBackend config
@@ -1294,6 +1308,7 @@ def _create_py_executor(
             cache_transceiver_config=cache_transceiver_config,
             virtual_memory_pools=vm_pools if not estimating_kv_cache else None,
             execution_stream=execution_stream,
+            dwdp_manager=dwdp_manager if not estimating_kv_cache else None,
             max_num_sequences=max_num_seq_slots,
         )
 

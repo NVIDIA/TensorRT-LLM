@@ -458,8 +458,7 @@ class ConfigurableMoE(MoE):
             )
 
     def _should_enable_dwdp(self) -> bool:
-        # DWDP is currently supported only by CuteDSL backends, and only with
-        # NVFP4 quantization.
+        # DWDP needs a backend that reads weights at call time, and NVFP4 or unquantized experts.
         if not self.backend.capabilities.supports_dwdp:
             return False
 
@@ -476,7 +475,9 @@ class ConfigurableMoE(MoE):
 
         quant_mode = getattr(quant_config, "layer_quant_mode", None)
         return bool(
-            quant_mode is not None and hasattr(quant_mode, "has_nvfp4") and quant_mode.has_nvfp4()
+            quant_mode is not None
+            and hasattr(quant_mode, "has_nvfp4")
+            and (quant_mode.has_nvfp4() or not quant_mode.has_any_quant(exclude_kv_cache=True))
         )
 
     def _get_quant_config_dict(self, model_config: ModelConfig) -> Optional[Dict]:

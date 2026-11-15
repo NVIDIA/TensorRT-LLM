@@ -41,7 +41,7 @@ try:
 except ImportError:
     logger = logging.getLogger(__name__)
 
-from .page_pool import PagePool, compute_slot_sizes
+from .page_pool import PagePool, assign_buffer_slots, compute_slot_sizes
 from .specs import EdgeInfo, LayerWeightSpecs, MnnvlHandleSet, PageAlignedLayout
 from .vmm import (
     free_va,
@@ -108,6 +108,7 @@ class WeightBuffer:
         "_page_pool",
         "_layer_states",
         "_moe_layer_indices",
+        "_buffer_slots",
         "_released",
     )
 
@@ -168,6 +169,7 @@ class WeightBuffer:
         local_end: int,
         dwdp_size: int,
         device_id: int,
+        num_slots: int = 2,
     ) -> WeightBuffer:
         """Create all VA mappings and remote page pool.
 
@@ -186,6 +188,7 @@ class WeightBuffer:
             local_end: Last local expert index (exclusive).
             dwdp_size: Number of DWDP ranks.
             device_id: CUDA device ordinal.
+            num_slots: Ring slots of the remote buffer (``DwdpConfig.num_prefetch_slots``).
 
         Returns:
             Ready-to-use WeightBuffer with all VA mappings established.
@@ -214,11 +217,11 @@ class WeightBuffer:
             # Step 2: Compute slot sizes and create page pool.
             # Because layouts already have pre/post sizes aligned to
             # pool_page_size, the slot sizes are automatically aligned too.
-            buffer_slot_assignments = {
-                layer_idx: buffer.buffer_index_for_layer(layer_idx)
-                for layer_idx in layer_weight_specs.keys()
-            }
-            slot_sizes = compute_slot_sizes(layouts, buffer_slot_assignments)
+            buffer._buffer_slots = assign_buffer_slots(layouts, num_slots)
+            slot_sizes = compute_slot_sizes(layouts, buffer._buffer_slots)
+            if len(slot_sizes) > num_slots:  # larger layers map the pages of all ring slots
+                larger = slot_sizes.pop()
+                slot_sizes = [max(size, -(-larger // num_slots)) for size in slot_sizes]
 
             buffer._page_pool = PagePool.create(
                 slot_sizes, device_id, page_size=buffer._pool_page_size
@@ -621,22 +624,21 @@ class WeightBuffer:
         """CUDA device ordinal."""
         return self._device_id
 
+    @property
+    def num_slots(self) -> int:
+        """Number of ring slots; a buffer index past them maps the pages of all of them."""
+        return self._page_pool.num_slots
+
     def buffer_index_for_layer(self, layer_idx: int) -> int:
-        """Double buffer slot: 0 or 1 based on MoE order (odd/even).
+        """Buffer slot of a MoE layer, as assigned by ``assign_buffer_slots``.
 
         Args:
             layer_idx: Layer index.
 
         Returns:
-            Buffer slot index (0 or 1).
+            Buffer slot index.
         """
-        # Find position of this layer in the MoE layer sequence
-        if layer_idx in self._moe_layer_indices:
-            moe_order = self._moe_layer_indices.index(layer_idx)
-        else:
-            moe_order = layer_idx
-
-        return moe_order % 2
+        return self._buffer_slots[layer_idx]
 
     def weight_names(self, layer_idx: int) -> List[str]:
         """Get weight names for a specific layer.

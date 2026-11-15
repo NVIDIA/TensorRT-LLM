@@ -41,6 +41,8 @@ no-op (returns the existing manager stored on the model).
 
 from __future__ import annotations
 
+import itertools
+import math
 import traceback
 from typing import Dict, List, Optional, Tuple
 
@@ -50,7 +52,16 @@ from torch import nn
 from tensorrt_llm.logger import logger
 
 from .specs import LayerWeightSpecs, PeerRanges, WeightSpec, lookup_owner
-from .transport import DWDPTransport
+from .transport import DWDPTransport, _export_handle, _import_handle
+from .vmm import (
+    VARegion,
+    align_up,
+    create_fabric_handle,
+    get_allocation_granularity,
+    peer_handle_type,
+    release_handle,
+    tensor_from_ptr,
+)
 from .weight_buffer import WeightBuffer
 from .weight_manager import DWDPWeightManager
 
@@ -94,6 +105,9 @@ def setup_dwdp(
     num_experts_per_worker: int,
     num_prefetch_experts: int,
     contention_opt: bool = False,
+    num_prefetch_slots: int = 2,
+    num_copy_streams: int = 1,
+    num_dense_slots: int = 0,
 ) -> Optional[DWDPWeightManager]:
     """Set up DWDP for a model after weight loading.
 
@@ -124,6 +138,10 @@ def setup_dwdp(
             redundancy: adjacent ranks' ranges overlap by
             ``num_experts_per_worker - num_prefetch_experts`` experts and
             ``lookup_owner`` resolves the lowest-rank owner.
+        contention_opt: Use the batched, peer-interleaved prefetch.
+        num_prefetch_slots: Expert prefetch buffer slots (``DwdpConfig``).
+        num_copy_streams: Copy streams the expert prefetches rotate over.
+        num_dense_slots: If positive, also shard the dense weights (``DenseDWDP``).
 
     Returns:
         A ready-to-use DWDPWeightManager if DWDP is enabled, ``None`` otherwise.
@@ -235,6 +253,7 @@ def setup_dwdp(
             local_end=local_end,
             dwdp_size=mapping.dwdp_size,
             device_id=device_id,
+            num_slots=num_prefetch_slots,
         )
     except BaseException:
         _release_during_rollback(transport, "transport")
@@ -270,6 +289,7 @@ def setup_dwdp(
             dwdp_rank=mapping.dwdp_rank,
             dwdp_size=mapping.dwdp_size,
             contention_opt=contention_opt,
+            num_copy_streams=num_copy_streams,
         )
     except BaseException:
         _release_during_rollback(weight_buffer, "weight buffer")
@@ -293,6 +313,10 @@ def setup_dwdp(
             num_experts_per_worker=num_experts_per_worker,
             peer_ranges=peer_ranges,
         )
+        if num_dense_slots > 0:
+            decoder_model.dwdp_dense = DenseDWDP(
+                model, comm, mapping.dwdp_rank, device_id, num_dense_slots
+            )
     except BaseException:
         _release_during_rollback(weight_manager, "weight manager")
         raise
@@ -318,6 +342,9 @@ def teardown_dwdp(
     unmapping the composite VA, then release the manager exactly once.
     """
     decoder_model = _get_decoder_model(model)
+    if getattr(decoder_model, "dwdp_dense", None) is not None:
+        decoder_model.dwdp_dense.release()
+        decoder_model.dwdp_dense = None
     managers = []
     for owner in (model, decoder_model):
         manager = getattr(owner, _DWDP_SETUP_DONE, None)
@@ -347,6 +374,137 @@ def teardown_dwdp(
                 first_error = exc
     if first_error is not None:
         raise first_error
+
+
+def dense_layout(
+    weights: List[List[torch.Tensor]], num_ranks: int, granularity: int
+) -> Tuple[List[List[int]], int]:
+    """Byte offsets of each layer's tensors in its blob, and the aligned per-rank part of a blob."""
+    offsets, blob = [], 0
+    for layer_weights in weights:
+        ends = list(itertools.accumulate(align_up(w.nbytes, 256) for w in layer_weights))
+        offsets.append([0] + ends[:-1])
+        blob = max(blob, ends[-1] if ends else 0)
+    return offsets, align_up(-(-blob // num_ranks), granularity)
+
+
+def pack_dense_rows(
+    weights: List[List[torch.Tensor]],
+    offsets: List[List[int]],
+    row: int,
+    rank: int,
+    out: torch.Tensor,
+) -> None:
+    """Copy ``rank``'s row of every layer's blob into ``out`` (uint8, ``len(weights) * row``)."""
+    lo = rank * row
+    for i, (layer_weights, layer_offsets) in enumerate(zip(weights, offsets)):
+        for w, o in zip(layer_weights, layer_offsets):
+            start, end = max(o, lo), min(o + w.nbytes, lo + row)
+            if start < end:
+                src = w.reshape(-1).view(torch.uint8)[start - o : end - o]
+                out[i * row + start - lo : i * row + end - lo].copy_(src)
+
+
+class DenseDWDP:
+    """DWDP for dense weights: each rank keeps 1/G of them and reads or pulls the rest.
+
+    The Linear weights of a decoder layer form one blob. Every rank keeps one row (1/G) of every
+    layer's blob in one fabric handle. Layer ``i``'s Linear weights are views of slot ``i % num_slots``.
+    When a layer is done with its slot, a side stream copies the G rows of the slot's next layer
+    into it (the last layers prefetch the next forward's first ones). The embedding and LM head
+    need few rows per step, so they are read in place: all ranks' rows mapped side by side.
+    """
+
+    def __init__(self, model: nn.Module, comm, rank: int, device_id: int, num_slots: int):
+        from ..linear import Linear
+
+        decoder = _get_decoder_model(model)
+        size, gran = comm.Get_size(), get_allocation_granularity(device_id)
+        self._mapped: List[Tuple[VARegion, List[int]]] = []
+        self._weights = [
+            [m.weight for m in layer.modules() if isinstance(m, Linear)] for layer in decoder.layers
+        ]
+        offsets, self._row = dense_layout(self._weights, size, gran)
+        rows = torch.empty(len(self._weights) * self._row, dtype=torch.uint8, device=device_id)
+        pack_dense_rows(self._weights, offsets, self._row, rank, rows)
+        self._store = self._share(rows, comm, rank, device_id)
+        self._num_slots = num_slots
+        self._slots = torch.empty(num_slots, size * self._row, dtype=torch.uint8, device=device_id)
+        for i, (layer_weights, layer_offsets) in enumerate(zip(self._weights, offsets)):
+            for w, o in zip(layer_weights, layer_offsets):
+                w.data = self._slots[i % self._num_slots, o : o + w.nbytes].view(w.dtype).view(w.shape)
+        lm_head = getattr(model, "llm", model).lm_head
+        for w in dict.fromkeys((decoder.embed_tokens.weight, lm_head.weight)):
+            n = align_up(-(-len(w) // size), gran // math.gcd(gran, w[0].nbytes))
+            local = w.new_zeros(n, *w.shape[1:])
+            src = w[rank * n : (rank + 1) * n]
+            local[: len(src)] = src
+            shared = self._share(local.view(-1).view(torch.uint8), comm, rank, device_id)
+            w.data = shared.view(w.dtype).view(-1, *w.shape[1:])[: len(w)]
+            w._capsule_wrapper = shared._capsule_wrapper
+        self._stream = torch.cuda.Stream(device_id)
+        self._ready = [torch.cuda.Event() for _ in range(self._num_slots)]
+        self._consumed = [torch.cuda.Event() for _ in range(self._num_slots)]
+        self._holders = [-1] * self._num_slots
+        for event in self._consumed:
+            event.record()
+        self._hooks = [decoder.register_forward_pre_hook(self._prime)]
+        for i, layer in enumerate(decoder.layers):
+            self._hooks.append(layer.register_forward_pre_hook(lambda *_, i=i: self._wait(i)))
+            self._hooks.append(layer.register_forward_hook(lambda *_, i=i: self._done(i)))
+
+    def _share(self, local: torch.Tensor, comm, rank: int, device_id: int) -> torch.Tensor:
+        """Put ``local`` (uint8) in a fabric handle; return all ranks' side by side as [G, n]."""
+        n, handle_type = local.numel(), peer_handle_type()
+        own = create_fabric_handle(n, device_id)
+        payloads = comm.allgather(_export_handle(own, handle_type))
+        handles = [
+            own if p == rank else _import_handle(x, handle_type) for p, x in enumerate(payloads)
+        ]
+        region = VARegion(len(handles) * n, device_id)
+        self._mapped.append((region, handles))
+        for p, handle in enumerate(handles):
+            region.map(p * n, n, handle)
+        shared = tensor_from_ptr(region.va, (len(handles), n), torch.uint8, device_id)
+        shared[rank].copy_(local)
+        torch.cuda.synchronize(device_id)
+        comm.Barrier()
+        return shared
+
+    def _fetch(self, i: int) -> None:
+        slot, n = i % self._num_slots, self._row
+        self._holders[slot] = i
+        with torch.cuda.stream(self._stream):
+            self._stream.wait_event(self._consumed[slot])
+            for p, rows in enumerate(self._store):
+                dst = self._slots[slot, p * n : (p + 1) * n]
+                dst.copy_(rows[i * n : (i + 1) * n], non_blocking=True)
+            self._ready[slot].record()
+
+    def _prime(self, *_) -> None:
+        # The previous forward primed them, unless there was none or it stopped early.
+        for i in range(min(self._num_slots, len(self._weights))):
+            if self._holders[i] != i:
+                self._fetch(i)
+
+    def _wait(self, i: int) -> None:
+        torch.cuda.current_stream().wait_event(self._ready[i % self._num_slots])
+
+    def _done(self, i: int) -> None:
+        self._consumed[i % self._num_slots].record()
+        nxt = i + self._num_slots
+        self._fetch(nxt if nxt < len(self._weights) else i % self._num_slots)
+
+    def release(self) -> None:
+        """Remove the hooks and unmap everything; the dense weights are unusable afterwards."""
+        torch.cuda.synchronize()
+        for hook in self._hooks:
+            hook.remove()
+        for region, handles in self._mapped:
+            region.release()
+            for handle in handles:
+                release_handle(handle)
+        self._mapped.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -412,8 +570,7 @@ def collect_moe_params(
                 f"the expected weight parameters {_EXPERT_WEIGHT_NAMES}."
             )
 
-        if not weight_names_set:
-            weight_names_set = found_names
+        weight_names_set += [name for name in found_names if name not in weight_names_set]
         logger.debug(
             f"[DWDP Setup] Layer {layer_idx}: collected {found_names}, "
             f"shapes={[local_params[(layer_idx, n)].shape for n in found_names]}"
@@ -1094,6 +1251,7 @@ def _get_decoder_model(model: nn.Module) -> nn.Module:
     Raises:
         RuntimeError: If the decoder model cannot be found.
     """
+    model = getattr(model, "llm", model)
     # Direct attribute: model.model
     if hasattr(model, "model") and hasattr(model.model, "layers"):
         return model.model
@@ -1152,6 +1310,8 @@ def _get_moe_and_experts(
     mlp = getattr(layer, "mlp", None)
     if mlp is None:
         mlp = getattr(layer, "block_sparse_moe", None)
+    if mlp is None:
+        mlp = getattr(layer, "feed_forward", None)
     if mlp is None:
         return None, None
 

@@ -29,6 +29,8 @@ l0_gb300_musespark:
   - accuracy/test_musespark_open.py::TestMuseSparkOpen::test_nvfp4_4gpus[cuda_graph]
   - accuracy/test_musespark_open.py::TestMuseSparkOpen::test_nvfp4_4gpus_sa_spec[sa2]
   - accuracy/test_musespark_open.py::TestMuseSparkOpen::test_nvfp4_4gpus_sa_spec[sa4]
+  # DWDP on the TRTLLM-Gen MoE, which Muse Spark Open context workers use.
+  - accuracy/test_dwdp_aggregated.py::TestDwdpAggDeepSeekV3Lite::test_dwdp_agg_accuracy[mode_a_uniform_trtllm]
   # MuseSparkOpen decode-path fusions (random weights, no checkpoint). The finalize+all-reduce
   # parity, stress and lifecycle files stay unlisted, as in l0_gb300_multi_gpus.yml: they need
   # an external 4- or 8-rank MPI launch and every case skips under single-process pytest.

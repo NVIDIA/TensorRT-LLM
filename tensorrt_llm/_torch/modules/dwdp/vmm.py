@@ -372,7 +372,8 @@ def tensor_from_ptr(
             segment_size=total_bytes,
             segment_stride=0,  # Not used for single segment
             num_segments=1,
-            torch_dtype=dtype,
+            # _dlpack_utils types BF16 as float16 and torch rejects 8-bit floats; view(dtype) below.
+            torch_dtype=torch.uint8 if dtype.itemsize == 1 else dtype,
             dev_id=device_id,
         )
 
@@ -381,8 +382,10 @@ def tensor_from_ptr(
         # Keep reference to capsule to prevent GC
         tensor._capsule_wrapper = capsule_wrapper
 
-        # Reshape to desired shape
-        return tensor.reshape(shape)
+        # Reshape to desired shape. A dtype view does not keep its base alive, so it holds the capsule too.
+        view = tensor.view(dtype).reshape(shape)
+        view._capsule_wrapper = capsule_wrapper
+        return view
 
     except ImportError:
         logger.info(

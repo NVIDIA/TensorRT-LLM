@@ -1607,6 +1607,15 @@ class BaseLLM:
     def _check_arguments(self, prompt_len: int, sampling_params: SamplingParams,
                          is_gen_only: bool) -> None:
 
+        # A context_only server's DFlash drafter keeps only its context pass.
+        drafter = getattr(self.args.speculative_config, "decoding_type", None)
+        if (getattr(self.args, "context_only", False)
+                and drafter in ("DFlash", "DSpark")
+                and sampling_params.max_tokens != 1):
+            raise RequestError(
+                f"A context_only server's {drafter} drafter cannot draft, so "
+                "max_tokens must be 1.")
+
         # Check prompt length against max_num_tokens to filter illegal requests.
         # Skip check for gen-only requests.
         if not self.args.enable_chunked_prefill and not is_gen_only:

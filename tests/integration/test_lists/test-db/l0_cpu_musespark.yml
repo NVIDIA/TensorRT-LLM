@@ -29,3 +29,4 @@ l0_cpu_musespark:
   - unittest/disaggregated/test_peer.py
   - unittest/disaggregated/test_rank_info.py
   - unittest/disaggregated/test_transfer_ownership_regressions.py
+  - unittest/_torch/modules/dwdp/test_dwdp_mixed_layers.py

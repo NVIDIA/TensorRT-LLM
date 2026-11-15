@@ -12,6 +12,8 @@ refuses DFlash on ANY engine configured with a cache transceiver backend; a
 context-side engine loses nothing, since it never runs generation steps.
 """
 
+from types import SimpleNamespace
+
 import pytest
 
 from tensorrt_llm.llmapi import (
@@ -137,3 +139,35 @@ def test_disagg_shares_draft_kv(monkeypatch, decoding_type, attention_backend, e
     config_cls = DFlashDecodingConfig if decoding_type == "DFlash" else DSparkDecodingConfig
     config = config_cls(max_draft_len=7, attention_backend=attention_backend)
     assert disagg_shares_draft_kv(config) is shares
+
+
+@pytest.mark.parametrize(
+    ("roles", "shares"),
+    [(("ctx", "gen"), True), (("ctx", "ctx"), True), (("gen",), False)],
+)
+def test_mpi_worker_world_shares_draft_kv_when_every_server_drafts(roles, shares):
+    """A world of context servers alone (e.g. DWDP context instances) shares too."""
+    from tensorrt_llm.commands.serve import _shared_draft_kv_blocker
+
+    spec = {"decoding_type": "DFlash"}
+    configs = [SimpleNamespace(type=r, other_args={"speculative_config": spec}) for r in roles]
+    assert (_shared_draft_kv_blocker(configs) is None) is shares
+
+
+def test_context_only_dflash_server_refuses_a_request_for_more_than_one_token():
+    """Its pruned drafter cannot draft, so such a request is refused before it is queued."""
+    from tensorrt_llm.executor import RequestError
+    from tensorrt_llm.llmapi.llm import BaseLLM
+    from tensorrt_llm.sampling_params import SamplingParams
+
+    def check(max_tokens, speculative_config):
+        args = SimpleNamespace(
+            context_only=True, speculative_config=speculative_config, enable_chunked_prefill=True
+        )
+        llm = SimpleNamespace(args=args, _check_one_model_speculative_sampling=lambda params: None)
+        BaseLLM._check_arguments(llm, 8, SamplingParams(max_tokens=max_tokens), is_gen_only=False)
+
+    check(1, _dflash_config())
+    check(2, None)
+    with pytest.raises(RequestError, match="context_only"):
+        check(2, _dflash_config())

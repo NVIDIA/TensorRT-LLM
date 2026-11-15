@@ -2453,8 +2453,11 @@ def _shared_draft_kv_blocker(server_configs) -> Optional[str]:
         cfg.type
         for cfg in server_configs if cfg.other_args.get("speculative_config")
     }
-    if with_spec != {"ctx", "gen"}:
-        return ("speculative_config in both context_servers and "
+    # A world of context servers alone (e.g. DWDP context instances, whose
+    # generation servers run elsewhere) shares too.
+    roles = {cfg.type for cfg in server_configs}
+    if with_spec != roles or roles not in ({"ctx", "gen"}, {"ctx"}):
+        return ("speculative_config in context_servers and, if any, "
                 "generation_servers")
     for cfg in server_configs:
         spec = cfg.other_args["speculative_config"]

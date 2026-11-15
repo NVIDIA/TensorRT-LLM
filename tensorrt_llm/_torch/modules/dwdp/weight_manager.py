@@ -35,7 +35,6 @@ Timeline visualization:
 
 from __future__ import annotations
 
-import bisect
 import logging
 import traceback
 from typing import Dict, List, Optional, Tuple
@@ -84,12 +83,18 @@ class DWDPWeightManager:
         "_dwdp_size",
         "_experts_per_rank",
         "_copy_stream",
+        "_copy_streams",
+        "_last_issued_buf",
+        "_issue_seq",
         "_prefetch_events",
         "_consume_events",
         "_transport",
         "_use_batched_prefetch",
         "_batched_copy_plans",
         "_released",
+        "_next_issue",
+        "_next_bind",
+        "_busy_slots",
     )
 
     def __init__(
@@ -102,12 +107,13 @@ class DWDPWeightManager:
         dwdp_rank: int,
         dwdp_size: int,
         contention_opt: bool = False,
+        num_copy_streams: int = 1,
     ) -> None:
         """Initialize the DWDPWeightManager.
 
-        Creates a dedicated copy stream and pre-allocates all CUDA events for
-        the double-buffer protocol. Both consume_events are recorded immediately
-        so the first prefetch does not stall waiting for a never-recorded event.
+        Creates the copy streams and pre-allocates all CUDA events for the
+        slot protocol. All consume_events are recorded immediately so the
+        first prefetch does not stall waiting for a never-recorded event.
 
         Args:
             weight_buffer: WeightBuffer with composite VA layout for all MoE layers.
@@ -132,6 +138,8 @@ class DWDPWeightManager:
                 to reduce single-NVLink-link contention.  Plans are cached
                 per layer since peer ``data_ptr()`` and destination
                 ``data_ptr()`` are stable after initialization.
+            num_copy_streams: Copy streams that consecutive layer prefetches
+                rotate over, so the host can enqueue further ahead.
 
         Raises:
             ValueError: If dwdp_rank is out of range or dwdp_size is invalid.
@@ -160,14 +168,20 @@ class DWDPWeightManager:
         # Using a separate stream allows copy/compute overlap.
         device = torch.device("cuda", weight_buffer.device_id)
         self._copy_stream = torch.cuda.Stream(device=device)
+        self._copy_streams = [self._copy_stream] + [
+            torch.cuda.Stream(device=device) for _ in range(num_copy_streams - 1)
+        ]
+        self._last_issued_buf: Optional[int] = None
+        self._issue_seq = 0
 
-        # Double-buffer events: one per buffer slot (0 and 1).
+        # Events: one pair per buffer slot.
         # prefetch_events[i]: recorded on copy_stream after P2P copy into slot i.
         #   Waited on by compute_stream (RAW — must finish copy before read).
         # consume_events[i]: recorded on compute_stream after forward using slot i.
         #   Waited on by copy_stream (WAR — must finish read before overwrite).
-        self._prefetch_events: List[torch.cuda.Event] = [torch.cuda.Event() for _ in range(2)]
-        self._consume_events: List[torch.cuda.Event] = [torch.cuda.Event() for _ in range(2)]
+        slots = range(1 + max(map(weight_buffer.buffer_index_for_layer, self._moe_layer_indices)))
+        self._prefetch_events: List[torch.cuda.Event] = [torch.cuda.Event() for _ in slots]
+        self._consume_events: List[torch.cuda.Event] = [torch.cuda.Event() for _ in slots]
         self._transport = None
 
         # Initialize consume_events as "already signaled" so the first prefetch
@@ -185,6 +199,11 @@ class DWDPWeightManager:
         self._use_batched_prefetch = contention_opt
         self._batched_copy_plans: Dict[int, Tuple[List[int], List[int], List[int]]] = {}
         self._released = False
+        # Positions in the MoE layer sequence of consecutive forward passes (p -> layer p % L);
+        # a copy is issued in order once its slot is free, so the end of a pass pulls the next one.
+        self._next_issue = 0
+        self._next_bind = 0
+        self._busy_slots = set()
 
         logger.info(
             f"[DWDPWeightManager] Initialized: rank={dwdp_rank}/{dwdp_size}, "
@@ -220,38 +239,6 @@ class DWDPWeightManager:
         """
         return layer_idx in self._moe_layer_set
 
-    def next_moe_layer(self, layer_idx: int) -> Optional[int]:
-        """Return the next MoE layer index after layer_idx.
-
-        Uses binary search for O(log n) lookup.
-
-        Args:
-            layer_idx: Current layer index.
-
-        Returns:
-            The next MoE layer index strictly greater than layer_idx,
-            or None if layer_idx is at or past the last MoE layer.
-        """
-        if not self._moe_layer_indices:
-            return None
-        pos = bisect.bisect_right(self._moe_layer_indices, layer_idx)
-        if pos < len(self._moe_layer_indices):
-            return self._moe_layer_indices[pos]
-        return None
-
-    def first_moe_layer(self) -> int:
-        """Return the first MoE layer index.
-
-        Returns:
-            The smallest MoE layer index.
-
-        Raises:
-            IndexError: If there are no MoE layers.
-        """
-        if not self._moe_layer_indices:
-            raise IndexError("No MoE layers configured")
-        return self._moe_layer_indices[0]
-
     def prefetch_layer(self, layer_idx: int) -> None:
         """Kick off async P2P copies for all remote expert slices of a layer.
 
@@ -283,19 +270,26 @@ class DWDPWeightManager:
             )
 
         buf_idx = self._weight_buffer.buffer_index_for_layer(layer_idx)
+        stream = self._copy_streams[self._issue_seq % len(self._copy_streams)]
+        self._issue_seq += 1
 
-        with torch.cuda.stream(self._copy_stream):
+        with torch.cuda.stream(stream):
             # WAR hazard: wait until compute finishes reading this buffer slot
             # before overwriting it with new P2P data.
-            self._copy_stream.wait_event(self._consume_events[buf_idx])
+            for slot in self._ring_slots(buf_idx):
+                stream.wait_event(self._consume_events[slot])
+            # Several copy streams: keep the copies in issue order (start after the previous layer's copies).
+            if len(self._copy_streams) > 1 and self._last_issued_buf is not None:
+                stream.wait_event(self._prefetch_events[self._last_issued_buf])
+            self._last_issued_buf = buf_idx
 
             if self._use_batched_prefetch:
-                self._prefetch_layer_batched(layer_idx)
+                self._prefetch_layer_batched(layer_idx, stream)
             else:
                 self._prefetch_layer_per_slice(layer_idx)
 
             # RAW signal: record event so compute_stream knows copy is done.
-            self._prefetch_events[buf_idx].record(self._copy_stream)
+            self._prefetch_events[buf_idx].record(stream)
 
         logger.debug(
             f"[DWDPWeightManager] Prefetch enqueued: layer={layer_idx}, buf_slot={buf_idx}"
@@ -303,7 +297,7 @@ class DWDPWeightManager:
 
     def _prefetch_layer_per_slice(self, layer_idx: int) -> None:
         """Default prefetch: one ``torch.Tensor.copy_`` per peer chunk."""
-        for name in self._weight_names:
+        for name in self._weight_buffer.weight_names(layer_idx):
             remote_slices = self._weight_buffer.get_remote_slices(layer_idx, name)
             for dst_slice, expert_start, expert_end in remote_slices:
                 # A remote slice may span multiple peer ranks.  Walk
@@ -352,7 +346,7 @@ class DWDPWeightManager:
         """
         # Step 1: collect per-peer ``(dst_ptr, src_ptr, total_size)`` triples.
         peer_triples: Dict[int, List[Tuple[int, int, int]]] = {}
-        for name in self._weight_names:
+        for name in self._weight_buffer.weight_names(layer_idx):
             remote_slices = self._weight_buffer.get_remote_slices(layer_idx, name)
             for dst_slice, expert_start, expert_end in remote_slices:
                 cursor = expert_start
@@ -410,7 +404,7 @@ class DWDPWeightManager:
 
         return dst_ptrs, src_ptrs, sizes
 
-    def _prefetch_layer_batched(self, layer_idx: int) -> None:
+    def _prefetch_layer_batched(self, layer_idx: int, stream: torch.cuda.Stream) -> None:
         """Batched prefetch: one ``cudaMemcpyBatchAsync`` per layer."""
         plan = self._batched_copy_plans.get(layer_idx)
         if plan is None:
@@ -435,7 +429,7 @@ class DWDPWeightManager:
             [attr],
             [0],
             1,
-            self._copy_stream.cuda_stream,
+            stream.cuda_stream,
         )
         if err != cudart.cudaError_t.cudaSuccess:
             raise RuntimeError(
@@ -475,6 +469,13 @@ class DWDPWeightManager:
         compute_stream = torch.cuda.current_stream(
             torch.device("cuda", self._weight_buffer.device_id)
         )
+        num_layers = len(self._moe_layer_indices)
+        if layer_idx != self._moe_layer_indices[self._next_bind % num_layers]:
+            # A pass stopped inside the sequence: drop its copies and restart at this layer.
+            torch.cuda.synchronize(self._weight_buffer.device_id)
+            self._next_bind = self._next_issue = self._moe_layer_indices.index(layer_idx)
+            self._busy_slots.clear()
+        self.start_forward()
 
         # RAW hazard: wait until P2P copy into this slot is complete
         # before the forward pass reads the data.
@@ -483,7 +484,7 @@ class DWDPWeightManager:
         # Bind full [num_experts, ...] tensors to the backend module's parameters.
         # The tensor is a composite view: local region is zero-copy MNNVL,
         # remote regions contain the freshly P2P-copied expert weights.
-        for name in self._weight_names:
+        for name in self._weight_buffer.weight_names(layer_idx):
             full_tensor = self._weight_buffer.get_full_tensor(layer_idx, name)
             param = getattr(backend_module, name)
             param.data = full_tensor
@@ -496,8 +497,8 @@ class DWDPWeightManager:
         This method must be called after the layer's MoE kernel is enqueued on
         the current compute stream. CUDA stream ordering then guarantees that
         the consume event cannot complete until the kernel has stopped reading
-        the slot. The copy stream waits on this event before reusing the slot
-        for the layer two positions ahead in the MoE sequence.
+        the slot. The copy stream waits on this event before reusing the slot,
+        and the copies this frees are issued now.
 
         Args:
             layer_idx: MoE layer whose compute was just enqueued.
@@ -511,8 +512,29 @@ class DWDPWeightManager:
         compute_stream = torch.cuda.current_stream(
             torch.device("cuda", self._weight_buffer.device_id)
         )
-        self._consume_events[buf_idx].record(compute_stream)
+        for slot in self._ring_slots(buf_idx):
+            self._consume_events[slot].record(compute_stream)
         logger.debug(f"[DWDPWeightManager] Compute recorded: layer={layer_idx}, buf_slot={buf_idx}")
+        self._busy_slots.difference_update(self._ring_slots(buf_idx))
+        self._next_bind += 1
+        self.start_forward()
+
+    def start_forward(self) -> None:
+        """Issue, in sequence order, every copy whose buffer slot is free."""
+        num_layers = len(self._moe_layer_indices)
+        while True:
+            layer_idx = self._moe_layer_indices[self._next_issue % num_layers]
+            slots = self._ring_slots(self._weight_buffer.buffer_index_for_layer(layer_idx))
+            if self._busy_slots.intersection(slots):
+                return
+            self._busy_slots.update(slots)
+            self.prefetch_layer(layer_idx)
+            self._next_issue += 1
+
+    def _ring_slots(self, buf_idx: int):
+        """Ring slots whose pages buffer slot ``buf_idx`` maps."""
+        num_slots = self._weight_buffer.num_slots
+        return range(num_slots) if buf_idx >= num_slots else (buf_idx,)
 
     def release(self) -> None:
         """Synchronize outstanding work and release all owned VMM resources."""

@@ -5287,6 +5287,30 @@ class DwdpConfig(StrictBaseModel):
         "Enable limited-contention prefetch optimization. Uses batched "
         "memcpy with round-robin slice ordering across peers and a 2 MiB "
         "slice granularity to reduce NVLink contention.")
+    num_prefetch_slots: int = Field(
+        default=2,
+        ge=2,
+        description=
+        "The number of expert prefetch buffer slots. Each slot holds the "
+        "remote experts of one MoE layer; more slots let the prefetch run "
+        "further ahead of the MoE compute, at the cost of device memory that "
+        "is then not available to the KV cache.")
+    num_copy_streams: int = Field(
+        default=1,
+        ge=1,
+        description=
+        "The number of CUDA streams the expert prefetches rotate over, one "
+        "MoE layer each. More streams let the host enqueue further ahead of "
+        "the GPU; the copies and their order are unchanged.")
+    num_dense_slots: int = Field(
+        default=0,
+        ge=0,
+        description=
+        "Also shard the dense weights across the DWDP group when positive. "
+        "Each rank keeps 1/dwdp_size of every decoder layer's Linear weights "
+        "and pulls the rest into this many single-layer slots ahead of use; "
+        "the embedding and LM head are read in place from all ranks. 0 keeps "
+        "the dense weights resident on every rank.")
 
 
 class BaseLlmArgs(StrictBaseModel):
@@ -6200,6 +6224,15 @@ class TorchLlmArgs(BaseLlmArgs):
     dwdp_config: Optional[DwdpConfig] = Field(
         default=None,
         description="DWDP (Distributed Weight Data Parallelism) config.",
+        status="prototype")
+
+    context_only: bool = Field(
+        default=False,
+        description="Serve only the context phase of disaggregated requests (a "
+        "disaggregated context server). Warmup skips generation shapes, and a "
+        "DFlash drafter keeps only the weights its context pass reads, leaving "
+        "the rest of their memory to the KV cache; such a server then refuses "
+        "requests for more than one token.",
         status="prototype")
 
     encoder_max_batch_size: Optional[int] = Field(

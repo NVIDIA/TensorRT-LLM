@@ -766,6 +766,7 @@ class PyTorchModelEngine(ModelEngine):
             cuda_graph_specialize_lora=(
                 self.llm_args.lora_config is not None
                 and self.llm_args.lora_config.cuda_graph_specialize_lora),
+            context_only=self.llm_args.context_only,
             **extra_fields,
         )
 

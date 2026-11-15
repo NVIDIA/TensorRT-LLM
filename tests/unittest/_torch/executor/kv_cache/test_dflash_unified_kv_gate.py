@@ -214,8 +214,9 @@ def test_dflash_on_generation_worker_only_keeps_separate_cache(monkeypatch, tmp_
         context_servers={},
         generation_servers={"speculative_config": {"decoding_type": "DFlash"}},
     )
-    # The launcher rejects the variable when only one section sets speculative_config.
-    with pytest.raises(click.UsageError, match="both context_servers and generation_servers"):
+    # The launcher rejects the variable when the generation servers draft and the context
+    # servers do not.
+    with pytest.raises(click.UsageError, match="context_servers and, if any, generation_servers"):
         _launch_from_disagg_config(monkeypatch, tmp_path, **generation_only)
     # Unset, it keeps the draft KV private on both servers.
     monkeypatch.delenv(_SHARED_DRAFT_KV_ENV)

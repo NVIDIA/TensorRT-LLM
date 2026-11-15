@@ -1108,11 +1108,6 @@ class PyExecutor:
         if is_trace_enabled("TLLM_TRACE_EXECUTOR_LOOP"):
             self.event_loop = trace_func(self.event_loop)
 
-        if dwdp_manager is not None and not self.disable_overlap_scheduler:
-            raise ValueError(
-                "DWDP requires disable_overlap_scheduler=True. "
-                "Overlap scheduler is not yet supported with DWDP.")
-
         if self.drafter is not None:
             if self.event_loop.__name__ == self._executor_loop_pp.__name__:
                 raise NotImplementedError(
@@ -5682,6 +5677,8 @@ class PyExecutor:
                     with self.perf_manager.record_perf_events(
                             gpu_forward_start, gpu_forward_end) as fwd_timing:
                         with self._step_scope(scheduled_batch):
+                            if self.dwdp_manager is not None:
+                                self.dwdp_manager.prefetch_first_layers()
                             batch_outputs = self._forward_step(
                                 scheduled_batch, previous_tensors_device)
 

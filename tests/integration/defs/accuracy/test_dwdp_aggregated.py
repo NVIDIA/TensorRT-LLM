@@ -60,19 +60,26 @@ class TestDwdpAggDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @skip_pre_blackwell
     @skip_post_blackwell_ultra
     @pytest.mark.parametrize(
-        "num_experts_per_worker,num_prefetch_experts,contention_opt",
+        "num_experts_per_worker,num_prefetch_experts,contention_opt,moe_backend",
         [
-            (18, 18, False),
-            (24, 16, False),
-            (18, 18, True),
+            (18, 18, False, "CUTEDSL"),
+            (24, 16, False, "CUTEDSL"),
+            (18, 18, True, "CUTEDSL"),
+            (18, 18, False, "TRTLLM"),
         ],
-        ids=["mode_a_uniform", "mode_b_overlap", "mode_a_uniform_contention_opt"],
+        ids=[
+            "mode_a_uniform",
+            "mode_b_overlap",
+            "mode_a_uniform_contention_opt",
+            "mode_a_uniform_trtllm",
+        ],
     )
     def test_dwdp_agg_accuracy(
         self,
         num_experts_per_worker: int,
         num_prefetch_experts: int,
         contention_opt: bool,
+        moe_backend: str,
     ) -> None:
         dwdp_config = DwdpConfig(
             dwdp_size=DWDP_SIZE,
@@ -90,7 +97,7 @@ class TestDwdpAggDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             tensor_parallel_size=DWDP_SIZE,
             enable_attention_dp=True,
             dwdp_config=dwdp_config,
-            moe_config=MoeConfig(backend="CUTEDSL"),
+            moe_config=MoeConfig(backend=moe_backend),
             disable_overlap_scheduler=True,
             enable_autotuner=False,
             enable_chunked_prefill=False,

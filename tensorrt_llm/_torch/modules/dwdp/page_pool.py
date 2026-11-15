@@ -276,7 +276,7 @@ class PagePool:
         number of cuMemMap calls by 8x.
 
         Args:
-            slot: Double buffer slot (0 or 1).
+            slot: Ring slot; ``num_slots`` maps the pages of every slot in turn.
             va_start: Page-aligned VA position to start mapping.
             size: Total bytes to map (must be a multiple of page_size;
                 callers should use pool_granularity-aligned pre/post sizes).
@@ -294,17 +294,19 @@ class PagePool:
 
         aligned_size = align_up(size, self._page_size)
         num_pages_needed = aligned_size // self._page_size
+        # A slot past the last one maps the pages of every slot in turn.
+        handles = self._page_handles[slot] if slot < self.num_slots else sum(self._page_handles, [])
 
-        if page_offset + num_pages_needed > len(self._page_handles[slot]):
+        if page_offset + num_pages_needed > len(handles):
             raise ValueError(
                 f"Mapping {num_pages_needed} pages from offset {page_offset} "
-                f"exceeds slot {slot} capacity of {len(self._page_handles[slot])} pages"
+                f"exceeds slot {slot} capacity of {len(handles)} pages"
             )
 
         mappings = []
         for i in range(num_pages_needed):
             va = va_start + i * self._page_size
-            handle = self._page_handles[slot][page_offset + i]
+            handle = handles[page_offset + i]
             map_handle(va, self._page_size, handle, offset=0)
             mappings.append((va, self._page_size))
 
@@ -366,6 +368,23 @@ class PagePool:
         return False
 
 
+def assign_buffer_slots(
+    layouts: dict[int, dict[str, "PageAlignedLayout"]],  # noqa: F821
+    num_slots: int = 2,
+) -> dict[int, int]:
+    """Rotate layers over ``num_slots`` slots; layers with more remote bytes get slot ``num_slots``.
+
+    Slot ``num_slots`` maps the pages of every ring slot, so a few larger (e.g. quant-excluded BF16)
+    layers cost no extra memory; they run with nothing else in flight.
+    """
+    remote = {i: sum(x.pre_size + x.post_size for x in w.values()) for i, w in layouts.items()}
+    common = min(remote.values())
+    regular = [layer for layer in sorted(remote) if remote[layer] == common]
+    slots = dict.fromkeys(remote, num_slots)
+    slots.update((layer, i % num_slots) for i, layer in enumerate(regular))
+    return slots
+
+
 def compute_slot_sizes(
     layouts: dict[int, dict[str, "PageAlignedLayout"]],  # noqa: F821
     buffer_slot_assignments: dict[int, int],
@@ -377,13 +396,13 @@ def compute_slot_sizes(
 
     Args:
         layouts: Mapping from layer_idx to {weight_name: PageAlignedLayout}.
-        buffer_slot_assignments: Mapping from layer_idx to slot (0 or 1).
+        buffer_slot_assignments: Mapping from layer_idx to slot.
 
     Returns:
-        [slot0_size, slot1_size] in bytes.
+        One size per slot, in bytes.
     """
 
-    slot_sizes = [0, 0]
+    slot_sizes = [0] * (max(buffer_slot_assignments.values()) + 1)
 
     for layer_idx, weight_layouts in layouts.items():
         slot = buffer_slot_assignments.get(layer_idx, layer_idx % 2)
