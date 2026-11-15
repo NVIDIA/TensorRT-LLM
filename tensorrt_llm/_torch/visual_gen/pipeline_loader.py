@@ -33,6 +33,7 @@ Dynamic Quantization:
 import os
 import time
 from contextlib import ExitStack
+from pathlib import Path
 from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
@@ -49,6 +50,7 @@ from tensorrt_llm.visual_gen.args import VisualGenArgs
 from .config import DiffusionPipelineConfig
 from .mapping import VisualGenMapping
 from .models import AutoPipeline
+from .models.ltx2_5.checkpoint import BF16_TRANSFORMER, resolve_ltx25_checkpoint
 from .models.ltx23.checkpoint import resolve_ltx23_checkpoint
 from .pipeline_registry import PIPELINE_REGISTRY, PipelineComponent
 
@@ -112,6 +114,8 @@ class PipelineLoader:
         """
         if os.path.exists(checkpoint_dir):
             if os.path.isdir(checkpoint_dir):
+                if (Path(checkpoint_dir) / BF16_TRANSFORMER).is_file():
+                    return resolve_ltx25_checkpoint(checkpoint_dir, revision=self.args.revision)
                 try:
                     class_name = AutoPipeline._detect_from_checkpoint(checkpoint_dir)
                 except ValueError:
@@ -152,6 +156,8 @@ class PipelineLoader:
                     ),
                     revision=revision,
                 )
+            if entry is not None and entry.pipeline_cls.__name__ == "LTX25ICLoraPipeline":
+                return resolve_ltx25_checkpoint(checkpoint_dir, revision=revision)
             if entry is not None and entry.download_patterns:
                 local_dir = download_hf_partial(
                     checkpoint_dir,

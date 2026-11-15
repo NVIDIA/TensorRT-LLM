@@ -1991,7 +1991,12 @@ class NVFP4LinearMethod(LinearMethodBase):
                 # Dynamic mode: compute input_scale and alpha from current input
                 FP8_MAX, E2M1_MAX = 448.0, 6.0
                 amax_input = torch.amax(torch.abs(input)).float()
-                input_scale = FP8_MAX * E2M1_MAX / amax_input
+                # Keep zero activations representable without inf * 0 in FP4
+                # quantization. The original amax still makes alpha exactly zero.
+                denominator = torch.where(amax_input == 0,
+                                          torch.ones_like(amax_input),
+                                          amax_input)
+                input_scale = FP8_MAX * E2M1_MAX / denominator
                 alpha = (amax_input /
                          (FP8_MAX * E2M1_MAX)) * module.weight_scale_2
             else:
