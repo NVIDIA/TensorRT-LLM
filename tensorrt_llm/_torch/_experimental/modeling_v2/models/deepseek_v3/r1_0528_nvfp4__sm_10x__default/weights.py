@@ -84,6 +84,7 @@ online EPLB, keeps a host copy of, and what the MTP layer leaves: all of it
 without MTP, its two aliased keys with it).
 """
 
+from collections import Counter
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Callable
@@ -874,10 +875,42 @@ class DeepseekV3DefaultWeights:
     def load(self, model, weights) -> None:
         """Fill every declared weight from the checkpoint. Each source is read through
         its cut, multi-key rows feed their transform several tensors at once, and
-        coverage is asserted in both directions, not only checkpoint-side."""
+        coverage is asserted in both directions, not only checkpoint-side.
+
+        Keys leave the engine's dict (`mark_consumed_keys`) as early as they can, as
+        the built-in models release what they consume: the keys this rank never reads
+        at the start, every other key after its last read. The engine can back many
+        tensors with one read-ahead buffer, which is freed only when all of its keys
+        are gone; held to the end of the load, every rank would keep the checkpoint
+        files it touches in host memory, beside the host copies online EPLB keeps of
+        the experts."""
         core = model.model
         manifest = self.manifest(core)
         consumed: set = set()
+        checkpoint_keys = set(weights.keys())
+        expected = self.expected_unconsumed(core, weights)
+        reads = Counter(
+            key
+            for sources in manifest.values()
+            for ckpt_key, _, _, _ in sources
+            for key in (ckpt_key if isinstance(ckpt_key, tuple) else (ckpt_key,))
+        )
+        reads.update(self._host_copy_keys(core))
+        reads["lm_head.weight"] += 1
+        mark_consumed = getattr(weights, "mark_consumed_keys", None)
+        if mark_consumed is not None:
+            mark_consumed(sorted(expected))
+
+        def done(keys) -> None:
+            """Count one read of each of `keys`; release the ones read for the last time."""
+            consumed.update(keys)
+            last = []
+            for key in keys:
+                reads[key] -= 1
+                if reads[key] == 0:
+                    last.append(key)
+            if mark_consumed is not None and last:
+                mark_consumed(last)
 
         def fill(param: torch.nn.Parameter, ckpt_key, index, cut, transform) -> None:
             dst = param.data if index is None else param.data[index]
@@ -885,7 +918,7 @@ class DeepseekV3DefaultWeights:
             assert dst.shape == src.shape, (ckpt_key, tuple(dst.shape), tuple(src.shape))
             assert src.dtype == dst.dtype, (ckpt_key, src.dtype, dst.dtype)
             dst.copy_(src, non_blocking=True)
-            consumed.update(ckpt_key if isinstance(ckpt_key, tuple) else (ckpt_key,))
+            done(ckpt_key if isinstance(ckpt_key, tuple) else (ckpt_key,))
 
         assert set(manifest.keys()) == set(core.w.keys()), (
             "manifest/parameter drift",
@@ -900,7 +933,7 @@ class DeepseekV3DefaultWeights:
             if param_key.endswith(self.RELEASE_AFTER):
                 torch.cuda.empty_cache()
 
-        self._share_experts(core, weights, consumed)
+        self._share_experts(core, weights, done)
 
         # The shell builds lm_head vocab-parallel under TP and whole under
         # attention DP; read the rows it built and nothing else.
@@ -914,8 +947,7 @@ class DeepseekV3DefaultWeights:
         assert shell == {"lm_head.weight"}, f"unfed shell parameters: {sorted(shell)}"
 
         torch.cuda.synchronize()
-        leftover = set(weights.keys()) - consumed
-        expected = self.expected_unconsumed(core, weights)
+        leftover = checkpoint_keys - consumed
         assert leftover == expected, (
             "checkpoint coverage: leftover keys are not exactly this rank's "
             f"unheld experts plus what the MTP layer leaves; unexpected "
@@ -931,7 +963,19 @@ class DeepseekV3DefaultWeights:
             if isinstance(entry.src, _ExpertWindow) and i in entry.layer_indices(d)
         }
 
-    def _share_experts(self, core, weights, consumed: set) -> None:
+    def _host_copy_keys(self, core):
+        """The checkpoint keys `_share_experts` reads, one per read."""
+        d = core.dims
+        for i, eplb in getattr(core, "eplb_layers", {}).items():
+            if not eplb.online:
+                continue
+            for entry in self.WEIGHTS:
+                if isinstance(entry.src, _ExpertWindow) and i in entry.layer_indices(d):
+                    for expert in eplb.host_experts:
+                        key = entry.src.keys(i, expert)
+                        yield from key if isinstance(key, tuple) else (key,)
+
+    def _share_experts(self, core, weights, done: Callable) -> None:
         """Under online EPLB, hand each MoE layer's load-balancer handle this rank's host
         copies of its share of the experts (`EplbLayer.share_experts`): every slot weight
         of each, read through the same cut and transform as a slot's, on the slots'
@@ -945,8 +989,9 @@ class DeepseekV3DefaultWeights:
                 entry = by_name[name]
                 key = entry.src.keys(i, expert)
                 cut = entry.cut(d) if entry.cut is not None else None
-                consumed.update(key if isinstance(key, tuple) else (key,))
-                return self.read(weights, key, cut, entry.transform, core, device)
+                t = self.read(weights, key, cut, entry.transform, core, device)
+                done(key if isinstance(key, tuple) else (key,))
+                return t
 
             eplb.share_experts(slot_weights, expert_weight)
 

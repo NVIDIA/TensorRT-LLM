@@ -257,6 +257,12 @@ class _Checkpoint(dict):
     def full(self, key) -> torch.Tensor:
         return _full(key, self.cfg)
 
+    def mark_consumed_keys(self, keys) -> int:
+        """The engine dict's release: the keys are gone, so a later read of one fails."""
+        for key in keys:
+            dict.pop(self, key)
+        return len(keys)
+
 
 def _read_first(core, ckpt, param_key):
     """The tensor `load` copies into `param_key`'s first source, through the
@@ -704,6 +710,8 @@ def test_load_reads_only_the_rank_share(layout, mtp, monkeypatch):
         )
         ckpt = _Checkpoint(cfg, keys)
         D.MODEL_WEIGHTS.load(model, ckpt)
+        # Every key has left the dict: unread ones at the start, read ones after their last read.
+        assert not set(ckpt.keys()), sorted(ckpt.keys())[:4]
         _assert_slot_scales_are_the_expert_products(core)
 
         seen = [k for k, _, _ in ckpt.reads]
@@ -828,6 +836,8 @@ def test_eplb_load_fills_every_slot_with_its_expert(layout, mtp, monkeypatch):
         )
         ckpt = _Checkpoint(cfg, keys)
         D.MODEL_WEIGHTS.load(model, ckpt)
+        # Every key has left the dict: unread ones at the start, read ones after their last read.
+        assert not set(ckpt.keys()), sorted(ckpt.keys())[:4]
 
         _assert_slot_scales_are_the_expert_products(core)
         reads = Counter(k for k, _, _ in ckpt.reads)
@@ -918,6 +928,8 @@ def test_online_eplb_load_hands_over_this_ranks_experts(layout, mtp, monkeypatch
         )
         ckpt = _Checkpoint(cfg, keys)
         D.MODEL_WEIGHTS.load(model, ckpt)
+        # Every key has left the dict: unread ones at the start, read ones after their last read.
+        assert not set(ckpt.keys()), sorted(ckpt.keys())[:4]
 
         reads = Counter(k for k, _, _ in ckpt.reads)
         for i, hosting in core.eplb_layers.items():
