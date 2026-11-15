@@ -608,6 +608,43 @@ def test_logprobs_against_logits(
                 )
 
 
+@pytest.mark.parametrize(
+    "logit_rewrite",
+    [
+        {"repetition_penalty": 1.3},
+        {"presence_penalty": 1.0, "frequency_penalty": 0.5},
+        {"bad": [" C"]},
+    ],
+    ids=["repetition_penalty", "presence_frequency_penalty", "bad_words"],
+)
+@pytest.mark.threadleak(enabled=False)
+def test_raw_logprobs_ignore_logit_rewrites(logit_rewrite: dict[str, Any], simple_llm: LLM):
+    """Raw logprobs come from the model's logits, before penalties and token bans rewrite them.
+
+    The prompt repeats its tokens, so the penalties and the banned word already change the
+    logits of the first generated token.
+    """
+    sampling_params = SamplingParams(
+        max_tokens=8,
+        logprobs=3,
+        logprobs_mode=LogprobMode.RAW,
+        return_generation_logits=True,
+        **logit_rewrite,
+    )
+    for output in simple_llm.generate(["A B C A B C A B"], sampling_params=sampling_params):
+        completion = output.outputs[0]
+        expected = torch.log_softmax(completion.generation_logits.to(device="cuda"), dim=-1).cpu()
+        assert len(completion.logprobs) == len(completion.token_ids)
+        for step, token_logprobs in enumerate(completion.logprobs):
+            for token_id, logprob_obj in token_logprobs.items():
+                torch.testing.assert_close(
+                    torch.tensor(logprob_obj.logprob, dtype=torch.float32),
+                    expected[step, token_id],
+                    msg=f"raw logprob {logprob_obj.logprob} of token {token_id} at step {step} "
+                    f"does not match the model's {expected[step, token_id].item()}",
+                )
+
+
 @pytest.mark.parametrize("logprobs_k", [0, 2], ids=["top_0", "top_2"])
 @pytest.mark.threadleak(enabled=False)
 def test_logprobs_with_grouped_samplings_strategies(logprobs_k: int, simple_llm: LLM):

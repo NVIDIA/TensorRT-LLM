@@ -2832,6 +2832,17 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         return_log_probs = self._log_probs._return_log_probs(sampling_requests)
         if return_log_probs:
             self._log_probs._prepare_log_probs(sampling_requests)
+        # Raw logprobs come from the model's logits, but the embedding bias,
+        # penalties and token bans below rewrite logits_cuda in place. When a
+        # request that asks for raw logprobs uses one of them, read the raw
+        # logprobs from a copy of the logits taken before those steps.
+        raw_logprobs_logits_cuda = logits_cuda
+        if return_log_probs and any(
+            self._slot_params.need_raw_logprobs[cast(int, request.py_seq_slot)]
+            and self._request_rewrites_logits(request)
+            for request in sampling_requests
+        ):
+            raw_logprobs_logits_cuda = logits_cuda.clone()
 
         seq_slots_host = torch.tensor(
             [r.py_seq_slot for r in sampling_requests],
@@ -2985,7 +2996,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         if return_log_probs:
             self._log_probs._process_logprobs(
                 batched_sampling_result,
-                logits_cuda=logits_cuda,
+                logits_cuda=raw_logprobs_logits_cuda,
                 # Drop the trailing scratch slot row (see dummy_slot_row): it
                 # belongs to no request, and the logprobs stores are sized by
                 # max_num_sequences, which also sets the flat gather stride
