@@ -630,3 +630,25 @@ def test_metadata_prepare_snapshots_and_advances_the_slot_counts():
     assert metadata.replay_has_boundary[:3].tolist() == [False, True, False]
     assert metadata.replay_conv_has_initial[:3].tolist() == [False, True, True]
     assert counter.tolist() == [1, 16, 4, 0]
+
+    # Decode-only steps of the same requests: a full prepare(), then the steady
+    # step that skips the state-index staging. Both advance the rows.
+    decode_lens = torch.tensor([1, 1, 1], dtype=torch.int)
+    decode_metadata = SimpleNamespace(
+        seq_lens=decode_lens,
+        seq_lens_cuda=decode_lens.cuda(),
+        num_contexts=0,
+        num_ctx_tokens=0,
+        kv_cache_manager=manager,
+        request_ids=[10, 11, 12],
+        kv_cache_params=SimpleNamespace(
+            num_cached_tokens_per_seq=torch.tensor([4, 16, 1], dtype=torch.int),
+        ),
+    )
+    metadata.prepare(decode_metadata)
+    assert metadata.replay_pos[:3].tolist() == [4, 0, 1]
+    assert counter.tolist() == [2, 17, 5, 0]
+    metadata.prepare_steady_gen_step(decode_metadata)
+    assert metadata.replay_pos[:3].tolist() == [5, 1, 2]
+    assert metadata.replay_has_boundary[:3].tolist() == [False, True, False]
+    assert counter.tolist() == [3, 18, 6, 0]

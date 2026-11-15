@@ -323,6 +323,37 @@ def lds128_v4_b32(smem_pointer, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def ldg_v4_b32(address: Int64, *, loc=None, ip=None):
+    """One 16-byte global load (``ld.global.v4.b32``); the four words are returned as ``Int32``."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32()] * 4),
+        [address.ir_value()],
+        "ld.global.v4.b32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,l",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+    return tuple(Int32(llvm.extractvalue(T.i32(), result, [index])) for index in range(4))
+
+
+@dsl_user_op
+def stg_v4_b32(address: Int64, word0: Int32, word1: Int32, word2: Int32, word3: Int32, *, loc=None, ip=None) -> None:
+    """One 16-byte global store (``st.global.v4.b32``) of four ``Int32`` words."""
+    llvm.inline_asm(
+        None,
+        [address.ir_value(), word0.ir_value(), word1.ir_value(), word2.ir_value(), word3.ir_value()],
+        "st.global.v4.b32 [$0], {$1, $2, $3, $4};",
+        "l,r,r,r,r",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def stg_f32(address: Int64, value: Float32, predicate: Optional[Int32] = None, *, loc=None, ip=None) -> None:
     if predicate is None:
         llvm.inline_asm(
@@ -798,6 +829,7 @@ __all__ = [
     "cvt_f32x4_to_f8x4_scaled4_pack_i32",
     "cvt_f32x4_to_f8x4_scaled_pack_i32",
     "exit",
+    "ldg_v4_b32",
     "lds128_v4_b32",
     "mbarrier_arrive_expect_tx_on_peer",
     "movmatrix_b16",
@@ -816,6 +848,7 @@ __all__ = [
     "stg_e8m0_from_f32",
     "stg_e8m0x8_from_f32",
     "stg_f32",
+    "stg_v4_b32",
     "tma_load_1d",
     "fence_acq_rel_gpu",
     "f32x2_pack",
