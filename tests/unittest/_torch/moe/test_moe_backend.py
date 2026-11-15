@@ -63,10 +63,13 @@ from tensorrt_llm._torch.moe.fused_moe import (
 )
 from tensorrt_llm._torch.moe.fused_moe.activation import (
     DEFAULT_MOE_ACTIVATION,
+    ActivationParamShape,
     MoEActivation,
+    MoEActivationSupport,
     SiTuActivation,
     SwigluActivation,
     SwigluBiasActivation,
+    install_activation_params,
     materialize_activation_params,
 )
 from tensorrt_llm._torch.moe.fused_moe.communication import NVLinkOneSided
@@ -91,8 +94,8 @@ from tensorrt_llm._torch.moe.fused_moe.cutlass import (
     TrtllmTritonFp8BlockScalesImpl,
 )
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import (
-    CuteDslB12xNvfp4FusedMoE,
-    CuteDslB12xW4a16Nvfp4FusedMoE,
+    FlashinferCutedslNvfp4Impl,
+    FlashinferCutedslW4a16Nvfp4Impl,
 )
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_fc12 import CuteDslFc12FusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
@@ -103,6 +106,7 @@ from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import (
     TRTLLMGenFusedMoE,
     trtllm_gen_leaf,
 )
+from tensorrt_llm._torch.moe.fused_moe.impl_blocks import MoEWeightOwnerMixin
 from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoECommPlan,
     MoEDeployment,
@@ -148,6 +152,7 @@ from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb.planner import (
 )
 from tensorrt_llm._torch.moe.fused_moe.quantization import (
     FusedMoEMethodBase,
+    MXFP4WeightTRTLLMGenFusedMoEMethod,
     NVFP4FusedMoEMethod,
     NVFP4MarlinFusedMoEMethod,
     NVFP4MegaMoECuteDslMethod,
@@ -2614,6 +2619,7 @@ def test_megamoe_quantize_reserves_sms_only_for_a_replica_plan(monkeypatch, requ
     request.addfinalizer(mega_moe_cute_dsl._fp4_quantize_has_sm_budget.cache_clear)
     moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
     torch.nn.Module.__init__(moe)
+    moe._shared_expert = None
     moe.fc31_input_scale = torch.ones(1)
     x = torch.zeros(3, 64, dtype=torch.bfloat16)
 
@@ -3549,7 +3555,7 @@ def test_apply_router_weight_on_input_support_is_not_inherited():
     wrapper."""
     assert TrtllmCutlassNvfp4Impl.capabilities.supports_apply_router_weight_on_input
     assert MarlinFusedMoE.capabilities.supports_apply_router_weight_on_input
-    for b12x_leaf in (CuteDslB12xNvfp4FusedMoE, CuteDslB12xW4a16Nvfp4FusedMoE):
+    for b12x_leaf in (FlashinferCutedslNvfp4Impl, FlashinferCutedslW4a16Nvfp4Impl):
         assert not b12x_leaf.capabilities.supports_apply_router_weight_on_input
     assert not TRTLLMGenFusedMoE.capabilities.supports_apply_router_weight_on_input
 
@@ -4000,11 +4006,13 @@ def test_megamoe_cutedsl_quantize_input_applies_pre_quant_scale(
     activation, which leaves ``quantize_input`` as the one place to apply it.
 
     ``__new__`` without ``__init__``: the real constructor wants a GPU and a
-    symmetric-memory provider, and ``quantize_input`` reads two parameters.
+    symmetric-memory provider, and ``quantize_input`` reads two parameters and
+    the fused shared expert, which stays unset here.
     """
     hidden_size = 64
     backend = TrtllmCutedslMegaMoeNvfp4Impl.__new__(TrtllmCutedslMegaMoeNvfp4Impl)
     torch.nn.Module.__init__(backend)
+    backend._shared_expert = None
     backend.fc31_input_scale = torch.nn.Parameter(torch.tensor(0.5), requires_grad=False)
     # Weight creation registers the slot as None, and only a checkpoint that
     # carries ``*.pre_quant_scale`` fills it, as ``NVFP4FusedMoEMethod`` does.
@@ -5834,6 +5842,88 @@ def test_moe_backend(
                 ref_fused_moe.check_accuracy(output, ref_output)
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or get_sm_version() != 90,
+    reason="The SM90 FP8 block-scale GEMM quantizes FC1 inputs in the row expansion",
+)
+@pytest.mark.parametrize("num_tokens", [1, 3, 8192])
+def test_cutlass_fp8_block_scales_skewed_routing(num_tokens: int):
+    """Row expansion with many rows per block, routed to few experts.
+
+    Most tokens pick the same four experts and the rest route randomly, so
+    each expansion block walks a long run of rows across expert boundaries,
+    past experts that received no rows, and into experts that received one.
+    """
+    num_experts, top_k, hidden_size, intermediate_size = 64, 4, 512, 512
+    dtype = torch.bfloat16
+    quant_algo = QuantAlgo.FP8_BLOCK_SCALES
+    with torch.device("cuda"):
+        torch.manual_seed(0)
+        AutoTuner.get().setup_distributed_state(Mapping())
+        routing_method = RenormalizeMoeRoutingMethod(top_k=top_k)
+        x = torch.randn((num_tokens, hidden_size), dtype=dtype)
+        router_logits = torch.randn((num_tokens, num_experts), dtype=dtype)
+        # 7 of every 8 tokens pick experts 0, 7, 8 and 40; the others pick four
+        # of experts 41-63, except tokens 7 and 15, which each send one row to
+        # expert 3 and 5. Experts 1, 2, 4, 6 and 9-39 receive no rows.
+        token = torch.arange(num_tokens)
+        hot = token % 8 != 7
+        router_logits[hot.nonzero().flatten()[:, None], torch.tensor([0, 7, 8, 40])] += 20.0
+        router_logits[(~hot).nonzero().flatten()[:, None], torch.arange(41, 64)] += 20.0
+        for single_token, expert in ((7, 3), (15, 5)):
+            if single_token < num_tokens:
+                router_logits[single_token, expert] += 40.0
+
+        quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+            quant_algo, x, MoeBackendType.CUTLASS
+        )
+        quantize_util = quantize_util_cls(
+            num_experts=num_experts,
+            dtype=dtype,
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_size,
+            quant_config=quant_config,
+        )
+        backend = create_test_backend(
+            backend_type=MoeBackendType.CUTLASS,
+            routing_method=routing_method,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            quant_config=quant_config,
+            mapping=Mapping(),
+        )
+        weights = quantize_util.create_weights(**quant_kwargs)
+        backend.load_weights([weights])
+        backend.post_load_weights()
+        backend.cuda()
+        ref_fused_moe = quantize_util.create_ref_module(routing_method)
+        ref_fused_moe.load_weights([weights])
+        ref_fused_moe.cuda()
+
+        with torch.inference_mode():
+            token_selected_experts, token_final_scales = routing_method.apply(router_logits)
+            counts = torch.bincount(token_selected_experts.flatten(), minlength=num_experts)
+            if num_tokens == 8192:
+                assert counts[[1, 2, 4, 6, *range(9, 40)]].sum() == 0
+                assert counts[3] == counts[5] == 1
+                assert counts.max() >= num_tokens * 7 // 8
+            ref_output = ref_fused_moe.forward(x, router_logits)
+            x_quantized, x_sf = backend.quantize_input(x, post_quant_comm=False)
+            output = run_backend_moe(
+                backend,
+                MoeBackendType.CUTLASS,
+                x_quantized,
+                x_sf,
+                token_selected_experts,
+                token_final_scales,
+                dtype,
+                router_logits,
+            )
+        ref_fused_moe.check_accuracy(output, ref_output)
+
+
 # =====================================================================
 # BF16 (unquantized) TRTLLM-Gen MoE: DeepSeekV3 / Renormalize routing
 # =====================================================================
@@ -6760,6 +6850,7 @@ def test_cutedsl_fc12_run_moe_sort_tables(
     backend.mapping = SimpleNamespace(moe_ep_size=1)
     backend._concurrent_sm_reserve = 0
     backend.apply_router_weight_on_input = False
+    backend.routing_method = None
     weights = MagicMock(expert_size_per_partition=8, slot_start=0)
     backend._build_local_weight_view = lambda: weights
     sort_outputs = (None,) * 6
@@ -7011,12 +7102,12 @@ _B12X_PREFILL_THRESHOLD = 64
 @pytest.mark.parametrize(
     "leaf_cls, num_tokens, reaches_cutlass",
     [
-        pytest.param(CuteDslB12xNvfp4FusedMoE, _B12X_PREFILL_THRESHOLD, True, id="nvfp4-prefill"),
+        pytest.param(FlashinferCutedslNvfp4Impl, _B12X_PREFILL_THRESHOLD, True, id="nvfp4-prefill"),
         pytest.param(
-            CuteDslB12xNvfp4FusedMoE, _B12X_PREFILL_THRESHOLD - 1, False, id="nvfp4-decode"
+            FlashinferCutedslNvfp4Impl, _B12X_PREFILL_THRESHOLD - 1, False, id="nvfp4-decode"
         ),
         pytest.param(
-            CuteDslB12xW4a16Nvfp4FusedMoE, _B12X_PREFILL_THRESHOLD, False, id="w4a16-prefill"
+            FlashinferCutedslW4a16Nvfp4Impl, _B12X_PREFILL_THRESHOLD, False, id="w4a16-prefill"
         ),
     ],
 )
@@ -7081,6 +7172,7 @@ class _FreshOutputBackend:
 
     capabilities = MoEStaticCapability()
     input_requirement = MoEInputRequirement()
+    fused_route_quant_enabled = True
 
     def __init__(self, stream_stack: list) -> None:
         self._stream_stack = stream_stack
@@ -7139,7 +7231,8 @@ def _chunking_moe(backend, num_chunks: int) -> SimpleNamespace:
         calculate_num_chunks=lambda all_rank_num_tokens: num_chunks,
         split_chunk=lambda n, k: [n // k + (i < n % k) for i in range(k)],
         determine_communication_method=no_op,
-        _using_load_balancer=lambda: False,
+        _using_dynamic_load_balancer=lambda: False,
+        _warmup_placement_route_counters=lambda row_offset: None,
         _load_balancer_start_wait_gpu_stage=no_op,
         _load_balancer_start_set_cpu_stage=no_op,
         _load_balancer_done_set_cpu_stage=no_op,
@@ -7164,7 +7257,9 @@ def _forward_in_two_chunks(backend) -> Tuple[torch.Tensor, torch.Tensor]:
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "leaf_cls", [CuteDslB12xNvfp4FusedMoE, CuteDslB12xW4a16Nvfp4FusedMoE], ids=["nvfp4", "w4a16"]
+    "leaf_cls",
+    [FlashinferCutedslNvfp4Impl, FlashinferCutedslW4a16Nvfp4Impl],
+    ids=["nvfp4", "w4a16"],
 )
 def test_b12x_multi_chunk_forward_keeps_every_chunk(leaf_cls, monkeypatch):
     """Every b12x call returns the same storage, so a two-chunk forward has to
@@ -7249,3 +7344,142 @@ def test_configurable_moe_exposes_the_backend_lora_state():
     assert getattr(moe, "_moe_lora_enabled", False) is True
     moe.backend = SimpleNamespace()
     assert getattr(moe, "_moe_lora_enabled", False) is False
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("meta_init", [False, True])
+@pytest.mark.parametrize("bias", [False, True])
+@pytest.mark.parametrize("gptoss", [False, True])
+@pytest.mark.parametrize(
+    "loading_mode",
+    [MoEWeightLoadingMode.VANILLA, MoEWeightLoadingMode.FUSED_GATE_UP_PROJ],
+)
+def test_mxfp4_fp8_trtllm_gen_accumulator_params(
+    monkeypatch: pytest.MonkeyPatch,
+    bias: bool,
+    gptoss: bool,
+    loading_mode: MoEWeightLoadingMode,
+    meta_init: bool,
+) -> None:
+    method = W4A8MXFP4FP8TRTLLMGenFusedMoEMethod()
+
+    class WeightOwner(MoEWeightOwnerMixin, torch.nn.Module):
+        activation_support = MoEActivationSupport(
+            kinds=frozenset({ActivationType.Swiglu, ActivationType.SwigluBias}),
+            alpha_beta=ActivationParamShape.PER_EXPERT_TENSOR,
+            limit=ActivationParamShape.PER_EXPERT_TENSOR,
+        )
+
+        def _get_quant_method(self) -> W4A8MXFP4FP8TRTLLMGenFusedMoEMethod:
+            return method
+
+    def create_module() -> WeightOwner:
+        owner = WeightOwner()
+        owner.num_experts = 4
+        owner.expert_size_per_partition = 2
+        owner.initial_local_expert_ids = [1, 3]
+        owner.weight_loading_mode = loading_mode
+        owner.bias = bias
+        owner.activation = (
+            SwigluBiasActivation(
+                gate_sigmoid_scale=torch.tensor([1.702, 1.5], device="cpu"),
+                linear_offset=torch.tensor([1.0, 2.0], device="cpu"),
+                clamp=torch.tensor([7.0, 9.0], device="cpu"),
+            )
+            if gptoss
+            else DEFAULT_MOE_ACTIVATION
+        )
+        device = "meta" if meta_init else "cpu"
+        install_activation_params(owner, device=device)
+        with torch.device(device):
+            owner.create_weights()
+        if meta_init:
+            owner.to_empty(device="cpu")
+        return owner
+
+    def create_weight_storage(
+        self: MXFP4WeightTRTLLMGenFusedMoEMethod, target_module: torch.nn.Module
+    ) -> None:
+        target_module.register_parameter("w3_w1_weight", torch.nn.Parameter(torch.zeros(2, 4, 2)))
+        target_module.register_parameter("w2_weight", torch.nn.Parameter(torch.zeros(2, 2, 2)))
+        target_module.register_buffer("w3_w1_bias", torch.zeros(2, 4) if bias else None)
+        target_module.register_buffer("w2_bias", torch.zeros(2, 2) if bias else None)
+
+    def load_experts(
+        target_module: torch.nn.Module,
+        checkpoint_weights: dict[str, torch.Tensor],
+        mode: MoEWeightLoadingMode,
+        expert_ids: list[int],
+        w31: torch.Tensor,
+        w2: torch.Tensor,
+        b31: torch.Tensor | None,
+        b2: torch.Tensor | None,
+    ) -> None:
+        if bias:
+            assert b31 is not None and b2 is not None
+            b31.copy_(checkpoint_weights["fc1_bias"])
+            b2.copy_(checkpoint_weights["fc2_bias"])
+
+    # Weight packing is orthogonal to the scale contract and requires CUDA.
+    monkeypatch.setattr(MXFP4WeightTRTLLMGenFusedMoEMethod, "create_weights", create_weight_storage)
+    monkeypatch.setattr(MXFP4WeightTRTLLMGenFusedMoEMethod, "load_quant_scales", lambda *a: None)
+    monkeypatch.setattr(
+        MXFP4WeightTRTLLMGenFusedMoEMethod,
+        "cache_derived_state",
+        FusedMoEMethodBase.cache_derived_state,
+    )
+    monkeypatch.setattr(method, "load_expert_weights_to_dst", load_experts)
+    module = create_module()
+
+    raw_beta = torch.tensor([1.0, 2.0])
+    raw_clamp = torch.tensor([7.0, 9.0])
+    fc1_bias = torch.arange(1, 9, dtype=torch.float32).reshape(2, 4)
+    fc2_bias = torch.arange(1, 5, dtype=torch.float32).reshape(2, 2)
+    for fc1_scale, fc2_scale in ((0.5, 0.25), (0.25, 0.5)):
+        weights = {"fc1_bias": fc1_bias, "fc2_bias": fc2_bias}
+        if loading_mode == MoEWeightLoadingMode.VANILLA:
+            for expert in range(module.num_experts):
+                weights[f"{expert}.w1.input_scale"] = torch.tensor(fc1_scale)
+                weights[f"{expert}.w3.input_scale"] = torch.tensor(fc1_scale)
+                weights[f"{expert}.w2.input_scale"] = torch.tensor(fc2_scale)
+        else:
+            weights["gate_up_proj_input_scale"] = torch.tensor(fc1_scale)
+            weights["down_proj_input_scale"] = torch.tensor(fc2_scale)
+
+        module.load_weights([weights])
+        module.post_load_weights()
+        module.post_load_weights()
+        module.process_weights_after_loading()
+
+        torch.testing.assert_close(
+            module.fc31_input_dequant, torch.full((2,), fc1_scale / fc2_scale)
+        )
+        if gptoss:
+            torch.testing.assert_close(module.act_alpha, torch.tensor([1.702, 1.5]))
+            torch.testing.assert_close(module.act_beta, raw_beta / fc1_scale)
+            torch.testing.assert_close(module.act_clamp, raw_clamp / fc1_scale)
+        else:
+            assert module.act_beta is None
+            assert module.act_clamp is None
+        if bias:
+            torch.testing.assert_close(module.w3_w1_bias, fc1_bias / fc1_scale)
+            torch.testing.assert_close(module.w2_bias, fc2_bias / fc2_scale)
+        assert not hasattr(module, "_act_beta_unscaled")
+        assert not hasattr(module, "_act_clamp_unscaled")
+
+        # Runtime weights omit the non-persistent activation configuration.
+        restored = create_module()
+        restored.load_state_dict(module.state_dict())
+        # A receiver can rebuild derived state without loading checkpoint weights.
+        restored.cache_derived_state()
+        restored.cache_derived_state()
+        if gptoss:
+            torch.testing.assert_close(restored.act_alpha, torch.tensor([1.702, 1.5]))
+            torch.testing.assert_close(restored.act_beta, raw_beta / fc1_scale)
+            torch.testing.assert_close(restored.act_clamp, raw_clamp / fc1_scale)
+        else:
+            assert restored.act_beta is None
+            assert restored.act_clamp is None
+        if bias:
+            torch.testing.assert_close(restored.w3_w1_bias, module.w3_w1_bias)
+            torch.testing.assert_close(restored.w2_bias, module.w2_bias)

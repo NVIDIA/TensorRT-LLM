@@ -47,6 +47,9 @@ from tensorrt_llm._torch.kernels.blackwell.utils import (
     is_power_of_2,
 )
 
+# TMA cache hint (CUTLASS copy_sm90_desc.hpp): L2 evict-first.
+_TMA_L2_EVICT_FIRST = 0x12F0000000000000
+
 """
 High-performance persistent blockscaled contiguous grouped dense GEMM (C = alpha * (SFA * A) * (SFB * B)) example for
 the NVIDIA Blackwell architecture using CUTE DSL.
@@ -206,6 +209,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         raster_along_m: bool = False,
         use_expert_counts: bool = False,
         num_local_experts: int = 0,
+        weight_evict_first: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel.
 
@@ -232,6 +236,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         self.raster_along_m = raster_along_m
         self.use_expert_counts = use_expert_counts
         self.num_local_experts = num_local_experts
+        # Expert weights (B, SFB) are loaded with the L2 evict-first hint.
+        self.weight_evict_first = weight_evict_first
         self.num_tile_info_fields = 6 if self.use_expert_counts else 5
         if self.use_expert_counts:
             assert self.num_local_experts > 0
@@ -1451,6 +1457,11 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                         tBsB_pipe,
                         tma_bar_ptr=tma_bar,
                         mcast_mask=b_full_mcast_mask,
+                        **(
+                            {"cache_policy": cutlass.Int64(_TMA_L2_EVICT_FIRST)}
+                            if cutlass.const_expr(self.weight_evict_first)
+                            else {}
+                        ),
                     )
                     cute.copy(
                         tma_atoms_sfb[0],
@@ -1458,6 +1469,11 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                         tBsSFB_pipe,
                         tma_bar_ptr=tma_bar,
                         mcast_mask=sfb_full_mcast_mask,
+                        **(
+                            {"cache_policy": cutlass.Int64(_TMA_L2_EVICT_FIRST)}
+                            if cutlass.const_expr(self.weight_evict_first)
+                            else {}
+                        ),
                     )
 
                     # Peek (try_wait) AB buffer empty for k_tile = prefetch_k_tile_cnt + k_tile + 1

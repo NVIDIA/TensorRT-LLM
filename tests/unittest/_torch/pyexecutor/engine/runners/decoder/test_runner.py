@@ -718,6 +718,7 @@ class TestDecodeGraphMetadataPreparation(unittest.TestCase):
                     promoted = frozenset({1})
                 elif case == "speculative":
                     enable_spec_decode = True
+                    selected = key._replace(draft_len=1)
                 elif case == "encoder_decoder":
                     engine._deferred_decode_outputs_supported = False
                 elif case == "context_parallel":
@@ -729,7 +730,7 @@ class TestDecodeGraphMetadataPreparation(unittest.TestCase):
                 ):
                     self.assertEqual(
                         metadata._csa2_defer_decode_outputs,
-                        case in ("ordinary", "ordinary_overlap"),
+                        case in ("ordinary", "ordinary_overlap", "speculative"),
                     )
                 self.assertFalse(metadata._csa2_defer_decode_outputs)
 

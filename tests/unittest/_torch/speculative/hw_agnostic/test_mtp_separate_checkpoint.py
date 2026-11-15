@@ -419,6 +419,34 @@ def test_nemotron_embedded_multimodal_mtp_uses_language_config() -> None:
     assert not spec_config.uses_replacement_heads
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "moe_selection",
+    [{"moe_backend": "CUTLASS"}, {"moe_tactic": "cutlass"}],
+    ids=["moe_backend", "moe_tactic"],
+)
+def test_mtp_moe_selection_allowed_for_shared_kv_replacement_heads(tmp_path, moe_selection) -> None:
+    """Replacement heads load through their own weight mapper, so they select for themselves."""
+    spec_config = MTPDecodingConfig(
+        max_draft_len=1,
+        speculative_model=str(tmp_path),
+        **moe_selection,
+    )
+    model_config = SimpleNamespace(
+        architectures=["Gemma4ForCausalLM"],
+        num_nextn_predict_layers=1,
+    )
+
+    update_spec_config_from_model_config(
+        spec_config, model_config, _EmbeddedOrHeadReplacementTarget
+    )
+
+    assert spec_config.uses_replacement_heads
+    assert spec_config._use_shared_kv_cache
+    for field, value in moe_selection.items():
+        assert getattr(spec_config, field) == value
+
+
 def test_remap_preprocessed_mtp_weights_for_draft_model():
     from tensorrt_llm._torch.speculative.utils import remap_preprocessed_mtp_weights_for_draft_model
 
