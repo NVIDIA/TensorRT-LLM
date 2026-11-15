@@ -20,7 +20,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import copy
 import os
 from types import SimpleNamespace
 from typing import (TYPE_CHECKING, Dict, List, Literal, NamedTuple, Optional,
@@ -357,14 +356,15 @@ class _DeferredSharedExpertFinalize(NamedTuple):
 
 
 def _with_moe_backend(model_config: ModelConfig, backend: str) -> ModelConfig:
-    """``model_config`` with another MoE backend for one layer's experts."""
-    if model_config.moe_backend == backend:
+    """``model_config`` with another MoE backend, and no tactic, for one
+    layer's experts.
+
+    The layer's experts run in another format than the checkpoint's, so a
+    tactic pinned for the checkpoint's format does not apply to them.
+    """
+    if model_config.moe_backend == backend and model_config.moe_tactic is None:
         return model_config
-    layer_config = copy.copy(model_config)
-    layer_config._frozen = False
-    layer_config.moe_backend = backend
-    layer_config._frozen = True
-    return layer_config
+    return model_config.copy_with(moe_backend=backend, moe_tactic=None)
 
 
 class Qwen3NextSparseMoeBlock(nn.Module):
@@ -440,19 +440,43 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             expert_quant_config = quant_config_for(
                 model_config.quant_config.kv_cache_quant_algo)
             weight_loading_mode = MoEWeightLoadingMode.VANILLA
-            moe_model_config = _with_moe_backend(model_config, "TRTLLM")
+            if model_config.moe_tactic is None:
+                moe_model_config = _with_moe_backend(model_config, "TRTLLM")
+            elif model_config.moe_backend != "TRTLLM":
+                raise ValueError(
+                    "speculative_config.draft_moe_dtype='nvfp4' runs the "
+                    f"draft experts of layer {layer_idx} on the TRTLLM-gen "
+                    "MoE, but speculative_config.moe_tactic="
+                    f"{model_config.moe_tactic!r} selects backend family "
+                    f"{model_config.moe_backend}. Unset "
+                    "speculative_config.moe_tactic, or name a TRTLLM-gen "
+                    "implementation such as "
+                    "'trtllm.trtllm_gen.fused_moe.nvfp4'.")
         elif _experts_excluded_from_quant(model_config, layer_idx):
-            # These experts end up bf16 whatever the per-layer entry says, so
-            # build them on CUTLASS, the only backend that serves bf16
-            # unconditionally.
+            # These experts end up bf16 whatever the per-layer entry says.
             expert_quant_config = QuantConfig(kv_cache_quant_algo=model_config.
                                               quant_config.kv_cache_quant_algo)
-            if model_config.moe_backend != "CUTLASS":
+            # An MTP layer's tactic can only be speculative_config.moe_tactic,
+            # which pins these experts: MoE resolution runs it or refuses it.
+            # Otherwise build them on CUTLASS, the only backend that serves
+            # bf16 unconditionally.
+            draft_tactic_pins_them = (model_config.moe_tactic is not None
+                                      and layer_idx is not None
+                                      and n_hidden is not None
+                                      and layer_idx >= n_hidden)
+            if not draft_tactic_pins_them and (
+                    model_config.moe_backend != "CUTLASS"
+                    or model_config.moe_tactic is not None):
                 moe_model_config = _with_moe_backend(model_config, "CUTLASS")
+                dropped_tactic = (
+                    "" if model_config.moe_tactic is None else
+                    f"; the MoE tactic {model_config.moe_tactic!r} does not "
+                    "apply to it")
                 logger.warning(
                     f"Layer {layer_idx} MoE experts are excluded from "
                     "quantization; using moe_backend=CUTLASS for this layer "
-                    f"(other layers keep {model_config.moe_backend}).")
+                    f"(other layers keep {model_config.moe_backend})"
+                    f"{dropped_tactic}.")
         self.experts = create_moe(
             num_experts=self.num_experts,
             routing_method=self.gate.routing_method,
@@ -609,14 +633,18 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         assert hidden_states.shape[-1] == self.hidden_dim
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_dim)
+        routed_hidden_states = hidden_states
         use_dp_padding = False
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
 
         if self.enable_attention_dp and self.mapping.tp_size > 1 and is_sm_120f(
         ):
             use_dp_padding = True
-            hidden_states = torch.nn.functional.pad(
-                hidden_states,
+            # Padding improves context-phase MoE communication on SM120. Keep
+            # it local to the routed experts: the shared expert operates on
+            # this rank's real tokens and must retain the unpadded row count.
+            routed_hidden_states = torch.nn.functional.pad(
+                routed_hidden_states,
                 (0, 0, 0, max(all_rank_num_tokens) - hidden_states.shape[0]))
 
         if not do_finalize and not (self.can_defer_finalize
@@ -629,18 +657,18 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             out = self._decode_front(
                 self.gate,
                 experts,
-                hidden_states,
+                routed_hidden_states,
                 all_rank_num_tokens=all_rank_num_tokens,
                 use_dp_padding=use_dp_padding,
                 do_finalize=do_finalize,
             )
             if out is not None:
                 return out
-            router_logits = self.gate(hidden_states)
+            router_logits = self.gate(routed_hidden_states)
             return experts(
-                hidden_states,
+                routed_hidden_states,
                 router_logits,
-                output_dtype=hidden_states.dtype,
+                output_dtype=routed_hidden_states.dtype,
                 all_rank_num_tokens=all_rank_num_tokens,
                 use_dp_padding=use_dp_padding,
                 do_finalize=do_finalize,

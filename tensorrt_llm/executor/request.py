@@ -238,8 +238,29 @@ class GenerationRequest:
     # zero blast radius on any other attribute.
     _I32 = "\x00i32be"
 
+    # Prompt-tail transport (executor/prompt_tail.py): a frontend sets
+    # ``_prompt_tail_tokens`` on an eligible request so that ``__getstate__``
+    # ships only that many trailing ids; the receiving side records the number
+    # of ids left out in ``_prompt_trimmed_prefix``.
+    _prompt_tail_tokens: int = 0
+    _prompt_trimmed_prefix: int = 0
+
+    @property
+    def prompt_len(self) -> int:
+        """Prompt length, counting ids the prompt-tail transport left out."""
+        buf = self.__dict__.get("_prompt_token_ids_i32")
+        ids = buf if buf is not None else self.__dict__.get("_prompt_token_ids")
+        return self._prompt_trimmed_prefix + (len(ids)
+                                              if ids is not None else 0)
+
     @property
     def prompt_token_ids(self):
+        if self._prompt_trimmed_prefix:
+            raise RuntimeError(
+                f"Request {self.id} carries only its last prompt ids "
+                f"({self._prompt_trimmed_prefix} left out by "
+                "gen_prompt_tail_tokens); the full prompt is not "
+                "available on the worker")
         ptids = self.__dict__.get("_prompt_token_ids")
         if ptids is None:
             buf = self.__dict__.get("_prompt_token_ids_i32")
@@ -282,8 +303,16 @@ class GenerationRequest:
     def __getstate__(self):
         state = self.__dict__.copy()
         buf = state.pop("_prompt_token_ids_i32", None)
+        tail = state.pop("_prompt_tail_tokens", 0)
         ptids = state.get("_prompt_token_ids")
-        if ptids is not None:
+        if tail:
+            ids = buf if buf is not None else ptids
+            tail_ids = np.ascontiguousarray(ids[len(ids) - tail:],
+                                            dtype=np.int32)
+            state["_prompt_token_ids"] = (GenerationRequest._I32,
+                                          tail_ids.tobytes())
+            state["_prompt_trimmed_prefix"] = len(ids) - tail
+        elif ptids is not None:
             state["_prompt_token_ids"] = GenerationRequest._enc_tokens(ptids)
         elif buf is not None:
             # not yet materialized -> encode the buffer's bytes directly

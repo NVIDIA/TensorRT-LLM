@@ -597,6 +597,7 @@ def _load_item(request_id: int, tokens: int, generation_only: bool = False) -> R
 
     request = Mock()
     request.num_input_tokens = tokens
+    request.py_prompt_trimmed_prefix = 0
     request.priority = DEFAULT_REQUEST_PRIORITY
     request.request_type = (
         RequestType.REQUEST_TYPE_GENERATION_ONLY
@@ -686,7 +687,12 @@ class TestQueuedLoadTracker:
         # A readable request, so only the item kind can keep it out of the totals.
         control = RequestQueueItem(5, _load_item(5, 10).request, is_canceled_request=True)
         unreadable = RequestQueueItem(
-            6, Mock(num_input_tokens=None, priority=DEFAULT_REQUEST_PRIORITY)
+            6,
+            Mock(
+                num_input_tokens=None,
+                py_prompt_trimmed_prefix=0,
+                priority=DEFAULT_REQUEST_PRIORITY,
+            ),
         )
         queue.add_requests([control, unreadable])
         assert queue.queued_load.totals() == (0, 0, 0, 0)

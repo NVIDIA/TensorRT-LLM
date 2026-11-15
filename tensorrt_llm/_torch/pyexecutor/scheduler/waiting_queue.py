@@ -36,7 +36,7 @@ class QueuedLoadTracker:
     share it (its tokens are those of the first one added); it stops counting
     when the last of them leaves. Removing an absent id is ignored, so the
     put-back path (pop, then prepend) stays consistent. Items without a
-    readable ``input_token_ids`` are not counted.
+    readable ``num_input_tokens`` are not counted.
     """
 
     def __init__(self) -> None:
@@ -58,12 +58,13 @@ class QueuedLoadTracker:
             entry[2] += 1
             return
         try:
-            tokens = int(item.request.num_input_tokens)
+            # The prompt length, with the ids a prompt-tail transport left out.
+            tokens = int(item.request.num_input_tokens + item.request.py_prompt_trimmed_prefix)
             is_gen = item.request.request_type == RequestType.REQUEST_TYPE_GENERATION_ONLY
         except (AttributeError, TypeError) as e:
             logger.warning(
                 f"Excluding queued item {item.id} from queued counters: "
-                f"input_token_ids not readable ({type(e).__name__})"
+                f"num_input_tokens not readable ({type(e).__name__})"
             )
             return
         self._entries[item.id] = [is_gen, tokens, 1]

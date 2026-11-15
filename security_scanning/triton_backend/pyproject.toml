@@ -5,12 +5,15 @@ description = ""
 authors = [
     {name = "TensorRT LLM [90828364+tensorrt-cicd@users.noreply.github.com]"}
 ]
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.12,<3.13"
 dependencies = [
+    "regex (>=2026.11.9,<2027.0.0)",
     "fire (>=0.7.1,<0.8.0)",
     "tritonclient[all] (>=2.74.0,<3.0.0)",
     "transformers (==5.5.4)",
+    "pandas (>=3.1.1,<4.0.0)",
     "tabulate (>=0.10.0,<0.11.0)",
+    "flash-attn (>=2.8.3.post2,<3.0.0)",
     "torchao (>=0.14.1)"
 ]
 

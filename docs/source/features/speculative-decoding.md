@@ -451,3 +451,17 @@ rejects fp8.
 planner for packed FP4 MLA decode. The default is disabled (0); the
 rule-based split plan remains active. Validate end-to-end latency on the
 serving workload before enabling wave simulation.
+
+### Draft layer row picking
+
+On the first draft step of MTP-Eagle and single-layer EAGLE 3 one-model
+drafting, and on every MTP layer of vanilla MTP, a draft layer that supports it
+runs its attention on every input row (writing the draft KV cache of each) but
+the rest of the layer (norms, MLP or MoE) only on the one row per request the
+drafter reads: the last prompt row of a context request, the last accepted row
+of a generation request. Vanilla MTP does not pick rows under attention data
+parallelism, and MTP-Eagle does not pick them on the spec-decode fast paths.
+`TLLM_SPEC_DISABLE_DRAFT_ROW_PICK=1` turns this off. The picked rows
+are numerically equivalent to the full layer's but not bitwise identical for
+MoE draft layers, whose kernels may round differently at another row count, so
+an occasional draft token can differ.

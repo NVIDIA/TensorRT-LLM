@@ -331,19 +331,42 @@ def test_queue_snapshot_leaves_kv_iteration_stats_to_measured_records():
 
     # On an interval iteration a snapshot must not fetch (fetching resets the
     # native deltas); off the interval it must not clear the latest stats.
+    fake._fill_kv_host_stats.reset_mock()
+    fake._take_scheduling_counters.reset_mock()
     for stats_iter in (8, 9):
-        assert _update(fake, stats_iter, collect_kv_iteration_stats=False) == {32: "deltas"}
+        assert _update(fake, stats_iter, consume_deltas=False) == {32: "deltas"}
     assert kv_cache_manager.get_iteration_stats.call_count == 1
     assert fake._last_kv_iter_stats_fetch_iter == 4
+    # Nor does it take the other counters that reset when read.
+    assert [call.args[2] for call in fake._fill_kv_host_stats.call_args_list] == [False, False]
+    fake._take_scheduling_counters.assert_not_called()
 
     # The measured record of iteration 8 still gets its fetch.
     assert _update(fake, 8) == {32: "deltas"}
     assert kv_cache_manager.get_iteration_stats.call_count == 2
     assert fake._last_kv_iter_stats_fetch_iter == 8
+    assert fake._fill_kv_host_stats.call_args.args[2] is True
+    fake._take_scheduling_counters.assert_called_once()
 
 
-@pytest.mark.parametrize("use_latest_kv_iter_stats", [True, False])
-def test_appended_row_carries_latest_kv_iteration_stats_only_on_request(use_latest_kv_iter_stats):
+@pytest.mark.parametrize("consume_deltas", [True, False])
+def test_page_table_counters_are_taken_only_by_measured_records(consume_deltas):
+    """Reading the page-table counters resets them; the slab size is a plain gauge."""
+    kv_cache_manager = MagicMock()
+    kv_cache_manager.host_slab_bytes.return_value = 4096
+    kv_cache_manager.take_page_table_stats.return_value = (1, 2, 3, 4.5)
+    kv_stats = types.SimpleNamespace(num_page_table_reuses=0)
+
+    PyExecutor._fill_kv_host_stats(
+        types.SimpleNamespace(_is_kv_manager_v2=True), kv_stats, kv_cache_manager, consume_deltas
+    )
+
+    assert kv_stats.host_slab_bytes == 4096
+    assert kv_cache_manager.take_page_table_stats.call_count == int(consume_deltas)
+    assert kv_stats.num_page_table_reuses == int(consume_deltas)
+
+
+def test_zero_duration_row_does_not_repeat_the_latest_kv_iteration_stats():
     """A queue snapshot must not repeat the KV deltas of the last measured record."""
     fake = types.SimpleNamespace(
         enable_attention_dp=False,
@@ -354,14 +377,16 @@ def test_appended_row_carries_latest_kv_iteration_stats_only_on_request(use_late
         stats=[],
         stats_lock=threading.Lock(),
         _latest_kv_iter_stats={32: "deltas"},
-        _latest_host_step_time_ms=None,
-        _latest_prev_device_step_time_ms=None,
+        _latest_host_step_time_ms=6.0,
+        _latest_prev_device_step_time_ms=4.0,
     )
+    fake._stats_scheduler_mode = PyExecutor._stats_scheduler_mode.__get__(fake)
+    fake._append_stats_rows = PyExecutor._append_stats_rows.__get__(fake)
     stats = IterationStats()
 
-    row = PyExecutor._append_iter_stats(
-        fake, stats, use_latest_kv_iter_stats=use_latest_kv_iter_stats
-    )
+    PyExecutor._append_iter_stats(fake, stats)
+    snapshot = PyExecutor._zero_duration_stats_row(fake, stats)
 
-    assert fake.stats == [row] and row[0] is stats
-    assert row[2] == ({32: "deltas"} if use_latest_kv_iter_stats else None)
+    (measured,) = fake.stats
+    assert measured == (stats, None, {32: "deltas"}, None, 6.0, 4.0, "non_overlap", None)
+    assert snapshot == (stats, None, None, None, 0.0, 0.0, "non_overlap", 0.0)

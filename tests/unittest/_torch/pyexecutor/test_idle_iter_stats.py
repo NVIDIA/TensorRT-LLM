@@ -3,6 +3,7 @@
 """Scheduler-confirmed idle and queue-only snapshots without model execution."""
 
 import datetime
+import json
 import threading
 import time
 from contextlib import nullcontext
@@ -81,14 +82,18 @@ def executor(clock):
             last_finalize_settled=False,
             last_idle_rank_states=None,
             last_fanout_is_queue_snapshot=False,
+            last_fanout_queued_counters=(),
             next_payload=lambda: None,
-            make_idle_heartbeat_records=Mock(return_value=[]),
+            make_idle_heartbeat_rows=Mock(return_value=[]),
         ),
     )
     # The real export, so rows have their real shape and side effects.
     stub._append_iter_stats = Mock(side_effect=PyExecutor._append_iter_stats.__get__(stub))
     _bind(
         stub,
+        "_stats_scheduler_mode",
+        "_zero_duration_stats_row",
+        "_append_stats_rows",
         "_maybe_emit_quiescent_stats",
         "_build_quiescent_stats",
         "_publish_idle_heartbeat",
@@ -98,6 +103,21 @@ def executor(clock):
         "_plan_idle_heartbeat_wait",
     )
     return stub
+
+
+def _append_measured(executor):
+    """Export a measured record; returns its row."""
+    executor._append_iter_stats(_snapshot(), ["req"])
+    return executor.stats[-1]
+
+
+def _publish_heartbeat(executor):
+    executor._publish_idle_heartbeat([executor._zero_duration_stats_row(_snapshot())])
+
+
+def _adp_rows(tag):
+    """Serialized rows of a two-rank fanout, as ADPIterStatsBuffer returns them."""
+    return [json.dumps({"attentionDpRank": rank, "tag": tag}) for rank in range(2)]
 
 
 def _queue_backlog(executor, queued_context_requests, queued_ctx_tokens=100):
@@ -112,7 +132,7 @@ def test_idle_snapshot_has_no_fabricated_iteration_time(executor):
     assert call.args[1:3] == (0.0, 0)
     assert call.args[3].batch_size == 0
     # A snapshot must not consume the KV deltas that belong to measured records.
-    assert call.kwargs == {"collect_kv_iteration_stats": False}
+    assert call.kwargs == {"consume_deltas": False}
     (row,) = executor.stats
     assert row[_ROW_KV_ITER_STATS] is None  # Nor repeat the last measured record's.
     assert row[_ROW_HOST_STEP_MS] == 0.0
@@ -161,9 +181,9 @@ def test_queue_snapshot_is_news_again_after_any_other_row(executor):
     """A consumer's newest row must not stay a stale measured or idle row."""
     _queue_backlog(executor, 2)
     assert _spin(executor) == 1
-    executor._append_iter_stats(_snapshot(), ["req"])  # A measured record.
+    _append_measured(executor)
     assert _spin(executor) == 3
-    executor._publish_idle_heartbeat([(_snapshot(), None)])
+    _publish_heartbeat(executor)
     assert _spin(executor) == 5
     assert _spin(executor) == 5
 
@@ -224,7 +244,7 @@ def test_idle_heartbeat_is_rate_limited_only_without_attention_dp(executor, cloc
 
 def test_idle_heartbeat_replaces_the_previous_heartbeat(executor, clock):
     """An idle engine keeps one heartbeat, however slowly its stats are read."""
-    measured = executor._append_iter_stats(_snapshot(), ["req"])
+    measured = _append_measured(executor)
     for _ in range(3):
         executor.iter_counter += 1
         clock.value += 1.0
@@ -233,67 +253,53 @@ def test_idle_heartbeat_replaces_the_previous_heartbeat(executor, clock):
     newest = executor.stats[1]
 
     # A measured record after the heartbeat ends the replaceable tail.
-    executor._append_iter_stats(_snapshot(), ["req"])
-    executor._publish_idle_heartbeat([(_snapshot(), None)])
+    _append_measured(executor)
+    _publish_heartbeat(executor)
     assert len(executor.stats) == 4 and executor.stats[1] is newest
 
     # Rows a consumer already took are left alone.
     taken, executor.stats = executor.stats, []
-    executor._publish_idle_heartbeat([(_snapshot(), None)])
+    _publish_heartbeat(executor)
     assert len(taken) == 4 and len(executor.stats) == 1
 
 
 def test_attention_dp_heartbeat_replaces_every_rank_row(executor):
-    first = [(_snapshot(), 0), (_snapshot(), 1)]
-    second = [(_snapshot(), 0), (_snapshot(), 1)]
+    first, second = _adp_rows("first"), _adp_rows("second")
     executor._publish_idle_heartbeat(first)
     executor._publish_idle_heartbeat(second)
-    assert [(row[_ROW_STATS], row[_ROW_RANK]) for row in executor.stats] == second
+    assert executor.stats == second
     # No rows: nothing is published and the previous heartbeat stays.
     executor._publish_idle_heartbeat([])
-    assert [(row[_ROW_STATS], row[_ROW_RANK]) for row in executor.stats] == second
+    assert executor.stats == second
 
 
 @pytest.mark.parametrize("kind", ["measured", "queue-snapshot", "idle-heartbeat"])
 def test_attention_dp_fanout_export_follows_the_fanout_kind(executor, kind):
-    def fanout():
-        return [
-            SimpleNamespace(
-                stats=_snapshot(queued_context_requests=1 - rank),
-                req_stats=["req"] if rank == 0 else None,
-                kv_iter_stats={0: "kv"} if rank == 0 else None,
-                attention_dp_rank=rank,
-                host_step_time_ms=3.0,
-                prev_device_step_time_ms=2.0,
-                gpu_forward_time_ms=1.0,
-            )
-            for rank in range(2)
-        ]
-
     executor.enable_attention_dp = True
-    executor._adp_iter_stats.last_fanout_is_queue_snapshot = kind == "queue-snapshot"
+    adp_stats = executor._adp_iter_stats
+    adp_stats.last_fanout_is_queue_snapshot = kind == "queue-snapshot"
+    adp_stats.last_fanout_queued_counters = (1, 100, 0, 0)
     if kind == "idle-heartbeat":
-        executor._adp_iter_stats.last_idle_rank_states = [object(), object()]
-    first, second = fanout(), fanout()
+        adp_stats.last_idle_rank_states = [object(), object()]
+    first, second, third = _adp_rows("first"), _adp_rows("second"), _adp_rows("third")
     executor._export_adp_fanout(first)
     executor._export_adp_fanout(second)
+    # An iteration that fans out no row exports nothing.
+    executor._export_adp_fanout([])
 
-    exported = [row[_ROW_STATS] for row in executor.stats]
     if kind == "measured":
-        # Every measured iteration is exported with its own stats and timings.
-        assert exported == [record.stats for record in first + second]
-        assert executor.stats[0][_ROW_REQ_STATS] == ["req"]
-        assert executor.stats[0][_ROW_KV_ITER_STATS] == {0: "kv"}
-        assert executor.stats[0][_ROW_HOST_STEP_MS] == 3.0
+        # Every measured iteration is exported.
+        assert executor.stats == first + second
     elif kind == "queue-snapshot":
         # The repeat is dropped: the first snapshot stays.
-        assert exported == [record.stats for record in first]
-        assert executor.stats[0][_ROW_HOST_STEP_MS] == 0.0
+        assert executor.stats == first
+        # A changed backlog is exported.
+        adp_stats.last_fanout_queued_counters = (2, 100, 0, 0)
+        executor._export_adp_fanout(third)
+        assert executor.stats == first + third
     else:
         # The newer heartbeat replaces the first.
-        assert exported == [record.stats for record in second]
-        assert executor.stats[0][_ROW_HOST_STEP_MS] == 0.0
-    assert [row[_ROW_RANK] for row in executor.stats[:2]] == [0, 1]
+        assert executor.stats == second
 
 
 def test_idle_tick_publishes_only_when_due(executor, clock):
@@ -314,15 +320,13 @@ def test_idle_tick_publishes_only_when_due(executor, clock):
 
 def test_attention_dp_idle_tick_repeats_one_row_per_rank(executor):
     executor.enable_attention_dp = True
-    records = [SimpleNamespace(stats=_snapshot(), attention_dp_rank=rank) for rank in range(3)]
-    executor._adp_iter_stats.make_idle_heartbeat_records.return_value = records
+    rows = _adp_rows("heartbeat")
+    executor._adp_iter_stats.make_idle_heartbeat_rows.return_value = rows
     executor._idle_heartbeat_tick()
-    executor._adp_iter_stats.make_idle_heartbeat_records.assert_called_once_with(
-        executor._update_iter_stats.call_args.args[0]
+    executor._adp_iter_stats.make_idle_heartbeat_rows.assert_called_once_with(
+        executor._update_iter_stats.call_args.args[0], "non_overlap"
     )
-    assert [(row[_ROW_STATS], row[_ROW_RANK]) for row in executor.stats] == [
-        (record.stats, rank) for rank, record in enumerate(records)
-    ]
+    assert executor.stats == rows
 
 
 def test_parked_rank_zero_publishes_heartbeats_through_the_request_queue(executor, monkeypatch):
@@ -339,7 +343,7 @@ def test_parked_rank_zero_publishes_heartbeats_through_the_request_queue(executo
     request_queue = ExecutorRequestQueue(
         dist=executor.dist, max_batch_size=8, enable_iter_perf_stats=True, batch_wait_timeout_ms=0.0
     )
-    measured = executor._append_iter_stats(_snapshot(), ["req"])
+    measured = _append_measured(executor)
     timeout, idle_tick = executor._plan_idle_heartbeat_wait(None)
     assert timeout is None
     item = RequestQueueItem(7, Mock())
@@ -478,7 +482,9 @@ def _attention_dp_rank(rank, clock):
     stub._get_init_iter_stats = lambda *args: make_stats()
     _bind(
         stub,
-        "_append_iter_stats",
+        "_stats_scheduler_mode",
+        "_zero_duration_stats_row",
+        "_append_stats_rows",
         "_maybe_emit_quiescent_stats",
         "_build_quiescent_stats",
         "_publish_idle_heartbeat",
@@ -504,7 +510,11 @@ def _attention_dp_idle_pass(ranks, clock):
         state.copy_iter_stats_from(stub._adp_iter_stats.next_payload())
         states.append(state)
     for stub in ranks:
-        stub._export_adp_fanout(stub._adp_iter_stats.finalize(states, is_rank0=stub.dist.rank == 0))
+        stub._export_adp_fanout(
+            stub._adp_iter_stats.finalize(
+                states, is_rank0=stub.dist.rank == 0, scheduler_mode=stub._stats_scheduler_mode()
+            )
+        )
     timeout, idle_tick = ranks[0]._plan_idle_heartbeat_wait(None)
     if idle_tick is not None:
         return idle_tick
@@ -543,18 +553,21 @@ def test_attention_dp_engine_parks_soon_after_going_idle(clock, overlap):
     assert passes == (3 if overlap else 2)
     assert clock.value == started  # No pass waited for a heartbeat period.
     # The measured record, then one fresh heartbeat row per rank.
-    assert [row[_ROW_RANK] for row in rank0.stats] == [0, 1, 0, 1]
-    assert [row[_ROW_STATS].iter_latency_ms for row in rank0.stats] == [5.0, 5.0, 0.0, 0.0]
-    heartbeat_iter = rank0.stats[2][_ROW_STATS].iter
-    assert heartbeat_iter == rank0.iter_counter - 1
+    rows = [json.loads(row) for row in rank0.stats]
+    assert [row["attentionDpRank"] for row in rows] == [0, 1, 0, 1]
+    assert [row["iterLatencyMS"] for row in rows] == [5.0, 5.0, 0.0, 0.0]
+    assert {row["schedulerMode"] for row in rows} == {"overlap"}
+    assert rows[2]["iter"] == rank0.iter_counter - 1
     assert ranks[1].stats == [] and ranks[1]._adp_iter_stats.next_payload() is None
 
     # Parked: heartbeats come from the tick alone and replace one another.
     for _ in range(3):
         clock.value += 1.0
         assert idle_tick() == 1.0
-    assert [row[_ROW_RANK] for row in rank0.stats] == [0, 1, 0, 1]
-    assert rank0.stats[2][_ROW_STATS].iter == rank0.iter_counter
+    rows = [json.loads(row) for row in rank0.stats]
+    assert [row["attentionDpRank"] for row in rows] == [0, 1, 0, 1]
+    assert [row["iter"] for row in rows[2:]] == [rank0.iter_counter] * 2
+    assert [row["hostStepTimeMS"] for row in rows[2:]] == [0.0, 0.0]
     assert rank0._adp_iter_stats.next_payload() is None
 
 
@@ -584,6 +597,7 @@ def _fetch_stub(**overrides):
             last_finalize_settled=False, last_idle_rank_states=None, next_payload=lambda: None
         ),
         _idle_heartbeat_tick=Mock(return_value=1.0),
+        _flush_staged_responses=lambda: None,
         request_accumulated=[],
         hang_detector=SimpleNamespace(pause=nullcontext),
         executor_request_queue=SimpleNamespace(get_from_request_queue=Mock(return_value=[])),

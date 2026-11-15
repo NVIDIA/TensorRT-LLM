@@ -15,8 +15,8 @@ The following is a table of supported models for the PyTorch backend:
 | `DeepseekV3ForCausalLM`              | DeepSeek-V3, Kimi-K2               | `deepseek-ai/DeepSeek-V3`                    |
 | `DeepseekV32ForCausalLM`             | DeepSeek-V3.2                      | `deepseek-ai/DeepSeek-V3.2`                  |
 | `DeepseekV4ForCausalLM` [^11]        | DeepSeek-V4                        | `deepseek-ai/DeepSeek-V4-Pro`                |
-| `DeepseekV41ForCausalLM`            | DeepSeek-V4.1 (text decoder)       | —                                          |
-| `DeepseekV41ForConditionalGeneration` | DeepSeek-V4.1                    | —                                          |
+| `DeepseekV41ForCausalLM` [^24]      | DeepSeek-V4.1 (text decoder)       | —                                          |
+| `DeepseekV41ForConditionalGeneration` [^24] | DeepSeek-V4.1              | —                                          |
 | `Exaone4ForCausalLM`                 | EXAONE 4.0                         | `LGAI-EXAONE/EXAONE-4.0-32B`                 |
 | `ExaoneMoeForCausalLM`               | K-EXAONE, K-EXAONE 2.0             | `LGAI-EXAONE/K-EXAONE-236B-A23B`, `LGAI-EXAONE/K-EXAONE-2.0-750B-A37B` |
 | `Gemma3ForCausalLM`                  | Gemma 3                            | `google/gemma-3-1b-it`                       |
@@ -50,6 +50,7 @@ The following is a table of supported models for the PyTorch backend:
 | `Qwen2ForRewardModel`                | Qwen2-based                        | `Qwen/Qwen2.5-Math-RM-72B`                   |
 | `Qwen3ForCausalLM`                   | Qwen3                              | `Qwen/Qwen3-8B`                              |
 | `Qwen3ForTextEmbedding`              | Qwen3-Embedding                    | `Qwen/Qwen3-Embedding-8B`                    |
+| `Qwen3ForTextReranking`              | Qwen3-Reranker                     | `Qwen/Qwen3-Reranker-8B`                     |
 | `Qwen3MoeForCausalLM`                | Qwen3MoE                           | `Qwen/Qwen3-30B-A3B`                         |
 | `Qwen3NextForCausalLM`               | Qwen3Next                          | `Qwen/Qwen3-Next-80B-A3B-Thinking`           |
 | `Qwen3_5MoeForCausalLM`              | Qwen3.8-MoE, Qwen3.5-MoE           | `Qwen/Qwen3.8-2.4T-A95B`, `Qwen/Qwen3.5-397B-A17B` |
@@ -127,6 +128,7 @@ statuses for the same architecture in the two matrices.
 [^21]: MiniMax-M3.1-Flash ships a standalone DSpark drafter in its `dspark/` directory (architecture `DSparkMiniMaxDraftModel`). Load it with `speculative_config: {decoding_type: DSpark, speculative_model: <checkpoint>/dspark, max_draft_len: 7}` (the drafter's block size is 7 and `max_draft_len` must match it). Keep KV cache block reuse enabled (the default): with `kv_cache_config.enable_block_reuse: false`, or on a disaggregated generation server, prompts of about 131k tokens or more fail with `Draft KV cache context resize failed`.
 [^22]: Text input only. The image and audio tokenizers of the checkpoint are not run, and the model generates only text tokens.
 [^23]: Text-only decision model. `trtllm-serve embeddings` detects the native checkpoint and selects the FlashInfer attention backend automatically. Python `LLM.encode` callers must set `model_kwargs.architectures` to `[PplxDeciderForDecision]`. The embedding vector contains the 255 raw decision logits; apply the checkpoint's calibration and candidate normalization in the caller.
+[^24]: DeepSeek-V4.1 uses CSA2 sparse attention; see [DeepSeek-V4.1 CSA2](../features/sparse-attention.md#deepseek-v41-csa2). Checkpoints with candidate-consumer layers, including the released one, run only on SM100-family GPUs with a DeepGEMM build that includes the sparse MQA-logits kernels; otherwise model construction fails. Checkpoints without such layers can also use the SM90 and SM120/SM121 attention routes. The Engram tables live in pinned host memory, placed on a GPU's host NUMA node when the GPUs report one. When that node lacks free memory, model loading evicts the node's page cache, which every process on the node loses, and retries. Set `TRTLLM_ENGRAM_EVICT_PAGE_CACHE=0` to skip the eviction; such a node's tables then fall back to host memory that can span NUMA nodes, which can slow lookups.
 
 # Encoder-Decoder Feature Support Matrix (PyTorch Backend)
 
@@ -258,9 +260,9 @@ mutually exclusive.
   example, `"512MiB"`), or `0` to disable cross-request reuse. The capacity applies per rank; ranks
   do not share a cache.
   - On the inline encoder path, a request whose items all hit the cache skips the encoder, and a
-    partially cached request encodes only its missing items. Inline caching supports only
-    single-modality requests. When combined with side-stream prefetch, peak memory is the cache
-    capacity plus any in-flight prefetched encoder inputs and outputs.
+    partially cached request encodes only its missing items. Mixed-modality requests are cached
+    per item. When combined with side-stream prefetch, peak memory is the cache capacity plus any
+    in-flight prefetched encoder inputs and outputs.
   - Models with item-level encoder scheduling use the item path unless
     `multimodal_config.encoder_scheduling_policy` is `DISABLED`. Cached items are reused before
     encoder work is selected, so they use none of the per-iteration encoder item or token budget.

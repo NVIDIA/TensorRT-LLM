@@ -36,7 +36,7 @@ from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 
 from .combined import CombinedFmha
-from .interface import Fmha, FmhaPhase
+from .interface import Fmha, FmhaPhase, FmhaPrewarmConfig
 from .phased import PhasedFmha
 from .registry import get_enabled_fmha_lib_classes
 
@@ -344,6 +344,26 @@ class FmhaManager:
             if fmha_cls.is_available(attn):
                 self.fmha_libs.append(fmha_cls(attn))
         self._layer_idx = getattr(attn, "layer_idx", None)
+
+    def prewarm(self, config: FmhaPrewarmConfig, attempted: set[type[Fmha]]) -> None:
+        """Try each eligible library once across all local attention layers."""
+        for fmha in self.fmha_libs:
+            fmha_cls = type(fmha)
+            if fmha_cls in attempted:
+                continue
+            try:
+                if not fmha.can_prewarm(config):
+                    continue
+                attempted.add(fmha_cls)
+                fmha.prewarm()
+            except Exception as e:
+                # Optional JIT initialization must not fail startup. An actual
+                # forward retries the build if it selects this library.
+                attempted.add(fmha_cls)
+                logger.warning(
+                    f"{fmha_cls.__name__} prewarm failed; retrying lazily on first use. "
+                    f"{type(e).__name__}: {e}"
+                )
 
     def _announce(self, fmha: Fmha, cache_key: _FmhaCacheKey) -> None:
         # One line per library per layer is enough to tell which kernel
