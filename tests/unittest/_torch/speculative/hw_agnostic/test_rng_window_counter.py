@@ -56,6 +56,7 @@ def _request(
         py_decoding_iter=decoding_iter,
         seed=seed,
         py_request_id=request_id,
+        py_spec_sampling_params=None,
     )
 
 
@@ -257,7 +258,9 @@ ROWS = MAX_DRAFT_LEN + 1
 def _populated(meta: SpecMetadata, requests: list[types.SimpleNamespace]) -> list[int]:
     """Run _populate_request_rng_state on CPU buffers and return request_offsets."""
     for request in requests:
-        request.sampling_config = types.SimpleNamespace(seed=request.seed)
+        request.sampling_config = types.SimpleNamespace(
+            temperature=1.0, top_k=None, top_p=None, min_p=None, seed=request.seed
+        )
     normalized = [(0.0, 0, 1.0, 0.0, ROWS) for _ in requests]
     meta._populate_request_rng_state(requests, normalized)
     return meta.request_offsets[: len(requests)].tolist()

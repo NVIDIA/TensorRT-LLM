@@ -9,6 +9,8 @@ import threading
 import time
 from typing import Iterable, List, Optional
 
+import numpy as np
+
 from tensorrt_llm.bindings.executor import Request
 from tensorrt_llm.llmapi.disagg_utils import get_local_request_id
 
@@ -59,6 +61,13 @@ class RequestQueueItem:
     # original arrival on the same clock.
     admit_arrival: Optional[float] = None
     admit_orig_arrival: Optional[float] = None
+    # Waiting-queue passes that left this request queued because its rank was full.
+    admission_wait_iters: int = 0
+    # The number of input token ids ``request`` carries (without the prefix a prompt-tail
+    # transport left out), kept when it travels without them, and those ids on the rank
+    # that owns such a request (see RequestBroadcaster).
+    num_input_tokens: Optional[int] = None
+    prompt_token_ids: Optional[np.ndarray] = None
 
     def __post_init__(self) -> None:
         # Normalize bound inputs before any queue, ADP, or broadcast handoff.
@@ -255,9 +264,11 @@ class ExecutorRequestQueue:
                     self.start_times[req_id] = start_time
                 child_req_ids = self._generate_child_request_ids(request)
 
-                item = RequestQueueItem(req_id,
-                                        request,
-                                        child_req_ids=child_req_ids)
+                item = RequestQueueItem(
+                    req_id,
+                    request,
+                    child_req_ids=child_req_ids,
+                    num_input_tokens=request.num_input_tokens)
                 if self._stamp_admission_times is not None:
                     self._stamp_admission_times(item, time.monotonic())
                 self.request_queue.put(item)

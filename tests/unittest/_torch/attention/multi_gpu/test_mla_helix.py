@@ -19,7 +19,6 @@ import sys
 import weakref
 from dataclasses import dataclass
 from functools import partial
-from types import SimpleNamespace
 from typing import Optional
 
 import _torch.attention.multi_gpu.helix_test_utils as helix_utils
@@ -28,6 +27,7 @@ import pytest
 import torch
 from _torch.attention.multi_gpu.helix_test_utils import (
     CACHE_TYPE_SELFKONLY,
+    _v_up_projector,
     activate_all_ranks_for_context,
     compute_mismatch_ratio,
     copy_weights_for_cp,
@@ -605,150 +605,6 @@ def test_mla_helix_fifo_v2_unaligned_softmax_stats():
 @pytest.mark.parametrize("comms_medium", ["nccl", "fifo_v1", "fifo_v2"])
 def test_mla_helix_v_up_before_alltoall(scenario: Scenario, comms_medium: str):
     run_helix_test(_full_test_multi_gpu, scenario, comms_medium)
-
-
-def _v_up_projector(num_heads: int, kv_lora_rank: int, v_head_dim: int, v_full: torch.Tensor):
-    """The fields of an MLA module that ``MLA._helix_project_v_partials`` reads."""
-    module = SimpleNamespace(
-        num_heads_tp=num_heads,
-        kv_lora_rank=kv_lora_rank,
-        v_head_dim=v_head_dim,
-        helix_v_b_proj_full=v_full,
-        use_cute_dsl_bf16_bmm=False,
-    )
-    module._bmm_bf16_out = partial(MLA._bmm_bf16_out, module)
-    return module
-
-
-def _v_up_builder(kv_b_weight, kv_b_scale, *, num_heads, cp_size, cp_rank, nope, v, k):
-    """The fields of an MLA module that ``MLA._build_helix_v_up_weight`` reads."""
-    module = SimpleNamespace(
-        mapping=SimpleNamespace(has_cp_helix=lambda: True, cp_rank=cp_rank),
-        dtype=torch.bfloat16,
-        kv_b_proj=SimpleNamespace(
-            weight=kv_b_weight,
-            weight_scale=kv_b_scale,
-            partition_plan=SimpleNamespace(enabled=False, op_kind=None),
-        ),
-        num_heads_tp=num_heads,
-        num_heads_tp_cp=num_heads // cp_size,
-        qk_nope_head_dim=nope,
-        v_head_dim=v,
-        kv_lora_rank=k,
-        v_b_proj_dequant=None,
-        helix_v_b_proj_full=None,
-        _helix_v_up_before_exchange=False,
-    )
-    module._bind_helix_v_up_weight = partial(MLA._bind_helix_v_up_weight, module)
-    return module
-
-
-@pytest.mark.parametrize("cp_rank", [0, 1])
-def test_helix_v_up_weight_from_fp8_kv_b(cp_rank: int) -> None:
-    """MLA dequantizes every tp-local head's V weight from the loaded FP8 kv_b_proj; this rank's
-    dequantized V chunk becomes a view of it."""
-    h, n, v, k, cp = 4, 128, 128, 256, 2
-    generator = torch.Generator().manual_seed(cp_rank)
-    weight = (torch.randn(h * (n + v), k, generator=generator) * 64).to(torch.float8_e4m3fn)
-    scale = torch.rand(h * (n + v) // 128, k // 128, generator=generator) + 0.5
-    module = _v_up_builder(
-        weight, scale, num_heads=h, cp_size=cp, cp_rank=cp_rank, nope=n, v=v, k=k
-    )
-    module.v_b_proj_dequant = torch.empty(h // cp, v, k, dtype=torch.bfloat16)
-    MLA._build_helix_v_up_weight(module)
-
-    value_codes = weight[h * n :].view(h, v, k)
-    value_scale = scale[h * n // 128 :].view(h, v // 128, k // 128)
-    expanded = value_scale.repeat_interleave(128, 1).repeat_interleave(128, 2)
-    full = (value_codes.float() * expanded).to(torch.bfloat16)
-    assert module._helix_v_up_before_exchange
-    assert torch.equal(module.helix_v_b_proj_full, full)
-    chunk = slice(cp_rank * h // cp, (cp_rank + 1) * h // cp)
-    assert torch.equal(module.v_b_proj_dequant, full[chunk])
-    assert (
-        module.v_b_proj_dequant.untyped_storage().data_ptr()
-        == module.helix_v_b_proj_full.untyped_storage().data_ptr()
-    )
-
-
-def test_helix_v_up_weight_views_bf16_kv_b() -> None:
-    h, n, v, k = 4, 64, 128, 256
-    weight = torch.randn(h * (n + v), k, dtype=torch.bfloat16)
-    module = _v_up_builder(weight, None, num_heads=h, cp_size=2, cp_rank=0, nope=n, v=v, k=k)
-    MLA._build_helix_v_up_weight(module)
-    assert module._helix_v_up_before_exchange
-    assert torch.equal(module.helix_v_b_proj_full, weight[h * n :].view(h, v, k))
-    assert module.helix_v_b_proj_full.data_ptr() == weight[h * n :].data_ptr()
-
-
-def test_helix_v_up_weight_needs_loaded_fp8_scales():
-    """A kv_b_proj whose scales are already in a GEMM layout keeps V after the exchange."""
-    h, n, v, k = 4, 128, 128, 256
-    weight = torch.zeros(h * (n + v), k, dtype=torch.float8_e4m3fn)
-    packed_scale = torch.zeros(k // 128 // 4 + 1, h * (n + v), dtype=torch.int32)
-    module = _v_up_builder(
-        weight, packed_scale, num_heads=h, cp_size=2, cp_rank=0, nope=n, v=v, k=k
-    )
-    MLA._build_helix_v_up_weight(module)
-    assert not module._helix_v_up_before_exchange
-    assert module.helix_v_b_proj_full is None
-
-
-@skip_pre_blackwell
-@pytest.mark.parametrize("num_tokens", [1, 37, 224])
-def test_helix_v_up_commutes_with_combine(num_tokens: int):
-    """Projecting V before the CP exchange equals projecting the combined latent.
-
-    Emulates the fifo_v2 exchange of ``cp_size`` ranks on one GPU and runs the
-    combine kernel on both the latent partials (followed by the rank's V
-    shard) and the V-projected partials. The two differ only by the BF16
-    rounding of the reassociated sums.
-    """
-    torch.manual_seed(0)
-    cp_size, num_heads, kv_lora_rank, v_head_dim = 4, 16, 512, 128
-    heads_per_rank = num_heads // cp_size
-    v_full = torch.randn(num_heads, v_head_dim, kv_lora_rank, device="cuda", dtype=torch.bfloat16)
-    v_full = v_full / kv_lora_rank**0.5
-    projector = _v_up_projector(num_heads, kv_lora_rank, v_head_dim, v_full)
-
-    # Partial outputs and (max, sum) softmax stats of every CP rank for all heads.
-    partials = [
-        torch.randn(num_tokens, num_heads * kv_lora_rank, device="cuda", dtype=torch.bfloat16)
-        for _ in range(cp_size)
-    ]
-    stats = []
-    for _ in range(cp_size):
-        s = torch.empty(num_tokens, num_heads, 2, device="cuda", dtype=torch.float32)
-        s[..., 0].uniform_(-2.0, 2.0)
-        s[..., 1].uniform_(0.5, 4.0)
-        stats.append(s)
-    projected = [MLA._helix_project_v_partials(projector, p) for p in partials]
-
-    def gather(per_rank, rank, value_dim):
-        # What rank ``rank`` holds after the exchange: its head chunk from every rank.
-        chunks = [
-            t.view(num_tokens, cp_size, heads_per_rank * value_dim)[:, rank] for t in per_rank
-        ]
-        return torch.stack(chunks, dim=1).view(num_tokens, cp_size, heads_per_rank, value_dim)
-
-    for rank in range(cp_size):
-        gathered_stats = torch.stack(
-            [s.view(num_tokens, cp_size, heads_per_rank * 2)[:, rank] for s in stats], dim=1
-        ).view(num_tokens, cp_size, heads_per_rank, 2)
-        latent = torch.ops.trtllm.helix_post_process_native(
-            gather(partials, rank, kv_lora_rank).contiguous(), gathered_stats.contiguous(), 1.0, 1
-        ).view(num_tokens, heads_per_rank, kv_lora_rank)
-        v_shard = v_full[rank * heads_per_rank : (rank + 1) * heads_per_rank]
-        reference = torch.empty(
-            num_tokens, heads_per_rank, v_head_dim, device="cuda", dtype=torch.bfloat16
-        )
-        torch.ops.trtllm.bmm_out(
-            latent.transpose(0, 1), v_shard.transpose(1, 2), reference.transpose(0, 1)
-        )
-        result = torch.ops.trtllm.helix_post_process_native(
-            gather(projected, rank, v_head_dim).contiguous(), gathered_stats.contiguous(), 1.0, 1
-        ).view(num_tokens, heads_per_rank, v_head_dim)
-        torch.testing.assert_close(result.float(), reference.float(), rtol=2e-2, atol=2e-2)
 
 
 def _alltoall_after_v_up_gemm(rank: int, world_size: int, num_replays: int) -> int:

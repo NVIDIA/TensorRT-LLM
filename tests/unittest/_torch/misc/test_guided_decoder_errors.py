@@ -22,6 +22,7 @@ responses are built. The loop tests run the real executor loops on a shell
 with stubbed collaborators and record the order of the calls that matter.
 """
 
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
@@ -179,13 +180,14 @@ def _loop_executor(monkeypatch, decoder, batches, log):
     executor.inflight_req_ids = set()
     executor._transfer_held_failures = {}
     executor.is_shutdown = False
+    executor._intake_window = threading.Event()
     executor.dist = Mock(tp_size=1, world_size=1)
     executor._disagg_coordinator = MagicMock()  # read through the `disagg` property
     executor.resource_manager = MagicMock()
     executor.resource_manager.resource_managers.get.return_value = None
 
     schedule = iter([*((batch, None) for batch in batches), (None, None)])
-    executor._prepare_and_schedule_batch = lambda: next(schedule)
+    executor._prepare_and_schedule_batch = lambda defer_gen_receives=False: next(schedule)
     executor._can_queue = Mock(return_value=(True, True))
     executor._kv_connector_start_batch = Mock(return_value=(True, True))
     executor._check_benchmark_disagg_gate = Mock(return_value=(True, False))
