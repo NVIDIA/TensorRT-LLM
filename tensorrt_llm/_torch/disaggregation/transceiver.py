@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 import os
 import threading
 import time
@@ -80,6 +81,52 @@ if TYPE_CHECKING:
 
 _FP4_MLA_OWNERSHIP_BRIDGE_ENV = "TRTLLM_ENABLE_FP4_MLA_KV_OWNERSHIP_BRIDGE"
 _FATAL_LOG_JOIN_TIMEOUT_S = 0.5
+
+# Pipelined generation transfer-status round (opt-in; TRTLLM_DISAGG_GEN_STATUS_PIPELINED=1). The per-iteration
+# at-least-0 status call of a TP generation worker normally runs two blocking cross-rank gathers (ready ids, then
+# outcomes) that wait for the slowest rank's executor to arrive. Pipelined, each call (1) waits for the round it
+# started one call earlier -- every rank started it an iteration ago, so it is normally complete -- and applies it,
+# then (2) starts the next round as one non-blocking MPI Iallgather that carries, for every locally finished receive,
+# its outcome (the same per-request rules as the blocking path), plus the rank's busy bit. A received request
+# therefore joins one iteration later. While a completed round showed no busy rank and nothing was admitted since,
+# rounds are skipped on every rank alike (every GEN_STATUS_PIPELINE_FORCE_EVERY-th call still runs one). Any other
+# status call (at least > 0, or block-all) first drains the outstanding round, then runs the blocking path.
+# Engaged only for TP (no attention DP), pp 1, cp 1 with the MPI communicator; otherwise the blocking path runs.
+_GEN_STATUS_PIPELINE_ENV = "TRTLLM_DISAGG_GEN_STATUS_PIPELINED"
+_GEN_STATUS_PIPELINE_FORCE_EVERY = 128
+_GEN_STATUS_PIPELINE_CAPACITY = (
+    1024  # finished receives one rank reports per round (more: a blocking round)
+)
+_GEN_STATUS_PIPELINE_MAGIC = 0x67656E7374617475  # 'genstatu'
+# outcome flags of one reported receive
+_PF_COMPLETED, _PF_FAILED, _PF_CANCELLED, _PF_RETIRABLE, _PF_VERIFIED = 1, 2, 4, 8, 16
+
+
+# Gen-side KV hand-off trace (opt-in; TRTLLM_DISAGG_GEN_HANDOFF_TRACE=<dir>): one JSON line per received request per
+# rank at retirement, steady-clock seconds (the perf-metrics clock): receive start, KV done on this rank (the session's
+# transfer_end_time), first status call that saw it done here, the call that retired it (consensus on every rank), and
+# the status-call indices of both. Pairs with perf_metrics' first_scheduled_time (rank 0) to split KV done -> admission.
+_GEN_HANDOFF_TRACE_ENV = "TRTLLM_DISAGG_GEN_HANDOFF_TRACE"
+
+
+def _steady_now() -> float:
+    now = tensorrt_llm.bindings.global_steady_clock_now()
+    return now.total_seconds() if hasattr(now, "total_seconds") else float(now)
+
+
+def _as_seconds(value) -> Optional[float]:
+    if value is None:
+        return None
+    return value.total_seconds() if hasattr(value, "total_seconds") else float(value)
+
+
+def _gen_status_pipeline_requested() -> bool:
+    return os.environ.get(_GEN_STATUS_PIPELINE_ENV, "0").strip().lower() in (
+        "1",
+        "true",
+        "on",
+        "yes",
+    )
 
 
 def _log_unproven_kv_transfer(event: QuiescenceFatalEvent) -> None:
@@ -231,6 +278,15 @@ def _validate_fp4_mla_bridge_profile(
 
 
 class KvCacheTransceiverV2(KvCacheTransceiver):
+    # Pipelined status round state (TRTLLM_DISAGG_GEN_STATUS_PIPELINED); class-level defaults keep a transceiver built
+    # without __init__ on the blocking path.
+    _pipe_on: bool = False
+    _pipe_req: Any = None
+    _pipe_armed: bool = False
+    _pipe_pending_publication: bool = False
+    _trace_file: Any = None
+    _trace_calls: int = 0
+
     @property
     def consumes_transfer_buffer(self) -> bool:
         return False
@@ -401,6 +457,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._gen_allgather: Callable = (
             pp_allgather if m.enable_attention_dp else self._dist.allgather
         )
+        self._init_gen_status_pipeline()
+        self._init_handoff_trace()
 
     def _exchange_rank_info(self):
         endpoints = cast(list, self._dist.allgather(self._transfer_worker.sender_endpoint))
@@ -1181,15 +1239,23 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._ever_had_recv_session = True
         req.set_kv_cache_transfer_start(tensorrt_llm.bindings.global_steady_clock_now())
         rid = get_unique_rid(req)
+        if self._trace_file is not None:
+            req.py_handoff_trace = {"recv_start": _steady_now(), "recv_call": self._trace_calls}
         if rid in self._recv_sessions:
             logger.warning(
                 f"request_and_receive_async: rid={rid} already has a recv session, skipping"
             )
             return
+        _tr = getattr(req, "py_handoff_trace", None)
+        _t0 = time.perf_counter()
         extent = self._create_cache_extent(req)
         chunk_bytes = self._chunk_num_bytes(extent.local)
         req.py_kv_cache_xfer_bytes = chunk_bytes * self._kv_size_rank_factor
+        _t1 = time.perf_counter()
         fetches = self._open_peer_source(req)
+        if _tr is not None:
+            _tr["extent_ms"] = (_t1 - _t0) * 1e3
+            _tr["open_peer_ms"] = (time.perf_counter() - _t1) * 1e3
         # Claimed to be transferring only once there is something to transfer: a builder that
         # raises above leaves the request where it was, not in a state nothing advances.
         req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
@@ -1199,7 +1265,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         try:
             # The handle that comes back is the contract's answer about this piece. What retires
             # the request is the sweep over the session tables, as it was before.
+            _t2 = time.perf_counter()
             fetches.fetch(extent, expected_write_bytes=chunk_bytes)
+            if _tr is not None:
+                _tr["fetch_ms"] = (time.perf_counter() - _t2) * 1e3
         except Exception:
             # No session means no publication and nothing the sweep could ever pair the request
             # with, so the registration made here is undone here and the request goes terminal.
@@ -1304,6 +1373,266 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return CtxTransferStatus(completed, failed)
 
     def check_gen_transfer_status(self, at_least_request_num: Optional[int]) -> GenTransferStatus:
+        if self._trace_file is not None:
+            self._trace_note_seen()
+        if not self._pipe_on:
+            return self._check_gen_transfer_status_blocking(at_least_request_num)
+        if at_least_request_num == 0:
+            return self._check_gen_status_pipelined()
+        # Any other call keeps its blocking semantics: finish the outstanding round first (every rank makes the same
+        # calls, so every rank drains here alike), then run the blocking path and report both.
+        drained = self._pipe_finish()
+        status = self._check_gen_transfer_status_blocking(at_least_request_num)
+        return GenTransferStatus(
+            drained.completed_requests + status.completed_requests,
+            drained.error_requests + status.error_requests,
+            drained.cancelled_requests + status.cancelled_requests,
+        )
+
+    def _check_gen_transfer_status_blocking(
+        self, at_least_request_num: Optional[int]
+    ) -> GenTransferStatus:
+        """The blocking status round (the path every call takes with the pipeline off)."""
+        return self._check_gen_transfer_status_blocking_body(at_least_request_num)
+
+    # -- gen-side hand-off trace (TRTLLM_DISAGG_GEN_HANDOFF_TRACE) ---------------------------------------
+
+    def _init_handoff_trace(self) -> None:
+        self._trace_file = None
+        self._trace_calls = 0
+        out_dir = os.environ.get(_GEN_HANDOFF_TRACE_ENV, "").strip()
+        if not out_dir:
+            return
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+            path = os.path.join(
+                out_dir, f"gen_handoff_rank{self._mapping.rank}_pid{os.getpid()}.jsonl"
+            )
+            self._trace_file = open(path, "a", buffering=1 << 16)
+            self._trace_lines = 0
+            logger.info(f"[GEN_HANDOFF_TRACE] rank {self._mapping.rank}: writing {path}")
+        except OSError as error:
+            logger.warning(f"[GEN_HANDOFF_TRACE] disabled: {error}")
+            self._trace_file = None
+
+    def trace_admission(self, admitted, prepare_s: float, receive_s: float) -> None:
+        """One line per admission call (coordinator.receive_gen_init): its host time split."""
+        if self._trace_file is None:
+            return
+        rec = {
+            "admission": True,
+            "rank": self._mapping.rank,
+            "t": _steady_now(),
+            "call": self._trace_calls,
+            "n": len(admitted),
+            "prepare_ms": prepare_s * 1e3,
+            "receive_ms": receive_s * 1e3,
+            "isl": [getattr(r, "prompt_len", None) for r in admitted],
+            "req_ids": [getattr(r, "py_request_id", None) for r in admitted],
+        }
+        self._trace_file.write(json.dumps(rec) + "\n")
+        self._trace_file.flush()
+
+    def _trace_note_seen(self) -> None:
+        """Called at every status call: stamp the first call that sees each receive done on this rank."""
+        self._trace_calls += 1
+        now = None
+        for rid, session in self._recv_sessions.items():
+            req = self._recv_reqs.get(rid)
+            tr = getattr(req, "py_handoff_trace", None) if req is not None else None
+            if tr is None or "seen_done" in tr:
+                continue
+            if session.is_completed() or session.has_failed():
+                now = _steady_now() if now is None else now
+                tr["seen_done"] = now
+                tr["seen_call"] = self._trace_calls
+                tr["kv_end"] = _as_seconds(getattr(session, "transfer_end_time", None))
+
+    def _trace_retire(self, completed, failed, cancelled) -> None:
+        now = _steady_now()
+        for kind, rids in (("completed", completed), ("failed", failed), ("cancelled", cancelled)):
+            for rid in rids:
+                req = self._recv_reqs.get(rid)
+                tr = getattr(req, "py_handoff_trace", None) if req is not None else None
+                if tr is None:
+                    continue
+                session = self._recv_sessions.get(rid)
+                rec = dict(tr)
+                rec.setdefault("seen_done", now)
+                rec.setdefault("seen_call", self._trace_calls)
+                if rec.get("kv_end") is None and session is not None:
+                    rec["kv_end"] = _as_seconds(getattr(session, "transfer_end_time", None))
+                rec.update(
+                    rid=rid,
+                    rank=self._mapping.rank,
+                    outcome=kind,
+                    retire=now,
+                    retire_call=self._trace_calls,
+                    pipelined=self._pipe_on,
+                    req_id=getattr(req, "py_request_id", None),
+                )
+                self._trace_file.write(json.dumps(rec) + "\n")
+                self._trace_lines += 1
+        if self._trace_lines and self._trace_lines % 64 == 0:
+            self._trace_file.flush()
+
+    # -- pipelined status round (TRTLLM_DISAGG_GEN_STATUS_PIPELINED) -------------------------------------
+
+    def _init_gen_status_pipeline(self) -> None:
+        self._pipe_on = False
+        self._pipe_req = None
+        self._pipe_armed = False
+        self._pipe_pending_publication = False
+        self._pipe_calls = self._pipe_rounds = self._pipe_skipped = self._pipe_overflow = 0
+        if not _gen_status_pipeline_requested():
+            return
+        m = self._mapping
+        why = []
+        if not self._gen_need_sync:
+            why.append("no generation-side consensus on this mapping")
+        if m.enable_attention_dp:
+            why.append("attention DP")
+        if m.pp_size != 1:
+            why.append(f"pp_size={m.pp_size}")
+        if getattr(m, "cp_size", 1) != 1:
+            why.append(f"cp_size={m.cp_size}")
+        if mpi_disabled() or type(self._dist).__name__ != "MPIDist":
+            why.append(f"communicator {type(self._dist).__name__} (needs MPIDist)")
+        if why:
+            logger.warning(
+                f"[GEN_STATUS_PIPELINED] requested but not engaged on rank {m.rank}: {'; '.join(why)}"
+            )
+            return
+        self._pipe_comm = mpi_comm()
+        if self._pipe_comm.Get_size() != m.world_size:
+            logger.warning(
+                f"[GEN_STATUS_PIPELINED] requested but not engaged on rank {m.rank}: MPI world "
+                f"{self._pipe_comm.Get_size()} != mapping world {m.world_size}"
+            )
+            return
+        words = 4 + 2 * _GEN_STATUS_PIPELINE_CAPACITY
+        self._pipe_send = np.zeros(words, dtype=np.int64)
+        self._pipe_recv = np.zeros((m.world_size, words), dtype=np.int64)
+        self._pipe_on = True
+        logger.info(
+            f"[GEN_STATUS_PIPELINED] engaged on rank {m.rank} (world {m.world_size}): the generation transfer-status "
+            "round is one non-blocking gather applied on the next call; idle rounds are skipped"
+        )
+
+    def note_gen_admission(self) -> None:
+        """Receives were admitted this iteration (the same requests on every rank): rounds run again."""
+        self._pipe_armed = False
+
+    def set_gen_pending_publication(self, pending: bool) -> None:
+        """Whether this rank holds admitted receives not yet published (deferred): it then reports busy."""
+        self._pipe_pending_publication = bool(pending)
+
+    def _pipe_local_report(self) -> bool:
+        """Fill the send buffer: every locally finished receive with its outcome flags. False on overflow."""
+        local_completed, local_failed = self._collect_done(self._recv_sessions, self._recv_reqs)
+        rows = []
+        for rid in local_completed + local_failed:
+            session = self._recv_sessions[rid]
+            result = session.wait_complete(blocking=False)
+            flags = 0
+            if not self._ownership_blocks_retirement(session):
+                flags |= _PF_RETIRABLE
+            if session.status == SessionStatus.CANCELLED:
+                if not self._ownership_blocks_retirement(session):
+                    flags |= _PF_CANCELLED
+            elif result == WaitResult.COMPLETED:
+                flags |= _PF_COMPLETED
+                if session.kv_write_verified():
+                    flags |= _PF_VERIFIED
+            elif result == WaitResult.FAILED:
+                if not self._ownership_blocks_retirement(session):
+                    flags |= _PF_FAILED
+            rows.append((rid, flags))
+        busy = bool(self._recv_sessions) or self._pipe_pending_publication
+        buf = self._pipe_send
+        buf[:] = 0
+        buf[0] = _GEN_STATUS_PIPELINE_MAGIC
+        buf[2] = int(busy)
+        if len(rows) > _GEN_STATUS_PIPELINE_CAPACITY or any(
+            not 0 <= rid < 2**63 for rid, _ in rows
+        ):
+            buf[3] = 1
+            return False
+        buf[1] = len(rows)
+        for i, (rid, flags) in enumerate(rows):
+            buf[4 + 2 * i] = rid
+            buf[5 + 2 * i] = flags
+        return True
+
+    def _pipe_finish(self) -> GenTransferStatus:
+        """Complete the outstanding round (if any) and apply it; every rank calls this at the same point."""
+        if self._pipe_req is None:
+            return GenTransferStatus([], [], [])
+        self._pipe_req.Wait()
+        self._pipe_req = None
+        return self._pipe_apply(self._pipe_recv)
+
+    def _check_gen_status_pipelined(self) -> GenTransferStatus:
+        self._pipe_calls += 1
+        out = self._pipe_finish()
+        forced = self._pipe_calls % _GEN_STATUS_PIPELINE_FORCE_EVERY == 0
+        if self._pipe_armed and not forced:
+            self._pipe_skipped += 1
+            return out
+        self._pipe_local_report()
+        from mpi4py import MPI  # noqa: F401  (the communicator is an mpi4py one)
+
+        self._pipe_req = self._pipe_comm.Iallgather(self._pipe_send, self._pipe_recv)
+        self._pipe_rounds += 1
+        if self._pipe_calls % 16384 == 0:
+            logger.info(
+                f"[GEN_STATUS_PIPELINED] rank {self._mapping.rank}: calls {self._pipe_calls} "
+                f"rounds {self._pipe_rounds} skipped {self._pipe_skipped} overflow {self._pipe_overflow}"
+            )
+        return out
+
+    def _pipe_apply(self, recv: np.ndarray) -> GenTransferStatus:
+        """Apply a completed round: the blocking path's consensus and outcome rules on the gathered reports."""
+        n = recv.shape[0]
+        if not all(int(recv[r, 0]) == _GEN_STATUS_PIPELINE_MAGIC for r in range(n)):
+            raise RuntimeError(
+                f"[GEN_STATUS_PIPELINED] a rank sent a status round without the pipeline header: every rank of the "
+                f"instance must run the same build with the same {_GEN_STATUS_PIPELINE_ENV}"
+            )
+        any_busy = any(int(recv[r, 2]) for r in range(n))
+        if any(int(recv[r, 3]) for r in range(n)):
+            # Some rank could not report everything: run one blocking round now (every rank sees the same flag).
+            self._pipe_overflow += 1
+            self._pipe_armed = False
+            return self._check_gen_transfer_status_blocking(0)
+        reports = []
+        for r in range(n):
+            cnt = int(recv[r, 1])
+            reports.append({int(recv[r, 4 + 2 * i]): int(recv[r, 5 + 2 * i]) for i in range(cnt)})
+        # to_process: receives every rank reported finished, in the blocking path's consensus order.
+        consensus = _find_consensus_request_ids([list(rep) for rep in reports], n)
+        to_process = [rid for rid in consensus if rid in self._recv_sessions]
+        flags_all = lambda rid, bit: [bool(rep[rid] & bit) for rep in reports]  # noqa: E731
+        cancelled = [rid for rid in to_process if any(flags_all(rid, _PF_CANCELLED))]
+        cancel_set = set(cancelled)
+        failed = [
+            rid for rid in to_process if any(flags_all(rid, _PF_FAILED)) and rid not in cancel_set
+        ]
+        terminal = cancel_set | set(failed)
+        completed = [
+            rid for rid in to_process if all(flags_all(rid, _PF_COMPLETED)) and rid not in terminal
+        ]
+        retirable = {rid for rid in to_process if all(flags_all(rid, _PF_RETIRABLE))}
+        verified = {rid for rid in to_process if all(flags_all(rid, _PF_VERIFIED))}
+        cancelled = [rid for rid in cancelled if rid in retirable]
+        failed = [rid for rid in failed if rid in retirable]
+        status = self._finalize_gen_outcomes(cancelled, failed, completed, verified)
+        self._pipe_armed = not any_busy
+        return status
+
+    def _check_gen_transfer_status_blocking_body(
+        self, at_least_request_num: Optional[int]
+    ) -> GenTransferStatus:
         if not self._ever_had_recv_session and not self._gen_need_sync:
             return GenTransferStatus([], [], [])
         block_all = at_least_request_num is None
@@ -1360,7 +1689,21 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         cancelled, failed, completed, verified = self._gen_consensus_outcome(
             to_process, cancelled, failed, completed, locally_verified
         )
+        return self._finalize_gen_outcomes(cancelled, failed, completed, verified)
 
+    def _finalize_gen_outcomes(self, cancelled, failed, completed, verified) -> GenTransferStatus:
+        """Apply agreed per-request outcomes (the same lists on every rank): close and retire the sessions."""
+        if self._trace_file is not None:
+            self._trace_retire(completed, failed, cancelled)
+        if self._pipe_on:
+            # The pipelined round decides completion from the ranks' reports, not in the blocking body's detection
+            # loop, which is where the receive's end time is stamped: stamp it here (same session value).
+            for rid in completed:
+                session = self._recv_sessions[rid]
+                if session.transfer_end_time is not None:
+                    self._recv_reqs[rid].set_kv_cache_transfer_end(session.transfer_end_time)
+                if session.kv_cache_size_bytes > 0:
+                    self._recv_reqs[rid].set_kv_cache_size(session.kv_cache_size_bytes)
         cancelled_reqs = []
         for rid in cancelled:
             session = self._recv_sessions[rid]

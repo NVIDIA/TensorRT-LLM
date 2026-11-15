@@ -364,11 +364,19 @@ class DisaggTransferCoordinator:
         start their KV receive in the configured transfer mode."""
         if not admitted:
             return
+        # Pipelined status rounds (TRTLLM_DISAGG_GEN_STATUS_PIPELINED): receives may start now (every rank admits the
+        # same requests), so the rounds run again until one shows no receive on any rank.
+        note_admission = getattr(self._transceiver, "note_gen_admission", None)
+        if note_admission is not None:
+            note_admission()
         defer_unready = self._defer_unready_gen_receives and uses_async_gen_transfer()
         # Take the admission readiness events first, so preparing resources
         # does not block this thread on them; publication polls them instead.
         fences = self._take_receive_fences(admitted) if defer_unready else {}
+        trace = getattr(self._transceiver, "trace_admission", None)
+        t_prep0 = time.perf_counter()
         self._effects.prepare_gen_resources(admitted)
+        t_prep1 = time.perf_counter()
 
         # gen_only_no_context has no CTX worker, so mark each request as
         # transmission-complete immediately.
@@ -403,6 +411,9 @@ class DisaggTransferCoordinator:
             for req in admitted:
                 self._transceiver.request_and_receive_async(req)
             self._stamp_gen_transfer_start(admitted)
+        if trace is not None:
+            # TRTLLM_DISAGG_GEN_HANDOFF_TRACE: host time of this admission (resources, then receive starts).
+            trace(admitted, t_prep1 - t_prep0, time.perf_counter() - t_prep1)
 
         self.reap_gen_receives(0)
 
@@ -653,6 +664,10 @@ class DisaggTransferCoordinator:
     @nvtx_range("reap_gen_receives")
     def reap_gen_receives(self, at_least: int = 0) -> None:
         """Poll receive-side transfers; rank-synchronized inside the transceiver."""
+        # Admitted receives this rank has not published yet count as in flight (pipelined status rounds' busy bit).
+        set_pending = getattr(self._transceiver, "set_gen_pending_publication", None)
+        if set_pending is not None:
+            set_pending(bool(getattr(self, "_unpublished_gen_receives", None)))
         gen_status = self._transceiver.check_gen_transfer_status(at_least)
         if gen_status.cancelled_requests:
             user_canceled_ids = set(self._registry.canceled_request_ids())
