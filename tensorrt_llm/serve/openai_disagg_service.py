@@ -333,7 +333,7 @@ class OpenAIDisaggregatedService(OpenAIService):
                     if hooks:
                         hooks.on_disagg_request_id(disagg_request_id)
                 gen_req = self._get_gen_request(request, ctx_response, disagg_request_id)
-            except Exception:
+            except (Exception, asyncio.CancelledError):
                 if gen_server:
                     await self._gen_router.finish_request(
                         request, success=False, req_id=gen_reservation_id
