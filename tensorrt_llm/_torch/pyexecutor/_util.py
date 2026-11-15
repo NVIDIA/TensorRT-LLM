@@ -4131,6 +4131,22 @@ class KvCacheCreator:
                         budget_attr, self_kv_cache_config,
                         draft_kv_cache_config))
 
+        # Opt-in (TRTLLM_KV_ESTIMATION_NO_HOST_TIER=1): the estimation pass builds throwaway probe
+        # managers that only hold dummy requests; with no explicit budget they auto-size a host
+        # spill tier whose host memory stays resident after the probe. Give the probes no host
+        # tier, so that memory stays free for the rest of the node (e.g. a Mooncake pool).
+        if estimating_kv_cache and os.environ.get(
+                "TRTLLM_KV_ESTIMATION_NO_HOST_TIER", "0") == "1":
+            self_kv_cache_config = self_kv_cache_config.model_copy(
+                update={"host_cache_size": 0})
+            if has_separate_one_model_draft:
+                draft_kv_cache_config = (draft_kv_cache_config
+                                         if draft_kv_cache_config is not None
+                                         else self._kv_cache_config).model_copy(
+                                             update={"host_cache_size": 0})
+            logger.info("KV cache estimation managers: host tier disabled "
+                        "(TRTLLM_KV_ESTIMATION_NO_HOST_TIER=1)")
+
         # Estimation managers are throwaway probes; the real build that
         # follows runs the check against the same engine and scheduler
         # settings.

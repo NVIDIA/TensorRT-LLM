@@ -3525,6 +3525,19 @@ class MooncakeStoreConfig(StrictBaseModel):
         "with the rest of the prefix. Has no effect without one-model "
         "speculative decoding or for a role that does not read the pool.")
 
+    @field_validator("run_dir", mode="after")
+    @classmethod
+    def _expand_run_dir_host(cls, value):
+        """Replace '{host}' in run_dir with this node's short hostname.
+
+        Servers that share one config (several servers, or a multi-node
+        server) then each get their own directory per node.
+        """
+        if value and "{host}" in value:
+            import socket
+            value = value.replace("{host}", socket.gethostname().split(".")[0])
+        return value
+
     @field_validator("segment_size", "staging_buffer_bytes", mode="after")
     @classmethod
     def _check_sizes(cls, value, info: ValidationInfo):
