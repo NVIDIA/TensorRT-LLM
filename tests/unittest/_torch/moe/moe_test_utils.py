@@ -45,8 +45,8 @@ from tensorrt_llm._torch.moe.fused_moe.cutlass import (
     find_cutlass_leaf,
 )
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import (
-    CuteDslB12xNvfp4FusedMoE,
-    CuteDslB12xW4a16Nvfp4FusedMoE,
+    FlashinferCutedslNvfp4Impl,
+    FlashinferCutedslW4a16Nvfp4Impl,
 )
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_densegemm import DenseGEMMFusedMoE
@@ -60,6 +60,7 @@ from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoEProblem,
     canonical_activation,
     canonical_quant,
+    identity_quant_of,
     normalize_quant,
 )
 from tensorrt_llm._torch.moe.fused_moe.impl_environment import collect_moe_environment
@@ -145,14 +146,14 @@ def find_backend_class(
         return find_cutedsl_grouped_gemm_leaf(quant_algo)
     if backend_type is MoeBackendType.CUTE_DSL_B12X:
         # Two leaves, one format each: NVFP4 keeps the CUTLASS prefill path,
-        # W4A16_NVFP4 never leaves the b12x kernel. Compared after
-        # canonical_quant, as the leaves' can_implement sees the format.
-        quant = canonical_quant(quant_algo)
+        # W4A16_NVFP4 never leaves the b12x kernel. Compared as identities
+        # spell the format, as the leaves' can_implement sees it.
+        quant = normalize_quant(canonical_quant(quant_algo))
         return next(
             (
                 leaf
-                for leaf in (CuteDslB12xNvfp4FusedMoE, CuteDslB12xW4a16Nvfp4FusedMoE)
-                if canonical_quant(leaf.b12x_quant_algo) == quant
+                for leaf in (FlashinferCutedslNvfp4Impl, FlashinferCutedslW4a16Nvfp4Impl)
+                if identity_quant_of(leaf) == quant
             ),
             None,
         )

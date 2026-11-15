@@ -157,9 +157,10 @@ example that uses no Modeling V1 model code.
    for switches to it as soon as the target lands. To keep a target opt-in
    until it is validated, decorate its class with `@disable_v2_by_default`
    (from `tensorrt_llm._torch._experimental.modeling_v2`). Deployments then use
-   it only when they set `modeling_v2` to `auto` or `require` explicitly. A
+   it only when they set `modeling_v2` to `auto` or `require` explicitly.
+   A target with MoE layers also declares the MoE tactics it honors, and a
    target that implements expert load balancing lists its modes in
-   `EPLB_MODES`; see [Routing](#routing).
+   `EPLB_MODES`. See [Routing](#routing).
 4. Use catalog operations where they fit. Add new operations as `OpWrapper`s
    with tests. See [Writing operations](#writing-operations).
 5. For C++/CUDA code, follow the [native code guide](../../../../cpp/tensorrt_llm/modeling_v2/README.md).
@@ -219,6 +220,17 @@ returns a target, the resolver compares the deployment's EPLB mode (`static`,
 treats a target that does not list it as `NoTarget`: `auto` keeps Modeling V1
 for that deployment and `require` raises with the reason. `EPLB_MODES` is empty
 unless the target sets it.
+
+`route` reads no MoE tactic (`moe_config.tactic`, `speculative_config.moe_tactic`),
+so a target with MoE layers declares the MoE implementation ids it runs.
+`moe_impls_honored` lists the ids a `moe_config.tactic` may resolve to for the
+target's experts, and `draft_moe_impls_honored` those a
+`speculative_config.moe_tactic` may resolve to for its draft's experts. List
+`ANY_MOE_IMPL` from `_router_index.py` when `create_moe` builds the experts and
+only that module runs them, and only the id whose buffers they read when the
+target's own kernels run the experts. A target that declares neither honors no
+tactic: under one, `modeling_v2="auto"` builds the built-in model instead and
+`"require"` fails. The [Kimi K3 targets](models/kimi_k3_vl/) declare both.
 
 How the model loader resolves a target:
 
