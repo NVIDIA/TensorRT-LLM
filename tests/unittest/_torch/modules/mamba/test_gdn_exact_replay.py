@@ -125,7 +125,7 @@ def test_normalized_inputs_do_not_depend_on_the_row_of_a_token():
             torch.testing.assert_close(part[0], whole[0, start:stop], rtol=0, atol=0)
 
 
-def _make_layer():
+def _make_layer(conv_scale=0.1):
     layer = Qwen3NextGatedDeltaNet.__new__(Qwen3NextGatedDeltaNet)
     torch.nn.Module.__init__(layer)
     layer.layer_idx = 0
@@ -135,7 +135,7 @@ def _make_layer():
     layer.head_k_dim, layer.head_v_dim = HEAD_K, HEAD_V
     layer.key_dim_per_tp, layer.value_dim_per_tp = KEY_DIM, VALUE_DIM
     layer.activation = "silu"
-    layer.conv1d = SimpleNamespace(weight=_randn(QKV_DIM, 4), bias=None)
+    layer.conv1d = SimpleNamespace(weight=_randn(QKV_DIM, 4, scale=conv_scale), bias=None)
     layer.A_log = torch.randn(V_HEADS, device="cuda") * 0.1
     layer.dt_bias = torch.randn(V_HEADS, device="cuda") * 0.1
     layer.prefill_graphable = True
@@ -231,8 +231,8 @@ def _attn(cache, lengths, prefills):
     )
 
 
-def _inputs(tokens):
-    return _randn(tokens, QKV_DIM), _randn(tokens, V_HEADS), _randn(tokens, V_HEADS)
+def _inputs(tokens, scale=0.1):
+    return _randn(tokens, QKV_DIM, scale=scale), _randn(tokens, V_HEADS), _randn(tokens, V_HEADS)
 
 
 def _run(layer, cache, inputs, lengths, prefills, slots, initial, output=None):
@@ -251,11 +251,14 @@ def _slice(inputs, start, stop):
     return tuple(tensor[start:stop] for tensor in inputs)
 
 
+# Wide pre-activations reach the deep-negative SiLU region, where the
+# channel-major convolution kernel switches formula for a whole warp of tokens.
+@pytest.mark.parametrize("wide", [False, True], ids=["narrow", "wide"])
 @pytest.mark.parametrize("length", [5, 64, 65, 150])
-def test_resumed_prefill_and_decode_match_single_shot_prefill(length):
+def test_resumed_prefill_and_decode_match_single_shot_prefill(length, wide):
     torch.manual_seed(length)
-    layer = _make_layer()
-    inputs = _inputs(length)
+    layer = _make_layer(conv_scale=1.0 if wide else 0.1)
+    inputs = _inputs(length, scale=3.0 if wide else 0.1)
     base = _Cache(3)
 
     full_cache = base.clone()

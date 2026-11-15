@@ -21,9 +21,10 @@ its own boundary, so a sequence's bits do not depend on the other rows of the
 batch. Decode rows run as one dense batch of one chunk per row.
 
 The convolution and the q/k normalization before the delta rule also use one
-kernel for every row: decode rows go through the prefill convolution as
-one-token sequences that continue their conv state, and through the prefill
-branch of the post-convolution kernel with one token per program.
+kernel for every row: decode rows go through the token-major prefill
+convolution as one-token sequences that continue their conv state, and
+through the prefill branch of the post-convolution kernel with one token per
+program.
 """
 
 from __future__ import annotations
@@ -44,7 +45,7 @@ from ..fla.cumsum import chunk_local_cumsum
 from ..fla.solve_tril import solve_tril
 from ..fla.wy_fast import recompute_w_u_fwd
 from .causal_conv1d import causal_conv1d_fn
-from .fuse_elementwise_ops import extract_transpose_prefill_slice, fused_gdn_post_conv
+from .fuse_elementwise_ops import fused_gdn_post_conv
 
 # The chunk size of the delta-rule kernels.
 GDN_CHUNK_SIZE = 64
@@ -160,19 +161,23 @@ def gdn_exact_replay_forward_core(
     out_all = output[0]
     out_all[num_tokens:].zero_()
 
-    # Every row goes through the prefill convolution kernel and the prefill
-    # branch of the post-convolution kernel, one token per program; decode
-    # rows are one-token sequences that continue their conv state. With
-    # several tokens per program the rounding of a token's q/k norm depends
-    # on its row in the block, which differs between prefill and decode.
-    tokens_t = extract_transpose_prefill_slice(mixed_qkv, num_tokens, 0, mixed_qkv.shape[1])
+    # Every row goes through the token-major prefill convolution and the
+    # prefill branch of the post-convolution kernel, one token per program;
+    # decode rows are one-token sequences that continue their conv state.
+    # Each of these computes a token from its own inputs only. The
+    # channel-major convolution picks between two SiLU forms per warp of
+    # tokens, and with several tokens per program the rounding of a token's
+    # q/k norm depends on its row in the block, so a token's bits would
+    # depend on its neighbors there.
+    tokens = mixed_qkv[:num_tokens]
+    conv_out = torch.empty((num_tokens, tokens.shape[1]), dtype=tokens.dtype, device=tokens.device)
     cu_seqlens = (
         mamba_metadata.query_start_loc[: batch_size + 1]
         if num_prefills
         else mamba_metadata._arange_buffer[: batch_size + 1]
     )
-    tokens_t = causal_conv1d_fn(
-        tokens_t,
+    causal_conv1d_fn(
+        tokens.t(),
         mixer.conv1d.weight,
         mixer.conv1d.bias,
         activation=mixer.activation,
@@ -180,11 +185,12 @@ def gdn_exact_replay_forward_core(
         has_initial_state=mamba_metadata.replay_conv_has_initial[:batch_size],
         cache_indices=state_indices,
         query_start_loc=cu_seqlens,
+        out=conv_out.t(),
     )
     q_all, k_all, v_all, g_all, beta_all = (
         tensor[0]
         for tensor in fused_gdn_post_conv(
-            tokens_t,
+            conv_out.t(),
             None,
             a[:num_tokens],
             b[:num_tokens],
