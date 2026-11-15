@@ -6395,7 +6395,7 @@ class PyExecutor:
             request.decoding_iter = request.py_decoding_iter
             response = request.create_response()
             if response is not None:
-                response.result.cached_tokens = request.cached_tokens
+                response.result.cached_tokens = request.reported_cached_tokens
                 if self.enable_attention_dp:
                     # Owner-local completions cannot enter a response gather.
                     self._pending_transfer_responses.append(
@@ -12598,7 +12598,7 @@ class PyExecutor:
                 self._start_connector_async_save(request)
             response = request.create_response()
             if response is not None:
-                response.result.cached_tokens = request.cached_tokens
+                response.result.cached_tokens = request.reported_cached_tokens
                 self._pending_transfer_responses.append(
                     (request.py_request_id, response))
             self._pending_response_terminations.append(request)
@@ -13043,7 +13043,7 @@ class PyExecutor:
             response = request.create_response()
             if response is None:
                 continue
-            response.result.cached_tokens = request.cached_tokens
+            response.result.cached_tokens = request.reported_cached_tokens
             response.result.ctx_computed_tokens = getattr(
                 request, 'py_ctx_computed_tokens', 0)
             response.result.ctx_first_begin = getattr(request,
@@ -13090,7 +13090,7 @@ class PyExecutor:
                 [request], gpu_times_cache=gpu_times_cache)
         response = request.create_response()
         if response:
-            response.result.cached_tokens = request.cached_tokens
+            response.result.cached_tokens = request.reported_cached_tokens
             response.result.ctx_computed_tokens = getattr(
                 request, 'py_ctx_computed_tokens', 0)
             response.result.ctx_first_begin = getattr(request,

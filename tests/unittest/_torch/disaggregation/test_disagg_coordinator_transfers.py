@@ -148,7 +148,7 @@ def test_fast_completion_of_an_active_request_stages_its_response_first() -> Non
     for that flush."""
     h = _Harness()
     response = SimpleNamespace(result=SimpleNamespace(cached_tokens=None, ctx_usage=None))
-    req = _Request(1, response=response, cached_tokens=5)
+    req = _Request(1, response=response, reported_cached_tokens=5)
     h.active.append(req)
     h.send(req)
     h.transceiver.finish_send(req)
