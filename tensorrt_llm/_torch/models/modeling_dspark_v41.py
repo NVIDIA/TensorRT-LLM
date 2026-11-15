@@ -144,6 +144,8 @@ class DSv41DSparkDraftModel(DSv4DSparkDraftModel):
     block_cls = DSv41DSparkBlock
     uses_lagged_pre = True
     checkpoint_fp8_block_size = 32
+    # V4.1 binds BF16 attention projections; the FP8 backend is rejected.
+    supports_fp8_attn_projections = False
     # Reference DSparkBlock.forward_head passes collapsed x to confidence,
     # while only the shared vocabulary projection consumes norm(x).
     confidence_uses_normalized_hidden = False
@@ -295,9 +297,6 @@ class DSv41DSparkForCausalLM(DSv4DSparkForCausalLM):
         missing = [name for name in required if name not in remapped]
         if missing:
             raise ValueError(f"V4.1 DSpark checkpoint is missing draft head weights: {missing}")
-        confidence_prefix = f"mtp_layers.{self.num_stages - 1}.confidence_head."
-        if not any(name.startswith(confidence_prefix) for name in remapped):
-            last.confidence_head = None
         self._prepare_confidence_head_for_load(remapped)
         DeepseekV41WeightLoader(self.dspark_model).load_weights(remapped)
         unexpected, unfed = _v41_load_coverage(self.dspark_model, remapped)
@@ -306,8 +305,7 @@ class DSv41DSparkForCausalLM(DSv4DSparkForCausalLM):
                 "DeepSeek-V4.1 DSpark weight load is incomplete: "
                 f"unconsumed keys {unexpected[:8]}; unfed parameters {unfed[:8]}"
             )
-        self.dspark_model.post_load_weights()
-        self.dspark_model.cache_attn_weights_from_state_dict(weights)
+        self.dspark_model.post_load_weights(weights)
         logger.info(f"[DSpark V4.1] loaded {self.num_stages} lagged-pre draft stages")
 
 

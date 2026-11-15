@@ -230,6 +230,7 @@ class PipelineLoader:
         skip_components: Optional[List[Union[str, PipelineComponent]]] = None,
         *,
         sleep_restore_mode: "SleepRestoreMode | None" = None,
+        sleep_release_host_backup: bool = False,
     ) -> "BasePipeline":
         """Load a pipeline, optionally backing its persistent GPU state in host RAM.
 
@@ -237,8 +238,12 @@ class PipelineLoader:
         Its loading context captures persistent allocations before weights are
         materialized; warmup runs after that context exits. Ordinary loading
         does not enter the sleep loading context.
+        ``sleep_release_host_backup=True`` frees host backups before wake returns.
+        This makes wake slower, and each subsequent sleep allocates a fresh backup.
         """
         if sleep_restore_mode is None:
+            if sleep_release_host_backup:
+                raise ValueError("sleep_release_host_backup requires sleep_restore_mode")
             return self._load(checkpoint_dir, skip_warmup, skip_components)
 
         with ExitStack() as loading_stack:
@@ -249,6 +254,7 @@ class PipelineLoader:
                 True,
                 skip_components,
                 sleep_restore_mode=sleep_restore_mode,
+                sleep_release_host_backup=sleep_release_host_backup,
                 loading_stack=loading_stack,
             )
         if not skip_warmup:
@@ -262,6 +268,7 @@ class PipelineLoader:
         skip_components: Optional[List[Union[str, PipelineComponent]]],
         *,
         sleep_restore_mode: "SleepRestoreMode | None" = None,
+        sleep_release_host_backup: bool = False,
         loading_stack: ExitStack | None = None,
     ) -> "BasePipeline":
         """
@@ -362,7 +369,11 @@ class PipelineLoader:
             if loading_stack is None:
                 raise RuntimeError("Sleep loading requires a loading context stack")
             loading_stack.enter_context(
-                pipeline._sleep_loading_context(sleep_restore_mode, device=self.device)
+                pipeline._sleep_loading_context(
+                    sleep_restore_mode,
+                    device=self.device,
+                    release_host_backup=sleep_release_host_backup,
+                )
             )
 
         # Convert meta tensors to their runtime devices. Offloaded submodules

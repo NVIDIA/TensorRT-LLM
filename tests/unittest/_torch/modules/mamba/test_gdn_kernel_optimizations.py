@@ -686,6 +686,8 @@ def test_gdn_attaches_only_static_fp8_scale():
 
 @pytest.mark.parametrize("ring_mode", [False, True], ids=["triton", "flashinfer_ring"])
 def test_gdn_replay_verify_dispatches_by_history_layout(monkeypatch, ring_mode):
+    """Triton replay addresses the history by the replay slots; ring replay gathers the
+    cursors at the replay slots, which equal the state slots for rings."""
     from tensorrt_llm._torch.modules.fla.cache_manager import ReplayStateUpdateMetadata
     from tensorrt_llm._torch.modules.mamba import gdn_mixer
 
@@ -734,6 +736,7 @@ def test_gdn_replay_verify_dispatches_by_history_layout(monkeypatch, ring_mode):
         layer_cache=layer_cache,
         replay_work_items=None,
         replay_n_writes=None,
+        replay_indices_d=torch.tensor([3, 1, 5, 0] if ring_mode else [4, 2, 0, 1]).int(),
     )
 
     if ring_mode:
@@ -747,6 +750,7 @@ def test_gdn_replay_verify_dispatches_by_history_layout(monkeypatch, ring_mode):
         assert set(calls) == {"triton"}
         kwargs = calls["triton"]
         assert kwargs["state_indices"].tolist() == [3, 1, 5]
+        assert kwargs["replay_indices"].tolist() == [4, 2, 0]
         assert kwargs["old_u"] == "old_x"
 
 
@@ -1073,3 +1077,106 @@ def test_gdn_verify_reads_inproj_rows_after_pdl_wait():
     torch.cuda.synchronize()
     assert torch.equal(y.view(torch.uint8), y_ref.view(torch.uint8))
     assert torch.equal(m["ssm"], m_ref["ssm"])
+
+
+def _page_strided(rows, num_slots, fill):
+    """``num_slots`` rows shaped like ``rows`` with a pool page's slot stride (a second row of padding per slot),
+    filled with ``fill``."""
+    backing = torch.full((num_slots, 2, *rows.shape[1:]), fill, device=rows.device).to(rows.dtype)
+    return backing[:, 1]
+
+
+@skip_no_sm100f
+@pytest.mark.parametrize("heads,n,t", [((2, 8), 4, 7), ((1, 4), 3, 4), ((16, 64), 2, 2)])
+@pytest.mark.parametrize("fp8", [False, True])
+def test_gdn_verify_with_separate_replay_slots_matches_coupled(heads, n, t, fp8):
+    """History and bookkeeping at replay slots other than the state slots give, bit for bit, the coupled results.
+
+    The coupled run keeps contiguous history and bookkeeping indexed by the state slots. The other keeps the same rows
+    at a disjoint set of replay slots of buffers with a pool page's slot stride, PNAT and the active buffer in strided
+    16-byte rows; every other history row holds NaN. Both run verify steps through checkpoint commits and advance
+    their bookkeeping with the same acceptance.
+    """
+    from tensorrt_llm._torch.modules.fla.cache_manager import (
+        ReplayStateUpdateMetadata,
+        _advance_replay_state,
+    )
+
+    H, HV, cd, _, _, st, mut = _verify_case(heads, n, t, pnat=0)
+    g = torch.Generator(device="cuda").manual_seed(4321)
+    state_indices = st["state_indices"]
+    num_replay_slots = _VERIFY_SLOTS + 2 * n + 3
+    # The replay slots lie past every state slot, so a row read by the state slot is NaN.
+    replay_indices = (
+        torch.randperm(num_replay_slots - _VERIFY_SLOTS, generator=g, device="cuda")[:n]
+        + _VERIFY_SLOTS
+    ).to(torch.int32)
+    state_rows, replay_rows = state_indices.long(), replay_indices.long()
+    initial_pnat = torch.randint(0, _VERIFY_HIST + 1, (n,), generator=g, device="cuda").int()
+    initial_pnat[0] = _VERIFY_HIST  # a checkpoint commit at the first step
+    initial_buf = torch.randint(0, 2, (n,), generator=g, device="cuda").int()
+
+    coupled = {name: tensor.clone() for name, tensor in mut.items()}
+    coupled["pnat"] = torch.zeros(_VERIFY_SLOTS, dtype=torch.int32, device="cuda")
+    coupled["buf"] = torch.zeros_like(coupled["pnat"])
+    coupled["pnat"][state_rows] = initial_pnat
+    coupled["buf"][state_rows] = initial_buf
+    separate = {"ssm": mut["ssm"].clone()}
+    for name in ("old_u", "old_k", "old_g"):
+        separate[name] = _page_strided(mut[name], num_replay_slots, float("nan"))
+        separate[name][replay_rows] = mut[name][state_rows]
+    meta = torch.full((num_replay_slots, 4), 13, dtype=torch.int32, device="cuda")
+    separate["pnat"], separate["buf"] = meta[:, 0], meta[:, 1]
+    separate["pnat"][replay_rows] = initial_pnat
+    separate["buf"][replay_rows] = initial_buf
+    assert not separate["old_k"].is_contiguous() and separate["pnat"].stride(0) == 4
+
+    def verify(side, proj, ba, replay):
+        return torch.ops.trtllm.gdn_verify(
+            proj,
+            proj[:, cd:].view(n * t, HV, _VERIFY_DIM),
+            ba[:, HV:],
+            ba[:, :HV],
+            st["a_log"],
+            st["dt_bias"],
+            st["norm_w"],
+            st["fp8_scale"] if fp8 else None,
+            1e-6,
+            side["ssm"],
+            state_indices,
+            side["old_u"],
+            side["old_k"],
+            side["old_g"],
+            side["buf"],
+            side["pnat"],
+            replay,
+        )
+
+    commits = 0
+    for _ in range(4):
+        commits += int((coupled["pnat"][state_rows] + t > _VERIFY_HIST).sum())
+        proj = (torch.randn(n * t, cd + HV * _VERIFY_DIM, generator=g, device="cuda") * 0.7).to(
+            torch.bfloat16
+        )
+        ba = torch.randn(n * t, 2 * HV, generator=g, device="cuda").to(torch.bfloat16)
+        y_coupled = verify(coupled, proj, ba, None)
+        y_separate = verify(separate, proj, ba, replay_indices)
+        assert torch.equal(y_separate.view(torch.uint8), y_coupled.view(torch.uint8))
+        accepted = torch.randint(1, t + 1, (n,), generator=g, device="cuda").int()
+        for side, rows in ((coupled, state_indices), (separate, replay_indices)):
+            _advance_replay_state(
+                ReplayStateUpdateMetadata(side["pnat"], side["buf"], t, _VERIFY_HIST),
+                rows,
+                accepted,
+            )
+    torch.cuda.synchronize()
+
+    assert commits >= 1
+    assert torch.equal(separate["ssm"], coupled["ssm"])
+    for name in ("old_u", "old_k", "old_g", "pnat", "buf"):
+        assert torch.equal(separate[name][replay_rows], coupled[name][state_rows]), name
+    others = torch.ones(num_replay_slots, dtype=torch.bool, device="cuda")
+    others[replay_rows] = False
+    for name in ("old_u", "old_k", "old_g"):
+        assert torch.isnan(separate[name][others].float()).all(), name
+    assert (meta[others] == 13).all() and (meta[replay_rows, 2:] == 13).all()

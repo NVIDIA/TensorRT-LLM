@@ -23,6 +23,7 @@ from .gvr_topk_decode_reg import GvrRegKernel
 from .gvr_topk_decode_self_sampling_host import prefill_ready as selfsampling_topk_prefill_ready
 from .gvr_topk_decode_self_sampling_host import run_prefill as selfsampling_topk_run_prefill
 from .gvr_topk_decode_self_sampling_host import run_varlen as selfsampling_topk_run_varlen
+from .gvr_topk_decode_self_sampling_host import varlen_ready as selfsampling_topk_varlen_ready
 from .gvr_topk_decode_tp import GvrTpKernel
 from .single_pass_multi_cta_radix_topk import SinglePassMultiCTARadixTopKKernel
 
@@ -40,4 +41,5 @@ __all__ = [
     "selfsampling_topk_run_varlen",
     "selfsampling_topk_run_prefill",
     "selfsampling_topk_prefill_ready",
+    "selfsampling_topk_varlen_ready",
 ]

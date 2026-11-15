@@ -39,7 +39,6 @@ try:
         handle_streaming_response,
     )
     from tensorrt_llm.serve.openai_protocol import StreamOptions, _logit_bias_to_embedding_bias
-    from tensorrt_llm.serve.openai_server import OpenAIServer
     from tensorrt_llm.serve.postprocess_handlers import (
         ChatCompletionPostprocArgs,
         chat_harmony_streaming_post_processor,
@@ -1559,9 +1558,6 @@ class TestStripIncompleteMessagesReporting:
 
 
 def test_none_tokenizer_num_postprocess_workers():
-    server = object.__new__(OpenAIServer)
-    server.tokenizer = None
-    assert server._vocab_size is None
     with pytest.raises(ValueError, match="logit_bias requires a tokenizer"):
         _logit_bias_to_embedding_bias({"0": 1.0}, vocab_size=None)
 

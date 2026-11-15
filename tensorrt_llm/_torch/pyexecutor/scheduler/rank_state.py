@@ -59,6 +59,40 @@ class RankKvCacheStats(NamedTuple):
         )
 
 
+class RankSpecDecodingStats(NamedTuple):
+    """Immutable rank-local speculative-decoding counters for one iteration."""
+
+    num_draft_tokens: int
+    num_accepted_tokens: int
+    num_requests_with_draft_tokens: int
+
+    @classmethod
+    def wire_size(cls) -> int:
+        """Return the number of scalar fields in a speculative-decoding snapshot.
+
+        Returns:
+            Number of fields in the named tuple's wire schema.
+        """
+        return len(cls._fields)
+
+    @classmethod
+    def deserialize(cls, data: list[int | float]) -> RankSpecDecodingStats:
+        """Restore the counters from their scalar wire fields.
+
+        Args:
+            data: Draft tokens, accepted draft tokens and requests with draft tokens.
+
+        Returns:
+            The immutable speculative-decoding snapshot.
+
+        Raises:
+            ValueError: The snapshot has an unexpected number of fields.
+        """
+        if len(data) != cls.wire_size():
+            raise ValueError(f"Speculative-decoding snapshot requires {cls.wire_size()} fields")
+        return cls(int(data[0]), int(data[1]), int(data[2]))
+
+
 @dataclass
 class RankIterStatsPayload:
     """Per-rank iteration payload piggybacked on the ADP allgather."""
@@ -66,8 +100,8 @@ class RankIterStatsPayload:
     # Legacy scalar widths are independent of the optional snapshot fields.
     _ITER_STATS_FIELD_COUNT: ClassVar[int] = 9
     _KV_LOAD_FIELD_COUNT: ClassVar[int] = 3
-    _SNAPSHOT_WIRE_VERSION: ClassVar[int] = -1
-    _SNAPSHOT_HEADER_SIZE: ClassVar[int] = 4
+    _SNAPSHOT_WIRE_VERSION: ClassVar[int] = -2
+    _SNAPSHOT_HEADER_SIZE: ClassVar[int] = 5
 
     has_iter_stats: int = 0
     iter_stats_iter: int = -1
@@ -83,6 +117,7 @@ class RankIterStatsPayload:
     kv_load_timestamp_ns: int = 0
     kv_cache_stats: RankKvCacheStats | None = None
     cross_kv_cache_stats: RankKvCacheStats | None = None
+    specdec_stats: RankSpecDecodingStats | None = None
 
     def serialize(self, include_kv_cache_load: bool = False) -> list[int | float]:
         """Serialize to a flat list for allgather transport."""
@@ -105,17 +140,17 @@ class RankIterStatsPayload:
                     self.kv_load_timestamp_ns,
                 ]
             )
-        if self.kv_cache_stats is not None or self.cross_kv_cache_stats is not None:
+        snapshots = (self.kv_cache_stats, self.cross_kv_cache_stats, self.specdec_stats)
+        if any(snapshot is not None for snapshot in snapshots):
             # The negative version cannot be confused with has_iter_stats (0/1).
-            # Presence flags frame both snapshots and the independent load fields.
+            # Presence flags frame the snapshots and the independent load fields.
             values = [
                 self._SNAPSHOT_WIRE_VERSION,
                 int(include_kv_cache_load),
-                int(self.kv_cache_stats is not None),
-                int(self.cross_kv_cache_stats is not None),
+                *(int(snapshot is not None) for snapshot in snapshots),
                 *values,
             ]
-            for snapshot in (self.kv_cache_stats, self.cross_kv_cache_stats):
+            for snapshot in snapshots:
                 if snapshot is not None:
                     values.extend(snapshot)
         return values
@@ -138,12 +173,13 @@ class RankIterStatsPayload:
             or data[0] != cls._SNAPSHOT_WIRE_VERSION
             or any(flag not in (0, 1) for flag in data[1 : cls._SNAPSHOT_HEADER_SIZE])
         ):
-            raise ValueError("Invalid KV snapshot payload header")
+            raise ValueError("Invalid snapshot payload header")
         return (
             cls._SNAPSHOT_HEADER_SIZE
             + cls._ITER_STATS_FIELD_COUNT
             + int(data[1]) * cls._KV_LOAD_FIELD_COUNT
             + int(data[2] + data[3]) * RankKvCacheStats.wire_size()
+            + int(data[4]) * RankSpecDecodingStats.wire_size()
         )
 
     @classmethod
@@ -153,7 +189,7 @@ class RankIterStatsPayload:
         if values and values[0] < 0:
             expected_size = cls.snapshot_payload_size(values)
             if len(values) != expected_size:
-                raise ValueError(f"KV snapshot payload requires {expected_size} fields")
+                raise ValueError(f"Snapshot payload requires {expected_size} fields")
             scalar_end = (
                 cls._SNAPSHOT_HEADER_SIZE
                 + cls._ITER_STATS_FIELD_COUNT
@@ -169,6 +205,11 @@ class RankIterStatsPayload:
             if values[3]:
                 result.cross_kv_cache_stats = RankKvCacheStats.deserialize(
                     values[cursor : cursor + RankKvCacheStats.wire_size()]
+                )
+                cursor += RankKvCacheStats.wire_size()
+            if values[4]:
+                result.specdec_stats = RankSpecDecodingStats.deserialize(
+                    values[cursor : cursor + RankSpecDecodingStats.wire_size()]
                 )
             return result
         scalar_field_count = cls._ITER_STATS_FIELD_COUNT + cls._KV_LOAD_FIELD_COUNT
@@ -225,7 +266,7 @@ class RankState:
                 values[prefix_field_count:]
             )
             if len(values) != prefix_field_count + stats_field_count + 4:
-                raise ValueError("KV snapshot rank state requires four trailing fields")
+                raise ValueError("Snapshot rank state requires four trailing fields")
         else:
             # Legacy messages have optional load telemetry and two or four tail
             # fields. Keep their framing independent of the Python dataclass size.

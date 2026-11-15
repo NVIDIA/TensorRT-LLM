@@ -173,3 +173,23 @@ def test_create_input_processor_skips_hf_config_for_other_formats(
     assert type(processor) is DefaultInputProcessor
     assert processor.tokenizer is tokenizer
     assert config_loads == []
+
+
+@pytest.mark.parametrize("capability", [None, False, True])
+@pytest.mark.parametrize("enabled", [None, False, True])
+def test_vision_gpu_normalize_requires_model_opt_in(
+    config_loads: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    capability: bool | None,
+    enabled: bool | None,
+) -> None:
+    if capability is not None:
+        monkeypatch.setattr(
+            _FakeVisionLanguageModel, "supports_vision_gpu_normalize", capability, raising=False
+        )
+    options = {} if enabled is None else {"vision_gpu_normalize": enabled}
+    processor = create_input_processor("/ckpt", object(), **options)
+    if enabled is None:
+        assert "vision_gpu_normalize" not in processor.kwargs
+    else:
+        assert processor.kwargs["vision_gpu_normalize"] is (enabled and capability is True)

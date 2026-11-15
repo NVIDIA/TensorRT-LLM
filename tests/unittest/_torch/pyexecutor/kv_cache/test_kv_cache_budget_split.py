@@ -260,6 +260,7 @@ class TestSplitGpuBudgetForDraft:
         draft_model_config.mapping = creator._mapping
         creator._kv_cache_manager_cls = DraftCostKVCacheManager
         creator._is_disagg = False
+        creator._disable_overlap_scheduler = False
         creator._should_create_separate_draft_kv_cache = Mock(return_value=True)
         creator._get_effective_draft_config = Mock(return_value=draft_model_config)
         creator._get_num_draft_layers = Mock(return_value=1)
@@ -336,6 +337,10 @@ class TestSplitGpuBudgetForDraft:
         # A Mock's truthy return would send get_num_extra_kv_tokens down the
         # one-engine arm; this test's config is a drafter outside the engine.
         mode.use_one_engine.return_value = False
+        # A truthy DFlash or DSpark check would route costing through the shared
+        # target and drafter cache path.
+        mode.is_dflash.return_value = False
+        mode.is_dspark.return_value = False
         costed_windows: list[tuple[object, list[int] | None]] = []
 
         class RecordingKVCacheManager(KVCacheManagerV2):
@@ -378,6 +383,7 @@ class TestSplitGpuBudgetForDraft:
         draft_model_config.mapping = creator._mapping
         creator._kv_cache_manager_cls = RecordingKVCacheManager
         creator._is_disagg = False
+        creator._disable_overlap_scheduler = False
         creator._cache_transceiver_config = None
         creator._should_create_separate_draft_kv_cache = Mock(return_value=True)
         creator._get_effective_draft_config = Mock(return_value=draft_model_config)
@@ -472,6 +478,7 @@ class TestSplitGpuBudgetForDraft:
         creator._max_num_tokens = 128
         creator._speculative_config = None
         creator._is_disagg = False
+        creator._disable_overlap_scheduler = False
         # The second of two pipeline ranks: it holds global layers 2 and 3.
         creator._mapping = Mock(enable_attention_dp=False, tp_size=1)
         creator._mapping.pp_layers.return_value = [2, 3]
@@ -502,6 +509,7 @@ class TestSplitGpuBudgetForDraft:
         c._is_encoder_decoder = Mock(return_value=False)
         c._kv_connector_manager = None
         c._is_disagg = False
+        c._disable_overlap_scheduler = False
         c._max_num_tokens = 8192
         c._max_beam_width = 1
         c._execution_stream = None
@@ -654,7 +662,7 @@ class TestSplitGpuBudgetForDraft:
             total_kv_intercept=200,
         )
 
-        with pytest.raises(ValueError, match="GPU budget"):
+        with pytest.raises(RuntimeError, match="GPU budget"):
             c._split_kv_cache_budget_for_draft("max_gpu_total_bytes")
 
 
@@ -723,6 +731,7 @@ def test_helix_attention_dp_draft_cost_uses_the_drafter_shard(mocker):
     c._draft_config = draft_model_config
     c._kv_cache_manager_cls = ProbeKVCacheManager
     c._is_disagg = True
+    c._disable_overlap_scheduler = False
     c._is_encoder_decoder = Mock(return_value=False)
     c._should_create_separate_draft_kv_cache = Mock(return_value=True)
     c._get_num_draft_layers = Mock(return_value=5)
@@ -1004,7 +1013,7 @@ class TestGpuSplitChargesFixedCost:
             total_kv_intercept=2 * GB,
         )
 
-        with pytest.raises(ValueError, match="GPU budget"):
+        with pytest.raises(RuntimeError, match="GPU budget"):
             c._split_kv_cache_budget_for_draft("max_gpu_total_bytes")
 
     def test_gpu_raise_does_not_block_subsequent_host_split(self):
@@ -1194,6 +1203,7 @@ class TestExternalDrafterKvDtype:
         draft_model_config.mapping = c._mapping
         c._kv_cache_manager_cls = ProbeKVCacheManager
         c._is_disagg = True
+        c._disable_overlap_scheduler = False
         c._cache_transceiver_config = None
         c._is_encoder_decoder = Mock(return_value=False)
         c._should_create_separate_draft_kv_cache = Mock(return_value=True)
@@ -1812,7 +1822,7 @@ class TestPerRequestWeightedSplit:
         # The slope budget is 1000 - 400 = 600, below the 700-byte one-mirror
         # quota. Flooring anyway would hand the draft 700 and the target 300,
         # below its 400-byte intercept.
-        with pytest.raises(ValueError, match="insufficient"):
+        with pytest.raises(RuntimeError, match="insufficient"):
             c._split_kv_cache_budget_for_draft("max_gpu_total_bytes")
 
     def test_draft_gpu_budget_cap_moves_the_excess_to_the_target(self, monkeypatch):

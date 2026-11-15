@@ -34,10 +34,12 @@ isolation -- it is spread across three points inside
 ``test_py_executor.py`` does for the PP scheduling path.
 """
 
+from contextlib import nullcontext
 from types import MethodType
 from unittest.mock import MagicMock, call
 
 import pytest
+import torch
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
@@ -1280,18 +1282,53 @@ def _make_pp_loop_executor(monkeypatch, *, num_micro_batches=2, agreement=(True,
 class TestPpLoopDrainWiring:
     """The three points in ``_executor_loop_pp`` that make the drain work."""
 
-    def test_loop_queues_normally_when_no_rebalance_is_pending(self, monkeypatch):
-        """Control case: without a drain the loop reaches the forward.
+    def test_last_pp_rank_samples_owned_logits_without_rebalance(self, monkeypatch):
+        """Without a drain, the last PP rank forwards and samples owned outputs."""
 
-        Without this the drain test below would pass even if ``can_queue`` were
-        never honored -- e.g. if the loop simply never queued anything.
-        """
+        class StopAfterSampling(RuntimeError):
+            pass
+
         exe = _make_pp_loop_executor(monkeypatch, agreement=(False,))
+        exe.dist.rank = exe.dist.pp_rank = 1
+        exe.dist.is_first_pp_rank = False
+        exe.dist.is_last_pp_rank = True
+        exe.scheduler = MagicMock()
+        exe.kv_cache_manager = MagicMock()
+        exe.inflight_req_ids = set()
+        exe.guided_decoder = None
+        exe.perf_manager = MagicMock()
+        exe.pp_multi_stream_sample = True
+        exe.finish_sample_event = MagicMock()
+        exe.sample_stream = MagicMock()
+        outputs = {"logits": torch.arange(6).reshape(2, 3), "context_logits_handled": True}
+        exe._forward_step = MagicMock(return_value=outputs)
+        exe._sample_async = MagicMock()
+        sampling_calls = MagicMock()
+        sampling_calls.attach_mock(exe.finish_sample_event.wait, "event_wait")
+        sampling_calls.attach_mock(exe.sample_stream.wait_stream, "stream_wait")
+        sampling_calls.attach_mock(exe._sample_async, "sample")
+        sampling_calls.attach_mock(exe.finish_sample_event.record, "event_record")
+        exe._handle_guided_decoder_errors = MagicMock(side_effect=StopAfterSampling)
+        monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
 
-        with pytest.raises(_ReachedForward):
+        with pytest.raises(StopAfterSampling):
             PyExecutor._executor_loop_pp(exe)
 
-        exe._forward_step_inter_pp.assert_called_once()
+        exe._forward_step.assert_called_once()
+        exe._sample_async.assert_called_once()
+        sampled = exe._sample_async.call_args.args[1]
+        assert sampled["context_logits_handled"] is True
+        assert sampled["logits"].data_ptr() != outputs["logits"].data_ptr()
+        torch.testing.assert_close(sampled["logits"], outputs["logits"])
+        outputs["logits"].zero_()
+        torch.testing.assert_close(sampled["logits"], torch.arange(6).reshape(2, 3))
+        exe.sample_stream.wait_stream.assert_called_once_with(torch.cuda.current_stream())
+        assert sampling_calls.mock_calls == [
+            call.event_wait(),
+            call.stream_wait(torch.cuda.current_stream()),
+            call.sample(*exe._sample_async.call_args.args),
+            call.event_record(),
+        ]
         exe._rebalance_kv_pools_now.assert_not_called()
 
     def test_drain_suppresses_queueing_then_rebalances_and_resumes(self, monkeypatch):

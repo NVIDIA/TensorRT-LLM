@@ -65,7 +65,9 @@ def test_a_model_without_hooks_gets_the_all_off_default(model):
 def test_every_field_defaults_to_off():
     for field in dataclasses.fields(RuntimeHooks):
         value = getattr(DEFAULT_RUNTIME_HOOKS, field.name)
-        if dataclasses.is_dataclass(value):
+        if field.name == "first_content_emit_iters":
+            assert value == 1
+        elif dataclasses.is_dataclass(value):
             assert all(
                 getattr(value, item.name) in (False, None) for item in dataclasses.fields(value)
             )
@@ -298,6 +300,8 @@ _SEAM_ATTRS = {
     "_execution_stream_loop_armed": False,
     "runtime_hooks": DEFAULT_RUNTIME_HOOKS,
     "decode_prologue": None,
+    "first_content_emit_iters": 1,
+    "_late_compile_detect": False,
 }
 # Locals the call sites hold a hook (or a decision on one) in.
 _SEAM_LOCALS = ("prologue",)
@@ -362,6 +366,17 @@ class _AllOffWalk:
             return body if body is not _UNKNOWN and body is other else _UNKNOWN
         if self._is_seam_call(node):
             return DEFAULT_RUNTIME_HOOKS
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "max"
+            and not node.keywords
+            and len(node.args) >= 2
+        ):
+            values = [self.value(arg, env) for arg in node.args]
+            if all(type(value) is int for value in values):
+                return max(values)
+            return _UNKNOWN
         if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
             operand = self.value(node.operand, env)
             return _UNKNOWN if operand is _UNKNOWN else not operand
@@ -378,6 +393,15 @@ class _AllOffWalk:
         if isinstance(node, ast.Compare) and len(node.ops) == 1:
             left, right = self.value(node.left, env), self.value(node.comparators[0], env)
             op = node.ops[0]
+            if type(left) is int and type(right) is int:
+                if isinstance(op, ast.Gt):
+                    return left > right
+                if isinstance(op, ast.GtE):
+                    return left >= right
+                if isinstance(op, ast.Lt):
+                    return left < right
+                if isinstance(op, ast.LtE):
+                    return left <= right
             if isinstance(op, (ast.Is, ast.IsNot)) and left is not _UNKNOWN:
                 if isinstance(node.comparators[0], ast.Constant) and right is None:
                     return (left is None) == isinstance(op, ast.Is)
@@ -816,3 +840,18 @@ def test_m3_hooks_are_immutable_once_declared():
 )
 def test_m3_every_metadata_upload_skip_asks_for_private_metadata_buffers(hooks, skips):
     assert hooks.skips_unchanged_metadata_uploads is skips
+
+
+@pytest.mark.parametrize(
+    "expression, expected",
+    [
+        ("max(1, self.runtime_hooks.first_content_emit_iters)", 1),
+        ("max(1, unknown)", _UNKNOWN),
+        ("self.first_content_emit_iters > 1", False),
+        ("self.first_content_emit_iters >= 1", True),
+        ("unknown > self.first_content_emit_iters", _UNKNOWN),
+    ],
+)
+def test_integer_hook_policy_is_decided_only_from_known_values(expression, expected):
+    walk = _AllOffWalk("sample.py")
+    assert walk.value(ast.parse(expression, mode="eval").body, {}) is expected

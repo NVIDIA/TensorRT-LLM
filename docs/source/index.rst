@@ -71,6 +71,7 @@ Welcome to TensorRT LLM's Documentation!
    features/subagent-routing.md
    features/embeddings.md
    features/kvcache.md
+   features/kv-hints.md
    features/kv-cache-compression.md
    features/long-sequence.md
    features/lora.md
@@ -80,6 +81,7 @@ Welcome to TensorRT LLM's Documentation!
    features/parallel-strategy.md
    features/quantization.md
    features/sampling.md
+   features/watermarking.md
    features/additional-outputs.md
    features/post-processor-hook.md
    features/guided-decoding.md

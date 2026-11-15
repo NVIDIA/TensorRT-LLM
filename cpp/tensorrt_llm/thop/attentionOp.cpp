@@ -1365,6 +1365,8 @@ int MHA::enqueueContext(FmhaParams const& p, cudaStream_t stream)
         fmhaParams.kvSeqLenPtr = decoder_params.seqKVLengths;
         fmhaParams.cuKvSeqLenPtr = contextCuKvSeqlens;
         fmhaParams.cuMaskRowsPtr = workspaceViews.cuMaskRows;
+        fmhaParams.variableWindowTokenStartsPtr = p.getVariableWindowTokenStarts();
+        fmhaParams.variableWindowTokenEndsPtr = p.getVariableWindowTokenEnds();
         fmhaParams.tileCounterPtr = workspaceViews.fmhaTileCounter;
         fmhaParams.scaleBmm1Ptr = workspaceViews.fmhaBmm1Scale;
         fmhaParams.scaleBmm2Ptr = workspaceViews.fmhaBmm2Scale;
@@ -2134,6 +2136,15 @@ MHA::MHA(AttentionBase const& key)
             // TODO: add the support for cross attention + contiguous kv cache.
             TLLM_LOG_WARNING("Fall back to unfused MHA because of cross attention + contiguous kv cache.");
         }
+        else if (cross_attention && use_kv_cache && quant_mode.hasKvCacheQuant()
+            && !(mPagedKVCache && paged_context_fmha))
+        {
+            // The fused context kernel reads the encoder K/V back from the paged cross cache, and it is only told
+            // the cache's element type when paged-context FMHA is on. Without that it reads a quantized cache as
+            // the activation type. The unfused path reads K/V from the 16-bit workspace and writes the cache
+            // through the quantizing transpose, so it is correct for every cache type.
+            TLLM_LOG_WARNING("Fall back to unfused MHA because of cross attention + quantized kv cache.");
+        }
         else
         {
             mEnableContextFMHA = true;
@@ -2196,6 +2207,8 @@ void MHA::initContext()
     initShared();
     if (!mEnableContextFMHA)
     {
+        TLLM_CHECK_WITH_INFO(
+            !use_variable_window, "Variable-window attention requires a supported context FMHA kernel configuration.");
         return;
     }
     MHARunnerFixedParams fmhaParams{};
@@ -2230,7 +2243,15 @@ void MHA::initContext()
     fmhaParams.forceFp32Acc = false;
 
     // setting attention mask type based on the mask type
-    fmhaParams.setAttentionMaskType(static_cast<std::int8_t>(mask_type));
+    if (use_variable_window)
+    {
+        TLLM_CHECK_WITH_INFO(mSM == 100 || mSM == 103, "Variable-window attention requires SM100 or SM103.");
+        fmhaParams.attentionMaskType = ContextAttentionMaskType::VARIABLE_WINDOW;
+    }
+    else
+    {
+        fmhaParams.setAttentionMaskType(static_cast<std::int8_t>(mask_type));
+    }
 
     if (cross_attention)
     {
@@ -2269,10 +2290,18 @@ void MHA::initContext()
 
     // Fall back to unfused MHA kernels if not supported.
     mEnableContextFMHA = mFmhaDispatcher->isSupported();
+    TLLM_CHECK_WITH_INFO(!use_variable_window || mEnableContextFMHA,
+        "Variable-window attention requires a supported context FMHA kernel configuration.");
 
     // Only FMHA supports custom mask currently.
     TLLM_CHECK_WITH_INFO(
         !useCustomMask() || mEnableContextFMHA, "Only Context FMHA supports custom mask input currently.");
+}
+
+bool MHA::supportsVariableWindow()
+{
+    initContext();
+    return use_variable_window && mEnableContextFMHA;
 }
 
 void MHA::initGeneration()
@@ -2349,6 +2378,22 @@ bool MHA::supportsNvFp4Output()
 
 void MHA::prepareInputs(FmhaParams& p, bool isGen)
 {
+    TORCH_CHECK(!isGen || !use_variable_window, "variable-window bounds are supported only for context attention");
+    if (!isGen && use_variable_window)
+    {
+        TORCH_CHECK(!p.is_cross && !p.use_spec_decoding && !sageAttnRequested(),
+            "Variable-window attention requires non-cross, non-speculative context attention without SageAttention.");
+        for (auto const& tensor :
+            {p.fwd.variable_window_token_starts.value(), p.fwd.variable_window_token_ends.value()})
+        {
+            TORCH_CHECK(tensor.is_cuda() && tensor.device() == p.getQueryInput().device(),
+                "variable-window bounds must be on the same device as qkv_or_q");
+            TORCH_CHECK(tensor.scalar_type() == at::kInt && tensor.dim() == 1 && tensor.is_contiguous(),
+                "variable-window bounds must be contiguous 1-D int32 tensors");
+            TORCH_CHECK(tensor.numel() == p.token_offset + p.num_tokens,
+                "variable-window bounds must have one element per packed context query token");
+        }
+    }
     TLLM_CHECK_WITH_INFO(p.fwd.is_fused_qkv || sageAttnRequested() || p.is_cross,
         "For non-cross, non-SageAttention attention, only fused QKV is supported now.");
 
@@ -3978,6 +4023,9 @@ AttentionBase AttentionBase::getCacheKey(FmhaParams const& p)
     c.cross_attention = p.is_cross;
     c.tokens_per_block = p.tokens_per_block;
     c.mask_type = static_cast<AttentionMaskType>(fwd.mask_type);
+    TORCH_CHECK(fwd.variable_window_token_starts.has_value() == fwd.variable_window_token_ends.has_value(),
+        "variable_window_token_starts and variable_window_token_ends must be provided together");
+    c.use_variable_window = fwd.variable_window_token_starts.has_value() && p.seq_offset == 0;
     c.position_embedding_type = attn.position_embedding_type;
     c.num_heads = attn.num_heads;
     c.num_kv_heads = attn.num_kv_heads;
@@ -3998,6 +4046,7 @@ AttentionBase AttentionBase::getCacheKey(FmhaParams const& p)
     c.use_tllm_gen_sparse_attention = hasAttnIndices && !hasPagedIndices;
 
     c.is_mla_enable = attn.is_mla_enable;
+    TORCH_CHECK(!c.use_variable_window || !c.is_mla_enable, "Variable-window attention does not support MLA.");
     c.q_lora_rank = attn.q_lora_rank.value_or(0);
     c.kv_lora_rank = attn.kv_lora_rank.value_or(0);
     c.qk_nope_head_dim = attn.qk_nope_head_dim.value_or(0);
@@ -4030,6 +4079,7 @@ std::string AttentionBase::toString() const
     TRTLLM_DUMP_FIELD(use_kv_cache)
     TRTLLM_DUMP_FIELD(cross_attention)
     TRTLLM_DUMP_FIELD(tokens_per_block)
+    TRTLLM_DUMP_FIELD(use_variable_window)
     ss << "mask_type=" << static_cast<int>(mask_type) << " ";
     ss << "position_embedding_type=" << static_cast<int>(position_embedding_type) << " ";
     TRTLLM_DUMP_FIELD(num_heads)
@@ -4110,6 +4160,50 @@ bool attention_supports_nvfp4_output(int64_t const num_heads, int64_t const num_
     bool const supported = op.supportsNvFp4Output();
     cache.emplace(key, supported);
     return supported;
+}
+
+bool attention_supports_variable_window(c10::ScalarType const dtype, c10::ScalarType const output_dtype,
+    int64_t const num_heads, int64_t const num_kv_heads, int64_t const head_size,
+    std::optional<int64_t> const tokens_per_block, int64_t const quant_mode, int64_t const /*max_num_requests*/,
+    int64_t const /*max_context_length*/, int64_t const /*max_seq_len*/,
+    std::optional<int64_t> const /*attention_chunk_size*/, bool const use_kv_cache, bool const use_paged_context_fmha)
+{
+    auto const sm = common::getSMVersion();
+    if ((sm != 100 && sm != 103)
+        || (output_dtype != dtype && output_dtype != at::kFloat8_e4m3fn && output_dtype != at::kByte))
+    {
+        return false;
+    }
+    AttentionBase cfg;
+    cfg.device = at::cuda::current_device();
+    cfg.type = runtime::TorchUtils::dataType(dtype);
+    cfg.num_heads = num_heads;
+    cfg.num_kv_heads = num_kv_heads;
+    cfg.head_size = head_size;
+    cfg.is_fp8_out = output_dtype == at::kFloat8_e4m3fn;
+    cfg.is_fp4_out = output_dtype == at::kByte;
+    cfg.use_kv_cache = use_kv_cache;
+    cfg.tokens_per_block = tokens_per_block.value_or(64);
+    cfg.quant_mode = common::QuantMode(static_cast<uint32_t>(quant_mode));
+    cfg.paged_context_fmha = use_paged_context_fmha;
+    cfg.use_variable_window = true;
+    // The phased runner's fixed configuration determines kernel availability.
+    static thread_local std::unordered_map<AttentionBase, bool> cache;
+    if (auto it = cache.find(cfg); it != cache.end())
+    {
+        return it->second;
+    }
+    bool supported = false;
+    try
+    {
+        MHA op{cfg};
+        supported = op.supportsVariableWindow();
+    }
+    catch (std::exception const& e)
+    {
+        TLLM_LOG_DEBUG("Variable-window FMHA probe rejected the configuration: %s", e.what());
+    }
+    return cache.emplace(cfg, supported).first->second;
 }
 
 int64_t spec_dec_tree_custom_mask_capacity(
@@ -4301,18 +4395,19 @@ std::size_t std::hash<tensorrt_llm::torch_ext::AttentionBase>::operator()(
     tensorrt_llm::torch_ext::AttentionBase const& c) const noexcept
 {
     std::size_t h = 0;
-    for (auto const v : {static_cast<std::int64_t>(c.device), static_cast<std::int64_t>(c.type),
-             std::int64_t{c.is_fp8_out}, std::int64_t{c.is_fp4_out}, std::int64_t{c.use_kv_cache},
-             std::int64_t{c.cross_attention}, c.tokens_per_block, static_cast<std::int64_t>(c.mask_type),
-             static_cast<std::int64_t>(c.position_embedding_type), c.num_heads, c.num_kv_heads, c.head_size,
-             c.rotary_embedding_dim, static_cast<std::int64_t>(c.quant_mode.value()), std::int64_t{c.uses_spcompress},
-             std::int64_t{c.paged_context_fmha}, std::int64_t{c.is_spec_decoding_enabled},
-             c.spec_decoding_target_max_gen_len, std::int64_t{c.fuses_dsv4_inv_rope_fp8_quant},
-             std::int64_t{c.use_sparse_attention}, std::int64_t{c.use_tllm_gen_sparse_attention},
-             std::int64_t{c.use_nvfp4_mla_kv_cache}, std::int64_t{c.is_mla_enable}, c.q_lora_rank, c.kv_lora_rank,
-             c.qk_nope_head_dim, c.qk_rope_head_dim, c.v_head_dim, c.predicted_tokens_per_seq, c.mla_layer_num,
-             std::int64_t{c.rope_append}, c.sage_attn_num_elts_per_blk_q, c.sage_attn_num_elts_per_blk_k,
-             c.sage_attn_num_elts_per_blk_v, std::int64_t{c.sage_attn_qk_int8}, std::int64_t{c.sage_attn_smooth_k}})
+    for (auto const v :
+        {static_cast<std::int64_t>(c.device), static_cast<std::int64_t>(c.type), std::int64_t{c.is_fp8_out},
+            std::int64_t{c.is_fp4_out}, std::int64_t{c.use_kv_cache}, std::int64_t{c.cross_attention},
+            c.tokens_per_block, static_cast<std::int64_t>(c.mask_type), std::int64_t{c.use_variable_window},
+            static_cast<std::int64_t>(c.position_embedding_type), c.num_heads, c.num_kv_heads, c.head_size,
+            c.rotary_embedding_dim, static_cast<std::int64_t>(c.quant_mode.value()), std::int64_t{c.uses_spcompress},
+            std::int64_t{c.paged_context_fmha}, std::int64_t{c.is_spec_decoding_enabled},
+            c.spec_decoding_target_max_gen_len, std::int64_t{c.fuses_dsv4_inv_rope_fp8_quant},
+            std::int64_t{c.use_sparse_attention}, std::int64_t{c.use_tllm_gen_sparse_attention},
+            std::int64_t{c.use_nvfp4_mla_kv_cache}, std::int64_t{c.is_mla_enable}, c.q_lora_rank, c.kv_lora_rank,
+            c.qk_nope_head_dim, c.qk_rope_head_dim, c.v_head_dim, c.predicted_tokens_per_seq, c.mla_layer_num,
+            std::int64_t{c.rope_append}, c.sage_attn_num_elts_per_blk_q, c.sage_attn_num_elts_per_blk_k,
+            c.sage_attn_num_elts_per_blk_v, std::int64_t{c.sage_attn_qk_int8}, std::int64_t{c.sage_attn_smooth_k}})
     {
         h = hashCombine(h, v);
     }
@@ -4324,5 +4419,6 @@ std::size_t std::hash<tensorrt_llm::torch_ext::AttentionBase>::operator()(
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def("attention_supports_nvfp4_output", &tensorrt_llm::torch_ext::attention_supports_nvfp4_output);
+    m.def("attention_supports_variable_window", &tensorrt_llm::torch_ext::attention_supports_variable_window);
     m.def("spec_dec_tree_custom_mask_capacity", &tensorrt_llm::torch_ext::spec_dec_tree_custom_mask_capacity);
 }

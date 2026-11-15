@@ -25,6 +25,18 @@
       "scenario": "Max Throughput"
     },
     {
+      "command": "trtllm-serve nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 --config ${TRTLLM_DIR}/examples/configs/curated/nemotron-super-marlin.yaml",
+      "config_filename": "nemotron-super-marlin.yaml",
+      "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/nemotron-super-marlin.yaml",
+      "config_path": "examples/configs/curated/nemotron-super-marlin.yaml",
+      "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/curated/nemotron-super-marlin.yaml",
+      "gpu_compatibility": "H100, H200",
+      "model": "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
+      "model_display_name": "Nemotron v3 Super (NVFP4)",
+      "model_url": "https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
+      "scenario": "NVFP4 on Hopper (Marlin)"
+    },
+    {
       "command": "trtllm-serve Qwen/Qwen3-Next-80B-A3B-Thinking --config ${TRTLLM_DIR}/examples/configs/curated/qwen3-next.yaml",
       "config_filename": "qwen3-next.yaml",
       "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/qwen3-next.yaml",

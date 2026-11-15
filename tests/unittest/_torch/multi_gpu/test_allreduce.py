@@ -20,6 +20,7 @@ import cloudpickle
 import pytest
 import torch
 from mpi4py import MPI
+from mpi4py.futures import MPIPoolExecutor
 from utils.util import check_accuracy, skip_pre_blackwell
 
 import tensorrt_llm
@@ -28,6 +29,8 @@ from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams, AllReduceStrategy,
                                              MiniMaxAllReduceRMS, MoEAllReduce,
                                              MoEAllReduceParams)
+from tensorrt_llm._torch.distributed.allreduce_helper import \
+    CustomAllReduceHelper
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.nccl_window_tensor_scope import \
@@ -930,6 +933,163 @@ def test_minimax_allreduce_rms_qk(mpi_pool_executor, non_contiguous_input):
         *zip(*[(tensor_parallel_size, run_minimax_allreduce_rms_qk_op, q_input,
                 k_input, rms_weights_q, rms_weights_k, eps,
                 non_contiguous_input)] * tensor_parallel_size),
+    )
+    for r in results:
+        assert r is True
+
+
+# About 10 ms of GPU time: long enough for the other ranks' Lamport kernel to
+# read the late rank's part of its buffer before that rank writes it.
+LATE_RANK_SLEEP_CYCLES = 20_000_000
+
+
+@torch.inference_mode()
+def run_lamport_mixed_dtype_single_rank(tensor_parallel_size: int,
+                                        dtype_order: str) -> bool:
+    """Alternate bf16 and fp32 ONESHOT all-reduces on one mapping.
+
+    Both dtypes share the mapping's Lamport workspace, and each call clears
+    the sub-buffer of the call before it. A large call followed by small
+    calls of the other dtype must clear exactly what the large call wrote:
+    clearing more runs into the buffer a later call is using, clearing less
+    leaves stale values that a later large call reads as already arrived.
+    One rank per round starts each call late, so the other ranks read its
+    part of the buffer before it arrives and any stale value is taken.
+    """
+    rank = tensorrt_llm.mpi_rank()
+    torch.cuda.set_device(rank)
+    mapping = Mapping(world_size=tensor_parallel_size,
+                      tp_size=tensor_parallel_size,
+                      rank=rank)
+    hidden_size = 6144
+    max_bytes = CustomAllReduceHelper.max_workspace_size_auto(
+        tensor_parallel_size, support_deterministic=False)
+    allreduce = {
+        dtype: AllReduce(mapping,
+                         strategy=AllReduceStrategy.ONESHOT,
+                         dtype=dtype)
+        for dtype in (torch.bfloat16, torch.float32)
+    }
+    big_dtype, small_dtype = ((torch.bfloat16, torch.float32)
+                              if dtype_order == "bf16_then_fp32" else
+                              (torch.float32, torch.bfloat16))
+    big_rows = int(0.9 * max_bytes) // (hidden_size * big_dtype.itemsize)
+    # The last call is the large shape again in the small dtype: after an
+    # under-clear it lands on the large call's stale sub-buffer.
+    small_dtype_big_rows = int(
+        0.9 * max_bytes) // (hidden_size * small_dtype.itemsize)
+    calls = [(big_rows, big_dtype), (8, small_dtype), (8, small_dtype),
+             (small_dtype_big_rows, small_dtype)]
+
+    try:
+        # Four calls per round on a triple buffer, so each round starts on a
+        # different sub-buffer.
+        for step, (rows, dtype) in enumerate(calls * 3):
+            late_rank = step // len(calls) % tensor_parallel_size
+            # Small integers sum exactly in both dtypes, so the comparison is
+            # exact and any stale or cleared element shows up.
+            parts = [
+                torch.randint(-8,
+                              9, (rows, hidden_size),
+                              generator=torch.Generator(
+                                  device="cuda").manual_seed(100 * step + r),
+                              device="cuda").to(dtype)
+                for r in range(tensor_parallel_size)
+            ]
+            expected = torch.stack(parts).float().sum(dim=0)
+            if rank == late_rank:
+                torch.cuda._sleep(LATE_RANK_SLEEP_CYCLES)
+            output = allreduce[dtype](parts[rank])
+            torch.cuda.synchronize()
+            torch.testing.assert_close(
+                output.float(),
+                expected,
+                rtol=0,
+                atol=0,
+                msg=lambda m: f"step {step}, {rows}x{hidden_size} {dtype}: {m}")
+    except Exception:
+        traceback.print_exc()
+        raise
+    return True
+
+
+# A wrong clear size can hang the ranks inside the kernel; the thread method
+# ends the session with a failure instead of waiting on the MPI pool.
+@pytest.mark.timeout(300, method="thread")
+@pytest.mark.skipif(torch.cuda.device_count() < 2,
+                    reason="Requires at least 2 GPUs for this test")
+@pytest.mark.parametrize("dtype_order", ["bf16_then_fp32", "fp32_then_bf16"])
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_allreduce_lamport_mixed_dtype(mpi_pool_executor: MPIPoolExecutor,
+                                       dtype_order: str) -> None:
+    tensor_parallel_size = mpi_pool_executor.num_workers
+    results = mpi_pool_executor.map(
+        run_lamport_mixed_dtype_single_rank,
+        *zip(*[(tensor_parallel_size, dtype_order)] * tensor_parallel_size),
+    )
+    for r in results:
+        assert r is True
+
+
+@torch.inference_mode()
+def run_minimax_rms_odd_tokens_single_rank(tensor_parallel_size: int) -> bool:
+    """One-token MiniMax reduce-RMS calls on one mapping.
+
+    Each call writes one 4-byte variance per rank, 8 bytes at TP2, and the
+    next call must still clear it: a call three calls later reuses the
+    sub-buffer and would otherwise take the late rank's old variance as
+    already arrived. Each rank holds a constant shard whose value changes
+    with the step, so an old variance changes the normalized output.
+    """
+    rank = tensorrt_llm.mpi_rank()
+    torch.cuda.set_device(rank)
+    mapping = Mapping(world_size=tensor_parallel_size,
+                      tp_size=tensor_parallel_size,
+                      rank=rank)
+    shard = 3072
+    minimax_allreduce_rms = MiniMaxAllReduceRMS(mapping=mapping)
+    weights = torch.ones((shard, ), dtype=torch.bfloat16, device="cuda")
+    try:
+        for step in range(12):
+            late_rank = step // 4 % tensor_parallel_size
+            values = [
+                float(1 + (step + r) % 5) for r in range(tensor_parallel_size)
+            ]
+            rms = (sum(v * v for v in values) / tensor_parallel_size)**0.5
+            local = torch.full((1, shard),
+                               values[rank],
+                               dtype=torch.bfloat16,
+                               device="cuda")
+            if rank == late_rank:
+                torch.cuda._sleep(LATE_RANK_SLEEP_CYCLES)
+            output = minimax_allreduce_rms(input=local,
+                                           rms_weights=weights,
+                                           eps=1e-6)
+            torch.cuda.synchronize()
+            torch.testing.assert_close(output.float(),
+                                       torch.full((1, shard),
+                                                  values[rank] / rms,
+                                                  device="cuda"),
+                                       rtol=2e-2,
+                                       atol=0,
+                                       msg=lambda m: f"step {step}: {m}")
+    except Exception:
+        traceback.print_exc()
+        raise
+    return True
+
+
+# A missed clear can also hang the ranks; see test_allreduce_lamport_mixed_dtype.
+@pytest.mark.timeout(300, method="thread")
+@pytest.mark.skipif(torch.cuda.device_count() < 2,
+                    reason="Requires at least 2 GPUs for this test")
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_minimax_allreduce_rms_odd_tokens(
+        mpi_pool_executor: MPIPoolExecutor) -> None:
+    tensor_parallel_size = mpi_pool_executor.num_workers
+    results = mpi_pool_executor.map(
+        run_minimax_rms_odd_tokens_single_rank,
+        *zip(*[(tensor_parallel_size, )] * tensor_parallel_size),
     )
     for r in results:
         assert r is True

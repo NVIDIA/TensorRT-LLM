@@ -29,6 +29,14 @@ from tensorrt_llm._torch.disaggregation.native.extent import Cancelled, Chunk, F
 from tensorrt_llm._torch.disaggregation.native.handle import TaskHandle
 from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
 
+_KV_RESULT_REPORT_TOKEN = b"report-token-123"
+
+
+def _publish_report_tokens(session, ranks=range(16)):
+    """Publish the per-writer report tokens that Receiver.dispatch_task mints."""
+    for task in getattr(session, "_kv_tasks", []):
+        task._kv_result_report_tokens = {int(r): _KV_RESULT_REPORT_TOKEN for r in ranks}
+
 
 def _params() -> DisaggregatedParams:
     return DisaggregatedParams(
@@ -239,8 +247,12 @@ def test_sender_late_done_reports_physical_failure_only(
         task.expected_transfers = 1
     status = Mock(wait=Mock(return_value=False), is_completed=Mock(return_value=False))
     status.last_status_str.return_value = "ERROR"
-    sender._agent = SimpleNamespace(name="nixl", submit_transfer_requests=lambda request: status)
-    request = SimpleNamespace(op="WRITE", remote_name="gen")
+    sender._agent = SimpleNamespace(
+        name="nixl",
+        submit_transfer_requests=lambda request: status,
+        check_remote_descs=lambda _name, _descs: True,
+    )
+    request = SimpleNamespace(op="WRITE", remote_name="gen", dst_descs=None)
     monkeypatch.setattr(transfer_mod.Sender, "_make_agent_request", Mock(return_value=request))
     dealer = Mock()
     sender._get_result_dealer = Mock(return_value=dealer)
@@ -315,7 +327,10 @@ def test_receiver_late_settlement_retains_logical_failure_and_quarantine(auxilia
     assert session.try_begin_transfer(task.slice_id, set(), writer_cohort={7})
     result = transfer_mod.AgentResult
     if auxiliary:
-        session.process_kv_agent_result(7, 0, True, result.FAILED)
+        _publish_report_tokens(session)
+        session.process_kv_agent_result(
+            7, 0, True, result.FAILED, kv_result_report_token=_KV_RESULT_REPORT_TOKEN
+        )
     else:
         session.process_aux_agent_result(7, result.FAILED)
 
@@ -323,7 +338,10 @@ def test_receiver_late_settlement_retains_logical_failure_and_quarantine(auxilia
         if auxiliary:
             session.process_aux_agent_result(7, status)
         else:
-            session.process_kv_agent_result(7, 0, True, status)
+            _publish_report_tokens(session)
+            session.process_kv_agent_result(
+                7, 0, True, status, kv_result_report_token=_KV_RESULT_REPORT_TOKEN
+            )
 
     report(result.IN_DOUBT)
     error = session.exception
@@ -360,8 +378,16 @@ def test_settlement_retries_in_order() -> None:
         dst_ptrs=np.array([]),
         sizes=np.array([]),
         receiver_slice_id=3,
+        kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
     )
-    initial = transfer_mod._make_kv_result_msg(7, 401, 3, False, transfer_mod.AgentResult.IN_DOUBT)
+    initial = transfer_mod._make_kv_result_msg(
+        7,
+        401,
+        3,
+        False,
+        transfer_mod.AgentResult.IN_DOUBT,
+        kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
+    )
     dealer = Mock()
     dealer.send.side_effect = [RuntimeError("initial send"), None, RuntimeError("late send"), None]
     sender._get_result_dealer = Mock(return_value=dealer)
@@ -381,6 +407,8 @@ def test_settlement_retries_in_order() -> None:
         for call in dealer.send.call_args_list
     ]
     assert codes == [2, 2, 3, 3]
+    tokens = [call.args[0][2] for call in dealer.send.call_args_list]
+    assert tokens == [_KV_RESULT_REPORT_TOKEN] * 4
     sender._shutdown = True
 
 
@@ -422,7 +450,14 @@ def test_committed_session_outcome_survives_late_settlement(
         task.mark_physical_operation_in_doubt(7)
         task.fail(RuntimeError("backend outcome ambiguous"))
     else:
-        session.process_kv_agent_result(7, 0, True, transfer_mod.AgentResult.IN_DOUBT)
+        _publish_report_tokens(session)
+        session.process_kv_agent_result(
+            7,
+            0,
+            True,
+            transfer_mod.AgentResult.IN_DOUBT,
+            kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
+        )
     handle = TaskHandle(session, task, token_end=16)
     expected_type = Cancelled if cancelled else Failed
     if poll_early:
@@ -434,7 +469,14 @@ def test_committed_session_outcome_survives_late_settlement(
     if direction == "send":
         assert task.poll_in_doubt_physical_operation(7)
     else:
-        session.process_kv_agent_result(7, 0, True, transfer_mod.AgentResult.FAILED_QUIESCED)
+        _publish_report_tokens(session)
+        session.process_kv_agent_result(
+            7,
+            0,
+            True,
+            transfer_mod.AgentResult.FAILED_QUIESCED,
+            kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
+        )
         session.process_aux_agent_result(7, transfer_mod.AgentResult.FAILED)
     assert task.resources_drained
     for outcome in (handle.poll(), TaskHandle(session, task, token_end=16).poll()):
@@ -449,7 +491,7 @@ def test_listener_failure_uses_worker_stream_in_ownership_bridge() -> None:
     sender = _sender()
     sender._send_task_queues = [queue.Queue()]
     sender._get_or_connect_dealer = Mock()
-    info = SimpleNamespace(unique_rid=401, instance_rank=7)
+    info = SimpleNamespace(unique_rid=401, instance_rank=7, context_first=False)
     message = [transfer_mod.MessageType.KV_AGENT_RESULT, b"failed"]
     sender._route_result_messages_to_receiver(info, "receiver", [message], defer_to_worker=False)
     sender._get_or_connect_dealer.assert_not_called()
@@ -481,6 +523,7 @@ def test_worker_polls_retained_status_when_queue_is_idle(
         src_ptrs=np.array([]),
         dst_ptrs=np.array([]),
         sizes=np.array([]),
+        kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
     )
     work_queue = Mock(get=Mock(side_effect=[queue.Empty, None]))
     dealer = Mock()
@@ -499,7 +542,14 @@ def test_worker_polls_retained_status_when_queue_is_idle(
     sender._get_result_dealer = Mock(return_value=dealer)
     sender._retain_in_doubt_transfer(
         meta,
-        transfer_mod._make_kv_result_msg(7, 401, 0, False, transfer_mod.AgentResult.IN_DOUBT),
+        transfer_mod._make_kv_result_msg(
+            7,
+            401,
+            0,
+            False,
+            transfer_mod.AgentResult.IN_DOUBT,
+            kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
+        ),
     )
     sender._send_task_queues = [work_queue]
     monkeypatch.setattr(transfer_mod.time, "sleep", Mock())
@@ -510,6 +560,8 @@ def test_worker_polls_retained_status_when_queue_is_idle(
     assert task.resources_drained
     assert not sender._pending_settlements[0]
     assert dealer.send.call_count == (4 if initial_send_fails else 2)
+    sent_tokens = {call.args[0][2] for call in dealer.send.call_args_list}
+    assert sent_tokens == {_KV_RESULT_REPORT_TOKEN}
     assert status.is_completed.call_count == 2
     assert task.status is transfer_mod.TaskStatus.ERROR
     sender._shutdown = True
@@ -536,9 +588,18 @@ def test_kv_result_frame_roundtrip() -> None:
 def test_make_kv_result_msg_uses_binary_frame(result_name: str) -> None:
     """Every KV result (success and failure) uses the binary frame so the receiver can decode it."""
     result = getattr(transfer_mod.AgentResult, result_name)
-    msg = transfer_mod._make_kv_result_msg(3, 12345, 7, True, result, transfer_size=8192)
+    msg = transfer_mod._make_kv_result_msg(
+        3,
+        12345,
+        7,
+        True,
+        result,
+        transfer_size=8192,
+        kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
+    )
     assert msg[0] == transfer_mod.MessageType.KV_AGENT_RESULT
-    assert len(msg) == 2  # type + frame
+    assert len(msg) == 3  # type + frame + report token
+    assert msg[2] == _KV_RESULT_REPORT_TOKEN
     r, rid, sl, last, code, size = transfer_mod._KV_RESULT_FRAME.unpack(msg[1])
     assert (r, rid, sl, last, size) == (3, 12345, 7, True, 8192)
     assert transfer_mod._AGENT_RESULT_BY_CODE[code] is result

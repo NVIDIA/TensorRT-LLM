@@ -131,3 +131,18 @@ def release_nccl_window_graph_owner(pool: Any) -> None:
         if owner is not None:
             torch.ops.trtllm.release_nccl_window_graph_owner(owner)
             del _pool_owners[key]
+
+
+@contextlib.contextmanager
+def nccl_window_allocation_suppressed() -> Iterator[None]:
+    """Serve NCCL-window requests on this thread from plain memory.
+
+    The window pool is left untouched, so work that does not run in SPMD order
+    across ranks cannot make a later request miss on only some ranks and enter
+    the collective registration alone.
+    """
+    previous = torch.ops.trtllm.set_nccl_window_allocation_suppressed(True)
+    try:
+        yield
+    finally:
+        torch.ops.trtllm.set_nccl_window_allocation_suppressed(previous)

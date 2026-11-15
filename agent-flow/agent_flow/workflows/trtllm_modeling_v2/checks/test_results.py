@@ -14,7 +14,7 @@ import re
 import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Collection, Iterable, Sequence
 
 import yaml
 
@@ -100,12 +100,16 @@ class Results:
             return None
         return Result(nodeid, str(entry.get("outcome") or "error"), str(entry.get("message") or ""))
 
-    def unrun(self, files: Iterable[str]) -> list[str]:
-        """The ``files`` holding a test with no result here: what is still to run."""
+    def unrun(self, files: Iterable[str], settled: Collection[str] = ()) -> list[str]:
+        """The ``files`` holding a test with no result here: what is still to run.
+
+        A test in ``settled`` is not waited for: it is left out on purpose.
+        """
         return [
             file
             for file in files
-            if (ids := self.test_ids(file)) is None or any(i not in self.tests for i in ids)
+            if (ids := self.test_ids(file)) is None
+            or any(i not in self.tests and i not in settled for i in ids)
         ]
 
 
@@ -149,6 +153,8 @@ class CompareReport:
     base_unknown: list[Comparison] = field(default_factory=list)
     #: Test ids with no result at the head; a file no session collected, whole.
     not_run: list[str] = field(default_factory=list)
+    #: Test ids with no result at the head that fail at the base: no change can regress them.
+    failing_at_base: list[str] = field(default_factory=list)
     passed: int = 0
 
     @property
@@ -170,6 +176,8 @@ def compare(
     the base does not hold it (its file is not among ``base_files``, or the
     base's collection of that file has no such test); pre-existing when it
     failed there too; and of unknown standing when the base has no result for it.
+    A test with no result at the head is not run there, unless it fails at the
+    base: a test that already fails cannot regress.
     """
     at_base = set(base_files)
     report = CompareReport()
@@ -182,7 +190,11 @@ def compare(
         for nodeid in ids:
             now = head.result(nodeid)
             if now is None:
-                report.not_run.append(nodeid)
+                then = base.result(nodeid)
+                if then is not None and then.outcome in FAILING:
+                    report.failing_at_base.append(nodeid)
+                else:
+                    report.not_run.append(nodeid)
                 continue
             if now.outcome not in FAILING:
                 report.passed += 1
@@ -306,10 +318,21 @@ def write_selection(path: Path, lines: Sequence[str]) -> Path:
     return path
 
 
-def driver_command(python: str, cache: str | Path, tree: str | Path, selection: str | Path) -> str:
-    """The driver's command line over the tests ``selection`` lists, run in ``tree``."""
+def driver_command(
+    python: str,
+    cache: str | Path,
+    tree: str | Path,
+    selection: str | Path,
+    skip: str | Path | None = None,
+) -> str:
+    """The driver's command line over the tests ``selection`` lists, run in ``tree``.
+
+    ``skip`` lists node ids to leave out of the files the selection names.
+    """
     words = [str(DRIVER), "run", "--cache", str(cache), "--repo", str(tree)]
     words += ["--selection", str(selection)]
+    if skip is not None:
+        words += ["--skip", str(skip)]
     return (
         f"{python} {' '.join(shlex.quote(w) for w in words)} "
         "-- -p no:cacheprovider -rA --timeout=180"

@@ -32,6 +32,7 @@ from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
     GenTransferStatus,
 )
 from tensorrt_llm._torch.disaggregation.native.transfer import (
+    RxSession,
     TaskStatus,
     TransferWorker,
     TransferWorkerConfig,
@@ -41,6 +42,7 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm.bindings import LlmRequestState
+from tensorrt_llm.disaggregated_params import DisaggregatedParams
 
 
 @dataclass
@@ -192,6 +194,28 @@ def _make_tx_session(
     return session
 
 
+def _assert_context_timeout_retains_transfer(
+    transceiver: KvCacheTransceiverV2,
+    session: _FakeSession | TxSession,
+    req: _FakeRequest,
+    warning: Mock,
+    unavailable_reason: str,
+) -> None:
+    assert transceiver._send_sessions == {16: session}
+    assert transceiver._send_reqs == {16: req}
+    assert session.aux_slot == 0
+    assert req.state is None
+    assert not req.py_kv_send_session_retired
+    assert warning.call_count == 2
+    for args, _kwargs in warning.call_args_list:
+        message = args[0]
+        assert "rid=16" in message
+        assert "kv_transfer_timeout_ms=60000ms" in message
+        assert "keeping it in progress" in message
+        assert "deadline_owner=native_sender_overall_wait" in message
+        assert f"progress_at_observation=unavailable({unavailable_reason})" in message
+
+
 def test_context_transfer_status_bounded_poll_keeps_not_ready_session_queued(
     monkeypatch,
 ) -> None:
@@ -282,24 +306,79 @@ def test_context_transfer_status_timeout_retains_session_and_request(monkeypatch
         warning,
     )
 
-    completed, failed = transceiver.check_context_transfer_status(None)
+    for _ in range(2):
+        completed, failed = transceiver.check_context_transfer_status(None)
+        assert completed == []
+        assert failed == []
 
-    completed_again, failed_again = transceiver.check_context_transfer_status(None)
-
-    assert completed == []
-    assert failed == []
-    assert completed_again == []
-    assert failed_again == []
     assert session.blocking_calls == [True, True]
     assert not session.closed
-    assert session.aux_slot == 0
-    assert transceiver._send_sessions == {16: session}
-    assert transceiver._send_reqs == {16: req}
-    assert warning.call_count == 2
-    messages = [args[0] for args, _kwargs in warning.call_args_list]
-    assert all("rid=16" in message for message in messages)
-    assert all("kv_transfer_timeout_ms=60000ms" in message for message in messages)
-    assert all("keeping it in progress" in message for message in messages)
+    _assert_context_timeout_retains_transfer(
+        transceiver, session, req, warning, "alternate_session"
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("context", [False, True])
+def test_timeout_description_selects_local_session_without_polling(context: bool) -> None:
+    """Executor timeout attribution uses native session data only when available."""
+    session = (
+        _make_tx_session([])
+        if context
+        else RxSession(
+            request_id=16,
+            params=DisaggregatedParams(disagg_request_id=16),
+            receiver=SimpleNamespace(
+                _enforce_physical_ownership=False,
+                setup_session=Mock(),
+                clear_session=Mock(),
+            ),
+        )
+    )
+    progress = f"progress_at_observation={'tx' if context else 'rx'}"
+    session._timeout_progress_description = Mock(return_value=progress)
+    session.wait_complete = Mock(side_effect=AssertionError("timeout description must not poll"))
+    transceiver = _make_transceiver({16: session} if context else {})
+    transceiver._recv_sessions = {} if context else {16: session}
+    req = SimpleNamespace(
+        py_request_id=16,
+        request_id=16,
+        py_disaggregated_params=None,
+        is_context_only_request=context,
+    )
+    assert transceiver._describe_transfer_timeout(req) == progress
+    session._timeout_progress_description.assert_called_once_with()
+    transceiver._send_sessions.clear()
+    transceiver._recv_sessions.clear()
+    assert "unavailable(session_not_found)" in transceiver._describe_transfer_timeout(req)
+    session.wait_complete.assert_not_called()
+    assert session.close()
+
+
+@pytest.mark.cpu_only
+def test_context_timeout_snapshot_failure_does_not_release_session(monkeypatch) -> None:
+    session = _make_tx_session([_FakeTask(TaskStatus.TRANSFERRING)])
+    session._base_args = SimpleNamespace(params=SimpleNamespace(disagg_request_id=16))
+    session._aux_buffer = Mock()
+    session.aux_slot = 0
+    session.wait_complete = Mock(return_value=WaitResult.TIMEOUT)
+    session._timeout_progress_description = Mock(side_effect=RuntimeError("snapshot unavailable"))
+    req = _FakeRequest()
+    transceiver = _make_transceiver({16: session}, {16: req})
+    warning = Mock()
+    monkeypatch.setattr("tensorrt_llm._torch.disaggregation.transceiver.logger.warning", warning)
+
+    for _ in range(2):
+        completed, failed = transceiver.check_context_transfer_status(None)
+        assert completed == []
+        assert failed == []
+
+    assert not session._closed
+    session._aux_buffer.free_slot.assert_not_called()
+    assert session.wait_complete.call_count == 2
+    assert session._timeout_progress_description.call_count == 2
+    _assert_context_timeout_retains_transfer(transceiver, session, req, warning, "snapshot_failed")
+    assert session.close()
 
 
 def test_context_transfer_status_zero_budget_processes_task_level_failure() -> None:
@@ -800,6 +879,8 @@ def _construct_worker_config(monkeypatch, cache_config) -> TransferWorkerConfig:
 
     Returns the TransferWorkerConfig it wired.
     """
+    monkeypatch.delenv("TRTLLM_ENABLE_KV_TRANSFER_LIFECYCLE_ENFORCEMENT", raising=False)
+    monkeypatch.delenv("TRTLLM_ENABLE_FP4_MLA_KV_OWNERSHIP_BRIDGE", raising=False)
     worker = SimpleNamespace(page_table=None)
     worker_constructor = Mock(return_value=worker)
     monkeypatch.setattr(
@@ -829,6 +910,7 @@ def _construct_worker_config(monkeypatch, cache_config) -> TransferWorkerConfig:
     # Everything the constructor can reach, not only what it reaches with these values: the
     # world-size and helix reads sit behind an env check, a monkeypatch and `cp_size == 1`.
     mapping = SimpleNamespace(
+        rank=0,
         cp_size=1,
         world_size=1,
         pp_size=1,
@@ -841,8 +923,8 @@ def _construct_worker_config(monkeypatch, cache_config) -> TransferWorkerConfig:
 
     KvCacheTransceiverV2(
         mapping=mapping,
-        dist=Mock(),
-        kv_cache_manager=Mock(spec=KVCacheManagerV2, max_batch_size=4),
+        dist=Mock(allgather=Mock(side_effect=lambda value: [value])),
+        kv_cache_manager=Mock(spec=KVCacheManagerV2, max_batch_size=4, is_disagg=False),
         cache_transceiver_config=cache_config,
     )
 
@@ -874,7 +956,7 @@ def test_transceiver_activates_fail_stop_only_for_ownership_bridge(
         assert isinstance(callback.__self__, KvCacheTransceiverV2)
         assert callback.__self__._kv_cache_manager is config.kv_cache_manager
         assert callback.__self__._retirement_mpi_comm is communicator
-        qualify_world.assert_called_once_with(callback.__self__._mapping)
+        qualify_world.assert_called_once_with(callback.__self__._mapping, warn=False)
     else:
         assert callback is None
         qualify_world.assert_not_called()

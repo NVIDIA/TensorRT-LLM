@@ -32,9 +32,8 @@ One module per leaf, named ``<provider>_<quant>``. Importing this package is
 what registers them, which is why ``trtllm_gen_leaf`` is defined at the bottom
 of this file: the lookup is only correct once every leaf module has loaded.
 
-NVFP4, FP8_BLOCK_SCALES, W4A16_MXFP4 and W4A8_MXFP4_MXFP8 exist on both
-providers; W4A8_NVFP4_FP8 and W4A8_MXFP4_FP8 are native-only, and the
-unquantized bf16 path is FlashInfer-only.
+Each format has exactly one leaf: every quantized format runs on the native
+``trtllm`` provider, and the unquantized bf16 path on FlashInfer.
 """
 
 from tensorrt_llm.models.modeling_utils import QuantAlgo
@@ -43,20 +42,13 @@ from ..impl_contract import canonical_quant, check_quant_matches_identity, norma
 from ..impl_identity import MOE_IMPL_REGISTRY, MoEImplId
 from .base import TrtllmGenFusedMoEBase
 from .eligibility import (
-    check_flashinfer_provider,
     check_flashinfer_shard_alignment,
-    check_mxfp4_flashinfer_shape,
     check_no_activation_constants,
     check_no_expert_bias,
     check_trtllm_gen_capabilities,
     check_trtllm_gen_leaf,
-    nvfp4_needs_padded_method,
 )
 from .flashinfer_bf16 import FlashinferTrtllmGenBf16Impl
-from .flashinfer_fp8_block_scales import FlashinferTrtllmGenFp8BlockScalesImpl
-from .flashinfer_nvfp4 import FlashinferTrtllmGenNvfp4Impl
-from .flashinfer_w4a8_mxfp4_mxfp8 import FlashinferTrtllmGenW4a8Mxfp4Mxfp8Impl
-from .flashinfer_w4a16_mxfp4 import FlashinferTrtllmGenW4a16Mxfp4Impl
 from .fp4_block_scale import (
     TRTLLMGenFp4BlockScaleBase,
     TRTLLMGenNvfp4Base,
@@ -81,21 +73,18 @@ from .trtllm_w4a8_nvfp4_fp8 import TrtllmTrtllmGenW4a8Nvfp4Fp8Impl
 from .trtllm_w4a16_mxfp4 import TrtllmTrtllmGenW4a16Mxfp4Impl
 
 
-def trtllm_gen_leaf(quant_algo: QuantAlgo | None, *, provider: str | None = None) -> type:
-    """The leaf implementing ``quant_algo``, on ``provider`` when given.
+def trtllm_gen_leaf(quant_algo: QuantAlgo | None) -> type:
+    """The leaf implementing ``quant_algo``.
 
     For callers that know the format and want the class rather than a verdict.
     Resolution does not use this -- it walks ``IMPL_PRIORITY`` and asks
     ``can_implement`` -- so this stays a lookup and never becomes a second
     selection path.
 
-    With ``provider`` left open the native leaf wins where there is one, which
-    matches a deployment without the FlashInfer opt-in flag.
-
     Raises when no leaf publishes the format. A caller enumerating formats
     wants ``find_trtllm_gen_leaf``, where absence is an ordinary answer.
     """
-    cls = find_trtllm_gen_leaf(quant_algo, provider=provider)
+    cls = find_trtllm_gen_leaf(quant_algo)
     if cls is not None:
         return cls
     registered = sorted(
@@ -105,58 +94,28 @@ def trtllm_gen_leaf(quant_algo: QuantAlgo | None, *, provider: str | None = None
     )
     raise ValueError(
         f"no TRTLLM-Gen implementation for quant="
-        f"{normalize_quant(canonical_quant(quant_algo))} on "
-        f"provider={'|'.join(_providers_to_try(provider))}; registered: {registered}"
+        f"{normalize_quant(canonical_quant(quant_algo))}; registered: {registered}"
     )
 
 
-def _providers_to_try(provider: str | None) -> tuple:
-    """The providers a lookup walks, in the order it walks them."""
-    return (provider,) if provider is not None else (PROVIDER_TRTLLM, PROVIDER_FLASHINFER)
-
-
-def find_trtllm_gen_leaf(
-    quant_algo: QuantAlgo | None, *, provider: str | None = None
-) -> type | None:
+def find_trtllm_gen_leaf(quant_algo: QuantAlgo | None) -> type | None:
     """The leaf implementing ``quant_algo``, or ``None`` if none publishes it.
 
     Goes through the registry rather than a table of its own, so a leaf that is
-    renamed or unregistered disappears from here too.
+    renamed or unregistered disappears from here too. The providers publish
+    disjoint formats, so at most one of them answers.
     """
     # The same two steps resolution takes (``moe_resolution`` canonicalizes,
     # ``MoEImplId`` folds case), so a caller naming NVFP4_AWQ or MIXED_PRECISION
     # here reaches the leaf resolution would pick rather than a lookup miss.
     quant = normalize_quant(canonical_quant(quant_algo))
-    for candidate in _providers_to_try(provider):
-        cls = MOE_IMPL_REGISTRY.lookup(
-            MoEImplId(candidate, TECHNIQUE_TRTLLM_GEN, KERNEL_FUSED_MOE, quant)
-        )
-        if cls is not None:
-            return cls
-    return None
-
-
-def trtllm_gen_leaves_in_resolution_order(quant_algo: QuantAlgo | None) -> tuple[type, ...]:
-    """The leaves a resolution walk would try for a format, in its order.
-
-    For a caller asking "would a run serve this?" rather than "which class
-    implements this format?". ``IMPL_PRIORITY`` ranks each FlashInfer leaf
-    ahead of its native sibling and the opt-in flag is what makes the
-    FlashInfer ones reject, so resolution falls through to the native leaf on a
-    *rejection* and not only on an absent leaf. A caller that picks one class
-    and asks it cannot reproduce that, whichever provider it picks first.
-
-    Shorter than two entries where only one provider publishes the format.
-    """
-    quant = normalize_quant(canonical_quant(quant_algo))
-    leaves = []
-    for provider in (PROVIDER_FLASHINFER, PROVIDER_TRTLLM):
+    for provider in (PROVIDER_TRTLLM, PROVIDER_FLASHINFER):
         cls = MOE_IMPL_REGISTRY.lookup(
             MoEImplId(provider, TECHNIQUE_TRTLLM_GEN, KERNEL_FUSED_MOE, quant)
         )
         if cls is not None:
-            leaves.append(cls)
-    return tuple(leaves)
+            return cls
+    return None
 
 
 __all__ = [
@@ -168,10 +127,6 @@ __all__ = [
     "TrtllmTrtllmGenW4a8Nvfp4Fp8Impl",
     "TrtllmTrtllmGenW4a8Mxfp4Fp8Impl",
     # flashinfer provider
-    "FlashinferTrtllmGenNvfp4Impl",
-    "FlashinferTrtllmGenFp8BlockScalesImpl",
-    "FlashinferTrtllmGenW4a16Mxfp4Impl",
-    "FlashinferTrtllmGenW4a8Mxfp4Mxfp8Impl",
     "FlashinferTrtllmGenBf16Impl",
     # shared layers
     "TrtllmGenFusedMoEBase",
@@ -189,15 +144,11 @@ __all__ = [
     "TRTLLM_GEN_INPUT_REQUIREMENT",
     "trtllm_gen_leaf",
     "find_trtllm_gen_leaf",
-    "trtllm_gen_leaves_in_resolution_order",
     "trtllm_gen_descriptor",
     "check_trtllm_gen_leaf",
     "check_trtllm_gen_capabilities",
     "check_quant_matches_identity",
-    "check_flashinfer_provider",
     "check_flashinfer_shard_alignment",
-    "check_mxfp4_flashinfer_shape",
     "check_no_activation_constants",
     "check_no_expert_bias",
-    "nvfp4_needs_padded_method",
 ]

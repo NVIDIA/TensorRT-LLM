@@ -922,6 +922,7 @@ def test_pyexecutor_shutdown_tail_failure_is_retryable():
     executor.virtual_memory_pools = RetryingPool()
     executor.sampler = Sampler()
     executor.dwdp_manager = DwdpManager()
+    executor.dense_dwdp_manager = None
 
     def terminal_cleanup(*, local_safe):
         events.append(("terminal_cleanup", local_safe))
