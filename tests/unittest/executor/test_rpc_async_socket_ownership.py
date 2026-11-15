@@ -21,6 +21,7 @@ class _App:
     def __init__(self):
         self.started = threading.Event()
         self.release = threading.Event()
+        self.saved_set = threading.Event()
         self.saved = None
 
     def echo(self, value):
@@ -31,6 +32,7 @@ class _App:
 
     def save(self, value):
         self.saved = value
+        self.saved_set.set()
 
     async def hold(self):
         self.started.set()
@@ -73,6 +75,7 @@ async def test_async_fire_and_forget(rpc):
     client, app = rpc
     assert await client.save(42).remote_async(need_response=False) is None
     assert await client.echo("barrier").remote_async() == "barrier"
+    assert await asyncio.to_thread(app.saved_set.wait, 2)
     assert app.saved == 42
     assert not client._pending_futures
 
@@ -82,6 +85,7 @@ async def test_async_timeout(rpc):
     client, _ = rpc
     with pytest.raises(RPCTimeout):
         await asyncio.wait_for(client.hold().remote_async(timeout=0.05), 2)
+    await _owner_barrier(client)
     assert not client._pending_futures
 
 
@@ -142,6 +146,8 @@ async def test_cancellation_racing_remote_error_retrieves_future_exception(rpc, 
 
     async def cancel_after_response(futures, **kwargs):
         ready = await asyncio.wait(futures, **kwargs)
+        if asyncio.get_running_loop() is not loop:
+            return ready
         assert ready[0]
         asyncio.current_task().cancel()
         await asyncio.sleep(0)
@@ -150,7 +156,15 @@ async def test_cancellation_racing_remote_error_retrieves_future_exception(rpc, 
     proxy = SimpleNamespace(**vars(asyncio))
     proxy.wait = cancel_after_response
     monkeypatch.setattr(rpc_client_module, "asyncio", proxy)
+
+    async def wait_on_owner():
+        future = asyncio.get_running_loop().create_future()
+        future.set_result(None)
+        done, _ = await rpc_client_module.asyncio.wait((future,))
+        assert future in done
+
     try:
+        await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(wait_on_owner(), client._loop))
         with pytest.raises(asyncio.CancelledError):
             await client.fail().remote_async()
         await _owner_barrier(client)

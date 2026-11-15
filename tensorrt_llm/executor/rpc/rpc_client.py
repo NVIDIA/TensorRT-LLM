@@ -458,6 +458,7 @@ class RPCClient:
 
         rpc_params = kwargs.get("__rpc_params", RPCParams())
         timeout = rpc_params.timeout if rpc_params.timeout is not None else self._timeout
+        # The bridge deadline is authoritative for cross-loop calls, including dispatch delay.
         deadline = None if timeout is None else caller_loop.time() + timeout
         with self._call_lock:
             if self._closed or self._server_stopped:
@@ -484,6 +485,7 @@ class RPCClient:
             result.cancel()
             future.cancel()
             if not result.cancelled():
+                # Retrieve errors that arrive concurrently with caller cancellation.
                 result.exception()
 
     async def _call_async(self, method_name, *args, **kwargs):
