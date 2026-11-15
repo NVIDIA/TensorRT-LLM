@@ -620,9 +620,16 @@ class Mamba2ExactReplayState:
         pin_ssd_autotune_configs()
 
     def reset_replay_slots(self, replay_slots: torch.Tensor) -> None:
-        """A request that starts in generation has run no tokens."""
+        """A request that starts in generation has run no tokens.
+
+        No prefill has cleared its buffers either, and its slot may hold
+        arbitrary bytes that a decode scan would read.
+        """
         if self.replay_num_tokens is not None:
             self.replay_num_tokens.index_fill_(0, replay_slots, 0)
+            for views in self._pool_layers:
+                for name in ("replay_x", "replay_dt", "replay_B"):
+                    views[_EXACT_REPLAY_ROLES[name]].index_fill_(0, replay_slots, 0)
 
     def reset_slots(
         self,
