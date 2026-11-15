@@ -226,11 +226,13 @@ def test_route_keeps_ulysses_4_for_an_empty_attention_precision(monkeypatch):
     assert scenarios.route_nvfp4_sm_107_u1_u4(_config(ulysses=4, attention_precision=empty)) is cls
 
 
-def test_route_refuses_a_malformed_attention_precision(monkeypatch):
+def test_route_leaves_the_attention_precision_entry_to_the_transformer(monkeypatch):
+    """The route does not parse the entry; the transformer it selects validates it once."""
     monkeypatch.setattr(scenarios, "_device_capability", lambda: (10, 7))
+    cls = _stub_scenario_package(monkeypatch)
     bad = {"schema_version": 1, "layers": {"transformer_blocks.45.attn": "fp8"}}
-    with pytest.raises(ValueError, match="only 'bf16'"):
-        scenarios.route_nvfp4_sm_107_u1_u4(_config(attention_precision=bad))
+    assert scenarios.route_nvfp4_sm_107_u1_u4(_config(attention_precision=bad)) is cls
+    assert not hasattr(scenarios, "resolve_attention_precision")
 
 
 def test_bad_mode_raises():

@@ -145,6 +145,8 @@ class TestParsing:
             (_entry(layers={"token_refiner*": "bf16"}), "is a pattern"),
             (_entry(layers={"": "bf16"}), "invalid module name"),
             (_entry(layers={45: "bf16"}), "invalid module name"),
+            (_entry(schema_version=1.0), "schema_version 1.0 is not supported"),
+            (_entry(schema_version=False), "schema_version False is not supported"),
         ],
     )
     def test_malformed_entry_is_refused(self, entry, reason):
@@ -239,6 +241,13 @@ class TestValidation:
 
     def test_async_flag_at_ulysses_1_is_ignored(self):
         ap.validate_attention_precision(_LAYERS, **{**self._KWARGS, "async_ulysses": True})
+
+    def test_refusal_names_the_supported_sizes(self):
+        """The message is derived from ``SUPPORTED_ULYSSES_SIZES``, not spelled beside it."""
+        text = " and ".join(str(size) for size in ap.SUPPORTED_ULYSSES_SIZES)
+        assert ap.SUPPORTED_ULYSSES_SIZES_TEXT == text
+        with pytest.raises(NotImplementedError, match=f"Ulysses {text}, found Ulysses 8"):
+            ap.validate_attention_precision(_LAYERS, **{**self._KWARGS, "ulysses_size": 8})
 
     def test_empty_mapping_skips_every_check(self):
         ap.validate_attention_precision({}, **{**self._KWARGS, "ulysses_size": 4})

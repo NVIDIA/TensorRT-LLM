@@ -50,6 +50,7 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 
 from .attention_precision import (
     SUPPORTED_ULYSSES_SIZES,
+    SUPPORTED_ULYSSES_SIZES_TEXT,
     attention_module_names,
     resolve_attention_precision,
     validate_attention_precision,
@@ -813,6 +814,7 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
 
     # The transformer-block class; a scenario (``models/minimax_h3/<scenario>/``) substitutes its own.
     block_cls = MiniMaxH3TransformerBlock
+    _supports_per_layer_quant = True
 
     def __init__(self, model_config: DiffusionModelConfig) -> None:
         super().__init__(model_config)
@@ -1119,8 +1121,8 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             ulysses_size = int(getattr(vgm, "ulysses_size", 1) or 1) if vgm is not None else 1
             if ulysses_size not in SUPPORTED_ULYSSES_SIZES:
                 raise NotImplementedError(
-                    "MiniMax-H3 MIXED_PRECISION is supported at Ulysses 1 and 4, "
-                    f"found Ulysses {ulysses_size}"
+                    "MiniMax-H3 MIXED_PRECISION is supported at Ulysses "
+                    f"{SUPPORTED_ULYSSES_SIZES_TEXT}, found Ulysses {ulysses_size}"
                 )
             if ulysses_size > 1 and self.model_config.parallel.async_ulysses:
                 raise NotImplementedError(

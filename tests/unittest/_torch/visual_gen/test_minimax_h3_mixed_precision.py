@@ -28,6 +28,7 @@ import torch
 
 from tensorrt_llm._torch.modules.linear import (
     FP8QDQLinearMethod,
+    Linear,
     NVFP4LinearMethod,
     UnquantizedLinearMethod,
 )
@@ -37,6 +38,7 @@ from tensorrt_llm._torch.visual_gen.config import (
     resolve_layer_quant_config,
 )
 from tensorrt_llm._torch.visual_gen.models.minimax_h3 import transformer_minimax_h3 as h3
+from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -218,6 +220,158 @@ class TestMixedPrecisionParsing:
         with pytest.raises(ValueError, match="lists no targets"):
             DiffusionPipelineConfig.load_diffusion_quant_config(export)
 
+    @pytest.mark.parametrize(
+        "target", ["transformer_blocks.*.ff.net.2", "transformer_blocks.1.attn.to_?", "blocks[0]"]
+    )
+    def test_pattern_target_is_refused(self, target):
+        """One pattern would count as one Linear and could contradict an exact name unseen."""
+        export = _mixed_precision_export(_FP8_LAYERS, quantized_layers=False)
+        export["config_groups"]["group_1"]["targets"].append(target)
+        with pytest.raises(ValueError, match="names the pattern"):
+            DiffusionPipelineConfig.load_diffusion_quant_config(export)
+
+    def test_pattern_in_quantized_layers_is_refused(self):
+        export = _mixed_precision_export(_FP8_LAYERS)
+        export["quantized_layers"]["transformer_blocks.*.attn.to_q"] = {"quant_algo": "FP8"}
+        with pytest.raises(ValueError, match="quantized_layers names the pattern"):
+            DiffusionPipelineConfig.load_diffusion_quant_config(export)
+
+    @pytest.mark.parametrize("target", ["", None, 7, ["transformer_blocks.0.attn.to_q"]])
+    def test_invalid_target_name_is_refused(self, target):
+        export = _mixed_precision_export(_FP8_LAYERS, quantized_layers=False)
+        export["config_groups"]["group_1"]["targets"].append(target)
+        with pytest.raises(ValueError, match="invalid module name"):
+            DiffusionPipelineConfig.load_diffusion_quant_config(export)
+
+    @staticmethod
+    def _regrouped(groups: dict) -> dict:
+        return {
+            "quant_algo": "MIXED_PRECISION",
+            "config_groups": {
+                name: {**(_NVFP4_GROUP if algo == "nvfp4" else _FP8_GROUP), "targets": targets}
+                for name, (algo, targets) in groups.items()
+            },
+        }
+
+    def test_dominant_algorithm_counts_names_not_groups(self):
+        """Three NVFP4 names split over three groups outnumber two FP8 names in one group."""
+        names = [f"transformer_blocks.0.{leaf}" for leaf in _BLOCK_LINEARS]
+        groups = {
+            "a": ("nvfp4", names[0:1]),
+            "b": ("fp8", names[1:3]),
+            "c": ("nvfp4", names[3:4]),
+            "d": ("nvfp4", names[4:5]),
+        }
+        for order in (list(groups), list(reversed(groups))):
+            quant_config, layers, _, _ = DiffusionPipelineConfig.load_diffusion_quant_config(
+                self._regrouped({name: groups[name] for name in order})
+            )
+            assert quant_config.quant_algo == QuantAlgo.NVFP4, order
+            assert quant_config.group_size == 16
+            assert len(layers) == 5
+
+    def test_repeated_names_do_not_inflate_the_count(self):
+        names = [f"transformer_blocks.0.{leaf}" for leaf in _BLOCK_LINEARS]
+        # NVFP4: one name listed three times and once more in a second group. FP8: two names.
+        groups = {
+            "a": ("nvfp4", [names[0]] * 3),
+            "b": ("fp8", names[1:3]),
+            "c": ("nvfp4", names[0:1]),
+        }
+        quant_config, layers, _, _ = DiffusionPipelineConfig.load_diffusion_quant_config(
+            self._regrouped(groups)
+        )
+        assert quant_config.quant_algo == QuantAlgo.FP8
+        assert len(layers) == 3
+
+    def test_tie_goes_to_nvfp4_in_either_group_order(self):
+        names = [f"transformer_blocks.0.{leaf}" for leaf in _BLOCK_LINEARS]
+        groups = {"x": ("fp8", names[0:3]), "y": ("nvfp4", names[3:6])}
+        for order in (["x", "y"], ["y", "x"]):
+            quant_config, _, _, _ = DiffusionPipelineConfig.load_diffusion_quant_config(
+                self._regrouped({name: groups[name] for name in order})
+            )
+            assert quant_config.quant_algo == QuantAlgo.NVFP4, order
+            assert quant_config.group_size == 16
+
+    @pytest.mark.parametrize(
+        "quantized_layers", [[], ["transformer_blocks.0.attn.to_q"], "NVFP4", 0, False]
+    )
+    def test_quantized_layers_must_be_a_mapping(self, quantized_layers):
+        export = _mixed_precision_export(_FP8_LAYERS)
+        export["quantized_layers"] = quantized_layers
+        with pytest.raises(ValueError, match="quantized_layers must be a mapping"):
+            DiffusionPipelineConfig.load_diffusion_quant_config(export)
+
+    @pytest.mark.parametrize(
+        "layer, reason",
+        [
+            ("NVFP4", "must be a mapping"),
+            (None, "must be a mapping"),
+            (["NVFP4"], "must be a mapping"),
+            ({}, "unsupported quant_algo None"),
+            ({"quant_algo": "FP8_BLOCK_SCALES"}, "unsupported quant_algo 'FP8_BLOCK_SCALES'"),
+            ({"quant_algo": "W4A16_AWQ"}, "unsupported quant_algo 'W4A16_AWQ'"),
+            ({"quant_algo": ["NVFP4"]}, "unsupported quant_algo"),
+            ({"quant_algo": "NVFP4", "group_size": 32}, "group_size 32"),
+            ({"quant_algo": "NVFP4", "group_size": 16.0}, "group_size 16.0"),
+            ({"quant_algo": "NVFP4", "group_size": None}, "group_size None"),
+            ({"quant_algo": "NVFP4", "group_size": True}, "group_size True"),
+        ],
+    )
+    def test_malformed_quantized_layer_is_refused(self, layer, reason):
+        export = _mixed_precision_export(_FP8_LAYERS)
+        export["quantized_layers"]["transformer_blocks.0.attn.to_q"] = layer
+        with pytest.raises(ValueError, match=reason):
+            DiffusionPipelineConfig.load_diffusion_quant_config(export)
+
+    def test_fp8_layer_with_a_group_size_is_refused(self):
+        export = _mixed_precision_export(_FP8_LAYERS)
+        export["quantized_layers"]["transformer_blocks.0.ff.net.2"] = {
+            "quant_algo": "FP8",
+            "group_size": 16,
+        }
+        with pytest.raises(ValueError, match="group_size 16"):
+            DiffusionPipelineConfig.load_diffusion_quant_config(export)
+
+    def test_agreeing_repeated_declarations_pass(self):
+        export = _mixed_precision_export(_FP8_LAYERS)
+        export["config_groups"]["group_2"] = {
+            **_FP8_GROUP,
+            "targets": ["transformer_blocks.0.ff.net.2"],
+        }
+        _, layers, _, _ = DiffusionPipelineConfig.load_diffusion_quant_config(export)
+        assert len(layers) == 12
+        assert layers["transformer_blocks.0.ff.net.2"].quant_algo == QuantAlgo.FP8
+
+    def test_conflicting_groups_raise(self):
+        export = _mixed_precision_export(_FP8_LAYERS, quantized_layers=False)
+        export["config_groups"]["group_2"] = {
+            **_NVFP4_GROUP,
+            "targets": ["transformer_blocks.0.ff.net.2"],
+        }
+        with pytest.raises(ValueError, match="both FP8 and NVFP4"):
+            DiffusionPipelineConfig.load_diffusion_quant_config(export)
+
+    @pytest.mark.parametrize(
+        "config_groups, reason",
+        [
+            ([], "has no config_groups"),
+            ("group_0", "has no config_groups"),
+            ({"group_0": ["transformer_blocks.0.attn.to_q"]}, "group 'group_0' must be a mapping"),
+            ({"group_0": {"targets": ["a"]}}, "needs a 'weights' mapping"),
+            (
+                {"group_0": {"weights": _NVFP4_GROUP["weights"], "targets": ["a"]}},
+                "needs a 'input_activations' mapping",
+            ),
+            ({"group_0": {**_NVFP4_GROUP, "targets": "a"}}, "lists no targets"),
+        ],
+    )
+    def test_malformed_config_groups_are_refused(self, config_groups, reason):
+        export = {"quant_algo": "MIXED_PRECISION", "config_groups": config_groups}
+        with pytest.raises(ValueError, match=reason):
+            DiffusionPipelineConfig.load_diffusion_quant_config(export)
+
     def test_pattern_targets_resolve(self):
         layers = {
             "transformer_blocks.*.ff.net.2": QuantConfig(quant_algo=QuantAlgo.FP8),
@@ -394,6 +548,23 @@ class TestMixedPrecisionModel:
             assert type(_linear(model, name).quant_method) is NVFP4LinearMethod, name
         assert model.apply_layer_quant_configs() == {"NVFP4": 4, "BF16": 12}
 
+    def test_runtime_names_and_patterns_still_exclude(self):
+        """The fused module's own name, and a pattern over either spelling, exclude it too."""
+        quant_config = QuantConfig(
+            quant_algo=QuantAlgo.NVFP4,
+            group_size=16,
+            exclude_modules=_IGNORE
+            + ["transformer_blocks.0.attn.qkv_proj", "transformer_blocks.1.ff*"],
+        )
+        model = h3.MiniMaxH3Transformer3DModel(_make_model_config(quant_config, None))
+        for name in (
+            "transformer_blocks.0.attn.qkv_proj",
+            "transformer_blocks.1.ff.gate_up_proj",
+            "transformer_blocks.1.ff.down_proj",
+        ):
+            assert not _linear(model, name).has_any_quant, name
+        assert model.apply_layer_quant_configs() == {"NVFP4": 5, "BF16": 11}
+
     def test_partial_exclusion_of_fused_linear_raises(self):
         quant_config = QuantConfig(
             quant_algo=QuantAlgo.NVFP4,
@@ -402,3 +573,65 @@ class TestMixedPrecisionModel:
         )
         with pytest.raises(ValueError, match="covers only part of the fused Linear"):
             h3.MiniMaxH3Transformer3DModel(_make_model_config(quant_config, None))
+
+
+# Every other VisualGen transformer: none of them reads a per-layer table.
+_OTHER_TRANSFORMERS = [
+    ("flux.transformer_flux", "FluxTransformer2DModel"),
+    ("flux.transformer_flux2", "Flux2Transformer2DModel"),
+    ("qwen_image.transformer_qwen_image", "QwenImageTransformer2DModel"),
+    ("wan.transformer_wan", "WanTransformer3DModel"),
+    ("ltx2.transformer_ltx2", "LTXModel"),
+    ("hunyuan_video1_5.transformer_hunyuan_video1_5", "HunyuanVideo15Transformer3DModel"),
+    ("glm_image.transformer_glm_image", "GlmImageTransformer2DModel"),
+    ("cosmos3.transformer_cosmos3", "Cosmos3VFMTransformer"),
+]
+
+
+class TestPerLayerQuantSupport:
+    @staticmethod
+    def _refuse_linear(monkeypatch):
+        def no_linear(*args, **kwargs):
+            raise AssertionError("a Linear was built before the per-layer table was refused")
+
+        monkeypatch.setattr(Linear, "__init__", no_linear)
+
+    @pytest.mark.parametrize("module, name", _OTHER_TRANSFORMERS, ids=lambda v: v.split(".")[-1])
+    def test_other_models_refuse_a_per_layer_table_before_allocation(
+        self, monkeypatch, module, name
+    ):
+        cls = getattr(
+            importlib.import_module(f"tensorrt_llm._torch.visual_gen.models.{module}"), name
+        )
+        assert issubclass(cls, BaseDiffusionModel)
+        assert not cls._supports_per_layer_quant
+        _, layers, _, _ = DiffusionPipelineConfig.load_diffusion_quant_config(
+            _mixed_precision_export(_FP8_LAYERS)
+        )
+        self._refuse_linear(monkeypatch)
+        config = DiffusionModelConfig(
+            quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16),
+            quant_config_dict=layers,
+        )
+        with pytest.raises(ValueError, match=f"not implemented for {name}"):
+            cls(model_config=config)
+
+    def test_base_model_refuses_before_its_subclass_runs(self):
+        class _Model(BaseDiffusionModel):
+            def __init__(self, model_config):
+                super().__init__(model_config)
+                raise AssertionError("the subclass constructor ran")
+
+        table = {"blocks.0.attn.to_q": QuantConfig(quant_algo=QuantAlgo.FP8)}
+        with pytest.raises(ValueError, match="not implemented for _Model"):
+            _Model(DiffusionModelConfig(quant_config_dict=table))
+
+    @pytest.mark.parametrize("table", [None, {}])
+    def test_base_model_accepts_no_table(self, table):
+        class _Model(BaseDiffusionModel):
+            pass
+
+        _Model(DiffusionModelConfig(quant_config_dict=table))
+
+    def test_minimax_h3_declares_support(self):
+        assert h3.MiniMaxH3Transformer3DModel._supports_per_layer_quant

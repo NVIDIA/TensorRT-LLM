@@ -14,8 +14,10 @@
 # limitations under the License.
 """Internal VisualGen pipeline and model configuration helpers."""
 
+import collections
 import fnmatch
 import json
+from collections.abc import Mapping as AbcMapping
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -116,6 +118,12 @@ _QUANT_ALGO_BY_NAME = {
     "W8A8_SQ_PER_CHANNEL": QuantAlgo.W8A8_SQ_PER_CHANNEL,
 }
 
+# The precisions a MIXED_PRECISION checkpoint may assign, most preferred first.
+_MIXED_PRECISION_CONFIGS = {
+    QuantAlgo.NVFP4: QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16),
+    QuantAlgo.FP8: QuantConfig(quant_algo=QuantAlgo.FP8),
+}
+
 
 def resolve_layer_quant_config(
     layer_quant_config: Optional[Dict[str, QuantConfig]], name: str
@@ -163,8 +171,9 @@ class DiffusionModelConfig(_VisualGenConfigBase):
 
     # Shared runtime configs copied from the owning pipeline config.
     quant_config: QuantConfig = PydanticField(default_factory=QuantConfig)
-    # Per-layer quant of a MIXED_PRECISION export: checkpoint module name or fnmatch pattern ->
-    # QuantConfig (load_diffusion_quant_config). None for single-precision checkpoints.
+    # Per-layer quant: checkpoint module name or fnmatch pattern -> QuantConfig. A MIXED_PRECISION
+    # export fills it with exact names only (load_diffusion_quant_config). None for
+    # single-precision checkpoints.
     quant_config_dict: Optional[Dict[str, QuantConfig]] = None
     compilation: CompilationConfig = PydanticField(default_factory=CompilationConfig)
     torch_compile: TorchCompileConfig = PydanticField(default_factory=TorchCompileConfig)
@@ -241,8 +250,9 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
     # VAE Conv-only ModelOpt overrides. None lets the checkpoint determine the mode.
     vae_conv_dynamic_weight_quant: Optional[bool] = None
     vae_conv_dynamic_activation_quant: Optional[bool] = None
-    # Per-layer quant of a MIXED_PRECISION export: checkpoint module name or fnmatch pattern ->
-    # QuantConfig (load_diffusion_quant_config). None for single-precision checkpoints.
+    # Per-layer quant: checkpoint module name or fnmatch pattern -> QuantConfig. A MIXED_PRECISION
+    # export fills it with exact names only (load_diffusion_quant_config). None for
+    # single-precision checkpoints.
     quant_config_dict: Optional[Dict[str, QuantConfig]] = None
     compilation: CompilationConfig = PydanticField(default_factory=CompilationConfig)
     torch_compile: TorchCompileConfig = PydanticField(default_factory=TorchCompileConfig)
@@ -425,15 +435,28 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
         return quant_config, layer_quant_config, dynamic_weight_quant, dynamic_activation_quant
 
     @staticmethod
-    def _mixed_precision_group_algo(group_name: str, group_config: dict) -> QuantConfig:
+    def _mixed_precision_group_algo(group_name: str, group_config: Any) -> QuantConfig:
         """The QuantConfig one ModelOpt ``config_groups`` entry describes.
 
         Weights and input activations must agree: 4-bit float with 16-element scale blocks is
         NVFP4, 8-bit float per tensor is FP8. Both are static recipes (calibrated scales in the
         checkpoint); a ``dynamic`` group is refused.
         """
-        weights = group_config.get("weights") or {}
-        activations = group_config.get("input_activations") or {}
+        if not isinstance(group_config, AbcMapping):
+            raise ValueError(
+                f"MIXED_PRECISION group {group_name!r} must be a mapping, got "
+                f"{type(group_config).__name__}"
+            )
+        sections = []
+        for key in ("weights", "input_activations"):
+            section = group_config.get(key)
+            if not isinstance(section, AbcMapping):
+                raise ValueError(
+                    f"MIXED_PRECISION group {group_name!r} needs a {key!r} mapping, got "
+                    f"{type(section).__name__}"
+                )
+            sections.append(section)
+        weights, activations = sections
         if weights.get("dynamic") or activations.get("dynamic"):
             raise ValueError(
                 f"MIXED_PRECISION group {group_name!r} asks for dynamic quantization; only static "
@@ -444,13 +467,52 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             for section in (weights, activations)
         )
         if signature == ((4, "float", 16), (4, "float", 16)):
-            return QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)
+            return _MIXED_PRECISION_CONFIGS[QuantAlgo.NVFP4].model_copy()
         if signature == ((8, "float", None), (8, "float", None)):
-            return QuantConfig(quant_algo=QuantAlgo.FP8)
+            return _MIXED_PRECISION_CONFIGS[QuantAlgo.FP8].model_copy()
         raise ValueError(
             f"MIXED_PRECISION group {group_name!r} is not NVFP4 (4-bit float, group_size 16) or "
-            f"per-tensor FP8 (8-bit float): weights={weights}, input_activations={activations}"
+            f"per-tensor FP8 (8-bit float): weights={dict(weights)}, "
+            f"input_activations={dict(activations)}"
         )
+
+    @staticmethod
+    def _mixed_precision_layer_name(name: Any, source: str) -> str:
+        """A checkpoint module name of a MIXED_PRECISION table: a non-empty exact name."""
+        if not isinstance(name, str) or not name:
+            raise ValueError(f"MIXED_PRECISION {source} has the invalid module name {name!r}")
+        if _GLOB_CHARS.intersection(name):
+            raise ValueError(
+                f"MIXED_PRECISION {source} names the pattern {name!r}; a MIXED_PRECISION "
+                "checkpoint assigns precisions by exact checkpoint module name"
+            )
+        return name
+
+    @staticmethod
+    def _mixed_precision_layer_algo(name: str, layer: Any) -> QuantConfig:
+        """The QuantConfig one ``quantized_layers`` entry describes (static NVFP4 or FP8)."""
+        if not isinstance(layer, AbcMapping):
+            raise ValueError(
+                f"MIXED_PRECISION quantized_layers[{name!r}] must be a mapping, got "
+                f"{type(layer).__name__}"
+            )
+        algo = layer.get("quant_algo")
+        config = _MIXED_PRECISION_CONFIGS.get(
+            _QUANT_ALGO_BY_NAME.get(algo) if isinstance(algo, str) else None
+        )
+        if config is None:
+            raise ValueError(
+                f"MIXED_PRECISION quantized_layers[{name!r}] has the unsupported quant_algo "
+                f"{algo!r}; only NVFP4 and FP8 are supported"
+            )
+        expected = 16 if config.quant_algo == QuantAlgo.NVFP4 else None
+        group_size = layer.get("group_size", expected)
+        if type(group_size) is not type(expected) or group_size != expected:
+            raise ValueError(
+                f"MIXED_PRECISION quantized_layers[{name!r}] gives {config.quant_algo.name} the "
+                f"group_size {group_size!r}; expected {expected!r}"
+            )
+        return config.model_copy()
 
     @staticmethod
     def _load_mixed_precision_quant_config(
@@ -458,27 +520,26 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
     ) -> Tuple[QuantConfig, Dict[str, QuantConfig], bool, bool]:
         """Parse a ModelOpt ``MIXED_PRECISION`` export (per-layer NVFP4 / FP8).
 
-        Each ``config_groups`` entry carries its own precision and the module names it applies to
-        (``targets``, exact checkpoint names or fnmatch patterns); ``quantized_layers`` lists the
-        same assignment per module. The per-layer dict holds both, and the two must agree. The
-        global QuantConfig is the dominant group (most targets), with ``ignore`` as its exclusion
-        list, so shared code that reads one algorithm (attention backend selection, the loader's
-        static-scale guard) sees the recipe most Linears run. Whether every quantized Linear is
-        covered is checked by the model, which knows its module names.
+        Each ``config_groups`` entry carries its own precision and the checkpoint module names it
+        applies to (``targets``); ``quantized_layers`` lists the same assignment per module. Both
+        use exact names, never patterns, and a name that receives two precisions is an error. The
+        per-layer dict holds the union.
+
+        The global QuantConfig is the algorithm most of those names carry (NVFP4 on a tie), with
+        ``ignore`` as its exclusion list, so shared code that reads one algorithm (attention
+        backend selection, the loader's static-scale guard) sees the recipe most Linears run. The
+        count is of unique checkpoint names, so it does not depend on how the names are split into
+        groups or on the order of the groups. Whether every quantized Linear is covered is checked
+        by the model, which knows its module names.
         """
-        groups = quant_config_dict.get("config_groups") or {}
-        if not groups:
+        groups = quant_config_dict.get("config_groups")
+        if not isinstance(groups, AbcMapping) or not groups:
             raise ValueError("MIXED_PRECISION quantization_config has no config_groups")
         layer_quant_config: Dict[str, QuantConfig] = {}
-        group_sizes: Dict[str, int] = {}
-        group_algos: Dict[str, QuantConfig] = {}
 
         def _assign(name: str, config: QuantConfig, source: str) -> None:
             previous = layer_quant_config.get(name)
-            if previous is not None and (previous.quant_algo, previous.group_size) != (
-                config.quant_algo,
-                config.group_size,
-            ):
+            if previous is not None and previous.quant_algo != config.quant_algo:
                 raise ValueError(
                     f"MIXED_PRECISION assigns {name!r} both {previous.quant_algo.name} and "
                     f"{config.quant_algo.name} ({source})"
@@ -487,29 +548,38 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
 
         for group_name, group_config in groups.items():
             config = DiffusionPipelineConfig._mixed_precision_group_algo(group_name, group_config)
-            targets = group_config.get("targets") or []
+            targets = group_config.get("targets")
             if not isinstance(targets, list) or not targets:
                 raise ValueError(f"MIXED_PRECISION group {group_name!r} lists no targets")
-            group_algos[group_name] = config
-            group_sizes[group_name] = len(targets)
             for target in targets:
-                _assign(target, config, f"group {group_name}")
-        for name, layer in (quant_config_dict.get("quantized_layers") or {}).items():
-            algo = _QUANT_ALGO_BY_NAME.get(layer.get("quant_algo"))
-            if algo is None:
-                raise ValueError(
-                    f"MIXED_PRECISION quantized_layers[{name!r}] has unknown quant_algo "
-                    f"{layer.get('quant_algo')!r}"
+                source = f"group {group_name!r}"
+                _assign(
+                    DiffusionPipelineConfig._mixed_precision_layer_name(target, source),
+                    config,
+                    source,
                 )
-            # FP8 entries carry no group_size; leave QuantConfig's default so the comparison
-            # with the group's config holds.
-            extra = {"group_size": layer["group_size"]} if "group_size" in layer else {}
-            _assign(name, QuantConfig(quant_algo=algo, **extra), "quantized_layers")
+        quantized_layers = quant_config_dict.get("quantized_layers")
+        if quantized_layers is None:
+            quantized_layers = {}
+        if not isinstance(quantized_layers, AbcMapping):
+            raise ValueError(
+                "MIXED_PRECISION quantized_layers must be a mapping of module name to precision, "
+                f"got {type(quantized_layers).__name__}"
+            )
+        for name, layer in quantized_layers.items():
+            name = DiffusionPipelineConfig._mixed_precision_layer_name(name, "quantized_layers")
+            _assign(
+                name,
+                DiffusionPipelineConfig._mixed_precision_layer_algo(name, layer),
+                "quantized_layers",
+            )
 
-        dominant = max(groups, key=lambda g: group_sizes[g])
+        counts = collections.Counter(config.quant_algo for config in layer_quant_config.values())
+        # _MIXED_PRECISION_CONFIGS lists NVFP4 first; max keeps the first of equal counts.
+        dominant = max(_MIXED_PRECISION_CONFIGS, key=lambda algo: counts[algo])
         quant_config = QuantConfig(
-            quant_algo=group_algos[dominant].quant_algo,
-            group_size=group_algos[dominant].group_size,
+            quant_algo=dominant,
+            group_size=_MIXED_PRECISION_CONFIGS[dominant].group_size,
             exclude_modules=quant_config_dict.get("ignore"),
         )
         return quant_config, layer_quant_config, False, False

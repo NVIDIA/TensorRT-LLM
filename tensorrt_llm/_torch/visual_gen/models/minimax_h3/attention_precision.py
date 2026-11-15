@@ -48,6 +48,7 @@ CHECKPOINT_KEY = "attention_precision"
 RUNTIME_KEY = "minimax_h3_attention_precision"
 # Ulysses sizes at which BF16 attention modules and MIXED_PRECISION Linears are served.
 SUPPORTED_ULYSSES_SIZES = (1, 4)
+SUPPORTED_ULYSSES_SIZES_TEXT = " and ".join(str(size) for size in SUPPORTED_ULYSSES_SIZES)
 BF16 = "bf16"
 _ENTRY_KEYS = frozenset({"schema_version", "layers"})
 _PATTERN_CHARACTERS = frozenset("*?[]")
@@ -67,10 +68,10 @@ def parse_attention_precision(entry: Any, source: str) -> dict[str, str]:
     if unknown:
         raise ValueError(f"{source}: attention_precision has unknown keys {unknown}")
     version = entry.get("schema_version")
-    if isinstance(version, bool) or version != SCHEMA_VERSION:
+    if type(version) is not int or version != SCHEMA_VERSION:
         raise ValueError(
             f"{source}: attention_precision schema_version {version!r} is not supported "
-            f"(expected {SCHEMA_VERSION})"
+            f"(expected the integer {SCHEMA_VERSION})"
         )
     layers = entry.get("layers")
     if not isinstance(layers, Mapping):
@@ -153,7 +154,8 @@ def validate_attention_precision(
         )
     if ulysses_size not in SUPPORTED_ULYSSES_SIZES:
         raise NotImplementedError(
-            f"attention_precision is supported at Ulysses 1 and 4, found Ulysses {ulysses_size}"
+            f"attention_precision is supported at Ulysses {SUPPORTED_ULYSSES_SIZES_TEXT}, "
+            f"found Ulysses {ulysses_size}"
         )
     if async_ulysses and ulysses_size > 1:
         raise NotImplementedError("attention_precision is not supported with async_ulysses")
