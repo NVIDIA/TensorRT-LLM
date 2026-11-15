@@ -835,8 +835,9 @@ class Mamba2Metadata:
                                  None)
         if replay_counter is not None and batch_size > 0:
             from .exact_replay import prepare_exact_replay_rows
-            prepare_exact_replay_rows(self, replay_counter, batch_size,
-                                      num_contexts, context_lens)
+            prepare_exact_replay_rows(
+                self, replay_counter, batch_size, num_contexts, context_lens,
+                getattr(kv_cache_manager, "mamba_replay_chunk_size", None))
 
         self.inforward_split = None
         plan = getattr(kv_cache_manager, "inforward_snapshot_plan", None)

@@ -67,6 +67,17 @@ _GDN_REPLAY_META_BYTES = 16
 _GDN_REPLAY_META_PNAT = 0
 _GDN_REPLAY_META_CACHE_BUF_IDX = 1
 _GDN_REPLAY_META_CACHE_BASE = 2
+# Exact replay (FORCE_DETERMINISTIC): per-layer inputs of the partial chunk, in
+# GDNLayerCache attribute order.
+_GDN_EXACT_REPLAY_ROLES = {
+    "replay_q": DataRole("gdn_exact_replay_q"),
+    "replay_k": DataRole("gdn_exact_replay_k"),
+    "replay_v": DataRole("gdn_exact_replay_v"),
+    "replay_g": DataRole("gdn_exact_replay_g"),
+    "replay_beta": DataRole("gdn_exact_replay_beta"),
+}
+# Held by the first local layer: a row holds [tokens run, padding x3] as int32.
+_GDN_EXACT_REPLAY_META_ROLE = DataRole("gdn_exact_replay_meta")
 
 
 class ReplayStateUpdateMetadata(NamedTuple):
@@ -206,6 +217,169 @@ class GDNLayerCache(MambaLayerCache):
     k_ring: torch.Tensor | None = None
     u_ring: torch.Tensor | None = None
     g_ring: torch.Tensor | None = None
+    # Exact replay (FORCE_DETERMINISTIC): inputs of the partial chunk after
+    # the boundary state held in `temporal`, and the slot's token count.
+    replay_q: torch.Tensor | None = None
+    replay_k: torch.Tensor | None = None
+    replay_v: torch.Tensor | None = None
+    replay_g: torch.Tensor | None = None
+    replay_beta: torch.Tensor | None = None
+    replay_num_tokens: torch.Tensor | None = field(
+        default=None,
+        metadata={"slot_shared": True},
+    )
+
+
+class GDNExactReplayState:
+    """Boundary-state semantics for FORCE_DETERMINISTIC (see mamba/gdn_exact_replay.py).
+
+    `temporal` holds each slot's FP32 state at its last chunk boundary; the
+    replay buffers hold the normalized `q` and `k`, `v`, the log decay `g` and
+    `beta` of the tokens after it, and `replay_num_tokens` counts the tokens a
+    slot has run. They are buffers of the recurrent-state slot, so a snapshot,
+    a relocation or a suspension of the slot carries them together with the
+    boundary state.
+    """
+
+    uses_replay = False
+    provides_layer_cache = True
+    replay_shares_state_slot = True
+    fused_verify = False
+    intermediate_indices = None
+    intermediate_ssm = None
+    intermediate_conv = None
+
+    def __init__(self, chunk_size: int) -> None:
+        self.chunk_size = chunk_size
+        self._pool_layers: list[dict[DataRole, torch.Tensor]] | None = None
+        self.replay_num_tokens: torch.Tensor | None = None
+
+    def replay_layout(self, context: MambaStateLayout, layer_id: int) -> ReplayLayout:
+        """Per-slot shapes of one layer's partial-chunk buffers.
+
+        The first local layer also holds the token-count row.
+        """
+        if not context.mamba_pp_layers:
+            return {}
+        num_v_heads, head_v_dim, head_k_dim = context.ssm_state_shape
+        num_k_heads = context.n_groups_per_rank
+        dtype = context.conv_state_dtype
+        chunk = self.chunk_size
+        layout = {
+            _GDN_EXACT_REPLAY_ROLES["replay_q"]: (dtype, [chunk, num_k_heads, head_k_dim]),
+            _GDN_EXACT_REPLAY_ROLES["replay_k"]: (dtype, [chunk, num_k_heads, head_k_dim]),
+            _GDN_EXACT_REPLAY_ROLES["replay_v"]: (dtype, [chunk, num_v_heads, head_v_dim]),
+            _GDN_EXACT_REPLAY_ROLES["replay_g"]: (torch.float32, [chunk, num_v_heads]),
+            _GDN_EXACT_REPLAY_ROLES["replay_beta"]: (torch.float32, [chunk, num_v_heads]),
+        }
+        if layer_id == context.mamba_pp_layers[0]:
+            layout[_GDN_EXACT_REPLAY_META_ROLE] = (
+                torch.int32,
+                [_GDN_REPLAY_META_BYTES // torch.int32.itemsize],
+            )
+        return layout
+
+    def bind_replay_pool(self, layers: list[dict[DataRole, torch.Tensor]]) -> None:
+        """Take the manager's per-layer views; their first dimension is the state slot."""
+        self._pool_layers = layers
+
+    def bind(
+        self,
+        context: MambaStateLayout,
+        ssm_states: list[torch.Tensor],
+        conv_states: list[torch.Tensor],
+    ) -> None:
+        if not context.mamba_pp_layers:
+            return
+        if self._pool_layers is None:
+            raise RuntimeError("GDN exact replay needs the cache manager's slot buffers")
+        from tensorrt_llm._torch.modules.mamba.gdn_exact_replay import pin_gdn_autotune_configs
+
+        self.replay_num_tokens = self._pool_layers[0][_GDN_EXACT_REPLAY_META_ROLE][:, 0]
+        pin_gdn_autotune_configs()
+
+    def reset_replay_slots(self, replay_slots: torch.Tensor) -> None:
+        """A request that starts in generation has run no tokens."""
+        if self.replay_num_tokens is not None:
+            self.replay_num_tokens.index_fill_(0, replay_slots, 0)
+
+    def reset_slots(
+        self,
+        slots: torch.Tensor,
+        host_slots: list[int],
+        replay_slots: torch.Tensor | None = None,
+    ) -> None:
+        # Context requests include resumed prefills and requests that reuse a
+        # snapshot, whose counts must survive; a request without cached tokens
+        # restarts its count in Mamba2Metadata.prepare instead.
+        return
+
+    def update(self, batch: MambaAcceptanceBatch) -> None:
+        return
+
+    def shutdown(self) -> None:
+        self._pool_layers = None
+        self.replay_num_tokens = None
+
+    def make_layer_cache(
+        self, layer_offset: int, conv: torch.Tensor, temporal: torch.Tensor
+    ) -> MambaLayerCache:
+        views = self._pool_layers[layer_offset]
+        return GDNLayerCache(
+            conv=conv,
+            temporal=temporal,
+            replay_num_tokens=self.replay_num_tokens,
+            **{name: views[role] for name, role in _GDN_EXACT_REPLAY_ROLES.items()},
+        )
+
+
+def _estimate_gdn_exact_replay_bytes_per_slot(model_config, mapping: Mapping, **kwargs) -> int:
+    """Bytes the exact-replay buffers add to every recurrent-state slot of a manager not yet built."""
+    from tensorrt_llm._torch.modules.mamba.gdn_exact_replay import (
+        GDN_CHUNK_SIZE,
+        exact_replay_disabled_reason,
+        exact_replay_requested,
+    )
+
+    if not exact_replay_requested():
+        return 0
+    spec_config = kwargs.get("spec_config")
+    params, local_layers, _ = _get_local_mamba_cache_layout(
+        model_config,
+        mapping,
+        spec_config=spec_config,
+        is_draft=kwargs.get("is_draft", False),
+        use_separate_draft_kv_cache=kwargs.get("use_separate_draft_kv_cache", False),
+    )
+    if not local_layers:
+        return 0
+    ssm_cache_dtype = params.mamba_ssm_cache_dtype or params.dtype
+    if exact_replay_disabled_reason(spec_config, ssm_cache_dtype, kwargs.get("is_disagg", False)):
+        return 0
+    tp_size = _mamba_effective_tp_size(mapping)
+    layer_ids = tuple(range(local_layers))
+    layout = MambaStateLayout(
+        layer_mask=(True,) * local_layers,
+        pp_layers=layer_ids,
+        mamba_pp_layers=layer_ids,
+        mapping=mapping,
+        conv_state_shape=(),
+        ssm_state_shape=(params.num_heads // tp_size, params.head_dim, params.state_size),
+        conv_state_dtype=params.dtype,
+        ssm_state_dtype=ssm_cache_dtype,
+        n_groups_per_rank=params.n_groups // tp_size,
+        max_batch_size=0,
+        state_index_capacity=0,
+        slot_capacity=None,
+        spec_config=spec_config,
+        conv_state_layout="q_k_v",
+    )
+    state = GDNExactReplayState(GDN_CHUNK_SIZE)
+    return sum(
+        dtype.itemsize * math.prod(shape)
+        for layer_id in layer_ids
+        for dtype, shape in state.replay_layout(layout, layer_id).values()
+    )
 
 
 class GDNIntermediateState:
@@ -999,8 +1173,58 @@ class Qwen35HybridCacheManager(MambaHybridCacheManagerV2):
         kwargs.setdefault("conv_state_layout", "q_k_v")
         super().__init__(*args, **kwargs)
 
+    def _exact_replay_state(self) -> GDNExactReplayState | None:
+        """The FORCE_DETERMINISTIC replay state, or None with the reason logged."""
+        from tensorrt_llm._torch.modules.mamba.gdn_exact_replay import (
+            GDN_CHUNK_SIZE,
+            exact_replay_disabled_reason,
+            exact_replay_requested,
+        )
+
+        if not exact_replay_requested():
+            return None
+        reason = exact_replay_disabled_reason(
+            self.spec_config, self.ssm_state_dtype, self._is_disagg
+        )
+        if reason is None:
+            logger.info_once(
+                "FORCE_DETERMINISTIC: GDN decode replays the chunked delta-rule arithmetic from "
+                "each sequence's last chunk boundary",
+                key="gdn_exact_replay",
+            )
+            return GDNExactReplayState(GDN_CHUNK_SIZE)
+        logger.warning_once(
+            f"FORCE_DETERMINISTIC: GDN keeps the default prefill and decode kernels because {reason}",
+            key="gdn_exact_replay_disabled",
+        )
+        return None
+
+    @property
+    def mamba_replay_num_tokens(self) -> torch.Tensor | None:
+        state = getattr(self, "_speculative_state", None)
+        return state.replay_num_tokens if isinstance(state, GDNExactReplayState) else None
+
+    @property
+    def mamba_replay_chunk_size(self) -> int | None:
+        state = getattr(self, "_speculative_state", None)
+        return state.chunk_size if isinstance(state, GDNExactReplayState) else None
+
     @override
-    def _initialize_spec_state(self) -> GDNIntermediateState | GDNReplayState:
+    def _inforward_snapshot_layout(self) -> tuple[int, int]:
+        rows, row_bytes = super()._inforward_snapshot_layout()
+        if isinstance(self._speculative_state, GDNExactReplayState):
+            # Exact replay runs a chunk through its end, so a snapshot point
+            # ends a context chunk instead of being staged inside one.
+            return 0, row_bytes
+        return rows, row_bytes
+
+    @override
+    def _initialize_spec_state(
+        self,
+    ) -> GDNIntermediateState | GDNReplayState | GDNExactReplayState:
+        replay_state = self._exact_replay_state()
+        if replay_state is not None:
+            return replay_state
         state = create_gdn_state(self, self._requested_replay, allow_flashinfer_ring=True)
 
         validate_gdn_layout(self, state)
@@ -1018,10 +1242,10 @@ class Qwen35HybridCacheManager(MambaHybridCacheManagerV2):
     @classmethod
     @override
     def _extra_state_bytes_per_rank(cls, model_config, mapping: Mapping, **kwargs) -> int:
-        # FlashInfer rings share every recurrent-state slot.
+        # FlashInfer rings, or the exact-replay buffers, share every recurrent-state slot.
         return estimate_gdn_replay_bytes_per_slot(
             model_config, mapping, flashinfer_ring=True, **kwargs
-        )
+        ) + _estimate_gdn_exact_replay_bytes_per_slot(model_config, mapping, **kwargs)
 
     def get_replay_state_update_metadata(self) -> ReplayStateUpdateMetadata | None:
         state = self._speculative_state
@@ -1061,6 +1285,7 @@ def get_gdn_cache_params(config, *, spec_config=None, quant_config=None):
 
 
 __all__ = [
+    "GDNExactReplayState",
     "GDNIntermediateState",
     "GDNLayerCache",
     "GDNReplayState",

@@ -358,6 +358,7 @@ def fused_gdn_post_conv(
     l2_norm_eps: float = 1e-6,
     softplus_threshold: float = 20.0,
     beta_dtype: torch.dtype = torch.float32,
+    block_tokens: int = 16,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fuse GDN post-conv split, Q/K normalization, and gate preparation.
 
@@ -375,6 +376,9 @@ def fused_gdn_post_conv(
         l2_norm_eps: Epsilon added to the Q/K squared norm.
         softplus_threshold: Linear fallback threshold for the decay gate softplus.
         beta_dtype: Output dtype for beta. Target verification uses the input dtype for parity.
+        block_tokens: Tokens per program. The Q/K squared norm of a token is reduced inside its
+            block, so its rounding depends on the token's row in the block; one token per program
+            gives every token the same reduction.
     Returns:
         Contiguous Q, K, V, log-space G, and beta tensors with shapes
         ``[1, num_tokens, num_k_heads, head_k_dim]``,
@@ -403,7 +407,6 @@ def fused_gdn_post_conv(
     # compile-time eliminates all decode address arithmetic and loads, so this
     # pointer and its strides are never interpreted as a decode tensor.
     decode_input = prefill if decode is None else decode
-    block_tokens = 16
     block_k = triton.next_power_of_2(head_k_dim)
     block_v = triton.next_power_of_2(head_v_dim)
     grid = (triton.cdiv(num_tokens, block_tokens), num_k_heads + num_v_heads)

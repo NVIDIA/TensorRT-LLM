@@ -102,7 +102,9 @@ def replay_ssd(x, dt, A, B, C, chunk_size, D, dt_bias, initial_states, dt_softpl
     return states, final_states
 
 
-def prepare_exact_replay_rows(metadata, counter, batch_size, num_contexts, context_lens):
+def prepare_exact_replay_rows(
+    metadata, counter, batch_size, num_contexts, context_lens, chunk_size=None
+):
     """Snapshot this step's replay positions and advance the slot token counts.
 
     ``counter`` is the slot-shared int32 count of tokens each slot has run
@@ -113,8 +115,9 @@ def prepare_exact_replay_rows(metadata, counter, batch_size, num_contexts, conte
     decode rows) and, for prefill rows, the host lists
     ``replay_prefill_n_pre`` and ``replay_prefill_has_boundary``. The counts
     advance here, once per step, because every layer sees the same tokens.
+    ``chunk_size`` defaults to the metadata's SSD chunk size.
     """
-    chunk_size = metadata.chunk_size
+    chunk_size = chunk_size or metadata.chunk_size
     slots = metadata.state_indices[:batch_size].long()
     counts = counter.index_select(0, slots)
     conv_has_initial = metadata.replay_conv_has_initial[:batch_size]
