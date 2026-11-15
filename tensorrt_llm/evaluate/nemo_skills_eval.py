@@ -440,6 +440,17 @@ class NemoSkillsEvaluator(Evaluator):
 
     def _batched_generate(self, llm, messages_list, sampling_params) -> List[str]:
         """Submit all prompts async (batched by the engine), then collect text."""
+        if self.apply_chat_template:
+            import copy
+
+            # _prompt_string renders the messages with the chat template, which
+            # already writes the special tokens the model expects (such as BOS).
+            # Tokenize that text without adding them again, as trtllm-serve does
+            # for chat requests.
+            sampling_params = (
+                copy.deepcopy(sampling_params) if sampling_params is not None else SamplingParams()
+            )
+            sampling_params.add_special_tokens = False
         outputs = [
             llm.generate_async(self._prompt_string(llm, m), sampling_params) for m in messages_list
         ]
