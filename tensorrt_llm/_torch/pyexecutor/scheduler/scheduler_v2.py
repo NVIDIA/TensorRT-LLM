@@ -148,6 +148,10 @@ class BudgetTracker:
         self._seen_peft_task_ids.add(lora_task_id)
 
 
+#: ShortestPrefillFirstOrder's aging factor; read only with shortest prefill first on.
+_AGING_FACTOR_ENV = "TRTLLM_SCHED_SHORTEST_PREFILL_AGING_FACTOR"
+
+
 def _read_non_negative_int_env(name: str, default: int) -> int:
     raw = os.environ.get(name)
     if raw is None or raw.strip() == "":
@@ -269,7 +273,8 @@ class ContextPageBackoff:
     One pass in N + 1 then probes whether pages have come back. Chunk
     continuations of started prefills are always tried, and passes without
     generation are never held: with nothing decoding, nothing else can use
-    the step.
+    the step. The scheduler sets N to its prefill-decode interval, so a
+    refused context step costs its slot like an admitted one.
 
     The state is a pure function of the sequence of scheduling decisions, so
     ranks that schedule the same requests stay in lockstep.
@@ -383,109 +388,85 @@ class _AdmissionDiagnostics:
 
 
 class ShortestPrefillFirstOrder:
-    """Order pending context requests by the prefill work they still need.
+    """Order pending context requests shortest prefill first, aged by admitted context work.
 
-    A request's work is the part of its prompt that is not cached yet: the
-    remaining context of a request that has started prefilling, or, for one
-    that has not, its prompt length minus the reusable prefix the KV cache
-    manager reports. Cheap follow-up turns then reach their first token ahead
-    of a long cold prompt that arrived earlier, and the long prompt takes what
-    is left of the chunk budget.
+    A request's work is the part of its prompt that is not cached yet: its prompt length
+    minus the reusable prefix the KV cache manager reports, probed once; a request first seen
+    after it started prefilling counts its remaining context instead. Its key is the context
+    tokens the scheduler had admitted when the request reached the context state, plus the
+    aging factor F times that work. Pending context requests are tried in key order, ties in
+    arrival order.
 
-    Aging bounds the reordering: a request that has gone ``max_wait_passes``
-    scheduling passes without being given any context tokens moves ahead of
-    every request that has not, and aged requests keep arrival order among
-    themselves. A long prompt that keeps receiving what is left of the budget
-    therefore never ages, while one that shorter requests keep crowding out
-    does. Ties keep arrival order. The clock runs for every active request in
-    the context state, including passes in which the batch fills up before the
-    scheduler reaches it.
+    Requests that arrive between the same two context admissions share the clock reading, so
+    the shortest goes first. An earlier request goes ahead of a later one once the context
+    tokens admitted between their arrivals exceed F times the difference in their work. A long
+    cold prompt that shorter ones keep crowding out therefore reaches the front once the
+    scheduler has admitted F times as many context tokens as it needs itself: from then on no
+    later arrival is tried ahead of it. The bound scales with each request's own work; F is the
+    order's only setting (``TRTLLM_SCHED_SHORTEST_PREFILL_AGING_FACTOR``, default
+    ``DEFAULT_AGING_FACTOR``). F = 0 tries pending context in arrival order and skips the
+    prefix probe; a larger F stays closer to pure shortest first and lets a long prompt wait
+    longer.
 
-    ``max_age_passes`` N > 0 adds a bound the waiting clock cannot give: a
-    request that reached the context state N or more passes ago counts as aged
-    too, however much leftover budget it has been given since. A long cold
-    prompt that shorter requests keep to a trickle of tokens therefore reaches
-    its first token at most N passes plus its own prefill after it arrived.
-    With ``aged_lead_every`` K > 1 such a request goes ahead only on every K-th
-    pass and takes what is left of the budget on the others, so shorter
-    requests keep most passes while it finishes.
+    The clock counts the context tokens of the requests the scheduler returned, a function
+    of its decisions, so ranks that schedule the same requests order them alike.
 
-    ``first_chunk_max_wait_passes`` M > 0 bounds how long a prompt that fits
-    one context step waits for it. Under a long queue (a prefill-decode
-    interval holds every context step back for N passes) shortest-first keeps
-    serving the newest short prompts, and a mid-size prompt can wait many
-    context steps. With M the aged requests split into three tiers, each in
-    arrival order: first those aged by ``max_age_passes``, which keeps that
-    bound on the oldest prompts; then requests that have not started
-    prefilling, have waited M passes and whose uncached prompt fits
-    ``first_chunk_max_tokens`` (the step's token budget); then those aged by
-    ``max_wait_passes``. Without M every aged request shares one tier, as
-    before. Started prompts and longer cold ones keep the ``max_wait_passes``
-    and ``max_age_passes`` clocks, so a long prompt is not promoted into
-    taking the whole budget pass after pass. The M tier applies on every pass;
-    ``aged_lead_every`` paces only the ``max_age_passes`` lead. An M at or
-    above ``max_wait_passes`` only orders such first chunks ahead of the other
-    requests aged by waiting.
+    The order may try a request that has not started prefilling ahead of one that has. The
+    scheduler therefore never lets the former preempt the latter for KV pages: arrival order
+    would have scheduled, and protected, the started request first.
 
-    The reordering may try a request that has not started prefilling ahead of
-    one that has. The scheduler therefore never lets the former preempt the
-    latter for KV pages: arrival order would have scheduled, and protected,
-    the started request first.
-
-    The prefix probe is a radix walk over the prompt, so it runs at most once
-    per request and only when there is something to reorder.
+    The prefix probe is a radix walk over the prompt, so it runs at most once per request
+    and only when there is something to reorder.
     """
 
-    def __init__(
-        self,
-        max_wait_passes: int,
-        max_age_passes: int = 0,
-        aged_lead_every: int = 1,
-        first_chunk_max_wait_passes: int = 0,
-        first_chunk_max_tokens: Optional[int] = None,
-    ):
-        self.max_wait_passes = max_wait_passes
-        self.max_age_passes = max_age_passes
-        self.aged_lead_every = max(aged_lead_every, 1)
-        self.first_chunk_max_wait_passes = first_chunk_max_wait_passes
-        self.first_chunk_max_tokens = first_chunk_max_tokens
-        self._pass = 0
-        self._waiting_since: dict[int, int] = {}
-        self._arrived_at: dict[int, int] = {}
-        self._uncached_estimate: dict[int, int] = {}
-        # Requests in the first-chunk tier of the current pass's order; how many
-        # of them were admitted since take_first_chunk_aged_admissions().
-        self._first_chunk_aged: set[int] = set()
-        self._first_chunk_aged_admissions = 0
-        self._first_chunk_aged_logged = False
+    #: Default F: how many times its own prefill work the scheduler admits for other requests
+    #: before a pending request stops being overtaken by later arrivals. 1 is the tightest
+    #: nonzero bound; in a closed-loop replay of a multi-turn agentic trace (aggregated,
+    #: interval 12) it raised p90 TTFT several-fold, because under load it degrades to arrival
+    #: order. 16 and 32 were unstable across replay variants; 64 kept shortest-first latencies.
+    DEFAULT_AGING_FACTOR = 64
+
+    def __init__(self, aging_factor: int = DEFAULT_AGING_FACTOR):
+        if aging_factor < 0:
+            raise ValueError(f"aging_factor must be non-negative, got {aging_factor}")
+        self._aging_factor = aging_factor
+        self._work = 0
+        self._arrival_work: dict[int, int] = {}
+        self._key: dict[int, int] = {}
+
+    @property
+    def aging_factor(self) -> int:
+        """F: the multiple of its own uncached work after which a request is no longer overtaken."""
+        return self._aging_factor
+
+    @property
+    def work(self) -> int:
+        """Context tokens the scheduler has admitted so far: the order's clock."""
+        return self._work
 
     def describe(self) -> str:
-        """The settings, for the scheduler's startup log."""
-        text = (
-            f"max_wait_passes={self.max_wait_passes}, "
-            f"max_age_passes={self.max_age_passes}, "
-            f"aged_lead_every={self.aged_lead_every}"
+        """The order, for the scheduler's startup log."""
+        return (
+            f"shortest prefill first, aged by admitted context tokens (factor {self._aging_factor})"
         )
-        if self.first_chunk_max_wait_passes > 0:
-            text += (
-                f", first_chunk_max_wait_passes={self.first_chunk_max_wait_passes}, "
-                f"first_chunk_max_tokens={self.first_chunk_max_tokens}"
-            )
-        return text
 
     def _uncached_tokens(self, req: LlmRequest, kv_cache_manager) -> int:
         if not req.is_first_context_chunk:
             return req.context_remaining_length
+        reusable = kv_cache_manager.probe_context_reuse(req)
+        if reusable is None:
+            return req.context_remaining_length
+        return max(req.prompt_len - reusable, 1)
+
+    def _key_of(self, req: LlmRequest, kv_cache_manager) -> int:
         request_id = req.py_request_id
-        estimate = self._uncached_estimate.get(request_id)
-        if estimate is None:
-            reusable = kv_cache_manager.probe_context_reuse(req)
-            if reusable is None:
-                estimate = req.context_remaining_length
-            else:
-                estimate = max(req.prompt_len - reusable, 1)
-            self._uncached_estimate[request_id] = estimate
-        return estimate
+        key = self._key.get(request_id)
+        if key is None:
+            key = self._arrival_work[request_id]
+            if self._aging_factor:
+                key += self._aging_factor * self._uncached_tokens(req, kv_cache_manager)
+            self._key[request_id] = key
+        return key
 
     def order(
         self,
@@ -498,80 +479,32 @@ class ShortestPrefillFirstOrder:
         """Account one scheduling pass and return *pending_ctx* in admission order.
 
         *pending_ctx* holds the requests this pass may try; *active_requests*
-        all active requests, whose context requests keep their waiting clocks
-        even when the pass does not reach them. Requests in other states
-        (encoder init) keep their relative order ahead of the context requests.
-        With ``reorder`` False the list is returned as is and only the waiting
-        bookkeeping advances, which is all a pass that admits no context work
-        needs.
+        all active requests, whose context requests take their clock reading on
+        the first pass they are seen, even when this pass does not reach them.
+        Requests in other states (encoder init) keep their relative order ahead
+        of the context requests. With ``reorder`` False the list is returned as
+        is and only the bookkeeping advances, which is all a pass that admits no
+        context work needs.
         """
-        self._pass += 1
-        if self._first_chunk_aged:
-            self._first_chunk_aged.clear()
         waiting_ids = {
             r.py_request_id for r in active_requests if r.state_value == context_init_state_value
         }
-        for request_id in [rid for rid in self._waiting_since if rid not in waiting_ids]:
-            del self._waiting_since[request_id]
-            self._arrived_at.pop(request_id, None)
-            self._uncached_estimate.pop(request_id, None)
-        for request_id in waiting_ids:
-            self._waiting_since.setdefault(request_id, self._pass)
-            self._arrived_at.setdefault(request_id, self._pass)
+        for request_id in self._arrival_work.keys() - waiting_ids:
+            del self._arrival_work[request_id]
+            self._key.pop(request_id, None)
+        for request_id in waiting_ids - self._arrival_work.keys():
+            self._arrival_work[request_id] = self._work
         context_reqs = [r for r in pending_ctx if r.state_value == context_init_state_value]
         if not reorder or len(context_reqs) < 2:
             return pending_ctx
-        age_leads = self.max_age_passes > 0 and self._pass % self.aged_lead_every == 0
-        first_chunk_wait = self.first_chunk_max_wait_passes
-
-        def admission_key(item):
-            arrival, req = item
-            request_id = req.py_request_id
-            if age_leads and self._pass - self._arrived_at[request_id] >= self.max_age_passes:
-                return (0, 0, arrival)
-            waited = self._pass - self._waiting_since[request_id]
-            if (
-                first_chunk_wait > 0
-                and waited >= first_chunk_wait
-                and req.is_first_context_chunk
-                and (
-                    self.first_chunk_max_tokens is None
-                    or self._uncached_tokens(req, kv_cache_manager) <= self.first_chunk_max_tokens
-                )
-            ):
-                self._first_chunk_aged.add(request_id)
-                return (0, 1, arrival)
-            if waited >= self.max_wait_passes:
-                # Without the first-chunk tier, every aged request shares one.
-                return (0, 2 if first_chunk_wait > 0 else 0, arrival)
-            return (1, self._uncached_tokens(req, kv_cache_manager), arrival)
-
-        ordered = [req for _, req in sorted(enumerate(context_reqs), key=admission_key)]
+        # sorted() is stable, so equal keys keep arrival order.
+        ordered = sorted(context_reqs, key=lambda req: self._key_of(req, kv_cache_manager))
         others = [r for r in pending_ctx if r.state_value != context_init_state_value]
         return others + ordered
 
-    def record_admitted(self, scheduled_ctx: RequestList) -> None:
-        """Restart the waiting clock of every request given context tokens this pass."""
-        for req in scheduled_ctx:
-            self._waiting_since[req.py_request_id] = self._pass
-        if self._first_chunk_aged:
-            admitted = [r for r in scheduled_ctx if r.py_request_id in self._first_chunk_aged]
-            if admitted and not self._first_chunk_aged_logged:
-                self._first_chunk_aged_logged = True
-                logger.info(
-                    "[V2Scheduler] shortest-prefill-first: first chunk of request "
-                    f"{admitted[0].py_request_id} admitted ahead of shorter prefills after "
-                    f"waiting {self.first_chunk_max_wait_passes} or more passes "
-                    f"(first_chunk_max_wait_passes={self.first_chunk_max_wait_passes}); later "
-                    "ones are counted in the prefill-decode interval summary, when that "
-                    "interval is set"
-                )
-            self._first_chunk_aged_admissions += len(admitted)
-
-    def take_first_chunk_aged_admissions(self) -> int:
-        """First chunks admitted from the first-chunk tier since the last call."""
-        count, self._first_chunk_aged_admissions = self._first_chunk_aged_admissions, 0
-        return count
+    def record_admitted(self, context_tokens: int) -> None:
+        """Advance the clock by the context tokens of the requests this pass returned."""
+        self._work += context_tokens
 
 
 class KVCacheV2Scheduler(RequestScheduler):
@@ -698,36 +631,25 @@ class KVCacheV2Scheduler(RequestScheduler):
             os.environ.get("TLLM_SCHEDULER_DISABLE_BLOCKED_CTX_SKIP", "0") != "1"
         )
 
-        # Opt-in (default off) context admission policies for decode-heavy
-        # aggregated serving; see PrefillDecodeInterval and
-        # ShortestPrefillFirstOrder. With both unset, scheduling is unchanged.
+        # Context admission, off by default: PrefillDecodeInterval, with
+        # ContextPageBackoff at the same interval, and ShortestPrefillFirstOrder
+        # (arrival order without it).
         interval = _read_non_negative_int_env("TRTLLM_SCHED_PREFILL_DECODE_INTERVAL", 0)
         self._prefill_decode_interval = PrefillDecodeInterval(interval) if interval > 0 else None
+        self._ctx_page_backoff = ContextPageBackoff(interval) if interval > 0 else None
         self._shortest_prefill_first = None
-        # Opt-in (default off): see ShortestPrefillFirstOrder's
-        # first_chunk_max_wait_passes. Acts only with shortest-prefill-first.
-        first_chunk_wait = _read_non_negative_int_env(
-            "TRTLLM_SCHED_SPF_FIRST_CHUNK_MAX_WAIT_PASSES", 0
-        )
         if os.environ.get("TRTLLM_SCHED_SHORTEST_PREFILL_FIRST", "0") == "1":
             self._shortest_prefill_first = ShortestPrefillFirstOrder(
-                _read_non_negative_int_env("TRTLLM_SCHED_SPF_MAX_WAIT_PASSES", 128),
-                max_age_passes=_read_non_negative_int_env("TRTLLM_SCHED_SPF_MAX_AGE_PASSES", 0),
-                aged_lead_every=_read_non_negative_int_env("TRTLLM_SCHED_SPF_AGED_LEAD_EVERY", 1),
-                first_chunk_max_wait_passes=first_chunk_wait,
-                first_chunk_max_tokens=max_num_tokens,
+                _read_non_negative_int_env(
+                    _AGING_FACTOR_ENV, ShortestPrefillFirstOrder.DEFAULT_AGING_FACTOR
+                )
             )
-        elif first_chunk_wait > 0:
+        elif os.environ.get(_AGING_FACTOR_ENV, "").strip():
             logger.warning(
-                "TRTLLM_SCHED_SPF_FIRST_CHUNK_MAX_WAIT_PASSES has no effect without "
+                f"{_AGING_FACTOR_ENV} is ignored: it applies only with "
                 "TRTLLM_SCHED_SHORTEST_PREFILL_FIRST=1"
             )
         self._context_admission_stats: Counter = Counter()
-
-        # Opt-in (default off): back off first-chunk context admission after
-        # the KV pool refuses one; see ContextPageBackoff.
-        backoff_passes = _read_non_negative_int_env("TRTLLM_SCHED_CTX_PAGE_BACKOFF_PASSES", 0)
-        self._ctx_page_backoff = ContextPageBackoff(backoff_passes) if backoff_passes > 0 else None
         # Set by the context admission paths when the KV pool refused pages
         # during the current pass.
         self._ctx_page_refused = False
@@ -742,23 +664,14 @@ class KVCacheV2Scheduler(RequestScheduler):
             self._try_allocate_context = diag.wrap("allocate", self._try_allocate_context)
             self.release_context_admission = diag.wrap("release", self.release_context_admission)
             self._admission_diag = diag
-        if self._ctx_page_backoff is not None or self._admission_diag is not None:
-            logger.info(
-                "KVCacheV2Scheduler context page backoff: "
-                f"passes={backoff_passes}, admission_diagnostics="
-                f"{self._admission_diag is not None}"
-            )
+        if self._admission_diag is not None:
+            logger.info("KVCacheV2Scheduler admission diagnostics on")
         if self._prefill_decode_interval is not None or self._shortest_prefill_first is not None:
+            order = self._shortest_prefill_first
             logger.info(
                 "KVCacheV2Scheduler context admission: "
-                f"prefill_decode_interval={interval}, "
-                "shortest_prefill_first="
-                f"{self._shortest_prefill_first is not None}"
-                + (
-                    f" ({self._shortest_prefill_first.describe()})"
-                    if self._shortest_prefill_first is not None
-                    else ""
-                )
+                f"{order.describe() if order is not None else 'arrival order'}, "
+                f"prefill_decode_interval={interval}"
             )
 
     def set_async_transfer_manager(self, mgr) -> None:
@@ -984,8 +897,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         # --- Phase 2: schedule deferred context / encoder requests ---
         # Generation PEFT pages are now fully committed in the budget.
         #
-        # The opt-in admission policies may hold context requests back this
-        # pass or change the order in which they are tried.
+        # The prefill-decode interval may hold context requests back this
+        # pass; ShortestPrefillFirstOrder, when on, sets the order they are tried in.
         has_generation = bool(scheduled_gen)
         ctx_candidates, deferred_by_interval = self._admissible_pending_ctx(
             pending_ctx, requests_list, has_generation
@@ -1111,7 +1024,14 @@ class KVCacheV2Scheduler(RequestScheduler):
         if self._prefill_decode_interval is not None:
             self._record_context_admission(scheduled_ctx, has_generation, deferred_by_interval)
         if self._shortest_prefill_first is not None:
-            self._shortest_prefill_first.record_admitted(scheduled_ctx)
+            self._shortest_prefill_first.record_admitted(
+                sum(
+                    req.context_chunk_size
+                    if self.chunking_enabled
+                    else req.context_remaining_length
+                    for req in scheduled_ctx
+                )
+            )
 
         self._detect_deadlock(
             active_requests,
@@ -1139,16 +1059,16 @@ class KVCacheV2Scheduler(RequestScheduler):
             has_chunking,
         )
 
-    # ---- Opt-in context admission policies ----
+    # ---- Context admission policies ----
 
     def _admissible_pending_ctx(
         self, pending_ctx: RequestList, active_requests: RequestList, has_generation: bool
     ) -> tuple[RequestList, bool]:
         """Pending requests phase 2 may try this pass, in the order to try them.
 
-        Returns the candidates and whether the prefill-decode interval held
-        context requests back. Without the opt-ins this is *pending_ctx*
-        unchanged.
+        Returns the candidates, in ShortestPrefillFirstOrder when it is on and in
+        arrival order otherwise, and whether the prefill-decode interval held
+        context requests back.
         """
         interval = self._prefill_decode_interval
         if interval is not None and interval.withdraw_if_not_run(
@@ -1181,20 +1101,13 @@ class KVCacheV2Scheduler(RequestScheduler):
         stats["deferred"] += int(deferred)
         stats["context"] += int(bool(scheduled_ctx))
         if stats["passes"] >= self._CONTEXT_ADMISSION_LOG_PASSES:
-            spf = self._shortest_prefill_first
-            first_chunk_aged = ""
-            if spf is not None and spf.first_chunk_max_wait_passes > 0:
-                first_chunk_aged = (
-                    f", {spf.take_first_chunk_aged_admissions()} first chunks admitted ahead after waiting "
-                    f"{spf.first_chunk_max_wait_passes} passes"
-                )
             logger.info(
                 f"[V2Scheduler] prefill-decode interval "
                 f"{self._prefill_decode_interval.interval}: over {stats['passes']} passes, "
                 f"{stats['context']} admitted context work, "
                 f"{stats['deferred']} held pending context back, "
                 f"{stats['withdrawn']} admissions withdrawn because the executor did not "
-                "run them" + first_chunk_aged
+                "run them"
             )
             stats.clear()
 
