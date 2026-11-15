@@ -24,6 +24,7 @@
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 
+#include <atomic>
 #include <csignal>
 #include <cstdlib>
 #include <mutex>
@@ -96,7 +97,7 @@ MPI_Op getMpiOp(MpiOp op)
 namespace
 {
 
-bool mpiInitialized = false;
+std::atomic<bool> mpiInitialized{false};
 std::recursive_mutex mpiMutex;
 using SignalHandler = void (*)(int);
 
