@@ -31,6 +31,8 @@ PROMPTS = [
 ]
 GREEDY = SamplingParams(max_tokens=10, temperature=0)
 SAMPLED = SamplingParams(max_tokens=16, temperature=0.8, top_p=0.9, seed=7)
+# A greedy token may flip only at a near tie: top two logprobs within 0.3.
+NEAR_TIE = 0.3
 
 
 def _graph_config(variants):
@@ -80,6 +82,35 @@ def _run(cuda_graph_config, *calls):
     return SimpleNamespace(keys=keys, calls=results, notices=notices, vocab_size=vocab_size)
 
 
+def _greedy_reference():
+    """The target's greedy outputs without speculation, with each step's top two logprobs."""
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
+        with LLM(
+            model=f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct",
+            max_batch_size=4,
+            kv_cache_config=KvCacheConfig(enable_block_reuse=False, free_gpu_memory_fraction=0.5),
+        ) as llm:
+            params = SamplingParams(max_tokens=GREEDY.max_tokens, temperature=0, logprobs=2)
+            return [output.outputs[0] for output in llm.generate(PROMPTS, params)]
+
+
+def _assert_greedy(outputs, reference):
+    """Each output follows the reference until it takes the runner-up at a near tie."""
+    for output, ref in zip(outputs, reference, strict=True):
+        assert len(ref.logprobs) == len(ref.token_ids) > 0
+        for token, ref_token, ref_step in zip(output.token_ids, ref.token_ids, ref.logprobs):
+            if token != ref_token:
+                runner_up = max(
+                    (c for c in ref_step if c != ref_token), key=lambda c: ref_step[c].logprob
+                )
+                assert token == runner_up
+                assert ref_step[ref_token].logprob - ref_step[runner_up].logprob < NEAR_TIE
+                break
+        else:
+            assert len(output.token_ids) == len(ref.token_ids)
+
+
 @pytest.mark.high_cuda_memory
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_sampling_variants_capture_only_the_listed_graphs():
@@ -97,9 +128,9 @@ def test_sampling_variants_capture_only_the_listed_graphs():
 
     # Without greedy graphs, greedy requests replay the advanced ones and still decode greedily.
     assert advanced_replays > 0 and advanced.notices == set()
-    assert [output.token_ids for output in advanced_outputs] == [
-        output.token_ids for output in greedy_outputs
-    ]
+    reference = _greedy_reference()
+    _assert_greedy(greedy_outputs, reference)
+    _assert_greedy(advanced_outputs, reference)
 
     # Without advanced graphs, the sampled request runs eagerly under the once-per-variant warning.
     assert greedy_replays > 0 and sampled_replays == 0
