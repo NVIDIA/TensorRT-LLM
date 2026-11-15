@@ -276,7 +276,7 @@ def test_k3_ci_runs_once_on_b300_or_gb300_by_topology():
                 if stage.yaml_stem == block.yaml_stem and block_matches_stage(block, stage)
             }
             assert matched == (
-                {"GB300-4_GPUs-PyTorch-1"}
+                {f"GB300-4_GPUs-PyTorch-{split}" for split in range(1, 4)}
                 if multi
                 else {f"DGX_B300-PyTorch-{split}" for split in range(1, 5)}
             )
