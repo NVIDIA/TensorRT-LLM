@@ -28,6 +28,7 @@
 #include "kv_cache_manager_v2/utils/funcGuard.h"
 #include "kv_cache_manager_v2/utils/hostMem.h"
 #include "kv_cache_manager_v2/utils/math.h"
+#include "kv_cache_manager_v2/utils/staticHostMem.h"
 #include "tensorrt_llm/common/logger.h"
 
 #include "tensorrt_llm/common/assert.h"
@@ -853,6 +854,7 @@ void StorageManager::destroy()
     }
     mRemoteClients.clear();
     releaseAllRetainedCopies(/*level=*/std::nullopt);
+    _releaseHostDropResources();
     for (auto& lvl : mLevels)
     {
         TLLM_CHECK_DEBUG(lvl.storage);
@@ -1004,6 +1006,350 @@ std::vector<Slot> StorageManager::newSlotsForPoolGroup(CacheLevel level, PoolGro
     }
     TLLM_CHECK_DEBUG(numSlots <= storage.numFreeSlots(pgIdx));
     return storage.allocateMultiple(pgIdx, numSlots);
+}
+
+namespace
+{
+
+//! Logs a failed host-drop hand-off, rate-limited: the first 20, then every 10000th.
+void logHostDropError(char const* where, int64_t count, char const* what)
+{
+    if (count <= 20 || count % 10000 == 0)
+    {
+        TLLM_LOG_WARNING(
+            "KV cache host-drop hand-off failed in %s (#%lld): %s", where, static_cast<long long>(count), what);
+    }
+}
+
+} // namespace
+
+void StorageManager::_handOffDroppedPages(std::vector<SharedPtr<Page>> const& pages, CacheLevel level)
+{
+    std::vector<HostDropRecord> records;
+    records.reserve(pages.size());
+    try
+    {
+        for (auto const& page : pages)
+        {
+            auto const* committed = dynamic_cast<CommittedPage const*>(page.get());
+            if (committed == nullptr || committed->block == nullptr || !page->hasValidSlot())
+            {
+                continue;
+            }
+            // The copy that brought the page here may still be in flight.
+            page->readyEvent.synchronize();
+            PoolGroupIndex const pgIdx = getPoolGroupIndex(level, page->lifeCycle);
+            auto const& key = committed->block->key;
+            auto const memAddress = std::get<MemAddress>(slotAddress(level, pgIdx, page->slotId(), PoolIndex{0}));
+            auto const bytes = slotSize(level, pgIdx).at(PoolIndex{0});
+            records.push_back(HostDropRecord{std::string(reinterpret_cast<char const*>(key.data()), key.size()),
+                static_cast<int32_t>(page->lifeCycle.value()), static_cast<int32_t>(committed->numTokensInBlock),
+                static_cast<uint64_t>(memAddress), static_cast<uint64_t>(bytes)});
+        }
+        if (!records.empty())
+        {
+            mHostDropHook(records);
+            mHostDropStats.handed += static_cast<int64_t>(records.size());
+        }
+    }
+    catch (std::exception const& error)
+    {
+        // A failed hand-off only costs a later pool miss; eviction must go on.
+        logHostDropError("eviction", ++mHostDropStats.errors, error.what());
+    }
+}
+
+HostDropRingInfo StorageManager::setUpHostDropRing(size_t ringBytes, bool preferKernel)
+{
+    std::lock_guard<std::mutex> lock(mHostDropMutex);
+    if (!mHostDropRing)
+    {
+        size_t slotBytes = 0;
+        for (CacheLevel level{0}; level < mLevels.size(); ++level)
+        {
+            if (cacheTier(level) != CacheTier::HOST_MEM)
+            {
+                continue;
+            }
+            for (PoolGroupIndex pgIdx{0}; pgIdx < numPoolGroups(level); ++pgIdx)
+            {
+                slotBytes = std::max(slotBytes, slotSize(level, pgIdx).at(PoolIndex{0}));
+            }
+        }
+        TLLM_CHECK_WITH_INFO(slotBytes > 0, "setUpHostDropRing: no host-memory cache level");
+        // Page-aligned ring slots.
+        constexpr size_t kSlotAlignment = 4096;
+        slotBytes = (slotBytes + kSlotAlignment - 1) / kSlotAlignment * kSlotAlignment;
+        size_t const numSlots = std::max<size_t>(ringBytes / slotBytes, 16);
+        cuCheck(cuCtxGetCurrent(&mHostDropCtx));
+        cuCheck(cuStreamCreate(&mHostDropStream, CU_STREAM_NON_BLOCKING));
+        mHostDropCopier = std::make_unique<BatchedPageCopier>();
+        mHostDropKernel = preferKernel && mHostDropCopier->kernelEnabled()
+            && mHostDropCopier->pageIndexLocation() == PageIndexLocation::kDevice;
+        if (mHostDropKernel)
+        {
+            mHostDropPairsCap = 16384;
+            cuCheck(cuMemAlloc(&mHostDropPairsDev, mHostDropPairsCap * sizeof(PageIndexPair)));
+        }
+        mHostDropRing = std::make_unique<StaticHostMem>(numSlots * slotBytes);
+        mHostDropSlotBytes = slotBytes;
+        mHostDropFree.clear();
+        for (size_t i = numSlots; i > 0; --i)
+        {
+            mHostDropFree.push_back(static_cast<int32_t>(i - 1));
+        }
+        mHostDropAsync.store(true, std::memory_order_release);
+        TLLM_LOG_INFO("KV cache host-drop ring: %zu slots x %zu B, copy=%s", numSlots, slotBytes,
+            mHostDropKernel ? "kernel" : "hostfn");
+    }
+    return HostDropRingInfo{static_cast<uint64_t>(mHostDropRing->address()), static_cast<uint64_t>(mHostDropSlotBytes),
+        static_cast<int64_t>(mHostDropRing->size() / mHostDropSlotBytes), mHostDropKernel};
+}
+
+std::vector<HostDropRingRecord> StorageManager::drainHostDrops(size_t maxRecords)
+{
+    if (mHostDropCtx != nullptr)
+    {
+        // The consumer may be a thread without a current context; event queries need one.
+        cuCtxSetCurrent(mHostDropCtx);
+    }
+    std::vector<HostDropRingRecord> out;
+    std::lock_guard<std::mutex> lock(mHostDropMutex);
+    while (!mHostDropQueue.empty())
+    {
+        auto& batch = mHostDropQueue.front();
+        if (!out.empty() && out.size() + batch.records.size() > maxRecords)
+        {
+            break;
+        }
+        if (!batch.done.queryComplete())
+        {
+            break;
+        }
+        for (auto& r : batch.records)
+        {
+            out.push_back(std::move(r));
+        }
+        mHostDropQueue.pop_front();
+    }
+    return out;
+}
+
+void StorageManager::releaseHostDropSlots(std::vector<int32_t> const& slots)
+{
+    std::lock_guard<std::mutex> lock(mHostDropMutex);
+    mHostDropFree.insert(mHostDropFree.end(), slots.begin(), slots.end());
+}
+
+void StorageManager::_releaseHostDropResources() noexcept
+{
+    try
+    {
+        mHostDropAsync.store(false, std::memory_order_release);
+        std::lock_guard<std::mutex> lock(mHostDropMutex);
+        if (mHostDropStream != nullptr)
+        {
+            cuStreamSynchronize(mHostDropStream);
+            cuStreamDestroy(mHostDropStream);
+            mHostDropStream = nullptr;
+        }
+        mHostDropQueue.clear();
+        if (mHostDropPairsDev != 0)
+        {
+            cuMemFree(mHostDropPairsDev);
+            mHostDropPairsDev = 0;
+        }
+        mHostDropCopier.reset();
+        mHostDropRing.reset();
+        mHostDropFree.clear();
+    }
+    catch (...)
+    {
+    }
+}
+
+void StorageManager::_queueHostDrops(std::vector<SharedPtr<Page>> const& pages, CacheLevel level)
+{
+    // The pages are DROPPABLE (no live reader) and their slots are released right after this returns. Instead of
+    // waiting for anything here, the copy into the ring is queued on the ring's stream behind each page's ready event,
+    // and the page's ready event becomes the copy's completion: the slot travels to its next owner with that event,
+    // and every new user of a slot waits on it in-stream. The consumer only sees a batch once its copy has completed.
+    int64_t ringFull = 0;
+
+    struct Item
+    {
+        Page* page;
+        CommittedPage const* committed;
+        PoolGroupIndex pgIdx;
+        size_t bytes;
+        int32_t slot;
+    };
+
+    std::vector<Item> items;
+    bool launched = false;
+    try
+    {
+        items.reserve(pages.size());
+        {
+            std::lock_guard<std::mutex> lock(mHostDropMutex);
+            for (auto const& page : pages)
+            {
+                auto const* committed = dynamic_cast<CommittedPage const*>(page.get());
+                if (committed == nullptr || committed->block == nullptr || !page->hasValidSlot())
+                {
+                    continue;
+                }
+                PoolGroupIndex const pgIdx = getPoolGroupIndex(level, page->lifeCycle);
+                size_t const bytes = slotSize(level, pgIdx).at(PoolIndex{0});
+                if (bytes > mHostDropSlotBytes || mHostDropFree.empty())
+                {
+                    ++ringFull;
+                    continue;
+                }
+                int32_t const slot = mHostDropFree.back();
+                mHostDropFree.pop_back();
+                items.push_back(Item{page.get(), committed, pgIdx, bytes, slot});
+            }
+        }
+        mHostDropStats.ringFull += ringFull;
+        if (!items.empty())
+        {
+            CUstream const stream = mHostDropStream;
+            std::vector<CUevent> waits;
+            waits.reserve(items.size());
+            for (auto const& item : items)
+            {
+                waits.push_back(item.page->readyEvent.handle());
+            }
+            streamWaitEvents(reinterpret_cast<CudaStream>(stream), std::move(waits));
+            MemAddress const ringBase = mHostDropRing->address();
+            std::vector<PoolGroupIndex> groups;
+            for (auto const& item : items)
+            {
+                if (std::find(groups.begin(), groups.end(), item.pgIdx) == groups.end())
+                {
+                    groups.push_back(item.pgIdx);
+                }
+            }
+            for (PoolGroupIndex const pgIdx : groups)
+            {
+                std::vector<size_t> idx;
+                for (size_t i = 0; i < items.size(); ++i)
+                {
+                    if (items[i].pgIdx == pgIdx)
+                    {
+                        idx.push_back(i);
+                    }
+                }
+                size_t const bytes = items[idx.front()].bytes;
+                if (mHostDropKernel)
+                {
+                    MemAddress const srcBase = std::get<MemAddress>(slotAddress(level, pgIdx, SlotId{0}, PoolIndex{0}));
+                    size_t off = 0;
+                    while (off < idx.size())
+                    {
+                        size_t const n = std::min(idx.size() - off, mHostDropPairsCap);
+                        std::vector<PageIndexPair> pairs(n);
+                        for (size_t j = 0; j < n; ++j)
+                        {
+                            auto const& item = items[idx[off + j]];
+                            pairs[j] = PageIndexPair{item.slot, static_cast<int32_t>(toSizeT(item.page->slotId()))};
+                        }
+                        copyToDeviceSyncSource(mHostDropPairsDev, pairs.data(), n, stream);
+                        PoolCopyArgs args{};
+                        args.dstBase = static_cast<CUdeviceptr>(ringBase);
+                        args.srcBase = static_cast<CUdeviceptr>(srcBase);
+                        args.dstStride = mHostDropSlotBytes;
+                        args.srcStride = bytes;
+                        args.bytesPerPage = static_cast<uint32_t>(bytes);
+                        args.pairs = reinterpret_cast<PageIndexPair const*>(mHostDropPairsDev);
+                        args.numPairs = static_cast<uint32_t>(n);
+                        launched = true;
+                        mHostDropCopier->launch(args, CopyDirection::kH2D, stream);
+                        off += n;
+                    }
+                }
+                else
+                {
+                    std::vector<CopyTask> tasks;
+                    tasks.reserve(idx.size());
+                    for (size_t const i : idx)
+                    {
+                        auto const& item = items[i];
+                        tasks.push_back(
+                            CopyTask{MemAddress(ringBase + static_cast<size_t>(item.slot) * mHostDropSlotBytes),
+                                slotAddress(level, pgIdx, item.page->slotId(), PoolIndex{0})});
+                    }
+                    launched = true;
+                    mCopyEngine->transfer(CacheTier::HOST_MEM, CacheTier::HOST_MEM, bytes, tasks, stream);
+                }
+            }
+            CachedCudaEvent const done(reinterpret_cast<CudaStream>(stream));
+            HostDropBatch batch{done, {}};
+            batch.records.reserve(items.size());
+            for (auto const& item : items)
+            {
+                item.page->readyEvent = done;
+                auto const& key = item.committed->block->key;
+                batch.records.push_back(
+                    HostDropRingRecord{std::string(reinterpret_cast<char const*>(key.data()), key.size()),
+                        static_cast<int32_t>(item.page->lifeCycle.value()),
+                        static_cast<int32_t>(item.committed->numTokensInBlock), item.slot,
+                        static_cast<uint64_t>(item.bytes)});
+            }
+            {
+                std::lock_guard<std::mutex> lock(mHostDropMutex);
+                mHostDropQueue.push_back(std::move(batch));
+            }
+            mHostDropStats.handed += static_cast<int64_t>(items.size());
+        }
+    }
+    catch (std::exception const& error)
+    {
+        // Never leave a slot to its next owner while a copy may still read it: finish the stream first, then give
+        // the ring slots back (nothing was queued for the consumer).
+        if (launched && mHostDropStream != nullptr)
+        {
+            cuStreamSynchronize(mHostDropStream);
+        }
+        {
+            std::lock_guard<std::mutex> lock(mHostDropMutex);
+            for (auto const& item : items)
+            {
+                mHostDropFree.push_back(item.slot);
+            }
+        }
+        logHostDropError("ring copy", ++mHostDropStats.errors, error.what());
+    }
+}
+
+void StorageManager::handOffDestroyedPage(Page& page)
+{
+    // Runs inside ~CommittedPage: no shared pointers to the page may be taken here.
+    try
+    {
+        auto const* committed = dynamic_cast<CommittedPage const*>(&page);
+        CacheLevel const level = page.cacheLevel;
+        if (committed == nullptr || committed->block == nullptr || !page.hasValidSlot()
+            || cacheTier(level) != CacheTier::HOST_MEM)
+        {
+            return;
+        }
+        page.readyEvent.synchronize();
+        PoolGroupIndex const pgIdx = getPoolGroupIndex(level, page.lifeCycle);
+        auto const& key = committed->block->key;
+        std::vector<HostDropRecord> records{
+            HostDropRecord{std::string(reinterpret_cast<char const*>(key.data()), key.size()),
+                static_cast<int32_t>(page.lifeCycle.value()), static_cast<int32_t>(committed->numTokensInBlock),
+                static_cast<uint64_t>(std::get<MemAddress>(slotAddress(level, pgIdx, page.slotId(), PoolIndex{0}))),
+                static_cast<uint64_t>(slotSize(level, pgIdx).at(PoolIndex{0}))}};
+        mHostDropHook(records);
+        mHostDropStats.handed += 1;
+    }
+    catch (std::exception const& error)
+    {
+        logHostDropError("page destruction", ++mHostDropStats.errors, error.what());
+    }
 }
 
 Address StorageManager::slotAddress(CacheLevel level, PoolGroupIndex pgIdx, SlotId slotId, PoolIndex poolIdx) const
@@ -1913,6 +2259,14 @@ void StorageManager::forceEvict(
                 TLLM_CHECK_DEBUG_WITH_INFO(page->status() == PageStatus::DROPPABLE, "Corrupted eviction controller");
             }
         }
+        // Forced eviction (resize, defragmentation) is not a capacity drop: these pages are not handed off.
+        for (auto const& pages : evicted)
+        {
+            for (auto const& page : pages)
+            {
+                page->hostDropHandled = true;
+            }
+        }
         if (dropRecorder)
         {
             for (auto const& pages : evicted)
@@ -2245,6 +2599,25 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
             TLLM_CHECK_DEBUG_WITH_INFO(
                 std::all_of(ev.begin(), ev.end(), [](auto const& p) { return p->status() == PageStatus::DROPPABLE; }),
                 "Evicted page at last level must be DROPPABLE");
+            if (lvlId != kHotLevel && !ev.empty())
+            {
+                // Pages the last host level drops go to the host-drop hook (or ring) before their slots are freed.
+                if (cacheTier(lvlId) == CacheTier::HOST_MEM)
+                {
+                    if (hostDropAsync())
+                    {
+                        _queueHostDrops(ev, lvlId);
+                    }
+                    else if (mHostDropHook)
+                    {
+                        _handOffDroppedPages(ev, lvlId);
+                    }
+                }
+                for (auto const& page : ev)
+                {
+                    page->hostDropHandled = true;
+                }
+            }
             if (dropRecorder && !ev.empty())
             {
                 dropRecorder(ev, lvlId);
