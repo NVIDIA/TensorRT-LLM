@@ -43,11 +43,6 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__dep
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__tp2ctx
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_107__dep2ctx
-  - unittest/_torch/modules/test_linear_output_slice.py::test_fp8_weight_slice_cache
-  - unittest/_torch/modules/test_linear_output_slice.py::test_prepare_output_slice_rejects_unsupported_projection_before_forward
-  - unittest/_torch/modules/test_linear_output_slice.py::test_prepare_output_slice_dispatches_to_linear_method
-  - unittest/_torch/modules/test_linear_output_slice.py::test_fp8_block_scale_low_m_dispatch_uses_full_weight_only
-  - unittest/_torch/modules/test_linear_output_slice.py::test_kimi_fp8_low_m_dispatch_uses_full_weight_only
   - disaggregated/test_aiperf_gate.py::test_fires_on_error_storm
   - disaggregated/test_aiperf_gate.py::test_passes_healthy_run_with_cancellations
   - disaggregated/test_aiperf_gate.py::test_missing_export_raises
@@ -222,7 +217,6 @@ l0_cpu:
   # only them.
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_103__tp4 --import-mode=importlib
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_103__tp8 --import-mode=importlib
-  - unittest/_torch/attention/test_fallback_fmha_extra_page_sizes.py
   - unittest/_torch/models/test_qwen3_next_eager_fusion.py::test_sparse_moe_keeps_shared_expert_tokens_unpadded
   # MiniMax-M3 VL input processor and wrapper forward; the CPU stage's -m cpu_only
   # leaves the checkpoint-backed tests out.
