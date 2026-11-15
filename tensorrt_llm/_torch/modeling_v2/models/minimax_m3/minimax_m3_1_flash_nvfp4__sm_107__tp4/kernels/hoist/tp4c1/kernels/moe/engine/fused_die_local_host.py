@@ -24,7 +24,7 @@ def _op_dl():
             raise ValueError(
                 f"fused_engine_dir must be the in-tree fused engine package {_FUSED_DIR} (got {DL_PORT})"
             )
-        _st["op"] = importlib.import_module(f"{__package__}.fused.host")
+        _st["op"] = importlib.import_module(".fused.host", __package__)
     return _st["op"]
 
 

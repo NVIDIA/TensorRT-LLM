@@ -136,7 +136,7 @@ def score(
 ) -> Optional[torch.Tensor]:
     """The per-KV-head prefill block scores [num_kv_heads, n_blocks, total_q] fp32 (the amax over each KV head's
     contiguous group of this rank's index heads, as _group_max_reduce), or None to keep the proxy."""
-    if torch.cuda.is_current_stream_capturing():
+    if idx_q.is_cuda and torch.cuda.is_current_stream_capturing():
         return None
     if num_kv_heads <= 0 or idx_q.dim() != 3 or idx_q.shape[1] % num_kv_heads:
         return None

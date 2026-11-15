@@ -104,6 +104,9 @@ def _worker(monkeypatch, served, rank, killed, *, real_layout=False):
         monkeypatch.setattr(dspark, "install_causal_draft", Mock(return_value=0))
         monkeypatch.setattr(dspark.dspark_ctxlen, "prepare", Mock(return_value=False))
         monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+        # The split-K drafter projections arm only without the his layout; arming them queries the device.
+        monkeypatch.setattr(dspark, "route_down_splitk", Mock(return_value=0))
+        monkeypatch.setattr(dspark, "route_oproj_splitk", Mock(return_value=0))
     return worker, routes, log
 
 
