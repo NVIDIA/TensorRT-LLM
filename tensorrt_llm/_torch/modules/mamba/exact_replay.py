@@ -238,6 +238,13 @@ def exact_replay_forward_core(
                 replay_x[slot, :tail] = x_aug[None, aug_len - tail :]
                 replay_dt[slot, :tail] = dt_aug[None, aug_len - tail :]
                 replay_B[slot, :tail] = B_aug[None, aug_len - tail :]
+            # A decode step scans the whole buffer row. The positions after
+            # its token only meet zero coefficients, but zero times a
+            # non-finite value is not zero and a newly acquired slot holds
+            # arbitrary bytes, so everything after the partial chunk is zero.
+            replay_x[slot, tail:] = 0
+            replay_dt[slot, tail:] = 0
+            replay_B[slot, tail:] = 0
             start = end
 
     if num_decodes:

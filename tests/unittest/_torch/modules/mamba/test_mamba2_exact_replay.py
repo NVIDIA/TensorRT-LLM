@@ -41,7 +41,16 @@ WIDTH = D_INNER + CONV_DIM + HEADS
 
 @pytest.fixture(autouse=True)
 def _pinned_tiles():
+    """Pin the SSD tiles for these tests and restore the autotune lists after."""
+    kernels = [entry[0] for entry in exact_replay._PINNED_SSD_CONFIGS]
+    saved = [(kernel, list(kernel.configs)) for kernel in kernels]
+    was_pinned = exact_replay._pinned
     pin_ssd_autotune_configs()
+    yield
+    for kernel, configs in saved:
+        kernel.configs = configs
+        kernel.cache.clear()
+    exact_replay._pinned = was_pinned
 
 
 def _randn(*shape, dtype=torch.bfloat16, scale=0.1):
@@ -258,6 +267,27 @@ def test_resumed_prefill_and_decode_match_single_shot_prefill(length):
     assert int(decode_cache.replay_num_tokens[1]) == length
 
 
+@pytest.mark.parametrize("stale", [float("nan"), float("inf")], ids=["nan", "inf"])
+def test_decode_ignores_what_a_slot_held_before(stale):
+    """A newly acquired slot holds arbitrary bytes, including non-finite values."""
+    torch.manual_seed(11)
+    layer = _make_layer()
+    length = 8
+    projected = _randn(length, WIDTH)
+    base = _Cache(3)
+    full = _run(layer, base.clone(), projected, [length], 1, [1], [False])
+
+    dirty = base.clone()
+    for name in ("replay_x", "replay_dt", "replay_B"):
+        getattr(dirty, name).fill_(stale)
+    outputs = [_run(layer, dirty, projected[:5], [5], 1, [1], [False])]
+    for name in ("replay_x", "replay_dt", "replay_B"):
+        assert not getattr(dirty, name)[1, 5:].any()
+    for t in range(5, length):
+        outputs.append(_run(layer, dirty, projected[t : t + 1], [1], 0, [1], [True]))
+    torch.testing.assert_close(torch.cat(outputs), full, rtol=0, atol=0)
+
+
 def test_mixed_batch_matches_isolated_rows():
     torch.manual_seed(7)
     layer = _make_layer()
@@ -396,8 +426,16 @@ def test_exact_replay_state_declares_slot_buffers_and_binds_their_views():
     # A context request keeps its count; a request that starts in generation restarts it.
     state.reset_slots(torch.tensor([1], device="cuda"), [1])
     assert state.replay_num_tokens.tolist() == [0, 9, 0, 7, 0]
+    for layer_views in views:
+        for buffer in layer_views.values():
+            buffer.fill_(1)
+    state.replay_num_tokens.copy_(torch.tensor([0, 9, 0, 7, 0]))
     state.reset_replay_slots(torch.tensor([3], device="cuda"))
     assert state.replay_num_tokens.tolist() == [0, 9, 0, 0, 0]
+    # ... and its buffers, which no prefill has cleared, are zero.
+    for name in ("replay_x", "replay_dt", "replay_B"):
+        buffer = getattr(state.make_layer_cache(1, conv[1], ssm[1]), name)
+        assert not buffer[3].any() and buffer[[0, 1, 2, 4]].all()
     state.shutdown()
     assert state.replay_num_tokens is None
 
@@ -532,13 +570,43 @@ def test_manager_keeps_the_replay_buffers_in_the_recurrent_state_slot(monkeypatc
         manager.shutdown()
 
 
-def test_disaggregated_serving_keeps_the_default_kernels(monkeypatch):
-    manager = _build_manager(monkeypatch, is_disagg=True)
+@pytest.mark.parametrize(
+    "override",
+    [{"is_disagg": True}, {"mamba_ssm_cache_dtype": torch.bfloat16}],
+    ids=["disaggregated", "bf16_state"],
+)
+def test_unmet_preconditions_keep_the_default_kernels(monkeypatch, override):
+    manager = _build_manager(monkeypatch, **override)
     try:
         assert not isinstance(manager._speculative_state, Mamba2ExactReplayState)
         assert manager.mamba_replay_num_tokens is None
     finally:
         manager.shutdown()
+
+
+@pytest.mark.parametrize(
+    "override, sm, reason",
+    [
+        ({}, 100, None),
+        ({}, 103, None),
+        ({"spec_config": object()}, 100, "speculative decoding"),
+        ({"is_disagg": True}, 100, "disaggregated serving"),
+        ({"ssm_cache_dtype": torch.bfloat16}, 100, "float32"),
+        ({}, 90, "SM100 and SM103"),
+        ({"chunk_size": None}, 100, "chunk size"),
+    ],
+)
+def test_exact_replay_preconditions(monkeypatch, override, sm, reason):
+    monkeypatch.setattr(mamba2_cache_manager, "get_sm_version", lambda: sm)
+    arguments = dict(
+        spec_config=None, ssm_cache_dtype=torch.float32, chunk_size=CHUNK, is_disagg=False
+    )
+    arguments.update(override)
+    actual = mamba2_cache_manager._exact_replay_disabled_reason(**arguments)
+    if reason is None:
+        assert actual is None
+    else:
+        assert reason in actual
 
 
 def test_snapshot_reuse_and_suspension_carry_the_replay_state(monkeypatch):
