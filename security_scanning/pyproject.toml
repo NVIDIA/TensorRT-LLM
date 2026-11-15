@@ -27,6 +27,7 @@ dependencies = [
     "h5py (==3.12.1)",
     "strenum (>=0.5.0,<0.6.0)",
     "sentencepiece (>=0.1.99)",
+    "torch (>=2.14.0a0,<=2.14.0)",
     "torchvision (>=0.29.2,<0.30.0)",
     "nvidia-nccl-cu13 (>=2.30.7,<=2.31.2)",
     "nccl4py (>=0.4,<=0.5)",
