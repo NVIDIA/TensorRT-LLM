@@ -93,8 +93,8 @@ from tensorrt_llm._torch.moe.fused_moe.cutlass import (
     TrtllmTritonFp8BlockScalesImpl,
 )
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_b12x import (
-    CuteDslB12xNvfp4FusedMoE,
-    CuteDslB12xW4a16Nvfp4FusedMoE,
+    FlashinferCutedslNvfp4Impl,
+    FlashinferCutedslW4a16Nvfp4Impl,
 )
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl_fc12 import CuteDslFc12FusedMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
@@ -2542,6 +2542,7 @@ def test_megamoe_quantize_reserves_sms_only_for_a_replica_plan(monkeypatch, requ
     request.addfinalizer(mega_moe_cute_dsl._fp4_quantize_has_sm_budget.cache_clear)
     moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
     torch.nn.Module.__init__(moe)
+    moe._shared_expert = None
     moe.fc31_input_scale = torch.ones(1)
     x = torch.zeros(3, 64, dtype=torch.bfloat16)
 
@@ -3477,7 +3478,7 @@ def test_apply_router_weight_on_input_support_is_not_inherited():
     wrapper."""
     assert TrtllmCutlassNvfp4Impl.capabilities.supports_apply_router_weight_on_input
     assert MarlinFusedMoE.capabilities.supports_apply_router_weight_on_input
-    for b12x_leaf in (CuteDslB12xNvfp4FusedMoE, CuteDslB12xW4a16Nvfp4FusedMoE):
+    for b12x_leaf in (FlashinferCutedslNvfp4Impl, FlashinferCutedslW4a16Nvfp4Impl):
         assert not b12x_leaf.capabilities.supports_apply_router_weight_on_input
     assert not TRTLLMGenFusedMoE.capabilities.supports_apply_router_weight_on_input
 
@@ -3928,11 +3929,13 @@ def test_megamoe_cutedsl_quantize_input_applies_pre_quant_scale(
     activation, which leaves ``quantize_input`` as the one place to apply it.
 
     ``__new__`` without ``__init__``: the real constructor wants a GPU and a
-    symmetric-memory provider, and ``quantize_input`` reads two parameters.
+    symmetric-memory provider, and ``quantize_input`` reads two parameters and
+    the fused shared expert, which stays unset here.
     """
     hidden_size = 64
     backend = TrtllmCutedslMegaMoeNvfp4Impl.__new__(TrtllmCutedslMegaMoeNvfp4Impl)
     torch.nn.Module.__init__(backend)
+    backend._shared_expert = None
     backend.fc31_input_scale = torch.nn.Parameter(torch.tensor(0.5), requires_grad=False)
     # Weight creation registers the slot as None, and only a checkpoint that
     # carries ``*.pre_quant_scale`` fills it, as ``NVFP4FusedMoEMethod`` does.
@@ -6768,6 +6771,7 @@ def test_cutedsl_fc12_run_moe_sort_tables(
     backend.mapping = SimpleNamespace(moe_ep_size=1)
     backend._concurrent_sm_reserve = 0
     backend.apply_router_weight_on_input = False
+    backend.routing_method = None
     weights = MagicMock(expert_size_per_partition=8, slot_start=0)
     backend._build_local_weight_view = lambda: weights
     sort_outputs = (None,) * 6
@@ -7019,12 +7023,12 @@ _B12X_PREFILL_THRESHOLD = 64
 @pytest.mark.parametrize(
     "leaf_cls, num_tokens, reaches_cutlass",
     [
-        pytest.param(CuteDslB12xNvfp4FusedMoE, _B12X_PREFILL_THRESHOLD, True, id="nvfp4-prefill"),
+        pytest.param(FlashinferCutedslNvfp4Impl, _B12X_PREFILL_THRESHOLD, True, id="nvfp4-prefill"),
         pytest.param(
-            CuteDslB12xNvfp4FusedMoE, _B12X_PREFILL_THRESHOLD - 1, False, id="nvfp4-decode"
+            FlashinferCutedslNvfp4Impl, _B12X_PREFILL_THRESHOLD - 1, False, id="nvfp4-decode"
         ),
         pytest.param(
-            CuteDslB12xW4a16Nvfp4FusedMoE, _B12X_PREFILL_THRESHOLD, False, id="w4a16-prefill"
+            FlashinferCutedslW4a16Nvfp4Impl, _B12X_PREFILL_THRESHOLD, False, id="w4a16-prefill"
         ),
     ],
 )
@@ -7089,6 +7093,7 @@ class _FreshOutputBackend:
 
     capabilities = MoEStaticCapability()
     input_requirement = MoEInputRequirement()
+    fused_route_quant_enabled = True
 
     def __init__(self, stream_stack: list) -> None:
         self._stream_stack = stream_stack
@@ -7147,7 +7152,8 @@ def _chunking_moe(backend, num_chunks: int) -> SimpleNamespace:
         calculate_num_chunks=lambda all_rank_num_tokens: num_chunks,
         split_chunk=lambda n, k: [n // k + (i < n % k) for i in range(k)],
         determine_communication_method=no_op,
-        _using_load_balancer=lambda: False,
+        _using_dynamic_load_balancer=lambda: False,
+        _warmup_placement_route_counters=lambda row_offset: None,
         _load_balancer_start_wait_gpu_stage=no_op,
         _load_balancer_start_set_cpu_stage=no_op,
         _load_balancer_done_set_cpu_stage=no_op,
@@ -7172,7 +7178,9 @@ def _forward_in_two_chunks(backend) -> Tuple[torch.Tensor, torch.Tensor]:
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "leaf_cls", [CuteDslB12xNvfp4FusedMoE, CuteDslB12xW4a16Nvfp4FusedMoE], ids=["nvfp4", "w4a16"]
+    "leaf_cls",
+    [FlashinferCutedslNvfp4Impl, FlashinferCutedslW4a16Nvfp4Impl],
+    ids=["nvfp4", "w4a16"],
 )
 def test_b12x_multi_chunk_forward_keeps_every_chunk(leaf_cls, monkeypatch):
     """Every b12x call returns the same storage, so a two-chunk forward has to

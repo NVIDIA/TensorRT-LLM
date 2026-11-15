@@ -174,6 +174,8 @@ class StorageStatistics:
     @property
     def evictable(self) -> int: ...
     @property
+    def retained_copies(self) -> int: ...
+    @property
     def available(self) -> int: ...
     @property
     def unavailable(self) -> int: ...
@@ -266,6 +268,7 @@ class GpuCacheTierConfig:
 class HostCacheTierConfig:
     quota: int
     max_quota: int | None = None
+    # Deprecated: set KVCacheManagerConfig.host_mem_backing. False still makes the placement strict.
     allow_remote_numa_fallback: bool = True
     @property
     def tier(self) -> CacheTier: ...
@@ -275,6 +278,10 @@ class HostCacheTierConfig:
 class DiskCacheTierConfig:
     quota: int
     path: str
+    num_io_threads: int = 0
+    keep_copy_after_restore: bool = False
+    write_through: bool = False
+    protected_copy_fraction: float = 1.0
     @property
     def tier(self) -> CacheTier: ...
     def validate(self) -> None: ...
@@ -516,6 +523,16 @@ class PoolRebalanceConfig:
     ratio_tolerance: float = 0.25
     moving_average_decay: float = 0.9999
 
+# Host bytes held by live page slabs in this process.
+def live_slab_bytes() -> int: ...
+
+# How the manager backs the host cache tier's memory; the tier does not read it.
+@dataclass(slots=True)
+class HostMemBackingConfig:
+    numa_node: int | None = None
+    allow_remote_numa_fallback: bool = True
+    def validate(self) -> None: ...
+
 @dataclass(slots=True)
 class KVCacheManagerConfig:
     tokens_per_block: int
@@ -551,6 +568,7 @@ class KVCacheManagerConfig:
     # Regions, each with a life cycle of its own, numbered after every layer life cycle in
     # declaration order. A (layer, role) pair belongs to one layer config or one region.
     regions: list[RegionConfig] = ...
+    host_mem_backing: HostMemBackingConfig = ...
     @property
     def enable_swa_scratch_reuse(self) -> bool: ...
 
@@ -777,6 +795,9 @@ class _KVCache:
     def cuda_stream(self, cuda_stream: CudaStream) -> None: ...
     @property
     def num_blocks(self) -> int: ...
+    @property
+    def page_storage_version(self) -> int:
+        """Changes whenever this cache's page indices, block count, beam width or history block change."""
     @property
     def batch_row(self) -> BatchRow | None:
         """Row this cache occupies in its :class:`Batch`, or ``None`` when it belongs to none.
