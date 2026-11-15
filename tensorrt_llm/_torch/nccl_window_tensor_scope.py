@@ -81,7 +81,9 @@ def _cuda_tensors(
         _cuda_tensors(value.fp8_tensor, tensors, visited, include_dataclasses)
         _cuda_tensors(value.scaling_factor, tensors, visited, include_dataclasses)
     elif is_dataclass(value) and not isinstance(value, type):
-        if not include_dataclasses:
+        if not include_dataclasses and not getattr(
+            type(value), "_trtllm_nccl_window_tensor_container", False
+        ):
             return
         value_type = type(value)
         for name in _dataclass_field_names(value_type):

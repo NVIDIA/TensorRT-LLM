@@ -6,7 +6,7 @@
 import functools
 import os
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable, ClassVar, Optional
 
 import torch
 import triton
@@ -50,6 +50,8 @@ class HCState:
     ``mHC.fused_hc`` still returns a 4-tuple so low-level callers (tests,
     benchmarks) stay unchanged.
     """
+
+    _trtllm_nccl_window_tensor_container: ClassVar[bool] = True
 
     residual: torch.Tensor
     post_mix: Optional[torch.Tensor] = None
