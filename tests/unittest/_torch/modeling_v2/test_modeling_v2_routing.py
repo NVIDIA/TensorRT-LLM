@@ -53,8 +53,8 @@ from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
 from tensorrt_llm._torch.model_config import KIMI_K3_DEFAULT_ROUTED_QUANT_ALGO, ModelConfig
 from tensorrt_llm._torch.models.modeling_auto import AutoModelForCausalLM
 from tensorrt_llm._torch.moe.fused_moe import moe_load_balancer
-from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import MOE_LOAD_BALANCER_MODES
 from tensorrt_llm._torch.moe.fused_moe.impl_identity import MoEImplId
+from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import MOE_LOAD_BALANCER_MODES
 from tensorrt_llm.llmapi.llm_args import (
     CacheTransceiverConfig,
     KvCacheConfig,
