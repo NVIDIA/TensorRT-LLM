@@ -2069,35 +2069,36 @@ def test_post_tune_merge_tactics_multi_rank(mpi_pool_executor):
         assert r["has_r0"] and r["has_r1"]
 
 
-def _autotune_dist_allgather_worker(world_size):
+def _autotune_dist_allgather_worker(world_size, init_file):
     import torch.distributed as dist
 
     from tensorrt_llm._torch.visual_gen.mapping import _VisualGenAutotuneDist
     rank = tensorrt_llm.mpi_rank()
-    os.environ["RANK"] = str(rank)
-    os.environ["WORLD_SIZE"] = str(world_size)
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "29557")
-    if not dist.is_initialized():
-        dist.init_process_group(backend="gloo",
-                                world_size=world_size,
-                                rank=rank)
-    # VG's real mesh has tp_size=1; the communicator must gather over the whole
-    # world regardless, so the mapping's tp axis is irrelevant to the gather.
-    d = _VisualGenAutotuneDist(
-        Mapping(world_size=world_size, rank=rank, tp_size=world_size))
-    return d.tp_cp_allgather(f"rank{rank}")
+    dist.init_process_group(backend="gloo",
+                            init_method=f"file://{init_file}",
+                            world_size=world_size,
+                            rank=rank)
+    try:
+        # VG's real mesh has tp_size=1; the communicator must gather over the whole
+        # world regardless, so the mapping's tp axis is irrelevant to the gather.
+        d = _VisualGenAutotuneDist(
+            Mapping(world_size=world_size, rank=rank, tp_size=world_size))
+        return d.tp_cp_allgather(f"rank{rank}")
+    finally:
+        dist.destroy_process_group()
 
 
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
-def test_visual_gen_autotune_dist_world_allgather(mpi_pool_executor):
+def test_visual_gen_autotune_dist_world_allgather(mpi_pool_executor, tmp_path):
     # _VisualGenAutotuneDist.tp_cp_allgather must gather every rank's object over
     # the default world group (not the single-rank tp subgroup), and construct
     # without running TorchDist.__init__.
     world_size = 2
+    init_file = str(tmp_path / "gloo-store")
     results = list(
         mpi_pool_executor.map(_autotune_dist_allgather_worker,
-                              *zip(*[(world_size, )] * world_size)))
+                              [world_size] * world_size,
+                              [init_file] * world_size))
     for got in results:
         assert got == ["rank0", "rank1"]
 
