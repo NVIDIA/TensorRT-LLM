@@ -24,7 +24,7 @@ def _make_inputs(
     rope_dim: int,
     num_heads: int,
     seed: int = 0,
-):
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     torch.manual_seed(seed)
     shape = (batch, seq, hidden_dim)
     if num_heads > 1:
@@ -168,11 +168,8 @@ def test_fused_dspark_rmsnorm_rope_matches_reference(
         apply_rmsnorm,
         inverse_rope,
     )
-    call_x, call_weight, call_freqs = inputs
     expected = _reference(
-        call_x,
-        call_weight,
-        call_freqs,
+        *inputs,
         num_heads,
         rope_dim,
         eps,

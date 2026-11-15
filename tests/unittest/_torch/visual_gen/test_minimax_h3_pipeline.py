@@ -1819,7 +1819,7 @@ def test_ref2va_freezes_audio_and_video_conditions(monkeypatch: pytest.MonkeyPat
         )
         return original(self, **kwargs)
 
-    monkeypatch.setattr(pipeline.transformer.__class__, "__call__", observe)
+    monkeypatch.setattr(_FakeMiniMaxH3Transformer, "__call__", observe)
     pipeline.forward(
         prompt="subject",
         seed=42,

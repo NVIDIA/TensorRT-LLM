@@ -49,7 +49,9 @@ def _compare(out, ref) -> None:
             assert gate_ratio(got, want) <= 1.0, f"{gate_ratio(got, want):.4g}x the band"
 
 
-def _build(spec, seed):
+def _build(
+    spec, seed
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int, bool]:
     rows, width, dtype = spec["rows"], HC_COUNT * HIDDEN, torch.bfloat16
     g = torch.Generator(device=DEV).manual_seed(seed)
     hc_out = (torch.randn(rows, width, generator=g, device=DEV) * 3.0).to(dtype)
@@ -87,14 +89,8 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by
 
 def test_stack_final_low_is_the_injecting_form_bitwise() -> None:
     args = _build(dict(rows=300), seed=7)
-    call_hc_out, call_rstd, call_norm_weight, call_first, call_hc_count, call_rank = args[:6]
-    low, inject = op(
-        call_hc_out, call_rstd, call_norm_weight, call_first, call_hc_count, call_rank, True
-    )
-    call_hc_out, call_rstd, call_norm_weight, call_first, call_hc_count, call_rank = args[:6]
-    low_f, none = op(
-        call_hc_out, call_rstd, call_norm_weight, call_first, call_hc_count, call_rank, False
-    )
+    low, inject = op(*args[:6], True)
+    low_f, none = op(*args[:6], False)
     assert none is None and inject.shape == (300, HC_COUNT)
     assert torch.equal(low, low_f)
 

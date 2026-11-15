@@ -23,14 +23,14 @@ runtime cache-manager plumbing.
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Optional, Tuple, cast
+from typing import Optional, Tuple
 
 import torch
 from einops import rearrange
 from fla.modules import FusedRMSNormGated, ShortConvolution
-from fla.ops.kda import chunk_kda, fused_recurrent_kda
+from fla.ops.kda import chunk_kda
+from test_common.fla_utils import fused_recurrent_kda_reference as kda_reference
 from torch import nn
 
 from tensorrt_llm._torch.modules.kimi_kda.kimi_kda_mixer import KimiKDALinearAttention
@@ -321,9 +321,6 @@ class KimiKDAReference(nn.Module):
         k = rearrange(k, "... (h d) -> ... h d", d=self.head_k_dim)
         v = rearrange(v, "... (h d) -> ... h d", d=self.head_dim)
 
-        kda_reference = cast(
-            Callable[..., tuple[torch.Tensor, torch.Tensor | None]], fused_recurrent_kda
-        )
         o, new_recurrent = kda_reference(
             q=q,
             k=k,

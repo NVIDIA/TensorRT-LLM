@@ -38,12 +38,10 @@ Requires: 1 GPU (sm100/sm103/sm107), fla-core, nvidia-cutlass-dsl,
 cuda-bindings. Skips cleanly otherwise.
 """
 
-from collections.abc import Callable
-from typing import cast
-
 import pytest
 import torch
 import torch.nn.functional as F
+from test_common.fla_utils import fused_recurrent_kda_reference as kda_reference
 
 _HAVE_DEPS = True
 _DEP_ERR = None
@@ -427,12 +425,6 @@ def _fla_sequential_reference(data, num_accepted):
     Returns out rows (new tokens only) and the committed state (after the
     first new token, FLA/cute ``[B, H, V, K]`` layout).
     """
-    from fla.ops.kda import fused_recurrent_kda
-
-    kda_reference = cast(
-        Callable[..., tuple[torch.Tensor, torch.Tensor | None]], fused_recurrent_kda
-    )
-
     B, H, K, V, W = data["B"], data["H"], data["K"], data["V"], data["W"]
     M, T = data["M"], data["T"]
     dim = H * K

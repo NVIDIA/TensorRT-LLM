@@ -47,7 +47,9 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
     assert_within_ulp(out, ref, element_ulp=2.0, rms_ulp=0.25)
 
 
-def _build(spec, seed):
+def _build(
+    spec, seed
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float, int, int]:
     g = torch.Generator(device="cuda").manual_seed(seed)
     rows, vocab = spec["rows"], spec["vocab"]
     table = torch.randn(vocab, HIDDEN, generator=g, device="cuda", dtype=torch.bfloat16)
@@ -68,51 +70,11 @@ def _build(spec, seed):
 def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by name
     args = _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % 2**31)
     certifying(op)
-    (
-        call_embed_table,
-        call_input_ids,
-        call_hidden_states,
-        call_enorm_weight,
-        call_hnorm_weight,
-        call_eps,
-        call_col_lo,
-        call_col_hi,
-    ) = args
-    out = op(
-        call_embed_table,
-        call_input_ids,
-        call_hidden_states,
-        call_enorm_weight,
-        call_hnorm_weight,
-        call_eps,
-        call_col_lo,
-        call_col_hi,
-        True,
-    )
+    out = op(*args, True)
     assert out.is_contiguous() and out.shape == (cell.spec["rows"], args[7] - args[6])
-    (
-        call_embed_table,
-        call_input_ids,
-        call_hidden_states,
-        call_enorm_weight,
-        call_hnorm_weight,
-        call_eps,
-        call_col_lo,
-        call_col_hi,
-    ) = args
     _compare(
         out,
-        op.reference(
-            call_embed_table,
-            call_input_ids,
-            call_hidden_states,
-            call_enorm_weight,
-            call_hnorm_weight,
-            call_eps,
-            call_col_lo,
-            call_col_hi,
-            True,
-        ),
+        op.reference(*args, True),
     )
 
 

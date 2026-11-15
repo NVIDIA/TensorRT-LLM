@@ -224,17 +224,8 @@ class ReusedBlocksByLevel:
     full: list[int]
     partial: list[int]
 
+@dataclass(slots=True)
 class SsmSnapshotIterationStatsDelta:
-    def __init__(
-        self,
-        iter_snapshot_lookups: int = 0,
-        iter_snapshot_hits: int = 0,
-        iter_snapshot_misses: int = 0,
-        iter_reused_tokens: int = 0,
-        iter_unreused_tokens: int = 0,
-        iter_aligned_snapshot_hits: int = 0,
-        iter_unaligned_snapshot_hits: int = 0,
-    ) -> None: ...
     iter_snapshot_lookups: int = 0
     iter_snapshot_hits: int = 0
     iter_snapshot_misses: int = 0

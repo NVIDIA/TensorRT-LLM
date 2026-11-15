@@ -163,7 +163,7 @@ def _bias() -> torch.Tensor:
     return _experts()[2]
 
 
-def _weights(p):
+def _weights(p) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """A layer's four TRTLLM-Gen buffers, in K3MoeState.layer's argument order."""
     return p["w31"], p["w31s"], p["w2"], p["w2s"]
 
@@ -227,7 +227,7 @@ def _draw(seed: int, rows: int):
     return logits, torch.randn(rows, H, generator=gen, device=DEV).bfloat16()
 
 
-def _routed_zeros(rows: int):
+def _routed_zeros(rows: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """k3_moe's inputs for ``rows`` tokens, all zero: (x_fp8, x_sf, topk_ids, topk_weights)."""
     return (
         torch.zeros(rows, H, dtype=torch.float8_e4m3fn, device=DEV),
@@ -427,12 +427,7 @@ def test_state_armed_and_sized():
     [1024, 3584] zero; a layer's counters int32 [680] zero. The loader's buffers fit the kernels.
     """
     proc, _, _ = _experts()
-    call_w3_w1_weight, call_w3_w1_weight_scale, call_w2_weight, call_w2_weight_scale = _weights(
-        proc
-    )
-    ok, why = is_supported(
-        call_w3_w1_weight, call_w3_w1_weight_scale, call_w2_weight, call_w2_weight_scale, E_LOCAL
-    )
+    ok, why = is_supported(*_weights(proc), E_LOCAL)
     assert ok, why
     sms = torch.cuda.get_device_properties(_device()).multi_processor_count
     state = K3MoeState(_device(), I_TP, E_LOCAL)
@@ -784,12 +779,10 @@ def test_unsupported_calls_refused_before_launch():
     before = [_snapshot(st, lyrs) for st, lyrs in objects]
     for m in (0, DECODE_MAX + 1):
         with pytest.raises(ValueError):
-            call_x_fp8, call_x_sf, call_topk_ids, call_topk_weights = _routed_zeros(m)
-            k3_moe(call_x_fp8, call_x_sf, call_topk_ids, call_topk_weights, OFFSET, layers[0])
+            k3_moe(*_routed_zeros(m), OFFSET, layers[0])
     for m in (0, WIDE_MAX + 1):
         with pytest.raises(ValueError):
-            call_x_fp8, call_x_sf, call_topk_ids, call_topk_weights = _routed_zeros(m)
-            k3_moe(call_x_fp8, call_x_sf, call_topk_ids, call_topk_weights, OFFSET, wide_layers[0])
+            k3_moe(*_routed_zeros(m), OFFSET, wide_layers[0])
     with pytest.raises(ValueError, match="head"):
         k3_moe(x_fp8, x_sf, ids, weights, OFFSET, flags_layer)
     with pytest.raises(ValueError, match="head"):

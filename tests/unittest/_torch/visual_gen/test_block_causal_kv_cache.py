@@ -91,7 +91,7 @@ def cache(request):
         mgr.shutdown()
 
 
-def rand_kv(n):
+def rand_kv(n) -> tuple[torch.Tensor, torch.Tensor]:
     k = torch.randn(n, NUM_KV_HEADS, HEAD_DIM, device=DEVICE, dtype=DTYPE)
     return k, torch.randn_like(k)
 
@@ -936,8 +936,7 @@ def test_spec_counts_size_the_causal_blocks():
         with pytest.raises(ValueError, match="exceed the open spec"):
             cache.plan(chunk, 10)
         with pytest.raises(ValueError):
-            call_k, call_v = rand_kv(chunk)
-            cache.write_staged(0, call_k, call_v, 10)
+            cache.write_staged(0, *rand_kv(chunk), 10)
     finally:
         cache.shutdown()
 

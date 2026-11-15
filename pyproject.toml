@@ -981,4 +981,6 @@ symbols = [
     "SpecMetadata",
     "ParakeetEncoderConfig",
     "AttentionMetadata",
+    "FlashInferAttentionMetadata",
+    "_SparseMqaGqaMetadata",
 ]

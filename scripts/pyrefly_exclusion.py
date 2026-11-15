@@ -69,6 +69,23 @@ def uninstalled_dependencies(project_root: Path) -> set[str]:
     return missing
 
 
+def has_local_import(search_path: Path, module: str) -> bool:
+    """Recognize local modules/packages without treating every directory as one."""
+    candidate = search_path
+    for part in module.split("."):
+        candidate = candidate / part
+        if (
+            candidate.with_suffix(".py").is_file()
+            or candidate.with_suffix(".pyi").is_file()
+            or (candidate / "__init__.py").is_file()
+            or (candidate / "__init__.pyi").is_file()
+        ):
+            return True
+    # A namespace package is local only if the requested path exists. A test
+    # directory sharing just the dependency's root name does not supply it.
+    return candidate.is_dir()
+
+
 def is_uninstalled_dependency(error: dict, missing: set[str], project_root: Path) -> bool:
     """Suppress missing optional distributions in test file-list checks, not local modules."""
     if error.get("name") != "missing-import":
@@ -84,23 +101,13 @@ def is_uninstalled_dependency(error: dict, missing: set[str], project_root: Path
     for parent in diagnostic_path.resolve().parents:
         if not parent.is_relative_to(project_root.resolve()):
             break
-        candidate = parent / root
-        if (
-            candidate.is_dir()
-            or candidate.with_suffix(".py").exists()
-            or candidate.with_suffix(".pyi").exists()
-        ):
+        if has_local_import(parent, match[1]):
             return False
     config = tomllib.loads((project_root / "pyproject.toml").read_text())
     for section in ("pyrefly", "pyrefly-tests"):
         native = config.get("tool", {}).get(section, {})
         for entry in native.get("search-path", []):
-            candidate = project_root / entry / root
-            if (
-                candidate.is_dir()
-                or candidate.with_suffix(".py").exists()
-                or candidate.with_suffix(".pyi").exists()
-            ):
+            if has_local_import(project_root / entry, match[1]):
                 return False
     return True
 

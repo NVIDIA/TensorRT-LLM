@@ -2,13 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """FLA parity tests for the fused KDA single-token decode kernel."""
 
-from collections.abc import Callable
 from dataclasses import dataclass
-from typing import cast
 
 import pytest
 import torch
 import torch.nn.functional as F
+from test_common.fla_utils import fused_recurrent_kda_reference as kda_reference
 
 import tensorrt_llm  # noqa: F401
 
@@ -230,12 +229,6 @@ def _fla_reference(
     apply_beta_sigmoid: bool,
     gate_lower_bound: float | None,
 ) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-    from fla.ops.kda import fused_recurrent_kda
-
-    kda_reference = cast(
-        Callable[..., tuple[torch.Tensor, torch.Tensor | None]], fused_recurrent_kda
-    )
-
     if update_conv_cache:
         assert inputs.state_indices is not None
         state_indices = inputs.state_indices.long()

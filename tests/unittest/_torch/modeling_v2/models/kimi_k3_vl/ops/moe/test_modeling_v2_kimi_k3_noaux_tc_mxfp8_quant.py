@@ -30,7 +30,9 @@ HIDDEN = 3584
 SF_COLS = HIDDEN // 32
 
 
-def _inputs(num_tokens: int, logit_scale: float = 2.5, seed: int = 0):
+def _inputs(
+    num_tokens: int, logit_scale: float = 2.5, seed: int = 0
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     gen = torch.Generator(device="cuda").manual_seed(seed)
     logits = torch.randn(num_tokens, NUM_EXPERTS, generator=gen, device="cuda") * logit_scale
     bias = torch.randn(NUM_EXPERTS, generator=gen, device="cuda") * 0.1
@@ -167,8 +169,7 @@ def test_rejects_out_of_contract() -> None:
     }
     for name, args in bad_calls.items():
         try:
-            call_router_logits, call_bias, call_hidden_states = args
-            kimi_k3_noaux_tc_mxfp8_quant(call_router_logits, call_bias, call_hidden_states, 1.0)
+            kimi_k3_noaux_tc_mxfp8_quant(*args, 1.0)
         except RuntimeError:
             continue
         raise AssertionError(f"{name}: the op accepted an out-of-contract call")

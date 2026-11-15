@@ -54,7 +54,7 @@ def _compare(key, head_weights, ref_key, ref_head_weights) -> None:
     assert_within_ulp(head_weights, ref_head_weights, 512.0, 128.0, ulp=FP32_ULP)
 
 
-def _build(rows: int, seed: int):
+def _build(rows: int, seed: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     g = torch.Generator(device="cuda").manual_seed(seed)
     x = torch.randn(rows, HIDDEN, generator=g, device="cuda").to(torch.bfloat16)
     weight = torch.randn(KEY + HEADS, HIDDEN, generator=g, device="cuda") * HIDDEN**-0.5
@@ -102,8 +102,7 @@ def test_a_handle_refuses_another_row_count() -> None:
     step's rows, so a mismatch must raise rather than compute a partial tile."""
     compiled = compile_handle(torch.cuda.current_device(), 2)
     with pytest.raises(ValueError, match="compiled for M=2"):
-        call_x, call_weight, call_key, call_head_weights = _build(4, seed=4)
-        op(call_x, call_weight, call_key, call_head_weights, compiled)
+        op(*_build(4, seed=4), compiled)
 
 
 @pytest.mark.parametrize("rows", MTP_ROWS)
@@ -177,8 +176,7 @@ def test_runtime_m_handle_is_the_compiled_handles_bitwise() -> None:
     torch.cuda.synchronize()
     assert torch.equal(key, key2) and torch.equal(head_weights, head_weights2)
     with pytest.raises(ValueError, match="M=1..192"):
-        call_x, call_weight, call_key, call_head_weights = _build(193, seed=5)
-        op(call_x, call_weight, call_key, call_head_weights, rag)
+        op(*_build(193, seed=5), rag)
 
 
 #: MTP5 at 1-3 requests (6 / 12 / 18 rows; MTP3 at 3 is 12): captured decode row counts without

@@ -51,7 +51,9 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
     assert_within_ulp(out, ref, element_ulp=2.0, rms_ulp=0.5)
 
 
-def _build(spec, seed):
+def _build(
+    spec, seed
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     g = torch.Generator(device="cuda").manual_seed(seed)
     hidden, inter = spec["hidden"], spec["inter"]
     tokens = spec.get("tokens", 1)
@@ -85,29 +87,11 @@ def _build(spec, seed):
 def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by name
     args = _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % 2**31)
     certifying(op)
-    call_x, call_router_logits, call_e_score_correction_bias, call_w3_w1, call_w2 = args
-    out = op(
-        call_x,
-        call_router_logits,
-        call_e_score_correction_bias,
-        call_w3_w1,
-        call_w2,
-        TOP_K,
-        ROUTED_SCALING_FACTOR,
-    )
+    out = op(*args, TOP_K, ROUTED_SCALING_FACTOR)
     torch.cuda.synchronize()
-    call_x, call_router_logits, call_e_score_correction_bias, call_w3_w1, call_w2 = args
     _compare(
         out,
-        op.reference(
-            call_x,
-            call_router_logits,
-            call_e_score_correction_bias,
-            call_w3_w1,
-            call_w2,
-            TOP_K,
-            ROUTED_SCALING_FACTOR,
-        ),
+        op.reference(*args, TOP_K, ROUTED_SCALING_FACTOR),
     )
 
 
@@ -132,7 +116,9 @@ def test_cuda_graph_replay_matches_eager(tokens, inter) -> None:
     assert not torch.equal(out, eager), "the replay must have read the new inputs"
 
 
-def _small(hidden=2048, inter=64, tokens=1):
+def _small(
+    hidden=2048, inter=64, tokens=1
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Operands of the right layout at a small supported shape.
 
     The weights stay uninitialized: only the refusals, which happen before any launch, are exercised.
@@ -149,51 +135,20 @@ def test_refuses_more_than_six_tokens() -> None:
     """Verify rows need another MoE path; no silent token-zero-only result."""
     with pytest.raises(RuntimeError, match="takes 1 to 6 tokens"):
         with validating(op):
-            call_x, call_router_logits, call_e_score_correction_bias, call_w3_w1, call_w2 = _small(
-                tokens=7
-            )
-            op(
-                call_x,
-                call_router_logits,
-                call_e_score_correction_bias,
-                call_w3_w1,
-                call_w2,
-                TOP_K,
-                ROUTED_SCALING_FACTOR,
-            )
+            op(*_small(tokens=7), TOP_K, ROUTED_SCALING_FACTOR)
 
 
 def test_refuses_an_expert_slice_it_does_not_serve() -> None:
     """The FC2 kernel walks the expert slice in 64-element K steps."""
     with pytest.raises(RuntimeError, match="unsupported hidden size"):
         with validating(op):
-            call_x, call_router_logits, call_e_score_correction_bias, call_w3_w1, call_w2 = _small(
-                inter=96
-            )
-            op(
-                call_x,
-                call_router_logits,
-                call_e_score_correction_bias,
-                call_w3_w1,
-                call_w2,
-                TOP_K,
-                ROUTED_SCALING_FACTOR,
-            )
+            op(*_small(inter=96), TOP_K, ROUTED_SCALING_FACTOR)
 
 
 def test_refuses_another_top_k() -> None:
     with pytest.raises(RuntimeError, match="top-8"):
         with validating(op):
-            call_x, call_router_logits, call_e_score_correction_bias, call_w3_w1, call_w2 = _small()
-            op(
-                call_x,
-                call_router_logits,
-                call_e_score_correction_bias,
-                call_w3_w1,
-                call_w2,
-                6,
-                ROUTED_SCALING_FACTOR,
-            )
+            op(*_small(), 6, ROUTED_SCALING_FACTOR)
 
 
 def test_refuses_a_misaligned_token() -> None:
@@ -211,16 +166,7 @@ def test_refuses_a_misaligned_token() -> None:
 def test_multi_matches_single_rows_bitwise(tokens, inter) -> None:
     args = _build(dict(tokens=tokens, hidden=6144, inter=inter, routing="random"), seed=32 + tokens)
     x, logits, bias, w3_w1, w2 = args
-    call_x, call_router_logits, call_e_score_correction_bias, call_w3_w1, call_w2 = args
-    multi = op(
-        call_x,
-        call_router_logits,
-        call_e_score_correction_bias,
-        call_w3_w1,
-        call_w2,
-        TOP_K,
-        ROUTED_SCALING_FACTOR,
-    )
+    multi = op(*args, TOP_K, ROUTED_SCALING_FACTOR)
     single = torch.cat(
         [
             op(x[r : r + 1], logits[r : r + 1], bias, w3_w1, w2, TOP_K, ROUTED_SCALING_FACTOR)

@@ -138,7 +138,7 @@ def _make_inputs(
     decode_query_len=1,
     topk=MSA_REQUIRED_TOPK,
     seed=0,
-):
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build (q, k_paged, v_paged, topk_idx, block_table, seq_lens), in that order.
 
     The order matches both the kernel wrapper and the oracle, so a test can
@@ -370,16 +370,7 @@ def test_sparse_decode_matches_reference(kv_dtype, num_kv_heads, group, decode_q
         group=group,
         decode_query_len=decode_query_len,
     )
-    call_q, call_k_paged, call_v_paged, call_topk_idx, call_block_table, call_seq_lens = inputs
-    out = _run(
-        call_q,
-        call_k_paged,
-        call_v_paged,
-        call_topk_idx,
-        call_block_table,
-        call_seq_lens,
-        decode_query_len,
-    )
+    out = _run(*inputs, decode_query_len)
     expected = _reference_sparse_decode(
         *inputs, sm_scale=HEAD_DIM**-0.5, decode_query_len=decode_query_len
     )
@@ -443,28 +434,8 @@ def test_sparse_decode_split_k_invariant(num_topk_chunks):
     """
     seq_lens = [4097, 300, 8192]
     inputs = _make_inputs(seq_lens, kv_dtype=torch.float8_e4m3fn, num_kv_heads=2, group=8, seed=7)
-    call_q, call_k_paged, call_v_paged, call_topk_idx, call_block_table, call_seq_lens = inputs
-    reference = _run(
-        call_q,
-        call_k_paged,
-        call_v_paged,
-        call_topk_idx,
-        call_block_table,
-        call_seq_lens,
-        1,
-        num_topk_chunks=1,
-    )
-    call_q, call_k_paged, call_v_paged, call_topk_idx, call_block_table, call_seq_lens = inputs
-    out = _run(
-        call_q,
-        call_k_paged,
-        call_v_paged,
-        call_topk_idx,
-        call_block_table,
-        call_seq_lens,
-        1,
-        num_topk_chunks=num_topk_chunks,
-    )
+    reference = _run(*inputs, 1, num_topk_chunks=1)
+    out = _run(*inputs, 1, num_topk_chunks=num_topk_chunks)
     torch.testing.assert_close(out.float(), reference.float(), rtol=1e-2, atol=1e-2)
 
 
@@ -479,10 +450,7 @@ def test_sparse_decode_ignores_padded_topk_entries():
     topk_idx = inputs[3]
     assert (topk_idx == -1).any()
 
-    call_q, call_k_paged, call_v_paged, call_topk_idx, call_block_table, call_seq_lens = inputs
-    out = _run(
-        call_q, call_k_paged, call_v_paged, call_topk_idx, call_block_table, call_seq_lens, 1
-    )
+    out = _run(*inputs, 1)
     expected = _reference_sparse_decode(*inputs, sm_scale=HEAD_DIM**-0.5, decode_query_len=1)
     torch.testing.assert_close(out.float(), expected, rtol=3e-2, atol=3e-2)
 
@@ -495,10 +463,7 @@ def test_sparse_decode_zero_length_rows_are_zero_not_nan():
     """
     seq_lens = [1024, 0, 512, 0]
     inputs = _make_inputs(seq_lens, kv_dtype=torch.float8_e4m3fn, seed=21)
-    call_q, call_k_paged, call_v_paged, call_topk_idx, call_block_table, call_seq_lens = inputs
-    out = _run(
-        call_q, call_k_paged, call_v_paged, call_topk_idx, call_block_table, call_seq_lens, 1
-    )
+    out = _run(*inputs, 1)
 
     assert torch.isfinite(out).all()
     assert torch.equal(out[1], torch.zeros_like(out[1]))
@@ -573,17 +538,7 @@ def test_sparse_decode_bf16_cache_zero_length_rows_are_zero_not_nan() -> None:
     inputs = _make_inputs(seq_lens, kv_dtype=torch.bfloat16, seed=75)
     for num_topk_chunks in (None, 1):
         kwargs = {} if num_topk_chunks is None else {"num_topk_chunks": num_topk_chunks}
-        call_q, call_k_paged, call_v_paged, call_topk_idx, call_block_table, call_seq_lens = inputs
-        out = _run(
-            call_q,
-            call_k_paged,
-            call_v_paged,
-            call_topk_idx,
-            call_block_table,
-            call_seq_lens,
-            1,
-            **kwargs,
-        )
+        out = _run(*inputs, 1, **kwargs)
         assert torch.isfinite(out).all()
         assert torch.equal(out[1], torch.zeros_like(out[1]))
         assert torch.equal(out[3], torch.zeros_like(out[3]))

@@ -194,7 +194,7 @@ def _shard_tp_weights(ref_attn, tp_attn, tp_rank, tp_size, qkv_mode=QKVMode.FUSE
 # =============================================================================
 
 
-def _wb(module):
+def _wb(module) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Return (weight, bias_or_None) for a Linear module."""
     return module.weight.data, (module.bias.data if module.bias is not None else None)
 
@@ -310,17 +310,11 @@ def _run_tp_with_params(
         else:
             ref_out = _manual_attention(x, qkv_w, qkv_b, out_w, out_b, num_heads, head_dim)
     else:
-        call_q_w, call_q_b = _wb(attn_ref.to_q)
-        call_k_w, call_k_b = _wb(attn_ref.to_k)
-        call_v_w, call_v_b = _wb(attn_ref.to_v)
         ref_out = _manual_attention_separate(
             x,
-            call_q_w,
-            call_q_b,
-            call_k_w,
-            call_k_b,
-            call_v_w,
-            call_v_b,
+            *_wb(attn_ref.to_q),
+            *_wb(attn_ref.to_k),
+            *_wb(attn_ref.to_v),
             out_w,
             out_b,
             num_heads,

@@ -49,7 +49,11 @@ def _rope_table(positions: int) -> torch.Tensor:
     return torch.cat([ang.cos(), ang.sin()], dim=1).float().cuda().contiguous()
 
 
-def _build(spec, seed):
+def _build(
+    spec, seed
+) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float, torch.Tensor, torch.Tensor
+]:
     """`(q, position_ids, cos_sin, wq, weight_scale, q_fp8_out, weights_out)` for one cell.
 
     Both outputs start poisoned, so a row the kernel skipped cannot pass. With `wq_pitch`
@@ -151,8 +155,7 @@ def test_a_fresh_launch_overwrites_every_row() -> None:
     kw = dict(is_neox=False, compiled=_compiled(False))
     out_fp8, out_w = first[5], first[6]
     op(*first, **kw)
-    call_q, call_position_ids, call_cos_sin, call_wq, call_weight_scale = second[:5]
-    op(call_q, call_position_ids, call_cos_sin, call_wq, call_weight_scale, out_fp8, out_w, **kw)
+    op(*second[:5], out_fp8, out_w, **kw)
     _compare((out_fp8, out_w), op.reference(*second, **kw))
 
 

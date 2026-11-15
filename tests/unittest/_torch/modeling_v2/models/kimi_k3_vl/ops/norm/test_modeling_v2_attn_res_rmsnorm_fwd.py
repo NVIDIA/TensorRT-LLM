@@ -43,7 +43,9 @@ INPUT_NAMES = ("layer_residual", "block_residual", "res_weight", "rms_weight", "
 _FAMILY = "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl"
 
 
-def _make_inputs(num_tokens: int, num_candidates: int, seed: int = 0) -> tuple[torch.Tensor, ...]:
+def _make_inputs(
+    num_tokens: int, num_candidates: int, seed: int = 0
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Inputs at the scales of main's op test, seeded by the cell."""
     torch.manual_seed(seed)
     layer_residual = (
@@ -83,54 +85,9 @@ def _check(cell) -> None:
     inputs = _make_inputs(num_tokens, num_candidates, zlib.crc32(cell.why.encode()) % 2**31)
     before = [tensor.clone() for tensor in inputs]
     with validating(attn_res_rmsnorm_fwd):
-        (
-            call_layer_residual,
-            call_block_residual,
-            call_res_weight,
-            call_rms_weight,
-            call_output_rms_weight,
-        ) = inputs
-        output = attn_res_rmsnorm_fwd(
-            call_layer_residual,
-            call_block_residual,
-            call_res_weight,
-            call_rms_weight,
-            call_output_rms_weight,
-            rms_eps,
-            output_rms_eps,
-        )
-        (
-            call_layer_residual,
-            call_block_residual,
-            call_res_weight,
-            call_rms_weight,
-            call_output_rms_weight,
-        ) = inputs
-        repeat = attn_res_rmsnorm_fwd(
-            call_layer_residual,
-            call_block_residual,
-            call_res_weight,
-            call_rms_weight,
-            call_output_rms_weight,
-            rms_eps,
-            output_rms_eps,
-        )
-    (
-        call_layer_residual,
-        call_block_residual,
-        call_res_weight,
-        call_rms_weight,
-        call_output_rms_weight,
-    ) = inputs
-    expected = attn_res_rmsnorm_fwd.reference(
-        call_layer_residual,
-        call_block_residual,
-        call_res_weight,
-        call_rms_weight,
-        call_output_rms_weight,
-        rms_eps,
-        output_rms_eps,
-    )
+        output = attn_res_rmsnorm_fwd(*inputs, rms_eps, output_rms_eps)
+        repeat = attn_res_rmsnorm_fwd(*inputs, rms_eps, output_rms_eps)
+    expected = attn_res_rmsnorm_fwd.reference(*inputs, rms_eps, output_rms_eps)
 
     cell = f"T={num_tokens} N={num_candidates} eps=({rms_eps}, {output_rms_eps})"
     assert output.shape == (num_tokens, 1, HIDDEN_SIZE), f"{cell}: shape {tuple(output.shape)}"
@@ -157,41 +114,11 @@ def test_cuda_graph_replay_matches_eager() -> None:
     """One cell per kernel: a call captured in a CUDA graph replays the eager call's bits."""
     for num_tokens, num_candidates in ((1, 4), (1, 9), (8, 5)):
         inputs = _make_inputs(num_tokens, num_candidates)
-        (
-            call_layer_residual,
-            call_block_residual,
-            call_res_weight,
-            call_rms_weight,
-            call_output_rms_weight,
-        ) = inputs
-        eager = attn_res_rmsnorm_fwd(
-            call_layer_residual,
-            call_block_residual,
-            call_res_weight,
-            call_rms_weight,
-            call_output_rms_weight,
-            RMS_EPS,
-            RMS_EPS,
-        )
+        eager = attn_res_rmsnorm_fwd(*inputs, RMS_EPS, RMS_EPS)
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            (
-                call_layer_residual,
-                call_block_residual,
-                call_res_weight,
-                call_rms_weight,
-                call_output_rms_weight,
-            ) = inputs
-            captured = attn_res_rmsnorm_fwd(
-                call_layer_residual,
-                call_block_residual,
-                call_res_weight,
-                call_rms_weight,
-                call_output_rms_weight,
-                RMS_EPS,
-                RMS_EPS,
-            )
+            captured = attn_res_rmsnorm_fwd(*inputs, RMS_EPS, RMS_EPS)
         # One replay before the poison: under cudaMallocAsync the captured output is a graph allocation, backed by
         # memory only once the graph has run.
         graph.replay()

@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import json
 import math
 import os
@@ -769,26 +784,3 @@ def test_rocket_add_dummy_requests_forwards_capture_sampling_params(mocker):
     mgr.add_dummy_requests([123], capture_sampling_params=sampling_params)
 
     assert base_add_dummy_requests.call_args.kwargs["capture_sampling_params"] is sampling_params
-
-
-if __name__ == "__main__":
-    # RocketKV e2e tests
-    print("=== Testing RocketKV E2E tests ===")
-    with pytest.MonkeyPatch.context() as monkeypatch:
-        test_model("pytorch", "llama-3.1-model/Llama-3.1-8B-Instruct", "VANILLA", monkeypatch)
-    with pytest.MonkeyPatch.context() as monkeypatch:
-        test_model("pytorch", "llama-3.1-model/Llama-3.1-8B-Instruct", "TRTLLM", monkeypatch)
-
-    # Unit tests for sparse_kv_predict
-    print("\n=== Testing sparse_kv_predict ===")
-    test_sparse_kv_predict(1, 1)  # bs=1, context only
-    test_sparse_kv_predict(2, 2)  # bs=2, context only
-    test_sparse_kv_predict(6, 3)  # bs=6, mixed (3 ctx + 3 gen)
-
-    # Unit tests for sparse_attn_predict
-    print("\n=== Testing sparse_attn_predict ===")
-    test_sparse_attn_predict(1, 0)  # bs=1, generation only
-    test_sparse_attn_predict(2, 0)  # bs=2, generation only
-    test_sparse_attn_predict(3, 0)  # bs=3, generation only
-    test_sparse_attn_predict(5, 3)  # bs=5, mixed (3 ctx + 2 gen)
-    test_sparse_attn_predict(6, 2)  # bs=6, mixed (2 ctx + 4 gen)

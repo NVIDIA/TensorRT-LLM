@@ -63,6 +63,8 @@ and its heavy dependency chain (which would create import cycles with
 import importlib
 from typing import TYPE_CHECKING
 
+# Static re-exports expose lazily loaded symbols to type checkers only.
+# Add public sampler symbols here when annotations need them through this package.
 if TYPE_CHECKING:
     from .sampler import SampleState as SampleState
     from .sampler import SampleStateTensors as SampleStateTensors
