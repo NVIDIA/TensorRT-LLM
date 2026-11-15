@@ -224,6 +224,15 @@ def test_coordinator_rejects_unknown_role():
         coordinator._router_for_role("typo")
 
 
+def test_coordinator_rejects_non_loopback_http_cluster_storage():
+    config = _make_config([], [], "round_robin", "round_robin")
+    config.hostname = "0.0.0.0"
+    config.disagg_cluster_config = DisaggClusterConfig(cluster_uri="http://127.0.0.1:18000")
+
+    with pytest.raises(ValueError, match="loopback-only"):
+        DisaggCoordinatorService(config, _client_factory)
+
+
 def test_kv_router_rejects_mixed_prepared_hash_algorithms():
     router = KvCacheAwareRouter(server_role=ServerRole.CONTEXT, servers=["server-a", "server-b"])
     router._prepared_ready_servers.update(router.servers)

@@ -7,12 +7,13 @@
 Usage, in the tree under test with that tree's python (standard library and
 pytest only, so it runs by path in any job)::
 
-    <python> test_driver.py run --cache DIR [--repo TREE] [--selection FILE] [ITEM ...] [-- PYTEST ARGS]
+    <python> test_driver.py run --cache DIR [--repo TREE] [--selection FILE] [--skip FILE] [ITEM ...] [-- PYTEST ARGS]
 
 ``run`` takes test files and node ids (``ITEM``, or one per line in
 ``--selection``) and runs one pytest process per test file, a ``session``
 each: a file that brings its process down loses only its own results, and a
-job cut short keeps every file it finished.
+job cut short keeps every file it finished. ``--skip`` lists node ids, one per
+line, to leave out of those files: they run nowhere and record nothing.
 
 A session writes one JSON record to ``<cache>/sessions/``: the tree's commit
 and whether its tracked files were clean, the environment and its digest, the
@@ -170,7 +171,7 @@ def _message(report) -> str:
     return (lines[0] if lines else "")[:400]
 
 
-def _plugin(record: dict, repo: str, selected: set[str] | None):
+def _plugin(record: dict, repo: str, selected: set[str] | None, skipped: set[str]):
     import pytest
 
     tests: dict[str, dict] = record["tests"]
@@ -194,13 +195,14 @@ def _plugin(record: dict, repo: str, selected: set[str] | None):
                 ids[item.nodeid] = repo_id(item.path, item.nodeid)
                 file, _, name = ids[item.nodeid].partition("::")
                 record["collected"].setdefault(file, []).append(name)
-            if selected is None:
+            if selected is None and not skipped:
                 return
-            files = {s for s in selected if "::" not in s}
+            files = {s for s in selected if "::" not in s} if selected is not None else set()
             keep, drop = [], []
             for item in items:
                 rid = ids[item.nodeid]
-                (keep if rid in selected or rid.partition("::")[0] in files else drop).append(item)
+                chosen = selected is None or rid in selected or rid.partition("::")[0] in files
+                (keep if chosen and rid not in skipped else drop).append(item)
             if drop:
                 config.hook.pytest_deselected(items=drop)
                 items[:] = keep
@@ -274,6 +276,7 @@ def session(args: argparse.Namespace) -> int:
         "collected": {},
     }
     selected = set(_read_selection(args.select, [])) if args.select else None
+    skipped = set(_read_selection(args.skip, [])) if args.skip else set()
     # As `python -m pytest` from the tree: the tree first on sys.path, this
     # script's directory nowhere on it.
     here = os.path.dirname(os.path.abspath(__file__))
@@ -282,7 +285,9 @@ def session(args: argparse.Namespace) -> int:
     os.chdir(repo)
     import pytest
 
-    code = int(pytest.main(list(args.pytest_args), plugins=[_plugin(record, repo, selected)]))
+    code = int(
+        pytest.main(list(args.pytest_args), plugins=[_plugin(record, repo, selected, skipped)])
+    )
     record["exit_code"] = code
     record["ended"] = _now()
     path = _write(args.cache, record)
@@ -318,6 +323,8 @@ def run(args: argparse.Namespace) -> int:
             with open(select, "w", encoding="utf-8") as handle:
                 handle.write("\n".join(items) + "\n")
             command += ["--select", select]
+        if args.skip:
+            command += ["--skip", os.path.abspath(args.skip)]
         command += ["--", *args.pytest_args, file]
         print(
             f"testcache: {file}: {'whole file' if whole else f'{len(items)} test(s)'}", flush=True
@@ -353,6 +360,7 @@ def _parse(argv: list[str]) -> argparse.Namespace:
             p.add_argument("items", nargs="*", help="Test files and node ids.")
         else:
             p.add_argument("--select", default="", help="Keep only these node ids.")
+        p.add_argument("--skip", default="", help="A file of node ids to leave out.")
     if "--" in argv:
         at = argv.index("--")
         args = parser.parse_args(argv[:at])

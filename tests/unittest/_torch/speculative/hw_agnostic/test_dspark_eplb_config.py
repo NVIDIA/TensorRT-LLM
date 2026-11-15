@@ -65,6 +65,7 @@ def _model_config(lb_config=None, num_hidden_layers=NUM_HIDDEN_LAYERS):
         mapping=Mapping(),
         max_num_tokens=8192,
         moe_max_num_tokens=8192,
+        use_cute_dsl_blockscaling_mm=False,
         # Forwarded to the drafter so its position table is sized by what the
         # runtime serves rather than max_position_embeddings. A real
         # ModelConfig always carries it, so the helper reads it unguarded.

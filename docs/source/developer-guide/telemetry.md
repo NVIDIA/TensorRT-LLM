@@ -32,7 +32,7 @@ unset or when the safety sanitizer rejects the runtime value.
 
 ### `TorchLlmArgs`
 
-333 captured fields.
+335 captured fields.
 
 | Captured key | Capture policy | Kind | Categorical domain |
 |--------------|----------------|------|--------------------|
@@ -285,6 +285,8 @@ unset or when the safety sanitizer rejects the runtime value.
 | `sparse_attention_config.indexer_rope_interleave` | `bool` | `value` |  |
 | `sparse_attention_config.kernel_size` | `int\|none` | `value` |  |
 | `sparse_attention_config.kt_cache_dtype` | `allowlist\|none` | `categorical` | `bfloat16`, `float8_e5m2` |
+| `sparse_attention_config.kv_cache_offload_config.gpu_cache_factor` | `float` | `value` |  |
+| `sparse_attention_config.kv_cache_offload_config.host_history_size` | `int\|none` | `value` |  |
 | `sparse_attention_config.num_attention_heads` | `int\|none` | `value` |  |
 | `sparse_attention_config.num_key_value_heads` | `int\|none` | `value` |  |
 | `sparse_attention_config.page_size` | `int\|none` | `value` |  |

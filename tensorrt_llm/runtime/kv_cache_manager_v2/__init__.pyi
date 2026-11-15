@@ -370,6 +370,11 @@ class SparseCacheConfig:
     shared memory on the current device.
     """
 
+    @property
+    def max_unit_ordinal(self) -> int:
+        """Largest zero-based unit ordinal supported by the sparse probe index."""
+        ...
+
     num_selected_blocks: int
     """Selection width: units a sparse-attention step selects for this layer."""
 
@@ -413,6 +418,7 @@ class ReusePolicy(enum.IntEnum):
     REQUIRED = 0
     PRIVATE = 1
     OPTIONAL = 2
+    SINK_REQUIRED_ONLY = 3
 
 @dataclass(slots=True)
 class AttentionLayerConfig:
@@ -452,6 +458,39 @@ class SsmLayerConfig:
     reuse_policy: ReusePolicy = ReusePolicy.REQUIRED
 
 LayerConfig = AttentionLayerConfig | SsmLayerConfig
+
+class RegionAllocationUnit(enum.IntEnum):
+    # One slot per KV cache and beam, held for the cache's lifetime.
+    REQUEST = 0
+    # One page per token block. Not supported yet.
+    TOKEN_BLOCK = 1
+
+@dataclass(slots=True)
+class RegionBuffer:
+    """One buffer of a region; the layer id places it in the per-layer address space."""
+
+    layer_id: LayerId
+    buffer: BufferConfig
+
+@dataclass(slots=True)
+class RegionConfig:
+    """Buffers that share a life cycle of the region's own, never merged with another one.
+
+    Only REQUEST regions with the PRIVATE reuse policy are supported: one slot per living
+    KV cache and beam, never published for reuse, returned when the cache closes. Each
+    buffer sits on a layer that has an SsmLayerConfig and sets no reuse policy of its own.
+
+    ``fixed_slot_count`` set gives the region a pool group of its own with exactly that many
+    GPU slots, which ratio-based sizing (construction, resize(), adjust() and the tuner)
+    leaves alone; a GPU quota too small to hold it is raised. None sizes it by ratio.
+    """
+
+    name: str
+    buffers: list[RegionBuffer]
+    allocation_unit: RegionAllocationUnit = RegionAllocationUnit.REQUEST
+    reuse_policy: ReusePolicy = ReusePolicy.PRIVATE
+    fixed_slot_count: int | None = None
+    def validate(self) -> None: ...
 
 @dataclass(slots=True)
 class KVCacheDesc:
@@ -509,6 +548,9 @@ class KVCacheManagerConfig:
     # gives way between them. The two can only conflict if the floors alone exceed this
     # budget, which construction rejects.
     host_sparse_pool_quota: int | None = None
+    # Regions, each with a life cycle of its own, numbered after every layer life cycle in
+    # declaration order. A (layer, role) pair belongs to one layer config or one region.
+    regions: list[RegionConfig] = ...
     @property
     def enable_swa_scratch_reuse(self) -> bool: ...
 
@@ -828,7 +870,6 @@ class _KVCache:
     def resume(
         self,
         cuda_stream: CudaStream | None = None,
-        is_decoding: bool | None = None,
         optional_reuse_groups: Sequence[LayerGroupId] | None = None,
     ) -> bool:
         """Lock this cache's pages at their required levels.
@@ -839,10 +880,6 @@ class _KVCache:
 
         Takes no sparse cache arena lease: that follows membership, so a request receiving
         its history costs the GPU cache nothing until it is seated.
-
-        ``is_decoding`` is accepted and ignored. Resuming no longer distinguishes a decoding
-        request; the parameter is kept so callers that still pass it keep working, and goes
-        with the full sparse attention support.
         """
     def prefetch(self, target: CacheLevel) -> bool: ...
     def get_swa_scratch_range(self, layer_group_id: LayerGroupId) -> HalfOpenRange:
@@ -957,11 +994,6 @@ class HalfOpenRange:
     def __len__(self) -> int: ...
     def __eq__(self, other: object) -> bool: ...
 
-class ScratchDesc:
-    range: HalfOpenRange
-    slot_ids: Sequence[int]
-    def __bool__(self) -> bool: ...
-
 @dataclass(slots=True, frozen=True)
 class PageIndexConverter:
     scale: int
@@ -973,7 +1005,7 @@ class PageIndexConverter:
         self,
         base_indices: Sequence[int],
         index_mode: PageIndexMode | None = None,
-        scratch_range: HalfOpenRange | ScratchDesc | None = None,
+        scratch_range: HalfOpenRange | None = None,
         scratch_slots: Sequence[int] = (),
     ) -> list[int]: ...
 
@@ -1319,10 +1351,17 @@ class Batch:
         after**: a block must be in its host page before it can be selected, and
         :meth:`_KVCache.resize` refuses a history this has not covered.
 
-        Bounded by the capacity each row started from, not by how far history travels, so
-        a resumed request moving history across a whole prompt writes back nothing -- its
-        units reached their host pages directly rather than through a cell. A move wider
-        than the in-flight headroom is refused.
+        Only flush a history that is final -- one the row is going to take up. A history
+        past the row's capacity is refused: those units were never written, so they have
+        no cell to write back from.
+
+        Bounded by what was in flight, not by how far history travels, so a resumed request
+        moving history across a whole prompt writes back nothing -- its units reached their
+        host pages directly rather than through a cell. The bound is aggregate: the units
+        crossed, summed over rows, must fit the per-layer write-back list, which is sized
+        from ``max_total_input_tokens``. One prefilling row may therefore use the budget
+        several decoding rows leave unspent, and a batch that exceeds it is refused before
+        any work is issued.
 
         Reads the index table as of the last :meth:`publish`, which covers the blocks in
         range because they were allocated by an earlier step.
@@ -1538,10 +1577,12 @@ class Batch:
         which member is passed makes no difference -- but it must still be a whole
         layer's sparse buffers, as :meth:`fetch_sparse_pages` requires.
 
-        The miss list this leaves behind is read by every :meth:`fetch_resolved_pages`
-        that follows and is overwritten by the next resolve of the same selection, so
-        fetch each member layer before resolving the selection again. Both run on
-        ``stream``, so that ordering is the caller's only across streams.
+        The miss list and per-slot cell mapping this leaves behind are read by every
+        :meth:`fetch_resolved_pages` that follows, and they belong to the life cycle rather
+        than to the selection: the next resolve of *any* selection in the same life cycle
+        overwrites them. Fetch every member layer before resolving another selection there,
+        or those fetches copy the later selection's units. Both run on ``stream``, so that
+        ordering is the caller's only across streams.
         """
 
     def fetch_resolved_pages(
@@ -1878,6 +1919,8 @@ class KVCacheManager:
     # Deprecated: use get_buffer_group_id. Raises RuntimeError for a split layer.
     def get_layer_group_id(self, layer_id: LayerId) -> LayerGroupId: ...
     def get_buffer_group_id(self, layer_id: LayerId, role: DataRole) -> CacheGroupId: ...
+    # Raises IndexError for a name no region declares.
+    def get_region_group_id(self, name: str) -> CacheGroupId: ...
     # Deprecated: use buffer_grouping. Raises RuntimeError if any layer is split.
     @property
     def layer_grouping(self) -> Sequence[Sequence[LayerId]]: ...

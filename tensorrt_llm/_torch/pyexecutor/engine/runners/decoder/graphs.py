@@ -25,6 +25,7 @@ from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
 )
 from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner
+from tensorrt_llm._torch.pyexecutor.config_utils import is_decode_only
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner, KeyType
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, get_draft_token_length
@@ -56,7 +57,7 @@ from ..common import get_top_level_model, prepare_multimodal_indices
 from .config import DecoderRunnerConfig
 from .dummy_requests import DummyRequestFactory
 from .inputs import DecoderInputPreparer
-from .metadata import DecoderMetadata, resolve_mamba_metadata_cls
+from .metadata import DecoderMetadata, resolve_mamba_metadata_cls, supports_advanced_draft_sampling
 from .warmup import WarmupAgreement
 
 # Context requests per warmup batch whose breakable prefill graph breaks get
@@ -924,7 +925,8 @@ class DecoderCudaGraphs:
             # Dummy warmup requests carry no sampling params, so the greedy pass
             # needs no override while the advanced one has to force the flag.
             _capture_variant("greedy")
-            _capture_variant("advanced sampling", force_non_greedy=True)
+            if supports_advanced_draft_sampling(self._config.spec_config):
+                _capture_variant("advanced sampling", force_non_greedy=True)
             if temperature_only_graphs:
                 # Temperature-only batches replay the vocabulary-sharded Gumbel-max
                 # target sampling (the advanced pass records the stock sampler: its
@@ -1010,6 +1012,12 @@ class DecoderCudaGraphs:
             self._config.prefill_cuda_graph_backend == PrefillCudaGraphBackend.PIECEWISE
             and not self._config.torch_compile_enabled
         ):
+            return
+        if is_decode_only(self.sparse_attention_config):
+            logger.warning(
+                "Skipping prefill CUDA graph capture: this worker serves "
+                "decode only and never runs a context batch."
+            )
             return
 
         logger.info("Running prefill CUDA graph warmup...")

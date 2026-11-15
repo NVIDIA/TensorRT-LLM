@@ -70,10 +70,9 @@ def _make_decoder_runner(
         model.extra_attrs = {}
         model.model_config = SimpleNamespace(pretrained_config=SimpleNamespace(rope_scaling=None))
     else:
-        model = SimpleNamespace(
-            extra_attrs={},
-            model_config=SimpleNamespace(pretrained_config=SimpleNamespace(rope_scaling=None)),
-        )
+        model = torch.nn.Module()
+        model.extra_attrs = {}
+        model.model_config = SimpleNamespace(pretrained_config=SimpleNamespace(rope_scaling=None))
     outputs = {"logits": object()}
     backend = Mock()
     backend.enabled = runner_enabled
@@ -417,6 +416,105 @@ class DecoderGraphForwardTestCase(unittest.TestCase):
                 else:
                     breakable_runner.execute.assert_called_once()
                     engine._forward_step.assert_not_called()
+
+    def test_context_logits_plan_runs_unpadded_batch(self) -> None:
+        """A bounded context-logits plan never sees decode-graph padding rows.
+
+        The plan derives its generation-row count from the hidden-state rows,
+        so the forward must run the scheduled batch rather than the batch
+        padded up to a captured graph size.
+        """
+        for has_plan in (True, False):
+            with self.subTest(has_plan=has_plan):
+                key = KeyType(batch_size=4, draft_len=0)
+                engine, graph_runner, resource_manager, _, _ = _make_decoder_runner(key)
+                context = _make_request_stub(1)
+                # A multi-row chunk is not promoted to a decode row, so the plan
+                # stays active.
+                context.context_chunk_size = 4
+                context.context_remaining_length = 4
+                context.context_current_position = 0
+                context.py_return_context_logits = True
+                batch = ScheduledRequests()
+                batch.context_requests_last_chunk = [context]
+                batch.generation_requests = [_make_request_stub(2)]
+                padded = ScheduledRequests()
+                padded.context_requests_last_chunk = [context]
+                padded.generation_requests = [
+                    *batch.generation_requests,
+                    _make_request_stub(3),
+                    _make_request_stub(4),
+                ]
+                graph_runner.pad_batch.side_effect = lambda *_args: nullcontext(padded)
+                plan = Mock(handled=False) if has_plan else None
+
+                with (
+                    patch.object(
+                        decoder_runner_module.ContextLogitsPlan, "for_batch", return_value=plan
+                    ),
+                    patch(
+                        "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs.torch.cuda.Event",
+                        return_value=Mock(),
+                    ),
+                ):
+                    engine.forward(
+                        ScheduledInputs(batch=batch, gather_context_logits=True),
+                        resource_manager=resource_manager,
+                    )
+
+                self.assertIs(graph_runner.maybe_get_cuda_graph.call_args.args[0], padded)
+                executed = engine._inputs.prepare_inputs.call_args.args[0]
+                if has_plan:
+                    self.assertIs(executed, batch)
+                    graph_runner.replay.assert_not_called()
+                    engine._forward_step.assert_called_once()
+                else:
+                    self.assertIs(executed, padded)
+                    graph_runner.replay.assert_called_once()
+
+    def test_context_logits_plan_bypasses_piecewise_compile(self) -> None:
+        """A bounded context-logits plan runs eagerly instead of a padded compiled prefill."""
+        for has_plan in (True, False):
+            with self.subTest(has_plan=has_plan):
+                engine, _, resource_manager, _, outputs = _make_decoder_runner(
+                    None, compile_only_piecewise_graphs=True
+                )
+                eager = torch.nn.Identity()
+                compiled = torch.nn.Identity()
+                eager.forward = Mock(return_value=outputs)
+                compiled.forward = Mock(return_value=outputs)
+                wrapper = PrefillCompiledModel(eager, compiled)
+                engine._model.model = wrapper
+                engine._forward_step.side_effect = lambda *args, **kwargs: wrapper()
+                context = _make_request_stub(1)
+                context.py_return_context_logits = True
+                batch = ScheduledRequests()
+                batch.context_requests_last_chunk = [context]
+                plan = Mock(handled=False) if has_plan else None
+
+                with (
+                    patch.object(
+                        decoder_runner_module.ContextLogitsPlan, "for_batch", return_value=plan
+                    ),
+                    patch(
+                        "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs.torch.cuda.Event",
+                        return_value=Mock(),
+                    ),
+                    patch(
+                        "tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner.get_per_request_prefill_cuda_graph_flag",
+                        return_value=True,
+                    ),
+                ):
+                    engine.forward(
+                        ScheduledInputs(batch=batch, gather_context_logits=True),
+                        resource_manager=resource_manager,
+                    )
+
+                selected = eager.forward if has_plan else compiled.forward
+                other = compiled.forward if has_plan else eager.forward
+                selected.assert_called_once_with()
+                other.assert_not_called()
+                self.assertFalse(wrapper._bypass_active)
 
     def test_generation_only_forward_does_not_call_new_selector(self) -> None:
         key = KeyType(batch_size=1, draft_len=0)

@@ -452,6 +452,15 @@ class KVCacheManager(BaseResourceManager):
         enable_chunked_prefill: bool = False,
         **kwargs,
     ) -> None:
+        logger.warning_once(
+            f"KV cache manager V1 ({type(self).__name__}) is deprecated as of "
+            "TensorRT-LLM 1.4 (2026-11) and will be removed after the 3-month "
+            "migration period; it keeps working until then. Use KV cache "
+            "manager V2 (kv_cache_config.use_kv_cache_manager_v2=True, the "
+            "default) for supported features. Sleep mode, RocketKV, and "
+            "skip-softmax still require V1 until V2 support is available. See "
+            "https://github.com/NVIDIA/TensorRT-LLM#deprecation-policy",
+            key="deprecated_kv_cache_manager_v1")
         self.mapping = mapping
         self.dtype = dtype
         self.kv_cache_type = kv_cache_type
@@ -3025,6 +3034,11 @@ class KVCacheCompressionManager(BaseResourceManager):
     @property
     def has_independent_draft_kv_cache(self) -> bool:
         return self.draft_kv_cache_manager is not None
+
+    @property
+    def mixed_precision_high_window(self) -> Optional[tuple[int, int]]:
+        """``(first_n, last_n)`` tokens per sequence left unquantized in cold tiers, else None."""
+        return None
 
     def create_cold_page_codec(
         self,

@@ -62,6 +62,7 @@ from .backends import (
 )
 from .backends.interface import AttentionBackend, PositionalEmbeddingParams, PredefinedAttentionMask
 from .backends.sparse.hooks import get_sparse_mla_hooks
+from .backends.sparse.mixed_precision_high_rows import store_mixed_precision_high_rows
 from .backends.utils import create_attention
 from .rotary_embedding import RotaryEmbedding
 
@@ -1217,6 +1218,19 @@ class MLA(nn.Module):
         latent_cache: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Dense MHA context path: expand KV via kv_b_proj and run attention."""
+        append_owned_kv = (
+            isinstance(attn_metadata, TrtllmAttentionMetadata)
+            and attn_metadata.helix_context_local_slots is not None
+        )
+        if append_owned_kv:
+            assert isinstance(self.mha, TrtllmAttention)
+            if self.mha.uses_fp4_mla_attention:
+                raise NotImplementedError(
+                    "Owner-only Helix prefill does not support dense FP4 MLA KV cache"
+                )
+            assert latent_cache is not None
+            self.mha.mla_rope_append_paged_kv_assign_q(q, latent_cache, attn_metadata)
+            k_pe = latent_cache[:, self.kv_lora_rank :]
         k = torch.empty_like(q).view(-1, self.num_context_heads, self.qk_head_dim)
         if self._use_kvbproj_strided_out():
             # Expand KV via per-head batched GEMMs that write k_nope directly
@@ -1261,7 +1275,7 @@ class MLA(nn.Module):
         # When rope_fusion=True (apply_rotary_emb=False), the rope portion
         # of k is left uninitialized here; the fused attention kernel
         # handles k_pe RoPE via latent_cache instead.
-        if self.apply_rotary_emb:
+        if self.apply_rotary_emb or append_owned_kv:
             k[..., self.qk_nope_head_dim :] = k_pe.view(-1, 1, self.qk_rope_head_dim)
         k = k.view(-1, self.num_context_heads * self.qk_head_dim)
 
@@ -1272,7 +1286,7 @@ class MLA(nn.Module):
             attn_metadata,
             forward_args=AttentionForwardArgs(
                 attention_input_type=AttentionInputType.context_only,
-                latent_cache=latent_cache,
+                latent_cache=None if append_owned_kv else latent_cache,
                 out_scale=self.out_scale,
                 output=output,
             ),
@@ -1540,6 +1554,11 @@ class MLA(nn.Module):
                 chunked_global_offset=chunked_global_offset,
                 chunked_max_seq_len=chunked_max_seq_len,
                 out_dtype=q.dtype,
+                helix_plan=(
+                    attn_metadata.helix_mla_chunk_plans[loop_idx]
+                    if attn_metadata.helix_mla_chunk_plans is not None
+                    else None
+                ),
             )
 
             # up proj to uncompressed kv
@@ -1738,6 +1757,17 @@ class MLA(nn.Module):
 
         if isinstance(self.mha, TrtllmAttention):
             assert isinstance(attn_metadata, TrtllmAttentionMetadata)
+            if attn_metadata.helix_context_local_slots is not None:
+                if self.mha.uses_fp4_mla_attention:
+                    raise NotImplementedError(
+                        "Owner-only Helix prefill does not support dense FP4 MLA KV cache"
+                    )
+                if attn_metadata.num_ctx_cached_tokens > 0 and (
+                    not attn_metadata.runtime_features.chunked_prefill or get_sm_version() < 100
+                ):
+                    raise NotImplementedError(
+                        "Helix cached context requires chunked prefill on SM100 or newer"
+                    )
             trtllm_attention = cast(TrtllmAttention, self.mha)
             # Warm up maybe_compiled_cat for both the chunked-prefill path and
             # the cached-kv path; without this, the cached-kv prefill
@@ -1992,6 +2022,16 @@ class MLA(nn.Module):
                             quant_q_buffer,
                             **fp4_rope_kwargs,
                         )
+                        if getattr(attn_metadata, "has_mixed_precision_high_rows", False):
+                            # The fused kernel wrote the NVFP4 pool; also write the
+                            # mixed-precision high pool.
+                            store_mixed_precision_high_rows(
+                                self.mqa,
+                                attn_metadata,
+                                latent_cache,
+                                position_ids,
+                                is_generation=True,
+                            )
 
             if fuse_fp4_q_quant or use_fp8_mla:
                 rope_stream = None

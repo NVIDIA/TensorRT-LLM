@@ -1064,3 +1064,77 @@ def test_eager_decoder_layer_scope_keeps_module_call_fast_path(
     assert ("forward" in layer.__dict__) is instance_forward
     assert layer.forward == original_forward
     assert layer(output) is output
+
+
+@pytest.mark.parametrize("configured", [False, True])
+def test_preallocation_uses_metadata_without_dummy_storage(monkeypatch, configured):
+    from tensorrt_llm._torch.custom_ops.torch_custom_ops import AllReduceRunner
+
+    input_tensor = torch.ones((3, 8), dtype=torch.float32)
+    calls = []
+
+    def prepare(*args):
+        calls.append(args)
+        return len(calls) > 1
+
+    monkeypatch.setattr(torch.ops.trtllm.preallocate_nccl_window_buffer, "bytes", prepare)
+
+    def reject_dummy_allocation(*args, **kwargs):
+        pytest.fail("Preallocation must not allocate a dummy tensor")
+
+    monkeypatch.setattr(torch, "empty", reject_dummy_allocation)
+    metadata = dict(max_num_tokens=16, hidden_size=8, dtype=torch.float16) if configured else {}
+    expected_bytes = 2 * 16 * 8 * 2 if configured else 3 * 8 * 4
+    # Retry failed preparation and recheck availability after successful preparation.
+    for expected_calls in (1, 2, 3):
+        AllReduceRunner._maybe_preallocate_buffers(
+            input_tensor, [0, 1], do_preparation=True, **metadata
+        )
+        assert len(calls) == expected_calls
+    for call in calls:
+        assert call[0] is input_tensor
+        assert call[1:] == ([0, 1], 2, expected_bytes)
+
+    # A wider tensor/configuration needs a larger window, even at the same token count.
+    if configured:
+        metadata["hidden_size"] = 16
+    else:
+        input_tensor = input_tensor.repeat(1, 2)
+    AllReduceRunner._maybe_preallocate_buffers(
+        input_tensor, [0, 1], do_preparation=True, **metadata
+    )
+    assert len(calls) == 4
+    assert calls[3][3] == 2 * expected_bytes
+
+
+@pytest.mark.parametrize("is_capturing", [False, True])
+def test_preallocation_rechecks_native_buffers(monkeypatch, is_capturing):
+    from tensorrt_llm._torch.custom_ops.torch_custom_ops import AllReduceRunner
+
+    with FakeTensorMode():
+        input_tensor = torch.ones((3, 8), dtype=torch.float32, device="cuda:0")
+    calls = []
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: is_capturing)
+
+    def prepare(*args):
+        calls.append(args)
+        return True
+
+    monkeypatch.setattr(torch.ops.trtllm.preallocate_nccl_window_buffer, "bytes", prepare)
+    for expected_calls in (1, 2):
+        AllReduceRunner._maybe_preallocate_buffers(input_tensor, [0, 1], do_preparation=True)
+        assert len(calls) == expected_calls
+    for call in calls:
+        assert call[0] is input_tensor
+        assert call[1:] == ([0, 1], 2, 3 * 8 * 4)
+
+
+def test_preallocation_preserves_legacy_and_byte_size_signatures():
+    input_tensor = torch.ones((3, 8), dtype=torch.float32)
+    op = torch.ops.trtllm.preallocate_nccl_window_buffer
+    assert op(input_tensor, [0, 1], 2) is None
+    assert op.bytes(input_tensor, [0, 1], 2, 1024) is False
+    with FakeTensorMode():
+        fake_input = torch.ones((3, 8), dtype=torch.float32)
+        assert op(fake_input, [0, 1], 2) is None
+        assert op.bytes(fake_input, [0, 1], 2, 1024) is False

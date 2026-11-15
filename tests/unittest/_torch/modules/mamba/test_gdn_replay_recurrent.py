@@ -21,8 +21,13 @@ update_mamba_states against:
   1. the legacy path (fused_recurrent_gated_delta_rule_update with
      intermediate_states_buffer + accepted-state copy), and
   2. a sequential fp32 reference.
+Checks that history addressed by replay slots other than the state slots, in
+non-contiguous buffers with strided bookkeeping, replays and commits bit for
+bit like history indexed by the state slots.
 """
 
+import math
+from types import SimpleNamespace
 from typing import Literal
 
 import pytest
@@ -667,3 +672,225 @@ def test_gdn_cached_replay_dispatch_cuda_graph_matches_eager(batch_size):
     torch.testing.assert_close(graph_u, eager_u, rtol=0, atol=0)
     torch.testing.assert_close(graph_k, eager_k, rtol=0, atol=0)
     torch.testing.assert_close(graph_G, eager_G, rtol=0, atol=0)
+
+
+def _replay_slot_history(num_layers, num_slots, HIST, H, HV, K, V, device, dtype, layout):
+    """Per-layer history views of ``num_slots`` rows, filled with NaN.
+
+    ``contiguous``: one stacked ``[layers, slots, 2, ...]`` tensor per buffer.
+    ``strided``: stacked views whose layer and slot strides differ from a
+    contiguous tensor's, as when several layers' buffers share a pool slot.
+    ``descriptors``: separately allocated, padded per-layer views that no
+    layer stride relates, with their descriptor table.
+    Returns ``(old_u, old_k, old_G, descriptors)``; with descriptors the buffers
+    are lists of per-layer views.
+    """
+    from tensorrt_llm._torch.modules.fla.cached_replay import build_gdn_history_descriptors
+
+    shapes = (
+        ((2, HIST, HV, V), dtype),
+        ((2, HIST, H, K), dtype),
+        ((2, HV, HIST), torch.float32),
+    )
+    buffers = []
+    for shape, buffer_dtype in shapes:
+        if layout == "contiguous":
+            buffers.append(
+                torch.full((num_layers, num_slots, *shape), float("nan"), device=device).to(
+                    buffer_dtype
+                )
+            )
+        elif layout == "strided":
+            backing = torch.full(
+                (num_slots, num_layers + 1, *shape), float("nan"), device=device
+            ).to(buffer_dtype)
+            buffers.append(backing[:, 1:].transpose(0, 1))
+        else:
+            numel = math.prod(shape)
+            buffers.append(
+                [
+                    torch.full((num_slots, numel + 8 * (layer + 1)), float("nan"), device=device)
+                    .to(buffer_dtype)[:, :numel]
+                    .view(num_slots, *shape)
+                    for layer in range(num_layers)
+                ]
+            )
+    descriptors = build_gdn_history_descriptors(*buffers) if layout == "descriptors" else None
+    return (*buffers, descriptors)
+
+
+@pytest.mark.parametrize("history_layout", ["strided", "descriptors"])
+@pytest.mark.parametrize("N", [6, 16], ids=["small_fused", "large_all_layer"])
+def test_gdn_cached_replay_with_separate_replay_slots_matches_coupled(N, history_layout):
+    """Replay slots that differ from the state slots give, bit for bit, the coupled-index results.
+
+    The coupled run keeps contiguous history indexed by the state slots. The
+    other keeps the same history at a disjoint set of replay slots of larger,
+    non-contiguous buffers (padded per-layer views with a descriptor table for
+    the all-layer commit, or stacked views with foreign layer and slot strides)
+    and the bookkeeping in strided rows; every other row holds NaN history. Both
+    run verify steps with checkpoint wraps through the in-kernel commit
+    (``small_fused``) or the work items and the all-layer commit
+    (``large_all_layer``), then advance their bookkeeping with the same
+    acceptance.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    from tensorrt_llm._torch.modules.fla.cache_manager import (
+        ReplayStateUpdateMetadata,
+        _advance_replay_state,
+    )
+    from tensorrt_llm._torch.modules.fla.cached_replay import (
+        CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE,
+        commit_gdn_cached_replay_history_layers,
+    )
+    from tensorrt_llm._torch.modules.mamba.mamba2_metadata import (
+        REPLAY_WORK_ITEM_WIDTH,
+        _build_replay_work_items_torch,
+    )
+
+    torch.manual_seed(2024)
+    device, dtype = "cuda", torch.bfloat16
+    num_layers, T, HIST, steps = 2, 4, 16, 8
+    H, HV, K, V = 2, 8, 64, 64
+    num_state_slots = N + 3
+    num_replay_slots = 2 * N + 5
+    partitioned = N >= CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
+    state_indices = torch.randperm(num_state_slots, device=device)[:N].int()
+    # The replay slots never coincide with a state slot.
+    replay_indices = (
+        torch.randperm(num_replay_slots - num_state_slots, device=device)[:N] + num_state_slots
+    ).int()
+    state_rows, replay_rows = state_indices.long(), replay_indices.long()
+
+    initial_states = (torch.randn(num_state_slots, num_layers, HV, V, K, device=device) * 0.5).to(
+        dtype
+    )
+    initial_u = (torch.randn(num_layers, N, 2, HIST, HV, V, device=device) * 0.5).to(dtype)
+    initial_k = torch.randn(num_layers, N, 2, HIST, H, K, device=device)
+    initial_k = (initial_k / initial_k.norm(dim=-1, keepdim=True)).to(dtype)
+    initial_G = -torch.cumsum(torch.rand(num_layers, N, 2, HV, HIST, device=device) * 0.1, dim=-1)
+    initial_pnat = torch.randint(0, HIST + 1, (N,), device=device, dtype=torch.int32)
+    initial_pnat[0] = HIST  # a wrap at the first step
+    initial_buf = torch.randint(0, 2, (N,), device=device, dtype=torch.int32)
+    A_log = torch.randn(num_layers, HV, device=device) * 0.5
+    dt_bias = torch.randn(num_layers, HV, device=device) * 0.5
+
+    def make_side(separate):
+        backing = initial_states.clone()
+        if separate:
+            num_slots, rows, layout = num_replay_slots, replay_rows, history_layout
+            meta = torch.full((num_slots, 4), 13, device=device, dtype=torch.int32)
+            pnat, buf = meta[:, 0], meta[:, 1]
+        else:
+            num_slots, rows, layout = num_state_slots, state_rows, "contiguous"
+            pnat = torch.zeros(num_slots, device=device, dtype=torch.int32)
+            buf = torch.zeros_like(pnat)
+        old_u, old_k, old_G, descriptors = _replay_slot_history(
+            num_layers, num_slots, HIST, H, HV, K, V, device, dtype, layout
+        )
+        for layer in range(num_layers):
+            old_u[layer][rows] = initial_u[layer]
+            old_k[layer][rows] = initial_k[layer]
+            old_G[layer][rows] = initial_G[layer]
+        pnat[rows] = initial_pnat
+        buf[rows] = initial_buf
+        return SimpleNamespace(
+            backing=backing,
+            states=[backing[:, layer] for layer in range(num_layers)],
+            old_u=old_u,
+            old_k=old_k,
+            old_G=old_G,
+            descriptors=descriptors,
+            meta=ReplayStateUpdateMetadata(pnat, buf, T, HIST),
+            replay_indices=replay_indices if separate else None,
+            rows=rows,
+            work_items=torch.zeros(N, REPLAY_WORK_ITEM_WIDTH, device=device, dtype=torch.int32),
+            n_writes=torch.zeros(1, device=device, dtype=torch.int32),
+        )
+
+    coupled, separate = make_side(False), make_side(True)
+    wraps = 0
+    for _ in range(steps):
+        wraps += int((coupled.meta.prev_num_accepted_tokens[state_rows] + T > HIST).sum())
+        if partitioned:
+            for side in (coupled, separate):
+                _build_replay_work_items_torch(
+                    state_indices,
+                    side.meta.prev_num_accepted_tokens,
+                    side.meta.cache_buf_idx,
+                    side.work_items,
+                    side.n_writes,
+                    T,
+                    HIST,
+                    side.replay_indices,
+                )
+            assert torch.equal(coupled.n_writes, separate.n_writes)
+        for layer in range(num_layers):
+            q = torch.randn(N, T, H, K, device=device, dtype=dtype)
+            k = torch.randn(N, T, H, K, device=device, dtype=dtype)
+            v = torch.randn(N, T, HV, V, device=device, dtype=dtype) * 0.5
+            a = torch.randn(N, T, HV, device=device, dtype=dtype)
+            b = torch.randn(N, T, HV, device=device, dtype=dtype)
+            outputs = [
+                fused_recurrent_gated_delta_rule_cached_replay_update(
+                    q,
+                    k,
+                    v,
+                    a,
+                    b,
+                    side.states[layer],
+                    state_indices,
+                    side.old_u[layer],
+                    side.old_k[layer],
+                    side.old_G[layer],
+                    None,
+                    side.meta.cache_buf_idx,
+                    side.meta.prev_num_accepted_tokens,
+                    history_size=HIST,
+                    use_qk_l2norm_in_kernel=True,
+                    A_log=A_log[layer],
+                    dt_bias=dt_bias[layer],
+                    replay_work_items=side.work_items if partitioned else None,
+                    n_writes=side.n_writes if partitioned else None,
+                    use_all_layer_commit=partitioned,
+                    replay_indices=side.replay_indices,
+                )
+                for side in (coupled, separate)
+            ]
+            assert torch.equal(outputs[0], outputs[1])
+        if partitioned:
+            for side in (coupled, separate):
+                history = (side.old_u, side.old_k, side.old_G)
+                if side.descriptors is not None:
+                    history = tuple(buffer[0] for buffer in history)
+                commit_gdn_cached_replay_history_layers(
+                    ssm_states=side.states[0],
+                    ssm_state_num_layers=num_layers,
+                    ssm_state_layer_stride=side.backing.stride(1),
+                    ssm_state_slot_stride=side.backing.stride(0),
+                    old_u=history[0],
+                    old_k=history[1],
+                    old_G=history[2],
+                    replay_work_items=side.work_items,
+                    n_writes=side.n_writes,
+                    history_size=HIST,
+                    history_descriptors=side.descriptors,
+                )
+        accepted = torch.randint(1, T + 1, (N,), device=device, dtype=torch.int32)
+        _advance_replay_state(coupled.meta, state_indices, accepted)
+        _advance_replay_state(separate.meta, replay_indices, accepted)
+
+    assert wraps >= N, f"only {wraps} checkpoint wraps; increase the steps"
+    assert torch.equal(coupled.backing, separate.backing)
+    for name in ("prev_num_accepted_tokens", "cache_buf_idx"):
+        assert torch.equal(
+            getattr(coupled.meta, name)[state_rows], getattr(separate.meta, name)[replay_rows]
+        )
+    for layer in range(num_layers):
+        for name in ("old_u", "old_k", "old_G"):
+            assert torch.equal(
+                getattr(coupled, name)[layer][state_rows],
+                getattr(separate, name)[layer][replay_rows],
+            ), f"layer {layer} {name}"

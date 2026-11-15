@@ -28,6 +28,7 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.speculative.spec_sampler_base import SampleStateTensorsSpec
 from tensorrt_llm.bindings import SamplingConfig
 from tensorrt_llm.llmapi.llm_args import (
     BaseSparseAttentionConfig,
@@ -599,3 +600,94 @@ class SparseGraphKeyTestCase(unittest.TestCase):
             runner._get_seq_len_mode(batch, overlap_state, frozenset({request.py_request_id}))
         )
         self.assertFalse(runner._get_seq_len_mode(batch, overlap_state, frozenset()))
+
+
+def _overlap_spec_batch(max_draft_len: int, *num_tokens: int) -> tuple:
+    """A decode batch under the overlap scheduler with speculative decoding: each request has a previous batch, and the
+    in-flight step's sampled tokens and drafts are device tensors the host has not read yet."""
+    batch = _generation_batch(*num_tokens)
+    for request in batch.generation_requests:
+        request.py_batch_idx = 0
+        request.py_is_first_draft = False
+    tensors = object.__new__(SampleStateTensorsSpec)
+    tensors.new_tokens = torch.zeros(1, len(num_tokens), 1, dtype=torch.int32)
+    tensors.next_draft_tokens = torch.zeros(len(num_tokens), max_draft_len, dtype=torch.int32)
+    return batch, tensors
+
+
+@pytest.mark.parametrize("max_draft_len", [1, 3])
+def test_identity_short_mode_keeps_every_attended_token_within_the_topk_span(max_draft_len) -> None:
+    """With the identity threshold (top-k span minus one generation step's tokens), a decode step the runner keys short
+    attends at most top-k blocks for every verify token, whatever the in-flight step accepted. The host knows a
+    request's tokens up to the step before the in-flight one; the in-flight step accepts a in [1, draft + 1] tokens and
+    this step adds draft more, so its last verify token attends T + a + draft tokens. The bare top-k span let a
+    request attend one block past it (bug B: identity steps at 2049 tokens)."""
+    span = 16 * 128
+    tokens_per_step = max_draft_len + 1
+    spec_config = SimpleNamespace(max_draft_len=max_draft_len, _use_shared_kv_cache=True)
+
+    def worst_attended(host_tokens: int) -> int:
+        return host_tokens + tokens_per_step + max_draft_len
+
+    def short(threshold: int, host_tokens: int) -> bool:
+        runner = _decoder_runner(short_long_seq_len_threshold=threshold)
+        runner.spec_config = spec_config
+        batch, tensors = _overlap_spec_batch(max_draft_len, host_tokens)
+        return runner._get_seq_len_mode(batch, tensors)
+
+    for host_tokens in range(span - 4 * tokens_per_step, span + 1):
+        if short(span - tokens_per_step, host_tokens):
+            assert worst_attended(host_tokens) <= span, host_tokens
+    # The unpadded span keys a request short whose worst case attends past it.
+    assert any(
+        short(span, t) and worst_attended(t) > span
+        for t in range(span - 4 * tokens_per_step, span + 1)
+    )
+
+
+@pytest.mark.parametrize("same_pack", [False, True])
+@pytest.mark.parametrize("replay_fails", [False, True])
+def test_replay_defers_copies_only_to_its_captured_pack(monkeypatch, same_pack, replay_fails):
+    key = KeyType(batch_size=1, draft_len=0)
+    captured = Mock()
+    active = captured if same_pack else Mock()
+    queued = []
+    metadata = object()
+    inputs = {
+        "attn_metadata": metadata,
+        "input_ids": torch.zeros(1),
+        "position_ids": torch.zeros(1, 1),
+    }
+    runner = object.__new__(CUDAGraphRunner)
+    runner.graph_metadata = {key: {"attn_metadata": metadata, "spec_metadata": None}}
+    runner.shared_static_tensors = inputs
+    runner.config = SimpleNamespace(use_mrope=False)
+    runner._check_strict_buffer_stability = lambda meta: None
+    runner._get_num_tokens_for_key = lambda key: 1
+    runner._step_input_prologue_keys = {key: captured}
+    runner._pre_replay_hooks = []
+
+    def replay():
+        queued.append("replay")
+        if replay_fails:
+            raise RuntimeError("replay failed")
+
+    runner.graphs = {key: SimpleNamespace(replay=replay)}
+    runner.graph_outputs = {key: None}
+    captured.on_graph_replay.side_effect = lambda: queued.append("release")
+    monkeypatch.setattr(
+        cuda_graph_runner_module.step_inputs, "is_active", lambda pack: pack is active
+    )
+    monkeypatch.setattr(
+        cuda_graph_runner_module.step_inputs, "flush", lambda *, in_graph: queued.append(in_graph)
+    )
+    if replay_fails:
+        with pytest.raises(RuntimeError, match="replay failed"):
+            runner.replay(key, inputs)
+    else:
+        runner.replay(key, inputs)
+    assert queued == [same_pack, "replay", "release"]
+    if same_pack:
+        captured.quiesce_graph_window.assert_not_called()
+    else:
+        captured.quiesce_graph_window.assert_called_once_with()

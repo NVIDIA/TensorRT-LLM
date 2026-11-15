@@ -128,8 +128,8 @@ def find_backend_class(backend_type: MoeBackendType, quant_algo=None):
     rather than restated.
 
     Names one class. A caller deciding whether a configuration is *runnable*
-    wants :func:`find_backend_classes` instead, because for ``TRTLLM`` that
-    question spans a provider pair.
+    wants :func:`find_backend_classes` instead, because for CUTLASS
+    ``fp8_block_scales`` that question spans two leaves.
     """
     if backend_type == MoeBackendType.TRTLLM:
         from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import find_trtllm_gen_leaf
@@ -149,19 +149,11 @@ def find_backend_class(backend_type: MoeBackendType, quant_algo=None):
 def find_backend_classes(backend_type: MoeBackendType, quant_algo=None) -> tuple:
     """The classes a resolution walk would try, in its order; empty if none.
 
-    A tuple and not one class because ``TRTLLM`` is a provider pair, and
-    resolution falls through to the native leaf when the FlashInfer one
-    rejects -- a missing wheel, an unmet shape -- not only when it is absent.
-    Asking a single pre-picked class prunes candidates a run would have served.
-
-    For CUTLASS ``fp8_block_scales`` these are the SM90 and SM120 leaves.
+    A tuple and not one class because CUTLASS publishes ``fp8_block_scales``
+    twice, as the SM90 and SM120 leaves, and resolution falls through to the
+    second when the first rejects. Asking a single pre-picked class prunes
+    candidates a run would have served.
     """
-    if backend_type == MoeBackendType.TRTLLM:
-        from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import (
-            trtllm_gen_leaves_in_resolution_order,
-        )
-
-        return trtllm_gen_leaves_in_resolution_order(quant_algo)
     if backend_type == MoeBackendType.CUTLASS:
         from tensorrt_llm._torch.moe.fused_moe.cutlass import cutlass_leaves_in_resolution_order
 
@@ -183,10 +175,9 @@ def get_backend_class(backend_type: MoeBackendType, quant_algo=None):
 
         return cutlass_leaf(quant_algo)
     if backend_type == MoeBackendType.TRTLLM:
-        # Leaves are keyed by (provider, quant), so the format has to be
-        # named. ``trtllm_gen_leaf`` returns the native leaf where one exists
-        # and the FlashInfer one for the unquantized format, which is what a
-        # run without the opt-in flag would select.
+        # Leaves are keyed by quant, so the format has to be named.
+        # ``trtllm_gen_leaf`` returns the native leaf for a quantized format
+        # and the FlashInfer one for the unquantized format.
         from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import trtllm_gen_leaf
 
         return trtllm_gen_leaf(quant_algo)

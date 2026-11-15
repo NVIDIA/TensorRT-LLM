@@ -76,8 +76,7 @@ def test_fused_dspark_rmsnorm_rope_supported_architectures():
     assert all(_is_dspark_rmsnorm_rope_sm_supported(sm) for sm in (100, 103, 107))
     assert not any(_is_dspark_rmsnorm_rope_sm_supported(sm) for sm in (90, 101, 110, 120))
     assert _is_dspark_rmsnorm_rope_sm_supported()
-    # The DSV4 DSpark attention kernel keeps its own, narrower gate.
-    assert _get_dspark_arch_str(107) is None
+    assert _get_dspark_arch_str(107) == "sm_107"
 
 
 @pytest.mark.parametrize(

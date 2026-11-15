@@ -199,6 +199,13 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
             return [128, 256, 512]
         return [128, 256]
 
+    @staticmethod
+    def tile_size_of(tactic: int | None) -> int:
+        """Routing tile of ``tactic``; the fallback tactic runs 128-row tiles."""
+        if isinstance(tactic, int) and tactic > 0:
+            return tactic
+        return 128
+
     def get_tuning_config(self) -> TuningConfig:
         key = self.unique_id()
         if key not in self.__class__.tuning_config_cache:
@@ -270,10 +277,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                     )
             return inputs[4]
 
-        if isinstance(tactic, int) and tactic > 0:
-            tile_size = tactic
-        else:
-            tile_size = 128
+        tile_size = self.tile_size_of(tactic)
         if not self.use_direct_expert_metadata:
             return self.forward_impl(
                 *inputs, enable_alltoall=self.enable_alltoall, tile_size=tile_size

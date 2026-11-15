@@ -6,8 +6,8 @@
 from __future__ import annotations
 
 import math
-import os
 import sys
+from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
@@ -21,10 +21,10 @@ else:
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     MambaAcceptanceBatch,
     MambaLayerCache,
-    MambaRole,
     MambaStateLayout,
     _get_local_mamba_cache_layout,
     _host_slots_to_device,
+    _is_disagg_context_server,
     _mamba_effective_tp_size,
     _promote_intermediate_states,
     _stack_state_views,
@@ -32,9 +32,13 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2 import (
     MambaHybridCacheManagerV2,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.regions import RegionProvider
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, DataRole
+
+from .replay_region import REPLAY_STATE_REGION, KDAReplayRegion, ReplayLayout
 
 _MAMBA_SSM_SEED_MASK = (1 << 62) - 1
 _MAMBA_SSM_UINT64_MASK = (1 << 64) - 1
@@ -97,8 +101,20 @@ class KDAReplayLayerCache(MambaLayerCache):
     def has_kda_replay_caches(self) -> bool:
         return self.kda_conv_q is not None
 
-    def commit_conv_window(self, slot_indices: torch.Tensor, conv_pool: torch.Tensor) -> None:
-        """Seed the replay convolution windows from the live pool."""
+    def commit_conv_window(
+        self,
+        slot_indices: torch.Tensor,
+        conv_pool: torch.Tensor,
+        replay_slot_indices: torch.Tensor | None = None,
+    ) -> None:
+        """Seed the replay convolution windows from the live pool.
+
+        Args:
+            slot_indices: ``[n]`` recurrent-state slots of the conv pool rows.
+            conv_pool: ``[slots, 3D, W - 1]`` live convolution pool.
+            replay_slot_indices: ``[n]`` replay slots of the same requests;
+                ``slot_indices`` when ``None``.
+        """
         from ._kda_kernels import copy_kda_replay_conv_window
 
         copy_kda_replay_conv_window(
@@ -107,11 +123,13 @@ class KDAReplayLayerCache(MambaLayerCache):
             self.kda_conv_k,
             self.kda_conv_v,
             slot_indices,
+            replay_slot_indices,
         )
 
 
 _KDA_BETA_CACHE_ALIGNMENT_BYTES = 16
 # KVCM copies 16-byte payloads; the replay kernel reads only the first int32.
+# The first local KDA layer holds this per-request row for every layer.
 _KDA_REPLAY_COUNT_BYTES = 16
 _KDA_REPLAY_COUNT_ROLE = DataRole("prev_num_accepted_tokens")
 _KDA_REPLAY_CONV_ROLES = ("kda_conv_q", "kda_conv_k", "kda_conv_v")
@@ -125,11 +143,6 @@ _KDA_SEEDED_ROLES = (
     "kda_beta_cache",
 )
 _KDA_DRAFT_RECORDS_ROLE = "kda_state_tok"
-
-
-def _is_disagg_context_server(is_disagg: bool) -> bool:
-    """Whether this worker only serves the context phase of disagg requests."""
-    return is_disagg and os.getenv("TRTLLM_DISAGG_ROLE") == "context"
 
 
 def _kda_replay_layout(
@@ -174,7 +187,7 @@ def _kda_replay_layout(
 def _kda_replay_bytes_per_slot(
     layout: dict[str, tuple[torch.dtype, list[int]]], num_local_layers: int
 ) -> int:
-    """Replay bytes one recurrent-state slot holds across local layers."""
+    """Replay bytes one replay slot holds across local layers."""
     if not layout or num_local_layers == 0:
         return 0
     layer_bytes = sum(dtype.itemsize * math.prod(shape) for dtype, shape in layout.values())
@@ -401,12 +414,16 @@ class KDAReplayState:
     ) -> None:
         self._stochastic_rounding = stochastic_rounding
         self.draft_records = draft_records
+        # Kernel-facing per-layer views of the manager's replay buffers, by role
+        # name; each view's first dimension is a replay slot.
         self.pool_layers: list[dict[str, torch.Tensor]] | None = None
+        self._pool_views: list[dict[DataRole, torch.Tensor]] | None = None
         self.num_speculative_tokens = num_speculative_tokens
-        self.suspended_requests: set[int] = set()
+        # Disaggregated generation requests suspended before their transferred
+        # state seeded the replay caches; they are seeded when they resume.
+        self.seed_on_resume: set[int] = set()
         self.acceptance_pending: set[int] = set()
         self.unseeded_requests: set[int] = set()
-        self._ssm_states: tuple[torch.Tensor, ...] = ()
         self._conv_states: tuple[torch.Tensor, ...] = ()
         self._committed_window = 0
         self.prev_num_accepted_tokens: torch.Tensor | None = None
@@ -465,21 +482,57 @@ class KDAReplayState:
             draft_records=self.draft_records,
         )
 
-    def pool_buffer_configs(self, context: MambaStateLayout, layer_id: int) -> list[BufferConfig]:
-        layout = self.pool_layout(context)
-        buffers = [
-            BufferConfig(role=DataRole(name), size=dtype.itemsize * math.prod(shape))
-            for name, (dtype, shape) in layout.items()
-        ]
-        if layout and layer_id == context.mamba_pp_layers[0]:
-            buffers.append(BufferConfig(role=_KDA_REPLAY_COUNT_ROLE, size=_KDA_REPLAY_COUNT_BYTES))
-        return buffers
+    @property
+    def replay_shares_state_slot(self) -> bool:
+        """Whether the replay buffers live in the recurrent-state slot.
 
-    def disagg_ignored_roles(self, context: MambaStateLayout) -> frozenset[DataRole]:
-        roles = {DataRole(name) for name in self.pool_layout(context)}
-        if roles:
-            roles.add(_KDA_REPLAY_COUNT_ROLE)
-        return frozenset(roles)
+        Without the drafts' records the replay buffers have replay slots of
+        their own. The kernels that read and write the records (the
+        experimental Kimi K3 engine's ``k3_kda_verify`` and ``k3_kda_attn``)
+        address the replay caches by the recurrent-state slot, so with the
+        records they share it.
+        """
+        return self.draft_records
+
+    @staticmethod
+    def replay_slot_count(max_living_caches: int, max_util_for_resume: float) -> int:
+        """GPU replay slots for every living KV cache, with the headroom ``KvCache.resume`` needs.
+
+        Every living KV cache keeps its replay slot while it is suspended. ``KvCache.resume``
+        fails when a pool group is above ``max_util_for_resume``, so all owners fit only in
+        ``ceil(owners / max_util_for_resume)`` slots: 4 owners at 0.8 need 5.
+
+        The count assumes beam width 1, which ``_create_kv_cache_manager`` enforces for KDA
+        models. Under beam search each beam holds its own replay state, so the owners become
+        ``max_living_caches * max_beam_width``; the fixed-pool estimate and the region's
+        allocation both take their count from here.
+        """
+        if not 0.0 < max_util_for_resume <= 1.0:
+            raise ValueError(f"max_util_for_resume must be in (0, 1], got {max_util_for_resume}")
+        return max(1, math.ceil(max_living_caches / max_util_for_resume))
+
+    def replay_layout(self, context: MambaStateLayout, layer_id: int) -> ReplayLayout:
+        """Per-slot shapes of one local KDA layer's replay buffers.
+
+        The first local layer also holds the accepted-draft count row that all
+        layers share.
+        """
+        layout = {DataRole(name): spec for name, spec in self.pool_layout(context).items()}
+        if layout and layer_id == context.mamba_pp_layers[0]:
+            layout[_KDA_REPLAY_COUNT_ROLE] = (
+                torch.int32,
+                [_KDA_REPLAY_COUNT_BYTES // torch.int32.itemsize],
+            )
+        return layout
+
+    def bind_replay_pool(self, layers: list[dict[DataRole, torch.Tensor]]) -> None:
+        """Use the manager's views of the ``replay_layout()`` roles instead of allocating.
+
+        Args:
+            layers: Per local KDA layer, ``{role: [replay_slots, *slot_shape]}``
+                views. ``bind()`` turns them into the kernels' layouts.
+        """
+        self._pool_views = layers
 
     def _layer_bytes_per_slot(self, section_dim: int, committed_window: int, num_heads: int) -> int:
         extended_window = committed_window + self.num_speculative_tokens
@@ -515,15 +568,37 @@ class KDAReplayState:
 
     @classmethod
     def estimate_bytes_per_slot(cls, model_config, mapping: Mapping, **kwargs) -> int:
-        """Estimate rank-local replay storage using the runtime replay gate and geometry."""
-        if _is_disagg_context_server(kwargs.get("is_disagg", False)):
+        """Estimate the rank-local bytes of one replay slot.
+
+        Uses the runtime replay gate and geometry; the count row is included.
+        """
+        selected = cls._estimate_selected_replay(model_config, mapping, **kwargs)
+        if selected is None:
             return 0
+        layout, local_layers, _ = selected
+        return _kda_replay_bytes_per_slot(layout, local_layers)
+
+    @classmethod
+    def estimate_seed_bytes_per_slot(cls, model_config, mapping: Mapping, **kwargs) -> int:
+        """Estimate the stochastic-rounding seed bytes of one recurrent-state slot."""
+        selected = cls._estimate_selected_replay(model_config, mapping, **kwargs)
+        if selected is None or not selected[2]:
+            return 0
+        return torch.int64.itemsize
+
+    @classmethod
+    def _estimate_selected_replay(
+        cls, model_config, mapping: Mapping, **kwargs
+    ) -> tuple[dict[str, tuple[torch.dtype, list[int]]], int, bool] | None:
+        """Return the replay layout, local layer count and stochastic rounding, or ``None``."""
+        if _is_disagg_context_server(kwargs.get("is_disagg", False)):
+            return None
         spec_config = kwargs.get("spec_config")
         num_spec = kwargs.get("kda_replay_num_spec")
         if num_spec is None:
             num_spec = get_kda_replay_num_spec(spec_config, manager_supports_replay=True)
         if num_spec is None:
-            return 0
+            return None
         params, local_layers, _ = _get_local_mamba_cache_layout(
             model_config,
             mapping,
@@ -532,7 +607,7 @@ class KDAReplayState:
             use_separate_draft_kv_cache=kwargs.get("use_separate_draft_kv_cache", False),
         )
         if not local_layers:
-            return 0
+            return None
         tp_size = _mamba_effective_tp_size(mapping)
         quant_config = model_config.quant_config
         stochastic_rounding = kwargs.get(
@@ -541,16 +616,14 @@ class KDAReplayState:
             and params.mamba_ssm_cache_dtype == torch.float16,
         )
         state = cls(num_spec, draft_records=kwargs.get("kda_draft_records", False))
-        return _kda_replay_bytes_per_slot(
-            _kda_replay_layout(
-                num_spec,
-                params.num_heads // tp_size,
-                params.head_dim,
-                params.conv_kernel - 1,
-                draft_records=state.draft_records,
-            ),
-            local_layers,
-        ) + (8 if stochastic_rounding else 0)
+        layout = _kda_replay_layout(
+            num_spec,
+            params.num_heads // tp_size,
+            params.head_dim,
+            params.conv_kernel - 1,
+            draft_records=state.draft_records,
+        )
+        return layout, local_layers, stochastic_rounding
 
     def bind(
         self,
@@ -565,7 +638,6 @@ class KDAReplayState:
             + context.mapping.rank * 1_009
         )
         self._conv_section_dims = context.conv_section_dims
-        self._ssm_states = tuple(ssm_states)
         self._conv_states = tuple(conv_states)
         self._committed_window = context.conv_state_shape[1] if conv_states else 0
         states = ssm_states
@@ -576,7 +648,9 @@ class KDAReplayState:
         if cache_size is None:
             raise RuntimeError("KDA replay requires the allocated V2 slot capacity")
         device = states[0].device
-        if self.pool_layers is None:
+        if self._pool_views is not None:
+            self._bind_pool_views(context)
+        elif self.pool_layers is None:
             fields, _ = allocate_kda_replay_fields(
                 num_local_layers=len(context.mamba_pp_layers),
                 cache_size=cache_size,
@@ -601,7 +675,29 @@ class KDAReplayState:
                 device,
             )
         self._stack_seed_views()
-        logger.info(f"Mamba Cache (kda-replay) is allocated for {cache_size} state slots")
+        logger.info(
+            f"Mamba Cache (kda-replay) holds {self.prev_num_accepted_tokens.shape[0]} replay "
+            f"slots for {cache_size} state slots"
+        )
+
+    def _bind_pool_views(self, context: MambaStateLayout) -> None:
+        num_heads = context.ssm_state_shape[0]
+        self.pool_layers = []
+        for views in self._pool_views:
+            layer = {}
+            for role, view in views.items():
+                if role == _KDA_REPLAY_COUNT_ROLE:
+                    continue
+                if role in _KDA_REPLAY_CONV_ROLES:
+                    view = view.transpose(-1, -2)
+                elif role == "kda_beta_cache":
+                    view = view[..., :num_heads]
+                layer[str(role)] = view
+            self.pool_layers.append(layer)
+        self.prev_num_accepted_tokens = self._pool_views[0][_KDA_REPLAY_COUNT_ROLE][..., 0]
+        # One replay index addresses every buffer.
+        if len({view.shape[0] for views in self._pool_views for view in views.values()}) != 1:
+            raise RuntimeError("KDA replay buffers must share one replay slot capacity")
 
     def _stack_seed_views(self) -> None:
         """Stack what seed_transferred_slots writes, so it runs on all layers at once."""
@@ -653,28 +749,59 @@ class KDAReplayState:
             **self._layer_cache_fields(layer_offset),
         )
 
-    def reset_slots(self, slots: torch.Tensor, host_slots: list[int]) -> None:
+    def reset_replay_slots(self, replay_slots: torch.Tensor) -> None:
+        """Clear the accepted-draft count of ``replay_slots``: nothing is pending there."""
+        if self.prev_num_accepted_tokens is None or replay_slots.numel() == 0:
+            return
+        self.prev_num_accepted_tokens.index_fill_(0, replay_slots, 0)
+
+    def refresh_seeds(self, host_slots: list[int]) -> None:
+        """Give the recurrent-state slots ``host_slots`` new stochastic-rounding seeds."""
+        if self.rand_seed is None or not host_slots:
+            return
+        self._seed_request_counter += 1
+        seeds = [
+            compute_deterministic_mamba_seed(
+                self._seed_request_counter,
+                slot,
+                self._seed_rank_offset,
+            )
+            for slot in host_slots
+        ]
+        slots = _host_slots_to_device(host_slots, self.rand_seed.device)
+        self.rand_seed[slots] = torch.tensor(
+            seeds,
+            dtype=torch.int64,
+            device=self.rand_seed.device,
+        )
+
+    def reset_slots(
+        self,
+        slots: torch.Tensor,
+        host_slots: list[int],
+        replay_slots: torch.Tensor | None = None,
+    ) -> None:
+        """Reset context requests' accepted-draft counts and refresh their state-slot seeds.
+
+        Args:
+            slots: ``[n]`` recurrent-state slots of the context requests.
+            host_slots: The same slots on the host.
+            replay_slots: ``[n]`` replay slots of the requests; the state slots
+                when ``None``.
+        """
         if self.prev_num_accepted_tokens is None or slots.numel() == 0:
             return
-        slots = _host_slots_to_device(host_slots, self.prev_num_accepted_tokens.device)
-        self.prev_num_accepted_tokens.index_fill_(0, slots, 0)
-        if self.rand_seed is not None:
-            self._seed_request_counter += 1
-            seeds = [
-                compute_deterministic_mamba_seed(
-                    self._seed_request_counter,
-                    slot,
-                    self._seed_rank_offset,
-                )
-                for slot in host_slots
-            ]
-            self.rand_seed[slots] = torch.tensor(
-                seeds,
-                dtype=torch.int64,
-                device=self.rand_seed.device,
-            )
+        if replay_slots is None:
+            replay_slots = _host_slots_to_device(host_slots, self.prev_num_accepted_tokens.device)
+        self.reset_replay_slots(replay_slots)
+        self.refresh_seeds(host_slots)
 
     def relocate_slots(self, old_slots: list[int], new_slots: list[int]) -> None:
+        """Move state-slot-indexed buffers after the requests' state slots changed.
+
+        Views of the manager's replay pool follow their requests on their own,
+        so only the seeds move then.
+        """
         if self.prev_num_accepted_tokens is None:
             return
         if self.pool_layers is not None and self.rand_seed is None:
@@ -704,29 +831,46 @@ class KDAReplayState:
                 self.rand_seed.index_select(0, source_slots),
             )
 
-    def update(self, batch: MambaAcceptanceBatch) -> None:
+    def update(self, batch: MambaAcceptanceBatch, replay_slots: torch.Tensor | None = None) -> None:
+        """Record the batch's accepted drafts.
+
+        Args:
+            batch: The generation rows' acceptance.
+            replay_slots: ``[num_generations]`` replay slots of the generation rows;
+                ``batch.destination_state_indices`` when ``None``.
+        """
         self.record_acceptance(
-            batch.destination_state_indices,
+            batch.destination_state_indices if replay_slots is None else replay_slots,
             batch.num_accepted_tokens - 1,
             batch.is_dummy_request,
         )
 
     @torch.inference_mode()
-    def seed_transferred_slots(self, state_indices: torch.Tensor) -> None:
-        """Seed completed-transfer slots from borrowed persistent conv views."""
+    def seed_transferred_slots(
+        self, state_indices: torch.Tensor, replay_indices: torch.Tensor | None = None
+    ) -> None:
+        """Seed completed-transfer requests' replay caches from borrowed persistent conv views.
+
+        Args:
+            state_indices: ``[n]`` recurrent-state slots holding the transferred conv states.
+            replay_indices: ``[n]`` replay slots of the same requests; ``state_indices``
+                when ``None``.
+        """
         if self.prev_num_accepted_tokens is None or state_indices.numel() == 0:
             return
+        if replay_indices is None:
+            replay_indices = state_indices
         committed_window = self._committed_window
         section_offsets = [0]
         for section_dim in self._conv_section_dims:
             section_offsets.append(section_offsets[-1] + section_dim)
 
-        self.prev_num_accepted_tokens.index_fill_(0, state_indices, 0)
+        self.prev_num_accepted_tokens.index_fill_(0, replay_indices, 0)
         stacked_replay = self._stacked_seed_replay
         if stacked_replay is not None:
             # All layers at once: one launch per replay buffer and section.
             for buffer in stacked_replay.values():
-                buffer.index_fill_(1, state_indices, 0)
+                buffer.index_fill_(1, replay_indices, 0)
             selected_conv = self._stacked_seed_conv.index_select(1, state_indices)
             for section_idx, name in enumerate(_KDA_REPLAY_CONV_ROLES):
                 buffer = stacked_replay[name]
@@ -734,7 +878,7 @@ class KDAReplayState:
                     :, :, section_offsets[section_idx] : section_offsets[section_idx + 1], :
                 ]
                 buffer[..., :committed_window].index_copy_(
-                    1, state_indices, section.to(buffer.dtype)
+                    1, replay_indices, section.to(buffer.dtype)
                 )
             return
         for layer_offset, conv_state in enumerate(self._conv_states):
@@ -742,7 +886,7 @@ class KDAReplayState:
             for name in _KDA_SEEDED_ROLES:
                 buffer = replay.get(name)
                 if buffer is not None:
-                    buffer.index_fill_(0, state_indices, 0)
+                    buffer.index_fill_(0, replay_indices, 0)
             selected_conv = conv_state.index_select(0, state_indices)
             for section_idx, name in enumerate(_KDA_REPLAY_CONV_ROLES):
                 buffer = replay[name]
@@ -750,19 +894,22 @@ class KDAReplayState:
                     :, section_offsets[section_idx] : section_offsets[section_idx + 1], :
                 ]
                 buffer[:, :, :committed_window].index_copy_(
-                    0, state_indices, section.to(buffer.dtype)
+                    0, replay_indices, section.to(buffer.dtype)
                 )
 
     def record_acceptance(
         self,
-        state_indices: torch.Tensor,
+        replay_indices: torch.Tensor,
         num_accepted_draft_tokens: torch.Tensor,
         is_dummy_request: torch.Tensor | None,
     ) -> None:
-        """Record accepted drafts, preserving dummy rows; each input has shape [batch]."""
+        """Record accepted drafts in the requests' replay slots, preserving dummy rows.
+
+        Each input has shape ``[batch]``.
+        """
         if self.prev_num_accepted_tokens is None:
             raise RuntimeError("KDA replay acceptance requires replay bookkeeping")
-        slots = state_indices.to(torch.long)
+        slots = replay_indices.to(torch.long)
         accepted = num_accepted_draft_tokens.to(torch.int32).clamp(min=0)
         if is_dummy_request is not None:
             current = self.prev_num_accepted_tokens[slots]
@@ -772,39 +919,12 @@ class KDAReplayState:
     @staticmethod
     @contextmanager
     def on_cache_stream(stream):
-        """Order replay commits and seeding against V2 page migration."""
+        """Order replay seeding against V2 page migration."""
         current = torch.cuda.current_stream()
         stream.wait_stream(current)
         with torch.cuda.stream(stream):
             yield
         current.wait_stream(stream)
-
-    def commit_pending_drafts(self, slot: int) -> None:
-        """Fold accepted drafts and the replay conv window into the persistent states."""
-        from ._kda_kernels import commit_kda_pending_drafts
-
-        assert self.prev_num_accepted_tokens is not None
-        slots = torch.full(
-            (1,), slot, dtype=torch.int32, device=self.prev_num_accepted_tokens.device
-        )
-        num_accepted = self.prev_num_accepted_tokens.index_select(0, slots)
-        for layer, (ssm_states, conv_states) in enumerate(zip(self._ssm_states, self._conv_states)):
-            replay = self._layer_cache_fields(layer)
-            commit_kda_pending_drafts(
-                ssm_states,
-                conv_states,
-                replay["kda_conv_q"],
-                replay["kda_conv_k"],
-                replay["kda_conv_v"],
-                replay.get("kda_k_cache"),
-                replay.get("kda_g_cache"),
-                replay.get("kda_v_cache"),
-                replay.get("kda_beta_cache"),
-                slots,
-                num_accepted,
-                state_tok=replay.get(_KDA_DRAFT_RECORDS_ROLE),
-            )
-        self.prev_num_accepted_tokens[slot].zero_()
 
     def _layer_replay_buffers(self) -> tuple[torch.Tensor, ...]:
         buffers = (
@@ -823,11 +943,11 @@ class KDAReplayState:
 
     def shutdown(self) -> None:
         self.pool_layers = None
-        self._ssm_states = ()
+        self._pool_views = None
         self._conv_states = ()
         self._stacked_seed_conv = None
         self._stacked_seed_replay = None
-        self.suspended_requests.clear()
+        self.seed_on_resume.clear()
         self.acceptance_pending.clear()
         self.unseeded_requests.clear()
         self.prev_num_accepted_tokens = None
@@ -841,56 +961,6 @@ class KDAReplayState:
         self.kda_state_tok = None
         self.intermediate_indices = None
         self.rand_seed = None
-
-
-def bind_kda_replay_pool(state: KDAReplayState, manager: MambaHybridCacheManagerV2) -> None:
-    """Bind model-owned KDA replay roles to views of the manager's native pools."""
-    layout = state.pool_layout(manager._state_layout)
-    if not layout:
-        return
-    required = {
-        (manager.layer_offsets[layer_id], str(role))
-        for layer_id in manager.mamba_pp_layers
-        for role in (MambaRole.SSM_STATE, MambaRole.CONV_STATE, *layout)
-    }
-    required.add((manager.layer_offsets[manager.mamba_pp_layers[0]], str(_KDA_REPLAY_COUNT_ROLE)))
-    if not any(
-        required.issubset(
-            {
-                (int(buffer_id.layer_id), str(buffer_id.role))
-                for coalesced in variant.coalesced_buffers
-                for buffer_id in coalesced.buffer_ids
-            }
-        )
-        for group in manager.impl.pool_group_descs
-        for variant in group.slot_desc.variants
-    ):
-        raise RuntimeError(
-            "KDA replay and recurrent-state buffers must share one KVCM "
-            "pool group and lifecycle to reuse the same logical slot index"
-        )
-
-    state.pool_layers = []
-    for layer_id in manager.mamba_pp_layers:
-        layer = {}
-        for name, (dtype, shape) in layout.items():
-            view = manager._get_state_buffer(
-                manager.layer_offsets[layer_id], DataRole(name), dtype, shape
-            )
-            if name in _KDA_REPLAY_CONV_ROLES:
-                view = view.transpose(-1, -2)
-            elif name == "kda_beta_cache":
-                view = view[..., : manager.ssm_state_shape[0]]
-            if view.shape[0] != manager._state_layout.slot_capacity:
-                raise RuntimeError(f"KDA replay buffer {name} has a different slot capacity")
-            layer[name] = view
-        state.pool_layers.append(layer)
-    state.prev_num_accepted_tokens = manager._get_state_buffer(
-        manager.layer_offsets[manager.mamba_pp_layers[0]],
-        _KDA_REPLAY_COUNT_ROLE,
-        torch.int32,
-        [_KDA_REPLAY_COUNT_BYTES // torch.int32.itemsize],
-    )[..., 0]
 
 
 def select_kda_replay_state(
@@ -932,6 +1002,7 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
     """KDA/MLA cache layout and K3-only replay lifecycle handling."""
 
     kda_context_only = False
+    _kda_replay_region: KDAReplayRegion | None = None
 
     @override
     def __init__(
@@ -949,6 +1020,7 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         self._requested_num_spec = kda_replay_num_spec
         self._requested_draft_records = kda_draft_records
         self._kda_replay: KDAReplayState | None = None
+        self._kda_replay_region: KDAReplayRegion | None = None
         kwargs.setdefault("conv_state_layout", "q_k_v")
         super().__init__(*args, **kwargs)
 
@@ -993,26 +1065,100 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         return self._kda_replay.pool_layout(self._state_layout)
 
     @override
+    def _managed_replay_state(self) -> None:
+        """``KDAReplayRegion`` declares, binds and indexes the KDA replay state."""
+        return None
+
+    @override
+    def _region_providers(self) -> Sequence[RegionProvider]:
+        providers = super()._region_providers()
+        if self._kda_replay is None or not self.mamba_pp_layers:
+            return providers
+        self._kda_replay_region = KDAReplayRegion(
+            self._kda_replay,
+            self._state_layout,
+            self.layer_offsets,
+            self._index_mapper_capacity,
+            self.kv_cache_config.max_util_for_resume,
+        )
+        return (*providers, self._kda_replay_region)
+
+    @override
     def _get_recurrent_buffer_configs(self, global_layer_id: int) -> list[BufferConfig]:
         buffers = super()._get_recurrent_buffer_configs(global_layer_id)
-        if self._kda_replay is not None:
-            buffers.extend(
-                self._kda_replay.pool_buffer_configs(self._state_layout, global_layer_id)
-            )
+        if self._kda_replay_region is not None:
+            buffers += self._kda_replay_region.shared_buffers(global_layer_id)
         return buffers
 
     @override
     def get_disagg_ignored_roles(self) -> frozenset[DataRole]:
         roles = super().get_disagg_ignored_roles()
-        if self._kda_replay is not None:
-            roles |= self._kda_replay.disagg_ignored_roles(self._state_layout)
+        if self._kda_replay_region is not None:
+            roles |= self._kda_replay_region.roles
         return roles
 
     @override
     def _setup_model_state(self) -> None:
-        if self._kda_replay is not None:
-            bind_kda_replay_pool(self._kda_replay, self)
+        region = self._kda_replay_region
+        if region is not None:
+            region.bind(
+                self._get_state_buffer,
+                self.layer_offsets,
+                self.get_region_group_ids(REPLAY_STATE_REGION),
+                self._host_state_indices.shape[0],
+                self.cuda_state_indices.device,
+            )
         super()._setup_model_state()
+
+    @property
+    @override
+    def replay_layer_group_id(self) -> int | None:
+        region = self._kda_replay_region
+        return region.group_id if region is not None else None
+
+    @property
+    @override
+    def cuda_replay_state_indices(self) -> torch.Tensor:
+        region = self._kda_replay_region
+        return (
+            region.cuda_indices(self.cuda_state_indices)
+            if region is not None
+            else self.cuda_state_indices
+        )
+
+    @override
+    def get_replay_state_indices(
+        self, request_ids: list[int] | None = None
+    ) -> torch.Tensor | list[int]:
+        if request_ids is None:
+            return self.cuda_replay_state_indices
+        region = self._kda_replay_region
+        if region is None or region.group_id is None:
+            # The replay buffers share the recurrent-state slots.
+            return [self._request_id_to_state_index[rid] for rid in request_ids]
+        return region.request_indices(request_ids)
+
+    @override
+    def _reset_context_mamba_slots(self, num_contexts: int) -> None:
+        if self._kda_replay_region is None:
+            super()._reset_context_mamba_slots(num_contexts)
+        else:
+            self._kda_replay_region.reset_context(
+                num_contexts, self.cuda_state_indices, self._host_state_indices
+            )
+
+    @override
+    def _update_model_state(self, batch: MambaAcceptanceBatch) -> None:
+        if self._kda_replay_region is None:
+            super()._update_model_state(batch)
+        else:
+            self._kda_replay_region.update(batch, self.cuda_state_indices)
+
+    @override
+    def shutdown(self) -> None:
+        if self._kda_replay_region is not None:
+            self._kda_replay_region.shutdown()
+        super().shutdown()
 
     @override
     def _build_cache_config(self, config):
@@ -1022,8 +1168,8 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
             and self.kv_cache_config.enable_kv_pool_rebalance
         ):
             raise ValueError(
-                "KDA replay views are bound once to the SSM pool's slot count, "
-                "and a rebalance can grow that pool past them: set "
+                "KDA replay state binds its pool views and per-slot buffers once, "
+                "and a rebalance can resize the pools past them: set "
                 "kv_cache_config.enable_kv_pool_rebalance=False."
             )
         return super()._build_cache_config(config)
@@ -1033,41 +1179,76 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         replay = self._kda_replay
         request_id = request.py_request_id
         cache = self.kv_cache_map.get(request_id)
-        slot = self._request_id_to_state_index.get(request_id, -1)
-        if replay is not None and slot >= 0 and cache is not None and cache.is_active:
+        if (
+            replay is not None
+            and request_id in self._request_id_to_state_index
+            and cache is not None
+            and cache.is_active
+        ):
             if request_id in replay.acceptance_pending:
                 raise RuntimeError(
                     f"Request {request_id} is being suspended before update_resources "
-                    "recorded the acceptance of its last verify, so its pending KDA drafts are unknown"
+                    "recorded the acceptance of its last verify in its KDA replay state"
                 )
             if request_id in replay.unseeded_requests:
+                # Its replay caches have not been seeded from the transferred
+                # state. Forget its slot so a transfer completion does not seed
+                # it while suspended; it is seeded when it resumes.
                 replay.unseeded_requests.remove(request_id)
-            else:
-                with replay.on_cache_stream(self._stream):
-                    replay.commit_pending_drafts(slot)
-            del self._request_id_to_state_index[request_id]
-            replay.suspended_requests.add(request_id)
+                replay.seed_on_resume.add(request_id)
+                del self._request_id_to_state_index[request_id]
         super().suspend_request(request)
 
     @override
     def _setup_state_indices(self, requests, num_contexts: int = 0) -> None:
         super()._setup_state_indices(requests, num_contexts)
+        if self._kda_replay_region is not None:
+            self._kda_replay_region.prepare(
+                requests,
+                self.kv_cache_map,
+                self.cuda_state_indices,
+                self._host_state_indices,
+                num_contexts,
+                self._skips_steady_state_index_upload,
+            )
         replay = self._kda_replay
         if replay is None or self.local_num_mamba_layers == 0:
             return
-        replay.suspended_requests.difference_update(
+        replay.seed_on_resume.difference_update(
             request.py_request_id for request in requests[:num_contexts]
         )
-        slots = []
-        for request in requests[num_contexts:]:
-            if request.py_request_id in replay.suspended_requests:
-                replay.suspended_requests.remove(request.py_request_id)
-                slots.append(self._request_id_to_state_index[request.py_request_id])
-        if slots:
+        resumed = [
+            request.py_request_id
+            for request in requests[num_contexts:]
+            if request.py_request_id in replay.seed_on_resume
+        ]
+        if resumed:
+            replay.seed_on_resume.difference_update(resumed)
             with replay.on_cache_stream(self._stream):
-                replay.seed_transferred_slots(
-                    _host_slots_to_device(slots, replay.prev_num_accepted_tokens.device)
-                )
+                self._seed_kda_replay_slots(resumed)
+
+    def _seed_kda_replay_slots(self, request_ids: list[int]) -> None:
+        """Seed the replay state of requests whose recurrent state was transferred."""
+        replay = self._kda_replay
+        # Each request once, in state-slot order.
+        request_ids = sorted(
+            {
+                request_id
+                for request_id in request_ids
+                if request_id in self._request_id_to_state_index
+            },
+            key=self._request_id_to_state_index.__getitem__,
+        )
+        if not request_ids:
+            return
+        device = replay.prev_num_accepted_tokens.device
+        replay.seed_transferred_slots(
+            _host_slots_to_device(
+                [self._request_id_to_state_index[request_id] for request_id in request_ids],
+                device,
+            ),
+            _host_slots_to_device(self.get_replay_state_indices(request_ids), device),
+        )
 
     @override
     def prepare_resources(self, scheduled_batch) -> None:
@@ -1096,9 +1277,11 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
     @override
     def free_resources(self, request, pin_on_release: bool = False) -> None:
         if self._kda_replay is not None:
-            self._kda_replay.suspended_requests.discard(request.py_request_id)
+            self._kda_replay.seed_on_resume.discard(request.py_request_id)
             self._kda_replay.acceptance_pending.discard(request.py_request_id)
             self._kda_replay.unseeded_requests.discard(request.py_request_id)
+        if self._kda_replay_region is not None:
+            self._kda_replay_region.release(request.py_request_id)
         super().free_resources(request, pin_on_release)
 
     @override
@@ -1109,18 +1292,37 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
 
     @classmethod
     @override
+    def _estimate_fixed_region_bytes(
+        cls,
+        model_config,
+        mapping: Mapping,
+        *,
+        max_batch_size: int,
+        kv_cache_config: KvCacheConfig,
+        **kwargs,
+    ) -> int:
+        return KDAReplayRegion.estimate_fixed_bytes(
+            model_config, mapping, max_batch_size, kv_cache_config.max_util_for_resume, **kwargs
+        )
+
+    @classmethod
+    @override
     def _extra_state_bytes_per_rank(cls, model_config, mapping: Mapping, **kwargs) -> int:
-        return KDAReplayState.estimate_bytes_per_slot(model_config, mapping, **kwargs)
+        seed_bytes = KDAReplayState.estimate_seed_bytes_per_slot(model_config, mapping, **kwargs)
+        if kwargs.get("kda_draft_records", False):
+            # With the records, the replay state shares every recurrent-state slot
+            # (KDAReplayState.replay_shares_state_slot).
+            return seed_bytes + KDAReplayState.estimate_bytes_per_slot(
+                model_config, mapping, **kwargs
+            )
+        return seed_bytes
 
     @override
     def _on_state_slots_relocated(self, old_slots: list[int], new_slots: list[int]) -> None:
         if self._kda_replay is None:
             return
         self._kda_replay.relocate_slots(old_slots, new_slots)
-        fresh_slots = [new for old, new in zip(old_slots, new_slots) if old < 0]
-        if fresh_slots:
-            slots = _host_slots_to_device(fresh_slots, self.cuda_state_indices.device)
-            self._kda_replay.reset_slots(slots, fresh_slots)
+        self._kda_replay.refresh_seeds([new for old, new in zip(old_slots, new_slots) if old < 0])
 
     @override
     def update_mamba_states(
@@ -1128,6 +1330,10 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
     ) -> None:
         if self.kda_context_only:
             return
+        if state_indices is not None and self.replay_layer_group_id is not None:
+            metadata = getattr(attn_metadata, "mamba_metadata", None)
+            if getattr(metadata, "replay_state_indices", None) is None:
+                raise RuntimeError("PRIVATE replay state needs mamba_metadata.replay_state_indices")
         super().update_mamba_states(
             attn_metadata, num_accepted_tokens, state_indices, accepted_leaf_positions
         )
@@ -1172,8 +1378,8 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         if not active_requests:
             return
         device = replay.prev_num_accepted_tokens.device
-        state_indices = torch.tensor(
-            [state_index_map[request.py_request_id] for request in active_requests],
+        replay_indices = torch.tensor(
+            self.get_replay_state_indices([request.py_request_id for request in active_requests]),
             dtype=torch.int32,
             device=device,
         )
@@ -1187,7 +1393,7 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
             dtype=torch.bool,
             device=device,
         )
-        replay.record_acceptance(state_indices, accepted_drafts, is_dummy_request)
+        replay.record_acceptance(replay_indices, accepted_drafts, is_dummy_request)
 
     @override
     def on_state_transfer_complete(self, request_ids: list[int]) -> None:
@@ -1195,17 +1401,7 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         if replay is None or replay.prev_num_accepted_tokens is None:
             return
         replay.unseeded_requests.difference_update(request_ids)
-        slots = sorted(
-            {
-                self._request_id_to_state_index[request_id]
-                for request_id in request_ids
-                if request_id in self._request_id_to_state_index
-            }
-        )
-        if slots:
-            replay.seed_transferred_slots(
-                _host_slots_to_device(slots, replay.prev_num_accepted_tokens.device)
-            )
+        self._seed_kda_replay_slots(request_ids)
 
     def seed_kda_replay_caches_for_disagg_gen(self, request_ids: list[int]) -> None:
         """Compatibility entry point; the executor uses the generic transfer hook."""
@@ -1282,7 +1478,6 @@ __all__ = [
     "KDAReplayLayerCache",
     "KimiK3HybridCacheManager",
     "allocate_kda_replay_fields",
-    "bind_kda_replay_pool",
     "get_kda_replay_num_spec",
     "get_kimi_cache_params",
     "resolve_kimi_ssm_cache_dtype",

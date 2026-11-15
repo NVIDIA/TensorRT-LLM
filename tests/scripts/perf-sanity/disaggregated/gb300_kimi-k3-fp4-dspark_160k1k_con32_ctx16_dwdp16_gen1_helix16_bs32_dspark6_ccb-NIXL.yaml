@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Kimi-K3 NVFP4 + DSpark decode at a fixed long context, for the gen_only_no_context
-# lane: one helix (CP16) gen worker on 4 GB300 nodes decodes 32 requests of exactly
+# Kimi-K3 NVFP4 + DSpark decode at a fixed long context. In the gen_only_no_context
+# lane, one helix (CP16) gen worker on 4 GB300 nodes decodes 32 requests of exactly
 # 163840 input / 1024 output random tokens (10240 KV tokens per rank). This is the
 # gen-only method of the K3 GB300 optimization work (balanced ISL 163840,
 # steady-state step time at b32), on the helix16 bs32 dspark6 gen worker of its
@@ -13,7 +13,7 @@
 # copied from that file unchanged; the AgentX trace replay, its client env, the
 # conversation router and the chat-history proxy options are left out. The ctx
 # section (the recipe's 16-GPU DWDP prefill fleet) is not started by
-# gen_only_no_context.
+# gen_only_no_context; the e2e lane runs the fleet in front of the gen worker.
 metadata:
   model_name: kimi_k3_nvfp4
   precision: fp4
@@ -58,7 +58,7 @@ environment:
   ctx_worker_env_var: CUDA_SCALE_LAUNCH_QUEUES=4x TLLM_V2_CTX_COST_KV_OFFSET=114000 TLLM_V2_CTX_COST_KV_DEPTH_THRESHOLD=143000
     TLLM_V2_CTX_COST_PER_CHUNK_DEPTH_TOKENS=0 TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS=0 TLLM_V2_CTX_DEMOTE_MAX_ITERS=0
     TRTLLM_CUTEDSL_SM_RESERVE=30 TRTLLM_CUTEDSL_DENSE_GEMM_SCHEDULER=clc_dynamic TLLM_MOE_ASYNC_INPUT_QUANT=0
-    TRTLLM_DWDP_PREFETCH_GATHER=1 TRTLLM_DWDP_GATHER_KERNEL=tma TRTLLM_DWDP_GATHER_BLOCKS=30 TRTLLM_DWDP_GATHER_THREADS=128
+    TRTLLM_DWDP_GATHER_BLOCKS=30 TRTLLM_DWDP_GATHER_THREADS=128
     TRTLLM_DWDP_GATHER_CLUSTER=2 TLLM_FMHA_LIBS=-flashinfer_trtllm_gen TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING=0
   server_env_var: TRTLLM_SERVER_DISABLE_GC=1
 profiling:
@@ -125,7 +125,9 @@ worker_config:
     disable_overlap_scheduler: true
     dwdp_config:
       contention_opt: false
+      copy_mode: gather
       dwdp_size: 16
+      gather_kernel: tma
       num_experts_per_worker: 56
       num_groups: 1
       num_prefetch_experts: 56

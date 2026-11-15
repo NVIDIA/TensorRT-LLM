@@ -13,8 +13,16 @@
 # License for the specific language governing permissions and limitations under
 # the License.
 
-add_tllm_gtest(cudaProfilerUtilsTest SOURCES cudaProfilerUtilsTest.cpp
-               FULL_STACK LABELS "unit;full-stack;host")
+add_tllm_gtest(
+  cudaProfilerUtilsTest
+  OWNER
+  common
+  SOURCES
+  cudaProfilerUtilsTest.cpp
+  LINK_LIBRARIES
+  tllm::common_profiler
+  LABELS
+  "unit;common;host")
 add_tllm_gtest(
   cudaUtilsTest
   OWNER
