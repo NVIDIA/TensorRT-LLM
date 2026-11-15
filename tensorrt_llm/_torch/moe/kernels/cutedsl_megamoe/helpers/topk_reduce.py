@@ -444,6 +444,7 @@ class TopkReduce:
         message_index: Optional[cute.Tensor] = None,  # (remote slot, token) -> message index
         topk_indices: Optional[cute.Tensor] = None,  # (token, topk) global expert ids
         local_rank: Optional[Int32] = None,
+        extra_term: Optional[cute.Tensor] = None,  # (>= token, hidden) bf16, added to every reduced row
     ):
         """Launch the reduce.
 
@@ -487,6 +488,13 @@ class TopkReduce:
         if cutlass.const_expr(topk_score is not None):
             topk_score = cute.make_tensor(
                 topk_score.iterator, cute.make_layout((topk_score.shape[0], self.num_topk), stride=topk_score.stride)
+            )
+
+        if cutlass.const_expr(extra_term is not None):
+            if cutlass.const_expr(self.ll_encoded or self.internode is not None):
+                raise ValueError("extra_term needs the static or persistent reduce.")
+            extra_term = cute.make_tensor(
+                extra_term.iterator, cute.make_layout((extra_term.shape[0], self.hidden), stride=extra_term.stride)
             )
 
         if cutlass.const_expr(self.ll_encoded):
@@ -538,10 +546,10 @@ class TopkReduce:
             launch_kwargs["preferred_smem_carveout"] = 0
         if cutlass.const_expr(self.persistent):
             self._reduce_persistent(
-                combine_quant, sf, topk_score, reduced_output, counters, num_tokens_dev, topk_indices
+                combine_quant, sf, topk_score, reduced_output, counters, num_tokens_dev, topk_indices, extra_term
             ).launch(**launch_kwargs)
         else:
-            self._reduce_static(combine_quant, sf, topk_score, reduced_output, topk_indices).launch(
+            self._reduce_static(combine_quant, sf, topk_score, reduced_output, topk_indices, extra_term).launch(
                 **launch_kwargs
             )
 
@@ -555,6 +563,7 @@ class TopkReduce:
         topk_score: Optional[cute.Tensor],   # (token, topk)
         reduced_output: cute.Tensor,         # (token, hidden)
         topk_indices: Optional[cute.Tensor] = None,  # (token, topk)
+        extra_term: Optional[cute.Tensor] = None,  # (token, hidden) bf16
     ):
         """One thread per (token, hidden_tile) worker; the grid carries the
         token count. This is the default path."""
@@ -568,6 +577,7 @@ class TopkReduce:
             reduced_output.shape[0],
             self.require_predicate,
             topk_indices,
+            extra_term,
         )
 
 
@@ -805,6 +815,7 @@ class TopkReduce:
         counters: cute.Tensor,  # int32 x1: work cursor, zeroed by the caller before every launch
         num_tokens_dev: cute.Tensor,  # int32 x1: valid token count
         topk_indices: Optional[cute.Tensor] = None,  # (token, topk)
+        extra_term: Optional[cute.Tensor] = None,  # (token, hidden) bf16
     ):
         """Fixed-grid form of the three ``_reduce_*`` kernels above.
         """
@@ -856,6 +867,7 @@ class TopkReduce:
                 num_tokens,
                 True,
                 topk_indices,
+                extra_term,
             )
 
             if need_fetch:
@@ -880,6 +892,7 @@ class TopkReduce:
         num_tokens: Int32,
         needs_guard: cutlass.Constexpr[bool] = True,
         topk_indices: Optional[cute.Tensor] = None,
+        extra_term: Optional[cute.Tensor] = None,
     ):
         """One ``(token, hidden_tile)`` cell, format-dispatched at compile time.
 
@@ -1045,6 +1058,29 @@ class TopkReduce:
                         else:
                             # +0 seed: a -0.0 first term yields +0.0 (main's semantics).
                             acc[i], acc[i + 1] = self._fma(dequant_pair, score, (Float32(0.0), Float32(0.0)))
+
+            if cutlass.const_expr(extra_term is not None):
+                extra = cute.make_rmem_tensor((hidden_per_thread,), cutlass.BFloat16)
+                extra_src = cute.zipped_divide(extra_term[token_idx, None], (hidden_per_thread,))[
+                    (None,), (hidden_tile_idx,)
+                ]
+                cute.copy(
+                    cute.make_copy_atom(
+                        cute.nvgpu.CopyUniversalOp(),
+                        cutlass.BFloat16,
+                        num_bits_per_copy=min(128, hidden_per_thread * cutlass.BFloat16.width),
+                    ),
+                    mark_alignment(extra_src, hidden_per_thread * cutlass.BFloat16.width // 8),
+                    extra,
+                )
+                if cutlass.const_expr(self.use_scalar_math):
+                    for i in cutlass.range_constexpr(hidden_per_thread):
+                        acc[i] = acc[i] + Float32(extra[i])
+                else:
+                    for i in cutlass.range_constexpr(0, hidden_per_thread, 2):
+                        acc[i], acc[i + 1] = cute.arch.add_packed_f32x2(
+                            (acc[i], acc[i + 1]), (Float32(extra[i]), Float32(extra[i + 1]))
+                        )
 
             out = cute.make_rmem_tensor((hidden_per_thread,), out_dtype)
             out.store(acc.load().to(out_dtype))

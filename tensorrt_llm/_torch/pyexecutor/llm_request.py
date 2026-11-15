@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import (TYPE_CHECKING, Any, Dict, Iterable, List, Optional,
                     Sequence, Union, cast)
 
+import numpy as np
 import torch
 
 import tensorrt_llm.bindings
@@ -76,6 +77,7 @@ def make_mm_encoder_transient_cache_key(request_id: int,
 
 
 if TYPE_CHECKING:
+    from ..speculative.interface import OneModelSamplingParams
     from ..tensor_lru_cache import TensorLRUCache
 
 
@@ -840,6 +842,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             return_routed_experts: bool = False,
             watermarking: Optional[bool] = None,
             **kwargs):
+        # Cached by OneModelSamplingParams.of_request.
+        self.py_spec_sampling_params: "OneModelSamplingParams | None" = None
+
         self.py_logits_post_processors = kwargs.pop("py_logits_post_processors",
                                                     None)
         # Owned entirely on the Python side: the TorchSampler is the only
@@ -987,14 +992,18 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             logprobs_mode)  # handle passed a raw string
         self.py_disaggregated_params = None
         self.py_conversation_params = None
-        # Uncached-prefill estimate published by the attention-DP router, if
-        # any. The V2 scheduler drops it when the demotion aging bound lets the
-        # request through.
+        # Prompt tokens beyond the conversation's previous turn, set by the
+        # conversation-aware attention-DP router; None when not estimated.
         self.py_uncached_prefill_tokens: int | None = None
         self.py_original_end_id = self.py_end_id
         self.py_bad_words = None
         self.py_no_repeat_ngram_size = None
         self.py_kv_hints: Optional[KvHintsSnapshot] = None
+        # The largest id of a prompt the prompt-tail transport restored
+        # (executor/prompt_tail.py) when recorded; None: admission scans it.
+        self.py_prompt_token_bound: Optional[int] = None
+        # Set once decoder-tail batching has held this context's final window for a pass.
+        self.py_ctx_decoder_held = False
 
         # In-forward Mamba snapshot point P the scheduler let this context
         # chunk run past (MambaHybridCacheManagerV2 consumes it).
@@ -1143,6 +1152,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_rewind_draft_token_separate_adjustment = 0
         self.py_decoding_iter = 0
         self.py_ctx_pre_resize_cap = None
+        self.py_draft_ctx_pre_resize_cap = None
         self.py_csa2_remote_tail_mode = None
         self.py_csa2_remote_tail_start = None
         self.py_csa2_remote_tail_split = None
@@ -1710,24 +1720,50 @@ def is_multimodal_encoder_ready(request: LlmRequest) -> bool:
     return not get_mm_pending_items(request)
 
 
+# From this prompt length on, one reduction over the received ids costs less than the full admission scan.
+_PROMPT_BOUND_MIN_IDS = 128 * 1024  # 128K
+
+
+def _restore_trimmed_prompt(tail_tokens, trimmed_prefix: int) -> np.ndarray:
+    """Full-length prompt ids from a sent tail and the number of ids left out before it."""
+    tail = np.asarray(tail_tokens, dtype=np.int32)
+    # A zeroed allocation can use untouched pages; only the tail is written.
+    tokens = np.zeros(trimmed_prefix + tail.size, dtype=np.int32)
+    tokens[trimmed_prefix:] = tail
+    return tokens
+
+
 def executor_request_to_llm_request(
         req_id: int,
         executor_request: ExecutorRequest | tllm_executor.Request,
         child_req_ids: List[int],
         exclude_last_generation_logits: bool,
         input_token_ids: Optional[List] = None,
-        position_ids: Optional[List] = None) -> LlmRequest:
+        position_ids: Optional[List] = None,
+        track_unique_tokens: bool = True) -> LlmRequest:
     envelope = ExecutorRequest.adapt(executor_request)
     inputs = envelope.inputs
     executor_request = envelope.request
     sampling_config = executor_request.sampling_config
 
-    if input_token_ids is not None:
-        input_tokens = input_token_ids
-    else:
-        # Owned int32 ndarray: the LlmRequest ctor memcpys it, where
-        # `input_token_ids` would build O(ISL) PyLongs to be cast back one by one.
-        input_tokens = executor_request.get_input_token_ids_array()
+    # The int32 array skips a Python int per prompt token.
+    input_tokens = (input_token_ids if input_token_ids is not None else
+                    executor_request.get_input_token_ids_array())
+    # A frontend may have sent only the prompt tail (executor/prompt_tail.py); the
+    # ids delivered to an attention-DP owner rank are that same tail.
+    trimmed_prefix = inputs.prompt_trimmed_prefix
+    prompt_token_bound = None
+    if trimmed_prefix:
+        if position_ids is not None:
+            raise ValueError(
+                "A request with a left-out prompt prefix cannot take split "
+                "input_token_ids")
+        received = np.asarray(input_tokens, dtype=np.int32)
+        if received.size and (trimmed_prefix + received.size
+                              >= _PROMPT_BOUND_MIN_IDS):
+            # The largest id read as unsigned, so a negative id is out of range.
+            prompt_token_bound = int(received.view(np.uint32).max())
+        input_tokens = _restore_trimmed_prompt(received, trimmed_prefix)
     if position_ids is None:
         position_ids = executor_request.position_ids
 
@@ -1869,6 +1905,7 @@ def executor_request_to_llm_request(
         llm_request_type=llm_request_type,
         context_phase_params=executor_request.context_phase_params,
         cache_salt=executor_request.cache_salt,
+        track_unique_tokens=track_unique_tokens,
         arrival_time=inputs.arrival_time,
         py_multimodal_data=py_multimodal_data,
         kv_cache_retention_config=executor_request.kv_cache_retention_config,
@@ -1899,6 +1936,7 @@ def executor_request_to_llm_request(
     # Published by the attention-DP router before this conversion, if at all.
     llm_request.py_uncached_prefill_tokens = inputs.uncached_prefill_tokens
     llm_request.py_kv_hints = inputs.kv_hints
+    llm_request.py_prompt_token_bound = prompt_token_bound
     if child_req_ids:
         for child_id in child_req_ids:
             llm_request.create_child_request(child_id)
@@ -1918,6 +1956,7 @@ def rewind_context_after_cache_drop(request: LlmRequest,
     request.context_chunk_size = request.prompt_len
     request.estimated_reusable_tokens = 0
     request.py_ctx_pre_resize_cap = None
+    request.py_draft_ctx_pre_resize_cap = None
 
 
 def get_draft_token_length(request: LlmRequest) -> int:
