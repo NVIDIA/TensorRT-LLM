@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.modules.context_logits import ContextLogitsWorkspace
+from tensorrt_llm._torch.modules.deterministic_linear import deterministic_linear
 from tensorrt_llm._torch.modules.embedding import LMHead
 from tensorrt_llm._torch.modules.linear import UnquantizedLinearMethod
 from tensorrt_llm._utils import get_sm_version
@@ -133,3 +134,16 @@ def test_context_logits_projection_token_count_invariance(monkeypatch, output_dt
         indices = torch.linspace(0, m - 1, 8, device="cuda").long()
         inputs[indices] = target
         torch.testing.assert_close(project(inputs)[indices], expected, rtol=0, atol=0)
+
+
+def test_linear_kernel_checks_its_arguments():
+    x = torch.zeros(3, 128, device="cuda", dtype=torch.bfloat16)
+    weight = torch.zeros(2, 128, device="cuda", dtype=torch.bfloat16)
+    # A bias view with a stride is read element by element, not as raw storage.
+    bias = torch.arange(4, device="cuda", dtype=torch.bfloat16)[::2]
+    assert deterministic_linear(x, weight, bias).float().tolist() == [[0.0, 2.0]] * 3
+    for bad_weight in (weight.new_zeros(2, 129), weight.new_zeros(2, 127), weight.new_zeros(128)):
+        with pytest.raises(ValueError, match="input features"):
+            deterministic_linear(x, bad_weight)
+    with pytest.raises(ValueError, match="output features"):
+        deterministic_linear(x, weight, weight.new_zeros(3))

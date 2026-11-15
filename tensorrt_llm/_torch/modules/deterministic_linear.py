@@ -66,7 +66,16 @@ def deterministic_linear(
     shape = x.shape[:-1]
     x = x.reshape(-1, x.shape[-1])
     m, k = x.shape
+    if weight.dim() != 2 or weight.shape[1] != k:
+        raise ValueError(f"weight of shape {tuple(weight.shape)} does not match {k} input features")
     n = weight.shape[0]
+    if bias is not None:
+        if bias.shape != (n,):
+            raise ValueError(
+                f"bias of shape {tuple(bias.shape)} does not match {n} output features"
+            )
+        # The kernel reads the bias with unit stride.
+        bias = bias.contiguous()
     bm, bn = (16, 64) if m < 32 else ((64, 64) if m < 256 else (128, 128))
     if out is None:
         output = torch.empty((m, n), device=x.device, dtype=output_dtype or x.dtype)
