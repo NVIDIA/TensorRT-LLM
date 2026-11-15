@@ -155,16 +155,19 @@ class _UniqueKeyLoader(yaml.SafeLoader):
             return
         self._checked_mappings.add(node)
         seen: set[object] = set()
+        merge_key = object()
         for key_node, _ in node.value:
-            # Merge keys and (unhashable) non-scalar keys are left to SafeLoader.
-            if not isinstance(key_node, yaml.ScalarNode) or key_node.tag == _YAML_MERGE_TAG:
+            # Non-scalar keys are left to SafeLoader. Merge directives have a distinct
+            # identity from a quoted '<<' key and may occur only once per mapping.
+            if not isinstance(key_node, yaml.ScalarNode):
                 continue
-            key = self.construct_object(key_node)
+            key = merge_key if key_node.tag == _YAML_MERGE_TAG else self.construct_object(key_node)
             if key in seen:
+                duplicate_key = "<<" if key is merge_key else key
                 raise yaml.constructor.ConstructorError(
                     "while constructing a mapping",
                     node.start_mark,
-                    f"found duplicate key {key!r}",
+                    f"found duplicate key {duplicate_key!r}",
                     key_node.start_mark,
                 )
             seen.add(key)

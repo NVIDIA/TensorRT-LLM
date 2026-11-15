@@ -151,9 +151,48 @@ def test_load_data_rejects_duplicate_keys_in_merge_sources(mod, tmp_path, merge)
         mod.load_data(tmp_path / "data.yml")
 
 
+@pytest.mark.parametrize(
+    "merge",
+    [
+        "  <<: {required: [{path: p/a.py, why: w}]}\n  <<: {required: []}",
+        "  <<: {<<: {required: [{path: p/a.py, why: w}]}, <<: {required: []}}",
+        "  <<: [{<<: {required: [{path: p/a.py, why: w}]}, <<: {required: []}}]",
+        "  <<: {<<: {<<: {required: [{path: p/a.py, why: w}]}, <<: {required: []}}}",
+    ],
+    ids=["direct", "mapping", "sequence", "nested"],
+)
+def test_load_data_rejects_duplicate_merge_directives(mod, tmp_path: Path, merge: str) -> None:
+    text = (
+        "version: 1\n"
+        "multi_gpu:\n"
+        f"{merge}\n"
+        "  file: t.groovy\n"
+        "  managed_prefix: p/\n"
+        "  forbidden: []\n"
+        "visual_gen: {file: r.py, tuples: []}\n"
+        "codeowners: {file: O, managed_prefixes: [], required: []}\n"
+    )
+    _write(tmp_path, "data.yml", text)
+    with pytest.raises(mod.ParseError, match="found duplicate key '<<'"):
+        mod.load_data(tmp_path / "data.yml")
+
+
 def test_merge_sources_still_allow_explicit_overrides(mod):
     assert yaml.load("<<: {required: [a]}\nrequired: []\n", Loader=mod._UniqueKeyLoader) == {
         "required": []
+    }
+
+
+def test_merge_source_sequence_keeps_first_source_precedence(mod) -> None:
+    assert yaml.load("<<: [{required: [a]}, {required: [b]}]\n", Loader=mod._UniqueKeyLoader) == {
+        "required": ["a"]
+    }
+
+
+def test_merge_key_is_distinct_from_literal_key(mod) -> None:
+    assert yaml.load("'<<': literal\n<<: {required: [a]}\n", Loader=mod._UniqueKeyLoader) == {
+        "<<": "literal",
+        "required": ["a"],
     }
 
 
