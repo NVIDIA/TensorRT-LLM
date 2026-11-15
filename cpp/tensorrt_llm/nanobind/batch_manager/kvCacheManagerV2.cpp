@@ -33,9 +33,11 @@
 #include "kv_cache_manager_v2/stats.h"
 #include "kv_cache_manager_v2/storage/config.h"
 #include "kv_cache_manager_v2/storage/core.h"
+#include "kv_cache_manager_v2/storageManager.h"
 #include "kv_cache_manager_v2/streamingEventSink.h"
 #include "kv_cache_manager_v2/utils/copyUtils.h"
 #include "kv_cache_manager_v2/utils/optionalGilRelease.h"
+#include "tensorrt_llm/common/logger.h"
 
 #include <algorithm>
 #include <cassert>
@@ -3833,6 +3835,111 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             {
                 nb::gil_scoped_release release;
                 return self.poolGroupDescs().raw();
+            })
+        .def(
+            "set_host_drop_hook",
+            [](kv::KvCacheManager& self, nb::object callback)
+            {
+                // The callable gets a list of (key: bytes, life_cycle: int, num_tokens: int, address: int, bytes: int),
+                // one per committed page the last host level drops, from inside eviction and before the slots are
+                // freed. `address` is valid only during the call. None removes the hook.
+                kv::HostDropHook hook;
+                if (!callback.is_none())
+                {
+                    if (!PyCallable_Check(callback.ptr()))
+                    {
+                        throw nb::type_error("set_host_drop_hook: callback must be callable or None");
+                    }
+                    // Held for the life of the process: releasing it would need the GIL at a time C++ chooses.
+                    PyObject* const fn = callback.release().ptr();
+                    // The storage manager owns the hook, so its stats outlive it.
+                    auto* const stats = &self.storage().hostDropStats();
+                    hook = [fn, stats](std::vector<kv::HostDropRecord> const& records)
+                    {
+                        nb::gil_scoped_acquire gil;
+                        // ~CommittedPage can get here from tp_dealloc while an exception is in flight: park it, so
+                        // the hook starts with a clean error indicator and the caller gets its exception back.
+                        nb::error_scope const pendingError;
+                        try
+                        {
+                            nb::list items;
+                            for (auto const& r : records)
+                            {
+                                items.append(nb::make_tuple(nb::bytes(r.key.data(), r.key.size()), r.lifeCycle,
+                                    r.numTokens, r.address, r.bytes));
+                            }
+                            nb::handle const callable(fn);
+                            callable(items);
+                        }
+                        catch (std::exception const& error) // nb::python_error included
+                        {
+                            auto const n = ++stats->errors;
+                            if (n <= 20 || n % 10000 == 0)
+                            {
+                                TLLM_LOG_WARNING("KV cache host-drop hook raised (#%lld): %s",
+                                    static_cast<long long>(n), error.what());
+                            }
+                        }
+                    };
+                }
+                // Never wait for the API lock with the GIL held: an evicting thread holds that lock while it waits
+                // for the GIL inside the hook. The replaced hook only holds a raw pointer, so dropping it needs no GIL.
+                nb::gil_scoped_release release;
+                auto const apiLock = self.lockExclusive();
+                self.storage().setHostDropHook(std::move(hook));
+            },
+            nb::arg("callback").none())
+        .def(
+            "host_drop_ring",
+            [](kv::KvCacheManager& self, size_t ringBytes, bool preferKernel)
+            {
+                // (address, slot_bytes, num_slots, kernel_copy) of the pinned ring the last host level copies its
+                // drops into. Switches the hand-off to the ring; the hook is no longer called on eviction.
+                kv::HostDropRingInfo info{};
+                {
+                    nb::gil_scoped_release release;
+                    info = self.storage().setUpHostDropRing(ringBytes, preferKernel);
+                }
+                return nb::make_tuple(info.address, info.slotBytes, info.numSlots, info.kernelCopy);
+            },
+            nb::arg("ring_bytes"), nb::arg("prefer_kernel") = true)
+        .def(
+            "drain_host_drops",
+            [](kv::KvCacheManager& self, size_t maxRecords)
+            {
+                // Ring records whose copies completed, oldest first: (key, life_cycle, num_tokens, slot, bytes).
+                std::vector<kv::HostDropRingRecord> records;
+                {
+                    nb::gil_scoped_release release;
+                    records = self.storage().drainHostDrops(maxRecords);
+                }
+                nb::list items;
+                for (auto const& r : records)
+                {
+                    items.append(nb::make_tuple(
+                        nb::bytes(r.key.data(), r.key.size()), r.lifeCycle, r.numTokens, r.slot, r.bytes));
+                }
+                return items;
+            },
+            nb::arg("max_records") = 4096)
+        .def(
+            "release_host_drop_slots",
+            [](kv::KvCacheManager& self, std::vector<int32_t> const& slots)
+            {
+                nb::gil_scoped_release release;
+                self.storage().releaseHostDropSlots(slots);
+            },
+            nb::arg("slots"))
+        .def("host_drop_stats",
+            [](kv::KvCacheManager& self)
+            {
+                // Cumulative host-drop hand-off counters, in pages.
+                auto& c = self.storage().hostDropStats();
+                nb::dict out;
+                out["handed"] = c.handed.load();
+                out["ring_full"] = c.ringFull.load();
+                out["errors"] = c.errors.load();
+                return out;
             })
         .def("clamp_max_seq_len_for_mem", &kv::KvCacheManager::clampMaxSeqLenForMem, nb::arg("batch_size"),
             nb::arg("token_num_upper_bound"), nb::call_guard<nb::gil_scoped_release>())

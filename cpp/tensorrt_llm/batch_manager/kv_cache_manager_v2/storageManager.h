@@ -28,13 +28,16 @@
 #include "kv_cache_manager_v2/storage/core.h"
 #include "tensorrt_llm/common/assert.h"
 
+#include <atomic>
 #include <cstdint>
 #include <deque>
 #include <functional>
 #include <list>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -43,6 +46,8 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 
 // Forward declarations.
 class Page;
+class StaticHostMem;
+class BatchedPageCopier;
 class KvCache;
 class CopyEngine;
 class StagingBuffer;
@@ -52,6 +57,46 @@ struct BackgroundDiskWrites; // utils/copyUtils.h
 using MigrationRecorder
     = std::function<void(std::vector<SharedPtr<Page>> const&, std::vector<Slot> const&, CacheLevel, CacheLevel)>;
 using DropRecorder = std::function<void(std::vector<SharedPtr<Page>> const&, CacheLevel)>;
+
+//! A committed page that the last host-memory cache level drops, described while its slot still holds the data.
+//! `address` points at the page's cold-page form in host memory and is valid only during the hook call.
+struct HostDropRecord
+{
+    std::string key; // radix block key
+    int32_t lifeCycle;
+    int32_t numTokens;
+    uint64_t address;
+    uint64_t bytes;
+};
+
+//! Called from inside eviction with the committed pages the last host level drops, before their slots are freed.
+using HostDropHook = std::function<void(std::vector<HostDropRecord> const&)>;
+
+//! A dropped host page copied into slot `slot` of the host-drop ring (see StorageManager::setUpHostDropRing).
+struct HostDropRingRecord
+{
+    std::string key; // radix block key
+    int32_t lifeCycle;
+    int32_t numTokens;
+    int32_t slot;
+    uint64_t bytes;
+};
+
+struct HostDropRingInfo
+{
+    uint64_t address;
+    uint64_t slotBytes;
+    int64_t numSlots;
+    bool kernelCopy; // true: the batched page-copy kernel; false: a host-callback memcpy on the ring's stream
+};
+
+//! Cumulative host-drop hand-off counters, in pages.
+struct HostDropStats
+{
+    std::atomic<int64_t> handed{0};   // pages passed to the hook or staged in the ring
+    std::atomic<int64_t> ringFull{0}; // pages dropped without a hand-off because no ring slot was free
+    std::atomic<int64_t> errors{0};   // failed hand-off calls
+};
 
 // Immutable bidirectional mapping between lifecycles and pool groups.
 class LifeCyclePoolGroupMapping
@@ -366,6 +411,41 @@ public:
     //! The hot level's second medium: host pages the GPU reads through a device mapping.
     [[nodiscard]] std::optional<CacheTier> sparseBackingMedium() const;
 
+    //! Installs (or, with an empty hook, removes) the host-drop hook. Inert until set.
+    void setHostDropHook(HostDropHook hook)
+    {
+        mHostDropHook = std::move(hook);
+    }
+
+    [[nodiscard]] bool hasHostDropHook() const noexcept
+    {
+        return static_cast<bool>(mHostDropHook);
+    }
+
+    //! Switches the last host level to the asynchronous hand-off: each dropped committed page is copied into a pinned
+    //! ring on a dedicated stream and queued, and no hook runs on the evicting thread. The ring is allocated on the
+    //! first call (at most `ringBytes`, at least 16 slots); later calls return the same ring. `preferKernel=false`
+    //! forces the host-callback copy.
+    HostDropRingInfo setUpHostDropRing(size_t ringBytes, bool preferKernel);
+    //! Ring records whose copies have completed, oldest first; a batch is never split.
+    std::vector<HostDropRingRecord> drainHostDrops(size_t maxRecords);
+    //! Returns ring slots to the free list once their contents have been consumed.
+    void releaseHostDropSlots(std::vector<int32_t> const& slots);
+
+    [[nodiscard]] bool hostDropAsync() const noexcept
+    {
+        return mHostDropAsync.load(std::memory_order_acquire);
+    }
+
+    [[nodiscard]] HostDropStats& hostDropStats() noexcept
+    {
+        return mHostDropStats;
+    }
+
+    //! Hands off a committed host page destroyed outside last-level eviction. Called from ~CommittedPage while the
+    //! page's block link and slot are still valid.
+    void handOffDestroyedPage(Page& page);
+
     // NOTE: Python's get_statistics(level) returns a list over all pool groups.
     // C++ takes a single pgIdx for flexibility; the nanobind wrapper loops over
     // all pool groups to match Python's signature.
@@ -607,6 +687,32 @@ private:
 
     // Owns the configured codec and outlives the storage and staging resources declared below.
     std::unique_ptr<IKvCacheColdPageCodec> mColdPageCodec;
+
+    // Host-drop hand-off; inert unless a connector installs a hook or sets up the ring.
+    HostDropHook mHostDropHook;
+    HostDropStats mHostDropStats;
+    void _handOffDroppedPages(std::vector<SharedPtr<Page>> const& pages, CacheLevel level);
+    void _queueHostDrops(std::vector<SharedPtr<Page>> const& pages, CacheLevel level);
+    void _releaseHostDropResources() noexcept;
+
+    struct HostDropBatch
+    {
+        CachedCudaEvent done;
+        std::vector<HostDropRingRecord> records;
+    };
+
+    std::mutex mHostDropMutex;
+    std::unique_ptr<StaticHostMem> mHostDropRing;
+    size_t mHostDropSlotBytes = 0;
+    std::vector<int32_t> mHostDropFree;
+    std::deque<HostDropBatch> mHostDropQueue;
+    CUstream mHostDropStream = nullptr;
+    CUcontext mHostDropCtx = nullptr;
+    std::unique_ptr<BatchedPageCopier> mHostDropCopier;
+    bool mHostDropKernel = false;
+    CUdeviceptr mHostDropPairsDev = 0;
+    size_t mHostDropPairsCap = 0; // in pairs
+    std::atomic<bool> mHostDropAsync{false};
 
     // Optional model-sized page staging is owned here and borrowed by CopyEngine.
     std::unique_ptr<StagingBufferManager> mPageStagingManager;
