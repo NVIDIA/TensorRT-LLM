@@ -44,6 +44,9 @@ def allreduce_rank_ordered(
     from .ops import allgather
 
     flat = input.reshape(-1)
+    if flat.numel() == 0:
+        # Every rank sees the same shape, so all of them skip the collective.
+        return torch.empty_like(input)
     if chunk_bytes is None:
         chunk_bytes = DETERMINISTIC_ALLREDUCE_CHUNK_BYTES
     chunk = max(1, chunk_bytes // (flat.element_size() * mapping.tp_size))

@@ -123,6 +123,40 @@ def run_deterministic_allreduce_rank(world, dtype, fusion_op, with_bias):
             for value, ref in zip(result, whole, strict=True):
                 torch.testing.assert_close(value, ref, rtol=0, atol=0)
 
+        # Distinct rows: each row of a multi-row call, whole or chunked inside
+        # the row, has the bits of the same row reduced alone.
+        multi_rows = torch.randn(world, 5, hidden, generator=generator).to(dtype)[rank].cuda()
+        multi_residual = torch.randn(5, hidden, generator=generator).to(dtype).cuda()
+        together = as_tuple(op(multi_rows, all_reduce_params=params(multi_residual)))
+        monkeypatch_value = deterministic_ops.DETERMINISTIC_ALLREDUCE_CHUNK_BYTES
+        deterministic_ops.DETERMINISTIC_ALLREDUCE_CHUNK_BYTES = 3 * 4096 + 1024
+        try:
+            pieces = as_tuple(op(multi_rows, all_reduce_params=params(multi_residual)))
+        finally:
+            deterministic_ops.DETERMINISTIC_ALLREDUCE_CHUNK_BYTES = monkeypatch_value
+        for row in range(5):
+            alone = as_tuple(
+                op(
+                    multi_rows[row : row + 1].contiguous(),
+                    all_reduce_params=params(multi_residual[row : row + 1]),
+                )
+            )
+            for value, piece, ref in zip(together, pieces, alone, strict=True):
+                torch.testing.assert_close(value[row : row + 1], ref, rtol=0, atol=0)
+                torch.testing.assert_close(piece[row : row + 1], ref, rtol=0, atol=0)
+
+        if (
+            world == 4
+            and fusion_op == AllReduceFusionOp.NONE
+            and dtype in (torch.float32, torch.bfloat16)
+        ):
+            # The documented order, rank by rank in FP32: ((2**25 + 1) - 2**25) + 1
+            # is 1. A pairwise order gives 0 and an FP64 sum gives 2.
+            contribution = (2.0**25, 1.0, -(2.0**25), 1.0)[rank]
+            x = torch.full((3, hidden), contribution, device="cuda", dtype=dtype)
+            (ordered,) = as_tuple(op(x, all_reduce_params=params(None)))
+            assert torch.equal(ordered, torch.ones_like(ordered))
+
         x = local_row.repeat(17, 1)
         residual = residual_row.repeat(17, 1)
         op(x, all_reduce_params=params(residual))
@@ -164,3 +198,11 @@ def test_nccl_deterministic_phase_and_graph(mpi_pool_executor, dtype, fusion_op,
         *zip(*[(world, dtype, fusion_op, with_bias)] * world),
     )
     assert all(results)
+
+
+def test_empty_input_skips_the_collective():
+    mapping = Mapping(world_size=4, rank=0, tp_size=4)
+    for shape in ((0, 4096), (3, 0)):
+        x = torch.empty(shape, device="cuda", dtype=torch.bfloat16)
+        output = deterministic_ops.allreduce_rank_ordered(x, mapping)
+        assert output.shape == x.shape and output.dtype == x.dtype
