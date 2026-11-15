@@ -156,7 +156,7 @@ class DepMergeMxfp8LinearMethod(MXFP8LinearMethod):
         if output is not None:
             return output if bias is None else output + bias
         if (
-            self.tune_decode_graph_backends
+            self.tune_mxfp8_backends
             and not is_torch_compiling()
             and _linear._FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get()
         ):

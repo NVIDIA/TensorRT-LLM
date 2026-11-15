@@ -2922,7 +2922,7 @@ def _swiglu_noh(mlp) -> bool:
         and type(method) is _NormqMXFP8LinearMethod
         and bool(getattr(method, "use_cutlass", False))
         and not (
-            getattr(method, "tune_decode_graph_backends", False)
+            getattr(method, "tune_mxfp8_backends", False)
             and _linear._FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get()
         )
     )
@@ -3019,7 +3019,7 @@ class _NormqMXFP8LinearMethod(MXFP8LinearMethod):
             prequant is None
             or not self.use_cutlass
             or (
-                self.tune_decode_graph_backends
+                self.tune_mxfp8_backends
                 and not is_torch_compiling()
                 and _linear._FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get()
             )

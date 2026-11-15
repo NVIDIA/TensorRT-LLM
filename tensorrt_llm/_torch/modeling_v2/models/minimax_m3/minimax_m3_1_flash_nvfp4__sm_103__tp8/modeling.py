@@ -902,7 +902,7 @@ def _mx_mode(state: _Mxfp8GemmState) -> MxMode:
     return MxMode(
         decode_graph=decode_graph,
         autotune=autotune,
-        tuned_quantize_gemm=method.tune_decode_graph_backends and decode_graph,
+        tuned_quantize_gemm=method.tune_mxfp8_backends and decode_graph,
         flashinfer=method.backend == "flashinfer"
         or (
             method.backend == "auto"

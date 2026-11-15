@@ -95,7 +95,7 @@ def _decode_graph_core(monkeypatch, pinned: bool):
     )
     monkeypatch.setattr(m, "linear_path", lambda *a: m.GENERIC_GEMM_PATH)
     monkeypatch.setattr(m.m3_prequant.SLOT, "pending", None)
-    method = types.SimpleNamespace(tune_decode_graph_backends=True)
+    method = types.SimpleNamespace(tune_mxfp8_backends=True)
     return types.SimpleNamespace(
         w={"w": torch.zeros(16, 32), "s": torch.zeros(16, 1)},
         mxfp8=types.SimpleNamespace(quant_method=method),

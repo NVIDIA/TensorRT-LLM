@@ -67,7 +67,7 @@ def _method(cls):
     method.backend = "trtllm"
     method.use_native_autotuner = False
     method._flashinfer_autotuned = False
-    method.tune_decode_graph_backends = True
+    method.tune_mxfp8_backends = True
     return method
 
 

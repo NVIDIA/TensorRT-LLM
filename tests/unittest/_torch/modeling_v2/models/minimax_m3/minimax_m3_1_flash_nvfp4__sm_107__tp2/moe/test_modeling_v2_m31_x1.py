@@ -157,7 +157,7 @@ def test_real_experts_match_current_path_eager_and_graph(monkeypatch, rows, fina
         },
         mxfp8=SimpleNamespace(
             quant_method=SimpleNamespace(
-                tune_decode_graph_backends=False,
+                tune_mxfp8_backends=False,
                 backend="auto",
                 _flashinfer_autotuned=False,
                 needs_native_autotune=False,

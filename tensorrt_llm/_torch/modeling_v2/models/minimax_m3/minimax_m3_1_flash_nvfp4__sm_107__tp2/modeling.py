@@ -2098,7 +2098,7 @@ class MxMode:
     decode_graph: bool  # inside a decode CUDA-graph warmup or capture
     autotune: bool  # inside the engine's FlashInfer MXFP8 tuning pass
     tuned_quantize_gemm: (
-        bool  # per-bucket tuned quantize + GEMM (decode graphs, tune_decode_graph_backends)
+        bool  # per-bucket tuned quantize + GEMM (decode graphs, tune_mxfp8_backends)
     )
     flashinfer: bool  # FlashInfer's MXFP8 GEMM on the quantized activation
     native_tuning: (
@@ -2113,7 +2113,7 @@ def _mx_mode(state: _Mxfp8GemmState) -> MxMode:
     return MxMode(
         decode_graph=decode_graph,
         autotune=autotune,
-        tuned_quantize_gemm=method.tune_decode_graph_backends and decode_graph,
+        tuned_quantize_gemm=method.tune_mxfp8_backends and decode_graph,
         flashinfer=method.backend == "flashinfer"
         or (
             method.backend == "auto"
@@ -2402,7 +2402,7 @@ def _linear(
         and s2 is None
         and prequant is None
         and MX_TAC_TP4
-        and core.mxfp8.quant_method.tune_decode_graph_backends
+        and core.mxfp8.quant_method.tune_mxfp8_backends
         and linear_path(n, k, rows, False, low_m_gemm) == GENERIC_GEMM_PATH
     ):
         # The stock bf16 branch below is m3_mxfp8_pinned_quantize + this GEMM: the boundary wrote those bytes.
@@ -2418,7 +2418,7 @@ def _linear(
         s2 is not None
         and prequant is None
         and MX_TAC_TP4
-        and core.mxfp8.quant_method.tune_decode_graph_backends
+        and core.mxfp8.quant_method.tune_mxfp8_backends
         and linear_path(n, k, rows, False, low_m_gemm) == GENERIC_GEMM_PATH
     ):
         # The stock bf16 branch below is the pinned MX-TAC quantize + GEMM: the same GEMM on the fused tail's bytes.
@@ -2437,7 +2437,7 @@ def _linear(
         path = linear_path(n, k, rows, prequant is not None, low_m_gemm)
     output = None
     # MX-TAC: the decode-graph MXFP8 quantize and GEMM at the target's fixed tactics, no AutoTuner.
-    pinned = MX_TAC_TP4 and core.mxfp8.quant_method.tune_decode_graph_backends
+    pinned = MX_TAC_TP4 and core.mxfp8.quant_method.tune_mxfp8_backends
     if prequant is not None:
         act, act_scale = prequant
         fold_cfg = _fold_cfg(n, k, rows) if defer and path == MX_GEMV_PATH else None

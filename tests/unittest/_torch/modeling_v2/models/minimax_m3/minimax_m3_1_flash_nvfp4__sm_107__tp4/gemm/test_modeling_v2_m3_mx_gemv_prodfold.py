@@ -299,7 +299,7 @@ def test_the_decode_attention_glue_folds_the_producer(monkeypatch, bf16, rows) -
         },
         mxfp8=SimpleNamespace(
             quant_method=SimpleNamespace(
-                tune_decode_graph_backends=False,
+                tune_mxfp8_backends=False,
                 backend="trtllm",
                 _flashinfer_autotuned=False,
                 needs_native_autotune=False,

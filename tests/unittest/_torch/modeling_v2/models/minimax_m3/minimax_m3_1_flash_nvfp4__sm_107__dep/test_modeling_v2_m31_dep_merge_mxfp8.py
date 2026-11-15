@@ -209,7 +209,7 @@ def _method(**attrs):
     method.backend = "trtllm"
     method.use_native_autotuner = False
     method._flashinfer_autotuned = False
-    method.tune_decode_graph_backends = False
+    method.tune_mxfp8_backends = False
     for name, value in attrs.items():
         setattr(method, name, value)
     return method
@@ -239,7 +239,7 @@ def test_apply_in_decode_graphs_runs_the_tuned_gemm_half_on_the_hand_off(monkeyp
     x, (q8, sf) = _published()
     token = _linear._FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.set(True)
     try:
-        out = _method(tune_decode_graph_backends=True).apply(_MODULE, x, None)
+        out = _method(tune_mxfp8_backends=True).apply(_MODULE, x, None)
     finally:
         _linear._FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.reset(token)
     ((a, kw),) = seen
@@ -264,7 +264,7 @@ def test_where_the_pin_engages_the_hand_off_runs_the_pinned_cute_tactic(monkeypa
     monkeypatch.setattr(merge_mxfp8, "mxfp8_gemm_autotuned", lambda *a, **kw: tuned.append(a))
     x, (q8, sf) = _published()
     bias = torch.full((2,), 3.0)
-    out = _decode_graph_apply(_method(tune_decode_graph_backends=True), _MODULE, x, bias)
+    out = _decode_graph_apply(_method(tune_mxfp8_backends=True), _MODULE, x, bias)
     ((a),) = pinned
     assert a == (q8, sf, _MODULE.weight, _MODULE.weight_scale, torch.bfloat16)
     assert tuned == [] and torch.equal(out, torch.full((2,), 4.0))
@@ -281,7 +281,7 @@ def test_unengaged_or_killed_the_hand_off_keeps_the_tuned_gemm(monkeypatch, kill
         merge_mxfp8, "mxfp8_gemm_autotuned", lambda *a, **kw: tuned.append(a) or torch.zeros(1)
     )
     x, (q8, sf) = _published()
-    _decode_graph_apply(_method(tune_decode_graph_backends=True), _MODULE, x)
+    _decode_graph_apply(_method(tune_mxfp8_backends=True), _MODULE, x)
     assert len(pinned) == (0 if killed else 1) and len(tuned) == 1 and tuned[0][0] is q8
 
 
