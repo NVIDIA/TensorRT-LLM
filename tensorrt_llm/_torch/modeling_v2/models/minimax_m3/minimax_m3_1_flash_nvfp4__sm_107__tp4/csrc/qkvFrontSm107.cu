@@ -380,12 +380,15 @@ __device__ __forceinline__ uint16_t quantize_fp4x4(float const (&e)[4], float se
     return static_cast<uint16_t>(fp32x8_to_e2m1(q));
 }
 
-struct alignas(64) FrontArgs
+// Aligned as its CUtensorMap member requires (at least 64 bytes), so the map stays aligned in the kernel argument.
+struct FrontArgs
 {
     CUtensorMap tmw; // weight [N, 6144] u8, box 128 K x 128 rows, SWIZZLE_128B
     QkvFrontParams p;
     int earlyTrigger;
 };
+
+static_assert(alignof(FrontArgs) >= 64, "the tensor map needs 64-byte alignment");
 
 // ---------------------------------------------------------------- the boundary row (warps 0..14 of a cluster < rows)
 // The cluster kernel (options 32) for row t over this CTA's kKs columns, then the MXFP8 copy into the hand-off.
