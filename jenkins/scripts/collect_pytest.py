@@ -93,6 +93,13 @@ def collect(args: list[str], log_dir: Path, timeout: float, retries: int) -> int
                 stdout=stdout,
                 stderr=stderr,
                 start_new_session=True,
+                # Collection imports test modules without starting the MPI runtime.
+                env={
+                    **os.environ,
+                    "MPI4PY_RC_INITIALIZE": "0",
+                    "TRT_LLM_NO_LIB_INIT": "1",
+                    "TLLM_DISABLE_MPI": "1",
+                },
             )
             try:
                 code = process.wait(timeout=timeout)

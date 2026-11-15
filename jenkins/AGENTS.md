@@ -71,6 +71,9 @@ Scope: this directory and its descendants. Supplements the repository-root
   deadline still applies. Keep attempt stdout/stderr under the stage result
   directory so the normal result upload preserves them on failure. Only the
   successful attempt's `output.txt` is parsed into the shard list.
+  The collection child disables mpi4py auto-initialization and TensorRT-LLM
+  library initialization. Keep these environment overrides local to that child;
+  normal test execution must retain its original runtime configuration.
 
 - For new or modified long pytest options that take a single file or directory
   path, use `--option=value` when supported. Keep the option and value in one
