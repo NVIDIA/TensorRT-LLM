@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Callable
 from functools import cache
 from importlib import import_module
@@ -262,6 +263,11 @@ class PrimsTSFmha(PhasedFmha):
 
     def __init__(self, attn: "TrtllmAttention") -> None:
         super().__init__(attn)
+        # Library selection is fixed when the attention instance is created.
+        self._explicitly_enabled = any(
+            entry.strip() in ("prims_ts", "+prims_ts")
+            for entry in os.environ.get("TLLM_FMHA_LIBS", "").split(",")
+        )
         # Cache each manager/pool's K-to-V page displacement without retaining
         # the manager itself.
         self._kv_page_offset_cache: dict[tuple[int, int], int] = {}
@@ -351,6 +357,10 @@ class PrimsTSFmha(PhasedFmha):
         *,
         phase: Optional[FmhaPhase] = None,
     ) -> bool:
+        favorable, reason = self._is_perf_favorable(forward_args)
+        if not favorable:
+            logger.debug(f"PrimTS FMHA is not performance-favorable: {reason}")
+            return False
         supported, reason = self._is_supported_with_reason(
             q,
             k,
@@ -363,6 +373,18 @@ class PrimsTSFmha(PhasedFmha):
         if not supported:
             logger.debug(f"PrimTS FMHA does not support request: {reason}")
         return supported
+
+    def _is_perf_favorable(self, forward_args: AttentionForwardArgs) -> tuple[bool, str]:
+        """Honor explicit selection; otherwise use the measured MLA generation path."""
+        if self._explicitly_enabled:
+            return True, ""
+        if not self.attn.is_mla_enable:
+            return False, "standard attention is not enabled by the performance policy."
+        if forward_args.attention_input_type != AttentionInputType.generation_only:
+            return False, "only MLA generation is enabled by the performance policy."
+        if get_sm_version() != 107:
+            return False, "MLA generation is enabled by the performance policy only on SM107."
+        return True, ""
 
     def _is_supported_with_reason(
         self,

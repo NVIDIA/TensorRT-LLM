@@ -827,34 +827,67 @@ def test_phase_support_check_preserves_whole_request_semantics(phase: FmhaPhase)
     assert "at least one KV" in reason
 
 
-def test_is_supported_accepts_and_forwards_phase_keyword(
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "selection,sm,is_mla,input_type,kernel_supported,expected",
+    [
+        (None, 107, True, AttentionInputType.generation_only, True, True),
+        (None, 107, True, AttentionInputType.generation_only, False, False),
+        (None, 100, True, AttentionInputType.generation_only, True, False),
+        (None, 103, True, AttentionInputType.generation_only, True, False),
+        (None, 107, True, AttentionInputType.context_only, True, False),
+        (None, 107, True, AttentionInputType.mixed, True, False),
+        (None, 107, False, AttentionInputType.generation_only, True, False),
+        ("+prims_ts", 100, False, AttentionInputType.context_only, True, True),
+        ("prims_ts", 103, True, AttentionInputType.context_only, True, True),
+        ("prims_ts,fallback", 107, True, AttentionInputType.generation_only, False, False),
+    ],
+)
+def test_is_supported_applies_perf_policy_and_forwards_phase(
     monkeypatch: pytest.MonkeyPatch,
+    selection: str | None,
+    sm: int,
+    is_mla: bool,
+    input_type: AttentionInputType,
+    kernel_supported: bool,
+    expected: bool,
 ) -> None:
-    attn = _Attention()
+    if selection is None:
+        monkeypatch.delenv("TLLM_FMHA_LIBS", raising=False)
+    else:
+        monkeypatch.setenv("TLLM_FMHA_LIBS", selection)
+    attn = _Attention(is_mla=is_mla)
     fmha = PrimsTSFmha(attn)
-    support_check = Mock(return_value=(True, ""))
+    support_check = Mock(return_value=(kernel_supported, ""))
+    monkeypatch.setattr(prims_ts_module, "get_sm_version", lambda: sm)
     monkeypatch.setattr(fmha, "_is_supported_with_reason", support_check)
     q = Mock(spec=torch.Tensor)
     metadata = SimpleNamespace()
-    forward_args = AttentionForwardArgs()
+    forward_args = AttentionForwardArgs(attention_input_type=input_type)
 
-    assert fmha.is_supported(
-        q,
-        None,
-        None,
-        metadata,
-        forward_args,
-        phase=FmhaPhase.GENERATION,
+    assert (
+        fmha.is_supported(
+            q,
+            None,
+            None,
+            metadata,
+            forward_args,
+            phase=FmhaPhase.GENERATION,
+        )
+        is expected
     )
-    support_check.assert_called_once_with(
-        q,
-        None,
-        None,
-        attn,
-        metadata,
-        forward_args,
-        phase=FmhaPhase.GENERATION,
-    )
+    if expected or not kernel_supported:
+        support_check.assert_called_once_with(
+            q,
+            None,
+            None,
+            attn,
+            metadata,
+            forward_args,
+            phase=FmhaPhase.GENERATION,
+        )
+    else:
+        support_check.assert_not_called()
 
 
 @pytest.mark.parametrize(
