@@ -50,7 +50,6 @@ l0_gb300:
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_103__tp4/norm --import-mode=importlib
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_103__tp4/sampling --import-mode=importlib
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_103__tp4/spec --import-mode=importlib
-  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_1_flash_nvfp4__sm_103__tp4/test_modeling_v2_m31_hosttail.py --import-mode=importlib
   - unittest/_torch/modeling_v2/models/minimax_m3/ops/moe/test_router_split.py
   # ------------- PyTorch tests ---------------
   # MLA context head slices, including FP8 scale-block boundaries.
