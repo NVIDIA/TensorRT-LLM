@@ -2407,7 +2407,7 @@ def fetchBuildArtifact(pipeline, String artifactPath, String dest, String mode =
 
 def cppTestArtifactPath(String config, String stageName)
 {
-    if (!stageName.contains("-CPP-") || !(config in [VANILLA_CONFIG, LINUX_AARCH64_CONFIG])) {
+    if (!stageName.contains("-CPP-") || config != VANILLA_CONFIG) {
         return ""
     }
     return "${ARTIFACT_PATH}/cpp-tests-${BUILD_CONFIGS[config][TARNAME]}"

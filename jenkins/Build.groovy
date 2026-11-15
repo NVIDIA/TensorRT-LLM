@@ -202,7 +202,6 @@ def BUILD_CONFIGS = [
     (WHEEL_ARCHS): "80;86;89;90;100;103;107;120",
   ],
   (CONFIG_LINUX_AARCH64): [
-    (CPP_TEST_BUNDLE): true,
     (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars NIXL_ROOT=/opt/nvidia/nvda_nixl --extra-cmake-vars MOONCAKE_ROOT=/usr/local/Mooncake --extra-cmake-vars ENABLE_BOLT_COMPATIBLE=ON",
     (TARNAME) : "TensorRT-LLM-GH200.tar.gz",
     (WHEEL_ARCHS): "90;100;103;107;120;121",

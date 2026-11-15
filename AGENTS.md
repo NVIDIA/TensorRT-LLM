@@ -244,10 +244,10 @@ The Linux Release source-build fixture reuses the installed CI library for the
 RNN formatter test. CI source and wheel use the same commit and image per
 architecture. Link/load errors fail the tests. Direct CMake builds use source
 libraries unless explicitly configured otherwise.
-`CONFIG_LINUX_X86_64_VANILLA` and `CONFIG_LINUX_AARCH64` also build `google-tests`
-and publish the `cpp_test_bundle` CMake component as a separate
+`CONFIG_LINUX_X86_64_VANILLA` also builds `google-tests`
+and publishes the `cpp_test_bundle` CMake component as a separate
 `cpp-tests-<main-tar-name>` artifact. The main package does not include the test
-programs. Only `-CPP-` stages using these two build configurations fetch and unpack
+programs. Only `-CPP-` stages using this build configuration fetch and unpack
 the companion into `src/cpp/build`, including fat-image consumers. Build reuse
 requires both artifacts. Linux Release integration fixtures use this bundle
 directly, retaining CTest selection and retries. The two FMHA tests share a
