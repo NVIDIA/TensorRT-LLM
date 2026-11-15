@@ -11,8 +11,8 @@ import tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops as cute_dsl_custom_ops
 from tensorrt_llm._torch.autotuner import AutoTuner
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 
+# Not cpu_only: AutoTuner.get() reads the CUDA device name.
 pytestmark = [
-    pytest.mark.cpu_only,
     pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="Requires CUTLASS DSL"),
 ]
 
