@@ -37,6 +37,10 @@ def _coordinator(manager: Mock, receive: Mock) -> DisaggTransferCoordinator:
     )
     coordinator = object.__new__(DisaggTransferCoordinator)
     coordinator._effects = PyExecutorEffects(executor)
+    coordinator._kv_cache_manager = manager
+    coordinator._is_kv_manager_v2 = True
+    coordinator._deferred_gen_receives = []
+    coordinator._started_gen_receives = {}
     coordinator._transceiver = SimpleNamespace(
         request_and_receive_async=receive,
         request_and_receive_sync=receive,
@@ -72,6 +76,9 @@ def _manager() -> Mock:
         KVCacheManagerV2._prepare_disagg_gen_init_cache, manager
     )
     manager.prepare_resources = MethodType(KVCacheManagerV2.prepare_resources, manager)
+    manager.wait_disagg_receive_ready = MethodType(
+        KVCacheManagerV2.wait_disagg_receive_ready, manager
+    )
     return manager
 
 
@@ -219,7 +226,7 @@ def test_readmission_refreshes_readiness_event(monkeypatch: pytest.MonkeyPatch) 
 
     assert manager.prepare_disagg_gen_init(request)
     assert manager.prepare_disagg_gen_init(request)
-    manager.prepare_resources(SimpleNamespace(context_requests=[request]))
+    manager.wait_disagg_receive_ready([request])
 
     first_ready.synchronize.assert_not_called()
     latest_ready.record.assert_called_once_with(manager._stream)

@@ -1430,7 +1430,9 @@ class TestKVCacheFailuresCtx:
         """Both pools claim the minimum of their backed-off probe depths.
 
         Pairing up front rather than claim-then-reconcile keeps the mismatch path
-        -- free the draft pages, re-claim shallower -- off the common case.
+        -- free the draft pages, re-claim shallower -- off the common case. The
+        draft's depth also goes to the target, whose capped lookup cannot see a
+        fork past the claim.
         """
         mgr = make_kv_cache_manager(tokens_per_block=64, enable_joint_kv_cache_reuse=True)
         draft_mgr = make_kv_cache_manager(tokens_per_block=64)
@@ -1455,6 +1457,7 @@ class TestKVCacheFailuresCtx:
         assert ids(out.context_requests) == [0]
         assert draft_mgr.prepare_context_cache.call_args_list == [call(req, expected)]
         mgr.prepare_context_cache.assert_called_once_with(req, expected)
+        mgr.note_context_fork.assert_called_once_with(req, draft_probe)
         draft_mgr.free_resources.assert_not_called()
 
     def test_paired_reuse_falls_back_to_zero_when_pools_disagree(self):
@@ -4603,6 +4606,31 @@ class TestPrefixAwareSkip:
         out = sched.schedule_request([req0, req1], {0})
         assert ids(out.context_requests) == [1]
 
+    def test_unpaid_deferral_stops_after_contributor_leaves_context(self):
+        """A duplicate whose first new block is still uncommitted after its contributor finished the
+        context phase was not repaid; it and later duplicates of that block are admitted together
+        instead of one per iteration (n samples of one prompt)."""
+        mgr = self._keyed_manager({i: b"blockA" for i in range(4)})
+        sched = make_scheduler(mgr, max_num_tokens=10000)
+        reqs = [make_ctx_request(i, 40) for i in range(4)]
+        assert ids(sched.schedule_request(reqs, set()).context_requests) == [0]
+        # req0 ran its whole context and is generating (still active, in flight); the block is
+        # still not in the tree.
+        reqs[0].state_value = make_gen_request(0).state_value
+        reqs[0].is_context_init_state = False
+        out = sched.schedule_request(reqs, {0})
+        assert ids(out.context_requests) == [1, 2, 3]
+
+    def test_deferral_kept_while_contributor_is_still_in_context(self):
+        """A contributor still prefilling (chunked) keeps its duplicates deferred."""
+        mgr = self._keyed_manager({0: b"blockA", 1: b"blockA"})
+        sched = make_scheduler(mgr, max_num_tokens=10000)
+        req0, req1 = make_ctx_request(0, 500), make_ctx_request(1, 500)
+        assert ids(sched.schedule_request([req0, req1], set()).context_requests) == [0]
+        req0.is_first_context_chunk = False
+        out = sched.schedule_request([req0, req1], {0})
+        assert 1 not in ids(out.context_requests)
+
     def test_distinct_prefixes_not_deferred(self):
         mgr = self._keyed_manager({0: b"blockA", 1: b"blockB"})
         sched = make_scheduler(mgr, max_num_tokens=10000)
@@ -5074,10 +5102,10 @@ def test_parked_connector_load_keeps_kv_pressure_retryable() -> None:
 
 
 @pytest.mark.parametrize("remote_mode", [None, "source", "destination"])
-def test_replay_only_batch_clears_deferred_generation_overlap_state(
+def test_remote_tail_source_defers_generation_and_destination_mixes(
     remote_mode: str | None,
 ) -> None:
-    """A resumed decode must not compensate for a token already harvested on CPU."""
+    """Only a source-only batch must clear the deferred decode's overlap state."""
     manager = make_kv_cache_manager()
     scheduler = make_scheduler(manager, max_num_tokens=256)
     decoding = make_gen_request(0)
@@ -5087,7 +5115,7 @@ def test_replay_only_batch_clears_deferred_generation_overlap_state(
 
     first = scheduler.schedule_request([decoding, replay], set())
     assert ids(first.context_requests) == [1]
-    if remote_mode is None:
+    if remote_mode != "source":
         assert ids(first.generation_requests) == [0]
         assert decoding.py_batch_idx == 7
     else:
@@ -5096,10 +5124,11 @@ def test_replay_only_batch_clears_deferred_generation_overlap_state(
         manager.try_allocate_generation.assert_not_called()
         manager.suspend_request.assert_not_called()
 
-    # After replay finishes, the deferred request resumes without losing KV.
-    resumed = scheduler.schedule_request([decoding], set())
-    assert ids(resumed.generation_requests) == [0]
-    manager.try_allocate_generation.assert_called_with(decoding)
+    if remote_mode == "source":
+        # The deferred request resumes from its host token count.
+        resumed = scheduler.schedule_request([decoding], set())
+        assert ids(resumed.generation_requests) == [0]
+        manager.try_allocate_generation.assert_called_with(decoding)
 
 
 @pytest.mark.parametrize("prompt_len", [0, 8])

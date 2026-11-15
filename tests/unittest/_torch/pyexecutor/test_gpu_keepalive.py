@@ -318,9 +318,12 @@ def test_fill_gate_wiring():
     class CleanupStub:
         _executor_loop_cleanup = pe.PyExecutor._executor_loop_cleanup
         _executor_events = None
+        _flush_staged_responses = pe.PyExecutor._flush_staged_responses
 
         def __init__(self, keepalive):
             self.events = []
+            self._staged_responses = []
+            self._intake_window = threading.Event()
             self.response_cv = threading.Condition(threading.Lock())
             self.response_cv.notify_all = lambda: self.events.append("notify_all")
             self.is_shutdown = False
