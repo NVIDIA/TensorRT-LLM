@@ -563,6 +563,13 @@ class Mamba2Metadata:
         self.query_start_loc = None
         self.query_start_loc_long = self._arange_buffer_long[:batch_size + 1]
 
+        replay_counter = getattr(kv_cache_manager, "mamba_replay_num_tokens",
+                                 None)
+        if replay_counter is not None and batch_size > 0:
+            # Exact replay advances its rows on every step, steady or not.
+            from .exact_replay import prepare_exact_replay_rows
+            prepare_exact_replay_rows(self, replay_counter, batch_size, 0, None)
+
         flush = getattr(kv_cache_manager, "flush_state_transfers", None)
         if flush is not None:
             flush()
