@@ -145,7 +145,10 @@ disable_ubi_repos_rockylinux() {
   # ones, and the install fails. The Rocky repositories carry the same packages,
   # so install from them only. The setting persists for later build steps.
   local ubi_repos
-  ubi_repos=$(dnf repolist --enabled | awk '$1 ~ /^ubi-8-/ {print $1}')
+  ubi_repos=$(
+    set -o pipefail
+    dnf repolist --enabled | awk '$1 ~ /^ubi-8-/ {print $1}'
+  )
   if [ -z "${ubi_repos}" ]; then
     return
   fi
