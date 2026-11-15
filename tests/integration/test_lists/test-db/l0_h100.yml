@@ -18,6 +18,7 @@ l0_h100:
   tests:
   - unittest/_torch/moe/test_moe_backend.py::test_cutlass_moe_routing_round_trip
   - unittest/_torch/moe/test_moe_backend.py::test_cutlass_moe_public_activation_ids
+  - unittest/_torch/moe/test_moe_backend.py::test_cutlass_fp8_block_scales_skewed_routing
   # Covers the GPU cases of tests/unittest/_torch/attention/ on H100; its cpu_only cases
   # run on CPU (l0_cpu). kernels/ has no entry of its own on any list, so this entry is
   # what runs it here. multi_gpu/ cases need >= 2 GPUs and most also need Blackwell, so

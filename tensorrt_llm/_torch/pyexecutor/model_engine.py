@@ -586,6 +586,10 @@ class ModelEngine:
                 self.llm_args.lora_config is not None
                 and self.llm_args.lora_config.cuda_graph_specialize_lora
             ),
+            samples_from_vocab_shards=(
+                isinstance(self.model, (DecoderModelForCausalLM, MultimodalModelMixin))
+                and self.model.samples_from_vocab_shards
+            ),
             spec_decode_fast_paths=self.spec_decode_fast_paths,
             watermark_config=self.llm_args.watermark_config,
             **extra_fields,
@@ -632,6 +636,10 @@ class ModelEngine:
         if isinstance(self._runner, DecoderRunner):
             return self._runner.spec_metadata
         return None
+
+    def replays_final_windows_only(self) -> bool:
+        """See ``DecoderRunner.replays_final_windows_only``."""
+        return isinstance(self._runner, DecoderRunner) and self._runner.replays_final_windows_only()
 
     @property
     def cuda_graph_runner(self) -> CUDAGraphRunner | None:

@@ -184,6 +184,8 @@ moe_config:
 
 The *Backend Capability Matrix* and *Quantization Support* tables: [`MOE_DEVELOPER_GUIDE.md`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md).
 
+For DeepSeek-V4 and DeepSeek-V4.1 on `MEGAMOE_CUTEDSL`, `moe_config.megamoe_fuse_shared_expert: true` (prototype) runs the model's single FP8 block-scale shared expert inside the MegaMoE kernel instead of as a separate MLP. It applies on SM100 / SM103 under attention DP with `moe_tensor_parallel_size` 1, to the target, one-model MTP and draft MoE layers together: either all of them fuse or none does. Otherwise the shared expert stays separate, and on `MEGAMOE_CUTEDSL` a warning names the reason.
+
 ### Terminology
 
 - **`world_size`**: number of ranks (GPUs) the model is served on.

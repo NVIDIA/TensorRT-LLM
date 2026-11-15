@@ -124,6 +124,8 @@ class DSparkAttentionKernel:
         # rounding. 0 keeps the generic DSpark attention output path unchanged.
         self.inverse_rope_dim = 0
         self.seq_len_q = seq_len_q
+        # Query tokens per M tile; with two, each CTA of the pair owns one token.
+        self.q_tokens_per_tile = 1
         self.mma_qk_tiler_k = mma_qk_tiler_k
         self.cluster_shape_mnk = (2, 1, 1)
         self.use_2cta_instrs = True
@@ -1747,7 +1749,9 @@ class DSparkAttentionKernel:
         tmem_thr_copy = tmem_tiled_copy.get_slice(tidx_compute)
         tTR_tS_for_sink = tmem_thr_copy.partition_D(cS)
         local_row = tTR_tS_for_sink[0][0]
-        head_idx = common_params.blk_coord[0] * cta_qk_tiler[0] + local_row
+        head_idx = local_row
+        if cutlass.const_expr(self.q_tokens_per_tile == 1):
+            head_idx += common_params.blk_coord[0] * cta_qk_tiler[0]
         my_sink = self.acc_dtype(0)
         # TMA zero-fills query rows outside the head dimension. The matching
         # sink loads must also be masked for a partially occupied head tile.
@@ -2377,8 +2381,11 @@ class DSparkAttentionKernel:
             tR2G_rO_src.store(tTR_rAcc.load().to(self.o_dtype))
             if cutlass.const_expr(self.inverse_rope_dim > 0):
                 nope_dim = self.latent_dim - self.inverse_rope_dim
+                token = common_params.blk_coord[1]
+                if cutlass.const_expr(self.q_tokens_per_tile == 2):
+                    token += common_params.blk_coord[0]
                 freqs_base = (
-                    common_params.blk_coord[2] * self.seq_len_q + common_params.blk_coord[1]
+                    common_params.blk_coord[2] * self.seq_len_q + token
                 ) * self.inverse_rope_dim
                 for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc), 2):
                     d = tTR_cO[i][1]
@@ -2391,7 +2398,13 @@ class DSparkAttentionKernel:
                         tR2G_rO_src[i] = (re * cos + im * sin).to(self.o_dtype)
                         tR2G_rO_src[i + 1] = (im * cos - re * sin).to(self.o_dtype)
 
-            if cute.elem_less(tTR_cO[0][0], common_params.H):
+            store_valid = cute.elem_less(tTR_cO[0][0], common_params.H)
+            if cutlass.const_expr(self.q_tokens_per_tile == 2 and self.seq_len_q % 2 == 1):
+                # The overlapping last tile of an odd block repeats its first token.
+                store_valid = store_valid & (
+                    (common_params.blk_coord[1] % 2 == 0) | (common_params.blk_coord[0] == 1)
+                )
+            if store_valid:
                 cute.autovec_copy(
                     tR2G_rO_src,
                     tR2G_rO_dst,
