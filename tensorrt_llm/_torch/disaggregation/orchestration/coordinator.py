@@ -42,6 +42,12 @@ _LEGACY_RETIRE_RETRY_INTERVAL = 2
 # batch for a while, but a peer that never asks must stay reclaimable.
 _CTX_PEER_WAIT_TIMEOUT_MULTIPLIER = 3
 
+# A started receive stays tracked until its request leaves these states.
+_RECEIVE_STATES = (
+    LlmRequestState.DISAGG_GENERATION_INIT,
+    LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
+)
+
 
 def is_gen_only_no_context_benchmark() -> bool:
     """Whether the ``gen_only_no_context`` benchmark skips KV transfer."""
@@ -94,6 +100,9 @@ class DisaggTransferCoordinator:
     # Class-level default, so a coordinator assembled without ``__init__``
     # keeps the blocking receive fence.
     _defer_unready_gen_receives = False
+    # Since take_gen_receive_counters: most deferred receives pending at once, and the wait (s).
+    _max_deferred_gen_receives = 0
+    _gen_receive_ready_wait_s = 0.0
 
     def __init__(
         self,
@@ -149,6 +158,16 @@ class DisaggTransferCoordinator:
         self._retiring_gen_receives: Dict[int, LlmRequest] = {}
         self._gen_termination_requested: Set[int] = set()
         self._fleet_has_retiring_gen_receives = False
+        # Prepared gen-init requests whose receive waits for start_deferred_gen_receives.
+        self._deferred_gen_receives: List[LlmRequest] = []
+        # Only a rank that polls its generation receives alone (a single rank, or attention DP with
+        # one pipeline stage) may post the ready ones first: helix CP ranks poll in a CP collective.
+        self._post_ready_gen_receives_first = is_kv_manager_v2 and (
+            dist.world_size == 1
+            or (enable_attention_dp and dist.pp_size == 1 and dist.cp_size == 1)
+        )
+        # Gen-init requests whose receive was started and not yet finished, by request id.
+        self._started_gen_receives: dict[int, LlmRequest] = {}
 
     # -- loop head -----------------------------------------------------------
 
@@ -534,23 +553,34 @@ class DisaggTransferCoordinator:
         )
 
     @nvtx_range("receive_gen_init")
-    def receive_gen_init(self, admitted: List[LlmRequest]) -> None:
+    def receive_gen_init(self, admitted: List[LlmRequest], defer: bool = False) -> None:
         """Prepare executor resources for the admitted gen-init requests, then
-        start their KV receive in the configured transfer mode."""
+        start their KV receive in the configured transfer mode.
+
+        ``defer`` says a forward step is in flight: asynchronous receives that
+        wait for KV admission work queued behind it are then posted by
+        ``start_deferred_gen_receives``. Their resources are prepared before that
+        work finishes, so the executor does not defer with a KV connector.
+        """
         if not admitted:
+            return
+        if defer and self._is_kv_manager_v2 and uses_async_gen_transfer():
+            self._effects.prepare_gen_resources(admitted)
+            self._emit_admission_diagnostics(admitted)
+            self._deferred_gen_receives.extend(admitted)
+            self._max_deferred_gen_receives = max(
+                self._max_deferred_gen_receives, len(self._deferred_gen_receives)
+            )
             return
         defer_unready = self._defer_unready_gen_receives and uses_async_gen_transfer()
         # Take the admission readiness events first, so preparing resources
         # does not block this thread on them; publication polls them instead.
         fences = self._take_receive_fences(admitted) if defer_unready else {}
+        if not defer_unready:
+            self._wait_gen_receive_ready(admitted)
         self._effects.prepare_gen_resources(admitted)
-        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED and self._is_kv_manager_v2:
-            # Selection and resource preparation are committed; receive
-            # publication may still wait for destination readiness below.
-            for req in admitted:
-                disagg_diagnostics.emit_kv_admission_result(
-                    req, self._kv_cache_manager, admitted=True, dist=self._dist
-                )
+        self._emit_admission_diagnostics(admitted)
+        self._started_gen_receives.update((req.py_request_id, req) for req in admitted)
 
         # gen_only_no_context has no CTX worker, so mark each request as
         # transmission-complete immediately.
@@ -569,26 +599,80 @@ class DisaggTransferCoordinator:
             self._check_transfer_errors("generation requests")
             return
 
-        if defer_unready:
-            for req in admitted:
-                self._unpublished_gen_receives[req.py_request_id] = (
-                    req,
-                    fences.get(req.py_request_id),
-                )
-            # Admission is rank-uniform: report before any rank starts one.
-            self._report_deferred_gen_receives()
-            self._publish_ready_gen_receives()
-            # A request still waiting leaves DISAGG_GENERATION_INIT as well, so
-            # every admitted request ends in the same state on every rank and
-            # the scheduler does not admit it again.
-            for req in admitted:
-                if req.py_request_id in self._unpublished_gen_receives:
-                    req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
-        else:
-            for req in admitted:
-                self._transceiver.request_and_receive_async(req)
-            self._stamp_gen_transfer_start(admitted)
+        if not defer_unready:
+            self._start_gen_receives(admitted)
+            return
+        for req in admitted:
+            self._unpublished_gen_receives[req.py_request_id] = (
+                req,
+                fences.get(req.py_request_id),
+            )
+        # Admission is rank-uniform: report before any rank starts one.
+        self._report_deferred_gen_receives()
+        self._publish_ready_gen_receives()
+        # A request still waiting leaves DISAGG_GENERATION_INIT as well, so
+        # every admitted request ends in the same state on every rank and
+        # the scheduler does not admit it again.
+        for req in admitted:
+            if req.py_request_id in self._unpublished_gen_receives:
+                req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+        self.reap_gen_receives(0)
 
+    def _emit_admission_diagnostics(self, admitted: List[LlmRequest]) -> None:
+        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED and self._is_kv_manager_v2:
+            # Selection and resource preparation are committed; receive
+            # publication may still wait for destination readiness.
+            for req in admitted:
+                disagg_diagnostics.emit_kv_admission_result(
+                    req, self._kv_cache_manager, admitted=True, dist=self._dist
+                )
+
+    @nvtx_range("start_deferred_gen_receives")
+    def start_deferred_gen_receives(self, wait_all: bool = True) -> None:
+        """Post the receives deferred by ``receive_gen_init(defer=True)``.
+
+        Must run with ``wait_all`` before the next scheduling pass, which would
+        otherwise admit the prepared requests again. Without it a rank that polls
+        its receives alone posts only the requests whose admission work is done.
+        """
+        if not self._deferred_gen_receives:
+            return
+        deferred, self._deferred_gen_receives = self._deferred_gen_receives, []
+        # A request failed since its preparation no longer owns its pages; the
+        # status poll still runs, as it would have for the whole batch.
+        admitted = [req for req in deferred if req.state == LlmRequestState.DISAGG_GENERATION_INIT]
+        if not wait_all and self._post_ready_gen_receives_first:
+            ready = [
+                req for req in admitted if self._kv_cache_manager.disagg_receive_ready_done(req)
+            ]
+            if len(ready) != len(admitted):
+                ready_ids = {id(req) for req in ready}
+                self._deferred_gen_receives = [req for req in admitted if id(req) not in ready_ids]
+                if not ready:
+                    return
+                admitted = ready
+        self._wait_gen_receive_ready(admitted)
+        self._started_gen_receives.update((req.py_request_id, req) for req in admitted)
+        self._start_gen_receives(admitted)
+
+    def _wait_gen_receive_ready(self, requests: List[LlmRequest]) -> None:
+        # A remote write does not follow stream order, so it waits for the pages' admission work.
+        if self._is_kv_manager_v2:
+            start = time.perf_counter()
+            self._kv_cache_manager.wait_disagg_receive_ready(requests)
+            self._gen_receive_ready_wait_s += time.perf_counter() - start
+
+    def take_gen_receive_counters(self) -> Tuple[int, float]:
+        """Return and reset the most deferred receives pending at once and the wait in ms."""
+        counters = (self._max_deferred_gen_receives, self._gen_receive_ready_wait_s * 1e3)
+        self._max_deferred_gen_receives = len(getattr(self, "_deferred_gen_receives", ()))
+        self._gen_receive_ready_wait_s = 0.0
+        return counters
+
+    def _start_gen_receives(self, admitted: List[LlmRequest]) -> None:
+        for req in admitted:
+            self._transceiver.request_and_receive_async(req)
+        self._stamp_gen_transfer_start(admitted)
         self.reap_gen_receives(0)
 
     def _align_sync_receive_failures_across_cp(self, admitted: List[LlmRequest]) -> None:
@@ -724,16 +808,24 @@ class DisaggTransferCoordinator:
     # -- batch execution -----------------------------------------------------
 
     def completed_gen_receives(self, scheduled_batch: "ScheduledRequests") -> List[LlmRequest]:
-        """Generation requests in the batch whose KV receive has completed.
+        """Generation requests in the batch whose KV receive has completed, in batch order.
 
         Read-only: the executor prepares batch-level resources for these
         requests while they are still transmission-complete, then calls
-        ``try_finish_gen_receive`` for each request in the batch.
+        ``try_finish_gen_receive`` for each of them. Only requests with a
+        started receive are visited, not the whole batch.
         """
+        started = self._started_gen_receives
+        completed = set()
+        for request_id, req in list(started.items()):
+            if req.is_disagg_generation_transmission_complete:
+                completed.add(request_id)
+            elif req.state not in _RECEIVE_STATES:
+                del started[request_id]
+        if not completed:
+            return []
         return [
-            req
-            for req in scheduled_batch.generation_requests
-            if req.is_disagg_generation_transmission_complete
+            req for req in scheduled_batch.generation_requests if req.py_request_id in completed
         ]
 
     def try_finish_gen_receive(self, request: LlmRequest) -> bool:
@@ -745,6 +837,7 @@ class DisaggTransferCoordinator:
         """
         if not request.is_disagg_generation_transmission_complete:
             return False
+        self._started_gen_receives.pop(request.py_request_id, None)
         request.state = LlmRequestState.GENERATION_IN_PROGRESS
         # commit_blocks_for_reuse requires the position to be at the prompt end.
         request.context_current_position = request.prompt_len
@@ -1185,11 +1278,12 @@ class DisaggTransferCoordinator:
         return pending
 
     def forget_request(self, request_id: int) -> None:
-        """Drop per-request cancellation bookkeeping once the request is freed."""
+        """Drop per-request cancellation and receive bookkeeping once the request is freed."""
         self._timed_out_ctx_cancelled_ids.discard(request_id)
         self._timed_out_gen_cancelled_ids.discard(request_id)
         self._legacy_retire_retry.pop(request_id, None)
         self._unpublished_gen_receives.pop(request_id, None)
+        self._started_gen_receives.pop(request_id, None)
 
     @nvtx_range("cancel_timed_out_gen_transfers")
     def _cancel_timed_out_gen_transfers(self) -> None:
@@ -1372,7 +1466,13 @@ class NoopDisaggCoordinator(DisaggTransferCoordinator):
     def align_gen_admission_across_cp(self, admitted: List[LlmRequest]) -> List[LlmRequest]:
         return admitted
 
-    def receive_gen_init(self, admitted: List[LlmRequest]) -> None:
+    def receive_gen_init(self, admitted: List[LlmRequest], defer: bool = False) -> None:
+        return None
+
+    def take_gen_receive_counters(self) -> Tuple[int, float]:
+        return 0, 0.0
+
+    def start_deferred_gen_receives(self, wait_all: bool = True) -> None:
         return None
 
     def completed_gen_receives(self, scheduled_batch: "ScheduledRequests") -> List[LlmRequest]:

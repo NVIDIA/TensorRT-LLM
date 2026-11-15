@@ -424,15 +424,41 @@ inline int getMaxSharedMemoryPerBlockOptin()
 template <typename T>
 inline int getMaxActiveBlocksPerSM(T kernel, int blockSize, size_t dynamicSMemSize)
 {
-    static std::unordered_map<T, int> cache;
-    auto it = cache.find(kernel);
+    // Occupancy depends on the launch shape, so a kernel launched with several block or shared-memory sizes gets one
+    // entry per shape.
+    struct Key
+    {
+        T kernel;
+        int blockSize;
+        size_t dynamicSMemSize;
+
+        bool operator==(Key const& other) const
+        {
+            return kernel == other.kernel && blockSize == other.blockSize && dynamicSMemSize == other.dynamicSMemSize;
+        }
+    };
+
+    struct KeyHash
+    {
+        size_t operator()(Key const& key) const
+        {
+            size_t seed = std::hash<T>{}(key.kernel);
+            seed ^= std::hash<int>{}(key.blockSize) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+            seed ^= std::hash<size_t>{}(key.dynamicSMemSize) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+            return seed;
+        }
+    };
+
+    static std::unordered_map<Key, int, KeyHash> cache;
+    Key const key{kernel, blockSize, dynamicSMemSize};
+    auto it = cache.find(key);
     if (it != cache.end())
     {
         return it->second;
     }
     int numBlocks;
     check_cuda_error(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocks, kernel, blockSize, dynamicSMemSize));
-    cache[kernel] = numBlocks;
+    cache[key] = numBlocks;
     return numBlocks;
 }
 

@@ -10,6 +10,7 @@ from typing import Optional
 from torch import nn
 
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm.llmapi.llm_args import auto_moe_backend_for_load_balancer
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -99,9 +100,30 @@ def _copy_model_config_with_moe_backend(
     draft_config._frozen = False
     try:
         draft_config.moe_backend = resolved_moe_backend
+        # The copy selects by its own backend: a moe_config.tactic names the
+        # target's experts, not these.
+        draft_config.moe_tactic = None
     finally:
         draft_config._frozen = was_frozen
     return draft_config
+
+
+def _mtp_moe_backend(model_config: ModelConfig) -> Optional[str]:
+    """The MoE backend the MTP layers request for themselves, or None to share the target's config.
+
+    The router refuses ``speculative_config.moe_tactic`` for this target, so the MTP layers
+    select by ``speculative_config.moe_backend``. With it unset they share the target's
+    config, unless ``moe_config.tactic`` pins the target: that tactic names the target's
+    experts, so the MTP layers resolve AUTO for their own weights, as the built-in MTP
+    drafter does. AUTO follows the per-layer dynamic EPLB rule of the target's balancer,
+    which the MTP layers register into.
+    """
+    requested_moe_backend = getattr(model_config.spec_config, "moe_backend", None)
+    if requested_moe_backend is None and model_config.moe_tactic is not None:
+        requested_moe_backend = "AUTO"
+    if requested_moe_backend == "AUTO":
+        requested_moe_backend = auto_moe_backend_for_load_balancer(model_config.moe_load_balancer)
+    return requested_moe_backend
 
 
 def _get_mtp_moe_quant_config(model_config: ModelConfig, layer_idx: int) -> QuantConfig:

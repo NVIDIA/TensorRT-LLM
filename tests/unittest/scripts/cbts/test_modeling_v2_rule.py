@@ -67,7 +67,7 @@ def rule(tmp_path) -> ModelingV2Rule:
         Block(yaml_stem="l0_cpu", block_index=0, condition={}, tests=["unittest/tools", _TREE]),
     ]
     stages = {
-        "B300-PyTorch-1": Stage("B300-PyTorch-1", "l0_b300", "aarch64", 1, 2),
+        "DGX_B300-PyTorch-1": Stage("DGX_B300-PyTorch-1", "l0_b300", "x86_64", 1, 4),
         "GB300-4_GPUs-PyTorch-1": Stage(
             "GB300-4_GPUs-PyTorch-1", "l0_gb300_multi_gpus", "aarch64", 1, 1
         ),
@@ -202,7 +202,7 @@ def test_k3_family_paths_select_kernel_collective_and_host_tests(rule, relative)
     selected = kernel_tests | {matrix, norm, native, host, accuracy, _TREE}
     assert _selected(result) == selected
     assert result.affected_stages == {
-        "B300-PyTorch-1",
+        "DGX_B300-PyTorch-1",
         "B200-PyTorch-1",
         "GB300-4_GPUs-PyTorch-1",
         "CPU-Generic-x86-1",
@@ -276,6 +276,8 @@ def test_k3_ci_runs_once_on_b300_or_gb300_by_topology():
                 if stage.yaml_stem == block.yaml_stem and block_matches_stage(block, stage)
             }
             assert matched == (
-                {"GB300-4_GPUs-PyTorch-1"} if multi else {"B300-PyTorch-1", "B300-PyTorch-2"}
+                {"GB300-4_GPUs-PyTorch-1"}
+                if multi
+                else {f"DGX_B300-PyTorch-{split}" for split in range(1, 5)}
             )
     assert seen == expected
