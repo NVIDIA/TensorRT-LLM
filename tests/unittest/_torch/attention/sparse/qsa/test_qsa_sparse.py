@@ -19,14 +19,23 @@ from tensorrt_llm._torch.attention.backends.sparse.qsa.indexer import (
 from tensorrt_llm._torch.attention.backends.sparse.qsa.kernels import (
     QSA_GENERATION_MAPPING_MAX_SEQS,
     _expand_launch,
+    _expand_qsa_block_indices_kernel,
+    _qsa_decode_token_mapping_kernel,
     _qsa_generation_token_mapping_kernel,
     _qsa_index_scores_query_tile,
+    _qsa_merge_splitk_kernel,
+    _qsa_paged_index_scores_kernel,
+    _qsa_paged_index_scores_qtile_kernel,
+    _qsa_paged_kv_store_kernel,
+    _qsa_paged_sparse_gqa_splitk_kernel,
+    _qsa_unscale_block_table_kernel,
     triton_qsa_decode_pre_indexer,
     triton_qsa_decode_token_mapping,
     triton_qsa_generation_token_mapping,
     triton_qsa_mtp_reuse_topk,
     triton_qsa_paged_index_scores,
     triton_qsa_paged_kv_store,
+    triton_qsa_paged_sparse_gqa,
     triton_qsa_prefill_compress,
     triton_qsa_unscale_block_table,
 )
@@ -598,11 +607,20 @@ def test_qsa_generation_token_mapping_matches_general_mapping(
         assert (actual[num_tokens:] == -7).all()
 
 
+def _at_offset(values: torch.Tensor, offset: int) -> torch.Tensor:
+    """``values`` as a view ``offset`` elements into a larger vector (unaligned for odd offsets)."""
+    view = torch.empty(offset + values.numel(), dtype=values.dtype, device=values.device)[offset:]
+    return view.copy_(values)
+
+
+@pytest.mark.parametrize("decode", [False, True])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_qsa_generation_token_mapping_compiles_once() -> None:
+def test_qsa_token_mapping_compiles_once(decode: bool) -> None:
     """Every batch size and verify width reuses one compiled kernel."""
+    kernel = _qsa_decode_token_mapping_kernel if decode else _qsa_generation_token_mapping_kernel
     compiled = []
     for num_seqs, width in ((1, 1), (1, 3), (16, 3), (17, 4), (64, 1), (256, 3)):
+        width = 1 if decode else width
         seq_lens = torch.full((num_seqs,), width, dtype=torch.int32, device="cuda")
         kv_lens = seq_lens + 1029 + torch.arange(num_seqs, dtype=torch.int32, device="cuda")
         num_tokens = num_seqs * width
@@ -612,22 +630,128 @@ def test_qsa_generation_token_mapping_compiles_once() -> None:
             torch.empty(num_tokens, dtype=torch.int32, device="cuda"),
             torch.empty(num_tokens, dtype=torch.int32, device="cuda"),
         )
-        triton_qsa_generation_token_mapping(
+        mapping = dict(
             kv_lens=kv_lens,
             seq_lens=seq_lens,
             request_indices=outputs[0],
             logical_positions=outputs[1],
             sequence_lengths=outputs[2],
             visible_blocks=outputs[3],
-            num_rows=num_tokens,
             compress_ratio=4,
         )
+        if decode:
+            triton_qsa_decode_token_mapping(**mapping)
+        else:
+            triton_qsa_generation_token_mapping(**mapping, num_rows=num_tokens)
         expected = _general_token_mapping(kv_lens, seq_lens, num_tokens, 4)
         for actual, reference in zip(outputs, expected):
             torch.testing.assert_close(actual, reference, rtol=0, atol=0)
-        cache = _qsa_generation_token_mapping_kernel.device_caches[torch.cuda.current_device()][0]
-        compiled.append(len(cache))
+        compiled.append(len(kernel.device_caches[torch.cuda.current_device()][0]))
     assert len(set(compiled)) == 1, compiled
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_qsa_row_metadata_kernels_compile_once() -> None:
+    """Block-index expansion, paged index scores (row-wise and query tile) and block-table unscale:
+    one compiled kernel per launch class for every row count and metadata offset, with the
+    results of aligned copies."""
+    torch.manual_seed(3)
+    device = torch.cuda.current_device()
+    kernels = (
+        _expand_qsa_block_indices_kernel,
+        _qsa_paged_index_scores_kernel,
+        _qsa_paged_index_scores_qtile_kernel,
+        _qsa_unscale_block_table_kernel,
+    )
+    tokens_per_block, ratio, pages, heads, head_dim = 8, 4, 40, 4, 16
+    block_table = torch.arange(4 * pages, dtype=torch.int32, device="cuda").view(4, pages)
+    index_cache = torch.randn(4 * pages, tokens_per_block, 1, head_dim, device="cuda").bfloat16()
+
+    def run(rows: int, offset: int) -> list:
+        positions = torch.randint(100, pages * tokens_per_block, (rows,), device="cuda").int()
+        requests = torch.randint(0, 4, (rows,), dtype=torch.int32, device="cuda")
+        blocks = torch.randint(0, 25, (rows, 128), dtype=torch.int32, device="cuda")
+        q = torch.randn(rows, heads, head_dim, device="cuda").bfloat16()
+        scaled = torch.where(block_table < 0, block_table, block_table * 48).repeat(rows, 1)
+        out = [
+            expand_qsa_block_indices(
+                blocks, _at_offset(positions, offset), _at_offset(positions + 1, offset),
+                compress_ratio=ratio, token_topk=512,
+            ),
+            triton_qsa_paged_index_scores(
+                q=q, index_cache=index_cache, block_table=block_table,
+                query_positions=_at_offset(positions, offset),
+                request_indices=_at_offset(requests, offset), tokens_per_block=tokens_per_block,
+                compress_ratio=ratio, context_rows=rows > 256,
+            ),
+            torch.empty_like(scaled),
+        ]  # fmt: skip
+        triton_qsa_unscale_block_table(
+            scaled_block_table=scaled, block_table=out[2], page_index_scale=48
+        )
+        return out
+
+    run(8, 0)
+    run(300, 0)
+    compiled = [len(k.device_caches[device][0]) for k in kernels]
+    for rows in (5, 64, 272, 513):
+        for offset in (1, 3):
+            state = torch.random.get_rng_state(), torch.cuda.get_rng_state()
+            actual = run(rows, offset)
+            torch.random.set_rng_state(state[0])
+            torch.cuda.set_rng_state(state[1])
+            for a, e in zip(actual, run(rows, 0)):
+                torch.testing.assert_close(a, e, rtol=0, atol=0, equal_nan=True)
+    assert [len(k.device_caches[device][0]) for k in kernels] == compiled
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_qsa_kv_store_and_splitk_compile_once_per_launch_class() -> None:
+    """K/V store, split-K sparse GQA and its merge: one compiled kernel per launch class for every
+    row count in the class (the split count and PDL follow the row bucket)."""
+    torch.manual_seed(5)
+    device = torch.cuda.current_device()
+    kernels = (
+        _qsa_paged_kv_store_kernel,
+        _qsa_paged_sparse_gqa_splitk_kernel,
+        _qsa_merge_splitk_kernel,
+    )
+    pages, tokens_per_block, head_dim, q_heads = 16, 8, 64, 4
+    k_cache = torch.zeros(pages, 1, tokens_per_block, head_dim, dtype=torch.bfloat16, device="cuda")
+    v_cache = torch.zeros_like(k_cache)
+    block_table = torch.arange(pages, dtype=torch.int32, device="cuda").view(2, pages // 2)
+
+    def run(rows: int) -> None:
+        requests = torch.randint(0, 2, (rows,), dtype=torch.int32, device="cuda")
+        positions = torch.randint(0, pages // 2 * tokens_per_block, (rows,), device="cuda")
+        kv = torch.randn(rows, 1, head_dim, dtype=torch.bfloat16, device="cuda")
+        triton_qsa_paged_kv_store(
+            k=kv,
+            v=kv,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            request_indices=requests,
+            logical_positions=positions,
+            block_table=block_table,
+            tokens_per_block=tokens_per_block,
+        )
+        triton_qsa_paged_sparse_gqa(
+            q=torch.randn(rows, q_heads, head_dim, dtype=torch.bfloat16, device="cuda"),
+            k_cache=k_cache,
+            v_cache=v_cache,
+            block_table=block_table,
+            selected_tokens=torch.randint(0, 64, (rows, 512), dtype=torch.int32, device="cuda"),
+            request_indices=requests,
+            tokens_per_block=tokens_per_block,
+            softmax_scale=head_dim**-0.5,
+        )
+
+    for first, others in ((2, (1, 3, 4)), (33, (32, 48, 100))):
+        run(first)
+        compiled = [len(k.device_caches[device][0]) for k in kernels]
+        for rows in others:
+            run(rows)
+        assert [len(k.device_caches[device][0]) for k in kernels] == compiled, first
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

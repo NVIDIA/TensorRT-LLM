@@ -103,6 +103,7 @@ def executor() -> PyExecutor:
     engine.enable_iter_perf_stats = False
     engine.num_fetch_requests = 0
     engine.should_exclude_last_generation_logits = False
+    engine.track_unique_tokens = True
     engine._pop_from_waiting_queue = Mock(return_value=([], {}))
     engine._maybe_record_hang_diagnostic_phase = Mock()
     engine._terminate_request = Mock(side_effect=AssertionError("unactivated request teardown"))

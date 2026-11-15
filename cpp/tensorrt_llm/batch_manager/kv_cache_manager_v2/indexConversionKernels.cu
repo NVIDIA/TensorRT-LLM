@@ -157,7 +157,9 @@ __global__ __launch_bounds__(kThreads) void indexConversionScratchKernel(IndexTa
     int32_t const end = min(begin + (kThreads << lg2Blocks), rowBlocks);
     for (int32_t block = begin + static_cast<int32_t>(threadIdx.x); block < end; block += kThreads)
     {
-        if (block >= scratchBeg && block < scratchEnd)
+        int32_t const slot = raw[block];
+        // A block in the scratch range that already has a regular page keeps it.
+        if (slot == kBadPageIndex.value() && block >= scratchBeg && block < scratchEnd)
         {
             // The slot cursor advances by the sub-pages each scratch block occupies. The
             // layer's own offset wraps inside the slot: a scratch slot is shared, so the
@@ -169,7 +171,6 @@ __global__ __launch_bounds__(kThreads) void indexConversionScratchKernel(IndexTa
                 : slotId * desc.scale + (total % desc.scale + offset) % desc.scale;
             continue;
         }
-        int32_t const slot = raw[block];
         out[block] = slot == kBadPageIndex.value() ? kBadPageIndex.value() : slot * desc.scale + offset;
     }
 }

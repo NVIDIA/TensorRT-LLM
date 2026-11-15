@@ -122,9 +122,20 @@ KVCM supports independent policies for callers that provide those indices.
 The sparse fetch path configured by `sparseCache` still uses one group per layer;
 its setup uses the checked layer lookup and rejects split layers.
 
-SSM lifecycles are deduplicated by policy, so a manager can have up to three SSM
-groups; iterate `ssmLifeCycleIds()` for working state and use
-`requiredSsmLifeCycleId()` only for prefix pruning.
+SSM lifecycles of layer buffers are deduplicated by policy, so layer configs give
+a manager up to three SSM groups; iterate `ssmLifeCycleIds()` for working state
+and use `requiredSsmLifeCycleId()` only for prefix pruning.
+
+`KVCacheManagerConfig::regions` declares buffers whose lifecycle comes from a
+`RegionConfig` rather than from a layer config. Each region has a lifecycle of
+its own: the region index is part of the `SsmLifeCycle` key, so a region never
+merges with a layer lifecycle or another region of equal policy. Region
+lifecycles are registered after every layer lifecycle, in declaration order, so
+declaring one never renumbers the layer groups. Only request regions with the
+`PRIVATE` policy are supported, on layers that have an `SsmLayerConfig`; a
+`(layer, role)` pair belongs to one layer config or one region. A region is an
+`SsmLifeCycle`, so every kind-dispatch site treats it as SSM state: one slot per
+cache and beam. `getRegionGroupId(name)` (`get_region_group_id`) resolves it.
 Optional SSM checkpoints require an exact endpoint match, including partial
 blocks. Fresh or unselected recurrent state must be initialized or reconstructed
 by the caller before inference. A pool-group index is a storage-layout index and is
@@ -358,6 +369,22 @@ physically duplicate the whole prompt; ownership splits at the prompt tail:
 - Every cache level has storage and a per-level eviction controller; each pool
   group has a priority-sorted set of LRU queues. Lower priority is evicted first,
   then least-recently-used within that priority.
+- Hot-tier pool groups are sized by ratio: per-lifecycle demand (from
+  `initialPoolRatio`, `typicalStep`, `constraints` or the tuner's averages)
+  becomes a byte ratio that splits the GPU quota above the constraint floors in
+  `mHotMinSlots`. `CacheLevelStorage::ratioToSlotCountList` does this at
+  construction, in `adjustCacheLevel()` (`resize()`/`adjust()`) and for tuner
+  targets (`constrainPoolGroupRatio()`). A region with
+  `RegionConfig::fixedSlotCount` instead gets a pool group of its own with
+  exactly that many slots (`StorageConfig::fixedSlotCounts`). All three call
+  sites take fixed groups out of the quota first and split the rest by ratio;
+  their ratio entries are ignored, `adjust()` never resizes them, and their tuner
+  target is their actual size. The fixed count is also the group's entry in
+  `mHotMinSlots`, so a GPU quota too small for all floors is raised to fit it, as
+  for the constraint floors. The region owner computes the count, including the
+  headroom `KvCache::resume()` needs below `maxUtilForResume`; the group is the
+  region's alone because that gate reads each pool group's utilization. Cold
+  tiers are sized as before.
 - `NodeRef` is a stable `std::list` iterator, but only within the exact
   `LRUEvictionPolicy` that issued it. Iterators from different lists are not
   comparable or interchangeable.
@@ -371,6 +398,35 @@ physically duplicate the whole prompt; ownership splits at the prompt tail:
 - CUDA virtual memory and copy operations use the driver/runtime APIs directly.
   Keep allocation granularity, stream ordering, and source/destination lifetime
   valid through asynchronous copies.
+- Retained disk copies (`disk_keep_copy_after_restore`, `disk_write_through`):
+  a disk slot can keep a copy of a page that lives in a hotter level. They are
+  tracked in `StorageManager` (`mRetainedCopies` oldest first, `mRetainedByPage`),
+  not by the eviction controller. Every path that frees, reuses, or resizes a
+  disk slot must account for them: an eviction to disk takes the copy's slot back
+  (`takeRetainedCopy`), a full last level drops LRU disk-only pages before
+  reclaiming copies, `adjustCacheLevel` releases only the copies of pool groups
+  that shrink, and `~Page` calls `onPageDestroyed` before its slot is released.
+  Copies beyond the tier's `protectedCopyFraction` share are released before
+  any disk-only page, and write-through creates none beyond it
+  (`protectedCopyShare`). Only full committed pages get copies
+  (`hasFinalContent`). A copy is reusable while its write is in flight or after
+  it completed without error (`validateRetainedCopy`); taking back an in-flight
+  copy promotes its write-through to a required write
+  (`promoteBackgroundDiskWrites`) and counts `reused_pending`. Storage
+  statistics report copies as `retainedCopies`, not as `evictable`.
+  `disk_copy_counters` keeps `retained == created - reused - reclaimed - dropped`
+  with one disk tier; tests assert it.
+- A write-through copy reads the host page while its write is in flight, and its
+  completion event lives only on the retained disk slot. Anything that releases
+  that host slot must merge `pendingDiskWrite()` into the slot's ready event.
+  Write-through takes free disk slots only, never evicts or reclaims, and a
+  failure skips the copy instead of failing the eviction that triggered it.
+- Async disk I/O (`utils/copyUtils.cpp`, `disk_io_threads`) is a process-wide
+  pool that starts at the first nonzero value and lives for the process. A
+  transfer is split into 4 MiB pieces; the stream waits on a completion flag in
+  device-mapped host memory with `cuStreamWaitValue64`, or in a host function
+  when that is unavailable or fails. Pieces are served reads first, then
+  required writes, then background writes, with aging so no queue starves.
 
 ## Testing a change here
 
@@ -641,6 +697,7 @@ Use extra review and tests for changes involving:
 - partial attention coverage, SSM checkpoints, SWA windows/sinks, or final
   snapshots;
 - CUDA stream/event lifetime or host-memory registration;
+- retained disk copies, write-through, or the disk I/O pool and its completion flags;
 - `KvCache` commit state, beam forks, reuse rebasing, or page-index buffers;
 - nanobind GIL release, callbacks, non-owning buffers, or exception translation.
 

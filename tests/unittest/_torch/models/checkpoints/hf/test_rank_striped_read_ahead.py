@@ -1014,6 +1014,8 @@ def _run_real_mpi_scenarios(checkpoint_dir: str) -> dict:
 
     subgroup = communicator.Split(color=rank, key=0)
     set_thread_local_mpi_comm(subgroup)
+    subgroup_effective = None
+    subgroup_weights = None
     subgroup_error = None
     try:
         subgroup_loader = _rank_striped_loader(partial_model_loading=rank == 0)
