@@ -1096,6 +1096,64 @@ class TestKimiK2StreamingMatchesWholeTextParse:
         assert payloads[-1]["choices"][0]["finish_reason"] == "tool_calls"
 
 
+def _render_qwen3_tool_call(tools, name, arguments):
+    """Return the tool call Qwen3-8B's chat template writes for one call.
+
+    Renders ``data/qwen3_chat_template.jinja`` with the Jinja settings that
+    ``transformers`` uses for chat templates, and returns the assistant's
+    text after the empty think block and before ``<|im_end|>``.
+    """
+    from pathlib import Path
+
+    from jinja2.ext import loopcontrols
+    from jinja2.sandbox import ImmutableSandboxedEnvironment
+
+    def tojson(value,
+               ensure_ascii=False,
+               indent=None,
+               separators=None,
+               sort_keys=False):
+        # transformers' ``tojson``: keeps key order and does not escape HTML.
+        return json.dumps(value,
+                          ensure_ascii=ensure_ascii,
+                          indent=indent,
+                          separators=separators,
+                          sort_keys=sort_keys)
+
+    env = ImmutableSandboxedEnvironment(trim_blocks=True,
+                                        lstrip_blocks=True,
+                                        extensions=[loopcontrols])
+    env.filters["tojson"] = tojson
+    template = env.from_string(
+        (Path(__file__).parent / "data" /
+         "qwen3_chat_template.jinja").read_text(encoding="utf-8"))
+    rendered = template.render(
+        messages=[{
+            "role": "user",
+            "content": "Call a tool."
+        }, {
+            "role":
+            "assistant",
+            "content":
+            "",
+            "tool_calls": [{
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": arguments
+                }
+            }]
+        }],
+        tools=[tool.model_dump(exclude_none=True) for tool in tools],
+        add_generation_prompt=False,
+        enable_thinking=False)
+    output = rendered.rsplit("<|im_start|>assistant\n",
+                             1)[1].split("<|im_end|>", 1)[0]
+    think = "<think>\n\n</think>\n\n"
+    assert output.startswith(think)
+    return output[len(think):]
+
+
 class TestQwen3ToolParser(BaseToolParserTestClass):
     """Test suite for Qwen3ToolParser class."""
 
@@ -1226,21 +1284,18 @@ class TestQwen3ToolParser(BaseToolParserTestClass):
         assert info.end == "}\n</tool_call>"
         assert info.trigger == "<tool_call>"
 
-    def test_structure_info_matches_chat_template_format(self):
+    def test_structure_info_matches_chat_template(self, sample_tools):
         """The tag's begin + arguments + end must match Qwen3's chat template.
 
-        The template renders ``{"name": "<name>", "arguments": <args|tojson>}``,
-        with the same spacing as ``json.dumps``. The strict-tools structural
-        tag forces ``begin`` verbatim, so any spacing difference forces the
-        model off the format it was trained on.
+        The strict-tools structural tag forces ``begin`` verbatim, so any
+        difference from the call the chat template writes forces the model
+        off the format it was trained on.
         """
         info = Qwen3ToolParser().structure_info()("get_weather")
         arguments = {"location": "Tokyo", "unit": "celsius"}
 
-        template_call = ("<tool_call>\n" + json.dumps({
-            "name": "get_weather",
-            "arguments": arguments
-        }) + "\n</tool_call>")
+        template_call = _render_qwen3_tool_call(sample_tools, "get_weather",
+                                                arguments)
 
         assert info.begin + json.dumps(arguments) + info.end == template_call
 
@@ -5935,6 +5990,56 @@ class TestBuildToolStrictGuidedDecoding:
         assert tag["content"]["type"] == "json_schema"
         assert tag["content"]["json_schema"]["properties"]["location"][
             "type"] == "string"
+
+    @pytest.fixture
+    def strict_tools(self, sample_tools):
+        for tool in sample_tools:
+            tool.function.strict = True
+        return sample_tools
+
+    @staticmethod
+    def _qwen3_strict_matcher(tools):
+        """Compile the qwen3 strict-tools grammar on a byte-level vocab."""
+        import xgrammar
+
+        from tensorrt_llm.serve.openai_server import \
+            _build_tool_strict_guided_decoding_params
+
+        result = _build_tool_strict_guided_decoding_params(tools, "qwen3")
+        tokenizer = xgrammar.TokenizerInfo([bytes([i])
+                                            for i in range(256)] + [b"<EOS>"],
+                                           stop_token_ids=[256])
+        compiler = xgrammar.GrammarCompiler(tokenizer)
+        return xgrammar.GrammarMatcher(
+            compiler.compile_structural_tag(result.structural_tag))
+
+    @pytest.mark.parametrize("name,arguments", [
+        ("get_weather", {
+            "location": "Tokyo",
+            "unit": "celsius"
+        }),
+        ("search_web", {
+            "query": "weather in Tokyo"
+        }),
+    ])
+    def test_qwen3_strict_grammar_matches_template_call(self, strict_tools,
+                                                        name, arguments):
+        """The strict grammar must accept the call Qwen3's template writes.
+
+        The same call without the spaces after ``"name":`` and
+        ``"arguments":`` must be rejected.
+        """
+        call = _render_qwen3_tool_call(strict_tools, name, arguments)
+        unspaced = call.replace('{"name": "',
+                                '{"name":"').replace('"arguments": ',
+                                                     '"arguments":')
+
+        matcher = self._qwen3_strict_matcher(strict_tools)
+        assert matcher.accept_string(call)
+        assert matcher.accept_token(256)
+        assert matcher.is_terminated()
+        assert not self._qwen3_strict_matcher(strict_tools).accept_string(
+            unspaced)
 
     def test_mixed_strict_and_non_strict(self):
         """Should constrain strict tools and allow any text for non-strict."""
