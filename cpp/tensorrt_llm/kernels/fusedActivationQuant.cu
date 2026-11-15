@@ -39,21 +39,24 @@ __device__ __forceinline__ float relu2_f32(float x)
 }
 
 // Explicitly rounded operations (no FMA contraction) evaluate the same fp32
-// expression, in the same order, as the PyTorch reference. min(x, eps) is
-// written as a select so that NaN propagates as it does in torch.clamp_max.
-__device__ __forceinline__ float xielu_f32(float x, XieluParams const& p)
+// expression, in the same order, as the PyTorch reference. The results are
+// bit-identical to it when both use the same CUDA toolkit's expm1f; toolkits can
+// differ by 1 ulp in expm1f, which can move an output that sits near a zero of
+// the negative branch by a few ulps. min(x, eps) is written as a select that
+// returns NaN when either operand is NaN, as torch.clamp_max does.
+__device__ __forceinline__ float xieluF32(float x, XieluParams const& p)
 {
     float const betaX = __fmul_rn(p.beta, x);
-    if (x > 0.0f)
+    if (x > 0.0F)
     {
         return __fadd_rn(__fmul_rn(__fmul_rn(p.alphaP, x), x), betaX);
     }
-    float const clamped = x > p.eps ? p.eps : x;
+    float const clamped = (x > p.eps || isnan(p.eps)) ? p.eps : x;
     return __fadd_rn(__fmul_rn(__fsub_rn(expm1f(clamped), x), p.alphaN), betaX);
 }
 
 template <typename T>
-__device__ __forceinline__ T float_to_native(float x)
+__device__ __forceinline__ T floatToNative(float x)
 {
     if constexpr (std::is_same_v<T, half>)
     {
@@ -70,7 +73,7 @@ __global__ void xieluKernel(T const* __restrict__ input, T* __restrict__ output,
     float const* __restrict__ coeffs, bool vectorized)
 {
     constexpr int kVecSize = sizeof(uint4) / sizeof(T);
-    XieluParams const params{coeffs[0], coeffs[1], coeffs[2], coeffs[3]};
+    XieluParams const params{.alphaP = coeffs[0], .alphaN = coeffs[1], .beta = coeffs[2], .eps = coeffs[3]};
     int64_t const stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
     int64_t const tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
 
@@ -87,7 +90,7 @@ __global__ void xieluKernel(T const* __restrict__ input, T* __restrict__ output,
 #pragma unroll
             for (int i = 0; i < kVecSize; i++)
             {
-                outVals[i] = float_to_native<T>(xielu_f32(static_cast<float>(inVals[i]), params));
+                outVals[i] = floatToNative<T>(xieluF32(static_cast<float>(inVals[i]), params));
             }
             reinterpret_cast<uint4*>(output)[v] = out;
         }
@@ -95,7 +98,7 @@ __global__ void xieluKernel(T const* __restrict__ input, T* __restrict__ output,
 
     for (int64_t i = numVecs * kVecSize + tid; i < numel; i += stride)
     {
-        output[i] = float_to_native<T>(xielu_f32(static_cast<float>(input[i]), params));
+        output[i] = floatToNative<T>(xieluF32(static_cast<float>(input[i]), params));
     }
 }
 

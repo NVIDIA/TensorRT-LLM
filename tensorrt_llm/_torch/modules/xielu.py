@@ -17,14 +17,20 @@
 import functools
 import math
 import os
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 
-def xielu_reference(x: torch.Tensor, a_p, a_n, beta, eps) -> torch.Tensor:
+def xielu_reference(
+    x: torch.Tensor,
+    a_p: Union[float, torch.Tensor],
+    a_n: Union[float, torch.Tensor],
+    beta: Union[float, torch.Tensor],
+    eps: Union[float, torch.Tensor],
+) -> torch.Tensor:
     """xIELU on post-softplus coefficients, computed in fp32 and rounded once to ``x.dtype``.
 
     The coefficients are Python floats or fp32 0-d tensors on ``x``'s device.
@@ -115,6 +121,11 @@ class XIELU(nn.Module):
         """fp32 ``[a_p, a_n, beta, eps]`` on the weights' device."""
         if self._coeffs is None or self._coeffs.device != self.alpha_p.device:
             self.cache_derived_state()
+        if self._coeffs is None:
+            raise RuntimeError(
+                "xIELU coefficients are derived from the weights, which are on the meta device; "
+                "materialize the module before calling it"
+            )
         return self._coeffs
 
     def post_load_weights(self) -> None:
@@ -138,7 +149,14 @@ class XIELU(nn.Module):
         return self.coeffs[3].item()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.is_cuda and x.dtype in (torch.float16, torch.bfloat16) and _xielu_op_available():
+        # The kernel has no backward; the PyTorch expression does.
+        needs_grad = torch.is_grad_enabled() and x.requires_grad
+        if (
+            x.is_cuda
+            and x.dtype in (torch.float16, torch.bfloat16)
+            and not needs_grad
+            and _xielu_op_available()
+        ):
             return torch.ops.trtllm.xielu(x, self.coeffs)
         return xielu_reference(x, *self.coeffs.unbind())
 

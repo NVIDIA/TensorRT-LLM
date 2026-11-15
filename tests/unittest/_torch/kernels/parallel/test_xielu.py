@@ -20,6 +20,13 @@ here are exact for bf16. fp16 allows 1 ulp: ``expm1f`` is only accurate to
 1 ulp, and CUDA's and PyTorch's builds can return neighbouring fp32 values,
 which can round to different fp16 values when the fp32 result is close to an
 fp16 tie (with nvcc 13.2 this happens for x = 0xA8F7, which random inputs hit).
+
+These bounds hold for the coefficients used here. With other coefficients, an
+input near a zero of the negative branch makes ``(expm1(x) - x) * a_n + beta * x``
+cancel, which magnifies a 1-ulp ``expm1f`` difference into a few ulps of the
+bf16 or fp16 result. The kernel and the reference then each match the exact fp32
+expression to within their own ``expm1f``, and agree bit-for-bit only when both
+are built with the same CUDA toolkit.
 """
 
 import pytest
@@ -313,3 +320,40 @@ def test_module_env_disables_kernel(monkeypatch, op_calls):
     act = XIELU().cuda()
     act(torch.randn(4, 64, device="cuda", dtype=torch.bfloat16))
     assert op_calls == []
+
+
+def test_module_on_meta_device_raises_clearly():
+    """A meta module has no coefficients; calling it names the cause instead of failing on None."""
+    with torch.device("meta"):
+        act = XIELU()
+    assert act.extra_repr() == ""
+    with pytest.raises(RuntimeError, match="meta device"):
+        act(torch.randn(4, 64, device="meta", dtype=torch.bfloat16))
+    with pytest.raises(RuntimeError, match="meta device"):
+        act.a_p  # noqa: B018
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_nan_eps_propagates_like_clamp_max(dtype):
+    """torch.clamp_max returns NaN for a NaN bound, so the negative branch does too."""
+    x = _special_values(dtype).cuda()
+    coeffs = {**COEFFS, "eps": float("nan")}
+    out = _op(x, **coeffs)
+    _assert_identical(out, xielu_reference(x, **coeffs))
+    assert torch.isnan(out[x.float() <= 0]).all()
+
+
+def test_module_falls_back_to_torch_when_grad_is_needed(op_calls):
+    """The kernel has no backward, so a gradient-tracking input takes the PyTorch path."""
+    act = XIELU().cuda()
+    act.load_weights([{"alpha_p": torch.tensor([0.3]), "alpha_n": torch.tensor([-1.7])}])
+    x = (torch.randn(4, 64, device="cuda") * 4).to(torch.bfloat16).requires_grad_(True)
+    act(x).float().sum().backward()
+    assert op_calls == []
+    x_ref = x.detach().clone().requires_grad_(True)
+    xielu_reference(x_ref, *act.coeffs.unbind()).float().sum().backward()
+    _assert_identical(x.grad, x_ref.grad)
+
+    with torch.no_grad():
+        act(x)
+    assert op_calls == [x.shape]

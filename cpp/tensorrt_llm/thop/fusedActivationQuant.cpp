@@ -39,21 +39,21 @@ at::Tensor xielu(at::Tensor const& input, at::Tensor const& coeffs)
         "xielu: coeffs must be a contiguous fp32 tensor [a_p, a_n, beta, eps]");
     TORCH_CHECK(coeffs.device() == input.device(), "xielu: coeffs must be on the same device as input");
     c10::cuda::CUDAGuard const deviceGuard(input.device());
-    at::Tensor const in = input.contiguous();
-    at::Tensor output = at::empty(in.sizes(), in.options());
+    at::Tensor const inputContiguous = input.contiguous();
+    at::Tensor output = at::empty(inputContiguous.sizes(), inputContiguous.options());
     float const* coeffsPtr = coeffs.data_ptr<float>();
-    auto stream = at::cuda::getCurrentCUDAStream(in.get_device());
+    auto const stream = at::cuda::getCurrentCUDAStream(inputContiguous.get_device());
 
-    if (in.scalar_type() == at::ScalarType::Half)
+    if (inputContiguous.scalar_type() == at::ScalarType::Half)
     {
-        kernels::invokeXielu<half>(reinterpret_cast<half const*>(in.data_ptr()),
-            reinterpret_cast<half*>(output.data_ptr()), in.numel(), coeffsPtr, stream);
+        kernels::invokeXielu<half>(reinterpret_cast<half const*>(inputContiguous.data_ptr()),
+            reinterpret_cast<half*>(output.data_ptr()), inputContiguous.numel(), coeffsPtr, stream);
     }
-    else if (in.scalar_type() == at::ScalarType::BFloat16)
+    else if (inputContiguous.scalar_type() == at::ScalarType::BFloat16)
     {
 #ifdef ENABLE_BF16
-        kernels::invokeXielu<__nv_bfloat16>(reinterpret_cast<__nv_bfloat16 const*>(in.data_ptr()),
-            reinterpret_cast<__nv_bfloat16*>(output.data_ptr()), in.numel(), coeffsPtr, stream);
+        kernels::invokeXielu<__nv_bfloat16>(reinterpret_cast<__nv_bfloat16 const*>(inputContiguous.data_ptr()),
+            reinterpret_cast<__nv_bfloat16*>(output.data_ptr()), inputContiguous.numel(), coeffsPtr, stream);
 #else
         C10_THROW_ERROR(NotImplementedError, "BFloat16 not enabled.");
 #endif
