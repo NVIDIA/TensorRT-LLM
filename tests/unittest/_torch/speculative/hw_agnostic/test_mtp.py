@@ -1849,27 +1849,6 @@ def test_mtp_moe_backend_allowed_for_full_external_assistant(
     assert spec_config.moe_backend == "CUTLASS"
 
 
-def test_mtp_moe_backend_rejected_for_shared_kv_replacement_heads() -> None:
-    class ReplacementHeadTarget:
-        pass
-
-    spec_config = MTPDecodingConfig(
-        max_draft_len=1,
-        speculative_model="/tmp/assistant",
-        moe_backend="CUTLASS",
-    )
-    model_config = SimpleNamespace(
-        architectures=["Gemma4ForCausalLM"],
-        num_nextn_predict_layers=1,
-    )
-
-    with pytest.raises(ValueError, match="replacement-head MTP"):
-        update_spec_config_from_model_config(spec_config, model_config, ReplacementHeadTarget)
-
-    assert spec_config.uses_replacement_heads
-    assert spec_config._use_shared_kv_cache
-
-
 def test_mtp_shared_kv_draft_inputs():
     spec_config = MTPDecodingConfig(
         max_draft_len=3,

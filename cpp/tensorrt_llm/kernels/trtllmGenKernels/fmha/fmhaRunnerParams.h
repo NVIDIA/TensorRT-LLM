@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/config.h"
+#include <climits>
 #include <cstdint>
 #include <cuda_runtime.h>
 
@@ -248,6 +249,8 @@ struct TllmGenFmhaRunnerParams
     TileScheduler mTileScheduler;
     // The multiCtasKvMode (i.e. multiBlockMode).
     bool mMultiCtasKvMode;
+    // Optional caller limit; the default preserves autotuner selection.
+    int32_t mMaxNumCtasPerSeqKv{INT_MAX};
     // Use block sparse attention.
     bool mUseBlockSparseAttention;
 

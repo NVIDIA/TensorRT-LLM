@@ -289,6 +289,8 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
                            and sparse_config.implementation == "msa")
     if (effective_kv_cache_quant in (QuantAlgo.NVFP4, QuantAlgo.NVFP4.value)
             and not supports_fp4_mla_attention(model_config)
+            and not getattr(getattr(model_config, "modeling_v2_target", None),
+                            "supports_nvfp4_kv_cache", False)
             and not uses_minimax_m3_msa and torch.cuda.is_available()
             and get_sm_version() == 107):
         if pyt_kv_cache_dtype.startswith("mixed_"):
@@ -2392,6 +2394,7 @@ class ModelLoader:
                 self.llm_args.mla_skip_correction_threshold
                 if self.llm_args.enable_mla_skip_correction else 0.0),
             moe_backend=self.llm_args.moe_config.backend,
+            moe_tactic=self.llm_args.moe_config.tactic,
             moe_disable_finalize_fusion=self.llm_args.moe_config.
             disable_finalize_fusion,
             megamoe_fuse_shared_expert=self._megamoe_fuse_shared_expert(

@@ -872,12 +872,25 @@ def _create_py_executor(
     # that bijection -- and that the launch runs without CUDA graphs.
     dwdp_manager: Optional[DwdpManager] = None
     if expert_dwdp:
-        # Only the CuteDSL MoE backends support DWDP (with NVFP4 weights), and
-        # AUTO resolves to none of them for the models DWDP serves. Without
-        # one, DWDP manages no MoE layer and every rank loads every expert
-        # before the launch fails.
-        if llm_args.moe_config.backend.upper() not in ("CUTEDSL",
-                                                       "CUTEDSL_FC12"):
+        # Only the CuteDSL MoE implementations support DWDP (with NVFP4
+        # weights), and AUTO resolves to none of them for the models DWDP
+        # serves. Without one, DWDP manages no MoE layer and every rank loads
+        # every expert before the launch fails.
+        moe_tactic = llm_args.moe_config.tactic
+        if moe_tactic is not None:
+            from tensorrt_llm._torch.moe.fused_moe.moe_resolution import \
+                moe_impl_request
+            impls = moe_impl_request(tactic=moe_tactic).impls
+            if not any(impl_cls.capabilities.supports_dwdp
+                       for impl_cls in impls):
+                raise ValueError(
+                    "DWDP requires a MoE implementation that supports it, but "
+                    f"moe_config.tactic={moe_tactic!r} matches "
+                    f"{[impl_cls.descriptor.impl_id for impl_cls in impls]}, "
+                    "none of which does. Name a CuteDSL NVFP4 implementation, "
+                    "for example 'cutedsl.grouped_gemm.nvfp4'.")
+        elif llm_args.moe_config.backend.upper() not in ("CUTEDSL",
+                                                         "CUTEDSL_FC12"):
             raise ValueError(
                 "DWDP requires an MoE backend that supports it: set "
                 "moe_config.backend: CUTEDSL (or CUTEDSL_FC12) with an NVFP4 "
