@@ -104,8 +104,10 @@ l0_cpu:
   - unittest/_torch/distributed
   # -m cpu_only selects only the marked tests here; the directory's GPU tests stay on l0_b200.
   - unittest/_torch/kv_cache_compression
-  # GLM routing and draft workspace setup use CPU metadata and mocked allocations.
+  # GLM routing, draft workspace setup and the MTP draft's MoE selection use CPU
+  # metadata, mocked allocations and a patched draft class.
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/spec/test_modeling_v2_draft_exchange.py
+  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/spec/test_modeling_v2_mtp_draft_moe.py
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/spec/test_modeling_v2_small_batch_mtp.py
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/test_routing.py
   # The qwen4_exp default target's cpu_only tests (its routing among them); this stage runs
