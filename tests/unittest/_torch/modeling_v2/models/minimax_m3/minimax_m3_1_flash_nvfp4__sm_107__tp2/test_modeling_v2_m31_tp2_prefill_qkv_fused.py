@@ -12,6 +12,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.modeling_v2._native import NoTarget
+from tensorrt_llm._torch.autotuner import AutoTuner
 
 try:
     from tensorrt_llm._torch.modeling_v2.models.minimax_m3.minimax_m3_1_flash_nvfp4__sm_107__tp2 import (  # noqa: E501
@@ -42,6 +43,10 @@ def fused_on(monkeypatch):
     monkeypatch.setattr(m, "_mx_mode", lambda _: mode)
     monkeypatch.setattr(m, "is_torch_compiling", lambda: False)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    # The AutoTuner singleton reads the device when it is built; these steps only ask whether it is tuning.
+    monkeypatch.setattr(
+        AutoTuner, "get", classmethod(lambda cls: types.SimpleNamespace(is_tuning_mode=False))
+    )
     yield mode
     m._CTXNORMQ_MX.clear()
     m._SP_STATE["ovl"] = None

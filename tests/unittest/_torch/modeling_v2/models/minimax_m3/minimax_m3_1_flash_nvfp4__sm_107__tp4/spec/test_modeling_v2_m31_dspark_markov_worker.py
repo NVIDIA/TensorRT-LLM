@@ -242,6 +242,7 @@ def test_tailbk_h_warmup_keeps_stock_path(monkeypatch):
     """The eager warmup of a graph batch (is_cuda_graph, not capturing): the stock method skips the rewind there, so
     the chain must not apply it either."""
     wk, launches, _, inputs = _rewind_worker(monkeypatch)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     meta = SimpleNamespace(is_cuda_graph=True)
     wk._refine_block_logits(None, torch.zeros(2, 3, 8), inputs, meta)
     wk._apply_kv_rewind_after_draft(None, meta)
