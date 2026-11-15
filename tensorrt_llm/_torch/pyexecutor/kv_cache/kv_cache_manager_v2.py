@@ -153,6 +153,23 @@ KV_CACHE_ITERATION_STATS_POOL_GROUP_FIELDS = tuple(
 # Shared by capacity estimation and growth, in addition to speculative tokens.
 BASE_GENERATION_TOKEN_COUNT = 1
 
+# Opt-in (default off): PR #20650's guard order in _log_window_crossing. Read once per
+# process; unset, the logger level is consulted first, as before.
+_BACKPORT_PR20650 = os.environ.get("TLLM_BACKPORT_PR20650", "") == "1"
+_backport_pr20650_reported = False
+
+
+def _report_backport_pr20650(phase: str) -> None:
+    """One stderr line per process the first time the PR #20650 order runs."""
+    global _backport_pr20650_reported
+    _backport_pr20650_reported = True
+    print(
+        f"TLLM_BACKPORT_PR20650 engaged=True first_phase={phase} pid={os.getpid()}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 # Readable name per CacheTier, used only to label level-indexed counters. The levels themselves
 # come from the configured tier list, so several levels may share a name. Keyed by the enum
 # member because the C++ backend binds CacheTier as a plain nanobind enum, not an IntEnum.
@@ -2514,14 +2531,28 @@ class KVCacheManagerV2(BaseResourceManager):
         Capacity grows monotonically within a request, so the condition below
         fires at most once per request per pool without extra bookkeeping.
 
-        Debug level only, and the guard runs before any of the strings or the
-        page-index scan are built, so a default run does no additional work.
+        Debug level only. This runs for every request on every step, so the
+        integer crossing test comes first and the logger is consulted only for
+        an actual crossing: ``is_debug_enabled`` resolves the caller's module
+        from the stack, which at large batch sizes can cost more per step than
+        the allocation it follows.
+
+        That order (PR #20650) applies only with TLLM_BACKPORT_PR20650=1; unset, the
+        logger level is consulted first, as before.
         """
-        if new_capacity <= pre_capacity or not logger.is_debug_enabled():
-            return
+        if not _BACKPORT_PR20650:
+            if new_capacity <= pre_capacity or not logger.is_debug_enabled():
+                return
+        else:
+            if new_capacity <= pre_capacity:
+                return
+            if not _backport_pr20650_reported:
+                _report_backport_pr20650(phase)
         for layer_group_id, window_size in self._get_windowed_layer_group_sizes().items():
             if not (pre_capacity <= window_size < new_capacity):
                 continue
+            if _BACKPORT_PR20650 and not logger.is_debug_enabled():
+                return
             logger.debug(
                 f"[KVCacheManagerV2] request {req.py_request_id} crossed the sliding window "
                 f"during {phase}: layer_group_id={layer_group_id}, window={window_size}, "
@@ -3839,6 +3870,15 @@ class KVCacheManagerV2(BaseResourceManager):
         ready.record(self._stream)
         self._disagg_receive_ready[req.py_request_id] = ready
         return True
+
+    def take_disagg_receive_ready(self, req: LlmRequest) -> torch.cuda.Event | None:
+        """Hand over the readiness event recorded at ``req``'s disagg admission.
+
+        The caller then owns the ordering guarantee: the receive destination
+        may be published only after the event completes. ``prepare_resources``
+        does not wait on a taken event.
+        """
+        return self._disagg_receive_ready.pop(req.py_request_id, None)
 
     def get_history_length(self, req: LlmRequest) -> int | None:
         """Return the cache's current history_length, or None if no cache.

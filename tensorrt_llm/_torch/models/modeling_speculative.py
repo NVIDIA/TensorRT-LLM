@@ -17,7 +17,8 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ...functional import PositionEmbeddingType
-from ..attention.attention import Attention
+from ..attention.attention import (PRUNE_LAST_TOKEN_TARGET, Attention,
+                                   prune_last_token_note, prune_last_token_step_ok)
 from ..attention.backends import AttentionMetadata
 from ..attention.backends.interface import PositionalEmbeddingParams, RopeParams
 from ..attention.mla import MLA
@@ -33,7 +34,7 @@ from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
 from ..speculative import (SpecMetadata, get_spec_worker,
                            should_use_separate_draft_kv_cache)
 from ..speculative.interface import SpeculativeDecodingMode
-from ..utils import AuxStreamType
+from ..utils import AuxStreamType, get_per_request_prefill_cuda_graph_flag
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM, TModel,
@@ -742,6 +743,7 @@ class Eagle3DecoderLayer(DecoderLayer):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         spec_metadata: SpecMetadata,
+        output_row_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         residual = hidden_states
 
@@ -750,11 +752,19 @@ class Eagle3DecoderLayer(DecoderLayer):
             embeds = self.input_layernorm(embeds)
             hidden_states = torch.cat([embeds, hidden_states], dim=-1)
 
+        # TLLM_PRUNE_LAST_TOKEN: attention (and the draft KV write) covers every
+        # token; o_proj, the MLP and the norms run on output_row_ids only.
+        extra = ({} if output_row_ids is None else {
+            "output_row_ids": output_row_ids
+        })
         hidden_states = self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
+            **extra,
         )
+        if output_row_ids is not None:
+            residual = residual[output_row_ids]
 
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
@@ -911,7 +921,11 @@ class Eagle3DraftModel(DecoderModel):
         spec_metadata: Optional[SpecMetadata] = None,
         hidden_states: Optional[torch.Tensor] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
+        output_row_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # ``output_row_ids`` (TLLM_PRUNE_LAST_TOKEN, see
+        # Eagle3OneModelWorker._draft_row_ids_ok): the last layer returns
+        # only these rows, in this order.
         # When ``all_rank_num_tokens`` is supplied the caller wants this draft
         # forward to run with a different attention-DP token distribution
         # (e.g. the worker's per-step value); restore the original on exit so
@@ -942,7 +956,7 @@ class Eagle3DraftModel(DecoderModel):
 
             residual = None
             if self.num_layers > 1:
-                for layer in self.midlayer:
+                for idx, layer in enumerate(self.midlayer):
                     if residual is not None:
                         hidden_states = hidden_states + residual
                     hidden_states, residual = layer(
@@ -951,6 +965,8 @@ class Eagle3DraftModel(DecoderModel):
                         hidden_states=hidden_states,
                         attn_metadata=attn_metadata,
                         spec_metadata=spec_metadata,
+                        output_row_ids=(output_row_ids if idx
+                                        == len(self.midlayer) - 1 else None),
                     )
             else:
                 hidden_states, residual = self.midlayer(
@@ -959,6 +975,7 @@ class Eagle3DraftModel(DecoderModel):
                     hidden_states=hidden_states,
                     attn_metadata=attn_metadata,
                     spec_metadata=spec_metadata,
+                    output_row_ids=output_row_ids,
                 )
 
             hidden_states, hidden_states_to_save = self.norm(
@@ -1824,6 +1841,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         resource_manager=None,
         **kwargs,
     ) -> torch.Tensor:
+        prune_offer = self._offer_row_pruning(attn_metadata, spec_metadata)
         hidden_states = self.model(
             input_ids=input_ids,
             attn_metadata=attn_metadata,
@@ -1832,6 +1850,17 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             spec_metadata=spec_metadata,
             **kwargs,
         )
+        # TLLM_PRUNE_LAST_TOKEN: if the target model took the offer, it
+        # returned only the gather_ids rows, in gather order. gather_ids is
+        # strictly increasing, so a full-length one is the identity and the
+        # row count alone tells whether the gather below is still needed.
+        rows_pruned = (prune_offer and hidden_states.shape[0]
+                       == spec_metadata.gather_ids.shape[0])
+        if prune_offer:
+            spec_metadata.prune_row_ids = None
+            if hidden_states.shape[0] < attn_metadata.num_tokens:
+                prune_last_token_note("target_last_layer", attn_metadata.num_tokens,
+                                hidden_states.shape[0])
         if spec_metadata is not None and spec_metadata.is_layer_capture(
                 self.layer_idx):
             spec_metadata.maybe_capture_hidden_states(self.layer_idx,
@@ -1842,7 +1871,8 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         if self.spec_worker is not None:
             # get logits
             logits = self.logits_processor.forward(
-                hidden_states[spec_metadata.gather_ids],
+                hidden_states
+                if rows_pruned else hidden_states[spec_metadata.gather_ids],
                 self.lm_head,
                 attn_metadata,
                 True,
@@ -1881,6 +1911,44 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             )
 
         return logits
+
+    def _offer_row_pruning(self, attn_metadata, spec_metadata) -> bool:
+        """TLLM_PRUNE_LAST_TOKEN: offer the target model the gather_ids rows.
+
+        Only a target model that declares it can take the offer
+        (modeling_gpt_oss.Transformer._prune_last_token) is offered anything;
+        for it, spec_metadata.prune_row_ids is set on every forward (so
+        its compiled graph always finds the attribute): gather_ids when
+        offered, else None. Offered only when nothing but the LM head reads
+        the final hidden states: the linear EAGLE3 one-model worker (its
+        drafter reads the captured layers, not this output; the MTP-Eagle,
+        dynamic-tree and shared-target-KV workers read it) and the final
+        output not captured; when the step carries context requests and at
+        least two gathered rows, has no token padding and is above the
+        piecewise CUDA graph sizes; and when nothing is being captured.
+        Generation-only steps stay as they are.
+        """
+        if (not PRUNE_LAST_TOKEN_TARGET or spec_metadata is None
+                or not getattr(self.model, "_prune_last_token", False)):
+            return False
+        spec_metadata.prune_row_ids = None
+        gather_ids = spec_metadata.gather_ids
+        if (self.spec_worker is None
+                or type(self.spec_worker).__name__ != "Eagle3OneModelWorker"
+                or getattr(self.spec_worker, "is_mtp_eagle", True)
+                or getattr(self.spec_worker, "_uses_external_shared_target_kv",
+                           True) or gather_ids is None
+                or gather_ids.shape[0] < 2 or attn_metadata.num_contexts <= 0
+                or attn_metadata.padded_num_tokens is not None
+                or get_per_request_prefill_cuda_graph_flag()
+                or spec_metadata.is_layer_capture(self.layer_idx)
+                or not prune_last_token_step_ok()):
+            return False
+        # One compiled graph for every row count (no 0/1 specialisation:
+        # at least two rows are offered).
+        torch._dynamo.maybe_mark_dynamic(gather_ids, 0)
+        spec_metadata.prune_row_ids = gather_ids
+        return True
 
     def _quantization_named_modules(self) -> Iterator[tuple[str, nn.Module]]:
         if not getattr(self.spec_config, "uses_replacement_heads", False):

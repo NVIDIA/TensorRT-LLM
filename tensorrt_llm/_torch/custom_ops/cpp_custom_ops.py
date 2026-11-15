@@ -760,6 +760,47 @@ def _register_fake():
     ) -> torch.Tensor:
         return payload.new_empty((local_num_tokens, payload.shape[2]))
 
+    @torch.library.register_fake("trtllm::moe_a2a_lamport_dispatch")
+    def _(
+        token_selected_experts: torch.Tensor,
+        input_payloads: List[torch.Tensor],
+        workspace: torch.Tensor,
+        metainfo: torch.Tensor,
+        lamport_workspace: torch.Tensor,
+        runtime_max_tokens_per_rank: int,
+        ep_rank: int,
+        ep_size: int,
+        top_k: int,
+        num_experts: int,
+        capacity_tokens: int,
+        record_bytes: int,
+        combine_slot_bytes: int,
+        expert_id_payload_index: int,
+        invalid_token_expert_id: int,
+    ) -> Tuple[List[torch.Tensor], int]:
+        recv_tensors = [
+            payload.new_empty((ep_size, runtime_max_tokens_per_rank, payload.shape[1]))
+            for payload in input_payloads
+        ]
+        return recv_tensors, 0
+
+    @torch.library.register_fake("trtllm::moe_a2a_lamport_combine")
+    def _(
+        payload: torch.Tensor,
+        local_num_tokens: int,
+        workspace: torch.Tensor,
+        metainfo: torch.Tensor,
+        lamport_workspace: torch.Tensor,
+        runtime_max_tokens_per_rank: int,
+        ep_rank: int,
+        ep_size: int,
+        top_k: int,
+        capacity_tokens: int,
+        record_bytes: int,
+        combine_slot_bytes: int,
+    ) -> torch.Tensor:
+        return payload.new_empty((local_num_tokens, payload.shape[2]))
+
     @torch.library.register_fake("trtllm::moe_a2a_initialize")
     def _(
         workspace: torch.Tensor,

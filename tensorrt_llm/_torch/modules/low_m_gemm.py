@@ -3,6 +3,7 @@
 
 import functools
 import os
+import sys
 from typing import Any, List, Optional
 
 import torch
@@ -556,6 +557,8 @@ class LowMGemmDispatcher:
         ):
             best_runner = cublas_runner
             best_tactic = -1
+        # The race's pick, read by _low_m_linear_eager for its engagement line.
+        self.last_choice = (type(best_runner).__name__, best_tactic)
         # Fetch or lazily create a per-(module, M-bucket, N) output buffer so
         # the kernel always writes to a stable device address compatible with
         # TRT-LLM's model-level CUDA-graph replay.  Allocation is guarded
@@ -653,6 +656,147 @@ def apply_low_m_gemm(
     """
     dispatcher: LowMGemmDispatcher = getattr(module, "_low_m_gemm_dispatcher", _DISPATCHER)
     return dispatcher.apply(module, input_tensor, weight, bias, force_active=force_active)
+
+
+# ---------------------------------------------------------------------------
+# Default-off small-M paths for GPT-OSS's BF16 attention projections on SM107
+# (Rubin).
+#
+# modeling_gpt_oss.py sets ``_small_m_path = (path, max_m)`` on a projection
+# only on SM107 and only when the worker opts in: TLLM_LOWM_GEMM_SM107=1 (path
+# "low_m") or TLLM_TINYGEMM2_PROJ_SM107 (path "tinygemm2").
+# UnquantizedLinearMethod.apply calls small_m_linear() for marked modules
+# only; every other module, model and GPU runs exactly as before.
+#
+# - "low_m": the dispatcher above (split-K vs cuBLAS AutoTuner race), which
+#   UnquantizedLinearMethod skips for use_custom_cublas_mm modules because that
+#   path may write an NCCL-window output. The dispatcher runs inside the custom
+#   op small_m::low_m_linear so torch.compile(fullgraph=True) sees one opaque op
+#   (it cannot trace the AutoTuner or data_ptr()). Calls the race cannot serve
+#   fall back to the module's own trtllm::cublas_mm call (DEFAULT buffer kind).
+# - "tinygemm2": trtllm::tinygemm2 (the GPT-OSS router kernel; its C++ check
+#   admits SM107 since #19224), as upstream PR #20636 does for the BF16
+#   projections of DeepSeek-V4.1 at decode on SM107.
+# Both paths keep that NCCL-window exclusion.
+# ---------------------------------------------------------------------------
+
+SMALL_M_PATH_ATTR = "_small_m_path"
+
+_small_m_printed: set = set()
+_low_m_linear_op = None
+_low_m_linear_error: Optional[str] = None
+_low_m_linear_keys: dict = {}
+_low_m_linear_cublas: set = set()  # (tuning bucket, n, k) whose race cuBLAS won
+
+
+def small_m_print_once(key: Any, text: str) -> None:
+    """Print one stderr line per process and key (worker INFO logs may be off)."""
+    if key in _small_m_printed:
+        return
+    _small_m_printed.add(key)
+    print(f"small-M GEMM: {text}", file=sys.stderr, flush=True)
+
+
+class _LowMBufferKey:
+    """Stands in for the Linear inside the op: the dispatcher reads only its name."""
+
+    __slots__ = ("_low_m_gemm_name",)
+
+    def __init__(self, name: str) -> None:
+        self._low_m_gemm_name = name
+
+
+def _low_m_linear_eager(
+    input: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
+) -> torch.Tensor:
+    """Eager body of small_m::low_m_linear: the low-M race, else trtllm::cublas_mm.
+
+    A tuning bucket whose race cuBLAS (torch.addmm) wins goes back to the
+    module's own trtllm::cublas_mm from its next call on, so this path never
+    swaps that call for addmm. A race win carries a real tactic (cuBLAS:
+    ("cublas",)); tactic -1 is the AutoTuner's cache-miss fallback, which the
+    attention and general warmups hit before the autotuner pass, and is never
+    recorded.
+    """
+    global _low_m_linear_error
+    m, n, k = int(input.shape[0]), int(weight.shape[0]), int(input.shape[1])
+    bucket = (_map_m_to_tuning_bucket(m), n, k)
+    output = None
+    untuned = False
+    if _low_m_linear_error is not None:
+        pick = "runner=cublas_mm (low_m off)"
+    elif bucket in _low_m_linear_cublas:
+        pick = "runner=cublas_mm (the race picked cuBLAS)"
+    else:
+        ptr = weight.data_ptr()
+        key = _low_m_linear_keys.get(ptr)
+        if key is None:
+            key = _low_m_linear_keys.setdefault(ptr, _LowMBufferKey(f"small_m_buffer@{ptr:#x}"))
+        try:
+            output = _DISPATCHER.apply(key, input, weight, bias, force_active=True)
+        except Exception as e:  # e.g. a CuTe DSL that cannot target this GPU
+            _low_m_linear_error = repr(e)
+            small_m_print_once("low_m_error", f"low_m off in this process, cublas_mm from now: {e!r}")
+            pick = "runner=cublas_mm (low_m off)"
+        else:
+            if output is None:
+                pick = "runner=cublas_mm (not a low-M candidate)"
+            else:
+                runner, tactic = getattr(_DISPATCHER, "last_choice", (None, None))
+                pick = f"runner={runner} tactic={tactic}"
+                untuned = tactic == -1  # AutoTuner cache miss: runners[0], not a race result
+                if untuned:
+                    pick += " (untuned: AutoTuner cache miss)"
+                elif runner == _CuBLASGemmRunner.__name__:
+                    _low_m_linear_cublas.add(bucket)
+                    pick += " (cublas_mm from the next call)"
+    # Keyed on `untuned` too, so the tuned pick still prints after a warmup miss.
+    small_m_print_once(("low_m", m, n, k, untuned), f"low_m m={m} n={n} k={k} {pick}")
+    if output is None:
+        return torch.ops.trtllm.cublas_mm(input, weight.t(), bias, out_dtype=None)
+    return output
+
+
+def register_low_m_linear_op() -> None:
+    """Register small_m::low_m_linear once, before torch.compile traces the model."""
+    global _low_m_linear_op
+    if _low_m_linear_op is not None:
+        return
+    op = torch.library.custom_op("small_m::low_m_linear", mutates_args=())(_low_m_linear_eager)
+
+    @op.register_fake
+    def _(input, weight, bias):
+        return input.new_empty((input.shape[0], weight.shape[0]))
+
+    _low_m_linear_op = op
+
+
+def small_m_linear(
+    module: torch.nn.Module, input: torch.Tensor, bias: Optional[torch.Tensor]
+) -> Optional[torch.Tensor]:
+    """Run a marked Linear's small-M path, or return None for its normal path.
+
+    torch.compile traces this function: no prints or environment reads here.
+    """
+    path, max_m = getattr(module, SMALL_M_PATH_ATTR)
+    if input.dim() != 2 or input.dtype != torch.bfloat16 or not 0 < input.shape[0] <= max_m:
+        return None
+    # UnquantizedLinearMethod's cublas_mm branch writes an NCCL-window output
+    # under this condition (TP all-reduce zero copy); neither path here can.
+    all_reduce = getattr(module, "all_reduce", None)
+    if all_reduce is not None and all_reduce.uses_nccl_symmetric_memory_window():
+        return None
+    if path == "tinygemm2":
+        # trtllm::tinygemm2 checks for contiguous BF16 operands and a BF16 bias.
+        if (
+            bias is None
+            or bias.dtype != torch.bfloat16
+            or module.weight.dtype != torch.bfloat16
+            or not input.is_contiguous()
+        ):
+            return None
+        return torch.ops.trtllm.tinygemm2(input, module.weight, bias)
+    return torch.ops.small_m.low_m_linear(input, module.weight, bias)
 
 
 __all__ = [

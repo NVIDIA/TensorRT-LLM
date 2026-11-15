@@ -43,7 +43,8 @@ from ..cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
                      is_torch_compiling, replace_parameter_and_save_metadata,
                      unswizzle_sf)
-from .low_m_gemm import _should_apply_low_m_gemm, apply_low_m_gemm
+from .low_m_gemm import (SMALL_M_PATH_ATTR, _should_apply_low_m_gemm,
+                         apply_low_m_gemm, small_m_linear)
 
 
 class WeightMode(str, enum.Enum):
@@ -609,6 +610,12 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
+        # Off by default: only modules that modeling_gpt_oss.py marked on SM107
+        # for a small-M opt-in get here.
+        if getattr(module, SMALL_M_PATH_ATTR, None) is not None:
+            output = small_m_linear(module, input, bias)
+            if output is not None:
+                return output
         # The opt-in low-M dispatcher routes to the built-in CuTe-DSL low-m GEMM
         # kernel and returns None to fall through to the normal GEMM path.
         # Skip when use_custom_cublas_mm is set: that path may allocate output

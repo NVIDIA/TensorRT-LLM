@@ -895,10 +895,37 @@ def customized_gc_thresholds(gen0_threshold: Optional[int] = None):
             )
 
 
+# Opt-in (default off): PR #20244's shared no-op range. Read once per
+# process, before any module applies nvtx_range_debug as a decorator; unset,
+# nvtx_range_debug returns its existing contextlib null context.
+_BACKPORT_PR20244 = os.environ.get("TLLM_BACKPORT_PR20244", "") == "1"
+
+
 @contextmanager
 def _null_context_manager():
     yield
 
+
+class _NullRange:
+    """Disabled NVTX range: a no-op context manager and an identity decorator.
+
+    A contextlib-based null context used as a decorator re-creates its
+    generator context manager on every call of the decorated function, which
+    the LLM API result path pays once per streamed response.
+    """
+    __slots__ = ()
+
+    def __enter__(self):
+        return None
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def __call__(self, func):
+        return func
+
+
+_NULL_RANGE = _NullRange()
 
 _T = TypeVar("_T")
 
@@ -942,12 +969,16 @@ def nvtx_range_debug(msg: str,
         category (str, optional): The category for the range. Defaults to None.
 
     Returns:
-        contextmanager: A context manager that either marks the NVTX range if enabled,
-                        or a null context manager that does nothing if disabled.
+        contextmanager: A context manager that marks the NVTX range if enabled.
+                        If disabled, a shared, stateless no-op (``_NULL_RANGE``)
+                        that is both a context manager and an identity
+                        decorator; it is safe for concurrent and nested use.
     """
     if os.getenv("TLLM_LLMAPI_ENABLE_NVTX", "0") == "1" or \
             os.getenv("TLLM_NVTX_DEBUG", "0") == "1":
         return nvtx_range(msg, color=color, domain=domain, category=category)
+    elif _BACKPORT_PR20244:
+        return _NULL_RANGE
     else:
         return _null_context_manager()
 

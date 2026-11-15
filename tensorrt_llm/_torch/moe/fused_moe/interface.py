@@ -23,6 +23,7 @@ import torch
 from torch import nn
 
 from ...distributed.ops import reducescatter
+from . import static_eplb_route
 from .activation import DEFAULT_MOE_ACTIVATION, MoEActivation
 from .impl_blocks import (MoEEplbWeightLayoutMixin, MoEExecutionContractMixin,
                           MoEWeightOwnerMixin)
@@ -41,6 +42,15 @@ from .impl_contract import (MoEDeployment, MoEEligibility, MoEProblem,
 FORCE_SEPARATED_ROUTING = os.environ.get(
     "TLLM_TRTLLMGEN_FORCE_SEPARATED_ROUTING", "0") == "1"
 
+# Opt-in: GPT-OSS may hand the MoE an MxFp8QuantizedTensor made by its fused
+# post-attention add+RMSNorm+MXFP8 kernel. Only then does the torch.compile
+# custom op below rebuild one; unset, it is unchanged.
+_FUSE_NORM_MXFP8 = os.environ.get("TLLM_GPTOSS_FUSE_NORM_MXFP8", "0") == "1"
+# Opt-in DEP glue (static_eplb_route.py): the same MXFP8 input under attention
+# DP ("mxfp8"), and the static-EPLB slot-routing fast path ("route").
+_DEP3_GLUE_PARTS = static_eplb_route.DEP3_GLUE_PARTS
+_FUSE_NORM_MXFP8 = _FUSE_NORM_MXFP8 or "mxfp8" in _DEP3_GLUE_PARTS
+
 
 def _reject(reason: MoERejectReason, detail: str) -> MoEEligibility:
     """Create a silent ``can_implement`` rejection."""
@@ -49,8 +59,8 @@ def _reject(reason: MoERejectReason, detail: str) -> MoEEligibility:
 
 from ...model_config import ModelConfig
 from ...utils import (ActivationType, AuxStreamType, Fp4QuantizedTensor,
-                      get_model_extra_attrs, is_gated_activation,
-                      is_torch_compiling)
+                      MxFp8QuantizedTensor, get_model_extra_attrs,
+                      is_gated_activation, is_torch_compiling)
 from .routing import (BaseMoeRoutingMethod, RoutingMethodType,
                       get_cached_perfect_router_logits,
                       precompute_common_perfect_router_logits)
@@ -131,6 +141,16 @@ def extract_extra_attrs(layer_idx: str):
     return moe_layer
 
 
+def _quantized_moe_input(x: torch.Tensor, x_sf: Optional[torch.Tensor],
+                         is_swizzled: bool):
+    """Rebuild the activation ``MoE.forward`` unpacked for moe_custom_op."""
+    if x_sf is None:
+        return x
+    if _FUSE_NORM_MXFP8 and x.dtype == torch.float8_e4m3fn:
+        return MxFp8QuantizedTensor(x, x_sf, is_swizzled)
+    return Fp4QuantizedTensor(x, x_sf, is_swizzled)
+
+
 @torch.library.custom_op("trtllm::moe_custom_op", mutates_args=())
 def moe_custom_op(
     layer_idx: str,
@@ -145,8 +165,7 @@ def moe_custom_op(
 ) -> List[torch.Tensor]:
     moe_layer = extract_extra_attrs(layer_idx)
 
-    hidden_states = x if x_sf is None else Fp4QuantizedTensor(
-        x, x_sf, is_swizzled)
+    hidden_states = _quantized_moe_input(x, x_sf, is_swizzled)
 
     res = moe_layer.forward_impl(
         hidden_states,
@@ -176,8 +195,7 @@ def _(
     use_dp_padding,
 ):
     moe_layer = extract_extra_attrs(layer_idx)
-    hidden_states = x if x_sf is None else Fp4QuantizedTensor(
-        x, x_sf, is_swizzled)
+    hidden_states = _quantized_moe_input(x, x_sf, is_swizzled)
     res = moe_layer.forward_fake(
         hidden_states,
         router_logits,
@@ -657,6 +675,11 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
                              use_dp: bool) -> torch.Tensor:
         """Route tokens using load balancer."""
         if self.layer_load_balancer:
+            if "route" in _DEP3_GLUE_PARTS:
+                slots = static_eplb_route.maybe_static_route(
+                    self, token_selected_experts, use_dp)
+                if slots is not None:
+                    return slots
             return self.layer_load_balancer.route(token_selected_experts,
                                                   use_dp)
         else:
@@ -814,12 +837,20 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
                     "adapter pointers). Disable `register_to_config`/"
                     "torch.compile for this model, or remove the MoE modules "
                     "from `lora_config.lora_target_modules`.")
-            hidden_states = x.fp4_tensor if isinstance(
-                x, Fp4QuantizedTensor) else x
-            x_sf = x.scaling_factor if isinstance(x,
-                                                  Fp4QuantizedTensor) else None
-            is_swizzled = x.is_sf_swizzled if isinstance(
-                x, Fp4QuantizedTensor) else False
+            if isinstance(x, MxFp8QuantizedTensor):
+                # Rebuilt by _quantized_moe_input from the FP8 dtype.
+                assert _FUSE_NORM_MXFP8, (
+                    "MXFP8 MoE input needs TLLM_GPTOSS_FUSE_NORM_MXFP8=1")
+                hidden_states = x.fp8_tensor
+                x_sf = x.scaling_factor
+                is_swizzled = x.is_sf_swizzled
+            else:
+                hidden_states = x.fp4_tensor if isinstance(
+                    x, Fp4QuantizedTensor) else x
+                x_sf = x.scaling_factor if isinstance(
+                    x, Fp4QuantizedTensor) else None
+                is_swizzled = x.is_sf_swizzled if isinstance(
+                    x, Fp4QuantizedTensor) else False
 
             res = moe_custom_op(
                 self.layer_idx_str,

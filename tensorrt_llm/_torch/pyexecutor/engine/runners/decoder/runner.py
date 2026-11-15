@@ -70,6 +70,10 @@ from tensorrt_llm._torch.speculative import (
     restore_attn_metadata_after_draft_replay,
 )
 from tensorrt_llm._torch.speculative.interface import INVALID_PROMPT_LOOKAHEAD_TOKEN
+from tensorrt_llm._torch.speculative.interface import (
+    ONE_MODEL_SPEC_FAST_PREPARE as _ONE_MODEL_SPEC_FAST_PREPARE,
+)
+from tensorrt_llm._torch.speculative.interface import one_model_spec_fast_prepare_note
 from tensorrt_llm._torch.speculative.spec_sampler_base import SampleStateTensorsSpec
 from tensorrt_llm._torch.speculative.utils import get_static_draft_len, resolve_draft_len
 from tensorrt_llm._torch.utils import (
@@ -139,6 +143,7 @@ def resolve_mamba_metadata_cls(model: torch.nn.Module) -> type[Mamba2Metadata]:
 def _make_single_token_context_graph_batch(
     scheduled_requests: ScheduledRequests,
     is_multimodal_decode_compatible: Callable[[LlmRequest], bool] | None = None,
+    preserve_eagle3_min_length_context: bool = False,
 ) -> tuple[ScheduledRequests, frozenset[int]]:
     """Build a decode-shaped graph candidate for final one-token contexts.
 
@@ -153,6 +158,14 @@ def _make_single_token_context_graph_batch(
         return scheduled_requests, frozenset()
 
     for request in context_requests:
+        # EAGLE3 masks EOS on context rows before sampling the first token.
+        # A decode-shaped graph would hide these rows from that mask.
+        if (
+            preserve_eagle3_min_length_context
+            and request.py_min_length == 1
+            and request.get_num_tokens(0) == request.orig_prompt_len
+        ):
+            return scheduled_requests, frozenset()
         if (
             request.context_chunk_size != 1
             or request.context_remaining_length != 1
@@ -197,6 +210,73 @@ def _make_single_token_context_graph_batch(
 NON_GREEDY_CAPTURE_SAMPLING_PARAMS = SamplingParams(
     temperature=0.7, top_k=50, top_p=0.9, min_p=0.05
 )
+
+
+def _pack_previous_tensor_extend_rows(
+    requests: list[LlmRequest],
+    previous_batch_idx: list[int],
+    tokens: int,
+    step_prompt_lengths: bool,
+    *,
+    extra_inputs: "ExtraInputsCollector",
+    padding_gen_slots: list,
+    request_ids: list,
+    sequence_lengths: list,
+    num_accepted_draft_tokens: list,
+    draft_lens: list,
+    gather_ids: list,
+    position_ids: list,
+    previous_batch_indices: list,
+    previous_pos_indices: list,
+    num_cached_tokens_per_seq: list,
+    prompt_lengths: list,
+) -> None:
+    """TLLM_ONE_MODEL_SPEC_FAST_PREPARE: pack extend requests that all have a
+    previous overlap tensor in one pass.
+
+    The batched form of the previous-tensor branch of ``_prepare_tp_inputs``'
+    extend loop (no promoted context row, no helix): every list receives the
+    same values in the same order, and every request the same updates, as that
+    branch gives them one request at a time. ``previous_batch_idx`` holds each
+    request's ``py_batch_idx`` before this call; ``tokens`` is the runtime
+    tokens per generation step.
+    """
+    add_generation_request = extra_inputs.add_generation_request
+    for request in requests:
+        if getattr(request, "py_needs_onehot_draft_probs", False):
+            if request.py_seq_slot is not None:
+                padding_gen_slots.append(request.py_seq_slot)
+            request.py_needs_onehot_draft_probs = False  # consume once
+        request.py_batch_idx = request.py_seq_slot
+        add_generation_request(request)
+
+    num_requests = len(requests)
+    past_seen_token_num = [request.max_beam_num_tokens - 1 for request in requests]
+    request_ids.extend([request.py_request_id for request in requests])
+    sequence_lengths.extend([tokens] * num_requests)
+    num_accepted_draft_tokens.extend([request.py_num_accepted_draft_tokens for request in requests])
+    draft_lens.extend([tokens - 1] * num_requests)
+    # Request i owns token rows [start + i * tokens, start + (i + 1) * tokens).
+    start = len(position_ids)
+    gather_ids.extend(range(start, start + num_requests * tokens))
+    positions = [0] * (num_requests * tokens)
+    previous_pos = [0] * (num_requests * tokens)
+    for offset in range(tokens):
+        positions[offset::tokens] = [past + offset for past in past_seen_token_num]
+        previous_pos[offset::tokens] = previous_batch_idx
+    position_ids.extend(positions)
+    previous_batch_indices.extend(previous_batch_idx)
+    previous_pos_indices.extend(previous_pos)
+    num_cached_tokens_per_seq.extend(
+        [
+            past + tokens - request.py_num_compressed_tokens
+            for request, past in zip(requests, past_seen_token_num)
+        ]
+    )
+    if step_prompt_lengths:
+        prompt_lengths.extend([tokens] * num_requests)
+    else:
+        prompt_lengths.extend([request.py_prompt_len for request in requests])
 
 
 class ExtraInputsCollector:
@@ -3414,36 +3494,57 @@ class DecoderRunner(ScheduledModelRunner):
         # Collect generation request IDs during categorization to avoid
         # a separate iteration over scheduled_requests.generation_requests later.
         all_gen_request_ids = []
-        for request in scheduled_requests.generation_requests:
-            is_promoted_context = request.py_request_id in promoted_context_request_ids
-            if is_promoted_context:
-                # A promoted row is a one-token final context chunk riding
-                # the decode path: this is its context-phase forward, so
-                # latch the reused prefix as the context branch does.
-                # Ordinary decode rows never write cached_tokens.
-                request.cached_tokens = request.context_current_position
+        if (
+            _ONE_MODEL_SPEC_FAST_PREPARE
+            and not promoted_context_request_ids
+            and next_draft_tokens_device is not None
+        ):
+            # TLLM_ONE_MODEL_SPEC_FAST_PREPARE: with the overlap scheduler's draft
+            # tensors and no promoted context row, the loop below sends every
+            # generation request to the extend group, so only the dummy split is
+            # per row.
+            _fast_generation_rows = scheduled_requests.generation_requests
+            all_gen_request_ids.extend([request.py_request_id for request in _fast_generation_rows])
+            _fast_is_dummy = [request.is_dummy for request in _fast_generation_rows]
+            if any(_fast_is_dummy):
+                for request, _fast_dummy in zip(_fast_generation_rows, _fast_is_dummy):
+                    if _fast_dummy:
+                        extend_dummy_requests.append(request)
+                    else:
+                        extend_requests.append(request)
             else:
-                all_gen_request_ids.append(request.py_request_id)
-            # In speculative iterations, keep promoted rows ahead of existing
-            # generation rows in the extend-request packing order. Although
-            # their q_len is one, this category provides the "no previous
-            # speculative tensor" branch needed to source their prompt token
-            # without disturbing the overlap offsets of ordinary generation
-            # siblings. Non-speculative promoted rows retain the established
-            # ordinary generation path below.
-            if is_promoted_context and enable_spec_decode:
-                extend_requests.append(request)
-            elif is_promoted_context:
-                generation_requests.append(request)
-            elif get_draft_token_length(request) > 0 or next_draft_tokens_device is not None:
-                if request.is_dummy:
-                    extend_dummy_requests.append(request)
+                extend_requests.extend(_fast_generation_rows)
+        else:
+            for request in scheduled_requests.generation_requests:
+                is_promoted_context = request.py_request_id in promoted_context_request_ids
+                if is_promoted_context:
+                    # A promoted row is a one-token final context chunk riding
+                    # the decode path: this is its context-phase forward, so
+                    # latch the reused prefix as the context branch does.
+                    # Ordinary decode rows never write cached_tokens.
+                    request.cached_tokens = request.context_current_position
                 else:
+                    all_gen_request_ids.append(request.py_request_id)
+                # In speculative iterations, keep promoted rows ahead of existing
+                # generation rows in the extend-request packing order. Although
+                # their q_len is one, this category provides the "no previous
+                # speculative tensor" branch needed to source their prompt token
+                # without disturbing the overlap offsets of ordinary generation
+                # siblings. Non-speculative promoted rows retain the established
+                # ordinary generation path below.
+                if is_promoted_context and enable_spec_decode:
                     extend_requests.append(request)
-            elif request.py_is_first_draft:
-                first_draft_requests.append(request)
-            else:
-                generation_requests.append(request)
+                elif is_promoted_context:
+                    generation_requests.append(request)
+                elif get_draft_token_length(request) > 0 or next_draft_tokens_device is not None:
+                    if request.is_dummy:
+                        extend_dummy_requests.append(request)
+                    else:
+                        extend_requests.append(request)
+                elif request.py_is_first_draft:
+                    first_draft_requests.append(request)
+                else:
+                    generation_requests.append(request)
         extend_requests += extend_dummy_requests
 
         # Helix bookkeeping is needed by BOTH the extend (speculative verify
@@ -3492,6 +3593,55 @@ class DecoderRunner(ScheduledModelRunner):
         previous_pos_indices = []
         runtime_tokens_per_gen_step = self.get_runtime_tokens_per_gen_step(runtime_draft_len)
         runtime_draft_token_buffer_width = runtime_tokens_per_gen_step - 1
+        if _ONE_MODEL_SPEC_FAST_PREPARE:
+            # TLLM_ONE_MODEL_SPEC_FAST_PREPARE: under the overlap scheduler the
+            # non-dummy rows ahead of the dummy tail usually all read their tokens
+            # from the previous step's device tensors (the loop's previous-tensor
+            # branch): pack them in one pass and let the loop take the rest. The
+            # full list is restored right after the loop.
+            _fast_all_extend_requests = extend_requests
+            if (
+                next_draft_tokens_device is not None
+                and not promoted_context_request_ids
+                and not _has_cp_helix
+            ):
+                _fast_num_real = len(extend_requests) - len(extend_dummy_requests)
+                _fast_real_requests = extend_requests[:_fast_num_real]
+                _fast_previous_batch_idx = [
+                    request.py_batch_idx for request in _fast_real_requests
+                ]
+                if _fast_real_requests and None not in _fast_previous_batch_idx:
+                    _pack_previous_tensor_extend_rows(
+                        _fast_real_requests,
+                        _fast_previous_batch_idx,
+                        runtime_tokens_per_gen_step,
+                        bool(
+                            enable_spec_decode
+                            and spec_config.spec_dec_mode.extend_ctx(
+                                self._config.attention_backend
+                            )
+                            and spec_config.is_linear_tree
+                        ),
+                        extra_inputs=extra_inputs,
+                        padding_gen_slots=padding_gen_slots,
+                        request_ids=request_ids,
+                        sequence_lengths=sequence_lengths,
+                        num_accepted_draft_tokens=num_accepted_draft_tokens,
+                        draft_lens=draft_lens,
+                        gather_ids=gather_ids,
+                        position_ids=position_ids,
+                        previous_batch_indices=previous_batch_indices,
+                        previous_pos_indices=previous_pos_indices,
+                        num_cached_tokens_per_seq=num_cached_tokens_per_seq,
+                        prompt_lengths=prompt_lengths,
+                    )
+                    one_model_spec_fast_prepare_note(
+                        "extend",
+                        f"speculative extend rows with a previous overlap tensor packed "
+                        f"in one pass ({_fast_num_real} rows, "
+                        f"{runtime_tokens_per_gen_step} tokens each)",
+                    )
+                    extend_requests = extend_requests[_fast_num_real:]
         for request in extend_requests:
             is_promoted_context = request.py_request_id in promoted_context_request_ids
             if getattr(request, "py_needs_onehot_draft_probs", False):
@@ -3618,6 +3768,8 @@ class DecoderRunner(ScheduledModelRunner):
                     prompt_lengths.append(request.py_prompt_len)
 
             extra_inputs.add_generation_request(request)
+        if _ONE_MODEL_SPEC_FAST_PREPARE:
+            extend_requests = _fast_all_extend_requests
 
         for request in first_draft_requests:
             request_ids.append(request.py_request_id)
@@ -4475,7 +4627,11 @@ class DecoderRunner(ScheduledModelRunner):
             and self.mapping.cp_size == 1
         ):
             graph_requests, promoted_context_request_ids = _make_single_token_context_graph_batch(
-                scheduled_requests, self._is_final_multimodal_context_decode_compatible
+                scheduled_requests,
+                self._is_final_multimodal_context_decode_compatible,
+                preserve_eagle3_min_length_context=(
+                    getattr(spec_metadata, "first_token_eos_ids", None) is not None
+                ),
             )
 
         with self.cuda_graph_runner.pad_batch(

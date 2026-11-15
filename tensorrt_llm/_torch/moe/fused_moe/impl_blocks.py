@@ -41,7 +41,7 @@ from typing import Dict, List, Optional, Union
 
 import torch
 
-from ...utils import Fp4QuantizedTensor
+from ...utils import Fp4QuantizedTensor, MxFp8QuantizedTensor
 from .impl_contract import MoEInputRequirement, MoEStaticCapability
 
 
@@ -118,8 +118,18 @@ class MoEExecutionContractMixin:
         differs override this and delegate the finalized case back here.
         """
         del router_logits, use_dp_padding, kwargs
-        is_nvfp4_input = isinstance(x, Fp4QuantizedTensor)
         assert do_finalize, "Default forward_fake does not support do_finalize=False"
+        if isinstance(x, MxFp8QuantizedTensor):
+            # An MXFP8 input (GPT-OSS fused post-attention norm, opt-in) is padded
+            # to the MoE input alignment; the finalized output has the layer's
+            # hidden size.
+            num_tokens = (
+                all_rank_num_tokens[self.mapping.tp_rank] if all_rank_num_tokens else x.shape[0]
+            )
+            return x.fp8_tensor.new_empty(
+                (num_tokens, self.hidden_size), dtype=output_dtype or torch.bfloat16
+            )
+        is_nvfp4_input = isinstance(x, Fp4QuantizedTensor)
         data_type = output_dtype if is_nvfp4_input else x.dtype
         num_tokens = (
             all_rank_num_tokens[self.mapping.tp_rank] if all_rank_num_tokens else x.shape[0]

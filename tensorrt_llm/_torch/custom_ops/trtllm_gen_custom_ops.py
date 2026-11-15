@@ -1238,7 +1238,8 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
                  routing_method_type: int,
                  act_type: int,
                  tune_max_num_tokens: int = 8192,
-                 use_dp: bool = False):
+                 use_dp: bool = False,
+                 do_finalize: bool = True):
 
         self.num_experts = num_experts
         self.top_k = top_k
@@ -1252,6 +1253,9 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
         self.routed_scaling_factor = routed_scaling_factor
         self.routing_method_type = routing_method_type
         self.act_type = act_type
+        # Not part of unique_id: the finalize kernel does not depend on the
+        # FC1/FC2 tactic, so both forms share the tuned tactics.
+        self.do_finalize = do_finalize
 
         self.tuning_config = MxE4m3MxE2m1BlockScaleMoERunner.get_tuning_config(
             self.num_experts // self.local_num_experts,
@@ -1290,6 +1294,22 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
         args = MxE4m3MxE2m1BlockScaleMoEInputs(*inputs)
 
         kernel_runner = self.get_runner()
+        if not self.do_finalize:
+            # [FC2 rows, routing weights, expanded_idx_to_permuted_idx]:
+            # the caller runs the finalize (mxFp4BlockScaleMoe.cpp).
+            assert output is None, "output is only supported when do_finalize=True"
+            return kernel_runner.run_moe_unfinalized(
+                args.routing_logits, args.routing_bias, args.hidden_states,
+                args.hidden_states_scale, args.gemm1_weights,
+                args.gemm1_weights_scale, args.gemm1_bias, args.gemm1_alpha,
+                args.gemm1_beta, args.gemm1_clamp_limit, args.gemm2_weights,
+                args.gemm2_weights_scale, args.gemm2_bias, None, None, None,
+                self.num_experts, self.top_k, self.n_group, self.topk_group,
+                self.intermediate_size, self.valid_hidden_size,
+                self.valid_intermediate_size, self.local_expert_offset,
+                self.local_num_experts, self.routed_scaling_factor,
+                self.routing_method_type, tactic, args.topk_weights,
+                args.topk_ids)
         return kernel_runner.run_moe(
             args.routing_logits, args.routing_bias, args.hidden_states,
             args.hidden_states_scale, args.gemm1_weights,
@@ -1537,6 +1557,166 @@ def mxe4m3_mxe2m1_block_scale_moe_runner(
     if output is not None:
         return torch.empty(0, device=result.device, dtype=result.dtype)
     return result
+
+
+@torch.library.custom_op(
+    "trtllm::mxe4m3_mxe2m1_block_scale_moe_runner_unfinalized", mutates_args=())
+def mxe4m3_mxe2m1_block_scale_moe_runner_unfinalized(
+        routing_logits: Optional[torch.Tensor],
+        routing_bias: Optional[torch.Tensor],
+        hidden_states: torch.Tensor,
+        hidden_states_scale: torch.Tensor,
+        gemm1_weights: torch.Tensor,
+        gemm1_weights_scale: torch.Tensor,
+        gemm1_bias: Optional[torch.Tensor],
+        gemm1_alpha: Optional[torch.Tensor],
+        gemm1_beta: Optional[torch.Tensor],
+        gemm1_clamp_limit: Optional[torch.Tensor],
+        gemm2_weights: torch.Tensor,
+        gemm2_weights_scale: torch.Tensor,
+        gemm2_bias: Optional[torch.Tensor],
+        num_experts: int,
+        top_k: int,
+        n_group: Optional[int],
+        topk_group: Optional[int],
+        intermediate_size: int,
+        valid_hidden_size: Optional[int],
+        valid_intermediate_size: Optional[int],
+        local_expert_offset: int,
+        local_num_experts: int,
+        routed_scaling_factor: Optional[float],
+        routing_method_type: int,
+        act_type: int,
+        topk_weights: Optional[torch.Tensor] = None,
+        topk_ids: Optional[torch.Tensor] = None,
+        tune_max_num_tokens: int = 8192,
+        use_dp: bool = False) -> List[torch.Tensor]:
+    """``mxe4m3_mxe2m1_block_scale_moe_runner`` without the finalize kernel.
+
+    Returns [FC2 rows [P, roundUp(valid_hidden_size, 128)] bf16, routing
+    weights [num_tokens, top_k], expanded_idx_to_permuted_idx [num_tokens,
+    top_k] int32]. Tactics come from the same tuning entries as the finalized
+    op (same op name and runner unique_id), so both run the same FC1/FC2.
+    """
+    tuner = AutoTuner.get()
+    kernel_runner = MxE4m3MxE2m1BlockScaleMoERunner(
+        num_experts,
+        top_k,
+        n_group,
+        topk_group,
+        intermediate_size,
+        valid_hidden_size,
+        valid_intermediate_size,
+        local_expert_offset,
+        local_num_experts,
+        routed_scaling_factor,
+        routing_method_type,
+        act_type,
+        tune_max_num_tokens=tune_max_num_tokens,
+        use_dp=use_dp,
+        do_finalize=False,
+    )
+
+    routing_logits_for_tuner, topk_weights_for_tuner, topk_ids_for_tuner, tuning_config_with_hook = \
+        prepare_dummy_topk_and_hook(
+            routing_method_type=routing_method_type,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            hidden_states=hidden_states,
+            routing_logits=routing_logits,
+            base_tuning_config=kernel_runner.tuning_config,
+            top_k=top_k,
+            num_experts=num_experts,
+            local_num_experts=local_num_experts,
+            n_group=n_group,
+            topk_group=topk_group,
+            routed_scaling_factor=routed_scaling_factor,
+            hidden_states_index=2,
+            local_expert_offset=local_expert_offset,
+            use_dp=use_dp,
+        )
+
+    input_tensors_for_tuner = [
+        routing_logits_for_tuner,
+        routing_bias,
+        hidden_states,
+        hidden_states_scale,
+        gemm1_weights,
+        gemm1_weights_scale,
+        gemm1_bias,
+        gemm1_alpha,
+        gemm1_beta,
+        gemm1_clamp_limit,
+        gemm2_weights,
+        gemm2_weights_scale,
+        gemm2_bias,
+        topk_weights_for_tuner,
+        topk_ids_for_tuner,
+    ]
+
+    # The finalized op's name: one set of tuned tactics for both forms.
+    kernel_runner, best_tactic = tuner.choose_one(
+        "trtllm::mxe4m3_mxe2m1_block_scale_moe_runner",
+        [kernel_runner],
+        tuning_config_with_hook,
+        input_tensors_for_tuner,
+    )
+
+    input_tensors = input_tensors_for_tuner
+    input_tensors[0] = routing_logits
+    input_tensors[-2] = topk_weights
+    input_tensors[-1] = topk_ids
+    return kernel_runner(input_tensors,
+                         tactic=[-1, -1] if best_tactic == -1 else best_tactic)
+
+
+@mxe4m3_mxe2m1_block_scale_moe_runner_unfinalized.register_fake
+def _(routing_logits,
+      routing_bias,
+      hidden_states,
+      hidden_states_scale,
+      gemm1_weights,
+      gemm1_weights_scale,
+      gemm1_bias,
+      gemm1_alpha,
+      gemm1_beta,
+      gemm1_clamp_limit,
+      gemm2_weights,
+      gemm2_weights_scale,
+      gemm2_bias,
+      num_experts,
+      top_k,
+      n_group,
+      topk_group,
+      intermediate_size,
+      valid_hidden_size,
+      valid_intermediate_size,
+      local_expert_offset,
+      local_num_experts,
+      routed_scaling_factor,
+      routing_method_type,
+      act_type,
+      topk_weights=None,
+      topk_ids=None,
+      tune_max_num_tokens=8192,
+      use_dp=False) -> List[torch.Tensor]:
+    num_tokens = hidden_states.shape[0]
+    hidden = valid_hidden_size if valid_hidden_size is not None else hidden_states.shape[
+        1]
+    width = (hidden + 127) // 128 * 128
+    # Row count bound at the largest MXFP8 tile (the real one depends on the
+    # tactic); only the finalize that consumes the rows reads them.
+    tile_tokens_dim = 256
+    max_num_padded_tokens = fp4_utils.pad_up(
+        num_tokens * top_k + (tile_tokens_dim - 1) * num_experts,
+        tile_tokens_dim)
+    wt_dtype = topk_weights.dtype if topk_weights is not None else torch.bfloat16
+    return [
+        hidden_states.new_empty((max_num_padded_tokens, width),
+                                dtype=torch.bfloat16),
+        hidden_states.new_empty((num_tokens, top_k), dtype=wt_dtype),
+        hidden_states.new_empty((num_tokens, top_k), dtype=torch.int32),
+    ]
 
 
 @dataclass(frozen=True)

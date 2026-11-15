@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -118,6 +118,11 @@ protected:
 };
 
 constexpr uint32_t xqaMlaCgaXBufSize = 8704 * 2;
+
+// TLLM_DECODER_INFO_ONCE_LAYERS (default off; see xqaDispatcher.cpp): forget the decoder info the trtllm-gen
+// generation path built last, so the next layer rebuilds it. Called by every attention enqueue that may write the
+// attention workspace outside that path (context phase, context parallelism, the MMHA fallback).
+void invalidateXqaDecoderInfoReuse();
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

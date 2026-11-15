@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include <cstdio>
+#include <cstdlib>
 #include <optional>
 #include <set>
 #include <unistd.h>
@@ -160,6 +162,27 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
     }
 
     int gpuSM = tensorrt_llm::common::getSMVersion();
+    // The Sm107a cubins are embedded (CMakeLists.txt) but offered only with TLLM_BATCHED_GEMM_SM107A=1; otherwise
+    // the candidate set is the same as in a build without them. Logged once per process when enabled.
+    static bool const enableSm107a = []()
+    {
+        char const* env = std::getenv("TLLM_BATCHED_GEMM_SM107A");
+        bool const on = env != nullptr && env[0] == '1' && env[1] == '\0';
+        if (on)
+        {
+            size_t n107 = 0;
+            auto const bmm0 = BatchedGemmInterface();
+            for (size_t j = 0; j < bmm0.getNumBatchedGemmConfigs(); ++j)
+            {
+                n107 += bmm0.getBatchedGemmConfigs()[j].mSm == SmVersion::Sm107a ? 1 : 0;
+            }
+            std::fprintf(stderr,
+                "[TRT-LLM] [INFO] TLLM_BATCHED_GEMM_SM107A=1 active: %zu Sm107a batched-GEMM configs in the registry "
+                "are offered to the runners on SM107 (GPU SM %d)\n",
+                n107, tensorrt_llm::common::getSMVersion());
+        }
+        return on;
+    }();
     for (size_t i = 0; i < bmm.getNumBatchedGemmConfigs(); ++i)
     {
         auto acceptIf = [i, &rejectReason, enableRejectLog](bool condition, std::string const& reason) -> bool
@@ -248,6 +271,12 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
 
         if (!acceptIf(isSMCompatible(gpuSM, configs[i].mSm),
                 fmtstr("SM not compatible (gpuSM: %d, kernelSM: %d)", gpuSM, static_cast<int>(configs[i].mSm))))
+        {
+            continue;
+        }
+
+        if (!acceptIf(configs[i].mSm != SmVersion::Sm107a || enableSm107a,
+                "Sm107a withheld (TLLM_BATCHED_GEMM_SM107A unset)"))
         {
             continue;
         }

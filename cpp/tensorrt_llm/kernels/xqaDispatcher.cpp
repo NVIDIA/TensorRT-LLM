@@ -19,8 +19,15 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQARunnerUtils.h"
 #include "tensorrt_llm/kernels/sparseAttentionKernels.h"
+#include "tensorrt_llm/kernels/swaDecodeAttention.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
+#include <atomic>
+#include <climits>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <type_traits>
 
 namespace
 {
@@ -46,6 +53,148 @@ namespace kernels
 
 namespace
 {
+
+// TLLM_DECODER_INFO_ONCE_LAYERS=N (default unset = off). The trtllm-gen generation path rebuilds cu_seqlens,
+// cu_kv_seqlens and the per-sequence rotary inv_freq (computeSeqAndPaddingOffsets) in every layer, from inputs
+// that do not change between the layers of one forward step, into the same workspace bytes. With N > 0, local
+// layer k in [1, N) reuses what layer k-1 left there when all of these hold:
+//   - layer k-1 was the last attention enqueue on this thread (context, CP and MMHA enqueues invalidate);
+//   - every input and output pointer, size and rotary field of the build is identical (DecoderInfoKey).
+// N must be the number of target attention layers on this rank (36 for GPT-OSS-120B), so a draft layer
+// (local index >= N), whose lengths change between iterations, always rebuilds. Layer 0 always rebuilds.
+// Under CUDA graphs the decision is taken at capture: layer 0's build is captured and replayed every step.
+struct DecoderInfoKey
+{
+    cudaStream_t stream;
+    void const* outQ;
+    void const* outKv;
+    void const* outInvFreq;
+    void const* inQLengths;
+    void const* inKvLengths;
+    void const* inInvFreqCache;
+    int batchSize;
+    int maxQSeqLength;
+    int numTokens;
+    int rotaryDim;
+    int rotaryType;
+    int rotaryMaxPositions;
+    float rotaryScale;
+    float rotaryBase;
+
+    bool operator==(DecoderInfoKey const& o) const
+    {
+        return stream == o.stream && outQ == o.outQ && outKv == o.outKv && outInvFreq == o.outInvFreq
+            && inQLengths == o.inQLengths && inKvLengths == o.inKvLengths && inInvFreqCache == o.inInvFreqCache
+            && batchSize == o.batchSize && maxQSeqLength == o.maxQSeqLength && numTokens == o.numTokens
+            && rotaryDim == o.rotaryDim && rotaryType == o.rotaryType && rotaryMaxPositions == o.rotaryMaxPositions
+            && rotaryScale == o.rotaryScale && rotaryBase == o.rotaryBase;
+    }
+};
+
+struct DecoderInfoReuseState
+{
+    bool valid = false;
+    int layer = -1;
+    DecoderInfoKey key{};
+    // Highest layer_idx that called reuseDecoderInfo since the last layer 0 (logged when it changes, to check N).
+    int stepMaxLayer = -1;
+};
+
+thread_local DecoderInfoReuseState gDecoderInfoReuse;
+
+int decoderInfoOnceLayers()
+{
+    static int const layers = []
+    {
+        char const* v = std::getenv("TLLM_DECODER_INFO_ONCE_LAYERS");
+        int n = (v != nullptr && v[0] != '\0') ? std::atoi(v) : 0;
+        n = n > 0 ? n : 0;
+        if (n > 0)
+        {
+            std::fprintf(stderr,
+                "[TRT-LLM] [INFO] TLLM_DECODER_INFO_ONCE_LAYERS=%d active: trtllm-gen generation layers 1..%d "
+                "reuse the previous layer's decoder info\n",
+                n, n - 1);
+        }
+        return n;
+    }();
+    return layers;
+}
+
+template <typename T>
+DecoderInfoKey makeDecoderInfoKey(BuildDecoderInfoParams<T> const& p, cudaStream_t stream)
+{
+    DecoderInfoKey k{};
+    k.stream = stream;
+    k.outQ = p.seqQOffsets;
+    k.outKv = p.seqKVOffsets;
+    k.outInvFreq = p.rotaryEmbeddingInvFreq;
+    k.inQLengths = p.seqQLengths;
+    k.inKvLengths = p.seqKVLengths;
+    k.inInvFreqCache = p.rotaryEmbeddingInvFreqCache;
+    k.batchSize = p.batchSize;
+    k.maxQSeqLength = p.maxQSeqLength;
+    k.numTokens = p.numTokens;
+    k.rotaryDim = p.rotaryEmbeddingDim;
+    k.rotaryType = static_cast<int>(p.rotaryScalingType);
+    k.rotaryMaxPositions = p.rotaryEmbeddingMaxPositions;
+    k.rotaryScale = p.rotaryEmbeddingScale;
+    k.rotaryBase = p.rotaryEmbeddingBase;
+    return k;
+}
+
+// Returns true when this layer may skip invokeBuildDecoderInfo, and records this layer as the last builder or reuser.
+template <typename T>
+bool reuseDecoderInfo(BuildDecoderInfoParams<T> const& p, int layerIdx, cudaStream_t stream)
+{
+    int const layers = decoderInfoOnceLayers();
+    if (layers <= 0)
+    {
+        return false;
+    }
+    DecoderInfoKey const key = makeDecoderInfoKey(p, stream);
+    auto& s = gDecoderInfoReuse;
+    if (layerIdx == 0)
+    {
+        // A new forward step. Log the previous step's highest layer_idx (among calls that build decoder info)
+        // whenever it differs from the last value logged, so the log shows every distinct value: N with a
+        // one-model drafter (its draft layer has index N), N-1 for a target-only forward. Above N is a misconfig.
+        static int loggedMax = -1;
+        if (s.stepMaxLayer > 0 && s.stepMaxLayer != loggedMax)
+        {
+            loggedMax = s.stepMaxLayer;
+            std::fprintf(stderr,
+                "[TRT-LLM] [INFO] TLLM_DECODER_INFO_ONCE_LAYERS=%d: step max layer_idx %d (%s)\n", layers,
+                s.stepMaxLayer,
+                s.stepMaxLayer == layers       ? "== N: draft layer seen, N matches the target layer count"
+                    : s.stepMaxLayer == layers - 1 ? "== N-1: target-only forward"
+                    : s.stepMaxLayer > layers      ? "> N: N is below the target layer count"
+                                                   : "< N-1: N exceeds the layers seen; check N");
+        }
+        s.stepMaxLayer = 0;
+    }
+    else if (layerIdx > s.stepMaxLayer)
+    {
+        s.stepMaxLayer = layerIdx;
+    }
+    bool const reuse = s.valid && layerIdx > 0 && layerIdx < layers && s.layer == layerIdx - 1 && s.key == key;
+    s.valid = true;
+    s.layer = layerIdx;
+    s.key = key;
+    if (reuse)
+    {
+        static bool logged = false;
+        if (!logged)
+        {
+            logged = true;
+            std::fprintf(stderr,
+                "[TRT-LLM] [INFO] TLLM_DECODER_INFO_ONCE_LAYERS: layer %d reuses decoder info "
+                "(batch=%d maxQ=%d tokens=%d)\n",
+                layerIdx, p.batchSize, p.maxQSeqLength, p.numTokens);
+        }
+    }
+    return reuse;
+}
 
 template <typename T, typename KVCacheBuffer>
 QKVPreprocessingParams<T, KVCacheBuffer> makeQKVPreprocessingParams(XQAParams const& params,
@@ -122,6 +271,122 @@ QKVPreprocessingParams<T, KVCacheBuffer> makeQKVPreprocessingParams(XQAParams co
     preprocessingParms.encoder_seq_lens = params.encoder_input_lengths;
 
     return preprocessingParms;
+}
+
+// TLLM_FMHA_SWA_DECODE_KERNEL=1 (exactly "1"). Read once per process.
+bool swaDecodeKernelFromEnv()
+{
+    static bool const value = []()
+    {
+        char const* env = std::getenv("TLLM_FMHA_SWA_DECODE_KERNEL");
+        return env != nullptr && std::strcmp(env, "1") == 0;
+    }();
+    return value;
+}
+
+// Opt-in (TLLM_FMHA_SWA_DECODE_KERNEL=1): run a short sliding-window generation attention (window + query tokens - 1
+// <= 160 keys, the GPT-OSS window-128 layers) on the dedicated kernel (swaDecodeAttention.h) instead of the
+// trtllm-gen FMHA, after the same QKV preprocessing. Same inputs (E4M3 Q, the paged E4M3 cache, the device scales,
+// the sinks) and the same mask; the kernel runs one 128-thread CTA per (request, KV head), so several short windows
+// are in flight per SM. Returns false, leaving the stock path to run, unless every condition holds.
+template <typename KVCacheBuffer>
+bool runSwaDecodeIfRequested(XqaFixedParams const& fixed, Data_type qDataType, XQAParams const& params,
+    KVCacheBuffer const& kvCacheBuffer, float const* bmm1Scale, float const* bmm2Scale, void const* q,
+    int const* cuSeqLensQ)
+{
+    if (!swaDecodeKernelFromEnv())
+    {
+        return false;
+    }
+    int const window = params.cyclic_attention_window_size;
+    int const headsPerKv = params.num_kv_heads > 0 ? params.num_q_heads / params.num_kv_heads : 0;
+    // Only short sliding windows are candidates; every other layer keeps the stock path silently.
+    if (window <= 0 || window + params.generation_input_length - 1 > 160)
+    {
+        return false;
+    }
+    char const* reject = nullptr;
+    if constexpr (!std::is_same_v<KVCacheBuffer, KVBlockArray>)
+    {
+        reject = "contiguous KV cache";
+    }
+    else if (qDataType != DATA_TYPE_E4M3 || fixed.kvDataType != DATA_TYPE_E4M3)
+    {
+        reject = "Q or KV is not E4M3";
+    }
+    else if (fixed.outputDataType != DATA_TYPE_BF16 || params.is_fp8_output || params.output_sf != nullptr)
+    {
+        reject = "output is not BF16";
+    }
+    else if (fixed.isMLA || fixed.hasAlibi || fixed.useTllmGenSparseAttention || params.use_sparse_attention_gen_paged)
+    {
+        reject = "MLA, ALiBi or sparse attention";
+    }
+    else if (params.beam_width != 1 || params.cross_attention || (params.is_spec_dec_tree && params.multi_query_tokens))
+    {
+        reject = "beam search, cross attention or a spec-dec tree";
+    }
+    else if (params.softmax_stats != nullptr || params.skip_softmax_threshold_scale_factor != 0.f
+        || params.helix_position_offsets != nullptr || params.helix_is_inactive_rank != nullptr)
+    {
+        reject = "softmax stats, skip-softmax or helix";
+    }
+    else if (params.sink_token_length != 0 || params.position_shift_enabled
+        || (params.chunked_attention_size != INT_MAX && params.chunked_attention_size > 0))
+    {
+        reject = "StreamingLLM sink tokens or chunked attention";
+    }
+    else if (bmm1Scale == nullptr || bmm2Scale == nullptr)
+    {
+        reject = "no device BMM scales";
+    }
+    else if (params.num_kv_heads <= 0 || headsPerKv * params.num_kv_heads != params.num_q_heads
+        || !swaDecodeAttentionSupported(params.head_size, headsPerKv, params.generation_input_length, window))
+    {
+        reject = "unsupported shape";
+    }
+    if (reject != nullptr)
+    {
+        static std::atomic<bool> loggedSkip{false};
+        if (!loggedSkip.exchange(true))
+        {
+            std::fprintf(stderr,
+                "[TRT-LLM] [INFO] TLLM_FMHA_SWA_DECODE_KERNEL=1 skipped (stock kept): %s (layer=%d window=%d "
+                "maxSeqLenQ=%d headDim=%d headsPerKv=%d)\n",
+                reject, params.layer_idx, window, params.generation_input_length, params.head_size, headsPerKv);
+        }
+        return false;
+    }
+    if constexpr (std::is_same_v<KVCacheBuffer, KVBlockArray>)
+    {
+        SwaDecodeAttentionParams p{};
+        p.q = q;
+        p.out = params.output;
+        p.kv = kvCacheBuffer;
+        p.seqLensKv = params.sequence_lengths;
+        p.cuSeqLensQ = cuSeqLensQ;
+        p.scaleSoftmaxLog2 = bmm1Scale + kIdxScaleSoftmaxLog2Ptr;
+        p.outputScale = bmm2Scale;
+        p.sinks = params.attention_sinks;
+        p.batch = static_cast<int>(params.batch_size);
+        p.numHeadsQ = params.num_q_heads;
+        p.numHeadsKv = params.num_kv_heads;
+        p.maxSeqLenQ = params.generation_input_length;
+        p.window = window;
+        static std::atomic<bool> loggedActive{false};
+        if (!loggedActive.exchange(true))
+        {
+            std::fprintf(stderr,
+                "[TRT-LLM] [INFO] TLLM_FMHA_SWA_DECODE_KERNEL=1 active: sliding-window generation attention on "
+                "swaDecodeFmhaKernel (layer=%d window=%d batch=%d maxSeqLenQ=%d headsPerKv=%d grid %dx%d, sinks=%d, "
+                "cuSeqLensQ=%d)\n",
+                params.layer_idx, window, p.batch, p.maxSeqLenQ, headsPerKv, p.numHeadsKv, p.batch,
+                p.sinks != nullptr ? 1 : 0, cuSeqLensQ != nullptr ? 1 : 0);
+        }
+        launchSwaDecodeAttention(p, params.stream);
+        return true;
+    }
+    return false;
 }
 
 } // namespace
@@ -389,8 +654,16 @@ void XqaDispatcher::runImpl(
             rotary_inv_freq_buf = launchParams.rotary_inv_freq_buf;
             cu_seqlens = launchParams.cu_seq_lens;
             cu_kv_seqlens = launchParams.cu_kv_seq_lens;
-            invokeBuildDecoderInfo(decoder_params, params.stream);
-            sync_check_cuda_error(params.stream);
+            // TLLM_DECODER_INFO_ONCE_LAYERS: the previous layer built identical values into these buffers.
+            if (!reuseDecoderInfo(decoder_params, params.layer_idx, params.stream))
+            {
+                invokeBuildDecoderInfo(decoder_params, params.stream);
+                sync_check_cuda_error(params.stream);
+            }
+        }
+        else
+        {
+            invalidateXqaDecoderInfoReuse();
         }
 
         // IDEA: Store rotary_processed Q buffer to output buffer.
@@ -404,6 +677,13 @@ void XqaDispatcher::runImpl(
 
         invokeQKVPreprocessing<T, KVCacheBuffer>(preprocessingParms, params.stream);
         sync_check_cuda_error(params.stream);
+
+        // TLLM_FMHA_SWA_DECODE_KERNEL=1: short sliding windows run on the dedicated kernel instead of the FMHA below.
+        if (runSwaDecodeIfRequested(mFixedParams, mQDataType, params, kv_cache_buffer, launchParams.bmm1_scale_ptr,
+                launchParams.bmm2_scale_ptr, xqa_q_input_ptr, cu_seqlens))
+        {
+            return;
+        }
 
         // Build runner parameters.
         TllmGenFmhaRunnerParams tllmRunnerParams;
@@ -470,6 +750,19 @@ void XqaDispatcher::runImpl(
         // The partial buffers' pointers when the multiCtasKv mode is enabled.
         tllmRunnerParams.multiCtasKvCounterPtr = launchParams.semaphores;
         tllmRunnerParams.multiCtasKvScratchPtr = launchParams.scratch;
+        // launchParams.scratch is followed by at least the multi-block partial-output region that
+        // getWorkspaceSize reserves (nbSubSeq rows of multi_block_workspace_alignment bytes; the rowMax, rowSum and
+        // semaphore regions it also reserves are not counted). 0 keeps the FMHA runner's default layout.
+        if (mFixedParams.multiBlockMode)
+        {
+            constexpr size_t kXQA_OUT_ELEM_SIZE = 2; // fp16 or bf16.
+            constexpr size_t kMaxBeamWidth = 4;
+            size_t const groupSize = static_cast<size_t>(mFixedParams.numQHeads / mFixedParams.numKvHeads);
+            size_t const multiBlockWorkspaceAlignment
+                = roundUp<size_t>(kXQA_OUT_ELEM_SIZE * kMaxBeamWidth * groupSize * mFixedParams.headSize, 128);
+            tllmRunnerParams.mMultiCtasKvScratchBytes
+                = multiBlockWorkspaceAlignment * static_cast<size_t>(getXqaMaxNumSubSeq(mFixedParams.isMLA));
+        }
 
         tllmRunnerParams.attentionSinksPtr = params.attention_sinks;
         tllmRunnerParams.cumSeqLensQPtr = cu_seqlens;
@@ -544,8 +837,14 @@ void XqaDispatcher::runImpl(
     }
     else
     {
+        invalidateXqaDecoderInfoReuse();
         mDecoderXqaRunner->template dispatch<KVCacheBuffer>(params, kv_cache_buffer, params.stream);
     }
+}
+
+void invalidateXqaDecoderInfoReuse()
+{
+    gDecoderInfoReuse.valid = false;
 }
 
 void XqaDispatcher::run(

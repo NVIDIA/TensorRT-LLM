@@ -295,6 +295,61 @@ def _strip_py_multimodal_data_post_prefill(request: LlmRequest) -> None:
     request.py_mm_encoder_state = None
 
 
+# Opt-in (default off): order the in-flight generation requests of each step by
+# KV length, longest first. Only the order of the requests within a step
+# changes; per-request math is unchanged. Read once per process.
+_LONGEST_KV_FIRST = os.environ.get("TLLM_LONGEST_KV_FIRST", "") == "1"
+_longest_kv_first_reported = set()
+
+
+def _report_longest_kv_first(event: str, rank, detail: str) -> None:
+    """One stderr line per process and event (worker INFO logs are off)."""
+    if event in _longest_kv_first_reported:
+        return
+    _longest_kv_first_reported.add(event)
+    print(
+        f"TLLM_LONGEST_KV_FIRST engaged=True {event} rank={rank} {detail} "
+        f"pid={os.getpid()}",
+        file=sys.stderr,
+        flush=True)
+
+
+def _order_generation_requests(requests: List[LlmRequest],
+                               rank=None) -> List[LlmRequest]:
+    """The generation requests in the order the model engine packs them.
+
+    Requests without ``py_batch_idx`` come first (stable): the model engine
+    relies on it (see ``_executor_loop_overlap``). With TLLM_LONGEST_KV_FIRST=1,
+    the requests that have ``py_batch_idx`` and are not dummies are then
+    reordered by ``max_beam_num_tokens``, longest first (stable on ties), within
+    the positions they already hold; every other request keeps its position.
+    """
+    ordered = sorted(  # stable sort
+        requests,
+        key=lambda req: int(req.py_batch_idx is not None),
+    )
+    if not _LONGEST_KV_FIRST:
+        return ordered
+    _report_longest_kv_first("active", rank, f"requests={len(ordered)}")
+    positions = [
+        i for i, req in enumerate(ordered)
+        if req.py_batch_idx is not None and not req.is_dummy
+    ]
+    if len(positions) < 2:
+        return ordered
+    movable = [ordered[i] for i in positions]
+    longest_first = sorted(movable,
+                           key=lambda req: -req.max_beam_num_tokens)
+    if any(a is not b for a, b in zip(movable, longest_first)):
+        for i, req in zip(positions, longest_first):
+            ordered[i] = req
+        _report_longest_kv_first(
+            "first_reorder", rank, f"reordered={len(positions)} "
+            f"kv_first={longest_first[0].max_beam_num_tokens} "
+            f"kv_last={longest_first[-1].max_beam_num_tokens}")
+    return ordered
+
+
 @contextmanager
 def _distributed_warmup_guard(dist: Distributed,
                               mapping: Mapping) -> Iterator[None]:
@@ -3039,10 +3094,9 @@ class PyExecutor:
                     # made in model_engine.py::_forward_step. This is only important
                     # for disaggregated serving. For non-disaggregated serving,
                     # the generation requests always have batch_idx.
-                    scheduled_batch.generation_requests = sorted(  # stable sort
+                    scheduled_batch.generation_requests = _order_generation_requests(
                         scheduled_batch.generation_requests,
-                        key=lambda req: int(req.py_batch_idx is not None),
-                    )
+                        rank=getattr(self.dist, "rank", None))
 
                     if self.kv_cache_transceiver:
                         # Return the first token to the client
@@ -3872,6 +3926,32 @@ class PyExecutor:
         transceiver = getattr(self, "kv_cache_transceiver", None)
         if transceiver is None:
             return NoopDisaggCoordinator()
+        is_kv_manager_v2 = getattr(self, "_is_kv_manager_v2", False)
+        # Only the overlap loop admits while the previous forward is still
+        # queued on the execution stream that records the admission fence. A
+        # KV connector is reported after that fence, so it keeps the wait.
+        defer_unready_gen_receives = (
+            is_kv_manager_v2
+            and not getattr(self, "disable_overlap_scheduler", True)
+            and self._dist_size(getattr(self, "dist", None), "pp_size") == 1
+            and getattr(self, "kv_connector_manager", None) is None)
+        # Backport of upstream PR #19857: off unless the worker opts in
+        # with TLLM_BACKPORT_PR19857=1; one line per process says why.
+        if os.environ.get("TLLM_BACKPORT_PR19857") == "1":
+            dist = getattr(self, "dist", None)
+            overlap = not getattr(self, "disable_overlap_scheduler", True)
+            connector = getattr(self, "kv_connector_manager", None)
+            print(
+                "TLLM_BACKPORT_PR19857 "
+                f"rank={getattr(dist, 'rank', None)} "
+                f"engaged={defer_unready_gen_receives} "
+                f"kv_manager_v2={is_kv_manager_v2} overlap={overlap} "
+                f"pp_size={self._dist_size(dist, 'pp_size')} "
+                f"kv_connector={connector is not None}",
+                file=sys.stderr,
+                flush=True)
+        else:
+            defer_unready_gen_receives = False
         return DisaggTransferCoordinator(
             transceiver=transceiver,
             transfer_manager=getattr(self, "async_transfer_manager", None),
@@ -3886,7 +3966,8 @@ class PyExecutor:
                 self, "force_terminate_ctx_for_partial_reuse", False),
             admission_controller=getattr(
                 self, "_disagg_transfer_admission_controller", None),
-            is_kv_manager_v2=getattr(self, "_is_kv_manager_v2", False))
+            is_kv_manager_v2=is_kv_manager_v2,
+            defer_unready_gen_receives=defer_unready_gen_receives)
 
     @staticmethod
     def _dist_size(dist, name: str) -> int:
@@ -5462,10 +5543,9 @@ class PyExecutor:
                     # made in model_engine.py::_forward_step. This is only important
                     # for disaggregated serving. For non-disaggregated serving,
                     # the generation requests always have batch_idx.
-                    scheduled_batch.generation_requests = sorted(  # stable sort
+                    scheduled_batch.generation_requests = _order_generation_requests(
                         scheduled_batch.generation_requests,
-                        key=lambda req: int(req.py_batch_idx is not None),
-                    )
+                        rank=getattr(self.dist, "rank", None))
 
                     if self.kv_cache_transceiver:
                         # Return the first token to the client

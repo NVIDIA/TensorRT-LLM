@@ -62,6 +62,34 @@ _CFT_ALIGNMENT_BYTES = 16
 _CFT_MIN_DRIVER_BRANCH = 615
 
 
+# Sentinel-polled (data-as-flag) dispatch and combine, default off (moeAlltoAllLamport.cuh): each receive slot holds a
+# sentinel until the sender's data overwrites it, and the receiver polls the slot, so the data is its own completion
+# flag. No system fence, no completion flags, no remote read in the combine, no prepare or sanitize kernel; outputs
+# bit-identical to the fence path. Every call of a communicator that enables it takes the sentinel-polled path
+# (mixing it with the fence path is not safe), so unsupported settings are refused, not silently routed to the fence
+# path.
+LAMPORT_ENV = "TLLM_MOE_A2A_LAMPORT"
+_LAMPORT_MAX_RANKS = 64
+_lamport_announced = False
+
+
+def lamport_requested() -> bool:
+    return os.environ.get(LAMPORT_ENV) == "1"
+
+
+def _lamport_record_bytes(hidden_size: int, dtype: torch.dtype, top_k: int) -> int:
+    """Upper bound of one token's dispatch payloads, each padded to 16 bytes.
+
+    Hidden states at most at the activation dtype, block scales at most one byte per 16 elements, then the slot ids
+    and the router weights (4 bytes each per top-k entry).
+    """
+    return (
+        pad_up(hidden_size * dtype.itemsize, 16)
+        + pad_up((hidden_size + 15) // 16, 16)
+        + 2 * pad_up(top_k * 4, 16)
+    )
+
+
 def get_force_cft() -> bool | None:
     value = os.environ.get(FORCE_CFT_ENV)
     if value == "0":
@@ -593,6 +621,58 @@ class NVLinkOneSided(Communication):
         # Invalid token expert ID (default to -1), the kernels in TRTLLM-gen is hard-code to support -1 only.
         self.invalid_token_expert_id: int = -1
 
+        self._lamport: dict | None = None
+        if lamport_requested():
+            self._lamport = self._init_lamport(hidden_size, dtype)
+
+    def _init_lamport(self, hidden_size: Optional[int], dtype: Optional[torch.dtype]) -> dict:
+        """Allocate (once per shared workspace) and initialize the sentinel-polled workspace."""
+        unsupported = [
+            name
+            for name, present in (
+                ("CFT counted writes", self.can_use_cft_counted_writes),
+                ("EP rank masks", self._rank_mask_enabled),
+                ("low-precision combine", self.use_low_precision_combine),
+                ("unknown hidden size or dtype", hidden_size is None or dtype is None),
+                (f"more than {_LAMPORT_MAX_RANKS} EP ranks", self.ep_size > _LAMPORT_MAX_RANKS),
+            )
+            if present
+        ]
+        if unsupported:
+            raise ValueError(f"{LAMPORT_ENV}=1 does not support: {', '.join(unsupported)}")
+        lamport = self._workspace_state.get("lamport")
+        if lamport is None:
+            capacity = self.max_num_tokens_per_rank
+            record_bytes = _lamport_record_bytes(hidden_size, dtype, self.top_k)
+            combine_slot_bytes = pad_up(hidden_size * dtype.itemsize, 16)
+            size = int(
+                torch.ops.trtllm.moe_a2a_lamport_workspace_size(
+                    self.ep_size, capacity, record_bytes, combine_slot_bytes
+                )
+            )
+            memory = MnnvlMemory(self.mapping, size)
+            workspace = memory.as_torch_strided_tensor(torch.uint8)
+            torch.ops.trtllm.moe_a2a_lamport_initialize(workspace, self.ep_rank)
+            lamport = {
+                "memory": memory,
+                "workspace": workspace,
+                "capacity": capacity,
+                "record_bytes": record_bytes,
+                "combine_slot_bytes": combine_slot_bytes,
+            }
+            self._workspace_state["lamport"] = lamport
+            global _lamport_announced
+            if not _lamport_announced:
+                _lamport_announced = True
+                line = (
+                    f"MoE all-to-all: sentinel-polled protocol ({LAMPORT_ENV}=1) ep_rank={self.ep_rank}/"
+                    f"{self.ep_size} capacity={capacity} tokens/rank record={record_bytes} B "
+                    f"combine_slot={combine_slot_bytes} B workspace={size / 2**20:.1f} MiB/rank"
+                )
+                tllm_logger.info(line)
+                print(f"[TRT-LLM] [I] {line}", file=sys.stderr, flush=True)
+        return lamport
+
     @property
     def moe_a2a_metainfo(self) -> torch.Tensor:
         return self._require_workspace_lifecycle().metainfo
@@ -712,6 +792,8 @@ class NVLinkOneSided(Communication):
 
     def checkpoint_prepare(self) -> None:
         """Collectively detach handles after every shared owner is idle."""
+        if self._lamport is not None:
+            raise RuntimeError(f"Checkpointing a {LAMPORT_ENV}=1 MoE All-to-All workspace is not supported")
         if self.can_use_cft_counted_writes:
             raise RuntimeError(
                 "Checkpointing a CFT-backed MoE All-to-All workspace is not supported"
@@ -868,25 +950,50 @@ class NVLinkOneSided(Communication):
         )
         active_rank_mask = active_rank_mask_snapshot.active_rank_mask
 
-        recv_buffers, combine_payload_offset, eplb_gathered_stats = (
-            torch.ops.trtllm.moe_a2a_dispatch(
+        lamport = self._lamport
+        if lamport is not None:
+            if eplb_local_stats is not None:
+                raise RuntimeError(f"{LAMPORT_ENV}=1 does not support EPLB statistics in dispatch")
+            # Expert ids for unused rows are filled inside the sentinel-polled dispatch (fused sanitize).
+            can_fuse_sanitize = True
+            recv_buffers, combine_payload_offset = torch.ops.trtllm.moe_a2a_lamport_dispatch(
                 token_selected_slots,
                 payloads,
                 self.workspace,
                 self.moe_a2a_metainfo,
+                lamport["workspace"],
                 runtime_max_tokens_per_rank,
                 self.ep_rank,
                 self.ep_size,
                 self.top_k,
                 self.num_experts,
-                eplb_local_stats,
-                can_use_cft_for_dispatch,
-                expert_id_payload_index if can_fuse_sanitize else None,
-                int(self.invalid_token_expert_id) if can_fuse_sanitize else None,
-                self._rank_mask_enabled,
-                active_rank_mask,
+                lamport["capacity"],
+                lamport["record_bytes"],
+                lamport["combine_slot_bytes"],
+                expert_id_payload_index,
+                int(self.invalid_token_expert_id),
             )
-        )
+            eplb_gathered_stats = torch.empty(0, dtype=torch.int32)
+        else:
+            recv_buffers, combine_payload_offset, eplb_gathered_stats = (
+                torch.ops.trtllm.moe_a2a_dispatch(
+                    token_selected_slots,
+                    payloads,
+                    self.workspace,
+                    self.moe_a2a_metainfo,
+                    runtime_max_tokens_per_rank,
+                    self.ep_rank,
+                    self.ep_size,
+                    self.top_k,
+                    self.num_experts,
+                    eplb_local_stats,
+                    can_use_cft_for_dispatch,
+                    expert_id_payload_index if can_fuse_sanitize else None,
+                    int(self.invalid_token_expert_id) if can_fuse_sanitize else None,
+                    self._rank_mask_enabled,
+                    active_rank_mask,
+                )
+            )
         self._watchdog_coordinator.watch_collective(
             self._alltoall_watchdog, "dispatch", active_rank_mask
         )
@@ -1022,22 +1129,40 @@ class NVLinkOneSided(Communication):
         combine_payload_offset = self._reserve_combine_region(
             final_hidden_states.shape[-1], final_hidden_states.dtype
         )
-        output = torch.ops.trtllm.moe_a2a_combine(
-            final_hidden_states,
-            int(local_num_tokens),
-            self.workspace,
-            self.moe_a2a_metainfo,
-            int(runtime_max_tokens_per_rank),
-            self.ep_rank,
-            self.ep_size,
-            self.top_k,
-            int(combine_payload_offset),
-            bool(self.payload_in_workspace),
-            bool(self.use_low_precision_combine),
-            use_cft_for_combine,
-            self._rank_mask_enabled,
-            active_rank_mask,
-        )
+        lamport = self._lamport
+        if lamport is not None:
+            # Reads the expert outputs where they are (in the workspace or not); no staging copy.
+            output = torch.ops.trtllm.moe_a2a_lamport_combine(
+                final_hidden_states,
+                int(local_num_tokens),
+                self.workspace,
+                self.moe_a2a_metainfo,
+                lamport["workspace"],
+                int(runtime_max_tokens_per_rank),
+                self.ep_rank,
+                self.ep_size,
+                self.top_k,
+                lamport["capacity"],
+                lamport["record_bytes"],
+                lamport["combine_slot_bytes"],
+            )
+        else:
+            output = torch.ops.trtllm.moe_a2a_combine(
+                final_hidden_states,
+                int(local_num_tokens),
+                self.workspace,
+                self.moe_a2a_metainfo,
+                int(runtime_max_tokens_per_rank),
+                self.ep_rank,
+                self.ep_size,
+                self.top_k,
+                int(combine_payload_offset),
+                bool(self.payload_in_workspace),
+                bool(self.use_low_precision_combine),
+                use_cft_for_combine,
+                self._rank_mask_enabled,
+                active_rank_mask,
+            )
         self._watchdog_coordinator.watch_collective(
             self._alltoall_watchdog, "combine", active_rank_mask
         )

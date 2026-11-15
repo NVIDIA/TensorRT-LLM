@@ -291,6 +291,9 @@ struct TllmGenFmhaRunnerParams
     // The scratch space for each CtaKv when the multiCtasKv mode is enabled.
     // PartialO, partialMax and partialSum will be stored to the scratch space.
     void* multiCtasKvScratchPtr;
+    // A lower bound of the bytes available at multiCtasKvScratchPtr. 0 means unknown, which keeps the
+    // default partial-buffer layout and disables TLLM_FMHA_SM107_MAX_CTAS_PER_SEQ for this call.
+    size_t mMultiCtasKvScratchBytes{0};
     // The softmax stats buffer.
     // The softmax max/sum values will be stored to the buffer if it is not nullptr.
     float2* softmaxStatsPtr;

@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import os
+import sys
 from typing import Any, Dict, Literal, Optional
 
 import torch
@@ -12,7 +14,7 @@ from transformers import GptOssConfig
 from tensorrt_llm._utils import get_hf_rope_theta, get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 
-from ..attention.attention import Attention
+from ..attention.attention import PRUNE_LAST_TOKEN_TARGET, Attention
 from ..attention.backends import AttentionMetadata
 from ..attention.backends.interface import (PositionalEmbeddingParams,
                                             PredefinedAttentionMask, RopeParams)
@@ -27,16 +29,113 @@ from ..modules.embedding import Embedding
 from ..moe.fused_moe import (MoEWeightLoadingMode, RenormalizeMoeRoutingMethod,
                              SwigluBiasActivation, TritonFusedMoE, create_moe,
                              is_moe_weight_owner)
+from ..moe.fused_moe.static_eplb_route import DEP3_NORM_MXFP8_ENABLED
 # isort: on
 from ..modules.linear import Linear, TensorParallelMode
+from ..modules.low_m_gemm import _MAX_M as LOW_M_MAX_M
+from ..modules.low_m_gemm import (SMALL_M_PATH_ATTR, small_m_print_once,
+                                  register_low_m_linear_op)
 from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
-from ..utils import Fp4QuantizedTensor
+from ..utils import (Fp4QuantizedTensor, MxFp8QuantizedTensor,
+                     is_torch_compiling)
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, filter_weights, register_auto_model
 
 # Use TinyGEMM when the number of tokens is not larger than this threshold
 MIN_LATENCY_TINYGEMM_NUM_TOKENS = 128
+
+# Default-off opt-ins for the small-M BF16 GEMMs on SM107 (Rubin), read once at
+# model construction. Each is ignored on every other GPU.
+# - TLLM_TINYGEMM2_ROUTER_SM107=1: the router gate takes tinygemm2 for up to
+#   MIN_LATENCY_TINYGEMM_NUM_TOKENS tokens, as on SM90/100/103 (that list,
+#   #8182, predates SM107; the op's own check admits SM107 since #19224).
+# - TLLM_LOWM_GEMM_SM107=1: an attention projection whose K is a multiple of
+#   128 (o_proj, K=4096; not qkv_proj, K=2880) takes the autotuned low-M
+#   dispatcher for up to 32 tokens, which use_custom_cublas_mm otherwise skips.
+# - TLLM_TINYGEMM2_PROJ_SM107=qkv_proj[,o_proj]: the named projections take
+#   tinygemm2 for up to TLLM_TINYGEMM2_PROJ_MAX_TOKENS (default 8) tokens; this
+#   wins over TLLM_LOWM_GEMM_SM107 for a projection named in both.
+#   Experimental: this path has not been validated for accuracy; run it only
+#   together with an accuracy check, and leave it unset in production
+#   configurations.
+_SMALL_M_SM_VERSION = 107
+_SMALL_M_PROJECTIONS = ("qkv_proj", "o_proj")
+
+# Default-off glue fusions for the layouts with no all-reduce to fuse into (TP1,
+# no attention DP), read once here; unset, nothing below changes and their
+# module (cute_dsl_kernels/gptoss_glue_fusion.py) is never imported. Each is
+# bitwise equal to the kernels it replaces.
+# - TLLM_GPTOSS_FUSE_FINALIZE_NORM=1: the MoE skips its finalize kernel, and one
+#   kernel gathers the top-k expert rows, sums them, adds the residual and runs
+#   the next layer's RMSNorm (the final norm after the last layer).
+# - TLLM_GPTOSS_FUSE_NORM_MXFP8=1: the post-attention add+RMSNorm also writes
+#   the MoE input's MXFP8 quantization, which the MoE then takes as is.
+_FUSE_FINALIZE_NORM = os.environ.get("TLLM_GPTOSS_FUSE_FINALIZE_NORM",
+                                     "0") == "1"
+_FUSE_NORM_MXFP8 = os.environ.get("TLLM_GPTOSS_FUSE_NORM_MXFP8", "0") == "1"
+# - TLLM_GPTOSS_DEP3_GLUE=mxfp8 (or 1/all): the same fused norm+MXFP8 under
+#   attention DP, ahead of the one-sided all-to-all's post-quant dispatch
+#   (moe/fused_moe/static_eplb_route.py documents the flag's parts).
+# The first gate miss or failure per fusion (all blocks share one
+# configuration), kept so the other blocks neither retry a failed compile nor
+# log again.
+_GLUE_GATE_FAILURE: Dict[str, str] = {}
+
+
+def _glue_gate(name: str, env: str, block: "TransformerBlock"):
+    """The gate's result when the fusion `name` serves this block, else None."""
+    if name in _GLUE_GATE_FAILURE:
+        return None
+    try:
+        from ..cute_dsl_kernels import gptoss_glue_fusion as glue
+        gate = {
+            "finalize_norm": glue.gate_finalize_norm,
+            "norm_mxfp8": glue.gate_norm_mxfp8,
+            "norm_mxfp8_dep3": glue.gate_norm_mxfp8_dep3,
+        }[name]
+        return gate(block, get_sm_version())
+    except Exception as e:  # any miss or failure keeps the unfused kernels
+        _GLUE_GATE_FAILURE[name] = repr(e)
+        print(
+            f"[TRT-LLM] [W] {env}=1 disabled for this process, unfused "
+            f"kernels kept: {e!r}",
+            file=sys.stderr,
+            flush=True)
+        return None
+
+
+def _mark_small_m_projections(attn: Attention, layer_idx: int) -> None:
+    """Mark qkv_proj/o_proj for a small-M path (SM107 opt-ins)."""
+    if get_sm_version() != _SMALL_M_SM_VERSION:
+        return
+    low_m = os.environ.get("TLLM_LOWM_GEMM_SM107", "0") == "1"
+    tiny = {
+        name.strip()
+        for name in os.environ.get("TLLM_TINYGEMM2_PROJ_SM107", "").split(",")
+        if name.strip()
+    }
+    if not low_m and not tiny:
+        return
+    tiny_max_m = int(os.environ.get("TLLM_TINYGEMM2_PROJ_MAX_TOKENS", "8"))
+    paths = []
+    for name in _SMALL_M_PROJECTIONS:
+        linear = getattr(attn, name)
+        shape = f"k={linear.in_features},n={linear.out_features}"
+        if name in tiny and tiny_max_m > 0:
+            setattr(linear, SMALL_M_PATH_ATTR, ("tinygemm2", tiny_max_m))
+            paths.append(f"{name}=tinygemm2(m<={tiny_max_m},{shape})")
+        elif (low_m and linear.use_custom_cublas_mm
+              and linear.in_features % 128 == 0):
+            register_low_m_linear_op()
+            setattr(linear, SMALL_M_PATH_ATTR, ("low_m", LOW_M_MAX_M))
+            paths.append(f"{name}=low_m(m<={LOW_M_MAX_M},{shape})")
+        else:
+            paths.append(f"{name}=unchanged({shape})")
+    ignored = sorted(tiny.difference(_SMALL_M_PROJECTIONS))
+    small_m_print_once(
+        "projections", f"sm={_SMALL_M_SM_VERSION} layer={layer_idx} " +
+        " ".join(paths) + (f" ignored={','.join(ignored)}" if ignored else ""))
 
 
 class AttentionBlock(Attention):
@@ -101,6 +200,7 @@ class AttentionBlock(Attention):
         self.norm = RMSNorm(hidden_size=pretrained_config.hidden_size,
                             eps=pretrained_config.rms_norm_eps,
                             dtype=pretrained_config.torch_dtype)
+        _mark_small_m_projections(self, layer_idx)
 
     def forward(
         self,
@@ -167,6 +267,17 @@ class MLPBlock(torch.nn.Module):
             dtype=pretrained_config.torch_dtype,
             use_custom_cublas_mm=use_custom_cublas_mm,
         )
+        # TLLM_TINYGEMM2_ROUTER_SM107=1 (see the note at the top).
+        self._tinygemm2_router_sm107 = (
+            get_sm_version() == _SMALL_M_SM_VERSION
+            and os.environ.get("TLLM_TINYGEMM2_ROUTER_SM107", "0") == "1")
+        if self._tinygemm2_router_sm107:
+            small_m_print_once(
+                "router",
+                f"sm={_SMALL_M_SM_VERSION} layer={layer_idx} router=tinygemm2"
+                f"(m<={MIN_LATENCY_TINYGEMM_NUM_TOKENS},"
+                f"k={pretrained_config.hidden_size},"
+                f"n={pretrained_config.num_local_experts})")
 
         self.routing_method = RenormalizeMoeRoutingMethod(
             top_k=pretrained_config.num_experts_per_tok,
@@ -211,7 +322,8 @@ class MLPBlock(torch.nn.Module):
                             x: torch.Tensor,
                             lora_params: Optional[dict] = None) -> torch.Tensor:
         # Skip tinygemm2 optimization when LoRA is active (tinygemm2 doesn't support LoRA)
-        use_tinygemm = (get_sm_version() in [90, 100, 103]
+        use_tinygemm = ((get_sm_version() in [90, 100, 103]
+                         or self._tinygemm2_router_sm107)
                         and x.shape[0] <= MIN_LATENCY_TINYGEMM_NUM_TOKENS
                         and (lora_params is None or not bool(lora_params)))
 
@@ -227,7 +339,8 @@ class MLPBlock(torch.nn.Module):
         self,
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
-        lora_params: Optional[dict] = None
+        lora_params: Optional[dict] = None,
+        x_quant: Optional[MxFp8QuantizedTensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         orig_shape = x.shape
         hidden_dim = orig_shape[-1]
@@ -238,18 +351,57 @@ class MLPBlock(torch.nn.Module):
 
         g = self.compute_gate_output(t, lora_params=lora_params)
 
-        # When attention_dp is not enabled, don't pass those parameters
-        expert_output = self.experts(x=t, router_logits=g)
+        if x_quant is not None:
+            # TLLM_GPTOSS_FUSE_NORM_MXFP8: the experts take the MXFP8 copy of t
+            # the fused post-attention norm wrote; the router keeps the BF16 t.
+            expert_output = self.experts(x=x_quant,
+                                         router_logits=g,
+                                         output_dtype=t.dtype)
+        else:
+            # When attention_dp is not enabled, don't pass those parameters
+            expert_output = self.experts(x=t, router_logits=g)
 
         expert_output = expert_output.view(orig_shape)
         return expert_output, residual
+
+    def forward_finalize_add_rmsnorm(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        norm: RMSNorm,
+        x_quant: Optional[MxFp8QuantizedTensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """norm(MoE(x), residual) with the MoE's finalize fused into the norm
+        (TLLM_GPTOSS_FUSE_FINALIZE_NORM): (normed output, new residual)."""
+        from ..cute_dsl_kernels import gptoss_glue_fusion as glue
+
+        orig_shape = x.shape
+        hidden_dim = orig_shape[-1]
+        t = x.view(-1, hidden_dim)
+        g = self.compute_gate_output(t)
+        experts = self.experts
+        g = experts._maybe_get_perfect_router_logits(g)
+        if x_quant is not None:
+            x_in, x_sf = x_quant.fp8_tensor, x_quant.scaling_factor
+        else:
+            x_in, x_sf = t, None
+        res = residual.view(-1, hidden_dim)
+        if experts.register_to_config and is_torch_compiling():
+            out, res = torch.ops.trtllm.gptoss_moe_finalize_add_rmsnorm(
+                experts.layer_idx_str, x_in, x_sf, g, res, norm.weight,
+                norm.variance_epsilon)
+        else:
+            out, res = glue.moe_layer_finalize_add_rmsnorm(
+                experts, x_in, x_sf, g, res, norm.weight, norm.variance_epsilon)
+        return out.view(orig_shape), res.view(orig_shape)
 
     def forward_attn_dp(
         self,
         x: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor] = None,
-        lora_params: Optional[dict] = None
+        lora_params: Optional[dict] = None,
+        x_quant: Optional[MxFp8QuantizedTensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         orig_shape = x.shape
         hidden_dim = orig_shape[-1]
@@ -267,27 +419,58 @@ class MLPBlock(torch.nn.Module):
 
         g = self.compute_gate_output(t, lora_params=lora_params)
 
-        # Let CutlassFusedMoE and TRTLLMGenFusedMoE handle allgather internally
-        # Pass the normalized tensor (t) as input to experts, not x
-        expert_output = self.experts(x=t,
-                                     router_logits=g,
-                                     all_rank_num_tokens=all_rank_num_tokens,
-                                     use_dp_padding=False)
+        if x_quant is not None and self._dep3_mxfp8_usable(
+                all_rank_num_tokens):
+            # TLLM_GPTOSS_DEP3_GLUE=mxfp8: the experts take the MXFP8 copy of
+            # t the fused post-attention norm wrote; quantize_input passes it
+            # to the post-quant dispatch as is. The router keeps the BF16 t.
+            expert_output = self.experts(
+                x=x_quant,
+                router_logits=g,
+                all_rank_num_tokens=all_rank_num_tokens,
+                use_dp_padding=False,
+                output_dtype=t.dtype)
+        else:
+            # Let CutlassFusedMoE and TRTLLMGenFusedMoE handle allgather internally
+            # Pass the normalized tensor (t) as input to experts, not x
+            expert_output = self.experts(
+                x=t,
+                router_logits=g,
+                all_rank_num_tokens=all_rank_num_tokens,
+                use_dp_padding=False)
 
         expert_output = expert_output.view(orig_shape)
         return expert_output, residual
+
+    def _dep3_mxfp8_usable(self, all_rank_num_tokens) -> bool:
+        """Whether this forward's MoE takes an MXFP8 input as is: one chunk
+        (the chunked path splits and re-pads its input) and no empty rank
+        (the scheduler pads the input with zero rows). Otherwise the BF16
+        output of the same fused kernel goes in and is quantized as today."""
+        if all_rank_num_tokens is None or min(all_rank_num_tokens) <= 0:
+            return False
+        return self.experts.calculate_num_chunks(all_rank_num_tokens) == 1
 
     def forward(
         self,
         x: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor] = None,
-        lora_params: Optional[dict] = None
+        lora_params: Optional[dict] = None,
+        x_quant: Optional[MxFp8QuantizedTensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.enable_attention_dp:
-            return self.forward_attn_dp(x, attn_metadata, residual, lora_params)
+            # x_quant is set only by TLLM_GPTOSS_DEP3_GLUE=mxfp8's gate.
+            return self.forward_attn_dp(x,
+                                        attn_metadata,
+                                        residual,
+                                        lora_params,
+                                        x_quant=x_quant)
         else:
-            return self.forward_normal(x, residual, lora_params)
+            return self.forward_normal(x,
+                                       residual,
+                                       lora_params,
+                                       x_quant=x_quant)
 
 
 class TransformerBlock(DecoderLayer):
@@ -341,6 +524,39 @@ class TransformerBlock(DecoderLayer):
                 strategy=config.allreduce_strategy,
                 dtype=config.pretrained_config.torch_dtype)
 
+        # Default-off glue fusions (see _FUSE_FINALIZE_NORM): False / None keep
+        # today's kernels.
+        self.fuse_finalize_norm = bool(_FUSE_FINALIZE_NORM and _glue_gate(
+            "finalize_norm", "TLLM_GPTOSS_FUSE_FINALIZE_NORM", self))
+        # The MoE input alignment the fused post-attention kernel was built for.
+        self.norm_mxfp8_alignment = (_glue_gate(
+            "norm_mxfp8", "TLLM_GPTOSS_FUSE_NORM_MXFP8", self)
+                                     if _FUSE_NORM_MXFP8 else None)
+        if (self.norm_mxfp8_alignment is None and DEP3_NORM_MXFP8_ENABLED
+                and self.enable_attn_dp):
+            # TLLM_GPTOSS_DEP3_GLUE=mxfp8: the same kernel under attention DP.
+            self.norm_mxfp8_alignment = _glue_gate("norm_mxfp8_dep3",
+                                                   "TLLM_GPTOSS_DEP3_GLUE",
+                                                   self)
+
+    def _fused_post_attention_norm_mxfp8(self, x: torch.Tensor,
+                                         residual: torch.Tensor):
+        """post_attention_layernorm(x, residual) plus the MXFP8 quantization
+        of its output the MoE would do, from one kernel; None when the MoE
+        resolved another input alignment."""
+        quant_method = getattr(self.mlp.experts.backend, "quant_method", None)
+        alignment = getattr(quant_method, "input_hidden_alignment", None)
+        if alignment != self.norm_mxfp8_alignment:
+            return None
+        norm = self.post_attention_layernorm
+        shape = x.shape
+        hidden = shape[-1]
+        out, residual, x_fp8, x_sf = torch.ops.trtllm.fused_add_rmsnorm_mxfp8(
+            x.reshape(-1, hidden), residual.reshape(-1, hidden), norm.weight,
+            norm.variance_epsilon, self.norm_mxfp8_alignment)
+        return (out.view(shape), residual.view(shape),
+                MxFp8QuantizedTensor(x_fp8, x_sf, is_sf_swizzled=False))
+
     def forward_normal(
         self,
         position_ids: torch.LongTensor,
@@ -361,12 +577,35 @@ class TransformerBlock(DecoderLayer):
                                 residual=residual,
                                 lora_params=lora_params,
                                 **kwargs)
-        x, residual = self.post_attention_layernorm(x, residual)
+        if kwargs.get("output_row_ids") is not None:
+            # TLLM_PRUNE_LAST_TOKEN: the attention output already holds only
+            # these rows; keep the residual rows that match.
+            residual = residual[kwargs["output_row_ids"]]
+        fused = None
+        if self.norm_mxfp8_alignment is not None and not lora_params:
+            fused = self._fused_post_attention_norm_mxfp8(x, residual)
+        if fused is None:
+            x, residual = self.post_attention_layernorm(x, residual)
+            x_quant = None
+        else:
+            x, residual, x_quant = fused
+
+        if self.fuse_finalize_norm and not lora_params:
+            # The MoE output never goes to memory: the fused kernel writes the
+            # next layer's normed input and residual (= MoE output + residual,
+            # which is what EAGLE3 captures).
+            x, residual = self.mlp.forward_finalize_add_rmsnorm(
+                x, residual, self.next_layer_layernorm, x_quant=x_quant)
+            if spec_metadata is not None:
+                spec_metadata.maybe_capture_hidden_states(
+                    self.layer_idx, residual, None)
+            return x, residual
 
         x, residual = self.mlp(x,
                                attn_metadata,
                                residual,
-                               lora_params=lora_params)
+                               lora_params=lora_params,
+                               x_quant=x_quant)
 
         if spec_metadata is not None:
             spec_metadata.maybe_capture_hidden_states(self.layer_idx, x,
@@ -515,6 +754,17 @@ class Transformer(DecoderModel):
             eps=config.pretrained_config.rms_norm_eps,
             dtype=config.pretrained_config.torch_dtype,
         )
+        # TLLM_PRUNE_LAST_TOKEN: the last layer may run on a row subset only
+        # when no collective sees its row count (single GPU, no attention DP
+        # or Helix CP) and its attention has no sparse hooks.
+        mapping = model_config.mapping
+        last = self.block[-1]
+        self._prune_last_token = (PRUNE_LAST_TOKEN_TARGET
+                                  and mapping.tp_size == 1
+                                  and not mapping.enable_attention_dp
+                                  and not mapping.has_cp_helix()
+                                  and not last.is_tp
+                                  and last.attn.sparse_attn_hooks is None)
 
     def forward(
         self,
@@ -533,8 +783,26 @@ class Transformer(DecoderModel):
 
         hidden_states = inputs_embeds or self.embedding(input_ids)
 
+        # TLLM_PRUNE_LAST_TOKEN: SpecDecOneEngineForCausalLM.forward offers the
+        # rows the step reads (spec_metadata.prune_row_ids, else None);
+        # the last layer then runs o_proj, the MoE and the final norm on those
+        # rows only. Dynamo traces this: an offer is a separate compiled graph
+        # (only offered for steps above the piecewise CUDA graph sizes), no
+        # offer adds no op, and with the setting unset nothing is read.
+        last_row_ids = None
+        if (self._prune_last_token and spec_metadata is not None
+                and not lora_params):
+            last_row_ids = getattr(spec_metadata, "prune_row_ids", None)
+            if last_row_ids is not None and spec_metadata.is_layer_capture(
+                    len(self.block) - 1):
+                last_row_ids = None
+
         residual = None
-        for block in self.block:
+        last_idx = len(self.block) - 1
+        for idx, block in enumerate(self.block):
+            extra = ({} if last_row_ids is None or idx != last_idx else {
+                "output_row_ids": last_row_ids
+            })
             hidden_states, residual = block(
                 position_ids=position_ids,
                 hidden_states=hidden_states,
@@ -542,6 +810,7 @@ class Transformer(DecoderModel):
                 residual=residual,
                 spec_metadata=spec_metadata,
                 lora_params=lora_params,
+                **extra,
             )
 
         return hidden_states

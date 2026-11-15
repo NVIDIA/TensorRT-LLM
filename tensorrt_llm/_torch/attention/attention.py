@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import os
+import sys
 import weakref
 from typing import List, Optional, Tuple, Union
 
@@ -31,6 +33,40 @@ from .backends.interface import (AttentionMask, CustomAttentionMask,
 from .backends.sparse.hooks import get_sparse_attention_hooks
 from .backends.utils import create_attention, get_attention_backend
 from .rotary_embedding import MRotaryEmbedding, RotaryEmbedding
+
+
+# Opt-in (default off), read once per process. TLLM_PRUNE_LAST_TOKEN=1 runs the output
+# side (o_proj onwards) of the EAGLE3 drafter layer and of the last target layer on the rows
+# the step reads (gather_ids: each context request's last token, each generation request's
+# verify or last-accepted rows) instead of every token, in steps that carry context requests.
+# Attention, and so every KV write, still runs on all tokens. TLLM_PRUNE_LAST_TOKEN=draft
+# prunes the drafter layer only.
+_PRUNE_LAST_TOKEN_ENV = os.environ.get("TLLM_PRUNE_LAST_TOKEN", "")
+PRUNE_LAST_TOKEN_DRAFT = _PRUNE_LAST_TOKEN_ENV in ("1", "draft")
+PRUNE_LAST_TOKEN_TARGET = _PRUNE_LAST_TOKEN_ENV == "1"
+_prune_last_token_noted = set()
+
+
+def prune_last_token_note(site: str, rows_in: int, rows_out: int) -> None:
+    """Print one TLLM_PRUNE_LAST_TOKEN line per process and site, on stderr."""
+    if site in _prune_last_token_noted:
+        return
+    _prune_last_token_noted.add(site)
+    print(
+        f"TLLM_PRUNE_LAST_TOKEN={_PRUNE_LAST_TOKEN_ENV} active site={site} "
+        f"rows={rows_in}->{rows_out} pid={os.getpid()}",
+        file=sys.stderr,
+        flush=True)
+
+
+def prune_last_token_step_ok() -> bool:
+    """Eager, uncaptured execution only.
+
+    No Dynamo trace, CUDA graph capture or breakable CUDA graph region.
+    """
+    return (not torch.compiler.is_compiling()
+            and not torch.cuda.is_current_stream_capturing()
+            and not is_in_breakable_cuda_graph())
 
 
 def extract_extra_attrs(layer_idx: str, attn_type: str):
@@ -1124,6 +1160,7 @@ class Attention(nn.Module):
         attention_sinks: Optional[torch.Tensor] = None,
         relative_attention_bias: Optional[torch.Tensor] = None,
         relative_attention_max_distance: int = 0,
+        output_row_ids: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -1139,6 +1176,10 @@ class Attention(nn.Module):
             lora_params (Optional[dict]): The LoRA parameters.
             attention_window_size (Optional[int]): The attention window size.
             attention_mask_data (Optional[torch.Tensor]): The attention mask data.
+            output_row_ids (Optional[torch.Tensor]): TLLM_PRUNE_LAST_TOKEN only: the
+                token rows to project and return, in this order. Attention itself (and
+                the KV write) still covers every token. Callers pass it only without
+                sparse attention hooks and Helix CP.
         Returns:
             torch.Tensor: The output tensor.
         """
@@ -1207,11 +1248,21 @@ class Attention(nn.Module):
             if sparse_output is not None:
                 return sparse_output
 
+        if output_row_ids is not None and isinstance(attn_output,
+                                                     torch.Tensor):
+            # Per-row projection: o_proj on the kept rows equals those rows of
+            # o_proj on all rows.
+            attn_output = attn_output[output_row_ids]
+            output_row_ids = None
         attn_output = _helix_cp_output_projection(self.o_proj, attn_output,
                                                   attn_metadata,
                                                   all_reduce_params,
                                                   self.mapping, self.mapping_o,
                                                   self.layer_idx, lora_params)
+        if output_row_ids is not None:
+            # A quantized attention output (not a plain tensor) is projected in
+            # full, then the rows are selected.
+            attn_output = attn_output[output_row_ids]
         return attn_output
 
     def apply_rope(self, q: torch.Tensor, k: Optional[torch.Tensor],

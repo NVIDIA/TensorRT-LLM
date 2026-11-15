@@ -304,8 +304,18 @@ class TRTLLMGenW4a8Mxfp4Mxfp8Base(TRTLLMGenFp4BlockScaleBase):
         return W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod()
 
     def quantize_input(
-        self, x: torch.Tensor, post_quant_comm: bool = True
+        self, x: torch.Tensor | MxFp8QuantizedTensor, post_quant_comm: bool = True
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if isinstance(x, MxFp8QuantizedTensor):
+            # Already quantized, bitwise as below, by GPT-OSS's fused
+            # post-attention add+RMSNorm+MXFP8 kernel (opt-in).
+            assert not x.is_sf_swizzled, (
+                "MxFp8QuantizedTensor should not be swizzled before communication"
+            )
+            assert x.fp8_tensor.shape[-1] % self.quant_method.input_hidden_alignment == 0, (
+                "MXFP8 input is not padded to this MoE's input alignment"
+            )
+            return x.fp8_tensor, x.scaling_factor.view(x.fp8_tensor.shape[0], -1)
         x, x_sf = self.op_backend.mxfp8_quantize(
             x, False, alignment=self.quant_method.input_hidden_alignment
         )

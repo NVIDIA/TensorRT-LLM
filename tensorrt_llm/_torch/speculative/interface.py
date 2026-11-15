@@ -14,7 +14,10 @@
 # limitations under the License.
 
 import copy
+import math
+import operator
 import os
+import sys
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -460,6 +463,85 @@ DEFAULT_SAMPLING_SEED = 42
 # all unseeded requests. A string so it cannot collide with a slot id.
 _UNSEEDED_RNG_WINDOW_KEY = "unseeded"
 
+# Default-off (TLLM_ONE_MODEL_SPEC_FAST_PREPARE=1): cut the per-request host work
+# of one-model speculative input preparation. Here: normalize each distinct
+# sampling-parameter set once per process instead of once per request, build
+# the Philox seed/offset rows of a batch without a seeded request as int64
+# tensors, and expand the per-token sampling rows by slice assignment; the
+# decoder runner batches its speculative extend packing under the same flag.
+# Every buffer, list, counter and request update keeps the same values and
+# order. Read once per process; unset, none of the code it guards runs.
+ONE_MODEL_SPEC_FAST_PREPARE = os.environ.get(
+    "TLLM_ONE_MODEL_SPEC_FAST_PREPARE", "0") == "1"
+_ONE_MODEL_SPEC_FAST_PREPARE_SAID: set = set()
+
+# TLLM_ONE_MODEL_SPEC_FAST_PREPARE: raw (temperature, top_k, top_p, min_p) ->
+# the (normalized row, greedy flag) of SpecMetadata._scan_one_model_sampling.
+# The normalization is a pure function of those four values. Keys that compare
+# equal can still differ in type (int / float / bool, which give the same
+# tensor bits) or in the sign of a zero; of the values the normalization passes
+# through unchanged only min_p can be zero, so its sign is part of the key.
+# Cleared when it reaches _NORMALIZED_SAMPLING_PARAMS_CACHE_SIZE entries.
+_NORMALIZED_SAMPLING_PARAMS: dict = {}
+_NORMALIZED_SAMPLING_PARAMS_CACHE_SIZE = 4096
+# Fields of a per-request normalized row (temperature, top_k, top_p, min_p,
+# num_tokens).
+_SAMPLING_VALUES = operator.itemgetter(0, 1, 2, 3)
+_NUM_TOKENS = operator.itemgetter(4)
+
+
+def one_model_spec_fast_prepare_note(part: str, message: str) -> None:
+    """One TLLM_ONE_MODEL_SPEC_FAST_PREPARE line per process and part, on
+    stderr (worker-rank INFO logging can be off)."""
+    if part in _ONE_MODEL_SPEC_FAST_PREPARE_SAID:
+        return
+    _ONE_MODEL_SPEC_FAST_PREPARE_SAID.add(part)
+    print(
+        f"[TRT-LLM] [I] TLLM_ONE_MODEL_SPEC_FAST_PREPARE active: {part}: "
+        f"{message} pid={os.getpid()}",
+        file=sys.stderr,
+        flush=True)
+
+
+def _normalized_sampling_row(normalize, temperature, top_k, top_p, min_p):
+    """TLLM_ONE_MODEL_SPEC_FAST_PREPARE: ``normalize(...)`` through the cache
+    above."""
+    negative_zero_min_p = (min_p == 0
+                           and math.copysign(1.0, min_p) < 0.0)
+    key = (temperature, top_k, top_p, min_p, negative_zero_min_p)
+    try:
+        row = _NORMALIZED_SAMPLING_PARAMS.get(key)
+    except TypeError:  # an unhashable value: no caching for it
+        return normalize(temperature=temperature,
+                         top_k=top_k,
+                         top_p=top_p,
+                         min_p=min_p)
+    if row is None:
+        row = normalize(temperature=temperature,
+                        top_k=top_k,
+                        top_p=top_p,
+                        min_p=min_p)
+        if len(_NORMALIZED_SAMPLING_PARAMS
+               ) >= _NORMALIZED_SAMPLING_PARAMS_CACHE_SIZE:
+            _NORMALIZED_SAMPLING_PARAMS.clear()
+        _NORMALIZED_SAMPLING_PARAMS[key] = row
+    return row
+
+
+def _repeat_per_row(values: list, counts: list) -> list:
+    """TLLM_ONE_MODEL_SPEC_FAST_PREPARE: ``values[i]`` repeated ``counts[i]``
+    times, in order (one entry per logits row from one per request)."""
+    num_values = len(values)
+    if num_values and counts[0] > 0 and counts.count(counts[0]) == num_values:
+        width = counts[0]
+        if width == 1:
+            return list(values)
+        out = [None] * (num_values * width)
+        for row in range(width):
+            out[row::width] = values
+        return out
+    return [value for value, count in zip(values, counts) for _ in range(count)]
+
 
 @dataclass
 class SpecMetadata:
@@ -801,20 +883,25 @@ class SpecMetadata:
             request_random_seed
 
         user_seeds = [request_random_seed(request) for request in requests]
-        request_seeds = [
-            DEFAULT_SAMPLING_SEED if seed is None else seed
-            for seed in user_seeds
-        ]
-        request_offsets = self._take_rng_window_offsets(
-            requests, [seed is not None for seed in user_seeds])
-        num_tokens_per_request = [n for *_, n in per_request_normalized]
+        if (ONE_MODEL_SPEC_FAST_PREPARE and requests
+                and user_seeds.count(None) == len(requests)):
+            request_seeds, request_offsets, flat_seeds, flat_offsets = (
+                self._unseeded_rng_rows(per_request_normalized))
+        else:
+            request_seeds = [
+                DEFAULT_SAMPLING_SEED if seed is None else seed
+                for seed in user_seeds
+            ]
+            request_offsets = self._take_rng_window_offsets(
+                requests, [seed is not None for seed in user_seeds])
+            num_tokens_per_request = [n for *_, n in per_request_normalized]
 
-        flat_seeds: list[int] = []
-        flat_offsets: list[int] = []
-        for seed, offset, num_tokens in zip(request_seeds, request_offsets,
-                                            num_tokens_per_request):
-            flat_seeds.extend(seed for _ in range(num_tokens))
-            flat_offsets.extend(offset for _ in range(num_tokens))
+            flat_seeds: list[int] = []
+            flat_offsets: list[int] = []
+            for seed, offset, num_tokens in zip(request_seeds, request_offsets,
+                                                num_tokens_per_request):
+                flat_seeds.extend(seed for _ in range(num_tokens))
+                flat_offsets.extend(offset for _ in range(num_tokens))
 
         # A batch wider than the buffers would silently truncate the copies
         # below, so assert rather than grow: CUDA graph batch sizes are already
@@ -845,6 +932,11 @@ class SpecMetadata:
                                        device='cuda')
 
         def _upload(dst: torch.Tensor, values: list[int]) -> None:
+            if ONE_MODEL_SPEC_FAST_PREPARE and isinstance(values, torch.Tensor):
+                # _unseeded_rng_rows' rows: already int64 (pinned when
+                # prefer_pinned()).
+                dst[:len(values)].copy_(values, non_blocking=True)
+                return
             dst[:len(values)].copy_(torch.tensor(values,
                                                  dtype=torch.int64,
                                                  pin_memory=prefer_pinned()),
@@ -854,6 +946,63 @@ class SpecMetadata:
         _upload(self.request_offsets, request_offsets)
         _upload(self.seeds, flat_seeds)
         _upload(self.offsets, flat_offsets)
+
+    def _unseeded_rng_rows(
+        self, per_request_normalized: list[tuple[float, int, float, float,
+                                                 int]]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """TLLM_ONE_MODEL_SPEC_FAST_PREPARE: ``_populate_request_rng_state``'s
+        ``(request_seeds, request_offsets, flat_seeds, flat_offsets)`` for a
+        batch without a seeded request, as int64 tensors.
+
+        Every request then takes the next window of the shared unseeded counter
+        in batch order (``_take_rng_window_offsets``): request i's offset is
+        ``(step + i) * (max_draft_len + 1)`` and the counter ends at
+        ``step + len(batch)``. Seeds are all ``DEFAULT_SAMPLING_SEED``, and each
+        request's seed and offset repeat over its rows.
+        """
+        num_tokens_per_request = list(map(_NUM_TOKENS, per_request_normalized))
+        num_requests = len(num_tokens_per_request)
+        window = self.max_draft_len + 1
+        step = self._rng_window_counter.get(_UNSEEDED_RNG_WINDOW_KEY, 0)
+        self._rng_window_counter[_UNSEEDED_RNG_WINDOW_KEY] = step + num_requests
+        pin_memory = prefer_pinned()
+
+        request_seeds = torch.full((num_requests, ),
+                                   DEFAULT_SAMPLING_SEED,
+                                   dtype=torch.int64,
+                                   pin_memory=pin_memory)
+        request_offsets = torch.empty(num_requests,
+                                      dtype=torch.int64,
+                                      pin_memory=pin_memory)
+        torch.arange(step,
+                     step + num_requests,
+                     dtype=torch.int64,
+                     out=request_offsets)
+        request_offsets.mul_(window)
+
+        num_rows = sum(num_tokens_per_request)
+        flat_seeds = torch.full((num_rows, ),
+                                DEFAULT_SAMPLING_SEED,
+                                dtype=torch.int64,
+                                pin_memory=pin_memory)
+        flat_offsets = torch.empty(num_rows,
+                                   dtype=torch.int64,
+                                   pin_memory=pin_memory)
+        width = num_tokens_per_request[0]
+        if num_tokens_per_request.count(width) == num_requests:
+            flat_offsets.view(num_requests, width).copy_(
+                request_offsets.view(num_requests, 1).expand(num_requests,
+                                                             width))
+        else:
+            flat_offsets.copy_(
+                torch.repeat_interleave(
+                    request_offsets,
+                    torch.tensor(num_tokens_per_request, dtype=torch.int64)))
+        one_model_spec_fast_prepare_note(
+            "rng", f"Philox seed/offset rows of an unseeded batch built as int64 "
+            f"tensors ({num_requests} requests, {num_rows} rows)")
+        return request_seeds, request_offsets, flat_seeds, flat_offsets
 
     def prepare_rejection_sampling_buffers(self):
         """
@@ -1219,6 +1368,11 @@ class SpecMetadata:
         per_request_normalized: list[tuple[float, int, float, float, int]] = []
         has_non_greedy_requests = False
         per_request_slot_ids: list[int] = []
+        if ONE_MODEL_SPEC_FAST_PREPARE:
+            one_model_spec_fast_prepare_note(
+                "sampling", "sampling parameters normalized once per distinct "
+                "(temperature, top_k, top_p, min_p); per-token rows expanded by "
+                "slice assignment")
 
         for request in requests:
             sampling_config = request.sampling_config
@@ -1230,18 +1384,28 @@ class SpecMetadata:
             # Context requests have no draft tokens yet.
             num_tokens = 1 + self.runtime_draft_len if request.state == LlmRequestState.GENERATION_IN_PROGRESS else 1
 
-            (
-                temp_val,
-                tk_val,
-                tp_val,
-                mp_val,
-                is_greedy,
-            ) = _normalize_request_sampling_params(
-                temperature=temp_val,
-                top_k=tk_val,
-                top_p=tp_val,
-                min_p=mp_val,
-            )
+            if ONE_MODEL_SPEC_FAST_PREPARE:
+                (
+                    temp_val,
+                    tk_val,
+                    tp_val,
+                    mp_val,
+                    is_greedy,
+                ) = _normalized_sampling_row(_normalize_request_sampling_params,
+                                             temp_val, tk_val, tp_val, mp_val)
+            else:
+                (
+                    temp_val,
+                    tk_val,
+                    tp_val,
+                    mp_val,
+                    is_greedy,
+                ) = _normalize_request_sampling_params(
+                    temperature=temp_val,
+                    top_k=tk_val,
+                    top_p=tp_val,
+                    min_p=mp_val,
+                )
 
             has_non_greedy_requests |= not is_greedy
 
@@ -1329,8 +1493,11 @@ class SpecMetadata:
                               self.is_spec_dec_tree else self.max_draft_len + 1)
         # Warmup batches may exceed max_num_requests * tokens_per_request (e.g.
         # when CUDA-graph warmup passes use max_batch_size > max_num_requests).
-        actual_flat_size = sum(num_tokens
-                               for *_, num_tokens in per_request_normalized)
+        if ONE_MODEL_SPEC_FAST_PREPARE:
+            actual_flat_size = sum(map(_NUM_TOKENS, per_request_normalized))
+        else:
+            actual_flat_size = sum(
+                num_tokens for *_, num_tokens in per_request_normalized)
         required_flat_size = max(tokens_per_request * self.max_num_requests,
                                  actual_flat_size)
 
@@ -1404,17 +1571,26 @@ class SpecMetadata:
                 or need_update_expanded_sampler_param):
             return
 
+        if ONE_MODEL_SPEC_FAST_PREPARE:
+            # Per-request columns once, for both buffer groups.
+            request_temperatures = [row[0] for row in per_request_normalized]
+            request_top_ks = [row[1] for row in per_request_normalized]
+            request_top_ps = [row[2] for row in per_request_normalized]
+            request_min_ps = ([row[3] for row in per_request_normalized]
+                              if fill_min_p else [])
+
         if need_update_sampler_param:
-            request_temperatures: list[float] = []
-            request_top_ks: list[int] = []
-            request_top_ps: list[float] = []
-            request_min_ps: list[float] = []
-            for temp_val, tk_val, tp_val, mp_val, _ in per_request_normalized:
-                request_temperatures.append(temp_val)
-                request_top_ks.append(tk_val)
-                request_top_ps.append(tp_val)
-                if fill_min_p:
-                    request_min_ps.append(mp_val)
+            if not ONE_MODEL_SPEC_FAST_PREPARE:
+                request_temperatures: list[float] = []
+                request_top_ks: list[int] = []
+                request_top_ps: list[float] = []
+                request_min_ps: list[float] = []
+                for temp_val, tk_val, tp_val, mp_val, _ in per_request_normalized:
+                    request_temperatures.append(temp_val)
+                    request_top_ks.append(tk_val)
+                    request_top_ps.append(tp_val)
+                    if fill_min_p:
+                        request_min_ps.append(mp_val)
 
             self.request_temperatures[:len(request_temperatures)].copy_(
                 torch.tensor(request_temperatures,
@@ -1452,16 +1628,25 @@ class SpecMetadata:
                 default=0)
 
         if need_update_expanded_sampler_param:
-            temperatures: list[float] = []
-            top_ks: list[int] = []
-            top_ps: list[float] = []
-            min_ps: list[float] = []
-            for temp_val, tk_val, tp_val, mp_val, num_tokens in per_request_normalized:
-                temperatures.extend(temp_val for _ in range(num_tokens))
-                top_ks.extend(tk_val for _ in range(num_tokens))
-                top_ps.extend(tp_val for _ in range(num_tokens))
-                if fill_min_p:
-                    min_ps.extend(mp_val for _ in range(num_tokens))
+            if ONE_MODEL_SPEC_FAST_PREPARE:
+                num_tokens_per_request = list(
+                    map(_NUM_TOKENS, per_request_normalized))
+                temperatures = _repeat_per_row(request_temperatures,
+                                               num_tokens_per_request)
+                top_ks = _repeat_per_row(request_top_ks, num_tokens_per_request)
+                top_ps = _repeat_per_row(request_top_ps, num_tokens_per_request)
+                min_ps = _repeat_per_row(request_min_ps, num_tokens_per_request)
+            else:
+                temperatures: list[float] = []
+                top_ks: list[int] = []
+                top_ps: list[float] = []
+                min_ps: list[float] = []
+                for temp_val, tk_val, tp_val, mp_val, num_tokens in per_request_normalized:
+                    temperatures.extend(temp_val for _ in range(num_tokens))
+                    top_ks.extend(tk_val for _ in range(num_tokens))
+                    top_ps.extend(tp_val for _ in range(num_tokens))
+                    if fill_min_p:
+                        min_ps.extend(mp_val for _ in range(num_tokens))
 
             self.temperatures[:len(temperatures)].copy_(torch.tensor(
                 temperatures, dtype=torch.float32, pin_memory=prefer_pinned()),
@@ -1505,10 +1690,14 @@ class SpecMetadata:
         ``top_k_max`` derives from the same values as the per-request buffers,
         so it stays valid for as long as they do.
         """
-        values = tuple(
-            (temp, top_k, top_p, min_p)
-            for temp, top_k, top_p, min_p, _ in per_request_normalized)
-        num_tokens = tuple(n for *_, n in per_request_normalized)
+        if ONE_MODEL_SPEC_FAST_PREPARE:
+            values = tuple(map(_SAMPLING_VALUES, per_request_normalized))
+            num_tokens = tuple(map(_NUM_TOKENS, per_request_normalized))
+        else:
+            values = tuple(
+                (temp, top_k, top_p, min_p)
+                for temp, top_k, top_p, min_p, _ in per_request_normalized)
+            num_tokens = tuple(n for *_, n in per_request_normalized)
 
         request_signature = values
         expanded_signature = (values, num_tokens)

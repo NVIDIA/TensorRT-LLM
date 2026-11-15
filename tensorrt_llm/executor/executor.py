@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import atexit
 import faulthandler
 import json
@@ -54,6 +69,26 @@ __all__ = [
 if enable_llm_debug():
     # Mainly enable more detailed logging from cpp runtime.
     set_level("info")
+
+# Opt-in (default off): PR #20244's empty-queue early return in
+# _handle_background_error. Read once per process; unset, every call drains the
+# queue with get_nowait(), as before.
+_BACKPORT_PR20244 = os.environ.get("TLLM_BACKPORT_PR20244", "") == "1"
+_backport_pr20244_reported = False
+
+
+def _report_backport_pr20244() -> None:
+    """One stderr line per process the first time the PR #20244 path runs."""
+    global _backport_pr20244_reported
+    _backport_pr20244_reported = True
+    import sys
+
+    from .. import _utils
+    print(
+        "TLLM_BACKPORT_PR20244 engaged=True first=_handle_background_error "
+        f"shared_null_range={_utils._BACKPORT_PR20244} pid={os.getpid()}",
+        file=sys.stderr,
+        flush=True)
 
 
 async def empty_async_iterable() -> AsyncIterable:
@@ -301,6 +336,15 @@ class GenerationExecutor(ABC):
                 self._set_fatal_error(error)
                 self.shutdown()
             raise error
+
+        # Called once per streamed response: skip the get_nowait() raise/catch
+        # of Empty in the common no-error case. An error enqueued concurrently
+        # is picked up on the next call. Only with TLLM_BACKPORT_PR20244=1.
+        if _BACKPORT_PR20244:
+            if not _backport_pr20244_reported:
+                _report_backport_pr20244()
+            if self._error_queue.empty():
+                return
 
         # Drain the first error from the queue using get_nowait() to
         # avoid blocking if another thread consumed the item between

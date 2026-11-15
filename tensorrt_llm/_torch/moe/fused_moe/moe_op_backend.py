@@ -41,6 +41,9 @@ import torch
 
 from tensorrt_llm._torch.utils import ActType_TrtllmGen
 
+from .kf_moe_w4a8 import maybe_run as _kf_moe_w4a8_maybe_run
+from .kf_moe_w4a8 import maybe_run_unfinalized as _kf_moe_w4a8_maybe_run_unfinalized
+
 # Global registry for MoE backends
 _MOE_OP_BACKEND_REGISTRY: Dict[str, Type["MoEOpBackend"]] = {}
 
@@ -457,6 +460,66 @@ class TRTLLMOpBackend(MoEOpBackend):
                 and gemm1_weights_scale.shape[-1] == hidden_size // 32
             ):
                 # mxfp4
+                if not do_finalize:
+                    # [FC2 rows, routing weights, expanded_idx_to_permuted_idx]
+                    # for a caller that fuses the finalize into its next kernel.
+                    if output is not None:
+                        raise ValueError("output is only supported when do_finalize=True")
+                    # Default-off TLLM_MOE_KF_DECODE / TLLM_MOE_KF_PREFILL (see kf_moe_w4a8.py):
+                    # the same triple from the alternative kernel, for the caller's fused finalize.
+                    kf_rows = _kf_moe_w4a8_maybe_run_unfinalized(
+                        router_logits, routing_bias, hidden_states, hidden_states_scale,
+                        gemm1_weights, gemm1_weights_scale, gemm1_bias, gemm1_alpha, gemm1_beta,
+                        gemm1_clamp_limit, gemm2_weights, gemm2_weights_scale, gemm2_bias, top_k,
+                        valid_hidden_size, valid_intermediate_size, local_expert_offset,
+                        local_num_experts, routing_method_type, gated_act_type, topk_weights,
+                        topk_ids,
+                    )
+                    if kf_rows is not None:
+                        return kf_rows
+                    return torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner_unfinalized(
+                        router_logits,
+                        routing_bias,
+                        hidden_states,
+                        hidden_states_scale,
+                        gemm1_weights,
+                        gemm1_weights_scale,
+                        gemm1_bias,
+                        gemm1_alpha,
+                        gemm1_beta,
+                        gemm1_clamp_limit,
+                        gemm2_weights,
+                        gemm2_weights_scale,
+                        gemm2_bias,
+                        num_experts,
+                        top_k,
+                        n_group,
+                        topk_group,
+                        intermediate_size,
+                        valid_hidden_size,
+                        valid_intermediate_size,
+                        local_expert_offset,
+                        local_num_experts,
+                        routed_scaling_factor,
+                        routing_method_type,
+                        gated_act_type,
+                        topk_weights,
+                        topk_ids,
+                        tune_max_num_tokens=tune_max_num_tokens,
+                        use_dp=use_dp,
+                    )
+                # Default-off alternative kernels (TLLM_MOE_KF_DECODE[_DEP], TLLM_MOE_KF_PREFILL;
+                # see kf_moe_w4a8.py). They finalize themselves here.
+                kf_out = _kf_moe_w4a8_maybe_run(
+                    router_logits, routing_bias, hidden_states, hidden_states_scale,
+                    gemm1_weights, gemm1_weights_scale, gemm1_bias, gemm1_alpha, gemm1_beta,
+                    gemm1_clamp_limit, gemm2_weights, gemm2_weights_scale, gemm2_bias, top_k,
+                    valid_hidden_size, valid_intermediate_size, local_expert_offset,
+                    local_num_experts, routing_method_type, gated_act_type, topk_weights,
+                    topk_ids, output,
+                )
+                if kf_out is not None:
+                    return kf_out
                 return torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner(
                     router_logits,
                     routing_bias,

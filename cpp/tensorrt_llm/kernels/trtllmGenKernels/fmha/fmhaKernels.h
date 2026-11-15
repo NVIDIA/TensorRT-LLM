@@ -19,7 +19,10 @@
 #include "cuda_runtime_api.h"
 #include "tensorrt_llm/common/config.h"
 #include <algorithm>
+#include <atomic>
 #include <cfloat>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <limits>
@@ -421,10 +424,19 @@ private:
 
         if (shouldUseNvrtc(options))
         {
+            FmhaOptions nvrtcOptions = options;
+#ifdef TLLM_RUBIN_FEATURES
+            // TLLM_FMHA_WARMUP_RUN_ARCH=1: compile the warm-up kernel for the arch run() compiles (Sm100f on Rubin,
+            // see the override in run()); otherwise every warmed kernel misses the JIT cache at first use.
+            if (warmupRunArchFromEnv() && tg::isArchRubin(options.mCudaArch) && !options.mUsesSpcompress)
+            {
+                nvrtcOptions.mCudaArch = tg::CudaArch::Sm100f;
+            }
+#endif // TLLM_RUBIN_FEATURES
             FmhaConfig fmhaConfig;
-            fmhaConfig.mOptions = options;
+            fmhaConfig.mOptions = nvrtcOptions;
             std::ostringstream sstream;
-            populateJsonConfig(options, sstream);
+            populateJsonConfig(nvrtcOptions, sstream);
             fmhaConfig.mGenCfgJsonStr = sstream.str();
 
             fmhaConfig.mExecPath = getExecPath().c_str();
@@ -556,7 +568,15 @@ public:
 
         // The number of CtasQ and CtasKv per sequence, Ctas in the Y dimension, and Ctas in the Z
         // dimension.
-        auto [numCtasX, numCtasY, numCtasZ] = computeNumCtas(options, params.mMultiProcessorCount);
+        std::tuple<int32_t, int32_t, int32_t> numCtasXYZ;
+        // Rows of partialStats reserved ahead of partialO when the SM107 override engaged, else 0.
+        int64_t forcedPartialStatsRows = 0;
+        if (!forceSm107DecodeKvSplit(params, options, optionsFromArgs, numCtasXYZ, forcedPartialStatsRows)
+            && !forceSm107NumCtasPerSeqKv(params, options, numCtasXYZ, forcedPartialStatsRows))
+        {
+            numCtasXYZ = computeNumCtas(options, params.mMultiProcessorCount);
+        }
+        auto [numCtasX, numCtasY, numCtasZ] = numCtasXYZ;
 
         // Set the launch grid size.
         tg::CudaRunner::Grid grid{numCtasX, numCtasY, numCtasZ};
@@ -577,6 +597,12 @@ public:
         FmhaData fmhaData;
         setFmhaData(params, options, fmhaData);
         fmha::checkSkipCorrThreshold(options, fmhaData.mMetaData.skipCorrThreshold);
+        if (forcedPartialStatsRows > 0)
+        {
+            // The default layout reserves multiProcessorCount * stepQ partialStats rows. The override can launch
+            // more CTAs than that covers, so partialO moves past all of their rows.
+            fmhaData.mOutputBuffers.partialOPtrD = fmhaData.mOutputBuffers.partialStatsPtrD + forcedPartialStatsRows;
+        }
 
         if (shouldUseNvrtc(options))
         {
@@ -663,6 +689,352 @@ public:
     }
 
 private:
+    // TLLM_FMHA_SM107_MAX_CTAS_PER_SEQ=<n>, 2 <= n <= 16. Unset, empty, non-numeric or out of range
+    // disables the override. Read once per process.
+    static int32_t sm107CtasPerSeqKvFromEnv()
+    {
+        static int32_t const value = []()
+        {
+            char const* env = std::getenv("TLLM_FMHA_SM107_MAX_CTAS_PER_SEQ");
+            if (env == nullptr || *env == '\0')
+            {
+                return 0;
+            }
+            char* end = nullptr;
+            long const parsed = std::strtol(env, &end, 10);
+            if (end == env || *end != '\0' || parsed < 2 || parsed > 16)
+            {
+                return 0;
+            }
+            return static_cast<int32_t>(parsed);
+        }();
+        return value;
+    }
+
+    // Opt-in split of the KV sequence over more CTAs for SM107 generation kernels that already use
+    // the gmem-reduction multiCtasKv mode with the static scheduler. computeNumCtas otherwise picks the number of
+    // KV splits per sequence itself. This asks computeNumCtas for n KV splits through its own
+    // mNumCtasPerSeqKv argument; it still applies its existing length bound and the existing SM107 cluster clamp
+    // (mMaxNumCtasPerSeqKv), so n is an upper bound, and the partial buffers must fit the declared scratch.
+    // Same kernel family and math: on the cubin path
+    // the hash ignores the split count; the NVRTC path (FP8-KV SwapsMmaAb generation, the GPT-OSS decode kernel)
+    // generates the same kernel and reads the split from KernelParams (mMaxNumCtasKv, grid). If FmhaInterface's
+    // module cache keys on the full options, the forced split JIT-compiles once more. Only the order of the
+    // partial-softmax reduction changes. Returns false, leaving `options` untouched, unless every condition holds;
+    // the caller then runs the stock computeNumCtas.
+    bool forceSm107NumCtasPerSeqKv(RunnerParams const& params, FmhaOptions& options,
+        std::tuple<int32_t, int32_t, int32_t>& numCtasXYZ, int64_t& partialStatsRows) const
+    {
+        int32_t const forced = sm107CtasPerSeqKvFromEnv();
+        if (forced <= 1 || mSM != kSM_107 || isContextKernel(params.mKernelType)
+            || params.mMultiCtasKvScratchBytes == 0 || params.multiCtasKvScratchPtr == nullptr
+            || params.multiCtasKvCounterPtr == nullptr)
+        {
+            return false;
+        }
+        using tensorrt_llm::kernels::MultiCtasKvMode;
+        // The stock decision, on a copy.
+        FmhaOptions base = options;
+        auto const baseXYZ = computeNumCtas(base, params.mMultiProcessorCount, /*enablesLogging=*/false);
+        if (base.mMultiCtasKvMode != MultiCtasKvMode::GmemReduction || base.mTileScheduler != TileScheduler::Static
+            || base.mMaxNumCtasKv >= forced)
+        {
+            return false;
+        }
+        // The forced decision, on a copy.
+        FmhaOptions trial = options;
+        trial.mNumCtasPerSeqKv = forced;
+        auto const trialXYZ = computeNumCtas(trial, params.mMultiProcessorCount, /*enablesLogging=*/false);
+        if (trial.mMultiCtasKvMode != MultiCtasKvMode::GmemReduction || trial.mTileScheduler != TileScheduler::Static
+            || trial.mMaxNumCtasKv <= base.mMaxNumCtasKv)
+        {
+            return false;
+        }
+        // Partial buffers: one stepQ-row tile per CTA, laid out [batch, numCtasY, numCtasQ, numCtasKv, stepQ]
+        // (fmhaReduction.cu). Stats are float2; partialO is 2-byte elements of headDimPerCtaV (bounded by headDimV).
+        int64_t const stepQ = static_cast<int64_t>(trial.mTileSizeQ) * trial.mNumInstsQ;
+        int64_t const numCtas = static_cast<int64_t>(std::get<0>(trialXYZ)) * std::get<1>(trialXYZ)
+            * std::get<2>(trialXYZ);
+        int64_t const rows = numCtas * stepQ;
+        int64_t const statsRows = std::max(rows, static_cast<int64_t>(params.mMultiProcessorCount) * stepQ);
+        int64_t const headDimV = std::max(trial.mHeadDimPerCtaV, trial.mHeadDimV);
+        size_t const bytesNeeded = static_cast<size_t>(statsRows) * sizeof(float2)
+            + static_cast<size_t>(rows) * static_cast<size_t>(headDimV) * 2;
+        if (bytesNeeded > params.mMultiCtasKvScratchBytes)
+        {
+            static std::atomic<bool> loggedScratch{false};
+            if (!loggedScratch.exchange(true))
+            {
+                std::fprintf(stderr,
+                    "[TRT-LLM] [INFO] TLLM_FMHA_SM107_MAX_CTAS_PER_SEQ=%d skipped: partial buffers need %zu "
+                    "bytes, scratch has %zu (batch=%d maxSeqLenKv=%d numCtas=%lld)\n",
+                    forced, bytesNeeded, params.mMultiCtasKvScratchBytes, params.mBatchSize, params.mMaxSeqLenKv,
+                    static_cast<long long>(numCtas));
+            }
+            return false;
+        }
+        // On the cubin path the cubin must exist for the forced options (it should: the hash ignores the split).
+        if (!shouldUseNvrtc(trial))
+        {
+            FmhaOptions lookup = trial;
+            algoFilterForCubinPath(lookup);
+            auto const hashAndInfo = hashFromFmhaOptions(lookup);
+            auto const& functions = getFunctions(lookup.mFusesDsv4InvRopeFp8Quant, lookup.mUsesDsv4Ue8m0ScaleO);
+            if (functions.find(hashAndInfo.first) == functions.end())
+            {
+                return false;
+            }
+        }
+        static std::atomic<bool> loggedActive{false};
+        if (!loggedActive.exchange(true))
+        {
+            std::fprintf(stderr,
+                "[TRT-LLM] [INFO] TLLM_FMHA_SM107_MAX_CTAS_PER_SEQ=%d active: numCtasPerSeqKv %d -> %d, "
+                "grid %dx%dx%d -> %dx%dx%d (batch=%d maxSeqLenQ=%d maxSeqLenKv=%d sms=%d), "
+                "partial buffers %zu of %zu bytes\n",
+                forced, base.mMaxNumCtasKv, trial.mMaxNumCtasKv, std::get<0>(baseXYZ), std::get<1>(baseXYZ),
+                std::get<2>(baseXYZ), std::get<0>(trialXYZ), std::get<1>(trialXYZ), std::get<2>(trialXYZ),
+                params.mBatchSize, params.mMaxSeqLenQ, params.mMaxSeqLenKv, params.mMultiProcessorCount, bytesNeeded,
+                params.mMultiCtasKvScratchBytes);
+        }
+        options = trial;
+        numCtasXYZ = trialXYZ;
+        partialStatsRows = statsRows;
+        return true;
+    }
+
+    // TLLM_FMHA_SM107_DECODE_KV_SPLIT=<s>, 2 <= s <= 8, or "auto" (returned as kSm107DecodeKvSplitAuto). Unset, empty,
+    // non-numeric or out of range disables the override. Read once per process.
+    static constexpr int32_t kSm107DecodeKvSplitAuto = -1;
+
+    static int32_t sm107DecodeKvSplitFromEnv()
+    {
+        static int32_t const value = []()
+        {
+            char const* env = std::getenv("TLLM_FMHA_SM107_DECODE_KV_SPLIT");
+            if (env == nullptr || *env == '\0')
+            {
+                return 0;
+            }
+            if (std::strcmp(env, "auto") == 0)
+            {
+                return kSm107DecodeKvSplitAuto;
+            }
+            char* end = nullptr;
+            long const parsed = std::strtol(env, &end, 10);
+            if (end == env || *end != '\0' || parsed < 2 || parsed > 8)
+            {
+                return 0;
+            }
+            return static_cast<int32_t>(parsed);
+        }();
+        return value;
+    }
+
+    // TLLM_FMHA_SM107_DECODE_KV_SPLIT_WAVES=<w>, 1 <= w <= 8 (default 2): the auto mode's fill target, in CTAs per SM.
+    // Unset, empty, non-numeric or out of range means 2. Read once per process.
+    static double sm107DecodeKvSplitWavesFromEnv()
+    {
+        static double const value = []()
+        {
+            char const* env = std::getenv("TLLM_FMHA_SM107_DECODE_KV_SPLIT_WAVES");
+            if (env == nullptr || *env == '\0')
+            {
+                return 2.0;
+            }
+            char* end = nullptr;
+            double const parsed = std::strtod(env, &end);
+            if (end == env || *end != '\0' || !(parsed >= 1.0 && parsed <= 8.0))
+            {
+                return 2.0;
+            }
+            return parsed;
+        }();
+        return value;
+    }
+
+    // The auto mode's split for a launch of numCtas CTAs (one per sequence and KV head) on sms SMs: engage only below
+    // waves * sms CTAs, then take floor(waves * sms / numCtas) splits, at least 2 and at most 8. Returns 1 (no split)
+    // when the launch already fills the target.
+    static int32_t sm107DecodeKvSplitAutoSplit(int64_t numCtas, int32_t sms, double waves)
+    {
+        double const target = waves * static_cast<double>(sms);
+        if (numCtas <= 0 || static_cast<double>(numCtas) >= target)
+        {
+            return 1;
+        }
+        int64_t const fill = static_cast<int64_t>(target / static_cast<double>(numCtas));
+        return static_cast<int32_t>(std::min<int64_t>(std::max<int64_t>(fill, 2), 8));
+    }
+
+    // TLLM_FMHA_SM107_DECODE_KV_SPLIT_CGA=1 reduces the split through CGA shared memory instead of global memory.
+    // Read once per process.
+    static bool sm107DecodeKvSplitUsesCgaFromEnv()
+    {
+        static bool const value = []()
+        {
+            char const* env = std::getenv("TLLM_FMHA_SM107_DECODE_KV_SPLIT_CGA");
+            return env != nullptr && std::strcmp(env, "1") == 0;
+        }();
+        return value;
+    }
+
+    // Opt-in KV split for SM107 generation launches that the autotuner runs with one CTA per (sequence, KV head).
+    // computeNumCtas gives each sequence multiProcessorCount / (numCtasQ * numCtasY * batch) KV splits, which is one
+    // (no split) once batch * numHeadsKv exceeds half the SMs: from batch 14 at 8 KV heads on 212 SMs. Below one
+    // wave the launch then leaves SMs idle and lasts as long as the CTA of the longest sequence; past one wave the
+    // persistent scheduler still ends with the CTAs of the longest sequences. This asks computeNumCtas for s KV
+    // splits per sequence with the static scheduler and the multiCtasKv mode the autotuner itself selects at small
+    // batch: gmem reduction, or CGA reduction with TLLM_FMHA_SM107_DECODE_KV_SPLIT_CGA=1. The kernel and its math
+    // are the same; only the order of the partial-softmax reduction changes. computeNumCtas still bounds s by the
+    // KV length (at least two KV steps per CTA) and by the SM107 pre-selection clamp. Gmem reduction steps s down
+    // until its partial buffers fit the scratch the caller declared, laid out as forceSm107NumCtasPerSeqKv lays
+    // them out. Scope: NVRTC generation kernels (FP8-KV SwapsMmaAb) of full-attention layers through a caller that
+    // declares the scratch (XqaDispatcher, multi-block mode). Launches whose stock choice already splits, and
+    // sliding-window, chunked, custom-mask, MLA, sparse and 2-CTA launches, keep the stock choice. With
+    // TLLM_FMHA_SM107_DECODE_KV_SPLIT=auto, s is chosen per launch from the stock grid: only launches of fewer than
+    // TLLM_FMHA_SM107_DECODE_KV_SPLIT_WAVES (default 2) CTAs per SM split, into floor(waves * SMs / CTAs) KV splits
+    // (2..8), so the split fills the GPU without adding waves of split CTAs. Returns false, leaving `options`
+    // untouched, unless every condition holds.
+    bool forceSm107DecodeKvSplit(RunnerParams const& params, FmhaOptions& options,
+        FmhaOptionsFromArgs const& optionsFromArgs, std::tuple<int32_t, int32_t, int32_t>& numCtasXYZ,
+        int64_t& partialStatsRows) const
+    {
+        int32_t const requested = sm107DecodeKvSplitFromEnv();
+        bool const autoSplit = requested == kSm107DecodeKvSplitAuto;
+        if ((requested <= 1 && !autoSplit) || mSM != kSM_107 || isContextKernel(params.mKernelType)
+            || isContextKernel(options.mFmhaKernelType) || !shouldUseNvrtc(options)
+            || params.mMultiCtasKvScratchBytes == 0 || params.multiCtasKvScratchPtr == nullptr
+            || params.multiCtasKvCounterPtr == nullptr || options.mIsMlaGen || isTokenSparse(options.mSparseType)
+            || usesSlidingWindowMask(options.mMaskType) || isCustomMask(options.mMaskType)
+            || options.mChunkedAttentionSize > 0 || options.mClusterDimX != 1 || options.mNumInstsQ != 1
+            || options.mBalancesWorkloadForCausalMask || options.mFusesDsv4InvRopeFp8Quant)
+        {
+            return false;
+        }
+        using tensorrt_llm::kernels::MultiCtasKvMode;
+        // The stock decision, on a copy: only launches without a KV split.
+        FmhaOptions base = options;
+        auto const baseXYZ = computeNumCtas(base, params.mMultiProcessorCount, /*enablesLogging=*/false);
+        if (base.mMultiCtasKvMode != MultiCtasKvMode::Disabled || base.mMaxNumCtasKv != 1)
+        {
+            return false;
+        }
+        // The split to try first: the fixed one, or the auto mode's fill of the stock grid.
+        int32_t first = requested;
+        if (autoSplit)
+        {
+            int64_t const baseCtas
+                = static_cast<int64_t>(std::get<0>(baseXYZ)) * std::get<1>(baseXYZ) * std::get<2>(baseXYZ);
+            first
+                = sm107DecodeKvSplitAutoSplit(baseCtas, params.mMultiProcessorCount, sm107DecodeKvSplitWavesFromEnv());
+            if (first <= 1)
+            {
+                return false;
+            }
+        }
+        // The flag's value as the log lines print it (formatted only when a line is printed).
+        char label[64] = "";
+        auto const formatLabel = [&]()
+        {
+            if (autoSplit)
+            {
+                std::snprintf(label, sizeof(label), "auto(waves=%.2f)", sm107DecodeKvSplitWavesFromEnv());
+            }
+            else
+            {
+                std::snprintf(label, sizeof(label), "%d", requested);
+            }
+            return label;
+        };
+        bool const usesCga = sm107DecodeKvSplitUsesCgaFromEnv();
+        int64_t const headDimV = std::max(options.mHeadDimPerCtaV, options.mHeadDimV);
+        if (usesCga && headDimV >= 256)
+        {
+            // The CGA reduction's shared memory does not fit 256- and 512-wide V tiles (the autotuner's own rule).
+            return false;
+        }
+        for (int32_t split = first; split >= 2; --split)
+        {
+            FmhaOptions trial = options;
+            trial.mMultiCtasKvMode = usesCga ? MultiCtasKvMode::CgaSmemReduction : MultiCtasKvMode::GmemReduction;
+            trial.mTileScheduler = TileScheduler::Static;
+            trial.mNumCtasPerSeqKv = split;
+            auto const trialXYZ = computeNumCtas(trial, params.mMultiProcessorCount, /*enablesLogging=*/false);
+            if (trial.mMultiCtasKvMode == MultiCtasKvMode::Disabled || trial.mMaxNumCtasKv <= 1)
+            {
+                // The KV is too short to split.
+                return false;
+            }
+            // Gmem partial buffers: one stepQ-row tile per CTA (fmhaReduction.cu); CGA reduction uses none.
+            int64_t statsRows = 0;
+            size_t bytesNeeded = 0;
+            if (!usesCga)
+            {
+                int64_t const stepQ = static_cast<int64_t>(trial.mTileSizeQ) * trial.mNumInstsQ;
+                int64_t const numCtas
+                    = static_cast<int64_t>(std::get<0>(trialXYZ)) * std::get<1>(trialXYZ) * std::get<2>(trialXYZ);
+                int64_t const rows = numCtas * stepQ;
+                statsRows = std::max(rows, static_cast<int64_t>(params.mMultiProcessorCount) * stepQ);
+                bytesNeeded = static_cast<size_t>(statsRows) * sizeof(float2)
+                    + static_cast<size_t>(rows) * static_cast<size_t>(headDimV) * 2;
+                if (bytesNeeded > params.mMultiCtasKvScratchBytes)
+                {
+                    continue;
+                }
+            }
+            try
+            {
+                checkFmhaOptions(trial, optionsFromArgs);
+            }
+            catch (std::exception const& e)
+            {
+                static std::atomic<bool> loggedInvalid{false};
+                if (!loggedInvalid.exchange(true))
+                {
+                    std::fprintf(stderr, "[TRT-LLM] [INFO] TLLM_FMHA_SM107_DECODE_KV_SPLIT=%s skipped: %s\n",
+                        formatLabel(), e.what());
+                }
+                return false;
+            }
+            if (!shouldUseNvrtc(trial))
+            {
+                return false;
+            }
+            // One line per distinct batch size, so that the split is visible at each captured batch.
+            static std::atomic<uint64_t> loggedBatches[64];
+            int32_t const batch = params.mBatchSize;
+            if (batch >= 0 && batch < 64 * 64)
+            {
+                uint64_t const bit = uint64_t{1} << (batch % 64);
+                if ((loggedBatches[batch / 64].fetch_or(bit) & bit) == 0)
+                {
+                    std::fprintf(stderr,
+                        "[TRT-LLM] [INFO] TLLM_FMHA_SM107_DECODE_KV_SPLIT=%s active (%s reduction): numCtasPerSeqKv "
+                        "1 -> %d, grid %dx%dx%d -> %dx%dx%d (batch=%d maxSeqLenQ=%d maxSeqLenKv=%d sms=%d), partial "
+                        "buffers %zu of %zu bytes\n",
+                        formatLabel(), usesCga ? "cga" : "gmem", trial.mMaxNumCtasKv, std::get<0>(baseXYZ),
+                        std::get<1>(baseXYZ), std::get<2>(baseXYZ), std::get<0>(trialXYZ), std::get<1>(trialXYZ),
+                        std::get<2>(trialXYZ), batch, params.mMaxSeqLenQ, params.mMaxSeqLenKv,
+                        params.mMultiProcessorCount, bytesNeeded, params.mMultiCtasKvScratchBytes);
+                }
+            }
+            options = trial;
+            numCtasXYZ = trialXYZ;
+            partialStatsRows = statsRows;
+            return true;
+        }
+        static std::atomic<bool> loggedScratch{false};
+        if (!loggedScratch.exchange(true))
+        {
+            std::fprintf(stderr,
+                "[TRT-LLM] [INFO] TLLM_FMHA_SM107_DECODE_KV_SPLIT=%s skipped: no split of 2 or more fits the %zu-byte "
+                "partial-buffer scratch (batch=%d maxSeqLenKv=%d)\n",
+                formatLabel(), params.mMultiCtasKvScratchBytes, params.mBatchSize, params.mMaxSeqLenKv);
+        }
+        return false;
+    }
+
     // Autotuner entry for checkIfKernelExist, warmupOneKernel, and run. SM107 may select
     // CgaSmemReduction configs where clusterDimX * mMaxNumCtasPerSeqKv must stay <= 16;
     // the pre/post clamps below enforce that. Other architectures keep the legacy path.
@@ -689,10 +1061,138 @@ private:
         }
 
         int32_t ctaDim = 512;
+        FmhaOptions const tunerInput = options;
+        FmhaOptionsFromArgs const tunerInputArgs = optionsFromArgs;
         FmhaAutoTuner autoTuner(options, optionsFromArgs, multiProcessorCount);
         std::tie(options, optionsFromArgs, ctaDim) = autoTuner.selectKernel();
         limitCgaSmemReductionCtasKv(options);
+        selectSwaStepKv128IfRequested(
+            tunerInput, tunerInputArgs, multiProcessorCount, options, optionsFromArgs, ctaDim);
         return {options, optionsFromArgs, ctaDim};
+    }
+
+    // TLLM_FMHA_WARMUP_RUN_ARCH=1 (exactly "1"). Read once per process.
+    static bool warmupRunArchFromEnv()
+    {
+        static bool const value = []()
+        {
+            char const* env = std::getenv("TLLM_FMHA_WARMUP_RUN_ARCH");
+            bool const on = env != nullptr && std::strcmp(env, "1") == 0;
+            if (on)
+            {
+                std::fprintf(stderr,
+                    "[TRT-LLM] [INFO] TLLM_FMHA_WARMUP_RUN_ARCH=1 active: FMHA JIT warm-up compiles NVRTC kernels "
+                    "for the arch run() uses (Sm100f on Rubin)\n");
+            }
+            return on;
+        }();
+        return value;
+    }
+
+    // TLLM_FMHA_SM107_SWA_STEP_KV128=1 (exactly "1"). Read once per process.
+    static bool swaStepKv128FromEnv()
+    {
+        static bool const value = []()
+        {
+            char const* env = std::getenv("TLLM_FMHA_SM107_SWA_STEP_KV128");
+            return env != nullptr && std::strcmp(env, "1") == 0;
+        }();
+        return value;
+    }
+
+    // Opt-in (TLLM_FMHA_SM107_SWA_STEP_KV128=1, SM107 only): a sliding-window generation kernel whose window fits in
+    // one KV tile (attentionWindowSize <= tileSizeKv = 128) steps 128 keys per iteration (numInstsKv 1) instead of the
+    // autotuner's 256 (numInstsKv 2), so a step no longer loads a mostly masked second tile. The autotuner is re-run
+    // with numInstsQ/Kv = (1,1) marked as set (FmhaAutoTuner::setNumInstsQAndKv keeps preset values unless forced),
+    // so every option derived from numInsts (MMA order, stages, ctaDim, k-partitions) comes from the autotuner
+    // itself. The trial replaces the stock choice only if it kept (1,1), matches the stock kernel in everything else
+    // that names it (kernel type, mask, tile sizes, Q grouping, scheduler, multi-CTA mode), stays on the NVRTC path
+    // and passes checkFmhaOptions; otherwise the stock choice stands. Only stock choices without a KV split
+    // (multiCtasKvMode Disabled: high-batch decode) are eligible, so no partial-result scratch layout
+    // changes. Same math; the online-softmax update (and P's
+    // FP8 rounding against the running max) runs per 128 keys instead of per 256, so outputs are not bit-identical.
+    void selectSwaStepKv128IfRequested(FmhaOptions const& tunerInput, FmhaOptionsFromArgs const& tunerInputArgs,
+        int32_t multiProcessorCount, FmhaOptions& options, FmhaOptionsFromArgs& optionsFromArgs, int32_t& ctaDim) const
+    {
+        if (!swaStepKv128FromEnv() || mSM != kSM_107)
+        {
+            return;
+        }
+        if (options.mFmhaKernelType != FmhaKernelType::SwapsMmaAbForGeneration
+            || options.mMaskType != TrtllmGenAttentionMaskType::SlidingOrChunkedCausal
+            || options.mChunkedAttentionSize != 0 || options.mAttentionWindowSize <= 0 || options.mTileSizeKv != 128
+            || options.mAttentionWindowSize > options.mTileSizeKv || options.mNumInstsQ != 1 || options.mNumInstsKv != 2
+            || options.mIsMlaGen || isTokenSparse(options.mSparseType) || !shouldUseNvrtc(options)
+            || options.mMultiCtasKvMode != tensorrt_llm::kernels::MultiCtasKvMode::Disabled)
+        {
+            return;
+        }
+        FmhaOptions input = tunerInput;
+        FmhaOptionsFromArgs inputArgs = tunerInputArgs;
+        input.mNumInstsQ = 1;
+        input.mNumInstsKv = 1;
+        inputArgs.mIsNumInstsQSet = true;
+        inputArgs.mIsNumInstsKvSet = true;
+        FmhaOptions trial;
+        FmhaOptionsFromArgs trialArgs;
+        int32_t trialCtaDim = ctaDim;
+        std::string reject;
+        try
+        {
+            FmhaAutoTuner trialTuner(input, inputArgs, multiProcessorCount);
+            std::tie(trial, trialArgs, trialCtaDim) = trialTuner.selectKernel();
+            limitCgaSmemReductionCtasKv(trial);
+            if (trial.mNumInstsQ != 1 || trial.mNumInstsKv != 1)
+            {
+                reject = "autotuner returned numInstsQ/Kv " + std::to_string(trial.mNumInstsQ) + "/"
+                    + std::to_string(trial.mNumInstsKv);
+            }
+            else if (trial.mFmhaKernelType != options.mFmhaKernelType || trial.mMaskType != options.mMaskType
+                || trial.mTileSizeQ != options.mTileSizeQ || trial.mTileSizeKv != options.mTileSizeKv
+                || trial.mGroupsHeadsQ != options.mGroupsHeadsQ
+                || trial.mGroupsTokensHeadsQ != options.mGroupsTokensHeadsQ
+                || trial.mTileScheduler != options.mTileScheduler || trial.mMultiCtasKvMode != options.mMultiCtasKvMode
+                || !shouldUseNvrtc(trial))
+            {
+                reject = "the (1,1) choice differs from the stock kernel beyond numInsts";
+            }
+            else
+            {
+                checkFmhaOptions(trial, trialArgs);
+            }
+        }
+        catch (std::exception const& e)
+        {
+            reject = std::string("exception: ") + e.what();
+        }
+        if (!reject.empty())
+        {
+            static std::atomic<bool> loggedSkip{false};
+            if (!loggedSkip.exchange(true))
+            {
+                std::fprintf(stderr,
+                    "[TRT-LLM] [INFO] TLLM_FMHA_SM107_SWA_STEP_KV128=1 skipped (stock kept): %s (batch=%d "
+                    "maxSeqLenQ=%d maxSeqLenKv=%d window=%d)\n",
+                    reject.substr(0, 300).c_str(), options.mBatchSize, options.mMaxSeqLenQ, options.mMaxSeqLenKv,
+                    options.mAttentionWindowSize);
+            }
+            return;
+        }
+        static std::atomic<bool> loggedActive{false};
+        if (!loggedActive.exchange(true))
+        {
+            std::fprintf(stderr,
+                "[TRT-LLM] [INFO] TLLM_FMHA_SM107_SWA_STEP_KV128=1 active: sliding-window gen stepKv %d -> %d "
+                "(numInstsKv 2 -> 1, tileSizeQ=%d groupsTokensHeadsQ=%d scheduler=%d multiCtasKv=%d ctaDim %d -> %d, "
+                "window=%d batch=%d maxSeqLenQ=%d)\n",
+                options.mTileSizeKv * options.mNumInstsKv, trial.mTileSizeKv * trial.mNumInstsKv, trial.mTileSizeQ,
+                static_cast<int>(trial.mGroupsTokensHeadsQ), static_cast<int>(trial.mTileScheduler),
+                static_cast<int>(trial.mMultiCtasKvMode), ctaDim, trialCtaDim, trial.mAttentionWindowSize,
+                trial.mBatchSize, trial.mMaxSeqLenQ);
+        }
+        options = trial;
+        optionsFromArgs = trialArgs;
+        ctaDim = trialCtaDim;
     }
 
     void limitCgaSmemReductionCtasKv(FmhaOptions& options) const

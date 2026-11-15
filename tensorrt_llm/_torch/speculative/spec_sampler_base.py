@@ -79,8 +79,23 @@ UNSUPPORTED_MIN_P_MSG = (
 )
 
 
+def _supports_eagle3_min_length_one(spec_config) -> bool:
+    """Whether the worker implements first-token EOS suppression."""
+    mode = getattr(spec_config, "spec_dec_mode", None)
+    if mode is None or not mode.is_eagle3_one_model():
+        return False
+    # A top-K of one uses the linear worker, despite the dynamic-tree flag.
+    return not (
+        getattr(spec_config, "use_dynamic_tree", False)
+        and getattr(spec_config, "dynamic_tree_max_topK", 0) > 1
+    )
+
+
 def one_model_sampling_rejection_reason(
-    sampling_params: Optional[SamplingParams], *, fused_sampling: bool = False
+    sampling_params: Optional[SamplingParams],
+    *,
+    fused_sampling: bool = False,
+    min_length_one_supported: bool = False,
 ) -> Optional[str]:
     """Why ``sampling_params`` cannot be served by the one-model speculative path.
 
@@ -102,7 +117,7 @@ def one_model_sampling_rejection_reason(
     # value rather than on its presence -- same reasoning as the LlmRequest
     # check below.
     min_tokens = sampling_params.min_tokens
-    if min_tokens and min_tokens > 0:
+    if min_tokens and min_tokens > 0 and not (min_tokens == 1 and min_length_one_supported):
         return UNSUPPORTED_MIN_LENGTH_MSG
     # Either form populates py_bad_words; the string form needs a tokenizer to
     # resolve, so test the raw fields rather than _get_bad_words().
@@ -194,7 +209,9 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         min_p = sampling_config.min_p
         if min_p and min_p > 0.0 and not self._fused_sampling:
             raise ValueError(UNSUPPORTED_MIN_P_MSG)
-        self._validate_unsupported_logits_processors(request)
+        self._validate_unsupported_logits_processors(
+            request, min_length_one_supported=self._min_length_one_supported
+        )
         # The occurrence penalties need a [slots, vocab_size] workspace that is only
         # allocated when the deploy opted in, so a request asking for them while the
         # flag is off cannot be honored. Reject instead of silently decoding from an
@@ -221,13 +238,15 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             )
 
     @staticmethod
-    def _validate_unsupported_logits_processors(request: LlmRequest) -> None:
+    def _validate_unsupported_logits_processors(
+        request: LlmRequest, *, min_length_one_supported: bool = False
+    ) -> None:
         """Reject logits-side sampling features the one-model path cannot apply.
 
         TorchSampler implements min_length, bad_words, no_repeat_ngram_size,
         embedding_bias and top_p_decay by editing the target logits before
-        sampling. The one-model path has no logits-editing hook, so each is
-        rejected here instead of being silently dropped.
+        sampling. These are rejected unless the worker explicitly supports them;
+        linear EAGLE3 implements the first-token EOS ban for min_length == 1.
 
         Each check gates on a non-neutral value rather than on presence, since a
         frontend may forward a default explicitly.
@@ -237,7 +256,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         # it is routinely present and holds the neutral value -- gate on the
         # value, not on its presence.
         min_length = getattr(request, "py_min_length", None)
-        if min_length and min_length > 0:
+        if min_length and min_length > 0 and not (min_length == 1 and min_length_one_supported):
             raise ValueError(UNSUPPORTED_MIN_LENGTH_MSG)
         if getattr(request, "py_bad_words", None):
             raise ValueError(UNSUPPORTED_BAD_WORDS_MSG)
@@ -265,6 +284,7 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
         enable_penalty: bool = False,
         penalty_supported: bool = True,
         fused_sampling: bool = False,
+        min_length_one_supported: bool = False,
     ):
         """
         Initialize the speculative sampler.
@@ -277,10 +297,13 @@ class SpecSampler(Sampler[SampleStateSpec], AsyncWorkerMixin):
             penalty_supported: whether this speculation mode's row layout is one
                 the penalties can map (linear modes yes, tree modes not yet).
             fused_sampling: whether the configured sampler supports min_p.
+            min_length_one_supported: whether the worker enforces first-token EOS
+                suppression. False for modes without this implementation.
         """
         self._enable_penalty = enable_penalty
         self._penalty_supported = penalty_supported
         self._fused_sampling = fused_sampling
+        self._min_length_one_supported = min_length_one_supported
         self._async_worker_init(args.enable_async_worker)
         self.mapping = None
         self.max_seq_len = args.max_seq_len

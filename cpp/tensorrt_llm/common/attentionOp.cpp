@@ -1083,6 +1083,7 @@ template <typename T>
 int AttentionOp::mlaGeneration(
     MlaParams<T>& params, EnqueueGenerationParams<T> const& generation_params, cudaStream_t stream)
 {
+    invalidateXqaDecoderInfoReuse(); // TLLM_DECODER_INFO_ONCE_LAYERS: this path writes the workspace.
     TLLM_CHECK_WITH_INFO(params.seqQOffset != nullptr, "seqQOffset is nullptr.");
     TLLM_CHECK_WITH_INFO(params.cache_seq_lens != nullptr, "cache_seq_lens is nullptr.");
     TLLM_CHECK_WITH_INFO(params.fmha_tile_counter != nullptr, "fmha_tile_counter is nullptr.");
@@ -1490,6 +1491,7 @@ MLA_FUNC_DEFINE(__nv_bfloat16)
 template <typename T, typename KVCacheBuffer>
 int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStream_t stream)
 {
+    invalidateXqaDecoderInfoReuse(); // TLLM_DECODER_INFO_ONCE_LAYERS: the context phase writes the workspace.
     int const headSize = getHeadSize();
 
     int const local_hidden_units_qo = mNumHeads * headSize;
@@ -2601,6 +2603,11 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
         sync_check_cuda_error(stream);
     }
 
+    if (mCpSize > 1)
+    {
+        invalidateXqaDecoderInfoReuse(); // TLLM_DECODER_INFO_ONCE_LAYERS: the CP buffers alias the workspace.
+    }
+
     // Try XQA optimization first.
     {
         // NOTE: input_seq_length = num_medusa_tokens + 1 (new generated one from the original LM head)
@@ -2645,6 +2652,8 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
             TLLM_LOG_DEBUG("XQA kernels are not selected in the generation phase.");
         }
     }
+
+    invalidateXqaDecoderInfoReuse(); // TLLM_DECODER_INFO_ONCE_LAYERS: the MMHA path writes the workspace.
 
     // This is the number of kv tokens that q needs to visit, but excluding one as it will be processed before the kv
     // loop.

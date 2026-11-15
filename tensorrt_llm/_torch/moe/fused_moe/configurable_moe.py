@@ -44,7 +44,12 @@ from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
 from tensorrt_llm._torch.moe.fused_moe.interface import MoE, MoESchedulerKind, _reject
 from tensorrt_llm._torch.moe.fused_moe.routing import BaseMoeRoutingMethod
 from tensorrt_llm._torch.pyexecutor.dwdp import get_global_dwdp_manager
-from tensorrt_llm._torch.utils import AuxStreamType, EventType, Fp4QuantizedTensor
+from tensorrt_llm._torch.utils import (
+    AuxStreamType,
+    EventType,
+    Fp4QuantizedTensor,
+    MxFp8QuantizedTensor,
+)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -667,7 +672,9 @@ class ConfigurableMoE(MoE):
         """
         input_ids = kwargs.get("input_ids")
 
-        if isinstance(x, Fp4QuantizedTensor):
+        # An MXFP8 input (GPT-OSS fused post-attention norm, opt-in) names its
+        # output dtype like an NVFP4 one.
+        if isinstance(x, (Fp4QuantizedTensor, MxFp8QuantizedTensor)):
             assert output_dtype is not None
         else:
             output_dtype = x.dtype

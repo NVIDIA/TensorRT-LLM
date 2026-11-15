@@ -29,6 +29,11 @@
 #include "tensorrt_llm/kernels/quantization.cuh"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
 
+#include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <type_traits>
 
 using namespace tensorrt_llm::common;
@@ -1187,6 +1192,798 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
 #endif
 }
 
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// TLLM_GPTOSS_ROPEKV_TOKEN_MAJOR=1 (default unset = off): token-major context-phase QKV preprocessing.
+//
+// applyBiasRopeUpdateKVCacheV2 gives every Q head its own grid row (blockIdx.y). For each token, each of the head_num
+// Q-head rows reloads the token's metadata (tokens_info, sequence and cache lengths, paged-KV block pointers) and its
+// cos/sin, and loads and rotates the K vector and loads the V vector of its KV head, although only the first Q head of
+// each KV head stores them: with 64 Q heads on 8 KV heads, every K and V vector is loaded and every K vector rotated
+// 8 times per token. ropeKvTokenMajorKernel gives each warp whole tokens. A lane keeps one 16-byte channel of the head
+// dimension, so its cos/sin, the token's metadata and the block pointers are read once per lane and token, and the
+// warp walks the token's [Q heads | K heads | V heads] row in 512-byte steps: each Q, K and V vector is loaded once
+// (Q and K with their rotary pair) and each K vector is rotated once.
+// Per element it runs the V2 kernel's helpers with the V2 kernel's operands (mmha::apply_rotary_embedding_gptneox
+// with the same cos/sin and sign, mmha::store_8bits_vec with the same scale, the KVBlockArray addressing,
+// zeroPagedVCacheTail, the FMHA scale block and PDL), so the FP8 Q, the paged K/V bytes and the FMHA scales it writes
+// are the V2 kernel's.
+// It takes context-phase launches only, with a cos/sin cache and GPT-NeoX-style rotation (RoPE, long RoPE, YaRN),
+// BF16 QKV without bias, a separate FP8 Q output, an FP8 paged KV cache, head size 64 and Q and KV head counts that
+// are multiples of 4 (GPT-OSS: 64 and 8 Q and KV heads per rank); everything else, and every generation-phase launch,
+// keeps the V2 kernel (ropeKvTokenMajorUnsupported). With the flag set, one line goes to stderr at the first launch
+// the kernel takes, and one at the first context-phase launch it leaves to the V2 kernel, with the reason.
+// The flag's value picks one of three occupancy/ILP variants of the same kernel (identical per-element work and
+// output; kRopeKvTokenMajorVariants): 1 = 4 Q steps of loads in flight at up to 64 registers (4 blocks of 256 threads
+// per SM), 2 = 2 steps at up to 51 registers (5 blocks), 3 = 4 steps at up to 85 registers (3 blocks). Any other
+// value is off. tllm_gptoss_ropekv_token_major_override() (unfusedAttentionKernels_2_bf16_fp8.cu) sets the mode per
+// process for in-process A/B tests.
+
+#if defined(ENABLE_BF16) && defined(ENABLE_FP8)
+template <typename T, typename TCache, typename KVCacheBuffer, int Dh>
+inline constexpr bool kRopeKvTokenMajorInstantiated = std::is_same_v<T, __nv_bfloat16>
+    && std::is_same_v<TCache, __nv_fp8_e4m3> && std::is_same_v<KVCacheBuffer, KVBlockArray> && Dh == 64;
+#else
+template <typename T, typename TCache, typename KVCacheBuffer, int Dh>
+inline constexpr bool kRopeKvTokenMajorInstantiated = false;
+#endif
+
+constexpr int kRopeKvTokenMajorThreads = 256;
+constexpr int kRopeKvTokenMajorVariants = 3;
+
+// Process-wide mode: -1 follows TLLM_GPTOSS_ROPEKV_TOKEN_MAJOR, 0 keeps the V2 kernel, 1..3 takes the launches the
+// token-major kernel covers with that variant.
+inline std::atomic<int>& ropeKvTokenMajorOverride()
+{
+    static std::atomic<int> mode{-1};
+    return mode;
+}
+
+// 0 = off, else the variant (1..kRopeKvTokenMajorVariants).
+inline int ropeKvTokenMajorVariant()
+{
+    static int const fromEnv = []
+    {
+        char const* v = std::getenv("TLLM_GPTOSS_ROPEKV_TOKEN_MAJOR");
+        if (v == nullptr || v[0] < '1' || v[0] > '0' + kRopeKvTokenMajorVariants || v[1] != '\0')
+        {
+            return 0;
+        }
+        return v[0] - '0';
+    }();
+    int const mode = ropeKvTokenMajorOverride().load(std::memory_order_relaxed);
+    return mode < 0 ? fromEnv : (mode <= kRopeKvTokenMajorVariants ? mode : 0);
+}
+
+// nullptr if ropeKvTokenMajorKernel covers this context-phase launch, else why not.
+template <int Dh, typename T, typename KVCacheBuffer>
+char const* ropeKvTokenMajorUnsupported(QKVPreprocessingParams<T, KVCacheBuffer> const& p)
+{
+    constexpr int kHeadsPerStep = 32 / (Dh * int(sizeof(T)) / 16);
+    if (p.generation_phase || p.cross_attention)
+    {
+        return "not a self-attention context launch";
+    }
+    if (p.q_only_input)
+    {
+        return "Q-only input";
+    }
+    if (!p.separate_q_kv_output || p.q_output == nullptr || p.q_output == p.qkv_input)
+    {
+        return "no separate Q output";
+    }
+    if (!p.quantized_fp8_output)
+    {
+        return "Q output is not FP8";
+    }
+    if (p.qkv_bias != nullptr)
+    {
+        return "QKV bias";
+    }
+    if (p.logn_scaling != nullptr)
+    {
+        return "logn scaling";
+    }
+    if (p.position_embedding_type != PositionEmbeddingType::kROPE_GPT_NEOX
+        && p.position_embedding_type != PositionEmbeddingType::kLONG_ROPE
+        && p.position_embedding_type != PositionEmbeddingType::kYARN)
+    {
+        return "position embedding type";
+    }
+    if (p.mrope_rotary_cos_sin != nullptr || p.rotary_coef_cache_buffer == nullptr)
+    {
+        return "cos/sin source";
+    }
+    if (p.rotary_embedding_dim <= 0 || p.rotary_embedding_dim > p.size_per_head)
+    {
+        return "rotary dimension";
+    }
+    if (p.spec_decoding_position_offsets != nullptr || p.helix_position_offsets != nullptr
+        || p.helix_is_inactive_rank != nullptr)
+    {
+        return "position offsets";
+    }
+    if (p.size_per_head != Dh || p.kv_head_num <= 0 || p.head_num % kHeadsPerStep != 0
+        || p.kv_head_num % kHeadsPerStep != 0 || p.head_num % p.kv_head_num != 0
+        || p.qheads_per_kv_head != p.head_num / p.kv_head_num)
+    {
+        return "head size or head counts";
+    }
+    if (p.token_num <= 0 || p.multi_processor_count <= 0
+        || ((p.tokens_info == nullptr || p.seq_lens == nullptr) && p.max_input_seq_len <= 0))
+    {
+        return "empty launch";
+    }
+    return nullptr;
+}
+
+template <typename VecT, typename T>
+inline __device__ VecT ropeKvTokenMajorLoad(T const* ptr)
+{
+    static_assert(sizeof(VecT) == sizeof(uint4), "16-byte vectors only");
+    // The input is not written by this kernel (separate Q output, paged KV), so the read-only path is safe.
+    uint4 const raw = __ldg(reinterpret_cast<uint4 const*>(ptr));
+    return *reinterpret_cast<VecT const*>(&raw);
+}
+
+// Q_BATCH: Q steps (HEADS_PER_STEP Q heads each) whose loads are issued before the first of them is rotated and
+// stored. MIN_BLOCKS: resident blocks per SM the register allocation must allow.
+template <typename T, typename TCache, int Dh, typename KVCacheBuffer, int Q_BATCH, int MIN_BLOCKS>
+__global__ void __launch_bounds__(kRopeKvTokenMajorThreads, MIN_BLOCKS) ropeKvTokenMajorKernel(
+    QKVPreprocessingParams<T, KVCacheBuffer> params)
+{
+    using VecT = typename VecType<T>::Type;
+    using QuantizedEltType = __nv_fp8_e4m3;
+    using GPTNeoXEltT = typename VecType<T>::GPTNeoXEltType;
+    constexpr int BYTES_PER_LOAD = 16;
+    constexpr int ELTS_PER_VEC = BYTES_PER_LOAD / sizeof(T);
+    constexpr int VECS_PER_HEAD = Dh * sizeof(T) / BYTES_PER_LOAD;
+    constexpr int HEADS_PER_STEP = WARP_SIZE / VECS_PER_HEAD;
+    static_assert(sizeof(VecT) == BYTES_PER_LOAD && WARP_SIZE % VECS_PER_HEAD == 0, "one head per lane group");
+    static_assert(sizeof(TCache) == 1, "8-bit KV cache only");
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
+
+    // The lane's channel of the head dimension: the same in every Q, K and V head it handles.
+    int const lane = threadIdx.x % WARP_SIZE;
+    int const channelIdx = lane % VECS_PER_HEAD;
+    int const headInStep = lane / VECS_PER_HEAD;
+    int const head_dim_idx = channelIdx * ELTS_PER_VEC;
+    bool const first_half = head_dim_idx < params.half_rotary_dim;
+    int const gptneox_rotary_dim_idx = first_half ? head_dim_idx : (head_dim_idx - params.half_rotary_dim);
+    bool const valid_rotary_dim_idx = head_dim_idx < params.rotary_embedding_dim;
+    float2 const masked_rotary_cos_sin = make_float2(1.0f, 0.0f);
+    int const rotated_head_dim_offset = first_half ? params.half_rotary_dim : -params.half_rotary_dim;
+    bool const variable_sequence_length = params.tokens_info != nullptr && params.seq_lens != nullptr;
+    bool const useKVCache = params.kv_cache_buffer.data != nullptr;
+    int const qSteps = params.head_num / HEADS_PER_STEP;
+    int const kvSteps = params.kv_head_num / HEADS_PER_STEP;
+
+    using TScale = typename mmha::kv_cache_scale_type_t<T, TCache>::Type;
+    TScale scaleOrigQuant;
+    mmha::convert_from_float(&scaleOrigQuant, params.qkv_scale_orig_quant ? params.qkv_scale_orig_quant[0] : 1.0f);
+
+    int const warpsPerBlock = blockDim.x / WARP_SIZE;
+    for (int token = blockIdx.x * warpsPerBlock + threadIdx.x / WARP_SIZE; token < params.token_num;
+         token += gridDim.x * warpsPerBlock)
+    {
+        // Metadata, as the V2 kernel derives it for a context-phase token.
+        int batch_idx, token_idx_in_seq;
+        if (variable_sequence_length)
+        {
+            auto const token_info = params.tokens_info[token];
+            batch_idx = token_info.x;
+            token_idx_in_seq = token_info.y;
+        }
+        else
+        {
+            batch_idx = token / params.max_input_seq_len;
+            token_idx_in_seq = token % params.max_input_seq_len;
+        }
+        int const cache_seq_len = params.cache_seq_lens[batch_idx];
+        int const actual_seq_len = variable_sequence_length ? params.seq_lens[batch_idx] : params.max_input_seq_len;
+        int const past_seq_len = (cache_seq_len - actual_seq_len);
+        bool valid_token = token_idx_in_seq < actual_seq_len;
+        token_idx_in_seq = std::min(actual_seq_len - 1, token_idx_in_seq);
+        int token_idx_in_kv_cache = past_seq_len + token_idx_in_seq;
+        valid_token = valid_token && (token_idx_in_kv_cache < cache_seq_len);
+        token_idx_in_kv_cache = std::min(token_idx_in_kv_cache, cache_seq_len - 1);
+        // The V2 kernel writes nothing for an invalid token (warp-uniform: one token per warp).
+        if (!valid_token)
+        {
+            continue;
+        }
+        int const rotary_position = token_idx_in_kv_cache;
+
+        // The lane's cos/sin, with the sign the V2 kernel gives the second half of the rotary dimension.
+        float2 rotary_coef[ELTS_PER_VEC];
+        {
+            float2 const* rotary_coef_cache_buffer = params.rotary_coef_cache_buffer
+                + static_cast<size_t>(rotary_position) * params.half_rotary_dim + gptneox_rotary_dim_idx;
+#pragma unroll
+            for (int elt_id = 0; elt_id < ELTS_PER_VEC; elt_id++)
+            {
+                float2 c = valid_rotary_dim_idx ? rotary_coef_cache_buffer[elt_id] : masked_rotary_cos_sin;
+                c.y = first_half ? -c.y : c.y;
+                rotary_coef[elt_id] = c;
+            }
+        }
+
+        T const* src = params.qkv_input + static_cast<size_t>(token) * params.hidden_size + head_dim_idx;
+        QuantizedEltType* qDst = reinterpret_cast<QuantizedEltType*>(params.q_output)
+            + static_cast<size_t>(token) * params.q_hidden_size + head_dim_idx;
+
+        // Q: rotate and quantize to the FP8 Q output.
+        for (int s0 = 0; s0 < qSteps; s0 += Q_BATCH)
+        {
+            VecT q[Q_BATCH];
+            VecT q_pair[Q_BATCH];
+#pragma unroll
+            for (int b = 0; b < Q_BATCH; ++b)
+            {
+                if (s0 + b < qSteps)
+                {
+                    int const off = ((s0 + b) * HEADS_PER_STEP + headInStep) * Dh;
+                    q[b] = ropeKvTokenMajorLoad<VecT>(src + off);
+                    q_pair[b] = ropeKvTokenMajorLoad<VecT>(src + off + rotated_head_dim_offset);
+                }
+            }
+#pragma unroll
+            for (int b = 0; b < Q_BATCH; ++b)
+            {
+                if (s0 + b < qSteps)
+                {
+#pragma unroll
+                    for (int elt_id = 0; elt_id < ELTS_PER_VEC; elt_id++)
+                    {
+                        GPTNeoXEltT& q_ = reinterpret_cast<GPTNeoXEltT*>(&q[b])[elt_id];
+                        GPTNeoXEltT q_pair_ = reinterpret_cast<GPTNeoXEltT*>(&q_pair[b])[elt_id];
+                        // The helper rotates a Q and a K element together; this lane's K slot is unused.
+                        GPTNeoXEltT k_unused = q_;
+                        mmha::apply_rotary_embedding_gptneox(q_, q_pair_, k_unused, q_pair_, rotary_coef[elt_id]);
+                    }
+                    int const off = ((s0 + b) * HEADS_PER_STEP + headInStep) * Dh;
+                    mmha::store_8bits_vec(qDst + off, q[b], 0, scaleOrigQuant);
+                }
+            }
+        }
+
+        if (!useKVCache)
+        {
+            continue;
+        }
+        // K and V: rotate K, quantize both into the paged KV cache.
+        auto* kDst
+            = reinterpret_cast<TCache*>(params.kv_cache_buffer.getKBlockPtr(batch_idx, token_idx_in_kv_cache));
+        auto* vDst
+            = reinterpret_cast<TCache*>(params.kv_cache_buffer.getVBlockPtr(batch_idx, token_idx_in_kv_cache));
+        T const* srcK = src + params.q_hidden_size;
+        T const* srcV = srcK + params.kv_hidden_size;
+        for (int s = 0; s < kvSteps; ++s)
+        {
+            int const kv_head_idx = s * HEADS_PER_STEP + headInStep;
+            int const off = kv_head_idx * Dh;
+            VecT k = ropeKvTokenMajorLoad<VecT>(srcK + off);
+            VecT k_pair = ropeKvTokenMajorLoad<VecT>(srcK + off + rotated_head_dim_offset);
+            VecT const v = ropeKvTokenMajorLoad<VecT>(srcV + off);
+#pragma unroll
+            for (int elt_id = 0; elt_id < ELTS_PER_VEC; elt_id++)
+            {
+                GPTNeoXEltT& k_ = reinterpret_cast<GPTNeoXEltT*>(&k)[elt_id];
+                GPTNeoXEltT k_pair_ = reinterpret_cast<GPTNeoXEltT*>(&k_pair)[elt_id];
+                // The helper rotates a Q and a K element together; this lane's Q slot is unused.
+                GPTNeoXEltT q_unused = k_;
+                mmha::apply_rotary_embedding_gptneox(q_unused, k_pair_, k_, k_pair_, rotary_coef[elt_id]);
+            }
+            int const inBlockIdx = params.kv_cache_buffer.getKVLocalIdx(
+                                       token_idx_in_kv_cache, kv_head_idx, VECS_PER_HEAD, channelIdx)
+                * ELTS_PER_VEC;
+            mmha::store_8bits_vec(kDst, k, inBlockIdx, scaleOrigQuant);
+            mmha::store_8bits_vec(vDst, v, inBlockIdx, scaleOrigQuant);
+            zeroPagedVCacheTail<T, TCache, VecT, /*GEN_PHASE=*/false>(params, batch_idx, token_idx_in_kv_cache,
+                cache_seq_len, kv_head_idx, VECS_PER_HEAD, channelIdx, /*isUniqueTokenWriter=*/true);
+        }
+    }
+
+    // Prepare values for fmha (the V2 kernel's block, run by one thread of the grid).
+    if (threadIdx.x == 0 && blockIdx.x == 0)
+    {
+        // Reset fmha tile counter to 0 before launching fmha kernels.
+        if (params.fmha_tile_counter)
+        {
+            params.fmha_tile_counter[0] = 0u;
+        }
+        // Take the quantization scales into consideration (8-bit KV cache: one scale for Q, K and V).
+        float const q_scale_quant_orig = params.qkv_scale_quant_orig ? params.qkv_scale_quant_orig[0] : 1.f;
+        float const k_scale_quant_orig = params.qkv_scale_quant_orig ? params.qkv_scale_quant_orig[0] : 1.f;
+        float const v_scale_quant_orig = params.qkv_scale_quant_orig ? params.qkv_scale_quant_orig[0] : 1.f;
+        float const o_scale_orig_quant = params.o_scale_orig_quant ? params.o_scale_orig_quant[0] : 1.f;
+        if (params.fmha_bmm1_scale)
+        {
+            // The scale after fmha bmm1.
+            params.fmha_bmm1_scale[0] = q_scale_quant_orig * k_scale_quant_orig * params.fmha_host_bmm1_scale;
+            // The scale prepared for log2 optimization.
+            constexpr float kLog2e = 1.4426950408889634074f;
+            params.fmha_bmm1_scale[1] = params.fmha_bmm1_scale[0] * kLog2e;
+        }
+        if (params.fmha_bmm2_scale)
+        {
+            // The scale after fmha bmm2.
+            params.fmha_bmm2_scale[0] = o_scale_orig_quant * v_scale_quant_orig;
+        }
+    }
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
+// Launches ropeKvTokenMajorKernel (variant 1..kRopeKvTokenMajorVariants) and returns true if it covers this launch,
+// else returns false (the caller runs the V2 kernel).
+template <typename T, typename TCache, int Dh, typename KVCacheBuffer>
+bool launchRopeKvTokenMajor(QKVPreprocessingParams<T, KVCacheBuffer> const& params, cudaStream_t stream, int variant)
+{
+    char const* const reason = ropeKvTokenMajorUnsupported<Dh>(params);
+    if (reason != nullptr)
+    {
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true))
+        {
+            std::fprintf(stderr,
+                "[TRT-LLM] [INFO] TLLM_GPTOSS_ROPEKV_TOKEN_MAJOR=%d: a context-phase launch keeps "
+                "applyBiasRopeUpdateKVCacheV2 (%s; heads %d/%d, head size %d, tokens %d); printed once\n",
+                variant, reason, params.head_num, params.kv_head_num, params.size_per_head, params.token_num);
+        }
+        return false;
+    }
+    using Params = QKVPreprocessingParams<T, KVCacheBuffer>;
+    void (*kernel)(Params) = variant == 2 ? ropeKvTokenMajorKernel<T, TCache, Dh, KVCacheBuffer, 2, 5>
+        : variant == 3                    ? ropeKvTokenMajorKernel<T, TCache, Dh, KVCacheBuffer, 4, 3>
+                                          : ropeKvTokenMajorKernel<T, TCache, Dh, KVCacheBuffer, 4, 4>;
+    constexpr int kWarpsPerBlock = kRopeKvTokenMajorThreads / WARP_SIZE;
+    // Grid-stride over tokens: at most one full occupancy of the SMs (2048 threads each), one token per warp.
+    int const numBlocks = std::min(int(divUp(params.token_num, kWarpsPerBlock)),
+        params.multi_processor_count * (2048 / kRopeKvTokenMajorThreads));
+    cudaLaunchConfig_t config;
+    config.gridDim = dim3(numBlocks);
+    config.blockDim = dim3(kRopeKvTokenMajorThreads);
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+    config.numAttrs = 1;
+    config.attrs = attrs;
+    cudaLaunchKernelEx(&config, kernel, params);
+    static std::atomic<bool> announced{false};
+    if (!announced.exchange(true))
+    {
+        std::fprintf(stderr,
+            "[TRT-LLM] [INFO] TLLM_GPTOSS_ROPEKV_TOKEN_MAJOR=%d active: context-phase RoPE + FP8 Q + paged KV write "
+            "run in ropeKvTokenMajorKernel (heads %d/%d, head size %d, rotary dim %d; first launch %d tokens, %d "
+            "blocks of %d threads)\n",
+            variant, params.head_num, params.kv_head_num, params.size_per_head, params.rotary_embedding_dim,
+            params.token_num, numBlocks, kRopeKvTokenMajorThreads);
+    }
+    return true;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// TLLM_GPTOSS_ROPEKV_GEN=1|2|3 (default unset = off): split-token generation-phase QKV preprocessing.
+//
+// A decode step runs one QKV preprocessing launch per attention layer on a few thousand tokens (requests x query
+// tokens per request). applyBiasRopeUpdateKVCacheV2 gives every Q head its own grid row (blockIdx.y), so for each token
+// each of the head_num Q-head rows reloads the token's metadata, its cos/sin and the paged-KV block pointers, and loads
+// and rotates the K vector and loads the V vector of its KV head, although only the first Q head of each KV head
+// stores them. At a few thousand tokens the launch moves little data; its instruction count and the latency of its
+// short dependent chains set its time.
+// ropeKvGenKernel gives each token WARPS_PER_TOKEN warps ("slices"): slice s owns the KV heads
+// [s * kvPerSlice, (s + 1) * kvPerSlice) and the Q heads that share them. A lane keeps one 16-byte channel of the head
+// dimension, so its cos/sin, the token's metadata and the block pointers are read once per lane and slice. The slice's
+// [Q heads | K heads | V heads] are walked in 512-byte steps (4 heads of 8 lanes); the loads of STEP_BATCH steps are
+// issued before the first of them is rotated, quantized and stored. Each K vector is loaded and rotated once and each V
+// vector loaded once.
+// Per element it runs the V2 kernel's helpers with the V2 kernel's operands, as ropeKvTokenMajorKernel does
+// (mmha::apply_rotary_embedding_gptneox with the same cos/sin and sign, mmha::store_8bits_vec with the same scale, the
+// KVBlockArray addressing, zeroPagedVCacheTail, the FMHA scale block and PDL), and it derives batch, position and
+// validity with the V2 kernel's own expressions (including speculative-decoding position offsets and the GEN_PHASE
+// specialisation the dispatch picks), so the FP8 Q, the paged K/V bytes and the FMHA scales it writes are the V2
+// kernel's.
+// It takes generation-phase launches only (params.generation_phase, as XqaDispatcher and
+// trtllm_gen_generation_preprocess set it), with a cos/sin cache and GPT-NeoX-style rotation (RoPE, long RoPE, YaRN),
+// BF16 QKV without bias, a separate FP8 Q output, an FP8 paged KV cache, head size 64, and KV heads divisible by the
+// variant's warps per token; everything else keeps the V2 kernel (ropeKvGenUnsupported). With the flag set, one line
+// goes to stderr at the first launch the kernel takes, and one at the first generation-phase launch it leaves to the V2
+// kernel, with the reason. The flag's value picks a variant (kRopeKvGenVariants; identical per-element work and
+// output): 1 = 4 warps per token, all of a slice's loads in flight (5 steps at 64/8 heads), up to 85 registers;
+// 2 = 8 warps per token, 3 steps, up to 64 registers; 3 = 2 warps per token, two rounds of 5 steps, up to 85
+// registers. Any other value is off. tllm_gptoss_ropekv_gen_override() (unfusedAttentionKernels_2_bf16_fp8.cu) sets
+// the mode per process for in-process A/B tests. Context-phase launches are TLLM_GPTOSS_ROPEKV_TOKEN_MAJOR's.
+
+constexpr int kRopeKvGenThreads = 128;
+constexpr int kRopeKvGenVariants = 3;
+
+// Process-wide mode: -1 follows TLLM_GPTOSS_ROPEKV_GEN, 0 keeps the V2 kernel, 1..3 takes the generation-phase
+// launches the split-token kernel covers with that variant.
+inline std::atomic<int>& ropeKvGenOverride()
+{
+    static std::atomic<int> mode{-1};
+    return mode;
+}
+
+// 0 = off, else the variant (1..kRopeKvGenVariants).
+inline int ropeKvGenVariant()
+{
+    static int const fromEnv = []
+    {
+        char const* v = std::getenv("TLLM_GPTOSS_ROPEKV_GEN");
+        if (v == nullptr || v[0] < '1' || v[0] > '0' + kRopeKvGenVariants || v[1] != '\0')
+        {
+            return 0;
+        }
+        return v[0] - '0';
+    }();
+    int const mode = ropeKvGenOverride().load(std::memory_order_relaxed);
+    return mode < 0 ? fromEnv : (mode <= kRopeKvGenVariants ? mode : 0);
+}
+
+// Warps per token of a variant.
+inline constexpr int ropeKvGenWarpsPerToken(int variant)
+{
+    return variant == 2 ? 8 : (variant == 3 ? 2 : 4);
+}
+
+// nullptr if ropeKvGenKernel covers this generation-phase launch with warpsPerToken warps per token, else why not.
+template <int Dh, typename T, typename KVCacheBuffer>
+char const* ropeKvGenUnsupported(QKVPreprocessingParams<T, KVCacheBuffer> const& p, int warpsPerToken)
+{
+    if (!p.generation_phase || p.cross_attention)
+    {
+        return "not a self-attention generation launch";
+    }
+    if (p.q_only_input)
+    {
+        return "Q-only input";
+    }
+    if (!p.separate_q_kv_output || p.q_output == nullptr || p.q_output == p.qkv_input)
+    {
+        return "no separate Q output";
+    }
+    if (!p.quantized_fp8_output)
+    {
+        return "Q output is not FP8";
+    }
+    if (p.qkv_bias != nullptr)
+    {
+        return "QKV bias";
+    }
+    if (p.logn_scaling != nullptr)
+    {
+        return "logn scaling";
+    }
+    if (p.position_embedding_type != PositionEmbeddingType::kROPE_GPT_NEOX
+        && p.position_embedding_type != PositionEmbeddingType::kLONG_ROPE
+        && p.position_embedding_type != PositionEmbeddingType::kYARN)
+    {
+        return "position embedding type";
+    }
+    if (p.mrope_rotary_cos_sin != nullptr || p.rotary_coef_cache_buffer == nullptr)
+    {
+        return "cos/sin source";
+    }
+    if (p.rotary_embedding_dim <= 0 || p.rotary_embedding_dim > p.size_per_head)
+    {
+        return "rotary dimension";
+    }
+    if (p.helix_position_offsets != nullptr || p.helix_is_inactive_rank != nullptr)
+    {
+        return "helix";
+    }
+    if (p.kv_cache_buffer.data == nullptr)
+    {
+        return "no KV cache";
+    }
+    if (p.size_per_head != Dh || p.kv_head_num <= 0 || p.head_num % p.kv_head_num != 0
+        || p.qheads_per_kv_head != p.head_num / p.kv_head_num || p.kv_head_num % warpsPerToken != 0)
+    {
+        return "head size or head counts";
+    }
+    if (p.token_num <= 0 || p.multi_processor_count <= 0 || p.max_input_seq_len <= 0)
+    {
+        return "empty launch";
+    }
+    return nullptr;
+}
+
+// GEN_PHASE: the V2 kernel's template flag for this launch (kernelV2DispatchHeadSize: a KV cache, one query token per
+// request and params.generation_phase). STEP_BATCH: steps (4 heads each) whose loads are issued before the first of
+// them is used. MIN_BLOCKS: resident blocks of kRopeKvGenThreads per SM the register allocation must allow.
+template <typename T, typename TCache, int Dh, typename KVCacheBuffer, bool GEN_PHASE, int WARPS_PER_TOKEN,
+    int STEP_BATCH, int MIN_BLOCKS>
+__global__ void __launch_bounds__(kRopeKvGenThreads, MIN_BLOCKS)
+    ropeKvGenKernel(QKVPreprocessingParams<T, KVCacheBuffer> params)
+{
+    using VecT = typename VecType<T>::Type;
+    using QuantizedEltType = __nv_fp8_e4m3;
+    using GPTNeoXEltT = typename VecType<T>::GPTNeoXEltType;
+    constexpr int BYTES_PER_LOAD = 16;
+    constexpr int ELTS_PER_VEC = BYTES_PER_LOAD / sizeof(T);
+    constexpr int VECS_PER_HEAD = Dh * sizeof(T) / BYTES_PER_LOAD;
+    constexpr int HEADS_PER_STEP = WARP_SIZE / VECS_PER_HEAD;
+    static_assert(sizeof(VecT) == BYTES_PER_LOAD && WARP_SIZE % VECS_PER_HEAD == 0, "one head per lane group");
+    static_assert(sizeof(TCache) == 1, "8-bit KV cache only");
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
+
+    // The lane's channel of the head dimension: the same in every Q, K and V head it handles.
+    int const lane = threadIdx.x % WARP_SIZE;
+    int const channelIdx = lane % VECS_PER_HEAD;
+    int const headInStep = lane / VECS_PER_HEAD;
+    int const head_dim_idx = channelIdx * ELTS_PER_VEC;
+    bool const first_half = head_dim_idx < params.half_rotary_dim;
+    int const gptneox_rotary_dim_idx = first_half ? head_dim_idx : (head_dim_idx - params.half_rotary_dim);
+    bool const valid_rotary_dim_idx = head_dim_idx < params.rotary_embedding_dim;
+    float2 const masked_rotary_cos_sin = make_float2(1.0f, 0.0f);
+    int const rotated_head_dim_offset = first_half ? params.half_rotary_dim : -params.half_rotary_dim;
+    bool const variable_sequence_length = params.tokens_info != nullptr && params.seq_lens != nullptr;
+    // Head slots of a slice: [qPerSlice Q heads | kvPerSlice K heads | kvPerSlice V heads].
+    int const kvPerSlice = params.kv_head_num / WARPS_PER_TOKEN;
+    int const qPerSlice = kvPerSlice * params.qheads_per_kv_head;
+    int const kEnd = qPerSlice + kvPerSlice;
+    int const slots = kEnd + kvPerSlice;
+    int const steps = (slots + HEADS_PER_STEP - 1) / HEADS_PER_STEP;
+
+    using TScale = typename mmha::kv_cache_scale_type_t<T, TCache>::Type;
+    TScale scaleOrigQuant;
+    mmha::convert_from_float(&scaleOrigQuant, params.qkv_scale_orig_quant ? params.qkv_scale_orig_quant[0] : 1.0f);
+
+    int const warpsPerBlock = blockDim.x / WARP_SIZE;
+    int const numItems = params.token_num * WARPS_PER_TOKEN;
+    for (int item = blockIdx.x * warpsPerBlock + threadIdx.x / WARP_SIZE; item < numItems;
+         item += gridDim.x * warpsPerBlock)
+    {
+        int const token = item / WARPS_PER_TOKEN;
+        int const slice = item % WARPS_PER_TOKEN;
+        int const qHead0 = slice * qPerSlice;
+        int const kvHead0 = slice * kvPerSlice;
+        T const* src = params.qkv_input + static_cast<size_t>(token) * params.hidden_size + head_dim_idx;
+        // Loads the vectors of steps [s0, s0 + STEP_BATCH): the slot's Q, K or V head, at its offset in the token's
+        // QKV row, and the rotary pair of a Q or K head.
+        VecT x[STEP_BATCH];
+        VecT x_pair[STEP_BATCH];
+        auto const loadSteps = [&](int s0)
+        {
+#pragma unroll
+            for (int b = 0; b < STEP_BATCH; ++b)
+            {
+                int const slot = (s0 + b) * HEADS_PER_STEP + headInStep;
+                if (s0 + b < steps && slot < slots)
+                {
+                    int const off = slot < qPerSlice ? (qHead0 + slot) * Dh
+                        : slot < kEnd                ? params.q_hidden_size + (kvHead0 + slot - qPerSlice) * Dh
+                                      : params.q_hidden_size + params.kv_hidden_size + (kvHead0 + slot - kEnd) * Dh;
+                    x[b] = ropeKvTokenMajorLoad<VecT>(src + off);
+                    if (slot < kEnd)
+                    {
+                        x_pair[b] = ropeKvTokenMajorLoad<VecT>(src + off + rotated_head_dim_offset);
+                    }
+                }
+            }
+        };
+        // The first steps' loads go out before the metadata chain below (cache length, then cos/sin and block
+        // pointers), so they overlap it. Every token < token_num has a QKV row; the V2 kernel also loads before its
+        // validity check.
+        loadSteps(0);
+        // Metadata, with the V2 kernel's expressions for this launch (GEN_PHASE as the dispatch picked it).
+        int batch_idx, token_idx_in_seq;
+        if constexpr (GEN_PHASE)
+        {
+            batch_idx = token;
+            token_idx_in_seq = 0;
+        }
+        else if (variable_sequence_length)
+        {
+            auto const token_info = params.tokens_info[token];
+            batch_idx = token_info.x;
+            token_idx_in_seq = token_info.y;
+        }
+        else
+        {
+            batch_idx = token / params.max_input_seq_len;
+            token_idx_in_seq = token % params.max_input_seq_len;
+        }
+        int const cache_seq_len = params.cache_seq_lens[batch_idx];
+        int const actual_seq_len = variable_sequence_length ? params.seq_lens[batch_idx] : params.max_input_seq_len;
+        int const past_seq_len = (cache_seq_len - actual_seq_len);
+        bool valid_token = GEN_PHASE || (token_idx_in_seq < actual_seq_len);
+        token_idx_in_seq = std::min(actual_seq_len - 1, token_idx_in_seq);
+        int token_idx_in_kv_cache = past_seq_len + token_idx_in_seq;
+        valid_token = valid_token && (token_idx_in_kv_cache < cache_seq_len);
+        token_idx_in_kv_cache = std::min(token_idx_in_kv_cache, cache_seq_len - 1);
+        // The V2 kernel writes nothing for an invalid token (warp-uniform: a slice is one token).
+        if (!valid_token)
+        {
+            continue;
+        }
+        int const rotary_position = params.spec_decoding_position_offsets != nullptr
+            ? (params.spec_decoding_position_offsets[token_idx_in_seq + batch_idx * params.max_input_seq_len]
+                + cache_seq_len - actual_seq_len)
+            : token_idx_in_kv_cache;
+
+        // The lane's cos/sin, with the sign the V2 kernel gives the second half of the rotary dimension.
+        float2 rotary_coef[ELTS_PER_VEC];
+        {
+            float2 const* rotary_coef_cache_buffer = params.rotary_coef_cache_buffer
+                + static_cast<size_t>(rotary_position) * params.half_rotary_dim + gptneox_rotary_dim_idx;
+#pragma unroll
+            for (int elt_id = 0; elt_id < ELTS_PER_VEC; elt_id++)
+            {
+                float2 c = valid_rotary_dim_idx ? rotary_coef_cache_buffer[elt_id] : masked_rotary_cos_sin;
+                c.y = first_half ? -c.y : c.y;
+                rotary_coef[elt_id] = c;
+            }
+        }
+        auto* kDst = reinterpret_cast<TCache*>(params.kv_cache_buffer.getKBlockPtr(batch_idx, token_idx_in_kv_cache));
+        auto* vDst = reinterpret_cast<TCache*>(params.kv_cache_buffer.getVBlockPtr(batch_idx, token_idx_in_kv_cache));
+
+        QuantizedEltType* qDst = reinterpret_cast<QuantizedEltType*>(params.q_output)
+            + static_cast<size_t>(token) * params.q_hidden_size + head_dim_idx;
+
+        for (int s0 = 0; s0 < steps; s0 += STEP_BATCH)
+        {
+            if (s0 > 0)
+            {
+                loadSteps(s0);
+            }
+#pragma unroll
+            for (int b = 0; b < STEP_BATCH; ++b)
+            {
+                int const slot = (s0 + b) * HEADS_PER_STEP + headInStep;
+                if (s0 + b < steps && slot < slots)
+                {
+                    if (slot < qPerSlice)
+                    {
+                        // Q: rotate and quantize to the FP8 Q output.
+#pragma unroll
+                        for (int elt_id = 0; elt_id < ELTS_PER_VEC; elt_id++)
+                        {
+                            GPTNeoXEltT& q_ = reinterpret_cast<GPTNeoXEltT*>(&x[b])[elt_id];
+                            GPTNeoXEltT q_pair_ = reinterpret_cast<GPTNeoXEltT*>(&x_pair[b])[elt_id];
+                            // The helper rotates a Q and a K element together; this lane's K slot is unused.
+                            GPTNeoXEltT k_unused = q_;
+                            mmha::apply_rotary_embedding_gptneox(q_, q_pair_, k_unused, q_pair_, rotary_coef[elt_id]);
+                        }
+                        mmha::store_8bits_vec(qDst + (qHead0 + slot) * Dh, x[b], 0, scaleOrigQuant);
+                    }
+                    else if (slot < kEnd)
+                    {
+                        // K: rotate and quantize into the paged KV cache.
+                        int const kv_head_idx = kvHead0 + slot - qPerSlice;
+#pragma unroll
+                        for (int elt_id = 0; elt_id < ELTS_PER_VEC; elt_id++)
+                        {
+                            GPTNeoXEltT& k_ = reinterpret_cast<GPTNeoXEltT*>(&x[b])[elt_id];
+                            GPTNeoXEltT k_pair_ = reinterpret_cast<GPTNeoXEltT*>(&x_pair[b])[elt_id];
+                            // The helper rotates a Q and a K element together; this lane's Q slot is unused.
+                            GPTNeoXEltT q_unused = k_;
+                            mmha::apply_rotary_embedding_gptneox(q_unused, k_pair_, k_, k_pair_, rotary_coef[elt_id]);
+                        }
+                        int const inBlockIdx = params.kv_cache_buffer.getKVLocalIdx(
+                                                   token_idx_in_kv_cache, kv_head_idx, VECS_PER_HEAD, channelIdx)
+                            * ELTS_PER_VEC;
+                        mmha::store_8bits_vec(kDst, x[b], inBlockIdx, scaleOrigQuant);
+                    }
+                    else
+                    {
+                        // V: quantize into the paged KV cache.
+                        int const kv_head_idx = kvHead0 + slot - kEnd;
+                        int const inBlockIdx = params.kv_cache_buffer.getKVLocalIdx(
+                                                   token_idx_in_kv_cache, kv_head_idx, VECS_PER_HEAD, channelIdx)
+                            * ELTS_PER_VEC;
+                        mmha::store_8bits_vec(vDst, x[b], inBlockIdx, scaleOrigQuant);
+                        zeroPagedVCacheTail<T, TCache, VecT, GEN_PHASE>(params, batch_idx, token_idx_in_kv_cache,
+                            cache_seq_len, kv_head_idx, VECS_PER_HEAD, channelIdx, /*isUniqueTokenWriter=*/true);
+                    }
+                }
+            }
+        }
+    }
+
+    // Prepare values for fmha (the V2 kernel's block, run by one thread of the grid).
+    if (threadIdx.x == 0 && blockIdx.x == 0)
+    {
+        // Reset fmha tile counter to 0 before launching fmha kernels.
+        if (params.fmha_tile_counter)
+        {
+            params.fmha_tile_counter[0] = 0u;
+        }
+        // Take the quantization scales into consideration (8-bit KV cache: one scale for Q, K and V).
+        float const q_scale_quant_orig = params.qkv_scale_quant_orig ? params.qkv_scale_quant_orig[0] : 1.f;
+        float const k_scale_quant_orig = params.qkv_scale_quant_orig ? params.qkv_scale_quant_orig[0] : 1.f;
+        float const v_scale_quant_orig = params.qkv_scale_quant_orig ? params.qkv_scale_quant_orig[0] : 1.f;
+        float const o_scale_orig_quant = params.o_scale_orig_quant ? params.o_scale_orig_quant[0] : 1.f;
+        if (params.fmha_bmm1_scale)
+        {
+            // The scale after fmha bmm1.
+            params.fmha_bmm1_scale[0] = q_scale_quant_orig * k_scale_quant_orig * params.fmha_host_bmm1_scale;
+            // The scale prepared for log2 optimization.
+            constexpr float kLog2e = 1.4426950408889634074f;
+            params.fmha_bmm1_scale[1] = params.fmha_bmm1_scale[0] * kLog2e;
+        }
+        if (params.fmha_bmm2_scale)
+        {
+            // The scale after fmha bmm2.
+            params.fmha_bmm2_scale[0] = o_scale_orig_quant * v_scale_quant_orig;
+        }
+    }
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
+template <typename T, typename TCache, int Dh, typename KVCacheBuffer, bool GEN_PHASE>
+auto ropeKvGenKernelFor(int variant) -> void (*)(QKVPreprocessingParams<T, KVCacheBuffer>)
+{
+    return variant == 2 ? ropeKvGenKernel<T, TCache, Dh, KVCacheBuffer, GEN_PHASE, ropeKvGenWarpsPerToken(2), 3, 8>
+        : variant == 3  ? ropeKvGenKernel<T, TCache, Dh, KVCacheBuffer, GEN_PHASE, ropeKvGenWarpsPerToken(3), 5, 6>
+                        : ropeKvGenKernel<T, TCache, Dh, KVCacheBuffer, GEN_PHASE, ropeKvGenWarpsPerToken(1), 5, 6>;
+}
+
+// Launches ropeKvGenKernel (variant 1..kRopeKvGenVariants) and returns true if it covers this generation-phase launch,
+// else returns false (the caller runs the V2 kernel). genPhaseKernel: the V2 kernel's GEN_PHASE for this launch.
+template <typename T, typename TCache, int Dh, typename KVCacheBuffer>
+bool launchRopeKvGen(
+    QKVPreprocessingParams<T, KVCacheBuffer> const& params, cudaStream_t stream, int variant, bool genPhaseKernel)
+{
+    int const warpsPerToken = ropeKvGenWarpsPerToken(variant);
+    char const* const reason = ropeKvGenUnsupported<Dh>(params, warpsPerToken);
+    if (reason != nullptr)
+    {
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true))
+        {
+            std::fprintf(stderr,
+                "[TRT-LLM] [INFO] TLLM_GPTOSS_ROPEKV_GEN=%d: a generation-phase launch keeps "
+                "applyBiasRopeUpdateKVCacheV2 (%s; heads %d/%d, head size %d, tokens %d); printed once\n",
+                variant, reason, params.head_num, params.kv_head_num, params.size_per_head, params.token_num);
+        }
+        return false;
+    }
+    using Params = QKVPreprocessingParams<T, KVCacheBuffer>;
+    void (*kernel)(Params) = genPhaseKernel ? ropeKvGenKernelFor<T, TCache, Dh, KVCacheBuffer, true>(variant)
+                                            : ropeKvGenKernelFor<T, TCache, Dh, KVCacheBuffer, false>(variant);
+    constexpr int kWarpsPerBlock = kRopeKvGenThreads / WARP_SIZE;
+    // One warp per (token, slice); grid-stride beyond 16 blocks per SM.
+    int64_t const numWarps = static_cast<int64_t>(params.token_num) * warpsPerToken;
+    int const numBlocks = static_cast<int>(
+        std::min<int64_t>((numWarps + kWarpsPerBlock - 1) / kWarpsPerBlock, params.multi_processor_count * 16));
+    cudaLaunchConfig_t config;
+    config.gridDim = dim3(numBlocks);
+    config.blockDim = dim3(kRopeKvGenThreads);
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+    config.numAttrs = 1;
+    config.attrs = attrs;
+    cudaLaunchKernelEx(&config, kernel, params);
+    static std::atomic<bool> announced{false};
+    if (!announced.exchange(true))
+    {
+        std::fprintf(stderr,
+            "[TRT-LLM] [INFO] TLLM_GPTOSS_ROPEKV_GEN=%d active: generation-phase RoPE + FP8 Q + paged KV write run "
+            "in ropeKvGenKernel (heads %d/%d, head size %d, rotary dim %d, %d warps per token; first launch %d "
+            "tokens, %d per request, spec offsets %d, %d blocks of %d threads)\n",
+            variant, params.head_num, params.kv_head_num, params.size_per_head, params.rotary_embedding_dim,
+            warpsPerToken, params.token_num, params.max_input_seq_len,
+            params.spec_decoding_position_offsets != nullptr ? 1 : 0, numBlocks, kRopeKvGenThreads);
+    }
+    return true;
+}
+
 // Use more blocks for the batch dimension in the generation phase.
 #define APPLY_BIAS_ROPE_UPDATE_KV_CACHE(Dh_MAX, ADD_BIAS, GEN_PHASE, STORE_QKV, DYNAMIC_ROTARY_SCALING, FP8_OUTPUT)    \
     dim3 block(WARP_SIZE, 1);                                                                                          \
@@ -1417,6 +2214,28 @@ void kernelV2DispatchHeadSize(QKVPreprocessingParams<T, KVCacheBuffer> params, c
     int const tokens_per_cuda_block = BLOCK_SIZE / vecs_per_head;
     bool generation_phase
         = (params.kv_cache_buffer.data != nullptr) && (params.max_input_seq_len == 1) && params.generation_phase;
+
+    if constexpr (kRopeKvTokenMajorInstantiated<T, TCache, KVCacheBuffer, Dh>)
+    {
+        // TLLM_GPTOSS_ROPEKV_TOKEN_MAJOR: the context-phase launches the token-major kernel covers.
+        if (!params.generation_phase)
+        {
+            int const variant = ropeKvTokenMajorVariant();
+            if (variant > 0 && launchRopeKvTokenMajor<T, TCache, Dh>(params, stream, variant))
+            {
+                return;
+            }
+        }
+        // TLLM_GPTOSS_ROPEKV_GEN: the generation-phase launches the split-token kernel covers.
+        else
+        {
+            int const variant = ropeKvGenVariant();
+            if (variant > 0 && launchRopeKvGen<T, TCache, Dh>(params, stream, variant, generation_phase))
+            {
+                return;
+            }
+        }
+    }
 
     if (add_bias)
     {
