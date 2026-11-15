@@ -3001,6 +3001,8 @@ class FakeWorker:
         self.queries = []
         #: What the last `wait_for_save` queued; see `submit_saves`.
         self.submitted = set()
+        #: Chain mode off, as on a worker started without TRTLLM_MOONCAKE_CHAIN.
+        self._chain = None
 
     def count_prefix_hit(self, block_hashes):
         self.queries.append(list(block_hashes))

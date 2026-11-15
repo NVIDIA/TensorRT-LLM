@@ -157,6 +157,21 @@ class BlockHashChain:
         """Hashes computed so far, indexed by block ordinal."""
         return self._hashes
 
+    @property
+    def seed(self) -> bytes:
+        """The chain's root: scope and prompt lookahead; chains with equal seeds hash tokens alike."""
+        return self._seed
+
+    def adopt_prefix(self, hashes: Sequence[bytes]) -> None:
+        """Start from the first hashes of a chain with the same seed over the same leading tokens.
+
+        The caller guarantees the tokens those blocks cover (their lookahead included) are equal; `extend`
+        then hashes only the blocks after them.
+        """
+        if self._hashes:
+            raise ValueError("adopt_prefix needs an empty chain")
+        self._hashes = list(hashes)
+
     def extend(self, tokens: Sequence[int]) -> Sequence[bytes]:
         """Grow the chain to cover every full block of `tokens`.
 

@@ -490,6 +490,8 @@ def _launch_master(
         f"--metrics_port={metrics_port}",
         f"--eviction_ratio={eviction_ratio}",
     ]
+    # Extra master flags (e.g. the eviction high watermark, the KV lease TTL), space separated.
+    command.extend(os.environ.get("TRTLLM_MOONCAKE_MASTER_EXTRA_ARGS", "").split())
 
     logger.warning(f"mooncake-store: starting {' '.join(command)} on {host}")
     with open(log_path, "wb") as log_file:

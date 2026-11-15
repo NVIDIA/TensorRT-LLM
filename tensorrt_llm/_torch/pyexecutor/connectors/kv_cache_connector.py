@@ -2037,6 +2037,17 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             request.state = LlmRequestState.CONTEXT_INIT
             self.finished_async_loading_requests[request.request_id] = request
 
+    def needs_alloc_pages(self, req: LlmRequest) -> bool:
+        """Whether `update_state_after_alloc` reads `req`'s page lists.
+
+        True unless the scheduler implements `needs_alloc_pages` and says no, so
+        the caller may skip gathering page indices nobody reads.
+        """
+        if self.scheduler is None or self.capacity_only or _is_dummy_request(req):
+            return False  # update_state_after_alloc returns before reading them
+        ask = getattr(self.scheduler, "needs_alloc_pages", None)
+        return True if ask is None else bool(ask(req))
+
     def update_state_after_alloc(
         self,
         req: LlmRequest,

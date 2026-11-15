@@ -84,6 +84,7 @@ from tensorrt_llm.logger import logger
 from ..kv_cache_connector import AllocationFence, KvCacheConnectorWorker
 from ..kv_cache_layout import KvCacheLayout
 from .addressing import PageAddressing
+from .chain import CHAIN_ENV, HostChain, chain_enabled
 from .config import (
     CONFIG_PATH_ENV,
     MooncakeStoreConnectorConfig,
@@ -546,6 +547,8 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         self._model_key = self._config.resolve_model_key(llm_args.model)
 
         self._addressing: Optional[PageAddressing] = None
+        # Chain mode: writes the host tier's evictees to the pool (see chain.py).
+        self._chain: Optional[HostChain] = None
         # Namespaces for this rank's attention shard, used for both directions
         # of transfer.
         self._namespaces: Dict[int, KeyNamespace] = {}
@@ -795,6 +798,16 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                 ) from startup_error
         if self._async_load:
             self._start_load_threads()
+
+        if chain_enabled() and self._config.role.loads:
+            from . import settings as _settings
+
+            if _settings.HOST_TIER_MANAGER is None:
+                raise RuntimeError(
+                    f"{CHAIN_ENV}=1 but no KV cache manager kept a host tier under the "
+                    "connector, so there is no host tier to chain the pool behind"
+                )
+            self._chain = HostChain(self, _settings.HOST_TIER_MANAGER, layout)
 
         logger.warning(
             f"mooncake-store worker rank {self._rank} registered layout: {addressing.describe()}"
@@ -1295,6 +1308,10 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
         first_failure: Optional[str] = None
         num_failed_pages = 0
         loaded_bytes = 0
+        chain = self._chain
+        exclusive_landed: Optional[List[Tuple[str, int]]] = (
+            [] if chain is not None and chain.exclusive else None
+        )
 
         for start in range(0, len(keys), batch_size):
             indices = [
@@ -1354,6 +1371,16 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
                 # these pages, so the scatter has to complete before either.
                 with _timed_phase(phases, "sync"):
                     _sync_stream(handle)
+            if exclusive_landed is not None and landed:
+                exclusive_landed.extend(
+                    (batch_keys[position], owners[indices[position]]) for position in landed
+                )
+        if exclusive_landed:
+            # Exclusive pool: the pages are in GPU pages now, so their pool copies go (after the chain's removal
+            # delay). A request that lost a page restarts without the prefix, so its pages keep their copies.
+            chain.on_loaded(
+                [key for key, owner in exclusive_landed if owner not in failed_requests]
+            )
         return failed_requests, num_failed_pages, first_failure, loaded_bytes
 
     # ---- asynchronous load path ----
@@ -1375,6 +1402,15 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
             metadata: This iteration's `MooncakeStoreMetadata`.
         """
         super().bind_connector_meta(metadata)
+        chain_map = getattr(metadata, "chain_map", None)
+        if chain_map and self._chain is not None:
+            # Chain mode: every rank learns the radix key -> connector block hash of the blocks computed this iteration.
+            try:
+                self._chain.apply_map(chain_map)
+            except Exception as exc:  # never raise here (outside the failure vote)
+                logger.error(
+                    f"mooncake-store rank {self._rank}: chain map apply failed: {type(exc).__name__}: {exc}"
+                )
         async_loads = getattr(metadata, "async_loads", None)
         if not async_loads:
             return
@@ -1941,6 +1977,9 @@ class MooncakeStoreConnectorWorker(KvCacheConnectorWorker):
 
     def shutdown(self) -> None:
         """Stop the transfer threads, then release what they used. Idempotent."""
+        if self._chain is not None:
+            chain, self._chain = self._chain, None
+            chain.shutdown()
         # What accumulated since the last line would otherwise be lost.
         self._maybe_log_hole_stats(force=True)
         self._maybe_log_load_stats(force=True)

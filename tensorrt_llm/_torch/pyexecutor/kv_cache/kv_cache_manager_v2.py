@@ -193,6 +193,10 @@ KV_CACHE_ITERATION_STATS_POOL_GROUP_FIELDS = tuple(
 # Shared by capacity estimation and growth, in addition to speculative tokens.
 BASE_GENERATION_TOKEN_COUNT = 1
 
+# Ask the KV connector whether it reads a request's page lists before gathering them for the
+# allocation report (mooncake-store connector with TRTLLM_MOONCAKE_CARRY=1).
+_SKIP_UNUSED_CONNECTOR_GATHER = os.environ.get("TRTLLM_MOONCAKE_CARRY", "0") == "1"
+
 # Readable name per CacheTier, used only to label level-indexed counters. The levels themselves
 # come from the configured tier list, so several levels may share a name. Keyed by the enum
 # member because the C++ backend binds CacheTier as a plain nanobind enum, not an IntEnum.
@@ -7784,7 +7788,16 @@ class KVCacheManagerV2(BaseResourceManager):
             # Both forms are offered; the manager picks the one this connector
             # implements. With several layer groups the flat list is empty,
             # because a page index is scoped to a group.
-            by_group = self.get_page_indices_by_layer_group(request)
+            needs_pages = (
+                getattr(self.kv_connector_manager, "needs_alloc_pages", None)
+                if _SKIP_UNUSED_CONNECTOR_GATHER
+                else None
+            )
+            if needs_pages is not None and not needs_pages(request):
+                # One empty list per group, the same call shape: the report returns before reading them.
+                by_group = [[] for _ in range(len(self.impl.layer_grouping))]
+            else:
+                by_group = self.get_page_indices_by_layer_group(request)
             flat = by_group[0] if len(by_group) == 1 else []
             self.kv_connector_manager.update_state_after_alloc(request, flat, by_group)
 

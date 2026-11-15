@@ -23,7 +23,7 @@ namespace, so one work list serves every shard.
 """
 
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Tuple
 
 __all__ = ["MooncakeStoreMetadata", "PageTransfer", "RequestTransfers"]
 
@@ -66,7 +66,11 @@ class MooncakeStoreMetadata:
     #: cache manager's allocation fence. Under TP the scheduler exists on rank 0
     #: only and every rank loads its own shard of the parked request's pages.
     async_loads: List[RequestTransfers] = field(default_factory=list)
+    #: Chain mode: (radix block key, connector block hash) of the blocks computed
+    #: this iteration, so every rank (tensor-parallel followers included, which
+    #: have no scheduler) can name its evicted host pages in the pool.
+    chain_map: List[Tuple[bytes, bytes]] = field(default_factory=list)
 
     def __bool__(self) -> bool:
         """Whether there is any work at all this iteration."""
-        return bool(self.loads or self.saves or self.async_loads)
+        return bool(self.loads or self.saves or self.async_loads or self.chain_map)

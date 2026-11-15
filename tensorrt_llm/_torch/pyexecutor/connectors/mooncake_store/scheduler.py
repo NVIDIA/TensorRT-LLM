@@ -40,6 +40,8 @@ same iteration's metadata, which they bind after the KV cache manager's
 allocation fence.
 """
 
+import os
+from collections import OrderedDict
 from typing import Dict, List, Optional, Tuple
 
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequest
@@ -55,6 +57,29 @@ from .validation import validate_attention_dp_config, validate_llm_args
 from .worker import MooncakeStoreConnectorWorker, resolve_local_worker
 
 __all__ = ["MooncakeStoreConnectorScheduler"]
+
+# Carry a conversation's hash chain into its next turn, skip the token copy of a repeated query whose chain already
+# covers the prompt, and let KVCacheManagerV2 skip the page-index gather when no asynchronous offer will read it.
+_CARRY = os.environ.get("TRTLLM_MOONCAKE_CARRY", "0") == "1"
+# Conversations whose last turn is remembered for carrying.
+_CARRY_MAX = int(os.environ.get("TRTLLM_MOONCAKE_CARRY_MAX", "") or 256)
+
+
+def _common_prefix_tokens(a, b, tokens_per_block: int) -> int:
+    """Tokens a and b share from the start: exact when one extends the other, else rounded down to a block."""
+    n = min(len(a), len(b))
+    if (a if len(a) == n else a[:n]) == (b if len(b) == n else b[:n]):
+        return n
+    span = 64 * tokens_per_block
+    for c in range(0, n, span):
+        e = min(n, c + span)
+        if a[c:e] != b[c:e]:
+            for s in range(c, e, tokens_per_block):
+                t = min(e, s + tokens_per_block)
+                if a[s:t] != b[s:t]:
+                    return s
+            return c  # unreachable: some block of the span differs
+    return n
 
 
 def _multimodal_item_digests(request: LlmRequest) -> Optional[Tuple[bytes, ...]]:
@@ -194,6 +219,8 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         # `None` of an unestablished span never keys a page.
         self._prompt_lookahead = draft_prompt_lookahead(spec_config) or 0
         self._requests: Dict[int, _RequestState] = {}
+        # (conversation id, chain seed) -> (tokens, hashes, blocks) of its last turn, oldest first; see `_carry_in`.
+        self._turns: "OrderedDict[tuple, tuple]" = OrderedDict()
         self._worker: Optional[MooncakeStoreConnectorWorker] = None
         # Saves bound in the last metadata, by request: the block ordinal they
         # end at. Settled by `_confirm_submitted_saves` at the next build.
@@ -248,8 +275,20 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
             # since `build_connector_meta` skips requests it has no state for.
             return 0, False
 
-        tokens = request.get_tokens(0)
-        state = self._state_for(request, tokens, scope)
+        if _CARRY:
+            state = self._requests.get(request.request_id)
+            num_tokens = request.get_num_tokens(0)
+            if state is None or len(state.chain.hashes) < (
+                max(0, num_tokens - self._prompt_lookahead) // self._tokens_per_block
+            ):
+                tokens = request.get_tokens(0)
+                num_tokens = len(tokens)
+                state = self._state_for(request, tokens, scope)
+            # Otherwise the chain already covers every full block of the prompt: no token copy, nothing to hash.
+        else:
+            tokens = request.get_tokens(0)
+            num_tokens = len(tokens)
+            state = self._state_for(request, tokens, scope)
         # Every query replaces the outstanding offer, which is what makes a
         # repeated admission-time query harmless.
         state.load_first_block = 0
@@ -275,7 +314,7 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         # Stop one token short of the prompt: the runtime still has to run a
         # forward pass for this request, and it cannot do that with nothing left
         # to compute.
-        last_block = (len(tokens) - 1) // self._tokens_per_block
+        last_block = (num_tokens - 1) // self._tokens_per_block
         candidates = state.chain.hashes[first_block:last_block]
         if not candidates:
             return 0, False
@@ -424,7 +463,18 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
             # iteration the runtime allocated pages to hold it.
             state.load_blocks = 0
 
-            if self._config.role.saves:
+            chain = self._require_worker()._chain
+            if chain is not None:
+                # Chain mode: nothing is written on compute. Remember each computed
+                # block's radix key, so the host tier's eviction can name it in the pool.
+                _, computed_end = self._saves_for(state, request_data, num_loaded_tokens)
+                metadata.chain_map.extend(
+                    chain.map_blocks(
+                        request_data.request_id, state.tokens, state.chain.hashes, computed_end
+                    )
+                )
+                state.saved_upto = max(state.saved_upto, computed_end)
+            elif self._config.role.saves:
                 saves, saves_end = self._saves_for(state, request_data, num_loaded_tokens)
                 if saves.pages:
                     state.emitted_saves = True
@@ -452,6 +502,9 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
             overwrite bytes mid-transfer.
         """
         state = self._requests.pop(request.request_id, None)
+        chain = self._worker._chain if self._worker is not None else None
+        if chain is not None:
+            chain.forget(request.request_id)
         return bool(state is not None and state.emitted_saves)
 
     def request_reset(self, request: LlmRequest) -> None:
@@ -466,6 +519,10 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
         """
         self._requests.pop(request.request_id, None)
         self._unconfirmed_saves.pop(request.request_id, None)
+        chain = self._worker._chain if self._worker is not None else None
+        if chain is not None:
+            # The next attempt re-maps from block 0 (idempotent pairs); drop this attempt's key iterator.
+            chain.forget(request.request_id)
         self._pending_async_loads = [
             transfers
             for transfers in self._pending_async_loads
@@ -542,10 +599,68 @@ class MooncakeStoreConnectorScheduler(KvCacheConnectorScheduler):
                 )
             )
             self._requests[request.request_id] = state
+            if _CARRY:
+                self._carry_in(request, state.chain, tokens)
+                state.chain.extend(tokens)
+                self._remember_turn(request, state.chain, tokens)
+                return state
         # The lookup runs before the request is scheduled, so the chain has to
         # be ready before any scheduler output exists.
         state.chain.extend(tokens)
         return state
+
+    # ---- hash-chain carry across conversation turns ----
+
+    def _chain_count(self, **deltas: int) -> None:
+        chain = self._worker._chain if self._worker is not None else None
+        if chain is not None:
+            chain.count(**deltas)
+
+    @staticmethod
+    def _conversation_id(request: LlmRequest):
+        params = getattr(request, "py_conversation_params", None)
+        return getattr(params, "conversation_id", None) if params is not None else None
+
+    def _carry_in(self, request: LlmRequest, chain: BlockHashChain, tokens: List[int]) -> None:
+        """Start `chain` from the conversation's previous turn over their common whole-block token prefix."""
+        turns = self._turns
+        cid = self._conversation_id(request)
+        if cid is None:
+            self._chain_count(carry_nocid=1)
+            return
+        entry = turns.get((cid, chain.seed))
+        if entry is None:
+            self._chain_count(carry_miss=1)
+            return
+        old_tokens, old_hashes, old_blocks = entry
+        tpb = self._tokens_per_block
+        common = _common_prefix_tokens(tokens, old_tokens, tpb)
+        # A block's hash also covers the lookahead tokens after it, so those must be common too.
+        blocks = min(old_blocks, max(0, common - self._prompt_lookahead) // tpb)
+        if common < min(len(tokens), len(old_tokens)):
+            self._chain_count(carry_edited=1)
+        if blocks > 0:
+            chain.adopt_prefix(old_hashes[:blocks])
+            self._chain_count(carry_hits=1, carry_blocks=blocks)
+        else:
+            self._chain_count(carry_miss=1)
+
+    def _remember_turn(self, request: LlmRequest, chain: BlockHashChain, tokens: List[int]) -> None:
+        """Remember this turn's tokens and hashes for the conversation's next turn."""
+        cid = self._conversation_id(request)
+        if cid is None:
+            return
+        turns = self._turns
+        key = (cid, chain.seed)
+        turns[key] = (tokens, chain.hashes, len(chain.hashes))
+        turns.move_to_end(key)
+        while len(turns) > _CARRY_MAX:
+            turns.popitem(last=False)
+
+    def needs_alloc_pages(self, request: LlmRequest) -> bool:
+        """Whether the allocation report will read this request's page lists: only an asynchronous offer does."""
+        state = self._requests.get(request.request_id)
+        return state is not None and state.load_blocks > 0 and state.load_async
 
     def _record_pages(self, state: _RequestState, request_data: RequestData) -> None:
         """Append this step's newly allocated page indices, by block ordinal."""
