@@ -278,13 +278,16 @@ class DecodeCudaGraphConfig(BaseCudaGraphConfig):
             "greedily; 'advanced' serves batches with a sampled request, one whose "
             "temperature, top-k, top-p or min-p does not resolve to greedy decoding "
             "(a seed or a penalty alone does not); 'temperature_only' serves sampled "
-            "batches whose sampled requests set only a temperature, on models whose "
-            "MTP-Eagle one-model decode samples vocabulary-sharded logits (the "
-            "spec-decode fast paths; today Qwen3.5 checkpoints on SM 10.0/10.3 GPUs) "
-            "with tensor parallelism, without attention DP, relaxed acceptance, "
-            "rejection sampling, penalties or watermark_config; on other "
-            "models the first capture rejects it. By default every variant the "
-            "engine supports is captured. "
+            "batches whose sampled requests set only a temperature, where the "
+            "target tokens are sampled from vocabulary-sharded logits: MTP-Eagle "
+            "one-model decode on models with the spec-decode fast paths (today "
+            "Qwen3.5 checkpoints on SM 10.0/10.3 GPUs) with tensor parallelism, "
+            "without attention DP, relaxed acceptance or watermark_config; or a "
+            "DSpark draft embedded in the target checkpoint (the DeepSeek-V4 "
+            "family) with tensor parallelism, or with attention DP and "
+            "enable_lm_head_tp_in_adp. Both need no rejection sampling or "
+            "penalties; elsewhere the first capture rejects it. By default every "
+            "variant the engine supports is captured. "
             "Without 'temperature_only', temperature-only batches use "
             "'advanced'. Without 'greedy', greedy batches use the sampled graphs "
             "('temperature_only' if listed, else 'advanced') and still decode "
@@ -293,8 +296,9 @@ class DecodeCudaGraphConfig(BaseCudaGraphConfig):
             "'advanced', and lose the argmax fast paths: with rejection sampling, "
             "argmax drafting and its LM-head-TP path, and the vocabulary-sharded "
             "target argmax where the model has one (models with the spec-decode fast "
-            "paths keep it by listing 'temperature_only', unless they use rejection "
-            "sampling; DFlash with tensor parallelism keeps its shard selection "
+            "paths and embedded DSpark drafts keep it by listing "
+            "'temperature_only', unless they use rejection sampling; DFlash with "
+            "tensor parallelism keeps its shard selection "
             "without rejection sampling and with advanced_sampling_mode "
             "'no_topk_no_topp'). Without 'advanced', a sampled batch that "
             "'temperature_only' does not serve runs eagerly; under attention DP the "
@@ -9637,20 +9641,27 @@ class TorchLlmArgs(BaseLlmArgs):
         from tensorrt_llm._torch.speculative.interface import \
             supports_sharded_target_sampling
 
+        # Only an embedded DSpark draft samples target tokens from vocabulary shards.
+        dspark_shards = (
+            spec_config.spec_dec_mode.is_dspark()
+            and spec_config.draft_is_embedded_in_target
+            and (self.enable_lm_head_tp_in_adp if self.enable_attention_dp else
+                 self.tensor_parallel_size > 1))
         # Batches never select temperature_only with rejection sampling,
         # penalties or a watermark.
         if (spec_config.use_rejection_sampling or spec_config.enable_penalty
                 or self.watermark_config is not None
-                or not supports_sharded_target_sampling(
+                or not (dspark_shards or supports_sharded_target_sampling(
                     spec_config,
                     types.SimpleNamespace(
                         tp_size=self.tensor_parallel_size,
-                        enable_attention_dp=self.enable_attention_dp))):
+                        enable_attention_dp=self.enable_attention_dp)))):
             raise ValueError(
                 "cuda_graph_config.sampling_variants lists 'temperature_only', which "
                 "needs MTP-Eagle one-model decoding with tensor parallelism and without "
-                "attention DP, relaxed acceptance, rejection sampling, penalties or "
-                "watermark_config")
+                "attention DP or relaxed acceptance, or an embedded DSpark draft with "
+                "tensor parallelism or with attention DP and enable_lm_head_tp_in_adp, "
+                "and no rejection sampling, penalties or watermark_config")
         return self
 
     @model_validator(mode="after")

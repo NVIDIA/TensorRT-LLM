@@ -439,9 +439,11 @@ One-engine speculative decoding captures its decode CUDA graphs once per samplin
 batches whose requests all decode greedily, `advanced` for batches with a sampled request (one whose
 temperature, top-k, top-p or min-p does not resolve to greedy decoding; a seed or a penalty alone does not),
 and `temperature_only` for sampled batches whose sampled requests set only a temperature. `temperature_only`
-needs a model whose MTP-Eagle one-model decode samples vocabulary-sharded logits (the spec-decode fast paths;
-today Qwen3.5 checkpoints on SM 10.0/10.3 GPUs), tensor parallelism, and no attention DP, relaxed acceptance,
-rejection sampling, penalties or `watermark_config`; on other models the first CUDA graph capture rejects it.
+needs target tokens sampled from vocabulary-sharded logits: MTP-Eagle one-model decode on a model with the
+spec-decode fast paths (today Qwen3.5 checkpoints on SM 10.0/10.3 GPUs) with tensor parallelism and without
+attention DP, relaxed acceptance or `watermark_config`, or a DSpark draft embedded in the target checkpoint (the
+DeepSeek-V4 family) with tensor parallelism or with attention DP and `enable_lm_head_tp_in_adp`. Neither works with
+rejection sampling or penalties; elsewhere the first CUDA graph capture rejects it.
 `cuda_graph_config.sampling_variants` (prototype) captures only the listed variants, which shortens startup
 and saves graph memory:
 
@@ -456,10 +458,10 @@ cuda_graph_config:
   and still decode greedily, at a cost: they add sampling-parameter and RNG-state uploads, take the sampled
   path in eager steps too, and on the `advanced` graphs exact ties can break differently than on the `greedy`
   graphs. They also lose the argmax fast paths: with rejection sampling, argmax drafting and its LM-head-TP
-  path; and the vocabulary-sharded target argmax where the model has one. A model with the spec-decode fast
-  paths keeps that argmax by listing `temperature_only`, unless it uses rejection sampling; DFlash with tensor
-  parallelism keeps its shard selection when it runs without rejection sampling and with
-  `advanced_sampling_mode: no_topk_no_topp`.
+  path; and the vocabulary-sharded target argmax where the model has one. Models with the spec-decode fast
+  paths, and embedded DSpark drafts, keep that argmax by listing `temperature_only`, unless they use rejection
+  sampling; DFlash with tensor parallelism keeps its shard selection when it runs without rejection sampling
+  and with `advanced_sampling_mode: no_topk_no_topp`.
 - Without `advanced`, a sampled batch that `temperature_only` does not serve runs eagerly, and the first one
   logs a warning. Under attention DP, every rank then runs that step eagerly.
 
