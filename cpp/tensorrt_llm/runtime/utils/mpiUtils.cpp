@@ -193,10 +193,23 @@ void initialize(MpiThreadSupport threadMode, bool forwardAbortToParent)
         return;
     }
     std::lock_guard<std::recursive_mutex> lk(mpiMutex);
-    if (mpiInitialized)
+    // Only the mutex owner can observe an in-progress initialization through re-entry.
+    static bool initializing = false;
+    if (mpiInitialized || initializing)
     {
         return;
     }
+    initializing = true;
+
+    struct ResetInitializing
+    {
+        bool& flag;
+
+        ~ResetInitializing()
+        {
+            flag = false;
+        }
+    } resetInitializing{initializing};
 #if ENABLE_MULTI_DEVICE
     int initialized = 0;
     TLLM_MPI_CHECK(MPI_Initialized(&initialized));
