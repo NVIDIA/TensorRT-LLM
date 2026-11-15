@@ -8,9 +8,13 @@ the path's collective state, so one job, not independent cases); see ``_rank_job
 """
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 __extra_import_path__ = ["../../../comm"]
-import _rank_job  # noqa: E402
+if TYPE_CHECKING:
+    from _torch.modeling_v2.comm import _rank_job
+else:
+    import _rank_job  # noqa: E402
 import pytest
 import torch
 

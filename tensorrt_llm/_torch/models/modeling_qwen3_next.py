@@ -609,14 +609,18 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         assert hidden_states.shape[-1] == self.hidden_dim
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_dim)
+        routed_hidden_states = hidden_states
         use_dp_padding = False
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
 
         if self.enable_attention_dp and self.mapping.tp_size > 1 and is_sm_120f(
         ):
             use_dp_padding = True
-            hidden_states = torch.nn.functional.pad(
-                hidden_states,
+            # Padding improves context-phase MoE communication on SM120. Keep
+            # it local to the routed experts: the shared expert operates on
+            # this rank's real tokens and must retain the unpadded row count.
+            routed_hidden_states = torch.nn.functional.pad(
+                routed_hidden_states,
                 (0, 0, 0, max(all_rank_num_tokens) - hidden_states.shape[0]))
 
         if not do_finalize and not (self.can_defer_finalize
@@ -629,18 +633,18 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             out = self._decode_front(
                 self.gate,
                 experts,
-                hidden_states,
+                routed_hidden_states,
                 all_rank_num_tokens=all_rank_num_tokens,
                 use_dp_padding=use_dp_padding,
                 do_finalize=do_finalize,
             )
             if out is not None:
                 return out
-            router_logits = self.gate(hidden_states)
+            router_logits = self.gate(routed_hidden_states)
             return experts(
-                hidden_states,
+                routed_hidden_states,
                 router_logits,
-                output_dtype=hidden_states.dtype,
+                output_dtype=routed_hidden_states.dtype,
                 all_rank_num_tokens=all_rank_num_tokens,
                 use_dp_padding=use_dp_padding,
                 do_finalize=do_finalize,
@@ -1426,8 +1430,6 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
     ):
         decode_kernels = _uses_decode_kernels(model_config)
         if decode_kernels:
-            # Every AllReduce this model builds: no NCCL_SYMMETRIC.
-            model_config.extra_attrs["allreduce_exclude_nccl_symmetric"] = True
             # Its FP4 MoE layers tune for the decode steps.
             model_config.extra_attrs["moe_decode_tuning"] = True
             # Its MNNVL all-reduces run the residual RMSNorm fusions on the CuTe DSL kernels.

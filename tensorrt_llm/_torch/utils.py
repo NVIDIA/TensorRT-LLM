@@ -35,6 +35,7 @@ aux_stream_name_list = [
     'MlaIndexerAux',
     'MlaCompressor',
     'MoeSharedGate',
+    'MhcCoefficients',
 ]
 AuxStreamType = Enum(
     'AuxStreamType',
@@ -61,6 +62,18 @@ def is_gdn_flashinfer_replay_enabled() -> bool:
 def is_gdn_flashinfer_replay_required() -> bool:
     """Return whether ineligible FlashInfer GDN replay must raise instead of falling back."""
     return os.environ.get("TRTLLM_USE_GDN_FLASHINFER_REPLAY", "0") == "force"
+
+
+# Engines of at most this many tokens per step and rank capture decode CUDA graphs at the highest of
+# PyTorch's stream priorities; captured kernels keep it, so the model stream goes ahead of the auxiliary
+# streams. Larger steps fill the GPU, and there the high priority starves the auxiliary streams.
+_DECODE_STREAM_PRIORITY_MAX_TOKENS = 256
+
+
+def decode_stream_priority(max_num_tokens: int) -> int:
+    """The stream priority of decode CUDA graphs (and DeepSeek-V4's shared expert) for an engine of
+    ``max_num_tokens`` per rank: PyTorch's highest, -3, or its default, 0."""
+    return -3 if max_num_tokens <= _DECODE_STREAM_PRIORITY_MAX_TOKENS else 0
 
 
 # IMPORTANT: Keep the same order of activation functions in this enum and the enum in
@@ -235,6 +248,9 @@ class Fp4QuantizedTensor:
     # dynamic NVFP4 producers for consumer GEMM alpha derivation:
     # alpha = reciprocal_scale * weight_scale_2.
     reciprocal_scale: Optional[torch.Tensor] = None
+    # The same activation as fp8_quantize_1x128_packed_ue8m0(x, False) returns it, when its
+    # producer wrote that too (E4M3 values, packed UE8M0 scales).
+    fp8_1x128: Optional[tuple[torch.Tensor, torch.Tensor]] = None
 
     @property
     def shape(self):

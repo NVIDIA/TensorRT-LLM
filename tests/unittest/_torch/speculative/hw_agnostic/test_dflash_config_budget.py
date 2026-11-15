@@ -315,6 +315,7 @@ class TestBudgetDerivation:
 
     def test_mode_is_keyword_only(self):
         with pytest.raises(TypeError):
+            # pyrefly: ignore [missing-argument]
             derive_dflash_ctx_memory_budget_bytes(100 * GIB, 0.8, None)
 
 

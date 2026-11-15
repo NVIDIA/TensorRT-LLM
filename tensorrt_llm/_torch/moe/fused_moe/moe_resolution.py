@@ -62,7 +62,7 @@ from .marlin import MarlinCudaNvfp4Impl, MarlinCudaW4a16Nvfp4Impl
 from .mega_moe import DeepgemmCudaW4a8Mxfp4Mxfp8Impl, TrtllmCutedslMegaMoeNvfp4Impl
 from .moe_load_balancer import get_moe_load_balancer
 from .trtllm_gen import (
-    FlashinferTrtllmGenBf16Impl,
+    TrtllmTrtllmGenBf16Impl,
     TrtllmTrtllmGenFp8BlockScalesImpl,
     TrtllmTrtllmGenNvfp4Impl,
     TrtllmTrtllmGenW4a8Mxfp4Fp8Impl,
@@ -108,7 +108,7 @@ IMPL_PRIORITY: Tuple[MoEImplClass, ...] = (
     TrtllmCutedslFusedFc12Nvfp4Impl,
     # The TRTLLM-Gen leaves. Order among them does not matter: the ``quant``
     # segments are disjoint, so at most one leaf can admit a given problem.
-    FlashinferTrtllmGenBf16Impl,  # the unquantized format; no native counterpart
+    TrtllmTrtllmGenBf16Impl,
     TrtllmTrtllmGenNvfp4Impl,
     TrtllmTrtllmGenFp8BlockScalesImpl,
     TrtllmTrtllmGenW4a16Mxfp4Impl,
@@ -150,7 +150,7 @@ BACKEND_FAMILY: Dict[str, FrozenSet[MoEImplClass]] = {
     # which. A pinned ``impl_id`` names exactly one of them.
     "TRTLLM": frozenset(
         {
-            FlashinferTrtllmGenBf16Impl,
+            TrtllmTrtllmGenBf16Impl,
             TrtllmTrtllmGenNvfp4Impl,
             TrtllmTrtllmGenFp8BlockScalesImpl,
             TrtllmTrtllmGenW4a16Mxfp4Impl,

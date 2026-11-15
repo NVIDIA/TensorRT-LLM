@@ -128,9 +128,7 @@ def find_backend_class(
     not one class each but sets of leaves keyed by quant, so each needs
     ``quant_algo``. CUTLASS publishes ``fp8_block_scales`` twice, once per SM
     family, so for that format the leaf is the one this device runs.
-    TRTLLM-Gen has one leaf per format: native for every quantized one, and
-    ``FlashinferTrtllmGenBf16Impl`` for the unquantized one, so only bf16 tests
-    are exercising a FlashInfer class.
+    TRTLLM-Gen has one leaf per format, the unquantized one included.
 
     Absence is returned rather than raised so that a parameter generator can
     tell it apart from a real failure: catching the exception instead would let
@@ -257,27 +255,6 @@ def _is_fp4_fp8_standalone_gemm_available() -> bool:
 
     _is_fp4_fp8_standalone_gemm_available._cached_result = result
     return result
-
-
-def _is_sm103_gpu() -> bool:
-    """Return whether the current test GPU is an SM103 device such as B300."""
-    if not torch.cuda.is_available():
-        return False
-    return torch.cuda.get_device_capability(0) == (10, 3)
-
-
-def skip_trtllm_bf16_on_sm103(
-    backend_type: MoeBackendType,
-    quant_algo: Optional[QuantAlgo],
-    dtype: torch.dtype,
-) -> None:
-    """Explicitly skip TRTLLM BF16 tests on SM103."""
-    if backend_type == MoeBackendType.TRTLLM and quant_algo is None and dtype == torch.bfloat16:
-        if _is_sm103_gpu():
-            pytest.skip(
-                "FIXME: TRTLLMGenFusedMoE BF16 (FlashInfer backend) is skipped on SM103 "
-                "due to CUDA errors"
-            )
 
 
 def should_skip_trtllm(
@@ -505,46 +482,18 @@ def should_skip_trtllm(
                 f"(mismatch ~20-22%). CUTLASS backend with the same config passes."
             )
 
-    # W4A8_MXFP4_FP8 used to share the GatedMLP+W4A8MXFP4FP8LinearMethod
-    # reference path with W4A8_MXFP4_MXFP8 and hit a ~50-70x ref-vs-fused gap
-    # caused by the ref module's dynamic FP8 quantization being miswired to
-    # ``trtllm::w4a8_mxfp4_fp8_gemm`` (FP4GemmType.W4A8_MXFP4_MXFP8, which
-    # expects per-block activation scales with alpha=1). The reference now
-    # dequantizes the MXFP4 weights at load time AND emulates the kernel's
-    # static per-tensor FP8 round-trip on FC1 and FC2 inputs (see
-    # ``MXFP4FP8RefGatedMLPFusedMoE.forward``), so the generic / default
-    # SwiGLU configs (any top_k, any model shape) see the same FP8 noise as
-    # the fused kernel and pass.
-    #
-    # The remaining failure surface is
-    # W4A8_MXFP4_FP8 + TRTLLM-Gen + ``swiglu_gptoss_style=True`` (any top_k,
-    # any model shape, single- or multi-GPU). The element-wise reproducer at
-    # ``tests/unittest/_torch/moe/test_w4a8_mxfp4_fp8_divergence_repro.py``
-    # holds the model config / weights / input identical and only toggles
-    # the SwiGLU shape; on ``e60_k4_h2048_i1408 seq=1`` it shows:
-    #   * default SwiGLU (alpha=1, beta=0, limit=inf):
-    #       kernel ~ ref (1.00x magnitude, 0% mismatch_frac, PASS)
-    #   * gpt-oss SwiGLU (alpha=1.702, beta=1.0, limit=7.0):
-    #       kernel ~ 600-800x SMALLER than ref (94% mismatch_frac, FAIL)
-    # Eight ref variants that toggle gate clamp single/double-sided, drop
-    # the ``+beta`` term, drop the limit clamp, or skip the FC1/FC2 FP8
-    # round-trip all stay at ~94% mismatch, so the ref activation algebra
-    # is not the source. The CUTLASS backend with the same gpt-oss SwiGLU
-    # passes (Phase B verification, 16 passed / 0 failed). The bug is
-    # therefore in the TRTLLM-Gen kernel's gpt-oss SwiGLU code path itself
-    # (likely a wrong scale wired into the gpt-oss epilogue path - see
-    # ``GemmGatedActOptions.h`` ``scaleC`` / ``dequantScaleAb`` plumbing).
-    #
-    # Skip removal must be tied to the kernel bug fix tracked in
-    # https://nvbugspro.nvidia.com/bug/6178914.
-    if quant_algo == QuantAlgo.W4A8_MXFP4_FP8 and swiglu_gptoss_style:
+    # Packed FP4 TMA descriptors require a 128-aligned logical K dimension.
+    # MXFP4 passes the TP shard width rather than its padded width.
+    if (
+        quant_algo == QuantAlgo.W4A8_MXFP4_FP8
+        and moe_tp_size > 1
+        and intermediate_size % moe_tp_size == 0
+        and (intermediate_size // moe_tp_size) % 128 != 0
+    ):
         return (
-            "[Kernel Bug NVBUG-6178914] TRTLLMGenFusedMoE W4A8_MXFP4_FP8 with "
-            "swiglu_gptoss_style: the kernel produces output ~600-800x smaller "
-            "than the bf16 reference across all top_k / model shapes / "
-            "parallel modes, while the same kernel matches ref under default "
-            "SwiGLU and CUTLASS matches ref under gpt-oss SwiGLU. Bug is "
-            "isolated to the TRTLLM-Gen gpt-oss SwiGLU epilogue scale path."
+            "[NVBUG-7085659] W4A8_MXFP4_FP8 TP uses a non-128-aligned "
+            f"logical TMA dimension (intermediate_size={intermediate_size}, "
+            f"moe_tp_size={moe_tp_size})."
         )
 
     # TP per-shard alignment: when moe_tp_size > 1, intermediate_size is sharded.
@@ -1072,7 +1021,6 @@ def should_skip_routing_method(
 def supports_autotuner_capture(
     backend_type: MoeBackendType,
     _quant_algo: Optional[QuantAlgo],
-    use_flashinfer: bool,
 ) -> bool:
     """
     Determine if a backend+quant_algo combination supports AutoTuner capture/replay.
@@ -1095,9 +1043,6 @@ def supports_autotuner_capture(
         MoeBackendType.CUTE_DSL_B12X,
         MoeBackendType.MARLIN,
     ):
-        return False
-
-    if use_flashinfer:
         return False
 
     return True
@@ -1493,8 +1438,8 @@ def should_skip_to_accelerate_ci(
         return None
 
     # --- Rule 0: Skip gated and unquantized (quant=None) for most backends ---
-    # Keep TRTLLM BF16 for FlashInfer and CuteDSL BF16 with locality domain for the
-    # dedicated locality domain backend matrix.
+    # Keep TRTLLM BF16, and CuteDSL BF16 with locality domain for the dedicated
+    # locality domain backend matrix.
     keeps_unquantized_bf16_coverage = dtype == torch.bfloat16 and (
         backend_type == MoeBackendType.TRTLLM
         or (backend_type == MoeBackendType.CUTEDSL and enable_locality_domains)

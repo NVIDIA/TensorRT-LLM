@@ -4,9 +4,11 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.sparse.csa2 import cache_manager as cache_module
 from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import (
     CSA2CacheManager,
     CSA2CacheRole,
@@ -17,6 +19,7 @@ from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import (
     read_index_rows,
     write_packed_index_rows,
 )
+from tensorrt_llm._torch.disaggregation.resource.cache_reuse import _CacheReuseAdapterV2
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -24,6 +27,12 @@ from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, DSparkDecodingConfig, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+    BAD_PAGE_INDEX,
+    GPU_LEVEL,
+    ReuseScope,
+    _introspection,
+)
 
 skip_pre_blackwell = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
@@ -369,12 +378,12 @@ def test_decoder_replay_selects_cache_lifecycles(monkeypatch, fallback, partial_
     try:
         assert manager.enable_partial_reuse == partial_reuse
         assert manager.impl.init_config.enable_partial_reuse == partial_reuse
-        replay = fallback in ("attention_dp", "disaggregated")
+        replay = fallback in ("scratch", "attention_dp", "disaggregated")
         assert manager.has_private_swa_suffix(1) == replay
         assert not manager.has_private_swa_suffix(0)
         assert not manager.has_private_swa_suffix(2)
         if replay:
-            assert manager._decoder_replay_window == manager.layout.window_size
+            assert manager._decoder_replay_window == 140
             for layer in manager.impl.init_config.layers:
                 decoder = layer.layer_id == manager._layer_roles[1, 1, CSA2CacheRole.SWA]
                 assert layer.reuse_policy == (
@@ -419,6 +428,7 @@ def _metadata(manager, request, metadata=None):
 def test_swa_publication_is_scoped_transaction_with_exact_request_and_destination():
     manager = CSA2CacheManager.__new__(CSA2CacheManager)
     manager._swa_publication_token = manager._swa_publication = None
+    manager._block_offsets_live = {}
     manager.pp_layers = [0, 1]
     manager.max_blocks_per_seq = 4
     state = {"fail": False, "offset": 0}
@@ -429,7 +439,7 @@ def test_swa_publication_is_scoped_transaction_with_exact_request_and_destinatio
             raise ValueError("conversion failed")
         return [request + 10 * layer + state["offset"], -1, 19]
 
-    def compute(request_ids, num_contexts):
+    def compute(request_ids, num_contexts, swa_out=None, **kwargs):
         # Stands in for the device conversion: one SWA table per local layer.
         manager._batch_page_tables = torch.tensor(
             [
@@ -438,6 +448,8 @@ def test_swa_publication_is_scoped_transaction_with_exact_request_and_destinatio
             ],
             dtype=torch.int32,
         ).reshape(2, len(request_ids), 4)
+        if swa_out is not None:
+            swa_out.copy_(manager._batch_page_tables[: swa_out.shape[0], :, : swa_out.shape[2]])
 
     manager.compute_batch_page_tables = compute
     destination = torch.full((2, 4, 2, 4), 99, dtype=torch.int32)
@@ -603,3 +615,378 @@ def test_linear_verification_steps_stay_resolvable(overlap):
                 _spec_accept(manager, requests, accepted)
     finally:
         _spec_cleanup(manager)
+
+
+def _context_only_layout() -> CSA2Layout:
+    return CSA2Layout(
+        (0, 0) + (2,) * 18 + (1,) * 20,
+        (2, 8, 14, 20),
+        (2, 8, 14, 20, 24, 28, 32, 36),
+        candidate_source_layer_id=20,
+    )
+
+
+def _declarative_manager(limit: int | None) -> CSA2CacheManager:
+    manager = object.__new__(CSA2CacheManager)
+    manager.context_swa_layer_limit = limit
+    manager.layout = _context_only_layout()
+    manager.pp_layers = list(range(40))
+    manager.tokens_per_block = 128
+    manager.max_draft_len = manager.reuse_match_backoff = 0
+    manager._decoder_replay_window = 0
+    manager._encoder_replay_enabled = False
+    manager._build_cache_config(SimpleNamespace(swa_scratch_reuse=None))
+    return manager
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("limit", [0, -1, 40, 41, 20.5, True, "20"])
+def test_invalid_context_swa_limit_fails_before_allocation(limit) -> None:
+    with pytest.raises(ValueError, match="context SWA layer limit"):
+        CSA2CacheManager(
+            KvCacheConfig(dtype="fp8"),
+            CacheType.SELFKONLY,
+            num_layers=40,
+            tokens_per_block=128,
+            mapping=Mapping(),
+            layout=_context_only_layout(),
+            context_swa_layer_limit=limit,
+        )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("limit", [None, 20])
+def test_prune_only_physical_swa_groups(limit: int | None) -> None:
+    manager = _declarative_manager(limit)
+    built = manager._build_cache_config(SimpleNamespace(swa_scratch_reuse=None))
+    retained = 40 if limit is None else limit
+    assert manager.pp_layers == list(range(40))
+    assert len(built.layers) == retained + 7
+    identities = set(manager._physical_roles.values())
+    assert {layer for layer, _, role in identities if role == CSA2CacheRole.SWA} == set(
+        range(retained)
+    )
+    assert {ratio for _, ratio, role in identities if role == CSA2CacheRole.SWA} == {1}
+    for role in (CSA2CacheRole.GLOBAL, CSA2CacheRole.INDEX):
+        assert {(layer, ratio) for layer, ratio, item in identities if item == role} == {
+            (2, 2),
+            (8, 2),
+            (14, 2),
+            (20, 1),
+        }
+        assert manager._layer_roles[3, 2, role] == manager._layer_roles[2, 2, role]
+        assert manager._layer_roles[39, 1, role] == manager._layer_roles[20, 1, role]
+    for role in (CSA2CacheRole.COMPRESSOR_KV, CSA2CacheRole.COMPRESSOR_SCORE):
+        assert {(layer, ratio) for layer, ratio, item in identities if item == role} == {
+            (2, 2),
+            (8, 2),
+            (14, 2),
+        }
+    sizes, windows = manager._get_runtime_cache_size_layer_components()
+    assert sizes.count(528) == retained
+    assert sum(size for size, window in zip(sizes, windows) if window is None) == 890
+    assert sizes.count(4096) == 3
+    assert (
+        sum(buffer.size for layer in built.layers for buffer in layer.buffers) == sum(sizes) * 128
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("tokens_per_block", [128, 256])
+@pytest.mark.parametrize("remote_tail", [False, True])
+def test_static_sizing_removes_only_swa_reservation(
+    tokens_per_block: int, remote_tail: bool
+) -> None:
+    layout = _context_only_layout()
+    text_config = SimpleNamespace(
+        compress_ratios=layout.compress_ratios,
+        kv_source_layer_ids=layout.kv_source_layer_ids,
+        index_source_layer_ids=layout.index_source_layer_ids,
+        candidate_source_layer_id=layout.candidate_source_layer_id,
+        candidate_topk_blocks=layout.candidate_topk_blocks,
+        candidate_block_size=layout.candidate_block_size,
+        index_topk=layout.index_topk,
+        sliding_window=layout.window_size,
+    )
+    model = SimpleNamespace(pretrained_config=text_config, get_num_attention_layers=lambda: 40)
+    ordinary = CSA2CacheManager.get_cache_size_per_token(
+        model, Mapping(), tokens_per_block=tokens_per_block, max_batch_size=32
+    )
+    model.extra_attrs = {"bounded_replay_on_generation": remote_tail}
+    full = CSA2CacheManager.get_cache_size_per_token(
+        model, Mapping(), tokens_per_block=tokens_per_block, max_batch_size=32
+    )
+    # Remote-tail retention adds a 128-row lookback to the 141-row replay window.
+    extra_pages = int(remote_tail)
+    assert full[0] == ordinary[0]
+    assert full[1] - ordinary[1] == 20 * extra_pages * tokens_per_block * 528 * 32
+    model.extra_attrs["csa2_context_swa_layer_limit"] = 20
+    pruned = CSA2CacheManager.get_cache_size_per_token(
+        model, Mapping(), tokens_per_block=tokens_per_block, max_batch_size=32
+    )
+    # The GLOBAL token slope stays fixed. Replay pages include headroom for
+    # the worst page alignment, including three pages for 128-token blocks.
+    assert full[0] == pruned[0] == 890
+    decoder_pages = 3 if tokens_per_block == 128 else 2
+    assert full[1] - pruned[1] == 20 * decoder_pages * tokens_per_block * 528 * 32
+
+
+@pytest.mark.cpu_only
+def test_logical_page_tables_and_null_pointers(monkeypatch) -> None:
+    manager = _declarative_manager(20)
+    manager.num_local_layers = 40
+    manager.num_pools = 3
+    manager.max_batch_size = 2
+    manager.max_beam_width = 1
+    manager.max_blocks_per_seq = 8
+    manager.impl = SimpleNamespace(get_mem_pool_base_address=lambda *args: 4096 + int(args[0]))
+    monkeypatch.setattr(cache_module, "prefer_pinned", lambda: False)
+    # The device page-table plan needs real converters; pointers do not.
+    monkeypatch.setattr(manager, "_init_batch_page_plan", lambda: None)
+    manager._prepare_page_table_tensor(2)
+    assert manager.kv_cache_pool_pointers.shape == (40, 2)
+    assert torch.all(manager.kv_cache_pool_pointers[:20, 0] != 0)
+    assert torch.count_nonzero(manager.kv_cache_pool_pointers[20:]) == 0
+    assert manager.kv_cache_pool_mapping[:, 0].tolist() == list(range(40))
+    with pytest.raises(ValueError, match="has no SWA cache"):
+        manager.get_buffers(20)
+    with pytest.raises(ValueError, match="has no SWA cache"):
+        manager.get_cache_indices(1, 39, CSA2CacheRole.SWA)
+
+    def compute(request_ids, num_contexts, swa_out, **kwargs):
+        # Stands in for the device conversion: SWA tables of the retained layers.
+        tables = [
+            [[r + layer, 88] + [BAD_PAGE_INDEX] * 6 for r in request_ids] for layer in range(20)
+        ]
+        swa_out.copy_(torch.tensor(tables, dtype=torch.int32))
+
+    manager.compute_batch_page_tables = compute
+    destination = torch.full((40, 2, 2, 8), 99, dtype=torch.int32)
+    manager._swa_publication_token = manager._swa_publication = None
+    manager._block_offsets_live = {}
+    manager.copy_batch_block_offsets(destination, [1], 1, 1, 1)
+    assert destination[:20, 0, 0, 0].tolist() == list(range(1, 21))
+    assert torch.all(destination[20:] == BAD_PAGE_INDEX)
+
+
+@pytest.mark.cpu_only
+def test_fresh_fill_uses_physical_roles_and_preserves_relocated_committed_pages(
+    monkeypatch,
+) -> None:
+    manager = _declarative_manager(20)
+    manager._fresh_page_fill = 0
+    manager._fresh_fill_announced = True
+    manager._fresh_pages_filled = {}
+    manager.kv_cache_map = {1: SimpleNamespace(num_committed_tokens=1)}
+    # Model layer 20's GLOBAL role remains, despite no SWA at that layer.
+    buffers = {
+        identity: torch.full((16, 1, 4), 7, dtype=torch.uint8)
+        for identity in manager._physical_roles.values()
+    }
+    page_tables = {identity: [1, 2, 3, 4, BAD_PAGE_INDEX, BAD_PAGE_INDEX] for identity in buffers}
+    manager.get_buffers = lambda layer, role: buffers[manager._cache_role_key(layer, role)]
+    manager.get_cache_indices = lambda request, layer, role: page_tables[
+        manager._cache_role_key(layer, role)
+    ]
+    manager._get_page_index_converter = lambda *args: SimpleNamespace(expansion=2)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    manager._fill_fresh_kv_pages(1)
+    for buffer in buffers.values():
+        assert torch.all(buffer[[1, 2]] == 7)  # ceil(committed / 128) * expansion
+        assert torch.all(buffer[[3, 4]] == 0)
+        buffer.fill_(9)
+    for identity in page_tables:
+        page_tables[identity] = [1, 2, 8, 9, 10, 11]
+    manager._fill_fresh_kv_pages(1)
+    for buffer in buffers.values():
+        assert torch.all(buffer[[1, 2, 8, 9]] == 9)  # protected or relocated
+        assert torch.all(buffer[[10, 11]] == 0)  # newly materialized ordinals
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("guard", [False, True])
+def test_real_context_allocator_omits_decoder_swa(monkeypatch, guard: bool) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CSA2 runtime cache storage requires CUDA")
+    monkeypatch.setenv("TRTLLM_KV_GUARD_PAGE", "nan" if guard else "")
+    monkeypatch.setenv("TRTLLM_KV_FRESH_PAGE_FILL", "zero")
+    manager = CSA2CacheManager(
+        KvCacheConfig(
+            max_gpu_total_bytes=128 << 20, host_cache_size=0, enable_block_reuse=False, dtype="fp8"
+        ),
+        CacheType.SELFKONLY,
+        num_layers=40,
+        tokens_per_block=128,
+        max_seq_len=2048,
+        max_batch_size=2,
+        max_num_tokens=1024,
+        mapping=Mapping(),
+        dtype=DataType.BF16,
+        vocab_size=8192,
+        layout=_context_only_layout(),
+        context_swa_layer_limit=20,
+    )
+    try:
+        assert manager.num_local_layers == 40
+        assert len(manager.impl.init_config.layers) == 27
+        assert len(list(manager.impl.all_buffer_ids)) == 34
+        assert torch.all(manager.kv_cache_pool_pointers[20:] == 0)
+        assert set(manager._guard_page_by_layer) == (set(range(20)) if guard else set())
+        assert manager.get_num_free_blocks() > 0
+        assert manager.blocks_in_primary_pool > 0
+        quota = manager._get_quota_from_max_tokens(1024)
+        assert manager._get_max_tokens_from_quota(quota) == pytest.approx(1024)
+        cache = manager._create_kv_cache(90, None, [])
+        assert cache is not None and manager._resume_and_restore(90, cache)
+        assert cache.resize(513)
+        manager._fill_fresh_kv_pages(90)
+        for owner in (2, 8, 14, 20):
+            assert manager.get_cache_indices(90, owner, CSA2CacheRole.GLOBAL)
+            assert manager.get_buffers(owner, CSA2CacheRole.GLOBAL).numel() > 0
+        for layer in range(20, 40):
+            with pytest.raises(ValueError, match="has no SWA cache"):
+                manager.get_buffers(layer)
+        destination = torch.empty(
+            (40, 2, 2, manager.max_blocks_per_seq), dtype=torch.int32, device="cuda"
+        )
+        manager.copy_batch_block_offsets(destination, [90], 1, 1, 1)
+        assert torch.all(destination[20:] == BAD_PAGE_INDEX)
+        assert sum(role == CSA2CacheRole.SWA for _, role in manager._batch_page_index) == 20
+        manager.check_invalid_values_in_kv_cache(fill_with_zero=True)
+        assert not manager.check_invalid_values_in_kv_cache()
+    finally:
+        for request_id in list(manager.kv_cache_map):
+            manager.free_resources(SimpleNamespace(py_request_id=request_id))
+        manager.shutdown()
+
+
+# The host-tier reuse path: block reuse on the CSA2 layout with a host tier behind a small GPU tier.
+TOKENS_PER_BLOCK = 128
+PREFIX_BLOCKS = 16
+PREFIX = PREFIX_BLOCKS * TOKENS_PER_BLOCK
+# Roles whose prefix pages a request reuses as they are; windowed roles are recomputed.
+SHARED_ROLES = (CSA2CacheRole.GLOBAL, CSA2CacheRole.INDEX)
+
+
+def _host_tier_manager() -> CSA2CacheManager:
+    return CSA2CacheManager(
+        KvCacheConfig(
+            max_gpu_total_bytes=64 << 20,
+            host_cache_size=512 << 20,
+            enable_block_reuse=True,
+            block_reuse_config=BlockReuseConfig(policy="all_reusable"),
+            dtype="fp8",
+        ),
+        CacheType.SELFKONLY,
+        num_layers=5,
+        tokens_per_block=TOKENS_PER_BLOCK,
+        max_seq_len=8192,
+        max_batch_size=4,
+        max_num_tokens=2048,
+        mapping=Mapping(),
+        dtype=DataType.BF16,
+        vocab_size=1 << 20,
+        layout=CSA2Layout((0, 2, 2, 1, 1), (1, 3), (1, 3)),
+    )
+
+
+def _publish(manager: CSA2CacheManager, request_id: int, tokens: list[int], seed: int) -> dict:
+    """Write random pages for ``tokens``, commit them for reuse and return the shared roles' contents."""
+    cache = manager._create_kv_cache(request_id, None, [])
+    assert manager._resume_and_restore(request_id, cache)
+    assert cache.resize(len(tokens))
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    written = {}
+    for model_layer, _, role in manager._physical_roles.values():
+        pool = manager.get_buffers(model_layer, role)
+        pages = [
+            page for page in manager.get_cache_indices(request_id, model_layer, role) if page >= 0
+        ]
+        for page in pages:
+            values = torch.randint(0, 255, pool[page].shape, generator=generator, device="cuda")
+            pool[page].copy_(values.to(pool.dtype))
+        if role in SHARED_ROLES:
+            written[model_layer, role] = [pool[page].clone() for page in pages]
+    cache.commit(tokens)
+    torch.cuda.synchronize()
+    manager.free_resources(SimpleNamespace(py_request_id=request_id))
+    return written
+
+
+def _prefix_levels(manager: CSA2CacheManager, request: LlmRequest) -> list[int]:
+    """Pages of the prefix ``request`` would reuse, counted per cache level."""
+    probe = manager.impl.create_kv_cache(
+        ReuseScope(lora_id=None, salt=manager._derive_reuse_salt(None)),
+        manager._context_reuse_tokens(request),
+    )
+    try:
+        assert probe.num_committed_tokens > 0
+        return list(_introspection.active_page_stats(probe)[0])
+    finally:
+        probe.close()
+
+
+def _host_tier_request(request_id: int, prefix: list[int]) -> LlmRequest:
+    request = LlmRequest(
+        request_id=request_id,
+        max_new_tokens=1,
+        input_tokens=prefix + [7, 8, 9],
+        sampling_config=SamplingConfig(),
+        is_streaming=False,
+    )
+    request.state = LlmRequestState.CONTEXT_INIT
+    return request
+
+
+def _admit(manager: CSA2CacheManager, request: LlmRequest, written: dict) -> int:
+    """Admit ``request``; its reused pages must hold the published bytes. Returns the reused tokens."""
+    assert manager.prepare_context(request)
+    reused_blocks = request.context_current_position // TOKENS_PER_BLOCK
+    assert reused_blocks > 0
+    torch.cuda.synchronize()
+    for (model_layer, role), pages in written.items():
+        pool = manager.get_buffers(model_layer, role)
+        reused = [
+            page
+            for page in manager.get_cache_indices(request.py_request_id, model_layer, role)
+            if page >= 0
+        ]
+        for page, expected in list(zip(reused, pages))[:reused_blocks]:
+            assert torch.equal(pool[page], expected)
+    return request.context_current_position
+
+
+@skip_pre_blackwell
+def test_context_reuse_from_the_host_tier() -> None:
+    """A context server's reuse path with a host tier: admission onboards a host-tier prefix with its
+    published bytes, and the transfer adapter's zero-copy block ordinals equal its aggregated page indices."""
+    manager = _host_tier_manager()
+    try:
+        prefix = list(range(1, PREFIX + 1))
+        written = _publish(manager, 10, prefix, seed=0)
+        request = _host_tier_request(30, prefix)
+        # Unrelated prefixes push the published prefix out of the GPU tier.
+        gpu_slots = max(stats.total for stats in manager.impl.get_storage_statistics(GPU_LEVEL))
+        for k in range(1, gpu_slots // PREFIX_BLOCKS + 3):
+            _publish(manager, 100 + k, [PREFIX * (k + 1) + t for t in range(PREFIX)], seed=k)
+        levels = _prefix_levels(manager, request)
+        assert levels[GPU_LEVEL] < sum(levels), f"the fillers did not evict the prefix: {levels}"
+        _admit(manager, request, written)
+
+        # The transfer adapter reads the admitted cache's block ordinals zero-copy.
+        cache = manager.kv_cache_map[request.py_request_id]
+        assert cache.is_active
+        adapter = _CacheReuseAdapterV2(SimpleNamespace(kv_cache_map={request.py_request_id: cache}))
+        groups = sorted(
+            {manager.impl.get_layer_group_id(layer) for layer in manager._layer_roles.values()}
+        )
+        for group in groups:
+            expected = np.fromiter(
+                cache.get_aggregated_page_indices(group, valid_only=False), dtype=np.int64
+            )
+            got = adapter.get_block_ordinals(request, group, None)
+            assert got.dtype == np.int64 and np.array_equal(got, expected), group
+    finally:
+        for request_id in list(manager.kv_cache_map):
+            manager.free_resources(SimpleNamespace(py_request_id=request_id))
+        manager.shutdown()

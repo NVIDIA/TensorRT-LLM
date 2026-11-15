@@ -1277,7 +1277,8 @@ class DFlashWorker(SpecWorkerBase):
         ``kv_cache_block_offsets`` entries are ``pool_block_index *
         num_pool_layers * kv_factor`` plus the K/V field index. What that has to
         be divided by to index a ``get_buffers`` view depends on the manager --
-        see the stride check below; attention_backend/utils.py hardcodes the V1
+        see the stride check below;
+        ``append_mla_latent_cache_generation_cuda_graph_safe`` hardcodes the V1
         divisor and is not a general contract.
         """
         mgr = draft_kv_cache_manager
