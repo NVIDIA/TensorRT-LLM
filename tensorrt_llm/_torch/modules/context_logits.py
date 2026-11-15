@@ -10,11 +10,14 @@ buffers and the hook that lets an active plan replace the LM-head output.
 
 from __future__ import annotations
 
+import os
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import TYPE_CHECKING, Iterator, Protocol
 
 import torch
+
+from tensorrt_llm._utils import get_sm_version
 
 if TYPE_CHECKING:
     from tensorrt_llm.mapping import Mapping
@@ -192,7 +195,19 @@ class ContextLogitsWorkspace:
         kwargs = {} if self.dtype == head.weight.dtype else {"out_dtype": self.dtype}
         succeeded = False
         try:
-            torch.mm(hidden, head.weight.t(), out=local, **kwargs)
+            if (
+                os.getenv("FORCE_DETERMINISTIC") == "1"
+                and hidden.dtype == torch.bfloat16
+                and head.weight.dtype == torch.bfloat16
+                and get_sm_version() in (100, 103)
+            ):
+                # Same K reduction order for every chunk size, as in the LM
+                # head's own GEMM.
+                from .deterministic_linear import deterministic_linear
+
+                deterministic_linear(hidden, head.weight, out=local)
+            else:
+                torch.mm(hidden, head.weight.t(), out=local, **kwargs)
             succeeded = True
         except torch.OutOfMemoryError:
             pass

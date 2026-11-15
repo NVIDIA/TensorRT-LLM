@@ -53,19 +53,26 @@ def deterministic_linear(
     bias: torch.Tensor | None = None,
     *,
     output_dtype: torch.dtype | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """BF16 linear with FP32 accumulation and a fixed 128-element K tile.
 
     Output tiles may vary with M; the reduction tile and accumulation order
     are independent of M. Bias is added before rounding to output_dtype
     (the input dtype by default). Routers can retain FP32 accumulation.
+    ``out`` is an optional contiguous [M, N] buffer to write instead of a new
+    tensor; its dtype is the output dtype.
     """
     shape = x.shape[:-1]
     x = x.reshape(-1, x.shape[-1])
     m, k = x.shape
     n = weight.shape[0]
     bm, bn = (16, 64) if m < 32 else ((64, 64) if m < 256 else (128, 128))
-    output = torch.empty((m, n), device=x.device, dtype=output_dtype or x.dtype)
+    if out is None:
+        output = torch.empty((m, n), device=x.device, dtype=output_dtype or x.dtype)
+    else:
+        assert out.shape == (m, n) and out.is_contiguous()
+        output = out
     if m and n:
         _linear_kernel[(triton.cdiv(m, bm), triton.cdiv(n, bn))](
             x,
