@@ -20,10 +20,12 @@ from tensorrt_llm._torch.models.checkpoints.hf.config_loader import \
 from tensorrt_llm._torch.models.checkpoints.hf.weight_loader import \
     HfWeightLoader
 from tensorrt_llm._torch.models.modeling_utils import register_checkpoint_loader
+from tensorrt_llm.checkpoint_format import CheckpointFormat
+from tensorrt_llm.llmapi.llm_args import CheckpointIOPolicy
 from tensorrt_llm.mapping import Mapping
 
 
-@register_checkpoint_loader("HF")
+@register_checkpoint_loader(CheckpointFormat.HF)
 class HfCheckpointLoader(BaseCheckpointLoader):
 
     def __init__(self,
@@ -40,7 +42,7 @@ class HfCheckpointLoader(BaseCheckpointLoader):
         else:
             self._config_loader = config_loader
         self._weight_mapper = weight_mapper
-        self._checkpoint_format = "HF"
+        self._checkpoint_format = CheckpointFormat.HF
 
     def cleanup(self) -> None:
         # Clean up weight mapper first as it may hold model references
@@ -74,14 +76,14 @@ class HfCheckpointLoader(BaseCheckpointLoader):
             loader = self.weight_loader
             loader._reset_checkpoint_io_status()
             status = loader._last_checkpoint_io_status
-            status.selected = "native"
-            if loader.checkpoint_io_policy != "native":
+            status.selected = CheckpointIOPolicy.NATIVE
+            if loader.checkpoint_io_policy != CheckpointIOPolicy.NATIVE:
                 status.fallback_reason = (
                     "context-only model loading requires lazy safetensors "
                     "without full-checkpoint read-ahead")
             weights = loader._load_lazy_safetensors(
                 checkpoint_dir, kwargs.get("use_consolidated", False))
-            status.effective = "native"
+            status.effective = CheckpointIOPolicy.NATIVE
             loader._log_checkpoint_io_status()
             return weights
         return super().load_weights(checkpoint_dir, mapping=mapping, **kwargs)
@@ -92,7 +94,8 @@ class HfCheckpointLoader(BaseCheckpointLoader):
         """Delegate the optimized session only for the built-in HF path."""
         if (type(self) is HfCheckpointLoader
                 and type(self.weight_loader) is HfWeightLoader
-                and self.weight_loader.checkpoint_io_policy != "native" and
+                and self.weight_loader.checkpoint_io_policy
+                != CheckpointIOPolicy.NATIVE and
                 not self._uses_context_only_lazy_loading(kwargs.get("model"))):
             with self.weight_loader.open_weight_session(checkpoint_dir,
                                                         mapping=mapping,
@@ -138,5 +141,5 @@ class HfCheckpointLoader(BaseCheckpointLoader):
         return self._config_loader
 
     @property
-    def checkpoint_format(self) -> str:
+    def checkpoint_format(self) -> CheckpointFormat:
         return self._checkpoint_format

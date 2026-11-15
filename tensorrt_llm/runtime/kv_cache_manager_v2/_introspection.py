@@ -65,6 +65,25 @@ def poison_for_testing(reason: str) -> None:
     _cpp().poison_for_testing(reason)
 
 
+def async_disk_io_enabled() -> bool:
+    """Whether the process-wide disk I/O pool is running, so disk transfers are asynchronous."""
+    return bool(_cpp().async_disk_io_enabled())
+
+
+def inject_disk_write_failures_for_testing(count: int) -> None:
+    """Make the next ``count`` disk write pieces fail without writing."""
+    _cpp().inject_disk_write_failures_for_testing(count)
+
+
+def delay_background_disk_writes_for_testing(seconds: float) -> None:
+    """The async disk I/O pool starts a background (write-through) write piece only once it has been queued for
+    ``seconds`` (0: no delay).
+
+    A piece promoted to a required write is not delayed.
+    """
+    _cpp().delay_background_disk_writes_for_testing(seconds)
+
+
 def create_test_padding_cold_page_codec(cold_page_bytes_by_layer: dict[int, int]) -> Any:
     """Create the private native padding codec used by cold-tier end-to-end tests."""
     return _cpp().create_test_padding_cold_page_codec(cold_page_bytes_by_layer)
@@ -246,6 +265,11 @@ def storage_utilization(manager: Any, cache_level: int = 0) -> list[float]:
     return list(_cpp().storage_utilization(manager, cache_level))
 
 
+def disk_copy_counters(manager: Any) -> dict[str, int]:
+    """Return the retained disk copy and write-through counters of the storage manager."""
+    return dict(_cpp().disk_copy_counters(manager))
+
+
 def sparse_cache_resident_ordinals(kv_cache: Any, lc_id: int) -> list[int]:
     """Resident unit ordinal per sparse cache entry, laid out [buffer][entry].
 
@@ -343,11 +367,24 @@ def batch_watermarks(batch: Any) -> tuple[list[int], list[int]]:
     return list(history), list(capacity)
 
 
+def batch_sparse_clock(batch: Any) -> tuple[int, int]:
+    """A Batch's sparse eviction clock as (host counter, staged copy).
+
+    The staged copy sits in the pinned block publish() uploads, so both are host reads: this
+    neither synchronises nor waits on a publish in flight.
+    """
+    return tuple(_cpp().batch_sparse_clock(batch))
+
+
 class SparseResolveResult(NamedTuple):
     """State and outputs of one sparse resolve launch."""
 
     resident_ordinal: list[int]
-    lru_order: list[int]
+    #: Steps since each entry's last use, and whether that use found the entry already
+    #: resident. Eviction takes the oldest first and, within one age, what was fetched
+    #: before what was hit. ``-1`` and ``0`` where the entry is free.
+    entry_age: list[int]
+    entry_hit: list[int]
     out_slot: list[int]
     #: The compacted work list, one run per layer, of which the first ``miss_total[layer]``
     #: are valid. Entry order is whatever the CTAs raced to, so compare as a set.
@@ -460,7 +497,7 @@ def sparse_flush_list(
 
 def sparse_resolve(
     resident_ordinal: list[int],
-    lru_order: list[int],
+    entry_age: list[int],
     num_layers: int,
     entries_per_layer: int,
     selected: list[int],
@@ -477,6 +514,9 @@ def sparse_resolve(
     the view each row owns, while the selection and every output are [layer][row][width]
     so that each launch sees a contiguous slice of its own.
 
+    ``entry_age`` is the age in steps each entry starts at, or an empty list to leave every
+    entry at zero -- which leaves the eviction order among them arbitrary.
+
     A negative selection entry is padding. ``inactive_rows`` get a default view, standing
     in for a row holding no reservation. Ordinals in ``[history_units, capacity_units)`` are in
     flight: they are made resident before the selection takes any victim, are never
@@ -492,7 +532,8 @@ def sparse_resolve(
 
     (
         resident,
-        lru,
+        ages,
+        hits,
         out,
         miss_row,
         miss_ord,
@@ -502,7 +543,7 @@ def sparse_resolve(
         in_flight,
     ) = _cpp().sparse_resolve(
         resident_ordinal,
-        lru_order,
+        entry_age,
         num_layers,
         entries_per_layer,
         selected,
@@ -514,7 +555,8 @@ def sparse_resolve(
     )
     return SparseResolveResult(
         list(resident),
-        list(lru),
+        list(ages),
+        list(hits),
         list(out),
         list(miss_row),
         list(miss_ord),

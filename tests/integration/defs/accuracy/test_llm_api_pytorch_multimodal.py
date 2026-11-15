@@ -12,10 +12,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 import os
+from pathlib import Path
 from typing import ClassVar
 
+import numpy as np
 import pytest
+from PIL import Image
+from transformers import AutoProcessor
 
 from tensorrt_llm import LLM
 from tensorrt_llm.evaluate.post_processing import (
@@ -196,6 +201,63 @@ class TestGemma4_26B_A4B(LlmapiAccuracyTestHarness):
                 sampling_params=self.sampling_params,
                 extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
             )
+
+
+@skip_pre_hopper
+@pytest.mark.skip_less_device_memory(80000)
+class TestGemma4_31B(LlmapiAccuracyTestHarness):
+    MODEL_PATH = f"{llm_models_root()}/gemma/gemma-4-31B-it"
+
+    def test_multi_image_encoder_budget(self, tmp_path: Path) -> None:
+        """A request spanning several encoder steps completes, and the executor keeps serving."""
+        # Raise every image to 1120 soft tokens (10,080 encoder patches) so 8 images need several
+        # encoder steps.
+        for name in os.listdir(self.MODEL_PATH):
+            if name != "processor_config.json":
+                os.symlink(os.path.join(self.MODEL_PATH, name), tmp_path / name)
+        with open(os.path.join(self.MODEL_PATH, "processor_config.json")) as f:
+            processor_config = json.load(f)
+        processor_config["image_processor"]["max_soft_tokens"] = 1120
+        with open(tmp_path / "processor_config.json", "w") as f:
+            json.dump(processor_config, f)
+        processor = AutoProcessor.from_pretrained(tmp_path)
+        assert processor.image_processor.max_soft_tokens == 1120
+
+        num_images = 8
+        prompt = processor.apply_chat_template(
+            [
+                {
+                    "role": "user",
+                    "content": [{"type": "image"}] * num_images
+                    + [{"type": "text", "text": "Describe these images."}],
+                }
+            ],
+            add_generation_prompt=True,
+        )
+        rng = np.random.default_rng(0)
+        images = [
+            Image.fromarray(rng.integers(0, 256, (2000, 2000, 3), dtype=np.uint8))
+            for _ in range(num_images)
+        ]
+        sampling_params = SamplingParams(max_tokens=8)
+        with LLM(
+            str(tmp_path),
+            max_seq_len=65536,
+            max_batch_size=32,
+            max_num_tokens=2048,
+            enable_chunked_prefill=True,
+            attn_backend="FLASHINFER",
+            cuda_graph_config=None,
+            kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.7),
+        ) as llm:
+            output = llm.generate(
+                {"prompt": prompt, "multi_modal_data": {"image": images}}, sampling_params
+            )
+            # About 8.7k prompt tokens at 1120 soft tokens per image, about 2.1k at the default 280.
+            assert len(output.prompt_token_ids) > num_images * 1000
+            assert output.outputs[0].token_ids
+            output = llm.generate("Hello", sampling_params)
+            assert output.outputs[0].token_ids
 
 
 @skip_pre_hopper
@@ -576,7 +638,7 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
         """MMMU-val on the K3 VL checkpoint (16 GPUs, DEP16).
 
         No automated L0 stage schedules 16-GPU functional tests; this case is
-        registered in qa/llm_function_multinode.txt and run by QA's weekly
+        registered in qa/llm_function_multinode.yml and run by QA's weekly
         multinode pipeline (qualified on 4x4 GB300 nodes; reference in
         references/mmmu.yaml). Mirrors examples/kimi_k3/run_eval_kimi_k3.sbatch
         --task mmmu: the base eval_extra_llm_options.yaml serving config with
@@ -594,17 +656,10 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
             enable_chunked_prefill=True,
             cuda_graph_config=CudaGraphConfig(enable_padding=True, max_batch_size=32),
             moe_config=MoeConfig(max_num_tokens=33024, use_low_precision_moe_combine=True),
-            # use_kv_cache_manager_v2=False: the VL wrapper inherits K2.5's
-            # V2 cache-manager preference, but the qualified K3 MMMU
-            # configuration ran V1, and under V2 this test's long-generation
-            # shape (max_seq_len 24576, 16k-token outputs) stalled with all
-            # GPUs idle in QA validation (the GSM8K legs' shorter shape runs
-            # fine under V2). Pin V1 until the V2 x KDA-hybrid path is
-            # qualified at this shape.
             kv_cache_config=KvCacheConfig(
                 free_gpu_memory_fraction=0.25,
                 tokens_per_block=64,
-                use_kv_cache_manager_v2=False,
+                use_kv_cache_manager_v2=True,
             ),
         ) as llm:
             # Reference-key contract: the K3 checkpoint carries its

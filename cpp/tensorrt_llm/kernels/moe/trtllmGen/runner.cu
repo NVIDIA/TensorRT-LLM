@@ -140,6 +140,8 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         routingData.mPreprocessType = moe::dev::routing::RoutingPreprocessType::Sigmoid;
         routingData.mPostprocessType = moe::dev::routing::RoutingPostprocessType::SumNormalize;
         routingData.mNormTopkProb = true;
+        // Matches the Python reference's sum + 1e-20: an all-underflow token gets 0 weights, not NaN.
+        routingData.mSumEpsilon = 1e-20f;
 
         // Pass-through raw pointer; kernels will cast to the proper InputT based on routing method
         routingData.mPtrScores = expertIds == nullptr ? routingLogits : nullptr;

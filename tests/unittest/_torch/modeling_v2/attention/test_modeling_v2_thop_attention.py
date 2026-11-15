@@ -56,9 +56,11 @@ exercised:
    V readout, and gated against the bf16-KV reference); the decode kernel
    takes its query from quant_q_buffer and its two scales from
    mla_bmm1_scale/mla_bmm2_scale, reading neither `q` nor the kv scale
-   tensors; and only the append side honours kv_scale_orig_quant, so the
-   context phase is correct at s = 1.0 alone while decode is correct at any s
-   once the caller folds it into the bmm scales. The requests' pages are
+   tensors; and the context side honours kv_scale_orig_quant in its own copies —
+   since 46d4e94654 they are gridded at the cache write scale, with the two
+   dequant factors folded into the bmm scales by the op itself — so the context
+   phase is true math at any s, while decode is correct at any s once the
+   caller folds it into the bmm scales. The requests' pages are
    scattered out of order, which is what pins the e4m3-sized slab geometry.
 2d. The **complete R1 cell over that fp8 pool** — YaRN table and
    q_scaling = 1/mscale^2 together with the fp8 pool, which is what every
@@ -3583,6 +3585,7 @@ class _MlaPagedEnv:
         softmax_scale: Optional[float] = None,
         e4m3_inputs: bool = False,
         kv_scale_factors: bool = False,
+        e4m3_cache_grid: bool = False,
     ) -> torch.Tensor:
         """fp32 causal MHA over per-position-roped q/k, headDimV=V_HEAD_DIM.
 
@@ -3590,11 +3593,17 @@ class _MlaPagedEnv:
         q/k rope slices in place). softmax_scale overrides the env's own
         scale, which is what lets a q_scaling sweep build rival references.
 
-        e4m3_inputs rounds q, k and v through e4m3 at scale 1.0, which is what
-        the context FMHA quantizes them to under quant_mode 128 (the pool plays
-        no part in the context math; it is written, not read). kv_scale_factors
-        adds the two factors that path applies on top — softmax scale * s**2
-        and output * s — which cancel only at s = 1.0.
+        e4m3_inputs rounds q, k and v through e4m3 at scale 1.0 — the s = 1.0
+        form of the cache write scale the context FMHA quantizes its bf16 copies
+        to under quant_mode 128 (the pool itself plays no part in the context
+        math; it is written, not read — its write *scale* rides on the copies
+        since 46d4e94654, see e4m3_cache_grid). kv_scale_factors
+        adds the two dequantization factors the path folds into its bmm scales —
+        softmax scale * s**2 and output * s — which cancel only at s = 1.0.
+        e4m3_cache_grid rounds the operands at the cache write scale instead,
+        e4m3(x * kv_scale_orig_quant), the grid the op's bf16 operand copies
+        are quantized on since 46d4e94654; together with the two factors it
+        reproduces that runtime math exactly, which is true math at every s.
         """
         scale = self.softmax_scale if softmax_scale is None else softmax_scale
         out_scale = 1.0
@@ -3617,9 +3626,10 @@ class _MlaPagedEnv:
                 # k_pe comes from latent_cache, roped and broadcast per head.
                 k_seq[i, :, QK_NOPE_HEAD_DIM:] = self.rope_ref(latent[i, KV_LORA_RANK:], i).float()
             if e4m3_inputs:
-                q_seq = q_seq.to(torch.float8_e4m3fn).float()
-                k_seq = k_seq.to(torch.float8_e4m3fn).float()
-                v_seq = v_seq.to(torch.float8_e4m3fn).float()
+                grid = (1.0 / self.kv_scale) if e4m3_cache_grid else 1.0
+                q_seq = (q_seq * grid).to(torch.float8_e4m3fn).float()
+                k_seq = (k_seq * grid).to(torch.float8_e4m3fn).float()
+                v_seq = (v_seq * grid).to(torch.float8_e4m3fn).float()
             scores = torch.einsum("ihd,jhd->hij", q_seq, k_seq) * scale
             mask = torch.tril(torch.ones(ln, ln, dtype=torch.bool, device="cuda"))
             probs = torch.softmax(scores.masked_fill(~mask, float("-inf")), dim=-1)
@@ -3785,6 +3795,7 @@ def _explicit_kv_reference(
     softmax_scale: float = MLA_SOFTMAX_SCALE,
     e4m3_inputs: bool = False,
     out_scale: float = 1.0,
+    e4m3_grid_scale: float = 1.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """fp32 attention over explicit per-sequence K/V ranges plus softmax
     stats: per (token, head), m = row max of the scaled logits and
@@ -3794,10 +3805,15 @@ def _explicit_kv_reference(
     undefined and downstream merge plans skip them. Returns
     (bf16 output [Tq, H*v], fp32 stats [Tq, H, 2]).
 
-    e4m3_inputs rounds q, k and v through e4m3 at scale 1.0, which is what this
-    flavor quantizes them to under quant_mode 128; out_scale multiplies the
+    e4m3_inputs rounds q, k and v through e4m3 at scale 1.0 — the s = 1.0
+    form of the cache write grid this flavor quantizes its bf16 copies to under
+    quant_mode 128; out_scale multiplies the
     output, the second of the two dequantization factors that path applies (the
-    first, s**2, rides in softmax_scale). Both cancel only at s = 1.0. The
+    first, s**2, rides in softmax_scale). Both cancel only at s = 1.0.
+    e4m3_grid_scale pre-multiplies the operands before the e4m3 rounding —
+    kv_scale_orig_quant (1/s) is the grid the op's own bf16-copies
+    quantization runs at, so with the two kv-scale factors it reconstructs
+    that path's math exactly. The
     stats stay in the un-scaled domain the op writes them in and are not
     certified on the fp8 path."""
     total_q = sum(q_lens)
@@ -3812,9 +3828,9 @@ def _explicit_kv_reference(
         k_seq = k[kv_start : kv_start + kv_len].view(kv_len, num_heads, QK_HEAD_DIM).float()
         v_seq = v[kv_start : kv_start + kv_len].view(kv_len, num_heads, V_HEAD_DIM).float()
         if e4m3_inputs:
-            q_seq = q_seq.to(torch.float8_e4m3fn).float()
-            k_seq = k_seq.to(torch.float8_e4m3fn).float()
-            v_seq = v_seq.to(torch.float8_e4m3fn).float()
+            q_seq = (q_seq * e4m3_grid_scale).to(torch.float8_e4m3fn).float()
+            k_seq = (k_seq * e4m3_grid_scale).to(torch.float8_e4m3fn).float()
+            v_seq = (v_seq * e4m3_grid_scale).to(torch.float8_e4m3fn).float()
         scores = torch.einsum("ihd,jhd->hij", q_seq, k_seq) * softmax_scale
         if mask_type == MASK_CAUSAL:
             offset = kv_len - q_len
@@ -4088,8 +4104,8 @@ def test_fp8_mla_context_prefill_h128() -> None:
     both measured here rather than inherited:
 
     1. The context FMHA does *not* stay in bf16. Under quant_mode 128 the MLA
-       context path quantizes q, k and v to e4m3 (at scale 1.0 — the pool's
-       write scale is not applied to them) and runs the FMHA on those, so
+       context path quantizes q, k and v to e4m3 (at the cache write scale,
+       1.0 here, since 46d4e94654) and runs the FMHA on those, so
        prefill accuracy *is* affected by cache quantization. The bf16-KV
        reference — the one the bf16 pool is certified against, and what a
        caller would assume from the standard-configuration section — sits far
@@ -4310,10 +4326,14 @@ def test_fp8_mla_kv_scale_semantics_h128() -> None:
     Write side (both phases' appends): kv_scale_orig_quant is applied, and the
     row lands bit-exactly as e4m3(row * orig_quant) at every scale.
 
-    Context read side: the FMHA quantizes q/k/v at scale 1.0 but still applies
-    the dequantization factors s**2 (softmax scale) and s (output), so at
-    s != 1.0 the context result is silently wrong — the s = 1.0 math sits
-    21x-48x outside the fp8 band, while the distorted model reproduces the run.
+    Context read side: the FMHA quantizes q/k/v at the pool write scale —
+    e4m3(x * orig_quant), the grid the copies have carried since 46d4e94654 —
+    and folds the dequantization factors s**2 (softmax scale) and s (output)
+    into its bmm scales, so the context phase is true math at every s, like
+    the decode path. Off the powers of two the s = 1.0 grid placement is left
+    outside the band by the grid shift alone (observed 1.95x at s = 1.5),
+    while the pre-46d4e94654 unit-grid-plus-one-fold model is left far
+    behind at every non-unit s (observed 9.1x / 12.0x at s = 1.5 / 2.0).
 
     Generation read side: neither scale tensor is read at all. The dequant has
     to arrive folded into mla_bmm1_scale/mla_bmm2_scale (as the production
@@ -4337,21 +4357,40 @@ def test_fp8_mla_kv_scale_semantics_h128() -> None:
         if scale == 1.0:
             torch.testing.assert_close(out, true_ref, rtol=FP8_MLA_RTOL, atol=FP8_MLA_ATOL)
         else:
+            # Since 46d4e94654 the context is true math at every s: the bf16
+            # copies ride the cache write grid and the two kv-scale factors fold
+            # into the bmm scales. The runtime reference reproduces the run inside
+            # the band, with the same headroom the certified s=1.0 case has
+            # (observed 0.42x at both s=1.5 and s=2.0).
+            runtime_ref = env.context_reference(
+                lens, *pre, e4m3_inputs=True, kv_scale_factors=True, e4m3_cache_grid=True
+            )
+            torch.testing.assert_close(out, runtime_ref, rtol=FP8_MLA_RTOL, atol=FP8_MLA_ATOL)
+            if scale == 1.5:
+                # Off the powers of two the unit-grid math is left outside the
+                # band by the grid shift alone (observed 1.95x at s=1.5): the
+                # sweep's non-power-of-two member is where the two placements
+                # are told apart.
+                unit_band = _band_fraction(out, true_ref, FP8_MLA_ATOL, FP8_MLA_RTOL)
+                assert 1.5 < unit_band < 4.0, (
+                    f"the s={scale} run does not carry the cache write grid "
+                    f"(unit-grid band fraction {unit_band:.4g})"
+                )
+            else:
+                # At s = 2.0 e4m3(x / s) * s retraces e4m3(x) bitwise, so the
+                # cache write grid and the unit grid lead to the same math here.
+                torch.testing.assert_close(out, true_ref, rtol=FP8_MLA_RTOL, atol=FP8_MLA_ATOL)
+            # The pre-46d4e94654 model — unit grid plus the two factors — is
+            # now the rejected one, far outside at every non-unit s (observed 9.1x
+            # at s=1.5 and 12.0x at s=2.0, against the 0.42x of the runtime
+            # reference above).
             _assert_far_outside_band(
                 out,
-                true_ref,
-                10.0,
-                f"fp8 MLA context at s={scale} against the s=1.0 math",
+                distorted,
+                4.0,
+                f"fp8 MLA context at s={scale} against the unit-grid one-fold model",
                 FP8_MLA_ATOL,
                 FP8_MLA_RTOL,
-            )
-            # The distortion is exactly the two kv-scale factors: the model
-            # lands inside the fp8 band itself (observed 0.58x at s=1.5 and
-            # 0.84x at s=2.0, against 21x / 48x for the true-value hypothesis),
-            # so it is gated at 1.5x rather than 1.0x only to leave the same
-            # headroom the certified s=1.0 case has.
-            assert _band_fraction(out, distorted, FP8_MLA_ATOL, FP8_MLA_RTOL) < 1.5, (
-                f"the s**2 / s model does not explain the s={scale} run"
             )
 
     # None in both slots == 1.0 tensors, bitwise, in the output and the pool.
@@ -4725,6 +4764,7 @@ def _fp8_no_append_reference(
     e4m3_inputs: bool = True,
     kv_scale_factors: bool = False,
     softmax_scale: Optional[float] = None,
+    e4m3_cache_grid: bool = False,
 ) -> torch.Tensor:
     """The no-append context flavor's fp8 reference — the counterpart of
     _MlaPagedEnv.context_reference for this flavor's explicit K/V.
@@ -4733,8 +4773,12 @@ def _fp8_no_append_reference(
     which is what the call quantizes them to under quant_mode 128; setting it
     False builds the bf16-KV rival. kv_scale_factors adds the two factors that
     path applies on top — s**2 on the softmax scale and s on the output —
-    which cancel only at s = 1.0. softmax_scale overrides the env's own scale,
-    which is what builds a q_scaling rival.
+    which cancel only at s = 1.0. e4m3_cache_grid rounds the operands at the
+    cache write scale, e4m3(x * kv_scale_orig_quant), the grid the op's
+    bf16-copies quantization runs at since 46d4e94654; with the two factors
+    it reproduces that runtime math exactly — true math at every s.
+    softmax_scale overrides the env's own scale, which is what builds a q_scaling
+    rival.
     """
     scale = env.softmax_scale if softmax_scale is None else softmax_scale
     s = env.kv_scale if kv_scale_factors else 1.0
@@ -4749,6 +4793,7 @@ def _fp8_no_append_reference(
         scale * s * s,
         e4m3_inputs=e4m3_inputs,
         out_scale=s,
+        e4m3_grid_scale=(1.0 / env.kv_scale) if e4m3_cache_grid else 1.0,
     )[0]
 
 
@@ -4824,15 +4869,18 @@ def test_fp8_mla_no_append_operands_and_scale_h128() -> None:
        has, and it could not be assumed here, because this flavor's K/V arrive
        already dequantized from an fp8 pool and it appends nothing. Peaked
        readout: give key 0 a score no other key approaches, and every output
-       row *is* V row 0. It comes back as e4m3(V[0]) with max abs deviation 0
-       (99.98% of the raw bytes equal, the rest signed zeros), while the
-       unquantized V[0] a bf16-pool call would return is 60.5 bf16 ulps away.
-    2. The two kv-scale factors land on it exactly as they land on the fresh
-       flavor: quantization at 1.0, then s**2 on the softmax scale and s on the
-       output. At s = 2.0 the peaked readout returns 2 * e4m3(V[0]) bit for
-       bit, and on realistic inputs the true-value model sits 48x outside the
-       band while the distorted one explains the run at 0.86 of it. So this
-       flavor is correct at s = 1.0 alone, like the other context flavor.
+       row *is* V row 0 — as the runtime's own arithmetic s * e4m3(V[0] / s),
+       bit-exact to at least 99.96% at every s of the sweep; at the production
+       s = 1.0 that is plain e4m3(V[0])), while the unquantized V[0] a
+    2. The kv scale lands on it exactly as it lands on the fresh flavor, since
+       46d4e94654: quantization at the cache write grid, then s**2 on the
+       softmax scale and s on the output — together, true math at every s. On
+       realistic inputs the runtime reference explains the run inside the band
+       (observed 0.40x / 0.35x at s = 1.5 / 2.0) while the unit-grid
+       rivals are left outside — the one-fold model far outside (observed 9.3x /
+       11.7x), the unit-grid true math off the powers of two (observed 2.15x at
+       s = 1.5, bitwise retraced at s = 2.0). So this flavor is correct at
+       any s, like the other context flavor.
     """
     h = MLA_NUM_HEADS_H128
     seq_len = 40
@@ -4871,8 +4919,14 @@ def test_fp8_mla_no_append_operands_and_scale_h128() -> None:
             v,
         ).view(seq_len, h, V_HEAD_DIM)
 
+        # The runtime grids V[0] at the cache write scale (since 46d4e94654) and
+        # multiplies s back through bmm2's scale: the readout is s * e4m3(V[0]/s)
+        # in fp32 arithmetic, retracing e4m3(V[0]) * s bitwise at powers of two.
         expected = (
-            (v0.float().to(torch.float8_e4m3fn).float() * scale)
+            (v0.float() * (1.0 / scale))
+            .to(torch.float8_e4m3fn)
+            .float()
+            .mul(scale)
             .to(torch.bfloat16)
             .unsqueeze(0)
             .expand_as(rows)
@@ -4884,7 +4938,7 @@ def test_fp8_mla_no_append_operands_and_scale_h128() -> None:
             .mean()
         )
         assert exact > 0.99, (
-            f"only {exact:.4f} of the readout is bit-exact {scale} * e4m3(V[0]) at s={scale}"
+            f"only {exact:.4f} of the readout is bit-exact s * e4m3(V[0] / s) at s={scale}"
         )
         rival = (v0.float() * scale).unsqueeze(0)
         ulps = float(((rows.float() - rival).abs() / (2**-8 * rival.abs().clamp(min=2**-8))).max())
@@ -4893,7 +4947,7 @@ def test_fp8_mla_no_append_operands_and_scale_h128() -> None:
             f"s={scale} — this probe cannot tell an e4m3 V operand from a bf16 one"
         )
 
-    # Realistic inputs: which of the two models explains a run at s != 1.0.
+    # Realistic inputs: which model explains a run at s != 1.0.
     new_lens = [32, 9]
     kv_lens = [64, 24]
     for scale in KV_SCALE_SWEEP:
@@ -4912,19 +4966,33 @@ def test_fp8_mla_no_append_operands_and_scale_h128() -> None:
         if scale == 1.0:
             torch.testing.assert_close(out, true_ref, rtol=FP8_MLA_RTOL, atol=FP8_MLA_ATOL)
         else:
+            # Since 46d4e94654 this flavor is true math at every s, on the cache
+            # write grid; the runtime reference reproduces the run inside the band
+            # (observed 0.40x at s=1.5 and 0.35x at s=2.0).
+            runtime_ref = _fp8_no_append_reference(
+                env, *operands, kv_scale_factors=True, e4m3_cache_grid=True
+            )
+            torch.testing.assert_close(out, runtime_ref, rtol=FP8_MLA_RTOL, atol=FP8_MLA_ATOL)
+            if scale == 1.5:
+                # the grid shift alone leaves the unit-grid math outside the band
+                # here too (observed 2.15x); at s=2.0 the e4m3 grid retraces
+                # bitwise, so both placements coincide there
+                unit_band = _band_fraction(out, true_ref, FP8_MLA_ATOL, FP8_MLA_RTOL)
+                assert 1.5 < unit_band < 4.0, (
+                    f"the s={scale} no-append run does not carry the cache write "
+                    f"grid (unit-grid band fraction {unit_band:.4g})"
+                )
+            # The pre-46d4e94654 unit-grid-plus-one-fold model is the rejected
+            # one, far outside at every non-unit s (observed 9.3x at s=1.5 and
+            # 11.7x at s=2.0).
+            distorted = _fp8_no_append_reference(env, *operands, kv_scale_factors=True)
             _assert_far_outside_band(
                 out,
-                true_ref,
-                10.0,
-                f"fp8 no-append MLA context at s={scale} against the s=1.0 math",
+                distorted,
+                4.0,
+                f"fp8 no-append MLA context at s={scale} against the unit-grid one-fold model",
                 FP8_MLA_ATOL,
                 FP8_MLA_RTOL,
-            )
-            # Same 1.5x allowance the fresh-prefill scale case uses: the
-            # distorted model lands inside the band (observed 0.86x at s=2.0).
-            distorted = _fp8_no_append_reference(env, *operands, kv_scale_factors=True)
-            assert _band_fraction(out, distorted, FP8_MLA_ATOL, FP8_MLA_RTOL) < 1.5, (
-                f"the s**2 / s model does not explain the s={scale} run"
             )
 
 
@@ -5668,6 +5736,7 @@ def _op_reference(
     causal: bool = True,
     e4m3: bool = False,
     layer: Optional[int] = None,
+    window: Optional[int] = None,
     nvfp4: bool = False,
 ) -> torch.Tensor:
     """`op.reference` over the history the env mirrored for these requests.
@@ -5699,6 +5768,7 @@ def _op_reference(
         v_head_dim=d,
         softmax_scale=1.0 / math.sqrt(d),
         causal=causal,
+        window=window,
         e4m3_inputs=e4m3,
         e4m3_probabilities=e4m3,
     )
@@ -7242,10 +7312,11 @@ def _cell_paged(cell, arm) -> None:
         tokens_per_block=spec["tokens_per_block"],
         num_blocks=spec["num_blocks"],
         max_batch=spec["max_num_requests"],
-        max_blocks_per_seq=16,
+        max_blocks_per_seq=spec.get("max_blocks_per_seq", 16),
         pool_dtype=torch.float8_e4m3fn if fp8 else torch.bfloat16,
         quant_mode=spec["quant_mode"],
         kv_scaling_factor=spec["kv_scale"] if fp8 or nvfp4 else None,
+        attention_window_size=spec["window"],
     )
     cached, new, nc = spec["cached"], spec["new"], spec["num_contexts"]
     p, paged = spec["predicted_tokens_per_seq"], spec["use_paged_context_fmha"]
@@ -7283,7 +7354,10 @@ def _cell_paged(cell, arm) -> None:
     assert not (nvfp4 and not paged), "an NVFP4 cell runs the paged-context path"
     e4m3 = (fp8 or nvfp4) and (paged or nc == 0)
     causal = spec["mask_type"] == MASK_CAUSAL
-    _compare(out, _op_reference(env, qkv, list(new), rids, causal=causal, e4m3=e4m3, nvfp4=nvfp4))
+    ref = _op_reference(
+        env, qkv, list(new), rids, causal=causal, e4m3=e4m3, window=spec["window"], nvfp4=nvfp4
+    )
+    _compare(out, ref)
     for rid in rids:
         env.check_cache(rid)
     env.check_unwritten_pool_zero()
@@ -7550,7 +7624,7 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             ),
         ),
     ),
-    "qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__tp1": (
+    "qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default": (
         Cell(
             why="qwen4_exp prefill: GQA 24q/2kv d256, bf16 pool, paged context; "
             "a fresh 70-row sequence beside 33 rows over a 48-token cached prefix",

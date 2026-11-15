@@ -49,7 +49,7 @@ template <typename InputType, typename OutputType, typename SFType>
 void moeActivation(InputType const* input, OutputType* output, float const* global_sf, SFType* output_sf,
     int32_t const* tile_idx_to_mn_limit, int32_t const* num_non_exiting_tiles,
     cutlass_kernels::ActivationParams activation_params, int32_t const max_num_permuted_tokens,
-    int32_t const interm_size, int32_t const tile_size, cudaStream_t stream);
+    int32_t const interm_size, int32_t const tile_size, cudaStream_t stream, bool const gate_first = false);
 
 } // namespace kernels::cute_dsl
 

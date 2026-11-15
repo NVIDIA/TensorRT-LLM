@@ -36,7 +36,7 @@ from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 
 from .combined import CombinedFmha
-from .interface import Fmha, FmhaPhase
+from .interface import Fmha, FmhaPhase, FmhaPrewarmConfig
 from .phased import PhasedFmha
 from .registry import get_enabled_fmha_lib_classes
 
@@ -133,6 +133,7 @@ class _FmhaCacheKey(NamedTuple):
     generation_batch_size: int
     generation_seq_len_q: int
     attention_mask_type: AttentionMaskType
+    has_variable_window: bool
     use_spec_decoding: bool
     has_block_sparse_inputs: bool
     # LoRA can change the effective output from packed NVFP4 to unpacked BF16
@@ -344,6 +345,26 @@ class FmhaManager:
                 self.fmha_libs.append(fmha_cls(attn))
         self._layer_idx = getattr(attn, "layer_idx", None)
 
+    def prewarm(self, config: FmhaPrewarmConfig, attempted: set[type[Fmha]]) -> None:
+        """Try each eligible library once across all local attention layers."""
+        for fmha in self.fmha_libs:
+            fmha_cls = type(fmha)
+            if fmha_cls in attempted:
+                continue
+            try:
+                if not fmha.can_prewarm(config):
+                    continue
+                attempted.add(fmha_cls)
+                fmha.prewarm()
+            except Exception as e:
+                # Optional JIT initialization must not fail startup. An actual
+                # forward retries the build if it selects this library.
+                attempted.add(fmha_cls)
+                logger.warning(
+                    f"{fmha_cls.__name__} prewarm failed; retrying lazily on first use. "
+                    f"{type(e).__name__}: {e}"
+                )
+
     def _announce(self, fmha: Fmha, cache_key: _FmhaCacheKey) -> None:
         # One line per library per layer is enough to tell which kernel
         # serves a model; the logger dedups on the key.
@@ -418,6 +439,7 @@ class FmhaManager:
             generation_batch_size=generation_batch_size,
             generation_seq_len_q=generation_seq_len_q,
             attention_mask_type=attention_mask_type,
+            has_variable_window=forward_args.variable_window_token_starts is not None,
             use_spec_decoding=metadata.use_spec_decoding,
             has_block_sparse_inputs=block_sparse_inputs is not None,
             output_dtype=output_dtype,

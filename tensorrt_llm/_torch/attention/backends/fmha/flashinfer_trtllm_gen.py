@@ -61,7 +61,7 @@ from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantMode
 
-from .interface import FmhaPhase
+from .interface import FmhaPhase, FmhaPrewarmConfig
 from .phased import FmhaParams, PhasedFmha
 from .utils import (
     get_attention_chunk_size,
@@ -403,6 +403,77 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             return False
 
         return True
+
+    @staticmethod
+    def prewarm() -> None:
+        """Build flashinfer's TRTLLM-Gen FMHA module now instead of on first use.
+
+        On first use flashinfer downloads the module's kernel metadata and
+        compiles its launcher with nvcc; later calls only load the built module.
+        """
+        # Decode, prefill and MLA all load the same fmha_gen JIT spec. One
+        # getter builds its shared library and installs its cubin loader.
+        flashinfer.decode.get_trtllm_gen_fmha_module()
+
+    def can_prewarm(self, config: FmhaPrewarmConfig) -> bool:
+        """Check static phase eligibility without allocating request tensors."""
+        attn = self.attn
+        if config.helix or self.serves_only_extra_page_sizes() or attn.sparse_params is not None:
+            return False
+        if (
+            attn.position_embedding_type in (4, 5)
+            or config.dtype not in self.SUPPORTED_INPUT_DTYPES
+        ):
+            return False
+        page_size = config.tokens_per_block
+        if (
+            page_size <= 0
+            or page_size & (page_size - 1)
+            or page_size not in self.SUPPORTED_TOKENS_PER_BLOCK | config.extra_tokens_per_block
+        ):
+            return False
+        kv_dtype = config.kv_cache_dtype
+        output_dtype = attn.get_quantize_output_dtype(False) or config.dtype
+        low_precision_output = output_dtype == torch.float8_e4m3fn
+        context_q_dtype = (
+            torch.float8_e4m3fn
+            if low_precision_output or kv_dtype in (DataType.FP8, DataType.NVFP4)
+            else config.dtype
+        )
+        generation_q_dtype = (
+            torch.float8_e4m3fn
+            if low_precision_output or kv_dtype == DataType.NVFP4
+            else config.dtype
+        )
+        if attn.is_mla_enable:
+            generation_supported, _ = self._check_mla_generation_support(
+                head_size=attn.head_dim,
+                num_heads=attn.num_heads,
+                tokens_per_block=page_size,
+                kv_lora_rank=attn.kv_lora_rank,
+                qk_rope_head_dim=attn.qk_rope_head_dim,
+            )
+            context_supported = False
+        else:
+            # Keep unusual dense head sizes on lazy initialization even if a
+            # generation request might eventually find a compatible kernel.
+            if attn.head_dim in self.UNSUPPORTED_HEAD_SIZES_CONTEXT:
+                return False
+            context_supported = True
+            generation_supported = (
+                attn.num_heads // attn.num_kv_heads <= self.MAX_HEADS_RATIO_GENERATION
+            )
+        return (
+            config.context
+            and context_supported
+            and (context_q_dtype, kv_dtype, output_dtype) in self.SUPPORTED_DTYPE_COMBOS_CONTEXT
+        ) or (
+            config.generation
+            and generation_supported
+            and page_size >= self.MIN_TOKENS_PER_BLOCK
+            and (generation_q_dtype, kv_dtype, output_dtype)
+            in self.SUPPORTED_DTYPE_COMBOS_GENERATION
+        )
 
     @classmethod
     def serves_only_extra_page_sizes(cls) -> bool:

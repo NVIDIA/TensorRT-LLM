@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -157,10 +157,13 @@ private:
      */
     AllocationInfo getAllocationInfoFromDevPtr(void const* devPtr);
 
-    // if GPU memory has NUMA id, then CPU can direct access that. We should use this.
+    // Host access to device memory, in order of preference:
+    // 1. GPU memory is a NUMA node (mGpuMemNumaId >= 0), so the CPU can access it directly.
     int mGpuMemNumaId = -1;
-    // if Not, we should use GDRCopy
+    // 2. Otherwise, GDRCopy maps device memory for the host.
     gdr_t mGdrHandle = nullptr;
+    // 3. Without GDRCopy, managed memory that the host can access directly (hardware-coherent platforms).
+    bool mHostDirectManagedAccess = false;
 
     int mDevId = -1;
 

@@ -34,7 +34,8 @@ import requests
 import yaml
 from defs.common import get_free_port_in_ci as get_free_port
 from defs.common import (get_ucx_tls, parse_gsm8k_output,
-                         resolve_llm_model_path, wait_for_server)
+                         resolve_llm_model_path, wait_for_reported_addr,
+                         wait_for_server)
 from defs.conftest import (get_sm_version, llm_models_root, skip_arm,
                            skip_no_hopper, skip_pre_blackwell, skip_pre_hopper)
 from defs.deepseek_v41_gsm8k import GSM8K_TEST_TIMEOUT
@@ -800,7 +801,7 @@ def setup_disagg_cluster(
     log_output_dir: str | None = None,
 ) -> tuple[dict[str, Any], list[ProcessWrapper], list[ProcessWrapper],
            ProcessWrapper, int, str]:
-    """Load config, launch workers + disagg server, wait for ready.
+    """Load config, launch the workers and the disagg server, wait for ready.
 
     Args:
         config_file: Path to disaggregated server config YAML
@@ -819,7 +820,8 @@ def setup_disagg_cluster(
             startup fails (CI's --output-dir, so they get uploaded)
 
     Returns:
-        tuple: (config, ctx_workers, gen_workers, disagg_server, server_port, work_dir)
+        tuple: (config, ctx_workers, gen_workers, disagg_server, server_port, work_dir),
+        where server_port is the port the disagg server bound
     """
     with open(config_file, 'r') as f:
         config = yaml.safe_load(f)
@@ -847,7 +849,6 @@ def setup_disagg_cluster(
     if disagg_cluster_overrides:
         disagg_cluster.update(disagg_cluster_overrides)
     server_host = config.get("hostname", "localhost")
-    server_port = get_free_port()
     if save_log:
         log_base = os.path.join(cwd or ".", "disagg-logs")
         os.makedirs(log_base, exist_ok=True)
@@ -856,15 +857,27 @@ def setup_disagg_cluster(
         work_dir = tempfile.mkdtemp()
     logger.info(f"Disagg cluster work_dir (worker logs): {work_dir}")
     server_env = env
-    coordinator_url = f"http://{server_host}:{server_port}"
+    report_addr = None
     if config.get("num_workers", 1) > 1:
+        # trtllm-serve rejects port 0 for a fleet, whose frontends share one
+        # public port, so that port and the coordinator's are picked here.
+        server_port = get_free_port()
         coordinator_port = get_free_port()
         while coordinator_port == server_port:
             coordinator_port = get_free_port()
-        coordinator_url = f"http://{server_host}:{coordinator_port}"
+        disagg_cluster[
+            "cluster_uri"] = f"http://{server_host}:{coordinator_port}"
         server_env = (env or os.environ).copy()
         server_env["TRTLLM_DISAGG_COORDINATOR_PORT"] = str(coordinator_port)
-    disagg_cluster["cluster_uri"] = coordinator_url
+    else:
+        # The server binds a kernel-assigned port and writes it to report_addr,
+        # so no other process can take the port between choosing and binding
+        # it. The server hosts the cluster storage on its own port and never
+        # reads the port in its copy of cluster_uri; the workers get the
+        # reported address.
+        server_port = 0
+        report_addr = os.path.join(work_dir, "disagg_server.addr")
+        disagg_cluster["cluster_uri"] = f"http://{server_host}:0"
 
     # Auto-deduce minimal_instances from num_instances
     ctx_servers = config.get("context_servers", {})
@@ -884,18 +897,12 @@ def setup_disagg_cluster(
                     gen_servers.get("pipeline_parallel_size", 1) *
                     gen_servers.get("context_parallel_size", 1))
 
-    # Build worker configs
     internal_request_auth_key = config.get(
         "internal_request_auth_key") or secrets.token_hex(32)
-    ctx_worker_config = build_worker_config(config, ctx_servers, disagg_cluster)
-    gen_worker_config = build_worker_config(config, gen_servers, disagg_cluster)
-    ctx_worker_config["internal_request_auth_key"] = internal_request_auth_key
-    gen_worker_config["internal_request_auth_key"] = internal_request_auth_key
 
     cluster_start = time.perf_counter()
     print("[startup] cluster_launch_to_ready: start", flush=True)
 
-    # Launch workers
     model = model_name or config.get("model")
     if model:
         model = resolve_llm_model_path(model)
@@ -908,6 +915,62 @@ def setup_disagg_cluster(
     num_gpus = torch.cuda.device_count()
 
     try:
+        server_config = {
+            "hostname":
+            server_host,
+            "port":
+            server_port,
+            "num_workers":
+            config.get("num_workers", 1),
+            "disagg_cluster":
+            disagg_cluster,
+            "context_servers": {
+                "router": ctx_servers.get("router", {})
+            },
+            "generation_servers": {
+                "router": gen_servers.get("router", {})
+            },
+            "conditional_disagg_config":
+            config.get("conditional_disagg_config", None),
+            "perf_metrics_max_requests":
+            config.get("perf_metrics_max_requests", 0),
+            "perf_metrics_output_dir":
+            config.get("perf_metrics_output_dir", None),
+            "return_perf_metrics":
+            config.get("return_perf_metrics", False),
+            "internal_request_auth_key":
+            internal_request_auth_key,
+        }
+        if schedule_style:
+            server_config["schedule_style"] = schedule_style
+        server_launch_kwargs = dict(save_log=save_log, env=server_env, cwd=cwd)
+        if report_addr is not None:
+            # The workers register with the server, so a server on a
+            # kernel-assigned port starts first and they get the port it
+            # reports.
+            disagg_server = run_disagg_server(server_config,
+                                              work_dir,
+                                              server_port,
+                                              report_addr=report_addr,
+                                              **server_launch_kwargs)
+            _, server_port = wait_for_reported_addr(report_addr,
+                                                    server_start_timeout,
+                                                    disagg_server.process)
+            disagg_server.port = server_port
+            disagg_cluster = dict(
+                disagg_cluster,
+                cluster_uri=f"http://{server_host}:{server_port}")
+
+        # Build worker configs and launch workers
+        ctx_worker_config = build_worker_config(config, ctx_servers,
+                                                disagg_cluster)
+        gen_worker_config = build_worker_config(config, gen_servers,
+                                                disagg_cluster)
+        ctx_worker_config[
+            "internal_request_auth_key"] = internal_request_auth_key
+        gen_worker_config[
+            "internal_request_auth_key"] = internal_request_auth_key
+
         for i in range(num_ctx_instances):
             device_ids = ",".join(
                 str(d) for d in dict.fromkeys((next_device + j) % num_gpus
@@ -948,41 +1011,12 @@ def setup_disagg_cluster(
             )
             next_device += gpus_per_gen
 
-        # Build minimal server config and launch
-        server_config = {
-            "hostname":
-            server_host,
-            "port":
-            server_port,
-            "num_workers":
-            config.get("num_workers", 1),
-            "disagg_cluster":
-            disagg_cluster,
-            "context_servers": {
-                "router": ctx_servers.get("router", {})
-            },
-            "generation_servers": {
-                "router": gen_servers.get("router", {})
-            },
-            "conditional_disagg_config":
-            config.get("conditional_disagg_config", None),
-            "perf_metrics_max_requests":
-            config.get("perf_metrics_max_requests", 0),
-            "perf_metrics_output_dir":
-            config.get("perf_metrics_output_dir", None),
-            "return_perf_metrics":
-            config.get("return_perf_metrics", False),
-            "internal_request_auth_key":
-            internal_request_auth_key,
-        }
-        if schedule_style:
-            server_config["schedule_style"] = schedule_style
-        disagg_server = run_disagg_server(server_config,
-                                          work_dir,
-                                          server_port,
-                                          save_log=save_log,
-                                          env=server_env,
-                                          cwd=cwd)
+        if disagg_server is None:
+            # A fleet's public and coordinator ports are picked above, so its
+            # server starts after the workers.
+            disagg_server = run_disagg_server(server_config, work_dir,
+                                              server_port,
+                                              **server_launch_kwargs)
 
         all_workers = ctx_workers + gen_workers
 
@@ -1115,9 +1149,10 @@ def run_disaggregated_test(example_dir,
                            config_overrides=None):
     """Run disaggregated test using service discovery instead of MPI.
 
-    If assert_ctx_log_contains or assert_gen_log_contains is set, worker logs are captured and,
-    after the client tests, at least one worker of each specified role must log its substring
-    (used to prove an intended code path actually engaged instead of silently falling back).
+    If assert_ctx_log_contains or assert_gen_log_contains is set (a substring or a tuple of them),
+    worker logs are captured and, after the client tests, at least one worker of each specified
+    role must log each substring (used to prove an intended code path actually engaged instead of
+    silently falling back).
     """
     if mpi_disabled():
         pytest.skip(
@@ -1185,11 +1220,11 @@ def run_disaggregated_test(example_dir,
             use_ray=True)
         if post_client_test is not None:
             post_client_test(server_url)
-        for role, workers, marker in (
+        for role, workers, markers in (
             ("context", ctx_workers, assert_ctx_log_contains),
             ("generation", gen_workers, assert_gen_log_contains),
         ):
-            if marker is None:
+            if markers is None:
                 continue
             # Fail loudly if the marker is absent: the code path the test means to
             # exercise never ran and something else silently took its place.
@@ -1198,10 +1233,12 @@ def run_disaggregated_test(example_dir,
                 if w.log_path and os.path.exists(w.log_path):
                     with open(w.log_path, 'r', errors='replace') as f:
                         logs.append(f.read())
-            assert any(marker in log for log in logs), (
-                f"expected marker {marker!r} in a {role}-worker log, "
-                f"but none of {len(logs)} log(s) contained it "
-                f"(the intended code path did not engage)")
+            for marker in ((markers, )
+                           if isinstance(markers, str) else markers):
+                assert any(marker in log for log in logs), (
+                    f"expected marker {marker!r} in a {role}-worker log, "
+                    f"but none of {len(logs)} log(s) contained it "
+                    f"(the intended code path did not engage)")
         success = True
     finally:
         terminate(*ctx_workers, *gen_workers, disagg_server)
@@ -1557,6 +1594,67 @@ def test_disaggregated_overlap_transceiver_runtime_python(
                            env=env,
                            model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.skip_less_device(4)
+def test_disaggregated_context_first_bf16_ownership(
+        disaggregated_test_root: str, llm_venv: Any,
+        disaggregated_example_root: str) -> None:
+    """Exercise serving activation and output through two real TP2 executors.
+
+    Args:
+        disaggregated_test_root: Fixture preparing the integration test assets.
+        llm_venv: Runtime environment with the tested TRT-LLM installation.
+        disaggregated_example_root: Existing disaggregated serving/client harness.
+
+    This verifies activation and successful serving, not outstanding-DMA fencing
+    or replacement after a fatal transfer. Native module tests cover retirement.
+    """
+    model_root = resolve_llm_model_path("Qwen3/Qwen3-0.6B")
+    setup_model_symlink(llm_venv, model_root, "Qwen3/Qwen3-0.6B")
+    env = llm_venv._new_env.copy()
+    env.update({
+        "TRTLLM_ENABLE_KV_TRANSFER_LIFECYCLE_ENFORCEMENT": "1",
+        "TRTLLM_DISAGG_NO_RETRY": "1",
+        "TRTLLM_USE_PY_NIXL_KVCACHE": "0",
+        "TRTLLM_NIXL_KVCACHE_BACKEND": "UCX",
+        "TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP": "0",
+        "TRTLLM_DISAGG_LAYERWISE": "0",
+        "TRTLLM_ENABLE_FP4_MLA_KV_OWNERSHIP_BRIDGE": "0",
+    })
+    worker_config = {
+        "dtype": "bfloat16",
+        "tensor_parallel_size": 2,
+        "pipeline_parallel_size": 1,
+        "context_parallel_size": 1,
+        "enable_attention_dp": False,
+        "kv_cache_config": {
+            "use_kv_cache_manager_v2": True,
+            "free_gpu_memory_fraction": 0.2,
+            "enable_partial_reuse": False,
+        },
+        "cache_transceiver_config": {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+            "kv_transfer_timeout_ms": 60000,
+            "kv_cache_bounce_size_mb": 0,
+            "agent_bounce_buffer_enable": False,
+            "enable_pipelined_transfer": False,
+        },
+    }
+    run_disaggregated_test(
+        disaggregated_example_root,
+        "overlap_transceiver_runtime_python",
+        env=env,
+        model_path=model_root,
+        cwd=llm_venv.get_working_directory(),
+        disagg_schedule_style="context_first",
+        config_overrides={
+            "context_servers": worker_config,
+            "generation_servers": worker_config,
+        },
+        assert_ctx_log_contains="Context-first BF16 KV ownership ENABLED",
+        assert_gen_log_contains="Context-first BF16 KV ownership ENABLED")
 
 
 # Exercises the disaggregated KV-cache transfer path with the Python cache transceiver runtime
@@ -2092,16 +2190,49 @@ def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_gen_only(
 def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_overlap(
         disaggregated_test_root, llm_venv, disaggregated_example_root,
         deepseek_v3_model_root):
+    """Attention DP with the overlap scheduler and the servers' scheduling fields.
+
+    A long prompt reaches the generation workers trimmed to its tail and must still be answered.
+    """
     setup_model_symlink(llm_venv, deepseek_v3_model_root,
                         "DeepSeek-V3-Lite/fp8")
 
-    run_disaggregated_test(disaggregated_example_root,
-                           "deepseek_v3_lite_fp_8_attention_dp_overlap",
-                           num_iters=1,
-                           env=llm_venv._new_env,
-                           model_path=deepseek_v3_model_root,
-                           cwd=llm_venv.get_working_directory(),
-                           server_start_timeout=1200)
+    def trimmed_prompt_answer(server_url):
+        import requests
+
+        with open(
+                f"{disaggregated_example_root}/clients/long_prompts.json") as f:
+            prompt = json.load(f)[0]
+        # Longer than gen_prompt_tail_tokens: the generation workers get only its tail.
+        prompt += ("\n\nQuestion: What is the capital of Germany?\n"
+                   "Answer: The capital of Germany is")
+        response = requests.post(f"{server_url}/v1/completions",
+                                 json={
+                                     "model": "DeepSeek-V3-Lite/fp8",
+                                     "prompt": prompt,
+                                     "max_tokens": 8,
+                                     "temperature": 0
+                                 },
+                                 timeout=600)
+        assert response.status_code == 200, response.text
+        result = response.json()
+        assert result["usage"]["prompt_tokens"] > 256, result["usage"]
+        text = result["choices"][0]["text"]
+        assert "berlin" in text.lower(), text
+
+    run_disaggregated_test(
+        disaggregated_example_root,
+        "deepseek_v3_lite_fp_8_attention_dp_overlap",
+        num_iters=1,
+        env=llm_venv._new_env,
+        gen_env={"TLLM_LOG_LEVEL": "INFO"},
+        model_path=deepseek_v3_model_root,
+        cwd=llm_venv.get_working_directory(),
+        server_start_timeout=1200,
+        post_client_test=trimmed_prompt_answer,
+        assert_gen_log_contains=(
+            "max_gen_init_admissions_per_pass=1",
+            "prompt tail trimming: first trimmed request sends 256"))
 
 
 @skip_no_hopper
@@ -2192,6 +2323,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_tp1_attention_dp_overlap_one_mtp(
         cwd=llm_venv.get_working_directory())
 
 
+@pytest.mark.skip_less_device(4)
 @skip_no_hopper
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
@@ -2208,6 +2340,7 @@ def test_disaggregated_deepseek_v3_lite_bf16_cache_aware_balance(
                            cwd=llm_venv.get_working_directory())
 
 
+@pytest.mark.skip_less_device(2)
 @skip_no_hopper
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
@@ -2225,6 +2358,7 @@ def test_disaggregated_deepseek_v3_lite_bf16_conditional(
 
 
 # V2 variant of the conditional disagg test: KV manager V2 + Python NIXL transceiver.
+@pytest.mark.skip_less_device(2)
 @skip_no_hopper
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
@@ -2882,6 +3016,7 @@ def run_accuracy_test(model_path: str, server_url: str, concurrency: int,
         return False, accuracy_value
 
 
+@pytest.mark.skip_less_device(3)
 @skip_pre_hopper
 @pytest.mark.parametrize("benchmark_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
@@ -4291,6 +4426,7 @@ def run_disaggregated_cancel_test(example_dir,
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+@pytest.mark.skip_less_device(2)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
 def test_disaggregated_cancel_large_context_requests(disaggregated_test_root,

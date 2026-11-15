@@ -1205,6 +1205,7 @@ class Gemma4UnifiedProcessorShim:
         videos=None,
         return_tensors: str | TensorType | None = "pt",
         do_rescale: bool | None = None,
+        do_normalize: bool | None = None,
         **kwargs,
     ) -> BatchFeature:
         if videos is not None:
@@ -1228,6 +1229,8 @@ class Gemma4UnifiedProcessorShim:
             images_kwargs = {}
             if do_rescale is not None:
                 images_kwargs["do_rescale"] = do_rescale
+            if do_normalize is not None:
+                images_kwargs["do_normalize"] = do_normalize
             processed_images = self.image_processor(
                 images, return_tensors=return_tensors, **images_kwargs
             )
