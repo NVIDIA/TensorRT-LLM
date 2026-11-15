@@ -15,6 +15,7 @@ from .config import (
     _ceil_div,
     _fp4_mla_cutedsl_kernel_module,
     _fp4_mla_packed_rows_per_seq,
+    _fp4_mla_packed_wave_plan_enabled,
 )
 from .layout import _ensure_workspace_tensor
 
@@ -227,5 +228,6 @@ def _launch_fp4_mla_packed_plan(
         query_len=geometry.query_len,
         helix_kv_bounds=geometry.helix_kv_bounds,
         generation_lengths=generation_lengths,
+        wave_plan=_fp4_mla_packed_wave_plan_enabled(),
     )
     metadata.fp4_mla_state.packed_plan_key = geometry.key

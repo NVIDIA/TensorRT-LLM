@@ -27,7 +27,6 @@ set(SRCS
     kvCacheManagerV2Utils.cpp
     kvCacheManagerV2Utils.cu
     mlaCacheFormatter.cpp
-    peftCacheManager.cpp
     rnnCacheFormatter.cpp
     rnnCacheTransBuffer.cpp)
 
@@ -117,6 +116,38 @@ target_link_libraries(tllm_batch_scheduler PUBLIC tllm::kv_cache_legacy)
 target_include_directories(tllm_batch_scheduler
                            PRIVATE ${maybe_nvtx_includedir})
 
+add_library(tllm_context_transfer_consensus STATIC
+            contextTransferVoteReducer.cpp)
+add_library(tllm::context_transfer_consensus ALIAS
+            tllm_context_transfer_consensus)
+target_link_libraries(tllm_context_transfer_consensus PUBLIC tllm::common_error)
+target_compile_features(tllm_context_transfer_consensus PUBLIC cxx_std_20)
+set_target_properties(
+  tllm_context_transfer_consensus PROPERTIES CXX_EXTENSIONS OFF
+                                             POSITION_INDEPENDENT_CODE ON)
+
+add_library(tllm_batch_request_info STATIC requestInfo.cpp)
+add_library(tllm::batch_request_info ALIAS tllm_batch_request_info)
+target_link_libraries(
+  tllm_batch_request_info
+  PUBLIC tllm::kv_cache_legacy
+  PRIVATE ${Python3_LIBRARIES})
+target_compile_features(tllm_batch_request_info PUBLIC cxx_std_20)
+set_target_properties(
+  tllm_batch_request_info PROPERTIES CXX_EXTENSIONS OFF
+                                     POSITION_INDEPENDENT_CODE ON)
+
+add_library(tllm_peft_cache STATIC peftCacheManager.cpp)
+add_library(tllm::peft_cache ALIAS tllm_peft_cache)
+target_link_libraries(
+  tllm_peft_cache
+  PUBLIC tllm::runtime_lora_cache tllm::kv_cache_legacy
+         tllm::runtime_worker_pool
+  PRIVATE tllm::runtime_numpy tllm::runtime_utils)
+target_compile_features(tllm_peft_cache PUBLIC cxx_std_20)
+set_target_properties(tllm_peft_cache PROPERTIES CXX_EXTENSIONS OFF
+                                                 POSITION_INDEPENDENT_CODE ON)
+
 foreach(component tllm_kv_cache_host_memory tllm_kv_cache tllm_kv_cache_legacy
                   tllm_batch_scheduler)
   target_compile_features(${component} PUBLIC cxx_std_20)
@@ -129,8 +160,10 @@ target_compile_options(
 add_cuda_architectures(tllm_kv_cache 89)
 
 add_library(${BATCH_MANAGER_STATIC_TARGET} STATIC ${SRCS})
-target_link_libraries(${BATCH_MANAGER_STATIC_TARGET}
-                      PUBLIC tllm::kv_cache tllm::batch_scheduler)
+target_link_libraries(
+  ${BATCH_MANAGER_STATIC_TARGET}
+  PUBLIC tllm::kv_cache tllm::batch_scheduler tllm::context_transfer_consensus
+         tllm::peft_cache tllm::batch_request_info)
 target_include_directories(
   ${BATCH_MANAGER_STATIC_TARGET}
   PUBLIC ${KV_CACHE_MANAGER_V2_INCLUDE_DIR}

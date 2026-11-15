@@ -127,9 +127,6 @@ def _build_repo(tmp_path: Path, *, modeling: str = _MODELING) -> Path:
         target / catalog_paths.MODEL_OPS_DIRNAME / "moe" / "router.py",
         root / catalog_paths.model_ops_tests_dir(TARGET_REL) / "moe" / "test_modeling_v2_router.py",
     )
-    (root / catalog_paths.CATALOG_TESTS_DIR / "test_modeling_v2_claims.py").write_text(
-        "def test(): ...\n", encoding="utf-8"
-    )
     routing = root / catalog_paths.MODELING_V2_PACKAGE / "models" / "gpt_oss" / "routing.py"
     routing.write_text(
         "def route(*args):\n"

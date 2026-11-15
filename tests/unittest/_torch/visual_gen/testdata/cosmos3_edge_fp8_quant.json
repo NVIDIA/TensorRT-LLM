@@ -1,0 +1,49 @@
+{
+  "backbone_type": "cosmos3_edge_nemotron_dense",
+  "num_hidden_layers": 28,
+  "hidden_act": "relu2",
+  "sound_gen": false,
+  "action_gen": true,
+  "quant_algo": "FP8",
+  "quant_method": "modelopt",
+  "quant_type": "FP8_FP8",
+  "weight_only": false,
+  "config_groups": {
+    "group_0": {
+      "input_activations": {
+        "dynamic": false,
+        "num_bits": 8,
+        "type": "float"
+      },
+      "weights": {
+        "dynamic": false,
+        "num_bits": 8,
+        "type": "float"
+      },
+      "targets": [
+        "Linear"
+      ]
+    }
+  },
+  "runtime": {
+    "diffusion_step_policy": {
+      "schema_version": 1,
+      "type": "first_last_n",
+      "index_space": "denoising_loop_iteration",
+      "scope": [
+        "transformer"
+      ],
+      "default_mode": "native",
+      "first_steps": {
+        "count": 3,
+        "mode": "a16"
+      },
+      "last_steps": {
+        "count": 3,
+        "mode": "a16"
+      },
+      "overlap": "a16",
+      "reasoner": "a16"
+    }
+  }
+}

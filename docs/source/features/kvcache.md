@@ -76,6 +76,10 @@ scheduler_config:
 
 ### Selecting the KV Cache Manager
 
+```{warning}
+KV cache manager V1 (`use_kv_cache_manager_v2: false`, or `auto` when it resolves to V1) is deprecated as of TensorRT-LLM 1.4 (2026-11) and will be removed after the 3-month migration period. Use KV cache manager V2, the default, for supported features. Sleep mode (`sleep_config`), RocketKV, and skip-softmax still require V1 until V2 support is available; keep V1 for these features during migration.
+```
+
 TensorRT LLM ships two KV cache manager implementations. `use_kv_cache_manager_v2`
 selects between them and defaults to `true`, which selects the V2 manager. Set it
 to `false` to select the V1 C++ manager for models that support it. Set it to
@@ -143,17 +147,17 @@ kv_cache_config:
 
 The first part of the dtype names the history storage (NVFP4 values with one
 FP8 scale per 16 elements); the second part is the dtype attention computes
-in and the retained tokens are stored in. Like `dtype: fp8`, it overrides the
+in and the first/last tokens are stored in. Like `dtype: fp8`, it overrides the
 checkpoint's KV quantization: `fp8` selects FP8 KV, `float16` and `bfloat16`
-select the unquantized model dtype. Retention follows the
-cache page granularity, and at least one of `mixed_precision_first_n` and
+select the unquantized model dtype. The first/last tokens are kept in
+whole cache pages, and at least one of `mixed_precision_first_n` and
 `mixed_precision_last_n` must be positive.
 
-Each mixed-precision layer owns two pools: its original pool holds the NVFP4
-history, and a second layer group, appended after the model's own layer
-groups, holds the retained tokens. When `pool_ratio` is set it must therefore
-carry one more entry than the model has layer groups, with the retained-token
-group last; leave it unset to size all groups automatically. Sliding-window
+Each mixed-precision layer keeps two pools: the mixed-precision low pool holds
+the NVFP4 history and the mixed-precision high pool holds the first/last tokens.
+The mixed-precision high pools form one extra layer group after the model's own,
+so a `pool_ratio` must carry one more entry than the model has layer groups, with
+the mixed-precision high group last; leave it unset to size all groups automatically. Sliding-window
 layers and layers whose KV is shared with another layer stay native.
 
 Before a mixed-precision layer runs, the attention metadata gathers the two
@@ -167,9 +171,18 @@ forward converts up to the longest sequence in the batch for every
 mixed-precision layer (the full span inside CUDA graphs), which is the
 feature's per-step cost.
 
-The prototype requires the TRTLLM or FlashInfer attention backend with
-`use_kv_cache_manager_v2: true`, and does not support speculative decoding,
-beam search, sparse attention, cold-page compression or context parallelism.
+The prototype requires `use_kv_cache_manager_v2: true` with the TRTLLM or
+FlashInfer attention backend. It supports the standard V2 manager (dense
+models), the hybrid Mamba manager (Qwen3.5, Kimi-K3) and the sparse MLA
+backends (DSA, DeepSeek-V4), and the speculative decoding modes below. Beam
+search, cold-page compression, KV connectors and context parallelism are not
+supported.
+
+| Speculative decoding | Status | KV cache of the drafter layers |
+|---|---|---|
+| MTP (one-model) | Supported | Mixed-precision high and low pools, like the model's own layers |
+| EAGLE3 (one-model) and other drafters with their own architecture | Supported | Plain cache: the mixed-precision high dtype on dense backends, NVFP4 (the mixed-precision low dtype) on DSA and DeepSeek-V4 |
+| Dynamic-tree drafting | Not supported | Rejected at startup |
 
 ### SWA Endpoint Retention
 
@@ -337,7 +350,67 @@ Before a block is evicted from GPU memory, it can optionally be offloaded to hos
 
 When offloading is enabled, `KvCacheConfig.cold_tier_offload_min_priority` controls which unreferenced blocks can be offloaded. Blocks below the threshold are discarded from GPU memory; blocks at or above it can move to a cold tier. The default threshold is 30. The old name, `secondary_offload_min_priority`, remains accepted as a deprecated alias.
 
+With the V2 KV cache manager, `host_cache_bind_to_gpu_numa_node: true` (prototype) allocates the host tier only on the GPU's host NUMA node, reclaiming page cache there instead of spilling to another node. When the binding cannot be honored, startup fails instead of falling back, for example when a GPU reports no host NUMA node or a node cannot hold the host tiers of all the ranks bound to it.
+
 Here is an [example](../../../examples/llm-api/llm_kv_cache_offloading.py) to show how to enable host offloading.
+
+### Offloading to Disk (KV Cache Manager V2)
+
+KV cache manager V2 can add a disk tier below host memory. Blocks evicted from host memory are written to
+files in `disk_cache_path` and stay reusable until they are evicted from disk; reusing one copies it back
+through host memory. The disk tier is enabled with `disk_cache_size` (bytes, per rank) and
+`disk_cache_path`, and requires `use_kv_cache_manager_v2: true`. A disk tier without a host tier is
+allowed, but the options below that involve the host tier then have no effect.
+`disk_prefetch_num_reqs` starts copying the disk-resident prefix blocks of that many queued context
+requests to host memory ahead of time (0 disables it; it requires block reuse).
+
+Four prototype options reduce the cost of disk I/O. The first three are off by default:
+
+| Option | Effect |
+|---|---|
+| `disk_io_threads` | Runs disk reads and writes on this many worker threads instead of in a CUDA host callback, so several transfers proceed at once and a restore does not wait behind an eviction write. Reads are served first, then eviction writes, then background (write-through) writes; a write that has waited too long is served ahead of that order. Range 0-256. |
+| `disk_keep_copy_after_restore` | When a block is restored from disk, its disk copy is kept. If the block is evicted to disk again, it takes that copy back instead of being written again. |
+| `disk_write_through` | When a block is evicted from GPU to host memory, it is also copied to disk in the background, so its later host-to-disk eviction writes nothing. These copies use free disk space only: on a full disk the copy is skipped and the block is written when it is evicted, as without this option. If the block is evicted to disk while its copy is still being written, the eviction takes the copy and waits for that write, which then runs ahead of other background writes, instead of writing the block again. Requires `disk_io_threads` > 0 and a host tier (`host_cache_size` > 0); without a host tier it is turned off with a warning. |
+| `disk_protected_copy_fraction` | Share of the disk tier, 0.0-1.0 (default 1.0), that the copies kept by the two options above may hold ahead of blocks whose only copy is on disk. See below. |
+
+`disk_keep_copy_after_restore` and `disk_write_through` are independent; either can be used alone. They act
+only on blocks that are fully computed and reusable, so they have no effect when block reuse is disabled.
+A disk copy kept by either option is a duplicate of a block that lives in a hotter tier. It saves a disk
+write, but it takes disk space that could hold a block whose only copy is on disk, so the two compete
+when the disk tier is full. `disk_protected_copy_fraction` sets the balance:
+
+- Copies within the share (`disk_protected_copy_fraction` x the disk tier's blocks) come first. When the
+  disk tier is full, it drops the least recently used blocks whose only copy is on disk, and releases
+  these copies (oldest first) only when that is not enough.
+- Copies beyond the share are released first, before any of those blocks, and write-through makes no
+  copy beyond it.
+
+The default of 1.0 protects every copy, which saves the most writes and suits deployments limited by disk
+write bandwidth. A lower value keeps more distinct blocks on disk, which suits deployments whose reuse is
+limited by disk capacity. 0.0 keeps copies only while there is free disk space.
+
+Disk-tier storage statistics report the copies apart from evictable blocks (`retained_copies`, and
+`secondaryRetainedCopyNumBlocks` in the per-iteration KV cache statistics), and count them as available,
+since the tier releases them when it needs the room.
+
+The worker pool is shared by the whole process: the first KV cache manager that sets a nonzero
+`disk_io_threads` starts it, and later values, including 0, do not change it (a warning is logged when a
+value is ignored).
+
+Setting any of these options to a non-default value without `disk_cache_size` > 0, or with KV cache manager
+V1, is rejected, and `disk_write_through` without `disk_io_threads` > 0 is rejected.
+
+```yaml
+kv_cache_config:
+  use_kv_cache_manager_v2: true
+  enable_block_reuse: true
+  host_cache_size: 171798691840   # 160 GiB
+  disk_cache_size: 1099511627776  # 1 TiB
+  disk_cache_path: /raid/kv_cache
+  disk_io_threads: 16
+  disk_keep_copy_after_restore: true
+  disk_write_through: true
+```
 
 KV cache compression can reduce the storage and transfer cost of offloaded
 Pages, or reduce the amount of KV retained by an algorithm. Compression is
@@ -347,9 +420,13 @@ their activation points.
 
 ### Partial Reuse
 
-Partial reuse of a block can happen when some but not all tokens are matched. It is enabled by default, but can be disabled by setting ```enable_partial_reuse``` to False.
+Partial reuse of a block can happen when some but not all tokens are matched. It is enabled by default. Set `enable_partial_reuse=False` to stop matching part of a cached block.
 
-The property ```copy_on_partial_reuse``` specifies whether a block should be copied or not in order to allow partial reuse. If copying is disabled, a partially matched block can only be reused if no other request is using it. If copying is enabled, partially matched blocks are not reused directly, instead a new block is created and the matched tokens are copied into the new block. This allows multiple requests to partially reuse a block.
+KV cache manager V2 (the default; see [Selecting the KV Cache Manager](#selecting-the-kv-cache-manager)) ignores `copy_on_partial_reuse`. Before extending a reused partial tail page, V2 copies it into a new page owned by the request, even for an unreferenced leaf that V1 could reuse directly. The cached page stays in the reuse tree, so multiple requests can partially reuse it.
+
+With one-model speculative decoding, V2's draft-lookahead backoff can still shorten a block-aligned reuse match (by `max_draft_len` for vanilla MTP, or one token for the EAGLE3 and MTP-Eagle one-model modes), leaving a partial tail page that is copied even when `enable_partial_reuse=False`.
+
+KV cache manager V1 can reuse an unreferenced leaf directly, even with `copy_on_partial_reuse=True`. When direct reuse is not possible, enabling this property allows a new block to be allocated and the matched tokens to be copied into it. With `copy_on_partial_reuse=False`, partial matching is restricted to unreferenced leaves. If two requests in one batch partially match the same unreferenced leaf, V1 copies the matched tokens for the earlier request even with `copy_on_partial_reuse=False`.
 
 ### Attention Window Size
 

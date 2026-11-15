@@ -224,6 +224,32 @@
             "dtypeMmaA": "e4m3",
             "sfBlockSizeA": 32,
             "act": "swiglu"
+        },
+        "BatchedGemmBf16Bf16Base": {
+            "_template": "BatchedGemmNonDsBase",
+            "dtypeA": "bf16",
+            "dtypeB": "bf16",
+            "dtypeC": "bf16",
+            "mmaK": 16,
+            "tileK": 128,
+            "act": "swiglu",
+            "layoutA": "B"
+        },
+        "BatchedGemmBf16Bf16LowLatency": {
+            "_template": "BatchedGemmBf16Bf16Base",
+            "mmaM": 128,
+            "clusterDimX": 1,
+            "transposeMmaOutput": true,
+            "batch": "N",
+            "ctaSwizzleType": "rasterizeAlongM"
+        },
+        "BatchedGemmBf16Bf16HighThroughput": {
+            "_template": "BatchedGemmBf16Bf16Base",
+            "mmaM": 256,
+            "clusterDimX": 2,
+            "transposeMmaOutput": true,
+            "batch": "N",
+            "ctaSwizzleType": "rasterizeAlongM"
         }
     },
     "configs": [
@@ -3377,6 +3403,301 @@
                 [
                     64,
                     "107a"
+                ]
+            ]
+        },
+        {
+            "_comment": "Bf16xBf16_FC1_no_splitK",
+            "_template": "BatchedGemmBf16Bf16LowLatency",
+            "routeAct": "ldgsts",
+            "fusedAct,act,eltwiseActType,biasType,fusedBiasShuffleMode": [
+                [
+                    true,
+                    "swiglu",
+                    "none",
+                    "none",
+                    "none"
+                ],
+                [
+                    false,
+                    "swiglu",
+                    "relu2",
+                    "none",
+                    "none"
+                ]
+            ],
+            "useUnrollLoop2xForMma": [
+                true,
+                false
+            ],
+            "dtypeC": "bf16",
+            "mmaN,tileN,epilogueTileN,tileK,numStages,numSlicesForSplitK,clusterDimZ": [
+                [
+                    8,
+                    8,
+                    8,
+                    128,
+                    6,
+                    1,
+                    1
+                ],
+                [
+                    8,
+                    8,
+                    8,
+                    128,
+                    5,
+                    1,
+                    1
+                ],
+                [
+                    8,
+                    8,
+                    8,
+                    128,
+                    4,
+                    1,
+                    1
+                ],
+                [
+                    16,
+                    16,
+                    16,
+                    128,
+                    6,
+                    1,
+                    1
+                ],
+                [
+                    16,
+                    16,
+                    16,
+                    128,
+                    5,
+                    1,
+                    1
+                ],
+                [
+                    16,
+                    16,
+                    16,
+                    128,
+                    4,
+                    1,
+                    1
+                ],
+                [
+                    32,
+                    32,
+                    32,
+                    128,
+                    5,
+                    1,
+                    1
+                ],
+                [
+                    32,
+                    32,
+                    32,
+                    128,
+                    4,
+                    1,
+                    1
+                ]
+            ],
+            "tileScheduler,numStagesMma": [
+                [
+                    "static",
+                    1
+                ],
+                [
+                    "persistent",
+                    2
+                ]
+            ]
+        },
+        {
+            "_comment": "Bf16xBf16_FC1_HighThroughput",
+            "_template": "BatchedGemmBf16Bf16HighThroughput",
+            "routeAct": "tma",
+            "fusedAct,act,eltwiseActType,biasType,fusedBiasShuffleMode": [
+                [
+                    true,
+                    "swiglu",
+                    "none",
+                    "none",
+                    "none"
+                ],
+                [
+                    false,
+                    "swiglu",
+                    "relu2",
+                    "none",
+                    "none"
+                ]
+            ],
+            "useUnrollLoop2xForMma": [
+                true,
+                false
+            ],
+            "dtypeC": "bf16",
+            "layoutA": "B",
+            "mmaN,tileN,epilogueTileN,tileK,numStages,numRegsPerThreadEpilogueWarp,numRegsPerThreadNonEpilogueWarp": [
+                [
+                    64,
+                    64,
+                    64,
+                    128,
+                    5,
+                    168,
+                    96
+                ],
+                [
+                    128,
+                    128,
+                    128,
+                    64,
+                    6,
+                    168,
+                    96
+                ]
+            ],
+            "tileScheduler,numStagesMma": [
+                [
+                    "persistent",
+                    2
+                ]
+            ]
+        },
+        {
+            "_comment": "Bf16xBf16_FC2_no_splitK",
+            "_template": "BatchedGemmBf16Bf16LowLatency",
+            "routeAct": false,
+            "fusedAct": false,
+            "useUnrollLoop2xForMma": [
+                true,
+                false
+            ],
+            "dtypeC": "bf16",
+            "mmaN,tileN,epilogueTileN,tileK,numStages,numSlicesForSplitK,clusterDimZ": [
+                [
+                    8,
+                    8,
+                    8,
+                    128,
+                    6,
+                    1,
+                    1
+                ],
+                [
+                    8,
+                    8,
+                    8,
+                    128,
+                    5,
+                    1,
+                    1
+                ],
+                [
+                    8,
+                    8,
+                    8,
+                    128,
+                    4,
+                    1,
+                    1
+                ],
+                [
+                    16,
+                    16,
+                    16,
+                    128,
+                    6,
+                    1,
+                    1
+                ],
+                [
+                    16,
+                    16,
+                    16,
+                    128,
+                    5,
+                    1,
+                    1
+                ],
+                [
+                    16,
+                    16,
+                    16,
+                    128,
+                    4,
+                    1,
+                    1
+                ],
+                [
+                    32,
+                    32,
+                    32,
+                    128,
+                    5,
+                    1,
+                    1
+                ],
+                [
+                    32,
+                    32,
+                    32,
+                    128,
+                    4,
+                    1,
+                    1
+                ]
+            ],
+            "tileScheduler,numStagesMma": [
+                [
+                    "static",
+                    1
+                ],
+                [
+                    "persistent",
+                    2
+                ]
+            ]
+        },
+        {
+            "_comment": "Bf16xBf16_FC2_HighThroughput",
+            "_template": "BatchedGemmBf16Bf16HighThroughput",
+            "routeAct": false,
+            "fusedAct": false,
+            "useUnrollLoop2xForMma": [
+                true,
+                false
+            ],
+            "dtypeC": "bf16",
+            "mmaN,tileN,epilogueTileN,tileK,numStages,numRegsPerThreadEpilogueWarp,numRegsPerThreadNonEpilogueWarp": [
+                [
+                    64,
+                    64,
+                    64,
+                    128,
+                    5,
+                    168,
+                    96
+                ],
+                [
+                    128,
+                    128,
+                    64,
+                    64,
+                    8,
+                    168,
+                    96
+                ]
+            ],
+            "tileScheduler,numStagesMma": [
+                [
+                    "persistent",
+                    2
                 ]
             ]
         }

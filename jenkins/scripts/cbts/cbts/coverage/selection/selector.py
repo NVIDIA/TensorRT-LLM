@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Coverage-based selection: changed core-Python files -> per-stage impacted/skippable sets."""
+"""Coverage-based selection: changed Python files -> per-stage impacted/skippable sets."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from cbts.coverage.selection.pytest_change_analysis import PytestImpactIndex
 from cbts.coverage.selection.python_change_analysis import (
     ImportTarget,
     PythonChangeFacts,
@@ -50,7 +51,7 @@ from cbts.rules._helpers import (
 
 @dataclass
 class CoverageResult:
-    """Per-stage-family coverage decision over a set of residual core-Python files."""
+    """Per-stage-family coverage decision over a set of residual Python files."""
 
     ok: bool
     reason: str
@@ -104,6 +105,7 @@ class CoverageSelector:
         else:
             self._external_references = external_references
             self._external_reference_paths = external_reference_paths
+        self._pytest_impact = PytestImpactIndex(self.repo_root)
         self._untrusted: set[str] | None = None
 
     def untrusted_tests(self) -> set[str]:
@@ -174,6 +176,14 @@ class CoverageSelector:
                 iter_diff_deleted_post_lines(selection_diff),
                 pre_source=reconstruct_diff_pre_image(source, diff),
             )
+            pytest_reason = self._pytest_impact.decline_reason(
+                path,
+                source,
+                qualnames | dependencies.changed_bindings,
+                pre_source=reconstruct_diff_pre_image(source, diff),
+            )
+            if pytest_reason:
+                return impacted, sorted(no_data), sorted(caller_bounded), no_diff, pytest_reason
             if dependencies.new_class_bindings:
                 # Every method of an added data class is reached through a
                 # consumer of that new class binding. Its declaration has no
@@ -550,9 +560,8 @@ class CoverageSelector:
     ) -> CoverageResult:
         """Resolve impact from raw source images and optional executable selection diffs."""
         for path in residual_files:
-            # Gate on the repo path: canon() matches `tensorrt_llm/` anywhere.
-            if not (path.endswith(".py") and path.startswith("tensorrt_llm/")):
-                return CoverageResult(ok=False, reason=f"non-core-Python residual file: {path}")
+            if not path.endswith(".py"):
+                return CoverageResult(ok=False, reason=f"non-Python residual file: {path}")
             cf = canon(path)
             if not self.db.file_has_touch_rows(cf):
                 return CoverageResult(

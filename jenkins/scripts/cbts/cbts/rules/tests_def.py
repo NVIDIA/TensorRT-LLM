@@ -43,12 +43,14 @@ from ._helpers import (
     iter_diff_post_line_numbers,
     iter_diff_pre_image,
     lookup_paths_into_block_filters,
+    reconstruct_diff_pre_image,
     resolve_affected_stages,
     stages_by_yaml_stem,
 )
 from .base import PRInputs, Rule, RuleResult
 from .docs import is_docs_path
 from .out_of_scope import is_out_of_scope
+from .perf_model_paths import MODEL_PATHS, model_path_filters
 
 # Changes touching at least this fraction of all blocks (top-level conftest,
 # common.py, …) are too broad to narrow usefully and trigger fallback.
@@ -57,6 +59,11 @@ BLAST_RADIUS_FRACTION = 0.8
 ACCURACY_REFS_PREFIX = "tests/integration/defs/accuracy/references/"
 ACCURACY_DIR = "tests/integration/defs/accuracy"
 DEFS_GIT_PREFIX = "tests/integration/defs/"
+QA_PERF_HARNESS_SOURCES = {
+    f"{DEFS_GIT_PREFIX}perf/test_perf.py",
+    f"{DEFS_GIT_PREFIX}perf/utils.py",
+}
+QA_PERF_FUNCTIONAL_TEST = "unittest/others/test_perf_qa_functional.py"
 
 _CLASS_RE = re.compile(r"class\s+(\w+)")
 # `acceptance_length.yaml` keys tests directly (`TestC::test_m`) instead of
@@ -273,9 +280,13 @@ class TestsDefRule(Rule):
         )
         self._total_blocks = len(yaml_index.blocks)
         self._acc_class_indexes: Optional[tuple[dict[str, list[str]], dict[str, list[str]]]] = None
+        self._acc_reference_consumers: dict[str, set[str]] = {}
+        self._acc_test_methods: set[str] = set()
         self._acc_source_texts: tuple[str, ...] = ()
 
-    def _compute_anchors(self, git_path: str, yaml_path: str, diff: str) -> list[str]:
+    def _compute_anchors(
+        self, git_path: str, yaml_path: str, diff: str, raw_diff: str | None = None
+    ) -> list[str]:
         """Return lookup anchors for one file.
 
         Python helpers use direct static, L0-covered test importers when safe.
@@ -289,6 +300,13 @@ class TestsDefRule(Rule):
             git_path,
             self._reference_index,
         )
+        if import_consumers is not None:
+            import_consumers = [
+                QA_PERF_FUNCTIONAL_TEST
+                if f"{DEFS_GIT_PREFIX}{consumer}" in QA_PERF_HARNESS_SOURCES
+                else consumer
+                for consumer in import_consumers
+            ]
         if (
             import_consumers is not None
             and lookup_paths_into_block_filters(self.yaml_index, import_consumers)[0]
@@ -303,6 +321,37 @@ class TestsDefRule(Rule):
         except (OSError, UnicodeDecodeError):
             return [yaml_path]
         if _diff_has_deletions(diff):
+            # Raw hunks retain the original line counts and deleted blank lines.
+            # Normalized selection diffs cannot reliably reconstruct the source.
+            pre_source = reconstruct_diff_pre_image(content, raw_diff or diff)
+            if pre_source is not None:
+                deleted_lines: set[int] = set()
+                old_line = 0
+                for line in (raw_diff or diff).splitlines():
+                    match = re.match(r"@@ -(\d+)", line)
+                    if match is not None:
+                        old_line = int(match.group(1))
+                    elif line.startswith(("---", "+++")):
+                        continue
+                    elif line.startswith("-"):
+                        if line[1:].strip() and not line[1:].lstrip().startswith("#"):
+                            deleted_lines.add(old_line)
+                        old_line += 1
+                    elif line.startswith(" "):
+                        old_line += 1
+                deleted_scopes = _map_lines_to_pytest_scopes(pre_source, deleted_lines)
+                added_lines = iter_diff_added_post_line_numbers(diff)
+                added_scopes = (
+                    _map_lines_to_pytest_scopes(content, added_lines) if added_lines else set()
+                )
+                if deleted_scopes is None or added_scopes is None:
+                    return [yaml_path]
+                scopes = deleted_scopes | added_scopes
+                return [
+                    f"{yaml_path}::{scope}"
+                    for scope in sorted(scopes)
+                    if "::" not in scope or scope.partition("::")[0] not in scopes
+                ]
             return self._recover_deleted_scope_anchors(yaml_path, content, diff)
         line_numbers = iter_diff_post_line_numbers(diff)
         if not line_numbers:
@@ -315,10 +364,9 @@ class TestsDefRule(Rule):
     def _recover_deleted_scope_anchors(self, yaml_path: str, content: str, diff: str) -> list[str]:
         """Combine post-image scopes for `+` lines with pre-image scopes for `-` lines.
 
-        Removed lines can anchor to the next surviving post-image scope,
-        so every diff with deletions takes this path before accepting
-        post-image mappings. Reading deleted lines from the pre-image
-        avoids attributing them to an adjacent surviving scope.
+        Used when complete pre-image reconstruction is unavailable.
+        Reading deleted lines from hunk-local class context avoids
+        attributing them to an adjacent surviving post-image scope.
         """
         if not _diff_has_deletions(diff):
             return [yaml_path]
@@ -340,9 +388,9 @@ class TestsDefRule(Rule):
         """Map a `references/<dataset>.yaml` diff to per-test anchors.
 
         Top-level YAML keys name what the section is a reference for:
-        a HF model in most files, a `TestC::test_m` id in
-        `acceptance_length.yaml`. Either way they resolve to anchors
-        under `accuracy/test_*.py`, whose lineage walk then matches every
+        a HF model in most files, a `TestC::test_m` id or a literal
+        reference key in `acceptance_length.yaml`. They resolve to anchors
+        under `accuracy/`, whose lineage walk then matches every
         parametrization. Falls back to `[yaml_path]` (→ dir walk-up to
         `accuracy/`) when the changed sections can't be resolved.
 
@@ -395,14 +443,31 @@ class TestsDefRule(Rule):
     def _reference_key_anchors(self, key: str) -> list[str]:
         """Anchors for one reference-YAML top-level key.
 
-        A `TestC::test_m` key (`acceptance_length.yaml`) resolves through
-        the class index; any other key is treated as a HF model name.
+        A `TestC::test_m` key selects a method only when it is defined on
+        the class. Otherwise the class is retained, including inherited
+        tests, and namespace consumers are included as well.
+        Other acceptance keys select every consumer of their namespace,
+        including variants constructed by appending a suffix to another key.
+        Module-level constants and helpers select the whole test file.
+        Variant names are not interpreted as pytest method names.
         """
         match = _TEST_ID_KEY_RE.match(key)
         if match is None:
-            return list(self._accuracy_model_to_classes().get(key, ()))
-        class_name, method = match.groups()
-        return [f"{c}::{method}" for c in self._accuracy_class_to_paths().get(class_name, ())]
+            anchors = list(self._accuracy_model_to_classes().get(key, ()))
+        else:
+            class_name, method = match.groups()
+            anchors = []
+            for qualified in self._accuracy_class_to_paths().get(class_name, ()):
+                method_anchor = f"{qualified}::{method}"
+                if method_anchor in self._acc_test_methods:
+                    anchors.append(method_anchor)
+                else:
+                    anchors.append(qualified)
+                    anchors.extend(self._acc_reference_consumers.get(class_name, ()))
+        namespace, separator, _ = key.partition("::")
+        return sorted(set(anchors)) or (
+            sorted(self._acc_reference_consumers.get(namespace, ())) if separator else []
+        )
 
     def _accuracy_model_to_classes(self) -> dict[str, list[str]]:
         """HF model name → list of `accuracy/test_X.py::ClassName`."""
@@ -423,7 +488,7 @@ class TestsDefRule(Rule):
         return any(key in source for source in self._acc_source_texts for key in keys)
 
     def _scan_accuracy_classes(self) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
-        """Cached AST scan of `accuracy/test_*.py` for `Test*` classes.
+        """Cached recursive AST scan of accuracy tests for classes and reference literals.
 
         Returns (model name → qualified classes, class name → qualified
         classes). The first index is keyed by the literal
@@ -437,7 +502,7 @@ class TestsDefRule(Rule):
         source_texts: list[str] = []
         acc_dir = self._repo_root / ACCURACY_DIR
         if acc_dir.is_dir():
-            for py in sorted(acc_dir.glob("test_*.py")):
+            for py in sorted(acc_dir.rglob("test_*.py")):
                 try:
                     source = py.read_text(encoding="utf-8")
                 except (OSError, UnicodeDecodeError):
@@ -447,12 +512,31 @@ class TestsDefRule(Rule):
                     tree = ast.parse(source)
                 except (SyntaxError, ValueError):
                     continue
-                rel = f"accuracy/{py.name}"
+                rel = py.relative_to(self._repo_root / DEFS_GIT_PREFIX).as_posix()
                 for node in tree.body:
+                    consumer = (
+                        f"{rel}::{node.name}"
+                        if isinstance(node, ast.ClassDef) and node.name.startswith("Test")
+                        else rel
+                    )
+                    for value in ast.walk(node):
+                        if (
+                            isinstance(value, ast.Constant)
+                            and isinstance(value.value, str)
+                            and "::" in value.value
+                        ):
+                            namespace = value.value.partition("::")[0]
+                            self._acc_reference_consumers.setdefault(namespace, set()).add(consumer)
                     if not isinstance(node, ast.ClassDef) or not node.name.startswith("Test"):
                         continue
                     qualified = f"{rel}::{node.name}"
                     by_class.setdefault(node.name, []).append(qualified)
+                    self._acc_test_methods.update(
+                        f"{qualified}::{child.name}"
+                        for child in node.body
+                        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+                        and child.name.startswith("test")
+                    )
                     for child in node.body:
                         if not isinstance(child, ast.Assign):
                             continue
@@ -485,7 +569,30 @@ class TestsDefRule(Rule):
 
         for git_path in candidates:
             yaml_path = self.yaml_index.git_path_to_yaml_key(git_path)
-            if yaml_path is None:
+            qa_perf = git_path in QA_PERF_HARNESS_SOURCES
+            basename = PurePosixPath(git_path).name
+            if (
+                not qa_perf
+                and git_path.startswith(DEFS_GIT_PREFIX)
+                and git_path.endswith(".py")
+                and not basename.startswith("test_")
+                and basename not in {"__init__.py", "conftest.py"}
+            ):
+                importers = self._reference_index.direct_importers(
+                    git_path.removeprefix(DEFS_GIT_PREFIX)
+                )
+                qa_perf = any(
+                    f"{DEFS_GIT_PREFIX}{consumer}" in QA_PERF_HARNESS_SOURCES
+                    for consumer in importers.paths
+                )
+            if qa_perf:
+                qa_blocks, _ = lookup_paths_into_block_filters(
+                    self.yaml_index, [QA_PERF_FUNCTIONAL_TEST]
+                )
+                if not qa_blocks:
+                    # Without the CPU harness test, narrowing cannot protect QA execution.
+                    return None
+            if yaml_path is None and not qa_perf:
                 base = git_path.rsplit("/", 1)[-1]
                 if base.startswith("test_") and base.endswith(".py"):
                     # Standalone test_*.py not referenced by any L0 YAML —
@@ -495,14 +602,40 @@ class TestsDefRule(Rule):
                     handled.add(git_path)
                     no_match.add(git_path)
                     continue
-                # conftest / __init__ / helper / data — could impact
-                # selection via implicit pytest discovery; let Selector
-                # report it as Unhandled → fallback.
+                # conftest / __init__ / helper / data can carry shared pytest
+                # state. Leave them unclaimed for coverage's AST dependency
+                # checks; shared fixture/hook/state changes still fall back.
                 out_of_namespace.add(git_path)
                 continue
             handled.add(git_path)
-            anchors = self._compute_anchors(git_path, yaml_path, pr.diffs.get(git_path, ""))
-            file_bf, _ = lookup_paths_into_block_filters(self.yaml_index, anchors)
+            diff = pr.diffs.get(git_path, "")
+            file_bf = None
+            if git_path == MODEL_PATHS:
+                consumers = _direct_test_importers(self._repo_root, git_path, self._reference_index)
+                if consumers is not None:
+                    try:
+                        source = (self._repo_root / git_path).read_text(encoding="utf-8")
+                    except (OSError, UnicodeDecodeError):
+                        source = ""
+                    file_bf = model_path_filters(
+                        self._repo_root,
+                        source,
+                        pr.raw_diffs.get(git_path, diff),
+                        consumers,
+                        self.yaml_index,
+                    )
+            if file_bf is None:
+                anchors = (
+                    self._compute_anchors(git_path, yaml_path, diff, pr.raw_diffs.get(git_path))
+                    if yaml_path is not None
+                    else []
+                )
+                file_bf, _ = lookup_paths_into_block_filters(self.yaml_index, anchors)
+            if qa_perf:
+                for key, prefix_to_ids in qa_blocks.items():
+                    dst = file_bf.setdefault(key, {})
+                    for prefix, ids in prefix_to_ids.items():
+                        dst.setdefault(prefix, set()).update(ids)
             if not file_bf:
                 # In-namespace but no YAML entry covers this path → no
                 # narrow contribution; claimed as noop.

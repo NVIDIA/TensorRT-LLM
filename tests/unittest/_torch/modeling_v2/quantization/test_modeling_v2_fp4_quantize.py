@@ -50,7 +50,7 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             spec=dict(shape=(16, 256), dtype=torch.bfloat16, vec=16, swizzled=True),
         ),
     ),
-    "qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__tp1": (
+    "qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default": (
         Cell(
             why="qwen3.8 decode: 1 token, hidden 2560, linear -- its routed-expert input",
             spec=dict(shape=(1, 2560), dtype=torch.bfloat16, vec=16, swizzled=False),

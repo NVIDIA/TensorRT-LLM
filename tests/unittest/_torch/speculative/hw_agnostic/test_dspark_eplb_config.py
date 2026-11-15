@@ -65,10 +65,13 @@ def _model_config(lb_config=None, num_hidden_layers=NUM_HIDDEN_LAYERS):
         mapping=Mapping(),
         max_num_tokens=8192,
         moe_max_num_tokens=8192,
+        use_cute_dsl_blockscaling_mm=False,
         # Forwarded to the drafter so its position table is sized by what the
         # runtime serves rather than max_position_embeddings. A real
         # ModelConfig always carries it, so the helper reads it unguarded.
         max_seq_len=8192,
+        use_low_precision_moe_combine=False,
+        megamoe_fuse_shared_expert=False,
         pretrained_config=SimpleNamespace(num_hidden_layers=num_hidden_layers),
     )
 

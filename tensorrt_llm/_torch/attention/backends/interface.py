@@ -14,6 +14,8 @@ import torch
 from typing_extensions import Self
 
 if TYPE_CHECKING:
+    from ...attention.backends.prims_ts.vc_attention.quantization import \
+        VCAttentionOperands
     from ...model_config import ModelConfig
     from ...modules.mamba.mamba2_metadata import Mamba2Metadata
     from ...pyexecutor.kv_cache.mixed_precision_staging import \
@@ -214,6 +216,9 @@ class AttentionMetadata:
     # first prepare() on a manager with mixed-precision layers.
     mixed_precision_staging: Optional["MixedPrecisionKVStaging"] = field(
         init=False, default=None, repr=False, compare=False)
+    # The same for the MTP layers of a separate draft manager; swapped in for draft forwards.
+    draft_mixed_precision_staging: "MixedPrecisionKVStaging | None" = field(
+        init=False, default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.is_cross:
@@ -355,47 +360,88 @@ class AttentionMetadata:
         """
         self._prepare_mamba_metadata()
 
-    def _has_mixed_precision_kv(self) -> bool:
-        """Whether the KV cache manager holds mixed-precision layers."""
+    def support_steady_gen_step(self) -> bool:
+        """Whether ``prepare_steady_gen_step`` may advance this metadata."""
+        return False
+
+    def _has_mixed_precision_staging(self) -> bool:
+        """Whether this backend runs attention on a staging copy of the mixed-precision layers."""
         # isinstance guards against mocks and against V1 managers, which have
         # no mixed-precision layers.
-        high_layers = getattr(self.kv_cache_manager, "high_layers", None)
-        return isinstance(high_layers, dict) and bool(high_layers)
+        manager = self.kv_cache_manager
+        high_layers = getattr(manager, "mixed_precision_high_layers", None)
+        # The cold-page window keeps the history at the high precision and reads
+        # the high rows through the page tables instead of a staging copy.
+        return (isinstance(high_layers, dict) and bool(high_layers)
+                and manager.mixed_precision_low_dtype
+                != manager.mixed_precision_high_dtype)
 
     def prepare_mixed_precision_kv(self, layout: str,
                                    tokens_per_block: int) -> None:
-        """Create the staging copy on first use, then refresh it per batch."""
+        """Create the staging copies on first use, then refresh them per batch."""
+        self.mixed_precision_staging = self._refresh_mixed_precision_kv(
+            self.mixed_precision_staging, self.kv_cache_manager, "mixed",
+            layout, tokens_per_block)
+        draft = self.draft_kv_cache_manager
+        draft_high_layers = getattr(draft, "mixed_precision_high_layers", None)
+        # A draft view runs on the draft manager itself and has no draft of its own.
+        if (draft is not self.kv_cache_manager
+                and isinstance(draft_high_layers, dict) and draft_high_layers):
+            self.draft_mixed_precision_staging = self._refresh_mixed_precision_kv(
+                self.draft_mixed_precision_staging, draft, "draft_mixed",
+                layout, tokens_per_block)
+
+    def sync_draft_mixed_precision_staging(
+            self) -> "MixedPrecisionKVStaging | None":
+        """Give the draft staging copy the target's lengths at the start of a draft forward.
+
+        A mixed-precision MTP draft manager holds the same tokens as the target manager,
+        and overlap-scheduler corrections may have changed the target's lengths on the
+        device since prepare().
+
+        Returns:
+            The draft staging copy; None without a separate mixed-precision draft manager.
+        """
+        draft = self.draft_mixed_precision_staging
+        if draft is not None:
+            draft.lengths.copy_(self.mixed_precision_staging.lengths)
+        return draft
+
+    def _refresh_mixed_precision_kv(
+            self, view: "MixedPrecisionKVStaging | None",
+            manager: KVCacheManagerV2, name: str, layout: str,
+            tokens_per_block: int) -> "MixedPrecisionKVStaging":
         from ...pyexecutor.kv_cache.mixed_precision_staging import \
             MixedPrecisionKVStaging
 
-        view = self.mixed_precision_staging
-        if view is None or view.manager is not self.kv_cache_manager:
+        if view is None or view.manager is not manager:
             # Built once per metadata object (eager or CUDA graph copy); the
             # reserved buffer-pool block is shared, so the staging copy is
             # allocated and zeroed once per rank and the KV budget profiling
             # run already accounts for it.
             buffers = (self.cuda_graph_buffers if self.cuda_graph_buffers
                        is not None else get_memory_buffers())
-            view = MixedPrecisionKVStaging(self.kv_cache_manager,
+            view = MixedPrecisionKVStaging(manager,
                                            buffers,
                                            rows=self.max_num_sequences
                                            or self.max_num_requests,
                                            layout=layout,
                                            pool_layout=self.kv_layout,
-                                           tokens_per_block=tokens_per_block)
+                                           tokens_per_block=tokens_per_block,
+                                           name=name)
             logger.info_once(
-                "Mixed-precision KV staging on this rank: "
+                f"Mixed-precision KV staging ({name}) on this rank: "
                 f"{view.staging_bytes / (1 << 20):.1f} MiB = {view.rows} "
                 f"requests x {view.max_blocks_per_seq} pages x "
                 f"{view.max_page_bytes} B ({layout}, {tokens_per_block} "
                 "tokens per page)",
-                key="mixed_precision_kv_staging")
-            self.mixed_precision_staging = view
+                key=f"{name}_precision_kv_staging")
         view.update(self.request_ids,
                     self.kv_cache_params.num_cached_tokens_per_seq,
                     self.seq_lens.tolist(),
                     capture_graph=self.is_cuda_graph)
         self._on_mixed_precision_kv_prepared(view)
+        return view
 
     def _on_mixed_precision_kv_prepared(
             self, view: "MixedPrecisionKVStaging") -> None:
@@ -405,7 +451,9 @@ class AttentionMetadata:
             self, layer_idx: int) -> Optional["MixedPrecisionKVStaging"]:
         """Return the staging cache of a mixed-precision layer, else None."""
         staging = self.mixed_precision_staging
-        if staging is None or layer_idx not in staging.pools:
+        if (staging is None or layer_idx not in staging.pools
+                or staging.manager is not self.kv_cache_manager):
+            # No staging for a layer without a mixed-precision high pool, or of a manager not in use.
             return None
         return staging
 
@@ -1010,6 +1058,10 @@ class AttentionForwardArgs:
     # consume the per-phase slice in ``FmhaParams.output``, not this full buffer.
     output: Optional[torch.Tensor] = None
     output_sf: Optional[torch.Tensor] = None
+    variable_window_token_starts: Optional[torch.Tensor] = cpp_field(
+        dtype=torch.int32)
+    variable_window_token_ends: Optional[torch.Tensor] = cpp_field(
+        dtype=torch.int32)
     kv_scale_orig_quant: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
     kv_scale_quant_orig: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
     out_scale: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
@@ -1029,6 +1081,14 @@ class AttentionForwardArgs:
     quant_q_buffer: Optional[torch.Tensor] = None
     cross_kv: Optional[torch.Tensor] = None
     relative_attention_bias: Optional[torch.Tensor] = None
+    # Caller-quantized FP8 Q for the MLA FP8 context / fused generation paths;
+    # only meaningful together with `quant_q_buffer`. The fused paths that
+    # quantize into `quant_q_buffer` (DSv4 generation / context RoPE) read the
+    # value as the quant scale. The non-sparse FP8 context path reads only the
+    # presence: its FMHA dequantizes Q / K / V with the kv cache scale, so
+    # caller-quantized FP8 `k` / `v` and `quant_q_buffer` must have been
+    # quantized with `kv_scale_orig_quant`, and this tensor must carry that
+    # scale.
     quant_scale_qkv: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
     dsv4_inv_rope_cos_sin_cache: Optional[torch.Tensor] = cpp_field(
         dtype=torch.float32)
@@ -1062,6 +1122,12 @@ class AttentionForwardArgs:
     # E4M3 with one scale each, folded into the softmax and output scales.
     qk_fp8_per_tensor: bool = False
     v_fp8_per_tensor: bool = False
+    # VC-Attention recipe of the PrimTS FMHA library. The caller prepares the
+    # operands (K in grouped token order, V as E4M3 tile residuals with its
+    # scale and means, under QK8 the rotated E4M3 Q and K with their block
+    # scales) and the library runs the matching plan on them.
+    vc_attention: bool = False
+    vc_operands: Optional["VCAttentionOperands"] = None
 
     # Packed QKV for non-MLA attention. MLA always passes a separate query.
     is_fused_qkv: bool = False
