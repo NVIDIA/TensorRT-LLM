@@ -236,9 +236,15 @@ def gdn_exact_replay_forward_core(
                 )
                 ssm_states[slot] = state
             tail = aug_len - full_len
-            if tail:
-                for buffer, t in zip(buffers, inputs):
+            # The chunk rule reads whole buffer rows. The rows after the live
+            # ones do not change a live row, unless one holds a non-finite or
+            # very large leftover, and a newly acquired slot holds arbitrary
+            # bytes: everything after the partial chunk is zero.
+            for buffer, t in zip(buffers, inputs):
+                if tail:
                     buffer[slot, :tail] = t[None, full_len:]
+                buffer[slot, tail:] = 0
+            if tail:
                 out_tail = torch.empty(
                     1, chunk, num_v_heads, head_v_dim, dtype=out_all.dtype, device=out_all.device
                 )

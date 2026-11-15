@@ -299,9 +299,16 @@ class GDNExactReplayState:
         pin_gdn_autotune_configs()
 
     def reset_replay_slots(self, replay_slots: torch.Tensor) -> None:
-        """A request that starts in generation has run no tokens."""
+        """A request that starts in generation has run no tokens.
+
+        No prefill has cleared its buffers either, and its slot may hold
+        arbitrary bytes that the chunk rule would read.
+        """
         if self.replay_num_tokens is not None:
             self.replay_num_tokens.index_fill_(0, replay_slots, 0)
+            for views in self._pool_layers:
+                for role in _GDN_EXACT_REPLAY_ROLES.values():
+                    views[role].index_fill_(0, replay_slots, 0)
 
     def reset_slots(
         self,

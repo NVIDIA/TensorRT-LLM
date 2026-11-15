@@ -286,6 +286,28 @@ def test_resumed_prefill_and_decode_match_single_shot_prefill(length, wide):
     assert int(decode_cache.replay_num_tokens[1]) == length
 
 
+@pytest.mark.parametrize("stale", [float("nan"), float("inf"), 1e30], ids=["nan", "inf", "1e30"])
+def test_replay_ignores_what_a_slot_held_before(stale):
+    """A newly acquired slot holds arbitrary bytes, including non-finite values."""
+    torch.manual_seed(11)
+    layer = _make_layer()
+    length = 8
+    inputs = _inputs(length)
+    base = _Cache(3)
+    full = _run(layer, base.clone(), inputs, [length], 1, [1], [False])
+
+    buffers = ("replay_q", "replay_k", "replay_v", "replay_g", "replay_beta")
+    dirty = base.clone()
+    for name in buffers:
+        getattr(dirty, name).fill_(stale)
+    outputs = [_run(layer, dirty, _slice(inputs, 0, 5), [5], 1, [1], [False])]
+    for name in buffers:
+        assert not getattr(dirty, name)[1, 5:].any()
+    for t in range(5, length):
+        outputs.append(_run(layer, dirty, _slice(inputs, t, t + 1), [1], 0, [1], [True]))
+    torch.testing.assert_close(torch.cat(outputs), full, rtol=0, atol=0)
+
+
 def test_mixed_batch_matches_isolated_rows():
     torch.manual_seed(7)
     layer = _make_layer()
@@ -434,8 +456,17 @@ def test_replay_state_declares_slot_buffers_and_binds_their_views():
     # A context request keeps its count; a request that starts in generation restarts it.
     state.reset_slots(torch.tensor([1], device="cuda"), [1])
     assert state.replay_num_tokens.tolist() == [0, 9, 0, 7, 0]
+    for layer_views in views:
+        for buffer in layer_views.values():
+            buffer.fill_(1)
+    state.replay_num_tokens.copy_(torch.tensor([0, 9, 0, 7, 0]))
     state.reset_replay_slots(torch.tensor([3], device="cuda"))
     assert state.replay_num_tokens.tolist() == [0, 9, 0, 0, 0]
+    # ... and its buffers, which no prefill has cleared, are zero.
+    cache = state.make_layer_cache(1, conv[1], ssm[1])
+    for name in _REPLAY_BUFFERS:
+        buffer = getattr(cache, name)
+        assert not buffer[3].any() and buffer[[0, 1, 2, 4]].all()
     state.shutdown()
     assert state.replay_num_tokens is None
 
