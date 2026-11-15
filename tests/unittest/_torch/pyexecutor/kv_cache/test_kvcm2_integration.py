@@ -3603,6 +3603,7 @@ def _make_publishing_manager(policy: BlockReusePolicy) -> KVCacheManagerV2:
     manager.conversation_manager = None
     manager.kv_connector_manager = None
     manager.kv_cache_map = {}
+    manager.tokens_per_block = 4
     return manager
 
 
@@ -7096,6 +7097,20 @@ def test_fresh_fill_skips_committed_prefix(monkeypatch: pytest.MonkeyPatch) -> N
     assert torch.equal(buffer[5], torch.full((2,), _FRESH_FILL))
 
 
+def test_fresh_fill_skips_deferred_generation_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A deferred generation commit's tokens already hold KV, though the cache has
+    not counted them yet; filling their block would erase them."""
+    buffer = torch.zeros(8, 2)
+    kv_cache = _FreshFillKVCache([2, 5, 6], num_committed_tokens=TOKENS_PER_BLOCK)
+    manager = _make_fresh_fill_manager(buffer, kv_cache, monkeypatch)
+    manager._deferred_generation_commits = {1: (Mock(), TOKENS_PER_BLOCK + 1)}
+
+    manager._fill_fresh_kv_pages(1)
+    assert torch.equal(buffer[2], torch.zeros(2))
+    assert torch.equal(buffer[5], torch.zeros(2))
+    assert torch.equal(buffer[6], torch.full((2,), _FRESH_FILL))
+
+
 def test_fresh_fill_disabled_or_unknown_request_is_a_noop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -7887,6 +7902,217 @@ def test_try_commit_generation_blocks_honors_guards(
     manager.try_commit_generation_blocks(request)
 
     assert kv_cache.committed_tokens is None
+
+
+def _generation_request(max_beam_num_tokens: int, **overrides: object) -> SimpleNamespace:
+    fields = {
+        "py_request_id": 1,
+        "is_dummy_request": False,
+        "is_context_only_request": False,
+        "prompt_len": 4,
+        "max_beam_num_tokens": max_beam_num_tokens,
+        "state": LlmRequestState.GENERATION_IN_PROGRESS,
+        "get_tokens_view": lambda beam_id: np.arange(64, dtype=np.int32),
+    }
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+class _RecordingKVCache(_FakeKVCache):
+    """Logs commit/suspend/close so tests can check the flush comes first."""
+
+    def __init__(self, num_committed_tokens: int) -> None:
+        super().__init__(num_committed_tokens)
+        self.calls: list[tuple[str, list[int]]] = []
+
+    def commit(self, tokens: list[int], is_end: bool = False) -> None:
+        super().commit(tokens, is_end)
+        self.calls.append(("commit", list(tokens)))
+
+    def suspend(self) -> None:
+        self.calls.append(("suspend", []))
+
+    def close(self) -> None:
+        self.calls.append(("close", []))
+
+
+def test_try_commit_generation_blocks_defers_partial_block() -> None:
+    request = _generation_request(max_beam_num_tokens=7)
+    kv_cache = _RecordingKVCache(num_committed_tokens=4)
+    manager = _make_publishing_manager(BlockReusePolicy.ALL_REUSABLE)
+    manager.tokens_per_block = 8
+    manager.kv_cache_map = {request.py_request_id: kv_cache}
+
+    manager.try_commit_generation_blocks(request)
+
+    assert kv_cache.calls == []
+    assert kv_cache.num_committed_tokens == 4
+    assert manager._committed_token_bound(request.py_request_id, kv_cache) == 6
+
+
+def test_try_commit_generation_blocks_commits_deferred_tokens_when_block_fills() -> None:
+    request = _generation_request(max_beam_num_tokens=6)
+    kv_cache = _RecordingKVCache(num_committed_tokens=4)
+    manager = _make_publishing_manager(BlockReusePolicy.ALL_REUSABLE)
+    manager.tokens_per_block = 8
+    manager.kv_cache_map = {request.py_request_id: kv_cache}
+
+    for max_beam_num_tokens in (6, 7, 8, 10):
+        request.max_beam_num_tokens = max_beam_num_tokens
+        manager.try_commit_generation_blocks(request)
+
+    # One commit, at the step the block filled, carrying every token since the last one.
+    assert kv_cache.calls == [("commit", [4, 5, 6, 7, 8])]
+    assert kv_cache.num_committed_tokens == 9
+    assert manager._committed_token_bound(request.py_request_id, kv_cache) == 9
+
+    manager._flush_deferred_generation_commit(request.py_request_id)
+
+    assert len(kv_cache.calls) == 1
+
+
+def test_try_commit_generation_blocks_commits_when_block_fills_exactly() -> None:
+    request = _generation_request(max_beam_num_tokens=8)
+    kv_cache = _RecordingKVCache(num_committed_tokens=4)
+    manager = _make_publishing_manager(BlockReusePolicy.ALL_REUSABLE)
+    manager.tokens_per_block = 8
+    manager.kv_cache_map = {request.py_request_id: kv_cache}
+    manager.try_commit_generation_blocks(request)
+    assert kv_cache.calls == []
+
+    request.max_beam_num_tokens = 9
+    manager.try_commit_generation_blocks(request)
+
+    # A stable count of 8 fills the block, so the commit lands on this step, not a later one.
+    assert kv_cache.calls == [("commit", [4, 5, 6, 7])]
+    assert manager._committed_token_bound(request.py_request_id, kv_cache) == 8
+
+    manager._flush_deferred_generation_commit(request.py_request_id)
+
+    assert len(kv_cache.calls) == 1
+
+
+def test_try_commit_generation_blocks_end_commits_deferred_tail() -> None:
+    request = _generation_request(max_beam_num_tokens=7)
+    kv_cache = _RecordingKVCache(num_committed_tokens=4)
+    manager = _make_publishing_manager(BlockReusePolicy.ALL_REUSABLE)
+    manager.tokens_per_block = 8
+    manager.kv_cache_map = {request.py_request_id: kv_cache}
+    manager.try_commit_generation_blocks(request)
+
+    request.max_beam_num_tokens = 8
+    request.state = LlmRequestState.GENERATION_COMPLETE
+    manager.try_commit_generation_blocks(request)
+
+    assert kv_cache.calls == [("commit", [4, 5, 6])]
+    assert kv_cache.commit_is_end
+
+
+def test_suspend_request_flushes_deferred_generation_commit() -> None:
+    request = _generation_request(max_beam_num_tokens=7)
+    kv_cache = _RecordingKVCache(num_committed_tokens=4)
+    manager = _make_publishing_manager(BlockReusePolicy.ALL_REUSABLE)
+    manager.tokens_per_block = 8
+    manager.kv_cache_map = {request.py_request_id: kv_cache}
+    manager.try_commit_generation_blocks(request)
+
+    manager.suspend_request(request)
+
+    assert kv_cache.calls == [("commit", [4, 5]), ("suspend", [])]
+    assert not kv_cache.commit_is_end
+
+
+def _make_freeing_manager(
+    request: SimpleNamespace, kv_cache: _RecordingKVCache
+) -> KVCacheManagerV2:
+    manager = _make_publishing_manager(BlockReusePolicy.ALL_REUSABLE)
+    manager.tokens_per_block = 8
+    manager.kv_cache_map = {request.py_request_id: kv_cache}
+    manager._pending_preemption = {}
+    manager._allocated_draft_lens = {}
+    manager._inflight_draft_lens = {}
+    manager._request_stats_enabled_ids = set()
+    manager._fresh_pages_filled = {}
+    manager._disagg_receive_ready = {}
+    manager._on_allocation_stream = set()
+    manager._allocation_ready = {}
+    manager._remove_kv_cache = Mock(
+        side_effect=lambda request_id: kv_cache.calls.append(("close", []))
+    )
+    return manager
+
+
+def test_free_resources_flushes_deferred_generation_commit_before_close() -> None:
+    request = _generation_request(max_beam_num_tokens=7)
+    kv_cache = _RecordingKVCache(num_committed_tokens=4)
+    manager = _make_freeing_manager(request, kv_cache)
+    manager.try_commit_generation_blocks(request)
+
+    manager.free_resources(request)
+
+    # close() turns the committed tail into the partial block a later request can reuse.
+    assert kv_cache.calls == [("commit", [4, 5]), ("close", [])]
+    assert manager._committed_token_bound(request.py_request_id, kv_cache) == 6
+
+
+def test_free_resources_flushes_deferred_generation_commit_before_deferred_close() -> None:
+    request = _generation_request(
+        max_beam_num_tokens=7, is_generation_only_request=True, is_dummy=False
+    )
+    kv_cache = _RecordingKVCache(num_committed_tokens=4)
+    manager = _make_freeing_manager(request, kv_cache)
+    manager._defer_close_enabled = True
+
+    def defer_close(request_id: int) -> bool:
+        # The deferred close unmaps the cache now, so a later flush would find nothing.
+        manager.kv_cache_map.pop(request_id)
+        kv_cache.calls.append(("deferred_close", []))
+        return True
+
+    manager._defer_remove_kv_cache = Mock(side_effect=defer_close)
+    manager.try_commit_generation_blocks(request)
+
+    manager.free_resources(request)
+
+    assert kv_cache.calls == [("commit", [4, 5]), ("deferred_close", [])]
+    manager._remove_kv_cache.assert_not_called()
+    assert not manager._deferred_generation_commits
+
+
+def test_flush_deferred_generation_commit_skips_inactive_cache() -> None:
+    request = _generation_request(max_beam_num_tokens=7)
+    kv_cache = _RecordingKVCache(num_committed_tokens=4)
+    manager = _make_publishing_manager(BlockReusePolicy.ALL_REUSABLE)
+    manager.tokens_per_block = 8
+    manager.kv_cache_map = {request.py_request_id: kv_cache}
+    manager.try_commit_generation_blocks(request)
+    kv_cache.is_active = False
+
+    manager._flush_deferred_generation_commit(request.py_request_id)
+
+    assert kv_cache.calls == []
+    assert manager._committed_token_bound(request.py_request_id, kv_cache) == 4
+
+
+def test_shutdown_flushes_deferred_generation_commit_before_close() -> None:
+    request = _generation_request(max_beam_num_tokens=7)
+    kv_cache = _RecordingKVCache(num_committed_tokens=4)
+    manager = _make_publishing_manager(BlockReusePolicy.ALL_REUSABLE)
+    manager.tokens_per_block = 8
+    manager.kv_cache_map = {request.py_request_id: kv_cache}
+    manager._disagg_receive_ready = {}
+    manager._on_allocation_stream = set()
+    manager._allocation_ready = {}
+    manager._request_stats_enabled_ids = set()
+    manager._fresh_pages_filled = {}
+    manager.impl = Mock()
+    manager.event_manager = None
+    manager.try_commit_generation_blocks(request)
+
+    manager.shutdown()
+
+    assert kv_cache.calls == [("commit", [4, 5]), ("close", [])]
+    assert not manager._deferred_generation_commits
 
 
 @pytest.mark.parametrize("role", [Role.VALUE, Role.KEY_BLOCK_SCALE])

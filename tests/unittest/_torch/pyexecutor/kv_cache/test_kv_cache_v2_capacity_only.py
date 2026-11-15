@@ -42,6 +42,8 @@ def _manager(
     manager.kv_cache_map = {}
     # No windowed pools; the window-crossing check reads them on every growth.
     manager._windowed_layer_group_sizes = {}
+    # 197 -> 200 committed tokens fills a block here, so generation commits are not deferred.
+    manager.tokens_per_block = 8
     return manager
 
 

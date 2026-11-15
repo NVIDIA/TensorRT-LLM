@@ -1590,7 +1590,7 @@ class CSA2CacheManager(KVCacheManagerV2):
         cache = self.kv_cache_map.get(request_id)
         if cache is None:
             return
-        committed = int(cache.num_committed_tokens or 0)
+        committed = self._committed_token_bound(request_id, cache)
         protected_blocks = (committed + self.tokens_per_block - 1) // self.tokens_per_block
         state = self._fresh_pages_filled.setdefault(request_id, {})
         filled = 0

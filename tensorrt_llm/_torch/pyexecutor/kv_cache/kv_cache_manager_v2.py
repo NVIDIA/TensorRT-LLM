@@ -2281,6 +2281,9 @@ class KVCacheManagerV2(BaseResourceManager):
     # connector-reservation cap read it on instances tests build without
     # running __init__. Zero disables the spec recompute tail.
     _spec_recompute_tail: int = 0
+    # request id -> (request, stable token count) whose generation commit is
+    # deferred; see try_commit_generation_blocks. Created on first use.
+    _deferred_generation_commits: Optional[dict[int, tuple[LlmRequest, int]]] = None
     # True on hybrid Mamba/GDN managers; __init__ then coerces a positive
     # recompute tail to a full re-prefill.
     _has_recurrent_state: bool = False
@@ -3776,7 +3779,7 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_cache = self.kv_cache_map.get(request_id)
         if kv_cache is None:
             return
-        committed = int(getattr(kv_cache, "num_committed_tokens", 0) or 0)
+        committed = self._committed_token_bound(request_id, kv_cache)
         protected = (committed + self.tokens_per_block - 1) // self.tokens_per_block
         num_blocks = int(kv_cache.num_blocks)
         state = self._fresh_pages_filled.setdefault(request_id, {})
@@ -7431,6 +7434,7 @@ class KVCacheManagerV2(BaseResourceManager):
         """Suspend a request's KV cache, allowing pages to migrate to a secondary tier."""
         kv_cache = self.kv_cache_map.get(req.py_request_id)
         if kv_cache is not None and kv_cache.is_active:
+            self._flush_deferred_generation_commit(req.py_request_id)
             kv_cache.suspend()
 
     def resume_request(self, req: LlmRequest) -> bool:
@@ -9487,18 +9491,55 @@ class KVCacheManagerV2(BaseResourceManager):
         is_end = request.state == LlmRequestState.GENERATION_COMPLETE
         start = kv_cache.num_committed_tokens
         if stable_token_count > start:
-            tokens = self._reuse_token_source(request)
-            if start >= request.prompt_len:
-                # Multimodal items live in the prompt, so generated text needs no digests.
-                tokens = tokens[start:stable_token_count]
-            else:
-                # A generation-only request may still have an uncommitted prompt suffix.
-                tokens = self._augment_tokens_for_block_reuse(
-                    tokens, request, start=start, end=stable_token_count
-                )
-            kv_cache.commit(tokens, is_end=is_end)
+            tokens_per_block = self.tokens_per_block
+            if not is_end and stable_token_count // tokens_per_block == start // tokens_per_block:
+                # Until a block fills, commit() only appends to the cache's token list.
+                # Defer it; _flush_deferred_generation_commit catches up before the tail matters.
+                deferred = self._deferred_generation_commits
+                if deferred is None:
+                    deferred = self._deferred_generation_commits = {}
+                deferred[request.py_request_id] = (request, stable_token_count)
+                return
+            self._commit_generation_tokens(request, kv_cache, start, stable_token_count, is_end)
         elif is_end:
             kv_cache.commit([], is_end=True)
+
+    def _commit_generation_tokens(
+        self, request: LlmRequest, kv_cache: _KVCache, start: int, end: int, is_end: bool
+    ) -> None:
+        tokens = self._reuse_token_source(request)
+        if start >= request.prompt_len:
+            # Multimodal items live in the prompt, so generated text needs no digests.
+            tokens = tokens[start:end]
+        else:
+            # A generation-only request may still have an uncommitted prompt suffix.
+            tokens = self._augment_tokens_for_block_reuse(tokens, request, start=start, end=end)
+        kv_cache.commit(tokens, is_end=is_end)
+
+    def _flush_deferred_generation_commit(self, request_id: int) -> None:
+        """Commit the partial-block tail try_commit_generation_blocks deferred.
+
+        Must run while the cache is active and before stop_committing() (close)
+        or suspend(), so the cache's committed tokens match a per-step commit.
+        """
+        deferred = self._deferred_generation_commits
+        entry = deferred.pop(request_id, None) if deferred else None
+        if entry is None:
+            return
+        kv_cache = self.kv_cache_map.get(request_id)
+        if kv_cache is None or not kv_cache.is_active:
+            return
+        request, end = entry
+        start = kv_cache.num_committed_tokens
+        if end > start:
+            self._commit_generation_tokens(request, kv_cache, start, end, is_end=False)
+
+    def _committed_token_bound(self, request_id: int, kv_cache: _KVCache) -> int:
+        """Committed tokens, counting a deferred generation commit as done."""
+        committed = int(getattr(kv_cache, "num_committed_tokens", 0) or 0)
+        deferred = self._deferred_generation_commits
+        entry = deferred.get(request_id) if deferred else None
+        return max(committed, entry[1]) if entry else committed
 
     def release_index_slot(self, request_id: int) -> None:
         """Release IndexMapper slot early while keeping KV cache blocks allocated.
@@ -9722,6 +9763,9 @@ class KVCacheManagerV2(BaseResourceManager):
         self._disagg_receive_ready.pop(request.py_request_id, None)
         self._on_allocation_stream.discard(request.py_request_id)
         self._allocation_ready.pop(request.py_request_id, None)
+        # Commit the deferred tail while the cache is still mapped; a deferred
+        # close below unmaps it before the actual close.
+        self._flush_deferred_generation_commit(request.py_request_id)
         # Dummies reuse request ids, so their closes stay immediate.
         if (
             self._defer_close_enabled
@@ -10136,6 +10180,8 @@ class KVCacheManagerV2(BaseResourceManager):
         # the caches it lent against are still alive.
         if self._sharing is not None:
             self._sharing._on_shutdown()
+        for request_id in list(self._deferred_generation_commits or ()):
+            self._flush_deferred_generation_commit(request_id)
         for kv_cache in self.kv_cache_map.values():
             kv_cache.close()
         self.kv_cache_map.clear()

@@ -803,6 +803,34 @@ def test_fresh_fill_uses_physical_roles_and_preserves_relocated_committed_pages(
         assert torch.all(buffer[[10, 11]] == 0)  # newly materialized ordinals
 
 
+@pytest.mark.cpu_only
+def test_fresh_fill_preserves_deferred_generation_tokens(monkeypatch) -> None:
+    manager = _declarative_manager(20)
+    manager._fresh_page_fill = 0
+    manager._fresh_fill_announced = True
+    manager._fresh_pages_filled = {}
+    manager.kv_cache_map = {1: SimpleNamespace(num_committed_tokens=128)}
+    # The cache counts one block; a deferred commit already wrote a token into the second.
+    manager._deferred_generation_commits = {1: (SimpleNamespace(), 129)}
+    buffers = {
+        identity: torch.full((16, 1, 4), 7, dtype=torch.uint8)
+        for identity in manager._physical_roles.values()
+    }
+    page_tables = {identity: [1, 2, 3, 4, 5, 6] for identity in buffers}
+    manager.get_buffers = lambda layer, role: buffers[manager._cache_role_key(layer, role)]
+    manager.get_cache_indices = lambda request, layer, role: page_tables[
+        manager._cache_role_key(layer, role)
+    ]
+    manager._get_page_index_converter = lambda *args: SimpleNamespace(expansion=2)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+
+    manager._fill_fresh_kv_pages(1)
+
+    for buffer in buffers.values():
+        assert torch.all(buffer[[1, 2, 3, 4]] == 7)  # ceil(129 / 128) * expansion
+        assert torch.all(buffer[[5, 6]] == 0)
+
+
 @skip_pre_blackwell
 @pytest.mark.parametrize("guard", [False, True])
 def test_real_context_allocator_omits_decoder_swa(monkeypatch, guard: bool) -> None:
