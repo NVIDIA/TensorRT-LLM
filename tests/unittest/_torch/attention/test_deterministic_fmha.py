@@ -3,6 +3,7 @@
 """Real runtime selection must keep attention invariant to unrelated requests."""
 
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -19,8 +20,84 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
+from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
+
+
+@pytest.fixture
+def deterministic_launches(monkeypatch):
+    """The phases the deterministic library launched; a fallback would launch none."""
+    phases = []
+    launch = DeterministicFmha._run_attention
+
+    def recorded(self, phase, **kwargs):
+        phases.append(phase)
+        return launch(self, phase, **kwargs)
+
+    monkeypatch.setattr(DeterministicFmha, "_run_attention", recorded)
+    return phases
+
+
+@pytest.mark.parametrize(
+    "change, reason",
+    [
+        ({}, None),
+        ({"query_dtype": torch.float16}, "query dtype"),
+        ({"kv_dtype": DataType.FP8}, "KV cache dtype"),
+        ({"is_cross": True}, "cross attention"),
+        ({"beam_width": 2}, "beam width"),
+        ({"tokens_per_block": 128}, "KV page size"),
+        ({"num_heads": 66}, "query heads per KV head"),
+        ({"use_spec_decoding": True}, "speculative decoding"),
+        ({"attention_sinks": torch.zeros(8)}, "attention sinks"),
+        ({"mask_type": AttentionMaskType.padding}, "mask type"),
+        ({"attention_chunk_size": 16}, "chunked attention"),
+        ({"attention_window_size": 64}, "sliding attention window"),
+        ({"attention_window_size": None}, "sliding attention window"),
+    ],
+)
+def test_requests_the_kernel_cannot_serve_are_left_to_the_fallback(change, reason):
+    setup = dict(
+        query_dtype=torch.bfloat16,
+        kv_dtype=DataType.BF16,
+        is_cross=False,
+        beam_width=1,
+        tokens_per_block=32,
+        num_heads=8,
+        use_spec_decoding=False,
+        attention_sinks=None,
+        mask_type=AttentionMaskType.causal,
+        attention_chunk_size=0,
+        attention_window_size=128,
+    )
+    setup.update(change)
+    layer = SimpleNamespace(
+        num_heads=setup["num_heads"],
+        num_kv_heads=2,
+        attention_chunk_size=setup["attention_chunk_size"],
+    )
+    fmha = DeterministicFmha.__new__(DeterministicFmha)
+    fmha._attn_ref = lambda: layer
+    metadata = SimpleNamespace(
+        kv_cache_manager=SimpleNamespace(dtype=setup["kv_dtype"]),
+        is_cross=setup["is_cross"],
+        beam_width=setup["beam_width"],
+        tokens_per_block=setup["tokens_per_block"],
+        use_spec_decoding=setup["use_spec_decoding"],
+        max_seq_len=128,
+    )
+    forward_args = SimpleNamespace(
+        attention_sinks=setup["attention_sinks"],
+        mask_type=setup["mask_type"],
+        attention_window_size=setup["attention_window_size"],
+    )
+    query = torch.empty(1, 8 * 64, dtype=setup["query_dtype"])
+    actual = fmha._unsupported_reason(query, metadata, forward_args)
+    if reason is None:
+        assert actual is None
+    else:
+        assert reason in actual
 
 
 @pytest.mark.parametrize("contexts", [1, 3])
@@ -85,7 +162,9 @@ def test_context_attention_ignores_generation_length_tail(contexts: int, generat
 
 @pytest.mark.parametrize("dim", [64, 128, 256])
 @pytest.mark.parametrize("page", [32, 64])
-def test_deterministic_attention_runtime_phase_invariance(monkeypatch, dim, page):
+def test_deterministic_attention_runtime_phase_invariance(
+    monkeypatch, deterministic_launches, dim, page
+):
     if not torch.cuda.is_available() or get_sm_version() not in (100, 103):
         pytest.skip("Requires SM100 or SM103")
     monkeypatch.setenv("FORCE_ATTENTION_KERNEL_DETERMINISTIC", "1")
@@ -143,12 +222,15 @@ def test_deterministic_attention_runtime_phase_invariance(monkeypatch, dim, page
         del attention
     finally:
         manager.shutdown()
+    assert deterministic_launches == [FmhaPhase.CONTEXT, FmhaPhase.GENERATION]
     torch.testing.assert_close(results[0], results[1], rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("length", [513, 2049, 8193])
 @pytest.mark.parametrize("page", [32, 64])
-def test_deterministic_attention_runtime_batch_invariance(monkeypatch, length, page):
+def test_deterministic_attention_runtime_batch_invariance(
+    monkeypatch, deterministic_launches, length, page
+):
     if not torch.cuda.is_available() or get_sm_version() not in (100, 103):
         pytest.skip("Requires SM100 or SM103")
     monkeypatch.setenv("FORCE_ATTENTION_KERNEL_DETERMINISTIC", "1")
@@ -208,4 +290,5 @@ def test_deterministic_attention_runtime_batch_invariance(monkeypatch, length, p
             del pool, metadata, attention
         finally:
             manager.shutdown()
+    assert deterministic_launches == [FmhaPhase.GENERATION] * 2
     torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0)

@@ -49,7 +49,9 @@ and at most 32 query heads per KV head on SM100/SM103. Sliding windows,
 attention sinks, cross attention, MLA, and speculative decoding are not
 supported. Unsupported layers or batches emit a warning and use the existing
 fallback, which does not provide this arithmetic guarantee. An explicit
-`TLLM_FMHA_LIBS` override must include `deterministic` to select this library.
+`TLLM_FMHA_LIBS` override must include `deterministic` to select this library;
+if it leaves out `fallback`, an unsupported layer or batch raises a
+`RuntimeError` instead.
 
 The kernel uses Tensor Cores and rounds the attention probabilities to BF16
 before the value product, so its accuracy against an exact reference is that of

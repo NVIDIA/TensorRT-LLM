@@ -200,12 +200,15 @@ def test_attention_all_rows_unaligned_chunks_and_graph_metadata(dim, shared):
     torch.testing.assert_close(captured, run(q, lens, table, cu), rtol=0, atol=0)
 
 
+# 32 query heads per KV head is the largest supported group; decode then runs
+# 32 rows per program on eight warps instead of four.
+@pytest.mark.parametrize("heads_kv", [(6, 2), (32, 1)], ids=["6x2", "32x1"])
 @pytest.mark.parametrize("dim", [64, 128, 256])
 @pytest.mark.parametrize("shared", [True, False])
-def test_attention_key_segments_and_parallel_decode(dim, shared):
+def test_attention_key_segments_and_parallel_decode(dim, shared, heads_kv):
     """Rows whose keys span several segments agree in prefill, serial and parallel decode."""
     torch.manual_seed(5)
-    length, heads, kv_heads, page = 2500, 6, 2, 32
+    (heads, kv_heads), length, page = heads_kv, 2500, 32
     pages = math.ceil(length / page)
     keys = torch.randn(pages, kv_heads, page, dim, device="cuda", dtype=torch.bfloat16)
     values = torch.randn_like(keys)
