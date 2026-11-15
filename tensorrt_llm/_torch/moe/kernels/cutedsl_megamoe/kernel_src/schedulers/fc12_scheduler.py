@@ -24,6 +24,7 @@ from .fc12_mapping import (
     map_fc12_linear_work_id,
     map_phase_interleaved_fc12_work_id,
     resolve_phase_interleaved_fc1_claim_target,
+    resolve_phase_interleaved_stream_extent,
     rewind_fc12_mapping_cursor,
 )
 from .non_clc_mixed_cga import NonClcMixedCgaConfig, NonClcMixedCgaSchedulerWorker
@@ -433,12 +434,14 @@ class _PhaseInterleaveControlState:
         fc1_exhausted: Boolean,
         fc2_exhausted: Boolean,
         prologue_claims_synchronized: Boolean,
+        shared_num_tokens: Int32,
     ) -> None:
         self.prologue_remaining = prologue_remaining
         self.cycle_position = cycle_position
         self.fc1_exhausted = fc1_exhausted
         self.fc2_exhausted = fc2_exhausted
         self.prologue_claims_synchronized = prologue_claims_synchronized
+        self.shared_num_tokens = shared_num_tokens
 
     def _fields(self) -> Tuple:
         return (
@@ -447,6 +450,7 @@ class _PhaseInterleaveControlState:
             self.fc1_exhausted,
             self.fc2_exhausted,
             self.prologue_claims_synchronized,
+            self.shared_num_tokens,
         )
 
     def __extract_mlir_values__(self) -> list:
@@ -524,6 +528,8 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
         self.launch_cluster_cnt_merge_as_preferred = self.non_clc_mixed_cga_config.launch_cluster_cnt_merge_as_preferred
         self.compute_cluster_count = impl_desc.get("compute_cluster_count", self.launch_cluster_cnt_merge_as_preferred)
         self.work_tile_type = SwapAbFc12WorkTileInfo if self.is_swap_ab else NonSwapAbFc12WorkTileInfo
+        # (output blocks, tokens per tile, cluster M) once claim_shared_fc2_tiles is called.
+        self.shared_fc2_claim_shape = None
 
         self._validate_configuration()
         mma_cta_count = 2 if self.use_2cta_instrs else 1
@@ -758,7 +764,45 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
             prologue_claims_synchronized=Boolean(
                 self.defer_consumer_until_full_ready
             ),
+            shared_num_tokens=Int32(0),
         )
+
+    def claim_shared_fc2_tiles(
+        self, *, output_blocks: int, tokens_per_tile: int, cluster_m: int
+    ) -> None:
+        """Continue the FC2 claim stream into the fused shared expert's down-projection tiles, so the clusters
+        that finish their routed work first take more of them."""
+        if not self.is_swap_ab:
+            raise ValueError("Shared down-projection claims need the swap-AB mapping.")
+        self.shared_fc2_claim_shape = (output_blocks, tokens_per_tile, cluster_m)
+
+    def set_shared_fc2_tokens(self, num_tokens: Int32) -> None:
+        """The shared expert's (local) token count, which sizes its claimed down-projection tiles."""
+        self._control_state.shared_num_tokens = num_tokens
+
+    def _map_shared_fc2_work_id(
+        self, shared_work_id: Int32, cta_id_in_mapping_cluster: cute.Coord, num_tokens: Int32
+    ) -> Tuple[SchedulerWorkTileBase, Boolean]:
+        """Map an FC2 ID's offset past the routed tiles to a shared down-projection tile."""
+        output_blocks, tokens_per_tile, cluster_m = self.shared_fc2_claim_shape
+        token_blocks = (num_tokens + Int32(tokens_per_tile - 1)) // Int32(tokens_per_tile)
+        is_valid = shared_work_id < token_blocks * Int32(output_blocks)
+        token_block = shared_work_id // Int32(output_blocks)
+        output_block = shared_work_id - token_block * Int32(output_blocks)
+        valid_tokens = cutlass.min(
+            num_tokens - token_block * Int32(tokens_per_tile), Int32(tokens_per_tile)
+        )
+        work_tile = SwapAbFc12WorkTileInfo(
+            expert_idx=Int32(0),
+            tile_m_idx=output_block * Int32(cluster_m) + cta_id_in_mapping_cluster[1],
+            tile_n_idx=token_block,
+            cumulative_data_physical_row=Int32(0),
+            cumulative_sf_physical_row=Int32(0),
+            cumulative_token_block_count=Int32(0),
+            valid_tokens_in_cta_tile=valid_tokens,
+            phase_and_flags=Int32(BlockPhase.SharedLinear2),
+        )
+        return work_tile, is_valid
 
     @cute.jit
     def cluster_uniform_counter_ready(
@@ -806,6 +850,8 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
         control_state = self._control_state
         fc1_exhausted = control_state.fc1_exhausted
         ready = Boolean(False)
+        if task_mapping_state.stream_token_blocks < Int32(0):
+            task_mapping_state = resolve_phase_interleaved_stream_extent(task_mapping_state)
 
         if fc1_exhausted:
             ready = work_id_worker.cluster_uniform_counter_ready(
@@ -864,6 +910,8 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
         task_mapping_state = self._task_mapping_state
         control_state = self._control_state
         fc1_exhausted = control_state.fc1_exhausted
+        if task_mapping_state.stream_token_blocks < Int32(0):
+            task_mapping_state = resolve_phase_interleaved_stream_extent(task_mapping_state)
 
         if not fc1_exhausted:
             linear_work_id = work_id_worker.claim_next_work(
@@ -923,6 +971,9 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
         stream_has_work = Boolean(False)
         prologue_claims_synchronized = control_state.prologue_claims_synchronized
         resolved = Boolean(False)
+        # The first call runs after the expert sizes are ready.
+        if task_mapping_state.stream_token_blocks < Int32(0):
+            task_mapping_state = resolve_phase_interleaved_stream_extent(task_mapping_state)
 
         while not resolved:
             if fc1_exhausted and fc2_exhausted:
@@ -960,6 +1011,16 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
                         task_mapping_state,
                     )
                 )
+                if cutlass.const_expr(self.shared_fc2_claim_shape is not None):
+                    if (not want_fc1) and (not stream_has_work):
+                        work_tile, stream_has_work = self._map_shared_fc2_work_id(
+                            linear_work_id
+                            - task_mapping_state.stream_tiles(
+                                task_mapping_state.fc2_claims_per_token_block
+                            ),
+                            cta_id_in_mapping_cluster,
+                            control_state.shared_num_tokens,
+                        )
                 if stream_has_work:
                     if (not want_fc1) and (not prologue_claims_synchronized):
                         fc1_exhausted = self._wait_for_fc1_prologue_claims(
@@ -1045,6 +1106,7 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
             "interleave_fc2_slots",
             "interleave_cycle_length",
             "minimum_global_fc1_claims",
+            "shared_fc2_claim_shape",
         ):
             setattr(result, field_name, getattr(self, field_name))
         return result

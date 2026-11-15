@@ -34,6 +34,7 @@
 #include "kv_cache_manager_v2/storage/config.h"
 #include "kv_cache_manager_v2/storage/core.h"
 #include "kv_cache_manager_v2/streamingEventSink.h"
+#include "kv_cache_manager_v2/utils/copyUtils.h"
 #include "kv_cache_manager_v2/utils/optionalGilRelease.h"
 
 #include <algorithm>
@@ -1504,6 +1505,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_ro("total", &kv::StorageStatistics::total)
         .def_ro("free", &kv::StorageStatistics::free)
         .def_ro("evictable", &kv::StorageStatistics::evictable)
+        .def_ro("retained_copies", &kv::StorageStatistics::retainedCopies)
         .def_prop_ro("available", &kv::StorageStatistics::available)
         .def_prop_ro("unavailable", &kv::StorageStatistics::unavailable);
 
@@ -1753,10 +1755,25 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_prop_ro("tier", &kv::HostCacheTierConfig::tier)
         .def("validate", &kv::HostCacheTierConfig::validate) DEF_COPY(kv::HostCacheTierConfig);
 
+    m.def("live_slab_bytes", &kv::liveSlabBytes, "Host bytes held by live page slabs in this process.");
+
+    nb::class_<kv::HostMemBackingConfig>(m, "HostMemBackingConfig")
+        .def(nb::init<std::optional<int>, bool>(), nb::arg("numa_node") = nb::none(),
+            nb::arg("allow_remote_numa_fallback") = true)
+        .def_rw("numa_node", &kv::HostMemBackingConfig::numaNode)
+        .def_rw("allow_remote_numa_fallback", &kv::HostMemBackingConfig::allowRemoteNumaFallback)
+        .def("validate", &kv::HostMemBackingConfig::validate) DEF_COPY(kv::HostMemBackingConfig);
+
     nb::class_<kv::DiskCacheTierConfig>(m, "DiskCacheTierConfig")
-        .def(nb::init<size_t, std::string>(), nb::arg("quota"), nb::arg("path"))
+        .def(nb::init<size_t, std::string, int, bool, bool, float>(), nb::arg("quota"), nb::arg("path"),
+            nb::arg("num_io_threads") = 0, nb::arg("keep_copy_after_restore") = false, nb::arg("write_through") = false,
+            nb::arg("protected_copy_fraction") = 1.0F)
         .def_rw("quota", &kv::DiskCacheTierConfig::quota)
         .def_rw("path", &kv::DiskCacheTierConfig::path)
+        .def_rw("num_io_threads", &kv::DiskCacheTierConfig::numIoThreads)
+        .def_rw("keep_copy_after_restore", &kv::DiskCacheTierConfig::keepCopyAfterRestore)
+        .def_rw("write_through", &kv::DiskCacheTierConfig::writeThrough)
+        .def_rw("protected_copy_fraction", &kv::DiskCacheTierConfig::protectedCopyFraction)
         .def_prop_ro("tier", &kv::DiskCacheTierConfig::tier)
         .def("validate", &kv::DiskCacheTierConfig::validate) DEF_COPY(kv::DiskCacheTierConfig);
 
@@ -1958,7 +1975,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 std::optional<kv::SwaScratchReuseConfig> swaScratchReuse, bool commitMinSnapshot, bool enableStats,
                 bool textOnly, bool enablePartialCommit, kv::PoolRebalanceConfig poolRebalance,
                 kv::Priority coldTierOffloadMinPriority, std::optional<size_t> hostSparsePoolQuota,
-                std::vector<kv::RegionConfig> regions)
+                std::vector<kv::RegionConfig> regions, kv::HostMemBackingConfig hostMemBacking)
             {
                 new (cfg) kv::KVCacheManagerConfig();
                 cfg->tokensPerBlock = tokensPerBlock;
@@ -1986,6 +2003,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 cfg->coldTierOffloadMinPriority = coldTierOffloadMinPriority;
                 cfg->hostSparsePoolQuota = hostSparsePoolQuota;
                 cfg->regions = std::move(regions);
+                cfg->hostMemBacking = std::move(hostMemBacking);
                 // Mirror Python's __post_init__: validate at construction. Config-integrity
                 // failures raise AssertionError (translated below).
                 cfg->validate();
@@ -1999,7 +2017,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("pool_rebalance") = kv::PoolRebalanceConfig{},
             nb::arg("cold_tier_offload_min_priority") = tensorrt_llm::batch_manager::kDefaultColdTierOffloadMinPriority,
             nb::arg("host_sparse_pool_quota").none() = std::nullopt,
-            nb::arg("regions") = std::vector<kv::RegionConfig>{})
+            nb::arg("regions") = std::vector<kv::RegionConfig>{},
+            nb::arg("host_mem_backing") = kv::HostMemBackingConfig{})
         .def_rw("tokens_per_block", &kv::KVCacheManagerConfig::tokensPerBlock)
         .def_rw("cache_tiers", &kv::KVCacheManagerConfig::cacheTiers)
         .def_rw("layers", &kv::KVCacheManagerConfig::layers)
@@ -2028,6 +2047,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "One positive, normalized cache-tier quota weight per layer group.")
         .def_rw("swa_scratch_reuse", &kv::KVCacheManagerConfig::swaScratchReuse)
         .def_rw("commit_min_snapshot", &kv::KVCacheManagerConfig::commitMinSnapshot)
+        .def_rw("host_mem_backing", &kv::KVCacheManagerConfig::hostMemBacking)
         .def_rw("enable_stats", &kv::KVCacheManagerConfig::enableStats)
         .def_rw("text_only", &kv::KVCacheManagerConfig::textOnly)
         .def_rw("pool_rebalance", &kv::KVCacheManagerConfig::poolRebalance)
@@ -2189,6 +2209,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_prop_ro("status", [](kv::KvCache const& kvc) { return kvc.status(); })
         .def_prop_ro("is_active", &kv::KvCache::isActive)
         .def_prop_ro("num_blocks", [](kv::KvCache const& self) { return self.numBlocks().value(); })
+        .def_prop_ro("page_storage_version", &kv::KvCache::pageStorageVersion)
         .def_prop_ro(
             "batch_row",
             [](kv::KvCache const& self) -> std::optional<int>
@@ -2321,6 +2342,16 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     mIntrospection.def(
         "poison_for_testing", [](std::string const& reason) { kv::Poison::set("poison_for_testing", reason.c_str()); },
         nb::arg("reason"), "Set the KVCM2 poison latch directly, to exercise the refusal paths.");
+    mIntrospection.def(
+        "async_disk_io_enabled", []() { return kv::asyncDiskIoEnabled(); },
+        "Whether the process-wide disk I/O pool is running, so disk transfers are asynchronous.");
+    mIntrospection.def(
+        "inject_disk_write_failures_for_testing", [](uint64_t count) { kv::injectDiskWriteFailuresForTesting(count); },
+        nb::arg("count"), "Make the next `count` disk write pieces fail without writing.");
+    mIntrospection.def(
+        "delay_background_disk_writes_for_testing",
+        [](double seconds) { kv::delayBackgroundDiskWritesForTesting(seconds); }, nb::arg("seconds"),
+        "The async disk I/O pool starts a background write piece only once it has been queued for `seconds`.");
 
     nb::class_<EventManagerTestBlock>(mIntrospection, "TestBlock").def("close", &EventManagerTestBlock::close);
 
@@ -2774,6 +2805,23 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             return std::move(utilization.raw());
         },
         nb::arg("manager"), nb::arg("cache_level") = kv::kHotLevel.value(), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
+        "disk_copy_counters",
+        [](kv::KvCacheManager& manager)
+        {
+            auto const c = manager.storage().diskCopyCounters();
+            nb::dict counters;
+            counters["retained"] = c.retained;
+            counters["created"] = c.created;
+            counters["reused"] = c.reused;
+            counters["reused_pending"] = c.reusedPending;
+            counters["reclaimed"] = c.reclaimed;
+            counters["dropped"] = c.dropped;
+            counters["write_through_pages"] = c.writeThroughPages;
+            counters["write_through_skipped"] = c.writeThroughSkipped;
+            return counters;
+        },
+        nb::arg("manager"));
     mIntrospection.def(
         "grains_for_slots",
         [](kv::SlotCount numSlots, std::vector<size_t> const& slotSizeList, size_t granularity,
