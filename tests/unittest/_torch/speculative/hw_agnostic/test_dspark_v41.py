@@ -292,8 +292,11 @@ def test_v41_draft_rejects_fp8_attention_projections(monkeypatch: pytest.MonkeyP
     ],
     ids=["no_tactic", "grouped_gemm", "w4a8_fp8", "mega_moe"],
 )
+@pytest.mark.parametrize(
+    "learn_placement", [False, True], ids=["shared_placement", "draft_placement"]
+)
 def test_v41_draft_tactic_resolves_against_the_draft_stages_only(
-    monkeypatch, tactic, quant_algo, moe_backend
+    monkeypatch, tactic, quant_algo, moe_backend, learn_placement
 ):
     """The target checkpoint is loaded without the draft tactic, as the embedded draft's loader
     kwargs do, and the tactic is resolved against the MXFP4 draft stages alone."""
@@ -319,7 +322,20 @@ def test_v41_draft_tactic_resolves_against_the_draft_stages_only(
     )
     selection = None if tactic is None else MoESelection(tactic=tactic)
 
-    draft_config = DSv41DSparkDraftModel._derive_draft_model_config(model_config, 4, 1, selection)
+    draft_balancer = object() if learn_placement else None
+    monkeypatch.setattr(
+        DSv41DSparkDraftModel,
+        "_draft_load_balancer_config",
+        staticmethod(lambda config: draft_balancer),
+    )
+    draft_config = DSv41DSparkDraftModel._derive_draft_model_config(
+        model_config, 4, 1, selection, block_size=5
+    )
+    assert draft_config.moe_load_balancer is draft_balancer
+    assert draft_config.moe_row_space == ("draft" if learn_placement else "main")
+    assert draft_config.moe_row_space_rows_per_request == (5 if learn_placement else None)
+    assert model_config.moe_load_balancer is None
+    assert model_config.moe_row_space == "main"
 
     stage_experts = draft_config.quant_config_dict["model.layers.4.mlp.experts"]
     assert stage_experts.quant_algo is quant_algo
@@ -726,3 +742,29 @@ def test_v41_sampled_batch_keeps_the_heads_greedy_proposals(monkeypatch, num_gen
         sampled = worker.sample_draft_tokens(corrected, metadata, num_gens, num_contexts=0)
     assert corrected.shape == (num_gens, block, vocab)
     assert torch.equal(proposals.to(torch.int32), sampled)
+
+
+@pytest.mark.cpu_only
+def test_v41_explicit_draft_backend_preserves_nvfp4_conversion(monkeypatch):
+    monkeypatch.setattr(
+        ModelConfig,
+        "_get_safetensors_header_for_tensor",
+        staticmethod(lambda checkpoint_dir, name: {"dtype": "I8", "shape": [8, 8]}),
+    )
+    monkeypatch.setattr(model_config_module, "get_sm_version", lambda: 100)
+    model_config = ModelConfig(
+        pretrained_config=SimpleNamespace(
+            _name_or_path="/unused", architectures=["DeepseekV41ForCausalLM"]
+        ),
+        sparse_attention_config=None,
+        quant_config=QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES),
+        moe_backend="TRTLLM",
+    )
+    draft_config = DSv41DSparkDraftModel._derive_draft_model_config(
+        model_config, 4, 1, MoESelection(backend="MEGAMOE_CUTEDSL")
+    )
+    experts = draft_config.quant_config_dict["model.layers.4.mlp.experts"]
+    assert experts.quant_algo is QuantAlgo.NVFP4
+    assert experts.group_size == 16
+    assert (draft_config.moe_backend, draft_config.moe_tactic) == ("MEGAMOE_CUTEDSL", None)
+    assert model_config.quant_config_dict is None
