@@ -70,8 +70,10 @@ class FakeSession:
     def __init__(self, **kwargs):
         self.kwargs = kwargs
         self.closed = False
+        self.posted_urls = []
 
-    def post(self, *args, **kwargs):
+    def post(self, url, **kwargs):
+        self.posted_urls.append(url)
         raise RuntimeError("no network in this test")
 
     async def close(self):
@@ -103,7 +105,9 @@ def test_fallback_session_uses_the_decision(monkeypatch, request_func, api_url, 
     monkeypatch.setattr(brf.aiohttp, "TCPConnector", lambda **kwargs: None)
     output = asyncio.run(request_func(make_input(api_url)))
     assert not output.success
+    assert "no network in this test" in output.error
     assert [s.kwargs["trust_env"] for s in sessions] == [trust_env]
+    assert sessions[0].posted_urls == [api_url]
     assert sessions[0].closed
 
 
@@ -118,4 +122,5 @@ def test_supplied_session_is_used_as_is(monkeypatch, request_func, api_url):
     output = asyncio.run(request_func(make_input(api_url), session=session))
     assert not output.success
     assert "no network in this test" in output.error
+    assert session.posted_urls == [api_url]
     assert not session.closed
