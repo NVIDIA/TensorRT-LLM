@@ -2079,10 +2079,12 @@ def _autotune_dist_allgather_worker(world_size, init_file):
                             world_size=world_size,
                             rank=rank)
     try:
-        # VG's real mesh has tp_size=1; the communicator must gather over the whole
-        # world regardless, so the mapping's tp axis is irrelevant to the gather.
+        # A TP-only gather would return one rank instead of the whole world.
         d = _VisualGenAutotuneDist(
-            Mapping(world_size=world_size, rank=rank, tp_size=world_size))
+            Mapping(world_size=world_size,
+                    rank=rank,
+                    tp_size=1,
+                    pp_size=world_size))
         return d.tp_cp_allgather(f"rank{rank}")
     finally:
         dist.destroy_process_group()
