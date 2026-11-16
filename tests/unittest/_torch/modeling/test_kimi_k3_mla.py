@@ -559,6 +559,10 @@ def test_kimi_linear_forward_matches_reference(monkeypatch: pytest.MonkeyPatch) 
                 module.post_load_weights()
         reference.cuda()
 
+    for name, parameter in model.named_parameters():
+        if "res_proj" in name:
+            assert not parameter.any(), f"{name} must be zero for the uniform-mix reference"
+
     input_ids = torch.tensor([3, 7, 11, 5], device="cuda", dtype=torch.long)
     embeddings = model.model.embed_tokens(input_ids)
 
