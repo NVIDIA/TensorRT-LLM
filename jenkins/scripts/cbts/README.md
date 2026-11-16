@@ -217,6 +217,13 @@ CBTS control testcase so normal JUnit reporting still has a result; unexpected
 empty collections and collection failures remain errors. Cases never move
 from an unselected shard into a selected shard.
 
+With `reuse_build`, the packaged pytest sources may predate the intersection
+options. Before creating a companion, Jenkins checks option registration in the
+packaged `tests/integration/defs/conftest.py` without importing it. If either
+`--cbts-test-list` or `--cbts-shard-result` is unavailable, the selected stages
+use the original source test list and original shard assignment. No companion
+or new pytest options are passed in either ordinary/agent or native-sbatch runs.
+
 ## Stage scheduling
 
 The Python selector returns affected candidates across pre-merge and Post-Merge
