@@ -191,7 +191,7 @@ def test_attention_quant_ignore_scope(mode: str) -> None:
                 qk_dtype="nvfp4",
                 v_dtype="fp8",
                 ignore=["transformer_blocks.0.attn1"] if mode == "block" else [],
-                ignored_steps=[1] if mode == "step" else [],
+                ignore_steps=[1] if mode == "step" else [],
             ),
         ),
         attention_metadata_state={},

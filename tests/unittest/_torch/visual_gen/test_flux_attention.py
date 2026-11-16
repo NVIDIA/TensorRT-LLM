@@ -345,7 +345,7 @@ def test_flux_attention_quant_ignore_bypasses_explicit_qkv_quantization() -> Non
     attention = FluxJointAttention.__new__(FluxJointAttention)
     torch.nn.Module.__init__(attention)
     attention._quant_attention_config = QuantAttentionConfig(
-        qk_dtype="fp8", v_dtype="fp8", ignored_steps=[0]
+        qk_dtype="fp8", v_dtype="fp8", ignore_steps=[0]
     )
     attention._quantization_excluded = False
     attention._quant_ignore_state = {}

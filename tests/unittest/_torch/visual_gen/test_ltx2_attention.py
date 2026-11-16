@@ -437,7 +437,7 @@ if __name__ == "__main__":
 
 
 @pytest.mark.cpu_only
-def test_linear_ignored_steps_keep_norm_output_bf16() -> None:
+def test_linear_ignore_steps_keep_norm_output_bf16() -> None:
     from types import SimpleNamespace
     from unittest.mock import patch
 
@@ -448,7 +448,7 @@ def test_linear_ignored_steps_keep_norm_output_bf16() -> None:
     )
 
     projection = SimpleNamespace(
-        quant_config=SimpleNamespace(ignored_steps=[1]),
+        quant_config=SimpleNamespace(ignore_steps=[1]),
         quant_method=NVFP4LinearMethod(),
         input_scale=torch.ones(()),
         scaling_vector_size=16,
@@ -475,12 +475,12 @@ def test_linear_ignored_steps_keep_norm_output_bf16() -> None:
     fused.assert_called_once()
     assert "sf_scale" not in fused.call_args.kwargs
     assert output.dtype == torch.bfloat16
-    projection.quant_config.ignored_steps = []
+    projection.quant_config.ignore_steps = []
     assert get_nvfp4_input_scale(projection) is projection.input_scale
 
 
 @pytest.mark.cpu_only
-def test_linear_ignored_steps_bypass_async_qkv_quantization() -> None:
+def test_linear_ignore_steps_bypass_async_qkv_quantization() -> None:
     from unittest.mock import patch
 
     from test_common.visual_gen_quantization import (
@@ -492,10 +492,10 @@ def test_linear_ignored_steps_bypass_async_qkv_quantization() -> None:
     from tensorrt_llm._torch.visual_gen.quantization.quant_dispatcher import (
         install_linear_quant_dispatcher,
     )
-    from tensorrt_llm.visual_gen.args import DiffusionQuantConfig
+    from tensorrt_llm.visual_gen.args import LinearQuantConfig
 
     config = DiffusionModelConfig(
-        quant_config=DiffusionQuantConfig(quant_algo="NVFP4", ignored_steps=[0]),
+        quant_config=LinearQuantConfig(quant_algo="NVFP4", ignore_steps=[0]),
         dynamic_weight_quant=True,
         force_dynamic_quantization=False,
         attention=AttentionConfig(backend="VANILLA"),

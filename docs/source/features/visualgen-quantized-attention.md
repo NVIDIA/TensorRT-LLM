@@ -81,7 +81,7 @@ After a recipe meets the quality target, benchmark its end-to-end throughput wit
 | `vc_repair_budget` | float in `[0, 1)` | `0.0` | Fraction of tokens VC-Attention appends as V repair rows instead of restoring tile means. `0` restores the means. `vc_attention` only. |
 | `deco_attention` | bool | `false` | Run the recipe as DeCo-Attention on the `CUTEDSL` backend. See [DeCo-Attention in the `CUTEDSL` backend](#deco-attention-in-the-cutedsl-backend). |
 | `ignore` | list of strings | `[]` | Attention module paths that keep their native BF16/FP16 dtype at every step. Uses the same patterns as Linear exclusions. |
-| `ignored_steps` | list of integers ≥ 0 | `[]` | Zero-based denoising iterations that use the selected backend's native BF16/FP16 attention for every layer, independently of Linear quantization. |
+| `ignore_steps` | list of integers ≥ 0 | `[]` | Steps that use the selected backend's native BF16/FP16 attention for every layer. Step 0 is the first denoising step. |
 
 Routing (`tensorrt_llm/_torch/visual_gen/attention/backends/utils.py`) forwards the validated `quant_attention_config` into the backend constructor: `TrtllmAttention` for `TRTLLM`, `CuDNNAttention` for `CUDNN`, `FlashInferAttention` for `FLASHINFER`, and for `CUTEDSL` the dense `CuTeDSLAttention` FMHA backend, or `DeCoAttention` when `deco_attention` is set.
 
@@ -392,10 +392,10 @@ For NVFP4 PV, set `v_dtype` to `nvfp4`.
 
 ## Layer and step exclusions
 
-Use `ignore` for layer exclusions or `ignored_steps` for step exclusions under
+Use `ignore` for layer exclusions or `ignore_steps` for step exclusions under
 `quant_config` for Linear layers (including attention projections), and under
 `attention_config.quant_attention_config` for attention kernels. Nonempty `ignore`
-and `ignored_steps` lists are mutually exclusive across both configurations.
+and `ignore_steps` lists are mutually exclusive across both configurations.
 Excluded attention uses the selected backend's native BF16/FP16 path.
 
 **By layer.** `ignore` accepts module paths, `*` wildcard patterns, or
@@ -428,13 +428,13 @@ remains quantized at its other steps. Step 0 is the first denoising step.
 quant_config:
   quant_algo: NVFP4
   dynamic: true
-  ignored_steps: [0, 1]
+  ignore_steps: [0, 1]
 attention_config:
   backend: CUTEDSL
   quant_attention_config:
     qk_dtype: nvfp4
     v_dtype: fp8
-    ignored_steps: [0, 2]
+    ignore_steps: [0, 2]
 ```
 
 - Linear step exclusions require quantizing BF16/FP16 checkpoint weights at load

@@ -37,7 +37,7 @@ from tensorrt_llm._torch.visual_gen.quantization.quant_dispatcher import (
     install_linear_quant_dispatcher,
 )
 from tensorrt_llm.models.modeling_utils import QuantConfig
-from tensorrt_llm.visual_gen.args import AttentionConfig, DiffusionQuantConfig, QuantAttentionConfig
+from tensorrt_llm.visual_gen.args import AttentionConfig, LinearQuantConfig, QuantAttentionConfig
 
 Component = Literal["linear", "attention"]
 QuantizationRoute = Literal["bf16", "quantized"]
@@ -351,7 +351,7 @@ class ToyDiTBlock(nn.Module):
             self.linear.post_load_weights()
         else:
             self.linear = _ToyLinear(
-                quant.quant_algo is not None and not excluded, bool(quant.ignored_steps)
+                quant.quant_algo is not None and not excluded, bool(quant.ignore_steps)
             )
         arguments = dict(
             backend=config.attention.backend,
@@ -386,8 +386,8 @@ class ToyDiT(nn.Module):
         block_count: int = 2,
         linear_ignore: tuple[str, ...] = (),
         attention_ignore: tuple[str, ...] = (),
-        linear_quant_ignored_steps: tuple[int, ...] = (),
-        attention_quant_ignored_steps: tuple[int, ...] = (),
+        linear_quant_ignore_steps: tuple[int, ...] = (),
+        attention_quant_ignore_steps: tuple[int, ...] = (),
         quantized_linear: bool = True,
         quantized_attention: bool = True,
         real_kernels: bool = False,
@@ -395,10 +395,10 @@ class ToyDiT(nn.Module):
     ) -> None:
         super().__init__()
         self.model_config = DiffusionModelConfig(
-            quant_config=DiffusionQuantConfig(
+            quant_config=LinearQuantConfig(
                 quant_algo=("NVFP4" if real_kernels else "FP8") if quantized_linear else None,
                 exclude_modules=list(linear_ignore),
-                ignored_steps=list(linear_quant_ignored_steps),
+                ignore_steps=list(linear_quant_ignore_steps),
             ),
             dynamic_weight_quant=True,
             force_dynamic_quantization=True,
@@ -408,7 +408,7 @@ class ToyDiT(nn.Module):
                     qk_dtype="nvfp4",
                     v_dtype="fp8",
                     ignore=list(attention_ignore),
-                    ignored_steps=list(attention_quant_ignored_steps),
+                    ignore_steps=list(attention_quant_ignore_steps),
                 )
                 if quantized_attention
                 else None,
@@ -419,7 +419,7 @@ class ToyDiT(nn.Module):
             ToyDiTBlock(self.model_config, index, real_kernels=real_kernels)
             for index in range(block_count)
         )
-        if linear_quant_ignored_steps and install_dispatch:
+        if linear_quant_ignore_steps and install_dispatch:
             install_linear_quant_dispatcher(self, self.model_config.attention_metadata_state)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:

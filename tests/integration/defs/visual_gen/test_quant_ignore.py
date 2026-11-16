@@ -116,7 +116,7 @@ def _make_case_config(
     if case is None:
         return config
     ignore_config = (
-        {"ignored_steps": [step for step in range(STEPS) if step != case.target]}
+        {"ignore_steps": [step for step in range(STEPS) if step != case.target]}
         if case.mode == "step"
         else {}
     )

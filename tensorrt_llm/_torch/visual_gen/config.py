@@ -37,7 +37,7 @@ from tensorrt_llm.visual_gen.args import (
     CompilationConfig,
     CpuOffloadConfig,
     CudaGraphConfig,
-    DiffusionQuantConfig,
+    LinearQuantConfig,
     ParallelConfig,
     RuntimeLoRAConfig,
     SeaCacheConfig,
@@ -316,7 +316,7 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
         if isinstance(user_quant, dict) and user_quant.get("quant_algo") is not None:
             return cls.load_diffusion_quant_config(user_quant)
         if isinstance(user_quant, QuantConfig) and user_quant.quant_algo is not None:
-            if isinstance(user_quant, DiffusionQuantConfig) and user_quant.ignored_steps:
+            if isinstance(user_quant, LinearQuantConfig) and user_quant.ignore_steps:
                 return (
                     user_quant,
                     None,
@@ -395,16 +395,16 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             if quant_algo == QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN:
                 dynamic_activation_quant = True
 
-        quant_config = DiffusionQuantConfig(
+        quant_config = LinearQuantConfig(
             quant_algo=quant_algo,
             group_size=group_size,
             exclude_modules=quant_config_dict.get("ignore"),
-            ignored_steps=quant_config_dict.get("ignored_steps", []),
+            ignore_steps=quant_config_dict.get("ignore_steps", []),
         )
 
-        if quant_config.ignored_steps and not dynamic_weight_quant:
+        if quant_config.ignore_steps and not dynamic_weight_quant:
             raise ValueError(
-                "quant_config.ignored_steps requires a quant_algo and dynamic weight "
+                "quant_config.ignore_steps requires a quant_algo and dynamic weight "
                 "quantization from a BF16/FP16 checkpoint (dynamic: true)."
             )
 
@@ -840,8 +840,8 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
 
         recipe = attention_cfg.quant_attention_config
         needs_quant_ignore_state = any(
-            getattr(quant[0], "ignored_steps", []) for quant in transformer_quant_configs.values()
-        ) or (recipe is not None and bool(recipe.ignored_steps))
+            getattr(quant[0], "ignore_steps", []) for quant in transformer_quant_configs.values()
+        ) or (recipe is not None and bool(recipe.ignore_steps))
         attention_metadata_state = (
             create_attention_metadata_state()
             if attention_cfg.backend in ("TRTLLM", "FLASHINFER") or needs_quant_ignore_state

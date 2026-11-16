@@ -72,7 +72,7 @@ def install_linear_quant_dispatcher(model: torch.nn.Module, state: dict[str, Any
                 and getattr(config, "quant_algo", None) is not None
             ):
                 raise ValueError(
-                    "Linear ignored_steps requires retained BF16 weights for every quantized "
+                    "Linear ignore_steps requires retained BF16 weights for every quantized "
                     f"Linear; {type(module).__name__} was loaded without retained unquantized weights."
                 )
             continue

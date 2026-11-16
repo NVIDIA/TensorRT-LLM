@@ -39,7 +39,7 @@ def _pipeline(model: ToyDiT, second: ToyDiT | None = None) -> SimpleNamespace:
 @pytest.mark.cpu_only
 def test_pipeline_installs_quant_dispatcher() -> None:
     model = ToyDiT(
-        linear_quant_ignored_steps=(0,), quantized_attention=False, install_dispatch=False
+        linear_quant_ignore_steps=(0,), quantized_attention=False, install_dispatch=False
     )
     pipeline = _pipeline(model)
     BasePipeline._setup_linear_quant_dispatcher(pipeline)
@@ -62,8 +62,8 @@ def test_pipeline_installs_quant_dispatcher() -> None:
 
 @pytest.mark.cpu_only
 def test_linear_and_attention_steps_are_independent() -> None:
-    model = ToyDiT(linear_quant_ignored_steps=(0, 1), attention_quant_ignored_steps=(0, 2))
-    second = ToyDiT(linear_quant_ignored_steps=(0, 1), attention_quant_ignored_steps=(0, 2))
+    model = ToyDiT(linear_quant_ignore_steps=(0, 1), attention_quant_ignore_steps=(0, 2))
+    second = ToyDiT(linear_quant_ignore_steps=(0, 1), attention_quant_ignore_steps=(0, 2))
     pipeline = _pipeline(model, second)
     keys = {}
     runner = SimpleNamespace(register_extra_key_fn=lambda name, fn: keys.update({name: fn}))
@@ -96,7 +96,7 @@ def test_linear_and_attention_steps_are_independent() -> None:
 
 @pytest.mark.cpu_only
 def test_cfg_branches_share_quant_ignore_state() -> None:
-    model = ToyDiT(linear_quant_ignored_steps=(1,), attention_quant_ignored_steps=(0,))
+    model = ToyDiT(linear_quant_ignore_steps=(1,), attention_quant_ignore_steps=(0,))
     pipeline = _pipeline(model)
     inputs = torch.randn(1, 8, 128, dtype=torch.bfloat16)
     with observe_quantization_paths(model) as trace:
@@ -117,7 +117,7 @@ def test_cfg_branches_share_quant_ignore_state() -> None:
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("exit_mode", ["normal", "exception"])
 def test_quant_ignore_state_is_cleared(exit_mode: str) -> None:
-    model = ToyDiT(linear_quant_ignored_steps=(0,), attention_quant_ignored_steps=(0,))
+    model = ToyDiT(linear_quant_ignore_steps=(0,), attention_quant_ignore_steps=(0,))
     pipeline = _pipeline(model)
     iterator = BasePipeline._profile_denoise_steps(pipeline, range(2))
     next(iterator)
@@ -145,8 +145,8 @@ def test_execution_mode_preserves_quantization_routes(execution_mode: str) -> No
     with torch.device("cuda"):
         model = ToyDiT(
             block_count=1,
-            linear_quant_ignored_steps=(0, 1),
-            attention_quant_ignored_steps=(0, 2),
+            linear_quant_ignore_steps=(0, 1),
+            attention_quant_ignore_steps=(0, 2),
             real_kernels=True,
         )
     inputs = torch.randn(1, 128, 128, dtype=torch.bfloat16, device="cuda")

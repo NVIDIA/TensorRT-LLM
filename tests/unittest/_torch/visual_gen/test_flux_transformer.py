@@ -797,12 +797,12 @@ if __name__ == "__main__":
 
 
 @pytest.mark.cpu_only
-def test_linear_ignored_steps_disable_shared_nvfp4_quantization() -> None:
+def test_linear_ignore_steps_disable_shared_nvfp4_quantization() -> None:
     from tensorrt_llm._torch.visual_gen.models.flux.transformer_flux import (
         FluxSingleTransformerBlock,
     )
 
-    config = SimpleNamespace(ignored_steps=[0])
+    config = SimpleNamespace(ignore_steps=[0])
 
     def projection():
         return SimpleNamespace(
@@ -818,5 +818,5 @@ def test_linear_ignored_steps_disable_shared_nvfp4_quantization() -> None:
         attn=SimpleNamespace(fuse_qk_norm_rope=True, qkv_proj=projection()), proj_mlp=projection()
     )
     assert not FluxSingleTransformerBlock.configure_shared_nvfp4_quantize(block)
-    config.ignored_steps = []
+    config.ignore_steps = []
     assert FluxSingleTransformerBlock.configure_shared_nvfp4_quantize(block)

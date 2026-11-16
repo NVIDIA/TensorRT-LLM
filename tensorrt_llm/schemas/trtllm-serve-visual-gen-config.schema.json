@@ -363,7 +363,7 @@
       "title": "CudaGraphConfig",
       "type": "object"
     },
-    "DiffusionQuantConfig": {
+    "LinearQuantConfig": {
       "additionalProperties": false,
       "description": "Linear quantization configuration with per-step quantization exclusions.",
       "properties": {
@@ -418,14 +418,14 @@
           "title": "Has Zero Point",
           "type": "boolean"
         },
-        "ignored_steps": {
-          "description": "Zero-based denoising iterations that run Linear layers with the original BF16 weights instead of quantization. Requires a high-precision checkpoint and load-time weight quantization; retaining BF16 weights increases memory use. Cannot be combined with nonempty Linear or attention ignore lists.",
+        "ignore_steps": {
+          "description": "Denoising step numbers at which Linear layers run without quantization; 0 is the first step. Requires a BF16/FP16 checkpoint and load-time weight quantization. Cannot be combined with layer exclusions.",
           "items": {
             "minimum": 0,
             "type": "integer"
           },
           "status": "prototype",
-          "title": "Ignored Steps",
+          "title": "Ignore Steps",
           "type": "array"
         },
         "kv_cache_quant_algo": {
@@ -498,7 +498,7 @@
           "type": "boolean"
         }
       },
-      "title": "DiffusionQuantConfig",
+      "title": "LinearQuantConfig",
       "type": "object"
     },
     "ParallelConfig": {
@@ -662,7 +662,7 @@
           "type": "boolean"
         },
         "ignore": {
-          "description": "Attention module paths excluded from attention quantization at every step. Uses the same glob and re: patterns as Linear exclude_modules; paths may be relative to a transformer or qualified by its component name. Cannot be combined with nonempty Linear or attention ignored_steps lists.",
+          "description": "Attention module paths excluded from attention quantization at every step. Uses the same glob and re: patterns as Linear exclude_modules; paths may be relative to a transformer or qualified by its component name. Cannot be combined with nonempty Linear or attention ignore_steps lists.",
           "items": {
             "type": "string"
           },
@@ -670,14 +670,14 @@
           "title": "Ignore",
           "type": "array"
         },
-        "ignored_steps": {
-          "description": "Zero-based denoising iterations that use the selected backend's native BF16/FP16 attention instead of this quantization recipe. Independent of Linear ignored_steps; cannot be combined with nonempty Linear or attention ignore lists.",
+        "ignore_steps": {
+          "description": "Denoising step numbers at which attention runs without quantization, using the selected backend's BF16/FP16 path; 0 is the first step. Linear and attention can specify different steps. Cannot be combined with layer exclusions.",
           "items": {
             "minimum": 0,
             "type": "integer"
           },
           "status": "prototype",
-          "title": "Ignored Steps",
+          "title": "Ignore Steps",
           "type": "array"
         },
         "k_block_size": {
@@ -1271,13 +1271,13 @@
             "properties": {
               "quant_config": {
                 "properties": {
-                  "ignored_steps": {
+                  "ignore_steps": {
                     "minItems": 1,
                     "type": "array"
                   }
                 },
                 "required": [
-                  "ignored_steps"
+                  "ignore_steps"
                 ],
                 "type": "object"
               }
@@ -1292,13 +1292,13 @@
                 "properties": {
                   "quant_attention_config": {
                     "properties": {
-                      "ignored_steps": {
+                      "ignore_steps": {
                         "minItems": 1,
                         "type": "array"
                       }
                     },
                     "required": [
-                      "ignored_steps"
+                      "ignore_steps"
                     ],
                     "type": "object"
                   }
@@ -1357,13 +1357,13 @@
         "properties": {
           "quant_config": {
             "properties": {
-              "ignored_steps": {
+              "ignore_steps": {
                 "minItems": 1,
                 "type": "array"
               }
             },
             "required": [
-              "ignored_steps"
+              "ignore_steps"
             ],
             "type": "object"
           }
@@ -1526,7 +1526,7 @@
     "quant_config": {
       "anyOf": [
         {
-          "$ref": "#/$defs/DiffusionQuantConfig"
+          "$ref": "#/$defs/LinearQuantConfig"
         },
         {
           "$ref": "#/$defs/QuantConfig"
@@ -1534,7 +1534,7 @@
         {
           "additionalProperties": true,
           "properties": {
-            "ignored_steps": {
+            "ignore_steps": {
               "items": {
                 "minimum": 0,
                 "type": "integer"

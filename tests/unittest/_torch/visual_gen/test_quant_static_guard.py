@@ -19,7 +19,7 @@ from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
-from tensorrt_llm.visual_gen.args import DiffusionQuantConfig
+from tensorrt_llm.visual_gen.args import LinearQuantConfig
 
 # Pure-CPU test (stub Linear, no device): runs in the CPU lane (l0_cpu.yml),
 # which selects with `-m cpu_only`; GPU stages deselect it via `not cpu_only`.
@@ -217,7 +217,7 @@ class TestDynamicQuantGuard:
     ) -> None:
         loader = DynamicLinearWeightLoader(
             DiffusionModelConfig(
-                quant_config=DiffusionQuantConfig(quant_algo=quant_algo, ignored_steps=[0]),
+                quant_config=LinearQuantConfig(quant_algo=quant_algo, ignore_steps=[0]),
                 dynamic_weight_quant=True,
             )
         )
@@ -226,7 +226,7 @@ class TestDynamicQuantGuard:
             with pytest.raises(
                 ValueError,
                 match=(
-                    r"ignored_steps.*dynamic: true.*"
+                    r"ignore_steps.*dynamic: true.*"
                     f"Load-time weight quantization \\({quant_algo.name}\\).*blocks.0.attn1.to_q"
                 ),
             ):
@@ -239,18 +239,18 @@ class TestDynamicQuantGuard:
         assert module.loaded is None
 
     @pytest.mark.parametrize(
-        ("ignored_steps", "weight_dtype"),
+        ("ignore_steps", "weight_dtype"),
         [(None, torch.bfloat16), ([], torch.bfloat16), ([], torch.uint8)],
         ids=["not-configured", "empty", "prequantized"],
     )
     def test_without_step_exclusions_preserves_existing_loading(
-        self, ignored_steps: list[int] | None, weight_dtype: torch.dtype
+        self, ignore_steps: list[int] | None, weight_dtype: torch.dtype
     ) -> None:
         quant_algo = QuantAlgo.W4A16_AWQ
         quant_config = (
             QuantConfig(quant_algo=quant_algo)
-            if ignored_steps is None
-            else DiffusionQuantConfig(quant_algo=quant_algo, ignored_steps=ignored_steps)
+            if ignore_steps is None
+            else LinearQuantConfig(quant_algo=quant_algo, ignore_steps=ignore_steps)
         )
         loader = DynamicLinearWeightLoader(
             DiffusionModelConfig(quant_config=quant_config, dynamic_weight_quant=True)
@@ -330,7 +330,7 @@ class TestStaticNVFP4ActivationScale:
     def test_step_exclusions_still_require_calibrated_scale(self, quantizer):
         loader = DynamicLinearWeightLoader(
             DiffusionModelConfig(
-                quant_config=DiffusionQuantConfig(quant_algo=QuantAlgo.NVFP4, ignored_steps=[0]),
+                quant_config=LinearQuantConfig(quant_algo=QuantAlgo.NVFP4, ignore_steps=[0]),
                 dynamic_weight_quant=True,
                 force_dynamic_quantization=False,
             )
