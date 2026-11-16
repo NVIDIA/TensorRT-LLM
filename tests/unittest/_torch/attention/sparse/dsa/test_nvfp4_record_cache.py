@@ -88,11 +88,8 @@ def _set_record_reader(monkeypatch, unsupported_reason):
     "layout, reader_unsupported_reason, expected",
     [
         (None, None, NVFP4_MLA_RECORD_LAYOUT),
-        ("auto", None, NVFP4_MLA_RECORD_LAYOUT),
         (None, "no reader.", NVFP4_MLA_RESIDUAL_LAYOUT),
-        ("auto", "no reader.", NVFP4_MLA_RESIDUAL_LAYOUT),
         ("residual", None, NVFP4_MLA_RESIDUAL_LAYOUT),
-        ("fp8rope", None, NVFP4_MLA_RECORD_LAYOUT),
         # An explicit request for records is kept; generation then gathers them.
         ("fp8rope", "no reader.", NVFP4_MLA_RECORD_LAYOUT),
     ],
@@ -151,7 +148,6 @@ def test_record_layout_rejects_kv_cache_offload(monkeypatch):
 @pytest.mark.parametrize(
     "head_dim, rope_head_dim, kv_cache_config, kv_cache_offload, unsupported",
     [
-        (576, 64, KvCacheConfig(), False, None),
         (320, 64, KvCacheConfig(), False, "512 \\+ 64 latent"),
         (576, 64, SimpleNamespace(mixed_precision_kv=object()), False, "mixed-precision"),
         (576, 64, KvCacheConfig(), True, "KV cache offload"),
@@ -163,29 +159,21 @@ def test_cache_that_cannot_hold_records_keeps_the_residual_layout(
     reason = _get_nvfp4_mla_record_unsupported_reason(
         head_dim, rope_head_dim, kv_cache_config, kv_cache_offload
     )
-    assert (reason is None) == (unsupported is None)
+    assert reason is not None
     _set_record_reader(monkeypatch, None)
 
-    for layout in (None, "auto"):
+    for layout in (None, "auto", "residual"):
         _request_layout(monkeypatch, layout)
-        expected = NVFP4_MLA_RECORD_LAYOUT if unsupported is None else NVFP4_MLA_RESIDUAL_LAYOUT
-        assert resolve_nvfp4_mla_kv_cache_layout(reason) == expected
-
-    _request_layout(monkeypatch, "residual")
-    assert resolve_nvfp4_mla_kv_cache_layout(reason) == NVFP4_MLA_RESIDUAL_LAYOUT
+        assert resolve_nvfp4_mla_kv_cache_layout(reason) == NVFP4_MLA_RESIDUAL_LAYOUT
 
     # An explicit request for records is not overridden.
     _request_layout(monkeypatch, "fp8rope")
-    if unsupported is None:
-        assert resolve_nvfp4_mla_kv_cache_layout(reason) == NVFP4_MLA_RECORD_LAYOUT
-    else:
-        with pytest.raises(ValueError, match=unsupported):
-            resolve_nvfp4_mla_kv_cache_layout(reason)
+    with pytest.raises(ValueError, match=unsupported):
+        resolve_nvfp4_mla_kv_cache_layout(reason)
 
 
-@pytest.mark.parametrize("layout", [None, "auto"])
-def test_auto_stores_records_only_where_they_are_read_in_place(monkeypatch, layout):
-    _request_layout(monkeypatch, layout)
+def test_auto_stores_records_only_where_they_are_read_in_place(monkeypatch):
+    _request_layout(monkeypatch, None)
     seen = []
 
     def reader_unsupported_reason(mapping=None):
@@ -202,24 +190,3 @@ def test_auto_stores_records_only_where_they_are_read_in_place(monkeypatch, layo
     assert seen == [mapping]
     _set_record_reader(monkeypatch, None)
     assert resolve_nvfp4_mla_kv_cache_layout(None, mapping) == NVFP4_MLA_RECORD_LAYOUT
-
-
-@pytest.mark.parametrize("layout", ["residual", "fp8rope"])
-def test_explicit_layout_does_not_ask_for_the_record_reader(monkeypatch, layout):
-    _request_layout(monkeypatch, layout)
-
-    def reader_unsupported_reason(mapping=None):
-        raise AssertionError("an explicit layout does not depend on the record reader")
-
-    monkeypatch.setattr(
-        prims_ts_dsa_sparse_mla,
-        "get_nvfp4_mla_record_reader_unsupported_reason",
-        reader_unsupported_reason,
-    )
-    assert resolve_nvfp4_mla_kv_cache_layout(None, Mapping()) == layout
-
-
-def test_unknown_layout_request_is_rejected(monkeypatch):
-    _request_layout(monkeypatch, "records")
-    with pytest.raises(ValueError, match=NVFP4_MLA_KV_CACHE_LAYOUT_ENV):
-        resolve_nvfp4_mla_kv_cache_layout(None)

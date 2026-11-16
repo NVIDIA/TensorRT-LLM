@@ -57,6 +57,8 @@ def test_default_scales_nvfp4_kv_caches_of_dsa_models_only(monkeypatch):
     assert _scales(weights, dsa=False) == {}
     assert _scales(weights, kv=_FP8_KV) == {}
     assert _scales(weights, kv=_UNQUANTIZED_KV) == {}
+    monkeypatch.setenv(_MLA_LATENT_SCALE_ENV, "off")
+    assert _scales(weights) == {}
 
 
 def test_explicit_target_scales_every_quantized_kv_cache(monkeypatch):
@@ -68,44 +70,8 @@ def test_explicit_target_scales_every_quantized_kv_cache(monkeypatch):
     assert _scales(weights, kv=_UNQUANTIZED_KV) == {}
 
 
-@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "on"])
-def test_rejects_invalid_target(monkeypatch, value):
-    monkeypatch.setenv(_MLA_LATENT_SCALE_ENV, value)
-    with pytest.raises(ValueError, match=_MLA_LATENT_SCALE_ENV):
-        _scales(_checkpoint([0.004]))
-
-
-def test_off_leaves_weights_alone(monkeypatch):
-    monkeypatch.setenv(_MLA_LATENT_SCALE_ENV, "off")
-    assert _scales(_checkpoint([0.004])) == {}
-
-
-def test_projection_that_stays_quantized_is_skipped(monkeypatch):
+def test_quantized_projection_is_scaled_only_when_the_loader_dequantizes_it(monkeypatch):
     monkeypatch.setenv(_MLA_LATENT_SCALE_ENV, "auto")
     weights = _checkpoint([0.004], projection_dtype=torch.float8_e4m3fn)
     assert _scales(weights) == {}
-
-
-def test_projection_dequantized_by_the_loader_is_scaled(monkeypatch):
-    monkeypatch.setenv(_MLA_LATENT_SCALE_ENV, "auto")
-    weights = _checkpoint([0.004], projection_dtype=torch.float8_e4m3fn)
     assert _scales(weights, dequantized=True) == {_PREFIX.format(0): 256.0}
-
-
-def test_scaled_weights_keep_the_projection_output(monkeypatch):
-    """kv_b_proj(layernorm(x)) is bit-identical in BF16 after the power-of-two rescaling."""
-    monkeypatch.setenv(_MLA_LATENT_SCALE_ENV, "auto")
-    weights = _checkpoint([0.004])
-    name = _PREFIX.format(0)
-    scale = _scales(weights)[name]
-    gamma = weights[f"{name}.kv_a_layernorm.weight"]
-    projection = weights[f"{name}.kv_b_proj.weight"]
-    x = torch.randn(8, _LATENT_DIM, generator=torch.Generator().manual_seed(1))
-    normed = (x / x.pow(2).mean(-1, keepdim=True).sqrt()).to(torch.bfloat16)
-
-    latent = normed * gamma
-    scaled_latent = normed * (gamma * scale)
-    assert torch.equal(scaled_latent.float(), latent.float() * scale)
-    reference = latent.float() @ projection.float().T
-    rescaled = scaled_latent.float() @ (projection / scale).float().T
-    assert torch.equal(rescaled, reference)

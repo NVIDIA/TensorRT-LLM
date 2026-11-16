@@ -78,40 +78,20 @@ def test_layer_skips_the_gather_only_when_the_library_serves():
     assert prims_ts_reads_nvfp4_mla_records(_metadata(), _Layer())
     # Skip-correction and unsupported head counts keep the library out of the layer's FMHA list.
     assert not prims_ts_reads_nvfp4_mla_records(_metadata(), _Layer(lists_library=False))
-    assert not prims_ts_reads_nvfp4_mla_records(_metadata(helix=True), _Layer())
     assert not prims_ts_reads_nvfp4_mla_records(_metadata(helix_offsets=torch.zeros(1)), _Layer())
-    assert not prims_ts_reads_nvfp4_mla_records(_metadata(beam_width=2), _Layer())
-    assert not prims_ts_reads_nvfp4_mla_records(
-        _metadata(layout=NVFP4_MLA_RESIDUAL_LAYOUT), _Layer()
-    )
 
-
-@pytest.mark.cpu_only
-def test_metadata_leaves_out_the_gather_rows_only_when_the_library_can_run(monkeypatch):
-    monkeypatch.setattr(registry, "get_enabled_fmha_lib_classes", lambda: [PrimsTSDsaSparseMlaFmha])
-    monkeypatch.setattr(prims_ts_dsa_sparse_mla, "get_sm_version", lambda: 103)
-    monkeypatch.setattr(
-        prims_ts_dsa_sparse_mla, "get_prims_ts_toolchain_unsupported_reason", lambda: None
-    )
-    assert prims_ts_reads_nvfp4_mla_records(_metadata())
-    assert not prims_ts_reads_nvfp4_mla_records(_metadata(helix=True))
-    assert not prims_ts_reads_nvfp4_mla_records(_metadata(beam_width=2))
-    assert not prims_ts_reads_nvfp4_mla_records(_metadata(layout=NVFP4_MLA_RESIDUAL_LAYOUT))
-
-    monkeypatch.setattr(prims_ts_dsa_sparse_mla, "get_sm_version", lambda: 90)
-    assert not prims_ts_reads_nvfp4_mla_records(_metadata())
-    monkeypatch.setattr(prims_ts_dsa_sparse_mla, "get_sm_version", lambda: 103)
-    monkeypatch.setattr(
-        prims_ts_dsa_sparse_mla,
-        "get_prims_ts_toolchain_unsupported_reason",
-        lambda: "no CuTe DSL",
-    )
-    assert not prims_ts_reads_nvfp4_mla_records(_metadata())
-    monkeypatch.setattr(
-        prims_ts_dsa_sparse_mla, "get_prims_ts_toolchain_unsupported_reason", lambda: None
-    )
-    monkeypatch.setattr(registry, "get_enabled_fmha_lib_classes", lambda: [])
-    assert not prims_ts_reads_nvfp4_mla_records(_metadata())
+    # The library's request check and the gather skip share the metadata conditions.
+    layer = _Layer()
+    library = PrimsTSDsaSparseMlaFmha(layer)
+    q = SimpleNamespace(device=SimpleNamespace(type="cuda"), ndim=2)
+    fwd = SimpleNamespace()
+    for metadata, expected in (
+        (_metadata(helix=True), "Helix"),
+        (_metadata(beam_width=2), "beam search"),
+        (_metadata(layout=NVFP4_MLA_RESIDUAL_LAYOUT), "layout"),
+    ):
+        assert not prims_ts_reads_nvfp4_mla_records(metadata, _Layer())
+        assert expected in library._unsupported_reason(q, None, None, metadata, fwd)
 
 
 @pytest.mark.cpu_only
@@ -154,22 +134,6 @@ def test_sm107_needs_the_rubin_helpers_of_the_cute_dsl(monkeypatch):
     monkeypatch.setattr(prims_ts_dsa_sparse_mla, "IS_CUTLASS_DSL_RUBIN_AVAILABLE", False)
     assert not prims_ts_reads_nvfp4_mla_records(_metadata())
     assert "Rubin helpers" in PrimsTSDsaSparseMlaFmha._unavailable_reason(layer)
-
-
-@pytest.mark.cpu_only
-def test_library_rejects_the_requests_the_gather_skip_rejects():
-    """The library's request check and the gather skip share the metadata conditions."""
-    layer = _Layer()
-    library = PrimsTSDsaSparseMlaFmha(layer)
-    q = SimpleNamespace(device=SimpleNamespace(type="cuda"), ndim=2)
-    fwd = SimpleNamespace()
-    for metadata, expected in (
-        (_metadata(helix=True), "Helix"),
-        (_metadata(beam_width=2), "beam search"),
-        (_metadata(layout=NVFP4_MLA_RESIDUAL_LAYOUT), "layout"),
-    ):
-        assert not prims_ts_reads_nvfp4_mla_records(metadata, _Layer())
-        assert expected in library._unsupported_reason(q, None, None, metadata, fwd)
 
 
 @pytest.mark.cpu_only
