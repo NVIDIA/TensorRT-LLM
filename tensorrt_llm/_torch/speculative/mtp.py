@@ -989,11 +989,14 @@ class MTPWorker(SpecWorkerBase):
             if getattr(attn_metadata, "fp4_mla_state", None) is not None:
                 attn_metadata.update_for_spec_dec()
 
-        if attn_metadata.kv_cache_params is not None and not attn_metadata.is_cuda_graph:
-            for i in range(num_contexts, batch_size):
-                # used for vanilla MLA, list on cpu
-                attn_metadata.kv_cache_params.num_cached_tokens_per_seq[
-                    i] -= runtime_draft_len + 1 - num_accepted_tokens[i].item()
+        if (num_contexts < batch_size
+                and attn_metadata.kv_cache_params is not None
+                and not attn_metadata.is_cuda_graph):
+            # Vanilla MLA consumes host KV lengths. Read the decode counts together.
+            accepted = num_accepted_tokens[num_contexts:batch_size].tolist()
+            cached = attn_metadata.kv_cache_params.num_cached_tokens_per_seq
+            for i, count in enumerate(accepted, start=num_contexts):
+                cached[i] -= runtime_draft_len + 1 - count
 
     def prepare_drafter_inputs(
         self,
