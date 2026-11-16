@@ -218,6 +218,17 @@ def test_llm_beam_search_pp2(compare_pp1: bool, async_relay: bool,
             assert [list(beam.token_ids) for beam in output.outputs
                     ] == [list(beam.token_ids)
                           for beam in reference.outputs], prompt
+            for beam, reference_beam in zip(output.outputs, reference.outputs):
+                assert beam.cumulative_logprob == pytest.approx(
+                    reference_beam.cumulative_logprob, rel=1e-4,
+                    abs=1e-4), prompt
+                assert len(beam.logprobs) == len(
+                    reference_beam.logprobs), prompt
+                for token_id, actual, expected in zip(beam.token_ids,
+                                                      beam.logprobs,
+                                                      reference_beam.logprobs):
+                    assert actual[token_id].logprob == pytest.approx(
+                        expected[token_id].logprob, rel=1e-4, abs=1e-4), prompt
     for prompt, output in zip(prompts, outputs):
         beams = output.outputs
         assert len(beams) == beam_width, prompt
