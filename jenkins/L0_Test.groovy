@@ -5418,6 +5418,30 @@ def getMakoArgsFromStageName(stageName, parseSysinfo=false) {
     return makoArgs
 }
 
+// Inspect the packaged parser without importing its GPU/runtime dependencies.
+def packagedPytestSupportsCbts(String llmSrc) {
+    return sh(returnStatus: true, script: """
+        python3 - '${llmSrc}/tests/integration/defs/conftest.py' <<'CBTS_SUPPORT_PY'
+import ast
+from pathlib import Path
+import sys
+try:
+    tree = ast.parse(Path(sys.argv[1]).read_text())
+except (OSError, SyntaxError):
+    sys.exit(1)
+options = {
+    arg.value
+    for node in ast.walk(tree)
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    and node.func.attr == 'addoption'
+    for arg in node.args
+    if isinstance(arg, ast.Constant) and isinstance(arg.value, str)
+}
+sys.exit(0 if {'--cbts-test-list', '--cbts-shard-result'} <= options else 1)
+CBTS_SUPPORT_PY
+    """) == 0
+}
+
 def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=null, String clusterName=null) {
     def makoOpts = preDefinedMakoOpts
 
@@ -5492,6 +5516,13 @@ def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=nu
             echo "CBTS [${cbts.scope}]: ${overrideYaml} missing/empty -- falling back to source test-db"
         }
     }
+    def sourceTestDBPath = "${llmSrc}/tests/integration/test_lists/test-db"
+    if (preserveCbtsShardScope() && testDBPath != sourceTestDBPath &&
+            !packagedPytestSupportsCbts(llmSrc)) {
+        echo "CBTS: packaged pytest lacks shard-intersection options; " +
+             "using the original test list and shard assignment for ${stageName}"
+        testDBPath = sourceTestDBPath
+    }
     def testList = "${llmSrc}/${testContext}.txt"
     def testDBQueryCmd = [
         "trt-test-db",
@@ -5537,7 +5568,7 @@ CBTS_PY
     // silently masked.
     def testCount = sh(returnStdout: true, script: "grep -c . -- ${testList} || test \$? -eq 1").trim()
     def testDBLabel = fileExists("${testList}.cbts") ? "source (CBTS after sharding)" :
-        ((cbts != null && cbts.test_db_dir_override) ? "CBTS-narrowed [${cbts.scope}]" : "source")
+        (testDBPath != sourceTestDBPath ? "CBTS-narrowed [${cbts.scope}]" : "source")
     echo "renderTestDB: stage=${stageName} context=${testContext} test-db=${testDBLabel} dir=${testDBPath} -> ${testCount} tests"
     sh(script: "cat ${testList}")
     if (testCount == "0") {
