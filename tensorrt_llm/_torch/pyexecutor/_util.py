@@ -1501,7 +1501,8 @@ class KvCacheCreator:
                 # pools. The draft manager never derives (see there).
                 kv_cache_config = kv_cache_config.model_copy(
                     update={"max_attention_window": derived_windows})
-        if (not is_draft and issubclass(manager_cls, MambaHybridCacheManagerV2)
+        if (not is_draft and isinstance(manager_cls, type)
+                and issubclass(manager_cls, MambaHybridCacheManagerV2)
                 and self._model_engine is not None
                 and _uses_gdn_mtp_replay(self._model_engine.model)):
             # Cost the GDN replay region of the state the manager will select.
