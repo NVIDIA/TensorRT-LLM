@@ -20,7 +20,8 @@ def test_quantized_attention_matches_dense_backend_with_calibrated_error(
     sequence_length, monkeypatch
 ):
     """T2: same real video-self-attention shapes/QKV, dense FlashInfer reference."""
-    assert torch.cuda.get_device_capability() == (10, 0)
+    if torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("Attention fidelity thresholds are calibrated only on B200 (SM100)")
     torch.manual_seed(42)
     dense = FlashInferAttention(num_heads=32, head_dim=128, dtype=torch.bfloat16)
     quant = FlashInferAttention(
