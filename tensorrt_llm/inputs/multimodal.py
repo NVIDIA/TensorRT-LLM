@@ -20,6 +20,7 @@ import numpy as np
 import torch
 from blake3 import blake3
 
+from tensorrt_llm._errors import UnsupportedError
 from tensorrt_llm._utils import maybe_pin_memory
 from tensorrt_llm.inputs.multimodal_data import (MEDIA_MODALITIES,
                                                  BaseModalityData, VideoData,
@@ -1383,6 +1384,43 @@ class MMHashResult(NamedTuple):
     `None` when the caller supplied no UUIDs at all."""
 
 
+def validate_mm_uuids(
+    mm_data: Dict[str, Any],
+    mm_uuids: Optional[Dict[str, Any]],
+) -> Dict[str, List[Optional[str]]]:
+    """Check a request's `multi_modal_uuids` against its `mm_data`.
+
+    Returns modality -> one UUID string or None per item, for each modality of
+    `mm_data` that has UUIDs. Raises ValueError for a malformed value, which is
+    an error in the request.
+    """
+    if mm_uuids is None:
+        return {}
+    if not isinstance(mm_uuids, dict):
+        raise ValueError(
+            "multi_modal_uuids must be a dict of modality to UUIDs, got "
+            f"{type(mm_uuids).__name__}")
+    uuids_by_modality: Dict[str, List[Optional[str]]] = {}
+    for modality, items in mm_data.items():
+        if modality not in mm_uuids:
+            continue
+        uuids = mm_uuids[modality]
+        if not isinstance(uuids, list):
+            uuids = [uuids]
+        num_items = len(items) if isinstance(items, list) else 1
+        if len(uuids) != num_items:
+            raise ValueError(
+                f"UUID list length ({len(uuids)}) doesn't match "
+                f"data items length ({num_items}) for modality '{modality}'")
+        for uuid in uuids:
+            if uuid is not None and not isinstance(uuid, str):
+                raise ValueError(
+                    f"multi_modal_uuids['{modality}'] items must be strings "
+                    f"or None, got {type(uuid).__name__}")
+        uuids_by_modality[modality] = uuids
+    return uuids_by_modality
+
+
 def apply_mm_hashes(mm_data: Dict[str, Any],
                     mm_uuids: Optional[Dict[str, List[Optional[str]]]] = None,
                     hash_lib=default_hasher) -> "MMHashResult":
@@ -1436,18 +1474,10 @@ def apply_mm_hashes(mm_data: Dict[str, Any],
 
     mm_hashes: Dict[str, List[str]] = {}
     mm_uuids_by_key: Dict[str, List[Optional[str]]] = {}
+    uuids_by_modality = validate_mm_uuids(mm_data, mm_uuids)
 
     for modality, items in mm_items.items():
-        modality_uuids = None
-        if mm_uuids is not None and modality in mm_uuids:
-            modality_uuids = mm_uuids[modality]
-            if not isinstance(modality_uuids, list):
-                modality_uuids = [modality_uuids]
-            if len(modality_uuids) != len(items):
-                raise ValueError(
-                    f"UUID list length ({len(modality_uuids)}) doesn't match "
-                    f"data items length ({len(items)}) for modality '{modality}'"
-                )
+        modality_uuids = uuids_by_modality.get(modality)
 
         hashes: List[str] = []
         uuids: List[Optional[str]] = []
@@ -1541,8 +1571,13 @@ def find_mm_token_lengths(
             raise ValueError("video_grid_thw must have shape [num_segments, 3]")
 
     for modality, items in mm_items.items():
+        if not items:
+            # Nothing to count, so a missing hook does not matter: an empty
+            # list must not turn hashing off for the other modalities.
+            num_mm_tokens[modality] = []
+            continue
         if not hasattr(input_processor, f"get_num_tokens_per_{modality}"):
-            raise AttributeError(
+            raise UnsupportedError(
                 f"Input processor {type(input_processor).__name__} does not have 'get_num_tokens_per_{modality}' method required for multimodal hashing."
             )
 

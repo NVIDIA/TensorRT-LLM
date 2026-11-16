@@ -50,7 +50,7 @@ from .multimodal import (MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalInput,
                          _find_mm_token_start_pos_from_masks, apply_mm_hashes,
                          default_hasher, find_mm_token_lengths,
                          get_multimodal_item_metadata, hexdigest_to_int32,
-                         validate_mm_inputs)
+                         validate_mm_inputs, validate_mm_uuids)
 # yapf: enable
 from .multimodal_data import MEDIA_MODALITIES, serialize_item
 from .prefix_token_cache import (OffsetTokenizer, PrefixTokenCache,
@@ -687,7 +687,7 @@ class BaseMultimodalInputProcessor(ABC):
         if hasattr(self.processor, '_get_num_multimodal_tokens'):
             return self.processor._get_num_multimodal_tokens
         else:
-            raise NotImplementedError(
+            raise UnsupportedError(
                 f"get_num_multimodal_tokens not implemented for {self.__class__.__name__}. "
                 "Please override this method or ensure the processor has _get_num_multimodal_tokens method."
             )
@@ -1538,9 +1538,8 @@ def create_input_processor_with_hash(
         )
         # Raise (rather than returning ([], None)) so process_prompt_maybe_hash
         # treats this as a failed hashing attempt: it falls back to the basic
-        # input processor and caches multimodal_hashing_supported=False instead
-        # of marking hashing as supported and forwarding an empty prompt
-        # downstream.
+        # input processor instead of marking hashing as supported and
+        # forwarding an empty prompt downstream.
         if not num_mm_tokens_by_key:
             raise ValueError(
                 "multimodal hashing could not determine multimodal token "
@@ -1584,7 +1583,7 @@ def create_input_processor_with_hash(
         mm_ids = input_processor.get_mm_token_ids()
         mm_special_token_ids = input_processor.get_mm_special_token_ids()
         if vocab_size is None and mm_ids is None:
-            raise ValueError(
+            raise UnsupportedError(
                 "Cannot locate vocab_size or mm_token_ids for multimodal token preprocessing"
             )
         # Compute all three masks once here and reuse downstream. The embed
@@ -1640,56 +1639,51 @@ def create_input_processor_with_hash(
     def process_prompt_maybe_hash(
         inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
-        try_multimodal_hashing = False  # only used for first time
-        use_multimodal_hashing = False  # used for subsequent calls
         # Any subset of the supported modalities is eligible for hashing.
         # ``None`` payloads are skipped so an empty bucket doesn't gate off
         # hashing for the modalities that are actually present.
-        modalities = [
-            m for m, d in inputs.get('multi_modal_data', {}).items()
-            if d is not None
-        ]
-        if modalities and all(m in MEDIA_MODALITIES for m in modalities):
-            if input_processor.multimodal_hashing_supported is not None:
-                use_multimodal_hashing = input_processor.multimodal_hashing_supported
-            else:
-                # First-time probe: attempt hashing and latch the result on
-                # the input processor.
-                try_multimodal_hashing = True
+        mm_data = inputs.get('multi_modal_data', {})
+        modalities = [m for m, d in mm_data.items() if d is not None]
+        can_hash = bool(modalities) and all(m in MEDIA_MODALITIES
+                                            for m in modalities)
+        # A modality with items but no token-count hook cannot be hashed. Skip
+        # hashing for this request only, so the other modalities keep it.
+        for m in modalities:
+            has_items = not (isinstance(mm_data[m], list) and not mm_data[m])
+            if has_items and not hasattr(input_processor,
+                                         f"get_num_tokens_per_{m}"):
+                can_hash = False
+        hashing_supported = input_processor.multimodal_hashing_supported
 
-        if try_multimodal_hashing or use_multimodal_hashing:
+        if can_hash and hashing_supported is not False:
+            # Bad UUIDs are an error in the request: raise it here, so the
+            # request is not served without them.
+            validate_mm_uuids(mm_data, inputs.get('multi_modal_uuids'))
             try:
-                prompt_token_ids, extra_processed_inputs = multimodal_hashing_process(
-                    inputs, sampling_params)
-                if try_multimodal_hashing:
-                    # if trying for first time, set the flag to True
-                    input_processor.multimodal_hashing_supported = True
+                result = multimodal_hashing_process(inputs, sampling_params)
+                # The probe worked: hashing is supported.
+                input_processor.multimodal_hashing_supported = True
+                return result
             except Exception as e:
-                logger.warning(f"Multimodal hashing failed: {e}.")
-                if try_multimodal_hashing:
-                    # if trying for first time, fall back to basic input processor
-                    # and set the flag to False so that we don't try again
+                logger.warning(f"Multimodal hashing failed: {e}. "
+                               "Falling back to basic input processor.")
+                # Turn hashing off for good only if the probe finds that the
+                # processor cannot hash. The hashing steps raise
+                # UnsupportedError only for that: no HF
+                # _get_num_multimodal_tokens, or neither vocab_size nor
+                # mm_token_ids. Other errors can come from this request, so
+                # keep the flag and serve the request without hashes, as the
+                # basic processor does.
+                if hashing_supported is None and isinstance(
+                        e, UnsupportedError):
                     input_processor.multimodal_hashing_supported = False
-                    logger.warning("Falling back to basic input processor.")
-                    try:
-                        prompt_token_ids, extra_processed_inputs = input_processor(
-                            inputs, sampling_params)
-                    except Exception as e2:
-                        logger.warning(f"Basic input processor failed: {e}.")
-                        logger.debug(traceback.format_exc())
-                        raise e2
-                else:
-                    raise e
-        else:
-            try:
-                prompt_token_ids, extra_processed_inputs = input_processor(
-                    inputs, sampling_params)
-            except Exception as e:
-                logger.warning(f"Basic input processor failed: {e}.")
-                logger.debug(traceback.format_exc())
-                raise e
 
-        return prompt_token_ids, extra_processed_inputs
+        try:
+            return input_processor(inputs, sampling_params)
+        except Exception as e:
+            logger.warning(f"Basic input processor failed: {e}.")
+            logger.debug(traceback.format_exc())
+            raise e
 
     def input_processor_wrapper(
         inputs: TextPrompt, sampling_params: SamplingParams
