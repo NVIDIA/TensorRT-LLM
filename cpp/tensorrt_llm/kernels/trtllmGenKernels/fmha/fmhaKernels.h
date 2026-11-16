@@ -277,6 +277,13 @@ public:
         {
             return true;
         }
+        // The cubin table does not carry every context and KeepsMmaAb generation variant the selector
+        // can pick (e.g. FP8-KV spec-decoding generation with tileSizeQ=64). Generate the missing ones.
+        if ((isContextKernel(options.mFmhaKernelType) || isKeepsMmaAbForGenerationKernel(options.mFmhaKernelType))
+            && !isTokenSparse(options.mSparseType) && options.mDtypeKv != tg::Dtype::E2m1 && !hasCubinKernel(options))
+        {
+            return true;
+        }
         // Sparse MQA/GQA uses NVRTC path for now because no model really uses it.
         if (isStaticTokenSparse(options.mSparseType) && !options.mIsMlaGen)
         {
@@ -373,6 +380,14 @@ public:
         {
             options.mMaskType = TrtllmGenAttentionMaskType::Causal;
         }
+    }
+
+    // Whether the cubin table carries the kernel that the cubin path of run() would load for these options.
+    bool hasCubinKernel(FmhaOptions options) const
+    {
+        algoFilterForCubinPath(options);
+        auto const& functions = getFunctions(options.mFusesDsv4InvRopeFp8Quant, options.mUsesDsv4Ue8m0ScaleO);
+        return functions.find(hashIdFromFmhaOptions(options)) != functions.end();
     }
 
 private:
@@ -816,8 +831,11 @@ private:
         // changed autotuner choices without fixing a known failure mode on those GPUs.
         if (mSM != kSM_107)
         {
+            int32_t ctaDim = 512;
             FmhaAutoTuner autoTuner(options, optionsFromArgs, multiProcessorCount);
-            return autoTuner.selectKernel();
+            std::tie(options, optionsFromArgs, ctaDim) = autoTuner.selectKernel();
+            useInKernelReductionForSwapsMmaAb(options);
+            return {options, optionsFromArgs, ctaDim};
         }
 
         if (isGmemReduction(options.mMultiCtasKvMode) && options.mTileScheduler == TileScheduler::Static)
@@ -834,8 +852,21 @@ private:
         int32_t ctaDim = 512;
         FmhaAutoTuner autoTuner(options, optionsFromArgs, multiProcessorCount);
         std::tie(options, optionsFromArgs, ctaDim) = autoTuner.selectKernel();
+        useInKernelReductionForSwapsMmaAb(options);
         limitCgaSmemReductionCtasKv(options);
         return {options, optionsFromArgs, ctaDim};
+    }
+
+    // The autotuner picks GmemReductionWithSeparateKernel for every headDimV=512 GQA generation
+    // kernel, but runFmhaReduction only implements it for KeepsMmaAb kernels. A SwapsMmaAb kernel
+    // (e.g. Gemma4 global layers, few Q heads per KV head) reduces its KV splits in-kernel instead.
+    static void useInKernelReductionForSwapsMmaAb(FmhaOptions& options)
+    {
+        if (isSwapsMmaAbForGenerationKernel(options.mFmhaKernelType)
+            && isGmemReductionWithSeparateKernel(options.mMultiCtasKvMode))
+        {
+            options.mMultiCtasKvMode = tensorrt_llm::kernels::MultiCtasKvMode::GmemReduction;
+        }
     }
 
     static void configurePaddedMlaTile(FmhaOptions& options, FmhaOptionsFromArgs& optionsFromArgs)
@@ -978,12 +1009,36 @@ private:
             kernelMeta.mGroupsTokensHeadsQ, numInstsQ, numInstsKv, kernelMeta.mFp16Softmax, kernelMeta.mUsesSpcompress);
     }
 
-    std::pair<uint64_t, std::string> hashFromFmhaOptions(FmhaOptions const& options) const
+    uint64_t hashIdFromFmhaOptions(FmhaOptions const& options) const
     {
         // uses2CtaMma: "2CTA MMA kernel variant" (MLA KeepsMmaAb with clusterDimX=2).
         // CGA scaling (clusterDimX *= mMaxNumCtasKv) is applied only at launch time in launchFmhaKernel,
         // so options.mClusterDimX here is the unscaled value from the autotuner.
-        bool uses2CtaMma = (options.mClusterDimX == 2);
+        bool const uses2CtaMma = (options.mClusterDimX == 2);
+        // The fp16-softmax and 2:4 activation-sparsity variants are Rubin-only kernel selectors; the
+        // FmhaOptions fields carrying them exist only under TLLM_RUBIN_FEATURES. They must be hashed
+        // consistently with hashID(KernelMeta) so the Sm107a plain/fp16/spcompress siblings dispatch to
+        // distinct cubins (and register without hashId collisions).
+#ifdef TLLM_RUBIN_FEATURES
+        bool const fp16Softmax = options.mEnablesFp16Softmax;
+        bool const usesSpcompress = options.mUsesSpcompress;
+#else
+        bool const fp16Softmax = false;
+        bool const usesSpcompress = false;
+#endif
+        return hashID(static_cast<int>(options.mQkvLayout), static_cast<int>(options.mMaskType),
+            static_cast<int>(options.mFmhaKernelType), static_cast<int>(options.mTileScheduler),
+            static_cast<int>(options.mMultiCtasKvMode), static_cast<int>(options.mHeadDimPerCtaV),
+            static_cast<int>(options.mHeadDimQk), static_cast<int>(options.mHeadDimV),
+            static_cast<int>(options.mTileSizeQ), static_cast<int>(options.mTileSizeKv),
+            static_cast<int>(options.mNumTokensPerPage), options.mReuseSmemKForV, uses2CtaMma,
+            static_cast<int>(options.mSparseType), options.mSkipsSoftmaxWhenPossible, options.mGroupsHeadsQ,
+            options.mGroupsTokensHeadsQ, options.mNumInstsQ, options.mNumInstsKv, fp16Softmax, usesSpcompress);
+    }
+
+    std::pair<uint64_t, std::string> hashFromFmhaOptions(FmhaOptions const& options) const
+    {
+        bool const uses2CtaMma = (options.mClusterDimX == 2);
         // Debug info.
         std::string info = "dtypeQ=" + std::to_string(static_cast<int>(mDtypeQ)) + ", dtypeK="
             + std::to_string(static_cast<int>(mDtypeK)) + ", dtypeV=" + std::to_string(static_cast<int>(mDtypeV))
@@ -1012,27 +1067,7 @@ private:
 
         TLLM_LOG_DEBUG("Searching for kernel traits: " + info);
 
-        // The fp16-softmax and 2:4 activation-sparsity variants are Rubin-only kernel selectors; the
-        // FmhaOptions fields carrying them exist only under TLLM_RUBIN_FEATURES. They must be hashed
-        // consistently with hashID(KernelMeta) so the Sm107a plain/fp16/spcompress siblings dispatch to
-        // distinct cubins (and register without hashId collisions).
-#ifdef TLLM_RUBIN_FEATURES
-        bool const fp16Softmax = options.mEnablesFp16Softmax;
-        bool const usesSpcompress = options.mUsesSpcompress;
-#else
-        bool const fp16Softmax = false;
-        bool const usesSpcompress = false;
-#endif
-        return std::make_pair(
-            hashID(static_cast<int>(options.mQkvLayout), static_cast<int>(options.mMaskType),
-                static_cast<int>(options.mFmhaKernelType), static_cast<int>(options.mTileScheduler),
-                static_cast<int>(options.mMultiCtasKvMode), static_cast<int>(options.mHeadDimPerCtaV),
-                static_cast<int>(options.mHeadDimQk), static_cast<int>(options.mHeadDimV),
-                static_cast<int>(options.mTileSizeQ), static_cast<int>(options.mTileSizeKv),
-                static_cast<int>(options.mNumTokensPerPage), options.mReuseSmemKForV, uses2CtaMma,
-                static_cast<int>(options.mSparseType), options.mSkipsSoftmaxWhenPossible, options.mGroupsHeadsQ,
-                options.mGroupsTokensHeadsQ, options.mNumInstsQ, options.mNumInstsKv, fp16Softmax, usesSpcompress),
-            info);
+        return std::make_pair(hashIdFromFmhaOptions(options), info);
     }
 
     std::string const& getExecPath() const
