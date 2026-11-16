@@ -546,9 +546,11 @@ def _load_guided_decoding_tokenizer(llm_args: TorchLlmArgs,
     """Load the tokenizer whose vocabulary guided decoding masks, from the checkpoint.
 
     A Mistral-native checkpoint (``checkpoint_format`` ``mistral`` or
-    ``mistral_large_3``) is read through mistral-common, as its input processor
-    reads it, whatever Hugging Face tokenizer files it also ships. An explicit
-    ``custom_tokenizer`` takes precedence.
+    ``mistral_large_3``) with a Tekken tokenizer (``tekken.json``) is read
+    through mistral-common, as its input processor reads it, whatever Hugging
+    Face tokenizer files it also ships; guided decoding supports Tekken
+    vocabularies only, so other checkpoints keep their Hugging Face tokenizer.
+    An explicit ``custom_tokenizer`` takes precedence.
 
     Args:
         llm_args: The LLM arguments, for ``custom_tokenizer``,
@@ -559,8 +561,9 @@ def _load_guided_decoding_tokenizer(llm_args: TorchLlmArgs,
         The loaded tokenizer.
     """
     custom_tokenizer = llm_args.custom_tokenizer
-    if custom_tokenizer is None and llm_args.checkpoint_format in (
-            CheckpointFormat.MISTRAL, CheckpointFormat.MISTRAL_LARGE_3):
+    if (custom_tokenizer is None and llm_args.checkpoint_format
+            in (CheckpointFormat.MISTRAL, CheckpointFormat.MISTRAL_LARGE_3)
+            and os.path.isfile(os.path.join(checkpoint_dir, "tekken.json"))):
         custom_tokenizer = "mistral_common"
     if custom_tokenizer:
         from tensorrt_llm.tokenizer import load_custom_tokenizer

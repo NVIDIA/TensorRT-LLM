@@ -158,6 +158,17 @@ def test_other_checkpoints_reload_the_hf_tokenizer(dual_format_dir, llm_args):
     assert tokenizer.encode(HF_TOKENIZER_TEXT) == HF_TOKENIZER_IDS
 
 
+@pytest.mark.parametrize("checkpoint_format", ["mistral", "mistral_large_3"])
+def test_a_native_checkpoint_without_tekken_reloads_its_hf_tokenizer(
+    dual_format_dir, checkpoint_format
+):
+    """Guided decoding masks Tekken vocabularies only; a SentencePiece checkpoint keeps HF's."""
+    (dual_format_dir / "tekken.json").unlink()
+    tokenizer = _load_guided_decoding_tokenizer(_llm_args(checkpoint_format), str(dual_format_dir))
+    assert type(tokenizer) is TransformersTokenizer
+    assert tokenizer.encode(HF_TOKENIZER_TEXT) == HF_TOKENIZER_IDS
+
+
 def test_custom_tokenizer_reloads_the_tekken_tokenizer_of_an_hf_checkpoint(dual_format_dir):
     tokenizer = _load_guided_decoding_tokenizer(
         _llm_args(custom_tokenizer="mistral_common"), str(dual_format_dir)
@@ -169,6 +180,24 @@ def test_tokenizers_without_their_own_vocabulary_keep_the_hf_path():
     config = GuidedDecodingConfig(backend=GuidedDecodingConfig.GuidedDecodingBackend.LLGUIDANCE)
     assert _llguidance_tokenizer(config, object(), 32) is None
     assert _llguidance_tokenizer(config, None, 32) is None
+
+
+def test_llguidance_masks_a_padded_vocabulary(tokenizer):
+    """The bitmask covers the model's padded vocabulary (a TP size that does not divide the
+    vocabulary pads it); a padded id is never allowed and is refused without an error."""
+    n_words = tokenizer.tokenizer.n_words
+    padded = n_words + 96
+    llg = tokenizer.llguidance_tokenizer(padded)
+    assert llg.vocab_size == padded
+    config = get_guided_decoding_config("llguidance", tokenizer)
+    factory = LLGuidanceMatcherFactory(config, padded, tokenizer=llg)
+    matcher = factory.create(
+        GuidedDecodingParams(GuidedDecodingParams.GuideType.JSON_SCHEMA, _SCHEMA)
+    )
+    allowed = _allowed(matcher, padded)
+    assert allowed and max(allowed) < n_words
+    assert not matcher.accept_token(padded - 1)
+    assert _consume(matcher, _text(tokenizer, '{"city": "Paris"}'))
 
 
 def test_llguidance_tokenizer_is_tekken(tokenizer, llg):
