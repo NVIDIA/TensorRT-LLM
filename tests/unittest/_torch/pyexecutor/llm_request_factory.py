@@ -20,6 +20,7 @@ def make_llm_request(
     *,
     input_token_ids: Sequence[int] = (1, 2, 3, 4),
     max_tokens: int = 8,
+    streaming: bool = False,
     **request_options: Any,
 ) -> LlmRequest:
     """Build a real ``LlmRequest`` of ``request_type`` via ``executor_request_to_llm_request``.
@@ -37,6 +38,7 @@ def make_llm_request(
     executor_request = trtllm.Request(
         input_token_ids=list(input_token_ids),
         max_tokens=max_tokens,
+        streaming=streaming,
         type=request_type,
         context_phase_params=context_phase_params,
         **request_options,
