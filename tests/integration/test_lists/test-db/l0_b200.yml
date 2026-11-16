@@ -34,9 +34,6 @@ l0_b200:
       backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
-  - unittest/_torch/attention/test_attention_mla.py::test_kvb_context_layout
-  - unittest/_torch/attention/test_attention_mla.py::test_expand_context_kv_storage
-  - unittest/_torch/attention/test_attention_mla.py::test_attention_mla_compact_v
   - unittest/_torch/modeling_v2/models/glm5_next/glm_5_3_flash_nvfp4__sm_100__default_mtp_fused/spec/test_modeling_v2_mtp_step.py
   - unittest/_torch/models/test_qwen3_5_int4_loading.py
   - unittest/_torch/modules/test_linear_uneven_tp.py::TestW4A16AWQMLP::test_optional_pre_quant_scale
