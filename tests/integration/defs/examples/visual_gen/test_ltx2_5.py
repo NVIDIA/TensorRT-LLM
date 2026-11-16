@@ -37,6 +37,30 @@ def _case():
     return CASES[name]
 
 
+def _assert_audio_duration(audio: np.ndarray, rate: int, frame_count: int) -> None:
+    assert rate == 48000
+    expected = frame_count / 24
+    # The audio latent grid is 25 Hz; allow one 40 ms decoder boundary.
+    # AAC uses 1024-sample frames; allow two frames for priming/tail padding.
+    lower = expected - 0.04 - 1 / rate
+    upper = expected + 0.04 + 2 * 1024 / rate
+    actual = len(audio) / rate
+    assert lower <= actual <= upper, (
+        f"Decoded audio duration {actual:.6f}s outside [{lower:.6f}, {upper:.6f}]s "
+        f"for {frame_count} frames at 24 fps"
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("frame_count", [case[2] for case in CASES.values()])
+def test_audio_duration_rejects_truncation(frame_count: int) -> None:
+    samples = round(frame_count / 24 * 48000)
+    _assert_audio_duration(np.ones((samples, 2)), 48000, frame_count)
+    _assert_audio_duration(np.ones((samples + 2048, 2)), 48000, frame_count)
+    with pytest.raises(AssertionError, match="Decoded audio duration"):
+        _assert_audio_duration(np.ones((samples // 2, 2)), 48000, frame_count)
+
+
 @pytest.fixture(scope="module")
 def generated_video(tmp_path_factory):
     root = Path(os.environ.get("LTX25_MODEL_ROOT") or get_checkpoint("LTX-2.5"))
@@ -118,8 +142,7 @@ def test_ltx2_5_example_smoke(generated_video) -> None:
         ]
     )
     audio, rate = sf.read(BytesIO(audio_bytes))
-    assert rate == 48000
-    assert len(audio) > 0
+    _assert_audio_duration(audio, rate, frame_count)
 
 
 def test_ltx2_5_official_bf16_lpips(generated_video) -> None:
