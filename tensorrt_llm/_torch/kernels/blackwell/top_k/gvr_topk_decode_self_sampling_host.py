@@ -4289,6 +4289,8 @@ def run_varlen(
     k = indices.shape[1]
     if not (indices.is_contiguous() and kv_lens.is_contiguous()):
         raise RuntimeError("indices/kv_lens must be contiguous")
+    if indices.data_ptr() & 15:
+        raise RuntimeError("indices base must be 16-byte aligned")
     # logits: accept row-major views with a wider row stride (the DSL
     # paged-MQA logits arena is 256-aligned and column-sliced — a legal
     # NON-contiguous view). The kernel only needs (base, row stride):
@@ -4456,6 +4458,8 @@ def _run_varlen_16bit(
     k = indices.shape[1]
     if not (indices.is_contiguous() and kv_lens.is_contiguous()):
         raise RuntimeError("indices/kv_lens must be contiguous")
+    if indices.data_ptr() & 15:
+        raise RuntimeError("indices base must be 16-byte aligned")
     if logits.stride(1) != 1:
         raise RuntimeError("logits inner stride must be 1")
     npad = logits.stride(0) if num_rows > 1 else logits.shape[1]

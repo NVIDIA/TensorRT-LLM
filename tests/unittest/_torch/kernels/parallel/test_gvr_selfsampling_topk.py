@@ -612,6 +612,11 @@ def test_selfsampling_topk_varlen_guards():
     with pytest.raises(RuntimeError, match="contiguous"):
         strided = torch.zeros((2, 2), dtype=torch.int32, device=_DEV)[:, 0]
         ss_host.run_varlen(logits, strided, indices)
+    # every varlen build stores the output with 16-byte alignment assumed
+    misaligned = torch.zeros(2 * 512 + 1, dtype=torch.int32, device=_DEV)[1:].view(2, 512)
+    for lg in (logits, logits.to(torch.bfloat16)):
+        with pytest.raises(RuntimeError, match="indices base must be 16-byte aligned"):
+            ss_host.run_varlen(lg, kv, misaligned)
 
 
 def test_selfsampling_topk_varlen_cuda_graph():
