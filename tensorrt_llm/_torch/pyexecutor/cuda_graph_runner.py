@@ -2059,11 +2059,13 @@ class DSparkCUDAGraphRunner(CUDAGraphRunner):
     def pad_batch(self,
                   scheduled_requests: ScheduledRequests,
                   resource_manager: ResourceManager,
-                  runtime_draft_len: int = 0):
+                  runtime_draft_len: int = 0,
+                  sampling_mode: Optional[int] = None):
         """Consume the shape vote once, including an exceptional forward exit."""
         try:
             with super().pad_batch(scheduled_requests, resource_manager,
-                                   runtime_draft_len) as padded_requests:
+                                   runtime_draft_len,
+                                   sampling_mode) as padded_requests:
                 yield padded_requests
         finally:
             self.adp_shape_agreement = None
