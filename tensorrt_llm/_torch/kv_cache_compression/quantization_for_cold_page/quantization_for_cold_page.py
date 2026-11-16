@@ -3,12 +3,21 @@
 """Common runtime pipeline for cold-page quantization."""
 
 import math
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional, Sequence
+
+from tensorrt_llm.logger import logger
 
 from ...pyexecutor.resource_manager import DataType, KVCacheCompressionManager
 
 if TYPE_CHECKING:
+    from transformers import PretrainedConfig
+
+    from tensorrt_llm.llmapi.llm_args import ColdPageQuantizationCompressionConfig
     from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig
+
+_RUNTIME_TYPES = {DataType.HALF: 0, DataType.BF16: 1, DataType.FP8: 2}
+"""Runtime KV dtypes a cold-page quantizer reads, as the kernels' runtime type codes."""
 
 # These models use contiguous RoPE: key-only buffers are MLA latents with RoPE
 # trailing; key+value buffers are partial-rotary GQA with RoPE leading. Adding a
@@ -42,18 +51,87 @@ _DEEPSEEK_V4_ROPE_DIM = _DEEPSEEK_V4_ROW_STRIDE - _DEEPSEEK_V4_NOPE_DIM
 _DEEPSEEK_V4_FOOTER_SCALE_ROW_BYTES = 584
 
 
+@dataclass(frozen=True)
+class _ColdPageBufferLayout:
+    """One hot buffer; ``quantized_range_*`` picks which numbers of each K/V vector are quantized.
+
+    A zero ``quantized_range_elements`` stores the buffer unchanged.
+    """
+
+    role: str
+    quantized_range_start: int = 0
+    quantized_range_elements: int = 0
+
+
+@dataclass(frozen=True)
+class _ColdPageLayerLayout:
+    layer_id: int
+    num_kv_heads: int
+    tokens_per_page: int
+    raw_row_stride_elements: int
+    buffers: tuple[_ColdPageBufferLayout, ...]
+
+
+@dataclass
+class _ColdPageCodecState:
+    """Format state owned by one target, draft, or retry codec."""
+
+    layer_layouts: dict[int, _ColdPageLayerLayout]
+    layer_ids: tuple[int, ...]
+    runtime_type: int
+    lifecycle_metadata: tuple = field(init=False)
+
+
 class ColdPageQuantizationCompression(KVCacheCompressionManager):
-    """Common codec registration, callbacks, and KV-row geometry for cold-page quantizers."""
+    """Common codec registration, callbacks, and KV-row geometry for cold-page quantizers.
+
+    A format sets ``_FORMAT_NAME``, ``_RANGE_ALIGNMENT`` and ``_RANGE_ALIGNMENT_UNIT``.
+    """
 
     uses_iteration_lifecycle = False
     provides_cold_page_codec = True
 
-    _FORMAT_NAME = "NVFP4"
+    _FORMAT_NAME: str
     """Format name used in user-facing messages."""
-    _skip_rope_quantization = False
-    _RANGE_ALIGNMENT = 16
+    _RANGE_ALIGNMENT: int
     """Quantized ranges must start and end on multiples of this many elements."""
-    _RANGE_ALIGNMENT_UNIT = "NVFP4 scale groups"
+    _RANGE_ALIGNMENT_UNIT: str
+    """What one ``_RANGE_ALIGNMENT`` of elements is called in error messages."""
+    _skip_rope_quantization = False
+
+    def __init__(
+        self,
+        config: "ColdPageQuantizationCompressionConfig",
+        *,
+        pretrained_config: "PretrainedConfig",
+    ) -> None:
+        super().__init__(config, pretrained_config=pretrained_config)
+        self._skip_rope_quantization = bool(config.skip_rope_quantization)
+        model_type = getattr(pretrained_config, "model_type", None)
+        architectures = getattr(pretrained_config, "architectures", None) or []
+        if architectures and architectures[0] == "GlmMoeDsaForCausalLM":
+            model_type = "glm_moe_dsa"
+        if self._skip_rope_quantization and model_type not in _SKIP_ROPE_QUANTIZATION_MODEL_TYPES:
+            logger.warning(
+                "skip_rope_quantization is supported for model types "
+                f"{sorted(_SKIP_ROPE_QUANTIZATION_MODEL_TYPES)} only; ignoring it for "
+                f"{model_type!r} and quantizing whole K and V vectors with {self._FORMAT_NAME}."
+            )
+            self._skip_rope_quantization = False
+
+    def _skip_rope(self, is_draft: bool) -> bool:
+        """Whether a KVCM keeps RoPE lossless.
+
+        The codec holds only the target model's config, so it cannot locate RoPE in a draft
+        model's K vectors: draft KVCMs always quantize whole vectors.
+        """
+        if self._skip_rope_quantization and is_draft:
+            logger.warning(
+                "skip_rope_quantization: draft-model K and V vectors are quantized in full with "
+                f"{self._FORMAT_NAME}."
+            )
+            return False
+        return self._skip_rope_quantization
 
     @property
     def mixed_precision_high_window(self) -> Optional[tuple[int, int]]:

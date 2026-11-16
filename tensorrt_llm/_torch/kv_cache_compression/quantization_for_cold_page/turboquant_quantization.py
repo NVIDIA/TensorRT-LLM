@@ -3,12 +3,12 @@
 """TurboQuant cold-page layout, metadata, and Triton kernel dispatch."""
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Sequence
 
 import torch
 
-from tensorrt_llm.logger import logger
+from tensorrt_llm.math_utils import pad_up
 
 from ...pyexecutor.resource_manager import DataType
 from . import turboquant_math as tq_math
@@ -17,9 +17,13 @@ from .quantization_for_cold_page import (
     _DEEPSEEK_V4_CSA_ROLES,
     _DEEPSEEK_V4_HCA_ROLES,
     _DEEPSEEK_V4_NOPE_DIM,
+    _DEEPSEEK_V4_ROPE_DIM,
     _DEEPSEEK_V4_ROW_STRIDE,
-    _SKIP_ROPE_QUANTIZATION_MODEL_TYPES,
+    _RUNTIME_TYPES,
     ColdPageQuantizationCompression,
+    _ColdPageBufferLayout,
+    _ColdPageCodecState,
+    _ColdPageLayerLayout,
 )
 
 if TYPE_CHECKING:
@@ -28,7 +32,6 @@ if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import ColdPageQuantizationCompressionConfig
     from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig
 
-_RUNTIME_TYPES = {DataType.HALF: 0, DataType.BF16: 1, DataType.FP8: 2}
 _TORCH_DTYPES = (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
 _ALIGNMENT = 16
 _MAX_PIECES = 4
@@ -39,14 +42,6 @@ _LUT_STRIDE = 16  # fp32 entries per codebook in the kernels' centroid table (LU
 _MODES = {"mse": 0, "fractional": 1}
 # A 64-bit stand-in for the KVCM addresses when kernels are compiled ahead of use.
 _ADDRESS = 1 << 40
-
-
-def _align(value: int) -> int:
-    return (value + _ALIGNMENT - 1) // _ALIGNMENT * _ALIGNMENT
-
-
-def _next_power_of_two(value: int) -> int:
-    return 1 << max(value - 1, 0).bit_length()
 
 
 def _centroid_table(constants: dict[str, Any], device: torch.device) -> torch.Tensor:
@@ -66,24 +61,6 @@ def _centroid_table(constants: dict[str, Any], device: torch.device) -> torch.Te
 def _power_of_two_pieces(width: int) -> tuple[int, ...]:
     """Split ``width`` into descending powers of two, e.g. 576 -> (512, 64)."""
     return tuple(1 << bit for bit in reversed(range(width.bit_length())) if width >> bit & 1)
-
-
-@dataclass(frozen=True)
-class _TurboQuantBufferLayout:
-    """One hot buffer; a zero ``quantized_range_elements`` stores the buffer unchanged."""
-
-    role: str
-    quantized_range_start: int = 0
-    quantized_range_elements: int = 0
-
-
-@dataclass(frozen=True)
-class _TurboQuantLayerLayout:
-    layer_id: int
-    num_kv_heads: int
-    tokens_per_page: int
-    raw_row_stride_elements: int
-    buffers: tuple[_TurboQuantBufferLayout, ...]
 
 
 @dataclass(frozen=True)
@@ -150,15 +127,15 @@ class _TurboQuantGeometry:
         for group, (width, bits) in zip("AB", self.groups):
             for plane, plane_bits in enumerate(_BIT_PLANES[bits]):
                 offsets[f"{group}{plane}"] = cursor
-                cursor += _align(self.rows * width * plane_bits // 8)
+                cursor += pad_up(self.rows * width * plane_bits // 8, _ALIGNMENT)
         # One BF16 scale per row and instance.
         offsets["scale"] = cursor
-        cursor += _align(self.rows * 2 * len(self.instances))
+        cursor += pad_up(self.rows * 2 * len(self.instances), _ALIGNMENT)
         if self.mode == "fractional":
             offsets["mask"] = cursor
-            cursor += _align(self.rows // self.tokens_per_page * self.width // 8)
+            cursor += pad_up(self.rows // self.tokens_per_page * self.width // 8, _ALIGNMENT)
         offsets["raw"] = cursor
-        cursor += _align(self.rows * self.raw_elements * self.element_bytes)
+        cursor += pad_up(self.rows * self.raw_elements * self.element_bytes, _ALIGNMENT)
         offsets["end"] = cursor
         return offsets
 
@@ -168,10 +145,10 @@ class _TurboQuantGeometry:
         """Compile-time arguments of the encode or decode kernel for this geometry.
 
         ``capability`` is the GPU's compute capability; the launch shapes measured on SM100-family
-        GPUs apply only there. Decode constants carry ``COLS``, the output columns accumulated at
-        a time by single-instance passes (0: the whole instance), and ``COLS_IN_PARALLEL``, whether
-        separate programs take those column blocks; ``decode_passes`` turns them into launches.
+        GPUs apply only there. Decode constants carry ``HALVES``: whether a single-instance row
+        accumulates its output columns in two halves (see ``decode_passes``).
         """
+        import triton
         import triton.language as tl
 
         pieces = self.pieces
@@ -179,7 +156,7 @@ class _TurboQuantGeometry:
         pages_per_tile, rows_pad = 1, self.rows
         launch: dict[str, int] = {}
         if self.mode == "fractional":
-            block_m = max(16, _next_power_of_two(self.tokens_per_page))
+            block_m = max(16, triton.next_power_of_2(self.tokens_per_page))
             tile_rows = self.tokens_per_page
         else:
             # Tensor-core tiles of 64+ rows accumulate in tensor memory: 512 fp32 columns shared
@@ -199,7 +176,7 @@ class _TurboQuantGeometry:
             block_m = launch.pop("block_m", block_m)
             tile_rows = block_m
             if self.rows < block_m:
-                rows_pad = _next_power_of_two(self.rows)
+                rows_pad = triton.next_power_of_2(self.rows)
                 pages_per_tile = block_m // rows_pad
         regions = self.regions()
         groups = self.groups
@@ -223,8 +200,7 @@ class _TurboQuantGeometry:
                 + positive_centroids
                 + [0.0] * (8 - len(positive_centroids))
             )
-        cols = launch.pop("cols", 0)
-        cols_in_parallel = launch.pop("cols_in_parallel", False)
+        halves = launch.pop("halves", False)
         constants = dict(
             ELEM=(tl.float16, tl.bfloat16, tl.float8e4nv)[self.runtime_type],
             N=self.width,
@@ -255,7 +231,7 @@ class _TurboQuantGeometry:
             OFF_MASK=regions.get("mask", 0),
             OFF_RAW=regions["raw"],
             RAW=self.raw_elements,
-            RAW_BLOCK=_next_power_of_two(max(self.raw_elements, 1)),
+            RAW_BLOCK=triton.next_power_of_2(max(self.raw_elements, 1)),
             **{
                 "num_warps": 4 if block_m * self.width <= 4096 else 8,
                 # Wide rows keep their pieces resident; pipelining their matrix tiles would not fit.
@@ -264,47 +240,32 @@ class _TurboQuantGeometry:
             },
         )
         if not encode:
-            constants["COLS"] = cols
-            constants["COLS_IN_PARALLEL"] = cols_in_parallel
+            constants["HALVES"] = halves
         return constants
 
-    def decode_passes(
-        self, cols: int, cols_in_parallel: bool = False
-    ) -> tuple[tuple[int, int, int], ...]:
-        """(PASS, COL_BLOCKS, SPLIT) of every decode launch of a row.
+    def decode_passes(self, halves: bool) -> tuple[tuple[int, bool], ...]:
+        """(PASS, HALVES) of every decode launch of a row.
 
-        Blocked rows decode one instance per pass. With ``cols``, an mse pass that decodes a single
-        instance wider than ``cols`` accumulates its output columns in COL_BLOCKS blocks of
-        ``cols``: one after another in the program that read the codes, or, with
-        ``cols_in_parallel``, in SPLIT = COL_BLOCKS programs per row tile, which read the codes
-        COL_BLOCKS times (from L2 for codes in device memory, over the host link otherwise).
+        Blocked rows decode one instance per pass (PASS), every other row in one pass (-1). With
+        ``halves``, a row that is a single mse instance accumulates its output columns in two
+        halves; each chunk of its codes is still read once.
         """
         if self.blocked:
-            passes = range(len(self.instances))
-        else:
-            passes = (-1,)
-        single = self.blocked or len(self.pieces) == 1
-        out = []
-        for decode_pass in passes:
-            width = self.pieces[decode_pass] if self.blocked else self.width
-            blocks = 1
-            if cols and single and self.mode == "mse" and width > cols:
-                blocks = width // cols
-            out.append((decode_pass, blocks, blocks if cols_in_parallel else 1))
-        return tuple(out)
+            return tuple((decode_pass, False) for decode_pass in range(len(self.instances)))
+        single = self.mode == "mse" and len(self.pieces) == 1
+        return ((-1, bool(halves) and single),)
 
     def _wide_mse_launch(
         self, encode: bool, accumulated: int, capability: tuple[int, int]
     ) -> dict[str, int]:
-        """Tiles, warps, stages, register cap and decode column split of mse rows wider than 256.
+        """Tiles, warps, stages, register cap and decode column halves of mse rows wider than 256.
 
         Measured on GB300 (SM103) and used on SM100-family GPUs only; other GPUs keep the generic
         shapes. MLA latents (576 values, three instances) and DeepSeek-V4 CSA rows (448) encode
         fastest with 64-row tiles of 8 warps capped at 128 registers, so that two programs share
         an SM; blocked rows also pipeline their matrix tiles. Decoding takes 128-row tiles; a
-        single instance wider than 448 (512 values) accumulates its output columns in two blocks
-        of 256, whose accumulators fit tensor memory. Splitting the columns over programs instead
-        is faster with cold pages in device memory but reads the codes over the host link twice.
+        single instance wider than 448 (512 values) accumulates its output columns in two halves
+        of 256, whose accumulators fit tensor memory.
         """
         if self.mode != "mse" or self.width <= 256 or capability[0] != 10:
             return {}
@@ -319,7 +280,7 @@ class _TurboQuantGeometry:
         if accumulated <= 448:
             return dict(block_m=128, num_warps=8, num_stages=1)
         if len(self.pieces) == 1:
-            return dict(block_m=128, num_warps=8, num_stages=1, cols=256)
+            return dict(block_m=128, num_warps=8, num_stages=1, halves=True)
         return dict(block_m=32, num_warps=8, num_stages=2)
 
     @staticmethod
@@ -345,8 +306,6 @@ class _TurboQuantLaunch:
     encode_kernel: Any = None
     """Kernels compiled at configure time and launched without the JIT dispatcher."""
     decode_kernels: tuple = ()
-    decode_splits: tuple = ()
-    """Programs per row tile of every decode kernel (SPLIT)."""
     copy: bool = False
 
 
@@ -356,16 +315,6 @@ class _TurboQuantColdPageMetadata:
 
     launches: tuple[_TurboQuantLaunch, ...]
     cold_page_bytes: int
-
-
-@dataclass
-class _TurboQuantColdPageCodecState:
-    """TurboQuant state owned by one target, draft, or retry codec."""
-
-    layer_layouts: dict[int, _TurboQuantLayerLayout]
-    layer_ids: tuple[int, ...]
-    runtime_type: int
-    lifecycle_metadata: tuple[_TurboQuantColdPageMetadata, ...] = field(init=False)
 
 
 class TurboQuantColdPageQuantizationCompression(ColdPageQuantizationCompression):
@@ -382,18 +331,6 @@ class TurboQuantColdPageQuantizationCompression(ColdPageQuantizationCompression)
         pretrained_config: "PretrainedConfig",
     ) -> None:
         super().__init__(config, pretrained_config=pretrained_config)
-        self._skip_rope_quantization = bool(config.skip_rope_quantization)
-        model_type = getattr(pretrained_config, "model_type", None)
-        architectures = getattr(pretrained_config, "architectures", None) or []
-        if architectures and architectures[0] == "GlmMoeDsaForCausalLM":
-            model_type = "glm_moe_dsa"
-        if self._skip_rope_quantization and model_type not in _SKIP_ROPE_QUANTIZATION_MODEL_TYPES:
-            logger.warning(
-                "skip_rope_quantization is supported for model types "
-                f"{sorted(_SKIP_ROPE_QUANTIZATION_MODEL_TYPES)} only; ignoring it for "
-                f"{model_type!r} and TurboQuant-encoding whole K and V vectors."
-            )
-            self._skip_rope_quantization = False
         bits = float(config.turboquant_bits)
         self._seed = int(config.turboquant_seed)
         if bits != int(bits):
@@ -414,7 +351,7 @@ class TurboQuantColdPageQuantizationCompression(ColdPageQuantizationCompression)
         num_kv_heads_per_layer: Sequence[int],
         head_dim_per_layer: Sequence[int],
         is_draft: bool = False,
-    ) -> _TurboQuantColdPageCodecState:
+    ) -> _ColdPageCodecState:
         from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig
 
         runtime_type = _RUNTIME_TYPES.get(runtime_dtype)
@@ -428,16 +365,9 @@ class TurboQuantColdPageQuantizationCompression(ColdPageQuantizationCompression)
             )
         runtime_type = runtime_type if runtime_type is not None else 0
 
-        # The codec holds only the target model's config, so it cannot locate RoPE in a draft
-        # model's K vectors: draft KVCMs always quantize whole vectors.
-        skip_rope = self._skip_rope_quantization
-        if skip_rope and is_draft:
-            logger.warning(
-                "skip_rope_quantization: draft-model K and V vectors are TurboQuant-encoded in full."
-            )
-            skip_rope = False
+        skip_rope = self._skip_rope(is_draft)
 
-        layouts: dict[int, _TurboQuantLayerLayout] = {}
+        layouts: dict[int, _ColdPageLayerLayout] = {}
         deepseek_v4_layers: set[int] = set()
         if getattr(self.pretrained_config, "model_type", None) == "deepseek_v4":
             deepseek_v4_layouts = self._build_deepseek_v4_layer_layouts(
@@ -445,6 +375,7 @@ class TurboQuantColdPageQuantizationCompression(ColdPageQuantizationCompression)
                 attention_layers=attention_layers,
                 pp_layers=pp_layers,
                 runtime_type=runtime_type,
+                skip_rope=skip_rope,
             )
             deepseek_v4_layers = set(deepseek_v4_layouts)
             layouts.update(
@@ -469,7 +400,7 @@ class TurboQuantColdPageQuantizationCompression(ColdPageQuantizationCompression)
                 buffer_name=f"cold-page layer {layer_id} key",
             )
             buffers = [
-                _TurboQuantBufferLayout(
+                _ColdPageBufferLayout(
                     role=role,
                     quantized_range_start=key_range[0] if role == "key" else 0,
                     quantized_range_elements=key_range[1] if role == "key" else head_dim,
@@ -479,11 +410,11 @@ class TurboQuantColdPageQuantizationCompression(ColdPageQuantizationCompression)
             for buffer in buffers:
                 self._check_quantized_width(buffer.quantized_range_elements, layer_id, buffer.role)
             buffers += [
-                _TurboQuantBufferLayout(role=str(buffer.role))
+                _ColdPageBufferLayout(role=str(buffer.role))
                 for buffer in layer.buffers
                 if str(buffer.role) not in compressed_roles
             ]
-            layouts[layer_id] = _TurboQuantLayerLayout(
+            layouts[layer_id] = _ColdPageLayerLayout(
                 layer_id=layer_id,
                 num_kv_heads=int(num_kv_heads_per_layer[layer_id]),
                 tokens_per_page=int(cache_config.tokens_per_block),
@@ -491,7 +422,7 @@ class TurboQuantColdPageQuantizationCompression(ColdPageQuantizationCompression)
                 buffers=tuple(buffers),
             )
 
-        return _TurboQuantColdPageCodecState(
+        return _ColdPageCodecState(
             layer_layouts=layouts,
             layer_ids=tuple(sorted(layouts)),
             runtime_type=runtime_type,
@@ -529,13 +460,15 @@ class TurboQuantColdPageQuantizationCompression(ColdPageQuantizationCompression)
         attention_layers: Sequence["AttentionLayerConfig"],
         pp_layers: Sequence[int],
         runtime_type: int,
-    ) -> dict[int, _TurboQuantLayerLayout | None]:
-        """CSA rows keep 64 RoPE values and the indexer cache unchanged; None selects fallback."""
+        skip_rope: bool,
+    ) -> dict[int, _ColdPageLayerLayout | None]:
+        """CSA rows: the 448 NoPE values, and the 64 RoPE values unless ``skip_rope``, are encoded;
+        the indexer cache is kept unchanged. None selects the lossless fallback."""
 
         roles_by_layer, has_csa_cache, _ = self._deepseek_v4_model_layers(
             attention_layers, pp_layers
         )
-        layouts: dict[int, _TurboQuantLayerLayout | None] = {}
+        layouts: dict[int, _ColdPageLayerLayout | None] = {}
         for layer in attention_layers:
             layer_id = int(layer.layer_id)
             buffer_roles = roles_by_layer.get(layer_id)
@@ -545,31 +478,40 @@ class TurboQuantColdPageQuantizationCompression(ColdPageQuantizationCompression)
                 layouts[layer_id] = None
                 if has_csa_cache and buffer_roles == _DEEPSEEK_V4_HCA_ROLES:
                     # Co-located with the CSA cache in one lifecycle: owned, but stored as is.
-                    layouts[layer_id] = _TurboQuantLayerLayout(
+                    layouts[layer_id] = _ColdPageLayerLayout(
                         layer_id=layer_id,
                         num_kv_heads=0,
                         tokens_per_page=0,
                         raw_row_stride_elements=0,
                         buffers=tuple(
-                            _TurboQuantBufferLayout(role=str(buffer.role))
-                            for buffer in layer.buffers
+                            _ColdPageBufferLayout(role=str(buffer.role)) for buffer in layer.buffers
                         ),
                     )
                 continue
             tokens_per_page = self._deepseek_v4_csa_tokens_per_page(
                 cache_config, layer, runtime_type=runtime_type
             )
-            layouts[layer_id] = _TurboQuantLayerLayout(
+            # A compressed row is 448 NoPE elements followed by 64 RoPE elements.
+            range_start, range_elements = self._calculate_quantized_range(
+                _DEEPSEEK_V4_ROW_STRIDE,
+                skip_rope=skip_rope,
+                rope=(_DEEPSEEK_V4_NOPE_DIM, _DEEPSEEK_V4_ROPE_DIM),
+                buffer_name=f"cold-page layer {layer_id} {_DEEPSEEK_V4_COMPRESS}",
+            )
+            self._check_quantized_width(range_elements, layer_id, _DEEPSEEK_V4_COMPRESS)
+            layouts[layer_id] = _ColdPageLayerLayout(
                 layer_id=layer_id,
                 num_kv_heads=1,
                 tokens_per_page=tokens_per_page,
                 raw_row_stride_elements=_DEEPSEEK_V4_ROW_STRIDE,
                 buffers=tuple(
-                    _TurboQuantBufferLayout(
-                        role=str(buffer.role), quantized_range_elements=_DEEPSEEK_V4_NOPE_DIM
+                    _ColdPageBufferLayout(
+                        role=str(buffer.role),
+                        quantized_range_start=range_start,
+                        quantized_range_elements=range_elements,
                     )
                     if str(buffer.role) == _DEEPSEEK_V4_COMPRESS
-                    else _TurboQuantBufferLayout(role=str(buffer.role))
+                    else _ColdPageBufferLayout(role=str(buffer.role))
                     for buffer in layer.buffers
                 ),
             )
@@ -579,7 +521,7 @@ class TurboQuantColdPageQuantizationCompression(ColdPageQuantizationCompression)
         return native.ColdPageIndexLocation.DEVICE
 
     def build_lifecycle_metadata(
-        self, codec_state: _TurboQuantColdPageCodecState, lifecycle: object
+        self, codec_state: _ColdPageCodecState, lifecycle: object
     ) -> _TurboQuantColdPageMetadata:
         element_bytes = 1 if codec_state.runtime_type == 2 else 2
         quantized: dict[_TurboQuantGeometry, list[tuple[int, int, int]]] = {}
@@ -598,7 +540,7 @@ class TurboQuantColdPageQuantizationCompression(ColdPageQuantizationCompression)
                     raise ValueError("Cold-page hot buffer has invalid address or size")
                 if not buffer.quantized_range_elements:
                     copied.append((raw_base, raw_slot_bytes, raw_bytes, cursor))
-                    cursor += _align(raw_bytes)
+                    cursor += pad_up(raw_bytes, _ALIGNMENT)
                     continue
                 if raw_bytes != rows * layout.raw_row_stride_elements * element_bytes:
                     raise ValueError("Hot buffer size does not match TurboQuant geometry")
@@ -618,7 +560,7 @@ class TurboQuantColdPageQuantizationCompression(ColdPageQuantizationCompression)
                 )
                 quantized.setdefault(geometry, []).append((raw_base, raw_slot_bytes, cursor))
                 cursor += geometry.regions()["end"]
-        cold_page_bytes = _align(cursor)
+        cold_page_bytes = pad_up(cursor, _ALIGNMENT)
         if cold_page_bytes == 0:
             raise ValueError("TurboQuant cold-page lifecycle has no buffers")
 
@@ -679,9 +621,7 @@ class TurboQuantColdPageQuantizationCompression(ColdPageQuantizationCompression)
         capability = torch.cuda.get_device_capability(device)
         encode_constants = dict(geometry.kernel_constants(True, capability), PASS=-1)
         decode_constants = geometry.kernel_constants(False, capability)
-        passes = geometry.decode_passes(
-            decode_constants.pop("COLS"), decode_constants.pop("COLS_IN_PARALLEL")
-        )
+        passes = geometry.decode_passes(decode_constants.pop("HALVES"))
         centroids = _centroid_table(encode_constants, device)
         launch = _TurboQuantLaunch(
             num_buffers=len(entries),
@@ -691,7 +631,6 @@ class TurboQuantColdPageQuantizationCompression(ColdPageQuantizationCompression)
             encode_constants=encode_constants,
             decode_constants=decode_constants,
             hot_base=hot_base,
-            decode_splits=tuple(split for _, _, split in passes),
         )
         # Compile now: configure() runs at KVCM construction, not on migration. The pointer
         # arguments are compiled for 16-byte aligned addresses, which every launch checks.
@@ -707,9 +646,9 @@ class TurboQuantColdPageQuantizationCompression(ColdPageQuantizationCompression)
                 *sample,
                 *launch.decode_args,
                 grid=(1, 1, 1),
-                **dict(launch.decode_constants, PASS=decode_pass, COL_BLOCKS=blocks, SPLIT=split),
+                **dict(launch.decode_constants, PASS=decode_pass, HALVES=halves),
             )
-            for decode_pass, blocks, split in passes
+            for decode_pass, halves in passes
         )
         # Load the modules now, so that an unsupported geometry fails here, not in a migration.
         for kernel in (launch.encode_kernel, *launch.decode_kernels):
@@ -757,11 +696,14 @@ class TurboQuantColdPageQuantizationCompression(ColdPageQuantizationCompression)
             for encode in (True, False)
         )
         launch.decode_kernels = (decode_kernel,)
+        # As for the quantized launches: a module that cannot load fails here, not in a migration.
+        for kernel in (launch.encode_kernel, decode_kernel):
+            kernel._init_handles()
         return launch
 
     def _launch(
         self,
-        codec_state: _TurboQuantColdPageCodecState,
+        codec_state: _ColdPageCodecState,
         lifecycle_index: int,
         cold_base: int,
         page_indices: int,
@@ -789,9 +731,8 @@ class TurboQuantColdPageQuantizationCompression(ColdPageQuantizationCompression)
             constants = launch.encode_constants if encode else launch.decode_constants
             page_programs, tiles = _TurboQuantGeometry.grid(constants, num_pages)
             args = launch.encode_args if encode else launch.decode_args
-            splits = (1,) if encode else launch.decode_splits
-            for kernel, split in zip(kernels, splits):
-                kernel[(page_programs * split, launch.num_buffers, tiles)](
+            for kernel in kernels:
+                kernel[(page_programs, launch.num_buffers, tiles)](
                     page_indices,
                     cold_base,
                     metadata.cold_page_bytes,
@@ -803,7 +744,7 @@ class TurboQuantColdPageQuantizationCompression(ColdPageQuantizationCompression)
 
     def encode_cold_pages(
         self,
-        codec_state: _TurboQuantColdPageCodecState,
+        codec_state: _ColdPageCodecState,
         lifecycle_index: int,
         cold_base: int,
         page_indices: int,
@@ -816,7 +757,7 @@ class TurboQuantColdPageQuantizationCompression(ColdPageQuantizationCompression)
 
     def decode_cold_pages(
         self,
-        codec_state: _TurboQuantColdPageCodecState,
+        codec_state: _ColdPageCodecState,
         lifecycle_index: int,
         cold_base: int,
         page_indices: int,

@@ -35,6 +35,12 @@ _DTYPES = {
 }
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+# The providers are built directly here, past the SM89 admission check of an FP8 active KV cache.
+requires_fp8 = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9),
+    reason="an FP8 active KV cache needs compute capability 8.9 or newer",
+)
+_FP8 = pytest.param("fp8", marks=requires_fp8)
 
 
 def _provider(bits=4, seed=0, *, pretrained_config=None, skip_rope=False):
@@ -240,7 +246,7 @@ def test_mse_distortion_is_data_oblivious(bits, kind):
 
 
 @requires_cuda
-@pytest.mark.parametrize("runtime", ("bf16", "fp16", "fp8"))
+@pytest.mark.parametrize("runtime", ("bf16", "fp16", _FP8))
 def test_zero_tiny_and_huge_vectors_stay_finite(runtime):
     codec = _kv_codec(_provider(4), runtime=runtime)
     generator = torch.Generator(device="cuda").manual_seed(0)
@@ -310,28 +316,37 @@ def test_fractional_bits_lie_between_their_integer_neighbours(bits, kind):
         (4, "bf16", 1e-3),
         (3, "fp16", 1e-3),
         (2, "bf16", 1e-3),
-        (4, "fp8", 2e-2),
+        pytest.param(4, "fp8", 2e-2, marks=requires_fp8),
         (3.5, "bf16", 0.1),
         (2.5, "bf16", 0.1),
     ),
 )
-def test_repeated_round_trips(bits, runtime, limit):
-    """Re-encoding a decoded Page (an onboarded Page offloaded again) does not accumulate error.
+def test_repeated_round_trips_settle(bits, runtime, limit):
+    """Re-encoding a decoded Page (an onboarded Page offloaded again) settles without compounding.
 
-    Integer bit widths reproduce their codes; fractional bits mostly keep their outlier channels.
+    After a few round trips the cold bytes repeat with period 1 or 2: most vectors reproduce their
+    codes and a few alternate between two codes; fractional bits may first move channels between
+    their two groups. On GB300 every setting here settled within 14 round trips.
     """
 
+    trips = 32
     codec = _kv_codec(_provider(bits), runtime=runtime)
     generator = torch.Generator(device="cuda").manual_seed(4)
     values = {key: _vectors("outlier_channels", (4, 2, 32, 128), generator) for key in codec.hot}
     for key, value in values.items():
         codec.hot[key][:4] = value.to(codec.dtype)
-    errors = []
-    for trip in range(4):
+    errors, colds = [], []
+    for trip in range(trips):
         codec.encode([0, 1, 2, 3], [0, 1, 2, 3] if trip == 0 else [4, 5, 6, 7])
         codec.decode([4, 5, 6, 7], [0, 1, 2, 3])
+        colds.append(codec.cold[: 4 * codec.cold_page_bytes].clone())
         errors.append(sum(_nmse(v.to(codec.dtype), codec.hot[k][4:]) for k, v in values.items()))
+    # A NaN would slip through max() below, and inf <= inf holds.
+    assert all(math.isfinite(error) for error in errors), errors
     assert max(errors) <= errors[0] * (1 + limit), errors
+    assert all(torch.equal(colds[trip], colds[trip - 2]) for trip in range(trips - 8, trips)), [
+        trip for trip in range(2, trips) if not torch.equal(colds[trip], colds[trip - 2])
+    ]
 
 
 @requires_cuda
@@ -436,8 +451,10 @@ def test_skip_rope_quantization_keeps_rope_bytes(pretrained_config, roles, head_
 
 @requires_cuda
 @pytest.mark.parametrize("bits", (4, 3.5))
-def test_deepseek_v4_csa_rows_quantize_nope_and_keep_rope_and_indexer(bits):
-    """448 NoPE values of each CSA row are quantized; RoPE, indexer and SWA bytes are not."""
+@pytest.mark.parametrize("skip_rope", (False, True))
+def test_deepseek_v4_csa_rows_follow_skip_rope_and_keep_the_indexer(bits, skip_rope):
+    """CSA rows are quantized whole, or their 448 NoPE values with skip_rope_quantization (RoPE
+    bytes kept); indexer and SWA bytes are never quantized."""
 
     cache_config = SimpleNamespace(
         tokens_per_block=128,
@@ -454,7 +471,9 @@ def test_deepseek_v4_csa_rows_quantize_nope_and_keep_rope_and_indexer(bits):
             ),
         ),
     )
-    provider = _provider(bits, pretrained_config=SimpleNamespace(model_type="deepseek_v4"))
+    provider = _provider(
+        bits, pretrained_config=SimpleNamespace(model_type="deepseek_v4"), skip_rope=skip_rope
+    )
     layers = {
         1: {"deepseek_v4_compress": (1, 32, 512), "deepseek_v4_indexer_compress": (1, 32, 34)}
     }
@@ -475,8 +494,13 @@ def test_deepseek_v4_csa_rows_quantize_nope_and_keep_rope_and_indexer(bits):
     restored = _round_trip(codec, values)
     row = values[(1, "deepseek_v4_compress")].to(codec.dtype)
     out = restored[(1, "deepseek_v4_compress")]
-    assert torch.equal(out[..., 448:].view(torch.uint8), row[..., 448:].view(torch.uint8))
-    assert _nmse(row[..., :448], out[..., :448]) < 1.15 * PAPER_MSE[3]
+    quantized = 448 if skip_rope else 512
+    (layout,) = (b for b in codec.state.layer_layouts[1].buffers if b.quantized_range_elements)
+    assert (layout.quantized_range_start, layout.quantized_range_elements) == (0, quantized)
+    assert torch.equal(
+        out[..., quantized:].view(torch.uint8), row[..., quantized:].view(torch.uint8)
+    )
+    assert _nmse(row[..., :quantized], out[..., :quantized]) < 1.15 * PAPER_MSE[3]
     indexer = values[(1, "deepseek_v4_indexer_compress")].to(codec.dtype)
     assert torch.equal(
         restored[(1, "deepseek_v4_indexer_compress")].view(torch.uint8), indexer.view(torch.uint8)
@@ -484,7 +508,7 @@ def test_deepseek_v4_csa_rows_quantize_nope_and_keep_rope_and_indexer(bits):
 
 
 @requires_cuda
-@pytest.mark.parametrize("runtime", ("fp16", "fp8"))
+@pytest.mark.parametrize("runtime", ("fp16", _FP8))
 def test_mixed_head_dims_and_runtime_dtypes(runtime):
     """One lifecycle with layers of two head dims decodes into the same runtime dtype."""
 
@@ -540,6 +564,14 @@ def test_large_shuffled_batch_matches_page_by_page_encoding():
     for chunk in range(0, pages, 512):
         codec.encode(destination[chunk : chunk + 512], shuffle[chunk : chunk + 512])
     assert torch.equal(codec.cold, batched)
+    # Cold page destination[i] holds slot shuffle[i]: decoding it back into that slot must give
+    # every vector its own reconstruction, not another slot's (an error of about 2).
+    source = codec.hot[(0, "key")][shuffle].double()
+    codec.hot[(0, "key")].zero_()
+    codec.decode(shuffle, destination)
+    restored = codec.hot[(0, "key")][shuffle].double()
+    errors = ((restored - source) ** 2).sum(-1) / (source**2).sum(-1)
+    assert errors.mean() < 1.15 * PAPER_MSE[3] and errors.max() < 0.5, errors.max()
 
 
 @requires_cuda

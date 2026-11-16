@@ -13,7 +13,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-r"""Accuracy of cold-page KV codecs when the shared prompt prefix is served from the cold tier.
+r"""End-to-end smoke test of cold-page KV codecs: answers served from a cold-tier prompt prefix.
+
+The questions are easy and each prefix page goes to the cold tier and back once, so a pass shows
+that decoded cold pages work end to end; it is not evidence of accuracy on real workloads.
 
 Cold-page quantization encodes a KV page only when KVCacheManagerV2 offloads it from the GPU to
 the Host/Disk tier and decodes it when the page is onboarded for block reuse. Per format, in its
