@@ -478,7 +478,10 @@ class RouteCapture:
             else:
                 rid = req.py_request_id
                 layout.extend((rid, begin + off) for off in range(n))
-                self._gen_count.setdefault(rid, 0)
+                # Decode positions restart after the prompt this context phase
+                # prefills; a request paused for recompute re-prefills a prompt
+                # that already holds its generated tokens.
+                self._gen_count[rid] = 0
                 self._had_context = True
                 # Record prompt tokens + prompt_len once, for incremental populate
                 # (finish_forward can then push prompt blocks without the request).
@@ -499,13 +502,14 @@ class RouteCapture:
                 # request state. Under the OVERLAP scheduler the host state lags one
                 # decode step at this hook (its ``_update_requests`` runs AFTER the
                 # forward, py_executor overlap loop), so ``max_beam_num_tokens - 1``
-                # is off by one and EVERY decode route mis-attributes -> KL blows up
-                # (0.0007 -> ~1.0). ``gen_count`` increments exactly once per
-                # processed decode token for this request (dummies excluded), so
-                # ``py_prompt_len + gen_count`` is the true position and is
-                # overlap-safe (and identical to max_beam_num_tokens-1 without
-                # overlap, where 0.0007 was validated).
-                abs_pos = int(getattr(req, "py_prompt_len", 0)) + self._gen_count.get(rid, 0)
+                # is off by one and EVERY decode route would mis-attribute.
+                # ``gen_count`` increments exactly once per processed decode token
+                # since the request's last context phase (dummies excluded), so
+                # ``prompt_len + gen_count`` is the true position and is
+                # overlap-safe. ``prompt_len`` is the live C++ prompt length: a
+                # pause moves the generated tokens into it, while
+                # ``py_prompt_len`` is refreshed only by a pause for recompute.
+                abs_pos = int(req.prompt_len) + self._gen_count.get(rid, 0)
                 layout.append((rid, abs_pos))
                 self._gen_count[rid] = self._gen_count.get(rid, 0) + 1
         self._layout = layout
