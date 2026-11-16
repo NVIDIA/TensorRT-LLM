@@ -710,6 +710,30 @@ class TestParseChatMessageContentPart:
         with pytest.raises(ValueError, match="non-empty 'data' field"):
             parse_chat_message_content_part(part, mm_tracker)
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("grid", [None, [1, 4, 6]])
+    async def test_image_embeds_part_keeps_image_grid(self, mm_tracker, grid):
+        import base64
+        import io
+
+        import torch
+
+        embeds = torch.ones(6, 4)
+        with io.BytesIO() as buf:
+            torch.save(embeds, buf)
+            image_embeds = {"data": base64.b64encode(buf.getvalue()).decode("ascii")}
+        if grid is not None:
+            image_embeds["image_grid_thw"] = grid
+        part = {"type": "image_embeds", "image_embeds": image_embeds}
+
+        item = await parse_chat_message_content_part(part, mm_tracker)["data"]
+
+        if grid is None:
+            torch.testing.assert_close(item, embeds)
+        else:
+            assert item["image_grid_thw"] == grid
+            torch.testing.assert_close(item["mm_embeddings"], embeds)
+
 
 class TestMakeMediaIo:
     """_make_media_io constructs correctly-configured MediaIO instances."""
