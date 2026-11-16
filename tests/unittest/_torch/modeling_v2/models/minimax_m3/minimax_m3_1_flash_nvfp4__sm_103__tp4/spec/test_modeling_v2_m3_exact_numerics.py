@@ -75,7 +75,7 @@ def _stock_accept(logits: torch.Tensor, draft: torch.Tensor):
     """The in-tree greedy strict acceptance (``SpecWorkerBase._sample_and_accept_draft_tokens_base``) of the gathered
     float logits of a decode-only batch, no forcing."""
     md = SimpleNamespace(is_all_greedy_sample=True, is_ragged_verify=False, is_cuda_graph=False)
-    worker = SimpleNamespace(force_num_accepted_tokens=0.0)
+    worker = SimpleNamespace(force_num_accepted_tokens=0.0, fused_sample_accept=False)
     worker._sample_tokens_for_batch = lambda *a: Eagle3OneModelWorker._sample_tokens_for_batch(
         worker, *a
     )
