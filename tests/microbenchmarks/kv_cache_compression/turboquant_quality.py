@@ -8,8 +8,8 @@ into pinned host cold pages through the provider interface and decodes them back
 * the normalized MSE ||x - x_hat||^2 / ||x||^2 for Gaussian vectors, vectors with a few large
   channels (like real K), sparse vectors, one-hot vectors, the all-equal vector, and vectors whose
   norms span 1e-6..1e6 within a Page;
-* for ``prod``, the bias and the variance (times d) of <y, x_hat> - <y, x> for unit x and y;
-* the normalized MSE after one and after four round trips (each re-encoding the decoded Page).
+* the normalized MSE after 1, 4 and 16 round trips, each re-encoding the decoded Page as an
+  onboarded Page that is offloaded again would be.
 
 Run on one GPU::
 
@@ -27,8 +27,9 @@ from tensorrt_llm.llmapi.llm_args import ColdPageQuantizationCompressionConfig, 
 from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig, BufferConfig
 
 DIM, HEADS, TOKENS, PAGES = 128, 8, 32, 16
-SETTINGS = [("mse", b) for b in (2, 2.5, 3, 3.5, 4)] + [("prod", b) for b in (2, 3, 4)]
+BITS = (2, 2.5, 3, 3.5, 4)
 INPUTS = ("gaussian", "outliers", "sparse", "one_hot", "constant", "mixed_norms")
+TRIPS = (1, 4, 16)
 
 
 def _manager(config):
@@ -150,39 +151,26 @@ def _inputs(kind, generator):
     return x
 
 
-def _inner_products(codec, generator):
-    x = _inputs("outliers", generator)
-    x /= x.norm(dim=-1, keepdim=True)
-    codec.round_trips(x, 1)
-    y = torch.randn(x.shape, generator=generator, device="cuda", dtype=torch.float64)
-    y /= y.norm(dim=-1, keepdim=True)
-    error = ((codec.hot["k"][PAGES:].double() - x.to(torch.bfloat16).double()) * y).sum(-1)
-    return float(error.mean()), float(error.var()) * DIM
-
-
 def main():
     rows = []
-    for mode, bits in SETTINGS + [("nvfp4", None)]:
-        if mode == "nvfp4":
+    for fmt, bits in [("turboquant", b) for b in BITS] + [("nvfp4", None)]:
+        if fmt == "nvfp4":
             config = ColdPageQuantizationCompressionConfig(quant="nvfp4")
         else:
-            config = ColdPageQuantizationCompressionConfig(
-                quant="turboquant", turboquant_bits=bits, turboquant_mode=mode
-            )
+            config = ColdPageQuantizationCompressionConfig(quant="turboquant", turboquant_bits=bits)
         codec = _Codec(_manager(config))
         generator = torch.Generator(device="cuda").manual_seed(0)
         errors = [codec.round_trips(_inputs(kind, generator), 1)[0] for kind in INPUTS]
-        bias, variance = _inner_products(codec, generator) if mode != "mse" else (None, None)
-        trips = codec.round_trips(_inputs("outliers", generator), 4)
-        rows.append((mode, bits, errors, bias, variance, trips[0], trips[-1]))
-    print("| mode | bits | " + " | ".join(INPUTS) + " | IP bias | IP var x d | 1 trip | 4 trips |")
-    print("|---|---|" + "---|" * (len(INPUTS) + 4))
-    for mode, bits, errors, bias, variance, first, last in rows:
-        ip = (f"{bias:+.1e} | {variance:.3f}") if bias is not None else "- | -"
+        trips = codec.round_trips(_inputs("outliers", generator), max(TRIPS))
+        rows.append((fmt, bits, errors, [trips[n - 1] for n in TRIPS]))
+    trip_columns = " | ".join(f"{n} trip{'s' if n > 1 else ''}" for n in TRIPS)
+    print("| format | bits | " + " | ".join(INPUTS) + f" | {trip_columns} |")
+    print("|---|---|" + "---|" * (len(INPUTS) + len(TRIPS)))
+    for fmt, bits, errors, trips in rows:
         print(
-            f"| {mode} | {bits if bits is not None else 4.5} | "
-            + " | ".join(f"{e:.4f}" for e in errors)
-            + f" | {ip} | {first:.4f} | {last:.4f} |"
+            f"| {fmt} | {bits if bits is not None else 4.5} | "
+            + " | ".join(f"{e:.4f}" for e in errors + trips)
+            + " |"
         )
 
 

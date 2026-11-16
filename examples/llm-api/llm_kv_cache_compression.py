@@ -45,8 +45,7 @@ with compute capability 8.0 or newer.
 python llm_kv_cache_compression.py \
     --compression-method turboquant-cold-page \
     --model Qwen/Qwen3-8B \
-    --turboquant-bits 3 \
-    --turboquant-mode mse
+    --turboquant-bits 3
 ```
 
 TriAttention
@@ -113,7 +112,7 @@ def run_nvfp4_cold_page(model: str) -> None:
     )
 
 
-def run_turboquant_cold_page(model: str, bits: float, mode: str, seed: int | None) -> None:
+def run_turboquant_cold_page(model: str, bits: float, seed: int | None) -> None:
     """Keep active KV unchanged and store Host/Disk Pages with TurboQuant."""
     seed_option = {} if seed is None else {"turboquant_seed": seed}
     _generate(
@@ -126,7 +125,6 @@ def run_turboquant_cold_page(model: str, bits: float, mode: str, seed: int | Non
         ColdPageQuantizationCompressionConfig(
             quant="turboquant",
             turboquant_bits=bits,
-            turboquant_mode=mode,
             **seed_option,
         ),
     )
@@ -172,20 +170,13 @@ def parse_arguments() -> argparse.Namespace:
         type=float,
         choices=(2.0, 2.5, 3.0, 3.5, 4.0),
         default=4.0,
-        help="TurboQuant average bits per value; prod mode supports 2, 3, and 4.",
-    )
-    parser.add_argument(
-        "--turboquant-mode",
-        choices=("mse", "prod"),
-        default="mse",
-        help="mse minimizes reconstruction error; prod makes inner products unbiased.",
+        help="TurboQuant average bits per value.",
     )
     parser.add_argument(
         "--turboquant-seed",
         type=int,
         default=None,
-        help="Seed of the TurboQuant rotation and QJL projection matrices "
-        "(default: the configuration default).",
+        help="Seed of the TurboQuant rotation matrices (default: the configuration default).",
     )
     args = parser.parse_args()
     if args.compression_method == "triattention" and not args.calibration_path:
@@ -199,9 +190,7 @@ def main() -> None:
     if args.compression_method == "nvfp4-cold-page":
         run_nvfp4_cold_page(model)
     elif args.compression_method == "turboquant-cold-page":
-        run_turboquant_cold_page(
-            model, args.turboquant_bits, args.turboquant_mode, args.turboquant_seed
-        )
+        run_turboquant_cold_page(model, args.turboquant_bits, args.turboquant_seed)
     else:
         run_triattention(model, args.calibration_path)
 

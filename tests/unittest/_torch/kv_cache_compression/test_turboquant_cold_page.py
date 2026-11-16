@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""TurboQuant cold-page codec: distortion, unbiasedness, layouts, and the codec contract.
+"""TurboQuant cold-page codec: distortion, layouts, and the codec contract.
 
 Every test drives the provider through the KVCM-facing interface (build_codec_state, configure,
 encode_cold_pages, decode_cold_pages) with raw addresses, pinned host cold pages, and device page
@@ -26,9 +26,8 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import DataType
 from tensorrt_llm.llmapi.llm_args import ColdPageQuantizationCompressionConfig
 from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig, BufferConfig
 
-# Theorem 1 (normalized MSE) and Theorem 2 (inner-product variance times d) at d = 128.
+# Theorem 1 (normalized MSE) at d = 128.
 PAPER_MSE = {2: 0.117, 3: 0.034, 4: 0.0094}
-PAPER_PROD_VARIANCE = {2: 0.56, 3: 0.18, 4: 0.047}
 _DTYPES = {
     "bf16": (torch.bfloat16, DataType.BF16),
     "fp16": (torch.float16, DataType.HALF),
@@ -38,11 +37,10 @@ _DTYPES = {
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 
 
-def _provider(bits=4, mode="mse", seed=0, *, pretrained_config=None, skip_rope=False):
+def _provider(bits=4, seed=0, *, pretrained_config=None, skip_rope=False):
     config = ColdPageQuantizationCompressionConfig(
         quant="turboquant",
         turboquant_bits=bits,
-        turboquant_mode=mode,
         turboquant_seed=seed,
         skip_rope_quantization=skip_rope,
     )
@@ -220,9 +218,6 @@ def test_codebooks_and_matrices_match_the_paper_and_the_seed():
     assert torch.allclose(rotation @ rotation.T, torch.eye(576, dtype=torch.float64), atol=1e-10)
     assert torch.equal(rotation, tq_math.haar_rotation.__wrapped__(0, 576))
     assert not torch.equal(rotation, tq_math.haar_rotation.__wrapped__(1, 576))
-    projection = tq_math.qjl_projection(0, 128)
-    assert torch.equal(projection, tq_math.qjl_projection.__wrapped__(0, 128))
-    assert not torch.equal(projection, tq_math.qjl_projection.__wrapped__(1, 128))
     centroids, thresholds = tq_math.lloyd_max_codebook(128, 3)
     assert torch.allclose(centroids, -centroids.flip(0), atol=1e-9)
     assert torch.all(thresholds[1:] > thresholds[:-1])
@@ -291,42 +286,6 @@ def test_fp16_decode_saturates_at_the_fp16_range():
 
 
 @requires_cuda
-@pytest.mark.parametrize("bits", (2, 3, 4))
-def test_prod_inner_products_are_unbiased(bits):
-    dim, count = 128, 16 * 2 * 32
-    codec = _kv_codec(_provider(bits, "prod"), slots=32, layers=1)
-    generator = torch.Generator(device="cuda").manual_seed(10 + bits)
-    x = _vectors("outlier_channels", (16, 2, 32, dim), generator)
-    x = x / x.norm(dim=-1, keepdim=True)
-    restored = _round_trip(codec, {(0, "key"): x, (0, "value"): x})[(0, "key")].double()
-    y = torch.randn((16, 2, 32, dim), generator=generator, device="cuda", dtype=torch.float64)
-    y = y / y.norm(dim=-1, keepdim=True)
-    error = ((restored - x.to(torch.bfloat16).double()) * y).sum(-1).flatten()
-    assert abs(float(error.mean())) < 4 * float(error.std()) / math.sqrt(count)
-    variance = float(error.var()) * dim
-    assert 0.6 * PAPER_PROD_VARIANCE[bits] < variance < 1.4 * PAPER_PROD_VARIANCE[bits], variance
-
-
-@requires_cuda
-def test_prod_is_unbiased_over_seeds_for_one_pair():
-    """E over the random rotation and projection of <y, x_hat> equals <y, x> (Theorem 2)."""
-
-    generator = torch.Generator(device="cuda").manual_seed(5)
-    x = _vectors("outlier_channels", (1, 1, 32, 128), generator)
-    x = (x / x.norm(dim=-1, keepdim=True)).expand(2, 1, 32, 128).contiguous()
-    y = torch.randn(128, generator=generator, device="cuda", dtype=torch.float64)
-    y /= y.norm()
-    errors = []
-    for seed in range(24):
-        codec = _Codec(_provider(2, "prod", seed), {0: {"key": (1, 32, 128)}}, slots=4, pages=2)
-        restored = _round_trip(codec, {(0, "key"): x})[(0, "key")].double()
-        errors.append(((restored - x.to(torch.bfloat16).double()) @ y)[0, 0])
-    errors = torch.cat(errors)  # 24 seeds x 32 identical vectors
-    per_seed = errors.view(24, 32).mean(1)
-    assert abs(float(per_seed.mean())) < 4 * float(per_seed.std()) / math.sqrt(24)
-
-
-@requires_cuda
 @pytest.mark.parametrize("bits", (2.5, 3.5))
 @pytest.mark.parametrize("kind", ("gaussian", "outlier_channels"))
 def test_fractional_bits_lie_between_their_integer_neighbours(bits, kind):
@@ -346,21 +305,23 @@ def test_fractional_bits_lie_between_their_integer_neighbours(bits, kind):
 
 @requires_cuda
 @pytest.mark.parametrize(
-    "bits,mode,runtime,limit",
+    "bits,runtime,limit",
     (
-        (4, "mse", "bf16", 1e-3),
-        (3, "mse", "fp16", 1e-3),
-        (2, "mse", "bf16", 1e-3),
-        (4, "mse", "fp8", 2e-2),
-        (3.5, "mse", "bf16", 0.1),
-        (2.5, "mse", "bf16", 0.1),
-        (4, "prod", "bf16", None),
+        (4, "bf16", 1e-3),
+        (3, "fp16", 1e-3),
+        (2, "bf16", 1e-3),
+        (4, "fp8", 2e-2),
+        (3.5, "bf16", 0.1),
+        (2.5, "bf16", 0.1),
     ),
 )
-def test_repeated_round_trips(bits, mode, runtime, limit):
-    """Re-encoding a decoded Page: integer-bit mse is stable; prod accumulates fresh QJL noise."""
+def test_repeated_round_trips(bits, runtime, limit):
+    """Re-encoding a decoded Page (an onboarded Page offloaded again) does not accumulate error.
 
-    codec = _kv_codec(_provider(bits, mode), runtime=runtime)
+    Integer bit widths reproduce their codes; fractional bits mostly keep their outlier channels.
+    """
+
+    codec = _kv_codec(_provider(bits), runtime=runtime)
     generator = torch.Generator(device="cuda").manual_seed(4)
     values = {key: _vectors("outlier_channels", (4, 2, 32, 128), generator) for key in codec.hot}
     for key, value in values.items():
@@ -370,36 +331,24 @@ def test_repeated_round_trips(bits, mode, runtime, limit):
         codec.encode([0, 1, 2, 3], [0, 1, 2, 3] if trip == 0 else [4, 5, 6, 7])
         codec.decode([4, 5, 6, 7], [0, 1, 2, 3])
         errors.append(sum(_nmse(v.to(codec.dtype), codec.hot[k][4:]) for k, v in values.items()))
-    if limit is None:
-        assert errors[1] > errors[0]  # documented: prod is unbiased per round trip, not idempotent
-    else:
-        assert max(errors) <= errors[0] * (1 + limit), errors
+    assert max(errors) <= errors[0] * (1 + limit), errors
 
 
 @requires_cuda
 @pytest.mark.parametrize(
-    "bits,mode,code_bits",
-    (
-        (2, "mse", 2),
-        (3, "mse", 3),
-        (4, "mse", 4),
-        (2, "prod", 2),
-        (3, "prod", 3),
-        (4, "prod", 4),
-        (2.5, "mse", 2.5),
-        (3.5, "mse", 3.5),
-    ),
+    "bits,code_bits",
+    ((2, 2), (3, 3), (4, 4), (2.5, 2.5), (3.5, 3.5)),
 )
-def test_cold_page_bytes_stay_within_the_bit_budget(bits, mode, code_bits):
-    codec = _kv_codec(_provider(bits, mode), heads=8, layers=2)
+def test_cold_page_bytes_stay_within_the_bit_budget(bits, code_bits):
+    codec = _kv_codec(_provider(bits), heads=8, layers=2)
     vectors, elements = 2 * 2 * 8 * 32, 2 * 2 * 8 * 32 * 128
     side_bits = (codec.cold_page_bytes * 8 - code_bits * elements) / vectors
     assert 0 < side_bits <= 64, side_bits
 
 
 @requires_cuda
-@pytest.mark.parametrize("mode", ("mse", "prod"))
-def test_encoding_is_deterministic_and_seeded(mode):
+@pytest.mark.parametrize("bits", (3, 2.5))
+def test_encoding_is_deterministic_and_seeded(bits):
     generator = torch.Generator(device="cuda").manual_seed(6)
     values = {
         key: _vectors("outlier_channels", (4, 2, 32, 128), generator)
@@ -407,7 +356,7 @@ def test_encoding_is_deterministic_and_seeded(mode):
     }
     blobs = []
     for seed in (0, 0, 1):
-        codec = _kv_codec(_provider(3, mode, seed=seed))
+        codec = _kv_codec(_provider(bits, seed=seed))
         _round_trip(codec, values)
         blobs.append(codec.cold.clone())
         codec.encode([0, 1, 2, 3], [0, 1, 2, 3])
@@ -417,19 +366,19 @@ def test_encoding_is_deterministic_and_seeded(mode):
 
 
 @requires_cuda
-@pytest.mark.parametrize("bits,mode", ((4, "mse"), (2.5, "mse"), (3, "prod")))
-def test_mla_latent_with_a_lossless_auxiliary_buffer(bits, mode):
+@pytest.mark.parametrize("bits", (4, 3, 2.5))
+def test_mla_latent_with_a_lossless_auxiliary_buffer(bits):
     """A 576-wide key-only latent (not a power of two) plus raw DSA index keys."""
 
     layers = {layer: {"key": (1, 32, 576), "index_key": (1, 32, 132)} for layer in range(3)}
-    codec = _Codec(_provider(bits, mode), layers, num_kv_heads=(1,) * 3, head_dim=(576,) * 3)
+    codec = _Codec(_provider(bits), layers, num_kv_heads=(1,) * 3, head_dim=(576,) * 3)
     generator = torch.Generator(device="cuda").manual_seed(7)
     values = {
         key: _vectors("outlier_channels", (4, *codec.hot[key].shape[1:]), generator)
         for key in codec.hot
     }
     restored = _round_trip(codec, values)
-    bound = {4: 1.15 * PAPER_MSE[4], 2.5: PAPER_MSE[2], 3: 0.25}[bits]
+    bound = {4: 1.15 * PAPER_MSE[4], 3: 1.15 * PAPER_MSE[3], 2.5: PAPER_MSE[2]}[bits]
     for (layer, role), value in values.items():
         if role == "index_key":
             assert torch.equal(

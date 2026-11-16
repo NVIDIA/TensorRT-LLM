@@ -27,9 +27,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig, Buffe
 
 pytestmark = pytest.mark.cpu_only
 
-_SUPPORTED_SETTINGS = [("mse", bits) for bits in (2, 2.5, 3, 3.5, 4)] + [
-    ("prod", bits) for bits in (2, 3, 4)
-]
+_SUPPORTED_BITS = (2, 2.5, 3, 3.5, 4)
 
 
 @pytest.fixture(autouse=True)
@@ -81,7 +79,7 @@ def _admit(
 
 def test_defaults_and_dumps_keep_each_format_to_its_own_options() -> None:
     turboquant = _turboquant()
-    assert (turboquant.turboquant_bits, turboquant.turboquant_mode) == (4.0, "mse")
+    assert turboquant.turboquant_bits == 4.0
     assert type(turboquant.turboquant_bits) is float
     assert turboquant.turboquant_seed == 5
     assert not turboquant.skip_rope_quantization
@@ -94,7 +92,6 @@ def test_defaults_and_dumps_keep_each_format_to_its_own_options() -> None:
         "mixed_precision_first_n": 0,
         "mixed_precision_last_n": 0,
         "turboquant_bits": 4.0,
-        "turboquant_mode": "mse",
         "turboquant_seed": 5,
     }
     # NVFP4 stays the default format, and its dump holds only the shared and the NVFP4 options.
@@ -111,14 +108,13 @@ def test_defaults_and_dumps_keep_each_format_to_its_own_options() -> None:
     assert ColdPageQuantizationCompressionConfig.model_validate(nvfp4.model_dump()) == nvfp4
 
 
-@pytest.mark.parametrize(("mode", "bits"), _SUPPORTED_SETTINGS)
-def test_supported_settings_parse_from_python_and_yaml_and_round_trip(mode, bits) -> None:
+@pytest.mark.parametrize("bits", _SUPPORTED_BITS)
+def test_supported_settings_parse_from_python_and_yaml_and_round_trip(bits) -> None:
     yaml_options = yaml.safe_load(f"""
 kv_cache_compression_config:
   algorithm: quantization_for_cold_page
   quant: turboquant
   turboquant_bits: {bits}
-  turboquant_mode: {mode}
   turboquant_seed: 7
 """)
     section = yaml_options["kv_cache_compression_config"]
@@ -126,19 +122,15 @@ kv_cache_compression_config:
     assert type(section["turboquant_bits"]) is type(bits)
     serve_args = update_llm_args_with_extra_dict({"model": "/tmp/dummy_model"}, yaml_options)
     configs = (
-        _turboquant(turboquant_bits=bits, turboquant_mode=mode, turboquant_seed=7),
-        _turboquant(turboquant_bits=float(bits), turboquant_mode=mode, turboquant_seed=7),
-        _turboquant(turboquant_bits=np.float32(bits), turboquant_mode=mode, turboquant_seed=7),
+        _turboquant(turboquant_bits=bits, turboquant_seed=7),
+        _turboquant(turboquant_bits=float(bits), turboquant_seed=7),
+        _turboquant(turboquant_bits=np.float32(bits), turboquant_seed=7),
         ColdPageQuantizationCompressionConfig.model_validate(section),
         TorchLlmArgs(**serve_args).kv_cache_compression_config,
     )
     for config in configs:
         assert config == configs[0]
-        assert (config.quant, config.turboquant_mode, config.turboquant_bits) == (
-            "turboquant",
-            mode,
-            bits,
-        )
+        assert (config.quant, config.turboquant_bits) == ("turboquant", bits)
         assert type(config.turboquant_bits) is float
         assert ColdPageQuantizationCompressionConfig.model_validate(config.model_dump()) == config
         assert (
@@ -168,14 +160,8 @@ def test_model_defaults_revalidate_the_dump_of_either_format() -> None:
             ({"quant": "turboquant", "turboquant_bits": bits}, "turboquant_bits must be one of")
             for bits in (1, 5, 2.25, "x", True)
         ),
-        *(
-            (
-                {"quant": "turboquant", "turboquant_mode": "prod", "turboquant_bits": bits},
-                "fractional bit widths require turboquant_mode='mse'",
-            )
-            for bits in (2.5, 3.5)
-        ),
-        ({"quant": "turboquant", "turboquant_mode": "lloyd"}, "turboquant_mode"),
+        # TurboQuant-prod is not offered: re-encoding on every offload compounds its QJL error.
+        ({"quant": "turboquant", "turboquant_mode": "prod"}, "turboquant_mode"),
         ({"quant": "turboquant", "turboquant_seed": -1}, "turboquant_seed"),
         (
             {"quant": "turboquant", "nvfp4_residual_dim": 64},
@@ -188,8 +174,8 @@ def test_model_defaults_revalidate_the_dump_of_either_format() -> None:
         # Explicitly set TurboQuant options are rejected even at their default values.
         ({"turboquant_bits": 4}, "turboquant_bits applies only to quant='turboquant'"),
         (
-            {"quant": "nvfp4", "turboquant_mode": "mse", "turboquant_seed": 0},
-            "turboquant_mode, turboquant_seed apply only to quant='turboquant'",
+            {"quant": "nvfp4", "turboquant_bits": 3, "turboquant_seed": 0},
+            "turboquant_bits, turboquant_seed apply only to quant='turboquant'",
         ),
     ],
 )
@@ -199,19 +185,19 @@ def test_unsupported_settings_are_rejected_at_construction(options, match) -> No
 
 
 @pytest.mark.parametrize(
-    ("bits", "mode", "width", "error", "match"),
+    ("bits", "width", "error", "match"),
     [
-        (4, "mse", 24, ValueError, "divisible by 16"),  # alignment of integer widths
-        (2.5, "mse", 48, ValueError, "divisible by 32"),  # alignment of fractional widths
-        (4, "mse", 560, NotImplementedError, "power-of-two rest"),  # 2 x 256 + 48
-        (4, "mse", 1024, NotImplementedError, "up to 1008"),  # instance size
-        (4, "prod", 752, NotImplementedError, "at most 4 power-of-two pieces"),  # 512+128+64+32+16
+        (4, 24, ValueError, "divisible by 16"),  # alignment of integer widths
+        (2.5, 48, ValueError, "divisible by 32"),  # alignment of fractional widths
+        (4, 560, NotImplementedError, "power-of-two rest"),  # 2 x 256 + 48
+        (4, 1024, NotImplementedError, "fewer than 1024"),  # instance size
+        (4, 496, NotImplementedError, "at most 4 power-of-two pieces"),  # 256+128+64+32+16
     ],
 )
-def test_codec_state_rejects_unsupported_vector_widths(bits, mode, width, error, match) -> None:
+def test_codec_state_rejects_unsupported_vector_widths(bits, width, error, match) -> None:
     """The width rules reject a layout before any kernel is compiled (no GPU needed)."""
     provider = TurboQuantColdPageQuantizationCompression(
-        _turboquant(turboquant_bits=bits, turboquant_mode=mode),
+        _turboquant(turboquant_bits=bits),
         pretrained_config=SimpleNamespace(model_type="llama"),
     )
     slot_bytes = 32 * width * 2  # one KV head, 32 tokens, BF16
