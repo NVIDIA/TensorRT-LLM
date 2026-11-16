@@ -294,6 +294,25 @@ def atom_add_u32(addr, val, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def atom_add_u32_p(addr, val, pred, dflt, *, loc=None, ip=None):
+    # Predicated returning atom.add without a branch, so the atom.adds of a batch issue back to
+    # back; returns dflt where pred == 0.
+    from cutlass.cutlass_dsl import T as _T
+
+    return Uint32(
+        L._asm(
+            _T.i32(),
+            [L._v(addr, loc, ip), L._v(val, loc, ip), L._v(pred, loc, ip), L._v(dflt, loc, ip)],
+            "{\n\t.reg .pred p;\n\tsetp.ne.u32 p, $3, 0;\n\tmov.u32 $0, $4;\n\t@p atom.relaxed.gpu.global.add.u32 $0, "
+            "[$1], $2;\n}",
+            "=r,l,r,r,r",
+            loc,
+            ip,
+        )
+    )
+
+
+@dsl_user_op
 def atom_exch_u64(addr, val, *, loc=None, ip=None):
     # atomic swap of a 64-bit global word (relaxed, gpu scope); returns the old value
     from cutlass.cutlass_dsl import T as _T
@@ -619,6 +638,13 @@ class Dsv4SparseDecodeKernel:
         tszall: bool = False,
         qdb: bool = False,
         dpf: bool = False,
+        early: bool = False,
+        tearly: bool = False,
+        b1l: bool = False,
+        b1l_u: int = 2,
+        b1l_e: bool = True,
+        b1l_pub: bool = False,
+        b1l_upub: int = 2,
     ):
         assert coop, (
             "the protocol spins across CTAs: all 148 CTAs must be co-resident (cooperative launch)"
@@ -741,6 +767,19 @@ class Dsv4SparseDecodeKernel:
         self.qdb = bool(qdb) and self.nrows > 1
         # next row's descriptor / ctx loaded one row ahead in the stream roles (knob dpf)
         self.dpf = bool(dpf) and self.nrows > 1
+        # stream CTAs: row descriptor load first, TMA descriptor prefetch at entry (knob early)
+        self.early = bool(early)
+        # _team_cta: row and window lengths loaded before the barrier setup (knob tearly)
+        self.tearly = bool(tearly)
+        # candidate publish in batches of b1l_u per lane, their histogram atom.adds back to back and
+        # the first batch before the count barrier (b1l_e); at 1 row and on the last row (knob b1l)
+        self.b1l = bool(b1l)
+        self.b1l_u = int(b1l_u)
+        self.b1l_e = bool(b1l_e)
+        # the same in the publisher warps of the earlier rows, b1l_upub per lane (knob b1l_pub)
+        self.b1l_pub = bool(b1l_pub)
+        self.b1l_upub = int(b1l_upub)
+        assert 1 <= self.b1l_u <= 4 and 1 <= self.b1l_upub <= 4, "b1l_u / b1l_upub in 1..4"
         self.num_q_stages = 2 if self.qdb else 1
         if self.qdb:
             # Q 2 x 8 KB, W 2 x 256 B, then the scales, over the single-row logits / block-table buffers (unused for
@@ -1246,27 +1285,37 @@ class Dsv4SparseDecodeKernel:
         if tidx == 0:
             gw1, gw2, gw3 = self._entry_loads(ws)
         desc_lane = mDesc[cta * 32 + lane]
-        s0 = cute.arch.shuffle_sync(desc_lane, 0)
-        ns = cute.arch.shuffle_sync(desc_lane, 1)
-        n_desc = cute.arch.shuffle_sync(desc_lane, 2)
-        ord0 = cute.arch.shuffle_sync(desc_lane, 3)
-        ord1 = cute.arch.shuffle_sync(desc_lane, 4)
-        nwin = cute.arch.shuffle_sync(desc_lane, 5)
-        n = n_desc
-        SMP, SS2, TGT, TGT2 = L.gvr_ladder(
-            n,
-            Int32(K_TOP),
-            Int32(PLAN["aim_base"]),
-            Int32(PLAN["sfac"]),
-            Int32(PLAN["amin"]),
-            Int32(PLAN["sd_en"]),
-            PLAN["r_const"],
-            PLAN["scap"],
-        )
-        wst = Int32(8) * SS2
-        t_lo = s0 * Int32(SPLIT_TOK)
-        nwin0 = (nwin + Int32(1)) // Int32(2)
-        nwin1 = nwin // Int32(2)
+        if cutlass.const_expr(self.early):
+            # The descriptor load above stays the first global load and the TMA warps prefetch their
+            # descriptors now, so both round trips overlap the barrier init and bar.sync 0.
+            if warp_idx == 8 or warp_idx == 9:
+                cpasync.prefetch_descriptor(tma_atom_a)
+                cpasync.prefetch_descriptor(tma_atom_s)
+                if warp_idx == 8:
+                    cpasync.prefetch_descriptor(tma_atom_b)
+                    cpasync.prefetch_descriptor(tma_atom_w)
+        if cutlass.const_expr(self.nrows > 1 or not self.early):
+            s0 = cute.arch.shuffle_sync(desc_lane, 0)
+            ns = cute.arch.shuffle_sync(desc_lane, 1)
+            n_desc = cute.arch.shuffle_sync(desc_lane, 2)
+            ord0 = cute.arch.shuffle_sync(desc_lane, 3)
+            ord1 = cute.arch.shuffle_sync(desc_lane, 4)
+            nwin = cute.arch.shuffle_sync(desc_lane, 5)
+            n = n_desc
+            SMP, SS2, TGT, TGT2 = L.gvr_ladder(
+                n,
+                Int32(K_TOP),
+                Int32(PLAN["aim_base"]),
+                Int32(PLAN["sfac"]),
+                Int32(PLAN["amin"]),
+                Int32(PLAN["sd_en"]),
+                PLAN["r_const"],
+                PLAN["scap"],
+            )
+            wst = Int32(8) * SS2
+            t_lo = s0 * Int32(SPLIT_TOK)
+            nwin0 = (nwin + Int32(1)) // Int32(2)
+            nwin1 = nwin // Int32(2)
         storage_bar = cute.recast_ptr(arena + S_OFF_BAR, dtype=Int64)
         misc_i32 = cute.recast_ptr(arena + S_OFF_MISC, dtype=Int32)
         kv_mbar_0 = storage_bar
@@ -1286,6 +1335,12 @@ class Dsv4SparseDecodeKernel:
         q_free = storage_bar + (S_BAR_T + 1)
         if tidx == 0:
             prims.mbarrier_init(tbar, 1)
+            if cutlass.const_expr(self.early and self.nrows == 1):
+                # A zero that the descriptor shuffles read back (volatile) after bar.sync 0.
+                sts_volatile_u32(
+                    Int32(cute.recast_ptr(arena + S_OFF_MISC + 60 * 4, dtype=Int32).toint()),
+                    Int32(0),
+                )
             if cutlass.const_expr(self.nrows > 1):
                 # the Q / W stage is free again once both MMA groups' last MMAs of a row completed (tcgen05.commit)
                 # and the math warps read the row's weights
@@ -1470,11 +1525,34 @@ class Dsv4SparseDecodeKernel:
         )
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
         if cutlass.const_expr(self.nrows == 1):
+            if cutlass.const_expr(self.early):
+                # At 1 row the descriptor fields are read after bar.sync 0 and only the math warps
+                # (the users of SMP / SS2) run the ladder. Adding the volatile zero keeps the
+                # shuffles below the barrier.
+                desc_lane = desc_lane + lds_volatile_u32(
+                    Int32(cute.recast_ptr(arena + S_OFF_MISC + 60 * 4, dtype=Int32).toint())
+                )
+                s0 = cute.arch.shuffle_sync(desc_lane, 0)
+                ns = cute.arch.shuffle_sync(desc_lane, 1)
+                n_desc = cute.arch.shuffle_sync(desc_lane, 2)
+                ord0 = cute.arch.shuffle_sync(desc_lane, 3)
+                ord1 = cute.arch.shuffle_sync(desc_lane, 4)
+                nwin = cute.arch.shuffle_sync(desc_lane, 5)
+                n = n_desc
+                SMP = Int32(0)
+                SS2 = Int32(1)
+                TGT = Int32(0)
+                TGT2 = Int32(0)
+                wst = Int32(8)
+                t_lo = s0 * Int32(SPLIT_TOK)
+                nwin0 = (nwin + Int32(1)) // Int32(2)
+                nwin1 = nwin // Int32(2)
             if warp_idx == 8 or warp_idx == 9:
                 cute.arch.warpgroup_reg_dealloc(24)
                 grp = warp_idx - 8
-                cpasync.prefetch_descriptor(tma_atom_a)
-                cpasync.prefetch_descriptor(tma_atom_s)
+                if cutlass.const_expr(not self.early):
+                    cpasync.prefetch_descriptor(tma_atom_a)
+                    cpasync.prefetch_descriptor(tma_atom_s)
                 pol = None
                 if cutlass.const_expr(self.policy != CP.POL_NONE):
                     pol = CP.make_l2_policy(self.policy)
@@ -1486,8 +1564,9 @@ class Dsv4SparseDecodeKernel:
                 if cutlass.const_expr(self.wdelay > 0):
                     t_ref = Int64(L.gtimer())
                 if grp == 0:
-                    cpasync.prefetch_descriptor(tma_atom_b)
-                    cpasync.prefetch_descriptor(tma_atom_w)
+                    if cutlass.const_expr(not self.early):
+                        cpasync.prefetch_descriptor(tma_atom_b)
+                        cpasync.prefetch_descriptor(tma_atom_w)
                     q_pipeline.producer_acquire(q_prod_state)
                     q_bar = q_pipeline.producer_get_barrier(q_prod_state)
                     cute.copy(
@@ -1649,6 +1728,19 @@ class Dsv4SparseDecodeKernel:
                 tCtAcc_base_1 = cute.make_tensor(
                     tmem_ptr + cols_per_group, tCtAcc_fake_staged.layout
                 )
+                if cutlass.const_expr(self.early):
+                    # The board-sample ladder, in the math warps only.
+                    SMP, SS2, TGT, TGT2 = L.gvr_ladder(
+                        n,
+                        Int32(K_TOP),
+                        Int32(PLAN["aim_base"]),
+                        Int32(PLAN["sfac"]),
+                        Int32(PLAN["amin"]),
+                        Int32(PLAN["sd_en"]),
+                        PLAN["r_const"],
+                        PLAN["scap"],
+                    )
+                    wst = Int32(8) * SS2
                 local_tidx = tidx % 128
                 cC = cute.make_identity_tensor(epi_sub_mn)
                 if tidx == 0:
@@ -1810,6 +1902,23 @@ class Dsv4SparseDecodeKernel:
                                 cnt1,
                                 Tv,
                             )
+                b1e_ = None
+                if cutlass.const_expr(self.b1l and self.b1l_e):
+                    # Bins and histogram atom.adds of each warp's first U x 32 candidates now (T is
+                    # known), so their round trip overlaps the stream-end barrier, the TMEM free and
+                    # the prefix.
+                    cute.arch.sync_warp()
+                    b1e_ = self._b1l_issue(
+                        sSub,
+                        wsub,
+                        cnt1,
+                        tidx % Int32(32),
+                        Tv,
+                        L.f32_of_u32(Uint32(s_tv[1])),
+                        mHist.iterator.toint(),
+                        self.b1l_u,
+                        SUBCAP,
+                    )
                 prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
                 L.bar(3, 256)
                 prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
@@ -1841,6 +1950,7 @@ class Dsv4SparseDecodeKernel:
                     mCtl,
                     Tv,
                     s_tv,
+                    b1e_=b1e_,
                 )
             else:
                 cute.arch.warpgroup_reg_dealloc(24)
@@ -1866,16 +1976,22 @@ class Dsv4SparseDecodeKernel:
             if warp_idx == 8 or warp_idx == 9:
                 cute.arch.warpgroup_reg_dealloc(24)
                 grp = warp_idx - 8
-                cpasync.prefetch_descriptor(tma_atom_a)
-                cpasync.prefetch_descriptor(tma_atom_s)
+                if cutlass.const_expr(not self.early):
+                    cpasync.prefetch_descriptor(tma_atom_a)
+                    cpasync.prefetch_descriptor(tma_atom_s)
                 pol = None
                 if cutlass.const_expr(self.policy != CP.POL_NONE):
                     pol = CP.make_l2_policy(self.policy)
                 bt_cols = cute.size(mBlockTable, mode=[1])
-                cpasync.prefetch_descriptor(tma_atom_b)
-                cpasync.prefetch_descriptor(tma_atom_w)
+                if cutlass.const_expr(not self.early):
+                    cpasync.prefetch_descriptor(tma_atom_b)
+                    cpasync.prefetch_descriptor(tma_atom_w)
                 if cutlass.const_expr(self.dpf):
-                    dnx_ = mDesc[cta * Int32(32) + lane]
+                    if cutlass.const_expr(self.early):
+                        # Row 0's descriptor is the entry load.
+                        dnx_ = desc_lane
+                    else:
+                        dnx_ = mDesc[cta * Int32(32) + lane]
                 else:
                     dnx_ = Int32(0)
                 for r_ in cutlass.range(self.nrows, unroll=1):
@@ -1892,7 +2008,14 @@ class Dsv4SparseDecodeKernel:
                             + lane
                         ]
                     else:
-                        desc_lane = mDesc[(r_ * Int32(self.num_sms) + cta) * Int32(32) + lane]
+                        if cutlass.const_expr(self.early):
+                            # Row 0 keeps the entry load (issued before bar.sync 0).
+                            if r_ > Int32(0):
+                                desc_lane = mDesc[
+                                    (r_ * Int32(self.num_sms) + cta) * Int32(32) + lane
+                                ]
+                        else:
+                            desc_lane = mDesc[(r_ * Int32(self.num_sms) + cta) * Int32(32) + lane]
                     s0 = cute.arch.shuffle_sync(desc_lane, 0)
                     ns = cute.arch.shuffle_sync(desc_lane, 1)
                     n_desc = cute.arch.shuffle_sync(desc_lane, 2)
@@ -2505,6 +2628,8 @@ class Dsv4SparseDecodeKernel:
                             mStR_,
                             nth=256,
                             bid=3,
+                            b1u=(self.b1l_u if self.b1l else 0),
+                            b1e=self.b1l_e,
                         )
                         if tidx == 0:
                             rstl_ = cute.make_tensor(
@@ -2654,6 +2779,8 @@ class Dsv4SparseDecodeKernel:
                             nth=96,
                             bid=4,
                             pf=self.ppref,
+                            b1u=(self.b1l_upub if self.b1l_pub else 0),
+                            b1e=False,
                         )
                         if live != Int32(0):
                             if pid == Int32(0):
@@ -2909,6 +3036,96 @@ class Dsv4SparseDecodeKernel:
         return self._w(ws, W_CNT) + Int64(slot * Int32(160) + c) * Int64(8)
 
     @cute.jit
+    def _b1l_issue(
+        self,
+        lst,
+        base,
+        cnt,
+        k0,
+        Tv,
+        bscale,
+        ghist,
+        U: cutlass.Constexpr[int],
+        cap: cutlass.Constexpr[int],
+    ):
+        # Entries k0 + 32 j (j < U) of a lane-strided per-warp candidate list: their bins and U
+        # predicated returning histogram atom.adds, issued back to back. Returns (entry, bin,
+        # ordinal) per entry; ordinal BUCKET_CAP means no bucket store (k >= cnt, or bscale <= 0).
+        hon = cutlass.select_(bscale > Float32(0.0), Int32(1), Int32(0))
+        out = []
+        for j in cutlass.range_constexpr(U):
+            kj = k0 + Int32(32 * j)
+            e_ = Uint64(lst[base + cutlass.min(kj, Int32(cap - 1))])
+            bq_ = L._vbin(e_, Tv, bscale, NB_INITIAL)
+            pj = cutlass.select_(kj < cnt, hon, Int32(0))
+            o_ = atom_add_u32_p(ghist + Int64(bq_) * Int64(4), Uint32(1), pj, Uint32(BUCKET_CAP))
+            out.append(e_)
+            out.append(bq_)
+            out.append(o_)
+        return out
+
+    @cute.jit
+    def _b1l_issue_flat(
+        self,
+        sList,
+        pre,
+        tot,
+        k0,
+        Tv,
+        bscale,
+        ghist,
+        U: cutlass.Constexpr[int],
+        nth: cutlass.Constexpr[int],
+        NW: cutlass.Constexpr[int],
+        LCAP: cutlass.Constexpr[int],
+    ):
+        # Entries k0 + nth j (j < U) of the CTA-wide flattened list (warp wk = the last warp with
+        # pre[wk] <= k, index k - pre[wk] of its scan list): bins and predicated atom.adds back to
+        # back.
+        hon = cutlass.select_(bscale > Float32(0.0), Int32(1), Int32(0))
+        out = []
+        for j in cutlass.range_constexpr(U):
+            kj = k0 + Int32(nth * j)
+            wk = Int32(0)
+            bk = Int32(0)
+            for w_ in cutlass.range_constexpr(1, NW):
+                wk = cutlass.select_(kj >= pre[w_], Int32(w_), wk)
+                bk = cutlass.select_(kj >= pre[w_], pre[w_], bk)
+            e_ = Uint64(sList[cutlass.min(wk * Int32(LCAP) + kj - bk, Int32(NW * LCAP - 1))])
+            bq_ = L._vbin(e_, Tv, bscale, NB_INITIAL)
+            pj = cutlass.select_(kj < tot, hon, Int32(0))
+            o_ = atom_add_u32_p(ghist + Int64(bq_) * Int64(4), Uint32(1), pj, Uint32(BUCKET_CAP))
+            out.append(e_)
+            out.append(bq_)
+            out.append(o_)
+        return out
+
+    @cute.jit
+    def _b1l_store(
+        self,
+        st_,
+        k0,
+        cnt,
+        rbase,
+        pre,
+        bucket_base,
+        U: cutlass.Constexpr[int],
+        step: cutlass.Constexpr[int] = 32,
+    ):
+        # Stores of one batch of _b1l_issue / _b1l_issue_flat: the packet entries (position pre +
+        # k), then the bucket entries (each waits for its atom.add).
+        for j in cutlass.range_constexpr(U):
+            kj = k0 + Int32(step * j)
+            if kj < cnt:
+                L.st_g_u64(rbase + Int64(pre + kj) * Int64(8), st_[3 * j])
+        for j in cutlass.range_constexpr(U):
+            if st_[3 * j + 2] < Uint32(BUCKET_CAP):
+                L.st_g_u64(
+                    self._bucket_addr(bucket_base, st_[3 * j + 1], Int32(st_[3 * j + 2])),
+                    st_[3 * j],
+                )
+
+    @cute.jit
     def _stream_publish(
         self,
         cta,
@@ -2934,6 +3151,7 @@ class Dsv4SparseDecodeKernel:
         Tv,
         s_tv,
         serve: cutlass.Constexpr[bool] = True,
+        b1e_=None,
     ):
         lane = tidx % 32
         wid = tidx // 32
@@ -2955,16 +3173,28 @@ class Dsv4SparseDecodeKernel:
         bscale = L.f32_of_u32(Uint32(s_tv[1]))
         ghist = mHist.iterator.toint()
         bucket_base = mRegion.iterator.toint()
-        k = lane
-        while k < cnt1:
-            e = Uint64(sSub[wsub + k])
-            L.st_g_u64(rbase + Int64(pre + k) * Int64(8), e)
-            if bscale > Float32(0.0):
-                bq = L._vbin(e, Tv, bscale, NB_INITIAL)
-                ordinal = atom_add_u32(ghist + Int64(bq) * Int64(4), Uint32(1))
-                if ordinal < Uint32(BUCKET_CAP):
-                    L.st_g_u64(self._bucket_addr(bucket_base, bq, Int32(ordinal)), e)
-            k = k + Int32(32)
+        if cutlass.const_expr(self.b1l):
+            # The early batch's stores (its atom.adds were issued before the stream-end barrier),
+            # then the warp's remaining candidates in batches of U.
+            k = lane
+            if cutlass.const_expr(b1e_ is not None):
+                self._b1l_store(b1e_, lane, cnt1, rbase, pre, bucket_base, self.b1l_u)
+                k = lane + Int32(32 * self.b1l_u)
+            while k < cnt1:
+                st_ = self._b1l_issue(sSub, wsub, cnt1, k, Tv, bscale, ghist, self.b1l_u, SUBCAP)
+                self._b1l_store(st_, k, cnt1, rbase, pre, bucket_base, self.b1l_u)
+                k = k + Int32(32 * self.b1l_u)
+        else:
+            k = lane
+            while k < cnt1:
+                e = Uint64(sSub[wsub + k])
+                L.st_g_u64(rbase + Int64(pre + k) * Int64(8), e)
+                if bscale > Float32(0.0):
+                    bq = L._vbin(e, Tv, bscale, NB_INITIAL)
+                    ordinal = atom_add_u32(ghist + Int64(bq) * Int64(4), Uint32(1))
+                    if ordinal < Uint32(BUCKET_CAP):
+                        L.st_g_u64(self._bucket_addr(bucket_base, bq, Int32(ordinal)), e)
+                k = k + Int32(32)
         if cutlass.const_expr(self.bulk):
             if tidx == 255:
                 if tot & Int32(1) != Int32(0):
@@ -3203,6 +3433,8 @@ class Dsv4SparseDecodeKernel:
         nth: cutlass.Constexpr[int],
         bid: cutlass.Constexpr[int],
         pf: cutlass.Constexpr[bool] = True,
+        b1u: cutlass.Constexpr[int] = 0,
+        b1e: cutlass.Constexpr[bool] = False,
     ):
         # one row's first-round publish by nth threads (named barrier bid): vectorized scan of the row's 2048
         # logits in 128-position chunks (round robin over the warps; positions < n via ntok), per-warp SMEM lists of the
@@ -3242,6 +3474,12 @@ class Dsv4SparseDecodeKernel:
                             | Uint64(L.u32_of_f32(vals_[c_][e_]))
                         )
                     cnt = cnt + Int32(cute.arch.popc(bm))
+        b1st_ = None
+        if cutlass.const_expr(b1u > 0 and b1e):
+            # Bins and histogram atom.adds of this warp's first b1u x 32 candidates before the count
+            # barrier and the prefix, so their round trip overlaps them.
+            cute.arch.sync_warp()
+            b1st_ = self._b1l_issue(sList, lw, cnt, lane, Tv, bscale, ghist, b1u, LCAP)
         if lane == Int32(0):
             s_wc[wid] = cnt
         L.bar(bid, nth)
@@ -3253,22 +3491,44 @@ class Dsv4SparseDecodeKernel:
         if live != Int32(0):
             if tid == Int32(0):
                 self._stamp(mStamps, cta, 40)
-        k = tid
-        while k < tot:
-            wk = Int32(0)
-            bk = Int32(0)
+        if cutlass.const_expr(b1u > 0 and b1e):
+            # Each warp publishes its own scan list (lane-strided) from the warp's prefix on, which
+            # keeps the flattened packet order: the early batch's stores, then batches of b1u.
+            myp = Int32(0)
             for w_ in cutlass.range_constexpr(1, NW):
-                if k >= pre[w_]:
-                    wk = Int32(w_)
-                    bk = pre[w_]
-            e = Uint64(sList[wk * Int32(LCAP) + k - bk])
-            L.st_g_u64(rbase + Int64(k) * Int64(8), e)
-            if bscale > Float32(0.0):
-                bq = L._vbin(e, Tv, bscale, NB_INITIAL)
-                ordinal = atom_add_u32(ghist + Int64(bq) * Int64(4), Uint32(1))
-                if ordinal < Uint32(BUCKET_CAP):
-                    L.st_g_u64(self._bucket_addr(bucket_base, bq, Int32(ordinal)), e)
-            k = k + Int32(nth)
+                myp = cutlass.select_(wid >= Int32(w_), pre[w_], myp)
+            self._b1l_store(b1st_, lane, cnt, rbase, myp, bucket_base, b1u)
+            k = lane + Int32(32 * b1u)
+            while k < cnt:
+                st_ = self._b1l_issue(sList, lw, cnt, k, Tv, bscale, ghist, b1u, LCAP)
+                self._b1l_store(st_, k, cnt, rbase, myp, bucket_base, b1u)
+                k = k + Int32(32 * b1u)
+        elif cutlass.const_expr(b1u > 0):
+            # The CTA-wide flattened order in batches of b1u.
+            k = tid
+            while k < tot:
+                st_ = self._b1l_issue_flat(
+                    sList, pre, tot, k, Tv, bscale, ghist, b1u, nth, NW, LCAP
+                )
+                self._b1l_store(st_, k, tot, rbase, Int32(0), bucket_base, b1u, nth)
+                k = k + Int32(nth * b1u)
+        else:
+            k = tid
+            while k < tot:
+                wk = Int32(0)
+                bk = Int32(0)
+                for w_ in cutlass.range_constexpr(1, NW):
+                    if k >= pre[w_]:
+                        wk = Int32(w_)
+                        bk = pre[w_]
+                e = Uint64(sList[wk * Int32(LCAP) + k - bk])
+                L.st_g_u64(rbase + Int64(k) * Int64(8), e)
+                if bscale > Float32(0.0):
+                    bq = L._vbin(e, Tv, bscale, NB_INITIAL)
+                    ordinal = atom_add_u32(ghist + Int64(bq) * Int64(4), Uint32(1))
+                    if ordinal < Uint32(BUCKET_CAP):
+                        L.st_g_u64(self._bucket_addr(bucket_base, bq, Int32(ordinal)), e)
+                k = k + Int32(nth)
         if tid == Int32(nth - 1):
             if tot & Int32(1) != Int32(0):
                 L.st_g_u64(
@@ -3687,6 +3947,10 @@ class Dsv4SparseDecodeKernel:
         s_fin = _ptr(arena, T_OFF_FIN, Float32)
         s_idx = _ptr(arena, T_OFF_IDX, Int32)
         misc = _ptr(arena, T_OFF_MISC, Int32)
+        if cutlass.const_expr(self.tearly):
+            # The row and window lengths are loaded at entry, before the barrier setup.
+            swa_len_e_ = mSwaLens[0]
+            n_e_ = mDesc[2]
         gw1 = Uint64(0)
         gw2 = Uint64(0)
         gw3 = Uint64(0)
@@ -3757,8 +4021,12 @@ class Dsv4SparseDecodeKernel:
         tr = None
         if cutlass.const_expr(self.stamps):
             tr = mStamps.iterator.toint() + Int64(cta) * Int64(NSTAMP * 8)
-        swa_len = mSwaLens[0]
-        n = mDesc[2]
+        if cutlass.const_expr(self.tearly):
+            swa_len = swa_len_e_
+            n = n_e_
+        else:
+            swa_len = mSwaLens[0]
+            n = mDesc[2]
         if n < Int32(0) or n > Int32(N_MAX):
             n = Int32(0)
         n_sel = cutlass.min(n, Int32(K_TOP))

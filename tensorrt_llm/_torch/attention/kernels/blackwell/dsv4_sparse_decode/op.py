@@ -100,7 +100,7 @@ _BASE = dict(
 # Each batch size extends the previous set. At 4 and 8 rows two teams of 8 CTAs serve the rows in turn while 132 CTAs
 # stream the indexer K cache.
 _BS1 = dict(swag=True, nohoist=True, rs24=True, rs24_t4split=True, rs24_lsu=12)
-_BS2 = dict(_BS1, math_regs=216, kv_stages=3, wdelay=0)
+_BS2 = dict(_BS1, math_regs=216, kv_stages=3, wdelay=0, early=True, tearly=True)
 _BS4 = dict(
     _BS2,
     nteams=2,
@@ -118,7 +118,7 @@ _BS4 = dict(
     tsz01=True,
     bpf=True,
 )
-_BS8 = dict(_BS4, tszall=True, dpf=True)
+_BS8 = dict(_BS4, tszall=True, dpf=True, b1l=True, b1l_pub=True, b1l_upub=2)
 _CONFIGS: dict[int, dict] = {1: _BS1, 2: _BS2, 4: _BS4, 8: _BS8}
 
 _lock = threading.Lock()
