@@ -11288,22 +11288,6 @@ class PyExecutor:
                 logger.debug(
                     f'Send first token response for request {req.py_request_id}'
                 )
-                # Snapshot prepended first_gen_logits for the response:
-                #
-                # 1. generation_logits is not stored on LlmResult; every
-                #    access goes through __getattr__ -> PyResult property
-                #    -> LogitsStorage, re-reading shared mutable state.
-                # 2. All streaming responses reference the same PyResult,
-                #    so later tokens mutate what earlier responses would
-                #    read.
-                # 3. With the overlap scheduler, exclude_last_generation_logits
-                #    is True, which would hide the prepended logits since
-                #    they are the only entry at this point.
-                #
-                # WAR: read the logits now (bypassing exclusion), then set
-                # the tensor directly on LlmResult as an instance attribute.
-                # This shadows __getattr__ so the consumer always gets the
-                # correct, frozen logits.
                 has_prepended_logits = self._has_prepended_logits(req)
                 logits_snapshot = (req.py_result.get_latest_logits_unexcluded()
                                    if has_prepended_logits else None)
