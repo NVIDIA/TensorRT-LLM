@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025–2026 Lightricks Ltd.
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
-# SPDX-License-Identifier: LicenseRef-LTX-2
+# SPDX-License-Identifier: Apache-2.0
 
 # LTX-2 specific 3D RoPE with interleaved and split variants,
 # fractional position normalization, and middle-indices-grid support.

@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025–2026 Lightricks Ltd.
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
-# SPDX-License-Identifier: LicenseRef-LTX-2
+# SPDX-License-Identifier: Apache-2.0
 #
 # This is NOT the attention used by the main denoising transformer.  The 48-layer
 # transformer blocks use LTX2Attention (in transformer_ltx2.py), which is backed
