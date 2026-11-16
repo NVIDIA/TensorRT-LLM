@@ -843,7 +843,8 @@ def fast_rs_verify(
     assert logits.dtype == torch.float32 and logits.stride(1) == 1
     assert draft_probs.dtype == torch.float32 and draft_probs.stride(2) == 1
     assert draft_probs.shape[2] == vocab and draft_probs.shape[1] >= k
-    assert draft_tokens.stride(1) == 1
+    # The kernels read request b's draft tokens at b * k, so the rows must be packed.
+    assert draft_tokens.is_contiguous()
     _check_request_args(temperatures, slot_ids, seed, offset, rows, num_gens)
     nc, nc_pow2 = _num_chunks(vocab)
     # Row statistics of the K + 1 target rows.
