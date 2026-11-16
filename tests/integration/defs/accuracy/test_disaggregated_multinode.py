@@ -201,7 +201,7 @@ def _worker_env() -> dict[str, str]:
     apply_ucx_env(
         env,
         cluster_name=os.environ.get("SLURM_CLUSTER_NAME", ""),
-        fallback_peer=(NODE_LIST[1 - NODE_RANK], CTX_SERVER_PORT),
+        detect_devices=True,
     )
     return env
 

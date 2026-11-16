@@ -223,89 +223,102 @@ def test_detect_gpu_type_returns_empty_on_failure(
     assert fresh_detect_gpu_type() == ""
 
 
-@pytest.mark.parametrize("cluster_name", ("", "aws-pdx-slurm-1"))
-def test_apply_ucx_env_tcp_fallback(monkeypatch, cluster_name):
-    peer = ("node1", 8001)
+@pytest.mark.parametrize("cluster_name", ("", "aws-pdx-slurm-1", "oci-jhb"))
+def test_apply_ucx_env_detects_local_device(monkeypatch, cluster_name):
     calls = []
 
-    def route_device(address):
-        calls.append(address)
-        return "eth9"
+    def local_device():
+        calls.append(True)
+        return "bond0"
 
-    monkeypatch.setattr(cluster_env, "_tcp_route_device", route_device)
-    environ = {"UCX_TLS": "old", "OTHER": "kept", "UCX_CUDA_IPC_ENABLE_MNNVL": "n"}
+    monkeypatch.setattr(cluster_env, "_local_net_device", local_device)
+    environ = {"UCX_TLS": "old", "OTHER": "kept"}
     applied = cluster_env.apply_ucx_env(
-        environ, cluster_name=cluster_name, gpu_type="B300", fallback_peer=peer
+        environ, cluster_name=cluster_name, gpu_type="B300", detect_devices=True
     )
-    assert calls == [peer]
-    assert applied == {"UCX_TLS": "tcp,self,sm,cuda_copy,cuda_ipc", "UCX_NET_DEVICES": "eth9"}
-    assert environ == {"OTHER": "kept", "UCX_CUDA_IPC_ENABLE_MNNVL": "n", **applied}
+    assert calls == [True]
+    assert applied["UCX_NET_DEVICES"] == "bond0"
+    assert environ == {"OTHER": "kept", **applied}
+    if cluster_name == "oci-jhb":
+        assert applied["UCX_TCP_AF_PRIO"] == "inet"
+        assert applied["UCX_TLS"] == "cuda_ipc,cuda_copy,sm,self,tcp"
+    else:
+        assert applied["UCX_TLS"] == "tcp,self,sm,cuda_copy,cuda_ipc"
 
 
 @pytest.mark.parametrize("cluster_name", ("aws-pdx", "nsc-svg", "oci-jhb"))
-def test_apply_ucx_env_fallback_preserves_explicit_devices(monkeypatch, cluster_name):
-    def unexpected_route(peer):
-        pytest.fail("Explicit device selection must bypass route detection")
+def test_apply_ucx_env_detection_preserves_explicit_devices(monkeypatch, cluster_name):
+    def unexpected_detection():
+        pytest.fail("Explicit device selection must bypass detection")
 
-    monkeypatch.setattr(cluster_env, "_tcp_route_device", unexpected_route)
+    monkeypatch.setattr(cluster_env, "_local_net_device", unexpected_detection)
     environ = {"UCX_NET_DEVICES": "eth-custom"}
     applied = cluster_env.apply_ucx_env(
-        environ, cluster_name=cluster_name, gpu_type="B300", fallback_peer=("node1", 8001)
+        environ, cluster_name=cluster_name, gpu_type="B300", detect_devices=True
     )
     assert applied["UCX_NET_DEVICES"] == "eth-custom"
     assert environ["UCX_NET_DEVICES"] == "eth-custom"
-    if cluster_name == "oci-jhb":
-        assert environ["UCX_TCP_AF_PRIO"] == "inet"
 
 
-def test_apply_ucx_env_cluster_rule_bypasses_fallback(monkeypatch):
-    def unexpected_route(peer):
-        pytest.fail("Cluster rules must bypass route detection")
+def test_apply_ucx_env_cluster_device_bypasses_detection(monkeypatch):
+    def unexpected_detection():
+        pytest.fail("Cluster-configured devices must bypass detection")
 
-    monkeypatch.setattr(cluster_env, "_tcp_route_device", unexpected_route)
+    monkeypatch.setattr(cluster_env, "_local_net_device", unexpected_detection)
     environ = {}
     applied = cluster_env.apply_ucx_env(
-        environ, cluster_name="oci-jhb", gpu_type="GB300", fallback_peer=("node1", 8001)
+        environ, cluster_name="nsc-svg", gpu_type="B300", detect_devices=True
     )
-    assert applied == {"UCX_TLS": "cuda_ipc,cuda_copy,sm,self,tcp", "UCX_TCP_AF_PRIO": "inet"}
+    assert applied["UCX_NET_DEVICES"].startswith("mlx5_0:1,")
 
 
-@pytest.mark.parametrize("scenario", ("success", "route_error", "missing_interface"))
-def test_tcp_route_device(monkeypatch, scenario):
-    peer = ("node1", 8001)
-
-    class RouteSocket:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            pass
-
-        def connect(self, address):
-            assert address == peer
-            if scenario == "route_error":
-                raise OSError("no route")
-
-        def getsockname(self):
-            return ("10.0.0.1", 12345)
-
-    def make_socket(family, kind):
-        assert family == socket.AF_INET
-        assert kind == socket.SOCK_DGRAM
-        return RouteSocket()
-
+@pytest.mark.parametrize(
+    ("scenario", "expected"),
+    (
+        ("default", "bond0"),
+        ("lowest_metric", "bond0"),
+        ("single", "bond0"),
+        ("no_route_file", "bond0"),
+        ("ambiguous", None),
+        ("equal_metrics", None),
+        ("no_devices", None),
+        ("down_default", "eth0"),
+        ("rejected_default", "eth0"),
+    ),
+)
+def test_local_net_device(monkeypatch, tmp_path, scenario, expected):
     addresses = {
-        "eth0": [SimpleNamespace(family=socket.AF_INET, address="10.0.0.2")],
-        "eth9": [SimpleNamespace(family=socket.AF_INET, address="10.0.0.1")],
+        "lo": [SimpleNamespace(family=socket.AF_INET, address="127.0.0.1")],
+        "bond0": [SimpleNamespace(family=socket.AF_INET, address="10.0.0.1")],
+        "eth0": [SimpleNamespace(family=socket.AF_INET, address="10.1.0.1")],
+        "eth1": [SimpleNamespace(family=socket.AF_INET6, address="fe80::1")],
+        "eth2": [SimpleNamespace(family=socket.AF_INET, address="169.254.1.1")],
     }
-    monkeypatch.setattr(cluster_env.socket, "socket", make_socket)
+    if scenario in ("single", "no_route_file"):
+        del addresses["eth0"]
+    if scenario == "no_devices":
+        addresses = {}
+    stats = {name: SimpleNamespace(isup=True) for name in addresses}
+    if scenario == "down_default":
+        stats["bond0"].isup = False
     monkeypatch.setitem(
         sys.modules,
         "psutil",
-        SimpleNamespace(net_if_addrs=lambda: {} if scenario == "missing_interface" else addresses),
+        SimpleNamespace(net_if_addrs=lambda: addresses, net_if_stats=lambda: stats),
     )
-    if scenario == "success":
-        assert cluster_env._tcp_route_device(peer) == "eth9"
+    route_file = tmp_path / "route"
+    monkeypatch.setattr(cluster_env, "Path", lambda path: route_file)
+    routes = "Iface Destination Gateway Flags RefCnt Use Metric Mask\n"
+    if scenario not in ("single", "ambiguous", "no_devices", "no_route_file"):
+        flags = "0203" if scenario == "rejected_default" else "0003"
+        routes += f"bond0 00000000 0100000A {flags} 0 0 100 00000000\n"
+    if scenario in ("lowest_metric", "equal_metrics", "rejected_default"):
+        metric = 100 if scenario == "equal_metrics" else 200
+        routes += f"eth0 00000000 0100010A 0003 0 0 {metric} 00000000\n"
+    if scenario != "no_route_file":
+        route_file.write_text(routes)
+    if expected is not None:
+        assert cluster_env._local_net_device() == expected
     else:
-        with pytest.raises(RuntimeError, match="set UCX_NET_DEVICES"):
-            cluster_env._tcp_route_device(peer)
+        with pytest.raises(RuntimeError, match="set UCX_NET_DEVICES explicitly"):
+            cluster_env._local_net_device()
