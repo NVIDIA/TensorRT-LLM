@@ -122,7 +122,7 @@ __device__ __forceinline__ float addRn(float a, float b)
     return r;
 }
 
-//! FlashInfer ``sigmoid_accurate`` as compiled with ``-use_fast_math``.
+//! ``sigmoid_accurate`` as FlashInfer's JIT build compiles it (``-use_fast_math``).
 __device__ __forceinline__ float routingSigmoid(float x)
 {
     return fmaFtz(tanhApprox(mulFtz(x, 0.5f)), 0.5f, 0.5f);
@@ -241,7 +241,7 @@ __device__ __forceinline__ void loadB2(uint32_t (&b)[4], uint32_t base, int rowB
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// Routing (FlashInfer routingCustom: SigmoidBias + ScaledSumNormalize, warp per token).
+// Routing (routingCustom as FlashInfer's fast-math JIT build: SigmoidBias + ScaledSumNormalize, warp per token).
 // ---------------------------------------------------------------------------------------------------------------
 
 //! Selection key: the score's bits mapped to an unsigned order (a NaN score ranks above every number), then the

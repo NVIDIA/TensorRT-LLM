@@ -21,7 +21,11 @@ import triton.language as tl
 from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
-from tensorrt_llm._torch.kernels.nvfp4_quant import can_use_nvfp4_quant, nvfp4_quant
+from tensorrt_llm._torch.kernels.nvfp4_quant import (
+    can_use_nvfp4_quant,
+    nvfp4_fp8_dual_quant,
+    nvfp4_quant,
+)
 
 pytestmark = skip_pre_blackwell
 
@@ -126,6 +130,29 @@ def test_nvfp4_quant_all_nan_position_masks(global_scale: float) -> None:
     x = torch.randn(65536, 16, device="cuda", dtype=torch.bfloat16)
     x.masked_fill_(nan_mask, float("nan"))
     _check(x.reshape(1024, 1024), torch.tensor([global_scale], device="cuda", dtype=torch.float32))
+
+
+@pytest.mark.parametrize("rows", [1, 5, 1025, 4097])
+@pytest.mark.parametrize("hidden", [1024, 4096])
+@pytest.mark.parametrize("global_scale", [1e-6, 1.0, 1e6])
+@pytest.mark.parametrize("fp8_scale", [1e-3, 0.05, 1.0, 100.0])
+def test_nvfp4_fp8_dual_quant_parity(
+    rows: int, hidden: int, global_scale: float, fp8_scale: float
+) -> None:
+    torch.manual_seed(42)
+    x = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16) * 8
+    x[0, :16] = 0.0
+    scale = torch.tensor([global_scale], device="cuda", dtype=torch.float32)
+    fp8_scale_t = torch.tensor([fp8_scale], device="cuda", dtype=torch.float32)
+    q, sf, fp8 = nvfp4_fp8_dual_quant(x, scale, fp8_scale_t)
+    expected = torch.ops.trtllm.fp4_quantize(x, scale, 16, False, False)
+    for result, reference in zip((q, sf), expected):
+        torch.testing.assert_close(result, reference, rtol=0, atol=0)
+    expected_fp8, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(x, fp8_scale_t)
+    assert fp8.dtype == expected_fp8.dtype == torch.float8_e4m3fn
+    torch.testing.assert_close(
+        fp8.view(torch.uint8), expected_fp8.view(torch.uint8), rtol=0, atol=0
+    )
 
 
 @triton.jit

@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import hmac
 import math
 import os
 import queue
@@ -23,7 +24,7 @@ import struct
 import threading
 import time
 import weakref
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from enum import Enum
@@ -121,6 +122,32 @@ _FALLBACK_TX_WAIT_SLICE_S = 1.0
 # an overall deadline. KvCacheTransceiverV2 requires a configured transfer
 # timeout before it creates either sender or receiver sessions.
 _FALLBACK_TX_OVERALL_TIMEOUT_S = 60.0
+_RANK_INFO_AUTH_CONTEXT = b"trtllm-rank-info-request-v1\0"
+_RANK_INFO_NONCE_BYTES = 32
+_RANK_INFO_AUTH_TAG_BYTES = 32
+_RANK_INFO_CHALLENGE_CACHE_SIZE = 4096
+_RANK_INFO_CHALLENGE_TTL_S = 10.0
+
+
+def _validate_rank_info_auth_key(key: Optional[bytes]) -> Optional[bytes]:
+    if key is not None and (not isinstance(key, bytes) or not key):
+        raise ValueError(
+            "RankInfo authentication keys must be nonempty bytes when configured; "
+            "use the same internal_request_auth_key on communicating peers"
+        )
+    return key
+
+
+class RankInfoAuthenticationError(PermissionError):
+    """A peer failed the native RankInfo authentication handshake."""
+
+
+def _rank_info_auth_tag(auth_key: bytes, endpoint: str, nonce: bytes) -> bytes:
+    return hmac.digest(
+        auth_key,
+        _RANK_INFO_AUTH_CONTEXT + endpoint.encode("utf-8") + b"\0" + nonce,
+        "sha256",
+    )
 
 
 # Every REQUEST_DATA from a generation server on v1.3.0rc25 or a later release that still has
@@ -291,6 +318,8 @@ class MessageType:
     KV_AGENT_RESULT = b"KV_AGENT_RESULT"
     REQUEST_DATA = b"REQUEST_DATA"
     REQUEST_INSTANCE_INFO = b"REQUEST_INSTANCE_INFO"
+    AUTHENTICATION_CHALLENGE = b"AUTHENTICATION_CHALLENGE"
+    AUTHENTICATION_ERROR = b"AUTHENTICATION_ERROR"
     REGISTER_RANK_INFO = b"REGISTER_RANK_INFO"
     AUX_AGENT_RESULT = b"AUX_AGENT_RESULT"
     CANCEL_SESSION = b"CANCEL_SESSION"
@@ -414,6 +443,12 @@ class _LogicalOutcomes:
 
     def cancel(self, by_peer: bool) -> None:
         self._end(_LogicalOutcome(SessionStatus.CANCELLED, by_peer=by_peer))
+
+    @property
+    def failed(self) -> bool:
+        """Whether the first terminal decision was a failure; a later cancel does not change it."""
+        with self._lock:
+            return self._terminal is not None and self._terminal.status is SessionStatus.ERROR
 
     def _end(self, outcome: _LogicalOutcome) -> None:
         with self._lock:
@@ -660,6 +695,10 @@ class Sender(SenderBase):
     # RecvReqInfo that never gets consumed.  Entries older than this
     # are evicted during periodic sweeps.
     _STALE_REQ_INFO_TTL_S = 120.0
+    # How long a cleared TxSession's id is remembered. A generation peer can ask for its KV
+    # long after the context side gave up on it (its request may wait in the generation queue
+    # for minutes), so this outlives the stale-request-info TTL.
+    _RETIRED_SESSION_TTL_S = 600.0
 
     def __init__(
         self,
@@ -690,6 +729,11 @@ class Sender(SenderBase):
         # cancelled immutable ID until Sender teardown, not merely metadata TTL.
         self._pre_cancelled_rids: dict[int, bool] = {}
         self._pending_session_quiescence: dict[tuple[int, int], _SessionQuiescence] = {}
+        # unique_rid -> clear time, for sessions already cleared (completed, failed, cancelled or
+        # timed out), oldest first. A REQUEST_DATA for one of them must be answered FAILED:
+        # parking it as an early generation-first request would leave the peer's receive
+        # unresolved for good. Protected by _sessions_lock.
+        self._retired_rids: dict[int, float] = {}
         self._shutdown = False
         self._shutdown_requested = False
         self._instance_rank = self._registrar.self_rank_info.instance_rank
@@ -790,9 +834,9 @@ class Sender(SenderBase):
     def sweep_stale_req_infos(self):
         """Evict RecvReqInfo entries that have no matching TxSession and exceed the TTL.
 
-        Called opportunistically from the listener thread when a new REQUEST_DATA
-        arrives. With gen-first ADP broadcast, non-assigned DP ranks accumulate
-        entries that are never consumed; this sweep prevents unbounded growth.
+        Called from the executor's context-status poll. With gen-first ADP
+        broadcast, non-assigned DP ranks accumulate entries that are never
+        consumed; this sweep prevents unbounded growth.
 
         A context-first entry that no TxSession claimed within the TTL never will
         be (the session already ended, or the receiver names a request this rank
@@ -800,6 +844,13 @@ class Sender(SenderBase):
         waiting for data that will not arrive.
         """
         now = time.monotonic()
+        with self._sessions_lock:
+            # Oldest first (see clear_session), so only expired entries are visited.
+            while self._retired_rids:
+                rid, ts = next(iter(self._retired_rids.items()))
+                if now - ts <= self._RETIRED_SESSION_TTL_S:
+                    break
+                del self._retired_rids[rid]
         with self._peer_requests_lock:
             stale_rids = [
                 rid
@@ -825,8 +876,8 @@ class Sender(SenderBase):
         """Report FAILED for a context-first REQUEST_DATA that no TxSession claimed.
 
         This resolves the receiver's task, so its RxSession fails through the
-        normal transfer-failure path. The sweep runs on the executor and listener
-        threads, so the message goes through a worker queue.
+        normal transfer-failure path. The sweep runs on the executor thread, not
+        the listener's, so the message goes through a worker queue.
         """
         logger.warning(
             f"KV transfer request rid={info.unique_rid} from receiver "
@@ -845,6 +896,7 @@ class Sender(SenderBase):
                 raise RuntimeError("cannot create a TxSession after Sender shutdown")
             if owned and unique_rid in self._sessions:
                 raise RuntimeError("cannot replace an owned TxSession")
+            self._retired_rids.pop(unique_rid, None)
             if unique_rid in self._pre_cancelled_rids:
                 pre_cancel = True
                 cancelled_by_peer = self._pre_cancelled_rids[unique_rid]
@@ -886,6 +938,9 @@ class Sender(SenderBase):
             expected_count = len(self._registrar.get_peer_overlap(peer_ri, peer_ri.dp_rank).ranks)
             if self._is_req_ready(unique_rid, expected_count):
                 with tx_session.lock:
+                    # The executor reads both without the lock, so publish the
+                    # time first: a ready session always carries its time.
+                    tx_session.peer_ready_time = time.monotonic()
                     tx_session.receiver_ready = True
         return
 
@@ -2074,8 +2129,25 @@ class Sender(SenderBase):
                 self.ownership_enabled(info.context_first)
                 and info.unique_rid in self._pre_cancelled_rids
             )
+            refused = False
+            retired = False
             if session is None and not fenced:
-                self._save_peer_req_info(info)
+                # A retried generation request carries a fresh unique_rid, so the
+                # context-side id names the retired session as well.
+                retired = (
+                    info.unique_rid in self._retired_rids
+                    or info.sender_req_id in self._retired_rids
+                )
+                # The session it names may also still be live. Serving it would
+                # need every reply keyed by the receiver's id and could write the
+                # same pieces to two attempts, so it is refused rather than parked.
+                retry_of_live_session = (
+                    info.sender_req_id != info.unique_rid
+                    and self._get_session(info.sender_req_id) is not None
+                )
+                refused = retired or retry_of_live_session
+                if not refused:
+                    self._save_peer_req_info(info)
         if received_timestamp is not None:
             with disagg_diagnostics.suppress_diagnostic_errors():
                 disagg_diagnostics.emit_event(
@@ -2097,6 +2169,18 @@ class Sender(SenderBase):
             self._queue_session_quiescence(info.unique_rid, info.instance_name, info.instance_rank)
             return
         if session is None:
+            if refused:
+                # Nothing will ever be sent for this request; say so instead of leaving
+                # the peer's receive (and its KV pages) waiting forever. Typically the
+                # context side timed out waiting for it while the peer's request sat in
+                # its generation queue, or it is a retry of a request still in flight.
+                logger.warning(
+                    f"_respond_with_kv: TxSession {info.sender_req_id} "
+                    f"{'already retired' if retired else 'serves an earlier attempt'}; "
+                    f"failing REQUEST_DATA for peer rid={info.unique_rid} "
+                    f"rank={info.instance_rank}"
+                )
+                self._send_failed_result_to_receiver(info)
             return
         with session.lock:
             with self._sessions_lock:
@@ -2259,6 +2343,8 @@ class Sender(SenderBase):
         if self._is_req_ready(req_info.unique_rid, expected_transfers):
             session = self._get_session(req_info.unique_rid)
             if session is not None and not session.receiver_ready:
+                # Time before flag, as in setup_session.
+                session.peer_ready_time = time.monotonic()
                 session.receiver_ready = True
 
     def has_all_peer_req_infos(self, unique_rid: int) -> bool:
@@ -2276,6 +2362,9 @@ class Sender(SenderBase):
         with self._sessions_lock:
             if unique_rid in self._sessions:
                 del self._sessions[unique_rid]
+                # Re-insert so the dict stays ordered by clear time.
+                self._retired_rids.pop(unique_rid, None)
+                self._retired_rids[unique_rid] = time.monotonic()
         self._remove_req_info(unique_rid)
 
     def send_cancel_to_receivers(self, unique_rid: int) -> None:
@@ -2397,6 +2486,8 @@ class TxSession(TxSessionBase):
                 self._retirement.close()
             raise
         self.receiver_ready: bool = False
+        # time.monotonic() when receiver_ready turned True, i.e. every peer rank had asked.
+        self.peer_ready_time: Optional[float] = None
         self.kv_tasks = []
         self.aux_task = None
         self._reported_aux_peer_ranks: set[int] = set()
@@ -3087,12 +3178,16 @@ class Receiver(ReceiverBase):
         enforce_physical_ownership: bool = False,
         retirement_watchdog: Optional[RetirementWatchdog] = None,
         context_first_ownership: bool = False,
+        rank_info_auth_key: Optional[bytes] = None,
+        rank_info_timeout_s: float = _FALLBACK_TX_OVERALL_TIMEOUT_S,
     ):
         self._registrar = peer_registrar
         self._agent = agent
         self._enforce_physical_ownership = enforce_physical_ownership
         self._context_first_ownership = context_first_ownership
         self._retirement_watchdog = retirement_watchdog
+        self._rank_info_auth_key = _validate_rank_info_auth_key(rank_info_auth_key)
+        self._rank_info_timeout_s = rank_info_timeout_s
         self._dealers = {}
         self._sender_ep_instance_map = {}
         # info_endpoint -> diagnostic message for peers that failed the
@@ -3290,20 +3385,18 @@ class Receiver(ReceiverBase):
                     )
                     self._context_first_incompatible_peers[info_endpoint] = message
                     raise PeerIncompatibleError(message) from error
-        except PeerIncompatibleError as e:
+        except (PeerIncompatibleError, RankInfoAuthenticationError) as e:
             # Fail only this request via the normal transfer-error path
             # (task ERROR -> session ERROR -> WaitResult.FAILED ->
             # DISAGG_TRANS_ERROR), so one incompatible context peer does not
-            # take down the whole generation worker. The async path's
-            # cross-rank consensus unions failed rids, so the request fails
-            # globally once any rank fails here — ranks whose page table has
-            # no recurrent layers (e.g. a hybrid-model PP stage) pass
-            # validation and may still run a transfer that is then
-            # discarded. The task is already in the session's _kv_tasks and
-            # session._sender_endpoints is still empty, so the unpublished
-            # owner can close locally.
+            # take down the whole generation worker. Keyed multi-rank receives
+            # coordinate admission before publication; this handles local
+            # dispatch failures. The async outcome consensus unions failures
+            # only after the request reaches the completion-processing set.
+            # The task is already in the session's _kv_tasks, and session._sender_endpoints is still
+            # empty, so the unpublished owner can close locally.
             logger.error(
-                "dispatch_task: context peer incompatible, failing request "
+                "dispatch_task: context peer rejected, failing request "
                 f"unique_rid={task._unique_rid}: {e}"
             )
             session = self._get_session(task._unique_rid)
@@ -3478,9 +3571,57 @@ class Receiver(ReceiverBase):
         if self._should_register_peer(params):
             logger.info(f"Registering peer in first request to endpoint '{info_endpoint}'")
             messenger = ZMQMessenger(mode="DEALER", endpoint=info_endpoint)
+            deadline = time.monotonic() + self._rank_info_timeout_s
             try:
                 messenger.send([MessageType.REQUEST_INSTANCE_INFO])
-                message = messenger.receive()
+                message = messenger.receive(
+                    timeout_ms=max(0, int((deadline - time.monotonic()) * 1000))
+                )
+                if message == [MessageType.AUTHENTICATION_ERROR]:
+                    raise RankInfoAuthenticationError(
+                        "RankInfo authentication challenge unavailable: server is busy; retry the request"
+                    )
+                if self._rank_info_auth_key is None:
+                    if message and message[0] == MessageType.AUTHENTICATION_CHALLENGE:
+                        raise RankInfoAuthenticationError(
+                            "Context peer requires RankInfo authentication: configure the same "
+                            "internal_request_auth_key on communicating peers"
+                        )
+                    if len(message) != 1:
+                        raise RankInfoAuthenticationError(
+                            "Invalid unauthenticated RankInfo response"
+                        )
+                else:
+                    if (
+                        len(message) != 2
+                        or message[0] != MessageType.AUTHENTICATION_CHALLENGE
+                        or len(message[1]) != _RANK_INFO_NONCE_BYTES
+                    ):
+                        raise RankInfoAuthenticationError(
+                            "Invalid RankInfo authentication challenge: both peers must enable "
+                            "authentication with matching internal_request_auth_key values and "
+                            "use compatible versions"
+                        )
+                    nonce = message[1]
+                    messenger.send(
+                        [
+                            MessageType.REQUEST_INSTANCE_INFO,
+                            nonce,
+                            _rank_info_auth_tag(self._rank_info_auth_key, info_endpoint, nonce),
+                        ]
+                    )
+                    message = messenger.receive(
+                        timeout_ms=max(0, int((deadline - time.monotonic()) * 1000))
+                    )
+                    if message == [MessageType.AUTHENTICATION_ERROR]:
+                        raise RankInfoAuthenticationError(
+                            "RankInfo authentication failed: challenge expired or proof rejected; "
+                            "retry the request and verify matching internal_request_auth_key values"
+                        )
+            except TimeoutError as error:
+                raise RankInfoAuthenticationError(
+                    "RankInfo exchange timed out; retry the request and verify peer availability"
+                ) from error
             finally:
                 messenger.stop()
 
@@ -3507,6 +3648,7 @@ class Receiver(ReceiverBase):
                     self._registrar.self_extractor.page_table,
                     sender_info.page_table,
                 )
+                self._registrar.validate_draft_layers_compatible(sender_info)
                 self._registrar.validate_view_head_geometry(sender_info)
             except ValueError as e:
                 msg = (
@@ -3731,6 +3873,10 @@ class RxSession(RxSessionBase):
         self._exception: Optional[Exception] = None
         self._closed = False
         self._terminal_status: Optional[SessionStatus] = None
+        # When this failed receive started waiting on its remaining writers, and whether that
+        # wait has run out (see failed_receive_awaits_writers).
+        self._writer_wait_start: Optional[float] = None
+        self._writer_wait_expired = False
         self.transfer_start_time = None
         self.transfer_end_time = None
         self.kv_cache_size_bytes: int = 0
@@ -4430,14 +4576,51 @@ class RxSession(RxSessionBase):
 
         cancel_request() must return False while this is True.
         """
-        return not self.resources_drained()
+        return not self.resources_drained() or self.failed_receive_awaits_writers()
+
+    # A failed receive waits at most this many transfer timeouts for its remaining writers.
+    _WRITER_WAIT_TIMEOUT_MULTIPLIER = 2
+
+    def failed_receive_awaits_writers(self) -> bool:
+        """Whether this failed receive must stay open for writers that have not stopped.
+
+        Without physical ownership the first writer's FAILED fails the receive, while the
+        other writers it asked may still be writing into its pages, so retiring it then could
+        hand those pages to another request mid-write. A live writer ends with a result or a
+        CANCEL_SESSION, at the latest when its own context-side transfer deadline expires,
+        which comes before ``_WRITER_WAIT_TIMEOUT_MULTIPLIER`` transfer timeouts. A writer
+        still silent then is presumed gone (e.g. its process died), and the receive is let go
+        rather than pinning its pages and slot on a worker that may never act on its own
+        receive timeout. The hold covers cancellation too: a client abort or a timeout that
+        cancels the receive after it failed must not free it early either (``cancel_request``
+        refuses while ``has_transferring_tasks``). A receive cancelled before it failed is
+        not held. Polled from the executor thread.
+        """
+        if self._enforce_physical_ownership or not self._logical_outcomes.failed:
+            return False
+        if self._writer_wait_expired:
+            return False
+        if not any(task.reports_outstanding for task in self._kv_tasks):
+            return False
+        if self._timeout_s is None or self._timeout_s <= 0:
+            return True
+        now = time.monotonic()
+        if self._writer_wait_start is None:
+            self._writer_wait_start = now
+        waited_s = now - self._writer_wait_start
+        if waited_s <= self._timeout_s * self._WRITER_WAIT_TIMEOUT_MULTIPLIER:
+            return True
+        self._writer_wait_expired = True
+        logger.warning(
+            f"RxSession {self.disagg_request_id}: a writer has not reported {waited_s:.0f}s "
+            "after the receive failed; retiring it without that writer's result"
+        )
+        return False
 
     def _failed_wait_result(self) -> Optional[WaitResult]:
-        return (
-            WaitResult.FAILED
-            if not self._enforce_physical_ownership or self.resources_drained()
-            else None
-        )
+        if not self._enforce_physical_ownership:
+            return None if self.failed_receive_awaits_writers() else WaitResult.FAILED
+        return WaitResult.FAILED if self.resources_drained() else None
 
     def _completed_wait_result(self) -> Optional[WaitResult]:
         if getattr(self, "_retirement", None) is not None and not self.is_completed():
@@ -4546,14 +4729,27 @@ class RxSession(RxSessionBase):
 
 
 class RankInfoServer:
-    def __init__(self, rank_info: RankInfo, addr: Optional[str] = None, port: Optional[int] = None):
+    def __init__(
+        self,
+        rank_info: RankInfo,
+        addr: Optional[str] = None,
+        port: Optional[int] = None,
+        rank_info_auth_key: Optional[bytes] = None,
+    ):
         self._rank_info = rank_info
+        self._rank_info_auth_key = _validate_rank_info_auth_key(rank_info_auth_key)
+        self._rank_info_auth_challenges: OrderedDict[bytes, tuple[bytes, float]] = OrderedDict()
         self._shutdown = False  # must be set before _start_listener() so __del__ is safe
         if addr is None and port is None:
             endpoint = f"tcp://{get_local_ip()}:*"
         else:
             endpoint = f"tcp://{addr}:{port}"
         self._messenger = ZMQMessenger(mode="ROUTER", endpoint=endpoint)
+        if self._rank_info_auth_key is None:
+            logger.warning(
+                "Native RankInfo authentication is disabled: internal_request_auth_key is not "
+                "configured, so REQUEST_INSTANCE_INFO returns transfer metadata without authentication"
+            )
         self._start_listener()
 
     @property
@@ -4585,7 +4781,57 @@ class RankInfoServer:
 
         self._messenger.start_listener(handle_message)
 
-    def _handle_rank_info_request(self, send_id: bytes, _message: list[bytes]):
+    def _handle_rank_info_request(self, send_id: bytes, message: list[bytes]):
+        if self._rank_info_auth_key is None:
+            response = (
+                self._rank_info.to_bytes()
+                if len(message) == 1
+                else MessageType.AUTHENTICATION_ERROR
+            )
+            self._messenger.send([send_id, response])
+            return
+
+        now = time.monotonic()
+        # Entries stay in creation order; repeated requests do not extend their lifetime.
+        while self._rank_info_auth_challenges:
+            _, expires_at = next(iter(self._rank_info_auth_challenges.values()))
+            if expires_at > now:
+                break
+            self._rank_info_auth_challenges.popitem(last=False)
+
+        if len(message) == 1:
+            pending = self._rank_info_auth_challenges.get(send_id)
+            if pending is None:
+                if len(self._rank_info_auth_challenges) >= _RANK_INFO_CHALLENGE_CACHE_SIZE:
+                    self._messenger.send([send_id, MessageType.AUTHENTICATION_ERROR])
+                    return
+                pending = (
+                    secrets.token_bytes(_RANK_INFO_NONCE_BYTES),
+                    now + _RANK_INFO_CHALLENGE_TTL_S,
+                )
+                self._rank_info_auth_challenges[send_id] = pending
+            self._messenger.send([send_id, MessageType.AUTHENTICATION_CHALLENGE, pending[0]])
+            return
+
+        pending = self._rank_info_auth_challenges.pop(send_id, None)
+        if len(message) != 3:
+            self._messenger.send([send_id, MessageType.AUTHENTICATION_ERROR])
+            return
+
+        nonce, provided_tag = message[1:]
+        expected_nonce = pending[0] if pending is not None else b""
+        authenticated = (
+            len(nonce) == _RANK_INFO_NONCE_BYTES
+            and len(provided_tag) == _RANK_INFO_AUTH_TAG_BYTES
+            and hmac.compare_digest(nonce, expected_nonce or b"")
+            and hmac.compare_digest(
+                provided_tag,
+                _rank_info_auth_tag(self._rank_info_auth_key, self.endpoint, nonce),
+            )
+        )
+        if not authenticated:
+            self._messenger.send([send_id, MessageType.AUTHENTICATION_ERROR])
+            return
         self._messenger.send([send_id, self._rank_info.to_bytes()])
 
     def __del__(self):
@@ -4660,10 +4906,12 @@ class TransferWorkerConfig:
     # trailing _BYTES, lowercased); dict > env > default. Ignored when
     # agent_buffer_size_mb == 0.
     agent_bounce_params: Optional[Dict[str, str]] = None
+    rank_info_auth_key: Optional[bytes] = field(default=None, repr=False)
 
 
 class TransferWorker:
     def __init__(self, config: TransferWorkerConfig):
+        self._shutdown_prepared = False
         self._config = config
         self._retirement_watchdog = None
         if config.quiescence_fatal_callback is not None:
@@ -4675,6 +4923,7 @@ class TransferWorker:
                         "deadline retirement requires finite positive transfer timeouts"
                     )
             self._retirement_watchdog = RetirementWatchdog(self._on_quiescence_fatal)
+        self._rank_info_auth_key = _validate_rank_info_auth_key(config.rank_info_auth_key)
         kvm = config.kv_cache_manager
         self._aux_buffer = _make_aux_buffer(
             kvm, config.max_concurrent_sessions, config.max_draft_len
@@ -4755,6 +5004,10 @@ class TransferWorker:
             request_id, "receive", self._config.rx_timeout_s
         )
 
+    def prepare_rank_info(self, request: LlmRequest) -> None:
+        """Authenticate and cache the context peer without publishing receive buffers."""
+        self._receiver._get_sender_info(request.py_disaggregated_params)
+
     def create_rx_session(self, request: LlmRequest) -> RxSession:
         params = request.py_disaggregated_params
         assert params is not None
@@ -4776,7 +5029,11 @@ class TransferWorker:
         self._sender.sweep_stale_req_infos()
 
     def _setup_peer_infrastructure(self, kvm: KVCacheManagerV2):
-        self._rank_info_server = RankInfoServer(self._rank_info) if kvm.mapping.rank == 0 else None
+        self._rank_info_server = (
+            RankInfoServer(self._rank_info, rank_info_auth_key=self._rank_info_auth_key)
+            if kvm.mapping.rank == 0
+            else None
+        )
         self._kv_extractor = KVRegionExtractorV1(kvm)
         self._peer_registrar = PeerRegistrar(self._rank_info, self._kv_extractor)
 
@@ -4821,6 +5078,8 @@ class TransferWorker:
                 enforce_physical_ownership=self._config.enforce_physical_ownership,
                 retirement_watchdog=self._retirement_watchdog,
                 context_first_ownership=self._config.context_first_ownership,
+                rank_info_auth_key=self._rank_info_auth_key,
+                rank_info_timeout_s=self._config.rx_timeout_s or _FALLBACK_TX_OVERALL_TIMEOUT_S,
             )
             self._rank_info.transfer_engine_info = bytes(self._agent.get_local_agent_desc())
             self._rank_info.self_endpoint = self._receiver.endpoint
@@ -4873,8 +5132,9 @@ class TransferWorker:
         assert self._rank_info is not None
         return self._rank_info.page_table
 
-    def shutdown(self):
-        if getattr(self, "_shutdown", False):
+    def prepare_shutdown(self) -> None:
+        """Stop listeners and transfers, refusing active owners; retain registrations."""
+        if getattr(self, "_shutdown_prepared", False):
             return
         self.request_shutdown()
         watchdog = getattr(self, "_retirement_watchdog", None)
@@ -4894,9 +5154,17 @@ class TransferWorker:
             receiver.shutdown()
         if rank_info_server is not None:
             rank_info_server.shutdown()
+        self._shutdown_prepared = True
+
+    def shutdown(self) -> None:
+        """Finish shutdown by releasing registrations and the transfer agent."""
+        if getattr(self, "_shutdown", False):
+            return
+        self.prepare_shutdown()
         self._shutdown = True
-        # Deregister NIXL memory before agent.shutdown so pinned GPU memory is released
-        # (e.g. when the KV cache manager is recreated after profiling).
+        # For prompt unpinning, callers unmap KV pools before deregistration.
+        # UCX shared GDRCopy caching otherwise retains the pinned pages until
+        # a later registration. prepare_shutdown() retains registrations.
         agent = getattr(self, "_agent", None)
         if agent is not None:
             try:

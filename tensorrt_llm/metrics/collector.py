@@ -359,7 +359,10 @@ class MetricsCollector:
                 "source_cache_tier", "destination_cache_level",
                 "destination_cache_tier"
             ],
-            buckets=[0.00001, 0.0001, 0.001, 0.01, 0.1, 1, 10, 60, 300])
+            buckets=[
+                0.00001, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01,
+                0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 60, 300
+            ])
         self.kv_cache_migration_timing_skipped = Counter(
             name=self.metric_prefix + "kv_cache_migration_timing_skipped_total",
             documentation=
@@ -670,6 +673,56 @@ class MetricsCollector:
             name=self.metric_prefix + "avg_decoded_tokens_per_iter",
             documentation="Average number of decoded tokens per iteration",
             labelnames=self.labels.keys())
+
+        # KV cache scheduling decisions and host memory (KV cache manager V2)
+        self.ctx_chunks_reverted = Counter(
+            name=self.metric_prefix + "ctx_chunks_reverted_total",
+            documentation=
+            "Context chunks whose KV growth was given back, by reason",
+            labelnames=(*iteration_labelnames, "reason"))
+        self.ctx_tokens_reverted = Counter(
+            name=self.metric_prefix + "ctx_tokens_reverted_total",
+            documentation=
+            "Context tokens of the chunks whose KV growth was given back",
+            labelnames=iteration_labelnames)
+        self.gen_deferred_receives = Gauge(
+            name=self.metric_prefix + "gen_deferred_receives",
+            documentation=
+            "Most disaggregated generation receives waiting at once to be posted",
+            labelnames=iteration_labelnames)
+        self.gen_receive_ready_wait_seconds = Counter(
+            name=self.metric_prefix + "gen_receive_ready_wait_seconds_total",
+            documentation=
+            "Host time blocked on KV admission work before posting generation receives",
+            labelnames=iteration_labelnames)
+        self.gen_init_holds = Counter(
+            name=self.metric_prefix + "gen_init_holds_total",
+            documentation=
+            "Generation-init requests left for a later pass, by reason",
+            labelnames=(*iteration_labelnames, "reason"))
+        self.ctx_decoder_hold_passes = Counter(
+            name=self.metric_prefix + "ctx_decoder_hold_passes_total",
+            documentation=
+            "Scheduling passes in which decoder-tail batching held final windows",
+            labelnames=iteration_labelnames)
+        self.ctx_decoder_held_requests = Counter(
+            name=self.metric_prefix + "ctx_decoder_held_requests_total",
+            documentation=
+            "Context requests whose final window decoder-tail batching held",
+            labelnames=iteration_labelnames)
+        self.kv_cache_host_slab_bytes = Gauge(
+            name=self.metric_prefix + "kv_cache_host_slab_bytes",
+            documentation="Host bytes held by live KV cache page slabs",
+            labelnames=iteration_labelnames)
+        self.kv_cache_page_table_conversions = Counter(
+            name=self.metric_prefix + "kv_cache_page_table_conversions_total",
+            documentation="Sparse-attention page-table conversions, by path",
+            labelnames=(*iteration_labelnames, "path"))
+        self.kv_cache_page_table_full_build_seconds = Counter(
+            name=self.metric_prefix +
+            "kv_cache_page_table_full_build_seconds_total",
+            documentation="Host time in full sparse page-table rebuilds",
+            labelnames=iteration_labelnames)
 
         # Speculative decoding metrics
         self.counter_spec_decode_num_draft_tokens = Counter(
@@ -1028,14 +1081,14 @@ class MetricsCollector:
                                                             bool) or value < 0:
                     continue
                 key = (rank, level, pool_group, operation)
-                previous = self._prev_tier_movement.get(key, 0)
-                if value >= previous:
+                previous = self._prev_tier_movement.get(key)
+                if previous is None or value > previous:
                     movement_labels = {**labels, "operation": operation}
                     self._log_counter(self.kv_cache_tier_moved_blocks,
-                                      movement_labels, value - previous)
+                                      movement_labels, value - (previous or 0))
                     self._log_counter(self.kv_cache_tier_moved_bytes,
                                       movement_labels,
-                                      (value - previous) * slot_bytes)
+                                      (value - (previous or 0)) * slot_bytes)
                 self._prev_tier_movement[key] = value
 
     def _label_merge(self, labels: Dict[str, str]) -> Dict[str, str]:
@@ -1411,6 +1464,37 @@ class MetricsCollector:
             if histogram is not None:
                 self._log_histogram(histogram, value_seconds, labels=labels)
 
+    def _log_scheduling_decisions(self, ifb_stats: dict,
+                                  rank_labels: Dict[str, str]) -> None:
+        """Log one rank's KV scheduling decision counters from its inflightBatchingStats."""
+        for key, reason in (("numSkippedForwardCtxChunks", "skipped_forward"),
+                            ("numDroppedCtxChunks", "dropped")):
+            if ifb_stats.get(key, 0) > 0:
+                self._log_counter(self.ctx_chunks_reverted, {
+                    **rank_labels, "reason": reason
+                }, ifb_stats[key])
+        for key, reason in (("numGenInitCapHolds", "admission_cap"),
+                            ("numGenInitTransferBudgetHolds",
+                             "transfer_budget")):
+            if ifb_stats.get(key, 0) > 0:
+                self._log_counter(self.gen_init_holds, {
+                    **rank_labels, "reason": reason
+                }, ifb_stats[key])
+        for key, counter in (("numRevertedCtxTokens", self.ctx_tokens_reverted),
+                             ("numCtxDecoderHoldPasses",
+                              self.ctx_decoder_hold_passes),
+                             ("numCtxDecoderHeldRequests",
+                              self.ctx_decoder_held_requests)):
+            if ifb_stats.get(key, 0) > 0:
+                self._log_counter(counter, rank_labels, ifb_stats[key])
+        if ifb_stats.get("genReceiveReadyWaitMs", 0) > 0:
+            self._log_counter(self.gen_receive_ready_wait_seconds, rank_labels,
+                              ifb_stats["genReceiveReadyWaitMs"] / 1e3)
+        if "numDeferredGenReceives" in ifb_stats:
+            self._log_gauge(self.gen_deferred_receives,
+                            ifb_stats["numDeferredGenReceives"],
+                            labels=rank_labels)
+
     def _log_rank_iteration_stats(self, iteration_stats: dict,
                                   rank: str) -> None:
         """Log local KV and scheduling measurements for one rank.
@@ -1499,6 +1583,21 @@ class MetricsCollector:
                 self._log_gauge(self.kv_cache_tokens_per_block,
                                 kv_stats["tokensPerBlock"],
                                 labels=rank_labels)
+            if "hostSlabBytes" in kv_stats:
+                self._log_gauge(self.kv_cache_host_slab_bytes,
+                                kv_stats["hostSlabBytes"],
+                                labels=rank_labels)
+            for key, path in (("numPageTableReuses",
+                               "reused"), ("numPageTableRowUpdates", "rows"),
+                              ("numPageTableFullBuilds", "full")):
+                if kv_stats.get(key, 0) > 0:
+                    self._log_counter(self.kv_cache_page_table_conversions, {
+                        **rank_labels, "path": path
+                    }, kv_stats[key])
+            if kv_stats.get("pageTableFullBuildMs", 0) > 0:
+                self._log_counter(self.kv_cache_page_table_full_build_seconds,
+                                  rank_labels,
+                                  kv_stats["pageTableFullBuildMs"] / 1e3)
 
         # Inflight batching stats
         if ifb_stats := iteration_stats.get("inflightBatchingStats"):
@@ -1534,6 +1633,7 @@ class MetricsCollector:
                     self._log_histogram(self.histogram_prefill_batch_tokens,
                                         num_ctx_tokens,
                                         labels=rank_labels)
+            self._log_scheduling_decisions(ifb_stats, rank_labels)
             # Prefill batch occupancy: context_requests / max_active_requests
             num_context = ifb_stats.get("numContextRequests", 0)
             max_active = iteration_stats.get("maxNumActiveRequests", 0)

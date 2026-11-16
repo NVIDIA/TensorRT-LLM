@@ -298,16 +298,10 @@ class TestExistingRankAndTransferMetrics:
         from types import SimpleNamespace
 
         from tensorrt_llm.executor.result import GenerationResultBase
+        from tensorrt_llm.sampling_params import SamplingParams
 
-        result = SimpleNamespace(
-            candidate_metric_records=[],
-            candidate_metrics=[],
-            metrics_dict={},
-            cached_tokens=0,
-            prompt_token_ids=[1, 2],
-            per_pos_drafted=None,
-            per_pos_accepted=None,
-        )
+        result = GenerationResultBase(id=1, sampling_params=SamplingParams())
+        result.prompt_token_ids = [1, 2]
         output = SimpleNamespace(
             finish_reason="end_id",
             token_ids=[3, 4],
@@ -323,7 +317,7 @@ class TestExistingRankAndTransferMetrics:
             RequestEventTiming.KV_CACHE_SIZE: 1024,
         }
         for sequence_index in [0, 1]:
-            GenerationResultBase.record_stats(result, output, stats, sequence_index)
+            result.record_stats(output, stats, sequence_index)
         for candidate in result.candidate_metrics:
             collector.log_request_metrics_dict(candidate)
         assert _get_counter_value(collector, "kv_cache_transfer_bytes") == 1024
@@ -1853,6 +1847,47 @@ class TestRequestErrorCounter:
 
 
 class TestTierStoragePressure:
+    def test_unchanged_movement_preserves_zero_series_without_counter_updates(
+        self, collector: MetricsCollector, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from unittest.mock import Mock
+
+        snapshot = {
+            "cacheLevel": 0,
+            "poolGroupId": 0,
+            "slotSize": [64],
+            "totalNumBlocks": 10,
+            "freeNumBlocks": 10,
+            "evictableNumBlocks": 0,
+            "restoredBlocks": 0,
+            "evictedBlocks": 0,
+            "capacityDroppedBlocks": 0,
+            "priorityDroppedBlocks": 0,
+        }
+        stats = {"kvCacheStorageStats": [snapshot]}
+        collector.log_iteration_stats(stats)
+        labels = {
+            **collector.labels,
+            "dp_rank": "0",
+            "cache_level": "0",
+            "cache_tier": "",
+            "pool_group": "0",
+            "operation": "restore",
+        }
+        assert _has_series(collector.kv_cache_tier_moved_blocks, labels)
+        log_counter = Mock(wraps=collector._log_counter)
+        monkeypatch.setattr(collector, "_log_counter", log_counter)
+        collector.log_iteration_stats(stats)
+        assert not any(
+            call.args[0] is collector.kv_cache_tier_moved_blocks
+            or call.args[0] is collector.kv_cache_tier_moved_bytes
+            for call in log_counter.call_args_list
+        )
+        snapshot["restoredBlocks"] = 3
+        collector.log_iteration_stats(stats)
+        assert collector.kv_cache_tier_moved_blocks.labels(**labels)._value.get() == 3
+        assert collector.kv_cache_tier_moved_bytes.labels(**labels)._value.get() == 192
+
     def test_serialized_snapshot_keeps_levels_pools_states_and_movement(
         self, collector: MetricsCollector
     ) -> None:
@@ -2045,6 +2080,10 @@ class TestTierStoragePressure:
                 destination_cache_tier="gpu" if operation == "restore" else "disk",
             )
             histogram = collector.histogram_kv_cache_tier_migration.labels(**labels)
+            assert all(
+                boundary in histogram._upper_bounds
+                for boundary in (0.00025, 0.0005, 0.0025, 0.005, 0.025, 0.05, 0.25, 0.5)
+            )
             assert histogram._sum.get() == pytest.approx(expected)
             assert sum(bucket.get() for bucket in histogram._buckets) == 1
         stats["kvCacheMigrationTimings"] = []

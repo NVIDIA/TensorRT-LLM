@@ -28,6 +28,7 @@ from tensorrt_llm._torch.modules.mamba.mamba2_metadata import (
     REPLAY_WORK_ITEM_WIDTH,
     REPLAY_WORK_PNAT,
     REPLAY_WORK_POSITION_IN_DECODE_BATCH,
+    REPLAY_WORK_REPLAY_SLOT,
 )
 from tensorrt_llm._torch.modules.mamba.replay_selective_state_update import (
     _stochastic_round_int8_packed,
@@ -47,13 +48,21 @@ def _make_replay_work_items(
     state_batch_indices,
     device,
     explicit_order=None,
+    replay_batch_indices=None,
 ):
-    """Build the replay metadata consumed by persistent_main."""
+    """Build the replay metadata consumed by persistent_main.
+
+    PNAT and the active buffer are read at the replay slots, which default to
+    the state slots.
+    """
+    if replay_batch_indices is None:
+        replay_batch_indices = state_batch_indices
     position_in_decode_batch = torch.arange(batch, device=device, dtype=torch.int32)
     cache_slot = state_batch_indices[:batch].to(torch.int32)
-    cache_slot_long = cache_slot.to(torch.long)
-    pnat = prev_tokens[cache_slot_long].to(torch.int32)
-    active_cache_buf_idx = cache_buf_idx[cache_slot_long].to(torch.int32)
+    replay_slot = replay_batch_indices[:batch].to(torch.int32)
+    replay_slot_long = replay_slot.to(torch.long)
+    pnat = prev_tokens[replay_slot_long].to(torch.int32)
+    active_cache_buf_idx = cache_buf_idx[replay_slot_long].to(torch.int32)
     write_mask = (pnat + T) > max_window
     n_writes = write_mask.sum().to(torch.int32).reshape(1)
 
@@ -67,6 +76,7 @@ def _make_replay_work_items(
     replay_work_items[:, REPLAY_WORK_CACHE_SLOT] = cache_slot[order]
     replay_work_items[:, REPLAY_WORK_PNAT] = pnat[order]
     replay_work_items[:, REPLAY_WORK_CACHE_BUF_IDX] = active_cache_buf_idx[order]
+    replay_work_items[:, REPLAY_WORK_REPLAY_SLOT] = replay_slot[order]
     return n_writes, replay_work_items.contiguous()
 
 
@@ -965,6 +975,151 @@ def test_replay_selective_state_update_scenarios(
                 atol=0,
                 msg=f"Nowrite slot {i}: state HBM modified (scenario={scenario})",
             )
+
+
+@pytest.mark.parametrize("rectangle_for_nowrite", [False, True], ids=["norect", "rect"])
+@pytest.mark.parametrize("mode", ["persistent_main", "persistent_dynamic"], ids=["pm", "pd"])
+def test_replay_selective_state_update_with_separate_replay_slots(mode, rectangle_for_nowrite):
+    """Replay history addressed through its own slots matches history stored at the state slots.
+
+    The replay slots are a different permutation in a larger buffer, and PNAT and the active
+    buffer index live in strided 16-byte rows, as in a KV-cache-manager pool. Outputs, states
+    and the history each request writes match the coupled run bit for bit; rows of other slots
+    are left alone.
+    """
+    nheads, head_dim, d_state, ngroups = 16, 64, 128, 1
+    T, max_window = 6, 16
+    device, dtype = "cuda", torch.bfloat16
+    num_state_slots, num_replay_slots = 5, 7
+    state_batch_indices = torch.tensor([3, 0, 4, 1], device=device, dtype=torch.int32)
+    replay_batch_indices = torch.tensor([6, 2, 0, 5], device=device, dtype=torch.int32)
+    # Mixed checkpoint-write (PNAT + T > max_window) and append requests.
+    pnat_per_request = torch.tensor([3, 12, 10, 15], device=device, dtype=torch.int32)
+    batch = state_batch_indices.shape[0]
+    state_rows = state_batch_indices.long()
+    replay_rows = replay_batch_indices.long()
+
+    generator = torch.Generator(device=device).manual_seed(7)
+
+    def randn(*shape, out_dtype=dtype, scale=1.0):
+        values = torch.randn(shape, generator=generator, device=device) * scale
+        return values.to(out_dtype)
+
+    A_base = -torch.rand(nheads, generator=generator, device=device) - 0.5
+    A = repeat(A_base, "h -> h p n", p=head_dim, n=d_state)
+    dt_bias = repeat(randn(nheads), "h -> h p", p=head_dim)
+    D = repeat(randn(nheads), "h -> h p", p=head_dim)
+    x = randn(batch, T, nheads, head_dim)
+    dt = repeat(randn(batch, T, nheads), "b t h -> b t h p", p=head_dim)
+    B = randn(batch, T, ngroups, d_state)
+    C = randn(batch, T, ngroups, d_state)
+    state0 = randn(num_state_slots, nheads, head_dim, d_state)
+
+    names = ("old_x", "old_B", "old_dt", "old_dA_cumsum")
+    coupled = {
+        "old_x": randn(num_state_slots, 2, max_window, nheads, head_dim),
+        "old_B": randn(num_state_slots, 2, max_window, ngroups, d_state),
+        "old_dt": randn(num_state_slots, 2, nheads, max_window, out_dtype=torch.float32).abs(),
+        "old_dA_cumsum": randn(
+            num_state_slots, 2, nheads, max_window, out_dtype=torch.float32, scale=0.1
+        ),
+    }
+    coupled_pnat = torch.zeros(num_state_slots, device=device, dtype=torch.int32)
+    coupled_pnat[state_rows] = pnat_per_request
+    coupled_buf = torch.randint(
+        0, 2, (num_state_slots,), generator=generator, device=device, dtype=torch.int32
+    )
+
+    separate = {
+        name: randn(num_replay_slots, *tensor.shape[1:], out_dtype=tensor.dtype)
+        for name, tensor in coupled.items()
+    }
+    for name in names:
+        separate[name][replay_rows] = coupled[name][state_rows]
+    # [PNAT, active buffer, padding, padding] per replay slot.
+    meta = torch.full((num_replay_slots, 4), -1, device=device, dtype=torch.int32)
+    meta[replay_rows, 0] = pnat_per_request
+    meta[replay_rows, 1] = coupled_buf[state_rows]
+    separate_before = {name: tensor.clone() for name, tensor in separate.items()}
+    meta_before = meta.clone()
+
+    def run(history, pnat, cache_buf_idx, replay_indices):
+        n_writes, work_items = _make_replay_work_items(
+            pnat,
+            cache_buf_idx,
+            T,
+            max_window,
+            batch,
+            state_batch_indices,
+            device,
+            replay_batch_indices=replay_indices,
+        )
+        state = state0.clone()
+        out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
+        replay_selective_state_update(
+            state,
+            *(history[name] for name in names),
+            cache_buf_idx,
+            pnat,
+            x=x,
+            dt=dt,
+            A=A,
+            B=B,
+            C=C,
+            out=out,
+            n_writes=n_writes,
+            replay_work_items=work_items,
+            D=D,
+            dt_bias=dt_bias,
+            dt_softplus=True,
+            state_batch_indices=state_batch_indices,
+            replay_batch_indices=replay_indices,
+            mode=mode,
+            rectangle_for_nowrite=rectangle_for_nowrite,
+        )
+        return state, out
+
+    expected_state, expected_out = run(coupled, coupled_pnat, coupled_buf, None)
+    state, out = run(separate, meta[:, 0], meta[:, 1], replay_batch_indices)
+
+    assert torch.equal(out, expected_out)
+    assert torch.equal(state, expected_state)
+    others = [slot for slot in range(num_replay_slots) if slot not in replay_rows.tolist()]
+    for name in names:
+        assert torch.equal(separate[name][replay_rows], coupled[name][state_rows]), name
+        assert torch.equal(separate[name][others], separate_before[name][others]), name
+    assert torch.equal(meta, meta_before)
+
+
+@pytest.mark.parametrize("builder", ["torch", "triton"])
+def test_replay_work_items_read_replay_slots(builder):
+    """Work items carry the state slot and replay slot and read PNAT through the replay slot."""
+    from tensorrt_llm._torch.modules.mamba.mamba2_metadata import (
+        _build_replay_work_items_torch,
+        _build_replay_work_items_triton,
+    )
+
+    device = "cuda"
+    state_indices = torch.tensor([3, 0, 4, 1], device=device, dtype=torch.int32)
+    replay_indices = torch.tensor([6, 2, 0, 5], device=device, dtype=torch.int32)
+    meta = torch.full((7, 4), -1, device=device, dtype=torch.int32)
+    meta[replay_indices.long(), 0] = torch.tensor([3, 12, 10, 15], device=device, dtype=torch.int32)
+    meta[replay_indices.long(), 1] = torch.tensor([0, 1, 1, 0], device=device, dtype=torch.int32)
+    work_items = torch.zeros(8, REPLAY_WORK_ITEM_WIDTH, device=device, dtype=torch.int32)
+    n_writes = torch.zeros(1, device=device, dtype=torch.int32)
+    build = (
+        _build_replay_work_items_torch if builder == "torch" else _build_replay_work_items_triton
+    )
+    build(state_indices, meta[:, 0], meta[:, 1], work_items, n_writes, 6, 16, replay_indices)
+
+    # Requests 1 and 3 write a checkpoint (PNAT + 6 > 16) and come first.
+    assert n_writes.item() == 2
+    rows = work_items[:4]
+    assert rows[:, REPLAY_WORK_POSITION_IN_DECODE_BATCH].tolist() == [1, 3, 0, 2]
+    assert rows[:, REPLAY_WORK_CACHE_SLOT].tolist() == [0, 1, 3, 4]
+    assert rows[:, REPLAY_WORK_REPLAY_SLOT].tolist() == [2, 5, 6, 0]
+    assert rows[:, REPLAY_WORK_PNAT].tolist() == [12, 15, 3, 10]
+    assert rows[:, REPLAY_WORK_CACHE_BUF_IDX].tolist() == [1, 0, 0, 1]
 
 
 @pytest.mark.parametrize(

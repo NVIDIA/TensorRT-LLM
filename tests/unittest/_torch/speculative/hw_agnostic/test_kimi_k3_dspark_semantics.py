@@ -483,7 +483,7 @@ needs_gpu = pytest.mark.skipif(
 def test_dspark_drafter_loads_head_weights_and_parses_config():
     weights = _tiny_weights()
     drafter = _build_drafter(True, weights)
-    assert drafter._dspark_shift_label and drafter._use_swa
+    assert drafter.shift_label and drafter._use_swa
     assert drafter._swa_window == SWA_WINDOW
     assert drafter._layer_windows == [(SWA_WINDOW - 1, SWA_WINDOW - 1)] * 2
     assert drafter.has_markov_head
@@ -658,7 +658,7 @@ def test_published_drafter_spelling_activates_the_heads():
     # Declared nowhere in the published config, so it rides on the DSpark
     # default. False would run slots 1..K on a block_size-K drafter and read
     # the next request's anchor slot.
-    assert drafter._dspark_shift_label
+    assert drafter.shift_label
     torch.testing.assert_close(drafter.markov_w1.cpu(), weights["markov_head.markov_w1.weight"])
     assert drafter.confidence_proj_bias is not None
 
@@ -743,8 +743,8 @@ def test_plain_dflash_drafter_keeps_old_gates():
     drafter = _build_drafter(False, _tiny_weights())
     assert not drafter._use_swa
     assert drafter._layer_windows == [(-1, -1)] * 2
+    assert drafter.shift_label is False
     for absent in (
-        "_dspark_shift_label",
         "has_markov_head",
         "markov_w1",
         "confidence_proj_weight",
@@ -1448,7 +1448,7 @@ def test_mla_dspark_loads_the_torchspec_spelling_and_keeps_its_embedding():
     weights = _tiny_mla_weights()
     drafter = _build_mla_drafter(weights)
 
-    assert drafter._dspark_shift_label
+    assert drafter.shift_label
     assert drafter.has_markov_head
     assert drafter._kv_factor == 1, "the MLA cache stores one latent, not K and V"
     assert (drafter._num_kv_heads, drafter._head_dim) == (1, MLA_LATENT)

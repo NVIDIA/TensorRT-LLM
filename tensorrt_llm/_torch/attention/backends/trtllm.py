@@ -28,11 +28,12 @@ import torch
 if TYPE_CHECKING:
     from tensorrt_llm.mapping import Mapping
 
+    from ...host_staging import HostUploader
     from ...model_config import ModelConfig
     from ...speculative.interface import SpecMetadata
     from ...speculative.spec_tree_manager import SpecTreeManager
     from .fmha.gqa_decode import GqaDecodeFmha, GqaDecodeSetup
-    from .fmha.interface import Fmha
+    from .fmha.interface import Fmha, FmhaPrewarmConfig
     from .sparse.dsa.metadata import TokenMajorGenView
 
 from tensorrt_llm._utils import (get_sm_version, is_sm_100f, is_sm_120f,
@@ -47,7 +48,7 @@ from tensorrt_llm.quantization.mode import QuantMode
 
 from ...distributed import cp_allgather
 from ...kimi_k3_cache_policy import get_kimi_k3_fp8_kv_layer_ids, is_kimi_k3
-from ...pyexecutor import step_inputs
+from ...pyexecutor import h2d_cache, step_inputs
 from ...pyexecutor.config_utils import is_mla
 from ...pyexecutor.h2d_cache import copy_h2d_pool_shared
 from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
@@ -63,12 +64,19 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
                         KVCacheParams, MLAParams, PositionalEmbeddingParams,
                         PredefinedAttentionMask, RopeParams,
                         merge_attention_forward_args)
+from .mixed_precision_rows import store_mixed_precision_low_rows
 from .sparse.hooks import prepare_sparse_runtime_params
 from .sparse.params import BlockSparseForwardInputs, SparseParams
 from .sparse.skip_softmax import SkipSoftmaxParams
 from .utils import log_attention_failure_context
 
 _SKIP_CORRECTION_SUPPORTED_SMS = frozenset((100, 103))
+
+
+def _has_fp8_context_mla_fmha(sm_version: int) -> bool:
+    """Whether MLA context attention with an FP8 or NVFP4 KV cache runs the op's
+    FP8 context MLA FMHA on this SM (``mFP8ContextMLA`` in thop/attentionOp.cpp)."""
+    return sm_version == 90 or is_sm_100f(sm_version) or is_sm_120f(sm_version)
 
 
 def _resolve_skip_correction_threshold(threshold: float,
@@ -207,6 +215,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     # when beam search is enabled.
     beam_width: int = 1
 
+    # Set by the runner that owns this metadata: per-step uploads go through it.
+    host_uploader: Optional["HostUploader"] = None
+
     # Plan caches of the FMHA libraries, keyed by library. A planned wrapper owns
     # workspaces that CUDA graphs capture, so it lives exactly as long as this
     # metadata; every layer that runs with this metadata reuses it.
@@ -309,6 +320,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     kv_cache_block_offsets: Optional[torch.Tensor] = None
     host_kv_cache_block_offsets: Optional[torch.Tensor] = None
     draft_kv_cache_block_offsets: Optional[torch.Tensor] = None
+    # Cold-page window: the high page table (-1 = not held) and the block
+    # offsets before the redirect.
+    mixed_precision_high_block_table: Optional[Any] = None
+    draft_mixed_precision_high_block_table: Optional[Any] = None
+    mixed_precision_low_block_offsets: Optional[torch.Tensor] = None
+    draft_mixed_precision_low_block_offsets: Optional[torch.Tensor] = None
+    # The sparse backends redirect selected rows instead of block offsets.
+    mixed_precision_block_offsets_redirect: ClassVar[bool] = True
     # Active block-ID buffers, defaulting to the target cache. Separate draft
     # storage lets CUDA graphs bind stable target and draft addresses.
     block_ids_per_seq: Optional[torch.Tensor] = None
@@ -564,6 +583,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     capture_graph=capture_graph,
                 )
 
+            self._create_mixed_precision_high_block_tables(
+                buffers, capture_graph)
+
             if self.enable_flash_mla:
                 self.block_ids_per_seq = self.get_empty(
                     buffers,
@@ -756,6 +778,28 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         state = getattr(self, "fp4_mla_state", None)
         if state is not None:
             state.update_for_spec_dec(self)
+
+    def set_decode_kv_regime(self, kv_regime: Optional[int]) -> None:
+        # The FP4 MLA decode dispatcher chooses 2x | 4x | two-stream on it.
+        state = self.fp4_mla_state
+        if state is not None:
+            state.kv_regime_max_kv = kv_regime
+
+    @property
+    def decode_kv_regime(self) -> Optional[int]:
+        state = self.fp4_mla_state
+        return None if state is None else state.kv_regime_max_kv
+
+    def set_decode_packed_split(self, packed_split: Optional[bool]) -> None:
+        # The FP4 MLA packed decode launches its split budget only when True.
+        state = self.fp4_mla_state
+        if state is not None:
+            state.packed_split = packed_split
+
+    @property
+    def decode_packed_split(self) -> Optional[bool]:
+        state = self.fp4_mla_state
+        return None if state is None else state.packed_split
 
     def _invalidate_mla_scheduler_buffers(self) -> None:
         # Spec-dec rewrites q_lens and kv_lens between sub-steps, so the cumulative
@@ -1070,6 +1114,15 @@ class TrtllmAttentionMetadata(AttentionMetadata):
              self.host_request_types_runtime, self._num_generations,
              self.max_num_sequences) = saved
 
+    def _upload_to_device(self, key: str, destination: torch.Tensor,
+                          value: torch.Tensor, engine_staging: bool) -> bool:
+        """Copy host ``value`` into ``destination`` through the runner's uploader, unless the
+        engine stages this copy itself (``engine_staging``) or no uploader is set: then False."""
+        if self.host_uploader is None or engine_staging:
+            return False
+        self.host_uploader.upload(key, value, destination)
+        return True
+
     def prepare(self) -> None:
         super().prepare()
         self.context_plan = None
@@ -1101,9 +1154,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             device='cpu',
         )
         self.prompt_lens_cpu[:self.num_seqs].copy_(prompt_lens)
-        copy_h2d_pool_shared(self.prompt_lens_cuda[:self.num_seqs],
-                             self.prompt_lens_cpu[:self.num_seqs],
-                             pack=True)
+        if not self._upload_to_device(
+                "prompt_lens", self.prompt_lens_cuda[:self.num_seqs],
+                self.prompt_lens_cpu[:self.num_seqs], h2d_cache.enabled()):
+            copy_h2d_pool_shared(self.prompt_lens_cuda[:self.num_seqs],
+                                 self.prompt_lens_cpu[:self.num_seqs],
+                                 pack=True)
 
         # number of tokens in the kv cache for each sequence in the batch
         cached_token_lens = torch.tensor(
@@ -1158,8 +1214,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # the sequence length including the cached tokens and the input tokens.
         self.kv_lens[:self.num_seqs].copy_(
             kv_lens + self.kv_cache_params.num_extra_kv_tokens)
-        step_inputs.copy_(self.kv_lens_cuda[:self.num_seqs],
-                          maybe_pin_memory(kv_lens[:self.num_seqs]))
+        if not self._upload_to_device(
+                "kv_lens", self.kv_lens_cuda[:self.num_seqs],
+                kv_lens[:self.num_seqs], step_inputs.is_open()):
+            step_inputs.copy_(self.kv_lens_cuda[:self.num_seqs],
+                              maybe_pin_memory(kv_lens[:self.num_seqs]))
         # total kv lens for context requests and generation requests, without extra tokens
         self.host_total_kv_lens[0] = kv_lens[:self.num_contexts].sum().item()
         self.host_total_kv_lens[1] = kv_lens[self.num_contexts:self.
@@ -1247,6 +1306,115 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             # Native BF16 paged-context FMHA reads 32-token pages.
             self.prepare_mixed_precision_kv(
                 "HND", min(self.kv_cache_manager.tokens_per_block, 32))
+        self._fill_mixed_precision_high_block_tables()
+
+    @property
+    def redirects_mixed_precision_block_offsets(self) -> bool:
+        """Dense attention: the block offsets of held blocks point at the high layer's blocks."""
+        return (self.mixed_precision_high_block_table is not None
+                and self.mixed_precision_block_offsets_redirect)
+
+    def _create_mixed_precision_high_block_tables(self, buffers,
+                                                  capture_graph: bool) -> None:
+        """Allocate the high page tables and, for dense attention, the block-offset copies."""
+        (self.mixed_precision_high_block_table,
+         self.mixed_precision_low_block_offsets) = (
+             self._new_mixed_precision_high_block_tables(
+                 self.kv_cache_manager, "", buffers, capture_graph))
+        (self.draft_mixed_precision_high_block_table,
+         self.draft_mixed_precision_low_block_offsets) = (
+             self._new_mixed_precision_high_block_tables(
+                 self.draft_kv_cache_manager, "draft_", buffers, capture_graph))
+
+    def _new_mixed_precision_high_block_tables(
+        self, manager, cache_prefix: str, buffers, capture_graph: bool
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """The high page table and block-offset copy of one manager; None where it takes none."""
+        if not getattr(manager, "mixed_precision_high_layers", None):
+            return None, None  # no manager, or no mixed precision
+        redirect_block_offsets = self.mixed_precision_block_offsets_redirect
+        if redirect_block_offsets and not manager.mixed_precision_high_layer_offsets:
+            return None, None  # NVFP4 history: dense attention runs on the staging copy
+        if redirect_block_offsets and manager._use_per_layer_page_tables:
+            raise NotImplementedError(
+                "The cold-page first/last-N window needs one block-offset "
+                "table per pool")
+        high_table = self.get_empty(
+            buffers,
+            [self.max_num_sequences, manager.max_blocks_per_seq],
+            cache_name=cache_prefix + "mixed_precision_high_block_table",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+        if not redirect_block_offsets:
+            return high_table, None
+        low_block_offsets = self.get_empty(
+            buffers,
+            [
+                manager.num_attention_op_pools, self.max_num_sequences, 2,
+                manager.max_blocks_per_seq
+            ],
+            cache_name=cache_prefix + "mixed_precision_low_block_offsets",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+        return high_table, low_block_offsets
+
+    def _fill_mixed_precision_high_block_table(
+            self, manager, high_layer: int, high_table: torch.Tensor) -> None:
+        """Refresh a high page table over its full width; the draft loop writes past this step."""
+        host_table = torch.full((self.num_seqs, high_table.shape[1]),
+                                -1,
+                                dtype=torch.int32,
+                                pin_memory=prefer_pinned())
+        manager._fill_page_table(high_layer, self.request_ids,
+                                 host_table.numpy())
+        high_table[:self.num_seqs].copy_(host_table, non_blocking=True)
+
+    def _fill_mixed_precision_high_block_tables(self) -> None:
+        """Refresh the high page tables; dense attention also points held blocks at the high layer's blocks."""
+        num_seqs = self.num_seqs
+        for manager, high_table, low_offsets, block_offsets in (
+            (self.kv_cache_manager, self.mixed_precision_high_block_table,
+             self.mixed_precision_low_block_offsets,
+             self.kv_cache_block_offsets),
+            (self.draft_kv_cache_manager,
+             self.draft_mixed_precision_high_block_table,
+             self.draft_mixed_precision_low_block_offsets,
+             self.draft_kv_cache_block_offsets),
+        ):
+            if high_table is None:
+                continue
+            # All layers share one mixed-precision high pool, so one table serves them all.
+            self._fill_mixed_precision_high_block_table(
+                manager,
+                next(iter(manager.mixed_precision_high_layers.values())),
+                high_table)
+            if low_offsets is None:
+                continue
+            low_offsets[:, :num_seqs].copy_(block_offsets[:, :num_seqs])
+            # A block is held when the high page table has a page for it.
+            held_blocks = high_table[:num_seqs] >= 0
+            for pool_id, high_block_delta in manager.mixed_precision_high_block_deltas.items(
+            ):
+                if high_block_delta is None:
+                    raise NotImplementedError(
+                        "The cold-page first/last-N window needs every mixed-precision "
+                        "high layer of a pool at the same block distance from its layer"
+                    )
+                # Point the held blocks of this pool at the high layer's blocks, K and V.
+                pool_block_offsets = block_offsets[pool_id, :num_seqs]
+                high_block_offsets = high_table[:num_seqs] * manager.kv_factor + high_block_delta
+                torch.where(held_blocks,
+                            high_block_offsets,
+                            pool_block_offsets[:, 0],
+                            out=pool_block_offsets[:, 0])
+                if manager.kv_factor == 2:
+                    torch.where(held_blocks,
+                                high_block_offsets +
+                                int(manager.kv_offset[pool_id]),
+                                pool_block_offsets[:, 1],
+                                out=pool_block_offsets[:, 1])
 
     def _on_mixed_precision_kv_prepared(self, view) -> None:
         """Lay out the staging pages as TRTLLM block offsets for this batch."""
@@ -1285,6 +1453,27 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         """Undo _swap_mixed_precision_kv, block offsets included."""
         super()._restore_mixed_precision_kv(saved[:2])
         self.kv_cache_block_offsets = saved[2]
+
+    def _layer_takes_mixed_precision(self, layer_idx: int) -> bool:
+        """Whether this attention layer has a mixed-precision high layer in the current manager."""
+        manager = self.kv_cache_manager
+        return manager.layer_offsets[
+            layer_idx] in manager.mixed_precision_high_layers
+
+    @contextlib.contextmanager
+    def mixed_precision_kv_staging(self, layer_idx: int):
+        """Cold-page first/last-N mixed precision: a layer that takes it reads through its
+        redirected block offsets and copies the step's new rows back afterwards; a layer that
+        does not (a sliding-window layer, for example) runs untouched."""
+        if not self.redirects_mixed_precision_block_offsets:
+            with super().mixed_precision_kv_staging(layer_idx):
+                yield
+            return
+        if not self._layer_takes_mixed_precision(layer_idx):
+            yield
+            return
+        yield
+        store_mixed_precision_low_rows(self, layer_idx)
 
     def prepare_encoder_decoder_from_precomputed_lengths(
             self, prompt_lens: torch.Tensor, kv_lens: torch.Tensor,
@@ -1347,6 +1536,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 and not self.enable_context_mla_with_cached_kv
                 and self.fp4_mla_state is None
                 and not self._has_mixed_precision_staging()
+                and self.mixed_precision_high_block_table is None
                 and not self.kv_cache_params.use_full_generation_page_table)
 
     def key_prepared_block_offsets(self) -> None:
@@ -1409,6 +1599,88 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             prompt_lens_cpu=self.prompt_lens_cpu[:num_seqs],
             host_request_types=self.host_request_types[:num_seqs],
         )
+
+    def support_steady_gen_step(self) -> bool:
+        """Whether ``prepare_steady_gen_step`` may advance this metadata.
+
+        True for the plain decode configuration whose per-step state is fully
+        described by the kv lengths and the KV block table: this class itself
+        (the sparse-attention subclasses keep per-step state in their own
+        ``prepare()``), no FP4-MLA state, no helix / cross attention / locality
+        domains / flash-MLA / MLA cached-kv prefill handling, no mixed-precision
+        KV staging, and a KV cache manager with a known block size.
+        """
+        return (type(self) is TrtllmAttentionMetadata
+                and self.fp4_mla_state is None
+                and self.kv_cache_manager is not None and getattr(
+                    self.kv_cache_manager, 'tokens_per_block', None) is not None
+                and not self.enable_helix and not self.has_cross_sub_metadata
+                and not getattr(self, 'locality_domain_enabled', False)
+                and not self.enable_flash_mla
+                and not self.enable_context_mla_with_cached_kv
+                and not self._has_mixed_precision_staging()
+                and self.kv_cache_params is not None
+                and self.kv_cache_params.use_cache)
+
+    def prepare_steady_gen_step(self, num_real: int, *,
+                                refresh_block_offsets: bool) -> None:
+        """Advance the state of the last ``prepare()`` by one decode step.
+
+        Valid only right after a ``prepare()`` (or a previous call of this
+        method) for a generation-only batch whose first ``num_real`` requests
+        each committed exactly one more token and whose remaining rows are
+        CUDA-graph padding dummies; ``kv_cache_params`` must already hold
+        this step's cached-token counts. Prompt lengths, request types, seq
+        lens and request ids are unchanged, so only the kv lengths move (one
+        in-place add on host and device instead of a rebuilt tensor and an
+        H2D copy). The KV block table is re-staged only when the caller saw a
+        real request start a new block (``refresh_block_offsets``); otherwise
+        the previously staged prefix still covers every block the kernels
+        read. The Mamba metadata, if any, skips its state-index staging the
+        same way.
+        """
+        if self.mamba_metadata:
+            self.mamba_metadata.prepare_steady_gen_step(self)
+        extra_attrs = get_model_extra_attrs()
+        if extra_attrs is None:
+            get_global_attrs().attention_metadata = weakref.ref(self)
+
+        num_seqs = self.num_seqs
+        self.kv_lens[:num_real].add_(1)
+        self.kv_lens_cuda[:num_real].add_(1)
+        # prepare() binds kv_lens_runtime (host_past_key_value_lengths in
+        # thop.attention, hence max_past_kv_length / mMaxSeqLenKv) to a tensor
+        # of its own without the extra kv tokens, not to self.kv_lens: move it
+        # with the others or eager attention launches keep the stale bound.
+        self.kv_lens_runtime[:num_real].add_(1)
+        self.host_total_kv_lens[1] += num_real
+
+        if refresh_block_offsets:
+            max_kv_len = int(self.kv_lens[:num_seqs].max())
+            spec_active = (self.draft_kv_cache_manager is not None
+                           or self.is_spec_decoding_enabled
+                           or bool(self.kv_cache_params.num_extra_kv_tokens) or
+                           (self.runtime_features is not None and
+                            self.runtime_features.has_speculative_draft_tokens))
+            max_blocks = None
+            if not spec_active and self.kv_cache_manager.tokens_per_block:
+                max_blocks = ceil_div(max_kv_len,
+                                      self.kv_cache_manager.tokens_per_block)
+            self.kv_cache_manager.copy_batch_block_offsets(
+                self.kv_cache_block_offsets,
+                self.request_ids,
+                self.beam_width,
+                self.num_contexts,
+                num_seqs,
+                max_blocks=max_blocks)
+            if self.draft_kv_cache_manager is not None:
+                self.draft_kv_cache_manager.copy_batch_block_offsets(
+                    self.draft_kv_cache_block_offsets,
+                    self.request_ids,
+                    self.beam_width,
+                    self.num_contexts,
+                    num_seqs,
+                    max_blocks=max_blocks)
 
     def prepare_encoder_only(self) -> None:
         """Fast path for encoder-only forward (eager + CUDA graph capture)."""
@@ -1486,6 +1758,21 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.block_ids_per_seq[:self.num_generations, :num_blocks].copy_(
             block_ids_per_seq[self.num_contexts:], non_blocking=True)
 
+    def _mla_cached_kv_partition_tokens(self) -> Optional[int]:
+        """Cached tokens attended per MLA context partition, or None if unpartitioned.
+
+        Chunked prefill splits the cached prefix by its buffer size. FP4 MLA
+        also attends a prefix claimed by block reuse in partitions read back
+        from FP4 storage; each partition must fit the FP8 context scratch,
+        which holds ``max_num_tokens`` tokens per chunked-prefill buffer.
+        """
+        features = self.runtime_features
+        if features.chunked_prefill:
+            return features.chunk_size * features.chunked_prefill_buffer_batch_size
+        if self.fp4_mla_state is not None:
+            return int(self.max_num_tokens)
+        return None
+
     def pre_process_for_chunked_prefill(
         self,
         chunked_seq_len: torch.Tensor,
@@ -1495,15 +1782,19 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         merge_op_tensor: torch.Tensor,
         max_chunk_len_per_loop: list[int],
         chunked_loop_num: int,
+        total_chunk_size: Optional[int] = None,
     ) -> None:
         """
         Pre-process the MLA layer for chunked prefill.
         This method is called before the forward pass to prepare the MLA layer for chunked prefill.
+        Each loop attends at most ``total_chunk_size`` cached tokens summed over the
+        context requests; it defaults to the chunked-prefill buffer size.
         """
         num_contexts = self.num_contexts
-        chunk_size = self.runtime_features.chunk_size
-        chunk_batch_size = self.runtime_features.chunked_prefill_buffer_batch_size
-        total_chunk_size = chunk_size * chunk_batch_size
+        if total_chunk_size is None:
+            chunk_size = self.runtime_features.chunk_size
+            chunk_batch_size = self.runtime_features.chunked_prefill_buffer_batch_size
+            total_chunk_size = chunk_size * chunk_batch_size
         remain_buffer_len = total_chunk_size
         current_batch_idx = 0
         max_chunk_len_per_loop.clear()
@@ -1611,10 +1902,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             )
             # determine the number of loop
             # currently we assume that the chunk size is the same as the max_num_tokens
-            if self.runtime_features.chunked_prefill:
-                chunk_size = self.runtime_features.chunk_size
-                chunk_batch_size = self.runtime_features.chunked_prefill_buffer_batch_size
-                total_chunk_size = chunk_size * chunk_batch_size
+            total_chunk_size = self._mla_cached_kv_partition_tokens()
+            if total_chunk_size is not None:
                 self.chunked_loop_num = math.ceil(self.num_ctx_cached_tokens /
                                                   total_chunk_size)
                 self.chunked_seq_len = torch.zeros(
@@ -1666,7 +1955,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     cu_chunked_seq_len=self.host_cu_chunked_seq_len,
                     merge_op_tensor=self.host_merge_op_tensor,
                     max_chunk_len_per_loop=self.max_chunk_len_per_loop,
-                    chunked_loop_num=self.chunked_loop_num)
+                    chunked_loop_num=self.chunked_loop_num,
+                    total_chunk_size=total_chunk_size)
                 self.chunked_seq_len.copy_(self.host_chunked_seq_len,
                                            non_blocking=True)
                 self.cu_chunked_seq_len.copy_(self.host_cu_chunked_seq_len,
@@ -1916,6 +2206,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     cache_context_plan: bool = False
     # FMHA library classes this instance tries before the registry's libraries.
     prepended_fmha_lib_classes: tuple = ()
+    # Head dimension per K/V stage of FlashInferTrtllmGenFmha's FP8 paged causal context attention, run through
+    # trtllm::fmha_paged_context_fp8; 0 keeps FlashInfer's kernel.
+    context_fmha_head_dim_per_stage_kv: int = 0
+    # In a context-only step, FlashInferTrtllmGenFmha computes only each request's last output row (the others are
+    # zero); every row's K / V is still written.
+    context_last_rows_only: bool = False
 
     # Layer state the native attention op reads through FmhaParams.attn. The
     # generator (scripts/generate_fmha_params.py) collects these annotations;
@@ -1960,6 +2256,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         skip_correction_threshold: float = 0.0,
         gqa_decode: Optional["GqaDecodeSetup"] = None,
         cache_context_plan: bool = False,
+        context_fmha_head_dim_per_stage_kv: int = 0,
+        context_last_rows_only: bool = False,
         **kwargs,
     ) -> None:
         """
@@ -1989,6 +2287,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             cache_context_plan (bool): Plan a context-only forward once for the
                 layers that share its metadata and run the trtllm-gen context
                 kernel from that plan (dense, non-sparse layers only).
+            context_fmha_head_dim_per_stage_kv (int): See the class attribute.
+            context_last_rows_only (bool): See the class attribute.
         """
         super().__init__(layer_idx, num_heads, head_dim, num_kv_heads,
                          quant_config, **kwargs)
@@ -2062,6 +2362,15 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self.local_layer_idx: Optional[int] = None
         self._fmha_manager: Optional[FmhaManager] = None
         self.gqa_decode = gqa_decode
+        if context_fmha_head_dim_per_stage_kv < 0 or (
+                context_fmha_head_dim_per_stage_kv > 0
+                and head_dim % context_fmha_head_dim_per_stage_kv != 0):
+            raise ValueError(
+                f"context_fmha_head_dim_per_stage_kv="
+                f"{context_fmha_head_dim_per_stage_kv} must be 0 or divide "
+                f"head_dim={head_dim}.")
+        self.context_fmha_head_dim_per_stage_kv = context_fmha_head_dim_per_stage_kv
+        self.context_last_rows_only = context_last_rows_only
         # A GQA decode library of this layer, which plans the module's KV append and deferred prologue (set with
         # the FMHA manager).
         self.gqa_decode_fmha: Optional["GqaDecodeFmha"] = None
@@ -2083,6 +2392,20 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         """Whether this layer executes dense FP4 MLA, not sparse NVFP4 storage."""
         return (self.is_mla_enable and self.has_fp4_kv_cache
                 and self.sparse_params is None)
+
+    @property
+    def has_fp8_context_mla(self) -> bool:
+        """Whether MLA context attention with an FP8 KV cache runs the op's FP8
+        context MLA FMHA, which reads FP8 Q, K and V."""
+        return (self.is_mla_enable and self.has_fp8_kv_cache
+                and _has_fp8_context_mla_fmha(get_sm_version()))
+
+    def prewarm_fmha(self, config: "FmhaPrewarmConfig",
+                     attempted: set[type["Fmha"]]) -> None:
+        """Prewarm the initialized manager's eligible libraries, once per library."""
+        manager = getattr(self, "_fmha_manager", None)
+        if manager is not None:
+            manager.prewarm(config, attempted)
 
     def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
         self.quant_config = new_quant_config or QuantConfig()
@@ -2191,12 +2514,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             if fp8_fallback_layers and fp8_fallback_layers.intersection(
                     mapping.pp_layers(config.num_hidden_layers)):
                 nvfp4_uses_fp8_context = True
-        sm_version = get_sm_version()
         fp8_context_mla = (quant_mode is not None
                            and (quant_mode.has_fp8_kv_cache()
                                 or nvfp4_uses_fp8_context)
-                           and (sm_version == 90 or is_sm_100f(sm_version)
-                                or is_sm_120f(sm_version)))
+                           and _has_fp8_context_mla_fmha(get_sm_version()))
         if not fp8_context_mla:
             return 0
         # Attention-DP runs the full head set per rank; otherwise heads shard across TP (mirror
@@ -3375,7 +3696,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata.kv_cache_block_offsets,
             metadata.kv_cache_manager.kv_cache_pool_pointers,
             metadata.kv_cache_manager.kv_cache_pool_mapping,
-            None,  # kv_scale_orig_quant
+            # An FP8 pool quantizes with the per-tensor scale; NVFP4 uses its block scales.
+            self.kv_scale_orig_quant if self.has_fp8_kv_cache else None,
             0,  # residual_dim
             self.get_local_layer_idx(metadata),
             metadata.kv_cache_manager.tokens_per_block,

@@ -240,6 +240,11 @@ def test_accuracy_directories_are_targets(repo: Path = _REPO):
     assert not problems, "\n".join(problems)
 
 
+# Families that ship directly constructed components without a registered model.
+# An exemption is invalid as soon as routing or registry imports are introduced.
+_COMPONENT_ONLY_FAMILIES: set[str] = {"beam"}
+
+
 def test_every_routed_target_has_accuracy_tests(repo: Path = _REPO):
     """Every class a family's ``route`` returns lives in a target with accuracy tests.
 
@@ -251,6 +256,15 @@ def test_every_routed_target_has_accuracy_tests(repo: Path = _REPO):
     for family_dir in _families(repo):
         routing = family_dir / "routing.py"
         where = routing.relative_to(repo)
+        if family_dir.name in _COMPONENT_ONLY_FAMILIES:
+            registry = repo / _PY / "models/__init__.py"
+            prefix = f"{_MODELS_PACKAGE}.{family_dir.name}"
+            imported = any(
+                name == prefix or name.startswith(prefix + ".") for name in _imports(registry, repo)
+            )
+            if routing.exists() or imported:
+                problems.append(f"{where}: component-only exemption has routing or registration")
+            continue
         if not routing.is_file():
             problems.append(f"{where}: missing")
             continue

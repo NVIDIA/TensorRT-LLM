@@ -81,19 +81,20 @@ def test_explicit_global_production_matches_original(model_and_config, overlap, 
                 for buffer, old in zip(buffers, initial):
                     buffer.copy_(old)
                 metadata.prepare()
+                project = owner.self_attn.compressor.project
+
+                def record_project(x, batch, index_wk):
+                    # Steps of <= 64 rows compute index K in the fused launch, without index_wk.
+                    latent, index_k = project(x, batch, index_wk)
+                    values["index_wk"] = (index_k.clone(),)
+                    return latent, index_k
+
                 with (
                     explicit_global_production(owner, metadata) if split else nullcontext(),
                     capture_layers(model) as values,
                     patch.object(
-                        owner.self_attn.compressor,
-                        "forward",
-                        wraps=owner.self_attn.compressor.forward,
-                    ) as main_write,
-                    patch.object(
-                        owner.self_attn.index_wk,
-                        "forward",
-                        wraps=owner.self_attn.index_wk.forward,
-                    ) as index_write,
+                        owner.self_attn.compressor, "project", side_effect=record_project
+                    ) as global_write,
                 ):
                     logits = model(
                         input_ids=ids,
@@ -102,9 +103,9 @@ def test_explicit_global_production_matches_original(model_and_config, overlap, 
                         return_context_logits=True,
                     )
                 assert {"u20", "wkv", "index_wk", "q_swa", "layer5"} <= values.keys()
-                assert main_write.call_count == index_write.call_count == 1
-                assert main_write.call_args.args[0].shape[0] == sum(lengths)
-                assert index_write.call_args.args[0].shape[0] == sum(lengths)
+                assert global_write.call_count == 1
+                assert global_write.call_args.args[0].shape[0] == sum(lengths)
+                assert values["index_wk"][0].shape[0] == sum(lengths)
                 torch.cuda.synchronize()
                 assert torch.isfinite(logits).all()
                 values["logits"] = (logits.clone(),)

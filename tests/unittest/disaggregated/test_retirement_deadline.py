@@ -638,6 +638,7 @@ def _tx_session(watchdog: RetirementWatchdog, *, need_aux: bool = True) -> trans
     sender._sessions_lock = threading.Lock()
     sender._sessions = {}
     sender._pre_cancelled_rids = {}
+    sender._retired_rids = {}
     sender._shutdown = True
     sender._shutdown_requested = False
     sender._peer_requests_lock = threading.Lock()
@@ -1566,7 +1567,7 @@ def test_unpublished_constructor_failure_removes_watchdog_owner(
     params = DisaggregatedParams(disagg_request_id=4)
     existing = object()
     if direction == "send":
-        sender = SimpleNamespace(
+        owner = SimpleNamespace(
             _retirement_watchdog=watchdog,
             _enforce_physical_ownership=True,
             _sessions_lock=threading.Lock(),
@@ -1578,27 +1579,27 @@ def test_unpublished_constructor_failure_removes_watchdog_owner(
             transfer_mod.TxSession,
             4,
             params,
-            sender,
+            owner,
             aux_buffer=aux,
             overall_timeout_s=5.0,
             retirement_watchdog=watchdog,
         )
     else:
-        receiver = _receiver(watchdog)
-        receiver._shutdown = True
-        receiver._sessions[4] = existing
+        owner = _receiver(watchdog)
+        owner._shutdown = True
+        owner._sessions[4] = existing
         construct = partial(
             transfer_mod.RxSession,
             4,
             params,
-            receiver,
+            owner,
             aux_buffer=aux,
             timeout_s=5.0,
             retirement_watchdog=watchdog,
         )
     with pytest.raises(RuntimeError):
         construct()
-    assert (sender if direction == "send" else receiver)._sessions[4] is existing
+    assert owner._sessions[4] is existing
     assert not watchdog._owners
     if failure == "session registration":
         aux.free_slot.assert_called_once_with(1)

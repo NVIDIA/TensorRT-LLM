@@ -306,6 +306,10 @@ def GPU_TYPE_LIST = "gpu_type"
 def TEST_BACKEND = "test_backend"
 @Field
 def IS_POST_MERGE = "post_merge"
+// True outside the official post-merge pipeline, where post-merge perf-sanity stages run only when
+// --stage-list or --extra-stage names them.
+@Field
+def SKIP_POST_MERGE_PERF_SANITY = "skip_post_merge_perf_sanity"
 @Field
 def ADD_MULTI_GPU_TEST = "add_multi_gpu_test"
 @Field
@@ -398,6 +402,7 @@ def testFilter = [
     (GPU_TYPE_LIST): trimForStageList(gitlabParamsFromBot.get((GPU_TYPE_LIST), null)?.tokenize(',')),
     (TEST_BACKEND): trimForStageList(gitlabParamsFromBot.get((TEST_BACKEND), null)?.tokenize(',')),
     (IS_POST_MERGE): (env.JOB_NAME ==~ /.*PostMerge.*/) || gitlabParamsFromBot.get((IS_POST_MERGE), false),
+    (SKIP_POST_MERGE_PERF_SANITY): !(env.JOB_NAME ==~ /.*PostMerge.*/),
     (ADD_MULTI_GPU_TEST): gitlabParamsFromBot.get((ADD_MULTI_GPU_TEST), false),
     (ONLY_MULTI_GPU_TEST): gitlabParamsFromBot.get((ONLY_MULTI_GPU_TEST), false) || gitlabParamsFromBot.get((ENABLE_MULTI_GPU_TEST), false),
     (DISABLE_MULTI_GPU_TEST): gitlabParamsFromBot.get((DISABLE_MULTI_GPU_TEST), false),
@@ -485,6 +490,10 @@ def BOLT_CONSUME_TRIPLES = "bolt_consume_triples"
 def RELEASE_TARGET = "release_target"
 @Field
 def JOB_TYPE = "job_type"
+// BUILD_NUMBER of the official post-merge pipeline, passed to every L0_Test job so they all
+// apply consistent stage scheduling; null otherwise.
+@Field
+def POST_MERGE_BUILD_NUMBER = "post_merge_build_number"
 // The primary location of build artifacts (see llmArtifactsPrimary), passed to every child job.
 // Child jobs run on other Jenkins controllers, whose own LLM_ARTIFACTS_PRIMARY can differ.
 @Field
@@ -511,6 +520,7 @@ def globalVars = [
     (BOLT_PROFILE_BRANCH): "",
     (BOLT_CONSUME_TRIPLES): BOLT_PRODUCER_TRIPLE,
     (JOB_TYPE): env.JOB_BASE_NAME,
+    (POST_MERGE_BUILD_NUMBER): (env.JOB_NAME ==~ /.*PostMerge.*/) ? env.BUILD_NUMBER : null,
     (TRTLLM_RELEASE_REPO): null,
 ]
 globalVars[BUILD_BRANCH] = resolveBuildBranch(globalVars)
@@ -2030,11 +2040,20 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/_torch/custom_ops/torch_custom_ops.py",
         "tensorrt_llm/_torch/custom_ops/userbuffers_custom_ops.py",
         "tensorrt_llm/_torch/distributed/",
+        // GQA KV-replica decode and the MNNVL / TP2 all-reduce + norm kernels: their tests run only in
+        // l0_gb300's 4-GPU pre-merge block.
+        "tensorrt_llm/_torch/attention/backends/fmha/gqa_",
+        "tensorrt_llm/_torch/kernels/blackwell/gemm_allreduce_norm.py",
+        "tensorrt_llm/_torch/kernels/blackwell/gemm_twoshot_allreduce_norm.py",
+        "tensorrt_llm/_torch/kernels/blackwell/mnnvl_",
+        "tensorrt_llm/_torch/kernels/blackwell/tp2_allreduce_norm.py",
         "tensorrt_llm/_torch/models/modeling_llama.py",
         "tensorrt_llm/_torch/models/modeling_qwen3_next.py",
         "tensorrt_llm/_torch/moe/",
         "tensorrt_llm/_torch/pyexecutor/_util.py",
         "tensorrt_llm/_torch/pyexecutor/cuda_graph_runner.py",
+        // KVCM2 remote tier: its fabric-transport tests run only on GB300 (l0_gb300).
+        "tensorrt_llm/_torch/pyexecutor/kv_cache/remote_donor.py",
         "tensorrt_llm/_torch/pyexecutor/model_engine.py",
         "tensorrt_llm/_torch/pyexecutor/py_executor.py",
         "tensorrt_llm/_torch/weight_sharing/",
@@ -2098,8 +2117,10 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_node4_gpu16.yml",
         "tests/integration/test_lists/test-db/l0_model_express.yml",
         "tests/integration/test_lists/test-db/l0_rtx_pro_6000.yml",
+        "tests/unittest/_torch/attention/multi_gpu/",
         "tests/unittest/_torch/multi_gpu/",
         "tests/unittest/_torch/moe/multi_gpu/",
+        "tests/unittest/kv_cache_manager_v2_tests/",
         "tests/unittest/_torch/multi_gpu_modeling/",
         "tests/unittest/_torch/visual_gen/multi_gpu/",
         "tests/unittest/disaggregated/",
@@ -2680,14 +2701,23 @@ def getCommonParameters()
     ]
 }
 
+// Nightly release passes its Slack thread down so PLC notifications reply in it.
+// Read via env: callers build a local `params` list that shadows the build params.
+def getPLCSlackParameters()
+{
+    return [
+        string(name: 'slack_thread_id', value: env.slack_thread_id ?: ''),
+    ]
+}
+
 def getPLCRepoUrlKey()
 {
     def repoUrlKey = "tensorrt_llm_github_sync"
+    def normalizedRepo = LLM_REPO.replaceFirst(/\.git$/, "")
     withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
-        if (LLM_REPO == DEFAULT_LLM_REPO) {
+        if (normalizedRepo == DEFAULT_LLM_REPO.replaceFirst(/\.git$/, "")) {
             repoUrlKey = "tensorrt_llm_internal"
-        } else if (LLM_REPO == "https://github.com/NVIDIA/TensorRT-LLM.git" ||
-                   LLM_REPO == "https://github.com/NVIDIA/TensorRT-LLM") {
+        } else if (normalizedRepo == "https://github.com/NVIDIA/TensorRT-LLM") {
             repoUrlKey = "tensorrt_llm_github"
         }
     }
@@ -2867,7 +2897,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                                 string(name: 'runContainerOssScanning', value: 'false'),
                                 string(name: 'runContainerMalwareScanning', value: 'false'),
                                 string(name: 'runSonarQube', value: 'false'),
-                            ]
+                            ] + getPLCSlackParameters()
                             def handle = build(
                                 job: "/LLM/helpers/PLCScanningSetup",
                                 parameters: params,
@@ -3422,7 +3452,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             string(name: 'runContainerOssScanning', value: 'true'),
                             string(name: 'runContainerMalwareScanning', value: 'false'),
                             string(name: 'runSonarQube', value: 'false'),
-                        ]
+                        ] + getPLCSlackParameters()
                         def logger = new Logger(pipeline)
                         def handle = build(
                             job: "/LLM/helpers/PLCScanningSetup",
