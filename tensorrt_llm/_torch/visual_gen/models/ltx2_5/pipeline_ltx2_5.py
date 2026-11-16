@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import json
 import math
+import tempfile
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from safetensors import safe_open
@@ -22,7 +24,7 @@ from tensorrt_llm._torch.visual_gen.pipeline import (
     RoleSpec,
 )
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
-from tensorrt_llm.inputs.media_io import VideoMediaIO
+from tensorrt_llm.inputs.media_io import _MAX_RESPONSE_BYTES, _check_media_size, _get_cv2
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from ..ltx2.ltx2_core.audio_vae import AudioDecoderConfigurator, decode_audio
@@ -69,6 +71,32 @@ from .video_vae import LTX25VideoDecoderConfigurator, LTX25VideoEncoderConfigura
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.visual_gen.executor import DiffusionRequest
+
+
+def _read_reference_prefix(content: bytes, frames: int) -> list[np.ndarray]:
+    """Decode the first source frames without sampling or scanning the remaining clip."""
+    _check_media_size(len(content), _MAX_RESPONSE_BYTES)
+    cv2 = _get_cv2()
+    decoded = []
+    with tempfile.NamedTemporaryFile(suffix=".mp4") as tmp:
+        tmp.write(content)
+        tmp.flush()
+        capture = cv2.VideoCapture(tmp.name)
+        try:
+            if not capture.isOpened():
+                raise ValueError("Reference video could not be opened")
+            if capture.get(cv2.CAP_PROP_FRAME_COUNT) <= 0 or capture.get(cv2.CAP_PROP_FPS) <= 0:
+                raise ValueError("Video has no frames or invalid FPS.")
+            for _ in range(frames):
+                if not capture.grab():
+                    break
+                ok, frame = capture.retrieve()
+                if not ok:
+                    break
+                decoded.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        finally:
+            capture.release()
+    return decoded
 
 
 def _read_config(path: str) -> dict:
@@ -594,10 +622,9 @@ class LTX25ICLoraPipeline(BasePipeline):
     def _read_reference(self, content: bytes, height: int, width: int, frames: int) -> torch.Tensor:
         scale = self.reference_downscale_factor
         height, width = height // scale, width // scale
-        # Disable uniform sampling: IC-LoRA consumes the first N source frames.
-        source = VideoMediaIO(num_frames=-1, fps=-1, format="np").load_bytes(content).frames
+        source = _read_reference_prefix(content, frames)
         decoded = []
-        for frame in source[:frames]:
+        for frame in source:
             image = torch.from_numpy(frame).to(device=self.device, dtype=torch.float32)
             image = image.permute(2, 0, 1).unsqueeze(0)
             ratio = max(height / image.shape[-2], width / image.shape[-1])

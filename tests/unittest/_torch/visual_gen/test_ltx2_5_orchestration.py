@@ -144,9 +144,13 @@ def test_infer_restores_after_stage_one_failure(monkeypatch, failure) -> None:
 
 def test_reference_uses_first_frames_and_preserves_normalization(monkeypatch) -> None:
     frames = np.stack([np.full((4, 6, 3), value, dtype=np.uint8) for value in (0, 64, 128, 255)])
-    loader = Mock()
-    loader.return_value.load_bytes.return_value.frames = frames
-    monkeypatch.setattr(impl, "VideoMediaIO", loader)
+    capture = Mock()
+    capture.isOpened.return_value = True
+    capture.get.return_value = 24
+    capture.grab.side_effect = [True] * 4 + [False]
+    capture.retrieve.side_effect = [(True, frame) for frame in frames]
+    cv2 = impl._get_cv2()
+    monkeypatch.setattr(cv2, "VideoCapture", lambda path: capture)
     pipeline = SimpleNamespace(
         device=torch.device("cpu"),
         dtype=torch.bfloat16,
@@ -155,9 +159,16 @@ def test_reference_uses_first_frames_and_preserves_normalization(monkeypatch) ->
         video_encoder=lambda video: video,
     )
     actual = impl.LTX25ICLoraPipeline._read_reference(pipeline, b"video", 2, 2, 3)
-    loader.assert_called_once_with(num_frames=-1, fps=-1, format="np")
+    assert capture.grab.call_count == 3
+    assert capture.retrieve.call_count == 3
+    capture.release.assert_called_once()
     assert actual.shape == (1, 3, 3, 2, 2)
     expected = (torch.tensor([0.0, 64.0, 128.0]) / 127.5 - 1).bfloat16()
     assert torch.equal(actual[0, 0, :, 0, 0], expected)
+    capture.reset_mock()
+    capture.grab.side_effect = [True] * 4 + [False]
+    capture.retrieve.side_effect = [(True, frame) for frame in frames]
     with pytest.raises(ValueError, match="at least 5 frames"):
         impl.LTX25ICLoraPipeline._read_reference(pipeline, b"video", 2, 2, 5)
+    assert capture.grab.call_count == 5
+    capture.release.assert_called_once()
