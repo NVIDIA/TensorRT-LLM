@@ -905,6 +905,45 @@ def test_conv1d_verify_update_hoist_and_pdl_wait_bitwise(conv_dim, num_decodes, 
         assert torch.equal(a, b)
 
 
+@skip_no_cuda
+def test_conv1d_update_compiles_once_across_request_counts_and_slot_offsets():
+    """One compiled update kernel for every request count and slot-vector offset."""
+    from tensorrt_llm._torch.modules.mamba.causal_conv1d_triton import (
+        _causal_conv1d_update_kernel,
+        causal_conv1d_update,
+    )
+
+    conv_dim, steps = 384, 4
+    g = torch.Generator(device="cuda").manual_seed(7)
+    weight = (torch.randn(conv_dim, 4, generator=g, device="cuda") * 0.4).to(torch.bfloat16)
+    state0 = torch.randn(16, conv_dim, 3, generator=g, device="cuda").to(torch.bfloat16)
+    x = torch.randn(5, steps, conv_dim, generator=g, device="cuda").to(torch.bfloat16)
+    slots = torch.tensor([0, 1, 2, 3, 9, 4, 12, 7, 2, 14, 5], dtype=torch.int32, device="cuda")
+    rows = torch.arange(5, dtype=torch.int32, device="cuda")
+
+    def run(n, offset, aligned=False):
+        # The slot vector is a view `offset` entries past an aligned start, like a mixed step's
+        # decode half.
+        state = state0.clone()
+        windows = torch.zeros(5, steps, conv_dim, 3, dtype=torch.bfloat16, device="cuda")
+        slot_view = slots[4 + offset :][:n]
+        out = causal_conv1d_update(
+            x[:n].transpose(1, 2), state, weight, None, "silu",
+            conv_state_indices=slot_view.clone() if aligned else slot_view,
+            intermediate_conv_window=windows, intermediate_state_indices=rows[:n],
+        )  # fmt: skip
+        return out, state, windows
+
+    run(1, 0)
+    cache = _causal_conv1d_update_kernel.device_caches[torch.cuda.current_device()][0]
+    compiled = len(cache)
+    for n, offset in ((1, 1), (2, 3), (3, 2), (5, 1)):
+        actual, expected = run(n, offset), run(n, offset, aligned=True)
+        for a, e in zip(actual, expected):
+            assert torch.equal(a, e), (n, offset)
+    assert len(cache) == compiled
+
+
 skip_no_sm100f = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
     reason="needs SM100/SM103",
@@ -1180,3 +1219,34 @@ def test_gdn_verify_with_separate_replay_slots_matches_coupled(heads, n, t, fp8)
     for name in ("old_u", "old_k", "old_g"):
         assert torch.isnan(separate[name][others].float()).all(), name
     assert (meta[others] == 13).all() and (meta[replay_rows, 2:] == 13).all()
+
+
+@skip_no_cuda
+def test_fused_gdn_post_conv_linear_gate():
+    """``g_linear=True`` emits alpha = exp(g_log) (the FlashInfer prefill convention); everything else is unchanged."""
+    from tensorrt_llm._torch.modules.mamba.fuse_elementwise_ops import fused_gdn_post_conv
+
+    torch.manual_seed(3)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    num_k_heads, num_v_heads, head_k_dim, head_v_dim = 2, 8, 128, 128
+    num_prefill_tokens, num_decode_tokens = 77, 5
+    qkv_dim = 2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim
+    num_tokens = num_prefill_tokens + num_decode_tokens
+    prefill = torch.randn(qkv_dim, num_prefill_tokens, dtype=dtype, device=device)
+    decode = torch.randn(num_decode_tokens, qkv_dim, dtype=dtype, device=device)
+    a = torch.randn(num_tokens, num_v_heads, dtype=dtype, device=device)
+    b = torch.randn(num_tokens, num_v_heads, dtype=dtype, device=device)
+    A_log = torch.randn(num_v_heads, dtype=torch.float32, device=device) - 2.0
+    dt_bias = torch.randn(num_v_heads, dtype=torch.float32, device=device) * 0.1
+    args = (prefill, decode, a, b, A_log, dt_bias, num_k_heads, head_k_dim, num_v_heads, head_v_dim)
+
+    log_out = fused_gdn_post_conv(*args)
+    lin_out = fused_gdn_post_conv(*args, g_linear=True)
+    for x, y in zip(log_out[:3] + (log_out[4],), lin_out[:3] + (lin_out[4],)):
+        assert torch.equal(x, y)
+    g_log, g_lin = log_out[3], lin_out[3]
+    assert g_lin.dtype == torch.float32 and g_lin.is_contiguous()
+    torch.testing.assert_close(g_lin, torch.exp(g_log), rtol=1e-6, atol=1e-7)
+    assert bool((g_log <= 0).all())
+    assert bool((g_lin > 0).all()) and bool((g_lin <= 1.0).all())

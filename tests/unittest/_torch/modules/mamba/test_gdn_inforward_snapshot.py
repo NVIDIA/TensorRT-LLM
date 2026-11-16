@@ -21,6 +21,7 @@ import torch
 
 from tensorrt_llm._torch.modules.mamba.causal_conv1d import causal_conv1d_fn
 from tensorrt_llm._torch.modules.mamba.gdn_mixer import (
+    _gdn_prefill_uses_flashinfer,
     _inforward_split_conv_states,
     _inforward_split_prefill_core,
     chunk_gated_delta_rule,
@@ -91,7 +92,10 @@ def _chunk(q, k, v, g, beta, initial, start, end):
     return out, final[0]
 
 
-def test_split_prefill_core_matches_two_iterations():
+@pytest.mark.parametrize("linear_gate", [False, True], ids=["log_gate", "linear_gate"])
+def test_split_prefill_core_matches_two_iterations(linear_gate):
+    if linear_gate and not _gdn_prefill_uses_flashinfer():
+        pytest.skip("only the FlashInfer scan takes the linear-space gate")
     split = _split()
     total = sum(length for _, _, length, _ in _BATCH)
     q, k, v, g, beta = _inputs(total)
@@ -118,7 +122,20 @@ def test_split_prefill_core_matches_two_iterations():
             expected_stage[entry.row] = end_state.to(stage.dtype)
         start += length
 
-    out = _inforward_split_prefill_core(q, k, v, g, beta, ssm_states, split, stage, None)
+    # The reference scans take the log-space gate; the split path gets what the mixer passes it:
+    # alpha = exp(g) when the FlashInfer scan is the resolved one.
+    out = _inforward_split_prefill_core(
+        q,
+        k,
+        v,
+        g.exp() if linear_gate else g,
+        beta,
+        ssm_states,
+        split,
+        stage,
+        None,
+        g_is_linear=linear_gate,
+    )
     torch.cuda.synchronize()
     # Batched and per-request chunked prefill may round differently in bf16, and the
     # tails start from the unrounded state at P: compare to bf16 tolerance.

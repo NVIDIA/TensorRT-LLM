@@ -41,6 +41,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
+#include <atomic>
 #include <cstddef>
 #include <memory>
 #include <new>
@@ -57,6 +58,8 @@ template <typename T>
 class WeakPtr;
 template <typename T>
 class EnableSharedFromThis;
+template <typename... Ts>
+class SlabArena;
 
 // =========================================================================
 // Control block
@@ -126,6 +129,56 @@ struct InplaceControlBlock final : ControlBlockBase
     }
 };
 
+// One allocation backing many control blocks, freed after the last of them and its arena.
+struct SlabHeader
+{
+    int liveBlocks = 1;
+    size_t bytes = 0;
+};
+
+//! Bytes of the slabs allocated and not yet freed in this process. Defined in page.cpp, so every
+//! shared library that includes this header uses the one counter.
+extern std::atomic<size_t> gLiveSlabBytes;
+
+inline void releaseSlab(SlabHeader* slab) noexcept
+{
+    if (--slab->liveBlocks == 0)
+    {
+        gLiveSlabBytes.fetch_sub(slab->bytes, std::memory_order_relaxed);
+        slab->~SlabHeader();
+        ::operator delete(static_cast<void*>(slab));
+    }
+}
+
+template <typename T>
+struct SlabControlBlock final : ControlBlockBase
+{
+    explicit SlabControlBlock(SlabHeader* owner) noexcept
+        : slab(owner)
+    {
+    }
+
+    alignas(T) unsigned char storage[sizeof(T)];
+    SlabHeader* slab;
+
+    T* ptr() noexcept
+    {
+        return std::launder(reinterpret_cast<T*>(&storage));
+    }
+
+    void destroyObject() noexcept override
+    {
+        ptr()->~T();
+    }
+
+    void deallocate() noexcept override
+    {
+        SlabHeader* const owner = slab;
+        this->~SlabControlBlock();
+        releaseSlab(owner);
+    }
+};
+
 // ---------------------------------------------------------------------------
 // EnableSharedFromThis detection — handles polymorphic inheritance.
 // E.g. makeShared<CommittedPage>() detects EnableSharedFromThis<Page>
@@ -143,6 +196,9 @@ template <typename T>
 inline constexpr bool hasEnable = !std::is_void_v<EnableBase<T>>;
 
 } // namespace detail
+
+//! Host bytes held by live SlabArena allocations (page slabs) in this process.
+size_t liveSlabBytes() noexcept;
 
 // =========================================================================
 // SharedPtr<T>
@@ -337,6 +393,8 @@ private:
     friend SharedPtr<To> dynamicPointerCast(SharedPtr<From> const&);
     template <typename U>
     friend std::shared_ptr<U> toStd(SharedPtr<U> const&);
+    template <typename... Us>
+    friend class SlabArena;
 
     T* mPtr;
     detail::ControlBlockBase* mCb;
@@ -529,6 +587,8 @@ protected:
 private:
     template <typename U, typename... Args>
     friend SharedPtr<U> makeShared(Args&&... args);
+    template <typename... Us>
+    friend class SlabArena;
 
     mutable WeakPtr<T> mWeakThis;
 };
@@ -565,6 +625,104 @@ SharedPtr<T> makeShared(Args&&... args)
 
     return result;
 }
+
+// =========================================================================
+// SlabArena<Ts...> — control blocks for up to `capacity` objects of each listed type in one
+// allocation, so objects created together sit together in memory. Each slot is used at most
+// once; the allocation is freed after the arena and every object made from it are gone.
+// Same threading requirement as SharedPtr: the counts are plain ints.
+// =========================================================================
+
+template <typename... Ts>
+class SlabArena
+{
+public:
+    explicit SlabArena(size_t capacity)
+        : mCapacity(capacity)
+    {
+        if (capacity == 0)
+        {
+            return;
+        }
+        size_t bytes = sizeof(detail::SlabHeader);
+        ((bytes = placeArray<Ts>(bytes)), ...);
+        mBase = static_cast<unsigned char*>(::operator new(bytes));
+        mHeader = new (mBase) detail::SlabHeader();
+        mHeader->bytes = bytes;
+        detail::gLiveSlabBytes.fetch_add(bytes, std::memory_order_relaxed);
+    }
+
+    ~SlabArena()
+    {
+        if (mHeader != nullptr)
+        {
+            detail::releaseSlab(mHeader);
+        }
+    }
+
+    SlabArena(SlabArena const&) = delete;
+    SlabArena& operator=(SlabArena const&) = delete;
+
+    //! Like makeShared<T>, in the next unused T slot; falls back to the heap when none is left.
+    template <typename T, typename... Args>
+    SharedPtr<T> makeShared(Args&&... args)
+    {
+        constexpr size_t kIndex = indexOf<T>();
+        if (mHeader == nullptr || mUsed[kIndex] == mCapacity)
+        {
+            return kv_cache_manager_v2::makeShared<T>(std::forward<Args>(args)...);
+        }
+        void* const address = mBase + mOffsets[kIndex] + mUsed[kIndex] * sizeof(detail::SlabControlBlock<T>);
+        auto* cb = new (address) detail::SlabControlBlock<T>(mHeader);
+        try
+        {
+            new (cb->storage) T(std::forward<Args>(args)...);
+        }
+        catch (...)
+        {
+            cb->~SlabControlBlock();
+            throw;
+        }
+        ++mUsed[kIndex];
+        ++mHeader->liveBlocks;
+
+        SharedPtr<T> result;
+        result.mPtr = cb->ptr();
+        result.mCb = cb;
+        if constexpr (detail::hasEnable<T>)
+        {
+            static_cast<detail::EnableBase<T>&>(*result.mPtr).mWeakThis = result;
+        }
+        return result;
+    }
+
+private:
+    template <typename T>
+    static constexpr size_t indexOf()
+    {
+        static_assert((std::is_same_v<T, Ts> || ...), "type is not part of this arena");
+        size_t index = 0;
+        bool found = false;
+        ((found = found || std::is_same_v<T, Ts>, index += found ? 0 : 1), ...);
+        return index;
+    }
+
+    template <typename T>
+    size_t placeArray(size_t offset)
+    {
+        constexpr size_t kAlign = alignof(detail::SlabControlBlock<T>);
+        static_assert(kAlign <= __STDCPP_DEFAULT_NEW_ALIGNMENT__);
+        offset = (offset + kAlign - 1) / kAlign * kAlign;
+        mOffsets[indexOf<T>()] = offset;
+        return offset + mCapacity * sizeof(detail::SlabControlBlock<T>);
+    }
+
+    size_t mCapacity;
+    unsigned char* mBase = nullptr;
+    detail::SlabHeader* mHeader = nullptr;
+    size_t mOffsets[sizeof...(Ts)] = {};
+    size_t mUsed[sizeof...(Ts)] = {};
+};
 
 // =========================================================================
 // dynamicPointerCast<To>(SharedPtr<From>)

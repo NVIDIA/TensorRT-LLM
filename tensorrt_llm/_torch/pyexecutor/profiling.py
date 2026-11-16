@@ -44,7 +44,7 @@ import threading
 import time
 import uuid
 import weakref
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Callable, Dict, Iterator, List, Optional
 
 import torch
@@ -130,12 +130,14 @@ class ProfileController:
         is_warmup: Callable[[], bool],
         broadcast_start: Callable[[dict], None],
         broadcast_stop: Callable[[], None],
+        pause_hang_detector: Callable[[], AbstractContextManager] = nullcontext,
     ) -> None:
         self.rank = rank
         self._current_iteration = current_iteration
         self._is_warmup = is_warmup
         self._broadcast_start = broadcast_start
         self._broadcast_stop = broadcast_stop
+        self._pause_hang_detector = pause_hang_detector
 
         # Runtime-configurable profiling state. Populated by start_profile()
         # when triggered via HTTP endpoints (e.g. trtllm-serve /start_profile)
@@ -790,16 +792,18 @@ class ProfileController:
         self._calibrator.pre_step(self._step)
 
     def _stop_window(self) -> None:
-        if self._active_enable_torch_trace and self._torch_profiler is not None:
-            self._torch_profiler.stop()
-            self._torch_profiler.export_chrome_trace(self._active_torch_trace_path)
-            logger.info(
-                f"Profiling stopped at iteration "
-                f"{self._current_iteration()}, "
-                f"trace saved to {self._active_torch_trace_path}"
-            )
-        torch.cuda.cudart().cudaProfilerStop()
-        self._calibrator.stop()
+        # The trace flush stalls every rank for longer than the hang timeout.
+        with self._pause_hang_detector():
+            if self._active_enable_torch_trace and self._torch_profiler is not None:
+                self._torch_profiler.stop()
+                self._torch_profiler.export_chrome_trace(self._active_torch_trace_path)
+                logger.info(
+                    f"Profiling stopped at iteration "
+                    f"{self._current_iteration()}, "
+                    f"trace saved to {self._active_torch_trace_path}"
+                )
+            torch.cuda.cudart().cudaProfilerStop()
+            self._calibrator.stop()
 
     # ---- shutdown --------------------------------------------------
 
@@ -888,6 +892,7 @@ class PyExecutorProfileManager:
         prev_fetch_requests_cur_rank = 0
         # Last kv_cache_util printed and the iteration it was computed at.
         kv_util_str = "N/A"
+        kv_reuse_str = ""
         kv_util_iter = None
 
         log_ranks_str = os.environ.get(PROFILE_LOG_RANKS_ENV_VAR_NAME, "0")
@@ -903,7 +908,7 @@ class PyExecutorProfileManager:
             nonlocal start_event_1, end_event_1, start_event_2, end_event_2
             nonlocal prev_device_step_time, prev_fetch_requests_cur_rank
             nonlocal boundary_count
-            nonlocal kv_util_str, kv_util_iter
+            nonlocal kv_util_str, kv_reuse_str, kv_util_iter
             controller.end_iteration()
 
             # Capture per-loop timing whenever stats or the iter log
@@ -943,7 +948,15 @@ class PyExecutorProfileManager:
                 executor._latest_host_step_time_ms = host_step_time
                 executor._latest_prev_device_step_time_ms = prev_device_step_time
 
-                if executor.print_log and (log_all_ranks or executor.dist.rank in log_ranks):
+                # Sampled iteration statistics thin the log to the same iterations.
+                if (
+                    executor.print_log
+                    and (log_all_ranks or executor.dist.rank in log_ranks)
+                    and (
+                        not executor.enable_iter_perf_stats
+                        or executor.iter_counter % executor.iter_perf_stats_interval == 0
+                    )
+                ):
                     if prev_device_step_time is None:
                         prev_device_step_time_str = "N/A"  # first iteration
                     else:
@@ -953,11 +966,20 @@ class PyExecutorProfileManager:
                     ):
                         kv_util_iter = it
                         kv_util_str = "N/A"
+                        kv_reuse_str = ""
                         kv_stats = executor.kv_cache_manager.get_kv_cache_stats()
                         if kv_stats.max_num_blocks > 0:
                             kv_util_str = (
                                 f"{1.0 - kv_stats.free_num_blocks / kv_stats.max_num_blocks:.3f}"
                             )
+                        # Cumulative (warmup-adjusted) block reuse counters;
+                        # kv_cache_util only shows blocks pinned by active
+                        # requests, so it says nothing about prefix reuse.
+                        kv_reuse_str = (
+                            f"kv_reused_blocks = {kv_stats.reused_blocks}, "
+                            f"kv_missed_blocks = {kv_stats.missed_blocks}, "
+                            f"kv_hit_rate = {kv_stats.cache_hit_rate:.3f}, "
+                        )
                     import datetime
 
                     formatted_timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -980,6 +1002,7 @@ class PyExecutorProfileManager:
                         f"adp_dummy_ctx_tokens = {executor._iter_adp_dummy_ctx_tokens}, "
                         f"adp_dummy_gen_tokens = {executor._iter_adp_dummy_gen_tokens}, "
                         f"kv_cache_util = {kv_util_str}, "
+                        f"{kv_reuse_str}"
                         f"currank_total_requests = {executor.num_fetch_requests_cur_rank}/"
                         f"{executor.num_fetch_requests}, "
                         f"host_step_time = {host_step_time}ms, "

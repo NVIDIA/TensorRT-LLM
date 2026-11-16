@@ -126,7 +126,7 @@ from ..distributed import (
 )
 from ..distributed.symm_mem_allgather import SymmetricMemoryAllGather
 from ..kimi_k3_cache_policy import KIMI_K3_FP8_KV_LAYERS_ENV, get_kimi_k3_fp8_kv_layer_ids
-from ..model_config import ModelConfig
+from ..model_config import KIMI_K3_DEFAULT_ROUTED_QUANT_ALGO, ModelConfig
 from ..modules.dwdp.dense.manager import get_global_dense_dwdp_manager
 from ..modules.gated_mlp import GatedMLP
 from ..modules.kimi_kda import KimiKDALinearAttention
@@ -1499,12 +1499,6 @@ _K3_ROUTED_EXPERT_KEY_SUFFIXES = ("block_sparse_moe.experts", "mlp.experts")
 # widen what matches instead of just missing, as it does in the dict lookup.
 _K3_ROUTED_EXPERT_MODULE_PREFIXES = ("language_model.model.", "model.")
 
-# Routed-expert quantization used when the checkpoint declares nothing per
-# layer. The original ``moonshotai/Kimi-K3`` ships a compressed-tensors
-# ``mxfp4-pack-quantized`` config with no ModelOpt per-layer entries, and that
-# checkpoint is what this default has always served.
-_K3_DEFAULT_ROUTED_QUANT_ALGO = QuantAlgo.W4A8_MXFP4_MXFP8
-
 
 # ---------------------------------------------------------------------------
 # Routed-expert checkpoint layouts.
@@ -1983,9 +1977,9 @@ class KimiK3MoERuntime(nn.Module):
             "Kimi K3 layer %d routed experts: no per-layer quant config in the "
             "checkpoint, defaulting to %s",
             layer_idx,
-            _K3_DEFAULT_ROUTED_QUANT_ALGO,
+            KIMI_K3_DEFAULT_ROUTED_QUANT_ALGO,
         )
-        return QuantConfig(quant_algo=_K3_DEFAULT_ROUTED_QUANT_ALGO)
+        return QuantConfig(quant_algo=KIMI_K3_DEFAULT_ROUTED_QUANT_ALGO)
 
     @staticmethod
     def _check_trtllm_situ_quant(moe_backend: str, quant_algo: Optional[QuantAlgo]) -> None:

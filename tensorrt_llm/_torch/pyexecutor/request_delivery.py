@@ -55,18 +55,37 @@ class ResponseChannel:
         Args:
             responses: ``(request_id, response)`` pairs, in delivery order.
         """
+        self.deliver(self.route(responses))
+
+    def route(
+        self, responses: Iterable[tuple[int, LlmResponse]]
+    ) -> list[tuple[int, LlmResponse, ActorHandle | None]]:
+        """Pair each response with its request's current result wait queue.
+
+        A response delivered later keeps this queue even after its request is released.
+
+        Args:
+            responses: ``(request_id, response)`` pairs, in delivery order.
+
+        Returns:
+            ``(request_id, response, queue)`` triples for ``deliver``.
+        """
+        return [(req_id, resp, self.result_wait_queues.get(req_id)) for req_id, resp in responses]
+
+    def deliver(self, routed: Iterable[tuple[int, LlmResponse, ActorHandle | None]]) -> None:
+        """Store routed responses for pickup, forward them to their queues and wake the waiters.
+
+        Args:
+            routed: Triples from ``route``, in delivery order.
+        """
         with self.response_cv:
-            for req_id, resp in responses:
+            for req_id, resp, result_wait_queue in routed:
                 if req_id in self.responses.keys():
                     self.responses[req_id].append(resp)
                 else:
                     self.responses.update({req_id: [resp]})
-                if (
-                    type(resp) is LlmResponse
-                    and req_id in self.result_wait_queues
-                    and self.result_wait_queues[req_id] is not None
-                ):
-                    self.result_wait_queues[req_id].put_response.remote(resp.client_id, resp)
+                if type(resp) is LlmResponse and result_wait_queue is not None:
+                    result_wait_queue.put_response.remote(resp.client_id, resp)
             self.response_cv.notify_all()
 
     def await_any(

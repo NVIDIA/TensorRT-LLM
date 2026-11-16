@@ -135,7 +135,7 @@ SPEC_DEC_REAL_DATASET_MODELS = {
     },
     **{
         model: "cnn_dailymail"
-        for model in DEEPSEEK_V41_MODELS
+        for model in DEEPSEEK_V41_MODELS | QWEN38_MTP_MODELS
     },
     "nemotron_3_super_120b_nvfp4_mtp": "cnn_dailymail",
     "nemotron_3.5_lightning_30b_nvfp4_mtp": "cnn_dailymail",
@@ -276,23 +276,28 @@ AGGR_SERVER_PERF_METRIC_LOG_QUERIES = {
     PerfMetricType.USER_THROUGHPUT:
     re.compile(r"User throughput \(tok\/s\):\s+(-?[\d\.]+)"),
     PerfMetricType.FIRST_TOKEN_TIME:
-    re.compile(r"Mean TTFT \(ms\):\s+(-?[\d\.]+)"),
+    re.compile(
+        r"Mean TTFT \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
     PerfMetricType.MEDIAN_FIRST_TOKEN_TIME:
-    re.compile(r"Median TTFT \(ms\):\s+(-?[\d\.]+)"),
+    re.compile(
+        r"Median TTFT \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
     PerfMetricType.P99_FIRST_TOKEN_TIME:
-    re.compile(r"P99 TTFT \(ms\):\s+(-?[\d\.]+)"),
+    re.compile(r"P99 TTFT \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
     PerfMetricType.INTER_TOKEN_TIME:
-    re.compile(r"Mean ITL \(ms\):\s+(-?[\d\.]+)"),
+    re.compile(r"Mean ITL \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
     PerfMetricType.MEDIAN_INTER_TOKEN_TIME:
-    re.compile(r"Median ITL \(ms\):\s+(-?[\d\.]+)"),
+    re.compile(
+        r"Median ITL \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
     PerfMetricType.P99_INTER_TOKEN_TIME:
-    re.compile(r"P99 ITL \(ms\):\s+(-?[\d\.]+)"),
+    re.compile(r"P99 ITL \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
     PerfMetricType.OUTPUT_TOKEN_TIME:
-    re.compile(r"Mean TPOT \(ms\):\s+(-?[\d\.]+)"),
+    re.compile(
+        r"Mean TPOT \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
     PerfMetricType.MEDIAN_OUTPUT_TOKEN_TIME:
-    re.compile(r"Median TPOT \(ms\):\s+(-?[\d\.]+)"),
+    re.compile(
+        r"Median TPOT \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
     PerfMetricType.P99_OUTPUT_TOKEN_TIME:
-    re.compile(r"P99 TPOT \(ms\):\s+(-?[\d\.]+)"),
+    re.compile(r"P99 TPOT \(ms\):\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+)|N/A)[ \t]*$"),
     PerfMetricType.INFERENCE_TIME:
     re.compile(r"Mean E2EL \(ms\):\s+(-?[\d\.]+)"),
     PerfMetricType.MEDIAN_INFERENCE_TIME:
@@ -1314,7 +1319,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                                        dataset_source: str,
                                        num_requests: Optional[int] = None,
                                        skip_requests: int = 0):
-        """Write a real-text dataset of fixed-length prompts.
+        """Write a real-text dataset with target-length prompts.
 
         Args:
             num_requests: Samples to write; the case's request count if None.
@@ -1366,8 +1371,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                     if not prompt_ids:
                         continue
                     if len(prompt_ids) < input_len:
-                        # Keep strict fixed-length requests for perf coverage
-                        # by extending short real-dataset prompts.
+                        # Extend short articles to the target token-ID length.
                         repeats = (input_len + len(prompt_ids) -
                                    1) // len(prompt_ids)
                         prompt_ids = (prompt_ids * repeats)[:input_len]
@@ -1388,8 +1392,11 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                         enable_thinking=False,
                         add_generation_prompt=True,
                     )
-                    prompt_ids = tokenizer.encode(prompt_text,
-                                                  add_special_tokens=False)
+
+                # Count the final text after decoding and any template rendering.
+                prompt_ids = tokenizer.encode(prompt_text,
+                                              add_special_tokens=False)
+                if self._config.model_name in DEEPSEEK_V41_MODELS:
                     max_seq_len = model_config['max_seq_len']
                     if len(prompt_ids) + output_len > max_seq_len:
                         raise ValueError(
@@ -1700,9 +1707,9 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         return PerfBenchScriptTestCmds(data_cmds, build_cmd, benchmark_cmds,
                                        mpi_cmd)
 
-    def get_perf_result(self, outputs: Dict[int, str]) -> float:
+    def get_perf_result(self, outputs: Dict[int, str]) -> float | None:
         """
-        Get perf metric result from test output logs.
+        Get a measured value, or None for an explicitly unavailable metric.
         """
         metric = self._current_metric
         cmd_idx = metric.cmd_idx
@@ -1722,6 +1729,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             for line in outputs[cmd_idx].split("\n")
         ]
         metric_values = []
+        unavailable = False
         for match in regex_matches:
             if match:
                 # Handle multiple capture groups - use the first non-None group
@@ -1730,8 +1738,14 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                     if match.group(i) is not None:
                         value = match.group(i)
                         break
-                if value is not None:
+                if value == "N/A":
+                    unavailable = True
+                elif value is not None:
                     metric_values.append(float(value))
+
+        if not metric_values and unavailable:
+            print_info(f"Metric {metric_name} is N/A; skip recording it.")
+            return None
 
         if len(metric_values) == 0:
             if self._config.runtime == "bench" and self._config.num_gpus > 1 and metric.metric_type == PerfMetricType.BUILD_TIME:

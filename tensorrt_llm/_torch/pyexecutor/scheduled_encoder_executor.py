@@ -162,6 +162,7 @@ class ScheduledEncoderExecutor:
             is_warmup=lambda: False,
             broadcast_start=self._request_queue.enqueue_profile_start_request,
             broadcast_stop=self._request_queue.enqueue_profile_stop_request,
+            pause_hang_detector=self._hang_detector.pause,
         )
 
         if llm_args.enable_iter_perf_stats:

@@ -115,3 +115,17 @@ def test_registered_wait_queue_receives_responses_until_released():
     channel.publish([(7, _response(7, client_id=70)), (9, _response(9, client_id=90))])
 
     assert wait_queue.received == [(70, first)]
+
+
+def test_a_routed_response_reaches_its_queue_after_the_request_is_released():
+    channel = ResponseChannel()
+    wait_queue = _WaitQueue()
+    channel.register([7], wait_queue)
+    staged = _response(7, client_id=70)
+
+    routed = channel.route([(7, staged)])
+    channel.release(7)
+    channel.deliver(routed)
+
+    assert wait_queue.received == [(70, staged)]
+    assert _await_single(channel, 7, timeout=0) == [staged]
