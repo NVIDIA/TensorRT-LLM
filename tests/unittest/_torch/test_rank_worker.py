@@ -299,7 +299,10 @@ def test_without_shared_builds_each_rank_keeps_a_store_of_its_own(
     assert _jit_share._cute_store() == os.path.join("/nonexistent-share-dir", "cute")
 
 
-def test_a_store_that_cannot_be_made_leaves_every_build_here(worker_env, monkeypatch, tmp_path):
+@pytest.mark.parametrize("first", ["run", "submit"])
+def test_a_store_that_cannot_be_made_leaves_every_build_here(
+    worker_env, monkeypatch, tmp_path, first
+):
     not_a_directory = tmp_path / "share"
     not_a_directory.write_text("")
     monkeypatch.setenv(_jit_share.SHARE_DIR_ENV, str(not_a_directory))
@@ -309,11 +312,15 @@ def test_a_store_that_cannot_be_made_leaves_every_build_here(worker_env, monkeyp
     try:
         # The pass ends: no build waits for a worker.
         with rank.pass_scope():
-            assert (
-                rank.run("record", f"{targets.__name__}:record", (str(tmp_path / "r"), 1)) is None
-            )
-            assert not targets.compile_kernel.submit(33)
+            if first == "run":
+                record = (f"{targets.__name__}:record", (str(tmp_path / "r"), 1))
+                assert rank.run("record", *record) is None
+            else:
+                assert not targets.compile_kernel.submit(33)
+            # The first build found the store unusable: the workers are off.
+            assert not rank.accepting()
             assert targets.compile_kernel(33).pid == os.getpid()
     finally:
         rank.stop()
+    assert rank._futures == {}
     assert rank.counts() == {} and rank._workers_started == 0
