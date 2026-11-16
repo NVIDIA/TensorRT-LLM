@@ -23,6 +23,7 @@ Tekken files under LLM_MODELS_ROOT.
 import asyncio
 import base64
 import copy
+import re
 from io import BytesIO
 from types import SimpleNamespace
 
@@ -229,7 +230,11 @@ def tokenizer(request):
 
 def _server_ids(tokenizer, **fields):
     """The chat route's rendering steps for one request."""
-    request = ChatCompletionRequest(model="m", **copy.deepcopy(fields))
+    return _request_ids(tokenizer, ChatCompletionRequest(model="m", **copy.deepcopy(fields)))
+
+
+def _request_ids(tokenizer, request):
+    """The chat route's rendering steps for a built request (the Anthropic route builds one)."""
     apply_model_chat_extensions(request, _MODEL_TYPE)
     conversation, media, counts, _ = parse_chat_messages_coroutines(request.messages, _config())
     resources = SimpleNamespace(
@@ -249,6 +254,7 @@ def _server_ids(tokenizer, **fields):
             tools=None if request.tools is None else [tool.model_dump() for tool in request.tools],
             documents=request.documents,
             chat_template_kwargs=request.chat_template_kwargs or {},
+            injected_chat_template_kwargs=request.injected_chat_template_kwargs,
         )
     )
     assert rendered.text is None
@@ -385,6 +391,94 @@ def test_reasoning_effort_renders_where_the_checkpoint_declares_it(tokenizer):
     assert high != _mistral_ids(tokenizer, _HI, reasoning_effort="none")
     with pytest.raises(ValueError, match="reasoning_effort"):
         _server_ids(tokenizer, messages=_HI, chat_template_kwargs={"reasoning_effort": "turbo"})
+
+
+def _declared_efforts(tokenizer):
+    builder = getattr(tokenizer.tokenizer, "model_settings_builder", None)
+    effort = None if builder is None else builder.reasoning_effort
+    return [] if effort is None else [str(getattr(v, "value", v)) for v in effort.values]
+
+
+def _check_effort(tokenizer, render, effort):
+    """An effort the checkpoint declares renders; any other is an invalid request.
+
+    Every route answers a ValueError raised while rendering with HTTP 400 and its message,
+    which lists the efforts the checkpoint declares (vLLM and SGLang do the same).
+    """
+    declared = _declared_efforts(tokenizer)
+    if effort in declared:
+        assert render() == _mistral_ids(tokenizer, _HI, reasoning_effort=effort)
+        return
+    # The wording is mistral-common's (1.12 rejects efforts outside its own enum earlier).
+    with pytest.raises(ValueError, match="reasoning_effort") as error:
+        render()
+    assert all(re.search(rf"\b{value}\b", str(error.value)) for value in declared)
+
+
+@pytest.mark.parametrize("effort", ["minimal", "low", "medium", "high", "xhigh", "max"])
+def test_a_chat_reasoning_effort_is_checked_against_the_checkpoint(tokenizer, effort):
+    _check_effort(
+        tokenizer, lambda: _server_ids(tokenizer, messages=_HI, reasoning_effort=effort), effort
+    )
+
+
+@pytest.mark.parametrize("effort", ["minimal", "low", "medium", "high", "xhigh"])
+def test_a_responses_reasoning_effort_is_checked_against_the_checkpoint(tokenizer, effort):
+    from tensorrt_llm.serve.openai_protocol import ResponsesRequest
+    from tensorrt_llm.serve.responses_utils import (
+        reasoning_chat_template_kwargs,
+        reasoning_injected_chat_template_keys,
+    )
+
+    request = ResponsesRequest(model="m", input="Hi.", reasoning={"effort": effort})
+    kwargs = reasoning_chat_template_kwargs(request, model_type=_MODEL_TYPE)
+    assert kwargs["reasoning_effort"] == effort
+
+    def render():
+        return _render(
+            tokenizer,
+            _HI,
+            chat_template_kwargs=kwargs,
+            injected_chat_template_kwargs=reasoning_injected_chat_template_keys(request),
+        )
+
+    _check_effort(tokenizer, render, effort)
+
+
+@pytest.mark.parametrize("effort", ["low", "medium", "high", "max"])
+def test_an_anthropic_effort_is_checked_against_the_checkpoint(tokenizer, effort):
+    from tensorrt_llm.serve.anthropic_adapter import convert_anthropic_request
+    from tensorrt_llm.serve.anthropic_protocol import AnthropicMessagesRequest
+
+    def render():
+        anthropic = AnthropicMessagesRequest(
+            model="m", messages=_HI, max_tokens=16, output_config={"effort": effort}
+        )
+        return _request_ids(tokenizer, convert_anthropic_request(anthropic))
+
+    _check_effort(tokenizer, render, effort)
+
+
+@pytest.mark.parametrize(
+    "reasoning,kwargs", [({"effort": "none"}, {"thinking": False}), ({}, {"thinking": True})]
+)
+def test_a_responses_reasoning_toggle_renders_the_checkpoint_default(tokenizer, reasoning, kwargs):
+    """A reasoning toggle without a declared effort leaves the checkpoint's default."""
+    from tensorrt_llm.serve.openai_protocol import ResponsesRequest
+    from tensorrt_llm.serve.responses_utils import (
+        reasoning_chat_template_kwargs,
+        reasoning_injected_chat_template_keys,
+    )
+
+    request = ResponsesRequest(model="m", input="Hi.", reasoning=reasoning)
+    assert reasoning_chat_template_kwargs(request, model_type=_MODEL_TYPE) == kwargs
+    ids = _render(
+        tokenizer,
+        _HI,
+        chat_template_kwargs=kwargs,
+        injected_chat_template_kwargs=reasoning_injected_chat_template_keys(request),
+    )
+    assert ids == _mistral_ids(tokenizer, _HI)
 
 
 def _user_with_image(size):
