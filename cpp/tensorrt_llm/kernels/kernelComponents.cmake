@@ -124,7 +124,7 @@ add_tllm_kernel_library(
   LINK_LIBRARIES trtllm_gen_fmha_interface tllm::kernel_cutlass_headers)
 
 add_tllm_kernel_library(
-  tllm_kernel_cuda_core_gemm SOURCES weightOnlyBatchedGemv/cudaCoreGemm.cu
+  tllm_kernel_cuda_core_gemm SOURCES cudaCoreGemm/cudaCoreGemm.cu
   LINK_LIBRARIES tllm::common_environment tllm::kernel_cutlass_headers)
 
 add_tllm_kernel_library(
