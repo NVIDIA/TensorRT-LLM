@@ -160,15 +160,21 @@ def test_apply_ucx_env_uses_slurm_cluster_name() -> None:
 
     applied = cluster_env.apply_ucx_env(environ, gpu_type="GB300")
 
-    expected = {"UCX_TLS": "cuda_ipc,cuda_copy,sm,self,tcp", "UCX_TCP_AF_PRIO": "inet"}
+    expected = {
+        "UCX_TLS": "cuda_ipc,cuda_copy,sm,self,tcp",
+        "UCX_TCP_AF_PRIO": "inet",
+        "UCX_NET_DEVICES": "eth0",
+    }
     assert applied == expected
     assert environ == {"SLURM_CLUSTER_NAME": "oci-jhb-slurm-1", "OTHER": "kept", **expected}
 
 
-def test_apply_ucx_env_is_noop_on_unlisted_cluster() -> None:
+def test_apply_ucx_env_detection_opt_out_on_unlisted_cluster() -> None:
     environ = {"UCX_TLS": "tcp", "UCX_NET_DEVICES": "eth0", "UCX_CUDA_IPC_ENABLE_MNNVL": "n"}
 
-    applied = cluster_env.apply_ucx_env(environ, cluster_name="dlcluster", gpu_type="H100")
+    applied = cluster_env.apply_ucx_env(
+        environ, cluster_name="dlcluster", gpu_type="H100", detect_devices=False
+    )
 
     assert applied is None
     assert environ == {
@@ -178,10 +184,10 @@ def test_apply_ucx_env_is_noop_on_unlisted_cluster() -> None:
     }
 
 
-def test_apply_ucx_env_is_noop_outside_slurm() -> None:
+def test_apply_ucx_env_detection_opt_out_outside_slurm() -> None:
     environ = {"UCX_TLS": "tcp", "UCX_NET_DEVICES": "eth0"}
 
-    assert cluster_env.apply_ucx_env(environ, gpu_type="H100") is None
+    assert cluster_env.apply_ucx_env(environ, gpu_type="H100", detect_devices=False) is None
     assert environ == {"UCX_TLS": "tcp", "UCX_NET_DEVICES": "eth0"}
 
 
@@ -233,9 +239,7 @@ def test_apply_ucx_env_detects_local_device(monkeypatch, cluster_name):
 
     monkeypatch.setattr(cluster_env, "_local_net_device", local_device)
     environ = {"UCX_TLS": "old", "OTHER": "kept"}
-    applied = cluster_env.apply_ucx_env(
-        environ, cluster_name=cluster_name, gpu_type="B300", detect_devices=True
-    )
+    applied = cluster_env.apply_ucx_env(environ, cluster_name=cluster_name, gpu_type="B300")
     assert calls == [True]
     assert applied["UCX_NET_DEVICES"] == "bond0"
     assert environ == {"OTHER": "kept", **applied}
@@ -253,9 +257,7 @@ def test_apply_ucx_env_detection_preserves_explicit_devices(monkeypatch, cluster
 
     monkeypatch.setattr(cluster_env, "_local_net_device", unexpected_detection)
     environ = {"UCX_NET_DEVICES": "eth-custom"}
-    applied = cluster_env.apply_ucx_env(
-        environ, cluster_name=cluster_name, gpu_type="B300", detect_devices=True
-    )
+    applied = cluster_env.apply_ucx_env(environ, cluster_name=cluster_name, gpu_type="B300")
     assert applied["UCX_NET_DEVICES"] == "eth-custom"
     assert environ["UCX_NET_DEVICES"] == "eth-custom"
 
@@ -266,9 +268,7 @@ def test_apply_ucx_env_cluster_device_bypasses_detection(monkeypatch):
 
     monkeypatch.setattr(cluster_env, "_local_net_device", unexpected_detection)
     environ = {}
-    applied = cluster_env.apply_ucx_env(
-        environ, cluster_name="nsc-svg", gpu_type="B300", detect_devices=True
-    )
+    applied = cluster_env.apply_ucx_env(environ, cluster_name="nsc-svg", gpu_type="B300")
     assert applied["UCX_NET_DEVICES"].startswith("mlx5_0:1,")
 
 

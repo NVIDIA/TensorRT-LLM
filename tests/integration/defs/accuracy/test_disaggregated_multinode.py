@@ -201,7 +201,6 @@ def _worker_env() -> dict[str, str]:
     apply_ucx_env(
         env,
         cluster_name=os.environ.get("SLURM_CLUSTER_NAME", ""),
-        detect_devices=True,
     )
     return env
 

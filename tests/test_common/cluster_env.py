@@ -16,10 +16,9 @@ There are two consumers:
   with get_ucx_tls_cmd(). L0_Test.groovy passes the resolved cluster via
   --cluster-name.
 * Multi-node tests call apply_ucx_env() on the environment they hand to the
-  servers they spawn, with the cluster taken from SLURM_CLUSTER_NAME. Only
-  cluster-specific rules are applied by default; callers can opt into
-  local device detection for unlisted clusters. The catch-all rule's clear-only
-  behavior is limited to PerfSanity.
+  servers they spawn, with the cluster taken from SLURM_CLUSTER_NAME. Local
+  device detection fills in missing devices by default. The catch-all rule's
+  clear-only behavior is limited to PerfSanity.
 
 Cluster names follow SlurmPartition.clusterName in the bloom Jenkins shared
 library (src/com/nvidia/bloom/SlurmConfig.groovy), e.g. "gcp-nrt", "aws-cmh",
@@ -274,7 +273,7 @@ def _local_net_device() -> str:
     )
 
 
-def apply_ucx_env(environ=None, cluster_name=None, gpu_type=None, *, detect_devices=False):
+def apply_ucx_env(environ=None, cluster_name=None, gpu_type=None, *, detect_devices=True):
     """Apply cluster UCX settings, optionally detecting a local network device.
 
     A cluster-specific rule clears BASE_UCX_UNSET_VARS and sets its vars.
@@ -288,8 +287,9 @@ def apply_ucx_env(environ=None, cluster_name=None, gpu_type=None, *, detect_devi
         environ: Mapping to update; defaults to os.environ.
         cluster_name: Cluster name; defaults to SLURM_CLUSTER_NAME.
         gpu_type: GPU type token; defaults to detect_gpu_type().
-        detect_devices: Opt into local interface detection and preserve an
-            explicit UCX_NET_DEVICES override. Defaults to False.
+        detect_devices: Detect missing local devices and preserve an explicit
+            UCX_NET_DEVICES override. Defaults to True; False applies only
+            cluster rules.
 
     Returns:
         The vars that were set, or None when no rule or detection applies.
