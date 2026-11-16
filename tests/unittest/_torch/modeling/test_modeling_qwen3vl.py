@@ -1123,13 +1123,15 @@ def test_qwen_vl_encoder_puts_item_grid_on_embedding_handles(encoder_cls, mm_enc
     expected = [{"image_grid_thw": [1, 4, 6]}, {"image_grid_thw": [1, 6, 4]}]
     if encoder_cls is not modeling_qwen2vl.Qwen2VisionModelBase:
         # Qwen3-VL encodes images and videos in one call. The video comes first in the prompt.
+        # It has one timestamp per frame group.
         data["video"] = {
             "pixel_values_videos": torch.zeros(32, 4),
             "video_grid_thw": torch.tensor([[2, 4, 4]]),
+            "video_timestamps": [[0.25, 1.25]],
         }
         item_refs.insert(0, ("video", 0))
         lengths.insert(0, 8)
-        expected.insert(0, {"video_grid_thw": [2, 4, 4]})
+        expected.insert(0, {"video_grid_thw": [2, 4, 4], "video_timestamps": [0.25, 1.25]})
     data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(
         item_refs, output_embedding_lengths=lengths
     )
@@ -1152,6 +1154,26 @@ def test_qwen_vl_encoder_puts_item_grid_on_embedding_handles(encoder_cls, mm_enc
         assert param.multimodal_data["multimodal_embedding_metadata"] == expected
     else:
         assert "multimodal_embedding_metadata" not in param.multimodal_data
+
+
+@pytest.mark.cpu_only
+def test_qwen2_5_vl_encoder_puts_video_timing_on_embedding_handles():
+    """Each Qwen2.5-VL video handle also gets its seconds per temporal grid step."""
+    data = {
+        "video": {
+            "pixel_values_videos": torch.zeros(48, 4),
+            "video_grid_thw": torch.tensor([[2, 4, 4], [1, 4, 4]]),
+            "second_per_grid_ts": torch.tensor([0.5, 1.0]),
+        },
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+            [("video", 1), ("video", 0)], output_embedding_lengths=[4, 8]
+        ),
+    }
+    modeling_qwen2vl._set_item_grid_metadata([MultimodalParams(multimodal_data=data)])
+    assert data["multimodal_embedding_metadata"] == [
+        {"video_grid_thw": [1, 4, 4], "second_per_grid_ts": 1.0},
+        {"video_grid_thw": [2, 4, 4], "second_per_grid_ts": 0.5},
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -2707,3 +2729,36 @@ def test_normalization_transport_partial_encoder_cache() -> None:
     encoder.assert_not_called()
     assert torch.equal(attached[0], params.multimodal_data["multimodal_embedding"])
     assert params.multimodal_data["image"]["vision_normalization"] is spec
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("model", ["qwen2.5", "qwen3"])
+def test_qwen_vl_item_metadata_rebuilds_video_prompt_text(model):
+    """An encoded video's metadata holds its timing, so its prompt text can be rebuilt.
+
+    Qwen3-VL puts a "<t seconds>" timestamp before each frame group; Qwen2.5-VL
+    uses the seconds per grid step for mRoPE positions.
+    """
+    processor, _ = _make_qwen_vl_hf_processor(model)
+    request = _qwen_vl_request(["wide", "video"], text=None)
+    request["prompt"] = processor.get_mm_items_prompt(
+        request["multi_modal_data"], request["mm_item_order"]
+    )
+    ids, extra = create_input_processor_with_hash(processor)(request, SamplingParams())
+    data = extra["multimodal_data"]
+    modeling_qwen2vl._set_item_grid_metadata([MultimodalParams(multimodal_data=data)])
+    image, video = data["multimodal_embedding_metadata"]
+
+    t, h, w = image["image_grid_thw"]
+    text = "<|vision_start|>" + "<|image_pad|>" * (t * h * w // 4) + "<|vision_end|>"
+    t, h, w = video["video_grid_thw"]
+    frame = "<|vision_start|>" + "<|video_pad|>" * (h * w // 4) + "<|vision_end|>"
+    if model == "qwen3":
+        assert set(video) == {"video_grid_thw", "video_timestamps"}
+        assert len(video["video_timestamps"]) == t
+        text += "".join(f"<{seconds:.1f} seconds>{frame}" for seconds in video["video_timestamps"])
+    else:
+        assert set(video) == {"video_grid_thw", "second_per_grid_ts"}
+        assert video["second_per_grid_ts"] > 0
+        text += frame.replace("<|video_pad|>", "<|video_pad|>" * t)
+    assert ids == processor.tokenizer(text).input_ids

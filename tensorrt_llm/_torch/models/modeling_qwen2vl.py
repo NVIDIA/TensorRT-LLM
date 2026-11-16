@@ -1413,6 +1413,11 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                 "video_grid_thw":
                 processed_inputs.get('video_grid_thw')
             }
+            # Per-video timing, kept so each video's prompt text and mRoPE
+            # can be rebuilt from its own metadata.
+            for key in ("second_per_grid_ts", "video_timestamps"):
+                if processed_inputs.get(key) is not None:
+                    multimodal_data["video"][key] = processed_inputs[key]
 
         for modality, normalization in processed_inputs.get(
                 "vision_normalization", {}).items():
@@ -2319,26 +2324,41 @@ def _qwen_vision_input_partitions(
         pixel_key: MultimodalItemPartition(item_lengths=patch_counts),
         grid_key: _QWEN_VISION_BATCHED_FIELD,
         "second_per_grid_ts": _QWEN_VISION_BATCHED_FIELD,
+        "video_timestamps": _QWEN_VISION_BATCHED_FIELD,
     }
 
 
-def _set_item_grid_metadata(multimodal_params: List[MultimodalParams]) -> None:
-    """Put each item's grid on its embedding handle, in prompt order.
+# Per-item fields a prefill worker needs to rebuild an item's prompt text and
+# mRoPE positions: the grid, and for videos the timing of each frame group
+# (Qwen2.5-VL `second_per_grid_ts`, Qwen3-VL frame timestamps).
+_QWEN_ITEM_METADATA_KEYS = {
+    "image": ("image_grid_thw", ),
+    "video": ("video_grid_thw", "second_per_grid_ts", "video_timestamps"),
+}
 
-    A prefill worker that gets these embeddings without this encoder's mRoPE
-    positions (for example from an embedding cache) needs the grid to build
-    them.
+
+def _set_item_grid_metadata(multimodal_params: List[MultimodalParams]) -> None:
+    """Put each item's grid and video timing on its embedding handle.
+
+    Items are in prompt order. A prefill worker that gets these embeddings
+    without this encoder's mRoPE positions (for example from an embedding
+    cache) needs them to build the prompt and its positions.
     """
     for param in multimodal_params:
         item_refs, _ = param.get_item_layout()
         data = param.multimodal_data
-        grids = {}
+        values = {}
         metadata = []
         for modality, index in item_refs:
-            key = f"{modality}_grid_thw"
-            if modality not in grids:
-                grids[modality] = data[modality][key].tolist()
-            metadata.append({key: grids[modality][index]})
+            item = {}
+            for key in _QWEN_ITEM_METADATA_KEYS[modality]:
+                if (modality, key) not in values:
+                    value = data[modality].get(key)
+                    values[modality, key] = (value.tolist() if isinstance(
+                        value, torch.Tensor) else value)
+                if values[modality, key] is not None:
+                    item[key] = values[modality, key][index]
+            metadata.append(item)
         data["multimodal_embedding_metadata"] = metadata
 
 
