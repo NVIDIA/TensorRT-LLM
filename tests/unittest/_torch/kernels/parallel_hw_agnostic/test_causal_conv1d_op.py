@@ -133,7 +133,7 @@ def test_causal_conv1d(
         x_batches = []
         for b in range(batch_size):
             x_batches.append(x[b, :, : host_context_lengths[b]])
-            x_in_out = torch.cat(x_batches, dim=1)
+        x_in_out = torch.cat(x_batches, dim=1)
     else:
         x_in_out = x.detach().clone()
 

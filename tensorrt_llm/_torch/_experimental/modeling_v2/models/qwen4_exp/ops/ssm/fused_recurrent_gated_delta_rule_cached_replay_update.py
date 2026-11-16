@@ -82,13 +82,14 @@ def _tep4_cell(why, path, n, t, **spec) -> Cell:
 class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
     """One verify step of `N` sequences x `T` tokens through one GDN layer, for
     the cached-replay state layout. Per live row (`slot = state_indices[n] >= 0`),
-    with `p = prev_num_accepted_tokens[slot]`, `b = cache_buf_idx[slot]`:
+    with its history slot `r = replay_indices[n]` (`slot` when `replay_indices` is
+    None), `p = prev_num_accepted_tokens[r]`, `b = cache_buf_idx[r]`:
 
     1. the state the step starts from is rebuilt from the checkpoint
        `h0 = ssm_states[slot]` (`[HV, V, K]`, K innermost) and the `p` pending
-       history entries in half `b` -- update vectors `u_j = old_u[slot, b, j]`,
-       normalized keys `k_j = old_k[slot, b, j]`, cumulative log-decays
-       `G_j = old_G[slot, b, :, j]` measured from the checkpoint:
+       history entries in half `b` -- update vectors `u_j = old_u[r, b, j]`,
+       normalized keys `k_j = old_k[r, b, j]`, cumulative log-decays
+       `G_j = old_G[r, b, :, j]` measured from the checkpoint:
        `h = exp(G_{p-1}) h0 + sum_j exp(G_{p-1} - G_j) u_j k_j^T`;
     2. the `T` new tokens run the gated delta rule in order (q/k head
        `hv // (HV // H)`, so a v-head group shares one q/k head):
@@ -257,8 +258,10 @@ class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
     commit stays on, so the call is partitioned from N = 16 exactly as above. At dep4 a
     rank holds all 16 / 48 heads, tp1's geometry.
 
-    Metadata consumed: `state_indices` (one slot per row), and per slot
-    `prev_num_accepted_tokens` and `cache_buf_idx`. `replay_work_items` /
+    Metadata consumed: `state_indices` (one checkpoint slot per row),
+    `replay_indices` (one history slot per row, `state_indices` when None), and per
+    history slot `prev_num_accepted_tokens` and `cache_buf_idx`, at any element
+    stride (a manager keeps both in one row per slot). `replay_work_items` /
     `n_writes` are only checked (shape, dtype); the kernel never reads them, their
     presence switches the in-kernel commit off. `old_beta` is never read or written.
 
@@ -333,10 +336,9 @@ class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
     history buffers whose shape disagrees with `history_size` or the head geometry
     (the kernel addresses them by `history_size`, so 16-deep buffers called at 12
     read other slots' entries); history buffers, `prev_num_accepted_tokens` or
-    `cache_buf_idx` covering fewer slots than `ssm_states` (a slot of the pool past
-    their end is read and written out of bounds); a strided `prev_num_accepted_tokens`
-    or `cache_buf_idx` (read at element `slot`). A strided `state_indices` is
-    harmless: the entry's input guard makes it contiguous.
+    `cache_buf_idx` covering fewer slots than the rows' history slots (`replay_indices`,
+    else the pool's; a slot past their end is read and written out of bounds). A
+    strided `state_indices` is harmless: the entry's input guard makes it contiguous.
 
     Not certified: pre-gated `g`/`beta` (`A_log=None`); `use_qk_l2norm_in_kernel=
     False`; an `ssm_states` other than fp32 or bf16; at 16 / 48 heads a bf16 one at
@@ -387,6 +389,7 @@ class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
         packed_qkv: Optional[torch.Tensor] = None,
         use_all_layer_commit: bool = False,
         output: Optional[torch.Tensor] = None,
+        replay_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         return _cached_replay_update(
             q=q,
@@ -419,6 +422,7 @@ class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
             packed_qkv=packed_qkv,
             use_all_layer_commit=use_all_layer_commit,
             output=output,
+            replay_indices=replay_indices,
         )
 
     def reference(
@@ -453,6 +457,7 @@ class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
         packed_qkv: Optional[torch.Tensor] = None,
         use_all_layer_commit: bool = False,
         output: Optional[torch.Tensor] = None,
+        replay_indices: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """`(out, ssm_states, old_u, old_k, old_G)` as the call leaves them;
         mutates nothing. The state is rebuilt from the checkpoint and history
@@ -499,15 +504,16 @@ class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
         if live.numel() == 0:
             return out.to(out_dtype), pool, u_buf, k_buf, G_buf
         slot = state_indices[:N][live].long()
-        p = prev_num_accepted_tokens[slot].long()
-        b = cache_buf_idx[slot].long()
+        rslot = slot if replay_indices is None else replay_indices[:N][live].long()
+        p = prev_num_accepted_tokens[rslot].long()
+        b = cache_buf_idx[rslot].long()
         M, depth = live.numel(), old_u.shape[2]
 
         # 1. the pending state: checkpoint plus the p history entries of half b
         pending = torch.arange(depth, device=dev)[None, :] < p[:, None]  # [M, depth]
-        Gh = torch.where(pending[:, None, :], old_G[slot, b].float(), 0.0)  # [M, HV, depth]
-        Uh = torch.where(pending[:, :, None, None], old_u[slot, b].float(), 0.0)
-        Kh = torch.where(pending[:, :, None, None], old_k[slot, b].float(), 0.0)
+        Gh = torch.where(pending[:, None, :], old_G[rslot, b].float(), 0.0)  # [M, HV, depth]
+        Uh = torch.where(pending[:, :, None, None], old_u[rslot, b].float(), 0.0)
+        Kh = torch.where(pending[:, :, None, None], old_k[rslot, b].float(), 0.0)
         Kh = Kh.repeat_interleave(rep, dim=2)  # [M, depth, HV, K]
         last = (p - 1).clamp(min=0)[:, None, None].expand(M, HV, 1)
         g_start = torch.where(p[:, None] > 0, Gh.gather(2, last).squeeze(2), 0.0)  # [M, HV]
@@ -537,10 +543,10 @@ class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
         w_off = torch.where(wrap, 0, p)
         for t in range(T):
             pos = w_off + t
-            u_buf[slot, w_buf, pos] = u_new[t].to(u_buf.dtype)
-            k_buf[slot, w_buf, pos] = kf[live, t].to(k_buf.dtype)
+            u_buf[rslot, w_buf, pos] = u_new[t].to(u_buf.dtype)
+            k_buf[rslot, w_buf, pos] = kf[live, t].to(k_buf.dtype)
             G_store = torch.where(wrap[:, None], G_new[t], g_start + G_new[t])
-            G_buf[slot, w_buf, :, pos] = G_store.to(G_buf.dtype)
+            G_buf[rslot, w_buf, :, pos] = G_store.to(G_buf.dtype)
         if replay_work_items is None and bool(wrap.any()):
             pool[slot[wrap]] = checkpoint[wrap].to(pool.dtype)
         return out.to(out_dtype), pool, u_buf, k_buf, G_buf
@@ -577,6 +583,7 @@ class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
         packed_qkv: Optional[torch.Tensor] = None,
         use_all_layer_commit: bool = False,
         output: Optional[torch.Tensor] = None,
+        replay_indices: Optional[torch.Tensor] = None,
     ) -> None:
         N, _, H, K = k.shape
         HV, V = v.shape[2], v.shape[3]
@@ -585,18 +592,28 @@ class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
             "kernel reads one slot per sequence with no bound, so a shorter tensor hands the "
             "trailing rows whatever follows it in memory, and they write that slot's history"
         )
-        pool_slots, slots = ssm_states.shape[0], old_u.shape[0]
-        assert slots >= pool_slots, (
-            f"the history buffers have {slots} slots for a {pool_slots}-slot pool -- a slot "
-            "past the history's end is read and written out of bounds"
+        # The history is addressed by the replay slots, the state slots when none are given.
+        if replay_indices is None:
+            history_slots, slot_space = ssm_states.shape[0], "the recurrent pool"
+        else:
+            assert replay_indices.dim() == 1 and replay_indices.shape[0] >= N, (
+                f"replay_indices has shape {tuple(replay_indices.shape)} for {N} sequences -- "
+                "the kernel reads one replay slot per sequence with no bound"
+            )
+            history_slots, slot_space = int(replay_indices[:N].max()) + 1, "the replay slots"
+        slots = old_u.shape[0]
+        assert slots >= history_slots, (
+            f"the history buffers have {slots} slots for {history_slots} of {slot_space} -- a "
+            "slot past the history's end is read and written out of bounds"
         )
         for name, tensor in (
             ("prev_num_accepted_tokens", prev_num_accepted_tokens),
             ("cache_buf_idx", cache_buf_idx),
         ):
-            assert tensor.dim() == 1 and tensor.is_contiguous() and tensor.shape[0] >= pool_slots, (
-                f"{name} has shape {tuple(tensor.shape)} and stride {tensor.stride()}; the kernel "
-                f"reads one element per slot of the {pool_slots}-slot pool, at the slot's index"
+            assert tensor.dim() == 1 and tensor.shape[0] >= history_slots, (
+                f"{name} has shape {tuple(tensor.shape)}; the kernel reads one element per "
+                f"history slot ({history_slots} of {slot_space}), at the slot's index times "
+                "the element stride"
             )
         expected = {
             "old_u": (old_u, (slots, 2, history_size, HV, V)),

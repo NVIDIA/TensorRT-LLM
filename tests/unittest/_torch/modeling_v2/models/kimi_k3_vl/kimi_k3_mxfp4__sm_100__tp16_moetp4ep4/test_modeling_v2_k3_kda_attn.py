@@ -166,8 +166,6 @@ def test_attn_on_manager_pools(mgr, slots, cell) -> None:
                         kc.SCALE,
                         kc.EPS,
                     )
-                    if layer == 0:
-                        out_f64 = f64(ref.last_rows)
                     torch.cuda.synchronize()
                     assert torch.equal(got, want), (req, rnd, layer)
                     assert kc.rel(got, out_reference) <= kc.TOL_OUT, (req, rnd, layer)
@@ -175,6 +173,7 @@ def test_attn_on_manager_pools(mgr, slots, cell) -> None:
                     others = kc.other_slots(p["ssm"].shape[0], [s])
                     assert kc.same_rows(p, before, others, POOL_NAMES), (req, rnd, layer)
                     if layer == 0:
+                        out_f64 = f64(ref.last_rows)
                         assert kc.rel(got, out_f64) <= kc.TOL_OUT, (req, rnd, kc.rel(got, out_f64))
                 accepted = kc.pending_schedule(1, kc.NUM_SPEC, rnd)[0]
                 _accept([pools[0], copies[0], reference_pools[0]], s, accepted)

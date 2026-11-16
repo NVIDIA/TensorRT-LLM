@@ -226,6 +226,7 @@ def test_mm_item_metadata_rejects_mismatched_embedding_lengths():
     input_processor = create_input_processor_with_hash(_ItemMetadataFakeProcessor([1]))
 
     with pytest.raises(ValueError, match="do not match"):
+        # pyrefly: ignore [unexpected-keyword]
         input_processor({"prompt": "unused"}, sampling_params=None)
 
 
@@ -266,6 +267,7 @@ def test_mm_item_metadata_rejects_wrong_return_type():
     input_processor = create_input_processor_with_hash(BadMetadataProcessor([2]))
 
     with pytest.raises(TypeError, match="must return a"):
+        # pyrefly: ignore [unexpected-keyword]
         input_processor({"prompt": "unused"}, sampling_params=None)
 
 
@@ -1191,6 +1193,7 @@ def test_runtime_data_cumsum_math_with_specials_mistral_shape():
 def test_runtime_data_requires_cumsum():
     """embed_mask_cumsum is required."""
     with pytest.raises(TypeError):
+        # pyrefly: ignore [missing-argument]
         MultimodalRuntimeData(past_seen_token_num=0, chunk_end_pos=5)
 
 

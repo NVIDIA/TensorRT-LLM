@@ -159,7 +159,7 @@ class KimiK3DFlashWorker(DFlashWorker):
             or mgr._kda_replay.prev_num_accepted_tokens is None
             or getattr(mgr, "_dummy_request_mask", None) is None
             or mamba_metadata is None
-            or mamba_metadata.state_indices.dtype != torch.int32
+            or mamba_metadata.replay_state_indices.dtype != torch.int32
         ):
             return False
         # The kernel's block counts are backed entries, which a sliding-window
@@ -468,7 +468,7 @@ class KimiK3DFlashWorker(DFlashWorker):
             self._ctx_block_counts,
             self._ctx_block_tables,
             mgr._kda_replay.prev_num_accepted_tokens,
-            attn_metadata.mamba_metadata.state_indices,
+            attn_metadata.mamba_metadata.replay_state_indices,
             mgr._dummy_request_mask,
             attn_metadata.kv_lens_cuda,
             self._batch_to_slot_buffer.tensor,

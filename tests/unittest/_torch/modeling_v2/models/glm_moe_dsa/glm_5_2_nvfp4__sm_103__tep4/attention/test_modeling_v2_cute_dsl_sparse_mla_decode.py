@@ -11,12 +11,15 @@ slot, so a kernel that reads its valid prefix one short drops the key that
 dominates the softmax.
 
 The handle is built the way the target builds it, for every batch up to a
-bound, and the bound is the largest batch any cell drives. A `gmem_split` cell
+bound, and the bound is the largest batch any cell drives. A cell of up to 2
+rows per sequence runs on the width-2 handle and a wider one on a handle built
+at its own `max_sq`, as MTP3 / MTP5 build theirs. A `gmem_split` cell
 takes the smallest batch whose kernel pick on this device is that split with
 the global-memory reducer; the device's SM count and cluster occupancy decide
 it, so it is found here rather than written into the cell.
 """
 
+import dataclasses
 import math
 import zlib
 
@@ -51,16 +54,19 @@ P_SUBNORMAL = 2.0**-10 / 448.0
 
 
 def _band(q, pool, rows, scale):
-    """`(A, Q2, S)` per output element, in fp64, from the operands.
+    """`(A, Q2, S, D)` per output element, in fp64, from the operands.
 
     `A = sum_r p_r |v_r|`, `Q2 = sum_r p_r**2 v_r**2`, and `S` bounds the
     subnormal-probability error, `P_SUBNORMAL * max_r p_r * sum_r |v_r|`
     (the max undoes the normalization: unnormalized, the top key is 1).
+    `D` is how far dropping the row and head's top-probability key would move
+    the output: `p / (1 - p) * |v_top - o|`, with `o = sum_r p_r v_r`, or `|o|`
+    when that key is the only one (no key left: the output is 0).
     """
     qd = q.view(torch.uint8).view(torch.float8_e4m3fn).float().double()
     kv = pool.reshape(-1).view(torch.uint8).reshape(-1, LATENT)
     shape = (qd.shape[0], HEADS, V_DIM)
-    a, q2, s_ = (torch.zeros(shape, dtype=torch.float64, device=q.device) for _ in range(3))
+    a, q2, s_, d = (torch.zeros(shape, dtype=torch.float64, device=q.device) for _ in range(4))
     for lo in range(0, qd.shape[0], 8):
         hi = min(lo + 8, qd.shape[0])
         r = rows[lo:hi]
@@ -68,11 +74,38 @@ def _band(q, pool, rows, scale):
         k = kv[r.clamp(min=0)].view(torch.float8_e4m3fn).float().double()
         s = torch.einsum("thd,tkd->thk", qd[lo:hi], k) * scale
         p = torch.softmax(s.masked_fill(~valid[:, None, :], float("-inf")), -1).nan_to_num(0.0)
-        v = k[..., :V_DIM].abs() * valid[..., None]
+        signed = k[..., :V_DIM] * valid[..., None]
+        v = signed.abs()
         a[lo:hi] = torch.einsum("thk,tkd->thd", p, v)
         q2[lo:hi] = torch.einsum("thk,tkd->thd", p * p, v * v)
         s_[lo:hi] = P_SUBNORMAL * p.amax(-1, keepdim=True) * v.sum(1)[:, None, :]
-    return a, q2, s_
+        top_p, top = p.max(-1)
+        v_top = torch.gather(signed, 1, top[..., None].expand(-1, -1, V_DIM))
+        o = torch.einsum("thk,tkd->thd", p, signed)
+        rest = 1.0 - top_p
+        moved = (top_p / rest.clamp_min(1e-300))[..., None] * (v_top - o).abs()
+        d[lo:hi] = torch.where((valid.sum(-1) == 1)[:, None, None], o.abs(), moved)
+    return a, q2, s_, d
+
+
+def _bound(band):
+    """The per-element gate of `_compare`."""
+    a, _, s, _ = band
+    return (P_ROUND + 2.0**-8 + 2.0**-12) * a + s
+
+
+def _assert_discriminative(band) -> None:
+    """The reference can tell a dropped key: in every query row, some head's
+    output would leave the band if its top-probability key were dropped (the
+    construction puts a row's top key at its last valid slot, which a prefix one
+    short skips). A flat softmax would pass a kernel that drops keys."""
+    a, _, _, d = band
+    assert float(a.amax()) > 0.0, "the reference output is all zero"
+    caught = (d > _bound(band)).any(-1).any(-1)
+    assert bool(caught.all()), (
+        f"{int((~caught).sum())} of {caught.numel()} query rows would not notice a "
+        "dropped top key: the softmax is too flat to certify the valid prefix"
+    )
 
 
 def _compare(out, ref, band) -> None:
@@ -91,10 +124,10 @@ def _compare(out, ref, band) -> None:
     square of at most `2**-8 Q2`, gated with a factor 2 on the root. A kernel
     reading a wrong row, a wrong prefix or a wrong scale misses by O(A).
     """
-    a, q2, s = band
+    a, q2, s, _ = band
     assert bool(torch.isfinite(out).all()), "an output element is not finite (unwritten?)"
     err = out.double().reshape(a.shape) - ref.double().reshape(a.shape)
-    bound = (P_ROUND + 2.0**-8 + 2.0**-12) * a + s
+    bound = _bound(band)
     over = err.abs() > bound
     assert not bool(over.any()), (
         f"{int(over.sum())} elements outside the band; worst |err| / bound = "
@@ -155,20 +188,27 @@ def _build(spec, seed):
         mla_bmm1_scale=torch.tensor(SCALES, dtype=torch.float32, device="cuda"),
         mla_bmm2_scale=torch.ones(1, dtype=torch.float32, device="cuda"),
         index_kind=kind,
-        local_layer_idx=layer if shift else None,
+        # Base rows take their layer even at layer 0 (no shift); global rows take none.
+        local_layer_idx=layer if kind == entry.INDEX_KIND_BASE_WITH_LAYER_OFFSET else None,
     )
     return args, rows
 
 
-def _gmem_batch(split: int) -> int | None:
-    """The smallest batch whose kernel pick on this device is `split` CTAs with
-    the global-memory reducer, or None when every batch of that split fits in
-    one occupancy wave. A split above 1 needs at least `2 * max_sq * batch`
-    SMs, so the search stops at the SM count."""
+def _width(p: int) -> int:
+    """The `max_sq` of the handle the target passes for `p` rows per sequence."""
+    return max(entry.MAX_SQ, p)
+
+
+def _gmem_batch(split: int, max_sq: int) -> int | None:
+    """The smallest batch whose kernel pick on this device, on a grid of
+    `max_sq` rows per sequence, is `split` CTAs with the global-memory reducer,
+    or None when every batch of that split fits in one occupancy wave. A split
+    above 1 needs at least `2 * max_sq * batch` SMs, so the search stops at the
+    SM count."""
     dev = torch.cuda.current_device()
     sms = torch.cuda.get_device_properties(dev).multi_processor_count
     for batch in range(1, sms + 1):
-        if entry.split_k_variant(batch, device_index=dev) == (split, True):
+        if entry.split_k_variant(batch, device_index=dev, max_sq=max_sq) == (split, True):
             return batch
     return None
 
@@ -179,7 +219,7 @@ def _resolve(spec) -> dict | None:
     device never selects it."""
     if "lens" in spec:
         return dict(spec)
-    batch = _gmem_batch(spec["gmem_split"])
+    batch = _gmem_batch(spec["gmem_split"], _width(spec["p"]))
     if batch is None:
         return None
     return dict(spec, lens=[spec["p"] + (347 * i) % 3000 for i in range(batch)])
@@ -187,10 +227,18 @@ def _resolve(spec) -> dict | None:
 
 @pytest.fixture(scope="module")
 def compiled():
-    """The handle as the target builds it, both index kinds, for every batch up
-    to the largest any cell drives."""
-    bound = max(len(r["lens"]) for c in op.CELLS if (r := _resolve(c.spec)) is not None)
-    return entry.compile(max_batch_size=bound, device_index=torch.cuda.current_device())
+    """The handles as the target builds them, by `max_sq`: both index kinds, for
+    every batch up to the largest any cell of that width drives."""
+    bounds: dict[int, int] = {}
+    for c in op.CELLS:
+        r = _resolve(c.spec)
+        if r is not None:
+            w = _width(r["p"])
+            bounds[w] = max(bounds.get(w, 0), len(r["lens"]))
+    dev = torch.cuda.current_device()
+    return {
+        w: entry.compile(max_batch_size=b, device_index=dev, max_sq=w) for w, b in bounds.items()
+    }
 
 
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
@@ -203,29 +251,199 @@ def test_certified_cells(cell, compiled, certifying) -> None:  # noqa: F811 — 
             "global-memory reducer on this device; the target never reaches it here"
         )
     certifying(op)
+    handle = compiled[_width(spec["p"])]
     args, rows = _build(spec, zlib.crc32(cell.why.encode()) % 2**31)
-    out = op(**args, compiled=compiled)
+    out = op(**args, compiled=handle)
     torch.cuda.synchronize()
-    ref = op.reference(**args, compiled=compiled)
-    _compare(out, ref, _band(args["quant_q_buffer"], args["kv_pool_view"], rows, SCALES[0]))
+    ref = op.reference(**args, compiled=handle)
+    band = _band(args["quant_q_buffer"], args["kv_pool_view"], rows, SCALES[0])
+    _assert_discriminative(band)
+    _compare(out, ref, band)
 
 
-def test_handle_covers_every_batch_up_to_a_large_bound() -> None:
-    """The target builds its handle for the engine's max_batch_size, whatever
+#: One cell per handle width the target passes: MTP1, and MTP3 / MTP5 verify on base rows;
+#: on B300, MTP5 at 32 (base rows), 31 (global rows) and 25 (base rows) sequences run
+#: split-K 2 with the cluster reducer.
+_REPLAY = {
+    "mtp1": dict(p=2, lens=[2049, 40, 3000], index_kind="global", layer=1),
+    "mtp3": dict(
+        p=4, lens=[4 + 271 * i for i in range(32)], index_kind="base_with_layer_offset", layer=2
+    ),
+    "mtp5": dict(
+        p=6, lens=[6 + 263 * i for i in range(32)], index_kind="base_with_layer_offset", layer=0
+    ),
+    "mtp5_b31": dict(p=6, lens=[9 + 211 * i for i in range(31)], index_kind="global", layer=2),
+    "mtp5_b25": dict(
+        p=6, lens=[6 + 337 * i for i in range(25)], index_kind="base_with_layer_offset", layer=1
+    ),
+}
+
+
+@pytest.mark.parametrize("name", list(_REPLAY))
+def test_graph_replay_is_bitwise_eager(name, compiled) -> None:
+    """The target captures this op in its decode graph: a replay must write the
+    eager call's bytes, and a second replay on new inputs copied into the same
+    buffers must write that call's bytes (the runner binds addresses, not
+    values)."""
+    spec = _REPLAY[name]
+    handle = compiled[_width(spec["p"])]
+    args, _ = _build(spec, 41)
+    fresh, _ = _build(spec, 42)
+    eager = op(**args, compiled=handle).clone()
+    eager_fresh = op(**fresh, compiled=handle).clone()
+    args["output"].fill_(float("nan"))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        op(**args, compiled=handle)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(args["output"].view(torch.int16), eager.view(torch.int16))
+    for key in ("quant_q_buffer", "kv_pool_view", "sparse_attn_indices", "sequence_length"):
+        args[key].copy_(fresh[key])
+    args["output"].fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(args["output"].view(torch.int16), eager_fresh.view(torch.int16))
+
+
+@pytest.mark.parametrize("max_sq", [entry.MAX_SQ, 4, 6], ids=["mtp1", "mtp3", "mtp5"])
+def test_handle_covers_every_batch_up_to_a_large_bound(max_sq) -> None:
+    """The target builds its handles for the engine's max_batch_size, whatever
     it is: every batch up to that bound must find its pick in the handle, for
     both index kinds, and the compile count must stay bounded. Picks the cells
     already built come from the compile cache."""
     dev = torch.cuda.current_device()
     bound = 2048
-    handle = entry.compile(max_batch_size=bound, device_index=dev)
+    handle = entry.compile(max_batch_size=bound, device_index=dev, max_sq=max_sq)
     built = {(k.num_ctas_kv, k.use_gmem_reduction, k.index_kind) for k in handle.kernels}
     kinds = (entry.INDEX_KIND_GLOBAL, entry.INDEX_KIND_BASE_WITH_LAYER_OFFSET)
     for batch in range(1, bound + 1):
-        variant = entry.split_k_variant(batch, device_index=dev)
+        variant = entry.split_k_variant(batch, device_index=dev, max_sq=max_sq)
         for kind in kinds:
             assert (*variant, kind) in built, (batch, variant, kind)
     # Splits 8, 4 and 2, each with or without the global-memory reducer, and 1.
     assert len(built) <= 7 * len(kinds), sorted(built)
+
+
+def _kernel_pick(batch: int, max_sq: int) -> tuple[int, bool]:
+    """The kernel's own split-K rule, as its runner applies it when not told."""
+    kernel = entry._kernel
+    dev = torch.cuda.current_device()
+    sms = torch.cuda.get_device_properties(dev).multi_processor_count
+    ctas = kernel._select_num_ctas_kv(
+        batch_size=batch, max_sq=max_sq, max_seq_len_kv=TOP_K, multiprocessor_count=sms
+    )
+    gmem = ctas > 1 and kernel._select_gmem_reduction(
+        batch_size=batch, max_sq=max_sq, max_active_clusters=kernel._max_active_clusters(dev, ctas)
+    )
+    return ctas, bool(gmem)
+
+
+def test_only_the_wide_handle_overrides_the_kernel_pick(monkeypatch) -> None:
+    """MTP1 keeps the kernel's own split-K picks: the width-2 handle overrides no batch up to
+    2048. A wide handle overrides only its `SPLIT2_CLUSTER_BATCHES` (on a 148-SM B300: none
+    at max_sq 4, 25..32 sequences at max_sq 6), with split-K 2 and the cluster
+    reducer, and the op hands the runner exactly that pick there and None (the kernel's
+    rule) elsewhere."""
+    dev = torch.cuda.current_device()
+    sms = torch.cuda.get_device_properties(dev).multi_processor_count
+    for max_sq in (entry.MAX_SQ, 4, 6):
+        want = entry.SPLIT2_CLUSTER_BATCHES.get((sms, max_sq), frozenset())
+        if max_sq == entry.MAX_SQ:
+            assert not want
+        for batch in range(1, 2049):
+            pick = entry.split_k_variant(batch, device_index=dev, max_sq=max_sq)
+            assert pick == ((2, False) if batch in want else _kernel_pick(batch, max_sq)), (
+                max_sq,
+                batch,
+            )
+    if sms == 148:
+        assert not entry.SPLIT2_CLUSTER_BATCHES.get((148, 4))
+        assert entry.SPLIT2_CLUSTER_BATCHES[(148, 6)] == set(range(25, 33))
+    seen = []
+    # The base module keeps only the shared parts (no runner since the base kernel's removal):
+    # spying on the wide module alone still proves no call reaches another kernel.
+    for module in (entry._wide_kernel,):
+
+        def spy(*args, _real=module.prepare_runner, _module=module, **kwargs):
+            runner = _real(*args, **kwargs)
+            seen.append(
+                (
+                    kwargs["num_ctas_kv"],
+                    kwargs["use_gmem_reduction"],
+                    runner.specialization,
+                    _module,
+                )
+            )
+            return runner
+
+        monkeypatch.setattr(module, "prepare_runner", spy)
+    for max_sq, batch in ((entry.MAX_SQ, 32), (4, 19), (4, 32), (6, 24), (6, 25), (6, 32)):
+        handle = entry.compile(max_batch_size=32, device_index=dev, max_sq=max_sq)
+        assert handle.split2_cluster_batches == {
+            b for b in entry.SPLIT2_CLUSTER_BATCHES.get((sms, max_sq), ()) if b <= 32
+        }
+        spec = dict(p=max_sq, lens=[3000 + 7 * i for i in range(batch)], index_kind="global")
+        args, _ = _build(dict(spec, layer=0), 11)
+        op(**args, compiled=handle)
+        forced, gmem, specialization, module = seen[-1]
+        # Every handle, MTP1's included, runs the V-reuse kernel.
+        assert module is entry._wide_kernel
+        if batch in handle.split2_cluster_batches:
+            assert (forced, gmem) == (2, False)
+        else:
+            assert (forced, gmem) == (None, None)
+        got = (specialization.num_ctas_kv, specialization.use_gmem_reduction)
+        assert got == entry.split_k_variant(batch, device_index=dev, max_sq=max_sq)
+
+
+def test_a_split2_batch_never_takes_the_steady_state_launch(monkeypatch) -> None:
+    """CTX-HOST-DIET's steady-state launch (`run_accepted`) replays what it recorded for a call
+    signature, and the signature does not name a wide handle's split-K 2 override: the op
+    records only the kernel's own pick and sends an override batch to `prepare_runner` on every
+    call. A handle without the override keeps the kernel's pick on its second (steady-state)
+    call, and the served handle keeps split-K 2 on both, in either order."""
+    dev = torch.cuda.current_device()
+    sms = torch.cuda.get_device_properties(dev).multi_processor_count
+    if 25 not in entry.SPLIT2_CLUSTER_BATCHES.get((sms, 6), ()):
+        pytest.skip("no MTP5 split-K 2 override at 25 sequences on this device")
+    monkeypatch.setattr(entry, "_HOST_DIET", True)
+    monkeypatch.setattr(entry._wide_kernel, "_ACCEPTED", {})
+    served = entry.compile(max_batch_size=25, device_index=dev, max_sq=6)
+    assert 25 in served.split2_cluster_batches
+    plain = dataclasses.replace(served, split2_cluster_batches=frozenset())
+    spec = dict(p=6, lens=[6 + 307 * i for i in range(25)], index_kind="global", layer=0)
+    args, _ = _build(spec, 5)
+    want = {}
+    for name, forced in (("served", 2), ("plain", None)):
+        out = torch.full_like(args["output"], float("nan"))
+        runner = entry._wide_kernel.prepare_runner(
+            args["quant_q_buffer"],
+            args["kv_pool_view"],
+            args["sparse_attn_indices"],
+            out,
+            args["cu_q_seqlens"],
+            args["sequence_length"],
+            mla_bmm1_scale=args["mla_bmm1_scale"],
+            mla_bmm2_scale=args["mla_bmm2_scale"],
+            all_sparse_indices_valid=served.all_sparse_indices_valid,
+            max_sq=6,
+            num_ctas_kv=forced,
+            use_gmem_reduction=False if forced else None,
+            index_kind=spec["index_kind"],
+        )
+        runner.compiled = served.kernels[runner.specialization]
+        runner()
+        want[name] = out
+    torch.cuda.synchronize()
+    assert not torch.equal(want["served"].view(torch.int16), want["plain"].view(torch.int16))
+    for name, handle in (("plain", plain), ("served", served)) * 2:
+        out = torch.full_like(args["output"], float("nan"))
+        op(**dict(args, output=out), compiled=handle)
+        torch.cuda.synchronize()
+        assert torch.equal(out.view(torch.int16), want[name].view(torch.int16)), name
+    # One record: the plain handle's signature (its second call took the steady state).
+    assert len(entry._wide_kernel._ACCEPTED) == 1
 
 
 def test_a_batch_above_the_handle_raises_rather_than_compiling() -> None:
