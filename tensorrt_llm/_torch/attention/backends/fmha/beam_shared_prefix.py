@@ -881,9 +881,9 @@ class BeamSharedPrefixFmha(PhasedFmha):
         """Whether this forward can use the library (instance-invariant checks only)."""
         if phase == FmhaPhase.CONTEXT:
             return False
-        if metadata.num_contexts > 0 and not self._context_impl.is_supported(
-            q, k, v, metadata, forward_args, phase=FmhaPhase.CONTEXT
-        ):
+        if phase is None and metadata.num_contexts > 0:
+            # A mixed batch is claimed through the generation phase only, so the manager pairs
+            # this library with its own choice of context library.
             return False
         if forward_args.attention_input_type == AttentionInputType.context_only:
             return False

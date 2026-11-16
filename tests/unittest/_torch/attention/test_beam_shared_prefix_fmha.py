@@ -52,6 +52,7 @@ from tensorrt_llm._torch.attention.backends.fmha.beam_shared_prefix import (
 from tensorrt_llm._torch.attention.backends.fmha.beam_shared_prefix_kernels import (
     fused_tail_and_merge,
 )
+from tensorrt_llm._torch.attention.backends.fmha.interface import FmhaPhase
 from tensorrt_llm._torch.attention.backends.fmha.shared_prefix_fa4 import (
     PrefixGroups,
     prefix_request_tables,
@@ -499,6 +500,15 @@ def test_library_selection_does_not_depend_on_per_step_state():
     unplanned.max_seq_len = 64
     assert lib._is_supported(q, None, None, planned, forward_args)
     assert lib._is_supported(q, None, None, unplanned, forward_args)
+    # A mixed batch is claimed for its generation phase only; the manager picks the context library.
+    mixed = _beam_meta(
+        manager, beam_width=2, request_ids=(7, 9), kv_lens=(5, 5), prompt_lens=(4, 4)
+    )
+    mixed.num_contexts = 1
+    mixed.num_ctx_tokens = 0
+    mixed.max_seq_len = 64
+    assert not lib._is_supported(q, None, None, mixed, forward_args)
+    assert lib._is_supported(q, None, None, mixed, forward_args, phase=FmhaPhase.GENERATION)
 
 
 def test_prefix_request_tables_chunk_skip_empty_groups_and_size_the_last_page():
@@ -793,6 +803,7 @@ def _e2e_candidate(model_path, lengths, max_tokens, **extra_env):
         iterations=iterations,
     )
     assert iterations["served"] > 0, iterations
+    assert iterations["planned"] > 0, iterations
     return beams
 
 
