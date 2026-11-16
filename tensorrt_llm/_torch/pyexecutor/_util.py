@@ -1548,6 +1548,12 @@ class KvCacheCreator:
                 and _uses_gdn_mtp_replay(self._model_engine.model)):
             # Cost the GDN replay region of the state the manager will select.
             extra_kwargs = dict(extra_kwargs, gdn_mtp_replay=True)
+        if (not is_draft and self._speculative_config is not None
+                and issubclass(manager_cls, MambaHybridCacheManagerV2)
+                and self._model_engine is not None
+                and _uses_kda_mtp_replay(self._model_engine.model)):
+            # Cost the KDA replay region of the state the manager will select.
+            extra_kwargs = dict(extra_kwargs, kda_mtp_replay=True)
         cost = CacheCost.from_raw(
             manager_cls.get_cache_size_per_token(
                 model_config,
@@ -4721,6 +4727,24 @@ def _uses_gdn_mtp_replay(model: torch.nn.Module) -> bool:
         for layer in layers)
 
 
+def _uses_kda_mtp_replay(model: torch.nn.Module) -> bool:
+    """Whether ``model``'s KDA layers can verify drafts with the KDA MTP replay kernels.
+
+    They must be the PyTorch KDA mixer with a 4-tap convolution and the -5
+    gate lower bound the kernels fold in.
+    """
+    from ..modules.kimi_kda.kimi_kda_mixer import KimiKDALinearAttention
+    if not isinstance(model, torch.nn.Module):
+        return False
+    layers = [
+        module for module in model.modules()
+        if isinstance(module, KimiKDALinearAttention)
+    ]
+    return bool(layers) and all(
+        layer.conv_size == 4 and layer.gate_lower_bound == -5.0
+        for layer in layers)
+
+
 def _create_kv_cache_manager(
         model_engine: Optional[ModelEngine],
         kv_cache_manager_cls,
@@ -4993,6 +5017,11 @@ def _create_kv_cache_manager(
                 and issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2)
                 and getattr(backbone, "kda_draft_records", False)):
             kda_extra_kwargs["kda_draft_records"] = True
+        if (spec_config is not None
+                and issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2)
+                and model_engine is not None
+                and _uses_kda_mtp_replay(model_engine.model)):
+            kda_extra_kwargs["kda_mtp_replay"] = True
         if (not is_glm5_next and issubclass(kv_cache_manager_cls,
                                             MambaHybridCacheManagerV2)):
             # The V2 manager reads the MLA geometry and the per-layer KV
