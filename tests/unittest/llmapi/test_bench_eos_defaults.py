@@ -22,6 +22,7 @@ import socket
 from argparse import Namespace
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from threading import Thread
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -32,6 +33,7 @@ import pytest
 import torch
 from aiohttp import web
 from click.testing import CliRunner
+from test_common.serve.app_factory import AggConfig, isolated_serve_env
 from transformers import LlamaConfig, LlamaForCausalLM
 
 from tensorrt_llm.bench.benchmark import low_latency, throughput
@@ -79,6 +81,25 @@ def test_speculative_config_info():
         "spec_num_tokens": "3",
         "spec_draft_model": "draft",
     }
+
+
+@pytest.mark.asyncio
+async def test_get_model_speculative_metadata(tmp_path: Path) -> None:
+    with isolated_serve_env(tmp_path) as serve_env:
+        server = serve_env.build_openai_server(AggConfig())
+        server.generator.args.speculative_config = EAGLE3_ARGS.speculative_config
+
+        response = await server.get_model()
+
+        assert response.status_code == 200
+        metadata = json.loads(response.body)["data"][0]["metadata"]
+        assert metadata is not None
+        assert metadata["speculative_config"] == {
+            "spec_enabled": "true",
+            "spec_method": "Eagle3",
+            "spec_num_tokens": "3",
+            "spec_draft_model": "draft",
+        }
 
 
 def _models_payload(args):
