@@ -53,6 +53,8 @@ class Fp8MqaLogitsPrefillKernel:
         self.num_kv_stages = num_kv_stages
         self.num_q_stages = num_q_stages
         # Query rows per TMEM load, 32 accumulator columns each.
+        if BLOCK_Q % rows_per_load:
+            raise ValueError(f"rows_per_load must divide {BLOCK_Q}, got {rows_per_load}")
         self.rows_per_load = rows_per_load
         self.num_umma_stages = 2
         self.N = BLOCK_Q * HEADS
