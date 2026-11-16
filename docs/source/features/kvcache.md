@@ -260,6 +260,39 @@ boundary, so the executor uses the `FORCE_CHUNK` chunking policy. The option
 requires V2 and block reuse. It has no effect on models without SWA layers or on
 SWA layers with joint target/draft KV cache reuse.
 
+### Session Leases on Disaggregated Context Servers
+
+In a multi-turn conversation, each turn's prompt usually starts with the previous
+turn's prompt. A context server normally closes a finished request's cache, which
+unlocks its pages, and the next turn matches the same prefix in the radix tree and
+locks those pages again. With the prototype
+`kv_cache_config.block_reuse_config.max_session_leases` option, V2 keeps the cache
+of a finished context-only request active, keyed by its conversation, for up to
+that many conversations. The next turn of the conversation whose prompt starts with
+the leased tokens takes the cache over and only allocates and computes its new
+tokens:
+
+```yaml
+kv_cache_config:
+  enable_block_reuse: true
+  use_kv_cache_manager_v2: true
+  block_reuse_config:
+    max_session_leases: 256
+    session_lease_max_utilization: 0.8
+```
+
+A request takes part only when it is context-only (the context server of
+disaggregated serving) and carries conversation params
+(`conversation_params.conversation_id` on the request). A leased cache holds whole
+blocks only, so a next turn that differs inside the last partial block still takes
+it over; a turn that differs earlier closes the lease and reuses the committed
+blocks from the radix tree as usual. Leased pages cannot be evicted, so leases close
+oldest first when GPU pool utilization exceeds `session_lease_max_utilization` and
+when an allocation fails. Committed blocks of a leased cache stay shareable with
+other requests. Leases are off for draft managers, joint target/draft reuse, beam
+search, KV connectors, Helix context parallelism, and the hybrid recurrent-state
+managers. The option requires V2, block reuse, and the `all_reusable` policy.
+
 ### Mamba Snapshot Boundaries
 
 Hybrid Mamba models must retain the recurrent Mamba state together with the

@@ -5745,12 +5745,38 @@ class BlockReuseConfig(StrictBaseModel):
         "prompt, the prompt end is snapshotted as a fallback. Requires KV cache "
         "manager v2 and block reuse.")
 
+    max_session_leases: NonNegativeInt = Field(
+        default=0,
+        status="prototype",
+        description=
+        "Maximum number of conversations whose finished context KV cache a "
+        "disaggregated context server keeps active (pages locked) for the "
+        "conversation's next turn. A next turn whose prompt starts with the "
+        "leased tokens takes the cache over instead of matching and locking "
+        "its prefix again, and computes only its new tokens. Applies to "
+        "context-only requests that carry conversation params. Leases close "
+        "oldest first above `session_lease_max_utilization` or when an "
+        "allocation fails. Zero disables leases. Positive values require KV "
+        "cache manager v2, block reuse enabled, and policy='all_reusable'.")
+
+    session_lease_max_utilization: float = Field(
+        default=0.8,
+        gt=0,
+        le=1,
+        status="prototype",
+        description=
+        "GPU KV cache pool utilization above which session leases are closed, "
+        "oldest first. Only used when `max_session_leases` is positive.")
+
     @model_validator(mode="after")
     def validate_swa_endpoint_policy(self) -> 'BlockReuseConfig':
         if self.swa_endpoint_rewind_tokens > 0 and self.policy != "all_reusable":
             raise ValueError(
                 "block_reuse_config.swa_endpoint_rewind_tokens requires "
                 "block_reuse_config.policy='all_reusable'.")
+        if self.max_session_leases > 0 and self.policy != "all_reusable":
+            raise ValueError("block_reuse_config.max_session_leases requires "
+                             "block_reuse_config.policy='all_reusable'.")
         return self
 
 

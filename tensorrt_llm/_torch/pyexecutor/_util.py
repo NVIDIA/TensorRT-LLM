@@ -1259,6 +1259,11 @@ class KvCacheCreator:
                         "block_reuse_config.swa_endpoint_rewind_tokens requires "
                         "KVCacheManagerV2, which is not supported with "
                         f"{incompat_str}.")
+                if kv_cache_config.block_reuse_config.max_session_leases > 0:
+                    raise NotImplementedError(
+                        "block_reuse_config.max_session_leases requires "
+                        "KVCacheManagerV2, which is not supported with "
+                        f"{incompat_str}.")
                 # Plain V2 (explicitly enabled or selected by a model preference):
                 # V2 was a preference, not a structural requirement, so we can
                 # safely fall back to V1.

@@ -43,6 +43,7 @@ l0_a10:
   - unittest/_torch/disaggregation/test_disagg_index_mapper_early_release.py
   - unittest/_torch/pyexecutor/kv_cache/sharing
   - unittest/_torch/pyexecutor/kv_cache/test_kv_cache_v2_branch_snapshot.py
+  - unittest/_torch/pyexecutor/kv_cache/test_kv_cache_v2_session_lease.py
   - unittest/_torch/pyexecutor/kv_cache/test_helix_agg_preemption.py
   - unittest/_torch/pyexecutor/kv_cache/test_kv_cache_v2_adp_dummy_draft_rollback.py
   - unittest/_torch/pyexecutor/connectors/test_kv_cache_layout.py

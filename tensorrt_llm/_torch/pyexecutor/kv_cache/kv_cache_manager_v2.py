@@ -156,6 +156,7 @@ from ..resource_manager import (
 )
 from ..scheduler import ScheduledRequests
 from .regions import RegionLayout, RegionProvider, lay_out_regions
+from .session_lease import SessionLease, SessionLeases
 from .sparse_offload_memory import (
     HostHistoryReservations,
     plan_host_history_bytes,
@@ -2291,6 +2292,9 @@ class KVCacheManagerV2(BaseResourceManager):
     # The lender sharing.attach_lender installs, one per manager for its life; None without one.
     # On the class so it exists without running __init__.
     _sharing = None
+    # Session leases (block_reuse_config.max_session_leases), set at the end of __init__;
+    # on the class so instances built without running __init__ have none.
+    _session_leases: Optional[SessionLeases] = None
     # Branch snapshots (block_reuse_config.enable_branch_snapshot); declared on
     # the class for instances built without running __init__.
     _commit_branch_snapshots = False
@@ -3470,6 +3474,9 @@ class KVCacheManagerV2(BaseResourceManager):
         self._reserve_guard_page()
         if self._sparse_kv_offload is not None:
             self._setup_sparse_kv_offload(kv_cache_config, max_seq_len, num_reserved_index_slots)
+        # Request id -> page-priority cell of each cache that may be leased.
+        self._lease_priority_cells: Dict[int, list] = {}
+        self._session_leases = self._create_session_leases(block_reuse_config)
 
         # Last: bind the publisher socket and start its thread only once every check
         # above has passed. Constructing the manager is side-effect free, so a failure
@@ -6408,6 +6415,128 @@ class KVCacheManagerV2(BaseResourceManager):
         """Resume context pages; subclasses may select model-specific reuse groups."""
         return self._resume_and_restore(req.py_request_id, kv_cache)
 
+    def _create_session_leases(self, block_reuse_config) -> Optional[SessionLeases]:
+        """Session leases for this manager, or None when off or unsupported (logged once)."""
+        capacity = block_reuse_config.max_session_leases
+        if capacity <= 0:
+            return None
+        unsupported = [
+            (reason, failed)
+            for reason, failed in (
+                ("a derived KV cache manager", type(self) is not KVCacheManagerV2),
+                ("a draft KV cache manager", self.is_draft),
+                ("a KV cache size estimation pass", self.is_estimating_kv_cache),
+                ("block reuse is off", not self.enable_block_reuse),
+                (
+                    "policy is not all_reusable",
+                    self.block_reuse_policy != BlockReusePolicy.ALL_REUSABLE,
+                ),
+                ("beam width above 1", self.max_beam_width != 1),
+                ("a KV connector", self.kv_connector_manager is not None),
+                ("Helix context parallelism", self._has_cp_helix),
+                ("joint target/draft KV cache reuse", self.enable_joint_kv_cache_reuse),
+                ("draft prompt lookahead", self.reuse_match_backoff != 0),
+                ("context_recompute_tail", self._spec_recompute_tail != 0),
+                ("sparse KV cache offload", self._sparse_kv_offload is not None),
+            )
+            if failed
+        ]
+        if unsupported:
+            if not self.is_estimating_kv_cache:
+                logger.warning(
+                    "block_reuse_config.max_session_leases is ignored: "
+                    + "; ".join(reason for reason, _ in unsupported)
+                )
+            return None
+        max_utilization = block_reuse_config.session_lease_max_utilization
+        logger.info(
+            f"KVCacheManagerV2 session leases: up to {capacity} conversations, closed oldest "
+            f"first above GPU pool utilization {max_utilization}"
+        )
+        return SessionLeases(
+            capacity, max_utilization, self._gpu_pool_utilization, self._close_leased_cache
+        )
+
+    def _gpu_pool_utilization(self) -> float:
+        """Locked share of the fullest GPU pool group; free and evictable pages count as available."""
+        stats = self._get_storage_statistics(GPU_LEVEL)
+        return max(((s.total - s.available) / s.total for s in stats if s.total > 0), default=0.0)
+
+    def _close_leased_cache(self, request_id: int, kv_cache: _KVCache) -> None:
+        kv_cache.close()
+        self.impl.clear_stats_excluded(request_id)
+
+    def _take_over_session_lease(self, req: LlmRequest) -> Optional[_KVCache]:
+        """Take over the leased cache of *req*'s conversation, or None for the normal path.
+
+        Only context-only, text-only requests with conversation params are registered: a
+        registered request commits whole blocks only and keeps its cache open for commits
+        until it is released (see ``try_commit_blocks`` and ``free_resources``).
+        """
+        key = _request_conversation_key(req)
+        if key is None or not req.is_context_only_request or req.multimodal_hashes is not None:
+            return None
+        if self.index_mapper.num_free_slots() == 0:
+            return None  # _create_kv_cache declines too; the request retries next iteration
+        leases = self._session_leases
+        lease = leases.admit(key, req.py_request_id, self._reuse_token_source(req))
+        admitted = leases.counters["admitted"]
+        if admitted in (100, 1000) or admitted % 10000 == 0:
+            logger.info(
+                f"KVCacheManagerV2 session leases: {leases.counters}, holding {len(leases)}"
+            )
+        if lease is None:
+            return None
+        kv_cache = lease.kv_cache
+        if lease.priority_cell is not None:
+            lease.priority_cell[0] = _swa_endpoint_priority(
+                req.prompt_len, self.tokens_per_block, self._swa_endpoint_rewind
+            )
+            self._lease_priority_cells[req.py_request_id] = lease.priority_cell
+        self.kv_cache_map[req.py_request_id] = kv_cache
+        self.index_mapper.add_new_sequence(req.py_request_id)
+        self._set_page_index_bufs(req.py_request_id, kv_cache)
+        return kv_cache
+
+    def _lease_released_cache(self, request: LlmRequest, pin_on_release: bool) -> bool:
+        """Lease a finished context request's cache instead of closing it; True if leased."""
+        request_id = request.py_request_id
+        priority_cell = self._lease_priority_cells.pop(request_id, None)
+        key = self._session_leases.release(request_id)
+        kv_cache = self.kv_cache_map.get(request_id)
+        if key is None or kv_cache is None:
+            return False
+        # The partial last block stays uncommitted, so a next turn that differs inside it
+        # (for example in the chat template's generation prompt) can still take over.
+        depth = request.prompt_len // self.tokens_per_block * self.tokens_per_block
+        if (
+            pin_on_release
+            or request.state != LlmRequestState.DISAGG_CONTEXT_COMPLETE
+            or request.context_remaining_length != 0
+            or depth == 0
+            or not kv_cache.is_active
+            or kv_cache.batch_row is not None
+            or kv_cache.num_committed_tokens != depth
+            or self.kv_connector_manager is not None
+            or self._sharing is not None
+        ):
+            return False
+        if request_id not in self._early_freed_index_requests:
+            self.release_index_slot(request_id)
+        self._early_freed_index_requests.discard(request_id)
+        self.kv_cache_map.pop(request_id)
+        kv_cache.discard_pending_stats()
+        tokens = np.array(self._reuse_token_source(request)[:depth], dtype=np.int32)
+        self._session_leases.put(key, SessionLease(request_id, kv_cache, tokens, priority_cell))
+        return True
+
+    def _retry_resize_shedding_leases(self, kv_cache: _KVCache, capacity: int) -> bool:
+        """After a failed resize, close session leases oldest first and retry."""
+        while self._session_leases is not None and self._session_leases.close_oldest():
+            if kv_cache.resize(capacity):
+                return True
+        return False
+
     def _context_reuse_tokens(
         self, req: LlmRequest, reuse_limit: int | None = None
     ) -> Sequence[TokenIdExt]:
@@ -6573,6 +6702,12 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         if not self.enable_block_reuse or req.py_request_id in self.kv_cache_map:
             return None
+        if self._session_leases is not None:
+            leased = self._session_leases.peek(
+                _request_conversation_key(req), self._reuse_token_source(req)
+            )
+            if leased is not None:
+                return leased
         return self.impl.probe_reuse(
             ReuseScope(lora_id=req.lora_task_id, salt=self._derive_reuse_salt(req.cache_salt)),
             self._context_reuse_tokens(req),
@@ -6631,6 +6766,8 @@ class KVCacheManagerV2(BaseResourceManager):
             # Stays None when the cache was resumed rather than freshly
             # matched, which is also the case where no branch point applies.
             num_lookup_tokens = None
+            if kv_cache is None and self._session_leases is not None and reuse_limit is None:
+                kv_cache = self._take_over_session_lease(req)
             if kv_cache is None:
                 if self.enable_block_reuse:
                     # Empty (not None) for a zero limit: lookup is off, but
@@ -6774,6 +6911,8 @@ class KVCacheManagerV2(BaseResourceManager):
         success = (
             kv_cache.resize(capacity, history) if history is not None else kv_cache.resize(capacity)
         )
+        if not success and history is None:
+            success = self._retry_resize_shedding_leases(kv_cache, capacity)
         if not success:
             logger.debug(
                 f"[KVCacheManagerV2] request {req.py_request_id} failed to resize KV cache "
@@ -8934,6 +9073,15 @@ class KVCacheManagerV2(BaseResourceManager):
             return
 
         commit_end = request.context_current_position
+        # A request that may lease its cache commits whole blocks only and keeps committing,
+        # so the conversation's next turn can continue on the same cache.
+        keep_for_lease = (
+            self._session_leases is not None
+            and request.context_remaining_length == 0
+            and self._session_leases.is_admitted(request.py_request_id)
+        )
+        if keep_for_lease:
+            commit_end -= commit_end % self.tokens_per_block
         if commit_end > kv_cache.num_committed_tokens:
             tokens = self._augment_tokens_for_block_reuse(
                 self._reuse_token_source(request),
@@ -8944,7 +9092,7 @@ class KVCacheManagerV2(BaseResourceManager):
             # TODO: On a disaggregated prefill server, pass is_end=True for
             # the last context chunk to improve performance.
             kv_cache.commit(tokens)
-        keep_committing = self._can_commit_generation_blocks(request)
+        keep_committing = keep_for_lease or self._can_commit_generation_blocks(request)
         if request.context_remaining_length == 0 and not keep_committing:
             kv_cache.stop_committing()
 
@@ -9228,6 +9376,8 @@ class KVCacheManagerV2(BaseResourceManager):
             and request.py_request_id not in _RESERVED_REQUEST_IDS
             and self._defer_remove_kv_cache(request.py_request_id)
         ):
+            return
+        if self._session_leases is not None and self._lease_released_cache(request, pin_on_release):
             return
         if self._host_history_reservations is not None:
             self._host_history_reservations.release(request.py_request_id)
@@ -9570,6 +9720,8 @@ class KVCacheManagerV2(BaseResourceManager):
         # the caches it lent against are still alive.
         if self._sharing is not None:
             self._sharing._on_shutdown()
+        if self._session_leases is not None:
+            self._session_leases.close_all()
         for kv_cache in self.kv_cache_map.values():
             kv_cache.close()
         self.kv_cache_map.clear()
@@ -10361,6 +10513,12 @@ class KVCacheManagerV2(BaseResourceManager):
             priority_kwargs["custom_priority_callback"] = _swa_endpoint_priority(
                 expected_prompt_length, self.tokens_per_block, self._swa_endpoint_rewind
             )
+            if self._session_leases is not None and self._session_leases.is_admitted(request_id):
+                # A leased cache can be taken over by a longer prompt, whose endpoint the
+                # callback must follow; the cell lets a takeover replace it.
+                cell = [priority_kwargs["custom_priority_callback"]]
+                self._lease_priority_cells[request_id] = cell
+                priority_kwargs["custom_priority_callback"] = lambda o, lc: cell[0](o, lc)
         kv_cache = self.impl.create_kv_cache(
             ReuseScope(lora_id=lora_task_id, salt=reuse_salt),
             input_tokens,
@@ -10436,6 +10594,16 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         if not self.enable_block_reuse:
             return None
+        if (
+            self._session_leases is not None
+            and req.py_request_id not in self.kv_cache_map
+            and self._session_leases.peek(
+                _request_conversation_key(req), self._reuse_token_source(req)
+            )
+            is not None
+        ):
+            # A takeover commits past its own leased blocks; there is no block to deduplicate.
+            return None
         tokens = self._context_reuse_tokens(req)
         # Length test rather than truthiness: on the C++ backend this is the
         # request's zero-copy int32 view, and an array has no truth value.
@@ -10483,6 +10651,8 @@ class KVCacheManagerV2(BaseResourceManager):
     ):
         # A deferred close commits its pages for reuse, which must not outlive the clear.
         self.flush_deferred_closes()
+        if self._session_leases is not None:
+            self._session_leases.close_all()
         try:
             self.impl.clear_reusable_blocks()
             if on_cleared is not None:
