@@ -15,14 +15,14 @@ vendors:
   flashinfer-prims-ts:
     url: https://github.com/yuxianq/flashinfer.git
     branch: cute-dsl-precompile-api--prims-ts-vendor
-    commit: 9bcd5093c41a2a79d85036df6de4c95bdf9db2d5
+    commit: 1d5c402bb25046a111b64c6e1a405be133149c96
     source: flashinfer/attention/prims_ts
     destination: tensorrt_llm/_torch/attention/backends/prims_ts
     include:
     - '**/*.py'
     patch: 3rdparty/vendor_patches/flashinfer-prims-ts.patch
-    patch_digest: sha256:01b531e9559d2fd7f6cb68263f302dfb0a7868fe0d3a138a87acccc74c9713db
-    digest: sha256-tree-v1:44fa645738bf972baff00881b396489e7fb2a933cd83f7b70cad79ea4cc511ab
+    patch_digest: sha256:9107c8e49729d2ecfbeddba0275124496096b9b73cbdf6f6aa68360ac99c8a54
+    digest: sha256-tree-v1:3b880ac255ad7729199a428eb54b133df911e8391205e85f02d535b697307386
   openengine-proto:
     url: https://github.com/ai-dynamo/openengine.git
     tag: v0.1.0
