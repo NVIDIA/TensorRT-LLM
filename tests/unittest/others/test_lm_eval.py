@@ -1943,10 +1943,33 @@ def test_native_mistral_eval_renders_the_chat_with_its_images(
     assert rendered["conversation"][0]["content_parts"] == parts
     assert rendered["mm_placeholder_counts"] == counts
     assert [image.size for image in rendered["mm_data"]["image"]] == loaded
-    assert rendered["chat_template_kwargs"] == {"reasoning_effort": "none"}
+    assert rendered["chat_template_kwargs"] == {
+        "reasoning_effort": "none",
+        "continue_final_message": False,
+    }
     submitted = wrapper.llm.generate_async.call_args.args[0]
     assert submitted["prompt_token_ids"] == [1, 100, 200] and "prompt" not in submitted
     assert len(submitted["multi_modal_data"]["image"]) == len(loaded)
+
+
+def test_native_mistral_eval_continues_a_gen_prefix():
+    """A gen_prefix ends the chat with the assistant turn the model continues."""
+    from mistral_common.protocol.instruct.request import ChatCompletionRequest
+    from test_common.mistral_tekken import load_tekken
+
+    tokenizer = load_tekken("bundled")
+    wrapper = _make_multimodal_wrapper(model_type="mistral_common")
+    wrapper.llm.tokenizer = tokenizer
+    wrapper.chat_template_kwargs = None
+    history = [
+        {"role": "user", "content": "Pick a color."},
+        {"role": "assistant", "content": "The color is"},
+    ]
+    deferred = wrapper.apply_chat_template(history, add_generation_prompt=False)
+    expected = tokenizer.mistral.encode_chat_completion(
+        ChatCompletionRequest.from_openai(messages=history, continue_final_message=True)
+    ).tokens
+    assert wrapper._render_native_mistral_chat(deferred, []) == expected
 
 
 @pytest.mark.parametrize("prompt", [None, "[INST]Q[/INST]"])
