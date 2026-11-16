@@ -99,7 +99,10 @@ target_compile_features(tllm_common_nccl PUBLIC cxx_std_20)
 target_compile_definitions(
   tllm_common_nccl PUBLIC ENABLE_MULTI_DEVICE=$<BOOL:${ENABLE_MULTI_DEVICE}>)
 if(ENABLE_MULTI_DEVICE)
-  target_link_libraries(tllm_common_nccl PUBLIC ${NCCL_LIB})
+  target_link_libraries(
+    tllm_common_nccl
+    PUBLIC ${NCCL_LIB} MPI::MPI_C torch_cpu c10
+    PRIVATE tllm::runtime_distributed)
 endif()
 set_target_properties(tllm_common_nccl PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
