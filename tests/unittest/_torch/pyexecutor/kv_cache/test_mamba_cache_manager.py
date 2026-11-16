@@ -30,7 +30,7 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
 )
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.kimi_k3_cache_policy import KIMI_K3_FP8_KV_LAYERS_ENV
-from tensorrt_llm._torch.model_config import KVCacheLayerSpec
+from tensorrt_llm._torch.model_config import KVCacheLayerSpec as ModelKVCacheLayerSpec
 from tensorrt_llm._torch.modules.fla.cache_manager import (
     GDNReplayState,
     Qwen35HybridCacheManager,
@@ -86,9 +86,11 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_RE
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BlockReusePolicy,
     KVCacheLayerOwner,
-    KVCacheLayerSpec,
     KVCacheManagerV2,
     Role,
+)
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    KVCacheLayerSpec as KVCacheStorageLayerSpec,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
     CppMambaHybridCacheManager,
@@ -789,7 +791,7 @@ def test_skip_softmax_hybrid_follows_the_dense_manager_routing(
     model_config.get_num_mamba_layers = lambda: num_mamba_layers
     if variable_geometry:
         model_config.kv_cache_layer_specs = tuple(
-            KVCacheLayerSpec(head_dim=head_dim, num_kv_heads=2, num_q_heads=8)
+            ModelKVCacheLayerSpec(head_dim=head_dim, num_kv_heads=2, num_q_heads=8)
             for head_dim in (256, 512)
         )
     model_config.sparse_attention_config = SkipSoftmaxAttentionConfig(threshold_scale_factor=1000.0)
@@ -2983,8 +2985,8 @@ def test_v2_hybrid_fp4_disagg_page_table_covers_every_role(
         mgr.shutdown()
 
 
-def _fp8_draft_layer_spec(global_layer_id: int) -> KVCacheLayerSpec:
-    return KVCacheLayerSpec(
+def _fp8_draft_layer_spec(global_layer_id: int) -> KVCacheStorageLayerSpec:
+    return KVCacheStorageLayerSpec(
         global_layer_id=global_layer_id,
         owner=KVCacheLayerOwner.DRAFT,
         dtype=DataType.FP8,
