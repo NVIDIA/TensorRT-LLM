@@ -48,7 +48,6 @@ from ..llmapi.startup_checks import no_visible_gpu_error
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import _SyncQueue, configure_cpu_affinity, logger_debug
-from ..metrics.perf import PerfMetricsCollector
 from ..sampling_params import SamplingParams
 from .executor import GenerationExecutor
 from .ipc import IpcQueue
@@ -1296,16 +1295,13 @@ class BaseWorker(GenerationExecutor):
         # Already serialized on the producing rank via allgather — just emit.
         if (isinstance(stats, tuple) and len(stats) == 2
                 and stats[0] == "per_rank_dict"):
-            return PerfMetricsCollector.collect_iteration(
-                stats[1]).iteration_json()
+            return json.dumps(stats[1])
         # Attention-DP fanout rows are serialized when rank 0 appends them.
         if isinstance(stats, str):
             return stats
 
         entry = IterationStatsRecord.from_tuple(stats)
-        # Preserve the public JSON shape while collecting categories before exposure.
-        record = PerfMetricsCollector.collect_iteration(entry.to_dict())
-        return record.iteration_json()
+        return entry.to_json()
 
     @staticmethod
     def _kv_cache_capacity_serializer(capacity) -> str:

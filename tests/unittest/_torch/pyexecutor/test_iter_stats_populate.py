@@ -1106,8 +1106,8 @@ def test_attention_dp_fanout_rows_match_serializing_each_rank_stats():
 
     rows = buffer.finalize(states[::-1], is_rank0=True, scheduler_mode="non_overlap")
 
-    assert rows == expected
-    assert [BaseWorker._stats_serializer(row) for row in rows] == expected
+    assert [json.loads(row) for row in rows] == [json.loads(row) for row in expected]
+    assert [BaseWorker._stats_serializer(row) for row in rows] == rows
 
 
 def test_attention_dp_fanout_waits_for_complete_matching_payloads():

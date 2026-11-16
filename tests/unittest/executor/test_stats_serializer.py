@@ -125,6 +125,21 @@ def _make_mock_kv_iter_stats(
 
 
 class TestStatsSerializer:
+    def test_native_json_is_not_decoded_for_transport(self, monkeypatch):
+        from tensorrt_llm._torch.pyexecutor import iteration_stats
+
+        native = _make_mock_iteration_stats()
+        record = IterationStatsRecord(native, attention_dp_rank=3, host_step_time_ms=12.5)
+        expected = record.to_dict()
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                iteration_stats.json,
+                "loads",
+                MagicMock(side_effect=AssertionError("native JSON was decoded")),
+            )
+            wire = BaseWorker._stats_serializer(record)
+        assert json.loads(wire) == expected
+
     def test_named_record_preserves_all_wire_fields(self):
         iter_stats = _make_mock_iteration_stats()
         req_stats = MagicMock()

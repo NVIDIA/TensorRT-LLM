@@ -46,6 +46,21 @@ class IterationStatsRecord(NamedTuple):
         (defaulting to zero for consumers that require it).
         """
         stats = json.loads(self.iteration_stats.to_json_str())
+        stats.update(self._extra_fields(tp_rank=tp_rank))
+        return stats
+
+    def to_json(self) -> str:
+        """Append Python-owned fields without decoding the native JSON snapshot."""
+        native = self.iteration_stats.to_json_str().rstrip()
+        extra = json.dumps(self._extra_fields())
+        # Native IterationStats serializes an object; the extra fields are not
+        # part of that native schema. Keep its nested payload encoded in C++.
+        if not native[1:-1].strip():
+            return extra
+        return native[:-1] + ", " + extra[1:]
+
+    def _extra_fields(self, *, tp_rank: int | None = None) -> dict:
+        stats = {}
         if tp_rank is None:
             stats["attentionDpRank"] = (
                 0 if self.attention_dp_rank is None else self.attention_dp_rank

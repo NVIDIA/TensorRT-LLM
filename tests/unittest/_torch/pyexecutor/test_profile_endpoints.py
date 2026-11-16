@@ -37,6 +37,7 @@ def _bare_executor():
     handlers depend on. Avoids the heavy real __init__."""
     executor = PyExecutor.__new__(PyExecutor)
     executor.iter_counter = 0
+    executor.iter_perf_stats_interval = 1
     executor.profile_start_iters = set()
     executor.profile_stop_iters = set()
     executor.global_rank = 0
