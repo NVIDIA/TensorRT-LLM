@@ -197,6 +197,7 @@ from tensorrt_llm._torch.models.modeling_multimodal_utils import (
     get_multimodal_embeddings,
 )
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
+from tensorrt_llm._torch.modules.linear import TensorParallelMode
 from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
 from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
 from tensorrt_llm._torch.speculative import get_spec_worker
@@ -207,6 +208,15 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from . import weights as _weights
+from .ops.comm.symm_logits_gather import build_workspace as build_logits_gather
+from .ops.comm.symm_logits_gather import symm_logits_gather_softcap
+from .ops.dspark.draft_ops import (
+    triton_draft_attention,
+    triton_latent_tail,
+    triton_markov_gate,
+    triton_markov_input,
+    triton_markov_logits,
+)
 from .ops.gemm.cute_dsl_fused_fp8_block_scale_linear import cute_dsl_fused_fp8_block_scale_linear
 from .ops.gemm.low_m_cublas_mm import low_m_cublas_mm as cublas_mm
 
@@ -349,6 +359,14 @@ _UNFUSED_GLUE = os.environ.get("TRTLLM_MODELING_V2_UNFUSED_GLUE", "0") == "1"
 # (`maybe_execute_in_parallel`). Set TRTLLM_MODELING_V2_SERIAL_SHARED_EXPERT=1 in every rank's
 # environment at launch; off by default.
 _SERIAL_SHARED_EXPERT = os.environ.get("TRTLLM_MODELING_V2_SERIAL_SHARED_EXPERT", "0") == "1"
+# The most logit rows the symmetric gather takes: a decode step's rows are its sequences times
+# the verified tokens (16 x 4 at max_batch_size 16). A step with more rows (a large context
+# batch) takes the NCCL path on every rank.
+# capacity: fixed: 64 rows x 2 slots x every rank's vocabulary shard in bf16 (50 MiB a rank).
+_LOGITS_GATHER_ROWS = 64
+# The gather's buffer slot per caller: one target and one draft gather a step.
+_TARGET_LOGITS_SLOT = 0
+_DRAFT_LOGITS_SLOT = 1
 
 
 def _prefill_logits_budget(max_num_tokens: int, max_seq_len: int) -> int:
@@ -927,6 +945,89 @@ class MistralLarge4Tp4ModelingV2(DecoderModel):
         )
 
 
+def _dspark_block(
+    core,
+    draft,
+    noise_embedding,
+    query_positions,
+    num_ctx_per_req,
+    ctx_cache_batch_idx,
+    ctx_kv_cache,
+    ctx_page_table,
+):
+    """The draft block's three BF16 layers over the query block, attending the last trained
+    window of the request's context features and the whole block (non-causal).
+
+    The context is always paged (`DraftModel._paged_ctx_cache`): each layer's attention is
+    triton_draft_attention over the page table, and its query rope and latent tail are
+    triton_latent_tail.
+    """
+    draft._build_fused_kv_buffers()
+    draft._ensure_rope()
+    batch, block, hidden = noise_embedding.shape
+    rows = batch * block
+    query = torch.empty(
+        batch,
+        block,
+        core.heads,
+        core.lat_dim,
+        dtype=noise_embedding.dtype,
+        device=noise_embedding.device,
+    )
+    values = torch.empty(
+        rows, core.heads, core.v_dim, dtype=noise_embedding.dtype, device=noise_embedding.device
+    )
+    residual = noise_embedding.reshape(rows, hidden).clone()
+    normalized = torch.empty_like(residual)
+    x = flashinfer_rmsnorm(residual, draft._layers[0].attn_norm, core.eps)
+    for i, layer in enumerate(draft._layers):
+        q = cublas_mm(x, layer.q, None, None).view(batch, block, core.heads, core.qk_dim)
+        bmm_out(
+            q[..., : core.nope].reshape(rows, core.heads, core.nope).transpose(0, 1),
+            layer.k_b,
+            query[..., : core.kv_lora].view(rows, core.heads, core.kv_lora).transpose(0, 1),
+        )
+        kv = cublas_mm(x, layer.kv_a, None, None)
+        block_kv = triton_latent_tail(
+            kv,
+            layer.kv_norm.view(1, core.kv_lora),
+            core.eps,
+            query_positions.reshape(rows),
+            draft._rope.indexer,
+            kv.new_empty((batch, block, core.lat_dim)),
+            q=q.view(rows, core.heads * core.qk_dim),
+            query=query,
+            nope=core.nope,
+        )
+        latent = triton_draft_attention(
+            query,
+            ctx_kv_cache[i][:, 0, 0],
+            ctx_page_table,
+            ctx_cache_batch_idx,
+            num_ctx_per_req,
+            block_kv,
+            core.softmax_scale,
+            draft.window,
+        )
+        bmm_out(
+            latent.reshape(rows, core.heads, core.kv_lora).transpose(0, 1),
+            layer.v_b.transpose(1, 2),
+            values.transpose(0, 1),
+        )
+        partial = cublas_mm(values.reshape(rows, -1), layer.out, None, None)
+        o = cute_dsl_allreduce_add_rmsnorm(
+            partial, residual, layer.ffn_norm, normalized, core._lamport
+        )
+        gate = cublas_mm(o, layer.gate, None, None)
+        up = cublas_mm(o, layer.up, None, None)
+        activated = flashinfer_silu_and_mul(torch.cat((gate, up), dim=-1))
+        mlp = cublas_mm(activated, layer.down, None, None)
+        x = cute_dsl_allreduce_add_rmsnorm(
+            mlp, residual, layer.next_norm, normalized, core._lamport
+        )
+    return x
+
+
 class PrefillTarget:
     """The general case: context rows, and possibly generation rows behind them."""
 
@@ -1449,93 +1550,16 @@ class PrefillTarget:
         ctx_kv_cache=None,
         ctx_page_table=None,
     ):
-        draft._build_fused_kv_buffers()
-        draft._ensure_rope()
-        core = self.core
-        batch, block, hidden = noise_embedding.shape
-        rows = batch * block
-        # Gather a bounded window, not every page in the configured context.
-        # Invalid padding slots are masked even if their pages are allocated.
-        lengths = num_ctx_per_req[:batch].long()
-        offsets = torch.arange(draft.window, device=noise_embedding.device)
-        positions = (lengths - draft.window).clamp_min(0)[:, None] + offsets[None, :]
-        valid = positions < lengths[:, None]
-        slots = ctx_cache_batch_idx.long()
-        if ctx_page_table is not None:
-            page_size = ctx_kv_cache[0].shape[-2]
-            table = ctx_page_table.index_select(0, slots).long()
-            safe_positions = positions.clamp(max=table.shape[1] * page_size - 1)
-            pages = table.gather(1, safe_positions // page_size).clamp_min(0)
-            page_offsets = safe_positions % page_size
-        else:
-            safe_positions = positions.clamp(max=ctx_k_cache.shape[2] - 1)
-        key_valid = torch.cat(
-            (valid, torch.ones(batch, block, dtype=torch.bool, device=valid.device)), dim=1
+        return _dspark_block(
+            self.core,
+            draft,
+            noise_embedding,
+            query_positions,
+            num_ctx_per_req,
+            ctx_cache_batch_idx,
+            ctx_kv_cache,
+            ctx_page_table,
         )
-        query = torch.empty(
-            batch,
-            block,
-            core.heads,
-            core.lat_dim,
-            dtype=noise_embedding.dtype,
-            device=noise_embedding.device,
-        )
-        values = torch.empty(
-            rows, core.heads, core.v_dim, dtype=noise_embedding.dtype, device=noise_embedding.device
-        )
-        residual = noise_embedding.reshape(rows, hidden).clone()
-        normalized = torch.empty_like(residual)
-        x = flashinfer_rmsnorm(residual, draft._layers[0].attn_norm, core.eps)
-        for i, layer in enumerate(draft._layers):
-            q = cublas_mm(x, layer.q, None, None).view(batch, block, core.heads, core.qk_dim)
-            bmm_out(
-                q[..., : core.nope].reshape(rows, core.heads, core.nope).transpose(0, 1),
-                layer.k_b,
-                query[..., : core.kv_lora].view(rows, core.heads, core.kv_lora).transpose(0, 1),
-            )
-            query[..., core.kv_lora :].copy_(draft._rotate(q[..., core.nope :], query_positions))
-            kv = cublas_mm(x, layer.kv_a, None, None)
-            content = flashinfer_rmsnorm(
-                kv[:, : core.kv_lora].contiguous(), layer.kv_norm, core.eps
-            )
-            block_kv = torch.cat(
-                (
-                    content.view(batch, block, core.kv_lora),
-                    draft._rotate(
-                        kv[:, core.kv_lora :].view(batch, block, core.rope_dim), query_positions
-                    ),
-                ),
-                dim=-1,
-            )
-            if ctx_page_table is not None:
-                context = ctx_kv_cache[i][:, 0, 0][pages, page_offsets]
-            else:
-                context = ctx_k_cache[slots[:, None], i, safe_positions, 0]
-            # Zero masked values as well as scores: 0 * an uninitialized
-            # NaN in the latent pool must not contaminate the weighted sum.
-            context = context.masked_fill(~valid.unsqueeze(-1), 0)
-            keys = torch.cat((context, block_kv), dim=1)
-            scores = torch.einsum("bshd,btd->bsht", query, keys).float() * core.softmax_scale
-            scores = scores.masked_fill(~key_valid[:, None, None, :], float("-inf"))
-            probabilities = torch.softmax(scores, dim=-1).to(keys.dtype)
-            latent = torch.einsum("bsht,btc->bshc", probabilities, keys[..., : core.kv_lora])
-            bmm_out(
-                latent.reshape(rows, core.heads, core.kv_lora).transpose(0, 1),
-                layer.v_b.transpose(1, 2),
-                values.transpose(0, 1),
-            )
-            partial = cublas_mm(values.reshape(rows, -1), layer.out, None, None)
-            o = cute_dsl_allreduce_add_rmsnorm(
-                partial, residual, layer.ffn_norm, normalized, core._lamport
-            )
-            gate = cublas_mm(o, layer.gate, None, None)
-            up = cublas_mm(o, layer.up, None, None)
-            activated = flashinfer_silu_and_mul(torch.cat((gate, up), dim=-1))
-            mlp = cublas_mm(activated, layer.down, None, None)
-            x = cute_dsl_allreduce_add_rmsnorm(
-                mlp, residual, layer.next_norm, normalized, core._lamport
-            )
-        return x
 
 
 class DecodeTarget:
@@ -1832,93 +1856,16 @@ class DecodeTarget:
         ctx_kv_cache=None,
         ctx_page_table=None,
     ):
-        draft._build_fused_kv_buffers()
-        draft._ensure_rope()
-        core = self.core
-        batch, block, hidden = noise_embedding.shape
-        rows = batch * block
-        # Gather a bounded window, not every page in the configured context.
-        # Invalid padding slots are masked even if their pages are allocated.
-        lengths = num_ctx_per_req[:batch].long()
-        offsets = torch.arange(draft.window, device=noise_embedding.device)
-        positions = (lengths - draft.window).clamp_min(0)[:, None] + offsets[None, :]
-        valid = positions < lengths[:, None]
-        slots = ctx_cache_batch_idx.long()
-        if ctx_page_table is not None:
-            page_size = ctx_kv_cache[0].shape[-2]
-            table = ctx_page_table.index_select(0, slots).long()
-            safe_positions = positions.clamp(max=table.shape[1] * page_size - 1)
-            pages = table.gather(1, safe_positions // page_size).clamp_min(0)
-            page_offsets = safe_positions % page_size
-        else:
-            safe_positions = positions.clamp(max=ctx_k_cache.shape[2] - 1)
-        key_valid = torch.cat(
-            (valid, torch.ones(batch, block, dtype=torch.bool, device=valid.device)), dim=1
+        return _dspark_block(
+            self.core,
+            draft,
+            noise_embedding,
+            query_positions,
+            num_ctx_per_req,
+            ctx_cache_batch_idx,
+            ctx_kv_cache,
+            ctx_page_table,
         )
-        query = torch.empty(
-            batch,
-            block,
-            core.heads,
-            core.lat_dim,
-            dtype=noise_embedding.dtype,
-            device=noise_embedding.device,
-        )
-        values = torch.empty(
-            rows, core.heads, core.v_dim, dtype=noise_embedding.dtype, device=noise_embedding.device
-        )
-        residual = noise_embedding.reshape(rows, hidden).clone()
-        normalized = torch.empty_like(residual)
-        x = flashinfer_rmsnorm(residual, draft._layers[0].attn_norm, core.eps)
-        for i, layer in enumerate(draft._layers):
-            q = cublas_mm(x, layer.q, None, None).view(batch, block, core.heads, core.qk_dim)
-            bmm_out(
-                q[..., : core.nope].reshape(rows, core.heads, core.nope).transpose(0, 1),
-                layer.k_b,
-                query[..., : core.kv_lora].view(rows, core.heads, core.kv_lora).transpose(0, 1),
-            )
-            query[..., core.kv_lora :].copy_(draft._rotate(q[..., core.nope :], query_positions))
-            kv = cublas_mm(x, layer.kv_a, None, None)
-            content = flashinfer_rmsnorm(
-                kv[:, : core.kv_lora].contiguous(), layer.kv_norm, core.eps
-            )
-            block_kv = torch.cat(
-                (
-                    content.view(batch, block, core.kv_lora),
-                    draft._rotate(
-                        kv[:, core.kv_lora :].view(batch, block, core.rope_dim), query_positions
-                    ),
-                ),
-                dim=-1,
-            )
-            if ctx_page_table is not None:
-                context = ctx_kv_cache[i][:, 0, 0][pages, page_offsets]
-            else:
-                context = ctx_k_cache[slots[:, None], i, safe_positions, 0]
-            # Zero masked values as well as scores: 0 * an uninitialized
-            # NaN in the latent pool must not contaminate the weighted sum.
-            context = context.masked_fill(~valid.unsqueeze(-1), 0)
-            keys = torch.cat((context, block_kv), dim=1)
-            scores = torch.einsum("bshd,btd->bsht", query, keys).float() * core.softmax_scale
-            scores = scores.masked_fill(~key_valid[:, None, None, :], float("-inf"))
-            probabilities = torch.softmax(scores, dim=-1).to(keys.dtype)
-            latent = torch.einsum("bsht,btc->bshc", probabilities, keys[..., : core.kv_lora])
-            bmm_out(
-                latent.reshape(rows, core.heads, core.kv_lora).transpose(0, 1),
-                layer.v_b.transpose(1, 2),
-                values.transpose(0, 1),
-            )
-            partial = cublas_mm(values.reshape(rows, -1), layer.out, None, None)
-            o = cute_dsl_allreduce_add_rmsnorm(
-                partial, residual, layer.ffn_norm, normalized, core._lamport
-            )
-            gate = cublas_mm(o, layer.gate, None, None)
-            up = cublas_mm(o, layer.up, None, None)
-            activated = flashinfer_silu_and_mul(torch.cat((gate, up), dim=-1))
-            mlp = cublas_mm(activated, layer.down, None, None)
-            x = cute_dsl_allreduce_add_rmsnorm(
-                mlp, residual, layer.next_norm, normalized, core._lamport
-            )
-        return x
 
 
 class DraftModel(nn.Module):
@@ -1971,8 +1918,10 @@ class DraftModel(nn.Module):
         return self.core.w["draft_markov_output"]
 
     def logits_processor(self, hidden, lm_head, attn_metadata, gather):
-        logits = self._shell.logits_processor(hidden, lm_head, attn_metadata, gather)
         # The shared-head logits are soft-capped before the RNN bias is added.
+        if gather and lm_head is self._shell.lm_head:
+            return self._shell.capped_logits(hidden, attn_metadata, _DRAFT_LOGITS_SLOT)
+        logits = self._shell.logits_processor(hidden, lm_head, attn_metadata, gather)
         return tanh_softcap(logits, self._shell.softcap)
 
     def _build_fused_kv_buffers(self):
@@ -2019,19 +1968,6 @@ class DraftModel(nn.Module):
                 w.device,
             )
 
-    def _rotate(self, x, positions):
-        table = self._rope.indexer[positions.long()]
-        cos, sin = table.chunk(2, dim=-1)
-        # One head axis for Q, none for the shared latent K.
-        if x.ndim == positions.ndim + 2:
-            cos, sin = cos.unsqueeze(-2), sin.unsqueeze(-2)
-        even, odd = x.float()[..., 0::2], x.float()[..., 1::2]
-        return (
-            torch.stack((even * cos - odd * sin, even * sin + odd * cos), -1)
-            .flatten(-2)
-            .to(x.dtype)
-        )
-
     def embed_draft_block(self, anchors, block_size):
         # The route pins the trained block width; no mask token is looked up
         # in the vocabulary (its sentinel is deliberately out of range).
@@ -2051,15 +1987,20 @@ class DraftModel(nn.Module):
         self._build_fused_kv_buffers()
         self._ensure_rope()
         core = self.core
-        latent = []
-        for layer in self._layers:
+        rows = projected_hidden.shape[0]
+        out = projected_hidden.new_empty((rows, len(self._layers), 1, core.lat_dim))
+        positions = positions.reshape(-1)
+        for i, layer in enumerate(self._layers):
             kv = cublas_mm(projected_hidden, layer.kv_a, None, None)
-            content = flashinfer_rmsnorm(
-                kv[:, : core.kv_lora].contiguous(), layer.kv_norm, core.eps
+            triton_latent_tail(
+                kv,
+                layer.kv_norm.view(1, core.kv_lora),
+                core.eps,
+                positions,
+                self._rope.indexer,
+                out[:, i],
             )
-            rope = self._rotate(kv[:, core.kv_lora :], positions.reshape(-1))
-            latent.append(torch.cat((content, rope), dim=-1))
-        return torch.stack(latent, dim=1).unsqueeze(2), None
+        return out, None
 
     def dflash_forward_with_metadata(self, *, attn_metadata, **kwargs):
         # The phase belongs to this engine step, including mixed batches.
@@ -2074,34 +2015,28 @@ class DraftModel(nn.Module):
         vocab_slice=None,
         hidden_states,
     ):
+        # The shell's lm_head gathers the whole vocabulary, so the worker never slices it and
+        # its argmax_fn is a plain argmax: the chain's own argmax stands in for it, fused with
+        # the bias add.
+        assert vocab_slice is None, vocab_slice
         w = self.core.w
         output = w["draft_markov_output"]
-        if vocab_slice is not None:
-            output = output[vocab_slice]
         previous = first_prev_tokens.long()
         state = None
-        refined = []
+        refined = torch.empty_like(base_logits)
         for i in range(base_logits.shape[1]):
-            weight = w["draft_markov_embedding"]
-            valid = (previous >= 0) & (previous < weight.shape[0])
-            embedding = nn.functional.embedding(previous.clamp(0, weight.shape[0] - 1), weight)
-            embedding = embedding.masked_fill(~valid.unsqueeze(-1), 0)
-            if state is None:
-                state = torch.zeros_like(embedding)
             joint = cublas_mm(
-                torch.cat((state, embedding, hidden_states[:, i]), dim=-1),
+                triton_markov_input(
+                    previous, w["draft_markov_embedding"], state, hidden_states[:, i]
+                ),
                 w["draft_joint"].t(),
                 w["draft_joint_bias"],
                 None,
             )
-            gate, candidate, emitted = joint.chunk(3, dim=-1)
-            gate = torch.sigmoid(gate)
-            state = gate * state + (1 - gate) * torch.tanh(candidate)
-            bias = cublas_mm(torch.tanh(emitted), output.t(), None, None)
-            logits = base_logits[:, i] + bias
-            refined.append(logits)
-            previous = argmax_fn(logits)
-        return torch.stack(refined, dim=1)
+            state, emitted = triton_markov_gate(joint, state)
+            bias = cublas_mm(emitted, output.t(), None, None)
+            previous = triton_markov_logits(base_logits[:, i], bias, refined[:, i])
+        return refined
 
 
 class _VisionBlock(NamedTuple):
@@ -2412,6 +2347,8 @@ class ModelingV2MistralLarge4Nvfp4Sm107Tp4(
         self.draft_model = None
         self.draft_config = None
         self.spec_worker = None
+        # The logits' symmetric vocabulary gather, built at load (`post_load_weights`).
+        self._logits_gather = None
         if self.spec_config is not None:
             # This is allocation geometry for the independently paged BF16
             # draft, not a second registry-resolved model or target cache.
@@ -2499,22 +2436,32 @@ class ModelingV2MistralLarge4Nvfp4Sm107Tp4(
             lora_params=lora_params,
             **kwargs,
         )
-        logits = self.logits_processor(
+        logits = self.capped_logits(
             nn.functional.embedding(spec_metadata.gather_ids, hidden),
-            self.lm_head,
             attn_metadata,
-            True,
+            _TARGET_LOGITS_SLOT,
         )
         return self.spec_worker(
             input_ids=worker_input_ids,
             position_ids=position_ids,
             hidden_states=hidden,
-            logits=tanh_softcap(logits, self.softcap),
+            logits=logits,
             attn_metadata=attn_metadata,
             spec_metadata=spec_metadata,
             draft_model=self.draft_model,
             resource_manager=kwargs.get("resource_manager"),
         )
+
+    def capped_logits(self, hidden: torch.Tensor, attn_metadata, slot: int) -> torch.Tensor:
+        """The soft-capped full-vocabulary fp32 logits of every row of `hidden`, through the
+        shared lm_head: the symmetric gather when the step's rows fit it, else the NCCL
+        gather, the upcast and the soft-cap. Every rank takes the same side."""
+        gather = self._logits_gather
+        if hidden.shape[0] > gather.rows:
+            logits = self.logits_processor(hidden, self.lm_head, attn_metadata, True)
+            return tanh_softcap(logits, self.softcap)
+        local = self.lm_head.apply_linear(hidden, self.lm_head.bias)
+        return symm_logits_gather_softcap(local, gather, slot, self.softcap)
 
     def load_weights(self, weights, *args, **kwargs):
         _weights.MODEL_WEIGHTS.load(self, weights)
@@ -2535,3 +2482,15 @@ class ModelingV2MistralLarge4Nvfp4Sm107Tp4(
             self._vision = VisionTower(self.model)
         if self.draft_model is not None:
             self.draft_model._build_fused_kv_buffers()
+        if self.spec_worker is not None:
+            # The route fixes the lm_head the gather is written for: a bf16 column shard of the
+            # whole vocabulary on every rank of the 4- or 8-rank TP group, gathered, no padding.
+            mapping = self.model_config.mapping
+            lm_head = self.lm_head
+            assert lm_head.tp_mode == TensorParallelMode.COLUMN and lm_head.gather_output
+            assert lm_head.padding_size == 0 and lm_head.weight.dtype == torch.bfloat16
+            # Collective: every rank of the TP group (the process group the Lamport workspace
+            # brought up) builds it at load, with the same arguments.
+            self._logits_gather = build_logits_gather(
+                _LOGITS_GATHER_ROWS, self.lm_head.weight.shape[0], mapping.tp_rank, mapping.tp_size
+            )
