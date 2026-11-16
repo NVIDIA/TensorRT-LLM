@@ -68,6 +68,7 @@ from ..modules.mhc.mhc_lowm import (
     mhc_lamport_allreduce,
     mhc_post_collapse_norm,
     mhc_split_enabled,
+    ob_boundary_enabled,
 )
 from ..modules.multi_stream_utils import do_multi_stream
 from ..moe.fused_moe.impl_contract import MOE_DECODE_OPTIONS, MoEDecodeOptions
@@ -1075,6 +1076,16 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
             self._mhc_lamport_resolved = True
         return self._mhc_lamport
 
+    def _ob_weights(self) -> tuple:
+        """The MXFP8 o_b projection's weight and linear scales, as the deferred projection reads them."""
+        from ..modules.low_m_gemm import mxfp8_linear_scale
+
+        linear = self.self_attn.o_b_proj
+        if linear.weight.dtype != torch.float8_e4m3fn:
+            return ()
+        scale = mxfp8_linear_scale(linear)
+        return (linear.weight,) if scale is None else (linear.weight, scale)
+
     def _moe_supports_unfinalized(self) -> bool:
         """Whether the routed experts can hand back their rows before the top-k combine."""
         experts = self.mlp.experts
@@ -1194,6 +1205,8 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
         ffn_split = self._mhc_split(residual.shape[0], ffn=True)
         # Split boundaries can also all-reduce the sublayer output in their own launch.
         lamport = self._mhc_fused_allreduce() if split else None
+        # The attention may hand back its o_b input for the FFN boundary to project in its launch.
+        defer_ob = lamport is not None and ffn_split and ob_boundary_enabled(residual.shape[0])
         attn_coeff_event = None
         # The entry boundary (split or single-pass) also emits the MXFP8 input of the fused
         # query/SWA projection.
@@ -1219,6 +1232,10 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
                 events=self._mhc_attn_events,
                 allreduce=entry_allreduce,
                 mxfp8=mxfp8,
+                # The split FFN boundary reads these coefficients after its dependency wait.
+                coefficients_release_after_wait=ffn_split,
+                # Its o_b CTAs then read their weights from L2.
+                l2_prefetch=self._ob_weights() if defer_ob and entry_allreduce is not None else (),
             )
             residual, attn_pre, post_mix, comb_mix, layer_input, attn_coeff_event = boundary[:6]
             if mxfp8:
@@ -1256,19 +1273,23 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
                 residual.reshape(residual.shape[0], -1),
                 getattr(attn_metadata, "csa2_replay_query_rows", None),
             )
-        x_attn = self.self_attn(
-            position_ids=position_ids,
-            hidden_states=layer_input,
-            attn_metadata=attn_metadata,
-            hidden_states_mxfp8=layer_input_mxfp8,
-            # The split boundary's critical half prefetches its residual before its PDL wait,
-            # so the all-reduce may let it launch at its start.
-            all_reduce_params=AllReduceParams(
-                enable_allreduce=not self.disable_attn_allreduce and lamport is None,
-                trigger_completion_at_end=not split,
-            ),
-            **kwargs,
-        )
+        self.self_attn.defer_ob_to_boundary = defer_ob
+        try:
+            x_attn = self.self_attn(
+                position_ids=position_ids,
+                hidden_states=layer_input,
+                attn_metadata=attn_metadata,
+                hidden_states_mxfp8=layer_input_mxfp8,
+                # The split FFN boundary loads its constant inputs, and after a split entry also
+                # its residual, before its PDL wait, so the all-reduce may let it launch at its start.
+                all_reduce_params=AllReduceParams(
+                    enable_allreduce=not self.disable_attn_allreduce and lamport is None,
+                    trigger_completion_at_end=not ffn_split,
+                ),
+                **kwargs,
+            )
+        finally:
+            self.self_attn.defer_ob_to_boundary = False
         if after_attention_callback is not None:
             after_attention_callback()
         if capture_done is not None:
