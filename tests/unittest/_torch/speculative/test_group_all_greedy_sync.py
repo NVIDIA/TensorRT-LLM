@@ -30,9 +30,12 @@ def _fake_request(temperature=None, top_k=None, top_p=None, min_p=None, slot=0):
             top_k=top_k,
             top_p=top_p,
             min_p=min_p,
+            seed=None,
         ),
         state=LlmRequestState.GENERATION_IN_PROGRESS,
         py_seq_slot=slot,
+        py_spec_sampling_params=None,
+        py_logits_post_processors=None,
         py_request_id=next(_request_ids),
     )
 
@@ -44,6 +47,8 @@ def _fake_meta(group_all_greedy_sample=None):
         dummy_slot_row=0,
         spec_dec_mode=types.SimpleNamespace(use_one_engine=lambda: True),
         group_all_greedy_sample=group_all_greedy_sample,
+        group_all_temperature_only=None,
+        samples_from_vocab_shards=False,
         temperature_only_graphs=False,
         _sampling_scan_cache=None,
     )

@@ -48,7 +48,9 @@
       "source_subdir": "dont-add-this-project-with-add-subdirectory",
       "patch_file": [
         "patches/deepgemm_configurable_barrier_timeout.patch",
-        "patches/deepgemm_sm10x_family_target.patch"
+        "patches/deepgemm_sm10x_family_target.patch",
+        "patches/deepgemm_mqa_logits_relu_fmax.patch",
+        "patches/deepgemm_mega_mhc_tiled_sf.patch"
       ]
     },
     {

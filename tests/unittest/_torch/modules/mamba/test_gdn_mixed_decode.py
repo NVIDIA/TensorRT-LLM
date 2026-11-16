@@ -142,13 +142,34 @@ def test_mixed_decode_matches_decode_only(
         else None
     )
     actual_conv, actual_state = conv.clone(), state.clone()
-    with patch.object(
-        gdn_mixer, "chunk_gated_delta_rule", wraps=gdn_mixer.chunk_gated_delta_rule
-    ) as prefill_call:
+    # The prefill scan has two entry points (the adapter, and the single-launch direct
+    # path taken with a preallocated output on SM100, which returns False elsewhere and
+    # then falls back to the adapter); both run for real, only observed.
+    direct_launches = []
+    real_direct = gdn_mixer.chunk_gated_delta_rule_indexed_direct
+
+    def observe_direct(*args, **kwargs):
+        launched = real_direct(*args, **kwargs)
+        if launched:
+            direct_launches.append(args)
+        return launched
+
+    with (
+        patch.object(
+            gdn_mixer, "chunk_gated_delta_rule", wraps=gdn_mixer.chunk_gated_delta_rule
+        ) as scan_call,
+        patch.object(gdn_mixer, "chunk_gated_delta_rule_indexed_direct", observe_direct),
+    ):
         actual = layer.forward_extend(actual_conv, actual_state, output=output, **common)
-    # Only the prefill requests go through the prefill kernel.
-    assert prefill_call.call_count == 1
-    assert prefill_call.call_args.kwargs["cu_seqlens"].shape[0] == num_prefills + 1
+    # Only the prefill requests go through the prefill kernel, in a single scan.
+    assert scan_call.call_count + len(direct_launches) == 1
+    scan_cu_seqlens = (
+        scan_call.call_args.kwargs["cu_seqlens"]
+        if scan_call.call_count
+        # (q, k, v, g, beta), output, cu_seqlens, ssm_states, state_indices
+        else direct_launches[0][6]
+    )
+    assert scan_cu_seqlens.shape[0] == num_prefills + 1
 
     torch.testing.assert_close(actual[:, prefill_length:], expected_decode, rtol=0, atol=0)
     torch.testing.assert_close(
@@ -180,6 +201,87 @@ def test_mixed_decode_matches_decode_only(
             torch.testing.assert_close(actual_conv, expected_conv, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("deterministic", [True, False])
+@pytest.mark.parametrize("use_flashinfer", [False, True])
+@pytest.mark.parametrize("prefill_lengths", [(127,), (7, 129)])
+def test_fused_prefill_conv_under_force_deterministic(
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    deterministic: bool,
+    use_flashinfer: bool,
+    prefill_lengths: tuple[int, ...],
+) -> None:
+    """FORCE_DETERMINISTIC=1 skips the fused prefill conv, so a prompt prefilled alone gets the GDN state it
+    gets next to decodes; without it a context-only batch keeps the fused path."""
+    monkeypatch.setenv("FORCE_DETERMINISTIC", "1" if deterministic else "0")
+    monkeypatch.setenv("TLLM_USE_FLASHINFER_GDN_PREFILL", "1" if use_flashinfer else "0")
+    if use_flashinfer and not gdn_mixer._use_flashinfer_gdn_prefill():
+        pytest.skip("FlashInfer GDN prefill is unavailable on this GPU")
+    gdn_mixer._resolve_chunk_gated_delta_rule.cache_clear()
+    request.addfinalizer(gdn_mixer._resolve_chunk_gated_delta_rule.cache_clear)
+    torch.manual_seed(42)
+    layer = _make_layer()
+    layer.conv_kernel_size, layer.conv_dim_per_tp = 4, 2048
+    assert gdn_mixer.gdn_prefill_conv_supported(128, 128, 4, "silu", 2048, 4)
+    layer.fused_prefill_conv = True
+    num_decodes, num_slots = 3, 7
+    num_prefills, prefill_length = len(prefill_lengths), sum(prefill_lengths)
+    num_tokens = prefill_length + num_decodes
+    projected = torch.randn(num_tokens, 3072, device="cuda", dtype=torch.bfloat16) * 0.1
+    gates = torch.randn(num_tokens, 16, device="cuda", dtype=torch.bfloat16) * 0.1
+    conv = torch.randn(num_slots, 2048, 3, device="cuda", dtype=torch.bfloat16) * 0.1
+    state = torch.randn(num_slots, 8, 128, 128, device="cuda", dtype=torch.float32) * 0.1
+    indices = torch.tensor([5, 4][:num_prefills] + [3, 0, 6], device="cuda", dtype=torch.int32)
+    lengths = [0, *prefill_lengths, *([1] * num_decodes)]
+    positions = torch.tensor(lengths, device="cuda", dtype=torch.int32).cumsum(0, dtype=torch.int32)
+
+    def run(batch_decodes: int):
+        tokens = prefill_length + batch_decodes
+        batch = num_prefills + batch_decodes
+        conv_states, ssm_states = conv.clone(), state.clone()
+        # The decode convolution writes into its input, so each run gets fresh inputs.
+        mixed_qkv = projected.clone()[:tokens, :2048]
+        b, a = gates[:tokens, :8].clone(), gates[:tokens, 8:].clone()
+        with patch.object(
+            gdn_mixer, "gdn_prefill_conv_post", wraps=gdn_mixer.gdn_prefill_conv_post
+        ) as fused_call:
+            out = layer.forward_extend(
+                conv_states,
+                ssm_states,
+                mixed_qkv=mixed_qkv,
+                a=a,
+                b=b,
+                batch_size=batch,
+                has_initial_states=torch.ones(batch, device="cuda", dtype=torch.bool),
+                cache_indices=indices[:batch],
+                query_start_loc=positions[: batch + 1],
+                query_start_loc_long=positions[: batch + 1].long(),
+                num_prefill_tokens=prefill_length,
+                num_decode_tokens=batch_decodes,
+                state_indices_p=indices[:num_prefills],
+                state_indices_d=indices[num_prefills:batch],
+                num_prefill=num_prefills,
+                num_decodes=batch_decodes,
+            )
+        return out[:, :prefill_length], conv_states, ssm_states, fused_call.call_count
+
+    # Warm chunk tuning with disposable state, as in the mixed-batch test above.
+    run(0)
+    alone, alone_conv, alone_state, alone_fused = run(0)
+    if not deterministic:
+        assert alone_fused == 1
+        return
+    assert alone_fused == 0
+    mixed, mixed_conv, mixed_state, mixed_fused = run(num_decodes)
+    assert mixed_fused == 0
+    prefill_slots = indices[:num_prefills]
+    torch.testing.assert_close(mixed, alone, rtol=0, atol=0)
+    torch.testing.assert_close(
+        mixed_state[prefill_slots], alone_state[prefill_slots], rtol=0, atol=0
+    )
+    torch.testing.assert_close(mixed_conv[prefill_slots], alone_conv[prefill_slots], rtol=0, atol=0)
+
+
 def test_forward_core_runs_prefill_groups_from_host_offsets(
     request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -207,6 +309,7 @@ def test_forward_core_runs_prefill_groups_from_host_offsets(
         state_indices=indices,
         query_start_loc=positions,
         query_start_loc_long=positions.long(),
+        arange_long=lambda n: torch.arange(n + 1, device="cuda", dtype=torch.int64),
         replay_work_items=None,
         replay_n_writes=None,
     )

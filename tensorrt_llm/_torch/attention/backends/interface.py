@@ -360,6 +360,10 @@ class AttentionMetadata:
         """
         self._prepare_mamba_metadata()
 
+    def support_steady_gen_step(self) -> bool:
+        """Whether ``prepare_steady_gen_step`` may advance this metadata."""
+        return False
+
     def _has_mixed_precision_staging(self) -> bool:
         """Whether this backend runs attention on a staging copy of the mixed-precision layers."""
         # isinstance guards against mocks and against V1 managers, which have
@@ -1132,6 +1136,11 @@ class AttentionForwardArgs:
     # the output sets output_gate_applied, and the caller applies the gate otherwise.
     output_gate: Optional[torch.Tensor] = None
     output_gate_applied: bool = False
+    # o_proj's static FP8 input scale offered together with output_gate: an FMHA library that applies the gate may
+    # also write the gated output as E4M3 at this scale, byte for byte as o_proj's own static quant would, into
+    # output_fp8 [num_tokens, num_heads * head_dim]; the caller then passes output_fp8 to o_proj (output unwritten).
+    gated_out_scale: Optional[torch.Tensor] = None
+    output_fp8: Optional[torch.Tensor] = None
     # Paged FP8 query / K / V the caller already wrote for this generation-only call (fmha/gqa_decode.py).
     kv_append: Optional["KvAppendPlan"] = None
     # Optional normalized diffusion timestep for timestep-varying sparse attention.
