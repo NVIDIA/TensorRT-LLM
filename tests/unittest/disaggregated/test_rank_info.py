@@ -211,17 +211,19 @@ def test_rank_info_represents_cache_element_bytes(
 
 
 @pytest.mark.parametrize(
-    ("layer_specs", "draft_layer_ids", "expected"),
+    ("shares_draft_layers", "draft_layer_ids", "expected"),
     [
-        (None, (), 0),
-        # Folded MTP/Eagle draft layers have no layer specs and travel as
+        (False, (), 0),
+        # Folded MTP/Eagle draft layers have no explicit storage and travel as
         # ordinary layers, so they are not advertised.
-        (None, (36,), 0),
-        ((object(),), (36, 37), 2),
+        (False, (36,), 0),
+        # Explicit draft layers: a plain manager's layer specs or the layers a
+        # hybrid manager appends.
+        (True, (36, 37), 2),
     ],
 )
 def test_from_kv_cache_manager_reports_unified_draft_layers(
-    monkeypatch, layer_specs, draft_layer_ids, expected
+    monkeypatch, shares_draft_layers, draft_layer_ids, expected
 ) -> None:
     monkeypatch.setattr(rank_info_module, "build_page_table_from_manager", lambda _: None)
     manager = SimpleNamespace(
@@ -242,9 +244,9 @@ def test_from_kv_cache_manager_reports_unified_draft_layers(
         head_dim=128,
         dtype=bindings.DataType.HALF,
         kv_factor=2,
-        layer_specs=layer_specs,
         draft_layer_ids=draft_layer_ids,
     )
+    manager.get_draft_kv_cache_view = lambda: manager if shares_draft_layers else None
 
     info = RankInfo.from_kv_cache_manager("ctx", manager, device_id=0)
 

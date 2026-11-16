@@ -10,12 +10,15 @@ import triton
 import triton.language as tl
 from torch.nn.parameter import Parameter
 
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import AllReduceParams, AllReduceStrategy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import ceil_div
 
+from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..distributed import allgather
+from ..utils import is_torch_compiling
 from .context_logits import ContextLogitsWorkspace
 from .fla.op import gdc_wait_with_memory_clobber
 from .linear import Linear, TensorParallelMode
@@ -287,6 +290,10 @@ class LMHead(Linear):
                                              self.output_dtype)
         return super().apply_linear(input, bias, lora_params, layer_idx)
 
+    def local_logits(self, input: torch.Tensor) -> torch.Tensor:
+        """This rank's vocabulary columns of the output: a column-parallel head without its gather."""
+        return self.apply_linear(input, self.bias)
+
     def skip_forward(
             self,
             input: torch.Tensor,
@@ -334,7 +341,19 @@ def pre_comm_embedding_ops(
     vocab_end_index: int,
     gather_output: bool,
     padding_size: int,
+    use_masked_embedding_kernel: bool = False,
 ):
+    start = vocab_start_index if tp_mode == TensorParallelMode.COLUMN else 0
+    if (use_masked_embedding_kernel and not is_torch_compiling()
+            and get_sm_version() in (100, 103, 107) and IS_CUTLASS_DSL_AVAILABLE
+            and vocab_end_index - start == weight.shape[0]
+            and not (tp_mode == TensorParallelMode.ROW and gather_output
+                     and tp_rank == tp_size - 1 and padding_size > 0)):
+        from ..kernels.blackwell.masked_embedding import (
+            masked_embedding, supports_masked_embedding)
+        if supports_masked_embedding(input_, weight):
+            return masked_embedding(input_, weight, start)
+
     if tp_mode == TensorParallelMode.COLUMN:
         input_, input_mask = get_masked_input_and_mask(
             input_,
@@ -395,6 +414,8 @@ class Embedding(LMHead):
             If not provided, the embedding is not parallelized.
         use_gather_kernel (bool): a non-parallel table looks tokens up with one
             gather launch (``embedding_gather``) instead of the masked lookup.
+        use_masked_embedding_kernel (bool): on SM100/103/107, the masked lookup
+            is one CuTe DSL launch (``kernels/blackwell/masked_embedding.py``).
     """
 
     def __init__(
@@ -410,6 +431,7 @@ class Embedding(LMHead):
         use_custom_cublas_mm: bool = False,
         use_gather_kernel: bool = False,
         allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
+        use_masked_embedding_kernel: bool = False,
     ):
         super().__init__(
             embedding_dim=embedding_dim,
@@ -425,6 +447,7 @@ class Embedding(LMHead):
 
         self.enable_torch_compile_for_embedding = enable_torch_compile_for_embedding
         self.use_gather_kernel = use_gather_kernel
+        self.use_masked_embedding_kernel = use_masked_embedding_kernel
         # Built once: every torch.compile() call deep-copies the Inductor
         # config, even with disable=True; compilation itself is lazy.
         self._pre_comm_ops_func = (torch.compile(pre_comm_embedding_ops,
@@ -463,7 +486,8 @@ class Embedding(LMHead):
                                     self.tp_rank, self.tp_mode,
                                     self.vocab_start_index,
                                     self.vocab_end_index, self.gather_output,
-                                    self.padding_size)
+                                    self.padding_size,
+                                    self.use_masked_embedding_kernel)
 
         # Run the all_reduce/all_gather.
         if self.tp_size > 1:

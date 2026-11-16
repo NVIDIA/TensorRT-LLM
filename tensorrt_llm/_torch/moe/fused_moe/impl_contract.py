@@ -703,6 +703,29 @@ class MoECommPlan:
 
 
 @dataclass(frozen=True)
+class MoERoutingTables:
+    """Routing tables in the kernel's layout, one entry per tile of ``tiles``; a tactic with
+    another tile routes itself."""
+
+    tables: torch.Tensor
+    tiles: Tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class MoEFusedRouteQuant:
+    """``routing_method.apply`` and ``quantize_input`` results from one launch, plus the
+    backend kernel's optional routing tables."""
+
+    token_selected_experts: torch.Tensor
+    token_final_scales: torch.Tensor
+    x: torch.Tensor
+    x_sf: torch.Tensor
+    routing_tables: Optional[MoERoutingTables] = None
+    # The launch also added its picks to the warmup expert placement's counters.
+    routes_counted: bool = False
+
+
+@dataclass(frozen=True)
 class PreroutedRouting:
     """Routing a caller computed for one ``run_moe`` of an impl that declares
     ``supports_prerouted_routing``: the routing tables of the kernels' tile
@@ -802,6 +825,8 @@ class MoERunContext:
     all_rank_num_tokens: Optional[List[int]] = None
     # produced by the comm strategy, one object per forward
     comm_plan: Optional[MoECommPlan] = None
+    # produced by a fused route+quant launch for the routing above
+    routing_tables: Optional[MoERoutingTables] = None
     # produced by a decode front end that routed the tokens itself; single
     # chunk, no communication (see PreroutedRouting)
     prerouted: Optional[PreroutedRouting] = None
