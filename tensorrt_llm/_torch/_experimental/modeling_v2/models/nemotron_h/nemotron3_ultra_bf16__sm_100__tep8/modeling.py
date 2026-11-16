@@ -23,7 +23,7 @@ window) completed by one all-reduce over the 8 ranks.
 The routed experts run on this target's fused_moe (CUTLASS) by default. Asking
 for `moe_config.backend` MEGAMOE_CUTEDSL or TRTLLM by name runs them instead in
 the engine's MoE layer, built with Modeling V1's `create_moe` on its unquantized
-Relu2 leaf: CuTe DSL MegaMoE (fused dispatch, experts and combine) or FlashInfer's
+Relu2 leaf: CuTe DSL MegaMoE (fused dispatch, experts and combine) or the
 TRTLLM-Gen BF16 MoE. Those layers route the fp32 logits themselves (the same
 noaux_tc selection) and return this rank's partial, so the block's all-reduce is
 unchanged. A request either leaf turns down fails at construction; it is never
@@ -126,7 +126,7 @@ UNCERTIFIED_GENERIC_CALLS = (
 # also pins the leaf within the backend, so the request cannot be served by another kernel.
 _ENGINE_MOE_LEAVES = {
     "MEGAMOE_CUTEDSL": "trtllm.cutedsl.mega_moe.none",
-    "TRTLLM": "flashinfer.trtllm_gen.fused_moe.none",
+    "TRTLLM": "trtllm.trtllm_gen.fused_moe.none",
 }
 
 # An empty slot in the recurrent-state pools (padding rows of a captured batch).

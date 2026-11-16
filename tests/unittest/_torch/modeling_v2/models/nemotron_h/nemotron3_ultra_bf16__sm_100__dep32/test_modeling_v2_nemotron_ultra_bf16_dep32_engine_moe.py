@@ -200,7 +200,7 @@ def test_one_engine_layer_per_moe_block(monkeypatch, requested, comm):
         (
             "AUTO",
             lambda kw: _FakeConfigurableMoE(
-                "flashinfer.trtllm_gen.fused_moe.none", list(range(WINDOW))
+                "trtllm.trtllm_gen.fused_moe.none", list(range(WINDOW))
             ),
             "runs that request only on trtllm.cutlass.grouped_gemm.none",
         ),
@@ -214,7 +214,7 @@ def test_one_engine_layer_per_moe_block(monkeypatch, requested, comm):
         (
             "TRTLLM",
             lambda kw: _FakeConfigurableMoE(
-                "flashinfer.trtllm_gen.fused_moe.none", list(range(WINDOW)), use_dp=False
+                "trtllm.trtllm_gen.fused_moe.none", list(range(WINDOW)), use_dp=False
             ),
             "without attention DP",
         ),

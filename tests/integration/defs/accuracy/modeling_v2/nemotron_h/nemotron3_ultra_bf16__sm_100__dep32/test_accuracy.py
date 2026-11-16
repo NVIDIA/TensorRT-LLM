@@ -68,5 +68,5 @@ class TestModelingV2Nemotron3UltraBf16Sm100Dep32(NemotronHBf16Target):
         self._gsm8k(max_batch_size=32)
 
     def test_gsm8k_trtllm_moe(self):
-        # FlashInfer's TRTLLM-Gen BF16 MoE over the engine's all-to-all.
+        # The TRTLLM-Gen BF16 MoE over the engine's all-to-all.
         self._gsm8k(max_batch_size=32, moe_backend="TRTLLM")

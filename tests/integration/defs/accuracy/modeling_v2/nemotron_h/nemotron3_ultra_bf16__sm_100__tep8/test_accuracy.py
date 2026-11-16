@@ -38,5 +38,5 @@ class TestModelingV2Nemotron3UltraBf16Sm100Tep8(NemotronHBf16Target):
         self._gsm8k(max_batch_size=256, moe_backend="MEGAMOE_CUTEDSL")
 
     def test_gsm8k_trtllm_moe(self):
-        # The routed experts on the engine's TRTLLM-Gen BF16 MoE (FlashInfer, Relu2, top-22).
+        # The routed experts on the engine's TRTLLM-Gen BF16 MoE (Relu2, top-22).
         self._gsm8k(max_batch_size=256, moe_backend="TRTLLM")

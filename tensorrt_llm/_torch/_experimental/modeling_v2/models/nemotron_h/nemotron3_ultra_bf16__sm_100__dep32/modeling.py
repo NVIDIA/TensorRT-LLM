@@ -34,7 +34,7 @@ not run.
 
 The routed experts run in the engine's MoE layer, built with Modeling V1's
 `create_moe` on its unquantized Relu2 leaf, for every `moe_config.backend` routing
-admits: CUTLASS (AUTO resolves to it), TRTLLM (FlashInfer's TRTLLM-Gen BF16 MoE) or
+admits: CUTLASS (AUTO resolves to it), TRTLLM (TRTLLM-Gen BF16 MoE) or
 MEGAMOE_CUTEDSL (CuTe DSL MegaMoE). That layer owns the exchange of tokens between
 ranks, which a target-local expert path would have to rebuild: CUTLASS and TRTLLM
 dispatch and combine the 2048-wide latent with the engine's all-to-all (NVLinkOneSided
@@ -150,7 +150,7 @@ UNCERTIFIED_GENERIC_CALLS = (
 _ENGINE_MOE_LEAVES = {
     "CUTLASS": "trtllm.cutlass.grouped_gemm.none",
     "MEGAMOE_CUTEDSL": "trtllm.cutedsl.mega_moe.none",
-    "TRTLLM": "flashinfer.trtllm_gen.fused_moe.none",
+    "TRTLLM": "trtllm.trtllm_gen.fused_moe.none",
 }
 # The backends whose kernel owns the exchange between ranks (no host-side communication).
 _FUSED_COMM_BACKENDS = frozenset({"MEGAMOE_CUTEDSL"})
