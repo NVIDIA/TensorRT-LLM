@@ -222,8 +222,8 @@ class KvCacheConnectorWorker(ABC):
     #: Only an explicit True counts. May be set per instance. Must be the same
     #: on every rank.
     drops_reuse_match_backoff: bool = False
-    #: Opt in when a prefix load can come up short -- a page offered at lookup
-    #: is gone at load time -- and the worker reports the affected requests
+    #: Opt in when a prefix load can come up short (a page offered at lookup
+    #: is gone at load time) and the worker reports the affected requests
     #: through `take_failed_load_requests` / `take_failed_async_load_requests`
     #: instead of raising. The runtime then restarts only those requests. On a
     #: tensor-parallel rank (more than one rank without attention DP) the
@@ -235,8 +235,8 @@ class KvCacheConnectorWorker(ABC):
     #: Opt in to completion headroom on a disaggregated server whose
     #: `KVCacheManagerV2` has no tier below GPU. The manager then admits a
     #: request only while the pages every admitted request still needs to
-    #: finish fit -- a decode its output, a connector prefill the rest of its
-    #: prompt -- so a restore chosen after the final batch is not starved by
+    #: finish fit (a decode its output, a connector prefill the rest of its
+    #: prompt), so a restore chosen after the final batch is not starved by
     #: other requests' chunks. Only an explicit True counts, and a
     #: `capacity_only` worker's is ignored. Read from the worker, which every
     #: rank holds, so every rank sees it; may be set per instance in
@@ -543,7 +543,7 @@ class KvCacheConnectorScheduler(ABC):
         This does not include the tokens already matched on device (indicated by `num_computed_tokens`).
 
         After a reported load failure, the runtime sets
-        ``request.py_connector_load_failed`` for the rest of the request's
+        `request.py_connector_load_failed` for the rest of the request's
         lifetime. Schedulers supporting failed-load recovery must decline
         further reads for that request and still initialize their save state,
         so a persistent metadata hit cannot cause an endless restart loop.
@@ -1679,10 +1679,10 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             failed: The request IDs the worker reported.
 
         Returns:
-            ``failed``, unchanged.
+            `failed`, unchanged.
 
         Raises:
-            RuntimeError: When ``failed`` is not empty on a tensor-parallel rank.
+            RuntimeError: When `failed` is not empty on a tensor-parallel rank.
         """
         if failed and not self.enable_attention_dp and mpi_world_size() > 1:
             raise RuntimeError(
