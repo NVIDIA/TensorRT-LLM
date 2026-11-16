@@ -1066,6 +1066,28 @@ def test_eager_decoder_layer_scope_keeps_module_call_fast_path(
     assert layer(output) is output
 
 
+def test_promote_synchronized_releases_reads_epoch_before_sync(monkeypatch):
+    events = []
+    monkeypatch.setattr(
+        nccl_window_graph.torch.ops.trtllm,
+        "get_nccl_window_buffer_release_epoch",
+        lambda: events.append("epoch") or 7,
+    )
+    monkeypatch.setattr(
+        nccl_window_graph.torch.cuda, "synchronize", lambda: events.append("synchronize")
+    )
+    monkeypatch.setattr(
+        nccl_window_graph.torch.ops.trtllm,
+        "promote_nccl_window_buffer_releases",
+        lambda device, epoch: events.append(("promote", device, epoch)),
+    )
+    monkeypatch.setattr(nccl_window_graph.torch.cuda, "current_device", lambda: 0)
+
+    nccl_window_graph.promote_synchronized_nccl_window_releases()
+
+    assert events == ["epoch", "synchronize", ("promote", 0, 7)]
+
+
 @pytest.mark.parametrize("configured", [False, True])
 def test_preallocation_uses_metadata_without_dummy_storage(monkeypatch, configured):
     from tensorrt_llm._torch.custom_ops.torch_custom_ops import AllReduceRunner

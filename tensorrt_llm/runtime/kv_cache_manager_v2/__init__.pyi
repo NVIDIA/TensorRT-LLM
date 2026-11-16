@@ -67,6 +67,9 @@ class LogicError(Exception):
 
 class OutOfPagesError(Exception): ...
 
+class RemoteMemError(Exception):
+    """A remote cache level failed a transfer or claim; its contents can no longer be trusted."""
+
 def poison_reason() -> str | None:
     """First recorded invariant violation, or None. Never clears, so it is safe to poll."""
 
@@ -80,6 +83,11 @@ class CacheTier(enum.IntEnum):
     GPU_MEM = 0
     HOST_MEM = 1
     DISK = 2
+    REMOTE = 3
+
+class RemoteTransport(enum.Enum):
+    NIXL = 0
+    FABRIC = 1
 
 class PageStatus(enum.Enum):
     LOCKED = enum.auto()
@@ -173,6 +181,8 @@ class StorageStatistics:
     def free(self) -> int: ...
     @property
     def evictable(self) -> int: ...
+    @property
+    def retained_copies(self) -> int: ...
     @property
     def available(self) -> int: ...
     @property
@@ -274,6 +284,7 @@ class GpuCacheTierConfig:
 class HostCacheTierConfig:
     quota: int
     max_quota: int | None = None
+    # Deprecated: set KVCacheManagerConfig.host_mem_backing. False still makes the placement strict.
     allow_remote_numa_fallback: bool = True
     @property
     def tier(self) -> CacheTier: ...
@@ -283,6 +294,30 @@ class HostCacheTierConfig:
 class DiskCacheTierConfig:
     quota: int
     path: str
+    num_io_threads: int = 0
+    keep_copy_after_restore: bool = False
+    write_through: bool = False
+    protected_copy_fraction: float = 1.0
+    @property
+    def tier(self) -> CacheTier: ...
+    def validate(self) -> None: ...
+
+@dataclass(slots=True)
+class RemoteTransferConfig:
+    """How a remote tier's pages move, apart from the memory it declares."""
+
+    transport: RemoteTransport = RemoteTransport.NIXL
+    timeout_ms: int = ...  # how long one batch may take before the level fails
+    backend_params: dict[str, str] = ...  # NIXL only: e.g. {"device_list": "mlx5_0"}
+
+@dataclass(slots=True)
+class RemoteCacheTierConfig:
+    quota: int
+    path: str  # the rendezvous directory
+    wait_timeout_ms: int = ...
+    expected_donors: int = 0  # 0: unknown
+    pool_ratio: list[float] = ...  # empty: the hot level's split
+    transfer: RemoteTransferConfig = ...
     @property
     def tier(self) -> CacheTier: ...
     def validate(self) -> None: ...
@@ -467,6 +502,39 @@ class SsmLayerConfig:
 
 LayerConfig = AttentionLayerConfig | SsmLayerConfig
 
+class RegionAllocationUnit(enum.IntEnum):
+    # One slot per KV cache and beam, held for the cache's lifetime.
+    REQUEST = 0
+    # One page per token block. Not supported yet.
+    TOKEN_BLOCK = 1
+
+@dataclass(slots=True)
+class RegionBuffer:
+    """One buffer of a region; the layer id places it in the per-layer address space."""
+
+    layer_id: LayerId
+    buffer: BufferConfig
+
+@dataclass(slots=True)
+class RegionConfig:
+    """Buffers that share a life cycle of the region's own, never merged with another one.
+
+    Only REQUEST regions with the PRIVATE reuse policy are supported: one slot per living
+    KV cache and beam, never published for reuse, returned when the cache closes. Each
+    buffer sits on a layer that has an SsmLayerConfig and sets no reuse policy of its own.
+
+    ``fixed_slot_count`` set gives the region a pool group of its own with exactly that many
+    GPU slots, which ratio-based sizing (construction, resize(), adjust() and the tuner)
+    leaves alone; a GPU quota too small to hold it is raised. None sizes it by ratio.
+    """
+
+    name: str
+    buffers: list[RegionBuffer]
+    allocation_unit: RegionAllocationUnit = RegionAllocationUnit.REQUEST
+    reuse_policy: ReusePolicy = ReusePolicy.PRIVATE
+    fixed_slot_count: int | None = None
+    def validate(self) -> None: ...
+
 @dataclass(slots=True)
 class KVCacheDesc:
     capacity: int
@@ -490,6 +558,16 @@ class PoolRebalanceConfig:
     target_ratio_update_interval: int = 100
     ratio_tolerance: float = 0.25
     moving_average_decay: float = 0.9999
+
+# Host bytes held by live page slabs in this process.
+def live_slab_bytes() -> int: ...
+
+# How the manager backs the host cache tier's memory; the tier does not read it.
+@dataclass(slots=True)
+class HostMemBackingConfig:
+    numa_node: int | None = None
+    allow_remote_numa_fallback: bool = True
+    def validate(self) -> None: ...
 
 @dataclass(slots=True)
 class KVCacheManagerConfig:
@@ -523,6 +601,10 @@ class KVCacheManagerConfig:
     # gives way between them. The two can only conflict if the floors alone exceed this
     # budget, which construction rejects.
     host_sparse_pool_quota: int | None = None
+    # Regions, each with a life cycle of its own, numbered after every layer life cycle in
+    # declaration order. A (layer, role) pair belongs to one layer config or one region.
+    regions: list[RegionConfig] = ...
+    host_mem_backing: HostMemBackingConfig = ...
     @property
     def enable_swa_scratch_reuse(self) -> bool: ...
 
@@ -749,6 +831,9 @@ class _KVCache:
     def cuda_stream(self, cuda_stream: CudaStream) -> None: ...
     @property
     def num_blocks(self) -> int: ...
+    @property
+    def page_storage_version(self) -> int:
+        """Changes whenever this cache's page indices, block count, beam width or history block change."""
     @property
     def batch_row(self) -> BatchRow | None:
         """Row this cache occupies in its :class:`Batch`, or ``None`` when it belongs to none.
@@ -1835,9 +1920,6 @@ class KVCacheManager:
     def take_migration_timings(self) -> tuple[list[tuple[int, int, int, float]], int]:
         """Drain completed samples and return the lifetime cumulative skipped count."""
         ...
-    def get_and_reset_migration_timings(self) -> tuple[list[tuple[int, int, int, float]], int]:
-        """Compatibility alias for take_migration_timings; the skipped count is not reset."""
-        ...
     def get_and_reset_iteration_cached_tokens_by_level(self) -> list[int]: ...
     def get_and_reset_iteration_connector_cached_tokens(self) -> int: ...
     def get_and_reset_iteration_reused_blocks_by_level(
@@ -1858,6 +1940,10 @@ class KVCacheManager:
     def is_stats_excluded(self, kv_cache_id: int | None) -> bool: ...
     @property
     def cache_tier_list(self) -> Sequence[CacheTier]: ...
+    @property
+    def any_remote_level_failed(self) -> bool:
+        """Whether any remote level failed on this rank (a transfer, or its donor went away). Lock-free."""
+        ...
     @property
     def tokens_per_block(self) -> int: ...
     @property
@@ -1897,6 +1983,8 @@ class KVCacheManager:
     # Deprecated: use get_buffer_group_id. Raises RuntimeError for a split layer.
     def get_layer_group_id(self, layer_id: LayerId) -> LayerGroupId: ...
     def get_buffer_group_id(self, layer_id: LayerId, role: DataRole) -> CacheGroupId: ...
+    # Raises IndexError for a name no region declares.
+    def get_region_group_id(self, name: str) -> CacheGroupId: ...
     # Deprecated: use buffer_grouping. Raises RuntimeError if any layer is split.
     @property
     def layer_grouping(self) -> Sequence[Sequence[LayerId]]: ...

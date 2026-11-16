@@ -178,7 +178,7 @@ manager, with at most 128 cached timing events. Collection queries completion
 without synchronization or waiting; unfinished samples remain pending and ready
 samples are drained once. The native `take_migration_timings()` API returns those
 completed samples and a lifetime cumulative skipped count; it never resets the
-skipped count. `get_and_reset_migration_timings()` remains a compatibility alias.
+skipped count.
 A full budget skips eligible samples and increments
 `kv_cache_migration_timing_skipped_total`. No stats polling means no further
 retirement, so an idle worker may expose results only when another record arrives.

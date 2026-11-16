@@ -39,6 +39,7 @@
 #include <memory>
 #include <optional>
 #include <set>
+#include <string>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -200,12 +201,14 @@ public:
     // Defaults false (safe: the scanning path is taken).
     BlockRadixTree::ReuseMatch matchReuse(
         ReuseScope const& reuseScope, TokenSpan inputTokens, bool knownNoDigest = false) const;
-    int probeReuse(ReuseScope reuseScope = {}, TokenSpan inputTokens = {}, bool knownNoDigest = false) const;
+    // Matches under the shared lock. Once a remote level has failed, the first probe after it takes the exclusive lock
+    // to unlink that level's pages, as createKvCache does, so that no probe counts them.
+    int probeReuse(ReuseScope reuseScope = {}, TokenSpan inputTokens = {}, bool knownNoDigest = false);
 
     // Read-only, advisory key of the first full block past the reusable prefix.
     // Uses the same fresh, window-aware match as probeReuse without acquiring pages.
     std::optional<BlockKey> probeFirstNewBlockKey(
-        ReuseScope reuseScope = {}, TokenSpan inputTokens = {}, bool knownNoDigest = false) const;
+        ReuseScope reuseScope = {}, TokenSpan inputTokens = {}, bool knownNoDigest = false);
 
     // ---- Memory pool queries -----------------------------------------------
 
@@ -305,6 +308,10 @@ public:
     //! Cache group of one buffer; throws std::out_of_range for an unknown buffer.
     CacheGroupId getBufferGroupId(LayerId layerId, DataRole const& role) const;
 
+    //! CacheGroupId of the region named `name` (see KVCacheManagerConfig::regions).
+    //! Throws std::out_of_range for a name no region declares.
+    CacheGroupId getRegionGroupId(std::string const& name) const;
+
     //! Deprecated: use bufferGrouping(). Partitions uniform layers by lifecycle.
     //! Throws common::TllmException if any layer spans several groups. Member order
     //! is unspecified; use poolGroupDescs() to inspect physical buffer ordering.
@@ -343,8 +350,6 @@ public:
     //! Drain completed timing samples and return the lifetime cumulative skipped-sample count.
     //! Incomplete samples remain pending; the skipped-sample count is never reset.
     std::pair<MigrationTimingSamples, int64_t> takeMigrationTimings();
-    // Compatibility alias; only completed samples are drained, not the skipped counter.
-    std::pair<MigrationTimingSamples, int64_t> getAndResetMigrationTimings();
     PeakBlockStatsByPoolGroup getAndResetIterationPeakBlockStats(CacheLevel cacheLevel);
     // Drain every level at once. The peaks are already tracked as one per-level record, so a
     // caller that wants all of them should not take that record apart one level at a time.
@@ -567,6 +572,13 @@ public:
     friend class Batch;
 
 private:
+    //! Unlink the committed pages of newly failed remote levels from the radix tree, so that no new match reads them;
+    //! a request still holding such a page fails its next resume (RemoteMemError). Caller holds the exclusive lock.
+    void _unlinkPagesOfFailedRemoteLevels();
+    //! _unlinkPagesOfFailedRemoteLevels() under the exclusive lock if a remote client failed since the last unlink; for
+    //! the probes, which otherwise match under the shared lock. Without a failure it reads only atomics.
+    void _unlinkPagesIfARemoteLevelFailed();
+
     //! Units a step selects per buffer of this life cycle. The cache must hold a whole
     //! selection on top of everything in flight, so this is what the in-flight headroom is
     //! measured against.
@@ -721,6 +733,8 @@ private:
     std::shared_ptr<EventSink> mEventSink;
     std::shared_ptr<StorageManager> mStorage;
     std::shared_ptr<BlockRadixTree> mRadixTree;
+    //! StorageManager::numFailedRemoteClients() as of the last _unlinkPagesOfFailedRemoteLevels().
+    std::atomic<size_t> mNumFailedRemoteClientsUnlinked{0};
 
     // Weak references to all living KvCaches.
     std::set<KvCache*> mLivingKvCaches;

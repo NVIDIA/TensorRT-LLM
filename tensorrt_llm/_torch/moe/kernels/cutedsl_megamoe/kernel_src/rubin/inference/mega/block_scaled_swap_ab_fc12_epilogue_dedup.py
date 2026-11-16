@@ -16,12 +16,9 @@ from .....api import ImplDesc, ProblemDesc
 from .....communication.nvlink_domain.symmetric_buffer import SymmetricBufferDevice
 from .....communication.token_protocol import TokenSrcMetadata
 from .....helpers.iket_compat import iket
-from .....helpers.ptx_helpers import (
-    cp_async_bulk_s2g,
-    cp_reduce_async_bulk_add_bf16_s2g,
-)
+from .....helpers.ptx_helpers import cp_async_bulk_s2g, cp_reduce_async_bulk_add_bf16_s2g
 from ....function_mapping import FunctionMapping
-from ....schedulers import SwapAbFc12WorkTileInfo
+from ....schedulers.fc12_mapping import SwapAbFc12WorkTileInfo
 from .block_scaled_swap_ab_fc12_epilogue import (
     GatedActEpilogueArgs,
     SwapABFc2Epilogue,

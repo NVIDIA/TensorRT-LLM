@@ -6417,6 +6417,66 @@ class TestKimiK3ToolParser(BaseToolParserTestClass):
         assert result.calls[0].name == "undefined_func"
         assert result.calls[0].tool_index == 0
 
+    @staticmethod
+    def _namespaced_tools():
+        """Tools declared inside namespaces; two share the bare name ``status``."""
+        return _make_tools(("functions.exec", None), ("functions.wait", None),
+                           ("a.status", None), ("b.status", None))
+
+    @staticmethod
+    def _parse_logging_warnings(text: str,
+                                tools: list[ChatCompletionToolsParam]):
+        """Parse ``text`` whole; return its calls and the warnings it logged."""
+        from unittest.mock import patch
+
+        with patch("tensorrt_llm.serve.tool_parser.kimi_k3_tool_parser.logger"
+                   ) as mock_logger:
+            result = KimiK3ToolParser().detect_and_parse(text, tools)
+        calls = [(call.tool_index, call.name, call.parameters)
+                 for call in result.calls]
+        warnings = [call.args[0] for call in mock_logger.warning.call_args_list]
+        return calls, warnings
+
+    def test_bare_name_of_namespaced_tool_does_not_warn(self):
+        """A namespaced tool called by its bare name is not an undefined function.
+
+        The call is delivered under the name the model wrote.
+        """
+        text = self._section(
+            self._call("exec", 1, self._argument("cmd", "string", "ls")),
+            self._call("wait", 2, self._argument("seconds", "number", "5")))
+
+        calls, warnings = self._parse_logging_warnings(text,
+                                                       self._namespaced_tools())
+
+        assert calls == [(0, "exec", '{"cmd": "ls"}'),
+                         (1, "wait", '{"seconds": 5}')]
+        assert warnings == []
+
+    @pytest.mark.parametrize(
+        "undeclared",
+        [
+            "undefined_func",
+            # A bare name two declared tools share names neither of them.
+            "status",
+            # A qualifier no declared tool has.
+            "tools.exec",
+        ])
+    def test_call_naming_no_declared_tool_still_warns(self, undeclared):
+        """Only the call that names no declared tool is reported."""
+        text = self._section(
+            self._call("exec", 1, self._argument("cmd", "string", "ls")),
+            self._call(undeclared, 2, self._argument("arg", "string", "x")))
+
+        calls, warnings = self._parse_logging_warnings(text,
+                                                       self._namespaced_tools())
+
+        assert calls == [(0, "exec", '{"cmd": "ls"}'),
+                         (1, undeclared, '{"arg": "x"}')]
+        assert warnings == [
+            f"Model attempted to call undefined function: {undeclared}"
+        ]
+
     def test_supports_structural_tag(self):
         """Reject JSON-schema structural tagging for XTML bodies.
 

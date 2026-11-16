@@ -538,6 +538,7 @@ def test_current_main_warmup_keeps_serving_timeout_only_for_capture(monkeypatch,
     decoder = object.__new__(DecoderCudaGraphs)
     decoder.cuda_graph_runner = graph
     decoder.run_cuda_graph_warmup = warmup
+    decoder._warm_inforward_split = lambda resource_manager: None
     decoder.warmup_and_capture(object())
 
     assert calls == [(True, False, True), (False, True, False)]
