@@ -17,6 +17,7 @@
 import asyncio
 import os
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -25,10 +26,12 @@ from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest import mock
 
+import httpx
 import msgspec
 import pytest
+import uvicorn
 from aiohttp import web
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 from starlette.routing import Match
 
@@ -157,6 +160,59 @@ def test_attached_server_forwards_launcher_owned_routes(tmp_path) -> None:
         assert r.status_code == 503 and "unavailable" in r.json()["error"]
 
 
+def test_forwarding_timeout_warns_that_a_queued_post_can_still_execute(tmp_path) -> None:
+    payload = {"requests": []}
+    seen = []
+
+    async def run() -> None:
+        launcher = FastAPI()
+        created = asyncio.Event()
+
+        @launcher.post("/v1/messages/batches")
+        async def create_batch(request: Request) -> dict:
+            seen.append(await request.json())
+            created.set()
+            return {"id": "batch-1"}
+
+        path = str(tmp_path / "launcher.sock")
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+            listener.bind(path)
+            listener.listen()
+            forwarder = LauncherForwarder(path, timeout_s=0.05)
+            frontend = FastAPI()
+            frontend.add_api_route("/v1/messages/batches", forwarder.forward, methods=["POST"])
+            serving = None
+            server = uvicorn.Server(
+                uvicorn.Config(
+                    launcher,
+                    http="h11",
+                    loop="asyncio",
+                    lifespan="off",
+                    log_config=None,
+                    log_level=None,
+                )
+            )
+            try:
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=frontend), base_url="http://frontend"
+                ) as client:
+                    response = await client.post("/v1/messages/batches", json=payload)
+                assert not seen
+                serving = asyncio.create_task(server.serve(sockets=[listener]))
+                await asyncio.wait_for(created.wait(), timeout=5)
+            finally:
+                server.should_exit = True
+                if serving is not None:
+                    await asyncio.wait_for(serving, timeout=5)
+                await forwarder.close()
+
+        assert seen == [payload]
+        assert response.status_code == 504
+        assert "may still be processed" in response.json()["error"]
+
+    asyncio.run(run())
+
+
 async def _wait_for(predicate, timeout: float = 10.0) -> None:
     deadline = time.monotonic() + timeout
     while not predicate():
@@ -181,8 +237,8 @@ def test_watchdog_counts_health_failures_only_after_the_launcher_answered(tmp_pa
         task = asyncio.create_task(watchdog.run())
         launcher = None
         try:
-            # The launcher starts listening after its attached frontends: ~25
-            # failed probes against a socket nobody serves yet are not fatal.
+            # Startup probes can fail before the launcher answers; failures
+            # only count after its first successful response.
             await asyncio.sleep(0.5)
             launcher = await asyncio.to_thread(_FakeLauncher, path, 503)
             await _wait_for(lambda: launcher.health_hits >= 3)

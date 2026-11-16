@@ -84,6 +84,7 @@ def _spawn_attached_frontends(
     cancelled: threading.Event | None = None,
     report_failure: Callable[[int, str, str], None] | None = None,
     affinity_sockets: dict[int, socket.socket] | None = None,
+    launcher_socket: socket.socket | None = None,
 ) -> list:
     """Spawn num_frontends - 1 attached serving frontend processes.
 
@@ -102,6 +103,9 @@ def _spawn_attached_frontends(
     affinity_sockets maps a frontend id to the affinity socket the launcher
     bound for it (_frontend_affinity_sockets). Each child inherits its own
     socket; the launcher closes its copy and removes it from the dict.
+
+    launcher_socket is closed before terminating children if startup fails,
+    releasing any forwarded requests queued before the launcher starts serving.
     """
     from tensorrt_llm.executor.proxy import GenerationExecutorProxy
 
@@ -156,6 +160,8 @@ def _spawn_attached_frontends(
             logger.info(f"Launched attached serving frontend {frontend_id} (pid {child.pid})")
         _wait_attached_frontends_ready(children, ready_fds, cancelled, report_failure)
     except BaseException:
+        if launcher_socket is not None:
+            launcher_socket.close()
         _terminate_attached_frontends(children)
         raise
     finally:

@@ -154,16 +154,25 @@ class LauncherForwarder:
                     status_code=resp.status,
                     media_type=resp.headers.get("Content-Type"),
                 )
-        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as error:
             logger.warning(
-                f"Forwarding {request.method} {target} to the launcher frontend failed: {e!r}"
+                f"Forwarding {request.method} {target} to the launcher frontend failed: {error!r}"
             )
+            if isinstance(error, asyncio.TimeoutError):
+                status_code = 504
+                message = (
+                    f"The launcher frontend did not respond to {request.url.path} in time; "
+                    "the request may still be processed. Check its result before retrying."
+                )
+            else:
+                status_code = 503
+                message = (
+                    f"The launcher frontend that serves {request.url.path} "
+                    f"is unavailable: {error!r}"
+                )
             return JSONResponse(
-                status_code=503,
-                content={
-                    "error": f"The launcher frontend that serves {request.url.path} "
-                    f"is unavailable: {e!r}"
-                },
+                status_code=status_code,
+                content={"error": message},
             )
 
     async def get_status(self, path: str, timeout_s: float = 5.0) -> Optional[int]:
@@ -259,8 +268,8 @@ class AttachedFrontendWatchdog:
     async def run(self) -> None:
         loop = asyncio.get_running_loop()
         failures = 0
-        # The launcher starts listening only after its attached frontends are
-        # ready, so failures count once it has answered.
+        # The launcher socket listens before its attached frontends start, but
+        # the launcher only answers once they are ready.
         launcher_answered = False
         next_health = loop.time() + self._health_interval
         while True:
