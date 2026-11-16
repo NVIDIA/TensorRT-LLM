@@ -50,6 +50,12 @@ def compare(candidate: dict, reference: dict, *, quality: bool = True) -> dict:
     """Keep initialization, steps and raw outputs separate in the diagnostic report."""
     if candidate["recipe"] != reference["recipe"]:
         raise ValueError("Candidate/reference generation recipes differ")
+    for trace in (candidate, reference):
+        rate = trace.get("sample_rate")
+        if not isinstance(rate, int) or isinstance(rate, bool) or rate <= 0:
+            raise ValueError("Expected sample_rate to be a positive integer")
+    if candidate["sample_rate"] != reference["sample_rate"]:
+        raise ValueError("Candidate/reference audio sample rates differ")
     if (
         len(candidate.get("initializations", [])) != 4
         or len(reference.get("initializations", [])) != 4

@@ -475,6 +475,7 @@ l0_b200:
   - unittest/_torch/visual_gen/test_ltx2_pipeline.py
   # LTX-2.5 tests use the model-specific Gemma4 environment documented in its example.
   - unittest/_torch/visual_gen/test_ltx2_5_conditioning.py
+  - unittest/_torch/visual_gen/test_ltx2_5_bwe.py
   - unittest/_torch/visual_gen/test_ltx2_5_registry.py
   - unittest/_torch/visual_gen/test_ltx2_5_transformer.py
   - unittest/_torch/visual_gen/test_ltx2_5_validation.py

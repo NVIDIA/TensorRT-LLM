@@ -147,6 +147,20 @@ def validate_transformer_weights(module: torch.nn.Module, weights: dict[str, tor
             f"LTX-2.5 transformer checkpoint mismatch: missing={sorted(missing)[:20]}, "
             f"unexpected={sorted(unexpected)[:20]}"
         )
+    parameters = dict(module.named_parameters())
+    modules = dict(module.named_modules())
+    for key, source in weights.items():
+        name = _normalize_common_name(key)
+        parent, _, leaf = name.rpartition(".")
+        layer = modules[parent]
+        shape = parameters[name].shape
+        if isinstance(layer, Linear) and leaf == "weight":
+            shape = (layer.out_features, layer.in_features)
+        if source.shape != shape:
+            raise ValueError(
+                f"LTX-2.5 transformer weight shape mismatch: {name}: "
+                f"expected={tuple(shape)}, actual={tuple(source.shape)}"
+            )
 
 
 @torch.no_grad()

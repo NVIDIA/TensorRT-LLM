@@ -173,6 +173,60 @@ def test_incomplete_transformer_checkpoint_fails_before_loading():
     torch.testing.assert_close(model.weight, original, rtol=0, atol=0)
 
 
+def test_broadcastable_checkpoint_shape_is_rejected_before_loading() -> None:
+    from tensorrt_llm._torch.visual_gen.models.ltx2_5.loading import load_transformer_weights_strict
+
+    class Model(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.other = torch.nn.Parameter(torch.ones(2, dtype=torch.bfloat16))
+            self.keyframes_abs_pos_embedding = torch.nn.Parameter(
+                torch.ones(1, 4, dtype=torch.bfloat16)
+            )
+            self.load_called = False
+
+        def load_weights(self, weights: dict[str, torch.Tensor]) -> None:
+            self.load_called = True
+            for name, parameter in self.named_parameters():
+                parameter.copy_(weights[name])
+
+    model = Model()
+    original = {name: value.clone() for name, value in model.state_dict().items()}
+    weights = {
+        "other": torch.zeros(2, dtype=torch.bfloat16),
+        "keyframes_abs_pos_embedding": torch.zeros(1, 1, dtype=torch.bfloat16),
+    }
+    with pytest.raises(ValueError, match="shape mismatch: keyframes_abs_pos_embedding"):
+        load_transformer_weights_strict(model, weights)
+    assert not model.load_called
+    for name, value in model.state_dict().items():
+        torch.testing.assert_close(value, original[name], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("algorithm", ["FP8_BLOCK_SCALES", "NVFP4"])
+def test_quantized_checkpoint_uses_logical_weight_shape(algorithm: str) -> None:
+    from tensorrt_llm._torch.modules.linear import Linear
+    from tensorrt_llm._torch.visual_gen.models.ltx2_5.loading import validate_transformer_weights
+    from tensorrt_llm.mapping import Mapping
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    with torch.device("meta"):
+        layer = Linear(
+            256,
+            128,
+            bias=False,
+            dtype=torch.bfloat16,
+            mapping=Mapping(),
+            quant_config=QuantConfig(quant_algo=QuantAlgo(algorithm)),
+            force_dynamic_quantization=True,
+        )
+    source = torch.zeros(128, 256, dtype=torch.bfloat16)
+    validate_transformer_weights(layer, {"weight": source})
+    with pytest.raises(ValueError, match="weight shape mismatch"):
+        validate_transformer_weights(layer, {"weight": source[:, :1]})
+
+
 def test_iclora_scale_does_not_use_peft_alpha(tmp_path):
     model = torch.nn.Sequential(torch.nn.Linear(4, 3, bias=False, dtype=torch.bfloat16))
     original = model[0].weight.detach().clone()
