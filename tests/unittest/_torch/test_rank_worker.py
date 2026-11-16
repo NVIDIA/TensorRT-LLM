@@ -133,13 +133,15 @@ def test_a_build_no_worker_has_started_is_taken_back_and_made_here(worker, tmp_p
     started, release = tmp_path / "started", tmp_path / "release"
     with worker.pass_scope():
         busy = worker.run("busy", f"{targets.__name__}:hold", (str(started), str(release)))
-        deadline = time.monotonic() + 60
-        while not started.exists() and time.monotonic() < deadline:
-            time.sleep(0.05)
-        assert targets.compile_kernel.submit(40)
-        # The only worker is busy: the kernel is made here at once.
-        assert targets.compile_kernel(40).pid == os.getpid()
-        release.touch()
+        try:
+            deadline = time.monotonic() + 60
+            while not started.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert targets.compile_kernel.submit(40)
+            # The only worker is busy: the kernel is made here at once.
+            assert targets.compile_kernel(40).pid == os.getpid()
+        finally:
+            release.touch()
         assert busy.result()[0] == "done"
     assert worker.counts() == {"done": 1, "taken": 1}
 
@@ -175,6 +177,8 @@ def test_a_run_that_fails_reports_the_error(worker):
 
 
 def test_a_build_a_worker_cannot_load_fails_alone(worker, tmp_path):
+    # One worker at most: the next build waits for it rather than starting another.
+    worker.max_workers = 1
     with worker.pass_scope():
         unloadable = worker.run(
             "unloadable", f"{targets.__name__}:record", (targets.LoadsOnlyHere(), 0)
@@ -276,9 +280,40 @@ def test_a_kernel_claimed_by_a_process_that_never_builds_it_is_compiled_here(
         rank.stop()
 
 
-def test_without_shared_builds_each_rank_keeps_a_store_of_its_own(worker_env, monkeypatch):
+def test_without_shared_builds_each_rank_keeps_a_store_of_its_own(
+    worker_env, monkeypatch, tmp_path
+):
     monkeypatch.setenv(_jit_share.SHARE_DIR_ENV, "/nonexistent-share-dir")
     monkeypatch.setattr(_jit_share, "enabled", lambda: False)
-    stores = [RankWorker(workers=1, enabled=True)._store_dir() for _ in range(2)]
+    ranks = [RankWorker(workers=1, enabled=True) for _ in range(2)]
+    stores = [rank._store_dir() for rank in ranks]
     assert stores[0] != stores[1]
     assert not any(store.startswith("/nonexistent-share-dir") for store in stores)
+    # Once a worker takes a build, the shared kernel caches keep CuTe DSL kernels where the
+    # workers build them, until the pass ends.
+    with ranks[0].pass_scope():
+        record = ranks[0].run("record", f"{targets.__name__}:record", (str(tmp_path / "r"), 1))
+        assert record is not None
+        assert _jit_share._cute_store() == stores[0]
+    assert record.result()[0] == "done"
+    assert _jit_share._cute_store() == os.path.join("/nonexistent-share-dir", "cute")
+
+
+def test_a_store_that_cannot_be_made_leaves_every_build_here(worker_env, monkeypatch, tmp_path):
+    not_a_directory = tmp_path / "share"
+    not_a_directory.write_text("")
+    monkeypatch.setenv(_jit_share.SHARE_DIR_ENV, str(not_a_directory))
+    monkeypatch.setattr(_jit_share, "enabled", lambda: True)
+    rank = RankWorker(workers=1, enabled=True)
+    monkeypatch.setattr(RankWorker, "_instance", rank)
+    try:
+        # The pass ends: no build waits for a worker.
+        with rank.pass_scope():
+            assert (
+                rank.run("record", f"{targets.__name__}:record", (str(tmp_path / "r"), 1)) is None
+            )
+            assert not targets.compile_kernel.submit(33)
+            assert targets.compile_kernel(33).pid == os.getpid()
+    finally:
+        rank.stop()
+    assert rank.counts() == {} and rank._workers_started == 0

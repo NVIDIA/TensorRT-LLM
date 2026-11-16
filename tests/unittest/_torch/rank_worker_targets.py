@@ -72,10 +72,14 @@ def fail() -> None:
     raise ValueError("a build that fails")
 
 
-def hold(started: str, release: str) -> None:
-    """A build that creates the file ``started`` and runs until the file ``release`` exists."""
+def hold(started: str, release: str, timeout: float = 120.0) -> None:
+    """A build that creates the file ``started`` and runs until the file ``release`` exists,
+    for at most ``timeout`` seconds."""
     open(started, "w").close()
+    deadline = time.monotonic() + timeout
     while not os.path.exists(release):
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"{release} was not created within {timeout}s")
         time.sleep(0.05)
 
 

@@ -247,7 +247,11 @@ class RankWorker:
     @contextlib.contextmanager
     def pass_scope(self) -> Iterator[None]:
         """A build pass: workers take the builds asked for inside it, and stop when the
-        outermost pass ends, after its builds."""
+        outermost pass ends, after its builds. Once a worker takes a build, the rank's shared
+        kernel caches (``tensorrt_llm._jit_share``) keep CuTe DSL kernels in the store the
+        workers build into, until the pass ends."""
+        from tensorrt_llm import _jit_share
+
         with self._lock:
             self._depth += 1
         try:
@@ -259,6 +263,8 @@ class RankWorker:
             if last:
                 self.join()
                 self.stop()
+                if not self.in_worker:
+                    _jit_share.set_rank_store(None)
 
     def accepting(self) -> bool:
         """Whether a worker takes a build asked for now."""
@@ -281,8 +287,8 @@ class RankWorker:
         with ``args``; the build's kernel reaches this process through its compiler's cache or
         the store. Returns a future of ``(status, seconds, error)`` (status ``"done"`` or
         ``"failed"``), the earlier one for a ``key`` asked for before, or None when no worker
-        takes it (outside a pass, with workers off, or ``args`` that do not pickle): the caller
-        then builds in this process."""
+        takes it (outside a pass, with workers off, ``args`` that do not pickle, or a store that
+        cannot be made): the caller then builds in this process."""
         if not self.accepting():
             return None
         with self._lock:
@@ -297,10 +303,12 @@ class RankWorker:
             if len(message) > _MAX_MESSAGE_BYTES:
                 logger.debug(f"[RankWorker] {key} is built here: {len(message)} bytes to send")
                 return None
+            pool = self._ensure_pool()
+            if pool is None:
+                return None
             future = Future()
             self._futures[key] = future
             task = self._tasks[key] = _Task(key, message, future, True)
-            pool = self._ensure_pool()
         pool.put(task)
         return future
 
@@ -311,7 +319,7 @@ class RankWorker:
         Returns False when the kernel was asked for before or is in the store already, and when
         no worker takes it (see :meth:`run`).
         """
-        if not self.accepting():
+        if not self.accepting() or self._usable_store() is None:
             return False
         key, paths = self._paths(name, args)
         with self._lock:
@@ -325,6 +333,9 @@ class RankWorker:
             except (pickle.PicklingError, TypeError, AttributeError) as e:
                 logger.debug(f"[RankWorker] {name}{args} is built here: {type(e).__name__}: {e}")
                 return False
+            pool = self._ensure_pool()
+            if pool is None:
+                return False
             future = Future()
             self._futures[key] = future
             if os.path.exists(paths.obj):
@@ -332,7 +343,6 @@ class RankWorker:
                 self._counts[_PRESENT] += 1
                 return False
             task = self._tasks[key] = _Task(key, message, future, True)
-            pool = self._ensure_pool()
         return pool.put(task)
 
     def take(self, name: str, args: tuple) -> Any:
@@ -469,10 +479,16 @@ class RankWorker:
                     self._build_s += result[1]
         task.future.set_result(result)
 
-    def _ensure_pool(self) -> "_Pool":
-        """The pool of this pass; called holding ``self._lock``."""
+    def _ensure_pool(self) -> Optional["_Pool"]:
+        """The pool of this pass, or None when the store cannot be made; called holding
+        ``self._lock``."""
         if self._pool is None:
-            store = self._store_dir()
+            store = self._usable_store()
+            if store is None:
+                return None
+            from tensorrt_llm import _jit_share
+
+            _jit_share.set_rank_store(store)
             env = {STORE_ENV: store, _SHARED_ENV: "1" if self._shared else "0"}
             self._pool = _Pool(self, self.max_workers, store, env)
         return self._pool
@@ -484,29 +500,45 @@ class RankWorker:
     # The store.
 
     def _existing_store(self) -> Optional[str]:
-        """The store, when this process has one: a lookup creates none."""
+        """The store, when this process has one: a lookup creates none, except of the store
+        the ranks of a launch share."""
         from tensorrt_llm import _jit_share
 
-        if self._store is None and not self.in_worker and _jit_share.enabled():
+        if self._store_ready or self.in_worker:
+            return self._store
+        if _jit_share.enabled():
+            return self._usable_store()
+        return None
+
+    def _usable_store(self) -> Optional[str]:
+        """The store, made if needed; None when it cannot be made, which turns the workers off:
+        every kernel then builds in this process."""
+        try:
             return self._store_dir()
-        return self._store
+        except OSError as e:
+            self.enabled = False
+            logger.warning_once(
+                f"[RankWorker] no worker process builds kernels: the store cannot be made: "
+                f"{type(e).__name__}: {e}",
+                key=("rank_worker", "store"),
+            )
+            return None
 
     def _store_dir(self) -> str:
         with self._store_lock:
             if not self._store_ready:
                 from tensorrt_llm import _jit_share
 
-                if self._store is None:
+                store, shared = self._store, self._shared
+                if store is None:
                     if _jit_share.enabled():
-                        self._store = os.path.join(os.environ[_jit_share.SHARE_DIR_ENV], "cute")
-                        self._shared = True
+                        store = os.path.join(os.environ[_jit_share.SHARE_DIR_ENV], "cute")
+                        shared = True
                     else:
-                        self._store = tempfile.mkdtemp(prefix="tllm-rank-worker-")
-                        atexit.register(shutil.rmtree, self._store, True)
-                os.makedirs(self._store, exist_ok=True)
-                if not self.in_worker:
-                    _jit_share.set_rank_store(self._store)
-                self._store_ready = True
+                        store = tempfile.mkdtemp(prefix="tllm-rank-worker-")
+                        atexit.register(shutil.rmtree, store, True)
+                os.makedirs(store, exist_ok=True)
+                self._store, self._shared, self._store_ready = store, shared, True
             return self._store
 
     def _paths(self, name: str, args: tuple) -> Tuple[str, _Paths]:

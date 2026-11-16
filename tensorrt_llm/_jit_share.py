@@ -99,8 +99,8 @@ _RANK_STORE_ENV = "TLLM_RANK_WORKER_STORE"
 _installed = False
 _slot: int | None = None
 _kernel_sharing_depth = 0
-# This rank's RankWorker store (set_rank_store), where shared kernel caches keep CuTe DSL
-# kernels when the processes of the launch do not share a directory.
+# The store of this rank's RankWorker build pass (set_rank_store), where shared kernel caches
+# keep CuTe DSL kernels while the pass runs.
 _rank_store: str | None = None
 _cute_salt: str | None = None
 # .claim: (claim, failed) of the kernel this thread claimed and has not stored.
@@ -270,21 +270,22 @@ class sharing_kernels:
         return False
 
 
-def set_rank_store(path: str) -> None:
-    """Have shared kernel caches keep CuTe DSL kernels in ``path``, this rank's RankWorker
-    store, when the processes of the launch do not share a directory: the rank then loads the
-    kernels its worker processes compiled."""
+def set_rank_store(path: str | None) -> None:
+    """Have shared kernel caches keep CuTe DSL kernels in ``path``, the store of this rank's
+    RankWorker build pass, where its worker processes build them; None when the pass ends."""
     global _rank_store
     _rank_store = path
 
 
 def _cute_store() -> str | None:
-    """Where shared kernel caches keep CuTe DSL kernels: ``<TLLM_JIT_SHARE_DIR>/cute``, else this
-    rank's RankWorker store, if it has one."""
+    """Where shared kernel caches keep CuTe DSL kernels: inside a RankWorker build pass, the
+    rank's store (in a worker process, the store of the rank it builds for); else
+    ``<TLLM_JIT_SHARE_DIR>/cute``, if set."""
+    store = _rank_store or os.environ.get(_RANK_STORE_ENV)
+    if store:
+        return store
     share_dir = os.environ.get(SHARE_DIR_ENV)
-    if share_dir:
-        return os.path.join(share_dir, "cute")
-    return _rank_store or os.environ.get(_RANK_STORE_ENV)
+    return os.path.join(share_dir, "cute") if share_dir else None
 
 
 def _kernel_sharing_active() -> bool:

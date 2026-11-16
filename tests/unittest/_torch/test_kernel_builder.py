@@ -97,15 +97,17 @@ def test_an_op_waiting_for_a_build_no_worker_has_started_takes_it_back(builder, 
     RankWorker.get().max_workers = 1
     started, release = tmp_path / "started", tmp_path / "release"
     with builder.build_pass("test"):
-        assert builder.submit("op", "busy", BuildTask(_HOLD, (str(started), str(release))))
-        deadline = time.monotonic() + 60
-        while not started.exists() and time.monotonic() < deadline:
-            time.sleep(0.05)
-        assert builder.submit("op", "k", BuildTask(_RECORD, (str(tmp_path / "k"), 1)))
-        # The only worker is busy: the op builds the kernel itself, at once.
-        assert builder.wait("op", "k") == 0.0
-        assert builder.state("op", "k") == "taken"
-        release.touch()
+        try:
+            assert builder.submit("op", "busy", BuildTask(_HOLD, (str(started), str(release))))
+            deadline = time.monotonic() + 60
+            while not started.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert builder.submit("op", "k", BuildTask(_RECORD, (str(tmp_path / "k"), 1)))
+            # The only worker is busy: the op builds the kernel itself, at once.
+            assert builder.wait("op", "k") == 0.0
+            assert builder.state("op", "k") == "taken"
+        finally:
+            release.touch()
     assert not (tmp_path / "k").exists()
 
 

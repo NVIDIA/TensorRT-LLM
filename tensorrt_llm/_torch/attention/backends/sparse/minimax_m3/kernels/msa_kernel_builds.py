@@ -305,9 +305,18 @@ def import_k2q_csr() -> bool:
     return time.perf_counter() - t0 >= 1.0
 
 
+def _route(module: Any, api: Any, package: _Package) -> None:
+    """Point the package's entry points at ``package``'s wrappers."""
+    global _package
+    _package = package
+    module.fmha_sm100_plan = package.plan
+    module.fmha_sm100 = package.run
+    api.get_fmha_variant = package.get_variant
+    api.get_reduction_module = package.get_reduction_module
+
+
 def install(module: types.ModuleType) -> None:
     """Route ``module``'s plan, run and variant lookup through ``KernelBuilder``; once."""
-    global _package
     if getattr(module, _INSTALLED, False):
         return
     with _install_lock:
@@ -324,9 +333,5 @@ def install(module: types.ModuleType) -> None:
                     f"{type(e).__name__}: {e}"
                 )
             else:
-                _package = package
-                module.fmha_sm100_plan = package.plan
-                module.fmha_sm100 = package.run
-                api.get_fmha_variant = package.get_variant
-                api.get_reduction_module = package.get_reduction_module
+                _route(module, api, package)
         setattr(module, _INSTALLED, True)

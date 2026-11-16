@@ -498,11 +498,15 @@ def autotune(tune_mode: bool = True,
         torch.ops.trtllm.set_fine_grained_sync_disabled_override(True)
 
     # While tuning, CuTe DSL kernels in shared runner caches go through the
-    # directory of TLLM_JIT_SHARE_DIR, or else the store of this rank's worker
-    # processes, which build kernels there inside a build pass (see
-    # tensorrt_llm._jit_share and tensorrt_llm._torch.rank_worker).
+    # directory of TLLM_JIT_SHARE_DIR when this process shares builds through
+    # it, or else, inside a build pass, through the store of this rank's worker
+    # processes, which build kernels there (see tensorrt_llm._jit_share and
+    # tensorrt_llm._torch.rank_worker). A TLLM_JIT_SHARE_DIR that
+    # jit_share.install() refused is not used.
     kernel_sharing = (jit_share.sharing_kernels() if tune_required and
-                      (jit_share.enabled() or RankWorker.get().accepting()) else
+                      (jit_share.enabled() or
+                       (RankWorker.get().accepting()
+                        and not os.environ.get(jit_share.SHARE_DIR_ENV))) else
                       contextlib.nullcontext())
     eager_forks_context = (no_eager_forks()
                            if tune_required else contextlib.nullcontext())

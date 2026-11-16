@@ -3192,7 +3192,7 @@ def tune_mode_workers(monkeypatch):
                                                        (True, False)],
                          ids=["workers", "workers_off", "no_build_pass"])
 def test_tune_mode_builds_every_tactic_in_worker_processes_before_profiling(
-        tune_mode_workers, tmp_path, workers_on, in_build_pass):
+        tune_mode_workers, tmp_path, monkeypatch, workers_on, in_build_pass):
     """In tune mode inside a build pass, an op that sets ``build_in_workers`` has the rank's
     worker processes build every (profile, tactic) its profiling times, before it profiles;
     with the workers off (``TLLM_KERNEL_BUILDER=0``), or outside a build pass, none builds
@@ -3208,6 +3208,17 @@ def test_tune_mode_builds_every_tactic_in_worker_processes_before_profiling(
         build_in_workers=True,
     )
     x = torch.randn(4, 8, device="cuda")
+    # The builds there are when the first tactic is timed.
+    built_at_profiling = []
+    profile = AutoTuner._profile_single_kernel
+
+    def profile_after_builds(self, *args, **kwargs):
+        if not built_at_profiling:
+            built_at_profiling.append(sorted(os.listdir(tmp_path)))
+        return profile(self, *args, **kwargs)
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel",
+                        profile_after_builds)
     build_pass = (tune_mode_workers.pass_scope()
                   if in_build_pass else contextlib.nullcontext())
     with build_pass, autotune():
@@ -3217,6 +3228,7 @@ def test_tune_mode_builds_every_tactic_in_worker_processes_before_profiling(
     built = sorted(os.listdir(tmp_path))
     if workers_on and in_build_pass:
         assert built == sorted(f"m{m}-t{t}" for m in (1, 2, 4) for t in (0, 1))
+        assert built_at_profiling == [built]
         assert all(
             int((tmp_path / name).read_text()) != os.getpid() for name in built)
         # The build pass stopped the workers.
