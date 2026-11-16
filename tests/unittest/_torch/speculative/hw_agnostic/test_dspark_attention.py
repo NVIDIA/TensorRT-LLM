@@ -1375,7 +1375,7 @@ def test_batched_fused_preparation_compacts_qkv_views(monkeypatch, batch, block)
     monkeypatch.setattr(modeling_dspark, "cute_dsl_dspark_rmsnorm_rope_cache_write", cache_write)
     monkeypatch.setattr(modeling_dspark, "cute_dsl_dspark_rmsnorm_rope_draft_block", draft_prepare)
     monkeypatch.setattr(
-        modeling_dspark, "fused_dsv4_dspark_attention", lambda q, *args: torch.zeros_like(q)
+        modeling_dspark, "fused_dsv4_dspark_ring_attention", lambda q, *args: torch.zeros_like(q)
     )
     monkeypatch.setattr(modeling_dspark, "_output_projection", lambda o, **kwargs: o)
     output = modeling_dspark.dspark_attention_forward_batched(
@@ -1406,57 +1406,6 @@ def test_batched_fused_preparation_compacts_qkv_views(monkeypatch, batch, block)
     )
     assert output.shape == (batch, block, heads, head_dim)
     assert calls == ["cache_write", "draft_block"]
-
-
-@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
-def test_ring_attention_metadata_maps_wrapped_slots(dtype):
-    slots = torch.tensor([3, 1, 0], dtype=dtype)
-    positions = torch.tensor([0, 64, 255], dtype=dtype)
-    lengths = torch.tensor([1, 32, 128], dtype=dtype)
-    tables, ends, valid, capacities = modeling_dspark._dspark_ring_attention_metadata(
-        slots, positions, lengths, 128
-    )
-    torch.testing.assert_close(tables, torch.tensor([[3, 3], [1, 1], [0, 0]], dtype=torch.int32))
-    torch.testing.assert_close(ends, torch.tensor([129, 193, 256], dtype=torch.int64))
-    torch.testing.assert_close(valid, lengths.long())
-    torch.testing.assert_close(capacities, torch.full((3,), 256, dtype=torch.int64))
-
-
-@pytest.mark.parametrize("with_valid_lengths", [False, True])
-def test_forward_batched_reuses_ring_attention_metadata(monkeypatch, with_valid_lengths):
-    hidden = torch.randn(2, 5, 2, 8)
-    stages = [types.SimpleNamespace(_dspark_attn={}) for _ in range(3)]
-    stage_call = Mock(side_effect=lambda stage, h, *args, **kwargs: h)
-    model = types.SimpleNamespace(
-        mtp_layers=stages,
-        block_size=5,
-        _attn_params={"window_size": 128},
-        forward_embed=Mock(return_value=(hidden, torch.randn(2, 8), torch.zeros(2, 5))),
-        _dspark_freqs_table=Mock(return_value=precompute_dspark_freqs_cis(2, 256)),
-        _tp_attention_ready=False,
-        _fuses_moe_boundary=Mock(return_value=False),
-        _initial_pre_mix=Mock(return_value=None),
-        _forward_stage=stage_call,
-        uses_lagged_pre=False,
-        forward_head=Mock(return_value=(None, None)),
-    )
-    build = Mock(wraps=modeling_dspark._dspark_ring_attention_metadata)
-    monkeypatch.setattr(modeling_dspark, "_dspark_ring_attention_metadata", build)
-    monkeypatch.setattr(modeling_dspark, "IS_CUTLASS_DSL_AVAILABLE", True)
-    DSv4DSparkDraftModel.forward_batched(
-        model,
-        torch.randn(2, 16),
-        torch.zeros(2, dtype=torch.long),
-        torch.tensor([64, 192]),
-        kv_windows=torch.empty(3, 3, 128, 512),
-        slots=torch.tensor([2, 0]),
-        valid_len=torch.tensor([1, 127]) if with_valid_lengths else None,
-    )
-    assert stage_call.call_count == 3
-    shared = [call.kwargs["ring_attention_metadata"] for call in stage_call.call_args_list]
-    assert all(item is shared[0] for item in shared)
-    assert build.call_count == int(with_valid_lengths)
-    assert (shared[0] is not None) == with_valid_lengths
 
 
 def test_context_wkv_uses_prepared_linear_slice():

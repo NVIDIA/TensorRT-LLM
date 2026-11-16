@@ -118,6 +118,9 @@ class DSparkAttentionKernel:
         # count separately from the absolute decode position, masking unwritten
         # rows in the first window tile while keeping the draft-block tile fixed.
         self.window_valid_len_from_tensor = True
+        # > 0: the page table is each request's slot and cache_seqs its start position in a ring of
+        # this many rows (one page aliased twice), so the window end and capacity are derived here.
+        self.ring_window = 0
         # Fixed-shape specializations may fuse the inverse-RoPE epilogue: the
         # last ``inverse_rope_dim`` output lanes are de-rotated in registers
         # right before the store, preserving the former kernel boundary's BF16
@@ -772,19 +775,13 @@ class DSparkAttentionKernel:
             while work_tile.is_valid_tile:
                 blk_coord = work_tile.tile_idx
                 # Construct fixed common/tma_qk/tma_pv params for load_tma
+                end = self.window_end(cache_seqs, blk_coord[2])
                 tma_common_params = SimpleNamespace(
                     blk_coord=blk_coord,
-                    position=cutlass.Int32(cache_seqs[blk_coord[2]]),
-                    window_end=cutlass.Int32(cache_seqs[blk_coord[2]]) % 128,
-                    valid_start=max(
-                        0,
-                        cutlass.Int32(cache_seqs[blk_coord[2]])
-                        - cutlass.Int32(window_valid_lens[blk_coord[2]]),
-                    ),
-                    valid_end=min(
-                        cutlass.Int32(cache_seqs[blk_coord[2]]),
-                        cutlass.Int32(capacities[blk_coord[2]]),
-                    ),
+                    position=end,
+                    window_end=end % 128,
+                    valid_start=max(0, end - cutlass.Int32(window_valid_lens[blk_coord[2]])),
+                    valid_end=min(end, self.window_capacity(capacities, blk_coord[2])),
                     load_q_pipeline=load_q_pipeline,
                     load_kv_pipeline=load_kv_pipeline,
                     sPT=sPT,
@@ -1034,6 +1031,20 @@ class DSparkAttentionKernel:
         return cache_seqs[batch_idx]
 
     @cute.jit
+    def window_end(self, cache_seqs: cute.Tensor, batch_idx: cutlass.Int32) -> cutlass.Int32:
+        """The row past the window's newest entry; a ring start maps into its second alias."""
+        if cutlass.const_expr(self.ring_window > 0):
+            return cutlass.Int32(cache_seqs[batch_idx]) % self.ring_window + (self.ring_window + 1)
+        return cutlass.Int32(cache_seqs[batch_idx])
+
+    @cute.jit
+    def window_capacity(self, capacities: cute.Tensor, batch_idx: cutlass.Int32) -> cutlass.Int32:
+        """The row past which the window holds nothing."""
+        if cutlass.const_expr(self.ring_window > 0):
+            return cutlass.Int32(2 * self.ring_window)
+        return cutlass.Int32(capacities[batch_idx])
+
+    @cute.jit
     def get_window_valid_len(
         self,
         window_valid_lens: cute.Tensor,
@@ -1044,9 +1055,9 @@ class DSparkAttentionKernel:
         """Return the initialized context length, excluding synthetic requests."""
         length = min(
             max(cutlass.Int32(window_valid_lens[batch_idx]), 0),
-            min(128, cutlass.Int32(positions[batch_idx])),
+            min(128, self.window_end(positions, batch_idx)),
         )
-        return length if capacities[batch_idx] > 0 else cutlass.Int32(0)
+        return length if self.window_capacity(capacities, batch_idx) > 0 else cutlass.Int32(0)
 
     @cute.jit
     def get_window_end_pos(
@@ -1054,7 +1065,7 @@ class DSparkAttentionKernel:
     ) -> cutlass.Int32:
         """Return the absolute position stored at the window suffix end."""
         if cutlass.const_expr(self.window_valid_len_from_tensor):
-            return cutlass.Int32(cache_seqs[batch_idx])
+            return self.window_end(cache_seqs, batch_idx)
         return cutlass.Int32(0)
 
     @cute.jit
@@ -1087,18 +1098,25 @@ class DSparkAttentionKernel:
         """Stage physical pages for each context row, then the draft block."""
         batch = common_params.blk_coord[2]
         lane = common_params.tidx % self.threads_per_warp
-        end = cutlass.Int32(common_params.positions[batch])
-        length = cutlass.Int32(common_params.valid_lengths[batch])
-        capacity = cutlass.Int32(common_params.capacities[batch])
         load_pt_pipeline = common_params.load_pt_pipeline
-        load_pt_pipeline.producer_acquire(load_pt_producer_state)
-        for i in cutlass.range_constexpr(4):
-            row = lane + i * 32
-            position = end - 1 - (end - 1 - row + 128) % 128
-            page = cutlass.Int32(-1)
-            if position >= max(0, end - length) and position < capacity:
-                page = common_params.mPT_win[position // self.history_page_size, batch]
-            common_params.sPT[row, load_pt_producer_state.index] = page
+        if cutlass.const_expr(self.ring_window > 0):
+            # Every row of a ring is in its one page; the softmax mask drops the unwritten rows.
+            slot = cutlass.Int32(common_params.mPT_win[0, batch])
+            load_pt_pipeline.producer_acquire(load_pt_producer_state)
+            for i in cutlass.range_constexpr(4):
+                common_params.sPT[lane + i * 32, load_pt_producer_state.index] = slot
+        else:
+            end = self.window_end(common_params.positions, batch)
+            length = cutlass.Int32(common_params.valid_lengths[batch])
+            capacity = self.window_capacity(common_params.capacities, batch)
+            load_pt_pipeline.producer_acquire(load_pt_producer_state)
+            for i in cutlass.range_constexpr(4):
+                row = lane + i * 32
+                position = end - 1 - (end - 1 - row + 128) % 128
+                page = cutlass.Int32(-1)
+                if position >= max(0, end - length) and position < capacity:
+                    page = common_params.mPT_win[position // self.history_page_size, batch]
+                common_params.sPT[row, load_pt_producer_state.index] = page
         load_pt_pipeline.producer_commit(load_pt_producer_state)
         load_pt_producer_state.advance()
 
@@ -1311,11 +1329,17 @@ class DSparkAttentionKernel:
         for row in cutlass.range(start_row, start_row + extent, rows):
             context_row = row_base + row
             page = common_params.sPT[context_row, page_table_stage]
-            position = (
-                common_params.position - 1 - (common_params.position - 1 - context_row + 128) % 128
-            )
+            # A ring's window row r is row r of its page.
+            offset = context_row // rows
             legal = cutlass.Boolean(True)
-            if cutlass.const_expr(rows > 1):
+            if cutlass.const_expr(self.ring_window == 0):
+                position = (
+                    common_params.position
+                    - 1
+                    - (common_params.position - 1 - context_row + 128) % 128
+                )
+                offset = position % self.history_page_size // rows
+            if cutlass.const_expr(rows > 1 and self.ring_window == 0):
                 legal = (page >= 0) & (
                     page == common_params.sPT[context_row + rows - 1, page_table_stage]
                 )
@@ -1345,7 +1369,6 @@ class DSparkAttentionKernel:
                     )
                     legal = not (has_valid | has_wrapped_valid)
             if legal:
-                offset = position % self.history_page_size // rows
                 if cutlass.const_expr(is_k_load):
                     src = gmem[tile][None, offset, head_tile, page]
                     dst = smem[tile][None, row // rows, 0, kv_stage]

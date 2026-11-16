@@ -254,6 +254,7 @@ class DSparkAttention(DSparkAttentionKernel):
         inverse_rope_dim: int = 0,
         history_page_size: int = 32,
         num_heads: int = num_heads,
+        ring: bool = False,
     ):
         if num_heads not in (8, 16, 32, 64, 128):
             raise ValueError(f"DSpark num_heads must be 8, 16, 32, 64 or 128, got {num_heads}")
@@ -279,6 +280,11 @@ class DSparkAttention(DSparkAttentionKernel):
             raise ValueError(
                 f"DSpark history page size must be 16, 32, 64, 128, or 256, got {history_page_size}"
             )
+        if ring and history_page_size != self.window_size:
+            raise ValueError(
+                f"A DSpark ring keeps one {self.window_size}-row page per request, "
+                f"got {history_page_size}"
+            )
         if inverse_rope_dim not in (0, 64):
             raise ValueError(f"DSpark inverse_rope_dim must be 0 or 64, got {inverse_rope_dim}")
 
@@ -301,8 +307,12 @@ class DSparkAttention(DSparkAttentionKernel):
         self.fixed_cache_seq_len = self.window_size + seq_len_q
         self.inverse_rope_dim = inverse_rope_dim
         self.history_page_size = history_page_size
-        # Subdivide the 64-row loads at physical-page and cyclic-window boundaries.
-        self.history_tile_sizes = tuple(sorted({1, 4, 16, min(history_page_size, 64)}))
+        self.ring_window = self.window_size if ring else 0
+        # A ring's one page holds every window row and the softmax mask drops the unwritten ones, so
+        # it loads whole 64-row tiles; other pools subdivide them at page and cyclic-window boundaries.
+        self.history_tile_sizes = (
+            (64,) if ring else tuple(sorted({1, 4, 16, min(history_page_size, 64)}))
+        )
         # 64 heads fill only half of the M128 tile, so two consecutive draft
         # tokens share one tile and its K/V loads, one token per CTA. The FP8
         # output epilogue stores one token per tile.

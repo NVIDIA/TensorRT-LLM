@@ -56,6 +56,7 @@ _DSV4_DSPARK_PAGE_SIZES = (16, 32, 64, 128, 256)
 
 
 _dspark_attention_kernel_cache: dict[tuple[int, int, int, str], Callable[..., None]] = {}
+_dspark_ring_attention_kernel_cache: dict[tuple[int, int, int, str], Callable[..., None]] = {}
 
 
 def _make_compile_gmem_pointer(dtype: Type[Numeric], assumed_align: int) -> Pointer:
@@ -73,6 +74,7 @@ def _compile_dspark_attention(
     arch_str: str,
     page_size: int,
     num_heads: int,
+    ring: bool = False,
 ) -> Callable[..., None]:
     """Compile the pointer host wrapper without runtime tensor specimens."""
     head_dim = _DSV4_DSPARK_HEAD_DIM
@@ -105,8 +107,10 @@ def _compile_dspark_attention(
         arch_str=arch_str,
         history_page_size=page_size,
         num_heads=num_heads,
+        ring=ring,
     )
-    # Scalars and typed, aligned compile-only pointers define the runtime ABI.
+    # Scalars and typed, aligned compile-only pointers define the runtime ABI; a ring's page table
+    # is the INT64 slot vector.
     # ``output_fake`` keeps one tensor argument for TVM-FFI environment-stream
     # detection without tying compilation to a real worker buffer.
     compiled = cute.compile(
@@ -119,7 +123,11 @@ def _compile_dspark_attention(
         _make_compile_gmem_pointer(cutlass.BFloat16, 16),
         _make_compile_gmem_pointer(cutlass.BFloat16, 16),
         _make_compile_gmem_pointer(cutlass.BFloat16, 16),
-        _make_compile_gmem_pointer(cutlass.Int32, 4),
+        (
+            _make_compile_gmem_pointer(cutlass.Int64, 8)
+            if ring
+            else _make_compile_gmem_pointer(cutlass.Int32, 4)
+        ),
         _make_compile_gmem_pointer(cutlass.Int64, 8),
         _make_compile_gmem_pointer(cutlass.Int64, 8),
         _make_compile_gmem_pointer(cutlass.Int64, 8),
@@ -137,22 +145,14 @@ def _compile_dspark_attention(
     return compiled
 
 
-@torch.library.custom_op(
-    "trtllm::fused_dsv4_dspark_attention", mutates_args=(), device_types="cuda"
-)
-def fused_dsv4_dspark_attention(
+def _check_dspark_attention_inputs(
     q: torch.Tensor,
     draft_block: torch.Tensor,
     kv_pages: torch.Tensor,
-    block_tables: torch.Tensor,
-    positions: torch.Tensor,
-    valid_lengths: torch.Tensor,
-    capacities: torch.Tensor,
     attn_sink: torch.Tensor,
     inverse_rope_freqs: torch.Tensor,
-    softmax_scale: float,
-) -> torch.Tensor:
-    """Attend to a 128-token context window and fuse the inverse-RoPE epilogue."""
+) -> tuple[str, int]:
+    """Validate the inputs both DSpark attention ops share; returns the arch and page size."""
     arch_str = _get_dspark_arch_str()
     if arch_str is None:
         raise RuntimeError("Embedded DSpark attention requires SM100, SM103, or SM107")
@@ -184,23 +184,6 @@ def fused_dsv4_dspark_attention(
         raise ValueError(
             f"DSpark draft KV must have shape {expected_draft_shape}, got {tuple(draft_block.shape)}"
         )
-    if block_tables.dtype != torch.int32 or block_tables.stride(1) != 1:
-        raise ValueError(
-            "DSpark page tables must have contiguous INT32 rows, got "
-            f"{block_tables.dtype} with strides {block_tables.stride()}"
-        )
-    if block_tables.shape[0] != batch:
-        raise ValueError(f"DSpark page tables must have {batch} rows, got {block_tables.shape[0]}")
-    for name, value in (
-        ("positions", positions),
-        ("valid lengths", valid_lengths),
-        ("capacities", capacities),
-    ):
-        if value.dtype != torch.int64 or value.shape != (batch,) or not value.is_contiguous():
-            raise ValueError(
-                f"DSpark {name} must be a contiguous INT64 [{batch}] vector, got "
-                f"{value.dtype} {tuple(value.shape)} with strides {value.stride()}"
-            )
     if attn_sink.dtype != torch.float32 or attn_sink.shape != (heads,):
         raise ValueError(
             f"DSpark attention sink must be FP32 [{heads}], got "
@@ -228,6 +211,46 @@ def fused_dsv4_dspark_attention(
     for value in (q, draft_block, attn_sink, inverse_rope_freqs):
         if not value.is_contiguous():
             raise ValueError("DSpark query, draft, sink and frequencies must be contiguous")
+    return arch_str, page_size
+
+
+@torch.library.custom_op(
+    "trtllm::fused_dsv4_dspark_attention", mutates_args=(), device_types="cuda"
+)
+def fused_dsv4_dspark_attention(
+    q: torch.Tensor,
+    draft_block: torch.Tensor,
+    kv_pages: torch.Tensor,
+    block_tables: torch.Tensor,
+    positions: torch.Tensor,
+    valid_lengths: torch.Tensor,
+    capacities: torch.Tensor,
+    attn_sink: torch.Tensor,
+    inverse_rope_freqs: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    """Attend to a 128-token context window and fuse the inverse-RoPE epilogue."""
+    arch_str, page_size = _check_dspark_attention_inputs(
+        q, draft_block, kv_pages, attn_sink, inverse_rope_freqs
+    )
+    batch, block, heads, _ = q.shape
+    if block_tables.dtype != torch.int32 or block_tables.stride(1) != 1:
+        raise ValueError(
+            "DSpark page tables must have contiguous INT32 rows, got "
+            f"{block_tables.dtype} with strides {block_tables.stride()}"
+        )
+    if block_tables.shape[0] != batch:
+        raise ValueError(f"DSpark page tables must have {batch} rows, got {block_tables.shape[0]}")
+    for name, value in (
+        ("positions", positions),
+        ("valid lengths", valid_lengths),
+        ("capacities", capacities),
+    ):
+        if value.dtype != torch.int64 or value.shape != (batch,) or not value.is_contiguous():
+            raise ValueError(
+                f"DSpark {name} must be a contiguous INT64 [{batch}] vector, got "
+                f"{value.dtype} {tuple(value.shape)} with strides {value.stride()}"
+            )
     if not all(
         value.is_cuda and value.device == q.device
         for value in (
@@ -281,6 +304,101 @@ def _(
     positions: torch.Tensor,
     valid_lengths: torch.Tensor,
     capacities: torch.Tensor,
+    attn_sink: torch.Tensor,
+    inverse_rope_freqs: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    return torch.empty_like(q)
+
+
+@torch.library.custom_op(
+    "trtllm::fused_dsv4_dspark_ring_attention", mutates_args=(), device_types="cuda"
+)
+def fused_dsv4_dspark_ring_attention(
+    q: torch.Tensor,
+    draft_block: torch.Tensor,
+    kv_pages: torch.Tensor,
+    slots: torch.Tensor,
+    start_pos: torch.Tensor,
+    valid_len: torch.Tensor,
+    attn_sink: torch.Tensor,
+    inverse_rope_freqs: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    """:func:`fused_dsv4_dspark_attention` over rolling windows: request ``b`` keeps its window in
+    page ``slots[b]``, ``valid_len[b]`` rows written and the newest at ``start_pos[b] % 128``. The
+    kernel derives the page table and positions itself, so no metadata is built per step. It loads
+    whole pages and masks the unwritten rows, which must therefore hold finite values."""
+    arch_str, page_size = _check_dspark_attention_inputs(
+        q, draft_block, kv_pages, attn_sink, inverse_rope_freqs
+    )
+    batch, block, heads, _ = q.shape
+    if page_size != _DSV4_DSPARK_WINDOW_SIZE:
+        raise ValueError(
+            f"A DSpark ring keeps one {_DSV4_DSPARK_WINDOW_SIZE}-row page per request, "
+            f"got {page_size}"
+        )
+    for name, value in (
+        ("slots", slots),
+        ("start positions", start_pos),
+        ("valid lengths", valid_len),
+    ):
+        if value.dtype != torch.int64 or value.shape != (batch,) or not value.is_contiguous():
+            raise ValueError(
+                f"DSpark ring {name} must be a contiguous INT64 [{batch}] vector, got "
+                f"{value.dtype} {tuple(value.shape)} with strides {value.stride()}"
+            )
+    if not all(
+        value.is_cuda and value.device == q.device
+        for value in (
+            q,
+            draft_block,
+            kv_pages,
+            slots,
+            start_pos,
+            valid_len,
+            attn_sink,
+            inverse_rope_freqs,
+        )
+    ):
+        raise ValueError("All DSpark attention inputs must be on the same CUDA device")
+    cache_key = (block, heads, page_size, arch_str)
+    compiled = _dspark_ring_attention_kernel_cache.get(cache_key)
+    if compiled is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("DSpark ring attention must run eagerly before graph capture")
+        compiled = _compile_dspark_attention(block, arch_str, page_size, heads, ring=True)
+        _dspark_ring_attention_kernel_cache[cache_key] = compiled
+    output = torch.empty_like(q)
+    compiled(
+        batch,
+        kv_pages.shape[0],
+        kv_pages.stride(0),
+        1,
+        1,
+        q.data_ptr(),
+        kv_pages.data_ptr(),
+        draft_block.data_ptr(),
+        slots.data_ptr(),
+        start_pos.data_ptr(),
+        valid_len.data_ptr(),
+        valid_len.data_ptr(),  # The ring's capacity is a kernel constant.
+        attn_sink.data_ptr(),
+        inverse_rope_freqs.data_ptr(),
+        output,
+        softmax_scale,
+    )
+    return output
+
+
+@torch.library.register_fake("trtllm::fused_dsv4_dspark_ring_attention")
+def _(
+    q: torch.Tensor,
+    draft_block: torch.Tensor,
+    kv_pages: torch.Tensor,
+    slots: torch.Tensor,
+    start_pos: torch.Tensor,
+    valid_len: torch.Tensor,
     attn_sink: torch.Tensor,
     inverse_rope_freqs: torch.Tensor,
     softmax_scale: float,
@@ -503,7 +621,7 @@ def warmup_fused_dsv4_dspark_attention(block_size: int, eps: float, num_heads: i
             )
             slots = torch.zeros((batch,), dtype=torch.int64, device=device)
             start_pos = torch.zeros((batch,), dtype=torch.int64, device=device)
-            slots_i32, cache_seqs = cute_dsl_dspark_rmsnorm_rope_cache_write(
+            cute_dsl_dspark_rmsnorm_rope_cache_write(
                 main_x,
                 weight,
                 main_freqs,
@@ -518,14 +636,13 @@ def warmup_fused_dsv4_dspark_attention(block_size: int, eps: float, num_heads: i
                 block_freqs,
                 eps,
             )
-            fused_dsv4_dspark_attention(
+            fused_dsv4_dspark_ring_attention(
                 q,
                 draft_block,
                 kv_cache,
-                slots_i32[:, None],
-                cache_seqs.to(torch.int64),
+                slots,
+                start_pos,
                 torch.zeros((batch,), dtype=torch.int64, device=device),
-                torch.full((batch,), _DSV4_DSPARK_WINDOW_SIZE, dtype=torch.int64, device=device),
                 torch.zeros((num_heads,), dtype=torch.float32, device=device),
                 block_freqs.view(
                     batch,

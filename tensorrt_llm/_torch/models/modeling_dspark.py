@@ -114,7 +114,6 @@ from ..modules.multi_stream_utils import private_stream
 from ..modules.mxfp8_draft_head import quantize_mxfp8_rows
 from ..modules.rms_norm import RMSNorm
 from ..pyexecutor.config_utils import MINIMAX_DSPARK_DRAFT_ARCH, is_mla
-from ..speculative.dspark_ring_metadata import dspark_ring_metadata
 from ..speculative.interface import SpeculativeDecodingMode
 from ..speculative.spec_tail_kernels import DraftBlockPlacement
 from ..speculative.vocab_parallel import markov_chain_logits
@@ -151,7 +150,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
     from ..attention.kernels.blackwell.dspark import tp_argmax
     from ..attention.kernels.blackwell.dspark.generation_prepare import dspark_draft_block_inputs
     from ..custom_ops.dspark_attention_custom_op import (
-        fused_dsv4_dspark_attention,
+        fused_dsv4_dspark_ring_attention,
         is_dsv4_dspark_attention_config_supported,
         is_fused_dsv4_dspark_attention_supported,
     )
@@ -676,32 +675,6 @@ def dspark_attention_forward(
     )
 
 
-def _dspark_ring_attention_metadata(
-    slots: torch.Tensor,
-    start_pos: torch.Tensor,
-    valid_len: torch.Tensor,
-    window_size: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Map a rolling window to two aliases of the same physical page.
-
-    The paged kernel reads rows ``[end - 128, end)`` of a ``2 * window_size``
-    ring. Both page-table columns alias the request's one ``window_size``-row page
-    (the page size must equal the kernel's 128-row window), and ``end`` is shifted
-    by ``window_size`` so every window row lands in one of the two aliases and the
-    kernel's ``min(128, position)`` bound never truncates ``valid_len``. Capacity
-    ``2 * window_size`` keeps the capacity mask from dropping rows.
-    """
-    if slots.is_cuda:
-        return dspark_ring_metadata(slots, start_pos, valid_len, window_size)
-    slots_i32 = slots.to(torch.int32)
-    return (
-        torch.stack((slots_i32, slots_i32), dim=1),
-        start_pos.to(torch.int64).remainder(window_size) + window_size + 1,
-        valid_len.to(torch.int64),
-        torch.full_like(start_pos, 2 * window_size, dtype=torch.int64),
-    )
-
-
 def _prepare_dspark_attention_rope(
     start_pos: torch.Tensor, block_size: int, freqs_cis: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -746,9 +719,6 @@ def dspark_attention_forward_batched(
     use_fused_output_projection: Optional[bool] = None,
     use_fused_qkv_input_projection: bool = False,
     use_fused_q_input_projection: bool = False,
-    ring_attention_metadata: Optional[
-        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
-    ] = None,
 ) -> torch.Tensor:
     """Batched, CUDA-graph-safe captured-context DSpark draft attention.
 
@@ -875,10 +845,6 @@ def dspark_attention_forward_batched(
         )
     )
     if fused:
-        if ring_attention_metadata is None:
-            ring_attention_metadata = _dspark_ring_attention_metadata(
-                slots, start_pos, valid_len, window_size
-            )
         with torch.cuda.stream(side) if on_gpu else nullcontext():
             # The preparation kernels consume compact rows; fused QKV projections
             # return strided views into the shared projection output.
@@ -912,15 +878,13 @@ def dspark_attention_forward_batched(
             ):
                 tensor.record_stream(side)
             draft_block.record_stream(main)
-        block_tables, positions, valid_lengths, capacities = ring_attention_metadata
-        o = fused_dsv4_dspark_attention(
+        o = fused_dsv4_dspark_ring_attention(
             q,
             draft_block,
             write_target,
-            block_tables,
-            positions,
-            valid_lengths,
-            capacities,
+            slots,
+            start_pos,
+            valid_len,
             attn_sink,
             inverse_rope_freqs,
             softmax_scale,
@@ -1021,9 +985,6 @@ def dspark_attention_forward_tp(
     kv_norm_w: torch.Tensor,
     eps: float,
     softmax_scale: float,
-    ring_attention_metadata: Optional[
-        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
-    ] = None,
 ) -> torch.Tensor:
     """Captured-context draft attention on this rank's head shard; returns the TP partial sum.
 
@@ -1036,8 +997,7 @@ def dspark_attention_forward_tp(
     scales) and the row-parallel ``wo_b``. The small-M GEMMs dequantize the E4M3 weights exactly
     in registers (BF16 activations, FP32 accumulation). Each request's main-KV frame is written
     as in the replicated path (``wkv`` is the stage's BF16 copy). The caller reduces the returned
-    ``[G, block, hidden]`` partial across the TP group. ``ring_attention_metadata`` maps the
-    rolling windows to the paged kernel's inputs (:func:`_dspark_ring_attention_metadata`).
+    ``[G, block, hidden]`` partial across the TP group.
     """
     from ..modules.low_m_gemm import fp8_grouped_lowm, mxfp8_linear_scale, mxfp8_lowm_linear
 
@@ -1076,19 +1036,13 @@ def dspark_attention_forward_tp(
     for tensor in (main_x, slots, start_pos, kv):
         tensor.record_stream(side)
     draft_block.record_stream(main)
-    if ring_attention_metadata is None:
-        ring_attention_metadata = _dspark_ring_attention_metadata(
-            slots, start_pos, valid_len, kv_window.shape[1]
-        )
-    block_tables, positions, valid_lengths, capacities = ring_attention_metadata
-    o = fused_dsv4_dspark_attention(
+    o = fused_dsv4_dspark_ring_attention(
         q.view(g, block, attn.num_heads_tp, head_dim),
         draft_block,
         kv_window,
-        block_tables,
-        positions,
-        valid_lengths,
-        capacities,
+        slots,
+        start_pos,
+        valid_len,
         attn.attn_sink,
         step.inverse_rope_freqs,
         softmax_scale,
@@ -2728,9 +2682,6 @@ class DSv4DSparkDraftModel(nn.Module):
         tp_step: Optional[DSparkTPAttentionStep] = None,
         deferred_in: Optional[DSparkDeferredMoe] = None,
         defer_out: bool = False,
-        ring_attention_metadata: Optional[
-            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
-        ] = None,
     ) -> (
         torch.Tensor
         | tuple[torch.Tensor, torch.Tensor]
@@ -2844,7 +2795,6 @@ class DSv4DSparkDraftModel(nn.Module):
                 kv_norm_w=stage._dspark_attn["kv_norm_w"],
                 eps=self._attn_params["eps"],
                 softmax_scale=self._attn_params["softmax_scale"],
-                ring_attention_metadata=ring_attention_metadata,
             )
             if split:
                 attn_allreduce = stage._mhc_fused_allreduce()
@@ -2862,7 +2812,6 @@ class DSv4DSparkDraftModel(nn.Module):
                 kv_cache,
                 slots,
                 valid_len=valid_len,
-                ring_attention_metadata=ring_attention_metadata,
                 freqs_cis=freqs_cis,
                 persist=True,
                 rope_metadata=rope_metadata,
@@ -3131,13 +3080,6 @@ class DSv4DSparkDraftModel(nn.Module):
             tp_step = self._tp_attention_step(rope_metadata)
         defer = self._fuses_moe_boundary(x.shape[0] * self.block_size) and not return_confidence
 
-        ring_attention_metadata = (
-            _dspark_ring_attention_metadata(
-                slots, start_pos, valid_len, int(self._attn_params["window_size"])
-            )
-            if valid_len is not None and IS_CUTLASS_DSL_AVAILABLE
-            else None
-        )
         h = x
         deferred = None
         for s, stage in enumerate(self.mtp_layers):
@@ -3158,7 +3100,6 @@ class DSv4DSparkDraftModel(nn.Module):
                 tp_step=tp_step,
                 deferred_in=deferred,
                 defer_out=defer,
-                ring_attention_metadata=ring_attention_metadata,
             )
             if defer:
                 h, pre_mix, deferred = h

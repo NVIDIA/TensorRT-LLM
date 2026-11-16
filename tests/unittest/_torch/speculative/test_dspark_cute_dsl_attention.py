@@ -263,6 +263,37 @@ def test_fused_dsv4_dspark_attention_matches_reference(heads, block, page_size):
     torch.testing.assert_close(inputs["kv_pages"], original_cache, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("heads,block", ((64, 5), (128, 6)))
+def test_ring_attention_matches_aliased_page_table(heads, block):
+    """The ring op equals the generic op on a table that aliases each request's page twice."""
+    torch.manual_seed(41)
+    start_pos = torch.tensor([0, 5, 127, 128, 129, 200, 255, 390], device="cuda")
+    valid_len = torch.tensor([0, 6, 128, 128, 1, 73, 128, 32], device="cuda")
+    batch = start_pos.numel()
+    slots = torch.randperm(batch + 2, device="cuda")[:batch]
+    freqs = dspark.precompute_dspark_freqs_cis(_ROPE_DIM, 1024, device="cuda")
+    block_freqs = freqs[start_pos[:, None] + 1 + torch.arange(block, device="cuda")]
+    common = dict(
+        q=torch.randn(batch, block, heads, 512, device="cuda", dtype=torch.bfloat16),
+        draft_block=torch.randn(batch, 8, 512, device="cuda", dtype=torch.bfloat16),
+        kv_pages=torch.randn(batch + 2, 128, 512, device="cuda", dtype=torch.bfloat16),
+        attn_sink=torch.randn(heads, device="cuda"),
+        inverse_rope_freqs=torch.view_as_real(block_freqs).contiguous(),
+        softmax_scale=512**-0.5,
+    )
+    expected = attention_op.fused_dsv4_dspark_attention(
+        block_tables=slots.int()[:, None].repeat(1, 2),
+        positions=start_pos % 128 + 129,
+        valid_lengths=valid_len,
+        capacities=torch.full_like(start_pos, 256),
+        **common,
+    )
+    actual = attention_op.fused_dsv4_dspark_ring_attention(
+        slots=slots, start_pos=start_pos, valid_len=valid_len, **common
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize(
     "heads,page_size,batch_repeats",
     [(64, 32, 1), (128, 64, 1), (128, 256, 1), (128, 64, 64)],
@@ -805,12 +836,12 @@ def test_warmup_uses_configured_head_count(monkeypatch, num_heads):
     )
     calls = []
 
-    def attention(q, draft, cache, tables, positions, lengths, capacities, sink, freqs, scale):
+    def attention(q, draft, cache, slots, start_pos, lengths, sink, freqs, scale):
         assert q.shape == (1, 5, num_heads, 512)
         assert sink.shape == (num_heads,)
         calls.append(num_heads)
 
-    monkeypatch.setattr(attention_op, "fused_dsv4_dspark_attention", attention)
+    monkeypatch.setattr(attention_op, "fused_dsv4_dspark_ring_attention", attention)
     attention_op.warmup_fused_dsv4_dspark_attention(5, 1e-6, num_heads)
     assert calls == [num_heads]
 
@@ -865,9 +896,8 @@ def test_production_ring_fused_qkv_layout_numbers_and_graph(monkeypatch, batch, 
         assert not main_view.is_contiguous()
 
     def run(target):
-        metadata = dspark._dspark_ring_attention_metadata(slots, start, lengths, window)
         return dspark.dspark_attention_forward_batched(
-            x, main, start, target, slots, lengths, ring_attention_metadata=metadata, **kwargs
+            x, main, start, target, slots, lengths, **kwargs
         )
 
     # The actual source fallback computes the oracle; only path selection changes.
@@ -976,7 +1006,7 @@ def test_dspark_attention_forward_batched_matches_scalar_reference(
         "draft_block": 0,
         "rmsnorm_rope": 0,
     }
-    op_attention = dspark_attention.fused_dsv4_dspark_attention
+    op_attention = dspark_attention.fused_dsv4_dspark_ring_attention
     op_cache_write = dspark_attention.cute_dsl_dspark_rmsnorm_rope_cache_write
     op_draft_block = dspark_attention.cute_dsl_dspark_rmsnorm_rope_draft_block
     op_rmsnorm_rope = dspark_attention.cute_dsl_dspark_rmsnorm_rope
@@ -998,7 +1028,7 @@ def test_dspark_attention_forward_batched_matches_scalar_reference(
         return op_rmsnorm_rope(*args)
 
     with monkeypatch.context() as patch:
-        patch.setattr(dspark_attention, "fused_dsv4_dspark_attention", counted_attention)
+        patch.setattr(dspark_attention, "fused_dsv4_dspark_ring_attention", counted_attention)
         patch.setattr(
             dspark_attention,
             "cute_dsl_dspark_rmsnorm_rope_cache_write",
