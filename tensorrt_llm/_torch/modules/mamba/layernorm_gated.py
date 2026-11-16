@@ -134,13 +134,23 @@ def _layer_norm_fwd_1pass_kernel(
     tl.store(Y + cols, y.to(Y.dtype.element_ty), mask=mask)
 
 
-# Rows per program of the multi-row gated-RMSNorm kernel. At the GDN decode
+# Rows per tile of the multi-row gated-RMSNorm kernel. At the GDN decode
 # shape (thousands of 128-element rows) one row per CTA leaves the kernel
 # launch-limited; 4 rows with 4 warps reproduces the single-row kernel's
-# reduction order (bitwise-identical output) at ~2x the throughput.
+# reduction order (bitwise-identical output) at ~2x the throughput. Shorter
+# rows take taller tiles, so every thread loads whole 16-byte vectors of x and
+# z; those may differ from the single-row kernel by rounding. The tile depends
+# only on the row length and dtype, never on the number of rows, so a row's
+# output does not depend on what else is in the batch.
 _MULTIROW_ROWS = 4
 _MULTIROW_NUM_WARPS = 4
 _MULTIROW_MAX_N = 256
+
+
+def _multirow_rows(N: int, element_size: int) -> int:
+    """Rows per tile of the multi-row kernel for rows of N elements."""
+    num_threads = 32 * _MULTIROW_NUM_WARPS
+    return max(_MULTIROW_ROWS, num_threads * (16 // element_size) // N)
 
 
 @functools.lru_cache(maxsize=None)
@@ -314,7 +324,8 @@ def _rms_norm_gated_fwd_multirow_kernel(
 
 
 # Tiles per program of rms_norm_gated_token_major from _MULTIROW_GROUPS_MIN_ROWS
-# rows (prefill-sized inputs).
+# rows (prefill-sized inputs), for 4-row tiles only; taller tiles run one per
+# program.
 _MULTIROW_GROUPS = 4
 _MULTIROW_GROUPS_MIN_ROWS = 1 << 16
 
@@ -326,7 +337,7 @@ _multirow_variants_with_siblings = set()
 def _compile_multirow_siblings(args, kwargs, device_index, launched=None):
     """Compile the multi-row kernel for args and kwargs (which fix GROUPS) with
     every reachable pair of LAUNCH_WITH_PDL and EVEN but ``launched``."""
-    rows_per_program = _MULTIROW_ROWS * kwargs["GROUPS"]
+    rows_per_program = kwargs["ROWS"] * kwargs["GROUPS"]
     # PDL runs only below one wave of programs, which the grids from
     # _MULTIROW_GROUPS_MIN_ROWS rows may never be.
     min_rows = 1 if kwargs["GROUPS"] == 1 else _MULTIROW_GROUPS_MIN_ROWS
@@ -357,7 +368,7 @@ def _launch_multirow_kernel(x,
                             **kwargs) -> None:
     """Gated RMSNorm of x's rows into y with the multi-row kernel.
 
-    ``grouped`` lets each program run _MULTIROW_GROUPS row tiles from
+    ``grouped`` lets each program run _MULTIROW_GROUPS 4-row tiles from
     _MULTIROW_GROUPS_MIN_ROWS rows. ``early_trigger`` releases PDL dependents
     at the start of each program where PDL is allowed (EARLY_TRIGGER).
     ``kwargs`` are the call's remaining constexprs (HEADS_PER_TOK,
@@ -381,9 +392,10 @@ def _launch_multirow_kernel(x,
     from this launch's, the siblings include the one-token launches.
     """
     M, N = x.shape
-    groups = (_MULTIROW_GROUPS
-              if grouped and M >= _MULTIROW_GROUPS_MIN_ROWS else 1)
-    rows_per_program = _MULTIROW_ROWS * groups
+    rows = _multirow_rows(N, x.element_size())
+    groups = (_MULTIROW_GROUPS if grouped and M >= _MULTIROW_GROUPS_MIN_ROWS
+              and rows == _MULTIROW_ROWS else 1)
+    rows_per_program = rows * groups
     grid = (triton.cdiv(M, rows_per_program), )
     device_index = x.device.index
     launch_with_pdl = _multirow_pdl(grid[0], device_index)
@@ -393,7 +405,7 @@ def _launch_multirow_kernel(x,
     args = (x, y, weight, z, rstd, fp8_scale, stride_x, stride_y, z.stride(0),
             M, eps)
     kwargs.update(N=N,
-                  ROWS=_MULTIROW_ROWS,
+                  ROWS=rows,
                   GROUPS=groups,
                   CONTIG=(stride_x == N and stride_y == N),
                   EARLY_TRIGGER=early_trigger,
