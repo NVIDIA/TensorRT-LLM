@@ -16,7 +16,7 @@
 """Split a QA list into 1–4, 5–8 and 9–16 GPU lists by reading source markers.
 
     python scripts/split_qa_by_gpu.py --test-list \
-        tests/integration/test_lists/qa/llm_function_core.txt --out-dir out/
+        tests/integration/test_lists/qa/functional/llm_function_core.txt --out-dir out/
 
 Unmarked cases require one GPU. GPU demand is the larger of the closest
 ``skip_less_device`` and ``skip_less_mpi_world_size`` bounds, assuming one MPI
