@@ -5,6 +5,7 @@ import copy
 import inspect
 import os
 import sys
+import time
 import traceback
 import warnings
 from contextlib import AbstractContextManager, contextmanager
@@ -34,7 +35,9 @@ from tensorrt_llm._torch.weight_sharing import (
     PostTransformRuntimeConstraints, PostTransformTransferScope, SourceIdentity,
     WeightManifestWriteResult, check_weight_sharing_compatibility,
     maybe_write_weight_manifest)
-from tensorrt_llm._utils import get_sm_version, str_dtype_to_torch
+from tensorrt_llm._utils import (ENABLE_MULTI_DEVICE, get_sm_version,
+                                 local_mpi_barrier, local_mpi_rank,
+                                 mpi_disabled, str_dtype_to_torch)
 from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                           ExecutorMemoryType,
@@ -52,6 +55,8 @@ from tensorrt_llm.quantization.utils.fp4_utils import float4_e2m1x2
 from ...llmapi.llm_args import CheckpointIOPolicy, LoadFormat
 from .._experimental.modeling_v2 import modeling_v2_resolve_on_all_ranks
 from ..locality_domain.policy import LocalityDomainPolicy
+from ..mmap_utils import (release_file_page_cache,
+                          wait_for_page_migration_to_settle)
 from ..model_config import ModelConfig
 from ..models import AutoModelForCausalLM
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
@@ -866,6 +871,46 @@ def _reject_dense_dwdp_update(model: torch.nn.Module, action: str) -> None:
             "this model's dense weights into staging slots shared across "
             "layers, so they cannot be rewritten in place. Launch without "
             "dwdp_config.enable_dense to update weights.")
+
+
+_RELEASE_CHECKPOINT_PAGE_CACHE_ENV = "TRTLLM_RELEASE_CHECKPOINT_PAGE_CACHE"
+
+
+def release_checkpoint_page_cache(checkpoint_dir: str) -> None:
+    """Drop the checkpoint's page cache once every rank on this node has loaded it.
+
+    Opt-in with ``TRTLLM_RELEASE_CHECKPOINT_PAGE_CACHE=1``. The weights are on the
+    GPU at this point. Left cached, the files are dropped later, at a time the
+    process does not choose, and the kernel's compaction of the freed memory then
+    stalls the server's host threads while it serves. Dropping them here, and
+    waiting for the page migration that follows to settle, moves both into
+    startup. A later restart reads the checkpoint from storage again.
+    """
+    if os.environ.get(_RELEASE_CHECKPOINT_PAGE_CACHE_ENV, "0") != "1":
+        return
+    if not checkpoint_dir or not os.path.isdir(checkpoint_dir):
+        return
+    if ENABLE_MULTI_DEVICE and mpi_disabled():
+        logger.warning(
+            f"{_RELEASE_CHECKPOINT_PAGE_CACHE_ENV}=1 is ignored without MPI, which "
+            "tells when every rank on the node has finished reading.")
+        return
+    # Every rank on a node reads the same files: drop them from one rank, after
+    # the last one has finished reading.
+    local_mpi_barrier()
+    if local_mpi_rank() == 0:
+        files = [
+            entry.path for entry in os.scandir(checkpoint_dir)
+            if entry.is_file()
+        ]
+        start = time.monotonic()
+        released = release_file_page_cache(files)
+        release_seconds = time.monotonic() - start
+        waited = wait_for_page_migration_to_settle()
+        logger.info(f"Released the page cache of {len(files)} checkpoint files "
+                    f"({released / 2**30:.1f} GiB) in {release_seconds:.1f} s; "
+                    f"page migration settled after {waited:.1f} s")
+    local_mpi_barrier()
 
 
 class ModelLoaderMetricNames(Enum):
@@ -1877,6 +1922,9 @@ class ModelLoader:
             self._metrics[ModelLoaderMetricNames.WEIGHT_MANIFEST_SECONDS.
                           value] = (manifest_result.build_seconds +
                                     manifest_result.write_seconds)
+
+        if load_format in (LoadFormat.AUTO, LoadFormat.GMS):
+            release_checkpoint_page_cache(checkpoint_dir)
 
         metrics = ", ".join(f"{name}={value:.4f}"
                             for name, value in self._metrics.items())

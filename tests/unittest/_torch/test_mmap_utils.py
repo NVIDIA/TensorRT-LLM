@@ -13,12 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import itertools
 import mmap
 import os
 
 import pytest
 
-from tensorrt_llm._torch.mmap_utils import populate_file_pages
+from tensorrt_llm._torch import mmap_utils
+from tensorrt_llm._torch.mmap_utils import (
+    populate_file_pages,
+    release_file_page_cache,
+    wait_for_page_migration_to_settle,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -58,3 +64,36 @@ def test_populate_file_pages_empty_and_missing_files(tmp_path):
     empty.touch()
     assert populate_file_pages(str(empty), mmap.PAGESIZE) == 0
     assert populate_file_pages(str(tmp_path / "missing.bin"), mmap.PAGESIZE) == 0
+
+
+def test_release_file_page_cache_counts_the_advised_files(tmp_path):
+    first = tmp_path / "a.safetensors"
+    second = tmp_path / "b.safetensors"
+    first.write_bytes(b"x" * 3000)
+    second.write_bytes(b"y" * 5000)
+
+    paths = [str(first), str(tmp_path / "missing.safetensors"), str(second)]
+    assert release_file_page_cache(paths) == 8000
+
+
+def test_wait_for_page_migration_to_settle_returns_once_quiet(monkeypatch):
+    monkeypatch.setattr(mmap_utils, "_migrated_pages", lambda: 100)
+
+    waited = wait_for_page_migration_to_settle(max_wait_s=10.0, quiet_s=0.05, poll_s=0.01)
+
+    assert 0.05 <= waited < 10.0
+
+
+def test_wait_for_page_migration_to_settle_is_bounded(monkeypatch):
+    migrated = itertools.count(step=10**6)
+    monkeypatch.setattr(mmap_utils, "_migrated_pages", lambda: next(migrated))
+
+    waited = wait_for_page_migration_to_settle(max_wait_s=0.05, quiet_s=10.0, poll_s=0.01)
+
+    assert 0.05 <= waited < 10.0
+
+
+def test_wait_for_page_migration_to_settle_without_vmstat(monkeypatch):
+    monkeypatch.setattr(mmap_utils, "_migrated_pages", lambda: None)
+
+    assert wait_for_page_migration_to_settle() == 0.0

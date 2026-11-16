@@ -2215,7 +2215,11 @@ class ServerConfig:
         return cmd
 
     def to_env(self) -> Dict[str, str]:
-        return to_env_dict(self.env_vars)
+        # Drop each checkpoint's page cache during startup, so the file system
+        # does not drop it, and the kernel compact memory, during a measurement.
+        env = {"TRTLLM_RELEASE_CHECKPOINT_PAGE_CACHE": "1"}
+        env.update(to_env_dict(self.env_vars))
+        return env
 
     def to_db_data(self) -> dict:
         """Convert ServerConfig to database data."""

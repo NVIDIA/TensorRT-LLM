@@ -26,7 +26,8 @@ import ctypes
 import errno as errno_codes
 import mmap
 import os
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Iterable
 
 __all__ = [
     "madvise_range",
@@ -269,3 +270,68 @@ def advise_tensor_pageout(tensor, mode: str = "dontneed"):
 
     # madvise only the complete pages fully inside the tensor's bounds.
     madvise_range(start_aligned, end_aligned - start_aligned, mode)
+
+
+def release_file_page_cache(paths: Iterable[str]) -> int:
+    """Drop the page cache of ``paths`` with ``posix_fadvise(POSIX_FADV_DONTNEED)``.
+
+    Returns the total size in bytes of the files that were advised. The kernel
+    keeps pages that are dirty or still mapped by a process.
+    """
+    released = 0
+    for path in paths:
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+        except OSError:
+            continue
+        try:
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            released += os.fstat(fd).st_size
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+    return released
+
+
+def _migrated_pages() -> int | None:
+    try:
+        with open("/proc/vmstat") as vmstat:
+            for line in vmstat:
+                if line.startswith("pgmigrate_success "):
+                    return int(line.split()[1])
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def wait_for_page_migration_to_settle(
+    max_wait_s: float = 120.0,
+    quiet_s: float = 5.0,
+    poll_s: float = 0.5,
+    max_pages_per_s: float = 2000.0,
+) -> float:
+    """Wait until the kernel has stopped migrating pages, or ``max_wait_s`` passes.
+
+    Freeing a large page cache at once leaves free memory fragmented, and the
+    kernel compacts it by migrating in-use pages. A thread that touches a page
+    under migration blocks until the copy finishes. Polls ``pgmigrate_success``
+    in ``/proc/vmstat`` until it grows by at most ``max_pages_per_s`` for
+    ``quiet_s`` seconds. Returns the seconds waited, 0 where it cannot be read.
+    """
+    start = time.monotonic()
+    previous = _migrated_pages()
+    if previous is None:
+        return 0.0
+    quiet_since = start
+    while True:
+        time.sleep(poll_s)
+        now = time.monotonic()
+        current = _migrated_pages()
+        if current is None:
+            return now - start
+        if (current - previous) / poll_s > max_pages_per_s:
+            quiet_since = now
+        previous = current
+        if now - quiet_since >= quiet_s or now - start >= max_wait_s:
+            return now - start
