@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 import torch
 
+from tensorrt_llm._errors import UnsupportedError
 from tensorrt_llm.inputs.media_io import MEDIA_IO_REGISTRY, MediaModality
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
@@ -24,6 +25,7 @@ from tensorrt_llm.inputs.multimodal import (
 )
 from tensorrt_llm.inputs.multimodal_data import MEDIA_MODALITIES, AudioData, VideoData
 from tensorrt_llm.inputs.registry import (
+    BaseMultimodalInputProcessor,
     create_input_processor_with_hash,
     maybe_compute_mm_embed_cumsum,
 )
@@ -706,6 +708,181 @@ def test_mm_item_metadata_rejects_conflicting_prompt_order(hashing_enabled: bool
         create_input_processor_with_hash(processor)(inputs, None)
 
     assert processor.multimodal_hashing_supported is hashing_enabled
+
+
+class _ProbeFakeProcessor(_KwargsHashFakeProcessor):
+    multimodal_hashing_supported = None
+
+    def __init__(self, call_error=None, count_error=None, vocab_size=100):
+        self.call_error = call_error
+        self.count_error = count_error
+        self.vocab_size = vocab_size
+        self.calls = 0
+
+    def __call__(self, inputs, sampling_params):
+        self.calls += 1
+        if self.call_error is not None:
+            raise self.call_error
+        return super().__call__(inputs, sampling_params)
+
+    def get_num_tokens_per_image(self, *, image):
+        if self.count_error is not None:
+            raise self.count_error
+        return super().get_num_tokens_per_image(image=image)
+
+    def get_vocab_size(self):
+        return self.vocab_size
+
+
+_PROBE_INPUTS = {"prompt": "unused", "multi_modal_data": {"image": [np.array([1], dtype=np.uint8)]}}
+
+
+@pytest.mark.parametrize(
+    "call_error,count_error",
+    [
+        (ValueError("bad image"), None),
+        (NotImplementedError("bad image"), None),
+        (None, ValueError("bad image")),
+        (None, NotImplementedError("bad image")),
+        (None, AttributeError("bad image")),
+        (None, TypeError("bad image")),
+    ],
+    ids=[
+        "processor_error",
+        "processor_unsupported_input",
+        "hashing_error",
+        "hashing_not_implemented",
+        "hashing_attribute_error",
+        "hashing_type_error",
+    ],
+)
+def test_request_error_in_hashing_probe_keeps_hashing_on(call_error, count_error) -> None:
+    """One bad first request must not turn hashing off for later requests."""
+    processor = _ProbeFakeProcessor(call_error, count_error)
+    wrapped = create_input_processor_with_hash(processor)
+
+    if call_error is not None:
+        with pytest.raises(type(call_error), match="bad image"):
+            wrapped(_PROBE_INPUTS, None)
+    else:
+        _, extra = wrapped(_PROBE_INPUTS, None)
+        assert "multimodal_input" not in extra
+    assert processor.multimodal_hashing_supported is None
+
+    processor.call_error = processor.count_error = None
+    _, extra = wrapped(_PROBE_INPUTS, None)
+    assert processor.multimodal_hashing_supported is True
+    assert extra["multimodal_input"].multimodal_hashes == [_CONTENT_HASH_SNAPSHOT["image"]]
+
+
+@pytest.mark.parametrize("no_items", [[], None], ids=["empty_list", "none"])
+def test_modality_without_items_keeps_hashing_on(no_items) -> None:
+    """An empty modality says nothing about whether the processor can hash.
+
+    An image request with ``"audio": []`` must not turn hashing off for later image requests.
+    """
+    processor = _ProbeFakeProcessor()  # Counts image tokens only.
+    wrapped = create_input_processor_with_hash(processor)
+    image = _PROBE_INPUTS["multi_modal_data"]["image"]
+
+    wrapped({"prompt": "unused", "multi_modal_data": {"image": image, "audio": no_items}}, None)
+    assert processor.multimodal_hashing_supported is not False
+
+    _, extra = wrapped(_PROBE_INPUTS, None)
+    assert processor.multimodal_hashing_supported is True
+    assert extra["multimodal_input"].multimodal_hashes == [_CONTENT_HASH_SNAPSHOT["image"]]
+
+
+@pytest.mark.parametrize(
+    "uuids",
+    [{"image": [123]}, {"image": ["a", "b"]}, ["image-uuid"]],
+    ids=["int_uuid", "length_mismatch", "not_a_dict"],
+)
+def test_bad_multimodal_uuids_are_a_request_error(uuids) -> None:
+    """Bad UUIDs fail the request before any processing and do not turn hashing off."""
+    processor = _ProbeFakeProcessor()
+    wrapped = create_input_processor_with_hash(processor)
+
+    with pytest.raises(ValueError, match="(?i)uuid"):
+        wrapped({**_PROBE_INPUTS, "multi_modal_uuids": uuids}, None)
+    assert processor.calls == 0
+    assert processor.multimodal_hashing_supported is None
+
+    _, extra = wrapped(_PROBE_INPUTS, None)
+    assert processor.multimodal_hashing_supported is True
+    assert extra["multimodal_input"].multimodal_hashes == [_CONTENT_HASH_SNAPSHOT["image"]]
+
+
+class _NoHfTokenCountProcessor(_ProbeFakeProcessor):
+    """Counts image tokens with the base processor, whose HF processor cannot."""
+
+    processor = object()
+    get_num_multimodal_tokens = BaseMultimodalInputProcessor.get_num_multimodal_tokens
+    get_num_tokens_per_image = BaseMultimodalInputProcessor.get_num_tokens_per_image
+
+
+@pytest.mark.parametrize(
+    "processor_cls,vocab_size",
+    [(_NoHfTokenCountProcessor, 100), (_ProbeFakeProcessor, None)],
+    ids=["no_hf_token_count", "no_vocab_or_mm_ids"],
+)
+def test_unsupported_hashing_turns_hashing_off(processor_cls, vocab_size) -> None:
+    processor = processor_cls(vocab_size=vocab_size)
+    wrapped = create_input_processor_with_hash(processor)
+    inputs = {
+        "prompt": "unused",
+        "multi_modal_data": {"image": [np.zeros((2, 2, 3), dtype=np.uint8)]},
+    }
+
+    for _ in range(2):
+        _, extra = wrapped(inputs, None)
+        assert "multimodal_input" not in extra
+        assert processor.multimodal_hashing_supported is False
+    # The probe and its fallback, then only the basic processor.
+    assert processor.calls == 3
+
+
+def test_modality_without_token_count_hook_does_not_change_other_modalities() -> None:
+    """A bad image, a good image, then audio, which the processor cannot count.
+
+    The audio request is served without hashes, and image requests keep hashing.
+    """
+    processor = _ProbeFakeProcessor(count_error=ValueError("bad image"))  # Counts images only.
+    wrapped = create_input_processor_with_hash(processor)
+    audio = {"prompt": "unused", "multi_modal_data": {"audio": [np.zeros(2, dtype=np.float32)]}}
+
+    _, extra = wrapped(_PROBE_INPUTS, None)
+    assert "multimodal_input" not in extra
+    processor.count_error = None
+    _, extra = wrapped(_PROBE_INPUTS, None)
+    assert extra["multimodal_input"].multimodal_hashes == [_CONTENT_HASH_SNAPSHOT["image"]]
+
+    calls = processor.calls
+    _, extra = wrapped(audio, None)
+    assert "multimodal_input" not in extra
+    assert processor.calls == calls + 1  # No hashing attempt, only the basic processor.
+    assert processor.multimodal_hashing_supported is True
+
+    _, extra = wrapped(_PROBE_INPUTS, None)
+    assert extra["multimodal_input"].multimodal_hashes == [_CONTENT_HASH_SNAPSHOT["image"]]
+
+
+def test_hashing_error_with_hashing_on_serves_request() -> None:
+    """With hashing on, a request whose hashing fails is served like the probe serves it."""
+    processor = _ProbeFakeProcessor(count_error=ValueError("bad image"))
+    processor.multimodal_hashing_supported = True
+    wrapped = create_input_processor_with_hash(processor)
+
+    _, extra = wrapped(_PROBE_INPUTS, None)
+    assert "multimodal_input" not in extra
+    assert processor.multimodal_hashing_supported is True
+
+
+def test_missing_hf_token_count_is_unsupported() -> None:
+    with pytest.raises(UnsupportedError, match="_get_num_multimodal_tokens"):
+        _NoHfTokenCountProcessor().get_num_tokens_per_image(
+            image=np.zeros((2, 2, 3), dtype=np.uint8)
+        )
 
 
 def _process_mm_contract(
