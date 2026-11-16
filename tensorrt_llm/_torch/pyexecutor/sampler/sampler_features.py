@@ -43,7 +43,13 @@ from typing import Any, Callable, Iterator, Optional, cast
 
 import torch
 
-from tensorrt_llm._utils import nvtx_range, prefer_pinned
+from tensorrt_llm._utils import (
+    CudaStreamScope,
+    current_cuda_stream,
+    nvtx_range,
+    prefer_pinned,
+    wait_event,
+)
 from tensorrt_llm.bindings.executor import FinishReason
 
 from ..llm_request import LlmRequest
@@ -616,7 +622,7 @@ class SamplerEvent:
             futures.wait(self.worker_futures)
         self.cuda_event.synchronize()
         if self.side_stream_event is not None:
-            self.side_stream_event.synchronize()
+            wait_event(self.side_stream_event)
 
 
 class _SideStreamCopier:
@@ -635,7 +641,7 @@ class _SideStreamCopier:
     def __init__(
         self,
         side_stream: torch.cuda.Stream,
-        side_stream_ctx: torch.cuda.StreamContext,
+        side_stream_ctx: torch.cuda.StreamContext | CudaStreamScope,
     ) -> None:
         self._side_stream = side_stream
         self._side_stream_ctx = side_stream_ctx
@@ -657,7 +663,7 @@ class _SideStreamCopier:
         if not self._tasks:
             self.event = None
             return None
-        self._side_stream.wait_stream(torch.cuda.current_stream())
+        self._side_stream.wait_stream(current_cuda_stream())
         with self._side_stream_ctx:
             for dst, src in self._tasks:
                 # Prevent the caching allocator from giving this memory back to the main
@@ -693,9 +699,7 @@ class AsyncWorkerMixin:
         # Private D2H side stream + cached stream context shared by all
         # speculative beam-history copiers.
         self._d2h_side_stream: torch.cuda.Stream = torch.cuda.Stream()
-        self._d2h_side_stream_ctx: torch.cuda.StreamContext = torch.cuda.stream(
-            self._d2h_side_stream
-        )
+        self._d2h_side_stream_ctx = CudaStreamScope(self._d2h_side_stream)
 
     def async_worker_enabled(self) -> bool:
         return getattr(self, "_enable_async_worker", False)

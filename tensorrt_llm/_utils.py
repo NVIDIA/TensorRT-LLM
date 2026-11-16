@@ -1373,6 +1373,40 @@ def maybe_pin_memory(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
+def wait_event(event: torch.cuda.Event) -> None:
+    """``event.synchronize()``, skipped for a completed event: ``synchronize``
+    releases the GIL even then, ``query`` keeps it."""
+    if not event.query():
+        event.synchronize()
+
+
+def current_cuda_stream() -> torch.cuda.Stream:
+    """``torch.cuda.current_stream()`` without the per-call device lookup."""
+    return torch.cuda.current_stream(torch.cuda.current_device())
+
+
+class CudaStreamScope:
+    """``torch.cuda.stream(stream)`` for a stream of the current device, without
+    the per-call device lookups."""
+
+    __slots__ = ("_stream", "_previous")
+
+    def __init__(self, stream: Optional[torch.cuda.Stream]) -> None:
+        self._stream = stream
+        self._previous = None
+
+    def __enter__(self) -> None:
+        if self._stream is not None:
+            self._previous = torch.cuda.current_stream(
+                self._stream.device_index)
+            torch.cuda.set_stream(self._stream)
+
+    def __exit__(self, *exc_info) -> None:
+        if self._previous is not None:
+            torch.cuda.set_stream(self._previous)
+            self._previous = None
+
+
 def async_tensor_h2d(data, dtype: torch.dtype,
                      device: Union[str, torch.device]) -> torch.Tensor:
     """Build a CPU tensor from `data` and ship it to `device` with a

@@ -82,6 +82,7 @@ def _make_runner(dist, max_batch=64, dummy_ok=True):
         batch_size=max_batch,
         use_mrope=False,
         enable_in_graph_sampling=False,
+        skip_adp_count_gather=False,
     )
     runner._sample_type_resolver = None
     runner._round_up_batch_size_with_draft_len = lambda bs, draft_len: 4 if bs <= 4 else 8

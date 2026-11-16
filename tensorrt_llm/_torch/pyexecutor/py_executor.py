@@ -30,7 +30,8 @@ except ImportError:
     from cuda import cudart
 
 from tensorrt_llm._startup import _StartupTimer
-from tensorrt_llm._utils import (CUASSERT, customized_gc_thresholds,
+from tensorrt_llm._utils import (CUASSERT, CudaStreamScope, current_cuda_stream,
+                                 customized_gc_thresholds,
                                  get_steady_clock_now_in_seconds,
                                  is_trace_enabled, mpi_comm, mpi_disabled,
                                  nvtx_range, set_thread_local_mpi_comm,
@@ -692,6 +693,16 @@ class _ExecutorExecutionConfig:
     transfer_budget_is_explicit: bool = False
     # kv_cache_config.defer_generation_only_release.
     defer_generation_only_release: bool = False
+
+
+def _without_batch_idx_first(requests: List[LlmRequest]) -> List[LlmRequest]:
+    """A new list of ``requests``, those without a batch index first, stably."""
+    without_batch_idx = [req for req in requests if req.py_batch_idx is None]
+    if not without_batch_idx:
+        return list(requests)
+    return without_batch_idx + [
+        req for req in requests if req.py_batch_idx is not None
+    ]
 
 
 class PyExecutor:
@@ -4489,10 +4500,8 @@ class PyExecutor:
                     # the generation requests always have batch_idx.
                     # Sort before preparing resources, so the resource managers see
                     # the requests in the order the forward runs them.
-                    scheduled_batch.generation_requests = sorted(  # stable sort
-                        scheduled_batch.generation_requests,
-                        key=lambda req: int(req.py_batch_idx is not None),
-                    )
+                    scheduled_batch.generation_requests = _without_batch_idx_first(
+                        scheduled_batch.generation_requests)
 
                     self._maybe_record_hang_diagnostic_phase(
                         "preparing_resources", scheduled_batch)
@@ -8304,10 +8313,8 @@ class PyExecutor:
                     # the generation requests always have batch_idx.
                     # Sort before preparing resources, so the resource managers see
                     # the requests in the order the forward runs them.
-                    scheduled_batch.generation_requests = sorted(  # stable sort
-                        scheduled_batch.generation_requests,
-                        key=lambda req: int(req.py_batch_idx is not None),
-                    )
+                    scheduled_batch.generation_requests = _without_batch_idx_first(
+                        scheduled_batch.generation_requests)
 
                     self._maybe_record_hang_diagnostic_phase(
                         "preparing_resources", scheduled_batch)
@@ -8476,7 +8483,7 @@ class PyExecutor:
                     # current stream).
                     sample_stream = (self.execution_stream if isinstance(
                         self.sampler, SpecSampler) else None)
-                    with torch.cuda.stream(
+                    with CudaStreamScope(
                             sample_stream
                     ), self.perf_manager.record_perf_events(
                             None, gpu_sample_end) as sample_timing:
@@ -11916,7 +11923,12 @@ class PyExecutor:
         non-overlap mode, so the second union term is a no-op there.
         """
         model = getattr(self.model_engine, "model", None)
-        if model is None:
+        # The helper does nothing for other models or with the prefetch off.
+        if not isinstance(model, MultimodalModelMixin):
+            return
+        max_prefetch_ahead = (
+            self.llm_args.multimodal_config.encoder_side_stream_max_ahead)
+        if max_prefetch_ahead is None or max_prefetch_ahead <= 0:
             return
         in_flight = {r.py_request_id for r in scheduled_batch.all_requests()}
         if self.previous_batch is not None:
@@ -11930,8 +11942,6 @@ class PyExecutor:
         ]
         if not pending:
             return
-        max_prefetch_ahead = (
-            self.llm_args.multimodal_config.encoder_side_stream_max_ahead)
         try:
             maybe_prefetch_mm_encoder_for_next_iter(
                 model=model,
@@ -12027,12 +12037,11 @@ class PyExecutor:
             # with KVCacheTransferManager's onboard/offload operations. With the
             # loop on the execution stream both waits are program order.
             if not self._loop_on_execution_stream:
-                self._stream_ordering_events[0].record(
-                    torch.cuda.current_stream())
+                self._stream_ordering_events[0].record(current_cuda_stream())
                 self.execution_stream.wait_event(
                     self._stream_ordering_events[0])
             self._attach_encoder_output_to_execution_stream(scheduled_requests)
-            with torch.cuda.stream(self.execution_stream):
+            with CudaStreamScope(self.execution_stream):
                 outputs = forward(scheduled_requests, self.resource_manager,
                                   new_tensors_device, cache_indirection_buffer)
                 if isinstance(outputs, dict):
@@ -12054,7 +12063,7 @@ class PyExecutor:
             # before downstream operations use the outputs.
             if not self._loop_on_execution_stream:
                 self._stream_ordering_events[1].record(self.execution_stream)
-                torch.cuda.current_stream().wait_event(
+                current_cuda_stream().wait_event(
                     self._stream_ordering_events[1])
 
             if self._is_kv_manager_v2:
@@ -12099,8 +12108,9 @@ class PyExecutor:
         and adjust the exclude_last_generation_logits flag accordingly.
         """
         for request in generation_requests:
-            if request.state != LlmRequestState.GENERATION_COMPLETE and request.will_complete_next_iteration(
-            ):
+            # will_complete_next_iteration is rarely true, so test it first.
+            if request.will_complete_next_iteration(
+            ) and request.state != LlmRequestState.GENERATION_COMPLETE:
                 request.set_exclude_last_generation_logits(False)
                 request.state = LlmRequestState.GENERATION_TO_COMPLETE
 
@@ -13415,7 +13425,10 @@ class PyExecutor:
                     new_active_requests.append(request)
                 continue
 
-            if request.is_generation_only_request and not request.is_finished:
+            # Nothing below changes the request's state before the response.
+            is_generation_only = request.is_generation_only_request
+            is_finished = request.is_finished
+            if is_generation_only and not is_finished:
                 # If request is in transmission, so we don't need to emit a response
                 # Also, for the first iteration with overlap, we should skip since first
                 # token has already been emitted previously
@@ -13423,10 +13436,11 @@ class PyExecutor:
                         not self.disable_overlap_scheduler
                         and getattr(request, "py_csa2_remote_tail_mode", None)
                         != "destination" and request.py_decoding_iter <= 1):
-                    self.perf_manager.append_step_metrics(
-                        request,
-                        self.iter_counter,
-                        batch_token_time=batch_token_time)
+                    if perf_metrics_enabled:
+                        self.perf_manager.append_step_metrics(
+                            request,
+                            self.iter_counter,
+                            batch_token_time=batch_token_time)
                     new_active_requests.append(request)
                     continue
 
@@ -13446,7 +13460,7 @@ class PyExecutor:
                 request.update_perf_metrics(self.iter_counter)
 
             request_done = False
-            if request.is_finished:
+            if is_finished:
                 # Guard the engine lookup -- minimal executors (unit tests)
                 # may have no engine.
                 route_capture = getattr(getattr(self, "model_engine", None),
@@ -13455,7 +13469,7 @@ class PyExecutor:
                     route_capture.attach_routes(request)  # R3: append routes
             # A generation-only request's first streamed content must not wait
             # for stream_interval after the context-side first token.
-            first_gen_emit = (request.is_generation_only_request
+            first_gen_emit = (is_generation_only
                               and not request.py_gen_first_emitted)
             should_emit = self._should_emit_response(request, emit_first_iter,
                                                      first_gen_emit)
@@ -13464,8 +13478,7 @@ class PyExecutor:
             # every earlier step only costs a native call. Requests that
             # return perf metrics keep the call: it finalizes their ctx GPU
             # totals.
-            if (should_emit and not request.is_finished
-                    and not request.streaming
+            if (should_emit and not is_finished and not request.streaming
                     and not request.return_perf_metrics):
                 should_emit = False
             if should_emit:
