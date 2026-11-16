@@ -558,6 +558,29 @@ def test_eager_decoder_layer_hooks_scope_each_invocation(tensor_scope_events):
     assert tensor_scope_events[-1][-1] is False
 
 
+def test_module_inputs_keep_unmarked_metadata_inside_tensor_containers() -> None:
+    @dataclass
+    class Metadata:
+        shared: torch.Tensor
+
+    @nccl_window_tensor_scope.nccl_window_tensor_container
+    @dataclass
+    class Activations:
+        hidden_states: torch.Tensor
+        metadata: Metadata
+
+    with FakeTensorMode():
+        hidden_states = torch.empty(2, device="cuda")
+        metadata = Metadata(torch.empty(2, device="cuda"))
+    activations = Activations(hidden_states, metadata)
+
+    tensors = nccl_window_tensor_scope._module_call_cuda_tensors((activations,), {})
+
+    assert nccl_window_tensor_scope.is_nccl_window_tensor_container(Activations)
+    assert not nccl_window_tensor_scope.is_nccl_window_tensor_container(Metadata)
+    assert list(map(id, tensors)) == [id(hidden_states)]
+
+
 def test_eager_decoder_layer_scope_consumes_mhc_activations(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
