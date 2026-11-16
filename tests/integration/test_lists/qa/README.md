@@ -54,16 +54,13 @@ This directory contains various test configuration files:
 - `functional/llm_function_rtx6k.txt` - RTX 6000 series specific tests
 - `functional/llm_function_stress.txt` - Functional stress test cases
 
-All functional test lists belong in `functional/`. Launch YAML with `defaults`
-and `tests[].case` and plain-text lists live directly in that folder. Versioned
-functional databases, such as `llm_spark_func.yml`, live in `functional/test-db/`
-so their `trt-test-db` queries do not scan launch YAML.
-Keep only versioned `trt-test-db` YAML files directly in `qa/`. The pinned
-`trt-test-db` reader scans `qa/*.yml` without recursion and parses every file
-before selecting a context; a case list there prevents performance list generation.
-Both QA validators recursively discover text and YAML lists under `functional/`.
-Spark database queries must use `functional/test-db/` so they do not scan the
-incompatible multinode launch YAML. No compatibility links remain in `qa/`.
+Test lists whose names start with `llm_function` belong in `functional/`.
+Spark, Triton and performance lists keep their existing paths directly in `qa/`.
+The pinned `trt-test-db` reader scans `qa/*.yml` without recursion and parses every
+file before selecting a context; multinode launch YAML must remain outside that
+scan because it uses `defaults` and `tests[].case` rather than the database schema.
+Both QA validators discover text and YAML lists under `functional/`.
+No compatibility links remain in `qa/`.
 
 ### Multi-node Launch Parameters
 
@@ -112,10 +109,10 @@ Do not pass this case list to `trt-test-db`; performance selectors continue to u
 - `llm_trt_integration_perf_sanity.yml` - Integration performance sanity checks
 
 ### Triton Backend Tests
-- `functional/llm_triton_integration.txt` - Triton backend integration tests
+- `llm_triton_integration.txt` - Triton backend integration tests
 
 ### Release-Specific Tests
-- `functional/test-db/llm_spark_func.yml` - Functional tests for DGX-Spark release
+- `llm_spark_func.yml` - Functional tests for DGX-Spark release
 - `llm_spark_perf.yml` - Performance tests for DGX-Spark release
 
 ## Test Execution Schedule

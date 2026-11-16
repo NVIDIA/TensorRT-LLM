@@ -466,10 +466,7 @@ def test_verify_qa_yaml_rejects_invalid_entries(mod, tmp_path, monkeypatch, cont
 def test_verify_qa_grouped_yaml(mod, tmp_path, monkeypatch, filename):
     import yaml
 
-    source_dir = REPO_ROOT / "tests" / "integration" / "test_lists" / "qa"
-    if filename == "llm_spark_func.yml":
-        source_dir = source_dir / "functional" / "test-db"
-    source = source_dir / filename
+    source = REPO_ROOT / "tests" / "integration" / "test_lists" / "qa" / filename
     qa_dir = tmp_path / "tests" / "integration" / "test_lists" / "qa"
     qa_dir.mkdir(parents=True)
     (qa_dir / filename).write_text(source.read_text(), encoding="utf-8")
