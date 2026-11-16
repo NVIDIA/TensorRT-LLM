@@ -3144,7 +3144,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         return self
 
     def prepare_sparse_indexer(
-        self, layer_idx: int, sparse_block: int
+        self, layer_idx: int, sparse_block: int, build: bool = True
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
         """Descriptors for DeepGEMM's paged *sparse* MQA logits, or None if unavailable.
 
@@ -3152,7 +3152,8 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         rows (native 64-row index pages and per-query block table) plus
         the host-prepared generation-row -> request map, and builds the kernel
         schedule once per owner and forward: every candidate consumer of an owner
-        scores the same published blocks over the same pages.
+        scores the same published blocks over the same pages. ``build=False`` returns no
+        schedule (None) and waits for no prebuilt one.
         """
         from tensorrt_llm.deep_gemm import get_paged_sparse_mqa_logits_metadata
 
@@ -3161,6 +3162,8 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         if inputs is None:
             return None
         pages, table, counts, row_requests, blocks, serial = inputs
+        if not build:
+            return pages, table, counts, row_requests, None
         schedules = self.__dict__.setdefault("_csa2_sparse_schedules", {})
         cached = schedules.get(owner)
         if cached is None or cached[0] != serial:
