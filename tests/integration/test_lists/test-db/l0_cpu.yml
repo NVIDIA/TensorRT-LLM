@@ -54,6 +54,7 @@ l0_cpu:
   # modeling_v2 routing and routing-table claims: config shapes and a monkeypatched
   # compute capability, no device. The rest of unittest/_torch/modeling_v2 needs a GPU.
   - unittest/_torch/modeling_v2/test_modeling_v2_claims.py
+  - unittest/_torch/modeling_v2/models/musespark_open/muse_spark_open_816b_a42b_nvfp4__sm_103__tep/ops/attention/test_modeling_v2_multi_request_split_kv_page64.py
   - unittest/_torch/modeling_v2/test_modeling_v2_routing.py
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_fp8_indexer_rejects_different_qk_norm_epsilons
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_moe_reduces_only_local_terms
@@ -90,6 +91,12 @@ l0_cpu:
   - unittest/_torch/speculative/test_spec_slot_pool_sizing.py
   - unittest/_torch/test_hf_quant_config.py
   - unittest/_torch/test_mmap_utils.py
+  - unittest/_torch/test_connector.py
+  - unittest/_torch/test_connector_adp.py
+  - unittest/_torch/test_connector_spec_scope.py
+  - unittest/_torch/models/test_modeling_utils.py::test_tied_embedding_parallel_layout
+  - unittest/_torch/models/test_modeling_utils.py::test_tied_embedding_rejects_incompatible_layout
+  - unittest/_torch/test_connector_shared_pool.py
   - unittest/_torch/test_model_config.py
   - unittest/_torch/test_route_capture.py
   - unittest/_torch/test_utils.py
@@ -162,6 +169,7 @@ l0_cpu:
   - unittest/llmapi/apps/test_harmony_parsing.py::TestStripIncompleteMessagesReporting
   - unittest/llmapi/apps/test_kimi_serve_extensions.py
   - unittest/llmapi/apps/test_musespark_serve_extensions.py
+  - unittest/_torch/modeling_v2/models/musespark_open/muse_spark_open_816b_a42b_nvfp4__sm_103__tep/test_modeling_v2_tep4_extra_paths.py
   - unittest/llmapi/apps/test_openai_chat_disagg_multimodal.py
   - unittest/llmapi/apps/test_openai_server_iteration_stats.py
   - unittest/llmapi/apps/test_reasoning_prompt_resolution.py

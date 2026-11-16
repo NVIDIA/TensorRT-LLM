@@ -417,6 +417,33 @@ public:
         return mNumReusableTokensBeforePruning;
     }
 
+    // ---- Superseded sliding-window anchor demotion (opt-in) ----------------
+    //
+    // When set, close() lowers the eviction priority of the reused sliding-window pages this
+    // request has superseded: committed SWA pages of the matched prefix (sink blocks excluded)
+    // whose current priority is above `priority` and above what this cache's priority callback
+    // gives the same (ordinal, life cycle). With an endpoint priority callback, that is an old
+    // prompt endpoint's window the request extended past; the window at its own endpoint keeps
+    // its priority. Such pages are evicted before other prioritized pages, but stay reusable
+    // until then. Eviction order only: prefix matching, page data and attention are unchanged.
+    // Per-object setting (no lock); the demotion itself runs inside close() under the exclusive
+    // API lock.
+    void setSupersededAnchorPriority(std::optional<Priority> priority) noexcept
+    {
+        mSupersededAnchorPriority = priority;
+    }
+
+    std::optional<Priority> supersededAnchorPriority() const noexcept
+    {
+        return mSupersededAnchorPriority;
+    }
+
+    // Number of pages close() demoted (0 before close or when disabled).
+    int numDemotedAnchorPages() const noexcept
+    {
+        return mNumDemotedAnchorPages;
+    }
+
     std::vector<TokenIdExt> const& committedTokens() const noexcept
     {
         return mCommittedTokens;
@@ -661,6 +688,10 @@ private:
     void _truncateBlockBeams(SeqBlock& block, BeamIndex beamWidth);
     void _appendBeams(BeamIndex oldBeamWidth, BeamIndex newBeamWidth);
 
+    // Lower the eviction priority of superseded reused SWA pages (see setSupersededAnchorPriority).
+    // Caller holds the exclusive API lock. Returns the number of pages demoted.
+    int _demoteSupersededAnchors(Priority priority);
+
     // Release stale held uncommitted pages for SWA layers after committing stops.
     // Mirrors Python's _on_stop_committing().
     void _onStopCommitting();
@@ -768,6 +799,10 @@ private:
     bool mTextOnly = false;
     int mNumReusableTokensBeforeHybridPruning;
     int mNumReusableTokensBeforePruning;
+    // Matched (reused) block count at creation; bounds the superseded-anchor demotion walk.
+    int mNumMatchedBlocks = 0;
+    std::optional<Priority> mSupersededAnchorPriority;
+    int mNumDemotedAnchorPages = 0;
     bool mEnableRequestStats = false;
     int mNumCommittedBlocks;
     std::optional<CachedCudaEvent> mFinishEvent;

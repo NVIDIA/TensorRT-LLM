@@ -271,6 +271,15 @@ def reuse_match_pages(
     return num_tokens, pages
 
 
+def reuse_match_page_priorities(
+    manager: Any, reuse_scope: Any, tokens: Any, lc_id: int
+) -> tuple[int, list[tuple[int, int, bool] | None]]:
+    """Match ``tokens`` and report, per block, ``(priority, cache_level, scheduled)`` of the
+    lifecycle's page, or ``None`` when the block holds no page for ``lc_id``."""
+    num_tokens, raw = _cpp().reuse_match_page_priorities(manager, reuse_scope, list(tokens), lc_id)
+    return num_tokens, [None if e is None else tuple(e) for e in raw]
+
+
 def reuse_match_planned_drop_counts(
     manager: Any,
     reuse_scope: Any,

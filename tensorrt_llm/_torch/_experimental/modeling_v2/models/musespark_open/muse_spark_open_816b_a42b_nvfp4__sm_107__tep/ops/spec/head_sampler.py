@@ -119,6 +119,54 @@ POLL_TIMEOUT_S = 600
 #: Vectors (4 elements) of one virtual thread kernel B's walk stages in shared memory.
 WALK_VECTORS = 64
 
+# The multi-CTA top-p test (``head_sampler_coop_fold``'s TOPP_ROUNDS). A row with top-p and
+# neither top-k nor min-p runs the shipped tokens-only rejection loop: a draw, then a sweep of
+# the whole row for the mass above the candidate (kept iff it is at most top_p x the support
+# mass), and on a rejection another sweep for the next draw's support -- all in kernel B's one
+# CTA per row, so a top-p verify head costs the same at 8 and at 128 rows. ``draw_topp`` stops
+# kernel B after the first draw, spreads the test's sweep over VB / 128 CTAs per row and
+# decides in one CTA per row from the shipped reduction of the per-thread partials; a rejected
+# round's next support needs no sweep (it is the same partials' mass). The same tokens as
+# ``draw`` (same partials, reductions, Philox draws and walks).
+
+#: Test rounds per call spread over CTAs (0: off; ``configure``); later rounds run in the
+#: row's CTA.
+TOPP_ROUNDS = 0
+#: Most ``TOPP_ROUNDS`` (``kTopPMaxRounds``).
+TOPP_MAX_ROUNDS = 4
+#: int32 words of one row's record (``kTopPRecordBytes`` / 4).
+TOPP_RECORD_WORDS = 32
+#: int32 words of one virtual thread's partial (count, mass).
+TOPP_PARTIAL_WORDS = 2
+
+# The distributed sampler (``head_sampler_coop_fold``'s DIST_MIN_ROWS; ``ds_sample``). On decode steps
+# of DIST_MIN_ROWS..DIST_MAX_ROWS rows the head runs only the local LM-head GEMM (no logits
+# all-gather, no ``cat``); one kernel per rank, one CTA per row, stages this rank's GEMM row in fabric
+# memory, pulls the 1 / world of the row its virtual threads fold (vt = 1024 / world * rank + a), folds them
+# with kernel A's statements, and the ranks exchange per-virtual-thread states, the walked candidate
+# and the top-p test's partials (LL elements over the multicast fabric). Every rank then runs kernel
+# B's reductions, Philox draws and decisions on the same 1024 values, so every rank writes kernel B's
+# token. Rows with top-k / min-p gather their row and run the shipped body (kernel B's filtered path).
+
+#: Fewest rows of a decode step the distributed sampler takes (0: off; ``configure``).
+DIST_MIN_ROWS = 0
+#: The lowest floor (one K=7 verify block) and the most rows (the 1024-thread virtual block's calls).
+DIST_FLOOR = 8
+DIST_MAX_ROWS = 128
+#: Most ranks (``kDsMaxRanks``).
+DIST_MAX_RANKS = 8
+#: globaltimer stamps per (rank here, row) of the instrumented build (``kDsStamps``): entry, row staged, ready
+#: polled, row pulled, folded + published, states reduced, first draw's candidate, end.
+DIST_STAMPS = 8
+DIST_STAMP_NAMES = ("entry", "staged", "ready", "pull", "fold", "states", "draw", "end")
+#: ``head_sampler_coop_fold``'s DIST_FABRIC (``configure``): the fabric variant of ``ds_sample`` (LL staging pulled
+#: with its flags -- no system fence, no ready flag -- and 24-byte states); the same tokens.
+DIST_FABRIC = False
+#: Bytes of an LL state, pair and candidate entry (``kDsStateBytes``, ``kDsPairBytes``, ``kDsSlotBytes``).
+DIST_STATE_BYTES = 32
+DIST_PAIR_BYTES = 16
+DIST_SLOT_BYTES = 32
+
 _LOCK = threading.Lock()
 _LOADED: Optional[str] = None
 
@@ -237,6 +285,27 @@ def new_states(rows: int, device: torch.device) -> torch.Tensor:
     return torch.empty(words, dtype=torch.int32, device=device)
 
 
+def topp_scratch_words(rows: int) -> Tuple[int, int]:
+    """int32 words of ``draw_topp``'s (records, partials) for a call of ``rows`` (<= MAX_ROWS) rows."""
+    if not 1 <= rows <= MAX_ROWS:
+        raise ValueError(f"the multi-CTA top-p test takes 1..{MAX_ROWS} rows, got {rows}")
+    return rows * TOPP_RECORD_WORDS, rows * VIRTUAL_THREADS * TOPP_PARTIAL_WORDS
+
+
+def new_topp_scratch(device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+    """``draw_topp``'s records and partials, for every call of at most ``MAX_ROWS`` rows."""
+    records, partials = topp_scratch_words(MAX_ROWS)
+    return (
+        torch.zeros(records, dtype=torch.int32, device=device),
+        torch.zeros(partials, dtype=torch.int32, device=device),
+    )
+
+
+def topp_takes(rows: int, rounds: int) -> bool:
+    """Whether a ``split_sample`` call of ``rows`` rows runs ``draw_topp`` with ``rounds`` rounds."""
+    return rounds > 0 and rows <= MAX_ROWS
+
+
 def _neutral_or_filtered_rows_ok(vocab: int) -> bool:
     # The walk stages WALK_VECTORS vectors per 1024-thread virtual thread, twice that per
     # 512-thread one: the same vocabulary bound.
@@ -283,10 +352,18 @@ class SplitSample(OpWrapper):
     kernel's own result depends on which store lands, is decided by the
     rule. The single-walker path runs when exactly one thread claims.
 
+    With ``topp_rounds`` (``TOPP_ROUNDS``, calls of at most ``MAX_ROWS`` rows) kernel B is
+    ``draw_topp``: kernel B, then ``topp_rounds`` pairs of the multi-CTA top-p test (grid
+    (rows, 8) x 128 sweep, grid rows x 1024 decision); a row with top-p and no top-k / min-p
+    is decided there, every other row in kernel B as before. Same tokens (the same per-thread
+    partials, cub reductions, Philox draws and walks as the shipped rejection loop).
+    ``topp_records`` / ``topp_partials`` are ``new_topp_scratch``'s.
+
     Hard limits
       rows <= WIDE_MAX_ROWS (``states`` holds ``state_words(rows)`` words, as
       ``new_states(rows)`` gives), vocab % 4 == 0, vocab / 4 <= 64 * 1024 (the
-      walk stages one virtual thread's vectors in shared memory).
+      walk stages one virtual thread's vectors in shared memory);
+      ``topp_rounds`` in 0..TOPP_MAX_ROUNDS.
 
     Not certified: torch.compile.
     """
@@ -306,6 +383,9 @@ class SplitSample(OpWrapper):
         pdl: bool = False,
         coop_max_rows: int = 0,
         verify_pdl: bool = False,
+        topp_rounds: int = 0,
+        topp_records: Optional[torch.Tensor] = None,
+        topp_partials: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         m, inv, cap = cap_constants(multiplier, soft_cap)
         if logits.shape[0] <= min(coop_max_rows, MAX_ROWS):
@@ -317,6 +397,25 @@ class SplitSample(OpWrapper):
         else:
             torch.ops.musespark_open_sm107_head_sampler.fold_plain(
                 logits, temperatures, states, m, inv, cap, FOLD_THREADS, pdl
+            )
+        if topp_takes(logits.shape[0], topp_rounds):
+            return torch.ops.musespark_open_sm107_head_sampler.draw_topp(
+                logits,
+                temperatures,
+                top_ks,
+                top_ps,
+                min_ps,
+                seed,
+                offset,
+                states,
+                topp_records,
+                topp_partials,
+                m,
+                inv,
+                cap,
+                topp_rounds,
+                pdl,
+                verify_pdl and pdl,
             )
         return torch.ops.musespark_open_sm107_head_sampler.draw(
             logits,
@@ -349,10 +448,14 @@ class SplitSample(OpWrapper):
         pdl: bool = False,
         coop_max_rows: int = 0,
         verify_pdl: bool = False,
+        topp_rounds: int = 0,
+        topp_records: Optional[torch.Tensor] = None,
+        topp_partials: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """The built-in head: the processor's soft cap, then the shipped fused sampler.
 
-        ``states``, ``pdl``, ``coop_max_rows`` and ``verify_pdl`` are ignored.
+        ``states``, ``pdl``, ``coop_max_rows``, ``verify_pdl`` and the ``topp_*`` arguments are
+        ignored.
         """
         capped = reference_capped(logits, multiplier, soft_cap)
         return torch.ops.trtllm.fused_sample_from_logits(
@@ -374,6 +477,9 @@ class SplitSample(OpWrapper):
         pdl: bool = False,
         coop_max_rows: int = 0,
         verify_pdl: bool = False,
+        topp_rounds: int = 0,
+        topp_records: Optional[torch.Tensor] = None,
+        topp_partials: Optional[torch.Tensor] = None,
     ) -> None:
         if logits.dtype != torch.bfloat16 or logits.dim() != 2:
             raise ValueError("logits must be BF16 [rows, vocab]")
@@ -386,6 +492,13 @@ class SplitSample(OpWrapper):
             raise ValueError("states is smaller than new_states(rows)")
         if coop_max_rows < 0:
             raise ValueError("coop_max_rows must be 0 (off) or a row count")
+        if not 0 <= topp_rounds <= TOPP_MAX_ROUNDS:
+            raise ValueError(f"topp_rounds must be in 0..{TOPP_MAX_ROUNDS}")
+        if topp_takes(rows, topp_rounds):
+            want = topp_scratch_words(rows)
+            for name, t, words in zip(("topp_records", "topp_partials"), (topp_records, topp_partials), want):
+                if t is None or t.dtype != torch.int32 or t.numel() < words:
+                    raise ValueError(f"{name} must be int32 of at least {words} words (new_topp_scratch)")
 
 
 split_sample = SplitSample()
@@ -661,19 +774,44 @@ def shared_gather_workspace(mapping: Mapping, shard: int) -> HeadGatherWorkspace
 VP_MIN_ROWS = 16
 
 
-def configure(*, vp_min_rows: int = 16) -> None:
-    """Set the vocabulary-parallel head's row floor (``vocab_parallel_head``'s MIN_ROWS).
+def configure(
+    *, vp_min_rows: int = 16, topp_rounds: int = 0, dist_min_rows: int = 0, dist_fabric: bool = False
+) -> None:
+    """Set the vocabulary-parallel head's row floor (``vocab_parallel_head``'s MIN_ROWS), the
+    multi-CTA top-p test's rounds (``head_sampler_coop_fold``'s TOPP_ROUNDS, 0: off) and the
+    distributed sampler's row floor (``head_sampler_coop_fold``'s DIST_MIN_ROWS, 0: off).
 
     ``lever_settings.apply`` calls it from the model's plan before any install; 8 takes one
-    K=7 verify block (for a composition that serves no ``lm_head_inbox``), 16 two.
+    K=7 verify block (for a composition that serves no ``lm_head_inbox``), 16 two. The split
+    sampler's head (``split_sampler.target_head.TargetHead``) reads ``TOPP_ROUNDS`` and
+    ``DIST_MIN_ROWS`` when it is built.
 
     Raises:
-        ValueError: for a floor other than 8 or 16.
+        ValueError: for a floor other than 8 or 16, rounds outside 0..TOPP_MAX_ROUNDS, or a
+            distributed floor other than 0 or 8..DIST_MAX_ROWS.
     """
-    global VP_MIN_ROWS
+    global VP_MIN_ROWS, TOPP_ROUNDS, DIST_MIN_ROWS, DIST_FABRIC
     if vp_min_rows not in (8, 16):
         raise ValueError(f"the vocabulary-parallel head's row floor is 8 or 16, got {vp_min_rows}")
+    if isinstance(topp_rounds, bool) or not isinstance(topp_rounds, int):
+        raise ValueError(f"the multi-CTA top-p test's rounds are an integer, got {topp_rounds!r}")
+    if not 0 <= topp_rounds <= TOPP_MAX_ROUNDS:
+        raise ValueError(
+            f"the multi-CTA top-p test's rounds are 0..{TOPP_MAX_ROUNDS}, got {topp_rounds}"
+        )
+    if isinstance(dist_min_rows, bool) or not isinstance(dist_min_rows, int):
+        raise ValueError(f"the distributed sampler's row floor is an integer, got {dist_min_rows!r}")
+    if dist_min_rows != 0 and not DIST_FLOOR <= dist_min_rows <= DIST_MAX_ROWS:
+        raise ValueError(
+            f"the distributed sampler's row floor is 0 (off) or {DIST_FLOOR}..{DIST_MAX_ROWS}, "
+            f"got {dist_min_rows}"
+        )
+    if not isinstance(dist_fabric, bool):
+        raise ValueError(f"the distributed sampler's fabric switch is a bool, got {dist_fabric!r}")
     VP_MIN_ROWS = vp_min_rows
+    TOPP_ROUNDS = topp_rounds
+    DIST_MIN_ROWS = dist_min_rows
+    DIST_FABRIC = dist_fabric
 
 
 #: Claimants of a row whose crossings the ranks exchange (``kVpClaimants``).
@@ -1128,6 +1266,317 @@ class VocabParallelWorkspace:
 
     def nbytes(self) -> int:
         """Device memory this rank holds for the head (exchange copy + staging rows)."""
+        return self.layout.nbytes + self.layout.staging_bytes
+
+    def errors(self) -> int:
+        """The poll status word (synchronizes)."""
+        return int(self.status.item())
+
+
+# ---------------------------------------------------------------------------------------
+# The distributed sampler (``head_sampler_coop_fold``'s DIST_MIN_ROWS; ``ds_sample``).
+
+
+class DistLayout:
+    """The distributed sampler's buffers for ``ranks`` contiguous shards of ``shard`` elements and calls of at
+    most ``max_rows`` rows.
+
+    The LL area (one copy per rank, zeroed at construction; flag 0 is never used): ready flags
+    ``[2][max_rows][ranks]`` pairs, states ``[2][max_rows][1024]`` (two pairs each), candidates
+    ``[2][2][max_rows][ranks]`` (two pairs each), partials ``[2][2][max_rows][1024]`` pairs (call parity, round
+    parity); ``nbytes`` in all. Staging (per rank, peers read it): ``[2][max_rows][shard]`` BF16.
+    """
+
+    def __init__(self, ranks: int, shard: int, max_rows: int, ll_staging: bool = False):
+        if ranks not in (1, 2, 4, 8):
+            raise ValueError(f"the distributed sampler takes 1, 2, 4 or 8 ranks, got {ranks}")
+        if shard % 4:
+            raise ValueError(f"shard {shard} is not a whole number of 4-element vectors")
+        if not 1 <= max_rows <= DIST_MAX_ROWS:
+            raise ValueError(f"max_rows must be in 1..{DIST_MAX_ROWS}, got {max_rows}")
+        self.ranks = int(ranks)
+        self.shard = int(shard)
+        self.shard_vecs = self.shard // 4
+        self.vocab = self.ranks * self.shard
+        if not _neutral_or_filtered_rows_ok(self.vocab):
+            raise ValueError(f"a vocabulary of {self.vocab} does not fit the walk")
+        self.max_rows = int(max_rows)
+        self.ready_offset = 0
+        self.states_offset = self.ready_offset + 2 * self.max_rows * self.ranks * DIST_PAIR_BYTES
+        self.cand_offset = self.states_offset + 2 * self.max_rows * VIRTUAL_THREADS * DIST_STATE_BYTES
+        self.partial_offset = self.cand_offset + 4 * self.max_rows * self.ranks * DIST_SLOT_BYTES
+        self.nbytes = self.partial_offset + 4 * self.max_rows * VIRTUAL_THREADS * DIST_PAIR_BYTES
+        #: DIST_FABRIC's LL staging holds each 8-byte vector as a 16-byte pair of LL elements.
+        self.ll_staging = bool(ll_staging)
+        self.staging_bytes = 2 * self.max_rows * self.shard * 2 * (2 if self.ll_staging else 1)
+        #: Dynamic shared memory of one CTA: this rank's vectors of a row as FP32, 1024 / ranks slots per
+        #: 1024-vector stripe (rank r's virtual threads are r * 1024 / ranks ..).
+        self.smem_bytes = -(-(self.vocab // 4) // VIRTUAL_THREADS) * (VIRTUAL_THREADS // self.ranks) * 16
+
+    def offsets(self) -> dict:
+        return dict(
+            ready_offset=self.ready_offset,
+            states_offset=self.states_offset,
+            cand_offset=self.cand_offset,
+            partial_offset=self.partial_offset,
+        )
+
+
+class _DistRank:
+    """One process's view: its rank(s), the staging and LL addresses, the counters."""
+
+    def __init__(
+        self,
+        layout: DistLayout,
+        rank: int,
+        emulated: bool,
+        staging: list,
+        publish: list,
+        copies: list,
+        counters: torch.Tensor,
+        status: torch.Tensor,
+    ):
+        self.layout = layout
+        self.rank = int(rank)
+        self.emulated = bool(emulated)
+        self.staging = [int(x) for x in staging]
+        self.publish = [int(x) for x in publish]
+        self.copies = [int(x) for x in copies]
+        self.counters = counters
+        self.status = status
+
+    def sample(
+        self,
+        local,
+        pending,
+        temperatures,
+        top_ks,
+        top_ps,
+        min_ps,
+        seed,
+        offset,
+        multiplier,
+        soft_cap,
+        pdl,
+        early_trigger,
+        stamps=None,
+        fabric=False,
+    ):
+        """``ds_sample``; ``stamps`` (benches: int64 ``[ranks here * max_rows * DIST_STAMPS]``) runs the
+        instrumented build, which stores globaltimer stamps per (rank here, row) at its phase boundaries;
+        ``fabric`` the DIST_FABRIC variant."""
+        m, inv, cap = cap_constants(multiplier, soft_cap)
+        lay = self.layout
+        return torch.ops.musespark_open_sm107_head_sampler.ds_sample(
+            local,
+            pending,
+            temperatures,
+            top_ks,
+            top_ps,
+            min_ps,
+            seed,
+            offset,
+            self.staging,
+            self.publish,
+            self.copies,
+            self.counters,
+            self.status,
+            self.rank,
+            lay.ranks,
+            self.emulated,
+            lay.max_rows,
+            lay.ready_offset,
+            lay.states_offset,
+            lay.cand_offset,
+            lay.partial_offset,
+            POLL_TIMEOUT_S,
+            m,
+            inv,
+            cap,
+            pdl,
+            early_trigger,
+            stamps,
+            bool(fabric),
+        )
+
+
+def dist_sample(
+    view: _DistRank,
+    pending: torch.Tensor,
+    local: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    seed: Optional[torch.Tensor],
+    offset: Optional[torch.Tensor],
+    multiplier: float,
+    soft_cap: float,
+    pdl: bool = False,
+    early_trigger: bool = False,
+    fabric: bool = False,
+) -> torch.Tensor:
+    """This rank's tokens (int32 ``[rows]``) of the step whose ``[rows, shard]`` LM-head shard ``local`` is: the
+    split sampler's tokens on the gathered row (``split_sample``), from the ranks' shards. Every rank of the group
+    makes the same call. ``pending`` (``[rows, vocab]`` BF16) is written for rows with top-k / min-p only."""
+    return view.sample(
+        local,
+        pending,
+        temperatures,
+        top_ks,
+        top_ps,
+        min_ps,
+        seed,
+        offset,
+        multiplier,
+        soft_cap,
+        pdl,
+        early_trigger,
+        fabric=fabric,
+    )
+
+
+class DistEmulation:
+    """``ranks`` virtual ranks on one GPU, every one's CTAs in one launch (``ds_sample`` with ``emulated``): every
+    LL value is stored into each rank's copy, every rank's staging is a plain tensor. The kernel is the served one.
+    Every CTA waits for its row's CTAs of the other ranks, so ``rows * ranks`` must not exceed the SM count."""
+
+    def __init__(self, ranks: int, shard: int, max_rows: int, device, ll_staging: bool = False):
+        load_library()
+        self.layout = DistLayout(ranks, shard, max_rows, ll_staging)
+        lay = self.layout
+        self.device = torch.device(device)
+        self.copies = [
+            torch.zeros(lay.nbytes // 4, dtype=torch.int32, device=self.device) for _ in range(ranks)
+        ]
+        self.staging = [
+            torch.zeros(lay.staging_bytes // 2, dtype=torch.bfloat16, device=self.device)
+            for _ in range(ranks)
+        ]
+        self.counters = torch.zeros(ranks * max_rows, dtype=torch.int32, device=self.device)
+        self.status = torch.zeros(1, dtype=torch.int32, device=self.device)
+        self.view = _DistRank(
+            lay,
+            0,
+            True,
+            [s.data_ptr() for s in self.staging],
+            [c.data_ptr() for c in self.copies],
+            [c.data_ptr() for c in self.copies],
+            self.counters,
+            self.status,
+        )
+
+    def sample(
+        self, locals_, temperatures, top_ks, top_ps, min_ps, seed, offset, multiplier, soft_cap, fabric=False
+    ):
+        """Every rank's tokens (``[ranks, rows]`` int32) and pending rows (``[ranks, rows, vocab]``)."""
+        rows = locals_[0].shape[0]
+        lay = self.layout
+        local = torch.cat(list(locals_), dim=0).contiguous()
+        pending = torch.zeros((lay.ranks * rows, lay.vocab), dtype=torch.bfloat16, device=self.device)
+        tokens = self.view.sample(
+            local,
+            pending,
+            temperatures,
+            top_ks,
+            top_ps,
+            min_ps,
+            seed,
+            offset,
+            multiplier,
+            soft_cap,
+            False,
+            False,
+            fabric=fabric,
+        )
+        return tokens.view(lay.ranks, rows), pending.view(lay.ranks, rows, lay.vocab)
+
+
+class DistWorkspace:
+    """The distributed sampler's fabric buffers for one tensor-parallel group: the LL area (multicast; each
+    rank's copy zeroed) and every rank's staging rows (unicast; peers read them), for calls of at most
+    ``max_rows`` rows. Construction is collective over the group and succeeds or raises on every rank (the
+    library load and its agreement, then the allocations and a second agreement)."""
+
+    def __init__(
+        self, mapping: Mapping, shard: int, max_rows: int = DIST_MAX_ROWS, ll_staging: bool = False
+    ):
+        from tensorrt_llm._torch.distributed.ops import (
+            _get_mnnvl_workspace_comm,
+            _make_mnnvl_mcast_buffer,
+            _mnnvl_device_index,
+            _mnnvl_workspace_all_succeeded,
+        )
+
+        self.ranks = mapping.tp_size
+        self.rank = mapping.tp_rank
+        self.device = torch.device("cuda", _mnnvl_device_index(mapping))
+        self._comm = _get_mnnvl_workspace_comm(mapping)
+        self.library = ""
+        error: Optional[BaseException] = None
+        try:
+            self.layout = DistLayout(self.ranks, shard, max_rows, ll_staging)
+            if torch.cuda.get_device_capability(self.device) != (10, 7):
+                raise RuntimeError("the distributed sampler runs on SM107 only")
+            sms = torch.cuda.get_device_properties(self.device).multi_processor_count
+            if sms < self.layout.max_rows:
+                raise RuntimeError(
+                    f"{self.layout.max_rows} rows need {self.layout.max_rows} resident CTAs, the GPU has {sms} SMs"
+                )
+            self.library = load_library()
+            if not hasattr(torch.ops.musespark_open_sm107_head_sampler, "ds_sample"):
+                raise RuntimeError("the head sampler library has no ds_sample op")
+        except Exception as exc:  # noqa: BLE001 - every failure must reach the agreement
+            error = exc
+        if not _mnnvl_workspace_all_succeeded(self._comm, error is None):
+            raise RuntimeError(
+                "[musespark_open] head_sampler_coop_fold DIST_MIN_ROWS: the distributed sampler failed to load on "
+                f"at least one rank{f' (this rank: {error!r})' if error is not None else ''}"
+            ) from error
+        lay = self.layout
+        try:
+            multi_node = mapping.is_multi_node()
+            self._area = _make_mnnvl_mcast_buffer(self._comm, lay.nbytes, mapping, multi_node)
+            self._staging = _make_mnnvl_mcast_buffer(self._comm, lay.staging_bytes, mapping, multi_node)
+            self.copy = self._area.get_uc_buffer(self.rank, (lay.nbytes // 4,), torch.int32, 0)
+            self._mc = self._area.get_mc_buffer((lay.nbytes // 4,), torch.int32, 0)
+            self.staging_of = [
+                self._staging.get_uc_buffer(peer, (lay.staging_bytes // 2,), torch.bfloat16, 0)
+                for peer in range(self.ranks)
+            ]
+            with torch.cuda.device(self.device):
+                self.copy.zero_()
+                self.counters = torch.zeros(lay.max_rows, dtype=torch.int32, device=self.device)
+                self.status = torch.zeros(1, dtype=torch.int32, device=self.device)
+                torch.cuda.synchronize(self.device)
+        except Exception as exc:  # noqa: BLE001 - every failure must reach the agreement
+            error = exc
+        if not _mnnvl_workspace_all_succeeded(self._comm, error is None):
+            raise RuntimeError(
+                "[musespark_open] head_sampler_coop_fold DIST_MIN_ROWS: the distributed sampler's fabric buffers "
+                f"failed on at least one rank{f' (this rank: {error!r})' if error is not None else ''}"
+            ) from error
+        self.view = _DistRank(
+            lay,
+            self.rank,
+            False,
+            [t.data_ptr() for t in self.staging_of],
+            [self._mc.data_ptr()],
+            [self.copy.data_ptr()],
+            self.counters,
+            self.status,
+        )
+
+    @property
+    def max_rows(self) -> int:
+        return self.layout.max_rows
+
+    @property
+    def vocab(self) -> int:
+        return self.layout.vocab
+
+    def nbytes(self) -> int:
+        """Device memory this rank holds for the sampler (LL area copy + staging rows)."""
         return self.layout.nbytes + self.layout.staging_bytes
 
     def errors(self) -> int:

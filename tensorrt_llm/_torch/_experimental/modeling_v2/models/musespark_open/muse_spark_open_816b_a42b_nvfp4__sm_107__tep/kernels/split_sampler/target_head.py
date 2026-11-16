@@ -312,6 +312,63 @@ class MultimemGather:
         return torch.cat([x.reshape(info["output_shape"]) for x in out.chunk(self.world)], dim=-1)
 
 
+def topp_setup(rounds: int, device: torch.device) -> tuple:
+    """``(rounds, records, partials)`` of the multi-CTA top-p test (``head_sampler.TOPP_ROUNDS``).
+
+    0 rounds: ``(0, None, None)``. Otherwise the loaded head sampler library must register
+    ``draw_topp`` (the knob never falls back to kernel B's in-CTA test).
+
+    Raises:
+        RuntimeError: when the knob is set and the library has no ``draw_topp`` op.
+    """
+    if rounds <= 0:
+        return 0, None, None
+    if not hasattr(torch.ops.musespark_open_sm107_head_sampler, "draw_topp"):
+        raise RuntimeError(
+            f"[musespark_open] head_sampler_coop_fold TOPP_ROUNDS={rounds}: the head sampler library has "
+            "no draw_topp op (multi-CTA top-p test unavailable)"
+        )
+    records, partials = _hs.new_topp_scratch(device)
+    logger.info(
+        f"[musespark_open] head_sampler_coop_fold TOPP_ROUNDS={rounds}: split_sampler calls of at most "
+        f"{_hs.MAX_ROWS} rows decide top-p-only rows with the multi-CTA top-p test "
+        f"({(records.numel() + partials.numel()) * 4 / 2**20:.2f} MiB of scratch)"
+    )
+    return int(rounds), records, partials
+
+
+def dist_setup(min_rows: int, mapping, shard: int, vocab_parallel: bool) -> tuple:
+    """``(min_rows, workspace)`` of the distributed sampler (``head_sampler.DIST_MIN_ROWS``); ``(0, None)`` when off.
+
+    Collective over the TP group when on (``DistWorkspace``). Every rank decides alike (the same plan).
+
+    Raises:
+        ValueError: when ``vocab_parallel_head`` is on too (both take the same decode steps).
+        RuntimeError: when the sampler cannot run on some rank (on every rank alike).
+    """
+    if min_rows <= 0:
+        return 0, None
+    if vocab_parallel:
+        raise ValueError(
+            f"[musespark_open] head_sampler_coop_fold DIST_MIN_ROWS={min_rows}: vocab_parallel_head samples the same "
+            "decode steps without the all-gather; turn one of them off"
+        )
+    workspace = _hs.DistWorkspace(
+        mapping, shard, _hs.DIST_MAX_ROWS, ll_staging=bool(_hs.DIST_FABRIC)
+    )
+    logger.info(
+        f"[musespark_open] head_sampler_coop_fold DIST_MIN_ROWS={min_rows}: decode steps of {min_rows}.."
+        f"{workspace.max_rows} rows sample the ranks' own LM-head shards (ds_sample, no logits all-gather), "
+        f"{workspace.nbytes() / 2**20:.1f} MiB of fabric buffers on this rank"
+        + (
+            "; DIST_FABRIC=1: LL staging (no fence / ready flag), 24-byte states"
+            if _hs.DIST_FABRIC
+            else ""
+        )
+    )
+    return int(min_rows), workspace
+
+
 class TargetHead:
     """The state the re-classed processor and worker share: the step's pending BF16 row."""
 
@@ -345,6 +402,10 @@ class TargetHead:
     #: the ``RsVerifyArgs`` of the verify this step routed to ``sample_rejection`` (set by the worker's
     #: ``_accept_draft_tokens``, consumed by its ``_sample_tokens_for_batch``).
     rs_pending = None
+    #: ``head_sampler_coop_fold``'s DIST_MIN_ROWS: the distributed sampler's fabric buffers (None: off).
+    dist: Optional[_hs.DistWorkspace] = None
+    #: Whether the pending row is a distributed-sampler step's (``pending_local`` holds this rank's shard).
+    pending_dist = False
 
     def __init__(
         self,
@@ -380,6 +441,12 @@ class TargetHead:
         self.max_rows = _hs.MAX_ROWS
         self.states = _hs.new_states(self.max_rows, self.device)
         self.wide_states: Optional[torch.Tensor] = None
+        # head_sampler_coop_fold TOPP_ROUNDS: the multi-CTA top-p test's scratch (split_sample
+        # calls of at most MAX_ROWS rows), allocated here, before any capture.
+        self.topp_rounds, self.topp_records, self.topp_partials = topp_setup(
+            _hs.TOPP_ROUNDS, self.device
+        )
+        self._topp_logged = False
         # vocab_parallel_head: the fabric buffers for steps of VP_MIN_ROWS..max_rows rows
         # (collective; rebuilt for the wider steps by ``widen``).
         self.mapping = mapping
@@ -389,6 +456,12 @@ class TargetHead:
             self.vp = _hs.VocabParallelWorkspace(
                 mapping, int(lm_head.weight.shape[0]), self.max_rows
             )
+        # head_sampler_coop_fold DIST_MIN_ROWS: the distributed sampler's fabric buffers (collective).
+        self.dist_min_rows, self.dist = dist_setup(
+            _hs.DIST_MIN_ROWS, mapping, int(lm_head.weight.shape[0]), vocab_parallel
+        )
+        self.pending_dist = False
+        self._dist_logged = False
         # head_multimem_gather: the MULTIMEM logits gather of MULTIMEM_GATHER_ROWS-row steps,
         # when every rank can build it (collective). Its row band (8) is below
         # vocab_parallel_head's (VP_MIN_ROWS..max_rows), so the two never take the same step
@@ -510,6 +583,18 @@ class TargetHead:
                 "drained within its step"
             )
         rows = hidden_states.shape[0]
+        if self.dist is not None and self.dist_min_rows <= rows <= self.dist.max_rows:
+            # head_sampler_coop_fold DIST_MIN_ROWS: the built-in Linear.forward's local GEMM, no all-gather; the
+            # distributed sampler reads the shards (vocab_parallel_head's statements).
+            local = lm_head.apply_linear(hidden_states, lm_head.bias, None, None)
+            logits = torch.empty(
+                (rows, self.dist.vocab), dtype=torch.bfloat16, device=hidden_states.device
+            )
+            self.pending_local = local
+            self.pending_inbox = False
+            self.pending_dist = True
+            self.pending = logits
+            return logits
         if self.vp is not None and _hs.VP_MIN_ROWS <= rows <= self.vp.max_rows:
             # The built-in Linear.forward's local GEMM (column-parallel: apply_linear, then the
             # all-gather this path leaves out), through the instance's apply_linear.
@@ -585,10 +670,35 @@ class TargetHead:
         local = self.pending_local
         inbox = self.pending_inbox
         s2_row = self.pending_s2
+        dist_row = self.pending_dist
         self.pending = None
         self.pending_inbox = False
         self.pending_local = None
         self.pending_s2 = False
+        self.pending_dist = False
+        if dist_row:
+            if not self._dist_logged:
+                self._dist_logged = True
+                logger.info(
+                    f"[musespark_open] head_sampler_coop_fold DIST_MIN_ROWS={self.dist_min_rows}: engaged on a "
+                    f"{local.shape[0]}-row decode step (ds_sample: no logits all-gather)"
+                )
+            return _hs.dist_sample(
+                self.dist.view,
+                logits,
+                local,
+                temperatures,
+                top_ks,
+                top_ps,
+                min_ps,
+                seed,
+                offset,
+                self.multiplier,
+                self.soft_cap,
+                self.pdl,
+                self.verify_pdl and self.pdl,
+                fabric=_hs.DIST_FABRIC,
+            )
         if s2_row:
             return self.s2.sample(
                 temperatures,
@@ -638,6 +748,14 @@ class TargetHead:
                 self.pdl,
                 verify_pdl=self.verify_pdl,
             )
+        rows = logits.shape[0]
+        if not self._topp_logged and _hs.topp_takes(rows, self.topp_rounds):
+            self._topp_logged = True
+            logger.info(
+                f"[musespark_open] head_sampler_coop_fold TOPP_ROUNDS={self.topp_rounds}: engaged on a "
+                f"{rows}-row split_sampler call (draw_topp: top-p-only rows decided by the multi-CTA "
+                "top-p test)"
+            )
         return _hs.split_sample(
             logits,
             temperatures,
@@ -648,15 +766,18 @@ class TargetHead:
             offset,
             self.multiplier,
             self.soft_cap,
-            self.states if logits.shape[0] <= _hs.MAX_ROWS else self.wide_states,
+            self.states if rows <= _hs.MAX_ROWS else self.wide_states,
             self.pdl,
             coop_max_rows=self.coop_max_rows,
             verify_pdl=self.verify_pdl,
+            topp_rounds=self.topp_rounds,
+            topp_records=self.topp_records,
+            topp_partials=self.topp_partials,
         )
 
     def vocab_parallel(self, logits) -> bool:
         """Whether ``logits`` is the pending row of a vocab-parallel step."""
-        return self.owns(logits) and self.pending_local is not None
+        return self.owns(logits) and self.pending_local is not None and not self.pending_dist
 
     def argmax(self, logits: torch.Tensor) -> torch.Tensor:
         """``torch.argmax`` of the built-in capped row of a vocab-parallel pending row (int64); consumes it."""
@@ -721,6 +842,7 @@ class TargetHead:
             local = self.pending_local
             self.pending = None
             self.pending_local = None
+            self.pending_dist = False
             # The built-in Linear.forward's gather of the column-parallel output.
             return allgather(local, self.lm_head.mapping, sizes=self.lm_head.gather_output_sizes)
         if self.pending_inbox:
@@ -766,6 +888,7 @@ class TargetHead:
         elif self.pending_local is not None:
             self.pending = None
             self.pending_local = None
+            self.pending_dist = False
         elif self.pending is not None:
             self._gather_now(self.pending)
 

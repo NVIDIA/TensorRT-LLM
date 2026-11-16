@@ -696,6 +696,15 @@ def _keeps_prefetch(site: "_Site", rows: int) -> bool:
 #: their producer. ``tep8_wide64_kernels`` (site -> kernel) replaces a site's tactic; it must keep
 #: that site's ``split_k``.
 TEP8_WIDE64_MIN_ROWS, TEP8_WIDE64_MAX_ROWS = WIDE_MAX_ROWS + 1, 64
+#: ``tep8_wide64_min_rows`` (``configure``; the ``tep8_wide64_splitk`` lever's MIN_ROWS) moves
+#: ``TEP8_WIDE64_MIN_ROWS`` down from its default ``TEP8_WIDE64_FLOOR`` (33) to as few as
+#: ``TEP8_WIDE64_MIN_LIMIT`` rows: the 2..4-request steps' QKV and o_proj then run the wide64 tactics
+#: (each site's split_k, as the 9..32-row wide table: the same bits) through ``wide64``, which forks
+#: no weight prefetch, as at 33..64 rows. Independently of it, a step the direct hop
+#: (``tep8_direct_hop``'s MIN_ROWS) takes below 33 rows publishes its o_proj from ``wide64``'s
+#: scatter branch on the served wide64 tactic.
+TEP8_WIDE64_FLOOR = TEP8_WIDE64_MIN_ROWS
+TEP8_WIDE64_MIN_LIMIT = MAX_ROWS + 1
 #: Tactic per site for 33..64 rows (split_k of the 8-row cells); stages are what shared memory
 #: holds at 64-wide tiles. Measured (40 and 64 rows, behind a predecessor that releases early): QKV
 #: 6.0-6.2 us vs cuBLAS 8.1-8.7 (64-row tiles keep 144 CTAs and stream each weight slab once);
@@ -724,6 +733,125 @@ def _tep8_wide64_kernels(overrides: Optional[Mapping]) -> Dict[str, str]:
 TEP8_WIDE64_SITES: FrozenSet[str] = frozenset()
 TEP8_WIDE64_KERNELS: Dict[str, str] = {}
 
+#: ``tep8_wide64_max_rows`` (``configure``; the ``tep8_wide64_splitk`` lever's MAX_ROWS): the last
+#: row count of a TP8 QKV call on the wide64 tactic, ``TEP8_WIDE64_MAX_ROWS`` (64) by default. Above
+#: 64, up to ``TEP8_WIDE64_WIDE_LIMIT`` (9..16 requests at K = 7, which the built-in ``Linear`` sends
+#: to cuBLAS: nvjet split-K plus a splitKreduce launch, ~8.6 us at 96..128 rows), the call runs in ONE
+#: launch of the served QKV tactic compiled exactly as its 64-row launch, whose grid's second
+#: dimension takes the extra 64-row token tiles (``splitk_gemm.run_splitk_dense_tiles``), as
+#: ``projection_publish``'s 65..128-row publication does: split_k 4 (the 8-row cell's) fixes each
+#: element's K slices and their reduction order, so every row gets the bits it gets in a 1..64-row
+#: call (its one-request bits). ``TEP8_WIDE64_WIDE_SITES`` only: o_proj keeps its 65..128-row paths
+#: (hop128 on an armed step, else cuBLAS). ``tep8_wide64_wide_tile`` (WIDE_TILE, output columns x
+#: rows, ``TEP8_WIDE64_WIDE_TILE``) moves that launch off the served tile: ``128x64`` (mma_m 128:
+#: 18 x 2 x 4 = 144 CTAs at 65..128 rows, where ``64x64`` gives 288 on 212 SMs) or ``64x128``
+#: (mma_n 128: one token tile, 36 x 1 x 4 = 144 CTAs, each weight slab read once) or ``128x128``
+#: (one token tile, 18 x 1 x split_k CTAs: the activation re-read 18 times instead of 36), its
+#: stages lowered to what shared memory holds; same split_k, same bits. On VR the 64-wide tiles lose
+#: to cuBLAS at 65..128 rows (W6: 8.5..10.1 us vs 7.0..7.8): they are L2-bound (~13.5 TB/s), the
+#: 36 column tiles re-reading the activation (128 rows: 72 MiB of activation for 37.7 MiB of weight).
+#: ``tep8_wide64_wide_split_k`` (WIDE_SPLIT_K, ``TEP8_WIDE64_WIDE_SPLIT_K``; 0 = the served tactic's)
+#: 8 takes the launch to split_k 8 (the reduce-scatter epilogue): ``128x128`` at split_k 8 is
+#: 18 x 8 = 144 CTAs of 512 KiB each, the 64-row launch's grid and bytes per CTA, in one launch with
+#: the reduction in-kernel (cuBLAS adds a splitKreduce launch, ~2.4 us at 96..128 rows). A split_k
+#: other than the served one sums K in other slices: every row's bits change (numeric, gated).
+#: ``2cta`` (``TEP8_WIDE64_WIDE_2CTA``) takes the launch off split-K's 1-CTA family to
+#: ``ops/gemm/splitk_gemm_2cta``: tcgen05 ``cta_group::2`` MMA on 128-column x 128-token pair tiles
+#: (each CTA stages half the columns and half the tokens: the 64-row launch's bytes per CTA for
+#: twice the rows), the K slices reduced over DSMEM in the 1-CTA owner order, the weight slice
+#: prefetched into L2 before the PDL wait; at the served split_k 4 every row is bit for bit its
+#: 64-row launch's and its 8-row cell's (W14), 36 x 4 = 144 CTAs. It runs the kernel's reduce-scatter
+#: epilogue (``TEP8_WIDE64_2CTA_RS``: each K-slice CTA reduces and stores a quarter of the pair tile,
+#: the same additions in the same order, so the same bits; 12 A/B stages instead of 8). W14 (vrg-q2rg):
+#: 6.66..6.88 us at 65..128 rows against cuBLAS 7.06..8.19 (owner epilogue 7.25..7.63). split_k 4
+#: only; WIDE_SPLIT_K 8 is refused with it.
+TEP8_WIDE64_WIDE_MAX_ROWS = TEP8_WIDE64_MAX_ROWS
+TEP8_WIDE64_WIDE_LIMIT = 2 * TEP8_WIDE64_MAX_ROWS
+TEP8_WIDE64_WIDE_SITES: FrozenSet[str] = frozenset({"qkv"})
+#: WIDE_TILE's names -> (mma_m, mma_n); ``64x64`` is the served wide64 tile.
+TEP8_WIDE64_WIDE_TILES: Mapping[str, Tuple[int, int]] = {
+    "64x64": (64, 64),
+    "128x64": (128, 64),
+    "64x128": (64, 128),
+    "128x128": (128, 128),
+    "2cta": (128, 128),
+}
+TEP8_WIDE64_WIDE_TILE = (64, 64)
+#: WIDE_TILE ``2cta``: the one launch on ``ops/gemm/splitk_gemm_2cta`` (its pair tile above).
+TEP8_WIDE64_2CTA = "2cta"
+TEP8_WIDE64_WIDE_2CTA = False
+#: The split_k sizes the 2-CTA kernel serves (its cluster (2, split_k) stays within 8 CTAs).
+TEP8_WIDE64_2CTA_SPLIT_KS = (2, 4)
+#: WIDE_TILE ``2cta`` runs the kernel's reduce-scatter epilogue (bitwise the owner epilogue's output).
+TEP8_WIDE64_2CTA_RS = True
+#: ... and stages its first weight k-tiles in shared memory before the PDL wait (``prestage``: the
+#: same loads, earlier; W14 vrg-q2pg bitwise, a graph of two PDL calls too: 6.99 / 7.22 / 7.40 ->
+#: 6.67 / 6.91 / 7.14 us at 64 / 96 / 128 rows).
+TEP8_WIDE64_2CTA_PRESTAGE = True
+#: ``tep8_wide64_splitk``'s PREP_FOLD (``MUSESPARK_OPEN_LEVER_TEP8_WIDE64_SPLITK__PREP_FOLD=1``): a
+#: WIDE_TILE ``2cta`` call armed by ``multi_request_prep_append`` (``DenseGemmDispatcher.prep_fold``)
+#: runs ``ops/gemm/splitk_gemm_2cta_prep``: the same GEMM (its token blocks reduce-scattered whole, the
+#: same additions in the same order) with the packed decode prep -- q/k norm, RoPE, gate split, E4M3
+#: query, FP8 K/V append, FMHA scale words, cu_seqlens -- in its epilogue, the prep's statements on the
+#: reduced tile: the prep launch and its dependency edge go. The same bytes as 2cta + the packed prep.
+TEP8_WIDE64_PREP_FOLD = False
+#: WIDE_SPLIT_K's values: 0 keeps the served tactic's split_k.
+TEP8_WIDE64_WIDE_SPLIT_KS = (0, 4, 8)
+TEP8_WIDE64_WIDE_SPLIT_K = 0
+#: ``_wide_tiles_kernel`` per (served kernel, tile, K, N), resolved at install.
+_WIDE_TILES_KERNELS: Dict[tuple, str] = {}
+
+#: ``tep8_direct_prefetch_min_rows`` (``configure``; the ``tep8_direct_hop`` lever's
+#: PREFETCH_MIN_ROWS, 0 off): on a decode step of at least that many rows (and above
+#: ``WIDE_MAX_ROWS``, where the module's own rule forks no prefetch) that the direct publication
+#: armed, the QKV call forks the L2 prefetch of its layer's o_proj weight (``fork_direct_prefetch``),
+#: as a 1..32-row QKV call does (``dense_gemm_prefetch``), and the o_proj producer's ``plan.join``
+#: joins it. Above 32 rows the QKV takes the wide64 split-K or cuBLAS, which fork nothing, so the
+#: scatter producer streams its 16 MiB weight slice cold from HBM after its dependency wait: at
+#: 9..16 requests its predecessor is the 1.5..2.5 us attention norm-gate on every layer (the CL8 SWA
+#: block, behind which the 64-row producer stages its weight before the wait, serves 1..8
+#: requests), so the 65..128-row producer's 5.3..6.4 us (bs9..16) is mostly cold weight streaming.
+#: The prefetch reads an immutable weight and writes nothing anyone reads: same bits.
+DIRECT_PREFETCH_MIN_ROWS = 0
+DIRECT_PREFETCH_LIMIT = 128
+
+
+def _2cta_shape_error(n: int, k: int, split_k: int) -> Optional[str]:
+    """Why ``ops/gemm/splitk_gemm_2cta`` cannot take an ``N x K`` weight at ``split_k``, or None
+    (its pair tile is 128 output columns, its k-tile 64)."""
+    if int(split_k) not in TEP8_WIDE64_2CTA_SPLIT_KS:
+        return f"split_k {split_k} not in {list(TEP8_WIDE64_2CTA_SPLIT_KS)}"
+    if int(n) % 128 or int(k) % (64 * int(split_k)):
+        return f"N {n} is not whole 128-column pair tiles or K {k} not whole 64 x {split_k} slices"
+    return None
+
+
+def _wide_tiles_kernel(kernel: str, tile: Tuple[int, int], k: int, n: int, split_k: int = 0) -> str:
+    """The kernel of ``tep8_wide64_max_rows``'s one launch: ``kernel`` (a site's served wide64
+    tactic) on ``tile`` = (mma_m, mma_n), at ``split_k`` (0: the served tactic's), its stages lowered
+    until the 64-row call accepts it.
+
+    ``install`` resolves it (``_WIDE_TILES_KERNELS``), so a bad one fails there, not at a step.
+
+    Raises:
+        ValueError: ``kernel`` is not a split-K kernel, or no stage count fits.
+    """
+    family, fields = parse_kernel(kernel)
+    if family != SPLITK:
+        raise ValueError(
+            f"[musespark_open] tep8_wide64_splitk MAX_ROWS: {kernel} is not a split-K kernel"
+        )
+    wide = _fit_stages(
+        f"splitk:{tile[0]},{tile[1]},{int(split_k) or fields[2]},{fields[3]}",
+        TEP8_WIDE64_MAX_ROWS,
+        k,
+        n,
+    )
+    error = kernel_error(wide, TEP8_WIDE64_MAX_ROWS, k, n)
+    if error is not None:
+        raise ValueError(f"[musespark_open] tep8_wide64_splitk MAX_ROWS: {wide}: {error}")
+    return wide
+
 
 def configure(
     *,
@@ -732,8 +860,14 @@ def configure(
     tep4_narrow_gemms: Optional[Mapping] = None,
     tep8_wide64: bool = False,
     tep8_wide64_kernels: Optional[Mapping] = None,
+    tep8_wide64_min_rows: int = TEP8_WIDE64_FLOOR,
+    tep8_wide64_max_rows: int = TEP8_WIDE64_MAX_ROWS,
+    tep8_wide64_wide_tile: str = "64x64",
+    tep8_wide64_wide_split_k: int = 0,
+    tep8_direct_prefetch_min_rows: int = 0,
     prefetch_join: str = "before",
     drop_weight_prefetch: Tuple[str, ...] = (),
+    tep8_wide64_prep_fold: bool = False,
 ) -> None:
     """Set the dispatcher's table overrides and prefetch scheduling; the defaults keep the measured
     tables and the module's prefetch rule.
@@ -748,18 +882,90 @@ def configure(
             tep4 sites' 1..8-row steps (``kernel_steps``); None keeps the measured tables.
         tep8_wide64: the 33..64-row TP8 QKV and o_proj calls on split-K (``TEP8_WIDE64_SITES``).
         tep8_wide64_kernels: site -> kernel replacing ``SM107_TP8_WIDE64_KERNELS`` entries.
+        tep8_wide64_min_rows: the first row count of those calls (``TEP8_WIDE64_MIN_ROWS``):
+            ``TEP8_WIDE64_MIN_LIMIT``..``TEP8_WIDE64_FLOOR``.
+        tep8_wide64_max_rows: the last row count of the QKV calls (``TEP8_WIDE64_WIDE_MAX_ROWS``):
+            ``TEP8_WIDE64_MAX_ROWS``..``TEP8_WIDE64_WIDE_LIMIT``; above 64 rows one launch.
+        tep8_wide64_wide_tile: the tile of that launch (``TEP8_WIDE64_WIDE_TILE``), a name of
+            ``TEP8_WIDE64_WIDE_TILES``; ``2cta`` the 2-CTA kernel (``TEP8_WIDE64_WIDE_2CTA``).
+        tep8_wide64_wide_split_k: that launch's split_k (``TEP8_WIDE64_WIDE_SPLIT_K``), one of
+            ``TEP8_WIDE64_WIDE_SPLIT_KS`` (0: the served tactic's).
+        tep8_direct_prefetch_min_rows: the fewest rows of an armed direct-hop step whose QKV call
+            forks the o_proj weight's L2 prefetch (``DIRECT_PREFETCH_MIN_ROWS``): 0 (none) ..
+            ``DIRECT_PREFETCH_LIMIT``.
         prefetch_join: join the weight prefetch ``before`` or ``after`` the consumer GEMM's launch
             (``PREFETCH_JOIN_AFTER``).
         drop_weight_prefetch: the consumer sites (or ``all``) whose weight prefetch is not forked
             (``DROPPED_PREFETCH_CONSUMERS``).
+        tep8_wide64_prep_fold: armed 2-CTA calls fold the multi-request decode prep into their
+            epilogue (``TEP8_WIDE64_PREP_FOLD``); needs ``tep8_wide64_wide_tile`` ``2cta`` and a
+            ``tep8_wide64_max_rows`` above 64.
 
     Raises:
         ValueError: for a ``prefetch_join`` other than ``before`` / ``after``, an unknown
             ``drop_weight_prefetch`` site, or, with ``tep8_wide64``, an unknown
-            ``tep8_wide64_kernels`` site; nothing is set then.
+            ``tep8_wide64_kernels`` site, or a ``tep8_wide64_min_rows`` outside
+            ``TEP8_WIDE64_MIN_LIMIT``..``TEP8_WIDE64_FLOOR``, a ``tep8_wide64_max_rows`` outside
+            ``TEP8_WIDE64_MAX_ROWS``..``TEP8_WIDE64_WIDE_LIMIT``, a ``tep8_wide64_wide_tile`` not
+            in ``TEP8_WIDE64_WIDE_TILES``, ``2cta`` with a ``tep8_wide64_wide_split_k`` it does not
+            serve, a ``tep8_wide64_max_rows`` above 64 without ``tep8_wide64``, or
+            ``tep8_wide64_prep_fold`` without ``2cta`` above 64 rows; nothing is set then.
     """
     global POOL_SPLITK8, _TEP4_WIDE_GEMMS, _TEP4_NARROW_GEMMS, DROPPED_PREFETCH_CONSUMERS
-    global PREFETCH_JOIN_AFTER, TEP8_WIDE64_SITES, TEP8_WIDE64_KERNELS
+    global PREFETCH_JOIN_AFTER, TEP8_WIDE64_SITES, TEP8_WIDE64_KERNELS, TEP8_WIDE64_MIN_ROWS
+    global TEP8_WIDE64_WIDE_MAX_ROWS, TEP8_WIDE64_WIDE_TILE, DIRECT_PREFETCH_MIN_ROWS
+    global TEP8_WIDE64_WIDE_SPLIT_K, TEP8_WIDE64_WIDE_2CTA, TEP8_WIDE64_PREP_FOLD
+    if int(tep8_wide64_wide_split_k) not in TEP8_WIDE64_WIDE_SPLIT_KS:
+        raise ValueError(
+            f"[musespark_open] dense_gemms: tep8_wide64_wide_split_k must be one of "
+            f"{list(TEP8_WIDE64_WIDE_SPLIT_KS)}, got {tep8_wide64_wide_split_k}"
+        )
+    if not 0 <= int(tep8_direct_prefetch_min_rows) <= DIRECT_PREFETCH_LIMIT:
+        raise ValueError(
+            f"[musespark_open] dense_gemms: tep8_direct_prefetch_min_rows must be in "
+            f"0..{DIRECT_PREFETCH_LIMIT}, got {tep8_direct_prefetch_min_rows}"
+        )
+    if not TEP8_WIDE64_MIN_LIMIT <= int(tep8_wide64_min_rows) <= TEP8_WIDE64_FLOOR:
+        raise ValueError(
+            f"[musespark_open] dense_gemms: tep8_wide64_min_rows must be in "
+            f"{TEP8_WIDE64_MIN_LIMIT}..{TEP8_WIDE64_FLOOR}, got {tep8_wide64_min_rows}"
+        )
+    if not TEP8_WIDE64_MAX_ROWS <= int(tep8_wide64_max_rows) <= TEP8_WIDE64_WIDE_LIMIT:
+        raise ValueError(
+            f"[musespark_open] dense_gemms: tep8_wide64_max_rows must be in "
+            f"{TEP8_WIDE64_MAX_ROWS}..{TEP8_WIDE64_WIDE_LIMIT}, got {tep8_wide64_max_rows}"
+        )
+    if int(tep8_wide64_max_rows) > TEP8_WIDE64_MAX_ROWS and not tep8_wide64:
+        raise ValueError(
+            "[musespark_open] dense_gemms: tep8_wide64_max_rows above "
+            f"{TEP8_WIDE64_MAX_ROWS} needs tep8_wide64"
+        )
+    if tep8_wide64_wide_tile not in TEP8_WIDE64_WIDE_TILES:
+        raise ValueError(
+            f"[musespark_open] dense_gemms: tep8_wide64_wide_tile must be one of "
+            f"{list(TEP8_WIDE64_WIDE_TILES)}, got {tep8_wide64_wide_tile!r}"
+        )
+    if (
+        tep8_wide64_wide_tile == TEP8_WIDE64_2CTA
+        and int(tep8_wide64_wide_split_k)
+        and int(tep8_wide64_wide_split_k) not in TEP8_WIDE64_2CTA_SPLIT_KS
+    ):
+        raise ValueError(
+            "[musespark_open] dense_gemms: tep8_wide64_wide_tile 2cta serves split_k "
+            f"{list(TEP8_WIDE64_2CTA_SPLIT_KS)} (tep8_wide64_wide_split_k 0 = the served 4), got "
+            f"tep8_wide64_wide_split_k {tep8_wide64_wide_split_k}"
+        )
+    if tep8_wide64_prep_fold and not (
+        tep8_wide64
+        and tep8_wide64_wide_tile == TEP8_WIDE64_2CTA
+        and int(tep8_wide64_max_rows) > TEP8_WIDE64_MAX_ROWS
+    ):
+        raise ValueError(
+            "[musespark_open] dense_gemms: MUSESPARK_OPEN_LEVER_TEP8_WIDE64_SPLITK__PREP_FOLD folds "
+            "the decode prep into the 2-CTA QKV launch: it needs WIDE_TILE=2cta and MAX_ROWS above "
+            f"{TEP8_WIDE64_MAX_ROWS} (got tile {tep8_wide64_wide_tile!r}, max_rows "
+            f"{tep8_wide64_max_rows}, tep8_wide64 {bool(tep8_wide64)})"
+        )
     join = str(prefetch_join).strip() or "before"
     if join not in ("before", "after"):
         raise ValueError(
@@ -775,6 +981,13 @@ def configure(
     PREFETCH_JOIN_AFTER = join == "after"
     TEP8_WIDE64_SITES = sites
     TEP8_WIDE64_KERNELS = kernels
+    TEP8_WIDE64_MIN_ROWS = int(tep8_wide64_min_rows)
+    TEP8_WIDE64_WIDE_MAX_ROWS = int(tep8_wide64_max_rows)
+    DIRECT_PREFETCH_MIN_ROWS = int(tep8_direct_prefetch_min_rows)
+    TEP8_WIDE64_WIDE_TILE = TEP8_WIDE64_WIDE_TILES[tep8_wide64_wide_tile]
+    TEP8_WIDE64_WIDE_2CTA = tep8_wide64_wide_tile == TEP8_WIDE64_2CTA
+    TEP8_WIDE64_WIDE_SPLIT_K = int(tep8_wide64_wide_split_k)
+    TEP8_WIDE64_PREP_FOLD = bool(tep8_wide64_prep_fold)
 
 
 #: The kernel families of ``ops/gemm/dense_gemm``.
@@ -855,6 +1068,11 @@ class DenseGemmDispatcher:
         #: for one call), the next call of its row count and width returns this tensor after the
         #: joins and the prefetch fork, without a GEMM, and clears it. ``None`` otherwise.
         self.substitute: Optional[torch.Tensor] = None
+        #: While set (``TEP8_WIDE64_PREP_FOLD``: by ``multi_request_prep_append`` for one decode
+        #: forward of its layer), a WIDE_TILE ``2cta`` call takes it and, unless it declines the
+        #: call (``operands``), runs the prep-fold kernel and hands it the prep's outputs
+        #: (``finish``). ``None`` otherwise.
+        self.prep_fold: Optional[object] = None
 
     @staticmethod
     def is_decode_call(input_tensor: torch.Tensor) -> bool:
@@ -941,8 +1159,9 @@ class DenseGemmDispatcher:
     def wide64(
         self, input_tensor: torch.Tensor, weight: torch.Tensor, bias
     ) -> Optional[torch.Tensor]:
-        """A 33..64-row TP8 decode call of a ``TEP8_WIDE64_SITES`` site on flashinfer's split-K, or ``None``
-        (the caller then runs the built-in ``Linear.apply_linear``, i.e. cuBLAS)."""
+        """A 33..64-row TP8 decode call of a ``TEP8_WIDE64_SITES`` site on flashinfer's split-K (QKV up
+        to ``TEP8_WIDE64_WIDE_MAX_ROWS``: ``_wide_tiles``), or ``None`` (the caller then runs the
+        built-in ``Linear.apply_linear``, i.e. cuBLAS)."""
         site = self.site
         plan = site.plan
         if site.role not in TEP8_WIDE64_SITES or plan.tp_size != 8 or bias is not None:
@@ -965,7 +1184,20 @@ class DenseGemmDispatcher:
             return None
         k = int(weight.shape[1])
         rows = input_tensor.numel() // k
-        if not TEP8_WIDE64_MIN_ROWS <= rows <= TEP8_WIDE64_MAX_ROWS:
+        if TEP8_WIDE64_MAX_ROWS < rows <= 2 * TEP8_WIDE64_MAX_ROWS and site.role == "o_proj":
+            # hop128 (``tep8_direct_hop``'s MAX_ROWS 128): only a step the direct publication armed;
+            # every other 65..128-row call keeps cuBLAS, as before.
+            return self._direct128(input_tensor, weight, rows, k)
+        if rows > TEP8_WIDE64_MAX_ROWS:
+            if rows <= TEP8_WIDE64_WIDE_MAX_ROWS and site.role in TEP8_WIDE64_WIDE_SITES:
+                # ``tep8_wide64_max_rows``: 65..MAX_ROWS-row QKV in one launch (every row's bits).
+                return self._wide_tiles(input_tensor, weight, rows, k)
+            return None
+        if rows < TEP8_WIDE64_MIN_ROWS and not (
+            # ``tep8_direct_hop``'s MIN_ROWS below the wide64 band: an armed step's o_proj still
+            # scatters (below); every other call keeps the 9..32-row wide table.
+            site.role == "o_proj" and rows > MAX_ROWS and self._direct_target(rows) is not None
+        ):
             return None
         plan.join()
         if plan.named_forks:
@@ -978,9 +1210,16 @@ class DenseGemmDispatcher:
             from ...ops.allreduce import post_attn_hop_wide as _wide
 
             publication = getattr(_wide, "_DIRECT_PUBLICATION", None)
-            target = publication.target(self, rows) if publication is not None else None
+            target = self._direct_target(rows)
             if target is not None:
                 view, peer_stride, fb_layout = target
+                if rows < TEP8_WIDE64_FLOOR:
+                    logger.info_once(
+                        f"[musespark_open] tep8_direct_hop: o_proj of {_wide.SERVED_DIRECT_ROWS[0]}.."
+                        f"{TEP8_WIDE64_FLOOR - 1}-row steps scatters on the served wide64 tactic "
+                        f"{TEP8_WIDE64_KERNELS[site.role]} (direct hop MIN_ROWS)",
+                        key="musespark_open.tep8_direct_hop_low_rows",
+                    )
                 family, fields = parse_kernel(TEP8_WIDE64_KERNELS[site.role])
                 if family != "splitk" or fields[2] != 1:
                     raise RuntimeError(
@@ -995,12 +1234,245 @@ class DenseGemmDispatcher:
                     _wide.SplitKTactic(*fields),
                     peer_stride,
                     fb_layout,
+                    # The workspace's slots per source (16 on hop128's 128-row workspace).
+                    publication.target_slots(),
                 )
                 return view.view(*input_tensor.shape[:-1], int(weight.shape[0]))
         out = dense_gemm(
             input_tensor.view(-1, k), weight, TEP8_WIDE64_KERNELS[site.role], plan.enable_pdl
         )
         return out.view(*input_tensor.shape[:-1], int(weight.shape[0]))
+
+    def _direct_target(self, rows: int):
+        """``DirectPublication.target`` of this dispatcher's call of ``rows`` rows (the armed step's
+        scatter view), or None (no direct publication, not armed, or not this step's rows)."""
+        from ...ops.allreduce import post_attn_hop_wide as _wide
+
+        publication = getattr(_wide, "_DIRECT_PUBLICATION", None)
+        return publication.target(self, rows) if publication is not None else None
+
+    def fork_direct_prefetch(self, input_tensor: torch.Tensor, weight: torch.Tensor) -> bool:
+        """``DIRECT_PREFETCH_MIN_ROWS``: after a QKV call of a decode step of at least that many rows
+        (above ``WIDE_MAX_ROWS``) that the direct publication armed, fork the L2 prefetch of the
+        layer's o_proj weight (``DenseGemmPlan.fork_prefetch``; the o_proj producer joins it).
+        Returns whether it forked."""
+        site = self.site
+        if site.role != "qkv" or site.next_weight is None or not DIRECT_PREFETCH_MIN_ROWS:
+            return False
+        if torch.is_grad_enabled() or torch.compiler.is_compiling():
+            return False
+        rows = input_tensor.numel() // max(int(weight.shape[-1]), 1)
+        if rows <= WIDE_MAX_ROWS or rows < DIRECT_PREFETCH_MIN_ROWS:
+            return False
+        from ...ops.allreduce import post_attn_hop_wide as _wide
+
+        publication = getattr(_wide, "_DIRECT_PUBLICATION", None)
+        if publication is None or getattr(publication, "rows", None) != rows:
+            return False
+        site.plan.fork_prefetch(site.next_weight())
+        logger.info_once(
+            "[musespark_open] tep8_direct_hop PREFETCH_MIN_ROWS: the QKV call of armed "
+            f"{max(DIRECT_PREFETCH_MIN_ROWS, WIDE_MAX_ROWS + 1)}..{getattr(_wide, 'DIRECT_MAX_ROWS', 64)}-row "
+            "steps forks the L2 prefetch of the layer's o_proj weight (joined by the scatter producer)",
+            key="musespark_open.tep8_direct_prefetch",
+        )
+        return True
+
+    def _wide_tiles(
+        self, input_tensor: torch.Tensor, weight: torch.Tensor, rows: int, k: int
+    ) -> torch.Tensor:
+        """``tep8_wide64_max_rows``: a 65..``TEP8_WIDE64_WIDE_MAX_ROWS``-row call of a
+        ``TEP8_WIDE64_WIDE_SITES`` site in ONE launch of its served wide64 tactic on
+        ``TEP8_WIDE64_WIDE_TILE`` tiles, the token tiles on the grid's second dimension
+        (``splitk_gemm.run_splitk_dense_tiles``): each row gets the bits it gets in a 1..64-row call
+        (the same split_k). Like the 33..64-row calls, it joins and forks no weight prefetch.
+        WIDE_TILE ``2cta``: ``_wide_2cta`` instead."""
+        if TEP8_WIDE64_WIDE_2CTA:
+            return self._wide_2cta(input_tensor, weight, rows, k)
+        from ...ops.gemm import splitk_gemm as _splitk
+
+        site = self.site
+        plan = site.plan
+        n = int(weight.shape[0])
+        key = (
+            TEP8_WIDE64_KERNELS[site.role],
+            TEP8_WIDE64_WIDE_TILE,
+            k,
+            n,
+            TEP8_WIDE64_WIDE_SPLIT_K,
+        )
+        kernel = _WIDE_TILES_KERNELS.get(key)
+        if kernel is None:
+            kernel = _WIDE_TILES_KERNELS[key] = _wide_tiles_kernel(*key)
+        plan.join()
+        if plan.named_forks:
+            plan.join_role(site.role)
+        out = torch.empty((rows, n), dtype=input_tensor.dtype, device=input_tensor.device)
+        _splitk.run_splitk_dense_tiles(
+            input_tensor.view(-1, k),
+            weight.t(),
+            out,
+            plan.enable_pdl,
+            _splitk.SplitKTactic(*parse_kernel(kernel)[1]),
+        )
+        fields = parse_kernel(kernel)[1]
+        same = fields[2] == parse_kernel(TEP8_WIDE64_KERNELS[site.role])[1][2]
+        logger.info_once(
+            f"[musespark_open] tep8_wide64_splitk: {site.role} of {TEP8_WIDE64_MAX_ROWS + 1}.."
+            f"{TEP8_WIDE64_WIDE_MAX_ROWS}-row TP8 decode steps in one launch of {kernel} "
+            f"({fields[1]}-row token tiles, "
+            + (
+                f"the {TEP8_WIDE64_MAX_ROWS}-row call's bits"
+                if same
+                else f"split_k {fields[2]}: numeric, not the {TEP8_WIDE64_MAX_ROWS}-row call's bits"
+            )
+            + "; MAX_ROWS)",
+            key=f"musespark_open.tep8_wide64_max_rows.{site.role}",
+        )
+        return out.view(*input_tensor.shape[:-1], n)
+
+    def _wide_2cta(
+        self, input_tensor: torch.Tensor, weight: torch.Tensor, rows: int, k: int
+    ) -> torch.Tensor:
+        """WIDE_TILE ``2cta``: the 65..``TEP8_WIDE64_WIDE_MAX_ROWS``-row call in one launch of
+        ``ops/gemm/splitk_gemm_2cta`` at the served tactic's split_k (or WIDE_SPLIT_K): each row the
+        bits of its 1..64-row call at that split_k. A build or launch failure raises (no fallback)."""
+        site = self.site
+        plan = site.plan
+        n = int(weight.shape[0])
+        split_k = TEP8_WIDE64_WIDE_SPLIT_K or parse_kernel(TEP8_WIDE64_KERNELS[site.role])[1][2]
+        error = _2cta_shape_error(n, k, split_k)
+        if error is not None:
+            raise ValueError(f"[musespark_open] tep8_wide64_splitk WIDE_TILE 2cta: {error}")
+        from ...ops.gemm import splitk_gemm_2cta as _two
+
+        fold = self.prep_fold
+        self.prep_fold = None
+        plan.join()
+        if plan.named_forks:
+            plan.join_role(site.role)
+        out = torch.empty((rows, n), dtype=input_tensor.dtype, device=input_tensor.device)
+        if fold is not None:
+            if not (TEP8_WIDE64_PREP_FOLD and TEP8_WIDE64_2CTA_RS):
+                raise RuntimeError(
+                    "[musespark_open] tep8_wide64_splitk: a prep fold armed with "
+                    "MUSESPARK_OPEN_LEVER_TEP8_WIDE64_SPLITK__PREP_FOLD off or the owner epilogue"
+                )
+            operands = fold.operands(out)
+            if operands is not None:
+                from ...ops.gemm import splitk_gemm_2cta_prep as _fold
+
+                _fold.run_splitk_2cta_prep_fold(
+                    input_tensor.view(-1, k),
+                    weight,
+                    out,
+                    plan.enable_pdl,
+                    split_k,
+                    TEP8_WIDE64_2CTA_PRESTAGE,
+                    **operands,
+                )
+                fold.finish(out)
+                logger.info_once(
+                    f"[musespark_open] tep8_wide64_splitk PREP_FOLD: {TEP8_WIDE64_MAX_ROWS + 1}.."
+                    f"{TEP8_WIDE64_WIDE_MAX_ROWS}-row multi-request decode steps run the QKV "
+                    "projection and the packed decode prep (q/k norm, RoPE, gate split, E4M3 query, "
+                    "FP8 K/V append, FMHA scales) in one launch of the 2-CTA split-K kernel "
+                    f"(ops/gemm/splitk_gemm_2cta_prep, split_k {split_k}; the same bytes)",
+                    key="musespark_open.tep8_wide64_prep_fold",
+                )
+                return out.view(*input_tensor.shape[:-1], n)
+        _two.run_splitk_2cta(
+            input_tensor.view(-1, k),
+            weight,
+            out,
+            plan.enable_pdl,
+            split_k,
+            rs=TEP8_WIDE64_2CTA_RS,
+            prestage=TEP8_WIDE64_2CTA_PRESTAGE,
+        )
+        served = parse_kernel(TEP8_WIDE64_KERNELS[site.role])[1][2]
+        logger.info_once(
+            f"[musespark_open] tep8_wide64_splitk: {site.role} of {TEP8_WIDE64_MAX_ROWS + 1}.."
+            f"{TEP8_WIDE64_WIDE_MAX_ROWS}-row TP8 decode steps in one launch of the 2-CTA split-K "
+            f"kernel (ops/gemm/splitk_gemm_2cta, "
+            f"{'reduce-scatter' if TEP8_WIDE64_2CTA_RS else 'owner'} epilogue, split_k {split_k}: "
+            + (
+                f"the {TEP8_WIDE64_MAX_ROWS}-row call's bits"
+                if split_k == served
+                else f"numeric, not the {TEP8_WIDE64_MAX_ROWS}-row call's bits"
+            )
+            + "; WIDE_TILE 2cta)",
+            key=f"musespark_open.tep8_wide64_2cta.{site.role}",
+        )
+        return out.view(*input_tensor.shape[:-1], n)
+
+    def _direct128(
+        self, input_tensor: torch.Tensor, weight: torch.Tensor, rows: int, k: int
+    ) -> Optional[torch.Tensor]:
+        """hop128: o_proj of a 65..128-row step the direct publication armed, on the split_k-1
+        scatter kernel (``post_attn_hop_wide.DIRECT128_PRODUCER``): ``chunks`` as 64-row launches of
+        the served tactic (each chunk's tokens land in their own slots: chunk c through the view
+        advanced by 8 c slots), in token order on the current stream (PDL chains them); ``grid`` /
+        ``tile128`` as one launch of 64- or 128-token tiles. ``None`` (cuBLAS, as before) when not
+        armed."""
+        from ...ops.allreduce import post_attn_hop_wide as _wide
+
+        site = self.site
+        plan = site.plan
+        publication = getattr(_wide, "_DIRECT_PUBLICATION", None)
+        if publication is None or not getattr(_wide, "DIRECT128", False):
+            return None
+        target = publication.target(self, rows)
+        if target is None:
+            return None
+        view, peer_stride, fb_layout = target
+        family, fields = parse_kernel(TEP8_WIDE64_KERNELS[site.role])
+        if family != "splitk" or fields[2] != 1:
+            raise RuntimeError(
+                f"[musespark_open] hop128: o_proj runs {TEP8_WIDE64_KERNELS[site.role]}, not a "
+                "split_k 1 split-K kernel"
+            )
+        plan.join()
+        if plan.named_forks:
+            plan.join_role(site.role)
+        a = input_tensor.view(-1, k)
+        b = weight.t()
+        slots = publication.target_slots()
+        mode, stages = _wide.DIRECT128_PRODUCER
+        if mode != "chunks":
+            if not fb_layout:
+                raise RuntimeError(
+                    f"[musespark_open] hop128 producer {mode}: needs the fb-layout workspace"
+                )
+            _wide.run_splitk_scatter_wide(
+                a,
+                b,
+                publication.chunk_view(view, 0, rows),
+                plan.enable_pdl,
+                _wide.hop128_tactic(mode, stages),
+                peer_stride,
+                slots,
+            )
+            logger.info_once(
+                f"[musespark_open] hop128 producer: o_proj of {TEP8_WIDE64_MAX_ROWS + 1}.."
+                f"{_wide.DIRECT_MAX_ROWS}-row steps in one {mode} launch ({stages} stages)",
+                key="musespark_open.hop128_producer",
+            )
+            return view.view(*input_tensor.shape[:-1], int(weight.shape[0]))
+        tactic = _wide.SplitKTactic(*fields)
+        for row0 in range(0, rows, TEP8_WIDE64_MAX_ROWS):
+            n = min(TEP8_WIDE64_MAX_ROWS, rows - row0)
+            _wide.run_splitk_scatter(
+                a[row0 : row0 + n],
+                b,
+                publication.chunk_view(view, row0, n),
+                plan.enable_pdl,
+                tactic,
+                peer_stride,
+                fb_layout,
+                slots,
+            )
+        return view.view(*input_tensor.shape[:-1], int(weight.shape[0]))
 
     def _launches_itself(self, input_tensor, weight, bias) -> bool:
         """Whether this call launches the plan's kernel itself: it fits, and when a transport slot is armed
@@ -1129,11 +1601,15 @@ class MuseSparkOpenTepDenseLinear(Linear):
         batch = dispatcher.site.plan.batch
         lora = getattr(self, "lora", None) is not None and bool(lora_params)
         if batch is None or lora:
+            out = None
             if TEP8_WIDE64_SITES and not lora:
                 out = dispatcher.wide64(input, self.weight, bias)
-                if out is not None:
-                    return out
-            return Linear.apply_linear(self, input, bias, lora_params, layer_idx)
+            if out is None:
+                out = Linear.apply_linear(self, input, bias, lora_params, layer_idx)
+            if DIRECT_PREFETCH_MIN_ROWS and not lora:
+                # After the call's GEMM is on the stream: the prefetch overlaps attention.
+                dispatcher.fork_direct_prefetch(input, self.weight)
+            return out
         return batch.projection(
             dispatcher.site,
             input,
@@ -1274,6 +1750,18 @@ def install(
                         f"cannot serve {rows} rows: {error} (ops/gemm/splitk_gemm.py validates "
                         "it with its wide64 setting)"
                     )
+            if role in TEP8_WIDE64_WIDE_SITES and TEP8_WIDE64_WIDE_MAX_ROWS > TEP8_WIDE64_MAX_ROWS:
+                # MAX_ROWS: resolve (and check) the one-launch kernel here, not at a step.
+                if TEP8_WIDE64_WIDE_2CTA:
+                    split_k = TEP8_WIDE64_WIDE_SPLIT_K or fields[2]
+                    error = _2cta_shape_error(shape[1], shape[0], split_k)
+                    if error is not None:
+                        raise ValueError(
+                            f"[musespark_open] tep8_wide64_splitk WIDE_TILE 2cta: {role} {error}"
+                        )
+                else:
+                    key = (kernel, TEP8_WIDE64_WIDE_TILE, *shape, TEP8_WIDE64_WIDE_SPLIT_K)
+                    _WIDE_TILES_KERNELS[key] = _wide_tiles_kernel(*key)
         logger.info(
             f"[musespark_open] dense_gemms tep8_wide64: TP8 calls of {TEP8_WIDE64_MIN_ROWS}.."
             f"{TEP8_WIDE64_MAX_ROWS} rows of "

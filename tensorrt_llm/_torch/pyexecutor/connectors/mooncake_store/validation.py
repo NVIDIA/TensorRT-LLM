@@ -62,6 +62,27 @@ def validate_llm_args(llm_args: TorchLlmArgs) -> None:
             "is untested. Run with tensor parallelism only."
         )
 
+    if getattr(llm_args.kv_cache_config, "enable_swa_scratch_reuse", False):
+        raise NotImplementedError(
+            "The mooncake-store connector does not support "
+            "kv_cache_config.enable_swa_scratch_reuse. The connector saves a "
+            "sliding window's pages at the end of a prompt from the page indices "
+            "the cache reported when it allocated them, and scratch reuse lets a "
+            "prefill write a window block into a page it does not keep."
+        )
+
+    spec_config = getattr(llm_args, "speculative_config", None)
+    recompute_tail = (
+        getattr(spec_config, "context_recompute_tail", 0) if spec_config is not None else 0
+    )
+    if recompute_tail:
+        raise NotImplementedError(
+            "The mooncake-store connector does not support "
+            "speculative_config.context_recompute_tail. The runtime trims a reserved prefix to leave that tail for "
+            "the drafter after the lookup verified the sliding window at the full end, so the window the trimmed "
+            "load needs was never checked against the store. Leave context_recompute_tail at 0."
+        )
+
     # Only configs with an index-V cache declare the setting.
     sparse_config = llm_args.sparse_attention_config
     if sparse_config is not None and not getattr(sparse_config, "sparse_disable_index_value", True):
@@ -103,6 +124,7 @@ def validate_node_budget(
     *,
     ranks_on_node: Optional[int] = None,
     available_bytes: Optional[int] = None,
+    load_threads: int = 1,
 ) -> None:
     """Reject a segment size this node cannot afford once every rank asks.
 
@@ -118,6 +140,8 @@ def validate_node_budget(
             Defaults to the local MPI communicator's size.
         available_bytes: Host memory to measure against. Defaults to the
             kernel's own figure.
+        load_threads: Asynchronous loader threads per loading rank, each
+            pinning a staging pool of its own.
     """
     from tensorrt_llm._utils import local_mpi_size
 
@@ -131,9 +155,10 @@ def validate_node_budget(
 
     segment_claim = ranks_on_node * max(0, config.global_segment_size)
     # Staging is pinned for the process's lifetime and comes out of the same
-    # DRAM, so it belongs in the sum even when no segment is mounted. One pool
-    # per direction, and a capacity-only rank opens neither.
-    directions = int(config.role.loads) + int(config.role.saves)
+    # DRAM, so it belongs in the sum even when no segment is mounted. Loads get
+    # a pool for the executor and one per asynchronous loader thread, saves
+    # one, and a capacity-only rank opens none.
+    directions = (1 + load_threads) * int(config.role.loads) + int(config.role.saves)
     staging_claim = ranks_on_node * directions * MAX_STAGING_BUFFER_BYTES
 
     claimed = segment_claim + staging_claim
@@ -186,18 +211,109 @@ def validate_node_budget(
     )
 
 
-def validate_layout(layout: "KvCacheLayout") -> None:
-    """Reject KV cache geometries this connector cannot key correctly."""
-    windowed = [group.layer_group_id for group in layout.groups if group.window_size is not None]
-    if windowed:
-        raise NotImplementedError(
-            "The mooncake-store connector does not support sliding-window "
-            f"attention (layer groups {windowed} declare a window size). A page's "
-            "validity then depends on where the window sits, which is a property "
-            "of the request that read it rather than of the tokens it holds, so "
-            "content-addressed reuse across instances is not sound."
-        )
+# Kept from our lineage (donor.py / trtllm-serve mooncake_donor use it; not in PR #21270).
+def _cgroup_room(
+    proc_cgroup: str = "/proc/self/cgroup", root: str = "/sys/fs/cgroup"
+) -> Optional[int]:
+    """Least room left under any cgroup v2 memory limit above this process.
 
+    Room is the limit less what reclaim cannot free: usage less the page
+    cache that reclaim can drop, which leaves out shared memory and
+    unevictable (mlocked) pages. `None` when no limit applies or one is
+    unreadable.
+    """
+    try:
+        with open(proc_cgroup) as handle:
+            path = next(
+                (line.strip().split("::", 1)[1] for line in handle if line.startswith("0::")), None
+            )
+    except OSError:
+        return None
+    if path is None:
+        return None
+    rooms = []
+    parts = [part for part in path.split("/") if part]
+    for depth in range(len(parts), -1, -1):
+        directory = os.path.join(root, *parts[:depth])
+        try:
+            with open(os.path.join(directory, "memory.max")) as handle:
+                limit = handle.read().strip()
+        except OSError:
+            continue
+        if not limit.isdigit():
+            continue
+        # A known finite limit always counts, however little else is readable.
+        try:
+            with open(os.path.join(directory, "memory.current")) as handle:
+                current = int(handle.read().strip())
+        except (OSError, ValueError):
+            rooms.append(0)  # usage unknown: assume no room rather than drop the limit
+            continue
+        try:
+            with open(os.path.join(directory, "memory.stat")) as handle:
+                stat = dict(line.split() for line in handle if len(line.split()) == 2)
+            reclaimable = max(
+                0, int(stat["file"]) - int(stat["shmem"]) - int(stat.get("unevictable", 0))
+            )
+        except (OSError, KeyError, ValueError):
+            reclaimable = 0  # no page-cache allowance without the statistics
+        rooms.append(int(limit) - (current - reclaimable))
+    return min(rooms) if rooms else None
+
+
+def validate_donation_budget(
+    segment_size: int, local_buffer_size: int, *, available_bytes: Optional[int] = None
+) -> None:
+    """Reject a donation this node cannot back, before any of it is allocated.
+
+    A donor runs beside the node's servers, so a segment larger than what is
+    left surfaces as the OOM killer once Mooncake touches it rather than as a
+    failed start. The same measure and reserve as `validate_node_budget`.
+
+    The host's figure is capped by the room under any container (cgroup)
+    memory limit.
+
+    Args:
+        segment_size: Bytes the donor lends.
+        local_buffer_size: Mooncake's per-process transfer buffer, also host memory.
+        available_bytes: Host memory to measure against. Defaults to the
+            kernel's own figure.
+    """
+    claimed = segment_size + local_buffer_size
+    if available_bytes is None:
+        available_bytes = _available_host_memory()
+        # A container's memory limit can be far below what the host has free.
+        room = _cgroup_room()
+        if room is not None:
+            available_bytes = room if available_bytes is None else min(available_bytes, room)
+    if available_bytes is None:
+        logger.warning(
+            "mooncake-store: cannot read this node's available memory, so the "
+            f"{claimed / _GIB:.1f} GiB donation is not checked against it."
+        )
+        return
+    budget = available_bytes - NODE_BUDGET_RESERVE_BYTES
+    if claimed <= budget:
+        return
+    affordable = max(0, budget - local_buffer_size)
+    raise ValueError(
+        f"mooncake-store: this node cannot back a {segment_size / _GIB:.1f} GiB donation "
+        f"(plus a {local_buffer_size / _GIB:.2f} GiB transfer buffer): only "
+        f"{available_bytes / _GIB:.1f} GiB is available and "
+        f"{NODE_BUDGET_RESERVE_BYTES / _GIB:.0f} GiB of that is reserved for the "
+        f"node's servers. Lower --segment_size to at most {affordable / _GIB:.1f} GiB."
+    )
+
+
+def validate_layout(layout: "KvCacheLayout") -> None:
+    """Reject KV cache geometries this connector cannot key correctly.
+
+    Sliding-window groups are accepted. A page's bytes are fixed by the tokens
+    up to and including its block, which its key already chains, so a stored
+    page is never wrong for a request that shares the prefix. What a window
+    changes is which pages exist: the scheduler saves a window's pages only at
+    the end of each prompt, and a lookup resumes only where those are present.
+    """
     if not layout.groups:
         raise ValueError(
             "The KV cache layout describes no layer groups, so there is nothing "

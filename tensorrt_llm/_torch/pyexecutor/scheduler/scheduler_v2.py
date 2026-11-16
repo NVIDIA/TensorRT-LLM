@@ -38,6 +38,52 @@ from .scheduler import (
     drop_decoder_context_requests_waiting_for_encoder_output,
 )
 
+# MCB (local diagnostics / experiment, 2026-11-08): TRTLLM_MCB_DIAG=1 counts, per scheduling pass, why pending
+# context requests were not scheduled (read by the executor's [MCB] pass line). TRTLLM_MCB_LOAD_AHEAD=1 starts
+# asynchronous connector prefix loads without charging the token budget (_mcb_try_load_ahead).
+_MCB_DIAG = os.environ.get("TRTLLM_MCB_DIAG", "0") == "1"
+_MCB_LOAD_AHEAD = os.environ.get("TRTLLM_MCB_LOAD_AHEAD", "0") == "1"
+MCB_LAST_PASS = {"c": None}
+
+# ---- KVRG: out-of-pages context retry gate (M3.1 port, default off) ----------------------------
+# With the KV pool full, phase 2 re-runs the reuse probe + claim (prepare_context, which under a
+# Mooncake store connector also runs the store lookup and its prefix reservation) and
+# resize_context for every waiting first-chunk context request on every pass, and each attempt
+# fails again. The gate remembers such a failure together with the pools' page counts (available
+# and evictable, every pool group, every cache level, target and draft pools) and replays the
+# stock outcome without the prepare/resize work until a count rises, the token budget or chunk
+# cap would give a smaller chunk than the failed one, or MAX_SKIP + (request id mod MAX_SKIP)
+# passes have gone by. A replayed failure has the stock side effects: an out-of-pages one still
+# calls preempt_for_pages exactly as stock does, and both kinds note the page refusal, so the
+# ContextPageBackoff (at the prefill-decode interval) sees the same refusals and
+# holds the same passes; a first chunk the backoff holds never reaches the gate. The gate
+# stands aside once the deadlock detector has counted half its threshold, and the MCB
+# load-ahead attempt (TRTLLM_MCB_LOAD_AHEAD) always runs for real. Chunked prefill only.
+# Port of peihengh fc115de3de (scheduler_v2.py, feat/m31-flash-perf2-vr-build), where it is on
+# by default with the kill switch TRTLLM_M31_DISABLE_KVRG=1. Here:
+#   default                     off (stock path)
+#   TRTLLM_M31_KVRG=1           gate on
+#   TRTLLM_M31_KVRG_SHADOW=1    stock decisions; the gate is only counted (implies tracking)
+#   TRTLLM_M31_KVRG_MAX_SKIP    default 16
+# Scheduling only; no numerics. Decisions use state identical on every TP rank.
+# Log lines start with "[M31 KVRG]".
+_KVRG_LOG_EVERY_S = 60.0
+
+
+def _kvrg_mode_from_env() -> str:
+    if os.environ.get("TRTLLM_M31_KVRG_SHADOW", "").strip() == "1":
+        return "shadow"
+    if os.environ.get("TRTLLM_M31_KVRG", "").strip() == "1":
+        return "on"
+    return "off"
+
+
+def _kvrg_max_skip_from_env() -> int:
+    try:
+        return max(1, int(os.environ.get("TRTLLM_M31_KVRG_MAX_SKIP", "16")))
+    except ValueError:
+        return 16
+
 
 class ScheduleAction(enum.Enum):
     """Result of a per-request scheduling attempt."""
@@ -426,13 +472,21 @@ class ShortestPrefillFirstOrder:
     #: order. 16 and 32 were unstable across replay variants; 64 kept shortest-first latencies.
     DEFAULT_AGING_FACTOR = 64
 
-    def __init__(self, aging_factor: int = DEFAULT_AGING_FACTOR):
+    def __init__(self, aging_factor: int = DEFAULT_AGING_FACTOR, store_aware: bool = True):
         if aging_factor < 0:
             raise ValueError(f"aging_factor must be non-negative, got {aging_factor}")
         self._aging_factor = aging_factor
+        # Also count the prefix the KV connector's store (Mooncake) can supply, so
+        # a store hit is not ranked as a cold prompt.
+        # TLLM_CTX_SRPT_STORE_AWARE=0 ranks on the local cache only.
+        self.store_aware = store_aware
         self._work = 0
         self._arrival_work: dict[int, int] = {}
         self._key: dict[int, int] = {}
+        # Requests prioritize() moved ahead: their work counts as zero.
+        self._prioritized: set[int] = set()
+        self._store_probe_counts = [0, 0, 0]  # probes, hits, store-only tokens
+        self._store_probe_last_log = time.monotonic()
 
     @property
     def aging_factor(self) -> int:
@@ -447,13 +501,20 @@ class ShortestPrefillFirstOrder:
     def describe(self) -> str:
         """The order, for the scheduler's startup log."""
         return (
-            f"shortest prefill first, aged by admitted context tokens (factor {self._aging_factor})"
+            f"shortest prefill first, aged by admitted context tokens (factor {self._aging_factor}), "
+            f"store_aware={self.store_aware}"
         )
 
     def _uncached_tokens(self, req: LlmRequest, kv_cache_manager) -> int:
         if not req.is_first_context_chunk:
             return req.context_remaining_length
+        if _MCB_LOAD_AHEAD and req.context_current_position > 0:
+            return req.context_remaining_length
         reusable = kv_cache_manager.probe_context_reuse(req)
+        if self.store_aware:
+            store_end = self._store_prefix_end(req, reusable, kv_cache_manager)
+            if store_end is not None and (reusable is None or store_end > reusable):
+                reusable = store_end
         if reusable is None:
             return req.context_remaining_length
         return max(req.prompt_len - reusable, 1)
@@ -463,10 +524,48 @@ class ShortestPrefillFirstOrder:
         key = self._key.get(request_id)
         if key is None:
             key = self._arrival_work[request_id]
-            if self._aging_factor:
+            if self._aging_factor and request_id not in self._prioritized:
                 key += self._aging_factor * self._uncached_tokens(req, kv_cache_manager)
             self._key[request_id] = key
         return key
+
+    def _store_prefix_end(
+        self, req: LlmRequest, local_reusable: Optional[int], kv_cache_manager
+    ) -> Optional[int]:
+        """End of the prompt prefix the KV connector's store can supply *req*, or None.
+
+        Probed once per request (the estimate is cached), from the local depth.
+        The probe is side-effect free; without attention DP it is a leader
+        broadcast, which holds because every TP rank ranks the same pending
+        requests in the same order. Blocks stored later leave the rank
+        conservative, never ahead of what the allocation-time query will offer.
+        """
+        connector = getattr(kv_cache_manager, "kv_connector_manager", None)
+        may_serve = getattr(kv_cache_manager, "_connector_may_serve", None)
+        if (
+            connector is None
+            or may_serve is None
+            or getattr(req, "py_connector_allocation_reported", False)
+            or not may_serve(req)
+        ):
+            return None
+        local_end = max(local_reusable or 0, req.context_current_position)
+        offered = connector.probe_num_matched_tokens(req, local_end)
+        counts = self._store_probe_counts
+        counts[0] += 1
+        store_end = None
+        if offered:
+            store_end = min(local_end + offered, req.prompt_len - 1)
+            counts[1] += 1
+            counts[2] += store_end - local_end
+        now = time.monotonic()
+        if now - self._store_probe_last_log >= 60.0:
+            self._store_probe_last_log = now
+            logger.info(
+                f"ctx-srpt store probes: probed={counts[0]} with_hit={counts[1]} "
+                f"store_tokens={counts[2]}"
+            )
+        return store_end
 
     def order(
         self,
@@ -492,6 +591,7 @@ class ShortestPrefillFirstOrder:
         for request_id in self._arrival_work.keys() - waiting_ids:
             del self._arrival_work[request_id]
             self._key.pop(request_id, None)
+            self._prioritized.discard(request_id)
         for request_id in waiting_ids - self._arrival_work.keys():
             self._arrival_work[request_id] = self._work
         context_reqs = [r for r in pending_ctx if r.state_value == context_init_state_value]
@@ -506,6 +606,16 @@ class ShortestPrefillFirstOrder:
         """Advance the clock by the context tokens of the requests this pass returned."""
         self._work += context_tokens
 
+    def prioritize(self, request_id: int) -> None:
+        """Count a not-yet-started request's prefill work as zero in its key.
+
+        Its work counts as zero, so its key is the clock reading it arrived at:
+        it goes ahead of every request that arrived with it or later (ties keep
+        arrival order).
+        """
+        self._prioritized.add(request_id)
+        self._key.pop(request_id, None)
+
 
 class KVCacheV2Scheduler(RequestScheduler):
     """Interleaved scheduler for KV Cache Manager V2.
@@ -514,8 +624,21 @@ class KVCacheV2Scheduler(RequestScheduler):
     assignment into one unified loop.
     """
 
+    # KVRG defaults keep the stock path for an instance built without __init__.
+    _kvrg_mode = "off"
+    _kvrg_track = False
+    _kvrg_bypass = False
+    _kvrg_iter = 0
+
+    # Per-request context chunk cap (TLLM_CTX_REQUEST_CHUNK_CAP); see __init__.
+    _ctx_request_chunk_cap: Optional[int] = None
+    _ctx_chunk_cap_eligible_share = False
+    _ctx_chunk_cap_this_pass: Optional[int] = None
+
     # Scheduling passes between two summaries of the prefill-decode interval.
     _CONTEXT_ADMISSION_LOG_PASSES = 4096
+    # Size above which the opt-in prefix-skip caches are pruned.
+    _PREFIX_SKIP_STATE_MAX_ENTRIES = 4096
 
     def __init__(
         self,
@@ -631,6 +754,56 @@ class KVCacheV2Scheduler(RequestScheduler):
             os.environ.get("TLLM_SCHEDULER_DISABLE_BLOCKED_CTX_SKIP", "0") != "1"
         )
 
+        # Opt-in (default off) extensions of the prefix-aware skip. With all
+        # three unset, the skip behaves as described in
+        # _collect_contributed_blocks.
+        #
+        # TRTLLM_SCHED_PREFIX_SKIP_PENDING=1: a started context request that is
+        # not in flight this pass also registers the block it is about to
+        # commit, so a first chunk sharing that prefix waits for it instead of
+        # recomputing the shared prefix. Under the overlap executor a long
+        # prefill is in flight only every other pass, and with an admission
+        # order other than arrival order a duplicate can otherwise be tried
+        # ahead of its contributor. A request is deferred at most
+        # TRTLLM_SCHED_PREFIX_SKIP_MAX_DEFER_PASSES times before it is
+        # admitted; the count restarts once it is scheduled.
+        self._prefix_skip_pending = os.environ.get("TRTLLM_SCHED_PREFIX_SKIP_PENDING", "0") == "1"
+        self._prefix_skip_max_defer_passes = _read_non_negative_int_env(
+            "TRTLLM_SCHED_PREFIX_SKIP_MAX_DEFER_PASSES", 2048
+        )
+        self._prefix_skip_defer_passes: dict[int, int] = {}
+        # TRTLLM_SCHED_PREFIX_SKIP_KEY_CACHE=1: cache a started context
+        # request's first-new-block key on its committed token count. The key
+        # moves only when the request commits blocks, so a pass re-probes only
+        # the requests whose previous chunk landed. The key is advisory (it
+        # only gates deferrals). A deferred first chunk also keeps its key:
+        # while that key is still some contributor's next block, the first
+        # chunk is deferred again without re-walking its prompt.
+        self._prefix_skip_key_cache = (
+            os.environ.get("TRTLLM_SCHED_PREFIX_SKIP_KEY_CACHE", "0") == "1"
+        )
+        self._continuation_key_cache: dict[int, tuple[int, bytes | None]] = {}
+        self._deferred_first_block_key: dict[int, bytes] = {}
+        # TRTLLM_SCHED_PREFIX_SKIP_PRIORITIZE=1 (with
+        # TRTLLM_SCHED_SHORTEST_PREFILL_FIRST=1): once the skip defers a
+        # request, its shortest-prefill-first work counts as zero, so its key
+        # is its arrival clock reading alone. The estimate was
+        # taken before the contributor computed the shared prefix, so it
+        # overstates the work left and would queue the request behind short
+        # ones while the contributor's sliding-window pages at the divergence
+        # point age out.
+        self._prefix_skip_prioritize = (
+            os.environ.get("TRTLLM_SCHED_PREFIX_SKIP_PRIORITIZE", "0") == "1"
+        )
+        if self._prefix_skip_pending or self._prefix_skip_key_cache or self._prefix_skip_prioritize:
+            logger.info(
+                "KVCacheV2Scheduler prefix-aware skip: "
+                f"pending_contributors={self._prefix_skip_pending} "
+                f"(max_defer_passes={self._prefix_skip_max_defer_passes}), "
+                f"key_cache={self._prefix_skip_key_cache}, "
+                f"prioritize_deferred={self._prefix_skip_prioritize}"
+            )
+
         # Context admission, off by default: PrefillDecodeInterval, with
         # ContextPageBackoff at the same interval, and ShortestPrefillFirstOrder
         # (arrival order without it).
@@ -642,7 +815,8 @@ class KVCacheV2Scheduler(RequestScheduler):
             self._shortest_prefill_first = ShortestPrefillFirstOrder(
                 _read_non_negative_int_env(
                     _AGING_FACTOR_ENV, ShortestPrefillFirstOrder.DEFAULT_AGING_FACTOR
-                )
+                ),
+                store_aware=os.environ.get("TLLM_CTX_SRPT_STORE_AWARE", "1").strip() != "0",
             )
         elif os.environ.get(_AGING_FACTOR_ENV, "").strip():
             logger.warning(
@@ -674,6 +848,58 @@ class KVCacheV2Scheduler(RequestScheduler):
                 f"prefill_decode_interval={interval}"
             )
 
+        # Opt-in (default off): while several
+        # context requests can take a chunk, cap each one's chunk at
+        # max(TLLM_CTX_REQUEST_CHUNK_CAP, its even share of the budget still left among
+        # the requests still able to take a chunk this pass), so long prompts interleave
+        # with shorter ones instead of taking the whole step. A lone eligible request
+        # keeps the full budget; forced (snapshot) chunking is not capped.
+        # TLLM_CTX_CHUNK_CAP_ELIGIBLE_SHARE=0 divides the whole budget over every
+        # candidate instead.
+        self._ctx_request_chunk_cap = self._resolve_ctx_request_chunk_cap(
+            os.environ.get("TLLM_CTX_REQUEST_CHUNK_CAP", "")
+        )
+        self._ctx_chunk_cap_eligible_share = (
+            self._ctx_request_chunk_cap is not None
+            and os.environ.get("TLLM_CTX_CHUNK_CAP_ELIGIBLE_SHARE", "1").strip() != "0"
+        )
+        self._ctx_chunk_cap_this_pass: Optional[int] = None
+
+        # Opt-in (default off): the out-of-pages context retry gate; see KVRG above.
+        self._kvrg_mode = _kvrg_mode_from_env()
+        if self._kvrg_mode != "off":
+            self._kvrg_init()
+
+    def _resolve_ctx_request_chunk_cap(self, raw: str) -> Optional[int]:
+        try:
+            cap = int(raw) if raw.strip() else 0
+        except ValueError:
+            raise ValueError(f"TLLM_CTX_REQUEST_CHUNK_CAP must be an integer, got {raw!r}")
+        if cap <= 0:
+            return None
+        if not self.chunking_enabled:
+            logger.warning("TLLM_CTX_REQUEST_CHUNK_CAP is ignored: chunked prefill is disabled")
+            return None
+        unit = max(self.chunk_unit_size, 1)
+        cap = max(unit, cap // unit * unit)
+        logger.info(
+            f"KVCacheV2Scheduler: per-request context chunk cap {cap} tokens while other "
+            "context requests are pending (TLLM_CTX_REQUEST_CHUNK_CAP)"
+        )
+        return cap
+
+    def _ctx_chunk_cap_for_share(
+        self, remaining_budget: Optional[int], num_eligible: int
+    ) -> Optional[int]:
+        """The chunk cap of the next request, given the budget it shares with *num_eligible*."""
+        if self._ctx_request_chunk_cap is None or num_eligible <= 1:
+            return None
+        if remaining_budget is None:
+            return self._ctx_request_chunk_cap
+        unit = max(self.chunk_unit_size, 1)
+        share = remaining_budget // num_eligible // unit * unit
+        return max(self._ctx_request_chunk_cap, share)
+
     def set_async_transfer_manager(self, mgr) -> None:
         """Register the AsyncTransferManager the deadlock detector consults.
 
@@ -694,6 +920,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         self, active_requests: RequestList, inflight_request_ids: set[int]
     ) -> SchedulerOutput:
         active_requests = drop_decoder_context_requests_waiting_for_encoder_output(active_requests)
+        if self._kvrg_track:
+            self._kvrg_iter += 1
         # Main scheduling loop
         (
             scheduled_encoder,
@@ -704,6 +932,8 @@ class KVCacheV2Scheduler(RequestScheduler):
             disagg_candidates,
             has_chunking,
         ) = self._schedule_loop(active_requests, inflight_request_ids)
+        if self._kvrg_track and self._kvrg_cnt:
+            self._kvrg_maybe_log()
 
         # Sort by LoRA task ID
         scheduled_encoder.sort(key=_get_lora_task_id)
@@ -906,6 +1136,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         self._ctx_page_refused = False
         backoff = self._ctx_page_backoff
         diag = self._admission_diag
+        if self._kvrg_track:
+            self._kvrg_begin_phase2(pending_ctx)
         if diag is not None:
             diag.begin_pass()
 
@@ -925,8 +1157,27 @@ class KVCacheV2Scheduler(RequestScheduler):
         # is itself the progress in that case.
         deferred_behind_contributor = False
 
-        for req in ctx_candidates:
+        # Per-request chunk cap (TLLM_CTX_REQUEST_CHUNK_CAP); None when unset.
+        ctx_left = None
+        if self._ctx_request_chunk_cap is not None:
+            ctx_left = sum(
+                req.state_value == self._context_init_state_value for req in ctx_candidates
+            )
+            if not self._ctx_chunk_cap_eligible_share:
+                self._ctx_chunk_cap_this_pass = self._ctx_chunk_cap_for_share(
+                    self.max_num_tokens, ctx_left
+                )
+                ctx_left = None
+
+        mcb = Counter() if _MCB_DIAG else None
+        self._mcb_pass = mcb
+        MCB_LAST_PASS["c"] = mcb
+        if mcb is not None:
+            mcb["cand"] = len(ctx_candidates)
+        for _mcb_i, req in enumerate(ctx_candidates):
             if budget.requests_full:
+                if mcb is not None:
+                    mcb["c_req_full"] += len(ctx_candidates) - _mcb_i
                 break
             # A radix probe cannot affect admission once the chunk token budget
             # is exhausted. Keep scanning: an encoder request may still fit.
@@ -937,8 +1188,21 @@ class KVCacheV2Scheduler(RequestScheduler):
                 and req.state_value == self._context_init_state_value
                 and not self._has_context_chunk_budget(budget)
             ):
+                if (
+                    _MCB_LOAD_AHEAD
+                    and req.py_request_id not in preempted_ids
+                    and self._mcb_try_load_ahead(req, budget, scheduled_ctx)
+                ):
+                    has_chunking = has_chunking or not req.is_last_context_chunk
+                    if mcb is not None:
+                        mcb["la_sched"] += 1
+                    continue
+                if mcb is not None:
+                    mcb["c_no_budget"] += 1
                 continue
             if req.py_request_id in preempted_ids:
+                if mcb is not None:
+                    mcb["c_preempted"] += 1
                 continue
             if (
                 backoff is not None
@@ -948,6 +1212,8 @@ class KVCacheV2Scheduler(RequestScheduler):
             ):
                 if diag is not None:
                     diag.count("held")
+                if mcb is not None:
+                    mcb["c_backoff"] += 1
                 continue
             # Fast path: a pending context request whose draft-mirror admission
             # is certainly refused this iteration cannot be scheduled, so the
@@ -958,6 +1224,8 @@ class KVCacheV2Scheduler(RequestScheduler):
             # pending request, ~1.2 s host time per iteration at ~250 pending).
             # Decision-neutral by construction: see the helper's contract.
             if self._pending_ctx_certainly_blocked(req):
+                if mcb is not None:
+                    mcb["c_blocked"] += 1
                 continue
             # Probe context requests before peft_pages_needed and before
             # _try_schedule_context so that a deferral costs nothing: KV pages
@@ -969,20 +1237,49 @@ class KVCacheV2Scheduler(RequestScheduler):
             if contributed_blocks is not None and (
                 req.state_value == self._context_init_state_value
             ):
-                first_new_block = self.kv_cache_manager.probe_first_new_block_key(req)
+                held_key = (
+                    self._deferred_first_block_key.get(req.py_request_id)
+                    if self._prefix_skip_key_cache and req.is_first_context_chunk
+                    else None
+                )
+                if held_key is not None and held_key in contributed_blocks:
+                    # Its next block is still a contributor's next block: no
+                    # block it could match has been committed since it was
+                    # last deferred.
+                    first_new_block = held_key
+                else:
+                    first_new_block = self._continuation_block_key(req)
                 if (
                     req.is_first_context_chunk
                     and first_new_block is not None
                     and first_new_block in contributed_blocks
+                    and (
+                        not self._prefix_skip_pending
+                        or self._prefix_skip_defer_passes.get(req.py_request_id, 0)
+                        < self._prefix_skip_max_defer_passes
+                    )
                 ):
                     logger.debug(
                         f"Deferring context request {req.py_request_id}: its first new "
                         "block is already contributed by a request that runs this iteration"
                     )
                     deferred_behind_contributor = True
+                    request_id = req.py_request_id
+                    if self._prefix_skip_pending:
+                        self._prefix_skip_defer_passes[request_id] = (
+                            self._prefix_skip_defer_passes.get(request_id, 0) + 1
+                        )
+                    if self._prefix_skip_prioritize and self._shortest_prefill_first is not None:
+                        self._shortest_prefill_first.prioritize(request_id)
+                    if self._prefix_skip_key_cache:
+                        self._deferred_first_block_key[request_id] = first_new_block
+                    if mcb is not None:
+                        mcb["c_contrib"] += 1
                     continue
             peft_pages = budget.peft_pages_needed(req)
             if peft_pages is None:
+                if mcb is not None:
+                    mcb["c_peft"] += 1
                 continue
             if req.state_value == self._encoder_init_state_value:
                 action, tokens = self._try_schedule_encoder(req, budget)
@@ -993,16 +1290,34 @@ class KVCacheV2Scheduler(RequestScheduler):
             else:
                 if diag is not None:
                     diag.count("attempts")
+                if ctx_left is not None:
+                    self._ctx_chunk_cap_this_pass = self._ctx_chunk_cap_for_share(
+                        budget.remaining_tokens, ctx_left
+                    )
+                    ctx_left -= 1
                 action, tokens, chunking_flag = self._try_schedule_context(
                     req, budget, preempt_for_pages
                 )
                 if action is ScheduleAction.STOP:
+                    if mcb is not None:
+                        mcb["c_stop"] += len(ctx_candidates) - _mcb_i
                     break
                 if action is ScheduleAction.SKIP:
+                    if mcb is not None:
+                        mcb["c_skip"] += 1
                     continue
                 has_chunking = has_chunking or chunking_flag
                 scheduled_ctx.append(req)
-                budget.commit(req, tokens, peft_pages)
+                mcb_async = (mcb is not None or _MCB_LOAD_AHEAD) and self._mcb_async_reserved(req)
+                if mcb is not None:
+                    mcb["s_ctx"] += 1
+                    mcb["s_tok"] += tokens
+                    if mcb_async:
+                        mcb["s_async"] += 1
+                        mcb["s_async_tok"] += tokens
+                # MCB load-ahead: a request whose prefix loads asynchronously is parked before the forward, so
+                # its chunk does not run this pass; leave the token budget to the others.
+                budget.commit(req, 0 if (_MCB_LOAD_AHEAD and mcb_async) else tokens, peft_pages)
                 # Register the block only once the request has cleared its
                 # budget and is committed. Registering earlier, inside the check
                 # above, would let a request that then fails to schedule defer
@@ -1014,13 +1329,18 @@ class KVCacheV2Scheduler(RequestScheduler):
                 # a request is only ever deferred behind a contributor that
                 # actually runs this iteration, so a deferral always leaves
                 # either inflight_request_ids or scheduled_ctx non-empty.
+                # TRTLLM_SCHED_PREFIX_SKIP_PENDING relaxes this to pending
+                # contributors and bounds each request's deferrals instead.
                 if first_new_block is not None:
                     contributed_blocks.add(first_new_block)
 
+        self._ctx_chunk_cap_this_pass = None
         if backoff is not None:
             backoff.record_pass(has_generation, self._ctx_page_refused)
         if diag is not None:
             diag.end_pass(len(ctx_candidates), len(scheduled_ctx))
+        if self._prefix_skip_pending or self._prefix_skip_key_cache:
+            self._forget_admitted_prefix_skip_state(scheduled_ctx, requests_list)
         if self._prefill_decode_interval is not None:
             self._record_context_admission(scheduled_ctx, has_generation, deferred_by_interval)
         if self._shortest_prefill_first is not None:
@@ -1192,6 +1512,10 @@ class KVCacheV2Scheduler(RequestScheduler):
         produce an iteration scheduling nothing, which the deadlock detector
         would report as a hang.
 
+        With ``TRTLLM_SCHED_PREFIX_SKIP_PENDING=1`` every started continuation
+        qualifies, in flight or not, and each request's deferrals are bounded
+        by ``TRTLLM_SCHED_PREFIX_SKIP_MAX_DEFER_PASSES`` instead.
+
         Returns None when the skip provably cannot fire this iteration, which
         lets the caller avoid every probe: nothing else consumes the radix walk,
         so a probe that cannot change a decision is pure overhead.
@@ -1206,7 +1530,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             for req in requests_list
             if req.state_value == self._context_init_state_value
             and not req.is_first_context_chunk
-            and req.request_id in inflight_request_ids
+            and (self._prefix_skip_pending or req.request_id in inflight_request_ids)
         ]
         if not in_flight and num_candidates < 2:
             # A lone candidate with nothing running can never be deferred: only
@@ -1219,10 +1543,47 @@ class KVCacheV2Scheduler(RequestScheduler):
                 return None
         contributed = set()
         for req in in_flight:
-            key = self.kv_cache_manager.probe_first_new_block_key(req)
+            key = self._continuation_block_key(req)
             if key is not None:
                 contributed.add(key)
         return contributed
+
+    def _continuation_block_key(self, req: LlmRequest) -> bytes | None:
+        """``probe_first_new_block_key`` of *req*, cached on a started request's commits.
+
+        With ``TRTLLM_SCHED_PREFIX_SKIP_KEY_CACHE=1`` the key of a started
+        context request is reused while its committed token count is unchanged.
+        """
+        manager = self.kv_cache_manager
+        if not self._prefix_skip_key_cache or req.is_first_context_chunk:
+            return manager.probe_first_new_block_key(req)
+        request_id = req.py_request_id
+        kv_cache = manager.kv_cache_map.get(request_id)
+        stamp = None if kv_cache is None else kv_cache.num_committed_tokens
+        cached = self._continuation_key_cache.get(request_id)
+        if stamp is not None and cached is not None and cached[0] == stamp:
+            return cached[1]
+        key = manager.probe_first_new_block_key(req)
+        if stamp is not None:
+            if len(self._continuation_key_cache) > self._PREFIX_SKIP_STATE_MAX_ENTRIES:
+                self._continuation_key_cache.clear()
+            self._continuation_key_cache[request_id] = (stamp, key)
+        return key
+
+    def _forget_admitted_prefix_skip_state(
+        self, scheduled_ctx: RequestList, requests_list: RequestList
+    ) -> None:
+        """Drop the prefix-skip bookkeeping of requests admitted this pass."""
+        for req in scheduled_ctx:
+            self._deferred_first_block_key.pop(req.py_request_id, None)
+            self._prefix_skip_defer_passes.pop(req.py_request_id, None)
+        if len(self._deferred_first_block_key) > self._PREFIX_SKIP_STATE_MAX_ENTRIES:
+            self._deferred_first_block_key.clear()
+        if len(self._prefix_skip_defer_passes) > self._PREFIX_SKIP_STATE_MAX_ENTRIES:
+            live = {r.py_request_id for r in requests_list}
+            self._prefix_skip_defer_passes = {
+                k: v for k, v in self._prefix_skip_defer_passes.items() if k in live
+            }
 
     # ---- Per-type scheduling methods ----
 
@@ -1293,6 +1654,13 @@ class KVCacheV2Scheduler(RequestScheduler):
         A loading request remains outside the schedulable state range.
         """
         first_chunk = req.is_first_context_chunk
+        gate = self._kvrg_track and self.chunking_enabled and not self._kvrg_bypass
+        if gate:
+            # KVRG: replay a failed first chunk's stock outcome while nothing it needs changed.
+            gated = self._kvrg_check(req, budget, preempt_for_pages)
+            if gated is not None:
+                return gated, 0, False
+            self._kvrg_fail_kind = None
         if self.chunking_enabled:
             result = self._try_schedule_context_chunked(req, budget, preempt_for_pages)
         else:
@@ -1303,6 +1671,8 @@ class KVCacheV2Scheduler(RequestScheduler):
             # alone cannot release them when the last cache tier is full.
             self.release_context_admission(req)
 
+        if gate:
+            self._kvrg_record(req, first_chunk, result[0])
         return result
 
     def release_context_admission(self, req: LlmRequest) -> None:
@@ -1379,9 +1749,62 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         return ScheduleAction.SCHEDULED, req_tokens, False
 
+    def _mcb_async_reserved(self, req: LlmRequest) -> bool:
+        """MCB: whether *req* holds a connector prefix reservation that will load asynchronously (it is then
+        parked before the forward and computes nothing this pass)."""
+        connector = getattr(self.kv_cache_manager, "kv_connector_manager", None)
+        if connector is None or not getattr(connector, "prefix_reservations_enabled", False):
+            return False
+        reservation = connector.get_prefix_reservation(req)
+        return (
+            reservation is not None and reservation.is_async and reservation.end > reservation.start
+        )
+
+    def _mcb_try_load_ahead(
+        self, req: LlmRequest, budget: BudgetTracker, scheduled_ctx: RequestList
+    ) -> bool:
+        """MCB experiment (TRTLLM_MCB_LOAD_AHEAD=1): start the connector prefix load of a first-chunk request the
+        token budget cannot fit this pass. It is admitted against a fresh budget (pages for its prefix and one
+        chunk) and kept only when its prefix loads asynchronously, i.e. it is parked before the forward and
+        computes nothing this pass; it is charged no tokens. Anything else is rolled back like a failed first-chunk
+        admission (caches freed, cursor rewound), so the request stays pending exactly as before. Tried once per
+        request, never preempts."""
+        if (
+            not req.is_first_context_chunk
+            or getattr(req, "py_mcb_la_tried", False)
+            or getattr(req, "py_connector_skip_store", False)
+            or req.py_request_id in self.kv_cache_manager.kv_cache_map
+        ):
+            return False
+        req.py_mcb_la_tried = True
+        peft_pages = budget.peft_pages_needed(req)
+        if peft_pages is None:
+            return False
+        shadow = BudgetTracker(self.max_num_tokens, self.max_num_requests, self.peft_cache_manager)
+        # A load-ahead attempt is tried once per request, against a fresh budget: always for real (KVRG).
+        self._kvrg_bypass = True
+        try:
+            action, _, _ = self._try_schedule_context(req, shadow, lambda _r: False)
+        finally:
+            self._kvrg_bypass = False
+        if action is not ScheduleAction.SCHEDULED:
+            return False
+        if self._mcb_async_reserved(req):
+            scheduled_ctx.append(req)
+            budget.commit(req, 0, peft_pages)
+            return True
+        self.release_context_admission(req)
+        mcb = getattr(self, "_mcb_pass", None)
+        if mcb is not None:
+            mcb["la_rollback"] += 1
+        return False
+
     def _note_page_refusal(self) -> None:
         """Record that the KV pool refused a context admission this pass."""
         self._ctx_page_refused = True
+        mcb = getattr(self, "_mcb_pass", None)
+        if mcb is not None:
+            mcb["page_refused"] += 1
         if self._admission_diag is not None:
             self._admission_diag.count("page_refused")
 
@@ -1420,6 +1843,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         if not self._prepare_context_pair(req):
             logger.debug(f"prepare_context failed for chunked context request {req.py_request_id}")
             self._note_page_refusal()
+            self._kvrg_fail_kind = "prepare"
+            self._kvrg_fail_chunk = 0
             return ScheduleAction.SKIP, 0, False
 
         # Calculate chunk size from remaining budget
@@ -1442,6 +1867,8 @@ class KVCacheV2Scheduler(RequestScheduler):
                 if remaining_budget is not None
                 else budget_context_remaining
             )
+            if self._ctx_chunk_cap_this_pass is not None:
+                chunk_size = min(chunk_size, self._ctx_chunk_cap_this_pass)
 
         if self.max_context_length is not None:
             chunk_size = min(chunk_size, self.max_context_length)
@@ -1449,6 +1876,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         chunk_size = min(
             chunk_size, remaining_budget if remaining_budget is not None else chunk_size
         )
+        kvrg_budget_chunk = chunk_size
 
         # Round down to chunk_unit_size boundary only when not hitting the end
         # or a checkpoint.
@@ -1492,6 +1920,8 @@ class KVCacheV2Scheduler(RequestScheduler):
             if preempt_for_pages(req):
                 return ScheduleAction.STOP, 0, False
             self._note_page_refusal()
+            self._kvrg_fail_kind = "alloc"
+            self._kvrg_fail_chunk = kvrg_budget_chunk
             return ScheduleAction.SKIP, 0, False
 
         cross_action = self._try_schedule_cross_context(req)
@@ -2050,6 +2480,227 @@ class KVCacheV2Scheduler(RequestScheduler):
     def _clear_request_runtime_state(self, req: LlmRequest) -> None:
         req.py_batch_idx = None
 
+    # ---- KVRG: out-of-pages context retry gate (see the module header) ----
+
+    def _kvrg_init(self) -> None:
+        self._kvrg_track = True
+        self._kvrg_max_skip = _kvrg_max_skip_from_env()
+        self._kvrg_iter = 0
+        # py_request_id -> (page counts after the failure, budget chunk of the failed attempt
+        # (0: prepare failure), "alloc" | "prepare", pass of the attempt)
+        self._kvrg_fail: dict = {}
+        self._kvrg_sig_cache = None
+        self._kvrg_fail_kind = None
+        self._kvrg_fail_chunk = 0
+        self._kvrg_retry_reason: dict = {}
+        self._kvrg_shadow_ids: set = set()
+        self._kvrg_cnt = Counter()
+        self._kvrg_tot = Counter()
+        self._kvrg_last_log = time.monotonic()
+        try:
+            from tensorrt_llm._utils import mpi_rank
+
+            self._kvrg_rank = int(mpi_rank())
+        except Exception:  # noqa: BLE001
+            self._kvrg_rank = -1
+        sig_len = -1
+        try:
+            sig_len = len(self._kvrg_signature())
+            why = None if sig_len > 0 else "no pool reports page counts"
+        except Exception as exc:  # noqa: BLE001
+            why = f"{type(exc).__name__}: {exc}"
+        self._kvrg_sig_cache = None
+        if why is not None:
+            self._kvrg_track = False
+            logger.warning(
+                f"[M31 KVRG] disabled rank={self._kvrg_rank}: page counts unavailable ({why})"
+            )
+        if not self.chunking_enabled:
+            logger.warning("[M31 KVRG] has no effect without chunked prefill")
+        logger.info(
+            f"[M31 KVRG] engaged rank={self._kvrg_rank} pid={os.getpid()} mode={self._kvrg_mode} "
+            f"active={int(self._kvrg_track)} maxskip={self._kvrg_max_skip} "
+            f"chunked={int(self.chunking_enabled)} "
+            f"page_backoff={self._ctx_page_backoff.passes if self._ctx_page_backoff else 0} "
+            f"draft={int(self.draft_kv_cache_manager is not None)} counts={sig_len} "
+            f"stall_bypass={self._DEADLOCK_STALL_ITERS // 2}"
+        )
+
+    def _kvrg_signature(self) -> tuple:
+        """(available, evictable) page counts of every pool group at every cache level, target
+        then draft pool. Both, because a finished request's pages can turn into reusable cached
+        pages (evictable) rather than free ones; a rise in either ends the gate for everyone."""
+        sig = self._kvrg_sig_cache
+        if sig is None:
+            vals = []
+            for mgr in (self.kv_cache_manager, self.draft_kv_cache_manager):
+                impl = getattr(mgr, "impl", None) if mgr is not None else None
+                if impl is None:
+                    continue
+                for level in range(len(impl.cache_tier_list)):
+                    for st in impl.get_storage_statistics(level):
+                        vals.append(int(st.available))
+                        vals.append(int(st.evictable))
+            sig = self._kvrg_sig_cache = tuple(vals)
+        return sig
+
+    def _kvrg_begin_phase2(self, pending_ctx: RequestList) -> None:
+        self._kvrg_sig_cache = None  # phase 1 grew the generation requests
+        self._kvrg_retry_reason.clear()
+        self._kvrg_shadow_ids.clear()
+        if self._kvrg_fail:
+            live = {r.py_request_id for r in pending_ctx}
+            for rid in [rid for rid in self._kvrg_fail if rid not in live]:
+                del self._kvrg_fail[rid]
+        if pending_ctx:
+            self._kvrg_cnt["phase2_waiting"] += 1
+            self._kvrg_cnt["pending_sum"] += len(pending_ctx)
+
+    def _kvrg_holds_cache(self, rid: int) -> bool:
+        for mgr in (self.kv_cache_manager, self.draft_kv_cache_manager):
+            if mgr is not None and rid in getattr(mgr, "kv_cache_map", ()):
+                return True
+        return False
+
+    def _kvrg_check(
+        self,
+        req: LlmRequest,
+        budget: "BudgetTracker",
+        preempt_for_pages: Callable[[LlmRequest], bool],
+    ) -> Optional[ScheduleAction]:
+        """The stock outcome to replay without the prepare/resize work, or None to attempt."""
+        rid = req.py_request_id
+        ent = self._kvrg_fail.get(rid)
+        if ent is None:
+            return None
+        sig_rec, chunk_rec, kind_rec, it_rec = ent
+        reason = None
+        if not req.is_first_context_chunk or self._kvrg_holds_cache(rid):
+            reason = "state"
+        elif self._stalled_schedules >= self._DEADLOCK_STALL_ITERS // 2:
+            # Near a deadlock declaration every pass is a real attempt, as in stock.
+            reason = "stall"
+        elif self._kvrg_iter - it_rec >= self._kvrg_max_skip + (rid % self._kvrg_max_skip):
+            reason = "cap"
+        else:
+            if chunk_rec:
+                limit = budget.remaining_tokens
+                cap = self._ctx_chunk_cap_this_pass
+                if cap is not None:
+                    limit = cap if limit is None else min(limit, cap)
+                if limit is not None and limit < chunk_rec:
+                    reason = "chunk"
+            if reason is None:
+                try:
+                    sig = self._kvrg_signature()
+                except Exception:  # noqa: BLE001
+                    sig = None
+                if (
+                    sig is None
+                    or len(sig) != len(sig_rec)
+                    or any(a > b for a, b in zip(sig, sig_rec))
+                ):
+                    reason = "rise"
+        if reason is not None:
+            self._kvrg_cnt["retry_" + reason] += 1
+            self._kvrg_retry_reason[rid] = reason
+            return None
+        if self._kvrg_mode != "on":
+            self._kvrg_cnt["shadow_gated"] += 1
+            self._kvrg_shadow_ids.add(rid)
+            return None
+        self._kvrg_cnt["gated"] += 1
+        self._kvrg_cnt["gated_" + kind_rec] += 1
+        if kind_rec == "alloc" and preempt_for_pages(req):
+            # Stock reaches the out-of-pages branch and preempts the same victim; it ends the
+            # pass and the next pass attempts for real.
+            self._kvrg_sig_cache = None
+            self._kvrg_cnt["gated_preempt"] += 1
+            del self._kvrg_fail[rid]
+            return ScheduleAction.STOP
+        # As the stock attempt would: the pool refused it (ContextPageBackoff, MCB, diagnostics).
+        self._note_page_refusal()
+        return ScheduleAction.SKIP
+
+    def _kvrg_record(self, req: LlmRequest, first_chunk: bool, action: ScheduleAction) -> None:
+        rid = req.py_request_id
+        self._kvrg_sig_cache = None  # the attempt may have changed the pool
+        kind, self._kvrg_fail_kind = self._kvrg_fail_kind, None
+        cnt = self._kvrg_cnt
+        cnt["attempts"] += 1
+        shadow_hit = rid in self._kvrg_shadow_ids
+        reason = self._kvrg_retry_reason.pop(rid, None)
+        old = self._kvrg_fail.get(rid)
+        if action is ScheduleAction.SCHEDULED:
+            if old is not None:
+                del self._kvrg_fail[rid]
+                cnt["retry_ok"] += 1
+                cnt["retry_ok_" + (reason or ("shadow" if shadow_hit else "none"))] += 1
+            if shadow_hit:
+                cnt["shadow_miss"] += 1
+            return
+        if not first_chunk or kind is None:
+            self._kvrg_fail.pop(rid, None)
+            return
+        cnt["fails"] += 1
+        cnt["fail_" + kind] += 1
+        if shadow_hit and old is not None:
+            return  # shadow: the gate would not have attempted; keep its last real record
+        try:
+            sig = self._kvrg_signature()
+        except Exception:  # noqa: BLE001
+            self._kvrg_fail.pop(rid, None)
+            return
+        self._kvrg_fail[rid] = (
+            sig,
+            self._kvrg_fail_chunk if kind == "alloc" else 0,
+            kind,
+            self._kvrg_iter,
+        )
+
+    def _kvrg_maybe_log(self) -> None:
+        now = time.monotonic()
+        elapsed = now - self._kvrg_last_log
+        first = not self._kvrg_tot and self._kvrg_cnt["gated"] + self._kvrg_cnt["shadow_gated"] > 0
+        if elapsed < _KVRG_LOG_EVERY_S and not first:
+            return
+        self._kvrg_last_log = now
+        w = self._kvrg_cnt
+        self._kvrg_tot.update(w)
+        t = self._kvrg_tot
+        keys = (
+            "phase2_waiting",
+            "attempts",
+            "fails",
+            "fail_alloc",
+            "fail_prepare",
+            "gated",
+            "gated_alloc",
+            "gated_prepare",
+            "gated_preempt",
+            "shadow_gated",
+            "shadow_miss",
+            "retry_rise",
+            "retry_chunk",
+            "retry_cap",
+            "retry_stall",
+            "retry_state",
+            "retry_ok",
+        )
+        pw = max(1, w["phase2_waiting"])
+        logger.info(
+            f"[M31 KVRG] summary rank={self._kvrg_rank} mode={self._kvrg_mode} it={self._kvrg_iter} "
+            f"window_s={elapsed:.0f} pending_mean={w['pending_sum'] / pw:.2f} "
+            f"tracked={len(self._kvrg_fail)} "
+            + " ".join(f"{k}={w[k]}" for k in keys)
+            + " | total "
+            + " ".join(
+                f"{k}={t[k]}"
+                for k in ("attempts", "fails", "gated", "shadow_gated", "shadow_miss", "retry_ok")
+            )
+        )
+        self._kvrg_cnt = Counter()
+
     def _try_preempt_for_pages(
         self,
         requests_list: RequestList,
@@ -2092,6 +2743,8 @@ class KVCacheV2Scheduler(RequestScheduler):
                 continue
 
             if not self._preempt_or_defer(victim, recompute_paused):
+                # Parked until its connector saves retire; it may still be ahead in this pass.
+                preempted_ids.add(victim.py_request_id)
                 return False
             logger.debug(
                 f"[V2Scheduler] Preempting request {victim.py_request_id} "

@@ -19,15 +19,17 @@ servers share a pool and keeps the pool's own settings stated once. It
 publishes them as a manifest that each server's
 `kv_connector_config.mooncake_store.pool` names.
 
-Capacity needs no command: every rank that joins the pool lends the memory its
-own config asks for.
+Capacity mostly needs no command: every rank that joins the pool lends the
+memory its own config asks for. `mooncake_donor` is for a node whose servers run
+no connector, and so lend nothing on their own.
 """
 
 import contextlib
+import os
 import signal
 import tempfile
 import time
-from typing import Optional
+from typing import Iterator, Optional
 
 import click
 
@@ -36,7 +38,7 @@ from tensorrt_llm.commands import _telemetry as _command_telemetry
 from tensorrt_llm.logger import logger
 from tensorrt_llm.usage.config import UsageContext
 
-#: Both commands sit in the telemetry-aware `trtllm-serve` group, so they offer
+#: These commands sit in the telemetry-aware `trtllm-serve` group, so they offer
 #: the same opt-out the group documents.
 _telemetry_option = click.option(
     "--telemetry/--no-telemetry",
@@ -241,6 +243,178 @@ def mooncake_master(
                 logger.info(
                     f"mooncake-store: master at {master.address} alive after "
                     f"{(now - started) / 60:.0f}m"
+                )
+
+
+@contextlib.contextmanager
+def _announced(path: Optional[str], content: str) -> Iterator[None]:
+    """Hold `content` at `path` for the life of the context, if a path is given.
+
+    Renamed into place so a launcher polling for it never reads half of it,
+    and removed on the way out so it never announces capacity that is gone.
+    """
+    if not path:
+        yield
+        return
+    staging = f"{path}.partial"
+    with open(staging, "w") as handle:
+        handle.write(content)
+    os.replace(staging, path)
+    try:
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(path)
+
+
+@click.command("mooncake_donor")
+@click.option(
+    "--pool_file",
+    type=str,
+    default=None,
+    help="The pool manifest 'trtllm-serve mooncake_master --pool_file' "
+    "publishes, as a path or file://<path>. The donor waits for it to "
+    "appear, as a server does.",
+)
+@click.option(
+    "--master_server_address",
+    type=str,
+    default=None,
+    help="A master's host:port, for a pool with no manifest to read. "
+    "Pool-wide settings then take their defaults: rdma, P2PHANDSHAKE. "
+    "Give this or --pool_file, not both.",
+)
+@click.option(
+    "--segment_size",
+    type=str,
+    required=True,
+    help="Host memory to lend from this node, as a binary size ('768GiB') "
+    "or a byte count. Ambiguous units such as 'GB' are refused.",
+)
+@click.option(
+    "--device_name",
+    type=str,
+    default="",
+    help="Comma-separated RDMA devices to register the segment on, as "
+    "mooncake_store.device_name. Empty picks the fastest active "
+    "InfiniBand devices, or leaves the choice to Mooncake when there "
+    "are none.",
+)
+@click.option(
+    "--local_hostname",
+    type=str,
+    default=None,
+    help="Address to register the segment under. Defaults to the "
+    "interface that routes to the master.",
+)
+@click.option(
+    "--ready_file",
+    type=str,
+    default=None,
+    help="File holding '<host> <bytes>' while the segment is mounted, "
+    "for a launcher that must not let servers rely on the capacity "
+    "before it exists. Removed on exit.",
+)
+@click.option(
+    "--run_dir",
+    type=str,
+    default=None,
+    help="Directory to record the segment in. One under the pool's run "
+    "directory counts toward 'trtllm-serve mooncake_pool_report'.",
+)
+@click.option(
+    "--timeout",
+    type=float,
+    default=60.0,
+    show_default=True,
+    help="Seconds to wait for the manifest and for the master to accept connections.",
+)
+@click.option(
+    "--heartbeat_seconds",
+    type=int,
+    default=300,
+    show_default=True,
+    help="Interval between liveness lines. 0 disables them.",
+)
+@_telemetry_option
+def mooncake_donor(
+    pool_file: Optional[str],
+    master_server_address: Optional[str],
+    segment_size: str,
+    device_name: str,
+    local_hostname: Optional[str],
+    ready_file: Optional[str],
+    run_dir: Optional[str],
+    timeout: float,
+    heartbeat_seconds: int,
+    telemetry: bool,
+):
+    """Lend this node's host memory to a Mooncake pool while this command runs.
+
+    For a node whose servers run no KV connector, such as a disaggregated
+    generation node: its memory joins the pool while its engines stay
+    connector-free. Start it once the master is up.
+    """
+    _apply_cli_telemetry(telemetry)
+
+    if (pool_file is None) == (master_server_address is None):
+        raise click.UsageError(
+            "Name the pool with exactly one of --pool_file and --master_server_address."
+        )
+
+    # Imported lazily so other subcommands and --help do not pay for the
+    # connector package.
+    from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import donate_segment
+    from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import parse_size
+    from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.master import POOL_FILE_SCHEME
+
+    try:
+        lending = parse_size(segment_size, strict_units=True)
+    except ValueError as exc:
+        raise click.BadParameter(str(exc), param_hint="--segment_size") from exc
+    if lending <= 0:
+        raise click.BadParameter(
+            f"{segment_size!r} lends nothing; a donor exists to lend memory.",
+            param_hint="--segment_size",
+        )
+    if pool_file is None:
+        pool = master_server_address
+    elif pool_file.startswith(POOL_FILE_SCHEME):
+        pool = pool_file
+    else:
+        pool = f"{POOL_FILE_SCHEME}{pool_file}"
+
+    with (
+        _signal_handoff(),
+        donate_segment(
+            pool,
+            lending,
+            device_name=device_name,
+            local_hostname=local_hostname,
+            timeout=timeout,
+            run_dir=run_dir,
+        ) as segment,
+        _announced(ready_file, f"{segment.host} {segment.segment_size}\n"),
+    ):
+        master = segment.manifest.master_server_address
+        logger.warning(
+            f"mooncake-store: this donor lends {segment.host}'s memory to the pool "
+            f"at {master} until this command stops"
+        )
+        # Idle by design: a put or get here would make this node a traffic
+        # client, which is what a donor exists to avoid.
+        started = time.monotonic()
+        announced = started
+        while True:
+            # The handler raises, so a signal ends this wait rather than resuming it.
+            time.sleep(1.0)
+            now = time.monotonic()
+            if heartbeat_seconds > 0 and now - announced >= heartbeat_seconds:
+                announced = now
+                logger.info(
+                    f"mooncake-store: {segment.host} still lending "
+                    f"{segment.segment_size / (1 << 30):.1f} GiB to the pool at "
+                    f"{master} after {(now - started) / 60:.0f}m"
                 )
 
 

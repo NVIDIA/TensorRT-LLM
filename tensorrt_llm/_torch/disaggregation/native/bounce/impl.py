@@ -18,6 +18,7 @@ and runs the side effects that drive each region's state machine. Never imports 
 
 from __future__ import annotations
 
+import os
 import queue
 import threading
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional
@@ -52,6 +53,22 @@ _SCATTER_POLL_S = 0.5  # how often the scatter worker wakes to re-check the stop
 _RESERVE_TIMEOUT_S = 0.2  # max wait for a bounce region before falling back to per-fragment
 _CLOSE_JOIN_S = 2.0  # max wait for the scatter thread to drain on close
 _QUARANTINE_GRACE_S = 60.0  # how long an orphaned region is held out of reuse
+
+# Opt-in (default off): create the gather/scatter streams with cudaStreamNonBlocking.
+# cudaStreamCreate makes a *blocking* stream, so every gather/scatter implicitly waits for
+# all work already queued on the legacy default stream. The executor makes that stream wait
+# for the whole in-flight forward (``current_stream().wait_stream(execution_stream)``), so a
+# send handed off while the next step is queued waits for that step to finish on the GPU
+# (~one prefill step, ~150 ms median on TEP4 8k chunks) once nothing blocks the host during
+# the forward (e.g. TRTLLM_DFLASH_CTX_NO_HOST_SYNC=1). Ordering does not need that wait: the
+# sender hands off a request only after the host synchronized on the sampler event of the
+# step that wrote its KV, and the scatter syncs its own stream before it reports completion.
+_NONBLOCKING_STREAMS_ENV = "TRTLLM_KV_BOUNCE_NONBLOCKING_STREAMS"
+
+
+def nonblocking_streams_enabled() -> bool:
+    """True when TRTLLM_KV_BOUNCE_NONBLOCKING_STREAMS=1 (default off)."""
+    return os.environ.get(_NONBLOCKING_STREAMS_ENV, "0").strip() == "1"
 
 
 class VmmBounceTransport(BounceTransport):
@@ -134,6 +151,7 @@ class VmmBounceTransport(BounceTransport):
         logger.info(
             f"[kv-bounce] Transport: send+recv regions of "
             f"{self._send_alloc.capacity / _MIB:.1f}MiB each"
+            + (", non-blocking gather/scatter streams" if nonblocking_streams_enabled() else "")
         )
 
     def _init_recv_state(self) -> None:
@@ -154,6 +172,8 @@ class VmmBounceTransport(BounceTransport):
         self._scatter_thread.start()
 
     def _new_stream(self):
+        if nonblocking_streams_enabled():
+            return CUASSERT(cudart.cudaStreamCreateWithFlags(cudart.cudaStreamNonBlocking))[0]
         return CUASSERT(cudart.cudaStreamCreate())[0]
 
     def _gather_blocking(self, src_addr: int, write_meta, total: int) -> None:

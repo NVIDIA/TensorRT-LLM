@@ -622,10 +622,13 @@ class DecoderModelForCausalLM(nn.Module,
 
         # use embedding weights in lm_head if tie word embedding is enabled
         if getattr(config.pretrained_config, 'tie_word_embeddings', False):
-            assert self.lm_head.tp_size == self.model.embed_tokens.tp_size, (
-                "lm_head and vocab embedding should use the same TP size")
             assert self.lm_head.tp_mode == self.model.embed_tokens.tp_mode, (
                 "lm_head and vocab embedding should use the same TP mode")
+            # Replicated weights have the same layout even when ADP's embedding
+            # retains the owner mapping and the LM head uses a singleton mapping.
+            if self.lm_head.tp_mode is not None:
+                assert self.lm_head.tp_size == self.model.embed_tokens.tp_size, (
+                    "lm_head and vocab embedding should use the same TP size")
             self.lm_head.weight = self.model.embed_tokens.weight
             if config.mapping.is_last_pp_rank():
                 self.model.keep_embed_tokens = True

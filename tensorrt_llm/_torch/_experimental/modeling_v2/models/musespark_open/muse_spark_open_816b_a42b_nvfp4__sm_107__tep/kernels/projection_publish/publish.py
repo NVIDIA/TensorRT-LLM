@@ -190,9 +190,14 @@ class PublishedProjections:
 
         33..448 rows, unless the build refused, or the forward is captured before the first
         eager armed forward built the transports (every rank captures the same graphs, so
-        every rank answers alike).
+        every rank answers alike). From ``projection_publish.publish_min_rows()`` instead of 33
+        (``tep8_publish_splitk``'s MIN_ROWS, split-K producer only): the 2..4-request steps then
+        publish and join as 5..8-request steps do, and the 9..32-row gathers stand down for them
+        (``MuseSparkOpenTepGatherMoE`` and the join take an armed publication first).
         """
-        if not MIN_ROWS <= rows <= MAX_ROWS or self._refused is not None:
+        if rows < MIN_ROWS and rows < _publish.publish_min_rows():
+            return False
+        if rows > MAX_ROWS or self._refused is not None:
             return False
         if not self._built and (
             torch.cuda.is_current_stream_capturing() or torch.compiler.is_compiling()

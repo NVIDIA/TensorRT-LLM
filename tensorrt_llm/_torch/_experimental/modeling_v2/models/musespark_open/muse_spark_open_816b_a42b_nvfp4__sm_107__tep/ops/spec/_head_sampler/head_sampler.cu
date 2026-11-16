@@ -323,6 +323,67 @@ __global__ void __launch_bounds__(THREADS) splitFoldKernel(SplitFoldParams p)
     gridDependencyTrigger();
 }
 
+// ---- The multi-CTA top-p test (head_sampler_coop_fold TOPP_ROUNDS) -------------------------
+// A row with top-p and neither top-k nor min-p takes the shipped body's tokens-only rejection
+// path (deferMassToRejection, reuseThreadMass): round 0 draws a candidate from kernel A's
+// states (kernel B's unfiltered first round, statement for statement), then every round sweeps
+// the whole row once for the CountMass of the weights strictly above the candidate's
+// (accepted iff that mass <= top_p x the round-0 support mass) and, on a rejection, once more
+// for the next round's per-thread support mass, all inside one 1024-thread CTA per row. Here
+// round 0 stops after its draw and leaves a record; the test's sweep runs over VB / 128 CTAs
+// per row (splitTopPCountKernel: each virtual thread's CountMass, its elements in the shipped
+// order with the shipped statements), and splitTopPDecideKernel reduces the VB partials with
+// the shipped cub::BlockReduce. A rejected round's next support mass per thread is that same
+// partial's mass (the shipped next-round sweep sums the same elements -- w >= 0 && w > the
+// rejected candidate's weight -- in the same order), so the next draw needs no sweep. The last
+// decide kernel finishes its rows in the CTA (one sweep per further round).
+
+//! Bytes of one row's record slot (``head_sampler.TOPP_RECORD_WORDS`` x 4).
+constexpr int kTopPRecordBytes = 128;
+
+//! A pending top-p row between the kernels of the test (one 128-byte slot per row).
+struct alignas(kTopPRecordBytes) SplitTopPRecord
+{
+    //! The row's Philox state after the round's draw.
+    curandStatePhilox4_32_10_t rng;
+    float maxScaled;
+    //! The round's candidate and its weight w.
+    float candWeight;
+    //! top_p x the round-0 support mass.
+    float massTarget;
+    int cand;
+    int argmax;
+    int round;
+    //! 1 while the row's token is undecided; every kernel B row writes it.
+    int pending;
+};
+
+static_assert(sizeof(SplitTopPRecord) == kTopPRecordBytes, "one record slot per row");
+//! Threads per CTA of the test's sweep (VB / kTopPCountThreads CTAs per row).
+constexpr int kTopPCountThreads = 128;
+//! Most test rounds one call spreads over CTAs (the last decide kernel finishes in-CTA).
+constexpr int kTopPMaxRounds = 4;
+
+//! Whether a row takes the multi-CTA test: top-p, and no filter before it.
+__device__ __forceinline__ bool splitTopPOnly(RowParams const& rp)
+{
+    return rp.needTopP && !rp.needTopK && !rp.needMinP;
+}
+
+//! Relative margin of the sweep's skip test (1 + 2^-10).
+constexpr float kTopPSkipMargin = 1.0009765625f;
+
+//! Whether virtual thread vt's sweep provably adds nothing (its CountMass stays {0, 0}, the
+//! shipped thread's value bit for bit), from its kernel A state `st`: no element of vt has
+//! w > candWeight. st.max is the exact maximum of vt's scaled logits x (the fold keeps the
+//! larger max; a NaN element makes st.sum NaN, which disables the skip), x - maxScaled is
+//! monotone in x, and __expf (ex2.approx of a monotone product) errs by far less than the
+//! margin, so every element's w is at most __expf(st.max - maxScaled) x the margin.
+__device__ __forceinline__ bool splitTopPSkips(OnlineSoftmax const& st, float maxScaled, float candWeight)
+{
+    return st.sum == st.sum && __expf(st.max - maxScaled) * kTopPSkipMargin < candWeight;
+}
+
 // ---- Cooperative kernel A (head_sampler_coop_fold) ----------------------------------------
 //! Kernel A on a plain BF16 row with the cap computed by every thread of the CTA.
 //!
@@ -440,9 +501,15 @@ __global__ void __launch_bounds__(THREADS) splitFoldCoopKernel(SplitFoldParams p
 //! PDL: waits on kernel A before reading anything. With `kTrigger` (``TargetHead.verify_pdl``)
 //! every CTA releases its dependent right after that wait; the dependent waits for this grid
 //! before it reads the tokens.
-template <int VB, int WALK, bool kTrigger>
+//!
+//! With `kTopPMulti` (the multi-CTA top-p test's first kernel) a top-p-only row
+//! (splitTopPOnly) takes the unfiltered first round -- the shipped rejection path's round 0,
+//! which draws from the same per-thread states and fixes the same mass target -- and, when it
+//! found a candidate, leaves `records[row]` pending instead of writing its token; every row
+//! writes its record's `pending`. The CTA releases its dependent at its end (not early).
+template <int VB, int WALK, bool kTrigger, bool kTopPMulti = false>
 __global__ void __launch_bounds__(VB, VB == kSplitNarrowBlock ? 2 : 1)
-    splitDrawKernel(FusedSamplingParams params, OnlineSoftmax const* states, SplitCap cap)
+    splitDrawKernel(FusedSamplingParams params, OnlineSoftmax const* states, SplitCap cap, SplitTopPRecord* records)
 {
     __shared__ FusedSamplingShared<VB> shared;
     __shared__ __align__(16) float wbuf[4 * WALK];
@@ -457,7 +524,7 @@ __global__ void __launch_bounds__(VB, VB == kSplitNarrowBlock ? 2 : 1)
     }
     __syncthreads();
     gridDependencyWait();
-    if constexpr (kTrigger)
+    if constexpr (kTrigger && !kTopPMulti)
     {
         gridDependencyTrigger();
     }
@@ -465,8 +532,23 @@ __global__ void __launch_bounds__(VB, VB == kSplitNarrowBlock ? 2 : 1)
     RowParams const rp = loadRowParams(params, row);
     if (rp.needTopK || rp.needTopP || rp.needMinP)
     {
-        fusedSamplingBody<CapBf16, VB, true, false>(params, shared);
-        return;
+        if constexpr (kTopPMulti)
+        {
+            if (!splitTopPOnly(rp))
+            {
+                if (tid == 0)
+                {
+                    records[row].pending = 0;
+                }
+                fusedSamplingBody<CapBf16, VB, true, false>(params, shared);
+                return;
+            }
+        }
+        else
+        {
+            fusedSamplingBody<CapBf16, VB, true, false>(params, shared);
+            return;
+        }
     }
     using BlockReduceOnline = cub::BlockReduce<OnlineSoftmax, VB>;
     using BlockScanF = cub::BlockScan<float, VB>;
@@ -622,7 +704,379 @@ __global__ void __launch_bounds__(VB, VB == kSplitNarrowBlock ? 2 : 1)
     if (tid == 0)
     {
         int const cand = shared.candIdx;
-        params.outputTokens[row] = cand >= 0 ? cand : shared.argmax;
+        if constexpr (kTopPMulti)
+        {
+            // A top-p row with a candidate: the shipped loop tests it next (the test kernels).
+            // Without one (the target fell past the support) the shipped loop breaks to the
+            // argmax, as the unfiltered row does.
+            SplitTopPRecord* const rec = records + row;
+            bool const pending = rp.needTopP && cand >= 0;
+            if (pending)
+            {
+                rec->rng = shared.rejectRng;
+                rec->maxScaled = maxScaled;
+                rec->candWeight = shared.candWeight;
+                rec->massTarget = shared.massTarget;
+                rec->cand = cand;
+                rec->argmax = shared.argmax;
+                rec->round = 0;
+            }
+            else
+            {
+                params.outputTokens[row] = cand >= 0 ? cand : shared.argmax;
+            }
+            rec->pending = pending ? 1 : 0;
+        }
+        else
+        {
+            params.outputTokens[row] = cand >= 0 ? cand : shared.argmax;
+        }
+    }
+    if constexpr (kTopPMulti)
+    {
+        gridDependencyTrigger();
+    }
+}
+
+//! The test's sweep of one round over VB / kTopPCountThreads CTAs per row: virtual thread vt's
+//! CountMass of its elements w with w >= 0 && w > the record's candidate weight -- the shipped
+//! sweep's statements (`w = __expf(__fmul_rn(cap(x), tempInv) - maxScaled)`, count += 1, mass
+//! += w) over its elements in the shipped order (forEachLogit<CapBf16>: vectors vt + VB j in
+//! increasing j, elements 0..3), so each partial is the shipped thread vt's `local` bit for
+//! bit. A virtual thread whose kernel A state shows no element above the candidate's weight
+//! (splitTopPSkips) stores {0, 0} without reading its row. Rows whose record is not pending
+//! exit. Grid (numRows, VB / kTopPCountThreads).
+//!
+//! PDL: waits on its predecessor before reading anything; releases its dependent at its end.
+template <int VB>
+__global__ void __launch_bounds__(kTopPCountThreads) splitTopPCountKernel(FusedSamplingParams params,
+    OnlineSoftmax const* states, SplitTopPRecord const* records, CountMass* partials, SplitCap cap)
+{
+    static_assert(VB % kTopPCountThreads == 0, "whole CTAs of virtual threads");
+    gridDependencyWait();
+    int const row = blockIdx.x;
+    SplitTopPRecord const* const rec = records + row;
+    if (rec->pending == 0)
+    {
+        return;
+    }
+    int const vt = blockIdx.y * kTopPCountThreads + threadIdx.x;
+    float const tempInv = loadRowParams(params, row).tempInv;
+    float const maxScaled = rec->maxScaled;
+    float const candWeight = rec->candWeight;
+    int const vecCount = params.vocabSize / 4;
+    uint2 const* const rowVecs = static_cast<uint2 const*>(params.logits) + static_cast<size_t>(row) * vecCount;
+    CountMass local{0.0f, 0.0f};
+    bool const skip = splitTopPSkips(states[static_cast<size_t>(row) * VB + vt], maxScaled, candWeight);
+    for (int v0 = vt; !skip && v0 < vecCount; v0 += kSplitPrefetch * VB)
+    {
+        uint2 buf[kSplitPrefetch];
+#pragma unroll
+        for (int u = 0; u < kSplitPrefetch; ++u)
+        {
+            int const v = v0 + u * VB;
+            if (v < vecCount)
+            {
+                buf[u] = __ldg(rowVecs + v);
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < kSplitPrefetch; ++u)
+        {
+            int const v = v0 + u * VB;
+            if (v < vecCount)
+            {
+                __nv_bfloat16 const* elems = reinterpret_cast<__nv_bfloat16 const*>(&buf[u]);
+#pragma unroll
+                for (int j = 0; j < 4; ++j)
+                {
+                    float const w = __expf(__fmul_rn(capOf(__bfloat162float(elems[j]), cap), tempInv) - maxScaled);
+                    if (w >= 0.0f && w > candWeight)
+                    {
+                        local.count += 1.0f;
+                        local.mass += w;
+                    }
+                }
+            }
+        }
+    }
+    partials[static_cast<size_t>(row) * VB + vt] = local;
+    gridDependencyTrigger();
+}
+
+//! Shared memory of the test's decide kernel.
+template <int VB>
+struct SplitTopPShared
+{
+    union
+    {
+        typename cub::BlockReduce<CountMass, VB>::TempStorage reduceCountMass;
+        typename cub::BlockScan<float, VB>::TempStorage scanF;
+    } temp;
+
+    curandStatePhilox4_32_10_t rejectRng;
+    float target;
+    float candWeight;
+    int candIdx;
+    int keep;
+    int walker;
+    float walkerBase;
+    unsigned long long lastCrossing;
+};
+
+//! A draw of the shipped rejection loop at a round >= 1, from every thread's support mass
+//! `localMass` (its elements w with w >= 0 && w > pivot, summed in the sweep order): the
+//! block scan, tid 0's Philox uniform from shared.rejectRng times the support mass, and the
+//! claimants' walk with the shipped membership test (w >= 0 && w > pivot) -- one claimant's
+//! weights computed in parallel and summed by one thread in its order (kernel B's walk); several
+//! claimants walk their own elements and the later crossing position, then the higher thread,
+//! stands (kernel B's rule for the shipped kernel's racing writes). Leaves the candidate in
+//! shared.candIdx / shared.candWeight (-1: the target fell past the support). `wbuf` holds
+//! 4 x WALK floats; a walker's vectors fit (drawTopP checks vocab / 4 <= WALK x VB).
+template <int VB, int WALK>
+__device__ void splitTopPDraw(SplitTopPShared<VB>& shared, float* wbuf, uint2 const* rowVecs, int vecCount,
+    SplitCap const& cap, float tempInv, float maxScaled, float pivot, float localMass)
+{
+    int const tid = threadIdx.x;
+    float base = 0.0f;
+    float supportMass = 0.0f;
+    cub::BlockScan<float, VB>(shared.temp.scanF).ExclusiveSum(localMass, base, supportMass);
+    __syncthreads();
+    if (tid == 0)
+    {
+        shared.target = curand_uniform(&shared.rejectRng) * supportMass;
+        shared.candIdx = -1;
+        shared.walker = -1;
+        shared.lastCrossing = 0ull;
+    }
+    __syncthreads();
+    float const target = shared.target;
+    bool const claims = target >= base && target < base + localMass;
+    if (claims)
+    {
+        shared.walker = tid;
+        shared.walkerBase = base;
+    }
+    int const claimants = __syncthreads_count(claims);
+    if (claimants == 1)
+    {
+        int const walker = shared.walker;
+        int const walkVectors = (vecCount - walker + VB - 1) / VB;
+        if (tid < walkVectors)
+        {
+            uint2 const packed = rowVecs[walker + tid * VB];
+            __nv_bfloat16 const* elems = reinterpret_cast<__nv_bfloat16 const*>(&packed);
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+            {
+                wbuf[tid * 4 + j] = __expf(__fmul_rn(capOf(__bfloat162float(elems[j]), cap), tempInv) - maxScaled);
+            }
+        }
+        __syncthreads();
+        if (tid == 0)
+        {
+            float running = shared.walkerBase;
+            int cand = -1;
+            float candWeight = 0.0f;
+            float4 const* w4 = reinterpret_cast<float4 const*>(wbuf);
+            for (int q = 0; q < walkVectors && cand < 0; ++q)
+            {
+                float4 const quad = w4[q];
+                float const ws[4] = {quad.x, quad.y, quad.z, quad.w};
+#pragma unroll
+                for (int j = 0; j < 4; ++j)
+                {
+                    float const w = ws[j];
+                    if (cand < 0 && w >= 0.0f && w > pivot)
+                    {
+                        running += w;
+                        if (running > target)
+                        {
+                            cand = (walker + q * VB) * 4 + j;
+                            candWeight = w;
+                        }
+                    }
+                }
+            }
+            if (cand >= 0)
+            {
+                shared.candIdx = cand;
+                shared.candWeight = candWeight;
+            }
+        }
+    }
+    else if (claimants > 1)
+    {
+        int crossIdx = -1;
+        float crossWeight = 0.0f;
+        unsigned long long crossing = 0ull;
+        if (claims)
+        {
+            float running = base;
+            int position = 0;
+            for (int v = tid; v < vecCount && crossIdx < 0; v += VB)
+            {
+                uint2 const packed = rowVecs[v];
+                __nv_bfloat16 const* elems = reinterpret_cast<__nv_bfloat16 const*>(&packed);
+                for (int j = 0; j < 4; ++j)
+                {
+                    float const w = __expf(__fmul_rn(capOf(__bfloat162float(elems[j]), cap), tempInv) - maxScaled);
+                    ++position;
+                    if (!(w >= 0.0f && w > pivot))
+                    {
+                        continue;
+                    }
+                    running += w;
+                    if (running > target)
+                    {
+                        crossIdx = v * 4 + j;
+                        crossWeight = w;
+                        crossing = (static_cast<unsigned long long>(position) << 32)
+                            | static_cast<unsigned long long>(tid + 1);
+                        break;
+                    }
+                }
+            }
+            if (crossIdx >= 0)
+            {
+                atomicMax(&shared.lastCrossing, crossing);
+            }
+        }
+        __syncthreads();
+        if (crossIdx >= 0 && crossing == shared.lastCrossing)
+        {
+            shared.candIdx = crossIdx;
+            shared.candWeight = crossWeight;
+        }
+    }
+    __syncthreads();
+}
+
+//! The test's decision of one round: one VB-thread CTA per pending row reduces the VB partials
+//! with the shipped cub::BlockReduce<CountMass, VB> (thread t holds virtual thread t's partial,
+//! so the block value is the shipped `above` bit for bit) and keeps the candidate iff
+//! above.mass <= the mass target (top-k is off). On a rejection the candidate's weight becomes
+//! the pivot and the next round draws from each thread's partial mass (splitTopPDraw); without
+//! `kFinal` the new candidate goes back into the record for the next sweep kernel, with it
+//! the CTA sweeps the row itself (the shipped sweep) until the row is decided. The shipped
+//! round budget (kMaxRejectRounds) and its fallbacks (the argmax) hold.
+//!
+//! PDL: waits on the sweep kernel before reading anything. With `kTrigger` (the last kernel of
+//! the call under ``TargetHead.verify_pdl``) every CTA releases its dependent right after that
+//! wait; without `kFinal` at its end.
+template <int VB, int WALK, bool kFinal, bool kTrigger>
+__global__ void __launch_bounds__(VB, VB == kSplitNarrowBlock ? 2 : 1) splitTopPDecideKernel(FusedSamplingParams params,
+    OnlineSoftmax const* states, SplitTopPRecord* records, CountMass const* partials, SplitCap cap)
+{
+    __shared__ SplitTopPShared<VB> shared;
+    __shared__ __align__(16) float wbuf[4 * WALK];
+    gridDependencyWait();
+    if constexpr (kTrigger)
+    {
+        gridDependencyTrigger();
+    }
+    int const row = blockIdx.x;
+    int const tid = threadIdx.x;
+    SplitTopPRecord* const rec = records + row;
+    if (rec->pending == 0)
+    {
+        return;
+    }
+    float const maxScaled = rec->maxScaled;
+    float const massTarget = rec->massTarget;
+    int const argmax = rec->argmax;
+    float candWeight = rec->candWeight;
+    int cand = rec->cand;
+    int round = rec->round;
+    if (tid == 0)
+    {
+        shared.rejectRng = rec->rng;
+    }
+    float const tempInv = loadRowParams(params, row).tempInv;
+    int const vecCount = params.vocabSize / 4;
+    uint2 const* const rowVecs = static_cast<uint2 const*>(params.logits) + static_cast<size_t>(row) * vecCount;
+    CountMass local = partials[static_cast<size_t>(row) * VB + tid];
+    // Every thread has read the record before tid 0 may rewrite it.
+    __syncthreads();
+    for (;;)
+    {
+        CountMass const above = cub::BlockReduce<CountMass, VB>(shared.temp.reduceCountMass).Reduce(local, CountMassOp());
+        __syncthreads();
+        if (tid == 0)
+        {
+            shared.keep = above.mass <= massTarget ? 1 : 0;
+        }
+        __syncthreads();
+        if (shared.keep)
+        {
+            if (tid == 0)
+            {
+                params.outputTokens[row] = cand;
+                rec->pending = 0;
+            }
+            break;
+        }
+        // Rejected: the kept set is downward-closed in w, so the candidate and everything at
+        // or below its weight leave the support.
+        float const pivot = candWeight;
+        if (++round >= kMaxRejectRounds)
+        {
+            if (tid == 0)
+            {
+                params.outputTokens[row] = argmax;
+                rec->pending = 0;
+            }
+            break;
+        }
+        splitTopPDraw<VB, WALK>(shared, wbuf, rowVecs, vecCount, cap, tempInv, maxScaled, pivot, local.mass);
+        cand = shared.candIdx;
+        candWeight = shared.candWeight;
+        if (cand < 0)
+        {
+            if (tid == 0)
+            {
+                params.outputTokens[row] = argmax;
+                rec->pending = 0;
+            }
+            break;
+        }
+        if constexpr (!kFinal)
+        {
+            if (tid == 0)
+            {
+                rec->rng = shared.rejectRng;
+                rec->candWeight = candWeight;
+                rec->cand = cand;
+                rec->round = round;
+            }
+            break;
+        }
+        else
+        {
+            // The next test's sweep in this CTA: the shipped sweep (thread tid's vectors), skipped
+            // where it provably adds nothing (splitTopPSkips).
+            local = CountMass{0.0f, 0.0f};
+            bool const skip = splitTopPSkips(states[static_cast<size_t>(row) * VB + tid], maxScaled, candWeight);
+            for (int v = tid; !skip && v < vecCount; v += VB)
+            {
+                uint2 const packed = rowVecs[v];
+                __nv_bfloat16 const* elems = reinterpret_cast<__nv_bfloat16 const*>(&packed);
+#pragma unroll
+                for (int j = 0; j < 4; ++j)
+                {
+                    float const w = __expf(__fmul_rn(capOf(__bfloat162float(elems[j]), cap), tempInv) - maxScaled);
+                    if (w >= 0.0f && w > candWeight)
+                    {
+                        local.count += 1.0f;
+                        local.mass += w;
+                    }
+                }
+            }
+        }
+    }
+    if constexpr (!kFinal)
+    {
+        gridDependencyTrigger();
     }
 }
 
@@ -1252,6 +1706,869 @@ __global__ void __launch_bounds__(32) vpArgmaxKernel(VpParams p, int slots)
     gridDependencyTrigger();
 }
 
+// ----------------------------------------------------------------------------------------
+// The distributed verify sampler (ds_sample; head_sampler_coop_fold DIST_MIN_ROWS): the split sampler's tokens
+// from the ranks' own LM-head shards, with no logits all-gather. One kernel, one 1024-thread CTA per row on every
+// rank.
+//
+// Kernel A's virtual thread vt folds the global vectors v = vt + 1024 j. Rank r takes the virtual threads
+// vt = L r + a (a < L = 1024 / world), whose vectors v = 1024 j + L r + a (shared-memory slot i = L j + a) are
+// 1 / world of the row in runs of L contiguous vectors; it pulls exactly those from the ranks' staged GEMM outputs
+// (vector v lives on rank v / shardVecs of the contiguous column-parallel shards), keeps them in shared memory as
+// kernel A's scaled logits
+// x = __fmul_rn(capOf(logit), tempInv), and folds each of its virtual threads with kernel A's statements in kernel
+// A's order: every state is kernel A's bit for bit. The ranks exchange the states; every rank then runs kernel B's
+// block reduce, rebase, scan and Philox draw on all 1024 states (thread t holds virtual thread t, so the cub
+// reductions are kernel B's), the claimant's owner walks it from shared memory and publishes the candidate, and
+// every rank takes it. A top-p-only row then runs the shipped rejection loop (splitTopPDecideKernel's form): each
+// rank sums its virtual threads' CountMass of the weights above the candidate's (the shipped sweep's statements,
+// skipped where splitTopPSkips proves the sum is {0, 0}), the ranks exchange them, every rank reduces the 1024
+// partials with the shipped cub::BlockReduce and keeps the candidate iff the mass above is at most the mass target;
+// a rejected round draws from the partials' masses (the shipped next sweep's sums). Every rank decides alike, so
+// every rank writes the same token. A row with top-k or min-p gathers its whole row from the staged shards into
+// this rank's pending row and runs the shipped body (kernel B's filtered path on the same bits).
+//
+// Transport: the s2 sampler's LL elements ((flag << 32) | word, written as 16-byte stores through every publish
+// target -- the multicast address in service -- and polled in this rank's copy with relaxed system-scope loads
+// until both elements carry the expected flag). flag = (epoch << 5) | round. The staged shards are plain fabric
+// memory read by the peers with relaxed system-scope loads after a ready flag (vp_draw's staging protocol:
+// stores, __threadfence_system, flag; poll, __threadfence_system, loads).
+// - Writers: ready (callParity, row, r), state (callParity, row, r, a), candidate (callParity, roundParity, row, r)
+//   and partial (callParity, roundParity, row, r, a) are written only by rank r's CTA `row`, once per (call,
+//   round); staging (callParity, row) of rank r only by that CTA. Readers: rank R's CTA `row` reads only rank R's
+//   copy (and every rank's staging of its row).
+// - Epochs: CTA `row` keeps counters[row] (this rank's device memory, only that CTA's): a call uses counter + 1
+//   (counter + 3 when that value's low 27 bits are 0, since the areas start zeroed: the parity still alternates)
+//   and stores it back at its end. Every rank makes the same calls with the same rows, so the CTAs of a row agree
+//   on every call's epoch, and consecutive calls of a row always have opposite parities.
+// - Reuse across calls: call e uses parity e & 1 everywhere. A rank writes a parity-(e & 1) area or staging again
+//   only in its call e + 2 of that row, after its call-(e + 1) CTA polled every rank's call-(e + 1) ready flag,
+//   which each rank publishes in its call-(e + 1) kernel, i.e. after its call-e kernel completed (stream order: the
+//   kernel waits for its predecessor before its first access, so its predecessors have completed transitively).
+// - Reuse across rounds of a call: round k uses round parity k & 1. A rank publishes round k + 2 only after it
+//   polled every rank's round-(k + 1) partials, which each rank publishes after its reads of round k.
+// - Residency: a CTA waits only for the same row's CTAs on the other ranks, so every rank's grid must be resident
+//   at once (rows <= the SM count at one CTA per SM; the emulation runs every emulated rank's CTAs in one grid).
+//
+// The flag has 27 epoch bits: a stale element matches only 2^27 calls of its row later.
+
+//! Most ranks the distributed sampler takes.
+constexpr int kDsMaxRanks = 8;
+//! Its block: one thread per virtual thread of kernel A's 1024-thread block.
+constexpr int kDsThreads = kSplitBlock;
+//! Bytes of a state (two LL pairs: {max, sum}, {argmax, 0}), a pair (ready flag, partial) and a candidate entry
+//! (two LL pairs: {index, weight}, {key, 0}).
+constexpr unsigned long long kDsStateBytes = 32;
+constexpr unsigned long long kDsPairBytes = 16;
+constexpr unsigned long long kDsSlotBytes = 32;
+//! The round in the flag's low bits.
+constexpr int kDsRoundBits = 5;
+static_assert(kMaxRejectRounds <= (1 << kDsRoundBits), "the round fits the flag");
+//! Staged vectors one thread loads before using them.
+constexpr int kDsBatch = 8;
+//! Polls a thread spins before it backs off.
+constexpr int kDsSpins = 64;
+//! globaltimer stamps per (rank here, row) of the instrumented build (tests / benches): entry, row staged,
+//! ready polled, row pulled, folded + published, states reduced, first draw's candidate, end.
+constexpr int kDsStamps = 8;
+
+struct DsParams
+{
+    //! Row params, seed / offset, the vocabulary; outputTokens [ranksHere][numRows]; logits the pending
+    //! [ranksHere][numRows][vocab] BF16 rows (written for top-k / min-p rows only).
+    FusedSamplingParams fs;
+    //! [ranksHere][numRows][shardVecs]: this process's ranks' LM-head GEMM outputs.
+    uint2 const* local{nullptr};
+    //! Every rank's staging buffer, [2][maxRows][shardVecs] vectors (peer addresses; the emulation's tensors).
+    uint2* staging[kDsMaxRanks]{};
+    //! LL area bases the values are stored through (the multicast address; every emulated rank's copy).
+    unsigned long long publish[kDsMaxRanks]{};
+    int numPublish{0};
+    //! The reading rank's LL area copy, by rank here (in service [0]).
+    unsigned long long copy[kDsMaxRanks]{};
+    //! [ranksHere][maxRows] epoch counters.
+    uint32_t* counters{nullptr};
+    int* status{nullptr};
+    SplitCap cap{};
+    int rank{0};
+    int world{1};
+    //! 1: every emulated rank's CTAs in one grid (blockIdx.y is the rank).
+    int emulated{0};
+    int shardVecs{0};
+    int maxRows{0};
+    unsigned long long readyOffset{0};
+    unsigned long long statesOffset{0};
+    unsigned long long candOffset{0};
+    unsigned long long partialOffset{0};
+    unsigned long long timeoutNs{0};
+    //! The instrumented build only: [ranksHere][maxRows][kDsStamps] globaltimer values.
+    unsigned long long* stamps{nullptr};
+};
+
+__device__ __forceinline__ uint32_t dsFlag(uint32_t epoch, int round)
+{
+    return (epoch << kDsRoundBits) | static_cast<uint32_t>(round);
+}
+
+__device__ __forceinline__ void dsStorePair(unsigned long long address, unsigned long long a, unsigned long long b)
+{
+    asm volatile("st.global.v2.b64 [%0], {%1, %2};" ::"l"(address), "l"(a), "l"(b) : "memory");
+}
+
+__device__ __forceinline__ void dsLoadPair(unsigned long long address, unsigned long long& a, unsigned long long& b)
+{
+    asm volatile("ld.relaxed.sys.global.v2.b64 {%0, %1}, [%2];" : "=l"(a), "=l"(b) : "l"(address) : "memory");
+}
+
+//! One LL element (the fabric variant's third state word).
+__device__ __forceinline__ void dsStoreOne(unsigned long long address, unsigned long long a)
+{
+    asm volatile("st.global.b64 [%0], %1;" ::"l"(address), "l"(a) : "memory");
+}
+
+__device__ __forceinline__ unsigned long long dsLoadOne(unsigned long long address)
+{
+    unsigned long long a;
+    asm volatile("ld.relaxed.sys.global.b64 %0, [%1];" : "=l"(a) : "l"(address) : "memory");
+    return a;
+}
+
+__device__ __forceinline__ bool dsFresh(unsigned long long a, unsigned long long b, uint32_t flag)
+{
+    return static_cast<uint32_t>(a >> 32) == flag && static_cast<uint32_t>(b >> 32) == flag;
+}
+
+//! Records a poll that waited past the timeout and traps (a peer that never published).
+__device__ __noinline__ void dsTimedOut(int* status)
+{
+    atomicOr(status, kSplitPollTimeout);
+    __threadfence_system();
+    __trap();
+}
+
+//! Spin until both elements of the pair at `address` carry `flag`.
+__device__ __forceinline__ void dsAwaitPair(unsigned long long address, uint32_t flag, int* status,
+    unsigned long long timeoutNs, unsigned long long& a, unsigned long long& b)
+{
+    dsLoadPair(address, a, b);
+    if (dsFresh(a, b, flag))
+    {
+        return;
+    }
+    unsigned long long const start = globalTimerNs();
+    for (int spins = 0;; ++spins)
+    {
+        if (spins >= kDsSpins)
+        {
+            __nanosleep(32);
+        }
+        if (globalTimerNs() - start > timeoutNs)
+        {
+            dsTimedOut(status);
+        }
+        dsLoadPair(address, a, b);
+        if (dsFresh(a, b, flag))
+        {
+            return;
+        }
+    }
+}
+
+//! Spin until the element at `address` carries `flag`.
+__device__ __forceinline__ unsigned long long dsAwaitOne(
+    unsigned long long address, uint32_t flag, int* status, unsigned long long timeoutNs)
+{
+    unsigned long long a = dsLoadOne(address);
+    if (static_cast<uint32_t>(a >> 32) == flag)
+    {
+        return a;
+    }
+    unsigned long long const start = globalTimerNs();
+    for (int spins = 0;; ++spins)
+    {
+        if (spins >= kDsSpins)
+        {
+            __nanosleep(32);
+        }
+        if (globalTimerNs() - start > timeoutNs)
+        {
+            dsTimedOut(status);
+        }
+        a = dsLoadOne(address);
+        if (static_cast<uint32_t>(a >> 32) == flag)
+        {
+            return a;
+        }
+    }
+}
+
+__device__ __forceinline__ void dsPublishOne(DsParams const& p, unsigned long long offset, unsigned long long a)
+{
+    for (int i = 0; i < p.numPublish; ++i)
+    {
+        dsStoreOne(p.publish[i] + offset, a);
+    }
+}
+
+//! Store a pair through every publish target.
+__device__ __forceinline__ void dsPublish(
+    DsParams const& p, unsigned long long offset, unsigned long long a, unsigned long long b)
+{
+    for (int i = 0; i < p.numPublish; ++i)
+    {
+        dsStorePair(p.publish[i] + offset, a, b);
+    }
+}
+
+__device__ __forceinline__ unsigned long long dsTag(uint32_t flag)
+{
+    return static_cast<unsigned long long>(flag) << 32;
+}
+
+//! The distributed sampler: one CTA per row (x the emulated ranks). Dynamic shared memory: L float4 per
+//! 1024-vector stripe of the row (this rank's slots).
+//! PDL: waits on its predecessor (the LM-head GEMM) before its first global access; with `kTrigger`
+//! (``TargetHead.verify_pdl``) releases its dependent right after.
+//! kFabric (DIST_FABRIC): the staging is LL -- each rank writes vector v of its row as the pair {flag | word0,
+//! flag | word1} (16 bytes, call parity as before) and the peers' pulls check the flags as they load, so there is no
+//! system fence, no ready flag and no wait for one (the ready phase was 13 / 27 us at 16 / 128 rows on 8 ranks);
+//! a state travels as three LL elements (24 bytes: the {max, sum} pair + {argmax}) instead of four. The same values
+//! in the same places, so the same tokens. Staging holds 16 bytes per vector (``DistLayout(ll_staging=True)``).
+template <bool kTrigger, bool kStamp = false, bool kFabric = false>
+__global__ void __launch_bounds__(kDsThreads, 1) dsSampleKernel(DsParams const p)
+{
+    extern __shared__ float4 sx[];
+    using BlockReduceOnline = cub::BlockReduce<OnlineSoftmax, kDsThreads>;
+    using BlockReduceCountMass = cub::BlockReduce<CountMass, kDsThreads>;
+    using BlockScanF = cub::BlockScan<float, kDsThreads>;
+    __shared__ FusedSamplingShared<kDsThreads> shared;
+    __shared__ __align__(16) float wbuf[4 * kSplitWalkVectors];
+    __shared__ uint32_t sEpoch;
+    __shared__ int sWalker;
+    __shared__ float sBase;
+    __shared__ uint32_t sOwners;
+    __shared__ unsigned long long sLastCrossing;
+    __shared__ int sCrossIdx;
+    __shared__ float sCrossWeight;
+    __shared__ int sCand;
+    __shared__ float sCandWeight;
+    __shared__ int sKeep;
+
+    int const row = blockIdx.x;
+    int const tid = threadIdx.x;
+    int const rank = p.emulated ? static_cast<int>(blockIdx.y) : p.rank;
+    int const here = p.emulated ? rank : 0;
+    int const world = p.world;
+    int const localThreads = kDsThreads / world;
+    int const sv = p.shardVecs;
+    int const vecCount = p.fs.vocabSize / 4;
+    auto stamp = [&](int k)
+    {
+        if constexpr (kStamp)
+        {
+            if (tid == 0)
+            {
+                p.stamps[(static_cast<size_t>(here) * p.maxRows + row) * kDsStamps + k] = globalTimerNs();
+            }
+        }
+    };
+    if (tid == 0)
+    {
+        sSplitCap = p.cap;
+    }
+    gridDependencyWait();
+    if constexpr (kTrigger)
+    {
+        gridDependencyTrigger();
+    }
+    stamp(0);
+    uint32_t* const counter = p.counters + static_cast<size_t>(here) * p.maxRows + row;
+    if (tid == 0)
+    {
+        uint32_t epoch = *counter + 1u;
+        if ((epoch & 0x07FFFFFFu) == 0u)
+        {
+            epoch += 2u;  // never flag 0 (the zeroed areas); the parity keeps alternating
+        }
+        sEpoch = epoch;
+    }
+    __syncthreads();
+    uint32_t const epoch = sEpoch;
+    unsigned long long const callParity = epoch & 1u;
+    unsigned long long const copy = p.copy[here];
+    FusedSamplingParams fs = p.fs;
+    fs.outputTokens = p.fs.outputTokens + static_cast<size_t>(here) * p.fs.numRows;
+    fs.logits = static_cast<__nv_bfloat16 const*>(p.fs.logits)
+        + static_cast<size_t>(here) * p.fs.numRows * static_cast<size_t>(p.fs.vocabSize);
+    RowParams const rp = loadRowParams(fs, row);
+    uint32_t const flag0 = dsFlag(epoch, 0);
+    size_t const stagedRow = (static_cast<size_t>(callParity) * p.maxRows + row) * static_cast<size_t>(sv);
+
+    // ---- 1. Stage this rank's row of the GEMM output and publish its ready flag; poll every rank's.
+    {
+        uint2 const* const localRow = p.local + (static_cast<size_t>(here) * p.fs.numRows + row) * sv;
+        if constexpr (kFabric)
+        {
+            unsigned long long const mineLL
+                = reinterpret_cast<unsigned long long>(p.staging[rank]) + static_cast<unsigned long long>(stagedRow) * 16u;
+            unsigned long long const tag = dsTag(flag0);
+            for (int v = tid; v < sv; v += kDsThreads)
+            {
+                uint2 const w = __ldg(localRow + v);
+                dsStorePair(mineLL + static_cast<unsigned long long>(v) * 16u, tag | w.x, tag | w.y);
+            }
+        }
+        else
+        {
+            uint2* const mine = p.staging[rank] + stagedRow;
+            for (int v = tid; v < sv; v += kDsThreads)
+            {
+                mine[v] = __ldg(localRow + v);
+            }
+        }
+    }
+    __syncthreads();
+    stamp(1);
+    if constexpr (!kFabric)
+    {
+        // The CTA's staging stores, then (one thread) a system fence and the flag: the stores reach the peers first.
+        unsigned long long const readyRow
+            = p.readyOffset + (callParity * p.maxRows + row) * static_cast<unsigned long long>(world) * kDsPairBytes;
+        if (tid == 0)
+        {
+            __threadfence_system();
+            dsPublish(p, readyRow + static_cast<unsigned long long>(rank) * kDsPairBytes, dsTag(flag0) | 1u,
+                dsTag(flag0) | 1u);
+        }
+        if (tid < world)
+        {
+            unsigned long long a, b;
+            dsAwaitPair(copy + readyRow + static_cast<unsigned long long>(tid) * kDsPairBytes, flag0, p.status,
+                p.timeoutNs, a, b);
+            __threadfence_system();
+        }
+        __syncthreads();
+    }
+    stamp(2);
+    // kFabric: the LL staging pair of global vector v (on rank v / shardVecs).
+    auto llAt = [&](int v)
+    {
+        int const q = v / sv;
+        return reinterpret_cast<unsigned long long>(p.staging[q])
+            + (static_cast<unsigned long long>(stagedRow) + static_cast<unsigned long long>(v - q * sv)) * 16u;
+    };
+
+    bool const filtered = rp.needTopK || rp.needTopP || rp.needMinP;
+    if (filtered && !splitTopPOnly(rp))
+    {
+        // ---- The exact fallback: the row in vocabulary order into this rank's pending row, the shipped body.
+        uint2* const dst = reinterpret_cast<uint2*>(const_cast<void*>(fs.logits)) + static_cast<size_t>(row) * vecCount;
+        if constexpr (kFabric)
+        {
+            for (int v0 = tid; v0 < vecCount; v0 += kDsThreads * kDsBatch)
+            {
+                unsigned long long a[kDsBatch], b[kDsBatch];
+#pragma unroll
+                for (int u = 0; u < kDsBatch; ++u)
+                {
+                    int const v = v0 + u * kDsThreads;
+                    if (v < vecCount)
+                    {
+                        dsLoadPair(llAt(v), a[u], b[u]);
+                    }
+                }
+#pragma unroll
+                for (int u = 0; u < kDsBatch; ++u)
+                {
+                    int const v = v0 + u * kDsThreads;
+                    if (v < vecCount)
+                    {
+                        if (!dsFresh(a[u], b[u], flag0))
+                        {
+                            dsAwaitPair(llAt(v), flag0, p.status, p.timeoutNs, a[u], b[u]);
+                        }
+                        dst[v] = make_uint2(static_cast<uint32_t>(a[u]), static_cast<uint32_t>(b[u]));
+                    }
+                }
+            }
+        }
+        else
+        for (int v0 = tid; v0 < vecCount; v0 += kDsThreads * kDsBatch)
+        {
+            uint2 buf[kDsBatch];
+#pragma unroll
+            for (int u = 0; u < kDsBatch; ++u)
+            {
+                int const v = v0 + u * kDsThreads;
+                if (v < vecCount)
+                {
+                    int const q = v / sv;
+                    buf[u] = loadRelaxedSys(p.staging[q] + stagedRow + (v - q * sv));
+                }
+            }
+#pragma unroll
+            for (int u = 0; u < kDsBatch; ++u)
+            {
+                int const v = v0 + u * kDsThreads;
+                if (v < vecCount)
+                {
+                    dst[v] = buf[u];
+                }
+            }
+        }
+        __syncthreads();
+        fusedSamplingBody<CapBf16, kDsThreads, true, false>(fs, shared);
+        __syncthreads();
+        stamp(7);
+        if (tid == 0)
+        {
+            *counter = epoch;
+        }
+        return;
+    }
+
+    // ---- 2. This rank's vectors of the row (slot i = L j + a: global vector v = 1024 j + L rank + a, runs of L
+    //         contiguous vectors) as kernel A's scaled logits.
+    int const slots = (vecCount + kDsThreads - 1) / kDsThreads * localThreads;
+    auto slotVector = [&](int i) { return (i / localThreads) * kDsThreads + localThreads * rank + i % localThreads; };
+    auto capped = [&](uint32_t lo, uint32_t hi)
+    {
+        uint2 const packed = make_uint2(lo, hi);
+        __nv_bfloat16 const* elems = reinterpret_cast<__nv_bfloat16 const*>(&packed);
+        float4 x;
+        x.x = __fmul_rn(capOf(__bfloat162float(elems[0]), p.cap), rp.tempInv);
+        x.y = __fmul_rn(capOf(__bfloat162float(elems[1]), p.cap), rp.tempInv);
+        x.z = __fmul_rn(capOf(__bfloat162float(elems[2]), p.cap), rp.tempInv);
+        x.w = __fmul_rn(capOf(__bfloat162float(elems[3]), p.cap), rp.tempInv);
+        return x;
+    };
+    if constexpr (kFabric)
+    {
+        for (int i0 = tid; i0 < slots; i0 += kDsThreads * kDsBatch)
+        {
+            unsigned long long a[kDsBatch], b[kDsBatch];
+#pragma unroll
+            for (int u = 0; u < kDsBatch; ++u)
+            {
+                int const i = i0 + u * kDsThreads;
+                int const v = slotVector(i);
+                if (i < slots && v < vecCount)
+                {
+                    dsLoadPair(llAt(v), a[u], b[u]);
+                }
+            }
+#pragma unroll
+            for (int u = 0; u < kDsBatch; ++u)
+            {
+                int const i = i0 + u * kDsThreads;
+                int const v = slotVector(i);
+                if (i < slots && v < vecCount)
+                {
+                    if (!dsFresh(a[u], b[u], flag0))
+                    {
+                        dsAwaitPair(llAt(v), flag0, p.status, p.timeoutNs, a[u], b[u]);
+                    }
+                    sx[i] = capped(static_cast<uint32_t>(a[u]), static_cast<uint32_t>(b[u]));
+                }
+            }
+        }
+    }
+    else
+    {
+    for (int i0 = tid; i0 < slots; i0 += kDsThreads * kDsBatch)
+    {
+        uint2 buf[kDsBatch];
+#pragma unroll
+        for (int u = 0; u < kDsBatch; ++u)
+        {
+            int const i = i0 + u * kDsThreads;
+            int const v = slotVector(i);
+            if (i < slots && v < vecCount)
+            {
+                int const q = v / sv;
+                buf[u] = loadRelaxedSys(p.staging[q] + stagedRow + (v - q * sv));
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < kDsBatch; ++u)
+        {
+            int const i = i0 + u * kDsThreads;
+            if (i < slots && slotVector(i) < vecCount)
+            {
+                __nv_bfloat16 const* elems = reinterpret_cast<__nv_bfloat16 const*>(&buf[u]);
+                float4 x;
+                x.x = __fmul_rn(capOf(__bfloat162float(elems[0]), p.cap), rp.tempInv);
+                x.y = __fmul_rn(capOf(__bfloat162float(elems[1]), p.cap), rp.tempInv);
+                x.z = __fmul_rn(capOf(__bfloat162float(elems[2]), p.cap), rp.tempInv);
+                x.w = __fmul_rn(capOf(__bfloat162float(elems[3]), p.cap), rp.tempInv);
+                sx[i] = x;
+            }
+        }
+    }
+    }
+    __syncthreads();
+    stamp(3);
+
+    // ---- 3. Fold this rank's virtual threads (vt = L rank + tid: slots i = tid + L j, vectors vt + 1024 j, in
+    //         increasing j) with kernel A's statements, publish the states, poll every rank's.
+    OnlineSoftmax own{-FLT_MAX, 0.0f, 0};
+    unsigned long long const statesRow = p.statesOffset + (callParity * p.maxRows + row) * kDsThreads * kDsStateBytes;
+    if (tid < localThreads)
+    {
+        // combineOnlineSoftmax(st, {x, 1, index}) element by element, in splitFoldCoopKernel's / the s2 fold's
+        // FORM 1 statements (its two branches as selects; the branch weight __expf off the sum's chain): the same
+        // operations on the same values in the same order as kernel A, so the same state bit for bit.
+        int const vt = localThreads * rank + tid;
+        float runMax = -FLT_MAX;
+        float runSum = 0.0f;
+        int runArg = 0;
+        for (int j = 0; vt + j * kDsThreads < vecCount; ++j)
+        {
+            float4 const x = sx[tid + localThreads * j];
+            float const xs[4] = {x.x, x.y, x.z, x.w};
+            int const base = (vt + j * kDsThreads) * 4;
+#pragma unroll
+            for (int e = 0; e < 4; ++e)
+            {
+                bool const keep = runMax >= xs[e];
+                float const w = keep ? __expf(xs[e] - runMax) : __expf(runMax - xs[e]);
+                runArg = keep ? runArg : base + e;
+                runMax = keep ? runMax : xs[e];
+                runSum = keep ? runSum + 1.0f * w : 1.0f + runSum * w;
+            }
+        }
+        own = OnlineSoftmax{runMax, runSum, runArg};
+        unsigned long long const at
+            = statesRow + (static_cast<unsigned long long>(rank) * localThreads + tid) * kDsStateBytes;
+        dsPublish(p, at, dsTag(flag0) | __float_as_uint(own.max), dsTag(flag0) | __float_as_uint(own.sum));
+        if constexpr (kFabric)
+        {
+            dsPublishOne(p, at + 16u, dsTag(flag0) | static_cast<uint32_t>(own.argmax));
+        }
+        else
+        {
+            dsPublish(p, at + 16u, dsTag(flag0) | static_cast<uint32_t>(own.argmax), dsTag(flag0));
+        }
+    }
+    stamp(4);
+    OnlineSoftmax cachedThreadStats;
+    {
+        // Virtual thread tid: rank tid / L's slot tid % L, i.e. entry tid.
+        unsigned long long const at = copy + statesRow + static_cast<unsigned long long>(tid) * kDsStateBytes;
+        unsigned long long e0, e1, e2;
+        dsAwaitPair(at, flag0, p.status, p.timeoutNs, e0, e1);
+        if constexpr (kFabric)
+        {
+            e2 = dsAwaitOne(at + 16u, flag0, p.status, p.timeoutNs);
+        }
+        else
+        {
+            unsigned long long e3;
+            dsAwaitPair(at + 16u, flag0, p.status, p.timeoutNs, e2, e3);
+        }
+        cachedThreadStats = OnlineSoftmax{__uint_as_float(static_cast<uint32_t>(e0)),
+            __uint_as_float(static_cast<uint32_t>(e1)), static_cast<int>(static_cast<uint32_t>(e2))};
+    }
+
+    // ---- 4. Kernel B's first round on every rank (block reduce, rebase, Philox), then the draws.
+    OnlineSoftmax const rowStats
+        = BlockReduceOnline(shared.temp.reduceOnline).Reduce(cachedThreadStats, OnlineSoftmaxOp());
+    if (tid == 0)
+    {
+        shared.maxScaled = rowStats.max;
+        shared.argmax = rowStats.argmax;
+        shared.totalMass = rowStats.sum;
+    }
+    __syncthreads();
+    stamp(5);
+    float const maxScaled = shared.maxScaled;
+    int const argmax = shared.argmax;
+    float const cachedLocalMass = cachedThreadStats.sum * __expf(cachedThreadStats.max - maxScaled);
+    if (tid == 0)
+    {
+        initRowRng(fs, row, &shared.rejectRng);
+    }
+    __syncthreads();
+
+    // One draw of the rejection loop at `round` from every thread's support mass (w >= 0 && w > pivot): kernel
+    // B's scan, tid 0's Philox uniform (round 0 also fixes the mass target), the claimants' walk on the ranks that
+    // hold them (kernel B's statements on the shared-memory copy), the candidates through the slot area, kernel B's
+    // rule across several claimants. Leaves sCand / sCandWeight (-1: the target fell past the support).
+    auto drawRound = [&](float localMass, float pivot, int round)
+    {
+        float base = 0.0f;
+        float supportMass = 0.0f;
+        BlockScanF(shared.temp.scanF).ExclusiveSum(localMass, base, supportMass);
+        __syncthreads();
+        if (tid == 0)
+        {
+            if (round == 0)
+            {
+                shared.massTarget = rp.topP * supportMass;
+            }
+            shared.target = curand_uniform(&shared.rejectRng) * supportMass;
+            sWalker = -1;
+            sOwners = 0u;
+            sLastCrossing = 0ull;
+            sCrossIdx = -1;
+            sCrossWeight = 0.0f;
+            sCand = -1;
+            sCandWeight = 0.0f;
+        }
+        __syncthreads();
+        float const target = shared.target;
+        bool const claims = target >= base && target < base + localMass;
+        if (claims)
+        {
+            sWalker = tid;
+            sBase = base;
+            atomicOr(&sOwners, 1u << (tid / localThreads));
+        }
+        int const claimants = __syncthreads_count(claims);
+        uint32_t const flag = dsFlag(epoch, round);
+        unsigned long long const tag = dsTag(flag);
+        unsigned long long const slotRow = p.candOffset
+            + ((callParity * 2u + static_cast<unsigned long long>(round & 1)) * p.maxRows + row)
+                * static_cast<unsigned long long>(world) * kDsSlotBytes;
+        if (claimants == 1)
+        {
+            int const walker = sWalker;
+            int const owner = walker / localThreads;
+            if (owner == rank)
+            {
+                // Kernel B's single-walker walk: the weights in parallel, summed by one thread in order.
+                int const a = walker % localThreads;
+                int const walkVectors = (vecCount - walker + kDsThreads - 1) / kDsThreads;
+                if (tid < walkVectors)
+                {
+                    float4 const x = sx[a + localThreads * tid];
+                    wbuf[tid * 4 + 0] = __expf(x.x - maxScaled);
+                    wbuf[tid * 4 + 1] = __expf(x.y - maxScaled);
+                    wbuf[tid * 4 + 2] = __expf(x.z - maxScaled);
+                    wbuf[tid * 4 + 3] = __expf(x.w - maxScaled);
+                }
+                __syncthreads();
+                if (tid == 0)
+                {
+                    float running = sBase;
+                    int cand = -1;
+                    float candWeight = 0.0f;
+                    float4 const* w4 = reinterpret_cast<float4 const*>(wbuf);
+                    for (int q = 0; q < walkVectors && cand < 0; ++q)
+                    {
+                        float4 const quad = w4[q];
+                        float const ws[4] = {quad.x, quad.y, quad.z, quad.w};
+#pragma unroll
+                        for (int j = 0; j < 4; ++j)
+                        {
+                            float const w = ws[j];
+                            if (cand < 0 && w >= 0.0f && w > pivot)
+                            {
+                                running += w;
+                                if (running > target)
+                                {
+                                    cand = (walker + q * kDsThreads) * 4 + j;
+                                    candWeight = w;
+                                }
+                            }
+                        }
+                    }
+                    unsigned long long const at = slotRow + static_cast<unsigned long long>(rank) * kDsSlotBytes;
+                    dsPublish(p, at, tag | static_cast<uint32_t>(cand), tag | __float_as_uint(candWeight));
+                    dsPublish(p, at + 16u, tag, tag);
+                    sCand = cand;
+                    sCandWeight = candWeight;
+                }
+            }
+            else if (tid == 0)
+            {
+                unsigned long long a, b;
+                dsAwaitPair(copy + slotRow + static_cast<unsigned long long>(owner) * kDsSlotBytes, flag, p.status,
+                    p.timeoutNs, a, b);
+                sCand = static_cast<int>(static_cast<uint32_t>(a));
+                sCandWeight = __uint_as_float(static_cast<uint32_t>(b));
+            }
+        }
+        else if (claimants > 1)
+        {
+            // Kernel B's several-claimants walk, each claimant on the rank that holds its vectors; each rank
+            // publishes its latest crossing with key = position * 2048 + tid + 1 (the order of kernel B's
+            // (position << 32) | (tid + 1)), every rank takes the largest key.
+            int crossIdx = -1;
+            float crossWeight = 0.0f;
+            unsigned long long crossing = 0ull;
+            if (claims && tid / localThreads == rank)
+            {
+                float running = base;
+                int position = 0;
+                int const a = tid % localThreads;
+                for (int q = 0; tid + q * kDsThreads < vecCount && crossIdx < 0; ++q)
+                {
+                    float4 const x = sx[a + localThreads * q];
+                    float const xs[4] = {x.x, x.y, x.z, x.w};
+                    for (int j = 0; j < 4; ++j)
+                    {
+                        float const w = __expf(xs[j] - maxScaled);
+                        ++position;
+                        if (!(w >= 0.0f && w > pivot))
+                        {
+                            continue;
+                        }
+                        running += w;
+                        if (running > target)
+                        {
+                            crossIdx = (tid + q * kDsThreads) * 4 + j;
+                            crossWeight = w;
+                            crossing = (static_cast<unsigned long long>(position) << 32)
+                                | static_cast<unsigned long long>(tid + 1);
+                            break;
+                        }
+                    }
+                }
+                if (crossIdx >= 0)
+                {
+                    atomicMax(&sLastCrossing, crossing);
+                }
+            }
+            __syncthreads();
+            if (crossIdx >= 0 && crossing == sLastCrossing)
+            {
+                sCrossIdx = crossIdx;
+                sCrossWeight = crossWeight;
+            }
+            __syncthreads();
+            if (tid == 0)
+            {
+                uint32_t const owners = sOwners;
+                if ((owners >> rank) & 1u)
+                {
+                    unsigned long long const best = sLastCrossing;
+                    uint32_t const key
+                        = best == 0ull ? 0u : static_cast<uint32_t>((best >> 32) * 2048ull + (best & 0xFFFFFFFFull));
+                    int const idx = best == 0ull ? -1 : sCrossIdx;
+                    float const w = best == 0ull ? 0.0f : sCrossWeight;
+                    unsigned long long const at = slotRow + static_cast<unsigned long long>(rank) * kDsSlotBytes;
+                    dsPublish(p, at, tag | static_cast<uint32_t>(idx), tag | __float_as_uint(w));
+                    dsPublish(p, at + 16u, tag | key, tag);
+                }
+                uint32_t bestKey = 0u;
+                int token = -1;
+                float tokenWeight = 0.0f;
+                for (int r = 0; r < world; ++r)
+                {
+                    if (((owners >> r) & 1u) == 0u)
+                    {
+                        continue;
+                    }
+                    unsigned long long a, b, c, d;
+                    unsigned long long const at = copy + slotRow + static_cast<unsigned long long>(r) * kDsSlotBytes;
+                    dsAwaitPair(at, flag, p.status, p.timeoutNs, a, b);
+                    dsAwaitPair(at + 16u, flag, p.status, p.timeoutNs, c, d);
+                    int const idx = static_cast<int>(static_cast<uint32_t>(a));
+                    uint32_t const key = static_cast<uint32_t>(c);
+                    if (idx >= 0 && key > bestKey)
+                    {
+                        bestKey = key;
+                        token = idx;
+                        tokenWeight = __uint_as_float(static_cast<uint32_t>(b));
+                    }
+                }
+                sCand = token;
+                sCandWeight = tokenWeight;
+            }
+        }
+        __syncthreads();
+    };
+
+    drawRound(cachedLocalMass, -1.0f, 0);
+    stamp(6);
+    int cand = sCand;
+    float candWeight = sCandWeight;
+    int token = cand >= 0 ? cand : argmax;
+    if (rp.needTopP && cand >= 0)
+    {
+        // ---- 5. The shipped rejection loop's tests (top-p only), the sweep spread over the ranks.
+        for (int round = 0;;)
+        {
+            uint32_t const flag = dsFlag(epoch, round);
+            unsigned long long const partRow = p.partialOffset
+                + ((callParity * 2u + static_cast<unsigned long long>(round & 1)) * p.maxRows + row) * kDsThreads
+                    * kDsPairBytes;
+            if (tid < localThreads)
+            {
+                CountMass mine{0.0f, 0.0f};
+                if (!splitTopPSkips(own, maxScaled, candWeight))
+                {
+                    int const vt = localThreads * rank + tid;
+                    for (int j = 0; vt + j * kDsThreads < vecCount; ++j)
+                    {
+                        float4 const x = sx[tid + localThreads * j];
+                        float const xs[4] = {x.x, x.y, x.z, x.w};
+#pragma unroll
+                        for (int j = 0; j < 4; ++j)
+                        {
+                            float const w = __expf(xs[j] - maxScaled);
+                            if (w >= 0.0f && w > candWeight)
+                            {
+                                mine.count += 1.0f;
+                                mine.mass += w;
+                            }
+                        }
+                    }
+                }
+                dsPublish(p, partRow + (static_cast<unsigned long long>(rank) * localThreads + tid) * kDsPairBytes,
+                    dsTag(flag) | __float_as_uint(mine.count), dsTag(flag) | __float_as_uint(mine.mass));
+            }
+            CountMass part;
+            {
+                unsigned long long a, b;
+                dsAwaitPair(copy + partRow + static_cast<unsigned long long>(tid) * kDsPairBytes, flag, p.status,
+                    p.timeoutNs, a, b);
+                part = CountMass{
+                    __uint_as_float(static_cast<uint32_t>(a)), __uint_as_float(static_cast<uint32_t>(b))};
+            }
+            CountMass const above = BlockReduceCountMass(shared.temp.reduceCountMass).Reduce(part, CountMassOp());
+            __syncthreads();
+            if (tid == 0)
+            {
+                sKeep = above.mass <= shared.massTarget ? 1 : 0;
+            }
+            __syncthreads();
+            if (sKeep)
+            {
+                token = cand;
+                break;
+            }
+            // Rejected: the candidate and everything at or below its weight leave the support; the next
+            // round's per-thread support mass is this test's partial mass (the shipped sweep's same sum).
+            float const pivot = candWeight;
+            if (++round >= kMaxRejectRounds)
+            {
+                token = argmax;
+                break;
+            }
+            drawRound(part.mass, pivot, round);
+            cand = sCand;
+            candWeight = sCandWeight;
+            if (cand < 0)
+            {
+                token = argmax;
+                break;
+            }
+        }
+    }
+    if (tid == 0)
+    {
+        fs.outputTokens[row] = token;
+    }
+    __syncthreads();
+    stamp(7);
+    if (tid == 0)
+    {
+        *counter = epoch;
+    }
+}
+
 } // namespace fusedSampling
 } // namespace kernels
 } // namespace tensorrt_llm
@@ -1530,28 +2847,97 @@ at::Tensor draw(at::Tensor const& logits, at::Tensor const& temperatures, at::Te
     auto tokens = at::empty({logits.size(0)}, logits.options().dtype(at::kInt));
     params.outputTokens = tokens.data_ptr<int32_t>();
     auto const* threadStates = reinterpret_cast<fs::OnlineSoftmax const*>(states.data_ptr());
+    fs::SplitTopPRecord* const noRecords = nullptr;
     if (fs::splitVirtualBlock(params.numRows) == fs::kSplitBlock)
     {
         if (earlyTrigger)
         {
             launch(fs::splitDrawKernel<fs::kSplitBlock, fs::kSplitWalkVectors, true>, dim3(params.numRows),
-                dim3(fs::kSplitBlock), pdl, params, threadStates, softCap(multiplier, invCap, cap));
+                dim3(fs::kSplitBlock), pdl, params, threadStates, softCap(multiplier, invCap, cap), noRecords);
         }
         else
         {
             launch(fs::splitDrawKernel<fs::kSplitBlock, fs::kSplitWalkVectors, false>, dim3(params.numRows),
-                dim3(fs::kSplitBlock), pdl, params, threadStates, softCap(multiplier, invCap, cap));
+                dim3(fs::kSplitBlock), pdl, params, threadStates, softCap(multiplier, invCap, cap), noRecords);
         }
     }
     else if (earlyTrigger)
     {
         launch(fs::splitDrawKernel<fs::kSplitNarrowBlock, fs::kSplitNarrowWalkVectors, true>, dim3(params.numRows),
-            dim3(fs::kSplitNarrowBlock), pdl, params, threadStates, softCap(multiplier, invCap, cap));
+            dim3(fs::kSplitNarrowBlock), pdl, params, threadStates, softCap(multiplier, invCap, cap), noRecords);
     }
     else
     {
         launch(fs::splitDrawKernel<fs::kSplitNarrowBlock, fs::kSplitNarrowWalkVectors, false>, dim3(params.numRows),
-            dim3(fs::kSplitNarrowBlock), pdl, params, threadStates, softCap(multiplier, invCap, cap));
+            dim3(fs::kSplitNarrowBlock), pdl, params, threadStates, softCap(multiplier, invCap, cap), noRecords);
+    }
+    return tokens;
+}
+
+//! Kernel B with the multi-CTA top-p test (head_sampler_coop_fold TOPP_ROUNDS), on calls of at
+//! most kWideBlockMaxRows rows: kernel B on every row (a top-p-only row stops after its first
+//! draw and leaves its record), then `rounds` pairs of the test's sweep (VB / 128 CTAs per row)
+//! and decision (one CTA per row; the last one finishes every row). `records` holds
+//! kTopPRecordBytes per row, `partials` 2 words per (row, virtual thread). The tokens are
+//! draw()'s (bitwise: the same per-thread partials, reductions, Philox draws and walks).
+at::Tensor drawTopP(at::Tensor const& logits, at::Tensor const& temperatures, at::Tensor const& topKs,
+    at::Tensor const& topPs, at::Tensor const& minPs, std::optional<at::Tensor> const& seed,
+    std::optional<at::Tensor> const& offset, at::Tensor const& states, at::Tensor const& records,
+    at::Tensor const& partials, double multiplier, double invCap, double cap, int64_t rounds, bool pdl,
+    bool earlyTrigger)
+{
+    TORCH_CHECK(logits.scalar_type() == at::kBFloat16, "logits must be BF16");
+    at::cuda::CUDAGuard guard(logits.device());
+    auto params = rowParams(logits, temperatures, topKs, topPs, minPs, seed, offset);
+    TORCH_CHECK(fs::splitVirtualBlock(params.numRows) == fs::kSplitBlock, "the multi-CTA top-p test takes at most ",
+        fs::kWideBlockMaxRows, " rows");
+    TORCH_CHECK(params.vocabSize / 4 <= fs::kSplitWalkVectors * fs::kSplitBlock, "vocabulary too wide for the walk");
+    TORCH_CHECK(rounds >= 1 && rounds <= fs::kTopPMaxRounds, "1..", fs::kTopPMaxRounds, " test rounds");
+    checkStates(states, logits.size(0));
+    TORCH_CHECK(records.is_cuda() && records.is_contiguous() && records.scalar_type() == at::kInt
+            && records.device() == logits.device(),
+        "records must be a contiguous int32 tensor on the logits' device");
+    TORCH_CHECK(records.numel() * 4 >= static_cast<int64_t>(params.numRows) * fs::kTopPRecordBytes,
+        "records holds kTopPRecordBytes per row");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(records.data_ptr()) % fs::kTopPRecordBytes == 0,
+        "records must be aligned to its 128-byte slots");
+    TORCH_CHECK(partials.is_cuda() && partials.is_contiguous() && partials.scalar_type() == at::kInt
+            && partials.device() == logits.device(),
+        "partials must be a contiguous int32 tensor on the logits' device");
+    TORCH_CHECK(partials.numel() >= static_cast<int64_t>(params.numRows) * fs::kSplitBlock * 2,
+        "partials holds 2 words per (row, virtual thread)");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(partials.data_ptr()) % 8 == 0, "partials must be 8-byte aligned");
+    auto tokens = at::empty({logits.size(0)}, logits.options().dtype(at::kInt));
+    params.outputTokens = tokens.data_ptr<int32_t>();
+    auto const* threadStates = reinterpret_cast<fs::OnlineSoftmax const*>(states.data_ptr());
+    auto* const recs = reinterpret_cast<fs::SplitTopPRecord*>(records.data_ptr());
+    auto* const parts = reinterpret_cast<fs::CountMass*>(partials.data_ptr());
+    auto const capv = softCap(multiplier, invCap, cap);
+    dim3 const rowsGrid(static_cast<unsigned>(params.numRows));
+    launch(fs::splitDrawKernel<fs::kSplitBlock, fs::kSplitWalkVectors, false, true>, rowsGrid, dim3(fs::kSplitBlock),
+        pdl, params, threadStates, capv, recs);
+    for (int64_t r = 0; r < rounds; ++r)
+    {
+        launch(fs::splitTopPCountKernel<fs::kSplitBlock>,
+            dim3(static_cast<unsigned>(params.numRows), fs::kSplitBlock / fs::kTopPCountThreads),
+            dim3(fs::kTopPCountThreads), pdl, params, threadStates, static_cast<fs::SplitTopPRecord const*>(recs), parts,
+            capv);
+        auto const* const done = static_cast<fs::CountMass const*>(parts);
+        if (r + 1 < rounds)
+        {
+            launch(fs::splitTopPDecideKernel<fs::kSplitBlock, fs::kSplitWalkVectors, false, false>, rowsGrid,
+                dim3(fs::kSplitBlock), pdl, params, threadStates, recs, done, capv);
+        }
+        else if (earlyTrigger)
+        {
+            launch(fs::splitTopPDecideKernel<fs::kSplitBlock, fs::kSplitWalkVectors, true, true>, rowsGrid,
+                dim3(fs::kSplitBlock), pdl, params, threadStates, recs, done, capv);
+        }
+        else
+        {
+            launch(fs::splitTopPDecideKernel<fs::kSplitBlock, fs::kSplitWalkVectors, true, false>, rowsGrid,
+                dim3(fs::kSplitBlock), pdl, params, threadStates, recs, done, capv);
+        }
     }
     return tokens;
 }
@@ -1793,6 +3179,163 @@ at::Tensor vpArgmax(at::Tensor const& status, int64_t rows, int64_t copy, int64_
     return tokens;
 }
 
+//! The dynamic shared memory a dsSampleKernel block may use on `device` (the device's opt-in limit less the
+//! kernel's static shared memory), raised once per instantiation and device.
+template <bool kTrigger, bool kStamp, bool kFabric>
+size_t dsRaiseSmem(int device)
+{
+    constexpr int kDevices = 64;
+    static size_t limits[kDevices] = {};
+    TORCH_CHECK(device >= 0 && device < kDevices, "device index out of range");
+    if (limits[device] == 0)
+    {
+        cudaFuncAttributes attributes{};
+        C10_CUDA_CHECK(cudaFuncGetAttributes(&attributes, fs::dsSampleKernel<kTrigger, kStamp, kFabric>));
+        int optin = 0;
+        C10_CUDA_CHECK(cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+        size_t const limit = static_cast<size_t>(optin) - attributes.sharedSizeBytes;
+        C10_CUDA_CHECK(cudaFuncSetAttribute(
+            fs::dsSampleKernel<kTrigger, kStamp, kFabric>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(limit)));
+        limits[device] = limit;
+    }
+    return limits[device];
+}
+
+//! ds_sample: the distributed sampler's tokens (int32 [ranksHere * rows]; ranksHere = world when `emulated`, else
+//! 1). `local` is [ranksHere * rows, shard] BF16 (this process's ranks' LM-head GEMM outputs, rank-major),
+//! `pending` [ranksHere * rows, world * shard] BF16 (written for top-k / min-p rows only); the row params are
+//! [rows]. `staging` holds every rank's staging address ([2][maxRows][shard / 4] vectors), `publish` the LL area
+//! bases the values are stored through, `copies` the LL area copy of each rank here.
+at::Tensor dsSample(at::Tensor const& local, at::Tensor const& pending, at::Tensor const& temperatures,
+    at::Tensor const& topKs, at::Tensor const& topPs, at::Tensor const& minPs, std::optional<at::Tensor> const& seed,
+    std::optional<at::Tensor> const& offset, at::IntArrayRef staging, at::IntArrayRef publish, at::IntArrayRef copies,
+    at::Tensor const& counters, at::Tensor const& status, int64_t rank, int64_t world, bool emulated, int64_t maxRows,
+    int64_t readyOffset, int64_t statesOffset, int64_t candOffset, int64_t partialOffset, int64_t timeoutS,
+    double multiplier, double invCap, double cap, bool pdl, bool earlyTrigger, std::optional<at::Tensor> const& stamps,
+    bool fabric)
+{
+    TORCH_CHECK(world >= 1 && world <= fs::kDsMaxRanks && fs::kDsThreads % world == 0, "1, 2, 4 or 8 ranks");
+    TORCH_CHECK(rank >= 0 && rank < world, "rank out of range");
+    int64_t const ranksHere = emulated ? world : 1;
+    TORCH_CHECK(local.scalar_type() == at::kBFloat16 && local.dim() == 2 && local.is_contiguous() && local.is_cuda(),
+        "local must be a contiguous CUDA BF16 [ranks here * rows, shard] tensor");
+    TORCH_CHECK(local.size(0) % ranksHere == 0, "local holds every rank here's rows");
+    int64_t const rows = local.size(0) / ranksHere;
+    int64_t const shard = local.size(1);
+    TORCH_CHECK(shard % 4 == 0, "the shard must be a whole number of 4-element vectors");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(local.data_ptr()) % 8 == 0, "local must be 8-byte aligned");
+    TORCH_CHECK(rows >= 1 && rows <= maxRows, "1..max_rows rows");
+    // Above kWideBlockMaxRows rows the split sampler runs the 512-thread virtual block: not this kernel's.
+    TORCH_CHECK(maxRows <= fs::kWideBlockMaxRows, "max_rows above ", fs::kWideBlockMaxRows);
+    TORCH_CHECK(pending.scalar_type() == at::kBFloat16 && pending.dim() == 2 && pending.is_contiguous()
+            && pending.size(0) == ranksHere * rows && pending.size(1) == world * shard,
+        "pending must be a contiguous BF16 [ranks here * rows, world * shard] tensor");
+    at::cuda::CUDAGuard guard(local.device());
+    auto params = rowParams(pending.narrow(0, 0, rows), temperatures, topKs, topPs, minPs, seed, offset);
+    TORCH_CHECK(params.vocabSize / 4 <= fs::kSplitWalkVectors * fs::kDsThreads, "vocabulary too wide for the walk");
+    TORCH_CHECK(static_cast<int64_t>(staging.size()) == world, "one staging address per rank");
+    TORCH_CHECK(publish.size() >= 1 && publish.size() <= static_cast<size_t>(fs::kDsMaxRanks), "1..8 publish targets");
+    TORCH_CHECK(static_cast<int64_t>(copies.size()) == ranksHere, "one LL area copy per rank here");
+    TORCH_CHECK(counters.is_cuda() && counters.scalar_type() == at::kInt && counters.is_contiguous()
+            && counters.numel() >= ranksHere * maxRows,
+        "counters holds one int32 per (rank here, row)");
+    TORCH_CHECK(status.is_cuda() && status.scalar_type() == at::kInt && status.numel() >= 1, "status int32[1]");
+    TORCH_CHECK(pending.device() == local.device() && counters.device() == local.device()
+            && status.device() == local.device() && temperatures.device() == local.device(),
+        "every tensor on the local shard's device");
+    int device = 0;
+    C10_CUDA_CHECK(cudaGetDevice(&device));
+    int sms = 0;
+    C10_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
+    // Every CTA waits for the same row's CTAs of the other ranks: the grid must be resident at once.
+    TORCH_CHECK(rows * ranksHere <= sms, "ds_sample: ", rows * ranksHere, " CTAs exceed the ", sms,
+        " SMs (one resident CTA each)");
+    fs::DsParams p;
+    p.fs = params;
+    p.fs.logits = pending.data_ptr();
+    auto tokens = at::empty({ranksHere * rows}, local.options().dtype(at::kInt));
+    p.fs.outputTokens = tokens.data_ptr<int32_t>();
+    p.local = reinterpret_cast<uint2 const*>(local.data_ptr());
+    for (int64_t r = 0; r < world; ++r)
+    {
+        TORCH_CHECK(staging[r] % 16 == 0, "staging addresses must be 16-byte aligned");
+        p.staging[r] = reinterpret_cast<uint2*>(staging[r]);
+    }
+    for (size_t i = 0; i < publish.size(); ++i)
+    {
+        TORCH_CHECK(publish[i] % 16 == 0, "publish targets must be 16-byte aligned");
+        p.publish[i] = static_cast<unsigned long long>(publish[i]);
+    }
+    p.numPublish = static_cast<int>(publish.size());
+    for (int64_t r = 0; r < ranksHere; ++r)
+    {
+        TORCH_CHECK(copies[r] % 16 == 0, "LL area copies must be 16-byte aligned");
+        p.copy[r] = static_cast<unsigned long long>(copies[r]);
+    }
+    TORCH_CHECK(readyOffset % 16 == 0 && statesOffset % 16 == 0 && candOffset % 16 == 0 && partialOffset % 16 == 0,
+        "LL regions 16-byte aligned");
+    p.counters = reinterpret_cast<uint32_t*>(counters.data_ptr<int32_t>());
+    p.status = status.data_ptr<int32_t>();
+    p.cap = softCap(multiplier, invCap, cap);
+    p.rank = static_cast<int>(rank);
+    p.world = static_cast<int>(world);
+    p.emulated = emulated ? 1 : 0;
+    p.shardVecs = static_cast<int>(shard / 4);
+    p.maxRows = static_cast<int>(maxRows);
+    p.readyOffset = static_cast<unsigned long long>(readyOffset);
+    p.statesOffset = static_cast<unsigned long long>(statesOffset);
+    p.candOffset = static_cast<unsigned long long>(candOffset);
+    p.partialOffset = static_cast<unsigned long long>(partialOffset);
+    p.timeoutNs = static_cast<unsigned long long>(timeoutS) * 1000000000ull;
+    // This rank's slots: L per 1024-vector stripe of the row.
+    size_t const smem = static_cast<size_t>((params.vocabSize / 4 + fs::kDsThreads - 1) / fs::kDsThreads)
+        * (fs::kDsThreads / world) * sizeof(float4);
+    bool const stamped = stamps.has_value();
+    if (stamped)
+    {
+        auto const& t = stamps.value();
+        TORCH_CHECK(t.is_cuda() && t.scalar_type() == at::kLong && t.is_contiguous() && t.device() == local.device()
+                && t.numel() >= ranksHere * maxRows * fs::kDsStamps,
+            "stamps: int64 [ranks here * max_rows * kDsStamps] on the local shard's device");
+        p.stamps = reinterpret_cast<unsigned long long*>(t.data_ptr<int64_t>());
+    }
+    // One instantiation per (trigger, stamps, fabric); the served ones are <trigger, false, fabric>.
+    size_t (*raise)(int) = nullptr;
+    void (*kernel)(fs::DsParams const) = nullptr;
+#define DS_PICK(T, S, F)                                                                                               \
+    if (earlyTrigger == T && stamped == S && fabric == F)                                                              \
+    {                                                                                                                  \
+        raise = &dsRaiseSmem<T, S, F>;                                                                                 \
+        kernel = &fs::dsSampleKernel<T, S, F>;                                                                         \
+    }
+    DS_PICK(true, true, true)
+    DS_PICK(true, true, false)
+    DS_PICK(true, false, true)
+    DS_PICK(true, false, false)
+    DS_PICK(false, true, true)
+    DS_PICK(false, true, false)
+    DS_PICK(false, false, true)
+    DS_PICK(false, false, false)
+#undef DS_PICK
+    TORCH_CHECK(raise != nullptr && kernel != nullptr, "ds_sample: no instantiation");
+    size_t const most = raise(device);
+    TORCH_CHECK(smem <= most, "ds_sample: a shard of ", shard, " needs ", smem, " bytes of shared memory, ", most,
+        " available");
+    cudaLaunchConfig_t config{};
+    config.gridDim = dim3(static_cast<unsigned>(rows), static_cast<unsigned>(ranksHere));
+    config.blockDim = dim3(fs::kDsThreads);
+    config.dynamicSmemBytes = smem;
+    config.stream = at::cuda::getCurrentCUDAStream();
+    cudaLaunchAttribute attribute[1];
+    attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attribute[0].val.programmaticStreamSerializationAllowed = pdl ? 1 : 0;
+    config.attrs = attribute;
+    config.numAttrs = 1;
+    C10_CUDA_CHECK(cudaLaunchKernelEx(&config, kernel, p));
+    return tokens;
+}
+
 //! The DFlash 2 sampled path walk (draft_path_sample.cuh): the [B, K] int32 draft tokens and the [K, B, top_k]
 //! distributions the positions were drawn from. With draft_probs, also writes each position's distribution into
 //! its request's slot row at the candidates' vocabulary ids (the caller zeroes those rows first).
@@ -1892,6 +3435,10 @@ TORCH_LIBRARY(musespark_open_sm107_head_sampler, m)
         "Tensor? offset, Tensor states, float multiplier, float inv_cap, float cap, bool pdl, "
         "bool early_trigger=False) -> Tensor");
     m.def(
+        "draw_topp(Tensor logits, Tensor temperatures, Tensor top_ks, Tensor top_ps, Tensor min_ps, Tensor? seed, "
+        "Tensor? offset, Tensor states, Tensor(a!) records, Tensor(b!) partials, float multiplier, float inv_cap, "
+        "float cap, int rounds, bool pdl, bool early_trigger=False) -> Tensor");
+    m.def(
         "fold_plain_coop(Tensor logits, Tensor temperatures, Tensor(a!) states, float multiplier, float inv_cap, "
         "float cap, int vts, int threads, bool early_trigger, bool pdl) -> ()");
     m.def("ref_fold(Tensor capped, Tensor temperatures, Tensor(a!) states) -> ()");
@@ -1915,6 +3462,13 @@ TORCH_LIBRARY(musespark_open_sm107_head_sampler, m)
         "vp_argmax(Tensor(a!) status, int rows, int copy, int rank, int ranks, int shard_vecs, int state_stride, "
         "int greedy_offset, int greedy_stride, int cand_stride, int timeout_s, bool pdl) -> Tensor");
     m.def(
+        "ds_sample(Tensor local, Tensor(a!) pending, Tensor temperatures, Tensor top_ks, Tensor top_ps, "
+        "Tensor min_ps, Tensor? seed, Tensor? offset, int[] staging, int[] publish, int[] copies, "
+        "Tensor(b!) counters, Tensor(c!) status, int rank, int world, bool emulated, int max_rows, "
+        "int ready_offset, int states_offset, int cand_offset, int partial_offset, int timeout_s, "
+        "float multiplier, float inv_cap, float cap, bool pdl, bool early_trigger=False, Tensor? stamps=None, "
+        "bool fabric=False) -> Tensor");
+    m.def(
         "draft_path_sample(Tensor edges, Tensor unary, Tensor ids, Tensor temperatures, Tensor top_ks, "
         "Tensor top_ps, Tensor min_ps, Tensor seed, Tensor offset, int slot_base, int slot_span, "
         "Tensor(a!)? draft_probs, Tensor? slots) -> (Tensor, Tensor)");
@@ -1925,6 +3479,7 @@ TORCH_LIBRARY_IMPL(musespark_open_sm107_head_sampler, CUDA, m)
     m.impl("fold_plain", &foldPlain);
     m.impl("fold_gather", &foldGather);
     m.impl("draw", &draw);
+    m.impl("draw_topp", &drawTopP);
     m.impl("fold_plain_coop", &foldPlainCoop);
     m.impl("ref_fold", &refFold);
     m.impl("cap", &capRows);
@@ -1933,5 +3488,6 @@ TORCH_LIBRARY_IMPL(musespark_open_sm107_head_sampler, CUDA, m)
     m.impl("vp_draw", &vpDraw);
     m.impl("vp_decide", &vpDecide);
     m.impl("vp_argmax", &vpArgmax);
+    m.impl("ds_sample", &dsSample);
     m.impl("draft_path_sample", &draftPathSample);
 }

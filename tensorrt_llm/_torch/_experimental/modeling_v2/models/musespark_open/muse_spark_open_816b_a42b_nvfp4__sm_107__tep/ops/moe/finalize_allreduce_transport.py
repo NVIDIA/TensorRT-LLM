@@ -81,10 +81,11 @@ grid is at most ``GRID_STEP`` CTAs. ``2**32`` is a multiple of
 ``2 * GRID_STEP``, so the parity survives the counter's wrap. ``GRID_STEP`` is
 the layout's (``grid_step``): 128 for ``MAX_TOKENS``, 256 for
 ``WIDE_MAX_TOKENS`` (a 32-token call is 256 CTAs of 64 threads and 2 KiB of
-shared memory, resident at once on the devices served), and 128, 256 or 512
-for a TP8 layout of ``TP8_MAX_TOKENS`` = 16, 32 or 64 tokens (a 64-token call
-is 512 CTAs in 64 clusters of 8, which must all be resident at once on the
-device served). The two builds of a TP8
+shared memory, resident at once on the devices served), and 128, 256, 512 or
+1024 for a TP8 layout of ``TP8_MAX_TOKENS`` = 16, 32, 64 or 128 tokens (a 64-token call
+is 512 CTAs in 64 clusters of 8, a 128-token call 1024 CTAs in 128 clusters of 8 --
+about five 64-thread CTAs per SM on Rubin's 212 -- which must all be resident at once
+on the device served). The two builds of a TP8
 workspace share its receive area and counter: a call of either advances the
 counter by the layout's ``grid_step``, and both map a ``(token, column
 vector)`` slot to the same thread, so the arguments above hold across builds.
@@ -128,8 +129,13 @@ its arithmetic at 17..32 tokens too; at TP8 the built-in switches to one CTA
 per token above 16 tokens, which the cluster-8 order is not, so the wide
 layout is TP4-only. A TP8 workspace instead takes its calls of
 17..``TP8_MAX_TOKENS`` itself, on its own layout of that many tokens and the
-flat build (``TP8_MAX_TOKENS`` is ``configure``'s ``tep8_max_tokens``: 16, 32
-or 64, 16 by default; no TP4 workspace uses it).
+flat build (``TP8_MAX_TOKENS`` is ``configure``'s ``tep8_max_tokens``: 16, 32,
+64 or 128, 16 by default; no TP4 workspace uses it). 128 is the built-in TP8
+kernel's own bound (``_MAX_TOKENS``), whose 17..128-token calls all run one CTA
+per token, the flat build's order (checked per token count at workspace build):
+with it the 65..128-token TP8 calls (9..16 requests at K = 7) leave the built-in
+kernel too (the GB300 port's ``MUSESPARK_OPEN_TEP8_FINALIZE_TRANSPORT_TOKENS=128``,
+bitwise on 8 ranks incl. graph replays, bs16 -0.39 ms there).
 """
 
 from __future__ import annotations
@@ -158,13 +164,15 @@ WIDE_MAX_TOKENS = 32
 LAYOUT_RANK_COUNTS = {MAX_TOKENS: (4, 8), WIDE_MAX_TOKENS: (4,)}
 #: The built-in TP8 kernel's cluster-8 range; above it the built-in runs one CTA per token.
 CLUSTER8_TOKENS = 16
-#: The layout of a TP8 workspace (``configure``'s ``tep8_max_tokens``: 16, 32 or 64; the
-#: ``tep8_finalize_transport_64`` lever sets 64), whose calls of 17..TP8_MAX_TOKENS tokens add their
+#: The layout of a TP8 workspace (``configure``'s ``tep8_max_tokens``: 16, 32, 64 or 128; the
+#: ``tep8_finalize_transport_64`` lever sets its TOKENS, 64 by default), whose calls of 17..TP8_MAX_TOKENS tokens add their
 #: slot sums flat, in the built-in one-CTA-per-token order (``flat_sum``, as at TP4; the built-in
 #: runs one CTA per token up to 128). TP4 workspaces ignore it (their 17..32-token calls are
 #: ``serve_wide_calls``'). Kept out of ``LAYOUT_RANK_COUNTS`` (``has_layout``), so a 32-token TP8
 #: layout never makes the TP4 wide layout's entry admit TP8.
 TP8_MAX_TOKENS = 16
+#: The TP8 layouts ``configure`` accepts (128: the built-in TP8 kernel's own bound).
+TP8_LAYOUTS = (16, 32, 64, 128)
 #: CTAs per token (one cluster), threads per CTA, BF16 values per thread.
 CLUSTER = 8
 VECTOR = 8
@@ -243,6 +251,18 @@ class Transport:
     arrival: str = "red"
     reduction: str = "warp"
     trigger: str = "late"
+    #: ``index_prefetch`` (the ``tep8_finalize_transport_64`` lever's INDEX_PREFETCH): each thread
+    #: loads its token's eight row-map entries before ``griddepcontrol.wait`` and issues the
+    #: expert-row loads from them right after it, beside a second, post-wait load of the same
+    #: entries; a slot whose entry changed (the pre-wait value was stale) has its row loaded again
+    #: from the post-wait entry, so every value used is the post-wait one: bit for bit today's.
+    #: It takes the row-map round trip off the chain wait -> row map -> rows -> norms -> publish.
+    prefetch: bool = False
+    #: Timer stamps (measurement only; 0 = none): the device address of an int64 buffer of
+    #: ``16 * grid`` entries; thread 0 of CTA ``b`` writes ``%globaltimer`` at stage ``i``
+    #: (``STAMP_STAGES``) into entry ``16 b + 2 i`` (entry ``16 b + 2 i + 1`` holds a word the
+    #: stage produced, which keeps the stamp behind it). A compile-time constant.
+    stamps: int = 0
 
     def __post_init__(self):
         choices = {
@@ -254,9 +274,27 @@ class Transport:
         for name, allowed in choices.items():
             if getattr(self, name) not in allowed:
                 raise ValueError(f"Transport.{name} must be one of {allowed}")
+        if not isinstance(self.prefetch, bool):
+            raise ValueError("Transport.prefetch must be a bool")
+        if not isinstance(self.stamps, int) or self.stamps < 0 or self.stamps % 8:
+            raise ValueError("Transport.stamps must be 0 or an 8-byte-aligned device address")
 
     def label(self) -> str:
-        return f"{self.publish}/{self.arrival}/{self.reduction}/{self.trigger}"
+        base = f"{self.publish}/{self.arrival}/{self.reduction}/{self.trigger}"
+        return base + ("/prefetch" if self.prefetch else "") + ("/stamps" if self.stamps else "")
+
+
+#: The stages ``Transport.stamps`` records, in order (entry ``i`` of a CTA's eight).
+STAMP_STAGES = (
+    "entry",  # kernel start (before the cluster setup and the dependency wait)
+    "dep wait",  # griddepcontrol.wait returned
+    "rows",  # the row map and the eight expert rows arrived (the slot sums of squares computed)
+    "norms",  # the cluster's slot norms exchanged and summed (after the CTA barrier)
+    "publish",  # this rank's partial stored to the multicast slot
+    "poll",  # every peer's words arrived
+    "store",  # the sum stored
+    "exit",  # after the late trigger / exit barrier
+)
 
 
 #: The transport ``finalize_transport`` installs. ``configure``'s ``trigger`` ``entry`` (the
@@ -269,27 +307,32 @@ DEFAULT = Transport()
 ENTRY_TRIGGER = Transport(trigger="entry")
 
 
-def configure(*, tep8_max_tokens: int = 16, trigger: str = "late") -> None:
+def configure(*, tep8_max_tokens: int = 16, trigger: str = "late", index_prefetch: bool = False) -> None:
     """Set the TP8 workspace layout and the trigger of the transport ``finalize_transport`` builds.
 
     ``lever_settings.apply`` sets them from the model's plan before any install; a workspace
     built afterwards takes them (``FinalizeTransportWorkspace``'s defaults).
 
     Args:
-        tep8_max_tokens: the token layout of a TP8 workspace (``TP8_MAX_TOKENS``): 16, 32 or 64.
-            Above 16 its calls of 17..``tep8_max_tokens`` tokens run the flat build.
+        tep8_max_tokens: the token layout of a TP8 workspace (``TP8_MAX_TOKENS``): one of
+            ``TP8_LAYOUTS`` (16, 32, 64 or 128). Above 16 its calls of
+            17..``tep8_max_tokens`` tokens run the flat build.
         trigger: the dependent-launch trigger of ``DEFAULT``: ``"late"`` or ``"entry"``
             (an empty value is ``"late"``).
+        index_prefetch: ``DEFAULT``'s ``prefetch`` (``Transport.prefetch``): the row map read
+            before the dependency wait, verified after it.
 
     Raises:
-        ValueError: if ``tep8_max_tokens`` is not 16, 32 or 64, or ``trigger`` is not a
-            ``Transport`` trigger.
+        ValueError: if ``tep8_max_tokens`` is not one of ``TP8_LAYOUTS``, or ``trigger`` is not
+            a ``Transport`` trigger.
     """
     global TP8_MAX_TOKENS, DEFAULT
     tokens = int(tep8_max_tokens)
-    if tokens not in (16, 32, 64):
-        raise ValueError(f"finalize transport token cap {tokens}: 16, 32 or 64")
-    transport = Transport(trigger=str(trigger).strip() or "late")
+    if tokens not in TP8_LAYOUTS:
+        raise ValueError(
+            f"finalize transport token cap {tokens}: one of {', '.join(map(str, TP8_LAYOUTS))}"
+        )
+    transport = Transport(trigger=str(trigger).strip() or "late", prefetch=bool(index_prefetch))
     TP8_MAX_TOKENS = tokens
     DEFAULT = transport
 
@@ -409,6 +452,41 @@ if HAS_CUTE_DSL:
             ip,
         )
         return _split_words(result, loc, ip)
+
+    @dsl_user_op
+    def _reload_row_x4(address, load, replace, o0, o1, o2, o3, *, loc=None, ip=None):
+        """``index_prefetch``'s correction: the given words unless ``replace``; then the coherent
+        16-byte row load when ``load``, else zeros (the default path's words for that slot)."""
+        result = _asm(
+            ir.Type.parse(_FOUR_WORDS),
+            [_i64(address, loc, ip), _u32(load, loc, ip), _u32(replace, loc, ip)]
+            + [_u32(w, loc, ip) for w in (o0, o1, o2, o3)],
+            "{\n.reg .pred p, q;\n.reg .b32 a, b, c, d;\n"
+            "mov.b32 a, $7;\nmov.b32 b, $8;\nmov.b32 c, $9;\nmov.b32 d, $10;\n"
+            "setp.ne.u32 q, $6, 0;\n"
+            "@q mov.b32 a, 0;\n@q mov.b32 b, 0;\n@q mov.b32 c, 0;\n@q mov.b32 d, 0;\n"
+            "setp.ne.u32 p, $5, 0;\n"
+            "@p ld.global.v4.b32 {a, b, c, d}, [$4];\n"
+            "mov.b32 $0, a;\nmov.b32 $1, b;\nmov.b32 $2, c;\nmov.b32 $3, d;\n}",
+            "=r,=r,=r,=r,l,r,r,r,r,r,r",
+            loc,
+            ip,
+        )
+        return _split_words(result, loc, ip)
+
+    @dsl_user_op
+    def _stamp(address, after, *, loc=None, ip=None):
+        """Measurement only: ``%globaltimer`` into the int64 at ``address`` and ``after`` (a
+        word the stage produced, so the stamp is not taken before it exists) into the next."""
+        _asm(
+            None,
+            [_i64(address, loc, ip), _u32(after, loc, ip)],
+            "{\n.reg .b64 g;\n.reg .b32 x;\nmov.b32 x, $1;\n"
+            "mov.u64 g, %globaltimer;\nst.global.u64 [$0], g;\nst.global.u32 [$0+8], x;\n}",
+            "l,r",
+            loc,
+            ip,
+        )
 
     @dsl_user_op
     def _reset_x4(address, enabled, *, loc=None, ip=None):
@@ -620,6 +698,8 @@ if HAS_CUTE_DSL:
             self.push = transport.reduction == "push"
             self.warp_push = transport.reduction == "warp"
             self.entry_trigger = transport.trigger == "entry"
+            self.prefetch = transport.prefetch
+            self.stamps = int(transport.stamps)
             self.pdl = pdl
 
         def select_row(self, indices, rows, token, k):
@@ -742,6 +822,11 @@ if HAS_CUTE_DSL:
 
             # A dry launch only makes the driver load the module.
             if dry == 0:
+                stamp_base = None
+                if cutlass.const_expr(self.stamps != 0):
+                    stamp_base = Int64(self.stamps) + Int64(block) * 128
+                    if tid == 0:
+                        _stamp(stamp_base, Uint32(block))
                 if cutlass.const_expr(self.push or self.warp_push):
                     # The receive mbarrier, visible cluster-wide before any peer
                     # sends (no global memory is touched before the wait).
@@ -757,10 +842,19 @@ if HAS_CUTE_DSL:
                     cute.arch.barrier()
                     cute.arch.cluster_arrive_relaxed()
                     cute.arch.cluster_wait()
+                # index_prefetch: the row map before the dependency wait (possibly stale: every
+                # entry is read again after the wait and a changed one reloads its row).
+                early_index = []
+                if cutlass.const_expr(self.prefetch):
+                    for k in cutlass.range_constexpr(TOP_K):
+                        early_index.append(self.select_row(indices, rows, token, k)[0])
                 if cutlass.const_expr(self.pdl):
                     cute.arch.griddepcontrol_wait()
                     if cutlass.const_expr(self.entry_trigger):
                         cute.arch.griddepcontrol_launch_dependents()
+                if cutlass.const_expr(self.stamps != 0):
+                    if tid == 0:
+                        _stamp(stamp_base + 16, Uint32(block))
 
                 # Selected rows and routing weights; invalid slots read nothing.
                 selection = Int64(token) * TOP_K
@@ -769,16 +863,46 @@ if HAS_CUTE_DSL:
                 row_valid = []
                 row_weight = []
                 row_words = []
-                for k in cutlass.range_constexpr(TOP_K):
-                    index, valid = self.select_row(indices, rows, token, k)
-                    row_index.append(index)
-                    row_valid.append(valid)
-                    row_weight.append(_load_f32(weights.toint() + (selection + k) * 4))
-                    offset = _expert_rows.routed_row_offset(
-                        Int64(index), Int64(row_stride), Int64(column)
-                    )
-                    address = gemm_address + offset * 2
-                    row_words.append(_load_row_x4(address, valid))
+                if cutlass.const_expr(self.prefetch):
+                    # The rows of the early entries first, then the entries again (all in flight
+                    # together), then a slot whose entry changed reloads (or clears) its words.
+                    for k in cutlass.range_constexpr(TOP_K):
+                        early_valid = Uint32(_expert_rows.routed_row_valid(early_index[k], rows))
+                        offset = _expert_rows.routed_row_offset(
+                            Int64(early_index[k]), Int64(row_stride), Int64(column)
+                        )
+                        row_words.append(_load_row_x4(gemm_address + offset * 2, early_valid))
+                    for k in cutlass.range_constexpr(TOP_K):
+                        index, valid = self.select_row(indices, rows, token, k)
+                        row_index.append(index)
+                        row_valid.append(valid)
+                        row_weight.append(_load_f32(weights.toint() + (selection + k) * 4))
+                    for k in cutlass.range_constexpr(TOP_K):
+                        changed = Uint32(row_index[k] != early_index[k])
+                        offset = _expert_rows.routed_row_offset(
+                            Int64(row_index[k]), Int64(row_stride), Int64(column)
+                        )
+                        w0, w1, w2, w3 = _reload_row_x4(
+                            gemm_address + offset * 2,
+                            row_valid[k] & changed,
+                            changed,
+                            row_words[k][0],
+                            row_words[k][1],
+                            row_words[k][2],
+                            row_words[k][3],
+                        )
+                        row_words[k] = (w0, w1, w2, w3)
+                else:
+                    for k in cutlass.range_constexpr(TOP_K):
+                        index, valid = self.select_row(indices, rows, token, k)
+                        row_index.append(index)
+                        row_valid.append(valid)
+                        row_weight.append(_load_f32(weights.toint() + (selection + k) * 4))
+                        offset = _expert_rows.routed_row_offset(
+                            Int64(index), Int64(row_stride), Int64(column)
+                        )
+                        address = gemm_address + offset * 2
+                        row_words.append(_load_row_x4(address, valid))
                 norm_words = _load_input_x4(norm.toint() + Int64(column) * 2, Uint32(1))
 
                 # This call's buffer, then this CTA's arrival.
@@ -816,6 +940,9 @@ if HAS_CUTE_DSL:
                             square_sum + scaled_low * scaled_low + scaled_high * scaled_high
                         )
                     partials.append(cute.arch.warp_reduction_sum(square_sum))
+                if cutlass.const_expr(self.stamps != 0):
+                    if tid == 0:
+                        _stamp(stamp_base + 32, _float_bits(partials[TOP_K - 1]))
                 if cutlass.const_expr(self.warp_push):
                     # Each warp's 8 slot sums (lane 0's, as the built-in stores
                     # them) into row (crank, warp) of every cluster CTA, this one
@@ -891,6 +1018,9 @@ if HAS_CUTE_DSL:
                                 total = total + _load_cluster_peer_f32(cta_sums.iterator + tid, c)
                             sums[tid] = total
                 cute.arch.barrier()
+                if cutlass.const_expr(self.stamps != 0):
+                    if tid == 0:
+                        _stamp(stamp_base + 48, _float_bits(sums[0]))
 
                 # Normalize each slot, weight it, and accumulate in FP32.
                 result = [Float32(0.0)] * VECTOR
@@ -911,10 +1041,16 @@ if HAS_CUTE_DSL:
                 slot = self.slot_offset(token, column)
                 receive_address = receive.toint()
                 self.publish(own, buffer, slot, rank, mcast, peers)
+                if cutlass.const_expr(self.stamps != 0):
+                    if tid == 0:
+                        _stamp(stamp_base + 64, own[0])
                 values = cute.make_rmem_tensor(cute.make_layout((self.ranks, 4)), Uint32)
                 self.poll(
                     values, own[0], own[1], own[2], own[3], buffer, slot, rank, receive_address
                 )
+                if cutlass.const_expr(self.stamps != 0):
+                    if tid == 0:
+                        _stamp(stamp_base + 80, values[self.ranks - 1, 0])
                 self.retire(buffer, slot, rank, receive_address)
 
                 # The built-in sum: every rank's partial in rank order, FP32 from +0.
@@ -928,6 +1064,9 @@ if HAS_CUTE_DSL:
                 for w in cutlass.range_constexpr(4):
                     packed.append(_pack_bf16x2(total_out[2 * w], total_out[2 * w + 1]))
                 _store_x4(out.toint() + slot, packed[0], packed[1], packed[2], packed[3])
+                if cutlass.const_expr(self.stamps != 0):
+                    if tid == 0:
+                        _stamp(stamp_base + 96, packed[0])
 
                 if cutlass.const_expr(self.pdl and not self.entry_trigger):
                     cute.arch.griddepcontrol_launch_dependents()
@@ -935,6 +1074,9 @@ if HAS_CUTE_DSL:
                     # Keep this CTA's shared memory alive until its cluster peers read it.
                     cute.arch.cluster_arrive()
                     cute.arch.cluster_wait()
+                if cutlass.const_expr(self.stamps != 0):
+                    if tid == 0:
+                        _stamp(stamp_base + 112, packed[0])
 
     _POINTER_DTYPES = (
         BFloat16,  # gemm

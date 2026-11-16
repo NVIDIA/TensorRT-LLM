@@ -76,6 +76,13 @@ RING_SIZES = {8: EXPERTS // 8, 4: EXPERTS // 4}
 #: tail instead of following it (the traced top-8 -> ring buddy gap is 0.7 us). Launch timing
 #: only: values unchanged.
 _RB_PDL = False
+#: The ``tep8_router_push`` lever's ``RB_CUDA`` (``configure(cuda_tables=True)``): the 8-rank balanced
+#: two-window calls with tables (``meta_tile``; the count rule or ``tep8_tile_placement``'s) of at most
+#: 128 rows run ``ring_buddy_cuda.rb_tables`` (one 1024-thread CUDA CTA, PDL) instead of this module's
+#: Triton program: the same ids, BF16 weights, stats and CTA tables; an expert's rows in token order.
+#: VR nsys (wall + rp9, rank 0): the Triton program ends 3.4 / 4.1 / 3.9 / 4.3 us after the router push
+#: at bs8 / 9 / 12 / 16 and FC1 waits for it.
+_CUDA_TABLES = False
 
 
 def block_of(ranks: int) -> int:
@@ -91,11 +98,13 @@ def block_of(ranks: int) -> int:
     raise ValueError(f"ring_buddy_assign serves rings of {sorted(RING_SIZES)} ranks, got {ranks}")
 
 
-#: Largest ``M * TOP_K`` one program handles: 64 decode rows (eight requests' K = 7 verify
+#: Largest ``M * TOP_K`` one program handles: 128 decode rows (sixteen requests' K = 7 verify
 #: steps), so ring-buddy balance also places the 33..64-row TEP8 steps under the
-#: ``tep8_ring_buddy_wide`` lever (``ring_buddy.configure(tep8_max_rows=64)``); the kernel is
-#: the same [SLOTS, RANKS] program at a 512-slot tile.
-MAX_SLOTS = 512
+#: ``tep8_ring_buddy_wide`` lever (``ring_buddy.configure(tep8_max_rows=64)``, a 512-slot tile)
+#: and, with its MAX_ROWS raised to 128, the 65..128-row ones (a 1024-slot tile); the kernel is
+#: the same [SLOTS, RANKS] program at every tile, and smaller calls keep their tile. (The GB300
+#: port, ``sm_103__tep8``, serves 128 rows on this program: device gate kernel == reference.)
+MAX_SLOTS = 1024
 
 #: The half window (``half_window_experts``, tep4): a block's upper half starts at this
 #: local index, and the stack ``[own block | the predecessor's upper half]`` holds
@@ -124,6 +133,20 @@ META_FIELDS = ("e2p", "p2t", "c2b", "c2m", "nnc", "tnp")
 #: 32 / 16 rows: 8 warps -3.09 / -2.86 / -2.54 / -1.73 us against the routing-kernel chain,
 #: 4 warps -2.43 / -2.48 / -2.83 / -1.63).
 _META_WARPS = 8
+#: Warps of the table-writing program on its 1024-slot tile (65..128 rows; ``configure``'s
+#: ``wide_warps``, the ``tep8_ring_buddy_wide`` lever's WIDE_WARPS). Default ``_META_WARPS`` (8),
+#: the program served before. VR nsys (wall + rp9, rank 0): the ring buddy ends 3.1-3.2 us after
+#: the router push at 56..64 rows (512-slot tile) and 4.0-4.3 us at 72 / 96 / 128 rows (the
+#: 1024-slot tile: 576 slots at bs9 are padded to it), on the router path's critical chain (FC1
+#: starts when it ends). At 1024 slots 8 warps hold 4 slots a thread in every [SLOTS]- and
+#: [SLOTS, RANKS]-shaped step. The placement is integer arithmetic on the step's ids, so the warp
+#: count changes no id, table size or weight; only the order of an expert's rows inside its tiles
+#: (``pos``: CTA-scope atomics, arrival order, as with any warp count) may differ, which the
+#: row-independent expert GEMMs do not see.
+_WIDE_WARPS = 8
+#: The warp counts ``wide_warps`` accepts, and the tile from which it applies.
+WIDE_WARPS_CHOICES = (4, 8, 16, 32)
+WIDE_WARPS_FROM_SLOTS = 1024
 
 
 #: The ``tep8_tile_placement`` lever (``configure(tile_placement=True, tile_min_rows=...)``):
@@ -136,14 +159,45 @@ _META_WARPS = 8
 #: its outflow, the last one only if it lands closer. Every rank derives the same placement
 #: (integer arithmetic on the same ids), so each slot still runs on exactly one rank; only which
 #: experts move changes, so it is accuracy-equivalent to the count rule, not bitwise (per-rank
-#: finalize partials). Off: the count rule.
+#: finalize partials). Off: the count rule. ``tile_max_rows`` (the lever's MAX_ROWS, default 64:
+#: the band it was measured on) bounds it from above: a prerouted call of more rows (65..128 under
+#: ``prerouted_experts``' TEP8_MAX_ROWS, 16-token tiles) keeps the count rule unless it is raised.
+#: ``tile_cost`` (the lever's COST_A / COST_B) sets ``_TILE_COST`` per deployment: (20, 11) are
+#: GB300's costs; on VR the FP4 FC1 + FC2 of a bs8 (64-row) layer take ~39 us for ~28 experts a
+#: rank (~1.4 us an expert, mostly one tile), and the finalize transport still waits 2.5-2.7 us a
+#: layer at bs4-8 on the slowest rank's experts (8-rank nsys at bs12/16: the rank with the latest
+#: FC2 end is the one with the longest FC1 + FC2 in 93 % of layers), so the VR costs are an A/B.
 _TILE_PLACEMENT = False
 _TILE_MIN_ROWS = 33
+_TILE_MAX_ROWS = 64
 _TILE_COST = (20, 11)
+#: The bounds ``configure`` accepts for ``tile_cost`` (0.1 us; the kernel adds them in int32 over
+#: at most 64 local experts).
+TILE_COST_A_RANGE = (1, 255)
+TILE_COST_B_RANGE = (0, 255)
+#: The tile placement on the two BF16 expert layers (``configure(bf16_tile_cost=(A, B), bf16_tile=...)``,
+#: the lever's BF16_COST_A / BF16_COST_B / BF16_TILE): their stacked call has no prerouted tables (the
+#: routing kernel builds its own at the BF16 op's tile, 8 tokens at 65..128 rows on VR), so the rule
+#: runs on the call's ids alone with these costs and tile, in the lever's MIN_ROWS..MAX_ROWS band.
+#: A = 0 (default): the BF16 layers keep the count rule. VR 8-rank nsys (vrg-p16-wall, bs12 / bs16):
+#: FC1 + FC2 of a BF16 layer 161 / 188 us, max - median over the ranks 20 / 23 us (3.1 / 3.7 on the
+#: NVFP4 layers); a census-routing model fits ~80-85 + ~25-30 x (tiles - 1) (0.1 us) there.
+_BF16_TILE_COST = (0, 0)
+_BF16_TILE = 8
+BF16_TILE_CHOICES = (8, 16, 32, 64)
 
 
 def configure(
-    *, rb_pdl: bool = False, tile_placement: bool = False, tile_min_rows: int = 33
+    *,
+    rb_pdl: bool = False,
+    tile_placement: bool = False,
+    tile_min_rows: int = 33,
+    tile_max_rows: int = 64,
+    tile_cost: Tuple[int, int] = (20, 11),
+    wide_warps: int = 8,
+    cuda_tables: bool = False,
+    bf16_tile_cost: Tuple[int, int] = (0, 0),
+    bf16_tile: int = 8,
 ) -> None:
     """Set the settings this module reads when it launches the placement kernel.
 
@@ -153,33 +207,156 @@ def configure(
     Args:
         rb_pdl: the ``tep8_ring_buddy_pdl`` lever: the 8-rank ring's table-writing call
             launches as a PDL dependent of the routing kernel (``_RB_PDL``).
-        tile_placement: the ``tep8_tile_placement`` lever: TEP8 prerouted calls of at least
-            ``tile_min_rows`` rows place experts by tile cost (``_TILE_PLACEMENT``).
+        tile_placement: the ``tep8_tile_placement`` lever: TEP8 prerouted calls of
+            ``tile_min_rows``..``tile_max_rows`` rows place experts by tile cost
+            (``_TILE_PLACEMENT``).
         tile_min_rows: the fewest rows a call places by tile cost (``_TILE_MIN_ROWS``).
+        tile_max_rows: the most rows a call places by tile cost (``_TILE_MAX_ROWS``).
+        tile_cost: ``(A, B)`` in 0.1 us: an expert's placement cost ``A + B * (tiles - 1)``
+            (``_TILE_COST``; (20, 11) by default, GB300's).
+        wide_warps: warps of the table-writing program on the ``WIDE_WARPS_FROM_SLOTS``-slot
+            tile (``_WIDE_WARPS``; one of ``WIDE_WARPS_CHOICES``, 8 by default).
+        cuda_tables: the ``tep8_router_push`` lever's ``RB_CUDA``: the 8-rank balanced two-window
+            table-writing calls run ``ring_buddy_cuda``'s CUDA program (``_CUDA_TABLES``).
+        bf16_tile_cost: ``(A, B)`` in 0.1 us for the BF16 layers' calls (``bf16=True``) in the
+            ``tile_min_rows``..``tile_max_rows`` band while ``tile_placement`` is on
+            (``_BF16_TILE_COST``); A = 0 (default) keeps their count rule.
+        bf16_tile: the token tile those costs count in (``_BF16_TILE``; one of
+            ``BF16_TILE_CHOICES``, 8 by default).
+
+    Raises:
+        ValueError: if ``tile_cost`` is not two integers in ``TILE_COST_A_RANGE`` /
+            ``TILE_COST_B_RANGE``, ``bf16_tile_cost`` not two integers in 0..255, ``bf16_tile``
+            not one of ``BF16_TILE_CHOICES``, or ``wide_warps`` not one of
+            ``WIDE_WARPS_CHOICES`` (nothing is set).
     """
-    global _RB_PDL, _TILE_PLACEMENT, _TILE_MIN_ROWS
+    global _RB_PDL, _TILE_PLACEMENT, _TILE_MIN_ROWS, _TILE_MAX_ROWS, _TILE_COST, _WIDE_WARPS
+    global _CUDA_TABLES
+    global _BF16_TILE_COST, _BF16_TILE
+    if int(wide_warps) not in WIDE_WARPS_CHOICES:
+        raise ValueError(f"wide_warps is one of {WIDE_WARPS_CHOICES}, got {wide_warps!r}")
+    bf16_cost = tuple(int(c) for c in bf16_tile_cost)
+    if (
+        len(bf16_cost) != 2
+        or not 0 <= bf16_cost[0] <= TILE_COST_A_RANGE[1]
+        or not 0 <= bf16_cost[1] <= TILE_COST_B_RANGE[1]
+    ):
+        raise ValueError(
+            f"bf16_tile_cost is (A, B) with A in 0..{TILE_COST_A_RANGE[1]} (0: off) and B in "
+            f"0..{TILE_COST_B_RANGE[1]} (0.1 us), got {bf16_tile_cost!r}"
+        )
+    if int(bf16_tile) not in BF16_TILE_CHOICES:
+        raise ValueError(f"bf16_tile is one of {BF16_TILE_CHOICES}, got {bf16_tile!r}")
+    # A = 0 is off whatever B: one stored value for off
+    if bf16_cost[0] == 0:
+        bf16_cost = (0, 0)
+    cost = tuple(int(c) for c in tile_cost)
+    if (
+        len(cost) != 2
+        or not TILE_COST_A_RANGE[0] <= cost[0] <= TILE_COST_A_RANGE[1]
+        or not TILE_COST_B_RANGE[0] <= cost[1] <= TILE_COST_B_RANGE[1]
+    ):
+        raise ValueError(
+            f"tile_cost is (A, B) with A in {TILE_COST_A_RANGE[0]}..{TILE_COST_A_RANGE[1]} and B in "
+            f"{TILE_COST_B_RANGE[0]}..{TILE_COST_B_RANGE[1]} (0.1 us), got {tile_cost!r}"
+        )
+    _TILE_COST = cost
+    _WIDE_WARPS = int(wide_warps)
     _RB_PDL = bool(rb_pdl)
+    _CUDA_TABLES = bool(cuda_tables)
     _TILE_PLACEMENT = bool(tile_placement)
     _TILE_MIN_ROWS = int(tile_min_rows)
+    _TILE_MAX_ROWS = int(tile_max_rows)
+    _BF16_TILE_COST = bf16_cost
+    _BF16_TILE = int(bf16_tile)
     if _TILE_PLACEMENT:
         try:
             from tensorrt_llm.logger import logger as _logger
 
             _logger.info(
-                f"[musespark_open] tep8_tile_placement: prerouted calls of >= {_TILE_MIN_ROWS} "
-                f"rows place experts by cost {_TILE_COST[0]} + {_TILE_COST[1]} x (tiles - 1) "
-                "(0.1 us) on the two-window ring"
+                f"[musespark_open] tep8_tile_placement: prerouted calls of {_TILE_MIN_ROWS}.."
+                f"{_TILE_MAX_ROWS} rows place experts by cost {_TILE_COST[0]} + {_TILE_COST[1]} "
+                "x (tiles - 1) (0.1 us) on the two-window ring"
+                + (
+                    f"; the BF16 layers' calls by {_BF16_TILE_COST[0]} + {_BF16_TILE_COST[1]} x "
+                    f"({_BF16_TILE}-token tiles - 1)"
+                    if _BF16_TILE_COST[0]
+                    else ""
+                )
+            )
+        except Exception:  # noqa: BLE001 - logging only
+            pass
+    if _WIDE_WARPS != _META_WARPS:
+        try:
+            from tensorrt_llm.logger import logger as _logger
+
+            _logger.info(
+                f"[musespark_open] ring_buddy_assign: the {WIDE_WARPS_FROM_SLOTS}-slot table-writing "
+                f"program (65..128 rows) runs {_WIDE_WARPS} warps ({_META_WARPS} below)"
             )
         except Exception:  # noqa: BLE001 - logging only
             pass
 
 
-def expert_cost(tokens: int, tile: int, cost=_TILE_COST) -> int:
+def program_warps(slots: int, tables: bool) -> int:
+    """Warps of the one program for a ``slots``-slot tile: ``_WIDE_WARPS`` on the table-writing
+    calls of at least ``WIDE_WARPS_FROM_SLOTS`` slots, ``_META_WARPS`` on the other table-writing
+    calls, ``NUM_WARPS`` without tables."""
+    if not tables:
+        return NUM_WARPS
+    return _WIDE_WARPS if slots >= WIDE_WARPS_FROM_SLOTS else _META_WARPS
+
+
+def cuda_tables_take(ranks: int, balance: bool, half: bool, slots: int, tile: Optional[int]) -> bool:
+    """Whether a table-writing call runs ``ring_buddy_cuda``'s CUDA program (``_CUDA_TABLES``, ``RB_CUDA``):
+    8 ranks, the balanced two-window placement (by count or, ``_TILE_PLACEMENT``, by tile cost; not the half
+    window), at most 1024 slots, a ``meta_tile`` of 8..64. Rank-uniform facts only."""
+    return (
+        _CUDA_TABLES
+        and ranks == 8
+        and bool(balance)
+        and not half
+        and 0 < slots <= MAX_SLOTS
+        and tile in (8, 16, 32, 64)
+    )
+
+
+def expert_cost(tokens: int, tile: int, cost=None) -> int:
     """The tile placement's cost of an expert (0.1 us) for ``tokens`` tokens in ``tile``-token
-    tiles (0 when absent)."""
+    tiles (0 when absent); ``cost`` defaults to the configured ``_TILE_COST``."""
     if tokens <= 0:
         return 0
+    cost = _TILE_COST if cost is None else cost
     return cost[0] + cost[1] * ((tokens + tile - 1) // tile - 1)
+
+
+def tile_rule(
+    rows: int,
+    meta_tile: Optional[int],
+    balance: bool,
+    half: bool,
+    ranks: int,
+    bf16: bool = False,
+) -> Optional[Tuple[int, int, int]]:
+    """``(A, B, tile)`` of the tile placement a ``rows``-row call takes, or None (the count rule).
+
+    With the lever on, a balanced two-window TP8 call of ``_TILE_MIN_ROWS``..``_TILE_MAX_ROWS`` rows
+    takes it: a call with prerouted tables (``meta_tile``) at ``_TILE_COST`` on the tables' tile, a
+    BF16 layer's call without tables (``bf16``) at ``_BF16_TILE_COST`` on ``_BF16_TILE`` when its A
+    is set; any other call keeps the count rule."""
+    if (
+        not _TILE_PLACEMENT
+        or not balance
+        or half
+        or ranks != 8
+        or not _TILE_MIN_ROWS <= rows <= _TILE_MAX_ROWS
+    ):
+        return None
+    if meta_tile is not None:
+        return (_TILE_COST[0], _TILE_COST[1], meta_tile)
+    if bf16 and _BF16_TILE_COST[0] > 0:
+        return (_BF16_TILE_COST[0], _BF16_TILE_COST[1], _BF16_TILE)
+    return None
 
 
 def meta_sizes(rows: int, window: int, tile: int) -> Dict[str, int]:
@@ -422,9 +599,10 @@ def _ring_buddy_assign_kernel(
     tl.store(stats_ptr + RANKS + ranks, load - x + x_prev)
 
 
-def place_tile_reference(flat: List[int], ranks: int, tile: int, cost=_TILE_COST) -> List[int]:
+def place_tile_reference(flat: List[int], ranks: int, tile: int, cost=None) -> List[int]:
     """The tile placement in plain Python: for each slot's expert, the rank that runs it (the
-    kernel's integer rule)."""
+    kernel's integer rule; ``cost`` defaults to the configured ``_TILE_COST``)."""
+    cost = _TILE_COST if cost is None else cost
     size = block_of(ranks)
     tokens = {}
     for e in flat:
@@ -510,13 +688,15 @@ class RingBuddyAssign(OpWrapper):
     (tep4, ``half_window_experts``) is the balanced placement onto the successor's
     copy of each block's upper half only (``ring_windows.place_half``): its ids
     address the 96-expert ``[own block | predecessor's experts 32..63]`` stack.
+    ``bf16=True`` marks a BF16 expert layer's call (no tables): it takes the tile rule on the
+    BF16 costs when ``tile_rule`` says so (``configure(bf16_tile_cost=...)``), else the count rule.
     """
 
     ARCHS = frozenset({Arch.SM_107})
 
     note = """
     Pure function of ``selected`` and ``rank``; one program, so it is meant for
-    decode rows (``M * 8 <= 256``). Duplicate ids within a row are not expected
+    decode rows (``M * 8 <= MAX_SLOTS``). Duplicate ids within a row are not expected
     (top-k selection is distinct) and are counted once in the census.
 
     The rewritten ids are meaningful only for an expert call with
@@ -537,6 +717,7 @@ class RingBuddyAssign(OpWrapper):
         ranks: int = RANKS,
         half: bool = False,
         meta_tile: Optional[int] = None,
+        bf16: bool = False,
     ):
         block = block_of(ranks)
         static_from = block if static_from is None else static_from
@@ -561,15 +742,30 @@ class RingBuddyAssign(OpWrapper):
             meta["tile"] = meta_tile
             ctas = max(16, triton.next_power_of_2(sizes["c2b"]))
         dummy = stats
-        tilew = (
-            _TILE_PLACEMENT
-            and meta is not None
-            and balance
-            and not half
-            and ranks == 8
-            and selected.shape[0] >= _TILE_MIN_ROWS
-        )
+        rule = tile_rule(selected.shape[0], meta_tile, balance, half, ranks, bf16)
+        tilew = rule is not None
+        cost_a, cost_b, tile = rule if tilew else (*_TILE_COST, meta_tile if meta is not None else 8)
         pdl = _RB_PDL and meta is not None and ranks == 8
+        if (
+            _CUDA_TABLES
+            and meta is not None
+            and cuda_tables_take(ranks, balance or half, half, num_slots, meta_tile)
+        ):
+            from . import ring_buddy_cuda as _rbc
+
+            if _rbc.launch(
+                selected,
+                weights,
+                rank,
+                meta_tile,
+                local_ids,
+                weights_bf16,
+                stats,
+                meta,
+                tilew=tilew,
+                cost=_TILE_COST,
+            ):
+                return local_ids, weights_bf16, stats, meta
         _ring_buddy_assign_kernel[(1,)](
             selected,
             weights,
@@ -592,13 +788,13 @@ class RingBuddyAssign(OpWrapper):
             STATIC_FROM=static_from,
             HALF=half,
             META=meta is not None,
-            TILE=meta_tile if meta is not None else 8,
+            TILE=tile,
             CTAS=ctas,
             TILEW=tilew,
-            COST_A=_TILE_COST[0],
-            COST_B=_TILE_COST[1],
+            COST_A=cost_a,
+            COST_B=cost_b,
             PDL=pdl,
-            num_warps=_META_WARPS if meta is not None else NUM_WARPS,
+            num_warps=program_warps(slots, meta is not None),
             launch_pdl=pdl,
         )
         if meta is not None:
@@ -615,9 +811,11 @@ class RingBuddyAssign(OpWrapper):
         ranks: int = RANKS,
         half: bool = False,
         meta_tile: Optional[int] = None,
+        bf16: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """The placement in plain Python over the host copy of ``selected``
-        (``ring_windows.place_half`` with ``half``)."""
+        (``ring_windows.place_half`` with ``half``; the count rule, as with the tile rule off:
+        ``place_tile_reference`` is the tile rule's)."""
         if half:
             from ...kernels.replicated_experts import windows as _windows
 
@@ -675,6 +873,7 @@ class RingBuddyAssign(OpWrapper):
         ranks: int = RANKS,
         half: bool = False,
         meta_tile: Optional[int] = None,
+        bf16: bool = False,
     ) -> None:
         """Inputs the kernel would read past or misplace without an error."""
         assert meta_tile is None or (not half and meta_tile in (8, 16, 32, 64)), (

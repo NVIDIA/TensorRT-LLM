@@ -30,7 +30,9 @@ instead of the router logits (``moe.shard_routing``), and the attention-side res
 writes the router's FP32 input next to the pre-FFN norm output (``router_input``); both are
 bitwise. With ``ce_gather`` the attention input of steps of at least ``ce_gather.MIN_ROWS``
 rows is gathered by the copy engines and the QKV projection runs in row blocks behind
-per-peer flags; also bitwise.
+per-peer flags; also bitwise. The two reduce-scatters of each layer can run in row chunks
+on side streams, overlapped with the GEMMs around them (``overlap``: the output projection,
+the attention-side tail and the experts' reduce-scatter; each its own lever, off by default).
 
 DFlash taps the residual stream after its capture layers, and that stream is
 sharded here. For the forward the step's capture buffer
@@ -191,14 +193,19 @@ def install(model: MuseSparkOpenModel, sm: Optional[int]) -> "ContextSequencePar
     parts installed beside the MoE re-class are ``SHARD_PARTS``.
 
     The MNNVL all-reduce workspaces are grown on the first prefill step
-    (``ContextSequenceParallel.reserve``).
+    (``ContextSequenceParallel.reserve``). The reduce-scatter overlaps ``overlap.configure``
+    set (``context_sp_oproj_overlap``, ``context_sp_tail_pipeline``,
+    ``context_sp_moe_rs_overlap``) are wired here too; their side streams are made on that
+    first prefill step.
 
     Raises:
         ValueError: when ``refusal`` names a reason, a layer's MoE is not the built-in one,
-            a layer's fused finalize all-reduce serves ``MIN_ROWS`` rows, or ``sm`` is not
-            ``SERVED_SM`` (None included).
+            a layer's fused finalize all-reduce serves ``MIN_ROWS`` rows, ``sm`` is not
+            ``SERVED_SM`` (None included), or the tail pipeline is set without the
+            ``router_input`` part.
     """
     from . import moe as _moe
+    from . import overlap as _overlap
 
     if sm != SERVED_SM:
         got = "no SM version" if sm is None else f"sm{sm}"
@@ -206,16 +213,25 @@ def install(model: MuseSparkOpenModel, sm: Optional[int]) -> "ContextSequencePar
             f"[musespark_open] context_sequence_parallel is written for sm{SERVED_SM}, got {got}"
         )
     parts = SHARD_PARTS
+    comm = _overlap.CommOverlap()
+    if comm.tail_pipeline and "router_input" not in parts:
+        raise ValueError(
+            "[musespark_open] context_sp_tail_pipeline joins through the router-input join; "
+            f"the path's parts are {parts}"
+        )
     path = ContextSequenceParallel(model, sm)
     _moe.install(model, min_rows=MIN_ROWS, shard_routing="shard_routing" in parts)
     if "router_input" in parts:
         from . import router_input as _router_input
 
-        _router_input.install(model, path.step)
+        _router_input.install(model, path.step, tail=comm.tail_pipeline)
     if "ce_gather" in parts:
         from . import ce_gather as _ce_gather
 
         path.ce_gather = _ce_gather.install(model)
+    if comm:
+        comm.install(model)
+        path.comm_overlap = comm
     return path
 
 
@@ -293,6 +309,8 @@ class ContextSequenceParallel:
         # The copy-engine gather of the attention input (``ce_gather.install``); None when
         # a layer's QKV projection cannot run in row blocks.
         self.ce_gather = None
+        # The reduce-scatter overlaps (``overlap.CommOverlap``); None when none is set.
+        self.comm_overlap = None
         # Set while ``forward`` runs the layers: the attention-side joins then also write
         # the router's FP32 input (``router_input``).
         self.step = SequenceParallelStep()
@@ -318,6 +336,8 @@ class ContextSequenceParallel:
         if self.ce_gather is not None:
             self.ce_gather.build()
             self.ce_gather.start_watch()
+        if self.comm_overlap is not None:
+            self.comm_overlap.build()
         self.reserved = True
 
     def takes(self, attn_metadata: Any, rows: int, kwargs: Dict[str, Any]) -> bool:

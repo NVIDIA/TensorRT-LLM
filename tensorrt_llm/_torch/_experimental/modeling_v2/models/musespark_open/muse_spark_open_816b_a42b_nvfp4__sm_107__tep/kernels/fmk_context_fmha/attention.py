@@ -24,6 +24,15 @@ selection and its cache key are unchanged), whose ``run_context`` runs:
 3. ``paged_context_fmha_fmk`` into the context rows of the layer's output, with the softmax
    scale (``bmm1[1]``) and the output scale (``bmm2[0]``) read on the device.
 
+Pure context steps (``PURE_CONTEXT``, off by default). With the lever's ``PURE_CONTEXT`` param at 1
+the library is also offered on steps that hold context rows only (no generation request, beam
+width 1, any input type but ``generation_only``): the FMHA manager then hands such a step's whole
+batch to it (a context-phase library and no generation phase), so every full-attention layer of a
+ctx-only / prefill step runs the multi-instance kernel instead of the thop op's trtllm-gen cubin. The
+cache key separates these steps (generation batch size 0) from the mixed band. Same numerics as on
+mixed steps; the accuracy gate covers mixed steps only, so the param stays 0 until a pure-context
+gate (GSM8K-long + SPEED-Bench AL on prefill-heavy traffic) passes.
+
 No host synchronisation: every device value is read in stream order. A call this path
 cannot serve runs the thop op as before (``ThopContextPhaseFmha.run_context``), logged
 once per reason: a stream capture in progress, a mask other than causal, attention sinks,
@@ -51,11 +60,13 @@ from typing import Optional, Sequence, Tuple
 import torch
 from torch.utils._python_dispatch import _disable_current_modes
 
+from tensorrt_llm._torch.attention.backends.fmha.interface import FmhaPhase
 from tensorrt_llm._torch.attention.backends.fmha.phased import FmhaParams
 from tensorrt_llm._torch.attention.backends.fmha.utils import (
     get_attention_chunk_size,
     get_bmm1_scale,
 )
+from tensorrt_llm._torch.attention.backends.interface import AttentionInputType
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
@@ -120,6 +131,16 @@ class StepPlans:
         return self._plan
 
 
+def takes_pure_context(attn_metadata) -> bool:
+    """Whether a step holds context rows only (``PURE_CONTEXT``): at least one context request,
+    no generation request, beam width 1. Host-side reads only."""
+    return (
+        getattr(attn_metadata, "num_contexts", 0) > 0
+        and getattr(attn_metadata, "num_generations", 0) == 0
+        and getattr(attn_metadata, "beam_width", 1) == 1
+    )
+
+
 class FmkContextPhaseFmha(_mixed.ThopContextPhaseFmha):
     """``ThopContextPhaseFmha`` whose context phase runs the multi-instance context FMHA.
 
@@ -127,23 +148,47 @@ class FmkContextPhaseFmha(_mixed.ThopContextPhaseFmha):
     cannot serve runs the base's thop context phase.
     """
 
-    def __init__(self, attn, fallback, plans: StepPlans, workspace: _fmk.FmkWorkspace):
+    def __init__(
+        self,
+        attn,
+        fallback,
+        plans: StepPlans,
+        workspace: _fmk.FmkWorkspace,
+        pure_context: bool = False,
+    ):
         super().__init__(attn, fallback)
         self._plans = plans
         self._workspace = workspace
+        #: Also offered on pure context steps (the lever's ``PURE_CONTEXT`` param).
+        self.pure_context = bool(pure_context)
+        self._pure_step = False
         #: Context phases run on the multi-instance kernel, and declined (thop op).
         self.fmk_calls = 0
         self.declined_calls = 0
 
+    def _is_supported(self, q, k, v, metadata, forward_args, *, phase=None) -> bool:
+        if self.pure_context and phase == FmhaPhase.CONTEXT and takes_pure_context(metadata):
+            if forward_args.attention_input_type == AttentionInputType.generation_only:
+                return False
+            if forward_args.output is None or forward_args.output_sf is not None:
+                return False
+            return self._fallback.is_supported(q, k, v, metadata, forward_args)
+        return super()._is_supported(q, k, v, metadata, forward_args, phase=phase)
+
+    def _step_kind(self) -> str:
+        return "a pure context step" if self._pure_step else "a mixed step's context rows"
+
     def run_context(self, params: FmhaParams) -> None:
+        self._pure_step = takes_pure_context(params.meta)
+        kind = "pure" if self._pure_step else "mixed"
         lengths = self._host_lengths(params)
         reason = self._decline(params, lengths)
         if reason is not None:
             self.declined_calls += 1
             logger.info_once(
-                f"[musespark_open] fmk_context_fmha: a mixed step's context rows ran the thop op "
+                f"[musespark_open] fmk_context_fmha: {self._step_kind()} ran the thop op "
                 f"(layer {self.attn.layer_idx}): {reason}",
-                key=f"musespark_open.fmk_context_fmha.decline.{reason}",
+                key=f"musespark_open.fmk_context_fmha.decline.{kind}.{reason}",
             )
             super().run_context(params)
             return
@@ -151,10 +196,10 @@ class FmkContextPhaseFmha(_mixed.ThopContextPhaseFmha):
         self.fmk_calls += 1
         self.context_calls += 1
         logger.info_once(
-            f"[musespark_open] fmk_context_fmha: a mixed step's context rows "
+            f"[musespark_open] fmk_context_fmha: {self._step_kind()} "
             f"({params.batch_size} requests, {params.num_tokens} rows, layer "
             f"{self.attn.layer_idx}) ran the multi-instance context FMHA",
-            key="musespark_open.fmk_context_fmha.ran",
+            key=f"musespark_open.fmk_context_fmha.ran.{kind}",
         )
 
     @staticmethod
@@ -366,9 +411,10 @@ def _prepare(
     return workspace
 
 
-def install(model: torch.nn.Module, compute_capability) -> int:
+def install(model: torch.nn.Module, compute_capability, pure_context: bool = False) -> int:
     """Replace the ``ThopContextPhaseFmha`` of every full-attention layer's FMHA manager with
-    an ``FmkContextPhaseFmha``. Returns the number of layers changed.
+    an ``FmkContextPhaseFmha`` (also offered on pure context steps when ``pure_context``).
+    Returns the number of layers changed.
 
     Run after ``mixed_step_gen_rows.install`` and before any CUDA graph is captured. Every
     layer is checked before any changes; idempotent.
@@ -401,12 +447,17 @@ def install(model: torch.nn.Module, compute_capability) -> int:
             i for i, fmha in enumerate(libs) if isinstance(fmha, _mixed.ThopContextPhaseFmha)
         )
         if isinstance(libs[index], FmkContextPhaseFmha):
+            libs[index].pure_context = bool(pure_context)
+            attn._fmha_manager._cache.clear()
             continue
-        libs[index] = FmkContextPhaseFmha(attn, libs[index]._fallback, plans, workspace)
+        libs[index] = FmkContextPhaseFmha(
+            attn, libs[index]._fallback, plans, workspace, pure_context=pure_context
+        )
         attn._fmha_manager._cache.clear()
     logger.info(
         f"[musespark_open] fmk_context_fmha: the context rows of mixed steps with "
-        f"{_mixed.MIN_GENERATIONS}..{_mixed.MAX_GENERATIONS} generation requests run the "
+        f"{_mixed.MIN_GENERATIONS}..{_mixed.MAX_GENERATIONS} generation requests"
+        f"{' and every pure context step' if pure_context else ''} run the "
         f"multi-instance context FMHA on {len(chosen)} full-attention layers ({num_ctas} CTAs, "
         f"workspace {workspace.nbytes / 2**20:.1f} MiB)"
     )
@@ -422,6 +473,7 @@ def context_library(attn) -> Optional[FmkContextPhaseFmha]:
 
 
 __all__ = [
+    "takes_pure_context",
     "FmkContextPhaseFmha",
     "StepPlans",
     "context_library",

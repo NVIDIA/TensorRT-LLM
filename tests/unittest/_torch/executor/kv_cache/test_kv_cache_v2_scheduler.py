@@ -117,10 +117,11 @@ def test_sparse_metadata_republishes_after_connector_acceptance() -> None:
     manager.kv_connector_manager = Mock()
     manager._connector_reservations_enabled = Mock(return_value=True)
     manager._accept_connector_prefix_reservations = order.accept
+    manager._on_allocation_stream = set()
     order.attach_mock(manager.kv_connector_manager.build_scheduler_output, "report")
     order.attach_mock(manager.sparse_metadata_batch.record_read, "record_read")
     order.attach_mock(manager.sparse_metadata_batch.publish, "publish")
-    scheduled = Mock()
+    scheduled = Mock(context_requests=[])
     manager.report_batch_to_connector(scheduled)
     assert order.mock_calls == [
         call.accept(scheduled),
@@ -5607,3 +5608,288 @@ class TestAdmissionDiagnostics:
         plain = run()
         backoff_env.setenv(_DIAG_ENV, "1")
         assert run() == plain
+
+
+class TestPrefixSkipExtensions:
+    """Opt-in extensions of the prefix-aware skip (TRTLLM_SCHED_PREFIX_SKIP_*).
+
+    All default off; with them unset the skip behaves as TestPrefixAwareSkip pins.
+    """
+
+    _ENVS = (
+        "TRTLLM_SCHED_PREFIX_SKIP_PENDING",
+        "TRTLLM_SCHED_PREFIX_SKIP_MAX_DEFER_PASSES",
+        "TRTLLM_SCHED_PREFIX_SKIP_KEY_CACHE",
+        "TRTLLM_SCHED_PREFIX_SKIP_PRIORITIZE",
+        "TRTLLM_SCHED_SHORTEST_PREFILL_FIRST",
+    )
+
+    @pytest.fixture(autouse=True)
+    def _clean_env(self, monkeypatch):
+        for name in self._ENVS:
+            monkeypatch.delenv(name, raising=False)
+
+    @staticmethod
+    def _manager(keys):
+        return make_kv_cache_manager(
+            enable_block_reuse=True,
+            block_reuse_policy=BlockReusePolicy.ALL_REUSABLE,
+            first_new_block_fn=lambda req: keys.get(req.request_id),
+        )
+
+    @staticmethod
+    def _pending_contributor_and_duplicate():
+        # req 0 has started its prefill (a continuation) but is not in flight this pass;
+        # req 1 is a first chunk whose first new block is the one req 0 commits next, and is
+        # tried first (as after a shortest-prefill-first reorder). By default req 0 registers
+        # its block only once it is scheduled, which is too late for req 1.
+        req0 = make_ctx_request(0, 500, prompt_len=1000, is_first_context_chunk=False)
+        req1 = make_ctx_request(1, 500)
+        return [req1, req0]
+
+    def test_defaults_off(self):
+        sched = make_scheduler(self._manager({}))
+        assert not sched._prefix_skip_pending
+        assert not sched._prefix_skip_key_cache
+        assert not sched._prefix_skip_prioritize
+
+    def test_pending_contributor_not_registered_by_default(self):
+        mgr = self._manager({0: b"blockA", 1: b"blockA"})
+        sched = make_scheduler(mgr, max_num_tokens=10000)
+        out = sched.schedule_request(self._pending_contributor_and_duplicate(), set())
+        assert ids(out.context_requests) == [1, 0]
+
+    def test_pending_contributor_defers_duplicate(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_SCHED_PREFIX_SKIP_PENDING", "1")
+        mgr = self._manager({0: b"blockA", 1: b"blockA"})
+        sched = make_scheduler(mgr, max_num_tokens=10000)
+        out = sched.schedule_request(self._pending_contributor_and_duplicate(), set())
+        assert ids(out.context_requests) == [0]
+        assert sched._prefix_skip_defer_passes == {1: 1}
+
+    def test_pending_deferrals_are_bounded(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_SCHED_PREFIX_SKIP_PENDING", "1")
+        monkeypatch.setenv("TRTLLM_SCHED_PREFIX_SKIP_MAX_DEFER_PASSES", "2")
+        mgr = self._manager({0: b"blockA", 1: b"blockA"})
+        sched = make_scheduler(mgr, max_num_tokens=10000)
+        reqs = self._pending_contributor_and_duplicate()
+        admitted = [ids(sched.schedule_request(reqs, set()).context_requests) for _ in range(3)]
+        assert admitted == [[0], [0], [1, 0]]
+        # Admission forgets the request's deferral count.
+        assert 1 not in sched._prefix_skip_defer_passes
+
+    def test_key_cache_probes_a_continuation_once_per_commit(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_SCHED_PREFIX_SKIP_KEY_CACHE", "1")
+        mgr = self._manager({0: b"blockA", 1: b"blockB", 2: b"blockC"})
+        mgr.kv_cache_map[0] = Mock(is_active=True, num_committed_tokens=128)
+        sched = make_scheduler(mgr, max_num_tokens=10000)
+        req0 = make_ctx_request(0, 500, prompt_len=1000, is_first_context_chunk=False)
+        reqs = [req0, make_ctx_request(1, 100), make_ctx_request(2, 100)]
+
+        def probes_of_req0():
+            return sum(1 for c in mgr.probe_first_new_block_key.call_args_list if c.args[0] is req0)
+
+        sched.schedule_request(reqs, {0})
+        sched.schedule_request(reqs, {0})
+        assert probes_of_req0() == 1
+        mgr.kv_cache_map[0].num_committed_tokens = 192  # its chunk landed: the key may move
+        sched.schedule_request(reqs, {0})
+        assert probes_of_req0() == 2
+
+    def test_key_cache_keeps_the_deferred_first_chunk_key(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_SCHED_PREFIX_SKIP_KEY_CACHE", "1")
+        mgr = self._manager({0: b"blockA", 1: b"blockA"})
+        sched = make_scheduler(mgr, max_num_tokens=10000)
+        req0 = make_ctx_request(0, 500, prompt_len=1000, is_first_context_chunk=False)
+        req1 = make_ctx_request(1, 500)
+        assert ids(sched.schedule_request([req0, req1], {0}).context_requests) == []
+        assert sched._deferred_first_block_key == {1: b"blockA"}
+        probes = mgr.probe_first_new_block_key.call_count
+        # Still behind the same contributor block: deferred again without re-probing req 1.
+        sched.schedule_request([req0, req1], {0})
+        assert not any(
+            c.args[0] is req1 for c in mgr.probe_first_new_block_key.call_args_list[probes:]
+        )
+
+    def test_prioritize_zeroes_the_deferred_work(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_SCHED_SHORTEST_PREFILL_FIRST", "1")
+        monkeypatch.setenv("TRTLLM_SCHED_PREFIX_SKIP_PRIORITIZE", "1")
+        mgr = self._manager({0: b"blockA", 1: b"blockA"})
+        sched = make_scheduler(mgr, max_num_tokens=10000)
+        req0 = make_ctx_request(0, 500, prompt_len=1000, is_first_context_chunk=False)
+        req1 = make_ctx_request(1, 900)
+        sched.schedule_request([req0, req1], {0})
+        spf = sched._shortest_prefill_first
+        assert 1 in spf._prioritized
+        # Its work counts as zero: the key is the clock reading it arrived at.
+        assert spf._key_of(req1, mgr) == spf._arrival_work[1]
+
+    def test_prioritize_without_spf_is_inert(self, monkeypatch):
+        monkeypatch.setenv("TRTLLM_SCHED_PREFIX_SKIP_PRIORITIZE", "1")
+        mgr = self._manager({0: b"blockA", 1: b"blockA"})
+        sched = make_scheduler(mgr, max_num_tokens=10000)
+        req0 = make_ctx_request(0, 500, prompt_len=1000, is_first_context_chunk=False)
+        out = sched.schedule_request([req0, make_ctx_request(1, 900)], {0})
+        assert ids(out.context_requests) == []
+
+
+# ===========================================================================
+# Opt-in KVRG: out-of-pages context retry gate (M3.1 port)
+# ===========================================================================
+
+
+_KVRG_ENV = "TRTLLM_M31_KVRG"
+_KVRG_SHADOW_ENV = "TRTLLM_M31_KVRG_SHADOW"
+_KVRG_MAX_SKIP_ENV = "TRTLLM_M31_KVRG_MAX_SKIP"
+
+
+class _Stats:
+    def __init__(self, available, evictable=0):
+        self.available = available
+        self.evictable = evictable
+
+
+def _with_page_counts(mgr, counts):
+    """Give the mock a pool-statistics surface the gate reads: one level, one pool group."""
+    mgr.impl = Mock()
+    mgr.impl.cache_tier_list = [0]
+    mgr.impl.get_storage_statistics.side_effect = lambda level: [_Stats(*counts)]
+    return mgr
+
+
+@pytest.fixture
+def kvrg_env(backoff_env):
+    for name in (_KVRG_ENV, _KVRG_SHADOW_ENV, _KVRG_MAX_SKIP_ENV):
+        backoff_env.delenv(name, raising=False)
+    return backoff_env
+
+
+def _chunked(mgr, **kwargs):
+    return make_scheduler(mgr, max_num_tokens=1000, ctx_chunk_config=(None, 64), **kwargs)
+
+
+class TestKVRetryGate:
+    def test_off_by_default_retries_every_pass(self, kvrg_env):
+        counts = [10, 0]
+        mgr = _with_page_counts(_refusing_manager({1}), counts)
+        sched = _chunked(mgr)
+        assert sched._kvrg_mode == "off" and not sched._kvrg_track
+        ctx = make_ctx_request(1, 500)
+        for _ in range(4):
+            assert ids(sched.schedule_request([ctx], set()).context_requests) == []
+        assert _resize_attempts(mgr) == [1] * 4
+        assert mgr.prepare_context.call_count == 4
+
+    def test_replays_a_refusal_until_pages_rise(self, kvrg_env):
+        kvrg_env.setenv(_KVRG_ENV, "1")
+        counts = [10, 0]
+        refused = {1}
+        mgr = _with_page_counts(_refusing_manager(refused), counts)
+        sched = _chunked(mgr)
+        assert sched._kvrg_track
+        ctx = make_ctx_request(1, 500)
+        for _ in range(4):
+            assert ids(sched.schedule_request([ctx], set()).context_requests) == []
+        # One real attempt; the next three passes replay it without prepare/resize.
+        assert _resize_attempts(mgr) == [1]
+        assert mgr.prepare_context.call_count == 1
+        assert sched._kvrg_cnt["gated"] + sched._kvrg_tot["gated"] == 3
+        # A page count rises: the next pass attempts for real, and succeeds.
+        counts[0] = 11
+        refused.clear()
+        assert ids(sched.schedule_request([ctx], set()).context_requests) == [1]
+        assert _resize_attempts(mgr) == [1, 1]
+        assert sched._kvrg_fail == {}
+
+    def test_evictable_rise_also_ends_the_gate(self, kvrg_env):
+        kvrg_env.setenv(_KVRG_ENV, "1")
+        counts = [10, 0]
+        mgr = _with_page_counts(_refusing_manager({1}), counts)
+        sched = _chunked(mgr)
+        ctx = make_ctx_request(1, 500)
+        sched.schedule_request([ctx], set())
+        sched.schedule_request([ctx], set())
+        counts[1] = 1
+        sched.schedule_request([ctx], set())
+        assert _resize_attempts(mgr) == [1, 1]
+
+    def test_cap_forces_a_real_attempt(self, kvrg_env):
+        kvrg_env.setenv(_KVRG_ENV, "1")
+        kvrg_env.setenv(_KVRG_MAX_SKIP_ENV, "4")
+        mgr = _with_page_counts(_refusing_manager({1}), [10, 0])
+        sched = _chunked(mgr)
+        ctx = make_ctx_request(1, 500)  # id 1: cap = 4 + 1 % 4 = 5 passes
+        attempted = []
+        for step in range(12):
+            before = len(mgr.resize_context.call_args_list)
+            sched.schedule_request([ctx], set())
+            if _resize_attempts(mgr)[before:]:
+                attempted.append(step)
+        assert attempted == [0, 5, 10]
+
+    def test_a_smaller_chunk_is_attempted(self, kvrg_env):
+        kvrg_env.setenv(_KVRG_ENV, "1")
+        mgr = _with_page_counts(_refusing_manager({1}), [10, 0])
+        sched = _chunked(mgr)
+        ctx = make_ctx_request(1, 500)
+        sched.schedule_request([ctx], set())  # refused at a 500-token chunk
+        # Another context request takes 512 tokens first: request 1 could only get a smaller chunk now.
+        other = make_ctx_request(2, 512)
+        sched.schedule_request([other, ctx], set())
+        assert _resize_attempts(mgr) == [1, 2, 1]
+        assert sched._kvrg_cnt["retry_chunk"] + sched._kvrg_tot["retry_chunk"] == 1
+
+    def test_replayed_refusals_drive_the_page_backoff_like_stock(self, kvrg_env):
+        """With generation running, the backoff holds the same passes and decides the same outputs."""
+        outputs = {}
+        for mode in ("off", "on"):
+            if mode == "on":
+                kvrg_env.setenv(_KVRG_ENV, "1")
+            # The backoff runs at the prefill-decode interval.
+            kvrg_env.setenv(_INTERVAL_ENV, "2")
+            mgr = _with_page_counts(_refusing_manager({1, 2}), [10, 0])
+            sched = _chunked(mgr)
+            gen = make_gen_request(0)
+            pending = [make_ctx_request(1, 300), make_ctx_request(2, 300)]
+            seq = []
+            for _ in range(9):
+                out = sched.schedule_request([gen, *pending], set())
+                seq.append(
+                    (ids(out.generation_requests), ids(out.context_requests), sched._ctx_page_backoff.remaining)
+                )
+            outputs[mode] = (seq, len(_resize_attempts(mgr)))
+        assert outputs["on"][0] == outputs["off"][0]
+        assert outputs["on"][1] < outputs["off"][1]
+
+    def test_shadow_mode_keeps_stock_decisions_and_counts(self, kvrg_env):
+        kvrg_env.setenv(_KVRG_SHADOW_ENV, "1")
+        mgr = _with_page_counts(_refusing_manager({1}), [10, 0])
+        sched = _chunked(mgr)
+        assert sched._kvrg_mode == "shadow" and sched._kvrg_track
+        ctx = make_ctx_request(1, 500)
+        for _ in range(4):
+            sched.schedule_request([ctx], set())
+        assert _resize_attempts(mgr) == [1] * 4
+        assert sched._kvrg_cnt["shadow_gated"] + sched._kvrg_tot["shadow_gated"] == 3
+
+    def test_disables_itself_without_page_counts(self, kvrg_env):
+        kvrg_env.setenv(_KVRG_ENV, "1")
+        mgr = _refusing_manager({1})
+        mgr.impl = Mock()
+        mgr.impl.cache_tier_list = []
+        sched = _chunked(mgr)
+        assert not sched._kvrg_track
+        ctx = make_ctx_request(1, 500)
+        for _ in range(3):
+            sched.schedule_request([ctx], set())
+        assert _resize_attempts(mgr) == [1] * 3
+
+    def test_stall_bypass_attempts_every_pass(self, kvrg_env):
+        kvrg_env.setenv(_KVRG_ENV, "1")
+        mgr = _with_page_counts(_refusing_manager({1}), [10, 0])
+        sched = _chunked(mgr)
+        ctx = make_ctx_request(1, 500)
+        sched.schedule_request([ctx], set())
+        sched._stalled_schedules = sched._DEADLOCK_STALL_ITERS // 2
+        sched.schedule_request([ctx], set())
+        assert _resize_attempts(mgr) == [1, 1]

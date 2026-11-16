@@ -223,6 +223,13 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
             raise NoTarget(
                 f"no routing module for this architecture; routed architectures: {known}"
             )
+        # A routing module may set the environment switches its targets read by default for
+        # this deployment (read at their import, inside ``route``); the environment wins.
+        apply_defaults = getattr(routing, "apply_deployment_defaults", None)
+        if apply_defaults is not None:
+            apply_defaults(
+                pretrained_config, config.mapping, _device_compute_capability(), _facts_of(llm_args)
+            )
         target = routing.route(
             pretrained_config, config.mapping, _device_compute_capability(), config.spec_config
         )

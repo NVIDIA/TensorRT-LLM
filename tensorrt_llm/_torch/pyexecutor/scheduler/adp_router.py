@@ -42,6 +42,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
 from tensorrt_llm.logger import logger
 
+from ... import adp_groups
 from ..llm_request import LlmRequestState
 
 if TYPE_CHECKING:
@@ -133,6 +134,10 @@ class RankState:
     num_active_tokens: int = 0
     num_retiring_requests: int = 0
     iter_stats: RankIterStatsPayload = field(default_factory=RankIterStatsPayload)
+    # KV connector under attention DP (port of #19369): owner-local transfers
+    # awaiting response delivery, and whether the local completion poll failed.
+    num_connector_transfers: int = 0
+    connector_poll_failed: bool = False
 
     def copy_iter_stats_from(self, iter_stats_payload: RankIterStatsPayload | None) -> None:
         if iter_stats_payload is None:
@@ -147,6 +152,8 @@ class RankState:
             self.num_active_tokens,
             self.num_retiring_requests,
             *self.iter_stats.serialize(),
+            self.num_connector_transfers,
+            int(self.connector_poll_failed),
         ]
 
     @classmethod
@@ -155,7 +162,8 @@ class RankState:
         values = list(data)
         rank_state_prefix_field_count = 4
         rank_state_fields = fields(cls)[:rank_state_prefix_field_count]
-        max_field_count = rank_state_prefix_field_count + len(fields(RankIterStatsPayload))
+        stats_field_count = len(fields(RankIterStatsPayload))
+        max_field_count = rank_state_prefix_field_count + stats_field_count + 2
         if len(values) < 1:
             raise ValueError("RankState payload is missing required field rank")
         if len(values) > max_field_count:
@@ -170,12 +178,15 @@ class RankState:
                 rank_values.append(field_info.default_factory())
             else:
                 raise ValueError(f"RankState payload is missing required field {field_info.name}")
+        stats_end = rank_state_prefix_field_count + stats_field_count
         return cls(
             rank=rank_values[0],
             num_active_requests=rank_values[1],
             num_active_tokens=rank_values[2],
             num_retiring_requests=rank_values[3],
-            iter_stats=RankIterStatsPayload.deserialize(values[rank_state_prefix_field_count:]),
+            iter_stats=RankIterStatsPayload.deserialize(values[rank_state_prefix_field_count:stats_end]),
+            num_connector_transfers=values[stats_end] if len(values) > stats_end else 0,
+            connector_poll_failed=bool(values[stats_end + 1]) if len(values) > stats_end + 1 else False,
         )
 
 
@@ -286,6 +297,8 @@ class ADPRouter(ABC):
         active_requests: list[LlmRequest],
         new_requests: list[RequestQueueItem] | None = None,
         iter_stats_payload: RankIterStatsPayload | None = None,
+        num_connector_transfers: int = 0,
+        connector_poll_failed: bool = False,
     ) -> list[RankState]:
         """Build local RankState, allgather across DP ranks, return all states.
 
@@ -296,6 +309,10 @@ class ADPRouter(ABC):
                 new-request info (e.g. KV-cache-aware routing).
             iter_stats_payload: Completed previous-iteration stats payload to
                 piggyback on this allgather, if one is pending.
+            num_connector_transfers: Owner-local transfers or completed loads
+                awaiting response delivery before their slots can be freed.
+            connector_poll_failed: Whether the local completion poll failed;
+                all owners must then enter the executor's error vote.
         """
         if self.exclude_retiring_requests:
             active_requests_for_overlap = build_active_requests_for_overlap(active_requests)
@@ -306,6 +323,8 @@ class ADPRouter(ABC):
         local_state = self.create_rank_state(active_requests_for_overlap, new_requests or [])
         local_state.num_retiring_requests = num_retiring_requests
         local_state.copy_iter_stats_from(iter_stats_payload)
+        local_state.num_connector_transfers = num_connector_transfers
+        local_state.connector_poll_failed = connector_poll_failed
         responses = self.dist.tp_allgather(local_state.serialize())
         return [RankState.deserialize(data=resp) for resp in responses]
 
@@ -569,11 +588,16 @@ class KVCacheAwareADPRouter(ADPRouter):
         self.match_rate_threshold = match_rate_threshold
         self.fair_share_multiplier = fair_share_multiplier
         self._all_ranks_prefix_matches: List[Dict[int, int]] = []
-        # Cold-start warmup: ranks not yet targeted through this router.
+        # Attention-DP groups (adp_groups): route over groups; 1 = stock.
+        self._group_tp = adp_groups.group_attn_tp(getattr(self.dist, "mapping", None))
+        # Cold-start warmup: ranks (groups) not yet targeted through this router.
         # Empty set disables warmup; see ``route_requests``.
-        self._pending_warmup_ranks: Set[int] = (
-            set(range(self.dist.mapping.dp_size)) if cold_start_warmup else set()
+        n_units = (
+            adp_groups.dp_size(self.dist.mapping)
+            if self._group_tp > 1
+            else self.dist.mapping.dp_size
         )
+        self._pending_warmup_ranks: Set[int] = set(range(n_units)) if cold_start_warmup else set()
         # Requests still sending KV to GEN are invisible in active_requests;
         # when ``account_for_in_transfer`` is True, fold them back in via the
         # transfer manager (see create_rank_state). Disabled by default
@@ -646,6 +670,9 @@ class KVCacheAwareADPRouter(ADPRouter):
 
         all_data = self.dist.tp_allgather(local_matches)
 
+        if self._group_tp > 1:
+            # One table per group (its first rank's), indexed like the group route states.
+            all_data = adp_groups.collapse(list(all_data), self._group_tp)
         self._all_ranks_prefix_matches = []
         for rank_data in all_data:
             matches: Dict[int, int] = {}

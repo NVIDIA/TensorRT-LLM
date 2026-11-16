@@ -399,6 +399,71 @@ def _is_shape_decline(reason: str) -> bool:
     return re.fullmatch(r"(\d+ rows .*|.* sequences)", reason) is not None
 
 
+#: The lever knob of the prep fold (``tep8_wide64_splitk``'s PREP_FOLD), for messages.
+PREP_FOLD_KNOB = "MUSESPARK_OPEN_LEVER_TEP8_WIDE64_SPLITK__PREP_FOLD"
+
+
+def _dense_gemms():
+    """``kernels/dense_gemms/dispatcher``, whose 2-CTA QKV launch takes the prep fold."""
+    from ..dense_gemms import dispatcher
+
+    return dispatcher
+
+
+class _PrepFoldRequest:
+    """One layer's prep fold, armed for one decode forward (``tep8_wide64_splitk``'s PREP_FOLD).
+
+    The layer's QKV call (``dense_gemms`` ``_wide_2cta``) takes it: ``operands`` gives the
+    prep-fold kernel the packed prep's operands for the projection it writes (``None`` when the
+    call declines the fold: the unfused path then runs and declines it the same way), ``finish``
+    records the outputs; ``preprocess_qkv`` returns them instead of launching the prep.
+    """
+
+    def __init__(self, attention, position_ids: Optional[torch.Tensor], metadata) -> None:
+        self.attention = attention
+        self.position_ids = position_ids
+        self.metadata = metadata
+        #: The QKV call took the request.
+        self.reached = False
+        #: Why the call declined the fold, or None.
+        self.declined: Optional[str] = None
+        #: ``(projection pointer, shape, qkv_out, gate, folded preprocess)`` once the kernel ran.
+        self.result: Optional[tuple] = None
+        self._pending: Optional[tuple] = None
+
+    def operands(self, qkv: torch.Tensor) -> Optional[dict]:
+        self.reached = True
+        attention = self.attention
+        if not attention._fits_preattn_prep(qkv, self.position_ids):
+            self.declined = "the projection does not fit preattn_prep"
+            return None
+        decline = attention._mr_append_decline(qkv, self.metadata)
+        if decline is not None:
+            self.declined = decline
+            return None
+        operands, prefetch, folded = attention._mr_append_operands(
+            qkv, self.position_ids, self.metadata
+        )
+        if prefetch is not None:
+            raise RuntimeError(
+                f"[musespark_open] {PREP_FOLD_KNOB}: a {qkv.shape[0]}-row step asks the prep for "
+                "an L2 prefetch, which the folded prep does not issue"
+            )
+        rows = qkv.shape[0]
+        qkv_out = torch.empty(
+            (rows, (attention.num_heads + 2 * attention.num_key_value_heads) * 64),
+            dtype=qkv.dtype,
+            device=qkv.device,
+        )
+        gate = torch.empty((rows, attention.num_heads * 64), dtype=qkv.dtype, device=qkv.device)
+        self._pending = (qkv_out, gate, folded)
+        return dict(qkv_out=qkv_out, gate_out=gate, **operands)
+
+    def finish(self, qkv: torch.Tensor) -> None:
+        qkv_out, gate, folded = self._pending
+        self.result = (qkv.data_ptr(), tuple(qkv.shape), qkv_out, gate, folded(qkv_out))
+
+
 class MultiRequestPrepAppendAttention:
     """Mixin re-classed in front of every layer's attention class.
 
@@ -417,6 +482,9 @@ class MultiRequestPrepAppendAttention:
     _mr_append_census: Optional[MultiRequestCensus] = None
     _mr_append_min_seqs: int = MIN_SEQS
     _mr_append_packed_min_rows: Optional[int] = None
+    #: ``tep8_wide64_splitk``'s PREP_FOLD: arm the layer's 2-CTA QKV call with the prep (``install``).
+    _mr_append_prep_fold: bool = False
+    _mr_append_fold_request: Optional[_PrepFoldRequest] = None
 
     def forward(self, position_ids, hidden_states, attn_metadata, *args, **kwargs):
         census = self._mr_append_census
@@ -431,20 +499,77 @@ class MultiRequestPrepAppendAttention:
             census.record(self.layer_idx, NOT_TAKEN)
         self._mr_append_metadata = attn_metadata if takes else None
         self._mr_append_folded = None
+        dispatcher = None
+        if takes and self._mr_append_prep_fold:
+            dispatcher = self._mr_append_arm_fold(position_ids, hidden_states, attn_metadata)
         try:
             result = super().forward(position_ids, hidden_states, attn_metadata, *args, **kwargs)
         finally:
             self._mr_append_metadata = None
             self._mr_append_folded = None
+            if dispatcher is not None:
+                if dispatcher.prep_fold is self._mr_append_fold_request:
+                    dispatcher.prep_fold = None
+                self._mr_append_fold_request = None
         if counted and self.layer_idx == census.layers[-1]:
             census.end()
         return result
+
+    def _mr_append_arm_fold(self, position_ids, hidden_states, attn_metadata):
+        """Hand this forward's QKV call the prep (PREP_FOLD) when it runs on the 2-CTA kernel;
+        returns the armed dispatcher, or None."""
+        _dense = _dense_gemms()
+        rows = hidden_states.numel() // max(int(hidden_states.shape[-1]), 1)
+        if not (
+            _dense.TEP8_WIDE64_PREP_FOLD
+            and _dense.TEP8_WIDE64_WIDE_2CTA
+            and _dense.TEP8_WIDE64_MAX_ROWS < rows <= _dense.TEP8_WIDE64_WIDE_MAX_ROWS
+        ):
+            return None
+        dispatcher = self.qkv_proj.__dict__.get("_low_m_dispatcher")
+        if dispatcher is None:
+            raise RuntimeError(
+                f"[musespark_open] {PREP_FOLD_KNOB}: layer {self.layer_idx}'s QKV projection has no "
+                "dense_gemms dispatcher to fold the prep into"
+            )
+        request = _PrepFoldRequest(self, position_ids, attn_metadata)
+        dispatcher.prep_fold = request
+        self._mr_append_fold_request = request
+        return dispatcher
+
+    def _mr_append_take_fold(self, request: _PrepFoldRequest, qkv: torch.Tensor, position_ids):
+        """The outputs the QKV launch's folded prep wrote, as ``preprocess_qkv`` returns them."""
+        pointer, shape, qkv_out, gate, folded = request.result
+        if (
+            self._mr_append_metadata is None
+            or getattr(self, "_preattn_prep", None) is None
+            or qkv.data_ptr() != pointer
+            or tuple(qkv.shape) != shape
+            or position_ids is not request.position_ids
+        ):
+            raise RuntimeError(
+                f"[musespark_open] {PREP_FOLD_KNOB}: layer {self.layer_idx}'s preprocess got a "
+                "projection, positions or step other than the ones its QKV launch folded the prep of"
+            )
+        self._mr_append_folded = folded
+        self._mr_append_record(NOT_REACHED)
+        return qkv_out, None, None, gate
 
     def _mr_append_record(self, kind: str, detail: str = "") -> None:
         if self._mr_append_census is not None:
             self._mr_append_census.record(self.layer_idx, kind, detail)
 
     def preprocess_qkv(self, qkv: torch.Tensor, position_ids: Optional[torch.Tensor]):
+        request = self._mr_append_fold_request
+        if request is not None:
+            if request.result is not None:
+                return self._mr_append_take_fold(request, qkv, position_ids)
+            if not request.reached:
+                logger.error(
+                    f"[musespark_open] {PREP_FOLD_KNOB}: layer {self.layer_idx}'s "
+                    f"{qkv.shape[0]}-row QKV call did not run the 2-CTA prep-fold launch; the "
+                    "prep runs unfused"
+                )
         md = self._mr_append_metadata
         if md is None or getattr(self, "_preattn_prep", None) is None:
             return super().preprocess_qkv(qkv, position_ids)
@@ -542,6 +667,19 @@ class MultiRequestPrepAppendAttention:
     def _mr_append_prep(
         self, qkv: torch.Tensor, position_ids: Optional[torch.Tensor], md
     ) -> Tuple[torch.Tensor, torch.Tensor, MultiRequestFoldedPreprocess]:
+        operands, prefetch, folded = self._mr_append_operands(qkv, position_ids, md)
+        qkv_out, gate = multi_request_prep_append(
+            qkv,
+            **operands,
+            enable_pdl=LAUNCH_PDL,
+            prefetch=prefetch,
+            packed_min_rows=self._mr_append_packed_min_rows,
+        )
+        return qkv_out, gate, folded(qkv_out)
+
+    def _mr_append_operands(self, qkv: torch.Tensor, position_ids: Optional[torch.Tensor], md):
+        """``multi_request_prep_append``'s operands of this call but ``qkv`` and the launch
+        options, its prefetch, and ``folded(qkv_out)``: the folded preprocess of its output."""
         attn = self.attn
         rows = qkv.shape[0]
         seqs = int(md.num_seqs)
@@ -581,32 +719,28 @@ class MultiRequestPrepAppendAttention:
         rope = not self.skip_rope
         batch = getattr(self, "_batch_dense_gemms", None)
         prefetch = batch.prep_prefetch(self, rows) if batch is not None else None
-        qkv_out, gate = multi_request_prep_append(
-            qkv,
-            self.rotary_emb.rotary_cos_sin if rope else None,
-            position_ids if rope else None,
-            self.num_heads,
-            self.num_key_value_heads,
-            self.q_norm.variance_epsilon,
-            self.scale_query_by,
-            self._qkv_layout_inverse is not None,
-            seqs,
-            kv_pool,
-            block_tables,
-            seq_lens,
-            attn.kv_scale_orig_quant,
-            attn.kv_scale_quant_orig,
-            q_buf,
-            bmm1,
-            bmm2,
-            cu_seqlens,
-            bmm1_host,
-            1.0,
-            LAUNCH_PDL,
-            prefetch=prefetch,
-            packed_min_rows=self._mr_append_packed_min_rows,
+        operands = dict(
+            cos_sin=self.rotary_emb.rotary_cos_sin if rope else None,
+            position_ids=position_ids if rope else None,
+            num_q_heads=self.num_heads,
+            num_kv_heads=self.num_key_value_heads,
+            eps=self.q_norm.variance_epsilon,
+            q_scale=self.scale_query_by,
+            qkv_permuted=self._qkv_layout_inverse is not None,
+            num_seqs=seqs,
+            kv_pool=kv_pool,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            kv_scale_orig_quant=attn.kv_scale_orig_quant,
+            kv_scale_quant_orig=attn.kv_scale_quant_orig,
+            q_fp8=q_buf,
+            bmm1_scale=bmm1,
+            bmm2_scale=bmm2,
+            cu_seqlens=cu_seqlens,
+            bmm1_host_scale=bmm1_host,
+            o_scale=1.0,
         )
-        folded = MultiRequestFoldedPreprocess(
+        folded = lambda qkv_out: MultiRequestFoldedPreprocess(  # noqa: E731
             qkv_out=qkv_out,
             rows=rows,
             num_seqs=seqs,
@@ -627,7 +761,7 @@ class MultiRequestPrepAppendAttention:
             quant_mode=int(attn.quant_mode),
             bmm1_host=bmm1_host,
         )
-        return qkv_out, gate, folded
+        return operands, prefetch, folded
 
 
 @functools.lru_cache(maxsize=None)
@@ -637,7 +771,10 @@ def _folded_class(base: type) -> type:
 
 
 def install(
-    model: torch.nn.Module, min_seqs: int = MIN_SEQS, packed_min_rows: Optional[int] = None
+    model: torch.nn.Module,
+    min_seqs: int = MIN_SEQS,
+    packed_min_rows: Optional[int] = None,
+    prep_fold: bool = False,
 ) -> int:
     """Re-class every layer's attention with ``MultiRequestPrepAppendAttention`` in front.
 
@@ -645,7 +782,9 @@ def install(
     class each layer carries by then, and acts only on decode steps of ``min_seqs``
     or more sequences (a composition whose own paths fold the append of smaller
     multi-request steps passes the first count they leave to this one). Calls of
-    ``packed_min_rows`` rows or more (``packed_prep_append``) take the packed kernel.
+    ``packed_min_rows`` rows or more (``packed_prep_append``) take the packed kernel. With
+    ``prep_fold`` (``tep8_wide64_splitk``'s PREP_FOLD) a step whose QKV call runs the 2-CTA
+    kernel gets the prep in that launch (``_PrepFoldRequest``).
     Every layer is checked before any is re-classed. Idempotent: a model whose
     layers all carry the mixin is left alone. Returns the number of layers
     re-classed.
@@ -654,7 +793,8 @@ def install(
         ValueError: if ``eliding`` would not reach the built-in preprocess
             (``preprocess_reachable``), or a layer's attention is not a
             ``preattn_prep`` class or is not on the TRTLLM backend over fused QKV
-            with 64-wide heads.
+            with 64-wide heads; with ``prep_fold``, if a layer's QKV projection has no
+            ``dense_gemms`` dispatcher.
     """
     reason = preprocess_reachable()
     if reason is not None:
@@ -663,9 +803,21 @@ def install(
             f"{reason}"
         )
     attentions = [layer.self_attn for layer in model.layers]
+    if prep_fold:
+        bare = [
+            attention.layer_idx
+            for attention in attentions
+            if "_low_m_dispatcher" not in getattr(attention.qkv_proj, "__dict__", {})
+        ]
+        if bare:
+            raise ValueError(
+                f"[musespark_open] {PREP_FOLD_KNOB} folds the prep into the 2-CTA QKV launch of "
+                f"dense_gemms; the QKV projections of layers {bare} have no dense_gemms dispatcher"
+            )
     if all(isinstance(attention, MultiRequestPrepAppendAttention) for attention in attentions):
         for attention in attentions:
             attention._mr_append_packed_min_rows = packed_min_rows
+            attention._mr_append_prep_fold = bool(prep_fold)
         return 0
     refused = []
     for attention in attentions:
@@ -702,6 +854,8 @@ def install(
         attention._mr_append_census = census
         attention._mr_append_min_seqs = min_seqs
         attention._mr_append_packed_min_rows = packed_min_rows
+        attention._mr_append_prep_fold = bool(prep_fold)
+        attention._mr_append_fold_request = None
     packed = (
         "packed grid (last rows, items per program): "
         f"{[(last, items) for last, items, _, _ in PACKED_GEOMETRY]}, one item per program on "
@@ -722,4 +876,10 @@ def install(
         f"of up to {MAX_ROWS_PER_SEQ} rows each; their trtllm-gen generation preprocess launch "
         f"(decoder-info + append) is skipped; {grid}"
     )
+    if prep_fold:
+        logger.info(
+            f"[musespark_open] {PREP_FOLD_KNOB}: on steps whose QKV call runs the 2-CTA split-K "
+            "kernel (tep8_wide64_splitk WIDE_TILE 2cta, 65..MAX_ROWS rows) the prep runs in that "
+            "launch's epilogue (ops/gemm/splitk_gemm_2cta_prep); no prep launch"
+        )
     return len(attentions)

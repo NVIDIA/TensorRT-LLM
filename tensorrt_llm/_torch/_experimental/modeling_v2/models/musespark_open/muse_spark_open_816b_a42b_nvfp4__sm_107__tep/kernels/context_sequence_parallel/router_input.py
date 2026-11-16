@@ -20,6 +20,12 @@ called with that very norm output. Every other call is the built-in join.
 Numerics: bitwise. The kernel body is the built-in one (same block, warps, loads,
 roundings and reduction), and the extra output is an exact widening of the BF16 value
 the built-in stores.
+
+``tail_pipeline`` (the ``context_sp_tail_pipeline`` lever, behind the overlapped output
+projection of ``context_sp_oproj_overlap``) runs this join and the MoE input preparation
+chunk by chunk behind the projection's chunked reduce-scatters; a port of the sm103
+target's ``MUSESPARK_OPEN_SP_TAIL_PIPELINE`` (with the router GEMM on the whole shard and
+the BF16 expert layers' norm output kept as it is).
 """
 
 from __future__ import annotations
@@ -32,6 +38,7 @@ import triton.language as tl
 
 from tensorrt_llm._torch.models import modeling_musespark_open as _builtin
 from tensorrt_llm._torch.models.modeling_musespark_open import MuseSparkOpenGatedResidual
+from tensorrt_llm.logger import logger
 
 #: Rows at or below which the built-in join may take its cluster boundary kernel instead
 #: of the Triton one; a sequence-parallel shard always has more.
@@ -100,12 +107,17 @@ def join_with_router_input(
     eps: float,
     next_norm,
     gain: Optional[torch.Tensor] = None,
+    out: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     """``(updated, next_input, next_input.float())`` from one launch, or None.
 
+    ``out``: contiguous ``(updated, next_input, router_input)`` buffers of the call's
+    shape to write instead of fresh ones (row slices of whole-shard buffers; the kernel
+    is one program per row, so a slice's rows are the whole-shard call's bit for bit).
+
     None wherever the built-in ``_add_after_rmsnorm_and_norm`` would not launch its
-    Triton kernel with this call's operands (its unfused or cluster-boundary arms); the
-    caller then runs the built-in join.
+    Triton kernel with this call's operands (its unfused or cluster-boundary arms), or
+    ``out`` does not fit; the caller then runs the built-in join.
     """
     if not (
         join._fused_enabled
@@ -125,9 +137,24 @@ def join_with_router_input(
     ):
         return None
     alpha, beta = join.coefficients()
-    updated = torch.empty_like(residual)
-    next_input = torch.empty_like(branch)
-    router_input = torch.empty_like(residual)
+    if out is None:
+        updated = torch.empty_like(residual)
+        next_input = torch.empty_like(branch)
+        router_input = torch.empty_like(residual)
+    else:
+        updated, next_input, router_input = out
+        if not (
+            updated.shape == residual.shape
+            and router_input.shape == residual.shape
+            and next_input.shape == branch.shape
+            and updated.dtype == residual.dtype
+            and router_input.dtype == torch.float32
+            and next_input.dtype == branch.dtype
+            and updated.is_contiguous()
+            and next_input.is_contiguous()
+            and router_input.is_contiguous()
+        ):
+            return None
     hidden_size = residual.shape[-1]
     _join_with_router_input_kernel[(residual.shape[0],)](
         updated,
@@ -148,6 +175,100 @@ def join_with_router_input(
         num_warps=_builtin._RESIDUAL_NUM_WARPS,
     )
     return updated, next_input, router_input
+
+
+def tail_pipeline(layer, residual: torch.Tensor, split) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The attention-side join and the MoE input preparation, chunk by chunk (``context_sp_tail_pipeline``).
+
+    The built-in decoder layer's ``_sp_tail_pipeline`` hook. ``split`` is the overlapped
+    output projection's ``SplitProjection``: chunk ``c`` holds rows ``[lo, hi)`` of this
+    rank's shard, reduced on the projection stream. For each chunk in turn, after its
+    reduce-scatter's event, the main stream runs the join (``join_with_router_input`` into
+    row slices of whole-shard buffers) and the pooler GEMM + pre-expert NVFP4 quantization
+    on its BF16 rows, while the later chunks are still being reduced. The payload and scales
+    are concatenated and handed to the layer's MoE (``moe.sp_pre``) with the join's FP32 rows
+    (``moe.sp_router_input``); its sequence-parallel arm runs the router GEMM on the whole
+    shard, routes and gathers as before. A BF16 expert layer (layers 0 and 61) keeps the
+    pre-expert norm output, concatenated as it is (the MoE gathers it in BF16 as before).
+
+    Numerics: the join and the quantization are per row (bitwise); the pooler GEMM runs on
+    row chunks, bitwise where the BF16 GEMM is row-split invariant at ``[chunk, 8192] x
+    [8192, 4096]`` (it is on sm103; the sm107 GPU test checks it). The router GEMM (FP32) is
+    not split.
+
+    Raises:
+        RuntimeError: when a chunk's join would not run its fused kernel, or the chunks'
+            expert inputs come back in different formats or with swizzled scales.
+    """
+    from tensorrt_llm._torch.utils import Fp4QuantizedTensor
+
+    moe = layer.feed_forward
+    join = layer.add_attn
+    eps = layer.post_attn_norm.variance_epsilon
+    next_norm = layer.pre_ffn_norm
+    main = torch.cuda.current_stream()
+    hidden = residual.shape[1]
+    updated = torch.empty_like(residual)
+    next_input = torch.empty(
+        (residual.shape[0], hidden), dtype=split.results[0].dtype, device=residual.device
+    )
+    router_input = torch.empty_like(residual)
+    payload, scales = [], []
+    for (lo, hi), reduced, event in split.chunks():
+        main.wait_event(event)
+        rows = slice(lo, hi)
+        joined = join_with_router_input(
+            join,
+            residual[rows],
+            reduced,
+            eps,
+            next_norm,
+            None,
+            out=(updated[rows], next_input[rows], router_input[rows]),
+        )
+        if joined is None:
+            raise RuntimeError(
+                "[musespark_open] context_sp_tail_pipeline: the attention-side join of a "
+                f"{hi - lo}-row chunk would not run its fused kernel"
+            )
+        prepared = moe.prepare_expert_input(moe.pooler(next_input[rows]))
+        if isinstance(prepared, Fp4QuantizedTensor):
+            if prepared.is_sf_swizzled:
+                raise RuntimeError(
+                    "[musespark_open] context_sp_tail_pipeline: the pre-expert quantization of a "
+                    "chunk returned swizzled scales"
+                )
+            payload.append(prepared.fp4_tensor)
+            scales.append(prepared.scaling_factor)
+        else:
+            # BF16 expert layers (and any layer the fused quantization declines): the
+            # pre-expert norm output, per row, gathered in BF16 by the MoE as before.
+            payload.append(prepared)
+            scales.append(None)
+    if any(sc is None for sc in scales) and not all(sc is None for sc in scales):
+        raise RuntimeError(
+            "[musespark_open] context_sp_tail_pipeline: the chunks of one shard were prepared "
+            "in different formats"
+        )
+    split.release(main)
+    # The router GEMM (FP32) is not split: it runs once on the whole shard, in the MoE as
+    # before, from the join's FP32 rows.
+    moe.sp_router_input = (next_input, router_input)
+
+    def cat(parts):
+        return torch.cat(parts, 0) if len(parts) > 1 else parts[0]
+
+    if scales[0] is None:
+        prepared = cat(payload)
+    else:
+        prepared = Fp4QuantizedTensor(cat(payload), cat(scales), is_sf_swizzled=False)
+    moe.sp_pre = (next_input, None, prepared)
+    logger.info_once(
+        "[musespark_open] context_sp_tail_pipeline: attention-side join and expert input "
+        f"prepared in {len(payload)} chunks behind the output projection's reduce-scatters",
+        key="musespark_open.sm107.sp_tail_pipeline",
+    )
+    return updated, next_input
 
 
 class SequenceParallelStep:
@@ -195,8 +316,12 @@ def _with_mixin(base: type) -> type:
     return _CLASSES[base]
 
 
-def install(model, step: SequenceParallelStep) -> int:
+def install(model, step: SequenceParallelStep, tail: bool = False) -> int:
     """Re-class every layer's ``add_attn`` and point it at ``step`` and the layer's MoE; returns how many.
+
+    With ``tail`` (``context_sp_tail_pipeline``) every layer's ``_sp_tail_pipeline`` hook is
+    ``tail_pipeline``; the built-in layer calls it only on a step whose output projection
+    runs overlapped.
 
     Raises:
         ValueError: if a layer's ``add_attn`` is not a built-in ``MuseSparkOpenGatedResidual``.
@@ -223,4 +348,6 @@ def install(model, step: SequenceParallelStep) -> int:
         # ``_sp_moe = None`` first, and the module tree would hold the MoE twice.
         object.__setattr__(join, "_sp_step", step)
         object.__setattr__(join, "_sp_moe", layer.feed_forward)
+        if tail:
+            layer._sp_tail_pipeline = tail_pipeline
     return changed

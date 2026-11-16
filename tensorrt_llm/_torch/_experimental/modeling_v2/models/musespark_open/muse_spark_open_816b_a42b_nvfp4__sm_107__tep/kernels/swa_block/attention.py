@@ -394,12 +394,21 @@ class _SwaBlock:
         rows = md.num_tokens
         seq_lens = getattr(md, "seq_lens", None)
         # swa_block's ``one2`` (swa_eight_requests), read per call: TEP8 layers (2 KV heads) take
-        # up to 8 sequences.
+        # up to 8 sequences; with the TEP8 CL8 build's cl8_tep8_max_requests above 8 (under one2
+        # only: ``cl8_tep8_requests``), up to that many, the steps above 8 only while CL8
+        # launches them (``cl8_tep8_ready``). Steps of 2..MULTI_MAX_REQUESTS always come here
+        # (multi_request_prep_append folds none of them under wide_swa_block): the op picks CL8
+        # for them at TEP8 when cl8_tep8_min_requests allows (``cl8_tep8_takes``), else the
+        # split kernels.
         cap = (
             _ONE2_MAX_REQUESTS
             if _swa_ops._SWA_ONE2 and self.num_key_value_heads == 2
             else MULTI_MAX_REQUESTS
         )
+        if self.num_key_value_heads == 2 and n > cap:
+            wide = _swa_ops.cl8_tep8_requests()
+            if n <= wide and _swa_ops.cl8_tep8_ready(torch.cuda.current_device()):
+                cap = wide
         if (
             not 2 <= n <= cap
             or md.num_generations != n
@@ -578,11 +587,12 @@ def install_multi(model, blocks_per_program: Union[int, str] = 1) -> int:
             and attention.num_key_value_heads == 2
             and hasattr(attention, "_mr_append_min_seqs")
         ):
-            # swa_block's ``one2``: the one-launch block of 5..8 sequences does its own prep and K/V
-            # append on these layers, so multi_request_prep_append (installed before this) folds
-            # only larger steps here.
+            # swa_block's ``one2``: the one-launch block of 5..8 sequences (and CL8's TEP8 build up
+            # to its cl8_tep8_max_requests) does its own prep and K/V append on these layers, so
+            # multi_request_prep_append (installed before this) folds only larger steps here.
             attention._mr_append_min_seqs = max(
-                attention._mr_append_min_seqs, _ONE2_MAX_REQUESTS + 1
+                attention._mr_append_min_seqs,
+                max(_ONE2_MAX_REQUESTS, _swa_ops.cl8_tep8_requests()) + 1,
             )
             one2 += 1
         count += 1

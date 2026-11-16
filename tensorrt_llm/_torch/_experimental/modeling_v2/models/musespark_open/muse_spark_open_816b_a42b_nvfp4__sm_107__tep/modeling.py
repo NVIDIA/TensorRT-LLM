@@ -432,6 +432,7 @@ from tensorrt_llm.logger import logger
 from . import dispatch as _dispatch
 from . import layers as _layers
 from . import lever_settings as _lever_settings
+from . import role_env as _role_env
 from . import weights as _weights
 from .attention import DecodeAttentionPlan
 from .layers import _NO_ALLREDUCE, PostAttnHopCall
@@ -753,7 +754,9 @@ def _early_fc_index(fork, spec_metadata, num_layers: int) -> int:
     the fork carries ``drafter_fc_early_fork`` (``ContextKvFork.early_fc_on``) and that index
     is a decoder layer (all capture rows are final when it starts).
     """
-    if fork is None or not fork.early_fc_on or spec_metadata is None:
+    if fork is None or spec_metadata is None:
+        return -1
+    if not (fork.early_fc_on or getattr(fork, "paged_early_on", False)):
         return -1
     capture = getattr(spec_metadata, "layers_to_capture", None)
     if not capture or min(capture) < 0:
@@ -1034,9 +1037,17 @@ class DecodeTarget:
         # ---- end megakernel ----
         direct = self.unpool_direct
         rows = hidden_states.shape[0]
-        direct_armed = megakernel is None and direct is not None and direct.takes(rows)
+        published = self.published_projections
+        published_armed = published is not None and published.takes(rows)
+        # A step the publication takes (below 33 rows only under tep8_publish_splitk's MIN_ROWS)
+        # never also arms the 8-row / 16..32-row direct transports of the same projections.
+        direct_armed = (
+            megakernel is None and direct is not None and not published_armed and direct.takes(rows)
+        )
         pool = self.pool_direct
-        pool_armed = megakernel is None and pool is not None and pool.takes(rows)
+        pool_armed = (
+            megakernel is None and pool is not None and not published_armed and pool.takes(rows)
+        )
         # Under the megakernel, the direct pool sites of the layers outside it (the BF16-expert
         # layers 0 and 61, sites with the edge_bf16_moe_front lever) are armed alone.
         pool_skip = None
@@ -1051,8 +1062,6 @@ class DecodeTarget:
         router_armed = router is not None and router.takes(rows)
         wide_ar = self.wide_moe_allreduce
         wide_ar_armed = wide_ar is not None and wide_ar.takes(rows)
-        published = self.published_projections
-        published_armed = published is not None and published.takes(rows)
         two_shot = self.finalize_two_shot
         two_shot_armed = two_shot is not None and two_shot.takes(rows)
         # Installed at weight load, after this target was built.
@@ -1390,14 +1399,16 @@ _SM107_LEVERS = frozenset(
     }
 )
 #: The levers sm107 TEP8 adds: the drafter's fused context-K/V side chain, its early fc fork and
-#: the drafter preamble written by the folded commit (a dense arena or pages), and the 8-row head
-#: logits gathered over MULTIMEM.
+#: the drafter preamble written by the folded commit (a dense arena or pages), the 8-row head
+#: logits gathered over MULTIMEM, and the multi-request prep append's packed kernel (on only
+#: by its knob at TP8, ``levers._packed_prep_append``).
 _SM107_TEP8_LEVERS = frozenset(
     {
         "drafter_kv_side_chain",
         "drafter_fc_early_fork",
         "drafter_preamble_from_commit",
         "head_multimem_gather",
+        "packed_prep_append",
     }
 )
 #: The levers of the single-request decode schedule sm107 TEP8 also serves
@@ -1420,7 +1431,10 @@ _SM107_TEP8_SINGLE_REQUEST_LEVERS = _dispatch.SM107_TEP8_ONLY
 #: the router GEMM's staged epilogue, the lossy MXFP8 QKV of published decode steps, the
 #: E4M3-query split-KV decode's 20-page ring, context steps' prep on the vectorized rows
 #: kernel and their token embedding from the replicated table, and the sequence-parallel
-#: residual join's router FP32 input; and on the 2..4-request decode steps: the
+#: residual join's router FP32 input; the sequence-parallel steps' reduce-scatter overlaps
+#: (the output projection's chunks, the attention-side tail behind them and the experts'
+#: chunked reduce-scatter beside the unpool; on only by their knobs); and on the 2..4-request
+#: decode steps: the
 #: sliding-window split programs over several key blocks, the next QKV weight's prefetch
 #: forked after the experts and the DFlash capture written by the wide direct boundary (the
 #: full-attention prep fold of those steps is ``full_attention_fold_multi``).
@@ -1445,6 +1459,9 @@ _SM107_TEP4_LEVERS = frozenset(
         "context_prep_rows_vec",
         "context_embedding_replicated",
         "context_sp_router_input",
+        "context_sp_oproj_overlap",
+        "context_sp_tail_pipeline",
+        "context_sp_moe_rs_overlap",
         "swa_blocks_per_program",
         "wide_qkv_prefetch",
         "wide_capture_fold",
@@ -1668,6 +1685,8 @@ class ModelingV2MuseSparkOpen816bA42bNvfp4Sm107Tep(MuseSparkOpenOmniForCondition
         self._mapping = getattr(model_config, "mapping", None)
         # Before any installer: the kernel modules read these settings when they build.
         _lever_settings.apply(plan)
+        # The role's shared-path environment defaults (read when the executor builds, after the model).
+        _role_env.apply(plan)
         if plan and self._runtime_hooks is None:
             # Every composition serves both executor fast paths
             # (dispatch.TargetPaths); NO_PATHS declares no hooks.

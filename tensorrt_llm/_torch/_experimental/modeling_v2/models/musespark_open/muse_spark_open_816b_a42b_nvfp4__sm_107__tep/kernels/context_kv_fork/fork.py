@@ -90,6 +90,7 @@ from tensorrt_llm.logger import logger
 
 from ...ops.spec.context_kv_commit import MAX_REQUESTS, context_kv_commit
 from ...ops.spec.context_kv_commit_paged import (
+    PagedPreamble,
     context_kv_commit_paged,
     context_kv_commit_paged_preamble,
 )
@@ -276,6 +277,33 @@ def _rope_with_positions(drafter, pos_rep, fallback):
     return fused_rope_inplace
 
 
+#: ``paged_side_chain`` (``configure``; ``drafter_kv_fork_before_head__PAGED_CHAIN``, 0..2): over the KV cache manager's
+#: pages the side chain runs ``_fused_paged_side_chain`` (``ops/spec/context_kv_store_paged``: the block-table decode,
+#: extents, columns and positions in one launch, every layer's K / V into the pages in one) instead of the built-in
+#: ``_refresh_ctx_block_tables`` + ``_store_step_context`` (~45 launches). The same GEMMs, norms and RoPE as
+#: ``_fused_side_chain``; integer math and copies elsewhere: bitwise. A step it cannot take logs ERROR with the knob.
+#: 2: also its prep and the sharded ``fc`` GEMM at the early fork (``fire_early``, with ``drafter_fc_early_fork``: right
+#: after the last capture layer), as the dense chain's early part; the gather and the rest at the head fork.
+PAGED_SIDE_CHAIN = 0
+_PAGED_LOGGED: list = []
+
+
+def configure(*, paged_side_chain: int = 0) -> None:
+    """Set ``PAGED_SIDE_CHAIN`` (0..2); ``lever_settings.apply`` sets it before any install.
+
+    Raises:
+        ValueError: outside 0..2 (naming the knob); nothing is set then.
+    """
+    global PAGED_SIDE_CHAIN
+    value = int(paged_side_chain)
+    if not 0 <= value <= 2:
+        raise ValueError(
+            "[musespark_open] context_kv_fork: paged_side_chain must be in 0..2 "
+            f"(drafter_kv_fork_before_head__PAGED_CHAIN), got {value}"
+        )
+    PAGED_SIDE_CHAIN = value
+
+
 #: Where the side chain forks: right after the LM head's GEMM.
 POINT = "head"
 
@@ -421,6 +449,9 @@ class ContextKvFork:
         self.late_join_on = False
         #: ``paged_context_commit``: a paged context's commit runs ``context_kv_commit_paged``.
         self.paged_commit_on = False
+        #: Its launches recorded (eager steps and graph captures), and how many of them also wrote
+        #: the drafter preamble (``commit_paged_preamble``).
+        self.paged_commits = {"launches": 0, "with preamble": 0}
         #: ``paged_ctx_block_tables``: the side chain decodes a paged context's page table with
         #: ``ctx_block_tables_paged``.
         self.paged_tables_on = False
@@ -433,6 +464,11 @@ class ContextKvFork:
     @property
     def launched(self) -> bool:
         return self._launched is not None
+
+    @property
+    def paged_early_on(self) -> bool:
+        """``drafter_kv_fork_before_head__PAGED_CHAIN`` 2 over a paged context: the early fork runs its prep + fc."""
+        return PAGED_SIDE_CHAIN >= 2 and bool(getattr(self.worker, "_ctx_paged", False))
 
     # -- the target side ---------------------------------------------------
     def arm(self, spec_metadata, attn_metadata) -> None:
@@ -457,7 +493,7 @@ class ContextKvFork:
         """
         if self._armed is None or self._launched is not None or self._early is not None:
             return
-        if not (self.early_fc_on and self.side_chain_on):
+        if not ((self.early_fc_on and self.side_chain_on) or self.paged_early_on):
             return
         spec_metadata, attn_metadata = self._armed
         # plan() first: it declines a step whose arena is not built yet (warmup), which the
@@ -465,22 +501,41 @@ class ContextKvFork:
         plan = self.plan(spec_metadata, attn_metadata)
         if plan is None:
             return
-        if _side_chain_refusal(self.worker, self.draft_model) is not None:
-            return
         num_gens, k = plan
+        # drafter_kv_fork_before_head__PAGED_CHAIN 2: the paged chain's early part (its refusal is logged
+        # at the head fork).
+        paged = PAGED_SIDE_CHAIN >= 2 and self.worker._ctx_paged
+        if paged:
+            if (
+                _paged_side_chain_refusal(
+                    self, self.worker, self.draft_model, attn_metadata, num_gens
+                )
+                is not None
+            ):
+                return
+        elif _side_chain_refusal(self.worker, self.draft_model) is not None:
+            return
         main = torch.cuda.current_stream()
         if main == self.stream:
             return
         self.stream.wait_stream(main)
         with torch.cuda.stream(self.stream):
-            early = _side_chain_early(
-                self.worker,
-                self.draft_model,
-                spec_metadata,
-                num_gens,
-                k,
-                lambda: self._refresh_block_tables(attn_metadata, num_gens),
-            )
+            if paged:
+                # drafter_kv_fork_before_head__PAGED_CHAIN 2: the fused paged chain's early part.
+                early = _paged_side_chain_early(
+                    self.worker, self.draft_model, spec_metadata, attn_metadata, num_gens, k
+                )
+            else:
+                # A dense arena, or pages through _side_chain_prologue_paged (the page table
+                # decoded first, by paged_ctx_block_tables when it is on).
+                early = _side_chain_early(
+                    self.worker,
+                    self.draft_model,
+                    spec_metadata,
+                    num_gens,
+                    k,
+                    lambda: self._refresh_block_tables(attn_metadata, num_gens),
+                )
         if early is None:
             self._decline(
                 "drafter_fc_early_fork",
@@ -490,6 +545,12 @@ class ContextKvFork:
             return
         self._early = (early, num_gens, k)
         self.early_launches += 1
+        if paged and "early" not in _PAGED_LOGGED:
+            _PAGED_LOGGED.append("early")
+            logger.info(
+                "[musespark_open] context_kv_fork: the paged side chain's prep + sharded fc at the early fork "
+                "(drafter_kv_fork_before_head__PAGED_CHAIN 2)"
+            )
 
     def fire(self, point: str) -> None:
         """A fork point was reached: launch the armed step's side chain if this is its point."""
@@ -519,6 +580,15 @@ class ContextKvFork:
         self.stream.wait_stream(main)
         with torch.cuda.stream(self.stream):
             gen_hs = self.side_chain(spec_metadata, attn_metadata, num_gens, k)
+            # tep8_drafter_wide_gemms__PREFETCH 4: layer 0's front weights asked of the L2 behind the side
+            # chain (it runs beside the verify sampler; the main stream joins it before the drafter).
+            prefetch = (
+                self.draft_model.__dict__.get("_drafter_l2_prefetch")
+                if self.draft_model is not None
+                else None
+            )
+            if prefetch is not None:
+                prefetch.first(num_gens * (k + 1))
         self._early = None
         self._launched = Launched(main, capture, num_gens, k, point, gen_hs)
         self.launches[point] += 1
@@ -595,6 +665,7 @@ class ContextKvFork:
         self.stream.wait_stream(main)
         with torch.cuda.stream(self.stream):
             if worker._ctx_paged and self._commits_paged(worker, slots, num_accepted):
+                self._count_paged_commit(preamble=False)
                 context_kv_commit_paged(
                     worker._ctx_len,
                     worker._ctx_base,
@@ -767,6 +838,7 @@ class ContextKvFork:
         self.stream.wait_stream(main)
         with torch.cuda.stream(self.stream):
             if paged:
+                self._count_paged_commit(preamble=True)
                 context_kv_commit_paged_preamble(
                     worker._ctx_len,
                     worker._ctx_base,
@@ -805,6 +877,87 @@ class ContextKvFork:
                 worker._dummy_slot,
             )
         return num_ctx, i32s
+
+    def _count_paged_commit(self, preamble: bool) -> None:
+        """Count a ``context_kv_commit_paged`` launch; an INFO line at every power-of-two count."""
+        counts = self.paged_commits
+        counts["launches"] += 1
+        counts["with preamble"] += int(preamble)
+        n = counts["launches"]
+        if n & (n - 1) == 0:
+            logger.info(
+                f"[musespark_open] paged_context_commit: {n} launches recorded (eager steps and "
+                f"graph captures), {counts['with preamble']} also writing the drafter preamble and "
+                "the _seq_lens_cuda fill"
+            )
+
+    def commit_paged_preamble(
+        self,
+        launched: Launched,
+        slots,
+        num_accepted,
+        batch_idx,
+        query_positions,
+        seq_lens_cuda,
+        seq_lens_value: int,
+        draft_block: int,
+    ) -> tuple:
+        """``commit`` of a paged drafter context whose ``context_kv_commit_paged`` launch also writes
+        the drafter preamble and the ``_seq_lens_cuda`` fill (``PagedPreamble``).
+
+        On a forked folded step (``verify_fold``) the commit is followed, before the drafter's
+        first read, by the drafter forward's integer preamble (``windowed_block_decode``: the
+        lengths and ``batch_idx``, its ``ctx_cache_batch_idx``, as int32, the lengths + block,
+        the query positions as int32) and the prepare's ``_seq_lens_cuda[:g] = seq_lens_value``;
+        the one launch writes them from the lengths it computes. On the side stream, as
+        ``commit``; returns ``(num_ctx, i32s)``, allocated on the main stream and valid after the
+        join. The same values as ``commit`` and those statements.
+        """
+        worker = self.worker
+        if not (worker._ctx_paged and self._commits_paged(worker, slots, num_accepted)):
+            raise RuntimeError(
+                "[musespark_open] context_kv_fork: the commit with the drafter preamble needs a "
+                "paged drafter context that paged_context_commit takes"
+            )
+        main = torch.cuda.current_stream()
+        if main != launched.main or current_capture_id() != launched.capture:
+            raise RuntimeError(
+                "[musespark_open] context_kv_fork: the side chain was forked from another stream or "
+                "capture state than the one committing it"
+            )
+        device = worker._ctx_len.device
+        gens = launched.num_gens
+        num_ctx = torch.empty(gens, dtype=torch.int64, device=device)
+        preamble = PagedPreamble(
+            batch_idx,
+            query_positions,
+            seq_lens_cuda,
+            seq_lens_value,
+            torch.empty(gens, dtype=torch.int32, device=device),
+            torch.empty(gens, dtype=torch.int32, device=device),
+            torch.empty(gens, dtype=torch.int32, device=device),
+            torch.empty(gens * draft_block, dtype=torch.int32, device=device),
+        )
+        rows = self.rows[:gens]
+        self._count_paged_commit(preamble=True)
+        self.stream.wait_stream(main)
+        with torch.cuda.stream(self.stream):
+            context_kv_commit_paged(
+                worker._ctx_len,
+                worker._ctx_base,
+                slots,
+                num_accepted,
+                rows,
+                worker._ctx_block_counts if worker._ctx_block_tables is not None else None,
+                worker._ctx_page_size,
+                worker._compute_block_size,
+                worker._max_ctx,
+                worker._dummy_slot,
+                worker._ctx_unified_cache,
+                num_ctx,
+                preamble=preamble,
+            )
+        return num_ctx, preamble.i32s
 
     def settle(self) -> None:
         """Forget an armed step and join a side chain a failed step left behind.
@@ -878,6 +1031,44 @@ class ContextKvFork:
         the main stream's last kernel.
         """
         worker, drafter = self.worker, self.draft_model
+        if PAGED_SIDE_CHAIN and not worker._ctx_paged and "dense" not in _PAGED_LOGGED:
+            _PAGED_LOGGED.append("dense")
+            logger.error(
+                "[musespark_open] drafter_kv_fork_before_head__PAGED_CHAIN is set but the drafter context is not "
+                "paged: the knob does nothing here"
+            )
+        if PAGED_SIDE_CHAIN and worker._ctx_paged:
+            paged_refusal = _paged_side_chain_refusal(
+                self, worker, drafter, attn_metadata, num_gens
+            )
+            if paged_refusal is None:
+                if None not in _PAGED_LOGGED:
+                    _PAGED_LOGGED.append(None)
+                    logger.info(
+                        "[musespark_open] context_kv_fork: the paged context-K/V side chain in two launches around its "
+                        "GEMMs (drafter_kv_fork_before_head__PAGED_CHAIN)"
+                    )
+                early = None
+                if self._early is not None:
+                    early, early_gens, early_k = self._early
+                    if (early_gens, early_k) != (
+                        num_gens,
+                        k,
+                    ) or early.capture != current_capture_id():
+                        raise RuntimeError(
+                            "[musespark_open] context_kv_fork: the early paged side-chain part was launched for "
+                            "another step or capture state than the one forking now"
+                        )
+                return _fused_paged_side_chain(
+                    self, worker, drafter, spec_metadata, attn_metadata, num_gens, k, early
+                )
+            if paged_refusal not in _PAGED_LOGGED:
+                _PAGED_LOGGED.append(paged_refusal)
+                logger.error(
+                    "[musespark_open] drafter_kv_fork_before_head__PAGED_CHAIN is set but this step's side chain "
+                    "cannot take it "
+                    f"({paged_refusal}): the built-in store runs"
+                )
         refusal = _side_chain_refusal(worker, drafter) if self.side_chain_on else None
         if self.side_chain_on and refusal is None:
             # The dense full-length arena or the KV cache manager's pages (``_side_chain_refusal``).
@@ -1274,6 +1465,225 @@ def _fused_side_chain_paged(
     v_new = kv_flat.view(k_new.shape[0], k_new.shape[1], 2, *k_new.shape[2:])[:, :, 1]
     worker._store_context_kv_paged(k_new, v_new, pro.keys, pro.col)
     return pro.gen_hs
+
+
+# --------------------------------------------------------------------------
+# The paged side chain (``drafter_kv_fork_before_head__PAGED_CHAIN``, ``PAGED_SIDE_CHAIN``)
+# --------------------------------------------------------------------------
+
+
+def _paged_layer_pools_or_reason(worker):
+    """Each drafter layer's ``[pages, 2, kv_heads, page, head_dim]`` pool, or the reason the layers differ.
+
+    The page count is not compared: ``KVCacheManagerV2.get_buffers`` wraps each layer's own base address in a view
+    that runs to the end of the shared pool, so later layers see fewer pages. The scatter only takes each layer's
+    base pointer and the (shared) strides, and indexes pages with the same block table ``append_paged_kv_cache``
+    gets, so a different ``shape[0]`` changes nothing it writes.
+    """
+    buf = worker._ctx_kv_buf
+    try:
+        pools = [buf[layer] for layer in range(len(buf))]
+    except TypeError:
+        return None, f"the drafter context store is a {type(buf).__name__}, not a per-layer list"
+    if not pools:
+        return None, "the drafter context store has no layers"
+    first = pools[0]
+    for i, pool in enumerate(pools):
+        if not isinstance(pool, torch.Tensor) or pool.dim() != 5:
+            return None, f"drafter layer {i}'s pool is not a 5-d tensor"
+        if pool.shape[1:] != first.shape[1:] or pool.stride() != first.stride():
+            return None, (
+                f"drafter layer {i}'s pool is {tuple(pool.shape)} / {pool.stride()}, layer 0's "
+                f"{tuple(first.shape)} / {first.stride()}"
+            )
+        if pool.dtype != first.dtype or pool.device != first.device:
+            return None, f"drafter layer {i}'s pool dtype or device differs from layer 0's"
+    return pools, None
+
+
+def _paged_layer_pools(worker) -> Optional[list]:
+    """Each drafter layer's ``[pages, 2, kv_heads, page, head_dim]`` pool, or None when the layers differ."""
+    return _paged_layer_pools_or_reason(worker)[0]
+
+
+def _paged_side_chain_refusal(fork, worker, drafter, attn_metadata, num_gens: int) -> Optional[str]:
+    """Why ``_fused_paged_side_chain`` does not reproduce this step's paged store, or None."""
+    from tensorrt_llm._torch.models import modeling_dflash
+
+    if worker._ctx_block_tables is None or worker._ctx_block_counts is None:
+        return "the paged context has no manager block table (the private paged arena)"
+    offsets_name = (
+        "kv_cache_block_offsets" if worker._ctx_unified_cache else "draft_kv_cache_block_offsets"
+    )
+    src = getattr(attn_metadata, offsets_name, None)
+    if src is None or src.dim() != 4 or src.stride(3) != 1 or src.shape[1] < num_gens:
+        return f"the attention metadata's {offsets_name} is not [pools, batch, 2, blocks]"
+    if src.shape[3] != worker._ctx_block_tables.shape[1]:
+        return "the encoded block offsets and the drafter's block table differ in width"
+    if worker._ctx_block_counts.dtype != torch.int64 or worker._ctx_len.dtype != torch.int64:
+        return "the extents or the context lengths are not int64"
+    if worker._ctx_base is not None and worker._ctx_base.dtype != torch.int64:
+        return "the windowed base is not int64"
+    if modeling_dflash._flashinfer_rope is None:
+        return "no flashinfer RoPE"
+    if drafter._fused_kv_weight is None:
+        drafter._build_fused_kv_buffers()
+    pools, why = _paged_layer_pools_or_reason(worker)
+    if pools is None:
+        return f"the drafter layers' pools are not uniform [pages, 2, kv_heads, page, head_dim] tensors: {why}"
+    pool = pools[0]
+    nkv, hd = drafter._num_kv_heads, drafter._head_dim
+    if (
+        len(pools) != drafter._num_attn_layers
+        or pool.shape[1] != 2
+        or pool.shape[2] != nkv
+        or pool.shape[4] != hd
+    ):
+        return "the pools are not HND K/V planes of the drafter's heads"
+    if pool.stride(4) != 1 or pool.shape[3] != worker._ctx_page_size:
+        return "the pools' head_dim is not contiguous or their page is not the context page"
+    if getattr(drafter, "_input_ln_eps", None) is not None:
+        return "the drafter normalizes the projected rows before its K/V GEMM"
+    if drafter._fused_kv_weight.dtype != pool.dtype:
+        return "the K/V GEMM weight is not the pool dtype"
+    if drafter._k_norm_stacked is None:
+        return "no stacked K norm"
+    if _kv_gemm(drafter) is None:
+        return "precompute_context_kv is replaced by something other than drafter_fixed_gemms"
+    ptrs = fork.__dict__.get("_paged_layer_ptrs")
+    want = tuple(p.data_ptr() for p in pools)
+    if ptrs is None or ptrs[0] != want:
+        if torch.cuda.is_current_stream_capturing():
+            return "the pools' pointer table was not built before the capture"
+        fork._paged_layer_ptrs = (want, torch.tensor(want, dtype=torch.int64, device=pool.device))
+    return None
+
+
+def _paged_side_chain_prologue(
+    worker, drafter, spec_metadata, attn_metadata, num_gens: int, k: int
+):
+    """``context_kv_paged_prep`` (the block-table decode, extents, columns, positions, int32 RoPE positions) and the
+    captured rows, as a ``_SideChainPrologue``."""
+    from ...ops.spec.context_kv_store_paged import context_kv_paged_prep
+
+    rows_per_req = k + 1
+    rows = num_gens * rows_per_req
+    layers = drafter._num_attn_layers
+    device = worker._ctx_len.device
+    offsets_name = (
+        "kv_cache_block_offsets" if worker._ctx_unified_cache else "draft_kv_cache_block_offsets"
+    )
+    src = getattr(attn_metadata, offsets_name)[worker._ctx_pool_idx, :num_gens, 0]
+    slots = worker._batch_to_slot[:num_gens]
+    positions = torch.empty(rows, dtype=torch.long, device=device)
+    col = torch.empty(rows, dtype=torch.long, device=device)
+    pos_i32 = torch.empty(rows * layers, dtype=torch.int32, device=device)
+    context_kv_paged_prep(
+        src,
+        worker._ctx_block_tables,
+        worker._ctx_block_counts,
+        worker._ctx_len,
+        worker._ctx_base,
+        slots,
+        positions,
+        col,
+        pos_i32,
+        rows_per_req,
+        layers,
+        int(worker._ctx_block_offset),
+        int(worker._ctx_block_divisor),
+        int(worker._ctx_page_size),
+    )
+    gen_hs = spec_metadata.captured_hidden_states[
+        :rows, : spec_metadata.hidden_size * spec_metadata.num_capture_layers
+    ]
+    return _SideChainPrologue(slots, positions, col, pos_i32, gen_hs)
+
+
+def _paged_side_chain_early(worker, drafter, spec_metadata, attn_metadata, num_gens: int, k: int):
+    """The paged chain's early part (``drafter_kv_fork_before_head__PAGED_CHAIN`` 2): its prep, then the sharded
+    ``fc`` GEMM on this rank's rows (``_side_chain_early``'s statements), or None when the projection is not the
+    sharded ``fc``."""
+    from ... import spec_worker as _drafter_worker
+
+    rows = num_gens * (k + 1)
+    gen_hs = spec_metadata.captured_hidden_states[
+        :rows, : spec_metadata.hidden_size * spec_metadata.num_capture_layers
+    ]
+    x = gen_hs.reshape(-1, gen_hs.shape[-1]).to(drafter.fc.weight.dtype)
+    split = _sharded_fc(drafter, x)
+    if split is None:
+        return None
+    shard, state = split
+    prologue = _paged_side_chain_prologue(
+        worker, drafter, spec_metadata, attn_metadata, num_gens, k
+    )
+    local = _drafter_worker._gemm(x.contiguous(), shard, state.enable_pdl)
+    return _EarlyFc(prologue, local, state.gather, current_capture_id())
+
+
+def _fused_paged_side_chain(
+    fork, worker, drafter, spec_metadata, attn_metadata, num_gens: int, k: int, early=None
+):
+    """``ContextKvFork.side_chain`` over the manager's pages with its integer math and its stores fused.
+
+    ``_refresh_ctx_block_tables`` and ``_store_step_context``'s index math in one launch
+    (``context_kv_paged_prep``), ``DFlashForCausalLM.precompute_context_kv`` written out as
+    ``_fused_side_chain`` writes it (the same GEMMs, norms, products and RoPE on the same operands, in the same
+    order), and the per-layer ``append_paged_kv_cache`` calls as one scatter (``context_kv_paged_scatter``).
+    With ``early`` (``PAGED_SIDE_CHAIN`` 2) the prep and the sharded ``fc`` GEMM already ran at the early fork.
+    """
+    from tensorrt_llm._torch.models import modeling_dflash
+
+    from ...ops.spec.context_kv_store_paged import context_kv_paged_scatter
+
+    rows_per_req = k + 1
+    rows = num_gens * rows_per_req
+    layers = drafter._num_attn_layers
+    nkv, hd = drafter._num_kv_heads, drafter._head_dim
+    if early is not None:
+        pro = early.prologue
+        projected = drafter.hidden_norm(early.gather.gather(early.local))
+    else:
+        pro = _paged_side_chain_prologue(worker, drafter, spec_metadata, attn_metadata, num_gens, k)
+        projected = drafter.project_target_hidden(pro.gen_hs.reshape(-1, pro.gen_hs.shape[-1]))
+    col, gen_hs = pro.col, pro.gen_hs
+    pos_i32 = pro.pos_i32
+    pool = _paged_layer_pools(worker)[0]
+    # precompute_context_kv, its served branch (no input norm, the pool's dtype).
+    projected = projected.to(pool.dtype)
+    kv_flat = _kv_gemm(drafter)(projected)
+    kv = kv_flat.view(rows, layers, 2, nkv, hd)
+    k_new = kv[:, :, 0].contiguous()
+    k_new = torch.nn.functional.rms_norm(k_new, (hd,), eps=drafter._k_norm_eps)
+    k_new = k_new * drafter._k_norm_stacked.view(1, layers, 1, hd)
+    k_flat = k_new.view(rows * layers, nkv * hd)
+    dummy_q = drafter._rope_dummy_q
+    if dummy_q is None or dummy_q.dtype != k_flat.dtype or dummy_q.shape[0] < k_flat.shape[0]:
+        dummy_q = k_flat.new_empty(k_flat.shape[0], drafter._head_dim)
+        drafter._rope_dummy_q = dummy_q
+    modeling_dflash._flashinfer_rope(
+        pos_i32,
+        dummy_q[: k_flat.shape[0]],
+        k_flat,
+        drafter._head_dim,
+        drafter._get_cos_sin_cache(),
+        drafter._is_neox,
+    )
+    context_kv_paged_scatter(
+        k_new.view(rows, layers, nkv * hd),
+        kv_flat,
+        col,
+        worker._ctx_block_counts,
+        worker._ctx_block_tables,
+        fork._paged_layer_ptrs[1],
+        pool,
+        rows_per_req,
+        layers,
+        nkv,
+        hd,
+    )
+    return gen_hs
 
 
 # --------------------------------------------------------------------------

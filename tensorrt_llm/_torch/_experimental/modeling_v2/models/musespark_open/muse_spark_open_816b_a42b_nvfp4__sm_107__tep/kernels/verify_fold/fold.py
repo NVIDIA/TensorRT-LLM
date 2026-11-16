@@ -121,6 +121,53 @@ def _log_late_join_once() -> None:
         )
 
 
+#: ``paged_context_commit`` on a forked folded step over a PAGED drafter context (``_ctx_paged``:
+#: the KV cache manager's pages, with or without the unified block tables and the windowed base):
+#: the context-K/V fork's commit launch (``ops/spec/context_kv_commit_paged``) also writes the
+#: drafter forward's integer preamble (4 casts / adds) and the ``_seq_lens_cuda`` fill
+#: (``ContextKvFork.commit_paged_preamble``), and the noise gather writes the residual's copy, as
+#: ``drafter_preamble_from_commit`` does on the dense arena. The same values. The refusal reasons
+#: logged so far (None: the INFO line of an engaged step).
+_PAGED_LOGGED = []
+
+
+def _paged_preamble_refusal(
+    worker, fold, attn_metadata, num_gens: int, block_size: int
+) -> Optional[str]:
+    """Why the paged commit's launch cannot also write this forked folded step's drafter preamble, or None."""
+    if not worker._ctx_paged:
+        return "the drafter context is not paged"
+    if num_gens > worker.__dict__.get("_kv_fork").rows.numel():
+        return f"{num_gens} requests exceed the fork's rows"
+    index = fold.gen_rows if worker._ctx_block_tables is not None else None
+    if index is not None and not (
+        index.dtype in (torch.int32, torch.int64)
+        and index.is_contiguous()
+        and tuple(index.shape) == (num_gens,)
+    ):
+        return "the fold's batch rows are not [requests] contiguous int32 / int64"
+    qpos = fold.query_positions
+    seq_lens = getattr(attn_metadata, "_seq_lens_cuda", None)
+    if not (
+        qpos.dtype == torch.int64
+        and qpos.is_contiguous()
+        and tuple(qpos.shape) == (num_gens, block_size)
+    ):
+        return "the fold's query positions are not [requests, block] contiguous int64"
+    if not (
+        seq_lens is not None
+        and seq_lens.dtype in (torch.int32, torch.int64)
+        and seq_lens.is_contiguous()
+        and seq_lens.numel() >= num_gens
+    ):
+        return "the attention metadata's _seq_lens_cuda does not cover the requests"
+    if worker._ctx_block_tables is not None and (
+        worker._ctx_block_counts is None or getattr(worker, "_ctx_page_size", None) is None
+    ):
+        return "the block tables have no block counts / page size"
+    return None
+
+
 def _join_holding(fork, launched, held) -> None:
     """``fork.join(launched)``.
 
@@ -773,19 +820,50 @@ class SpecLoopFoldDFlashWorker(DFlashWorker):
             if self._fold_preamble
             else None
         )
-        if self._fold_preamble and refusal is None:
+        paged = False
+        if self._ctx_paged and fork._commits_paged(self, slots, gen_num_accepted):
+            # paged_context_commit takes this step's commit: its launch also writes the preamble.
+            paged_refusal = _paged_preamble_refusal(self, fold, attn_metadata, num_gens, block_size)
+            paged = paged_refusal is None
+            # Each refusal reason logs once, whether or not an earlier step engaged (and logged INFO).
+            if not paged and paged_refusal not in _PAGED_LOGGED:
+                _PAGED_LOGGED.append(paged_refusal)
+                logger.warning(
+                    "[musespark_open] verify_fold: paged_context_commit's launch leaves this step's "
+                    f"drafter preamble to the drafter forward ({paged_refusal})"
+                )
+            elif paged and None not in _PAGED_LOGGED:
+                _PAGED_LOGGED.append(None)
+                logger.info(
+                    "[musespark_open] verify_fold: paged drafter context commit + drafter preamble + "
+                    "_seq_lens_cuda fill in one launch (paged_context_commit)"
+                )
+        if (self._fold_preamble and refusal is None) or paged:
             # The commit also writes the drafter forward's integer preamble and the
             # _seq_lens_cuda fill; the noise gather also writes the residual's copy.
-            num_ctx, i32s = fork.commit_with_preamble(
-                launched,
-                slots,
-                gen_num_accepted,
-                fold.query_positions,
-                attn_metadata._seq_lens_cuda,
-                total_tokens_per_req,
-                block_size,
-                batch_idx,
-            )
+            if paged:
+                # paged_context_commit's launch with a PagedPreamble (_paged_preamble_refusal passed).
+                num_ctx, i32s = fork.commit_paged_preamble(
+                    launched,
+                    slots,
+                    gen_num_accepted,
+                    batch_idx,
+                    fold.query_positions,
+                    attn_metadata._seq_lens_cuda,
+                    total_tokens_per_req,
+                    block_size,
+                )
+            else:
+                num_ctx, i32s = fork.commit_with_preamble(
+                    launched,
+                    slots,
+                    gen_num_accepted,
+                    fold.query_positions,
+                    attn_metadata._seq_lens_cuda,
+                    total_tokens_per_req,
+                    block_size,
+                    batch_idx,
+                )
             table = _replicated_embedding.table_of(embed_tokens)
             residual = None
             normed = None
@@ -834,6 +912,8 @@ class SpecLoopFoldDFlashWorker(DFlashWorker):
             inputs = self._drafter_inputs(
                 noise_embed_2d, fold.query_positions, num_ctx, slots, fold.gen_rows, fold.bonus
             )
+            # The dense arena (``_preamble_refusal``) reads the context by slot; a paged one with
+            # block tables by row (``inputs["ctx_cache_batch_idx"]``, the i32s' batch index).
             if inputs["ctx_cache_batch_idx"] is not batch_idx:
                 raise FoldStateError(
                     "[musespark_open] drafter_preamble_from_commit: the drafter's batch index is "

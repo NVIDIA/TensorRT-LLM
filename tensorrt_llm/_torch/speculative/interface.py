@@ -1173,11 +1173,23 @@ class SpecMetadata:
             return
         onehot_vocab = (self.draft_probs_last_dim if self.draft_probs_last_dim
                         > 0 else self.draft_probs_vocab_size)
+        if _ONEHOT_INDEXED_PUT:
+            slots = torch.tensor(padding_slot_ids,
+                                 dtype=torch.long,
+                                 device=self.draft_probs.device)
+            self.draft_probs[slots, :draft_len, :onehot_vocab] = 0.0
+            self.draft_probs[slots, :draft_len, 0] = 1.0
+            return
+        # A device tensor built from a list and a scalar put through an advanced
+        # index each block the host until the stream drains; a pinned upload and
+        # index_fill_ (the value is a kernel argument) do not.
         slots = torch.tensor(padding_slot_ids,
                              dtype=torch.long,
-                             device=self.draft_probs.device)
-        self.draft_probs[slots, :draft_len, :onehot_vocab] = 0.0
-        self.draft_probs[slots, :draft_len, 0] = 1.0
+                             pin_memory=prefer_pinned()).to(
+                                 self.draft_probs.device, non_blocking=True)
+        self.draft_probs[:, :draft_len, :onehot_vocab].index_fill_(
+            0, slots, 0.0)
+        self.draft_probs[:, :draft_len, 0].index_fill_(0, slots, 1.0)
 
     def dp_num_tokens(self) -> int:
         """Return the attention-DP token count for the current batch.
@@ -1689,6 +1701,14 @@ def _padded_gen_draft_tokens(spec_metadata: SpecMetadata, num_gens: int,
         qo_indptr=build_qo_indptr(draft_lens),
         max_len=runtime_draft_len,
     ).to(torch.int32)
+
+
+# One-hot draft-prob rows (context and disagg-gen padding slots) are written
+# with index_fill_ and a pinned non-blocking slot upload instead of advanced-index
+# scalar puts, which synchronize the host with the GPU.
+# TRTLLM_DISABLE_ONEHOT_INDEX_FILL=1 restores the previous writes.
+_ONEHOT_INDEXED_PUT = os.environ.get("TRTLLM_DISABLE_ONEHOT_INDEX_FILL",
+                                     "0") == "1"
 
 
 class SpecWorkerBase(nn.Module, ABC):
@@ -3062,8 +3082,14 @@ class SpecWorkerBase(nn.Module, ABC):
         else:
             onehot_vocab = spec_metadata.draft_probs_vocab_size
             spec_metadata.draft_probs_last_dim = onehot_vocab
-        # index_fill_ over basic-slice views: an advanced-index assignment
-        # with the device slot ids synchronizes the host with the stream.
+        if _ONEHOT_INDEXED_PUT:
+            spec_metadata.draft_probs[
+                ctx_slot_ids, :draft_len, :onehot_vocab] = 0.0
+            spec_metadata.draft_probs[ctx_slot_ids, :draft_len, 0] = 1.0
+            return
+        # index_fill_ takes the value as a kernel argument. Assigning a Python
+        # scalar through an advanced index stages it as a pageable host tensor
+        # and blocks the host until the stream drains.
         draft_probs = spec_metadata.draft_probs
         draft_probs[:, :draft_len, :onehot_vocab].index_fill_(
             0, ctx_slot_ids, 0.0)

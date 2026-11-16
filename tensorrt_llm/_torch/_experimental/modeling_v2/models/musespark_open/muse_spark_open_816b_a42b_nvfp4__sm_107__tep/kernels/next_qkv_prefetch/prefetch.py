@@ -96,15 +96,28 @@ JOIN_ROLE = "qkv"
 #: prefetch running beside the finalize / unpool / boundary. 0 (the default) skips none.
 #: Scheduling only: bitwise.
 SKIP_ROWS = 0
+#: ``published_min_rows`` (``configure``; ``tep8_publish_splitk``'s MIN_ROWS below 33): decode steps
+#: of that many rows or more fork no prefetch, as the 33..64-row steps the publication takes fork
+#: none (their next QKV, a split-K launch that stages its weight before its wait, streams it while
+#: the PDL post-FFN join polls the transport). 0 (the default) changes nothing. Scheduling only:
+#: bitwise.
+PUBLISHED_MIN_ROWS = 0
 
 
-def configure(*, skip_rows: int = 0) -> None:
-    """Set the largest decode step, in rows, that forks no prefetch; 0 skips none.
+def configure(*, skip_rows: int = 0, published_min_rows: int = 0) -> None:
+    """Set the largest decode step, in rows, that forks no prefetch (0 skips none), and the fewest
+    rows of a step the publication takes below 33 (0: none), which forks none either.
 
-    ``lever_settings.apply`` sets it from the model's plan before any install.
+    ``lever_settings.apply`` sets them from the model's plan before any install.
     """
-    global SKIP_ROWS
+    global SKIP_ROWS, PUBLISHED_MIN_ROWS
     SKIP_ROWS = int(skip_rows or 0)
+    PUBLISHED_MIN_ROWS = int(published_min_rows or 0)
+
+
+def _forks_at(rows: int) -> bool:
+    """Whether a step of ``rows`` rows may fork (``SKIP_ROWS``, ``PUBLISHED_MIN_ROWS``)."""
+    return rows > SKIP_ROWS and not (PUBLISHED_MIN_ROWS and rows >= PUBLISHED_MIN_ROWS)
 
 
 #: Where the next-QKV prefetch of a 9..32-row decode step runs (``check_wide``): the
@@ -190,7 +203,7 @@ class QkvPrefetch:
 
     def ask(self, weight: torch.Tensor, rows: int) -> None:
         """Fork the prefetch of ``weight`` after the current stream's work, at ``rows``."""
-        if rows in self.rows and rows > SKIP_ROWS:
+        if rows in self.rows and _forks_at(rows):
             # The launch is built after the fork made its sink (first eager fork).
             forked = self.fork.fork(lambda: self.launches(weight, rows)(), device=weight.device)
             if forked and rows > MAX_ROWS and rows not in self._logged_wide:
@@ -335,6 +348,12 @@ def install(model, plan, wide: str = WIDE_OFF) -> QkvPrefetch:
         f"layers, layer 0's at the start of the decode forward; joined at the QKV GEMM; "
         f"rows {sorted(rows)}"
         + (f"; skip_rows={SKIP_ROWS}: none at <= {SKIP_ROWS} rows" if SKIP_ROWS else "")
+        + (
+            f"; published_min_rows={PUBLISHED_MIN_ROWS}: none at >= {PUBLISHED_MIN_ROWS} rows "
+            "(the publication's steps)"
+            if PUBLISHED_MIN_ROWS
+            else ""
+        )
     )
     if setting != WIDE_OFF:
         if not wide:

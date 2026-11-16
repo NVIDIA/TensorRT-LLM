@@ -96,7 +96,14 @@ from tensorrt_llm._torch.speculative.dflash import DFlashWorker
 from tensorrt_llm.logger import logger
 
 from .dispatch import LAUNCH_PDL
-from .ops.gemm.fixed_low_m_gemm import fixed_low_m_gemm, splitk_tactics, tactic_for, takes
+from .ops.gemm.fixed_low_m_gemm import (
+    deep_stage_tactics,
+    fixed_low_m_gemm,
+    splitk_tactics,
+    tactic_for,
+    takes,
+    wide_launch_tactics,
+)
 from .ops.spec.dflash_accept import (
     COUNTER_STRIDE,
     FORCE_FIXED,
@@ -133,23 +140,44 @@ TEP8_FC_GATHER_PROGRAMS = 0
 FC_SHARD_PREWARM = False
 
 
+#: The most rows ``fc_shard_wide_rows`` may set: the fabric projection gather's per-call token
+#: capacity at TP8 (``musespark_open_projection_gather._MAX_TOKENS``).
+FC_SHARD_WIDE_MAX_ROWS = 128
+
+
 def configure(
-    *, fc_shard_wide: bool = False, fc_gather_programs: int = 0, fc_shard_prewarm: bool = False
+    *,
+    fc_shard_wide: bool = False,
+    fc_shard_wide_rows: int = 64,
+    fc_gather_programs: int = 0,
+    fc_shard_prewarm: bool = False,
 ) -> None:
     """Set the sharded ``fc``'s TP8 row bound, its TP8 gather's program count and its prewarm.
 
     ``lever_settings.apply`` sets them from the model's plan before any install.
 
     Args:
-        fc_shard_wide: TP8 calls of up to 64 rows take the sharded ``fc`` (``FC_SHARD_MAX_ROWS``;
-            off: 8).
+        fc_shard_wide: TP8 calls of up to ``fc_shard_wide_rows`` rows take the sharded ``fc``
+            (``FC_SHARD_MAX_ROWS``; off: 8).
+        fc_shard_wide_rows: that bound (the lever's MAX_ROWS, 64 by default; up to
+            ``FC_SHARD_WIDE_MAX_ROWS``). Above 64 rows (9..16 requests at K = 7) the rank's GEMM
+            runs ``F.linear`` on its block (no fixed low-M tactic lists those rows), so a row's
+            bits are not its one-request bits there; only draft tokens can move.
         fc_gather_programs: programs of the TP8 fc gather (``TEP8_FC_GATHER_PROGRAMS``; 0: the
             built-in's).
         fc_shard_prewarm: create the shard GEMM's BLAS handles (and at TP4 connect the gather) at
             install (``FC_SHARD_PREWARM``).
+
+    Raises:
+        ValueError: for a ``fc_shard_wide_rows`` outside 8..``FC_SHARD_WIDE_MAX_ROWS``.
     """
     global FC_SHARD_MAX_ROWS, TEP8_FC_GATHER_PROGRAMS, FC_SHARD_PREWARM
-    FC_SHARD_MAX_ROWS = 64 if fc_shard_wide else 8
+    rows = int(fc_shard_wide_rows)
+    if not 8 <= rows <= FC_SHARD_WIDE_MAX_ROWS:
+        raise ValueError(
+            f"spec_worker: fc_shard_wide_rows {rows} is outside 8..{FC_SHARD_WIDE_MAX_ROWS}"
+        )
+    FC_SHARD_MAX_ROWS = rows if fc_shard_wide else 8
     TEP8_FC_GATHER_PROGRAMS = int(fc_gather_programs or 0)
     FC_SHARD_PREWARM = bool(fc_shard_prewarm)
 
@@ -996,8 +1024,34 @@ def install(
                 f"{len(sites.declined)} of {total} drafter GEMM call sites take no fixed "
                 f"tactic ({'; '.join(sites.declined) or 'the drafter has none'})"
             )
+        # tep8_drafter_wide_gemms__MAX_ROWS: resolve (and check) the 65..MAX_ROWS-row one-launch
+        # tactics here, not at a step. Empty at the default (64).
+        try:
+            wide = wide_launch_tactics(tactics)
+            # tep8_drafter_wide_gemms__DEEP_STAGES: the deepened 16..64-row entries fit (checked here).
+            deep = deep_stage_tactics(tactics)
+        except ValueError as error:
+            raise ValueError(
+                f"[musespark_open] drafter_fixed_gemms cannot run here: {error}"
+            ) from error
+        if deep:
+            logger.info(
+                f"[musespark_open] drafter_fixed_gemms: {len(deep)} drafter GEMM entries of 16..64 rows at deeper "
+                "A/B pipelines, the same tiles and K splits (tep8_drafter_wide_gemms__DEEP_STAGES): "
+                + ", ".join(f"{m}x[{n}, {k}] s{t.ab_stages}" for (m, k, n), t in sorted(deep.items()))
+            )
         if sites.changed:
             logger.info(
                 f"[musespark_open] drafter_fixed_gemms: {sites.installed} of {total} drafter GEMM call sites "
                 f"on fixed low-M tactics (the TP{tp_size} table)"
             )
+            if wide:
+                launches = ", ".join(
+                    f"[{n}, {k}] splitk:{t.mma_m},{t.mma_n},{t.split_k},{t.ab_stages}"
+                    for (k, n), t in sorted(wide.items())
+                )
+                logger.info(
+                    f"[musespark_open] drafter_fixed_gemms: 65..{max(m for m, _, _ in tactics)}-row "
+                    f"drafter GEMMs in one launch of the 64-row split-K tactic (each row's "
+                    f"one-request bits): {launches}"
+                )

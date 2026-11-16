@@ -50,6 +50,8 @@ lever can be A/B'd on one image; see the ``_*_enabled`` helpers for rationale):
   prefill work across single-node BF16 TP4/EP4 ranks;
   ``MUSESPARK_OPEN_PREFILL_SP_MIN_TOKENS`` (default 4096) sets the smallest step split.
 - ``MUSESPARK_OPEN_BF16X3_ROUTER`` (default off): BF16x3 projection for large routers.
+- ``MUSESPARK_OPEN_CTX_FUSIONS`` (default off): bit-identical context-step fusions
+  (pre-attention prep, residual joins, DFlash capture, top-8 routing, expert combine).
 - ``MUSESPARK_OPEN_FINALIZE_BF16_OUT`` (default off): the model's own unfused expert
   finalize stores BF16 instead of FP32, bitwise the following cast.
 - ``MUSESPARK_OPEN_FULL_ROUTING_ALL_BATCHES`` (default off): fuse large-batch routing;
@@ -64,6 +66,11 @@ lever can be A/B'd on one image; see the ``_*_enabled`` helpers for rationale):
   the reference reduction order above 128 tokens.
 - ``MUSESPARK_OPEN_OVERLAP_SP_PROJECTION`` (default off): overlap two output-projection
   chunks with reduce-scatter in eager sequence-parallel prefills of >=8192 tokens.
+- ``MUSESPARK_OPEN_OVERLAP_SP_PROJECTION_GRAPH`` (default off): with the switch above,
+  also overlap in steps captured into a CUDA graph (the served prefill graph), once the
+  projection stream exists (an eager step of >=8192 tokens creates it before capture).
+- ``MUSESPARK_OPEN_OVERLAP_SP_PROJECTION_CHUNKS`` (default 2): the output-projection
+  chunks the overlap runs (each chunk's reduce-scatter overlaps the next chunk's GEMM).
 - ``MUSESPARK_OPEN_PAD_SP_PROJECTION`` (default off): pad narrower projection inputs
   instead of outputs in eager sequence-parallel prefills; overlap takes precedence.
 
@@ -369,6 +376,316 @@ def _fused_post_expert_norm_combine(
     return out
 
 
+def _ctx_fusions_enabled() -> bool:
+    """Whether the context-step fusions run.
+
+    Off unless MUSESPARK_OPEN_CTX_FUSIONS names a truthy value. Each fusion keeps every value's
+    arithmetic and rounding, so outputs are bit-identical with the switch off:
+
+    - the pre-attention prep chain runs as the modeling_v2 TEP target's ``preattn_prep``
+      (vectorized above 512 rows), and the output norm-gate reads the gate from the QKV
+      projection as a strided view instead of a copy;
+    - the attention-side join also writes the router's FP32 input, and above ``_JOIN_MIN_ROWS``
+      rows both residual joins run ``_JOIN_ROWS`` tokens per program;
+    - the FFN-side join stores DFlash's BF16 capture of the residual;
+    - large-batch routing picks its top eight without the two 256-wide sorts;
+    - the sparse post-expert combine reloads the norm gain per slot instead of holding it in
+      registers.
+
+    Resolved once at import (module-level launch helpers and modeling_v2's router-input join read
+    it), before warmup and any graph capture.
+    """
+    return os.environ.get("MUSESPARK_OPEN_CTX_FUSIONS", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+_CTX_FUSIONS = _ctx_fusions_enabled()
+_JOIN_MIN_ROWS = 128
+_JOIN_ROWS = 4
+
+
+def _capture_slice(
+    spec_metadata: Any, layer_idx: int, hidden_states: torch.Tensor
+) -> Optional[torch.Tensor]:
+    """The ``[rows, hidden]`` BF16 column slice DFlash captures ``layer_idx`` into, or None (then the stock capture)."""
+    if spec_metadata is None or hidden_states.ndim != 2 or hidden_states.shape[0] <= 128:
+        return None
+    from ..speculative.dflash import DFlashSpecMetadata
+
+    if (
+        type(spec_metadata).maybe_capture_hidden_states
+        is not DFlashSpecMetadata.maybe_capture_hidden_states
+    ):
+        return None
+    buf = getattr(spec_metadata, "captured_hidden_states", None)
+    index = getattr(spec_metadata, "_layer_to_idx", {}).get(layer_idx)
+    rows, hidden = hidden_states.shape
+    if (
+        buf is None
+        or index is None
+        or buf.dtype != torch.bfloat16
+        or buf.ndim != 2
+        or not buf.is_contiguous()
+        or buf.device != hidden_states.device
+        or rows > buf.shape[0]
+        or (index + 1) * hidden > buf.shape[1]
+    ):
+        return None
+    return buf[:rows, index * hidden : (index + 1) * hidden]
+
+
+try:
+    from triton.language.extra import libdevice as _libdevice
+except ImportError:  # the pre-3.2 layout
+    from triton.language.extra.cuda import libdevice as _libdevice
+
+
+@triton.jit
+def _rsqrt_approx_ftz(x):
+    return tl.inline_asm_elementwise(
+        "rsqrt.approx.ftz.f32 $0, $1;", "=r,r", [x], dtype=tl.float32, is_pure=True, pack=1
+    )
+
+
+@triton.jit
+def _prep_normalize(x, inverse_rms, scale):
+    y = (x * inverse_rms).to(tl.bfloat16).to(tl.float32)
+    return (y * scale).to(tl.bfloat16).to(tl.float32)
+
+
+@triton.jit
+def _mul_ftz(a, b):
+    return tl.inline_asm_elementwise(
+        "mul.rn.ftz.f32 $0, $1, $2;", "=r,r,r", [a, b], dtype=tl.float32, is_pure=True, pack=1
+    )
+
+
+@triton.jit
+def _fma_ftz(a, b, c):
+    return tl.inline_asm_elementwise(
+        "fma.rn.ftz.f32 $0, $1, $2, $3;",
+        "=r,r,r,r",
+        [a, b, c],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _prep_rotate(even, odd, cos, sin):
+    return (
+        _fma_ftz(even, cos, _mul_ftz(-odd, sin)),
+        _fma_ftz(odd, cos, _mul_ftz(even, sin)),
+    )
+
+
+@triton.jit
+def _split8(x):
+    """[..., 2(d), 2(e), 2(f)] -> the eight [...] slices in index order 4d + 2e + f."""
+    f0, f1 = tl.split(x)
+    e0f0, e1f0 = tl.split(f0)
+    e0f1, e1f1 = tl.split(f1)
+    x0, x4 = tl.split(e0f0)
+    x2, x6 = tl.split(e1f0)
+    x1, x5 = tl.split(e0f1)
+    x3, x7 = tl.split(e1f1)
+    return x0, x1, x2, x3, x4, x5, x6, x7
+
+
+@triton.jit
+def _join8(x0, x1, x2, x3, x4, x5, x6, x7):
+    """Inverse of _split8: eight [B, 2, 2, 2] -> [B, 2, 2, 2, 2(d), 2(e), 2(f)]."""
+    p00 = tl.join(x0, x1)  # d0 e0 [.., f]
+    p01 = tl.join(x2, x3)  # d0 e1
+    p10 = tl.join(x4, x5)  # d1 e0
+    p11 = tl.join(x6, x7)  # d1 e1
+    q0 = tl.permute(tl.join(p00, p01), (0, 1, 2, 3, 5, 4))  # d0 [.., e, f]
+    q1 = tl.permute(tl.join(p10, p11), (0, 1, 2, 3, 5, 4))  # d1
+    return tl.permute(tl.join(q0, q1), (0, 1, 2, 3, 6, 4, 5))  # [.., d, e, f]
+
+
+@triton.jit(do_not_specialize=["rows"])
+def _preattn_prep_rows_vec_kernel(
+    qkv_ptr,
+    qkv_out_ptr,
+    cos_sin_ptr,
+    positions_ptr,
+    rows,
+    qkv_stride,
+    qkv_out_stride,
+    eps,
+    q_scale,
+    NUM_Q_HEADS: tl.constexpr,
+    NUM_KV_HEADS: tl.constexpr,
+    QKV_PERMUTED: tl.constexpr,
+    APPLY_ROPE: tl.constexpr,
+    LAUNCH_WITH_PDL: tl.constexpr,
+    BLOCK: tl.constexpr,
+    TRIGGER_AT_ENTRY: tl.constexpr = False,
+):
+    D: tl.constexpr = 64
+    HALF: tl.constexpr = 32
+    if LAUNCH_WITH_PDL:
+        if TRIGGER_AT_ENTRY:
+            tl.extra.cuda.gdc_launch_dependents()
+        tl.extra.cuda.gdc_wait()
+    row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    valid = row < rows
+    row = row.to(tl.int64)
+    head = tl.program_id(1)
+    is_q = head < NUM_Q_HEADS
+    kv_head = head - NUM_Q_HEADS
+    in_row = qkv_ptr + row * qkv_stride
+    out_row = qkv_out_ptr + row * qkv_out_stride
+    d = tl.arange(0, D)[None, :]
+    valid2 = valid[:, None]
+    # The gate stays in qkv (the caller returns a strided view of it); V heads are copied through.
+    if head >= NUM_Q_HEADS:
+        if QKV_PERMUTED:
+            v_in = NUM_Q_HEADS * D + NUM_KV_HEADS * D + kv_head * D
+        else:
+            v_in = 2 * NUM_Q_HEADS * D + NUM_KV_HEADS * D + kv_head * D
+        value = tl.load(in_row[:, None] + v_in + d, mask=valid2)
+        tl.store(
+            out_row[:, None] + (NUM_Q_HEADS + NUM_KV_HEADS) * D + kv_head * D + d,
+            value,
+            mask=valid2,
+        )
+    if QKV_PERMUTED:
+        in_off = tl.where(is_q, head * D, NUM_Q_HEADS * D + kv_head * D)
+    else:
+        in_off = tl.where(is_q, head * 2 * D, 2 * NUM_Q_HEADS * D + kv_head * D)
+    out_off = tl.where(is_q, head * D, NUM_Q_HEADS * D + kv_head * D)
+    scale = tl.where(is_q, q_scale, 1.0)
+
+    xrow = tl.load(in_row[:, None] + in_off + d, mask=valid2, other=0.0).to(tl.float32)
+    x0, x1, x2, x3, x4, x5, x6, x7 = _split8(tl.reshape(xrow, [BLOCK, 2, 2, 2, 2, 2, 2]))
+    s = _libdevice.add_rn(x0 * x0, x1 * x1)
+    s = _libdevice.add_rn(s, x2 * x2)
+    s = _libdevice.add_rn(s, x3 * x3)
+    s = _libdevice.add_rn(s, x4 * x4)
+    s = _libdevice.add_rn(s, x5 * x5)
+    s = _libdevice.add_rn(s, x6 * x6)
+    s = _libdevice.add_rn(s, x7 * x7)
+    total = tl.sum(tl.sum(tl.sum(s, axis=3), axis=2), axis=1)
+    inverse_rms = _rsqrt_approx_ftz(total / 64.0 + eps)[:, None, None, None]
+    y0 = _prep_normalize(x0, inverse_rms, scale)
+    y1 = _prep_normalize(x1, inverse_rms, scale)
+    y2 = _prep_normalize(x2, inverse_rms, scale)
+    y3 = _prep_normalize(x3, inverse_rms, scale)
+    y4 = _prep_normalize(x4, inverse_rms, scale)
+    y5 = _prep_normalize(x5, inverse_rms, scale)
+    y6 = _prep_normalize(x6, inverse_rms, scale)
+    y7 = _prep_normalize(x7, inverse_rms, scale)
+    if APPLY_ROPE:
+        position = tl.load(positions_ptr + row, mask=valid, other=0).to(tl.int64)
+        h = tl.arange(0, HALF)[None, :]
+        tab = cos_sin_ptr + position[:, None] * D + h
+        cos_row = tl.load(tab, mask=valid2, other=0.0)
+        sin_row = tl.load(tab + HALF, mask=valid2, other=0.0)
+        # [B, 32] -> [B, 2(a), 2(b), 2(c), 2(j1), 2(j0)], j = 2 * j1 + j0: element lane * 4 + j
+        c_j0a, c_j0b = tl.split(tl.reshape(cos_row, [BLOCK, 2, 2, 2, 2, 2]))
+        c0, c2 = tl.split(c_j0a)
+        c1, c3 = tl.split(c_j0b)
+        s_j0a, s_j0b = tl.split(tl.reshape(sin_row, [BLOCK, 2, 2, 2, 2, 2]))
+        s0, s2 = tl.split(s_j0a)
+        s1, s3 = tl.split(s_j0b)
+        y0, y1 = _prep_rotate(y0, y1, c0, s0)
+        y2, y3 = _prep_rotate(y2, y3, c1, s1)
+        y4, y5 = _prep_rotate(y4, y5, c2, s2)
+        y6, y7 = _prep_rotate(y6, y7, c3, s3)
+    yrow = _join8(
+        y0.to(tl.bfloat16),
+        y1.to(tl.bfloat16),
+        y2.to(tl.bfloat16),
+        y3.to(tl.bfloat16),
+        y4.to(tl.bfloat16),
+        y5.to(tl.bfloat16),
+        y6.to(tl.bfloat16),
+        y7.to(tl.bfloat16),
+    )
+    tl.store(out_row[:, None] + out_off + d, tl.reshape(yrow, [BLOCK, D]), mask=valid2)
+
+
+def _vectorized_preattn_prep(original):
+    """``original``'s signature; rows above 512 run ``_preattn_prep_rows_vec_kernel``.
+
+    Those return the gate as a strided view of ``qkv``, which ``rmsnorm_gate`` takes as is.
+    """
+
+    def prep(
+        qkv,
+        cos_sin,
+        position_ids,
+        num_q_heads,
+        num_kv_heads,
+        eps,
+        q_scale,
+        qkv_permuted,
+        enable_pdl=False,
+        trigger_at_entry=False,
+    ):
+        rows, width = qkv.shape
+        if (
+            rows <= 512
+            or qkv.dtype != torch.bfloat16
+            or qkv.stride(-1) != 1
+            or width != 2 * (num_q_heads + num_kv_heads) * 64
+            or (
+                cos_sin is not None
+                and (cos_sin.dtype != torch.float32 or not cos_sin.is_contiguous())
+            )
+        ):
+            return original(
+                qkv,
+                cos_sin,
+                position_ids,
+                num_q_heads,
+                num_kv_heads,
+                eps,
+                q_scale,
+                qkv_permuted,
+                enable_pdl=enable_pdl,
+                trigger_at_entry=trigger_at_entry,
+            )
+        qkv_out = torch.empty(
+            (rows, (num_q_heads + 2 * num_kv_heads) * 64), dtype=qkv.dtype, device=qkv.device
+        )
+        if qkv_permuted:
+            gate = qkv[:, (num_q_heads + 2 * num_kv_heads) * 64 :].view(rows, num_q_heads, 64)
+        else:
+            gate = qkv[:, : 2 * num_q_heads * 64].view(rows, num_q_heads, 2, 64)[:, :, 1, :]
+        positions = position_ids.reshape(-1) if cos_sin is not None else None
+        _preattn_prep_rows_vec_kernel[(triton.cdiv(rows, 16), num_q_heads + num_kv_heads)](
+            qkv,
+            qkv_out,
+            cos_sin,
+            positions,
+            rows,
+            qkv.stride(0),
+            qkv_out.stride(0),
+            eps,
+            q_scale,
+            NUM_Q_HEADS=num_q_heads,
+            NUM_KV_HEADS=num_kv_heads,
+            QKV_PERMUTED=qkv_permuted,
+            APPLY_ROPE=cos_sin is not None,
+            LAUNCH_WITH_PDL=enable_pdl,
+            BLOCK=16,
+            num_warps=4,
+            launch_pdl=enable_pdl,
+            **({"TRIGGER_AT_ENTRY": True} if enable_pdl and trigger_at_entry else {}),
+        )
+        return qkv_out, gate
+
+    return prep
+
+
 @triton.jit
 def _post_expert_norm_combine_sparse_kernel(
     out_ptr,  # [num_tokens, HIDDEN] fp32, or bf16/fp16 (rounded once at the store)
@@ -382,6 +699,7 @@ def _post_expert_norm_combine_sparse_kernel(
     TOP_K: tl.constexpr,
     HIDDEN: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    RELOAD_GAIN: tl.constexpr = False,
 ):
     """One program per token that visits only the slots local to this rank.
 
@@ -401,7 +719,8 @@ def _post_expert_norm_combine_sparse_kernel(
     token = tl.program_id(0)
     hoff = tl.arange(0, BLOCK_H)
     in_row = hoff < HIDDEN
-    gain = tl.load(norm_weight_ptr + hoff, mask=in_row, other=0.0).to(tl.float32) + 1.0
+    if not RELOAD_GAIN:
+        gain = tl.load(norm_weight_ptr + hoff, mask=in_row, other=0.0).to(tl.float32) + 1.0
     acc = tl.zeros([BLOCK_H], dtype=tl.float32)
     for slot in tl.static_range(TOP_K):
         index = tl.load(index_ptr + token * TOP_K + slot)
@@ -411,6 +730,15 @@ def _post_expert_norm_combine_sparse_kernel(
                 mask=in_row,
                 other=0.0,
             ).to(tl.float32)
+            if RELOAD_GAIN:
+                # The same gain, read from L1 per slot instead of held in registers across the slots: one more
+                # CTA per SM.
+                gain = (
+                    tl.load(norm_weight_ptr + hoff, mask=in_row, other=0.0, volatile=True).to(
+                        tl.float32
+                    )
+                    + 1.0
+                )
             scaled = row * gain
             variance = tl.sum(scaled * scaled, axis=0) / HIDDEN
             normed = scaled * tl.rsqrt(variance + eps)
@@ -456,6 +784,7 @@ def _sparse_post_expert_norm_combine(
         TOP_K=top_k,
         HIDDEN=hidden_size,
         BLOCK_H=triton.next_power_of_2(hidden_size),
+        RELOAD_GAIN=_CTX_FUSIONS,
         num_warps=_SPARSE_FINALIZE_NUM_WARPS,
     )
     return out
@@ -604,6 +933,9 @@ def _gated_residual_after_rmsnorm_kernel(
     HAS_GAIN: tl.constexpr,
     FUSE_NEXT_NORM: tl.constexpr,
     NORM_FP32_RESIDUAL: tl.constexpr,
+    cap_ptr=None,
+    cap_stride=0,
+    CAPTURE: tl.constexpr = False,
 ):
     """``alpha*residual + beta*rmsnorm(branch)`` for one token, in one kernel.
 
@@ -646,6 +978,11 @@ def _gated_residual_after_rmsnorm_kernel(
     beta = tl.load(beta_ptr + offs, mask=mask, other=0.0)
     updated = alpha * residual + beta * normed
     tl.store(out_ptr + base, updated, mask=mask)
+    if CAPTURE:
+        # DFlash's capture of this residual, ``updated.to(bfloat16)`` (RNE), into its buffer slice.
+        tl.store(
+            cap_ptr + token.to(tl.int64) * cap_stride + offs, updated.to(tl.bfloat16), mask=mask
+        )
     if FUSE_NEXT_NORM:
         if NORM_FP32_RESIDUAL:
             # Reference ordering: the next variance and normalization read the
@@ -660,6 +997,84 @@ def _gated_residual_after_rmsnorm_kernel(
         next_output = next_input * tl.rsqrt(next_variance + next_eps)
         next_output = next_output * (next_weight + 1.0)
         tl.store(next_out_ptr + base, next_output, mask=mask)
+
+
+@triton.jit
+def _gated_residual_rows_kernel(
+    out_ptr,
+    residual_ptr,
+    branch_ptr,
+    gain_ptr,
+    alpha_ptr,
+    beta_ptr,
+    eps,
+    next_out_ptr,
+    next_weight_ptr,
+    next_eps,
+    num_tokens,
+    HIDDEN: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    HAS_GAIN: tl.constexpr,
+    NORM_FP32_RESIDUAL: tl.constexpr,
+    cap_ptr=None,
+    cap_stride=0,
+    CAPTURE: tl.constexpr = False,
+    ROWS: tl.constexpr = 2,
+):
+    """``_gated_residual_after_rmsnorm_kernel`` with ``FUSE_NEXT_NORM``, ROWS tokens per program.
+
+    The per-feature vectors are loaded once per program and the next token's branch / residual rows are loaded
+    before the current token is reduced. Each token is computed by the built-in kernel's statements (same block,
+    loads, roundings and reductions), so the outputs are bit-identical.
+    """
+    offs = tl.arange(0, BLOCK_H)
+    mask = offs < HIDDEN
+    if HAS_GAIN:
+        gain = tl.load(gain_ptr + offs, mask=mask, other=0.0, eviction_policy="evict_last").to(
+            tl.float32
+        )
+    alpha = tl.load(alpha_ptr + offs, mask=mask, other=0.0, eviction_policy="evict_last")
+    beta = tl.load(beta_ptr + offs, mask=mask, other=0.0, eviction_policy="evict_last")
+    next_weight = tl.load(
+        next_weight_ptr + offs, mask=mask, other=0.0, eviction_policy="evict_last"
+    ).to(tl.float32)
+    t0 = tl.program_id(0) * ROWS
+    m0 = mask & (t0 < num_tokens)
+    base0 = t0.to(tl.int64) * HIDDEN + offs
+    branch = tl.load(branch_ptr + base0, mask=m0, other=0.0)
+    residual_raw = tl.load(residual_ptr + base0, mask=m0, other=0.0)
+    for r in tl.static_range(ROWS):
+        token = t0 + r
+        mrow = mask & (token < num_tokens)
+        base = token.to(tl.int64) * HIDDEN + offs
+        if r + 1 < ROWS:
+            # Prefetch the next token's rows while this one is reduced.
+            mnext = mask & (token + 1 < num_tokens)
+            nbranch = tl.load(branch_ptr + base + HIDDEN, mask=mnext, other=0.0)
+            nresidual = tl.load(residual_ptr + base + HIDDEN, mask=mnext, other=0.0)
+        scaled = branch.to(tl.float32)
+        if HAS_GAIN:
+            scaled = (scaled * gain).to(branch.dtype).to(tl.float32)
+        variance = tl.sum(scaled * scaled, axis=0) / HIDDEN
+        normed = (scaled * tl.rsqrt(variance + eps)).to(branch.dtype).to(tl.float32)
+        residual = residual_raw.to(tl.float32)
+        updated = alpha * residual + beta * normed
+        tl.store(out_ptr + base, updated, mask=mrow)
+        if CAPTURE:
+            tl.store(
+                cap_ptr + token.to(tl.int64) * cap_stride + offs, updated.to(tl.bfloat16), mask=mrow
+            )
+        if NORM_FP32_RESIDUAL:
+            next_input = updated
+        else:
+            next_input = updated.to(branch.dtype).to(tl.float32)
+        next_variance = tl.sum(next_input * next_input, axis=0) / HIDDEN
+        next_output = next_input * tl.rsqrt(next_variance + next_eps)
+        next_output = next_output * (next_weight + 1.0)
+        tl.store(next_out_ptr + base, next_output, mask=mrow)
+        if r + 1 < ROWS:
+            branch = nbranch
+            residual_raw = nresidual
 
 
 # Threads per program for the residual join, measured the same way the finalize's
@@ -1150,6 +1565,100 @@ def _full_routing_kernel(
 
 
 @triton.jit
+def _top8_routing_kernel(
+    logits,
+    bias,
+    selected,
+    weights,
+    eps,
+    EXPERTS: tl.constexpr,
+):
+    """``_full_routing_kernel`` with TORCH_ORDER, without the two sorts.
+
+    The keys are unique (expert-ID tie-break), so the 8 successive maxima are exactly the first 8 entries of the
+    descending sort. Of the second (ascending) sort only the first 8 entries are read; they are the 8 values
+    ``id + 256 * (ranked <= threshold)`` of those slots in ascending order (every other slot sorts at 512 + id), placed
+    here by rank. Entries 8..255 of ``ids`` are never read. From ``slots`` on the statements are the original's.
+    """
+    tl.static_assert(EXPERTS == 256)
+    row = tl.program_id(0)
+    expert = tl.arange(0, EXPERTS)
+    scores = tl.sigmoid(tl.load(logits + row * EXPERTS + expert))
+    ranked = scores + tl.load(bias + expert)
+    ranked = tl.where(ranked == 0.0, 0.0, ranked)
+    bits = ranked.to(tl.uint32, bitcast=True)
+    ordered = tl.where((bits >> 31) != 0, ~bits, bits ^ 0x80000000).to(tl.uint32)
+    keys = (ordered.to(tl.uint64) << 32) | (255 - expert).to(tl.uint64)
+    m0 = tl.max(keys, axis=0)
+    keys = tl.where(keys == m0, tl.zeros_like(keys), keys)
+    m1 = tl.max(keys, axis=0)
+    keys = tl.where(keys == m1, tl.zeros_like(keys), keys)
+    m2 = tl.max(keys, axis=0)
+    keys = tl.where(keys == m2, tl.zeros_like(keys), keys)
+    m3 = tl.max(keys, axis=0)
+    keys = tl.where(keys == m3, tl.zeros_like(keys), keys)
+    m4 = tl.max(keys, axis=0)
+    keys = tl.where(keys == m4, tl.zeros_like(keys), keys)
+    m5 = tl.max(keys, axis=0)
+    keys = tl.where(keys == m5, tl.zeros_like(keys), keys)
+    m6 = tl.max(keys, axis=0)
+    keys = tl.where(keys == m6, tl.zeros_like(keys), keys)
+    m7 = tl.max(keys, axis=0)
+    # threshold = ranked of the 8th key (decoded exactly from its upper word)
+    o7 = (m7 >> 32).to(tl.uint32)
+    t7 = tl.where((o7 >> 31) != 0, o7 ^ 0x80000000, ~o7).to(tl.uint32)
+    threshold = t7.to(tl.float32, bitcast=True)
+    v0 = _top8_order_value(m0, threshold)
+    v1 = _top8_order_value(m1, threshold)
+    v2 = _top8_order_value(m2, threshold)
+    v3 = _top8_order_value(m3, threshold)
+    v4 = _top8_order_value(m4, threshold)
+    v5 = _top8_order_value(m5, threshold)
+    v6 = _top8_order_value(m6, threshold)
+    v7 = _top8_order_value(m7, threshold)
+    ids = tl.zeros([EXPERTS], dtype=tl.int32)
+    ids = tl.where(expert == _top8_rank(v0, v0, v1, v2, v3, v4, v5, v6, v7), v0 % 256, ids)
+    ids = tl.where(expert == _top8_rank(v1, v0, v1, v2, v3, v4, v5, v6, v7), v1 % 256, ids)
+    ids = tl.where(expert == _top8_rank(v2, v0, v1, v2, v3, v4, v5, v6, v7), v2 % 256, ids)
+    ids = tl.where(expert == _top8_rank(v3, v0, v1, v2, v3, v4, v5, v6, v7), v3 % 256, ids)
+    ids = tl.where(expert == _top8_rank(v4, v0, v1, v2, v3, v4, v5, v6, v7), v4 % 256, ids)
+    ids = tl.where(expert == _top8_rank(v5, v0, v1, v2, v3, v4, v5, v6, v7), v5 % 256, ids)
+    ids = tl.where(expert == _top8_rank(v6, v0, v1, v2, v3, v4, v5, v6, v7), v6 % 256, ids)
+    ids = tl.where(expert == _top8_rank(v7, v0, v1, v2, v3, v4, v5, v6, v7), v7 % 256, ids)
+    slots = tl.arange(0, 8)
+    selected_ids = tl.gather(ids, slots, axis=0)
+    picked = tl.gather(scores, selected_ids, axis=0)
+    normalized = tl.div_rn(picked, tl.sum(picked, axis=0) + eps)
+    tl.store(selected + row * 8 + slots, selected_ids)
+    tl.store(weights + row * 8 + slots, normalized)
+
+
+@triton.jit
+def _top8_order_value(m, threshold):
+    """``id + 256 * (ranked <= threshold)`` of one extracted key (the original's second-sort value for slots < 8)."""
+    o = (m >> 32).to(tl.uint32)
+    b = tl.where((o >> 31) != 0, o ^ 0x80000000, ~o).to(tl.uint32)
+    ranked = b.to(tl.float32, bitcast=True)
+    ident = 255 - (m & 0xFFFFFFFF).to(tl.int32)
+    return ident + tl.where(ranked > threshold, 0, 256)
+
+
+@triton.jit
+def _top8_rank(v, v0, v1, v2, v3, v4, v5, v6, v7):
+    """Ascending position of ``v`` among the eight distinct values."""
+    return (
+        (v0 < v).to(tl.int32)
+        + (v1 < v).to(tl.int32)
+        + (v2 < v).to(tl.int32)
+        + (v3 < v).to(tl.int32)
+        + (v4 < v).to(tl.int32)
+        + (v5 < v).to(tl.int32)
+        + (v6 < v).to(tl.int32)
+        + (v7 < v).to(tl.int32)
+    )
+
+
+@triton.jit
 def _attention_norm_gate_kernel(
     out,
     attention,
@@ -1209,6 +1718,23 @@ class MuseSparkOpenRoutingMethod(MiniMaxM2MoeRoutingMethod):
         self._full_routing_torch_order = (
             os.getenv("MUSESPARK_OPEN_FULL_ROUTING_TORCH_ORDER", "0") == "1"
         )
+        # Static expert placement (``musespark_open_expert_placement``): maps the
+        # selected expert ids to the slots that hold them; None = identity.
+        self._slot_map = None
+
+    @property
+    def _routing_memo(self):
+        return self.__dict__.get("_routing_memo_value")
+
+    @_routing_memo.setter
+    def _routing_memo(self, memo) -> None:
+        """Every producer of the memo (``apply``, the sequence-parallel shard routing,
+        the decode MoE prologue) writes expert ids; under a static placement they are
+        stored as slot ids, once, here."""
+        slot_map = self.__dict__.get("_slot_map")
+        if memo is not None and slot_map is not None:
+            memo = (memo[0], memo[1], slot_map(memo[2]), *memo[3:])
+        self.__dict__["_routing_memo_value"] = memo
 
     @property
     def requires_separated_routing(self) -> bool:
@@ -1277,6 +1803,19 @@ class MuseSparkOpenRoutingMethod(MiniMaxM2MoeRoutingMethod):
                 (router_logits.shape[0], 8), device=router_logits.device, dtype=torch.int32
             )
             weights = torch.empty_like(selected, dtype=torch.float32)
+            torch_order = self._full_routing_torch_order and router_logits.shape[0] > 128
+            if _CTX_FUSIONS and torch_order:
+                _top8_routing_kernel[(router_logits.shape[0],)](
+                    router_logits,
+                    bias,
+                    selected,
+                    weights,
+                    self.renorm_eps,
+                    EXPERTS=256,
+                    num_warps=1 if router_logits.shape[0] >= 512 else 4,
+                )
+                self._routing_memo = (router_logits, version, selected, weights)
+                return selected, weights
             _full_routing_kernel[(router_logits.shape[0],)](
                 router_logits,
                 bias,
@@ -1288,14 +1827,14 @@ class MuseSparkOpenRoutingMethod(MiniMaxM2MoeRoutingMethod):
                 num_warps=1 if router_logits.shape[0] >= 512 else 4,
             )
             self._routing_memo = (router_logits, version, selected, weights)
-            return selected, weights
+            return self._routing_memo[2], weights
         scores, scores_with_bias = self.get_scores(router_logits, self.e_score_correction_bias)
         _, topk_idx = torch.topk(scores_with_bias, k=self.top_k, dim=-1, sorted=False)
         # Weights come from the *unbiased* scores; the bias only steers which
         # experts are picked.
         selected, weights = _routing_weights(scores, topk_idx, self.renorm_eps, self.output_dtype)
         self._routing_memo = (router_logits, version, selected, weights)
-        return selected, weights
+        return self._routing_memo[2], weights
 
 
 def _frozen_gate_cache_enabled() -> bool:
@@ -1391,6 +1930,10 @@ class MuseSparkOpenGatedResidual(nn.Module):
 
     TEMPERATURE = 0.3
     EPS = 1e-3
+    #: The layer's MoE, on an attention-side join of a context-fusions model
+    #: (``MUSESPARK_OPEN_CTX_FUSIONS``): the join of a large batch then also writes the
+    #: router's FP32 input and hands it to that MoE (``ctx_router_input``).
+    _router_input_moe = None
 
     def __init__(self, hidden_size: int, dtype: Optional[torch.dtype]):
         super().__init__()
@@ -1499,8 +2042,12 @@ class MuseSparkOpenGatedResidual(nn.Module):
         eps: float,
         next_norm: RMSNorm,
         gain: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        capture_out: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor] | Tuple[torch.Tensor, torch.Tensor, bool]:
         """Fuse a residual join with the next Gemma prenorm.
+
+        With ``capture_out`` the result is ``(updated, next_input, captured)``: ``captured`` is True when
+        the Triton kernel below also stored ``updated.to(capture_out.dtype)`` into ``capture_out``.
 
         Retain the branch-normalization and residual-to-BF16 rounding points.
         The next variance reduction may differ from FlashInfer's reduction order.
@@ -1508,6 +2055,17 @@ class MuseSparkOpenGatedResidual(nn.Module):
         by ``_preqkv_norm_fp32`` (see ``_preqkv_norm_fp32_residual_enabled``):
         set, all three arms norm the FP32 residual and round once on the output.
         """
+        moe = self._router_input_moe
+        if moe is not None and residual.shape[0] > 128:
+            from .._experimental.modeling_v2.models.musespark_open.muse_spark_open_816b_a42b_nvfp4__sm_103__tep.kernels.context_sequence_parallel.router_input import (  # noqa: E501
+                join_with_router_input,
+            )
+
+            joined = join_with_router_input(self, residual, branch, eps, next_norm, gain)
+            if joined is not None:
+                updated, next_input, router_input = joined
+                moe.ctx_router_input = (next_input, router_input)
+                return updated, next_input
         if not (
             self._fused_enabled
             and residual.is_cuda
@@ -1525,8 +2083,10 @@ class MuseSparkOpenGatedResidual(nn.Module):
         ):
             updated = self.add_after_rmsnorm(residual, branch, eps, gain)
             if self._preqkv_norm_fp32:
-                return updated, _rmsnorm_fp32_in(updated, next_norm)
-            return updated, next_norm(updated.to(branch.dtype))
+                result = updated, _rmsnorm_fp32_in(updated, next_norm)
+            else:
+                result = updated, next_norm(updated.to(branch.dtype))
+            return result if capture_out is None else (*result, False)
 
         alpha, beta = self.coefficients()
         if (
@@ -1537,7 +2097,7 @@ class MuseSparkOpenGatedResidual(nn.Module):
             from .musespark_open_boundary import cluster_boundary, cluster_boundary_supported
 
             if cluster_boundary_supported(residual, branch, gain, alpha, beta, next_norm.weight):
-                return cluster_boundary(
+                result = cluster_boundary(
                     residual,
                     branch,
                     gain,
@@ -1548,9 +2108,46 @@ class MuseSparkOpenGatedResidual(nn.Module):
                     next_norm.variance_epsilon,
                     norm_fp32_residual=self._preqkv_norm_fp32,
                 )
+                return result if capture_out is None else (*result, False)
         updated = torch.empty_like(residual)
         next_input = torch.empty_like(branch)
         hidden_size = residual.shape[-1]
+        capture = (
+            capture_out is not None
+            and capture_out.dtype == torch.bfloat16
+            and capture_out.shape == residual.shape
+            and capture_out.stride(-1) == 1
+            and capture_out.device == residual.device
+        )
+        cap_kwargs = (
+            dict(cap_ptr=capture_out, cap_stride=capture_out.stride(0), CAPTURE=True)
+            if capture
+            else {}
+        )
+        if _CTX_FUSIONS and residual.shape[0] > _JOIN_MIN_ROWS:
+            _gated_residual_rows_kernel[(triton.cdiv(residual.shape[0], _JOIN_ROWS),)](
+                updated,
+                residual,
+                branch,
+                gain if gain is not None else alpha,
+                alpha,
+                beta,
+                eps,
+                next_input,
+                next_norm.weight,
+                next_norm.variance_epsilon,
+                residual.shape[0],
+                HIDDEN=hidden_size,
+                BLOCK_H=triton.next_power_of_2(hidden_size),
+                HAS_GAIN=gain is not None,
+                NORM_FP32_RESIDUAL=self._preqkv_norm_fp32,
+                ROWS=_JOIN_ROWS,
+                num_warps=_RESIDUAL_NUM_WARPS,
+                **cap_kwargs,
+            )
+            if capture_out is None:
+                return updated, next_input
+            return updated, next_input, capture
         _gated_residual_after_rmsnorm_kernel[(residual.shape[0],)](
             updated,
             residual,
@@ -1568,8 +2165,11 @@ class MuseSparkOpenGatedResidual(nn.Module):
             FUSE_NEXT_NORM=True,
             NORM_FP32_RESIDUAL=self._preqkv_norm_fp32,
             num_warps=_RESIDUAL_NUM_WARPS,
+            **cap_kwargs,
         )
-        return updated, next_input
+        if capture_out is None:
+            return updated, next_input
+        return updated, next_input, capture
 
     def add_after_rmsnorm(
         self,
@@ -1739,6 +2339,35 @@ def _fused_preattention_enabled() -> bool:
         "yes",
         "on",
     )
+
+
+class SplitProjection:
+    """The overlapped output projection's reduced chunks, not yet joined (``_sp_tail_split``).
+
+    ``chunks()`` yields ``((lo, hi), reduced rows, event)``: rows ``[lo, hi)`` of this
+    rank's shard and the event of their reduce-scatter on ``stream``. The consumer waits
+    each event on its stream before reading the rows, and calls ``release`` once every
+    read is enqueued: that orders the next reuse of the reduced buffers (allocated on
+    ``stream``) after their consumption and drops the projection partials, which the
+    reduce-scatters read, only after the main stream has waited for all of them.
+    """
+
+    def __init__(self, results, events, partials, stream, bounds) -> None:
+        self.results = results
+        self.events = events
+        self._partials = partials
+        self.stream = stream
+        self.bounds = bounds
+
+    def chunks(self):
+        for index, (reduced, event) in enumerate(zip(self.results, self.events)):
+            yield (self.bounds[index], self.bounds[index + 1]), reduced, event
+
+    def release(self, main: torch.cuda.Stream) -> None:
+        for event in self.events:
+            main.wait_event(event)
+        self.stream.wait_stream(main)
+        self._partials = None
 
 
 class MuseSparkOpenAttention(QKNormRoPEAttention):
@@ -1945,17 +2574,28 @@ class MuseSparkOpenAttention(QKNormRoPEAttention):
         return reducescatter(partial, self.mapping, dim=0)
 
     def _overlap_sp_output_projection(self, attention_output: torch.Tensor) -> torch.Tensor:
-        """Project two chunks while reducing the preceding chunk to its token owners."""
+        """Project two chunks while reducing the preceding chunk to its token owners.
+
+        With ``_sp_tail_split`` set (by the decoder layer, for one call) the reduced
+        chunks are returned unjoined as a ``SplitProjection``: each with the event of its
+        reduce-scatter, so the caller can start on chunk ``c``'s rows while later chunks
+        are still being reduced.
+        """
         main = torch.cuda.current_stream(attention_output.device)
         if self._sp_projection_stream is None:
             self._sp_projection_stream = torch.cuda.Stream(device=attention_output.device)
         stream = self._sp_projection_stream
         padded = _pad_sequence_parallel_tokens(attention_output, self.mapping.tp_size)
         shard = padded.shape[0] // self.mapping.tp_size
-        split = (shard + 1) // 2
+        chunks = max(1, min(int(getattr(self, "_sp_projection_chunks", 2)), shard))
+        # Chunk c covers rows [ceil(c * shard / chunks), ceil((c + 1) * shard / chunks)) of
+        # every owner's shard; two chunks split at (shard + 1) // 2 as before.
+        bounds = [-(-shard * c // chunks) for c in range(chunks + 1)]
         results = []
         partials = []
-        for begin, end in ((0, split), (split, shard)):
+        events = []
+        split = getattr(self, "_sp_tail_split", False)
+        for begin, end in zip(bounds[:-1], bounds[1:]):
             # Each collective must see owner-major rows. Splitting the original
             # tensor in half would send rows to the wrong rank.
             packed = torch.cat(
@@ -1969,11 +2609,17 @@ class MuseSparkOpenAttention(QKNormRoPEAttention):
             stream.wait_stream(main)
             with torch.cuda.stream(stream):
                 reduced = reducescatter(partial, self.mapping, dim=0)
+                if split:
+                    event = torch.cuda.Event()
+                    event.record(stream)
+                    events.append(event)
             # Keep main-stream allocations alive through the final join. Their
             # next reuse on main is then ordered after the collective, without
             # record_stream delaying allocator reuse until CPU event polling.
             partials.append(partial)
             results.append(reduced)
+        if split:
+            return SplitProjection(results, events, partials, stream, bounds)
         main.wait_stream(stream)
         output = torch.cat(results, dim=0)
         # Results were allocated on stream but consumed by cat on main. Order
@@ -2096,6 +2742,10 @@ class MuseSparkOpenMoE(nn.Module):
     RMSNorm is nonlinear, so normalizing the already-combined result is a
     different model.
     """
+
+    #: ``(norm output, its FP32 widening)`` left by the layer's attention-side join
+    #: (``MuseSparkOpenGatedResidual._router_input_moe``); consumed or dropped by the next call.
+    ctx_router_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
 
     def __init__(
         self,
@@ -2261,6 +2911,26 @@ class MuseSparkOpenMoE(nn.Module):
         # finalize + all-reduce path lives. ``comm`` is decided in the
         # ConfigurableMoE constructor; the only later reassignment swaps one
         # strategy for another, never between None and a strategy.
+        from . import musespark_open_expert_placement as _placement
+
+        self.expert_slots = None
+        placed = (_placement.placement_table(self.num_experts) or {}).get(layer_idx)
+        if placed is not None:
+            if layer_quant_config is not None:
+                raise ValueError(
+                    f"[musespark_open] expert placement: layer {layer_idx} keeps BF16 experts "
+                    "(quant-excluded); only NVFP4 expert layers can be placed"
+                )
+            if not pure_ep or self.mapping.moe_ep_size * 64 != self.num_experts:
+                raise ValueError(
+                    "[musespark_open] expert placement needs EP4 with 64 experts per rank, got "
+                    f"moe_ep_size {self.mapping.moe_ep_size}, moe_tp_size {self.mapping.moe_tp_size}"
+                )
+            _placement.apply_to_experts(
+                self.experts, placed, self.mapping.moe_ep_rank, self.mapping.moe_ep_size
+            )
+            self.expert_slots = list(placed)
+            self.experts.routing_method._slot_map = _placement.SlotMap(placed)
         if getattr(self.experts, "comm", None) is not None:
             self.experts.unfinalized_combine_fn = self.finalize
         # An explicit strategy, not the AUTO default. AUTO routes through
@@ -2310,7 +2980,9 @@ class MuseSparkOpenMoE(nn.Module):
             projected = torch.nn.functional.linear(hidden_states, weight)
         return workspace.gather(projected)
 
-    def router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def router_logits(
+        self, hidden_states: torch.Tensor, router_input_f32: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """FP32 router logits, scaled by the metap multiplier before routing."""
         weight = getattr(self.router, "weight", None)
         if (
@@ -2400,6 +3072,9 @@ class MuseSparkOpenMoE(nn.Module):
                 enable_fp_fusion=False,
             )
             return output
+        if router_input_f32 is not None and router_input_f32.shape == hidden_states.shape:
+            # == hidden_states.to(torch.float32) bit for bit (written by the join kernel)
+            return self.router(router_input_f32) * self.metap_multiplier
         return self.router(hidden_states.to(torch.float32)) * self.metap_multiplier
 
     def prepare_expert_input(self, pooled: torch.Tensor) -> torch.Tensor | Fp4QuantizedTensor:
@@ -2442,7 +3117,9 @@ class MuseSparkOpenMoE(nn.Module):
         )
         return Fp4QuantizedTensor(fp4.view(torch.uint8), sf.view(torch.uint8), is_sf_swizzled=False)
 
-    def prepare_moe_inputs(self, hidden_states: torch.Tensor):
+    def prepare_moe_inputs(
+        self, hidden_states: torch.Tensor, router_input_f32: Optional[torch.Tensor] = None
+    ):
         """Overlap small-batch pooling with router preparation."""
         overlap = (
             getattr(self, "_prepare_stream", None) is not None
@@ -2457,7 +3134,10 @@ class MuseSparkOpenMoE(nn.Module):
         if overlap:
             self._prepare_stream.wait_stream(main_stream)
         with self.nvtx("router"):
-            router_logits = self.router_logits(hidden_states)
+            if router_input_f32 is None:
+                router_logits = self.router_logits(hidden_states)
+            else:
+                router_logits = self.router_logits(hidden_states, router_input_f32)
             if overlap:
                 # The backend consumes the same memoized tensors. Replacement
                 # logits (padding/chunking) still miss the memo and recompute.
@@ -2549,8 +3229,14 @@ class MuseSparkOpenMoE(nn.Module):
         num_tokens = hidden_states.shape[0] if sp_num_tokens is None else sp_num_tokens
         finalize_ar_used = False
         routing_method = self.experts.routing_method
+        handed = getattr(self, "ctx_router_input", None)
+        if handed is not None:
+            self.ctx_router_input = None
         if sp_num_tokens is None:
-            router_logits, pooled = self.prepare_moe_inputs(hidden_states)
+            if handed is None or handed[0] is not hidden_states:
+                router_logits, pooled = self.prepare_moe_inputs(hidden_states)
+            else:
+                router_logits, pooled = self.prepare_moe_inputs(hidden_states, handed[1])
         else:
             if getattr(self.experts, "comm", None) is not None:
                 raise ValueError("Prefill sequence parallelism requires MoE without external comm")
@@ -2730,6 +3416,15 @@ class MuseSparkOpenDecoderLayer(DecoderLayer):
     #: rows``; None (the default) runs the NCCL all-gather. A model-specific path may set it
     #: on a layer, together with a QKV projection that consumes what it returns.
     _sp_attn_input_gather = None
+    #: The sequence-parallel arm's attention-side tail, ``(layer, residual, SplitProjection)
+    #: -> (residual, ffn_input)``: joins and prepares the MoE input chunk by chunk while
+    #: the output projection's later chunks are still being reduced. None (the default)
+    #: joins the whole shard once the projection is reduced.
+    _sp_tail_pipeline = None
+    #: The fewest rows of a sequence-parallel step whose output projection the overlap
+    #: (``MUSESPARK_OPEN_OVERLAP_SP_PROJECTION``) takes. A model-specific path may set it on a
+    #: layer; the default is the switch's documented threshold.
+    _overlap_sp_projection_min_rows = 8192
 
     def __init__(
         self,
@@ -2748,6 +3443,14 @@ class MuseSparkOpenDecoderLayer(DecoderLayer):
         self.self_attn._sp_projection_stream = aux_stream
         self._overlap_sp_projection_enabled = (
             os.getenv("MUSESPARK_OPEN_OVERLAP_SP_PROJECTION", "0") == "1"
+        )
+        # Also overlap in captured steps (the served prefill graph); default off.
+        self._overlap_sp_projection_graph = (
+            self._overlap_sp_projection_enabled
+            and os.getenv("MUSESPARK_OPEN_OVERLAP_SP_PROJECTION_GRAPH", "0") == "1"
+        )
+        self.self_attn._sp_projection_chunks = int(
+            os.getenv("MUSESPARK_OPEN_OVERLAP_SP_PROJECTION_CHUNKS", "2")
         )
         self._pad_sp_projection_enabled = os.getenv("MUSESPARK_OPEN_PAD_SP_PROJECTION", "0") == "1"
         self.feed_forward = MuseSparkOpenMoE(model_config, layer_idx, aux_stream)
@@ -2822,12 +3525,28 @@ class MuseSparkOpenDecoderLayer(DecoderLayer):
                 attn_input = self.pre_qkv_proj_norm(hidden_states.to(self.dtype))
         # The attention projection and its TP reduction stay in this range.
         with self.nvtx("attn"):
+            capturing = torch.cuda.is_current_stream_capturing()
             overlap_projection = (
                 sp_num_tokens is not None
-                and sp_num_tokens >= 8192
+                and sp_num_tokens >= self._overlap_sp_projection_min_rows
                 and self._overlap_sp_projection_enabled
-                and not torch.cuda.is_current_stream_capturing()
+                and (
+                    not capturing
+                    # In a capture only with a projection stream made before it: a
+                    # stream is never created while capturing.
+                    or (
+                        getattr(self, "_overlap_sp_projection_graph", False)
+                        and getattr(self.self_attn, "_sp_projection_stream", None) is not None
+                    )
+                )
             )
+            if overlap_projection and capturing:
+                logger.info_once(
+                    "[musespark_open] MUSESPARK_OPEN_OVERLAP_SP_PROJECTION_GRAPH: output projection "
+                    f"overlapped in {getattr(self.self_attn, '_sp_projection_chunks', 2)} chunks "
+                    f"in a captured step of {sp_num_tokens} rows",
+                    key="musespark_open.overlap_sp_projection_graph",
+                )
             pad_projection = (
                 sp_num_tokens is not None
                 and self._pad_sp_projection_enabled
@@ -2840,14 +3559,19 @@ class MuseSparkOpenDecoderLayer(DecoderLayer):
                 else:
                     attn_input = gather(attn_input, sp_num_tokens)
                 kwargs = dict(kwargs, all_reduce_params=AllReduceParams(enable_allreduce=False))
-            attn_out = self.self_attn(
-                position_ids=position_ids,
-                hidden_states=attn_input,
-                attn_metadata=attn_metadata,
-                overlap_sp_output_projection=overlap_projection,
-                pad_sp_output_projection=pad_projection,
-                **kwargs,
-            )
+            tail = self._sp_tail_pipeline if overlap_projection else None
+            self.self_attn._sp_tail_split = tail is not None
+            try:
+                attn_out = self.self_attn(
+                    position_ids=position_ids,
+                    hidden_states=attn_input,
+                    attn_metadata=attn_metadata,
+                    overlap_sp_output_projection=overlap_projection,
+                    pad_sp_output_projection=pad_projection,
+                    **kwargs,
+                )
+            finally:
+                self.self_attn._sp_tail_split = False
             if sp_num_tokens is not None and not (overlap_projection or pad_projection):
                 attn_out = reducescatter(
                     _pad_sequence_parallel_tokens(attn_out, self.mapping.tp_size),
@@ -2861,17 +3585,41 @@ class MuseSparkOpenDecoderLayer(DecoderLayer):
         # prep branch's separate post_attn_norm and add_attn, because there is
         # no longer a boundary between them to annotate.
         with self.nvtx("norm_add_attn"):
-            hidden_states, ffn_input = self.add_attn._add_after_rmsnorm_and_norm(
-                hidden_states, attn_out, self.post_attn_norm.variance_epsilon, self.pre_ffn_norm
-            )
+            if isinstance(attn_out, SplitProjection):
+                hidden_states, ffn_input = self._sp_tail_pipeline(self, hidden_states, attn_out)
+            else:
+                hidden_states, ffn_input = self.add_attn._add_after_rmsnorm_and_norm(
+                    hidden_states, attn_out, self.post_attn_norm.variance_epsilon, self.pre_ffn_norm
+                )
         with self.nvtx("moe"):
             if sp_num_tokens is None:
                 ffn_out = self.feed_forward(ffn_input, attn_metadata)
             else:
                 ffn_out = self.feed_forward(ffn_input, attn_metadata, sp_num_tokens=sp_num_tokens)
+        captured = False
         with self.nvtx("norm_add_ffn"):
             next_attn_input = None
-            if next_layer_norm is not None:
+            capture_out = None
+            # Not on a join a modeling_v2 target re-classed (its override takes no capture_out).
+            if (
+                _CTX_FUSIONS
+                and next_layer_norm is not None
+                and sp_num_tokens is None
+                and type(self.add_ffn) is MuseSparkOpenGatedResidual
+            ):
+                capture_out = _capture_slice(
+                    kwargs.get("spec_metadata"), self.layer_idx, hidden_states
+                )
+            if next_layer_norm is not None and capture_out is not None:
+                hidden_states, next_attn_input, captured = self.add_ffn._add_after_rmsnorm_and_norm(
+                    hidden_states,
+                    ffn_out,
+                    self.post_ffn_norm.variance_epsilon,
+                    next_layer_norm,
+                    self.post_ffn_norm.gain(),
+                    capture_out=capture_out,
+                )
+            elif next_layer_norm is not None:
                 hidden_states, next_attn_input = self.add_ffn._add_after_rmsnorm_and_norm(
                     hidden_states,
                     ffn_out,
@@ -2888,7 +3636,7 @@ class MuseSparkOpenDecoderLayer(DecoderLayer):
                 )
         # DFlash captures the FP32 residual, independently of prenorm carry.
         spec_metadata = kwargs.get("spec_metadata")
-        if spec_metadata is not None:
+        if spec_metadata is not None and not captured:
             spec_metadata.maybe_capture_hidden_states(self.layer_idx, hidden_states, None)
         if next_attn_input is not None:
             return hidden_states, next_attn_input
@@ -2930,6 +3678,9 @@ class MuseSparkOpenModel(DecoderModel):
     #: Rows the MNNVL all-reduce workspaces are sized for at the first eager forward
     #: under prefill sequence parallelism; None once reserved, or with the split off.
     _mnnvl_reserve_tokens: Optional[int] = None
+    #: The modeling_v2 target's context_prep op for context steps (MUSESPARK_OPEN_CTX_FUSIONS=1),
+    #: or False; None until the first forward decides.
+    _context_prep = None
 
     def __init__(self, model_config: ModelConfig[MuseSparkOpenConfig]):
         super().__init__(model_config)
@@ -3062,6 +3813,32 @@ class MuseSparkOpenModel(DecoderModel):
         )
         self.dtype = config.torch_dtype
 
+    def _install_context_prep(self):
+        """The TEP4 modeling_v2 target's ``context_prep`` for every layer, or False.
+
+        With ``MUSESPARK_OPEN_CTX_FUSIONS=1`` the attention modules are re-classed as the
+        target's ``MuseSparkOpenTepAttention`` and context steps run its
+        ``preattn_prep`` op: the pre-attention prep chain (query / gate split, the
+        per-head norms, the query pre-scale, RoPE, the concat) in one launch,
+        bit-identical to the built-in chain. Above 512 rows the op runs vectorized.
+        Each attention-side join is also pointed at its layer's MoE
+        (``MuseSparkOpenGatedResidual._router_input_moe``).
+        """
+        if not _CTX_FUSIONS:
+            return False
+        from .._experimental.modeling_v2.models.musespark_open.muse_spark_open_816b_a42b_nvfp4__sm_103__tep import (  # noqa: E501
+            attention as _v2_attention,
+        )
+        from .._experimental.modeling_v2.models.musespark_open.muse_spark_open_816b_a42b_nvfp4__sm_103__tep.ops.attention import (  # noqa: E501
+            preattn_prep as _v2_prep,
+        )
+
+        for layer in self.layers:
+            _v2_attention.MuseSparkOpenTepAttention.adopt(layer.self_attn)
+            # A plain attribute: nn.Module.__setattr__ would register the MoE as a child of the join.
+            object.__setattr__(layer.add_attn, "_router_input_moe", layer.feed_forward)
+        return _vectorized_preattn_prep(_v2_prep.preattn_prep)
+
     def _reserve_mnnvl_workspaces_once(self) -> None:
         """Reserve the MNNVL all-reduce workspaces before the first CUDA graph capture.
 
@@ -3111,6 +3888,12 @@ class MuseSparkOpenModel(DecoderModel):
             embeds = embeds.narrow(0, mapping.tp_rank * shard_size, shard_size)
         # FP32 residual stream, entered once.
         hidden_states = embeds.to(torch.float32)
+
+        context_prep = self._context_prep
+        if context_prep is None:
+            context_prep = self._context_prep = self._install_context_prep()
+        if context_prep is not False and attn_metadata.num_contexts > 0:
+            kwargs = dict(kwargs, context_prep=context_prep)
 
         precomputed_attn_input = None
         for index, decoder_layer in enumerate(self.layers):

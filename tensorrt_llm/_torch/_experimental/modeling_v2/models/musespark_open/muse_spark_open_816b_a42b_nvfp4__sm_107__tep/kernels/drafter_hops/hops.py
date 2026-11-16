@@ -45,6 +45,77 @@ from ...ops.allreduce import drafter_hop as _hop
 #: The projection keyword of a hop site: return the partial, the hop all-reduces it.
 _NO_ALLREDUCE = AllReduceParams(enable_allreduce=False)
 
+#: ``tep8_wide_max_rows`` (``configure``; ``wide_drafter_hops__TEP8_MAX_ROWS``): the rows of a TP8
+#: drafter's wide workspace (``install_wide``) when above the device's served rows
+#: (``drafter_hop.wide_served_rows``, 64 on Rubin); the default 64 keeps the served rows. Above
+#: them, TP8 drafter forwards of 65..TEP8_WIDE_MAX_ROWS rows (9..16 requests at K = 7) take the
+#: fused one-shot hop instead of the built-in two-shot all-reduce + convolution + fused
+#: add-RMSNorm: the same kernel and transport as 9..64 rows (it takes up to ``WIDE_MAX_ROWS``
+#: rows), on a workspace of that many rows. TP4 keeps the served rows.
+TEP8_WIDE_MAX_ROWS = 64
+#: The band of ``tep8_wide_max_rows``: 64..128 (decode steps of up to 16 requests).
+TEP8_WIDE_ROWS_BAND = (64, 128)
+#: ``tep8_two_shot_min_rows`` (``configure``; ``wide_drafter_hops__TEP8_TWO_SHOT_MIN_ROWS``): TP8 drafter forwards of
+#: at least this many rows (up to ``TWO_SHOT_MAX_ROWS``) take the fused hop on its two-shot by column slice
+#: (``drafter_hop`` ``two_shot``: each rank reduces, convolves, adds and sums the squares of its own columns, then
+#: multicasts the FP32 ``h`` and its chain sums; the same statements, so bit for bit the one-shot hop) on a workspace
+#: of its own; 0 (default): none. Above the one-shot's band (65..128 rows) it replaces the built-in two-shot
+#: all-reduce + finish convolution + fused add-RMSNorm.
+TEP8_TWO_SHOT_MIN_ROWS = 0
+TWO_SHOT_MAX_ROWS = 128
+#: ``tep8_two_shot_max_rows`` (``configure``; ``wide_drafter_hops__TEP8_TWO_SHOT_MAX_ROWS``): the most rows a forward
+#: takes the two-shot fused hop at (its workspace keeps ``TWO_SHOT_MAX_ROWS`` rows, the gated build); 128
+#: (default): the whole band. vrg-zdf: at 96 / 128 rows the fused two-shot (16.0 / 18.4 us per hop) is slower
+#: than the built-in two-shot + convolution + add-RMSNorm it replaces there; at 25..64 rows it replaces the
+#: one-shot fused hop (-0.7 / -3.2 us per hop at 32 / 64 rows).
+TEP8_TWO_SHOT_MAX_ROWS = TWO_SHOT_MAX_ROWS
+
+
+def configure(
+    *,
+    tep8_wide_max_rows: int = 64,
+    tep8_two_shot_min_rows: int = 0,
+    tep8_two_shot_max_rows: int = 128,
+) -> None:
+    """Set ``TEP8_WIDE_MAX_ROWS``, ``TEP8_TWO_SHOT_MIN_ROWS`` and ``TEP8_TWO_SHOT_MAX_ROWS``. ``lever_settings.apply``
+    sets them from the model's plan before any install.
+
+    Raises:
+        ValueError: for a value outside ``TEP8_WIDE_ROWS_BAND`` / 0 or 9..``TWO_SHOT_MAX_ROWS`` /
+            9..``TWO_SHOT_MAX_ROWS`` and not below the minimum; nothing is set then.
+    """
+    global TEP8_WIDE_MAX_ROWS, TEP8_TWO_SHOT_MIN_ROWS, TEP8_TWO_SHOT_MAX_ROWS
+    rows = int(tep8_wide_max_rows)
+    low, high = TEP8_WIDE_ROWS_BAND
+    if not low <= rows <= high:
+        raise ValueError(
+            f"[musespark_open] drafter_hops: tep8_wide_max_rows must be in {low}..{high}, got "
+            f"{tep8_wide_max_rows}"
+        )
+    two = int(tep8_two_shot_min_rows)
+    if two != 0 and not 9 <= two <= TWO_SHOT_MAX_ROWS:
+        raise ValueError(
+            "[musespark_open] drafter_hops: tep8_two_shot_min_rows must be 0 or in "
+            f"9..{TWO_SHOT_MAX_ROWS} (wide_drafter_hops__TEP8_TWO_SHOT_MIN_ROWS), got {tep8_two_shot_min_rows}"
+        )
+    top = int(tep8_two_shot_max_rows)
+    if not 9 <= top <= TWO_SHOT_MAX_ROWS or (two and top < two):
+        raise ValueError(
+            f"[musespark_open] drafter_hops: tep8_two_shot_max_rows must be in 9..{TWO_SHOT_MAX_ROWS} and not below "
+            f"tep8_two_shot_min_rows {two} (wide_drafter_hops__TEP8_TWO_SHOT_MAX_ROWS), got {tep8_two_shot_max_rows}"
+        )
+    TEP8_WIDE_MAX_ROWS = rows
+    TEP8_TWO_SHOT_MIN_ROWS = two
+    TEP8_TWO_SHOT_MAX_ROWS = top
+
+
+def wide_rows(served: int, tp_size: int) -> int:
+    """The rows of the wide workspace of a drafter on a TP group of ``tp_size``, the device serving
+    ``served`` (``drafter_hop.wide_served_rows``): ``TEP8_WIDE_MAX_ROWS`` at TP8 when above it."""
+    if tp_size == 8 and TEP8_WIDE_MAX_ROWS > served:
+        return TEP8_WIDE_MAX_ROWS
+    return served
+
 
 class DrafterHopCall:
     """What the drafter holds for its fused hops: the workspace, the per-site modules, the mode."""
@@ -53,6 +124,11 @@ class DrafterHopCall:
         self.workspace = workspace
         #: The wide workspace (``wide_drafter_hops``), or None.
         self.wide: Optional["_hop.DrafterHopWorkspace"] = None
+        #: The two-shot workspace (``TEP8_TWO_SHOT_MIN_ROWS``) and its first row count, or None.
+        self.two_shot: Optional["_hop.DrafterHopWorkspace"] = None
+        self.two_shot_min_rows = 0
+        #: The two-shot's last row count (``TEP8_TWO_SHOT_MAX_ROWS``; its workspace holds ``TWO_SHOT_MAX_ROWS``).
+        self.two_shot_max_rows = 0
         #: The workspace of the forward ``takes`` admitted last.
         self.active = workspace
         #: Hops issued by this rank (a test counts them to see a forward took the fused path).
@@ -65,6 +141,9 @@ class DrafterHopCall:
             return False
         if rows <= _hop.MAX_ROWS:
             self.active = self.workspace
+            return True
+        if self.two_shot is not None and self.two_shot_min_rows <= rows <= self.two_shot_max_rows:
+            self.active = self.two_shot
             return True
         if self.wide is not None and rows <= self.wide.max_rows:
             self.active = self.wide
@@ -394,7 +473,8 @@ def install_wide(draft_model: Optional[nn.Module], mapping=None) -> None:
     norms = [layer.post_attention_layernorm for layer in layers]
     norms += [layer.input_layernorm for layer in layers[1:]] + [draft_model.model.norm]
     eps = sorted({float(norm.variance_epsilon) for norm in norms})
-    rows = _hop.wide_served_rows()
+    # wide_drafter_hops__TEP8_MAX_ROWS: a TP8 drafter's workspace may serve more rows.
+    rows = wide_rows(_hop.wide_served_rows(), layers[0].self_attn.o_proj.mapping.tp_size)
     call.wide = _hop.DrafterHopWorkspace(
         layers[0].self_attn.o_proj.mapping,
         sites=narrow.sites,
@@ -408,3 +488,22 @@ def install_wide(draft_model: Optional[nn.Module], mapping=None) -> None:
         f"{rows} rows ({call.wide.areas} areas, "
         f"{call.wide.nbytes() / 2**20:.1f} MiB of fabric memory on this rank)"
     )
+    tp_size = layers[0].self_attn.o_proj.mapping.tp_size
+    if TEP8_TWO_SHOT_MIN_ROWS and tp_size == 8 and call.two_shot is None:
+        call.two_shot = _hop.DrafterHopWorkspace(
+            layers[0].self_attn.o_proj.mapping,
+            sites=narrow.sites,
+            eps=eps,
+            early_trigger=narrow.early_trigger,
+            pre_wait=[tensor for _, tensor in pre_wait_operands(draft_model)],
+            max_rows=TWO_SHOT_MAX_ROWS,
+            two_shot=True,
+        )
+        call.two_shot_min_rows = TEP8_TWO_SHOT_MIN_ROWS
+        call.two_shot_max_rows = min(TEP8_TWO_SHOT_MAX_ROWS, call.two_shot.max_rows)
+        logger.info(
+            f"[musespark_open] wide_drafter_hops: two-shot fused drafter hops on forwards of "
+            f"{TEP8_TWO_SHOT_MIN_ROWS}..{call.two_shot_max_rows} rows ({call.two_shot.areas} areas, "
+            f"{call.two_shot.nbytes() / 2**20:.1f} MiB of fabric memory on this rank; "
+            "wide_drafter_hops__TEP8_TWO_SHOT_MIN_ROWS)"
+        )

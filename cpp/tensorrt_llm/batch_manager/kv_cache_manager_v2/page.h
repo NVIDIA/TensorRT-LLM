@@ -50,9 +50,10 @@ public:
     StorageManager* manager;
     LifeCycleId lifeCycle;
     CacheLevel cacheLevel;
-    // Immutable: PrioritizedEvictionPolicy locates a scheduled page's sub-queue by this value,
-    // so changing it while the page is scheduled would erase from the wrong list.
-    Priority const priority;
+    // PrioritizedEvictionPolicy locates a scheduled page's sub-queue by this value, so changing it
+    // while the page is scheduled would erase from the wrong list. Change it only through
+    // StorageManager::setPriority(), which re-queues a scheduled page under the new value.
+    Priority priority;
     WeakPtr<PageHolder> holder;     // empty → DROPPABLE
     std::optional<NodeRef> nodeRef; // present → scheduled for eviction
 

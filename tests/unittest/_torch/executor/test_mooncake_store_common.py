@@ -16,7 +16,7 @@
 
 Covers how a block of tokens becomes a store key, how the JSON config is read,
 the address a rank registers its segment under, and the pinned host slots
-every page passes through.
+pages pass through where GPUDirect RDMA is unavailable.
 
 Runs without a Mooncake installation: the store handle is replaced by an
 in-process fake that records what it was handed.
@@ -28,6 +28,7 @@ from types import SimpleNamespace
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import config as config_module
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import keys as keys_module
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import staging as staging_module
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import (
     MooncakeStoreConnectorConfig,
@@ -185,6 +186,33 @@ def test_reuse_scope_fields_cannot_be_confused_for_one_another():
     assert len(seeds) == 6
 
 
+@pytest.mark.parametrize(
+    "tokens",
+    [
+        list(range(5 * TOKENS_PER_BLOCK + 3)),
+        [-1, 0, 2**31, -(2**63), 2**63 - 1] * TOKENS_PER_BLOCK,
+    ],
+)
+def test_hash_chain_packed_encoding_matches_per_token_encoding(tokens, monkeypatch):
+    """Both token encodings name the same keys, so the kill switch cannot split a cache."""
+    scope = ReuseScope(cache_salt="tenant-a")
+    monkeypatch.setattr(keys_module, "_PACK_TOKENS", False)
+    per_token = list(BlockHashChain(TOKENS_PER_BLOCK, scope=scope).extend(tokens))
+    incremental_per_token = BlockHashChain(TOKENS_PER_BLOCK, scope=scope)
+    incremental_per_token.extend(tokens[: 2 * TOKENS_PER_BLOCK + 1])
+    monkeypatch.setattr(keys_module, "_PACK_TOKENS", True)
+    packed = list(BlockHashChain(TOKENS_PER_BLOCK, scope=scope).extend(tokens))
+    assert packed == per_token
+    assert list(incremental_per_token.extend(tokens)) == per_token
+
+
+def test_hash_chain_packed_encoding_rejects_out_of_range_tokens(monkeypatch):
+    for pack in (False, True):
+        monkeypatch.setattr(keys_module, "_PACK_TOKENS", pack)
+        with pytest.raises(OverflowError):
+            BlockHashChain(TOKENS_PER_BLOCK).extend([2**63] * TOKENS_PER_BLOCK)
+
+
 def test_hash_chain_rejects_shrinking_token_list():
     chain = BlockHashChain(TOKENS_PER_BLOCK)
     chain.extend(list(range(2 * TOKENS_PER_BLOCK)))
@@ -242,16 +270,17 @@ def set_pool_setting(store_config, **settings):
 
 
 def test_config_reads_sizes_and_staging_from_the_json(store_config):
-    """Sizes arrive as unit strings, and every page is staged through host."""
+    """Sizes arrive as unit strings, and staging is off until the JSON asks."""
     config = resolve_config()
     assert config.global_segment_size == 1024**3
     assert config.local_buffer_size == 256 * 1024**2
     assert config.role is StoreRole.BOTH
     assert config.resolve_model_key("/models/ignored") == "test-model"
-    assert config.stage_through_host is True
+    assert config.stage_through_host is False
 
-    # A config asking for the unsupported path is served by staging anyway.
-    set_pool_setting(store_config, stage_through_host=False)
+    raw = json.loads(store_config.read_text())
+    raw["stage_through_host"] = True
+    store_config.write_text(json.dumps(raw))
 
     config = resolve_config()
     assert config.stage_through_host is True
@@ -288,6 +317,49 @@ def test_config_rejects_a_role_it_does_not_have(store_config):
 
     with pytest.raises(ValueError, match="not one of"):
         resolve_config()
+
+
+#: Each one turns asynchronous loads off wherever it is set to 1.
+DISABLE_ASYNC_LOAD_VARIABLES = (
+    config_module.DISABLE_ASYNC_LOAD_ENV,
+    *config_module.DISABLE_ASYNC_LOAD_ENV_ALIASES,
+)
+
+
+@pytest.mark.parametrize(
+    "async_load, attention_dp, world_size, expected",
+    [
+        # Unset: on where one rank owns a parked request's pages, off under TP.
+        (None, False, 1, True),
+        (None, True, 4, True),
+        (None, False, 2, False),
+        # Asked for: tensor parallelism loads each rank's shard asynchronously.
+        (True, False, 2, True),
+        (True, True, 4, True),
+        (False, False, 1, False),
+    ],
+)
+def test_config_resolves_asynchronous_loads(
+    store_config, monkeypatch, async_load, attention_dp, world_size, expected
+):
+    for variable in DISABLE_ASYNC_LOAD_VARIABLES:
+        monkeypatch.delenv(variable, raising=False)
+    set_pool_setting(store_config, async_load=async_load)
+    assert resolve_config().resolve_async_load(attention_dp, world_size) is expected
+
+
+@pytest.mark.parametrize("variable", DISABLE_ASYNC_LOAD_VARIABLES)
+def test_config_environment_turns_asynchronous_loads_off_under_tensor_parallelism_too(
+    store_config, monkeypatch, variable
+):
+    set_pool_setting(store_config, async_load=True)
+    monkeypatch.setenv(variable, "1")
+    assert resolve_config().resolve_async_load(False, 2) is False
+
+
+def test_config_never_loads_asynchronously_for_a_role_that_does_not_read(store_config):
+    set_pool_setting(store_config, async_load=True, role="producer")
+    assert resolve_config().resolve_async_load(False, 2) is False
 
 
 def test_config_needs_a_pool_described_somewhere(monkeypatch):

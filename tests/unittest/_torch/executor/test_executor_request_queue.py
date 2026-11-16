@@ -332,6 +332,68 @@ def test_get_from_request_queue_async_behavior(executor_queue):
     thread.join()
 
 
+def _fetch_in_thread(executor_queue, timeout):
+    """Run one fetch on a daemon thread; returns (thread, items)."""
+    items = []
+    thread = threading.Thread(target=lambda: items.extend(
+        executor_queue.get_from_request_queue(timeout)),
+                              daemon=True)
+    thread.start()
+    return thread, items
+
+
+def _fill_to_max_batch(executor_queue, first_id):
+    # The batch wait ends once max_batch_size (8) items are in, so a waiting
+    # fetch returns without depending on the 60 s timeout.
+    for request_id in range(first_id, 9):
+        executor_queue.request_queue.put(RequestQueueItem(request_id, Mock()))
+
+
+@pytest.mark.parametrize("skip", [True, False])
+def test_skip_batch_wait_when_on_a_non_blocking_fetch(executor_queue, skip):
+    """A non-blocking fetch returns only what is queued when the predicate holds,
+    and batch-waits for more otherwise."""
+    executor_queue.batch_wait_timeout_ms = 60_000.0
+    calls = []
+    executor_queue.skip_batch_wait_when = lambda: calls.append(1) or skip
+    executor_queue.request_queue.put(RequestQueueItem(1, Mock()))
+
+    thread, items = _fetch_in_thread(executor_queue, datetime.timedelta(0))
+    if not skip:
+        _fill_to_max_batch(executor_queue, 2)
+    thread.join(timeout=30)
+
+    assert not thread.is_alive()
+    assert len(calls) == 1
+    assert [item.id for item in items] == ([1] if skip else list(range(1, 9)))
+
+
+@pytest.mark.parametrize("timeout", [None, datetime.timedelta(seconds=1)])
+def test_skip_batch_wait_when_is_not_asked_on_a_blocking_fetch(
+        executor_queue, timeout):
+    executor_queue.batch_wait_timeout_ms = 60_000.0
+    executor_queue.skip_batch_wait_when = Mock(return_value=True)
+    executor_queue.request_queue.put(RequestQueueItem(1, Mock()))
+
+    thread, items = _fetch_in_thread(executor_queue, timeout)
+    _fill_to_max_batch(executor_queue, 2)
+    thread.join(timeout=30)
+
+    assert not thread.is_alive()
+    executor_queue.skip_batch_wait_when.assert_not_called()
+    assert [item.id for item in items] == list(range(1, 9))
+
+
+def test_skip_batch_wait_when_is_not_asked_without_a_batch_wait(executor_queue):
+    executor_queue.skip_batch_wait_when = Mock(return_value=True)
+    executor_queue.request_queue.put(RequestQueueItem(1, Mock()))
+
+    items = executor_queue.get_from_request_queue(datetime.timedelta(0))
+
+    executor_queue.skip_batch_wait_when.assert_not_called()
+    assert [item.id for item in items] == [1]
+
+
 def test_request_queue_item_special_types():
     """Test RequestQueueItem special type detection."""
     # Create a mock request without sampling_config to avoid beam validation

@@ -2005,6 +2005,13 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             })
         .def("_get_num_reusable_tokens_before_hybrid_pruning", &kv::KvCache::numReusableTokensBeforeHybridPruning)
         .def("_get_num_reusable_tokens_before_pruning", &kv::KvCache::numReusableTokensBeforePruning)
+        // Opt-in superseded sliding-window anchor demotion applied by close() (eviction order only).
+        .def_prop_ro("superseded_anchor_priority", &kv::KvCache::supersededAnchorPriority)
+        .def(
+            "set_superseded_anchor_priority",
+            [](kv::KvCache& self, std::optional<kv::Priority> priority) { self.setSupersededAnchorPriority(priority); },
+            nb::arg("priority").none())
+        .def_prop_ro("num_demoted_anchor_pages", &kv::KvCache::numDemotedAnchorPages)
         // Both setters reach resize(), which takes the exclusive API lock: release the GIL first.
         .def_prop_rw("history_length", &kv::KvCache::historyLength,
             [](kv::KvCache& self, int hist)
@@ -2389,6 +2396,39 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         },
         nb::arg("manager"), nb::arg("reuse_scope"), nb::arg("tokens"), nb::arg("lc_id"),
         nb::arg("enable_partial") = false);
+    // Returns (num_tokens, prios) where prios[i] is None for a block with no page in
+    // this lifecycle, else (eviction priority, cache level, scheduled for eviction).
+    mIntrospection.def(
+        "reuse_match_page_priorities",
+        [](kv::KvCacheManager& manager, nb::object reuseScope, nb::object tokens, int lcId)
+        {
+            auto rs = castReuseScope(reuseScope);
+            int numTokens = 0;
+            std::vector<std::optional<std::tuple<int, int, bool>>> prios;
+            withTokens(tokens,
+                [&](kv::TokenSpan view, bool knownNoDigest)
+                {
+                    nb::gil_scoped_release release;
+                    auto const apiLock = manager.lockExclusive();
+                    auto matchResult = manager.radixTree().match(rs, view, knownNoDigest, false);
+                    numTokens = matchResult.numTokens;
+                    kv::LifeCycleId lc{lcId};
+                    prios.reserve(matchResult.blocks.stdSize());
+                    for (auto* block : matchResult.blocks)
+                    {
+                        auto* page = block->storage.at(lc);
+                        if (page == nullptr)
+                        {
+                            prios.emplace_back(std::nullopt);
+                            continue;
+                        }
+                        prios.emplace_back(
+                            std::make_tuple(page->priority, page->cacheLevel.value(), page->scheduledForEviction()));
+                    }
+                });
+            return std::make_tuple(numTokens, std::move(prios));
+        },
+        nb::arg("manager"), nb::arg("reuse_scope"), nb::arg("tokens"), nb::arg("lc_id"));
     // Returns (num_tokens, counts) where counts[i] is None for a block with no page in
     // this lifecycle, else the matched page's planned_drop_count.
     mIntrospection.def(

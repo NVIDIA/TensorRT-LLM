@@ -942,23 +942,38 @@ def _build_wide_direct(
         multicast=True,
         variants=variants,
         early_launch=True,
-        max_rows=64,
+        # hop128 (tep8_direct_hop's MAX_ROWS 128): a 128-row workspace, the pad only up to 64 rows.
+        max_rows=_wide.DIRECT128_MAX_ROWS if _wide.DIRECT128 else 64,
         wide_min_rows=_wide.SERVED_DIRECT_WIDE_MIN_ROWS,
         smem_pad=_wide.SERVED_DIRECT_PAD,
-        pad_rows=(0, 1024),
-        wait_first=True,
+        pad_rows=_wide.DIRECT128_PAD_ROWS if _wide.DIRECT128 else (0, 1024),
+        # tep8_direct_hop POLL_FIRST: the consumer polls before its dependency wait.
+        wait_first=not _wide.DIRECT_POLL_FIRST,
         fb_layout=True,
     )
     publication = _wide.DirectPublication(workspace, dispatchers, call.joins)
     _wide._DIRECT_PUBLICATION = publication
+    mode, stages = _wide.DIRECT128_PRODUCER
+    producer = (
+        f"; 65..{workspace.max_rows}-row o_proj on the {mode} producer ({stages} stages), "
+        f"consumer pad up to {_wide.DIRECT128_PAD_ROWS[1]} rows"
+        if _wide.DIRECT128
+        else ""
+    )
+    last = min(_wide.SERVED_DIRECT_ROWS[1], workspace.max_rows)
     logger.info(
         "[musespark_open] tep8_direct_hop: o_proj of decode steps of "
-        f"{_wide.SERVED_DIRECT_ROWS[0]}..{_wide.SERVED_DIRECT_ROWS[1]} rows scatters its partial into the "
+        f"{_wide.SERVED_DIRECT_ROWS[0]}..{last} rows scatters its partial into the "
         f"owners' slots on all {len(layers)} layers (window stride {workspace.peer_stride} B, feature-block "
         f"slots, +{workspace.workspace_bytes / 2**20:.1f} MiB fabric per rank); consumer: early, multicast "
         f"gather, two rows per 512-thread CTA from {_wide.SERVED_DIRECT_WIDE_MIN_ROWS} rows, "
-        f"SMEM pad {_wide.SERVED_DIRECT_PAD} B"
+        f"SMEM pad {_wide.SERVED_DIRECT_PAD} B{producer}"
     )
+    if _wide.DIRECT_POLL_FIRST:
+        logger.info(
+            "[musespark_open] tep8_direct_hop POLL_FIRST: the direct consumer polls its scatter / "
+            "gather slots before griddepcontrol.wait (the wait moves before the residual load)"
+        )
     return publication
 
 
@@ -1390,6 +1405,15 @@ def adopt_model(
                 model, sliding=multi_request_attention.SLIDING_LAYERS, min_requests=min_requests
             ),
         )
+    # tep8_wide64_splitk PREP_FOLD: the 2-CTA QKV launch runs multi_request_prep_append's prep.
+    prep_fold = bool(
+        plan.enabled("tep8_wide64_splitk") and plan.param("tep8_wide64_splitk", "PREP_FOLD")
+    )
+    if prep_fold and not plan.enabled("multi_request_prep_append"):
+        raise ValueError(
+            "[musespark_open] MUSESPARK_OPEN_LEVER_TEP8_WIDE64_SPLITK__PREP_FOLD folds "
+            "multi_request_prep_append's decode prep into the QKV launch; that lever is off"
+        )
     if plan.enabled("multi_request_prep_append"):
         # After every other attention re-class: its mixin goes in front of all of them and
         # acts only on decode steps of two or more sequences, where it swaps the generation
@@ -1413,7 +1437,7 @@ def adopt_model(
         )
         _tp_agreement.agreed_install(
             model.layers[0].mapping,
-            lambda: multi_request_append.install(model, min_seqs, packed_min_rows),
+            lambda: multi_request_append.install(model, min_seqs, packed_min_rows, prep_fold),
         )
     if preattn_prep_on:
         logger.info(
@@ -1452,7 +1476,11 @@ def adopt_model(
         try:
             _tp_agreement.agreed_install(
                 model.layers[0].mapping,
-                lambda: fmk_context_fmha.install(model, compute_capability),
+                lambda: fmk_context_fmha.install(
+                    model,
+                    compute_capability,
+                    pure_context=bool(plan.param("fmk_context_fmha", "PURE_CONTEXT")),
+                ),
             )
         except ValueError as refusal:
             plan.installed("fmk_context_fmha", False, str(refusal))

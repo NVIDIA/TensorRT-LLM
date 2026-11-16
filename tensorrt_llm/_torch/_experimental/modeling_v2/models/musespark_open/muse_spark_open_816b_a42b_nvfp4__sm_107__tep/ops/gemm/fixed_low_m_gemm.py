@@ -19,6 +19,8 @@ elements -- the same distance from the fp64 product as cuBLAS.
 
 from __future__ import annotations
 
+import functools
+
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
@@ -134,11 +136,53 @@ SM107_TP8_FC_WIDE_TACTICS: dict[tuple[int, int, int], tuple[int, int, int, int]]
     (_rows, 40960, 1024): (64, 16, 4, 10) if _rows <= 32 else (64, 32, 4, 8)
     for _rows in (16, 24, 32, 40, 48, 56, 64)
 }
+#: ``tep8_drafter_max_rows`` (``configure``; ``tep8_drafter_wide_gemms__MAX_ROWS``): the most rows
+#: of a TP8 drafter GEMM on the fixed split-K tactics, 64 by default (above it, 9..16 requests at
+#: K = 7, cuBLAS: nvjet split-K plus a cublasLt splitKreduce launch on the convolution coefficient
+#: and qkv projections at 72..128 rows, and on gate_up at 96, 16-21 reduce launches per step on the
+#: drafter's critical path). Above 64, up to ``TEP8_DRAFTER_WIDE_LIMIT``, the calls of the
+#: ``TEP8_DRAFTER_WIDE_SITES`` sites run in ONE launch of the site's 64-row tactic on the
+#: ``TEP8_DRAFTER_WIDE_TILE`` tile (``tep8_drafter_wide_tile``, output columns x rows; stages lowered
+#: to fit at launch, ``one_launch_tactic``), any token tiles past the first on the grid's second
+#: dimension (``splitk_gemm.run_splitk_dense_tiles``, as the TP8 QKV's
+#: ``tep8_wide64_splitk__MAX_ROWS``): the 64-row tactic keeps its 8-row cell's split_k, which fixes
+#: every element's K slices and their cluster-rank reduction order whatever the tile, so every row
+#: gets the bits it gets in a one-request step.
+TEP8_DRAFTER_MAX_ROWS = 64
+TEP8_DRAFTER_WIDE_LIMIT = 128
+#: WIDE_TILE's names -> (mma_m, mma_n); ``64x64`` is the 64-row tactic's own tile, ``64x128`` (the
+#: default) takes all rows in one token tile: the 64-row launch's CTA count, each weight slab read once.
+TEP8_DRAFTER_WIDE_TILES = {"64x64": (64, 64), "128x64": (128, 64), "64x128": (64, 128)}
+TEP8_DRAFTER_WIDE_TILE = (64, 128)
+#: The sites of the 65..MAX_ROWS-row launch (``_TP8_DRAFTER_WIDE_SHAPES`` names); the others keep
+#: cuBLAS above 64 rows. ``qkv`` covers the fused context K/V projection too (the same shape).
+TEP8_DRAFTER_WIDE_SITES: tuple[str, ...] = ("conv_coef", "qkv")
+#: The row count a 65..MAX_ROWS-row call's tactic is the one of (and is validated at).
+ONE_LAUNCH_ROWS = 64
 #: The settings ``configure`` sets (all off: the one-request sm107 TP8 table above as measured).
 TEP8_WIDE64 = False
 TEP8_DRAFTER_WIDE = False
 TEP8_FC_WIDE = False
 TEP8_DRAFTER_WIDE64 = False
+#: ``tep8_drafter_deep_stages`` (``configure``; ``tep8_drafter_wide_gemms__DEEP_STAGES``): the 16..64-row TP8
+#: drafter entries at deeper A/B pipelines, ``(rows, site) -> ab_stages``; tile and split_k stay the table's,
+#: so every output keeps its bits (stages change no K slice and no summation order). The wide tactics'
+#: stages were the deepest that fit the 232 KB opt-in shared memory (5 stages at a 64x64 split-4 tile, 7 at
+#: split 1); the split-K kernel's oversized mode (``splitk_gemm.configure(oversized_smem=True)``, 327 KB on
+#: sm107) fits 8 / 10. Measured on VR (vr_gst_bench: chains of cold weights behind a PDL predecessor, us
+#: per call at 64 rows): conv_coef 6.30 -> 5.69, qkv 5.64 -> 4.80, o_proj 3.57 -> 3.45, down 8.28 -> 7.93,
+#: gate_up 14.45 -> 13.44 (-3.5 us per drafter layer); 48 rows alike; 16 / 32 rows -0.2..-0.5 us on qkv /
+#: down / gate_up, the other sites as listed.
+_TP8_DRAFTER_DEEP_STAGES: dict[int, dict[str, int]] = {
+    16: {"qkv": 12, "down": 14, "gate_up": 14},
+    24: {"conv_coef": 10, "qkv": 12, "down": 13, "gate_up": 13},
+    32: {"conv_coef": 10, "qkv": 12, "down": 13, "gate_up": 13},
+    **{
+        rows: {"conv_coef": 8, "qkv": 8, "o_proj": 8, "down": 10, "gate_up": 10}
+        for rows in (40, 48, 56, 64)
+    },
+}
+TEP8_DRAFTER_DEEP_STAGES = False
 #: ``SM107_SPLITK_TACTICS`` as measured, before ``configure`` adds the wide entries.
 _SM107_SPLITK_TACTICS_BASE = dict(SM107_SPLITK_TACTICS)
 
@@ -191,7 +235,14 @@ MAX_M = 32
 
 
 def configure(
-    *, tep8_wide64: bool = False, tep8_drafter_wide: bool = False, tep8_fc_wide: bool = False
+    *,
+    tep8_wide64: bool = False,
+    tep8_drafter_wide: bool = False,
+    tep8_fc_wide: bool = False,
+    tep8_drafter_max_rows: int = 64,
+    tep8_drafter_wide_tile: str = "64x128",
+    tep8_drafter_wide_sites: tuple[str, ...] = ("conv_coef", "qkv"),
+    tep8_drafter_deep_stages: bool = False,
 ) -> None:
     """Set the wide entries of the sm107 TP8 tactic table and the kernel's row limit.
 
@@ -204,8 +255,58 @@ def configure(
             (needs the split-K kernel's ``wide64``).
         tep8_drafter_wide: the TP8 drafter's 16..32-row blocks (``SM107_TP8_DRAFTER_WIDE_TACTICS``).
         tep8_fc_wide: the DFlash fc shard's 16..32-row calls (``SM107_TP8_FC_WIDE_TACTICS``).
+        tep8_drafter_max_rows: ``TEP8_DRAFTER_MAX_ROWS``, 64..``TEP8_DRAFTER_WIDE_LIMIT``; above
+            64 (needs ``tep8_wide64`` and ``tep8_drafter_wide``) the 65..max_rows-row calls of
+            ``tep8_drafter_wide_sites`` take the site's 64-row tactic on
+            ``tep8_drafter_wide_tile``, launched once (``FixedLowMGemm``), and ``MAX_M`` is
+            max_rows.
+        tep8_drafter_wide_tile: ``TEP8_DRAFTER_WIDE_TILE``, a name of ``TEP8_DRAFTER_WIDE_TILES``.
+        tep8_drafter_wide_sites: ``TEP8_DRAFTER_WIDE_SITES``, a non-empty subset of
+            ``_TP8_DRAFTER_WIDE_SHAPES``.
+        tep8_drafter_deep_stages: ``TEP8_DRAFTER_DEEP_STAGES``: the listed 16..64-row drafter entries
+            at the ``_TP8_DRAFTER_DEEP_STAGES`` stage counts (needs ``tep8_drafter_wide``; the 40..64-row
+            ones exist with ``tep8_wide64``). ``deep_stage_tactics`` checks they fit at install.
+
+    Raises:
+        ValueError: for a ``tep8_drafter_max_rows`` outside 64..``TEP8_DRAFTER_WIDE_LIMIT``, or
+            above 64 without ``tep8_wide64`` and ``tep8_drafter_wide``, an unknown tile, an
+            empty or unknown site list, or deep stages without ``tep8_drafter_wide``; nothing is
+            set then.
     """
     global TEP8_WIDE64, TEP8_DRAFTER_WIDE, TEP8_FC_WIDE, TEP8_DRAFTER_WIDE64, MAX_M
+    global TEP8_DRAFTER_MAX_ROWS, TEP8_DRAFTER_WIDE_TILE, TEP8_DRAFTER_WIDE_SITES
+    global TEP8_DRAFTER_DEEP_STAGES
+    if tep8_drafter_deep_stages and not tep8_drafter_wide:
+        raise ValueError(
+            "fixed_low_m_gemm: tep8_drafter_deep_stages (tep8_drafter_wide_gemms__DEEP_STAGES) needs "
+            "tep8_drafter_wide (the 16..64-row drafter entries it deepens)"
+        )
+    max_rows = int(tep8_drafter_max_rows)
+    if not ONE_LAUNCH_ROWS <= max_rows <= TEP8_DRAFTER_WIDE_LIMIT:
+        raise ValueError(
+            f"fixed_low_m_gemm: tep8_drafter_max_rows must be in {ONE_LAUNCH_ROWS}.."
+            f"{TEP8_DRAFTER_WIDE_LIMIT}, got {tep8_drafter_max_rows}"
+        )
+    if max_rows > ONE_LAUNCH_ROWS and not (tep8_wide64 and tep8_drafter_wide):
+        raise ValueError(
+            f"fixed_low_m_gemm: tep8_drafter_max_rows above {ONE_LAUNCH_ROWS} needs tep8_wide64 "
+            "and tep8_drafter_wide (the 64-row drafter tactics it launches)"
+        )
+    if tep8_drafter_wide_tile not in TEP8_DRAFTER_WIDE_TILES:
+        raise ValueError(
+            f"fixed_low_m_gemm: tep8_drafter_wide_tile must be one of "
+            f"{list(TEP8_DRAFTER_WIDE_TILES)}, got {tep8_drafter_wide_tile!r}"
+        )
+    sites = tuple(tep8_drafter_wide_sites)
+    unknown = sorted(set(sites) - set(_TP8_DRAFTER_WIDE_SHAPES))
+    if not sites or unknown:
+        raise ValueError(
+            f"fixed_low_m_gemm: tep8_drafter_wide_sites must be a non-empty subset of "
+            f"{list(_TP8_DRAFTER_WIDE_SHAPES)}, got {list(sites)}"
+        )
+    TEP8_DRAFTER_MAX_ROWS = max_rows
+    TEP8_DRAFTER_WIDE_TILE = TEP8_DRAFTER_WIDE_TILES[tep8_drafter_wide_tile]
+    TEP8_DRAFTER_WIDE_SITES = sites
     TEP8_WIDE64 = bool(tep8_wide64)
     TEP8_DRAFTER_WIDE = bool(tep8_drafter_wide)
     TEP8_FC_WIDE = bool(tep8_fc_wide)
@@ -228,7 +329,29 @@ def configure(
                 if key[0] <= 32 or TEP8_WIDE64
             }
         )
+    if TEP8_DRAFTER_WIDE64 and TEP8_DRAFTER_MAX_ROWS > ONE_LAUNCH_ROWS:
+        # 65..MAX_ROWS rows: the site's 64-row tactic on the WIDE_TILE tile, one launch.
+        SM107_SPLITK_TACTICS.update(
+            {
+                (rows, *_TP8_DRAFTER_WIDE_SHAPES[site]): (
+                    *TEP8_DRAFTER_WIDE_TILE,
+                    *_TP8_DRAFTER_WIDE_TILES[ONE_LAUNCH_ROWS][site][2:],
+                )
+                for rows in range(ONE_LAUNCH_ROWS + 1, TEP8_DRAFTER_MAX_ROWS + 1)
+                for site in TEP8_DRAFTER_WIDE_SITES
+            }
+        )
+    TEP8_DRAFTER_DEEP_STAGES = bool(tep8_drafter_deep_stages)
+    if TEP8_DRAFTER_DEEP_STAGES:
+        # After the 65..MAX_ROWS entries (built from the 64-row cell as measured): only stages move.
+        for rows, sites in _TP8_DRAFTER_DEEP_STAGES.items():
+            for site, stages in sites.items():
+                key = (rows, *_TP8_DRAFTER_WIDE_SHAPES[site])
+                if key in SM107_SPLITK_TACTICS:
+                    SM107_SPLITK_TACTICS[key] = (*SM107_SPLITK_TACTICS[key][:3], stages)
     MAX_M = 64 if TEP8_WIDE64 and (TEP8_DRAFTER_WIDE or TEP8_FC_WIDE) else 32
+    if TEP8_DRAFTER_WIDE64 and TEP8_DRAFTER_MAX_ROWS > ONE_LAUNCH_ROWS:
+        MAX_M = TEP8_DRAFTER_MAX_ROWS
 
 
 _DEVICE_CAPABILITY: tuple[int, int] | None = None
@@ -292,6 +415,81 @@ def takes(x: torch.Tensor, weight: torch.Tensor) -> bool:
     )
 
 
+@functools.cache
+def one_launch_tactic(tactic: tuple[int, int, int, int], k: int, n: int):
+    """The ``SplitKTactic`` a 65..``TEP8_DRAFTER_MAX_ROWS``-row call of ``[*, k] x [n, k]^T`` at
+    ``tactic`` launches: ``tactic`` with its ``ab_stages`` lowered until the split-K kernel accepts
+    it at ``ONE_LAUNCH_ROWS`` rows (``run_splitk_dense_tiles`` validates there); tile and split_k
+    kept. The 64x64 tile is the 64-row tactic as is. Host code only; ``wide_launch_tactics``
+    resolves every listed one at install.
+
+    Raises:
+        ValueError: when no stage count fits (or the tile or split_k is refused).
+    """
+    from .splitk_gemm import SplitKTactic, validate_tactic
+
+    mma_m, mma_n, split_k, stages = tactic
+    error = None
+    for fit in range(stages, 0, -1):
+        candidate = SplitKTactic(mma_m, mma_n, split_k, fit)
+        try:
+            validate_tactic(candidate, ONE_LAUNCH_ROWS, n, k)
+        except ValueError as refused:
+            error = refused
+            continue
+        return candidate
+    raise ValueError(
+        f"fixed_low_m_gemm: no stage count of tactic {tactic} serves {ONE_LAUNCH_ROWS} x {k} -> "
+        f"{n}: {error}"
+    )
+
+
+def wide_launch_tactics(tactics: dict | None = None) -> dict:
+    """``(k, n) -> SplitKTactic`` of every 65..``TEP8_DRAFTER_MAX_ROWS``-row entry of ``tactics``
+    (the device's TP8 table when None), each resolved by ``one_launch_tactic``: ``spec_worker``'s
+    install calls it so that a tile the kernel refuses fails there, not at a step. Empty at the
+    default ``TEP8_DRAFTER_MAX_ROWS`` (64)."""
+    table = splitk_tactics() if tactics is None else tactics
+    return {
+        (k, n): one_launch_tactic(tuple(tactic), k, n)
+        for (m, k, n), tactic in table.items()
+        if m > ONE_LAUNCH_ROWS
+    }
+
+
+def deep_stage_tactics(tactics: dict | None = None) -> dict:
+    """``(rows, k, n) -> SplitKTactic`` of every deepened entry of ``tactics`` (the device's TP8 table when
+    None), each validated at its rows: ``spec_worker``'s install calls it so that a stage count the device's
+    shared memory cannot hold (no oversized mode) fails there, not at a step. Empty without
+    ``TEP8_DRAFTER_DEEP_STAGES``.
+
+    Raises:
+        ValueError: naming ``tep8_drafter_wide_gemms__DEEP_STAGES`` when an entry does not fit.
+    """
+    if not TEP8_DRAFTER_DEEP_STAGES:
+        return {}
+    from .splitk_gemm import SplitKTactic, validate_tactic
+
+    table = splitk_tactics() if tactics is None else tactics
+    out = {}
+    for rows, sites in _TP8_DRAFTER_DEEP_STAGES.items():
+        for site in sites:
+            k, n = _TP8_DRAFTER_WIDE_SHAPES[site]
+            tactic = table.get((rows, k, n))
+            if tactic is None:
+                continue
+            candidate = SplitKTactic(*tactic)
+            try:
+                validate_tactic(candidate, rows, n, k)
+            except ValueError as refused:
+                raise ValueError(
+                    f"fixed_low_m_gemm: tep8_drafter_wide_gemms__DEEP_STAGES: the {rows}-row {site} tactic "
+                    f"{tuple(tactic)} does not fit this device ({refused})"
+                ) from refused
+            out[(rows, k, n)] = candidate
+    return out
+
+
 class FixedLowMGemm(OpWrapper):
     """``x [M, K] @ weight [N, K].T -> [M, N]`` bf16, on the CuTe-DSL split-K kernel at ``tactic``."""
 
@@ -316,8 +514,9 @@ class FixedLowMGemm(OpWrapper):
     (the test's band); not bitwise ``F.linear``.
 
     Hard limits
-      M <= 32, K % 128 == 0, bf16, contiguous, 32-byte aligned operands
-      (``takes``), no bias.
+      M <= MAX_M (32; 64 with the wide entries; ``TEP8_DRAFTER_MAX_ROWS`` above it, those
+      calls in one ``run_splitk_dense_tiles`` launch of the 64-row tactic), K % 128 == 0,
+      bf16, contiguous, 32-byte aligned operands (``takes``), no bias.
 
     Not certified: torch.compile. CUDA-graph capture and replay are exercised
     by the test.
@@ -330,9 +529,19 @@ class FixedLowMGemm(OpWrapper):
         tactic: tuple[int, int, int, int],
         enable_pdl: bool,
     ) -> torch.Tensor:
-        from .splitk_gemm import SplitKTactic, run_splitk_dense
+        from .splitk_gemm import SplitKTactic, run_splitk_dense, run_splitk_dense_tiles
 
         out = torch.empty((x.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device)
+        if x.shape[0] > ONE_LAUNCH_ROWS:
+            # tep8_drafter_max_rows: 65..MAX_ROWS rows in one launch of the 64-row tactic (the
+            # token tiles on the grid's second dimension; each row's one-request bits).
+            return run_splitk_dense_tiles(
+                x.detach(),
+                weight.detach().t(),
+                out,
+                enable_pdl,
+                one_launch_tactic(tuple(tactic), int(weight.shape[1]), int(weight.shape[0])),
+            )
         # DLPack refuses tensors that require grad; a trainable nn.Linear
         # weight still does under inference mode.
         return run_splitk_dense(
@@ -358,7 +567,7 @@ class FixedLowMGemm(OpWrapper):
         enable_pdl: bool,
     ) -> None:
         assert takes(x, weight), (
-            "operands must be bf16, contiguous, 32-byte aligned, x [M <= 32, K] with K % 128 == 0 "
+            f"operands must be bf16, contiguous, 32-byte aligned, x [M <= {MAX_M}, K] with K % 128 == 0 "
             f"matching weight [N, K]; got x {tuple(x.shape)} {x.dtype} weight "
             f"{tuple(weight.shape)} {weight.dtype}"
         )

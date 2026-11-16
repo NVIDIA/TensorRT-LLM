@@ -25,6 +25,7 @@ would survive where the built-in kernel writes a signed zero.
 
 from __future__ import annotations
 
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -37,6 +38,7 @@ except ImportError:  # the pre-3.2 layout
     from triton.language.extra.cuda import libdevice
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
+from tensorrt_llm.logger import logger
 
 #: Head width the kernel's reduction tree is written for: 8 threads x 8 elements.
 HEAD_DIM = 64
@@ -387,6 +389,179 @@ def _preattn_prep_rows_kernel(
     tl.store(out + 7, y7.to(tl.bfloat16), mask=valid4)
 
 
+def _rows_vec_enabled() -> bool:
+    """Whether a step above ``ROW_KERNEL_MIN_ROWS`` rows runs ``_preattn_prep_rows_vec_kernel``.
+
+    Off unless TRTLLM_MSO_ENABLE_CTX4_PREP_VEC names a truthy value. Read once, at
+    import: a captured CUDA graph replays the kernel it recorded, so the choice must not change
+    between capture and replay.
+    """
+    return os.environ.get("TRTLLM_MSO_ENABLE_CTX4_PREP_VEC", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+#: ``_rows_vec_enabled`` as read at import.
+ROWS_VEC = _rows_vec_enabled()
+
+
+@triton.jit
+def _split8(x, B: tl.constexpr):
+    """``[B, 8, 8]`` (lane, element) -> the eight ``[B, 8]`` tensors of elements 0..7."""
+    a, b = tl.split(tl.reshape(x, [B, 8, 4, 2]))  # a = e0 e2 e4 e6, b = e1 e3 e5 e7
+    a0, a1 = tl.split(tl.reshape(a, [B, 8, 2, 2]))  # a0 = (e0, e4), a1 = (e2, e6)
+    b0, b1 = tl.split(tl.reshape(b, [B, 8, 2, 2]))  # b0 = (e1, e5), b1 = (e3, e7)
+    e0, e4 = tl.split(a0)
+    e2, e6 = tl.split(a1)
+    e1, e5 = tl.split(b0)
+    e3, e7 = tl.split(b1)
+    return e0, e1, e2, e3, e4, e5, e6, e7
+
+
+@triton.jit
+def _join8(e0, e1, e2, e3, e4, e5, e6, e7, B: tl.constexpr):
+    """The inverse of ``_split8``."""
+    a = tl.reshape(tl.join(tl.join(e0, e4), tl.join(e2, e6)), [B, 8, 4])
+    b = tl.reshape(tl.join(tl.join(e1, e5), tl.join(e3, e7)), [B, 8, 4])
+    return tl.reshape(tl.join(a, b), [B, 8, 8])
+
+
+@triton.jit
+def _split4(x, B: tl.constexpr):
+    """``[B, 8, 4]`` (lane, pair) -> the four ``[B, 8]`` tensors of pairs 0..3."""
+    a0, a1 = tl.split(tl.reshape(x, [B, 8, 2, 2]))  # a0 = (p0, p2), a1 = (p1, p3)
+    p0, p2 = tl.split(a0)
+    p1, p3 = tl.split(a1)
+    return p0, p1, p2, p3
+
+
+@triton.jit(do_not_specialize=["rows"])
+def _preattn_prep_rows_vec_kernel(
+    qkv_ptr,
+    qkv_out_ptr,
+    gate_out_ptr,
+    cos_sin_ptr,
+    positions_ptr,
+    rows,
+    qkv_stride,
+    qkv_out_stride,
+    gate_out_stride,
+    eps,
+    q_scale,
+    NUM_Q_HEADS: tl.constexpr,
+    NUM_KV_HEADS: tl.constexpr,
+    QKV_PERMUTED: tl.constexpr,
+    APPLY_ROPE: tl.constexpr,
+    LAUNCH_WITH_PDL: tl.constexpr,
+    BLOCK: tl.constexpr,
+    TRIGGER_AT_ENTRY: tl.constexpr = False,
+):
+    """``_preattn_prep_rows_kernel`` with each lane's eight elements moved as one 16 B vector.
+
+    The rows kernel issues eight 2-byte loads and stores per lane (one per element of the
+    lane), which holds it at ~2.5-2.8 TB/s on GB300. Here a head is loaded as one
+    ``[BLOCK, 8 lanes, 8 elements]`` tile and split into the same eight per-element tensors,
+    and the outputs are joined back before one store. The arithmetic is the rows kernel's
+    statement for statement: lane ``l = 4a + 2b + c`` owns elements ``8l .. 8l + 7``, summed in
+    order with ``add.rn``, then one add per lane bit 0, 1, 2; the same BF16 roundings, the
+    same ``rsqrt.approx.ftz`` and FTZ RoPE (pair ``4l + i`` of the table row). Bitwise equal
+    to the rows kernel (device test), 1.5-1.7x faster at 4096-8192 rows.
+    """
+    D: tl.constexpr = 64
+    HALF: tl.constexpr = 32
+    if LAUNCH_WITH_PDL:
+        if TRIGGER_AT_ENTRY:
+            tl.extra.cuda.gdc_launch_dependents()
+        tl.extra.cuda.gdc_wait()
+    row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    valid = row < rows
+    row = row.to(tl.int64)
+    head = tl.program_id(1)
+    is_q = head < NUM_Q_HEADS
+    kv_head = head - NUM_Q_HEADS
+    in_row = qkv_ptr + row * qkv_stride
+    out_row = qkv_out_ptr + row * qkv_out_stride
+
+    d = tl.arange(0, D)[None, :]
+    valid2 = valid[:, None]
+    if is_q:
+        if QKV_PERMUTED:
+            gate_in = (NUM_Q_HEADS + 2 * NUM_KV_HEADS) * D + head * D
+        else:
+            gate_in = head * 2 * D + D
+        gate = tl.load(in_row[:, None] + gate_in + d, mask=valid2)
+        tl.store(gate_out_ptr + row[:, None] * gate_out_stride + head * D + d, gate, mask=valid2)
+    else:
+        if QKV_PERMUTED:
+            v_in = NUM_Q_HEADS * D + NUM_KV_HEADS * D + kv_head * D
+        else:
+            v_in = 2 * NUM_Q_HEADS * D + NUM_KV_HEADS * D + kv_head * D
+        value = tl.load(in_row[:, None] + v_in + d, mask=valid2)
+        tl.store(
+            out_row[:, None] + (NUM_Q_HEADS + NUM_KV_HEADS) * D + kv_head * D + d,
+            value,
+            mask=valid2,
+        )
+
+    if QKV_PERMUTED:
+        in_off = tl.where(is_q, head * D, NUM_Q_HEADS * D + kv_head * D)
+    else:
+        in_off = tl.where(is_q, head * 2 * D, 2 * NUM_Q_HEADS * D + kv_head * D)
+    out_off = tl.where(is_q, head * D, NUM_Q_HEADS * D + kv_head * D)
+    scale = tl.where(is_q, q_scale, 1.0)
+
+    lane = tl.arange(0, 8)[None, :, None]
+    element = tl.arange(0, 8)[None, None, :]
+    valid3 = valid[:, None, None]
+    x = tl.load(in_row[:, None, None] + in_off + lane * 8 + element, mask=valid3, other=0.0)
+    x0, x1, x2, x3, x4, x5, x6, x7 = _split8(x.to(tl.float32), BLOCK)
+    s = libdevice.add_rn(x0 * x0, x1 * x1)
+    s = libdevice.add_rn(s, x2 * x2)
+    s = libdevice.add_rn(s, x3 * x3)
+    s = libdevice.add_rn(s, x4 * x4)
+    s = libdevice.add_rn(s, x5 * x5)
+    s = libdevice.add_rn(s, x6 * x6)
+    s = libdevice.add_rn(s, x7 * x7)
+    s = tl.reshape(s, [BLOCK, 2, 2, 2])
+    total = tl.sum(tl.sum(tl.sum(s, axis=3), axis=2), axis=1)
+    inverse_rms = _rsqrt_approx_ftz(total / 64.0 + eps)[:, None]
+    y0 = _normalize(x0, inverse_rms, scale)
+    y1 = _normalize(x1, inverse_rms, scale)
+    y2 = _normalize(x2, inverse_rms, scale)
+    y3 = _normalize(x3, inverse_rms, scale)
+    y4 = _normalize(x4, inverse_rms, scale)
+    y5 = _normalize(x5, inverse_rms, scale)
+    y6 = _normalize(x6, inverse_rms, scale)
+    y7 = _normalize(x7, inverse_rms, scale)
+
+    if APPLY_ROPE:
+        position = tl.load(positions_ptr + row, mask=valid, other=0).to(tl.int64)
+        pair = tl.arange(0, 8)[None, :, None] * 4 + tl.arange(0, 4)[None, None, :]
+        table = cos_sin_ptr + position[:, None, None] * D + pair
+        c0, c1, c2, c3 = _split4(tl.load(table, mask=valid3, other=0.0), BLOCK)
+        s0, s1, s2, s3 = _split4(tl.load(table + HALF, mask=valid3, other=0.0), BLOCK)
+        y0, y1 = _rotate(y0, y1, c0, s0)
+        y2, y3 = _rotate(y2, y3, c1, s1)
+        y4, y5 = _rotate(y4, y5, c2, s2)
+        y6, y7 = _rotate(y6, y7, c3, s3)
+
+    out = _join8(
+        y0.to(tl.bfloat16),
+        y1.to(tl.bfloat16),
+        y2.to(tl.bfloat16),
+        y3.to(tl.bfloat16),
+        y4.to(tl.bfloat16),
+        y5.to(tl.bfloat16),
+        y6.to(tl.bfloat16),
+        y7.to(tl.bfloat16),
+        BLOCK,
+    )
+    tl.store(out_row[:, None, None] + out_off + lane * 8 + element, out, mask=valid3)
+
+
 def is_rope_table(cos_sin: torch.Tensor) -> bool:
     """Whether ``cos_sin`` is a table the entry reads: contiguous fp32 ``[positions, 2, 32]``."""
     return (
@@ -531,7 +706,14 @@ class PreattnPrep(OpWrapper):
         if rows == 0:
             return qkv_out, gate_out
         if rows > ROW_KERNEL_MIN_ROWS:
-            _preattn_prep_rows_kernel[(triton.cdiv(rows, ROW_BLOCK), num_q_heads + num_kv_heads)](
+            rows_kernel = _preattn_prep_rows_vec_kernel if ROWS_VEC else _preattn_prep_rows_kernel
+            if ROWS_VEC:
+                logger.info_once(
+                    "[musespark_open] preattn_prep: TRTLLM_MSO_ENABLE_CTX4_PREP_VEC=1, prep rows kernel = "
+                    "_preattn_prep_rows_vec_kernel",
+                    key="musespark_open.ctx4_prep_vec.engaged",
+                )
+            rows_kernel[(triton.cdiv(rows, ROW_BLOCK), num_q_heads + num_kv_heads)](
                 qkv,
                 qkv_out,
                 gate_out,

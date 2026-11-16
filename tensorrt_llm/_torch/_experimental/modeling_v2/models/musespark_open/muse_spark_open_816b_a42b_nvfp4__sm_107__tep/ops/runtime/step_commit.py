@@ -177,12 +177,13 @@ def _step_commit_kernel_v2(desc_addr, BLOCK: tl.constexpr):
             values = tl.zeros([BLOCK], dtype=tl.int32) + a5.to(tl.int32)
             tl.store(dst + offs * a6, values, mask=mask)
         else:
+            bad_page = tl.sum(tl.where(fields == 7, row, 0), axis=0).to(tl.int32)
             pages = tl.load(src + offs, mask=mask, cache_modifier=".cv")
             scaled = pages * a4.to(tl.int32)
             bad = pages == -1
-            tl.store(dst + offs, tl.where(bad, 0, scaled), mask=mask)
+            tl.store(dst + offs, tl.where(bad, bad_page, scaled), mask=mask)
             dst_v = a6.to(tl.pointer_type(tl.int32))
-            tl.store(dst_v + offs, tl.where(bad, 0, scaled + a5.to(tl.int32)), mask=mask)
+            tl.store(dst_v + offs, tl.where(bad, bad_page, scaled + a5.to(tl.int32)), mask=mask)
 
 
 def _split_pieces(rows: np.ndarray, block: int) -> np.ndarray:

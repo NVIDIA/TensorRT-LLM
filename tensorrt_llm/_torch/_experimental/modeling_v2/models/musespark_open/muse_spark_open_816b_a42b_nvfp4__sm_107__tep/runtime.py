@@ -42,6 +42,10 @@ how much of this runs:
   only the block-table columns whose host page index changed since its last
   copy of that row (``_BlockOffsetsMemo``, which states when the memo is
   trusted); the readable columns hold the same words as with the full copy.
+  A manager with attention-op pool groups (a paged drafter context: the target and the
+  drafter in one ``KVCacheManagerV2``) is staged too, one table per group, as the
+  manager's own copy writes it (upstream #21789). Its parameter ``POOL_GROUPS`` is an
+  accepted alias with no effect (kept for the round-3 / E2E envs).
 
 ``step_loop_inline_commits`` (on top of both) changes how the launches are issued, with the
 same words written:
@@ -97,6 +101,11 @@ _INT_DTYPES = (torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8)
 #: Changed-column runs per block-table row recorded as separate descriptors; a row with
 #: more runs is re-copied as one span from its first to its last changed column.
 _MAX_BLOCK_RUNS = 4
+#: ``BAD_PAGE_INDEX`` of ``tensorrt_llm.runtime.kv_cache_manager_v2``: a host page index
+#: with no page, which the attention-op tables keep as their bad-page word.
+BAD_PAGE = -1
+#: The knob of ``incremental_block_offsets``'s ``POOL_GROUPS`` (the log lines name it).
+POOL_GROUPS_KNOB = "MUSESPARK_OPEN_LEVER_INCREMENTAL_BLOCK_OFFSETS__POOL_GROUPS"
 
 #: The reasons ``StepInputStaging.ineligible`` gives for every step of a configuration, not
 #: for one step: under ``incremental_block_offsets`` each is reported as a decline of it.
@@ -149,13 +158,35 @@ class _BlockOffsetsMemo:
 
     def __init__(self):
         self._scope: Optional[tuple] = None
-        #: (table, seq) -> (host row, scale, kv_offset, page indices of columns [0, n)).
-        self._rows: dict[tuple[int, int], tuple[int, int, int, np.ndarray]] = {}
+        #: Per device row (table, seq): the page indices of columns [0, width) the recorded
+        #: copies wrote (``_pages``), that width (``_width``; -1: nothing recorded) and the row's
+        #: (host row, scale, kv_offset) (``_keys``). Arrays, so ``table_runs`` compares all of a
+        #: step's rows at once; they grow to the largest (tables, seqs, columns) seen.
+        self._pages = np.zeros((0, 0, 0), dtype=np.int32)
+        self._width = np.zeros((0, 0), dtype=np.int64)
+        self._keys = np.zeros((0, 0, 3), dtype=np.int64)
+
+    def _clear(self) -> None:
+        self._width[...] = -1
+
+    def _reserve(self, tables: int, seqs: int, cols: int) -> None:
+        """Grow the arrays to hold (tables, seqs) rows of ``cols`` columns, keeping their content."""
+        t0, s0, c0 = self._pages.shape
+        if tables <= t0 and seqs <= s0 and cols <= c0:
+            return
+        t1, s1, c1 = max(tables, t0), max(seqs, s0), max(cols, c0)
+        pages = np.zeros((t1, s1, c1), dtype=np.int32)
+        width = np.full((t1, s1), -1, dtype=np.int64)
+        keys = np.zeros((t1, s1, 3), dtype=np.int64)
+        pages[:t0, :s0, :c0] = self._pages
+        width[:t0, :s0] = self._width
+        keys[:t0, :s0] = self._keys
+        self._pages, self._width, self._keys = pages, width, keys
 
     def forget(self) -> None:
         """Drop everything: the next recording copies every readable column."""
         self._scope = None
-        self._rows.clear()
+        self._clear()
 
     def open(self, manager: Any, dst: torch.Tensor, attn_metadata: Any) -> None:
         """Start a recording for ``dst``; resets the memo unless it last recorded this very table."""
@@ -167,7 +198,7 @@ class _BlockOffsetsMemo:
             or last[1] is not attn_metadata
             or last[2:] != scope[2:]
         ):
-            self._rows.clear()
+            self._clear()
         self._scope = scope
 
     def width(self, table: int, seq: int) -> Optional[int]:
@@ -176,8 +207,10 @@ class _BlockOffsetsMemo:
         Past them the row holds the words its writer left there: the bad-page word for an
         attention-op table, whose copy clears what its previous width covered.
         """
-        entry = self._rows.get((table, seq))
-        return None if entry is None else entry[3].shape[0]
+        if table >= self._width.shape[0] or seq >= self._width.shape[1]:
+            return None
+        width = int(self._width[table, seq])
+        return None if width < 0 else width
 
     def changed_runs(
         self, table: int, seq: int, row: int, scale: int, kv_offset: int, pages: np.ndarray
@@ -187,28 +220,72 @@ class _BlockOffsetsMemo:
         Remembers ``pages`` as what the device row holds once the recorded copies have run.
         """
         n = pages.shape[0]
-        entry = self._rows.get((table, seq))
-        if entry is None or entry[:3] != (row, scale, kv_offset):
+        self._reserve(table + 1, seq + 1, n)
+        width = int(self._width[table, seq])
+        if width < 0 or tuple(int(v) for v in self._keys[table, seq]) != (row, scale, kv_offset):
             runs = [(0, n)] if n else []
         else:
-            old = entry[3]
-            m = min(old.shape[0], n)
-            diff = np.flatnonzero(pages[:m] != old[:m])
-            runs = []
-            if diff.size:
-                cuts = np.flatnonzero(np.diff(diff) > 1)
-                starts = np.concatenate(([diff[0]], diff[cuts + 1]))
-                ends = np.concatenate((diff[cuts], [diff[-1]])) + 1
-                runs = [(int(a), int(b)) for a, b in zip(starts, ends)]
-            if n > m:
-                if runs and runs[-1][1] == m:
-                    runs[-1] = (runs[-1][0], n)
-                else:
-                    runs.append((m, n))
-            if len(runs) > _MAX_BLOCK_RUNS:
-                runs = [(runs[0][0], runs[-1][1])]
-        self._rows[(table, seq)] = (row, scale, kv_offset, pages.copy())
+            m = min(width, n)
+            runs = _runs_of(np.flatnonzero(pages[:m] != self._pages[table, seq, :m]), m, n)
+        self._pages[table, seq, :n] = pages
+        self._width[table, seq] = n
+        self._keys[table, seq] = (row, scale, kv_offset)
         return runs
+
+    def table_runs(
+        self, keys: np.ndarray, pages: np.ndarray
+    ) -> tuple[np.ndarray, list[list[list[tuple[int, int]]]]]:
+        """``width`` and ``changed_runs`` of every (table, seq) row of one step at once.
+
+        Args:
+            keys: int64 ``[tables, seqs, 3]``, each row's (host row, scale, kv_offset).
+            pages: int32 ``[tables, seqs, n]``, each row's first ``n`` host page indices.
+
+        Returns:
+            ``(widths, runs)``: int64 ``[tables, seqs]`` widths before this step (-1: none, as
+            ``width``'s None) and ``runs[table][seq]``, ``changed_runs``' list for the row; the
+            same values as calling ``width`` then ``changed_runs`` row by row, which this
+            replaces: the rows are compared in one array operation and only the rows that
+            changed build runs. Remembers ``pages`` as ``changed_runs`` does.
+        """
+        tables, seqs, n = pages.shape
+        self._reserve(tables, seqs, n)
+        widths = self._width[:tables, :seqs].copy()
+        known = (widths >= 0) & (self._keys[:tables, :seqs] == keys).all(axis=-1)
+        m = np.minimum(widths, n)
+        diff = (pages != self._pages[:tables, :seqs, :n]) & (np.arange(n) < m[..., None])
+        touched = ~known | diff.any(axis=-1) | (n > m)
+        runs: list[list[list[tuple[int, int]]]] = [[[] for _ in range(seqs)] for _ in range(tables)]
+        for t, q in zip(*np.nonzero(touched)):
+            t, q = int(t), int(q)
+            if not known[t, q]:
+                runs[t][q] = [(0, n)] if n else []
+            else:
+                runs[t][q] = _runs_of(np.flatnonzero(diff[t, q]), int(m[t, q]), n)
+        self._pages[:tables, :seqs, :n] = pages
+        self._width[:tables, :seqs] = n
+        self._keys[:tables, :seqs] = keys
+        return widths, runs
+
+
+def _runs_of(diff: np.ndarray, m: int, n: int) -> list[tuple[int, int]]:
+    """``changed_runs``' runs of a known row: the changed columns ``diff`` below ``m`` as runs,
+    ``[m, n)`` appended (or merged into a run ending at ``m``) when the row grew, one span past
+    ``_MAX_BLOCK_RUNS`` runs."""
+    runs = []
+    if diff.size:
+        cuts = np.flatnonzero(np.diff(diff) > 1)
+        starts = np.concatenate(([diff[0]], diff[cuts + 1]))
+        ends = np.concatenate((diff[cuts], [diff[-1]])) + 1
+        runs = [(int(a), int(b)) for a, b in zip(starts, ends)]
+    if n > m:
+        if runs and runs[-1][1] == m:
+            runs[-1] = (runs[-1][0], n)
+        else:
+            runs.append((m, n))
+    if len(runs) > _MAX_BLOCK_RUNS:
+        runs = [(runs[0][0], runs[-1][1])]
+    return runs
 
 
 class _PrepareStager:
@@ -532,19 +609,29 @@ class _PrepareStager:
         memo = self.blocks_memo
         if memo is not None:
             memo.open(manager, dst, self.attn_metadata)
-            pages = host.numpy()
+            # Every row of the step at once (table_runs): the widths and runs width /
+            # changed_runs give row by row.
+            pools = np.array([pool for pool, *_ in tables], dtype=np.int64)
+            index = np.array(rows, dtype=np.int64)
+            step_pages = host.numpy()[pools[:, None], index[None, :], 0, :cols]
+            step_keys = np.empty((len(tables), len(rows), 3), dtype=np.int64)
+            step_keys[..., 0] = index
+            step_keys[..., 1] = np.array([scale for _, scale, _, _ in tables])[:, None]
+            step_keys[..., 2] = np.array([kv_offset for _, _, kv_offset, _ in tables])[:, None]
+            widths, step_runs = memo.table_runs(step_keys, step_pages)
         # (table, seq, host row, column runs, columns past them to clear): one full-width run
         # per row without a memo.
         plan = []
+        unchanged = 0
         for table, (pool, scale, kv_offset, _) in enumerate(tables):
             for seq, row in enumerate(rows):
                 if memo is None:
                     runs, written = [(0, cols)], None
                 else:
-                    written = memo.width(table, seq)
-                    runs = memo.changed_runs(
-                        table, seq, row, scale, kv_offset, pages[pool, row, 0, :cols]
-                    )
+                    width = int(widths[table, seq])
+                    written = None if width < 0 else width
+                    runs = step_runs[table][seq]
+                    unchanged += not runs
                 tail = (cols, num_blocks if written is None else written) if clear_tail else (0, 0)
                 plan.append((table, seq, row, runs, tail))
         num_descriptors = sum(len(runs) + 2 * (hi > lo) for *_, runs, (lo, hi) in plan)
@@ -575,6 +662,8 @@ class _PrepareStager:
         if memo is not None:
             self.counts["block columns copied"] += copied
             self.counts["block columns kept"] += cols * len(plan) - copied
+            self.counts["block rows unchanged"] += unchanged
+            self.counts["block rows"] += len(plan)
         self.block_cols = cols
         self.block_seqs = num_seqs
         return True
@@ -611,6 +700,18 @@ class _PrepareStager:
         self.counts["prepare staged"] += 1
         if self.counts["prepare staged"] % _COUNTS_EVERY == 0:
             logger.debug(f"[musespark_open] step input staging counts {dict(self.counts)}")
+            rows_total = self.counts["block rows"]
+            if rows_total:
+                kept, copied = (
+                    self.counts["block columns kept"],
+                    self.counts["block columns copied"],
+                )
+                logger.info(
+                    f"[musespark_open] block-offset memo: {self.counts['prepare staged']} prepares, "
+                    f"rows unchanged {self.counts['block rows unchanged']}/{rows_total} "
+                    f"({100.0 * self.counts['block rows unchanged'] / rows_total:.1f} %), "
+                    f"columns kept {kept}/{kept + copied}"
+                )
 
     def discard(self) -> None:
         """Close the window after a failed prepare; what it recorded and has not launched is
@@ -1145,10 +1246,49 @@ def make_runtime_hooks(model: Any) -> RuntimeHooks:
     writer = plan is None or plan.enabled("sampler_store")
     one_stream = plan is not None and plan.enabled("step_loop_on_execution_stream")
     incremental_blocks = plan is not None and plan.enabled("incremental_block_offsets")
-    inline_commit = plan is not None and plan.enabled("step_loop_inline_commits")
+    # POOL_GROUPS: an alias kept for the round-3 / E2E envs; the stager stages a pool-group
+    # manager's tables whenever incremental_block_offsets is on (upstream #21789).
+    pool_groups = incremental_blocks and int(
+        plan.param("incremental_block_offsets", "POOL_GROUPS") or 0
+    )
+    if plan is not None:
+        # Loud: a STEP parameter set on a lever that is off changes nothing.
+        commit_v2 = plan.enabled("step_commit_v2")
+        for lever, key, on in (
+            ("incremental_block_offsets", "POOL_GROUPS", incremental_blocks),
+            ("step_commit_v2", "OVERLAP_FOLD", commit_v2),
+            ("step_commit_v2", "INLINE_COMMIT", commit_v2),
+        ):
+            if not on and int(plan.param(lever, key) or 0):
+                logger.error(
+                    f"[musespark_open] MUSESPARK_OPEN_LEVER_{lever.upper()}__{key} is set, but "
+                    f"{lever} is off: the parameter has no effect"
+                )
+    inline_lever = plan is not None and plan.enabled("step_loop_inline_commits")
+    # step_loop_inline_commits declares the fold with the early release and the inline commit
+    # tables; without it, step_commit_v2's OVERLAP_FOLD (0: the two built-in adds) and
+    # INLINE_COMMIT (0: the pinned-table kernel), whatever stream the step loop runs on.
+    overlap_fold = 2 if inline_lever else 0
+    inline_commit = inline_lever
+    if plan is not None and not inline_lever and plan.enabled("step_commit_v2"):
+        overlap_fold = int(plan.param("step_commit_v2", "OVERLAP_FOLD") or 0)
+        if int(plan.param("step_commit_v2", "INLINE_COMMIT") or 0):
+            from .ops.runtime import step_commit_inline as _sci
+
+            if not _sci.available():
+                raise RuntimeError(
+                    "[musespark_open] MUSESPARK_OPEN_LEVER_STEP_COMMIT_V2__INLINE_COMMIT=1, but "
+                    f"the inline commit kernel is unavailable: {_sci.unavailable_reason()}"
+                )
+            inline_commit = True
     hooks = RuntimeHooks(
         step_input_stager=(
-            StepInputStaging(pp_size, incremental_blocks, plan, inline_commit=inline_commit)
+            StepInputStaging(
+                pp_size,
+                incremental_blocks,
+                plan,
+                inline_commit=inline_commit,
+            )
             if stager
             else None
         ),
@@ -1156,15 +1296,20 @@ def make_runtime_hooks(model: Any) -> RuntimeHooks:
             SampleStoreWriter(pp_size, inline_commit=inline_commit) if writer else None
         ),
         step_loop_on_execution_stream=one_stream,
-        # Without step_loop_inline_commits: None, the two built-in adds.
-        overlap_offsets_applier=_ia.build_applier(2) if inline_commit else None,
+        # Without step_loop_inline_commits or OVERLAP_FOLD: None, the two built-in adds.
+        overlap_offsets_applier=_ia.build_applier(overlap_fold) if overlap_fold else None,
     )
     _sc.warm_up(inline_commit=inline_commit)
     logger.info(
         f"[musespark_open] executor hooks: step input staging {'on' if stager else 'off'}, "
         f"sampler store writer {'on' if writer else 'off'}, pp_size={pp_size}, step loop on "
         f"the execution stream={one_stream}, incremental block offsets={incremental_blocks}, "
-        f"inline commit tables={inline_commit}, "
+        + (
+            f"{POOL_GROUPS_KNOB}=1 (alias: pool-group tables are always staged), "
+            if pool_groups
+            else ""
+        )
+        + f"inline commit tables={inline_commit}, "
         f"overlap offsets fold={hooks.overlap_offsets_applier is not None}"
     )
     return hooks

@@ -187,6 +187,14 @@ SLAB_BYTES = MAX_ROWS * ROW_BYTES
 AREA_BYTES = MAX_RANKS * SLAB_BYTES
 #: Fewest sites a workspace may have (the reset argument needs 3).
 MIN_SITES = 3
+#: Two-shot gather slot of one thread: its 8 columns' FP32 ``h``.
+GATHER_SLOT_BYTES = VECTOR * 4
+
+
+def two_shot_area_bytes(max_rows: int, ranks: int = MAX_RANKS) -> int:
+    """One two-shot area: the scatter slabs (the one-shot's layout), the gather slots (``ranks`` sources x rows x
+    ``THREADS`` threads x ``GATHER_SLOT_BYTES``) and the chain sums (rows x ``THREADS`` FP32)."""
+    return ranks * max_rows * ROW_BYTES + ranks * max_rows * THREADS * GATHER_SLOT_BYTES + max_rows * THREADS * 4
 
 
 try:
@@ -324,6 +332,40 @@ if HAS_CUTE_DSL:
         )
 
     @dsl_user_op
+    def _store_x4_sys_if(address, enabled, w0, w1, w2, w3, *, loc=None, ip=None):
+        """Relaxed system-scope 16-byte store (a peer's unicast mapping) when ``enabled``."""
+        _asm(
+            None,
+            [_i64(address, loc, ip), _u32(enabled, loc, ip)]
+            + [_u32(w, loc, ip) for w in (w0, w1, w2, w3)],
+            "{\n.reg .pred p;\nsetp.ne.u32 p, $1, 0;\n"
+            "@p st.relaxed.sys.global.v4.b32 [$0], {$2, $3, $4, $5};\n}",
+            "l,r,r,r,r,r",
+            loc,
+            ip,
+        )
+
+    @dsl_user_op
+    def _store_x4_if(address, enabled, w0, w1, w2, w3, *, loc=None, ip=None):
+        """Plain 16-byte global store when ``enabled`` (the multicast publication of the two-shot gather)."""
+        _asm(
+            None,
+            [_i64(address, loc, ip), _u32(enabled, loc, ip)]
+            + [_u32(w, loc, ip) for w in (w0, w1, w2, w3)],
+            "{\n.reg .pred p;\nsetp.ne.u32 p, $1, 0;\n"
+            "@p st.global.v4.b32 [$0], {$2, $3, $4, $5};\n}",
+            "l,r,r,r,r,r",
+            loc,
+            ip,
+        )
+
+    @dsl_user_op
+    def _load_u64(address, *, loc=None, ip=None):
+        """One 64-bit word (the two-shot's peer-address table)."""
+        result = _asm(T.i64(), [_i64(address, loc, ip)], "ld.global.u64 $0, [$1];", "=l,l", loc, ip)
+        return Int64(result)
+
+    @dsl_user_op
     def _stale_bit(w0, w1, w2, w3, bit, *, loc=None, ip=None):
         """``bit`` while any of the four words is the sentinel, else 0, without a branch."""
         result = _asm(
@@ -442,6 +484,34 @@ if HAS_CUTE_DSL:
         return Int32(bits)
 
     @dsl_user_op
+    def _select_f32(condition, if_true, if_false, *, loc=None, ip=None):
+        """``if_true`` when ``condition`` is non-zero, else ``if_false`` (no branch)."""
+        result = _asm(
+            T.f32(),
+            [_u32(condition, loc, ip), _f32(if_true, loc, ip), _f32(if_false, loc, ip)],
+            "{\n.reg .pred p;\nsetp.ne.u32 p, $1, 0;\nselp.f32 $0, $2, $3, p;\n}",
+            "=f,r,f,f",
+            loc,
+            ip,
+            side_effects=False,
+        )
+        return Float32(result)
+
+    @dsl_user_op
+    def _f32_from_bits(word, *, loc=None, ip=None):
+        """The FP32 value with the bit pattern of ``word`` (exact; the two-shot gather's ``h``)."""
+        result = _asm(
+            T.f32(),
+            [_u32(word, loc, ip)],
+            "mov.b32 $0, $1;",
+            "=f,r",
+            loc,
+            ip,
+            side_effects=False,
+        )
+        return Float32(result)
+
+    @dsl_user_op
     def _unpack_bf16x2(word, *, loc=None, ip=None):
         """FP32 values of the low and high BF16 halves of ``word`` (exact)."""
         result = _asm(
@@ -499,6 +569,7 @@ if HAS_CUTE_DSL:
             direct: bool,
             max_rows: int = MAX_ROWS,
             timeout_ns: int = 0,
+            two_shot: bool = False,
         ):
             self.ranks = ranks
             self.eps = float(eps)
@@ -508,6 +579,14 @@ if HAS_CUTE_DSL:
             # Rows of one slab (one source rank's rows of an area) and its bytes.
             self.max_rows = int(max_rows)
             self.slab_bytes = self.max_rows * ROW_BYTES
+            # The two-shot by column slice (module docstring, ``TWO_SHOT``): CTA ``c`` of every row
+            # belongs to rank ``c``.
+            self.two_shot = bool(two_shot)
+            # Offsets of the gather slots and the chain sums inside a two-shot area.
+            self.gather_bytes_offset = self.ranks * self.slab_bytes
+            self.chain_bytes_offset = (
+                self.gather_bytes_offset + self.ranks * self.max_rows * THREADS * GATHER_SLOT_BYTES
+            )
             # 0: the polls spin without a bound (served); else a poll still stale after this
             # many nanoseconds executes ``trap`` (qualification builds).
             self.timeout_ns = int(timeout_ns)
@@ -531,6 +610,8 @@ if HAS_CUTE_DSL:
             delta_tap: Int32,
             dry: Int32,
             reset_rows: Int32,
+            peers: Int64,
+            area_offset: Int64,
             stream: cuda.CUstream,
         ):
             self.kernel(
@@ -550,6 +631,8 @@ if HAS_CUTE_DSL:
                 delta_tap,
                 dry,
                 reset_rows,
+                peers,
+                area_offset,
             ).launch(
                 grid=[rows * CLUSTER, 1, 1],
                 block=[THREADS, 1, 1],
@@ -578,6 +661,8 @@ if HAS_CUTE_DSL:
             delta_tap: Int32,
             dry: Int32,
             reset_rows: Int32,
+            peers: Int64,
+            area_offset: Int64,
         ):
             tid = cute.arch.thread_idx()[0]
             lane = tid % 32
@@ -616,6 +701,8 @@ if HAS_CUTE_DSL:
                     cute.arch.griddepcontrol_wait()
 
                 has_prev = Uint32(row != 0)
+                # Two-shot: the CTA of cluster rank ``crank`` owns its columns on rank ``crank``.
+                is_owner = Uint32(crank == rank)
                 row_offset = Int64(row) * ROW_BYTES + column_bytes
                 # Where this thread's 8 values sit in a slot row: thread-major, so that a
                 # warp's publish, resets and polls cover 512 contiguous bytes; in column
@@ -629,15 +716,28 @@ if HAS_CUTE_DSL:
                 if cutlass.const_expr(not self.direct):
                     own = _load_x4(partial + row_offset)
                     own_prev = _load_x4_if(partial + row_offset - ROW_BYTES, has_prev)
-                    # Publish this rank's partial row into its slot on every rank
-                    # (one store to the multicast address reaches every member).
-                    _store_x4(
-                        mcast + Int64(rank) * self.slab_bytes + slot_offset,
-                        own[0],
-                        own[1],
-                        own[2],
-                        own[3],
-                    )
+                    if cutlass.const_expr(self.two_shot):
+                        # Scatter: this rank's partial of these columns to their owner only
+                        # (its slot ``rank`` there, where the one-shot's multicast would write it).
+                        owner_area = _load_u64(peers + Int64(crank) * 8) + area_offset
+                        _store_x4_sys_if(
+                            owner_area + Int64(rank) * self.slab_bytes + slot_offset,
+                            Uint32(1) - is_owner,
+                            own[0],
+                            own[1],
+                            own[2],
+                            own[3],
+                        )
+                    else:
+                        # Publish this rank's partial row into its slot on every rank
+                        # (one store to the multicast address reaches every member).
+                        _store_x4(
+                            mcast + Int64(rank) * self.slab_bytes + slot_offset,
+                            own[0],
+                            own[1],
+                            own[2],
+                            own[3],
+                        )
                 # Retire the previous site's area: every row, every slot this
                 # rank polls (rows t, t + rows, ... of this CTA's columns).
                 if cutlass.const_expr(self.max_rows == MAX_ROWS):
@@ -663,12 +763,32 @@ if HAS_CUTE_DSL:
                             reset_on = Uint32(1)
                             if cutlass.const_expr(not self.direct):
                                 reset_on = Uint32(rank != p)
+                            if cutlass.const_expr(self.two_shot):
+                                # Only the owner reads (and so resets) its columns' scatter slots.
+                                reset_on = reset_on & is_owner
                             _reset_x4(
                                 previous
                                 + Int64(p) * self.slab_bytes
                                 + Int64(reset_row) * ROW_BYTES
                                 + slot_bytes,
                                 reset_on,
+                            )
+                        if cutlass.const_expr(self.two_shot):
+                            # A non-owner's gather slot (source crank); the row's 128 chain sums
+                            # (read by every CTA of the row: CTA 0 resets them).
+                            gather_prev = (
+                                previous
+                                + self.gather_bytes_offset
+                                + ((Int64(crank) * self.max_rows + Int64(reset_row)) * THREADS + Int64(tid))
+                                * GATHER_SLOT_BYTES
+                            )
+                            _reset_x4(gather_prev, Uint32(1) - is_owner)
+                            _reset_x4(gather_prev + 16, Uint32(1) - is_owner)
+                            _reset_x4(
+                                previous
+                                + self.chain_bytes_offset
+                                + (Int64(reset_row) * THREADS + Int64(tid) * 4) * 4,
+                                Uint32(tid < THREADS // 4) & Uint32(crank == 0),
                             )
                 r = _load_x4(residual + row_offset)
                 group = Int64(column // GROUP_SIZE)
@@ -688,6 +808,9 @@ if HAS_CUTE_DSL:
                         on = Uint32(1)
                         if cutlass.const_expr(not self.direct):
                             on = Uint32(rank != p)
+                        if cutlass.const_expr(self.two_shot):
+                            # Only the owner polls (its columns' scatter from every peer).
+                            on = on & is_owner
                         if cutlass.const_expr(half == 1):
                             on = on & has_prev
                         mine = own if half == 0 else own_prev
@@ -737,8 +860,8 @@ if HAS_CUTE_DSL:
                     if cutlass.const_expr(self.timeout_ns > 0):
                         elapsed = _globaltimer() - start
                         _trap_if(Uint32((stale != Uint32(0)) & (elapsed > Int64(self.timeout_ns))))
-                # Early trigger: past the last transport access.
-                if cutlass.const_expr(self.pdl and self.early_trigger):
+                # Early trigger: past the last transport access (the two-shot's comes after its gather).
+                if cutlass.const_expr(self.pdl and self.early_trigger and not self.two_shot):
                     cute.arch.griddepcontrol_launch_dependents()
 
                 keep = _keep(row % block)
@@ -777,23 +900,122 @@ if HAS_CUTE_DSL:
                         chain = _fma_rn(value, value, chain)
                     chains[tid] = chain
                 cute.arch.barrier()
-                # The 16 sums of flashinfer threads 16 crank .. 16 crank + 15, to every CTA of
-                # the row's cluster (this one included), 4 per store.
-                if tid < OWNERS // 4:
-                    target = all_chains.iterator + crank * OWNERS + tid * 4
-                    for peer in cutlass.range_constexpr(CLUSTER):
-                        cute.arch.store_async_dsmem(
-                            target.align(16),
-                            (
-                                _float_bits(chains[4 * tid]),
-                                _float_bits(chains[4 * tid + 1]),
-                                _float_bits(chains[4 * tid + 2]),
-                                _float_bits(chains[4 * tid + 3]),
-                            ),
-                            bars.iterator,
-                            peer,
+                if cutlass.const_expr(self.two_shot):
+                    # Gather: the owner multicasts its columns' FP32 h and its 16 chain sums to
+                    # every rank; a non-owner polls the owner's h of its columns, every CTA the
+                    # row's 128 chain sums (the owner's own arrive through the multicast too).
+                    gather_row = (
+                        self.gather_bytes_offset
+                        + ((Int64(crank) * self.max_rows + Int64(row)) * THREADS + Int64(tid))
+                        * GATHER_SLOT_BYTES
+                    )
+                    chain_row = self.chain_bytes_offset + Int64(row) * THREADS * 4
+                    _store_x4_if(
+                        mcast + gather_row,
+                        is_owner,
+                        _float_bits(x[0]),
+                        _float_bits(x[1]),
+                        _float_bits(x[2]),
+                        _float_bits(x[3]),
+                    )
+                    _store_x4_if(
+                        mcast + gather_row + 16,
+                        is_owner,
+                        _float_bits(x[4]),
+                        _float_bits(x[5]),
+                        _float_bits(x[6]),
+                        _float_bits(x[7]),
+                    )
+                    if tid < OWNERS // 4:
+                        _store_x4_if(
+                            mcast + chain_row + (Int64(crank) * OWNERS + Int64(tid) * 4) * 4,
+                            is_owner,
+                            _float_bits(chains[4 * tid]),
+                            _float_bits(chains[4 * tid + 1]),
+                            _float_bits(chains[4 * tid + 2]),
+                            _float_bits(chains[4 * tid + 3]),
                         )
-                cute.arch.mbarrier_wait(bars.iterator, 0)
+                    gather = cute.make_rmem_tensor(cute.make_layout((3, 4)), Uint32)
+                    gather_on = cute.make_rmem_tensor(cute.make_layout((3,)), Uint32)
+                    gather_on[0] = Uint32(1) - is_owner
+                    gather_on[1] = Uint32(1) - is_owner
+                    gather_on[2] = Uint32(tid < THREADS // 4)
+                    gather_stale = Uint32(0)
+                    for j in cutlass.range_constexpr(3):
+                        address = receive + gather_row + j * 16
+                        if cutlass.const_expr(j == 2):
+                            address = receive + chain_row + Int64(tid) * 16
+                        g0, g1, g2, g3 = _poll_x4(
+                            address, gather_on[j], Uint32(0), Uint32(0), Uint32(0), Uint32(0)
+                        )
+                        gather[j, 0] = g0
+                        gather[j, 1] = g1
+                        gather[j, 2] = g2
+                        gather[j, 3] = g3
+                        gather_stale = gather_stale | _stale_bit(g0, g1, g2, g3, gather_on[j] << Uint32(j))
+                    gather_start = Int64(0)
+                    if cutlass.const_expr(self.timeout_ns > 0):
+                        gather_start = _globaltimer()
+                    while gather_stale != Uint32(0):
+                        polled_gather = gather_stale
+                        for j in cutlass.range_constexpr(3):
+                            address = receive + gather_row + j * 16
+                            if cutlass.const_expr(j == 2):
+                                address = receive + chain_row + Int64(tid) * 16
+                            g0, g1, g2, g3 = _poll_x4(
+                                address,
+                                (polled_gather >> Uint32(j)) & Uint32(1),
+                                gather[j, 0],
+                                gather[j, 1],
+                                gather[j, 2],
+                                gather[j, 3],
+                            )
+                            gather[j, 0] = g0
+                            gather[j, 1] = g1
+                            gather[j, 2] = g2
+                            gather[j, 3] = g3
+                        gather_stale = Uint32(0)
+                        for j in cutlass.range_constexpr(3):
+                            gather_stale = gather_stale | _stale_bit(
+                                gather[j, 0],
+                                gather[j, 1],
+                                gather[j, 2],
+                                gather[j, 3],
+                                gather_on[j] << Uint32(j),
+                            )
+                        if cutlass.const_expr(self.timeout_ns > 0):
+                            elapsed = _globaltimer() - gather_start
+                            _trap_if(
+                                Uint32((gather_stale != Uint32(0)) & (elapsed > Int64(self.timeout_ns)))
+                            )
+                    # Early trigger: past the last transport access.
+                    if cutlass.const_expr(self.pdl and self.early_trigger):
+                        cute.arch.griddepcontrol_launch_dependents()
+                    if tid < THREADS // 4:
+                        for i in cutlass.range_constexpr(4):
+                            all_chains[4 * tid + i] = _f32_from_bits(gather[2, i])
+                    cute.arch.barrier()
+                    # A non-owner's h is the owner's FP32 words (the same statements computed them).
+                    for e in cutlass.range_constexpr(VECTOR):
+                        x[e] = _select_f32(is_owner, x[e], _f32_from_bits(gather[e // 4, e % 4]))
+                else:
+                    # The 16 sums of flashinfer threads 16 crank .. 16 crank + 15, to every CTA of
+                    # the row's cluster (this one included), 4 per store.
+                    if tid < OWNERS // 4:
+                        target = all_chains.iterator + crank * OWNERS + tid * 4
+                        for peer in cutlass.range_constexpr(CLUSTER):
+                            cute.arch.store_async_dsmem(
+                                target.align(16),
+                                (
+                                    _float_bits(chains[4 * tid]),
+                                    _float_bits(chains[4 * tid + 1]),
+                                    _float_bits(chains[4 * tid + 2]),
+                                    _float_bits(chains[4 * tid + 3]),
+                                ),
+                                bars.iterator,
+                                peer,
+                            )
+                    cute.arch.mbarrier_wait(bars.iterator, 0)
                 # Lane ``l`` of warp ``w`` holds flashinfer thread ``32 w + l``'s sum.
                 sum_sq = all_chains[tid]
                 for i in cutlass.range_constexpr(5):
@@ -832,8 +1054,11 @@ if HAS_CUTE_DSL:
         direct: bool,
         max_rows: int = MAX_ROWS,
         timeout_ns: int = 0,
+        two_shot: bool = False,
     ):
-        kernel = _DrafterHopKernel(ranks, eps, pdl, early_trigger, direct, max_rows, timeout_ns)
+        kernel = _DrafterHopKernel(
+            ranks, eps, pdl, early_trigger, direct, max_rows, timeout_ns, two_shot
+        )
         with torch.cuda.device(device_index):
             stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
             return cute.compile(
@@ -846,6 +1071,8 @@ if HAS_CUTE_DSL:
                 Int32(0),
                 Int32(1),
                 Int32(max_rows),
+                Int64(0),
+                Int64(0),
                 stream,
                 options="--enable-tvm-ffi",
             )
@@ -897,6 +1124,7 @@ class DrafterHopWorkspace:
         max_rows: int = MAX_ROWS,
         areas: Optional[int] = None,
         timeout_ns: int = 0,
+        two_shot: bool = False,
     ):
         from tensorrt_llm._torch.distributed.ops import (
             _get_mnnvl_workspace_comm,
@@ -918,6 +1146,12 @@ class DrafterHopWorkspace:
         self.max_rows = int(max_rows)
         self.wide = self.max_rows > MAX_ROWS
         self.timeout_ns = int(timeout_ns)
+        #: The two-shot by column slice (``TWO_SHOT``): a wide TP8 workspace only.
+        self.two_shot = bool(two_shot)
+        if self.two_shot and not (self.wide and self.ranks == MAX_RANKS and not self.direct):
+            raise ValueError(
+                "the two-shot drafter hop is a wide (more than 8 rows), TP8, multicast workspace"
+            )
         #: Rows of the last call issued (the reset bound of the next one inside a forward).
         self._last_rows = self.max_rows
         if self.wide:
@@ -934,7 +1168,11 @@ class DrafterHopWorkspace:
                     f"areas must divide the {self.sites} sites and be at least {MIN_SITES}"
                 )
             self.areas = int(areas)
-            self.area_bytes = self.ranks * self.max_rows * ROW_BYTES
+            self.area_bytes = (
+                two_shot_area_bytes(self.max_rows, self.ranks)
+                if self.two_shot
+                else self.ranks * self.max_rows * ROW_BYTES
+            )
         else:
             self.areas = self.sites
             self.area_bytes = AREA_BYTES
@@ -964,6 +1202,17 @@ class DrafterHopWorkspace:
             words = size // 4
             self._uc = self._handle.get_uc_buffer(self.rank, (words,), torch.int32, 0)
             self._mc = self._handle.get_mc_buffer((words,), torch.int32, 0)
+            #: The two-shot's scatter targets: every rank's unicast base, by rank.
+            self._peers = torch.tensor(
+                [
+                    self._handle.get_uc_buffer(p, (words,), torch.int32, 0).data_ptr()
+                    if self.two_shot
+                    else 0
+                    for p in range(self.ranks)
+                ],
+                dtype=torch.int64,
+                device=self.device,
+            )
             with torch.cuda.device(self.device):
                 self._uc.fill_(SENTINEL - (1 << 32))
                 torch.cuda.synchronize(self.device)
@@ -1034,9 +1283,13 @@ class DrafterHopWorkspace:
             self.direct,
             self.max_rows,
             self.timeout_ns,
+            self.two_shot,
         )
         dummy = self._uc_base
-        compiled(*([dummy] * 9), 1, self.rank, 8, 0, 0, 1, self.max_rows, self._stream())
+        compiled(
+            *([dummy] * 9), 1, self.rank, 8, 0, 0, 1, self.max_rows, self._peers.data_ptr(), 0,
+            self._stream(),
+        )  # fmt: skip
         self._kernels[eps] = compiled
         return compiled
 
@@ -1108,6 +1361,8 @@ class DrafterHopWorkspace:
             delta.stride(1),
             0,
             reset_rows,
+            self._peers.data_ptr(),
+            (site % self.areas) * self.area_bytes,
             self._stream(),
         )
         self.next_site = (site + 1) % self.sites

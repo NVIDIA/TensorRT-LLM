@@ -35,6 +35,18 @@ def adopt_drafter(shell, plan: "_dispatch.Plan") -> None:
         from .kernels.drafter_block_decode import block_decode as _draft
 
         _draft.install(shell.llm.draft_model, block_conv, block_decode)
+    if plan.enabled("tep8_drafter_wide_gemms") and plan.param(
+        "tep8_drafter_wide_gemms", "PREFETCH"
+    ):
+        # On the block decode drafter_block_decode just bound; reads the weights at each call.
+        from .kernels.drafter_l2_prefetch import prefetch as _drafter_prefetch
+
+        _drafter_prefetch.install(shell.llm.draft_model)
+    if plan.enabled("tep8_drafter_wide_gemms") and plan.param("tep8_drafter_wide_gemms", "QK_FOLD"):
+        # The QF marker for the block decode's multi-request path (no drafter_attn_pdl).
+        from .kernels.dr3_folds import folds as _dr3_qk
+
+        _dr3_qk.install_qk_fold_plain(shell.llm.draft_model)
     if plan.enabled("wide_drafter_window_attention"):
         # On the block decode drafter_block_decode just bound.
         from .kernels.wide_drafter_window_attention import attention as _wide_window
@@ -100,6 +112,24 @@ def adopt_drafter(shell, plan: "_dispatch.Plan") -> None:
             paged_tables=plan.enabled("paged_ctx_block_tables"),
             paged_store=plan.enabled("paged_ctx_kv_store"),
         )
+    if plan.enabled("drafter_kv_fork_before_head") and plan.param(
+        "drafter_kv_fork_before_head", "PAGED_COMMIT"
+    ):
+        # gint4-zf alias: PAGED_COMMIT maps to upstream #21789's paged_context_commit (one-launch
+        # paged commit on the context-K/V fork, which on a forked folded step also writes the
+        # drafter preamble); the value engages nothing of its own.
+        from tensorrt_llm.logger import logger
+
+        if plan.enabled("paged_context_commit"):
+            logger.info(
+                "[musespark_open] drafter_kv_fork_before_head__PAGED_COMMIT=1: alias of "
+                "paged_context_commit (on)"
+            )
+        else:
+            logger.error(
+                "[musespark_open] drafter_kv_fork_before_head__PAGED_COMMIT=1 is an alias of "
+                "paged_context_commit, which this plan does not run: the built-in commit runs"
+            )
     verify_fold = plan.enabled("verify_fold")
     path_walk_tail = plan.enabled("path_walk_tail")
     distributed_head_sampler = plan.enabled("distributed_head_sampler")
@@ -148,6 +178,13 @@ def adopt_drafter(shell, plan: "_dispatch.Plan") -> None:
         from .kernels.dr3_folds import folds as _dr3_folds
 
         _dr3_folds.install(getattr(shell.llm, "draft_model", None))
+    if plan.enabled("tep8_drafter_wide_gemms") and plan.param(
+        "tep8_drafter_wide_gemms", "SILU_FOLD"
+    ):
+        # After the PDL chain (its MLP class consults the fold) and the fixed GEMMs (the gate_up tactics).
+        from .kernels.drafter_silu_fold import fold as _silu_fold
+
+        _silu_fold.install(getattr(shell.llm, "draft_model", None))
     if plan.enabled("draft_head_tail"):
         # draft_head_tail: the draft head's tail after the shard GEMM as CUDA launches. After
         # draft_head (its worker class and key exchange). Collective.

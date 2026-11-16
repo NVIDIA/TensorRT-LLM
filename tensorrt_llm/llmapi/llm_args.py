@@ -2520,8 +2520,8 @@ class MooncakeStoreConfig(StrictBaseModel):
         "both",
         description="What this server does with the pool. 'both' reads and "
         "writes, 'producer' only writes, 'consumer' only reads, and "
-        "'capacity' does neither: its ranks lend memory without moving any "
-        "KV, so they pin no staging buffers and pay no per-request cost.")
+        "'capacity' does neither: its ranks lend memory without registering "
+        "any KV cache, so it needs no GPUDirect RDMA.")
     segment_size: Union[int, str] = Field(
         "16GiB",
         description="Host memory each of this server's ranks contributes to "
@@ -2545,12 +2545,24 @@ class MooncakeStoreConfig(StrictBaseModel):
         "disagree read each other's pages as their own, so it has no default "
         "and must be unique per checkpoint.")
     stage_through_host: bool = Field(
-        True,
+        False,
         telemetry=False,
         description="Copy pages through a pinned host buffer instead of "
-        "registering the KV pools with Mooncake. The only transfer path "
-        "supported today, so 'false' is ignored with a warning. Costs a copy "
-        "each way and needs no GPUDirect RDMA.")
+        "registering the KV pools with Mooncake. For a host whose HCA cannot "
+        "pin GPU pages; costs a copy each way. Ignored when role is "
+        "'capacity'.")
+    staging_buffer_bytes: int = Field(
+        512 * (1 << 20), gt=0, telemetry=False,
+        description="Pinned staging budget per direction; split over asynchronous loaders.")
+    async_load: Optional[bool] = Field(
+        None, telemetry=False,
+        description="Park prefix loads for background loading. None turns it on under attention DP "
+        "or on one rank and off elsewhere; true also turns it on under tensor parallelism, "
+        "where every rank loads its own shard and a failed load is fatal. "
+        "TRTLLM_MOONCAKE_DISABLE_ASYNC_LOAD=1 turns it off.")
+    async_load_workers: int = Field(
+        2, ge=1, telemetry=False,
+        description="Loader threads with independent CUDA streams and staging slots.")
     local_hostname: Optional[str] = Field(
         None,
         telemetry=False,
@@ -2558,6 +2570,15 @@ class MooncakeStoreConfig(StrictBaseModel):
         "under, for peers to reach them at. Derived by default from the "
         "interface that routes to the master. One value covers every rank, so "
         "only set it on a server whose ranks share a node.")
+    device_name: str = Field(
+        "",
+        telemetry=False,
+        description="Comma-separated RDMA devices this server's ranks "
+        "transfer over, such as 'mlx5_0,mlx5_2'. Empty picks the fastest "
+        "active InfiniBand devices on the node, or leaves the choice to "
+        "Mooncake when it finds none, as on a RoCE fabric. Set it where that "
+        "choice is wrong, such as NICs spanning several planes; one value "
+        "covers every rank of this server.")
     run_dir: Optional[str] = Field(
         None,
         telemetry=False,
@@ -2573,17 +2594,6 @@ class MooncakeStoreConfig(StrictBaseModel):
         "master to accept connections. Raise it when the wait spans a "
         "container start on another node. Expiring fails the server at "
         "startup.")
-
-    @field_validator("stage_through_host", mode="after")
-    @classmethod
-    def _force_host_staging(cls, value):
-        """Say here what the workers would otherwise each say after bringup."""
-        if not value:
-            logger.warning(
-                "Ignoring mooncake_store.stage_through_host=False: pages pass "
-                "through pinned host memory, which is the only transfer path "
-                "this connector supports today.")
-        return True
 
     @field_validator("segment_size", mode="after")
     @classmethod
@@ -2637,6 +2647,31 @@ class KvCacheConnectorConfig(StrictBaseModel):
         "set, trtllm-serve provisions the pool during bringup instead of "
         "requiring MOONCAKE_CONFIG_PATH from an external script.")
 
+    transfer_timeout_sec: float = Field(
+        default=600.0,
+        gt=0,
+        allow_inf_nan=False,
+        description="Deadline in seconds for an outstanding ADP KV connector "
+        "transfer. Checked at polling gates; cannot interrupt blocking callbacks. "
+        "Expiration fails all ADP owners and requires process restart. Unused without attention DP."
+    )
+    control_grace_sec: float = Field(
+        default=60.0,
+        gt=0,
+        allow_inf_nan=False,
+        description="Grace period in seconds for pending ADP KV connector "
+        "transfers after cancellation or shutdown. Can only shorten the "
+        "existing transfer deadline. Expiration fails all ADP owners and requires process restart. "
+        "Unused without attention DP.")
+    context_only: bool = Field(
+        default=False,
+        description="Declares a server that only runs context phases, i.e. a "
+        "disaggregated context server. A connector that transfers KV is then "
+        "allowed with speculative decoding: drafts are verified, and rejected, "
+        "only on the generation server, so the page lists this connector "
+        "tracks never shrink. A generation request that reaches the connector "
+        "fails the server.")
+
     @model_validator(mode="after")
     def _resolve_preset(self) -> "KvCacheConnectorConfig":
         from tensorrt_llm._torch.pyexecutor.connectors.registry import (
@@ -2664,6 +2699,212 @@ class KvCacheConnectorConfig(StrictBaseModel):
                 "mooncake_store describes a Mooncake pool, but this config "
                 f"resolves to connector_module={self.connector_module!r}. "
                 "Set connector: mooncake-store, or drop mooncake_store.")
+        return self
+
+
+class StoreHostDonorLateAutoConfig(StrictBaseModel):
+    """Size the late donation per GPU from a host-memory budget.
+
+    After warmup each GPU (rank) lends
+    ``max(0, host_budget_per_gpu - store_per_gpu - peak - margin_per_gpu
+    - startup)``, where ``peak`` is ``head_process_peak_per_gpu`` on the head
+    node (the node that runs the pool master and the frontend) and
+    ``process_peak_per_gpu`` elsewhere, and ``startup`` is the node's
+    ``startup_size_per_node`` over its ranks. The result is cut to the job's
+    memory limit and rounded down to ``granularity`` per NUMA node.
+    """
+    host_budget_per_gpu: Union[StrictInt, str] = Field(
+        telemetry=False,
+        description="Host memory one GPU may account for (store plus "
+        "process), e.g. a quarter of the node's memory on a 4-GPU node.")
+    store_per_gpu: Union[StrictInt, str] = Field(
+        telemetry=False,
+        description="Host store this GPU already holds outside the donor "
+        "(the KV connector's global segment). Checked against "
+        "global_segment_size in $MOONCAKE_CONFIG_PATH when that file is "
+        "readable.")
+    process_peak_per_gpu: Union[StrictInt, str] = Field(
+        telemetry=False,
+        description="Peak process memory per GPU on a node without the "
+        "frontend, measured over a full run.")
+    head_process_peak_per_gpu: Union[StrictInt, str] = Field(
+        telemetry=False,
+        description="Peak process memory per GPU on the head node, frontend "
+        "included, measured over a full run.")
+    margin_per_gpu: Union[StrictInt, str] = Field(
+        "2560MiB",
+        telemetry=False,
+        description="Memory per GPU kept out of the donation.")
+    head_hosts: Optional[List[str]] = Field(
+        None,
+        telemetry=False,
+        description="Host names that count as head nodes. Default: the node "
+        "the pool master runs on. A node whose role cannot be determined "
+        "counts as a head node.")
+    granularity: Union[StrictInt, str] = Field(
+        "1GiB",
+        telemetry=False,
+        description="Each NUMA node's late share is rounded down to a "
+        "multiple of this.")
+    job_memory_limit: Optional[Union[StrictInt, str]] = Field(
+        None,
+        telemetry=False,
+        description="Memory limit of this job on the node. Default: the "
+        "tightest cgroup v2 memory.max above this process.")
+
+    @field_validator("host_budget_per_gpu",
+                     "store_per_gpu",
+                     "process_peak_per_gpu",
+                     "head_process_peak_per_gpu",
+                     "margin_per_gpu",
+                     "granularity",
+                     "job_memory_limit",
+                     mode="after")
+    @classmethod
+    def _check_size(cls, value, info):
+        if value is None:
+            return value
+        from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import \
+            parse_size
+        try:
+            parsed = parse_size(value, strict_units=True)
+        except ValueError as exc:
+            raise ValueError(
+                f"store_host_donor.late_auto.{info.field_name}: {exc}")
+        if parsed < 0:
+            raise ValueError(f"store_host_donor.late_auto.{info.field_name}: "
+                             f"{value!r} is negative")
+        if info.field_name in ("host_budget_per_gpu", "granularity",
+                               "job_memory_limit") and parsed == 0:
+            raise ValueError(
+                f"store_host_donor.late_auto.{info.field_name} must be > 0")
+        return value
+
+    @field_validator("head_hosts", mode="after")
+    @classmethod
+    def _check_head_hosts(cls, value):
+        if value is not None and (not value or not all(value)):
+            raise ValueError("store_host_donor.late_auto.head_hosts must be a "
+                             f"nonempty list of names, got {value}")
+        return value
+
+
+class StoreHostDonorConfig(StrictBaseModel):
+    """Plain host memory this server lends to a Mooncake store pool.
+
+    The worker itself registers the memory with the pool's master, so no KV
+    connector and no helper process is needed; a server that also runs the
+    'mooncake-store' connector keeps its connector client separate. Each
+    node-level size is split evenly over the node's CPU NUMA nodes and one
+    rank per NUMA node registers that share with its memory bound there.
+    TRTLLM_DISABLE_STORE_HOST_DONOR=1 turns it off.
+    """
+    master: Optional[str] = Field(
+        None,
+        telemetry=False,
+        description="The pool master's 'host:port'. Defaults to "
+        "$MOONCAKE_MASTER, then to master_server_address in "
+        "$MOONCAKE_CONFIG_PATH.")
+    protocol: Literal["rdma", "tcp"] = Field(
+        "rdma",
+        telemetry=False,
+        description="Transport the pool reaches this memory over.")
+    device_name: Optional[str] = Field(
+        None,
+        telemetry=False,
+        description="RDMA devices, comma separated. Defaults to every active "
+        "InfiniBand device at the host's highest link rate.")
+    startup_size_per_node: Union[StrictInt, str] = Field(
+        0,
+        telemetry=False,
+        description="Host bytes per node registered while the model loads, as "
+        "a binary size ('1088GiB') or a byte count.")
+    late_size_per_node: Union[StrictInt, str] = Field(
+        0,
+        telemetry=False,
+        description="Host bytes per node registered after every rank has "
+        "finished warmup and CUDA graph capture, when memory used only during "
+        "startup has been released. 'auto' sizes it per GPU from late_auto, "
+        "or, without late_auto, lends from measured host memory in the "
+        "background: budget minus usage minus a buffer, re-checked every few "
+        "minutes.")
+    numa_nodes: Optional[List[NonNegativeInt]] = Field(
+        None,
+        telemetry=False,
+        description="CPU NUMA nodes to split each node's sizes over. Defaults "
+        "to every NUMA node with CPUs that this process may allocate on.")
+    local_buffer_size: Union[StrictInt, str] = Field(
+        "1GiB",
+        telemetry=False,
+        description="Transfer buffer of each donor client, on top of the "
+        "lent sizes.")
+    local_hostname: Optional[str] = Field(
+        None,
+        telemetry=False,
+        description="Address the segments are registered under. Defaults to "
+        "the interface that routes to the master.")
+    late_mode: Literal["auto", "same_client", "new_client"] = Field(
+        "auto",
+        telemetry=False,
+        description="How the late size is registered: mounted on the startup "
+        "client ('same_client'), through a second client ('new_client'), or "
+        "the former when the Mooncake bindings support it ('auto').")
+    late_delay_seconds: NonNegativeFloat = Field(
+        0.0,
+        telemetry=False,
+        description="0 registers the late size after warmup, before the "
+        "executor starts serving. A positive value registers it that many "
+        "seconds after the executor started, on a background thread.")
+    late_auto: Optional[StoreHostDonorLateAutoConfig] = Field(
+        None,
+        telemetry=False,
+        description="Budget the late size is computed from when "
+        "late_size_per_node is 'auto'.")
+
+    @field_validator("startup_size_per_node",
+                     "late_size_per_node",
+                     "local_buffer_size",
+                     mode="after")
+    @classmethod
+    def _check_size(cls, value, info):
+        from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import \
+            parse_size
+        if info.field_name == "late_size_per_node" and value == "auto":
+            return value
+        try:
+            parsed = parse_size(value, strict_units=True)
+        except ValueError as exc:
+            raise ValueError(f"store_host_donor.{info.field_name}: {exc}")
+        if parsed < 0:
+            raise ValueError(f"store_host_donor.{info.field_name}: {value!r} "
+                             "is negative")
+        if info.field_name == "local_buffer_size" and parsed == 0:
+            raise ValueError("store_host_donor.local_buffer_size must be > 0")
+        return value
+
+    @field_validator("numa_nodes", mode="after")
+    @classmethod
+    def _check_numa_nodes(cls, value):
+        if value is not None and (not value or len(set(value)) != len(value)):
+            raise ValueError("store_host_donor.numa_nodes must be a nonempty "
+                             f"list without duplicates, got {value}")
+        return value
+
+    @model_validator(mode="after")
+    def _check_lends_something(self) -> "StoreHostDonorConfig":
+        from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import \
+            parse_size
+        auto = self.late_size_per_node == "auto"
+        if self.late_auto is not None and not auto:
+            raise ValueError(
+                "store_host_donor: late_auto needs late_size_per_node 'auto'.")
+        if auto:
+            return self
+        if (parse_size(self.startup_size_per_node, strict_units=True) == 0 and
+                parse_size(self.late_size_per_node, strict_units=True) == 0):
+            raise ValueError(
+                "store_host_donor lends nothing: set startup_size_per_node "
+                "and/or late_size_per_node, or drop store_host_donor.")
         return self
 
 
@@ -6073,49 +6314,6 @@ def disagg_shares_draft_kv(
             and speculative_config.attention_backend in ("AUTO", "TRTLLM"))
 
 
-def disagg_dflash_error(
-    speculative_config: Optional[DecodingBaseConfig],
-    cache_transceiver_config: Optional[CacheTransceiverConfig]
-) -> Optional[str]:
-    """Refusal message for DFlash speculation on a disaggregated engine.
-
-    The DFlash drafter's pooled-context K/V buffers are filled only by a
-    local prefill forward (``DFlashWorker._store_prefill_context`` fires only
-    when the batch contains context requests), and they live in worker-local
-    CUDA buffers that the KV-cache transceiver never transfers. On a
-    disaggregated generation engine, requests arrive with their target-model
-    KV already transferred and skip straight to generation, so no request is
-    ever registered with the drafter: every request falls back to the single
-    shared dummy slot, whose contents the requests then cross-contaminate.
-    The target model still verifies every draft, so outputs stay correct and
-    nothing raises -- the failure is a silent acceptance-length collapse with
-    the full drafter overhead still paid on every step.
-
-    The engine cannot tell at config time whether it will serve the context
-    or the generation side (both sides carry the same
-    ``cache_transceiver_config``; the role is decided per request), so the
-    guard refuses the combination on any engine configured for
-    disaggregation. A context-side engine loses nothing: it never runs
-    generation steps, so a drafter there could never be exercised anyway.
-    """
-    if speculative_config is None or cache_transceiver_config is None:
-        return None
-    if cache_transceiver_config.backend is None:
-        return None
-    if not isinstance(speculative_config, DFlashDecodingConfig):
-        return None
-    return ("speculative_config.decoding_type=DFlash cannot be combined with "
-            "cache_transceiver_config (disaggregated serving). The DFlash "
-            "drafter builds its pooled context only during a local prefill "
-            "forward, and the KV-cache transceiver does not transfer that "
-            "worker-local state; on a disaggregated generation engine every "
-            "request would silently fall back to one shared dummy slot, "
-            "collapsing acceptance length while still paying the drafter "
-            "overhead. Remove speculative_config from the disaggregated "
-            "engine's options (run disaggregated without speculation), or run "
-            "aggregated (drop cache_transceiver_config) to use DFlash.")
-
-
 class TorchLlmArgs(BaseLlmArgs):
     # PyTorch backend specific configurations
     generation_config: Literal["auto", "trtllm"] = Field(
@@ -6582,6 +6780,13 @@ class TorchLlmArgs(BaseLlmArgs):
     kv_connector_config: Optional[KvCacheConnectorConfig] = Field(
         default=None,
         description="The config for KV cache connector.",
+        status="prototype",
+    )
+
+    store_host_donor: Optional[StoreHostDonorConfig] = Field(
+        default=None,
+        description="Host memory this server lends to a Mooncake store pool, "
+        "registered by the worker itself; needs no KV connector.",
         status="prototype",
     )
 
@@ -7154,13 +7359,13 @@ class TorchLlmArgs(BaseLlmArgs):
                         "(a disaggregated worker with "
                         "TRTLLM_DISAGG_SHARED_DRAFT_KV=0).")
                 assert self.speculative_config.max_draft_len > 0, "DFlash max_draft_len must be > 0"
-                # From the disaggregated-serving-benchmarking overlay (TRT-LLM aa7db814):
-                # the disagg_dflash_error refusal is dropped so gen-only SOL
-                # ladders can run DFlash on a disaggregated gen. Acceptance is
-                # forced (TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS), so the
-                # collapsed acceptance the refusal guards against does not
-                # reach the measurement; the drafter still runs every step.
-                # Only valid as a throughput measurement, never for quality.
+                # DFlash on a disaggregated engine is allowed: with the draft KV
+                # shared (the default for AUTO / TRTLLM, see
+                # disagg_shares_draft_kv) the drafter's prompt window travels
+                # with the target KV in the unified manager
+                # (_torch/disaggregation/draft_kv.py); otherwise the warning
+                # below fires. Gen-only SOL ladders that force acceptance
+                # (TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS) run either way.
                 # A Hugging Face repo id is not readable yet: both calls below
                 # then run without the drafter's config.json (the budget check
                 # covers only the token budget), and CachedModelLoader repeats
@@ -7177,7 +7382,6 @@ class TorchLlmArgs(BaseLlmArgs):
                     # verified against the target, so this costs acceptance
                     # rather than correctness: warn, do not reject.
                     logger.warning(
-                        "[dsb overlay: disagg DFlash refusal removed] "
                         "DFlash acceptance is degraded under disaggregated "
                         "serving: the cache transceiver moves the target KV "
                         "cache, but the drafter's context is built during "
@@ -7185,7 +7389,8 @@ class TorchLlmArgs(BaseLlmArgs):
                         "server drafts without the prompt context. Output is "
                         "unaffected; expect a lower acceptance rate than the "
                         "same configuration run aggregated. To transfer it, "
-                        "run both servers with attention_backend TRTLLM.")
+                        "run both servers with attention_backend TRTLLM (or "
+                        "AUTO) and TRTLLM_DISAGG_SHARED_DRAFT_KV unset or 1.")
                 self._validate_dflash_ctx_budget()
 
             if isinstance(self.speculative_config, DSparkDecodingConfig):

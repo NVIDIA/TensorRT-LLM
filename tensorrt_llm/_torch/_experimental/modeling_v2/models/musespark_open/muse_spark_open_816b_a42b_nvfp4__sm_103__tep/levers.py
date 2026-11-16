@@ -19,9 +19,12 @@ Knobs. These are the only variables the target reads for levers::
 
 ``<LEVER>`` is the lever's name upper-cased; ``__`` introduces a parameter or a resolver
 setting and never occurs inside a lever name. Values are case-insensitive and
-whitespace-stripped. Two shared-path variables are read as facts and never set or retired
-here: ``TRTLLM_KV_DEFER_CLOSE`` (on iff exactly ``1``, the KV cache manager's own test) and
-``UCX_RNDV_THRESH`` (set or not).
+whitespace-stripped. One variable outside these knobs decides which levers exist at all:
+``MUSESPARK_OPEN_SM103_TEP4_EXTRA_PATHS`` (``modeling.py``) adds fast paths to the sm103 TEP4
+composition, so a knob such as ``MUSESPARK_OPEN_LEVER_EARLY_EXPERT_IDS=on`` at TEP4 raises
+"does not serve" unless that variable names the path. Two shared-path variables are read as
+facts and never set or retired here: ``TRTLLM_KV_DEFER_CLOSE`` (on iff exactly ``1``, the KV
+cache manager's own test) and ``UCX_RNDV_THRESH`` (set or not).
 
 Semantics, in the order a lever is resolved:
 
@@ -649,6 +652,15 @@ WIDE_BALANCE_MIN_ROWS = 129
 WIDE_BALANCE_ROW_CEILING = 512
 
 
+def _never(why_off: str) -> RuleFn:
+    """Served but opt-in: off under ``auto`` unless its knob is ``on``."""
+
+    def rule(d: Deployment, t: Resolving, p: Mapping[str, object]) -> Tuple[bool, str]:
+        return False, why_off
+
+    return rule
+
+
 def _tep4_path_rule() -> Rule:
     return Rule(
         "upstream",
@@ -1045,6 +1057,12 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
             Kind.NUMERIC,
             "16, 24 and 32-row drafter blocks on a tep8 decode server",
             gates=(_served_untwinned(),),
+        ),
+        # Opt-in on sm103: the SM100-family CuTe DSL port of the sm107 lever.
+        "prefill_cutedsl_experts": Rule(
+            "HC",
+            Kind.COMPOSITION,
+            _never("opt-in on sm103 (SM100-family CuTe DSL port, ctx5-moe): knob on"),
         ),
         **{name: _tep4_path_rule() for name in TEP4_PATHS},
     }

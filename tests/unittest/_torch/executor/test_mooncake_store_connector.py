@@ -26,6 +26,7 @@ plain integers, which is all the addressing arithmetic needs.
 
 import contextlib
 import json
+import struct
 import threading
 import time
 from collections.abc import Iterator
@@ -35,6 +36,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
+    PrefixLoad,
     RequestData,
     SchedulerOutput,
 )
@@ -44,19 +46,30 @@ from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_layout import (
     KvCacheLayout,
     KvCacheRegion,
 )
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import scheduler as scheduler_module
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import staging as staging_module
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import worker as worker_module
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.addressing import PageAddressing
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.keys import BlockHashChain
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.metadata import (
+    MooncakeStoreMetadata,
     PageTransfer,
+    PrefixLoadTransfers,
     RequestTransfers,
+    WindowRetire,
 )
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.scheduler import (
     MooncakeStoreConnectorScheduler,
 )
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.validation import (
+    NODE_BUDGET_RESERVE_BYTES,
+    validate_layout,
+    validate_llm_args,
+    validate_node_budget,
+)
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.worker import (
     MooncakeStoreConnectorWorker,
+    PrefixHit,
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
@@ -79,6 +92,8 @@ class FakeStore:
         self.exist_calls = []
         self.closed = False
         self.fail_gets_for = set()
+        self.values = {}
+        self.remove_calls = []
         #: Workers built against this store. `make_worker` shuts each one down;
         #: the fixture repeats it as a backstop for early failures.
         self.workers = []
@@ -102,6 +117,28 @@ class FakeStore:
             -1 if (key in self.fail_gets_for or key not in self.objects) else sum(size)
             for key, size in zip(keys, sizes)
         ]
+
+    def put(self, key, value, *_args, **_kwargs):
+        if key in self.objects:
+            return -1
+        self.objects.add(key)
+        self.values[key] = bytes(value)
+        return 0
+
+    def get(self, key):
+        return self.values.get(key, b"") if key in self.objects else b""
+
+    def batch_remove(self, keys, force=False):
+        self.remove_calls.append((list(keys), force))
+        out = []
+        for key in keys:
+            if key in self.objects:
+                self.objects.discard(key)
+                self.values.pop(key, None)
+                out.append(0)
+            else:
+                out.append(-704)
+        return out
 
     def close(self):
         self.closed = True
@@ -188,7 +225,7 @@ def fake_store(monkeypatch):
     monkeypatch.setattr(worker_module, "_open_store", lambda _config: (store, "10.0.0.1"))
     # The node budget is a property of the machine the test happens to run on,
     # which is not what any of these tests are about.
-    monkeypatch.setattr(worker_module, "validate_node_budget", lambda _config: None)
+    monkeypatch.setattr(worker_module, "validate_node_budget", lambda _config, **_kwargs: None)
     yield store
     for worker in store.workers:
         worker.shutdown()
@@ -368,6 +405,7 @@ def test_a_save_that_raises_is_dropped_and_its_request_still_retires(
             (
                 SimpleNamespace(synchronize=lambda: None),
                 [RequestTransfers(42, [PageTransfer(b"\x01" * 16, 0, 1)])],
+                time.monotonic(),
             )
         )
 
@@ -441,9 +479,43 @@ def fake_cuda(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 3)
     monkeypatch.setattr(torch.cuda, "set_device", lambda index: recorded.append(index))
-    monkeypatch.setattr(torch.cuda, "Stream", lambda *_args, **_kwargs: SimpleNamespace())
+    monkeypatch.setattr(
+        torch.cuda, "Stream", lambda *_args, **_kwargs: SimpleNamespace(cuda_stream=0)
+    )
     monkeypatch.setattr(worker_module, "HostStagingPool", StubStagingPool)
     return recorded
+
+
+@pytest.mark.parametrize("disabled", [False, True])
+def test_put_retries_a_failed_page_unless_disabled(store_config, fake_store, monkeypatch, disabled):
+    """Port of our e930 save retry onto the PR worker: a failed key is put again."""
+    if disabled:
+        monkeypatch.setenv("TRTLLM_DISABLE_STORE_SAVE_RETRY", "1")
+    # Plain puts: with soft-pin on, a refused very first put is put again unpinned to probe pin support
+    # (test_mooncake_store_softpin.py covers that), which is not the save retry this test is about.
+    monkeypatch.delenv("TRTLLM_MOONCAKE_STORE_SOFTPIN", raising=False)
+    store_put = fake_store.batch_put_from_multi_buffers
+    failed_once = []
+
+    def flaky_put(keys, addresses, sizes, *args, **kwargs):
+        if not failed_once:
+            failed_once.append(list(keys))
+            fake_store.put_calls.append((list(keys), addresses, sizes))
+            return [-200] * len(keys)
+        return store_put(keys, addresses, sizes, *args, **kwargs)
+
+    monkeypatch.setattr(fake_store, "batch_put_from_multi_buffers", flaky_put)
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        worker._save_staging = None  # the PR always stages; test the put/retry logic without a device copy
+        block_hash = b"\x09" * 16
+        written, present, _ = worker._put([RequestTransfers(1, [PageTransfer(block_hash, 0, 2)])])
+        key = worker._namespaces[0].key(block_hash)
+        if disabled:
+            assert (written, len(fake_store.put_calls)) == (0, 1)
+            assert key not in fake_store.objects
+        else:
+            assert (written, present, len(fake_store.put_calls)) == (1, 0, 2)
+            assert key in fake_store.objects
 
 
 def test_staging_put_hands_the_store_one_host_buffer_per_page(
@@ -561,6 +633,30 @@ def test_a_save_thread_that_cannot_start_fails_registration(
             pytest.fail("registration should not have completed")
 
 
+def test_a_load_thread_that_cannot_start_fails_registration(
+    store_config, fake_store, fake_cuda, monkeypatch
+):
+    """A parked request waits on the load thread, so one that died must stop bringup."""
+    calls = []
+
+    def refuse_after_the_save_thread(index):
+        calls.append(index)
+        # The save thread binds the device first and registration waits for it.
+        if len(calls) > 1:
+            raise RuntimeError("cudaSetDevice failed")
+
+    monkeypatch.setattr(torch.cuda, "set_device", refuse_after_the_save_thread)
+
+    worker = MooncakeStoreConnectorWorker(make_llm_args())
+    fake_store.workers.append(worker)
+    try:
+        with pytest.raises(RuntimeError, match="load thread"):
+            worker.register_kv_cache_layout(make_layout())
+    finally:
+        # The save thread did start, so it has to be stopped.
+        worker.shutdown()
+
+
 def test_shutdown_leaves_the_store_open_under_a_save_still_reading(
     store_config, fake_store, staged_copies, monkeypatch
 ):
@@ -589,6 +685,7 @@ def test_shutdown_leaves_the_store_open_under_a_save_still_reading(
             (
                 SimpleNamespace(synchronize=lambda: None),
                 [RequestTransfers(1, [PageTransfer(b"\x05" * 16, 0, 0)])],
+                time.monotonic(),
             )
         )
         assert reading.wait(30.0), "the save thread never reached the store"
@@ -596,7 +693,8 @@ def test_shutdown_leaves_the_store_open_under_a_save_still_reading(
         worker.shutdown()
 
         assert not fake_store.closed
-        assert worker._store is fake_store
+        # The soft-pin switch wraps the handle (softpin.SoftPinStore); the store under it is what must stay open.
+        assert getattr(worker._store, "_inner", worker._store) is fake_store
         # Kept rather than dropped, so a later call retries the join.
         assert worker._save_thread is not None
 
@@ -899,3 +997,1119 @@ def test_scheduler_bypasses_multimodal_requests_it_cannot_identify(store_config)
     assert metadata.saves == []
     # Nothing was handed to a save thread, so nothing pins its pages either.
     assert scheduler.request_finished(request, [7, 8, 9]) is False
+
+
+# ---- sliding windows ----
+
+#: The window of the sliding group in these tests: two blocks.
+WINDOW = 2 * TOKENS_PER_BLOCK
+
+
+def make_window_layout(*, num_slots=16):
+    """Group 0 is full attention, group 1 a sliding window of `WINDOW` tokens."""
+    full = make_layout(num_slots=num_slots).groups[0]
+    windowed = KvCacheLayerGroupLayout(
+        layer_group_id=1,
+        layer_ids=(1,),
+        window_size=WINDOW,
+        regions=(
+            KvCacheRegion(
+                base=0x100000,
+                size=128,
+                stride=128,
+                num_slots=num_slots,
+                buffers=(KvCacheBufferRef(layer_id=1, role="key"),),
+            ),
+        ),
+    )
+    return KvCacheLayout(tokens_per_block=TOKENS_PER_BLOCK, groups=(full, windowed))
+
+
+def store_window(fake_store, worker, hashes, end_block):
+    """Store the window pages a prefix of `end_block` blocks ends with."""
+    _, stale_end = worker.stale_blocks(1, end_block * TOKENS_PER_BLOCK)
+    for block in range(stale_end, end_block):
+        fake_store.objects.add(worker._namespaces[1].key(hashes[block]))
+    return stale_end
+
+
+def test_validate_layout_accepts_a_sliding_window():
+    validate_layout(make_window_layout())
+
+
+def reference_chain(tokens, tokens_per_block):
+    """The chain under the per-token `int.to_bytes` encoding, which the packed fast path must match byte for byte."""
+    import hashlib
+
+    seed = BlockHashChain(tokens_per_block)._seed
+    hashes = []
+    for ordinal in range(len(tokens) // tokens_per_block):
+        block = tokens[ordinal * tokens_per_block : (ordinal + 1) * tokens_per_block]
+        hasher = hashlib.blake2b(digest_size=16)
+        hasher.update(hashes[-1] if hashes else seed)
+        hasher.update(b"".join(int(t).to_bytes(8, "little", signed=True) for t in block))
+        hashes.append(hasher.digest())
+    return hashes
+
+
+def test_hash_chain_matches_the_per_token_encoding_across_extends():
+    import random
+
+    rng = random.Random(7)
+    tokens = [rng.randrange(-(2**40), 2**40) for _ in range(40 * TOKENS_PER_BLOCK + 5)]
+    chain = BlockHashChain(TOKENS_PER_BLOCK)
+    for end in (3, TOKENS_PER_BLOCK, 7 * TOKENS_PER_BLOCK + 1, len(tokens)):
+        chain.extend(tokens[:end])
+        assert list(chain.hashes) == reference_chain(tokens[:end], TOKENS_PER_BLOCK)
+
+
+def test_interleaved_keys_match_namespace_keys(store_config, fake_store):
+    with make_worker(fake_store, layout=make_window_layout()) as worker:
+        namespaces = (
+            list(worker._namespaces.values()) * 3
+        )  # several namespaces, as a multi-rank peer list
+        hashes = [bytes([index]) * 16 for index in range(9)]
+        expected = [namespace.key(block_hash) for block_hash in hashes for namespace in namespaces]
+        assert worker_module._interleaved_keys(namespaces, hashes) == expected
+        assert worker_module._interleaved_keys(namespaces[:1], hashes) == [
+            namespaces[0].key(h) for h in hashes
+        ]
+        assert worker_module._interleaved_keys(namespaces, []) == []
+
+
+def test_worker_window_hit_needs_the_window_at_the_prefix_end(store_config, fake_store):
+    with make_worker(fake_store, layout=make_window_layout()) as worker:
+        hashes = [bytes([index]) * 16 for index in range(6)]
+        for block_hash in hashes:
+            fake_store.objects.add(worker._namespaces[0].key(block_hash))
+
+        # Every full-attention page but no window anywhere: no end is servable.
+        assert worker.find_prefix_hit(hashes, 0) == PrefixHit(0)
+        fake_store.exist_calls.clear()
+
+        window_from = store_window(fake_store, worker, hashes, 6)
+        assert 0 < window_from < 6
+        assert worker.find_prefix_hit(hashes, 0) == PrefixHit(6, {1: window_from})
+        # The window group's pages before the window are never asked for.
+        probed = {key for call in fake_store.exist_calls for key in call}
+        assert worker._namespaces[1].key(hashes[0]) not in probed
+
+
+def test_worker_window_hit_walks_back_over_the_rewind_only(store_config, fake_store):
+    with make_worker(fake_store, layout=make_window_layout()) as worker:
+        hashes = [bytes([index]) * 16 for index in range(6)]
+        for block_hash in hashes:
+            fake_store.objects.add(worker._namespaces[0].key(block_hash))
+        # An earlier prompt ended at block 5, one block short of the full hit.
+        store_window(fake_store, worker, hashes, 5)
+
+        worker._window_fallback = False
+        assert worker.find_prefix_hit(hashes, 0, rewind_tokens=0).blocks == 0
+        assert worker.find_prefix_hit(hashes, 0, rewind_tokens=TOKENS_PER_BLOCK).blocks == 5
+
+
+def test_worker_window_fallback_resumes_at_an_earlier_prompt_end(store_config, fake_store):
+    """Full-attention pages that outrun every stored window cost one prompt's delta, not the prefix."""
+    with make_worker(fake_store, layout=make_window_layout(num_slots=32)) as worker:
+        hashes = [bytes([index]) * 16 for index in range(12)]
+        for block_hash in hashes:
+            fake_store.objects.add(worker._namespaces[0].key(block_hash))
+        # Earlier prompts ended at blocks 4 and 7; the latest one, at 12, has no window yet.
+        store_window(fake_store, worker, hashes, 4)
+        window_from = store_window(fake_store, worker, hashes, 7)
+
+        assert worker.find_prefix_hit(hashes, 0, rewind_tokens=TOKENS_PER_BLOCK) == PrefixHit(
+            7, {1: window_from}
+        )
+        assert worker._lookup_stats.counts["recovered"] == 1
+
+        worker._window_fallback = False
+        assert worker.find_prefix_hit(hashes, 0, rewind_tokens=TOKENS_PER_BLOCK).blocks == 0
+        assert worker._lookup_stats.counts["window_miss"] == 1
+
+
+def test_worker_window_fallback_needs_a_complete_window(store_config, fake_store):
+    with make_worker(fake_store, layout=make_window_layout(num_slots=32)) as worker:
+        hashes = [bytes([index]) * 16 for index in range(12)]
+        for block_hash in hashes:
+            fake_store.objects.add(worker._namespaces[0].key(block_hash))
+        window_from = store_window(fake_store, worker, hashes, 4)
+        # The window at block 8 lost its last page, so only the end at 4 is complete.
+        store_window(fake_store, worker, hashes, 8)
+        fake_store.objects.discard(worker._namespaces[1].key(hashes[7]))
+
+        assert worker.find_prefix_hit(hashes, 0) == PrefixHit(4, {1: window_from})
+
+
+def test_worker_window_fallback_respects_what_is_on_device(store_config, fake_store):
+    with make_worker(fake_store, layout=make_window_layout(num_slots=32)) as worker:
+        hashes = [bytes([index]) * 16 for index in range(12)]
+        for block_hash in hashes[3:]:
+            fake_store.objects.add(worker._namespaces[0].key(block_hash))
+        store_window(fake_store, worker, hashes, 8)
+        # Resuming at 8 from a device prefix of 3 blocks: the store serves 5.
+        assert worker.find_prefix_hit(hashes[3:], 3).blocks == 5
+        # No stored end above the device prefix: nothing to serve.
+        assert worker.find_prefix_hit(hashes[9:], 9).blocks == 0
+
+
+def test_worker_window_hit_skips_what_is_on_device(store_config, fake_store):
+    with make_worker(fake_store, layout=make_window_layout()) as worker:
+        hashes = [bytes([index]) * 16 for index in range(6)]
+        for block_hash in hashes[4:]:
+            fake_store.objects.add(worker._namespaces[0].key(block_hash))
+        # Blocks 0..3 are on device, window included, so the store only needs
+        # the part of the end's window from block 4 on.
+        _, stale_end = worker.stale_blocks(1, 6 * TOKENS_PER_BLOCK)
+        for block in range(max(4, stale_end), 6):
+            fake_store.objects.add(worker._namespaces[1].key(hashes[block]))
+        assert worker.find_prefix_hit(hashes[4:], 4).blocks == 2
+
+
+class FakeWindowWorker:
+    """A lookup service over group 0 (full) and group 1 (a `WINDOW` window).
+
+    The window reads the blocks overlapping its last `WINDOW` tokens; the real
+    life cycle may keep a little more, which these tests do not depend on.
+    """
+
+    windowed_group_ids = (1,)
+
+    def __init__(self, hit: PrefixHit):
+        self.hit = hit
+        self.queries = []
+
+    def find_prefix_hit(self, block_hashes, first_block, rewind_tokens=0):
+        self.queries.append((list(block_hashes), first_block, rewind_tokens))
+        return PrefixHit(min(self.hit.blocks, len(block_hashes)), self.hit.window_present_from)
+
+    def sink_blocks(self, layer_group_id):
+        return 0
+
+    def stale_blocks(self, layer_group_id, history_length):
+        return 0, max(0, (history_length - WINDOW) // TOKENS_PER_BLOCK)
+
+
+def make_window_scheduler(store_config, hit=PrefixHit(0), rewind_tokens=0):
+    llm_args = make_llm_args()
+    llm_args.kv_cache_config.block_reuse_config = SimpleNamespace(
+        swa_endpoint_rewind_tokens=rewind_tokens
+    )
+    scheduler = MooncakeStoreConnectorScheduler(llm_args)
+    scheduler._worker = FakeWindowWorker(hit)
+    return scheduler
+
+
+def make_context_request(request_id, tokens, *, position=0, last_chunk=True):
+    request = make_request(request_id, tokens)
+    request.context_current_position = position
+    request.is_context_init_state = True
+    request.is_last_context_chunk = last_chunk
+    return request
+
+
+def window_data(request_id, tokens, full_pages, window_pages, computed_position=0):
+    data = request_data(request_id, tokens, full_pages)
+    data.computed_position = computed_position
+    data.new_block_ids_by_layer_group = [list(full_pages), list(window_pages)]
+    return data
+
+
+def pages_of(transfers, layer_group_id):
+    return [page.page_index for page in transfers.pages if page.layer_group_id == layer_group_id]
+
+
+def test_scheduler_saves_the_window_once_at_the_prompts_end(store_config):
+    scheduler = make_window_scheduler(store_config)
+    tokens = list(range(6 * TOKENS_PER_BLOCK))
+    request = make_context_request(1, tokens, last_chunk=False)
+    scheduler.get_num_new_matched_tokens(request, 0)
+
+    # The first report carries the whole prompt and the first chunk's pages.
+    first = scheduler.build_connector_meta(
+        SchedulerOutput(new_requests=[window_data(1, tokens, [10, 11, 12], [20, 21, 22])])
+    )
+    # A chunk short of the prompt's end saves full attention only.
+    assert pages_of(first.saves[0], 0) == [10, 11, 12]
+    assert pages_of(first.saves[0], 1) == []
+
+    request.context_current_position = 12
+    request.is_last_context_chunk = True
+    last = scheduler.build_connector_meta(
+        SchedulerOutput(cached_requests=[window_data(1, [], [13, 14, 15], [23, 24, 25], 12)])
+    )
+    # The window the prompt ends with: the blocks overlapping its last WINDOW
+    # tokens, blocks 4 and 5.
+    assert pages_of(last.saves[0], 0) == [13, 14, 15]
+    assert pages_of(last.saves[0], 1) == [24, 25]
+    assert scheduler.request_finished(request, []) is True
+
+
+def test_scheduler_saves_the_window_ahead_of_the_full_attention_blocks(store_config, monkeypatch):
+    for window_first, first_group in (("1", 1), ("0", 0)):
+        monkeypatch.setenv(scheduler_module.WINDOW_FIRST_ENV, window_first)
+        scheduler = make_window_scheduler(store_config)
+        tokens = list(range(6 * TOKENS_PER_BLOCK))
+        request = make_context_request(1, tokens)
+        scheduler.get_num_new_matched_tokens(request, 0)
+        metadata = scheduler.build_connector_meta(
+            SchedulerOutput(
+                new_requests=[
+                    window_data(1, tokens, [10, 11, 12, 13, 14, 15], [20, 21, 22, 23, 24, 25])
+                ]
+            )
+        )
+        (saves,) = metadata.saves
+        assert saves.pages[0].layer_group_id == first_group
+        assert pages_of(saves, 0) == [10, 11, 12, 13, 14, 15]
+        assert pages_of(saves, 1) == [24, 25]
+
+
+def test_scheduler_window_save_stops_at_what_the_request_still_holds(store_config):
+    """The last chunk's commit releases the rewind margin before the save thread runs."""
+    scheduler = make_window_scheduler(store_config, rewind_tokens=TOKENS_PER_BLOCK)
+    tokens = list(range(6 * TOKENS_PER_BLOCK))
+    request = make_context_request(1, tokens)
+    scheduler.get_num_new_matched_tokens(request, 0)
+
+    metadata = scheduler.build_connector_meta(
+        SchedulerOutput(
+            new_requests=[
+                window_data(1, tokens, [10, 11, 12, 13, 14, 15], [20, 21, 22, 23, 24, 25])
+            ]
+        )
+    )
+    # Only the window the prompt ends with, despite one block of rewind.
+    assert pages_of(metadata.saves[0], 1) == [24, 25]
+
+
+def test_scheduler_window_save_skips_blocks_the_window_has_passed(store_config):
+    scheduler = make_window_scheduler(store_config, rewind_tokens=4 * TOKENS_PER_BLOCK)
+    tokens = list(range(6 * TOKENS_PER_BLOCK))
+    request = make_context_request(1, tokens, position=4 * TOKENS_PER_BLOCK)
+    scheduler.get_num_new_matched_tokens(request, 4 * TOKENS_PER_BLOCK)
+
+    # The last chunk starts at block 4: blocks 0 and 1 have left the window and
+    # may hold another request's KV by now, even with a rewind that reaches them.
+    metadata = scheduler.build_connector_meta(
+        SchedulerOutput(
+            new_requests=[
+                window_data(1, tokens, [10, 11, 12, 13, 14, 15], [20, 21, 22, 23, 24, 25], 16)
+            ]
+        )
+    )
+    assert pages_of(metadata.saves[0], 1) == [24, 25]
+
+
+class LifeCycleWindowWorker(FakeWindowWorker):
+    """Stale range as `AttnLifeCycle.get_stale_range` computes it: window start (H + 1 - W) // tpb."""
+
+    def stale_blocks(self, layer_group_id, history_length):
+        return 0, max(0, (history_length + 1 - WINDOW) // TOKENS_PER_BLOCK)
+
+
+@pytest.mark.parametrize("tail, expected", [(0, [24, 25]), (TOKENS_PER_BLOCK - 2, [24, 25]), (TOKENS_PER_BLOCK - 1, [25])])
+def test_scheduler_window_save_skips_the_block_the_full_prompt_commit_releases(store_config, tail, expected):
+    """F1 (31 mod 32): with len % tpb == tpb - 1 the last chunk's commit to the full
+    length unlocks one more window block than the block-aligned end; it is not saved."""
+    scheduler = make_window_scheduler(store_config)
+    scheduler._worker = LifeCycleWindowWorker(PrefixHit(0))
+    tokens = list(range(6 * TOKENS_PER_BLOCK + tail))
+    request = make_context_request(1, tokens)
+    scheduler.get_num_new_matched_tokens(request, 0)
+    metadata = scheduler.build_connector_meta(
+        SchedulerOutput(
+            new_requests=[
+                window_data(1, tokens, [10, 11, 12, 13, 14, 15], [20, 21, 22, 23, 24, 25])
+            ]
+        )
+    )
+    assert pages_of(metadata.saves[0], 0) == [10, 11, 12, 13, 14, 15]
+    assert pages_of(metadata.saves[0], 1) == expected
+
+
+def chunked_prompt(scheduler, tokens):
+    """A cold prompt of 8 blocks in two chunks of 4; returns the two iterations' metadata."""
+    request = make_context_request(1, tokens, last_chunk=False)
+    scheduler.get_num_new_matched_tokens(request, 0)
+    first = scheduler.build_connector_meta(
+        SchedulerOutput(new_requests=[window_data(1, tokens, [10, 11, 12, 13], [20, 21, 22, 23])])
+    )
+    request.context_current_position = 4 * TOKENS_PER_BLOCK
+    request.is_last_context_chunk = True
+    last = scheduler.build_connector_meta(
+        SchedulerOutput(
+            cached_requests=[
+                window_data(1, [], [14, 15, 16, 17], [24, 25, 26, 27], 4 * TOKENS_PER_BLOCK)
+            ]
+        )
+    )
+    return first, last
+
+
+def test_scheduler_resaves_a_long_prompt_at_its_last_chunk(store_config, monkeypatch):
+    monkeypatch.setenv(scheduler_module.RESAVE_MIN_TOKENS_ENV, str(6 * TOKENS_PER_BLOCK))
+    first, last = chunked_prompt(
+        make_window_scheduler(store_config), list(range(8 * TOKENS_PER_BLOCK))
+    )
+    assert pages_of(first.saves[0], 0) == [10, 11, 12, 13]
+    # The whole prompt again, so the save path refreshes the head the first chunk wrote.
+    assert pages_of(last.saves[0], 0) == [10, 11, 12, 13, 14, 15, 16, 17]
+    assert pages_of(last.saves[0], 1) == [26, 27]
+
+
+def test_scheduler_does_not_resave_short_prompts_or_by_default(store_config, monkeypatch):
+    tokens = list(range(8 * TOKENS_PER_BLOCK))
+    _, last = chunked_prompt(make_window_scheduler(store_config), tokens)
+    assert pages_of(last.saves[0], 0) == [14, 15, 16, 17]
+    monkeypatch.setenv(scheduler_module.RESAVE_MIN_TOKENS_ENV, str(16 * TOKENS_PER_BLOCK))
+    _, last = chunked_prompt(make_window_scheduler(store_config), tokens)
+    assert pages_of(last.saves[0], 0) == [14, 15, 16, 17]
+
+
+def test_scheduler_loads_window_pages_only_where_the_runtime_resumes(store_config):
+    scheduler = make_window_scheduler(store_config, hit=PrefixHit(4, {1: 2}))
+    tokens = list(range(6 * TOKENS_PER_BLOCK + 1))
+    request = make_context_request(1, tokens)
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (4 * TOKENS_PER_BLOCK, False)
+
+    # Honoured in full: the cache gives the window pages for blocks 2 and 3 only.
+    request.context_current_position = 4 * TOKENS_PER_BLOCK
+    metadata = scheduler.build_connector_meta(
+        SchedulerOutput(
+            new_requests=[
+                window_data(
+                    1,
+                    tokens,
+                    [10, 11, 12, 13, 14, 15, 16],
+                    [BAD_PAGE_INDEX, BAD_PAGE_INDEX, 22, 23, 24, 25, 26],
+                )
+            ]
+        )
+    )
+    assert pages_of(metadata.loads[0], 0) == [10, 11, 12, 13]
+    assert pages_of(metadata.loads[0], 1) == [22, 23]
+
+
+def test_scheduler_refuses_a_short_honour_whose_window_is_not_stored(store_config):
+    scheduler = make_window_scheduler(store_config, hit=PrefixHit(4, {1: 2}))
+    tokens = list(range(6 * TOKENS_PER_BLOCK + 1))
+    request = make_context_request(1, tokens)
+    scheduler.get_num_new_matched_tokens(request, 0)
+
+    # The runtime resumes at block 2, whose window reads blocks 0 and 1: pages
+    # the store was never found to hold, since prompts do not end there.
+    request.context_current_position = 2 * TOKENS_PER_BLOCK
+    data = window_data(1, tokens, [10, 11, 12, 13, 14, 15, 16], [20, 21, 22, 23, 24, 25, 26])
+    with pytest.raises(RuntimeError, match="not found to hold"):
+        scheduler.build_connector_meta(SchedulerOutput(new_requests=[data]))
+
+
+def test_scheduler_passes_the_rewind_and_local_prefix_to_the_lookup(store_config):
+    scheduler = make_window_scheduler(store_config, rewind_tokens=8)
+    tokens = list(range(6 * TOKENS_PER_BLOCK))
+    scheduler.get_num_new_matched_tokens(make_context_request(1, tokens), 2 * TOKENS_PER_BLOCK)
+    _, first_block, rewind_tokens = scheduler._worker.queries[0]
+    assert (first_block, rewind_tokens) == (2, 8)
+
+
+def test_scheduler_saves_only_prompt_blocks_under_speculative_decoding(store_config):
+    """Rejected drafts rewind a request's page list, so a generated block's page may change hands."""
+    llm_args = make_llm_args()
+    llm_args.speculative_config = SimpleNamespace(max_draft_len=3)
+    scheduler = MooncakeStoreConnectorScheduler(llm_args)
+    scheduler._worker = FakeWorker(0)
+    tokens = list(range(2 * TOKENS_PER_BLOCK))
+    request = make_request(1, tokens)
+    scheduler.get_num_new_matched_tokens(request, 0)
+
+    first = scheduler.build_connector_meta(
+        SchedulerOutput(new_requests=[request_data(1, tokens, [4, 5])])
+    )
+    assert [page.page_index for page in first.saves[0].pages] == [4, 5]
+
+    more_tokens = list(range(2 * TOKENS_PER_BLOCK, 3 * TOKENS_PER_BLOCK))
+    second = scheduler.build_connector_meta(
+        SchedulerOutput(cached_requests=[request_data(1, more_tokens, [6])])
+    )
+    assert second.saves == []
+
+
+def test_scheduler_implements_the_per_layer_group_callbacks(store_config):
+    """A sliding-window cache has several layer groups, and the flat callbacks are never called for it."""
+    scheduler = make_window_scheduler(store_config)
+    tokens = list(range(2 * TOKENS_PER_BLOCK))
+    request = make_context_request(1, tokens)
+    scheduler.get_num_new_matched_tokens(request, 0)
+    scheduler.update_state_after_alloc_by_layer_group(request, [[4, 5], [6, 7]])
+    scheduler.build_connector_meta(
+        SchedulerOutput(new_requests=[window_data(1, tokens, [4, 5], [6, 7])])
+    )
+    assert scheduler.request_finished_by_layer_group(request, [[4, 5], [6, 7]]) is True
+    assert scheduler.request_finished_by_layer_group(request, [[4, 5], [6, 7]]) is False
+
+
+# ---- prefix reservations ----
+
+
+def wait_for(probe, timeout=5.0):
+    """Poll `probe` until it returns something truthy or `timeout` passes."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        value = probe()
+        if value:
+            return value
+        time.sleep(0.01)
+    return probe()
+
+
+def confirmed_load(reservation_id, request_id, start, end, pages_by_group, tokens, is_async=True):
+    return PrefixLoad(
+        reservation_id,
+        request_id,
+        start,
+        end,
+        is_async,
+        [list(p) for p in pages_by_group],
+        list(tokens),
+        None,
+    )
+
+
+def test_scheduler_reserve_prefix_promises_an_asynchronous_load(store_config):
+    scheduler = make_window_scheduler(store_config, hit=PrefixHit(4, {1: 2}))
+    request = make_context_request(1, list(range(6 * TOKENS_PER_BLOCK + 1)))
+    assert scheduler.reserve_prefix(request, 0, 11) == (4 * TOKENS_PER_BLOCK, True)
+
+
+def test_scheduler_reserve_prefix_loads_synchronously_on_request(store_config, monkeypatch):
+    monkeypatch.setenv(scheduler_module.SYNC_LOAD_ENV, "1")
+    scheduler = make_window_scheduler(store_config, hit=PrefixHit(4, {1: 2}))
+    request = make_context_request(1, list(range(6 * TOKENS_PER_BLOCK + 1)))
+    assert scheduler.reserve_prefix(request, 0, 11) == (4 * TOKENS_PER_BLOCK, False)
+
+
+def test_scheduler_reserve_prefix_offers_nothing_without_a_hit(store_config):
+    scheduler = make_window_scheduler(store_config, hit=PrefixHit(0))
+    request = make_context_request(1, list(range(6 * TOKENS_PER_BLOCK + 1)))
+    assert scheduler.reserve_prefix(request, 0, 11) == (0, False)
+
+
+def test_scheduler_turns_a_confirmed_reservation_into_page_transfers(store_config):
+    scheduler = make_window_scheduler(store_config, hit=PrefixHit(4, {1: 2}))
+    tokens = list(range(6 * TOKENS_PER_BLOCK + 1))
+    request = make_context_request(1, tokens)
+    scheduler.reserve_prefix(request, 0, 11)
+
+    full = [10, 11, 12, 13, 14, 15, 16]
+    window = [BAD_PAGE_INDEX, BAD_PAGE_INDEX, 22, 23, 24, 25, 26]
+    load = confirmed_load(11, 1, 0, 4 * TOKENS_PER_BLOCK, [full, window], tokens)
+    metadata = scheduler.build_connector_meta(SchedulerOutput(prefix_loads=[load]))
+    (prefix_load,) = metadata.prefix_loads
+    assert (prefix_load.reservation_id, prefix_load.is_async) == (11, True)
+    assert pages_of(prefix_load.transfers, 0) == [10, 11, 12, 13]
+    # The window reads blocks 2 and 3 at the load's end; 0 and 1 have no page.
+    assert pages_of(prefix_load.transfers, 1) == [22, 23]
+
+    # Once the request runs, nothing is loaded again and the store's blocks are
+    # not written back.
+    request.context_current_position = 4 * TOKENS_PER_BLOCK
+    later = scheduler.build_connector_meta(
+        SchedulerOutput(new_requests=[window_data(1, tokens, full, window, 4 * TOKENS_PER_BLOCK)])
+    )
+    assert later.loads == [] and later.prefix_loads == []
+    assert pages_of(later.saves[0], 0) == [14, 15]
+    assert pages_of(later.saves[0], 1) == [24, 25]
+
+
+def test_scheduler_refuses_a_confirmed_load_whose_window_was_not_found(store_config):
+    scheduler = make_window_scheduler(store_config, hit=PrefixHit(4, {1: 2}))
+    tokens = list(range(6 * TOKENS_PER_BLOCK + 1))
+    request = make_context_request(1, tokens)
+    scheduler.reserve_prefix(request, 0, 11)
+
+    # Confirmed only up to block 2, whose window reads blocks 0 and 1: pages the
+    # lookup never found, since no prompt ended there.
+    load = confirmed_load(
+        11, 1, 0, 2 * TOKENS_PER_BLOCK, [[10, 11, 12, 13], [20, 21, 22, 23]], tokens
+    )
+    with pytest.raises(RuntimeError, match="not found to hold"):
+        scheduler.build_connector_meta(SchedulerOutput(prefix_loads=[load]))
+
+
+def test_scheduler_release_trims_then_forgets_a_reservation(store_config):
+    scheduler = make_window_scheduler(store_config, hit=PrefixHit(4, {1: 2}))
+    request = make_context_request(1, list(range(6 * TOKENS_PER_BLOCK + 1)))
+    scheduler.reserve_prefix(request, 0, 11)
+    reservations = scheduler._requests[1].reservations
+
+    scheduler.release_prefix_reservation(request, 11, 2 * TOKENS_PER_BLOCK, 4 * TOKENS_PER_BLOCK)
+    assert (reservations[11].start, reservations[11].end) == (0, 2 * TOKENS_PER_BLOCK)
+    scheduler.release_prefix_reservation(request, 11, 0, 2 * TOKENS_PER_BLOCK)
+    assert 11 not in reservations
+
+
+def test_worker_loads_a_parked_requests_pages_off_the_executor_thread(
+    store_config, fake_store, staged_copies
+):
+    layout = make_layout()
+    with make_staged_worker(fake_store, store_config, layout=layout) as worker:
+        block_hash = b"\x05" * 16
+        key = worker._namespaces[0].key(block_hash)
+        fake_store.objects.add(key)
+        transfers = RequestTransfers(7, [PageTransfer(block_hash, 0, 3)])
+        worker.bind_connector_meta(
+            MooncakeStoreMetadata(prefix_loads=[PrefixLoadTransfers(21, True, transfers)])
+        )
+        worker.start_load_kv(None)
+
+        assert wait_for(worker.get_finished_prefix_loads) == [21]
+        (keys, addresses, _sizes) = fake_store.get_calls[0]
+        assert keys == [key]
+        # Through a loader's own slots, never the executor's.
+        loader_slots = {pool.slot_address(0) for pool in worker._async_load_stagings}
+        assert addresses[0][0] in loader_slots
+        assert addresses[0][0] != worker._load_staging.slot_address(0)
+        assert len(staged_copies) == 1
+
+
+def test_worker_starts_one_loader_per_configured_thread(
+    store_config, fake_store, staged_copies, monkeypatch
+):
+    monkeypatch.setenv(worker_module.LOAD_THREADS_ENV, "3")
+    with make_staged_worker(fake_store, store_config, layout=make_layout()) as worker:
+        assert len(worker._load_threads) == 3
+        # Each with slots of its own.
+        assert len({id(pool) for pool in worker._async_load_stagings}) == 3
+        assert all(thread.is_alive() for thread in worker._load_threads)
+    assert worker._load_threads == []
+
+
+def test_worker_refuses_a_loader_count_below_one(store_config, fake_store, monkeypatch):
+    monkeypatch.setenv(worker_module.LOAD_THREADS_ENV, "0")
+    with pytest.raises(ValueError, match="at least 1"):
+        MooncakeStoreConnectorWorker(make_llm_args())
+
+
+def test_node_budget_counts_a_staging_pool_per_loader_thread():
+    gib = 1 << 30
+    config = SimpleNamespace(global_segment_size=0, role=SimpleNamespace(loads=True, saves=True))
+    # The executor's pool, two loaders' and the save pool: 4 GiB of pinned staging.
+    validate_node_budget(
+        config, ranks_on_node=1, available_bytes=NODE_BUDGET_RESERVE_BYTES + 4 * gib, load_threads=2
+    )
+    with pytest.raises(ValueError, match="pin 4.0 GiB of staging"):
+        validate_node_budget(
+            config,
+            ranks_on_node=1,
+            available_bytes=NODE_BUDGET_RESERVE_BYTES + 4 * gib - 1,
+            load_threads=2,
+        )
+
+
+def test_worker_reports_a_synchronous_prefix_load_at_once(store_config, fake_store, staged_copies):
+    layout = make_layout()
+    with make_staged_worker(fake_store, store_config, layout=layout) as worker:
+        block_hash = b"\x06" * 16
+        fake_store.objects.add(worker._namespaces[0].key(block_hash))
+        transfers = RequestTransfers(7, [PageTransfer(block_hash, 0, 3)])
+        worker.bind_connector_meta(
+            MooncakeStoreMetadata(prefix_loads=[PrefixLoadTransfers(22, False, transfers)])
+        )
+        worker.start_load_kv(None)
+
+        assert worker.get_finished_prefix_loads() == [22]
+        assert worker.get_finished_prefix_loads() == []
+        (_keys, addresses, _sizes) = fake_store.get_calls[0]
+        assert addresses == [[worker._load_staging.slot_address(0)]]
+
+
+def test_worker_raises_a_failed_asynchronous_load_on_the_executor_thread(
+    store_config, fake_store, staged_copies
+):
+    layout = make_layout()
+    with make_staged_worker(fake_store, store_config, layout=layout) as worker:
+        block_hash = b"\x08" * 16
+        key = worker._namespaces[0].key(block_hash)
+        fake_store.objects.add(key)
+        fake_store.fail_gets_for.add(key)
+        transfers = RequestTransfers(7, [PageTransfer(block_hash, 0, 3)])
+        worker.bind_connector_meta(
+            MooncakeStoreMetadata(prefix_loads=[PrefixLoadTransfers(23, True, transfers)])
+        )
+        worker.start_load_kv(None)
+
+        def raised():
+            try:
+                worker.get_finished_prefix_loads()
+            except RuntimeError:
+                return True
+            return False
+
+        # The parked request can neither run nor be reported done, so the
+        # failure surfaces on the executor thread instead of hanging it.
+        assert wait_for(raised)
+        # A failed read is never scattered over the destination page.
+        assert staged_copies == []
+
+
+def test_worker_splits_a_long_probe_into_concurrent_chunks(store_config, fake_store, monkeypatch):
+    monkeypatch.setenv(worker_module.PROBE_CHUNK_ENV, "3")
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        keys = [f"k{index}" for index in range(8)]
+        fake_store.objects.update(keys[:5])
+        fake_store.exist_calls.clear()
+
+        assert worker._probe(keys) == [1, 1, 1, 1, 1, 0, 0, 0]
+        # Three calls of at most three keys, answered in key order.
+        assert sorted(len(call) for call in fake_store.exist_calls) == [2, 3, 3]
+        assert sorted(key for call in fake_store.exist_calls for key in call) == sorted(keys)
+
+
+def test_worker_probe_chunking_can_be_turned_off(store_config, fake_store, monkeypatch):
+    monkeypatch.setenv(worker_module.PROBE_CHUNK_ENV, "0")
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        keys = [f"k{index}" for index in range(8)]
+        fake_store.exist_calls.clear()
+        assert worker._probe(keys) == [0] * 8
+        assert [len(call) for call in fake_store.exist_calls] == [8]
+
+
+def test_worker_reports_a_failed_chunk_as_a_miss(store_config, fake_store, monkeypatch):
+    monkeypatch.setenv(worker_module.PROBE_CHUNK_ENV, "3")
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        real = fake_store.batch_is_exist
+
+        def flaky(keys):
+            if "k4" in keys:
+                raise RuntimeError("master unreachable")
+            return real(keys)
+
+        monkeypatch.setattr(fake_store, "batch_is_exist", flaky)
+        assert worker._probe([f"k{index}" for index in range(8)]) is None
+
+
+def test_scheduler_saves_only_the_blocks_a_chunk_completes(store_config):
+    """A drafter's extra KV tokens give the next chunk's first block a page before it is computed."""
+    scheduler = make_window_scheduler(store_config)
+    tokens = list(range(6 * TOKENS_PER_BLOCK))
+    request = make_context_request(1, tokens, last_chunk=False)
+    request.context_chunk_size = 2 * TOKENS_PER_BLOCK
+    scheduler.get_num_new_matched_tokens(request, 0)
+
+    first = scheduler.build_connector_meta(
+        SchedulerOutput(new_requests=[window_data(1, tokens, [10, 11, 12], [20, 21, 22])])
+    )
+    # Blocks 0 and 1 are computed; block 2 only has its page.
+    assert pages_of(first.saves[0], 0) == [10, 11]
+
+    request.context_current_position = 2 * TOKENS_PER_BLOCK
+    request.context_chunk_size = 4 * TOKENS_PER_BLOCK
+    request.is_last_context_chunk = True
+    last = scheduler.build_connector_meta(
+        SchedulerOutput(cached_requests=[window_data(1, [], [13, 14, 15], [23, 24, 25], 8)])
+    )
+    assert pages_of(last.saves[0], 0) == [12, 13, 14, 15]
+
+
+def test_validate_refuses_a_spec_recompute_tail():
+    llm_args = make_llm_args()
+    llm_args.speculative_config = SimpleNamespace(max_draft_len=7, context_recompute_tail=2048)
+    with pytest.raises(NotImplementedError, match="context_recompute_tail"):
+        validate_llm_args(llm_args)
+    llm_args.speculative_config.context_recompute_tail = 0
+    validate_llm_args(llm_args)
+
+
+def test_worker_starts_no_loader_threads_for_synchronous_loads(
+    store_config, fake_store, staged_copies, monkeypatch
+):
+    monkeypatch.setenv(worker_module.SYNC_LOAD_ENV, "1")
+    with make_staged_worker(fake_store, store_config, layout=make_layout()) as worker:
+        assert worker._load_threads == []
+        assert worker._async_load_stagings == []
+
+
+def test_worker_refuses_a_window_layout_without_prefix_reservations(store_config, fake_store):
+    llm_args = make_llm_args()
+    llm_args.scheduler_config = SimpleNamespace(enable_prefix_aware_scheduling=False)
+    worker = MooncakeStoreConnectorWorker(llm_args)
+    fake_store.workers.append(worker)
+    with pytest.raises(ValueError, match="enable_prefix_aware_scheduling"):
+        worker.register_kv_cache_layout(make_window_layout())
+
+
+def test_page_digests_record_save_load_and_retirement(
+    store_config, fake_store, monkeypatch, tmp_path
+):
+    """TRTLLM_MC_PAGE_DIGEST_DIR: a page written after its save shows up as a
+    `final` digest that differs from its `save` digest, and a load that put the
+    saved bytes back shows the same digest as the save."""
+    from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import digest as digest_module
+
+    memory = {}  # address -> bytes, standing in for device memory
+
+    def read(addresses, sizes):
+        return [memory.get(a, b"\x00" * s) for a, s in zip(addresses, sizes)]
+
+    monkeypatch.setattr(digest_module, "read_device_bytes", read)
+    monkeypatch.setenv(digest_module.PAGE_DIGEST_ENV, str(tmp_path / "digests"))
+    block_hash = b"\x06" * 16
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        worker._save_staging = worker._load_staging = None  # no device copies in a CPU test
+        saved_page = worker._addressing.buffers(0, 1)[0][0]
+        loaded_page = worker._addressing.buffers(0, 3)[0][0]
+        memory[saved_page] = b"saved-bytes"
+
+        worker._put([RequestTransfers(42, [PageTransfer(block_hash, 0, 1)])])
+        memory[saved_page] = b"written-late"  # a write after the save read the page
+        with worker._save_lock:
+            worker._closed_requests.add(42)
+        assert worker.get_finished([], [])[0] == [42]
+
+        memory[loaded_page] = b"saved-bytes"  # what a correct load leaves on the device
+        worker.bind_connector_meta(
+            SimpleNamespace(loads=[RequestTransfers(7, [PageTransfer(block_hash, 0, 3)])], saves=[], prefix_loads=())
+        )
+        worker.start_load_kv(None)
+        path = worker._page_digest.path
+
+    rows = [json.loads(line) for line in open(path)]
+    by_kind = {row["kind"]: row for row in rows}
+    assert set(by_kind) == {"save", "final", "load"}
+    assert len({row["key"] for row in rows}) == 1
+    assert by_kind["load"]["digest"] == by_kind["save"]["digest"]
+    assert by_kind["final"]["digest"] != by_kind["save"]["digest"]
+    assert by_kind["save"]["group"] == 0 and by_kind["save"]["ord"] == 0
+
+
+def test_page_digests_are_off_by_default(store_config, fake_store, monkeypatch):
+    monkeypatch.delenv("TRTLLM_MC_PAGE_DIGEST_DIR", raising=False)
+    with make_worker(fake_store, layout=make_layout()) as worker:
+        assert worker._page_digest is None
+
+
+
+
+def test_put_ships_window_pages_from_their_snapshot_slots(store_config, fake_store):
+    """mcgb2: a window page snapshotted by `wait_for_save` is put from its pinned slot, the rest live.
+
+    The store must receive exactly the slot address (the bytes copied on the execution stream before the
+    page could be recycled), never the device page the save thread would read later.
+    """
+    with make_worker(fake_store, layout=make_layout(num_groups=2)) as worker:
+        worker._save_staging = None
+        window_hash, full_hash = b"\x0a" * 16, b"\x0b" * 16
+        overrides = {(1, 3): (0, 0xABC000, 4096)}
+        written, present, _ = worker._put(
+            [RequestTransfers(1, [PageTransfer(full_hash, 0, 2), PageTransfer(window_hash, 1, 3)])],
+            overrides,
+        )
+        assert (written, present) == (2, 0)
+        by_key = {}
+        for keys, addresses, sizes in fake_store.put_calls:
+            for key, address, size in zip(keys, addresses, sizes):
+                by_key[key] = (address, size)
+        assert by_key[worker._namespaces[1].key(window_hash)] == ([0xABC000], [4096])
+        full_addresses, full_sizes = PageAddressing(make_layout(num_groups=2)).buffers(0, 2)
+        assert by_key[worker._namespaces[0].key(full_hash)] == (list(full_addresses), list(full_sizes))
+
+
+def test_drain_releases_window_snapshot_slots(store_config, fake_store):
+    """The save thread returns a pass's snapshot slots once its puts finish, so the ring cannot leak."""
+    released = []
+    with make_worker(fake_store, layout=make_layout(num_groups=2)) as worker:
+        worker._save_staging = None
+        worker._window_snapshot = SimpleNamespace(release=lambda slots: released.extend(slots))
+        with worker._save_lock:
+            worker._outstanding_saves[7] += 1
+        worker._save_queue.put(
+            (
+                SimpleNamespace(synchronize=lambda: None),
+                [RequestTransfers(7, [PageTransfer(b"\x0c" * 16, 1, 1)])],
+                time.monotonic(),
+                {(1, 1): (5, 0xDEF000, 4096)},
+            )
+        )
+        deadline = time.monotonic() + 5
+        while not released and time.monotonic() < deadline:
+            time.sleep(0.01)
+    assert released == [5]
+
+
+# ---- retiring superseded prompt-end windows (TRTLLM_MOONCAKE_STORE_WINDOW_KEEP; port of Zheyu Fu's 0046-0048) ----
+
+
+def test_scheduler_reports_a_prompt_end_and_where_it_resumed(store_config, monkeypatch):
+    monkeypatch.setenv(worker_module.WINDOW_KEEP_ENV, "2")
+    scheduler = make_window_scheduler(store_config, hit=PrefixHit(4, {1: 2}))
+    tokens = list(range(6 * TOKENS_PER_BLOCK + 1))
+    request = make_context_request(1, tokens, position=4 * TOKENS_PER_BLOCK)
+    scheduler.get_num_new_matched_tokens(request, 0)
+    metadata = scheduler.build_connector_meta(
+        SchedulerOutput(
+            new_requests=[
+                window_data(
+                    1,
+                    tokens,
+                    [10, 11, 12, 13, 14, 15, 16],
+                    [BAD_PAGE_INDEX, BAD_PAGE_INDEX, 22, 23, 24, 25, 26],
+                )
+            ]
+        )
+    )
+    (retire,) = metadata.retires
+    hashes = scheduler._requests[1].chain.hashes
+    assert (retire.end_block, retire.resume_block) == (6, 4)
+    assert retire.end_hash == hashes[5]
+    assert retire.hashes == list(hashes[:4])
+
+
+def test_scheduler_reports_no_prompt_end_by_default_or_for_a_cold_prompt(store_config, monkeypatch):
+    monkeypatch.delenv(worker_module.WINDOW_KEEP_ENV, raising=False)
+    tokens = list(range(6 * TOKENS_PER_BLOCK + 1))
+    # Off by default, even for a resumed prompt that saves its window.
+    scheduler = make_window_scheduler(store_config, hit=PrefixHit(4, {1: 2}))
+    scheduler.get_num_new_matched_tokens(make_context_request(1, tokens, position=4 * TOKENS_PER_BLOCK), 0)
+    data = window_data(
+        1, tokens, [10, 11, 12, 13, 14, 15, 16], [BAD_PAGE_INDEX, BAD_PAGE_INDEX, 22, 23, 24, 25, 26]
+    )
+    metadata = scheduler.build_connector_meta(SchedulerOutput(new_requests=[data]))
+    assert metadata.retires == [] and metadata.saves
+    monkeypatch.setenv(worker_module.WINDOW_KEEP_ENV, "2")
+    tokens = list(range(6 * TOKENS_PER_BLOCK))
+    scheduler = make_window_scheduler(store_config)
+    scheduler.get_num_new_matched_tokens(make_context_request(1, tokens), 0)
+    data = window_data(1, tokens, [10, 11, 12, 13, 14, 15], [20, 21, 22, 23, 24, 25])
+    # Nothing was resumed from, so there is no older window to link to.
+    assert scheduler.build_connector_meta(SchedulerOutput(new_requests=[data])).retires == []
+
+
+def retire_worker(fake_store, monkeypatch, keep, delay):
+    monkeypatch.setenv(worker_module.WINDOW_KEEP_ENV, str(keep))
+    monkeypatch.setenv(worker_module.WINDOW_RETIRE_DELAY_ENV, str(delay))
+    monkeypatch.setenv(worker_module.WINDOW_LINK_MIN_TOKENS_ENV, str(TOKENS_PER_BLOCK))
+    return make_worker(fake_store, layout=make_window_layout(num_slots=32))
+
+
+def chain_with_windows(fake_store, worker, ends, n=18):
+    hashes = [bytes([index]) * 16 for index in range(n)]
+    for block_hash in hashes:
+        fake_store.objects.add(worker._namespaces[0].key(block_hash))
+    for end in ends:
+        store_window(fake_store, worker, hashes, end)
+    return hashes
+
+
+def retire(worker, hashes, end, resume):
+    worker.bind_connector_meta(
+        MooncakeStoreMetadata(
+            retires=[WindowRetire(1, end, hashes[end - 1], resume, list(hashes[:resume]))]
+        )
+    )
+    worker.wait_for_save(None)
+
+
+def window_keys(worker, hashes, end, start=0):
+    _, stale_end = worker.stale_blocks(1, end * TOKENS_PER_BLOCK)
+    return {worker._namespaces[1].key(hashes[block]) for block in range(max(start, stale_end), end)}
+
+
+def test_worker_keeps_the_newest_windows_of_a_chain(store_config, fake_store, monkeypatch):
+    with retire_worker(fake_store, monkeypatch, keep=2, delay=0) as worker:
+        hashes = chain_with_windows(fake_store, worker, (4, 7, 10, 13, 16))
+        before = set(fake_store.objects)
+        # Turns ending at 7 .. 16, each resumed from the previous prompt end.
+        for end, resume in ((7, 4), (10, 7), (13, 10)):
+            retire(worker, hashes, end, resume)
+        assert wait_for(lambda: len(fake_store.remove_calls) == 1)
+        retire(worker, hashes, 16, 13)
+        assert wait_for(lambda: len(fake_store.remove_calls) == 2)
+        kept = window_keys(worker, hashes, 13) | window_keys(worker, hashes, 16)
+        gone = before - fake_store.objects
+        # Windows 7 and 10 lose their pages from the chain's floor (block 4: where its first linked end resumed) up
+        # to where the next kept window starts; the first window (4) and every full-attention page stay.
+        expected = set()
+        for target, newer in ((7, 10), (10, 13)):
+            low = worker.stale_blocks(1, target * TOKENS_PER_BLOCK)[1]
+            high = worker.stale_blocks(1, newer * TOKENS_PER_BLOCK)[1]
+            expected |= {worker._namespaces[1].key(hashes[b]) for b in range(max(low, 4), min(target, high))}
+        assert gone == expected and gone
+        assert not gone & kept
+        assert window_keys(worker, hashes, 4) <= fake_store.objects
+        assert all(worker._namespaces[0].key(block_hash) in fake_store.objects for block_hash in hashes)
+        assert kept <= fake_store.objects
+        assert all(force is False for _, force in fake_store.remove_calls)
+        # Each new end leaves a link to the end it resumed from; a retired end's link goes with its window.
+        assert struct.unpack("<qq", fake_store.get(worker._link_key(1, hashes[15]))) == (13, 4)
+        assert worker._link_key(1, hashes[6]) not in fake_store.objects
+        assert worker._link_key(1, hashes[9]) not in fake_store.objects
+        assert worker._retire_stats.total_retired == 2
+
+
+def test_worker_retires_nothing_without_enough_links_or_before_the_delay(
+    store_config, fake_store, monkeypatch
+):
+    with retire_worker(fake_store, monkeypatch, keep=3, delay=0) as worker:
+        hashes = chain_with_windows(fake_store, worker, (4, 7, 10, 13))
+        for end, resume in ((7, 4), (10, 7), (13, 10)):
+            retire(worker, hashes, end, resume)
+        assert wait_for(lambda: worker._retire_stats.ends == 3)
+        time.sleep(0.2)
+        assert fake_store.remove_calls == []
+    fake_store.remove_calls.clear()
+    with retire_worker(fake_store, monkeypatch, keep=1, delay=600) as worker:
+        hashes = chain_with_windows(fake_store, worker, (4, 7, 10))
+        retire(worker, hashes, 10, 7)
+        assert wait_for(lambda: worker._retire_stats.retired == 1)
+        assert fake_store.remove_calls == [] and len(worker._retire_due) == 1
+
+
+def test_worker_links_no_prompt_end_resumed_from_a_short_prefix(store_config, fake_store, monkeypatch):
+    with retire_worker(fake_store, monkeypatch, keep=1, delay=0) as worker:
+        monkeypatch.setattr(worker, "_link_min_tokens", 5 * TOKENS_PER_BLOCK)
+        hashes = chain_with_windows(fake_store, worker, (4, 7))
+        retire(worker, hashes, 7, 4)
+        assert wait_for(lambda: worker._retire_stats.ends == 1)
+        assert worker._link_key(1, hashes[6]) not in fake_store.objects
+        assert fake_store.remove_calls == []
+
+
+def test_worker_window_retirement_is_off_by_default(store_config, fake_store, monkeypatch):
+    """Unset (or 0): metadata carrying retires queues nothing and touches the store not at all."""
+    monkeypatch.delenv(worker_module.WINDOW_KEEP_ENV, raising=False)
+    with make_worker(fake_store, layout=make_window_layout(num_slots=32)) as worker:
+        assert worker._window_keep == 0
+        hashes = chain_with_windows(fake_store, worker, (4, 7, 10))
+        before = set(fake_store.objects)
+        for end, resume in ((7, 4), (10, 7)):
+            retire(worker, hashes, end, resume)
+        time.sleep(0.2)
+        assert worker._save_queue.qsize() == 0
+        assert worker._retire_stats.ends == 0 and worker._retire_due == []
+        assert fake_store.objects == before and fake_store.values == {} and fake_store.remove_calls == []
+
+
+def test_worker_retirement_forgets_removed_keys_in_the_local_stored_set(store_config, fake_store, monkeypatch):
+    """With the ldfix F3 local stored-key set on, a removed page must be re-saved, not skipped as known."""
+    monkeypatch.setenv("TRTLLM_MOONCAKE_STORE_LOCAL_STORED_SET", "1")
+    with retire_worker(fake_store, monkeypatch, keep=1, delay=0) as worker:
+        assert worker._local_stored is not None
+        hashes = chain_with_windows(fake_store, worker, (4, 7, 10))
+        worker._local_stored.add_many(set(fake_store.objects))
+        before = set(fake_store.objects)
+        retire(worker, hashes, 7, 4)
+        retire(worker, hashes, 10, 7)
+        assert wait_for(lambda: len(fake_store.remove_calls) == 1)
+        gone = before - fake_store.objects
+        assert gone
+        assert not any(worker._local_stored.known(sorted(gone)))
+        kept = sorted(fake_store.objects & before)
+        assert all(worker._local_stored.known(kept))
+
+
+def test_worker_removes_one_key_at_a_time_without_batch_remove(store_config, fake_store, monkeypatch):
+    """A binding without `batch_remove` falls back to non-forced per-key `remove`."""
+    with retire_worker(fake_store, monkeypatch, keep=1, delay=0) as worker:
+        calls = []
+
+        class NoBatch:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def __getattr__(self, name):
+                if name == "batch_remove":
+                    raise AttributeError(name)
+                return getattr(self._inner, name)
+
+            def remove(self, key, force=False):
+                calls.append((key, force))
+                return self._inner.batch_remove([key], force)[0]
+
+        worker._store = NoBatch(fake_store)
+        try:
+            fake_store.objects.update({"a", "b"})
+            assert worker._remove_keys(["a", "b", "c"]) == 2
+            assert calls == [("a", False), ("b", False), ("c", False)]
+        finally:
+            worker._store = fake_store
+
+
+# ---- window retirement: full-attention blocks the lookup found stored are not listed again ----
+
+
+class FullBlocksWindowWorker(FakeWindowWorker):
+    """A lookup that resumes at `hit.blocks` while the store holds full attention up to `full`."""
+
+    def __init__(self, hit, full):
+        super().__init__(hit)
+        self.full = full
+
+    def find_prefix_hit(self, block_hashes, first_block, rewind_tokens=0):
+        hit = super().find_prefix_hit(block_hashes, first_block, rewind_tokens)
+        return PrefixHit(hit.blocks, hit.window_present_from, full_blocks=self.full)
+
+
+def resumed_saves(store_config, monkeypatch, keep, resave=None):
+    if keep is None:
+        monkeypatch.delenv(worker_module.WINDOW_KEEP_ENV, raising=False)
+    else:
+        monkeypatch.setenv(worker_module.WINDOW_KEEP_ENV, str(keep))
+    if resave is not None:
+        monkeypatch.setenv(scheduler_module.RESAVE_MIN_TOKENS_ENV, str(resave))
+    scheduler = make_window_scheduler(store_config)
+    # The store holds full attention up to block 5, but the newest window it holds ends at block 2.
+    scheduler._worker = FullBlocksWindowWorker(PrefixHit(2, {1: 0}), full=5)
+    tokens = list(range(8 * TOKENS_PER_BLOCK + 1))
+    request = make_context_request(1, tokens, position=2 * TOKENS_PER_BLOCK)
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (2 * TOKENS_PER_BLOCK, False)
+    metadata = scheduler.build_connector_meta(
+        SchedulerOutput(
+            new_requests=[
+                window_data(
+                    1, tokens, [10, 11, 12, 13, 14, 15, 16, 17, 18], [20, 21, 22, 23, 24, 25, 26, 27, 28]
+                )
+            ]
+        )
+    )
+    return metadata
+
+
+def test_scheduler_does_not_relist_full_attention_the_store_holds_under_window_retirement(
+    store_config, monkeypatch
+):
+    """A retired window makes a request resume below where the store's full attention ends; the blocks in between
+    are recomputed, and the radix tree may rebase them onto pages it already holds (freeing this request's page) at
+    commit. They are in the store already, so they are not listed for saving."""
+    metadata = resumed_saves(store_config, monkeypatch, keep=3)
+    assert pages_of(metadata.loads[0], 0) == [10, 11]
+    assert pages_of(metadata.saves[0], 0) == [15, 16, 17]
+    # Also when a long prompt lists itself again at its last chunk.
+    metadata = resumed_saves(store_config, monkeypatch, keep=3, resave=TOKENS_PER_BLOCK)
+    assert pages_of(metadata.saves[0], 0) == [15, 16, 17]
+
+
+def test_scheduler_lists_every_computed_block_with_window_retirement_off(store_config, monkeypatch):
+    metadata = resumed_saves(store_config, monkeypatch, keep=None)
+    assert pages_of(metadata.saves[0], 0) == [12, 13, 14, 15, 16, 17]
+    metadata = resumed_saves(store_config, monkeypatch, keep=None, resave=TOKENS_PER_BLOCK)
+    assert pages_of(metadata.saves[0], 0) == [10, 11, 12, 13, 14, 15, 16, 17]
+
+
+def test_worker_reports_how_far_the_store_holds_full_attention_only_under_window_retirement(
+    store_config, fake_store, monkeypatch
+):
+    for keep, want in ((None, 0), ("3", 12)):
+        if keep is None:
+            monkeypatch.delenv(worker_module.WINDOW_KEEP_ENV, raising=False)
+        else:
+            monkeypatch.setenv(worker_module.WINDOW_KEEP_ENV, keep)
+        with make_worker(fake_store, layout=make_window_layout(num_slots=32)) as worker:
+            hashes = [bytes([index]) * 16 for index in range(12)]
+            for block_hash in hashes:
+                fake_store.objects.add(worker._namespaces[0].key(block_hash))
+            store_window(fake_store, worker, hashes, 4)
+            window_from = store_window(fake_store, worker, hashes, 7)
+            hit = worker.find_prefix_hit(hashes, 0, rewind_tokens=TOKENS_PER_BLOCK)
+            assert hit == PrefixHit(7, {1: window_from})
+            assert hit.full_blocks == want

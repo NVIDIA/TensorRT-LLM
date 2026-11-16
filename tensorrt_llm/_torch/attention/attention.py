@@ -11,6 +11,7 @@ from torch import nn
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
+from .. import adp_groups
 from ..distributed import (AllReduceParams, HelixAllToAllNative, alltoall_helix,
                            cp_allgather, reducescatter)
 from ..model_config import ModelConfig
@@ -595,9 +596,14 @@ class Attention(nn.Module):
         pp_size = self.mapping.pp_size
         cp_size = self.mapping.cp_size
         dp_size = 1
+        # Attention DP: every rank its own DP rank (tp 1), or, with TRTLLM_ADPTP_ATTN_TP=t (adp_groups), groups of
+        # t ranks running tensor-parallel attention: the projections below then shard over the group and the output
+        # projection all-reduces over it (a plain TP mapping over the group's ranks).
+        attn_group_tp = adp_groups.group_attn_tp(self.mapping)
+        sub_mapping_adp = self.mapping.enable_attention_dp and attn_group_tp == 1
         if self.mapping.enable_attention_dp:
-            dp_size = tp_size
-            tp_size = 1
+            dp_size = tp_size // attn_group_tp
+            tp_size = attn_group_tp
 
         if self.mapping.cp_size > 1:
             assert self.mapping.has_cp_helix(
@@ -611,7 +617,7 @@ class Attention(nn.Module):
             cp_config=self.mapping.cp_config,
             rank=self.mapping.rank,
             gpus_per_node=self.mapping.gpus_per_node,
-            enable_attention_dp=self.mapping.enable_attention_dp,
+            enable_attention_dp=sub_mapping_adp,
         )
         self.tp_size = tp_size
         self.cp_size = cp_size
@@ -669,7 +675,7 @@ class Attention(nn.Module):
             cp_size=1,
             rank=self.mapping.rank,
             gpus_per_node=self.mapping.gpus_per_node,
-            enable_attention_dp=self.mapping.enable_attention_dp,
+            enable_attention_dp=sub_mapping_adp,
         )
         self.mapping_o = mapping_o
 

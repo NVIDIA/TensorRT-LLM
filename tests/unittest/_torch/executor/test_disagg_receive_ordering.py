@@ -52,6 +52,8 @@ def _manager() -> Mock:
     manager = Mock(spec=KVCacheManagerV2)
     manager._stream = Mock()
     manager._disagg_receive_ready = {}
+    manager._on_allocation_stream = set()
+    manager._allocation_ready = {}
     manager._pending_preemption = {}
     manager.is_draft = False
     manager.kv_connector_manager = None

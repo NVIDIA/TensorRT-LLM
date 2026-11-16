@@ -15,8 +15,9 @@ device source of a GATHER.
 Semantics (per descriptor, as ``step_commit``'s module docstring states them,
 in the same int32 arithmetic): ``COPY`` ``dst[i] = staged[i]``; ``GATHER``
 ``dst[i * a6] = src[i * a4] + a5``; ``FILL`` ``dst[i * a6] = a5``; ``BLOCKS``
-``K[i] = 0`` if the page index is -1 else ``a4 * page``, ``V[i]`` the same plus
-``a5`` (``V`` at ``a6``). The host reads the COPY payload from the staging block
+``K[i] = bad`` if the page index is -1 else ``a4 * page``, ``V[i]`` the same plus
+``a5`` (``V`` at ``a6``), ``bad`` the descriptor's field 7 (0 on every BLOCKS row but
+the attention-op tables', -1). The host reads the COPY payload from the staging block
 and the BLOCKS page indices from the pinned page row at ``pack`` time; the
 stock kernel reads the same bytes at its execution time, and both are written
 by the host before the launch and not changed until the launch has executed
@@ -61,7 +62,7 @@ struct Row {
   int kind;
   int count;
   int a5;          // GATHER: add; FILL: value; BLOCKS: kv offset
-  int pad;
+  int bad;         // BLOCKS: the word of a BAD_PAGE_INDEX page (descriptor field 7)
 };
 struct Table {
   int n;
@@ -87,8 +88,8 @@ extern "C" __global__ void step_commit_inline(const __grid_constant__ Table t) {
       int page = t.words[r.src + i];
       unsigned scaled = (unsigned)page * (unsigned)(int)r.a4;
       int* dst_v = reinterpret_cast<int*>(r.a6);
-      dst[i] = page == -1 ? 0 : (int)scaled;
-      dst_v[i] = page == -1 ? 0 : (int)(scaled + (unsigned)r.a5);
+      dst[i] = page == -1 ? r.bad : (int)scaled;
+      dst_v[i] = page == -1 ? r.bad : (int)(scaled + (unsigned)r.a5);
     }
   }
 }
@@ -104,7 +105,7 @@ class _Row(ctypes.Structure):
         ("kind", ctypes.c_int32),
         ("count", ctypes.c_int32),
         ("a5", ctypes.c_int32),
-        ("pad", ctypes.c_int32),
+        ("bad", ctypes.c_int32),
     ]
 
 
@@ -130,7 +131,7 @@ _ROW_DTYPE = np.dtype(
         ("kind", "<i4"),
         ("count", "<i4"),
         ("a5", "<i4"),
-        ("pad", "<i4"),
+        ("bad", "<i4"),
     ]
 )
 assert _ROW_DTYPE.itemsize == ctypes.sizeof(_Row)
@@ -343,7 +344,8 @@ class InlineCommit:
         rows["kind"] = kinds
         rows["count"] = counts
         rows["a5"] = _to_i32(desc[:, 5])
-        rows["pad"] = 0
+        # BLOCKS: the bad-page word (field 7; 0 on every other kind's row).
+        rows["bad"] = _to_i32(desc[:, 7])
         src = desc[:, 2].copy()
         used = 0
         for i in np.flatnonzero(inline):

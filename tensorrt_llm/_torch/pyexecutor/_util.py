@@ -42,6 +42,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
 from tensorrt_llm.quantization import QuantAlgo
 
+from .. import adp_groups
 from ..attention.backends import get_sparse_attn_kv_cache_manager
 from ..disaggregation.kv_cache_transceiver import (
     AttentionTypeCpp, create_kv_cache_transceiver,
@@ -1360,7 +1361,8 @@ class KvCacheCreator:
             requests.append(request)
             remaining_tokens -= input_seq_len
         if self._mapping.enable_attention_dp:
-            requests = requests * self._mapping.tp_size
+            # One copy per attention-DP rank (per attention group with adp_groups).
+            requests = requests * adp_groups.dp_size(self._mapping)
         return requests
 
     def _create_dummy_encoder_inputs(self) -> List[MultimodalParams]:
@@ -1502,9 +1504,10 @@ class KvCacheCreator:
         # copies so each rank gets work during the estimation warmup. But the
         # scheduler distributes them evenly (1 per rank), so each rank's KV
         # cache only needs capacity for its own share, not all of them.
-        if self._mapping.enable_attention_dp and self._mapping.tp_size > 1:
-            num_cache_blocks = (num_cache_blocks + self._mapping.tp_size -
-                                1) // self._mapping.tp_size
+        # (Per attention group with adp_groups: the ranks of a group share one copy.)
+        dp = adp_groups.dp_size(self._mapping)
+        if self._mapping.enable_attention_dp and dp > 1:
+            num_cache_blocks = (num_cache_blocks + dp - 1) // dp
 
         # Max cuda graph warmup required tokens
         max_cuda_graph_bs = min(self._model_engine.batch_size,
@@ -2243,8 +2246,9 @@ class KvCacheCreator:
         if not isinstance(head_dim, int):
             head_dim = config.hidden_size // config.num_attention_heads
         dtype = self._layer_spec_dtype(model_config, fallback_dtype)
-        # Attention DP replicates attention weights, so every rank holds all heads.
-        tp_size = 1 if self._mapping.enable_attention_dp else self._mapping.tp_size
+        # Attention DP replicates attention weights, so every rank holds all heads (or its attention group's share,
+        # adp_groups).
+        tp_size = adp_groups.attn_tp_size(self._mapping)
         return ceil_div(heads, tp_size), head_dim, dtype, k_only
 
     @staticmethod

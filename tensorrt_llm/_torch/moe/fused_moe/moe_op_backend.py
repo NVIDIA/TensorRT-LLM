@@ -55,6 +55,38 @@ def register_op_backend(name: str):
     return decorator
 
 
+def _install_flashinfer_bf16_moe_tactic_pin() -> None:
+    """``TRTLLM_FI_BF16_MOE_TACTIC=<min_tokens>:<tile_n>:<config>``, e.g. ``2048:128:1``.
+
+    FlashInfer's autotuner is never entered for the BF16 MoE, so every call takes the
+    fallback, the smallest candidate tile (64 rows at 16K tokens). This answers its
+    ``choose_one`` with the given tactic for calls of at least ``min_tokens`` rows when the
+    tactic is valid for the shape. Tactics differ only in tiling, so the bits are the same.
+    """
+    spec = os.environ.get("TRTLLM_FI_BF16_MOE_TACTIC", "")
+    if not spec:
+        return
+    from flashinfer.autotuner import AutoTuner
+
+    tuner = AutoTuner.get()
+    if getattr(tuner, "_trtllm_bf16_moe_tactic_pin", None) == spec:
+        return
+    min_tokens, tile_n, config = (int(v) for v in spec.split(":"))
+    choose_one = type(tuner).choose_one.__get__(tuner)
+
+    def pinned(custom_op, runners, tuning_config, inputs, **kwargs):
+        if (
+            custom_op == "flashinfer::trtllm_bf16_moe"
+            and inputs[4].shape[0] >= min_tokens  # MoeRunnerInputs.hidden_states
+            and [tile_n, config] in [list(t) for t in runners[0].get_valid_tactics(inputs, None)]
+        ):
+            return runners[0], [tile_n, config]
+        return choose_one(custom_op, runners, tuning_config, inputs, **kwargs)
+
+    tuner.choose_one = pinned
+    tuner._trtllm_bf16_moe_tactic_pin = spec
+
+
 def get_op_backend(name: str) -> "MoEOpBackend":
     """Get a registered backend instance by name."""
     if name not in _MOE_OP_BACKEND_REGISTRY:
@@ -590,6 +622,7 @@ class FlashinferOpBackend(MoEOpBackend):
 
         # need to add this to the flashinfer side
         os.environ["FLASHINFER_EXTRA_LDFLAGS"] = "-Wl,-Bsymbolic-functions"
+        _install_flashinfer_bf16_moe_tactic_pin()
 
     def cvt_activation_type(self, activation_type) -> int:
         """Convert TRT-LLM ActivationType to FlashInfer ActivationType int value."""

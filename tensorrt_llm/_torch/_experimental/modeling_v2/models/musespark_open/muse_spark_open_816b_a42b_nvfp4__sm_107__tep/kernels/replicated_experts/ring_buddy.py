@@ -124,22 +124,41 @@ HALF_MAX_ROWS = 32
 STATIC_FROM = 28
 
 #: The ``prerouted_experts`` lever at TP8 (``configure(tep8_prerouted=True)``; the TP8 form of
-#: ``_PREROUTED``): the NVFP4 layers' 9..64-row decode calls on the tep8 two-window stack
+#: ``_PREROUTED``): the NVFP4 layers' 9..64-row (``_TEP8_PREROUTED_ROWS``) decode calls on the tep8 two-window stack
 #: (64 experts) take their routing tables from ``ring_buddy_assign`` (``meta_tile``, the same
 #: one-program kernel that places the step) and run FC1 / FC2 through TRT-LLM's
 #: ``fp4_block_scale_moe_prerouted`` op (the MoE runner without its routing kernel), at the
 #: tactic the stock call would run (the decode table's, else the autotuner's cached choice) when
-#: that tactic has 8-token tiles. Every expert row is bitwise the stock call's; only the order of
-#: an expert's rows in the permuted space differs (the routing kernel orders them by arrival, the
-#: tables by token). Calls the op does not serve keep the stock call. Off: the stock path. The
-#: call is ``ops/moe/prerouted_experts``' backend; on a build without the op, ring_buddy_assign
-#: writes no tables (``prerouted_experts.available``) and every call is the stock call.
+#: that tactic has 8-token tiles; a cached choice at another tile is treated as a cache miss: the
+#: prerouted call runs the stock call's fallback, the runner's default config at the tables' tile
+#: (``_stock_tactic``; a disaggregated generation server's warmup saves such entries). Every expert
+#: row is bitwise the stock call's at that tactic; only the order of an expert's rows in the
+#: permuted space differs (the routing kernel orders them by arrival, the tables by token). Calls
+#: the op does not serve keep the stock call. Off: the stock path. The call is
+#: ``ops/moe/prerouted_experts``' backend; on a build without the op, ring_buddy_assign writes no
+#: tables (``prerouted_experts.available``) and every call is the stock call.
 _TEP8_PREROUTED = False
 _PREROUTED_TILE = 8
+#: The TP8 prerouted calls' rows: 9..``configure(tep8_prerouted_max_rows=...)`` (the
+#: ``prerouted_experts`` lever's TEP8_MAX_ROWS, 64 by default). Above 64 rows (9..16 requests at
+#: K = 7; with ``tep8_ring_buddy_wide``'s MAX_ROWS raised so those steps run on the two-window stack)
+#: the tables are written for the tile the stock call runs there: the op's fallback config, tile
+#: nextPowerOfTwo(rows * top_k / 64) = 16 at 65..128 rows (``_prerouted_tile``), so every expert row
+#: stays bitwise the stock two-window call's; a call whose stock tactic has another tile keeps the
+#: stock call (``_tep8_prerouted_call``). The GB300 port of this band (``sm_103__tep8``,
+#: ``MUSESPARK_OPEN_TEP8_PREROUTED_MAX_ROWS=128``) passed its device gate and accuracy pair.
 _TEP8_PREROUTED_ROWS = range(9, 65)
+#: The prerouted tables' largest row count (sizes the op's index scratch).
+TEP8_PREROUTED_MAX_ROWS = 128
 #: The ``tep8_ring_buddy_wide`` lever (``configure(tep8_max_rows=64)``): the most decode rows the
 #: balanced tep8 stack serves (``_State.max_rows``); None keeps ``MAX_ROWS``.
 _TEP8_MAX_ROWS: Optional[int] = None
+
+
+def _prerouted_tile(rows: int) -> int:
+    """The token tile of the prerouted tables of a ``rows``-row two-window call: 8 up to 64 rows,
+    16 above (the stock call's fallback tile on the 64-expert window at 65..128 rows)."""
+    return _PREROUTED_TILE if rows <= 64 else 2 * _PREROUTED_TILE
 
 
 def _stock_tactic(
@@ -154,9 +173,23 @@ def _stock_tactic(
     act_type,
     tune_max_num_tokens,
 ):
-    """The ``(tile_n, config)`` the stock ``fp4_block_scale_moe_runner`` call runs on these inputs: the
-    autotuner's cached choice, looked up as that op looks it up, else (cache miss) the op's fallback, the
-    runner's default config. None while tuning, or when that is not an 8-token tile."""
+    """The ``(tile_n, config)`` the prerouted FC1 / FC2 run at on these inputs, or None (stock call).
+
+    The autotuner's cached choice for the stock ``fp4_block_scale_moe_runner`` call, looked up as
+    that op looks it up, when its tile is the prerouted tables' tile; else the op's cache-miss
+    fallback, the runner's default config at tile nextPowerOfTwo(rows * top_k / window) (8 at
+    9..64 rows on the 64-expert window, 16 at 65..128: ``_prerouted_tile``), when that is the
+    tables' tile. None while tuning, or when the fallback tile is not the tables' tile.
+
+    A cached tactic at another tile is treated as a cache miss, not as "keep the stock call": the
+    tables are written for one tile, and the lever's accuracy gates and perf baselines were taken
+    at the default config on that tile (cache miss). The served engine's autotuner is not blind to
+    these stacked shapes: a disaggregated generation server's warmup tunes the 64-expert window
+    (runner key ``(top_k, intermediate, local experts, act_type) = (8, 4096, 64, 0)``, 16..8192
+    tokens, tiles 16 / 32 / 64 / ...) and saves it into the shared ``TLLM_AUTOTUNER_CACHE_PATH``
+    file. Returning None on those entries sent every 9..64-row call back to the stock call and its
+    routing kernel (VR mbs16 TEP8 bs8, 64 rows: decode step 7.2 -> 8.1 ms). The override is
+    logged once per (window, cached tile, table tile)."""
     from tensorrt_llm._torch.autotuner import AutoTuner
     from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import (
         FP4BlockScaleMoERunner,
@@ -230,14 +263,19 @@ def _stock_tactic(
         ids,
     ]
     _, tactic = tuner.choose_one("trtllm::fp4_block_scale_moe_runner", [runner], config, inputs)
-    if tactic is None or isinstance(tactic, int) or -1 in tuple(tactic):
-        # No tuned entry (the served TEP8 engine's case: its autotuner never sees these stacked
-        # shapes): the op then runs its fallback, the runner's default config at tile
+    rows = x.fp4_tensor.shape[0]
+    # The tile ring_buddy_assign writes the prerouted tables for at this row count.
+    table_tile = _prerouted_tile(rows)
+    missed = tactic is None or isinstance(tactic, int) or -1 in tuple(tactic)
+    # A tuned entry at another tile (e.g. saved by a disaggregated generation server's warmup,
+    # which does tune these stacked shapes) is treated as a miss: see the docstring.
+    cached_tile = None if missed else int(tactic[0])
+    if missed or cached_tile != table_tile:
+        # The op's cache-miss fallback: the runner's default config at tile
         # nextPowerOfTwo(rows * top_k / window), clamped to its smallest tile (8).
-        rows = x.fp4_tensor.shape[0]
         avg = -(-rows * TOP_K // window)
         tile = max(8, 1 << max(avg - 1, 0).bit_length())
-        if tile != _PREROUTED_TILE:
+        if tile != table_tile:
             return None
         hidden = 2 * x.fp4_tensor.shape[1]
         ext = _prerouted_ext("tep8")
@@ -247,6 +285,14 @@ def _stock_tactic(
             tile,
             int(ext.default_config(tile, TOP_K, hidden, intermediate, window, rows, act_type)),
         )
+        if cached_tile is not None:
+            logger.info_once(
+                f"[musespark_open] prerouted_experts (tep8): the autotuner cache holds a "
+                f"{window}-expert stacked-window tactic at tile {cached_tile} for the stock "
+                f"expert call; it is not used: the prerouted FC1 / FC2 run the default config at "
+                f"tile {tile} (the routing tables' tile) instead",
+                key=f"musespark_open.tep8_prerouted.cached_tile_{window}_{cached_tile}_{tile}",
+            )
     else:
         tactic = (int(tactic[0]), int(tactic[1]))
     _prerouted_state[("tactic", key)] = tactic
@@ -267,13 +313,17 @@ def _tep8_prerouted_call(
     tune_max_num_tokens,
     tactic=None,
 ):
-    """FC1 / FC2 of a two-window call on ``ring_buddy_assign``'s tables, or None (the stock call)."""
+    """FC1 / FC2 of a two-window call on ``ring_buddy_assign``'s tables, or None (the stock call).
+
+    The tactic is ``tactic`` (the decode table's) when given, else ``_stock_tactic``'s, which keeps
+    the tables' tile even where the tuner cache holds a stacked-window tactic at another tile. A
+    tactic whose tile is not the tables' keeps the stock call."""
     rows = x.fp4_tensor.shape[0]
     if (
         rows not in _TEP8_PREROUTED_ROWS
         or meta.get("rows") != rows
         or window != 2 * BLOCK
-        or meta.get("tile") != _PREROUTED_TILE
+        or meta.get("tile") != _prerouted_tile(rows)
     ):
         return None
     if tactic is None:
@@ -297,7 +347,7 @@ def _tep8_prerouted_call(
     device = x.fp4_tensor.device
     dummy = _prerouted_state.get(("tep8_indexes", device))
     if dummy is None:
-        dummy = torch.zeros(_TEP8_PREROUTED_ROWS[-1] * TOP_K, dtype=torch.int32, device=device)
+        dummy = torch.zeros(TEP8_PREROUTED_MAX_ROWS * TOP_K, dtype=torch.int32, device=device)
         _prerouted_state[("tep8_indexes", device)] = dummy
     return ext.moe(
         x.fp4_tensor,
@@ -635,7 +685,7 @@ def _patch_routing(moe, state: _State) -> None:
                     state.static_from,
                     ranks=state.ranks,
                     half=state.half,
-                    meta_tile=_PREROUTED_TILE,
+                    meta_tile=_prerouted_tile(router_logits.shape[0]),
                 )
             else:
                 local_ids, weights_bf16, stats = ring_buddy_assign(
@@ -646,6 +696,8 @@ def _patch_routing(moe, state: _State) -> None:
                     state.static_from,
                     ranks=state.ranks,
                     half=state.half,
+                    # the BF16 layers' tile rule (tep8_tile_placement__BF16_COST_A, default off)
+                    bf16=state.kind == "bf16",
                 )
             state.placement = (
                 router_logits,
@@ -1048,6 +1100,7 @@ def configure(
     *,
     tep4_prerouted: bool = False,
     tep8_prerouted: bool = False,
+    tep8_prerouted_max_rows: int = 64,
     bf16_half_window: bool = False,
     tep8_max_rows: Optional[int] = None,
 ) -> None:
@@ -1061,16 +1114,34 @@ def configure(
             placement carries ``pool_direct_route``'s routing metadata run the prerouted
             expert op (``_PREROUTED``).
         tep8_prerouted: the ``prerouted_experts`` lever at TP8: ``ring_buddy_assign`` writes
-            the routing tables of the 9..64-row two-window calls, which run the prerouted
-            expert op (``_TEP8_PREROUTED``).
+            the routing tables of the 9..``tep8_prerouted_max_rows``-row two-window calls,
+            which run the prerouted expert op (``_TEP8_PREROUTED``).
+        tep8_prerouted_max_rows: the last row count of those calls (the lever's TEP8_MAX_ROWS):
+            64..``TEP8_PREROUTED_MAX_ROWS``; above 64 rows their tables have 16-token tiles.
         bf16_half_window: the ``bf16_half_window`` lever: the BF16 layers get the half
             window too (``_BF16_HALF_WINDOW``).
         tep8_max_rows: the ``tep8_ring_buddy_wide`` lever: the most decode rows the balanced
             tep8 stack serves; None keeps ``MAX_ROWS``.
+
+    Raises:
+        ValueError: for a ``tep8_prerouted_max_rows`` outside 64..``TEP8_PREROUTED_MAX_ROWS``
+            or a ``tep8_max_rows`` above it; nothing is set then.
     """
-    global _PREROUTED, _TEP8_PREROUTED, _BF16_HALF_WINDOW, _TEP8_MAX_ROWS
+    global _PREROUTED, _TEP8_PREROUTED, _BF16_HALF_WINDOW, _TEP8_MAX_ROWS, _TEP8_PREROUTED_ROWS
+    prerouted_rows = int(tep8_prerouted_max_rows)
+    if not 64 <= prerouted_rows <= TEP8_PREROUTED_MAX_ROWS:
+        raise ValueError(
+            f"ring_buddy: tep8_prerouted_max_rows {prerouted_rows} is outside "
+            f"64..{TEP8_PREROUTED_MAX_ROWS}"
+        )
+    if tep8_max_rows is not None and not 0 < int(tep8_max_rows) <= TEP8_PREROUTED_MAX_ROWS:
+        raise ValueError(
+            f"ring_buddy: tep8_max_rows {tep8_max_rows} is outside 1..{TEP8_PREROUTED_MAX_ROWS} "
+            "(ring_buddy_assign's one program covers 128 rows)"
+        )
     _PREROUTED = bool(tep4_prerouted)
     _TEP8_PREROUTED = bool(tep8_prerouted)
+    _TEP8_PREROUTED_ROWS = range(9, prerouted_rows + 1)
     _BF16_HALF_WINDOW = bool(bf16_half_window)
     _TEP8_MAX_ROWS = None if tep8_max_rows is None else int(tep8_max_rows)
 
@@ -1318,18 +1389,26 @@ def install(
         f"{sorted(set(skipped.values()))}"
     )
     if _TEP8_PREROUTED and ranks == 8 and windows >= 2 and balance and _prerouted.available():
+        wide_tiles = (
+            f", {2 * _PREROUTED_TILE}-token tiles at 65..{_TEP8_PREROUTED_ROWS[-1]} rows"
+            if _TEP8_PREROUTED_ROWS[-1] > 64
+            else ""
+        )
         logger.info(
             "[musespark_open] prerouted_experts (tep8): ring_buddy_assign writes the expert op's "
-            f"routing tables ({2 * block}-expert two-window stack, {_PREROUTED_TILE}-token tiles) "
-            f"for the NVFP4 layers' {_TEP8_PREROUTED_ROWS[0]}..{_TEP8_PREROUTED_ROWS[-1]}-row "
-            "decode calls, which run FC1 / FC2 on them through the prerouted expert op "
+            f"routing tables ({2 * block}-expert two-window stack, {_PREROUTED_TILE}-token tiles"
+            f"{wide_tiles}) for the NVFP4 layers' "
+            f"{_TEP8_PREROUTED_ROWS[0]}..{_TEP8_PREROUTED_ROWS[-1]}-row decode calls on the "
+            f"balanced stack (up to {_TEP8_MAX_ROWS if _TEP8_MAX_ROWS is not None else MAX_ROWS} "
+            "rows), which run FC1 / FC2 on them through the prerouted expert op "
             f"({_prerouted.describe()}) at the stock call's tactic, without the "
             f"routing kernel"
         )
     elif _TEP8_PREROUTED and ranks == 8 and windows >= 2 and balance:
         logger.warning(
             "[musespark_open] prerouted_experts (tep8) off: no prerouted backend (this build "
-            f"registers no trtllm::{_prerouted.OP_NAME}); the 9..64-row "
+            f"registers no trtllm::{_prerouted.OP_NAME}); the "
+            f"{_TEP8_PREROUTED_ROWS[0]}..{_TEP8_PREROUTED_ROWS[-1]}-row "
             "NVFP4 calls keep the stock expert call"
         )
     return sorted(installed + refreshed)

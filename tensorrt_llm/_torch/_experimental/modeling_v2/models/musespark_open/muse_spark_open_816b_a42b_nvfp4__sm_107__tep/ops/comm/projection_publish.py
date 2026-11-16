@@ -158,12 +158,82 @@ CUBLAS_WORKSPACE_ENV = ("CUBLAS_WORKSPACE_CONFIG", "CUBLASLT_WORKSPACE_SIZE")
 TEP8_PUBLISH_SPLITK = False
 #: Rows the split-K producer serves (the kernel's M <= 64 under the wide64 gate); other row counts keep cuBLAS.
 SPLITK_MIN_ROWS, SPLITK_MAX_ROWS = 33, 64
+#: ``configure``'s ``tep8_publish_splitk_max_rows`` (the ``tep8_publish_splitk`` lever's MAX_ROWS):
+#: the last row count the split-K producer publishes, 64 by default. Above 64 (up to
+#: ``SPLITK_WIDE_LIMIT``: 9..16 requests at K = 7) a slice publishes in ONE launch of the same
+#: tactic, compiled exactly as the 64-row launch (``_launch_options(SPLITK_MAX_ROWS, 4)``, so the
+#: same producer key), whose grid's second dimension takes the extra 64-row token tiles
+#: (``_run_splitk_wide``): split_k 4 is the 8-row cells', so every row keeps its one-request bits, as
+#: at 33..64 rows (vs cuBLAS one BF16 ulp at most). Each token tile's owner CTAs store each element
+#: of the slot once from registers (the census property, per tile), and the launch waits on its
+#: prerequisite grid before reading, so ``tep8_pool_programmatic_fork`` applies to these rows too.
+#: The GB300 port (``sm_103__tep8``, ``PUBLISH_WIDE=splitk`` + ``PUBLISH_WIDE_ONE=1``) served the
+#: same one-launch publication at 65..448 rows (device census and bits: PASS). Rubin needs its own
+#: census at 65..128 rows before a served run (``CERTIFIED_SPLITK_PRODUCERS_TP8`` keys the device
+#: code, which this does not change). Calls above the bound keep cuBLAS.
+SPLITK_WIDE_MAX_ROWS = 64
+SPLITK_WIDE_LIMIT = 128
+#: ``configure``'s ``tep8_publish_splitk_wide_pool_tile`` (the ``tep8_publish_splitk`` lever's
+#: WIDE_POOL_TILE): the pool slice's tile in that one launch (65..``SPLITK_WIDE_MAX_ROWS`` rows).
+#: ``64x16`` (default) is the 33..64-row tactic (64, 16, 4, 10): 8 x ceil(R / 16) x 4 CTAs (192 at
+#: 96 rows, 256 at 128: above 212 SMs at one CTA each, so a second wave), every 16-row token tile
+#: re-reading the rank's 8 MiB weight slice (6x / 8x). ``64x32`` is (64, 32, 4, 8): 96 CTAs at
+#: 65..96 rows, 128 at 97..128 (one wave), the slice read 3x / 4x. split_k 4 as the served tile (the
+#: 8-row cells'), so every row keeps its one-request bits. Its producer key is the unpool's
+#: certified one (same device code, owner epilogue, v4 mailbox, opt-in shared memory, PDL: the
+#: key does not name the shape), so it publishes only while that key is in a
+#: ``CERTIFIED_SPLITK_PRODUCERS_TP8`` entry of this SM count (``_splitk_publisher``), else the
+#: served tile. The census drove that key on the unpool's shape: rerun it at 65..128 rows with the
+#: pool on ``64x32`` before a served run (as the 65..128-row band itself needs).
+#: ``64x64`` is (64, 64, 4, 5): 8 x 2 x 4 = 64 CTAs at 65..128 rows (the slice read twice). Its
+#: point is co-residence: at 9..16 requests the pool GEMM runs beside the router push (96 / 128 CTAs
+#: of ~120 KiB shared memory each, holding their SMs ~8 us); with 64 CTAs of 208 KiB the pool takes
+#: the free SMs in one wave instead of waiting for the push's. Its key is unpool 64x64's (W10).
+SPLITK_WIDE_POOL_TILES = {"64x16": None, "64x32": (64, 32, 4, 8), "64x64": (64, 64, 4, 5)}
+SPLITK_WIDE_POOL_TILE = "64x16"
+#: ``configure``'s ``tep8_publish_splitk_wide_unpool_tile`` (the lever's WIDE_UNPOOL_TILE): the unpool
+#: slice's tile in that one launch. ``64x32`` (default) is the 33..64-row tactic (64, 32, 4, 8): 16 x
+#: ceil(R / 32) x 4 CTAs (192 at 65..96 rows, 256 at 97..128: a second wave on 212 SMs), the 8 MiB
+#: weight slice read 3x / 4x. ``64x64`` is (64, 64, 4, 5): 128 CTAs at 65..128 rows (one wave), the
+#: slice read twice; 5 stages keep the opt-in shared memory. split_k 4: each row's one-request bits.
+#: Its producer key is certified by the W10 census entry of ``CERTIFIED_SPLITK_PRODUCERS_TP8`` (212
+#: SMs); on a device or kernel build whose key no entry names, a set ``64x64`` is refused with an ERROR
+#: line and the unpool keeps its served tile (``_wide_unpool_tactic``): no run publishes uncensused.
+SPLITK_WIDE_UNPOOL_TILES = {"64x32": None, "64x64": (64, 64, 4, 5)}
+SPLITK_WIDE_UNPOOL_TILE = "64x32"
+#: ``configure``'s ``tep8_publish_splitk_wide_tile_min_rows`` (the lever's WIDE_TILE_MIN_ROWS): the
+#: fewest rows of a slice that takes WIDE_POOL_TILE / WIDE_UNPOOL_TILE; a 65..(this - 1)-row slice keeps
+#: the served tile in its one launch (same split_k: the same bits either way). 65 (default): the whole
+#: one-launch band. The served tiles fit one wave of 212 SMs up to 96 rows (pool 64x16: 8 x 6 x 4 = 192
+#: CTAs, unpool 64x32: 16 x 3 x 4 = 192) and spill into a second from 97 (224 / 256): vrg-poa / vrg-zga
+#: measured the wide tiles +0.14..+0.33 ms at bs12 (96 rows) and -0.08..-0.20 at bs13..16, so 97 keeps
+#: them where the served grid has a second wave.
+SPLITK_WIDE_TILE_MIN_ROWS = SPLITK_MAX_ROWS + 1
+#: ``configure``'s ``tep8_publish_splitk_min_rows`` (the ``tep8_publish_splitk`` lever's MIN_ROWS):
+#: the fewest rows of a TP8 decode step the publication takes, ``MIN_ROWS`` (33) by default. Below
+#: 33 (down to ``PUBLISH_MIN_LIMIT``: the 2..4-request steps at K = 7) a step publishes its pool /
+#: unpool slices, and its consumers (``pool_publish_fp4quant``, the post-FFN join) poll them, as a
+#: 33..64-row step does, instead of the 9..32-row gathers (``projection_gathers``), and only from the
+#: split-K producer: the cuBLAS census covers 33..448 rows, so these rows never publish from cuBLAS
+#: (``publish_min_rows``; ``publish_projection`` raises rather than run an uncensused producer).
+#: The split-K publication of these rows is the 33..64-row tactics' launch (the same pool / unpool
+#: tactics as the 9..32-row wide table's pool / unpool cells, split_k 4: each row's one-request
+#: bits), compiled with the 64-row launch's options (``_launch_options``: the conflict-free mailbox
+#: at every row count), so the same producer key: ``_splitk_publisher`` checks that the key at
+#: MIN_ROWS is the certified one and keeps 33 otherwise. The census drove 33..64 rows; Rubin needs
+#: the same census at MIN_ROWS..32 rows (both sites, the concurrent poller) before a served run.
+PUBLISH_MIN_ROWS = MIN_ROWS
+PUBLISH_MIN_LIMIT = 9
 #: (K, columns) of the TP8 slice -> (mma_m, mma_n, split_k, ab_stages): the fastest split-K-4 tile
 #: at 40..64 rows behind an early-releasing predecessor, from a sweep of the kernel's tactics.
 TP8_PUBLISH_SPLITK_TACTICS = {
     (UNPOOL_HIDDEN, POOL_HIDDEN // 8): (64, 16, 4, 10),  # pool [R, 8192] x [512, 8192]^T
     (POOL_HIDDEN, UNPOOL_HIDDEN // 8): (64, 32, 4, 8),  # unpool [R, 4096] x [1024, 4096]^T
 }
+#: The pool slice's (K, columns) key of ``TP8_PUBLISH_SPLITK_TACTICS``.
+POOL_SLICE = (UNPOOL_HIDDEN, POOL_HIDDEN // 8)
+#: The unpool slice's (K, columns) key of ``TP8_PUBLISH_SPLITK_TACTICS``.
+UNPOOL_SLICE = (POOL_HIDDEN, UNPOOL_HIDDEN // 8)
 #: (SM count, pool producer key, unpool producer key). The census first ran keyed on the hash of
 #: flashinfer's kernel file: the build with 64-row tiles, and that build with the deeper stages in
 #: oversized shared memory (128 checks, 0 failures), both with these tactics at 212 SMs. The entry
@@ -180,6 +250,16 @@ CERTIFIED_SPLITK_PRODUCERS_TP8 = frozenset(
             ("534e6f639ccb0b27b855884d278a2883", (64, 16, 4, 10), "owner", "v4", "opt-in", True),
             ("534e6f639ccb0b27b855884d278a2883", (64, 32, 4, 8), "owner", "v4", "opt-in", True),
         ),
+        # The 65..128-row one-launch tiles (WIDE_POOL_TILE 64x32, WIDE_UNPOOL_TILE 64x64): census W10
+        # (test_modeling_v2_wide128_bits.py) on Hecate, pool item vrg-poa job 1027577 (2026-11-10, 212
+        # SMs, tree b0cce84259): under a concurrent poller every slot element read only as the sentinel
+        # or its final value and was observed before its store, at 65 / 72 / 96 / 104 / 120 / 127 / 128
+        # rows, two trials each; each row bitwise the 33..64-row tactic and the 8-row cells (18 passed).
+        (
+            212,
+            ("534e6f639ccb0b27b855884d278a2883", (64, 32, 4, 8), "owner", "v4", "opt-in", True),
+            ("534e6f639ccb0b27b855884d278a2883", (64, 64, 4, 5), "owner", "v4", "opt-in", True),
+        ),
     }
 )
 #: Whether the kernel launches with programmatic dependent launch (the model's ``dispatch.LAUNCH_PDL``): it reads only
@@ -188,13 +268,93 @@ _SPLITK_PDL = True
 _splitk_state: dict = {}
 
 
-def _splitk_site_key(splitk, tactic: Tuple[int, int, int, int]):
-    """The producer key of one site's tactic, the same at every served row count, else None."""
-    keys = {
-        splitk.producer_key(rows, splitk.SplitKTactic(*tactic), _SPLITK_PDL)
-        for rows in (SPLITK_MIN_ROWS, SPLITK_MAX_ROWS)
-    }
+def _splitk_site_key(
+    splitk, tactic: Tuple[int, int, int, int], rows=(SPLITK_MIN_ROWS, SPLITK_MAX_ROWS)
+):
+    """The producer key of one site's tactic, the same at every row count of ``rows`` (the served
+    ones by default), else None."""
+    keys = {splitk.producer_key(r, splitk.SplitKTactic(*tactic), _SPLITK_PDL) for r in rows}
     return keys.pop() if len(keys) == 1 else None
+
+
+def _wide_tile_tactic(splitk, site: str, knob: str, tile: str, tactic):
+    """``tactic`` (``site``'s one-launch tile named ``tile`` by the lever's ``knob``) when its producer
+    key at the one launch's options is a certified key of this SM count (any site's), else None: the
+    served tile publishes, logged as an ERROR when the knob cannot engage (an uncertified key, or no
+    key: the census gate W10 fails then too), a warning when MAX_ROWS 64 leaves it no band."""
+    try:
+        sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+        key = _splitk_site_key(splitk, tactic, (SPLITK_MAX_ROWS,))
+    except Exception as error:  # noqa: BLE001 - no key: the served tile publishes
+        sms, key = None, f"unavailable ({error!r})"
+    certified = {
+        key for entry in CERTIFIED_SPLITK_PRODUCERS_TP8 if entry[0] == sms for key in entry[1:]
+    }
+    no_band = (
+        SPLITK_WIDE_MAX_ROWS <= SPLITK_MAX_ROWS or SPLITK_WIDE_TILE_MIN_ROWS > SPLITK_WIDE_MAX_ROWS
+    )
+    if no_band or key not in certified:
+        (logger.warning if no_band else logger.error)(
+            f"[musespark_open] projection_publish: tep8_publish_splitk {knob} {tile} ignored: "
+            + (
+                f"no one-launch band (MAX_ROWS {SPLITK_WIDE_MAX_ROWS}, WIDE_TILE_MIN_ROWS "
+                f"{SPLITK_WIDE_TILE_MIN_ROWS})"
+                if no_band
+                else f"its producer key {key} is not certified at {sms} SMs"
+            )
+            + f"; the {site} keeps its 33..64-row tile"
+        )
+        return None
+    logger.info(
+        f"[musespark_open] projection_publish: tep8_publish_splitk {knob} {tile}: the {site} slice "
+        f"of {SPLITK_WIDE_TILE_MIN_ROWS}..{SPLITK_WIDE_MAX_ROWS}-row steps publishes in one launch of "
+        f"{tactic} (a certified producer key; split_k 4: each row's one-request bits)"
+        + (
+            f"; {SPLITK_MAX_ROWS + 1}..{SPLITK_WIDE_TILE_MIN_ROWS - 1} rows keep the served tile "
+            "(WIDE_TILE_MIN_ROWS)"
+            if SPLITK_WIDE_TILE_MIN_ROWS > SPLITK_MAX_ROWS + 1
+            else ""
+        )
+    )
+    return tactic
+
+
+def _wide_pool_tactic(splitk):
+    """``SPLITK_WIDE_POOL_TILE``'s tactic, or None (``_wide_tile_tactic``)."""
+    return _wide_tile_tactic(
+        splitk,
+        "pool",
+        "WIDE_POOL_TILE",
+        SPLITK_WIDE_POOL_TILE,
+        SPLITK_WIDE_POOL_TILES[SPLITK_WIDE_POOL_TILE],
+    )
+
+
+def _wide_unpool_tactic(splitk):
+    """``SPLITK_WIDE_UNPOOL_TILE``'s tactic, or None (``_wide_tile_tactic``)."""
+    return _wide_tile_tactic(
+        splitk,
+        "unpool",
+        "WIDE_UNPOOL_TILE",
+        SPLITK_WIDE_UNPOOL_TILE,
+        SPLITK_WIDE_UNPOOL_TILES[SPLITK_WIDE_UNPOOL_TILE],
+    )
+
+
+def splitk_min_rows() -> int:
+    """The fewest rows the split-K producer publishes: ``PUBLISH_MIN_ROWS`` once ``_splitk_publisher``
+    accepted the band below 33 (``_splitk_state["low"]``), else ``SPLITK_MIN_ROWS``."""
+    return PUBLISH_MIN_ROWS if _splitk_state.get("low") else SPLITK_MIN_ROWS
+
+
+def publish_min_rows() -> int:
+    """The fewest rows of a TP8 decode step the publication takes: ``MIN_ROWS`` (33), or the
+    ``tep8_publish_splitk`` lever's MIN_ROWS when the split-K producer publishes and its key at that
+    row count is the certified one (``_splitk_publisher``). Rank-uniform: the plan, the files and the
+    device type decide."""
+    if PUBLISH_MIN_ROWS >= MIN_ROWS or _splitk_publisher() is None:
+        return MIN_ROWS
+    return splitk_min_rows()
 
 
 def _splitk_publisher():
@@ -232,14 +392,50 @@ def _splitk_publisher():
                 reason = f"the split-K producer census does not cover {key}"
             else:
                 publisher = (splitk.run_splitk_dense, splitk.SplitKTactic)
+                if PUBLISH_MIN_ROWS < SPLITK_MIN_ROWS:
+                    # The band below 33 publishes only with the certified key at its first row.
+                    low = tuple(
+                        _splitk_site_key(
+                            splitk, TP8_PUBLISH_SPLITK_TACTICS[site], (PUBLISH_MIN_ROWS,)
+                        )
+                        for site in (
+                            (UNPOOL_HIDDEN, POOL_HIDDEN // 8),
+                            (POOL_HIDDEN, UNPOOL_HIDDEN // 8),
+                        )
+                    )
+                    _splitk_state["low"] = low == key[1:]
+                    if not _splitk_state["low"]:
+                        logger.warning(
+                            "[musespark_open] projection_publish: tep8_publish_splitk MIN_ROWS "
+                            f"{PUBLISH_MIN_ROWS} ignored: the split-K producer key at "
+                            f"{PUBLISH_MIN_ROWS} rows {low} is not the certified one; decode steps "
+                            f"below {SPLITK_MIN_ROWS} rows keep the 9..32-row path"
+                        )
     except Exception as error:  # noqa: BLE001 - an unusable producer keeps cuBLAS
         reason = f"split-K kernel unavailable ({error!r})"
+    if publisher is not None and SPLITK_WIDE_POOL_TILES[SPLITK_WIDE_POOL_TILE] is not None:
+        _splitk_state["wide_pool"] = _wide_pool_tactic(splitk)
+    if publisher is not None and SPLITK_WIDE_UNPOOL_TILES[SPLITK_WIDE_UNPOOL_TILE] is not None:
+        _splitk_state["wide_unpool"] = _wide_unpool_tactic(splitk)
     if publisher is not None:
+        wide = (
+            f" ({SPLITK_MAX_ROWS + 1}..{SPLITK_WIDE_MAX_ROWS} rows in one launch of the same "
+            "tactics)"
+            if SPLITK_WIDE_MAX_ROWS > SPLITK_MAX_ROWS
+            else ""
+        )
         logger.info(
             "[musespark_open] projection_publish: TP8 pool / unpool slices of "
-            f"{SPLITK_MIN_ROWS}..{SPLITK_MAX_ROWS}-row steps publish from flashinfer split-K "
-            "(tep8_publish_splitk)"
+            f"{splitk_min_rows()}..{SPLITK_WIDE_MAX_ROWS}-row steps publish from flashinfer split-K "
+            f"(tep8_publish_splitk){wide}"
         )
+        if _splitk_state.get("low"):
+            logger.info(
+                "[musespark_open] projection_publish: tep8_publish_splitk MIN_ROWS "
+                f"{PUBLISH_MIN_ROWS}: decode steps of {PUBLISH_MIN_ROWS}..{SPLITK_MIN_ROWS - 1} rows "
+                "publish and join as 33..64-row steps do (split-K only, the 33..64-row tactics and "
+                "producer key), instead of the 9..32-row gathers"
+            )
     else:
         logger.warning(
             "[musespark_open] projection_publish: tep8_publish_splitk ignored, cuBLAS publishes: "
@@ -325,6 +521,11 @@ _JOIN_CL_LOGGED: list = []
 def configure(
     *,
     tep8_publish_splitk: bool = False,
+    tep8_publish_splitk_max_rows: int = 64,
+    tep8_publish_splitk_min_rows: int = MIN_ROWS,
+    tep8_publish_splitk_wide_pool_tile: str = "64x16",
+    tep8_publish_splitk_wide_unpool_tile: str = "64x32",
+    tep8_publish_splitk_wide_tile_min_rows: int = SPLITK_MAX_ROWS + 1,
     tep8_pool_programmatic: bool = False,
     tep8_join_pdl: bool = False,
     join_cluster: bool = False,
@@ -335,15 +536,70 @@ def configure(
     are the cuBLAS publication, the full stream-fork edge and the plain Triton join.
 
     Args:
-        tep8_publish_splitk: TP8 slices of 33..64 rows publish from the split-K kernel when its
-            producer is certified (``TEP8_PUBLISH_SPLITK``).
+        tep8_publish_splitk: TP8 slices of 33..``tep8_publish_splitk_max_rows`` rows publish from
+            the split-K kernel when its producer is certified (``TEP8_PUBLISH_SPLITK``).
+        tep8_publish_splitk_max_rows: that bound (``SPLITK_WIDE_MAX_ROWS``): 64..
+            ``SPLITK_WIDE_LIMIT``; above 64 rows one launch per slice (``_run_splitk_wide``).
+        tep8_publish_splitk_min_rows: the fewest rows of a step the publication takes
+            (``PUBLISH_MIN_ROWS``): ``PUBLISH_MIN_LIMIT``..``MIN_ROWS``; below 33 only with the
+            split-K producer (``publish_min_rows``).
+        tep8_publish_splitk_wide_pool_tile: the pool slice's tile at 65..
+            ``tep8_publish_splitk_max_rows`` rows (``SPLITK_WIDE_POOL_TILE``), a name of
+            ``SPLITK_WIDE_POOL_TILES``.
+        tep8_publish_splitk_wide_unpool_tile: the unpool slice's tile there
+            (``SPLITK_WIDE_UNPOOL_TILE``), a name of ``SPLITK_WIDE_UNPOOL_TILES``.
+        tep8_publish_splitk_wide_tile_min_rows: the fewest rows of a slice that takes those two
+            tiles (``SPLITK_WIDE_TILE_MIN_ROWS``): ``SPLITK_MAX_ROWS`` + 1..``SPLITK_WIDE_LIMIT``.
         tep8_pool_programmatic: the TP8 pool slice GEMM's fork edge from the post-attention hop
             is made programmatic while capturing (``TEP8_POOL_PROGRAMMATIC``).
         tep8_join_pdl: the post-FFN join launches with PDL and an entry trigger
             (``TEP8_JOIN_PDL``).
         join_cluster: the post-FFN join runs as the bitwise cluster kernel (``JOIN_CLUSTER``).
+
+    Raises:
+        ValueError: for a ``tep8_publish_splitk_max_rows`` outside
+            ``SPLITK_MAX_ROWS``..``SPLITK_WIDE_LIMIT`` or a ``tep8_publish_splitk_min_rows``
+            outside ``PUBLISH_MIN_LIMIT``..``MIN_ROWS``, or a
+            ``tep8_publish_splitk_wide_pool_tile`` not in ``SPLITK_WIDE_POOL_TILES`` (or an unpool
+            tile not in ``SPLITK_WIDE_UNPOOL_TILES``), or a ``tep8_publish_splitk_wide_tile_min_rows``
+            outside ``SPLITK_MAX_ROWS`` + 1..``SPLITK_WIDE_LIMIT``; nothing is set then.
     """
     global TEP8_PUBLISH_SPLITK, TEP8_POOL_PROGRAMMATIC, TEP8_JOIN_PDL, JOIN_CLUSTER
+    global SPLITK_WIDE_MAX_ROWS, PUBLISH_MIN_ROWS, SPLITK_WIDE_POOL_TILE, SPLITK_WIDE_UNPOOL_TILE
+    global SPLITK_WIDE_TILE_MIN_ROWS
+    tile_rows = int(tep8_publish_splitk_wide_tile_min_rows)
+    if not SPLITK_MAX_ROWS + 1 <= tile_rows <= SPLITK_WIDE_LIMIT:
+        raise ValueError(
+            f"projection_publish: tep8_publish_splitk_wide_tile_min_rows {tile_rows} is outside "
+            f"{SPLITK_MAX_ROWS + 1}..{SPLITK_WIDE_LIMIT}"
+        )
+    if tep8_publish_splitk_wide_unpool_tile not in SPLITK_WIDE_UNPOOL_TILES:
+        raise ValueError(
+            "projection_publish: tep8_publish_splitk_wide_unpool_tile "
+            f"{tep8_publish_splitk_wide_unpool_tile!r} is not one of {list(SPLITK_WIDE_UNPOOL_TILES)}"
+        )
+    if tep8_publish_splitk_wide_pool_tile not in SPLITK_WIDE_POOL_TILES:
+        raise ValueError(
+            "projection_publish: tep8_publish_splitk_wide_pool_tile "
+            f"{tep8_publish_splitk_wide_pool_tile!r} is not one of {list(SPLITK_WIDE_POOL_TILES)}"
+        )
+    wide_rows = int(tep8_publish_splitk_max_rows)
+    if not SPLITK_MAX_ROWS <= wide_rows <= SPLITK_WIDE_LIMIT:
+        raise ValueError(
+            f"projection_publish: tep8_publish_splitk_max_rows {wide_rows} is outside "
+            f"{SPLITK_MAX_ROWS}..{SPLITK_WIDE_LIMIT}"
+        )
+    low_rows = int(tep8_publish_splitk_min_rows)
+    if not PUBLISH_MIN_LIMIT <= low_rows <= MIN_ROWS:
+        raise ValueError(
+            f"projection_publish: tep8_publish_splitk_min_rows {low_rows} is outside "
+            f"{PUBLISH_MIN_LIMIT}..{MIN_ROWS}"
+        )
+    SPLITK_WIDE_MAX_ROWS = wide_rows
+    PUBLISH_MIN_ROWS = low_rows
+    SPLITK_WIDE_POOL_TILE = str(tep8_publish_splitk_wide_pool_tile)
+    SPLITK_WIDE_UNPOOL_TILE = str(tep8_publish_splitk_wide_unpool_tile)
+    SPLITK_WIDE_TILE_MIN_ROWS = tile_rows
     TEP8_PUBLISH_SPLITK = bool(tep8_publish_splitk)
     TEP8_POOL_PROGRAMMATIC = bool(tep8_pool_programmatic)
     TEP8_JOIN_PDL = bool(tep8_join_pdl)
@@ -744,7 +1000,11 @@ def programmatic_from(stream: torch.cuda.Stream, sources) -> bool:
 
 def _splitk_tactic(hidden: torch.Tensor, weight: torch.Tensor, slot: torch.Tensor):
     """The split-K tactic for this publication, or None (cuBLAS)."""
-    if not SPLITK_MIN_ROWS <= hidden.shape[0] <= SPLITK_MAX_ROWS or hidden.dim() != 2:
+    if hidden.dim() != 2 or hidden.shape[0] > SPLITK_WIDE_MAX_ROWS:
+        return None
+    if hidden.shape[0] < SPLITK_MIN_ROWS and (
+        PUBLISH_MIN_ROWS >= SPLITK_MIN_ROWS or hidden.shape[0] < publish_min_rows()
+    ):
         return None
     tactic = TP8_PUBLISH_SPLITK_TACTICS.get((hidden.shape[1], weight.shape[0]))
     if tactic is None or _splitk_publisher() is None:
@@ -1022,15 +1282,113 @@ def publish_projection(hidden: torch.Tensor, weight: torch.Tensor, slot: torch.T
     are the publication. ``weight`` is the rank's ``[columns, K]`` row slice of the
     projection's weight (contiguous rows of the loaded weight; no copy). Only with a
     certified producer (``producer_refusal``). With ``TEP8_PUBLISH_SPLITK`` a TP8 slice of
-    33..64 rows publishes from the split-K kernel instead, when its producer is certified
-    (``_splitk_publisher``).
+    33..``SPLITK_WIDE_MAX_ROWS`` rows publishes from the split-K kernel instead, when its producer
+    is certified (``_splitk_publisher``); above 64 rows in one launch (``_run_splitk_wide``).
     """
     tactic = _splitk_tactic(hidden, weight, slot)
+    if tactic is None and hidden.dim() == 2 and hidden.shape[0] < MIN_ROWS:
+        # tep8_publish_splitk's MIN_ROWS: never cuBLAS (uncensused) and never a per-site fallback.
+        tactic, hidden, weight = _low_rows_operands(hidden, weight, slot)
     if tactic is not None:
         run_splitk_dense, splitk_tactic = _splitk_publisher()
+        if hidden.shape[0] > SPLITK_MAX_ROWS:
+            if hidden.shape[0] < SPLITK_WIDE_TILE_MIN_ROWS:
+                pass  # WIDE_TILE_MIN_ROWS: the served tile (the same bits)
+            elif (hidden.shape[1], weight.shape[0]) == POOL_SLICE:
+                tactic = _splitk_state.get("wide_pool") or tactic
+            elif (hidden.shape[1], weight.shape[0]) == UNPOOL_SLICE:
+                tactic = _splitk_state.get("wide_unpool") or tactic
+            _run_splitk_wide(hidden, weight, slot, splitk_tactic(*tactic))
+            return
         run_splitk_dense(hidden, weight.t(), None, slot, _SPLITK_PDL, splitk_tactic(*tactic))
         return
     torch.mm(hidden, weight.t(), out=slot)
+
+
+_LOW_ROWS_COPIES: list = []
+
+
+def _low_rows_operands(hidden: torch.Tensor, weight: torch.Tensor, slot: torch.Tensor):
+    """``(tactic, hidden, weight)`` for a slice of fewer than ``MIN_ROWS`` rows that ``_splitk_tactic``
+    declined, on a step the publication armed (``publish_min_rows``, so the split-K producer and its
+    certified key at MIN_ROWS are there).
+
+    Below 33 rows cuBLAS never publishes (its census is 33..448), and a slice may not fall back to
+    the 9..32-row gathers on its own: its layer's buffer would drop out of the transport's alternation
+    (two consecutive calls on one buffer) while its peers, which took the publication, poll the slot.
+    So every rank-local reason ``_splitk_tactic`` declines for is served here instead: grad mode (the
+    kernel is inference-only either way) and an activation or weight slice that is not contiguous
+    or 32-byte aligned (published from a fresh contiguous copy: same values, so same bits). Only a
+    call the split-K producer cannot serve at all raises: no tactic for the shape, no producer, a
+    dtype other than BF16, or a slot that is not this call's ``[rows, columns]`` (all fixed by the
+    layer and the plan, so alike on every rank and step, and excluded by ``PublishedProjections``).
+    """
+    rows = hidden.shape[0]
+    tactic = TP8_PUBLISH_SPLITK_TACTICS.get((hidden.shape[1], weight.shape[0]))
+    reason = None
+    if tactic is None or _splitk_publisher() is None or rows < publish_min_rows():
+        reason = "no split-K producer serves it"
+    elif not hidden.dtype == weight.dtype == slot.dtype == torch.bfloat16:
+        reason = f"dtypes {hidden.dtype} / {weight.dtype} / {slot.dtype}"
+    elif tuple(slot.shape) != (rows, weight.shape[0]) or not slot.is_contiguous():
+        reason = f"slot {tuple(slot.shape)} contiguous={slot.is_contiguous()}"
+    elif slot.data_ptr() % 32:
+        reason = "a slot that is not 32-byte aligned"
+    if reason is not None:
+        raise RuntimeError(
+            f"[musespark_open] projection_publish: a {rows}-row slice {tuple(hidden.shape)} x "
+            f"{tuple(weight.shape)} cannot publish from the split-K producer ({reason}), and the cuBLAS "
+            f"census covers {MIN_ROWS}..448 rows only"
+        )
+    copied = []
+    if not hidden.is_contiguous() or hidden.data_ptr() % 32:
+        hidden = torch.empty(hidden.shape, dtype=hidden.dtype, device=hidden.device).copy_(hidden)
+        copied.append("activation")
+    if not weight.is_contiguous() or weight.data_ptr() % 32:
+        weight = torch.empty(weight.shape, dtype=weight.dtype, device=weight.device).copy_(weight)
+        copied.append("weight slice")
+    key = ("copy", tuple(copied)) if copied else ("grad", torch.is_grad_enabled())
+    if key not in _LOW_ROWS_COPIES:
+        _LOW_ROWS_COPIES.append(key)
+        logger.warning(
+            f"[musespark_open] projection_publish: a {rows}-row slice publishes from split-K "
+            + (
+                f"through a contiguous aligned copy of its {' and '.join(copied)}"
+                if copied
+                else f"with grad mode {'on' if torch.is_grad_enabled() else 'off'}"
+            )
+            + " (_splitk_tactic declined it; below 33 rows there is no cuBLAS fallback)"
+        )
+    return tactic, hidden, weight
+
+
+def _run_splitk_wide(hidden: torch.Tensor, weight: torch.Tensor, slot: torch.Tensor, tactic) -> None:
+    """``SPLITK_WIDE_MAX_ROWS``: ``run_splitk_dense`` of a 65..``SPLITK_WIDE_LIMIT``-row slice in ONE
+    launch, compiled exactly as the 64-row launch (``_launch_options(SPLITK_MAX_ROWS, split_k)``: the
+    33..64-row publication's producer key). The tactic is validated at the 64-row launch's M (tile,
+    K partition, shared memory); the kernel itself tiles any M (grid y = token tiles x split_k).
+    split_k fixes every element's bits (the K partition and its cluster-rank reduction order), so each
+    row is what the 33..64-row launch gives it (its one-request bits)."""
+    from ..gemm import splitk_gemm as sk
+
+    a, b = hidden, weight.t()
+    m, n, k = sk._validate_runtime_tensors(a, b, None, slot)
+    if not SPLITK_MAX_ROWS < m <= SPLITK_WIDE_LIMIT:
+        raise ValueError(
+            f"projection_publish: one-launch split-K publication takes {SPLITK_MAX_ROWS + 1}.."
+            f"{SPLITK_WIDE_LIMIT} rows, got {m}"
+        )
+    sk.validate_tactic(tactic, SPLITK_MAX_ROWS, n, k)
+    cute_tensors = sk._to_cute_swap(a, b, slot, None)
+    compiled = sk._get_compiled_splitk_kernel(
+        dtype=a.dtype,
+        tactic=tactic,
+        use_pdl=_SPLITK_PDL,
+        has_bias=False,
+        leading_dims=cute_tensors[4],
+        **sk._launch_options(SPLITK_MAX_ROWS, tactic.split_k),
+    )
+    compiled(*cute_tensors[:3], sk._cuda.CUstream(torch.cuda.current_stream(a.device).cuda_stream))
 
 
 class _GuardWords:

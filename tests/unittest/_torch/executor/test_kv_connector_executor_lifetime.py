@@ -20,6 +20,7 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.request_utils import RequestBroadcaster
+from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings.executor import FinishReason
 
 pytestmark = pytest.mark.cpu_only
@@ -27,6 +28,9 @@ pytestmark = pytest.mark.cpu_only
 
 def _executor() -> PyExecutor:
     executor = object.__new__(PyExecutor)
+    executor.enable_attention_dp = False
+    executor._kv_connector_failed = False
+    executor._kv_connector_has_pending = False
     executor.kv_connector_manager = Mock(spec=KvCacheConnectorManager)
     # Set explicitly: `capacity_only` is not on the spec, so a double that
     # leaves it unset fails loudly rather than silently lifting the executor
@@ -38,6 +42,7 @@ def _executor() -> PyExecutor:
     executor.kv_connector_manager.has_pending_loads.return_value = False
     executor.kv_connector_manager.get_finished.return_value = []
     executor.kv_connector_manager.take_finished_load_terminations.return_value = []
+    executor.kv_connector_manager.take_failed_async_load_requests.return_value = set()
     executor.kv_cache_manager = Mock()
     # A bare Mock answers both of these truthily, which would route every
     # finished request through the deferred-preemption path.
@@ -53,6 +58,7 @@ def _executor() -> PyExecutor:
     executor._do_terminate_request = Mock()
     executor._enqueue_responses = Mock()
     executor._release_transfer = Mock()
+    executor.store_host_donor = None
     return executor
 
 
@@ -171,18 +177,29 @@ def test_allocation_survives_until_the_completion_poll() -> None:
     executor._do_terminate_request.assert_not_called()
 
 
-def test_load_dispatch_marks_ownership_before_worker_launch(monkeypatch) -> None:
+@pytest.mark.parametrize("park_load", [False, True])
+def test_load_dispatch_marks_ownership_before_worker_launch(
+    monkeypatch: pytest.MonkeyPatch, park_load: bool
+) -> None:
     executor = _executor()
     connector = executor.kv_connector_manager
     calls = []
-    connector.take_scheduled_requests_pending_load.side_effect = lambda batch: calls.append("park")
+    batch = ScheduledRequests()
+    batch.context_requests_last_chunk = [_request()]
+
+    def park(scheduled: ScheduledRequests) -> None:
+        calls.append("park")
+        if park_load:
+            scheduled.reset_context_requests([])
+
+    connector.take_scheduled_requests_pending_load.side_effect = park
     connector.handle_metadata.side_effect = lambda: calls.append("metadata")
     connector.mark_prefix_loads_dispatched.side_effect = lambda: calls.append("own")
     connector.worker = Mock()
     connector.worker.start_load_kv.side_effect = lambda stream: calls.append("start")
     monkeypatch.setattr("torch.cuda.current_stream", lambda: None)
 
-    executor._kv_connector_start_batch(SimpleNamespace())
+    assert executor._kv_connector_start_batch(batch) == (not park_load, not park_load)
 
     assert calls == ["park", "metadata", "own", "start"]
 

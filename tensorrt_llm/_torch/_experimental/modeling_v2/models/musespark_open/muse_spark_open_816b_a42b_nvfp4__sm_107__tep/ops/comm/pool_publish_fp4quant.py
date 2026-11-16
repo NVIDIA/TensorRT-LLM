@@ -52,6 +52,42 @@ _VECTOR_SPAN_WORDS = 256
 
 _AVAILABLE = HAS_CUTE_DSL and _gather._AVAILABLE
 
+
+#: ``configure(norm_prefetch=True)`` (the ``tep8_pool_programmatic_fork`` lever's ``NORM_PREFETCH``): the kernel loads
+#: this thread's four 16-element blocks of the norm gain and the global scale (both parameters: immutable) before its
+#: dependency wait and its poll, and runs the quantization loop unrolled on them, instead of loading them after the
+#: row's last vector arrived (flashinfer's loop: a global load per scale block, in a runtime loop). The same
+#: operations on the same values: the payload and scales are the same bits. Why (VR nsys, pb2 1026468, 8 ranks
+#: aligned on the router push ends): the pool publication ends 3.7 us after the LAST rank's pool GEMM end at bs12
+#: (launch gap 0.35, GEMM-end spread 0.4), ~1.2-1.7 us over one fabric hop; the X600 pool gather ends 5.9 us after
+#: its GEMM at bs2 / 4; the pool branch is the step's floor at every bs once the router path is split.
+_NORM_PREFETCH = False
+
+
+def configure(*, norm_prefetch: bool = False) -> None:
+    """``lever_settings.apply`` sets it from the plan (``NORM_PREFETCH``); the default is the served kernel."""
+    global _NORM_PREFETCH
+    _NORM_PREFETCH = bool(norm_prefetch)
+
+
+_PREFETCH_LOGGED = set()
+
+
+def _log_prefetch(name: str) -> None:
+    """The engagement line, once per process and kernel."""
+    if name in _PREFETCH_LOGGED:
+        return
+    _PREFETCH_LOGGED.add(name)
+    try:
+        from tensorrt_llm.logger import logger as _logger
+
+        _logger.info(
+            f"[musespark_open] {name}: norm gain + global scale prefetched before the poll "
+            "(TEP8_POOL_PROGRAMMATIC_FORK__NORM_PREFETCH)"
+        )
+    except Exception:  # noqa: BLE001 - logging only
+        pass
+
 if _AVAILABLE:
     import cutlass
     import cutlass.cute as cute
@@ -68,7 +104,9 @@ if _AVAILABLE:
     class _PoolPublishRmsnormFp4QuantKernel(_FlashinferKernel):
         """flashinfer's RMSNorm + FP4 quantization, reading its row from the pool transport."""
 
-        def __init__(self, world: int, capacity: int, guard_ns: int, guard_break: bool):
+        def __init__(
+            self, world: int, capacity: int, guard_ns: int, guard_break: bool, prefetch: bool = False
+        ):
             major, minor = torch.cuda.get_device_capability()
             super().__init__(
                 dtype=cutlass.BFloat16,
@@ -101,6 +139,12 @@ if _AVAILABLE:
             self.per_rank = _VECTORS // world
             self.guard_ns = int(guard_ns)
             self.guard_break = bool(guard_break)
+            #: NORM_PREFETCH: the gain blocks and the global scale loaded before the poll (``configure``).
+            self.prefetch = bool(prefetch)
+            #: 16-element scale blocks per thread (4 at H=4096, 64 threads per row).
+            self.sf_per_thread = self.num_sf_blocks_per_row // self.threads_per_row
+            if self.prefetch and self.sf_per_thread * self.threads_per_row != self.num_sf_blocks_per_row:
+                raise ValueError("NORM_PREFETCH: the scale blocks do not split evenly over the row's threads")
 
         def owner(self, v: int) -> int:
             return v // self.per_rank
@@ -173,6 +217,26 @@ if _AVAILABLE:
         ):
             tidx, _, _ = cute.arch.thread_idx()
             bidx, _, _ = cute.arch.block_idx()
+
+            # NORM_PREFETCH (tep8_pool_programmatic_fork__NORM_PREFETCH): the norm gain (1 + w) and the global scale
+            # are parameters (immutable), so this thread's gain blocks and the scale are loaded here, before the
+            # dependency wait and the poll, instead of after the row's last vector arrived.
+            w_pre = None
+            gs_pre = None
+            if cutlass.const_expr(self.prefetch):
+                lane_pre = tidx % self.threads_per_row
+                w_pre = cute.make_rmem_tensor(cute.make_layout((8 * self.sf_per_thread,)), Uint32)
+                for sf_pre in cutlass.range_constexpr(self.sf_per_thread):
+                    start_pre = (lane_pre + sf_pre * self.threads_per_row) * self.block_size
+                    wp0 = _fp4.get_ptr_as_int64(mW, start_pre)
+                    wp1 = _fp4.get_ptr_as_int64(mW, start_pre + Int32(8))
+                    w_pre[8 * sf_pre], w_pre[8 * sf_pre + 1], w_pre[8 * sf_pre + 2], w_pre[8 * sf_pre + 3] = (
+                        _fp4.ld_global_v4_u32(wp0)
+                    )
+                    w_pre[8 * sf_pre + 4], w_pre[8 * sf_pre + 5], w_pre[8 * sf_pre + 6], w_pre[8 * sf_pre + 7] = (
+                        _fp4.ld_global_v4_u32(wp1)
+                    )
+                gs_pre = mGlobalScale[0]
 
             if enable_pdl:
                 cute.arch.griddepcontrol_wait()
@@ -292,7 +356,10 @@ if _AVAILABLE:
             )
             mean_sq = sum_sq / H
             rstd = cute.math.rsqrt(mean_sq + eps, fastmath=True)
-            global_scale_val = mGlobalScale[0]
+            if cutlass.const_expr(self.prefetch):
+                global_scale_val = gs_pre
+            else:
+                global_scale_val = mGlobalScale[0]
             cute.arch.barrier()
 
             # ==============================================================
@@ -300,10 +367,10 @@ if _AVAILABLE:
             # read from the shared tile).
             # ==============================================================
             if actual_row_idx < M:
-                num_sf_per_thread = (num_sf_blocks_per_row + threads_per_row - 1) // threads_per_row
-                for sf_iter in range(num_sf_per_thread):
-                    sf_idx = lane_in_row + sf_iter * threads_per_row
-                    if sf_idx < num_sf_blocks_per_row:
+                if cutlass.const_expr(self.prefetch):
+                    # NORM_PREFETCH: the same blocks and operations, unrolled, the gain from w_pre
+                    for sf_iter in cutlass.range_constexpr(self.sf_per_thread):
+                        sf_idx = lane_in_row + sf_iter * threads_per_row
                         block_start = sf_idx * block_size
 
                         x_h2 = cute.make_rmem_tensor((8,), Uint32)
@@ -311,10 +378,8 @@ if _AVAILABLE:
                         x_tile = sX.iterator + row_in_block * H + block_start
                         x_h2[0], x_h2[1], x_h2[2], x_h2[3] = _load_shared_words(x_tile)
                         x_h2[4], x_h2[5], x_h2[6], x_h2[7] = _load_shared_words(x_tile + 8)
-                        w_ptr0 = _fp4.get_ptr_as_int64(mW, block_start)
-                        w_ptr1 = _fp4.get_ptr_as_int64(mW, block_start + Int32(8))
-                        w_h2[0], w_h2[1], w_h2[2], w_h2[3] = _fp4.ld_global_v4_u32(w_ptr0)
-                        w_h2[4], w_h2[5], w_h2[6], w_h2[7] = _fp4.ld_global_v4_u32(w_ptr1)
+                        for k in cutlass.range_constexpr(8):
+                            w_h2[k] = w_pre[8 * sf_iter + k]
 
                         xw_h2 = _fp4.bfloat2_mul_8(x_h2, w_h2)
                         max_xw_h2 = _fp4.bfloat2_max_abs_8(xw_h2)
@@ -338,6 +403,45 @@ if _AVAILABLE:
                         out_offset = block_start // 2
                         out_ptr = _fp4.get_ptr_as_int64(mY, actual_row_idx * (H // 2) + out_offset)
                         _fp4.st_global_u64(out_ptr, packed64)
+                else:
+                    num_sf_per_thread = (num_sf_blocks_per_row + threads_per_row - 1) // threads_per_row
+                    for sf_iter in range(num_sf_per_thread):
+                        sf_idx = lane_in_row + sf_iter * threads_per_row
+                        if sf_idx < num_sf_blocks_per_row:
+                            block_start = sf_idx * block_size
+
+                            x_h2 = cute.make_rmem_tensor((8,), Uint32)
+                            w_h2 = cute.make_rmem_tensor((8,), Uint32)
+                            x_tile = sX.iterator + row_in_block * H + block_start
+                            x_h2[0], x_h2[1], x_h2[2], x_h2[3] = _load_shared_words(x_tile)
+                            x_h2[4], x_h2[5], x_h2[6], x_h2[7] = _load_shared_words(x_tile + 8)
+                            w_ptr0 = _fp4.get_ptr_as_int64(mW, block_start)
+                            w_ptr1 = _fp4.get_ptr_as_int64(mW, block_start + Int32(8))
+                            w_h2[0], w_h2[1], w_h2[2], w_h2[3] = _fp4.ld_global_v4_u32(w_ptr0)
+                            w_h2[4], w_h2[5], w_h2[6], w_h2[7] = _fp4.ld_global_v4_u32(w_ptr1)
+
+                            xw_h2 = _fp4.bfloat2_mul_8(x_h2, w_h2)
+                            max_xw_h2 = _fp4.bfloat2_max_abs_8(xw_h2)
+                            max_xw = _fp4.bfloat2_hmax_to_f32(max_xw_h2)
+                            y_f32 = _fp4.bfloat2_to_float16(xw_h2, rstd)
+
+                            max_abs = max_xw * rstd
+
+                            scale_float = global_scale_val * max_abs * fp4_max_rcp
+                            scale_float = _fp4.fmin_f32(scale_float, Float32(_fp4.FLOAT8_E4M3_MAX))
+
+                            scale_fp8_u32 = _fp4.cvt_f32_to_e4m3(scale_float)
+                            scale_fp8 = Uint8(scale_fp8_u32 & cutlass.Uint32(0xFF))
+
+                            inv_scale = _fp4.fp8_e4m3_to_f32_and_rcp(scale_fp8_u32) * global_scale_val
+
+                            mS[actual_row_idx, sf_idx] = scale_fp8
+
+                            packed64 = _fp4.quantize_and_pack_16(y_f32, inv_scale)
+
+                            out_offset = block_start // 2
+                            out_ptr = _fp4.get_ptr_as_int64(mY, actual_row_idx * (H // 2) + out_offset)
+                            _fp4.st_global_u64(out_ptr, packed64)
 
             if enable_pdl:
                 cute.arch.griddepcontrol_launch_dependents()
@@ -350,8 +454,11 @@ if _AVAILABLE:
         enable_pdl: bool,
         guard_ns: int,
         guard_break: bool,
+        prefetch: bool = False,
     ):
-        kernel = _PoolPublishRmsnormFp4QuantKernel(world, capacity, guard_ns, guard_break)
+        kernel = _PoolPublishRmsnormFp4QuantKernel(world, capacity, guard_ns, guard_break, prefetch)
+        if prefetch:
+            _log_prefetch("pool_publish_rmsnorm_fp4quant")
         rows = cute.sym_int()
         fake = cute.runtime.make_fake_compact_tensor
         with torch.cuda.device(device_index):
@@ -430,6 +537,7 @@ class PoolPublishRmsnormFp4Quant(OpWrapper):
             bool(enable_pdl),
             int(guard_ns),
             bool(guard_break),
+            _NORM_PREFETCH,
         )(
             layout,
             gain,

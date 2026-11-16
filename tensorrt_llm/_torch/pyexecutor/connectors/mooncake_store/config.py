@@ -31,8 +31,6 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional, Tuple
 
-from tensorrt_llm.logger import logger
-
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import MooncakeStoreConfig, TorchLlmArgs
 
@@ -251,6 +249,20 @@ def pool_config(llm_args: "TorchLlmArgs") -> Optional["MooncakeStoreConfig"]:
     return connector.mooncake_store if connector is not None else None
 
 
+#: Set to 1 to load matched prefixes synchronously inside the forward step.
+DISABLE_ASYNC_LOAD_ENV = "TRTLLM_MOONCAKE_DISABLE_ASYNC_LOAD"
+#: Earlier name of the same switch, still honoured.
+DISABLE_ASYNC_LOAD_ENV_ALIASES = ("TRTLLM_M31_DISABLE_MOONCAKE_ASYNC_LOAD",)
+
+
+def async_load_disabled_by_env() -> bool:
+    """Whether the environment turns asynchronous prefix loads off."""
+    return any(
+        os.getenv(name, "0") == "1"
+        for name in (DISABLE_ASYNC_LOAD_ENV, *DISABLE_ASYNC_LOAD_ENV_ALIASES)
+    )
+
+
 def provisioned_config_path(run_dir: Optional[str]) -> Optional[str]:
     """The client config a server rendered into `run_dir`, if there is one.
 
@@ -289,29 +301,55 @@ class MooncakeStoreConnectorConfig:
     #: RPC without bounding how much a request may transfer.
     transfer_batch_size: int = 64
     #: Pass pages through a pinned host buffer instead of registering the KV
-    #: pools with Mooncake. The only transfer path supported today, so a False
-    #: here is raised back to True.
-    stage_through_host: bool = True
+    #: pools with Mooncake. Costs a copy each way, but works without GPUDirect
+    #: RDMA, which registering device memory requires.
+    stage_through_host: bool = False
+    staging_buffer_bytes: int = 512 * (1 << 20)
+    #: Load matched prefixes on background threads instead of inside the
+    #: forward step. None (the default) turns it on under attention DP or on a
+    #: single rank; tensor parallelism takes an explicit True. See
+    #: `resolve_async_load`.
+    async_load: Optional[bool] = None
+    async_load_workers: int = 2
 
     def __post_init__(self) -> None:
         """Reject settings that would fail later, inside a transfer."""
-        if not self.stage_through_host:
-            if self.role.transfers:
-                logger.warning(
-                    "mooncake-store: ignoring stage_through_host=False. Pages "
-                    "pass through pinned host memory; registering the KV pools "
-                    "takes one registration per pool mapping, which this "
-                    "connector does not do yet."
-                )
-            object.__setattr__(self, "stage_through_host", True)
         if not self.master_server_address:
             raise ValueError("master_server_address is required")
         if self.local_buffer_size <= 0:
             raise ValueError("local_buffer_size must be > 0")
         if self.global_segment_size < 0:
             raise ValueError("global_segment_size must be >= 0")
+        if self.async_load is not None and type(self.async_load) is not bool:
+            raise ValueError("async_load must be boolean or null")
+        if type(self.async_load_workers) is not int or self.async_load_workers < 1:
+            raise ValueError("async_load_workers must be a positive integer")
+        if self.staging_buffer_bytes <= 0:
+            raise ValueError("staging_buffer_bytes must be positive")
         if self.transfer_batch_size <= 0:
             raise ValueError("transfer_batch_size must be > 0")
+
+    def resolve_async_load(self, attention_dp: bool, world_size: int) -> bool:
+        """Whether this rank loads prefixes asynchronously.
+
+        On by default under attention DP or on a single rank, where a parked
+        request is loaded and reported by the one rank that owns its pages, and
+        a load whose source went missing restarts the request.
+
+        Under tensor parallelism every rank holds a shard of each page. Each
+        rank starts the load of its own shard from the metadata rank 0
+        broadcasts, the connector manager resumes the request once every rank
+        has reported it, and a failed load is fatal, since the ranks cannot
+        agree on restarting it. That takes an explicit `async_load: true`;
+        left unset, loads stay synchronous there.
+
+        `TRTLLM_MOONCAKE_DISABLE_ASYNC_LOAD=1` turns it off everywhere.
+        """
+        if not self.role.loads or self.async_load is False or async_load_disabled_by_env():
+            return False
+        if self.async_load is True:
+            return True
+        return bool(attention_dp) or world_size == 1
 
     @property
     def capacity_only(self) -> bool:
@@ -346,7 +384,10 @@ class MooncakeStoreConnectorConfig:
             namespace=str(raw.get("namespace", DEFAULT_NAMESPACE)),
             model_key=raw.get("model_key") or None,
             transfer_batch_size=int(raw.get("transfer_batch_size", 64)),
-            stage_through_host=bool(raw.get("stage_through_host", True)),
+            stage_through_host=bool(raw.get("stage_through_host", False)),
+            staging_buffer_bytes=parse_size(raw.get("staging_buffer_bytes", 512 * (1 << 20))),
+            async_load=raw.get("async_load"),
+            async_load_workers=raw.get("async_load_workers", 2),
         )
 
     @staticmethod

@@ -21,6 +21,7 @@ import time
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field, replace
 from enum import IntEnum
+from functools import cached_property
 from typing import (
     TYPE_CHECKING,
     Callable,
@@ -41,6 +42,7 @@ import triton
 import triton.language as tl
 from strenum import StrEnum
 
+from tensorrt_llm._torch import adp_groups
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind, RoleLayout
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
 from tensorrt_llm._torch.utils import helix_local_len, maybe_compile
@@ -402,6 +404,7 @@ def _swa_endpoint_priority(
     prompt_length: int,
     tokens_per_block: int,
     rewind_tokens: int,
+    fork_point: Optional[List[int]] = None,
     branch: Optional[_SwaBranchCell] = None,
 ) -> Callable[[int, object], int]:
     """Assign page priorities around a fixed reusable prompt endpoint.
@@ -411,6 +414,16 @@ def _swa_endpoint_priority(
     Intermediate pages remain reusable until evicted. ``branch``, once its point
     is set, also gives endpoint priority to the window ending where the request
     left the reuse tree, so a sibling leaving at the same point reuses up to it.
+
+    ``fork_point`` (opt-in, TRTLLM_KV_SWA_FORK_ANCHOR=1) is a one-element cell
+    the caller fills right after the KV cache is created, before any page is
+    allocated: the depth at which this prompt's raw token match against the
+    radix tree ended although the match was pruned shorter (no sliding-window
+    pages resident there). That depth is a divergence point another request
+    already shares (e.g. sibling sub-agents of one parent). The window pages
+    ending there get the endpoint priority too, so the next request that
+    diverges at the same point finds them. Eviction order only: matching and
+    the attention math are unchanged.
     """
 
     def priority(ordinal: int, life_cycle: object) -> int:
@@ -418,10 +431,17 @@ def _swa_endpoint_priority(
             return 35
         first_protected_token = max(0, prompt_length - rewind_tokens - life_cycle.window_size)
         block_start = ordinal * tokens_per_block
+        block_end = block_start + tokens_per_block
         if ordinal < life_cycle.num_sink_blocks or (
-            block_start < prompt_length and block_start + tokens_per_block > first_protected_token
+            block_start < prompt_length and block_end > first_protected_token
         ):
             return 70
+        if fork_point is not None and fork_point[0] > 0:
+            fork = fork_point[0]
+            if block_start < fork and block_end > max(
+                0, fork - life_cycle.window_size - tokens_per_block
+            ):
+                return 70
         return 0
 
     if branch is None:
@@ -441,6 +461,26 @@ def _swa_endpoint_priority(
         return value
 
     return priority_with_branch
+
+
+def _swa_fork_anchor_enabled() -> bool:
+    return os.environ.get("TRTLLM_KV_SWA_FORK_ANCHOR", "0") == "1"
+
+
+def _swa_demote_anchors_enabled() -> bool:
+    return os.environ.get("TRTLLM_KV_SWA_DEMOTE_ANCHORS", "0") == "1"
+
+
+def _swa_demote_priority() -> int:
+    """Eviction priority of a superseded sliding-window anchor page.
+
+    Above the intermediate window pages (0) and below the endpoint windows (70)
+    and the full-attention pages (35) of _swa_endpoint_priority.
+    """
+    prio = int(os.environ.get("TRTLLM_KV_SWA_DEMOTE_PRIORITY", "1"))
+    if not 0 <= prio < 35:
+        raise ValueError(f"TRTLLM_KV_SWA_DEMOTE_PRIORITY must be in [0, 35), got {prio}")
+    return prio
 
 
 def _request_conversation_id(request: LlmRequest) -> Optional[str]:
@@ -1114,7 +1154,8 @@ def _get_static_cache_size_layer_components(
         head_dim = config.kv_lora_rank + config.qk_rope_head_dim
         kv_factor = 1
     else:
-        tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size
+        # Attention DP: every head, or the attention group's share (adp_groups; kv_head_tp_size).
+        tp_size = adp_groups.attn_tp_size(mapping)
         head_dim = getattr(config, "head_dim", None)
         if not isinstance(head_dim, int):
             head_dim = config.hidden_size // config.num_attention_heads
@@ -1719,9 +1760,21 @@ def _spec_recompute_claim_limit(
     return max(0, (req.prompt_len - tail) // tokens_per_block * tokens_per_block)
 
 
+def kv_head_tp_size(mapping) -> int:
+    """How many ways a rank's KV heads are split: ``tp_size`` without attention DP, 1 under attention DP (every head),
+    the attention group's size under attention-DP groups (``TRTLLM_ADPTP_ATTN_TP``). Same rule as the attention
+    module (``Attention.__init__``) and the static size estimate (``_get_static_cache_size_layer_components``)."""
+    return adp_groups.attn_tp_size(mapping)
+
+
 class KVCacheManagerV2(BaseResourceManager):
     # Sparse managers attach a metadata batch during initialization.
     sparse_metadata_batch: Batch | None = None
+    # Connector side allocation stream (see `wait_allocation_fences`). Class-level empty defaults so managers
+    # built without __init__ (test doubles) behave as without a connector; __init__ sets mutable ones.
+    _allocation_stream = None
+    _on_allocation_stream: "set[int] | frozenset[int]" = frozenset()
+    _allocation_ready: "dict[int, torch.cuda.Event]" = {}
     # Filled lazily by _cold_pool_group_membership(); the grouping is fixed after construction.
     # Declared on the class so it is present even when an instance is built without running __init__.
     _cold_pool_group_membership_cache: Optional[tuple[tuple[int, frozenset[int]], ...]] = None
@@ -1760,6 +1813,15 @@ class KVCacheManagerV2(BaseResourceManager):
     # takes SWA branch snapshots (see _SwaEndpointRetirer).
     _swa_retirer: Optional["_SwaEndpointRetirer"] = None
     _swa_pending_branch: Optional[Tuple[int, _SwaBranchCell]] = None
+
+    @cached_property
+    def _step_draft_lens(self) -> dict[int, deque[int]]:
+        # Draft width of every generation step grown but not yet passed to
+        # update_resources, oldest first. The overlap loop schedules step N+1
+        # (overwriting _allocated_draft_lens) before it updates step N, so
+        # update_resources reclaims each step's slots from this queue instead.
+        # A cached property so it exists without running __init__.
+        return {}
 
     def __init__(
         self,
@@ -1857,6 +1919,26 @@ class KVCacheManagerV2(BaseResourceManager):
         block_reuse_config = kv_cache_config.block_reuse_config
         self.block_reuse_policy = BlockReusePolicy(block_reuse_config.policy)
         self._swa_endpoint_rewind = block_reuse_config.swa_endpoint_rewind_tokens
+        # Opt-in: protect the sliding-window pages at a detected divergence
+        # point (see _swa_endpoint_priority). Eviction priority only.
+        self._swa_fork_anchor = _swa_fork_anchor_enabled() and self._swa_endpoint_rewind > 0
+        self._swa_fork_stats = [0, 0, 0]  # requests, fork anchors set, fork tokens
+        if self._swa_fork_anchor and not is_draft:
+            logger.info(
+                "KVCacheManagerV2: TRTLLM_KV_SWA_FORK_ANCHOR=1: sliding-window pages at a "
+                "pruned prefix-match divergence point get the endpoint eviction priority"
+            )
+        # Opt-in: on close, demote the reused endpoint window a request extended
+        # past (superseded anchor) to a low eviction priority, so old anchors are
+        # evicted before the current ones. Eviction priority only.
+        self._swa_demote_anchors = _swa_demote_anchors_enabled() and self._swa_endpoint_rewind > 0
+        self._swa_demote_prio = _swa_demote_priority() if self._swa_demote_anchors else None
+        self._swa_demote_stats = [0, 0, 0]  # closed caches, caches that demoted, demoted pages
+        if self._swa_demote_anchors and not is_draft:
+            logger.info(
+                "KVCacheManagerV2: TRTLLM_KV_SWA_DEMOTE_ANCHORS=1: superseded sliding-window "
+                f"endpoint pages are demoted to eviction priority {self._swa_demote_prio} on close"
+            )
         # Recompute tail for hidden-state drafters with block reuse: cap the
         # reuse claim of cache-hit context requests so at least this many
         # prompt tokens pass through the target forward (see
@@ -1895,9 +1977,10 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         assert self.max_copy_beam_width >= self.max_beam_width
 
-        tp_size = mapping.tp_size
-        if mapping.enable_attention_dp:
-            tp_size = 1
+        # Attention DP: every KV head, or the attention group's share under attention-DP groups (adp_groups). This
+        # must equal the attention module's per-rank KV heads: num_kv_heads_per_layer shapes every paged view the
+        # attention kernels read.
+        tp_size = kv_head_tp_size(mapping)
 
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
@@ -2415,6 +2498,10 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self.kv_cache_map: dict[int, _KVCache] = {}
         self._disagg_receive_ready: dict[int, torch.cuda.Event] = {}
+        # See `wait_allocation_fences`.
+        self._allocation_stream: torch.cuda.Stream | None = None
+        self._on_allocation_stream: set[int] = set()
+        self._allocation_ready: dict[int, torch.cuda.Event] = {}
         self._request_stats_enabled_ids: set[int] = set()
 
         # Lazily built map of layer-group id -> sliding window size, restricted
@@ -4115,11 +4202,93 @@ class KVCacheManagerV2(BaseResourceManager):
         return self
 
     @property
+    def execution_stream(self) -> torch.cuda.Stream:
+        """The stream this manager orders page reuse on (the executor's forward stream).
+
+        Work queued here on a page, including a previous owner's last forward, is
+        complete once an event recorded here after allocation completes, and the
+        connector side allocation stream is joined into it when a batch is reported
+        (see `_adopt_allocation_stream`). A writer on another stream orders itself
+        behind such an event, not behind the executor's current stream, which only
+        joins this one around forwards.
+        """
+        return self._stream
+
+    @property
     def blocks_in_primary_pool(self) -> int:
         """
         Get the number of blocks in the primary pool.
         """
         return self.impl.get_page_index_upper_bound(0, Role.KEY)
+
+    def wait_allocation_fences(self, request_ids: Iterable[int]) -> None:
+        """Block until the pages given to these requests are free of earlier GPU work.
+
+        For writers no CUDA stream orders, such as the NIC. Caches the connector
+        may write into are allocated on a side stream until their batch is
+        reported, so waiting for them skips the execution stream. Any other
+        request waits for the execution stream.
+
+        Args:
+            request_ids: Requests whose pages are about to be written.
+        """
+        if self._fresh_page_fill is not None:
+            # The diagnostic fill writes fresh pages on the stream, after the
+            # allocation, and only the stream orders the NIC behind it.
+            self._stream.synchronize()
+            return
+        events = []
+        for request_id in request_ids:
+            ready = self._allocation_ready.get(request_id)
+            if ready is not None:
+                events.append(ready)
+            elif request_id in self.kv_cache_map:
+                self._stream.synchronize()
+                return
+        for ready in events:
+            ready.synchronize()
+
+    def _cache_stream(self, request_id: int) -> int:
+        """The stream a request's cache is resumed on before its batch is reported."""
+        if request_id in self._on_allocation_stream:
+            return self._allocation_stream.cuda_stream
+        return self._stream.cuda_stream
+
+    def _place_on_allocation_stream(self, req: LlmRequest, kv_cache: _KVCache | None) -> None:
+        """Allocate a connector-served context cache on the side stream.
+
+        An active cache stays where it is, since moving it would make the side
+        stream wait for the execution stream.
+        """
+        if kv_cache is not None and kv_cache.is_active:
+            return
+        if not self._connector_may_serve(req) or req.py_connector_allocation_reported:
+            return
+        if self._allocation_stream is None:
+            self._allocation_stream = torch.cuda.Stream(device=self._stream.device)
+        self._on_allocation_stream.add(req.py_request_id)
+
+    def _adopt_allocation_stream(self, scheduled_batch: ScheduledRequests) -> None:
+        """Move the batch's caches from the side stream to the execution stream.
+
+        Setting an active cache's stream makes the new stream wait for the old
+        one, so the forward pass stays ordered behind the allocation.
+        """
+        adopted = [
+            req.py_request_id
+            for req in scheduled_batch.context_requests
+            if req.py_request_id in self._on_allocation_stream
+        ]
+        if not adopted:
+            return
+        ready = torch.cuda.Event()
+        ready.record(self._allocation_stream)
+        for request_id in adopted:
+            self._on_allocation_stream.discard(request_id)
+            self._allocation_ready[request_id] = ready
+            kv_cache = self.kv_cache_map.get(request_id)
+            if kv_cache is not None:
+                kv_cache.cuda_stream = self._stream.cuda_stream
 
     def is_attention_layer(self, layer_idx: int) -> bool:
         """Return whether ``layer_idx`` uses attention KV cache storage."""
@@ -4511,6 +4680,7 @@ class KVCacheManagerV2(BaseResourceManager):
             # same step instead of skipping one.
             req.py_helix_decode_group_index += 1
         self._allocated_draft_lens[request_id] = draft_slots
+        self._step_draft_lens.setdefault(request_id, deque()).append(draft_slots)
         return True
 
     def revert_allocate_generation(self, req: LlmRequest) -> None:
@@ -4530,6 +4700,9 @@ class KVCacheManagerV2(BaseResourceManager):
         draft_slots = self._allocated_draft_lens.pop(request_id, None)
         if draft_slots is None:
             return
+        step_widths = self._step_draft_lens.get(request_id)
+        if step_widths:
+            step_widths.pop()
         kv_cache = self.kv_cache_map.get(request_id)
         if kv_cache is None or not kv_cache.is_active:
             return
@@ -4637,7 +4810,7 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         if kv_cache.is_active:
             return True
-        if not kv_cache.resume(self._stream.cuda_stream):
+        if not kv_cache.resume(self._cache_stream(req_id)):
             return False
         self._restore_page_index_bufs(req_id, kv_cache)
         return True
@@ -4728,6 +4901,7 @@ class KVCacheManagerV2(BaseResourceManager):
             if self.conversation_manager is not None:
                 self.conversation_manager.prepare_request(req)
             kv_cache = self.kv_cache_map.get(req.py_request_id)
+            self._place_on_allocation_stream(req, kv_cache)
             # Stays None when the cache was resumed rather than freshly
             # matched, which is also the case where no branch point applies.
             num_lookup_tokens = None
@@ -4755,7 +4929,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 )
                 if kv_cache is None:
                     return None
-                kv_cache.cuda_stream = self._stream.cuda_stream
+                kv_cache.cuda_stream = self._cache_stream(req.py_request_id)
 
             if not self.enable_block_reuse:
                 kv_cache.stop_committing()
@@ -4914,8 +5088,8 @@ class KVCacheManagerV2(BaseResourceManager):
         # Deliberately no claim cap here: a disagg generation-init request
         # receives its prompt KV from the context worker and never runs a
         # prefill forward on this engine, so there is no drafter hidden state
-        # to recover. Spec decode on a disagg engine is guard-refused anyway
-        # (disagg_dflash_error).
+        # to recover. A DFlash drafter's prompt window arrives in the same
+        # pages when its draft layers share this manager (disagg draft window).
         if self.enable_block_reuse:
             _settle_context_cursor(req, reused, self.tokens_per_block)
 
@@ -4997,6 +5171,9 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"(target capacity {new_capacity})"
             )
         self._allocated_draft_lens[request.py_request_id] = current_draft_len
+        step_widths = self._step_draft_lens.get(request.py_request_id)
+        if step_widths:
+            step_widths[-1] = current_draft_len
 
     def suspend_request(self, req: LlmRequest) -> None:
         """Suspend a request's KV cache, allowing pages to migrate to a secondary tier."""
@@ -5230,18 +5407,102 @@ class KVCacheManagerV2(BaseResourceManager):
         slot for a block the window has passed, and the sibling KV transfer path
         drops the same range before sending.
         """
-        kv_cache = self.kv_cache_map.get(request.py_request_id)
+        return self.get_page_indices_by_layer_group_for_id(request.py_request_id)
+
+    def get_page_indices_by_layer_group_for_id(
+        self, request_id: int, mask_stale: bool = True
+    ) -> List[List[int]]:
+        """`get_page_indices_by_layer_group` by request id, on this rank's own slots.
+
+        Slot choice is rank-local: a recycled slot whose last GPU use has
+        finished is preferred over a never-used one, and that depends on this
+        rank's GPU progress. Tensor-parallel ranks therefore agree on which
+        blocks a request holds but not always on their slots, and a connector
+        that receives rank 0's indices maps them back through this.
+
+        ``mask_stale=False`` returns the slots attached at every ordinal, without
+        masking the blocks the window has passed: a translation from another
+        rank's slot has to find whatever that rank handed out.
+        """
+        kv_cache = self.kv_cache_map.get(request_id)
         if kv_cache is None:
             return [[] for _ in range(len(self.impl.layer_grouping))]
         history_length = kv_cache.history_length
         by_group: List[List[int]] = []
         for layer_group_id in range(len(self.impl.layer_grouping)):
             indices = list(kv_cache.get_aggregated_page_indices(layer_group_id, valid_only=False))
-            stale_start, stale_end = self._stale_block_range(layer_group_id, history_length)
-            for ordinal in range(stale_start, min(stale_end, len(indices))):
-                indices[ordinal] = BAD_PAGE_INDEX
+            if mask_stale:
+                stale_start, stale_end = self._stale_block_range(layer_group_id, history_length)
+                for ordinal in range(stale_start, min(stale_end, len(indices))):
+                    indices[ordinal] = BAD_PAGE_INDEX
             by_group.append(indices)
         return by_group
+
+    def lookup_local_page_indices_for_id(
+        self, request_id: int, wanted: Dict[int, np.ndarray], verify: bool = False
+    ) -> Tuple[Dict[int, np.ndarray], int, int]:
+        """This rank's slots at the given block ordinals, without building the request's whole page table.
+
+        For every layer group ``g`` in ``wanted`` (an int64 array of block ordinals, each >= 0), returns an int64
+        array aligned with it holding exactly what
+        ``get_page_indices_by_layer_group_for_id(request_id, mask_stale=False)[g][ordinal]`` holds, and
+        ``BAD_PAGE_INDEX`` where that table has no entry (an ordinal past the request's blocks, a group out of
+        range, or a request with no cache here). The slot-divergence fix (``MooncakeStoreConnectorWorker._localize``)
+        needs a handful of ordinals per request every iteration, and the full unmasked table walks every block of
+        every group in C++ and converts it to Python lists.
+
+        The cache publishes, per block ordinal, the slot of each page it holds a lock on: its base page index row,
+        which the C++ manager writes whenever a lock is taken (the slot of the locked page) or dropped (BAD), or
+        the locked page moves level. A locked page is the page attached at that ordinal, so a published entry is
+        the unmasked table's entry. An ordinal that reads BAD there may still have a page attached (a block the
+        window has passed, or a suspended cache, both of which hold pages without locking them), so a group with
+        any such ordinal is answered from the full unmasked query instead, as are all groups when ``verify`` is
+        set (the published answer is then compared, and the full query's answer returned).
+
+        Returns:
+            (slots by group, groups answered by the full query, groups whose published answer differed under
+            ``verify``).
+        """
+        num_groups = len(self.impl.layer_grouping)
+        kv_cache = self.kv_cache_map.get(request_id)
+        out: Dict[int, np.ndarray] = {}
+        fallbacks = mismatches = 0
+        # The unmasked table has exactly num_blocks entries per group (one per block, BAD where no page).
+        num_blocks = int(kv_cache.num_blocks) if kv_cache is not None else 0
+        for layer_group_id, ordinals in wanted.items():
+            slots = np.full(len(ordinals), BAD_PAGE_INDEX, dtype=np.int64)
+            if kv_cache is None or not 0 <= layer_group_id < num_groups or len(ordinals) == 0:
+                out[layer_group_id] = slots
+                continue
+            # A zero-copy view of the published row (an external row is padded past num_blocks); the gather copies.
+            row = np.asarray(kv_cache.get_base_page_indices(layer_group_id))
+            published = min(len(row), num_blocks)
+            inside = ordinals < published
+            slots[inside] = row[:published][ordinals[inside]]
+            # Ordinals the table has an entry for but the row publishes none (BAD) for: only the full query knows.
+            unpublished = bool(((ordinals < num_blocks) & (slots == BAD_PAGE_INDEX)).any())
+            if unpublished or verify:
+                full = np.array(
+                    list(kv_cache.get_aggregated_page_indices(layer_group_id, valid_only=False)),
+                    dtype=np.int64,
+                )
+                exact = np.full(len(ordinals), BAD_PAGE_INDEX, dtype=np.int64)
+                within = ordinals < len(full)
+                exact[within] = full[ordinals[within]]
+                if unpublished:
+                    fallbacks += 1
+                if verify:
+                    # Wherever the fast path would have answered alone it must equal the full query.
+                    trusted = (
+                        slots != BAD_PAGE_INDEX
+                        if unpublished
+                        else np.ones(len(ordinals), dtype=bool)
+                    )
+                    if not np.array_equal(exact[trusted], slots[trusted]):
+                        mismatches += 1
+                slots = exact
+            out[layer_group_id] = slots
+        return out, fallbacks, mismatches
 
     @nvtx_range("prepare_resources_kv_cache_manager_v2")
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
@@ -5332,6 +5593,7 @@ class KVCacheManagerV2(BaseResourceManager):
         if self.kv_connector_manager is not None and not self.is_draft:
             if finalize_prefix_reservations and self._connector_reservations_enabled():
                 self._accept_connector_prefix_reservations(scheduled_batch)
+            self._adopt_allocation_stream(scheduled_batch)
             self.kv_connector_manager.build_scheduler_output(scheduled_batch, self)
         # Connector acceptance can resize requests after prepare_resources.
         self._publish_sparse_metadata()
@@ -5463,6 +5725,17 @@ class KVCacheManagerV2(BaseResourceManager):
             req, local_end
         )
         offered_end = min(local_end + num_tokens, req.prompt_len - 1)
+        # The same hidden-state-drafter cap the reservation path applies (see
+        # `_prepare_connector_prefix_reservation`): the recomputed tail stays
+        # local, so the drafter sees target hidden states for it.
+        limit = _spec_recompute_claim_limit(
+            req,
+            tail=self._spec_recompute_tail,
+            tokens_per_block=self.tokens_per_block,
+            is_draft=self.is_draft,
+        )
+        if limit is not None:
+            offered_end = min(offered_end, limit)
 
         position = local_end
         if offered_end > local_end:
@@ -6712,8 +6985,28 @@ class KVCacheManagerV2(BaseResourceManager):
         pending, self._deferred_closes = self._deferred_closes, ()
         for request_id, kv_cache in pending:
             kv_cache.close()
+            self._note_swa_demote(kv_cache)
             self.impl.clear_stats_excluded(request_id)
         return len(pending)
+
+    def _note_swa_demote(self, kv_cache) -> None:
+        """Account the superseded-anchor demotion of a just-closed cache (opt-in)."""
+        if (
+            not getattr(self, "_swa_demote_anchors", False)
+            or kv_cache.superseded_anchor_priority is None
+        ):
+            return
+        stats = self._swa_demote_stats
+        stats[0] += 1
+        n = kv_cache.num_demoted_anchor_pages
+        if n:
+            stats[1] += 1
+            stats[2] += n
+        if stats[0] in (1, 10, 100) or stats[0] % 1000 == 0:
+            logger.info(
+                f"KVCacheManagerV2 SWA anchor demotion: {stats[1]} of {stats[0]} closed requests "
+                f"demoted superseded window pages; pages demoted so far {stats[2]}"
+            )
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
         # A request awaiting preemption can still be cancelled or fail while
@@ -6741,11 +7034,16 @@ class KVCacheManagerV2(BaseResourceManager):
         if self.conversation_manager is not None:
             self.conversation_manager.finish_request(request)
         self._allocated_draft_lens.pop(request.py_request_id, None)
+        self._step_draft_lens.pop(request.py_request_id, None)
         self._request_stats_enabled_ids.discard(request.py_request_id)
         # The next owner of these pages fills them again; keeping the set would
         # both leak and let a recycled page skip its fill.
         self._fresh_pages_filled.pop(request.py_request_id, None)
         self._disagg_receive_ready.pop(request.py_request_id, None)
+        if request.py_request_id in self._on_allocation_stream:
+            self._on_allocation_stream.discard(request.py_request_id)
+        if request.py_request_id in self._allocation_ready:
+            del self._allocation_ready[request.py_request_id]
         kv_cache = self.kv_cache_map.pop(request.py_request_id, None)
         if kv_cache is None:
             self.impl.clear_stats_excluded(request.py_request_id)
@@ -6762,6 +7060,7 @@ class KVCacheManagerV2(BaseResourceManager):
             self._deferred_closes = (*self._deferred_closes, (request.py_request_id, kv_cache))
             return
         kv_cache.close()
+        self._note_swa_demote(kv_cache)
         self.impl.clear_stats_excluded(request.py_request_id)
         if request.py_request_id in self._early_freed_index_requests:
             self._early_freed_index_requests.discard(request.py_request_id)
@@ -7076,6 +7375,10 @@ class KVCacheManagerV2(BaseResourceManager):
             kv_cache.close()
         self.kv_cache_map.clear()
         self._disagg_receive_ready.clear()
+        if self._on_allocation_stream:
+            self._on_allocation_stream.clear()
+        if self._allocation_ready:
+            self._allocation_ready.clear()
         self._request_stats_enabled_ids.clear()
         self._fresh_pages_filled.clear()
         # Drop the outstanding plans before the manager shuts down: discarding a handle applies
@@ -7570,6 +7873,11 @@ class KVCacheManagerV2(BaseResourceManager):
             if req.py_request_id not in self.kv_cache_map:
                 continue
             kv_cache = self.kv_cache_map[req.py_request_id]
+            # This step's own width: under the overlap scheduler
+            # _allocated_draft_lens already holds step N+1's, and reclaiming
+            # with it double-counts whenever consecutive widths differ.
+            step_widths = self._step_draft_lens.get(req.py_request_id)
+            step_draft_slots = step_widths.popleft() if step_widths else None
             # In the overlap scheduler, the scheduler for iteration N+1
             # may suspend a gen request's KV cache (via self-eviction or
             # victim eviction) while iteration N's update_resources still
@@ -7581,11 +7889,15 @@ class KVCacheManagerV2(BaseResourceManager):
             runtime_draft_len = req.py_rewind_len + accepted_draft_len
             # No entry: this manager did not grow through the scheduler (e.g.
             # disagg), so fall back to _generation_draft_slots' width.
-            allocated_draft_slots = self._allocated_draft_lens.get(
-                req.py_request_id,
-                max(runtime_draft_len, self._kv_reserve_draft_tokens)
-                if self.is_draft
-                else runtime_draft_len,
+            allocated_draft_slots = (
+                step_draft_slots
+                if step_draft_slots is not None
+                else self._allocated_draft_lens.get(
+                    req.py_request_id,
+                    max(runtime_draft_len, self._kv_reserve_draft_tokens)
+                    if self.is_draft
+                    else runtime_draft_len,
+                )
             )
             # Reclaim every reserved slot that was not occupied by an accepted
             # draft token.
@@ -7681,6 +7993,41 @@ class KVCacheManagerV2(BaseResourceManager):
         digest = hashlib.sha256(cache_salt.encode("utf-8")).digest()
         return int.from_bytes(digest[:8], "little")
 
+    def _set_swa_fork_point(
+        self, kv_cache, fork_point: List[int], expected_prompt_length: int
+    ) -> None:
+        """Fill the fork cell of a new request from its raw vs pruned prefix match.
+
+        Runs before the first resize, so every page the callback prices sees it.
+        The raw match is the token-path depth in the radix tree before the
+        page-coverage pruning; when it exceeds the committed (pruned) match by at
+        least one block, the prompt shares a prefix with some earlier request up
+        to that depth but no window pages were resident there. The cell is left
+        at 0 when the divergence lies inside the endpoint-protected tail, which
+        the endpoint priority already covers.
+        """
+        stats = self._swa_fork_stats
+        stats[0] += 1
+        if kv_cache is None:
+            return
+        try:
+            raw = int(kv_cache._get_num_reusable_tokens_before_pruning())
+            matched = int(kv_cache.num_committed_tokens)
+        except AttributeError:
+            return
+        tpb = self.tokens_per_block
+        if raw - matched < tpb or raw >= expected_prompt_length - self._swa_endpoint_rewind:
+            return
+        fork_point[0] = raw
+        stats[1] += 1
+        stats[2] += raw - matched
+        if stats[1] in (1, 10, 100) or stats[1] % 1000 == 0:
+            logger.info(
+                f"KVCacheManagerV2 SWA fork anchor: {stats[1]} of {stats[0]} requests anchored "
+                f"a divergence point (last: raw match {raw}, pruned {matched}, prompt "
+                f"{expected_prompt_length}); pruned-away tokens so far {stats[2]}"
+            )
+
     def _create_kv_cache(
         self,
         request_id: int,
@@ -7708,6 +8055,7 @@ class KVCacheManagerV2(BaseResourceManager):
         salt_int = self._derive_reuse_salt(cache_salt)
         enable_request_stats = enable_request_stats and not is_dummy and not self.is_draft
         priority_kwargs = {}
+        fork_point = None
         if (
             self._swa_endpoint_rewind > 0
             and self.enable_block_reuse
@@ -7716,13 +8064,19 @@ class KVCacheManagerV2(BaseResourceManager):
             and not self.is_draft
             and expected_prompt_length is not None
         ):
+            if getattr(self, "_swa_fork_anchor", False):
+                fork_point = [0]
             branch = None
             if self._swa_retirer is not None:
                 # Set by _record_branch_snapshot_point after the match, before any page exists.
                 branch = _SwaBranchCell()
                 self._swa_pending_branch = (request_id, branch)
             priority_kwargs["custom_priority_callback"] = _swa_endpoint_priority(
-                expected_prompt_length, self.tokens_per_block, self._swa_endpoint_rewind, branch
+                expected_prompt_length,
+                self.tokens_per_block,
+                self._swa_endpoint_rewind,
+                fork_point,
+                branch,
             )
         kv_cache = self.impl.create_kv_cache(
             ReuseScope(lora_id=lora_task_id, salt=salt_int),
@@ -7732,6 +8086,10 @@ class KVCacheManagerV2(BaseResourceManager):
             expected_prompt_length=expected_prompt_length,
             **priority_kwargs,
         )
+        if fork_point is not None:
+            self._set_swa_fork_point(kv_cache, fork_point, expected_prompt_length)
+        if priority_kwargs and getattr(self, "_swa_demote_anchors", False):
+            kv_cache.set_superseded_anchor_priority(self._swa_demote_prio)
         self.kv_cache_map[request_id] = kv_cache
         if enable_request_stats and not self.enable_stats:
             self._request_stats_enabled_ids.add(request_id)

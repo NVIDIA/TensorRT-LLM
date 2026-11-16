@@ -123,7 +123,8 @@ _ONE2_MAX_REQUESTS = 8
 #: per KV-head count (``hkv``), and two gates, each serving only its own head count and request
 #: range:
 #: - ``cl8_tep4`` (``_SWA_CL8``): TEP4, 4 KV heads per rank, 2..4 requests ("all": also 1).
-#: - ``cl8_tep8`` (``_TEP8_SWA_CL8``): TEP8, 2 KV heads per rank, 5..8 requests.
+#: - ``cl8_tep8`` (``_TEP8_SWA_CL8``): TEP8, 2 KV heads per rank, 5..8 requests (by default:
+#:   ``cl8_tep8_min_requests`` / ``cl8_tep8_max_requests`` move the band to 2..16).
 #:
 #: ``cl8_tep4`` "1": TEP4 decode steps of 2..4 requests (4 KV heads and 32 query heads per rank,
 #: 32-key FP8 pages, window 2048, fused prep with the norm-gate, q_fp8, at most 8 rows per
@@ -138,7 +139,8 @@ _ONE2_MAX_REQUESTS = 8
 #: NVRTC on its first eager call per device (a call inside a CUDA-graph capture before that falls
 #: back to the paths below and warns once).
 _SWA_CL8 = "0"
-#: ``cl8_tep8``: TEP8 decode steps of 5..8 requests (2 KV heads and 16 query heads per rank,
+#: ``cl8_tep8``: TEP8 decode steps of 5..8 requests by default (``_CL8_TEP8_MIN_REQUESTS``..
+#: ``_CL8_TEP8_MAX_REQUESTS``; 2 KV heads and 16 query heads per rank,
 #: 32-key FP8 pages, window 2048, fused prep with the norm-gate, q_fp8, at most 8 rows per request)
 #: run the whole sliding-window block as ONE cluster launch instead of ONE2: the same CL8 source
 #: (no ``__restrict__`` on the QKV projection or the gate; see the kernel) compiled with 2 KV heads
@@ -149,14 +151,90 @@ _SWA_CL8 = "0"
 #: unchanged. Compiled with NVRTC on the first eager call per device (a call inside a capture
 #: before that keeps the ONE2 path and warns once).
 _TEP8_SWA_CL8 = False
-#: Requests per step the TEP8 CL8 path takes (the ONE2 range at 2 KV heads).
+#: Requests per step the TEP8 CL8 path takes (the ONE2 range at 2 KV heads). The last one is
+#: ``configure``'s ``cl8_tep8_max_requests`` (the ``swa_one_cluster_block`` lever's
+#: TEP8_MAX_REQUESTS, 8 by default): up to ``CL8_TEP8_REQUESTS_LIMIT`` it also takes the TEP8 steps of
+#: 9..16 requests (65..128 rows), which otherwise decline the block (built-in FMHA after the
+#: multi-request prep-append, then the norm-gate). The launch is the same kernel on a grid of
+#: (8, 2, requests): each (request, KV head) is its own cluster with no exchange across clusters, so
+#: a request's output and K/V bytes are what CL8 gives it at 5..8 requests (batch-invariant); up to 13
+#: requests the 16 * requests CTAs fit one wave on Rubin's 212 SMs (one CTA per SM). Those steps run
+#: only when CL8 runs them (``cl8_tep8_ready``; ``swa_block_multi`` refuses 9+ sequences without it).
+#: Like 5..8, they need ``one2`` (CL8-TEP8 is gated on ONE2, whose routing it extends; see
+#: ``cl8_tep8_requests``).
+#:
+#: The first one is ``configure``'s ``cl8_tep8_min_requests`` (the lever's TEP8_MIN_REQUESTS, 5 by
+#: default, the band before it; ``CL8_TEP8_MIN_REQUESTS_FLOOR``..5): below 5 CL8 also takes the TEP8
+#: steps of 2..4 requests (16..32 rows at K = 7), which otherwise run the split / combine kernels
+#: (with ``prep_split``, ``preattn_prep`` first). Same kernel and grid (8, 2, requests), so 4..8
+#: clusters of 8 CTAs, one wave; each request gets the bits it gets inside a 5..8-request step (the
+#: GB300 port's MUSESPARK_OPEN_TEP8_SWA_CL8_MIN_REQUESTS, device-checked there). The caller already
+#: sends those steps to the block with their raw projection (``wide_swa_block``: 2..4 sequences;
+#: ``multi_request_prep_append`` takes 5+ only), and a capture before the build keeps the split
+#: path. Gated on ``one2`` like the rest of the TEP8 band (``cl8_tep8_takes``).
 _CL8_TEP8_MIN_REQUESTS, _CL8_TEP8_MAX_REQUESTS = 5, 8
+CL8_TEP8_REQUESTS_LIMIT = 16
+CL8_TEP8_MIN_REQUESTS_FLOOR = 2
+#: The request counts the TEP8 CL8 build has launched in this process (its once-per-count log).
+_CL8_TEP8_LOGGED = set()
+
+
+def cl8_tep8_requests() -> int:
+    """The most requests of a TEP8 (2 KV heads) step the one-launch block paths take: ONE2's 8, or
+    the CL8 build's ``_CL8_TEP8_MAX_REQUESTS`` when that is on and larger.
+
+    Without ``one2``, ``MULTI_MAX_REQUESTS`` whatever CL8's setting: CL8-TEP8 extends ONE2's
+    routing. The caller sends no TEP8 step of 5..8 sequences to the block without it, and
+    ``install_multi`` leaves ``multi_request_prep_append`` on every step above
+    ``MULTI_MAX_REQUESTS``; a 9..16-sequence step routed here would reach the block prepped
+    by the prep-append (no raw projection, no gate), which CL8 does not take, and be refused.
+    """
+    if not _SWA_ONE2:
+        return MULTI_MAX_REQUESTS
+    if _TEP8_SWA_CL8 and _CL8_TEP8_MAX_REQUESTS > _ONE2_MAX_REQUESTS:
+        return _CL8_TEP8_MAX_REQUESTS
+    return _ONE2_MAX_REQUESTS
+
+
+def cl8_tep8_ready(device_index: int) -> bool:
+    """Whether a TEP8 CL8 call on ``device_index`` launches CL8 now: a 2-KV-head build is compiled,
+    or no capture is running (the call compiles it). Host state only; every rank alike."""
+    if not _TEP8_SWA_CL8:
+        return False
+    if any(key[0] == device_index and key[2] == 2 for key in _CL8_FN):
+        return True
+    return not torch.cuda.is_current_stream_capturing()
+
+
+def cl8_tep8_takes(reqs: int) -> bool:
+    """Whether a TEP8 (2 KV heads) step of ``reqs`` sequences is the CL8 build's by its request
+    count: ``cl8_tep8`` on, under ``one2``, and ``_CL8_TEP8_MIN_REQUESTS`` <= ``reqs`` <=
+    ``_CL8_TEP8_MAX_REQUESTS``. ``swa_block_multi`` then launches CL8 if the call fits it
+    (``_cl8_eligible``, 32-key pages) and the build is ready; otherwise the paths below it.
+
+    ``one2`` changes nothing at 5..16 (``swa_block_multi`` refuses those counts without it); it
+    keeps the 2..4 band off where the rest of CL8-TEP8 is (``configure`` logs it inactive).
+    """
+    return _TEP8_SWA_CL8 and _SWA_ONE2 and _CL8_TEP8_MIN_REQUESTS <= reqs <= _CL8_TEP8_MAX_REQUESTS
 
 
 def configure(
-    *, cl8_tep4: str = "0", cl8_tep8: bool = False, prep_split: bool = False, one2: bool = False
+    *,
+    cl8_tep4: str = "0",
+    cl8_tep8: bool = False,
+    cl8_tep8_min_requests: int = 5,
+    cl8_tep8_max_requests: int = 8,
+    cl8_tep8_wide_min_requests: int = 0,
+    prep_split: bool = False,
+    one2: bool = False,
+    cl8_exact: bool = False,
 ) -> None:
     """Set the launch paths of the sliding-window decode block.
+
+    ``cl8_exact`` (``_CL8_EXACT``; the ``swa_one_cluster_block`` lever's EXACT): every CL8 build is the
+    ``CL8_EXACT`` variant -- the replaced ONE2 / split path's dtypes and operations at every rounding
+    point (fp32 scaled scores and exp2, fp32 row sums, bf16 P and V into the P.V MMA, fp32 partials and
+    merge); only the order of the sums differs. Set while no CL8 path is on, it logs ERROR.
 
     ``lever_settings.apply`` sets them from the model's plan before any install; the defaults
     are the stock paths.
@@ -164,23 +242,67 @@ def configure(
     Args:
         cl8_tep4: the one-cluster block on TEP4 decode steps (``swa_one_cluster_block``): "0"
             off, "1" on steps of 2..4 requests, "all" on steps of 1..4.
-        cl8_tep8: the one-cluster block on TEP8 decode steps of 5..8 requests
+        cl8_tep8: the one-cluster block on TEP8 decode steps of
+            ``cl8_tep8_min_requests``..``cl8_tep8_max_requests`` requests
             (``swa_one_cluster_block``).
+        cl8_tep8_min_requests: that range's first request count (``_CL8_TEP8_MIN_REQUESTS``):
+            ``CL8_TEP8_MIN_REQUESTS_FLOOR``..5.
+        cl8_tep8_max_requests: that range's last request count (``_CL8_TEP8_MAX_REQUESTS``):
+            8..``CL8_TEP8_REQUESTS_LIMIT``.
+        cl8_tep8_wide_min_requests: the fewest requests of a TEP8 CL8 step that runs one cluster
+            per request over both KV heads (``swa_cl8w``, ``_CL8_TEP8_WIDE_MIN_REQUESTS``); 0 none,
+            else 2..``CL8_TEP8_REQUESTS_LIMIT``.
         prep_split: the prep as its own launch on decode steps of 2+ requests whose split grid
             takes more than one wave (``swa_prep_split``).
         one2: the one-launch block on TEP4 decode steps of 2..4 requests and TEP8 steps of 5..8
             (``swa_eight_requests``).
 
     Raises:
-        ValueError: for a ``cl8_tep4`` other than "0", "1" or "all".
+        ValueError: for a ``cl8_tep4`` other than "0", "1" or "all", a ``cl8_tep8_min_requests``
+            outside ``CL8_TEP8_MIN_REQUESTS_FLOOR``..5, or a ``cl8_tep8_max_requests`` outside
+            8..``CL8_TEP8_REQUESTS_LIMIT``, or a ``cl8_tep8_wide_min_requests`` other than 0 or
+            2..``CL8_TEP8_REQUESTS_LIMIT``.
     """
-    global _SWA_CL8, _TEP8_SWA_CL8, _SWA_PREP_SPLIT, _SWA_ONE2
+    global _SWA_CL8, _TEP8_SWA_CL8, _SWA_PREP_SPLIT, _SWA_ONE2, _CL8_EXACT
+    global _CL8_TEP8_MIN_REQUESTS, _CL8_TEP8_MAX_REQUESTS, _CL8_TEP8_WIDE_MIN_REQUESTS
+    wide_min = int(cl8_tep8_wide_min_requests)
+    if wide_min and not CL8_TEP8_MIN_REQUESTS_FLOOR <= wide_min <= CL8_TEP8_REQUESTS_LIMIT:
+        raise ValueError(
+            f"swa_block: cl8_tep8_wide_min_requests is 0 or {CL8_TEP8_MIN_REQUESTS_FLOOR}.."
+            f"{CL8_TEP8_REQUESTS_LIMIT}, got {cl8_tep8_wide_min_requests}"
+        )
     if cl8_tep4 not in ("0", "1", "all"):
         raise ValueError(f'swa_block: cl8_tep4 is "0", "1" or "all", got {cl8_tep4!r}')
+    if not CL8_TEP8_MIN_REQUESTS_FLOOR <= int(cl8_tep8_min_requests) <= 5:
+        raise ValueError(
+            f"swa_block: cl8_tep8_min_requests is {CL8_TEP8_MIN_REQUESTS_FLOOR}..5, got "
+            f"{cl8_tep8_min_requests}"
+        )
+    if not 8 <= int(cl8_tep8_max_requests) <= CL8_TEP8_REQUESTS_LIMIT:
+        raise ValueError(
+            f"swa_block: cl8_tep8_max_requests is 8..{CL8_TEP8_REQUESTS_LIMIT}, got "
+            f"{cl8_tep8_max_requests}"
+        )
     _SWA_CL8 = cl8_tep4
     _TEP8_SWA_CL8 = bool(cl8_tep8)
+    _CL8_TEP8_MIN_REQUESTS = int(cl8_tep8_min_requests)
+    _CL8_TEP8_MAX_REQUESTS = int(cl8_tep8_max_requests)
+    _CL8_TEP8_WIDE_MIN_REQUESTS = wide_min
     _SWA_PREP_SPLIT = bool(prep_split)
     _SWA_ONE2 = bool(one2)
+    _CL8_EXACT = bool(cl8_exact)
+    if _CL8_EXACT:
+        if cl8_tep4 == "0" and not bool(cl8_tep8):
+            _cl8_log(
+                "[musespark_open] swa_block CL8 cl8_exact is set but no CL8 path is on "
+                "(swa_one_cluster_block off): no step runs the exact one-cluster block",
+                error=True,
+            )
+        else:
+            _cl8_log(
+                "[musespark_open] swa_block CL8 cl8_exact: the one-cluster block runs the replaced path's "
+                "arithmetic (fp32 exp2 of the fp32 scaled scores, fp32 row sums, bf16 P and V, fp32 merge)"
+            )
     if _SWA_CL8 != "0":
         _cl8_log(
             f"[musespark_open] swa_block CL8 gate: cl8_tep4={_SWA_CL8} "
@@ -192,7 +314,14 @@ def configure(
             "[musespark_open] swa_block CL8 gate: cl8_tep8 "
             f"({_CL8_TEP8_MIN_REQUESTS}-{_CL8_TEP8_MAX_REQUESTS} requests per TEP8 decode step "
             "run the one-cluster SWA block)"
+            + ("" if _SWA_ONE2 else "; inactive: it extends one2 (swa_eight_requests), which is off")
         )
+        if _CL8_TEP8_WIDE_MIN_REQUESTS:
+            _cl8_log(
+                "[musespark_open] swa_block CL8 gate: cl8_tep8_wide_min_requests "
+                f"{_CL8_TEP8_WIDE_MIN_REQUESTS}: TEP8 steps of {_CL8_TEP8_WIDE_MIN_REQUESTS}+ requests "
+                "run one 8-CTA cluster per request over both KV heads (swa_cl8w, one wave up to 22)"
+            )
 
 
 _CL8_SMEM = 180 * 1024
@@ -286,6 +415,26 @@ __device__ __forceinline__ void mma16816(float* c, u32 a0, u32 a1, u32 a2, u32 a
   asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
+#ifdef CL8_EXACT
+// CL8_EXACT: the replaced (ONE2 / split) Triton path's operations at each rounding point.
+// TRITON_EX2 / TRITON_DIV: the PTX Triton emits for tl.math.exp2 / the fp32 ``/`` of those kernels.
+__device__ __forceinline__ float t_ex2(float x) { float r; asm(TRITON_EX2 " %0, %1;" : "=f"(r) : "f"(x)); return r; }
+__device__ __forceinline__ float t_div(float a, float b) { float r; asm(TRITON_DIV " %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); return r; }
+__device__ __forceinline__ float f_sub(float a, float b) { float r; asm("sub.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b)); return r; }
+// two fp32 -> bf16x2 (lo in the low half), RN: tl.Tensor.to(tl.bfloat16)
+__device__ __forceinline__ u32 bf16x2(float lo, float hi) { u32 r; asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(r) : "f"(hi), "f"(lo)); return r; }
+// two E4M3 bytes (low byte first) -> bf16x2 (low half first); exact (E4M3 -> f16 -> f32 -> bf16, each exact)
+__device__ __forceinline__ u32 e4m3x2_bf16x2(u32 v) {
+  const u32 h = e4m3x2_f16x2(v);
+  float lo, hi;
+  asm("{ .reg .f16 a, b; mov.b32 {a, b}, %2; cvt.f32.f16 %0, a; cvt.f32.f16 %1, b; }" : "=f"(lo), "=f"(hi) : "r"(h));
+  return bf16x2(lo, hi);
+}
+__device__ __forceinline__ void mma16816bf(float* c, u32 a0, u32 a1, u32 a2, u32 a3, u32 b0, u32 b1) {
+  asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+               : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+#endif
 __device__ __forceinline__ void st_async2(u32 addr, float a, float b, u32 rbar) {
   asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.v2.f32 [%0], {%1, %2}, [%3];" :: "r"(addr), "f"(a), "f"(b), "r"(rbar) : "memory");
 }
@@ -334,6 +483,9 @@ __device__ __forceinline__ void load16_bf16(const u16* p, float* x) {
   }
 }
 
+#ifdef CL8_EXACT
+#define CL8_MX_OFF (BAR_OFF + 128)  // the two key halves' row maxima: 4 x 2 x 2 x 32 floats
+#endif
 extern "C" __global__ void __launch_bounds__(NT, 1)
 swa_cl8(const u16* qkv, long long qkv_stride, u8* __restrict__ pool, const int* __restrict__ bt,
         long long bt_req_stride, long long bt_kv_stride, const int* __restrict__ seq_lens,
@@ -358,7 +510,11 @@ swa_cl8(const u16* qkv, long long qkv_stride, u8* __restrict__ pool, const int* 
   const int key0 = first_page * PG;
   const float scale = LDP(kv_scale);
   const float sb = bf16r(scale);
+#ifdef CL8_EXACT
+  const float dequant = t_div(1.0f, scale);  // the replaced path's 1.0 / scale
+#else
   const float dequant = __fdiv_rn(1.0f, scale);
+#endif
   const float qk_scale = f_mul(f_mul(sm_scale_log2, dequant), dequant);
   int* wpid = reinterpret_cast<int*>(smem + WID_OFF);
   float* cs = reinterpret_cast<float*>(smem + CS_OFF);
@@ -446,8 +602,13 @@ swa_cl8(const u16* qkv, long long qkv_stride, u8* __restrict__ pool, const int* 
         *reinterpret_cast<uint4*>(smem + SK_OFF + swz8(krow, part)) = v;
       } else {
         uint4 a, b;
+#ifdef CL8_EXACT
+        a.x = e4m3x2_bf16x2(v.x); a.y = e4m3x2_bf16x2(v.x >> 16); a.z = e4m3x2_bf16x2(v.y); a.w = e4m3x2_bf16x2(v.y >> 16);
+        b.x = e4m3x2_bf16x2(v.z); b.y = e4m3x2_bf16x2(v.z >> 16); b.z = e4m3x2_bf16x2(v.w); b.w = e4m3x2_bf16x2(v.w >> 16);
+#else
         a.x = e4m3x2_f16x2(v.x); a.y = e4m3x2_f16x2(v.x >> 16); a.z = e4m3x2_f16x2(v.y); a.w = e4m3x2_f16x2(v.y >> 16);
         b.x = e4m3x2_f16x2(v.z); b.y = e4m3x2_f16x2(v.z >> 16); b.z = e4m3x2_f16x2(v.w); b.w = e4m3x2_f16x2(v.w >> 16);
+#endif
         *reinterpret_cast<uint4*>(smem + SV_OFF + swz(krow, 2 * part)) = a;
         *reinterpret_cast<uint4*>(smem + SV_OFF + swz(krow, 2 * part + 1)) = b;
       }
@@ -489,7 +650,11 @@ swa_cl8(const u16* qkv, long long qkv_stride, u8* __restrict__ pool, const int* 
         const float b = bf16r(f_mul(kvsel ? x[2 * p + 1] : y[2 * p + 1], sb));
         const u32 e = e4m3x2(a, b);
         if (p & 1) e8[p >> 1] |= e << 16; else e8[p >> 1] = e;
+#ifdef CL8_EXACT
+        w[p] = e4m3x2_bf16x2(e);
+#else
         w[p] = e4m3x2_f16x2(e);
+#endif
       }
       const int pos = past + t;
       u8* dst = pool + ((long long)pid * HKV + h) * (PG * D) + (pos & 31) * D + qt * 16;
@@ -543,6 +708,106 @@ swa_cl8(const u16* qkv, long long qkv_stride, u8* __restrict__ pool, const int* 
     }
   }
   TSTAMPM(4);
+#ifdef CL8_EXACT
+  // CL8_EXACT: the replaced (ONE2 / split) path at every rounding point. sc = s * qk_scale (fp32), keys outside the
+  // row's range -inf; the partition (this CTA's 288 keys) row max m = max(-1e30, max sc); p = exp2(sc - m) in fp32
+  // (Triton's exp2); l = the fp32 sum of p; P rounded to bf16 for the bf16 P.V MMA (fp32 accumulate); the partial is
+  // (acc * dequant, m, l). Only the order of the sums differs.
+  float m_lo = NEG_INF, m_hi = NEG_INF;
+#pragma unroll
+  for (int n = 0; n < 18; ++n) {
+    const int jt = kbase + 8 * n;
+#pragma unroll
+    for (int e = 0; e < 2; ++e) {
+      const int j = jt + 2 * c4 + e;
+      float a = f_mul(sa[n][e], qk_scale), b = f_mul(sa[n][2 + e], qk_scale);
+      if ((unsigned)(j - jlo_lo) > (unsigned)(jhi_lo - jlo_lo)) a = NEG_INF;
+      if ((unsigned)(j - jlo_hi) > (unsigned)(jhi_hi - jlo_hi)) b = NEG_INF;
+      sa[n][e] = a; sa[n][2 + e] = b;
+      m_lo = fmaxf(m_lo, a); m_hi = fmaxf(m_hi, b);
+    }
+  }
+  m_lo = fmaxf(m_lo, __shfl_xor_sync(0xffffffffu, m_lo, 1)); m_lo = fmaxf(m_lo, __shfl_xor_sync(0xffffffffu, m_lo, 2));
+  m_hi = fmaxf(m_hi, __shfl_xor_sync(0xffffffffu, m_hi, 1)); m_hi = fmaxf(m_hi, __shfl_xor_sync(0xffffffffu, m_hi, 2));
+  {
+    // the CTA's two key halves (warps rb and rb + 4) exchange their row maxima: one max per partition
+    float* mx = reinterpret_cast<float*>(smem + CL8_MX_OFF);
+    mx[((rb * 2 + kh) * 2) * 32 + lane] = m_lo;
+    mx[((rb * 2 + kh) * 2 + 1) * 32 + lane] = m_hi;
+    asm volatile("bar.sync 1, 256;" ::: "memory");
+    m_lo = fmaxf(m_lo, mx[((rb * 2 + (kh ^ 1)) * 2) * 32 + lane]);
+    m_hi = fmaxf(m_hi, mx[((rb * 2 + (kh ^ 1)) * 2 + 1) * 32 + lane]);
+  }
+  m_lo = fmaxf(m_lo, -1.0e30f);
+  m_hi = fmaxf(m_hi, -1.0e30f);
+  u32 pl[18], ph[18];
+  float l_lo = 0.f, l_hi = 0.f;
+#pragma unroll
+  for (int n = 0; n < 18; ++n) {
+    const float p0 = t_ex2(f_sub(sa[n][0], m_lo)), p1 = t_ex2(f_sub(sa[n][1], m_lo));
+    const float p2 = t_ex2(f_sub(sa[n][2], m_hi)), p3 = t_ex2(f_sub(sa[n][3], m_hi));
+    l_lo = f_add(f_add(l_lo, p0), p1);
+    l_hi = f_add(f_add(l_hi, p2), p3);
+    pl[n] = bf16x2(p0, p1);
+    ph[n] = bf16x2(p2, p3);
+  }
+  l_lo = f_add(l_lo, __shfl_xor_sync(0xffffffffu, l_lo, 1)); l_lo = f_add(l_lo, __shfl_xor_sync(0xffffffffu, l_lo, 2));
+  l_hi = f_add(l_hi, __shfl_xor_sync(0xffffffffu, l_hi, 1)); l_hi = f_add(l_hi, __shfl_xor_sync(0xffffffffu, l_hi, 2));
+  TSTAMPM(5);
+  // ---------------- O = P V over the warp's keys: bf16 P and V, fp32 accumulate
+  float oa[8][4];
+#pragma unroll
+  for (int n = 0; n < 8; ++n) oa[n][0] = oa[n][1] = oa[n][2] = oa[n][3] = 0.f;
+  {
+    const u32 sv = sm32(smem + SV_OFF);
+#pragma unroll
+    for (int kk = 0; kk < 9; ++kk) {
+      const u32 a0 = pl[2 * kk], a1 = ph[2 * kk], a2 = pl[2 * kk + 1], a3 = ph[2 * kk + 1];
+      const int vrow = kh * 144 + 16 * kk + (mi & 1) * 8 + rin;  // codespell:ignore
+#pragma unroll
+      for (int q = 0; q < 4; ++q) {
+        u32 b0, b1, b2, b3;
+        ldsm4t(sv + swz(vrow, 2 * q + (mi >> 1)), b0, b1, b2, b3);
+        mma16816bf(oa[2 * q], a0, a1, a2, a3, b0, b1);
+        mma16816bf(oa[2 * q + 1], a0, a1, a2, a3, b2, b3);
+      }
+    }
+  }
+  TSTAMPM(6);
+  // ---------------- the two key halves share the partition's max: their P.V and row sums add
+  float* scr = reinterpret_cast<float*>(smem + SCR_OFF) + rb * 36 * 32 + lane;
+  if (kh == 1) {
+#pragma unroll
+    for (int n = 0; n < 8; ++n) {
+#pragma unroll
+      for (int e = 0; e < 4; ++e) scr[(4 * n + e) * 32] = oa[n][e];
+    }
+    scr[34 * 32] = l_lo; scr[35 * 32] = l_hi;
+  }
+  asm volatile("bar.sync 1, 256;" ::: "memory");
+  if (kh == 0) {
+    const float L_lo = f_add(l_lo, scr[34 * 32]), L_hi = f_add(l_hi, scr[35 * 32]);
+    float* recv = reinterpret_cast<float*>(smem + RECV_OFF);
+    const u32 slot = sm32(recv + (rank * RM + g) * ROWF);
+    const u32 bar = sm32(smem + BAR_OFF);
+    const u32 ra_lo = mapa(slot, t_lo), ra_hi = mapa(slot, t_hi);
+    const u32 rb_lo = mapa(bar, t_lo), rb_hi = mapa(bar, t_hi);
+    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+#pragma unroll
+    for (int n = 0; n < 8; ++n) {
+      const float o0 = f_mul(f_add(oa[n][0], scr[(4 * n + 0) * 32]), dequant);
+      const float o1 = f_mul(f_add(oa[n][1], scr[(4 * n + 1) * 32]), dequant);
+      const float o2 = f_mul(f_add(oa[n][2], scr[(4 * n + 2) * 32]), dequant);
+      const float o3 = f_mul(f_add(oa[n][3], scr[(4 * n + 3) * 32]), dequant);
+      if (t_lo < M) st_async2(ra_lo + (8 * n + 2 * c4) * 4, o0, o1, rb_lo);
+      if (t_hi < M) st_async2(ra_hi + (8 * n + 2 * c4) * 4, o2, o3, rb_hi);
+    }
+    if (c4 == 0) {
+      if (t_lo < M) st_async2(ra_lo + 64 * 4, m_lo, L_lo, rb_lo);
+      if (t_hi < M) st_async2(ra_hi + 64 * 4, m_hi, L_hi, rb_hi);
+    }
+  }
+#else
   // mask (only tiles that straddle a row's range), softmax over the warp's 144 keys; the scale (> 0) is folded
   // into the exponent: p = 2^(s * qk_scale - m * qk_scale)
   float m_lo = NEG_INF, m_hi = NEG_INF;
@@ -641,6 +906,7 @@ swa_cl8(const u16* qkv, long long qkv_stride, u8* __restrict__ pool, const int* 
       if (t_hi < M) st_async2(ra_hi + 64 * 4, mhi, L_hi, rb_hi);
     }
   }
+#endif
   }  // ======== attention warps
   TSTAMP(7);
   // ---------------- merge token `rank` once its 8 partials (one per CTA) have landed: query head = warp
@@ -662,12 +928,25 @@ swa_cl8(const u16* qkv, long long qkv_stride, u8* __restrict__ pool, const int* 
     float den = 0.f, n0 = 0.f, n1 = 0.f;
 #pragma unroll
     for (int s = 0; s < NPART; ++s) {
+#ifdef CL8_EXACT
+      const float w = ls[s] > 0.f ? t_ex2(f_sub(ms[s], mmax)) : 0.f;  // the replaced merge's exp2(m - m_max)
+      den = f_add(den, f_mul(w, ls[s]));
+#else
       const float w = ls[s] > 0.f ? f_ex2(ms[s] - mmax) : 0.f;
       den += w * ls[s];
+#endif
       const float2 o = *reinterpret_cast<const float2*>(recv + (s * RM + warp) * ROWF + 2 * lane);
+#ifdef CL8_EXACT
+      n0 = f_add(n0, f_mul(o.x, w)); n1 = f_add(n1, f_mul(o.y, w));
+#else
       n0 += o.x * w; n1 += o.y * w;
+#endif
     }
+#ifdef CL8_EXACT
+    const float a0 = bf16r(t_div(n0, den)), a1 = bf16r(t_div(n1, den));
+#else
     const float a0 = bf16r(n0 / den), a1 = bf16r(n1 / den);
+#endif
     float sq = a0 * a0 + a1 * a1;
 #pragma unroll
     for (int o = 1; o < 32; o <<= 1) sq += __shfl_xor_sync(0xffffffffu, sq, o);
@@ -680,17 +959,574 @@ swa_cl8(const u16* qkv, long long qkv_stride, u8* __restrict__ pool, const int* 
   TSTAMP(8);
 }
 """
+#: ``cl8_tep8_wide_min_requests`` (``configure``; the ``swa_one_cluster_block`` lever's
+#: TEP8_WIDE_MIN_REQUESTS): the TEP8 CL8 steps of that many requests or more launch ``swa_cl8w``
+#: instead of ``swa_cl8``: ONE 8-CTA cluster per request (grid 8 x 1 x requests) that runs the
+#: request's two KV heads in turn, where ``swa_cl8`` runs one cluster per (request, KV head) (grid 8 x
+#: 2 x requests). The device holds 22 co-resident CL8 clusters, so swa_cl8 is one wave up to 11
+#: requests and two from 12; swa_cl8w is one wave up to 22. Each head's pass is ``swa_cl8``'s
+#: cluster of that head statement for statement -- the same 288 keys per CTA, the same 8 partials,
+#: pushes and merge order, the same appended K/V bytes -- so every request's output and cache bytes
+#: are swa_cl8's bit for bit (batch-invariant as swa_cl8). KV head 1's window is staged raw in shared
+#: memory (cp.async, before the dependency wait, zero-filled where head 0 reads zero); each head has
+#: its own receive buffer and mbarrier, and the two merges run after both passes. TEP8 (2 KV heads)
+#: only; the TEP8 build compiles both kernels at once (``_cl8_function``), and a capture that finds
+#: swa_cl8w missing launches swa_cl8 (the same bits). 0 (the default): swa_cl8 at every request count.
+#: Generated from ``_CL8_SRC``'s kernel by a fixed list of edits (the shared helpers and constants
+#: are ``_CL8_SRC``'s own text).
+_CL8W_KERNEL = r"""// swa_cl8w: swa_cl8 with ONE cluster per request (grid 8 x 1 x requests) that runs the request's two KV heads in turn
+// (TEP8: HKV 2), so 12..16-request steps fit one wave. Each head's pass is swa_cl8's cluster of that head statement for
+// statement (the same pages per CTA, partials, pushes and merge order): the same bits. Head 1's window is staged in
+// shared memory before the dependency wait; each head has its own receive buffer and mbarrier, and both merges run
+// after both passes.
+#if HKV != 2
+#error "swa_cl8w is the TEP8 build (2 KV heads per rank)"
+#endif
+#define BAR1_OFF (BAR_OFF + 8)
+#define RECV1_OFF (BAR_OFF + 16)                       // head 1's receive buffer
+#define STG_OFF (RECV1_OFF + NPART * RM * ROWF * 4)    // head 1's window bytes, raw: [9 * 256][16 B]
+#define CL8W_SMEM_END (STG_OFF + 9 * NTM * 16)
+#ifndef CL8W_SMEM
+#define CL8W_SMEM (180 * 1024)
+#endif
+static_assert(CL8W_SMEM_END <= CL8W_SMEM, "swa_cl8w shared memory");
+static_assert((RECV1_OFF % 16) == 0 && (STG_OFF % 16) == 0, "swa_cl8w alignment");
+#ifdef CL8_EXACT
+#undef CL8_MX_OFF
+#define CL8_MX_OFF CL8W_SMEM_END  // the two key halves' row maxima: 4 x 2 x 2 x 32 floats
+static_assert(CL8_MX_OFF + 2048 <= CL8W_SMEM, "swa_cl8w exact: shared memory");
+#endif
+
+extern "C" __global__ void __launch_bounds__(NT, 1)
+swa_cl8w(const u16* qkv, long long qkv_stride, u8* __restrict__ pool, const int* __restrict__ bt,
+        long long bt_req_stride, long long bt_kv_stride, const int* __restrict__ seq_lens,
+        const float* __restrict__ kv_scale, const float* __restrict__ cos_sin, const pos_t* __restrict__ positions,
+        float prep_eps, float q_scale, float sm_scale_log2, u16* __restrict__ out, long long out_stride,
+        const u16* gate, long long gate_tok_stride, long long gate_head_stride, float gate_eps,
+        int M, int q_stride, int k_col0, int v_col0, int rope, int pdl, u64* tbuf) {
+  extern __shared__ __align__(128) u8 smem[];
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  const int rank = blockIdx.x, req = blockIdx.z;  // gridDim.y == 1: this cluster runs both KV heads
+  TSTAMP(0);
+#ifdef CL8_INSTR
+  if (tid == 0) { u32 sm_; asm volatile("mov.u32 %0, %%smid;" : "=r"(sm_)); tbuf[(blockIdx.x + 8 * (blockIdx.y + HKV * blockIdx.z)) * 16 + 9] = sm_; }
+#endif
+
+  // ---------------- before the dependency wait: graph inputs and older cache bytes only
+  const int L = LDP(seq_lens + req);
+  const int past = L - M;
+  int lo = past - (WINDOW - 1);
+  if (lo < 0) lo = 0;
+  const int first_page = (lo >> 5) + rank * PAGES;
+  const int key0 = first_page * PG;
+  const float scale = LDP(kv_scale);
+  const float sb = bf16r(scale);
+#ifdef CL8_EXACT
+  const float dequant = t_div(1.0f, scale);  // the replaced path's 1.0 / scale
+#else
+  const float dequant = __fdiv_rn(1.0f, scale);
+#endif
+  const float qk_scale = f_mul(f_mul(sm_scale_log2, dequant), dequant);
+  int* wpid = reinterpret_cast<int*>(smem + WID_OFF);
+  float* cs = reinterpret_cast<float*>(smem + CS_OFF);
+  const int* btr = bt + (long long)req * bt_req_stride;
+  if (tid == 0) {
+#pragma unroll
+    for (int hb = 0; hb < HKV; ++hb) {  // one receive mbarrier (and buffer) per KV head
+      const u32 bar = sm32(smem + BAR_OFF + 8 * hb);
+      asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(bar) : "memory");
+      asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" :: "r"(bar), "r"(RECV_BYTES) : "memory");
+    }
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+  }
+  // arrive now, wait right before the first push (by then every peer's mbarrier is armed): off the critical path
+  asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+  // warps 0-7: the window's cached K/V into registers, each thread loading its own pages' ids (no SMEM hand-off):
+  // keys < past only; keys >= L and missing pages are zero; keys in [past, L) are the step's own (warps 8-9)
+  uint4 rb[9];
+  if (tid < NTM) {
+    int pids[9];
+#pragma unroll
+    for (int i = 0; i < 9; ++i) {
+      const int pl = 2 * i + (tid >> 7), kv = pl / PAGES, p = pl % PAGES, page = first_page + p;
+      pids[i] = (page * PG < past) ? LDP(btr + kv * bt_kv_stride + page) : -1;
+    }
+#pragma unroll
+    for (int i = 0; i < 9; ++i) {
+      const int c = i * NTM + tid, pl = c >> 7, w = c & 127, p = pl % PAGES;
+      const int key = (first_page + p) * PG + (w >> 2);
+      uint4 v = make_uint4(0u, 0u, 0u, 0u);
+      if (pids[i] >= 0 && key < past)
+        v = LDP(reinterpret_cast<const uint4*>(pool + ((long long)pids[i] * HKV + 0) * (PG * D) + w * 16));
+      rb[i] = v;
+    }
+    // KV head 1's window bytes, staged raw in shared memory (cp.async, zero-filled where head 0 loads zero) while the
+    // predecessor runs: head 1's pass reads them from there instead of from global memory
+#pragma unroll
+    for (int i = 0; i < 9; ++i) {
+      const int c = i * NTM + tid, pl = c >> 7, w = c & 127, p = pl % PAGES;
+      const int key = (first_page + p) * PG + (w >> 2);
+      const bool ok = pids[i] >= 0 && key < past;
+      const u8* src = ok ? pool + ((long long)pids[i] * HKV + 1) * (PG * D) + w * 16 : pool;
+      asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"
+                   :: "r"(sm32(smem + STG_OFF + c * 16)), "l"(src), "r"(ok ? 16 : 0) : "memory");
+    }
+    asm volatile("cp.async.commit_group;" ::: "memory");
+  } else {
+    // warps 8-9: the new rows' page ids and the step's RoPE rows
+    const int u = tid - NTM;
+    if (u < 16) {
+      const int t = u >> 1, kv = u & 1, pos = past + t, page = pos >> 5;
+      int pid = -1;
+      if (t < M && page >= first_page && page < first_page + PAGES) pid = LDP(btr + kv * bt_kv_stride + page);
+      wpid[2 * t + kv] = pid;
+    }
+    if (rope) {
+#pragma unroll
+      for (int k = 0; k < 8; ++k) {
+        const int i = k * 64 + u, t = i >> 6, c = i & 63;
+        float v = 0.f;
+        if (t < M) v = LDP(cos_sin + (long long)LDP(positions + req * M + t) * 64 + c);
+        cs[i] = v;
+      }
+    }
+  }
+  TSTAMP(1);
+  // ---------------- the dependency wait: the QKV projection (q, k, v and the gate) from here on
+  if (pdl) {
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+  }
+  __syncthreads();  // wpid / RoPE rows
+  TSTAMP(2);
+  float gva0 = 0.f, gva1 = 0.f, gvb0 = 0.f, gvb1 = 0.f;  // each KV head's gate values, for the merges
+  // ======== the two KV heads in turn, each exactly as swa_cl8's cluster of that head computes it
+#pragma unroll
+  for (int h = 0; h < HKV; ++h) {
+  if (h) {
+    // head 0's attention has read its tiles (SK / SV / SQ / SCR are reused); head 1's staged bytes have landed
+    asm volatile("cp.async.wait_all;" ::: "memory");
+    __syncthreads();
+  }
+  // gate of the token this CTA merges (token `rank`): warp = query head, two columns per lane
+  float gv0 = 0.f, gv1 = 0.f;
+  if (rank < M && warp < 8) {
+    const u32 g2 = *reinterpret_cast<const u32*>(gate + (long long)(req * M + rank) * gate_tok_stride +
+                                                 (long long)(h * GQ + warp) * gate_head_stride + 2 * lane);
+    gv0 = bf2f(g2); gv1 = bf2f(g2 >> 16);
+  }
+  if (h == 0) { gva0 = gv0; gva1 = gv1; } else { gvb0 = gv0; gvb1 = gv1; }
+  // query rows: row = token * 8 + query head, four threads per row (16 dims each). The q loads are issued first,
+  // the window's K/V tiles are written while they are in flight, then the prep runs.
+  if (warp < 8) {
+    const int row = tid >> 2, qt = tid & 3, t = row >> 3, qh = h * GQ + (row & 7);
+    float x[16], y[16];
+    if (t < M) {
+      load16_bf16(qkv + (long long)(req * M + t) * qkv_stride + (long long)qh * q_stride + qt * 16, x);
+    } else {
+#pragma unroll
+      for (int i = 0; i < 16; ++i) x[i] = 0.f;
+    }
+#pragma unroll
+    for (int i = 0; i < 9; ++i) {
+      const int c = i * NTM + tid, pl = c >> 7, w = c & 127, kv = pl / PAGES, p = pl % PAGES;
+      const int krow = p * PG + (w >> 2), part = w & 3;
+      const int key = key0 + krow;
+      if (key >= past && key < L) continue;  // the step's own keys: warps 8-9 write them
+      const uint4 v = h ? *reinterpret_cast<const uint4*>(smem + STG_OFF + c * 16) : rb[i];
+      if (kv == 0) {
+        *reinterpret_cast<uint4*>(smem + SK_OFF + swz8(krow, part)) = v;
+      } else {
+        uint4 a, b;
+#ifdef CL8_EXACT
+        a.x = e4m3x2_bf16x2(v.x); a.y = e4m3x2_bf16x2(v.x >> 16); a.z = e4m3x2_bf16x2(v.y); a.w = e4m3x2_bf16x2(v.y >> 16);
+        b.x = e4m3x2_bf16x2(v.z); b.y = e4m3x2_bf16x2(v.z >> 16); b.z = e4m3x2_bf16x2(v.w); b.w = e4m3x2_bf16x2(v.w >> 16);
+#else
+        a.x = e4m3x2_f16x2(v.x); a.y = e4m3x2_f16x2(v.x >> 16); a.z = e4m3x2_f16x2(v.y); a.w = e4m3x2_f16x2(v.y >> 16);
+        b.x = e4m3x2_f16x2(v.z); b.y = e4m3x2_f16x2(v.z >> 16); b.z = e4m3x2_f16x2(v.w); b.w = e4m3x2_f16x2(v.w >> 16);
+#endif
+        *reinterpret_cast<uint4*>(smem + SV_OFF + swz(krow, 2 * part)) = a;
+        *reinterpret_cast<uint4*>(smem + SV_OFF + swz(krow, 2 * part + 1)) = b;
+      }
+    }
+    if (CL8_ABL == 5) {
+#pragma unroll
+      for (int i = 0; i < 16; ++i) y[i] = x[i];
+    } else {
+      prep16(x, y, prep_eps, q_scale, cs + (t < M ? t : 0) * 64, qt, rope);
+    }
+    u32 q8[4];
+#pragma unroll
+    for (int p = 0; p < 8; ++p) {
+      float a = 0.f, b = 0.f;
+      if (t < M) { a = bf16r(f_mul(y[2 * p], sb)); b = bf16r(f_mul(y[2 * p + 1], sb)); }
+      const u32 e = e4m3x2(a, b);
+      if (p & 1) q8[p >> 1] |= e << 16; else q8[p >> 1] = e;
+    }
+    *reinterpret_cast<uint4*>(smem + SQ_OFF + swz8(row, qt)) = make_uint4(q8[0], q8[1], q8[2], q8[3]);
+  }
+  // the step's keys (warp 8) and values (warp 9) on this CTA's pages, four lanes per token
+  // the step's rows are consecutive positions on at most two pages: this CTA holds one iff it holds the first or last
+  if (warp >= 8 && (wpid[0] >= 0 || wpid[2 * (M - 1)] >= 0)) {
+    const int kvsel = warp - 8, t = lane >> 2, qt = lane & 3;
+    const int pid = (t < M) ? wpid[2 * t + kvsel] : -1;
+    float x[16], y[16];
+    if (pid >= 0) {
+      load16_bf16(qkv + (long long)(req * M + t) * qkv_stride + (kvsel ? v_col0 : k_col0) + h * D + qt * 16, x);
+    } else {
+#pragma unroll
+      for (int i = 0; i < 16; ++i) x[i] = 0.f;
+    }
+    prep16(x, y, prep_eps, 1.0f, cs + t * 64, qt, rope);  // keys; the value warp discards it
+    if (pid >= 0) {
+      u32 e8[4], w[8];
+#pragma unroll
+      for (int p = 0; p < 8; ++p) {
+        const float a = bf16r(f_mul(kvsel ? x[2 * p] : y[2 * p], sb));
+        const float b = bf16r(f_mul(kvsel ? x[2 * p + 1] : y[2 * p + 1], sb));
+        const u32 e = e4m3x2(a, b);
+        if (p & 1) e8[p >> 1] |= e << 16; else e8[p >> 1] = e;
+#ifdef CL8_EXACT
+        w[p] = e4m3x2_bf16x2(e);
+#else
+        w[p] = e4m3x2_f16x2(e);
+#endif
+      }
+      const int pos = past + t;
+      u8* dst = pool + ((long long)pid * HKV + h) * (PG * D) + (pos & 31) * D + qt * 16;
+      *reinterpret_cast<uint4*>(dst) = make_uint4(e8[0], e8[1], e8[2], e8[3]);
+      const int row = pos - key0;
+      if (kvsel == 0) {
+        *reinterpret_cast<uint4*>(smem + SK_OFF + swz8(row, qt)) = make_uint4(e8[0], e8[1], e8[2], e8[3]);
+      } else {
+        *reinterpret_cast<uint4*>(smem + SV_OFF + swz(row, 2 * qt)) = make_uint4(w[0], w[1], w[2], w[3]);
+        *reinterpret_cast<uint4*>(smem + SV_OFF + swz(row, 2 * qt + 1)) = make_uint4(w[4], w[5], w[6], w[7]);
+      }
+    }
+  }
+  __syncthreads();
+  TSTAMP(3);
+
+  if (warp < 8) {  // ======== attention warps
+  // ---------------- S = Q K^T: warp w = row block rb (rows 16rb.., tokens 2rb, 2rb+1) x key half kh (144 keys)
+  const int rb = warp & 3, kh = warp >> 2;
+  const int g = lane >> 2, c4 = lane & 3, mi = lane >> 3, rin = lane & 7;  // codespell:ignore
+  u32 qa[2][4];
+  {
+    const u32 sq = sm32(smem + SQ_OFF);
+    const int row = rb * 16 + (mi & 1) * 8 + rin;  // codespell:ignore
+#pragma unroll
+    for (int kk = 0; kk < 2; ++kk) ldsm4(sq + swz8(row, 2 * kk + (mi >> 1)), qa[kk][0], qa[kk][1], qa[kk][2], qa[kk][3]);
+  }
+  const int t_lo = 2 * rb, t_hi = t_lo + 1;
+  const int qp_lo = past + t_lo, qp_hi = past + t_hi;
+  // the keys row t attends: [max(lo, qp - WINDOW + 1), qp] (empty for t >= M)
+  const int jlo_lo = max(lo, qp_lo - WINDOW + 1), jhi_lo = t_lo < M ? qp_lo : -1;
+  const int jlo_hi = max(lo, qp_hi - WINDOW + 1), jhi_hi = t_hi < M ? qp_hi : -1;
+  const int jhi_u = max(jhi_lo, jhi_hi);  // the union of both rows' ranges is [jlo_lo, jhi_u]
+  const int kbase = key0 + kh * 144;
+  float sa[18][4];
+#pragma unroll
+  for (int n = 0; n < 18; ++n) sa[n][0] = sa[n][1] = sa[n][2] = sa[n][3] = 0.f;
+  if (CL8_ABL != 1) {
+    const u32 sk = sm32(smem + SK_OFF);
+#pragma unroll
+    for (int kk = 0; kk < 2; ++kk) {
+#pragma unroll
+      for (int n = 0; n < 18; n += 2) {
+        // matrices: (tile n, dims 32kk..+15), (tile n, +16..31), (tile n+1, ..), (tile n+1, ..): FP8 bytes
+        const int krow = kh * 144 + 8 * (n + (mi >> 1)) + rin;  // codespell:ignore
+        u32 b0, b1, b2, b3;
+        ldsm4(sk + swz8(krow, 2 * kk + (mi & 1)), b0, b1, b2, b3);
+        mma16832(sa[n], qa[kk][0], qa[kk][1], qa[kk][2], qa[kk][3], b0, b1);
+        mma16832(sa[n + 1], qa[kk][0], qa[kk][1], qa[kk][2], qa[kk][3], b2, b3);
+      }
+    }
+  }
+  TSTAMPM(4);
+#ifdef CL8_EXACT
+  // CL8_EXACT: the replaced (ONE2 / split) path at every rounding point. sc = s * qk_scale (fp32), keys outside the
+  // row's range -inf; the partition (this CTA's 288 keys) row max m = max(-1e30, max sc); p = exp2(sc - m) in fp32
+  // (Triton's exp2); l = the fp32 sum of p; P rounded to bf16 for the bf16 P.V MMA (fp32 accumulate); the partial is
+  // (acc * dequant, m, l). Only the order of the sums differs.
+  float m_lo = NEG_INF, m_hi = NEG_INF;
+#pragma unroll
+  for (int n = 0; n < 18; ++n) {
+    const int jt = kbase + 8 * n;
+#pragma unroll
+    for (int e = 0; e < 2; ++e) {
+      const int j = jt + 2 * c4 + e;
+      float a = f_mul(sa[n][e], qk_scale), b = f_mul(sa[n][2 + e], qk_scale);
+      if ((unsigned)(j - jlo_lo) > (unsigned)(jhi_lo - jlo_lo)) a = NEG_INF;
+      if ((unsigned)(j - jlo_hi) > (unsigned)(jhi_hi - jlo_hi)) b = NEG_INF;
+      sa[n][e] = a; sa[n][2 + e] = b;
+      m_lo = fmaxf(m_lo, a); m_hi = fmaxf(m_hi, b);
+    }
+  }
+  m_lo = fmaxf(m_lo, __shfl_xor_sync(0xffffffffu, m_lo, 1)); m_lo = fmaxf(m_lo, __shfl_xor_sync(0xffffffffu, m_lo, 2));
+  m_hi = fmaxf(m_hi, __shfl_xor_sync(0xffffffffu, m_hi, 1)); m_hi = fmaxf(m_hi, __shfl_xor_sync(0xffffffffu, m_hi, 2));
+  {
+    // the CTA's two key halves (warps rb and rb + 4) exchange their row maxima: one max per partition
+    float* mx = reinterpret_cast<float*>(smem + CL8_MX_OFF);
+    mx[((rb * 2 + kh) * 2) * 32 + lane] = m_lo;
+    mx[((rb * 2 + kh) * 2 + 1) * 32 + lane] = m_hi;
+    asm volatile("bar.sync 1, 256;" ::: "memory");
+    m_lo = fmaxf(m_lo, mx[((rb * 2 + (kh ^ 1)) * 2) * 32 + lane]);
+    m_hi = fmaxf(m_hi, mx[((rb * 2 + (kh ^ 1)) * 2 + 1) * 32 + lane]);
+  }
+  m_lo = fmaxf(m_lo, -1.0e30f);
+  m_hi = fmaxf(m_hi, -1.0e30f);
+  u32 pl[18], ph[18];
+  float l_lo = 0.f, l_hi = 0.f;
+#pragma unroll
+  for (int n = 0; n < 18; ++n) {
+    const float p0 = t_ex2(f_sub(sa[n][0], m_lo)), p1 = t_ex2(f_sub(sa[n][1], m_lo));
+    const float p2 = t_ex2(f_sub(sa[n][2], m_hi)), p3 = t_ex2(f_sub(sa[n][3], m_hi));
+    l_lo = f_add(f_add(l_lo, p0), p1);
+    l_hi = f_add(f_add(l_hi, p2), p3);
+    pl[n] = bf16x2(p0, p1);
+    ph[n] = bf16x2(p2, p3);
+  }
+  l_lo = f_add(l_lo, __shfl_xor_sync(0xffffffffu, l_lo, 1)); l_lo = f_add(l_lo, __shfl_xor_sync(0xffffffffu, l_lo, 2));
+  l_hi = f_add(l_hi, __shfl_xor_sync(0xffffffffu, l_hi, 1)); l_hi = f_add(l_hi, __shfl_xor_sync(0xffffffffu, l_hi, 2));
+  TSTAMPM(5);
+  // ---------------- O = P V over the warp's keys: bf16 P and V, fp32 accumulate
+  float oa[8][4];
+#pragma unroll
+  for (int n = 0; n < 8; ++n) oa[n][0] = oa[n][1] = oa[n][2] = oa[n][3] = 0.f;
+  {
+    const u32 sv = sm32(smem + SV_OFF);
+#pragma unroll
+    for (int kk = 0; kk < 9; ++kk) {
+      const u32 a0 = pl[2 * kk], a1 = ph[2 * kk], a2 = pl[2 * kk + 1], a3 = ph[2 * kk + 1];
+      const int vrow = kh * 144 + 16 * kk + (mi & 1) * 8 + rin;  // codespell:ignore
+#pragma unroll
+      for (int q = 0; q < 4; ++q) {
+        u32 b0, b1, b2, b3;
+        ldsm4t(sv + swz(vrow, 2 * q + (mi >> 1)), b0, b1, b2, b3);
+        mma16816bf(oa[2 * q], a0, a1, a2, a3, b0, b1);
+        mma16816bf(oa[2 * q + 1], a0, a1, a2, a3, b2, b3);
+      }
+    }
+  }
+  TSTAMPM(6);
+  // ---------------- the two key halves share the partition's max: their P.V and row sums add
+  float* scr = reinterpret_cast<float*>(smem + SCR_OFF) + rb * 36 * 32 + lane;
+  if (kh == 1) {
+#pragma unroll
+    for (int n = 0; n < 8; ++n) {
+#pragma unroll
+      for (int e = 0; e < 4; ++e) scr[(4 * n + e) * 32] = oa[n][e];
+    }
+    scr[34 * 32] = l_lo; scr[35 * 32] = l_hi;
+  }
+  asm volatile("bar.sync 1, 256;" ::: "memory");
+  if (kh == 0) {
+    const float L_lo = f_add(l_lo, scr[34 * 32]), L_hi = f_add(l_hi, scr[35 * 32]);
+    float* recv = reinterpret_cast<float*>(smem + (h ? RECV1_OFF : RECV_OFF));
+    const u32 slot = sm32(recv + (rank * RM + g) * ROWF);
+    const u32 bar = sm32(smem + BAR_OFF + 8 * h);
+    const u32 ra_lo = mapa(slot, t_lo), ra_hi = mapa(slot, t_hi);
+    const u32 rb_lo = mapa(bar, t_lo), rb_hi = mapa(bar, t_hi);
+    if (h == 0) asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");  // once: every peer's mbarriers armed
+#pragma unroll
+    for (int n = 0; n < 8; ++n) {
+      const float o0 = f_mul(f_add(oa[n][0], scr[(4 * n + 0) * 32]), dequant);
+      const float o1 = f_mul(f_add(oa[n][1], scr[(4 * n + 1) * 32]), dequant);
+      const float o2 = f_mul(f_add(oa[n][2], scr[(4 * n + 2) * 32]), dequant);
+      const float o3 = f_mul(f_add(oa[n][3], scr[(4 * n + 3) * 32]), dequant);
+      if (t_lo < M) st_async2(ra_lo + (8 * n + 2 * c4) * 4, o0, o1, rb_lo);
+      if (t_hi < M) st_async2(ra_hi + (8 * n + 2 * c4) * 4, o2, o3, rb_hi);
+    }
+    if (c4 == 0) {
+      if (t_lo < M) st_async2(ra_lo + 64 * 4, m_lo, L_lo, rb_lo);
+      if (t_hi < M) st_async2(ra_hi + 64 * 4, m_hi, L_hi, rb_hi);
+    }
+  }
+#else
+  // mask (only tiles that straddle a row's range), softmax over the warp's 144 keys; the scale (> 0) is folded
+  // into the exponent: p = 2^(s * qk_scale - m * qk_scale)
+  float m_lo = NEG_INF, m_hi = NEG_INF;
+#pragma unroll
+  for (int n = 0; n < 18; ++n) {
+    const int jt = kbase + 8 * n;
+    const bool in_lo = jt >= jlo_lo && jt + 7 <= jhi_lo, in_hi = jt >= jlo_hi && jt + 7 <= jhi_hi;
+    if (!(in_lo && in_hi)) {
+#pragma unroll
+      for (int e = 0; e < 2; ++e) {
+        const int j = jt + 2 * c4 + e;
+        if ((unsigned)(j - jlo_lo) > (unsigned)(jhi_lo - jlo_lo)) sa[n][e] = NEG_INF;
+        if ((unsigned)(j - jlo_hi) > (unsigned)(jhi_hi - jlo_hi)) sa[n][2 + e] = NEG_INF;
+      }
+    }
+    m_lo = fmaxf(m_lo, fmaxf(sa[n][0], sa[n][1]));
+    m_hi = fmaxf(m_hi, fmaxf(sa[n][2], sa[n][3]));
+  }
+  m_lo = fmaxf(m_lo, __shfl_xor_sync(0xffffffffu, m_lo, 1)); m_lo = fmaxf(m_lo, __shfl_xor_sync(0xffffffffu, m_lo, 2));
+  m_hi = fmaxf(m_hi, __shfl_xor_sync(0xffffffffu, m_hi, 1)); m_hi = fmaxf(m_hi, __shfl_xor_sync(0xffffffffu, m_hi, 2));
+  // ONE2's m is max(-1e30, max(s * scale)); here m is kept in raw units and scaled once
+  const float ms_lo = fmaxf(m_lo * qk_scale, -1.0e30f), ms_hi = fmaxf(m_hi * qk_scale, -1.0e30f);
+  // P = 2^(s * scale - m) in f16 straight from the MUFU (ex2.approx.f16x2: two per op); the row sums come from the
+  // P.V MMA itself (a ones column), so they are the sums of exactly the P values that weigh V
+  u32 pl[18], ph[18];
+#pragma unroll
+  for (int n = 0; n < 18; ++n) {
+    const u32 xl = f16x2(fmaf(sa[n][0], qk_scale, -ms_lo), fmaf(sa[n][1], qk_scale, -ms_lo));
+    const u32 xh = f16x2(fmaf(sa[n][2], qk_scale, -ms_hi), fmaf(sa[n][3], qk_scale, -ms_hi));
+    pl[n] = (CL8_ABL == 3) ? xl : ex2h2(xl);
+    ph[n] = (CL8_ABL == 3) ? xh : ex2h2(xh);
+  }
+  const float m_lo_out = ms_lo, m_hi_out = ms_hi;
+  TSTAMPM(5);
+  // ---------------- O = P V over the warp's keys, plus l = P . 1 in an extra n8 tile (column 64)
+  float oa[8][4], la[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+  for (int n = 0; n < 8; ++n) oa[n][0] = oa[n][1] = oa[n][2] = oa[n][3] = 0.f;
+  {
+    const u32 sv = sm32(smem + SV_OFF);
+    const u32 ones = (g == 0) ? 0x3C003C00u : 0u;  // B column 0 of the extra tile: two f16 1.0
+#pragma unroll
+    for (int kk = 0; kk < 9; ++kk) {
+      if (CL8_ABL == 1 || CL8_ABL == 2) continue;
+      const u32 a0 = pl[2 * kk], a1 = ph[2 * kk], a2 = pl[2 * kk + 1], a3 = ph[2 * kk + 1];
+      const int vrow = kh * 144 + 16 * kk + (mi & 1) * 8 + rin;  // codespell:ignore
+#pragma unroll
+      for (int q = 0; q < 4; ++q) {
+        u32 b0, b1, b2, b3;
+        ldsm4t(sv + swz(vrow, 2 * q + (mi >> 1)), b0, b1, b2, b3);
+        mma16816(oa[2 * q], a0, a1, a2, a3, b0, b1);
+        mma16816(oa[2 * q + 1], a0, a1, a2, a3, b2, b3);
+      }
+      mma16816(la, a0, a1, a2, a3, ones, ones);
+    }
+  }
+  // row sums live in column 64 (lanes with c4 == 0): give them to the whole quad
+  const float l_lo = __shfl_sync(0xffffffffu, la[0], lane & ~3), l_hi = __shfl_sync(0xffffffffu, la[2], lane & ~3);
+  TSTAMPM(6);
+  // ---------------- combine the two key halves of each row block in the CTA (warp rb + 4 into warp rb)
+  float* scr = reinterpret_cast<float*>(smem + SCR_OFF) + rb * 36 * 32 + lane;
+  if (kh == 1) {
+#pragma unroll
+    for (int n = 0; n < 8; ++n) {
+#pragma unroll
+      for (int e = 0; e < 4; ++e) scr[(4 * n + e) * 32] = oa[n][e];
+    }
+    scr[32 * 32] = m_lo_out; scr[33 * 32] = m_hi_out; scr[34 * 32] = l_lo; scr[35 * 32] = l_hi;
+  }
+  asm volatile("bar.sync 1, 256;" ::: "memory");
+  if (kh == 0) {
+    const float m1_lo = scr[32 * 32], m1_hi = scr[33 * 32], l1_lo = scr[34 * 32], l1_hi = scr[35 * 32];
+    const float mlo = fmaxf(m_lo_out, m1_lo), mhi = fmaxf(m_hi_out, m1_hi);
+    const float a_lo = f_ex2(m_lo_out - mlo), b_lo = f_ex2(m1_lo - mlo);
+    const float a_hi = f_ex2(m_hi_out - mhi), b_hi = f_ex2(m1_hi - mhi);
+    const float L_lo = l_lo * a_lo + l1_lo * b_lo, L_hi = l_hi * a_hi + l1_hi * b_hi;
+    // push: row lo -> CTA t_lo, row hi -> CTA t_hi (only tokens < M: no CTA waits for the others)
+    float* recv = reinterpret_cast<float*>(smem + (h ? RECV1_OFF : RECV_OFF));
+    const u32 slot = sm32(recv + (rank * RM + g) * ROWF);
+    const u32 bar = sm32(smem + BAR_OFF + 8 * h);
+    const u32 ra_lo = mapa(slot, t_lo), ra_hi = mapa(slot, t_hi);
+    const u32 rb_lo = mapa(bar, t_lo), rb_hi = mapa(bar, t_hi);
+    const float dq_lo = dequant, dq_hi = dequant;
+    if (h == 0) asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");  // once: every peer's mbarriers armed
+#pragma unroll
+    for (int n = 0; n < 8; ++n) {
+      const float o0 = (oa[n][0] * a_lo + scr[(4 * n + 0) * 32] * b_lo) * dq_lo;
+      const float o1 = (oa[n][1] * a_lo + scr[(4 * n + 1) * 32] * b_lo) * dq_lo;
+      const float o2 = (oa[n][2] * a_hi + scr[(4 * n + 2) * 32] * b_hi) * dq_hi;
+      const float o3 = (oa[n][3] * a_hi + scr[(4 * n + 3) * 32] * b_hi) * dq_hi;
+      if (t_lo < M) st_async2(ra_lo + (8 * n + 2 * c4) * 4, o0, o1, rb_lo);
+      if (t_hi < M) st_async2(ra_hi + (8 * n + 2 * c4) * 4, o2, o3, rb_hi);
+    }
+    if (c4 == 0) {
+      if (t_lo < M) st_async2(ra_lo + 64 * 4, mlo, L_lo, rb_lo);
+      if (t_hi < M) st_async2(ra_hi + 64 * 4, mhi, L_hi, rb_hi);
+    }
+  }
+#endif
+  }  // ======== attention warps
+  }  // ======== KV heads
+  TSTAMP(7);
+  // ---------------- merge token `rank` once its 8 partials (one per CTA) have landed: query head = warp
+#pragma unroll
+  for (int h = 0; h < HKV; ++h) {
+  const float gv0 = h ? gvb0 : gva0, gv1 = h ? gvb1 : gva1;
+  if (rank < M && warp < 8 && CL8_ABL != 6) {
+    const u32 bar = sm32(smem + BAR_OFF + 8 * h);
+    u32 done = 0;
+    while (!done) {
+      asm volatile("{\n\t.reg .pred p;\n\tmbarrier.try_wait.parity.shared::cta.b64 p, [%1], 0;\n\tselp.u32 %0, 1, 0, p;\n\t}"
+                   : "=r"(done) : "r"(bar) : "memory");
+    }
+    const float* recv = reinterpret_cast<const float*>(smem + (h ? RECV1_OFF : RECV_OFF));
+    float ms[NPART], ls[NPART], mmax = NEG_INF;
+#pragma unroll
+    for (int s = 0; s < NPART; ++s) {
+      const float2 ml = *reinterpret_cast<const float2*>(recv + (s * RM + warp) * ROWF + 64);
+      ms[s] = ml.x; ls[s] = ml.y;
+      mmax = fmaxf(mmax, ms[s]);
+    }
+    float den = 0.f, n0 = 0.f, n1 = 0.f;
+#pragma unroll
+    for (int s = 0; s < NPART; ++s) {
+#ifdef CL8_EXACT
+      const float w = ls[s] > 0.f ? t_ex2(f_sub(ms[s], mmax)) : 0.f;  // the replaced merge's exp2(m - m_max)
+      den = f_add(den, f_mul(w, ls[s]));
+#else
+      const float w = ls[s] > 0.f ? f_ex2(ms[s] - mmax) : 0.f;
+      den += w * ls[s];
+#endif
+      const float2 o = *reinterpret_cast<const float2*>(recv + (s * RM + warp) * ROWF + 2 * lane);
+#ifdef CL8_EXACT
+      n0 = f_add(n0, f_mul(o.x, w)); n1 = f_add(n1, f_mul(o.y, w));
+#else
+      n0 += o.x * w; n1 += o.y * w;
+#endif
+    }
+#ifdef CL8_EXACT
+    const float a0 = bf16r(t_div(n0, den)), a1 = bf16r(t_div(n1, den));
+#else
+    const float a0 = bf16r(n0 / den), a1 = bf16r(n1 / den);
+#endif
+    float sq = a0 * a0 + a1 * a1;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) sq += __shfl_xor_sync(0xffffffffu, sq, o);
+    const float inv = f_rsqrt(sq * 0.015625f + gate_eps);
+    const float r0 = bf16r(a0 * inv) * bf16r(1.f / (1.f + __expf(-gv0)));
+    const float r1 = bf16r(a1 * inv) * bf16r(1.f / (1.f + __expf(-gv1)));
+    *reinterpret_cast<u32*>(out + (long long)(req * M + rank) * out_stride + (h * GQ + warp) * D + 2 * lane) =
+        (u32)f2bf(r0) | ((u32)f2bf(r1) << 16);
+  }
+  }  // ======== merges, one per KV head
+  TSTAMP(8);
+}
+"""
+_CL8W_SRC = _CL8_SRC.split('extern "C" __global__')[0] + _CL8W_KERNEL
+_CL8_TEP8_WIDE_MIN_REQUESTS = 0
+
+
+def cl8_tep8_wide_takes(reqs: int) -> bool:
+    """Whether a TEP8 CL8 step of ``reqs`` requests (``cl8_tep8_takes``) launches ``swa_cl8w``: one
+    cluster per request over both KV heads (``_CL8_TEP8_WIDE_MIN_REQUESTS`` <= ``reqs``)."""
+    return bool(_CL8_TEP8_WIDE_MIN_REQUESTS) and reqs >= _CL8_TEP8_WIDE_MIN_REQUESTS
 
 
 _CL8_FN = {}
 _CL8_WARNED = set()
+#: ``cl8_exact`` (``configure``): every CL8 build is ``-DCL8_EXACT`` (keyed apart).
+_CL8_EXACT = False
+#: The PTX the replaced Triton kernels emit for ``tl.math.exp2`` and the fp32 ``/``, which the exact build
+#: issues at the same points (``-DTRITON_EX2`` / ``-DTRITON_DIV``; keyed). Read off their PTX on VR
+#: (vrg-zcx1): the ONE2 kernel's softmax and merge exp2 are ex2.approx.ftz.f32 (38 of its 39 ex2; the
+#: other, non-ftz, is its sigmoid), the split kernel's all 12, and every fp32 division is div.full.f32.
+CL8_EXACT_EX2 = "ex2.approx.ftz.f32"
+CL8_EXACT_DIV = "div.full.f32"
 
 
-def _cl8_log(msg: str, warning: bool = False) -> None:
+def _cl8_log(msg: str, warning: bool = False, error: bool = False) -> None:
     try:
         from tensorrt_llm.logger import logger
 
-        (logger.warning if warning else logger.info)(msg)
+        (logger.error if error else logger.warning if warning else logger.info)(msg)
     except Exception:  # noqa: BLE001 - standalone copies load this file without tensorrt_llm
         print(msg, flush=True)
 
@@ -701,21 +1537,46 @@ def _cl8_check(r):
     return r[1] if len(r) == 2 else r[1:]
 
 
-def _cl8_function(device: torch.device, pos64: bool, hkv: int):
+def _cl8_function(device: torch.device, pos64: bool, hkv: int, wide: bool = False):
     """The compiled CL8 kernel of ``device`` (int64 or int32 position ids: two compile-time builds; ``hkv`` KV heads
-    per rank: 4 at tep4, 2 at tep8); ``None`` if it is not compiled yet and a capture is running."""
+    per rank: 4 at tep4, 2 at tep8); ``None`` if it is not compiled yet and a capture is running. ``wide``: the
+    one-cluster-per-request kernel ``swa_cl8w`` (TEP8 only). Every eager call for the TEP8 build under
+    ``cl8_tep8_wide_min_requests`` also compiles ``swa_cl8w`` if it is missing -- including when the TEP8
+    build itself was compiled before the setting (a cache hit) -- so a capture finds both."""
     index = device.index if device.index is not None else torch.cuda.current_device()
-    key = (index, bool(pos64), int(hkv))
+    key = (
+        (index, bool(pos64), int(hkv))
+        + (("w",) if wide else ())
+        + (("exact", CL8_EXACT_EX2, CL8_EXACT_DIV) if _CL8_EXACT else ())
+    )
     fn = _CL8_FN.get(key)
     if fn is not None:
+        if (
+            int(hkv) == 2
+            and not wide
+            and _CL8_TEP8_WIDE_MIN_REQUESTS
+            and (index, bool(pos64), int(hkv), "w")
+            + (("exact", CL8_EXACT_EX2, CL8_EXACT_DIV) if _CL8_EXACT else ())
+            not in _CL8_FN
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            _cl8_function(device, pos64, hkv, wide=True)
         return fn
+    if wide and int(hkv) != 2:
+        raise ValueError(
+            f"swa_block CL8: the one-cluster-per-request build is TEP8's (2 KV heads), got {hkv}"
+        )
     if torch.cuda.is_current_stream_capturing():
         if key not in _CL8_WARNED:
             _CL8_WARNED.add(key)
             _cl8_log(
-                "[musespark_open] swa_block CL8: first call inside a CUDA-graph capture; this "
-                "capture keeps the path CL8 replaces (compile happens on an eager call)",
-                warning=True,
+                f"[musespark_open] swa_block CL8{' swa_cl8w' if wide else ''}"
+                f"{' (cl8_exact)' if _CL8_EXACT else ''}: first call inside a "
+                "CUDA-graph capture; this capture keeps the path CL8 replaces"
+                + (" (swa_cl8, the same bits)" if wide else "")
+                + " (compile happens on an eager call)",
+                warning=not _CL8_EXACT,
+                error=_CL8_EXACT,
             )
         return None
     from cuda.bindings import driver as cu
@@ -726,25 +1587,42 @@ def _cl8_function(device: torch.device, pos64: bool, hkv: int):
         raise RuntimeError(
             f"swa_block CL8 is built for sm_107 only, not compute capability {capability}"
         )
-    prog = _cl8_check(nvrtc.nvrtcCreateProgram(_CL8_SRC.encode(), b"swa_cl8.cu", 0, [], []))
+    prog = _cl8_check(
+        nvrtc.nvrtcCreateProgram(
+            (_CL8W_SRC if wide else _CL8_SRC).encode(),
+            b"swa_cl8w.cu" if wide else b"swa_cl8.cu",
+            0,
+            [],
+            [],
+        )
+    )
     opts = [b"--gpu-architecture=sm_107", b"-std=c++17", b"-default-device"]
     if hkv != 4:
         # The source's HKV defaults to 4 (the TEP4 build); the TEP8 build passes -DHKV=2.
         opts.append(f"-DHKV={int(hkv)}".encode())
     if pos64:
         opts.append(b"-DCL8_POS64")
+    if wide:
+        opts.append(f"-DCL8W_SMEM={_CL8_SMEM}".encode())
+    if _CL8_EXACT:
+        opts.append(b"-DCL8_EXACT")
+        opts.append(f'-DTRITON_EX2="{CL8_EXACT_EX2}"'.encode())
+        opts.append(f'-DTRITON_DIV="{CL8_EXACT_DIV}"'.encode())
     r = nvrtc.nvrtcCompileProgram(prog, len(opts), opts)
     n = _cl8_check(nvrtc.nvrtcGetProgramLogSize(prog))
     log = b" " * n
     nvrtc.nvrtcGetProgramLog(prog, log)
     if int(r[0]) != 0:
-        raise RuntimeError("swa_block CL8 NVRTC compile failed:\n" + log.decode(errors="replace"))
+        raise RuntimeError(
+            f"swa_block CL8{' swa_cl8w' if wide else ''} NVRTC compile failed:\n"
+            + log.decode(errors="replace")
+        )
     n = _cl8_check(nvrtc.nvrtcGetCUBINSize(prog))
     cubin = b" " * n
     _cl8_check(nvrtc.nvrtcGetCUBIN(prog, cubin))
     with torch.cuda.device(index):
         mod = _cl8_check(cu.cuModuleLoadData(cubin))
-        f = _cl8_check(cu.cuModuleGetFunction(mod, b"swa_cl8"))
+        f = _cl8_check(cu.cuModuleGetFunction(mod, b"swa_cl8w" if wide else b"swa_cl8"))
         _cl8_check(
             cu.cuFuncSetAttribute(
                 f,
@@ -767,11 +1645,16 @@ def _cl8_function(device: torch.device, pos64: bool, hkv: int):
     else:
         head = f"[musespark_open] swa_block CL8 (TEP8): cl8_tep8={_TEP8_SWA_CL8}"
         heads = f"{int(hkv)} KV heads per rank, "
+        if wide:
+            head += " swa_cl8w (one cluster per request)"
+            heads += "both per cluster, "
     _cl8_log(
         f"{head} compiled for sm_107 on device {index} (regs {regs}, local "
         f"{lmem} B, smem {_CL8_SMEM // 1024} KB, cluster 8, 320 threads, {heads}"
         f"{'int64' if pos64 else 'int32'} positions)"
     )
+    if int(hkv) == 2 and not wide and _CL8_TEP8_WIDE_MIN_REQUESTS:
+        _cl8_function(device, pos64, hkv, wide=True)
     return _CL8_FN[key]
 
 
@@ -829,7 +1712,10 @@ def _cl8_launch(
     qkv_permuted,
     enable_pdl,
     rope,
+    wide: bool = False,
 ):
+    """Launch a CL8 build: grid 8 x ``hkv`` x requests (``swa_cl8``), or 8 x 1 x requests for
+    ``wide`` (``swa_cl8w``: one cluster per request over its KV heads); the same arguments."""
     import ctypes
 
     from cuda.bindings import driver as cu
@@ -844,7 +1730,7 @@ def _cl8_launch(
     gts = gate.stride(0)
     ghs = gate.stride(1) if gate.dim() == 3 else HEAD_DIM
     cfg = cu.CUlaunchConfig()
-    cfg.gridDimX, cfg.gridDimY, cfg.gridDimZ = 8, hkv, reqs
+    cfg.gridDimX, cfg.gridDimY, cfg.gridDimZ = 8, (1 if wide else hkv), reqs
     cfg.blockDimX, cfg.blockDimY, cfg.blockDimZ = 320, 1, 1
     cfg.sharedMemBytes = _CL8_SMEM
     cfg.hStream = cu.CUstream(torch.cuda.current_stream(qkv.device).cuda_stream)
@@ -2618,11 +3504,12 @@ class SwaBlockMultiAttention(OpWrapper):
         if not fused_prep:
             width += num_kv_heads * HEAD_DIM
         if (
-            # ONE2 lifts the cap to 8 at TEP8 (2 KV heads), as kernels/swa_block/attention.py's
-            # caller does; 4 KV heads keep 2..4.
+            # ONE2 lifts the cap to 8 at TEP8 (2 KV heads), and CL8's TEP8 build to its
+            # _CL8_TEP8_MAX_REQUESTS, as kernels/swa_block/attention.py's caller does; 4 KV heads
+            # keep 2..4.
             not 2
             <= reqs
-            <= (_ONE2_MAX_REQUESTS if _SWA_ONE2 and num_kv_heads == 2 else MULTI_MAX_REQUESTS)
+            <= (cl8_tep8_requests() if num_kv_heads == 2 else MULTI_MAX_REQUESTS)
             or rows * reqs != total
             or not 1 <= rows <= MAX_ROWS
             or qkv.dtype != torch.bfloat16
@@ -2726,8 +3613,7 @@ class SwaBlockMultiAttention(OpWrapper):
                     rope,
                 )
         if (
-            _TEP8_SWA_CL8
-            and _CL8_TEP8_MIN_REQUESTS <= reqs <= _CL8_TEP8_MAX_REQUESTS
+            cl8_tep8_takes(reqs)
             and page == BLOCK_N
             and _cl8_eligible(
                 qkv,
@@ -2744,9 +3630,31 @@ class SwaBlockMultiAttention(OpWrapper):
                 2,
             )
         ):
-            # The one-cluster SWA block at TEP8 (``cl8_tep8``).
-            fn = _cl8_function(qkv.device, rope and positions.dtype == torch.int64, num_kv_heads)
+            # The one-cluster SWA block at TEP8 (``cl8_tep8``), on
+            # cl8_tep8_min_requests..cl8_tep8_max_requests sequences (5..8 by default).
+            pos64 = rope and positions.dtype == torch.int64
+            fn = _cl8_function(qkv.device, pos64, num_kv_heads)
+            wide = False
+            if fn is not None and cl8_tep8_wide_takes(reqs):
+                # One cluster per request over both KV heads (swa_cl8w), the same bits; swa_cl8 when
+                # a capture finds it not compiled.
+                wide_fn = _cl8_function(qkv.device, pos64, num_kv_heads, wide=True)
+                if wide_fn is not None:
+                    fn, wide = wide_fn, True
             if fn is not None:
+                if (reqs, wide) not in _CL8_TEP8_LOGGED:
+                    _CL8_TEP8_LOGGED.add((reqs, wide))
+                    _cl8_log(
+                        f"[musespark_open] swa_block CL8 (TEP8): decode steps of {reqs} requests "
+                        f"run the one-cluster SWA block (grid 8 x {1 if wide else num_kv_heads} x {reqs}, band "
+                        f"{_CL8_TEP8_MIN_REQUESTS}-{_CL8_TEP8_MAX_REQUESTS}"
+                        + (
+                            f"; swa_cl8w: one cluster per request over both KV heads from "
+                            f"{_CL8_TEP8_WIDE_MIN_REQUESTS} requests)"
+                            if wide
+                            else ")"
+                        )
+                    )
                 out = torch.empty(
                     (total, num_q_heads * HEAD_DIM), dtype=torch.bfloat16, device=qkv.device
                 )
@@ -2767,7 +3675,16 @@ class SwaBlockMultiAttention(OpWrapper):
                     qkv_permuted,
                     enable_pdl,
                     rope,
+                    wide,
                 )
+        if reqs > _ONE2_MAX_REQUESTS:
+            # 9..16 sequences are CL8's alone (cl8_tep8_max_requests): the split / ONE2 builds
+            # below are not certified there, and the caller routes them here only when CL8 is
+            # ready (cl8_tep8_ready).
+            raise ValueError(
+                f"swa_block_multi: a step of {reqs} sequences reached the block without the TEP8 "
+                "CL8 build (it takes 9+ sequences only through CL8)"
+            )
         out = torch.empty((total, num_q_heads * HEAD_DIM), dtype=torch.bfloat16, device=qkv.device)
         group_rows = rows * Q_PER_KV
         sms = None

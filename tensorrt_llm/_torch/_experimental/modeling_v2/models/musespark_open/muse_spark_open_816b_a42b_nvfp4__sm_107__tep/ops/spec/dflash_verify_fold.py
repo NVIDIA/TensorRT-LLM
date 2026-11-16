@@ -58,6 +58,19 @@ MAX_REQUESTS = LOOP_REQUESTS
 #: Elements of ``_seq_lens_cuda`` copied per loop iteration.
 SEQ_BLOCK = 128
 
+#: ``head_sampler_coop_fold``'s VERIFY_GRID (``configure``): the fold runs one program per request
+#: (``_dflash_verify_fold_grid_kernel``) instead of one program looping over them. Same outputs.
+GRID = False
+_GRID_LOGGED = False
+
+
+def configure(*, grid: bool = False) -> None:
+    """Set whether the fold runs one program per request (``lever_settings.apply``, before any install)."""
+    global GRID
+    if not isinstance(grid, bool):
+        raise ValueError(f"the verify fold's grid switch is a bool, got {grid!r}")
+    GRID = grid
+
 
 class VerifyFold(NamedTuple):
     """What one fold launch writes (shapes for ``g`` generation requests, ``K`` drafts, block ``B``)."""
@@ -258,6 +271,112 @@ def _dflash_verify_fold_kernel(
         tl.store(embed_ids_ptr + num_gens, mask_id)
 
 
+@triton.jit
+def _dflash_verify_fold_grid_kernel(
+    target_ptr,
+    draft_ptr,
+    draft_row_stride,
+    accepted_ptr,
+    num_accepted_ptr,
+    pool_ptr,
+    counter_ptr,
+    num_gens,
+    base_total,
+    max_total,
+    frac,
+    slots_ptr,
+    ctx_len_ptr,
+    max_ctx,
+    kv_lens_ptr,
+    seq_lens_ptr,
+    seq_lens_copy_ptr,
+    seq_lens_numel,
+    rewind_ptr,
+    gen_rows_ptr,
+    bonus_ptr,
+    num_accepted_long_ptr,
+    query_positions_ptr,
+    ctx_positions_ptr,
+    offsets_ptr,
+    embed_ids_ptr,
+    noise_ids_ptr,
+    mask_token_id,
+    block_size,
+    K: tl.constexpr,
+    BLOCK: tl.constexpr,
+    QBLOCK: tl.constexpr,
+    FORCE: tl.constexpr,
+    COUNTER_STRIDE: tl.constexpr,
+    SLOT_STRIDE: tl.constexpr,
+    POOL_MASK: tl.constexpr,
+    BUMP_KV_LENS: tl.constexpr,
+    COPY_SEQ_LENS: tl.constexpr,
+    SEQ_BLOCK: tl.constexpr,
+):
+    """``_dflash_verify_fold_kernel``'s loop body for request g = program_id(0), program 0 also the
+    per-call statements. Under FORCE == 2 every program takes the call's counter from one 64-bit
+    atomic add of 1 << 32 on the counter (low half: the counter before the call, untouched until
+    the last arrival; high half: the arrival ticket); the last program to arrive adds
+    1 - (num_gens << 32), leaving the counter + 1 the loop kernel stores. Each program reads the
+    counter + 1 the loop kernel's requests read. Counters below 2^32."""
+    g = tl.program_id(0)
+    cols = tl.arange(0, BLOCK)
+    qcols = tl.arange(0, QBLOCK)
+    row_width = K + 1
+    in_row = cols < row_width
+    in_block = qcols < block_size
+    mask_id = tl.zeros([], dtype=tl.int64) + mask_token_id
+    if g == 0:
+        if COPY_SEQ_LENS:
+            for start in range(0, seq_lens_numel, SEQ_BLOCK):
+                idx = start + tl.arange(0, SEQ_BLOCK)
+                keep = idx < seq_lens_numel
+                tl.store(seq_lens_copy_ptr + idx, tl.load(seq_lens_ptr + idx, mask=keep), mask=keep)
+        tl.store(offsets_ptr + cols, cols.to(tl.int64), mask=in_row)
+        tl.store(embed_ids_ptr + num_gens, mask_id)
+    counter = tl.zeros([], dtype=tl.int64)
+    if FORCE == 2:
+        ticket_unit = tl.full([], 1, tl.int64) << 32
+        old = tl.atomic_add(counter_ptr, ticket_unit)
+        counter = (old & 0xFFFFFFFF) + 1
+        n64 = tl.full([], 0, tl.int64) + num_gens
+        if (old >> 32) == n64 - 1:
+            tl.atomic_add(counter_ptr, 1 - (n64 << 32))
+    # --- acceptance: dflash_accept's statements for a generation row ---
+    tokens = tl.load(target_ptr + g * row_width + cols, mask=in_row, other=0)
+    tokens32 = tokens.to(tl.int32)
+    tl.store(accepted_ptr + g * row_width + cols, tokens32, mask=in_row)
+    if FORCE == 0:
+        drafts = tl.load(draft_ptr + g * draft_row_stride + cols, mask=cols < K, other=0)
+        mismatch = (cols < K) & (drafts.to(tl.int64) != tokens.to(tl.int64))
+        accepted = tl.min(tl.where(mismatch, cols, K), axis=0) + 1
+    elif FORCE == 1:
+        accepted = tl.zeros([], dtype=tl.int32) + base_total
+    else:
+        index = (counter * COUNTER_STRIDE + g * SLOT_STRIDE) & POOL_MASK
+        draw = tl.load(pool_ptr + index)
+        accepted = tl.minimum(base_total + (draw < frac).to(tl.int32), max_total)
+    accepted = accepted.to(tl.int32)
+    tl.store(num_accepted_ptr + g, accepted)
+    # --- the bookkeeping, each value written after the count it uses ---
+    tl.store(rewind_ptr + g, 1 - accepted)
+    if BUMP_KV_LENS:
+        tl.store(kv_lens_ptr + g, tl.load(kv_lens_ptr + g) + 1)
+    tl.store(gen_rows_ptr + g, g.to(tl.int64))
+    bonus_index = tl.maximum(accepted - 1, 0)
+    bonus = tl.sum(tl.where(in_row & (cols == bonus_index), tokens32, 0), axis=0).to(tl.int64)
+    tl.store(bonus_ptr + g, bonus)
+    accepted64 = accepted.to(tl.int64)
+    tl.store(num_accepted_long_ptr + g, accepted64)
+    slot = tl.load(slots_ptr + g)
+    ctx_len = tl.load(ctx_len_ptr + slot).to(tl.int64)
+    ctx_now = tl.minimum(ctx_len + accepted64, max_ctx)
+    tl.store(query_positions_ptr + g * block_size + qcols, ctx_now + qcols.to(tl.int64), mask=in_block)
+    tl.store(ctx_positions_ptr + g * row_width + cols, ctx_len + cols.to(tl.int64), mask=in_row)
+    tl.store(embed_ids_ptr + g, bonus)
+    tl.store(noise_ids_ptr + g * block_size + qcols, tl.where(qcols == 0, bonus, mask_id), mask=in_block)
+
+
 class DflashVerifyFold(OpWrapper):
     """``dflash_accept`` for a generation-only verify block, plus the DFlash worker's step bookkeeping.
 
@@ -343,6 +462,29 @@ class DflashVerifyFold(OpWrapper):
         pre_wait = (
             pre_wait and num_gens == 1 and (seq_lens is None or seq_lens.numel() <= SEQ_BLOCK)
         )
+        # VERIFY_GRID's per-request kernel knows the greedy / forced modes only: a rejection-sampled
+        # step's ACCEPTED_GIVEN (upstream #21789's rejection_fold) keeps the loop kernel, which reads
+        # the given counts.
+        if GRID and not pre_wait and force_mode != ACCEPTED_GIVEN:
+            _launch_grid(
+                out,
+                target_tokens,
+                draft_tokens,
+                force_mode,
+                base_total,
+                max_total,
+                frac,
+                pool,
+                counter,
+                slots,
+                ctx_len,
+                max_ctx,
+                block_size,
+                mask_token_id,
+                kv_lens,
+                seq_lens,
+            )
+            return out
         _dflash_verify_fold_kernel[(1,)](
             target_tokens,
             draft_tokens,
@@ -531,3 +673,78 @@ class DflashVerifyFold(OpWrapper):
 
 
 dflash_verify_fold = DflashVerifyFold()
+
+
+def _launch_grid(
+    out: VerifyFold,
+    target_tokens,
+    draft_tokens,
+    force_mode,
+    base_total,
+    max_total,
+    frac,
+    pool,
+    counter,
+    slots,
+    ctx_len,
+    max_ctx,
+    block_size,
+    mask_token_id,
+    kv_lens,
+    seq_lens,
+) -> None:
+    """VERIFY_GRID: ``_dflash_verify_fold_grid_kernel`` over (num_gens,) programs into ``out``."""
+    global _GRID_LOGGED
+    num_gens, k = draft_tokens.shape
+    fractional = force_mode == FORCE_FRACTIONAL
+    dummy = out.num_accepted
+    if not _GRID_LOGGED:
+        _GRID_LOGGED = True
+        from tensorrt_llm.logger import logger
+
+        logger.info(
+            f"[musespark_open] head_sampler_coop_fold VERIFY_GRID=1: engaged (dflash_verify_fold over {num_gens} "
+            "programs, one per request)"
+        )
+    _dflash_verify_fold_grid_kernel[(num_gens,)](
+        target_tokens,
+        draft_tokens,
+        draft_tokens.stride(0),
+        out.accepted,
+        out.num_accepted,
+        pool if fractional else dummy,
+        counter if fractional else dummy,
+        num_gens,
+        base_total,
+        max_total,
+        frac,
+        slots,
+        ctx_len,
+        max_ctx,
+        dummy if kv_lens is None else kv_lens,
+        dummy if seq_lens is None else seq_lens,
+        dummy if seq_lens is None else out.seq_lens_copy,
+        0 if seq_lens is None else seq_lens.numel(),
+        out.rewind,
+        out.gen_rows,
+        out.bonus,
+        out.num_accepted_long,
+        out.query_positions,
+        out.ctx_positions,
+        out.offsets,
+        out.embed_ids,
+        out.noise_ids,
+        mask_token_id,
+        block_size,
+        K=k,
+        BLOCK=triton.next_power_of_2(k + 1),
+        QBLOCK=triton.next_power_of_2(block_size),
+        FORCE=force_mode,
+        COUNTER_STRIDE=COUNTER_STRIDE,
+        SLOT_STRIDE=SLOT_STRIDE,
+        POOL_MASK=(pool.numel() - 1) if fractional else 0,
+        BUMP_KV_LENS=kv_lens is not None,
+        COPY_SEQ_LENS=seq_lens is not None,
+        SEQ_BLOCK=SEQ_BLOCK,
+        num_warps=1,
+    )

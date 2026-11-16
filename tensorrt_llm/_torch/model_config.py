@@ -29,6 +29,7 @@ import torch
 import transformers
 from transformers.utils import HF_MODULES_CACHE
 
+from tensorrt_llm._torch import adp_groups
 from tensorrt_llm._torch.locality_domain.policy import LocalityDomainPolicy
 from tensorrt_llm._torch.pyexecutor.config_utils import (
     get_glm5_next_layer_masks, get_glm5_next_num_attention_layers,
@@ -1444,7 +1445,9 @@ class ModelConfig(Generic[TConfig]):
 
         # Attention DP should not shard attention heads; use attn_tp_size=1 in that case
         # so downstream KV calculations see the full (non-partitioned) head count.
-        attn_tp_size = self.mapping.attn_tp_size if not self.mapping.enable_attention_dp else 1
+        # (or, with attention-DP groups, the group's attention TP: adp_groups).
+        attn_tp_size = (self.mapping.attn_tp_size if not self.mapping.enable_attention_dp else
+                        adp_groups.attn_tp_size(self.mapping))
         attn_cp_size = self.mapping.attn_cp_size
 
         def ceil_div(a, b):

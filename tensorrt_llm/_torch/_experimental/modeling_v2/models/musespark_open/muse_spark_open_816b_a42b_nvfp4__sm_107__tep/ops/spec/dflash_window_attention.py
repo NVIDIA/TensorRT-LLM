@@ -528,6 +528,60 @@ def default_launch_config(span: int, tile_rows: int) -> dict:
     return dict(block_n=SPLIT_BLOCK_N, tiles=tiles, num_warps=8, merge_warps=4)
 
 
+#: ``multi_tiles`` / ``multi_min_rows`` (``configure``; ``tep8_drafter_wide_gemms__WINDOW_TILES`` /
+#: ``__WINDOW_MIN_ROWS``): a call of at least ``MULTI_MIN_ROWS`` rows (requests x block rows; 65:
+#: the TEP8 steps of 9..16 requests) splits the window into ``MULTI_TILES``-tile splits instead of
+#: ``default_launch_config``'s one-tile ones. The one-tile geometry is the one-request tuning (65
+#: programs per request and KV head, each bound by its load latency, so more splits fill the
+#: device); at 9..16 requests a TEP8 rank's call is 585..1040 such programs (several waves on
+#: 212 SMs) and its merge reads 65 partials per row: fewer, longer splits (22 at 3 tiles) cut the
+#: waves and the merge's partials. 1 (default): the one-request geometry at every call. Only the
+#: split boundaries move (the merge's FP32 log-sum-exp order), so the output is not bitwise the
+#: one-tile call's; the same error gate (``note``).
+MULTI_TILES = 1
+MULTI_MIN_ROWS = 65
+#: ``multi_tiles``' band: 1..``MULTI_TILES_MAX`` tiles per split.
+MULTI_TILES_MAX = 8
+
+
+def configure(*, multi_tiles: int = 1, multi_min_rows: int = 65) -> None:
+    """Set ``MULTI_TILES`` (1..``MULTI_TILES_MAX``) and ``MULTI_MIN_ROWS`` (9..``MAX_TILE_ROWS`` *
+    ``MAX_SPLITS``). ``lever_settings.apply`` sets them from the model's plan before any install.
+
+    Raises:
+        ValueError: for a value outside its band; nothing is set then.
+    """
+    global MULTI_TILES, MULTI_MIN_ROWS
+    tiles, rows = int(multi_tiles), int(multi_min_rows)
+    if not 1 <= tiles <= MULTI_TILES_MAX:
+        raise ValueError(
+            f"dflash_window_attention: multi_tiles must be in 1..{MULTI_TILES_MAX}, got {multi_tiles}"
+        )
+    if not 9 <= rows <= 1024:
+        raise ValueError(
+            f"dflash_window_attention: multi_min_rows must be in 9..1024, got {multi_min_rows}"
+        )
+    MULTI_TILES, MULTI_MIN_ROWS = tiles, rows
+    if tiles > 1:
+        import sys as _sys
+
+        print(
+            f"[musespark_open] dflash_window_attention: calls of {rows}+ rows on {tiles}-tile "
+            f"splits ({tiles * SPLIT_BLOCK_N} keys per split; WINDOW_TILES)",
+            file=_sys.stderr,
+            flush=True,
+        )
+
+
+def launch_config(batch: int, m: int, span: int, tile_rows: int) -> dict:
+    """``default_launch_config``, with ``MULTI_TILES``-tile splits on calls of ``batch`` x ``m`` >=
+    ``MULTI_MIN_ROWS`` rows (never fewer tiles than the default's)."""
+    config = default_launch_config(span, tile_rows)
+    if MULTI_TILES > config["tiles"] and batch * m >= MULTI_MIN_ROWS:
+        config = dict(config, tiles=MULTI_TILES)
+    return config
+
+
 def window_attention_launch(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -802,7 +856,7 @@ class DflashWindowAttention(OpWrapper):
     ) -> torch.Tensor:
         m, num_q_heads = q.shape[1], q.shape[2]
         group = num_q_heads // k_cache.shape[2]
-        config = default_launch_config(window_size[0] + m, group * m)
+        config = launch_config(q.shape[0], m, window_size[0] + m, group * m)
         return window_attention_launch(
             q,
             k_cache,

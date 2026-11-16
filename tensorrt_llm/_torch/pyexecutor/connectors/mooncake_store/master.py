@@ -31,6 +31,7 @@ exporting `MOONCAKE_CONFIG_PATH` for the ranks the LLM constructor spawns.
 import contextlib
 import json
 import os
+import shlex
 import shutil
 import socket
 import subprocess  # nosec B404
@@ -87,6 +88,9 @@ LOG_TAIL_LINES = 20
 DEFAULT_MASTER_PORT = 50051
 DEFAULT_MASTER_METRICS_PORT = 9004
 DEFAULT_MASTER_EVICTION_RATIO = 0.05
+
+#: Extra command-line flags for the master binary, split like a shell would.
+MASTER_EXTRA_ARGS_ENV = "TRTLLM_MC_MASTER_EXTRA_ARGS"
 
 
 def _log_tail(path: str, lines: int = LOG_TAIL_LINES) -> str:
@@ -349,17 +353,25 @@ def resolve_device_name(protocol: str, configured: str, sysfs_root: Optional[str
 
     Which HCAs a node has is a property of the node rather than of the
     deployment, so detecting it keeps `protocol: rdma` portable across machine
-    types. Setting `device_name` overrides the detection.
+    types. Setting `mooncake_store.device_name` overrides the detection, which
+    matters where it picks wrong: on a RoCE fabric it finds no InfiniBand
+    device, and Mooncake's own discovery then takes every NIC, including ones
+    on planes the peers cannot reach.
     """
-    if configured or protocol != "rdma":
+    if protocol != "rdma":
+        return configured
+    if configured:
+        logger.warning(
+            f"mooncake-store: transferring over the configured RDMA devices {configured}"
+        )
         return configured
     detected = _highest_rate_ib_devices(sysfs_root)
     if not detected:
         logger.warning(
             "mooncake-store: protocol is rdma but no active InfiniBand device "
             f"was found under {sysfs_root or IB_SYSFS_ROOT}, so device_name is "
-            "left empty for Mooncake's own discovery. Set device_name to "
-            "choose explicitly."
+            "left empty for Mooncake's own discovery. Set "
+            "mooncake_store.device_name to choose explicitly."
         )
         return ""
     joined = ",".join(detected)
@@ -423,6 +435,9 @@ def _client_config(
         "role": StoreRole(pool.role).value,
         "transfer_batch_size": pool.transfer_batch_size,
         "stage_through_host": pool.stage_through_host,
+        "staging_buffer_bytes": pool.staging_buffer_bytes,
+        "async_load": pool.async_load,
+        "async_load_workers": pool.async_load_workers,
     }
     return config
 
@@ -482,6 +497,11 @@ def _launch_master(
         f"--metrics_port={metrics_port}",
         f"--eviction_ratio={eviction_ratio}",
     ]
+    # Flags this launcher does not model (for example
+    # `--eviction_high_watermark_ratio=0.93`) pass straight to the binary.
+    extra = os.environ.get(MASTER_EXTRA_ARGS_ENV, "").strip()
+    if extra:
+        command.extend(shlex.split(extra))
 
     logger.warning(f"mooncake-store: starting {' '.join(command)} on {host}")
     with open(log_path, "wb") as log_file:
@@ -793,7 +813,9 @@ def provision_pool(
         logger.warning(f"mooncake-store: joining the pool at {manifest.describe()}")
 
         config_path = os.path.join(run_dir, CLIENT_CONFIG_NAME)
-        config = _client_config(pool, manifest, resolve_device_name(manifest.protocol, ""))
+        config = _client_config(
+            pool, manifest, resolve_device_name(manifest.protocol, pool.device_name)
+        )
         claim_run_dir(run_dir, config["role"])
         # Renamed into place so a rank never reads half a config. The staging
         # name carries this process's pid so two writers, where a claim is

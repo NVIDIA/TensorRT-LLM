@@ -48,6 +48,13 @@ The router's FP32 input. When the layer's attention-side residual join already w
 the FP32 widening of this call's input (``router_input.SequenceParallelAttnJoin``,
 ``sp_router_input``), the router GEMM reads it instead of a fresh BF16 -> FP32 copy:
 the same values, the same GEMM.
+
+The tail pipeline (``context_sp_tail_pipeline``, ``router_input.tail_pipeline``) may hand
+the call its expert input already prepared on the shard (``sp_pre``: the pooler GEMM and the
+pre-expert quantization ran chunk by chunk behind the output projection's reduce-scatters);
+the call then skips its own pooler and quantization. With ``context_sp_moe_rs_overlap`` the
+experts' reduce-scatter and the unpool run in owner-major row chunks
+(``overlap.reduce_scatter_unpool``) on steps of at least ``_sp_rs_min_rows`` rows.
 """
 
 from __future__ import annotations
@@ -67,6 +74,8 @@ from tensorrt_llm._torch.models.modeling_musespark_open import (
 )
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor
 from tensorrt_llm.logger import logger
+
+from . import overlap as _overlap
 
 _CLASSES: Dict[Tuple[type, type], type] = {}
 
@@ -251,9 +260,17 @@ class ContextSequenceParallelMoE:
     #: ``(norm output, its FP32 widening)`` left by the layer's attention-side join for
     #: the next sequence-parallel call (``router_input``); consumed or dropped by it.
     sp_router_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+    #: ``(norm output, None, expert input)`` of the shard, prepared by the attention-side
+    #: tail pipeline (``router_input.tail_pipeline``); consumed or dropped by the next call.
+    sp_pre = None
     #: Whether a sequence-parallel call routes the shard's rows and gathers their ids and
     #: weights (``shard_routing``); otherwise it gathers the router logits (``install``).
     _sp_shard_routing: bool = True
+    #: ``context_sp_moe_rs_overlap`` (``overlap.CommOverlap``): the reduce-scatter's chunks (0:
+    #: the unchunked call), the fewest rows of a step that takes them, and the side stream.
+    _sp_rs_chunks: int = 0
+    _sp_rs_min_rows: int = 8192
+    _sp_rs_stream = None
 
     def _sp_router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """The router logits of the shard's rows, from the join's FP32 rows when it left them."""
@@ -277,14 +294,20 @@ class ContextSequenceParallelMoE:
             or rows > getattr(experts, "moe_max_num_tokens", rows)
         ):
             self.sp_router_input = None
+            self.sp_pre = None
             return super().forward(hidden_states, attn_metadata, *args, **kwargs)
         mapping = self.mapping
         shard = hidden_states.shape[0]
         routing_method = experts.routing_method
+        pre, self.sp_pre = self.sp_pre, None
         with self.nvtx("router"):
             router_logits = self._sp_router_logits(hidden_states)
         with self.nvtx("pool"):
-            prepared = self.prepare_expert_input(self.pooler(hidden_states))
+            if pre is not None and pre[0] is hidden_states:
+                # The tail pipeline pooled and quantized the shard chunk by chunk.
+                prepared = pre[2]
+            else:
+                prepared = self.prepare_expert_input(self.pooler(hidden_states))
             if isinstance(prepared, Fp4QuantizedTensor):
                 fp4, scale = prepared.fp4_tensor, prepared.scaling_factor
                 if prepared.is_sf_swizzled or fp4.shape[0] != shard or scale.numel() % shard:
@@ -349,6 +372,20 @@ class ContextSequenceParallelMoE:
                 rows,
                 hidden_states.dtype,
             )
+        stream = self._sp_rs_stream
+        if self._sp_rs_chunks and stream is not None and rows >= self._sp_rs_min_rows:
+            # ``context_sp_moe_rs_overlap``: chunk c + 1's reduce-scatter beside chunk c's unpool.
+            with self.nvtx("all_reduce"):
+                return _overlap.reduce_scatter_unpool(
+                    _pad_sequence_parallel_tokens(combined, mapping.tp_size),
+                    mapping,
+                    self._sp_rs_chunks,
+                    stream,
+                    lambda reduced: self._replicated_projection(
+                        self.unpooler, reduced, self._unpool_gather_workspace
+                    ),
+                    reducescatter,
+                )
         with self.nvtx("all_reduce"):
             combined = reducescatter(
                 _pad_sequence_parallel_tokens(combined, mapping.tp_size), mapping, dim=0

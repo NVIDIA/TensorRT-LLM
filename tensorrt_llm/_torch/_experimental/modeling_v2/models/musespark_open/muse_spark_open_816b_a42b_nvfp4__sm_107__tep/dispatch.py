@@ -402,8 +402,8 @@ FAST_PATHS: Tuple[FastPath, ...] = (
     ),
     FastPath(
         "wide_drafter_hops",
-        "the drafter all-reduce hops of 9..56-row (sm107: 9..64-row) block decodes on a wide "
-        "one-shot transport",
+        "the drafter all-reduce hops of 9..56-row (sm107: 9..64-row; TEP8 to TEP8_MAX_ROWS, up "
+        "to 128) block decodes on a wide one-shot transport",
         "draft",
         ("drafter_hops",),
     ),
@@ -558,25 +558,30 @@ FAST_PATHS: Tuple[FastPath, ...] = (
     ),
     FastPath(
         "tep8_wide64_splitk",
-        "the TP8 QKV and o_proj of 33..64-row decode calls on split-K",
+        "the TP8 QKV and o_proj of MIN_ROWS..64-row decode calls on split-K (MIN_ROWS 33, or "
+        "down to 9: the 2..4-request calls leave the wide table)",
         "construct",
         ("wide_dense_gemms",),
     ),
     FastPath(
         "tep8_publish_splitk",
-        "the TP8 pool and unpool slices of 33..64-row decode calls published from split-K",
+        "the TP8 pool and unpool slices of 33..64-row decode calls published from split-K (to "
+        "MAX_ROWS rows: 65..128 in one launch of the same tactics; from MIN_ROWS rows: below 33 "
+        "the 2..4-request steps publish and join on split-K too, instead of the wide gathers)",
         "construct",
         ("projection_publish",),
     ),
     FastPath(
         "tep8_drafter_wide_gemms",
-        "the TP8 drafter projections of 2..4-request blocks on split-K",
+        "the TP8 drafter projections of 2..4-request blocks on split-K (with tep8_wide64_splitk "
+        "5..8; to MAX_ROWS rows: SITES' 65..128-row calls in one launch of the 64-row tactic)",
         "draft",
         ("drafter_fixed_gemms",),
     ),
     FastPath(
         "tep8_fc_shard_wide",
-        "the TP8 sharded drafter fc on decode steps of up to 64 rows, its gather on 128 programs",
+        "the TP8 sharded drafter fc on decode steps of up to MAX_ROWS (64; up to 128) rows, its "
+        "gather on 128 programs",
         "draft",
         ("drafter_fc_shard",),
     ),
@@ -594,7 +599,8 @@ FAST_PATHS: Tuple[FastPath, ...] = (
     ),
     FastPath(
         "swa_one_cluster_block",
-        "the sliding-window decode attention block of one to eight requests as one cluster launch",
+        "the sliding-window decode attention block of one to eight requests as one cluster launch "
+        "(TEP8: TEP8_MIN_REQUESTS..TEP8_MAX_REQUESTS, 5..8 by default; from 2, up to 16)",
         "construct",
         ("swa_block",),
     ),
@@ -634,13 +640,14 @@ FAST_PATHS: Tuple[FastPath, ...] = (
     FastPath(
         "prerouted_experts",
         "the NVFP4 experts on trtllm::fp4_block_scale_moe_prerouted, from the placement "
-        "kernels' routing tables",
+        "kernels' routing tables (TP8: 9..TEP8_MAX_ROWS-row calls, 64 or up to 128)",
         "load",
         ("persistent_experts",),
     ),
     FastPath(
         "tep8_ring_buddy_wide",
-        "the TP8 ring-buddy expert placement on decode steps of up to 64 rows",
+        "the TP8 ring-buddy expert placement on decode steps of up to MAX_ROWS (64; up to 128) "
+        "rows",
         "load",
         ("replicated_experts",),
     ),
@@ -652,7 +659,8 @@ FAST_PATHS: Tuple[FastPath, ...] = (
     ),
     FastPath(
         "tep8_tile_placement",
-        "the TP8 replicated experts placed by tile cost on decode steps of 41 or more rows",
+        "the TP8 replicated experts placed by tile cost on decode steps of MIN_ROWS..MAX_ROWS "
+        "(41..64) rows",
         "load",
         ("replicated_experts",),
     ),
@@ -677,7 +685,8 @@ FAST_PATHS: Tuple[FastPath, ...] = (
     ),
     FastPath(
         "tep8_finalize_transport_64",
-        "the TP8 expert finalize of 17..64-token calls on a 64-token transport",
+        "the TP8 expert finalize of 17..TOKENS-token calls on a TOKENS-token transport (64; or 16, "
+        "32, 128)",
         "construct",
         ("finalize_transport",),
     ),
@@ -696,7 +705,8 @@ FAST_PATHS: Tuple[FastPath, ...] = (
     ),
     FastPath(
         "tep8_direct_hop",
-        "the TP8 o_proj of 33..64-row steps scattering its partial into the owners' hop slots",
+        "the TP8 o_proj of MIN_ROWS..MAX_ROWS-row steps (33..64, or 128 on a 128-row workspace; "
+        "MIN_ROWS down to 9) scattering its partial into the owners' hop slots",
         "construct",
         ("multi_request_post_attention_hop", "tep8_wide64_splitk"),
     ),
@@ -818,6 +828,27 @@ FAST_PATHS: Tuple[FastPath, ...] = (
     FastPath(
         "context_sp_router_input",
         "sm107 sequence-parallel steps' router FP32 input written by the residual join",
+        "construct",
+        ("context_sequence_parallel",),
+    ),
+    FastPath(
+        "context_sp_oproj_overlap",
+        "sm107 sequence-parallel steps' output projection in CHUNKS owner-major row chunks, "
+        "each chunk's reduce-scatter on a side stream beside the next chunk's GEMM",
+        "construct",
+        ("context_sequence_parallel",),
+    ),
+    FastPath(
+        "context_sp_tail_pipeline",
+        "sm107 sequence-parallel steps' attention-side join, pooler GEMM and NVFP4 expert input "
+        "per chunk behind the output projection's chunked reduce-scatters",
+        "construct",
+        ("context_sp_oproj_overlap",),
+    ),
+    FastPath(
+        "context_sp_moe_rs_overlap",
+        "sm107 sequence-parallel steps' experts reduce-scatter in CHUNKS owner-major row chunks "
+        "on a side stream, each chunk unpooled beside the next one's reduce-scatter",
         "construct",
         ("context_sequence_parallel",),
     ),
@@ -1043,6 +1074,9 @@ LEVER_NAMES: FrozenSet[str] = frozenset(
         "context_prep_rows_vec",
         "context_embedding_replicated",
         "context_sp_router_input",
+        "context_sp_oproj_overlap",
+        "context_sp_tail_pipeline",
+        "context_sp_moe_rs_overlap",
         "swa_blocks_per_program",
         "wide_qkv_prefetch",
         "wide_capture_fold",

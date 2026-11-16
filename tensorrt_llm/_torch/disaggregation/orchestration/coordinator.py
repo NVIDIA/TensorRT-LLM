@@ -131,6 +131,9 @@ class DisaggTransferCoordinator:
         self._unpublished_gen_receives: Dict[
             int, Tuple[LlmRequest, Optional["torch.cuda.Event"]]
         ] = {}
+        # Finished receives whose reuse commit try_finish_gen_receive deferred,
+        # for commit_deferred_gen_receives.
+        self._deferred_reuse_commits: List[LlmRequest] = []
 
     # -- loop head -----------------------------------------------------------
 
@@ -271,6 +274,22 @@ class DisaggTransferCoordinator:
         # context side.
         for req in self._transfers.requests_in_transfer().values():
             flag_if_timed_out(req, "context")
+            # Warn-only: a KV-connector save still holding the request after its
+            # send completed. Releasing here would free pages under the save.
+            hold_start = getattr(req, "py_kv_connector_hold_start_time", None)
+            if (
+                req.py_kv_transfer_start_time is None
+                and hold_start is not None
+                and not getattr(req, "py_kv_connector_hold_warned", False)
+            ):
+                held_ms = (time.monotonic() - hold_start) * 1000
+                if held_ms > timeout_ms:
+                    req.py_kv_connector_hold_warned = True
+                    logger.warning(
+                        f"KV connector save still holds context request {req.py_request_id} "
+                        f"{held_ms:.0f}ms after its KV send completed (> kv_transfer_timeout_ms="
+                        f"{timeout_ms}ms); pages stay pinned until the save finishes"
+                    )
         for req in self._registry.active_requests():
             if req.is_disagg_generation_transmission_in_progress:
                 flag_if_timed_out(req, "generation")
@@ -477,22 +496,45 @@ class DisaggTransferCoordinator:
             if req.is_disagg_generation_transmission_complete
         ]
 
-    def try_finish_gen_receive(self, request: LlmRequest) -> bool:
+    def try_finish_gen_receive(self, request: LlmRequest, defer_commit: bool = False) -> bool:
         """Close out a completed KV receive and hand the request to generation.
 
         Returns False, touching nothing, when the request is no longer
         transmission-complete (batch-level preparation may have failed and
         terminated it). Errors from the transfer side propagate.
+
+        With ``defer_commit``, the received blocks' reuse commit waits for
+        ``commit_deferred_gen_receives``: the request itself never reads the
+        reuse tree, so the executor runs the commit's host work after the
+        step's forward is launched.
         """
         if not request.is_disagg_generation_transmission_complete:
             return False
         request.state = LlmRequestState.GENERATION_IN_PROGRESS
         # commit_blocks_for_reuse requires the position to be at the prompt end.
         request.context_current_position = request.prompt_len
-        self._transceiver.commit_blocks_for_reuse(request)
+        if defer_commit:
+            self._deferred_reuse_commits.append(request)
+        else:
+            self._transceiver.commit_blocks_for_reuse(request)
         request.py_kv_transfer_start_time = None
         request.py_kv_transfer_timed_out = False
         return True
+
+    def commit_deferred_gen_receives(self) -> None:
+        """Commit the blocks of the receives ``try_finish_gen_receive`` deferred.
+
+        A request no longer in generation at its prompt end (it finished or
+        was terminated since) is skipped; a skipped commit only keeps its
+        blocks out of the reuse tree.
+        """
+        pending, self._deferred_reuse_commits = self._deferred_reuse_commits, []
+        for request in pending:
+            if (
+                request.state == LlmRequestState.GENERATION_IN_PROGRESS
+                and request.context_current_position == request.prompt_len
+            ):
+                self._transceiver.commit_blocks_for_reuse(request)
 
     def send_completed_context(self, requests: List[LlmRequest]) -> None:
         """Start async KV sends for finished context-only requests."""
@@ -563,6 +605,22 @@ class DisaggTransferCoordinator:
                 # Past the context phase: writing the error state here is safe.
                 request.state = LlmRequestState.DISAGG_TRANS_ERROR
             self.release_transfer(request)
+            if request_id in self._transfers.requests_in_transfer():
+                # The transceiver's send is settled. What still holds the request is
+                # another claim (a KV-connector save). Stop the KV-transfer clock and
+                # clear a timeout flag the send may have collected before it
+                # completed: otherwise a slow save is reported as a "KV cache
+                # transfer timeout" and the legacy timeout path below force-releases
+                # the connector's claim while its thread may still be reading the
+                # pages (m31 f440 xfer root cause, pd-perf-c32s 961642). The
+                # connector's save has no deadline on this (non-ADP) path, so a
+                # warn-only clock (check_transfer_timeouts) reports a hold that runs
+                # past kv_transfer_timeout_ms; it never releases the claim.
+                request.py_kv_transfer_start_time = None
+                request.py_kv_transfer_timed_out = False
+                if self._transceiver.kv_transfer_timeout_ms is not None:
+                    request.py_kv_connector_hold_start_time = time.monotonic()
+                    request.py_kv_connector_hold_warned = False
 
         # Releases above may have changed the set of requests in transfer.
         requests_in_transfer = self._transfers.requests_in_transfer()
@@ -906,8 +964,11 @@ class NoopDisaggCoordinator(DisaggTransferCoordinator):
     def completed_gen_receives(self, scheduled_batch: "ScheduledRequests") -> List[LlmRequest]:
         return []
 
-    def try_finish_gen_receive(self, request: LlmRequest) -> bool:
+    def try_finish_gen_receive(self, request: LlmRequest, defer_commit: bool = False) -> bool:
         return False
+
+    def commit_deferred_gen_receives(self) -> None:
+        return None
 
     def prepare_context_schedulable(self, new_requests: List[LlmRequest]) -> None:
         return None

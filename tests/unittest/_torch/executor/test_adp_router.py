@@ -218,9 +218,9 @@ class TestRankState:
         assert state.num_active_requests == 5
         assert state.num_active_tokens == 100
 
-    def test_serialize(self):
+    def test_serialize(self) -> None:
         state = RankState(rank=0, num_active_requests=5, num_active_tokens=100)
-        assert state.serialize() == [0, 5, 100, 0, 0, -1, 0, 0, 0, 0, 0, 0, 0]
+        assert state.serialize() == [0, 5, 100, 0, *RankIterStatsPayload().serialize(), 0, 0]
 
     def test_deserialize(self):
         state = RankState.deserialize(data=[2, 3, 50])
@@ -510,7 +510,7 @@ class TestDefaultADPRouter:
             RankState(rank=0, num_active_requests=1, num_active_tokens=10).serialize()
         )
 
-    def test_gather_all_rank_states_piggybacks_iter_stats(self):
+    def test_gather_all_rank_states_piggybacks_iter_stats(self) -> None:
         dist = _mock_dist(tp_rank=0, tp_size=2, has_cp_helix=False)
         pending = RankIterStatsPayload(
             has_iter_stats=1,
@@ -528,17 +528,40 @@ class TestDefaultADPRouter:
             num_active_requests=1,
             num_active_tokens=10,
             iter_stats=pending,
+            num_connector_transfers=5,
+            connector_poll_failed=True,
         )
         rank1 = RankState(rank=1, num_active_requests=2, num_active_tokens=20)
         dist.tp_allgather.return_value = [expected_local.serialize(), rank1.serialize()]
 
         router = DefaultADPRouter(dist=dist)
         req = Mock(py_orig_prompt_len=10)
-        states = router.gather_all_rank_states([req], iter_stats_payload=pending)
+        states = router.gather_all_rank_states(
+            [req],
+            iter_stats_payload=pending,
+            num_connector_transfers=5,
+            connector_poll_failed=True,
+        )
 
         assert states[0] == expected_local
         assert states[1] == rank1
         dist.tp_allgather.assert_called_once_with(expected_local.serialize())
+
+    def test_connector_fields_round_trip(self):
+        state = RankState(
+            rank=0,
+            num_connector_transfers=5,
+            connector_poll_failed=True,
+        )
+
+        wire = state.serialize()
+        assert len(wire) == 4 + len(RankIterStatsPayload().serialize()) + 2
+        restored = RankState.deserialize(wire)
+        assert restored.num_connector_transfers == 5
+        assert restored.connector_poll_failed
+        legacy = RankState.deserialize(wire[:-2])
+        assert legacy.num_connector_transfers == 0
+        assert not legacy.connector_poll_failed
 
 
 def test_schedule_attention_dp_requests_scheduled_requests(

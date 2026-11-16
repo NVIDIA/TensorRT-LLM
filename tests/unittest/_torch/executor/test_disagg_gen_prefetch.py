@@ -396,6 +396,11 @@ class _FakeDFlashWorker:
         self._batch_to_slot = torch.zeros(max_batch_size, dtype=torch.long)
         self.ctx_len = [0] * (max_batch_size + 1)
         self._assign_slot = MethodType(DFlashWorker._assign_slot, self)
+        # Private (non-unified) drafter context: generation slots start empty.
+        self._ctx_unified_cache = False
+        self._max_ctx = 8192
+        self._draft_window_counters = None
+        self._draft_window_counters_get = MethodType(DFlashWorker._draft_window_counters_get, self)
 
     def _write_ctx_len(self, updates, base_updates=None):
         for slot, value in updates.items():

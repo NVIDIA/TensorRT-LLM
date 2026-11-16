@@ -7,12 +7,14 @@ import gc
 import importlib
 import json
 import os
+import platform
+import threading
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import chain
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 from strenum import StrEnum
@@ -20,7 +22,8 @@ from strenum import StrEnum
 import tensorrt_llm
 from tensorrt_llm._startup import _StartupTimer
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
-from tensorrt_llm._utils import get_sm_version, global_mpi_rank
+from tensorrt_llm._utils import (get_sm_version, global_mpi_rank,
+                                 local_mpi_rank, local_mpi_size)
 from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
                                           ContextChunkingPolicy,
                                           ExecutorMemoryType,
@@ -33,6 +36,9 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
+
+if TYPE_CHECKING:
+    from tensorrt_llm.executor.ipc import IpcQueue
 
 from ..attention.backends.interface import AttentionRuntimeFeatures
 from ..attention.backends.utils import get_attention_backend
@@ -59,6 +65,9 @@ from .kv_cache import host_tier_memory
 from .model_engine import PyTorchModelEngine
 from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .py_executor import PyExecutor
+from .store_host_donor import (DISABLE_ENV, StoreHostDonor, active_donor,
+                               close_active_donor, cpu_numa_nodes,
+                               node_numa_disagreement, start_store_host_donor)
 
 _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS = (90, 100, 103, 107, 120, 121)
 _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS = (90, 100, 103, 107, 120)
@@ -550,7 +559,7 @@ def _create_py_executor_impl(
     checkpoint_dir: Optional[str] = None,
     tokenizer: Optional[TokenizerBase] = None,
     profiling_stage_data: Optional[dict] = None,
-    resource_governor_queue=None,
+    resource_governor_queue: "Optional[IpcQueue]" = None,
 ) -> PyExecutor:
     """Create and initialize a PyExecutor instance from the given LLM arguments.
 
@@ -741,6 +750,10 @@ def _create_py_executor(
         })
 
     dist = Distributed.get(mapping)
+
+    # Registers on background threads while the model loads.
+    store_host_donor = _start_store_host_donor(llm_args.store_host_donor, dist,
+                                               mapping.rank)
 
     vm_pools = {}
     sleep_config = llm_args.sleep_config
@@ -1079,16 +1092,6 @@ def _create_py_executor(
         # that was actually built.
         v2_selection = kv_cache_config.use_kv_cache_manager_v2
 
-        # Rejected draft tokens shrink a request's page list, and the freed slot
-        # goes to whichever request allocates next. The connector is only told
-        # about pages appended since the last report, so it would keep
-        # addressing a slot another request now owns.
-        if (spec_config is not None and spec_config.max_draft_len > 0
-                and v2_selection is True):
-            raise NotImplementedError(
-                "KV connector is not supported with speculative decoding. "
-                "Disable speculative decoding to run a connector.")
-
         # VSWA allocates one pool per window size, which only
         # `register_kv_cache_layout` can describe.
         max_attention_window = kv_cache_config.max_attention_window
@@ -1099,10 +1102,10 @@ def _create_py_executor(
                 "in this configuration. Set kv_cache_config.use_kv_cache_manager_v2=True."
             )
 
-        if mapping.enable_attention_dp:
+        if mapping.enable_attention_dp and v2_selection is False:
             raise NotImplementedError(
-                "KV connector is not supported with attention data parallelism (enable_attention_dp=True)."
-            )
+                "KV connector attention data parallelism requires KVCacheManagerV2. "
+                "Set kv_cache_config.use_kv_cache_manager_v2=True.")
 
         try:
             module = importlib.import_module(
@@ -1112,6 +1115,13 @@ def _create_py_executor(
             scheduler_cls = getattr(
                 module, kv_connector_config.connector_scheduler_class)
 
+            if mapping.enable_attention_dp:
+                KvCacheConnectorManager.validate_attention_dp(
+                    worker_cls,
+                    scheduler_cls,
+                    pp_size=mapping.pp_size,
+                    cp_size=mapping.cp_size)
+
             rank = tensorrt_llm.mpi_rank()
             # Some connector API implementations may need to establish out-of-band communication between the scheduler and workers.
             # In this case, the worker may be dependent on the scheduler, or vice-versa.
@@ -1119,7 +1129,8 @@ def _create_py_executor(
             with ThreadPoolExecutor(max_workers=2) as executor:
                 connector_worker_task = executor.submit(worker_cls, llm_args)
 
-                if scheduler_cls is not None and rank == 0:
+                if scheduler_cls is not None and (rank == 0 or
+                                                  mapping.enable_attention_dp):
                     connector_scheduler_task = executor.submit(
                         scheduler_cls, llm_args)
                     connector_scheduler = connector_scheduler_task.result()
@@ -1135,11 +1146,30 @@ def _create_py_executor(
                     forward_pass_callable)
 
             kv_connector_manager = KvCacheConnectorManager(
-                connector_worker, connector_scheduler)
+                connector_worker,
+                connector_scheduler,
+                enable_attention_dp=mapping.enable_attention_dp,
+                context_only=kv_connector_config.context_only)
 
         except Exception as e:
             logger.error(f"Error instantiating connector: {e}")
             raise e
+
+        # Rejected draft tokens shrink a request's page list, and the freed slot
+        # goes to whichever request allocates next. The connector is only told
+        # about pages appended since the last report, so it would keep
+        # addressing a slot another request now owns. Drafts are rejected only
+        # in generation steps: a capacity-only connector tracks no pages, and a
+        # context-only server never runs a generation step.
+        if (spec_config is not None and spec_config.max_draft_len > 0
+                and v2_selection is True
+                and not kv_connector_manager.capacity_only
+                and not kv_connector_manager.context_only):
+            raise NotImplementedError(
+                "KV connector is not supported with speculative decoding. "
+                "Disable speculative decoding, use a capacity-only connector, "
+                "or declare kv_connector_config.context_only on a "
+                "disaggregated context server.")
 
         if not kv_connector_manager.capacity_only:
             if (scheduler_config.capacity_scheduler_policy
@@ -1399,16 +1429,128 @@ def _create_py_executor(
     if mapping.rank == 0:
         logger.info(f"LLM Args:\n{llm_args}")
 
+    if store_host_donor is not None:
+        with _startup_timer.phase("store_host_donor_late"):
+            _register_store_host_donor_late(py_executor, store_host_donor,
+                                            dist)
     with _startup_timer.phase("executor_start_worker",
                               metrics=creation_metrics,
                               metric_name="worker_start_seconds"):
         py_executor.start_worker()
+    if (store_host_donor is not None
+            and store_host_donor.late_delay_seconds > 0):
+        store_host_donor.schedule_late()
 
     py_executor.metrics.update(initial_model_engine_metrics)
     _move_model_engine_metrics(py_executor, model_engine, "final",
                                draft_model_engine)
 
     return py_executor
+
+
+def _fleet_vote(dist: Distributed, step) -> None:
+    """Run ``step`` on every rank, then fail every rank if any rank failed."""
+    error = None
+    try:
+        step()
+    except Exception as exc:  # noqa: BLE001 - re-raised after the vote
+        error = exc
+    failures = [
+        failure for failure in dist.allgather(
+            None if error is None else f"rank {dist.rank}: {error}")
+        if failure is not None
+    ]
+    if error is not None:
+        raise error
+    if failures:
+        raise RuntimeError("store_host_donor failed on other ranks: " +
+                           "; ".join(failures))
+
+
+def _start_store_host_donor(config, dist: Distributed,
+                            rank: int) -> Optional[StoreHostDonor]:
+    """Start the donor on every rank, or fail every rank before model loading.
+
+    The vote runs only when the (rank-uniform) config is set, so executors
+    without a donor make no extra collective.
+    """
+    if config is None:
+        return None
+    disabled = os.environ.get(DISABLE_ENV, "0") == "1"
+    numa_nodes, detect_error = None, None
+    if not disabled and not config.numa_nodes:
+        try:
+            numa_nodes = cpu_numa_nodes()
+        except Exception as exc:  # noqa: BLE001 - raised inside the vote
+            detect_error = exc
+    # Every rank gathers, before anything that can fail: the kill switch and
+    # the detected socket lists must agree, or ranks would take different
+    # collective paths.
+    peers = dist.allgather((platform.node(), numa_nodes, disabled))
+    switch = {peer[2] for peer in peers}
+    if switch == {True}:
+        logger.warning(
+            f"{DISABLE_ENV}=1 on every rank: store_host_donor is off")
+        return None
+    started = []
+
+    def start():
+        if len(switch) > 1:
+            raise ValueError(
+                f"store_host_donor: {DISABLE_ENV} differs across ranks; set it on all "
+                "ranks or none")
+        if detect_error is not None:
+            raise detect_error
+        reason = node_numa_disagreement([peer[:2] for peer in peers],
+                                        platform.node())
+        if reason is not None:
+            raise ValueError(reason)
+        donor = start_store_host_donor(config,
+                                       rank=rank,
+                                       local_rank=local_mpi_rank(),
+                                       local_size=local_mpi_size(),
+                                       numa_nodes=numa_nodes)
+        owned = getattr(_construction_donors, "donors", None)
+        if owned is not None and donor is not None:
+            owned.append(donor)
+        started.append(donor)
+
+    _fleet_vote(dist, start)
+    return started[0]
+
+
+# Donors started by the executor construction running on this thread, so a
+# failed construction retires exactly its own donor.
+_construction_donors = threading.local()
+
+
+def _retire_owned_donor(donor: StoreHostDonor) -> None:
+    if active_donor() is donor:
+        close_active_donor()
+    else:
+        donor.close()
+
+
+def _register_store_host_donor_late(py_executor: PyExecutor,
+                                    donor: StoreHostDonor,
+                                    dist: Distributed) -> None:
+    """Finish the donor once the final executor's warmup is done everywhere.
+
+    The startup registrations are joined, then (with no late delay) the late
+    ones run, each step followed by a vote so that one rank's failure fails
+    all ranks instead of leaving them in a collective.
+    """
+    py_executor.store_host_donor = donor
+    if getattr(donor, "measured", None) is not None:
+        # A context server (it holds a KV connector) lends once serving began.
+        llm_args = getattr(py_executor, "llm_args", None)
+        donor.wait_traffic = getattr(llm_args, "kv_connector_config",
+                                     None) is not None
+        donor.traffic_probe = lambda: getattr(py_executor,
+                                              "num_fetch_requests", 0) > 0
+    _fleet_vote(dist, donor.wait_startup)
+    if donor.late_delay_seconds == 0:
+        _fleet_vote(dist, donor.register_late)
 
 
 @functools.wraps(_create_py_executor_impl)
@@ -1421,6 +1563,9 @@ def create_py_executor(
 ) -> PyExecutor:
     """Create a PyExecutor and roll back a partially initialized DWDP runtime."""
     previous_dwdp_manager = get_global_dwdp_manager()
+    owned_donors = []
+    outer_donors = getattr(_construction_donors, "donors", None)
+    _construction_donors.donors = owned_donors
     try:
         with monitor_executor_initialization(), _StartupTimer(
                 "executor_creation") as startup_timer:
@@ -1433,6 +1578,10 @@ def create_py_executor(
                 resource_governor_queue=resource_governor_queue,
             )
     except BaseException:
+        # Retire only donors this construction started; any other active donor
+        # belongs to another executor.
+        for donor in owned_donors:
+            _retire_owned_donor(donor)
         current_dwdp_manager = get_global_dwdp_manager()
         if (current_dwdp_manager is not None
                 and current_dwdp_manager is not previous_dwdp_manager):
@@ -1443,3 +1592,5 @@ def create_py_executor(
                     "Failed to roll back DWDP after PyExecutor construction error\n"
                     f"{traceback.format_exc()}")
         raise
+    finally:
+        _construction_donors.donors = outer_donors

@@ -43,6 +43,7 @@ def _silu_and_mul_pdl_kernel(
     swiglu_beta: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     ENTRY_TRIGGER: tl.constexpr,
+    HALF: tl.constexpr = 0,
 ) -> None:
     if ENTRY_TRIGGER:
         # Release the dependent (a GEMM that streams its weight before its own
@@ -60,8 +61,15 @@ def _silu_and_mul_pdl_kernel(
     offsets = j * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < d
 
-    a = tl.load(x_row_ptr + offsets, mask=mask).to(tl.float32)
-    b = tl.load(x_row_ptr + offsets + d, mask=mask).to(tl.float32)
+    if HALF:
+        # ``x`` is the GEMM output of an interleaved gate_up weight (``silu_fold_gemm.interleave_gate_up``):
+        # per 2 * HALF columns, HALF gate columns then the matching up columns. Only the addresses differ.
+        gate = (offsets // HALF) * (2 * HALF) + offsets % HALF
+        a = tl.load(x_row_ptr + gate, mask=mask).to(tl.float32)
+        b = tl.load(x_row_ptr + gate + HALF, mask=mask).to(tl.float32)
+    else:
+        a = tl.load(x_row_ptr + offsets, mask=mask).to(tl.float32)
+        b = tl.load(x_row_ptr + offsets + d, mask=mask).to(tl.float32)
 
     result = a * tl.sigmoid(swiglu_alpha * a) * (b + swiglu_beta)
 
@@ -111,8 +119,12 @@ class DrafterSiluAndMul(OpWrapper):
       unit column stride, even width (`takes`).
     """
 
-    def __call__(self, x: torch.Tensor, entry_trigger: bool) -> torch.Tensor:
+    def __call__(self, x: torch.Tensor, entry_trigger: bool, half: int = 0) -> torch.Tensor:
+        """``half`` > 0: ``x``'s columns are interleaved per ``2 * half`` (``tep8_drafter_wide_gemms__SILU_FOLD``'s
+        gate_up weight); the output is the plain order's, bit for bit (the same statements per element)."""
         rows, width = x.shape
+        if half and width % (2 * half):
+            raise ValueError(f"drafter_silu_and_mul: width {width} is not a multiple of 2 * half ({half})")
         d = width // 2
         out = torch.empty((rows, d), dtype=x.dtype, device=x.device)
         if rows == 0:
@@ -127,18 +139,22 @@ class DrafterSiluAndMul(OpWrapper):
             swiglu_beta=0.0,
             BLOCK_SIZE=BLOCK_SIZE,
             ENTRY_TRIGGER=entry_trigger,
+            HALF=int(half),
             num_warps=NUM_WARPS,
             launch_pdl=entry_trigger,
         )
         return out
 
-    def reference(self, x: torch.Tensor, entry_trigger: bool) -> torch.Tensor:
+    def reference(self, x: torch.Tensor, entry_trigger: bool, half: int = 0) -> torch.Tensor:
         """fp32 ``silu(gate) * up``, one rounding to ``x.dtype``. ``entry_trigger`` is ignored."""
+        if half:
+            tiles = x.reshape(x.shape[0], x.shape[1] // (2 * half), 2, half)
+            x = torch.cat((tiles[:, :, 0].reshape(x.shape[0], -1), tiles[:, :, 1].reshape(x.shape[0], -1)), dim=1)
         d = x.shape[1] // 2
         gate, up = x[:, :d].float(), x[:, d:].float()
         return (gate * torch.sigmoid(gate) * up).to(x.dtype)
 
-    def is_valid(self, x: torch.Tensor, entry_trigger: bool) -> None:
+    def is_valid(self, x: torch.Tensor, entry_trigger: bool, half: int = 0) -> None:
         assert takes(x), (
             "x must be a [rows, 2d] CUDA tensor of bf16 / fp16 / fp32 with unit column stride, "
             f"got {tuple(x.shape)} {x.dtype} stride {x.stride()}"

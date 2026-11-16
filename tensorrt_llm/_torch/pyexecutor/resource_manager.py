@@ -27,6 +27,7 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings
+from tensorrt_llm._torch import adp_groups
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.manager import LoraManager, LoraModelConfig
@@ -449,9 +450,8 @@ class KVCacheManager(BaseResourceManager):
         # cross-cache manager can still prepare its own copy.
         self._preprepared_dummy_request_ids: set[int] = set()
 
-        tp_size = mapping.tp_size
-        if mapping.enable_attention_dp:
-            tp_size = 1
+        # Attention DP: every KV head, or the attention group's share (adp_groups).
+        tp_size = adp_groups.attn_tp_size(mapping)
 
         if isinstance(num_kv_heads, int):
             self.num_kv_heads_per_layer = [
@@ -1717,7 +1717,7 @@ class KVCacheManager(BaseResourceManager):
             head_dim = config.kv_lora_rank + config.qk_rope_head_dim
             kv_factor = 1
         else:
-            tp_size = 1 if mapping.enable_attention_dp else mapping.tp_size
+            tp_size = adp_groups.attn_tp_size(mapping)
             head_dim = getattr(config, "head_dim", None)
             if not isinstance(head_dim, int):
                 head_dim = config.hidden_size // config.num_attention_heads
@@ -3187,7 +3187,10 @@ class ResourceManager:
             kv_cache_manager.maybe_fit_token_budget(scheduled_batch)
 
     @nvtx_range("prepare_resources")
-    def prepare_resources(self, scheduled_batch: ScheduledRequests):
+    def prepare_resources(self,
+                          scheduled_batch: ScheduledRequests,
+                          *,
+                          publish_connector_output: bool = True) -> None:
         for _, resource_manager in self.resource_managers.items():
             if hasattr(resource_manager, "prepare_resources"):
                 resource_manager.prepare_resources(scheduled_batch)
@@ -3199,7 +3202,8 @@ class ResourceManager:
         # run. See `report_batch_to_connector`.
         kv_cache_manager = self.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
-        if hasattr(kv_cache_manager, "report_batch_to_connector"):
+        if publish_connector_output and hasattr(kv_cache_manager,
+                                                "report_batch_to_connector"):
             kv_cache_manager.report_batch_to_connector(scheduled_batch)
 
     @nvtx_range("update_resources")

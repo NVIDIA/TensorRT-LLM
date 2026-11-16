@@ -7,7 +7,7 @@ import enum
 import queue
 import threading
 import time
-from typing import Iterable, List, Optional
+from typing import Callable, Iterable, List, Optional
 
 from tensorrt_llm.llmapi.disagg_utils import get_local_request_id
 
@@ -106,6 +106,9 @@ class ExecutorRequestQueue:
         self._parked_tags: frozenset[str] = frozenset()
         self._pending_wakeup_tags: frozenset[str] = frozenset()
         self.batch_wait_timeout_ms = batch_wait_timeout_ms
+        # Optional predicate: when it returns True on a non-blocking fetch, the
+        # batch_wait_timeout_ms wait for more requests is skipped.
+        self.skip_batch_wait_when: Optional[Callable[[], bool]] = None
 
     def _transition_admission_state(
         self,
@@ -257,6 +260,14 @@ class ExecutorRequestQueue:
             self.request_queue.put(
                 RequestQueueItem(req_id, is_canceled_request=True))
 
+    def pending_cancellation_ids(self) -> set[int]:
+        """Inspect cancellation sentinels without consuming queued requests."""
+        with self.request_queue.mutex:
+            return {
+                item.id
+                for item in self.request_queue.queue if item.is_canceled_request
+            }
+
     def enqueue_control_request(self,
                                 drain: bool = True,
                                 control_id: Optional[str] = None):
@@ -324,6 +335,13 @@ class ExecutorRequestQueue:
             pass
 
         if self.batch_wait_timeout_ms == 0:
+            return items
+
+        # A non-blocking fetch returns what the queue holds when the caller
+        # already has work for its next step.
+        if (timeout_secs is not None and timeout_secs <= 0
+                and self.skip_batch_wait_when is not None
+                and self.skip_batch_wait_when()):
             return items
 
         if len(items) >= self.max_batch_size:

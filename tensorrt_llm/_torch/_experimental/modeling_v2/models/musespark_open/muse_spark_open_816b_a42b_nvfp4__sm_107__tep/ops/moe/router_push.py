@@ -76,6 +76,14 @@ At TP8 (two trays of one NVLink domain):
   g = 0, CL = 16, unchanged).
 * The v1 routing tile needs [16][256] floats: ``red`` is sized max(CL x 256, 16 x 256) (unchanged
   at CL 16).
+* CL16 band (``tep8_cl16_max_rows``, the ``tep8_router_push`` lever's ``CL16_MAX_ROWS``, 0 = off):
+  calls of up to that many rows run 16-CTA clusters (512 of K per CTA, half the per-CTA GEMM and
+  tiles); same K tree, so the same bits. NEG x CL is then 32, so step A v2 routes in expert group
+  0's cluster only (CTA c: row 16 rb + c; ``#if CL == BM && NEG * CL != BM``), and expert group
+  1's cluster only publishes. The CL 8 builds' source is unchanged (that branch is preprocessed
+  out for them). Why (VR nsys, 8 ranks at bs12/16 and rank 0 at bs3/4/8): the push waits on its
+  peers for ~0.2 us (its predecessor is itself a cross-rank hop); its ~8 us at 24..64 rows is
+  its own latency chain, at 16 rows per CTA whatever the call's rows.
 """
 
 from __future__ import annotations
@@ -96,13 +104,71 @@ TEP8_MAX_ROWS = 128
 TEP8_CLUSTER = 8
 
 #: Settings (``configure``): the push at TP8 (``_TEP8_PUSH``), the fewest rows it takes
-#: (``TEP8_MIN_ROWS``) and step A on top of it (``_TEP8_ROUTE``).
+#: (``TEP8_MIN_ROWS``), step A on top of it (``_TEP8_ROUTE``) and the CL16 band
+#: (``TEP8_CL16_MAX_ROWS``).
 _TEP8_PUSH = False
 TEP8_MIN_ROWS = 9
 _TEP8_ROUTE = False
+#: TP8 CL16 band: calls of at most this many rows (0: none) run the 16-CTA-cluster builds
+#: (``TEP8_CL16_CLUSTER``): 512 of K per CTA instead of 1024, so each CTA's FP32-FMA shard GEMM,
+#: weight tile and activation tile halve, on twice the CTAs (64 at 32 rows, the CL 8 count at 64
+#: rows). The K tree is the same (module docstring: any CL), so the logits, the routing and the
+#: exchange protocol (gather layout, per-(row block, expert group) counters) are the CL 8 build's:
+#: a rank may run either build on any call. With step A, per-row routing (v2) runs in expert group
+#: 0's cluster (CTA c: row 16 rb + c); expert group 1's cluster only publishes. Capped at
+#: ``ROUTE_ROW_MAX`` (v2's band). The VR nsys (G15, wall + rp9) has the push on the router
+#: critical path at 17..32 rows (pool branch ~4 us shorter) but co-critical with the pool GEMM +
+#: publication at 64 rows (0.9 us slack, and 128 CL16 CTAs + the 128-CTA pool GEMM exceed the 212
+#: SMs), hence a band from the bottom.
+TEP8_CL16_MAX_ROWS = 0
+TEP8_CL16_CLUSTER = 16
+#: TP8 v2 band (``configure``'s ``tep8_route_row_max``): routed calls of at most this many rows route
+#: per row in every CTA (v2), larger ones in the row-block leader (v1). The routed build is compiled
+#: with it (``-DROUTE_ROW_MAX``). Default ``ROUTE_ROW_MAX`` (64), the band served before; up to
+#: ``TEP8_MAX_ROWS`` (128). Both epilogues are ``_full_routing_kernel`` bit for bit, so the band moves
+#: only time. Why (VR nsys, wall + rp9): the push is flat at ~8.0 us a layer up to 64 rows (v2) and
+#: ~11.2 us from 65 rows (72: vrg-p79 rank 0; 96 / 128: vrg-p16, 8 ranks, own work 10.9 us): the
+#: step is v1's epilogue (one CTA polls and routes its block's 16 rows) not the grid (64 -> 80
+#: CTAs). v1 was kept above 64 rows because v2's non-leaders hold their shared memory a few
+#: microseconds longer while the pool GEMM (160 / 192 / 256 CTAs at 72 / 96 / 128 rows) wants SMs:
+#: on VR the pool branch (pool GEMM + publication) ends 4.6 / 3.3 / 1.4 us before the ring buddy at
+#: bs9 / 12 / 16, so v2's ~3 us is on the critical path at bs9-12 and capped at ~1.4 us at bs16.
+TEP8_ROUTE_ROW_MAX = 64
+#: TP8 v2 rows per CTA (``configure``'s ``tep8_route_rows_per_cta``): 1 (default) routes one row in each
+#: of a block's NEG x CL = 16 CTAs; 2 (the CL 8 routed build compiled with ``-DROW_PAIRS=1``) routes two
+#: rows in each of expert group 0's 8 CTAs while expert group 1's non-leaders leave after the split
+#: exchange: half the push's CTAs stay resident through the poll and the routing (40 / 48 / 64 at 72 /
+#: 96 / 128 rows instead of 80 / 96 / 128), the hedge for v2 past 64 rows next to the 160..256-CTA
+#: pool GEMM; each CTA polls and routes its second row after its first. Same per-row epilogue, so the
+#: same bits. GPU stages (vr_cl16_ranks.py, 32 rows, CL 8, plain build): x staged 0.45, GEMM 2.40,
+#: cluster sum 0.74, publish 0.13, poll 2.02, store 0.06 us: the poll (fabric round trip) and v1's
+#: 16-row epilogue, not the GEMM, are what 65..128 rows can lose.
+TEP8_ROUTE_ROWS_PER_CTA = 1
+#: TP8 early dependents trigger (``configure``'s ``tep8_early_trigger``, the ``tep8_router_push`` lever's
+#: ``RB_CUDA``): the routed builds are compiled with ``-DEARLY_TRIGGER=1``, so every CTA executes
+#: ``griddepcontrol.launch_dependents`` right after its dependency wait instead of at its end: the push's
+#: PDL dependent, the ring-buddy placement (``ring_buddy_cuda.rb_tables``, whose first statement is
+#: ``griddepcontrol.wait``), is launched while the push runs (all of the push's CTAs are resident by then:
+#: the trigger fires once every CTA has executed it) and waits on-chip for the push's completion and
+#: memory flush, so its launch and prologue leave the router path. Values unchanged (a dependent still
+#: reads nothing before its wait; its loads of the push's outputs must not be read-only ones, e.g. through
+#: ``const __restrict__`` pointers, which the compiler may issue as ``ld.global.nc`` above the wait: the
+#: 8-rank gate 1026468 caught rb_tables doing so). VR nsys (wall + rp9, rank 0): today the ring buddy starts 0.7 us before
+#: the push ends at 64 rows (v2: each routing CTA triggers after its row) and at its end from 65 rows (v1:
+#: the leader triggers last).
+TEP8_EARLY_TRIGGER = False
 
 
-def configure(*, tep8_push: bool = False, tep8_min_rows: int = 9, tep8_route: bool = False) -> None:
+def configure(
+    *,
+    tep8_push: bool = False,
+    tep8_min_rows: int = 9,
+    tep8_route: bool = False,
+    tep8_cl16_max_rows: int = 0,
+    tep8_route_row_max: int = 64,
+    tep8_route_rows_per_cta: int = 1,
+    tep8_early_trigger: bool = False,
+) -> None:
     """Set whether and where the push serves TP8 router calls.
 
     ``lever_settings.apply`` sets them from the model's plan before any install; the defaults
@@ -113,11 +179,55 @@ def configure(*, tep8_push: bool = False, tep8_min_rows: int = 9, tep8_route: bo
             ``TEP8_MAX_ROWS`` rows run the push.
         tep8_min_rows: the fewest rows a call takes the push at.
         tep8_route: step A: the push also writes the routing method's selection and weights.
+        tep8_cl16_max_rows: the push's calls of at most this many rows run the CL16 builds
+            (``TEP8_CL16_MAX_ROWS``; 0, the default: none; at most ``ROUTE_ROW_MAX``).
+        tep8_route_row_max: the routed build's v2 band (``TEP8_ROUTE_ROW_MAX``):
+            ``ROUTE_ROW_MAX`` (64, the default) .. ``TEP8_MAX_ROWS`` (128).
+        tep8_route_rows_per_cta: v2's rows per CTA (``TEP8_ROUTE_ROWS_PER_CTA``): 1 (default) or 2.
+        tep8_early_trigger: the routed builds trigger their PDL dependents right after the dependency
+            wait (``TEP8_EARLY_TRIGGER``; off by default).
+
+    Raises:
+        ValueError: if ``tep8_cl16_max_rows`` is outside 0..``ROUTE_ROW_MAX`` or
+            ``tep8_route_row_max`` outside ``ROUTE_ROW_MAX``..``TEP8_MAX_ROWS``, or
+            ``tep8_route_rows_per_cta`` not 1 or 2 (nothing is set).
     """
-    global _TEP8_PUSH, TEP8_MIN_ROWS, _TEP8_ROUTE
+    global _TEP8_PUSH, TEP8_MIN_ROWS, _TEP8_ROUTE, TEP8_CL16_MAX_ROWS, TEP8_ROUTE_ROW_MAX
+    global TEP8_ROUTE_ROWS_PER_CTA, TEP8_EARLY_TRIGGER
+    if int(tep8_route_rows_per_cta) not in (1, 2):
+        raise ValueError(f"tep8_route_rows_per_cta is 1 or 2, got {tep8_route_rows_per_cta!r}")
+    cl16 = int(tep8_cl16_max_rows)
+    if not 0 <= cl16 <= ROUTE_ROW_MAX:
+        raise ValueError(f"tep8_cl16_max_rows is 0..{ROUTE_ROW_MAX}, got {tep8_cl16_max_rows!r}")
+    v2 = int(tep8_route_row_max)
+    if not ROUTE_ROW_MAX <= v2 <= TEP8_MAX_ROWS:
+        raise ValueError(
+            f"tep8_route_row_max is {ROUTE_ROW_MAX}..{TEP8_MAX_ROWS}, got {tep8_route_row_max!r}"
+        )
+    TEP8_ROUTE_ROW_MAX = v2
+    TEP8_ROUTE_ROWS_PER_CTA = int(tep8_route_rows_per_cta)
+    TEP8_EARLY_TRIGGER = bool(tep8_early_trigger)
     _TEP8_PUSH = bool(tep8_push)
     TEP8_MIN_ROWS = int(tep8_min_rows)
     _TEP8_ROUTE = bool(tep8_route)
+    TEP8_CL16_MAX_ROWS = cl16
+
+
+def route_extra(world: int, cluster: int) -> Tuple[str, ...]:
+    """The routed build's extra NVRTC options: ``-DROW_PAIRS=1`` for v2 in row pairs (TP8 at CL 8 only),
+    ``-DEARLY_TRIGGER=1`` for the early dependents trigger (TP8, any CL)."""
+    extra: Tuple[str, ...] = ()
+    if TEP8_ROUTE_ROWS_PER_CTA == 2 and world == 8 and cluster == 8:
+        extra += ("-DROW_PAIRS=1",)
+    if TEP8_EARLY_TRIGGER and world == 8:
+        extra += ("-DEARLY_TRIGGER=1",)
+    return extra
+
+
+def cl16_takes(rows: int) -> bool:
+    """Whether a TP8 push call of ``rows`` rows runs the CL16 builds (when they are built and keep the call's
+    clusters resident; else the CL 8 build runs it, with the same bits). Rank-uniform: settings and the row count."""
+    return _TEP8_PUSH and 1 <= rows <= TEP8_CL16_MAX_ROWS
 
 
 BUFFERS = 2
@@ -126,7 +236,8 @@ SENTINEL_I32 = -1
 
 
 TOP_K = 8
-#: Step A v2: calls of at most this many rows route per row in every CTA of the cluster; v1 above.
+#: Step A v2: calls of at most this many rows route per row in every CTA of the cluster; v1 above
+#: (the default of ``TEP8_ROUTE_ROW_MAX``, which the routed build compiles with, and the CL16 band's cap).
 ROUTE_ROW_MAX = 64
 
 
@@ -195,6 +306,12 @@ static_assert(ilog2(NCH) < 6, "K tree depth");
 #endif
 #ifndef ROUTE_LAB
 #define ROUTE_LAB 0
+#endif
+#ifndef ROW_PAIRS
+#define ROW_PAIRS 0
+#endif
+#ifndef EARLY_TRIGGER
+#define EARLY_TRIGGER 0
 #endif
 #if ROUTE
 // The weight sum's shuffle partners (element xor distances), the routing kernel's tree for a [256] FP32 sum with 2
@@ -426,6 +543,11 @@ tp_router_push(const u16* x, const float* w, float scale, float* out, u32* rbcnt
   asm volatile("cp.async.commit_group;" ::: "memory");
   asm volatile("griddepcontrol.wait;" ::: "memory");
   STAMP(1);
+#if EARLY_TRIGGER
+  // the dependent (the ring-buddy placement) launches now and waits in its own griddepcontrol.wait for this
+  // grid's completion; it fires once every CTA of the push has executed it (all resident by then)
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
   if (crank == 0 && t == 0) {
     const u32 old = atomicAdd(rbcnt + cid, 1u);
     s_buf = old & 1u;
@@ -507,9 +629,24 @@ tp_router_push(const u16* x, const float* w, float scale, float* out, u32* rbcnt
   asm volatile("barrier.cluster.arrive.release.aligned;\n\tbarrier.cluster.wait.acquire.aligned;" ::: "memory");
   STAMP(4);
 #if ROUTE
+#if CL == BM && NEG * CL != BM
+  // v2 at CL 16 with NEG > 1 (TP8's CL16 band): expert group 0's cluster has BM CTAs, so its CTA crank routes row
+  // 16 rb + crank and the other groups' non-leaders leave here (their leaders only publish, below)
+  const bool per_row = rows <= ROUTE_ROW_MAX;
+  if (crank != 0 && !(per_row && eg == 0)) { FLUSH(); return; }
+#else
+#if ROW_PAIRS
+  // v2 in row pairs (TP8, CL 8): expert group 0's CL CTAs route the block's BM rows, two each (CTA c: rows
+  // 16 rb + c and 16 rb + CL + c); the other groups' non-leaders leave here, so half the CTAs stay through the poll
+  static_assert(CL * 2 == BM && NEG == 2, "row pairs: expert group 0's CL CTAs route the block's BM rows");
+  const bool per_row = rows <= ROUTE_ROW_MAX;
+  if (crank != 0 && !(per_row && eg == 0)) { FLUSH(); return; }
+#else
   // v2: each CTA of the block's NEG clusters routes one row (CTA (eg, crank): row eg CL + crank)
   const bool per_row = NEG * CL == BM && rows <= ROUTE_ROW_MAX;
   if (crank != 0 && !per_row) { FLUSH(); return; }
+#endif
+#endif
   u32 buf = 0;
   if (crank == 0) {
 #else
@@ -550,8 +687,22 @@ tp_router_push(const u16* x, const float* w, float scale, float* out, u32* rbcnt
     // the buffer parity from the cluster's call counter: the leader's atomic precedes the cluster barrier (release /
     // acquire), and the next call's atomic waits for this grid (griddepcontrol.wait)
     if (crank != 0) buf = (ld_relaxed_gpu(rbcnt + cid) - 1u) & 1u;
+#if CL == BM && NEG * CL != BM
+    const int grow = eg == 0 ? rb * BM + (int)crank : rows;  // only expert group 0's CTAs route (one row each)
+#else
+#if ROW_PAIRS
+    const int grow = eg == 0 ? rb * BM + (int)crank : rows;  // and row grow + CL, below
+#else
     const int grow = rb * BM + eg * CL + (int)crank;
+#endif
+#endif
     if (grow < rows) route_row_cta(gather, buf, grow, out, red, bias_s, eps, sel, wts, t);
+#if ROW_PAIRS && !(CL == BM && NEG * CL != BM)
+    if (grow + CL < rows) {
+      __syncthreads();  // warp 0's selection of the first row is done with the scratch the second row reuses
+      route_row_cta(gather, buf, grow + CL, out, red, bias_s, eps, sel, wts, t);
+    }
+#endif
     FLUSH();
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     return;
@@ -670,7 +821,7 @@ class Kernel:
                 f"-DMAX_ROWS={int(max_rows)}".encode(),
                 f"-DTIMING={int(bool(timing))}".encode(),
             ]
-            + ([b"-DROUTE=1", f"-DROUTE_ROW_MAX={ROUTE_ROW_MAX}".encode()] if self.route else [])
+            + ([b"-DROUTE=1", f"-DROUTE_ROW_MAX={TEP8_ROUTE_ROW_MAX}".encode()] if self.route else [])
             + [e.encode() for e in extra]
         )
         r = nvrtc.nvrtcCompileProgram(prog, len(opts), opts)
@@ -886,6 +1037,11 @@ class RouterPush:
         self.cluster = cluster
         #: step A's build (``ROUTE``), compiled at the first routed call (eager: the first call is never captured)
         self.route_kernel: Optional[Kernel] = None
+        #: the CL16 band's builds (``prepare_cl16``, at the transport's eager creation): plain and routed
+        self.cl16_kernel: Optional[Kernel] = None
+        self.cl16_route_kernel: Optional[Kernel] = None
+        self._cl16_tried = False
+        # one counter per (row block, expert group) cluster: the same set at every CL
         self.rbcnt = torch.zeros(self.kernel.clusters(MAX_ROWS), dtype=torch.int32, device=device)
         self._timed: Dict[int, Kernel] = {}
         self._keepalive = keepalive
@@ -893,9 +1049,51 @@ class RouterPush:
     def route_build(self) -> Kernel:
         if self.route_kernel is None:
             self.route_kernel = Kernel(
-                self.device.index, self.world, self.cluster, self.kernel.tpl, route=True
+                self.device.index,
+                self.world,
+                self.cluster,
+                self.kernel.tpl,
+                route=True,
+                extra=route_extra(self.world, self.cluster),
             )
         return self.route_kernel
+
+    def prepare_cl16(self, route: bool) -> Optional[str]:
+        """Compile the CL16 band's builds once (eager; never under capture): plain, and routed when ``route``.
+        Returns a failure reason (the CL 8 builds then serve every call), else None."""
+        if self._cl16_tried:
+            return None
+        self._cl16_tried = True
+        if self.cluster == TEP8_CL16_CLUSTER:
+            return f"the push is already built at CL {self.cluster}"
+        try:
+            plain = Kernel(self.device.index, self.world, TEP8_CL16_CLUSTER, self.kernel.tpl)
+            routed = (
+                Kernel(
+                    self.device.index,
+                    self.world,
+                    TEP8_CL16_CLUSTER,
+                    self.kernel.tpl,
+                    route=True,
+                    extra=route_extra(self.world, TEP8_CL16_CLUSTER),
+                )
+                if route
+                else None
+            )
+        except Exception as exc:  # noqa: BLE001 - a missing non-portable cluster size or build failure
+            return f"{type(exc).__name__}: {exc}"
+        if plain.clusters(1) != self.kernel.clusters(1) or plain.max_clusters < 1:
+            return f"CL {TEP8_CL16_CLUSTER} keeps {plain.max_clusters} clusters resident"
+        self.cl16_kernel, self.cl16_route_kernel = plain, routed
+        return None
+
+    def cl16_build(self, rows: int, route: bool) -> Optional[Kernel]:
+        """The CL16 build for a call of ``rows`` rows when the band takes it and the build keeps its clusters
+        resident, else None (the CL 8 build runs it, with the same bits)."""
+        if not cl16_takes(rows):
+            return None
+        k = self.cl16_route_kernel if route else self.cl16_kernel
+        return k if k is not None and k.fits(rows) else None
 
     @classmethod
     def from_mapping(
@@ -956,14 +1154,16 @@ class RouterPush:
         rargs = None
         if route is not None:
             bias, eps, sel, wts = route
-            k = self.route_build()
+            k = self.cl16_build(rows, route=True) or self.route_build()
             if not k.fits(rows):
                 raise RuntimeError(
                     f"tp_router_push: the routed build does not keep {rows} rows resident"
                 )
             rargs = (bias.data_ptr(), float(eps), sel.data_ptr(), wts.data_ptr())
         else:
-            k = self.build_for(rows, tpl)
+            k = (self.cl16_build(rows, route=False) if tpl is None and timing is None else None) or (
+                self.build_for(rows, tpl)
+            )
             if k is None:
                 raise RuntimeError(f"tp_router_push: no build keeps {rows} rows resident")
             if timing is not None:
@@ -1063,9 +1263,24 @@ def _push_for(mapping, x: torch.Tensor, weight: torch.Tensor) -> Optional[Router
                 f"[musespark_open] tep{world} router push + routing: rank {mapping.tp_rank} also "
                 "writes the routing "
                 f"method's top-8 selection and weights (bit for bit _full_routing_kernel, TORCH_ORDER off, up to 128 "
-                f"rows; per row in every cluster CTA up to {ROUTE_ROW_MAX} rows) into the routing memo; routed build {r.regs} regs, {r.local_bytes} B local, "
+                f"rows; per row in every cluster CTA up to {TEP8_ROUTE_ROW_MAX} rows, {TEP8_ROUTE_ROWS_PER_CTA} row(s) per CTA) into the routing memo; routed build {r.regs} regs, {r.local_bytes} B local, "
                 f"{r.max_clusters} resident clusters"
             )
+        if TEP8_CL16_MAX_ROWS > 0:
+            why = push.prepare_cl16(route=route_armed())
+            if why is None:
+                c16 = push.cl16_route_kernel or push.cl16_kernel
+                logger.info(
+                    f"[musespark_open] tep{world} router push CL16: calls of {min_rows}..{TEP8_CL16_MAX_ROWS} rows run "
+                    f"{TEP8_CL16_CLUSTER}-CTA clusters ({HIDDEN // TEP8_CL16_CLUSTER} of K per CTA; per-row routing in "
+                    f"expert group 0's cluster); {'routed' if push.cl16_route_kernel else 'plain'} build {c16.regs} regs, "
+                    f"{c16.local_bytes} B local, {c16.max_clusters} resident clusters"
+                )
+            else:
+                logger.warning(
+                    f"[musespark_open] tep{world} router push CL16 inactive ({why}): calls of "
+                    f"{min_rows}..{TEP8_CL16_MAX_ROWS} rows keep the CL {cluster} build"
+                )
     return push
 
 

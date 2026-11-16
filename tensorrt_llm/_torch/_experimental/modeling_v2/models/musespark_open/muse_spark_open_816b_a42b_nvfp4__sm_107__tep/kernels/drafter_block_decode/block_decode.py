@@ -71,6 +71,72 @@ from ..context_kv_fork.fork import join_pending as _join_pending
 #: Operand dtypes the fused convolution takes; anything else runs the built-in.
 SUPPORTED_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
 
+#: ``finish_norm`` (``configure``; ``tep8_drafter_wide_gemms__FINISH_NORM``): on a block decode that does not
+#: take the fused drafter hop (the TP8 calls of 65..128 rows), each hop's tail after the projection's
+#: all-reduce -- the finish-side block convolution, then the next norm's fused residual add + RMSNorm -- runs
+#: as ONE launch (``ops/spec/drafter_finish_norm``: the fused hop's statements, bit for bit the two launches).
+FINISH_NORM = False
+#: ``qk_fold`` (``configure``; ``tep8_drafter_wide_gemms__QK_FOLD``): the QK fold (``kernels/dr3_folds``' QF: each
+#: window-attention split program normalizes and rotates the raw q / k_new it reads, the append stores the rotated
+#: keys) also without ``drafter_attn_pdl`` (multi-request block decodes: no PDL copy, no split pre-wait), when the
+#: drafter holds the QF marker (``dr3_folds.install_qk_fold_plain``). One QK norm + RoPE launch less per layer.
+QK_FOLD = False
+#: One ERROR / one INFO line per process.
+_FINISH_NORM_LOGGED = {"refused": False, "engaged": False}
+
+
+def configure(*, finish_norm: bool = False, qk_fold: bool = False) -> None:
+    """Set ``FINISH_NORM`` and ``QK_FOLD``; ``lever_settings.apply`` sets them before any install."""
+    global FINISH_NORM, QK_FOLD
+    FINISH_NORM = bool(finish_norm)
+    QK_FOLD = bool(qk_fold)
+
+
+def _finish_norm_reason(conv, norm, x, coefficients, residual) -> str | None:
+    """Why ``drafter_finish_norm`` cannot replace ``conv.finish`` + ``norm(x, residual)`` here, or None."""
+    from ...ops.spec import drafter_finish_norm as _finish
+
+    if type(norm).__name__ != "RMSNorm" or getattr(norm, "use_gemma", False):
+        return f"the norm is {type(norm).__name__} (gemma {getattr(norm, 'use_gemma', False)}), not the plain RMSNorm"
+    if (
+        getattr(conv, "taps", None) != _finish.TAPS
+        or getattr(conv, "group_size", _finish.GROUP_SIZE) != _finish.GROUP_SIZE
+    ):
+        return "the convolution geometry is not 2 taps x 16 channels per group"
+    if not _finish.takes(x, coefficients, conv.base_kernel[1], residual, norm.weight):
+        return "operands outside the kernel's (BF16, 8192 wide, unit column strides)"
+    return None
+
+
+def _finish_norm(conv, norm, x, coefficients, residual, block_size: int):
+    """``FINISH_NORM``: the normed rows (``residual`` updated in place), or None (log ERROR once naming the knob)."""
+    from ...ops.spec import drafter_finish_norm as _finish
+
+    reason = _finish_norm_reason(conv, norm, x, coefficients, residual)
+    if reason is not None:
+        if not _FINISH_NORM_LOGGED["refused"]:
+            _FINISH_NORM_LOGGED["refused"] = True
+            logger.error(
+                "[musespark_open] tep8_drafter_wide_gemms__FINISH_NORM is set but this block decode's hop tail "
+                f"cannot take it ({reason}): the built-in finish convolution + norm run"
+            )
+        return None
+    if not _FINISH_NORM_LOGGED["engaged"]:
+        _FINISH_NORM_LOGGED["engaged"] = True
+        logger.info(
+            "[musespark_open] drafter_block_decode: hop tail (finish convolution + add + RMSNorm) in one launch "
+            "(tep8_drafter_wide_gemms__FINISH_NORM)"
+        )
+    return _finish.drafter_finish_norm(
+        x,
+        coefficients,
+        conv.base_kernel[1],
+        residual,
+        norm.weight,
+        norm.variance_epsilon,
+        block_size,
+    )
+
 
 # ---- The drafter preamble computed by the prepare (drafter_preamble_from_commit) ---------
 class DrafterPreamble:
@@ -492,6 +558,11 @@ def windowed_block_decode(
         hops = None
     if hops is not None:
         hops.begin_forward()
+    # ``tep8_drafter_wide_gemms__PREFETCH`` (``kernels/drafter_l2_prefetch``): the next GEMMs'
+    # weights asked of the L2 from a side stream while the non-HBM kernels run (no value moves).
+    prefetch = self.__dict__.get("_drafter_l2_prefetch")
+    if prefetch is not None and not prefetch.takes(B * block_size):
+        prefetch = None
     layers = self.model.layers
     prenormed = None
     # PDL chain merge trigger (drafter_pdl_chain/chain.py): the merge releases o_proj's GEMM at its entry.
@@ -507,7 +578,13 @@ def windowed_block_decode(
     attn_pdl = self.__dict__.get("_pt_attn_pdl") if enable_pdl and wide is None else None
     # The QK fold (``kernels/dr3_folds``, not installed by any composition; on attn_pdl's path only): the window
     # attention's split normalizes and rotates the raw q / k_new instead of a QK norm + RoPE launch.
-    qk_fold = self.__dict__.get("_dr3_qf") if attn_pdl is not None else None
+    # A marker set without drafter_attn_pdl (``install_qk_fold_plain``, QK_FOLD) serves only the path without the
+    # PDL copy: the copy's split pre-wait loads rely on install_qk_fold's qkv-tactic check.
+    plain_qf = bool(self.__dict__.get("_dr3_qf_plain"))
+    if attn_pdl is not None:
+        qk_fold = self.__dict__.get("_dr3_qf") if not plain_qf else None
+    else:
+        qk_fold = self.__dict__.get("_dr3_qf") if QK_FOLD and plain_qf and wide is None else None
     if qk_fold is not None:
         from ..dr3_folds import folds as _dr3_folds
     for layer_idx, layer in enumerate(layers):
@@ -556,6 +633,8 @@ def windowed_block_decode(
                 )
 
             qkv_query = attn_mod.qkv_proj(hs_normed_flat)
+        if prefetch is not None:
+            prefetch.fork("attn", layer_idx, B * block_size)
         if pending_join is not None:
             # drafter_preamble_late_join: the first read of the side chain's outputs (positions,
             # lengths, arena) follows.
@@ -610,6 +689,8 @@ def windowed_block_decode(
                 qk_fold=layer_qk_fold,
             )
         attn_output = out.reshape(B * block_size, q_size)
+        if prefetch is not None:
+            prefetch.fork("mlp", layer_idx, B * block_size)
 
         res_flat = residual.reshape(-1, residual.shape[-1])
         if hops is not None:
@@ -627,11 +708,24 @@ def windowed_block_decode(
             )
         else:
             hidden_out = attn_mod.o_proj(attn_output)
-            if has_block_conv:
-                hidden_out = self.attention_convs[layer_idx].finish(
-                    hidden_out, attn_conv_coefficients, block_size
+            fused = None
+            if FINISH_NORM and has_block_conv:
+                fused = _finish_norm(
+                    self.attention_convs[layer_idx],
+                    layer.post_attention_layernorm,
+                    hidden_out,
+                    attn_conv_coefficients,
+                    res_flat,
+                    block_size,
                 )
-            hidden_out, res_flat = layer.post_attention_layernorm(hidden_out, res_flat)
+            if fused is not None:
+                hidden_out = fused
+            else:
+                if has_block_conv:
+                    hidden_out = self.attention_convs[layer_idx].finish(
+                        hidden_out, attn_conv_coefficients, block_size
+                    )
+                hidden_out, res_flat = layer.post_attention_layernorm(hidden_out, res_flat)
         if has_block_conv:
             hidden_out, mlp_conv_coefficients = self.mlp_convs[layer_idx].prepare(
                 hidden_out, block_size
@@ -654,8 +748,33 @@ def windowed_block_decode(
                 next_norm,
                 block_size,
             )
+            if prefetch is not None:
+                prefetch.fork("next", layer_idx, B * block_size)
             continue
         hidden_out = layer.mlp(hidden_out)
+        if prefetch is not None:
+            prefetch.fork("next", layer_idx, B * block_size)
+        if FINISH_NORM and has_block_conv:
+            next_norm = (
+                layers[layer_idx + 1].input_layernorm
+                if layer_idx + 1 < len(layers)
+                else self.model.norm
+            )
+            fused = _finish_norm(
+                self.mlp_convs[layer_idx],
+                next_norm,
+                hidden_out,
+                mlp_conv_coefficients,
+                res_flat,
+                block_size,
+            )
+            if fused is not None:
+                # The next layer's input norm (or model.norm) is applied: as the fused hop's prenormed.
+                prenormed = fused
+                residual = res_flat.reshape(B, block_size, -1)
+                hidden_states = hidden_out.reshape(B, block_size, -1)
+                continue
+            prenormed = None
         if has_block_conv:
             hidden_out = self.mlp_convs[layer_idx].finish(
                 hidden_out, mlp_conv_coefficients, block_size
@@ -664,7 +783,11 @@ def windowed_block_decode(
         hidden_states = hidden_out.reshape(B, block_size, -1)
         residual = res_flat.reshape(B, block_size, -1)
 
-    if hops is not None:
+    if prefetch is not None:
+        # The side stream's forks rejoin once (a captured graph needs every fork joined).
+        prefetch.join()
+    if hops is not None or prenormed is not None:
+        # The last hop (fused, or FINISH_NORM's tail) applied model.norm.
         return prenormed
     hidden_states_out, _ = self.model.norm(
         hidden_states.reshape(-1, hidden_states.shape[-1]),

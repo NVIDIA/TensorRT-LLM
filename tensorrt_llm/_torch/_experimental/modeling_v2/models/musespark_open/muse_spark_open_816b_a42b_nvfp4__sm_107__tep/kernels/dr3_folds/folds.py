@@ -371,6 +371,62 @@ def qk_fold_reason(draft_model: Optional[nn.Module]) -> Optional[str]:
     return None
 
 
+def qk_fold_plain_reason(draft_model: Optional[nn.Module]) -> Optional[str]:
+    """Why QF cannot run WITHOUT ``drafter_attn_pdl`` (``tep8_drafter_wide_gemms__QK_FOLD``), or None: the geometry
+    its Triton copy reproduces (NeoX, full rotary 128, no YaRN, QK norm without the Gemma weight, BF16 weights). Without
+    the PDL copy the split kernel takes no pre-wait loads, so the qkv GEMV's tactic is not constrained."""
+    from ..drafter_attn_pdl.attn_pdl import module_args
+
+    if draft_model is None or not hasattr(draft_model, "model"):
+        return "no drafter"
+    for index, layer in enumerate(draft_model.model.layers):
+        where = f"layer {index} attention"
+        attn = layer.self_attn
+        try:
+            args = module_args(attn)
+        except (ValueError, AttributeError) as error:
+            return f"{where}: {error}"
+        if not (
+            args.is_neox
+            and args.head_dim == 128
+            and args.rotary_dim == 128
+            and args.factor == 1.0
+            and args.attention_factor == 1.0
+            and args.is_qk_norm
+            and not args.use_gemma
+        ):
+            return f"{where}: {args} is not the NeoX / full-rotary / no-YaRN QK norm the fold reproduces"
+        if attn.q_norm.weight.dtype != torch.bfloat16 or attn.k_norm.weight.dtype != torch.bfloat16:
+            return f"{where}: the QK norm weights are not BF16"
+    return None
+
+
+def install_qk_fold_plain(draft_model: nn.Module) -> int:
+    """Set the QF marker from the attention modules themselves (no ``drafter_attn_pdl``); return the layers covered
+    (0 if it was set). ``tep8_drafter_wide_gemms__QK_FOLD``.
+
+    Raises:
+        ValueError: ``qk_fold_plain_reason``, naming the knob.
+    """
+    if QK_KEY in draft_model.__dict__:
+        return 0
+    reason = qk_fold_plain_reason(draft_model)
+    if reason is not None:
+        raise ValueError(
+            f"[musespark_open] tep8_drafter_wide_gemms__QK_FOLD cannot run here: {reason}"
+        )
+    from ..drafter_attn_pdl.attn_pdl import module_args
+
+    args = [module_args(layer.self_attn) for layer in draft_model.model.layers]
+    draft_model.__dict__[QK_KEY] = tuple((a.eps, a.base) for a in args)
+    draft_model.__dict__["_dr3_qf_plain"] = True
+    logger.info(
+        f"[musespark_open] drafter qk fold: QK norm + RoPE in the window attention's split programs on "
+        f"{len(args)} layers (tep8_drafter_wide_gemms__QK_FOLD)"
+    )
+    return len(args)
+
+
 def install_qk_fold(draft_model: nn.Module) -> int:
     """Set ``draft_model``'s QF marker (the per-layer eps / base); return how many layers it covers (0 if set).
 

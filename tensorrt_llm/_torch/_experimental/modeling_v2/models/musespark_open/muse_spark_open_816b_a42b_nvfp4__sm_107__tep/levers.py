@@ -47,7 +47,25 @@ Each band owns a selection of levers (``BAND_LEVERS``): the aggregated sm107 ban
 high-concurrency TEP4, the 2..4-request TEP4 and the single-request TEP8 levers; the default
 band the low-latency levers of the sm107 compositions and the upstream rules they changed. A
 lever in neither selection is both bands' (``full_attention_fold_multi``'s rule names the band
-itself, ``_full_attention_fold_multi``). Under ``auto`` a lever of the
+itself, ``_full_attention_fold_multi``; the three context-step levers of the TEP4 context
+servers, ``context_prep_rows_vec``, ``context_embedding_replicated`` and
+``context_sp_router_input``, are on for the ``ctx`` role and for aggregated servers by rule,
+and so is ``fmk_context_fmha``, on every pure context step of a ``ctx`` server; of the
+context-step reduce-scatter overlaps, ``context_sp_oproj_overlap`` and
+``context_sp_tail_pipeline`` are on for TEP4 ``ctx`` servers and on by their knobs elsewhere,
+and ``context_sp_moe_rs_overlap`` is off under ``auto`` until measured on sm107).
+
+Role defaults of the default band (the disaggregated deployment, integration 'int1'): a TEP8
+``gen`` server of ``max_batch_size`` 9..16 runs the low-latency levers at MAX_BATCH 16 with
+their 65..128-row bands (``_tep8_gen_wide``), and every TEP8 ``gen`` server pushes the router
+from 9 rows (``TEP8_GEN_ROUTER_PUSH_MIN_ROWS``) and runs the one-cluster SWA block from 2 requests
+(``TEP8_GEN_CL8_MIN_REQUESTS``); a TEP8 ``gen`` server of 9..16 requests also runs the
+X400 composite (CL8 to 11 requests, ``TEP8_GEN_CL8_MAX_REQUESTS``; router v2 to 128 rows; the
+vocabulary-parallel head off, i.e. its MAX_BATCH stays 8); a TEP4 ``ctx`` server runs
+``fmk_context_fmha`` at PURE_CONTEXT 1, the o_proj overlap, the tail pipeline and
+``context_sp_extra_parts``'s ``shard_routing``, without its ``ce_gather`` (int4: the copy
+engines stay free for the KV transfers). Aggregated servers keep the 1..8-request
+defaults and these levers' agg rules. Under ``auto`` a lever of the
 other band's selection resolves as under ``baseline`` (off, or its upstream rule), so each
 band's table is its own selection; its knob still turns it on where its structural and
 dependency rules allow, and the levers it builds on or requires then resolve by their own
@@ -150,6 +168,10 @@ RETIRED: Mapping[str, str] = types.MappingProxyType(
         "MUSESPARK_OPEN_NEXT_QKV_PREFETCH_SKIP_ROWS": PREFIX + "NEXT_QKV_PREFETCH_SKIP",
         "MUSESPARK_OPEN_SWA_CL8": PREFIX + "SWA_ONE_CLUSTER_BLOCK",
         "MUSESPARK_OPEN_TEP8_SWA_CL8": PREFIX + "SWA_ONE_CLUSTER_BLOCK",
+        # The GB300 port's name for the TEP8 CL8 band's first request count; here a parameter.
+        "MUSESPARK_OPEN_TEP8_SWA_CL8_MIN_REQUESTS": (
+            PREFIX + "SWA_ONE_CLUSTER_BLOCK" + SEP + "TEP8_MIN_REQUESTS"
+        ),
         "MUSESPARK_OPEN_SWA_PREP_SPLIT": PREFIX + "SWA_PREP_SPLIT",
         "MUSESPARK_OPEN_SWA_ONE2": PREFIX + "SWA_EIGHT_REQUESTS",
         "MUSESPARK_OPEN_FA_PREP_FOLD_MULTI": PREFIX + "FULL_ATTENTION_FOLD_MULTI",
@@ -158,9 +180,17 @@ RETIRED: Mapping[str, str] = types.MappingProxyType(
         "MUSESPARK_OPEN_BF16_HALF_WINDOW": PREFIX + "BF16_HALF_WINDOW",
         "MUSESPARK_OPEN_PREROUTED_META": PREFIX + "PREROUTED_EXPERTS",
         "MUSESPARK_OPEN_TEP8_PREROUTED": PREFIX + "PREROUTED_EXPERTS",
+        # The GB300 port's name for the TP8 prerouted band (sm_103__tep8); here a parameter.
+        "MUSESPARK_OPEN_TEP8_PREROUTED_MAX_ROWS": PREFIX
+        + "PREROUTED_EXPERTS"
+        + SEP
+        + "TEP8_MAX_ROWS",
         "MUSESPARK_OPEN_PREROUTED_SO": "nothing: the experts run trtllm::fp4_block_scale_moe_prerouted",
         "MUSESPARK_OPEN_ROUTER_ROWS_TILING": "nothing: the sm107 compositions tile the per-row router shard",
-        "MUSESPARK_OPEN_TEP8_RING_BUDDY_MAX_ROWS": PREFIX + "TEP8_RING_BUDDY_WIDE",
+        "MUSESPARK_OPEN_TEP8_RING_BUDDY_MAX_ROWS": PREFIX
+        + "TEP8_RING_BUDDY_WIDE"
+        + SEP
+        + "MAX_ROWS",
         "MUSESPARK_OPEN_TEP8_RB_PDL": PREFIX + "TEP8_RING_BUDDY_PDL",
         "MUSESPARK_OPEN_TEP8_TILE_PLACEMENT": PREFIX + "TEP8_TILE_PLACEMENT",
         "MUSESPARK_OPEN_TEP8_TILE_PLACEMENT_MIN_ROWS": PREFIX + "TEP8_TILE_PLACEMENT",
@@ -172,9 +202,13 @@ RETIRED: Mapping[str, str] = types.MappingProxyType(
         "MUSESPARK_OPEN_TEP8_WIDE_POOL_GATHER": PREFIX + "TEP8_WIDE_PROJECTION_GATHERS",
         "MUSESPARK_OPEN_TEP8_WIDE_UNPOOL_GATHER": PREFIX + "TEP8_WIDE_PROJECTION_GATHERS",
         "MUSESPARK_OPEN_FINALIZE_TRIGGER": PREFIX + "FINALIZE_ENTRY_TRIGGER",
-        "MUSESPARK_OPEN_TEP8_FINALIZE_TRANSPORT_TOKENS": PREFIX + "TEP8_FINALIZE_TRANSPORT_64",
+        "MUSESPARK_OPEN_TEP8_FINALIZE_TRANSPORT_TOKENS": (
+            PREFIX + "TEP8_FINALIZE_TRANSPORT_64" + SEP + "TOKENS"
+        ),
         "MUSESPARK_OPEN_HOP_ENTRY_TRIGGER": PREFIX + "HOP_ENTRY_TRIGGER",
         "MUSESPARK_OPEN_TEP8_HOP_DIRECT": PREFIX + "TEP8_DIRECT_HOP",
+        # The GB300 port's "lo-hi" band of the direct hop (sm_103__tep8); here MIN_ROWS / MAX_ROWS.
+        "MUSESPARK_OPEN_TEP8_HOP_DIRECT_ROWS": PREFIX + "TEP8_DIRECT_HOP" + SEP + "MIN_ROWS",
         "MUSESPARK_OPEN_TEP8_HOP_EARLY": PREFIX + "TEP8_EARLY_MULTICAST_HOP",
         "MUSESPARK_OPEN_TEP8_HOP_MULTICAST": PREFIX + "TEP8_EARLY_MULTICAST_HOP",
         "MUSESPARK_OPEN_TEP8_HOP_PAD_ROWS": PREFIX + "TEP8_EARLY_MULTICAST_HOP",
@@ -427,8 +461,9 @@ def band_of(d: Deployment) -> Band:
 class Param:
     """A heuristic threshold a lever declares, overridable by ``<LEVER>__<KEY>``.
 
-    An integer in ``low..high``; with ``choices``, a non-empty subset of ``choices``
-    (comma-separated, kept in ``choices`` order); with ``ranges``, a non-empty list of
+    An integer in ``low..high`` (with ``values``, one of ``values``); with ``choices``, a
+    non-empty subset of ``choices`` (comma-separated, kept in ``choices`` order), or with
+    ``one`` exactly one of them (the name itself); with ``ranges``, a non-empty list of
     inclusive integer ranges in ``low..high`` (``"lo-hi,lo-hi,n"``, as sorted
     ``(lo, hi)`` pairs). A lossy lever's range is a subset of
     the values its accuracy gate covered. ``default_for``, when set, gives the default
@@ -442,6 +477,10 @@ class Param:
     choices: Tuple[str, ...] = ()
     default_for: Optional[Callable[["Deployment"], object]] = None
     ranges: bool = False
+    #: With ``choices``: the value is exactly one name (a ``str``), not a subset.
+    one: bool = False
+    #: An integer parameter's allowed values (empty: every integer in ``low..high``).
+    values: Tuple[int, ...] = ()
 
     def default_of(self, deployment: "Deployment") -> object:
         return self.default if self.default_for is None else self.default_for(deployment)
@@ -453,6 +492,10 @@ class Param:
             ValueError: for a value outside the parameter's range or choices.
         """
         text = raw.strip().lower()
+        if self.choices and self.one:
+            if text not in self.choices:
+                raise ValueError(f"expected one of {list(self.choices)}, got {raw!r}")
+            return text
         if self.choices:
             names = [name.strip() for name in text.split(",") if name.strip()]
             unknown = sorted(set(names) - set(self.choices))
@@ -464,6 +507,14 @@ class Param:
             return tuple(choice for choice in self.choices if choice in names)
         if self.ranges:
             return self._parse_ranges(raw, text)
+        if self.values:
+            try:
+                value = int(text, 10)
+            except ValueError:
+                value = None
+            if value not in self.values:
+                raise ValueError(f"expected one of {list(self.values)}, got {raw!r}")
+            return value
         try:
             value = int(text, 10)
         except ValueError:
@@ -558,6 +609,9 @@ class Resolving:
     def __init__(self, served: FrozenSet[str], decisions: Mapping[str, Decision]) -> None:
         self._served = served
         self._decisions = decisions
+        #: The lever being decided and its parameters (``resolve`` sets it): its own
+        #: ``Rule.excluded`` reads them through ``param``.
+        self.pending: Optional[Tuple[str, Mapping[str, object]]] = None
 
     def on(self, name: str) -> bool:
         """Whether ``name`` resolved on; False for a lever the composition does not serve.
@@ -574,10 +628,13 @@ class Resolving:
         return decision.on
 
     def param(self, name: str, key: str) -> object:
-        """``name``'s parameter ``key`` as resolved, or its default when ``name`` is not served."""
+        """``name``'s parameter ``key`` as resolved (for the lever being decided, as its knob
+        sets it), or its default when ``name`` is not served."""
         decision = self._decisions.get(name)
         if decision is not None and key in decision.params:
             return decision.params[key]
+        if self.pending is not None and self.pending[0] == name and key in self.pending[1]:
+            return self.pending[1][key]
         return RULES[name].param(key).default
 
 
@@ -623,6 +680,10 @@ def _reaching(rows: int, what: str) -> RuleFn:
 
 
 def _packed_prep_append(d: Deployment, t: Resolving, p: Mapping[str, object]) -> Tuple[bool, str]:
+    if d.tp == 8:
+        # Served at TP8 for its A/B (12..16-request steps: 1728..2304 one-warp programs per
+        # call); its geometries were swept at TP4.
+        return False, "at tep8 on only by its knob (geometries swept at tep4)"
     rows = int(p["MIN_ROWS"])
     return _reaching(rows, f"prep-append calls of {rows} or more rows")(d, t, p)
 
@@ -728,26 +789,106 @@ def _router_gate(role: Role, scope: str) -> Gate:
 #: were measured on: TEP4 and TEP8 decode of one to eight requests.
 LL_MAX_BATCH = 8
 
+#: The most requests the low-latency levers serve by default on a TEP8 generation server (the
+#: ``gen`` role hint): the 'wall' set (every LL lever at MAX_BATCH 16, the 65..128-row bands of
+#: ``_wide128``) passed its accuracy gate on sm107 TEP8 at max_batch_size 16 (GSM8K-long
+#: conc 16, -0.08 pt; natural AL ratio 0.9991) and its ruler (bs10 / 12 / 16 -1.0 / -1.3 /
+#: -1.7 ms against MAX_BATCH 16 alone).
+LL_MAX_BATCH_TEP8_GEN = 16
+
+#: The fewest rows ``tep8_router_push`` takes by default on a TEP8 generation server (``rp9``:
+#: the kernel floor; ruler and accuracy gate passed at max_batch_size 8, ruler at 16).
+TEP8_GEN_ROUTER_PUSH_MIN_ROWS = 9
+
+
+#: The fewest requests of a TEP8 generation server's steps the one-cluster SWA block takes by
+#: default (CL8 on 2..4 requests: GSM8K-long -0.15 pt, natural AL 0.9965, W4 batch-invariance bits
+#: PASS; bs4 -0.51 ms); every other deployment keeps the 5..8-request ONE2 range.
+TEP8_GEN_CL8_MIN_REQUESTS = 2
+
+
+#: The most requests of a TEP8 generation server's 9..16-request steps the one-cluster SWA block
+#: takes by default (the X400 composite: CL8 to 11 requests, one wave; W4 bits PASS, composite GSM8K
+#: gate PASS; bs10 -0.38 ms). 12..16 requests keep the split kernels (CL8 would need two waves there).
+TEP8_GEN_CL8_MAX_REQUESTS = 11
+
+
+def _tep8_gen(d: Deployment) -> bool:
+    """Whether ``d`` is a TEP8 generation server (the ``gen`` role hint)."""
+    return d.tp == 8 and d.role is Role.GEN
+
+
+def _tep8_gen_wide(d: Deployment) -> bool:
+    """Whether ``d`` is a TEP8 generation server whose decode steps reach 65..128 rows:
+    ``max_batch_size`` above ``LL_MAX_BATCH`` and at most ``LL_MAX_BATCH_TEP8_GEN``.
+
+    Its low-latency levers default to MAX_BATCH 16 and their 65..128-row bands. Every other
+    deployment keeps the 1..8-request defaults, so a generation server of ``max_batch_size``
+    up to 8 resolves as before (the 128-row parameters also set kernel layouts there).
+    """
+    return (
+        _tep8_gen(d)
+        and d.max_batch_size is not None
+        and LL_MAX_BATCH < d.max_batch_size <= LL_MAX_BATCH_TEP8_GEN
+    )
+
+
+def _ll_max_batch(d: Deployment) -> int:
+    """The default MAX_BATCH of a low-latency lever on ``d`` (``_tep8_gen_wide``)."""
+    return LL_MAX_BATCH_TEP8_GEN if _tep8_gen_wide(d) else LL_MAX_BATCH
+
+
+def _wide128(default: int) -> Callable[[Deployment], int]:
+    """A 65..128-row band parameter's default: 128 on ``_tep8_gen_wide`` deployments, else
+    ``default``."""
+    return lambda d: 128 if _tep8_gen_wide(d) else default
+
+
+#: The gen lane's stacked winners (int5): on by default where they were gated and measured, a TEP8
+#: ``gen`` server of 9..16 requests (``_tep8_gen_wide``; stack round 1 ABBA at mbs16, LEDGER G92:
+#: -0.20 / -0.13 / -0.28 ms at bs8 / 12 / 16). The set the E2E X400 gen role ran as knobs
+#: (lanes/gen/vrg/gint/int4w_e2e_gen.env): the verify sampler's multi-CTA top-p and distributed
+#: sampling, the pool norm prefetch, incremental block offsets at 9..16 requests (and, over a paged
+#: drafter context, its pool groups), the QKV 2-CTA split-K to 128 rows (numeric, GSM8K PASS), the
+#: pool / unpool 64x64 tiles from 97 rows, and the drafter's deep split-K stages, PDL conv entry to
+#: 64 rows and two-shot fused hop on 25..64 rows. Everything else of the gen lane's tree (window
+#: tiles, paged commits, SiLU fold, L061; since int7 the drafter QK fold) stays off. Every value
+#: stays a knob away.
+def _tep8_gen_wide_winner(value: object, default: object) -> Callable[[Deployment], object]:
+    return lambda d: value if _tep8_gen_wide(d) else default
+
+
+def _tep8_gen_router_push_min_rows(d: Deployment) -> int:
+    return TEP8_GEN_ROUTER_PUSH_MIN_ROWS if _tep8_gen(d) else 33
+
+
+def _tep8_gen_cl8_min_requests(d: Deployment) -> int:
+    return TEP8_GEN_CL8_MIN_REQUESTS if _tep8_gen(d) else 5
+
+
+def _tep8_gen_cl8_max_requests(d: Deployment) -> int:
+    return TEP8_GEN_CL8_MAX_REQUESTS if _tep8_gen_wide(d) else 8
+
 
 def _ll_params() -> Tuple[Param, ...]:
-    return (Param("MAX_BATCH", LL_MAX_BATCH, 1, 64),)
+    return (Param("MAX_BATCH", LL_MAX_BATCH, 1, 64, default_for=_ll_max_batch),)
 
 
 def _ll_gate() -> Gate:
     """Where the numeric low-latency levers passed their accuracy gates."""
 
     def holds(d: Deployment) -> bool:
-        return (
-            d.tp in (4, 8)
-            and d.role in (Role.GEN, Role.AGG)
-            and d.max_batch_size is not None
-            and d.max_batch_size <= LL_MAX_BATCH
-        )
+        if d.role not in (Role.GEN, Role.AGG) or d.max_batch_size is None:
+            return False
+        if d.tp == 8:
+            return d.max_batch_size <= LL_MAX_BATCH_TEP8_GEN
+        return d.tp == 4 and d.max_batch_size <= LL_MAX_BATCH
 
     return Gate(
         holds,
-        f"sm107 tep4 and tep8 servers of max_batch_size up to {LL_MAX_BATCH}: greedy drift, "
-        "GSM8K and SPEED-Bench acceptance",
+        f"sm107 tep4 servers of max_batch_size up to {LL_MAX_BATCH} and tep8 servers up to "
+        f"{LL_MAX_BATCH_TEP8_GEN}: greedy drift, GSM8K and SPEED-Bench acceptance (tep8 9..16: "
+        "the 'wall' set, GSM8K-long conc 16 and natural AL)",
     )
 
 
@@ -769,7 +910,12 @@ def _yielding(yields_to: Tuple[str, ...], rule: RuleFn) -> RuleFn:
     return yielding
 
 
-def _ll(kind: Kind, yields_to: Tuple[str, ...] = (), exclusive: bool = False) -> Rule:
+def _ll(
+    kind: Kind,
+    yields_to: Tuple[str, ...] = (),
+    exclusive: bool = False,
+    params: Tuple[Param, ...] = (),
+) -> Rule:
     """A low-latency lever of decode steps: on while ``max_batch_size`` is at most MAX_BATCH.
 
     With ``yields_to`` it is off while one of those levers is on (``_yielding``); with
@@ -784,7 +930,7 @@ def _ll(kind: Kind, yields_to: Tuple[str, ...] = (), exclusive: bool = False) ->
         "LL",
         kind,
         rule,
-        params=_ll_params(),
+        params=_ll_params() + params,
         gates=gates,
         after=yields_to,
         conflicts=yields_to if exclusive else (),
@@ -825,7 +971,7 @@ SM107_TEP8_TEP4_PATHS = (
 )
 
 
-def _tep4_path_rule() -> Rule:
+def _tep4_path_rule(params: Tuple[Param, ...] = ()) -> Rule:
     return Rule(
         "upstream",
         Kind.COMPOSITION,
@@ -833,7 +979,35 @@ def _tep4_path_rule() -> Rule:
         baseline=_not_on_tep8(
             "the upstream sm107 tep8 composition does not serve it", "its rows, wherever served"
         ),
+        params=params,
     )
+
+
+#: Parameters of the ``SM107_TEP8_TEP4_PATHS`` rules (each default the band served before).
+_TEP4_PATH_PARAMS: Mapping[str, Tuple[Param, ...]] = {
+    # The most rows of a TP8 drafter forward on the wide fused hop (``drafter_hops.install_wide``):
+    # 64, the device's served wide rows (``drafter_hop.WIDE_SERVED_ROWS_BY_SM``: on Rubin the
+    # one-shot hop is the faster one at 64 rows and the slower one at 128); 65..TEP8_MAX_ROWS rows
+    # (9..16 requests) then take the one-shot hop (all-reduce + block convolution + add + RMSNorm in
+    # one launch) instead of the built-in two-shot + convolution + fused add-RMSNorm (three
+    # launches), on a wide workspace of TEP8_MAX_ROWS rows (5 areas x 8 ranks x rows x 16 KiB).
+    "wide_drafter_hops": (
+        Param("TEP8_MAX_ROWS", 64, 64, 128),
+        # TP8 drafter forwards of at least this many rows on the fused hop's two-shot by column slice
+        # (the same statements as the one-shot hop: bit for bit), 9..128; 0 (default): none.
+        Param(
+            "TEP8_TWO_SHOT_MIN_ROWS",
+            0,
+            0,
+            128,
+            values=(0, *range(9, 129)),
+            default_for=_tep8_gen_wide_winner(25, 0),
+        ),
+        # The most rows of that two-shot (128: the whole band). At 65..128 rows it replaces the built-in
+        # two-shot + convolution + add-RMSNorm, which is faster there (vrg-zdf): 64 keeps those.
+        Param("TEP8_TWO_SHOT_MAX_ROWS", 128, 9, 128, default_for=_tep8_gen_wide_winner(64, 128)),
+    ),
+}
 
 
 def _drafter_kv_glue(d: Deployment, t: Resolving, p: Mapping[str, object]) -> Tuple[bool, str]:
@@ -890,6 +1064,24 @@ def _on_agg_tep4(what: str, min_rows: int = 0) -> RuleFn:
     return rule
 
 
+def _ctx_or_agg_tep4(what: str) -> RuleFn:
+    """A rule on for ``what`` on sm107 TEP4 context servers (the ``ctx`` role hint) and on
+    aggregated sm107 TEP4 servers (``_on_agg_tep4``), off elsewhere.
+
+    For the levers of a context step alone: a context server runs the same context steps an
+    aggregated server does, so its band does not decide them (they are in no band's selection).
+    A generation or unhinted disaggregated server runs none of them, or cannot tell, and stays off.
+    """
+    agg = _on_agg_tep4(what)
+
+    def rule(d: Deployment, t: Resolving, p: Mapping[str, object]) -> Tuple[bool, str]:
+        if d.tp == 4 and d.role is Role.CTX:
+            return True, f"{what} on sm107 tep4 context servers"
+        return agg(d, t, p)
+
+    return rule
+
+
 #: The accuracy gate of the lossless-numeric HC levers.
 _AGG_TEP4_GATE = Gate(_agg_sm107_tep4, _AGG_TEP4)
 
@@ -942,6 +1134,97 @@ def _decode_qkv_excluded(d: Deployment, t: Resolving) -> Optional[str]:
     if "qkv" not in t.param("context_fp8_dense", "PROJECTIONS"):
         return "it reads context_fp8_dense's QKV copies, which context_fp8_dense__PROJECTIONS leaves out"
     return None
+
+
+#: Why ``auto`` leaves the context-step reduce-scatter overlaps off
+#: (``kernels/context_sequence_parallel/overlap``): their knobs turn them on.
+_CTX_OVERLAP_UNMEASURED = "not yet measured on sm107: on only by its knob"
+
+
+def _ctx_tep4(d: Deployment) -> bool:
+    """Whether ``d`` is an sm107 TEP4 context server (the ``ctx`` role hint)."""
+    return d.tp == 4 and d.role is Role.CTX
+
+
+def _on_ctx_tep4(what: str, elsewhere: str) -> RuleFn:
+    """A rule on for ``what`` on sm107 TEP4 context servers (``_ctx_tep4``), off elsewhere
+    for ``elsewhere`` (a knob still turns it on there)."""
+
+    def rule(d: Deployment, t: Resolving, p: Mapping[str, object]) -> Tuple[bool, str]:
+        if _ctx_tep4(d):
+            return True, f"{what} on sm107 tep4 context servers"
+        return False, elsewhere
+
+    return rule
+
+
+def _fmk_context_fmha(d: Deployment, t: Resolving, p: Mapping[str, object]) -> Tuple[bool, str]:
+    """On sm107 TEP4 context servers (every pure context step, PURE_CONTEXT 1) and on
+    aggregated sm107 TEP4 servers (the context rows of mixed steps), off elsewhere."""
+    if _ctx_tep4(d):
+        return True, "the pure context steps of sm107 tep4 context servers"
+    return _on_agg_tep4("the context rows of mixed steps")(d, t, p)
+
+
+#: The accuracy gate ``fmk_context_fmha`` passed on pure context steps (PURE_CONTEXT 1): every
+#: prefill of a CONC=1 run is a pure context step.
+_CTX_TEP4_FMK_GATE = Gate(
+    _ctx_tep4,
+    "sm107 tep4 context servers, pure context steps (PURE_CONTEXT 1): GSM8K-long CONC=1 -0.08 pt, "
+    "natural AL ratio 0.9974",
+)
+
+#: The parts ``context_sp_extra_parts`` adds on a context server: ``shard_routing`` too (the
+#: context-step reduce-scatter overlap set, 'ovts'), and no ``ce_gather`` (int4): its
+#: copy-engine gathers run during every large context step, exactly while that server's KV
+#: blocks go to the generation servers, and they share the copy engines with the cache
+#: transceiver's NIXL writes (rhea D1 H4: with it off the slow KV-transfer class drops to
+#: IBPL's, 9.4 % of requests vs 28-34 %; the GB300 fix of the same contention). The gather of
+#: the attention input then runs as an all-gather, as on an aggregated server; bitwise.
+_CTX_TEP4_EXTRA_PARTS = ("shard_routing", "router_input")
+
+
+def _ctx_overlap_excluded(
+    projection: str, needs_router_input: bool = False
+) -> Callable[[Deployment, Resolving], Optional[str]]:
+    """The structural exclusions of a context-step reduce-scatter overlap that runs the
+    ``projection`` GEMM on row chunks: ``context_fp8_dense`` on that projection (its MXFP8 path
+    is chosen by a call's rows, and a chunk has fewer than the whole call), and, with
+    ``needs_router_input``, a step without the sequence-parallel router-input join (the tail
+    pipeline joins through it)."""
+
+    def excluded(d: Deployment, t: Resolving) -> Optional[str]:
+        if t.on("context_fp8_dense") and projection in t.param("context_fp8_dense", "PROJECTIONS"):
+            return (
+                f"context_fp8_dense picks the {projection} GEMM's MXFP8 path by a call's rows, and "
+                "the chunked calls have fewer rows than the whole call"
+            )
+        if needs_router_input and not (
+            t.on("context_sp_router_input")
+            or (
+                t.on("context_sp_extra_parts")
+                and "router_input" in t.param("context_sp_extra_parts", "PARTS")
+            )
+        ):
+            return (
+                "it joins through the sequence-parallel router-input join, which neither "
+                "context_sp_router_input nor context_sp_extra_parts__PARTS turns on"
+            )
+        return None
+
+    return excluded
+
+
+def _ctx_overlap_params() -> Tuple[Param, ...]:
+    """A chunked reduce-scatter overlap's chunks, its row floor and its stream priority."""
+    return (
+        # Row chunks per step (1: the unchunked call on the side stream, a control).
+        Param("CHUNKS", 2, 1, 4),
+        # The fewest rows of a sequence-parallel step it takes.
+        Param("MIN_ROWS", 8192, 1024, 1 << 20),
+        # 1: the side stream runs at the device's highest priority; 0: the default priority.
+        Param("HIGH_PRIORITY", 1, 0, 1),
+    )
 
 
 #: The deployments the single-request decode schedule of sm107 TEP8 was measured on.
@@ -1066,7 +1349,20 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
             "LL",
             Kind.BITWISE,
             _at_most("MAX_BATCH"),
-            params=(Param("MAX_BATCH", 8, 1, 64),),
+            params=(
+                Param("MAX_BATCH", 8, 1, 64, default_for=_tep8_gen_wide_winner(16, 8)),
+                # Alias only (kept for the round-3 / E2E envs): upstream #21789 stages a manager
+                # with attention-op pool groups (a paged drafter context) whenever the lever is on,
+                # so the value changes nothing. int5's gen-role default (1 on a TEP8 gen server of
+                # 9..16 requests over a paged drafter context) is kept for the record.
+                Param(
+                    "POOL_GROUPS",
+                    0,
+                    0,
+                    1,
+                    default_for=lambda d: int(_tep8_gen_wide(d) and d.arena is Arena.PAGED),
+                ),
+            ),
         ),
         "drafter_kv_side_chain": Rule(
             "LL",
@@ -1081,7 +1377,24 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
             "LL",
             Kind.BITWISE,
             _off_at_hc(_coop_fold),
-            params=(Param("MAX_ROWS", 16, 1, 128),),
+            params=(
+                Param("MAX_ROWS", 16, 1, 128),
+                # 1..4: the split sampler's top-p-only rows (calls of at most 128 rows) take the
+                # multi-CTA top-p test (head_sampler.TOPP_ROUNDS: that many test rounds spread
+                # over 8 CTAs per row, the rest in the row's CTA); the same tokens. 0: off.
+                Param("TOPP_ROUNDS", 0, 0, 4, default_for=_tep8_gen_wide_winner(2, 0)),
+                # 8..128: split_sampler decode steps of at least that many rows (to 128) skip the logits
+                # all-gather: the distributed sampler (head_sampler.ds_sample) samples the ranks' own LM-head
+                # shards, kernel B's tokens. 0: off. Not with vocab_parallel_head.
+                Param("DIST_MIN_ROWS", 0, 0, 128, default_for=_tep8_gen_wide_winner(16, 0)),
+                # 1: DIST_MIN_ROWS' sampler stages its shard as LL elements the peers pull with their flags (no
+                # system fence / ready flag) and sends 24-byte states (ds_sample's fabric variant); the same
+                # tokens. 0: the gated form.
+                Param("DIST_FABRIC", 0, 0, 1),
+                # 1: the verify fold after the sampler (ops.spec.dflash_verify_fold) runs one program per request
+                # instead of one program looping over them; the same outputs. 0: off.
+                Param("VERIFY_GRID", 0, 0, 1),
+            ),
         ),
         "head_multimem_gather": Rule(
             "LL",
@@ -1114,26 +1427,195 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
             _vocab_parallel_head,
             baseline=_never("the upstream sm107 compositions sample on the split sampler"),
             params=(
+                # Not raised with the LL levers at 9..16 requests: the X400 composite samples a TEP8
+                # generation server of max_batch_size 9..16 on the split sampler (the gated path;
+                # bs13-16 -0.12..-0.18 ms, bs8 -0.15 ms).
                 Param("MAX_BATCH", LL_MAX_BATCH, 1, 64),
                 Param("MIN_ROWS", 8, 8, 16),
             ),
             after=("distributed_head_sampler",),
             conflicts=("distributed_head_sampler",),
         ),
-        **{name: _tep4_path_rule() for name in SM107_TEP8_TEP4_PATHS},
+        **{
+            name: _tep4_path_rule(_TEP4_PATH_PARAMS.get(name, ())) for name in SM107_TEP8_TEP4_PATHS
+        },
         # The Vera Rubin low-latency levers.
         "splitk_pool_split8": _ll(Kind.NUMERIC),
         "splitk_frontier_tables": _ll(Kind.NUMERIC, yields_to=("wide_qkv_prefetch",)),
-        "tep8_wide64_splitk": _ll(Kind.NUMERIC),
-        "tep8_publish_splitk": _ll(Kind.NUMERIC),
-        "tep8_drafter_wide_gemms": _ll(Kind.NUMERIC),
-        "tep8_fc_shard_wide": _ll(Kind.NUMERIC),
+        "tep8_wide64_splitk": _ll(
+            Kind.NUMERIC,
+            # The fewest rows of a TP8 QKV / o_proj call on the wide64 tactics (33: the 5..8-request
+            # band; down to 9, the 2..4-request steps' calls leave the 9..32-row wide table).
+            params=(
+                Param("MIN_ROWS", 33, 9, 33),
+                # The most rows of a TP8 QKV call on the wide64 tactic (64: cuBLAS above); 65..MAX_ROWS
+                # (9..16 requests) in one launch of it, 64-row token tiles on the grid (each row's
+                # 1..64-row bits). o_proj keeps its 65..128-row paths (hop128 / cuBLAS).
+                Param("MAX_ROWS", 64, 64, 128, default_for=_tep8_gen_wide_winner(128, 64)),
+                # That launch's tile, output columns x rows: 64x64 (the served tactic as is, two token
+                # tiles, 288 CTAs), 128x64 (144 CTAs) or 64x128 (one token tile, 144 CTAs: each weight
+                # slab read once); stages lowered to fit; same split_k, same bits. 2cta: the 2-CTA
+                # split-K kernel (ops/gemm/splitk_gemm_2cta, 128x128 pair tiles, in-kernel K-slice
+                # reduction; split_k 4: the same bits).
+                Param(
+                    "WIDE_TILE",
+                    "64x64",
+                    choices=("64x64", "128x64", "64x128", "128x128", "2cta"),
+                    one=True,
+                    default_for=_tep8_gen_wide_winner("2cta", "64x64"),
+                ),
+                # That launch's split_k (0: the served tactic's, 4); 8 (reduce-scatter epilogue)
+                # changes every row's bits (numeric).
+                Param("WIDE_SPLIT_K", 0, 0, 8, values=(0, 4, 8)),
+                # 1: with WIDE_TILE 2cta, a multi-request decode step's QKV call runs the packed decode
+                # prep (q/k norm, RoPE, gate split, E4M3 query, FP8 K/V append, FMHA scales) in the
+                # 2-CTA kernel's epilogue (ops/gemm/splitk_gemm_2cta_prep): no prep launch, no
+                # GEMM -> prep edge; the same bytes. Needs multi_request_prep_append.
+                Param("PREP_FOLD", 0, 0, 1),
+            ),
+        ),
+        "tep8_publish_splitk": _ll(
+            Kind.NUMERIC,
+            params=(
+                # The most rows of a TP8 slice the split-K producer publishes; 65..MAX_ROWS in one
+                # launch of the 33..64-row tactics (each row keeps its one-request bits).
+                Param("MAX_ROWS", 64, 64, 128, default_for=_wide128(64)),
+                # The fewest rows of a decode step the publication takes (33: the cuBLAS census's
+                # floor). Below 33 only on the split-K producer: the 2..4-request steps then publish
+                # and join as 5..8-request steps do, instead of the 9..32-row gathers.
+                Param("MIN_ROWS", 33, 9, 33),
+                # The pool slice's tile in that one launch: 64x16 (the 33..64-row tactic: 256 CTAs
+                # at 128 rows, two waves) or 64x32 (128 CTAs, the slice read half as often; the
+                # census's certified unpool key); split_k 4 either way, so the same bits.
+                Param(
+                    "WIDE_POOL_TILE",
+                    "64x16",
+                    choices=("64x16", "64x32", "64x64"),
+                    one=True,
+                    default_for=_tep8_gen_wide_winner("64x64", "64x16"),
+                ),
+                # The unpool slice's tile there: 64x32 (the 33..64-row tactic: 256 CTAs at 128
+                # rows) or 64x64 (128 CTAs; refused with an ERROR until the census certifies its key).
+                Param(
+                    "WIDE_UNPOOL_TILE",
+                    "64x32",
+                    choices=("64x32", "64x64"),
+                    one=True,
+                    default_for=_tep8_gen_wide_winner("64x64", "64x32"),
+                ),
+                # The fewest rows of a slice on those two tiles (65: the whole one-launch band; 97:
+                # only where the served tiles' grid spills into a second wave of 212 SMs); fewer
+                # rows keep the served tile, the same bits.
+                Param("WIDE_TILE_MIN_ROWS", 65, 65, 128, default_for=_tep8_gen_wide_winner(97, 65)),
+            ),
+        ),
+        "tep8_drafter_wide_gemms": _ll(
+            Kind.NUMERIC,
+            params=(
+                # The most rows of a TP8 drafter GEMM on the fixed split-K tactics (64: cuBLAS
+                # above, nvjet + a splitKreduce launch on conv_coef / qkv, and gate_up at 96 rows);
+                # 65..MAX_ROWS (9..16 requests) in ONE launch of the site's 64-row tactic, 64-row
+                # token tiles on the grid (each row's one-request bits). Needs tep8_wide64_splitk.
+                Param("MAX_ROWS", 64, 64, 128),
+                # That launch's tile, output columns x rows: 64x128 (one token tile: as many CTAs
+                # as the 64-row launch, one wave at every site, each weight slab read once), 64x64
+                # (the 64-row tactic as is, same compiled kernel; two token tiles: the conv
+                # coefficient GEMM's 256 CTAs are two waves on 212 SMs) or 128x64; stages lowered
+                # to fit; same split_k, same bits.
+                Param("WIDE_TILE", "64x128", choices=("64x64", "128x64", "64x128"), one=True),
+                # The sites that take it (the rest keep cuBLAS above 64 rows): the ones whose
+                # cuBLAS kernel at 72..128 rows is split-K + a reduce launch (conv_coef, qkv).
+                # gate_up splits only at 96 rows (128x160 + reduce, 18 us; 14 us unsplit at 72 and
+                # 128); o_proj / down: cuBLAS at 72..128 rows is already the 64-row tactic's time.
+                Param(
+                    "SITES",
+                    ("conv_coef", "qkv"),
+                    choices=("conv_coef", "qkv", "o_proj", "down", "gate_up"),
+                ),
+                # The drafter window attention's tiles per split on calls of at least
+                # WINDOW_MIN_ROWS rows (1: the one-request geometry, 65 one-tile splits per
+                # request: 585..1040 programs and 65 merged partials per row at 9..16 requests).
+                # 2..4: fewer, longer splits (33 / 22 / 17). Numeric (split boundaries), drafter only.
+                Param("WINDOW_TILES", 1, 1, 4),
+                Param("WINDOW_MIN_ROWS", 65, 9, 128),
+                # The drafter's next GEMM weights asked of the L2 from a side stream while its
+                # non-HBM kernels run (kernels/drafter_l2_prefetch): 0 off; 1 o_proj + MLP conv
+                # coefficients behind the window attention; 2 also gate_up + down behind o_proj's
+                # hop; 3 also the next layer's conv coefficients + qkv behind the MLP's hop. Same
+                # bits (a prefetch reads no value). On block decodes of PREFETCH_MIN_ROWS+ rows.
+                Param("PREFETCH", 0, 0, 4),
+                Param("PREFETCH_MIN_ROWS", 1, 1, 128),
+                # The weights those forks ask for. Default without the MLP's gate_up / down (176 MB per
+                # rank against Rubin's 126 MiB L2: asking for them evicts what the next GEMMs read; W10
+                # prefetch chain on VR: all six +10..+22 us/step, these four -9..-11).
+                Param(
+                    "PREFETCH_WEIGHTS",
+                    ("o_proj", "conv_mlp", "conv_attn", "qkv"),
+                    choices=("o_proj", "conv_mlp", "gate_up", "down", "conv_attn", "qkv"),
+                ),
+                # 1: on block decodes without the fused drafter hop (65..128 rows), each hop's tail
+                # (finish convolution + the next norm's residual add + RMSNorm) in one launch
+                # (ops/spec/drafter_finish_norm: the fused hop's statements, bit for bit the two).
+                Param("FINISH_NORM", 0, 0, 1),
+                # 1: each layer's QK norm + RoPE folded into the window attention's split programs
+                # (dr3_folds' QF, without the drafter_attn_pdl copy): one launch less per layer.
+                # int7: no longer a 9..16-request default (vrg-zia / zca: QK fold costs step time in-model).
+                Param("QK_FOLD", 0, 0, 1),
+                # The PDL chain's conv entry trigger (releases the next fixed-tactic GEMM to stream its
+                # weight during the block convolution) on block widths up to this many rows (32: the
+                # measured 1..4 requests); silu / merge triggers keep their measured widths.
+                Param("PDL_CONV_MAX_ROWS", 32, 32, 128, default_for=_tep8_gen_wide_winner(64, 32)),
+                # The PDL chain's selector fork (the candidate selector's hidden_projection on a side
+                # stream under the draft LM-head GEMM) on draft heads of several requests too, every
+                # multiple of K = 7 rows up to this (7: the one-request head only, as measured). Same bits.
+                Param("SELECTOR_FORK_MAX_ROWS", 7, 7, 112),
+                # 1: the 16..64-row drafter split-K entries at deeper A/B pipelines (the split-K kernel's
+                # oversized shared memory: 8 / 10 stages at the 64x64 tiles instead of the opt-in's 5 / 7);
+                # the same tiles and K splits, so the same bits (fixed_low_m_gemm._TP8_DRAFTER_DEEP_STAGES).
+                Param("DEEP_STAGES", 0, 0, 1, default_for=_tep8_gen_wide_winner(1, 0)),
+                # 1: every drafter MLP's silu(gate) * up in its gate_up GEMM's epilogue on 8..64-row blocks
+                # (kernels/drafter_silu_fold; gate_up weights interleaved in place, the other rows on the
+                # interleaved activation kernel). Same bits. Needs drafter_pdl_chain.
+                Param("SILU_FOLD", 0, 0, 1),
+            ),
+        ),
+        "tep8_fc_shard_wide": _ll(
+            Kind.NUMERIC,
+            # The most rows the TP8 sharded drafter fc takes (its fabric gather holds 128).
+            params=(Param("MAX_ROWS", 64, 8, 128, default_for=_wide128(64)),),
+        ),
         "weight_prefetch_after_join": _ll(
             Kind.BITWISE, yields_to=("wide_qkv_prefetch", "layer0_qkv_table")
         ),
-        "next_qkv_prefetch_skip": _ll(Kind.BITWISE),
+        "next_qkv_prefetch_skip": _ll(
+            Kind.BITWISE,
+            params=(
+                Param("MAX_ROWS", 8, 8, 64),
+            ),  # the largest decode step (rows) that forks no next-QKV prefetch
+        ),
+        # int9 (USER approved 2026-11-11 06:00): the one-cluster block is the EXACT build only, an
+        # order-only change: the replaced ONE2 / split path's operations at each rounding point
+        # (ex2.approx.ftz.f32 / div.full.f32, fp32 sums, bf16 P / V, fp32 merge; gen lane G124: 8-rank
+        # gate, mean 0.377 vs 0.372 ulp vs fp64). ``auto`` runs it where the original ran (the default
+        # band's TEP8 gen steps of 2..8 requests, 2..11 at 9..16). The original f16 build (int7b: LOSSY)
+        # is gone: EXACT is fixed at 1, so no knob selects it.
         "swa_one_cluster_block": _ll(
-            Kind.NUMERIC, yields_to=("swa_blocks_per_program",), exclusive=True
+            Kind.NUMERIC,
+            yields_to=("swa_blocks_per_program",),
+            exclusive=True,
+            # The fewest and the most requests of a TEP8 step the one-cluster block takes (5..8:
+            # the ONE2 range it replaces; from 2, the split kernels' 2..4-request steps, and up to
+            # 16, each request's clusters as at 5..8 requests).
+            params=(
+                Param("TEP8_MIN_REQUESTS", 5, 2, 5, default_for=_tep8_gen_cl8_min_requests),
+                Param("TEP8_MAX_REQUESTS", 8, 8, 16, default_for=_tep8_gen_cl8_max_requests),
+                # From this many requests (0: none) a TEP8 step runs ONE 8-CTA cluster per request over
+                # both KV heads (swa_cl8w, the same bits): one wave up to 22 requests, where the
+                # per-(request, KV head) clusters need two from 12.
+                Param("TEP8_WIDE_MIN_REQUESTS", 0, 0, 16),
+                # Every CL8 build is the exact variant (int9: fixed at 1; the f16 build is not offered).
+                Param("EXACT", 1, 1, 1),
+            ),
         ),
         "swa_prep_split": _ll(Kind.BITWISE, yields_to=("swa_blocks_per_program",), exclusive=True),
         "swa_eight_requests": _ll(
@@ -1148,32 +1630,151 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
         ),
         "split_kv_deep_rings": _ll(Kind.BITWISE),
         "bf16_half_window": _ll(Kind.NUMERIC),
-        "prerouted_experts": _ll(Kind.BITWISE),
-        "tep8_ring_buddy_wide": _ll(Kind.NUMERIC),
+        "prerouted_experts": _ll(
+            Kind.BITWISE,
+            # The most rows of a TP8 two-window call on the prerouted tables (16-token tiles
+            # above 64 rows, the stock call's tile there).
+            params=(Param("TEP8_MAX_ROWS", 64, 64, 128, default_for=_wide128(64)),),
+        ),
+        "tep8_ring_buddy_wide": _ll(
+            Kind.NUMERIC,
+            params=(
+                # The most rows the TP8 ring-buddy placement takes (its one program covers 128).
+                Param("MAX_ROWS", 64, 9, 128, default_for=_wide128(64)),
+                # Warps of its table-writing program on the 1024-slot tile (65..128 rows).
+                Param("WIDE_WARPS", 8, 4, 32, values=(4, 8, 16, 32)),
+            ),
+        ),
         "tep8_ring_buddy_pdl": _ll(Kind.BITWISE),
-        "tep8_tile_placement": _ll(Kind.NUMERIC),
-        "tep8_router_push": _ll(Kind.NUMERIC),
+        "tep8_tile_placement": _ll(
+            Kind.NUMERIC,
+            params=(
+                Param("MIN_ROWS", 41, 9, 64),  # the fewest rows placed by tile cost
+                Param("MAX_ROWS", 64, 9, 128),  # the most rows placed by tile cost
+                # An expert's cost A + B * (tiles - 1), in 0.1 us (GB300's 20 and 11 by default).
+                Param("COST_A", 20, 1, 255),
+                Param("COST_B", 11, 0, 255),
+                # The two BF16 expert layers (0 and 61): their stacked call (no prerouted tables) placed
+                # by the same tile rule on its own costs, BF16_COST_A + BF16_COST_B * (tiles - 1) in
+                # 0.1 us over BF16_TILE-token tiles, in the same MIN_ROWS..MAX_ROWS band. 0 (default): the
+                # BF16 layers keep the count rule. (VR 8-rank nsys at bs12 / 16: max - median of FC1 + FC2
+                # 20 / 23 us a BF16 layer vs 3.1 / 3.7 on the NVFP4 layers.)
+                Param("BF16_COST_A", 0, 0, 255),
+                Param("BF16_COST_B", 0, 0, 255),
+                Param("BF16_TILE", 8, 8, 64, values=(8, 16, 32, 64)),
+            ),
+        ),
+        "tep8_router_push": _ll(
+            Kind.NUMERIC,
+            params=(
+                # The fewest rows the router push takes (kernel floor 9; 9 on a TEP8 generation
+                # server, ``TEP8_GEN_ROUTER_PUSH_MIN_ROWS``).
+                Param("MIN_ROWS", 33, 9, 64, default_for=_tep8_gen_router_push_min_rows),
+                # The most rows a push call runs 16-CTA clusters at (half the per-CTA K: same bits; 0 = none;
+                # at most step A v2's 64 rows).
+                Param("CL16_MAX_ROWS", 0, 0, 64),
+                # The most rows step A routes per row in every CTA (v2; above: the row-block leader, v1).
+                # (128 on a TEP8 generation server of 9..16 requests: the X400 composite, _wide128.)
+                Param("ROUTE_ROW_MAX", 64, 64, 128, default_for=_wide128(64)),
+                # v2's rows per CTA: 2 keeps half the push's CTAs (expert group 0's) through the poll.
+                Param("ROUTE_ROWS_PER_CTA", 1, 1, 2),
+                # 1: the ring-buddy placement + prerouted tables after the push run as one CUDA CTA
+                # (ring_buddy_cuda.rb_tables) that the routed push triggers right after its dependency wait.
+                Param("RB_CUDA", 0, 0, 1),
+            ),
+        ),
         "tep8_router_prewait": _ll(Kind.BITWISE),
         "finalize_entry_trigger": _ll(Kind.BITWISE),
-        "tep8_finalize_transport_64": _ll(Kind.BITWISE),
-        "hop_entry_trigger": _ll(Kind.BITWISE),
+        "tep8_finalize_transport_64": _ll(
+            Kind.BITWISE,
+            # The TP8 transport's token layout: its 17..TOKENS-token calls run the flat build.
+            params=(
+                Param("TOKENS", 64, 16, 128, values=(16, 32, 64, 128), default_for=_wide128(64)),
+                # 1: the row map read before the dependency wait and verified after it
+                # (finalize_allreduce_transport.Transport.prefetch; the same bits).
+                Param("INDEX_PREFETCH", 0, 0, 1),
+            ),
+        ),
+        "hop_entry_trigger": _ll(
+            Kind.BITWISE,
+            params=(
+                # 1: the decode input boundary (model_boundary) also releases its dependent,
+                # layer 0's QKV GEMM, at entry on steps of INPUT_BOUNDARY_MIN_ROWS (9) rows or
+                # more, so the GEMM streams its weight during the boundary as every later
+                # layer's QKV does behind its post-FFN join; 0 the exit trigger everywhere.
+                Param("INPUT_BOUNDARY", 0, 0, 1),
+            ),
+        ),
         "tep8_early_multicast_hop": _ll(Kind.BITWISE),
-        "tep8_direct_hop": _ll(Kind.BITWISE),
+        "tep8_direct_hop": _ll(
+            Kind.BITWISE,
+            params=(
+                # The direct hop's last row count: 128 also publishes the 65..128-row o_proj.
+                Param("MAX_ROWS", 64, 64, 128, values=(64, 128), default_for=_wide128(64)),
+                # How o_proj of a 65..128-row step publishes: two 64-row launches, or one
+                # launch of 64-row (grid) or 128-row (tile128) token tiles; split_k 1 in each.
+                Param("PRODUCER", "grid", choices=("chunks", "grid", "tile128"), one=True),
+                # The one-launch producer's stages (0: the mode's, grid 3 / tile128 4).
+                Param("PRODUCER_STAGES", 0, 0, 12),
+                # The direct hop's first row count (33: the 5..8-request band; down to 9, the
+                # 2..4-request steps' o_proj scatters on the served wide64 tactic too).
+                Param("MIN_ROWS", 33, 9, 33),
+                # The fewest rows of an armed step whose QKV call forks the L2 prefetch of the
+                # layer's o_proj weight (0: none; at most 32 rows the module's rule already forks).
+                Param("PREFETCH_MIN_ROWS", 0, 0, 128),
+                # 1: the direct consumer polls its slots before its dependency wait (same bits).
+                Param("POLL_FIRST", 0, 0, 1),
+            ),
+        ),
         "tep8_publish_join": _ll(Kind.BITWISE),
-        "tep8_pool_programmatic_fork": _ll(Kind.BITWISE),
+        "tep8_pool_programmatic_fork": _ll(
+            Kind.BITWISE,
+            # 1: the pool branch's norm + NVFP4 kernels (pool publication, pool gather) load the norm gain and the
+            # global scale before their dependency wait / poll (the same bits).
+            params=(Param("NORM_PREFETCH", 0, 0, 1, default_for=_tep8_gen_wide_winner(1, 0)),),
+        ),
         "tep8_wide_projection_gathers": _ll(Kind.NUMERIC),
-        "step_commit_v2": _ll(Kind.BITWISE, yields_to=("step_loop_inline_commits",)),
+        "step_commit_v2": _ll(
+            Kind.BITWISE,
+            yields_to=("step_loop_inline_commits",),
+            params=(
+                # The overlap scheduler's two input corrections of a captured decode graph as
+                # one launch (ops/runtime/overlap_offsets, step_loop_inline_commits' applier):
+                # 0 the two built-in adds, 1 one launch, 2 one launch that releases its
+                # programmatic dependent (the input boundary, which waits first) at entry.
+                Param("OVERLAP_FOLD", 0, 0, 2),
+                # 1: the step-input and sampler-store launches carry their descriptor table in
+                # the kernel parameter block when it fits (ops/runtime/step_commit_inline, as
+                # step_loop_inline_commits' commits); 0 the pinned-table kernel.
+                Param("INLINE_COMMIT", 0, 0, 1),
+            ),
+        ),
         "wide_norm_gate_pdl": _ll(Kind.BITWISE),
         "drafter_kv_glue": Rule(
             "LL",
             Kind.BITWISE,
             _drafter_kv_glue,
-            params=_ll_params(),
+            # Not in the 'wall' set the TEP8 9..16-request gate ran (the rulers emulate the
+            # generation role over a windowed arena, where it was off at max_batch_size 16): its
+            # default stays at 8 requests on every deployment.
+            params=(Param("MAX_BATCH", LL_MAX_BATCH, 1, 64),),
             after=("drafter_kv_side_chain", "context_kv_late_join"),
             conflicts=("drafter_kv_side_chain",),
         ),
         "drafter_kv_fork_before_head": _ll(
-            Kind.BITWISE, yields_to=("context_kv_late_join", "context_kv_fork_last_layer")
+            Kind.BITWISE,
+            yields_to=("context_kv_late_join", "context_kv_fork_last_layer"),
+            # PAGED_COMMIT: alias only (kept for the round-3 / E2E envs) of upstream #21789's
+            # paged_context_commit, the one-launch paged commit on the context-K/V fork; the value
+            # engages nothing of its own (drafter.py logs the mapping).
+            params=(
+                Param("PAGED_COMMIT", 0, 0, 1),
+                # 1: over a paged drafter context, the forked side chain's block-table decode, columns and
+                # positions in one launch and every layer's K / V into the pages in one
+                # (ops/spec/context_kv_store_paged) instead of ~45 built-in launches; the same GEMMs, norms, RoPE.
+                # 2: also its prep and the sharded fc GEMM right after the last capture layer (the early fork).
+                Param("PAGED_CHAIN", 0, 0, 2),
+            ),
         ),
         "context_sp_extra_parts": Rule(
             "LL",
@@ -1185,6 +1786,9 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
                     "PARTS",
                     ("router_input", "ce_gather"),
                     choices=("shard_routing", "router_input", "ce_gather"),
+                    default_for=lambda d: (
+                        _CTX_TEP4_EXTRA_PARTS if _ctx_tep4(d) else ("router_input", "ce_gather")
+                    ),
                 ),
             ),
         ),
@@ -1194,8 +1798,12 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
         "fmk_context_fmha": Rule(
             "HC",
             Kind.NUMERIC,
-            _on_agg_tep4("the context rows of mixed steps"),
-            gates=(_AGG_TEP4_GATE,),
+            _fmk_context_fmha,
+            gates=(_AGG_TEP4_GATE, _CTX_TEP4_FMK_GATE),
+            # 1: also every pure context step (ctx-only / prefill steps): the default on sm107
+            # TEP4 context servers (gated there, _CTX_TEP4_FMK_GATE); 0 elsewhere, where the
+            # accuracy gate covers mixed steps only.
+            params=(Param("PURE_CONTEXT", 0, 0, 1, default_for=lambda d: int(_ctx_tep4(d))),),
         ),
         "context_kv_late_join": Rule(
             "HC", Kind.BITWISE, _on_agg_tep4("windowed block decodes after a forked commit")
@@ -1230,17 +1838,51 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
         "context_prep_rows_vec": Rule(
             "HC",
             Kind.BITWISE,
-            _on_agg_tep4("context steps' prep on the vectorized rows kernel"),
+            _ctx_or_agg_tep4("context steps' prep on the vectorized rows kernel"),
         ),
         "context_embedding_replicated": Rule(
             "HC",
             Kind.BITWISE,
-            _on_agg_tep4("context steps' token embedding from the replicated table"),
+            _ctx_or_agg_tep4("context steps' token embedding from the replicated table"),
         ),
         "context_sp_router_input": Rule(
             "HC",
             Kind.BITWISE,
-            _on_agg_tep4("the router's FP32 input from the sequence-parallel residual join"),
+            _ctx_or_agg_tep4("the router's FP32 input from the sequence-parallel residual join"),
+        ),
+        # The context-step reduce-scatter overlaps: bitwise where the chunked BF16 GEMMs are
+        # row-split invariant and NCCL reduces a chunk as the whole buffer (both held on GB300;
+        # their sm107 GPU tests decide it), else lossless-numeric.
+        # The o_proj overlap and the tail pipeline ('ovts', bitwise on sm107) are on by default
+        # on sm107 TEP4 context servers; the experts' overlap is not measured yet.
+        "context_sp_oproj_overlap": Rule(
+            "HC",
+            Kind.BITWISE,
+            _on_ctx_tep4(
+                "the o_proj reduce-scatter behind its row chunks", _CTX_OVERLAP_UNMEASURED
+            ),
+            params=_ctx_overlap_params(),
+            after=("context_fp8_dense",),
+            excluded=_ctx_overlap_excluded("o_proj"),
+        ),
+        "context_sp_tail_pipeline": Rule(
+            "HC",
+            Kind.BITWISE,
+            _on_ctx_tep4(
+                "the attention-side join, pooler GEMM and quantization behind the later chunks' "
+                "reduce-scatter",
+                _CTX_OVERLAP_UNMEASURED,
+            ),
+            after=("context_fp8_dense", "context_sp_router_input", "context_sp_extra_parts"),
+            excluded=_ctx_overlap_excluded("pool", needs_router_input=True),
+        ),
+        "context_sp_moe_rs_overlap": Rule(
+            "HC",
+            Kind.BITWISE,
+            _never(_CTX_OVERLAP_UNMEASURED),
+            params=_ctx_overlap_params(),
+            after=("context_fp8_dense",),
+            excluded=_ctx_overlap_excluded("unpool"),
         ),
         "decode_qkv_mxfp8": Rule(
             "HC", Kind.LOSSY, _lossy, after=("context_fp8_dense",), excluded=_decode_qkv_excluded
@@ -1342,18 +1984,15 @@ BAND_LEVERS: Mapping[Band, FrozenSet[str]] = types.MappingProxyType(
     {
         Band.AGGREGATED_SM107: frozenset(
             {
-                # High-concurrency TEP4.
+                # High-concurrency TEP4 (``fmk_context_fmha`` is in neither selection: its rule
+                # serves aggregated TEP4 servers' mixed steps and context servers' pure steps).
                 "step_window_compact",
-                "fmk_context_fmha",
                 "context_kv_late_join",
                 "hop_cluster_split",
                 "drafter_fc_inbox_wide",
                 "l061_tile32_pin",
                 "router_staged_epilogue",
                 "split_kv_deep_ring",
-                "context_prep_rows_vec",
-                "context_embedding_replicated",
-                "context_sp_router_input",
                 "decode_qkv_mxfp8",
                 # 2..4-request TEP4 decode steps.
                 "swa_blocks_per_program",
@@ -1883,6 +2522,7 @@ def resolve(
             param.key: knobs.params.get((name, param.key), param.default_of(d))
             for param in (rule.params if rule is not None else ())
         }
+        t.pending = (name, params)
         decision = _decide(
             name, rule, mode, knobs.default, params, d, t, structural, depends_on, requires, needed
         )

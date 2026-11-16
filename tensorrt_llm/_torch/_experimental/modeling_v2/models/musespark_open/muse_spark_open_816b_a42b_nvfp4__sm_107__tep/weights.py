@@ -246,4 +246,15 @@ def install_embedding_features(
         from .kernels.boundary_early_release import triggers as _pdl_triggers
         from .kernels.model_boundary import boundary as _model_boundary
 
-        _model_boundary.install(text_model, _pdl_triggers.capture_layers(text_model), mapping)
+        asked = bool(int(plan.param("hop_entry_trigger", "INPUT_BOUNDARY") or 0))
+        entry = asked and plan.enabled("hop_entry_trigger")
+        if asked and not entry:
+            from tensorrt_llm.logger import logger
+
+            logger.error(
+                "[musespark_open] MUSESPARK_OPEN_LEVER_HOP_ENTRY_TRIGGER__INPUT_BOUNDARY is set, "
+                "but hop_entry_trigger is off: the input boundary keeps its exit trigger"
+            )
+        _model_boundary.install(
+            text_model, _pdl_triggers.capture_layers(text_model), mapping, entry_trigger=entry
+        )

@@ -29,6 +29,21 @@ What this module does:
   built-in chain.
 * ``ModelBoundary.armed`` arms layer 61's BF16 join for one decode forward and disarms it on
   any exit; prefill never arms it.
+
+Entry trigger (``hop_entry_trigger``'s ``INPUT_BOUNDARY``). With ``install(...,
+entry_trigger=True)`` the input boundary of a step of ``ENTRY_MIN_ROWS`` rows or more (the
+multi-request steps) triggers its dependent at entry instead of after its last store, so
+layer 0's QKV GEMM -- launched right behind it with programmatic dependent launch, as every
+later layer's QKV is launched behind its post-FFN join, which releases it early too -- streams
+its immutable weight while the boundary runs. Why that is safe: the input boundary reads
+nothing before its own ``griddepcontrol.wait`` and writes only its two fresh outputs after it;
+the QKV GEMM (the wide split-K or cuBLAS kernel these rows take at every layer) reads no
+activation before its own wait, which returns only once the whole boundary grid has completed
+and its stores are visible -- the same contract every later layer's QKV meets behind a join
+that triggers before its stores; nothing is launched between the boundary and layer 0's QKV
+on these rows. A dependent launches only once every boundary CTA has started, so no grid in
+flight waits on a later one. Values: the same kernels in the same order; only the boundary's
+``griddepcontrol.launch_dependents`` moves, so the step is bit-identical.
 """
 
 from __future__ import annotations
@@ -112,14 +127,26 @@ def _bf16_join_class(base: type) -> type:
     return cls
 
 
+#: The fewest rows of a step whose input boundary triggers at entry under ``entry_trigger``
+#: (the multi-request steps; the one-request schedule keeps its own layer-0 front).
+ENTRY_MIN_ROWS = 9
+
+
 class ModelBoundary:
     """What ``DecodeTarget`` holds under ``model_boundary`` (``core._model_boundary``)."""
 
-    def __init__(self, model) -> None:
+    def __init__(self, model, entry_trigger: bool = False) -> None:
         self.table = model.embed_tokens.__dict__[_replicated.TABLE_ATTR]
         self.embed_norm = model.embed_norm
         self.qkv_norm = model.layers[0].pre_qkv_proj_norm
         self.last_join = model.layers[-1].add_ffn
+        #: ``hop_entry_trigger``'s ``INPUT_BOUNDARY``: steps of ``ENTRY_MIN_ROWS`` rows or more
+        #: trigger at entry.
+        self.entry_trigger = entry_trigger
+
+    def trigger_for(self, rows: int) -> str:
+        """The trigger of a ``rows``-row input boundary."""
+        return "entry" if self.entry_trigger and rows >= ENTRY_MIN_ROWS else "exit"
 
     def takes(
         self, input_ids: Optional[torch.Tensor], inputs_embeds: Optional[torch.Tensor]
@@ -142,6 +169,7 @@ class ModelBoundary:
             self.embed_norm.variance_epsilon,
             self.qkv_norm.weight,
             self.qkv_norm.variance_epsilon,
+            trigger=self.trigger_for(int(input_ids.shape[0])),
         )
 
     @contextlib.contextmanager
@@ -199,26 +227,46 @@ def _check(model, captured: FrozenSet[int]) -> None:
         )
 
 
-def install(model, captured: FrozenSet[int], mapping=None) -> ModelBoundary:
-    """Build the input-boundary kernel and re-class layer 61's join (agreed over ``mapping``'s TP group)."""
+def install(
+    model, captured: FrozenSet[int], mapping=None, entry_trigger: bool = False
+) -> ModelBoundary:
+    """Build the input-boundary kernel and re-class layer 61's join (agreed over ``mapping``'s TP group).
+
+    ``entry_trigger`` (``hop_entry_trigger``'s ``INPUT_BOUNDARY``): also build the entry-trigger
+    variant (agreed likewise: a failure raises on every rank) and use it on steps of
+    ``ENTRY_MIN_ROWS`` rows or more.
+    """
     reason = None
     try:
         _check(model, captured)
         # Compile now, with the step's id dtype (int32), so a compile failure is agreed here.
         _input._compile(_input.HIDDEN, _input.EXIT, "int32", torch.cuda.current_device())
+        if entry_trigger:
+            _input._compile(_input.HIDDEN, _input.ENTRY, "int32", torch.cuda.current_device())
     except Exception as error:  # noqa: BLE001 - every failure must reach the agreement
         reason = str(error)
+        if entry_trigger:
+            reason = (
+                "MUSESPARK_OPEN_LEVER_HOP_ENTRY_TRIGGER__INPUT_BOUNDARY=1: model_boundary: "
+                + reason
+            )
     reason = _tp_agreement.agreed_refusal(mapping, reason)
     if reason is not None:
         raise ValueError(reason)
     join = model.layers[-1].add_ffn
     join.__class__ = _bf16_join_class(type(join))
     join._bf16_out = False
-    boundary = ModelBoundary(model)
+    boundary = ModelBoundary(model, entry_trigger=entry_trigger)
     model._model_boundary = boundary
+    entry_note = (
+        f"; input boundary of {ENTRY_MIN_ROWS}+ rows triggers layer 0's QKV at entry "
+        "(MUSESPARK_OPEN_LEVER_HOP_ENTRY_TRIGGER__INPUT_BOUNDARY=1)"
+        if entry_trigger
+        else ""
+    )
     logger.info_once(
         "[musespark_open] model_boundary: decode input boundary in one launch, layer "
-        f"{len(model.layers) - 1} join stores BF16",
+        f"{len(model.layers) - 1} join stores BF16{entry_note}",
         key="musespark_open_model_boundary",
     )
     return boundary

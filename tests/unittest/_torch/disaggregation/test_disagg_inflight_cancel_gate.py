@@ -297,7 +297,7 @@ def test_context_transfer_error_keeps_request_active_until_all_owners_release():
     effects.terminate_request.assert_not_called()
 
 
-def test_user_cancel_waits_for_context_transfer_owners(monkeypatch):
+def test_user_cancel_waits_for_context_transfer_owners(monkeypatch: pytest.MonkeyPatch) -> None:
     request = SimpleNamespace(
         state=LlmRequestState.DISAGG_TRANS_ERROR,
         py_request_id=7,
@@ -308,6 +308,7 @@ def test_user_cancel_waits_for_context_transfer_owners(monkeypatch):
         finish_by_reason=Mock(),
     )
     executor = object.__new__(PyExecutor)
+    executor.enable_attention_dp = False
     executor.active_requests = [request]
     executor.canceled_req_ids = [request.py_request_id]
     executor.waiting_queue = Mock()

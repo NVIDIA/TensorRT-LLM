@@ -1,0 +1,338 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""The sm_107 (Vera Rubin) defaults of this target's fast-path switches.
+
+Each switch below started as an opt-in environment variable while its fast path was measured on Vera Rubin. On
+sm_107 the target now defaults each one to the value the measurements settled on (the AgentX
+configuration: TEP4 decode at batch 1-3 and TEP8 decode at batch 8, with TEP4 context workers). Setting the variable
+still wins, including to ``""`` or ``"0"`` to turn a switch off. On every other device each switch keeps the
+default its reader passes, which is the pre-existing behaviour.
+
+The switches are read through ``env``, at import or install as before, so every rank decides alike (one device
+type per deployment).
+"""
+
+from __future__ import annotations
+
+import functools
+import os
+from typing import Optional
+
+#: Switch -> value on sm_107 when the environment does not set it.
+SM107_DEFAULTS = {
+    # Dense GEMMs (flashinfer-style split-K kernel and its dispatcher tables).
+    "MUSESPARK_OPEN_SPLITK_MAILBOX_V4": "1",  # conflict-free split-K mailbox, same bits
+    "MUSESPARK_OPEN_SPLITK_RS": "1",  # reduce-scatter split-K epilogue, same bits
+    "MUSESPARK_OPEN_SPLITK_RS_ONLY": "8",  # ... only for split-K 8 calls (the pool GEMMs)
+    "MUSESPARK_OPEN_SPLITK_OVERSIZED_SMEM": "1",  # deeper split-K stages in oversized shared memory, same bits
+    "MUSESPARK_OPEN_POOL_SPLITK8": "1",  # TEP4 pool GEMM at split-K 8
+    "MUSESPARK_OPEN_TEP4_WIDE_GEMMS": (
+        '{"qkv":[[16,"splitk:64,16,2,16"],[32,"splitk:64,32,2,13"]],'
+        '"o_proj":[[16,"splitk:64,16,1,13"],[32,"splitk:64,32,1,13"]],'
+        '"pool":[[16,"splitk:64,16,8,10"],[32,"splitk:64,32,8,9"]]}'
+    ),
+    "MUSESPARK_OPEN_TEP4_NARROW_GEMMS": (
+        '{"qkv":[[1,"direct:256,2"],[2,"direct:64,4"],[3,"direct:32,2"],[8,"splitk:64,8,2,18"]],'
+        '"o_proj":[[2,"direct:128,4"],[8,"splitk:64,8,1,14"]],'
+        '"pool":[[1,"direct:256,2"],[6,"direct:128,2"],[8,"splitk:64,8,4,14"]]}'
+    ),
+    "MUSESPARK_OPEN_TEP8_WIDE64_SPLITK": "1",  # TP8 33..64-row QKV / o_proj on split-K
+    "MUSESPARK_OPEN_TEP8_WIDE64_KERNELS": '{"qkv": "splitk:64,64,4,8"}',
+    "MUSESPARK_OPEN_TEP8_PUBLISH_SPLITK": "1",  # TP8 pool / unpool slice publication from split-K
+    "MUSESPARK_OPEN_TEP8_DRAFTER_WIDE_GEMMS": "1",  # TP8 drafter projections on split-K above 8 rows
+    "MUSESPARK_OPEN_PREFETCH_JOIN": "after",
+    "MUSESPARK_OPEN_DROP_WEIGHT_PREFETCH": "qkv",
+    "MUSESPARK_OPEN_NEXT_QKV_PREFETCH_SKIP_ROWS": "8",
+    # Attention.
+    "MUSESPARK_OPEN_SWA_CL8": "all",  # TEP4 one-launch SWA block
+    "MUSESPARK_OPEN_TEP8_SWA_CL8": "1",  # TEP8 one-launch SWA block at 5..8 requests
+    "MUSESPARK_OPEN_SWA_PREP_SPLIT": "1",
+    "MUSESPARK_OPEN_SWA_ONE2": "1",
+    "MUSESPARK_OPEN_FA_PREP_FOLD_MULTI": "1",  # full-attention prep folded for 2..4 sequences
+    "MUSESPARK_OPEN_FA_STAGES": "20",  # full-attention split-KV TMA ring depth
+    "MUSESPARK_OPEN_MR_STAGES": "20",  # multi-request split-KV TMA ring depth
+    # MoE.
+    "MUSESPARK_OPEN_BF16_HALF_WINDOW": "1",
+    "MUSESPARK_OPEN_PREROUTED_META": "1",  # TEP4 prerouted experts (trtllm::fp4_block_scale_moe_prerouted)
+    "MUSESPARK_OPEN_TEP8_PREROUTED": "1",  # TEP8 prerouted experts (trtllm::fp4_block_scale_moe_prerouted)
+    "MUSESPARK_OPEN_ROUTER_ROWS_TILING": "16:1:2,24:2:2,32:2:2",
+    "MUSESPARK_OPEN_TEP8_RING_BUDDY_MAX_ROWS": "64",
+    "MUSESPARK_OPEN_TEP8_RB_PDL": "1",
+    "MUSESPARK_OPEN_TEP8_TILE_PLACEMENT": "1",
+    "MUSESPARK_OPEN_TEP8_TILE_PLACEMENT_MIN_ROWS": "41",
+    "MUSESPARK_OPEN_TEP8_ROUTER_PREWAIT": "1",
+    "MUSESPARK_OPEN_TEP8_ROUTER_PUSH": "1",
+    "MUSESPARK_OPEN_TEP8_ROUTER_PUSH_MIN_ROWS": "33",
+    "MUSESPARK_OPEN_TEP8_ROUTER_PUSH_ROUTE": "1",
+    "MUSESPARK_OPEN_TEP8_POOL_PROGRAMMATIC_FORK": "1",
+    "MUSESPARK_OPEN_TEP8_WIDE_POOL_GATHER": "1",
+    "MUSESPARK_OPEN_TEP8_WIDE_UNPOOL_GATHER": "1",
+    "MUSESPARK_OPEN_TEP8_FC_SHARD_WIDE": "1",
+    "MUSESPARK_OPEN_TEP8_FC_GATHER_PROGRAMS": "128",
+    # Communication and step glue.
+    "MUSESPARK_OPEN_FINALIZE_TRIGGER": "entry",
+    "MUSESPARK_OPEN_TEP8_FINALIZE_TRANSPORT_TOKENS": "64",
+    "MUSESPARK_OPEN_HOP_ENTRY_TRIGGER": "1",
+    "MUSESPARK_OPEN_TEP8_HOP_DIRECT": "1",
+    "MUSESPARK_OPEN_TEP8_HOP_EARLY": "1",
+    "MUSESPARK_OPEN_TEP8_HOP_MULTICAST": "1",
+    "MUSESPARK_OPEN_TEP8_HOP_PAD_ROWS": "9-40",
+    "MUSESPARK_OPEN_TEP8_HOP_R2": "w",
+    "MUSESPARK_OPEN_TEP8_HOP_R2_MIN_ROWS": "41",
+    "MUSESPARK_OPEN_TEP8_HOP_SMEM_PAD": "177408",
+    "MUSESPARK_OPEN_TEP8_JOIN_PDL": "1",
+    "MUSESPARK_OPEN_PUBLISH_JOIN_CLUSTER": "1",
+    "MUSESPARK_OPEN_NORM_GATE_PDL_MAX_ROWS": "128",
+    "MUSESPARK_OPEN_STEP_COMMIT_V2": "1",
+    "MUSESPARK_OPEN_CTX_KV_GLUE": "1",
+    "MUSESPARK_OPEN_CTX_KV_FORK_EARLY": "1",
+    "MUSESPARK_OPEN_VP_MIN_ROWS": "8",
+    # K2's wide opt-ins (TRTLLM_MUSESPARK_TEP_WIDE_{DIRECT,ROUTER_ROWS,OPROJ_PUBLISH}) are not listed: on this
+    # base they are the levers wide_direct_transports / wide_router_per_row / wide_oproj_publish
+    # (MUSESPARK_OPEN_LEVER_WIDE_*), and levers.RETIRED raises on the old names.
+    # Context workers.
+    "MUSESPARK_OPEN_FC_SHARD_PREWARM": "1",  # create the drafter fc's BLAS handles at install
+    "MUSESPARK_OPEN_SP_SM107_PARTS": "ce_gather,router_input",
+}
+
+
+#: Opt-in, off by default: ``MUSESPARK_OPEN_SM103_TEP8_F11=1`` serves the sm_107 TEP8 fast path (F11) on sm_103
+#: (GB300): the ``(103, 8)`` composition becomes ``modeling._SM103_TEP8_F11_TARGET`` and the switches of
+#: ``SM103_TEP8_DEFAULTS`` default on. Set it on TEP8 decode workers only: the defaults are process-wide (read at
+#: import, before the TP size is known), and the TEP4 composition ``(103, 4)`` is unchanged by it. Unset, sm_103
+#: behaves exactly as before; sm_107 never reads it.
+SM103_TEP8_F11_ENV = "MUSESPARK_OPEN_SM103_TEP8_F11"
+
+#: Switch -> value on sm_103 under ``MUSESPARK_OPEN_SM103_TEP8_F11=1`` when the environment does not set it: the
+#: TEP8 entries of ``SM107_DEFAULTS`` plus the step glue they build on, with these sm_103 limits (GB300: 160 SMs,
+#: 232448 B of opt-in shared memory per CTA, no oversized shared memory):
+#:
+#: * no ``SPLITK_OVERSIZED_SMEM`` and no ``TEP8_WIDE64_KERNELS`` override: the module's own wide64 QKV tactic
+#:   ``splitk:64,64,4,5`` fits the opt-in, F11's 8-stage QKV does not (245760 B); the stage count changes no bits
+#:   (``ops/gemm/splitk_gemm``), QKV keeps sm_103's 8-row ``split_k`` 4;
+#: * wide64 on QKV and o_proj (the module's sites, which the direct hop needs): sm_103's 8-row o_proj cell
+#:   is cuBLAS, and o_proj's split_k-1 wide64 tactic gives its bits row by row on GB300
+#:   (``dense_gemms.TEP8_WIDE64_CUBLAS_CELLS``);
+#: * the drafter's wide split-K tactics are sm_103's own (``fixed_low_m_gemm.SM103_TP8_DRAFTER_WIDE_TACTICS``);
+#: * no TEP4-only switch (``SWA_CL8=all``, ``TEP4_*``, ``PREROUTED_META``, ``POOL_SPLITK8``, ``ROUTER_ROWS_TILING``,
+#:   ``FA_STAGES``, ``MR_STAGES``: sm_103 already runs 20 multi-request stages), no context switch. The shared
+#:   attention switches F11's TEP8 shapes need (``SWA_ONE2``, ``SWA_PREP_SPLIT``, ``FA_PREP_FOLD_MULTI``) and
+#:   ``BF16_HALF_WINDOW`` are carried; they act on a TEP4 process too, which is why the switch is for TEP8 workers.
+SM103_TEP8_DEFAULTS = {
+    # Dense GEMMs.
+    "MUSESPARK_OPEN_SPLITK_MAILBOX_V4": "1",  # conflict-free split-K mailbox, same bits
+    "MUSESPARK_OPEN_TEP8_WIDE64_SPLITK": "1",  # TP8 33..64-row QKV / o_proj on split-K (module tactics fit sm_103)
+    "MUSESPARK_OPEN_TEP8_PUBLISH_SPLITK": "1",
+    "MUSESPARK_OPEN_TEP8_DRAFTER_WIDE_GEMMS": "1",
+    "MUSESPARK_OPEN_PREFETCH_JOIN": "after",
+    "MUSESPARK_OPEN_DROP_WEIGHT_PREFETCH": "qkv",
+    "MUSESPARK_OPEN_NEXT_QKV_PREFETCH_SKIP_ROWS": "8",
+    # Attention (SWA_ONE2 / SWA_PREP_SPLIT / FA_PREP_FOLD_MULTI also serve TEP8 shapes: ONE2 takes 5..8 requests at 2
+    # KV heads and CL8-TEP8 replaces it there; the fold takes 2..4 requests).
+    "MUSESPARK_OPEN_TEP8_SWA_CL8": "1",  # TEP8 one-launch SWA block at 5..8 requests (~180 KB smem, fits)
+    "MUSESPARK_OPEN_SWA_PREP_SPLIT": "1",
+    "MUSESPARK_OPEN_SWA_ONE2": "1",
+    "MUSESPARK_OPEN_FA_PREP_FOLD_MULTI": "1",
+    # MoE.
+    "MUSESPARK_OPEN_BF16_HALF_WINDOW": "1",  # BF16 layers 0 / 61 on the TEP8 ring-buddy window (flagged numeric)
+    "MUSESPARK_OPEN_TEP8_PREROUTED": "1",
+    "MUSESPARK_OPEN_TEP8_RING_BUDDY_MAX_ROWS": "64",
+    "MUSESPARK_OPEN_TEP8_RB_PDL": "1",
+    "MUSESPARK_OPEN_TEP8_TILE_PLACEMENT": "1",
+    "MUSESPARK_OPEN_TEP8_TILE_PLACEMENT_MIN_ROWS": "41",
+    "MUSESPARK_OPEN_TEP8_ROUTER_PREWAIT": "1",
+    "MUSESPARK_OPEN_TEP8_ROUTER_PUSH": "1",
+    "MUSESPARK_OPEN_TEP8_ROUTER_PUSH_MIN_ROWS": "33",
+    "MUSESPARK_OPEN_TEP8_ROUTER_PUSH_ROUTE": "1",
+    "MUSESPARK_OPEN_TEP8_POOL_PROGRAMMATIC_FORK": "1",
+    "MUSESPARK_OPEN_TEP8_WIDE_POOL_GATHER": "1",
+    "MUSESPARK_OPEN_TEP8_WIDE_UNPOOL_GATHER": "1",
+    "MUSESPARK_OPEN_TEP8_FC_SHARD_WIDE": "1",
+    "MUSESPARK_OPEN_TEP8_FC_GATHER_PROGRAMS": "128",
+    # Communication and step glue.
+    "MUSESPARK_OPEN_FINALIZE_TRIGGER": "entry",
+    "MUSESPARK_OPEN_TEP8_FINALIZE_TRANSPORT_TOKENS": "64",
+    "MUSESPARK_OPEN_HOP_ENTRY_TRIGGER": "1",
+    "MUSESPARK_OPEN_TEP8_HOP_DIRECT": "1",
+    "MUSESPARK_OPEN_TEP8_HOP_EARLY": "1",
+    "MUSESPARK_OPEN_TEP8_HOP_MULTICAST": "1",
+    "MUSESPARK_OPEN_TEP8_HOP_PAD_ROWS": "9-40",
+    "MUSESPARK_OPEN_TEP8_HOP_R2": "w",
+    "MUSESPARK_OPEN_TEP8_HOP_R2_MIN_ROWS": "41",
+    "MUSESPARK_OPEN_TEP8_HOP_SMEM_PAD": "177408",  # + the hop's own smem stays under 232448 B; tuned on VR
+    "MUSESPARK_OPEN_TEP8_JOIN_PDL": "1",
+    "MUSESPARK_OPEN_PUBLISH_JOIN_CLUSTER": "1",
+    "MUSESPARK_OPEN_NORM_GATE_PDL_MAX_ROWS": "128",
+    "MUSESPARK_OPEN_STEP_COMMIT_V2": "1",
+    "MUSESPARK_OPEN_CTX_KV_GLUE": "1",
+    "MUSESPARK_OPEN_CTX_KV_FORK_EARLY": "1",
+    "MUSESPARK_OPEN_VP_MIN_ROWS": "8",
+}
+
+
+@functools.lru_cache(maxsize=1)
+def _capability() -> Optional[tuple]:
+    """This process's CUDA device capability (None without CUDA)."""
+    try:
+        import torch
+
+        return tuple(torch.cuda.get_device_capability()) if torch.cuda.is_available() else None
+    except Exception:  # noqa: BLE001 - no device, no defaults
+        return None
+
+
+def on_sm107() -> bool:
+    """Whether this process's CUDA device is sm_107 (False without CUDA)."""
+    return _capability() == (10, 7)
+
+
+def sm103_tep8_f11() -> bool:
+    """Whether ``MUSESPARK_OPEN_SM103_TEP8_F11=1`` asks for the F11 TEP8 path on sm_103 (the environment only)."""
+    return os.environ.get(SM103_TEP8_F11_ENV, "") == "1"
+
+
+def on_sm103_tep8_f11() -> bool:
+    """Whether this process runs on sm_103 with ``MUSESPARK_OPEN_SM103_TEP8_F11=1``."""
+    return sm103_tep8_f11() and _capability() == (10, 3)
+
+
+#: ``MUSESPARK_OPEN_SM103_TEP8_WIDE_GEMMS`` (default off, in no defaults table) serves ``wide_dense_gemms`` -- the
+#: 9..32-row dense projections (decode steps of 2..4 requests at K = 7) on flashinfer's split-K with the ``split_k`` of
+#: the site's 8-row cell -- on sm_103 TEP8 under the F11 switch, for the sites it names: a comma list of qkv, o_proj,
+#: pool, unpool, or ``1`` for qkv,pool,unpool (the sites whose sm103 8-row cell is split-K). Without it those rows run
+#: cuBLAS (nvjet split-K + a separate splitKreduce, and no weight load before the dependency wait). Read from the
+#: environment only (``modeling`` decides the composition at import).
+SM103_TEP8_WIDE_GEMMS_ENV = "MUSESPARK_OPEN_SM103_TEP8_WIDE_GEMMS"
+SM103_TEP8_WIDE_GEMMS_DEFAULT_SITES = ("qkv", "pool", "unpool")
+_WIDE_GEMM_SITES = ("qkv", "o_proj", "pool", "unpool")
+
+
+def sm103_tep8_wide_gemm_sites() -> frozenset:
+    """The sites ``MUSESPARK_OPEN_SM103_TEP8_WIDE_GEMMS`` names (empty when unset, ``0`` or the F11 switch is off)."""
+    value = os.environ.get(SM103_TEP8_WIDE_GEMMS_ENV, "").strip()
+    if not sm103_tep8_f11() or value in ("", "0"):
+        return frozenset()
+    sites = (
+        SM103_TEP8_WIDE_GEMMS_DEFAULT_SITES
+        if value == "1"
+        else tuple(v.strip() for v in value.split(",") if v.strip())
+    )
+    unknown = sorted(set(sites) - set(_WIDE_GEMM_SITES))
+    if unknown:
+        raise ValueError(
+            f"{SM103_TEP8_WIDE_GEMMS_ENV}={value!r}: unknown sites {unknown} (of {_WIDE_GEMM_SITES})"
+        )
+    return frozenset(sites)
+
+
+#: Unpool-fuse: ``MUSESPARK_OPEN_SM103_TEP8_UNPOOL_DIRECT_WIDE=1`` (default off, in no defaults table) gives
+#: sm_103 TEP8 under the F11 switch the wide (32-row) layout of ``unpool_into_boundary``'s direct transport, which
+#: otherwise is TP4 only: a captured decode step of 16, 24 or 32 rows (2..4 requests at K = 7) has each layer's unpool
+#: GEMM store its ``[rows, 1024]`` slice straight into every rank's copy of a multicast slot, and the post-FFN boundary
+#: only polls and computes (``ops/comm/unpool_direct_boundary``), instead of reloading the slice and publishing it to
+#: its seven peers through the tagged wide inbox. Same bits as the gather boundary on the same
+#: slices: the GEMM is the one the step runs anyway -- cuBLAS today (its product is copied into the slot), or with
+#: ``MUSESPARK_OPEN_SM103_TEP8_WIDE_GEMMS`` naming ``unpool`` flashinfer's split-K, whose epilogue stores the slot.
+#: Needs ``MUSESPARK_OPEN_TEP8_WIDE_UNPOOL_GATHER`` (on in ``SM103_TEP8_DEFAULTS``). Read from the environment only.
+SM103_TEP8_UNPOOL_DIRECT_WIDE_ENV = "MUSESPARK_OPEN_SM103_TEP8_UNPOOL_DIRECT_WIDE"
+
+
+def sm103_tep8_unpool_direct_wide() -> bool:
+    """Whether ``MUSESPARK_OPEN_SM103_TEP8_UNPOOL_DIRECT_WIDE=1`` asks for the TP8 wide direct unpool transport
+    (only with the F11 switch on; the environment only)."""
+    if not sm103_tep8_f11():
+        return False
+    value = os.environ.get(SM103_TEP8_UNPOOL_DIRECT_WIDE_ENV, "").strip()
+    if value not in ("", "0", "1"):
+        raise ValueError(f"{SM103_TEP8_UNPOOL_DIRECT_WIDE_ENV}={value!r}: expected 0 or 1")
+    return value == "1"
+
+
+#: hop128: ``MUSESPARK_OPEN_SM103_TEP8_HOP_DIRECT128=1`` (default off, in no defaults table) extends the TEP8 direct
+#: post-attention hop (the direct hop: o_proj's split-K scatter epilogue + the direct consumer) from 33..64 to
+#: 33..128 rows (decode steps of 5..16 requests at K = 7) on sm_103 under the F11 switch. Rows 65..128 run o_proj as
+#: 64-row split_k-1 chunks of the same scatter kernel (each element one full-K FP32 accumulation, rounded once: the bits
+#: of the cuBLAS GEMM the built-in runs there, device-checked) into a 128-row workspace (16 slots per source), and the
+#: consumer sums the eight partials in rank order, as the two-shot hop it replaces. Read from the environment only.
+SM103_TEP8_HOP_DIRECT128_ENV = "MUSESPARK_OPEN_SM103_TEP8_HOP_DIRECT128"
+
+
+def sm103_tep8_hop_direct128() -> bool:
+    """Whether ``MUSESPARK_OPEN_SM103_TEP8_HOP_DIRECT128=1`` asks for the 65..128-row direct hop (only with the F11
+    switch on; the environment only)."""
+    if not sm103_tep8_f11():
+        return False
+    value = os.environ.get(SM103_TEP8_HOP_DIRECT128_ENV, "").strip()
+    if value not in ("", "0", "1"):
+        raise ValueError(f"{SM103_TEP8_HOP_DIRECT128_ENV}={value!r}: expected 0 or 1")
+    return value == "1"
+
+
+#: hop128 producer: ``MUSESPARK_OPEN_SM103_TEP8_HOP128_PRODUCER`` (with ``..._HOP_DIRECT128=1``; default
+#: ``chunks``, in no defaults table) picks how o_proj of a 65..128-row armed step publishes into the direct workspace:
+#:   * ``chunks``: the two 64-row launches of the served scatter kernel, one after the other (PDL-chained);
+#:   * ``grid[:S]``: one launch over the whole call, a 64-row token tile per ``blockIdx.y`` (each tile's slots offset by
+#:     its first token), ``S`` stages (default 3: two CTAs per SM, so both token tiles' 2 x 128 CTAs are resident);
+#:   * ``tile128[:S]``: one launch of 128-token tiles (one CTA per 64 features streams the weight once), ``S`` stages
+#:     (default 4).
+#: Every mode is split_k 1 (one full-K FP32 accumulation in K order, rounded once: the per-element bits do not depend
+#: on the tile width, the row count or the stage count), so all three store the same bits; only the launch differs.
+SM103_TEP8_HOP128_PRODUCER_ENV = "MUSESPARK_OPEN_SM103_TEP8_HOP128_PRODUCER"
+_HOP128_PRODUCER_STAGES = {"chunks": 7, "grid": 3, "tile128": 4}
+
+
+def sm103_tep8_hop128_producer() -> tuple:
+    """``(mode, ab_stages)`` of ``MUSESPARK_OPEN_SM103_TEP8_HOP128_PRODUCER`` (``chunks`` when unset; the environment
+    only). ``chunks`` keeps the served tactic's stages."""
+    value = os.environ.get(SM103_TEP8_HOP128_PRODUCER_ENV, "").strip() or "chunks"
+    mode, _, stages = value.partition(":")
+    if mode not in _HOP128_PRODUCER_STAGES or (
+        stages and (mode == "chunks" or not stages.isdigit() or not 1 <= int(stages) <= 12)
+    ):
+        raise ValueError(
+            f"{SM103_TEP8_HOP128_PRODUCER_ENV}={value!r}: expected chunks, grid[:S] or tile128[:S]"
+        )
+    return mode, int(stages) if stages else _HOP128_PRODUCER_STAGES[mode]
+
+
+#: hop256: ``MUSESPARK_OPEN_SM103_TEP8_HOP_DIRECT_MAX_ROWS`` (128 when unset, or 256; with ``..._HOP_DIRECT128=1``,
+#: in no defaults table) is the last row count of the direct hop. 256 extends it to the decode steps of 17..32 requests
+#: at K = 7 (129..256 rows), which otherwise run cuBLAS o_proj + the two-shot hop: a 256-row workspace (32 slots per
+#: source), o_proj on the same split_k-1 scatter kernel (``grid`` / ``tile128``: one launch of 3..4 token tiles;
+#: ``chunks``: 64-row launches), the consumer summing the eight partials in rank order. Same per-element arithmetic as
+#: at 65..128 rows (one full-K FP32 accumulation, rounded once); bitwise vs the cuBLAS o_proj it replaces is
+#: device-gated.
+SM103_TEP8_HOP_DIRECT_MAX_ROWS_ENV = "MUSESPARK_OPEN_SM103_TEP8_HOP_DIRECT_MAX_ROWS"
+
+
+def sm103_tep8_hop_direct_max_rows() -> int:
+    """The direct hop's last row count with ``..._HOP_DIRECT128=1``: 128 (unset) or 256 (the environment only)."""
+    value = os.environ.get(SM103_TEP8_HOP_DIRECT_MAX_ROWS_ENV, "").strip() or "128"
+    if value not in ("128", "256"):
+        raise ValueError(f"{SM103_TEP8_HOP_DIRECT_MAX_ROWS_ENV}={value!r}: expected 128 or 256")
+    return int(value)
+
+
+def env(name: str, default: Optional[str] = None) -> Optional[str]:
+    """``os.environ.get(name, default)``, except that an unset switch reads ``SM107_DEFAULTS[name]`` on sm_107 and
+    ``SM103_TEP8_DEFAULTS[name]`` on sm_103 under ``MUSESPARK_OPEN_SM103_TEP8_F11=1``."""
+    value = os.environ.get(name)
+    if value is not None:
+        return value
+    if name in SM107_DEFAULTS and on_sm107():
+        return SM107_DEFAULTS[name]
+    if name in SM103_TEP8_DEFAULTS and on_sm103_tep8_f11():
+        return SM103_TEP8_DEFAULTS[name]
+    return default

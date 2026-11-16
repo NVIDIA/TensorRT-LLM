@@ -16,7 +16,8 @@ off this is flashinfer's kernel:
 * ``mailbox_v4``: the conflict-free mailbox layout, same bits.
 * ``rs_split_k``: the reduce-scatter epilogue at the listed split-K sizes, same bits; with it on,
   split_k 8 is served too.
-* ``wide64``: 64-wide kernel-N tiles and up to 64 public rows.
+* ``wide64``: 64-wide kernel-N tiles and up to 64 public rows (65..128 in one launch, also on
+  128-wide tiles, through ``run_splitk_dense_tiles``).
 * ``oversized_smem``: the device's oversized shared memory, where the driver reports it, for
   deeper pipelines.
 
@@ -316,7 +317,9 @@ def validate_tactic(
         smem_capacity = _SMEM_CAPACITY_BYTES
     if tactic.mma_m not in _SUPPORTED_MMA_M:
         raise ValueError(f"unsupported mma_m={tactic.mma_m}")
-    if tactic.mma_n not in _SUPPORTED_MMA_N and not (tactic.mma_n == 64 and _wide64_enabled()):
+    if tactic.mma_n not in _SUPPORTED_MMA_N and not (
+        tactic.mma_n in _WIDE64_MMA_N and _wide64_enabled()
+    ):
         raise ValueError(f"unsupported mma_n={tactic.mma_n}")
     if tactic.split_k not in _SUPPORTED_SPLIT_K and not (
         tactic.split_k in _RS_ONLY_SPLIT_K and _rs_env()
@@ -1305,6 +1308,9 @@ def _rs_for(split_k: int) -> bool:
 #: 32-way bank conflict. A row's bits depend only on ``split_k`` (the K slices and their order),
 #: not on the tile widths or the row count.
 _WIDE64_MAX_M = 64
+#: The kernel-N tiles ``wide64`` adds: 64, and 128 for ``run_splitk_dense_tiles``'s one-token-tile
+#: launch of 65..128 rows (validation only; same kernel code, a row's bits still its split_k's).
+_WIDE64_MMA_N = (64, 128)
 
 
 def _wide64_enabled() -> bool:
@@ -1348,6 +1354,46 @@ def run_splitk_dense(
         compiled(*cute_tensors[:4], stream)
     else:
         compiled(*cute_tensors[:3], stream)
+    return out
+
+
+#: The most public rows ``run_splitk_dense_tiles`` takes in one launch (two 64-row token tiles of a
+#: 64-wide tactic: 9..16 requests at K = 7).
+WIDE64_TILES_MAX_M = 2 * _WIDE64_MAX_M
+
+
+def run_splitk_dense_tiles(a, b, out, pdl: bool, tactic: SplitKTactic):
+    """Bias-free ``run_splitk_dense`` of ``_WIDE64_MAX_M`` + 1..``WIDE64_TILES_MAX_M`` public rows in
+    ONE launch, compiled exactly as the tactic's ``_WIDE64_MAX_M``-row launch
+    (``_launch_options(_WIDE64_MAX_M, split_k)``: the same compiled kernel and ``producer_key``). The
+    tactic is validated at ``_WIDE64_MAX_M`` rows (tile, K partition, shared memory); the kernel tiles
+    any M itself (grid y = ceil(M / mma_n) token tiles x split_k; the last tile's missing rows are
+    TMA zero fill and are not stored). split_k fixes every element's bits (its K slices and their
+    cluster-rank reduction order), not the tile widths or the row count, so each row is what a call
+    of at most ``_WIDE64_MAX_M`` rows at the same split_k gives it. Needs ``wide64``.
+
+    Raises:
+        ValueError: without ``wide64``, for a row count outside the band, or for a tactic the
+            ``_WIDE64_MAX_M``-row call refuses.
+    """
+    m, n, k = _validate_runtime_tensors(a, b, None, out)
+    if not _wide64_enabled():
+        raise ValueError("run_splitk_dense_tiles needs the split-K kernel's wide64 (configure)")
+    if not _WIDE64_MAX_M < m <= WIDE64_TILES_MAX_M:
+        raise ValueError(
+            f"run_splitk_dense_tiles takes {_WIDE64_MAX_M + 1}..{WIDE64_TILES_MAX_M} rows, got {m}"
+        )
+    validate_tactic(tactic, _WIDE64_MAX_M, n, k)
+    cute_tensors = _to_cute_swap(a, b, out, None)
+    compiled = _get_compiled_splitk_kernel(
+        dtype=a.dtype,
+        tactic=tactic,
+        use_pdl=pdl,
+        has_bias=False,
+        leading_dims=cute_tensors[4],
+        **_launch_options(_WIDE64_MAX_M, tactic.split_k),
+    )
+    compiled(*cute_tensors[:3], _cuda.CUstream(_torch.cuda.current_stream(a.device).cuda_stream))
     return out
 
 

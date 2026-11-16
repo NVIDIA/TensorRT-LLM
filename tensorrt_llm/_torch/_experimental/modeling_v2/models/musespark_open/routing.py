@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# ruff: noqa: E501
 """Where a MuseSparkOpenOmniForCausalLM config lands. Read this file and you know.
 
 ``route`` is one forward-reading decision on three facts: the GPU, the model
@@ -90,6 +91,33 @@ def _tep(m: Any) -> bool:
     )
 
 
+#: GB300 TEP8 F11 (``muse_spark_open_816b_a42b_nvfp4__sm_103__tep8``): opt-in, the same switch the served GB300
+#: TEP8 images read (``sm107_defaults.SM103_TEP8_F11_ENV`` there).
+_SM103_TEP8_F11_ENV = "MUSESPARK_OPEN_SM103_TEP8_F11"
+
+
+def _sm103_tep8_f11(m: Any) -> bool:
+    """sm103 TEP8 under ``MUSESPARK_OPEN_SM103_TEP8_F11=1``: the GB300 F11 target (the TEP8 levers,
+    their ``MUSESPARK_OPEN_SM103_TEP8_*`` / ``MUSESPARK_OPEN_TEP8_*`` switches read as they were served).
+    Unset: the sm103 TEP target as upstream."""
+    import os
+
+    return int(m.tp_size) == 8 and os.environ.get(_SM103_TEP8_F11_ENV, "") == "1"
+
+
+def apply_deployment_defaults(
+    pretrained_config: Any, mapping: Any, compute_capability: Tuple[int, int], facts: Any
+) -> None:
+    """Before ``route``: the GB300 kernel switches this deployment runs unless its environment
+    sets them (``deployment_defaults``). Only for the configuration ``route`` serves on sm103."""
+    shape = tuple(getattr(pretrained_config, name, None) for name in _SHAPE_FIELDS)
+    if shape != _SHAPE or not _tep(mapping) or tuple(compute_capability) != _SM103:
+        return
+    from . import deployment_defaults
+
+    deployment_defaults.apply(compute_capability, mapping, facts)
+
+
 def route(
     pretrained_config: Any,
     mapping: Any,
@@ -130,6 +158,14 @@ def route(
     # routed targets off `from .<target>.modeling import <Class>` lines, so the imports
     # cannot be wrapped to fit the line limit.
     if capability == _SM103:
+        if _sm103_tep8_f11(mapping):
+            # fmt: off
+            # isort: off
+            from .muse_spark_open_816b_a42b_nvfp4__sm_103__tep8.modeling import ModelingV2MuseSparkOpen816bA42bNvfp4Sm103Tep8
+            # isort: on
+            # fmt: on
+            return ModelingV2MuseSparkOpen816bA42bNvfp4Sm103Tep8
+
         # fmt: off
         # isort: off
         from .muse_spark_open_816b_a42b_nvfp4__sm_103__tep.modeling import ModelingV2MuseSparkOpen816bA42bNvfp4Sm103Tep

@@ -170,9 +170,9 @@ def _restate_pool_block(
 ) -> None:
     """Restate `pool` as the client config at `path` leaves it.
 
-    `pool`, `local_hostname`, `run_dir` and `master_timeout` describe how to
-    reach the pool and where this run's files go, not what the server joins it
-    as, so they stay as they are.
+    `pool`, `local_hostname`, `device_name`, `run_dir` and `master_timeout`
+    describe how to reach the pool and where this run's files go, not what the
+    server joins it as, so they stay as they are.
     """
     # Each asked-for value is compared in the config's own terms, a role as its
     # string and a size as a byte count, so resolving a segment_size of "16GiB"

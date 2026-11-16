@@ -303,6 +303,61 @@ def test_overlapped_projection_uneven_rows_and_stream_reuse(
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("chunks", [1, 2, 3, 4, 8])
+@pytest.mark.parametrize("graph", [False, True])
+@torch.no_grad()
+def test_overlapped_projection_chunks_bitwise(chunks: int, graph: bool) -> None:
+    """MUSESPARK_OPEN_OVERLAP_SP_PROJECTION_{CHUNKS,GRAPH}: any chunk count, eager or replayed
+    from a CUDA graph, returns the unchunked projection's reduce-scatter bit for bit."""
+    if mpi_world_size() != 4:
+        pytest.skip("Requires four MPI ranks")
+    rank = mpi_rank()
+    torch.cuda.set_device(rank)
+    module = MuseSparkOpenAttention.__new__(MuseSparkOpenAttention)
+    nn.Module.__init__(module)
+    module.mapping = Mapping(world_size=4, rank=rank, tp_size=4, moe_ep_size=4)
+    module._sp_projection_stream = torch.cuda.Stream()
+    module._sp_projection_chunks = chunks
+    torch.manual_seed(911 + rank)
+    module.o_proj = Linear(
+        8192,
+        8192,
+        bias=False,
+        dtype=torch.bfloat16,
+        mapping=module.mapping,
+        tensor_parallel_mode=TensorParallelMode.ROW,
+        allreduce_strategy=AllReduceStrategy.NCCL,
+    ).cuda()
+    module.o_proj.weight.copy_(torch.randn_like(module.o_proj.weight) / 32)
+    for tokens in (8192, 8193, 16384):
+        inputs = torch.randn(tokens, 2048, device="cuda", dtype=torch.bfloat16)
+        partial = module.o_proj(inputs, all_reduce_params=AllReduceParams(enable_allreduce=False))
+        expected = reducescatter(_pad_sequence_parallel_tokens(partial, 4), module.mapping, dim=0)
+        if not graph:
+            actual = module._overlap_sp_output_projection(inputs)
+        else:
+            static = inputs.clone()
+            # Warm up on a side stream as torch.cuda.graph users do, then capture.
+            warm = torch.cuda.Stream()
+            warm.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(warm):
+                module._overlap_sp_output_projection(static)
+            torch.cuda.current_stream().wait_stream(warm)
+            torch.cuda.synchronize()
+            cuda_graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(cuda_graph):
+                captured = module._overlap_sp_output_projection(static)
+            static.copy_(torch.randn_like(static))
+            cuda_graph.replay()
+            static.copy_(inputs)
+            cuda_graph.replay()
+            torch.cuda.synchronize()
+            actual = captured
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert actual.shape == ((tokens + 3) // 4, 8192)
+
+
 def test_dense_projection_callback_stays_out_of_backend_arguments() -> None:
     module = Attention.__new__(Attention)
     nn.Module.__init__(module)

@@ -24,6 +24,7 @@ the built-in stores.
 
 from __future__ import annotations
 
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -32,6 +33,7 @@ import triton.language as tl
 
 from tensorrt_llm._torch.models import modeling_musespark_open as _builtin
 from tensorrt_llm._torch.models.modeling_musespark_open import MuseSparkOpenGatedResidual
+from tensorrt_llm.logger import logger
 
 #: Rows at or below which the built-in join may take its cluster boundary kernel instead
 #: of the Triton one; a sequence-parallel shard always has more.
@@ -93,6 +95,76 @@ def _join_with_router_input_kernel(
     tl.store(router_ptr + base, rounded.to(tl.float32), mask=mask)
 
 
+@triton.jit
+def _join_with_router_input_rows_kernel(
+    out_ptr,
+    residual_ptr,
+    branch_ptr,
+    gain_ptr,
+    alpha_ptr,
+    beta_ptr,
+    eps,
+    next_out_ptr,
+    next_weight_ptr,
+    next_eps,
+    router_ptr,
+    num_tokens,
+    HIDDEN: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    HAS_GAIN: tl.constexpr,
+    NORM_FP32_RESIDUAL: tl.constexpr,
+    ROWS: tl.constexpr = 2,
+):
+    """``_join_with_router_input_kernel`` with ROWS tokens per program (bitwise; see the FFN-side join's
+    ``_gated_residual_rows_kernel``): per-feature vectors loaded once, the next token's rows prefetched."""
+    offs = tl.arange(0, BLOCK_H)
+    mask = offs < HIDDEN
+    if HAS_GAIN:
+        gain = tl.load(gain_ptr + offs, mask=mask, other=0.0, eviction_policy="evict_last").to(
+            tl.float32
+        )
+    alpha = tl.load(alpha_ptr + offs, mask=mask, other=0.0, eviction_policy="evict_last")
+    beta = tl.load(beta_ptr + offs, mask=mask, other=0.0, eviction_policy="evict_last")
+    next_weight = tl.load(
+        next_weight_ptr + offs, mask=mask, other=0.0, eviction_policy="evict_last"
+    ).to(tl.float32)
+    t0 = tl.program_id(0) * ROWS
+    m0 = mask & (t0 < num_tokens)
+    base0 = t0.to(tl.int64) * HIDDEN + offs
+    branch = tl.load(branch_ptr + base0, mask=m0, other=0.0)
+    residual_raw = tl.load(residual_ptr + base0, mask=m0, other=0.0)
+    for r in tl.static_range(ROWS):
+        token = t0 + r
+        mrow = mask & (token < num_tokens)
+        base = token.to(tl.int64) * HIDDEN + offs
+        if r + 1 < ROWS:
+            # Prefetch the next token's rows while this one is reduced.
+            mnext = mask & (token + 1 < num_tokens)
+            nbranch = tl.load(branch_ptr + base + HIDDEN, mask=mnext, other=0.0)
+            nresidual = tl.load(residual_ptr + base + HIDDEN, mask=mnext, other=0.0)
+        scaled = branch.to(tl.float32)
+        if HAS_GAIN:
+            scaled = (scaled * gain).to(branch.dtype).to(tl.float32)
+        variance = tl.sum(scaled * scaled, axis=0) / HIDDEN
+        normed = (scaled * tl.rsqrt(variance + eps)).to(branch.dtype).to(tl.float32)
+        residual = residual_raw.to(tl.float32)
+        updated = alpha * residual + beta * normed
+        tl.store(out_ptr + base, updated, mask=mrow)
+        if NORM_FP32_RESIDUAL:
+            next_input = updated
+        else:
+            next_input = updated.to(branch.dtype).to(tl.float32)
+        next_variance = tl.sum(next_input * next_input, axis=0) / HIDDEN
+        next_output = next_input * tl.rsqrt(next_variance + next_eps)
+        next_output = next_output * (next_weight + 1.0)
+        rounded = next_output.to(next_out_ptr.dtype.element_ty)
+        tl.store(next_out_ptr + base, rounded, mask=mrow)
+        tl.store(router_ptr + base, rounded.to(tl.float32), mask=mrow)
+        if r + 1 < ROWS:
+            branch = nbranch
+            residual_raw = nresidual
+
+
 def join_with_router_input(
     join: MuseSparkOpenGatedResidual,
     residual: torch.Tensor,
@@ -100,8 +172,13 @@ def join_with_router_input(
     eps: float,
     next_norm,
     gain: Optional[torch.Tensor] = None,
+    out: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     """``(updated, next_input, next_input.float())`` from one launch, or None.
+
+    ``out``: contiguous ``(updated, next_input, router_input)`` buffers of the call's
+    shape to write instead of fresh ones (row slices of whole-shard buffers; the kernel
+    is one program per row, so a slice's rows are the whole-shard call's bit for bit).
 
     None wherever the built-in ``_add_after_rmsnorm_and_norm`` would not launch its
     Triton kernel with this call's operands (its unfused or cluster-boundary arms); the
@@ -125,10 +202,45 @@ def join_with_router_input(
     ):
         return None
     alpha, beta = join.coefficients()
-    updated = torch.empty_like(residual)
-    next_input = torch.empty_like(branch)
-    router_input = torch.empty_like(residual)
+    if out is None:
+        updated = torch.empty_like(residual)
+        next_input = torch.empty_like(branch)
+        router_input = torch.empty_like(residual)
+    else:
+        updated, next_input, router_input = out
+        if not (
+            updated.shape == residual.shape
+            and router_input.shape == residual.shape
+            and next_input.shape == branch.shape
+            and updated.is_contiguous()
+            and next_input.is_contiguous()
+            and router_input.is_contiguous()
+        ):
+            return None
     hidden_size = residual.shape[-1]
+    if _builtin._CTX_FUSIONS and residual.shape[0] > _builtin._JOIN_MIN_ROWS:
+        rows = _builtin._JOIN_ROWS
+        _join_with_router_input_rows_kernel[(triton.cdiv(residual.shape[0], rows),)](
+            updated,
+            residual,
+            branch,
+            gain if gain is not None else alpha,
+            alpha,
+            beta,
+            eps,
+            next_input,
+            next_norm.weight,
+            next_norm.variance_epsilon,
+            router_input,
+            residual.shape[0],
+            HIDDEN=hidden_size,
+            BLOCK_H=triton.next_power_of_2(hidden_size),
+            HAS_GAIN=gain is not None,
+            NORM_FP32_RESIDUAL=join._preqkv_norm_fp32,
+            ROWS=rows,
+            num_warps=_builtin._RESIDUAL_NUM_WARPS,
+        )
+        return updated, next_input, router_input
     _join_with_router_input_kernel[(residual.shape[0],)](
         updated,
         residual,
@@ -148,6 +260,94 @@ def join_with_router_input(
         num_warps=_builtin._RESIDUAL_NUM_WARPS,
     )
     return updated, next_input, router_input
+
+
+def tail_pipeline(layer, residual: torch.Tensor, split) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The attention-side join and the MoE input preparation, chunk by chunk (``MUSESPARK_OPEN_SP_TAIL_PIPELINE``).
+
+    ``split`` is the overlapped output projection's ``SplitProjection``: chunk ``c``
+    holds rows ``[lo, hi)`` of this rank's shard, reduced on the projection stream. For
+    each chunk in turn, after its reduce-scatter's event, the main stream runs the join
+    (``join_with_router_input`` into row slices of whole-shard buffers) and the pooler
+    GEMM + pre-expert NVFP4 quantization on its BF16 rows, while the later chunks are
+    still being reduced. The NVFP4 payload and scales are concatenated and handed to the
+    layer's MoE (``moe.sp_pre``) with the join's FP32 rows (``moe.sp_router_input``);
+    its sequence-parallel arm runs the router GEMM on the whole shard, routes and gathers
+    as before.
+
+    Numerics: bitwise. The join and the quantization are per row; the pooler GEMM (BF16,
+    8192 -> 4096) is row-split invariant on sm103 (raw bits equal for 1024/1024, 512/1536,
+    1023/1025 splits of a 2048-row shard);
+    the router GEMM (FP32/TF32) is not, so it is not split.
+    """
+    from tensorrt_llm._torch.utils import Fp4QuantizedTensor
+
+    moe = layer.feed_forward
+    join = layer.add_attn
+    eps = layer.post_attn_norm.variance_epsilon
+    next_norm = layer.pre_ffn_norm
+    main = torch.cuda.current_stream()
+    hidden = residual.shape[1]
+    updated = torch.empty_like(residual)
+    next_input = torch.empty(
+        (residual.shape[0], hidden), dtype=split.results[0].dtype, device=residual.device
+    )
+    router_input = torch.empty_like(residual)
+    payload, scales = [], []
+    for (lo, hi), reduced, event in split.chunks():
+        main.wait_event(event)
+        rows = slice(lo, hi)
+        joined = join_with_router_input(
+            join,
+            residual[rows],
+            reduced,
+            eps,
+            next_norm,
+            None,
+            out=(updated[rows], next_input[rows], router_input[rows]),
+        )
+        if joined is None:
+            raise RuntimeError(
+                "[musespark_open] MUSESPARK_OPEN_SP_TAIL_PIPELINE: the attention-side join of a "
+                "chunk would not run its fused kernel"
+            )
+        chunk_in = next_input[rows]
+        prepared = moe.prepare_expert_input(moe.pooler(chunk_in))
+        if isinstance(prepared, Fp4QuantizedTensor):
+            if prepared.is_sf_swizzled:
+                raise RuntimeError(
+                    "[musespark_open] MUSESPARK_OPEN_SP_TAIL_PIPELINE: the pre-expert quantization of "
+                    "a chunk returned swizzled scales"
+                )
+            payload.append(prepared.fp4_tensor)
+            scales.append(prepared.scaling_factor)
+        else:
+            # BF16 expert layers (and any layer the fused quantization declines): the
+            # pre-expert norm output, per row, gathered in BF16 by the MoE as before.
+            payload.append(prepared)
+            scales.append(None)
+    if any(sc is None for sc in scales) and not all(sc is None for sc in scales):
+        raise RuntimeError(
+            "[musespark_open] MUSESPARK_OPEN_SP_TAIL_PIPELINE: the chunks of one shard were "
+            "prepared in different formats"
+        )
+    split.release(main)
+    # The router GEMM is not row-split invariant (FP32/TF32 accumulation differs between
+    # row counts on sm103), so it runs once on the whole shard, in the MoE as before, from
+    # the join's FP32 rows.
+    moe.sp_router_input = (next_input, router_input)
+    cat = lambda parts: torch.cat(parts, 0) if len(parts) > 1 else parts[0]  # noqa: E731
+    if scales[0] is None:
+        prepared = cat(payload)
+    else:
+        prepared = Fp4QuantizedTensor(cat(payload), cat(scales), is_sf_swizzled=False)
+    moe.sp_pre = (next_input, None, prepared)
+    logger.info_once(
+        f"[musespark_open] MUSESPARK_OPEN_SP_TAIL_PIPELINE: attention-side join and pooled NVFP4 "
+        f"expert input prepared in {len(payload)} chunks behind the output projection's reduce-scatters",
+        key="musespark_open.sp_tail_pipeline",
+    )
+    return updated, next_input
 
 
 class SequenceParallelStep:
@@ -223,4 +423,6 @@ def install(model, step: SequenceParallelStep) -> int:
         # ``_sp_moe = None`` first, and the module tree would hold the MoE twice.
         object.__setattr__(join, "_sp_step", step)
         object.__setattr__(join, "_sp_moe", layer.feed_forward)
+        if os.getenv("MUSESPARK_OPEN_SP_TAIL_PIPELINE", "0") == "1":
+            layer._sp_tail_pipeline = tail_pipeline
     return changed

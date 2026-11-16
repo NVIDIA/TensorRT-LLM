@@ -112,6 +112,42 @@ ROWS = 8
 #: K = 7, at most the fixed GEMM's ``MAX_M`` of 32 rows. A width is taken when the
 #: drafter's tactic table covers every successor at it (``entry_rows``).
 ENTRY_ROW_CANDIDATES = (8, 16, 24, 32)
+#: ``conv_max_rows`` (``configure``; ``tep8_drafter_wide_gemms__PDL_CONV_MAX_ROWS``): the conv trigger's block widths
+#: also run past 32 rows, every multiple of 8 up to this (40..64: 5..8 requests on the wide64 drafter tactics; 72..128
+#: with MAX_ROWS 128 and every site in SITES), still only where every successor has a fixed tactic (``entry_rows``).
+#: The silu and merge triggers keep their measured widths. 32 (default): the measured candidates.
+CONV_MAX_ROWS = 32
+
+
+def configure(*, conv_max_rows: int = 32, selector_max_rows: int = 7) -> None:
+    """Set ``CONV_MAX_ROWS`` (32..128, a multiple of 8) and ``SELECTOR_MAX_ROWS`` (7..112);
+    ``lever_settings.apply`` sets them before any install.
+
+    Raises:
+        ValueError: outside the band; nothing is set then.
+    """
+    global CONV_MAX_ROWS, SELECTOR_MAX_ROWS
+    rows = int(conv_max_rows)
+    if not (32 <= rows <= 128 and rows % ROWS == 0):
+        raise ValueError(
+            "[musespark_open] drafter_pdl_chain: conv_max_rows must be a multiple of 8 in 32..128 "
+            f"(tep8_drafter_wide_gemms__PDL_CONV_MAX_ROWS), got {conv_max_rows}"
+        )
+    selector = int(selector_max_rows)
+    if not HEAD_ROWS <= selector <= SELECTOR_LIMIT:
+        raise ValueError(
+            f"[musespark_open] drafter_pdl_chain: selector_max_rows must be in {HEAD_ROWS}..{SELECTOR_LIMIT} "
+            f"(tep8_drafter_wide_gemms__SELECTOR_FORK_MAX_ROWS), got {selector_max_rows}"
+        )
+    CONV_MAX_ROWS, SELECTOR_MAX_ROWS = rows, selector
+
+
+def conv_candidates() -> tuple:
+    """``ENTRY_ROW_CANDIDATES`` and the multiples of 8 past them up to ``CONV_MAX_ROWS``."""
+    return ENTRY_ROW_CANDIDATES + tuple(
+        range(ENTRY_ROW_CANDIDATES[-1] + ROWS, CONV_MAX_ROWS + 1, ROWS)
+    )
+
 
 #: The compute capability the trigger widths below are measured on (sm107).
 TRIGGER_CAPABILITY = (10, 7)
@@ -141,8 +177,19 @@ def trigger_rows(rows: frozenset, capability: Optional[tuple] = None) -> frozens
 
 
 #: The draft head's rows for that request: its K = 7 draft slots. ``selector_fork``
-#: forks the selector projection only for this many rows.
+#: forks the selector projection for this many rows (and, with ``SELECTOR_MAX_ROWS``, its multiples).
 HEAD_ROWS = ROWS - 1
+#: ``selector_max_rows`` (``configure``; ``tep8_drafter_wide_gemms__SELECTOR_FORK_MAX_ROWS``): ``selector_fork``
+#: also forks for the draft-head rows of several requests, every multiple of ``HEAD_ROWS`` up to this
+#: (14..112: 2..16 requests at K = 7; the worker's gathered draft rows, one contiguous tensor the selector
+#: projects as is). 7 (default): the one-request rows only, as measured.
+SELECTOR_MAX_ROWS = HEAD_ROWS
+SELECTOR_LIMIT = 16 * HEAD_ROWS
+
+
+def selector_forks(rows: int) -> bool:
+    """Whether ``selector_fork`` forks the projection of ``rows`` draft-head rows."""
+    return rows == HEAD_ROWS or (rows > 0 and rows % HEAD_ROWS == 0 and rows <= SELECTOR_MAX_ROWS)
 
 
 # --------------------------------------------------------------------------
@@ -206,7 +253,7 @@ def entry_rows(draft_model: nn.Module) -> frozenset:
     silu triggers (``qkv_proj``, ``gate_up_proj``, ``o_proj``, ``down_proj`` of every layer)
     has a fixed tactic. A function of the drafter's shapes and TP table: rank-uniform."""
     rows = []
-    for width in ENTRY_ROW_CANDIDATES:
+    for width in conv_candidates():
         if all(
             _fixed_tactic_reason(linear, width, "") is None
             for layer in draft_model.model.layers
@@ -249,6 +296,15 @@ class EntryTriggerGatedMLP(GatedMLP):
         lora_params: Optional[dict] = None,
         **kwargs,
     ):
+        # tep8_drafter_wide_gemms__SILU_FOLD (``kernels/drafter_silu_fold``): the 8..64-row activation in the
+        # gate_up GEMM's epilogue, the other rows on the interleaved activation.
+        wide_fold = self.__dict__.get("_silu_fold")
+        if wide_fold is not None:
+            from ..drafter_silu_fold import fold as _silu_fold
+
+            return _silu_fold.folded_forward(
+                self, wide_fold, x, final_all_reduce_params, lora_params
+            )
         # The silu fold (``kernels/dr3_folds``, ``drafter_folds``): gate_up's weight rows are
         # interleaved and the 8-row activation runs in the gate_up GEMV's epilogue.
         tactic = self.__dict__.get("_dr3_sf")
@@ -379,6 +435,8 @@ class SelectorFork:
         self.stream = dedicated_stream()
         self.launches = 0
         self.taken = 0
+        #: A multi-request fork was not taken (logged once).
+        self.refused = False
         self._pending = None
 
     def settle(self) -> None:
@@ -396,7 +454,7 @@ class SelectorFork:
         if not (
             isinstance(hidden_states, torch.Tensor)
             and hidden_states.dim() == 2
-            and hidden_states.shape[0] == HEAD_ROWS
+            and selector_forks(hidden_states.shape[0])
             and hidden_states.dtype == weight.dtype
             and hidden_states.shape[-1] == weight.shape[1]
             and hidden_states.is_contiguous()
@@ -429,6 +487,14 @@ class SelectorFork:
             or input.shape[-1] != source.shape[-1]
             or not input.is_contiguous()
         ):
+            if source.shape[0] > HEAD_ROWS and not self.refused:
+                # SELECTOR_FORK_MAX_ROWS forked these rows; the projection was called on others.
+                self.refused = True
+                logger.error(
+                    "[musespark_open] tep8_drafter_wide_gemms__SELECTOR_FORK_MAX_ROWS: the selector projection "
+                    f"forked for {source.shape[0]} draft-head rows is not the call's input "
+                    f"({tuple(input.shape)}); computed inline (the forked GEMM is wasted)"
+                )
             self.settle()
             return None
         self._pending = None
@@ -573,5 +639,11 @@ def install(llm: nn.Module, mapping=None) -> frozenset:
             f"(in place: {','.join(sorted(now))}; block rows with the conv trigger "
             f"{_widths(widths)}, the silu trigger {_widths(silu_rows)}, "
             f"the merge trigger {_widths(merge_rows)})"
+        )
+    if "selector_fork" in changed and SELECTOR_MAX_ROWS > HEAD_ROWS:
+        logger.info(
+            f"[musespark_open] selector_fork: the selector projection on its side stream for draft heads of "
+            f"{HEAD_ROWS}..{SELECTOR_MAX_ROWS} rows, every multiple of {HEAD_ROWS} "
+            f"(tep8_drafter_wide_gemms__SELECTOR_FORK_MAX_ROWS)"
         )
     return changed
