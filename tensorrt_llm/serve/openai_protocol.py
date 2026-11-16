@@ -48,7 +48,7 @@ from openai.types.responses.tool import Tool
 from openai.types.shared import Metadata, Reasoning
 from openai_harmony import ReasoningEffort
 from pydantic import (AliasChoices, BaseModel, ConfigDict, Field,
-                      NonNegativeInt, PositiveInt, field_validator,
+                      NonNegativeInt, PositiveInt, PrivateAttr, field_validator,
                       model_serializer, model_validator)
 from typing_extensions import Annotated, Required, TypeAlias, TypedDict
 
@@ -378,6 +378,21 @@ class ConversationParams(OpenAIBaseModel):
                      "affinity; forwarded to workers as a header, never in the "
                      "body."))
 
+    # The server generated conversation_id for one request; it never recurs.
+    _generated_for_one_request: bool = PrivateAttr(default=False)
+
+    @classmethod
+    def for_one_request(cls, conversation_id: str) -> "ConversationParams":
+        """Params with a ``conversation_id`` generated for one request."""
+        params = cls(conversation_id=conversation_id)
+        params._generated_for_one_request = True
+        return params
+
+    @property
+    def generated_for_one_request(self) -> bool:
+        """Whether ``conversation_id`` was generated for one request."""
+        return self._generated_for_one_request
+
     @field_validator("conversation_id", mode="before")
     @classmethod
     def validate_conversation_id(cls, value: Any) -> str:
@@ -529,6 +544,120 @@ class EmbeddingResponse(OpenAIBaseModel):
         description="The list of embeddings, one per input item.")
     usage: EmbeddingUsageInfo = Field(
         description="Token usage for the request.")
+
+
+class RerankDocument(OpenAIBaseModel):
+    text: str = Field(description="The document text.")
+
+
+class RerankRequest(OpenAIBaseModel):
+    """Request accepted by /rerank and /v1/rerank."""
+
+    model: str | None = Field(default=None,
+                              description="The model to use for reranking.")
+    query: str = Field(min_length=1,
+                       description="The search query to compare documents to.")
+    documents: list[str | RerankDocument] = Field(
+        min_length=1, description="The documents to rerank.")
+    top_n: NonNegativeInt | None = Field(
+        default=None,
+        description="Maximum number of results to return; zero returns all.")
+    return_documents: bool = Field(
+        default=False,
+        description="Whether each result should include its document text.")
+    max_tokens_per_doc: PositiveInt | None = Field(
+        default=None,
+        description="Maximum number of document tokens included in each prompt."
+    )
+    instruction: str | None = Field(
+        default=None,
+        description="Optional task-specific instruction for Qwen3-Reranker.")
+
+
+class RerankResult(OpenAIBaseModel):
+    index: NonNegativeInt = Field(
+        description="Index of the document in the request.")
+    relevance_score: float = Field(ge=0.0,
+                                   le=1.0,
+                                   description="Document relevance score.")
+    document: RerankDocument | None = Field(
+        default=None, description="The document, when requested.")
+
+
+class RerankUsageInfo(OpenAIBaseModel):
+    prompt_tokens: NonNegativeInt = Field(
+        default=0, description="Number of input tokens processed.")
+    total_tokens: NonNegativeInt = Field(
+        default=0,
+        description="Total tokens processed, equal to prompt_tokens.")
+
+
+class RerankResponse(OpenAIBaseModel):
+    id: str = Field(default_factory=lambda: f"rerank-{uuid.uuid4().hex}")
+    model: str = Field(description="The model used for reranking.")
+    results: list[RerankResult] = Field(
+        description="Results ordered by descending relevance.")
+    usage: RerankUsageInfo = Field(description="Token usage for the request.")
+
+
+class RerankV2Request(OpenAIBaseModel):
+    """Cohere v2-compatible request accepted by /v2/rerank."""
+
+    model: str = Field(description="The model to use for reranking.")
+    query: str = Field(min_length=1,
+                       description="The search query to compare documents to.")
+    documents: list[str] = Field(min_length=1,
+                                 description="The documents to rerank.")
+    top_n: PositiveInt | None = Field(
+        default=None, description="Maximum number of results to return.")
+    max_tokens_per_doc: PositiveInt = Field(
+        default=4096,
+        description="Maximum number of document tokens included in each prompt."
+    )
+    priority: int = Field(
+        default=0,
+        ge=0,
+        le=999,
+        description=
+        "Request priority; TensorRT-LLM currently supports only zero.")
+    instruction: str | None = Field(
+        default=None,
+        description="TensorRT-LLM task-instruction extension for Qwen3-Reranker."
+    )
+
+
+class RerankV2Result(OpenAIBaseModel):
+    index: NonNegativeInt = Field(
+        description="Index of the document in the request.")
+    relevance_score: float = Field(ge=0.0,
+                                   le=1.0,
+                                   description="Document relevance score.")
+
+
+class RerankV2ApiVersion(OpenAIBaseModel):
+    version: Literal["2"] = Field(default="2", description="API version.")
+
+
+class RerankV2BilledUnits(OpenAIBaseModel):
+    search_units: PositiveInt = Field(
+        default=1, description="Number of billed search units.")
+
+
+class RerankV2Meta(OpenAIBaseModel):
+    api_version: RerankV2ApiVersion = Field(
+        default_factory=RerankV2ApiVersion,
+        description="Version metadata for the response.")
+    billed_units: RerankV2BilledUnits = Field(
+        default_factory=RerankV2BilledUnits,
+        description="Billing metadata for the response.")
+
+
+class RerankV2Response(OpenAIBaseModel):
+    id: str = Field(default_factory=lambda: f"rerank-{uuid.uuid4().hex}")
+    results: list[RerankV2Result] = Field(
+        description="Results ordered by descending relevance.")
+    meta: RerankV2Meta = Field(default_factory=RerankV2Meta,
+                               description="Response metadata.")
 
 
 def _response_format_to_guided_decoding_params(

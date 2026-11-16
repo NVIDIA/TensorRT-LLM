@@ -1205,6 +1205,78 @@ def test_autotuner_distributed_strategy(strategy, mpi_pool_executor):
         assert r is True
 
 
+def _rank_disagreeing_cache_worker(world_size, strategy, seeded_rank):
+    """Only ``seeded_rank`` starts with the cache entry, and the ranks' token counts build different
+    profile lists, as under attention DP; tuning must not deadlock."""
+    rank = tensorrt_llm.mpi_rank()
+    mapping = Mapping(world_size=world_size,
+                      rank=rank,
+                      tp_size=world_size,
+                      pp_size=1)
+    dist = Distributed.get(mapping)
+
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    tuner.setup_distributed_state(mapping)
+
+    x = torch.randn(16, 32, device='cuda')
+    w = torch.randn(32, 64, device='cuda')
+    runner = DistributedGemmRunner(prefer_tactics=[0, 1, 2, 3])
+    config = TuningConfig(distributed_tuning_strategy=strategy)
+    custom_op = f"test_rank_disagreeing_cache_{strategy.value}"
+    if rank == seeded_rank:
+        key = tuner.profiling_cache.get_cache_key(custom_op, runner,
+                                                  (x.size(), w.size()), config)
+        tuner.profiling_cache[key] = (0, 2, 1e-9)
+    bucketed_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+        0, 0, get_power_of_2_num_tokens_buckets, next_positive_power_of_2), ),
+                                   distributed_tuning_strategy=strategy)
+    bucketed_op = f"{custom_op}_bucketed"
+
+    with autotune():
+        _, tactic = tuner.choose_one(custom_op=custom_op,
+                                     runners=[runner],
+                                     tuning_config=config,
+                                     inputs=[x, w])
+        tuner.choose_one(
+            custom_op=bucketed_op,
+            runners=[runner],
+            tuning_config=bucketed_config,
+            inputs=[torch.randn(16 + 8 * rank, 32, device='cuda'), w])
+    # The 16-row bucket, which every rank profiled.
+    _, bucketed_tactic = tuner.choose_one(custom_op=bucketed_op,
+                                          runners=[runner],
+                                          tuning_config=bucketed_config,
+                                          inputs=[x, w])
+    tactics = dist.tp_cp_allgather(obj=(tactic, bucketed_tactic))
+    dist.barrier()
+    return rank, tactics
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2,
+                    reason="Requires at least 2 GPUs for this test")
+@pytest.mark.parametrize("seeded_rank", [1])
+@pytest.mark.parametrize(
+    "strategy",
+    [
+        DistributedTuningStrategy.BROADCAST,
+        DistributedTuningStrategy.PARALLEL,
+    ],
+)
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_rank_disagreeing_cache_does_not_deadlock(strategy, seeded_rank,
+                                                  mpi_pool_executor):
+    world_size = 2
+    results = list(
+        mpi_pool_executor.map(_rank_disagreeing_cache_worker,
+                              *zip(*[(world_size, strategy, seeded_rank)] *
+                                   world_size),
+                              timeout=300))
+    assert len(results) == world_size
+    for _, tactics in results:
+        assert len(set(tactics)) == 1, f"ranks disagree: {tactics}"
+
+
 @pytest.mark.parametrize("use_cuda_graph", [False, True])
 def test_global_timer_vs_cuda_event(use_cuda_graph, monkeypatch):
     """Verify globaltimer and cuda-event backends are statistically indistinguishable."""
@@ -1761,7 +1833,12 @@ def test_fp4_moe_tunes_on_dummy_topk_and_runs_on_runtime_topk(monkeypatch):
         seen["tuner"] = list(inputs)
         return runners[0], -1
 
-    def fake_forward(self, inputs, tactic, output=None, prerouted=None):
+    def fake_forward(self,
+                     inputs,
+                     tactic,
+                     output=None,
+                     prerouted=None,
+                     lamport_out=None):
         seen["kernel"] = list(inputs)
         return [torch.zeros(1, device="cuda")]
 
@@ -1997,35 +2074,38 @@ def test_post_tune_merge_tactics_multi_rank(mpi_pool_executor):
         assert r["has_r0"] and r["has_r1"]
 
 
-def _autotune_dist_allgather_worker(world_size):
+def _autotune_dist_allgather_worker(world_size, init_file):
     import torch.distributed as dist
 
     from tensorrt_llm._torch.visual_gen.mapping import _VisualGenAutotuneDist
     rank = tensorrt_llm.mpi_rank()
-    os.environ["RANK"] = str(rank)
-    os.environ["WORLD_SIZE"] = str(world_size)
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "29557")
-    if not dist.is_initialized():
-        dist.init_process_group(backend="gloo",
-                                world_size=world_size,
-                                rank=rank)
-    # VG's real mesh has tp_size=1; the communicator must gather over the whole
-    # world regardless, so the mapping's tp axis is irrelevant to the gather.
-    d = _VisualGenAutotuneDist(
-        Mapping(world_size=world_size, rank=rank, tp_size=world_size))
-    return d.tp_cp_allgather(f"rank{rank}")
+    dist.init_process_group(backend="gloo",
+                            init_method=f"file://{init_file}",
+                            world_size=world_size,
+                            rank=rank)
+    try:
+        # A TP-only gather would return one rank instead of the whole world.
+        d = _VisualGenAutotuneDist(
+            Mapping(world_size=world_size,
+                    rank=rank,
+                    tp_size=1,
+                    pp_size=world_size))
+        return d.tp_cp_allgather(f"rank{rank}")
+    finally:
+        dist.destroy_process_group()
 
 
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
-def test_visual_gen_autotune_dist_world_allgather(mpi_pool_executor):
+def test_visual_gen_autotune_dist_world_allgather(mpi_pool_executor, tmp_path):
     # _VisualGenAutotuneDist.tp_cp_allgather must gather every rank's object over
     # the default world group (not the single-rank tp subgroup), and construct
     # without running TorchDist.__init__.
     world_size = 2
+    init_file = str(tmp_path / "gloo-store")
     results = list(
         mpi_pool_executor.map(_autotune_dist_allgather_worker,
-                              *zip(*[(world_size, )] * world_size)))
+                              [world_size] * world_size,
+                              [init_file] * world_size))
     for got in results:
         assert got == ["rank0", "rank1"]
 
@@ -2253,14 +2333,18 @@ def test_parallel_rank_dealt_no_pair_runs_the_merged_winner(
     gathered = {}
 
     class _AllgatherDist:
-        """tp_cp_allgather of the ranks run so far, in rank order."""
+        """tp_cp_allgather of the ranks run so far, in rank order, matched call by call."""
 
         def __init__(self, rank):
             self.rank = rank
 
         def tp_cp_allgather(self, obj):
-            gathered[self.rank] = obj
-            return [gathered[r] for r in sorted(gathered)]
+            calls = gathered.setdefault(self.rank, [])
+            calls.append(obj)
+            n = len(calls) - 1
+            return [
+                gathered[r][n] for r in sorted(gathered) if len(gathered[r]) > n
+            ]
 
     op = "autotuner_test::parallel_rank_without_pairs"
     config = TuningConfig(

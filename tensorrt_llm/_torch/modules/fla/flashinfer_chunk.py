@@ -366,7 +366,15 @@ def chunk_gated_delta_rule(
     # otherwise FI skips the final-state aggregation entirely.
     need_state = inplace_indexed_state_update or output_final_state
     final_to_return: Optional[torch.Tensor] = None
-    if output_final_state and not inplace_indexed_state_update:
+    # Without a workspace the batch is one group, and FlashInfer writes the final state into this call's own buffer:
+    # when that buffer is already in the pool dtype it is returned as is (the cast-scatter would be a plain copy).
+    hand_over_final = (
+        output_final_state
+        and not inplace_indexed_state_update
+        and state_workspace is None
+        and state_dtype == initial_state.dtype
+    )
+    if output_final_state and not inplace_indexed_state_update and not hand_over_final:
         final_to_return = initial_state.new_empty(num_seqs, *initial_state.shape[1:])
 
     # Sequences are independent, so a batch larger than the workspace runs in
@@ -400,12 +408,23 @@ def chunk_gated_delta_rule(
 
         # --- Step 5: gather initial state (+ cast dtype only when required)
         # Fuse gather (+ optional cast) and contiguous into a single Triton kernel.
-        gathered_init = gather_cast_vk_to_fp32_vk(
-            group_state,
-            group_indices,
-            out_dtype=state_dtype,
-            output=state_workspace[0][:group_seqs] if state_workspace is not None else None,
-        )
+        if (
+            group_indices is None
+            and state_workspace is None
+            and group_state.dtype == state_dtype
+            and group_state.is_contiguous()
+            and group_state.shape[0] == group_seqs
+        ):
+            # Already packed [num_seqs, H, V, K] in the kernel's I/O dtype (the in-forward snapshot split gathers
+            # its rows itself): FlashInfer only reads it, so the gather would be a plain copy.
+            gathered_init = group_state
+        else:
+            gathered_init = gather_cast_vk_to_fp32_vk(
+                group_state,
+                group_indices,
+                out_dtype=state_dtype,
+                output=state_workspace[0][:group_seqs] if state_workspace is not None else None,
+            )
 
         # --- Step 6: call FlashInfer with pre-allocated output/state buffers
         # A q/k/v/output token row is heads x head_size (128) 16-bit values, a multiple
@@ -446,6 +465,8 @@ def chunk_gated_delta_rule(
         # slots named by ``initial_state_indices`` and leaves the rest untouched.
         if inplace_indexed_state_update:
             cast_scatter_fp32_vk_to_vk(out_state, group_state, group_indices)
+        elif hand_over_final:
+            final_to_return = out_state
         elif output_final_state:
             cast_scatter_fp32_vk_to_vk(out_state, final_to_return[seq_lo:seq_hi], None)
 

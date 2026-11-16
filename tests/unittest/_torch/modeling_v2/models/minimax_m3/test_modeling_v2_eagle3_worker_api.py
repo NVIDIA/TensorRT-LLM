@@ -131,10 +131,11 @@ def test_external_shared_kv_keeps_the_parent_tensor_return_contract(path: Path):
     forward = next(
         n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "_forward_impl"
     )
+    # ast.walk: the parent nests the branch in a try / finally (the side-stream join).
     branch = copy.deepcopy(
         next(
             n
-            for n in forward.body
+            for n in ast.walk(forward)
             if isinstance(n, ast.If)
             and ast.unparse(n.test) == "self._uses_external_shared_target_kv"
         )

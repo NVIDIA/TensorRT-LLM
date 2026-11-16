@@ -371,6 +371,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def consumes_transfer_buffer(self) -> bool:
         return False
 
+    @property
+    def reads_unique_tokens(self) -> bool:
+        return False
+
     def __init__(
         self,
         mapping: Mapping,
@@ -2334,6 +2338,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return True
 
     def commit_blocks_for_reuse(self, req) -> None:
+        # Without block reuse nothing is committed, so nothing needs verifying.
+        if not self._reuse_adapter.enable_block_reuse:
+            return
         # Verified-range admission (fail-closed): commit the received range
         # to the reuse tree only when every published destination byte has
         # attested write coverage on every rank. Transfer SUCCESS alone is

@@ -28,11 +28,12 @@ import torch
 if TYPE_CHECKING:
     from tensorrt_llm.mapping import Mapping
 
+    from ...host_staging import HostUploader
     from ...model_config import ModelConfig
     from ...speculative.interface import SpecMetadata
     from ...speculative.spec_tree_manager import SpecTreeManager
     from .fmha.gqa_decode import GqaDecodeFmha, GqaDecodeSetup
-    from .fmha.interface import Fmha
+    from .fmha.interface import Fmha, FmhaPrewarmConfig
     from .sparse.dsa.metadata import TokenMajorGenView
 
 from tensorrt_llm._utils import (get_sm_version, is_sm_100f, is_sm_120f,
@@ -47,7 +48,7 @@ from tensorrt_llm.quantization.mode import QuantMode
 
 from ...distributed import cp_allgather
 from ...kimi_k3_cache_policy import get_kimi_k3_fp8_kv_layer_ids, is_kimi_k3
-from ...pyexecutor import step_inputs
+from ...pyexecutor import h2d_cache, step_inputs
 from ...pyexecutor.config_utils import is_mla
 from ...pyexecutor.h2d_cache import copy_h2d_pool_shared
 from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
@@ -213,6 +214,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     # TrtllmAttention needs to know the beam width to access to the cache indirection buffer,
     # when beam search is enabled.
     beam_width: int = 1
+
+    # Set by the runner that owns this metadata: per-step uploads go through it.
+    host_uploader: Optional["HostUploader"] = None
 
     # Plan caches of the FMHA libraries, keyed by library. A planned wrapper owns
     # workspaces that CUDA graphs capture, so it lives exactly as long as this
@@ -1088,6 +1092,15 @@ class TrtllmAttentionMetadata(AttentionMetadata):
              self.host_request_types_runtime, self._num_generations,
              self.max_num_sequences) = saved
 
+    def _upload_to_device(self, key: str, destination: torch.Tensor,
+                          value: torch.Tensor, engine_staging: bool) -> bool:
+        """Copy host ``value`` into ``destination`` through the runner's uploader, unless the
+        engine stages this copy itself (``engine_staging``) or no uploader is set: then False."""
+        if self.host_uploader is None or engine_staging:
+            return False
+        self.host_uploader.upload(key, value, destination)
+        return True
+
     def prepare(self) -> None:
         super().prepare()
         self.context_plan = None
@@ -1119,9 +1132,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             device='cpu',
         )
         self.prompt_lens_cpu[:self.num_seqs].copy_(prompt_lens)
-        copy_h2d_pool_shared(self.prompt_lens_cuda[:self.num_seqs],
-                             self.prompt_lens_cpu[:self.num_seqs],
-                             pack=True)
+        if not self._upload_to_device(
+                "prompt_lens", self.prompt_lens_cuda[:self.num_seqs],
+                self.prompt_lens_cpu[:self.num_seqs], h2d_cache.enabled()):
+            copy_h2d_pool_shared(self.prompt_lens_cuda[:self.num_seqs],
+                                 self.prompt_lens_cpu[:self.num_seqs],
+                                 pack=True)
 
         # number of tokens in the kv cache for each sequence in the batch
         cached_token_lens = torch.tensor(
@@ -1176,8 +1192,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # the sequence length including the cached tokens and the input tokens.
         self.kv_lens[:self.num_seqs].copy_(
             kv_lens + self.kv_cache_params.num_extra_kv_tokens)
-        step_inputs.copy_(self.kv_lens_cuda[:self.num_seqs],
-                          maybe_pin_memory(kv_lens[:self.num_seqs]))
+        if not self._upload_to_device(
+                "kv_lens", self.kv_lens_cuda[:self.num_seqs],
+                kv_lens[:self.num_seqs], step_inputs.is_open()):
+            step_inputs.copy_(self.kv_lens_cuda[:self.num_seqs],
+                              maybe_pin_memory(kv_lens[:self.num_seqs]))
         # total kv lens for context requests and generation requests, without extra tokens
         self.host_total_kv_lens[0] = kv_lens[:self.num_contexts].sum().item()
         self.host_total_kv_lens[1] = kv_lens[self.num_contexts:self.
@@ -2147,6 +2166,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     cache_context_plan: bool = False
     # FMHA library classes this instance tries before the registry's libraries.
     prepended_fmha_lib_classes: tuple = ()
+    # Head dimension per K/V stage of FlashInferTrtllmGenFmha's FP8 paged causal context attention, run through
+    # trtllm::fmha_paged_context_fp8; 0 keeps FlashInfer's kernel.
+    context_fmha_head_dim_per_stage_kv: int = 0
+    # In a context-only step, FlashInferTrtllmGenFmha computes only each request's last output row (the others are
+    # zero); every row's K / V is still written.
+    context_last_rows_only: bool = False
 
     # Layer state the native attention op reads through FmhaParams.attn. The
     # generator (scripts/generate_fmha_params.py) collects these annotations;
@@ -2191,6 +2216,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         skip_correction_threshold: float = 0.0,
         gqa_decode: Optional["GqaDecodeSetup"] = None,
         cache_context_plan: bool = False,
+        context_fmha_head_dim_per_stage_kv: int = 0,
+        context_last_rows_only: bool = False,
         **kwargs,
     ) -> None:
         """
@@ -2220,6 +2247,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             cache_context_plan (bool): Plan a context-only forward once for the
                 layers that share its metadata and run the trtllm-gen context
                 kernel from that plan (dense, non-sparse layers only).
+            context_fmha_head_dim_per_stage_kv (int): See the class attribute.
+            context_last_rows_only (bool): See the class attribute.
         """
         super().__init__(layer_idx, num_heads, head_dim, num_kv_heads,
                          quant_config, **kwargs)
@@ -2293,6 +2322,15 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self.local_layer_idx: Optional[int] = None
         self._fmha_manager: Optional[FmhaManager] = None
         self.gqa_decode = gqa_decode
+        if context_fmha_head_dim_per_stage_kv < 0 or (
+                context_fmha_head_dim_per_stage_kv > 0
+                and head_dim % context_fmha_head_dim_per_stage_kv != 0):
+            raise ValueError(
+                f"context_fmha_head_dim_per_stage_kv="
+                f"{context_fmha_head_dim_per_stage_kv} must be 0 or divide "
+                f"head_dim={head_dim}.")
+        self.context_fmha_head_dim_per_stage_kv = context_fmha_head_dim_per_stage_kv
+        self.context_last_rows_only = context_last_rows_only
         # A GQA decode library of this layer, which plans the module's KV append and deferred prologue (set with
         # the FMHA manager).
         self.gqa_decode_fmha: Optional["GqaDecodeFmha"] = None
@@ -2321,6 +2359,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         context MLA FMHA, which reads FP8 Q, K and V."""
         return (self.is_mla_enable and self.has_fp8_kv_cache
                 and _has_fp8_context_mla_fmha(get_sm_version()))
+
+    def prewarm_fmha(self, config: "FmhaPrewarmConfig",
+                     attempted: set[type["Fmha"]]) -> None:
+        """Prewarm the initialized manager's eligible libraries, once per library."""
+        manager = getattr(self, "_fmha_manager", None)
+        if manager is not None:
+            manager.prewarm(config, attempted)
 
     def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
         self.quant_config = new_quant_config or QuantConfig()

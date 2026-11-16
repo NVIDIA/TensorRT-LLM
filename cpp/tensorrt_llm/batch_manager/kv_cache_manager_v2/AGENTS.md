@@ -6,7 +6,7 @@ SPDX-License-Identifier: Apache-2.0
 # KVCacheManagerV2 C++ Guide
 
 This directory contains the C++ implementation of KVCacheManagerV2: allocation,
-prefix reuse, eviction, GPU/host/disk movement, page locking, and KV-cache event
+prefix reuse, eviction, GPU/host/disk/remote movement, page locking, and KV-cache event
 generation. Python accesses it through the nanobind bindings in
 `cpp/tensorrt_llm/nanobind/batch_manager/kvCacheManagerV2.cpp`.
 
@@ -64,7 +64,9 @@ them before changing `batch.*`, `sparseCache.*` or the index conversion.
   -- act on which class they caught; throw those directly:
   `OutOfMemoryError` and its `Host`/`Disk`/`Cu` forms, `LogicError`,
   `AssertionError`, `CuError`, `CorruptedError`, `ResourceBusyError`,
-  `OutOfPagesError`.
+  `OutOfPagesError`, and `RemoteMemError` (a failed remote cache level: the
+  V2 scheduler and the prefetch path catch it by class to re-match, recompute
+  or fail only the affected requests).
   Validation at the binding boundary that throws `std::invalid_argument` or
   `std::out_of_range` is legacy and should migrate to `TLLM_CHECK*` as it is
   touched, so that KVCM2 ends up on the same footing as the rest of the repo.
@@ -148,7 +150,7 @@ sizes match, which is what lets a sparse pool be backed by host memory while a
 dense pool of the same group and level is device memory; the group reports
 GPU_MEM either way. Compatible sparse buffers still coalesce. Sparse buffers place no requirement on the cold tiers.
 
-`StorageManager` coordinates GPU, host, and disk cache levels. It allocates
+`StorageManager` coordinates GPU, host, disk, and remote cache levels. It allocates
 slots, schedules pages for eviction, migrates pages between levels, and resizes
 pools. `CopyEngine` performs the actual batched transfers; C++ code calls it
 directly and must not round-trip through Python bindings.
@@ -398,6 +400,62 @@ physically duplicate the whole prompt; ownership splits at the prompt tail:
 - CUDA virtual memory and copy operations use the driver/runtime APIs directly.
   Keep allocation granularity, stream ordering, and source/destination lifetime
   valid through asynchronous copies.
+- Retained disk copies (`disk_keep_copy_after_restore`, `disk_write_through`):
+  a disk slot can keep a copy of a page that lives in a hotter level. They are
+  tracked in `StorageManager` (`mRetainedCopies` oldest first, `mRetainedByPage`),
+  not by the eviction controller. Every path that frees, reuses, or resizes a
+  disk slot must account for them: an eviction to disk takes the copy's slot back
+  (`takeRetainedCopy`), a full last level drops LRU disk-only pages before
+  reclaiming copies, `adjustCacheLevel` releases only the copies of pool groups
+  that shrink, and `~Page` calls `onPageDestroyed` before its slot is released.
+  Copies beyond the tier's `protectedCopyFraction` share are released before
+  any disk-only page, and write-through creates none beyond it
+  (`protectedCopyShare`). Only full committed pages get copies
+  (`hasFinalContent`). A copy is reusable while its write is in flight or after
+  it completed without error (`validateRetainedCopy`); taking back an in-flight
+  copy promotes its write-through to a required write
+  (`promoteBackgroundDiskWrites`) and counts `reused_pending`. Storage
+  statistics report copies as `retainedCopies`, not as `evictable`.
+  `disk_copy_counters` keeps `retained == created - reused - reclaimed - dropped`
+  with one disk tier; tests assert it.
+- A write-through copy reads the host page while its write is in flight, and its
+  completion event lives only on the retained disk slot. Anything that releases
+  that host slot must merge `pendingDiskWrite()` into the slot's ready event.
+  Write-through takes free disk slots only, never evicts or reclaims, and a
+  failure skips the copy instead of failing the eviction that triggered it.
+- Async disk I/O (`utils/copyUtils.cpp`, `disk_io_threads`) is a process-wide
+  pool that starts at the first nonzero value and lives for the process. A
+  transfer is split into 4 MiB pieces; the stream waits on a completion flag in
+  device-mapped host memory with `cuStreamWaitValue64`, or in a host function
+  when that is unavailable or fails. Pieces are served reads first, then
+  required writes, then background writes, with aging so no queue starves.
+
+### Remote cache levels
+
+A remote level (`RemoteCacheTierConfig`, `CacheTier::REMOTE`) keeps its slots in
+host memory other processes donate (`tensorrt_llm/_torch/pyexecutor/kv_cache/remote_donor.py`).
+
+- `storage/remoteMem.*`: `RemoteMemClient`, one per rendezvous directory and
+  `StorageManager`: the donor table, the chunks claimed with O_EXCL claim files,
+  and the transfer backend. It opens and checks the directory once
+  (`openRendezvousDirectory`) and reads every donor file through that descriptor.
+  `RemoteRange` maps a pool's slots onto claimed chunks.
+- `storage/remoteTransfer.h`: the backend interface; `remoteTransferAgent.*`
+  (NIXL, one-sided RDMA concluded on the host) and `remoteTransferFabric.*`
+  (fabric memory mapped into this process, copied on the caller's stream).
+- Pages move through the pinned page staging ring. A host-concluded transfer
+  that misses its deadline fails the level, and its staging lease stays out of
+  use (`mUnquiescedRemoteTransfers`) until `quiesced()`; `destroy()` gives it one
+  more timeout, then leaks the lease, the claims and the backend
+  (`RemoteMemClient::abandon`).
+- A failed client fails its levels for good: they take no pages and give none
+  back. `dropPagesOfFailedRemoteLevels()` drops their evictable pages,
+  `KvCacheManager::_unlinkPagesOfFailedRemoteLevels()` unlinks the held ones from
+  the radix tree (from `createKvCache` with tokens, `prefetchReuse` and the
+  probes), and `prepareFreeSlots()` retries an eviction past a level whose WRITE
+  failed. Callers tell this failure apart by `RemoteMemError`.
+- A remote level cannot sit next to a file-backed disk level (rejected at
+  construction).
 
 ## Testing a change here
 
@@ -441,6 +499,15 @@ done
 from it: the radix tree, the storage manager, and the living-`KvCache` set.
 Mutating APIs take it exclusively; read-only queries take it shared, so several
 `probeReuse()` lookups run concurrently while a writer is excluded.
+
+Remote levels add two exceptions. Each `RemoteMemClient` has its own `mMutex`
+for its donor table, claims and backend; it is taken inside the manager lock
+(the storage manager calls the client), never the other way round, and the
+client never calls back into the manager. Its failure flag `mFailed` is an
+atomic, read without any lock by `StorageManager::anyRemoteLevelFailed()` /
+`numFailedRemoteClients()`: the `any_remote_level_failed` binding and the
+probes' check for newly failed levels, which then take the lock exclusively to
+unlink their pages before matching.
 
 **What the lock does and does not cover.** It protects state *shared between*
 `KvCache`s, not the fields of an individual one, and it is a guarantee about the
@@ -496,7 +563,10 @@ Two exposed accessors look like they might leak shared state and do not:
   `get_life_cycle_pool_group_indices`,
   `get_page_stride`, `get_page_index_scale`, `get_page_index_converter`,
   `get_mem_pool_base_address`, `supports_index_mode`, `init_config`, and the
-  config flags. `get_page_index_upper_bound` resembles that group but reads a
+  config flags. `any_remote_level_failed` is lock-free too but reads runtime
+  state: each remote client's atomic `failed()` flag, walking `mRemoteClients`,
+  which `destroy()` clears; it is safe while no `shutdown()` runs concurrently.
+  `get_page_index_upper_bound` resembles that group but reads a
   pool's current `numSlots`, which `_adjustLevel()` changes, so it takes the
   shared lock. Anything added here that reads resize-mutable state must too.
 - `get_base_page_indices` returns a zero-copy numpy view, but into
@@ -668,6 +738,7 @@ Use extra review and tests for changes involving:
 - partial attention coverage, SSM checkpoints, SWA windows/sinks, or final
   snapshots;
 - CUDA stream/event lifetime or host-memory registration;
+- retained disk copies, write-through, or the disk I/O pool and its completion flags;
 - `KvCache` commit state, beam forks, reuse rebasing, or page-index buffers;
 - nanobind GIL release, callbacks, non-owning buffers, or exception translation.
 
