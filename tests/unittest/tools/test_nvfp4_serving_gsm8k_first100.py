@@ -30,9 +30,6 @@ EXAMPLES_DIR = Path(__file__).resolve().parents[3] / "examples" / "llm-api"
 sys.path.insert(0, str(EXAMPLES_DIR))
 from gsm8k_eval import protocol, records  # noqa: E402
 
-# The command line beside the public package (its directory is on sys.path through ``public``).
-
-
 pytestmark = pytest.mark.cpu_only
 
 # Change only together with a new PROTOCOL_ID and a regenerated manifest.json.
