@@ -19,6 +19,7 @@ and ``v15`` are the files of Mistral-Large-3 and Mistral-Small-4 under LLM_MODEL
 ``[THINK]``; v15 also declares model settings (reasoning effort, response format).
 """
 
+import json
 from pathlib import Path
 
 import pytest
@@ -32,14 +33,43 @@ TEKKEN_CHECKPOINT_FILES = {
 }
 
 
+HF_TOKENIZER_TEXT = "the capital of france is"
+"""Text the tokenizer of ``write_hf_tokenizer`` encodes as ``HF_TOKENIZER_IDS``."""
+HF_TOKENIZER_IDS = [1, 2, 3, 4, 5]
+
+
+def bundled_tekken_file() -> Path:
+    """The newest Tekken file mistral-common ships; skips when it ships none."""
+    mistral_common = pytest.importorskip("mistral_common")
+    files = sorted((Path(mistral_common.__file__).parent / "data").glob("tekken*.json"))
+    if not files:
+        pytest.skip("this mistral_common ships no Tekken file")
+    return files[-1]
+
+
+def write_hf_tokenizer(directory: Path) -> None:
+    """Write a word-level Hugging Face tokenizer (``tokenizer.json``, ``tokenizer_config.json``).
+
+    Its vocabulary differs from every Tekken one, so a test can tell which of the two files of
+    a directory a loader read.
+    """
+    tokenizers = pytest.importorskip("tokenizers")
+    vocab = {"[UNK]": 0, **{word: i for i, word in enumerate(HF_TOKENIZER_TEXT.split(), 1)}}
+    word_level = tokenizers.Tokenizer(tokenizers.models.WordLevel(vocab=vocab, unk_token="[UNK]"))
+    word_level.pre_tokenizer = tokenizers.pre_tokenizers.Whitespace()
+    word_level.save(str(directory / "tokenizer.json"))
+    (directory / "tokenizer_config.json").write_text(
+        json.dumps({"tokenizer_class": "PreTrainedTokenizerFast", "unk_token": "[UNK]"})
+    )
+
+
 def load_tekken(source: str):
     """A ``MistralTokenizer`` over the ``source`` Tekken file; skips when it is not there."""
-    mistral_common = pytest.importorskip("mistral_common")
+    pytest.importorskip("mistral_common")
     from tensorrt_llm._torch.models.checkpoints.mistral.tokenizer import MistralTokenizer
 
     if source == "bundled":
-        files = sorted((Path(mistral_common.__file__).parent / "data").glob("tekken*.json"))
-        path = files[-1] if files else None
+        path = bundled_tekken_file()
     else:
         root = llm_models_root()
         path = None if root is None else root / TEKKEN_CHECKPOINT_FILES[source]

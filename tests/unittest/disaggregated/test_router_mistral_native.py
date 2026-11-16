@@ -235,12 +235,29 @@ def test_responses_request_routes_on_the_chat_ids(router):
     assert router._routing_key_sync(request)["num_tokens"] == len(expected)
 
 
-@pytest.mark.parametrize("model,checkpoint_format", [(_QWEN3, None), (_QWEN3, "HF"), (_ML3, None)])
-def test_other_checkpoint_formats_keep_the_hf_tokenizer(model, checkpoint_format):
-    """Without a Mistral-native format, a Mistral directory's tokenizer.json is read too."""
+def test_a_native_directory_without_its_format_tokenizes_completions_as_the_servers(checkpoint):
+    """Given only the directory, the router reads a Mistral-native checkpoint's Tekken file.
+
+    Completions get the servers' ids; chats, which it cannot render without the format, route
+    on no ids instead of failing.
+    """
+    model_dir, checkpoint_format = checkpoint
+    plain = _router(tokenizer_dir=model_dir)
+    native = _router(tokenizer_dir=model_dir, checkpoint_format=checkpoint_format)
+    assert type(plain._get_tokenizer("m")) is MistralTokenizer
+    expected = native._tokenize(CompletionRequest(model="m", prompt=_PROMPT))
+    assert plain._tokenize(CompletionRequest(model="m", prompt=_PROMPT)) == expected
+    chat = ChatCompletionRequest(model="m", messages=_MESSAGES)
+    assert plain._tokenize(chat) == [[]]
+    assert chat.prompt_token_ids is None
+
+
+@pytest.mark.parametrize("checkpoint_format", [None, "HF"])
+def test_other_checkpoint_formats_keep_the_hf_tokenizer(checkpoint_format):
+    """Without a Mistral-native format, an HF checkpoint's tokenizer is read."""
     from transformers import PreTrainedTokenizerBase
 
-    tokenizer_dir = str(_model_dir(model))
+    tokenizer_dir = str(_model_dir(_QWEN3))
     router = _router(tokenizer_dir=tokenizer_dir, checkpoint_format=checkpoint_format)
     reference = _router(tokenizer_dir=tokenizer_dir)
     tokenizer = router._get_tokenizer("m")
@@ -253,7 +270,6 @@ def test_other_checkpoint_formats_keep_the_hf_tokenizer(model, checkpoint_format
     )
     request = CompletionRequest(model="m", prompt=_PROMPT)
     assert router._tokenize(request) == [tokenizer(_PROMPT)["input_ids"]]
-    if model == _QWEN3:
-        chat = ChatCompletionRequest(model="m", messages=_MESSAGES)
-        expected = reference._tokenize(ChatCompletionRequest(model="m", messages=_MESSAGES))
-        assert router._tokenize(chat) == expected and expected[0]
+    chat = ChatCompletionRequest(model="m", messages=_MESSAGES)
+    expected = reference._tokenize(ChatCompletionRequest(model="m", messages=_MESSAGES))
+    assert router._tokenize(chat) == expected and expected[0]
