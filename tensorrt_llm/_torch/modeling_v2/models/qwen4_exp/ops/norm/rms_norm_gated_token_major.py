@@ -50,20 +50,29 @@ def _prefill_multirow(x: torch.Tensor, z: torch.Tensor, gate_activation: str) ->
 
 
 def _direct_launch(x, z, weight, eps, gate_activation):
-    """The registered op's own multi-row launch (same kernel, 4 rows a program, PDL by the
-    op's policy), skipping only the custom-op dispatch."""
+    """The registered op's own multi-row launch (same kernel, 4 rows a tile, its tiles per
+    program and fast-path hints, PDL by the op's policy), skipping only the custom-op dispatch."""
     rows, n = x.shape
     out = torch.empty_like(x)
-    grid = triton.cdiv(rows, _layernorm_gated._MULTIROW_ROWS)
+    rows_per_tile = _layernorm_gated._MULTIROW_ROWS
+    groups = (
+        _layernorm_gated._MULTIROW_GROUPS
+        if rows >= _layernorm_gated._MULTIROW_GROUPS_MIN_ROWS
+        else 1
+    )
+    grid = triton.cdiv(rows, rows_per_tile * groups)
     device = x.device.index
     pdl = _layernorm_gated._multirow_pdl(grid, device)
     with torch.cuda.device(device):
         _layernorm_gated._rms_norm_gated_fwd_multirow_kernel[(grid,)](
             x, out, weight, z, None, None, x.stride(0), out.stride(0), z.stride(0), rows, eps,
-            N=n, ROWS=_layernorm_gated._MULTIROW_ROWS, HEADS_PER_TOK=z.shape[1],
+            N=n, ROWS=rows_per_tile, HEADS_PER_TOK=z.shape[1],
             GATE_SIGMOID=gate_activation == "sigmoid", WEIGHT_IS_DELTA=False,
-            LAUNCH_WITH_PDL=pdl, num_warps=_layernorm_gated._MULTIROW_NUM_WARPS,
-            EARLY_TRIGGER=_layernorm_gated._pdl_device_policy(device)[0], launch_pdl=pdl,
+            LAUNCH_WITH_PDL=pdl, CONTIG=(x.stride(0) == n and out.stride(0) == n),
+            EVEN=(rows % (rows_per_tile * groups) == 0),
+            num_warps=_layernorm_gated._MULTIROW_NUM_WARPS,
+            EARLY_TRIGGER=_layernorm_gated._pdl_device_policy(device)[0], GROUPS=groups,
+            launch_pdl=pdl,
         )  # fmt: skip
     return out
 

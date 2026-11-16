@@ -47,6 +47,7 @@ def _launch(attention_output: torch.Tensor, gate: torch.Tensor) -> bool:
         attention_output,
         attention_output,
         gate,
+        attention_output,  # scale_ptr, read only for an FP8 output
         attention_output.stride(0),
         attention_output.stride(0),
         gate.stride(0),
