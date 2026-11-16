@@ -619,25 +619,31 @@ def test_chat_stream_cancelled_by_a_disconnect_logs_no_error(monkeypatch, server
     server_logger.error.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "steps", [[], [["data: one\n\n"]]], ids=["before_the_first_frame", "after_a_frame"]
+)
 @pytest.mark.parametrize("route", ["openai_chat", "chat_harmony"])
-def test_chat_stream_logs_a_failure_and_ends_with_an_error_event(monkeypatch, server_logger, route):
+def test_chat_stream_logs_a_failure_and_ends_with_an_error_event(
+    monkeypatch, server_logger, route, steps
+):
     """A failed generation is logged, and the stream ends with an error event and [DONE].
 
     A completion stream ends the same way, because HTTP 200 was already sent.
     """
 
     async def run():
-        generation = _StreamedGeneration([["data: one\n\n"]], then=RuntimeError("engine failed"))
+        generation = _StreamedGeneration(steps, then=RuntimeError("engine failed"))
         stream, server = await _chat_stream(monkeypatch, generation, route)
         return [frame async for frame in stream], server
 
     frames, server = asyncio.run(run())
 
-    assert frames[0] == "data: one\n\n"
+    sent = [frame for step in steps for frame in step]
+    assert frames[: len(sent)] == sent
     # OpenAI clients raise on an event whose data carries an "error" object.
-    error = json.loads(frames[1][len("data: ") :])["error"]
+    error = json.loads(frames[len(sent)][len("data: ") :])["error"]
     assert (error["message"], error["type"]) == ("engine failed", "server_error")
-    assert frames[2:] == ["data: [DONE]\n\n"]
+    assert frames[len(sent) + 1 :] == ["data: [DONE]\n\n"]
     server._extract_metrics.assert_not_awaited()
     server_logger.error.assert_called_once()
     assert "engine failed" in server_logger.error.call_args.args[0]
