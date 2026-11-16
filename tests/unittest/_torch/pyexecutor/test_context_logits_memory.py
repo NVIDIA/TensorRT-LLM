@@ -453,12 +453,8 @@ def test_short_compact_prompt_logprobs_fail_only_their_request() -> None:
     assert worker._refused_client_ids == {7}
 
 
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("explicit", [True, False], ids=["context_logits", "prompt_logprobs_only"])
-def test_recompute_stores_each_prompt_row_once(explicit: bool) -> None:
-    """A recompute that replays the prefill stores no context row a second time."""
-    prompt_len, vocab = 10, 31
-    request = LlmRequest(
+def make_llm_request(explicit: bool, prompt_len: int = 10, vocab: int = 31) -> LlmRequest:
+    return LlmRequest(
         request_id=1,
         max_new_tokens=4,
         input_tokens=[(7 * i) % vocab for i in range(prompt_len)],
@@ -469,13 +465,25 @@ def test_recompute_stores_each_prompt_row_once(explicit: bool) -> None:
         prompt_logprobs=2,
         return_logits_device_memory=False,
     )
-    logits = torch.randn(prompt_len + 2, vocab, generator=torch.Generator().manual_seed(5))
-    # Prefill the prompt in three chunks, so the first pass is chunked too.
-    for size in (4, 4, 2):
+
+
+def prefill_chunks(request: LlmRequest, logits: torch.Tensor, sizes: tuple[int, ...]) -> None:
+    for size in sizes:
         request.context_chunk_size = size
         begin = request.context_current_position
         store_context_logits(request, logits[begin : begin + size])
         request.move_to_next_context_chunk()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("explicit", [True, False], ids=["context_logits", "prompt_logprobs_only"])
+def test_recompute_stores_each_prompt_row_once(explicit: bool) -> None:
+    """A recompute that replays the prefill stores no context row a second time."""
+    prompt_len, vocab = 10, 31
+    request = make_llm_request(explicit, prompt_len, vocab)
+    logits = torch.randn(prompt_len + 2, vocab, generator=torch.Generator().manual_seed(5))
+    # Prefill the prompt in three chunks, so the first pass is chunked too.
+    prefill_chunks(request, logits, (4, 4, 2))
     result = request.py_result
     stored_logits = result.context_logits.clone() if explicit else None
     stored_logprob_rows = torch.cat(result.context_prompt_logprob_rows)
@@ -484,6 +492,7 @@ def test_recompute_stores_each_prompt_row_once(explicit: bool) -> None:
         request.add_new_token(token, 0)
 
     request.reset_for_recompute(_UNBOUNDED_PAUSE_MAX_INPUT_LEN)
+    assert request.py_result is result
     request.context_chunk_size = request.context_remaining_length
     assert request.context_chunk_size == prompt_len + 2
 
@@ -497,3 +506,36 @@ def test_recompute_stores_each_prompt_row_once(explicit: bool) -> None:
         torch.cat(result.context_prompt_logprob_rows), stored_logprob_rows, rtol=0, atol=0
     )
     assert result.context_prompt_last_logprobs is stored_last_logprobs
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("explicit", [True, False], ids=["context_logits", "prompt_logprobs_only"])
+def test_recompute_mid_prefill_stores_each_prompt_row_once(explicit: bool) -> None:
+    """A replay over partly stored rows stores the remaining prompt rows once and in order."""
+    prompt_len, vocab = 10, 31
+    logits = torch.randn(prompt_len, vocab, generator=torch.Generator().manual_seed(6))
+    reference = make_llm_request(explicit, prompt_len, vocab)
+    prefill_chunks(reference, logits, (prompt_len,))
+    expected = reference.py_result
+
+    request = make_llm_request(explicit, prompt_len, vocab)
+    prefill_chunks(request, logits, (4,))
+    result = request.py_result
+    request.reset_for_recompute(_UNBOUNDED_PAUSE_MAX_INPUT_LEN)
+    assert request.py_result is result
+    assert request.context_remaining_length == prompt_len
+
+    # The first replayed chunk overlaps the 4 stored rows.
+    prefill_chunks(request, logits, (6, 4))
+
+    if explicit:
+        torch.testing.assert_close(result.context_logits, expected.context_logits, rtol=0, atol=0)
+    else:
+        assert result.context_logits is None
+    torch.testing.assert_close(
+        torch.cat(result.context_prompt_logprob_rows),
+        torch.cat(expected.context_prompt_logprob_rows),
+    )
+    torch.testing.assert_close(
+        result.context_prompt_last_logprobs, expected.context_prompt_last_logprobs
+    )
