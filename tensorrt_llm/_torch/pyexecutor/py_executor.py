@@ -9267,7 +9267,9 @@ class PyExecutor:
 
         Args:
             rows: The snapshot's export rows (see _append_stats_rows).
-            counters: The queued counters those rows report.
+            counters: The snapshot's queued counters; under attention DP
+                every rank's, in rank order, so that a backlog moving between
+                ranks is a change too.
         """
         if not rows:
             return

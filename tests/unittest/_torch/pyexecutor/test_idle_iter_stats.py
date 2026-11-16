@@ -281,10 +281,11 @@ def test_attention_dp_fanout_export_follows_the_fanout_kind(executor, kind):
     executor.enable_attention_dp = True
     adp_stats = executor._adp_iter_stats
     adp_stats.last_fanout_is_busy_queue_snapshot = kind == "queue-snapshot"
-    adp_stats.last_fanout_queued_counters = (1, 100, 0, 0)
+    adp_stats.last_fanout_queued_counters = ((2, 200, 0, 0), (1, 100, 0, 0))
     if kind == "idle-heartbeat":
         adp_stats.last_idle_rank_states = [object(), object()]
     first, second, third = _adp_rows("first"), _adp_rows("second"), _adp_rows("third")
+    fourth = _adp_rows("fourth")
     executor._export_adp_fanout(first)
     executor._export_adp_fanout(second)
     # An iteration that fans out no row exports nothing.
@@ -297,12 +298,55 @@ def test_attention_dp_fanout_export_follows_the_fanout_kind(executor, kind):
         # The repeat is dropped: the first snapshot stays.
         assert executor.stats == first
         # A changed backlog is exported.
-        adp_stats.last_fanout_queued_counters = (2, 100, 0, 0)
+        adp_stats.last_fanout_queued_counters = ((2, 200, 0, 0), (2, 200, 0, 0))
         executor._export_adp_fanout(third)
         assert executor.stats == first + third
+        # So is the same backlog on other ranks.
+        adp_stats.last_fanout_queued_counters = ((3, 300, 0, 0), (1, 100, 0, 0))
+        executor._export_adp_fanout(fourth)
+        executor._export_adp_fanout(_adp_rows("repeat"))
+        assert executor.stats == first + third + fourth
     else:
         # The newer heartbeat replaces the first.
         assert executor.stats == second
+
+
+def test_attention_dp_queue_snapshot_is_exported_again_when_the_backlog_moves(executor):
+    """The fanout buffer's per-rank counters drive the export: a moved backlog is news."""
+    from tensorrt_llm._torch.pyexecutor.adp_iter_stats import ADPIterStatsBuffer
+    from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import RankState
+    from tensorrt_llm.bindings.executor import InflightBatchingStats, IterationStats
+
+    executor.enable_attention_dp = True
+    buffers = [ADPIterStatsBuffer(), ADPIterStatsBuffer()]
+    executor._adp_iter_stats = buffers[0]
+
+    def spin(iter_id, queued_requests_per_rank):
+        """One forward-less loop pass on both ranks; returns the rows exported so far."""
+        states = []
+        for rank, (buffer, queued) in enumerate(zip(buffers, queued_requests_per_rank)):
+            stats = IterationStats()
+            stats.iter = iter_id
+            stats.inflight_batching_stats = InflightBatchingStats()
+            stats.inflight_batching_stats.num_queued_context_requests = queued
+            stats.inflight_batching_stats.num_queued_ctx_tokens = 100 * queued
+            buffer.queue(stats, is_rank0=rank == 0, is_queue_snapshot=True)
+            states.append(RankState(rank=rank, iter_stats=buffer.next_payload()))
+        assert buffers[1].finalize(states, is_rank0=False) == []
+        executor._export_adp_fanout(buffers[0].finalize(states, is_rank0=True))
+        return [
+            (row["attentionDpRank"], row["numQueuedRequests"])
+            for row in map(json.loads, executor.stats)
+        ]
+
+    assert spin(1, [2, 1]) == [(0, 2), (1, 1)]
+    # A repeat is dropped.
+    assert spin(2, [2, 1]) == [(0, 2), (1, 1)]
+    # The same three requests, two of them now on rank 1.
+    assert spin(3, [1, 2]) == [(0, 2), (1, 1), (0, 1), (1, 2)]
+    assert spin(4, [1, 2]) == [(0, 2), (1, 1), (0, 1), (1, 2)]
+    # The backlog left rank 0 altogether: the snapshot has rank 1's row only.
+    assert spin(5, [0, 3]) == [(0, 2), (1, 1), (0, 1), (1, 2), (1, 3)]
 
 
 def test_zero_duration_rows_leave_the_encoder_calls_for_a_measured_record(executor):
@@ -338,7 +382,7 @@ def test_attention_dp_encoder_calls_go_on_rank_zeros_measured_row(
     executor.perf_manager.take_encoder_gpu_times_ms.return_value = [2.5]
     adp_stats = executor._adp_iter_stats
     adp_stats.last_fanout_is_busy_queue_snapshot = kind == "queue-snapshot"
-    adp_stats.last_fanout_queued_counters = (1, 100, 0, 0)
+    adp_stats.last_fanout_queued_counters = ((1, 100, 0, 0), (0, 0, 0, 0))
     adp_stats.last_fanout_has_rank0_row = has_rank0_row
     if kind == "idle-heartbeat":
         adp_stats.last_idle_rank_states = [object(), object()]

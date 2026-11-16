@@ -68,6 +68,10 @@ _PAYLOAD_IFB_KEYS = {
     "num_gen_kv_tokens": "numGenKvTokens",
     "num_paused_requests": "numPausedRequests",
     "num_paused_kv_tokens": "numPausedKvTokens",
+    "num_queued_context_requests": "numQueuedContextRequests",
+    "num_queued_ctx_tokens": "numQueuedCtxTokens",
+    "num_queued_gen_requests": "numQueuedGenRequests",
+    "num_queued_gen_kv_tokens": "numQueuedGenKvTokens",
 }
 # The /metrics JSON key of each scheduling counter a rank's payload carries.
 _SCHEDULING_COUNTER_KEYS = {
@@ -116,21 +120,25 @@ _SPECDEC_STATS_FORMAT = (
     "{" + ", ".join(f'"{key}": %r' for key in _SPECDEC_STATS_KEYS.values()) + "}"
 )
 # Marks for the parts of a rank row that differ between ranks other than 0, and their row text.
-_IFB_MARK, _KV_MARK, _SPECDEC_MARK, _RANK_MARK = (
+_IFB_MARK, _KV_MARK, _SPECDEC_MARK, _RANK_MARK, _QUEUED_MARK = (
     "@adp-row-inflight-batching-stats@",
     "@adp-row-kv-cache-stats@",
     "@adp-row-specdec-stats@",
     "@adp-row-attention-dp-rank@",
+    "@adp-row-num-queued-requests@",
 )
-_IFB_TEXT, _KV_TEXT, _SPECDEC_TEXT, _RANK_TEXT = (
+_IFB_TEXT, _KV_TEXT, _SPECDEC_TEXT, _RANK_TEXT, _QUEUED_TEXT = (
     json.dumps(_IFB_MARK),
     json.dumps(_KV_MARK),
     json.dumps(_SPECDEC_MARK),
     json.dumps(_RANK_MARK),
+    json.dumps(_QUEUED_MARK),
 )
 _MARK_TEXTS = re.compile(
     "("
-    + "|".join(re.escape(text) for text in (_IFB_TEXT, _KV_TEXT, _SPECDEC_TEXT, _RANK_TEXT))
+    + "|".join(
+        re.escape(text) for text in (_IFB_TEXT, _KV_TEXT, _SPECDEC_TEXT, _RANK_TEXT, _QUEUED_TEXT)
+    )
     + ")"
 )
 
@@ -250,9 +258,9 @@ class ADPIterStatsBuffer:
         # whether it settled an iteration at all, the rank states if that
         # iteration was an idle heartbeat (see make_idle_heartbeat_rows),
         # whether it was the queue snapshot of a busy engine with nothing
-        # scheduled on any rank, the queued totals its rows report
+        # scheduled on any rank, every rank's queued counters in rank order
         # (RankIterStatsPayload._QUEUED_FIELDS), and whether rank 0's row is
-        # among them (then it is the first).
+        # among the rows (then it is the first).
         self.last_finalize_settled = False
         self.last_idle_rank_states: Optional[List[RankState]] = None
         self.last_fanout_is_busy_queue_snapshot = False
@@ -418,16 +426,15 @@ class ADPIterStatsBuffer:
     def _make_rank_iter_stats(
         rank0_stats: IterationStats,
         rank_state: RankState,
-        queued_stats: Optional[RankIterStatsPayload] = None,
     ) -> IterationStats:
         """Build one IterationStats row for an ADP rank.
 
         Attention-DP emits one stats row per rank so downstream FPM consumers
         can see scheduling distribution and diagnose load imbalance. Scheduled
-        fields are rank-local. Queued fields are reported on rank 0's row:
-        ``queued_stats`` holds their totals over rank-local admitted backlogs
-        and rank 0's shared pre-admission queues (rank 0's own counters when
-        omitted).
+        and queued fields are rank-local: a rank's queued fields count the
+        requests it admitted and has not scheduled yet, and rank 0's also
+        count the pre-admission queues, which no rank owns yet. The queued
+        load of the engine is the sum over the ranks' rows.
         """
         rank = rank_state.rank
         payload = rank_state.iter_stats
@@ -463,6 +470,11 @@ class ADPIterStatsBuffer:
         ifb.num_paused_requests = payload.num_paused_requests
         ifb.num_paused_kv_tokens = payload.num_paused_kv_tokens
         ifb.num_scheduled_requests = ifb.num_context_requests + ifb.num_gen_requests
+        ifb.num_queued_context_requests = payload.num_queued_context_requests
+        ifb.num_queued_ctx_tokens = payload.num_queued_ctx_tokens
+        ifb.num_queued_gen_requests = payload.num_queued_gen_requests
+        ifb.num_queued_gen_kv_tokens = payload.num_queued_gen_kv_tokens
+        stats.num_queued_requests = ifb.num_queued_context_requests + ifb.num_queued_gen_requests
         counters = payload.scheduling_counters or _NO_SCHEDULING_COUNTERS
         for name, value in zip(RankSchedulingCounters._fields, counters):
             setattr(ifb, name, value)
@@ -470,18 +482,8 @@ class ADPIterStatsBuffer:
         if source_ifb is not None:
             ifb.micro_batch_id = source_ifb.micro_batch_id
             ifb.avg_num_decoded_tokens_per_iter = source_ifb.avg_num_decoded_tokens_per_iter
-            if rank == 0:
-                queued = source_ifb if queued_stats is None else queued_stats
-                ifb.num_queued_context_requests = queued.num_queued_context_requests
-                ifb.num_queued_ctx_tokens = queued.num_queued_ctx_tokens
-                ifb.num_queued_gen_requests = queued.num_queued_gen_requests
-                ifb.num_queued_gen_kv_tokens = queued.num_queued_gen_kv_tokens
-                stats.num_queued_requests = (
-                    ifb.num_queued_context_requests + ifb.num_queued_gen_requests
-                )
 
         if rank != 0:
-            stats.num_queued_requests = 0
             stats.num_completed_requests = 0
             stats.num_new_active_requests = 0
             stats.new_active_requests_queue_latency_ms = 0.0
@@ -547,12 +549,11 @@ class ADPIterStatsBuffer:
                 self.last_finalize_settled = True
                 return []
             states = sorted(matching_states, key=lambda s: s.rank)
-            queued_stats = RankIterStatsPayload()
-            for name in RankIterStatsPayload._QUEUED_FIELDS:
-                setattr(queued_stats, name, sum(getattr(s.iter_stats, name) for s in states))
             queued_counters = tuple(
-                getattr(queued_stats, name) for name in RankIterStatsPayload._QUEUED_FIELDS
+                tuple(getattr(s.iter_stats, name) for name in RankIterStatsPayload._QUEUED_FIELDS)
+                for s in states
             )
+            any_queued = any(any(counters) for counters in queued_counters)
             no_scheduled_work = not any(
                 getattr(s.iter_stats, name) for s in states for name in _SCHEDULED_WORK_FIELDS
             )
@@ -564,23 +565,22 @@ class ADPIterStatsBuffer:
                 is_queue_snapshot and not is_idle_heartbeat and no_scheduled_work
             )
             self.last_fanout_queued_counters = queued_counters
-            idle_with_empty_queues = is_idle_heartbeat and not any(queued_counters)
+            idle_with_empty_queues = is_idle_heartbeat and not any_queued
             exported_states = states
             if is_queue_snapshot and not idle_with_empty_queues:
                 # An idle heartbeat with empty queues reports every rank. Any other queue
-                # snapshot has a row only for the ranks with work to report: scheduled on
-                # that rank, or queued (rank 0's row carries the queued totals).
+                # snapshot has a row only for the ranks with work to report: scheduled or
+                # queued on that rank.
                 exported_states = [
                     s
-                    for s in states
+                    for s, counters in zip(states, queued_counters)
                     if any(getattr(s.iter_stats, name) for name in _ROW_WORK_FIELDS)
-                    or (s.rank == 0 and any(queued_counters))
+                    or any(counters)
                 ]
             self.last_fanout_has_rank0_row = any(s.rank == 0 for s in exported_states)
             rows = self._rank_rows(
                 rank0_stats,
                 exported_states,
-                queued_stats,
                 self._rank0_req_stats.get(iter_stats_iter),
                 self._rank0_kv_iter_stats.get(iter_stats_iter),
                 # Per-loop timings exist on rank 0 only; every rank's row carries them (ADP ranks
@@ -629,7 +629,6 @@ class ADPIterStatsBuffer:
         return self._rank_rows(
             rank0_stats,
             [replace(s, iter_stats=rank0_payload) if s.rank == 0 else s for s in rank_states],
-            rank0_payload,
             None,
             None,
             timings=dict(
@@ -645,20 +644,20 @@ class ADPIterStatsBuffer:
         self,
         rank0_stats: IterationStats,
         states: List[RankState],
-        queued_stats: RankIterStatsPayload,
         req_stats: Optional[List[RequestStats]],
         kv_iter_stats: Optional[Dict[int, object]],
         timings: Dict[str, object],
         is_queue_snapshot: bool,
     ) -> List[str]:
-        """Rows of ranks other than 0 differ only in their payload counts, KV cache stats,
-        speculative-decoding stats and rank: the first is built in full and the others are
-        spliced into its text. ``is_queue_snapshot`` marks every row (see queue())."""
+        """Rows of ranks other than 0 differ only in their payload counts (with the
+        ``numQueuedRequests`` those give), KV cache stats, speculative-decoding stats and rank:
+        the first is built in full and the others are spliced into its text.
+        ``is_queue_snapshot`` marks every row (see queue())."""
         rows: List[str] = []
         template = None
         for state in states:
             if state.rank == 0:
-                stats = self._make_rank_iter_stats(rank0_stats, state, queued_stats)
+                stats = self._make_rank_iter_stats(rank0_stats, state)
                 row = iteration_stats_row(
                     stats,
                     req_stats,
@@ -670,7 +669,7 @@ class ADPIterStatsBuffer:
                 rows.append(json.dumps(row))
                 continue
             if template is None:
-                stats = self._make_rank_iter_stats(rank0_stats, state, queued_stats)
+                stats = self._make_rank_iter_stats(rank0_stats, state)
                 row = iteration_stats_row(
                     stats,
                     attention_dp_rank=state.rank,
@@ -682,6 +681,7 @@ class ADPIterStatsBuffer:
                 row["kvCacheStats"] = _KV_MARK
                 row["specDecodingStats"] = _SPECDEC_MARK
                 row["attentionDpRank"] = _RANK_MARK
+                row["numQueuedRequests"] = _QUEUED_MARK
                 template = (_MARK_TEXTS.split(json.dumps(row)), ifb)
             pieces, ifb = template
             payload = state.iter_stats
@@ -698,6 +698,9 @@ class ADPIterStatsBuffer:
                     payload.specdec_stats, rank0_stats.specdec_stats
                 ),
                 _RANK_TEXT: str(state.rank),
+                _QUEUED_TEXT: str(
+                    payload.num_queued_context_requests + payload.num_queued_gen_requests
+                ),
             }
             rows.append("".join(fills.get(piece, piece) for piece in pieces))
         return rows
