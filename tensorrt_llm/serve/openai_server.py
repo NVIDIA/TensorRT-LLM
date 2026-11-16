@@ -677,6 +677,9 @@ class OpenAIServer(_VideoRoutesMixin):
                     merged.setdefault(modality, {}).update(kw)
                 cfg.media_io_kwargs = merged
                 self.multimodal_server_config = cfg
+        if self._is_visual_gen:
+            check_path_response_policy()
+
         self.allow_request_chat_template = allow_request_chat_template
         self._internal_disagg_auth_key = internal_disagg_auth_key
         self._enable_rl_control_endpoints = enable_rl_control_endpoints
@@ -690,13 +693,8 @@ class OpenAIServer(_VideoRoutesMixin):
         self.host = None
         self.port = None
 
-        if self._is_visual_gen:
-            check_path_response_policy()
-
-        # Dedicated thread pools for the chat / completion path. Keeping
-        # multimodal preprocessing and decode work off the asyncio default
-        # executor avoids contention with unrelated `to_thread` callers and
-        # lets the two stages be sized independently.
+        # Dedicated thread pools keep input and multimodal preprocessing off
+        # the asyncio default executor and let the stages be sized independently.
         self._input_proc_executor = ThreadPoolExecutor(
             max_workers=input_processor_workers,
             thread_name_prefix="trtllm_inputproc",
