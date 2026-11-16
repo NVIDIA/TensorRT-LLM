@@ -59,6 +59,8 @@ def compare(candidate: dict, reference: dict, *, quality: bool = True) -> dict:
         stages = trace.get("stage_outputs", {})
         if set(stages) != {"stage_1", "upsampled_video", "stage_2"}:
             raise ValueError("Expected both denoising stages and latent upsampler outputs")
+        if not isinstance(stages["upsampled_video"], torch.Tensor):
+            raise ValueError("Expected upsampled_video to be a tensor")
         if any(set(stages[name]) != {"video", "audio"} for name in ("stage_1", "stage_2")):
             raise ValueError("Expected both video and audio stage outputs")
     rows = {}

@@ -54,6 +54,20 @@ def test_incomplete_or_mismatched_reference_is_rejected(corruption):
         compare(candidate, reference)
 
 
+@pytest.mark.parametrize("side", ["candidate", "reference"])
+def test_empty_upsampler_output_is_rejected(side: str) -> None:
+    traces = {"candidate": _trace(), "reference": _trace()}
+    traces[side]["stage_outputs"]["upsampled_video"] = {}
+    with pytest.raises(ValueError, match="Expected upsampled_video to be a tensor"):
+        compare(traces["candidate"], traces["reference"], quality=False)
+
+
+def test_complete_trace_includes_upsampler_metric() -> None:
+    result = compare(_trace(), _trace(), quality=False)
+    assert result["pass"]
+    assert result["tensors"]["stage_outputs.upsampled_video"]["bitwise_equal"]
+
+
 def test_low_lpips_cannot_hide_intermediate_divergence(monkeypatch):
     import lpips
 
