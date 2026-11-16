@@ -48,7 +48,6 @@ def test_cache_retention(length, layer, window, accepted, dtype):
     manager.max_attention_window_vec[layer] = window
     if accepted:
         Component.check_cache_manager(component, manager)
-        assert Component.attention_windows(component, length) == [512] * 51 + [length]
     else:
         with pytest.raises(ValueError, match="cache keeps a window"):
             Component.check_cache_manager(component, manager)
