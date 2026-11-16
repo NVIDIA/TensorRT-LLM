@@ -42,6 +42,7 @@ import openai
 import psutil
 import pytest
 import requests
+from test_common.cluster_env import apply_ucx_env
 
 from tensorrt_llm.llmapi import CompletionOutput, RequestOutput, SamplingParams
 from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig, LlmArgs
@@ -180,8 +181,32 @@ def _is_generation_node() -> bool:
 
 
 def _worker_env() -> dict[str, str]:
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("OMPI_", "PMIX_", "PMI_", "SLURM_"))
+        and key
+        not in {
+            "MASTER_ADDR",
+            "MASTER_PORT",
+            "UCX_TLS",
+            "UCX_NET_DEVICES",
+        }
+    }
+    # Pyxis runs as root; dynamic MPI spawn needs these explicit overrides.
+    env.update(
+        {
+            "OMPI_ALLOW_RUN_AS_ROOT": "1",
+            "OMPI_ALLOW_RUN_AS_ROOT_CONFIRM": "1",
+            "TLLM_INDEXER_MQA_LOGITS_ELEM_BUDGET": "1073741824",
+        }
+    )
+    ucx_settings = apply_ucx_env(env, cluster_name=os.environ.get("SLURM_CLUSTER_NAME", ""))
+    if ucx_settings is None:
+        # Unlisted clusters use the TCP interface routed to the peer.
+        env["UCX_TLS"] = "tcp,self,sm,cuda_copy,cuda_ipc"
     ucx_net_devices = os.environ.get("UCX_NET_DEVICES")
-    if ucx_net_devices is None:
+    if ucx_settings is None and ucx_net_devices is None:
         peer_node = NODE_LIST[1 - NODE_RANK]
         try:
             # UDP connect selects a route without sending traffic to the peer.
@@ -210,32 +235,9 @@ def _worker_env() -> dict[str, str]:
                 f"to {peer_node}; set UCX_NET_DEVICES to an available TCP network interface."
             )
 
-    env = {
-        key: value
-        for key, value in os.environ.items()
-        if not key.startswith(("OMPI_", "PMIX_", "PMI_", "SLURM_"))
-        and key
-        not in {
-            "MASTER_ADDR",
-            "MASTER_PORT",
-            "UCX_TLS",
-            "UCX_NET_DEVICES",
-        }
-    }
-    # Pyxis starts these worker processes as root; preserve the explicit
-    # Open MPI container override for mpi4py dynamic worker spawn.
-    env.update(
-        {
-            "OMPI_ALLOW_RUN_AS_ROOT": "1",
-            "OMPI_ALLOW_RUN_AS_ROOT_CONFIRM": "1",
-            "TLLM_INDEXER_MQA_LOGITS_ELEM_BUDGET": "1073741824",
-            # Avoid auto-selecting an NVL72 RDMA VF whose container-visible
-            # IPv6 address UCX cannot bind. Use the TCP interface routed to the peer
-            # unless UCX_NET_DEVICES explicitly selects another device.
-            "UCX_NET_DEVICES": ucx_net_devices,
-            "UCX_TLS": "tcp,self,sm,cuda_copy,cuda_ipc",
-        }
-    )
+    # Preserve an explicit device selection over the shared cluster defaults.
+    if ucx_net_devices is not None:
+        env["UCX_NET_DEVICES"] = ucx_net_devices
     return env
 
 
