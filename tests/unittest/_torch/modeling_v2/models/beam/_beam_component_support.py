@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Test support shared by the Beam GPU tests under ``models/beam/``.
 
-Only harness code lives here: the IEEE fp32 session guard, the optional evidence writer,
-result bookkeeping that judges with the rules each test file passes in, op-path
+Only harness code lives here: the IEEE fp32 session guard, result bookkeeping that
+judges with the rules each test file passes in, op-path
 instrumentation, the one-request KV cache context of the block tests, and the generated
 configuration and state of the six-block small model. No reference math lives here; each
 reference stays in its own ``_*_reference.py`` or ``_*_cases.py`` module, and every rule
@@ -19,18 +19,12 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
-import json
 import math
-import os
-import platform
 import re
-import subprocess
-import sys
 import types
 import zlib
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
 import torch
@@ -67,7 +61,7 @@ def math_state() -> dict:
     }
 
 
-def ieee_fp32_session(write_evidence: Callable[[str, dict], None]) -> Iterator[dict]:
+def ieee_fp32_session() -> Iterator[dict]:
     """Enforce IEEE fp32 and verify it before and after the module's tests."""
     matmul = torch.backends.cuda.matmul
     saved = (
@@ -88,7 +82,6 @@ def ieee_fp32_session(write_evidence: Callable[[str, dict], None]) -> Iterator[d
         yield state
         after = fp32_gemm_probe()
         state.update(math_after=math_state(), fp32_gemm_probe_after=after)
-        write_evidence("fp32-session", {"fixture": "ieee_fp32", "math": state})
         assert after <= 1e-5, f"fp32 GEMM stopped being IEEE fp32 (relative error {after:.3g})"
     finally:
         # Legacy setters can also change the newer precision controls.
@@ -98,57 +91,6 @@ def ieee_fp32_session(write_evidence: Callable[[str, dict], None]) -> Iterator[d
         torch.backends.cudnn.allow_tf32 = allow_cudnn
         matmul.fp32_precision = matmul_precision
         torch.backends.cudnn.fp32_precision = cudnn_precision
-
-
-def git_revision() -> str | None:
-    import tensorrt_llm
-
-    root = Path(tensorrt_llm.__file__).resolve().parents[1]
-    try:
-        out = subprocess.run(
-            ["git", "-C", str(root), "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return out.stdout.strip() or None
-
-
-def environment(ieee: dict, execution: Mapping[str, object], **extra: object) -> dict:
-    """The device and software a case ran on; ``extra`` entries follow ``execution``."""
-    import tensorrt_llm
-
-    device = torch.cuda.current_device()
-    return {
-        "device_name": torch.cuda.get_device_name(device),
-        "device_capability": list(torch.cuda.get_device_capability(device)),
-        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
-        "torch": torch.__version__,
-        "torch_cuda": torch.version.cuda,
-        "tensorrt_llm": tensorrt_llm.__version__,
-        "tensorrt_llm_file": tensorrt_llm.__file__,
-        "source_revision": git_revision(),
-        "python": sys.version.split()[0],
-        "machine": platform.machine(),
-        "argv": sys.argv,
-        "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
-        "slurm_step_id": os.environ.get("SLURM_STEP_ID"),
-        "execution": dict(execution),
-        **extra,
-        "math": ieee,
-    }
-
-
-def write_evidence(env_var: str, name: str, record: dict) -> None:
-    """Write ``record`` as ``<name>.json`` into the directory named by ``env_var``, if set."""
-    directory = os.environ.get(env_var)
-    if not directory:
-        return
-    path = Path(directory)
-    path.mkdir(parents=True, exist_ok=True)
-    (path / f"{name}.json").write_text(json.dumps(record, indent=1, default=str) + "\n")
 
 
 def tensor_sha256(t: torch.Tensor) -> str:

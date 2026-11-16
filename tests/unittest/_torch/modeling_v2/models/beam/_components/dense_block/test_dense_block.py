@@ -28,17 +28,13 @@ Optional environment:
   compared against the captures, and the generated input must equal theirs bit for bit.
   Separate source-capture tests report SKIPPED when this variable is unset; an explicitly
   configured directory must contain valid captures. Reference tests run independently.
-* ``BEAM_DENSE_BLOCK_EVIDENCE``: a directory that receives one JSON record per test case:
-  every comparison with its rule, the op calls and CUDA kernels of the forward, and the
-  device and software it ran on; and ``fp32-session.json``, the fp32 GEMM checks made
-  before and after the module's tests.
+QA reports: use ``tests/scripts/beam_component_qa.py`` (see the component README).
 
 Dependencies: a TensorRT-LLM build for sm_103 with flashinfer importable. No model files.
 """
 
 from __future__ import annotations
 
-import functools
 import math
 import os
 import types
@@ -58,7 +54,7 @@ __extra_import_path__ = [".", "../..", "../../../.."]
 
 import _beam_component_support as support  # noqa: E402
 import _dense_block_reference as reference  # noqa: E402
-from _beam_component_support import assert_all_pass, tensor_sha256  # noqa: E402
+from _beam_component_support import assert_all_pass  # noqa: E402
 from _validating import validating  # noqa: E402
 
 from _components.dense_block import block as block_module  # noqa: E501
@@ -212,14 +208,11 @@ def block_config(**overrides) -> types.SimpleNamespace:
 def ieee_fp32():
     """The source's fp32 steps are IEEE fp32: refuse a process that substitutes TF32, both
     before the module's tests and after them."""
-    yield from support.ieee_fp32_session(_write_evidence)
+    yield from support.ieee_fp32_session()
 
 
-def _environment(ieee: dict) -> dict:
-    return support.environment(ieee, EXECUTION)
-
-
-_write_evidence = functools.partial(support.write_evidence, "BEAM_DENSE_BLOCK_EVIDENCE")
+def _execution_state(ieee: dict) -> dict:
+    return {"math": ieee, "execution": dict(EXECUTION)}
 
 
 # ----------------------------------------------------------------------------- comparison
@@ -523,11 +516,6 @@ def accounting(seed: int, blk: BeamDenseBlockBf16Sm103Tp1) -> dict:
         assert torch.equal(loaded[name], state[name]), f"{name} differs from the reference's"
     assert not reference.state_problems(generated(seed)["state_cpu"])
     record = {"tensors": len(loaded), "state_problems": []}
-    if os.environ.get("BEAM_DENSE_BLOCK_EVIDENCE"):
-        record["sha256"] = {
-            name: tensor_sha256(t) for name, t in generated(seed)["state_cpu"].items()
-        }
-        record["input_sha256"] = tensor_sha256(generated(seed)["input"])
     return record
 
 
@@ -748,7 +736,7 @@ def test_rejects_unsupported_inputs_before_dispatch(case) -> None:
 
 
 @pytest.mark.parametrize("seed,length", CASES, ids=CASE_IDS)
-def test_block_matches_reference(seed, length, ieee_fp32) -> None:
+def test_block_matches_reference(record_property, seed, length, ieee_fp32) -> None:
     """One case: the whole block, then every operation on its own input."""
     blk = loaded_block(seed)
     accounting_record = accounting(seed, blk)
@@ -763,7 +751,7 @@ def test_block_matches_reference(seed, length, ieee_fp32) -> None:
         final.update(reference="reference")
         results.append(final)
         results.extend(replay(blk, md, ref, "reference"))
-    _write_evidence(
+    record_property(
         f"block-seed{seed}-T{length}",
         {
             "test": "test_block_matches_reference",
@@ -771,7 +759,7 @@ def test_block_matches_reference(seed, length, ieee_fp32) -> None:
             "accounting": accounting_record,
             "rules": {k: list(v) for k, v in RULES.items()},
             "results": results,
-            "environment": _environment(ieee_fp32),
+            "execution_state": _execution_state(ieee_fp32),
         },
     )
     assert_all_pass(results)
@@ -795,7 +783,7 @@ def test_block_matches_source_captures(seed, length, ieee_fp32) -> None:
 
 
 @pytest.mark.parametrize("seed,length", CASES, ids=CASE_IDS)
-def test_forward_runs_the_component_path(seed, length, ieee_fp32) -> None:
+def test_forward_runs_the_component_path(record_property, seed, length, ieee_fp32) -> None:
     """One case: the component's own composition ran, op by op, through thop attention on
     this GPU, with no SDPA and no built-in Beam module on the way."""
     blk = loaded_block(seed)
@@ -830,9 +818,9 @@ def test_forward_runs_the_component_path(seed, length, ieee_fp32) -> None:
         "attention_kernels": [k for k in kernels if support.ATTENTION_KERNEL.search(k)],
         "sdpa_cpu_ops": [n for n in cpu_ops if support.SDPA_OPS.search(n)],
         "kv_cache": dict(KV_CACHE, manager=type(md.kv_cache_manager).__name__, **cache_mapping),
-        "environment": _environment(ieee_fp32),
+        "execution_state": _execution_state(ieee_fp32),
     }
-    _write_evidence(f"path-seed{seed}-T{length}", record)
+    record_property(f"path-seed{seed}-T{length}", record)
 
     assert type(blk).__module__.endswith("dense_block.block")
     assert tuple(names) == EXPECTED_CALLS, names
@@ -863,7 +851,7 @@ def test_forward_runs_the_component_path(seed, length, ieee_fp32) -> None:
     assert torch.equal(keys, k_in) and torch.equal(values, v_in)
 
 
-def test_detects_a_wrong_residual_coefficient(ieee_fp32, monkeypatch) -> None:
+def test_detects_a_wrong_residual_coefficient(record_property, ieee_fp32, monkeypatch) -> None:
     """The complete-block comparison rejects a zeroed final residual coefficient and
     accepts the unchanged block, on the same case and the same comparison."""
     seed, length = 17, 17
@@ -881,14 +869,14 @@ def test_detects_a_wrong_residual_coefficient(ieee_fp32, monkeypatch) -> None:
             out = blk(x, positions, md)
         runs[label] = compare("block_output", out, ref["block_output"], "block_output")
         runs[label]["feed_forward_scales"] = list(blk.feed_forward_scales)
-    _write_evidence(
+    record_property(
         f"fault-seed{seed}-T{length}",
         {
             "test": "test_detects_a_wrong_residual_coefficient",
             "case": {"seed": seed, "length": length},
             "fault": "final residual coefficient sqrt(2)/sqrt(3) -> 0.0, fixture-scoped",
             "runs": runs,
-            "environment": _environment(ieee_fp32),
+            "execution_state": _execution_state(ieee_fp32),
         },
     )
     assert runs["unchanged"]["passed"] is True, runs["unchanged"]["problems"]

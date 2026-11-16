@@ -29,9 +29,7 @@ Optional environment:
   under the same rules as with the reference. Separate source-capture tests report
   SKIPPED when this variable is unset; a configured directory must contain valid files.
   Ordinary reference and routing-invariant tests run independently.
-* ``BEAM_MOE_ROUTER_EVIDENCE``: a directory that receives one JSON record per test case:
-  every comparison with its rule, hashes of the routed tensors, the torch calls and CUDA
-  kernels of the forward, and the device and software it ran on.
+QA reports: use ``tests/scripts/beam_component_qa.py`` (see the component README).
 
 Dependencies: a TensorRT-LLM build for sm_103. No model files.
 """
@@ -39,17 +37,12 @@ Dependencies: a TensorRT-LLM build for sm_103. No model files.
 from __future__ import annotations
 
 import contextlib
-import functools
 import os
-import platform
-import sys
 import types
 from pathlib import Path
 
 import pytest
 import torch
-
-import tensorrt_llm
 
 try:
     import tensorrt_llm._torch.models.modeling_beam as builtin_beam
@@ -122,37 +115,17 @@ def router_config(**overrides) -> types.SimpleNamespace:
 @pytest.fixture(scope="module", autouse=True)
 def ieee_fp32():
     """Enforce IEEE fp32 and check the actual GEMM precision."""
-    yield from support.ieee_fp32_session(_write_evidence)
+    yield from support.ieee_fp32_session()
 
 
-# ----------------------------------------------------------------------------- evidence
+# ----------------------------------------------------------------------------- comparison bookkeeping
 
 
-def _environment() -> dict:
-    device = torch.cuda.current_device()
+def _execution_state() -> dict:
     return {
-        "device_name": torch.cuda.get_device_name(device),
-        "device_capability": list(torch.cuda.get_device_capability(device)),
-        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
-        "torch": torch.__version__,
-        "torch_cuda": torch.version.cuda,
-        "tensorrt_llm": tensorrt_llm.__version__,
-        "tensorrt_llm_file": tensorrt_llm.__file__,
-        "python": sys.version.split()[0],
-        "machine": platform.machine(),
-        "argv": sys.argv,
-        "pid": os.getpid(),
-        "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
-        "slurm_step_id": os.environ.get("SLURM_STEP_ID"),
         "execution": dict(EXECUTION),
-        "ambient_math": {
-            "cuda_matmul_fp32_precision": torch.backends.cuda.matmul.fp32_precision,
-        },
-        "source_captures": os.environ.get("BEAM_MOE_ROUTER_SOURCE_CAPTURES"),
+        "math": {"cuda_matmul_fp32_precision": torch.backends.cuda.matmul.fp32_precision},
     }
-
-
-_write_evidence = functools.partial(support.write_evidence, "BEAM_MOE_ROUTER_EVIDENCE")
 
 
 def route_hashes(route: dict) -> dict:
@@ -353,7 +326,9 @@ def check_invariants(route: dict, sum_to_one: bool) -> list:
 # ----------------------------------------------------------------------------- construction and loading
 
 
-def test_construction_allocates_only_the_router_state() -> None:
+def test_construction_allocates_only_the_router_state(
+    record_property,
+) -> None:
     """Construction allocates exactly the two FP32 router tensors: no expert, attention,
     cache or model state, and no submodule."""
     torch.cuda.synchronize()
@@ -373,9 +348,9 @@ def test_construction_allocates_only_the_router_state() -> None:
         "submodules": [n for n, _ in router.named_modules() if n],
         "elements": elements,
         "cuda_bytes_allocated": allocated,
-        "environment": _environment(),
+        "execution_state": _execution_state(),
     }
-    _write_evidence("construction", record)
+    record_property("construction", record)
     assert params == {"weight": ((256, 5120), torch.float32, False)}
     assert buffers == {"e_score_correction_bias": ((256,), torch.float32)}
     assert record["submodules"] == []
@@ -409,11 +384,11 @@ def test_construction_rejects_a_cpu_device() -> None:
 
 
 @pytest.mark.parametrize("seed", cases.SEEDS)
-def test_loading_copies_both_tensors_exactly(seed) -> None:
+def test_loading_copies_both_tensors_exactly(record_property, seed) -> None:
     weight, bias, _ = cases.matrix_case(seed, 1)
     router = BeamMoeRouterBf16Sm103Tp1(router_config(), LAYER_IDX, device="cuda")
     router.load_weights(weight, bias)
-    _write_evidence(
+    record_property(
         f"loading-seed{seed}",
         {
             "test": "test_loading_copies_both_tensors_exactly",
@@ -513,7 +488,9 @@ def test_forward_rejects_invalid_input(case, error, match) -> None:
 # ----------------------------------------------------------------------------- precision
 
 
-def test_precision_path_is_fp32_without_tf32_or_autocast() -> None:
+def test_precision_path_is_fp32_without_tf32_or_autocast(
+    record_property,
+) -> None:
     """Projection, sigmoid, selection scores, group scores and normalization are fp32, the
     projection is IEEE fp32 even when the caller has TF32 or bf16 autocast on, and the
     caller's global precision policy remains unchanged."""
@@ -540,7 +517,7 @@ def test_precision_path_is_fp32_without_tf32_or_autocast() -> None:
     fp64_error = float((route["logits"].double() - fp64_logits).abs().max())
     projection = [c for c in trace.calls if c["func"] == "trtllm.cublas_mm"]
     dtypes = {name: str(t.dtype) for name, t in route.items()}
-    _write_evidence(
+    record_property(
         "precision",
         {
             "test": "test_precision_path_is_fp32_without_tf32_or_autocast",
@@ -551,7 +528,7 @@ def test_precision_path_is_fp32_without_tf32_or_autocast() -> None:
             "logits_vs_fp64_max_abs": fp64_error,
             "bitwise_equal_to_plain_call": {k: torch.equal(route[k], plain[k]) for k in route},
             "torch_calls": [c["func"] for c in trace.calls],
-            "environment": _environment(),
+            "execution_state": _execution_state(),
         },
     )
     assert ambient == after == "tf32", (ambient, after)
@@ -576,7 +553,7 @@ def test_precision_path_is_fp32_without_tf32_or_autocast() -> None:
 
 
 @pytest.mark.parametrize("seed,tokens", cases.CASES, ids=cases.CASE_IDS)
-def test_matrix(seed, tokens) -> None:
+def test_matrix(record_property, seed, tokens) -> None:
     """One case of the fixed matrix: the output contract, every step against the reference
     the routing invariants, and the evidence that
     the routing ran on the GPU in this component's op with no host synchronization."""
@@ -616,7 +593,7 @@ def test_matrix(seed, tokens) -> None:
         "torch.Tensor.gather",
         "torch.Tensor.sum",
     }
-    _write_evidence(
+    record_property(
         f"matrix-seed{seed}-T{tokens}",
         {
             "test": "test_matrix",
@@ -638,7 +615,7 @@ def test_matrix(seed, tokens) -> None:
             "off_device_outputs": off_device,
             "sync_debug_mode": "error",
             "cuda_kernels": kernels,
-            "environment": _environment(),
+            "execution_state": _execution_state(),
         },
     )
     assert type(router).__module__.endswith("moe_router.router")
@@ -716,8 +693,10 @@ def route_fixture(name: str) -> tuple[dict, dict, list]:
     return route, reference, results
 
 
-def _record_fixture(name: str, test: str, route: dict, results: list, extra: dict) -> None:
-    _write_evidence(
+def _record_fixture(
+    record_property, name: str, test: str, route: dict, results: list, extra: dict
+) -> None:
+    record_property(
         f"fixture-{name}",
         {
             "test": test,
@@ -731,12 +710,14 @@ def _record_fixture(name: str, test: str, route: dict, results: list, extra: dic
             "hashes": route_hashes(route),
             "results": results,
             **extra,
-            "environment": _environment(),
+            "execution_state": _execution_state(),
         },
     )
 
 
-def test_bias_selects_but_never_weights() -> None:
+def test_bias_selects_but_never_weights(
+    record_property,
+) -> None:
     """The correction bias changes which experts are chosen, and the returned weights are
     still the normalized unbiased scores of the chosen experts."""
     zero, _, zero_results = route_fixture("bias_zero")
@@ -758,9 +739,16 @@ def test_bias_selects_but_never_weights() -> None:
         ),
         "weights_vs_normalized_biased_max_abs": leak_gap,
     }
-    _record_fixture("bias_zero", "test_bias_selects_but_never_weights", zero, zero_results, {})
     _record_fixture(
-        "bias_shift", "test_bias_selects_but_never_weights", shift, shift_results, extra
+        record_property, "bias_zero", "test_bias_selects_but_never_weights", zero, zero_results, {}
+    )
+    _record_fixture(
+        record_property,
+        "bias_shift",
+        "test_bias_selects_but_never_weights",
+        shift,
+        shift_results,
+        extra,
     )
     cases.assert_all_pass(zero_results + shift_results)
     assert zero["groups"].tolist() == [[0, 1, 2, 3]]
@@ -775,12 +763,15 @@ def test_bias_selects_but_never_weights() -> None:
     assert leak_gap > cases.RULES["weights"], f"bias in the weights would be invisible: {leak_gap}"
 
 
-def test_group_boundary_moves_with_the_top_two_sum() -> None:
+def test_group_boundary_moves_with_the_top_two_sum(
+    record_property,
+) -> None:
     """Only the challenger group's second expert moves, and the group crosses the 4th/5th
     boundary; the group holding the single best expert stays out."""
     route, _, results = route_fixture("group_boundary")
     group_scores = route["group_scores"]
     _record_fixture(
+        record_property,
         "group_boundary",
         "test_group_boundary_moves_with_the_top_two_sum",
         route,
@@ -798,7 +789,9 @@ def test_group_boundary_moves_with_the_top_two_sum() -> None:
     assert 5 not in route["groups"].flatten().tolist()
 
 
-def test_exclusion_masks_every_expert_of_dropped_groups() -> None:
+def test_exclusion_masks_every_expert_of_dropped_groups(
+    record_property,
+) -> None:
     """The best single expert sits in a group that loses; it and every other expert of the
     four dropped groups are -inf, although every retained selection score is negative."""
     route, _, results = route_fixture("exclusion")
@@ -806,6 +799,7 @@ def test_exclusion_masks_every_expert_of_dropped_groups() -> None:
     selected_scores = route["selection_scores"].gather(-1, ids)
     spike_score = float(route["selection_scores"][0, cases.EXCLUSION_SPIKE])
     _record_fixture(
+        record_property,
         "exclusion",
         "test_exclusion_masks_every_expert_of_dropped_groups",
         route,
@@ -820,11 +814,20 @@ def test_exclusion_masks_every_expert_of_dropped_groups() -> None:
     assert all(e // cases.PER_GROUP in route["groups"][0].tolist() for e in ids[0].tolist())
 
 
-def test_expert_boundary_moves_one_expert() -> None:
+def test_expert_boundary_moves_one_expert(
+    record_property,
+) -> None:
     """Expert 2 crosses the 8th/9th boundary within an unchanged group selection: it enters
     last and expert 97 leaves, every other position unchanged."""
     route, _, results = route_fixture("expert_boundary")
-    _record_fixture("expert_boundary", "test_expert_boundary_moves_one_expert", route, results, {})
+    _record_fixture(
+        record_property,
+        "expert_boundary",
+        "test_expert_boundary_moves_one_expert",
+        route,
+        results,
+        {},
+    )
     cases.assert_all_pass(results)
     assert route["groups"].tolist() == [[0, 1, 2, 3], [0, 1, 2, 3]]
     assert route["ids"].tolist() == [
@@ -833,7 +836,9 @@ def test_expert_boundary_moves_one_expert() -> None:
     ]
 
 
-def test_ties_follow_native_topk_order() -> None:
+def test_ties_follow_native_topk_order(
+    record_property,
+) -> None:
     """Match the native reference in each batch shape, including valid boundary ties."""
     route, _, results = route_fixture("ties")
     spec = cases.fixtures()["ties"]
@@ -859,6 +864,7 @@ def test_ties_follow_native_topk_order() -> None:
         for i, name in enumerate(spec["rows"])
     }
     _record_fixture(
+        record_property,
         "ties",
         "test_ties_follow_native_topk_order",
         route,
@@ -868,7 +874,9 @@ def test_ties_follow_native_topk_order() -> None:
     cases.assert_all_pass(results)
 
 
-def test_epsilon_is_the_source_denominator() -> None:
+def test_epsilon_is_the_source_denominator(
+    record_property,
+) -> None:
     """Weights divide by sum + 1e-20: a row whose scores underflow to 0 gets zero weights,
     not NaN, and a row whose selected scores sum to ~1e-20 sums to S / (S + 1e-20), well
     below 1 -- a denominator without the term, or with 1e-12 or 1e-6, gives 1 or ~0."""
@@ -878,6 +886,7 @@ def test_epsilon_is_the_source_denominator() -> None:
     expected_sum = (exact / (exact + 1e-20)).tolist()
     sums = route["weights"].sum(dim=-1).double().tolist()
     _record_fixture(
+        record_property,
         "epsilon",
         "test_epsilon_is_the_source_denominator",
         route,

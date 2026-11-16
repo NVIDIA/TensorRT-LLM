@@ -14,3 +14,26 @@ TP1 normalization and activation use their FlashInfer contracts; the TP4 input n
 and dense MLP use explicit FP32 Beam operators, so BF16 rounding can differ. TP1 also
 accepts a narrower RoPE schema. Compare each helper against its declared contract,
 not against the TP4 model as a bitwise reference.
+
+## Manual QA reports
+
+Tests expose comparison metrics with pytest's `record_property` fixture. Ordinary
+pytest runs do not write custom evidence files or collect Git/Slurm metadata.
+For a manual report, run the opt-in QA script from the repository root:
+
+```bash
+python tests/scripts/beam_component_qa.py --output /tmp/beam-router-qa -- \
+    tests/unittest/_torch/modeling_v2/models/beam/_components/moe_router -v
+```
+
+Use a new output directory for each run. `report.json` records pytest's exit code,
+collection/setup/call/teardown outcomes, comparison properties, and checkout/runtime
+identity. A successful setup phase does not imply a successful test; inspect the
+call and teardown outcomes too. Missing optional source captures remain explicit
+skips; configured invalid captures fail. The script neither stages captures nor
+changes numerical checks. Large suites still require their documented resources.
+
+This replaces the `BEAM_*_EVIDENCE` environment variables and per-case JSON files;
+metadata is collected once per QA run. Dense weight-accounting checks still compare
+all tensors directly, without the optional duplicate hashing pass. Keep reports
+outside the public repository because they contain local paths and scheduler IDs.

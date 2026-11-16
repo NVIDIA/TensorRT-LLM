@@ -20,12 +20,7 @@ Invocation (fp32 steps need the TF32 overrides removed before torch is imported)
     env -u TORCH_ALLOW_TF32_CUBLAS_OVERRIDE -u NVIDIA_TF32_OVERRIDE \\
         python -m pytest tests/unittest/_torch/modeling_v2/models/beam/_components/moe
 
-Optional environment:
-
-* ``BEAM_MOE_EVIDENCE``: a directory that receives one JSON record per compared case:
-  every comparison with its rule, the op and expert calls where they were recorded, and
-  the device and software it ran on; and ``fp32-session.json``, the fp32 GEMM checks made
-  before and after the module's tests.
+QA reports: use ``tests/scripts/beam_component_qa.py`` (see the component README).
 
 Dependencies: a TensorRT-LLM build for sm_103 and about 60 GiB of free device memory:
 one seed's generated state and the loaded MoE hold 18.75 GiB of expert weights each, and
@@ -34,7 +29,6 @@ one case builds a second, unloaded MoE. No model files.
 
 from __future__ import annotations
 
-import functools
 import gc
 import types
 from collections import OrderedDict
@@ -178,7 +172,7 @@ def moe_config(**overrides) -> types.SimpleNamespace:
 def ieee_fp32():
     """The source's fp32 steps are IEEE fp32: refuse a process that substitutes TF32, both
     before the module's tests and after them."""
-    yield from support.ieee_fp32_session(_write_evidence)
+    yield from support.ieee_fp32_session()
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -188,11 +182,8 @@ def device_memory():
     release_cache()
 
 
-def _environment(ieee: dict) -> dict:
-    return support.environment(ieee, EXECUTION)
-
-
-_write_evidence = functools.partial(support.write_evidence, "BEAM_MOE_EVIDENCE")
+def _execution_state(ieee: dict) -> dict:
+    return {"math": ieee, "execution": dict(EXECUTION)}
 
 
 # -------------------------------------------------- comparison
@@ -589,7 +580,7 @@ def test_rejects_unsupported_inputs_before_dispatch(case, error, match) -> None:
 
 
 @pytest.mark.parametrize("seed,length", CASES, ids=CASE_IDS)
-def test_moe_matches_reference(seed, length, ieee_fp32) -> None:
+def test_moe_matches_reference(record_property, seed, length, ieee_fp32) -> None:
     """One case: the forward's own routing (the router op's mapping of that call) selects
     exactly the reference's groups and experts in order, its fp32 steps and the output are
     within their rules, and the call leaves its input and the parameters untouched."""
@@ -611,7 +602,7 @@ def test_moe_matches_reference(seed, length, ieee_fp32) -> None:
     results.extend(compare_routes(route, ref_route))
     results.append(weight_invariants(route))
     results.append(unchanged(x, x_before, versions, after))
-    _write_evidence(
+    record_property(
         f"moe-seed{seed}-T{length}",
         {
             "test": "test_moe_matches_reference",
@@ -620,7 +611,7 @@ def test_moe_matches_reference(seed, length, ieee_fp32) -> None:
             "results": results,
             "selected_experts": sorted(set(route["ids"].reshape(-1).tolist())),
             "input_sha256": tensor_sha256(x),
-            "environment": _environment(ieee_fp32),
+            "execution_state": _execution_state(ieee_fp32),
         },
     )
     assert_all_pass(results)
@@ -629,7 +620,7 @@ def test_moe_matches_reference(seed, length, ieee_fp32) -> None:
 # -------------------------------------------------- tests: the component path
 
 
-def test_forward_runs_the_component_path(ieee_fp32) -> None:
+def test_forward_runs_the_component_path(record_property, ieee_fp32) -> None:
     """One case: the router op once, then BeamDispatchCombine, inside which every selected
     expert -- ascending, once each -- receives exactly its tokens' rows in token order and
     runs its own three projections and SwiGLU; every op's guard admits its arguments and no
@@ -640,14 +631,14 @@ def test_forward_runs_the_component_path(ieee_fp32) -> None:
     with builtin_beam_forbidden(), validating(*OPS), recording(*OPS, experts=True) as calls:
         out = moe(x)
         torch.cuda.synchronize()
-    _write_evidence(
+    record_property(
         f"path-seed{seed}-T{length}",
         {
             "test": "test_forward_runs_the_component_path",
             "case": {"seed": seed, "length": length},
             "moe": f"{type(moe).__module__}.{type(moe).__qualname__}",
             "op_calls": loggable(calls),
-            "environment": _environment(ieee_fp32),
+            "execution_state": _execution_state(ieee_fp32),
         },
     )
 
@@ -695,7 +686,7 @@ def test_forward_runs_the_component_path(ieee_fp32) -> None:
 # -------------------------------------------------- tests: designed fixtures
 
 
-def test_expert_identity_fixture(ieee_fp32, monkeypatch) -> None:
+def test_expert_identity_fixture(record_property, ieee_fp32, monkeypatch) -> None:
     """Designed logits route four tokens to the same eight experts -- both ends of the id
     range and of four groups -- in four different orders. Every one of the eight gets all
     four rows, the other 248 are never asked for, the output matches the reference, and
@@ -719,7 +710,7 @@ def test_expert_identity_fixture(ieee_fp32, monkeypatch) -> None:
     monkeypatch.undo()
     assert moe.experts[255] is not moe.experts[0]
     runs["restored"] = compare("moe_output", moe(x), ref_out, "moe_output")
-    _write_evidence(
+    record_property(
         "fixture-expert-identity",
         {
             "test": "test_expert_identity_fixture",
@@ -728,7 +719,7 @@ def test_expert_identity_fixture(ieee_fp32, monkeypatch) -> None:
             "weights": route["weights"].tolist(),
             "expert_calls": loggable(asked),
             "runs": runs,
-            "environment": _environment(ieee_fp32),
+            "execution_state": _execution_state(ieee_fp32),
         },
     )
     assert route["ids"].tolist() == designed, route["ids"].tolist()
@@ -744,7 +735,7 @@ def test_expert_identity_fixture(ieee_fp32, monkeypatch) -> None:
     assert runs["restored"]["passed"] is True, runs["restored"]["problems"]
 
 
-def test_changed_routing_between_calls(ieee_fp32) -> None:
+def test_changed_routing_between_calls(record_property, ieee_fp32) -> None:
     """Rows routed to expert set A, then rows routed to the disjoint set B, then A again:
     B's call routes as designed and asks for no expert of A, and the repeated A call
     reproduces the first one bit for bit -- nothing of one call's routing survives into
@@ -767,7 +758,7 @@ def test_changed_routing_between_calls(ieee_fp32) -> None:
             }
         )
     first, second, third = runs
-    _write_evidence(
+    record_property(
         "fixture-changed-routing",
         {
             "test": "test_changed_routing_between_calls",
@@ -775,7 +766,7 @@ def test_changed_routing_between_calls(ieee_fp32) -> None:
                 {"ids": r["ids"].tolist(), "experts": r["experts"], "result": r["vs_reference"]}
                 for r in runs
             ],
-            "environment": _environment(ieee_fp32),
+            "execution_state": _execution_state(ieee_fp32),
         },
     )
     assert first["ids"].tolist() == [designed_ids(SET_A, t) for t in range(len(RANKS))]
@@ -806,7 +797,7 @@ def test_zero_input_gives_exact_zero() -> None:
     assert [c["expert_id"] for c in asked] == sorted(set(route["ids"].reshape(-1).tolist()))
 
 
-def test_token_permutation_preserves_correspondence(ieee_fp32) -> None:
+def test_token_permutation_preserves_correspondence(record_property, ieee_fp32) -> None:
     """Reversing the tokens reverses the routing and the output: each token keeps its own
     experts and its own output row."""
     seed, length = 17, 17
@@ -828,18 +819,18 @@ def test_token_permutation_preserves_correspondence(ieee_fp32) -> None:
         compare("output_vs_reference", base, ref_out, "moe_output"),
         compare("permuted_output_vs_reference", permuted, ref_out[perm], "moe_output"),
     ]
-    _write_evidence(
+    record_property(
         f"permutation-seed{seed}-T{length}",
         {
             "test": "test_token_permutation_preserves_correspondence",
             "results": results,
-            "environment": _environment(ieee_fp32),
+            "execution_state": _execution_state(ieee_fp32),
         },
     )
     assert_all_pass(results)
 
 
-def test_detects_routed_scaling_faults(ieee_fp32, monkeypatch) -> None:
+def test_detects_routed_scaling_faults(record_property, ieee_fp32, monkeypatch) -> None:
     """The output comparison rejects the combination scaled by 1.0 or by 2.5 twice, and
     accepts the unchanged and the restored MoE, on the same case and the same rule."""
     seed, length = 17, 17
@@ -852,12 +843,12 @@ def test_detects_routed_scaling_faults(ieee_fp32, monkeypatch) -> None:
         runs[f"scaled_by_{factor}"] = compare("moe_output", moe(x), ref_out, "moe_output")
         monkeypatch.undo()
     runs["restored"] = compare("moe_output", moe(x), ref_out, "moe_output")
-    _write_evidence(
+    record_property(
         f"fault-scaling-seed{seed}-T{length}",
         {
             "test": "test_detects_routed_scaling_faults",
             "runs": runs,
-            "environment": _environment(ieee_fp32),
+            "execution_state": _execution_state(ieee_fp32),
         },
     )
     assert dispatch_combine.ROUTED_SCALING_FACTOR == 2.5

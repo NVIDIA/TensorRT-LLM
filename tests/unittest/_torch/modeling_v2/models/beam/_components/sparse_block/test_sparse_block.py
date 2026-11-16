@@ -26,12 +26,7 @@ Invocation (fp32 steps need the TF32 overrides removed before torch is imported)
     env -u TORCH_ALLOW_TF32_CUBLAS_OVERRIDE -u NVIDIA_TF32_OVERRIDE python -m pytest \\
         tests/unittest/_torch/modeling_v2/models/beam/_components/sparse_block
 
-Optional environment:
-
-* ``BEAM_SPARSE_BLOCK_EVIDENCE``: a directory that receives one JSON record per test
-  case: every comparison with its rule, the op calls and CUDA kernels of the forward
-  where they were recorded, and the device and software it ran on; and
-  ``fp32-session.json``, the fp32 GEMM checks made before and after the module's tests.
+QA reports: use ``tests/scripts/beam_component_qa.py`` (see the component README).
 
 Dependencies: a TensorRT-LLM build for sm_103 with flashinfer importable and about 60 GiB
 of free device memory: one seed's generated state and the loaded block hold 18.75 GiB of
@@ -40,7 +35,6 @@ expert weights each, and one test builds a second block. No model files.
 
 from __future__ import annotations
 
-import functools
 import gc
 import math
 import types
@@ -264,7 +258,7 @@ def replaced(items, index: int, value) -> list:
 def ieee_fp32():
     """The source's fp32 steps are IEEE fp32: refuse a process that substitutes TF32, both
     before the module's tests and after them."""
-    yield from support.ieee_fp32_session(_write_evidence)
+    yield from support.ieee_fp32_session()
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -274,12 +268,13 @@ def device_memory():
     release_cache()
 
 
-def _environment(ieee: dict) -> dict:
+def _execution_state(ieee: dict) -> dict:
     layer_mask = [i for i, kept in enumerate(LAYER_MASK) if kept]
-    return support.environment(ieee, EXECUTION, kv_cache=dict(KV_CACHE, layer_mask=layer_mask))
-
-
-_write_evidence = functools.partial(support.write_evidence, "BEAM_SPARSE_BLOCK_EVIDENCE")
+    return {
+        "math": ieee,
+        "execution": dict(EXECUTION),
+        "kv_cache": dict(KV_CACHE, layer_mask=layer_mask),
+    }
 
 
 # -------------------------------------------------- comparison
@@ -794,7 +789,7 @@ def test_rejects_unsupported_inputs_before_dispatch(case) -> None:
             blk(x, positions, md)
 
 
-def test_cache_slot_is_the_managers_local_index(ieee_fp32) -> None:
+def test_cache_slot_is_the_managers_local_index(record_property, ieee_fp32) -> None:
     """Logical layer 3 lives in slot 0 of a manager whose layer mask selects it alone: the
     attention op is called with local index 0, and the K and V it appended are read back
     through the manager under the logical index 3."""
@@ -815,14 +810,14 @@ def test_cache_slot_is_the_managers_local_index(ieee_fp32) -> None:
             out = blk(x, positions, md)
             torch.cuda.synchronize()
         keys, values = cache_rows(md, length)
-    _write_evidence(
+    record_property(
         f"cache-slot-seed{seed}-T{length}",
         {
             "test": "test_cache_slot_is_the_managers_local_index",
             "layout": layout,
             "step_local_layer_idx": step["local_layer_idx"],
             "op_calls": loggable(calls),
-            "environment": _environment(ieee_fp32),
+            "execution_state": _execution_state(ieee_fp32),
         },
     )
     assert isinstance(mgr, KVCacheManagerV2)
@@ -889,7 +884,7 @@ def test_cache_slot_in_a_manager_holding_two_layers(ieee_fp32) -> None:
 
 
 @pytest.mark.parametrize("seed,length", CASES, ids=CASE_IDS)
-def test_block_matches_reference(seed, length, ieee_fp32) -> None:
+def test_block_matches_reference(record_property, seed, length, ieee_fp32) -> None:
     """One case, routing judged apart from numerical error: exact routing on the block's own
     MoE input; against the whole reference block, routing differences only on near ties and
     the output within its rule on the tokens routed alike; the MoE output within its rule
@@ -903,7 +898,7 @@ def test_block_matches_reference(seed, length, ieee_fp32) -> None:
     ref = reference_record(seed, x, positions)
     results = block_results(seed, out, captured, ref)
     results.append(unchanged(x, x_before, versions, after))
-    _write_evidence(
+    record_property(
         f"block-seed{seed}-T{length}",
         {
             "test": "test_block_matches_reference",
@@ -912,7 +907,7 @@ def test_block_matches_reference(seed, length, ieee_fp32) -> None:
             "route_gap": ROUTE_GAP,
             "results": results,
             "input_sha256": tensor_sha256(x),
-            "environment": _environment(ieee_fp32),
+            "execution_state": _execution_state(ieee_fp32),
         },
     )
     assert_all_pass(results)
@@ -921,7 +916,7 @@ def test_block_matches_reference(seed, length, ieee_fp32) -> None:
 # -------------------------------------------------- tests: the component path
 
 
-def test_forward_runs_the_component_path(ieee_fp32) -> None:
+def test_forward_runs_the_component_path(record_property, ieee_fp32) -> None:
     """One case: the component's own composition ran, op by op, with the experts' calls
     nested inside BeamDispatchCombine, through thop attention on this GPU, with no SDPA, no
     built-in Beam module and every op's guard admitting its arguments."""
@@ -948,9 +943,9 @@ def test_forward_runs_the_component_path(ieee_fp32) -> None:
         "attention_kernels": [k for k in kernels if support.ATTENTION_KERNEL.search(k)],
         "sdpa_cpu_ops": [n for n in cpu_ops if support.SDPA_OPS.search(n)],
         "kv_cache_manager": type(manager).__name__,
-        "environment": _environment(ieee_fp32),
+        "execution_state": _execution_state(ieee_fp32),
     }
-    _write_evidence(f"path-seed{seed}-T{length}", record)
+    record_property(f"path-seed{seed}-T{length}", record)
 
     assert type(blk).__module__.endswith("sparse_block.block")
     top = [c for c in calls if c["depth"] == 0]
@@ -982,7 +977,7 @@ def test_forward_runs_the_component_path(ieee_fp32) -> None:
 # -------------------------------------------------- tests: fixtures
 
 
-def test_causal_prefix_independence(ieee_fp32) -> None:
+def test_causal_prefix_independence(record_property, ieee_fp32) -> None:
     """Two 129-token inputs sharing their first 17 rows: those rows reach the MoE bit for
     bit alike and are routed alike, and their outputs agree within the block rule (each
     expert's batch differs, so only the expert GEMMs' row counts change)."""
@@ -1007,21 +1002,21 @@ def test_causal_prefix_independence(ieee_fp32) -> None:
     ]
     if not results[1]["passed"]:
         results[1]["problems"].append("the shared rows' MoE inputs differ")
-    _write_evidence(
+    record_property(
         f"prefix-seed{seed}-T{length}",
         {
             "test": "test_causal_prefix_independence",
             "prefix": prefix,
             "results": results,
             "suffix_ids_differ": not torch.equal(ids_b[prefix:], ids_a[prefix:]),
-            "environment": _environment(ieee_fp32),
+            "execution_state": _execution_state(ieee_fp32),
         },
     )
     assert_all_pass(results)
     assert not torch.equal(out_b[0, prefix:], out_a[0, prefix:]), "the suffix changed nothing"
 
 
-def test_residual_uses_block3_coefficients(ieee_fp32, monkeypatch) -> None:
+def test_residual_uses_block3_coefficients(record_property, ieee_fp32, monkeypatch) -> None:
     """The residual entry with the block's coefficients is block 3's add bit for bit and
     differs from block 0's; and the block comparison rejects a block run with block 0's
     coefficients, and accepts the unchanged and the restored block."""
@@ -1055,13 +1050,13 @@ def test_residual_uses_block3_coefficients(ieee_fp32, monkeypatch) -> None:
             monkeypatch.undo()
         out, captured = run_block(blk, x, positions)
         runs[label] = block_results(seed, out, captured, ref)
-    _write_evidence(
+    record_property(
         f"fault-residual-seed{seed}-T{length}",
         {
             "test": "test_residual_uses_block3_coefficients",
             "fault": "block 0's residual coefficients in both adds, test-scoped",
             "runs": runs,
-            "environment": _environment(ieee_fp32),
+            "execution_state": _execution_state(ieee_fp32),
         },
     )
     assert_all_pass(runs["unchanged"])
