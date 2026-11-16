@@ -134,6 +134,9 @@ class DecoderMetadata:
         if isinstance(self.attn_metadata, TrtllmAttentionMetadata):
             self.attn_metadata.host_uploader = self._host_uploader
         self._arm_msa_policy(kv_cache_manager)
+        if isinstance(kv_cache_manager, KVCacheManagerV2) and self._config.steady_decode_prepare:
+            # The steady decode prepare re-reads a page table whenever its pages change.
+            kv_cache_manager.keep_growth_blocks()
 
         return self.attn_metadata
 

@@ -733,6 +733,7 @@ class DecoderCudaGraphs:
         position_id_offsets: torch.Tensor | None,
         is_dummy: bool = False,
         static_inputs_staged: int = 0,
+        pre_replay_staged: bool = False,
     ) -> Any:
         """Run the model by replaying the graph for ``key``, capturing it first if needed.
 
@@ -757,6 +758,7 @@ class DecoderCudaGraphs:
                 position_id_offsets=position_id_offsets,
                 is_dummy=is_dummy,
                 static_inputs_staged=static_inputs_staged,
+                pre_replay_staged=pre_replay_staged,
             )
 
     def _run(
@@ -774,6 +776,7 @@ class DecoderCudaGraphs:
         position_id_offsets: torch.Tensor | None,
         is_dummy: bool = False,
         static_inputs_staged: int = 0,
+        pre_replay_staged: bool = False,
     ) -> Any:
         breakable_runner = self.breakable_cuda_graph_runner
         if key is None:
@@ -841,6 +844,8 @@ class DecoderCudaGraphs:
                             inputs,
                             position_id_offsets=position_id_offsets,
                             static_inputs_staged=static_inputs_staged,
+                            # Passed only when set, so other replay calls keep their signature.
+                            **({"pre_replay_staged": True} if pre_replay_staged else {}),
                         )
                 finally:
                     restore_attn_metadata_after_draft_replay(attn_metadata, saved_draft)
@@ -1400,10 +1405,12 @@ class DecoderCudaGraphs:
                                     runtime_draft_len=runtime_draft_len,
                                 ),
                                 self._warmup_inputs,
-                                can_capture=lambda: getattr(
-                                    self._metadata.attn_metadata, "decoder_replay_plan", None
-                                )
-                                is None,
+                                can_capture=lambda: (
+                                    getattr(
+                                        self._metadata.attn_metadata, "decoder_replay_plan", None
+                                    )
+                                    is None
+                                ),
                             )
                             if not captured:
                                 logger.info(
