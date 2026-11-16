@@ -70,6 +70,7 @@ from .modeling_multimodal_mixin import (
     encode_multimodal_by_groups,
 )
 from .modeling_qwen2vl import (
+    _QWEN_PAD_TOKENS,
     Qwen2_5_VLVisionAttention,
     Qwen2VLInputProcessorBase,
     _prepare_qwen_vl_mrope_config,
@@ -277,6 +278,38 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
         )
         # Qwen3-VL keeps ``torch_dtype`` only on ``text_config`` under transformers 5.x.
         self._dtype = self.config.text_config.dtype
+
+    def _mm_embedding_width(self) -> int:
+        # Unlike previous Qwen VL models, the embeddings are concatenated with
+        # feature maps from deepstack layers.
+        deepstack_indexes = getattr(self.config.vision_config, "deepstack_visual_indexes", None)
+        return self.config.text_config.hidden_size * (1 + len(deepstack_indexes or []))
+
+    def get_mm_item_text(
+        self,
+        modality: str,
+        placeholder: str,
+        metadata: Dict[str, Any],
+        embedding_shape: Tuple[int, ...],
+    ) -> str:
+        """A video gets "<t seconds>" and its own vision span per frame group, as in HF."""
+        if modality != "video":
+            return super().get_mm_item_text(modality, placeholder, metadata, embedding_shape)
+        grid_t, grid_h, grid_w = self._check_mm_item_grid(modality, metadata, embedding_shape)
+        timestamps = metadata.get("video_timestamps")
+        if timestamps is None or len(timestamps) < grid_t:
+            raise ValueError(
+                f"it needs video_timestamps with one value per frame group ({grid_t}), which "
+                f"{type(self).__name__} writes in the prompt; got {timestamps}. Pass the "
+                "encoder's item metadata (handle['metadata'])."
+            )
+        pad = _QWEN_PAD_TOKENS["video"]
+        frame_rows = grid_h * grid_w // self.config.vision_config.spatial_merge_size**2
+        frame = placeholder.replace(pad, pad * frame_rows)
+        text = ""
+        for seconds in timestamps[:grid_t]:
+            text += f"<{seconds:.1f} seconds>{frame}"
+        return text
 
     @classmethod
     def _build_temporal_block(
@@ -665,11 +698,7 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
             raise TypeError("mm_handles must be a list")
 
         # Edge has no deepstack indexes. A missing field is zero levels.
-        deepstack_indexes = getattr(self.config.vision_config, "deepstack_visual_indexes", None)
-        num_deepstack_levels = len(deepstack_indexes or [])
-        # This is because, unlike previous Qwen VL models, the embeddings are concatenated with
-        # feature maps from deepstack layers.
-        expected_size = self.config.text_config.hidden_size * (1 + num_deepstack_levels)
+        expected_size = self._mm_embedding_width()
         for i, mm_handle in enumerate(mm_handles):
             if len(mm_handle["tensor_size"]) != 2:
                 raise ValueError(f"Multimodal embedding {i} must be rank 2")
