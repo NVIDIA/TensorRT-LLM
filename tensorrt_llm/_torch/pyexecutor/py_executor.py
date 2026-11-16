@@ -3849,7 +3849,6 @@ class PyExecutor:
             self._pending_iter_stats_dict = local_dict
             return
 
-
         with self.stats_lock:
             if (not _stats_buffer_is_unbounded(self.max_stats_len)
                     and len(self.stats) > self.max_stats_len):
