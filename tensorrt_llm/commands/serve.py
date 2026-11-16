@@ -32,7 +32,7 @@ from importlib.util import find_spec
 from pathlib import Path
 from types import FrameType
 from typing import (TYPE_CHECKING, Any, Dict, Iterator, Literal, NoReturn,
-                    Optional, Sequence, Set, Tuple)
+                    Optional, Sequence, Set)
 
 import click
 import pydantic
@@ -588,7 +588,7 @@ def _provision_kv_cache_pool(llm_args: dict,
         yield
 
 
-def _listen_on_launcher_uds(llm) -> Tuple[socket.socket, str]:
+def _listen_on_launcher_uds(llm: PyTorchLLM) -> tuple[socket.socket, str]:
     """Bind and listen on the Unix socket for launcher-owned forwarded routes.
 
     Attached frontends can serve before the launcher's uvicorn, so listen now
@@ -926,7 +926,7 @@ def launch_server(
                         extra_env={LAUNCHER_UDS_ENV: launcher_uds_path},
                         report_failure=_report_observed_child_failure,
                         affinity_sockets=attached_affinity_sockets,
-                        launcher_socket=launcher_uds_sock)
+                        before_terminate=launcher_uds_sock.close)
                     stop_watching_frontends = _watch_attached_frontends(
                         frontend_children)
                     multi_frontend_serving = MultiFrontendServing(
@@ -966,7 +966,9 @@ def launch_server(
                 if stop_watching_frontends is not None:
                     stop_watching_frontends.set()
                 if launcher_uds_sock is not None:
-                    # Its file goes with the ipc dir (see _listen_on_launcher_uds).
+                    # Close before stopping frontends to reset queued forwards
+                    # and release their handlers. Its file goes with the ipc dir
+                    # (see _listen_on_launcher_uds).
                     launcher_uds_sock.close()
                 if frontend_children:
                     _terminate_attached_frontends(frontend_children)

@@ -5,7 +5,10 @@
 import os
 import socket
 import threading
+from collections.abc import Callable
+from pathlib import Path
 from types import SimpleNamespace
+from typing import NoReturn
 from unittest.mock import Mock
 
 import pytest
@@ -86,7 +89,9 @@ def test_attached_frontend_adopts_inherited_socket(monkeypatch):
     assert own.fileno() == -1
 
 
-def test_launch_server_hands_its_sockets_to_the_server(monkeypatch, tmp_path):
+def test_launch_server_hands_its_sockets_to_the_server(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     from tensorrt_llm.commands import serve
 
     num_frontends, stride = 3, 7
@@ -101,8 +106,14 @@ def test_launch_server_hands_its_sockets_to_the_server(monkeypatch, tmp_path):
     handed_off = {}
 
     def fake_spawn(
-        llm, num_frontends, *, extra_env, report_failure, affinity_sockets, launcher_socket=None
-    ):
+        llm: Mock,
+        num_frontends: int,
+        *,
+        extra_env: dict[str, str],
+        report_failure: Callable[[int, str, str], None],
+        affinity_sockets: dict[int, socket.socket],
+        **kwargs: object,
+    ) -> list[Mock]:
         handed_off.update({i: s.getsockname()[1] for i, s in affinity_sockets.items()})
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as frontend:
             frontend.settimeout(5)
@@ -159,7 +170,7 @@ def test_launch_server_hands_its_sockets_to_the_server(monkeypatch, tmp_path):
 
 @pytest.mark.parametrize("failure_stage", ["server_setup", "frontend_startup"])
 def test_failed_launcher_start_releases_queued_connections_before_stopping_frontends(
-    monkeypatch, tmp_path, failure_stage
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure_stage: str
 ) -> None:
     from tensorrt_llm.commands import serve
     from tensorrt_llm.executor.proxy import GenerationExecutorProxy
@@ -179,21 +190,21 @@ def test_failed_launcher_start_releases_queued_connections_before_stopping_front
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as frontend:
         frontend.settimeout(1)
 
-        def fake_spawn(*args, extra_env, **kwargs):
+        def fake_spawn(*args: object, extra_env: dict[str, str], **kwargs: object) -> list[Mock]:
             frontend.connect(extra_env[serve.LAUNCHER_UDS_ENV])
             frontend.sendall(b"queued startup request")
             return [Mock()]
 
-        def fail_server(**kwargs):
+        def fail_server(**kwargs: object) -> NoReturn:
             raise RuntimeError("server setup failed")
 
-        def stop_frontends(children) -> None:
+        def stop_frontends(children: list[Mock]) -> None:
             with pytest.raises(ConnectionResetError):
                 frontend.recv(1)
             stopped.extend(children)
 
-        def fake_popen(*args, **kwargs):
-            frontend.connect(kwargs["env"][serve.LAUNCHER_UDS_ENV])
+        def fake_popen(*args: object, env: dict[str, str], **kwargs: object) -> Mock:
+            frontend.connect(env[serve.LAUNCHER_UDS_ENV])
             frontend.sendall(b"queued startup request")
             child = Mock(pid=1, returncode=0)
             child.wait.return_value = 0

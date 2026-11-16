@@ -173,6 +173,9 @@ class LauncherForwarder:
             return JSONResponse(
                 status_code=status_code,
                 content={"error": message},
+                headers={"x-should-retry": "false"}
+                if isinstance(error, asyncio.TimeoutError)
+                else None,
             )
 
     async def get_status(self, path: str, timeout_s: float = 5.0) -> Optional[int]:

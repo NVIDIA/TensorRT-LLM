@@ -15,10 +15,13 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Iterator
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 from tensorrt_llm.llmapi.mpi_session import split_mpi_env
 from tensorrt_llm.logger import logger
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm import LLM
 
 
 class FrontendStartupCancelled(RuntimeError):
@@ -77,14 +80,14 @@ def _input_processor_runs_without_gpu(llm) -> bool:
 
 
 def _spawn_attached_frontends(
-    llm,
+    llm: "LLM",
     num_frontends: int,
     *,
     extra_env: dict[str, str] | None = None,
     cancelled: threading.Event | None = None,
     report_failure: Callable[[int, str, str], None] | None = None,
     affinity_sockets: dict[int, socket.socket] | None = None,
-    launcher_socket: socket.socket | None = None,
+    before_terminate: Callable[[], None] | None = None,
 ) -> list:
     """Spawn num_frontends - 1 attached serving frontend processes.
 
@@ -104,8 +107,8 @@ def _spawn_attached_frontends(
     bound for it (_frontend_affinity_sockets). Each child inherits its own
     socket; the launcher closes its copy and removes it from the dict.
 
-    launcher_socket is closed before terminating children if startup fails,
-    releasing any forwarded requests queued before the launcher starts serving.
+    before_terminate releases caller-owned resources before terminating children
+    if startup fails.
     """
     from tensorrt_llm.executor.proxy import GenerationExecutorProxy
 
@@ -160,8 +163,8 @@ def _spawn_attached_frontends(
             logger.info(f"Launched attached serving frontend {frontend_id} (pid {child.pid})")
         _wait_attached_frontends_ready(children, ready_fds, cancelled, report_failure)
     except BaseException:
-        if launcher_socket is not None:
-            launcher_socket.close()
+        if before_terminate is not None:
+            before_terminate()
         _terminate_attached_frontends(children)
         raise
     finally:

@@ -23,6 +23,7 @@ import sys
 import threading
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -158,9 +159,10 @@ def test_attached_server_forwards_launcher_owned_routes(tmp_path) -> None:
     with TestClient(server.app) as client:
         r = client.get("/metrics")
         assert r.status_code == 503 and "unavailable" in r.json()["error"]
+        assert "x-should-retry" not in r.headers
 
 
-def test_forwarding_timeout_warns_that_a_queued_post_can_still_execute(tmp_path) -> None:
+def test_forwarding_timeout_warns_that_a_queued_post_can_still_execute(tmp_path: Path) -> None:
     payload = {"requests": []}
     seen = []
 
@@ -208,6 +210,7 @@ def test_forwarding_timeout_warns_that_a_queued_post_can_still_execute(tmp_path)
 
         assert seen == [payload]
         assert response.status_code == 504
+        assert response.headers["x-should-retry"] == "false"
         assert "may still be processed" in response.json()["error"]
 
     asyncio.run(run())
