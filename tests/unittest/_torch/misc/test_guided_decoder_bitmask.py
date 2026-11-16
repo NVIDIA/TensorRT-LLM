@@ -513,3 +513,33 @@ def test_recompute_replays_generated_tokens_into_matcher(monkeypatch, accepts):
         assert "rejected token 10" in failed_requests[0][1]
     # Only a request that is not failed gets a next-token mask.
     assert decoder.token_mask_host[0].item() == int(accepts)
+
+
+class _TerminatingMatcher(_ScriptedMatcher):
+    """Matcher that terminates once it accepts EOS and rejects every token after it."""
+
+    def __init__(self, eos_token: int):
+        super().__init__([True])
+        self._eos_token = eos_token
+
+    def accept_token(self, token_id: int) -> bool:
+        if self.is_terminated():
+            return False
+        return super().accept_token(token_id)
+
+    def is_terminated(self) -> bool:
+        return self._eos_token in self.accepted
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_recompute_replay_stops_at_terminated_matcher(monkeypatch):
+    """A request that generated past EOS (ignore_eos) replays only up to EOS."""
+    matcher = _TerminatingMatcher(eos_token=10)
+
+    decoder, failed_requests = _build_recomputed_request(monkeypatch, matcher)
+
+    assert failed_requests == []
+    assert decoder.grammar_matchers[_SLOT] is matcher
+    assert matcher.accepted == [10]
+    # A terminated matcher guides no further token.
+    assert decoder.token_mask_host[0].item() == 0

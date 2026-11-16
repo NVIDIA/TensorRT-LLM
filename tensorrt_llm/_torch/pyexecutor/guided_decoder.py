@@ -284,6 +284,12 @@ class GuidedDecoder:
                         req.guided_decoding_params)
                     self.grammar_matchers[slot] = matcher
                     for token in req.tokens_to_replay or ():
+                        # A request can keep generating after its matcher
+                        # accepted a stop token, for example with ignore_eos.
+                        # A terminated matcher accepts no further token; the
+                        # advance below skips it the same way.
+                        if matcher.is_terminated():
+                            break
                         if not matcher.accept_token(token):
                             raise ValueError(
                                 f"Request {req.request_id} at slot {slot}: the "
