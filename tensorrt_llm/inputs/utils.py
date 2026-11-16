@@ -816,20 +816,31 @@ def _native_mistral_response_format(response_format):
     """An OpenAI `response_format` as mistral-common's, or None if it renders nothing.
 
     `json_object` and a named `json_schema` render into the prompt's model
-    settings; other formats only constrain decoding.
+    settings; other formats only constrain decoding. mistral-common renders
+    response formats from 1.13.0 on, which needs Python 3.11; with an older
+    release a response format only constrains decoding.
     """
     if not isinstance(response_format, dict):
         return None
-    from mistral_common.protocol.instruct.request import (JsonSchema,
-                                                          ResponseFormat,
-                                                          ResponseFormats)
     kind = response_format.get("type")
+    named = response_format.get("json_schema")
+    if kind not in ("json_object", "json_schema") or (
+            kind == "json_schema" and
+        (not isinstance(named, dict) or named.get("schema") is None
+         or not named.get("name"))):
+        return None
+    from mistral_common.protocol.instruct import request as mistral_request
+    if not hasattr(mistral_request, "JsonSchema"):
+        logger.warning_once(
+            "mistral-common renders response formats from 1.13.0 on (Python "
+            "3.11 or later); the prompt leaves the response format out, and it "
+            "only constrains decoding.")
+        return None
+    ResponseFormat = mistral_request.ResponseFormat
+    ResponseFormats = mistral_request.ResponseFormats
+    JsonSchema = mistral_request.JsonSchema
     if kind == "json_object":
         return ResponseFormat(type=ResponseFormats.json_object)
-    named = response_format.get("json_schema")
-    if (kind != "json_schema" or not isinstance(named, dict)
-            or named.get("schema") is None or not named.get("name")):
-        return None
     return ResponseFormat(type=ResponseFormats.json_schema,
                           json_schema=JsonSchema(name=named["name"],
                                                  schema=named["schema"],
