@@ -17,12 +17,17 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.dsa.fp8_paged_mqa_logits import (  # noqa: E501
-    fp8_paged_mqa_logits as op,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.dsa.paged_mqa_logits_schedule import (  # noqa: E501
-    paged_mqa_logits_schedule,
-)
+from tensorrt_llm._torch._experimental.modeling_v2._native import NoTarget
+
+try:
+    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.dsa.fp8_paged_mqa_logits import (  # noqa: E501
+        fp8_paged_mqa_logits as op,
+    )
+    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.dsa.paged_mqa_logits_schedule import (  # noqa: E501
+        paged_mqa_logits_schedule,
+    )
+except NoTarget as exc:
+    pytest.skip(str(exc), allow_module_level=True)
 from tensorrt_llm._utils import get_sm_version
 
 __extra_import_path__ = ["../../../..", "."]
@@ -33,7 +38,8 @@ pytestmark = pytest.mark.skipif(
     get_sm_version() != 107, reason="the GLM-5.2 tp16 target's entries are certified on sm_107"
 )
 
-assert torch.cuda.is_available(), "fp8_paged_mqa_logits requires a CUDA device"
+if not torch.cuda.is_available():
+    pytest.skip("fp8_paged_mqa_logits requires a CUDA device", allow_module_level=True)
 
 _SPLIT = 256
 

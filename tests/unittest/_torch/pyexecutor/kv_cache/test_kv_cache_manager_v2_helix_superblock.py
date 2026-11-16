@@ -24,6 +24,7 @@ sampler advances ``py_decoding_iter``.
 
 import math
 import types
+from collections import deque
 from types import SimpleNamespace
 from typing import Optional
 
@@ -445,13 +446,16 @@ def _failing_gen_scheduler(
             try_allocate_generation=lambda req: False,
             is_request_active=lambda request_id: True,
             has_cache_tier_below_gpu=has_cache_tier_below_gpu,
+            flush_deferred_closes=lambda: False,
         ),
         draft_kv_cache_manager=None,
         enable_joint_kv_cache_reuse=False,
+        _joint_draft_manager=None,
     )
     sched._try_allocate_generation = types.MethodType(
         KVCacheV2Scheduler._try_allocate_generation, sched
     )
+    sched._admit_unpaired_draft = types.MethodType(KVCacheV2Scheduler._admit_unpaired_draft, sched)
     sched._try_evict_for_gen = lambda req, requests_list, req_it, req_it_end, *args: (
         ladder_calls.append("evict") or (req_it_end, False)
     )
@@ -512,6 +516,37 @@ def test_scheduler_allocation_failure_raises_under_disagg_helix(
     )
     with pytest.raises(RuntimeError, match="cannot preempt"):
         _schedule_failing_gen(sched, _gen_request())
+    assert ladder_calls == []
+
+
+@pytest.mark.parametrize("fits_after_close", [True, False], ids=["fits", "still_short"])
+def test_disagg_helix_allocation_failure_closes_deferred_releases_first(
+    fits_after_close: bool,
+) -> None:
+    """A finished generation-only request whose close is deferred
+    (defer_generation_only_release) still holds its pages. A disaggregated
+    helix generation server, which cannot preempt, closes it and retries before
+    raising."""
+    from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import ScheduleAction
+
+    ladder_calls = []
+    sched = _failing_gen_scheduler(enable_recompute_pause=False, ladder_calls=ladder_calls)
+    closed = []
+    mgr = sched.kv_cache_manager
+    mgr._deferred_closes = deque([(9, SimpleNamespace(close=lambda: closed.append(9)))])
+    mgr._sharing = None
+    mgr.impl = SimpleNamespace(clear_stats_excluded=lambda request_id: None)
+    mgr.flush_deferred_closes = types.MethodType(KVCacheManagerV2.flush_deferred_closes, mgr)
+    mgr.try_allocate_generation = lambda req: fits_after_close and bool(closed)
+
+    if fits_after_close:
+        action, tokens, *_ = _schedule_failing_gen(sched, _gen_request())
+        assert action is ScheduleAction.SCHEDULED and tokens == 1
+    else:
+        with pytest.raises(RuntimeError, match="cannot preempt"):
+            _schedule_failing_gen(sched, _gen_request())
+    assert closed == [9]
+    assert not mgr._deferred_closes
     assert ladder_calls == []
 
 

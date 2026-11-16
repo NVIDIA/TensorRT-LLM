@@ -91,3 +91,11 @@ def enable_telemetry(monkeypatch):
         "tensorrt_llm.usage.usage_lib._OPT_OUT_FILE",
         Path("/nonexistent/path/do_not_track"),
     )
+
+
+@pytest.fixture(autouse=True)
+def isolated_startup_state_dir(monkeypatch, tmp_path):
+    """Keep the local startup failure count of every test out of the real home."""
+    state_dir = tmp_path / "usage-state"
+    monkeypatch.setenv("TRTLLM_USAGE_STATE_DIR", str(state_dir))
+    return state_dir

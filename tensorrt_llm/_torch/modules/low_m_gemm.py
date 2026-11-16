@@ -3,12 +3,13 @@
 
 import functools
 import os
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
 from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.logger import logger
+from tensorrt_llm.math_utils import pad_up
 
 from ..autotuner import (
     AutoTuner,
@@ -17,6 +18,7 @@ from ..autotuner import (
     TunableRunner,
     TuningConfig,
 )
+from ..cute_dsl_utils import graph_safe_from_dlpack
 from ..flashinfer_utils import get_env_enable_pdl
 from . import low_m_mma_gemm
 
@@ -162,11 +164,16 @@ class _DirectGemmRunner(TunableRunner):
     inputs: ``[a [M,K] BF16, b_t [K,N] col-major BF16]``.
     """
 
-    def __init__(self, *, pdl: bool) -> None:
+    def __init__(self, *, pdl: bool, whole_bucket_tiles: bool = False) -> None:
         self.pdl = pdl
+        # Above the exact buckets, offer only 1-row tiles: a tactic timed at a coarse bucket's top must also serve
+        # every smaller row count of the bucket, or apply() falls back to cuBLAS where it does not.
+        self.whole_bucket_tiles = whole_bucket_tiles
 
     def unique_id(self) -> tuple:
-        return ("direct", bool(self.pdl))
+        return ("direct", bool(self.pdl)) + (
+            ("whole_bucket_tiles",) if self.whole_bucket_tiles else ()
+        )
 
     def is_tactic_compatible(
         self,
@@ -210,6 +217,8 @@ class _DirectGemmRunner(TunableRunner):
                 seen.setdefault(dataclasses.astuple(t), None)
         except ValueError:
             pass
+        if self.whole_bucket_tiles and m > _MAX_EXACT_DIRECT_M:
+            seen = dict.fromkeys((block, outputs, 1) for block, outputs, _ in seen)
         return list(seen)
 
     def forward(
@@ -460,15 +469,29 @@ class _WarpMmaFp8GemmRunner(TunableRunner):
 LOW_M_GEMM_ACTIVE = _parse_enabled()
 
 
-def _should_apply_low_m_gemm(input: torch.Tensor, module: Optional[torch.nn.Module] = None) -> bool:
-    """Fast pre-filter: the global enable flag (or a dispatcher attached to ``module``) and the M upper bound."""
-    if not LOW_M_GEMM_ACTIVE and getattr(module, "_low_m_gemm_dispatcher", None) is None:
+def low_m_gemm_takes_rows(module: Optional[torch.nn.Module], rows: int) -> bool:
+    """Whether a GEMM of ``rows`` rows takes the low-M path: the global enable flag (or a dispatcher attached to
+    ``module``) and the M upper bound (``_MAX_M``, or the module's own ceiling, ``LowMGemmDispatcher.limit_rows``)."""
+    dispatcher = getattr(module, "_low_m_gemm_dispatcher", None)
+    if not LOW_M_GEMM_ACTIVE and dispatcher is None:
         return False
     # The AutoTuner race is host code that torch.compile cannot trace.
+    if torch.compiler.is_compiling() or rows > _MAX_M:
+        return False
+    return dispatcher is None or dispatcher.takes_rows(module, rows)
+
+
+def _should_apply_low_m_gemm(input: torch.Tensor, module: Optional[torch.nn.Module] = None) -> bool:
+    """Fast pre-filter: :func:`low_m_gemm_takes_rows` for the rows of ``input``, after the enable flag (or a
+    dispatcher attached to ``module``) and the compile check, which cost no shape reads."""
+    if not LOW_M_GEMM_ACTIVE and getattr(module, "_low_m_gemm_dispatcher", None) is None:
+        return False
     if input.ndim < 1 or torch.compiler.is_compiling():
         return False
     k = int(input.shape[-1])
-    return k > 0 and input.numel() <= _MAX_M * k
+    if k <= 0:
+        return False
+    return low_m_gemm_takes_rows(module, input.numel() // k)
 
 
 class LowMGemmDispatcher:
@@ -490,6 +513,11 @@ class LowMGemmDispatcher:
        lazily on the first invocation.  The AutoTuner then profiles each
        (M-bucket, K, N) shape it encounters and caches the winner.
     """
+
+    # The direct kernel's coarse buckets offer only tactics that serve every row count of the bucket.
+    whole_bucket_direct_tiles: bool = False
+    # Per module: the most rows it takes on the low-M path (limit_rows); None: no limits.
+    _max_rows: Optional[Dict[torch.nn.Module, int]] = None
 
     def __init__(self) -> None:
         # _prepared: runners + TuningConfig have been created (set by _init_runners).
@@ -547,6 +575,10 @@ class LowMGemmDispatcher:
         if not LOW_M_GEMM_ACTIVE and not force:
             return
         for name, module in model.named_modules():
+            if getattr(module, "_low_m_gemm_dispatcher", None) is not None:
+                # A model that prepared its own dispatcher (e.g. Qwen3.5, with its row limits and tactics) keeps it:
+                # the loader's generic one must not replace it.
+                continue
             if module.__class__.__name__.endswith("Linear") or getattr(
                 module, LOW_M_GEMM_OPT_IN_ATTR, False
             ):
@@ -571,7 +603,7 @@ class LowMGemmDispatcher:
         self._runner_no_bias = _SplitKGemmRunner(has_bias=False, pdl=pdl)
         self._runner_with_bias = _SplitKGemmRunner(has_bias=True, pdl=pdl)
         # Direct SIMT runner: no-bias only; wins for M=1 with narrow N on K=8192.
-        self._direct = _DirectGemmRunner(pdl=pdl)
+        self._direct = _DirectGemmRunner(pdl=pdl, whole_bucket_tiles=self.whole_bucket_direct_tiles)
         self._warp_mma = _WarpMmaGemmRunner()
         # cuBLAS runners — always included as competitors so the AutoTuner can
         # fall back to cuBLAS for shapes where neither custom kernel is fastest.
@@ -616,6 +648,18 @@ class LowMGemmDispatcher:
             "Low-M BF16 GEMM dispatcher initialised "
             "(split-K tensor-core + SIMT direct vs cuBLAS AutoTuner; best kernel per shape)."
         )
+
+    def limit_rows(self, module: torch.nn.Module, max_rows: int) -> None:
+        """Keep ``module`` off the low-M path above ``max_rows`` rows."""
+        if self._max_rows is None:
+            self._max_rows = {}
+        self._max_rows[module] = max_rows
+
+    def takes_rows(self, module: torch.nn.Module, rows: int) -> bool:
+        """Whether ``module`` takes the low-M path at ``rows`` rows under its ``limit_rows`` ceiling."""
+        if self._max_rows is None:
+            return True
+        return rows <= self._max_rows.get(module, _MAX_M)
 
     def prepare(
         self,
@@ -906,6 +950,7 @@ def prepare_low_m_gemm(
     model: torch.nn.Module,
     force: bool = False,
     per_rank_tuning: bool = False,
+    whole_bucket_direct_tiles: bool = False,
 ) -> LowMGemmDispatcher:
     """Create a per-engine dispatcher and attach it to every eligible submodule.
 
@@ -926,12 +971,15 @@ def prepare_low_m_gemm(
             LLM arg).
         per_rank_tuning: Tune each rank on its own (attention DP: the ranks'
             projections see different token counts).
+        whole_bucket_direct_tiles: Race the direct kernel at the coarse M
+            buckets only with tactics that serve every row count of the bucket.
 
     Returns:
         The newly created :class:`LowMGemmDispatcher` for this engine.
     """
     dispatcher = LowMGemmDispatcher()
     dispatcher.per_rank_tuning = per_rank_tuning
+    dispatcher.whole_bucket_direct_tiles = whole_bucket_direct_tiles
     dispatcher.attach(model, force=force)
     return dispatcher
 
@@ -958,11 +1006,328 @@ def apply_low_m_gemm(
     return dispatcher.apply(module, input_tensor, weight, bias, force_active=force_active)
 
 
+# ---------------------------------------------------------------------------
+# Decode-sized projections over FP8 weights without activation quantization:
+# ``mxfp8_lowm_linear`` and ``fp8_grouped_lowm`` run one CuTe DSL warp-MMA GEMM
+# (``kernels/blackwell/lowm_fp8_mma_gemm``): BF16 activations times FP8
+# weights dequantized exactly in registers, FP32 accumulation.
+# ---------------------------------------------------------------------------
+
+
+@functools.lru_cache(maxsize=None)
+def lowm_fp8_supported() -> bool:
+    return torch.cuda.is_available() and torch.cuda.get_device_capability() in (
+        (10, 0),
+        (10, 3),
+        (10, 7),
+    )
+
+
+def default_k_warps(k: int) -> int:
+    """Split-K warps per CTA for the MMA kernel (one CTA per 8 output columns)."""
+    chunks = k // 64
+    valid = [kw for kw in (1, 2, 4, 8) if chunks % kw == 0]
+    if not valid:
+        raise ValueError(f"unsupported K={k} for the low-M FP8 MMA GEMM")
+    return next((kw for kw in valid if chunks // kw <= 8), valid[-1])
+
+
+def lowm_fp8_mma_fits(m: int, n: int, k: int) -> bool:
+    """Whether the MMA kernel serves an ``[m, k] x [n, k]`` problem on this device."""
+    return lowm_fp8_supported() and 0 < m <= 64 and n % 8 == 0 and k > 0 and k % 64 == 0
+
+
+@functools.lru_cache(maxsize=None)
+def _compiled_mma(
+    m: int,
+    n: int,
+    k: int,
+    use_pdl: bool,
+    split_n: int,
+    group_n: int = 0,
+    rope_head_dim: int = 0,
+    rope_positions: int = 0,
+    scale_block128: bool = False,
+    scale_swizzled: bool = False,
+    bf16_weights: bool = False,
+    out_dtype: torch.dtype = torch.bfloat16,
+    k_warps: int = 0,
+    a_rope_head_dim: int = 0,
+    a_rms_eps: Optional[float] = None,
+    n_tiles: int = 1,
+):
+    import cuda.bindings.driver as cuda
+    import cutlass.cute as cute
+
+    from ..kernels.blackwell.lowm_fp8_mma_gemm import LowMFp8MmaGemmKernel
+
+    kernel = LowMFp8MmaGemmKernel(
+        num_rows=m,
+        k_extent=k,
+        k_warps=k_warps or default_k_warps(k),
+        use_pdl=use_pdl,
+        split_n=split_n,
+        scale_block128=scale_block128,
+        group_n=group_n,
+        rope_head_dim=rope_head_dim,
+        scale_swizzled=scale_swizzled,
+        bf16_weights=bf16_weights,
+        a_rope_head_dim=a_rope_head_dim,
+        a_rms_norm=a_rms_eps is not None,
+        a_rms_eps=a_rms_eps or 0.0,
+        n_tiles=n_tiles,
+    )
+    dev = torch.device("cuda")
+    groups = n // group_n if group_n else 1
+    a = torch.empty((m, groups * k), dtype=torch.bfloat16, device=dev)
+    b = torch.empty((n, 2 * k if bf16_weights else k), dtype=torch.uint8, device=dev)
+    if bf16_weights:
+        s = _no_scale(dev)
+    elif scale_block128:
+        s = torch.empty((n // 128, k // 128), dtype=torch.float32, device=dev)
+    elif scale_swizzled:
+        s = torch.empty((pad_up(n, 128) * pad_up(k // 32, 4),), dtype=torch.uint8, device=dev)
+    else:
+        s = torch.empty((n, k // 32), dtype=torch.uint8, device=dev)
+    if split_n:
+        c = torch.empty((m, split_n), dtype=out_dtype, device=dev)
+        c2 = torch.empty((m, n - split_n), dtype=out_dtype, device=dev)
+    else:
+        c = c2 = torch.empty((m, n), dtype=out_dtype, device=dev)
+    pos = torch.empty((m,), dtype=torch.int32, device=dev)
+    cos_sin = torch.empty((max(rope_positions, 1), 2, 32), dtype=torch.float32, device=dev)
+    gamma = torch.empty((1, k if a_rms_eps is not None else 8), dtype=torch.bfloat16, device=dev)
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    return cute.compile(
+        kernel,
+        graph_safe_from_dlpack(a),
+        graph_safe_from_dlpack(b),
+        graph_safe_from_dlpack(s),
+        graph_safe_from_dlpack(c),
+        graph_safe_from_dlpack(c2),
+        graph_safe_from_dlpack(pos),
+        graph_safe_from_dlpack(cos_sin),
+        graph_safe_from_dlpack(gamma),
+        stream,
+    )
+
+
+@functools.lru_cache(maxsize=None)
+def _no_scale(device) -> torch.Tensor:
+    """The scale argument of BF16 weights, which have none."""
+    return torch.zeros((1,), dtype=torch.uint8, device=device)
+
+
+@functools.lru_cache(maxsize=None)
+def _no_gamma(device) -> torch.Tensor:
+    """The norm-weight argument of kernels without the A RMS norm."""
+    return torch.zeros((1, 8), dtype=torch.bfloat16, device=device)
+
+
+@functools.lru_cache(maxsize=None)
+def _rope_placeholders(m: int, device):
+    """The (positions [m] int32, cos/sin [1, 2, 32] fp32) arguments of kernels without RoPE."""
+    return (
+        torch.zeros((m,), dtype=torch.int32, device=device),
+        torch.zeros((1, 2, 32), dtype=torch.float32, device=device),
+    )
+
+
+def mxfp8_lowm_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    scale_lin: torch.Tensor,
+    *,
+    split_n: int = 0,
+    rope: Optional[Tuple[torch.Tensor, torch.Tensor, int]] = None,
+    scale_swizzled: bool = False,
+    rms_norm: Optional[Tuple[torch.Tensor, float]] = None,
+    n_tiles: int = 1,
+) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
+    """y = x @ dequant(weight).T for small M, in BF16.
+
+    x: [M, K] bf16 contiguous; weight: [N, K] e4m3 (N a multiple of 8); scale_lin: [N, K/32]
+    uint8 (UE8M0, linear layout), or with ``scale_swizzled`` the 1-D CUTLASS-swizzled scales of
+    an MXFP8 ``Linear``. With ``split_n`` the result is returned as two contiguous
+    tensors ``(y[:, :split_n], y[:, split_n:])`` written directly by the kernel.
+    ``rope``: (positions [M] int, cos/sin [P, 2, 32] fp32, head_dim) applies interleaved RoPE to
+    the last 64 columns of every head of the output.
+    ``rms_norm``: (gamma [K] bf16, eps) projects the RMS-normalized rows of x,
+    ``rms_norm(x) * gamma``, instead of x. ``n_tiles`` (N a multiple of ``8 * n_tiles``): 8-column
+    tiles per CTA, the same result with fewer CTAs.
+    """
+    import cuda.bindings.driver as cuda
+
+    m, k = x.shape
+    n = weight.shape[0]
+    if n % (8 * n_tiles):
+        raise ValueError(f"N={n} is not a multiple of {8 * n_tiles}")
+    if split_n:
+        out = torch.empty((m, split_n), dtype=torch.bfloat16, device=x.device)
+        out2 = torch.empty((m, n - split_n), dtype=torch.bfloat16, device=x.device)
+    else:
+        out = out2 = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
+    if rope is None:
+        positions, cos_sin = _rope_placeholders(m, x.device)
+        head_dim = 0
+    else:
+        positions, cos_sin, head_dim = rope
+        positions = positions.reshape(-1).to(torch.int32)
+    fn = _compiled_mma(
+        m,
+        n,
+        k,
+        get_env_enable_pdl(),
+        split_n,
+        0,
+        head_dim,
+        cos_sin.shape[0] if rope is not None else 0,
+        scale_swizzled=scale_swizzled,
+        a_rms_eps=None if rms_norm is None else float(rms_norm[1]),
+        n_tiles=n_tiles,
+    )
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    fn(
+        graph_safe_from_dlpack(x),
+        graph_safe_from_dlpack(weight.view(torch.uint8)),
+        graph_safe_from_dlpack(scale_lin),
+        graph_safe_from_dlpack(out),
+        graph_safe_from_dlpack(out2),
+        graph_safe_from_dlpack(positions),
+        graph_safe_from_dlpack(cos_sin),
+        graph_safe_from_dlpack(_no_gamma(x.device) if rms_norm is None else rms_norm[0].view(1, k)),
+        stream,
+    )
+    return (out, out2) if split_n else out
+
+
+def bf16_lowm_linear(
+    x: torch.Tensor, weight: torch.Tensor, out_dtype: torch.dtype = torch.float32
+) -> torch.Tensor:
+    """y = x @ weight.T for small M with BF16 weights, accumulated in FP32.
+
+    x: [M, K] bf16 contiguous; weight: [N, K] bf16 contiguous (N a multiple of 8).
+    """
+    import cuda.bindings.driver as cuda
+
+    m, k = x.shape
+    n = weight.shape[0]
+    out = torch.empty((m, n), dtype=out_dtype, device=x.device)
+    # Two weight vectors per lane and K chunk: twice the FP8 split keeps as many loads per warp.
+    k_warps = 2 * default_k_warps(k)
+    fn = _compiled_mma(
+        m,
+        n,
+        k,
+        get_env_enable_pdl(),
+        0,
+        bf16_weights=True,
+        out_dtype=out_dtype,
+        k_warps=k_warps if (k // 64) % k_warps == 0 else 0,
+    )
+    positions, cos_sin = _rope_placeholders(m, x.device)
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    fn(
+        graph_safe_from_dlpack(x),
+        graph_safe_from_dlpack(weight.view(torch.uint8)),
+        graph_safe_from_dlpack(_no_scale(x.device)),
+        graph_safe_from_dlpack(out),
+        graph_safe_from_dlpack(out),
+        graph_safe_from_dlpack(positions),
+        graph_safe_from_dlpack(cos_sin),
+        graph_safe_from_dlpack(_no_gamma(x.device)),
+        stream,
+    )
+    return out
+
+
+def mxfp8_linear_scale(module: torch.nn.Module) -> Optional[torch.Tensor]:
+    """Linear [N, K/32] UE8M0 scales of an MXFP8 ``Linear`` (cached on the module).
+
+    The CUTLASS path stores the scales swizzled; this undoes it once. Returns
+    None while a CUDA graph is being captured and the cache is cold.
+    """
+    cached = getattr(module, "_lowm_scale_lin", None)
+    if cached is not None:
+        return cached
+    if torch.cuda.is_current_stream_capturing():
+        return None
+    weight = module.weight
+    n, k = weight.shape
+    scale = module.weight_scale
+    if scale.dim() == 2 and scale.shape == (n, k // 32):
+        lin = scale.contiguous()
+    else:
+        from ..utils import unswizzle_sf
+
+        lin = unswizzle_sf(scale, n, k, 32)[:n, : k // 32].contiguous()
+    module._lowm_scale_lin = lin
+    return lin
+
+
+def fp8_grouped_lowm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    group_n: int,
+    inverse_rope: Optional[Tuple[torch.Tensor, torch.Tensor, int]] = None,
+) -> torch.Tensor:
+    """Grouped small-M GEMM over FP8 weights.
+
+    x: [M, G*K] bf16 contiguous; weight: [G*group_n, K] e4m3 (groups stacked along N);
+    scale: [G*group_n/128, K/128] fp32 power-of-two multipliers (128x128 blocks) or
+    [G*group_n, K/32] uint8 UE8M0 (linear layout). Returns [M, G*group_n] with
+    ``out[:, g*group_n:(g+1)*group_n] = x[:, g*K:(g+1)*K] @ dequant(weight[g]).T``.
+    ``inverse_rope``: (positions [M] int32, cos/sin [P, 2, 32] fp32, head_dim) rotates the last
+    64 columns of every head of x back as they load, as ``mla_rope_inplace(inverse=True)``.
+    """
+    import cuda.bindings.driver as cuda
+
+    m = x.shape[0]
+    n, k = weight.shape
+    block128 = scale.dtype == torch.float32
+    out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
+    if inverse_rope is None:
+        pos, cos_sin = _rope_placeholders(m, x.device)
+        head_dim = 0
+    else:
+        pos, cos_sin, head_dim = inverse_rope
+    fn = _compiled_mma(
+        m,
+        n,
+        k,
+        get_env_enable_pdl(),
+        0,
+        group_n,
+        scale_block128=block128,
+        rope_positions=cos_sin.shape[0] if inverse_rope is not None else 0,
+        a_rope_head_dim=head_dim,
+    )
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    fn(
+        graph_safe_from_dlpack(x),
+        graph_safe_from_dlpack(weight.view(torch.uint8)),
+        graph_safe_from_dlpack(scale),
+        graph_safe_from_dlpack(out),
+        graph_safe_from_dlpack(out),
+        graph_safe_from_dlpack(pos),
+        graph_safe_from_dlpack(cos_sin),
+        graph_safe_from_dlpack(_no_gamma(x.device)),
+        stream,
+    )
+    return out
+
+
 __all__ = [
     "LOW_M_GEMM_ACTIVE",
     "LOW_M_GEMM_OPT_IN_ATTR",
     "_MAX_M",
     "apply_low_m_gemm",
+    "bf16_lowm_linear",
+    "fp8_grouped_lowm",
     "low_m_gemm_dispatcher",
+    "lowm_fp8_supported",
+    "mxfp8_linear_scale",
+    "mxfp8_lowm_linear",
     "prepare_low_m_gemm",
 ]

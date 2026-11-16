@@ -13,7 +13,7 @@ run, based on what the PR changed. New rules are added in Python only.
 | Tier | Where | Basis |
 |---|---|---|
 | **1. Rules** | `cbts/rules/` | Path patterns and diffs. Each rule claims the files it understands and narrows to the blocks they affect. |
-| **2. Coverage** | `cbts/coverage/selection/`, `cbts/coverage/tier.py` | Runs only on what Tier 1 left unclaimed (the *residual*), and only when every residual file is core Python present in the touch DB. Maps changed lines to qualnames and removes entries no changed function reaches. Declines to the full run otherwise. See `cbts/coverage/selection/SELECTION.md`. |
+| **2. Coverage** | `cbts/coverage/selection/`, `cbts/coverage/tier.py` | Runs only on what Tier 1 left unclaimed (the *residual*), and only when every residual file is Python with test-attributed records in the touch DB, subject to AST checks for shared pytest state. Maps changed lines to qualnames and removes entries no changed function reaches. Declines to the full run otherwise. See `cbts/coverage/selection/SELECTION.md`. |
 
 The touch DB is produced by the post-merge collection under
 `cbts/coverage/collection/`; see `cbts/coverage/collection/COLLECTION.md`
@@ -50,7 +50,7 @@ Nine rules, registered in `cbts/command/main.py::RULE_CLASSES`:
 | `TestListRule` | `testlistonly` | `tests/integration/test_lists/test-db/*.yml` |
 | `VisualGenRule` | `visualgenonly` | VG source and the exact VG serve schema; public VG/media changes also keep full CPU and shared serving tests, package sanity, and performance sanity; missing required validation forces fallback |
 | `SpecDecRule` | `specdeconly` | `tensorrt_llm/_torch/speculative/**`, `tensorrt_llm/models/{eagle,medusa,redrafter}/**`, `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**`, `examples/llm-api/llm_speculative_decoding.py` (excl. docs; other suffixes incl. images kept as potential test fixtures) |
-| `ModelingV2Rule` | `modelingv2only` | `tensorrt_llm/_torch/_experimental/modeling_v2/**`, `cpp/tensorrt_llm/modeling_v2/**`, `cpp/cmake/modules/modeling_v2.cmake` (excl. docs); per model node for changes under `models/` |
+| `ModelingV2Rule` | `modelingv2only` | `tensorrt_llm/_torch/_experimental/modeling_v2/**`, `cpp/tensorrt_llm/modeling_v2/**`, `cpp/cmake/modules/modeling_v2.cmake` (excl. docs); per target or family for changes under `models/` and `catalog/<category>/`, from paths and imports |
 | `AgentFlowRule` | `agentflowonly` | `agent-flow/**` (excl. docs and out-of-scope metadata) |
 | `OpenEngineRule` | `openengineonly` | `tensorrt_llm/grpc/openengine/**` (excl. docs) |
 | `DocsRule` | `docsonly` | Outside noop paths: `docs/**` and verified Python docstring edits → `CPU-Build_Docs` plus registered documentation-related CPU tests; other `**/*.md` / `**/*.rst` → `CPU-Build_Docs` only |
@@ -67,7 +67,7 @@ See `cbts/rules/README.md` for per-rule logic.
 | `testlistonly` | `TestListRule` fired solo: PR only adds entries under `tests/integration/test_lists/test-db/*.yml`. |
 | `visualgenonly` | `VisualGenRule` fired solo. Internal VG changes select VG test entries; schema changes also retain schema validation. Public VG/media changes additionally retain the complete CPU suite, shared serving integration tests, package sanity, and performance sanity. Missing required validation forces `null` fallback. |
 | `specdeconly` | `SpecDecRule` fired solo: PR only touches speculative-decoding source paths (`tensorrt_llm/_torch/speculative/**`, `tensorrt_llm/models/{eagle,medusa,redrafter}/**`, `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**`, `examples/llm-api/llm_speculative_decoding.py`; excl. docs). Narrows to blocks containing spec-dec test entries (eagle / medusa / redrafter / ngram / draft-target-model / MTP). |
-| `modelingv2only` | `ModelingV2Rule` fired solo: PR only touches modeling_v2 code -- the subtree (`tensorrt_llm/_torch/_experimental/modeling_v2/**`, each family's native code in its `csrc/` included: one torch-op library per model family) or what the family libraries share (`cpp/tensorrt_llm/modeling_v2/**`, `cpp/cmake/modules/modeling_v2.cmake`); excl. docs, which are a fifth of the Python subtree — every catalog entry carries a contract document. A change under `models/` selects its model node's unit tests and target accuracy gates, plus whole-tree checks; shared code or an unreadable routing tree selects every modeling_v2 entry. No outward-facing fallback is needed: nothing beyond the resolver module is imported, and no family library is loaded, unless `LLM(modeling_v2=...)` is on; the CPU checks that keep this true run in every scope. The callers outside the subtree (`_torch/pyexecutor/model_loader.py`, `_torch/models/modeling_auto.py`) are left unclaimed, so touching them falls back to baseline. |
+| `modelingv2only` | `ModelingV2Rule` fired solo: PR only touches modeling_v2 code -- the subtree (`tensorrt_llm/_torch/_experimental/modeling_v2/**`, each family's native code in its `csrc/` included: one torch-op library per model family) or what the family libraries share (`cpp/tensorrt_llm/modeling_v2/**`, `cpp/cmake/modules/modeling_v2.cmake`); excl. docs, which are a fifth of the Python subtree — every catalog entry carries a contract document. A file in a target (`models/<family>/<target>/`, a directory the family's `routing.py` returns a target class from) selects only that target's unit and accuracy tests; if `routing.py` cannot be read, the whole family counts as family code. Other Python code under `models/<family>/` or `catalog/<category>/` selects its own unit tests plus the tests of every target and every unit test file under `unittest/_torch/modeling_v2/` that imports it, read from the PR head (a deleted or moved module still counts through its importers); family code no target imports selects the whole family in place of its own unit tests, and family native or data files select the whole family. Whole-tree checks always run; shared code selects every modeling_v2 entry. No outward-facing fallback is needed: nothing beyond the resolver module is imported, and no family library is loaded, unless `LLM(modeling_v2=...)` is on; the CPU checks that keep this true run in every scope. The callers outside the subtree (`_torch/pyexecutor/model_loader.py`, `_torch/models/modeling_auto.py`) are left unclaimed, so touching them falls back to baseline. |
 | `agentflowonly` | `AgentFlowRule` fired solo: PR only touches `agent-flow/**` source or test files (excl. docs). Runs `CPU-AgentFlow-UnitTest`. |
 | `openengineonly` | `OpenEngineRule` fired solo: PR only touches `tensorrt_llm/grpc/openengine/**` source files (excl. docs). Narrows to the registered OpenEngine unit tests: the stub-based ones on matching `CPU-Generic-*` stages, plus `test_capability_conformance.py` on `A10-PyTorch-*`, which needs a GPU. |
 | `docsonly` | `DocsRule` fired solo: all documentation changes run `CPU-Build_Docs`; changes under `docs/**` also run registered documentation-related CPU tests on matching `CPU-Generic-*` stages. Docs-only orchestration skips the SBSA track, so its resolved ARM stage is not launched. |
@@ -116,6 +116,7 @@ jenkins/scripts/cbts/                  outer vendor dir — put on PYTHONPATH fo
 │   │   ├── visual_gen.py
 │   │   ├── spec_dec.py
 │   │   ├── modeling_v2.py
+│   │   ├── modeling_v2_source.py  import and routing parser shared with the modeling_v2 CPU check
 │   │   ├── agent_flow.py
 │   │   ├── openengine.py
 │   │   ├── docs.py
@@ -371,7 +372,7 @@ CBTS defers to the existing filter chain when:
   but cannot decide; e.g. testdef blast-radius cap, testlist structural
   YAML edit)
 - Combined scope is `None` (incompatible mix)
-- Tier 2 declines: a residual file is not core Python, is absent from the
+- Tier 2 declines: a residual edit reaches shared pytest state, a file is not Python, lacks test-attributed records in the
   touch DB, has an unbounded import-executed change (class body, signature,
   decorator, or unsupported module statement), has no usable patch, has
   unparsable source, or has a closure change with no wider row set. A small AST

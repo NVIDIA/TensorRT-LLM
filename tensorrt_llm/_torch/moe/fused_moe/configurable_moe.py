@@ -51,7 +51,12 @@ from tensorrt_llm._torch.moe.fused_moe.interface import (
 )
 from tensorrt_llm._torch.moe.fused_moe.routing import BaseMoeRoutingMethod
 from tensorrt_llm._torch.pyexecutor.dwdp import get_global_dwdp_manager
-from tensorrt_llm._torch.utils import AuxStreamType, EventType, Fp4QuantizedTensor
+from tensorrt_llm._torch.utils import (
+    AuxStreamType,
+    EventType,
+    Fp4QuantizedTensor,
+    is_torch_compiling,
+)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -422,7 +427,6 @@ class ConfigurableMoE(MoE):
         # enforce ``moe.comm is None`` without ``getattr`` guards.
         self.backend = backend
         self._reject_non_divisible_ep_backend()
-        self.use_flashinfer = getattr(self.backend, "use_flashinfer", False)
 
         # DWDP eligibility needs the backend; a layer DWDP manages stores only
         # this rank's experts, so it is sized here, before the sync below
@@ -710,7 +714,7 @@ class ConfigurableMoE(MoE):
         Side effects:
             - May switch self.comm to AllGather if current strategy cannot be used
 
-        Note: This method does NOT create strategy if None (creation happens lazily elsewhere).
+        Note: This method does NOT create strategy if None.
               It only validates and potentially falls back existing AllToAll strategies.
 
         """
@@ -788,10 +792,19 @@ class ConfigurableMoE(MoE):
             # Currently the TRTLLMGEN reduce sum internally.
             # Keep updated with more supported backends.
             alltoall_result_do_sum=True,
-            use_flashinfer=self.use_flashinfer,
             hidden_size=self.hidden_size,
             communication_method=self.communication_method,
             allow_alltoall=self.backend.supports_alltoall,
+            layer_quant_config=getattr(self, "_override_quant_config", None),
+        )
+
+    def routes_from_logit_partials(self, routing_aux: Optional[torch.Tensor] = None) -> bool:
+        """Whether this forward reads the router logits only in the backend's fused route+quant
+        launch, which also takes them as ``RouterLogitPartials`` and sums them in order."""
+        return (
+            self.scheduler.routes_from_logit_partials(routing_aux)
+            and not self._enable_perfect_router
+            and not is_torch_compiling()
         )
 
     def forward_impl(
@@ -806,6 +819,7 @@ class ConfigurableMoE(MoE):
         lora_params: Optional[Dict] = None,
         input_ready_event: Optional[torch.cuda.Event] = None,
         prerouted: Optional[PreroutedRouting] = None,
+        lamport_fc2_out: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Forward entry point.
@@ -826,6 +840,9 @@ class ConfigurableMoE(MoE):
         ``prerouted``: the tokens' routing, computed by the caller for a backend
         that declares ``supports_prerouted_routing`` (one chunk, no
         communication).
+
+        ``lamport_fc2_out``: the un-finalized FC2 rows' buffer for a caller
+        whose MoE-output all-reduce polls them (``MoERunContext``).
         """
         input_ids = kwargs.get("input_ids")
         routing_aux = kwargs.get("routing_aux")
@@ -857,7 +874,10 @@ class ConfigurableMoE(MoE):
             lora_params=lora_params,
             routing_aux=routing_aux,
             input_ready_event=input_ready_event,
+            moe_hooks=kwargs.get("moe_hooks"),
+            unrouted_rows=kwargs.get("unrouted_rows"),
             prerouted=prerouted,
+            lamport_fc2_out=lamport_fc2_out,
         )
 
         # DWDP: record compute and trigger next prefetch (per-layer, not per-chunk).
@@ -1038,6 +1058,11 @@ class ConfigurableMoE(MoE):
             return False
         # Simplified check - AllGather strategy means no alltoall
         return not isinstance(self.comm, AllGatherReduceScatter)
+
+    @property
+    def has_comm_strategy(self) -> bool:
+        """Whether ``self.comm`` holds a strategy; decided at construction."""
+        return self.comm is not None
 
     @property
     def _weights_created(self):
