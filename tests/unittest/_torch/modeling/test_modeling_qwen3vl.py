@@ -16,7 +16,7 @@ from _torch.helpers import create_mock_cuda_graph_runner
 from PIL import Image
 from test_modeling_multimodal import MultimodalScenario, TestModelingMultimodal
 from test_modeling_qwen2vl import _make_vision_attention
-from transformers import Qwen3VLConfig
+from transformers import PretrainedConfig, Qwen3VLConfig
 from transformers import Qwen3VLForConditionalGeneration as HFQwen3VLForConditionalLM
 from utils.llm_data import llm_models_root
 
@@ -28,13 +28,17 @@ from tensorrt_llm._torch.models.modeling_multimodal_utils import (
     normalize_vision_pixels,
     vision_normalization_from_processor,
 )
+from tensorrt_llm._torch.models.modeling_qwen2vl import Qwen2_5_VLModel, Qwen2VLModel
 from tensorrt_llm._torch.models.modeling_qwen3vl import (
     Qwen3VisionModel,
+    Qwen3VisionModelBase,
     Qwen3VLInputProcessorBase,
     Qwen3VLModel,
     _triton_pos_embed_interpolate,
 )
+from tensorrt_llm._torch.models.modeling_qwen3vl_moe import Qwen3MoeVLModel
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
+from tensorrt_llm._torch.pyexecutor.model_loader import _validate_encoder_attention_backend_support
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.llmapi.llm_args import MultimodalConfig, MultimodalEncoderCudaGraphConfig
@@ -2218,3 +2222,75 @@ def test_normalization_transport_partial_encoder_cache() -> None:
     encoder.assert_not_called()
     assert torch.equal(attached[0], params.multimodal_data["multimodal_embedding"])
     assert params.multimodal_data["image"]["vision_normalization"] is spec
+
+
+class _RecordingVisionEncoder(torch.nn.Module):
+    def __init__(self, model_config: ModelConfig) -> None:
+        super().__init__()
+        self.model_config = model_config
+        self.weight = torch.nn.Parameter(torch.ones(1))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("decoder_backend", "override"),
+    [("TRTLLM", None), ("TRTLLM", "VANILLA"), ("FLASHINFER", "VANILLA")],
+)
+def test_qwen_encoder_backend_preserves_decoder(decoder_backend: str, override: str | None) -> None:
+    config = ModelConfig(
+        pretrained_config=PretrainedConfig(
+            text_config=PretrainedConfig(dtype=torch.float32),
+            vision_config=PretrainedConfig(),
+        ),
+        attn_backend=decoder_backend,
+        multimodal_config=MultimodalConfig(
+            encoder_attention_backend={"vision": override} if override else None
+        ),
+    )
+    config._frozen = True
+    encoder = Qwen3VisionModelBase(config, _RecordingVisionEncoder)
+    assert encoder.visual.model_config.attn_backend == (override or decoder_backend)
+    assert encoder.model_config.extra_attrs is config.extra_attrs
+    assert encoder.model_config._frozen
+    if override is None:
+        assert encoder.model_config is config
+    assert config.attn_backend == decoder_backend
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("override", [None, "VANILLA", "FLASHINFER"])
+def test_qwen2_5_vl_encoder_override_drops_decoder_kv_cache_quant(
+    override: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(modeling_qwen2vl, "Qwen2_5_VisionModel", _RecordingVisionEncoder)
+    pretrained_config = PretrainedConfig(vision_config=PretrainedConfig(num_heads=1))
+    pretrained_config.torch_dtype = torch.float32
+    config = ModelConfig(
+        pretrained_config=pretrained_config,
+        quant_config=QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8),
+        multimodal_config=MultimodalConfig(
+            encoder_attention_backend={"vision": override} if override else None
+        ),
+    )
+
+    encoder = modeling_qwen2vl.Qwen2VisionModelBase(config, _RecordingVisionEncoder)
+
+    vision = encoder.visual.model_config
+    assert vision.attn_backend == (override or "TRTLLM")
+    # The default keeps today's config. An override drops the decoder's FP8
+    # KV-cache setting, which FlashInfer rejects without a KV cache.
+    assert vision.quant_config.kv_cache_quant_algo == (None if override else QuantAlgo.FP8)
+    assert config.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+
+
+@pytest.mark.cpu_only
+def test_qwen_encoder_backend_declarations_preserve_fixed_hf_encoder() -> None:
+    public_backends = frozenset({"TRTLLM", "FLASHINFER", "VANILLA"})
+    for model_cls in (Qwen2_5_VLModel, Qwen3VLModel, Qwen3MoeVLModel):
+        assert model_cls.supported_encoder_attention_backends == {"vision": public_backends}
+    assert Qwen2VLModel.supported_encoder_attention_backends == {"vision": frozenset()}
+    with pytest.raises(ValueError, match="vision.*cannot be changed"):
+        _validate_encoder_attention_backend_support(
+            Qwen2VLModel,
+            MultimodalConfig(encoder_attention_backend={"vision": "VANILLA"}),
+        )

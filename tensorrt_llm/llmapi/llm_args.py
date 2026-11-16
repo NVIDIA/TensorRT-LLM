@@ -816,6 +816,10 @@ class MultimodalEncoderSchedulingPolicy(StrEnum):
     LLM capacity filtering (``MultimodalEagerEncoderScheduler``)."""
 
 
+# Public attention backends a multimodal encoder can select.
+EncoderAttentionBackend = Literal["VANILLA", "TRTLLM", "FLASHINFER"]
+
+
 class MultimodalConfig(StrictBaseModel):
     """Multimodal model configuration."""
 
@@ -828,6 +832,20 @@ class MultimodalConfig(StrictBaseModel):
          "inputs keep the existing CPU preprocessing path. False (default) "
          "disables GPU normalization."),
         status="prototype",
+    )
+
+    encoder_attention_backend: dict[str, EncoderAttentionBackend] | None = Field(
+        default=None,
+        description=
+        ("TensorRT-LLM attention backend for each logical multimodal encoder, "
+         "for example {'vision': 'FLASHINFER'}. Public values are VANILLA, TRTLLM, "
+         "and FLASHINFER. Image and video share the vision encoder. Only encoders "
+         "using TensorRT-LLM Attention support this option; encoders using fixed "
+         "attention reject overrides at initialization. Omitted entries retain "
+         "their model-specific defaults and the language model's attn_backend "
+         "is unchanged. Unsupported encoders or backends raise an error."),
+        status="prototype",
+        telemetry=False,
     )
 
     encoder_cuda_graph: dict[str, MultimodalEncoderCudaGraphConfig] | None = Field(
@@ -899,6 +917,16 @@ class MultimodalConfig(StrictBaseModel):
     def parse_encoder_cache_max_bytes(cls, value):
         return _parse_binary_byte_string(value)
 
+    @field_validator('encoder_attention_backend', mode='before')
+    @classmethod
+    def normalize_encoder_attention_backend(cls, value: object) -> object:
+        if isinstance(value, dict):
+            return {
+                name: backend.upper() if isinstance(backend, str) else backend
+                for name, backend in value.items()
+            }
+        return value
+
     @model_validator(mode='after')
     def validate_encoder_optimization_compatibility(self) -> 'MultimodalConfig':
         if (self.encoder_cuda_graph is not None
@@ -908,6 +936,22 @@ class MultimodalConfig(StrictBaseModel):
                 "multimodal_config.encoder_side_stream_max_ahead > 0 are "
                 "mutually exclusive. Disable side-stream MM prefetch or "
                 "disable MM encoder CUDA graphs.")
+        # VANILLA derives segment boundaries on the host, so graph replay
+        # would reuse the captured ones. Image and video share `vision`.
+        graph_encoders = {
+            "vision" if name in ("image", "video") else name
+            for name in self.encoder_cuda_graph or ()
+        }
+        vanilla_graph_encoders = sorted(
+            encoder for encoder, backend in (
+                self.encoder_attention_backend or {}).items()
+            if backend == "VANILLA" and encoder in graph_encoders)
+        if vanilla_graph_encoders:
+            raise ValueError(
+                "multimodal_config.encoder_attention_backend selects VANILLA "
+                f"for {vanilla_graph_encoders}, which does not support "
+                "multimodal_config.encoder_cuda_graph. Select TRTLLM or "
+                "FLASHINFER, or disable CUDA graphs for that encoder.")
         return self
 
 
@@ -2539,6 +2583,24 @@ class Nvfp4GemmConfig(StrictBaseModel):
         default_factory=lambda: ['cutlass', 'cublaslt', 'cutedsl', 'cuda_core'],
         min_length=1,
         description="List of backends to consider for auto-selection.")
+
+
+class AutoTunerNvMMHConfig(StrictBaseModel):
+    """nvMatmulHeuristics (nvMMH) guidance for the CuTe DSL GEMM/BMM autotuner.
+
+    CuTe DSL GEMM and BMM runners profile only the kernel configurations that
+    nvMatmulHeuristics ranks highest for each problem shape, taking every
+    field it models (CTA tile, cluster shape, split-K, rasterization order and
+    swizzle) as returned, instead of profiling their full tactic space.
+    ``max_tactics`` counts kernel configurations, not profiled tactics.
+    """
+    max_tactics: PositiveInt = Field(
+        default=5,
+        description=
+        "Number of top-ranked nvMatmulHeuristics kernel configurations kept per GEMM/BMM shape. "
+        "Each configuration expands into one tactic per combination of the knobs nvMatmulHeuristics "
+        "does not model (e.g. SM107 prefetch, scheduler and mixed-cluster variants), so the number "
+        "of profiled tactics can be several times max_tactics.")
 
 
 class AttentionDpConfig(StrictBaseModel):
@@ -8382,6 +8444,12 @@ class TorchLlmArgs(BaseLlmArgs):
         default=True,
         description=
         "Enable autotuner for all tunable ops. This flag is for debugging purposes only, and the performance may significantly degrade if set to false.",
+        status="prototype")
+
+    autotuner_nvmmh_config: Optional[AutoTunerNvMMHConfig] = Field(
+        default=None,
+        description=
+        "Use nvMatmulHeuristics to shrink the CuTe DSL GEMM/BMM autotuning search space to its top-ranked kernel configurations. None profiles every tactic.",
         status="prototype")
 
     use_fine_grained_sync: bool = Field(
