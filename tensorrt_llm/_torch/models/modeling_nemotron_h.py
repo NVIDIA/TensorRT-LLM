@@ -791,6 +791,8 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
                                                        | NemotronHPuzzleConfig]
                            ):
 
+    supports_multimodal_breakable_cuda_graph = True
+
     def __init__(
         self,
         model_config: NemotronHModelConfig,

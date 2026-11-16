@@ -1346,7 +1346,9 @@ class TestEvsVideoContextTokenId:
             video_context_token_id=video_context_token_id,
             sound_context_token_id=None,
         )
-        model_config = SimpleNamespace(pretrained_config=config, video_pruning_rate=0.5)
+        model_config = SimpleNamespace(
+            pretrained_config=config, video_pruning_rate=0.5, extra_attrs={}
+        )
         with (
             mock.patch.object(NemotronHMultimodalModel, "_update_config_for_quantization"),
             mock.patch.object(NemotronHMultimodalModel, "post_config"),

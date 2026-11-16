@@ -494,6 +494,15 @@ class Block(nn.Module):
             q_scaling=1.0,
             attention_chunk_size=None,
         )
+        # Vision attention runs from the multimodal wrapper with tower-local
+        # metadata. Unregister from the shared attn-layer map so it never takes
+        # the custom-op path (torch.compile or breakable CUDA graph), which reads
+        # the decoder's metadata (same contract as Qwen2_5_VLVisionAttention).
+        if self.attn.register_to_config:
+            self.model_config.extra_attrs.get("attn_layers",
+                                              {}).pop(self.attn.layer_idx_str,
+                                                      None)
+            self.attn.register_to_config = False
         if init_values:
             raise NotImplementedError(
                 "Limited RADIO model support: Block does not support LayerScale for now."
