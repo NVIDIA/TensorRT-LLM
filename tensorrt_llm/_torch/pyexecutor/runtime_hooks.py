@@ -150,28 +150,6 @@ class MsaRuntimePolicy:
     reuse_pool_views: bool = False
 
 
-@dataclass(frozen=True)
-class HybridCachePolicy:
-    """Recurrent-state cache policies a hybrid (recurrent + attention) model may opt into.
-
-    The engine passes them to the model's V2 hybrid cache manager
-    (``MambaHybridCacheManagerV2``) when it builds it. They change how
-    recurrent-state pages are kept and uploaded, never what a forward computes.
-    """
-
-    # Context requests whose prompt is shorter than this many tokens commit their
-    # recurrent-state pages (live state and snapshots) at the lowest eviction
-    # priority; attention pages keep theirs. A snapshot is reusable only at its exact
-    # token boundary and takes a whole state slot whatever the prompt length, while a
-    # short prompt is cheap to recompute. 0: off. Needs block reuse.
-    low_priority_snapshot_prompt_len: int = 0
-    # When the batch's recurrent-state indices or dummy-request mask change, write
-    # both device buffers with one SM kernel from pinned snapshots instead of two
-    # copy-engine copies, whose engine hand-offs delay the execution stream in front
-    # of the next step's inputs. Unchanged buffers are not written either way.
-    state_index_upload_kernel: bool = False
-
-
 class KvBalancedAdmissionPlanner(Protocol):
     """Chooses the requests attention-DP KV-balanced admission admits, and their ranks.
 
@@ -325,8 +303,6 @@ class RuntimeHooks:
     # peer buffers, kernel attribute and module loads), up to the memory free at that point. None keeps the
     # engine's default margin (1 GiB). The KV cache budget does not change.
     torch_mem_safety_margin: Optional[int] = None
-    # Recurrent-state cache policies of a hybrid model (see HybridCachePolicy).
-    hybrid_cache: HybridCachePolicy = HybridCachePolicy()
     # With long-prefill demotion on (TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS > 0), the
     # KV cache manager V2 scheduler classifies context requests by the prefix cache rather than
     # the router's estimate alone: an estimate above the threshold is checked once against the

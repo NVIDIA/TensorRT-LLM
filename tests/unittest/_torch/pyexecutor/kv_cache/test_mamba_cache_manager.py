@@ -5,7 +5,6 @@
 import contextlib
 import math
 import os
-import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -108,15 +107,9 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
     _mamba_snapshot_rule_counts,
     _promote_mamba_state_triton,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
-    mamba_cache_manager_v2 as mamba_cache_manager_v2_module,
-)
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     MambaAcceptanceBatch,
     _stack_state_views,
-)
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2 import (
-    _low_priority_recurrent_state,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.regions import (
     AllocationUnit,
@@ -137,7 +130,6 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     KVCacheManager,
     get_pp_layers,
 )
-from tensorrt_llm._torch.pyexecutor.runtime_hooks import HybridCachePolicy
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import get_sm_version, torch_dtype_to_binding
 from tensorrt_llm.bindings.executor import KvCacheRetentionConfig
@@ -158,7 +150,6 @@ from tensorrt_llm.llmapi.llm_utils import (
     _resolve_transceiver_runtime_auto,
 )
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.runtime import kv_cache_manager_v2 as runtime_kv_cache_manager_v2
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     GPU_LEVEL,
     AttentionLayerConfig,
@@ -3960,7 +3951,6 @@ def _build_v2_hybrid_with_mamba_layer(
     max_num_tokens: int = 8192,
     is_draft: bool = False,
     joint_kv_cache_reuse: bool = False,
-    hybrid_cache_policy: HybridCachePolicy | None = None,
 ) -> MambaHybridCacheManagerV2:
     """Construct a real MambaHybridCacheManagerV2."""
     # Draft layers of a combined speculative manager follow the model's layers in both masks.
@@ -4061,7 +4051,6 @@ def _build_v2_hybrid_with_mamba_layer(
         enable_stats=enable_stats,
         is_draft=is_draft,
         joint_kv_cache_reuse=joint_kv_cache_reuse,
-        hybrid_cache_policy=hybrid_cache_policy,
         **(
             {"kda_draft_records": kda_draft_records}
             if issubclass(model_cls, KimiK3HybridCacheManager)
@@ -4900,80 +4889,41 @@ def test_v2_hybrid_waiter_points_after_history_advanced_commit():
         mgr.shutdown()
 
 
-_LOW_PRIORITY_48 = HybridCachePolicy(low_priority_snapshot_prompt_len=48)
-
-
 def _is_recurrent(life_cycle) -> bool:
     return not isinstance(life_cycle, AttnLifeCycle)
 
 
-def test_low_priority_recurrent_state_callback_maps_life_cycles():
-    """The C++ backend passes the page's life cycle: only recurrent-state pages are demoted."""
-    attention = AttnLifeCycle(None, 0)
-    sliding_window = AttnLifeCycle(256, 0)
-    recurrent_state = runtime_kv_cache_manager_v2._cpp.SsmLifeCycle()
-    assert _low_priority_recurrent_state(0, attention) == PAGE_PRIORITY_DEFAULT
-    assert _low_priority_recurrent_state(3, sliding_window) == PAGE_PRIORITY_DEFAULT
-    assert _low_priority_recurrent_state(3, recurrent_state) == PAGE_PRIORITY_MIN
+def _recurrent_state_lowest(_ordinal: int, life_cycle) -> int:
+    """Lowest eviction priority for recurrent-state pages, the default for attention pages."""
+    return PAGE_PRIORITY_MIN if _is_recurrent(life_cycle) else PAGE_PRIORITY_DEFAULT
+
+
+class _ShortPromptStateLowest(MambaHybridCacheManagerV2):
+    """Commits the recurrent-state pages of prompts shorter than 48 tokens at the lowest priority."""
+
+    def _context_priority_callback(self, req):
+        return _recurrent_state_lowest if req.prompt_len < 48 else None
 
 
 @skip_no_cuda
-def test_v2_hybrid_low_priority_snapshot_callback_selection():
-    short = _make_v2_conversation_request(1, list(range(32)), "conv-1")
-    long = _make_v2_conversation_request(2, list(range(64)), "conv-2")
-    dummy = _make_v2_conversation_request(3, list(range(32)), "conv-3")
-    dummy.is_dummy_request = True
-
-    mgr = _build_v2_hybrid_with_mamba_layer(
-        enable_block_reuse=True,
-        block_reuse_policy="per_conversation",
-        additional_snapshot_offsets_from_end=[0],
-    )
-    try:
-        assert mgr._context_priority_callback(short) is None
-    finally:
-        mgr.shutdown()
-
-    mgr = _build_v2_hybrid_with_mamba_layer(
-        enable_block_reuse=True,
-        block_reuse_policy="per_conversation",
-        additional_snapshot_offsets_from_end=[0],
-        hybrid_cache_policy=_LOW_PRIORITY_48,
-    )
-    try:
-        assert mgr._context_priority_callback(short) is _low_priority_recurrent_state
-        assert mgr._context_priority_callback(long) is None
-        assert mgr._context_priority_callback(dummy) is None
-    finally:
-        mgr.shutdown()
-
-    # Without block reuse no snapshot is ever committed, so nothing is demoted.
-    mgr = _build_v2_hybrid_with_mamba_layer(
-        enable_block_reuse=False, hybrid_cache_policy=_LOW_PRIORITY_48
-    )
-    try:
-        assert mgr._context_priority_callback(short) is None
-    finally:
-        mgr.shutdown()
-
-
-@skip_no_cuda
-def test_v2_hybrid_low_priority_snapshot_callback_reaches_backend(monkeypatch):
+def test_v2_hybrid_context_priority_callback_reaches_backend():
+    """A subclass's callback is asked for both the recurrent-state and the attention pages."""
     calls = []
 
     def recording_callback(ordinal, life_cycle):
-        priority = _low_priority_recurrent_state(ordinal, life_cycle)
+        priority = _recurrent_state_lowest(ordinal, life_cycle)
         calls.append((_is_recurrent(life_cycle), priority))
         return priority
 
-    monkeypatch.setattr(
-        mamba_cache_manager_v2_module, "_low_priority_recurrent_state", recording_callback
-    )
+    class _Recording(MambaHybridCacheManagerV2):
+        def _context_priority_callback(self, req):
+            return recording_callback if req.prompt_len < 48 else None
+
     mgr = _build_v2_hybrid_with_mamba_layer(
         enable_block_reuse=True,
         block_reuse_policy="per_conversation",
         additional_snapshot_offsets_from_end=[0],
-        hybrid_cache_policy=_LOW_PRIORITY_48,
+        model_manager_cls=_Recording,
     )
     long = _make_v2_conversation_request(1, [1] + list(range(100, 163)), "conv-1")
     short = _make_v2_conversation_request(2, [2] + list(range(100, 131)), "conv-2")
@@ -5017,7 +4967,7 @@ def test_v2_hybrid_short_prompt_snapshot_eviction_order(demote_short_prompts):
         block_reuse_policy="per_conversation",
         max_num_turns=3,
         additional_snapshot_offsets_from_end=[0],
-        hybrid_cache_policy=_LOW_PRIORITY_48 if demote_short_prompts else None,
+        model_manager_cls=_ShortPromptStateLowest if demote_short_prompts else None,
     )
     old_long_tokens = [1] + list(range(100, 163))
     short_tokens = [2] + list(range(100, 131))
@@ -5084,8 +5034,6 @@ def _branch_snapshot_manager(
     mgr._page_pruned_tokens_total = 0
     mgr._branch_snapshots_taken_total = 0
     mgr._branch_snapshots_skipped_total = {}
-    # Logged just now, so the rate-limited INFO counters stay quiet.
-    mgr._branch_snapshot_counters_logged_at = time.monotonic()
     return mgr
 
 

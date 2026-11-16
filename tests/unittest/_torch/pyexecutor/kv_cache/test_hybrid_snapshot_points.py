@@ -10,23 +10,17 @@ sets those marks (the Kimi K3 SM107 targets' manager, tested with the family). H
 budget caps such a chunk is tested with the scheduler (``test_kv_cache_v2_scheduler.py``,
 ``TestMidchunkSnapshotBudget``).
 
-``MambaHybridCacheManagerV2`` logs its recurrent snapshot and reuse counters at INFO, at most
-once a minute.
+``MambaHybridCacheManagerV2`` counts the snapshots it commits at branch and waiter points.
 
 Every test here runs on stubs, without a GPU.
 """
 
-import time
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import BlockReusePolicy
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
-    mamba_cache_manager_v2 as mamba_cache_manager_v2_module,
-)
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
     _get_forced_context_chunk_size,
     _is_forced_context_chunk_boundary,
@@ -117,8 +111,6 @@ def _counters_stub():
     mgr._waiter_snapshot_points = None
     mgr._branch_snapshots_taken_total = 0
     mgr.kv_cache_map = {}
-    # Logged just now, so the rate-limited INFO counters stay quiet.
-    mgr._branch_snapshot_counters_logged_at = time.monotonic()
     mgr.tokens_per_block = 128
     mgr.kv_cache_config = KvCacheConfig(
         enable_block_reuse=True,
@@ -166,22 +158,3 @@ def test_inflight_prefix_counters():
         "inflight_prefix_points_taken=1"
     )
     assert "inflight_prefix_deferrals=2" in mgr._format_branch_snapshot_counters()
-
-
-def test_snapshot_counters_are_logged_at_info_once_a_minute(monkeypatch):
-    mgr = _counters_stub()
-    mgr._branch_snapshot_counters_logged_at = float("-inf")
-    clock = iter([1000.0, 1030.0, 1061.0])
-    monkeypatch.setattr(time, "monotonic", lambda: next(clock))
-    info = MagicMock()
-    monkeypatch.setattr(mamba_cache_manager_v2_module.logger, "info", info)
-    request = _context_request(1, 0, 1000, 1000, [1000])
-    kv_cache = SimpleNamespace(
-        _get_num_reusable_tokens_before_pruning=lambda: 0,
-        _get_num_reusable_tokens_before_hybrid_pruning=lambda: 0,
-        num_committed_tokens=0,
-    )
-    for _ in range(3):
-        mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=999)
-    # At most one INFO line a minute: the first two recordings are one minute apart.
-    assert info.call_count == 2
