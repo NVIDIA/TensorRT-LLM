@@ -12,11 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for the SM107 CuTe DSL BF16 dense GEMM/BMM custom ops.
+"""Tests for the CuTe DSL BF16 dense GEMM/BMM custom ops.
 
 The dispatch tests run on every architecture with CuTe DSL installed and check
 that ``trtllm::cute_dsl_bf16_{gemm,bmm}_rubin`` are unreachable off SM107. The
-correctness tests need SM107 and a CuTe DSL package with the SM107 helpers.
+SM107 correctness tests need SM107 and a CuTe DSL package with the SM107
+helpers. The split-K test of ``trtllm::cute_dsl_bf16_gemm_blackwell`` needs
+SM100/SM103.
 """
 
 import pytest
@@ -39,6 +41,10 @@ skip_not_sm107 = pytest.mark.skipif(
     reason="requires SM107 and a CuTe DSL package with SM107 support",
 )
 skip_on_sm107 = pytest.mark.skipif(getSMVersion() == 107, reason="checks the non-SM107 path")
+skip_not_sm100f = pytest.mark.skipif(
+    not IS_CUTLASS_DSL_AVAILABLE or getSMVersion() not in (100, 103),
+    reason="requires SM100/SM103 and cutlass-dsl",
+)
 
 
 def _runner_class(name):
@@ -247,3 +253,56 @@ def test_cute_dsl_bf16_bmm_rubin_strided_views():
     bad_weight = torch.randn(b, k, n, dtype=torch.bfloat16, device="cuda").transpose(1, 2)
     with pytest.raises(ValueError, match="K innermost"):
         runner([act, bad_weight, output], tactic=_select_tactic(tactics, "base"))
+
+
+# --------------------------------------------------------------------------
+# SM100/SM103 split-K.
+# --------------------------------------------------------------------------
+
+
+@skip_not_sm100f
+@pytest.mark.parametrize("split_k_slices", [2, 4, 8])
+@pytest.mark.parametrize("c_dtype", [torch.bfloat16, torch.float32])
+def test_cute_dsl_bf16_split_k_gemm_blackwell(split_k_slices, c_dtype):
+    """Split-K matches the dense reference for large-K, small-N shapes."""
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import CuteDSLBf16BlackwellGemmRunner
+
+    torch.manual_seed(2026)
+    runner = CuteDSLBf16BlackwellGemmRunner(output_dtype=c_dtype)
+    act, weight, output = _gemm_operands(64, 256, 7168, c_dtype)
+    base = (False, (128, 128), (1, 1))
+    tactic = base + ("m", 1, split_k_slices)
+    # Large K and small N, so the full sweep offers split-K for either output dtype.
+    assert tactic in runner.get_valid_tactics([act, weight, output], None)
+
+    # Direct split-K rounds each partial to the output dtype before the
+    # atomic TMA ADD, so BF16 output needs tolerance for both rounding and
+    # arrival-order changes.
+    rtol, atol = (2e-2, 2.5) if c_dtype == torch.bfloat16 else (1e-2, 1.0)
+
+    expected = act.float() @ weight.t().float()
+    runner([act, weight, output], tactic=tactic)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output.float(), expected, rtol=rtol, atol=atol)
+
+    # A second launch must not accumulate on the previous output; poisoning C
+    # also catches a missing zero inside CUDA-graph replay.
+    output.fill_(float("nan"))
+    runner([act, weight, output], tactic=tactic)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output.float(), expected, rtol=rtol, atol=atol)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        runner([act, weight, output], tactic=tactic)
+    output.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output.float(), expected, rtol=rtol, atol=atol)
+
+    if c_dtype == torch.float32:
+        split1_output = torch.empty_like(output)
+        runner([act, weight, split1_output], tactic=base)
+        torch.cuda.synchronize()
+        # Both write FP32; direct split-K only changes the reduction order.
+        torch.testing.assert_close(output, split1_output, rtol=1e-3, atol=1e-2)
