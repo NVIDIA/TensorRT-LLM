@@ -69,6 +69,7 @@ from .model_loader import ModelLoader, construct_checkpoint_loader
 from .py_executor import PyExecutor
 from .runtime_hooks import runtime_hooks_of
 from .scheduler import gen_preemption
+from .user_cache_directory import ensure_user_cache_directory
 
 _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS = (90, 100, 103, 107, 120, 121)
 _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS = (90, 100, 103, 107, 120)
@@ -1571,6 +1572,9 @@ def create_py_executor(
     left alone. Exiting the DWDP manager also exits the dense manager it
     registered, so the second rollback finds a standalone one only.
     """
+    # Before the engine compiles kernels at run time: without a user cache directory the kernel
+    # generator shares them with every process of the host, by name (see the module).
+    ensure_user_cache_directory()
     previous_dwdp_manager = get_global_dwdp_manager()
     previous_dense_manager = get_global_dense_dwdp_manager()
     try:
