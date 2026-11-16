@@ -17,6 +17,7 @@ from tensorrt_llm.bench.tuning.settings import get_model_config
 from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.commands.utils import \
     collect_explicit_cli_keys as _collect_explicit_cli_keys
+from tensorrt_llm.llmapi.utils import download_hf_model
 from tensorrt_llm.logger import logger
 
 # Map trtllm-bench Click parameter names to the LlmArgs field name (or
@@ -143,6 +144,10 @@ def get_general_cli_options(
         params: Dict, bench_env: BenchmarkEnvironment) -> GeneralExecSettings:
     """Get general execution settings from command line parameters.
 
+    A Mistral-native checkpoint is read from its local files, as the LLM API reads
+    it. Without --model_path, its model name is therefore downloaded here, and
+    `bench_env.checkpoint_path` is set to the snapshot directory.
+
     Args:
         params: Dictionary of command line parameters.
         bench_env: Benchmark environment containing model and checkpoint information.
@@ -171,6 +176,11 @@ def get_general_cli_options(
         if isinstance(llm_args_dict, dict):
             settings_dict["checkpoint_format"] = llm_args_dict.get(
                 "checkpoint_format")
+
+    if model_path is None and settings_dict.get("checkpoint_format") in (
+            CheckpointFormat.MISTRAL, CheckpointFormat.MISTRAL_LARGE_3):
+        bench_env.checkpoint_path = download_hf_model(model, bench_env.revision)
+        settings_dict["model_path"] = bench_env.checkpoint_path
 
     # Create and return the settings object, ignoring any extra fields
     return GeneralExecSettings(**settings_dict)

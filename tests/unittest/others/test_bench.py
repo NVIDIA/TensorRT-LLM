@@ -553,6 +553,52 @@ def test_cli_options_read_the_model_type_of_the_checkpoint_format(tmp_path, chec
         load.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "checkpoint_format, model_path, downloads",
+    [
+        ("mistral", None, True),
+        ("mistral_large_3", None, True),
+        ("mistral", "local", False),
+        (None, None, False),
+        ("HF", None, False),
+    ],
+)
+def test_cli_options_download_a_mistral_native_model_name_before_reading_it(
+    tmp_path, checkpoint_format, model_path, downloads
+):
+    """A model name in a Mistral-native format is read from its snapshot, as the LLM API reads it.
+
+    The checkpoint path is set before the model type, the tuning heuristic or the report read
+    the checkpoint; a local checkpoint and the Hugging Face format are not downloaded.
+    """
+    snapshot = tmp_path / "snapshot"
+    local = tmp_path / "local"
+    env = BenchmarkEnvironment(
+        model="org/model",
+        checkpoint_path=local if model_path else None,
+        workspace=tmp_path,
+        revision="rev",
+    )
+    params = {}
+    if checkpoint_format is not None:
+        params["extra_llm_api_options"] = _llm_api_options(
+            tmp_path, checkpoint_format=checkpoint_format
+        )
+    with mock.patch(
+        "tensorrt_llm.bench.benchmark.download_hf_model", return_value=snapshot
+    ) as download:
+        options = get_general_cli_options(params, env)
+    if downloads:
+        download.assert_called_once_with("org/model", "rev")
+        expected = snapshot
+    else:
+        download.assert_not_called()
+        expected = local if model_path else None
+    assert env.checkpoint_path == expected
+    assert options.model_path == expected
+    assert options.checkpoint_path == (expected or "org/model")
+
+
 # A small dense Mistral-native model: 2 layers, 4 query and 2 KV heads of 64.
 _MISTRAL_NATIVE_PARAMS = {
     "dim": 256,
