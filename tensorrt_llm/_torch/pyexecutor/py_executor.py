@@ -17,7 +17,8 @@ from contextlib import ExitStack, contextmanager, nullcontext
 from enum import IntEnum
 from queue import Queue
 from typing import (TYPE_CHECKING, Callable, Dict, Iterable, Iterator, List,
-                    Literal, NoReturn, Optional, Sequence, Set, Tuple, Union, cast)
+                    Literal, NoReturn, Optional, Sequence, Set, Tuple, Union,
+                    cast)
 
 import torch
 from strenum import StrEnum
