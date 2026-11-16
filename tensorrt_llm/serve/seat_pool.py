@@ -158,6 +158,7 @@ class SeatPool:
         self._waiters: Dict[int, Waiter] = {}
         self._buckets: Dict[Optional[str], _Bucket] = {}
         self._deadlines: List[Tuple[float, int, Waiter]] = []
+        self._live_deadlines = 0
         self._seq = itertools.count()
         self._pick_now: Optional[float] = None
         self.placed = 0
@@ -245,6 +246,7 @@ class SeatPool:
         bucket.push(waiter)
         if deadline is not None:
             heapq.heappush(self._deadlines, (deadline, waiter.seq, waiter))
+            self._live_deadlines += 1
         return waiter
 
     def _discard(self, waiter: Waiter) -> None:
@@ -255,8 +257,15 @@ class SeatPool:
         bucket.discard()
         if not bucket.live:
             del self._buckets[waiter.exclude]
-        if not self._waiters:
-            self._deadlines.clear()
+        if waiter.deadline is not None:
+            self._live_deadlines -= 1
+            if not self._live_deadlines:
+                self._deadlines.clear()
+            elif len(self._deadlines) > 2 * self._live_deadlines + _COMPACT_SLACK:
+                # Grants and cancellations can stay behind a live deadline
+                # for a full transfer timeout, even when few requests wait.
+                self._deadlines = [entry for entry in self._deadlines if entry[2].queued]
+                heapq.heapify(self._deadlines)
 
     def remove(self, rid: int) -> Optional[Waiter]:
         """Drop a waiter that finished or was cancelled before its placement."""
