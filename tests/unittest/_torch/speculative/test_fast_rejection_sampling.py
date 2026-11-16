@@ -579,14 +579,19 @@ def test_worker_paths_fast(monkeypatch):
     assert same >= ngen - 2
 
 
-def test_guided_decoding_keeps_reference(monkeypatch):
-    """With the flag on, a worker with a guided decoder keeps the reference path."""
+def test_guided_decoding_and_watermark_keep_reference(monkeypatch):
+    """With the flag on, a worker with a guided decoder, or a batch with a text watermark, keeps
+    the reference path."""
     monkeypatch.setenv(frs.FAST_RS_ENV_VAR, "1")
     md = _worker_metadata(4, range(4), 1, 0)
     worker = _Worker()
     logits = torch.zeros((4 * (K + 1), V), device=DEV)
     assert worker._fast_rs_applies(md, logits, V)
     worker.guided_decoder = types.SimpleNamespace()
+    assert not worker._fast_rs_applies(md, logits, V)
+    worker.guided_decoder = None
+    md.watermark = types.SimpleNamespace(ready=True)
+    assert md.watermark_ready
     assert not worker._fast_rs_applies(md, logits, V)
 
 
