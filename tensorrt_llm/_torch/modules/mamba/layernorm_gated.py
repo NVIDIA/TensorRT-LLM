@@ -132,13 +132,23 @@ def _layer_norm_fwd_1pass_kernel(
     tl.store(Y + cols, y.to(Y.dtype.element_ty), mask=mask)
 
 
-# Rows per program of the multi-row gated-RMSNorm kernel. At the GDN decode
+# Rows per tile of the multi-row gated-RMSNorm kernel. At the GDN decode
 # shape (thousands of 128-element rows) one row per CTA leaves the kernel
 # launch-limited; 4 rows with 4 warps reproduces the single-row kernel's
-# reduction order (bitwise-identical output) at ~2x the throughput.
+# reduction order (bitwise-identical output) at ~2x the throughput. Shorter
+# rows take taller tiles, so every thread loads whole 16-byte vectors of x and
+# z; those may differ from the single-row kernel by rounding. The tile depends
+# only on the row length and dtype, never on the number of rows, so a row's
+# output does not depend on what else is in the batch.
 _MULTIROW_ROWS = 4
 _MULTIROW_NUM_WARPS = 4
 _MULTIROW_MAX_N = 256
+
+
+def _multirow_rows(N: int, element_size: int) -> int:
+    """Rows per tile of the multi-row kernel for rows of N elements."""
+    num_threads = 32 * _MULTIROW_NUM_WARPS
+    return max(_MULTIROW_ROWS, num_threads * (16 // element_size) // N)
 
 
 @functools.lru_cache(maxsize=None)
@@ -310,7 +320,8 @@ def _rms_norm_gated_fwd_multirow_kernel(
 
 
 # Tiles per program of rms_norm_gated_token_major from _MULTIROW_GROUPS_MIN_ROWS
-# rows (prefill-sized inputs).
+# rows (prefill-sized inputs), for 4-row tiles only; taller tiles run one per
+# program.
 _MULTIROW_GROUPS = 4
 _MULTIROW_GROUPS_MIN_ROWS = 1 << 16
 
@@ -373,8 +384,10 @@ def rms_norm_gated_token_major(
     # rstd is not consumed on this path; Rstd=None skips both the scratch
     # allocation and the (measurably expensive) extra store in the kernel.
     device_index = x.device.index
-    groups = _MULTIROW_GROUPS if M >= _MULTIROW_GROUPS_MIN_ROWS else 1
-    grid_size = triton.cdiv(M, _MULTIROW_ROWS * groups)
+    rows = _multirow_rows(N, x.element_size())
+    groups = (_MULTIROW_GROUPS if M >= _MULTIROW_GROUPS_MIN_ROWS
+              and rows == _MULTIROW_ROWS else 1)
+    grid_size = triton.cdiv(M, rows * groups)
     launch_with_pdl = _multirow_pdl(grid_size, device_index)
     with torch.cuda.device(device_index):
         _rms_norm_gated_fwd_multirow_kernel[(grid_size, )](
@@ -390,13 +403,13 @@ def rms_norm_gated_token_major(
             M,
             eps,
             N=N,
-            ROWS=_MULTIROW_ROWS,
+            ROWS=rows,
             HEADS_PER_TOK=heads,
             GATE_SIGMOID=gate_sigmoid,
             WEIGHT_IS_DELTA=False,
             LAUNCH_WITH_PDL=launch_with_pdl,
             CONTIG=(x.stride(0) == N and out.stride(0) == N),
-            EVEN=(M % (_MULTIROW_ROWS * groups) == 0),
+            EVEN=(M % (rows * groups) == 0),
             num_warps=_MULTIROW_NUM_WARPS,
             # Dependents (out_proj) prefetch their weights; they read Y only
             # after their own griddepcontrol.wait.
@@ -470,7 +483,8 @@ def _layer_norm_fwd(
     rstd = torch.empty((ngroups * M, ), dtype=torch.float32, device=x.device)
     if _multirow_gated_rmsnorm_eligible(group_size, ngroups, bias, z,
                                         norm_before_gate, is_rms_norm):
-        grid_size = triton.cdiv(M, _MULTIROW_ROWS)
+        rows = _multirow_rows(group_size, x.element_size())
+        grid_size = triton.cdiv(M, rows)
         device_index = x.device.index
         launch_with_pdl = _multirow_pdl(grid_size, device_index)
         with torch.cuda.device(device_index):
@@ -487,14 +501,14 @@ def _layer_norm_fwd(
                 M,
                 eps,
                 N=group_size,
-                ROWS=_MULTIROW_ROWS,
+                ROWS=rows,
                 HEADS_PER_TOK=1,
                 GATE_SIGMOID=gate_sigmoid,
                 WEIGHT_IS_DELTA=weight_is_delta,
                 LAUNCH_WITH_PDL=launch_with_pdl,
                 CONTIG=(x.stride(0) == group_size
                         and out.stride(0) == group_size),
-                EVEN=(M % _MULTIROW_ROWS == 0),
+                EVEN=(M % rows == 0),
                 num_warps=_MULTIROW_NUM_WARPS,
                 launch_pdl=launch_with_pdl,
             )
