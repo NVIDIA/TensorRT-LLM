@@ -4090,6 +4090,8 @@ class _ReusedOutputFusedCommBackend:
     # Like MegaMoE-CuteDSL it does not declare run_moe_reuses_buffers: FusedCommMoEScheduler refuses
     # such a backend, and the copy of every non-final chunk is what makes this one safe.
     input_requirement = MoEInputRequirement()
+    # No fused route + quant launch: the scheduler routes with the routing method.
+    fused_route_quant_enabled = False
 
     def __init__(self, max_num_tokens: int, hidden_size: int) -> None:
         self.output_buffer = torch.zeros(max_num_tokens, hidden_size, dtype=torch.bfloat16)
@@ -4151,6 +4153,8 @@ def _chunking_fused_comm_scheduler(
         layer_load_balancer=None,
         num_slots=num_experts,
         _load_balancer_uses_replica_plan=lambda: False,
+        _using_dynamic_load_balancer=lambda: False,
+        _warmup_placement_route_counters=lambda row_offset: None,
         _load_balancer_start_wait_gpu_stage=lambda is_first_call: None,
         _load_balancer_start_set_cpu_stage=lambda is_last_call: None,
         _load_balancer_done_set_cpu_stage=lambda is_last_call: None,
