@@ -1243,11 +1243,18 @@ class KvCacheCreator:
             # for estimation, then restore it in configure_kv_cache_capacity().
             self._kv_cache_config.pool_ratio = None
             self._kv_cache_config.avg_seq_len = self._max_seq_len
-            # The estimation pass sizes GPU memory only. Its temporary target and
-            # draft managers do not get the host_cache_size split, so each would
-            # pin the full host tier (2x per rank with a separate draft pool) and
-            # can exhaust node RAM. No host tier during estimation;
-            # configure_kv_cache_capacity() restores it.
+            # host_cache_size is the number of bytes of pinned host memory the
+            # KV cache may use as an offload tier below the GPU pool. It is set
+            # by the user in kv_cache_config; there is no automatic heuristic
+            # for it, and None means no host tier.
+            #
+            # The estimation pass only measures how many tokens fit in GPU
+            # memory, so it does not need a host tier. Its temporary target and
+            # draft managers also do not split host_cache_size between them, so
+            # each one would pin the full amount (2x per rank with a separate
+            # draft pool) and could exhaust node RAM. We therefore set it to 0
+            # here. configure_kv_cache_capacity() puts the user's value back
+            # (saved as _host_cache_size_in) before the real managers are built.
             self._kv_cache_config.host_cache_size = 0
             if self._is_kv_cache_manager_v2:
                 free_mem, _ = torch.cuda.mem_get_info()
