@@ -253,6 +253,7 @@ def test_v2_receive_skips_the_claimed_sinks_of_a_missing_window():
             SimpleNamespace(endpoint=512, complete=False, policy=ReusePolicy.SINK_REQUIRED_ONLY),
         ],
         get_aggregated_page_indices=lambda group, valid_only: iter(pages[group]),
+        is_active=False,
     )
     manager = SimpleNamespace(
         enable_block_reuse=True,
