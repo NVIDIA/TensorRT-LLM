@@ -10,6 +10,8 @@
 * Padding rows (slot -1) are skipped and write nothing.
 * Misaligned slot indices and a/b give the same results as aligned copies.
 * A CUDA-graph captured call matches an eager call.
+* Rings that are block-strided views of shared pool slots, with strided cursor
+  rows, match standalone contiguous rings bit for bit.
 """
 
 import pytest
@@ -373,3 +375,98 @@ def test_flashinfer_ring_replay_cuda_graph_matches_eager():
 
     for name in ("output", "ssm_states", "k_ring", "u_ring", "g_ring"):
         torch.testing.assert_close(graphed[name], eager[name])
+
+
+@skip_unsupported
+@pytest.mark.parametrize("T", [4, 8])
+def test_flashinfer_ring_replay_reads_block_strided_rings(T):
+    """Rings that are views of pool slots holding several layers' buffers give, bit
+    for bit, the results of standalone contiguous rings.
+
+    A V2 manager keeps the rings in the recurrent-state slot, next to other
+    layers' rings, so their slot stride spans the whole slot; the history length
+    and ring start sit in one strided metadata row per slot. Both sides run many
+    steps through flushes and ring wrap-around, each advancing its cursors.
+    """
+    torch.manual_seed(0)
+    device, dtype = "cuda", torch.bfloat16
+    N, H, HV, K, V = 6, 2, 8, 128, 128
+    steps, history_size, layers_per_slot = 24, 16, 3
+    slots = N + 3
+    ring_size = FLASHINFER_REPLAY_RING_SIZE
+    A_log = (torch.randn(HV, device=device) * 0.5).to(dtype).float()
+    dt_bias = (torch.randn(HV, device=device) * 0.5).to(dtype).float()
+    init_states = (torch.randn(slots, HV, V, K, device=device) * 0.5).to(dtype)
+    state_indices = torch.randperm(slots - 1, device=device)[:N].int()
+    rows = state_indices.long()
+
+    def make_side(strided):
+        state_backing = torch.zeros(slots, layers_per_slot, HV, V, K, device=device, dtype=dtype)
+        side = {"ssm_states": state_backing[:, 1]}
+        side["ssm_states"].copy_(init_states)
+        ring_shapes = {
+            "k_ring": ((H, ring_size, K), dtype),
+            "u_ring": ((HV, ring_size, V), dtype),
+            "g_ring": ((HV, ring_size), torch.float32),
+        }
+        for name, (shape, ring_dtype) in ring_shapes.items():
+            if strided:
+                backing = torch.full(
+                    (slots, layers_per_slot, *shape), float("nan"), device=device
+                ).to(ring_dtype)
+                side[name] = backing[:, 1]
+                side[name].zero_()
+            else:
+                side[name] = torch.zeros(slots, *shape, device=device, dtype=ring_dtype)
+        if strided:
+            meta = torch.zeros(slots, 4, device=device, dtype=torch.int32)
+            side["hist_len"], side["cache_base"] = meta[:, 0], meta[:, 2]
+        else:
+            side["hist_len"] = torch.zeros(slots, device=device, dtype=torch.int32)
+            side["cache_base"] = torch.zeros_like(side["hist_len"])
+        side["metadata"] = ReplayStateUpdateMetadata(
+            side["hist_len"], torch.zeros_like(side["hist_len"]), T, history_size
+        )
+        return side
+
+    contiguous, strided = make_side(False), make_side(True)
+    assert not strided["k_ring"].is_contiguous() and strided["hist_len"].stride(0) == 4
+    num_flushes = 0
+    wrapped = False
+    for _ in range(steps):
+        q, k, v, a, b, _ = _make_step_inputs(N, T, H, HV, K, V, True, device, dtype)
+        num_flushes += int((contiguous["hist_len"][rows] + T > history_size).sum())
+        wrapped |= bool(
+            (contiguous["cache_base"][rows] + contiguous["hist_len"][rows] + T > ring_size).any()
+        )
+        outputs = [
+            flashinfer_cached_replay_update(
+                q,
+                k,
+                v,
+                a,
+                b,
+                A_log,
+                dt_bias,
+                side["ssm_states"],
+                state_indices,
+                side["k_ring"],
+                side["u_ring"],
+                side["g_ring"],
+                side["hist_len"][rows],
+                side["cache_base"][rows],
+                history_size=history_size,
+                output=torch.empty(N, T, HV, V, device=device, dtype=dtype),
+            )
+            for side in (contiguous, strided)
+        ]
+        assert torch.equal(outputs[0], outputs[1])
+        accepted = torch.randint(1, T + 1, (N,), device=device, dtype=torch.int32)
+        for side in (contiguous, strided):
+            _advance_ring_start(side["cache_base"], side["metadata"], state_indices)
+            _advance_replay_state(side["metadata"], state_indices, accepted)
+
+    assert num_flushes >= N, f"only {num_flushes} flushes; increase steps"
+    assert wrapped, "ring never wrapped; increase steps"
+    for name in ("ssm_states", "k_ring", "u_ring", "g_ring", "hist_len", "cache_base"):
+        assert torch.equal(contiguous[name], strided[name]), name

@@ -14,6 +14,8 @@ from torch import nn
 
 from tensorrt_llm._torch import memory as memory_mod
 from tensorrt_llm._torch.locality_domain.policy import LocalityDomainPolicy
+from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
+from tensorrt_llm._torch.moe.fused_moe.cutlass import TrtllmCutlassUnquantizedImpl
 from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_mod
 from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm._torch.weight_sharing import (
@@ -27,6 +29,7 @@ from tensorrt_llm._torch.weight_sharing import (
     PostTransformTransferScope,
 )
 from tensorrt_llm.llmapi.llm_args import LoadFormat
+from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
 
@@ -51,7 +54,8 @@ class _TinyModel(nn.Module):
     def __init__(self, events, *, include_draft=False):
         super().__init__()
         self.model_config = SimpleNamespace(
-            pretrained_config=SimpleNamespace(architectures=["TinyForCausalLM"], model_type="tiny")
+            pretrained_config=SimpleNamespace(architectures=["TinyForCausalLM"], model_type="tiny"),
+            mapping=Mapping(),
         )
         self._weights_transformed = False
         self._events = events
@@ -327,6 +331,71 @@ def test_gms_load_branch(monkeypatch, is_rw, expected_events):
         backend.materialize_module.assert_called_once_with(model)
 
 
+@pytest.mark.parametrize(
+    ("is_rw", "include_draft"),
+    [(True, False), (True, True), (False, False)],
+    ids=["writer", "writer-with-draft", "reader"],
+)
+def test_gms_checkpoint_policy_records_only_writer_disk_load(
+    monkeypatch: pytest.MonkeyPatch, is_rw: bool, include_draft: bool
+) -> None:
+    """Preserve the writer's observed policy across a draft load; readers stay unknown."""
+    events = []
+    spec_config = _spec_config_needing_draft_weights() if include_draft else None
+    loader = _make_loader(monkeypatch, events=events, spec_config=spec_config)
+    backend = _build_gms_backend(is_rw=is_rw, events=events)
+    _install_gms_backend(monkeypatch, backend)
+    checkpoint_loader = model_loader_mod.construct_checkpoint_loader(
+        None, "HF", load_format=LoadFormat.GMS, checkpoint_io_policy="auto"
+    )
+    weight_loader = checkpoint_loader.weight_loader
+    expected = {
+        "requested": "auto",
+        "selected": "native",
+        "activated": False,
+        "effective": "native",
+        "fallback_reason": weight_loader.last_checkpoint_io_status.fallback_reason,
+    }
+    assert "load_format='auto'" in expected["fallback_reason"]
+    model = model_loader_mod.AutoModelForCausalLM.from_config.return_value
+    if include_draft:
+        model.draft_config = None
+        model.load_draft_weights = MagicMock()
+    if not is_rw:
+        # A reader must not publish a previous disk load's status.
+        weight_loader._last_checkpoint_io_status.effective = "native"
+
+    def read_native(checkpoint_dir: str, *_args: object, **_kwargs: object) -> dict[str, object]:
+        """Stub storage access while observing the real loader's status reset.
+
+        Args:
+            checkpoint_dir: Target or draft checkpoint path.
+            *_args: Unused native-reader positional arguments.
+            **_kwargs: Unused native-reader keyword arguments.
+
+        Returns:
+            Nonempty weights for the tiny model's materialization stub.
+        """
+        if checkpoint_dir == "/draft":
+            assert loader.startup_metadata["checkpoint_io_policy"] == expected
+            assert weight_loader.last_checkpoint_io_status.effective == "none"
+        return {"weight": object()}
+
+    native_read = MagicMock(side_effect=read_native)
+    monkeypatch.setattr(weight_loader, "_load_weights_native", native_read)
+    monkeypatch.setattr(checkpoint_loader, "get_initialized_weight_mapper", MagicMock())
+
+    loader.load("/ckpt", checkpoint_loader)
+
+    assert loader.startup_metadata["checkpoint_io_policy"] == (expected if is_rw else None)
+    paths = [call.args[0] for call in native_read.call_args_list]
+    assert paths == (["/ckpt", "/draft"] if include_draft else ["/ckpt"] if is_rw else [])
+    if is_rw:
+        backend.finalize_write.assert_called_once_with(model)
+    else:
+        backend.materialize_module.assert_called_once_with(model)
+
+
 def test_gms_ro_materializes_between_alias_setup_and_cache_state(monkeypatch):
     events = []
     loader = _make_loader(monkeypatch, events=events)
@@ -396,6 +465,49 @@ def test_gms_ro_does_not_retransform_materialized_slice_weights(monkeypatch):
     assert loaded_model is model
     assert model.projection.cache_rebuilt
     assert model.projection._weights_transformed
+
+
+def test_gms_ro_marks_moe_backend_behind_removed_wrapper_transformed(monkeypatch):
+    """RO materialization marks routed-expert owners transformed without transforming them.
+
+    The RW writer already transformed the expert bytes in the pool. A MoE
+    backend behind the `_weights_removed` `ConfigurableMoE` wrapper never loads
+    on the RO path, so only its guard declared before any load lets
+    `_mark_weights_transformed` mark it, and a later transform walk must then
+    leave it alone.
+    """
+    events = []
+    loader = _make_loader(monkeypatch, events=events)
+    backend = _build_gms_backend(is_rw=False, events=events)
+    _install_gms_backend(monkeypatch, backend)
+
+    # `__new__`: the guard is a class-level declaration and needs no kernels or
+    # weights; set only the EPLB state that qualification reads and the
+    # quantization method that the derived-state walk calls.
+    experts = TrtllmCutlassUnquantizedImpl.__new__(TrtllmCutlassUnquantizedImpl)
+    nn.Module.__init__(experts)
+    experts.layer_load_balancer = None
+    experts.quant_method = MagicMock(name="quant_method")
+    experts.transform_weights = MagicMock(name="transform_weights")
+    wrapper = ConfigurableMoE.__new__(ConfigurableMoE)
+    nn.Module.__init__(wrapper)
+    wrapper.layer_load_balancer = None
+    wrapper._weights_removed = True
+    wrapper.backend = experts
+    model = model_loader_mod.AutoModelForCausalLM.from_config.return_value
+    model.experts = wrapper
+    checkpoint_loader = MagicMock(name="checkpoint_loader")
+    checkpoint_loader.checkpoint_format = "HF"
+
+    loaded_model, _ = loader.load("/ckpt", checkpoint_loader)
+
+    assert loaded_model is model
+    backend.materialize_module.assert_called_once_with(model)
+    assert experts._weights_transformed is True
+    assert wrapper._weights_transformed is False
+    experts.quant_method.cache_derived_state.assert_called_once_with(experts)
+    ModelLoader._walk_transform(loaded_model)
+    experts.transform_weights.assert_not_called()
 
 
 def test_gms_rw_post_load_runs_inside_pool_before_finalize(monkeypatch):

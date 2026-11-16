@@ -1,6 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the GLM-5.2 target's cute_dsl_indexer_q_side_fused entry."""
+"""GPU test for the GLM-5.2 target's cute_dsl_indexer_q_side_fused entry.
+
+The `wq_pitch=160` cells are the served context path: the head weights are the fp32 columns
+128..159 of the indexer projection's `[T, 160]` output, read in place. Beyond the reference,
+that launcher must write the pitch-32 launcher's bytes on the same values packed (what the
+column split gave the q side before).
+"""
 
 import zlib
 
@@ -28,10 +34,11 @@ THETA = 8.0e6  # the checkpoint's `rope_theta`
 _COMPILED: dict = {}
 
 
-def _compiled(is_neox: bool):
-    if is_neox not in _COMPILED:
-        _COMPILED[is_neox] = build(torch.cuda.current_device(), is_neox=is_neox)
-    return _COMPILED[is_neox]
+def _compiled(is_neox: bool, wq_pitch: int = HEADS):
+    key = (is_neox, wq_pitch)
+    if key not in _COMPILED:
+        _COMPILED[key] = build(torch.cuda.current_device(), is_neox=is_neox, wq_pitch=wq_pitch)
+    return _COMPILED[key]
 
 
 def _rope_table(positions: int) -> torch.Tensor:
@@ -45,7 +52,8 @@ def _rope_table(positions: int) -> torch.Tensor:
 def _build(spec, seed):
     """`(q, position_ids, cos_sin, wq, weight_scale, q_fp8_out, weights_out)` for one cell.
 
-    Both outputs start poisoned, so a row the kernel skipped cannot pass.
+    Both outputs start poisoned, so a row the kernel skipped cannot pass. With `wq_pitch`
+    160, `wq` is columns 128..159 of a `[tokens, 160]` fp32 buffer (the projection output).
     """
     g = torch.Generator(device="cuda").manual_seed(seed)
     tokens, max_pos = spec["tokens"], spec["max_pos"]
@@ -57,6 +65,12 @@ def _build(spec, seed):
     else:
         pos = torch.randint(0, max_pos, (tokens,), generator=g, device="cuda")
     wq = torch.randn(tokens, HEADS, generator=g, device="cuda")
+    pitch = spec.get("wq_pitch", HEADS)
+    if pitch != HEADS:
+        proj = torch.randn(tokens, pitch, generator=g, device="cuda")
+        proj[:, pitch - HEADS :] = wq
+        wq = proj[:, pitch - HEADS :]
+        assert wq.stride() == (pitch, 1)
     q_fp8_out = torch.full((tokens, HEADS, HEAD_DIM), 0x7F, dtype=torch.uint8, device="cuda").view(
         torch.float8_e4m3fn
     )
@@ -96,13 +110,38 @@ def _compare(out, ref) -> None:
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
 def test_certified_cells(cell) -> None:
     args = _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % 2**31)
-    kw = dict(is_neox=cell.spec["is_neox"], compiled=_compiled(cell.spec["is_neox"]))
+    pitch = cell.spec.get("wq_pitch", HEADS)
+    kw = dict(is_neox=cell.spec["is_neox"], compiled=_compiled(cell.spec["is_neox"], pitch))
     q_before = args[0].clone()
     with validating(op):
         out = op(*args, **kw)
     assert out[0] is args[5] and out[1] is args[6], "the op writes the caller's buffers"
     assert torch.equal(args[0], q_before), "q must not be written"
     _compare(out, op.reference(*args, **kw))
+
+
+#: Context row counts the pitch-160 launcher serves (65..8192): partial and full tiles, odd counts.
+PITCH160_ROWS = [65, 77, 127, 128, 129, 1099, 3001, 4097, 7293, 7999, 8191, 8192]
+
+
+@pytest.mark.parametrize("rows", PITCH160_ROWS)
+def test_pitch_160_writes_the_packed_launchers_bytes(rows) -> None:
+    """The served pitch-160 launcher == the pitch-32 launcher on `wq` packed, every q_fp8
+    byte and every head weight, bitwise."""
+    spec = dict(tokens=rows, positions="spread", max_pos=16384, is_neox=False, wq_pitch=160)
+    args = _build(spec, seed=zlib.crc32(f"pitch {rows}".encode()) % 2**31)
+    packed = (*args[:3], args[3].contiguous(), args[4], *_build(spec, seed=1)[5:])
+    got = op(*args, is_neox=False, compiled=_compiled(False, 160))
+    want = op(*packed, is_neox=False, compiled=_compiled(False))
+    torch.cuda.synchronize()
+    assert bool(torch.isfinite(want[1]).all()) and bool((want[1] != 0).any()), "degenerate"
+    codes, want_codes = got[0].view(torch.uint8), want[0].view(torch.uint8)
+    assert torch.equal(codes, want_codes), (
+        f"rows {rows}: {int((codes != want_codes).sum())} q_fp8 bytes differ from pitch 32"
+    )
+    assert torch.equal(got[1].view(torch.int32), want[1].view(torch.int32)), (
+        f"rows {rows}: {int((got[1] != want[1]).sum())} head weights differ from pitch 32"
+    )
 
 
 def test_a_fresh_launch_overwrites_every_row() -> None:

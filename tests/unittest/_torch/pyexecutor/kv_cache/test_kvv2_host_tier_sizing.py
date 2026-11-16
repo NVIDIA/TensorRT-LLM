@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests for KVCacheManagerV2 rank-aware auto host tier sizing.
 
 The auto-provisioned host tier is computed per rank but drawn from a
@@ -9,15 +12,37 @@ can arrive at divergent quotas; ``TestSyncHostTierQuota`` covers the
 cross-rank ``allreduce(MIN)`` that reconciles them to the fleet minimum.
 """
 
+from types import SimpleNamespace
+
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _compute_auto_host_tier_quota,
+    _skips_auto_host_tier,
     _sync_host_tier_quota,
 )
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 
+pytestmark = pytest.mark.cpu_only
+
 GiB = 1 << 30
+
+
+@pytest.mark.parametrize(
+    ("has_cp_helix", "is_disagg", "decoding_type", "skips"),
+    [
+        (True, False, "DSpark", True),
+        (True, False, "MTP", False),
+        (True, False, None, False),
+        (True, True, "DSpark", False),
+        (False, False, "DSpark", False),
+    ],
+)
+def test_auto_host_tier_is_skipped_only_for_agg_helix_with_dspark(
+    has_cp_helix, is_disagg, decoding_type, skips
+):
+    spec_config = None if decoding_type is None else SimpleNamespace(decoding_type=decoding_type)
+    assert _skips_auto_host_tier(has_cp_helix, is_disagg, spec_config) == skips
 
 
 class TestComputeAutoHostTierQuota:
@@ -123,6 +148,22 @@ class TestComputeAutoHostTierQuota:
             == 173 * GiB
         )
 
+    @pytest.mark.parametrize("memlock_limit", [0.0, float(1)])
+    def test_offloaded_history_without_headroom_provisions_no_tier(self, memlock_limit):
+        # Sparse KV cache offload has already pinned what the limits left, so the
+        # device quota would pin past them; the manager decides what to do
+        # without a tier instead.
+        assert (
+            _compute_auto_host_tier_quota(
+                quota=173 * GiB,
+                local_ranks=4,
+                mem_available=float(440 * GiB),
+                memlock_limit=memlock_limit,
+                pins_offloaded_history=True,
+            )
+            == 0
+        )
+
     def test_result_is_always_positive(self):
         # Exhausted node memory reading must not produce a non-positive tier.
         assert (
@@ -178,7 +219,6 @@ class TestSyncHostTierQuota:
         quota = 173 * GiB
         assert _sync_host_tier_quota(quota, _FakeMapping()) == quota
 
-    @pytest.mark.cpu_only
     @pytest.mark.skipif(not ENABLE_MULTI_DEVICE, reason="multi-device (MPI) build required")
     def test_multi_rank_syncs_to_fleet_min(self):
         """Every rank must end up with the same host-tier quota after the sync.

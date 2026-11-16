@@ -180,7 +180,7 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             ),
         ),
     ),
-    "qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__tp1": (
+    "qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default": (
         Cell(
             why="qwen4_exp main rope, decode: one token, Gemma norm and interleaved mRoPE "
             "with three distinct position rows",

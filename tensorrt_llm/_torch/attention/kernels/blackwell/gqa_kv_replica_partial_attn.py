@@ -63,8 +63,8 @@ total KV rather than its longest request:
 * combine: CTA j of the request finalizes chunk j; the merge loop is dispatched to a compile-time lanes-per-granule
   variant.
 
-Two-slot plan (``two_slot``, kernel_two, 65..128 requests): the plans above give every request at least one CTA, so
-past ~n_ctas / 2 uniform requests a CTA runs a whole request while others idle.
+Two-slot plan (``two_slot``, kernel_two, up to 128 requests; the host takes it from 33): the plans above give every
+request at least one CTA, so past ~n_ctas / 2 uniform requests a CTA runs a whole request while others idle.
 Here T = the smallest tile count with sum_r max(t_r, T) <= n_ctas * T; request r takes the virtual tile range
 [V_r, V_r + max(t_r, T)) (requests in order) and CTA i the range [i * T, (i + 1) * T), so a CTA computes at most T
 tiles, of at most two requests (slot 0, then slot 1, through one K / V ring and one O accumulator). Each request keeps
@@ -496,6 +496,114 @@ def _st_global_f32(addr, v, *, loc=None, ip=None) -> None:
 
 
 @dsl_user_op
+def _ffma2(a0, a1, b0, b1, c0, c1, *, loc=None, ip=None):
+    """(a0 * b0 + c0, a1 * b1 + c1) as one fma.rn.f32x2 (each lane IEEE fma.rn.f32: bitwise as two FFMA)."""
+    out = _asm(
+        llvm.StructType.get_literal([T.f32(), T.f32()]),
+        [Float32(v).ir_value(loc=loc, ip=ip) for v in (a0, a1, b0, b1, c0, c1)],
+        "{\n\t.reg .b64 a, b, c, d;\n\tmov.b64 a, {$2, $3};\n\tmov.b64 b, {$4, $5};\n\t"
+        "mov.b64 c, {$6, $7};\n\tfma.rn.f32x2 d, a, b, c;\n\tmov.b64 {$0, $1}, d;\n\t}\n",
+        "=f,=f,f,f,f,f,f,f",
+        False,
+        loc,
+        ip,
+    )
+    return tuple(Float32(llvm.extractvalue(T.f32(), out, [i], loc=loc, ip=ip)) for i in range(2))
+
+
+@dsl_user_op
+def _fadd2(a0, a1, b0, b1, *, loc=None, ip=None):
+    """(a0 + b0, a1 + b1) as one add.rn.f32x2 (bitwise as two add.rn.f32)."""
+    out = _asm(
+        llvm.StructType.get_literal([T.f32(), T.f32()]),
+        [Float32(v).ir_value(loc=loc, ip=ip) for v in (a0, a1, b0, b1)],
+        "{\n\t.reg .b64 a, b, d;\n\tmov.b64 a, {$2, $3};\n\tmov.b64 b, {$4, $5};\n\t"
+        "add.rn.f32x2 d, a, b;\n\tmov.b64 {$0, $1}, d;\n\t}\n",
+        "=f,=f,f,f,f,f",
+        False,
+        loc,
+        ip,
+    )
+    return tuple(Float32(llvm.extractvalue(T.f32(), out, [i], loc=loc, ip=ip)) for i in range(2))
+
+
+def _ld_red_max_ptx() -> str:
+    """4 x tcgen05.ld.red.max (LDTM.STAT, SM103) of 32 FP32 columns each from $1, $1 + 32, $1 + 64, $1 + 96 (this
+    warp's 32 lanes), one wait, $0 = the max over the 128 columns. The loaded values stay in asm-local registers."""
+    regs = lambda k: ", ".join(f"v{k * 32 + j}" for j in range(32))  # noqa: E731
+    body = "{\n\t.reg .f32 v<128>;\n\t.reg .f32 m<4>;\n\t.reg .b32 a<4>;\n\tmov.b32 a0, $1;\n\t"
+    body += "add.u32 a1, $1, 32;\n\tadd.u32 a2, $1, 64;\n\tadd.u32 a3, $1, 96;\n\t"
+    for k in range(4):
+        body += f"tcgen05.ld.red.sync.aligned.32x32b.x32.f32.max {{{regs(k)}}}, m{k}, [a{k}];\n\t"
+    body += "tcgen05.wait::ld.sync.aligned;\n\tmax.f32 m0, m0, m1;\n\tmax.f32 m2, m2, m3;\n\tmax.f32 $0, m0, m2;\n\t}\n"
+    return body
+
+
+@dsl_user_op
+def _tmem_row_max128(taddr, *, loc=None, ip=None) -> Float32:
+    """Max of this thread's row over 128 consecutive FP32 TMEM columns at taddr (lane field = the warp's lane base),
+    by LDTM.STAT; waits for the loads itself."""
+    return Float32(
+        _asm(
+            T.f32(),
+            [Int32(taddr).ir_value(loc=loc, ip=ip)],
+            _ld_red_max_ptx(),
+            "=f,r",
+            True,
+            loc,
+            ip,
+        )
+    )
+
+
+@dsl_user_op
+def _ld_shared_u32(addr, *, loc=None, ip=None) -> Int32:
+    return Int32(
+        _asm(
+            T.i32(),
+            [Int32(addr).ir_value(loc=loc, ip=ip)],
+            "ld.shared.b32 $0, [$1];",
+            "=r,r",
+            True,
+            loc,
+            ip,
+        )
+    )
+
+
+@dsl_user_op
+def _lamport_word(word, *, loc=None, ip=None) -> Uint32:
+    """A Lamport word (ll_exchange.py): the word, or 0x7FFFFFFF in place of the empty marker 0xFFFFFFFF (NaN data
+    only; still NaN)."""
+    return Uint32(
+        _asm(
+            T.i32(),
+            [Uint32(word).ir_value(loc=loc, ip=ip)],
+            "{ .reg .pred p; setp.eq.u32 p, $1, 0xFFFFFFFF; selp.b32 $0, 0x7FFFFFFF, $1, p; }",
+            "=r,r",
+            False,
+            loc,
+            ip,
+        )
+    )
+
+
+@dsl_user_op
+def _f32_bits(x, *, loc=None, ip=None) -> Uint32:
+    return Uint32(
+        _asm(
+            T.i32(),
+            [Float32(x).ir_value(loc=loc, ip=ip)],
+            "mov.b32 $0, $1;",
+            "=r,f",
+            False,
+            loc,
+            ip,
+        )
+    )
+
+
+@dsl_user_op
 def _griddep_wait(*, loc=None, ip=None) -> None:
     _asm(None, [], "griddepcontrol.wait;", "~{memory}", True, loc, ip)
 
@@ -609,9 +717,25 @@ class GqaKvReplicaPartialAttnKernel:
         p_shift: float = 5.0,
         wide_plan: bool = False,
         two_slot: bool = False,
+        ll_push: bool = False,
+        ll_slot_words: int = 0,
+        ll_lse_base: int = 0,
+        softmax_v2: bool = False,
     ):
+        """ll_push: the combine stores each finalized (O, LSE) row as Lamport words straight into the owning
+        member's alltoall_merge receive slot (ll_exchange.py: TPGroupExchange.merge_push_args; slot geometry
+        ll_slot_words / ll_lse_base, one epoch per row position), instead of out_o / out_lse; the merge then only polls.
+        softmax_v2 (SM103's tcgen05.ld.red.max): unmasked tiles take the row max from TMEM and exponentiate per
+        32-column chunk reloaded from TMEM with FFMA2 / FADD2; same arithmetic and order, bitwise as the default."""
         assert gh == cp_size * hql, "group heads = cp_size x q heads per rank"
         assert not (wide_plan and two_slot), "one plan variant"
+        self.softmax_v2 = bool(softmax_v2)
+        # cute.compile options: softmax_v2 builds with ptxas -O1, which keeps its MUFU.EX2 issues back to back.
+        self.compile_options = "--ptxas-options -O1" if self.softmax_v2 else None
+        self.ll_push = bool(ll_push)
+        self.ll_slot_words = int(ll_slot_words)
+        self.ll_lse_base = int(ll_lse_base)
+        assert not self.ll_push or 0 < self.ll_lse_base < self.ll_slot_words
         self.wide_plan = bool(wide_plan)
         self.two_slot = bool(two_slot)
         self.q_len = q_len
@@ -672,6 +796,9 @@ class GqaKvReplicaPartialAttnKernel:
         ws_ptr: cute.Pointer,
         cnt_ptr: cute.Pointer,
         batch: Int32,
+        ll_peers_ptr: cute.Pointer,
+        ll_state_ptr: cute.Pointer,
+        ll_grank: Int32,
         stream,
     ):
         R = self.rows
@@ -701,6 +828,9 @@ class GqaKvReplicaPartialAttnKernel:
         mLse = cute.make_tensor(lse_ptr, cute.make_layout((1,)))
         mWs = cute.make_tensor(ws_ptr, cute.make_layout((1,)))
         mCnt = cute.make_tensor(cnt_ptr, cute.make_layout((8,)))  # grid-barrier epoch per request
+        # ll_push: every member's receive region of the merge channel (G <= 8) and this member's row epochs
+        mPeers = cute.make_tensor(ll_peers_ptr, cute.make_layout((8,)))
+        mLLState = cute.make_tensor(ll_state_ptr, cute.make_layout((1 << 20,)))
 
         mma_qk = sm100_utils.make_trivial_tiled_mma(
             FP8,
@@ -785,6 +915,9 @@ class GqaKvReplicaPartialAttnKernel:
                 l_sh,
                 mWs,
                 mCnt,
+                mPeers,
+                mLLState,
+                ll_grank,
                 sQ_l,
                 sK_l,
                 sV_l,
@@ -827,6 +960,9 @@ class GqaKvReplicaPartialAttnKernel:
                 l_sh,
                 mWs,
                 mCnt,
+                mPeers,
+                mLLState,
+                ll_grank,
                 sQ_l,
                 sK_l,
                 sV_l,
@@ -970,40 +1106,52 @@ class GqaKvReplicaPartialAttnKernel:
         scale,
         apply_mask: cutlass.Constexpr,
         i_loc=None,
+        s_taddr=None,
     ):
         """Softmax of tile i (CTA-local) for row st (TMEM lane st): S -> x, mask (apply_mask: keys of slot 0 / 1 visible
         iff key < cnt_a / cnt_b), lazy rescale of (m, l, O row), P -> SMEM as E4M3. stt = [m_ref, l_acc].
         The O rescale of a lazy-rescale tile runs after P(i) is in SMEM (by then GEMM2(i - 1) has normally completed,
         and the S registers are free for 64-column TMEM round trips), before P(i) is released to GEMM2(i).
-        i_loc (kernel_two): the tile's index in its request (O holds nothing of the request before i_loc 1)."""
+        i_loc (kernel_two): the tile's index in its request (O holds nothing of the request before i_loc 1).
+        s_taddr (softmax_v2): this warp's TMEM address of S buffer 0 (lane base in bits 16+)."""
         s_full, s_empty, p_full, p_empty, o_done = bars_sm
         il = i if i_loc is None else i_loc
         sb = i % 2
+        V2: cutlass.Constexpr = self.softmax_v2 and not apply_mask
         cute.arch.mbarrier_wait(s_full + sb, (i // 2) & 1)
         accS = tStS[(None, None), 0, 0, sb]
-        for c in cutlass.range_constexpr(4):
-            cute.copy(t2r, thr_ld.partition_S(cute.local_tile(accS, (M_ROWS, 32), (0, c))), xs[c])
-        cute.arch.fence_view_async_tmem_load()
-        cute.arch.mbarrier_arrive(s_empty + sb)
-        # Mask (tiles with the new tokens, the request tail or a duplicate second slot; straight-line)
-        if const_expr(apply_mask):
+        mraw = Float32(0.0)
+        if const_expr(V2):
+            mraw = _tmem_row_max128(
+                s_taddr + sb * TILE_KEYS
+            )  # LDTM.STAT, waits itself; S stays in TMEM
+        else:
             for c in cutlass.range_constexpr(4):
-                for v in cutlass.range_constexpr(32):
-                    if const_expr(32 * c + v < PAGE):
-                        xs[c][v] = _keep_lt(xs[c][v], 32 * c + v, cnt_a)
-                    else:
-                        xs[c][v] = _keep_lt(xs[c][v], 32 * c + v - PAGE, cnt_b)
-        # Row max of the raw scores (scale > 0)
-        m0 = xs[0][0]
-        m1 = xs[1][0]
-        m2 = xs[2][0]
-        m3 = xs[3][0]
-        for v in cutlass.range_constexpr(1, 32):
-            m0 = cute.arch.fmax(m0, xs[0][v])
-            m1 = cute.arch.fmax(m1, xs[1][v])
-            m2 = cute.arch.fmax(m2, xs[2][v])
-            m3 = cute.arch.fmax(m3, xs[3][v])
-        mx = cute.arch.fmax(cute.arch.fmax(m0, m1), cute.arch.fmax(m2, m3)) * scale
+                cute.copy(
+                    t2r, thr_ld.partition_S(cute.local_tile(accS, (M_ROWS, 32), (0, c))), xs[c]
+                )
+            cute.arch.fence_view_async_tmem_load()
+            cute.arch.mbarrier_arrive(s_empty + sb)
+            # Mask (tiles with the new tokens, the request tail or a duplicate second slot; straight-line)
+            if const_expr(apply_mask):
+                for c in cutlass.range_constexpr(4):
+                    for v in cutlass.range_constexpr(32):
+                        if const_expr(32 * c + v < PAGE):
+                            xs[c][v] = _keep_lt(xs[c][v], 32 * c + v, cnt_a)
+                        else:
+                            xs[c][v] = _keep_lt(xs[c][v], 32 * c + v - PAGE, cnt_b)
+            # Row max of the raw scores (scale > 0)
+            m0 = xs[0][0]
+            m1 = xs[1][0]
+            m2 = xs[2][0]
+            m3 = xs[3][0]
+            for v in cutlass.range_constexpr(1, 32):
+                m0 = cute.arch.fmax(m0, xs[0][v])
+                m1 = cute.arch.fmax(m1, xs[1][v])
+                m2 = cute.arch.fmax(m2, xs[2][v])
+                m3 = cute.arch.fmax(m3, xs[3][v])
+            mraw = cute.arch.fmax(cute.arch.fmax(m0, m1), cute.arch.fmax(m2, m3))
+        mx = mraw * scale
         m_ref = stt[0]
         need = Int32(0)
         if mx > m_ref + self.rescale_threshold:
@@ -1031,17 +1179,44 @@ class GqaKvReplicaPartialAttnKernel:
         lc = Float32(0.0)
         ld = Float32(0.0)
         pw = cute.make_rmem_tensor((32,), Uint32)
-        for c in cutlass.range_constexpr(4):
-            for q4 in cutlass.range_constexpr(8):
-                p0 = _ex2(_fma(xs[c][4 * q4], scale, neg_m))
-                p1 = _ex2(_fma(xs[c][4 * q4 + 1], scale, neg_m))
-                p2 = _ex2(_fma(xs[c][4 * q4 + 2], scale, neg_m))
-                p3 = _ex2(_fma(xs[c][4 * q4 + 3], scale, neg_m))
-                la = la + p0
-                lb = lb + p1
-                lc = lc + p2
-                ld = ld + p3
-                pw[8 * c + q4] = _pack_e4m3x4(p0, p1, p2, p3)
+        if const_expr(V2):
+            # v2: S chunk c + 1 loads from TMEM while chunk c is exponentiated (xs[0] / xs[1] alternate); FFMA2 /
+            # FADD2 keep v1's per-element arithmetic and each accumulator's order, so P and l are bitwise as v1.
+            cute.copy(t2r, thr_ld.partition_S(cute.local_tile(accS, (M_ROWS, 32), (0, 0))), xs[0])
+            cute.arch.fence_view_async_tmem_load()
+            for c in cutlass.range_constexpr(4):
+                xb = xs[c % 2]
+                if const_expr(c + 1 < 4):
+                    cute.copy(
+                        t2r,
+                        thr_ld.partition_S(cute.local_tile(accS, (M_ROWS, 32), (0, c + 1))),
+                        xs[(c + 1) % 2],
+                    )
+                for q4 in cutlass.range_constexpr(8):
+                    a01 = _ffma2(xb[4 * q4], xb[4 * q4 + 1], scale, scale, neg_m, neg_m)
+                    a23 = _ffma2(xb[4 * q4 + 2], xb[4 * q4 + 3], scale, scale, neg_m, neg_m)
+                    p0 = _ex2(a01[0])
+                    p1 = _ex2(a01[1])
+                    p2 = _ex2(a23[0])
+                    p3 = _ex2(a23[1])
+                    la, lb = _fadd2(la, lb, p0, p1)
+                    lc, ld = _fadd2(lc, ld, p2, p3)
+                    pw[8 * c + q4] = _pack_e4m3x4(p0, p1, p2, p3)
+                if const_expr(c + 1 < 4):
+                    cute.arch.fence_view_async_tmem_load()
+            cute.arch.mbarrier_arrive(s_empty + sb)  # every read of this S buffer is done
+        else:
+            for c in cutlass.range_constexpr(4):
+                for q4 in cutlass.range_constexpr(8):
+                    p0 = _ex2(_fma(xs[c][4 * q4], scale, neg_m))
+                    p1 = _ex2(_fma(xs[c][4 * q4 + 1], scale, neg_m))
+                    p2 = _ex2(_fma(xs[c][4 * q4 + 2], scale, neg_m))
+                    p3 = _ex2(_fma(xs[c][4 * q4 + 3], scale, neg_m))
+                    la = la + p0
+                    lb = lb + p1
+                    lc = lc + p2
+                    ld = ld + p3
+                    pw[8 * c + q4] = _pack_e4m3x4(p0, p1, p2, p3)
         stt[1] = stt[1] + ((la + lb) + (lc + ld))
         pb = i % 2
         cute.arch.mbarrier_wait(p_empty + pb, ((i // 2) & 1) ^ 1)
@@ -1439,6 +1614,9 @@ class GqaKvReplicaPartialAttnKernel:
         l_st: Int32,
         l_sh: Int32,
         sScal: cute.Tensor,
+        mPeers: cute.Tensor,
+        mLLState: cute.Tensor,
+        ll_grank: Int32,
         comb_phase=0,
     ):
         """CTA ``split`` of the request's ``c_req`` CTAs finalizes elements [o_lo, o_hi) of the request with the
@@ -1499,6 +1677,9 @@ class GqaKvReplicaPartialAttnKernel:
                 l_st,
                 l_sh,
                 sScal,
+                mPeers,
+                mLLState,
+                ll_grank,
             )
             if lg_gps == 0:
                 self._merge(1, *args)
@@ -1540,6 +1721,9 @@ class GqaKvReplicaPartialAttnKernel:
         l_st: Int32,
         l_sh: Int32,
         sScal: cute.Tensor,
+        mPeers: cute.Tensor,
+        mLLState: cute.Tensor,
+        ll_grank: Int32,
     ):
         """Granule merge of the combine for ``lanes`` (compile time) lanes per granule."""
         gps: cutlass.Constexpr = (
@@ -1614,35 +1798,88 @@ class GqaKvReplicaPartialAttnKernel:
                         w1 = _pack_bf16x2(a2 * scl, a3 * scl)
                         w2 = _pack_bf16x2(a4 * scl, a5 * scl)
                         w3 = _pack_bf16x2(a6 * scl, a7 * scl)
-                        if const_expr(self.o_vec16):
-                            _st_global_v4_u32(addr, w0, w1, w2, w3)
-                        else:
-                            _st_global_u32(addr, w0)
-                            _st_global_u32(addr + 4, w1)
-                            _st_global_u32(addr + 8, w2)
-                            _st_global_u32(addr + 12, w3)
-                        if e0 % HEAD_DIM == 0:
-                            lse_out = -Float32.inf
-                            if den > Float32(0.0):
-                                lse_out = mrow + _lg2(den)
-                            _st_global_f32(
-                                l_base + (dd * l_sd + tok * l_st + hh * l_sh) * 4, lse_out
+                        lse_out = -Float32.inf
+                        if den > Float32(0.0):
+                            lse_out = mrow + _lg2(den)
+                        if const_expr(self.ll_push):
+                            self._ll_store(
+                                mPeers, mLLState, ll_grank, dd, tok, hh, e0, w0, w1, w2, w3, lse_out
                             )
+                        else:
+                            if const_expr(self.o_vec16):
+                                _st_global_v4_u32(addr, w0, w1, w2, w3)
+                            else:
+                                _st_global_u32(addr, w0)
+                                _st_global_u32(addr + 4, w1)
+                                _st_global_u32(addr + 8, w2)
+                                _st_global_u32(addr + 12, w3)
+                            if e0 % HEAD_DIM == 0:
+                                _st_global_f32(
+                                    l_base + (dd * l_sd + tok * l_st + hh * l_sh) * 4, lse_out
+                                )
             else:
                 # this rank sees no key of the request: O = 0, LSE = -inf
                 if jg == 0:
                     if g < n_gran:
-                        if const_expr(self.o_vec16):
-                            _st_global_v4_u32(addr, Uint32(0), Uint32(0), Uint32(0), Uint32(0))
-                        else:
-                            _st_global_u32(addr, Uint32(0))
-                            _st_global_u32(addr + 4, Uint32(0))
-                            _st_global_u32(addr + 8, Uint32(0))
-                            _st_global_u32(addr + 12, Uint32(0))
-                        if e0 % HEAD_DIM == 0:
-                            _st_global_f32(
-                                l_base + (dd * l_sd + tok * l_st + hh * l_sh) * 4, -Float32.inf
+                        if const_expr(self.ll_push):
+                            self._ll_store(
+                                mPeers,
+                                mLLState,
+                                ll_grank,
+                                dd,
+                                tok,
+                                hh,
+                                e0,
+                                Uint32(0),
+                                Uint32(0),
+                                Uint32(0),
+                                Uint32(0),
+                                -Float32.inf,
                             )
+                        else:
+                            if const_expr(self.o_vec16):
+                                _st_global_v4_u32(addr, Uint32(0), Uint32(0), Uint32(0), Uint32(0))
+                            else:
+                                _st_global_u32(addr, Uint32(0))
+                                _st_global_u32(addr + 4, Uint32(0))
+                                _st_global_u32(addr + 8, Uint32(0))
+                                _st_global_u32(addr + 12, Uint32(0))
+                            if e0 % HEAD_DIM == 0:
+                                _st_global_f32(
+                                    l_base + (dd * l_sd + tok * l_st + hh * l_sh) * 4, -Float32.inf
+                                )
+
+    @cute.jit
+    def _ll_store(
+        self,
+        mPeers: cute.Tensor,
+        mLLState: cute.Tensor,
+        ll_grank: Int32,
+        dd: Int32,
+        tok: Int32,
+        hh: Int32,
+        e0: Int32,
+        w0: Uint32,
+        w1: Uint32,
+        w2: Uint32,
+        w3: Uint32,
+        lse: Float32,
+    ):
+        """ll_push: one granule's 4 O words (and, at d = 0, the row's LSE) into member dd's merge slot, the layout
+        alltoall_merge's push writes: row position r = tok * hql + hh (one partial per member), epoch mLLState[r],
+        slot half epoch & 1, this member's source slot ll_grank; O words at r * D/2, LSE at ll_lse_base + r. The
+        Lamport words are 4-byte words of 16-byte stores (each lands whole), so the poller needs no fence."""
+        r = tok * self.hql + hh
+        ep = mLLState[r]
+        half = Int64(ep & 1) * Int64(self.cp * self.ll_slot_words)
+        base = mPeers[dd] + (half + Int64(ll_grank) * Int64(self.ll_slot_words)) * 4
+        o_addr = base + (Int64(r) * Int64(HEAD_DIM // 2) + Int64((e0 % HEAD_DIM) // 2)) * 4
+        lse_addr = base + (Int64(self.ll_lse_base) + Int64(r)) * 4
+        _st_global_v4_u32(
+            o_addr, _lamport_word(w0), _lamport_word(w1), _lamport_word(w2), _lamport_word(w3)
+        )
+        if e0 % HEAD_DIM == 0:
+            _st_global_u32(lse_addr, _lamport_word(_f32_bits(lse)))
 
     @cute.kernel
     def kernel(
@@ -1672,6 +1909,9 @@ class GqaKvReplicaPartialAttnKernel:
         l_sh: Int32,
         mWs: cute.Tensor,
         mCnt: cute.Tensor,
+        mPeers: cute.Tensor,
+        mLLState: cute.Tensor,
+        ll_grank: Int32,
         sQ_l: cute.ComposedLayout,
         sK_l: cute.ComposedLayout,
         sV_l: cute.ComposedLayout,
@@ -1885,7 +2125,16 @@ class GqaKvReplicaPartialAttnKernel:
                         tcgen05.commit(empty_k + s)
                 if i >= 1:
                     mma_pv = self._gemm2(
-                        i - 1, mma_pv, tOtO, tCrP, tCrV, full_v, p_full, empty_v, p_empty, o_done
+                        i - 1,
+                        mma_pv,
+                        tOtO,
+                        tCrP,
+                        tCrV,
+                        full_v,
+                        p_full,
+                        empty_v,
+                        p_empty,
+                        o_done,
                     )
             with cute.arch.elect_one():
                 tcgen05.commit(o_full)
@@ -1921,6 +2170,10 @@ class GqaKvReplicaPartialAttnKernel:
                 x2 = cute.make_rmem_tensor_like(frag, Float32)
                 x3 = cute.make_rmem_tensor_like(frag, Float32)
                 xs = (x0, x1, x2, x3)
+                s_taddr = Int32(0)
+                if const_expr(self.softmax_v2):
+                    # this warp's TMEM address of S buffer 0: allocated base + lane base (32 lanes per warp)
+                    s_taddr = _ld_shared_u32(tmem_holder.toint()) + sw * (32 << 16)
                 stt = cute.make_rmem_tensor((2,), Float32)
                 stt[0] = -Float32.inf
                 stt[1] = Float32(0.0)
@@ -1963,6 +2216,7 @@ class GqaKvReplicaPartialAttnKernel:
                             cnt_b,
                             scale,
                             True,
+                            s_taddr=s_taddr,
                         )
                     else:
                         self._softmax_tile(
@@ -1986,6 +2240,7 @@ class GqaKvReplicaPartialAttnKernel:
                             cnt_b,
                             scale,
                             False,
+                            s_taddr=s_taddr,
                         )
                 if n_t > 0:
                     # Normalized FP16 partial row -> staging (the K / V rings are free once o_full fired)
@@ -2108,6 +2363,9 @@ class GqaKvReplicaPartialAttnKernel:
             l_st,
             l_sh,
             sScal,
+            mPeers,
+            mLLState,
+            ll_grank,
         )
         # Release the dependents: after a CTA barrier that follows the last global store
         cute.arch.sync_threads()
@@ -2147,6 +2405,9 @@ class GqaKvReplicaPartialAttnKernel:
         l_sh: Int32,
         mWs: cute.Tensor,
         mCnt: cute.Tensor,
+        mPeers: cute.Tensor,
+        mLLState: cute.Tensor,
+        ll_grank: Int32,
         sQ_l: cute.ComposedLayout,
         sK_l: cute.ComposedLayout,
         sV_l: cute.ComposedLayout,
@@ -2451,6 +2712,10 @@ class GqaKvReplicaPartialAttnKernel:
                 x2 = cute.make_rmem_tensor_like(frag, Float32)
                 x3 = cute.make_rmem_tensor_like(frag, Float32)
                 xs = (x0, x1, x2, x3)
+                s_taddr = Int32(0)
+                if const_expr(self.softmax_v2):
+                    # this warp's TMEM address of S buffer 0: allocated base + lane base (32 lanes per warp)
+                    s_taddr = _ld_shared_u32(tmem_holder.toint()) + sw * (32 << 16)
                 stt = cute.make_rmem_tensor((2,), Float32)
                 bars_sm = (s_full, s_empty, p_full, p_empty, o_done)
                 for k in cutlass.range_constexpr(2):
@@ -2508,6 +2773,7 @@ class GqaKvReplicaPartialAttnKernel:
                                     scale,
                                     True,
                                     i_loc=i,
+                                    s_taddr=s_taddr,
                                 )
                             else:
                                 self._softmax_tile(
@@ -2532,6 +2798,7 @@ class GqaKvReplicaPartialAttnKernel:
                                     scale,
                                     False,
                                     i_loc=i,
+                                    s_taddr=s_taddr,
                                 )
                         # ---- normalized FP16 partial row -> the workspace (chunk-major, see _combine) ----
                         l_tot = stt[1]
@@ -2671,6 +2938,9 @@ class GqaKvReplicaPartialAttnKernel:
                     l_st,
                     l_sh,
                     sScal,
+                    mPeers,
+                    mLLState,
+                    ll_grank,
                     comb_phase=(Int32(0), cph1)[k],
                 )
         # ======================= release the dependents: after a CTA barrier that follows the last global store =====

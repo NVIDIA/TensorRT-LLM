@@ -50,13 +50,10 @@ owns an optional ``confidence_provider`` callable
         -> Optional[Sequence[Sequence[float]]]   # [num_gens][K] host rows
 
 which the DFlash worker invokes at draft time (via
-:meth:`DFlashAcceptStatsRecorder.record_draft_confidence`). With the
-provider ``None`` (this MR), no calibration rows are collected and the
-calibration table stays empty. The DSpark confidence-scheduled
-verification MR ships ``tensorrt_llm._torch.speculative.dspark_confidence``
-with the real provider (built on its ``compute_draft_confidence`` /
-``build_confidence_prev_tokens`` helpers); when that module is importable,
-:func:`maybe_create_recorder` picks it up automatically.
+:meth:`DFlashAcceptStatsRecorder.record_draft_confidence`). No provider is
+wired by default: with the provider ``None``, no calibration rows are
+collected and the calibration table stays empty. A real provider would
+evaluate the drafter's DSpark confidence head per drafted position.
 
 This module is import-light on purpose (no torch import) so the
 aggregation math is unit-testable on CPU-only hosts.
@@ -80,19 +77,6 @@ STATS_FILE_PREFIX = "dflash_accept_stats_rank"
 ConfidenceProvider = Callable[..., Optional[Sequence[Sequence[float]]]]
 
 
-def _resolve_default_confidence_provider() -> Optional[ConfidenceProvider]:
-    """Return the DSpark confidence provider if its module is in the tree.
-
-    The module ships with the DSpark confidence-scheduled verification MR;
-    without it (this MR alone) calibration rows are simply not collected.
-    """
-    try:
-        from .dspark_confidence import dspark_confidence_provider
-    except ImportError:
-        return None
-    return dspark_confidence_provider
-
-
 def maybe_create_recorder(max_draft_len: int, rank: int) -> Optional["DFlashAcceptStatsRecorder"]:
     """Create a recorder iff TLLM_DFLASH_ACCEPT_STATS_DIR is set (else None)."""
     stats_dir = os.environ.get(ENV_STATS_DIR)
@@ -110,7 +94,7 @@ def maybe_create_recorder(max_draft_len: int, rank: int) -> Optional["DFlashAcce
         max_draft_len,
         rank,
         flush_every=flush_every,
-        confidence_provider=_resolve_default_confidence_provider(),
+        confidence_provider=None,
     )
 
 
