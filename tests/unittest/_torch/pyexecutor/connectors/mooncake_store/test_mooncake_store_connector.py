@@ -2050,7 +2050,7 @@ def test_staging_get_scatters_back_to_the_device_regions(store_config, fake_stor
         assert addresses == [[slot]]
         assert sizes == [[sum(device_sizes)]]
 
-        # The scatter is the mirror of the gather: same split, opposite direction.
+        # The scatter is the inverse of the gather: same split, opposite direction.
         expected = []
         offset = 0
         for address, size in zip(device_addresses, device_sizes):

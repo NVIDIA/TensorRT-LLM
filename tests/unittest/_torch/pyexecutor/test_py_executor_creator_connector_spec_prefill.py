@@ -165,8 +165,6 @@ def test_a_capacity_role_mooncake_server_runs_mtp_with_attention_dp() -> None:
     _validate_connector_admission(manager, generation_request)
 
 
-
-
 @pytest.mark.parametrize(
     "spec_config, worker_cls, scheduler_cls, transceiver, use_v2",
     [
