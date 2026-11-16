@@ -148,6 +148,14 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
     def use_kda_mtp_replay(self) -> bool:
         return isinstance(self._kda_replay, KDAMtpReplayState)
 
+    @property
+    def commits_every_generation_step(self) -> bool:
+        """Whether every generation step, drafts or not, needs ``update_mamba_states``.
+
+        The KDA MTP replay verifies one-token steps too and commits them after sampling.
+        """
+        return self.use_kda_mtp_replay
+
     @override
     def _managed_replay_state(self) -> None:
         """``KDAReplayRegion`` declares, binds and indexes the KDA replay state."""

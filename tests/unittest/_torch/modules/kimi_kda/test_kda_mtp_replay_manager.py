@@ -623,3 +623,53 @@ def test_kda_mtp_replay_history_follows_a_suspended_request(slot_taken):
     actual = _run_replay_rounds(accepted_per_round, suspend_after=3, slot_taken=slot_taken)
     for round_idx, (got, want) in enumerate(zip(actual, expected, strict=True)):
         assert torch.equal(got, want), f"verify round {round_idx}"
+
+
+@pytest.mark.parametrize("commits", [True, False], ids=["replay_state", "other_state"])
+@pytest.mark.parametrize("num_contexts", [0, 1, 3])
+def test_skip_drafting_commits_replay_states(commits, num_contexts):
+    """A step without drafts still commits its generation tokens to a replay state."""
+    from tensorrt_llm._torch.speculative.interface import SpecWorkerBase
+
+    calls = []
+    manager = SimpleNamespace(
+        commits_every_generation_step=commits,
+        update_mamba_states=lambda **kwargs: calls.append(kwargs),
+    )
+    worker = SimpleNamespace(
+        _execute_guided_decoder_if_present=lambda logits: None,
+        _sample_tokens_for_batch=lambda logits, spec_metadata, nc, bs: torch.tensor(
+            [5, 6, 7], dtype=torch.int32
+        ),
+    )
+    state_indices = torch.tensor([4, 1, 2], dtype=torch.int32)
+    attn_metadata = SimpleNamespace(
+        num_seqs=3,
+        num_contexts=num_contexts,
+        kv_cache_manager=manager,
+        mamba_metadata=SimpleNamespace(state_indices=state_indices),
+    )
+
+    out = SpecWorkerBase.skip_drafting(
+        worker, None, None, None, torch.zeros(3, 8), attn_metadata, SimpleNamespace(), None
+    )
+
+    assert out["new_tokens"][:, 0].tolist() == [5, 6, 7]
+    if not commits or num_contexts == 3:
+        assert calls == []
+        return
+    (call,) = calls
+    assert call["attn_metadata"] is attn_metadata
+    assert call["num_accepted_tokens"].tolist() == [1, 1, 1]
+    assert call["state_indices"] is state_indices
+
+
+@pytest.mark.parametrize("manager_cls", [KimiK3HybridCacheManager, Glm5NextCacheManager])
+@pytest.mark.parametrize("kda_mtp_replay", [True, False])
+def test_kda_managers_commit_every_step_only_with_the_mtp_replay(manager_cls, kda_mtp_replay):
+    _requires_mtp_replay_kernels()
+    mgr = _manager(manager_cls, kda_mtp_replay=kda_mtp_replay)
+    try:
+        assert mgr.commits_every_generation_step is kda_mtp_replay
+    finally:
+        mgr.shutdown()

@@ -2254,6 +2254,17 @@ class SpecWorkerBase(nn.Module, ABC):
                                    batch_size,
                                    has_drafts=False)
 
+        # Replay states verify every generation step, so its token is
+        # committed after sampling even without drafts.
+        kv_cache_manager = attn_metadata.kv_cache_manager
+        if (getattr(kv_cache_manager, "commits_every_generation_step", False)
+                and batch_size > num_contexts):
+            kv_cache_manager.update_mamba_states(
+                attn_metadata=attn_metadata,
+                num_accepted_tokens=num_accepted_tokens,
+                state_indices=attn_metadata.mamba_metadata.state_indices,
+            )
+
         next_draft_tokens = torch.zeros((batch_size, 0),
                                         dtype=torch.int,
                                         device=logits.device)
