@@ -28,19 +28,24 @@ def test_split_loading_preserves_checkpoint_dtype_and_nonpersistent_buffers(tmp_
     assert module.sinc_filter.dtype == torch.float32
 
 
-def test_split_component_rejects_unexplained_extra_weights(tmp_path) -> None:
+@pytest.mark.parametrize("wrapper", ["", "vae."])
+def test_split_component_rejects_unexplained_extra_weights(tmp_path, wrapper) -> None:
     path = tmp_path / "component.safetensors"
-    save_file({"decoder.weight": torch.ones(1, 1), "decoder.unknown": torch.ones(1)}, str(path))
+    save_file(
+        {"decoder.weight": torch.ones(1, 1), wrapper + "decoder.unknown": torch.ones(1)},
+        str(path),
+    )
     with pytest.raises(ValueError, match="Unexpected decoder"):
         impl._load_split_component(str(path), torch.nn.Linear(1, 1, bias=False), "decoder.")
 
 
-def test_inverse_stft_basis_is_a_declared_non_forward_buffer(tmp_path) -> None:
+@pytest.mark.parametrize("wrapper", ["", "vae."])
+def test_inverse_stft_basis_is_a_declared_non_forward_buffer(tmp_path, wrapper) -> None:
     path = tmp_path / "vocoder.safetensors"
     save_file(
         {
-            "vocoder.weight": torch.ones(1, 1),
-            "vocoder.mel_stft.stft_fn.inverse_basis": torch.ones(1),
+            wrapper + "vocoder.weight": torch.ones(1, 1),
+            wrapper + "vocoder.mel_stft.stft_fn.inverse_basis": torch.ones(1),
         },
         str(path),
     )

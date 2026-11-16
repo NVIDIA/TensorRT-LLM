@@ -100,7 +100,12 @@ def _load_split_component(path: str, module: torch.nn.Module, prefix: str) -> No
         allowed_unused = (
             {"vocoder.mel_stft.stft_fn.inverse_basis"} if prefix == "vocoder." else set()
         )
-        unexpected = {key for key in keys if key.startswith(prefix)} - consumed - allowed_unused
+        allowed_unused |= {"vae." + key for key in allowed_unused}
+        unexpected = (
+            {key for key in keys if key.startswith((prefix, "vae." + prefix))}
+            - consumed
+            - allowed_unused
+        )
         if unexpected:
             raise ValueError(f"Unexpected {prefix} checkpoint tensors: {sorted(unexpected)}")
     module.load_state_dict(weights, strict=True, assign=True)
