@@ -26,7 +26,7 @@ from .._utils import nvtx_range_debug
 from ..executor import (DetokenizedGenerationResultBase, GenerationResult,
                         GenerationResultBase)
 from ..executor.postproc_worker import PostprocArgs
-from ..executor.result import Logprob, TokenLogprobs
+from ..executor.result import CompletionOutput, Logprob, TokenLogprobs
 from ..llmapi import SamplingParams
 from ..llmapi.disagg_utils import (get_usage_tokens_from_ctx,
                                    rewrite_usage_info_from_ctx,
@@ -844,6 +844,12 @@ class CompletionPostprocArgs(PostprocArgs):
     detokenize: bool = True
     prompt: Optional[str] = None
     return_logprobs: bool = False
+    # The prompt's token ids, set when an echoed prompt reports logprobs: the
+    # echoed logprobs start with one entry per prompt token.
+    prompt_token_ids: Optional[List[int]] = None
+    # Characters taken by the echoed prompt tokens; text offsets of streamed
+    # tokens after the first chunk start after them.
+    echo_text_offset: int = 0
     stream_options: Optional[StreamOptions] = None
     ctx_usage: Optional[UsageInfo] = None
     # Cache per-request stream metadata so every chunk reuses the same response
@@ -875,6 +881,7 @@ def create_completion_logprobs(token_ids: List[int],
     token_logprobs = []
     top_logprobs_list = []
     tokens = []
+    offset = initial_offset
     for token_id, logprob in zip(token_ids, logprobs):
         if isinstance(logprob, dict):
             token_logprobs.append(max(logprob[token_id].logprob, -9999.0))
@@ -887,15 +894,54 @@ def create_completion_logprobs(token_ids: List[int],
             token_logprobs.append(max(logprob, -9999.0))
 
         token = tokenizer.decode(token_id)
-        if len(text_offset) == 0:
-            text_offset.append(initial_offset)
-        else:
-            text_offset.append(text_offset[-1] + len(token))
+        text_offset.append(offset)
+        offset += len(token)
         tokens.append(token)
     return CompletionLogProbs(text_offset=text_offset,
                               token_logprobs=token_logprobs,
                               tokens=tokens,
                               top_logprobs=top_logprobs_list)
+
+
+def create_echo_prompt_logprobs(
+        prompt_token_ids: List[int], tokenizer: TransformersTokenizer,
+        prompt_logprobs: List[float] | TokenLogprobs) -> CompletionLogProbs:
+    """Logprobs of an echoed prompt, one entry per prompt token.
+
+    The first prompt token has no context, so its logprob is None, as in the
+    OpenAI completions API. Entry ``t`` of ``prompt_logprobs`` scores prompt
+    token ``t + 1``; an entry past the prompt scores the first generated token,
+    which the generated logprobs report.
+    """
+    first_token = tokenizer.decode(prompt_token_ids[0])
+    scored_ids = prompt_token_ids[1:]
+    scored = create_completion_logprobs(scored_ids,
+                                        tokenizer,
+                                        prompt_logprobs[:len(scored_ids)],
+                                        initial_offset=len(first_token))
+    return CompletionLogProbs(text_offset=[0] + scored.text_offset,
+                              token_logprobs=[None] + scored.token_logprobs,
+                              tokens=[first_token] + scored.tokens,
+                              top_logprobs=[None] + scored.top_logprobs)
+
+
+def _echo_prompt_logprobs(
+        args: CompletionPostprocArgs,
+        output: CompletionOutput) -> Optional[CompletionLogProbs]:
+    """Logprobs of the echoed prompt, or None if there are none to report."""
+    if not (args.echo and args.prompt_token_ids and output.prompt_logprobs):
+        return None
+    return create_echo_prompt_logprobs(args.prompt_token_ids, args.tokenizer,
+                                       output.prompt_logprobs)
+
+
+def _join_completion_logprobs(first: CompletionLogProbs,
+                              second: CompletionLogProbs) -> CompletionLogProbs:
+    return CompletionLogProbs(
+        text_offset=first.text_offset + second.text_offset,
+        token_logprobs=first.token_logprobs + second.token_logprobs,
+        tokens=first.tokens + second.tokens,
+        top_logprobs=first.top_logprobs + second.top_logprobs)
 
 
 @nvtx_range_debug("completion_stream_post_processor")
@@ -933,8 +979,17 @@ def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase,
         if args.return_logprobs:
             logprobs = output.logprobs_diff
             token_ids = output.token_ids_diff
+            prompt_logprobs = (_echo_prompt_logprobs(args, output)
+                               if args.first_iteration else None)
+            if prompt_logprobs is not None:
+                args.echo_text_offset = sum(
+                    len(token) for token in prompt_logprobs.tokens)
             choice.logprobs = create_completion_logprobs(
-                token_ids, args.tokenizer, logprobs, output._last_text_len)
+                token_ids, args.tokenizer, logprobs,
+                args.echo_text_offset + output._last_text_len)
+            if prompt_logprobs is not None:
+                choice.logprobs = _join_completion_logprobs(
+                    prompt_logprobs, choice.logprobs)
 
         chunk = CompletionStreamResponse(model=args.model,
                                          choices=[choice],
@@ -1004,8 +1059,14 @@ def completion_response_post_processor(
         if args.return_logprobs:
             logprobs = output.logprobs
             token_ids = output.token_ids
+            prompt_logprobs = _echo_prompt_logprobs(args, output)
+            generated_offset = 0 if prompt_logprobs is None else sum(
+                len(token) for token in prompt_logprobs.tokens)
             choice.logprobs = create_completion_logprobs(
-                token_ids, args.tokenizer, logprobs)
+                token_ids, args.tokenizer, logprobs, generated_offset)
+            if prompt_logprobs is not None:
+                choice.logprobs = _join_completion_logprobs(
+                    prompt_logprobs, choice.logprobs)
 
         completion_tokens += output.length
         choices.append(choice)

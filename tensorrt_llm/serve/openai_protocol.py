@@ -896,6 +896,8 @@ class CompletionRequest(OpenAIBaseModel):
             best_of=self.best_of,
             frequency_penalty=self.frequency_penalty,
             logprobs=sampling_logprobs,
+            # As in the OpenAI API, an echoed prompt reports its logprobs too.
+            prompt_logprobs=sampling_logprobs if self.echo else None,
             max_tokens=self.max_tokens,
             n=self.n,
             presence_penalty=self.presence_penalty,

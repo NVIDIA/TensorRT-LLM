@@ -3353,6 +3353,9 @@ class OpenAIServer(_VideoRoutesMixin):
                         prompt_token_ids=prompt_token_ids)
                 else:
                     tokens_prompt = prompt
+                if postproc_args.echo and postproc_args.return_logprobs:
+                    postproc_args.prompt_token_ids = list(
+                        tokens_prompt["prompt_token_ids"])
 
                 promise = self.generator.generate_async(
                     inputs=tokens_prompt,
