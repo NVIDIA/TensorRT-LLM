@@ -494,7 +494,7 @@ def fresh_context(
             ),
             seq_lens=torch.tensor([num_tokens] * num_requests, dtype=torch.int),
             request_ids=request_ids,
-            prompt_lens=[cached_tokens + num_tokens] * num_requests,
+            prompt_lens=[num_tokens] * num_requests,
         )
         md.prepare()
         yield md
