@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@user/yuanjingx/add_fbd_evn', 'trtllm-jenkins-shared-lib@main']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
@@ -7614,34 +7614,34 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "DGX_H100-4_GPUs-PyTorch-Others-2": ["auto:dgx-h100-x4", "l0_dgx_h100", 2, 2, 4],
         "DGX_H100-4_GPUs-PyTorch-Ray-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-PyTorch-Post-Merge-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
-        "DGX_B200-CPP-1": ["auto:dgx-b200-flex", "l0_b200", 1, 1, 1, 1, true],
-        "DGX_B200-PyTorch-1": ["auto:dgx-b200-flex", "l0_b200", 1, 9, 1, 1, true],
-        "DGX_B200-PyTorch-2": ["auto:dgx-b200-flex", "l0_b200", 2, 9, 1, 1, true],
-        "DGX_B200-PyTorch-3": ["auto:dgx-b200-flex", "l0_b200", 3, 9, 1, 1, true],
-        "DGX_B200-PyTorch-4": ["auto:dgx-b200-flex", "l0_b200", 4, 9, 1, 1, true],
-        "DGX_B200-PyTorch-5": ["auto:dgx-b200-flex", "l0_b200", 5, 9, 1, 1, true],
-        "DGX_B200-PyTorch-6": ["auto:dgx-b200-flex", "l0_b200", 6, 9, 1, 1, true],
-        "DGX_B200-PyTorch-7": ["auto:dgx-b200-flex", "l0_b200", 7, 9, 1, 1, true],
-        "DGX_B200-PyTorch-8": ["auto:dgx-b200-flex", "l0_b200", 8, 9, 1, 1, true],
-        "DGX_B200-PyTorch-9": ["auto:dgx-b200-flex", "l0_b200", 9, 9, 1, 1, true],
-        "DGX_B200-PyTorch-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200", 1, 2, 1, 1, true],
-        "DGX_B200-PyTorch-Post-Merge-2": ["auto:dgx-b200-flex", "l0_b200", 2, 2, 1, 1, true],
-        "DGX_B200-2_GPUs-PyTorch-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 2, 1, true],
-        "DGX_B200-4_GPUs-PyTorch-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 4, 4, 1, true],
-        "DGX_B200-4_GPUs-PyTorch-2": ["auto:dgx-b200-flex", "l0_dgx_b200", 2, 4, 4, 1, true],
-        "DGX_B200-4_GPUs-PyTorch-3": ["auto:dgx-b200-flex", "l0_dgx_b200", 3, 4, 4, 1, true],
-        "DGX_B200-4_GPUs-PyTorch-4": ["auto:dgx-b200-flex", "l0_dgx_b200", 4, 4, 4, 1, true],
-        "DGX_B200-4_GPUs-PyTorch-Ray-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 4, 1, true],
-        "DGX_B200-4_GPUs-PyTorch-Post-Merge-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 4, 4, 1, true],
-        "DGX_B200-4_GPUs-PyTorch-Post-Merge-2": ["auto:dgx-b200-flex", "l0_dgx_b200", 2, 4, 4, 1, true],
-        "DGX_B200-4_GPUs-PyTorch-Post-Merge-3": ["auto:dgx-b200-flex", "l0_dgx_b200", 3, 4, 4, 1, true],
-        "DGX_B200-4_GPUs-PyTorch-Post-Merge-4": ["auto:dgx-b200-flex", "l0_dgx_b200", 4, 4, 4, 1, true],
-        "DGX_B200-8_GPUs-PyTorch-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 4, 8, 1, true],
-        "DGX_B200-8_GPUs-PyTorch-2": ["auto:dgx-b200-flex", "l0_dgx_b200", 2, 4, 8, 1, true],
-        "DGX_B200-8_GPUs-PyTorch-3": ["auto:dgx-b200-flex", "l0_dgx_b200", 3, 4, 8, 1, true],
-        "DGX_B200-8_GPUs-PyTorch-4": ["auto:dgx-b200-flex", "l0_dgx_b200", 4, 4, 8, 1, true],
+        "DGX_B200-CPP-1": ["b200-flex-fbd-evn", "l0_b200", 1, 1, 1, 1, true],
+        "DGX_B200-PyTorch-1": ["b200-flex-fbd-evn", "l0_b200", 1, 9, 1, 1, true],
+        "DGX_B200-PyTorch-2": ["b200-flex-fbd-evn", "l0_b200", 2, 9, 1, 1, true],
+        "DGX_B200-PyTorch-3": ["b200-flex-fbd-evn", "l0_b200", 3, 9, 1, 1, true],
+        "DGX_B200-PyTorch-4": ["b200-flex-fbd-evn", "l0_b200", 4, 9, 1, 1, true],
+        "DGX_B200-PyTorch-5": ["b200-flex-fbd-evn", "l0_b200", 5, 9, 1, 1, true],
+        "DGX_B200-PyTorch-6": ["b200-flex-fbd-evn", "l0_b200", 6, 9, 1, 1, true],
+        "DGX_B200-PyTorch-7": ["b200-flex-fbd-evn", "l0_b200", 7, 9, 1, 1, true],
+        "DGX_B200-PyTorch-8": ["b200-flex-fbd-evn", "l0_b200", 8, 9, 1, 1, true],
+        "DGX_B200-PyTorch-9": ["b200-flex-fbd-evn", "l0_b200", 9, 9, 1, 1, true],
+        "DGX_B200-PyTorch-Post-Merge-1": ["b200-flex-fbd-evn", "l0_b200", 1, 2, 1, 1, true],
+        "DGX_B200-PyTorch-Post-Merge-2": ["b200-flex-fbd-evn", "l0_b200", 2, 2, 1, 1, true],
+        "DGX_B200-2_GPUs-PyTorch-1": ["b200-flex-fbd-evn", "l0_dgx_b200", 1, 1, 2, 1, true],
+        "DGX_B200-4_GPUs-PyTorch-1": ["b200-flex-fbd-evn", "l0_dgx_b200", 1, 4, 4, 1, true],
+        "DGX_B200-4_GPUs-PyTorch-2": ["b200-flex-fbd-evn", "l0_dgx_b200", 2, 4, 4, 1, true],
+        "DGX_B200-4_GPUs-PyTorch-3": ["b200-flex-fbd-evn", "l0_dgx_b200", 3, 4, 4, 1, true],
+        "DGX_B200-4_GPUs-PyTorch-4": ["b200-flex-fbd-evn", "l0_dgx_b200", 4, 4, 4, 1, true],
+        "DGX_B200-4_GPUs-PyTorch-Ray-1": ["b200-flex-fbd-evn", "l0_dgx_b200", 1, 1, 4, 1, true],
+        "DGX_B200-4_GPUs-PyTorch-Post-Merge-1": ["b200-flex-fbd-evn", "l0_dgx_b200", 1, 4, 4, 1, true],
+        "DGX_B200-4_GPUs-PyTorch-Post-Merge-2": ["b200-flex-fbd-evn", "l0_dgx_b200", 2, 4, 4, 1, true],
+        "DGX_B200-4_GPUs-PyTorch-Post-Merge-3": ["b200-flex-fbd-evn", "l0_dgx_b200", 3, 4, 4, 1, true],
+        "DGX_B200-4_GPUs-PyTorch-Post-Merge-4": ["b200-flex-fbd-evn", "l0_dgx_b200", 4, 4, 4, 1, true],
+        "DGX_B200-8_GPUs-PyTorch-1": ["b200-flex-fbd-evn", "l0_dgx_b200", 1, 4, 8, 1, true],
+        "DGX_B200-8_GPUs-PyTorch-2": ["b200-flex-fbd-evn", "l0_dgx_b200", 2, 4, 8, 1, true],
+        "DGX_B200-8_GPUs-PyTorch-3": ["b200-flex-fbd-evn", "l0_dgx_b200", 3, 4, 8, 1, true],
+        "DGX_B200-8_GPUs-PyTorch-4": ["b200-flex-fbd-evn", "l0_dgx_b200", 4, 4, 8, 1, true],
         // M3 CTX TP2/EP2 -> GEN TP4/EP1 C++ NIXL bounce accuracy (6 GPUs).
-        "DGX_B200-6_GPUs-PyTorch-M3-Post-Merge-1": ["auto:dgx-b200-flex", "l0_dgx_b200_m3_6gpu", 1, 1, 6, 1, true],
+        "DGX_B200-6_GPUs-PyTorch-M3-Post-Merge-1": ["b200-flex-fbd-evn", "l0_dgx_b200_m3_6gpu", 1, 1, 6, 1, true],
         "DGX_B300-PyTorch-1": ["auto:dgx-b300-flex", "l0_b300", 1, 4, 1, 1, true],
         "DGX_B300-PyTorch-2": ["auto:dgx-b300-flex", "l0_b300", 2, 4, 1, 1, true],
         "DGX_B300-PyTorch-3": ["auto:dgx-b300-flex", "l0_b300", 3, 4, 1, 1, true],
@@ -7654,11 +7654,11 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "DGX_B300-4_GPUs-PyTorch-Post-Merge-2": ["auto:dgx-b300-flex", "l0_dgx_b300", 2, 2, 4, 1, true],
         // VisualGen PerfSanity post-merge test.
         // See the "-k_of_N" scheduling rules above the GB300 PerfSanity stage definitions.
-        "DGX_B200-8_GPUs-PyTorch-VisualGen-PerfSanity-Post-Merge-4_of_4": ["auto:dgx-b200-flex", "l0_b200_visual_gen_perf_sanity", 1, 1, 8, 1, true],
+        "DGX_B200-8_GPUs-PyTorch-VisualGen-PerfSanity-Post-Merge-4_of_4": ["b200-flex-fbd-evn", "l0_b200_visual_gen_perf_sanity", 1, 1, 8, 1, true],
         // Single-GPU Gemma4 PerfSanity post-merge baseline
-        "DGX_B200-PyTorch-PerfSanity-Post-Merge-1_of_4": ["auto:dgx-b200-flex", "l0_b200_perf_sanity", 1, 1, 1, 1, true],
+        "DGX_B200-PyTorch-PerfSanity-Post-Merge-1_of_4": ["b200-flex-fbd-evn", "l0_b200_perf_sanity", 1, 1, 1, 1, true],
         // PerfSanity post-merge tests
-        "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-2_of_4": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 1, 1, 8, 1, true],
+        "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-2_of_4": ["b200-flex-fbd-evn", "l0_b200_multi_gpus_perf_sanity", 1, 1, 8, 1, true],
         "GR100-PyTorch-Post-Merge-1": ["auto:gr100-x1", "l0_gr100", 1, 1],
     ]
     x86SlurmTestConfigs = cbtsResizeSplits(x86SlurmTestConfigs)
