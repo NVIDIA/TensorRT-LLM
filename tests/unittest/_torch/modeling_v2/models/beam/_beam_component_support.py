@@ -521,7 +521,6 @@ def cache_rows(
     APIs take the logical layer and translate it to the local slot themselves."""
     mgr = md.kv_cache_manager
     view = mgr.get_buffers(layer_idx, kv_layout="HND")
-    view = view[:: mgr.get_layer_page_index_scale(layer_idx) // 2]
     keys, values = [], []
     for page in range((length + tokens_per_block - 1) // tokens_per_block):
         k_off = int(md.kv_cache_block_offsets[0, 0, 0, page])
