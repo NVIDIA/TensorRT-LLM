@@ -214,6 +214,7 @@ l0_cpu:
   - unittest/_torch/models/test_modeling_utils.py::test_tied_embedding_parallel_layout
   - unittest/_torch/models/test_qwen3next_moe_input_dual_quant.py
   - unittest/_torch/models/test_modeling_utils.py::test_tied_embedding_rejects_incompatible_layout
+  - unittest/_torch/models/test_spark_config.py
   - unittest/_torch/models/test_modeling_utils.py::test_quantization_passes_match_declared_fused_checkpoint_names
   - unittest/_torch/test_connector_shared_pool.py
   - unittest/_torch/test_model_config.py
