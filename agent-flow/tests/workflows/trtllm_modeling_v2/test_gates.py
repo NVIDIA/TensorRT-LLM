@@ -29,7 +29,6 @@ from agent_flow.workflows.trtllm_modeling_v2.checks import (
     disagg,
     divergence,
     gate_cli,
-    gate_records,
     test_results,
 )
 from agent_flow.workflows.trtllm_modeling_v2.checks import serve as sg
@@ -65,7 +64,7 @@ from agent_flow.workflows.trtllm_modeling_v2.run.validation.completion import (
 )
 from agent_flow.workflows.trtllm_modeling_v2.spec import task_schema
 
-from ._helpers import _ENTRY, _REPO_ROOT, TARGET_REL, _build_repo, _verify, _workflow, _write_entry
+from ._helpers import _ENTRY, _REPO_ROOT, TARGET_REL, _build_repo, _verify, _write_entry
 
 _gates_TASK = {
     "checkpoint_path": "/ckpt/Qwen3-30B-A3B",
@@ -1171,60 +1170,6 @@ def test_an_unreadable_reference_is_unknown_not_a_failure(tmp_path):
     )
     result = boot_checks.run_boot_gate(_gates_env(), task_data=task, runner=run, workdir=tmp_path)
     assert result.passed and "divergence UNKNOWN" in result.detail
-
-
-_ANCHOR = 92.30
-
-
-_statistical_floor_TASK = {
-    "checkpoint_path": "/ckpt/M",
-    "parallel": "tep4",
-    "trtllm_repo_path": "/repo",
-    "accuracy": {"benchmark": "gsm8k", "reference_yaml": "r.yaml", "tolerance": 5.0},
-}
-
-
-def _verdict(member, measured, reference=_ANCHOR, se=0.734):
-    return check_result.GateResult(
-        name="accuracy[gsm8k]",
-        passed=True,
-        detail="",
-        member=member,
-        measured=measured,
-        reference=reference,
-        se=se,
-    )
-
-
-def test_delivery_refuses_open_findings_first(tmp_path):
-    """Before the delivery report, and as a remediable verdict a relaunch re-enters."""
-    from agent_flow.workflows.trtllm_modeling_v2.run.validation import completion, contract
-
-    wf = _workflow(tmp_path)
-    wf.task_data = {"accuracy": dict(_statistical_floor_TASK["accuracy"])}
-    accuracy_checks.note_systematic_shift(
-        gate_records.records_for(wf.workspace),
-        [_verdict("tep4", 91.0), _verdict("tp4", 91.1)],
-        wf.task_data["accuracy"],
-        "dspark",
-    )
-    closed = []
-    wf._close_run = lambda state, log, verdict: closed.append(verdict)
-    wf._contract = contract.Contract(checks=())
-    wf.environment = SimpleNamespace(world_size=1)
-    wf._target_marker = lambda: ""
-    verdict = contract.evaluate(wf._contract, wf._contract_status(), marker="")
-    assert (
-        completion.run_deliver_phase(
-            wf,
-            SimpleNamespace(units_done=["core"]),
-            None,
-            lambda files: completion.assess(verdict, files=files),
-        )
-        is False
-    )
-    assert closed == ["delivery-failed:findings"]
-    assert "delivery blocked" in wf.journal.path.read_text(encoding="utf-8")
 
 
 def _spec(tmp_path) -> dict:

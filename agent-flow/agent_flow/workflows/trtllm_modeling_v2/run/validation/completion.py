@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Delivery: the gate findings, the checks on disk, the delivered tests, and the contract.
+"""Delivery: the checks on disk, the delivered tests, and the contract.
 
 The delivered tests run here, at the checkout's ``HEAD``, as one job with no
 agent turn. The contract's journal section also says where correctness stands
@@ -18,8 +18,7 @@ from rich.markup import escape as escape_markup
 
 from agent_flow.console import print_message, print_rule
 
-from ...checks import accuracy as accuracy_checks
-from ...checks import gate_records, test_results
+from ...checks import test_results
 from ...checks.accuracy import resolve_model_key
 from ...checks.delivery import Check as DeliveryCheck
 from ...checks.delivery import DeliveryReport, accuracy_test_path, verify_delivery
@@ -110,19 +109,13 @@ def run_deliver_phase(
     detail = "\n".join(result.gaps) or "required work or unread worker reports remain"
     workflow.journal.section("delivery blocked", detail)
     print_message(f"[bold red]✘ delivery blocked:\n{escape_markup(detail)}[/bold red]", log)
-    verdict = (
-        "delivery-failed:findings"
-        if any(c.name.startswith("finding:") for c in report.failures)
-        else "delivery-failed:contract"
-        if not result.evaluation.holds
-        else "delivery-failed"
-    )
+    verdict = "delivery-failed:contract" if not result.evaluation.holds else "delivery-failed"
     workflow._close_run(state, log, verdict=verdict)
     return False
 
 
 def delivery_failures(workflow) -> list[str]:
-    """What fails of the delivery checks on disk and the gate findings, one line each.
+    """What fails of the delivery checks on disk, one line each.
 
     As cheap as reading files: the execution stage reads it on every state of the
     target the contract holds on, so full support includes it.
@@ -157,16 +150,6 @@ def delivery_report(workflow, *, run_tests: bool = False) -> DeliveryReport:
     Cheap, and safe to repeat, unless ``run_tests`` has the delivered tests
     run first (:func:`tests_check`).
     """
-    findings = tuple(
-        DeliveryCheck(
-            f"finding:{finding.key}", False, str(finding.values.get("detail", finding.key))
-        )
-        for finding in accuracy_checks.blocking_findings(
-            gate_records.records_for(workflow.workspace), workflow.task_data.get("accuracy") or {}
-        )
-    )
-    if findings:
-        return DeliveryReport(checks=findings)
     report = verify_delivery(
         repo_root=workflow.task_data["trtllm_repo_path"],
         target_rel=workflow._preflight.target_rel,

@@ -24,9 +24,6 @@ RESULTS_FILENAME = "gate_results.jsonl"
 KIND_ACCEPTANCE = "acceptance"
 
 
-KIND_FINDING = "finding"
-
-
 #: A checkpoint the stock implementation cannot load, on one GPU architecture:
 #: the acceptance gate's ``=off`` leg is skipped from then on.
 KIND_STOCK_UNAVAILABLE = "stock_unavailable"
@@ -34,7 +31,7 @@ KIND_STOCK_UNAVAILABLE = "stock_unavailable"
 
 @dataclass(frozen=True)
 class GateRecord:
-    """One measurement, or one finding."""
+    """One measurement."""
 
     kind: str
     key: Mapping[str, Any]
@@ -139,26 +136,6 @@ class GateRecords:
         return None
 
 
-def open_findings(
-    records: GateRecords, acknowledged: Mapping[str, str] | None = None
-) -> list[GateRecord]:
-    """Findings whose newest record is still unresolved and not acknowledged.
-
-    A later record with the same key and ``passed`` true resolves a finding.
-    ``acknowledged`` is the CURRENT task's ``accuracy.floor.acknowledge``
-    mapping, read at delivery.
-    """
-    newest: dict[str, GateRecord] = {}
-    for record in records.all(KIND_FINDING):
-        newest[json.dumps(dict(record.key), sort_keys=True)] = record
-    reasons = acknowledged or {}
-    return [
-        record
-        for record in newest.values()
-        if not record.passed and str(record.key.get("unit")) not in reasons
-    ]
-
-
 def records_for(workspace: str | Path) -> GateRecords:
     """The results file of a run's workspace."""
     return GateRecords(Path(workspace) / RESULTS_FILENAME)
@@ -168,9 +145,7 @@ __all__ = [
     "GateRecord",
     "GateRecords",
     "KIND_ACCEPTANCE",
-    "KIND_FINDING",
     "KIND_STOCK_UNAVAILABLE",
     "RESULTS_FILENAME",
-    "open_findings",
     "records_for",
 ]

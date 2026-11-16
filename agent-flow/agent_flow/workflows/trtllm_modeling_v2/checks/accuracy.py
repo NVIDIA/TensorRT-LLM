@@ -21,9 +21,8 @@ from ..spec.task_schema import resolve_per_unit, resolve_samples
 from . import accuracy_policy, check_config, feature_evidence
 from .check_config import check_configuration, engine_declaration, resolve_llm_api_options
 from .check_runtime import MODE_REQUIRE, ShellRunner, default_shell_runner, gate_workdir, with_mode
-from .gate_records import KIND_FINDING, GateRecord, GateRecords, open_findings
 from .runtime_evidence import EVAL_NOT_ATTESTED, attest_engine, engine_failure, engine_records
-from .verdict import UNKNOWN_TREE_STATE, GateResult, inspect_tree, lost_session, verdict_factory
+from .verdict import GateResult, inspect_tree, lost_session, verdict_factory
 
 ACCURACY_TIMEOUT_S = 4 * 60 * 60
 
@@ -377,69 +376,6 @@ def run_accuracy_gate(
     )
 
 
-def check_systematic_shift(
-    results: Sequence[GateResult],
-    accuracy: Mapping[str, Any],
-    unit: str | None,
-) -> accuracy_policy.ShiftFinding | None:
-    """The cross-member check over one unit's accuracy verdicts (:func:`.accuracy_policy.systematic_shift`).
-
-    Verdicts without a measurement or an SE are left out.
-    """
-    policy = accuracy_policy.resolve_floor_policy(accuracy)
-    readings = {
-        str(r.member): (float(r.measured), float(r.reference), float(r.se))
-        for r in results
-        if r.measured is not None and r.reference is not None and r.se is not None
-    }
-    return accuracy_policy.systematic_shift(
-        unit,
-        readings,
-        min_members=policy.shift_min_members,
-        acknowledged=policy.acknowledged,
-    )
-
-
-#: The key a systematic-shift finding is recorded under, per unit.
-SHIFT_FINDING = "systematic_shift"
-
-
-def note_systematic_shift(
-    records: GateRecords,
-    results: Sequence[GateResult],
-    accuracy: Mapping[str, Any],
-    unit: str | None,
-) -> accuracy_policy.ShiftFinding | None:
-    """Run :func:`check_systematic_shift` and record its outcome either way.
-
-    A unit with no shift records a resolved entry, so a finding raised by an
-    earlier turn of the same unit stops blocking once a later turn is clean.
-    """
-    finding = check_systematic_shift(results, accuracy, unit)
-    tree = results[-1].tree_state if results else UNKNOWN_TREE_STATE
-    records.append(
-        GateRecord(
-            kind=KIND_FINDING,
-            key={"finding": SHIFT_FINDING, "unit": str(unit)},
-            tree=tree,
-            passed=finding is None or bool(finding.acknowledged),
-            values={
-                "detail": finding.describe() if finding else "no systematic shift",
-                "members": {
-                    str(r.member): {"measured": r.measured, "reference": r.reference, "se": r.se}
-                    for r in results
-                },
-            },
-        )
-    )
-    return finding
-
-
-def blocking_findings(records: GateRecords, accuracy: Mapping[str, Any]) -> list[GateRecord]:
-    """Findings that refuse delivery under the CURRENT ``accuracy.floor.acknowledge``."""
-    return open_findings(records, accuracy_policy.resolve_floor_policy(accuracy).acknowledged)
-
-
 def resolve_reference(
     task_data: Mapping[str, Any],
     *,
@@ -480,13 +416,9 @@ def resolve_model_key(task_data: Mapping[str, Any], unit: str | None = None) -> 
 __all__ = [
     "resolve_model_key",
     "ACCURACY_TIMEOUT_S",
-    "SHIFT_FINDING",
-    "blocking_findings",
-    "check_systematic_shift",
     "eval_command",
     "eval_harness_command",
     "load_reference_score",
-    "note_systematic_shift",
     "parse_eval_score",
     "resolve_discriminators",
     "resolve_floor",

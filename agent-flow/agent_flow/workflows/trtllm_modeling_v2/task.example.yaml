@@ -171,13 +171,10 @@ accuracy:
 
   # `statistical` (default): reference - k x SE, the SE binomial over the benchmark's sample count
   # (0.75 points for GSM8K's 1319 questions at 92 %: k = 2 puts the floor 1.5 points down);
-  # `tolerance`: reference - `tolerance`. A unit gated at `shift_min_members` or more whose every
-  # member scores over 1 SE low is a FINDING, blocking delivery until `acknowledge` gives a reason.
+  # `tolerance`: reference - `tolerance`.
   # floor:
   #   rule: statistical
   #   k: 2.0                   # default
-  #   shift_min_members: 2     # default
-  #   acknowledge: {dspark: "every member -0.9..-1.1: drafter changes rounding, see 06-gates/..."}
 
   # In benchmark points; read only under `floor.rule: tolerance`. Default 5.0.
   tolerance: 5.0

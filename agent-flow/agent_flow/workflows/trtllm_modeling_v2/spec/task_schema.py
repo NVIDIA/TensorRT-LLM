@@ -282,8 +282,8 @@ BOOT_RENDERS: tuple[str, ...] = ("loader", "raw")
 # Serve defaults are derived from the declared sequence bound in derive_gate_defaults.
 SERVE_KEYS: tuple[str, ...] = ("enabled", "prompt", "max_tokens", "timeout")
 
-# Floor computation and systematic-shift findings are owned by checks/stats.py.
-FLOOR_KEYS: tuple[str, ...] = ("rule", "k", "shift_min_members", "acknowledge")
+# The floor itself is computed in checks/accuracy_policy.py.
+FLOOR_KEYS: tuple[str, ...] = ("rule", "k")
 
 ENVIRONMENT_KEYS: tuple[str, ...] = (
     "kind",
@@ -1044,18 +1044,6 @@ def _validate_floor(block: Mapping[str, Any], errors: list[str]) -> None:
         k = floor.get("k")
         if k is not None and (not _number(k) or k <= 0):
             errors.append(f"'{where}.k' must be a number > 0, got {k!r}")
-        members = floor.get("shift_min_members")
-        if members is not None and not _positive_int(members):
-            errors.append(f"'{where}.shift_min_members' must be an integer >= 1, got {members!r}")
-        acknowledge = floor.get("acknowledge")
-        if acknowledge is not None and (
-            not isinstance(acknowledge, dict)
-            or not all(isinstance(v, str) and v.strip() for v in acknowledge.values())
-        ):
-            errors.append(
-                f"'{where}.acknowledge' must map a unit to the reason its systematic shift "
-                f"is accepted, as a non-empty string"
-            )
     else:
         floor = {}
 

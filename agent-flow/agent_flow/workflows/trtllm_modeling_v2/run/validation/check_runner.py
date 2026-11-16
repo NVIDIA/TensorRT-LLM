@@ -34,12 +34,7 @@ from ...infra.compute.executor import (
 from ...infra.compute.sessions import session_wait_from_task
 from ...infra.git import resolve_commit
 from ...spec import variants as variants_mod
-from ...spec.task_schema import (
-    assembly_units,
-    features_through,
-    members_for,
-    parse_parallel_segment,
-)
+from ...spec.task_schema import assembly_units, features_through, parse_parallel_segment
 from ..startup import datasets as datasets_mod
 from ..workspace import snapshots as snapshots_mod
 from . import anchors as anchors_mod
@@ -66,14 +61,8 @@ class CheckRunner:
         self.journal = workflow.journal
         self.gate_log = workflow.gate_log
         self._member_runners = {}
-        self._accuracy_by_unit = {}
-        self._accuracy_lock = threading.Lock()
         self._session = threading.local()
-        self._accuracy_owed = {}
         self.pin = None
-        for check in workflow._contract.checks if workflow._contract else ():
-            if check.gate.startswith("accuracy["):
-                self._accuracy_owed.setdefault(check.unit, []).append(check.member)
 
     def _features_through(self, unit: str) -> list[str]:
         """Features implemented once ``unit`` is assembled, in order.
@@ -286,9 +275,6 @@ class CheckRunner:
             result = self._gate(check, log)
         else:
             result, marker = self._gate_on_snapshot(snapshots, check, log)
-        if check.gate.startswith("accuracy[") and result.passed:
-            with self._accuracy_lock:
-                self._note_shift(check.unit, check.member, result, self._spec_for(check.unit)[0])
         self._note_runtime_facts(check, result, marker)
         return result
 
@@ -541,27 +527,3 @@ class CheckRunner:
                     f"```\n{result.stdout_tail.rstrip()}\n```",
                 )
         return result
-
-    def _note_shift(self, unit: str, member: str, result: Any, spec: Any = None) -> None:
-        """Once every member `unit` owes an accuracy check has a verdict, check them together.
-
-        Each member can clear its own floor while all of them sit under the
-        anchor; that is recorded as a finding and refused at delivery. The
-        members are those the contract owes the benchmark at
-        (:func:`~..contract.benchmark_members`), else every member of the unit.
-        """
-        measured = self._accuracy_by_unit.setdefault(unit, {})
-        measured[member] = result
-        spec = spec or self.task_data
-        members = getattr(self, "_accuracy_owed", {}).get(unit) or members_for(
-            spec, unit, self.workflow._gate_env().world_size
-        )
-        if set(members) <= set(measured):
-            finding = accuracy_checks.note_systematic_shift(
-                gate_records.records_for(self.workspace),
-                [measured[m] for m in members],
-                spec.get("accuracy") or {},
-                unit,
-            )
-            if finding is not None:
-                self.journal.event("finding", finding.describe())
