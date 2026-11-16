@@ -707,7 +707,9 @@ is narrowed to the formats the MoE experts run as
 `quant_config_dict` experts module, read as model code reads it
 (`layerwise_moe_quant_config`), else the format model code runs experts
 without an entry as, which is `KIMI_K3_DEFAULT_ROUTED_QUANT_ALGO` on Kimi K3
-whatever its global format, and the global format elsewhere. So DeepSeek-V4's
+whatever its global format, and the global format elsewhere. DeepSeek-V4 and
+V4.1 leave their MTP layers' entries out first (`ModelConfig._without_mtp_layers`),
+since those layers select for themselves. So DeepSeek-V4's
 FP8 block-scale attention does not keep `deepgemm` from settling on
 `MEGAMOE_DEEPGEMM` for its MXFP4 experts, and `mega_moe` settles on it for Kimi
 K3's W4A16_MXFP4-parsed checkpoint too. `mega_moe` is `MEGAMOE_CUTEDSL` on
@@ -768,7 +770,9 @@ lazily, once an MXFP4 checkpoint is detected, so loading other checkpoints does
 not read the SM; an `AUTO` literal not resolved yet (`llm_utils`) names no
 implementation and takes the SM's first choice. `OVERRIDE_QUANT_ALGO` still
 takes precedence. Checkpoint parsing writes the target selection's format for
-the MTP layers too, so an MTP copy that selects for itself picks the format
+the MTP layers too (DeepSeek-V4 MTP experts stored in a layout of their own get
+the format an unpinned request picks, since a target's tactic need not run
+them), so an MTP copy that selects for itself picks the format
 again (`_mxfp4_run_quant_config`) in a `quant_config_dict` of its own. The
 embedded DSpark draft loads the target checkpoint, whose expert map describes
 the main layers, so `external_drafter_config_kwargs` loads it without the

@@ -414,7 +414,8 @@ class ModelConfig(Generic[TConfig]):
     # layer in a format it names no implementation of fails to build, unless
     # model code re-points the layer (Qwen3-Next and MuseSpark Open do for
     # quant-excluded target experts). Loading sets ``moe_backend`` to the one
-    # family it implies for the checkpoint (``pinned_moe_backend``).
+    # family it implies for the checkpoint (``pinned_moe_backend``), not
+    # counting DeepSeek-V4 and V4.1 MTP layers, which select for themselves.
     moe_tactic: Optional[str] = None
     # IF true, disables FC2+finalize fusion in CUTLASS MoE backend
     moe_disable_finalize_fusion: bool = False
@@ -1288,6 +1289,30 @@ class ModelConfig(Generic[TConfig]):
         return None
 
     @staticmethod
+    def _without_mtp_layers(
+            quant_config_dict: Optional[Dict[str, QuantConfig]],
+            num_hidden_layers: int) -> Optional[Dict[str, QuantConfig]]:
+        """``quant_config_dict`` without the entries of embedded MTP layers:
+        ``mtp.*`` keys and ``model.layers.{i}`` keys with ``i`` at or past
+        ``num_hidden_layers``, the index MTP layers take."""
+        if not quant_config_dict:
+            return quant_config_dict
+
+        def is_mtp(name: str) -> bool:
+            segments = name.split(".")
+            if segments[0] == "mtp":
+                return True
+            return (len(segments) > 2 and segments[:2] == ["model", "layers"]
+                    and segments[2].isdigit()
+                    and int(segments[2]) >= num_hidden_layers)
+
+        return {
+            name: quant_config
+            for name, quant_config in quant_config_dict.items()
+            if not is_mtp(name)
+        }
+
+    @staticmethod
     def _make_routed_experts_quant_config(
             layout: str,
             moe_request: Optional["MoEImplRequest"]) -> QuantConfig:
@@ -1394,41 +1419,58 @@ class ModelConfig(Generic[TConfig]):
         num_mtp = 0
         if (spec_config is not None
                 and spec_config.spec_dec_mode.is_mtp_one_model()):
+            # Unset only before the count is read from the checkpoint: V4's
+            # from_pretrained reads it before calling this, and V4.1, which
+            # does not, rejects one-model MTP when the model is built.
             num_mtp = spec_config.num_nextn_predict_layers or 0
+        mtp_experts_quant_config = experts_quant_config
+        mtp_layout = layout
         if num_mtp:
             mtp_layout = ModelConfig._detect_deepseek_v4_routed_moe_layout(
                 checkpoint_dir, _DEEPSEEK_V4_MTP_ROUTED_EXPERT_WEIGHT)
             if mtp_layout is None:
-                # Probe missed (unknown naming convention, MTP shard absent from
-                # the index, or an unexpected dtype/rank). Falling back to the
-                # dense config is exactly the failure this detection exists to
-                # prevent, so say so instead of failing later inside
-                # fused_moe load_quant_scales.
-                logger.warning(
-                    "DeepSeek-V4 MTP routed-expert layout could not be detected "
-                    f"from {_DEEPSEEK_V4_MTP_ROUTED_EXPERT_WEIGHT}; assuming the "
-                    f"dense layout ({layout}). If this checkpoint "
-                    "stores its MTP routed experts in a different format, "
-                    "loading will fail in fused_moe load_quant_scales.")
-                mtp_experts_quant_config = experts_quant_config
+                # Probe missed: the tensor is in no shard (another naming
+                # convention) or has an unexpected dtype or rank. The MTP
+                # layers keep the dense config, which fails in fused_moe
+                # load_quant_scales if their experts use another format.
+                mtp_layout = layout
+                logger.warning_once(
+                    "DeepSeek-V4 MTP routed-expert layout could not be "
+                    "detected from %s; assuming the dense layout (%s). If this "
+                    "checkpoint stores its MTP routed experts in a different "
+                    "format, loading will fail in fused_moe load_quant_scales.",
+                    _DEEPSEEK_V4_MTP_ROUTED_EXPERT_WEIGHT,
+                    layout,
+                    key=("deepseek_v4_mtp_layout_probe_missed", checkpoint_dir))
             elif mtp_layout != layout:
+                # A tactic pinned for the target names the target's
+                # implementations, which need not run this layout. The MTP
+                # layers then select their MoE for themselves
+                # (_draft_moe_selection) and write the run format that
+                # selection picks (_copy_mtp_model_config_with_moe_selection),
+                # so the entry stored here is the format an unpinned request
+                # picks, a placeholder until then.
+                mtp_request = (None if moe_request is not None
+                               and moe_request.pinned else moe_request)
                 mtp_experts_quant_config = (
                     ModelConfig._make_routed_experts_quant_config(
-                        mtp_layout, moe_request))
-                logger.info(
-                    f"DeepSeek-V4 MTP routed experts use a different layout "
-                    f"({mtp_layout}) than the dense experts ({layout}).")
-            else:
-                mtp_experts_quant_config = experts_quant_config
+                        mtp_layout, mtp_request))
             for i in range(num_mtp):
                 layer_quant_config[
                     f"model.layers.{num_hidden + i}.mlp.experts"] = (
                         mtp_experts_quant_config)
 
-        logger.info(
-            "Detected DeepSeek-V4 routed MoE %s checkpoint layout; using "
-            "%s for routed experts.", layout.upper(),
-            experts_quant_config.quant_algo)
+        if mtp_layout == layout:
+            logger.info(
+                "Detected DeepSeek-V4 routed MoE %s checkpoint layout; using "
+                "%s for routed experts.", layout.upper(),
+                experts_quant_config.quant_algo)
+        else:
+            logger.info(
+                "Detected DeepSeek-V4 routed MoE %s checkpoint layout with "
+                "%s MTP routed experts; using %s for the target's routed "
+                "experts.", layout.upper(), mtp_layout.upper(),
+                experts_quant_config.quant_algo)
         return layer_quant_config
 
     @staticmethod
@@ -2211,9 +2253,18 @@ class ModelConfig(Generic[TConfig]):
             # The literal model code is built for, derived from the tactic
             # (see MoEImplRequest.backend_for). The Mistral config loader
             # (checkpoints/mistral/config_loader.py) repeats this derivation.
-            moe_backend = moe_selection.resolve_backend(architecture,
-                                                        quant_config,
-                                                        layer_quant_config)
+            tactic_layer_quant_config = layer_quant_config
+            if (architecture in _DEEPSEEK_V4_ARCHITECTURES
+                    or architecture in _DEEPSEEK_V41_ARCHITECTURES):
+                # The tactic pins the target's layers only; the MTP layers
+                # select their MoE for themselves (_draft_moe_selection), and
+                # their experts can run another format than the dense ones
+                # (_set_deepseek_v4_routed_moe_quant_config), which must not
+                # widen the tactic's family.
+                tactic_layer_quant_config = cls._without_mtp_layers(
+                    layer_quant_config, pretrained_config.num_hidden_layers)
+            moe_backend = moe_selection.resolve_backend(
+                architecture, quant_config, tactic_layer_quant_config)
         kwargs['moe_backend'] = moe_backend
         kwargs['moe_backend_requested'] = requested_moe_backend
 
