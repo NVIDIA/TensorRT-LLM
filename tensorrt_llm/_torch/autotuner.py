@@ -441,10 +441,7 @@ def autotune(tune_mode: bool = True,
             # save cache
             if cache_path is not None:
                 logger.info(f"[Autotuner] Saving cache to {cache_path}")
-                autotuner.profiling_cache.save_cache(
-                    cache_path,
-                    rank,
-                    write_shared=autotuner._writes_shared_cache())
+                autotuner.profiling_cache.save_cache(cache_path, rank)
         finally:
             # Restore the singleton's prior distributed state (see enter) so the
             # temporary full-world state does not persist past this context.
@@ -576,16 +573,15 @@ def _exclusive_cache_lock(lock_path: Path, timeout: float) -> Iterator[bool]:
     """Hold the POSIX lock on `lock_path` that serializes cache writers.
 
     Yields False, without the lock, if another process holds it for `timeout`
-    seconds.
+    seconds. Closing the file releases the lock.
     """
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
-    try:
+    with open(lock_path, "a") as lock_file:
         deadline = time.monotonic() + timeout
         delay = 0.05
         while True:
             try:
-                fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.lockf(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
             except OSError as e:
                 # A lock held elsewhere fails with EACCES or EAGAIN.
@@ -597,12 +593,7 @@ def _exclusive_cache_lock(lock_path: Path, timeout: float) -> Iterator[bool]:
                 return
             time.sleep(min(delay, remaining))
             delay = min(2 * delay, 1.0)
-        try:
-            yield True
-        finally:
-            fcntl.lockf(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
+        yield True
 
 
 class AutoTunerProfilingCache:
@@ -777,41 +768,40 @@ class AutoTunerProfilingCache:
 
         return shared_cache, rank_cache
 
-    def save_cache(self,
-                   file_path: Union[str, Path],
-                   rank: int,
-                   write_shared: bool = True) -> None:
+    def save_cache(self, file_path: Union[str, Path], rank: int) -> None:
         """Merge this cache into the JSON file at `file_path`.
 
         INDEPENDENT ops go to the `rank_{rank}` section, other ops to the shared
-        section, and excluded ops are dropped. Writers serialize on a lock file
-        and merge rather than replace, so entries another process saved since
-        this one loaded are kept. A save that adds nothing takes no lock and
-        writes nothing; one that cannot take the lock within
-        TLLM_AUTOTUNER_CACHE_LOCK_TIMEOUT seconds is skipped with a warning.
-
-        Args:
-            write_shared: Whether to save the shared section. Ranks that hold
-                the same shared entries leave it to one of them.
+        section, and excluded ops are dropped. A save with no entries to persist
+        returns at once; one whose entries the file holds already takes no lock
+        and writes nothing. Otherwise it re-reads the file under a lock, keeping
+        what other processes saved meanwhile, merges and replaces the file by
+        rename; a corrupt file is replaced. A save that hits an I/O error, or
+        cannot take the lock within TLLM_AUTOTUNER_CACHE_LOCK_TIMEOUT seconds,
+        is skipped with a warning and leaves the file as it was.
         """
         file_path = Path(file_path)
+        shared_cache, rank_cache = self._partition_cache_by_strategy()
+        sections = {}
+        if shared_cache:
+            sections[self.SHARED_CACHE_KEY] = self._serialize_cache_data(
+                shared_cache)
+        if rank_cache:
+            sections[f"rank_{rank}"] = self._serialize_cache_data(rank_cache)
+        if not sections:
+            return
         try:
-            shared_cache, rank_cache = self._partition_cache_by_strategy()
-            sections = {f"rank_{rank}": self._serialize_cache_data(rank_cache)}
-            if write_shared:
-                sections[self.SHARED_CACHE_KEY] = self._serialize_cache_data(
-                    shared_cache)
-            try:
-                on_disk = self._read_cache_file(file_path) or {}
-            except OSError:
-                # An unlocked read can race a rename; the locked read decides.
-                on_disk = {}
-            if not any(sections.values()) or not self._merge_sections(
-                    on_disk, sections):
-                logger.info(f"[AutoTuner] Nothing new to save to {file_path}")
-                return
+            saved = self._holds_sections(self._read_cache_file(file_path),
+                                         sections)
+        except (OSError, ValueError):
+            # The locked read below handles such a file.
+            saved = False
+        if saved:
+            logger.info(f"[AutoTuner] Nothing new to save to {file_path}")
+            return
 
-            timeout = _cache_lock_timeout()
+        timeout = _cache_lock_timeout()
+        try:
             with _exclusive_cache_lock(self._lock_path_for(file_path),
                                        timeout) as locked:
                 if not locked:
@@ -820,17 +810,27 @@ class AutoTunerProfilingCache:
                         f"another process held its lock for {timeout:g} s "
                         f"({_CACHE_LOCK_TIMEOUT_ENV})")
                     return
-                current_cache = self._read_cache_file(file_path) or {
-                    "metadata": self._serialize_metadata()
-                }
-                if self._merge_sections(current_cache, sections):
-                    self._atomic_write_json(file_path, current_cache)
-            logger.info(
-                f"[AutoTuner] Successfully saved cache to {file_path} using JSON format"
-            )
-        except Exception as e:
-            logger.error(f"[AutoTuner] Failed to save cache with JSON: {e}")
-            raise
+                try:
+                    cache_file = self._read_cache_file(file_path)
+                except ValueError as e:
+                    logger.warning(f"[AutoTuner] Replacing the corrupt cache "
+                                   f"file {file_path}: {e!r}")
+                    cache_file = {}
+                if self._holds_sections(cache_file, sections):
+                    # Another process saved the same entries meanwhile.
+                    return
+                cache_file.setdefault("metadata", self._serialize_metadata())
+                for name, entries in sections.items():
+                    cache_file.setdefault(name, {}).update(entries)
+                self._atomic_write_json(file_path, cache_file)
+        except OSError as e:
+            # The entries stay in memory for this process's next save.
+            logger.warning(
+                f"[AutoTuner] Skipped saving the cache to {file_path}: {e!r}")
+            return
+        logger.info(
+            f"[AutoTuner] Successfully saved cache to {file_path} using JSON format"
+        )
 
     @staticmethod
     def _lock_path_for(file_path: Path) -> Path:
@@ -838,37 +838,35 @@ class AutoTunerProfilingCache:
         return file_path.with_name(file_path.name + ".lock")
 
     @staticmethod
-    def _merge_sections(cache_file: Dict[str, Any],
+    def _holds_sections(cache_file: Dict[str, Any],
                         sections: Dict[str, Dict[str, Any]]) -> bool:
-        """Merge `sections` into `cache_file`; return whether it changed."""
-        changed = False
-        for name, entries in sections.items():
-            on_disk = cache_file.setdefault(name, {})
-            for key, value in entries.items():
-                if on_disk.get(key) != value:
-                    on_disk[key] = value
-                    changed = True
-        return changed
+        """Whether `cache_file` already holds every entry of `sections`."""
+        return all(
+            cache_file.get(name, {}).get(key) == value
+            for name, entries in sections.items()
+            for key, value in entries.items())
 
-    @staticmethod
-    def _read_cache_file(file_path: Path) -> Optional[Dict[str, Any]]:
-        """Parse the cache file; None if it is missing, empty or unparsable.
+    @classmethod
+    def _read_cache_file(cls, file_path: Path) -> Dict[str, Any]:
+        """Parse the cache file; empty if it is missing or empty.
 
-        Writers replace the file by rename, so reading needs no lock. A file
-        torn by a crash or by an older in-place writer is ignored.
+        Writers replace the file by rename, so reading needs no lock. Raises
+        OSError if the file cannot be read (after `_read_cache_text` retries
+        stale NFS handles) and ValueError if it is corrupt, e.g. torn by a crash.
         """
         try:
             content = _read_cache_text(file_path)
         except FileNotFoundError:
-            return None
+            return {}
         if not content.strip():
-            return None
-        try:
-            return json.loads(content)
-        except json.JSONDecodeError as e:
-            logger.warning(f"[AutoTuner] Ignoring unparsable cache file "
-                           f"{file_path}: {e!r}")
-            return None
+            return {}
+        cache_file = json.loads(content)
+        if not isinstance(cache_file, dict) or not all(
+                isinstance(section, dict)
+                for name, section in cache_file.items() if name in
+            ("metadata", cls.SHARED_CACHE_KEY) or name.startswith("rank_")):
+            raise ValueError("not a JSON object of cache sections")
+        return cache_file
 
     @staticmethod
     def _atomic_write_json(file_path: Path, payload: Dict[str, Any]) -> None:
@@ -878,32 +876,37 @@ class AutoTunerProfilingCache:
         """
         tmp_path = file_path.with_name(
             f".{file_path.name}.tmp.{os.getpid()}.{time.time_ns()}")
-        with open(tmp_path, "w") as f:
-            json.dump(payload, f, indent=2, default=str)
-        os.rename(tmp_path, file_path)
+        try:
+            with open(tmp_path, "w") as f:
+                json.dump(payload, f, indent=2, default=str)
+            os.rename(tmp_path, file_path)
+        except OSError:
+            with contextlib.suppress(OSError):
+                tmp_path.unlink()
+            raise
 
     def load_cache(self, file_path: Union[str, Path], rank: int) -> None:
         """Merge the file's shared and `rank_{rank}` entries into this cache.
 
         Takes no lock, as writers replace the file by rename. The file wins on a
         key both hold; entries the file lacks, e.g. after a skipped save, are
-        kept. An empty, unreadable or unparsable file is ignored.
+        kept. A file that cannot be read or parsed is skipped with a warning.
 
         Raises:
             FileNotFoundError: If cache file doesn't exist
         """
         file_path = Path(file_path)
-        if not file_path.exists():
-            raise FileNotFoundError(f"Cache file not found: {file_path}")
-
         try:
-            current_cache_contents = self._read_cache_file(file_path)
-        except OSError as e:
-            # An unlocked read can race a rename (NFS ESTALE) or fail on I/O.
+            exists = file_path.exists()
+            current_cache_contents = (self._read_cache_file(file_path)
+                                      if exists else {})
+        except (OSError, ValueError) as e:
             logger.warning(
-                f"[AutoTuner] Not loading the cache at {file_path}: {e!r}")
+                f"[AutoTuner] Not loading the cache file {file_path}: {e!r}")
             return
-        if current_cache_contents is None:
+        if not exists:
+            raise FileNotFoundError(f"Cache file not found: {file_path}")
+        if not current_cache_contents:
             return
         try:
             self._deserialize_metadata(
@@ -2776,13 +2779,6 @@ class AutoTuner:
             missed.update(key for key, hit in zip(rank_keys, rank_hits)
                           if not hit)
         return [key not in missed for key in keys]
-
-    def _writes_shared_cache(self) -> bool:
-        """Whether this rank saves the shared cache section.
-
-        Ranks of one tuning group hold the same shared entries.
-        """
-        return not self._is_distributed() or self._tuning_group()[1] == 0
 
     def _parallel_deal_start(self, custom_op: str, profile: OptimizationProfile,
                              strategy: DistributedTuningStrategy) -> int:

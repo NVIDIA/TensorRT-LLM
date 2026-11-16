@@ -2400,13 +2400,9 @@ def _save_and_load_while_peers_do(cache_path, rank, num_procs):
     for i in range(_CACHE_IO_ROUNDS):
         rank_key = (rank_op, "Runner", "()", ((rank, i), ))
         cache.cache[rank_key] = (0, i, 1.0)
-        # Every process holds the same merged entry; one of them saves it.
+        # Every process holds the same merged entry.
         cache.cache[(shared_op, "Runner", "()", ((i, ), ))] = (0, i, 1.0)
-        if rank != 0:
-            # Must not reach the file: only rank 0 writes the shared section.
-            extra_key = (shared_op, "Runner", "()", ((-rank, i), ))
-            cache.cache[extra_key] = (0, 0, 1.0)
-        cache.save_cache(cache_path, rank, write_shared=rank == 0)
+        cache.save_cache(cache_path, rank)
         reloaded = autotuner.AutoTunerProfilingCache()
         reloaded.load_cache(cache_path, rank)
         assert reloaded.cache[rank_key] == (0, i, 1.0)
@@ -2488,6 +2484,96 @@ def test_cache_save_is_skipped_while_another_process_holds_the_lock(
     reloaded.load_cache(path, rank=0)
     assert reloaded.cache[new_key] == (0, 2, 2.0)
     assert skips() == 1
+
+
+def _tune_gemm_with_cache(cache_path):
+    """One autotune() session that tunes a GEMM and saves to `cache_path`."""
+    with autotune(cache_path=str(cache_path)):
+        _, tactic = AutoTuner.get().choose_one(
+            "autotuner_test::cached_gemm", [GemmRunner()], TuningConfig(),
+            [torch.randn(M, 64), torch.randn(64, 128)])
+    return tactic
+
+
+@pytest.mark.parametrize("damage", ["corrupt", "unreadable"])
+def test_bad_cache_file_does_not_fail_load_tune_save(tmp_path, monkeypatch,
+                                                     damage):
+    """Load, tune and save over a corrupt or unreadable cache file raise
+    nothing: the save replaces a corrupt file and leaves an unreadable one."""
+    cache_path = tmp_path / "cache.json"
+    on_disk = autotuner.AutoTunerProfilingCache()
+    on_disk.cache[("autotuner_test::saved_gemm", "Runner", "()",
+                   ((1, ), ))] = (0, 1, 1.0)
+    if damage == "corrupt":
+        cache_path.write_bytes(b'\xff\xfe{"torn')
+    else:
+        on_disk.save_cache(cache_path, rank=0)
+    AutoTuner.get().clear_cache()
+    with monkeypatch.context() as patch:
+        if damage == "unreadable":
+
+            def read_fails(file_path, attempts=5):
+                raise OSError(errno.EIO, os.strerror(errno.EIO), file_path)
+
+            patch.setattr(autotuner, "_read_cache_text", read_fails)
+        tactic = _tune_gemm_with_cache(cache_path)
+
+    reloaded = autotuner.AutoTunerProfilingCache()
+    reloaded.load_cache(cache_path, rank=0)
+    if damage == "corrupt":
+        assert [entry[1] for entry in reloaded.cache.values()] == [tactic]
+    else:
+        # An I/O error must not cost the file the entries it holds.
+        assert reloaded.cache == on_disk.cache
+
+
+def test_saves_with_nothing_new_write_nothing(tmp_path):
+    """A session with nothing to persist creates no files, and one whose
+    entries are all on disk leaves the file alone."""
+    cache_path = tmp_path / "cache" / "cache.json"
+    AutoTuner.get().clear_cache()
+    with autotune(cache_path=str(cache_path)):
+        pass
+    assert not cache_path.parent.exists()
+
+    _tune_gemm_with_cache(cache_path)
+    saved = cache_path.stat()
+    _tune_gemm_with_cache(cache_path)
+    now = cache_path.stat()
+    assert (now.st_ino, now.st_mtime_ns) == (saved.st_ino, saved.st_mtime_ns)
+
+
+def _tune_with_node_local_cache(cache_dir):
+    """Tune a MERGE op; each rank saves to its own file, as on local disks."""
+    rank = tensorrt_llm.mpi_rank()
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    tuner.setup_distributed_state(Mapping(world_size=2, rank=rank, tp_size=2))
+    config = TuningConfig(
+        distributed_tuning_strategy=DistributedTuningStrategy.MERGE)
+    inputs = [
+        torch.randn(16, 32, device='cuda'),
+        torch.randn(32, 64, device='cuda')
+    ]
+    cache_path = os.path.join(cache_dir, f"node_{rank}", "cache.json")
+    with autotune(cache_path=cache_path):
+        tuner.choose_one(custom_op="autotuner_test::node_local_cache",
+                         runners=[DistributedGemmRunner()],
+                         tuning_config=config,
+                         inputs=inputs)
+    return True
+
+
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_shared_tactics_reach_every_node_local_cache(tmp_path,
+                                                     mpi_pool_executor):
+    """With a cache path local to each node, every node's file gets the
+    tuning group's shared tactics."""
+    assert all(
+        mpi_pool_executor.map(_tune_with_node_local_cache, [str(tmp_path)] * 2))
+    files = [tmp_path / f"node_{rank}" / "cache.json" for rank in range(2)]
+    shared = [json.loads(f.read_text()).get("shared") for f in files]
+    assert shared[0] and shared[0] == shared[1]
 
 
 def _post_tune_merge_worker(world_size):
