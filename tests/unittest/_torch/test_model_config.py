@@ -652,10 +652,22 @@ def test_a_tactic_on_kimi_k3_follows_the_format_its_experts_run_as(quant_config_
     )
 
 
+def test_a_tactic_on_unquantized_experts_follows_the_bf16_mega_moe_leaf():
+    """The unquantized MegaMoE CuteDSL leaf serves BF16 experts, so ``mega_moe`` pins its family."""
+    assert (
+        ModelConfig.pinned_moe_backend(
+            "mega_moe", QuantConfig(), None, architecture="NemotronHForCausalLM"
+        )
+        == "MEGAMOE_CUTEDSL"
+    )
+
+
 @pytest.mark.parametrize(
     "quant_config, architecture",
     [
-        pytest.param(QuantConfig(), "LlamaForCausalLM", id="dense"),
+        pytest.param(
+            QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES), "LlamaForCausalLM", id="dense"
+        ),
         pytest.param(_K3_CHECKPOINT, "Qwen3MoeForCausalLM", id="unserved_format"),
     ],
 )
