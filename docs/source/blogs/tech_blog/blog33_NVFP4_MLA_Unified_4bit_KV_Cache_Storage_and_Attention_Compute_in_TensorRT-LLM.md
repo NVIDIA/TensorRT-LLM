@@ -94,7 +94,7 @@ Figure 1 shows the decode dataflow of NVFP4 MLA. The shared cache holds the late
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog31_dataflow.svg" width="1000">
+  <img src="../media/tech_blog33_dataflow.svg" width="1000">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 1: Decode dataflow of NVFP4 MLA. The shared NVFP4 cache holds the NoPE and RoPE channels plus an FP4 residual for RoPE. BMM1 (QK) and BMM2 (PV) both multiply FP4 operands on FP4 Tensor Cores and accumulate in FP32. Online softmax turns the scores into FP4 weights for BMM2, and the output is normalized in FP32. BMM2 reads the same FP4 values and scales as BMM1, in a transposed view and without requantization.</em></sub></p>
@@ -124,7 +124,7 @@ where $C_R$ is the RoPE part of the cache, $\widehat C_R$ its NVFP4 base, and $\
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog31_rope_residual.svg" width="800">
+  <img src="../media/tech_blog33_rope_residual.svg" width="800">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 2: Cache layout of one token. The NoPE base (B<sub>N</sub>) and the RoPE base (B<sub>R</sub>) form the base NVFP4 latent; the RoPE residual (E<sub>R</sub>) is a second FP4 component for the 64 RoPE channels only. Each component stores E2M1 values with its own E4M3 block scales.</em></sub></p>
@@ -143,7 +143,7 @@ NVFP4 MLA instead quantizes the NoPE latent in **16×16 blocks of 16 tokens by 1
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog31_2d_blocks.svg" width="1000">
+  <img src="../media/tech_blog33_2d_blocks.svg" width="1000">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 3: (a) The shared MLA cache: K uses all 576 channels and V uses the 512 NoPE channels. (b) BMM1 reduces over channels and (c) BMM2 reduces over tokens. (d) With per-token 1×16 blocks, BMM2 needs a dequantize, regroup and requantize pass that rounds the values a second time. (e) With 16×16 blocks, one scale covers 16 values in both directions, so both BMMs use the same FP4 values and scales.</em></sub></p>
@@ -178,7 +178,7 @@ A fast kernel is only part of the work. The FP4 cache also has to be written dur
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog31_system.svg" width="1000">
+  <img src="../media/tech_blog33_system.svg" width="1000">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 4: A request in disaggregated serving with NVFP4 MLA. The context worker runs FP8 context attention and writes completed 16-token blocks into the paged NVFP4 cache. Only the canonical state, together with a small BF16 tail, is transferred. The generation worker rebuilds the BMM2 view from the imported pages and decodes with FP4 attention, keeping the newest tokens of each request in a BF16 tail until their block is complete.</em></sub></p>
@@ -380,7 +380,7 @@ We measure the throughput-latency trade-off of disaggregated DeepSeek-R1 serving
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog31_pareto.svg" width="1000">
+  <img src="../media/tech_blog33_pareto.svg" width="1000">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 5: Measured throughput and per-user generation rate of disaggregated DeepSeek-R1 serving with MTP=3 on Rubin GPUs, for (a) 8K/16K Reasoning with about 8K input and 16K output tokens per request and (b) the MLPerf DeepSeek-R1 dataset. Marker shapes give the generation layout, lines give each precision's envelope over the layouts, and faded points lie below the envelope of their precision. Throughput counts all context and generation GPUs.</em></sub></p>
