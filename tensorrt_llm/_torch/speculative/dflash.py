@@ -2450,10 +2450,15 @@ class DFlashWorker(SpecWorkerBase):
                     if (
                         self.guided_decoder is not None
                         and self._guided_draft_loop
+                        and spec_metadata.use_rejection_sampling
                         and K == self.max_draft_len
                     ):
-                        # The loop's step 0 / step K-1 roll the matcher back,
-                        # so it is only valid for a full-length block.
+                        # Rejection sampling needs the draft distribution q to
+                        # be the grammar-masked proposal; strict acceptance
+                        # does not, and the loop costs a host round-trip per
+                        # draft position. The loop's step 0 / step K-1 roll the
+                        # matcher back, so it is only valid for a full-length
+                        # block.
                         gen_draft_tokens = self._sample_draft_tokens_guided(
                             gen_logits,
                             spec_metadata,

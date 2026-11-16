@@ -15,6 +15,7 @@
 import asyncio
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Optional
@@ -34,7 +35,8 @@ from tensorrt_llm._torch.model_config import MoeLoadBalancerConfig
 # isort: off
 from tensorrt_llm.llmapi import (
     AttentionDpConfig, BlockReuseConfig, CudaGraphConfig, DFlashDecodingConfig,
-    DSparkDecodingConfig, Eagle3DecodingConfig, KvCacheConfig, MambaStateConfig,
+    DSparkDecodingConfig, Eagle3DecodingConfig, GuidedDecodingParams,
+    KvCacheConfig, MambaStateConfig,
     MiniMaxM3SparseAttentionConfig, MoeConfig, MTPDecodingConfig,
     PrefillCudaGraphBackend, QSASparseAttentionConfig, SamplingParams,
     SchedulerConfig, SkipSoftmaxAttentionConfig, SAEnhancerConfig,
@@ -3368,6 +3370,42 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                   f"= {acceptance_length:.3f}")
             assert_acceptance_length("TestQwen3_8B::test_dspark",
                                      acceptance_length)
+
+    @skip_pre_blackwell
+    @pytest.mark.parametrize("use_rejection_sampling", [False, True])
+    def test_dspark_guided_decoding(self, use_rejection_sampling):
+        """Standalone DSpark with a grammar: every output matches the regex.
+
+        Sampling at temperature > 0 so rejection sampling is exercised; the
+        draft and target distributions are both grammar-masked.
+        """
+        dspark_model_dir = (
+            f"{llm_models_root()}/dspark/dspark_qwen3_8b_block7")
+        target_model_dir = f"{llm_models_root()}/Qwen3/Qwen3-8B"
+        pattern = r"(red|green|blue) (cat|dog){2,4}[0-9]{3}"
+        spec_config = DSparkDecodingConfig(
+            max_draft_len=7,
+            speculative_model=dspark_model_dir,
+            attention_backend="TRTLLM",
+            use_rejection_sampling=use_rejection_sampling)
+        with LLM(target_model_dir,
+                 max_batch_size=8,
+                 cuda_graph_config=CudaGraphConfig(max_batch_size=8,
+                                                   enable_padding=True),
+                 kv_cache_config=KvCacheConfig(enable_block_reuse=False,
+                                               free_gpu_memory_fraction=0.6),
+                 guided_decoding_backend="xgrammar",
+                 speculative_config=spec_config) as llm:
+            outputs = llm.generate(
+                ["Pick a colour and some animals:"] * 16,
+                sampling_params=SamplingParams(
+                    max_tokens=32,
+                    temperature=0.8,
+                    top_p=0.95,
+                    guided_decoding=GuidedDecodingParams(regex=pattern)),
+                use_tqdm=False)
+        for output in outputs:
+            assert re.fullmatch(pattern, output.outputs[0].text)
 
     @skip_pre_blackwell
     @pytest.mark.parametrize("tp_size,pp_size,ep_size,attention_dp",
