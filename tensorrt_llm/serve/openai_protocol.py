@@ -48,7 +48,7 @@ from openai.types.responses.tool import Tool
 from openai.types.shared import Metadata, Reasoning
 from openai_harmony import ReasoningEffort
 from pydantic import (AliasChoices, BaseModel, ConfigDict, Field,
-                      NonNegativeInt, PositiveInt, field_validator,
+                      NonNegativeInt, PositiveInt, PrivateAttr, field_validator,
                       model_serializer, model_validator)
 from typing_extensions import Annotated, Required, TypeAlias, TypedDict
 
@@ -377,6 +377,21 @@ class ConversationParams(OpenAIBaseModel):
         description=("Server-private parent-session id for sub-agent routing "
                      "affinity; forwarded to workers as a header, never in the "
                      "body."))
+
+    # The server generated conversation_id for one request; it never recurs.
+    _generated_for_one_request: bool = PrivateAttr(default=False)
+
+    @classmethod
+    def for_one_request(cls, conversation_id: str) -> "ConversationParams":
+        """Params with a ``conversation_id`` generated for one request."""
+        params = cls(conversation_id=conversation_id)
+        params._generated_for_one_request = True
+        return params
+
+    @property
+    def generated_for_one_request(self) -> bool:
+        """Whether ``conversation_id`` was generated for one request."""
+        return self._generated_for_one_request
 
     @field_validator("conversation_id", mode="before")
     @classmethod

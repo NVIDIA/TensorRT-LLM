@@ -235,6 +235,18 @@ class Distributed(ABC):
             return None
         return self.broadcast(obj, root=root)
 
+    def broadcast_or_none_with_header(self, obj, header: list[int], root=0):
+        """``broadcast_or_none`` plus a fixed-size int64 ``header`` that rides
+        with the "anything?" word, so it costs no extra round.
+
+        ``header`` holds the root's values; other ranks pass a placeholder of
+        the same length. Returns ``(root's header, root's object or None)``.
+        """
+        values = self.broadcast_int64([int(obj is not None), *header],
+                                      root=root)
+        received = self.broadcast(obj, root=root) if values[0] else None
+        return [int(v) for v in values[1:]], received
+
     @abstractmethod
     def allgather(self, obj, root=0):
         pass
@@ -1383,7 +1395,8 @@ class TorchDist(Distributed):
                                obj,
                                pg,
                                root: int,
-                               allow_none: bool = False):
+                               allow_none: bool = False,
+                               header: Optional[list[int]] = None):
         """Broadcast a pickled object through CUDA staging.
 
         The root does not wait for the current call: size and payload are
@@ -1404,11 +1417,16 @@ class TorchDist(Distributed):
         every rank then skips the payload round and returns ``None``.
         Unambiguous because pickle never yields 0 bytes; without the flag
         ``None`` pickles like any other object.
+
+        ``header``: int64 values (the root's; a same-length placeholder
+        elsewhere) sent in the size word's tensor; the call then returns
+        ``(root's header, object)``.
         """
         is_root = torch.distributed.get_rank() == root
         with self._cuda_obj_guard(), self._cuda_obj_stream_ctx():
             staging = self._cuda_obj_staging_for(pg)
-            size = staging["bcast_size"]
+            size, pinned_size = self._cuda_bcast_size_buffers(
+                staging, 1 + (len(header) if header is not None else 0))
             if is_root:
                 if allow_none and obj is None:
                     data = b""
@@ -1421,8 +1439,10 @@ class TorchDist(Distributed):
                     # by stream order, the call before that's broadcast
                     # kernels -- see the docstring).
                     fence.synchronize()
-                pinned_size = staging["bcast_pinned_size"]
                 pinned_size[0] = nbytes
+                if header is not None:
+                    pinned_size[1:].copy_(
+                        torch.as_tensor(header, dtype=torch.int64))
                 size.copy_(pinned_size, non_blocking=True)
                 buf = None
                 if nbytes:
@@ -1442,15 +1462,33 @@ class TorchDist(Distributed):
                 dist.broadcast(size, src=root, group=pg)
                 if buf is not None:
                     dist.broadcast(buf, src=root, group=pg)
-                return obj
+                return obj if header is None else (list(header), obj)
             dist.broadcast(size, src=root, group=pg)
-            nbytes = int(size.cpu())
+            received_size = size.cpu().tolist()
+            nbytes = received_size[0]
             if nbytes == 0:
-                return None
+                return None if header is None else (received_size[1:], None)
             buf = torch.empty(nbytes, dtype=torch.uint8, device="cuda")
             dist.broadcast(buf, src=root, group=pg)
             data = buf.cpu()
-        return pickle.loads(data.numpy().tobytes())  # nosec B301
+        received = pickle.loads(data.numpy().tobytes())  # nosec B301
+        return received if header is None else (received_size[1:], received)
+
+    @staticmethod
+    def _cuda_bcast_size_buffers(staging: dict, width: int):
+        """The CUDA size word of a broadcast and its pinned host mirror: the
+        single word, or ``width`` words when a header rides along."""
+        if width == 1:
+            return staging["bcast_size"], staging["bcast_pinned_size"]
+        key = ("bcast_header", width)
+        buffers = staging.get(key)
+        if buffers is None:
+            buffers = (torch.empty(width, dtype=torch.int64, device="cuda"),
+                       torch.empty(width,
+                                   dtype=torch.int64,
+                                   pin_memory=prefer_pinned()))
+            staging[key] = buffers
+        return buffers
 
     @log_op
     def broadcast(self, obj, root=0, prefer_cpu=False):
@@ -1495,6 +1533,17 @@ class TorchDist(Distributed):
                                                root,
                                                allow_none=True)
         return super().broadcast_or_none(obj, root=root)
+
+    @log_op
+    def broadcast_or_none_with_header(self, obj, header: list[int], root=0):
+        vote_pg = self._cuda_obj_pg("world") if mpi_disabled() else None
+        if vote_pg is not None:
+            return self._cuda_broadcast_object(obj,
+                                               vote_pg,
+                                               root,
+                                               allow_none=True,
+                                               header=header)
+        return super().broadcast_or_none_with_header(obj, header, root=root)
 
     @log_op
     def allgather(self, obj):
