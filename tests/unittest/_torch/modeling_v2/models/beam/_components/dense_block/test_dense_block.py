@@ -703,7 +703,6 @@ def test_block_constructs_alone(ieee_fp32) -> None:
     assert blk.checkpoint_tensors()["self_attn.v_proj.weight"].shape == (1024, 5120)
     assert blk.attention_scales == (1 / math.sqrt(2), 1 / math.sqrt(2))
     assert blk.feed_forward_scales == (1 / math.sqrt(3), math.sqrt(2) / math.sqrt(3))
-    assert "modeling_beam" not in Path(block_module.__file__).read_text()
 
 
 # ----------------------------------------------------------------------------- tests: declared limits

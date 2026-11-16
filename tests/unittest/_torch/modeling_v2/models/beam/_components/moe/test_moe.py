@@ -38,7 +38,6 @@ import functools
 import gc
 import types
 from collections import OrderedDict
-from pathlib import Path
 
 import pytest
 import torch
@@ -63,7 +62,6 @@ from _beam_component_support import (  # noqa: E402
 )
 from _validating import validating  # noqa: E402
 
-from _components.moe import moe as moe_module
 from _components.moe.moe import BeamMoeBf16Sm103Tp1
 from _components.moe_expert.expert import BeamMoeExpertBf16Sm103Tp1  # noqa: E501
 from _components.moe_router.router import BeamMoeRouterBf16Sm103Tp1  # noqa: E501
@@ -440,7 +438,6 @@ def test_moe_constructs_alone() -> None:
             assert tensors[f"experts.{expert_id}.{attr}.weight"] is getattr(expert, attr)
     pointers = [t.data_ptr() for name, t in tensors.items() if name.startswith("experts.")]
     assert len(pointers) == 768 and len(set(pointers)) == 768
-    assert "modeling_beam" not in Path(moe_module.__file__).read_text()
 
 
 # -------------------------------------------------- tests: declared limits

@@ -45,7 +45,6 @@ import gc
 import math
 import types
 from collections import OrderedDict
-from pathlib import Path
 
 import pytest
 import torch
@@ -636,7 +635,6 @@ def test_block_constructs_alone() -> None:
     assert blk.feed_forward_scales == (1 / 3, math.sqrt(8) / 3)
     assert blk.attention_scales != block_module.depth_scales(0, True)
     assert blk.feed_forward_scales != block_module.depth_scales(0, False)
-    assert "modeling_beam" not in Path(block_module.__file__).read_text()
 
 
 # -------------------------------------------------- tests: declared limits

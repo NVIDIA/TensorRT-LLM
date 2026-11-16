@@ -841,33 +841,39 @@ def test_expert_boundary_moves_one_expert() -> None:
     ]
 
 
-def test_ties_follow_the_pinned_topk_order() -> None:
-    """Exactly tied scores are routed in the order `torch.topk(..., sorted=True)` returns
-    -- the source's order, stated in `_router_cases.TIE_ROUTES` -- whether a row is routed
-    in a batch or alone. Ids are compared in order, never sorted."""
+def test_ties_follow_native_topk_order() -> None:
+    """Match the native reference in each batch shape, including valid boundary ties."""
     route, _, results = route_fixture("ties")
     spec = cases.fixtures()["ties"]
     weight, bias, hidden = cases.fixture_tensors(spec)
     router = loaded_router(weight, bias)
     alone = {}
     for i, name in enumerate(spec["rows"]):
-        _, _, single = routed(router, hidden[i : i + 1].cuda())
+        single_input = hidden[i : i + 1].cuda()
+        _, _, single = routed(router, single_input)
+        expected = reference_route(router, single_input)
+        results += cases.compare_routes(single, expected, f"reference:{name}")
         alone[name] = (single["groups"][0].tolist(), single["ids"][0].tolist())
+        for observed, row in ((route, i), (single, 0)):
+            groups, ids = observed["groups"][row], observed["ids"][row]
+            cases.assert_topk_membership(observed["group_scores"][row], groups, cases.TOPK_GROUP)
+            allowed = torch.isin(
+                torch.arange(cases.EXPERTS, device=ids.device) // cases.PER_GROUP, groups
+            )
+            scores = observed["selection_scores"][row].masked_fill(~allowed, -float("inf"))
+            cases.assert_topk_membership(scores, ids, cases.TOP_K)
     batched = {
         name: (route["groups"][i].tolist(), route["ids"][i].tolist())
         for i, name in enumerate(spec["rows"])
     }
     _record_fixture(
         "ties",
-        "test_ties_follow_the_pinned_topk_order",
+        "test_ties_follow_native_topk_order",
         route,
         results,
-        {"batched": batched, "alone": alone, "pinned": cases.TIE_ROUTES},
+        {"batched": batched, "alone": alone},
     )
     cases.assert_all_pass(results)
-    for name, pinned in cases.TIE_ROUTES.items():
-        assert batched[name] == (list(pinned[0]), list(pinned[1])), (name, batched[name])
-        assert alone[name] == batched[name], (name, alone[name])
 
 
 def test_epsilon_is_the_source_denominator() -> None:

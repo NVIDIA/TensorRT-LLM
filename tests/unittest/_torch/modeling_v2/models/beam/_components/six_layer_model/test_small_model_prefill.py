@@ -413,7 +413,18 @@ def test_rejected_load_changes_nothing(case) -> None:
         bad["model.layers.5.mlp.gate.weight"] = state["model.layers.5.mlp.gate.weight"].bfloat16()
     else:
         bad[model_module.HEAD] = state[model_module.HEAD].tolist
-    with pytest.raises((ValueError, TypeError)):
+    error, match = {
+        "missing_head": (ValueError, r"weights mismatch: missing .*lm_head\.weight"),
+        "unexpected_name": (
+            ValueError,
+            r"weights mismatch: missing \[\], unexpected .*model\.layers\.6",
+        ),
+        "late_expert_fp32": (TypeError, r"experts\.255\.down_proj\.weight must be torch.bfloat16"),
+        "late_expert_transposed": (ValueError, r"experts\.255\.down_proj\.weight must be \["),
+        "router_bf16": (TypeError, r"mlp\.gate\.weight must be torch.float32"),
+        "head_not_a_tensor": (TypeError, r"lm_head\.weight must be a torch.Tensor"),
+    }[case]
+    with pytest.raises(error, match=match):
         model.load_weights(bad)
     after = {n: t._version for n, t in model.checkpoint_tensors().items()}
     assert after == versions
@@ -439,35 +450,6 @@ def test_failed_copy_leaves_the_model_unavailable(monkeypatch) -> None:
 
 # -------------------------------------------------- tests: input and cache contracts
 
-_BAD_INPUTS = [
-    "float_ids",
-    "bool_ids",
-    "int16_ids",
-    "negative_id",
-    "id_vocab_size",
-    "batch_2",
-    "flat_ids",
-    "empty",
-    "too_long",
-    "host_ids",
-    "non_contiguous_ids",
-    "positions_offset",
-    "float_positions",
-    "positions_shape",
-    "host_positions",
-    "metadata_type",
-    "cached_prefix",
-    "context_length_mismatch",
-    "one_layer_cache",
-    "seven_layer_cache",
-    "duplicate_slots",
-    "slot_out_of_range",
-    "missing_layer",
-    "all_sliding_windows",
-    "no_sliding_windows",
-    "fp16_cache",
-    "four_kv_heads",
-]
 #: Host pool tables replaced after the manager built them: rows sharing a slot's storage or
 #: swapped between slots, an offset outside its pool, a fractional, int64 or misshapen
 #: mapping, and pointer rows other than the manager's.
@@ -481,11 +463,51 @@ _BAD_POOL_TABLES = [
     "aliased_pool_pointers",
     "secondary_pool_pointer",
 ]
-_BAD_INPUTS += _BAD_POOL_TABLES + ["swa_scratch_cache"]
+
+_BAD_INPUTS = {
+    "float_ids": "input_ids must be a dense torch.int32 or torch.int64 tensor",
+    "bool_ids": "input_ids must be a dense torch.int32 or torch.int64 tensor",
+    "int16_ids": "input_ids must be a dense torch.int32 or torch.int64 tensor",
+    "negative_id": "token ids must be in",
+    "id_vocab_size": "token ids must be in",
+    "batch_2": "input_ids must be \\[1, T\\]",
+    "flat_ids": "input_ids must be \\[1, T\\]",
+    "empty": "supported token counts per call",
+    "too_long": "supported token counts per call",
+    "host_ids": "input_ids must be contiguous on the model",
+    "non_contiguous_ids": "input_ids must be contiguous on the model",
+    "positions_offset": "positions must be exactly those",
+    "float_positions": "position_ids must be a contiguous integer",
+    "positions_shape": "position_ids must be a contiguous integer",
+    "host_positions": "position_ids must be a contiguous integer",
+    "metadata_type": "attn_metadata must be TrtllmAttentionMetadata",
+    "cached_prefix": "paged-context FMHA is required",
+    "context_length_mismatch": "new tokens .* do not fill the call's 17 tokens",
+    "one_layer_cache": "does not hold logical layer 1",
+    "seven_layer_cache": "must hold exactly logical layers 0-5",
+    "duplicate_slots": "must map one-to-one onto slots 0-5",
+    "slot_out_of_range": "maps logical layer 5 to slot 6",
+    "missing_layer": "maps logical layer 0 to slot 0.*holding 5 logical layers",
+    "all_sliding_windows": "full-attention layer 5 must keep the whole context",
+    "no_sliding_windows": "sliding layer 0 must keep a 512-token window",
+    "fp16_cache": "KV cache must be BF16 with 8 kv heads of 128",
+    "four_kv_heads": "KV cache must be BF16 with 8 kv heads of 128",
+    "aliased_pool_rows": "layer 4's pool row .* addresses .*manager keeps slot 4's keys",
+    "swapped_pool_offsets": "layer 0's pool row .* addresses .*manager keeps slot 0's keys",
+    "pool_offset_out_of_range": "layer 5 has pool row",
+    "fractional_pool_offsets": "pool mapping must be a host torch.int32",
+    "int64_pool_mapping": "pool mapping must be a host torch.int32",
+    "extra_pool_mapping_row": "pool mapping must be a host torch.int32",
+    "aliased_pool_pointers": "pool row .* addresses .*manager keeps slot",
+    "secondary_pool_pointer": "layer 0's pool row .* addresses .*manager keeps slot 0's keys",
+    "swa_scratch_cache": "without sliding-window scratch reuse",
+}
 
 
-@pytest.mark.parametrize("case", _BAD_INPUTS)
-def test_rejects_unsupported_inputs_before_dispatch(case, monkeypatch) -> None:
+@pytest.mark.parametrize("case,match", _BAD_INPUTS.items())
+def test_rejects_unsupported_inputs_before_dispatch(
+    case: str, match: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Each declared restriction raises ValueError before any op or the embedding runs."""
     model, _ = loaded(17)
     length = 17
@@ -549,6 +571,7 @@ def test_rejects_unsupported_inputs_before_dispatch(case, monkeypatch) -> None:
             md = object()
         elif case == "cached_prefix":
             md.kv_lens_runtime[0] = length + 8
+            md.use_paged_context_fmha = False
         elif case in ("duplicate_slots", "slot_out_of_range", "missing_layer"):
             offsets = dict(md.kv_cache_manager.layer_offsets)
             if case == "duplicate_slots":
@@ -583,7 +606,7 @@ def test_rejects_unsupported_inputs_before_dispatch(case, monkeypatch) -> None:
             monkeypatch.setattr(mgr, "kv_cache_pool_pointers", pointers)
         elif case == "swa_scratch_cache":
             monkeypatch.setattr(md.kv_cache_manager, "enable_swa_scratch_reuse", True)
-        with no_dispatch(), pytest.raises(ValueError):
+        with no_dispatch(), pytest.raises(ValueError, match=match):
             model(ids, positions, md)
 
 
