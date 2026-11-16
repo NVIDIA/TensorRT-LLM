@@ -26,6 +26,7 @@ from tensorrt_llm._torch.configs.kimi_linear import KimiLinearConfig
 from tensorrt_llm._torch.kimi_k3_cache_policy import KIMI_K3_FP8_KV_LAYERS_ENV
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_kimi_linear import KimiLinearForCausalLM
+from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.utils import model_extra_attrs
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
@@ -58,17 +59,22 @@ def _checkpoint_weights(reference: KimiMLAAttention, fp8: bool) -> dict:
     return projections
 
 
-def _assert_matches_reference(actual: torch.Tensor, expected: torch.Tensor, fp8: bool) -> None:
+def _assert_matches_reference(
+    actual: torch.Tensor, expected: torch.Tensor, fp8: bool, fp8_cache: bool = False
+) -> None:
     # DeepGEMM weight resmoothing and activation rounding compound across the
     # A/B projections and absorption (about 7% relative L2 on this fixture).
     # Bound both elementwise outliers and the overall error relative to the signal.
-    atol, rtol = (0.1, 0.1) if fp8 else (0.005, 0.03)
+    atol, rtol = (0.1, 0.1) if fp8 or fp8_cache else (0.005, 0.03)
     torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
     relative_l2 = (
         torch.linalg.vector_norm(actual.float() - expected.float())
         / torch.linalg.vector_norm(expected.float()).clamp_min(1e-8)
     ).item()
-    assert relative_l2 < (0.08 if fp8 else 0.01), f"relative L2 error: {relative_l2}"
+    # Combining FP8 projections with FP8 KV reaches 8.03% even without CP
+    # on the six-head fixture. Keep the weight-only bound unchanged.
+    limit = 0.09 if fp8 and fp8_cache else (0.08 if fp8 or fp8_cache else 0.01)
+    assert relative_l2 < limit, f"relative L2 error: {relative_l2}"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -491,3 +497,124 @@ def test_k3_mla_nvfp4_kv_chunked_prefill_with_cached_prefix_matches_huggingface(
     errors = f"relative L2: context {context_error:.4f}, generation {generation_error:.4f}"
     assert context_error < 0.1, errors
     assert generation_error < 0.2, errors
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@torch.no_grad()
+def test_kimi_linear_forward_matches_reference(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TLLM_FMHA_LIBS", "fallback")
+    config = KimiLinearConfig(
+        architectures=["KimiLinearForCausalLM"],
+        vocab_size=128,
+        pad_token_id=0,
+        bos_token_id=1,
+        eos_token_id=2,
+        hidden_size=256,
+        intermediate_size=256,
+        num_hidden_layers=1,
+        attn_res_block_size=1,
+        torch_dtype=torch.bfloat16,
+        linear_attn_config={"kda_layers": [], "full_attn_layers": [1], "num_heads": 32},
+        num_attention_heads=32,
+        num_key_value_heads=32,
+        q_lora_rank=1536,
+        kv_lora_rank=512,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
+        rms_norm_eps=1e-6,
+        mla_use_nope=True,
+        mla_use_output_gate=True,
+        max_position_embeddings=512,
+    )
+    config._attn_implementation = "eager"
+    model_config = ModelConfig(
+        pretrained_config=config,
+        attn_backend="TRTLLM",
+        max_num_tokens=4,
+        max_seq_len=4,
+    )
+    model_class = get_registered_model_class("KimiLinearForCausalLM")
+    assert model_class is KimiLinearForCausalLM
+
+    with torch.random.fork_rng():
+        torch.manual_seed(42)
+        reference = KimiMLAAttention(config, layer_idx=0).bfloat16().eval()
+        with torch.device("cuda"):
+            model = model_class(model_config).eval()
+        projections = {
+            name: parameter.detach().clone() for name, parameter in reference.named_parameters()
+        }
+        load_mla_checkpoint(model, projections, "")
+        layer = model.model.layers[0]
+        for parameter in model.parameters():
+            if parameter.ndim == 1:
+                parameter.fill_(1)
+        model.model.embed_tokens.weight.normal_(std=0.2)
+        model.lm_head.weight.normal_(std=0.1)
+        layer.mlp.gate_up_proj.weight.normal_(std=0.04)
+        layer.mlp.down_proj.weight.normal_(std=0.04)
+        for module in layer.self_attn.modules():
+            if callable(getattr(module, "post_load_weights", None)):
+                module.post_load_weights()
+        reference.cuda()
+
+    for name, parameter in model.named_parameters():
+        if "res_proj" in name:
+            assert not parameter.any(), f"{name} must be zero for the uniform-mix reference"
+
+    input_ids = torch.tensor([3, 7, 11, 5], device="cuda", dtype=torch.long)
+    embeddings = model.model.embed_tokens(input_ids)
+
+    def normalize(x):
+        xf = x.float()
+        return (xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + config.rms_norm_eps)).to(
+            x.dtype
+        )
+
+    causal_mask = torch.full((4, 4), float("-inf"), device="cuda").triu(1)[None, None]
+    attention_output = reference(
+        normalize(embeddings).unsqueeze(0), attention_mask=causal_mask
+    ).squeeze(0)
+    # The checkpoint helper zeroes score projections, so both residual
+    # selections are uniform averages of the embedding and running stream.
+    mlp_input = normalize(((embeddings.float() + attention_output.float()) * 0.5).bfloat16())
+    gate, up = F.linear(mlp_input, layer.mlp.gate_up_proj.weight).float().chunk(2, dim=-1)
+    activated = (gate.tanh() * gate.sigmoid() * up).bfloat16()
+    mlp_output = F.linear(activated, layer.mlp.down_proj.weight)
+    prefix = attention_output + mlp_output
+    expected_hidden = normalize(((embeddings.float() + prefix.float()) * 0.5).bfloat16())
+    expected_logits = F.linear(expected_hidden, model.lm_head.weight).float()
+    bypass_logits = F.linear(normalize(embeddings), model.lm_head.weight).float()
+
+    scenario = SimpleNamespace(
+        ctx_len=4,
+        batch=1,
+        kv_cache_tokens_per_block=64,
+        num_layers=1,
+        kv_cache_dtype=torch.bfloat16,
+    )
+    manager, metadata = setup_kv_and_metadata(
+        scenario,
+        model_config.mapping,
+        cache_type=CACHE_TYPE_SELFKONLY,
+        num_kv_heads=1,
+        head_dim=config.kv_lora_rank + config.qk_rope_head_dim,
+    )
+    try:
+        extra_attrs = dict(model_config.extra_attrs)
+        extra_attrs["attention_metadata"] = weakref.ref(metadata)
+        with model_extra_attrs(extra_attrs):
+            logits = model(
+                attn_metadata=metadata,
+                input_ids=input_ids,
+                return_context_logits=True,
+            )
+
+        assert logits.shape == (4, config.vocab_size)
+        assert logits.dtype == torch.float32
+        assert torch.isfinite(logits).all()
+        torch.testing.assert_close(logits, expected_logits, atol=0.03, rtol=0.03)
+        assert not torch.allclose(logits, bypass_logits, atol=0.03, rtol=0.03)
+    finally:
+        manager.shutdown()

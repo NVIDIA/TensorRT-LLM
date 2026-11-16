@@ -89,7 +89,28 @@ def test_guard_refuses_an_eps_the_handle_was_not_compiled_with(compiled) -> None
             op(q_raw, q_w, ckv_raw, kv_w, 1e-6, compiled)
 
 
-def test_guard_refuses_a_compact_destination_handle() -> None:
+@pytest.mark.parametrize("rows", [entry.WARP_ROW_MIN_ROWS, 777, 8192])
+def test_warp_row_kernel_is_bit_identical_to_the_cta_kernel(rows, compiled) -> None:
+    """From WARP_ROW_MIN_ROWS rows the op runs the warp-per-row kernel. Both kernels
+    reduce in the same order, so swapping one for the other must not move a bit."""
+    parent, q_raw, q_w, ckv_raw, kv_w = _build(dict(rows=rows), seed=rows)
+    assert entry.takes_warp_row(q_raw, q_w, ckv_raw, kv_w)
+    cta_parent = parent.clone()
+    cta_q, cta_kv, _ = torch.split(cta_parent, [_Q, _KV, _ROW - _Q - _KV], -1)
+    cta_only = entry.CompiledQkvARmsnorm(cta=compiled.cta, warp_row=compiled.cta)
+    want_q, _ = op(cta_q, q_w, cta_kv, kv_w, 1e-5, cta_only)
+    got_q, _ = op(q_raw, q_w, ckv_raw, kv_w, 1e-5, compiled)
+    assert torch.equal(got_q, want_q)
+    assert torch.equal(parent, cta_parent)
+    assert want_q.float().abs().sum() > 0, "a zero reference proves nothing"
+
+
+def test_below_the_threshold_the_cta_kernel_runs(compiled) -> None:
+    _, q_raw, q_w, ckv_raw, kv_w = _build(dict(rows=entry.WARP_ROW_MIN_ROWS - 1), seed=5)
+    assert not entry.takes_warp_row(q_raw, q_w, ckv_raw, kv_w)
+
+
+def test_guard_refuses_a_compact_destination_handle(compiled) -> None:
     """Compiled for compact outputs, the kernel writes kv at row pitch 512 into
     a buffer whose pitch is 2624: the wrong elements, no error."""
     from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_103__tep4.kernels.norm import (  # noqa: E501
@@ -97,10 +118,11 @@ def test_guard_refuses_a_compact_destination_handle() -> None:
     )
 
     compact = kernel.compile_qkv_a_rmsnorm(torch.cuda.current_device(), 1e-5, inplace_kv_view=False)
+    handle = entry.CompiledQkvARmsnorm(cta=compact, warp_row=compiled.warp_row)
     _, q_raw, q_w, ckv_raw, kv_w = _build(dict(rows=4), seed=2)
     with pytest.raises(AssertionError, match="compact outputs"):
         with validating(op):
-            op(q_raw, q_w, ckv_raw, kv_w, 1e-5, compact)
+            op(q_raw, q_w, ckv_raw, kv_w, 1e-5, handle)
 
 
 def test_guard_refuses_a_foreign_handle() -> None:

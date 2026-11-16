@@ -488,9 +488,9 @@ std::vector<SharedPtr<Block>> Block::clearStaleBlocksAfterPageUnlink(
     auto const* const alc = std::get_if<AttnLifeCycle>(&lc);
     NodeBase* pruneStart = &block;
 
-    // If this is a full-attention block or a sink block: evict subtree.
+    // If this is a full-attention block or a sink block of a REQUIRED or SINK_REQUIRED_ONLY lifecycle: evict subtree.
     // Mirrors Python: pages = remove_subtree(self)
-    if (alc && requiresPrefixCoverage(*alc)
+    if (alc && (requiresPrefixCoverage(*alc) || alc->reusePolicy == ReusePolicy::SINK_REQUIRED_ONLY)
         && (!alc->windowSize.has_value() || block.ordinal() < BlockOrdinal{alc->numSinkBlocks}))
     {
         pruneStart = block.prev;
@@ -899,7 +899,7 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(
         bool shortened = false;
         for (auto [lcId, attn] : attnLcs)
         {
-            if (!requiresPrefixCoverage(*attn))
+            if (!requiresPrefixCoverage(*attn) && attn->reusePolicy != ReusePolicy::SINK_REQUIRED_ONLY)
             {
                 continue;
             }
@@ -907,10 +907,12 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::pruneMatch(
             int const staleBeg = staleRange.beg.value();
             int const staleEnd = staleRange.end.value();
             int const numMatchedBlocks = static_cast<int>(matched.size());
+            bool const sinksOnly = attn->reusePolicy == ReusePolicy::SINK_REQUIRED_ONLY;
             for (int i = 0; i < numMatchedBlocks; ++i)
             {
                 // Mirrors Python's chain(range(stale.beg), range(stale.end, len(matched))).
-                if (staleBeg <= i && i < staleEnd)
+                // SINK_REQUIRED_ONLY checks only range(stale.beg), its sinks; its window is OPTIONAL.
+                if ((staleBeg <= i && i < staleEnd) || (sinksOnly && i >= staleBeg))
                 {
                     continue;
                 }

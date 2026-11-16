@@ -115,7 +115,7 @@ def _reference_sliding_block_tables_with_scratch(
     )
     scratch_capacity = scratch_begs.shape[1]
     scratch_rows = output[:, :, :scratch_capacity, :]
-    mask = mask[pool_ids] & valid_pool[:, :, None, None]
+    mask = mask[pool_ids] & valid_pool[:, :, None, None] & (base == BAD_PAGE_INDEX)
     output[:, :, :scratch_capacity, :].copy_(torch.where(mask, scratch_index, scratch_rows))
     return output
 
@@ -186,6 +186,18 @@ def test_deepseek_v4_compute_sliding_block_tables_with_scratch_matches_reference
     scratch_pages = torch.randint(1, 8, scales.shape, dtype=torch.int32, device=device)
     num_contexts = torch.tensor(scratch_capacity - 1, dtype=torch.int32, device=device)
 
+    # A reserved normal page and a page-less block can both enter the next
+    # chunk's scratch range. Keep the normal address and fill only the missing one.
+    pool_ids[0, 0] = 0
+    scales[0, 0] = 2
+    layer_offsets[0, 0] = 1
+    scratch_pages[0, 0] = 1
+    scratch_begs[0, 0] = 0
+    scratch_ends[0, 0] = 3
+    scratch_slots[0, 0, 0] = 4095
+    block_offsets[0, copy_idx[0], 0, 0] = 7
+    block_offsets[0, copy_idx[0], 0, 1] = BAD_PAGE_INDEX
+
     expected = _reference_sliding_block_tables_with_scratch(
         block_offsets,
         copy_idx,
@@ -216,4 +228,6 @@ def test_deepseek_v4_compute_sliding_block_tables_with_scratch_matches_reference
         output,
     )
 
+    assert output[0, 0, 0, 0].item() == 15
+    assert output[0, 0, 0, 1].item() == 8190
     assert torch.equal(output, expected)

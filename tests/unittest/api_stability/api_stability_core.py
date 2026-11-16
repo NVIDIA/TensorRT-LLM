@@ -20,7 +20,7 @@ import torch
 import transformers
 import yaml
 from annotated_types import Gt
-from pydantic import BaseModel
+from pydantic import BaseModel, JsonValue
 
 import tensorrt_llm
 from tensorrt_llm import LLM, DisaggregatedParams
@@ -32,10 +32,12 @@ from tensorrt_llm.executor.result import SimpleTokenLogprobs, TokenLogprobs
 from tensorrt_llm.llmapi import (CalibConfig, CompletionOutput,
                                  GuidedDecodingParams, QuantConfig,
                                  RequestOutput, SamplingParams)
-from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
+from tensorrt_llm.llmapi.llm_args import (CheckpointIOPolicy,
+                                          PrefillCudaGraphBackend)
 from tensorrt_llm.llmapi.llm_utils import LlmArgs
 from tensorrt_llm.logger import Singleton
 from tensorrt_llm.sampling_params import LogprobMode
+from tensorrt_llm.watermark import WatermarkConfig
 
 
 def repr_annotation(field_type: type) -> str:

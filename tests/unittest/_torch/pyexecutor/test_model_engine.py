@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import gc
+import os
 import unittest
 import weakref
 from ast import literal_eval
@@ -18,7 +19,6 @@ import torch
 from _torch.pyexecutor.engine_test_utils import (
     DummyModel,
     DummyModelEngine,
-    _AttentionBackend,
     _clone_tensors,
     _create_request,
     _create_request_with_tokens,
@@ -27,11 +27,14 @@ from _torch.pyexecutor.engine_test_utils import (
 )
 
 import tensorrt_llm._torch.pyexecutor.model_engine as model_engine_module
-from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
+from tensorrt_llm._torch.custom_ops.torch_custom_ops import AllReduceRunner
+from tensorrt_llm._torch.distributed import ops as distributed_ops
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
+from tensorrt_llm._torch.pyexecutor.engine import model_setup
 from tensorrt_llm._torch.pyexecutor.engine.model_call import ModelCaller
+from tensorrt_llm._torch.pyexecutor.engine.model_setup import apply_torch_compile
 from tensorrt_llm._torch.pyexecutor.engine.multimodal import is_multimodal
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import DecoderCudaGraphs
@@ -40,9 +43,9 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import (
     DecoderInputPreparer,
 )
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import PrefillCompiledModel
+from tensorrt_llm._torch.pyexecutor.engine.runners.encoder import EncoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import EncoderDecoderRunner
-from tensorrt_llm._torch.pyexecutor.engine.runners.no_kv_cache import NoKVCacheRunner
-from tensorrt_llm._torch.pyexecutor.engine.runners.pooling import PoolingRunner
+from tensorrt_llm._torch.pyexecutor.engine.runners.mm_encoder import MultimodalEncoderRunner
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
@@ -51,12 +54,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.utils import torch_compiling
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, SADecodingConfig
-from tensorrt_llm.llmapi.llm_args import (
-    EncodeCudaGraphConfig,
-    MultimodalConfig,
-    PrefillCudaGraphBackend,
-    TorchLlmArgs,
-)
+from tensorrt_llm.llmapi.llm_args import MultimodalConfig, PrefillCudaGraphBackend, TorchLlmArgs
 from tensorrt_llm.mapping import Mapping
 
 if TYPE_CHECKING:
@@ -120,6 +118,47 @@ def _install_graph_runner_stub(runner: DecoderRunner, key: KeyType | None = None
     stub.replay.side_effect = replay
     runner._graphs.cuda_graph_runner = stub
     return stub
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("enabled", [False, True])
+def test_init_from_args_forwards_vision_gpu_normalize(
+    monkeypatch: pytest.MonkeyPatch,
+    enabled: bool,
+) -> None:
+    llm_args = SimpleNamespace(
+        encode_only=False,
+        mm_encoder_only=False,
+        get_runtime_sizes=lambda: (1, 16, 64, 4),
+        encoder_max_batch_size=None,
+        encoder_max_num_tokens=None,
+        multimodal_config=MultimodalConfig(vision_gpu_normalize=enabled),
+        checkpoint_format="HF",
+        trust_remote_code=False,
+    )
+    create_input_processor = Mock()
+    monkeypatch.setattr(model_setup, "_configure_deep_gemm_pdl", Mock())
+    monkeypatch.setattr(model_engine_module, "create_input_processor", create_input_processor)
+    engine = SimpleNamespace()
+
+    ModelEngine._init_from_args(
+        engine,
+        model_path="dummy",
+        llm_args=llm_args,
+        mapping=Mapping(),
+        attn_runtime_features=None,
+        dist=None,
+        spec_config=None,
+    )
+
+    create_input_processor.assert_called_once_with(
+        "dummy",
+        tokenizer=None,
+        checkpoint_format="HF",
+        trust_remote_code=False,
+        **({"vision_gpu_normalize": True} if enabled else {}),
+    )
+    assert engine.input_processor is create_input_processor.return_value
 
 
 @pytest.mark.cpu_only
@@ -606,19 +645,55 @@ class DecoderForwardTestCase(unittest.TestCase):
         self.assertEqual(attn_metadata.num_contexts, 0)
 
 
-class ModelEngineTestCase(unittest.TestCase):
-    def test_breakable_rejects_multimodal_models(self) -> None:
-        engine = object.__new__(ModelEngine)
-        engine.model = DummyLegacyMultimodalIndexModel()
-        engine.input_processor = None
-        engine.llm_args = SimpleNamespace(
-            prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE, disable_mm_encoder=False
+@pytest.mark.cpu_only
+def test_model_engine_rejects_encode_only() -> None:
+    with pytest.raises(ValueError, match="EncoderExecutor"):
+        ModelEngine(
+            model_path="dummy",
+            llm_args=SimpleNamespace(encode_only=True),
+            mapping=Mapping(),
         )
 
-        self.assertTrue(is_multimodal(engine.model, engine.input_processor))
-        with self.assertRaisesRegex(ValueError, "multimodal models"):
-            engine._validate_breakable_cuda_graph_compatibility()
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("backend", ["piecewise", "breakable"])
+@pytest.mark.parametrize("mm_encoder_only", [False, True])
+def test_model_engine_resolves_multimodal_prefill_graphs_before_validation(
+    monkeypatch: pytest.MonkeyPatch, backend: str, mm_encoder_only: bool
+) -> None:
+    model = DummyLegacyMultimodalIndexModel()
+    model.model_config = SimpleNamespace(is_generation=not mm_encoder_only)
+    llm_args = TorchLlmArgs(
+        model="dummy", mm_encoder_only=mm_encoder_only, prefill_cuda_graph_backend=backend
+    )
+    monkeypatch.setattr(model_setup, "_configure_deep_gemm_pdl", Mock())
+    monkeypatch.setattr(
+        model_engine_module,
+        "create_input_processor",
+        Mock(return_value=Mock(spec=BaseMultimodalInputProcessor)),
+    )
+    monkeypatch.setattr(
+        ModelEngine,
+        "_init_from_model",
+        Mock(side_effect=RuntimeError("model configuration resolved")),
+    )
+    monkeypatch.setattr(ModelEngine, "__del__", lambda self: None)
+    engine = ModelEngine.__new__(ModelEngine)
+    rejects_breakable = not mm_encoder_only and backend == "breakable"
+    expected_error = ValueError if rejects_breakable else RuntimeError
+    message = "multimodal models" if rejects_breakable else "model configuration resolved"
+    with pytest.raises(expected_error, match=message):
+        ModelEngine.__init__(
+            engine, model_path="dummy", llm_args=llm_args, mapping=Mapping(), model=model
+        )
+
+    expected_backend = "disabled" if mm_encoder_only else backend
+    assert engine.llm_args.prefill_cuda_graph_backend == PrefillCudaGraphBackend(expected_backend)
+    if mm_encoder_only:
+        assert engine.llm_args.torch_compile_config is None
+
+
+class ModelEngineTestCase(unittest.TestCase):
     def test_breakable_allows_text_decoder_with_multimodal_processor(self) -> None:
         engine = object.__new__(ModelEngine)
         engine.model = Mock(spec=DecoderModelForCausalLM)
@@ -660,22 +735,28 @@ class ModelEngineTestCase(unittest.TestCase):
         for compile_enabled in (True, False):
             with self.subTest(compile_enabled=compile_enabled):
                 resource_manager = Mock()
+                model = Mock()
                 model_engine = SimpleNamespace(
+                    model=model,
                     warmup_scope=nullcontext,
                     _torch_compile_backend=Mock() if compile_enabled else None,
                     llm_args=SimpleNamespace(
                         torch_compile_config=SimpleNamespace(enable_fullgraph=False)
                     ),
-                    _apply_torch_compile=Mock(),
                 )
-                with patch("gc.collect") as collect, patch("torch.compiler.reset") as reset:
+                with (
+                    patch("gc.collect") as collect,
+                    patch("torch.compiler.reset") as reset,
+                    patch(
+                        "tensorrt_llm._torch.pyexecutor.model_engine.apply_torch_compile",
+                        return_value=(model, False),
+                    ) as apply_compile,
+                ):
                     ModelEngine.restore_compiled_model_after_refit(model_engine, resource_manager)
                 resource_manager.get_resource_manager.assert_not_called()
                 collect.assert_not_called()
                 reset.assert_not_called()
-                self.assertEqual(
-                    model_engine._apply_torch_compile.call_count, 1 if compile_enabled else 0
-                )
+                self.assertEqual(apply_compile.call_count, 1 if compile_enabled else 0)
 
     def test_decoder_buffers_are_allocated_only_for_decoder_runner(self) -> None:
         llm_args = TorchLlmArgs(
@@ -697,13 +778,13 @@ class ModelEngineTestCase(unittest.TestCase):
                         tuple(runner._buffers.cache_indirection.shape), (4, 2, engine.max_seq_len)
                     )
                 else:
-                    self.assertIsInstance(runner, PoolingRunner)
+                    self.assertIsInstance(runner, EncoderRunner)
                     self.assertIsNone(engine.cuda_graph_runner)
                 self.assertEqual(isinstance(runner._buffers, DecoderInputBuffers), is_generation)
 
     def test_no_kv_cache_runners_reject_speculative_config(self) -> None:
         for mm_encoder_only, runner_name in (
-            (False, "PoolingRunner"),
+            (False, "EncoderRunner"),
             (True, "MultimodalEncoderRunner"),
         ):
             with self.subTest(runner=runner_name):
@@ -725,7 +806,7 @@ class ModelEngineTestCase(unittest.TestCase):
 
     @pytest.mark.cpu_only
     def test_runner_engine_shared_entries_skip_decoder_state(self) -> None:
-        runner = Mock(spec=NoKVCacheRunner)
+        runner = Mock(spec=MultimodalEncoderRunner)
         engine = object.__new__(ModelEngine)
         engine._runner = runner
         engine._torch_compile_backend = None
@@ -963,6 +1044,7 @@ def test_pcg_fx_fallback_policy_is_model_specific(
         pretrained_config=SimpleNamespace(torch_dtype=torch.float32, hidden_size=4),
         mapping=mapping,
         sparse_attention_config=None,
+        is_generation=True,
     )
     eager = torch.nn.Linear(4, 4)
     model.model = eager
@@ -1002,8 +1084,8 @@ def test_pcg_fx_fallback_policy_is_model_specific(
     ):
         monkeypatch.setattr(_util, name, Mock(return_value=False))
     monkeypatch.setattr(_util, "compute_max_num_sequences", Mock(return_value=4))
+    monkeypatch.setattr(model_setup, "_configure_deep_gemm_pdl", Mock())
     for name in (
-        "_configure_deep_gemm_pdl",
         "create_input_processor",
         "setup_mm_encoder_attn_metadata",
     ):
@@ -1022,14 +1104,14 @@ def test_pcg_fx_fallback_policy_is_model_specific(
     monkeypatch.setattr(ModelEngine, "__del__", lambda self: None)
     backend_factory = Mock()
     backend_factory.Streams = list
-    monkeypatch.setattr(model_engine_module, "Backend", backend_factory)
+    monkeypatch.setattr(model_setup, "Backend", backend_factory)
     compiled = torch.nn.Identity()
     compile_model = Mock(return_value=compiled)
     monkeypatch.setattr(torch, "compile", compile_model)
     monkeypatch.setattr(torch._dynamo.config, "cache_size_limit", 16)
     # Stop after the complete compilation block, before runtime cache allocation.
     monkeypatch.setattr(
-        model_engine_module,
+        model_setup,
         "get_attention_backend",
         Mock(side_effect=RuntimeError("compile setup complete")),
     )
@@ -1068,17 +1150,98 @@ def test_pcg_fx_fallback_policy_is_model_specific(
 
 class TestWarmupCleanup(unittest.TestCase):
     @pytest.mark.cpu_only
+    def test_allreduce_tuning_uses_resolved_token_budget(self) -> None:
+        """Use the post-clamp budget, independently of the encoder configuration."""
+        engine = object.__new__(ModelEngine)
+        engine.llm_args = SimpleNamespace(enable_autotuner=True)
+        engine.max_seq_len = 2048
+        engine.batch_size = 2
+        engine.encoder_max_num_tokens = 65536
+        engine.model = SimpleNamespace(model_config=SimpleNamespace(is_encoder_decoder=True))
+        for configured, expected in (
+            (40000, 4096),
+            (None, 4096),
+            (3000, 3000),
+        ):
+            with (
+                self.subTest(configured=configured),
+                patch.object(AllReduceRunner, "configure_tuning_buckets") as configure,
+                patch.object(model_engine_module, "resolve_max_seq_len", return_value=2048),
+            ):
+                engine.max_num_tokens = configured
+                engine._init_model_capacity()
+                engine._configure_allreduce_tuning()
+                configure.assert_called_once_with(expected)
+        engine.llm_args.enable_autotuner = False
+        with patch.object(AllReduceRunner, "configure_tuning_buckets") as configure:
+            engine._configure_allreduce_tuning()
+            configure.assert_not_called()
+
+    @pytest.mark.cpu_only
+    def test_allreduce_configuration_precedes_runner_warmup(self) -> None:
+        engine = object.__new__(ModelEngine)
+        engine._runner = Mock(spec=model_engine_module.ScheduledModelRunner)
+        events = []
+        engine._runner.warmup.side_effect = lambda *args: events.append("warmup")
+        with patch.object(
+            engine,
+            "_configure_allreduce_tuning",
+            side_effect=lambda: events.append("configure"),
+        ):
+            engine._warmup_impl(Mock(spec=ResourceManager))
+        self.assertEqual(events, ["configure", "warmup"])
+
+    @pytest.mark.cpu_only
+    def test_allreduce_forward_routes_tuning_and_inference(self) -> None:
+        """Select Python profiling or native dispatch without executing a collective."""
+        layer = object.__new__(distributed_ops.AllReduce)
+        torch.nn.Module.__init__(layer)
+        layer.mapping = SimpleNamespace(tp_size=2, tp_group=[0, 1])
+        layer.strategy = distributed_ops.AllReduceStrategy.AUTO
+        layer.symm_mem_allreduce = None
+        layer.mnnvl_allreduce = None
+        layer._disable_mpi = False
+        layer.workspace = None
+        inputs = torch.ones(2, 4)
+        output = torch.zeros_like(inputs)
+        with (
+            patch.dict(os.environ, {"TLLM_DISABLE_ALLREDUCE_AUTOTUNE": "0"}),
+            patch.object(distributed_ops, "_ALLREDUCE_AUTOTUNER_TUNING_MODE", False),
+            patch.object(torch.ops.trtllm, "tunable_allreduce", return_value=[output]) as tunable,
+            patch.object(torch.ops.trtllm, "autotuned_allreduce", return_value=[output]) as native,
+        ):
+            for tuning in (True, False):
+                for exclude_nccl_symmetric in (True, False):
+                    with self.subTest(tuning=tuning, exclude_nccl_symmetric=exclude_nccl_symmetric):
+                        layer._exclude_nccl_symmetric = exclude_nccl_symmetric
+                        tunable.reset_mock()
+                        native.reset_mock()
+                        distributed_ops.set_allreduce_autotuner_tuning_mode(tuning)
+                        self.assertIs(layer.forward(inputs), output)
+                        use_python = tuning or exclude_nccl_symmetric
+                        selected, unused = (tunable, native) if use_python else (native, tunable)
+                        selected.assert_called_once()
+                        self.assertIs(selected.call_args.kwargs["input"], inputs)
+                        if use_python:
+                            self.assertEqual(
+                                selected.call_args.kwargs["exclude_nccl_symmetric"],
+                                exclude_nccl_symmetric,
+                            )
+                        unused.assert_not_called()
+
+    @pytest.mark.cpu_only
     def test_no_kv_cache_warmup_rejects_allocated_kv_cache(self) -> None:
         """Verify a no-KV-cache runner rejects an allocated KV cache before warmup."""
         model_engine = object.__new__(ModelEngine)
+        model_engine.llm_args = SimpleNamespace(enable_autotuner=False)
         model_engine._metrics = {}
         model_engine.model = SimpleNamespace(model_config=SimpleNamespace(is_encoder_decoder=False))
         model_engine.moe_load_balancer = None
         model_engine._warmup_depth = 0
-        model_engine._runner = Mock(spec=NoKVCacheRunner)
+        model_engine._runner = Mock(spec=MultimodalEncoderRunner)
         runner = model_engine._runner
-        runner._validate_resources = NoKVCacheRunner._validate_resources.__get__(runner)
-        runner.warmup.side_effect = NoKVCacheRunner.warmup.__get__(runner)
+        runner._validate_resources = MultimodalEncoderRunner._validate_resources.__get__(runner)
+        runner.warmup.side_effect = MultimodalEncoderRunner.warmup.__get__(runner)
         resource_manager = Mock()
         resource_manager.get_resource_manager.return_value = object()
 
@@ -1143,66 +1306,6 @@ class TestWarmupCleanup(unittest.TestCase):
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    ("cuda_graph_config", "expected_encode_config"),
-    [
-        (None, False),
-        (CudaGraphConfig(), False),
-        (EncodeCudaGraphConfig(batch_sizes=[1], num_tokens=[16], seq_lens=[16]), True),
-    ],
-)
-def test_encoder_runner_graph_config_comes_only_from_cuda_graph_config(
-    cuda_graph_config: CudaGraphConfig | None,
-    expected_encode_config: bool,
-) -> None:
-    """Encode-only takes its buckets from `cuda_graph_config`, never from llm_args."""
-    engine = object.__new__(ModelEngine)
-    engine._model_caller = Mock()
-    engine.model = object()
-    engine.mapping = object()
-    engine.cuda_graph_config = cuda_graph_config
-    engine.llm_args = SimpleNamespace(
-        encoder_cuda_graph_config=EncodeCudaGraphConfig(
-            batch_sizes=[8],
-            num_tokens=[64],
-            seq_lens=[64],
-        ),
-        enable_autotuner=False,
-    )
-    engine.batch_size = 4
-    engine.max_num_tokens = 16
-    engine.max_seq_len = 16
-    engine.max_beam_width = 1
-    engine.without_logits = False
-    engine.attn_backend = _AttentionBackend
-    engine.attn_runtime_features = AttentionRuntimeFeatures()
-    engine.dist = object()
-    engine.moe_load_balancer = None
-    runner_config = object()
-    expected_runner = object()
-    runner_type = Mock(return_value=expected_runner)
-
-    with patch(
-        "tensorrt_llm._torch.pyexecutor.model_engine.EncoderRunnerConfig.create",
-        return_value=runner_config,
-    ) as create_config:
-        actual = engine._initialize_encoder_runner(runner_type)
-
-    assert actual is expected_runner
-    resolved = create_config.call_args.kwargs["graph_config"]
-    assert resolved is (cuda_graph_config if expected_encode_config else None)
-    runner_type.assert_called_once_with(
-        engine.model,
-        runner_config,
-        mapping=engine.mapping,
-        dist=engine.dist,
-        moe_load_balancer=engine.moe_load_balancer,
-        model_caller=engine._model_caller,
-        attention_runtime_features=engine.attn_runtime_features,
-    )
-
-
-@pytest.mark.cpu_only
 def test_model_engine_forward_encoder_delegates_scheduled_encoder_batch() -> None:
     runner = Mock(spec=EncoderDecoderRunner)
     hidden_states = object()
@@ -1240,7 +1343,7 @@ def test_engine_passes_call_state_and_returns_length_update(
     is_dummy: bool,
     enable_spec_decode: bool,
 ) -> None:
-    runner = Mock(spec=NoKVCacheRunner)
+    runner = Mock(spec=MultimodalEncoderRunner)
     outputs = {"logits": object()}
     if effective_length is not None:
         outputs["runtime_draft_len"] = effective_length
@@ -1330,7 +1433,9 @@ def test_refit_updates_compiled_weights_without_invalidating_graphs(
         ),
     ):
         if compile_enabled:
-            engine._apply_torch_compile("eager", False)
+            engine.model, engine._torch_compile_prefill_only = apply_torch_compile(
+                engine.model, "eager", llm_args=engine.llm_args, fullgraph=False
+            )
         for value, unwrap, restore in (
             (
                 2.0,
@@ -1420,7 +1525,7 @@ def test_layerwise_nvtx_flag_controls_real_forward_markers(
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("fails", [False, True])
 def test_warmup_restores_serving_state_after_success_or_failure(fails: bool) -> None:
-    runner = Mock(spec=NoKVCacheRunner)
+    runner = Mock(spec=MultimodalEncoderRunner)
     engine, resources = _model_engine_with_runner(runner, kv_cache_manager=None)
     engine._metrics = {}
     balancer = engine.moe_load_balancer = Mock()

@@ -94,6 +94,10 @@ file is reported to the planner for ownership; it is not silently omitted.
   the `comm/` pattern: every rank asserts, a deadline, world size as an axis.
 - Assert CUDA availability (no skip), seed randomness, import the entry by
   its absolute path, and share no fixture with another entry's test.
+- A local entry's or variant's test counts toward its target's test budget
+  (10-15 modules, 20 at most). Import a helper the catalog's tests or the
+  target's already have (`_validating.py`, `_cells.py`, a `_`-prefixed module
+  beside the target's tests) instead of pasting another copy of it.
 - A normal cell fits **10 s / 40 GiB**. Boundary-sized probes use
   `spec.large=True` and `pytest.mark.large`; pre-merge excludes them. Report a
   missing marker registration rather than editing `tests/unittest/pytest.ini`.
@@ -101,8 +105,8 @@ file is reported to the planner for ownership; it is not silently omitted.
   boundaries. Probe those the runtime envelope reaches; record all limits,
   guarding measured silent failures. Size from measured `runtime_facts.yaml`.
 - Iterate with `pytest -k`; certify once after the last edit to entry **and**
-  test: run the whole test file and `test_modeling_v2_claims.py` /
-  `test_modeling_v2_no_stale_claims.py` under `tests/unittest/_torch/modeling_v2`.
+  test: run the whole test file and `test_modeling_v2_no_stale_claims.py` under
+  `tests/unittest/_torch/modeling_v2`.
   Batch compatible cells into one pytest process. Add the measured device to
   `ARCHS` only after passing; a missing `Arch` enum gets its own commit.
   Unmeasured cells/arches remain uncertified; report failures, never widen a

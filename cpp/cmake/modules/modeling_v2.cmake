@@ -29,9 +29,9 @@ Each family builds into one torch-op library, libth_modeling_v2_<family>.so,
 installed next to libth_common.so. Nothing in it is linked into
 libtensorrt_llm.so or libth_common.so; the Python loader
 (tensorrt_llm/_torch/_experimental/modeling_v2/_native.py) opens it only when
-routing picks one of the family's targets. The "Native code" section of the
-modeling_v2 README is the guide for authors; cpp/tensorrt_llm/modeling_v2/
-holds only what every family shares (this discovery, the common/ macros).
+routing picks one of the family's targets. cpp/tensorrt_llm/modeling_v2/README.md
+is the guide for authors; cpp/tensorrt_llm/modeling_v2/ holds only what every
+family shares (this discovery, the common/ macros).
 
 A family's csrc/CMakeLists.txt uses three functions; names are the Python
 package names:
@@ -86,31 +86,26 @@ function(_modeling_v2_ident out name)
       PARENT_SCOPE)
 endfunction()
 
+# A family name is used as-is in C++ and torch namespaces and joined to target
+# names with "_", so it may not contain "__" or start or end with "_".
 function(_modeling_v2_check_family_name family)
-  if(NOT family MATCHES "^[a-z][a-z0-9_]*[a-z0-9]$" OR family MATCHES "__")
+  if(NOT family MATCHES "^[A-Za-z]([A-Za-z0-9_]*[A-Za-z0-9])?$" OR family
+                                                                   MATCHES "__")
     message(
       FATAL_ERROR
-        "modeling_v2: family '${family}' is not a snake_case package name")
+        "modeling_v2: family '${family}' must be a Python package name that "
+        "starts with a letter, ends with a letter or digit and has no '__'")
   endif()
 endfunction()
 
-# <checkpoint>__<sm>__<parallel>, the identity the Python target directory
-# carries (see tensorrt_llm/_torch/_experimental/modeling_v2/README.md).
+# A target name is a Python package name. It also names the target's C++
+# namespace and CMake targets, where "shared" is the family's shared code.
 function(_modeling_v2_check_target_name target)
-  string(REPLACE "__" ";" segments "${target}")
-  list(LENGTH segments count)
-  if(NOT count EQUAL 3 OR NOT target MATCHES "^[a-z][a-z0-9_]*$")
+  if(NOT target MATCHES "^[A-Za-z][A-Za-z0-9_]*$" OR target STREQUAL "shared")
     message(
       FATAL_ERROR
-        "modeling_v2: target '${target}' is not a <checkpoint>__<sm>__<parallel> name"
-    )
-  endif()
-  list(GET segments 1 sm)
-  if(NOT sm MATCHES "^sm_[0-9]+[a-z0-9]*$")
-    message(
-      FATAL_ERROR
-        "modeling_v2: target '${target}' has no sm_<arch> segment (got '${sm}')"
-    )
+        "modeling_v2: target '${target}' must be a Python package name that "
+        "starts with a letter and is not 'shared'")
   endif()
 endfunction()
 
@@ -235,6 +230,14 @@ function(add_modeling_v2_family family)
     message(FATAL_ERROR "modeling_v2: family '${family}' is declared twice")
   endif()
   set_property(GLOBAL APPEND PROPERTY MODELING_V2_FAMILIES "${family}")
+  get_property(namespaces GLOBAL PROPERTY MODELING_V2_NAMESPACES)
+  if("mv2_${family}" IN_LIST namespaces)
+    message(
+      FATAL_ERROR
+        "modeling_v2: torch namespace 'mv2_${family}' of family ${family} is already taken"
+    )
+  endif()
+  set_property(GLOBAL APPEND PROPERTY MODELING_V2_NAMESPACES "mv2_${family}")
   set_property(GLOBAL PROPERTY MODELING_V2_${family}_SOURCE_DIR
                                "${CMAKE_CURRENT_SOURCE_DIR}")
   set_property(GLOBAL PROPERTY MODELING_V2_${family}_PACKAGE_DIR
