@@ -18,11 +18,13 @@ import ctypes
 import errno
 import os
 import signal
+import socket
 import sys
 import threading
 import time
 from collections.abc import Callable
 from functools import partial
+from multiprocessing.process import BaseProcess
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -32,7 +34,8 @@ import zmq
 from utils.spawn_process import SpawnProcessContext, spawn_process
 
 from tensorrt_llm._torch.visual_gen import executor as executor_module
-from tensorrt_llm._torch.visual_gen.executor import DiffusionRemoteClient
+from tensorrt_llm._torch.visual_gen.executor import DiffusionRemoteClient, run_diffusion_worker
+from tensorrt_llm.visual_gen.args import CompilationConfig, ParallelConfig, VisualGenArgs
 from tensorrt_llm.visual_gen.visual_gen import VisualGenResult
 
 pytestmark = pytest.mark.cpu_only
@@ -150,6 +153,24 @@ def _lightweight_background(client: DiffusionRemoteClient) -> None:
     client.shutdown_event.wait()
 
 
+def _rendezvous_worker(*, fail_pipeline: bool = False, **worker_kwargs) -> None:
+    pipeline = SimpleNamespace(
+        default_generation_params={},
+        extra_param_specs={},
+        supports_image_edit=False,
+        ref_slot_specs={},
+        cleanup=MagicMock(),
+    )
+    with (
+        patch.object(executor_module.torch.cuda, "is_available", return_value=False),
+        patch.object(executor_module, "PipelineLoader") as loader,
+    ):
+        loader.return_value.load.return_value = pipeline
+        if fail_pipeline:
+            loader.return_value.load.side_effect = RuntimeError("model load failed")
+        run_diffusion_worker(**worker_kwargs)
+
+
 def _run_temporary_constructor_coordinator(
     lifecycle_context: SpawnProcessContext,
     worker_entrypoint: Callable[..., None] = _parent_bound_worker,
@@ -174,10 +195,6 @@ def _run_temporary_constructor_coordinator(
                 patch.object(
                     executor_module,
                     "find_free_port",
-                    # DiffusionRemoteClient requests the distributed master,
-                    # request ZMQ, and response ZMQ ports in this order. The
-                    # patched networking paths below never bind these ports;
-                    # fixed placeholders keep construction deterministic.
                     side_effect=[29500, 29501, 29502],
                 ),
                 patch.object(
@@ -677,6 +694,55 @@ def test_sigkill_worker_and_coordinator_kills_remaining_workers() -> None:
 @pytest.mark.skipif(sys.platform != "linux", reason="native parent monitoring is Linux-specific")
 def test_temporary_constructor_thread_does_not_kill_worker() -> None:
     _assert_temporary_constructor_worker_lifecycle()
+
+
+@pytest.mark.timeout(_COLD_SPAWN_TIMEOUT)
+@pytest.mark.skipif(sys.platform != "linux", reason="native parent monitoring is Linux-specific")
+@pytest.mark.parametrize("fail_pipeline", [False, True], ids=["ready", "startup-fails"])
+def test_local_rendezvous_port_is_owned_until_shutdown(tmp_path: Path, fail_pipeline: bool) -> None:
+    context = executor_module._get_mp_context("spawn")
+    create_process = context.Process
+    master_ports = []
+    args = VisualGenArgs(
+        model=str(tmp_path),
+        parallel_config=ParallelConfig(ulysses_size=2),
+        compilation_config=CompilationConfig(skip_warmup=True),
+    )
+
+    def create_worker(*process_args, **process_kwargs) -> BaseProcess:
+        master_port = process_kwargs["kwargs"]["master_port"]
+        if not master_ports:
+            master_ports.append(master_port)
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as contender:
+                with pytest.raises(OSError) as bind_error:
+                    contender.bind(("127.0.0.1", master_port))
+                assert bind_error.value.errno == errno.EADDRINUSE
+        return create_process(*process_args, **process_kwargs)
+
+    with (
+        patch.object(executor_module, "_detect_external_launch", return_value=None),
+        patch.object(executor_module, "get_ip_address", return_value="127.0.0.1"),
+        patch.object(executor_module, "_get_mp_context", return_value=context),
+        patch.object(context, "Process", side_effect=create_worker),
+        patch.object(
+            executor_module,
+            "run_diffusion_worker",
+            partial(_rendezvous_worker, fail_pipeline=fail_pipeline),
+        ),
+    ):
+        if fail_pipeline:
+            with pytest.raises(RuntimeError, match="local worker processes exited"):
+                DiffusionRemoteClient(args=args)
+        else:
+            client = DiffusionRemoteClient(args=args)
+            try:
+                assert all(worker.is_alive() for worker in client.worker_processes)
+            finally:
+                client.shutdown()
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as contender:
+        contender.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        contender.bind(("127.0.0.1", master_ports[0]))
 
 
 def test_cleanup_is_registered_before_waiting_for_ready() -> None:

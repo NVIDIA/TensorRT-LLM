@@ -19,6 +19,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import zmq
+from torch.distributed.constants import default_pg_timeout
 
 from tensorrt_llm._torch.distributed.initialization import init_torch_distributed
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
@@ -761,6 +762,7 @@ def run_diffusion_worker(
     local_rank: Optional[int] = None,
     in_client_process: bool = False,
     parent_pid: Optional[int] = None,
+    use_client_store: bool = False,
 ):
     """Entry point for worker process.
 
@@ -816,9 +818,15 @@ def run_diffusion_worker(
                     f"performance."
                 )
 
+        store = (
+            dist.TCPStore(master_addr, master_port, is_master=False, timeout=default_pg_timeout)
+            if use_client_store
+            else None
+        )
         init_torch_distributed(
             backend="cuda:nccl,cpu:gloo" if torch.cuda.is_available() else "gloo",
-            init_method="env://",
+            store=store,
+            init_method=None if use_client_store else "env://",
             world_size=world_size,
             rank=rank,
             device_id=torch.device(f"cuda:{device_id}") if torch.cuda.is_available() else None,
@@ -887,6 +895,7 @@ class DiffusionRemoteClient:
     ):
         self.args = args
         self.n_workers = args.parallel_config.n_workers
+        self._rendezvous_store: dist.TCPStore | None = None
 
         # --- Detect external launcher (torchrun / srun) ---
         ext = _detect_external_launch()
@@ -895,7 +904,14 @@ class DiffusionRemoteClient:
             # Single-node: coordinator spawns all workers locally
             # Setup distributed env
             self.master_addr = "127.0.0.1"
-            self.master_port = find_free_port()
+            self._rendezvous_store = dist.TCPStore(
+                self.master_addr,
+                0,
+                is_master=True,
+                wait_for_workers=False,
+                timeout=default_pg_timeout,
+            )
+            self.master_port = self._rendezvous_store.port
 
             # Setup IPC addresses
             self.host_ip = get_ip_address()
@@ -997,6 +1013,7 @@ class DiffusionRemoteClient:
                             "log_level": logger.level,
                             "local_rank": rank,
                             "parent_pid": parent_pid,
+                            "use_client_store": True,
                         },
                     )
                     self.worker_processes.append(p)
@@ -1518,6 +1535,7 @@ class DiffusionRemoteClient:
                 shutdown_error = e
             logger.error(f"DiffusionClient: Error stopping workers: {e}")
         finally:
+            self._rendezvous_store = None
             self._shutdown_error = shutdown_error
             self._shutdown_complete.set()
 
