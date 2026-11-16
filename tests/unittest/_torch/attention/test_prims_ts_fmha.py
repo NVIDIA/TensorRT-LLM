@@ -838,7 +838,7 @@ def test_phase_support_check_preserves_whole_request_semantics(phase: FmhaPhase)
         (None, 107, True, AttentionInputType.context_only, True, False),
         (None, 107, True, AttentionInputType.mixed, True, False),
         (None, 107, False, AttentionInputType.generation_only, True, False),
-        ("+prims_ts", 100, False, AttentionInputType.context_only, True, True),
+        (" + prims_ts ", 100, False, AttentionInputType.context_only, True, True),
         ("prims_ts", 103, True, AttentionInputType.context_only, True, True),
         ("prims_ts,fallback", 107, True, AttentionInputType.generation_only, False, False),
     ],

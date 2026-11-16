@@ -265,7 +265,7 @@ class PrimsTSFmha(PhasedFmha):
         super().__init__(attn)
         # Library selection is fixed when the attention instance is created.
         self._explicitly_enabled = any(
-            entry.strip() in ("prims_ts", "+prims_ts")
+            entry.strip().removeprefix("+").strip() == "prims_ts"
             for entry in os.environ.get("TLLM_FMHA_LIBS", "").split(",")
         )
         # Cache each manager/pool's K-to-V page displacement without retaining
