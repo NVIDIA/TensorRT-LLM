@@ -65,6 +65,7 @@ def _choice(delta, **kwargs):
 
 
 def test_metadata_events_do_not_count_as_generated_output(monkeypatch):
+    """Verify role-only, finish-only, and usage chunks do not affect TTFT or ITL."""
     out = _request(
         monkeypatch,
         [
@@ -73,15 +74,72 @@ def test_metadata_events_do_not_count_as_generated_output(monkeypatch):
             (110.5, _choice({"content": ""})),
             (111.0, _choice({"content": "i"})),
             (112.0, _choice({}, finish_reason="stop")),
+            (113.0, {"choices": [], "usage": {"completion_tokens": 3}}),
+        ],
+    )
+    assert out.success
+    assert out.generated_text == "Hi"
+    assert out.output_tokens == 3
+    assert out.ttft == 10.0
+    assert out.itl == [0.5, 0.5]
+    assert out.latency == 13.0
+
+
+@pytest.mark.parametrize(
+    "buffered_delta",
+    [
+        {"content": ""},
+        {"content": "", "reasoning_content": ""},
+        {},
+    ],
+)
+def test_unflushed_token_deltas_set_ttft_and_itl(monkeypatch, buffered_delta):
+    """Count token-bearing chunks whose text is not flushed yet in TTFT and ITL."""
+    out = _request(
+        monkeypatch,
+        [
+            (101.0, _choice({"role": "assistant"})),
+            (104.0, _choice(buffered_delta)),
+            (110.0, _choice({"content": "Hi"})),
+            (112.0, _choice({}, finish_reason="stop")),
+        ],
+    )
+    assert out.success
+    assert out.generated_text == "Hi"
+    assert out.ttft == 4.0
+    assert out.itl == [6.0]
+    assert out.latency == 12.0
+
+
+def test_intervening_and_null_field_metadata_do_not_affect_timing(monkeypatch):
+    """Ignore null-valued fields on role/finish chunks and intervening role chunks."""
+    out = _request(
+        monkeypatch,
+        [
+            (101.0, _choice({"role": "assistant", "content": None}, finish_reason=None)),
+            (110.0, _choice({"content": "H"})),
+            (110.5, _choice({"role": "assistant"})),
+            (111.0, _choice({"content": "i"})),
+            (112.0, _choice({"content": None}, finish_reason="stop")),
             (113.0, {"choices": [], "usage": {"completion_tokens": 2}}),
         ],
     )
     assert out.success
     assert out.generated_text == "Hi"
-    assert out.output_tokens == 2
     assert out.ttft == 10.0
     assert out.itl == [1.0]
     assert out.latency == 13.0
+
+    no_output = _request(
+        monkeypatch,
+        [
+            (101.0, _choice({"role": "assistant", "content": None})),
+            (102.0, _choice({"content": None}, finish_reason="length")),
+        ],
+    )
+    assert not no_output.success
+    assert no_output.ttft == 0.0
+    assert no_output.itl == []
 
 
 @pytest.mark.parametrize(
@@ -97,6 +155,7 @@ def test_metadata_events_do_not_count_as_generated_output(monkeypatch):
     ],
 )
 def test_nonempty_output_types_set_ttft(monkeypatch, delta):
+    """Record TTFT on the first non-empty output delta regardless of field type."""
     out = _request(
         monkeypatch,
         [
@@ -112,6 +171,7 @@ def test_nonempty_output_types_set_ttft(monkeypatch, delta):
 
 
 def test_finish_event_can_also_carry_output(monkeypatch):
+    """Include output carried on a finish chunk in ITL and generated text."""
     out = _request(
         monkeypatch,
         [
@@ -127,6 +187,7 @@ def test_finish_event_can_also_carry_output(monkeypatch):
 
 
 def test_no_output_has_no_first_token_or_intervals(monkeypatch):
+    """Mark streams with only role and finish metadata as failed with zero TTFT."""
     out = _request(
         monkeypatch,
         [(101.0, _choice({"role": "assistant"})), (102.0, _choice({}, finish_reason="stop"))],

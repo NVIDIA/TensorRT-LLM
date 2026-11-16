@@ -354,17 +354,25 @@ async def async_request_openai_chat_completions(
                         data = json.loads(chunk)
 
                         if choices := data.get("choices"):
-                            delta = choices[0]["delta"]
+                            choice = choices[0]
+                            delta = choice.get("delta") or {}
                             content = delta.get("content")
-                            # Role-only and finish-only events do not contain
-                            # generated output. Keep a separate timestamp so
-                            # metadata cannot shorten the next output interval.
-                            if any(
-                                    delta.get(key)
-                                    for key in ("content", "reasoning_content",
-                                                "reasoning", "tool_calls",
-                                                "function_call", "refusal",
-                                                "audio")):
+                            # Exclude role-only and empty finish metadata
+                            # chunks; other chunks (including empty-content or
+                            # empty deltas without finish_reason for buffered
+                            # tokens) represent token steps. Keep a separate
+                            # timestamp so metadata cannot shorten the next
+                            # inter-token interval.
+                            delta_keys = {
+                                key
+                                for key, value in delta.items()
+                                if value is not None
+                            }
+                            is_role_only = delta_keys == {"role"}
+                            is_empty_finish = (not delta_keys
+                                               and choice.get("finish_reason")
+                                               is not None)
+                            if not (is_role_only or is_empty_finish):
                                 if last_output_timestamp is None:
                                     output.ttft = timestamp - st
                                 else:
