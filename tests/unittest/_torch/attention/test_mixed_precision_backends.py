@@ -116,6 +116,7 @@ def test_optimized_two_pool_prefill_and_decode(
         register_to_config=False,
         use_gqa_decode_fmha=False,
         cache_context_plan=False,
+        offers_gated_fp8_out=False,
         _output_quant_flags=None,
         _use_quantize_output=lambda: False,
     )

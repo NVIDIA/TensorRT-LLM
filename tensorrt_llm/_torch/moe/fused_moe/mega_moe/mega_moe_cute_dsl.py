@@ -69,6 +69,7 @@ non-1 scales compute correctly.
 from __future__ import annotations
 
 import functools
+import math
 import os
 import weakref
 from dataclasses import dataclass
@@ -87,11 +88,13 @@ from tensorrt_llm._torch.moe.custom_ops.cute_dsl_megamoe_custom_op import (
 )
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.logger import logger
-from tensorrt_llm.math_utils import ceil_div
+from tensorrt_llm.math_utils import ceil_div, pad_up
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ....autotuner import AutoTuner
 from ....cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+from ....model_config import _DEEPSEEK_V4_ARCHITECTURES as _V4_ARCHITECTURES
+from ....model_config import _DEEPSEEK_V41_ARCHITECTURES as _V41_ARCHITECTURES
 from ....model_config import ModelConfig
 from ....utils import ActivationType, AuxStreamType, Fp4QuantizedTensor
 from ..activation import (
@@ -104,6 +107,7 @@ from ..impl_base import MoEImplBase, apply_moe_impl_construction_state
 from ..impl_contract import (
     MoEDeployment,
     MoEEligibility,
+    MoEFusedRouteQuant,
     MoEProblem,
     MoERejectReason,
     MoERunContext,
@@ -112,8 +116,18 @@ from ..impl_contract import (
 from ..impl_environment import MoEDep
 from ..impl_identity import MoEImplDescriptor, MoEImplId, register_moe_impl
 from ..interface import MoESchedulerKind, MoEWeightLoadingMode, _reject
+from ..moe_warmup_placement import RouteCounters
 from ..quantization import NVFP4MegaMoECuteDslMethod
 from ..routing import BaseMoeRoutingMethod
+from .shared_expert import (
+    build_shared_expert_weights,
+    mxfp8_quantize_megamoe,
+    shared_activation_buffers,
+)
+
+if IS_CUTLASS_DSL_AVAILABLE:
+    from ....moe.kernels.blackwell.dsv4_route_quant import dsv4_route_nvfp4_quant
+    from ....moe.kernels.blackwell.megamoe_stage_inputs import stage_megamoe_inputs
 
 __all__ = [
     "MegaMoECuteDsl",
@@ -127,6 +141,16 @@ __all__ = [
 # ---------------------------------------------------------------------------
 # Capability probe
 # ---------------------------------------------------------------------------
+
+
+_DEEPSEEK_V4_ARCHITECTURES = _V4_ARCHITECTURES | _V41_ARCHITECTURES
+
+
+def _warn_shared_expert_fusion_ignored(reason: str) -> None:
+    logger.warning_once(
+        f"moe_config.megamoe_fuse_shared_expert is ignored: {reason}",
+        key="megamoe_fuse_shared_expert_ignored",
+    )
 
 
 class MegaMoeCuteDslUnavailable(RuntimeError):
@@ -283,6 +307,42 @@ def _as_nvfp4(t: torch.Tensor) -> torch.Tensor:
 
 def _as_fp8_sf(t: torch.Tensor) -> torch.Tensor:
     return t if t.dtype == torch.float8_e4m3fn else t.view(torch.float8_e4m3fn)
+
+
+def _slot_table(global_assignments: List[int]) -> torch.Tensor:
+    """The int32 expert -> slot table of a placement with one copy per expert (slot -> expert list)."""
+    table = [0] * len(global_assignments)
+    for slot, expert in enumerate(global_assignments):
+        table[expert] = slot
+    return torch.tensor(table, dtype=torch.int32)
+
+
+def replica_slot_table(
+    global_assignments: List[int], num_experts: int, ep_rank: int
+) -> torch.Tensor:
+    """The routing table of a placement with copies (slot -> expert list holding every expert):
+    ``num_experts`` words ``(copies << 16) | start``, then each expert's slots rotated by
+    ``ep_rank``. A pick in row r takes copy ``h(r) % copies``, h(r) = (r * 0x9E3779B1 mod 2^32) >> 16,
+    so ranks spread a hot expert's rows over its copies. Copies hold the same bytes."""
+    slots_of: List[List[int]] = [[] for _ in range(num_experts)]
+    for slot, expert in enumerate(global_assignments):
+        slots_of[int(expert)].append(slot)
+    meta, flat = [], []
+    for slots in slots_of:
+        if not slots or len(global_assignments) >= 1 << 16:
+            raise ValueError("MegaMoE replica placement must hold every expert in < 65536 slots")
+        k = ep_rank % len(slots)
+        meta.append((len(slots) << 16) | len(flat))
+        flat.extend(slots[k:] + slots[:k])
+    return torch.tensor(meta + flat, dtype=torch.int32)
+
+
+def _replica_slots(table: torch.Tensor, expert_ids: torch.Tensor, num_experts: int) -> torch.Tensor:
+    """``replica_slot_table``'s slots of ``expert_ids`` [rows, top_k], as the routing launch picks."""
+    rows = torch.arange(expert_ids.shape[0], device=expert_ids.device, dtype=torch.int64)[:, None]
+    meta = table[expert_ids.long()].long()
+    copy = (((rows * 0x9E3779B1) & 0xFFFFFFFF) >> 16) % (meta >> 16)
+    return table[num_experts + (meta & 0xFFFF) + copy].to(torch.int32)
 
 
 @functools.cache
@@ -606,10 +666,14 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         # DeepSeek V4 and V4.1 apply routing weights before FC2 input quantization.
         architectures = getattr(model_config.pretrained_config, "architectures", None) or ()
         self.apply_topk_in_fc1 = any(
-            architecture in ("DeepseekV4ForCausalLM", "DeepseekV41ForCausalLM")
-            for architecture in architectures
+            architecture in _DEEPSEEK_V4_ARCHITECTURES for architecture in architectures
         )
         self._topk_idx_dtype = torch.int32 if get_sm_version() == 107 else torch.int64
+        # The fused launch writes unpadded scale rows, so only shapes without SF padding fuse.
+        self._fuses_route_quant = (
+            self.routing_method.sqrt_softplus_bias_selection
+            and megamoe_activation_sf_bytes_per_row(self.hidden_size) == self.hidden_size // 16
+        )
 
         # The wire format must match on all EP ranks: it sizes the symmetric workspace.
         combine_format = os.environ.get("MEGAMOE_COMBINE_FORMAT", "bf16")
@@ -625,6 +689,20 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         # MERGE lockstep sweep). Must be set identically on ALL ranks (it
         # gates collective tuning behavior).
         self.tactic_autotune = os.environ.get("MEGAMOE_TACTIC_AUTOTUNE", "0") == "1"
+
+        # The FP8 shared expert runs inside the fused kernel once fuse_shared_expert succeeds.
+        self.num_fused_shared_expert = type(self).fused_shared_expert_count(model_config)
+        if self.num_fused_shared_expert and not (
+            combine_format == "bf16"
+            and self.activation_type is ActivationType.Swiglu
+            and self.act_alpha is None
+            and self.act_beta is None
+        ):
+            _warn_shared_expert_fusion_ignored("needs the bf16 combine and a plain SwiGLU")
+            self.num_fused_shared_expert = 0
+        self._shared_expert: Optional[dict] = None
+        # (launch bucket, live tokens) of the last MXFP8 quantization of the shared expert's input.
+        self._shared_quantized: Optional[Tuple[int, int]] = None
 
         # Buffer sizing. MoE layers execute serially per forward; one pool
         # sized to the worst-case per-rank tokens covers every layer. The
@@ -655,6 +733,13 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         # Lockstep per-chunk cross-rank max for the NEXT run_moe (set via
         # ``set_adaptive_launch_tokens``); ``None`` -> full bucket.
         self._active_launch_max_tokens: Optional[int] = None
+        # (bucket ids buffer, ids, weights, x, x_sf) written by the last fused route+quant launch.
+        self._prestaged: Optional[Tuple[torch.Tensor, ...]] = None
+        # Expert -> slot table of a static placement (built in create_weights), with copies a
+        # ``replica_slot_table``, and its slot -> expert assignments.
+        self._slot_of_expert: Optional[torch.Tensor] = None
+        self._expert_of_slot: Optional[torch.Tensor] = None
+        self._replicated = False
 
         # Resolve EP ProcessGroup at construction. Resolving at forward
         # time would be collective on a non-synchronous call stack and
@@ -860,17 +945,92 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         # registers mega-format derived parameters alongside the raw
         # NVFP4 family so per-slot migration stays byte-consistent.
 
+    @classmethod
+    def fused_shared_expert_count(cls, model_config: ModelConfig) -> int:
+        """Run the FP8 shared expert inside the fused kernel (moe_config.megamoe_fuse_shared_expert).
+
+        Only on SM100/SM103 under attention DP with one shared expert, which is then rank-local.
+        """
+        if not model_config.megamoe_fuse_shared_expert:
+            return 0
+        # Only DeepseekV4MoE hands its shared expert over and keeps it when the fusion is refused.
+        architectures = getattr(model_config.pretrained_config, "architectures", None) or ()
+        mapping = model_config.mapping
+        n_shared_experts = getattr(model_config.pretrained_config, "n_shared_experts", 0) or 0
+        if not any(architecture in _DEEPSEEK_V4_ARCHITECTURES for architecture in architectures):
+            reason = "not a DeepSeek-V4 model"
+        elif get_sm_version() not in (100, 103):
+            reason = "needs SM100/SM103"
+        elif not mapping.enable_attention_dp or mapping.moe_tp_size != 1:
+            reason = "needs attention DP with moe_tensor_parallel_size 1"
+        elif n_shared_experts != 1:
+            reason = "needs exactly one shared expert"
+        else:
+            return 1
+        _warn_shared_expert_fusion_ignored(reason)
+        return 0
+
+    def can_fuse_shared_expert(self, shared_experts) -> bool:
+        """Whether ``fuse_shared_expert`` would take over this MLP (builds and drops its weights)."""
+        return (
+            self.num_fused_shared_expert > 0
+            and self._shared_expert is None
+            and build_shared_expert_weights(shared_experts, self.hidden_size) is not None
+        )
+
+    def decline_shared_expert(self) -> None:
+        """Keep the shared expert separate: ``fuse_shared_expert`` refuses it from now on."""
+        self.num_fused_shared_expert = 0
+
+    def fuse_shared_expert(self, shared_experts) -> bool:
+        """Take over a gated FP8 block-scale MLP; returns whether the fused kernel now runs it."""
+        if self.num_fused_shared_expert == 0 or self._shared_expert is not None:
+            return False
+        weights = build_shared_expert_weights(shared_experts, self.hidden_size)
+        if weights is None:
+            logger.warning_once(
+                "[MegaMoECuteDsl] the shared expert is not a fusable FP8 block-scale MLP; "
+                "it keeps running separately.",
+                key="megamoe_shared_expert_not_fused",
+            )
+            return False
+        for name in ("fc1_weight", "fc1_weight_sf", "fc2_weight", "fc2_weight_sf"):
+            self.register_buffer(f"shared_{name}", weights.pop(name), persistent=False)
+        self._shared_expert = weights
+        device = self.shared_fc1_weight.device
+        for max_T in self._maxt_buckets:
+            shared_activation_buffers(max_T, self.hidden_size, device)
+        logger.info_once(
+            "[MegaMoECuteDsl] the FP8 shared expert runs inside the fused kernel.",
+            key="megamoe_shared_expert_fused",
+        )
+        return True
+
+    def _shared_activation_target(
+        self, num_tokens: int
+    ) -> Optional[Tuple[int, torch.Tensor, torch.Tensor]]:
+        """The launch bucket and its MXFP8 buffers for the shared expert's input, if fused and they fit."""
+        if self._shared_expert is None:
+            return None
+        launch_max_T = self._select_launch_max_tokens(self._active_launch_max_tokens)
+        if num_tokens > launch_max_T:
+            # run_moe rejects this launch; the bucket's buffers must not be overrun first.
+            return None
+        x8, x8_sf = shared_activation_buffers(
+            launch_max_T, self.hidden_size, self.shared_fc1_weight.device
+        )
+        return launch_max_T, x8, x8_sf
+
     # ------------------------------------------------------------------
     # EP process-group resolution (no collective at forward time)
     # ------------------------------------------------------------------
     def _maybe_init_torch_dist_under_mpi(self):
         """Bootstrap a torch.distributed NCCL WORLD group under the MPI orchestrator.
 
-        The MPI orchestrator (trtllm-bench / mpirun) never calls
-        ``init_process_group``, but the symmetric-memory rendezvous needs a
-        ProcessGroup; for pure DEP a node-local NCCL WORLD suffices. No-op
-        under Ray or single-rank. Failures propagate: a rank that retried
-        ``init_process_group`` alone would never rendezvous with its peers.
+        The symmetric-memory rendezvous needs a ProcessGroup; for pure DEP a
+        node-local NCCL WORLD suffices. No-op under Ray or single-rank. Failures
+        propagate: a rank that retried ``init_process_group`` alone would never
+        rendezvous with its peers.
         """
         from tensorrt_llm._torch.distributed.initialization import ensure_cutedsl_torch_distributed
 
@@ -949,6 +1109,16 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         # Step 2-3: quant method registers all NVFP4 + MegaMoE-format params.
         self.quant_method = self._get_quant_method()
         self.quant_method.create_weights(self)
+        # A static placement (one copy per expert or a replicated cover) is applied by the routing
+        # launch, which writes slots.
+        self._slot_of_expert = self._make_slot_table()
+        if self._slot_of_expert is not None:
+            with torch.inference_mode(False):
+                self._expert_of_slot = torch.tensor(
+                    list(self.initial_global_assignments),
+                    dtype=torch.int32,
+                    device=self._slot_of_expert.device,
+                )
         # Step 4.
         self._weights_created = True
 
@@ -1114,6 +1284,53 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             "source weights are released after initial packing."
         )
 
+    @property
+    def maps_expert_slots(self) -> bool:
+        """Whether this layer maps routed experts to slots itself (a static placement), so the
+        scheduler hands it expert ids instead of running the balancer's routing."""
+        return self._slot_of_expert is not None
+
+    def _routing_table(self, global_assignments: List[int]) -> torch.Tensor:
+        if self._replicated:
+            return replica_slot_table(global_assignments, int(self.num_experts), int(self.ep_rank))
+        return _slot_table(global_assignments)
+
+    def _make_slot_table(self) -> Optional[torch.Tensor]:
+        balancer = self.layer_load_balancer
+        if balancer is None or not balancer.is_static_routing() or self.ep_size == 1:
+            return None
+        assignments = list(self.initial_global_assignments)
+        if set(assignments) != set(range(self.num_experts)):
+            return None
+        self._replicated = self.num_slots != self.num_experts
+        # A normal (not inference) tensor at a fixed address, rewritten in place when experts move.
+        with torch.inference_mode(False):
+            return self._routing_table(assignments).to(
+                torch.device("cuda", torch.cuda.current_device())
+            )
+
+    def on_expert_placement_changed(self, global_assignments: List[int]) -> None:
+        """The warmup placement moved experts between slots: rewrite the routing table in place, so
+        CUDA graphs captured before the move route to the new slots. The caller moved the per-slot
+        weights and the balancer's table, with the device idle."""
+        with torch.inference_mode():
+            self._slot_of_expert.copy_(self._routing_table(global_assignments))
+            self._expert_of_slot.copy_(torch.tensor(global_assignments, dtype=torch.int32))
+
+    def slots_of_experts(self, expert_ids: torch.Tensor) -> torch.Tensor:
+        """The slots the static placement routes ``expert_ids`` [rows, top_k] to, as the launch does."""
+        if self._replicated:
+            return _replica_slots(self._slot_of_expert, expert_ids, int(self.num_experts))
+        return torch.index_select(self._slot_of_expert, 0, expert_ids.reshape(-1)).view(
+            expert_ids.shape
+        )
+
+    def experts_of_slots(self, slot_ids: torch.Tensor) -> torch.Tensor:
+        """The experts the static placement holds in ``slot_ids``."""
+        return torch.index_select(self._expert_of_slot, 0, slot_ids.reshape(-1)).view(
+            slot_ids.shape
+        )
+
     def _build_weight_view(self) -> MegaMoECuteDslWeightView:
         """Bundle the MegaMoE-format weight tensors registered by the
         quant method. ``run_moe`` calls this once per chunk so the
@@ -1133,6 +1350,69 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
     # ------------------------------------------------------------------
     # MoE-contract methods
     # ------------------------------------------------------------------
+    # The routing launch adds its picks to the warmup placement's counters.
+    counts_routes = True
+
+    def _route_quant_fuses(self) -> bool:
+        # The fused launch quantizes x as is; a pre-quant scale (AWQ/ARC) must apply first.
+        return self._fuses_route_quant and getattr(self, "fc31_act_scale", None) is None
+
+    def takes_router_logit_partials(self) -> bool:
+        return self._route_quant_fuses()
+
+    def try_fused_route_quant(
+        self,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        route_counters: Optional[RouteCounters] = None,
+    ) -> Optional[MoEFusedRouteQuant]:
+        """Sqrt-softplus routing and NVFP4 input quantization in one launch, written straight into
+        the launch bucket's kernel inputs once the scheduler has chosen the bucket; a static
+        placement's slots go into the bucket and ``route_counters`` get the picks."""
+        if not self._route_quant_fuses():
+            return None
+        bucket = self._route_quant_bucket(x.shape[0], self.routing_method.top_k, x.device, x.dtype)
+        table = self._slot_of_expert
+        shared_target = self._shared_activation_target(x.shape[0])
+        ids, weights, x_fp4, x_sf, _ = dsv4_route_nvfp4_quant(
+            router_logits,
+            self.routing_method.e_score_correction_bias,
+            x,
+            self.fc31_input_scale,
+            self.routing_method.top_k,
+            self.routing_method.routed_scaling_factor,
+            torch.float32,
+            staged=bucket,
+            slot_of_expert=None if bucket is None else table,
+            replicas=bucket is not None and self._replicated,
+            counters=route_counters,
+            mxfp8=None if shared_target is None else shared_target[1:],
+        )
+        if shared_target is not None:
+            self._shared_quantized = (shared_target[0], x.shape[0])
+        if bucket is not None:
+            self._prestaged = (bucket[0], ids, weights, x_fp4, x_sf)
+        return MoEFusedRouteQuant(
+            ids, weights, x_fp4, x_sf, routes_counted=route_counters is not None
+        )
+
+    def _route_quant_bucket(self, num_tokens: int, top_k: int, device, output_dtype):
+        """The chosen launch bucket's (ids, weights, activation, scales) when the fused launch can
+        write them directly, else None."""
+        if self._active_launch_max_tokens is None or self.tactic_autotune or num_tokens == 0:
+            return None
+        launch_max_T = self._select_launch_max_tokens(self._active_launch_max_tokens)
+        if num_tokens > launch_max_T or launch_max_T in self._genphase_direct_input_buckets:
+            return None
+        bufs = self._acquire_buffers(
+            top_k=top_k,
+            hidden=self.hidden_size,
+            device=device,
+            output_dtype=output_dtype,
+            launch_max_T=launch_max_T,
+        )
+        return bufs.topk_idx_local, bufs.topk_weights, bufs.activation, bufs.activation_sf
+
     def quantize_input(
         self,
         x: Union[torch.Tensor, "Fp4QuantizedTensor"],
@@ -1180,28 +1460,34 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             empty_x = torch.empty((0, hidden // 2), dtype=torch.uint8, device=x_bf16.device)
             empty_sf = torch.empty((0, sf_cols), dtype=torch.uint8, device=x_bf16.device)
             return empty_x, empty_sf
+        x_routed = x_bf16
         fc31_act_scale = getattr(self, "fc31_act_scale", None)
         if fc31_act_scale is not None:
             # Product stays bf16, which is what ``fp4_quantize`` below is given
             # on every other route into it: ``_SUPPORTED_ACTIVATION_DTYPES``
             # admits bf16 activations only, so ``fc31_act_scale``, created at
             # ``module.dtype``, is bf16 as well.
-            x_bf16 = x_bf16 * fc31_act_scale
+            x_routed = x_bf16 * fc31_act_scale
         # Leave a replica plan's SMs to its concurrent HALO-Q/TMA kernel. The
         # default overload remains unchanged without a plan.
         if reserved_sms > 0 and _fp4_quantize_has_sm_budget():
             # Positional: a keyword argument costs the op dispatch about a microsecond.
             x_fp4, x_sf = torch.ops.trtllm.fp4_quantize.sm_budget(
-                x_bf16, self.fc31_input_scale, 16, False, False, reserved_sms
+                x_routed, self.fc31_input_scale, 16, False, False, reserved_sms
             )
         else:
             x_fp4, x_sf = torch.ops.trtllm.fp4_quantize(
-                x_bf16,
+                x_routed,
                 self.fc31_input_scale,
                 16,  # scaling_vector_size == Nvfp4BlockSize
                 False,  # sf_use_ue8m0
                 False,  # is_sf_swizzled - MegaMoE expects plain K-major
             )
+        shared_target = self._shared_activation_target(x_bf16.shape[0])
+        if shared_target is not None:
+            # The shared expert takes the unscaled input.
+            mxfp8_quantize_megamoe(x_bf16, shared_target[1], shared_target[2])
+            self._shared_quantized = (shared_target[0], x_bf16.shape[0])
         # ``fp4_quantize(is_sf_swizzled=False)`` returns LINEAR layout
         # ``(rows, ceil(hidden/16))`` with no column pad. The kernel TMA
         # load needs ``pad_up(ceil_div(hidden, 16), 4)`` bytes per row
@@ -1260,10 +1546,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
     ) -> torch.Tensor:
         """Run the fused MegaMoE CuteDSL kernel on pre-quantized inputs.
 
-        Keeps the scheduler's ``int32`` token-selected experts on SM107 and
-        delegates the staging + kernel launch to :meth:`_run_moe`, which
-        returns the reduced ``(T, hidden)`` output. Other architectures keep
-        the existing ``int64`` kernel ABI.
+        Delegates the staging + kernel launch to :meth:`_run_moe`; staging widens
+        the ``int32`` expert ids to the kernel's index type.
         """
         del workspace  # The symmetric buffer is this backend's own workspace.
         x = ctx.x
@@ -1639,6 +1923,31 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         in_kernel_fc2_reduce = self._use_in_kernel_fc2_reduce(launch_max_T)
         if in_kernel_fc2_reduce and num_tokens > 0:
             combine_output[:num_tokens].zero_()
+        shared_kwargs = {}
+        if self._shared_expert is not None:
+            shared_activation, shared_activation_sf = shared_activation_buffers(
+                launch_max_T, hidden, combine_output.device
+            )
+            shared_kwargs = dict(
+                shared_fc1_weight=self.shared_fc1_weight,
+                shared_fc1_weight_sf=self.shared_fc1_weight_sf,
+                shared_fc2_weight=self.shared_fc2_weight,
+                shared_fc2_weight_sf=self.shared_fc2_weight_sf,
+                shared_activation=shared_activation,
+                shared_activation_sf=shared_activation_sf,
+                shared_num_tokens=num_tokens,
+                shared_intermediate_size=self._shared_expert["intermediate_size"],
+                shared_gate_up_clamp=self._shared_expert["gate_up_clamp"],
+            )
+            if num_tokens > 0:
+                # The bucket's combine buffer is overwritten by the next layer, and no add
+                # copies the result out of it any more. The kernel ABI requires the output's
+                # row count to keep the bucket's divisibility; rows past num_tokens are dropped.
+                combine_output = torch.empty(
+                    (pad_up(num_tokens, math.gcd(launch_max_T, 128)), 1, hidden),
+                    dtype=combine_output.dtype,
+                    device=combine_output.device,
+                )
 
         set_active_megamoe_profiling_scratch(
             scratch_provider.get_regions()
@@ -1718,6 +2027,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 combine_format=self.combine_format,
                 tactic_autotune=bool(self.tactic_autotune),
                 num_tokens=num_tokens,
+                **shared_kwargs,
                 # Helper-free launches omit the READY gate.
                 helper_expert_count=_S_active,
                 hot_expert_weight_ready_flags=helper_ready_flags,
@@ -1769,6 +2079,9 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             self.apply_topk_in_fc1,
             str(device),
             output_dtype,
+            None
+            if self._shared_expert is None
+            else (self._shared_expert["intermediate_size"], self._shared_expert["gate_up_clamp"]),
         )
         if key in _MEGAMOE_PRIMED_LADDERS:
             return
@@ -1811,15 +2124,11 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 output_dtype=output_dtype,
                 launch_max_T=max_T,
             )
-            self._stage_inputs(
-                bufs=bufs,
-                x=None,
-                x_sf=None,
-                topk_idx=None,
-                topk_weights=None,
-                num_tokens=0,
-                top_k=top_k,
-                stage_activation=False,
+            stage_megamoe_inputs(
+                torch.empty((0, top_k), dtype=torch.int32, device=device),
+                torch.empty((0, top_k), dtype=torch.float32, device=device),
+                bufs.topk_idx_local,
+                bufs.topk_weights,
             )
             # Bucket priming has no replica plan and therefore compiles the S=0 path.
             self._launch_megamoe_kernel(
@@ -1886,6 +2195,14 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 f"{self.max_num_tokens}). This indicates the scheduler's "
                 f"lockstep chunk-max hint diverged from the staged tokens."
             )
+        if self._shared_expert is not None:
+            quantized, self._shared_quantized = self._shared_quantized, None
+            if num_tokens > 0 and quantized != (launch_max_T, num_tokens):
+                raise RuntimeError(
+                    f"MegaMoECuteDsl: the fused shared expert's MXFP8 input was written for "
+                    f"(bucket, tokens) = {quantized}, but this launch is ({launch_max_T}, "
+                    f"{num_tokens}); route + quantize or quantize_input must precede run_moe."
+                )
         if num_tokens == 0 and self.ep_size == 1:
             return torch.empty((0, hidden), dtype=output_dtype, device=device)
 
@@ -1911,8 +2228,21 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             output_dtype=output_dtype,
             launch_max_T=launch_max_T,
         )
+        prestaged, self._prestaged = self._prestaged, None
+        # The fused route+quant launch already wrote exactly these inputs into this bucket, as expert
+        # slots when a static placement maps them.
+        inputs_staged = (
+            prestaged is not None
+            and prestaged[0] is bufs.topk_idx_local
+            and all(a is b for a, b in zip((topk_idx, topk_weights, x, x_sf), prestaged[1:]))
+        )
+        if replica_plan is None and (topk_idx.dtype != torch.int32 or not topk_idx.is_contiguous()):
+            topk_idx = topk_idx.to(torch.int32).contiguous()
+        if self._slot_of_expert is not None and not inputs_staged:
+            topk_idx = self.slots_of_experts(topk_idx)
         use_direct_inputs = (
-            self.ep_size > 1
+            not inputs_staged
+            and self.ep_size > 1
             and not self.tactic_autotune
             and num_tokens == launch_max_T
             and launch_max_T in self._genphase_direct_input_buckets
@@ -1934,7 +2264,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             and topk_idx.data_ptr() % 16 == 0
             and topk_weights.data_ptr() % 16 == 0
         )
-        if not use_direct_routing_inputs:
+        if replica_plan is not None and not use_direct_routing_inputs:
+            # HALO-Q writes a replica plan's routes on its own stream: only their copy waits for it.
             self._stage_inputs(
                 bufs=bufs,
                 x=x,
@@ -1945,6 +2276,17 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 top_k=top_k,
                 stage_activation=not use_direct_inputs,
                 replica_plan=replica_plan,
+            )
+        elif not use_direct_routing_inputs and not inputs_staged:
+            stage_megamoe_inputs(
+                topk_idx,
+                topk_weights,
+                bufs.topk_idx_local,
+                bufs.topk_weights,
+                x=None if use_direct_inputs else x,
+                x_sf=None if use_direct_inputs else x_sf,
+                act_buffer=bufs.activation,
+                sf_buffer=bufs.activation_sf,
             )
         return self._launch_megamoe_kernel(
             activation=x if use_direct_inputs else bufs.activation,

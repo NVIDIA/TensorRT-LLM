@@ -57,6 +57,10 @@ class AllGatherReduceScatter(Communication):
         """
         return True
 
+    def carries_unrouted_rows(self) -> bool:
+        """The gathered expert ids reach the backends unchanged."""
+        return True
+
     def dispatch(
         self,
         hidden_states: torch.Tensor,
