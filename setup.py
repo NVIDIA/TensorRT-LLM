@@ -716,6 +716,7 @@ setup(
     ],
     distclass=BinaryDistribution,
     options=get_build_state_options(),
+    license="NVIDIA Software License Agreement, Apache License 2.0, and others",
     keywords="nvidia tensorrt deeplearning inference",
     package_data={
         'tensorrt_llm':

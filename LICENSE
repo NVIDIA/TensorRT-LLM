@@ -11,6 +11,10 @@ products:
 - cpp/tensorrt_llm/kernels/trtllmGenKernels/gemm/trtllmGen_gemm_export/cubins
 - cpp/tensorrt_llm/kernels/trtllmGenKernels/gemmGatedAct/trtllmGen_gatedAct_export/cubins
 
+These licenses are available at the following URLs:
+- NVIDIA Software License Agreement: https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-software-license-agreement/
+- Product Specific Terms for NVIDIA AI products: https://www.nvidia.com/en-us/agreements/enterprise-software/product-specific-terms-for-ai-products/
+
 This project is licensed under the Apache 2.0 license, unless otherwise
 specified. The full text for every license used in this project is
 available below.
@@ -115,6 +119,10 @@ Original Source: https://developer.nvidia.com/nvshmem
 Copyright (c) 2016-2021, NVIDIA Corporation. All rights reserved.
 Licensed under the NVIDIA Software Development Kits License Agreement
 and the NVSHMEM Supplement, with separate third-party license notices.
+
+The NVIDIA Software Development Kits License Agreement and the NVSHMEM
+Supplement are available at the following URL:
+https://archive.docs.nvidia.com/nvshmem/api/3.2.5/sla.html
 
 --------------------------------------------------------------------------------
 Quack
