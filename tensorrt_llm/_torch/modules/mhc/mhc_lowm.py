@@ -7,10 +7,12 @@ lagged boundary's new residual stream and the normalized input of the next subla
 boundary's coefficients (``pre`` / ``post`` / ``comb`` for the *next* boundary) are computed
 separately from the new residual and can run off the critical path.
 
-The split boundary runs for at most 64 tokens. ``mhc_allreduce_post_collapse_norm`` also
-all-reduces the previous sublayer's tensor-parallel partial output in the same launch: over the
-IPC workspace when the group is inside one tray, or over the MNNVL fabric-memory workspace when it
-spans trays.
+The split boundary runs for at most 64 tokens, or on SM100/SM103 for up to 4096 (from 1024 rows
+attention entries with a post update keep DeepGEMM's ``mega_mhc``), where the coefficients are one
+CuTe DSL launch (``mHC.lagged_coefficients``): a tcgen05 kernel from 512 tokens, an mma.sync one
+below. ``mhc_allreduce_post_collapse_norm`` also all-reduces the previous sublayer's
+tensor-parallel partial output in the same launch: over the IPC workspace when the group is inside
+one tray, or over the MNNVL fabric-memory workspace when it spans trays.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ from dataclasses import dataclass
 
 import torch
 
+from tensorrt_llm._utils import is_blackwell_datacenter
 from tensorrt_llm.math_utils import pad_up
 
 from ...cute_dsl_utils import graph_safe_from_dlpack
@@ -36,51 +39,98 @@ def _device_supported() -> bool:
     )
 
 
-def mhc_split_enabled(num_tokens: int, hidden_size: int, mult: int) -> bool:
-    """Whether a boundary of ``num_tokens`` rows can take the split (critical + coefficient) path."""
+# Split boundaries of more rows than this need the one-launch CuTe DSL coefficient half.
+LOWM_MAX_TOKENS = 64
+# The mma.sync coefficient kernel's largest batch (``mHC`` takes the tcgen05 one from fewer rows).
+MMA_SYNC_MAX_TOKENS = 1023
+_SPLIT_MAX_TOKENS = 4096
+
+
+@functools.lru_cache(maxsize=None)
+def split_max_tokens(mega_mhc: bool = True) -> int:
+    """Rows up to which boundaries split on SM100/SM103: 1023 for boundaries that keep ``mega_mhc``
+    from 1024 rows, 4096 for the others. Elsewhere ``LOWM_MAX_TOKENS``."""
+    if not is_blackwell_datacenter():
+        return LOWM_MAX_TOKENS
+    return MMA_SYNC_MAX_TOKENS if mega_mhc else _SPLIT_MAX_TOKENS
+
+
+def mhc_split_enabled(num_tokens: int, hidden_size: int, mult: int, mega_mhc: bool = True) -> bool:
+    """Whether a boundary of ``num_tokens`` rows can take the split (critical + coefficient) path
+    (``mega_mhc``: see :func:`split_max_tokens`); above ``LOWM_MAX_TOKENS`` rows its coefficients
+    also need ``mHC.coefficient_kernel_ready``."""
     if not _device_supported():
         return False
     if mult != 4 or hidden_size % 256 or hidden_size // 8 > 1024:
         return False
     # FORCE_DETERMINISTIC keeps every boundary size on mhc_fused_hc's pinned tactic.
-    return 0 < num_tokens <= 64 and os.getenv("FORCE_DETERMINISTIC", "0") != "1"
+    return (
+        0 < num_tokens <= split_max_tokens(mega_mhc)
+        and os.getenv("FORCE_DETERMINISTIC", "0") != "1"
+    )
+
+
+@functools.lru_cache(maxsize=None)
+def _sm_count() -> int:
+    return torch.cuda.get_device_properties().multi_processor_count
+
+
+def _vectors(m: int, hidden: int) -> int:
+    """8-wide vectors per thread of the critical half: one token per CTA fills an SM's registers,
+    so batches above one wave of SMs give each thread several vectors and fit more tokens per SM."""
+    if m <= _sm_count() or hidden % (32 * 8 * 4):
+        return 1
+    return 2 if m <= 2 * _sm_count() else 4
 
 
 @functools.lru_cache(maxsize=None)
 def _compiled_post_collapse_norm(
-    m: int, hidden: int, norm_eps: float, post_update: bool, use_pdl: bool, quant: str | None = None
+    hidden: int,
+    norm_eps: float,
+    post_update: bool,
+    use_pdl: bool,
+    quant: str | None = None,
+    collapse: bool = True,
+    vectors: int = 1,
+    residual_after_wait: bool = False,
+    moe_rows: int = 0,
 ):
-    import cuda.bindings.driver as cuda
     import cutlass
     import cutlass.cute as cute
 
+    from ...kernels.blackwell.mhc.mhc_boundary import _mat
     from ...kernels.blackwell.mhc.mhc_split_boundary import MhcPostCollapseNormKernel
 
     kernel = MhcPostCollapseNormKernel(
-        hidden=hidden, norm_eps=norm_eps, use_pdl=use_pdl, post_update=post_update, quant=quant
+        hidden=hidden,
+        norm_eps=norm_eps,
+        use_pdl=use_pdl,
+        post_update=post_update,
+        quant=quant,
+        l2_residual=True,
+        collapse=collapse,
+        vectors=vectors,
+        residual_after_wait=residual_after_wait,
+        moe_rows=moe_rows,
     )
-    dev = torch.device("cuda")
-    x = torch.empty((m, hidden), dtype=torch.bfloat16, device=dev)
-    res = torch.empty((m, 4 * hidden), dtype=torch.bfloat16, device=dev)
-    post = torch.empty((m, 4), dtype=torch.float32, device=dev)
-    comb = torch.empty((m, 16), dtype=torch.float32, device=dev)
-    pre = torch.empty((m, 4), dtype=torch.float32, device=dev)
-    w = torch.empty((1, hidden), dtype=torch.bfloat16, device=dev)
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    m = cute.sym_int()
+    bf16, f32 = cutlass.BFloat16, cutlass.Float32
     return cute.compile(
         kernel,
-        graph_safe_from_dlpack(x),
-        graph_safe_from_dlpack(res),
-        graph_safe_from_dlpack(post),
-        graph_safe_from_dlpack(comb),
-        graph_safe_from_dlpack(pre),
-        graph_safe_from_dlpack(w),
-        graph_safe_from_dlpack(res),
-        graph_safe_from_dlpack(x),
+        _mat(bf16, m, hidden),
+        _mat(bf16, m, 4 * hidden),
+        _mat(f32, m, 4),
+        _mat(f32, m, 16),
+        _mat(f32, m, 4),
+        _mat(bf16, 1, hidden),
+        _mat(bf16, m, 4 * hidden),
+        _mat(bf16, m, hidden),
         cutlass.Int64(0),
         cutlass.Int64(0),
         cutlass.Int64(0),
-        stream,
+        cutlass.Int64(0),
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
     )
 
 
@@ -400,6 +450,35 @@ def mhc_allreduce_post_collapse_norm(
     return res_out.view(m, mult, hidden), out
 
 
+def mhc_post_update(
+    x: torch.Tensor,
+    residual_prev: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+) -> torch.Tensor:
+    """``mhc_post_mapping_cuda`` (``post[j] * x + sum_k comb[k][j] * residual[k]``, BF16) as one
+    launch of the critical half without its collapse: the same bits, ``[M, 4, H]``."""
+    m, mult, hidden = residual_prev.shape
+    assert mult == 4 and residual_prev.dtype == torch.bfloat16
+    res_flat = residual_prev.reshape(m, mult * hidden).contiguous()
+    x = x.reshape(m, hidden).contiguous()
+    post = post_mix.reshape(m, mult).to(torch.float32).contiguous()
+    comb = comb_mix.reshape(m, mult * mult).to(torch.float32).contiguous()
+    res_out = torch.empty_like(res_flat)
+    fn = _compiled_post_collapse_norm(
+        hidden,
+        0.0,
+        True,
+        get_env_enable_pdl(),
+        None,
+        collapse=False,
+        vectors=_vectors(m, hidden),
+    )
+    # pre / weight / out are unused without the collapse.
+    fn(x, res_flat, post, comb, post, x[:1], res_out, x, 0, 0, 0, 0)
+    return res_out.view(m, mult, hidden)
+
+
 def mhc_post_collapse_norm(
     x_prev: torch.Tensor | None,
     residual_prev: torch.Tensor,
@@ -410,6 +489,7 @@ def mhc_post_collapse_norm(
     norm_eps: float,
     mxfp8: bool = False,
     nvfp4_scale: torch.Tensor | None = None,
+    residual_after_wait: bool = False,
 ) -> tuple[torch.Tensor, ...]:
     """Critical half of a lagged mHC boundary.
 
@@ -423,11 +503,11 @@ def mhc_post_collapse_norm(
     With ``mxfp8`` a third element holds ``torch.ops.trtllm.mxfp8_quantize(layer_input, True)``
     (the scales of the swizzled layout's padding rows, which no product reads, are left unwritten);
     with an FP32 ``nvfp4_scale [1]`` it holds ``fp4_quantize(layer_input, nvfp4_scale, 16, False,
-    False)``.
+    False)``. With a post update the kernel reads ``residual_prev`` before its
+    programmatic-dependency wait unless ``residual_after_wait`` (see ``mHC.split_hc_lagged``).
+    ``x_prev`` may also be an un-reduced MoE output with ``rows`` ``[M, k, H]`` (contiguous per
+    token) and ``shared`` ``[M, H]`` BF16: the kernel sums it as its ``finalize()`` does.
     """
-    import cuda.bindings.driver as cuda
-    import cutlass
-
     m, mult, hidden = residual_prev.shape
     assert mult == 4 and residual_prev.dtype == torch.bfloat16
     post_update = x_prev is not None
@@ -435,6 +515,14 @@ def mhc_post_collapse_norm(
     pre = pre_mix.reshape(m, mult).to(torch.float32).contiguous()
     weight = norm_weight.to(torch.bfloat16).contiguous().view(1, hidden)
     out = torch.empty((m, hidden), dtype=torch.bfloat16, device=residual_prev.device)
+    rows = getattr(x_prev, "rows", None)
+    if rows is not None and x_prev.shared is None:
+        x_prev, rows = x_prev.finalize(), None
+    elif rows is not None:
+        assert rows.dtype == torch.bfloat16 and rows.shape[0] == m and rows.shape[2] == hidden
+        assert rows.stride(2) == 1 and rows.stride(1) == hidden
+        assert rows.stride(0) == rows.shape[1] * hidden
+        x_prev = x_prev.shared
     if post_update:
         x = x_prev.reshape(m, hidden).contiguous()
         post = post_mix_prev.reshape(m, mult).to(torch.float32).contiguous()
@@ -448,22 +536,28 @@ def mhc_post_collapse_norm(
         res_out = res_flat
     quant, quantized, scale_addr = _quantized_outputs(m, hidden, out.device, mxfp8, nvfp4_scale)
     fn = _compiled_post_collapse_norm(
-        m, hidden, float(norm_eps), post_update, get_env_enable_pdl(), quant
+        hidden,
+        float(norm_eps),
+        post_update,
+        get_env_enable_pdl(),
+        quant,
+        vectors=_vectors(m, hidden),
+        residual_after_wait=residual_after_wait,
+        moe_rows=0 if rows is None else rows.shape[1],
     )
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     fn(
-        graph_safe_from_dlpack(x),
-        graph_safe_from_dlpack(res_flat),
-        graph_safe_from_dlpack(post),
-        graph_safe_from_dlpack(comb),
-        graph_safe_from_dlpack(pre),
-        graph_safe_from_dlpack(weight),
-        graph_safe_from_dlpack(res_out),
-        graph_safe_from_dlpack(out),
-        cutlass.Int64(quantized[0].data_ptr() if quant else 0),
-        cutlass.Int64(quantized[1].data_ptr() if quant else 0),
-        cutlass.Int64(scale_addr),
-        stream,
+        x,
+        res_flat,
+        post,
+        comb,
+        pre,
+        weight,
+        res_out,
+        out,
+        quantized[0].data_ptr() if quant else 0,
+        quantized[1].data_ptr() if quant else 0,
+        scale_addr,
+        0 if rows is None else rows.data_ptr(),
     )
     if quant:
         return res_out.view(m, mult, hidden), out, quantized
