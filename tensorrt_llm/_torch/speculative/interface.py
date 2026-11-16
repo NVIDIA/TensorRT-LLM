@@ -2656,7 +2656,7 @@ class SpecWorkerBase(nn.Module, ABC):
         return sample_and_strict_accept(
             self.key_exchange,
             logits,
-            self.mapping.tp_rank * logits.shape[-1],
+            self._target_head_mapping.tp_rank * logits.shape[-1],
             spec_metadata.temperatures[:logits.shape[0]],
             self._gumbel_seed,
             GREEDY_TEMPERATURE_THRESHOLD,
