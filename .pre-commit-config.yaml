@@ -1465,7 +1465,7 @@ legacy-files: &legacy_files |
     )$
 # <<<< END AUTO-GENERATED >>>>
 
-# Full-project Pyrefly scans use the file set in pyproject.toml. The pre-commit
+# Full-project Pyrefly scans use product/test settings in pyproject.toml. The pre-commit
 # hook passes changed paths to the script's default changed-file mode.
 
 # Global exclude: vendored code + trtllm-gen FMHA artifacts (cubin pointers, export headers, cuda_ptx)
@@ -1641,6 +1641,6 @@ repos:
         language: script
         verbose: true
         require_serial: true
-        # Pass changed paths; the wrapper skips non-product Python inputs.
+        # Pass changed paths; the wrapper accepts product and test Python inputs.
         pass_filenames: true
-        files: ^(tensorrt_llm/.*\.pyi?$|pyproject\.toml$|scripts/(run_pyrefly\.sh|pyrefly_exclusion\.py)$|\.pre-commit-config\.yaml$)
+        files: (\.pyi?$|^pyproject\.toml$|^scripts/run_pyrefly\.sh$|^\.pre-commit-config\.yaml$)

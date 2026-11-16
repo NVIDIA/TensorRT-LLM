@@ -78,6 +78,7 @@ def _mixed_metadata(num_ctx_tokens: int, num_decodes: int) -> SimpleNamespace:
     cu_seqlens = torch.tensor([0, num_ctx_tokens], device=device, dtype=torch.long)
     mamba = SimpleNamespace(
         state_indices=state_indices,
+        replay_state_indices=state_indices,
         query_start_loc_long=cu_seqlens,
         query_start_loc=cu_seqlens.to(torch.int32),
         has_initial_states=torch.zeros(num_prefills, device=device, dtype=torch.bool),

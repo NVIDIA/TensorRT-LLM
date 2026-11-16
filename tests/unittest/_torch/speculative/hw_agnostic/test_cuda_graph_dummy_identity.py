@@ -50,6 +50,8 @@ def test_target_only_dummy_identity_is_unchanged():
 
 @pytest.mark.parametrize("physical_k", [1, 3, 8])
 def test_padding_families_never_consume_real_worker_slots(monkeypatch, physical_k):
+    dummy_id = None
+
     def cpu_allocator(original):
         def allocate(*args, **kwargs):
             kwargs["device"] = "cpu"

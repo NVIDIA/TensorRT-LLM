@@ -2113,6 +2113,66 @@ class TestDeepSeekV41(LlmapiAccuracyTestHarness):
             assert acceptance_length >= 3.0, (
                 f"DSpark acceptance length {acceptance_length:.3f} < 3.0")
 
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.threadleak(enabled=False)
+    def test_breakable_prefill_cuda_graph(
+            self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Breakable prefill graphs give eager prefill's greedy tokens on DEP4.
+
+        Bounded replay plans every attention-DP prefill batch, so the 128- and 1,500-token
+        prompts both run eagerly with the decoder pass from its own graphs.
+        """
+        for name in tuple(os.environ):
+            if name.startswith("TRTLLM_V41_"):
+                monkeypatch.delenv(name)
+
+        # Text keeps the greedy choices well apart; graph and eager rounding differ slightly.
+        text = (
+            "TensorRT-LLM accelerates reliable large language model inference "
+            "with efficient attention, parallelism, and CUDA graphs. ") * 100
+        sampling_params = SamplingParams(max_tokens=8,
+                                         min_tokens=8,
+                                         temperature=0,
+                                         ignore_eos=True,
+                                         detokenize=False,
+                                         add_special_tokens=False)
+
+        def run(backend):
+            with LLM(
+                    self.MODEL_PATH + "-NVFP4",
+                    tensor_parallel_size=4,
+                    moe_expert_parallel_size=4,
+                    gpus_per_node=4,
+                    enable_attention_dp=True,
+                    custom_tokenizer="deepseek_v41",
+                    trust_remote_code=True,
+                    # Breakable prefill graphs serve the checkpoint text-only.
+                    disable_mm_encoder=True,
+                    max_seq_len=4096,
+                    max_num_tokens=2048,
+                    max_batch_size=8,
+                    cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2, 4, 8],
+                                                      enable_padding=True),
+                    moe_config=MoeConfig(backend="TRTLLM"),
+                    kv_cache_config=KvCacheConfig(dtype="fp8",
+                                                  enable_block_reuse=False,
+                                                  tokens_per_block=128,
+                                                  max_tokens=65536,
+                                                  free_gpu_memory_fraction=0.5),
+                    sparse_attention_config={"algorithm": "csa2"},
+                    prefill_cuda_graph_backend=backend,
+                    prefill_capture_num_tokens=[128, 256, 512, 1024]) as llm:
+                text_ids = llm.tokenizer.encode(text, add_special_tokens=False)
+                token_ids = []
+                for prompt in (text_ids[:128], text_ids[:1500]):
+                    output = llm.generate_async(
+                        prompt, sampling_params=sampling_params).result()
+                    token_ids.append(output.outputs[0].token_ids)
+                return token_ids
+
+        assert run(PrefillCudaGraphBackend.BREAKABLE) == run(
+            PrefillCudaGraphBackend.DISABLED)
+
 
 _DEEPSEEK_V4_GSM8K_SYSTEM_PROMPT = (
     "Solve the problem carefully. End your response with a final line exactly "
@@ -3878,6 +3938,32 @@ class TestQwen3_30B_A3B_Instruct_2507(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_acc_spec=f"target_sparsity={target_sparsity}")
 
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device_memory(140000)
+    def test_skip_softmax_attention_kv_cache_manager_v1(self):
+        """Skip Softmax on KVCacheManager V1, which the C++ transceiver needs."""
+        sparse_attention_config = SkipSoftmaxAttentionConfig(
+            threshold_scale_factor={
+                "prefill": 18471.56,
+                "decode": 852.20,
+            })
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75,
+                                        enable_block_reuse=False,
+                                        dtype="fp8",
+                                        use_kv_cache_manager_v2=False)
+
+        with LLM(self.MODEL_PATH,
+                 attn_backend="TRTLLM",
+                 moe_config=MoeConfig(
+                     backend="TRTLLM" if get_sm_version() in (100,
+                                                              103) else "AUTO"),
+                 max_batch_size=256,
+                 max_num_tokens=100000,
+                 kv_cache_config=kv_cache_config,
+                 sparse_attention_config=sparse_attention_config) as llm:
+            task = LongBenchV1(self.MODEL_NAME)
+            task.evaluate(llm, extra_acc_spec="target_sparsity=0.9")
+
     @skip_pre_hopper
     @pytest.mark.skip_less_device(4)
     @parametrize_with_ids("fp8kv", [False, True])
@@ -5427,7 +5513,11 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
                           extra_acc_spec=extra_acc_spec,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
-    def _run_bf16_mtp(self, mocker, acceptance_key):
+    def _run_bf16_mtp(self,
+                      mocker,
+                      acceptance_key,
+                      tp_size=1,
+                      attention_dp=False):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
                                         enable_block_reuse=False)
         cuda_graph_config = CudaGraphConfig(enable_padding=True,
@@ -5437,8 +5527,9 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
 
         with LLM(self.MODEL_PATH,
                  trust_remote_code=True,
-                 tensor_parallel_size=1,
+                 tensor_parallel_size=tp_size,
                  moe_expert_parallel_size=1,
+                 enable_attention_dp=attention_dp,
                  max_seq_len=4096,
                  max_batch_size=32,
                  enable_chunked_prefill=True,
@@ -5456,6 +5547,19 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
 
     def test_bf16_mtp(self, mocker):
         self._run_bf16_mtp(mocker, "TestQwen3_5_35B_A3B::test_bf16_mtp")
+
+    @pytest.mark.skip_less_device(2)
+    def test_bf16_mtp_adp2(self, mocker):
+        """MTP under attention DP across mixed and generation-only ranks.
+
+        One rank's new prompts meet the other's generation-only steps, and
+        both ranks' draft MoE collectives must agree on their sizes (rows
+        mixed up across ranks show as a lower acceptance length).
+        """
+        self._run_bf16_mtp(mocker,
+                           "TestQwen3_5_35B_A3B::test_bf16_mtp_adp2",
+                           tp_size=2,
+                           attention_dp=True)
 
     def test_bf16_mtp_flashinfer_ring_replay(self, mocker, monkeypatch):
         """Same as test_bf16_mtp with GDN replay on the FlashInfer ring kernel."""
@@ -6213,6 +6317,24 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
                             index_share_for_mtp_iteration=True),
                         acceptance_length_key="test_nvfp4_adp4_mtp3_trtllm",
                         ple_host_offload=False)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(70000)
+    @pytest.mark.skip_less_host_memory(131072)
+    def test_nvfp4_adp4_cutlass_ple_offload(self,
+                                            monkeypatch: pytest.MonkeyPatch,
+                                            mocker) -> None:
+        """NVFP4 with attention DP4, expert EP4, and PLE host offload."""
+        self._run_evals(f"{llm_models_root()}/Qwen3.8-Flash-Next-NVFP4",
+                        tensor_parallel_size=4,
+                        moe_backend="CUTLASS",
+                        max_draft_len=None,
+                        expected_quant_algo=QuantAlgo.MIXED_PRECISION,
+                        monkeypatch=monkeypatch,
+                        mocker=mocker,
+                        moe_expert_parallel_size=4,
+                        enable_attention_dp=True)
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_device_memory(100000)
