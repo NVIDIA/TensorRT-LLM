@@ -377,6 +377,10 @@ metadata and cache behavior.
 All backend metadata types inherit from `AttentionMetadata`. The base contract
 includes sequence-length and request-level state, KV-cache manager and
 parameters, runtime feature flags, and optional CUDA-graph buffer management.
+A CUDA graph runner that keys its decode graphs by KV regime hands the
+regime ceiling to the graph's metadata through `set_decode_kv_regime`; only a
+backend whose decode path depends on the KV length keeps it (the FP4 MLA
+2x | 4x | two-stream dispatcher), the default ignores it.
 Sparse metadata subtypes consume only `SparseMetadataParams`, not
 backend-owned `SparseParams`.
 
@@ -385,8 +389,9 @@ are valid within one forward and shared by one runner's CUDA graphs, not across
 runners or concurrent forwards. Warmup must register enough capacity; capture
 probes capacity without growing the pool. `CUDAGraphRunner.clear()` releases it.
 Unlike `cuda_graph_buffers`, which may use a process-wide pool, this storage must
-not hold persistent plans or caches. Triton FP4 MLA opts its per-forward decode
-scratch into this pool; CuTe DSL partials remain metadata-local.
+not hold persistent plans or caches. Triton FP4 MLA and the opt-in 4x decoder
+share per-forward partials through this pool; the 2x CuTe DSL partials and all
+persistent decode plans remain metadata-local.
 
 **`TrtllmAttentionMetadata`** is the main metadata family. It adds paged-KV
 block information, TRTLLM runtime state, chunked-prefill/speculative-decode/Helix
@@ -641,13 +646,19 @@ The FMHA package is split by role:
   attends every partition through `Fp4MlaFmha.forward_context_partition`;
   non-final chunks must cover whole 16-token FP4 tiles, which the scheduler
   keeps by rounding them to the 128-token chunk unit. A prefix reused from
-  the block cache is attended the same way, so FP4 MLA block reuse requires
-  chunked prefill; the cached-KV path (`forward_context_with_cached_kv`)
-  rejects FP4 MLA layers. Reuse must also resume on a full FP4 tile, which
-  holds for hybrid linear-attention models (reuse ends on a recurrent-state
-  snapshot that the hybrid manager aligns to a cache block) but not for dense
-  FP4 MLA, whose reuse match can back off into a tile by the one-model
-  draft's prompt lookahead; dense FP4 MLA therefore keeps block reuse off.
+  the block cache is attended the same way, with or without chunked prefill;
+  without it, each partition holds up to `max_num_tokens` cached tokens, the
+  size of the FP8 context scratch. The cached-KV path
+  (`forward_context_with_cached_kv`) rejects FP4 MLA layers. Reuse must also
+  resume on a full FP4 tile. Hybrid linear-attention models resume on a
+  recurrent-state snapshot that the hybrid manager aligns to a cache block,
+  and keep block reuse tied to chunked prefill. The dense manager claims
+  whole cache blocks only, without the reuse-match backoff of one-model
+  drafts, and keeps its HP ring request-private
+  (`ReusePolicy.PRIVATE`), so the ring never cuts a match short. With reuse
+  on, a context step repacks the packed V of every page it reads, reused
+  pages included, and a dense manager's generation steps write packed V
+  directly, since they append to pages their request allocated.
   Disaggregated serving (Python NIXL transceiver only) transfers the K, K-scale, and BF16
   HP-tail roles; before its first forward, the generation worker rebuilds the
   derived V-scale and packed-V sidecars from the imported cache
@@ -656,7 +667,9 @@ The FMHA package is split by role:
   and the disaggregated launcher publish) keeps a single-copy cache without
   those sidecars (`fp4_mla_context_only_cache`), so it sizes and allocates
   only K, K scales, and the HP ring, runs context attention only, and skips
-  generation warmup shapes. Hybrid
+  generation warmup shapes. A one-model MTP drafter on such a worker must
+  draft a single token (`max_draft_len: 1`), because its later draft steps
+  are generation steps; the generation worker fills in the drafts it lacks. Hybrid
   linear-attention models (Kimi K3)
   keep their MLA latent cache in `MambaHybridCacheManagerV2`, which composes
   `Fp4MlaV2CacheLayoutPolicy` with the recurrent-state lifecycle: the policy

@@ -11,6 +11,9 @@ import triton.language as tl
 
 from tensorrt_llm._utils import get_sm_version
 
+from . import decode_4x as _decode_4x
+from . import decode_twostream as _decode_twostream
+from . import fp4_mla_dispatch as _dispatch
 from .cache_update import _prepare_fp4_mla_q_buffers
 from .config import (
     _FP4_MLA_CUTEDSL_BACKEND,
@@ -38,10 +41,11 @@ from .layout import (
     _get_fp4_mla_kv_cache_tensors,
     _get_fp4_mla_q_global_scale,
     _get_fp4_mla_swizzled_scale_size,
+    _max_sequences,
     _validate_fp4_mla_attention_q_shape,
     _validate_fp4_mla_cache_shape,
     _validate_fp4_mla_kv_storage_shape,
-    _workspace_has_capacity,
+    _workspace_capacity_numel,
     get_fp4_mla_v_scale_pool_view,
 )
 from .metadata import (
@@ -350,10 +354,11 @@ def _run_triton_attention_decode(
     # scratch. Otherwise the numerically equivalent single-level reduce avoids
     # growing the shared pool while capturing.
     if num_reduce_groups > 1 and torch.cuda.is_current_stream_capturing():
-        group_shape = (num_queries, num_reduce_groups, num_heads)
-        groups_ready = _workspace_has_capacity(
-            metadata, "_fp4_mla_attention_group_max_buf", group_shape
-        ) and _workspace_has_capacity(metadata, "_fp4_mla_attention_group_sum_buf", group_shape)
+        needed = num_queries * num_reduce_groups * num_heads
+        groups_ready = all(
+            _workspace_capacity_numel(metadata, name, torch.float32, q_fp4.device) >= needed
+            for name in ("_fp4_mla_attention_group_max_buf", "_fp4_mla_attention_group_sum_buf")
+        )
         if not groups_ready:
             num_reduce_groups = 1
     if num_reduce_groups <= 1:
@@ -372,6 +377,9 @@ def _run_triton_attention_decode(
             **launch_meta,
         )
     else:
+        stats_capacity = (
+            _max_sequences(metadata) * query_len_per_seq * _FP4_MLA_MAX_REDUCE_GROUPS * num_heads
+        )
         group_max = _ensure_workspace_tensor(
             metadata,
             "_fp4_mla_attention_group_max_buf",
@@ -379,6 +387,7 @@ def _run_triton_attention_decode(
             dtype=torch.float32,
             device=q_fp4.device,
             shared=True,
+            capacity_numel=stats_capacity,
         )
         group_sum = _ensure_workspace_tensor(
             metadata,
@@ -387,6 +396,7 @@ def _run_triton_attention_decode(
             dtype=torch.float32,
             device=q_fp4.device,
             shared=True,
+            capacity_numel=stats_capacity,
         )
         _attn_group_reduce_stats_kernel[(num_queries, num_head_blocks, num_reduce_groups)](
             group_max,
@@ -462,10 +472,11 @@ def _run_triton_attention_decode(
     # Use split PV during capture only when warmup registered enough partial
     # output scratch; unsplit PV is numerically equivalent and needs no pool growth.
     if page_split > 1 and torch.cuda.is_current_stream_capturing():
-        partial_ready = _workspace_has_capacity(
-            metadata,
-            "_fp4_mla_attention_pv_partial_buf",
-            (num_queries, page_split, num_heads, kv_lora_rank),
+        partial_ready = (
+            _workspace_capacity_numel(
+                metadata, "_fp4_mla_attention_pv_partial_buf", torch.float32, q_fp4.device
+            )
+            >= num_queries * page_split * num_heads * kv_lora_rank
         )
         if not partial_ready:
             page_split = 1
@@ -654,6 +665,9 @@ def _run_cutedsl_packed_decode(
     # generation lengths; a stale key means this call plans on other bounds.
     if metadata.fp4_mla_state.packed_plan_key != plan_geometry.key:
         _launch_fp4_mla_packed_plan(plan_geometry, kv_lens, metadata)
+    # Metadata-owned CuTe DSL partials reserve the largest batch/query width
+    # the plan can use and return contiguous views for the current geometry.
+    slot_rows_bound = max(plan_geometry.slot_rows_bound, task_capacity * physical_m)
     partial = _ensure_workspace_tensor(
         metadata,
         "_fp4_mla_packed_split_partial",
@@ -661,6 +675,7 @@ def _run_cutedsl_packed_decode(
         dtype=torch.float32,
         device=device,
         shared=False,
+        capacity_numel=slot_rows_bound * 512,
     )[:tasks]
     maxima = _ensure_workspace_tensor(
         metadata,
@@ -669,6 +684,7 @@ def _run_cutedsl_packed_decode(
         dtype=torch.float32,
         device=device,
         shared=False,
+        capacity_numel=slot_rows_bound,
     )[:tasks]
     sums = _ensure_workspace_tensor(
         metadata,
@@ -677,6 +693,7 @@ def _run_cutedsl_packed_decode(
         dtype=torch.float32,
         device=device,
         shared=False,
+        capacity_numel=slot_rows_bound,
     )[:tasks]
     module.run_trtllm_fp4_mla_decode_packed(
         q_fp4,
@@ -1069,6 +1086,87 @@ def run_fp4_mla_attention_decode(
                     "full-pool base and page offset."
                 )
 
+        if packed_rows_per_seq and _decode_4x._fp4_mla_cutedsl_4x_enabled():
+            # Path selection (fp4_mla_dispatch): 2x packed by default; the four-CTA-cluster kernel, or the
+            # two-stream split (4x arm + 2x arm), only inside the static envelope and where the measured gain is
+            # certain. The kernels are compiled and planned for the page-table capacity; the choice itself uses the
+            # KV regime ceiling of a regime-keyed CUDA graph (Fp4MlaState.kv_regime_max_kv), an upper bound of the
+            # step's longest live KV; eager steps decide on the capacity.
+            from . import fp4_mla_cutedsl_4x_host as _host_4x
+
+            max_kv_len_4x = max_pages * metadata.page_size
+            strategy = _dispatch.choose_decode_strategy(
+                num_requests=num_gen_seqs,
+                query_len=query_len_per_seq,
+                num_heads=num_heads,
+                rows_per_seq=packed_rows_per_seq,
+                kv_capacity=max_kv_len_4x,
+                sm_count=_get_sm_count(q.device),
+                envelope_reason=_host_4x.envelope_reason_static,
+                live_max_kv=getattr(metadata.fp4_mla_state, "kv_regime_max_kv", None),
+                helix=helix_kv_bounds is not None,
+                softmax_stats=softmax_stats_tensor is not None,
+                v_packed=core_v_packed is not None,
+                four_x_unavailable=_host_4x.device_unsupported_reason(q.device),
+            )
+            _decode_4x._fp4_mla_4x_record(
+                None if strategy.path != _dispatch.PATH_2X else strategy.reason,
+                num_gen_seqs,
+                query_len_per_seq,
+                max_kv_len_4x,
+                tag=strategy.record_tag,
+            )
+            if strategy.path == _dispatch.PATH_TWO_STREAM:
+                _decode_twostream.run_cutedsl_twostream_decode(
+                    cutedsl_kernel,
+                    metadata,
+                    q_fp4,
+                    q_sf,
+                    kv_cache,
+                    sf_cache,
+                    core_v_packed,
+                    core_v_sf,
+                    global_scale,
+                    q_global_scale,
+                    src_page_ids,
+                    metadata.fp4_mla_state.paged_kv_indptr_decode[: num_gen_seqs + 1],
+                    kv_lens,
+                    output,
+                    num_heads=num_heads,
+                    query_len=query_len_per_seq,
+                    num_requests=num_gen_seqs,
+                    num_requests_2x=strategy.num_requests_2x,
+                    rows_per_seq=packed_rows_per_seq,
+                    max_kv_len=max_kv_len_4x,
+                    sm_scale=float(sm_scale),
+                    v_page_offset=v_page_offset,
+                    run_4x=_decode_4x._run_cutedsl_4x_decode,
+                    run_2x=_run_cutedsl_packed_decode,
+                )
+                return
+            if strategy.path == _dispatch.PATH_4X:
+                _decode_4x._run_cutedsl_4x_decode(
+                    q_fp4,
+                    q_sf,
+                    kv_cache,
+                    sf_cache,
+                    core_v_packed,
+                    core_v_sf,
+                    global_scale,
+                    q_global_scale,
+                    src_page_ids,
+                    metadata.fp4_mla_state.paged_kv_indptr_decode[: num_gen_seqs + 1],
+                    kv_lens,
+                    output,
+                    num_heads=num_heads,
+                    query_len=query_len_per_seq,
+                    num_requests=num_gen_seqs,
+                    max_kv_len=max_kv_len_4x,
+                    sm_scale=float(sm_scale),
+                    v_page_offset=v_page_offset,
+                    metadata=metadata,
+                )
+                return
         if packed_rows_per_seq:
             _run_cutedsl_packed_decode(
                 cutedsl_kernel,
@@ -1144,6 +1242,7 @@ def run_fp4_mla_attention_decode(
                 dtype=torch.float32,
                 device=output.device,
                 shared=False,
+                capacity_numel=2 * _max_sequences(metadata) * query_len_per_seq * physical_heads,
             )
         if num_heads < physical_heads and not direct_split_output:
             kernel_output = _ensure_workspace_tensor(
