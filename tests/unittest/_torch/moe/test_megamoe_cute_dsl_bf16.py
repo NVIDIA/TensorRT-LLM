@@ -952,6 +952,10 @@ def test_megamoe_bf16_cpu_buffer_layout_and_tactics():
     assert bf16_key == (*nvfp4_key, "bf16")
     assert megamoe_op._megamoe_problem_key_quant_kind(nvfp4_key) == "nvfp4"
     assert megamoe_op._megamoe_problem_key_quant_kind(bf16_key) == "bf16"
+    # A runner's unique_id appends its own entries to an nvfp4 key: the fused shared expert's
+    # tuple, or a model tag (the GLM-5.2 Rubin runner's).
+    for appended in (("shared_fp8", 1024, None), "glm-rubin-high-throughput"):
+        assert megamoe_op._megamoe_problem_key_quant_kind((*nvfp4_key, appended)) == "nvfp4"
     # NVFP4's shape-tuned SM107 table is keyed by that historical key.
     dsv4_pro = dict(
         key,

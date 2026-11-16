@@ -1227,8 +1227,15 @@ def _megamoe_problem_key(
 
 
 def _megamoe_problem_key_quant_kind(problem_key: Tuple) -> str:
-    """The ``quant_kind`` a ``_megamoe_problem_key`` was built for."""
-    return problem_key[18] if len(problem_key) > 18 else "nvfp4"
+    """The ``quant_kind`` a ``_megamoe_problem_key`` was built for.
+
+    Position 18 holds it only for a kind other than nvfp4 (or a non-gated activation). Callers
+    may pass the key with their own entries appended there -- a runner's ``unique_id`` adds the
+    fused shared expert's tuple or a model tag -- so anything at position 18 that is not a quant
+    kind means an nvfp4 key.
+    """
+    kind = problem_key[18] if len(problem_key) > 18 else None
+    return kind if isinstance(kind, str) and kind in _MEGAMOE_OPERAND_FORMATS else "nvfp4"
 
 
 def _shape_tuned_megamoe_tactic(problem_key: Tuple) -> Optional[Tuple]:
