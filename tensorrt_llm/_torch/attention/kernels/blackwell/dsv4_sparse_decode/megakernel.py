@@ -1698,6 +1698,9 @@ class Dsv4SparseDecodeKernel:
                             tTR_0 = thr_copy_ref_0.partition_S(
                                 cute.flat_divide(tAcc_c0, epi_sub_mn)
                             )
+                            # The scale load from this K stage must complete before the
+                            # release lets the TMA refill the stage.
+                            B.fence_proxy_async_smem()
                             kv_pipeline_0.consumer_release(kv_cons_state_math_0)
                             kv_cons_state_math_0.advance()
                             cute.copy(tiled_copy_ref_0, tTR_0[None, None, None, 0, 0], tTR_rAcc)
@@ -1769,6 +1772,9 @@ class Dsv4SparseDecodeKernel:
                             tTR_1 = thr_copy_ref_1.partition_S(
                                 cute.flat_divide(tAcc_c1, epi_sub_mn)
                             )
+                            # The scale load from this K stage must complete before the
+                            # release lets the TMA refill the stage.
+                            B.fence_proxy_async_smem()
                             kv_pipeline_1.consumer_release(kv_cons_state_math_1)
                             kv_cons_state_math_1.advance()
                             cute.copy(tiled_copy_ref_1, tTR_1[None, None, None, 0, 0], tTR_rAcc)
@@ -2246,6 +2252,9 @@ class Dsv4SparseDecodeKernel:
                     for w_j in cutlass.range_constexpr(self.num_w_in_reg):
                         w_cache[w_j] = sW[w_j, q_stage_local]
                     q_cons_state.advance()
+                    # All 256 threads fence: each warp's weight loads must complete before tid 0's
+                    # q_free arrival lets the TMA refill this Q / W stage with the next row.
+                    B.fence_proxy_async_smem()
                     L.bar(3, 256)
                     if tidx == 0:
                         prims.mbarrier_arrive((q_free + q_stage_local) if self.qdb else q_free)
@@ -2294,6 +2303,9 @@ class Dsv4SparseDecodeKernel:
                                 tTR_0 = thr_copy_ref_0.partition_S(
                                     cute.flat_divide(tAcc_c0, epi_sub_mn)
                                 )
+                                # The scale load from this K stage must complete before the
+                                # release lets the TMA refill the stage.
+                                B.fence_proxy_async_smem()
                                 kv_pipeline_0.consumer_release(kv_cons_state_math_0)
                                 kv_cons_state_math_0.advance()
                                 cute.copy(tiled_copy_ref_0, tTR_0[None, None, None, 0, 0], tTR_rAcc)
@@ -2351,6 +2363,9 @@ class Dsv4SparseDecodeKernel:
                                 tTR_1 = thr_copy_ref_1.partition_S(
                                     cute.flat_divide(tAcc_c1, epi_sub_mn)
                                 )
+                                # The scale load from this K stage must complete before the
+                                # release lets the TMA refill the stage.
+                                B.fence_proxy_async_smem()
                                 kv_pipeline_1.consumer_release(kv_cons_state_math_1)
                                 kv_cons_state_math_1.advance()
                                 cute.copy(tiled_copy_ref_1, tTR_1[None, None, None, 0, 0], tTR_rAcc)
