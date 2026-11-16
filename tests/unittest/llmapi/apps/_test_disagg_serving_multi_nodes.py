@@ -28,7 +28,7 @@ from .utils import expand_slurm_nodelist
 
 RANK = int(os.environ.get("SLURM_PROCID", 0))
 NODE_RANK = int(os.environ.get("SLURM_NODEID", 0))
-NODE_LIST = expand_slurm_nodelist(os.environ.get("SLURM_NODELIST", ""))
+NODE_LIST = expand_slurm_nodelist(os.environ.get("SLURM_STEP_NODELIST", ""))
 LOCAL_RANK = int(os.environ.get("SLURM_LOCALID", 0))
 
 pytestmark = pytest.mark.threadleak(enabled=False)
@@ -64,7 +64,7 @@ def require_supported_slurm_topology() -> None:
         "SLURM_PROCID",
         "SLURM_NODEID",
         "SLURM_LOCALID",
-        "SLURM_NODELIST",
+        "SLURM_STEP_NODELIST",
         "SLURM_STEP_NUM_NODES",
         "SLURM_STEP_NUM_TASKS",
     )
@@ -86,7 +86,7 @@ def require_supported_slurm_topology() -> None:
             "python -m pytest ...; "
             f"got SLURM_STEP_NUM_NODES={os.environ['SLURM_STEP_NUM_NODES']}, "
             f"SLURM_STEP_NUM_TASKS={os.environ['SLURM_STEP_NUM_TASKS']}, "
-            f"SLURM_NODELIST={NODE_LIST}")
+            f"SLURM_STEP_NODELIST={NODE_LIST}")
     if LOCAL_RANK != 0 or RANK != NODE_RANK:
         pytest.fail(
             "This test supports exactly one pytest task per Slurm node; "

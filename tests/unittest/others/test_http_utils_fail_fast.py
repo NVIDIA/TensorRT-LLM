@@ -12,8 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Fail-fast endpoint readiness and shutdown waits (no GPU, no server)."""
+"""Fail-fast endpoint and multi-node coordination helpers (no GPU, no server)."""
 
+import ast
+import os
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -33,6 +35,10 @@ pytestmark = pytest.mark.cpu_only
 
 # Nothing listens here; connections are refused immediately.
 DEAD_URL = "http://127.0.0.1:9/health"
+MULTINODE_TEST_PATHS = (
+    Path("tests/unittest/llmapi/apps/_test_disagg_serving_multi_nodes.py"),
+    Path("tests/unittest/llmapi/apps/_test_disagg_serving_multi_nodes_service_discovery.py"),
+)
 
 
 @pytest.fixture(autouse=True)
@@ -48,6 +54,49 @@ def _server_log(tmp_path, content):
     p = tmp_path / "server.log"
     p.write_text(content)
     return str(p)
+
+
+def _load_slurm_topology_fixture(path: Path):
+    tree = ast.parse(path.read_text())
+    selected_nodes = []
+    required_assignments = {"RANK", "NODE_RANK", "NODE_LIST", "LOCAL_RANK"}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id in required_assignments
+            for target in node.targets
+        ):
+            selected_nodes.append(node)
+        elif isinstance(node, ast.FunctionDef) and node.name == "require_supported_slurm_topology":
+            node.decorator_list = []
+            selected_nodes.append(node)
+
+    namespace = {
+        "os": os,
+        "pytest": pytest,
+        "expand_slurm_nodelist": lambda value: {
+            "node[01-02]": ["node01", "node02"],
+            "node[01-04]": ["node01", "node02", "node03", "node04"],
+        }[value],
+    }
+    module = ast.Module(body=selected_nodes, type_ignores=[])
+    exec(compile(ast.fix_missing_locations(module), path, "exec"), namespace)
+    return namespace
+
+
+@pytest.mark.parametrize("module_path", MULTINODE_TEST_PATHS)
+def test_slurm_topology_uses_step_nodelist(monkeypatch, module_path: Path) -> None:
+    monkeypatch.setenv("SLURM_PROCID", "0")
+    monkeypatch.setenv("SLURM_NODEID", "0")
+    monkeypatch.setenv("SLURM_LOCALID", "0")
+    monkeypatch.setenv("SLURM_NODELIST", "node[01-04]")
+    monkeypatch.setenv("SLURM_STEP_NODELIST", "node[01-02]")
+    monkeypatch.setenv("SLURM_STEP_NUM_NODES", "2")
+    monkeypatch.setenv("SLURM_STEP_NUM_TASKS", "2")
+
+    namespace = _load_slurm_topology_fixture(module_path)
+
+    assert namespace["NODE_LIST"] == ["node01", "node02"]
+    namespace["require_supported_slurm_topology"]()
 
 
 def test_dead_server_proc_fails_fast_and_dumps_log(tmp_path):
