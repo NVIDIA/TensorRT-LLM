@@ -1,25 +1,44 @@
 {# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 SPDX-License-Identifier: Apache-2.0 -#}
-## The decision file
+## The decision file: your receipt
 
 **Your last action is to write your decision file.** Write it with the `Write` tool to:
 
 ```
-<workspace>/decisions/<unit>-{{ agent }}-<turn>.yaml
+<workspace>/decisions/<name>-{{ agent }}-<turn>.yaml
 ```
 
-The exact path is given at the end of your dispatch prompt. Write that file and no other: every turn gets a path no earlier turn used, and a decision written anywhere else is never read. The file is YAML with exactly these keys:
+The exact path is at the end of your dispatch: a decision written anywhere else is never read. The file is YAML, `decision` first:
 
 ```yaml
+decision: ready        # or: blocked
 summary: |
   What you did, in a few lines. Numbers verbatim from tool output.
-decision: <exactly one of the decisions listed above>
 ```
 {% if extra %}
-This role also carries these keys when they apply:
+It also carries these keys when they apply, each at the top level, in these forms:
 
 ```yaml
-{% for key in extra %}  {{ key }}: ...
+{% for key, form in extra %}{{ key }}: {{ form }}
 {% endfor %}```
+
+**The file must parse as YAML.** Put a value in double quotes when it holds a colon followed by a space or a `#`. A sentence is never the value of a key that takes a number or a path.
+
+`not_done` is one thing only: what **your card** asked and you did not do, each with its measured numbers. Not what another task owns, and not a note that something does not apply.
+
+**A doubt your work can go on without is a `next_question` on a `ready` receipt.** Do the work as well as what you were given allows, and ask: your work lands, nothing waits for the answer, and the session that watches the run checks it against the engine's code. It is worth asking when it is about what only that session can change (a requirement that looks mistaken: an anchor far from the reference row, an option the engine refuses) and being wrong would cost another task or a load of the model. What the tree can tell you, search for and do not ask. Give what answers the question without you: what you were given, what you found, and the search or command that shows each. Two questions go into the one key, each with its verb, the weightier first. `blocked` is for work that cannot go on.
+
+**Begin `next_question` with the one word that names what answers it.** The session answers with exactly one of these, so say which, with what it needs, and then your question in a sentence or two:
+
+- `feedback`: on a `ready` receipt, a ruling that changes nothing: it reaches every later turn as a note, and your work is not run again.
+- `retry`: on a `blocked` receipt, one more attempt of yours: with a ruling, or once something outside the run was changed for it (a rebuilt base). Say what the note must tell you.
+- `retry --task <task>`: another task must change something first. Say which task and what.
+- `allow-shared --path <path>`: you must write a file outside your write scope. Name it.
+- `edit-env --set <key>=<value>`: the environment must change.
+- `split`: the rows must change: the task is too large, or a row or a cell of the survey is missing or wrong. Name the rows as they should be.
+- `change-requirement`: the spec must change: a requirement is mistaken (an anchor, a floor, an option), or one you would add. Say which, from what to what, and what shows it.
+- `skip`: the outcome cannot be had here.
+
+You name the word; you never run it, and you change no requirement yourself. When two would do, name the one you prefer first.
 {% endif %}
-Any other value, or no file, is a turn that produced no decision.
+Any other `decision`, a file that does not parse, or no file, is a turn that produced no receipt.

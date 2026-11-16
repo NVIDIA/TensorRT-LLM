@@ -9,9 +9,10 @@ one path its dispatch reserved (:func:`mark_decision_dispatch`). The
 orchestrator reads it there and nowhere else (:func:`read_decision`): a turn
 that wrote no valid decision has none, whatever an earlier turn wrote.
 
-A finished task leaves a bounded receipt in ``tasks/<id>.receipt.yaml``.
-Dependent tasks receive its decision, landed commits and evidence paths
-without a planner turn restating them in a goal.
+Each attempt of a task leaves a bounded receipt, ``tasks/<id>.<attempt>.receipt.yaml``,
+written once. A ``ready`` one gives the tasks that depend on it the decision, landed
+commits, references and what was left; a ``blocked`` one gives its escalation what was
+tried, the command and its result line, what was ruled out, and the next question.
 """
 
 from __future__ import annotations
@@ -25,78 +26,18 @@ from typing import Any, Iterable, Mapping, Sequence
 
 import yaml
 
-from ...agents.decisions import DECISIONS_BY_AGENT, PLAN_ROLES
-from ...infra.files import write_text_atomic
+from ...agents.decisions import BLOCKED_KEYS, DECISIONS_BY_AGENT, PLAN_ROLES
+from ...infra.files import publish_once, write_text_atomic
 from ..records.journal import utc_now
 
 DECISIONS_DIRNAME = "decisions"
 
-#: Keys a MACRO decision's `constituents` entries may carry besides `target` and `tier`.
-CONSTITUENT_OPTIONAL: tuple[str, ...] = ("surface", "note", "unit", "depends_on")
-
-
-#: The keys a kernel writer's ``engine_defect`` report carries; ``detect`` is optional.
-ENGINE_DEFECT_KEYS: tuple[str, ...] = ("affects", "trigger", "detect", "proposal")
-
-
-def engine_defect_report(raw: Any) -> str:
-    """A kernel writer's ``engine_defect`` report as one line for the planner; ``""`` unless it names the defect.
-
-    It names the defect with ``affects`` (where it is), ``trigger`` (the
-    parameter regime that hits it) and ``proposal`` (the fix); ``detect`` (the
-    failing test, or the cell as a mapping) follows when given.
-    """
-    if not isinstance(raw, Mapping):
-        return ""
-    said = {key: _one_line(raw.get(key)) for key in ENGINE_DEFECT_KEYS}
-    if not all(said[key] for key in ("affects", "trigger", "proposal")):
-        return ""
-    line = (
-        f"engine defect in `{said['affects']}`, hit by {said['trigger']}; "
-        f"proposed fix: {said['proposal']}"
-    )
-    return line + (f"; detected by {said['detect']}" if said["detect"] else "")
-
-
-def _one_line(value: Any) -> str:
-    if isinstance(value, Mapping):
-        value = json.dumps(dict(value), sort_keys=True, default=str)
-    return " ".join(str(value).split()) if value is not None else ""
-
-
-def parse_constituents(raw: Any) -> list[dict[str, Any]]:
-    """Normalize a MACRO decision's child list: one with no ``target`` is dropped, no ``tier`` is 1."""
-    if not isinstance(raw, list):
-        return []
-    children: list[dict[str, Any]] = []
-    for row in raw:
-        if not isinstance(row, dict):
-            continue
-        target = str(row.get("target", "")).strip()
-        if not target:
-            continue
-        try:
-            tier = int(row.get("tier", 1) or 1)
-        except (TypeError, ValueError):
-            tier = 1
-        child: dict[str, Any] = {"target": target, "tier": tier}
-        for key in CONSTITUENT_OPTIONAL:
-            value = row.get(key)
-            if value is None:
-                continue
-            if key == "depends_on":
-                if isinstance(value, list):
-                    child[key] = [int(v) for v in value if str(v).strip().lstrip("-").isdigit()]
-            elif str(value).strip():
-                child[key] = str(value).strip()
-        children.append(child)
-    return children
-
-
 #: The unit a plan role's decision is filed under: the plan is not per unit.
 PLAN_DECISION_UNIT = "plan"
-#: The unit a build role's decision is filed under when none is in progress.
-DEFAULT_DECISION_UNIT = "core"
+#: What a build role's decision is filed under when its work is for no one deployment: the
+#: target itself. A file name is read by the worker that writes to it, so it says what
+#: the work is for and nothing else.
+DEFAULT_DECISION_UNIT = "target"
 
 
 def decision_unit(agent: str, unit: str = "") -> str:
@@ -108,19 +49,6 @@ def decision_unit(agent: str, unit: str = "") -> str:
     if agent in PLAN_ROLES:
         return PLAN_DECISION_UNIT
     return re.sub(r"[^A-Za-z0-9_.]+", "_", unit or DEFAULT_DECISION_UNIT)
-
-
-def uncertified_report(value: Any) -> str:
-    """A decision's ``uncertified`` list as one line for the planner; ``""`` when it names none."""
-    if isinstance(value, str):
-        value = value.splitlines()
-    if not isinstance(value, list):
-        return ""
-    calls = [" ".join(str(v).split()) for v in value if str(v).strip()]
-    if not calls:
-        return ""
-    listed = "; ".join(calls)
-    return "uncertified: " + (listed if len(listed) <= 1200 else listed[:1197] + "...")
 
 
 def decision_path(
@@ -255,10 +183,44 @@ def read_decision(path: Path, agent: str) -> dict[str, Any] | None:
         return None
     if not isinstance(raw, dict):
         return None
-    decision = str(raw.get("decision", "")).strip()
+    decision = str(raw.get("decision", "")).strip().lower()
     if decision not in DECISIONS_BY_AGENT[agent]:
         return None
     return {**raw, "decision": decision}
+
+
+def decision_problem(path: Path, agent: str) -> str:
+    """Why the file at ``path`` is no receipt of ``agent``'s; ``""`` when it is one, or is not there.
+
+    For the next attempt's card: a worker whose finished turn was not counted is told
+    which line of what it wrote could not be read, in the parser's own words.
+    """
+    path = Path(path)
+    if not path.is_file() or _predates_dispatch(path):
+        return ""
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except yaml.YAMLError as exc:
+        mark = getattr(exc, "problem_mark", None)
+        where = f" at line {mark.line + 1}, column {mark.column + 1}" if mark is not None else ""
+        problem = " ".join(str(getattr(exc, "problem", "") or exc).split())
+        return (
+            f"the receipt `{path}` is not valid YAML{where}: {problem}. Nothing of it was "
+            "read: write that line as a plain `key: value` (quote a value that holds a colon) "
+            "and keep the rest"
+        )
+    except OSError as exc:
+        return f"the receipt `{path}` could not be read: {exc}"
+    if not isinstance(raw, dict):
+        return f"the receipt `{path}` is not a mapping of keys to values: nothing of it was read"
+    decision = str(raw.get("decision", "")).strip().lower()
+    allowed = DECISIONS_BY_AGENT[agent]
+    if decision not in allowed:
+        return (
+            f"the receipt `{path}` says `decision: {raw.get('decision')!r}`, which is not one of "
+            f"{', '.join(sorted(allowed))}"
+        )
+    return ""
 
 
 def decision_value(path: Path, agent: str) -> str | None:
@@ -269,17 +231,16 @@ def decision_value(path: Path, agent: str) -> str | None:
 
 #: The heading a task's prompt carries its dependencies' receipts under.
 HEADING = "## Receipts of the tasks this one depends on"
-#: Beside the envelope ``tasks/<id>.json``.
+#: Beside the envelope ``tasks/<id>.json``: one per attempt, ``<id>.<attempt>.receipt.yaml``.
 RECEIPT_SUFFIX = ".receipt.yaml"
+#: The most lines a receipt keeps of one list, and the most of each line.
+LIST_ITEMS, LIST_CHARS = 12, 300
 #: The most of the summary's first paragraph a receipt keeps.
 SUMMARY_CHARS = 400
 #: The most commits a receipt lists; a count says how many more there were.
 MAX_COMMITS = 12
 #: Past this many characters of a prompt's receipts, each further one is a single line.
 RENDER_CHARS = 12_000
-
-#: A full or abbreviated commit id.
-_COMMIT = re.compile(r"^[0-9a-f]{7,64}$")
 
 
 @dataclass
@@ -297,6 +258,8 @@ class TaskResult:
         data = read_decision(decision_file, role) or {}
         return cls(
             str(data.get("decision") or ""),
+            # A file that is there and is no receipt says why: the next attempt reads it.
+            note="" if data else decision_problem(decision_file, role),
             data=data,
             decision_file=decision_file,
             result_file=result_file,
@@ -335,12 +298,38 @@ def _entry(raw: Mapping[str, Any]) -> str:
     return clip(str(entry), 300) if entry else ""
 
 
-def _tests(raw: Mapping[str, Any]) -> str:
-    """A kernel writer's test result, from its decision's ``receipt`` (a mapping with ``result``, or text)."""
-    receipt = raw.get("receipt")
-    if isinstance(receipt, Mapping):
-        receipt = receipt.get("result")
-    return first_paragraph(receipt, 200) if receipt else ""
+def one_line(value: Any) -> str:
+    if isinstance(value, Mapping):
+        value = ", ".join(f"{k}: {v}" for k, v in value.items())
+    return " ".join(str(value).split()) if value is not None else ""
+
+
+def lines_of(value: Any) -> list[str]:
+    """A receipt's list as lines of text, bounded: a mapping item is one line, text is its lines."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        value = value.splitlines()
+    if isinstance(value, Mapping):
+        value = [value]
+    if not isinstance(value, (list, tuple)):
+        value = [value]
+    found = [clip(one_line(v), LIST_CHARS) for v in value if one_line(v)]
+    if len(found) > LIST_ITEMS:
+        found = [*found[:LIST_ITEMS], f"and {len(found) - LIST_ITEMS} more"]
+    return found
+
+
+def _check(raw: Mapping[str, Any]) -> dict[str, str]:
+    """The card's check as the worker ran it: its id, the command, the result line."""
+    check = raw.get("check")
+    if isinstance(check, Mapping):
+        return {
+            key: clip(one_line(check.get(key)), 400)
+            for key in ("id", "command", "result")
+            if check.get(key)
+        }
+    return {"result": clip(one_line(check), 400)} if check else {}
 
 
 def build(
@@ -350,13 +339,8 @@ def build(
     result: TaskResult,
     attempt: int = 1,
     commits: Sequence[str] = (),
-    cleared: str = "",
 ) -> dict[str, Any]:
-    """The receipt of task ``task_id``, from the dispatch that actually ran.
-
-    ``cleared`` is the commit a regression check found clean, the next one's
-    base (``checks/test_results.default_base``).
-    """
+    """The receipt of one attempt of task ``task_id``, from the dispatch that actually ran."""
     raw = result.data
     receipt: dict[str, Any] = {
         "task": task_id,
@@ -372,14 +356,26 @@ def build(
         if len(commits) > MAX_COMMITS:
             shown.append(f"and {len(commits) - MAX_COMMITS} more")
         receipt["commits"] = shown
-    entry, tests = _entry(raw), _tests(raw)
+    entry, check = _entry(raw), _check(raw)
     if entry:
         receipt["entry"] = entry
-    if tests:
-        receipt["tests"] = tests
-    cleared = str(cleared or raw.get("cleared") or "").strip().lower()
-    if _COMMIT.match(cleared):
-        receipt["cleared"] = cleared
+    if check:
+        receipt["check"] = check
+    for key in ("references", "not_done", "tried", "ruled_out"):
+        found = lines_of(raw.get(key))
+        if found:
+            receipt[key] = found
+    for key in (
+        "blocker_kind",
+        "observed",
+        "expected",
+        "command",
+        "result",
+        "next_question",
+        "pin",
+    ):
+        if raw.get(key):
+            receipt[key] = clip(one_line(raw[key]), 600)
     if result.decision_file is not None:
         receipt["decision_file"] = str(result.decision_file)
     if result.result_file is not None:
@@ -388,24 +384,42 @@ def build(
     return receipt
 
 
-def path_for(tasks_dir: Path, task_id: str) -> Path:
-    return Path(tasks_dir) / f"{task_id}{RECEIPT_SUFFIX}"
+def blocked_problem(raw: Mapping[str, Any]) -> str:
+    """What a ``blocked`` receipt leaves out of what it must carry; ``""`` when it carries all."""
+    missing = [key for key in BLOCKED_KEYS if not one_line(raw.get(key))]
+    return f"its blocked receipt leaves out {', '.join(missing)}" if missing else ""
+
+
+def path_for(tasks_dir: Path, task_id: str, attempt: int = 1) -> Path:
+    return Path(tasks_dir) / f"{task_id}.{int(attempt)}{RECEIPT_SUFFIX}"
 
 
 def write(tasks_dir: Path, receipt: Mapping[str, Any]) -> Path:
-    """Keep ``receipt`` as its task's, replacing an earlier attempt's whole."""
-    path = path_for(tasks_dir, str(receipt["task"]))
+    """Keep ``receipt`` as its attempt's: an attempt's receipt is written once."""
+    path = path_for(tasks_dir, str(receipt["task"]), int(receipt.get("attempt") or 1))
     path.parent.mkdir(parents=True, exist_ok=True)
-    write_text_atomic(
-        path, yaml.safe_dump(dict(receipt), sort_keys=False, allow_unicode=True, width=100)
-    )
+    if path.exists():
+        return path
+    # Whole, and once: of two writers of one attempt's receipt the first stands, and no
+    # reader sees half of it.
+    text = yaml.safe_dump(dict(receipt), sort_keys=False, allow_unicode=True, width=100)
+    publish_once(path, text, write=write_text_atomic)
     return path
 
 
-def read(tasks_dir: Path, task_id: str) -> dict[str, Any] | None:
-    """The receipt kept for ``task_id``, or None when there is none to read."""
+def read(tasks_dir: Path, task_id: str, attempt: int | None = None) -> dict[str, Any] | None:
+    """The receipt of ``task_id``'s ``attempt``, or of its latest; None when there is none."""
+    if attempt is None:
+        found = []
+        for path in Path(tasks_dir).glob(f"{task_id}.*{RECEIPT_SUFFIX}"):
+            number = path.name[len(task_id) + 1 : -len(RECEIPT_SUFFIX)]
+            if number.isdigit():
+                found.append(int(number))
+        if not found:
+            return None
+        attempt = max(found)
     try:
-        raw = yaml.safe_load(path_for(tasks_dir, task_id).read_text(encoding="utf-8"))
+        raw = yaml.safe_load(path_for(tasks_dir, task_id, attempt).read_text(encoding="utf-8"))
     except (OSError, yaml.YAMLError):
         return None
     return raw if isinstance(raw, dict) and raw.get("task") else None
@@ -441,13 +455,58 @@ def _full(receipt: Mapping[str, Any]) -> str:
         lines.append(f"- integrated: {'; '.join(str(c) for c in commits)}")
     if receipt.get("entry"):
         lines.append(f"- entry: `{receipt['entry']}`")
-    if receipt.get("tests"):
-        lines.append(f"- tests: {receipt['tests']}")
-    if receipt.get("cleared"):
-        lines.append(f"- cleared: `{receipt['cleared']}`")
+    check = receipt.get("check") or {}
+    if check:
+        lines.append(
+            f"- check: {check.get('id') or 'its own'}: `{check.get('command', '')}` -> "
+            f"{check.get('result', 'no result line')}"
+        )
+    # What it left not done is what the next task must know. The references it read are
+    # places it resolved at its own commit: they stay in its receipt's file, and are not
+    # handed on as places to go to.
+    for line in receipt.get("not_done") or ():
+        lines.append(f"- not done: {line}")
+    if receipt.get("references"):
+        lines.append(f"- it lists {len(receipt['references'])} reference(s) it read, in its file")
     if _paths(receipt):
         lines.append(f"- {_paths(receipt)}")
     return "\n".join(lines).rstrip()
+
+
+def brief(receipts: Iterable[Mapping[str, Any]]) -> str:
+    """The dependencies of a task, one line each: how it ended, its check's result, its file.
+
+    A dispatch carries this, not the receipts whole: the envelope holds them as data and
+    each line names the file to read for more.
+    """
+    receipts = list(receipts)
+    if not receipts:
+        return ""
+    lines = [
+        HEADING,
+        "",
+        "Each ended ready and landed before this one started. One line each; the file it "
+        "names has the rest. What one of them left `not done` is not done: read its file "
+        "before you build on it.",
+        "",
+    ]
+    for receipt in receipts:
+        check = receipt.get("check") or {}
+        said = [
+            f"`{receipt.get('task')}` ({receipt.get('kind')}): {receipt.get('decision') or 'no decision'}"
+        ]
+        if check:
+            said.append(
+                f"check {check.get('id') or 'its own'}: {check.get('result') or 'no result line'}"
+            )
+        left = len(receipt.get("not_done") or ())
+        if left:
+            said.append(f"{left} thing(s) left not done")
+        where = receipt.get("decision_file") or receipt.get("result_file")
+        if where:
+            said.append(f"`{where}`")
+        lines.append("- " + "; ".join(said))
+    return "\n".join(lines)
 
 
 def render(receipts: Iterable[Mapping[str, Any]]) -> str:
@@ -457,10 +516,9 @@ def render(receipts: Iterable[Mapping[str, Any]]) -> str:
         return ""
     blocks = [
         HEADING,
-        "Each task below finished and passed its checks before this one started. The "
-        "orchestrator took this from their decision and result files; read those for "
-        "anything more. Your goal may have been written before they finished: where what "
-        "they found changes your work, say so in your report.",
+        "Each task below ended ready and landed before this one started. The run took this "
+        "from their decision and result files; read those for anything more. What one of "
+        "them left `not done` is not done: do not build on it as if it were.",
     ]
     used = sum(len(b) for b in blocks)
     for receipt in receipts:
@@ -473,31 +531,31 @@ def render(receipts: Iterable[Mapping[str, Any]]) -> str:
 
 
 __all__ = [
-    "CONSTITUENT_OPTIONAL",
     "DECISIONS_DIRNAME",
     "DEFAULT_DECISION_UNIT",
-    "ENGINE_DEFECT_KEYS",
     "PLAN_DECISION_UNIT",
     "current_decision",
     "decision_dispatch_matches",
     "decision_file_instruction",
     "decision_path",
+    "decision_problem",
     "decision_unit",
     "decision_value",
-    "engine_defect_report",
     "mark_decision_dispatch",
-    "parse_constituents",
     "read_decision",
-    "uncertified_report",
     "HEADING",
     "MAX_COMMITS",
     "RECEIPT_SUFFIX",
     "RENDER_CHARS",
     "SUMMARY_CHARS",
+    "blocked_problem",
+    "brief",
     "build",
     "clip",
     "TaskResult",
     "first_paragraph",
+    "lines_of",
+    "one_line",
     "path_for",
     "read",
     "render",

@@ -6,12 +6,15 @@
 The spool scheduler puts this directory first on every job's ``PYTHONPATH``, so this
 ``sitecustomize`` runs at interpreter start in the job's shell, every MPI rank and every worker
 the engine spawns. For each module in ``MV2FLOW_RESOLVE_MODULES`` (default ``tensorrt_llm``) it
-appends one JSON line to ``$MV2FLOW_RESOLVE_LOG`` and writes one ``[mv2flow-resolve] ...`` line
-to stderr; the scheduler judges the records (``provenance.py``). The next ``sitecustomize`` on
-``sys.path`` then runs, so a site or distribution hook this one shadows still takes effect.
+appends one JSON line to ``$MV2FLOW_RESOLVE_LOG`` (the origin, the identity of the native build
+beside it, the process's role instance ``$MV2FLOW_ROLE`` and its world rank) and writes one
+``[mv2flow-resolve] ...`` line to stderr; the scheduler judges the records (``provenance.py``).
+The next ``sitecustomize`` on ``sys.path`` then runs, so a site or distribution hook this one
+shadows still takes effect.
 """
 
 import importlib.abc
+import importlib.util
 import json
 import os
 import socket
@@ -28,6 +31,55 @@ def _rank():
     return "-"
 
 
+def _root(module, origin):
+    """The directory ``module`` was imported from: the one that holds its top-level package."""
+    package = os.path.dirname(origin) if origin.endswith("__init__.py") else origin
+    for _ in module.split("."):
+        package = os.path.dirname(package)
+    return package
+
+
+def _pintree():
+    """``pintree.py``, which sits beside this directory, loaded by its path.
+
+    This file runs where the flow's package may not be importable.
+    """
+    name = "mv2flow_pintree"
+    if name not in sys.modules:
+        path = os.path.join(os.path.dirname(_HERE), "pintree.py")
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            del sys.modules[name]
+            raise
+    return sys.modules[name]
+
+
+def _build(module, origin):
+    """The identity of the native build beside ``origin``: by the content of its libraries.
+
+    ``pintree.build_id``: the name of the build record of the libraries the package holds, or,
+    in a pinned job, of exactly the ones the pin's record names (``$MV2FLOW_TREE_LIBS``, paths
+    in the tree). Other bytes are another identity whatever a file's size and times say; the
+    same bytes anywhere are the same one. Each library's digest is read from the node's cache
+    when the file has not changed since some process digested it, so a job's ranks do not each
+    read every library. ``None`` when the package holds no library, or the identity cannot be
+    taken: a record without one counts for no rank.
+    """
+    if not origin:
+        return None
+    try:
+        named = os.environ.get("MV2FLOW_TREE_LIBS")
+        names = [n for n in named.split(":") if n] if named is not None else None
+        top = module.split(".")[0]
+        return _pintree().build_id(_root(module, origin), names=names, packages=[top])
+    except Exception:
+        return None
+
+
 def _record(module, spec):
     origin = None
     if spec is not None:
@@ -37,6 +89,8 @@ def _record(module, spec):
     entry = {
         "module": module,
         "origin": origin,
+        "build": _build(module, origin),
+        "role": os.environ.get("MV2FLOW_ROLE") or None,
         "pid": os.getpid(),
         "rank": _rank(),
         "host": socket.gethostname(),

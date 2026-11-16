@@ -1,14 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The GPU side of a run: compute sessions, their spools, and how a command reaches one.
+"""The GPU side of a run: the pool, its one spool, and how a command reaches it.
 
 Everything that runs ON the compute node (:mod:`.scheduler`) or is called from
 a job's shell (:mod:`.spoolctl`, ``scripts/``) is standard-library only and
 runs by path, because the interpreter inside the container is the engine's,
-not the orchestrator's. The orchestrator's side is :mod:`.executor` (a command,
-run here or through a spool), :mod:`.placement` (which spool can take it) and
-:mod:`.sessions` (declaring, rendering and handing over sessions).
+not the orchestrator's. The orchestrator's side is :mod:`.executor` (a command
+as a job in the spool), :mod:`.pool` (when a holder is needed, and its end),
+:mod:`.slurm` (how a holder and a step are built on Slurm) and :mod:`.sessions`
+(the watchers' entry scripts).
 """
 
 from pathlib import Path

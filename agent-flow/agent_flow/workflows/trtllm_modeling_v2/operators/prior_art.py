@@ -1,329 +1,167 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Prior art for a checkpoint, found in the repository before any agent turn.
+"""What the engine already has for a checkpoint, read off the repository before any agent turn.
 
-Intake reads it from disk only: no engine import, no GPU. Two products:
+No engine import, no GPU.
 
-- :func:`find_prior_art` ranks what the tree already implements against the
-  words the checkpoint's ``config.json`` uses (``sparse``, ``indexer``,
-  ``topk``, ``compress`` ...): other targets' ``ops/``, the shared catalog,
-  the attention backends and the custom ops. A match is a lead for the
-  survey, not a verdict: the surveyor still reads the entry's cells.
-- :func:`engine_constraints` states what the engine's kernels refuse for this
-  geometry, read from the source that refuses it (a head dimension the
-  trtllm-gen FMHA has no kernel for, say), with the design it usually implies.
-  Each limit is one :data:`ENGINE_RULES` entry.
-- :func:`stock_supports` says whether the stock modeling path registers the
-  checkpoint's architecture, which decides whether preflight's substrate gate
-  needs a proxy checkpoint.
+- :func:`engine_model` names the engine's own model of the checkpoint's architecture,
+  found by its registration: the class and what its module defines. It is
+  the first thing a survey and a card are offered: the reference to copy from and to
+  compare against, which a target may not import (:mod:`.v1_rule`).
+- :func:`engine_constraints` states what the engine's kernels refuse for this geometry,
+  read from the source that refuses it, with the design it usually implies.
+- :func:`engine_kv_dtypes` is the KV-cache dtypes the engine's loader accepts.
 
-All are printed by ``trtllm-modeling-v2 intake lint`` so the operator can put
-the leads that hold into the spec's ``notes``, which every role reads.
-
-Every place read off the tree is an anchor (:mod:`.tree_anchors`): found where
-it was last seen, else by what it defines. One the checkout has nowhere is
-left out and reported (:data:`PRIOR_ART_ANCHORS`), never replaced by a value
-remembered here.
+Each is read through an anchor (:mod:`.tree_anchors`): the files that hold its
+definition, wherever this checkout keeps them.
 """
 
 from __future__ import annotations
 
 import ast
-import math
+import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 from . import tree_anchors
-from .coverage import CATALOG_DIR, MODEL_OPS_DIRNAME, MODELING_V2_PACKAGE
+from .v1_rule import registered_classes
 
-#: Where the tree keeps implementations a target may reuse, and what each is:
-#: ModelingV2's own, then the engine's, each an anchor.
-TARGETS_GLOB = f"{MODELING_V2_PACKAGE}/models/*/*/{MODEL_OPS_DIRNAME}"
-ENGINE_ANCHORS: tuple[tuple[str, str], ...] = (
-    ("attention_backends", "attention backend"),
-    ("custom_ops", "custom op"),
-    ("kernels", "kernel"),
-    ("moe_modules", "MoE module"),
+#: Why the engine's own model is offered, and what a target may do with it.
+ENGINE_MODEL_REASON = (
+    "the engine's own implementation of this architecture: the reference for behaviour and "
+    "numerics. A ModelingV2 target may not import it (the ModelingV2 guide): read it, copy "
+    "what you need from it into the target, and compare against it"
 )
-KIND_TARGET_OP = "another target's op"
-KIND_CATALOG = "catalog entry"
-
-#: Words too common in configs and code to say anything about an architecture.
-STOPWORDS = frozenset(
-    {
-        "size",
-        "num",
-        "dim",
-        "dims",
-        "type",
-        "types",
-        "true",
-        "false",
-        "none",
-        "model",
-        "config",
-        "hidden",
-        "layer",
-        "max",
-        "min",
-        "use",
-        "enabled",
-        "enable",
-        "list",
-        "factor",
-        "theta",
-        "token",
-        "len",
-        "length",
-        "eps",
-        "dtype",
-        "float32",
-        "float16",
-        "bfloat16",
-        "torch",
-        "the",
-        "and",
-        "for",
-        "impl",
-        "attention",
-        "head",
-        "norm",
-        "group",
-        "block",
-        "method",
-        "setting",
-        "other",
-        "architecture",
-        "init",
-        "value",
-        "producer",
-        "version",
-        "ignore",
-        "quant",
-        "algo",
-        "name",
-        "path",
-        "kernel",
-        "op",
-        "ops",
-        "test",
-        "tests",
-        "util",
-        "utils",
-        "base",
-        "default",
-        "common",
-        "module",
-        "backend",
-        "custom",
-        "fused",
-        "triton",
-        "torch",
-        "flashinfer",
-        "trtllm",
-        "tensorrt",
-        "llm",
-        "local",
-        "shared",
-        "load",
-        "weight",
-        "output",
-        "input",
-        "apply",
-        "with",
-        "from",
-        "into",
-        "per",
-        "all",
-        "out",
-        "position",
-        "embedding",
-        "embeddings",
-        "act",
-        "select",
-        "start",
-        "end",
-        "id",
-        "ids",
-        "only",
-        "original",
-        "cache",
-        "pool",
-        "cls",
-        "need",
-        "generation",
-        "fp32",
-        "top",
-        "seq",
-        "causal",
-        "quantization",
-    }
-)
-_SPLIT = re.compile(r"[^A-Za-z0-9]+|(?<=[a-z])(?=[A-Z])")
-_DEF = re.compile(r"^(?:def|class) ([A-Za-z_][A-Za-z0-9_]*)", re.M)
-
-
-def _stem(word: str) -> str:
-    """One light suffix strip, so ``indexer`` meets ``index`` and ``experts`` meets ``expert``."""
-    for suffix in ("ation", "ion", "ers", "er", "es", "s"):
-        if word.endswith(suffix) and len(word) - len(suffix) >= 4:
-            return word[: -len(suffix)]
-    return word
-
-
-def words(text: str) -> set[str]:
-    """The stemmed, lower-case words of an identifier or a phrase, stop words dropped."""
-    out = set()
-    for raw in _SPLIT.split(text):
-        word = raw.lower()
-        if len(word) < 3 or word.isdigit():
-            continue
-        stem = _stem(word)
-        if word not in STOPWORDS and stem not in STOPWORDS:
-            out.add(stem)
-    return out
-
-
-def config_words(config: Mapping[str, Any]) -> set[str]:
-    """Every word the config's keys and string values use, nested blocks included."""
-    found: set[str] = set()
-
-    def walk(node: Any) -> None:
-        if isinstance(node, Mapping):
-            for key, value in node.items():
-                found.update(words(str(key)))
-                walk(value)
-        elif isinstance(node, (list, tuple)):
-            for item in node[:8]:
-                walk(item)
-        elif isinstance(node, str):
-            found.update(words(node))
-
-    walk(config)
-    return found
+#: The names of each list an :class:`EngineModel` shows.
+ENGINE_MODEL_NAMES = 12
 
 
 @dataclass(frozen=True)
-class Candidate:
-    """One implementation the tree already has, and why it may serve this checkpoint."""
+class EngineModel:
+    """The engine's own (Modeling V1) model of the checkpoint's architecture, as names to search."""
 
+    #: The checkpoint's architecture the engine registers a model for, and that class.
+    architecture: str
+    cls: str
+    #: Where the registration was when it was read: evidence about one commit.
     path: str
-    kind: str
-    matched: tuple[str, ...]
-    score: float
-    names: tuple[str, ...] = ()
+    #: The classes the registered class's own module defines (its layers, its weight loader).
+    defines: tuple[str, ...] = ()
 
-    def render(self) -> str:
-        names = f" ({', '.join(self.names[:4])})" if self.names else ""
-        return f"- `{self.path}`{names} — {self.kind}; matches: {', '.join(self.matched)}"
+    def search(self) -> str:
+        """How the registered class is found, wherever its file is."""
+        return f'register_auto_model("{self.architecture}")'
+
+    def render(self, *, where: bool = True) -> str:
+        """The first lead: the names to search for and why, in lines."""
+
+        def listed(names: Sequence[str]) -> str:
+            return ", ".join(f"`{name}`" for name in names[:ENGINE_MODEL_NAMES])
+
+        lines = [
+            f"**The engine registers a model for `{self.architecture}`**: `{self.cls}`, "
+            f"{ENGINE_MODEL_REASON}.",
+            f"- find it by its registration: `git grep -n '{self.search()}'`"
+            + (f"; found in `{self.path}`" if where else ""),
+        ]
+        if len(self.defines) > 1:
+            rest = [name for name in self.defines if name != self.cls]
+            lines.append(f"- its module also defines: {listed(rest)}")
+        return "\n".join(lines)
 
 
 @dataclass
 class PriorArt:
-    """What :func:`find_prior_art` found, best first, per kind."""
+    """Whether the engine has its own model of a checkpoint's architecture (:func:`find_prior_art`)."""
 
-    words: tuple[str, ...]
-    candidates: list[Candidate] = field(default_factory=list)
+    #: The checkpoint's `architectures`, and the engine's own model of one of them.
+    #: ``registered``: whether the engine registers a model for one; ``None``: not known
+    #: (the checkout has no built-in model, or the config names no architecture).
+    architectures: tuple[str, ...] = ()
+    registered: bool | None = None
+    engine_model: EngineModel | None = None
+    #: The classes registered under a name that is not written out: one may be this one's.
+    unnamed: tuple[str, ...] = ()
 
-    def by_kind(self, kind: str) -> list[Candidate]:
-        return [c for c in self.candidates if c.kind == kind]
-
-    def render(self, limit: int = 12) -> str:
-        if not self.candidates:
-            return "No implementation in the tree shares the checkpoint's vocabulary."
-        lines: list[str] = []
-        for kind in dict.fromkeys(c.kind for c in self.candidates):
-            ranked = self.by_kind(kind)
-            lines.append(f"**{kind}** ({len(ranked)}):")
-            lines += [c.render() for c in ranked[:limit]]
-            if len(ranked) > limit:
-                lines.append(f"- ... {len(ranked) - limit} more")
-            lines.append("")
-        return "\n".join(lines).rstrip() + "\n"
-
-
-def _python_files(root: Path) -> Iterable[Path]:
-    if not root.is_dir():
-        return ()
-    return (
-        p for p in sorted(root.rglob("*.py")) if p.name != "__init__.py" and "test" not in p.name
-    )
+    def reference(self, *, where: bool = True) -> str:
+        """Whether the engine has its own model of this architecture, and its names; ``""``: not known."""
+        if self.engine_model is not None:
+            return self.engine_model.render(where=where)
+        if self.registered is False and self.architectures:
+            named = ", ".join(f"`{a}`" for a in self.architectures)
+            unless = ", ".join(f"`{cls}`" for cls in self.unnamed)
+            return (
+                f"**The engine registers no model for {named}**: there is no implementation of "
+                "this architecture in the engine to copy from. The HuggingFace reference is the "
+                "ground truth."
+                + (
+                    f" (Registered under a name that is not written out: {unless}.)"
+                    if unless
+                    else ""
+                )
+            )
+        return ""
 
 
-def _target_ops(repo: Path) -> list[tuple[str, str, set[str], tuple[str, ...]]]:
-    found = []
-    paths = {
-        *repo.glob(TARGETS_GLOB),
-        *repo.glob(f"{MODELING_V2_PACKAGE}/models/*/{MODEL_OPS_DIRNAME}"),
-    }
-    for ops in sorted(paths):
-        for path in _python_files(ops):
-            rel = path.relative_to(repo).as_posix()
-            found.append((rel, KIND_TARGET_OP, words(path.stem) | words(path.parent.name), ()))
+def _registered(repo: Path) -> dict[str, tuple[str, str]]:
+    """Each architecture the engine registers a model for: ``{architecture: (file, class)}``.
+
+    Read where the registrations are concentrated: an example that registers a model of
+    its own elsewhere is not a model the engine ships.
+    """
+    zoo = tree_anchors.resolve(repo, "builtin_models")
+    found: dict[str, tuple[str, str]] = {}
+    for rel in zoo.paths:
+        if zoo.homes and not any(rel.startswith(f"{home}/") for home in zoo.homes):
+            continue
+        try:
+            text = (repo / rel).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for architecture, cls in registered_classes(text):
+            found.setdefault(architecture, (rel, cls))
     return found
 
 
-def _catalog(repo: Path) -> list[tuple[str, str, set[str], tuple[str, ...]]]:
-    root = repo / CATALOG_DIR
-    return [
-        (p.relative_to(repo).as_posix(), KIND_CATALOG, words(p.stem) | words(p.parent.name), ())
-        for p in _python_files(root)
-        if not p.name.startswith("_")
-    ]
+def engine_model(
+    repo: str | Path,
+    config: Mapping[str, Any],
+    known: Mapping[str, tuple[str, str]] | None = None,
+) -> EngineModel | None:
+    """The engine's own model of the checkpoint's architecture; ``None`` when it registers none.
 
-
-def _engine(repo: Path) -> list[tuple[str, str, set[str], tuple[str, ...]]]:
-    found = []
-    for key, kind in ENGINE_ANCHORS:
-        for rel_dir in tree_anchors.resolve(repo, key).paths:
-            for path in _python_files(repo / rel_dir):
-                try:
-                    text = path.read_text(encoding="utf-8", errors="replace")
-                except OSError:
-                    continue
-                names = tuple(n for n in _DEF.findall(text) if not n.startswith("_"))
-                vocab = words(path.relative_to(repo / rel_dir).as_posix())
-                for name in names:
-                    vocab |= words(name)
-                found.append((path.relative_to(repo).as_posix(), kind, vocab, names))
-    return found
-
-
-def find_prior_art(repo: str | Path, config: Mapping[str, Any], *, min_words: int = 2) -> PriorArt:
-    """What the tree at ``repo`` implements that shares ``config``'s vocabulary, best first.
-
-    A candidate shares at least ``min_words`` words with the config; each word
-    scores by its rarity across every candidate (inverse document frequency),
-    so ``sparse`` + ``gqa`` + ``topk`` outrank common words.
-    Engine files list the public functions that matched.
+    The class is found by its registration, never by a path, and its names are the public
+    classes its own module defines.
     """
     repo = Path(repo)
-    wanted = config_words(config)
-    pool = _target_ops(repo) + _catalog(repo) + _engine(repo)
-    if not pool or not wanted:
-        return PriorArt(words=tuple(sorted(wanted)))
-    frequency: dict[str, int] = {}
-    for _, _, vocab, _ in pool:
-        for word in vocab & wanted:
-            frequency[word] = frequency.get(word, 0) + 1
-    total = len(pool)
-    candidates = []
-    for rel, kind, vocab, names in pool:
-        matched = sorted(vocab & wanted)
-        if not matched:
-            continue
-        score = sum(math.log(1 + total / frequency[w]) for w in matched)
-        if len(matched) < min_words:
-            continue
-        hits = tuple(n for n in names if words(n) & wanted and len(words(n) & wanted) >= 2)
-        if names and not hits:
-            continue
-        candidates.append(Candidate(rel, kind, tuple(matched), round(score, 2), hits))
-    candidates.sort(key=lambda c: (-c.score, c.path))
-    return PriorArt(words=tuple(sorted(wanted)), candidates=candidates)
+    known = _registered(repo) if known is None else known
+    architecture = next((str(a) for a in config.get("architectures") or () if str(a) in known), "")
+    if not architecture:
+        return None
+    rel, cls = known[architecture]
+    try:
+        text = (repo / rel).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        text = ""
+    defines = [n for n in re.findall(r"^class (\w+)", text, re.M) if not n.startswith("_")]
+    return EngineModel(architecture, cls, rel, tuple(dict.fromkeys([cls, *defines])))
+
+
+def find_prior_art(repo: str | Path, config: Mapping[str, Any]) -> PriorArt:
+    """Whether the tree at ``repo`` has the engine's own model of ``config``'s architecture, and which."""
+    found = PriorArt(architectures=tuple(str(a) for a in config.get("architectures") or ()))
+    try:
+        known = _registered(Path(repo))
+        found.engine_model = engine_model(repo, config, known)
+    except OSError:
+        return found
+    if known and found.architectures:
+        found.registered = found.engine_model is not None
+        found.unnamed = tuple(cls for name, (_, cls) in known.items() if not name.isidentifier())
+    return found
 
 
 def head_dims(config: Mapping[str, Any]) -> dict[str, int]:
@@ -364,20 +202,11 @@ def fmha_rule(repo: str | Path | None) -> tuple[tuple[int, ...], int, str] | Non
     return listed, int(match.group(2)), where
 
 
-@dataclass(frozen=True)
-class EngineLimit:
-    """One thing the engine's kernels refuse for this geometry, and how a plan gets past it."""
+def engine_constraints(config: Mapping[str, Any], repo: str | Path | None = None) -> list[str]:
+    """What the engine's kernels refuse for this checkpoint's geometry, each with its usual way out.
 
-    #: The sentence: what is refused, where that is read, and the usual way out.
-    text: str
-    #: The value a plan that addressed it names, e.g. ``192``.
-    subject: str
-    #: Words one of which that plan also names: the ways out, e.g. ``("256", "native")``.
-    ways_out: tuple[str, ...]
-
-
-def fmha_head_dims(config: Mapping[str, Any], repo: str | Path | None = None) -> list[EngineLimit]:
-    """Head dimensions the trtllm-gen FMHA has no kernel for, and the padding way out."""
+    One limit is read: the head dimensions the trtllm-gen FMHA has no kernel for.
+    """
     rule = fmha_rule(repo)
     if rule is None:
         return []
@@ -386,123 +215,77 @@ def fmha_head_dims(config: Mapping[str, Any], repo: str | Path | None = None) ->
     for where, dim in sorted(head_dims(config).items()):
         if dim not in listed and dim % multiple:
             unsupported.setdefault(dim, []).append(f"`{where}`")
-    limits: list[EngineLimit] = []
+    limits = []
     for dim, wheres in sorted(unsupported.items()):
         padded = next(d for d in (*sorted(listed), *(multiple * k for k in range(1, 9))) if d > dim)
-        text = (
+        limits.append(
             f"{', '.join(wheres)} = {dim}: the trtllm-gen FMHA has no kernel for head dim {dim} "
             f"({source}: {', '.join(map(str, listed))} or a multiple of {multiple}). The "
             f"paged-context path chunked prefill and block reuse take needs one: zero-pad the "
             f"heads to {padded} in the KV pools and keep the softmax scale at 1/sqrt({dim}) "
-            f"(q_scaling = sqrt({dim}/{padded}) in the attention op's convention), or plan a "
-            f"new native kernel. Native work costs rebuilds; padding usually does not."
+            f"(q_scaling = sqrt({dim}/{padded}) in the attention op's convention). The other "
+            f"way is a new native kernel, which no run builds: it is a rebuild of the base."
         )
-        limits.append(EngineLimit(text, str(dim), (str(padded), "native")))
     return limits
 
 
-EngineRule = Callable[[Mapping[str, Any], "str | Path | None"], list[EngineLimit]]
+def reference_for(model: EngineModel | None) -> str:
+    """The engine's own model as one lead of a card: its class and the search that finds it.
 
-#: Engine limits checked against a checkpoint's geometry, each read from the source that
-#: enforces it. A new limit (a GEMM shape, a KV dtype, a rope variant) adds its function here.
-ENGINE_RULES: tuple[EngineRule, ...] = (fmha_head_dims,)
-
-
-def engine_limits(config: Mapping[str, Any], repo: str | Path | None = None) -> list[EngineLimit]:
-    """What the engine's kernels refuse for this checkpoint's geometry (:data:`ENGINE_RULES`)."""
-    return [limit for rule in ENGINE_RULES for limit in rule(config, repo)]
-
-
-def engine_constraints(config: Mapping[str, Any], repo: str | Path | None = None) -> list[str]:
-    """What the engine's kernels refuse for this checkpoint's geometry, each with its usual way out."""
-    return [limit.text for limit in engine_limits(config, repo)]
-
-
-def _op_words(name: str) -> set[str]:
-    """A listed implementation's words: its category and name, not the directory of its owner."""
-    return words(name.split("/ops/", 1)[-1].split(" ->", 1)[0].replace("/", " "))
-
-
-def ranker(config: Mapping[str, Any], names: Iterable[str]) -> Callable[[str], float]:
-    """How much each of ``names`` shares ``config``'s vocabulary: rarer shared words weigh more.
-
-    For ordering a long list before it is cut (the surface survey's), so the
-    implementations this checkpoint is likely to reuse come first whatever
-    their names sort as. A name outside ``names`` scores by the same weights.
+    ``""`` when the engine registers no model for the checkpoint's architecture. A search
+    and a reason, as every lead: no place.
     """
-    wanted = config_words(config)
-    pool = [_op_words(n) for n in names]
-    frequency: dict[str, int] = {}
-    for vocab in pool:
-        for word in vocab & wanted:
-            frequency[word] = frequency.get(word, 0) + 1
-    total = max(len(pool), 1)
-
-    def score(name: str) -> float:
-        return sum(math.log(1 + total / frequency.get(w, 1)) for w in _op_words(name) & wanted)
-
-    return score
-
-
-#: The heading of the survey dispatch's prior-art section.
-PRIOR_ART_HEADING = "## Prior art and engine limits for this checkpoint"
-
-
-def survey_block(found: PriorArt | None, limits: Sequence[EngineLimit], *, limit: int = 5) -> str:
-    """What the surveyor reads before it maps a step to a GAP: the leads, and the engine's limits."""
-    lines = [PRIOR_ART_HEADING, ""]
-    if not limits and (found is None or not found.candidates):
+    if model is None:
         return ""
-    lines.append(
-        "Read off this tree and the checkpoint's `config.json` before this phase started "
-        "(`prior_art.md` in the workspace has the longer list). A lead is where to look, not "
-        "a verdict: read its code and cells. A step you map to a GAP that writes new code "
-        "names in `tried` each lead below that shares its words and why it does not serve."
+    return (
+        f"`{model.cls}` (the engine's own implementation of this architecture; search "
+        f"`{model.search()}`): copy what you need from it into the target; do not import it. "
+        "Compare against it"
     )
+
+
+#: The engine's own model as a run found it, as data, in its workspace: what each card's
+#: first lead is made from (:func:`reference_for`).
+PRIOR_ART_DATA = "prior_art.json"
+
+
+def save(found: PriorArt | None, path: str | Path) -> None:
+    """Keep the engine's own model at ``path`` as data; remove the file when there is none."""
+    path = Path(path)
+    if found is None or found.engine_model is None:
+        path.unlink(missing_ok=True)
+        return
+    path.write_text(json.dumps(asdict(found.engine_model), indent=1), encoding="utf-8")
+
+
+def load(path: str | Path) -> EngineModel | None:
+    """What :func:`save` kept at ``path``; ``None`` when there is no such file or it is not that."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        return EngineModel(**{k: tuple(v) if isinstance(v, list) else v for k, v in data.items()})
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+
+
+#: The heading of the survey dispatch's section.
+PRIOR_ART_HEADING = "## The engine's own model and its limits for this checkpoint"
+
+
+def survey_block(found: PriorArt | None, limits: Sequence[str]) -> str:
+    """What the survey's dispatch carries: the engine's own model of the architecture, and its limits."""
+    first = found.reference() if found is not None else ""
+    if not limits and not first:
+        return ""
+    lines = [PRIOR_ART_HEADING, ""]
+    if first:
+        lines += [first, ""]
     if limits:
         lines += [
-            "",
-            "**Engine limits for this geometry** -- state the design for each in `plan.md`:",
+            "**Engine limits for this geometry**: `plan.md` says how the target gets past each.",
             "",
         ]
-        lines += [f"- {limit.text}" for limit in limits]
-    if found is not None and found.candidates:
-        lines += ["", "**Implementations this tree already has**, ranked by shared vocabulary:", ""]
-        lines.append(found.render(limit=limit).rstrip())
-    return "\n".join(lines) + "\n"
-
-
-#: How a stock (non-modeling_v2) model module registers an architecture.
-_REGISTERED = re.compile(r"""register_auto_model\(\s*["']([^"']+)["']""")
-
-
-def stock_architectures(repo: str | Path) -> set[str] | None:
-    """The architectures the stock modeling path registers, or ``None`` when the tree has no zoo."""
-    zoo = tree_anchors.resolve(repo, "builtin_models")
-    index = tree_anchors.read(repo, "builtin_model_index")
-    if not zoo.found and index is None:
-        return None
-    found: set[str] = set()
-    for rel in zoo.paths:
-        for path in sorted((Path(repo) / rel).rglob("*.py")):
-            try:
-                found.update(
-                    _REGISTERED.findall(path.read_text(encoding="utf-8", errors="replace"))
-                )
-            except OSError:
-                continue
-    try:
-        tree = ast.parse(index[0]) if index is not None else None
-    except (SyntaxError, ValueError):
-        tree = None
-    for node in ast.walk(tree) if tree is not None else ():
-        target = node.targets[0] if isinstance(node, ast.Assign) else getattr(node, "target", None)
-        if isinstance(target, ast.Name) and target.id == "MODEL_ARCH_TO_MODULE":
-            try:
-                found.update(str(k) for k in ast.literal_eval(node.value))
-            except (ValueError, TypeError):
-                pass
-    return found
+        lines += [f"- {text}" for text in limits]
+    return "\n".join(lines).rstrip() + "\n"
 
 
 #: The value of the PyTorch loader's list of ``kv_cache_config.dtype`` values.
@@ -523,44 +306,19 @@ def engine_kv_dtypes(repo: str | Path | None) -> tuple[tuple[str, ...], str] | N
     return (values, where) if values else None
 
 
-def stock_supports(repo: str | Path, config: Mapping[str, Any]) -> bool | None:
-    """Whether the stock path registers one of the checkpoint's ``architectures``; ``None``: unknown."""
-    architectures = [str(a) for a in config.get("architectures") or ()]
-    known = stock_architectures(repo)
-    if not architectures or not known:
-        return None
-    return any(a in known for a in architectures)
-
-
-#: The anchors this module reads; the lint names each this checkout has nowhere.
-PRIOR_ART_ANCHORS: tuple[str, ...] = (
-    *(key for key, _ in ENGINE_ANCHORS),
-    "fmha_head_dims",
-    "builtin_models",
-    "builtin_model_index",
-    "kv_cache_dtypes",
-)
-
-
 __all__ = [
-    "ENGINE_ANCHORS",
-    "ENGINE_RULES",
-    "PRIOR_ART_ANCHORS",
+    "PRIOR_ART_DATA",
     "PRIOR_ART_HEADING",
-    "Candidate",
-    "EngineLimit",
+    "EngineModel",
     "PriorArt",
-    "config_words",
     "engine_constraints",
     "engine_kv_dtypes",
-    "engine_limits",
+    "engine_model",
     "find_prior_art",
-    "fmha_head_dims",
     "fmha_rule",
     "head_dims",
-    "ranker",
-    "stock_architectures",
-    "stock_supports",
+    "load",
+    "reference_for",
+    "save",
     "survey_block",
-    "words",
 ]

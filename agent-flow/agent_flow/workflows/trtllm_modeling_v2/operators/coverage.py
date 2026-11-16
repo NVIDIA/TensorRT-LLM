@@ -1,54 +1,47 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Operator coverage in ``vocabulary.yaml`` — the survey's machine-readable product.
+"""``vocabulary.yaml``, the survey's product, as far as code reads it.
 
-Each computation step lands in one of three states:
+Code makes a run's tasks from the survey with no planner, so it reads of each piece of
+work what that takes and nothing more: which entry a kernel row writes or certifies
+(``mode``, ``target``, and ``site`` for the local variant of a shared entry), what the row
+waits for (``depends_on``) and which deployment first needs it (``deployment``). The
+other rows are :mod:`.rows`. Everything else a surveyor writes into the file (its map of
+the model's steps, its reasons, its cells) is its own to word: it reaches the row's
+worker on its card and is held to no form here.
 
-===========  ==========================================================
-``OK``       an entry exists and its ``CELLS`` cover this checkpoint's
-             values on an arch in its ``ARCHS`` — nothing to do
-``CERT``     an entry exists, but this surface is not covered — dispatch
-             the kernel writer to verify it
-``GAP``      no entry at all — dispatch the kernel writer to onboard one
-===========  ==========================================================
-
-A ``GAP`` row says *where* its implementation comes from, via the sourcing
-ladder (``TIER_*``). Only when **every** rung is exhausted is the verdict a
-**vocabulary ceiling**, and that claim has to carry its evidence per rung.
+This module also says where an entry's files are: the one fact about the tree the
+workflow keeps, for the package it adds a target to (:data:`SUBJECT_PATHS`).
 """
 
 from __future__ import annotations
 
-import ast
 import re
 import zlib
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import yaml
 
+#: The workflow's subject: the ModelingV2 package a run adds its target to, and the
+#: directory the package's tests mirror it in. These two are where a run **writes**, and
+#: they are the only directories of the engine this workflow names. Everything it reads
+#: off the engine is found by what a file defines (``operators/tree_anchors.py``), and
+#: nothing a worker is told names a place in the engine.
 MODELING_V2_PACKAGE = "tensorrt_llm/_torch/_experimental/modeling_v2"
-CATALOG_DIR = f"{MODELING_V2_PACKAGE}/catalog"
 CATALOG_TESTS_DIR = "tests/unittest/_torch/modeling_v2"
+SUBJECT_PATHS: tuple[str, ...] = (MODELING_V2_PACKAGE, CATALOG_TESTS_DIR)
+CATALOG_DIR = f"{MODELING_V2_PACKAGE}/catalog"
 #: A target's own entries -- ops only it calls -- sit in this directory of the
 #: target, one ``<category>/<name>.py`` each, and their tests mirror that path
 #: under ``CATALOG_TESTS_DIR/models/<family>/<target>/``.
 MODEL_OPS_DIRNAME = "ops"
 
-_CATALOG_IMPORT = re.compile(
-    r"tensorrt_llm\._torch\._experimental\.modeling_v2\.catalog\.([a-z_]+)\.([a-z0-9_]+)"
-)
-
 
 #: The survey's product, in the run's workspace.
 VOCABULARY_FILENAME = "vocabulary.yaml"
-
-STATE_OK = "OK"
-STATE_CERT = "CERT"
-STATE_GAP = "GAP"
-_VALID_STATES = (STATE_OK, STATE_CERT, STATE_GAP)
 
 MODE_ONBOARD = "onboard"
 MODE_VERIFY = "verify"
@@ -66,66 +59,8 @@ _SITE = re.compile(r"^[a-z0-9]+(?:_[a-z0-9]+)*$")
 #: dispatch from here, above any row, so its decision file never collides with one.
 REF_DISPATCH_BASE, REF_DISPATCH_SPAN = 10_000, 90_000
 
-# Where a GAP's implementation is allowed to come from, cheapest first.
-TIER_TRTLLM_OP = 1  # torch.ops.trtllm.* -- an op the engine already exports
-TIER_INTREE_CALLABLE = 2  # a callable already in this tree -- the kernel plane, reused
-TIER_KERNEL_LIBRARY = 3  # flashinfer.* -- a pinned kernel library, called directly
-TIER_NATIVE_TORCH = 4  # composed from torch ops, written by this run
-TIER_TRITON = 5  # a Triton kernel, written by this run
-_VALID_TIERS = (
-    TIER_TRTLLM_OP,
-    TIER_INTREE_CALLABLE,
-    TIER_KERNEL_LIBRARY,
-    TIER_NATIVE_TORCH,
-    TIER_TRITON,
-)
-
-#: The packages the kernel-library rung may call: kernel libraries the engine
-#: already pins in ``requirements.txt``.
-KERNEL_LIBRARIES: tuple[str, ...] = ("flashinfer",)
-
-#: What each rung means to the agent that has to build it.
-TIER_DESCRIPTION: dict[int, str] = {
-    TIER_TRTLLM_OP: "an op the engine already exports as torch.ops.trtllm.*",
-    TIER_INTREE_CALLABLE: (
-        "a callable already in this repository: the engine's modules, its attention "
-        "backends (sparse ones included), custom ops and kernels (`tree_map.md` in the "
-        "workspace says where each is in this checkout), or another modeling_v2 "
-        "target's `ops/` (reused by copying it into this target's own `ops/`); the kernel plane is "
-        "reused, not rewritten"
-    ),
-    TIER_KERNEL_LIBRARY: (
-        "a kernel from a library the engine already pins (FlashInfer), called through "
-        "its public Python API because no trtllm op wraps it; the kernel is reused, "
-        "not rewritten. Read its API in the run's interpreter"
-    ),
-    TIER_NATIVE_TORCH: (
-        "no engine implementation exists, so compose one from torch ops. Correct "
-        "first and slow is acceptable for a functionality onboarding; the tuning "
-        "phase replaces it"
-    ),
-    TIER_TRITON: (
-        "native torch cannot express it, or does so at a cost that breaks the "
-        "gate's budget, so write a Triton kernel, adapted from an existing one "
-        "(FlashInfer, vLLM, SGLang) where there is one"
-    ),
-}
-
-#: A tier above this is work this run *writes* rather than *wraps*.
-HIGHEST_REUSING_TIER = TIER_KERNEL_LIBRARY
-
-VERDICT_ASSEMBLABLE = "assemblable"
-VERDICT_AFTER_ADDITIONS = "assemblable_after_additions"
-VERDICT_CEILING = "ceiling"
-_VALID_VERDICTS = (VERDICT_ASSEMBLABLE, VERDICT_AFTER_ADDITIONS, VERDICT_CEILING)
-
 #: The unit a queue row belongs to when it names none.
 UNIT_CORE = "core"
-
-#: Cells one queue row may list. The kernel writer certifies every cell its row lists, so a
-#: row covers each axis of the envelope (dtype, rows per captured batch, per-rank sizes, the
-#: prefill chunk), not their product.
-MAX_ROW_CELLS = 64
 
 
 class VocabularyError(ValueError):
@@ -195,8 +130,6 @@ class QueueItem:
     depends_on: tuple[int, ...] = ()
     surface: str | None = None
     note: str = ""
-    #: Which rung of the sourcing ladder supplies this entry.
-    tier: int = TIER_TRTLLM_OP
     #: The first assembly unit that needs this entry. It decides what a
     #: failed dispatch blocks, not when the dispatch runs
     #: (`run/orchestrator._add_kernel_tasks`).
@@ -216,14 +149,6 @@ class QueueItem:
             return None
         return variant_target(self.target, self.site or f"r{self.n}")
 
-    @property
-    def writes_implementation(self) -> bool:
-        """True when this dispatch must *write* the kernel, not wrap one.
-
-        Tiers 1-3 wrap something that exists; 4-5 do not.
-        """
-        return self.tier > HIGHEST_REUSING_TIER
-
 
 def _require_mapping(value: Any, what: str) -> dict[str, Any]:
     if not isinstance(value, dict):
@@ -231,87 +156,30 @@ def _require_mapping(value: Any, what: str) -> dict[str, Any]:
     return value
 
 
-def _check_steps(raw: Any, errors: list[str]) -> None:
-    if raw is None:
-        return
-    if not isinstance(raw, list):
-        errors.append(f"`steps` must be a list, got {type(raw).__name__}")
-        return
-    for index, row in enumerate(raw):
-        if not isinstance(row, dict):
-            errors.append(f"steps[{index}] must be a mapping, got {type(row).__name__}")
-            continue
-        state = row.get("state")
-        if state not in _VALID_STATES:
-            errors.append(f"steps[{index}].state is {state!r}; expected one of {_VALID_STATES}")
-        if not str(row.get("step", "")).strip():
-            errors.append(f"steps[{index}].step must name the computation step")
-        if state in (STATE_OK, STATE_CERT):
-            if not str(row.get("entry", "")).strip():
-                errors.append(f"steps[{index}] is {state} but names no catalog `entry`")
-            if not str(row.get("contract_line", "")).strip():
-                errors.append(
-                    f"steps[{index}] is {state} but quotes no `contract_line`; the line "
-                    f"that decides coverage is the evidence for this row"
-                )
-        elif state == STATE_GAP:
-            tier = row.get("tier")
-            if tier is None:
-                errors.append(
-                    f"steps[{index}] is GAP but names no `tier`. Say which rung of the "
-                    f"sourcing ladder supplies it: {_VALID_TIERS} — see TIER_DESCRIPTION. "
-                    f"'No trtllm op exists' is a statement about tier 1, not a ceiling."
-                )
-            elif tier not in _VALID_TIERS:
-                errors.append(f"steps[{index}].tier is {tier!r}; expected one of {_VALID_TIERS}")
-            candidate = str(row.get("candidate", "")).strip()
-            if tier in (TIER_TRTLLM_OP, TIER_INTREE_CALLABLE, TIER_KERNEL_LIBRARY):
-                if not candidate:
-                    errors.append(
-                        f"steps[{index}] is GAP at tier {tier} but names no `candidate`; "
-                        f"tiers 1-3 wrap something that already exists, so it must be named"
-                    )
-                elif (
-                    tier == TIER_KERNEL_LIBRARY and candidate.split(".")[0] not in KERNEL_LIBRARIES
-                ):
-                    errors.append(
-                        f"steps[{index}] is GAP at tier {tier} with candidate {candidate!r}, "
-                        f"which is not in a kernel library the engine pins "
-                        f"({', '.join(KERNEL_LIBRARIES)}). Name the library callable "
-                        f"(`flashinfer.<module>.<name>`); a trtllm op is tier 1 and an "
-                        f"in-tree callable tier 2"
-                    )
-            elif tier in (TIER_NATIVE_TORCH, TIER_TRITON):
-                if not str(row.get("tried", "")).strip():
-                    errors.append(
-                        f"steps[{index}] is GAP at tier {tier}, which means this run has "
-                        f"to *write* the implementation. Record in `tried` what was "
-                        f"searched at the cheaper rungs and why it was rejected — "
-                        f"otherwise the ladder is a way to skip straight to writing a "
-                        f"kernel without looking for one"
-                    )
-
-
 def _parse_unit(
     row: Mapping[str, Any], index: int, units: Sequence[str] | None, errors: list[str]
 ) -> str:
-    """The row's ``unit``, defaulting to core; checked against the run's units when known."""
-    raw = row.get("unit")
+    """The deployment that first needs the row's entry; the first one's when the row names none.
+
+    Read from the row's ``deployment`` and checked against the spec's deployments when
+    they are known.
+    """
+    raw = row.get("deployment")
     if raw is None:
         return UNIT_CORE
     if not isinstance(raw, str) or not raw.strip():
         errors.append(
-            f"queue[{index}].unit is {raw!r}; it must name the one assembly unit that "
-            f"first needs this entry (`{UNIT_CORE}`, the default, or a feature from "
-            f"task.yaml `features`)"
+            f"queue[{index}].deployment is {raw!r}; it must be the name of the one deployment "
+            f"that first needs this entry, as `task.yaml`'s `deployments` name it. Leave the "
+            f"key off when the first deployment needs the entry"
         )
         return UNIT_CORE
     unit = raw.strip()
     if units is not None and unit not in units:
         errors.append(
-            f"queue[{index}].unit is {unit!r}, which is not one of this run's assembly "
-            f"units {list(units)}. Tag a row only with the first unit that needs its "
-            f"entry; leave it off (core) when core needs it or you are unsure"
+            f"queue[{index}].deployment is {unit!r}, which is not one of the spec's "
+            f"deployments {list(units)}. Name only the deployment that first needs the "
+            f"entry; leave the key off when the first deployment needs it or you are unsure"
         )
         return UNIT_CORE
     return unit
@@ -349,7 +217,7 @@ def _parse_queue(
 
     items: list[QueueItem] = []
     seen_n: set[int] = set()
-    seen_targets: dict[str, str] = {}
+    seen_own: set[str] = set()
     seen_variants: dict[str, int] = {}
     for index, row in enumerate(raw):
         if not isinstance(row, dict):
@@ -377,21 +245,13 @@ def _parse_queue(
             )
         if not target:
             errors.append(f"queue[{index}].target must name exactly one catalog entry")
-        elif target in seen_targets and seen_targets[target] != mode:
+        elif target in seen_own:
             errors.append(
-                f"queue[{index}] has {target!r} in both chapters "
-                f"({seen_targets[target]} and {mode}). An entry onboarded here is "
-                f"tested at this checkpoint's values by construction, so it never "
-                f"also needs verifying"
+                f"queue[{index}] is a second row on {target!r}, an entry of the target's own: "
+                f"two rows would write the same file. Make them one row"
             )
-        elif target in seen_targets and not target.startswith("ops/"):
-            errors.append(
-                f"queue[{index}] is a second {mode} row on {target!r}. Write one row per "
-                f"shared entry: every call site's shapes as its `cells` (and the sites in "
-                f"its `note`), so one kernel writer certifies them all and nothing is merged later"
-            )
-        elif target:
-            seen_targets[target] = str(mode)
+        elif not _is_shared(target):
+            seen_own.add(target)
 
         depends_raw = row.get("depends_on") or []
         if not isinstance(depends_raw, list):
@@ -404,36 +264,12 @@ def _parse_queue(
             except (TypeError, ValueError):
                 errors.append(f"queue[{index}].depends_on holds {dep!r}, which is not a number")
 
-        if mode == MODE_VERIFY and not str(row.get("surface", "")).strip():
-            errors.append(
-                f"queue[{index}] is a verify dispatch with no `surface`. The value and "
-                f"the contract line that excludes it are what the kernel writer is dispatched "
-                f"with, so vagueness here costs a whole run"
-            )
-        cells = row.get("cells")
-        if isinstance(cells, list) and len(cells) > MAX_ROW_CELLS:
-            errors.append(
-                f"queue[{index}] lists {len(cells)} cells, more than {MAX_ROW_CELLS}. The kernel "
-                f"writer certifies each one: cover each axis (every dtype, each call site's rows "
-                f"at the smallest and largest captured batch, each member's per-rank sizes, one "
-                f"chunk at max_num_tokens), varying one at a time from a base cell, not their product"
-            )
-
-        try:
-            tier = int(row.get("tier", TIER_TRTLLM_OP))
-        except (TypeError, ValueError):
-            errors.append(f"queue[{index}].tier must be one of {_VALID_TIERS}")
-            tier = TIER_TRTLLM_OP
-        else:
-            if tier not in _VALID_TIERS:
-                errors.append(f"queue[{index}].tier is {tier!r}; expected one of {_VALID_TIERS}")
         site = _parse_site(row, index, target, errors)
         item = QueueItem(
             n=n,
             mode=str(mode),
             target=target,
             depends_on=tuple(depends),
-            tier=tier,
             surface=row.get("surface"),
             note=str(row.get("note", "")),
             unit=_parse_unit(row, index, units, errors),
@@ -463,7 +299,7 @@ def parse_vocabulary(
     *,
     units: Sequence[str] | None = None,
 ) -> tuple[QueueItem, ...]:
-    """Validate a parsed mapping, batching every problem into one error, and return its queue.
+    """The queue of a parsed vocabulary: what code needs of each kernel row, every problem at once.
 
     ``units`` is the run's assembly units (``task_schema.assembly_units``).
     When given, every queue row's ``unit`` must be one of them; when not,
@@ -472,57 +308,7 @@ def parse_vocabulary(
     """
     data = _require_mapping(data, source)
     errors: list[str] = []
-
-    verdict = data.get("verdict")
-    if verdict not in _VALID_VERDICTS:
-        errors.append(f"`verdict` is {verdict!r}; expected one of {_VALID_VERDICTS}")
-
-    _check_steps(data.get("steps"), errors)
     queue = _parse_queue(data.get("queue"), errors, units)
-
-    ceiling = data.get("ceiling")
-    if verdict == VERDICT_CEILING and isinstance(ceiling, dict):
-        exhausted = ceiling.get("exhausted")
-        if not isinstance(exhausted, dict):
-            errors.append(
-                "`ceiling` must carry an `exhausted` mapping with one entry per tier "
-                f"{_VALID_TIERS}, saying what was searched and why that rung failed. "
-                f"A ceiling that has not considered tier {TIER_KERNEL_LIBRARY} (FlashInfer's "
-                f"API) and tiers {TIER_NATIVE_TORCH}-{TIER_TRITON} is a report that nobody "
-                "looked outside the engine or wrote the kernel yet, which is not the same thing."
-            )
-        else:
-            missing = [t for t in _VALID_TIERS if not str(exhausted.get(t, "")).strip()]
-            if missing:
-                errors.append(
-                    f"`ceiling.exhausted` says nothing about tier(s) {missing}. "
-                    f"Tier {TIER_KERNEL_LIBRARY} is FlashInfer's public API, which the "
-                    f"op inventory cannot see; tiers {TIER_NATIVE_TORCH}-{TIER_TRITON} are "
-                    f"this run writing the implementation itself. Declaring a ceiling "
-                    f"without ruling them out claims more than was established."
-                )
-
-    if verdict == VERDICT_CEILING:
-        if not isinstance(ceiling, dict) or not str(ceiling.get("step", "")).strip():
-            errors.append(
-                "`verdict: ceiling` requires a `ceiling` mapping naming the exact "
-                "`step` and what was `searched`. A ceiling is the one verdict that "
-                "ends the run, so it carries its evidence or it is not a verdict"
-            )
-    elif ceiling not in (None, {}):
-        errors.append(f"`ceiling` is set but the verdict is {verdict!r}; they must agree")
-
-    if verdict == VERDICT_ASSEMBLABLE and queue:
-        errors.append(
-            f"`verdict: assemblable` means nothing has to be added first, but the "
-            f"queue holds {len(queue)} dispatch(es). Use "
-            f"`{VERDICT_AFTER_ADDITIONS}` instead"
-        )
-    if verdict == VERDICT_AFTER_ADDITIONS and not queue:
-        errors.append(
-            f"`verdict: {VERDICT_AFTER_ADDITIONS}` with an empty queue says additions "
-            f"are needed but names none. Use `{VERDICT_ASSEMBLABLE}` instead"
-        )
 
     if errors:
         bullet = "\n  - "
@@ -613,79 +399,17 @@ def queue_item_from_ref(ref: str, task_id: str, goal: str = "") -> QueueItem | N
     return QueueItem(n=n, mode=mode, target=target, note=goal, site=site or None)
 
 
-def imported_catalog_entries(modeling_py: Path) -> list[tuple[str, str]]:
-    """Return ``(category, name)`` for every catalog entry a target imports."""
-    tree = ast.parse(modeling_py.read_text(encoding="utf-8"))
-    found: list[tuple[str, str]] = []
-    for node in ast.walk(tree):
-        module = None
-        if isinstance(node, ast.ImportFrom) and node.module:
-            module = node.module
-        elif isinstance(node, ast.Import):
-            for alias in node.names:
-                match = _CATALOG_IMPORT.search(alias.name)
-                if match:
-                    found.append((match.group(1), match.group(2)))
-            continue
-        if module:
-            match = _CATALOG_IMPORT.search(module)
-            if match:
-                found.append((match.group(1), match.group(2)))
-    return sorted(set(found))
-
-
 def model_ops_tests_dir(target_rel: str) -> str:
     """``.../modeling_v2/models/<family>/<target>`` -> its tests' directory."""
     tail = target_rel.rstrip("/").split(f"{MODELING_V2_PACKAGE}/", 1)[-1]
     return f"{CATALOG_TESTS_DIR}/{tail}"
 
 
-def entry_module(target: str) -> str:
-    """The tail every path of ``target``'s entry module ends in.
-
-    ``target`` is a dispatch's ``<category>/<name>`` (the shared catalog) or
-    ``ops/<category>/<name>`` (the run's target's own); see the entry spec.
-    """
-    parts = target.strip("/").split("/")
-    home = "ops" if parts[0] == "ops" and len(parts) > 2 else "catalog"
-    return f"{home}/{'/'.join(parts[-2:])}.py"
-
-
-def is_entry_file(path: str, target: str) -> bool:
-    """Whether the repo-relative ``path`` is one of the files ``target``'s entry spans.
-
-    The entry module, its GPU test (with a collective's rank body beside it),
-    and the ``__init__.py`` of a new ``ops/<category>/``: what a kernel writer writes
-    for one entry, in both trees.
-    """
-    parts = target.strip("/").split("/")
-    if len(parts) < 2:
-        return False
-    category, name = parts[-2], parts[-1]
-    file = PurePosixPath(path)
-    if path.startswith("tensorrt_llm/"):
-        if path.endswith("/" + entry_module(target)):
-            return True
-        return (
-            parts[0] == "ops"
-            and file.name == "__init__.py"
-            and path.endswith(f"/ops/{category}/__init__.py")
-        )
-    if path.startswith("tests/") and file.parent.name == category:
-        stem = file.stem
-        return stem == f"test_modeling_v2_{name}" or stem.startswith(
-            (f"test_modeling_v2_{name}_", f"_{name}_")
-        )
-    return False
-
-
 __all__ = [
-    "is_entry_file",
-    "entry_module",
-    "imported_catalog_entries",
     "model_ops_tests_dir",
     "MODEL_OPS_DIRNAME",
     "MODELING_V2_PACKAGE",
+    "SUBJECT_PATHS",
     "CATALOG_TESTS_DIR",
     "CATALOG_DIR",
     "MODE_ONBOARD",
@@ -693,13 +417,7 @@ __all__ = [
     "OP_MATRIX_SUFFIX",
     "QueueItem",
     "VARIANT_SEPARATOR",
-    "STATE_CERT",
-    "STATE_GAP",
-    "STATE_OK",
     "UNIT_CORE",
-    "VERDICT_AFTER_ADDITIONS",
-    "VERDICT_ASSEMBLABLE",
-    "VERDICT_CEILING",
     "VOCABULARY_FILENAME",
     "VocabularyError",
     "entry_paths",

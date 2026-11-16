@@ -4,9 +4,10 @@
 """How GPU work is launched — resolved once, then handed to every agent.
 
 The ``environment`` block of ``task.yaml`` becomes a :class:`RunEnvironment`, whose ``prefix``
-every GPU command is prepended with; the agent prompts carry that string. ``local`` runs on this
-host's claimed devices, ``session_spool`` through a compute session's spool. This module only
-builds commands; :mod:`.executor` runs them.
+every GPU command is prepended with; the agent prompts carry that string. Inside a run every
+GPU command is a job in the run's one spool, whatever the environment: the watchers of the
+pool's holders are the only ledger of devices (:mod:`.pool`). This module only builds commands;
+:mod:`.executor` runs them.
 """
 
 from __future__ import annotations
@@ -19,15 +20,11 @@ from typing import Any, Mapping, Sequence
 
 from ..files import read_json
 from . import SPOOLCTL_PATH
+from . import pool as pool_mod
+from . import slurm as slurm_mod
 from .scheduler import SpoolPaths
 from .server_runtime import MULTI_TASK_SLURM_VARS, rank_launch
-from .sessions import (
-    MERGED_ENV_VARS,
-    SessionSpec,
-    describe_sessions,
-    env_assignments,
-    sessions_from_task,
-)
+from .sessions import MERGED_ENV_VARS, env_assignments
 
 #: The wrapper that makes a pre-launched MPI world work: rank 0 runs the leader and the task,
 #: every other rank a worker.
@@ -62,12 +59,10 @@ def single_task_scrub(keep: Sequence[str] = ()) -> str:
     return f'for v in ${{!PMI@}} ${{!PMIX@}} ${{!MPI@}} ${{!OMPI@}} ${{!SLURM@}}; do {tests} && unset "$v"; done'
 
 
-SINGLE_TASK_MPI_SCRUB = single_task_scrub()
-
 # Above one task, under `mpirun`, the misleading variables are the Slurm task ones:
 # `trtllm-llmapi-launch` reads `SLURM_PROCID` before `OMPI_COMM_WORLD_RANK` for its rank and
 # `SLURM_NTASKS` before `OMPI_COMM_WORLD_SIZE` for `mpi_world_size`. Right under `srun`, wrong
-# under an `mpirun` inside a one-task allocation, which is what a `session_spool` job is.
+# under an `mpirun` inside a one-task allocation, which is what a watcher's job is.
 # Unscrubbed, every rank reads rank 0 of a world of 1 and becomes a `mgmn_leader_node` waiting
 # for workers that never come: no error, no exit, a hang.
 MULTI_TASK_SLURM_SCRUB = "env " + " ".join(f"-u {name}" for name in MULTI_TASK_SLURM_VARS)
@@ -84,12 +79,14 @@ class RunEnvironment:
     world_size: int = 1
     # The image the GPU jobs run in, if any: an interpreter path above is a path inside it.
     container_image: str | None = None
-    # ``session_spool`` only: the spool a long-lived compute session watches.
+    # The run's one spool; ``None`` only for ``local`` resolved outside a run.
     spool: str | None = None
-    # Every declared session an agent may submit to.
-    sessions: tuple[SessionSpec, ...] = ()
-    # ``perf.dev_spools``: the sessions the tuners submit to; no other prompt names them.
-    dev_spools: tuple[str, ...] = ()
+    # ``environment.slurm``: how a step across nodes is built.
+    slurm: Mapping[str, Any] | None = None
+    # Devices on one node, when the spec states it.
+    gpus_per_node: int | None = None
+    # How long one holder lasts, when it has an end (seconds).
+    holder_time_s: float | None = None
 
     @property
     def ntasks(self) -> int:
@@ -171,9 +168,46 @@ class RunEnvironment:
             argv = " ".join(shlex.quote(str(part)) for part in argv)
         return self.command(f"{shlex.quote(self.python)} {argv}", single_process=single_process)
 
+    def step(self, *, ranks: int, nodes: int, hosts: str, command: str) -> str:
+        """The shell line that runs ``command`` as ``ranks`` tasks of one world on ``hosts``.
+
+        Slurm's own line: the flow has no other launcher across nodes.
+        """
+        if self.slurm:
+            return slurm_mod.step_line(
+                self.slurm,
+                run=slurm_mod.run_id(self.spool or ""),
+                ranks=ranks,
+                nodes=nodes,
+                hosts=hosts,
+                command=command,
+            )
+        raise EnvironmentError(
+            f"a step of {ranks} rank(s) across {nodes} node(s) needs environment.slurm: "
+            f"{pool_mod.OTHER_ENVIRONMENT}"
+        )
+
+    def on_each_node(self, command: str, nodes: int) -> str:
+        """The script of a multi-node job that runs ``command`` once on each of its nodes.
+
+        The holder's lead runs the script once; each node gets one single-rank step with its
+        rank in ``MV2FLOW_JOB_NODE_RANK``. The script ends with the first code that is not 0.
+        """
+        lines = ['IFS=, read -ra MV2FLOW_HOSTS <<< "$MV2FLOW_JOB_HOSTS"', "pids=()"]
+        for rank in range(nodes):
+            step = self.step(
+                ranks=1,
+                nodes=1,
+                hosts=f'"${{MV2FLOW_HOSTS[{rank}]}}"',
+                command=f"env MV2FLOW_JOB_NODE_RANK={rank} {command}",
+            )
+            lines += [f"{step} &", "pids+=($!)"]
+        lines += ['rc=0; for pid in "${pids[@]}"; do wait "$pid" || rc=$?; done', 'exit "$rc"']
+        return "\n".join(lines)
+
     def describe(self) -> str:
         """The block injected verbatim into every agent's prompt."""
-        if self.kind == "session_spool":
+        if self.spool:
             return self._describe_spool()
         device_line = ", ".join(str(d) for d in self.devices) if self.devices else "(none)"
         return (
@@ -195,7 +229,7 @@ class RunEnvironment:
         )
 
     def _describe_spool(self) -> str:
-        """The prompt block for a long-lived compute session watching a spool."""
+        """The prompt block of the run's spool: work is a file, and it states its size and wall."""
         spool = self.spool or "<spool>"
         exports = "\n".join(f"export {part}" for part in env_assignments(self.launch_env))
         if not exports:
@@ -205,45 +239,55 @@ class RunEnvironment:
         return (
             "## Running GPU work\n"
             "\n"
-            "A compute session is already running and its scheduler watches a spool "
-            "directory. You do **not** allocate nodes or start GPU work any other way: "
-            "no cluster scheduler commands, no GPU process of your own. Work is a file.\n"
+            "The run holds its GPUs in a pool, and a scheduler on every held node watches "
+            "one spool directory. You do **not** allocate nodes or start GPU work any other "
+            "way: `sbatch` and `srun` are not yours, and no GPU process of your own. Work is "
+            "a file.\n"
             "\n"
-            "Run something and wait for it (prints the log, exits with the job's code):\n"
+            "**Your card's check is already such a job, with its size and wall filled in: "
+            "run it as the card gives it.** Anything else that runs the engine's Python "
+            "(one test, a probe, an import), with a device or without, is a job of your "
+            "own. Submit it and wait for it (it prints the log and exits with the job's "
+            "code):\n"
             "\n"
             "```bash\n"
-            f"SPOOL={spool} {submit} --gpus <N|all> --wall <limit> <name> '<command>'\n"
+            f"SPOOL={spool} {submit} --tree <your tree> --gpus <N> --wall <limit> <name> "
+            "'<command>'\n"
             "```\n"
             "\n"
-            "- `--gpus N` asks for N devices; the scheduler exports `CUDA_VISIBLE_DEVICES` to "
-            "exactly those. **Never set `CUDA_VISIBLE_DEVICES` yourself.** `--gpus all` holds "
-            "the whole node, exclusively — use it for anything that loads the full model. "
-            "Without `--gpus`, a `free-` name holds no device and any other name holds the "
-            "whole node.\n"
+            "- **`--tree <your tree>` always.** The job then runs a pin of your tree, from "
+            "inside it, and imports your code. Without it the job imports whatever copy of "
+            "the engine is installed, and your new files are not there.\n"
+            "- **A job of your own states its size and its wall**, the smallest that fit: "
+            "`--gpus 0` for what needs no device, `--gpus 1` for a kernel test (`--nodes N` "
+            "for whole nodes), and a `--wall` a little over what the command takes. A job "
+            "that states neither is refused, and the refusal says what to add. **Never set "
+            "`CUDA_VISIBLE_DEVICES` yourself**: the scheduler gives each job its devices.\n"
             "- `--wall` is counted from the job's start; time spent queued is free. A job "
-            "past its limit is stopped and reported as timed out.\n"
+            "past its limit is stopped and reported as timed out, and one starts only where "
+            "its wall ends before the allocation does.\n"
             "- **A job waiting in the queue is not a block.** Other tasks share these "
             "devices; yours starts when they free. Do the rest of your task meanwhile and "
-            "poll its log or `status`; the site blocks you only when it refuses the job or "
-            "no session runs.\n"
-            "- `<name>` must be unique to what you are doing and must start with your "
-            "request's prefix when one is set (`$MV2FLOW_JOB_PREFIX`). Its log is "
-            f"`{spool}/logs/<name>.log` and **that file is the result**; your recollection of "
-            "what scrolled past is not.\n"
+            "poll its log or `status` every few minutes; you are blocked only when the job "
+            "is refused or no watcher runs.\n"
+            "- `<name>` is unique to what you are doing and starts with your request's "
+            "prefix when one is set (`$MV2FLOW_JOB_PREFIX`). Its log is "
+            f"`{spool}/logs/<name>.log` and **that file is the result**.\n"
             f"- `{control} status` shows what runs, what waits and why. "
             f"`{control} cancel <name>` is the only way to stop a job: never `kill`, "
             "`pkill` or time out a process yourself.\n"
             "\n"
-            "The script runs inside the container on the compute node, so it sees the same "
-            "filesystem you do. Start it with:\n"
+            "The job runs where the engine's environment is (inside the container on a "
+            "compute node, when the run has one). It sees the storage every node shares, "
+            "and your tree through `--tree`. Start its command with:\n"
             "\n"
             "```bash\n"
             f"{exports}\n"
             "```\n"
             "\n"
-            f"The Python interpreter is `{self.python}`. World size {self.world_size}.\n"
+            f"The engine's Python interpreter is `{self.python}`: it exists where jobs run, "
+            f"and maybe not in your shell. World size {self.world_size}.\n"
             "\n"
-            + describe_sessions(self.sessions)
             + (
                 "This run is **multi-rank**, so an engine command has to be launched with "
                 "the ranks already in place:\n"
@@ -267,10 +311,8 @@ class RunEnvironment:
                 if self.needs_llmapi_launch
                 else ""
             )
-            + "**Do not construct a launcher command, do not probe for one, and do not call a "
-            "test-runner skill.** The session was resolved before you started and it is not "
-            "yours to rediscover. If this protocol does not fit what you need to run, that "
-            "is a **symptom to report in your final message** — not a problem to solve.\n"
+            + "**Do not construct a launcher command and do not probe for one.** If this "
+            "protocol does not fit what you need to run, say so in your receipt.\n"
         )
 
 
@@ -280,7 +322,7 @@ def shares_allocation_with_spool(env: "RunEnvironment") -> str | None:
     The evidence is the ``slurm_job`` of the spool's ``status.json``; only two known, equal job ids
     warn.
     """
-    if env.kind != "session_spool" or not env.spool:
+    if not env.spool:
         return None
     # A spool job has no SLURM_* variables (they are scrubbed) and carries the session's job id
     # under this name instead.
@@ -299,15 +341,6 @@ def shares_allocation_with_spool(env: "RunEnvironment") -> str | None:
     )
 
 
-def scheduler_owns_devices(kind: str) -> bool:
-    """Whether a scheduler, not this process, decides the devices and the host.
-
-    "Not local" rather than a list of remote kinds: a kind added later is remote until someone
-    says otherwise, the safe default.
-    """
-    return kind != "local"
-
-
 def resolve_environment(
     task_data: Mapping[str, Any],
     *,
@@ -317,39 +350,27 @@ def resolve_environment(
     """Build a :class:`RunEnvironment` from a validated task spec and preflight's ``devices``."""
     block = dict(task_data.get("environment") or {})
     env = {str(k): str(v) for k, v in (block.get("env") or {}).items()}
-
-    declared = sessions_from_task({"environment": block}) if block.get("sessions") else ()
+    slurm = block.get("slurm") if isinstance(block.get("slurm"), Mapping) else None
+    per_node = (slurm or {}).get("gpus_per_node") or block.get("gpus_per_node")
     return RunEnvironment(
-        kind=str(block.get("kind", "local")),
+        kind=pool_mod.environment_kind(block),
         python=str(block.get("python", "python3")),
         env=env,
-        devices=tuple(int(d) for d in devices),
+        # In a spool the watcher exports each job's devices; a claim here would mask them.
+        devices=() if block.get("spool") else tuple(int(d) for d in devices),
         world_size=max(1, int(world_size)),
-        container_image=block.get("container_image"),
+        container_image=(slurm or {}).get("container_image") or block.get("container_image"),
         spool=block.get("spool"),
-        sessions=declared,
-        dev_spools=_dev_spools(task_data.get("perf")),
-    )
-
-
-def _dev_spools(perf: Any) -> tuple[str, ...]:
-    """``perf.dev_spools``, less any spool that also measures (``perf.spools``).
-
-    Only a declared list: the campaign's fallback to its measuring spools is not one, and a gate
-    beside a measurement would skew it.
-    """
-    if not isinstance(perf, Mapping):
-        return ()
-    measuring = {Path(str(s)) for s in perf.get("spools") or ()}
-    return tuple(
-        str(s) for s in perf.get("dev_spools") or () if s and Path(str(s)) not in measuring
+        slurm=dict(slurm) if slurm else None,
+        gpus_per_node=int(per_node) if per_node else None,
+        holder_time_s=pool_mod.holder_time_s(block),
     )
 
 
 # Why `TMPDIR` has a maximum length. The LLM API's RPC binds an IPC socket
-# under `TMPDIR` named `rpc_test_<uuid4>` (`get_unique_ipc_addr` in
-# `tensorrt_llm/executor/rpc/rpc_common.py`, `os.path.join`ed onto
-# `tempfile.gettempdir()`). A unix domain socket path is capped by the kernel
+# under `TMPDIR` named `rpc_test_<uuid4>` (the engine's `get_unique_ipc_addr`,
+# which `os.path.join`s it onto `tempfile.gettempdir()`; `git grep` finds it
+# where the tree has it now). A unix domain socket path is capped by the kernel
 # at `sizeof(sockaddr_un.sun_path)`: an `AF_UNIX` bind succeeds at 107
 # characters and fails at 108. `len("rpc_test_") + len(str(uuid.uuid4()))` is
 # 9 + 36, and the separator `os.path.join` inserts is the third term.
@@ -409,9 +430,7 @@ __all__ = [
     "MULTI_TASK_SLURM_VARS",
     "RunEnvironment",
     "MPI_SETTINGS_KEPT",
-    "SINGLE_TASK_MPI_SCRUB",
     "single_task_scrub",
     "resolve_environment",
-    "scheduler_owns_devices",
     "shares_allocation_with_spool",
 ]

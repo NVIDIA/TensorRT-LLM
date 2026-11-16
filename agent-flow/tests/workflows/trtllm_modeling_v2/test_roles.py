@@ -14,7 +14,6 @@ import tomllib
 from dataclasses import asdict, replace
 from importlib.resources import files
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import anyio
@@ -25,19 +24,14 @@ from jinja2 import StrictUndefined, UndefinedError
 from agent_flow.backends import claude_code
 from agent_flow.logger import get_logger
 from agent_flow.types import AgentTextEvent, SessionInitEvent, ThinkingEvent, ToolCallEvent
-from agent_flow.workflows.trtllm_modeling_v2.agents import prompts, roles, slots
+from agent_flow.workflows.trtllm_modeling_v2.agents import prompts, roles
 from agent_flow.workflows.trtllm_modeling_v2.agents.decisions import names
 from agent_flow.workflows.trtllm_modeling_v2.agents.prompts import _common, _render, kernel, survey
-from agent_flow.workflows.trtllm_modeling_v2.agents.prompts.tags import (
-    TAG_PROMPTS,
-    TAG_SUMMARIES,
-    task_tags,
-)
+from agent_flow.workflows.trtllm_modeling_v2.agents.prompts.tags import TAG_PROMPTS, task_tags
 from agent_flow.workflows.trtllm_modeling_v2.agents.prompts.worker import WORKER_BASE
-from agent_flow.workflows.trtllm_modeling_v2.agents.slots import AgentGate, Priority
 from agent_flow.workflows.trtllm_modeling_v2.agents.turns import (
     InProcessTurnExecutor,
-    TurnOutcome,
+    TurnEnded,
     TurnRequest,
     TurnTimeout,
 )
@@ -50,8 +44,8 @@ from agent_flow.workflows.trtllm_modeling_v2.run.execution.handoff import (
     read_decision,
 )
 from agent_flow.workflows.trtllm_modeling_v2.run.execution.tasks import ExecutionStage
-from agent_flow.workflows.trtllm_modeling_v2.run.graph import WORKER_TAGS, Graph, Task
-from agent_flow.workflows.trtllm_modeling_v2.run.startup import agent_probe, bootstrap, primers
+from agent_flow.workflows.trtllm_modeling_v2.run.graph import WORKER_KINDS, Graph, Task
+from agent_flow.workflows.trtllm_modeling_v2.run.startup import agent_probe, bootstrap
 from agent_flow.workflows.trtllm_modeling_v2.run.startup.agent_probe import (
     AGENT_PROBE_RECORD,
     AGENT_PROBE_SKIP_ENV,
@@ -72,7 +66,7 @@ def test_a_claude_role_keeps_its_stop_hook_and_a_codex_role_gets_none(tmp_path):
             "defaults": {"backend": "claude-code", "model": "claude-test-model"},
             "roles": {
                 "assembler": {"reasoning_effort": "high"},
-                "planner": {
+                "surveyor": {
                     "backend": "codex",
                     "model": "codex-test-model",
                     "extra_mcp_servers": kb,
@@ -90,84 +84,33 @@ def test_a_claude_role_keeps_its_stop_hook_and_a_codex_role_gets_none(tmp_path):
     assert backend.hooks and backend.hooks["Stop"]
     assert backend.cwd == workflow.workspace
     assert layer.config.required_tools == ()
+    # Nothing wakes a worker after its turn ends: the tool to be woken by is not offered.
+    assert layer.config.disallowed_tools == ("Monitor",)
 
-    layer = workflow._make_agent("planner", "system")
+    layer = workflow._make_agent("surveyor", "system")
     backend = layer.config.backend
     assert (backend.kind, backend.model) == ("codex", "codex-test-model")
     assert backend.hooks is None
     assert backend.extra_mcp_servers == kb
-    assert layer.config.required_tools == ()
+    assert layer.config.required_tools == () and layer.config.disallowed_tools == ()
     # Without the user's plugins, and, once the agent probe has read them, their skills.
     assert backend.plugins is False and backend.disabled_skills == ()
     workflow._foreign_skills = {"codex": ("imagegen", "cluster-jobs")}
-    backend = workflow._make_agent("planner", "system").config.backend
+    backend = workflow._make_agent("surveyor", "system").config.backend
     assert backend.disabled_skills == ("imagegen", "cluster-jobs")
 
 
 def test_a_role_whose_model_the_spec_does_not_state_is_refused():
     """Nothing is inherited from the launching session or the environment."""
-    spec = {"agents": {"defaults": {"model": "m"}, "roles": {"planner": {"backend": "codex"}}}}
-    with pytest.raises(roles.AgentConfigError, match="states no model for planner:"):
+    spec = {"agents": {"defaults": {"model": "m"}, "roles": {"surveyor": {"backend": "codex"}}}}
+    with pytest.raises(roles.AgentConfigError, match="states no model for surveyor:"):
         roles.resolve_role_agents(spec)
-    with pytest.raises(roles.AgentConfigError, match="surveyor, kernel_writer"):
+    with pytest.raises(roles.AgentConfigError, match="surveyor, kernel_writer, assembler:"):
         roles.resolve_role_agents({})
-    spec["agents"]["roles"]["planner"]["model"] = "codex-m"
+    spec["agents"]["roles"]["surveyor"]["model"] = "codex-m"
     agents = roles.resolve_role_agents(spec)
-    assert (agents["planner"].backend, agents["planner"].model) == ("codex", "codex-m")
+    assert (agents["surveyor"].backend, agents["surveyor"].model) == ("codex", "codex-m")
     assert (agents["assembler"].backend, agents["assembler"].model) == ("claude-code", "m")
-
-
-@pytest.fixture
-def _quick_polls(monkeypatch):
-    """Background and side turns look again every 0.1s here, not every 5s."""
-    monkeypatch.setattr(slots, "_BACKGROUND_POLL_S", 0.1)
-
-
-class _Turns:
-    """Turns that hold their slot until released, started one thread each."""
-
-    def __init__(self, gate: AgentGate) -> None:
-        self.gate = gate
-        self.release = threading.Event()
-        self.admitted: list[str] = []
-        self._lock = threading.Lock()
-
-    def start(self, name: str, priority: Priority) -> None:
-        def hold():
-            with self.gate.slot(priority):
-                with self._lock:
-                    self.admitted.append(name)
-                self.release.wait()
-
-        threading.Thread(target=hold, daemon=True).start()
-
-    def settle(self) -> None:
-        time.sleep(0.2)
-
-
-@pytest.mark.usefixtures("_quick_polls")
-def test_the_planner_owns_the_reserved_slot_and_takes_no_other():
-    turns = _Turns(AgentGate(8))
-    for i in range(8):
-        turns.start(f"task{i}", Priority.REQUIRED)
-    turns.settle()
-    assert len(turns.admitted) == 7  # the eighth task turn waits: the last slot is the planner's
-    turns.start("critic", Priority.SIDE)
-    turns.settle()
-    assert "critic" not in turns.admitted
-    turns.start("planner", Priority.PLANNER)
-    turns.settle()
-    assert "planner" in turns.admitted and len(turns.admitted) == 8
-    turns.release.set()
-    # Arriving first, the planner still leaves every task slot to the tasks.
-    first = _Turns(AgentGate(4))
-    first.start("planner", Priority.PLANNER)
-    first.settle()
-    for i in range(3):
-        first.start(f"task{i}", Priority.REQUIRED)
-    first.settle()
-    assert len(first.admitted) == 4
-    first.release.set()
 
 
 @pytest.fixture
@@ -191,13 +134,12 @@ class SayingLayer:
 
 
 @pytest.mark.usefixtures("_probe_runs")
-def test_a_failed_probe_stops_the_run_before_any_planner_turn(tmp_path, task_file, monkeypatch):
+def test_a_failed_probe_stops_the_run_before_any_agent_turn(tmp_path, task_file, monkeypatch):
     said = "Bash failed: Error: connect EPERM /tmp/claude/srt-mux-9.sock"
     monkeypatch.setattr(agent_probe, "make_probe_layer", lambda a, w: SayingLayer(a, w, said))
     shells: list[str] = []
     workflow = _workflow(
         tmp_path,
-        skip_substrate_gate=False,
         shell_runner=lambda command, env=None, timeout=0: shells.append(command),
     )
     log = get_logger().console
@@ -267,10 +209,7 @@ def _request(role: str = "kernel_writer", what: str = "k12", prompt: str = "go")
     )
 
 
-def test_a_turn_past_its_bound_is_stopped_and_retried_as_an_infrastructure_failure(tmp_path):
-    # Imported here: importing the orchestrator first walks into the stages' import cycle.
-    from agent_flow.workflows.trtllm_modeling_v2.run.orchestrator import _not_the_task
-
+def test_a_turn_past_its_bound_is_stopped_and_counts_as_a_failed_attempt(tmp_path):
     layer = StreamingLayer(hold=threading.Event())
     executor = InProcessTurnExecutor(lambda r: layer, timeout_s=0.2, records=tmp_path)
     started = time.monotonic()
@@ -283,8 +222,47 @@ def test_a_turn_past_its_bound_is_stopped_and_retried_as_an_infrastructure_failu
     assert layer.cancelled
     done = json.loads((tmp_path / "001-kernel_writer.done").read_text())
     assert done["outcome"] == "timed out" and "001-kernel_writer.activity.log" in done["error"]
-    # What an unanswered turn raises: the orchestrator retries it as the run's failure.
-    assert _not_the_task(f"raised {type(raised.value).__name__}: {raised.value}")
+    # What an unanswered turn raises is no receipt: the orchestrator counts the attempt
+    # failed and starts the next one while the task's budget lasts.
+    assert isinstance(raised.value, TurnTimeout)
+
+
+def test_a_turn_the_run_ends_is_stopped_as_at_its_limit_and_says_it_was_ended(tmp_path):
+    """The session that watches a run answers a task while its agent is still in its turn."""
+    layer = StreamingLayer(hold=threading.Event())
+    executor = InProcessTurnExecutor(lambda r: layer, timeout_s=60, records=tmp_path)
+    assert executor.end("k12") is False, "no turn is in flight yet"
+    raised: list[BaseException] = []
+
+    def turn() -> None:
+        try:
+            executor.run(_request())
+        except BaseException as exc:  # what the task's thread would see
+            raised.append(exc)
+
+    thread = threading.Thread(target=turn)
+    thread.start()
+    deadline = time.monotonic() + 5
+    while not executor.end("k12"):
+        assert time.monotonic() < deadline, "the turn never started"
+        time.sleep(0.01)
+    thread.join(10)
+    assert not thread.is_alive()
+    # Cancelled as at its own limit: the CLI is stopped with it, and the record says which.
+    (exc,) = raised
+    assert isinstance(exc, TurnEnded) and "the turn was ended before it answered" in str(exc)
+    assert layer.cancelled
+    assert json.loads((tmp_path / "001-kernel_writer.done").read_text())["outcome"] == "ended"
+    assert executor.end("k12") is False, "the turn is over"
+
+    # Watching for the end changes nothing else: a turn that raises is still seen as
+    # what it raised, with its own words.
+    class Refusing:
+        async def aforward(self, prompt):
+            raise ValueError("the backend said no")
+
+    with pytest.raises(ValueError, match="the backend said no"):
+        InProcessTurnExecutor(lambda r: Refusing(), timeout_s=5).run(_request())
 
 
 def _completed(workspace, *, task="core-tp", attempt=2):
@@ -298,8 +276,8 @@ def _completed(workspace, *, task="core-tp", attempt=2):
 
     class Answer:
         async def aforward(self, prompt):
-            decision.write_text("decision: UNIT_READY\nsummary: measured on the worker tree\n")
-            return "UNIT_READY"
+            decision.write_text("decision: ready\nsummary: measured on the worker tree\n")
+            return "ready"
 
     records = workspace / "turns"
     original = InProcessTurnExecutor(lambda request: Answer(), records=records)
@@ -334,99 +312,13 @@ def test_a_relaunch_adopts_without_another_agent_call_or_decision_copy(tmp_path)
     workflow, answer = _relaunched(tmp_path, attempt=2)
     workspace = workflow.workspace
     result = ExecutionStage(workflow)._dispatch_task("assembler", "core", "core-tp", "assemble")
-    assert result.decision == "UNIT_READY"
+    assert result.decision == "ready"
     assert result.result_file.is_file()
     assert len(list((workspace / "turns").glob("*.request.json"))) == 1
     # Read where the earlier dispatch reserved it: no path is reserved again.
     assert [p.name for p in (workspace / "decisions").glob("*.yaml")] == [answer.name]
-    assert result.data["decision"] == "UNIT_READY"
+    assert result.data["decision"] == "ready"
     assert "decision adopted on resume" in workflow.journal_path.read_text()
-
-
-class _Executor:
-    """Answers each turn, and records its prompt and the layer it was bound to."""
-
-    def __init__(self):
-        self.layers = []
-        self.prompts = []
-
-    def bound(self, layer):
-        self.layers.append(layer)
-        return SimpleNamespace(run=self.run)
-
-    def run(self, request):
-        self.prompts.append(request.prompt)
-        return TurnOutcome(role=request.role, text="ok")
-
-
-class _Layer:
-    def __init__(self, fork_from=None):
-        self.fork_from = fork_from
-        self.closed = False
-
-    def __exit__(self, *args):
-        self.closed = True
-
-
-def _primed(tmp_path, monkeypatch, primer):
-    """A workflow whose kernel_writer has ``primer`` ready, its executor, and the forks it made."""
-    executor, made = _Executor(), []
-    workflow = _workflow(tmp_path, primers=True)
-    workflow.task_data = {"agents": {"defaults": {"model": "claude-test-model"}}}
-    workflow._turns = executor
-    workflow._primers["kernel_writer"] = primer
-    workflow._primer_ready["kernel_writer"] = threading.Event()
-    workflow._primer_ready["kernel_writer"].set()
-
-    def make_agent(*args, fork_from=None, **kwargs):
-        made.append(fork_from)
-        return _Layer(fork_from)
-
-    monkeypatch.setattr(workflow, "_make_agent", make_agent)
-    return workflow, executor, made
-
-
-def test_a_codex_role_keeps_its_primer_thread_for_later_forks(tmp_path, monkeypatch):
-    executor = _Executor()
-    workflow = _workflow(tmp_path, primers=True)
-    workflow._turns = executor
-    workflow.task_data = {"agents": {"defaults": {"backend": "codex", "model": "codex-test-model"}}}
-
-    def make_agent(name, system_prompt, *, requires_decision=True, session_mode="stateless",
-                   fork_from=None):  # fmt: skip
-        layer = _Layer(fork_from)
-        layer.session_id = "thread-1"
-        return layer
-
-    monkeypatch.setattr(workflow, "_make_agent", make_agent)
-    ready = threading.Event()
-    workflow._primer_ready["kernel_writer"] = ready
-    workflow._build_primer("kernel_writer", "v", ready)
-    assert ready.is_set()
-    assert "your session is copied to start every later kernel_writer turn" in executor.prompts[-1]
-    assert workflow._primers["kernel_writer"].session_id == "thread-1"
-    start = workflow._turn_start("kernel_writer", "implement")
-    assert start.forked and start.layer.fork_from == "thread-1"
-    assert primers.load(workflow.workspace)["kernel_writer"].session_id == "thread-1"
-
-
-def test_a_failed_fork_keeps_the_summary_fallback_across_restart(tmp_path, monkeypatch):
-    summary = tmp_path / "briefing.md"
-    summary.write_text("saved source reading")
-    primer = primers.Primer("kernel_writer", "old-thread", "a" * 40, "v", str(summary))
-    workflow, executor, _ = _primed(tmp_path, monkeypatch, primer)
-    original = executor.run
-
-    def run(request):
-        if request.prompt.startswith("**You are now working your own turn"):
-            raise RuntimeError("thread/fork failed before the turn started")
-        return original(request)
-
-    monkeypatch.setattr(executor, "run", run)
-    assert workflow._run_turn("kernel_writer", "verify", "do the entry") == "ok"
-    assert str(summary) in executor.prompts[-1]
-    kept = primers.load(workflow.workspace)["kernel_writer"]
-    assert kept.session_id == "" and kept.summary == str(summary)
 
 
 def _write(workspace: Path, agent: str, iteration: int, payload: dict) -> Path:
@@ -437,7 +329,7 @@ def _write(workspace: Path, agent: str, iteration: int, payload: dict) -> Path:
 
 
 def test_a_decision_older_than_the_marker_is_refused(tmp_path):
-    stale = _write(tmp_path, "assembler", 1, {"summary": "s", "decision": "BLOCKED"})
+    stale = _write(tmp_path, "assembler", 1, {"summary": "s", "decision": "blocked"})
     os.utime(stale, (1_000_000, 1_000_000))  # written long before this dispatch
     stale.with_name(f".{stale.stem}.dispatched").write_text("", encoding="utf-8")
     assert read_decision(stale, "assembler") is None
@@ -445,15 +337,15 @@ def test_a_decision_older_than_the_marker_is_refused(tmp_path):
 
 def test_a_previous_turns_decision_is_never_read_as_this_ones(tmp_path):
     """A new dispatch is reserved a new path: the earlier verdict is neither read nor overwritten."""
-    old = _write(tmp_path, "assembler", 1, {"summary": "s", "decision": "BLOCKED"})
+    old = _write(tmp_path, "assembler", 1, {"summary": "s", "decision": "blocked"})
     before = old.read_text()
     target = mark_decision_dispatch(tmp_path, "assembler", 1)
 
     assert target != old
     assert current_decision(tmp_path, "assembler", 1) == target
     assert read_decision(target, "assembler") is None
-    target.write_text("summary: s\ndecision: UNIT_READY\n", encoding="utf-8")
-    assert read_decision(target, "assembler")["decision"] == "UNIT_READY"
+    target.write_text("summary: s\ndecision: ready\n", encoding="utf-8")
+    assert read_decision(target, "assembler")["decision"] == "ready"
     assert old.read_text() == before
 
 
@@ -474,38 +366,46 @@ def test_markdown_and_user_notes_are_neither_escaped_nor_rendered_again() -> Non
 
 def test_decision_file_extra_keys_scope_and_role_endings() -> None:
     plain = _common.decision_file_block("surveyor")
-    extra = _common.decision_file_block("assembler", ("blocked_reason", "uncertified"))
-    assert "<unit>-surveyor-<turn>.yaml" in plain
-    assert "This role also carries" not in plain
-    assert "  blocked_reason: ...\n  uncertified: ...\n```" in extra
+    extra = _common.decision_file_block("assembler", ("check", "next_question"))
+    assert "<name>-surveyor-<turn>.yaml" in plain and "<unit>" not in plain
+    assert "It also carries" not in plain
+    # Each key is shown in the form its value takes: a sentence where a number belongs
+    # once cost a finished kernel row its attempt.
+    assert 'check: {id: "<the card\'s check id>"' in extra
+    assert 'next_question: "<the word that names what answers it>: <your one question' in extra
+    assert "The file must parse as YAML" in extra
+    # `decision` is the first key of the example, and the two values are the only ones.
+    assert plain.index("decision: ready") < plain.index("summary: |")
     assert _common.scope_block("full") == ""
     assert "ignore the vision tensors" in _common.scope_block("text_only")
+    assert set(asdict(prompts.DEFAULT_PROMPTS)) == {"surveyor", "kernel_writer", "assembler"}
     for role, prompt in asdict(prompts.DEFAULT_PROMPTS).items():
+        assert names(role) == ("ready", "blocked")
         for decision in names(role):
-            assert decision in prompt
+            assert f"- `{decision}`:" in prompt
+        for key in ("tried", "command", "result", "ruled_out", "next_question"):
+            assert key in prompt
         assert "SPDX-License-Identifier" not in prompt
-    assert task_tags("feature", ("investigate", "assemble")) == (
-        "assemble",
-        "feature",
-        "investigate",
-    )
-    assert tuple(TAG_PROMPTS) == WORKER_TAGS == tuple(TAG_SUMMARIES)
-    for tag, text in TAG_PROMPTS.items():
-        assert text.startswith(f"## Tag `{tag}`")
+    # A row of the target is briefed by its own short section, not by the whole target's;
+    # a new attempt adds its section.
+    assert task_tags("feature", ("investigate",)) == ("feature", "investigate")
+    assert [task_tags(kind) for kind in ("weights", "routing", "state", "assemble")] == [
+        ("weights",),
+        ("routing",),
+        ("state",),
+        ("assemble",),
+    ]
+    assert set(TAG_PROMPTS) - {"investigate"} <= set(WORKER_KINDS)
 
 
 def test_workers_wait_for_results_and_write_decisions_before_ending() -> None:
-    for role in ("surveyor", "kernel_writer", "assembler", "tuner"):
+    for role in ("surveyor", "kernel_writer", "assembler"):
         text = getattr(prompts.DEFAULT_PROMPTS, role)
         assert WORKER_BASE in text
-        assert "nothing wakes you after it" in text
-        assert "While a job your answer needs is queued or running" in text
-        assert "keep\n  polling or waiting in bounded calls" in text
-        assert "write your decision file before ending the turn" in text
-    layout = " ".join(_common.MODELING_V2_LAYOUT.split())
-    assert "static metadata and routing" in layout
-    assert "tests that require a GPU" in layout
-    assert "do not treat that glob as a CPU-only test suite" in layout
+    # The roles that commit read what holds for the code they test; the surveyor does not.
+    assert _common.MODELING_V2_NATIVE in prompts.DEFAULT_PROMPTS.kernel_writer
+    assert _common.MODELING_V2_NATIVE in prompts.DEFAULT_PROMPTS.assembler
+    assert _common.MODELING_V2_NATIVE not in prompts.DEFAULT_PROMPTS.surveyor
 
 
 @pytest.fixture
@@ -518,87 +418,58 @@ def kernel_context() -> kernel.KernelContext:
         target_rel="modeling_v2/models/family/target",
         vocabulary_path="/run/vocabulary.yaml",
         note="Finish the previous attempt.",
-        goal="certify norm",
+        goal="## Your task: `k4-rmsnorm` (kernel, attempt 1 of 3)\n\n**What it is for.** certify norm",
         task_id="k4-rmsnorm",
         task_kind="kernel",
-        tags=("tune",),
-        tier=4,
         landing="ops/norm/rmsnorm__r4",
         paths=("entry.py", "test.py"),
         shared=("catalog/norm/rmsnorm.py", "catalog/test_rmsnorm.py"),
-        environment_kind="local",
-        devices=4,
     )
 
 
-@pytest.mark.parametrize("environment,devices", [("local", 1), ("local", 4), ("session_spool", 4)])
-def test_kernel_device_assignment_respects_scheduler_and_device_zero(
-    kernel_context: kernel.KernelContext, environment: str, devices: int
+def test_no_kernel_writer_is_told_a_device_the_watcher_assigns_it(
+    kernel_context: kernel.KernelContext,
 ) -> None:
-    ctx = replace(kernel_context, environment_kind=environment, devices=devices)
+    """On one host too: concurrent writers get distinct devices from the spool, not an index."""
+    ctx = kernel_context
     text = kernel.kernel_prompt(ctx)
-    assert ("CUDA_VISIBLE_DEVICES=0" in text) is (environment == "local" and devices > 1)
+    assert "CUDA_VISIBLE_DEVICES=" not in text
     assert text.index(ctx.note) < text.index("## Your task")
-    assert text.index("## Tag `kernel`") < text.index("## Tag `tune`")
+    assert text.index("## Your task") < text.index("## Tag `kernel`")
+    assert "tags:" not in text
     assert "from .ops.norm.rmsnorm__r4 import rmsnorm" in text
     assert text.index("`entry.py`") < text.index("`test.py`")
     assert "The surface to certify: bf16" in text
 
 
-@pytest.mark.parametrize(
-    ("tier", "mode", "expected", "absent"),
-    [
-        (None, "verify", "no rung is recorded", "no implementation yet"),
-        (1, "onboard", "Sourcing: **tier 1", "no implementation yet"),
-        ("3", "verify", "FlashInfer callable directly", "no implementation yet"),
-        (4, "onboard", "no implementation yet", "FlashInfer callable directly"),
-        (5, "verify", "Sourcing: **tier 5", "no implementation yet"),
-    ],
-)
-def test_kernel_sourcing_and_landing_branches(
-    kernel_context: kernel.KernelContext, tier: object, mode: str, expected: str, absent: str
+@pytest.mark.parametrize("mode", ["onboard", "verify"])
+def test_a_kernel_dispatch_says_where_the_entry_lands(
+    kernel_context: kernel.KernelContext, mode: str
 ) -> None:
-    ctx = replace(kernel_context, tier=tier, item=replace(kernel_context.item, mode=mode))
+    ctx = replace(kernel_context, item=replace(kernel_context.item, mode=mode))
     text = kernel.kernel_prompt(ctx)
-    assert expected in text
-    assert absent not in text
     assert ("Write the entry there" in text) is (mode == "onboard")
-    assert ("Start the variant as a copy" in text) is (mode != "onboard")
+    assert ("It starts as a copy of the entry's module" in text) is (mode != "onboard")
 
 
-def test_survey_capture_variants_and_tune_identity_files(tmp_path: Path, monkeypatch) -> None:
-    capture = check_config.CaptureList((1, 8), False, source="unit.yaml")
+def test_survey_capture_variants(monkeypatch) -> None:
+    capture = check_config.CaptureList((1, 8), False, source="tp1.yaml")
     monkeypatch.setattr(
         check_config,
         "launch_captures",
         lambda _: [
-            check_config.LaunchCapture("core", "core", "unit.yaml", capture),
+            check_config.LaunchCapture("core", "core", "tp1.yaml", capture),
             check_config.LaunchCapture("same", "core", "same.yaml", capture),
             check_config.LaunchCapture("disabled", "core", "disabled.yaml", None),
         ],
     )
-    identity = tmp_path / "identity.yaml"
-    identity.write_text("cuda_graph_config: null\n", encoding="utf-8")
-    missing = tmp_path / "missing.yaml"
-    text = survey.capture_lists_block(
-        {
-            "perf": {
-                "enabled": True,
-                "configs": [
-                    {"name": "identity", "identity_configs": [str(identity), str(missing)]},
-                    {"name": "derived", "workload": {"concurrency": [1, 8]}},
-                    {"name": "overlay", "llm_api_options": {"cuda_graph_config": None}},
-                ],
-            }
-        }
-    )
+    # Performance work is not the flow's: the survey plans no serving config.
+    text = survey.capture_lists_block({})
     assert "`core`: 2 batches [1, 8], unpadded" in text
-    assert "variants same: their unit's list" in text
-    assert "variant `disabled` (unit `core`): no CUDA graphs at any gate" in text
-    assert f"tune `identity`: no CUDA graphs, from {identity}" in text
-    assert f"{missing} (not readable here)" in text
-    assert "`capture_batch_sizes` up to concurrency 8" in text
-    assert "tune `overlay`: no CUDA graphs, from its `llm_api_options`" in text
+    assert "same: the same list as their deployment" in text
+    assert "`disabled` (a server of deployment `core`): no CUDA graphs in any check" in text
+    for old in ("tune", "variant", "unit", "gate"):
+        assert old not in text
 
 
 def test_all_template_resources_are_declared_as_package_data() -> None:
@@ -619,19 +490,3 @@ def test_all_template_resources_are_declared_as_package_data() -> None:
     for name in loaded:
         assert (resources / name).is_file()
         _render._ENVIRONMENT.get_template(name)
-
-
-@pytest.mark.parametrize("invalid", ["yaml", "capture"])
-def test_invalid_tune_configuration_is_reported_without_losing_other_configs(tmp_path, invalid):
-    if invalid == "yaml":
-        path = tmp_path / "invalid.yaml"
-        path.write_text("cuda_graph_config: [\n")
-        bad = {"name": "bad", "identity_configs": [str(path)]}
-    else:
-        bad = {"name": "bad", "llm_api_options": {"cuda_graph_config": "invalid"}}
-    text = survey.capture_lists_block(
-        {"perf": {"enabled": True, "configs": [bad, {"name": "good"}]}}
-    )
-    assert "tune `bad`: cannot be resolved" in text
-    assert "repair this configuration before measuring" in text
-    assert "tune `good`:" in text

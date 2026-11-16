@@ -13,10 +13,9 @@ from __future__ import annotations
 
 import ast
 import re
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Mapping
 
 import yaml
 
@@ -27,23 +26,12 @@ from ..infra.git import (
     audit_commits,
     resolve_base,
 )
-from ..operators.coverage import (
-    CATALOG_DIR,
-    CATALOG_TESTS_DIR,
-    MODEL_OPS_DIRNAME,
-    MODELING_V2_PACKAGE,
-    model_ops_tests_dir,
-)
+from ..operators import v1_rule
+from ..operators.coverage import CATALOG_DIR, CATALOG_TESTS_DIR, MODELING_V2_PACKAGE
 
 ACCURACY_REFERENCES_DIR = "tests/integration/defs/accuracy/references"
 ACCURACY_TESTS_DIR = "tests/integration/defs/accuracy"
 TEST_DB_DIR = "tests/integration/test_lists/test-db"
-
-_MODEL_OPS_IMPORT = re.compile(
-    r"tensorrt_llm\._torch\._experimental\.modeling_v2\.models\.[a-z0-9_]+\."
-    r"([a-z0-9_]+)\.ops\.([a-z_]+)\.([a-z0-9_]+)"
-)
-_RELATIVE_OPS_IMPORT = re.compile(r"^ops\.([a-z_]+)\.([a-z0-9_]+)")
 
 
 @dataclass(frozen=True)
@@ -76,34 +64,6 @@ class DeliveryReport:
 
     def render(self) -> str:
         return "\n".join(check.render() for check in self.checks)
-
-
-def imported_model_ops(modeling_py: Path) -> list[tuple[str, str, str]]:
-    """Return ``(target_dir, category, name)`` for every ``ops/`` entry a target imports.
-
-    A target reaches its own ``ops/`` relatively (``from .ops.moe.x import X``)
-    or by absolute path; either way ``target_dir`` is the directory the entry
-    lives in, so an import of *another* target's op is visible as one.
-    """
-    tree = ast.parse(modeling_py.read_text(encoding="utf-8"))
-    own = modeling_py.parent.name
-    found: set[tuple[str, str, str]] = set()
-    for node in ast.walk(tree):
-        modules: list[str] = []
-        if isinstance(node, ast.ImportFrom) and node.module:
-            if node.level == 1:
-                match = _RELATIVE_OPS_IMPORT.match(node.module)
-                if match:
-                    found.add((own, match.group(1), match.group(2)))
-                continue
-            modules = [node.module]
-        elif isinstance(node, ast.Import):
-            modules = [alias.name for alias in node.names]
-        for module in modules:
-            match = _MODEL_OPS_IMPORT.search(module)
-            if match:
-                found.add((match.group(1), match.group(2), match.group(3)))
-    return sorted(found)
 
 
 @dataclass(frozen=True)
@@ -223,52 +183,6 @@ def _entry_problems(wrapper: Path) -> tuple[list[str], EntryContract | None]:
     return list(contract.problems), contract
 
 
-def check_catalog_entries(repo_root: Path, entries: Iterable[tuple[str, str]]) -> list[Check]:
-    """Every imported shared entry exists and states a certified contract."""
-    checks: list[Check] = []
-    for category, name in entries:
-        rel = f"{category}/{name}.py"
-        problems, contract = _entry_problems(repo_root / CATALOG_DIR / rel)
-        checks.append(
-            Check(
-                name=f"catalog:{rel}",
-                passed=not problems,
-                detail="; ".join(problems) or _contract_detail(contract),
-            )
-        )
-    return checks
-
-
-def check_model_ops(
-    repo_root: Path, target_rel: str, ops: Iterable[tuple[str, str, str]]
-) -> list[Check]:
-    """Every ``ops/`` entry the target imports is its own, and states a certified contract."""
-    own = Path(target_rel.rstrip("/")).name
-    checks: list[Check] = []
-    for target_dir, category, name in ops:
-        rel = f"{MODEL_OPS_DIRNAME}/{category}/{name}.py"
-        if target_dir != own:
-            checks.append(
-                Check(
-                    name=f"ops:{rel}",
-                    passed=False,
-                    detail=f"imported from another target's ops/ ({target_dir}); use family-shared "
-                    f"code or the catalog, or copy it into this target's "
-                    f"{MODEL_OPS_DIRNAME}/{category}/",
-                )
-            )
-            continue
-        problems, contract = _entry_problems(repo_root / target_rel / rel)
-        checks.append(
-            Check(
-                name=f"ops:{rel}",
-                passed=not problems,
-                detail="; ".join(problems) or _contract_detail(contract),
-            )
-        )
-    return checks
-
-
 def _test_check(repo_root: Path, tests_dir: str, label: str, category: str, name: str) -> Check:
     candidates = [
         f"{tests_dir}/{category}/test_modeling_v2_{name}{suffix}.py"
@@ -313,106 +227,46 @@ def _test_check(repo_root: Path, tests_dir: str, label: str, category: str, name
     )
 
 
-def check_catalog_tests(repo_root: Path, entries: Iterable[tuple[str, str]]) -> list[Check]:
-    """Every shared entry has its GPU test, under the name CI matches, driving its cells.
-
-    A multi-rank entry's test is an op matrix over world sizes and is named
-    ``test_modeling_v2_<name>_op_matrix.py``, as the in-tree ``comm`` tests
-    are; either name satisfies the check.
-    """
-    return [
-        _test_check(repo_root, CATALOG_TESTS_DIR, f"test:{category}/{name}", category, name)
-        for category, name in entries
-    ]
-
-
-def check_model_op_tests(
-    repo_root: Path, target_rel: str, ops: Iterable[tuple[str, str, str]]
-) -> list[Check]:
-    """Every own ``ops/`` entry has its GPU test under the target's mirror of the tests tree."""
-    own = Path(target_rel.rstrip("/")).name
-    tests_dir = model_ops_tests_dir(target_rel)
-    return [
-        _test_check(repo_root, tests_dir, f"test:ops/{category}/{name}", category, name)
-        for target_dir, category, name in ops
-        if target_dir == own
-    ]
-
-
 def _dependency_checks(repo_root: Path, target_rel: str) -> list[Check]:
-    """Audit static imports within the target, its family and catalog reexports.
+    """The rules of an entry, for every entry the target reaches by its static imports.
 
-    This is an import dependency check, not a runtime call graph: dynamic imports
-    and runtime mutations of module attributes cannot be proven from this scan.
-    Engine/runtime dependencies outside these scopes are deliberately not traversed.
+    Followed through the target, its family and the catalog's reexports by reading files:
+    a dynamic import is not seen, and the engine outside these scopes is not traversed. A
+    module that is missing or does not parse is not this rule's to say: the session
+    imports the target, and says so.
     """
     target = repo_root / target_rel
     family = target.parent
     catalog = repo_root / CATALOG_DIR
-    siblings = (
-        {
-            path
-            for path in family.iterdir()
-            if path.is_dir() and path != target and (path / "modeling.py").is_file()
-        }
-        if family.is_dir()
-        else set()
-    )
-    pending = [target / "modeling.py"]
-    pending.extend(
-        target / name for name in ("__init__.py", "weights.py") if (target / name).is_file()
-    )
+    pending = [target / name for name in ("modeling.py", "__init__.py", "weights.py")]
     visited: set[Path] = set()
     entries: set[Path] = set()
-    checks: list[Check] = []
 
     def local(path: Path) -> bool:
         return path.is_relative_to(family) or path.is_relative_to(catalog)
 
-    def module_file(path: Path) -> Path | None:
-        if path.with_suffix(".py").is_file():
-            return path.with_suffix(".py")
-        if (path / "__init__.py").is_file():
-            return path / "__init__.py"
-        return None
-
-    def follow(path: Path, source: Path, line: int, *, required: bool) -> None:
+    def follow(path: Path) -> None:
         if not local(path):
             return
         if (
             path.is_relative_to(catalog)
-            and path.relative_to(catalog).parts
+            and path.relative_to(catalog).parts[:1]
             and (path.relative_to(catalog).parts[0].startswith("_"))
         ):
             return
-        if any(path == sibling or path.is_relative_to(sibling) for sibling in siblings):
-            checks.append(
-                Check(
-                    "target:isolated",
-                    False,
-                    f"{source.relative_to(repo_root)}:{line}: sibling import {path}",
-                )
-            )
-            return
-        resolved = module_file(path)
-        if resolved is None:
-            if required and not path.is_dir():
-                checks.append(
-                    Check(
-                        "dependency:module",
-                        False,
-                        f"{source.relative_to(repo_root)}:{line}: missing module {path}",
-                    )
-                )
+        if path.with_suffix(".py").is_file():
+            resolved = path.with_suffix(".py")
+        elif (path / "__init__.py").is_file():
+            resolved = path / "__init__.py"
+        else:
             return
         pending.append(resolved)
         # Python executes package initializers before importing their children.
         for parent in resolved.parents:
             if not local(parent):
                 break
-            init = parent / "__init__.py"
-            if init.is_file():
-                pending.append(init)
+            if (parent / "__init__.py").is_file():
+                pending.append(parent / "__init__.py")
             if parent in (family, catalog):
                 break
 
@@ -423,195 +277,238 @@ def _dependency_checks(repo_root: Path, target_rel: str) -> list[Check]:
         visited.add(source)
         try:
             tree = ast.parse(source.read_text(encoding="utf-8"))
-        except (OSError, SyntaxError, UnicodeError) as exc:
-            checks.append(
-                Check("dependency:python", False, f"{source.relative_to(repo_root)}: {exc}")
-            )
+        except (OSError, SyntaxError, UnicodeError):
             continue
-        # Infrastructure modules and package initializers are not entries.
-        home = catalog if source.is_relative_to(catalog) else family
-        parts = source.relative_to(home).parts
-        op_parts = (
-            parts
-            if home == catalog
-            else (
-                parts[1:]
-                if parts and parts[0] == "ops"
-                else parts[2:]
-                if len(parts) > 1 and parts[1] == "ops"
-                else ()
-            )
-        )
-        is_entry = len(op_parts) == 2 and not source.name.startswith("_")
-        if is_entry:
+        if _is_entry(source, family, catalog):
             entries.add(source)
-            if home == catalog:
+            if source.is_relative_to(catalog):
                 # Entry internals are implementation details, not model dependencies.
                 continue
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
-                    follow(
-                        repo_root.joinpath(*alias.name.split(".")),
-                        source,
-                        node.lineno,
-                        required=True,
-                    )
+                    follow(repo_root.joinpath(*alias.name.split(".")))
             elif isinstance(node, ast.ImportFrom):
                 base = source.parent if node.level else repo_root
                 for _ in range(max(node.level - 1, 0)):
                     base = base.parent
                 if node.module:
                     base = base.joinpath(*node.module.split("."))
-                follow(base, source, node.lineno, required=True)
+                follow(base)
                 for alias in node.names:
                     if alias.name != "*":
-                        # An imported name may be a symbol or a reexport, not a submodule.
-                        child = base / alias.name
-                        required = False
-                        if local(base) and base.is_dir() and module_file(child) is None:
-                            initializer = base / "__init__.py"
-                            exported: set[str] = set()
-                            if initializer.is_file():
-                                try:
-                                    init_tree = ast.parse(initializer.read_text(encoding="utf-8"))
-                                except (OSError, SyntaxError, UnicodeError):
-                                    pass  # The queued initializer reports the parsing failure.
-                                else:
-                                    for binding in ast.walk(init_tree):
-                                        if isinstance(binding, (ast.FunctionDef, ast.ClassDef)):
-                                            exported.add(binding.name)
-                                        elif isinstance(binding, ast.Name) and isinstance(
-                                            binding.ctx, ast.Store
-                                        ):
-                                            exported.add(binding.id)
-                                        elif isinstance(binding, (ast.Import, ast.ImportFrom)):
-                                            exported.update(
-                                                a.asname or a.name.split(".")[0]
-                                                for a in binding.names
-                                            )
-                            required = alias.name not in exported and "*" not in exported
-                        follow(child, source, node.lineno, required=required)
-    for entry in sorted(entries):
-        problems, contract = _entry_problems(entry)
-        rel = entry.relative_to(repo_root)
-        checks.append(
-            Check(f"entry:{rel}", not problems, "; ".join(problems) or _contract_detail(contract))
+                        follow(base / alias.name)
+    return [
+        check
+        for entry in sorted(entries)
+        for check in _entry_checks(repo_root, family, catalog, entry)
+    ]
+
+
+def _entry_parts(source: Path, family: Path, catalog: Path) -> tuple[str, ...]:
+    """``source`` below the directory its entries lie in: ``(<category>, <name>.py)`` for an entry."""
+    home = catalog if source.is_relative_to(catalog) else family
+    parts = source.relative_to(home).parts
+    if home != catalog:
+        parts = (
+            parts[1:]
+            if parts and parts[0] == "ops"
+            else parts[2:]
+            if len(parts) > 1 and parts[1] == "ops"
+            else ()
         )
-        if entry.is_relative_to(catalog):
-            category = entry.parent.name
-            label = f"test:{category}/{entry.stem}"
-            tests_dir = CATALOG_TESTS_DIR
-        else:
-            owner = entry.parent.parent.parent
-            category = entry.parent.name
-            label = f"test:{entry.relative_to(family).with_suffix('')}"
-            tests_dir = str(
-                Path(CATALOG_TESTS_DIR) / owner.relative_to(repo_root / MODELING_V2_PACKAGE)
-            )
-        checks.append(_test_check(repo_root, tests_dir, label, category, entry.stem))
-    return checks
+    return tuple(parts)
 
 
-def check_target(repo_root: Path, target_rel: str) -> list[Check]:
-    """The workflow's model and weight-loading products exist and are valid Python.
+def _is_entry(source: Path, family: Path, catalog: Path) -> bool:
+    """Whether ``source`` lies where an entry does and is named as one.
 
-    Model lifecycle methods may be inherited or delegated; prefill/decode classes and
-    weight tables are implementation choices. Boot and accuracy gates prove execution.
+    In the catalog (``<category>/<name>.py``), in the family's shared ``ops/`` or in a
+    target's own. Infrastructure modules and package initializers (a name that starts
+    with ``_``) are not entries.
     """
-    target = repo_root / target_rel
-    checks = []
-    for product in ("modeling.py", "weights.py"):
-        path = target / product
-        if product == "weights.py" and not path.exists():
-            continue
-        problem = ""
-        if path.is_file():
-            try:
-                ast.parse(path.read_text(encoding="utf-8"))
-            except (SyntaxError, UnicodeError) as exc:
-                problem = f"invalid Python: {exc}"
-        else:
-            problem = f"missing: {path}"
-        checks.append(
-            Check(name=f"target:{product}", passed=not problem, detail=problem or str(path))
-        )
-    checks.extend(_check_sibling_imports(repo_root, target))
+    return len(_entry_parts(source, family, catalog)) == 2 and not source.name.startswith("_")
+
+
+def _entry_tests_dir(repo_root: Path, catalog: Path, entry: Path) -> str:
+    """The directory CI matches the tests of ``entry``'s home in, above its category."""
+    if entry.is_relative_to(catalog):
+        return CATALOG_TESTS_DIR
+    owner = entry.parent.parent.parent
+    return str(Path(CATALOG_TESTS_DIR) / owner.relative_to(repo_root / MODELING_V2_PACKAGE))
+
+
+def entry_test_places(repo_root: Path | str, target_rel: str, path: str) -> tuple[str, ...]:
+    """Where the delivery looks for the test of what ``path`` holds; none when it holds no entry.
+
+    ``path`` is relative to the repository and need not exist: only where it lies and
+    how it is named are read, as :func:`check_changed_entries` reads them. For an
+    entry's file: the name CI matches, then a multi-rank entry's (its op matrix, and the
+    rank body beside it). For a category's directory: the directory its tests mirror it
+    in. Known when a task is made, so the task's write scope can hold them from the
+    start: a rule of the delivery is never one its own write scope keeps a task from.
+    """
+    root = Path(repo_root)
+    family, catalog = (root / target_rel).parent, root / CATALOG_DIR
+    source = root / str(path).rstrip("/")
+    if not (source.is_relative_to(catalog) or source.is_relative_to(family)):
+        return ()
+    parts = _entry_parts(source, family, catalog)
+    try:
+        if len(parts) == 1 and source.suffix != ".py" and not parts[0].startswith("_"):
+            return (f"{_entry_tests_dir(root, catalog, source / 'x.py')}/{parts[0]}/",)
+        if source.suffix != ".py" or not _is_entry(source, family, catalog):
+            return ()
+        folder = f"{_entry_tests_dir(root, catalog, source)}/{source.parent.name}"
+    except ValueError:  # outside the package: CI matches no test for it
+        return ()
+    name = source.stem
+    return (
+        f"{folder}/test_modeling_v2_{name}.py",
+        f"{folder}/test_modeling_v2_{name}_op_matrix.py",
+        f"{folder}/_{name}_op_matrix.py",
+    )
+
+
+def _entry_checks(repo_root: Path, family: Path, catalog: Path, entry: Path) -> list[Check]:
+    """The rules one entry is held to: it states its contract, and its test is where CI matches it."""
+    problems, contract = _entry_problems(entry)
+    rel = entry.relative_to(repo_root)
+    checks = [
+        Check(f"entry:{rel}", not problems, "; ".join(problems) or _contract_detail(contract))
+    ]
+    if entry.is_relative_to(catalog):
+        category = entry.parent.name
+        label = f"test:{category}/{entry.stem}"
+    else:
+        category = entry.parent.name
+        label = f"test:{entry.relative_to(family).with_suffix('')}"
+    tests_dir = _entry_tests_dir(repo_root, catalog, entry)
+    checks.append(_test_check(repo_root, tests_dir, label, category, entry.stem))
     return checks
 
 
-def _check_sibling_imports(repo_root: Path, target: Path) -> list[Check]:
-    """Targets may share family code, but cannot depend on another target's implementation."""
-    if not target.is_dir():
-        return []
-    siblings = [p for p in target.parent.iterdir() if p != target and (p / "modeling.py").is_file()]
-    if not siblings:
-        return []
-    violations = []
-    for source in target.rglob("*.py"):
-        try:
-            tree = ast.parse(source.read_text(encoding="utf-8"))
-        except (SyntaxError, UnicodeError):
+def check_changed_entries(
+    repo_root: Path | str, target_rel: str, changed: Iterable[str]
+) -> list[Check]:
+    """The delivery's rules for one entry, on the entries among the files a task changed.
+
+    ``changed`` are repository-relative paths. A file that lies where an entry does (in
+    the catalog, in the family's ``ops/`` or a target's own) is held to what the
+    whole-target check holds every entry the finished target imports to: it is an
+    ``OpWrapper`` that states its contract, and its test is where CI matches it and
+    drives its cells. Neither rule needs the finished target, so the task that wrote the
+    file hears of it when it hands in, not when the run ends. A file that was removed,
+    or lies elsewhere, is no entry.
+    """
+    root = Path(repo_root)
+    family = (root / target_rel).parent
+    catalog = root / CATALOG_DIR
+    checks: list[Check] = []
+    for rel in sorted({str(path) for path in changed}):
+        path = root / rel
+        if path.suffix != ".py" or not path.is_file():
             continue
-        for node in ast.walk(tree):
-            imports = []
-            if isinstance(node, ast.Import):
-                imports = [repo_root.joinpath(*alias.name.split(".")) for alias in node.names]
-            elif isinstance(node, ast.ImportFrom):
-                base = source.parent if node.level else repo_root
-                for _ in range(max(node.level - 1, 0)):
-                    base = base.parent
-                base = base.joinpath(*(node.module or "").split("."))
-                imports = [base, *(base / alias.name for alias in node.names)]
-            for imported in imports:
-                if any(imported == sibling or sibling in imported.parents for sibling in siblings):
-                    violations.append(f"{source.relative_to(repo_root)}:{node.lineno}: {imported}")
-    return [
-        Check(
-            "target:isolated",
-            not violations,
-            "; ".join(violations)
-            if violations
-            else "no sibling target imports; family code is allowed",
-        )
-    ]
+        shared = path.is_relative_to(catalog)
+        if not shared and not path.is_relative_to(family):
+            continue
+        if shared and path.relative_to(catalog).parts[0].startswith("_"):
+            continue
+        if _is_entry(path, family, catalog):
+            checks.extend(_entry_checks(root, family, catalog, path))
+    return checks
 
 
-def check_routing(repo_root: Path, family: str, target_rel: str) -> list[Check]:
-    """The target is reachable: routing names it."""
-    routing = repo_root / MODELING_V2_PACKAGE / "models" / family / "routing.py"
-    if not routing.is_file():
-        return [Check(name="routing:module", passed=False, detail=f"missing: {routing}")]
+def routing_places(repo_root: Path | str, target_rel: str) -> tuple[str, ...]:
+    """Where a target's routing is written, and what registers it.
 
-    text = routing.read_text(encoding="utf-8")
-    # Routing imports the target where it returns it, relative to the family
-    # package (``from .<target>.modeling import ...``); an
-    # absolute ``models.<family>.<target>`` form names it too.
-    dotted = target_rel.split(f"{MODELING_V2_PACKAGE}/", 1)[-1].replace("/", ".").rstrip(".")
-    relative = f"from .{Path(target_rel.rstrip('/')).name}."
-    referenced = dotted in text or relative in text
-    return [
-        Check(
-            name="routing:target",
-            passed=referenced,
-            detail=(
-                f"{routing.name} references {dotted}"
-                if referenced
-                else f"{routing.name} does not reference {dotted}; the target would "
-                f"never be selected, and under `auto` the built-in implementation "
-                f"would answer instead"
-            ),
-        ),
-    ]
+    The family's ``routing.py``, beside the family's targets. And, for a family the
+    models' package does not import yet, that package's initializer: importing the package
+    imports every family's routing, and a new family adds its one line there. Read from
+    where the target lies and from the tree at ``repo_root``; a tree that cannot be read
+    names the family's file only. Known when a routing row's task is made, so its write
+    scope holds them from the start.
+    """
+    family = Path(target_rel.rstrip("/")).parent
+    if family.parent.name != "models":
+        return ()
+    places = [f"{family.as_posix()}/routing.py"]
+    registry = family.parent / "__init__.py"
+    try:
+        text = (Path(repo_root) / registry).read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return tuple(places)
+    if not re.search(rf"^\s*from \.{re.escape(family.name)} import routing\b", text, re.M):
+        places.append(registry.as_posix())
+    return tuple(places)
 
 
-def check_accuracy_reference(repo_root: Path, reference_yaml: str, model_key: str) -> list[Check]:
-    """The anchor this run gated against is written down, keyed by the model."""
+#: The spec's key for the guide's import rule, and the value that waives it: a requirement
+#: the outer session may change, as every requirement (``resolve change-requirement``).
+V1_IMPORTS_KEY, V1_IMPORTS_ALLOWED, V1_IMPORTS_REFUSED = "v1_imports", "allowed", "refused"
+
+
+def v1_imports_refused(task_data: Mapping[str, Any]) -> bool:
+    """Whether the run holds its target to the guide's import rule: it does unless the spec waives it."""
+    target = task_data.get("target") if isinstance(task_data, Mapping) else None
+    stated = target.get(V1_IMPORTS_KEY) if isinstance(target, Mapping) else None
+    return str(stated or V1_IMPORTS_REFUSED) != V1_IMPORTS_ALLOWED
+
+
+def check_v1_imports(repo_root: Path | str, paths: Iterable[str]) -> list[Check]:
+    """The guide's import rule, asked of each Python file among ``paths`` (repository-relative).
+
+    A target reads the engine's Modeling V1 implementation and may copy or adapt it into
+    its own operations; it does not import, subclass or call it. What the guide forbids,
+    and what an imported name is, are read from the checkout (``operators/v1_rule.py``).
+    One failing check per file that imports a thing the guide names (a model class, a
+    model's own module, an attention backend, a fused MoE module, a layer). An import
+    from a place the guide lists that is none of those is not certain: it is said in a
+    check that passes, for a person to decide. No check where the checkout's guide states
+    no such rule, and none for a file with no such import.
+    """
+    root = Path(repo_root)
+    found = v1_rule.rule(root)
+    if found is None:
+        return []
+    checks: list[Check] = []
+    for path in sorted({str(p) for p in paths}):
+        if not path.endswith(".py") or not (root / path).is_file():
+            continue
+        imports = v1_rule.v1_imports(root, path, found=found)
+        certain = [item.render() for item in imports if item.certain]
+        unsure = [item.render() for item in imports if not item.certain]
+        if certain:
+            checks.append(
+                Check(
+                    f"imports:{path}",
+                    False,
+                    "; ".join(certain)
+                    + ": a target reads Modeling V1 code and may copy it into its own "
+                    "operations; it does not import, subclass or call it",
+                )
+            )
+        elif unsure:
+            checks.append(
+                Check(f"imports:{path}", True, "not certain, for a person: " + "; ".join(unsure))
+            )
+    return checks
+
+
+def check_accuracy_reference(
+    repo_root: Path, reference_yaml: str, model_key: str, declared_anchor: str = ""
+) -> list[Check]:
+    """The anchor this run gated against is written down, keyed by the model.
+
+    ``declared_anchor`` is what a spec's declared anchor amounts to as an entry of the
+    file, in words (the caller knows the spec): a missing entry then says what to write.
+    """
     path = Path(reference_yaml)
     if not path.is_absolute():
         path = repo_root / path
+    known = f". The spec declares it: {declared_anchor}" if declared_anchor else ""
     if not path.is_file():
-        return [Check(name="accuracy:reference", passed=False, detail=f"missing: {path}")]
+        return [Check(name="accuracy:reference", passed=False, detail=f"missing: {path}{known}")]
     data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     present = model_key in data
     return [
@@ -622,7 +519,7 @@ def check_accuracy_reference(repo_root: Path, reference_yaml: str, model_key: st
                 f"{path.name} carries an entry for {model_key}"
                 if present
                 else f"{path.name} has no entry for {model_key}; the gate ran against "
-                f"an anchor that is not recorded anywhere"
+                f"an anchor that is not recorded anywhere{known}"
             ),
         )
     ]
@@ -679,50 +576,23 @@ def check_test_registration(repo_root: Path, accuracy_test: str) -> list[Check]:
     return checks
 
 
-def check_tree_committed(repo_root: Path, paths: Sequence[str]) -> list[Check]:
-    """Whether the delivered trees are in git, not just on somebody's disk.
+def check_ci(
+    repo_root: Path,
+    *,
+    reference_yaml: str,
+    model_key: str,
+    accuracy_test: str,
+    declared_anchor: str = "",
+) -> list[Check]:
+    """The delivery's rules that set a target up for CI: its anchor's row, its test, a list.
 
-    Returns **no check at all** outside a git work tree, rather than a failing
-    one. Where there is no git there is no claim to make, and a fixture in a
-    temporary directory is not a delivery.
+    One list. The delivery's check reads it on the finished target and the task that
+    writes those files reads it in its tree: a rule the check applies is one the
+    task was told.
     """
-    if not (repo_root / ".git").exists():
-        return []
-    try:
-        result = subprocess.run(
-            ["git", "status", "--porcelain", "--", *paths],
-            cwd=repo_root,
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        return [
-            Check(
-                name="git:target-committed",
-                passed=False,
-                detail=f"could not run git status: {type(exc).__name__}: {exc}",
-            )
-        ]
-    if result.returncode != 0:
-        return [
-            Check(
-                name="git:target-committed",
-                passed=False,
-                detail=f"git status exited {result.returncode}: {result.stderr.strip()[:200]}",
-            )
-        ]
-    dirty = [line for line in result.stdout.splitlines() if line.strip()]
     return [
-        Check(
-            name="git:target-committed",
-            passed=not dirty,
-            detail=(
-                "the delivered trees are clean at HEAD"
-                if not dirty
-                else "uncommitted, so a clone would not have them:\n  " + "\n  ".join(dirty[:12])
-            ),
-        )
+        *check_accuracy_reference(repo_root, reference_yaml, model_key, declared_anchor),
+        *check_test_registration(repo_root, accuracy_test),
     ]
 
 
@@ -766,17 +636,35 @@ def verify_delivery(
     model_key: str,
     accuracy_test: str,
     commit_policy: CommitPolicy | None = None,
+    v1_imports: bool = True,
+    declared_anchor: str = "",
 ) -> DeliveryReport:
-    """Run every mechanical delivery check and return the report."""
+    """Run every mechanical delivery check and return the report.
+
+    ``v1_imports``: whether the target's files are held to the guide's import rule
+    (:func:`check_v1_imports`); a spec may waive it (:func:`v1_imports_refused`).
+    """
     root = Path(repo_root)
     checks: list[Check] = []
 
-    checks.extend(check_target(root, target_rel))
     checks.extend(_dependency_checks(root, target_rel))
-    checks.extend(check_routing(root, family, target_rel))
-    checks.extend(check_accuracy_reference(root, reference_yaml, model_key))
-    checks.extend(check_test_registration(root, accuracy_test))
-    checks.extend(check_tree_committed(root, (target_rel, MODELING_V2_PACKAGE, CATALOG_TESTS_DIR)))
+    if v1_imports:
+        target = root / target_rel
+        own = (
+            sorted(p.relative_to(root).as_posix() for p in target.rglob("*.py"))
+            if target.is_dir()
+            else []
+        )
+        checks.extend(check_v1_imports(root, own))
+    checks.extend(
+        check_ci(
+            root,
+            reference_yaml=reference_yaml,
+            model_key=model_key,
+            accuracy_test=accuracy_test,
+            declared_anchor=declared_anchor,
+        )
+    )
     if commit_policy is not None:
         checks.extend(check_commit_hygiene(root, commit_policy))
     return DeliveryReport(checks=tuple(checks))
@@ -790,16 +678,14 @@ __all__ = [
     "EntryContract",
     "TEST_DB_DIR",
     "check_accuracy_reference",
-    "check_catalog_entries",
-    "check_catalog_tests",
+    "check_changed_entries",
+    "check_ci",
+    "entry_test_places",
+    "routing_places",
     "check_commit_hygiene",
-    "check_model_op_tests",
-    "check_model_ops",
-    "check_routing",
-    "check_target",
     "check_test_registration",
-    "check_tree_committed",
+    "check_v1_imports",
     "entry_contract",
-    "imported_model_ops",
+    "v1_imports_refused",
     "verify_delivery",
 ]

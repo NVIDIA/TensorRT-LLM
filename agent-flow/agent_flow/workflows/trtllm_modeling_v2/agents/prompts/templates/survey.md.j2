@@ -2,46 +2,23 @@
 SPDX-License-Identifier: Apache-2.0 -#}
 {{ heading }}
 
-Planning preview of the shared public LLM configuration (`checks/check_config.py`, `launch_captures`). Request checks and trtllm-eval receive the same options. The engine can filter batches by launch limits; these previews are not actual capture evidence. Worker observations remain necessary.
+A planning preview, resolved from each deployment's options as the checks will launch them. The engine can filter batches by its launch limits, so a preview is not evidence of what was captured: a worker's observation is still needed.
 
 {% if error is not none -%}
-- the units' lists cannot be resolved ({{ error }}); preflight names the cause
+- the deployments' lists cannot be resolved ({{ error }}); preflight names the cause
 {% endif -%}
 {% for capture in captures -%}
 - {% if capture.name != capture.unit -%}
-variant `{{ capture.name }}` (unit `{{ capture.unit }}`):
+`{{ capture.name }}` (a server of deployment `{{ capture.unit }}`):
 {%- else -%}
 `{{ capture.name }}`:
 {%- endif %} {% if capture.description is none -%}
-no CUDA graphs at any gate
+no CUDA graphs in any check
 {% else -%}
-{{ capture.description }}, at boot, acceptance and accuracy, from {{ capture.source }}
+{{ capture.description }}, in every check of its session, from {{ capture.source }}
 {% endif -%}
 {% endfor -%}
 {% if inherited -%}
-- variants {{ inherited | join(', ') }}: their unit's list
+- {{ inherited | join(', ') }}: the same list as their deployment
 {% endif -%}
 - LLM API default, `CudaGraphConfig()`, what a user who sets no `cuda_graph_config` runs: {{ default_capture }}
-{% if not perf_enabled -%}
-- tune: `perf` is off, so no serving config is measured
-{% else -%}
-{% for entry in tune -%}
-- tune `{{ entry.name }}`: {% if entry.error -%}
-cannot be resolved ({{ entry.error }}); repair this configuration before measuring
-{% elif not entry.readable -%}
-{{ entry.path }} (not readable here)
-{% else -%}
-{% if entry.description is none -%}
-no CUDA graphs
-{%- else -%}
-{{ entry.description }}
-{%- endif %}, from {% if entry.path -%}
-{{ entry.path }}
-{% elif entry.overlay -%}
-its `llm_api_options`
-{% else -%}
-`capture_batch_sizes` up to concurrency {{ entry.max_concurrency }}
-{% endif -%}
-{% endif -%}
-{% endfor -%}
-{% endif -%}

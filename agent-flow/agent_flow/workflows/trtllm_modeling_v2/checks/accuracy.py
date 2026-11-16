@@ -1,7 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Accuracy evaluation, reference lookup and cross-member findings."""
+"""How a benchmark's score is read and judged, and ``trtllm-eval`` in a load of its own.
+
+A deployment's benchmarks are scored through its session's endpoint
+(``checks/session.py``). What is here is shared by both ways of taking a score: reading
+it from what an evaluator prints (:func:`parse_eval_score`), the reference rows
+(:func:`load_reference_score`) and the one-sided judgment against the floor its anchor
+sets (:func:`judged`). :func:`run_eval` is the other way: ``trtllm-eval`` on an
+aggregated deployment's options, which loads the model once more. It runs for a
+benchmark the endpoint evaluator cannot carry or one the spec marks ``through: eval``,
+and its line says so.
+"""
 
 from __future__ import annotations
 
@@ -17,12 +27,11 @@ import yaml
 from ..infra.compute.commands import ended_early
 from ..infra.compute.environment import RunEnvironment
 from ..infra.files import write_text_atomic
-from ..spec.task_schema import resolve_per_unit, resolve_samples
-from . import accuracy_policy, check_config, feature_evidence
-from .check_config import check_configuration, engine_declaration, resolve_llm_api_options
+from ..spec.deployments import REQUIREMENT_OPTION, requirement, requirement_said
+from ..spec.task_schema import resolve_per_unit
+from . import accuracy_policy, attest
 from .check_runtime import MODE_REQUIRE, ShellRunner, default_shell_runner, gate_workdir, with_mode
 from .gate_records import KIND_FINDING, GateRecord, GateRecords, open_findings
-from .runtime_evidence import EVAL_NOT_ATTESTED, attest_engine, engine_failure, engine_records
 from .verdict import UNKNOWN_TREE_STATE, GateResult, inspect_tree, lost_session, verdict_factory
 
 ACCURACY_TIMEOUT_S = 4 * 60 * 60
@@ -46,53 +55,28 @@ _LM_EVAL_SCORE = re.compile(r"lm-eval\s+\S+\s+.*?accuracy:\s*([0-9]+(?:\.[0-9]+)
 _MMLU_SCORE = re.compile(r"MMLU weighted average accuracy:\s*([0-9]+(?:\.[0-9]+)?)")
 
 
-def resolve_discriminators(
-    accuracy: Mapping[str, Any], unit: str | None
-) -> Mapping[str, Any] | None:
-    """Pick the accuracy-reference discriminators for ``unit``; ``None`` when there are none.
-
-    Accepts either a flat mapping (the whole run) or a mapping from unit
-    name to mapping, with ``default`` as the fallback key.
-    """
-    block = accuracy.get("discriminators")
-    if not isinstance(block, dict):
-        return None
-    # Per-unit form is recognised by its values being mappings; a flat form
-    # like {"quant_algo": "NVFP4"} has scalar values.
-    if any(isinstance(v, dict) for v in block.values()):
-        chosen = block.get(unit)
-        if chosen is None:
-            chosen = block.get("default")
-        return chosen if isinstance(chosen, dict) else None
-    return block
-
-
 def eval_command(
     task_data: Mapping[str, Any],
-    config: Mapping[str, Any],
-    benchmark: str,
+    deployment: Any,
+    benchmark: Any,
     *,
     workdir: str | Path,
-    unit: str | None = None,
-    member: str | None = None,
+    dataset_path: str | None = None,
 ) -> list[str]:
-    """Public trtllm-eval CLI using the same resolved configuration the verdict attests."""
-    accuracy = dict(task_data.get("accuracy") or {})
-    options = dict(config["llm"])
-    options.pop("model")
-    target = gate_workdir(workdir) / f"eval.{unit or 'unit'}.{member or 'member'}.yaml"
+    """``trtllm-eval`` on the deployment's options under its Modeling V2 requirement, as shell words."""
+    options = {
+        **deployment.server.options,
+        REQUIREMENT_OPTION: requirement(deployment.server.options),
+    }
+    target = gate_workdir(workdir) / f"eval.{deployment.name}.{benchmark.name}.yaml"
     write_text_atomic(target, yaml.safe_dump(options, sort_keys=True), mode=0o600)
-    parts = [
-        "trtllm-eval",
-        shlex.quote(f"--model={task_data['checkpoint_path']}"),
-        shlex.quote(f"--config={target}"),
-        benchmark,
-    ]
-    if accuracy.get("dataset_path"):
-        parts.append(shlex.quote(f"--dataset_path={accuracy['dataset_path']}"))
-    arguments = [str(arg) for arg in resolve_per_unit(accuracy, "benchmark_args", unit) or ()]
-    # Logged samples and the inference text stay under the gate's directory, for an audit.
-    if benchmark == "gsm8k" and "--log_samples" in arguments:
+    parts = ["trtllm-eval", f"--model={task_data['checkpoint_path']}", f"--config={target}"]
+    parts.append(benchmark.name)
+    if dataset_path:
+        parts.append(f"--dataset_path={dataset_path}")
+    arguments = [str(arg) for arg in benchmark.args]
+    # Logged samples and the inference text stay under the check's directory, for an audit.
+    if benchmark.name == "gsm8k" and "--log_samples" in arguments:
         output = None
         for index, argument in enumerate(arguments):
             if argument.startswith("--output_path="):
@@ -104,22 +88,7 @@ def eval_command(
             arguments.append(f"--output_path={output}")
         if not any(arg == "--output_dir" or arg.startswith("--output_dir=") for arg in arguments):
             arguments.append(f"--output_dir={Path(output) / 'inference'}")
-    parts.extend(shlex.quote(arg) for arg in arguments)
-    return parts
-
-
-def eval_harness_command(environment: RunEnvironment, parts: Sequence[str]) -> str:
-    """Launch the installed public CLI; the one upstream rank hook observes workers.
-
-    The benchmark prints its running score every :data:`EVAL_PROGRESS_EVERY`
-    answers unless the environment already sets how often.
-    """
-    progress = {EVAL_PROGRESS_ENV: str(EVAL_PROGRESS_EVERY)}
-    environment = replace(
-        environment,
-        env={**progress, **environment.env, "HF_DATASETS_OFFLINE": "1", "HF_HUB_OFFLINE": "1"},
-    )
-    return environment.command(" ".join(parts))
+    return [shlex.quote(part) for part in (*parts, *arguments)]
 
 
 #: A line that may carry a benchmark's score: a metric's name, then a number. What a
@@ -181,6 +150,17 @@ def unparsed_score_detail(output: str, pattern: str | None) -> str:
     )
 
 
+#: The keys an in-tree accuracy test selects a reference row by, and the value a row that
+#: leaves one out stands for.
+REFERENCE_SPEC_DEFAULTS: dict[str, Any] = {
+    "dtype": "auto",
+    "quant_algo": None,
+    "kv_cache_quant_algo": None,
+    "spec_dec_algo": None,
+    "extra_acc_spec": None,
+}
+
+
 def load_reference_score(
     reference_yaml: str | Path,
     model_key: str,
@@ -189,10 +169,14 @@ def load_reference_score(
 ) -> float:
     """Read the anchor for one model from TensorRT-LLM's accuracy references.
 
-    An entry matches when its discriminators (``quant_algo``,
-    ``kv_cache_quant_algo``, ``spec_dec_algo``) are exactly the ones asked
-    for, no more, no less. Raises ``KeyError`` when no entry, or more than
-    one, matches: the anchor is never invented.
+    The row is the one the in-tree accuracy test would take: the first whose
+    ``dtype``, ``quant_algo``, ``kv_cache_quant_algo``, ``spec_dec_algo`` and
+    ``extra_acc_spec`` equal the ones asked for, a key the row leaves out
+    counting as ``auto`` for ``dtype`` and unset for the rest. A row's other
+    keys (``num_samples``, ``threshold``, ...) do not select. A discriminator
+    outside those five narrows the match to rows that carry it with that
+    value. Raises ``KeyError`` when no row matches: the anchor is never
+    invented.
     """
     path = Path(reference_yaml)
     if not path.is_file():
@@ -206,174 +190,160 @@ def load_reference_score(
         )
 
     wanted = {k: v for k, v in (discriminators or {}).items() if v is not None}
-    entries = data[model_key] or []
-    matches = []
+    asked = {key: wanted.get(key, default) for key, default in REFERENCE_SPEC_DEFAULTS.items()}
+    narrowing = {k: v for k, v in wanted.items() if k not in REFERENCE_SPEC_DEFAULTS}
+    entries = [e for e in data[model_key] or [] if isinstance(e, dict)]
     for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        present = {k: v for k, v in entry.items() if k != "accuracy"}
-        if present == wanted:
-            matches.append(entry)
-
-    if not matches:
-        available = [
-            {k: v for k, v in e.items() if k != "accuracy"} for e in entries if isinstance(e, dict)
-        ]
-        raise KeyError(
-            f"{path}:{model_key} has no entry matching {wanted or '{}'}. Available "
-            f"discriminator sets: {available}"
+        selects = all(
+            entry.get(key, default) == asked[key]
+            for key, default in REFERENCE_SPEC_DEFAULTS.items()
         )
-    if len(matches) > 1:
-        raise KeyError(
-            f"{path}:{model_key} has {len(matches)} entries matching {wanted or '{}'}; "
-            f"the anchor must be unambiguous"
-        )
-    return float(matches[0]["accuracy"])
+        if selects and all(entry.get(k) == v for k, v in narrowing.items()) and "accuracy" in entry:
+            return float(entry["accuracy"])
+    available = [
+        {k: e[k] for k in (*REFERENCE_SPEC_DEFAULTS, *narrowing) if k in e} for e in entries
+    ]
+    raise KeyError(
+        f"{path}:{model_key} has no entry matching {wanted or '{}'}. Available "
+        f"discriminator sets: {available}"
+    )
 
 
-def resolve_floor(
-    accuracy: Mapping[str, Any],
-    unit: str | None,
-    benchmark: str,
-    reference: float,
-    output: str = "",
-    relative: bool = False,
-) -> tuple[accuracy_policy.Floor | None, str]:
-    """The floor ``reference`` gets under ``accuracy.floor``, and where its count came from.
-
-    ``relative``: ``reference`` is the unit's own score at this member, on this target.
-    """
-    policy = accuracy_policy.resolve_floor_policy(accuracy)
-    samples, source = resolve_samples(accuracy, unit, benchmark, output)
-    return accuracy_policy.floor_for(policy, reference, samples, relative), source
-
-
-def run_accuracy_gate(
+def run_eval(
     environment: RunEnvironment,
     *,
     task_data: Mapping[str, Any],
-    reference: float,
+    deployment: Any,
+    benchmark: Any,
+    anchor: Any,
     workdir: str | Path,
     runner: ShellRunner = default_shell_runner,
     timeout: int | None = None,
-    unit: str | None = None,
-    member: str | None = None,
-    relative: bool = False,
+    relative_score: float | None = None,
+    dataset_path: str | None = None,
 ) -> GateResult:
-    """Run ``trtllm-eval`` and compare against the anchor. One-sided.
+    """Score ``benchmark`` on an aggregated ``deployment`` with ``trtllm-eval``, in a load of its own.
 
-    The floor is ``reference - k * SE`` by default (:func:`resolve_floor`), a
-    fixed ``reference - tolerance`` under ``accuracy.floor.rule: tolerance``.
-    ``relative``: ``reference`` is the unit's own score at this member on this
-    target (a configuration variant's ``anchor: relative``), and the SE is that
-    of the difference. The engine is held to the unit's options file
-    (:func:`engine_declaration`).
+    One job at the deployment's own width: the evaluator loads the model, scores, and
+    exits. Every rank's engine is held to the deployment's options (``checks/attest.py``)
+    and the score to ``anchor``'s floor (:func:`judged`). ``relative_score`` is the score
+    of the deployment a relative anchor names, measured as this one is.
     """
-    accuracy = dict(task_data.get("accuracy") or {})
-    timeout = int(accuracy.get("timeout", ACCURACY_TIMEOUT_S)) if timeout is None else timeout
-    benchmark = str(resolve_per_unit(accuracy, "benchmark", unit) or "gsm8k")
-    tolerance = float(accuracy.get("tolerance", 0.0))
-    env = with_mode(environment, MODE_REQUIRE)
-    _verdict = verdict_factory(inspect_tree(task_data))
-    planned, _ = resolve_floor(accuracy, unit, benchmark, reference, relative=relative)
-
-    def floor_fields(floor: accuracy_policy.Floor | None) -> dict[str, Any]:
-        if floor is None:
-            return {}
-        return {
-            "floor": floor.value,
-            "se": floor.se,
-            "samples": floor.samples,
-            "floor_rule": floor.describe(),
-        }
-
-    name = f"accuracy[{benchmark}]"
-    common = dict(name=name, member=member, reference=reference, tolerance=tolerance)
-    config = check_configuration(
-        task_data, environment, unit=unit, features=None, max_tokens=64, member=member
-    )
-    config["llm"]["modeling_v2"] = MODE_REQUIRE
-    for key in ("max_seq_len", "max_batch_size"):
-        if accuracy.get(key) is not None:
-            config["llm"][key] = accuracy[key]
-    if accuracy.get("max_batch_size") is not None:
-        # The benchmark's batch is a global total too: each attention-DP rank serves its share.
-        check_config.share_batch(config["llm"], member, config["llm"].get("tensor_parallel_size"))
-    parts = eval_command(task_data, config, benchmark, unit=unit, member=member, workdir=workdir)
-    command = eval_harness_command(env, parts)
-
+    verdict = verdict_factory(inspect_tree(task_data))
+    accuracy = task_data.get("accuracy") or {}
     started = time.monotonic()
+    fields: dict[str, Any] = {}
+
+    def ran(**more: Any) -> GateResult:
+        return verdict(
+            name=f"accuracy[{benchmark.name}]",
+            member=deployment.shape,
+            duration_s=time.monotonic() - started,
+            **{**fields, **more},
+        )
+
+    if timeout is None:
+        timeout = int(accuracy.get("timeout") or ACCURACY_TIMEOUT_S)
+    parts = eval_command(
+        task_data, deployment, benchmark, workdir=workdir, dataset_path=dataset_path
+    )
+    env = {
+        EVAL_PROGRESS_ENV: str(EVAL_PROGRESS_EVERY),
+        **environment.env,
+        **deployment.env,
+        **benchmark.env,
+        "HF_DATASETS_OFFLINE": "1",
+        "HF_HUB_OFFLINE": "1",
+    }
+    mode = requirement(deployment.server.options)
+    if requirement_said(deployment):
+        fields["warnings"] = (requirement_said(deployment),)
+    launch = with_mode(replace(environment, env=env, world_size=deployment.ranks), mode)
+    command = launch.command(" ".join(parts))
     result = runner(command, None, timeout)
-    elapsed = time.monotonic() - started
     combined = result.stdout + result.stderr
-    tail = "\n".join(combined.splitlines()[-40:])
-    ran = dict(command=command, duration_s=elapsed, stdout_tail=tail, **common)
-
+    fields.update(command=command, stdout_tail="\n".join(combined.splitlines()[-40:]))
     if result.infrastructure:
-        return _verdict(**lost_session(result), **ran, **floor_fields(planned))
+        return ran(**lost_session(result))
     if result.timed_out:
-        return _verdict(
-            passed=False, detail=ended_early(result, timeout), **ran, **floor_fields(planned)
-        )
+        return ran(passed=False, detail=ended_early(result, timeout))
     if not result.ok:
-        return _verdict(
-            passed=False,
-            detail=f"trtllm-eval exited {result.returncode}",
-            **ran,
-            **floor_fields(planned),
-        )
-    options = resolve_llm_api_options(accuracy, unit)
-    declared = engine_declaration(config, mode=MODE_REQUIRE)
-    asks = bool(declared.get("block_reuse"))
-    attested = attest_engine(combined, declared, absent=EVAL_NOT_ATTESTED)
-    ran["engine"] = engine_records((attested,))
-    failure = engine_failure(combined, attested, options=options, asks=asks)
-    if failure:
-        return _verdict(passed=False, detail=failure, **ran, **floor_fields(planned))
-    unobserved = feature_evidence.unobserved(attested, check_config.subject_fields(task_data, unit))
-    if unobserved:
-        return _verdict(
-            passed=False,
-            detail=feature_evidence.unobserved_detail(unobserved),
-            **ran,
-            **floor_fields(planned),
-        )
-
-    pattern = resolve_per_unit(accuracy, "score_pattern", unit)
-    measured = parse_eval_score(combined, pattern)
+        return ran(passed=False, detail=f"trtllm-eval exited {result.returncode}")
+    attested = attest.attest(
+        combined,
+        {**deployment.server.options, REQUIREMENT_OPTION: mode},
+        tree=task_data.get("trtllm_repo_path"),
+        target=mode == MODE_REQUIRE,
+    )
+    fields["engine"] = (attested.record(),)
+    if attested.failure():
+        return ran(passed=False, detail=attested.failure())
+    measured = parse_eval_score(combined, benchmark.score_pattern)
     if measured is None:
-        return _verdict(
-            passed=False,
-            detail=unparsed_score_detail(combined, pattern),
-            **ran,
-            **floor_fields(planned),
+        return ran(passed=False, detail=unparsed_score_detail(combined, benchmark.score_pattern))
+    return ran(
+        **judged(
+            measured,
+            anchor,
+            benchmark,
+            accuracy_policy.resolve_floor_policy(accuracy),
+            relative_score=relative_score,
+            output=combined,
+            how=" by `trtllm-eval`, in a load of its own",
         )
+    )
 
-    floor, source = resolve_floor(accuracy, unit, benchmark, reference, combined, relative)
-    if floor is None:
-        return _verdict(
+
+def judged(
+    measured: float,
+    anchor: Any,
+    benchmark: Any,
+    policy: accuracy_policy.FloorPolicy,
+    *,
+    relative_score: float | None = None,
+    output: str = "",
+    how: str = "",
+) -> dict[str, Any]:
+    """The verdict fields of ``measured`` against the floor ``anchor`` sets; one-sided.
+
+    ``anchor`` and ``benchmark`` are a deployment's (``checks/anchors.py``,
+    ``spec/deployments.py``); ``relative_score`` is the score of the deployment a
+    relative anchor names, measured as this one is. ``how`` says the way the score was
+    taken (through the endpoint, by ``trtllm-eval`` in a load of its own).
+    """
+    from . import anchors as anchors_mod
+
+    if anchor.unit == "fraction" and measured > 1:
+        # Compared as it is, a percentage would clear any floor a fraction sets.
+        return dict(
             passed=False,
-            detail=f"measured {measured:.4f}, but the statistical floor needs the sample "
-            f"count and there is {source}. A floor that cannot be computed is not a pass",
             measured=measured,
-            **ran,
+            detail=f"measured {measured:.4f}{how}, which is no fraction: the benchmark's `unit` "
+            f"says its scores are fractions, and this one is on another scale; state the unit "
+            f"the evaluator reports",
+        )
+    floor, source = anchors_mod.floor(
+        anchor, benchmark, policy, relative_score=relative_score, output=output
+    )
+    if floor is None:
+        return dict(
+            passed=False,
+            measured=measured,
+            detail=f"measured {measured:.4f}{how}, but no floor can be computed under it "
+            f"({source}). A floor that cannot be computed is not a pass",
         )
     passed = measured >= floor.value
-    return _verdict(
+    return dict(
         passed=passed,
-        detail=(
-            f"measured {measured:.4f} {'>=' if passed else '<'} {floor.value:.4f} "
-            f"({floor.describe()}; count from {source}); score validation only; "
-            + (
-                f"engine observability UNKNOWN for {', '.join(attested.not_attested)}; "
-                if attested.not_attested
-                else ""
-            )
-            + "eval cache reuse was not probed (zero hits are not a failure)"
-        ),
         measured=measured,
-        **ran,
-        **floor_fields(floor),
+        reference=floor.reference,
+        tolerance=floor.tolerance,
+        floor=floor.value,
+        se=floor.se,
+        samples=floor.samples,
+        floor_rule=floor.describe(),
+        detail=f"measured {measured:.4f} {'>=' if passed else '<'} {floor.value:.4f}{how} "
+        f"({floor.describe()}; count from {source}; anchor: {anchor.kind}, {anchor.source})",
     )
 
 
@@ -382,9 +352,10 @@ def check_systematic_shift(
     accuracy: Mapping[str, Any],
     unit: str | None,
 ) -> accuracy_policy.ShiftFinding | None:
-    """The cross-member check over one unit's accuracy verdicts (:func:`.accuracy_policy.systematic_shift`).
+    """The check across the deployments scored on one benchmark (:func:`.accuracy_policy.systematic_shift`).
 
-    Verdicts without a measurement or an SE are left out.
+    ``results`` are their accuracy lines, each named by its deployment (``member``), and
+    ``unit`` the benchmark. Lines without a measurement or an SE are left out.
     """
     policy = accuracy_policy.resolve_floor_policy(accuracy)
     readings = {
@@ -400,7 +371,7 @@ def check_systematic_shift(
     )
 
 
-#: The key a systematic-shift finding is recorded under, per unit.
+#: The key a systematic-shift finding is recorded under, per benchmark.
 SHIFT_FINDING = "systematic_shift"
 
 
@@ -412,8 +383,8 @@ def note_systematic_shift(
 ) -> accuracy_policy.ShiftFinding | None:
     """Run :func:`check_systematic_shift` and record its outcome either way.
 
-    A unit with no shift records a resolved entry, so a finding raised by an
-    earlier turn of the same unit stops blocking once a later turn is clean.
+    A benchmark with no shift records a resolved entry, so a finding raised on an
+    earlier state of the target stops blocking once a later one is clean.
     """
     finding = check_systematic_shift(results, accuracy, unit)
     tree = results[-1].tree_state if results else UNKNOWN_TREE_STATE
@@ -440,34 +411,12 @@ def blocking_findings(records: GateRecords, accuracy: Mapping[str, Any]) -> list
     return open_findings(records, accuracy_policy.resolve_floor_policy(accuracy).acknowledged)
 
 
-def resolve_reference(
-    task_data: Mapping[str, Any],
-    *,
-    model_key: str,
-    discriminators: Mapping[str, Any] | None = None,
-    unit: str | None = None,
-) -> float:
-    """Look up this run's anchor, resolving the reference path against the repo.
-
-    ``discriminators`` overrides ``accuracy.discriminators`` for ``unit``.
-    """
-    accuracy = dict(task_data.get("accuracy") or {})
-    reference_yaml = Path(str(resolve_per_unit(accuracy, "reference_yaml", unit)))
-    if not reference_yaml.is_absolute():
-        reference_yaml = Path(str(task_data["trtllm_repo_path"])) / reference_yaml
-    if discriminators is None:
-        discriminators = resolve_discriminators(accuracy, unit)
-    return load_reference_score(reference_yaml, model_key, discriminators=discriminators)
-
-
 def resolve_model_key(task_data: Mapping[str, Any], unit: str | None = None) -> str:
-    """The HuggingFace repo name this unit's anchor row is keyed by.
+    """The HuggingFace repo name the run's anchor rows are keyed by.
 
-    An explicit ``accuracy.model_key`` when the spec states one (per unit,
-    :func:`~.spec.task_schema.resolve_per_unit`), otherwise the last two components of the
-    checkpoint path (``<org>/<model>``). This is the one implementation: the
-    workflow's ``_model_key`` delegates here, so preflight's anchor check and
-    the gate resolve the same key.
+    ``accuracy.model_key`` when the spec states one, otherwise the last two components
+    of the checkpoint path (``<org>/<model>``). A benchmark that states its own is read
+    by ``checks/anchors.py``.
     """
     accuracy = dict(task_data.get("accuracy") or {})
     explicit = resolve_per_unit(accuracy, "model_key", unit)
@@ -478,20 +427,17 @@ def resolve_model_key(task_data: Mapping[str, Any], unit: str | None = None) -> 
 
 
 __all__ = [
-    "resolve_model_key",
     "ACCURACY_TIMEOUT_S",
     "SHIFT_FINDING",
     "blocking_findings",
     "check_systematic_shift",
     "eval_command",
-    "eval_harness_command",
+    "judged",
     "load_reference_score",
     "note_systematic_shift",
     "parse_eval_score",
-    "resolve_discriminators",
-    "resolve_floor",
-    "resolve_reference",
-    "run_accuracy_gate",
+    "resolve_model_key",
+    "run_eval",
     "score_lines",
     "unparsed_score_detail",
 ]

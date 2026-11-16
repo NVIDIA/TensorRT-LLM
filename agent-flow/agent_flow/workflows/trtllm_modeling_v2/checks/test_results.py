@@ -19,6 +19,7 @@ from typing import Collection, Iterable, Sequence
 import yaml
 
 from ..infra.git import git_output
+from ..operators import tree_anchors
 from .harness.test_driver import RECORD_VERSION, SESSIONS_DIRNAME
 
 #: The driver, run by path with the tree's python.
@@ -44,11 +45,23 @@ class Session:
     """One recorded pytest process."""
 
     commit: str | None
+    #: Whether git said the tree's tracked files match the commit; ``None``: it gave no answer.
     clean: bool | None
     env_digest: str
     tests: dict[str, dict]
     collected: dict[str, list[str]]
     ended: str = ""
+    #: The tree was a pin of this commit: made from it, read-only, checked when its job started.
+    pinned: bool = False
+
+    @property
+    def counts(self) -> bool:
+        """Whether its results are the commit's: a clean tree, or a pin git gave no answer for.
+
+        A tree git called modified never counts. One of unknown state counts only when it
+        is a pin: nothing else says what was run.
+        """
+        return bool(self.clean) or (self.clean is None and self.pinned)
 
     @classmethod
     def load(cls, path: Path) -> "Session | None":
@@ -65,6 +78,7 @@ class Session:
             tests={k: v for k, v in (raw.get("tests") or {}).items() if isinstance(v, dict)},
             collected=raw.get("collected") or {},
             ended=str(raw.get("ended") or raw.get("started") or ""),
+            pinned=bool(raw.get("pinned")),
         )
 
 
@@ -76,12 +90,35 @@ def load_sessions(cache: str | Path) -> list[Session]:
 
 @dataclass
 class Results:
-    """What the clean sessions at one commit recorded in one environment; the newest wins."""
+    """What the sessions that count at one commit recorded in one environment; the newest wins."""
 
     commit: str
     env_digest: str = ""
     tests: dict[str, dict] = field(default_factory=dict)
     collected: dict[str, list[str]] = field(default_factory=dict)
+    #: What ran here in a tree of unknown state that was no pin (:attr:`Session.counts`):
+    #: per test file, each test's outcome. Not results; said, so that "it ran and was not
+    #: counted" is never reported as "it did not run".
+    uncounted: dict[str, dict[str, str]] = field(default_factory=dict)
+
+    def said_of(self, item: str) -> str:
+        """Why ``item`` (a file or a test) has no result though it ran; ``""`` when it did not run."""
+        file, _, name = item.partition("::")
+        ran = self.uncounted.get(file)
+        if not ran:
+            return ""
+        if name:
+            outcome = ran.get(item)
+            how = f"it {outcome}" if outcome else "its file ran"
+        else:
+            counts: dict[str, int] = {}
+            for outcome in ran.values():
+                counts[outcome] = counts.get(outcome, 0) + 1
+            how = ", ".join(f"{n} {outcome}" for outcome, n in sorted(counts.items())) or "it ran"
+        return (
+            f"ran at this commit ({how}) and is not counted: git gave no answer on whether "
+            "the tree it ran in was clean, and that tree was no pin"
+        )
 
     def test_ids(self, file: str) -> list[str] | None:
         """The tests ``file`` holds here; ``None`` when no session collected it.
@@ -114,17 +151,28 @@ class Results:
 
 
 def recorded(cache: str | Path, commit: str, env_digest: str = "") -> Results:
-    """The results the clean sessions at ``commit`` recorded.
+    """The results the sessions that count at ``commit`` recorded (:attr:`Session.counts`).
 
-    In ``env_digest`` when given, else in the environment the newest of them ran in.
+    In ``env_digest`` when given, else in the environment the newest of them ran in. What
+    ran there in a tree of unknown state that was no pin is kept apart
+    (:attr:`Results.uncounted`): it is no result, and it is not "did not run" either.
     """
-    sessions = [s for s in load_sessions(cache) if s.commit == commit and s.clean]
+    at = [s for s in load_sessions(cache) if s.commit == commit]
+    sessions = [s for s in at if s.counts]
     env = env_digest or next((s.env_digest for s in reversed(sessions) if s.env_digest), "")
     found = Results(commit, env)
     for session in sessions:
         if session.env_digest == env:
             found.tests.update(session.tests)
             found.collected.update(session.collected)
+    for session in at:
+        if session.clean is None and not session.pinned and session.env_digest == env:
+            for file in session.collected:
+                found.uncounted.setdefault(file, {})
+            for nodeid, entry in session.tests.items():
+                found.uncounted.setdefault(nodeid.partition("::")[0], {})[nodeid] = str(
+                    entry.get("outcome") or "error"
+                )
     return found
 
 
@@ -271,11 +319,11 @@ def head_results(results: Results, files: Iterable[str]) -> HeadResults:
 
 
 def default_base(workspace: str | Path, repo: str | Path, head: str) -> str | None:
-    """The commit a regression check last cleared, else the run's starting commit.
+    """The commit the run started from: what a failing case on ``head`` is compared with.
 
-    The first is the newest ``cleared`` among the receipts in
-    ``<workspace>/tasks/`` that is an ancestor of ``head``; the second, the
-    parent of the oldest commit any receipt says its task integrated.
+    The parent of the oldest commit any receipt in ``<workspace>/tasks/`` says its task
+    integrated, among those that are ancestors of ``head``. ``None`` when no receipt names
+    one: there is then nothing to compare with.
     """
 
     def resolve(rev: str) -> str | None:
@@ -293,13 +341,6 @@ def default_base(workspace: str | Path, repo: str | Path, head: str) -> str | No
             continue
         if isinstance(data, dict):
             receipts.append(data)
-    cleared = []
-    for receipt in receipts:
-        commit = resolve(str(receipt["cleared"])) if receipt.get("cleared") else None
-        if commit and ancestor(commit, head):
-            cleared.append((str(receipt.get("written_at") or ""), commit))
-    if cleared:
-        return max(cleared)[1]
     integrated = []
     for receipt in receipts:
         for line in receipt.get("commits") or ():
@@ -309,6 +350,42 @@ def default_base(workspace: str | Path, repo: str | Path, head: str) -> str | No
                 integrated.append(commit)
     oldest = [c for c in integrated if all(ancestor(c, o) for o in integrated)]
     return resolve(f"{oldest[0]}^") if oldest else None
+
+
+#: The seconds a case gets when it states no limit of its own (``pytest.mark.timeout``).
+CASE_TIMEOUT_S = 180
+#: The anchor whose definition tells a test of the engine's accuracy harness.
+ACCURACY_TESTS_ANCHOR = "accuracy_tests"
+
+
+def accuracy_tests(repo: str | Path, commit: str, files: Sequence[str]) -> dict[str, str]:
+    """The files among ``files`` that are tests of the engine's accuracy harness at ``commit``.
+
+    Each with its text there. Told by what the file defines (a test class built on the
+    harness: the definition ``tree_anchors`` finds the engine's accuracy tests by), never
+    by where the file is. One search over the named files, then each hit is read once.
+    """
+    anchor = tree_anchors.ANCHORS[ACCURACY_TESTS_ANCHOR]
+    named = [f for f in files if anchor.reads(f)]
+    if not named:
+        return {}
+    literals = [word for literal in anchor.literals for word in ("-e", literal)]
+    listing = git_output(repo, "grep", "-l", "-F", *literals, commit, "--", *named) or ""
+    found = {}
+    for line in listing.splitlines():
+        path = line.partition(":")[2]
+        text = git_output(repo, "show", f"{commit}:{path}") or ""
+        if path in named and anchor.matches(text):
+            found[path] = text
+    return found
+
+
+def cut_at_default(message: str) -> bool:
+    """Whether ``message`` is that of a case cut at :data:`CASE_TIMEOUT_S`, the driver's limit.
+
+    A case with a limit of its own is cut at that one, and its message names it.
+    """
+    return re.search(rf"Timeout\s*\(?>\s*{CASE_TIMEOUT_S}(?:\.0+)?\s*s\b", message) is not None
 
 
 def write_selection(path: Path, lines: Sequence[str]) -> Path:
@@ -324,10 +401,15 @@ def driver_command(
     tree: str | Path,
     selection: str | Path,
     skip: str | Path | None = None,
+    *,
+    collect_only: bool = False,
 ) -> str:
     """The driver's command line over the tests ``selection`` lists, run in ``tree``.
 
-    ``skip`` lists node ids to leave out of the files the selection names.
+    ``skip`` lists node ids to leave out of the files the selection names. A case that
+    states no limit of its own gets :data:`CASE_TIMEOUT_S`. With ``collect_only`` the files are
+    imported and their cases listed, and none runs: a file that does not import or
+    collect is recorded as failing, as when it runs.
     """
     words = [str(DRIVER), "run", "--cache", str(cache), "--repo", str(tree)]
     words += ["--selection", str(selection)]
@@ -335,12 +417,14 @@ def driver_command(
         words += ["--skip", str(skip)]
     return (
         f"{python} {' '.join(shlex.quote(w) for w in words)} "
-        "-- -p no:cacheprovider -rA --timeout=180"
+        f"-- -p no:cacheprovider -rA --timeout={CASE_TIMEOUT_S}"
+        + (" --collect-only" if collect_only else "")
     )
 
 
 __all__ = [
     "CACHE_DIRNAME",
+    "CASE_TIMEOUT_S",
     "DRIVER",
     "CompareReport",
     "Comparison",
@@ -348,7 +432,9 @@ __all__ = [
     "Result",
     "Results",
     "Session",
+    "accuracy_tests",
     "compare",
+    "cut_at_default",
     "default_base",
     "driver_command",
     "head_results",

@@ -1,13 +1,39 @@
 {# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 SPDX-License-Identifier: Apache-2.0 -#}
-## Tag `feature` — one feature on the target
+## Tag `feature`: one behaviour on the target
 
-The target's core is built and its gates pass. Your task adds one feature
-(your task's `ref`, one of `task.yaml`'s `features`), or makes the target
-serve one configuration variant as well. **Every check the target passed
-keeps passing**: with the feature off, the target runs as it did. Your task's
-checks say what the feature must pass. A feature that needs an entry the
-vocabulary lacks blocks as a `vocabulary_gap`, as the core would. **Load the
-`trtllm-modeling-v2-features` skill first**: where the feature lives in the
-engine, what the target must honour for it, and how to prove it from a CPU
-check up to its gate.
+**What it is for.** The one behaviour your card names, on a target whose
+first deployment is being or has been built. With the feature off the
+target runs as it did: every check it passed keeps passing.
+
+**Hand back.** The change, and the smallest test that would fail without
+it: the engine's own test that already turns the feature on, or one case on
+one small input. Say in your receipt, for each thing your card required,
+`verified` (its proof passed) or `configured` (on, not proven); never report
+configured as verified.
+
+**How it is judged.** By your card's check, and then by the deployment's
+session on the loaded model: the options every rank ran, the boot prompts,
+the API, the score, its probes. Build no harness for what the session
+measures, and write your receipt once your check passes. What the engine
+holds a target to, for the feature your card names:
+
+- **A cached prefix** (block reuse, chunked prefill, draft tokens): a
+  context call may start at a cached offset. Positions, rotary phases and
+  attention take each sequence's cached length from the metadata
+  (`num_cached_tokens_per_seq`), and nothing may hinge on "the first time
+  this request is seen".
+- **A drafter** (speculative decoding): the draft layers or the captured
+  hidden states are part of the forward; state written per draft token is
+  committed for the accepted count only. What a drafter must show is
+  accepted tokens per step above 1.0 on the deployment's workload, read from
+  the session's answers: correct text alone shows nothing, since rejection
+  keeps the output right when the drafts are wrong.
+- **A cache dtype**: the forward reads the resolved algorithm from the model
+  configuration, hands the attention op its scales whenever the cache is
+  quantized, and refuses an algorithm it does not implement with `NoTarget`.
+- **An image or audio input**: only the embeddings of the tokens this step
+  computes are fused; part of an image may already be cached.
+- **CUDA graphs**: every per-step value reaches the forward through metadata
+  tensors the engine refreshes in place; a Python scalar computed per step
+  is frozen at its capture-time value.

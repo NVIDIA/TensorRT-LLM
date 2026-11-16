@@ -1,38 +1,44 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Who runs a command: a subprocess here, or a job in a compute session's spool.
+"""Who runs a command: a job in the run's spool, or (outside a run) a subprocess here.
 
-``environment.py`` builds the command line; :func:`select_command_executor` is the one place that
-maps an ``environment.kind`` onto who runs it: ``local`` a subprocess here (:mod:`.commands`),
-``session_spool`` a job in a spool (``spoolctl.py``'s protocol). :class:`SpoolCommandExecutor` is
-the gates' policy over the spool:
+``environment.py`` builds the command line; :func:`select_command_executor` maps the resolved
+environment onto who runs it. Inside a run that is always the run's one spool
+(``spoolctl.py``'s protocol): the watchers of its holders are the only ledger of devices, on one
+host as on a cluster. :class:`SpoolCommandExecutor` is the gates' policy over the spool:
 
+- **A job states its size and its wall**: ``gpus`` or ``nodes``, and the command's deadline.
+  Nothing is sized by a default, so a caller that names no size is refused here.
 - **The deadline counts from the job's start**: time queued behind other work says nothing about
-  the command. A queued wait is bounded by the session's liveness instead, so a dead session
-  cannot hang its caller.
-- **A command given up on is withdrawn** (``cancel/<name>``), so a session that comes back does
-  not run work nobody waits for. A spool whose heartbeat is already stale gets nothing queued.
-- **A lost session is not a failed command**: the result says so in ``infrastructure``, and
-  :meth:`SpoolCommandExecutor.wait_for_session` waits for one to come back before a re-run.
-- **Nor is a cancelled job**: its ``infrastructure`` begins with :data:`CANCELLED`; the gate it
-  ran for has no verdict, and is not re-run at once against whoever cancelled it.
+  the command. A queued wait is bounded by the pool's liveness instead, so a dead session
+  cannot hang its caller; a holder still in the queue is not a dead session.
+- **A command given up on is withdrawn** (``cancel/<name>``), so a watcher that comes back does
+  not run work nobody waits for. A spool whose heartbeat is stale and that no controller is
+  getting a holder for gets nothing queued.
+- **A lost job is not a failed command**: the scheduler re-runs it once; after that the result
+  says so in ``infrastructure`` and is no verdict. Nothing above the scheduler runs it again.
+- **Nor is a cancelled job, or one whose stated ranks reported no origin**: its
+  ``infrastructure`` begins with :data:`CANCELLED`, or says which rank was not heard from.
 - **A long wait is said**: a job waited on for ``spoolctl.WAIT_NOTE_S`` is passed to ``note``
-  (the run's journal), whether queued or running and since when, and why the session holds it.
+  (the run's journal), whether queued or running and since when, and why the watcher holds it.
 """
 
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import itertools
+import json
 import os
+import shlex
 import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping
 
-from . import placement, spoolctl
+from . import pintree, spoolctl
 from .commands import (
     TIMEOUT_RETURNCODE,
     CommandExecutor,
@@ -43,13 +49,14 @@ from .commands import (
 from .environment import RunEnvironment
 from .scheduler import (
     CANCELLED_REASON,
+    NO_ORIGIN_REASON,
     SESSION_LOSS_REASONS,
     STALLED_REASON,
     WATCHER_STALE_S,
     SpoolPaths,
+    holder_coming,
     watcher_age,
 )
-from .sessions import GATE_ROLES
 
 #: How a command's ``infrastructure`` begins when its job was withdrawn through the spool
 #: (by the operator, or by a caller that gave up on it): no verdict, and not a lost session.
@@ -60,13 +67,6 @@ CANCELLED = "the job was cancelled through the spool"
 ACCURACY = 2
 #: Every other check: the feature units, the variants, the proofs, delivery.
 FEATURE = 1
-#: The tune campaign's measurements and candidates: background work, below every job of the
-#: onboarding (a worker's own jobs queue at 0). A negative class never ages (``scheduler``), so a
-#: campaign's job, however long it waits, never ranks ahead of the onboarding's or holds one back.
-PERF = -1
-#: A tuner's own jobs (its tests, micro-benches, A/Bs): below the campaign's measurements, which
-#: run one at a time and hold back every candidate behind the one being measured.
-TUNER = -2
 
 _local = threading.local()
 
@@ -87,9 +87,39 @@ def job_priority(priority: int) -> Iterator[None]:
 
 
 def current_job_priority() -> int:
-    """The class this thread's jobs queue at; the scheduler's 0 by default (never :data:`PERF`)."""
+    """The class this thread's jobs queue at; the scheduler's 0 by default (a worker's own jobs)."""
     priority = getattr(_local, "priority", None)
     return 0 if priority is None else int(priority)
+
+
+#: Under the spool: for each request a process has queued a job for and not yet read, the
+#: job's name (``<request>.json``).
+REQUESTS_DIRNAME = "requests"
+#: A file a command names is part of its request when it is at most this large, and at most
+#: this many of them are read.
+REQUEST_FILE_BYTES = 1 << 20
+REQUEST_FILES = 32
+
+
+def left_in_spool(spool: str | Path) -> list[str]:
+    """The jobs earlier processes queued on ``spool`` and never read, by name.
+
+    Each is still queued, running, or finished with its receipt unread. The request that
+    made one takes it when it is made again (:meth:`SpoolCommandExecutor.execute`).
+    """
+    root, paths, found = Path(spool), SpoolPaths(spool), []
+    for path in sorted((root / REQUESTS_DIRNAME).glob("*.json")):
+        try:
+            name = str(json.loads(path.read_text(encoding="utf-8"))["name"])
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        if (
+            (paths.pending / f"{name}.sh").exists()
+            or (paths.running / f"{name}.sh").exists()
+            or paths.receipt(name).exists()
+        ):
+            found.append(name)
+    return found
 
 
 class SpoolCommandExecutor(CommandExecutor):
@@ -99,31 +129,54 @@ class SpoolCommandExecutor(CommandExecutor):
         self,
         spool: str | Path,
         *,
+        gpus: str | int | None = None,
+        nodes: int = 0,
         poll_s: float = 3.0,
         name_prefix: str = "gate",
-        gpus: str = "all",
-        nodes: int = 1,
         priority: int = 0,
         tree: str | Path | None = None,
-        pool: Sequence[str | Path] = (),
+        pin: str | Path | None = None,
+        ranks: str = "",
+        on_each_node: Callable[[str, int], str] | None = None,
+        once: bool = False,
         note: Callable[[str], None] | None = None,
+        python: str = "python3",
     ) -> None:
         self.root = Path(spool)
-        #: Every spool a command may go to, ``spool`` first.
-        self.pool = [self.root, *(Path(p) for p in pool if Path(p) != self.root)]
-        self._pick_lock = threading.Lock()
+        #: The interpreter on the nodes: what a step of a job of several nodes runs its pin with.
+        self.python = python
         self.poll_s = poll_s
         self.name_prefix = name_prefix
-        # Gang execution reserves every device of each participating node.
-        self.gpus = "all" if nodes > 1 else gpus
-        if nodes < 1:
-            raise ValueError("nodes must be positive")
-        self.nodes = nodes
-        #: The class each job queues at (:data:`ACCURACY`, :data:`FEATURE`, :data:`PERF`).
+        if nodes < 0:
+            raise ValueError("nodes must not be negative")
+        if gpus is None and not nodes:
+            raise ValueError(
+                "a spool job states its size: give gpus (a count, 0 or 'all') or nodes"
+            )
+        #: Whole nodes the job holds; 0 when it states devices instead (on one node).
+        self.nodes = nodes if nodes > 1 or gpus is None else 0
+        #: What each job asks for when it states devices; whole nodes carry no count.
+        self.gpus = None if self.nodes else str(gpus)
+        #: The class each job queues at (:data:`ACCURACY`, :data:`FEATURE`, or 0).
         self.priority = priority
-        #: The checkout a job runs against (its working directory and first ``PYTHONPATH``
-        #: entry); the session refuses a result that imported the package from anywhere else.
+        #: The tree a job runs (its working directory and first ``PYTHONPATH`` entry). A job
+        #: runs a pin: a pinned tree (``Integration.at``) names its pin, any other tree is
+        #: pinned as each job is queued (``spoolctl.tree_header``). The scheduler refuses a
+        #: result that imported the package from anywhere else, or found other libraries.
         self.tree = str(Path(tree).resolve()) if tree else None
+        #: The pin every job runs, given as its file: for a caller that holds a pin and no
+        #: tree of it here (a check of one commit, whose tree is made on the job's node).
+        self.pin = str(pin) if pin else None
+        #: The rank worlds an engine job must hear an origin from (``<role>:<size>,...``).
+        self.ranks = ranks
+        #: For a job of several nodes: the script that runs a command once on each of them
+        #: (``RunEnvironment.on_each_node``). The lead runs a multi-node job's script once.
+        self.on_each_node = on_each_node
+        #: The command is itself the script the lead runs once: it starts its own steps
+        #: across the reserved nodes (a deployment's session).
+        self.once = once
+        if self.nodes > 1 and on_each_node is None and not once:
+            raise ValueError("a job of several nodes needs the environment's step line")
         #: Allowance past a job's own deadline for the session to stop it.
         self.grace_s = 180.0
         #: Where a long wait on a job is said (``spoolctl.wait_for_job``); nowhere when ``None``.
@@ -141,56 +194,6 @@ class SpoolCommandExecutor(CommandExecutor):
             f"{uuid.uuid4().hex[:6]}-{next(self._seq)}"
         )
 
-    def _alive(self, root: Path, now: float | None = None) -> bool:
-        age = watcher_age(root, now)
-        return age is not None and age <= WATCHER_STALE_S
-
-    def session_alive(self) -> bool:
-        """Whether a watcher on any spool of the pool has heart-beat within ``WATCHER_STALE_S``."""
-        return any(self._alive(root) for root in self.pool)
-
-    def _pick(self, job: placement.JobNeeds, now: float | None = None) -> Path:
-        """The live spool of the pool to send a command to; the pool's first when none is live.
-
-        Only the live spools that can take ``job`` now compete
-        (:attr:`placement.SpoolView.pickable`): a session in hand-over, or one ending before the
-        job's wall limit, would park it for a successor that may be hours away. One that starts
-        it at once comes first, then the least loaded; failing all, the least loaded live one.
-        """
-        if len(self.pool) == 1:
-            return self.root
-        now = time.time() if now is None else now
-        live: list[tuple[int, Path]] = []
-        ready: list[tuple[bool, int, Path]] = []
-        for root in self.pool:
-            if not self._alive(root, now):
-                continue
-            paths = SpoolPaths(root)
-            load = sum(1 for _ in paths.pending.glob("*.sh")) + sum(
-                1 for _ in paths.running.glob("*.sh")
-            )
-            live.append((load, root))
-            view = placement.assess(root, job, stale_s=WATCHER_STALE_S, now=now)
-            if view.pickable:
-                # A job already waiting is seen at once; the watcher's free devices
-                # only on its next tick.
-                waiting = any(paths.pending.glob("*.sh"))
-                ready.append((not (view.starts_now and not waiting), load, root))
-        if ready:
-            return min(ready, key=lambda choice: choice[:2])[2]
-        return min(live, key=lambda choice: choice[0])[1] if live else self.root
-
-    def wait_for_session(self, timeout_s: float, *, poll_s: float | None = None) -> bool:
-        """Wait at most ``timeout_s`` for a live watcher in the session pool."""
-        deadline = time.monotonic() + max(0.0, timeout_s)
-        interval = self.poll_s if poll_s is None else poll_s
-        while not self.session_alive():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return False
-            time.sleep(min(interval, remaining))
-        return True
-
     def _withdraw(self, root: Path, name: str) -> str:
         try:
             flag = spoolctl.cancel_job(root, name)
@@ -202,29 +205,158 @@ class SpoolCommandExecutor(CommandExecutor):
         log = SpoolPaths(root).log(name)
         return log.read_text(encoding="utf-8", errors="replace") if log.exists() else ""
 
+    def _tree_fields(self, name: str, cwd: str | None) -> tuple[dict[str, str], str | None]:
+        """The header field for the tree a job runs, and the directory its script still enters.
+
+        A job runs a pin: the one this executor was given, else the tree's, taken now
+        (``spoolctl.tree_header``). The pin's tree is then the job's working directory, so a
+        command that names the tree itself as its directory enters nothing, and one that
+        names a directory inside the tree enters that directory of the pin's tree, by its
+        path from the tree's top: never the tree that moves on. A command that names a
+        directory outside the tree, or a tree nothing can pin, states no tree, as before.
+        """
+        inside: str | None = None  # the command's directory, from the tree's top
+        if self.tree and not cwd:
+            inside = ""
+        elif self.tree and cwd:
+            real = os.path.realpath(cwd)
+            if real == self.tree:
+                inside = ""
+            elif real.startswith(self.tree + os.sep):
+                inside = os.path.relpath(real, self.tree)
+        if self.pin:
+            fields = {"pin": self.pin}
+        elif inside is not None:
+            fields = spoolctl.tree_header(self.tree, name)
+            if cwd and "pin" not in fields:
+                fields = {}
+        else:
+            fields = {}
+        if fields.get("pin") and inside is not None:
+            return fields, (inside or None)
+        return fields, cwd
+
+    # ----------------------------------------------- one request, one job
+    def _request(self, header: Mapping[str, Any], spec: CommandSpec, cwd: str | None) -> str:
+        """What a job would do, as one digest: the identity a job in the spool is adopted by.
+
+        Its size, owner, pin, ranks, directory, command and environment, and the content
+        of each small file its command names (a session's spec, a test selection): a job
+        that would read other inputs is another request. Not its name, nor its token.
+        """
+        files: dict[str, str] = {}
+        try:
+            words = shlex.split(spec.rendered)
+        except ValueError:
+            words = spec.rendered.split()
+        for word in words:
+            # As a shell writes a path: after an option's `=`, before a `;` or a redirect.
+            word = (word.rpartition("=")[2] if word.startswith("-") else word).strip(";&|()<>")
+            if len(files) >= REQUEST_FILES or not os.path.isabs(word):
+                continue
+            try:
+                if os.path.isfile(word) and os.path.getsize(word) <= REQUEST_FILE_BYTES:
+                    files[word] = hashlib.sha256(Path(word).read_bytes()).hexdigest()
+            except OSError:
+                continue
+        said = {k: v for k, v in header.items() if k != "token" and v is not None}
+        payload = [said, spec.rendered, cwd, dict(spec.env or {}), files]
+        text = json.dumps(payload, sort_keys=True, default=str)
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()[:24]
+
+    def _adoptable(self, root: Path, request: str) -> tuple[str, str] | None:
+        """The job an earlier process queued for ``request`` and never read: its name and token.
+
+        A process that queues a job leaves its name under the request until it has read the
+        job's result. One that dies meanwhile leaves the job in the spool with nobody
+        waiting: queued, running, or finished with its receipt unread. The next process to
+        make the same request takes that job, and queues no second one. A name whose job
+        is nowhere in the spool any more is forgotten.
+        """
+        path = root / REQUESTS_DIRNAME / f"{request}.json"
+        try:
+            held = json.loads(path.read_text(encoding="utf-8"))
+            name, token = str(held["name"]), str(held["token"])
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+        paths = SpoolPaths(root)
+        there = (
+            (paths.pending / f"{name}.sh").exists()
+            or (paths.running / f"{name}.sh").exists()
+            or paths.receipt(name).exists()
+        )
+        if there:
+            return name, token
+        path.unlink(missing_ok=True)
+        return None
+
+    def _remember(self, root: Path, request: str, name: str, token: str) -> None:
+        """Leave ``name`` under ``request`` until its result is read (:meth:`_adoptable`)."""
+        path = root / REQUESTS_DIRNAME / f"{request}.json"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"name": name, "token": token, "at": time.time()}))
+        except OSError:
+            pass  # a job nobody can adopt is queued again by a later process, as before
+
     def execute(self, spec: CommandSpec) -> CommandResult:
         name = self._name()
         token = uuid.uuid4().hex
         submitted = time.time()
+        root = self.root
+        wall = int(spec.timeout_s) if spec.timeout_s and spec.timeout_s > 0 else 0
+        if not wall and self.gpus != "0":
+            raise ValueError(
+                f"a job that holds devices states a wall: give the command of {name} a timeout"
+            )
+        tree, cwd = self._tree_fields(name, spec.cwd)
         header = {
             "gpus": self.gpus,
-            "nodes": self.nodes if self.nodes > 1 else None,
-            "wall": int(spec.timeout_s) if spec.timeout_s and spec.timeout_s > 0 else None,
+            "nodes": self.nodes or None,
+            "wall": wall,
             "owner": self.name_prefix,
             "token": token,
-            "tree": self.tree if self.tree and not spec.cwd else None,
+            **tree,
             "priority": self.priority or None,
+            "ranks": self.ranks or None,
         }
-        script = spoolctl.render_job(spec.rendered, header=header, cwd=spec.cwd, env=spec.env)
-        with self._pick_lock:
-            root = self._pick(placement.JobNeeds.from_script(name, script), submitted)
-            age = watcher_age(root, submitted)
-            if age is None or age <= WATCHER_STALE_S:
-                root.mkdir(parents=True, exist_ok=True)
-                spoolctl.queue_job(
-                    root, name, script, owner=self.name_prefix, require_watcher=False
+        request = self._request(header, spec, cwd)
+        adopted = self._adoptable(root, request)
+        if adopted is not None:
+            # A job of this very request is in the spool, left by a process that is gone
+            # or still waiting for it: it is waited for here, and none is queued beside it.
+            name, token = adopted
+            if self.note is not None:
+                self.note(
+                    f"{name} on {root} was queued for this request before: it is adopted, "
+                    "not queued a second time"
                 )
-        if age is not None and age > WATCHER_STALE_S:
+            return self._result(root, name, token, spec, submitted, request)
+        command = spec.rendered
+        if self.nodes > 1 and not self.once:
+            # The lead runs this script once; the command itself runs once on each node.
+            inner = SpoolPaths(root).jobs / name / "node.sh"
+            inner.parent.mkdir(parents=True, exist_ok=True)
+            on_node = f"bash {shlex.quote(str(inner))}"
+            if tree.get("pin"):
+                # Each node makes (or finds) the pin's tree and checks its libraries itself.
+                record = SpoolPaths(root).tree_log(name)
+                step = pintree.step_argv(tree["pin"], name, record, self.python)
+                on_node = f"{shlex.join(step)} {on_node}"
+            else:
+                cwd = cwd or self.tree
+            inner.write_text(spoolctl.render_job(command, cwd=cwd, env=spec.env), encoding="utf-8")
+            command = self.on_each_node(on_node, self.nodes)
+            script = spoolctl.render_job(command, header=header)
+        else:
+            script = spoolctl.render_job(command, header=header, cwd=cwd, env=spec.env)
+        age = watcher_age(root, submitted)
+        dead = age is not None and age > WATCHER_STALE_S and not holder_coming(root, submitted)
+        if not dead:
+            root.mkdir(parents=True, exist_ok=True)
+            spoolctl.queue_job(root, name, script, owner=self.name_prefix, require_watcher=False)
+            self._remember(root, request, name, token)
+        else:
             reason = (
                 f"the session watching {root} stopped heart-beating {age:.0f}s ago; "
                 f"nothing was queued"
@@ -235,6 +367,24 @@ class SpoolCommandExecutor(CommandExecutor):
                 timed_out=True,
                 infrastructure=reason,
             )
+        return self._result(root, name, token, spec, submitted, request)
+
+    def _result(
+        self, root: Path, name: str, token: str, spec: CommandSpec, submitted: float, request: str
+    ) -> CommandResult:
+        """Wait for job ``name`` and read its result; the request then has no job to adopt.
+
+        A wait that is cut (the process is stopped or dies) leaves the request as it is:
+        the job is still in the spool, and the next process to ask takes it.
+        """
+        result = self._wait(root, name, token, spec, submitted)
+        # Read, or given up and withdrawn: the next process to ask queues its own.
+        (root / REQUESTS_DIRNAME / f"{request}.json").unlink(missing_ok=True)
+        return result
+
+    def _wait(
+        self, root: Path, name: str, token: str, spec: CommandSpec, submitted: float
+    ) -> CommandResult:
         try:
             record = spoolctl.wait_for_job(
                 root,
@@ -264,6 +414,8 @@ class SpoolCommandExecutor(CommandExecutor):
                 f"the session that ran it stopped heart-beating and the job was closed "
                 f"out as {record['reason']}: {record.get('detail') or 'no detail recorded'}"
             )
+        elif record.get("reason") == NO_ORIGIN_REASON:
+            lost = f"no result: {record.get('detail') or 'a stated rank reported no origin'}"
         elif record.get("reason") == CANCELLED_REASON:
             cancelled = f"{CANCELLED}: {record.get('detail') or 'no detail recorded'}"
         return CommandResult(
@@ -281,46 +433,51 @@ class SpoolCommandExecutor(CommandExecutor):
 def select_command_executor(
     environment: RunEnvironment,
     *,
+    gpus: str | int | None = None,
+    nodes: int = 0,
     name_prefix: str = "gate",
     tree: Path | str | None = None,
-    gpus: str = "all",
-    nodes: int = 1,
+    pin: Path | str | None = None,
     priority: int = 0,
+    ranks: str = "",
     note: Callable[[str], None] | None = None,
+    once: bool = False,
 ) -> CommandExecutor:
-    """The executor this run's commands go through.
+    """The executor this run's commands go through: the run's one spool.
 
-    On a spool, ``tree`` (the checkout under test) is every job's working directory and first
-    ``PYTHONPATH`` entry, and ``gpus`` (a count, or ``all``) what each job asks for. The spools of
-    every session whose role takes gate jobs (:data:`sessions.GATE_ROLES`) form a pool beside
-    ``environment.spool``, and each command goes to the live one that would start it soonest.
-    A long wait on a job is said to ``note``.
+    The caller states the size of each job: ``gpus`` (a count, 0 for a job that holds no device,
+    or ``all``) or ``nodes`` (whole nodes; more than one is run once by a holder's lead, the
+    command once on each node through the environment's step line; with ``once`` the command
+    is itself the script the lead runs, and starts its own steps). On the spool, ``tree`` (the
+    tree under test, pinned) is every job's working directory and first ``PYTHONPATH`` entry;
+    a caller that holds the pin itself gives its file as ``pin``. A long wait on a job is said
+    to ``note``.
+
+    Only an environment that names no spool runs the command in this process: ``kind: local``
+    resolved outside a run (a gate started by hand), where no watcher holds the devices.
     """
-    if environment.kind == "session_spool" and environment.spool:
-        pool = [session.spool for session in environment.sessions if session.role in GATE_ROLES]
+    if environment.spool:
         return SpoolCommandExecutor(
             environment.spool,
             name_prefix=name_prefix,
             tree=tree,
+            pin=pin,
             gpus=gpus,
             nodes=nodes,
             priority=priority,
-            pool=pool,
+            ranks=ranks,
+            on_each_node=environment.on_each_node if nodes > 1 and not once else None,
+            once=once,
             note=note,
+            python=environment.python,
         )
+    if environment.kind != "local":
+        raise ValueError(f"environment.kind {environment.kind!r} names no spool to submit to")
     if nodes > 1:
-        raise ValueError("multi-node commands require session_spool gang execution")
+        raise ValueError(
+            "a command on several nodes needs a holder of several nodes, not this host"
+        )
     return LocalCommandExecutor()
-
-
-def wait_for_session(executor: CommandExecutor | None, timeout_s: float) -> bool:
-    """Wait up to ``timeout_s`` for the session ``executor`` submits to to heart-beat again.
-
-    False at once for an executor with no session behind it: nothing there can come back.
-    """
-    if isinstance(executor, SpoolCommandExecutor):
-        return executor.wait_for_session(timeout_s)
-    return False
 
 
 def shell_runner_for(executor: CommandExecutor, *, default_timeout: int = 1800) -> Any:
@@ -340,13 +497,10 @@ __all__ = [
     "ACCURACY",
     "CANCELLED",
     "FEATURE",
-    "PERF",
     "SESSION_LOSS_REASONS",
     "SpoolCommandExecutor",
-    "TUNER",
     "current_job_priority",
     "job_priority",
     "select_command_executor",
     "shell_runner_for",
-    "wait_for_session",
 ]

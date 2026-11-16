@@ -7,8 +7,8 @@
 The client half of :mod:`scheduler`: standard-library only and runnable by path, from any shell
 with a ``python3`` (``trtllm-modeling-v2 spool`` is the same program)::
 
-    spoolctl.py submit [--gpus N|all] [--wall 2h] [--priority P] [--tree DIR] <name> <command...>  # run, wait
-    spoolctl.py launch [--gpus N|all] [--wall 2h] [--priority P] [--tree DIR] <name> <command...>  # queue
+    spoolctl.py submit --gpus N|all --wall 2h [--priority P] [--tree DIR] <name> <command...>  # run, wait
+    spoolctl.py launch --gpus N|all --wall 2h [--priority P] [--tree DIR] <name> <command...>  # queue
     spoolctl.py wait [--session-wait 15m] <name>
     spoolctl.py status [--json]
     spoolctl.py cancel <name>
@@ -16,6 +16,9 @@ with a ``python3`` (``trtllm-modeling-v2 spool`` is the same program)::
 The spool is ``--spool`` (before or after the action), else ``$SPOOL``, else ``$MV2FLOW_SPOOL``.
 The owner prefix is ``--owner``, else ``$MV2FLOW_JOB_PREFIX``; when one is set a job name must
 start with it, and a name whose previous result belongs to another owner is refused.
+
+A job states its size (``--gpus``, or ``--nodes`` for whole nodes) and its wall (``--wall``):
+one that does not is refused here with the line the scheduler would refuse it with.
 """
 
 from __future__ import annotations
@@ -32,10 +35,12 @@ from typing import Callable, Mapping
 
 try:
     from .. import files as _files
+    from . import pintree as _pintree
     from . import scheduler as _sched
 except ImportError:  # run by path: the sibling module is on sys.path[0]
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     import files as _files
+    import pintree as _pintree  # type: ignore[no-redef]
     import scheduler as _sched  # type: ignore[no-redef]
 
 #: Exit code when the session is not there to run the job.
@@ -107,7 +112,7 @@ def queue_job(
     paths = _sched.SpoolPaths(spool)
     if not paths.root.is_dir():
         raise SpoolError(f"spool {paths.root} does not exist", EXIT_NO_SESSION)
-    if require_watcher:
+    if require_watcher and not _sched.holder_coming(paths.root):
         age = _sched.watcher_age(paths.root)
         if age is None:
             raise SpoolError(
@@ -152,9 +157,10 @@ def wait_for_job(
 
     ``timeout_s`` counts from the job's START, and ``grace_s`` past it is the session's to stop the
     job and write the receipt. A spool no watcher ever heart-beat on fails at once, or
-    ``unwatched_s`` after submission (a session still starting). A job re-run after a lost
-    allocation is waited for through its re-run. Once the job has waited :data:`WAIT_NOTE_S`, and
-    then at most that often, ``note`` gets :func:`waiting_line`.
+    ``unwatched_s`` after submission (a session still starting); not while the run's controller
+    is getting it a holder (:func:`scheduler.holder_coming`), whose queue wait is not the job's.
+    A job re-run after a lost allocation is waited for through its re-run. Once the job has
+    waited :data:`WAIT_NOTE_S`, and then at most that often, ``note`` gets :func:`waiting_line`.
 
     Raises :class:`SpoolError`, with :data:`EXIT_NO_SESSION` when the session, not the job, ended
     the wait: the watchers stopped heart-beating for ``stale_s``, or none ever watched.
@@ -176,19 +182,21 @@ def wait_for_job(
         meta = _files.read_json(paths.running / f"{name}.json") or {}
         started = float(meta["started_epoch"]) if meta.get("started_epoch") else None
         age = _sched.watcher_age(paths.root, now)
-        if started is not None:
-            if timeout_s and now > started + timeout_s + grace_s:
-                raise SpoolError(
-                    f"job {name!r} ran past its {timeout_s:g}s deadline (counted from its "
-                    f"start) and the session did not close it",
-                    _sched.RC_WALL_LIMIT,
-                )
+        if started is not None and timeout_s and now > started + timeout_s + grace_s:
+            raise SpoolError(
+                f"job {name!r} ran past its {timeout_s:g}s deadline (counted from its "
+                f"start) and the session did not close it",
+                _sched.RC_WALL_LIMIT,
+            )
+        coming = _sched.holder_coming(paths.root, now)
+        if started is not None or coming:
+            pass
         elif age is None and (unwatched_s is None or now > submitted + unwatched_s):
             raise SpoolError(
                 f"nothing started job {name!r} and no session watches {paths.root}",
                 EXIT_NO_SESSION,
             )
-        if age is not None and age > stale_s:
+        if age is not None and age > stale_s and not coming:
             raise SpoolError(
                 f"the session watching {paths.root} stopped heart-beating {age:.0f}s ago",
                 EXIT_NO_SESSION,
@@ -241,8 +249,8 @@ def left_in_spool(spool: str | Path, name: str) -> str:
     for where in ("running", "pending"):
         if (paths.root / where / f"{name}.sh").exists():
             return (
-                f"{name} is still in {where}/: a session that starts on this spool (the "
-                f"allocation requeued, or a successor) runs it, or closes it out node_lost if it "
+                f"{name} is still in {where}/: a watcher that starts on this spool (the "
+                f"allocation requeued, or a later holder) runs it, or closes it out node_lost if it "
                 f"may not run again; `spoolctl.py wait {name}` returns that. Submitting it "
                 f"again would run it twice"
             )
@@ -288,9 +296,10 @@ def format_status(data: Mapping[str, object]) -> str:
         lines.append("  no watcher has ever heart-beat here")
     for record in watchers:
         stale = " STALE" if float(record.get("age_s", 0)) > WATCHER_STALE_S else ""
-        handover = record.get("handover") or {}
+        held = record.get("held") or {}
         lines.append(
-            f"  watcher {record.get('watcher')} session={record.get('session') or '-'} "
+            f"  {'lead' if record.get('lead') else 'watcher'} {record.get('watcher')} "
+            f"holder={record.get('holder') or '-'} "
             f"job={record.get('slurm_job')} heartbeat {record.get('age_s')}s ago{stale}; "
             f"devices {','.join(record.get('devices') or []) or '-'} "
             f"free {','.join(record.get('free') or []) or '-'}"
@@ -300,10 +309,12 @@ def format_status(data: Mapping[str, object]) -> str:
                 else ""
             )
             + (
-                f" in hand-over, successor {handover.get('successor') or 'none yet'}"
-                if handover
+                " memory not back on "
+                + ", ".join(f"{d} ({e.get('used_mib')} MiB)" for d, e in sorted(held.items()))
+                if held
                 else ""
             )
+            + (f"; retiring: {record['retiring']}" if record.get("retiring") else "")
         )
         for job in record.get("running") or []:
             lines.append(
@@ -334,24 +345,34 @@ def _add_spool_option(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_job_options(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--gpus", help="device count, or 'all' for the whole node")
+    parser.add_argument(
+        "--gpus", help="device count, 0 for none, or 'all' for the whole node (or give --nodes)"
+    )
     parser.add_argument(
         "--nodes",
         type=int,
-        help="whole nodes the job holds (a session of that many nodes); each runs the command",
+        help="whole nodes the job holds (a holder of that many nodes); its lead runs the "
+        "command once, and the command starts its ranks across $MV2FLOW_JOB_HOSTS",
     )
-    parser.add_argument("--wall", help="wall limit from start (7200, 90m, 2h, HH:MM:SS); 0 = none")
+    parser.add_argument(
+        "--wall", help="wall limit from start (7200, 90m, 2h, HH:MM:SS); 0 states none. Required"
+    )
+    parser.add_argument(
+        "--ranks",
+        help="the rank worlds an engine job must hear an origin from: <role>:<size>[,...]",
+    )
     parser.add_argument(
         "--priority",
         type=int,
-        help="class the job queues at (default 0); a higher one starts first, a negative one is "
-        "background work that never ages",
+        help="class the job queues at (default 0); a higher one starts first",
     )
     parser.add_argument("--owner", help="requester prefix (default $MV2FLOW_JOB_PREFIX)")
     parser.add_argument(
         "--tree",
-        help="checkout to run against: working directory AND first PYTHONPATH entry; the "
-        "receipt is refused if any process imported tensorrt_llm from elsewhere",
+        help="the tree to run: it is pinned now (what it holds, uncommitted edits included, "
+        "and the build record of its libraries), and the job runs that pin as its working "
+        "directory and first PYTHONPATH entry, never the tree as it moves on; a job whose "
+        "processes imported tensorrt_llm from elsewhere, or found other libraries, has no result",
     )
     parser.add_argument(
         "--session-wait",
@@ -389,20 +410,50 @@ def build_parser() -> argparse.ArgumentParser:
 def job_header(args: argparse.Namespace, owner: str | None, token: str) -> dict[str, object]:
     """The ``#spool:`` fields one submission's options ask for."""
     header: dict[str, object] = {}
+    nodes = getattr(args, "nodes", None)
+    if args.gpus is None and not nodes:
+        raise SpoolError(f"job {args.name!r} {_sched.SIZE_MISSING}")
+    if args.wall is None:
+        raise SpoolError(f"job {args.name!r} {_sched.WALL_MISSING}")
     if args.gpus is not None:
         header["gpus"] = args.gpus
-    if getattr(args, "nodes", None) and args.nodes > 1:
-        header["nodes"] = args.nodes
-    if args.wall is not None:
+    if nodes:
+        header["nodes"] = nodes
+    try:
         header["wall"] = int(_sched.parse_duration(args.wall))
+    except ValueError as exc:
+        raise SpoolError(f"--wall: {exc}") from exc
+    if getattr(args, "ranks", None):
+        header["ranks"] = args.ranks
     if getattr(args, "priority", None):
         header["priority"] = args.priority
     if owner:
         header["owner"] = owner
     if args.tree:
-        header["tree"] = os.path.abspath(args.tree)
+        header.update(tree_header(os.path.abspath(args.tree), args.name))
     header["token"] = token
     return header
+
+
+def tree_header(tree: str, name: str = "") -> dict[str, str]:
+    """The header field for a job that runs ``tree``: its pin, made now.
+
+    ``pin=<pin file>`` when the tree's run keeps trees (``pintree.pin_tree``): the job then
+    runs what the tree holds at this moment. ``tree=<dir>`` only for a directory nothing can
+    pin, which the job runs as it is.
+    """
+    try:
+        pinned = _pintree.pin_tree(tree, name)
+    except _pintree.PinError as exc:
+        raise SpoolError(f"--tree {tree} could not be pinned: {exc}") from exc
+    return {"pin": pinned} if pinned else {"tree": tree}
+
+
+def pinned_command(command: str, tree: str, header: Mapping[str, object]) -> str:
+    """``command`` with the moving tree's path replaced by where its pin will be, when known."""
+    pin = _files.read_json(Path(str(header["pin"]))) if header.get("pin") else None
+    where = str((pin or {}).get("tree") or "")
+    return command.replace(tree, where) if where else command
 
 
 def _submit(args: argparse.Namespace, *, wait: bool) -> int:
@@ -414,12 +465,18 @@ def _submit(args: argparse.Namespace, *, wait: bool) -> int:
     token = uuid.uuid4().hex
     if args.tree and not os.path.isdir(args.tree):
         raise SpoolError(f"--tree {args.tree} is not a directory")
-    cwd = (
-        (os.path.abspath(args.tree) if args.tree else None)
-        or os.environ.get("MV2FLOW_REPO")
-        or os.getcwd()
-    )
-    script = render_job(command, header=job_header(args, owner, token), cwd=cwd)
+    header = job_header(args, owner, token)
+    if header.get("pin"):
+        # The pin's tree is the working directory; the tree it was taken from moves on.
+        cwd = None
+        command = pinned_command(command, os.path.abspath(args.tree), header)
+    else:
+        cwd = (
+            (os.path.abspath(args.tree) if args.tree else None)
+            or os.environ.get("MV2FLOW_REPO")
+            or os.getcwd()
+        )
+    script = render_job(command, header=header, cwd=cwd)
     queue_job(spool, args.name, script, owner=owner)
     paths = _sched.SpoolPaths(spool)
     if not wait:

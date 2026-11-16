@@ -18,7 +18,10 @@ line, to leave out of those files: they run nowhere and record nothing.
 A session writes one JSON record to ``<cache>/sessions/``: the tree's commit
 and whether its tracked files were clean, the environment and its digest, the
 tests each file collected, and per test its outcome, duration and failure
-message.
+message. ``clean`` is ``null`` when git gave no answer: unknown, not dirty. A
+tree a run pinned (it holds the pin's marker for the commit it is at) says so
+in ``pinned``: it was made from that commit, read-only, and checked when its
+job started, so its results count whatever git could say here.
 """
 
 from __future__ import annotations
@@ -37,6 +40,9 @@ from datetime import datetime, timezone
 #: Bumped when a record's meaning changes; the reader skips other versions.
 RECORD_VERSION = 1
 SESSIONS_DIRNAME = "sessions"
+#: At the root of a tree a run pinned: the commit it was made from
+#: (``infra/compute/pintree.py``, the same name).
+PIN_MARKER = ".mv2flow-pin"
 #: Outcomes, the worse the higher: a test's is its worst phase's.
 SEVERITY = {None: 0, "passed": 1, "skipped": 2, "xfailed": 2, "xpassed": 3, "failed": 4, "error": 5}
 
@@ -141,10 +147,30 @@ def _git(repo: str, *args: str) -> str | None:
     return done.stdout if done.returncode == 0 else None
 
 
+def pinned_commit(repo: str) -> str | None:
+    """The commit a pinned tree was made from, by its marker; ``None`` for any other tree."""
+    try:
+        with open(os.path.join(repo, PIN_MARKER), encoding="utf-8") as handle:
+            marker = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    commit = marker.get("commit") if isinstance(marker, dict) else None
+    return str(commit) if commit else None
+
+
 def tree_state(repo: str) -> tuple[str | None, bool | None]:
-    """The tree's commit and whether its tracked files match it (None: git cannot say)."""
+    """The tree's commit and whether its tracked files match it (None: git cannot say).
+
+    A file's change time is left out of the comparison. A pinned tree is made read-only
+    after its index is written, which moves that time for every file: git would then read
+    every tracked file again, through its filters, on each question (half a minute for
+    the engine's tree, and more on a busy node), and the question has a limit. An edit
+    still shows by the file's size, modification time or inode.
+    """
     head = (_git(repo, "rev-parse", "--verify", "HEAD") or "").strip() or None
-    status = _git(repo, "status", "--porcelain", "--untracked-files=no")
+    status = _git(
+        repo, "-c", "core.trustctime=false", "status", "--porcelain", "--untracked-files=no"
+    )
     return head, (None if status is None else not status.strip())
 
 
@@ -262,11 +288,15 @@ def session(args: argparse.Namespace) -> int:
     """One pytest process, recorded: how each test it ran ended."""
     repo = os.path.abspath(args.repo)
     commit, clean = tree_state(repo)
+    # A pinned tree names its commit itself: where git gave no answer, that one stands.
+    marker = pinned_commit(repo)
+    commit = commit or marker
     env = environment()
     record = {
         "version": RECORD_VERSION,
         "commit": commit,
         "clean": clean,
+        "pinned": bool(marker) and marker == commit,
         "python": sys.executable,
         "argv": list(args.pytest_args),
         "started": _now(),

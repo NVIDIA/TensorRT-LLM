@@ -7,9 +7,11 @@ import argparse
 import importlib
 import logging
 import os
+import signal
 import sys
+import threading
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Sequence
 
 from .agents.turns import DEFAULT_ROLE_TURN_TIMEOUTS
 from .infra.git import (
@@ -23,8 +25,14 @@ from .infra.git import (
 )
 from .infra.monitor.heartbeat import ORCHESTRATOR_HEARTBEAT_S, start_orchestrator_heartbeat
 from .run.records.state import STATE_FILENAME
-from .run.workflow import DEFAULT_EVENT_WINDOW_S, DEFAULT_MAX_ATTEMPTS, DEFAULT_REVISION_CAP
+from .run.workflow import DEFAULT_MAX_ATTEMPTS
 from .spec.task_schema import TaskSchemaError, load_and_validate_task_yaml
+
+#: The run ended with everything left blocked: answer what is asked (`resolve`), then run it again.
+EXIT_ESCALATED = 76
+#: The start did not start (its preflight, its first holder or its agents): as for a spec
+#: that does not load.
+EXIT_NOT_STARTED = 2
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -36,7 +44,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         prog="trtllm-modeling-v2",
         description=(
             "Bring one checkpoint to a gated modeling_v2 target: "
-            "preflight -> execution stage -> deliver."
+            "preflight -> execution stage -> deliver. Exit 0 when the run closed, 76 when "
+            "everything left is blocked and waits for an answer (`resolve`, then the same command), "
+            "75 when the controller stopped for the limit of the job it runs in (the same command "
+            "goes on)."
         ),
     )
     source = parser.add_mutually_exclusive_group(required=True)
@@ -67,13 +78,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--goal",
         default=None,
         help="With --checkpoint: the features, members and workload in one line, e.g. "
-        '"mtp disagg@tp1/tp2 tp1 tep4 dep4 isl=8192 osl=1024 tune" (spec/derive.py). '
+        '"mtp disagg@tp1/tp2 tp1 tep4 dep4 isl=8192 osl=1024" (spec/derive.py). '
         "Features the checkpoint carries are built unless named `-<feature>`.",
     )
     parser.add_argument(
         "--workspace",
         type=Path,
-        default=Path("workspace/trtllm-modeling-v2"),
+        default=Path("workspace/trtllm-modeling-v2").absolute(),
         help="Workspace directory for the run's shared state (task.yaml, "
         "plan.md, vocabulary.yaml,journal.md, reports/). "
         "Created on demand.",
@@ -82,45 +93,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--max-parallel-tasks",
         type=int,
         default=DEFAULT_MAX_PARALLEL_TASKS,
-        help="How many agents work at once, task turns and the planner's "
-        "alike; task turns leave one of them for the planner. A task keeps "
-        "its place until its checks are in; checks take no agent. "
+        help="How many agent turns run at once: the run's one counter. A check takes "
+        "no agent, and devices are the pool's to hand out, never counted here. "
         f"Default {DEFAULT_MAX_PARALLEL_TASKS}.",
-    )
-    parser.add_argument(
-        "--revision-cap",
-        type=int,
-        default=DEFAULT_REVISION_CAP,
-        help="How many graph revisions the planner may make without progress (a task "
-        "done, a change landed on the target or a contract check turning green) before "
-        f"the run closes planner-stalled. Default {DEFAULT_REVISION_CAP}.",
     )
     parser.add_argument(
         "--max-attempts",
         type=int,
         default=DEFAULT_MAX_ATTEMPTS,
-        help="How many worker runs one task gets, its first and the planner's retries: a "
-        "revision that retries a task past them is refused, and the planner reshapes the work "
-        f"instead. Default {DEFAULT_MAX_ATTEMPTS}.",
-    )
-    parser.add_argument(
-        "--event-window",
-        dest="event_window_s",
-        type=float,
-        default=DEFAULT_EVENT_WINDOW_S,
-        metavar="SECONDS",
-        help="While work is in flight, batch ordinary reports, green finishes and nonblocking "
-        "task failures for this many seconds. Failures blocking pending hard dependencies, "
-        "operator messages, failed re-checks, or an idle graph wake the planner at once. "
-        f"Default {DEFAULT_EVENT_WINDOW_S:g}.",
-    )
-    parser.add_argument(
-        "--no-primers",
-        dest="primers",
-        action="store_false",
-        help="Start every planner, kernel writer and assembler turn afresh instead of as a fork "
-        "of one briefing session per role, which read what all of them read first "
-        "(run/startup/primers.py; a turn that cannot fork reads the session's summary).",
+        help="How many attempts one task gets before it is blocked and asks the session "
+        "that watches the run; `resolve retry` adds one. A turn the "
+        f"controller's own limit cut spends none. Default {DEFAULT_MAX_ATTEMPTS}.",
     )
     parser.add_argument(
         "--clean",
@@ -137,40 +120,6 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Run preflight, resolve the environment, print the plan of "
         "record, and stop before the first agent turn. The fastest way to "
         "find out whether this host can host this run.",
-    )
-    parser.add_argument(
-        "--wait-for-spool",
-        type=float,
-        default=0.0,
-        metavar="MINUTES",
-        help="With a session_spool environment, wait up to MINUTES for the "
-        "spool to appear (its compute session is still importing the image) "
-        "instead of failing validation at once.",
-    )
-    parser.add_argument(
-        "--skip-substrate-gate",
-        action="store_true",
-        help="Skip preflight's substrate gate — the cold start that proves "
-        "this host generates a token on the STOCK modeling path under this "
-        "run's runtime block. It is the single highest-value preflight "
-        "check and skipping it means the three failures it catches "
-        "(MPI_ERR_SPAWN, kvCache sizing, NVRTC's missing cuda.h) resurface "
-        "hours later inside an agent's turn, reading as target defects. "
-        "A resumed run already skips the gate when its last pass "
-        "(gates/substrate/pass.json) is under 12 h old in the same environment; "
-        "use this only when the gate itself is what is broken. It is "
-        "NOT the answer to an architecture the stock path does not know — "
-        "declare `environment.substrate_checkpoint` for that, which keeps "
-        "the two checks that do not depend on the checkpoint.",
-    )
-    parser.add_argument(
-        "--stage",
-        dest="entry_stage",
-        choices=["", "tune"],
-        default="",
-        help="Start at a later stage. `tune` runs the performance stage (ground truth, "
-        "tuner candidates) on an already-onboarded target, or re-enters a "
-        "delivered run at it. Same as the `tune` subcommand. Needs a `perf:` block.",
     )
     parser.add_argument(
         "--agent-turn-timeout",
@@ -258,26 +207,53 @@ def _derive_spec(
     Raises :class:`~.spec.derive.DeriveError` with every open question of a
     new derivation: the spec and its report are written first, to be answered in.
     """
-    import yaml
-
     from .spec import derive as derive_mod
 
     path = workspace / derive_mod.SPEC_FILENAME
     if path.is_file() and not clean:
         print(f"→ {path}: the spec derived before, as it stands; --clean derives it again")
         return path
-    site_data = yaml.safe_load(site.read_text(encoding="utf-8")) or {}
+    site_data = derive_mod.read_site(site)
     derivation = derive_mod.derive_spec(
         checkpoint, site_data, derive_mod.parse_goal(goal), site_path=site
     )
-    derive_mod.write_derivation(workspace, derivation)
+    derive_mod.write_derivation(workspace, derivation, derive_mod.KEPT)
     print(f"→ derived {path} (see {workspace / derive_mod.REPORT_FILENAME})")
+    for where, value, source in derivation.unstated:
+        if where == "environment.kind":
+            print(f"→ environment: {value} ({source}); written into the spec")
     if derivation.questions:
         raise derive_mod.DeriveError(
             f"{path} leaves {len(derivation.questions)} question(s) open; answer them in it and "
             "run the same command again:\n  - " + "\n  - ".join(derivation.questions)
         )
     return path
+
+
+#: The options of a run that name a path; a subcommand's ``--workspace`` is the same one.
+PATH_OPTIONS = ("--task", "--checkpoint", "--site", "--workspace")
+
+
+def _whole(argv: Sequence[str], options: Sequence[str]) -> list[str]:
+    """``argv`` with the path each of ``options`` names made absolute.
+
+    Once, where the command line is read: a job runs in its pin's tree on a node, a record
+    is read by another process, and the command that continues a run is said to whoever
+    reads its log. None of them may carry a path relative to where a person stood.
+    ``--option path`` and ``--option=path``, the option shortened as argparse takes it.
+    """
+    out: list[str] = []
+    path_next = False
+    for word in argv:
+        name, equals, value = word.partition("=")
+        named = len(name) > 2 and any(option.startswith(name) for option in options)
+        if path_next:
+            word = os.path.abspath(word)
+        elif named and equals:
+            word = f"{name}={os.path.abspath(value)}"
+        path_next = named and not equals and not path_next
+        out.append(word)
+    return out
 
 
 def _lazy_main(module: str) -> Callable[[list[str]], int]:
@@ -289,57 +265,29 @@ def _lazy_main(module: str) -> Callable[[list[str]], int]:
     return run
 
 
-def _metrics(argv: list[str]) -> int:
-    import json
-
-    from .run.records import metrics
-    from .run.records.journal import Journal
-
-    parser = argparse.ArgumentParser(
-        prog="trtllm-modeling-v2 metrics",
-        description="What a run cost and proved so far: milestones, cells, checks by gate with "
-        "their device-hours, turns by role, refused graphs, operator messages.",
-    )
-    parser.add_argument("--workspace", type=Path, required=True, help="The run's workspace.")
-    args = parser.parse_args(argv)
-    opened = Journal(path=args.workspace / "journal.md").opened_at()
-    path = metrics.write(args.workspace, opened=opened)
-    print(json.dumps(json.loads(path.read_text(encoding="utf-8")), indent=1))
-    return 0
-
-
 def _feedback(argv: list[str]) -> int:
-    from .run import inbox
+    """``feedback --workspace W "text"``: append ``text``, time-stamped, to the notes file."""
+    from .run import escalation
 
     parser = argparse.ArgumentParser(
         prog="trtllm-modeling-v2 feedback",
-        description="Leave a message for the planner of the run in a workspace. The run "
-        "puts it first in the planner's next turn. A message steers the work in a few "
-        f"sentences, evidence in a file it names; past {inbox.MESSAGE_MAX_CHARS} characters "
-        "the planner reads its head and the path of the whole. It does not change the "
-        "contract's checks, which task.yaml defines, and is no place for status reports.",
+        description=f"Append a note, with its time, to `<workspace>/{escalation.NOTES_FILENAME}`. "
+        "Every worker's card tells it to read that file first and again before its receipt; "
+        "no agent interprets it and it adds no task. To reach a turn in progress, stop the "
+        "run and start it again with the same command: the cut turn runs again as the "
+        "attempt it was. A requirement is changed with `resolve ... change-requirement`, "
+        "which records it, not with a note.",
     )
     parser.add_argument("--workspace", type=Path, required=True, help="The run's workspace.")
     text = parser.add_mutually_exclusive_group(required=True)
-    text.add_argument("message", nargs="?", help="The message.")
-    text.add_argument("--file", type=Path, help="Read the message from this file.")
-    parser.add_argument(
-        "--now",
-        action="store_true",
-        help="Wake the planner for it at once; otherwise it rides with the planner's next turn.",
-    )
+    text.add_argument("message", nargs="?", help="The note.")
+    text.add_argument("--file", type=Path, help="Read the note from this file.")
     args = parser.parse_args(argv)
-    message = args.file.read_text(encoding="utf-8") if args.file else args.message
-    try:
-        path = inbox.post(args.workspace, message, now=args.now)
-    except ValueError as exc:
-        parser.error(str(exc))
-    print(f"left for the planner's {'turn, now' if args.now else 'next turn'}: {path}")
-    if len(message.strip()) > inbox.MESSAGE_MAX_CHARS:
-        print(
-            f"note: the message is {len(message.strip())} characters; the planner reads its "
-            f"first {inbox.MESSAGE_MAX_CHARS} and the path of the whole"
-        )
+    message = (args.file.read_text(encoding="utf-8") if args.file else args.message).strip()
+    if not message:
+        parser.error("the note is empty")
+    path = escalation.append_note(args.workspace, message)
+    print(f"appended to {path}: every later turn reads it")
     return 0
 
 
@@ -349,56 +297,30 @@ def _feedback(argv: list[str]) -> int:
 SUBCOMMANDS = {
     # From a request to a spec, before launch: `intake derive|lint ...` (spec/INTAKE.md).
     "intake": _lazy_main(".spec.intake"),
-    "gate": _lazy_main(".checks.gate_cli"),
-    # Compute sessions: render entry scripts, hand-over.
-    "session": _lazy_main(".infra.compute.sessions"),
+    # One check, as the orchestrator runs it; with a run's own spec its result is recorded
+    # in the run's ledger under the pin it measured (run/evidence.py).
+    "gate": _lazy_main(".run.evidence"),
+    # The pool's holders: `pool status|stop --workspace W`.
+    "pool": _lazy_main(".infra.compute.pool"),
     # Jobs in a session's spool: `spool submit|launch|wait|status|cancel ...`.
     "spool": _lazy_main(".infra.compute.spoolctl"),
     # The operator's loop of a run: wait, status.
     "monitor": _lazy_main(".infra.monitor.status"),
-    # A message for the planner of a running run: `feedback --workspace W "..."`.
+    # A note for the workers of a run: `feedback --workspace W "..."`.
     "feedback": _feedback,
-    # What a run cost and proved so far: `metrics --workspace W` (writes metrics.json).
-    "metrics": _metrics,
+    # The outer session's answer to a block: `resolve --workspace W <verb> <task|run|pool> ...`.
+    "resolve": _lazy_main(".run.resolve"),
 }
-
-
-def _wait_for_spool(task: Path, timeout_s: float, poll_s: float = 15.0) -> bool:
-    """Wait for a session_spool environment's spool directory; validation still owns the verdict."""
-    import time
-
-    import yaml
-
-    try:
-        env = (yaml.safe_load(task.read_text()) or {}).get("environment") or {}
-    except (OSError, yaml.YAMLError):
-        return False
-    spool = env.get("spool") if env.get("kind") == "session_spool" else None
-    if not isinstance(spool, str) or Path(spool).is_dir():
-        return True
-    print(f"→ waiting up to {timeout_s / 60:g} min for the spool {spool} (its session is starting)")
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        time.sleep(poll_s)
-        if Path(spool).is_dir():
-            return True
-    return False
 
 
 def main(argv: list[str] | None = None) -> None:
     """Run the trtllm-modeling-v2 workflow as a CLI."""
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] in SUBCOMMANDS:
-        sys.exit(SUBCOMMANDS[argv[0]](argv[1:]))
-    if argv and argv[0] == "tune":
-        # `trtllm-modeling-v2 tune --task T --workspace W` == `--stage tune`.
-        argv = [*argv[1:], "--stage", "tune"]
+        # Its `--task` may be a task's name (`resolve`): the workspace is a path in each.
+        sys.exit(SUBCOMMANDS[argv[0]](_whole(argv[1:], ("--workspace",))))
+    argv = _whole(argv, PATH_OPTIONS)
     args = _parse_args(argv)
-    if args.wait_for_spool > 0:
-        # A derived task takes its environment from the site.
-        spec = args.site if args.checkpoint is not None else args.task
-        _wait_for_spool(Path(spec), args.wait_for_spool * 60)
-
     # Validate at the CLI boundary: an invalid spec must abort before any
     # agent is constructed.
     from .spec.derive import DeriveError
@@ -421,6 +343,8 @@ def main(argv: list[str] | None = None) -> None:
     except (TaskSchemaError, DeriveError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         sys.exit(2)
+    from .infra.compute import controller as controller_mod
+
     identity = _commit_identity(task_data)
     # Pinned for the rest of the process and every agent it starts, so every
     # commit the run makes is authored, committed and signed off as one user.
@@ -438,20 +362,48 @@ def main(argv: list[str] | None = None) -> None:
     os.environ.setdefault("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1")
 
     from .agents.roles import AgentConfigError
+    from .run import orchestrator as orchestrator_mod
     from .run.workflow import TrtllmModelingV2Workflow
+
+    def leave(code: int) -> None:
+        # The limit is minutes away and the run did not return: nothing is waited for.
+        logging.shutdown()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        heartbeat.mark_exit()
+        os._exit(code)
+
+    def told_to_stop(signum: int, frame: object) -> None:
+        # TERM, as a job's script or the scheduler sends it: leave now, and say so where
+        # whoever watches the run reads it. Without the mark a script that waits for the
+        # run's watcher waits until it is killed. Nothing in flight is waited for: the next
+        # start runs it again.
+        heartbeat.record["why"] = "told to stop (SIGTERM)"
+        try:
+            leave(128 + signum)
+        except BaseException:
+            # The signal came during a write: flushing again raises. It still leaves.
+            heartbeat.mark_exit()
+            os._exit(128 + signum)
+
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGTERM, told_to_stop)
+
+    # A controller inside a job stops before that job's end, whoever submitted it.
+    limit = controller_mod.watch_limit(
+        args.workspace,
+        argv,
+        stop=lambda reason: orchestrator_mod.stop_run(args.workspace, reason),
+        leave=leave,
+    )
 
     with TrtllmModelingV2Workflow(
         workspace=args.workspace,
         max_parallel_tasks=args.max_parallel_tasks,
-        revision_cap=args.revision_cap,
         max_attempts=args.max_attempts,
         clean=args.clean,
         dry_run=args.dry_run,
-        skip_substrate_gate=args.skip_substrate_gate,
         agent_turn_timeout=args.agent_turn_timeout,
-        entry_stage=args.entry_stage,
-        event_window_s=args.event_window_s,
-        primers=args.primers,
     ) as workflow:
         try:
             workflow.run(args.task)
@@ -465,6 +417,34 @@ def main(argv: list[str] | None = None) -> None:
             sys.stderr.flush()
             heartbeat.mark_exit()
             os._exit(130)
+    if limit is not None and limit.finish():
+        if getattr(getattr(workflow, "_state", None), "done", False):
+            # The run closed while the limit was being said: nothing is left to continue.
+            return
+        # Stopped for the limit: to be continued, by the command that was printed. The turns
+        # in flight are not waited for: what continues the run starts them again.
+        leave(controller_mod.EXIT_CONTINUE)
+    state = getattr(workflow, "_state", None)
+    if getattr(workflow, "_budget_stop", False) and not getattr(state, "done", False):
+        # The run's bound of node-hours is reached and no holder is left. It waits for an
+        # answer (`POOL_CAPACITY` names the verb): the same command, run again before the
+        # bound is raised, would stop here again, so this is not "to be continued". No turn
+        # is waited for.
+        heartbeat.record["why"] = "the run's bound of node-hours is reached (POOL_CAPACITY)"
+        leave(EXIT_ESCALATED)
+    if getattr(workflow, "_not_started", ""):
+        # The start did not start: never a success, whoever reads the status (a script's
+        # `&&`, or Slurm's state of the controller's own job, which would say COMPLETED).
+        heartbeat.record["why"] = f"the start did not start: {workflow._not_started}"
+        heartbeat.mark_exit()
+        sys.exit(EXIT_NOT_STARTED)
+    if getattr(workflow, "_escalated", False):
+        # Everything left is blocked: the run's own status, for whoever watches it.
+        heartbeat.record["why"] = "everything left is blocked and waits for an answer"
+        heartbeat.mark_exit()
+        sys.exit(EXIT_ESCALATED)
+    if getattr(state, "done", False):
+        heartbeat.record["why"] = f"the run closed: {getattr(state, 'verdict', '') or 'done'}"
 
 
 if __name__ == "__main__":

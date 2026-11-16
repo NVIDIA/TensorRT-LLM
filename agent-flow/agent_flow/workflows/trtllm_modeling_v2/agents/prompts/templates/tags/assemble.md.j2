@@ -1,51 +1,37 @@
 {# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 SPDX-License-Identifier: Apache-2.0 -#}
-## Tag `assemble` — the target
+## Tag `assemble`: the target, for one deployment
 
-Read an existing target and its weight loader end to end before writing.
-Derive the implementation from `vocabulary.yaml` (the steps), the checkpoint
-as data, the HF reference for the math, and the entries' contracts. Re-derive
-an axis on which this checkpoint differs from the exemplar, and route on it
-when it changes which implementation supports the deployment.
+**What it is for.** The engine serves this checkpoint, with the options of
+the deployment your card names, through a ModelingV2 target: its model
+classes, its weight loading and its routing exist, built from the entries
+the earlier rows landed, and the deployment's session passes.
 
-Follow the developer README's model lifecycle: the constructor, `load_weights`,
-`post_load_weights` and `forward` may be inherited, overridden or delegated.
-Keep weight mapping, transformation and sharding in the weight-loading code.
-A `WEIGHTS` table is a scaffold convention, not a required loader interface.
-Account for every model parameter and checkpoint key, including deliberately
-unused tensors and why they are unused. Use the current checkout's tests to
-verify loading.
+**Hand back.** The target's files, committed inside your write scope. The
+forward is a readable sequence of operator calls with every argument
+explicit. Every model parameter and every checkpoint key is accounted for:
+loaded, transformed, shared out across ranks, or skipped with the reason
+beside it. The route picks the target once, at model load, and refuses any
+other configuration with `NoTarget` and a reason. `vocabulary.yaml` and
+`plan.md` say which steps the forward has and which entry serves each. A
+call no entry covers is a `blocked` receipt naming the missing entry, as
+soon as you know. A correct call outside its entry's `CELLS` is one line
+under `not_done` and no reason to stop.
 
-Keep the sequence of operator calls in `forward` readable and every argument
-explicit. Wrap kernels in thin, stateless `OpWrapper`s with `reference`,
-`is_valid`, `CELLS` and `ARCHS`; weights, configuration and persistent state
-are arguments, with state owned by the target. Reuse operations from the
-catalog or the family and put new code at the narrowest scope that uses it.
-A target must not import from a sibling target; family sharing is allowed.
-Helpers and modules are allowed. Separate `PrefillTarget` and `DecodeTarget`
-classes are optional, and need not duplicate common code. `step_args` is an
-optional metadata-validation helper, not a required forward interface;
-`TRTLLM_MODELING_V2_VALIDATE=1` checks metadata on targets that support it.
+**How it is judged.** By one session of the deployment: its servers are
+loaded once, with `modeling_v2="require"`, and every check asks them. Each
+rank ran the options it was given; the boot prompts and the API answer; the
+benchmark scores against its floor; the probes the deployment names pass.
+Every run of the check is a load of the model, so a shortfall is a signal
+to find a cause, not a verdict to try again: when you cannot say what the
+next run would show, hand back `blocked` with what you ruled out. Turning
+an option off to get a pass hides a defect, unless the deployment's own
+options turn it off.
 
-Routing selects a supported target once at model load and explains unsupported
-configurations with `NoTarget`. Per-step differences stay inside the target.
-Preserve CUDA-graph safety: avoid host synchronization and data-dependent host
-branches in captured paths. Derive bounds on rows, tokens, batches and slots
-from engine arguments, and check them against `runtime_facts.yaml` rather
-than the workloads the gates happened to serve.
-
-Validate and benchmark the target with `modeling_v2="require"`, so a fallback
-cannot masquerade as target evidence. Run the applicable current-checkout
-unit and whole-model tests; naming conventions and scaffold helpers alone
-are not proof of correctness. A failing checkout check remains a failure to
-report or fix within scope, even when a guide describes a newer convention.
-
-Run a gate yourself to debug, with the command your dispatch names. **A
-shortfall is a debug signal, not a verdict**: back every re-gate with one
-explicit causal hypothesis, and after three hypothesis-backed fixes without
-improvement, stop and block with `accuracy_shortfall` and the trail. Turning
-a runtime switch off (block reuse, say) to get a green gate hides a defect,
-unless `task.yaml`'s runtime block turns it off. The anchor is read-only. A
-call no entry covers is a `vocabulary_gap`: block as soon as you know, naming
-it. Formatting is not your job: the operator lints the branch once, before it
-becomes a PR.
+Three things a later deployment judges and one request does not show.
+Per-sequence state lives in pools the cache manager owns: state in tensors
+of the target's own is invisible to block reuse, eviction, CUDA-graph replay
+and the transfer of a disaggregated deployment. A captured path holds no
+host synchronization and no data-dependent host branch. Bounds on rows,
+tokens, batches and slots come from the deployment's options, not from the
+workload a check happened to send.

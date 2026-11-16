@@ -1,0 +1,31 @@
+{# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0 -#}
+## Tag `state`: what the target keeps per sequence
+
+**What it is for.** Every per-sequence state object of the target (keys and
+values, and whatever else it keeps: indexer keys, block scales, compressed
+or recurrent state) is owned by a cache manager, in a role the manager
+declares. Only then do block reuse, eviction, CUDA-graph replay and the
+transfer between the two sides of a disaggregated deployment see it: state
+in tensors the target owns is stale after the first reused prefix and never
+crosses a hop.
+
+**Hand back.** For each state object: the manager that owns it, its dtype
+and layout, and how the forward learns how much of it is already cached
+(`num_cached_tokens_per_seq`); and the transfer test below. No transport,
+launcher, proxy or role service: the engine's transceiver moves the state
+(`CacheTransceiverConfig`, `create_kv_cache_transceiver`), and your work is
+the state it moves.
+
+**How it is judged.** By a transfer test in one process, between the two
+layouts your card states, with the source state filled with values you can
+recognise: they arrive exactly, the layers match, and the cached length is
+the prompt's. A hop carries the pages of every role the context side's
+manager declares, and nothing else. The manager says how each role maps
+between two layouts (`get_disagg_role_mapper_kinds`,
+`get_disagg_role_layouts`, `MapperKind`): a role whose bytes are the same on
+every rank is replicated, one that splits by head states its geometry.
+Generation's first forward is a generation step whose cached length is the
+prompt's length, and it needs nothing the context forward computed without
+storing. The tree has single-process transfer tests: the one whose cache
+kind is yours is the nearest start.

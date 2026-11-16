@@ -5,63 +5,15 @@
 
 from __future__ import annotations
 
-import re
-import threading
-import time
-from pathlib import Path
-
-import pytest
 import yaml
 
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import CommandResult
 from agent_flow.workflows.trtllm_modeling_v2.operators import prior_art
-from agent_flow.workflows.trtllm_modeling_v2.run import orchestrator as orchestrator_mod
-from agent_flow.workflows.trtllm_modeling_v2.run.execution.tasks import ExecutionStage
-from agent_flow.workflows.trtllm_modeling_v2.run.records.state import STAGE_EXECUTION, save_state
+from agent_flow.workflows.trtllm_modeling_v2.run.records.state import STAGE_EXECUTION
 from agent_flow.workflows.trtllm_modeling_v2.run.startup import bootstrap
 from agent_flow.workflows.trtllm_modeling_v2.run.workflow import TrtllmModelingV2Workflow
 
-from ._helpers import (
-    _STATE,
-    TARGET_REL,
-    Script,
-    _install,
-    _state,
-    _substrate_boot,
-    _workflow,
-    _write_vocabulary,
-    passing_shell,
-    plan_every_unit,
-    unit_tasks,
-    write_graph,
-)
-
-
-def test_the_feature_skill_names_only_paths_the_tree_has():
-    """The skill and the workers' reuse rule are maps of paths: a path the tree lost is stale."""
-    from agent_flow.workflows.trtllm_modeling_v2.agents.prompts import _common, worker
-    from agent_flow.workflows.trtllm_modeling_v2.agents.roles import PACKAGED_SKILLS_DIR
-
-    root = Path(__file__).resolve().parents[4]
-    if not (root / "tensorrt_llm").is_dir():
-        pytest.skip("not inside a TensorRT-LLM checkout")
-    skill = PACKAGED_SKILLS_DIR / "trtllm-modeling-v2-features"
-    text = "\n".join(
-        [
-            *(p.read_text() for p in skill.rglob("*.md")),
-            Path(worker.__file__).read_text(),
-            Path(_common.__file__).read_text(),
-            *(p.read_text() for p in Path(_common.__file__).parent.rglob("*.j2")),
-        ]
-    )
-    named = set()
-    for found in re.findall(r"`((?:_torch|tensorrt_llm|tests|cpp|examples)/[^`\s]+)`", text):
-        path = found.split("::")[0].rstrip(".,;:)")
-        path = "tensorrt_llm/" + path if path.startswith("_torch/") else path
-        if not any(ch in path for ch in "*<{["):
-            named.add(path)
-    missing = sorted(p for p in named if not (root / p).exists())
-    assert not missing, f"the feature skill names paths this tree lacks: {missing}"
+from ._helpers import Script, _install, _state, _workflow, _write_vocabulary
 
 
 def test_preflight_failure_ends_the_run_before_any_agent(tmp_path, task_file, monkeypatch):
@@ -76,63 +28,14 @@ def test_preflight_failure_ends_the_run_before_any_agent(tmp_path, task_file, mo
     assert "preflight failed" in (tmp_path / "ws" / "journal.md").read_text()
 
 
-def test_the_substrate_gate_runs_beside_the_first_turns_and_its_failure_leaves_the_run_open(
-    tmp_path, task_file, monkeypatch
-):
-    planner_called, booted = threading.Event(), []
-
-    def failing(command, env=None, timeout=0):
-        if _substrate_boot(command):
-            booted.append(command)
-            # The gate answers only once the first turn is under way: it does not hold it back.
-            planner_called.wait(10)
-            return CommandResult(returncode=1, stdout="MPI_ERR_SPAWN: could not spawn processes")
-        return passing_shell()(command, env, timeout)
-
-    workspace = (tmp_path / "ws").resolve()
-
-    def planner(turn, prompt):
-        planner_called.set()
-        deadline = time.monotonic() + 10
-        while not orchestrator_mod._STOPS[workspace].done():
-            assert time.monotonic() < deadline
-            time.sleep(0.01)
-        return plan_every_unit(turn, prompt)
-
-    workflow = _workflow(tmp_path, shell_runner=failing, skip_substrate_gate=False)
-    calls = _install(monkeypatch, workflow, Script(None, planner=planner))
-    with workflow:
-        workflow.run(task_file)
-    assert booted, "the substrate gate never ran"
-    # The graph the turn wrote is never adopted: nothing starts after the stop.
-    assert [name for name, _ in calls] == ["planner"]
-    state = _state(tmp_path)
-    assert not state.done and state.verdict == "" and state.stage == STAGE_EXECUTION
-    journal = (tmp_path / "ws" / "journal.md").read_text()
-    assert "substrate gate failed" in journal and "stopped: the substrate gate failed" in journal
-    assert "run closed" not in journal
-
-    # Fixed outside the run, the same command proves the host again and goes on.
-    second = _workflow(tmp_path, skip_substrate_gate=False)
-    _install(monkeypatch, second, Script(None))
-    with second:
-        second.run(task_file)
-    assert _state(tmp_path).verdict == "delivered"
-
-
-def test_a_survey_that_writes_what_the_tree_has_is_sent_back_once(tmp_path, task_file, monkeypatch):
-    """The review holds the draft to the dispatch's prior art; the re-draft is taken as it is."""
+def test_a_survey_is_not_sent_back_for_what_it_leaves_unsaid(tmp_path, task_file, monkeypatch):
+    """A survey is judged by what its rows cause: no review holds its reasoning to a form."""
     monkeypatch.setattr(TrtllmModelingV2Workflow, "survey_first", True)
-    lead = prior_art.Candidate(
-        path="tensorrt_llm/_torch/attention/backends/sparse/qsa/kernels.py",
-        kind="attention backend",
-        matched=("gqa", "sparse", "topk"),
-        score=9.0,
-        names=("triton_qsa_paged_sparse_gqa",),
-    )
 
     def take(workflow, config):
-        workflow._prior_art = prior_art.PriorArt(words=lead.matched, candidates=[lead])
+        workflow._prior_art = prior_art.PriorArt(
+            architectures=("NewForCausalLM",), registered=False
+        )
         workflow._engine_limits = []
         workflow._prior_art_block = prior_art.survey_block(workflow._prior_art, [])
 
@@ -142,218 +45,180 @@ def test_a_survey_that_writes_what_the_tree_has_is_sent_back_once(tmp_path, task
 
     def surveyor(turn, prompt):
         prompts.append(prompt)
-        tried = (
-            "no trtllm op or _torch/modules callable"
-            if turn == 1
-            else ("qsa/kernels.py takes power-of-two heads only")
-        )
+        # A row that writes new code beside a lead it does not name, with no call site.
         _write_vocabulary(workspace, [{"n": 1, "mode": "onboard", "target": "ops/norm/rms"}])
-        doc = yaml.safe_load((workspace / "vocabulary.yaml").read_text())
-        doc["steps"].append(
-            {
-                "step": "sparse GQA attention over the selected regions",
-                "values": {"topk": 512},
-                "state": "GAP",
-                "tier": 5,
-                "tried": tried,
-            }
-        )
-        (workspace / "vocabulary.yaml").write_text(yaml.safe_dump(doc), encoding="utf-8")
-        return {"decision": "DRAFT_READY", "summary": f"draft {turn}"}
+        return {"decision": "ready", "summary": f"draft {turn}"}
 
     workflow = _workflow(tmp_path)
-    calls = _install(monkeypatch, workflow, Script(None, surveyor=surveyor))
+    _install(monkeypatch, workflow, Script(None, surveyor=surveyor))
     with workflow:
         workflow.run(task_file)
-    assert [name for name, _ in calls].count("surveyor") == 2
-    assert "Prior art and engine limits" in prompts[0] and "Survey review" not in prompts[0]
-    assert "## Survey review: re-draft" in prompts[1] and "runs once" in prompts[1]
-    assert "qsa/kernels.py" in prompts[1]
-    assert (workspace / "survey_review.md").is_file()
-    assert "survey review: sent back with 1 finding(s)" in (workspace / "journal.md").read_text()
+    assert len(prompts) == 1, "one survey turn, and no second draft"
+    # What the run found of the engine's own model reached the surveyor in its dispatch.
+    assert "The engine registers no model for `NewForCausalLM`" in prompts[0]
+    assert not (workspace / "survey_review.md").exists()
+    assert "survey review" not in (workspace / "journal.md").read_text()
     assert _state(tmp_path).verdict == "delivered"
 
 
-def test_a_shared_change_is_followed_by_a_regression_check_with_no_turn(
-    tmp_path, task_file, monkeypatch
+def test_a_run_with_everything_left_blocked_stops_escalated_and_resumes_once_resolved(
+    tmp_path, task_file, monkeypatch, capsys
 ):
-    def planner(turn, prompt):
-        if turn == 1:
-            assert "## Shared code" in prompt and TARGET_REL in prompt
-            core = {
-                **unit_tasks(tmp_path / "ws")[0],
-                "touches": ["tensorrt_llm/_torch/_experimental/modeling_v2/catalog/norm/rms.py"],
-            }
-            write_graph(prompt, [core, *unit_tasks(tmp_path / "ws")[1:]])
-            return {"decision": "GRAPH_UPDATED", "summary": "core changes a shared entry"}
-        return {"decision": "DONE", "summary": "done"}
+    from agent_flow.workflows.trtllm_modeling_v2.run import escalation, resolve
+    from agent_flow.workflows.trtllm_modeling_v2.run import graph as g
+    from agent_flow.workflows.trtllm_modeling_v2.run.execution import handoff
+    from agent_flow.workflows.trtllm_modeling_v2.run.records import report
 
-    checked = []
-    workflow = _workflow(tmp_path)
-    monkeypatch.setattr(
-        ExecutionStage,
-        "_run_regression_check",
-        lambda self, task: checked.append((task.id, task.covers)) or [],
-    )
-    calls = _install(monkeypatch, workflow, Script(None, planner=planner))
-    with workflow:
-        workflow.run(task_file)
-    assert _state(tmp_path).verdict == "delivered"
-    # It covered what core landed.
-    assert checked == [("regression", ["core@1"])]
-    graph = yaml.safe_load((tmp_path / "ws" / "graph.yaml").read_text())
-    check = next(t for t in graph["tasks"] if t["id"] == "regression")
-    assert check["kind"] == "check" and check["regression"] and check["status"] == "done"
-    assert check["depends_on"] == ["core"]
-    # No agent turn ran for it, and the graph says who added it.
-    assert [name for name, _ in calls] == ["planner", "assembler"]
-    assert any(
-        r["reason"].startswith("orchestrator: regression checks") for r in graph["revisions"]
-    )
-
-
-def test_a_closed_run_whose_campaign_did_not_end_resumes_only_the_campaign(
-    tmp_path, task_file, monkeypatch
-):
-    import agent_flow.workflows.trtllm_modeling_v2.tune.stage as stage
-
+    blocked = {
+        "decision": "blocked",
+        "summary": "the router's weights have no key in the checkpoint",
+        "tried": ["the names the HF module uses", "the names the sibling target uses"],
+        "command": "python -m pytest tests/x.py::test_router",
+        "result": "1 failed",
+        "ruled_out": ["a typo in the mapping"],
+        "next_question": "is the router tied to the embedding in this export?",
+    }
+    workspace = tmp_path / "ws"
     first = _workflow(tmp_path)
-    _install(monkeypatch, first, Script(None))
+    calls = _install(monkeypatch, first, Script(None, assembler=lambda turn, prompt: blocked))
     with first:
         first.run(task_file)
-    state = _state(tmp_path)
-    # The process stopped while the campaign the onboarding closed beside still ran.
-    state.tune = {"onboarded": "delivered", "base_commit": "c0ffee1", "attempt": 2}
-    save_state(tmp_path / "ws" / _STATE, state)
-    resumed: list[dict] = []
-    monkeypatch.setattr(
-        stage, "resume_campaign", lambda wf, st: resumed.append(dict(st.tune)) or "tuned"
+    # The run stays open, exits with its own status, and says where it stands.
+    assert first._escalated and not _state(tmp_path).done and len(calls) == 1
+    saved = g.Graph.load(workspace / g.GRAPH_FILENAME)
+    (waits,) = escalation.waiting(saved)
+    # What waits behind it: its session, and the task the session's pass starts (the
+    # files the delivery requires for CI, which code makes a task for).
+    assert waits.startswith("assemble-core (assemble), attempt 1, worker/")
+    assert waits.endswith("it holds session-core, delivery-files")
+    assert f"it asks: {blocked['next_question']}" in waits
+    # What its worker tried and ruled out is in its receipt, written once.
+    receipt = handoff.read(workspace / "tasks", "assemble-core", 1)
+    assert receipt["command"] == blocked["command"] and receipt["result"] == "1 failed"
+    assert receipt["tried"] == blocked["tried"] and receipt["ruled_out"] == blocked["ruled_out"]
+    text = (workspace / report.REPORT_FILENAME).read_text()
+    assert ": escalated" in text.splitlines()[0] and "**Not onboarded**" in text
+    assert "`assemble-core` (blocked)" in text and "(attempt 1 waits for an answer)" in text
+    out = " ".join(capsys.readouterr().out.split())
+    assert (
+        "the run is escalated: 1 block(s) wait for an answer" in out
+        and "resolve --workspace" in out
     )
+    # The outer session answers with no controller running; the same command then finishes.
+    argv = [
+        "--workspace",
+        str(workspace),
+        "retry",
+        "assemble-core",
+        "--note",
+        "it is tied: skip it",
+    ]
+    assert resolve.main(argv) == 0
     second = _workflow(tmp_path)
-    calls = _install(monkeypatch, second, Script(None))
+    again = _install(monkeypatch, second, Script(None))
     with second:
         second.run(task_file)
-    assert calls == [] and [r["base_commit"] for r in resumed] == ["c0ffee1"]
-    state = _state(tmp_path)
-    assert state.done and state.verdict == "delivered" and state.tune["verdict"] == "tuned"
-    # Once it ended, a re-run finds the run complete.
-    third = _workflow(tmp_path)
-    _install(monkeypatch, third, Script(None))
-    with third:
-        third.run(task_file)
-    assert len(resumed) == 1
+    assert _state(tmp_path).verdict == "delivered" and not second._escalated
+    # The assembly again. The delivery's task takes no turn: the tree holds the CI files
+    # and no landing recorded a finding.
+    assert [role for role, _ in again] == ["assembler"]
+    text = (workspace / report.REPORT_FILENAME).read_text()
+    assert ": delivered" in text.splitlines()[0] and "**Onboarded** at `c0ffee1`" in text
+    assert "Nothing: every task of the run is done." in text
+    assert "it is tied: skip it" in (workspace / escalation.NOTES_FILENAME).read_text()
 
 
-@pytest.mark.parametrize("outcome", ["TUNE_PENDING", "TUNED"], ids=["pending", "completed"])
-def test_a_campaign_pending_before_delivery_resumes_only_on_the_next_run(
-    tmp_path, task_file, monkeypatch, outcome
+def test_a_run_whose_session_could_not_verify_a_check_closes_partial_and_says_which(
+    tmp_path, task_file, monkeypatch, capsys
 ):
-    import agent_flow.workflows.trtllm_modeling_v2.tune.stage as stage
+    import json
 
-    spec = yaml.safe_load(task_file.read_text())
-    spec["perf"] = {"enabled": True}
-    task_file.write_text(yaml.safe_dump(spec))
-    settled = threading.Event()
-    finished = orchestrator_mod.GraphOrchestrator._finish
-    attempts, resumed = [], []
+    from agent_flow.workflows.trtllm_modeling_v2.checks import session as session_mod
+    from agent_flow.workflows.trtllm_modeling_v2.checks import verdict as check_result
+    from agent_flow.workflows.trtllm_modeling_v2.run import escalation
+    from agent_flow.workflows.trtllm_modeling_v2.run import graph as g
+    from agent_flow.workflows.trtllm_modeling_v2.run.records import report
 
-    def finish(self, task, decision, failed):
-        finished(self, task, decision, failed)
-        if task.kind == "tune":
-            settled.set()
+    why = "hop: 2 of 2 response(s) name no transfer interval"
+    loads = []
 
-    def tune(wf, state, base_commit, attempt=1):
-        attempts.append(attempt)
-        state.tune.update(
-            phase="done" if outcome == "TUNED" else "campaign",
-            base_commit=base_commit,
-            attempt=attempt,
-        )
-        return outcome, "allocation expired" if outcome == "TUNE_PENDING" else "finished"
+    def not_observed(deployment, environment, **kwargs):
+        # Every check of the session answered; one could not observe what it is for.
+        loads.append(deployment.name)
+        member = deployment.shape
+        boot = check_result.GateResult(name="boot", member=member, passed=True, detail="answered")
+        own = check_result.GateResult(
+            name="deployment", member=member, passed=True, unverified=why,
+            detail="2 check(s): nothing failed, 1 not verified",
+        )  # fmt: skip
+        return session_mod.SessionResult((boot,), own, loads=1)
 
-    def planner(turn, prompt):
-        if turn == 1:
-            tasks = unit_tasks(tmp_path / "ws")
-            tasks.append(
-                {
-                    "id": "tail",
-                    "kind": "feature",
-                    "ref": "core",
-                    "goal": "finish onboarding",
-                    "depends_on": ["core"],
-                    "touches": [f"{TARGET_REL}/tail.py"],
-                }
-            )
-            tasks.append(
-                {
-                    "id": "tune",
-                    "kind": "tune",
-                    "goal": "tune the core",
-                    "depends_on": ["core"],
-                    "touches": [],
-                }
-            )
-            write_graph(prompt, tasks)
-            return {"decision": "GRAPH_UPDATED", "summary": "core, tail and optional tune"}
-        return {"decision": "DONE", "summary": "done"}
-
-    def assemble(turn, prompt):
-        if turn == 2:
-            assert settled.wait(10), "onboarding must finish after the tune outcome is recorded"
-        return {"decision": "UNIT_READY", "summary": "assembled"}
-
-    monkeypatch.setattr(orchestrator_mod.GraphOrchestrator, "_finish", finish)
-    monkeypatch.setattr(stage, "run_tune_task", tune)
-    monkeypatch.setattr(
-        stage, "resume_campaign", lambda wf, st: resumed.append(dict(st.tune)) or "tuned"
-    )
-    first = _workflow(tmp_path, event_window_s=0)
-    _install(monkeypatch, first, Script(None, planner=planner, assembler=assemble))
-    with first:
-        first.run(task_file)
+    monkeypatch.setattr(session_mod, "run_deployment", not_observed)
+    workspace = tmp_path / "ws"
+    workflow = _workflow(tmp_path)
+    calls = _install(monkeypatch, workflow, Script(None))
+    with workflow:
+        workflow.run(task_file)
+    # Closed, with its own verdict: not escalated, nothing repaired, one load.
     state = _state(tmp_path)
-    assert state.done and state.verdict == "delivered"
-    assert attempts == [1]
-    assert not resumed, "a deferred campaign must not be retried during the same run"
-    if outcome == "TUNE_PENDING":
-        assert state.tune["onboarded"] == "delivered" and not state.tune.get("verdict")
-        graph = yaml.safe_load((tmp_path / "ws/graph.yaml").read_text())
-        assert next(t for t in graph["tasks"] if t["id"] == "tune")["status"] == "pending"
-    else:
-        assert "onboarded" not in state.tune
+    assert state.done and state.verdict == "partial" and not workflow._escalated
+    assert escalation.waiting(g.Graph.load(workspace / g.GRAPH_FILENAME)) == []
+    assert loads == ["core"]
+    # One turn, the assembly's. The delivery's task takes none: the tree already holds
+    # the CI files, and no landing recorded a finding.
+    assert [role for role, _ in calls] == ["assembler"]
+    said = f"core:deployment@tp1: {why}"
+    graph = yaml.safe_load((workspace / "graph.yaml").read_text())
+    session = next(t for t in graph["tasks"] if t["id"] == "session-core")
+    assert session["status"] == "done" and session["unverified"] == [said]
+    # Onboarded is pinned, and its one record says what the session could not verify.
+    record = json.loads((workspace / "onboarded.json").read_text())
+    assert record["session"] == "session-core" and record["unverified"] == [said]
+    text = (workspace / report.REPORT_FILENAME).read_text()
+    assert ": partial" in text.splitlines()[0]
+    assert f"failed nothing on that commit, and could not verify: {said}." in text
+    assert f"- `session-core` is done with `core:deployment@tp1` not verified: {why}" in text
+    assert "Nothing: every task of the run is done." in text
+    journal = (workspace / "journal.md").read_text()
+    assert f"; not verified: {said}" in journal and "[partial] every task is done" in journal
+    out = " ".join(capsys.readouterr().out.split())
+    assert "run closed — verdict partial" in out and "the run is escalated" not in out
+    # The same command again finds a closed run and measures nothing more.
+    again = _workflow(tmp_path)
+    _install(monkeypatch, again, Script(None))
+    with again:
+        again.run(task_file)
+    assert loads == ["core"] and _state(tmp_path).verdict == "partial"
 
-    second = _workflow(tmp_path)
-    calls = _install(monkeypatch, second, Script(None))
-    with second:
-        second.run(task_file)
-    assert calls == []
-    assert len(resumed) == (1 if outcome == "TUNE_PENDING" else 0)
-    if resumed:
-        assert resumed[0]["base_commit"] == "c0ffee1" and resumed[0]["attempt"] == 1
-        assert _state(tmp_path).tune["verdict"] == "tuned"
-    third = _workflow(tmp_path)
-    _install(monkeypatch, third, Script(None))
-    with third:
-        third.run(task_file)
-    assert len(resumed) == (1 if outcome == "TUNE_PENDING" else 0)
 
+def test_a_workspace_of_an_older_flow_is_refused_in_one_line_before_anything_is_dispatched(
+    tmp_path, task_file, monkeypatch, capsys
+):
+    """A graph with a task of a kind this flow no longer has (`tune`) died with a KeyError."""
+    from agent_flow.workflows.trtllm_modeling_v2.run import graph as graph_mod
+    from agent_flow.workflows.trtllm_modeling_v2.run.records.state import WorkflowState, save_state
 
-def test_a_campaign_resumes_on_its_first_pin_as_its_last_attempt(monkeypatch):
-    from types import SimpleNamespace
-
-    import agent_flow.workflows.trtllm_modeling_v2.tune.stage as stage
-
-    seen = []
-
-    def stage_for(wf, state, base_commit="", attempt=1):
-        seen.append((base_commit, attempt))
-        return "tune-failed:spec"
-
-    monkeypatch.setattr(stage, "_stage_for", stage_for)
-    state = SimpleNamespace(tune={"base_commit": "c0ffee1", "attempt": 2})
-    assert stage.resume_campaign(None, state) == "tune-failed:spec"
-    assert seen == [("c0ffee1", 2)]
-    assert stage.campaign_verdict("TUNED\ntuned from c0ffee1") == "tuned"
-    assert stage.campaign_verdict("TUNE_FAILED (tune-failed:baseline)") == "tune-failed:baseline"
-    assert stage.campaign_verdict("TUNE_FAILED (incomplete)") is None
-    assert stage.campaign_verdict("raised OSError: the session went away") is None
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    state_path = workspace / ".trtllm_modeling_v2_state.json"
+    save_state(state_path, WorkflowState(task_path=str(task_file), stage=STAGE_EXECUTION))
+    tasks = [
+        {"id": "t1", "kind": "assemble", "goal": "assemble core", "status": "done"},
+        {"id": "t7", "kind": "tune", "goal": "tune the core", "status": "pending"},
+    ]
+    (workspace / graph_mod.GRAPH_FILENAME).write_text(yaml.safe_dump({"tasks": tasks}))
+    assert graph_mod.removed_kinds(workspace / graph_mod.GRAPH_FILENAME) == ["t7 (tune)"]
+    workflow = _workflow(tmp_path)
+    calls = _install(monkeypatch, workflow, Script(None))
+    with workflow:
+        workflow.run(task_file)
+    said = " ".join(capsys.readouterr().out.split())
+    assert "was written by an older flow (its graph holds t7 (tune))" in said
+    assert "start a new workspace, or pass --clean" in said
+    assert calls == [], "nothing was dispatched"
+    # The same line for a state file left at a stage this flow no longer has.
+    (workspace / graph_mod.GRAPH_FILENAME).unlink()
+    state_path.write_text(state_path.read_text().replace(STAGE_EXECUTION, "tune"))
+    with _workflow(tmp_path) as again:
+        again.run(task_file)
+    assert "its state is at stage 'tune'" in " ".join(capsys.readouterr().out.split())

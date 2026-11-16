@@ -1,0 +1,8 @@
+{# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0 -#}
+## A test that loads the model
+
+A test that loads the model and scores a benchmark, as the engine's own
+accuracy tests do (the classes on `LlmapiAccuracyTestHarness`), states its
+own time limit, as those of them that carry `pytest.mark.timeout` do: a
+case that states none is cut at the short limit a case gets by default.

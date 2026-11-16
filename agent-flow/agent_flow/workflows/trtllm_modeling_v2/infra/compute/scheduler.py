@@ -2,11 +2,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The compute half of ``environment.kind: session_spool``: a scheduler that drains a spool.
+"""The compute half of the pool: a scheduler that drains a spool.
 
-A compute session is an allocation whose main process is this scheduler. This module is
-**standard-library only** and runs by path (``python3 scheduler.py watch <spool>``): the
-interpreter inside the container is the engine's, not the orchestrator's.
+A *holder* is an allocation (or one host). On each of its nodes this scheduler runs as a
+*watcher*, inside the container; one more, the *lead*, runs with no devices where steps across
+nodes can be started. This module is **standard-library only** and runs by path
+(``python3 scheduler.py watch <spool>``): the interpreter inside the container is the engine's,
+not the orchestrator's.
 
 PROTOCOL
 ========
@@ -20,94 +22,111 @@ PROTOCOL
     <spool>/done/<name>.json      the verdict: rc, reason, devices, times, owner, token
     <spool>/done/<name>.rc        the exit code, renamed into place LAST
     <spool>/cancel/<name>         ask the scheduler to stop a job (the sanctioned kill)
+    <spool>/stop                  the pool is ending: admit nothing, exit when idle
+    <spool>/holders/<holder>.stop the same, for the watchers of one holder
 
 A reader that sees ``done/<name>.rc`` may trust the log and the JSON beside it. A job declares
 what it needs in header lines among its first :data:`HEADER_SCAN_LINES` lines, for example
-``#spool: gpus=2 wall=2h priority=0 owner=r014 token=<uuid> tree=<checkout>``.
+``#spool: gpus=2 wall=2h priority=0 owner=r014 token=<uuid> pin=<pin file>``.
 
-``gpus`` is a device count or ``all`` (the whole node, exclusively). Without it a ``free-`` name
-holds nothing and any other name holds the whole node.
+**A job runs a pin, never a moving tree.** ``pin=`` names a pin file (``pintree.py``): a source
+commit and the build record of its native libraries. The watcher starts such a job through
+``pintree.py run``: the pin's tree is made on this node, its libraries are
+checked against the record, and the job's script runs inside it (its working directory and
+first ``PYTHONPATH`` entry). Whoever queues a job against a tree pins it first
+(``spoolctl --tree``). ``tree=`` is left for a directory nothing can pin (no checkout of a
+run): the job runs it as it is and its receipt names no pin.
+
+**A job states its size and its wall.** ``gpus`` is a device count, ``0`` for a job that holds
+no device, or ``all`` (the whole node, exclusively); ``nodes`` is a count of whole nodes.
+``wall`` is the limit from the job's start (``0`` states that it has none). A job that states
+neither ``gpus`` nor ``nodes``, or no ``wall``, is refused with one line that says what to add:
+nothing is sized by a default.
 
 MULTI-NODE JOBS
 ===============
 
 ::
 
-    <spool>/gangs/<name>/record.json       its nodes: the leader first, then each member
+    <spool>/gangs/<name>/record.json       its nodes: the lead, then each member
     <spool>/gangs/<name>/ready/<watcher>   a member drained for it
-    <spool>/gangs/<name>/go.json           every node is drained: each starts its part
-    <spool>/gangs/<name>/parts/<rank>.json how each node's part ended
+    <spool>/gangs/<name>/go.json           every node is drained: the lead runs the script
 
-A job declaring ``nodes=N`` holds N whole nodes of one allocation: one watcher per node, all on
-this spool (a session of ``nodes: N``). The watcher that admits it leads: it picks N-1 live peers
-of its allocation and records them; each stops admitting GPU work and, once drained, says it is
-ready. When all are, the leader claims the job, writes ``go.json`` and every node runs the same
-script under ``MV2FLOW_JOB_NODES``, ``MV2FLOW_JOB_NODE_RANK``, ``MV2FLOW_JOB_HOSTS`` and
-``MV2FLOW_JOB_MASTER``, rank 0's log at ``logs/<name>.log``, rank r's at ``logs/<name>.node<r>.log``.
-A part that fails stops the others; the job's receipt waits for every part and carries the
-first that failed. One multi-node job holds a spool's nodes at a time.
+A job declaring ``nodes=N`` holds N whole nodes of one holder. The holder's lead forms it: it
+picks N live watchers of its own holder and records them; each stops admitting GPU work and,
+once drained and with every device of its node read clean (the Clean rule), says it is ready.
+When all are, the lead claims the job, writes ``go.json`` and runs the script **once**, where
+it runs itself, under ``MV2FLOW_JOB_NODES`` and ``MV2FLOW_JOB_HOSTS``. The script starts each
+rank world across those hosts with the environment's step line (``slurm.step_line`` on Slurm).
+The members hold their devices until the job's receipt exists. One multi-node job holds a
+spool's nodes at a time.
+
+The lead keeps the allocation's identity in what it starts (the job id, the node list) and drops
+the task's and the step's (:func:`lead_environment`): without the first a step asks for a new
+allocation, with the second a rank takes itself for the lead's own task.
 
 LOST ALLOCATIONS
 ================
 
 A job in ``running/`` whose watcher stopped heart-beating ran on an allocation that is gone
-(Slurm requeued it onto another node, or it ended or failed). The scheduler that finds it (the
-requeued allocation's next start, or any other watcher of the spool) runs it again, at most
-:data:`MAX_RERUNS` times: the script goes back to ``pending/`` with its submission time, so its
-place in the queue, and a ``#spool-rerun: <n>`` line after its shebang counts its re-runs (the
-receipt's ``reruns``). A run on an earlier start of this same allocation (a lower
-``SLURM_RESTART_COUNT``) is known lost at once; any other once its watcher has been silent
-:data:`WATCHER_STALE_S`.
+(it ended or failed: a holder is never requeued). The watcher that finds it runs it again, at
+most :data:`MAX_RERUNS` times: the script goes back to ``pending/`` with its submission time,
+so its place in the queue, and a ``#spool-rerun: <n>`` line after its shebang counts its
+re-runs (the receipt's ``reruns``). It is known lost once its watcher has been silent
+:data:`WATCHER_STALE_S`. This is the only re-run of a lost job anywhere in the flow.
 
 A job that used its re-runs, whose cancel was requested or whose name is already queued gets
 ``reason=node_lost`` (``RC_NODE_LOST``) instead. A job whose processes still run on this host
 outlived only its watcher: it is closed out as ``orphaned`` (``RC_ORPHANED``), never run again
 beside itself.
 
-HAND-OVER
-=========
+RULES, EACH READ EVERY PASS AND NONE STORED
+===========================================
 
-::
+**Fit.** A watcher takes a GPU job only if the job's wall plus :data:`FIT_MARGIN_S` ends before
+its allocation does. A job that does not fit waits in ``pending/`` for a holder that ends later.
 
-    <spool>/handover/acks/<allocation>.json   the job a driver submitted to follow <allocation>
+**Retire.** A watcher that runs nothing exits when a live watcher of another holder of as many
+nodes ends later than it does, or when a stop marker exists. It does not exit for a holder of
+another width: that one is there for other work. A lead exits once no watcher of its holder is
+left, which ends the allocation.
 
-``handover_lead`` before its allocation ends a watcher is in hand-over (its status record's
-``handover``): it holds each GPU job that would not finish in time, and the operator loop asks
-for a successor until an ack names one. An ack is keyed by the allocation it follows, so a later
-ack for the next allocation never replaces it. A ready successor also starts hand-over before
-the alert window, so long jobs can use a fresh allocation. The old watcher admits nothing more
-and exits when its existing jobs are done.
+**Clean.** A device is free when no job of this watcher holds it and one ``nvidia-smi`` reading
+of this pass finds at most :data:`DEVICE_MAX_USED_MIB` in use on it. A reading that fails, or
+that does not name the device, is "not free": the job waits. Memory held by a process this
+watcher did not start is reported in the heartbeat (``held``: the device, the memory, the pids)
+and never touched; what a job of this watcher left behind is stopped under the safe-kill rule.
 
-ADMISSION
-=========
+**Order.** One priority queue per watcher, ordered by effective priority (``priority`` plus one
+per :data:`AGING_S` waited), then whole-node jobs before device-slot jobs, then submission order
+(the pending file's mtime), then name. A GPU job waiting for devices blocks every GPU job ranked
+below it, so a stream of single-device jobs never starves a whole-node or multi-device one; a
+job that holds no device never waits for one.
 
-One priority queue per watcher, ordered by effective priority (``priority`` plus one per
-:data:`AGING_S` waited), then whole-node jobs before device-slot jobs, then submission order (the
-pending file's mtime), then name. A GPU job waiting for devices blocks every GPU job ranked below
-it, so a stream of single-device jobs never starves a whole-node or multi-device one; a job that
-holds no device never waits for one. A job of a negative priority is background work (the tune
-campaign's): it does not age, so every other job ranks ahead of it however long it has waited,
-and, ranked last, it holds none of them back.
-
-A GPU job starts only on devices whose memory has come back. An engine sizes its KV-cache and
-recurrent pools from the device memory it finds free, so one started beside memory a cancelled
-job (or a rank or launcher child of it) has not given back reserves less than the same engine
-elsewhere, or fails. As a GPU job is about to start, one ``nvidia-smi`` reading hands out first
-the free devices with at most :data:`DEVICE_MAX_USED_MIB` in use, and the job waits for any other
-it gets; a device still in use :data:`DEVICE_RELEASE_WAIT_S` after a reading first found it so is
-quarantined until a reading finds it released. Without ``nvidia-smi`` nothing waits.
+**Origin.** A job with a tree whose processes imported the watched package from anywhere
+else is refused. A job that states ``ranks=<role>:<n>[,<role>:<n>]`` must hear from every world
+rank of every role: each reports where it imported the package from and the identity of the
+libraries beside it, and all must agree. A rank with no complete record (none at all, one of
+another module, one without a build identity, one whose rank is no number) makes the job
+``no_origin`` (:data:`RC_NO_ORIGIN`): no result, never a pass. So does a pinned job whose tree
+could not be made, whose libraries are not those its pin records, or one of whose processes
+found other libraries than the ones verified on its host: where a job runs a pin, the libraries
+are the record's or the job has no result.
 
 LIMITS AND THE SAFE-KILL RULE
 =============================
 
-Every job runs in its own session with core dumps disabled and without the allocation's MPI
-context in its environment (``PMI*``, ``PMIX*``, ``OMPI*``, ``SLURM*``, ``PRTE*``, ``PALS*``). A
-process that inherits that context is part of the allocation's MPI job, and when it dies
-abnormally Slurm's MPI error handler kills the **whole allocation**. Having removed it, the
-scheduler may stop its own jobs: on a wall-clock limit, a stall after a failure line or a cancel
-request it sends SIGTERM and, :data:`KILL_GRACE_S` later, SIGKILL. **It never signals a process
-whose environment still carries the allocation's context** (:func:`is_mpi_attached`); that
-process is left alone, the job is marked failed, and its devices stay quarantined until it exits.
+Every job a watcher runs has its own session, core dumps disabled, and none of the allocation's
+MPI context in its environment (``PMI*``, ``PMIX*``, ``OMPI*``, ``SLURM*``, ``PRTE*``,
+``PALS*``). A process that inherits that context is part of the allocation's MPI job, and when
+it dies abnormally Slurm's MPI error handler kills the **whole allocation**. Having removed it,
+the scheduler may stop its own jobs: on a wall-clock limit, a stall after a failure line or a
+cancel request it sends SIGTERM and, :data:`KILL_GRACE_S` later, SIGKILL. **It never signals a
+process whose environment still carries the allocation's context** (:func:`is_mpi_attached`);
+that process is left alone, the job is marked failed, and its devices stay out of service until
+it exits. A lead stops a multi-node job the same way: its children are the script and the local
+launchers of its steps, which carry the job's identity and no task's, and ending a launcher
+ends its step.
 """
 
 from __future__ import annotations
@@ -130,12 +149,12 @@ from typing import Any, Callable, Iterable, Mapping
 
 try:
     from ..files import read_json, write_json_atomic, write_text_atomic
+    from . import pintree as _pintree
     from . import provenance as _provenance
-    from . import rebuild as _rebuild
 except ImportError:  # run by path: the sibling modules are on sys.path[0]
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import pintree as _pintree  # type: ignore[no-redef]
     import provenance as _provenance  # type: ignore[no-redef]
-    import rebuild as _rebuild  # type: ignore[no-redef]
     from files import read_json, write_json_atomic, write_text_atomic
 
 # --------------------------------------------------------------------------- protocol
@@ -146,7 +165,13 @@ HEADER_TAG = "#spool:"
 GANG_RECORD = "record.json"
 GANG_READY = "ready"
 GANG_GO = "go.json"
-GANG_PARTS = "parts"
+
+#: ``<spool>/stop``: the pool is ending. ``<spool>/holders/<holder>.stop``: one holder is.
+STOP_MARKER = "stop"
+HOLDERS_DIRNAME = "holders"
+#: The controller's view of the pool, rewritten each of its passes; fresh for this long.
+POOL_SNAPSHOT = "pool.json"
+POOL_FRESH_S = 180.0
 
 #: Prefix of the line that counts a job's re-runs after lost allocations (:func:`stamp_rerun`).
 RERUN_TAG = "#spool-rerun:"
@@ -154,7 +179,7 @@ RERUN_TAG = "#spool-rerun:"
 #: Header lines are only looked for this far into a script.
 HEADER_SCAN_LINES = 64
 
-#: A job whose name starts with this and declares no ``gpus`` holds no device.
+#: A name may start with this before its owner's prefix; by convention a job that holds no device.
 FREE_PREFIX = "free-"
 
 #: The ``gpus`` value that asks for the whole node, exclusively.
@@ -166,8 +191,6 @@ NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 #: errno values of a full filesystem or quota: transient for a long-lived watcher.
 FULL_FILESYSTEM_ERRNOS = frozenset({28, 122})  # ENOSPC, EDQUOT
 
-HANDOVER_DIRNAME = "handover"
-
 RC_WALL_LIMIT = 124
 RC_STALLED = 210
 RC_ORPHANED = 212
@@ -176,11 +199,13 @@ RC_LAUNCH_FAILED = 215
 RC_CANCELLED = 216
 RC_MIXED_CHECKOUT = 217
 RC_NODE_LOST = 218
-#: A multi-node job's part stopped because another node's part failed.
-RC_GANG_STOPPED = 219
+#: A rank the job said it would hear from reported no origin: no result.
+RC_NO_ORIGIN = 220
 
 #: Verdict reasons of a job its session ended, not the job: nothing in them is a verdict.
 SESSION_LOSS_REASONS = frozenset({"orphaned", "node_lost"})
+#: The verdict reason of a job one of whose stated ranks reported no origin: no result either.
+NO_ORIGIN_REASON = "no_origin"
 #: The verdict reason of a job withdrawn through the spool (``cancel/<name>``): it measured nothing.
 CANCELLED_REASON = "cancelled"
 #: The reason of a job stopped for making no progress after a failure line (:data:`FAILURE_STALL_S`).
@@ -195,9 +220,6 @@ MAX_RERUNS = 1
 #: Seconds between scheduling passes.
 POLL_S = 3.0
 
-#: Wall limit of a GPU job that declares none (``--default-wall``). Device-free jobs have none.
-DEFAULT_WALL_S = 7200.0
-
 #: Seconds of waiting that raise a pending job's priority by one.
 AGING_S = 3600.0
 
@@ -211,6 +233,9 @@ FAILURE_STALL_S = 600.0
 RESOLVE_HOOK_DIR = Path(__file__).resolve().parent / "resolvehook"
 
 RESOLVE_MODULES = "tensorrt_llm"
+
+#: What starts a pinned job: makes the pin's tree on this node, checks it, runs the job in it.
+PINTREE = Path(__file__).resolve().parent / "pintree.py"
 
 #: Verdict reasons after which the job has said nothing about what it ran.
 TIMEOUT_REASONS = frozenset({"wall_limit", STALLED_REASON})
@@ -232,17 +257,24 @@ _FAILURE_LINE = re.compile(
 #: How much new log a pass reads looking for failure lines.
 _LOG_SCAN_BYTES = 1 << 20
 
-#: A job is admitted near the allocation's end only if its wall limit leaves this much spare.
-HANDOVER_MARGIN_S = 120.0
+#: A job is admitted only if its wall limit ends this long before the allocation does (Fit).
+FIT_MARGIN_S = 120.0
 
-#: Device memory in use (MiB) above which a device still holds what a finished job left.
+#: Device memory in use (MiB) above which a device is not free (Clean).
 DEVICE_MAX_USED_MIB = 1024.0
 
-#: How long a device may hold memory no job of the watcher accounts for before it is quarantined.
-DEVICE_RELEASE_WAIT_S = 300.0
+#: How old the heartbeat's device reading may get while no job asks for one.
+DEVICE_READING_S = 60.0
 
-#: How often a quarantined device is read again while no job is waiting to start.
-DEVICE_RECHECK_S = 60.0
+#: What a job that states no size, or no wall, is refused with.
+SIZE_MISSING = (
+    "states no size: add gpus=<count|all> (0 holds no device) or nodes=<count> to its "
+    "`#spool:` line (spoolctl: --gpus or --nodes)"
+)
+WALL_MISSING = (
+    "states no wall: add wall=<limit, counted from its start> to its `#spool:` line "
+    "(spoolctl: --wall)"
+)
 
 _GB = 1024.0**3
 
@@ -301,6 +333,19 @@ def _parse_word(text: str) -> str:
     return text
 
 
+def _parse_ranks(text: str) -> tuple[tuple[str, int], ...]:
+    """``ctx0:4,gen0:2`` -> ``(("ctx0", 4), ("gen0", 2))``: each role instance and its world size."""
+    out: list[tuple[str, int]] = []
+    for part in text.split(","):
+        role, sep, size = part.partition(":")
+        if not sep or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,40}", role) or not size.isdigit():
+            raise ValueError("must be <role>:<world size>[,<role>:<world size>]")
+        if int(size) < 1 or role in dict(out):
+            raise ValueError("each role is named once, with a world size >= 1")
+        out.append((role, int(size)))
+    return tuple(out)
+
+
 #: Header key -> (JobSpec attribute, converter). Unknown keys refuse the job:
 #: a misspelt limit that is silently ignored is a limit nobody has.
 HEADER_KEYS: dict[str, tuple[str, Callable[[str], object]]] = {
@@ -311,6 +356,8 @@ HEADER_KEYS: dict[str, tuple[str, Callable[[str], object]]] = {
     "owner": ("owner", _parse_word),
     "token": ("token", _parse_word),
     "tree": ("tree", _parse_tree),
+    "pin": ("pin", _parse_tree),
+    "ranks": ("ranks", _parse_ranks),
 }
 
 
@@ -324,12 +371,17 @@ class JobSpec:
     #: Whole nodes the job holds; more than one makes it a multi-node job (MULTI-NODE JOBS).
     nodes: int = 1
     priority: int = 0
-    #: Wall-clock limit from START, in seconds. ``None`` takes the watcher's default; 0 is none.
+    #: Wall-clock limit from START, in seconds; 0 states that there is none.
     wall_s: float | None = None
     owner: str = ""
     token: str = ""
-    #: The checkout the job runs against: its working directory and first PYTHONPATH entry.
+    #: A directory nothing pins that the job runs against as it is: its working directory and
+    #: first PYTHONPATH entry.
     tree: str = ""
+    #: The pin file of the tree the job runs: made on this node and checked before it starts.
+    pin: str = ""
+    #: The rank worlds an engine job must hear from: ``(role instance, world size)`` each (Origin).
+    ranks: tuple[tuple[str, int], ...] = ()
     #: When the job was submitted (the pending file's mtime).
     submitted: float = 0.0
     #: Times the job has run again after lost allocations (its ``#spool-rerun:`` line).
@@ -407,7 +459,12 @@ def job_spec_from_script(name: str, text: str, submitted: float = 0.0) -> JobSpe
         except ValueError as exc:
             errors.append(f"{key}={raw!r}: {exc}")
     if "gpus" not in values:
-        spec.gpus = 0 if name.startswith(FREE_PREFIX) else None
+        # Whole nodes when it states ``nodes``; else it states no size and is refused.
+        spec.gpus = None
+        if "nodes" not in values:
+            errors.append(SIZE_MISSING)
+    if "wall" not in values:
+        errors.append(WALL_MISSING)
     spec.errors = errors
     return spec
 
@@ -417,30 +474,44 @@ def scrub_environment(env: Mapping[str, str]) -> dict[str, str]:
     return {k: v for k, v in env.items() if not SCRUB_PATTERN.match(k)}
 
 
-def is_mpi_attached(environ: Mapping[str, str]) -> bool:
+#: What a lead keeps of the allocation in the jobs it runs: the job's identity, nothing of a task.
+LEAD_KEPT = re.compile(
+    r"^SLURM_(JOB_|JOBID$|CONF$|CLUSTER_NAME$|WORKING_CLUSTER$|NODELIST$|NNODES$|SUBMIT_|"
+    r"RESTART_COUNT$)"
+)
+#: What a lead drops besides every other ``SLURM*``: whatever bootstraps or names an MPI rank.
+_LEAD_DROPPED = re.compile(r"^(PMI|PMIX|OMPI|PRTE|PALS|MPI)")
+
+
+def lead_environment(env: Mapping[str, str]) -> dict[str, str]:
+    """``env`` for a job the lead runs: the allocation's identity kept, the task's and step's dropped.
+
+    A step started from it joins this allocation (``SLURM_JOB_ID``) and is given its own task
+    and MPI context by the launcher; nothing of the lead's own task reaches a rank.
+    """
+    return {
+        k: v
+        for k, v in env.items()
+        if not _LEAD_DROPPED.match(k) and (not k.startswith("SLURM") or LEAD_KEPT.match(k))
+    }
+
+
+def is_mpi_attached(environ: Mapping[str, str], *, job_identity: bool = False) -> bool:
     """Whether a process carries the allocation's Slurm/PMI context: the safe-kill rule.
 
     ``PMI_FD`` is Slurm's PMI-2 wire-up. An ``mpirun`` started inside a scrubbed job has its own
     PMIx namespace and is not attached: signalling it or its ranks cannot reach the allocation.
+    With ``job_identity`` (a lead's own children) the variables :func:`lead_environment` keeps do
+    not count: they name the allocation and make the process no part of its MPI job.
     """
     for key, value in environ.items():
-        if key.startswith("SLURM_") or key == "PMI_FD":
+        if key == "PMI_FD":
+            return True
+        if key.startswith("SLURM_") and not (job_identity and LEAD_KEPT.match(key)):
             return True
         if key == "PMIX_NAMESPACE" and value.startswith("slurm"):
             return True
     return False
-
-
-def restart_count(environ: Mapping[str, str]) -> int | None:
-    """Times Slurm has requeued this allocation (``SLURM_RESTART_COUNT``); ``None`` outside Slurm.
-
-    Slurm sets it only once a job has been requeued, so a job that has an id
-    and no count is on its first start.
-    """
-    value = environ.get("SLURM_RESTART_COUNT", "").strip()
-    if value.isdigit():
-        return int(value)
-    return 0 if environ.get("SLURM_JOB_ID") else None
 
 
 # --------------------------------------------------------------------------- /proc
@@ -570,6 +641,26 @@ def read_device_memory_mib() -> dict[str, int] | None:
     return used or None
 
 
+def read_device_holders() -> dict[str, list[int]]:
+    """The pids of the compute processes on each device, keyed by device UUID; empty when unknown."""
+    try:
+        done = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=gpu_uuid,pid", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    holders: dict[str, list[int]] = {}
+    for line in done.stdout.splitlines():
+        fields = [part.strip() for part in line.split(",")]
+        if len(fields) == 2 and fields[1].isdigit():
+            holders.setdefault(fields[0], []).append(int(fields[1]))
+    return holders
+
+
 # --------------------------------------------------------------------------- files
 
 
@@ -590,7 +681,12 @@ class SpoolPaths:
         self.gangs = self.root / "gangs"
         self.status = self.root / "watcher.status"
         self.snapshot = self.root / "status.json"
-        self.handover = self.root / HANDOVER_DIRNAME
+        self.holders = self.root / HOLDERS_DIRNAME
+        self.stop = self.root / STOP_MARKER
+        #: The run's controller writes what it sees of the pool here each pass (``pool.py``).
+        self.pool = self.root / POOL_SNAPSHOT
+        #: Per job, the files a multi-node job's steps run (``jobs/<name>/``).
+        self.jobs = self.root / "jobs"
 
     def ensure(self) -> None:
         for name in self.SUBDIRS:
@@ -613,10 +709,15 @@ class SpoolPaths:
             self.done / f"{name}.sh",
             self.logs / f"{name}.log",
             self.resolve_log(name),
+            self.tree_log(name),
         ]
 
     def resolve_log(self, name: str) -> Path:
         return self.logs / f"{name}.resolve.jsonl"
+
+    def tree_log(self, name: str) -> Path:
+        """Per host of a pinned job: the tree made there and what was verified (``pintree.py``)."""
+        return self.logs / f"{name}.tree.jsonl"
 
     def archive(self, name: str) -> list[Path]:
         """Move a previous run's results under ``history/`` instead of overwriting them."""
@@ -629,6 +730,12 @@ class SpoolPaths:
                 os.replace(path, target)
                 moved.append(target)
         return moved
+
+    def stopped(self, holder: str = "") -> bool:
+        """Whether the pool is ending, or ``holder`` alone is asked to end."""
+        if self.stop.exists():
+            return True
+        return bool(holder) and (self.holders / f"{holder}.{STOP_MARKER}").exists()
 
     def live_watchers(self, stale_s: float, now: float | None = None) -> list[dict]:
         """Status records of every watcher that heart-beat within ``stale_s``."""
@@ -670,16 +777,26 @@ def watcher_records(spool: str | Path) -> list[dict]:
     return list(found.values())
 
 
-def latest_watcher(spool: str | Path) -> dict:
-    """The newest watcher record, including a successor not yet in status.json."""
-    return max(watcher_records(spool), key=lambda row: float(row["alive_epoch"]), default={})
-
-
 def watcher_age(spool: str | Path, now: float | None = None) -> float | None:
     """Seconds since any watcher on ``spool`` last heart-beat; ``None`` if none ever did."""
     now = time.time() if now is None else now
     beats = [float(record["alive_epoch"]) for record in watcher_records(spool)]
     return now - max(beats) if beats else None
+
+
+def holder_coming(spool: str | Path, now: float | None = None) -> bool:
+    """Whether the run's controller is getting ``spool`` a holder, by its own fresh snapshot.
+
+    Between two holders, or before the first has left the queue, no watcher heart-beats and the
+    spool is still served: a job queued now starts when the holder does.
+    """
+    now = time.time() if now is None else now
+    snapshot = read_json(SpoolPaths(spool).pool) or {}
+    try:
+        fresh = now - float(snapshot.get("at", 0)) <= POOL_FRESH_S
+    except (TypeError, ValueError):
+        return False
+    return fresh and not snapshot.get("stopping")
 
 
 # --------------------------------------------------------------------------- scheduler
@@ -691,16 +808,18 @@ class SchedulerConfig:
 
     #: Device ids this watcher hands out, as ``CUDA_VISIBLE_DEVICES`` spells them.
     devices: tuple[str, ...] = ()
-    #: Wall limit for a GPU job that declares none. Device-free jobs default to none.
-    default_wall_s: float = DEFAULT_WALL_S
     #: How long processes a finished job left behind may outlive it.
     leftover_grace_s: float = 10.0
-    #: The session this watcher belongs to, for status and the operator loop.
+    #: The session this watcher belongs to, for status.
     session: str = ""
-    #: When the allocation ends (epoch seconds); ``None`` when unknown.
+    #: When the allocation ends (epoch seconds); ``None`` when it has no end.
     ends_at: float | None = None
-    #: How long before ``ends_at`` the watcher is in hand-over and stops admitting long jobs.
-    handover_lead_s: float = 3600.0
+    #: The holder this watcher belongs to: the name its submission was recorded under.
+    holder: str = ""
+    #: How many nodes that holder has (its shape).
+    nodes: int = 1
+    #: Lead mode: no devices, forms the multi-node jobs of its holder and runs their scripts.
+    lead: bool = False
 
 
 @dataclass
@@ -769,29 +888,26 @@ class Scheduler:
         self.environ = dict(os.environ if environ is None else environ)
         self.host = socket.gethostname()
         self.slurm_job = self.environ.get("SLURM_JOB_ID", "unknown")
-        #: Which start of a requeued allocation this is; ``None`` outside Slurm.
-        self.restart = restart_count(self.environ)
-        self.watcher_id = watcher_id or f"{self.host}-{os.getpid()}"
+        # A lead shares its host with that node's watcher, in another pid namespace.
+        kind = "-lead" if self.config.lead else ""
+        self.watcher_id = watcher_id or f"{self.host}{kind}-{os.getpid()}"
         self.started = self.clock()
         self.jobs: dict[str, RunningJob] = {}
         self.pending_reasons: dict[str, str] = {}
         self._spec_cache: dict[str, tuple[float, JobSpec]] = {}
         self._last_pending: list[JobSpec] = []
-        #: Set when ending or a later-ending successor is ready: since when,
-        #: and the successor's watcher once one is up.
-        self.handover: dict = {}
-        #: Free device -> when a reading first found it over ``DEVICE_MAX_USED_MIB``.
-        self._device_held_since: dict[str, float] = {}
-        #: Device -> ``used_mib`` and ``since`` (first found over) for memory never released.
-        self._device_quarantine: dict[str, dict] = {}
+        #: Free device -> ``used_mib``, ``pids`` and ``since`` for memory a reading found on it
+        #: that no job of this watcher holds (Clean); the heartbeat reports it as ``held``.
+        self._held: dict[str, dict] = {}
         #: This pass's device reading, taken at most once a pass (see _read_device_memory).
         self._device_reading: Mapping[str, int] | None = None
         self._device_read = False
-        self._device_read_epoch = 0.0
-        #: This pass's native locations by job tree (see _admission_hold).
-        self._native_seen: dict[str, list[str]] = {}
-        #: The multi-node job this node drains for, while it forms (see _serve_gangs).
+        #: When a device reading last succeeded; ``None`` until one has.
+        self._device_read_epoch: float | None = None
+        #: The multi-node job this node drains for, or holds its devices for (see _serve_gangs).
         self._reserved_for = ""
+        #: A lead: whether a watcher of its own holder has been seen alive.
+        self._peers_seen = False
         self.paths.ensure()
 
     # ------------------------------------------------------------- lifecycle
@@ -805,15 +921,20 @@ class Scheduler:
             f"started={utc_iso(self.started)}",
             f"spool={self.paths.root}",
             f"session={self.config.session or '-'}",
+            f"holder={self.config.holder or '-'} nodes={self.config.nodes}"
+            + (" lead" if self.config.lead else ""),
             f"devices={','.join(self.config.devices) or '-'}",
             f"CUDA_VISIBLE_DEVICES={self.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}",
             f"watcher: ready at {utc_iso()}",
         ]
         write_text_atomic(self.paths.status, "\n".join(lines) + "\n")
+        if self.config.devices:
+            # The first heartbeat says whether this watcher can read its devices at all.
+            self._read_device_memory(self.clock())
         self.heartbeat()
 
     def serve(self) -> int:
-        """Run until a successor is up and every job this watcher started is gone."""
+        """Run until this watcher may retire and every job it started is gone (Retire)."""
         while True:
             try:
                 self.tick()
@@ -828,10 +949,9 @@ class Scheduler:
                     file=sys.stderr,
                     flush=True,
                 )
-            if self.handover.get("successor") and not self.jobs:
-                self._append_status(
-                    f"watcher: handed over to {self.handover['successor']}, exiting at {utc_iso()}"
-                )
+            why = self._exit_reason(self.clock())
+            if why:
+                self._append_status(f"watcher: {why}; exiting at {utc_iso()}")
                 (self.paths.watchers / f"{self.watcher_id}.json").unlink(missing_ok=True)
                 return 0
             time.sleep(POLL_S)
@@ -846,12 +966,13 @@ class Scheduler:
         """One scheduling pass: reap, enforce limits, admit, report."""
         now = self.clock()
         table = read_proc_table()
+        self._device_reading, self._device_read = None, False
         for job in list(self.jobs.values()):
             self._advance(job, now, table)
         self._recover_orphans(now, table)
         self._serve_gangs(now)
-        self._plan_handover(now)
         self._admit(now)
+        self._report_devices(now)
         self.heartbeat()
 
     def heartbeat(self) -> None:
@@ -861,32 +982,33 @@ class Scheduler:
         write_json_atomic(self.paths.snapshot, snapshot)
 
     def snapshot(self, now: float) -> dict:
-        """What this watcher is doing, for status readers and the operator loop."""
+        """What this watcher is doing, for status readers and the pool's controller."""
         allocated = self._allocated()
         quarantined = self._quarantined()
+        held = set(self._held)
         return {
             "watcher": self.watcher_id,
             "host": self.host,
             "pid": os.getpid(),
             "slurm_job": self.slurm_job,
-            "restart": self.restart,
             "session": self.config.session,
+            "holder": self.config.holder,
+            "nodes": self.config.nodes,
+            "lead": self.config.lead,
             "spool": str(self.paths.root),
             "started": utc_iso(self.started),
             "alive": utc_iso(now),
             "alive_epoch": now,
             "ends_at": utc_iso(self.config.ends_at) if self.config.ends_at else None,
-            "default_wall_s": self.config.default_wall_s,
             "ends_at_epoch": self.config.ends_at,
             "remaining_s": round(self.config.ends_at - now, 1) if self.config.ends_at else None,
-            "handover": dict(self.handover) or None,
+            "retiring": self._retire_reason(now) or None,
+            "reserved_for": self._reserved_for or None,
             "devices": list(self.config.devices),
-            "free": [d for d in self.config.devices if d not in allocated | quarantined],
+            "free": [d for d in self.config.devices if d not in allocated | quarantined | held],
             "quarantined": sorted(quarantined),
-            "quarantined_memory": {
-                device: {"used_mib": entry["used_mib"], "since": utc_iso(entry["since"])}
-                for device, entry in sorted(self._device_quarantine.items())
-            },
+            "held": {device: dict(entry) for device, entry in sorted(self._held.items())},
+            "device_reading_epoch": self._device_read_epoch,
             "running": [self._describe_running(job, now) for job in self.jobs.values()],
             "pending": [
                 {
@@ -928,9 +1050,6 @@ class Scheduler:
     # ------------------------------------------------------------- admission
 
     def _effective_priority(self, spec: JobSpec, now: float) -> int:
-        if spec.priority < 0:
-            # Background work (the tune campaign's) never ages past anyone else's.
-            return spec.priority
         return spec.priority + int(max(0.0, now - spec.submitted) // AGING_S)
 
     def _rank_key(self, spec: JobSpec, now: float) -> tuple:
@@ -945,12 +1064,12 @@ class Scheduler:
         return {d for job in self.jobs.values() for d in job.devices}
 
     def _quarantined(self) -> set[str]:
-        held = {d for job in self.jobs.values() if job.unsafe_pids for d in job.devices}
-        return held | set(self._device_quarantine)
+        """Devices of a finished job whose processes the safe-kill rule forbids stopping."""
+        return {d for job in self.jobs.values() if job.unsafe_pids for d in job.devices}
 
     def _free_devices(self) -> list[str]:
-        """Devices no job of this watcher holds and no quarantine keeps, in the order handed out."""
-        taken = self._allocated() | set(self._device_quarantine)
+        """Devices no job of this watcher holds, in the order handed out."""
+        taken = self._allocated()
         return [d for d in self.config.devices if d not in taken]
 
     def _scan_pending(self) -> list[JobSpec]:
@@ -979,19 +1098,21 @@ class Scheduler:
         return specs
 
     def _classify(self, spec: JobSpec) -> JobSpec:
-        """Apply this watcher's defaults and refuse what it can never run."""
-        if spec.wall_s is None:
-            spec.wall_s = self.config.default_wall_s if spec.holds_gpus else 0.0
+        """Refuse what this watcher can never run."""
         if spec.tree and not Path(spec.tree).is_dir():
             spec.errors.append(f"tree {spec.tree} is not a directory this watcher can see")
+        if spec.pin and spec.tree:
+            spec.errors.append("names both pin= and tree=: a job runs one tree")
+        elif spec.pin and not Path(spec.pin).is_file():
+            spec.errors.append(f"pin {spec.pin} is not a file this watcher can see")
         if spec.gang and spec.gpus is not None:
             spec.errors.append(
                 f"asks for {spec.nodes} nodes and {spec.gpus} GPU(s): a multi-node job holds "
                 f"whole nodes; drop gpus or set gpus=all"
             )
-        if spec.gpus is not None and spec.gpus > len(self.config.devices):
+        if not self.config.lead and spec.gpus is not None and spec.gpus > len(self.config.devices):
             spec.errors.append(
-                f"asks for {spec.gpus} GPU(s); this session hands out "
+                f"asks for {spec.gpus} GPU(s); this watcher hands out "
                 f"{len(self.config.devices)} ({','.join(self.config.devices) or 'none'})"
             )
         return spec
@@ -1000,12 +1121,11 @@ class Scheduler:
         pending = self._scan_pending()
         self._last_pending = []
         self.pending_reasons = {}
-        self._device_reading, self._device_read = None, False
-        self._native_seen = {}
-        if self._device_quarantine and now - self._device_read_epoch >= DEVICE_RECHECK_S:
-            self._read_device_memory(now)
+        stopping = self.paths.stopped(self.config.holder)
         blocked_by: str | None = None
         for spec in sorted(pending, key=lambda s: self._rank_key(s, now)):
+            if self.config.lead and not spec.gang:
+                continue  # a node's watcher takes it
             if spec.errors:
                 self._refuse(spec, "; ".join(spec.errors))
                 continue
@@ -1017,11 +1137,20 @@ class Scheduler:
             if (self.paths.running / f"{spec.name}.sh").exists():
                 self._wait(spec, "a job of the same name is still running")
                 continue
+            if stopping:
+                self._wait(spec, "the pool is ending: this watcher takes nothing more")
+                continue
             hold = self._admission_hold(spec, now)
             if hold is not None:
                 self._wait(spec, hold.reason)
                 continue
             if spec.gang:
+                if not self.config.lead:
+                    self._wait(
+                        spec,
+                        f"a multi-node job: the lead of a holder with {spec.nodes} nodes forms it",
+                    )
+                    continue
                 leads = self._leads(spec.name)
                 if blocked_by is not None and not leads:
                     self._wait(spec, f"queued behind {blocked_by}")
@@ -1029,7 +1158,7 @@ class Scheduler:
                 hold = self._gang_step(spec, now)
                 if hold is not None:
                     self._wait(spec, hold.reason)
-                    # Only a formed job this node leads holds back the work ranked below it.
+                    # Only a formed job this lead holds back the work ranked below it.
                     if self._leads(spec.name):
                         blocked_by = spec.name
                 continue
@@ -1063,65 +1192,38 @@ class Scheduler:
         return None
 
     def _place(self, spec: JobSpec, now: float) -> "tuple[str, ...] | Hold":
-        """The devices a GPU job starts on now, or why it waits for devices.
+        """The devices a GPU job starts on now, or why it waits for devices (Clean).
 
-        Only free devices are read against :data:`DEVICE_MAX_USED_MIB` (running jobs' memory is
-        on the devices they hold). Only a reading returns a quarantined device, so a job that only
-        a quarantined device would place takes a reading first.
+        A device is handed out only when no job here holds it and this pass's reading finds its
+        memory back. A reading that failed, or that does not name the device, leaves it not
+        free: the job waits, whatever holds the memory is reported, and nothing is killed.
         """
         free = self._free_devices()
-        devices = self._devices_for(spec, free)
-        if devices is None and self._device_quarantine:
-            quarantined = [d for d in self.config.devices if d in self._device_quarantine]
-            if self._devices_for(spec, free + quarantined) is not None:
-                self._read_device_memory(now)
-                free = self._free_devices()
-                devices = self._devices_for(spec, free)
-        if devices is None:
-            return Hold(self._device_wait_reason(spec, free))
-        reading = self._read_device_memory(now) if devices else None
+        if self._devices_for(spec, free) is None:
+            return Hold(self._device_wait_reason(spec, free, free))
+        reading = self._read_device_memory(now)
         if reading is None:
-            return devices
-        free = self._free_devices()
-        held = {d: reading[d] for d in free if reading.get(d, 0) > DEVICE_MAX_USED_MIB}
-        for device in set(self._device_held_since) - set(held):
-            del self._device_held_since[device]
-        for device in held:
-            self._device_held_since.setdefault(device, now)
-        overdue = {
-            device: used
-            for device, used in held.items()
-            if now - self._device_held_since[device] >= DEVICE_RELEASE_WAIT_S
-        }
-        if overdue:
-            self._quarantine_devices(overdue, now)
-            free = [d for d in free if d not in overdue]
-        devices = self._devices_for(
-            spec, [d for d in free if d not in held] + [d for d in free if d in held]
-        )
+            return Hold(
+                "no device reading this pass (nvidia-smi failed or named no device): a device "
+                "that cannot be read is not free"
+            )
+        clean = [d for d in free if d in reading and reading[d] <= DEVICE_MAX_USED_MIB]
+        devices = self._devices_for(spec, clean)
         if devices is None:
-            return Hold(self._device_wait_reason(spec, free))
-        waiting = [d for d in devices if d in held]
-        if not waiting:
-            return devices
-        since = min(self._device_held_since[d] for d in waiting)
-        return Hold(
-            "device memory in use: "
-            + ", ".join(f"{d} ({held[d]} MiB)" for d in waiting)
-            + f" > {DEVICE_MAX_USED_MIB:.0f} MiB (waiting {now - since:.0f}s of "
-            f"{DEVICE_RELEASE_WAIT_S:.0f}s for it to be released)"
-        )
+            return Hold(self._device_wait_reason(spec, clean, free))
+        return devices
 
-    def _device_wait_reason(self, spec: JobSpec, free: list[str]) -> str:
+    def _device_wait_reason(self, spec: JobSpec, clean: list[str], free: list[str]) -> str:
         reason = (
             "waiting for the whole node to drain"
             if spec.whole
-            else f"waiting for {spec.gpus} GPU(s); {len(free)} free"
+            else f"waiting for {spec.gpus} GPU(s); {len(clean)} free"
         )
-        if self._device_quarantine:
-            reason += "; quarantined, memory not released: " + ", ".join(
-                f"{device} ({entry['used_mib']} MiB)"
-                for device, entry in sorted(self._device_quarantine.items())
+        dirty = [d for d in free if d not in clean]
+        if dirty:
+            reason += "; memory not back on: " + ", ".join(
+                f"{d} ({self._held[d]['used_mib']} MiB)" if d in self._held else f"{d} (no reading)"
+                for d in dirty
             )
         return reason
 
@@ -1129,116 +1231,132 @@ class Scheduler:
         """Memory in use on each device (MiB) by device id; ``None`` when it cannot be read."""
         return read_device_memory_mib()
 
+    def device_holders(self) -> Mapping[str, list[int]]:
+        """The pids of the compute processes on each device, by device id; empty when unknown."""
+        return read_device_holders()
+
     def _read_device_memory(self, now: float) -> Mapping[str, int] | None:
         """This pass's device reading: ``nvidia-smi`` runs once a pass at most.
 
-        A reading returns every quarantined device it finds released.
+        Each reading renews ``held``: the free devices whose memory is not back, with the pids
+        on them. Those are not this watcher's to stop; the pool's controller reports them.
         """
         if self._device_read:
             return self._device_reading
-        self._device_read, self._device_read_epoch = True, now
+        self._device_read = True
         self._device_reading = self.device_memory_mib()
         if self._device_reading is None:
+            self._held = {}
             return None
-        for device, entry in list(self._device_quarantine.items()):
-            used = self._device_reading.get(device)
-            if used is None:
-                continue
-            if used > DEVICE_MAX_USED_MIB:
-                entry["used_mib"] = used
-                continue
-            del self._device_quarantine[device]
-            self._append_status(
-                f"watcher: device {device} released its memory ({used} MiB in use); "
-                f"back in service at {utc_iso(now)}"
-            )
+        self._device_read_epoch = now
+        over = {
+            device: self._device_reading[device]
+            for device in self._free_devices()
+            if self._device_reading.get(device, 0) > DEVICE_MAX_USED_MIB
+        }
+        if getattr(self, "_gang_started", False):
+            # This node is reserved for a multi-node job its lead is running: the engines on
+            # its devices are that job's (started by the lead's steps, so no job of this
+            # watcher), not memory nobody accounts for. The usual rule is back with the receipt.
+            over = {}
+        holders = self.device_holders() if over else {}
+        self._held = {
+            device: {
+                "used_mib": used,
+                "pids": sorted(holders.get(device, ())),
+                "since": self._held.get(device, {}).get("since", now),
+            }
+            for device, used in over.items()
+        }
         return self._device_reading
 
-    def _quarantine_devices(self, overdue: Mapping[str, int], now: float) -> None:
-        """Take devices out of service whose memory no job of this watcher accounts for."""
-        for device, used in overdue.items():
-            since = self._device_held_since.pop(device, now)
-            self._device_quarantine[device] = {"used_mib": used, "since": since}
-            self._append_status(
-                f"watcher: device {device} quarantined at {utc_iso(now)}: {used} MiB in use "
-                f"{now - since:.0f}s after a reading first found it so, and no job here holds it"
-            )
+    def _report_devices(self, now: float) -> None:
+        """Keep the heartbeat's device reading at most :data:`DEVICE_READING_S` old."""
+        if not self.config.devices or self._device_read:
+            return
+        last = self._device_read_epoch
+        if last is None or now - last >= DEVICE_READING_S:
+            self._read_device_memory(now)
 
     def _admission_hold(self, spec: JobSpec, now: float) -> "Hold | None":
         """Why this job must wait whatever the devices say; ``None`` if it may start.
 
         These holds never block the jobs ranked below: they are about the job
-        itself (the session is ending, the native build it loads is being
-        rebuilt), not about a resource it shares with them.
+        itself (it does not fit before the allocation's end), not about a
+        resource it shares with them.
         """
-        hold = self._handover_hold(spec, now)
-        if hold is not None:
-            return hold
-        if spec.holds_gpus:
-            for marker in _rebuild.active_announcements(self.paths.root, now):
-                # A job that names no tree imports whatever the session's
-                # interpreter resolves, which is most often the tree being
-                # rebuilt, so it waits too.
-                if spec.tree and not _rebuild.loads_rebuilt(
-                    spec.tree, marker, self._native_locations(spec.tree)
-                ):
-                    continue
-                linked = (
-                    f"; {spec.tree} shares its native build"
-                    if spec.tree and not _rebuild.same_tree(spec.tree, marker.get("tree"))
-                    else ""
-                )
-                return Hold(
-                    f"native rebuild of {marker.get('tree')} in progress since "
-                    f"{utc_iso(float(marker.get('started', now)))} on {marker.get('host')}" + linked
-                )
+        return self._fit_hold(spec, now)
+
+    def _fit_hold(self, spec: JobSpec, now: float) -> "Hold | None":
+        """Fit: a GPU job starts only if its wall and the margin end before the allocation does."""
+        ends_at = self.config.ends_at
+        if ends_at is None or not spec.holds_gpus:
+            return None
+        remaining = ends_at - now
+        wall = float(spec.wall_s or 0)
+        if wall <= 0 or wall + FIT_MARGIN_S > remaining:
+            return Hold(
+                f"the allocation ends in {remaining:.0f}s, too soon for a job allowed "
+                f"{'unlimited time' if wall <= 0 else f'{wall:.0f}s'}; it waits for a holder "
+                f"that ends later"
+            )
         return None
 
-    def _native_locations(self, tree: str) -> list[str]:
-        """Where ``tree``'s native build really is, resolved once a pass."""
-        if tree not in self._native_seen:
-            self._native_seen[tree] = _rebuild.native_locations(tree)
-        return self._native_seen[tree]
+    # ----------------------------------------------------------------- retire
 
-    # -------------------------------------------------------------- hand-over
+    def _same_holder(self, record: Mapping[str, Any]) -> bool:
+        """Whether ``record`` is a watcher (or the lead) of this watcher's own holder."""
+        if self.config.holder and record.get("holder") == self.config.holder:
+            return True
+        return self.slurm_job != "unknown" and record.get("slurm_job") == self.slurm_job
 
-    def _plan_handover(self, now: float) -> None:
-        """Drain when the allocation is ending or a later-ending successor is ready."""
+    def _retire_reason(self, now: float) -> str:
+        """Why this watcher exits once it runs nothing, or ``""`` (Retire).
+
+        A stop marker; or a live watcher of another holder of as many nodes whose allocation
+        ends later. A holder of another width is no successor, wider or narrower: work needs
+        the holder of its own width, and the pool gives back one that none needs. Read from
+        the files each time it is asked, never remembered.
+        """
+        if self.paths.stop.exists():
+            return "the pool is ending"
+        if self.paths.stopped(self.config.holder):
+            return f"holder {self.config.holder} was asked to end"
         ends_at = self.config.ends_at
         if ends_at is None:
-            return
+            return ""
+        for peer in self.paths.live_watchers(WATCHER_STALE_S, now):
+            if peer.get("lead") or peer.get("watcher") == self.watcher_id:
+                continue
+            if self._same_holder(peer) or int(peer.get("nodes") or 1) != self.config.nodes:
+                continue
+            if _ends_after(peer, ends_at):
+                later = peer.get("holder") or peer.get("watcher")
+                return f"holder {later} ends later and has as many nodes"
+        return ""
+
+    def _exit_reason(self, now: float) -> str:
+        """Why this watcher exits now, or ``""``: it may retire and nothing is left to it."""
+        if self.jobs or self._reserved_for:
+            return ""
+        why = self._retire_reason(now)
+        if not why or not self.config.lead:
+            return why
+        # A lead ends its allocation: only once no watcher of its holder is left.
         peers = [
             peer
             for peer in self.paths.live_watchers(WATCHER_STALE_S, now)
-            if peer.get("watcher") != self.watcher_id and _ends_after(peer, ends_at)
+            if not peer.get("lead") and self._same_holder(peer)
         ]
-        if ends_at - now > self.config.handover_lead_s and not peers:
-            return
-        if not self.handover:
-            self.handover["since"] = utc_iso(now)
-            self._append_status(f"watcher: allocation ends {utc_iso(ends_at)}; in hand-over")
         if peers:
-            successor = peers[0].get("watcher")
-            if self.handover.get("successor") != successor:
-                self._append_status(f"watcher: successor {successor} is up")
-            self.handover["successor"] = successor
-
-    def _handover_hold(self, spec: JobSpec, now: float) -> "Hold | None":
-        ends_at = self.config.ends_at
-        if ends_at is None:
-            return None
-        successor = self.handover.get("successor")
-        if successor:
-            return Hold(f"this session is handing over to {successor}")
-        remaining = ends_at - now
-        wall = float(spec.wall_s or 0)
-        if spec.holds_gpus and (wall <= 0 or wall + HANDOVER_MARGIN_S > remaining):
-            return Hold(
-                f"the allocation ends in {remaining:.0f}s, too soon for a job allowed "
-                f"{'unlimited time' if wall <= 0 else f'{wall:.0f}s'}; it waits for the "
-                f"successor session, which drains this spool"
-            )
-        return None
+            self._peers_seen = True
+            return ""
+        if not self._peers_seen and now - self.started < WATCHER_STALE_S:
+            return ""  # its watchers may still be starting
+        for root in self.paths.gangs.iterdir():
+            if self._leads(root.name):
+                shutil.rmtree(root, ignore_errors=True)
+        return why
 
     def _wait(self, spec: JobSpec, reason: str) -> None:
         self.pending_reasons[spec.name] = reason
@@ -1258,9 +1376,9 @@ class Scheduler:
         return bool(record) and record.get("leader") == self.watcher_id
 
     def _gang_step(self, spec: JobSpec, now: float) -> "Hold | None":
-        """Form multi-node job ``spec`` with this node leading, then start it once all drained.
+        """Form multi-node job ``spec`` from this lead's holder, then run it once all drained.
 
-        ``None`` once it started here (or another watcher claimed it); otherwise why it waits.
+        ``None`` once it started here (or another lead claimed it); otherwise why it waits.
         """
         root = self.paths.gangs / spec.name
         record = read_json(root / GANG_RECORD)
@@ -1271,50 +1389,44 @@ class Scheduler:
         if record is None:
             others = sorted(p.name for p in self.paths.gangs.iterdir() if p.is_dir())
             if others:
-                return Hold(f"the multi-node job {others[0]} holds this session's nodes")
+                return Hold(f"the multi-node job {others[0]} holds this spool's nodes")
             peers = sorted(
                 (
                     w
                     for w in self.paths.live_watchers(WATCHER_STALE_S, now)
-                    if w.get("slurm_job") == self.slurm_job
-                    and w.get("watcher") != self.watcher_id
-                    and w.get("host") != self.host
+                    if not w.get("lead") and self._same_holder(w)
                 ),
                 key=lambda w: (str(w.get("host")), str(w.get("watcher"))),
-            )[: spec.nodes - 1]
-            if len(peers) < spec.nodes - 1:
+            )[: spec.nodes]
+            if len(peers) < spec.nodes:
                 return Hold(
-                    f"asks for {spec.nodes} nodes; allocation {self.slurm_job} has "
-                    f"{1 + len(peers)} live on this spool"
+                    f"asks for {spec.nodes} nodes; holder "
+                    f"{self.config.holder or self.slurm_job} has {len(peers)} live on this spool"
                 )
             try:
                 root.mkdir()
             except FileExistsError:
-                return Hold("another watcher is forming it")
+                return Hold("another lead is forming it")
             record = {
                 "name": spec.name,
                 "leader": self.watcher_id,
                 "allocation": self.slurm_job,
-                "members": [self.watcher_id, *(str(w["watcher"]) for w in peers)],
-                "hosts": [self.host, *(str(w.get("host")) for w in peers)],
+                "holder": self.config.holder,
+                "members": [str(w["watcher"]) for w in peers],
+                "hosts": [str(w.get("host")) for w in peers],
                 "formed": utc_iso(now),
             }
             write_json_atomic(root / GANG_RECORD, record)
         if record.get("leader") != self.watcher_id:
             return Hold(f"its nodes are formed by {record.get('leader')}")
         members, hosts = list(record["members"]), list(record["hosts"])
-        lost = [h for m, h in zip(members[1:], hosts[1:]) if m not in live]
+        lost = [h for m, h in zip(members, hosts) if m not in live]
         if lost:
             shutil.rmtree(root, ignore_errors=True)
             return Hold(f"{', '.join(lost)} stopped heart-beating; its nodes are formed again")
-        placed = self._place(spec, now)
-        if isinstance(placed, Hold):
-            return Hold(f"this node: {placed.reason}")
-        waiting = [
-            h for m, h in zip(members[1:], hosts[1:]) if not (root / GANG_READY / m).exists()
-        ]
+        waiting = [h for m, h in zip(members, hosts) if not (root / GANG_READY / m).exists()]
         if waiting:
-            return Hold(f"waiting for {', '.join(waiting)} to drain for it")
+            return Hold(f"waiting for {', '.join(waiting)} to drain and read clean for it")
         pending = self.paths.pending / f"{spec.name}.sh"
         running = self.paths.running / f"{spec.name}.sh"
         try:
@@ -1324,13 +1436,19 @@ class Scheduler:
         self._spec_cache.pop(spec.name, None)
         self.paths.archive(spec.name)
         write_json_atomic(root / GANG_GO, {"hosts": hosts, "started": utc_iso(now)})
-        gang = {"name": spec.name, "rank": 0, "nodes": len(members), "hosts": hosts}
-        self._launch(spec, running, placed, now, gang={**gang, "members": members})
+        gang = {"name": spec.name, "nodes": len(members), "hosts": hosts, "members": members}
+        self._launch(spec, running, (), now, gang=gang)
         return None
 
     def _serve_gangs(self, now: float) -> None:
-        """This node's part in the multi-node jobs that name it: drain while one forms, then run."""
+        """This node's part in the multi-node job that names it: drain, then hold its devices.
+
+        A member runs nothing of the job: the lead runs its script, whose steps reach this
+        node. The member keeps its devices out of the queue until the job's receipt exists
+        (the lead then removes the record), or until the lead stops heart-beating.
+        """
         self._reserved_for = ""
+        self._gang_started = False
         live: set[str] | None = None
         for root in sorted(p for p in self.paths.gangs.iterdir() if p.is_dir()):
             name = root.name
@@ -1343,138 +1461,52 @@ class Scheduler:
                 shutil.rmtree(root, ignore_errors=True)
                 continue
             record = read_json(root / GANG_RECORD)
-            members = list((record or {}).get("members") or [])
-            if self.watcher_id not in members[1:]:
-                continue
-            rank, name = members.index(self.watcher_id), root.name
-            part = f"{name}.node{rank}"
-            if part in self.jobs or (root / GANG_PARTS / f"{rank}.json").exists():
+            if self.watcher_id not in list((record or {}).get("members") or []):
                 continue
             live = self._live(now) if live is None else live
             if record.get("leader") not in live:
                 shutil.rmtree(root, ignore_errors=True)
                 continue
-            if read_json(root / GANG_GO) is None:
-                self._reserved_for = name
-                if not any(job.spec.holds_gpus for job in self.jobs.values()):
+            self._reserved_for = name
+            if read_json(root / GANG_GO) is not None:
+                # The lead runs the job: what its steps load on this node's devices is the job's.
+                self._gang_started = True
+                continue
+            ready = root / GANG_READY / self.watcher_id
+            if self._drained_and_clean(now):
+                try:
                     (root / GANG_READY).mkdir(exist_ok=True)
-                    (root / GANG_READY / self.watcher_id).touch()
-                continue
-            script = self.paths.running / f"{name}.sh"
-            try:
-                text = script.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                continue
-            spec = self._classify(job_spec_from_script(part, text, submitted=now))
-            self.paths.archive(part)
-            gang = {"name": name, "rank": rank, "nodes": len(members), "hosts": record["hosts"]}
-            self._launch(
-                spec, script, tuple(self._free_devices()), now, gang={**gang, "members": members}
-            )
+                    ready.touch()
+                except FileNotFoundError:
+                    # The lead closed the job while this node read its devices: nothing is
+                    # left to be ready for. Dying here would take this node's jobs along.
+                    self._reserved_for = ""
+            else:
+                # A reading that fails, or memory that is back late, takes the word back.
+                ready.unlink(missing_ok=True)
 
-    def _gang_stop(self, job: RunningJob, now: float) -> Verdict | None:
-        """Why this node's part of a multi-node job must stop: another part failed, or a lost node."""
-        gang = job.gang or {}
-        root = self.paths.gangs / gang.get("name", "")
-        for path in sorted((root / GANG_PARTS).glob("*.json")):
-            part = read_json(path) or {}
-            if int(path.stem) != gang.get("rank") and part.get("rc") not in (None, 0):
-                return Verdict(
-                    RC_GANG_STOPPED,
-                    "gang_stopped",
-                    f"node {path.stem} ({part.get('host')}) of {gang.get('name')} ended "
-                    f"rc={part.get('rc')} ({part.get('reason')})",
-                )
-        live = self._live(now)
-        lost = [h for m, h in zip(gang.get("members", ()), gang.get("hosts", ())) if m not in live]
-        if lost:
-            return Verdict(
-                RC_NODE_LOST,
-                "node_lost",
-                f"{', '.join(lost)} of {gang.get('name')} stopped heart-beating",
-            )
-        return None
+    def _drained_and_clean(self, now: float) -> bool:
+        """Whether this node may join a multi-node job: nothing of its own on a device (Clean).
 
-    def _write_gang_receipt(self, job: RunningJob, now: float) -> None:
-        """Record this node's part; the leader's receipt waits for every node's."""
-        gang = job.gang or {}
-        root = self.paths.gangs / gang["name"]
-        verdict = job.verdict or Verdict(RC_LAUNCH_FAILED, "launch_failed")
-        mine = root / GANG_PARTS / f"{gang['rank']}.json"
-        if not mine.exists():
-            mine.parent.mkdir(parents=True, exist_ok=True)
-            write_json_atomic(
-                mine,
-                {
-                    "rank": gang["rank"],
-                    "host": self.host,
-                    "rc": verdict.rc,
-                    "reason": verdict.reason,
-                    "detail": verdict.detail,
-                    "started": utc_iso(job.started),
-                    "ended": utc_iso(now),
-                },
-            )
-        if gang["rank"] > 0:
-            self._log(job, f"node {gang['rank']} ended rc={verdict.rc} reason={verdict.reason}")
-            job.receipt_written = True
-            return
-        if not self._holds(gang["name"]):
-            job.receipt_written = True
-            return
-        parts = {int(p.stem): read_json(p) or {} for p in (root / GANG_PARTS).glob("*.json")}
-        live = self._live(now)
-        for rank, (member, host) in enumerate(zip(gang["members"], gang["hosts"])):
-            if rank in parts:
-                continue
-            if member in live:
-                return  # its part is still running there
-            parts[rank] = {
-                "rank": rank,
-                "host": host,
-                "rc": RC_NODE_LOST,
-                "reason": "node_lost",
-                "detail": f"{host} stopped heart-beating before its part ended",
-            }
-        failed = [parts[r] for r in sorted(parts) if parts[r].get("rc") not in (None, 0)]
-        failed.sort(key=lambda p: p.get("reason") == "gang_stopped")
-        if failed:
-            first = failed[0]
-            verdict = Verdict(
-                int(first["rc"]),
-                str(first.get("reason")),
-                f"node {first.get('rank')} ({first.get('host')}): {first.get('detail') or ''}".rstrip(
-                    ": "
-                ),
-            )
-        else:
-            verdict = self._judge_provenance(job, Verdict(0, "exit"))
-        job.verdict = verdict
-        record = self._record(
-            job.spec,
-            verdict,
-            devices=list(job.devices),
-            started=utc_iso(job.started),
-            started_epoch=job.started,
-            ended=utc_iso(now),
-            duration_s=round(now - job.started, 3),
-            wall_s=job.wall_s,
-            unsafe_pids=list(job.unsafe_pids),
-            nodes=gang["nodes"],
-            hosts=list(gang["hosts"]),
-            parts=[
-                {k: parts[r].get(k) for k in ("rank", "host", "rc", "reason")}
-                for r in sorted(parts)
-            ],
+        No GPU job of this watcher runs, and this pass's reading names every device of the
+        node with its memory back. A reading that failed is "not free" here as for any job.
+        """
+        if any(job.spec.holds_gpus for job in self.jobs.values()):
+            return False
+        reading = self._read_device_memory(now)
+        if reading is None:
+            return False
+        return all(
+            device in reading and reading[device] <= DEVICE_MAX_USED_MIB
+            for device in self.config.devices
         )
-        self._finish_files(gang["name"], record, job.log_path, now)
-        shutil.rmtree(root, ignore_errors=True)
-        job.receipt_written = True
 
     # ---------------------------------------------------------------- launch
 
     def _job_environment(self, spec: JobSpec, devices: tuple[str, ...]) -> dict[str, str]:
-        env = scrub_environment(self.environ)
+        # A lead's job starts steps of this allocation: it keeps the job's identity.
+        scrub = lead_environment if self.config.lead else scrub_environment
+        env = scrub(self.environ)
         if spec.holds_gpus:
             env["CUDA_VISIBLE_DEVICES"] = ",".join(devices)
         env.update(
@@ -1524,16 +1556,14 @@ class Scheduler:
         *,
         gang: dict | None = None,
     ) -> None:
-        """Start ``running`` as job ``spec`` on ``devices``; a multi-node part when ``gang``."""
+        """Start ``running`` as job ``spec`` on ``devices``; a lead runs a multi-node job's script."""
         log_path = self.paths.log(spec.name)
         env = self._job_environment(spec, devices)
         if gang is not None:
             env.update(
                 {
                     "MV2FLOW_JOB_NODES": str(gang["nodes"]),
-                    "MV2FLOW_JOB_NODE_RANK": str(gang["rank"]),
                     "MV2FLOW_JOB_HOSTS": ",".join(gang["hosts"]),
-                    "MV2FLOW_JOB_MASTER": gang["hosts"][0],
                 }
             )
         header = (
@@ -1543,18 +1573,25 @@ class Scheduler:
         )
         if gang is not None:
             header += (
-                f"=== node {gang['rank']} of {gang['nodes']} of {gang['name']}: "
-                f"{','.join(gang['hosts'])} ===\n"
+                f"=== {gang['nodes']} nodes, run once by the lead: {','.join(gang['hosts'])} ===\n"
             )
         if spec.tree:
             header += f"=== tree {spec.tree} (working directory and first PYTHONPATH entry) ===\n"
+        argv = ["bash", str(running)]
+        if spec.pin:
+            # The pin's tree is made on this node and its libraries are checked, in the job's
+            # own process and on its own clock; the script then runs inside the tree.
+            header += f"=== pin {spec.pin}: its tree is made and checked here first ===\n"
+            record = str(self.paths.tree_log(spec.name))
+            prelude = [sys.executable, str(PINTREE), "run", "--pin", spec.pin, "--job", spec.name]
+            argv = [*prelude, "--record", record, *(["--steps"] if gang else []), "--", *argv]
         try:
             with log_path.open("w", encoding="utf-8") as log:
                 log.write(header + "\n")
             log = log_path.open("ab")
             try:
                 proc = subprocess.Popen(
-                    ["bash", str(running)],
+                    argv,
                     stdin=subprocess.DEVNULL,
                     stdout=log,
                     stderr=subprocess.STDOUT,
@@ -1575,8 +1612,6 @@ class Scheduler:
         job.log_size = len(header.encode("utf-8")) + 1
         job.last_progress = now
         self.jobs[spec.name] = job
-        if gang is not None and gang["rank"] > 0:
-            return  # the leader records the job; a member's part is its own
         write_json_atomic(
             self.paths.running / f"{spec.name}.json",
             {
@@ -1592,7 +1627,6 @@ class Scheduler:
                 "owner": spec.owner,
                 "token": spec.token,
                 "slurm_job": self.slurm_job,
-                "restart": self.restart,
                 "session": self.config.session,
             },
         )
@@ -1685,13 +1719,17 @@ class Scheduler:
 
     def _limit_verdict(self, job: RunningJob, now: float) -> Verdict | None:
         """Why a still-running job must stop now, if it must."""
-        name = job.gang["name"] if job.gang else job.spec.name
-        if (self.paths.cancel / name).exists():
+        if (self.paths.cancel / job.spec.name).exists():
             return Verdict(RC_CANCELLED, CANCELLED_REASON, "cancel requested through the spool")
         if job.gang:
-            stop = self._gang_stop(job, now)
-            if stop is not None:
-                return stop
+            live = self._live(now)
+            lost = [h for m, h in zip(job.gang["members"], job.gang["hosts"]) if m not in live]
+            if lost:
+                return Verdict(
+                    RC_NODE_LOST,
+                    "node_lost",
+                    f"{', '.join(lost)} of {job.spec.name} stopped heart-beating",
+                )
         if job.wall_s and now - job.started > job.wall_s:
             return Verdict(
                 RC_WALL_LIMIT,
@@ -1716,7 +1754,7 @@ class Scheduler:
             environ = read_environ(pid)
             if environ is None:
                 continue
-            if is_mpi_attached(environ):
+            if is_mpi_attached(environ, job_identity=self.config.lead):
                 refused.append(pid)
                 continue
             try:
@@ -1762,6 +1800,7 @@ class Scheduler:
             "owner": spec.owner,
             "token": spec.token,
             "tree": spec.tree,
+            "pin": spec.pin,
             "gpus": spec.describe_gpus(),
             "watcher": self.watcher_id,
             "host": self.host,
@@ -1773,9 +1812,6 @@ class Scheduler:
         }
 
     def _write_receipt(self, job: RunningJob, now: float) -> None:
-        if job.gang:
-            self._write_gang_receipt(job, now)
-            return
         if not self._holds(job.spec.name):
             # This watcher fell silent long enough for another to find the run
             # lost; what it found (a re-run, or a receipt) stands.
@@ -1800,8 +1836,12 @@ class Scheduler:
             duration_s=round(now - job.started, 3),
             wall_s=job.wall_s,
             unsafe_pids=list(job.unsafe_pids),
+            **({"nodes": job.gang["nodes"], "hosts": list(job.gang["hosts"])} if job.gang else {}),
         )
         self._finish_files(job.spec.name, record, job.log_path, now)
+        if job.gang:
+            # The members hold their devices until this record is gone.
+            shutil.rmtree(self.paths.gangs / job.spec.name, ignore_errors=True)
         job.receipt_written = True
 
     def _holds(self, name: str) -> bool:
@@ -1816,8 +1856,31 @@ class Scheduler:
         return (self.paths.running / f"{name}.sh").exists()
 
     def _judge_provenance(self, job: RunningJob, verdict: Verdict) -> Verdict:
-        """Refuse a result whose processes imported from different checkouts."""
+        """Origin: every rank the job stated reported, and all ran one source and one build.
+
+        A pinned job is judged first by what was verified where it ran: no verified tree, or a
+        process that found other libraries than the verified ones, is no result.
+        """
         records = _provenance.read_records(self.paths.resolve_log(job.spec.name))
+        if job.spec.pin:
+            trees = _pintree.read_tree_records(self.paths.tree_log(job.spec.name))
+            problem = _provenance.check_pinned(records, trees)
+            if problem:
+                detail = f"{problem}. The job ran no tree its pin vouches for: no result."
+                self._log(job, detail)
+                return Verdict(RC_NO_ORIGIN, NO_ORIGIN_REASON, detail)
+        if job.spec.ranks and verdict.rc == 0:
+            watched = tuple(m.strip() for m in RESOLVE_MODULES.split(",") if m.strip())
+            missing = _provenance.missing_ranks(records, job.spec.ranks, watched)
+            if missing:
+                detail = (
+                    f"no origin record from {', '.join(missing)}: the job states "
+                    f"{','.join(f'{role}:{size}' for role, size in job.spec.ranks)} and each "
+                    f"rank must report where it imported {RESOLVE_MODULES} from and the identity "
+                    f"of its build. No result."
+                )
+                self._log(job, detail)
+                return Verdict(RC_NO_ORIGIN, NO_ORIGIN_REASON, detail)
         if not records:
             return verdict
         judged = _provenance.check(records, tree=job.spec.tree or None)
@@ -1878,7 +1941,7 @@ class Scheduler:
         if not job.receipt_written:
             self._write_receipt(job, now)
         if not job.receipt_written:
-            return  # a multi-node job's receipt waits for its other nodes' parts
+            return
         self.jobs.pop(job.spec.name, None)
         (self.paths.cancel / job.spec.name).unlink(missing_ok=True)
 
@@ -1935,33 +1998,17 @@ class Scheduler:
             self._lost(name, script, meta, requeued or self._gone(meta), now)
 
     def _earlier_start(self, meta: Mapping[str, Any]) -> str:
-        """Why the run ``meta`` records was on an earlier start of this allocation, or ``""``.
+        """Why the run ``meta`` records was started by an earlier watcher of this name, or ``""``.
 
-        Slurm ends every process of a job's start before starting it again, so a run recorded
-        under a lower ``SLURM_RESTART_COUNT`` of this job is gone even while its watcher's last
-        heartbeat is fresh. A run that names this watcher yet is not one of its jobs was started
-        by an earlier watcher of that name (the same host and pid, after a reboot).
+        A run that names this watcher yet is not one of its jobs was started by an earlier
+        watcher of that name (the same host and pid, after a reboot).
         """
-        if meta.get("watcher") == self.watcher_id:
-            return (
-                f"watcher {self.watcher_id}, which started the job at {meta.get('started')}, "
-                f"ended before the watcher of that name now on this spool started, and the job "
-                f"with it"
-            )
-        job = str(meta.get("slurm_job") or "")
-        theirs = meta.get("restart")
-        if (
-            job in ("", "unknown")
-            or job != self.slurm_job
-            or self.restart is None
-            or not isinstance(theirs, int)
-            or theirs >= self.restart
-        ):
+        if meta.get("watcher") != self.watcher_id:
             return ""
         return (
-            f"allocation {job} was requeued: its start {theirs} on {meta.get('host')} "
-            f"(watcher {meta.get('watcher')}), which started the job at "
-            f"{meta.get('started')}, ended, and the job with it"
+            f"watcher {self.watcher_id}, which started the job at {meta.get('started')}, "
+            f"ended before the watcher of that name now on this spool started, and the job "
+            f"with it"
         )
 
     def _gone(self, meta: Mapping[str, Any]) -> str:
@@ -2085,35 +2132,40 @@ def build_parser() -> argparse.ArgumentParser:
     watch.add_argument(
         "--gpus", default="auto", help="'auto', a device count, or an explicit comma list of ids"
     )
-    watch.add_argument("--session", default="", help="session name, for status and hand-over")
-    watch.add_argument("--default-wall", default="2h", help="wall limit for GPU jobs that set none")
+    watch.add_argument("--session", default="", help="session name, for status")
     watch.add_argument(
-        "--time-limit",
-        help="the allocation's time limit; with SLURM_JOB_START_TIME it fixes the end",
+        "--holder", default="", help="the holder this watcher belongs to (default $MV2FLOW_HOLDER)"
     )
-    watch.add_argument("--handover-lead", default="1h", help="how long before the end to hand over")
+    watch.add_argument(
+        "--lead",
+        action="store_true",
+        help="no devices: form the holder's multi-node jobs and run their scripts here",
+    )
     return parser
 
 
-def allocation_end(args: argparse.Namespace, environ: Mapping[str, str]) -> float | None:
-    """When this allocation ends: Slurm's own figure, else the declared limit from its start."""
+def allocation_end(environ: Mapping[str, str]) -> float | None:
+    """When this allocation ends, by Slurm's own figure; ``None`` where there is none."""
     value = environ.get("SLURM_JOB_END_TIME", "")
-    if value.isdigit() and int(value) > 0:
-        return float(value)
-    if args.time_limit:
-        start = environ.get("SLURM_JOB_START_TIME", "")
-        begun = float(start) if start.isdigit() else time.time()
-        return begun + parse_duration(args.time_limit)
-    return None
+    return float(value) if value.isdigit() and int(value) > 0 else None
+
+
+def holder_nodes(environ: Mapping[str, str]) -> int:
+    """How many nodes this watcher's holder has: the allocation's, else one."""
+    for name in ("SLURM_JOB_NUM_NODES", "SLURM_NNODES"):
+        if environ.get(name, "").isdigit():
+            return max(1, int(environ[name]))
+    return 1
 
 
 def config_from_args(args: argparse.Namespace, environ: Mapping[str, str]) -> SchedulerConfig:
     return SchedulerConfig(
-        devices=discover_devices(args.gpus, environ),
-        default_wall_s=parse_duration(args.default_wall),
+        devices=() if args.lead else discover_devices(args.gpus, environ),
         session=args.session,
-        ends_at=allocation_end(args, environ),
-        handover_lead_s=parse_duration(args.handover_lead),
+        ends_at=allocation_end(environ),
+        holder=args.holder or environ.get("MV2FLOW_HOLDER", ""),
+        nodes=holder_nodes(environ),
+        lead=args.lead,
     )
 
 
@@ -2134,25 +2186,28 @@ def main(argv: list[str] | None = None) -> int:
 __all__ = [
     "ALL_GPUS",
     "AGING_S",
-    "DEFAULT_WALL_S",
     "DEVICE_MAX_USED_MIB",
-    "DEVICE_RELEASE_WAIT_S",
+    "DEVICE_READING_S",
     "FAILURE_STALL_S",
+    "FIT_MARGIN_S",
     "FREE_PREFIX",
     "CANCELLED_REASON",
-    "HANDOVER_DIRNAME",
-    "HANDOVER_MARGIN_S",
     "HEADER_KEYS",
+    "HOLDERS_DIRNAME",
     "HEADER_TAG",
     "JobSpec",
     "KILL_GRACE_S",
     "MAX_RERUNS",
     "NAME_PATTERN",
+    "NO_ORIGIN_REASON",
+    "POOL_FRESH_S",
+    "POOL_SNAPSHOT",
     "POLL_S",
     "RC_CANCELLED",
     "RC_LAUNCH_FAILED",
     "RC_MIXED_CHECKOUT",
     "RC_NODE_LOST",
+    "RC_NO_ORIGIN",
     "RC_ORPHANED",
     "RC_REFUSED",
     "RC_STALLED",
@@ -2161,25 +2216,29 @@ __all__ = [
     "RESOLVE_HOOK_DIR",
     "RunningJob",
     "SESSION_LOSS_REASONS",
+    "SIZE_MISSING",
     "STALLED_REASON",
+    "STOP_MARKER",
     "Scheduler",
     "SchedulerConfig",
     "SpoolPaths",
     "TIMEOUT_REASONS",
     "Verdict",
+    "WALL_MISSING",
     "WATCHER_STALE_S",
     "is_mpi_attached",
     "job_processes",
     "job_spec_from_script",
+    "lead_environment",
     "parse_duration",
     "parse_header",
     "read_device_memory_mib",
     "read_environ",
     "read_proc_table",
     "reruns_of",
-    "restart_count",
     "scrub_environment",
     "stamp_rerun",
+    "holder_coming",
     "utc_iso",
     "watcher_age",
     "watcher_records",

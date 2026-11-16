@@ -21,7 +21,6 @@ resolves from the local cache or fails; nothing is downloaded.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
@@ -32,12 +31,6 @@ from typing import Any, Iterable, Mapping
 RECORD_MARKER = "MV2FLOW_RECORD"
 #: What the driver imported, once, before the engine starts.
 DRIVER_MARKER = "MV2FLOW_DRIVER"
-#: What the engine runs once it is up, once per engine a harness builds (see
-#: :mod:`.engine_facts`).
-ENGINE_MARKER = "MV2FLOW_ENGINE"
-#: What the engine reused from its KV cache over the workload, once per engine,
-#: after the workload (see :mod:`.reuse_probe`).
-REUSE_MARKER = "MV2FLOW_REUSE"
 #: What one rank's executor worker runs, printed by that worker as it sets its
 #: engine up, once per rank (see ``rankhook/sitecustomize.py``).
 RANK_ENGINE_MARKER = "MV2FLOW_RANK_ENGINE"
@@ -75,6 +68,45 @@ class DatasetError(ValueError):
 # ------------------------------------------------------------------- records
 
 
+#: The directory a session names for its ranks' own records: one file per role instance
+#: and rank. A file has one writer, so a record arrives whole whatever the other ranks of
+#: the world write to the stream they share.
+RANK_RECORDS_ENV = "MV2FLOW_RANK_RECORDS"
+
+
+def rank_record_file(directory: str | Path, instance: str, rank: Any) -> Path:
+    """Where rank ``rank`` of role instance ``instance`` keeps its own records, one a line."""
+    return Path(directory) / f"rank-engine.{instance}.{rank}.jsonl"
+
+
+def keep_record(path: str | Path, payload: Mapping[str, Any]) -> None:
+    """Append ``payload`` to ``path`` as one line, in one write: whole, or not there."""
+    line = json.dumps(dict(payload), ensure_ascii=True, sort_keys=True) + "\n"
+    descriptor = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    try:
+        os.write(descriptor, line.encode("ascii"))
+    finally:
+        os.close(descriptor)
+
+
+def kept_records(directory: str | Path, instance: str) -> list[dict[str, Any]]:
+    """Every record the ranks of ``instance`` kept in files of their own, in rank order."""
+    records: list[dict[str, Any]] = []
+    for path in sorted(Path(directory).glob(f"rank-engine.{instance}.*.jsonl")):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(record, dict):
+                records.append(record)
+    return records
+
+
 def emit(marker: str, payload: Mapping[str, Any]) -> None:
     """Print ``<marker> <json>`` on one line and flush."""
     line = json.dumps(dict(payload), ensure_ascii=True, sort_keys=True)
@@ -101,11 +133,6 @@ def parse_marked(output: str, marker: str) -> list[dict[str, Any]]:
         if isinstance(data, dict):
             records.append(data)
     return records
-
-
-def prompt_digest(text: str) -> str:
-    """A short, stable name for a prompt, for pairing records across runs."""
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
 # ------------------------------------------------------------------- datasets
@@ -322,17 +349,15 @@ def normalize_file(source: str, target: str) -> None:
 __all__ = [
     "DRIVER_MARKER",
     "DatasetError",
-    "ENGINE_MARKER",
     "KNOWN_DATASETS",
     "RANK_ENGINE_MARKER",
+    "RANK_RECORDS_ENV",
     "RECORD_MARKER",
-    "REUSE_MARKER",
     "TEXT_FIELDS",
     "emit",
     "is_lfs_pointer",
     "load_rows",
     "parse_marked",
-    "prompt_digest",
     "normalize_requests",
     "normalize_file",
     "select_prompts",

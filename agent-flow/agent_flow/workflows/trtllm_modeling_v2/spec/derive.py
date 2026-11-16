@@ -2,28 +2,31 @@
 # SPDX-License-Identifier: Apache-2.0
 """The fast path: the run's spec derived in seconds from the checkpoint, ``site.yaml`` and a goal.
 
-``--checkpoint``, ``--site`` and ``--goal`` write ``task.derived.yaml`` into the
-workspace (the spec ``--task`` would take) beside ``derive.report.md``, which
-says every value the goal did not state and where it came from. What cannot be
-derived is an open question: the run stops before it starts and names each, and
-the operator answers it in the spec. A feature the checkpoint carries (draft
-layers, a vision or audio tower) is built unless the goal puts it out of scope;
-anything else is built only when the goal names it.
+``--checkpoint``, ``--site`` and ``--goal`` write ``task.derived.yaml`` (the spec
+``--task`` would take), each deployment's native options beside it
+(``engines/<name>.yaml``) and ``derive.report.md``, which says every value the goal did
+not state and where it came from. What cannot be derived is an open question: the run
+stops before it starts and names each, and the operator answers it in the spec. A feature
+is brought up only when the goal names it: what the checkpoint carries beside (draft
+layers, a vision or audio tower) the report lists with the word that adds it.
 
-The core configuration is what every unit is gated under: CUDA graphs and the
-overlap scheduler on, the KV cache in the checkpoint's own format, block reuse
-and chunked prefill off. A non-core runtime feature the goal names
-(``chunked_prefill``, ``prefix_reuse``) and each extra KV dtype (``kv=``) is one
-configuration variant of core, judged at one member against core's own score:
-each non-core feature on its own, never a cross product. The goal is one line of
-words, separated by spaces, commas or semicolons; :func:`parse_goal` defines
-the accepted features, members, profiles and key=value settings.
+What a goal comes to is a list of deployments. Each member the goal names (``tp1``,
+``tep4``, ``dep4``) is one deployment of the core configuration at that layout: CUDA
+graphs and the overlap scheduler on, the KV cache in the checkpoint's own format, block
+reuse and chunked prefill off. Each feature is one more deployment whose options turn it
+on, each on its own, never a cross product: a drafter (``speculative_config``), a tower
+(``inputs: [text, image]``), disaggregation (``ctx`` and ``gen``), each extra KV dtype
+(``kv=``), chunked prefill and prefix reuse; the last four are judged against the first
+deployment's own score (``relative_to``). The goal is one line of words, separated by
+spaces, commas or semicolons; :func:`parse_goal` defines them.
 """
 
 from __future__ import annotations
 
+import ast
 import json
 import re
+import shutil
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,50 +34,63 @@ from typing import Any, Mapping
 
 import yaml
 
-from ..operators import tree_anchors
+from ..infra.compute import pool as pool_mod
+from ..infra.git import git_output
+from . import deployments as deployments_mod
 from .schema_keys import reject_unknown_keys
-from .task_schema import (
-    DEFAULT_PERF_CONCURRENCY,
-    DISAGG_FEATURE,
-    DISAGG_KEYS,
-    FEATURE_FAMILIES,
-    PARALLEL_PATTERN,
-    PROFILE_CERTIFIED,
-    PROFILE_SMOKE,
-    PROFILE_STANDARD,
-    PROFILES,
-    SPECULATORS,
-    parse_parallel_segment,
-)
+from .task_schema import DEFAULT_BOOT_MAX_TOKENS
 
 #: The derived spec and its report, in the workspace.
 SPEC_FILENAME = "task.derived.yaml"
 REPORT_FILENAME = "derive.report.md"
-#: Where each unit's LLM-API options are written, beside the spec.
-LLM_API_DIRNAME = "llm_api"
+#: Where each deployment's native options are written, beside the spec.
+ENGINES_DIRNAME = "engines"
+#: A parallel layout on N GPUs: tensor parallel (``tp``), with expert parallel too
+#: (``tep``), and with attention data parallel as well (``dep``).
+LAYOUT = re.compile(r"^(tp|tep|dep)([1-9]\d*)$")
+#: The features that draft tokens a target model verifies.
+SPECULATORS: frozenset[str] = frozenset({"mtp", "eagle3", "dflash", "dspark"})
+DISAGG_FEATURE = "disagg"
+#: The name of the disaggregated deployment a goal's ``disagg`` comes to.
+DISAGG_DEPLOYMENT = "pd"
+#: The features a goal may name. A drafter, a tower and disaggregation are brought up
+#: by options this module writes; for the others it writes a deployment of the core
+#: configuration and asks which options turn the feature on.
+FEATURE_WORDS: frozenset[str] = frozenset(
+    {
+        *SPECULATORS,
+        "multimodal",
+        DISAGG_FEATURE,
+        "kv_quant",
+        "host_offload",
+        "decoder_replay",
+        "encoder_replay",
+    }
+)
 
-#: Members when neither the goal nor the site names any.
+#: The layout of the first deployment when neither the goal nor the site names any.
 DEFAULT_MEMBERS: tuple[str, ...] = ("tp1",)
 #: The workload when neither the goal nor the site states one. Stated rather
 #: than left to the engine, which would size its cache for the checkpoint's
 #: whole ``max_position_embeddings``.
 DEFAULT_WORKLOAD: dict[str, int] = {"isl": 4096, "osl": 1024, "max_batch_size": 64}
-#: Tokens between Mamba state snapshots on a hybrid checkpoint with block
-#: reuse: without a snapshot policy the engine turns reuse off.
-DEFAULT_SNAPSHOT_INTERVAL = 2048
-#: The boot gate's prompts when the site declares none: one whose answer any
-#: working target states, checked, and one open continuation.
+#: The boot gate's prompts when the site declares none, as INTAKE states them: one fact
+#: and one arithmetic word problem, each checked by a keyword any working target states.
 DEFAULT_BOOT: dict[str, Any] = {
     "prompts": [
         {"prompt": "The capital of France is", "keywords_any": ["Paris"]},
-        "In one sentence, photosynthesis is",
+        {
+            "prompt": "Question: A crate holds 12 bottles. How many bottles do 6 crates "
+            "hold? Answer:",
+            "keywords_any": ["72"],
+        },
     ],
-    "max_tokens": 32,
+    "max_tokens": DEFAULT_BOOT_MAX_TOKENS,
 }
 DEFAULT_BENCHMARK = "gsm8k"
 
 #: Goal word -> its runtime switch: ``-<word>`` turns a core one off; naming a non-core
-#: one (:data:`NON_CORE_SWITCHES`) adds its configuration variant.
+#: one (:data:`NON_CORE_SWITCHES`) adds a deployment that turns it on.
 RUNTIME_WORDS: dict[str, str] = {
     "cuda_graph": "cuda_graph",
     "overlap_scheduler": "overlap_scheduler",
@@ -83,19 +99,17 @@ RUNTIME_WORDS: dict[str, str] = {
 }
 #: The runtime switches of the core configuration: on unless the goal turns them off.
 CORE_SWITCHES: frozenset[str] = frozenset({"cuda_graph", "overlap_scheduler"})
-#: Non-core runtime switch -> the configuration variant that turns it on: off in core.
+#: Non-core runtime switch -> the deployment that turns it on: off in every other.
 NON_CORE_SWITCHES: dict[str, str] = {"chunked_prefill": "chunked", "kv_cache_reuse": "reuse"}
-#: Tokens per prefill chunk in the ``chunked`` variant when the goal names none: below the
+#: Tokens per prefill chunk in the ``chunked`` deployment when the goal names none: below the
 #: benchmark's few-shot prompts, so their prefill is split.
 DEFAULT_CHUNK_TOKENS = 512
-#: The units a goal may name: every feature of the spec.
-UNIT_WORDS: frozenset[str] = frozenset(FEATURE_FAMILIES)
-#: ``<feature>:<depth>`` -> the profile the feature's checks follow.
-DEPTH_WORDS: dict[str, str] = {
-    "smoke": PROFILE_SMOKE,
-    "standard": PROFILE_STANDARD,
-    "full": PROFILE_CERTIFIED,
-}
+#: The features a goal may name.
+UNIT_WORDS: frozenset[str] = FEATURE_WORDS
+#: ``<feature>:<depth>``: how much the feature's deployment is judged by. ``smoke``: its
+#: session's own checks and no benchmark; ``standard``: its benchmarks too.
+DEPTH_SMOKE, DEPTH_STANDARD = "smoke", "standard"
+DEPTH_WORDS: dict[str, str] = {"smoke": DEPTH_SMOKE, "standard": DEPTH_STANDARD}
 #: Speculative algorithm -> its reference rows' ``spec_dec_algo`` and the LLM
 #: API's ``speculative_config.decoding_type`` (the two spell them alike).
 SPEC_DEC_ALGO = {"mtp": "MTP", "eagle3": "Eagle3", "dflash": "DFlash", "dspark": "DSpark"}
@@ -110,15 +124,16 @@ SITE_KEYS = (
     "trtllm_repo_path",
     "environment",
     "agents",
-    "perf",
     "commit_policy",
     # The cluster's devices, and what a derived spec takes when its goal is silent.
     "device",
     "defaults",
 )
 SITE_DEVICE_KEYS = ("arch", "gpus_per_node", "nodes")
-SITE_PERF_KEYS = ("spools", "dev_spools", "env_script")
-SITE_DEFAULTS_KEYS = ("members", "workload", "accuracy", "boot", "disagg", "profile")
+SITE_DEFAULTS_KEYS = ("members", "workload", "accuracy", "boot", "disagg")
+#: What a site may state for the disaggregated deployment: its environment (the transport
+#: the cluster needs), its timeout, and native tests that also judge it.
+SITE_DISAGG_KEYS = ("env", "timeout", "tests")
 #: ``reference`` (how the anchor was measured) is the operator's record; nothing reads it.
 SITE_ACCURACY_KEYS = ("benchmark", "protocol", "reference", "reference_yaml", "model_key")
 
@@ -157,7 +172,7 @@ class Goal:
     units: dict[str, bool] = field(default_factory=dict)
     #: Unit -> the members the goal narrows it to.
     unit_members: dict[str, list[str]] = field(default_factory=dict)
-    #: Unit -> the profile the goal gives it (``multimodal:smoke``).
+    #: Feature -> the depth the goal gives it (``multimodal:smoke``).
     unit_profiles: dict[str, str] = field(default_factory=dict)
     #: The goal asks for speculative decoding by the checkpoint's own drafter (True),
     #: or for none at all (False).
@@ -171,13 +186,13 @@ class Goal:
     params: dict[str, Any] = field(default_factory=dict)
     accuracy: dict[str, str] = field(default_factory=dict)
     arch: str | None = None
-    tune: bool = False
 
 
 def parse_goal(text: str | None) -> Goal:
     """Read a goal line. Raises :class:`DeriveError` naming every unknown word."""
     goal = Goal(text=" ".join((text or "").split()))
     errors: list[str] = []
+    unknown: list[str] = []
     for word in re.split(r"[\s,;]+", goal.text):
         if not word:
             continue
@@ -185,10 +200,7 @@ def parse_goal(text: str | None) -> Goal:
             _key_value(goal, word, errors)
             continue
         lowered = word.lower()
-        if lowered == "tune":
-            goal.tune = True
-            continue
-        if PARALLEL_PATTERN.match(lowered):
+        if LAYOUT.match(lowered):
             goal.members.append(lowered)
             continue
         if lowered == "text_only":
@@ -218,14 +230,21 @@ def parse_goal(text: str | None) -> Goal:
             goal.units[name] = not out
             if members and not out:
                 listed = [m for m in members.split("/") if m]
-                if not listed or not all(PARALLEL_PATTERN.match(m) for m in listed):
+                if not listed or not all(LAYOUT.match(m) for m in listed):
                     errors.append(
                         f"goal: {word!r} names no members of the form tp<N>, tep<N>, dep<N>"
                     )
                 else:
                     goal.unit_members[name] = listed
         else:
+            unknown.append(word)
             errors.append(f"goal: {word!r} is not a feature, a member or key=value")
+    if unknown:
+        known = sorted({*UNIT_WORDS, *RUNTIME_WORDS, "speculative", "text_only"})
+        errors.append(
+            f"goal: the words a goal knows are {', '.join(known)}; a member is tp<N>, "
+            "tep<N> or dep<N>; a word is left out with a leading `-`"
+        )
     if errors:
         raise DeriveError("\n".join(errors))
     return goal
@@ -251,7 +270,7 @@ def _key_value(goal: Goal, word: str, errors: list[str]) -> None:
             elif "kv_dtype" in goal.params:
                 errors.append(
                     f"goal: {word!r}: kv= is named once, its dtypes in one word "
-                    "(kv=bf16/fp8/nvfp4): the first is every gate's, each other a variant"
+                    "(kv=bf16/fp8/nvfp4): the first is every deployment's, each other its own"
                 )
             else:
                 goal.params["kv_dtype"] = dtypes[0]
@@ -281,6 +300,54 @@ def read_config(checkpoint: str | Path) -> dict[str, Any] | None:
     return data
 
 
+#: How the engine's sources name a registry of its built-in custom tokenizers: a mapping
+#: from an alias to a class. A pattern to search the checkout with, never a path.
+_TOKENIZER_REGISTRY = r"^[A-Z_]*TOKENIZER[A-Z_]*ALIAS[A-Z_]* *= *\{"
+
+
+def registered_tokenizer(repo: str | Path, model_type: Any) -> str | None:
+    """The alias the engine registers a custom tokenizer under for this ``model_type``, if any.
+
+    Searched in the engine's checkout as derive runs: a module-level mapping whose name
+    says tokenizer aliases, one of whose keys is the checkpoint's own ``model_type``. Such
+    a model's chat template is the tokenizer's, so a session that leaves the option out
+    asks the API with another prompt than the model was trained on. ``None`` when the
+    engine registers none for it or the checkout cannot be searched.
+    """
+    if not isinstance(model_type, str) or not model_type:
+        return None
+    found = git_output(repo, "grep", "-l", "-E", _TOKENIZER_REGISTRY, "--", "*.py") or ""
+    for name in found.split():
+        try:
+            tree = ast.parse((Path(repo) / name).read_text(encoding="utf-8"))
+        except (OSError, SyntaxError, ValueError):
+            continue
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Dict):
+                keys = [k.value for k in node.value.keys if isinstance(k, ast.Constant)]
+                if re.match(_TOKENIZER_REGISTRY, ast.unparse(node)) and model_type in keys:
+                    return model_type
+    return None
+
+
+#: Where the engine keeps the recipes it serves and tests a model with.
+RECIPE_PLACES: tuple[str, ...] = ("tests/integration/defs", "examples")
+
+
+def engine_recipes(repo: str | Path, model_type: Any, limit: int = 5) -> list[str]:
+    """The engine's test and example files named for ``model_type``: where its own recipe is.
+
+    Searched in the engine's checkout as derive runs, as the tokenizer is: the flow
+    keeps no table of models. Only their paths: which of the options such a file sets
+    a deployment needs is for a person to say, so derive names the files and reads none.
+    """
+    name = str(model_type or "").strip().lower()
+    if not name:
+        return []
+    listed = git_output(repo, "ls-files", "--", *RECIPE_PLACES) or ""
+    return [path for path in listed.splitlines() if name in path.lower()][:limit]
+
+
 def draft_layers(config: Mapping[str, Any]) -> int:
     """How many draft (MTP) layers the checkpoint carries; 0 for none."""
     for key in DRAFT_LAYER_KEYS:
@@ -305,8 +372,6 @@ class CheckpointFacts:
     speculator: str | None
     draft_len: int | None
     towers: tuple[str, ...]
-    #: What marks the checkpoint hybrid (``spec/derive.hybrid_marker``), or None.
-    hybrid: str | None
     #: The ``<org>/<model>`` name the config states, the reference rows' key.
     name: str | None
 
@@ -344,9 +409,61 @@ def inspect_checkpoint(path: Path) -> CheckpointFacts:
         speculator=speculator,
         draft_len=int(draft_len) if isinstance(draft_len, int) and draft_len > 0 else None,
         towers=tuple(k for k in ("vision_config", "audio_config") if k in config),
-        hybrid=hybrid_marker(config),
         name=str(name) if isinstance(name, str) and _REPO_NAME.match(name) else None,
     )
+
+
+def _state_environment(environment: dict[str, Any], unstated: list) -> None:
+    """Write the environment's kind into the spec when the site does not state it, and say so.
+
+    What the site's block names decides (Slurm fields, a spool somebody else's watchers
+    serve). A block that names nothing is Slurm where ``sbatch`` is on this host and this one
+    host otherwise: detected here, written down, never chosen silently at the start.
+    """
+    if environment.get("kind"):
+        return
+    named = any(environment.get(key) for key in ("slurm", "spool"))
+    kind = pool_mod.environment_kind(environment)
+    if named:
+        source = "the site's environment block"
+    elif shutil.which("sbatch"):
+        source = "detected: sbatch is on this host; state environment.slurm"
+    else:
+        kind = pool_mod.KIND_LOCAL
+        source = "detected: no sbatch on this host, so this one host"
+    environment["kind"] = kind
+    unstated.append(("environment.kind", kind, source))
+
+
+def _environment_owed(environment: Mapping[str, Any]) -> list[str]:
+    """What a run cannot start without and the environment does not state, one question each.
+
+    The same values the spec's load and the start's preflight ask for, said here together:
+    a user with one host and no site file has nobody else to state them.
+    """
+    owed = []
+    if not str(environment.get("python") or "").strip():
+        owed.append(
+            "environment.python: the absolute path of the Python that has TensorRT-LLM "
+            "installed (`<venv>/bin/python`); every check runs under it"
+        )
+    env = environment.get("env")
+    unset = [name for name in SCRATCH_VARIABLES if not (isinstance(env, Mapping) and env.get(name))]
+    if unset:
+        owed.append(
+            f"environment.env: set {' and '.join(unset)} to a scratch directory of the run's "
+            "own, not under /tmp and short (a socket is bound under TMPDIR)"
+        )
+    return owed
+
+
+def read_site(path: str | Path) -> Any:
+    """The site file at ``path``. Raises :class:`DeriveError`, naming ``--site``, when none can be read."""
+    try:
+        return yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        why = getattr(exc, "strerror", None) or str(exc).splitlines()[0]
+        raise DeriveError(f"--site {path}: no site file can be read there ({why})") from exc
 
 
 def validate_site(site: Any) -> list[str]:
@@ -358,7 +475,17 @@ def validate_site(site: Any) -> list[str]:
     for key in ("trtllm_repo_path", "environment"):
         if not site.get(key):
             errors.append(f"site.yaml: '{key}' is required")
-    for key, keys in (("device", SITE_DEVICE_KEYS), ("perf", SITE_PERF_KEYS)):
+    environment = site.get("environment")
+    if isinstance(environment, Mapping):
+        kind = environment.get("kind")
+        if environment.get("pool") is not None or (kind and kind not in pool_mod.KINDS):
+            # Neither Slurm nor one host: the same message the spec's own load gives.
+            named = f"kind: {kind}" if kind and kind not in pool_mod.KINDS else "pool"
+            errors.append(
+                f"site.yaml: 'environment' names an environment the flow has no launcher for "
+                f"(`environment.{named}`): {pool_mod.OTHER_ENVIRONMENT}"
+            )
+    for key, keys in (("device", SITE_DEVICE_KEYS),):
         block = site.get(key)
         if block is not None and not isinstance(block, Mapping):
             errors.append(f"site.yaml: '{key}' must be a mapping")
@@ -374,7 +501,7 @@ def validate_site(site: Any) -> list[str]:
     if members is not None and (
         not isinstance(members, list)
         or not members
-        or not all(isinstance(m, str) and PARALLEL_PATTERN.match(m) for m in members)
+        or not all(isinstance(m, str) and LAYOUT.match(m) for m in members)
     ):
         errors.append(
             "site.yaml: 'defaults.members' must be a non-empty list of tp<N>, tep<N>, dep<N>"
@@ -383,15 +510,13 @@ def validate_site(site: Any) -> list[str]:
         ("workload", WORKLOAD_KEYS),
         ("accuracy", SITE_ACCURACY_KEYS),
         ("boot", None),
-        ("disagg", DISAGG_KEYS),
+        ("disagg", SITE_DISAGG_KEYS),
     ):
         block = defaults.get(key)
         if block is not None and not isinstance(block, Mapping):
             errors.append(f"site.yaml: 'defaults.{key}' must be a mapping")
         elif block and keys:
             reject_unknown_keys(block, keys, errors, where=f"site.yaml defaults.{key}")
-    if defaults.get("profile") is not None and defaults["profile"] not in PROFILES:
-        errors.append(f"site.yaml: 'defaults.profile' must be one of {list(PROFILES)}")
     return errors
 
 
@@ -399,15 +524,54 @@ def validate_site(site: Any) -> list[str]:
 class Derivation:
     """A derived spec, what it holds that the goal did not state, and what is still open."""
 
+    #: The spec without its ``deployments``: :func:`write_derivation` adds them.
     spec: dict[str, Any]
-    #: Unit -> the LLM-API options its gates run under, written beside the spec.
-    llm_api_options: dict[str, dict[str, Any]]
+    #: The deployments, the first one first: each as a spec states it, its ``options``
+    #: (or each role's) still the mapping :func:`write_derivation` writes to a file.
+    deployments: list[dict[str, Any]]
     #: ``(field, value, source)`` for every value read from the checkpoint or the
     #: site, or defaulted.
     unstated: list[tuple[str, Any, str]] = field(default_factory=list)
     questions: list[str] = field(default_factory=list)
     #: The checkpoint, site and goal it was derived from, and when.
     derived: dict[str, str] = field(default_factory=dict)
+
+
+def layout_options(layout: str, base: Mapping[str, Any]) -> dict[str, Any]:
+    """``base`` (the core configuration) at one parallel layout, as native options.
+
+    ``base`` states the batch as the global total: under attention data parallel the
+    engine's batch, and its CUDA graphs', are each rank's share of it.
+    """
+    found = LAYOUT.match(layout)
+    if not found:
+        raise DeriveError(f"{layout!r} is not a parallel layout: tp<N>, tep<N> or dep<N>")
+    kind, size = found.group(1), int(found.group(2))
+    options = json.loads(json.dumps(dict(base)))
+    total = options.get("max_batch_size")
+    if total and kind == "dep":
+        options["max_batch_size"] = max(1, -(-int(total) // size))
+    graphs = options.get("cuda_graph_config")
+    if isinstance(graphs, dict) and options.get("max_batch_size"):
+        graphs["max_batch_size"] = options["max_batch_size"]
+    options.update(
+        tensor_parallel_size=size,
+        pipeline_parallel_size=1,
+        moe_expert_parallel_size=1 if kind == "tp" else size,
+        enable_attention_dp=kind == "dep",
+    )
+    return options
+
+
+def _overlaid(base: Mapping[str, Any], overlay: Mapping[str, Any]) -> dict[str, Any]:
+    """``overlay`` laid over ``base``, mapping by mapping."""
+    merged = dict(base)
+    for key, value in overlay.items():
+        if isinstance(value, Mapping) and isinstance(merged.get(key), Mapping):
+            merged[key] = _overlaid(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
 
 
 def derive_spec(
@@ -438,11 +602,11 @@ def derive_spec(
     if facts.unread_quantization:
         questions.append(
             f"the checkpoint is quantized ({facts.unread_quantization}) and states no "
-            "quant_algo: set accuracy.discriminators to the reference row's (quant_algo, "
-            "kv_cache_quant_algo), so the anchor is not the unquantized model's"
+            "quant_algo: set accuracy.discriminators to the reference row's (quant_algo), so "
+            "the anchor is not the unquantized model's"
         )
 
-    # The members.
+    # The layouts: one deployment of the core configuration each.
     if goal.members:
         members = list(dict.fromkeys(goal.members))
     elif defaults.get("members"):
@@ -464,17 +628,13 @@ def derive_spec(
         if key not in goal.workload and key != "max_batch_size":
             note(f"workload.{key}", value, source)
     workload.update(goal.workload)
-    if goal.tune and not workload.get("concurrency"):
-        workload["concurrency"] = note(
-            "workload.concurrency", list(DEFAULT_PERF_CONCURRENCY), "default"
-        )
     concurrency = workload.get("concurrency") or []
     max_seq_len = workload.get("max_seq_len") or (
         workload["isl"] + workload["osl"] if "isl" in workload and "osl" in workload else None
     )
     max_batch_size = workload.get("max_batch_size") or (max(concurrency) if concurrency else None)
     if concurrency and "max_batch_size" not in goal.workload:
-        # A default batch below the goal's concurrency would queue the perf points it names.
+        # A default batch below the goal's concurrency would queue the requests it names.
         max_batch_size = max(int(max_batch_size or 0), max(concurrency))
     if max_batch_size and "max_batch_size" not in goal.workload:
         # The value the spec carries, not the default it was raised from.
@@ -484,21 +644,31 @@ def derive_spec(
             source if max_batch_size == workload.get("max_batch_size") else "concurrency",
         )
 
-    # The units: the checkpoint's own drafter and towers unless the goal says otherwise. A
-    # goal that names its features asks for those: what else the checkpoint carries is left out.
+    # The features: those the goal names. What the checkpoint carries beside them (its own
+    # drafter, its towers) is certain; whether this run onboards it is the user's to say, and
+    # a first run is one deployment. The report names each with the word that adds it.
     built: list[str] = []
-    listed = any(goal.units.values()) or goal.speculative is True
     speculator = next((u for u, on in goal.units.items() if on and u in SPECULATORS), None)
-    if (
-        speculator is None
-        and goal.speculative is not False
-        and not any(goal.units.get(u) is False for u in SPECULATORS)
-    ):
-        if facts.speculator and listed and not goal.speculative:
-            note("features (left out)", facts.speculator, "checkpoint carries it, goal names none")
-        elif facts.speculator:
-            speculator = note("features (speculator)", facts.speculator, "checkpoint")
-        elif goal.speculative:
+    own = facts.speculator
+    if speculator == "mtp" and own and own != "mtp" and not goal.params.get("drafter"):
+        # "MTP" is what a goal calls a checkpoint's own draft layers. This checkpoint's are
+        # another algorithm's and the goal names no drafter of its own: the checkpoint's is
+        # written, and the report says so. Ordinary MTP at depth 1 would be written
+        # otherwise, for layers the engine drives another way.
+        speculator = note(
+            "features (speculator)",
+            own,
+            f"checkpoint: the goal says `mtp`, and the checkpoint's own draft layers are "
+            f"{SPEC_DEC_ALGO[own]}'s; say `{own}` in --goal, or name another drafter with "
+            "`drafter=`",
+        )
+        for said in (goal.units, goal.unit_members, goal.unit_profiles):
+            if "mtp" in said:
+                said[own] = said.pop("mtp")
+    if speculator is None and goal.speculative:
+        if own:
+            speculator = note("features (speculator)", own, "checkpoint")
+        else:
             questions.append(
                 "speculative: the goal asks for speculative decoding and the checkpoint carries "
                 "no draft layers; name the algorithm (mtp, eagle3, dflash or dspark)"
@@ -507,57 +677,96 @@ def derive_spec(
         built.append(speculator)
         if "draft_len" not in goal.params and facts.draft_len and speculator == facts.speculator:
             goal.params["draft_len"] = note("draft_len", facts.draft_len, "checkpoint")
+    elif own and goal.speculative is None and goal.units.get(own) is None:
+        note(
+            "features (left out)",
+            own,
+            f"the checkpoint carries {SPEC_DEC_ALGO[own]} draft layers: `{own}` in --goal adds "
+            "their deployment",
+        )
     multimodal = goal.units.get("multimodal")
-    if multimodal is None and facts.towers and listed:
-        multimodal = False
-        note("features (left out)", "multimodal", "checkpoint carries it, goal names none")
-    elif multimodal is None and facts.towers:
-        multimodal = note("features (multimodal)", True, "checkpoint")
     if multimodal:
         built.append("multimodal")
+    elif multimodal is None and facts.towers:
+        note(
+            "features (left out)",
+            "multimodal",
+            "the checkpoint carries a tower: `multimodal` in --goal adds its deployment",
+        )
     built += [
         u for u, on in goal.units.items() if on and u not in SPECULATORS and u != "multimodal"
     ]
 
-    # The runtime: the core switches on unless the goal turns them off, the rest off.
-    runtime: dict[str, Any] = {
-        name: name in CORE_SWITCHES and name not in goal.switches_off
-        for name in RUNTIME_WORDS.values()
-    }
+    # The core configuration: the core switches on unless the goal turns them off, the rest off.
+    cuda_graph = "cuda_graph" not in goal.switches_off
     for switch in sorted(set(NON_CORE_SWITCHES) - goal.switches_on - goal.switches_off):
-        note(f"runtime.{switch}", False, "core configuration: a non-core feature")
-    reuse = "kv_cache_reuse" in goal.switches_on
+        note(switch, False, "core configuration: a non-core feature")
     chunked = "chunked_prefill" in goal.switches_on
     snapshot = goal.params.get("snapshot_interval")
-    if facts.hybrid and reuse and not snapshot:
-        snapshot = note("snapshot_interval", DEFAULT_SNAPSHOT_INTERVAL, "default")
     kv_dtype = str(goal.params.get("kv_dtype") or "").lower()
     native_kv = str(facts.kv_cache_quant_algo or "").lower()
     if kv_dtype in ("", "auto") and native_kv in _KV_DTYPES:
         kv_dtype = note("kv_cache dtype", native_kv, "checkpoint")
-    flags = []
-    if max_seq_len:
-        flags.append(f"--max_seq_len={max_seq_len}")
-    if max_batch_size:
-        flags.append(f"--max_batch_size={max_batch_size}")
-    if goal.params.get("chunk_tokens") and not chunked:
-        flags.append(f"--max_num_tokens={goal.params['chunk_tokens']}")
+    kv: dict[str, Any] = {"enable_block_reuse": False}
+    if kv_dtype in _KV_DTYPES:
+        kv["dtype"] = kv_dtype
     if goal.params.get("kv_fraction"):
-        flags.append(f"--kv_cache_fraction={goal.params['kv_fraction']}")
-    runtime["extra_flags"] = flags
+        kv["free_gpu_memory_fraction"] = float(goal.params["kv_fraction"])
+    core: dict[str, Any] = {
+        "cuda_graph_config": {"enable_padding": True} if cuda_graph else None,
+        "enable_chunked_prefill": False,
+        "kv_cache_config": kv,
+        "speculative_config": None,
+    }
+    if "overlap_scheduler" in goal.switches_off:
+        core["disable_overlap_scheduler"] = True
+    if max_seq_len:
+        core["max_seq_len"] = int(max_seq_len)
+    if max_batch_size:
+        core["max_batch_size"] = int(max_batch_size)
+    if goal.params.get("chunk_tokens") and not chunked:
+        core["max_num_tokens"] = int(goal.params["chunk_tokens"])
+    # A model the engine registers a tokenizer of its own for is served with it.
+    tokenizer = registered_tokenizer(site["trtllm_repo_path"], facts.config.get("model_type"))
+    if tokenizer:
+        core["custom_tokenizer"] = note(
+            "custom_tokenizer",
+            tokenizer,
+            "the engine registers one for the checkpoint's model_type",
+        )
+    # Code the checkpoint ships (`auto_map`) is loaded only when the options allow it.
+    for name in ("config.json", "tokenizer_config.json", "processor_config.json"):
+        try:
+            shipped = json.loads((checkpoint / name).read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            continue
+        if isinstance(shipped, Mapping) and "auto_map" in shipped:
+            core["trust_remote_code"] = True
+    # What else this architecture needs to serve is in no file derive can read for certain:
+    # the engine's own recipes for it are named, for a person to compare.
+    model_type = facts.config.get("model_type")
+    recipes = engine_recipes(site["trtllm_repo_path"], model_type)
+    if recipes:
+        questions.append(
+            f"engine options: the files under `{ENGINES_DIRNAME}/` hold what every model takes"
+            + (" and the tokenizer the engine registers" if tokenizer else "")
+            + ", and nothing of this architecture's own (a sparse-attention algorithm, say, or "
+            "`trust_remote_code` where the checkpoint names no `auto_map`). Derive reads no "
+            f"recipe. The engine's tree has files named for `{model_type}`: "
+            f"{', '.join(recipes)}. Add to each options file what they set and your "
+            "deployment needs"
+        )
 
-    # The accuracy anchor.
+    # The accuracy defaults every benchmark takes.
     site_accuracy = dict(defaults.get("accuracy") or {})
     for key, value in site_accuracy.items():
         if key not in goal.accuracy:
             note(f"accuracy.{key}", value, "site")
     anchor = {**site_accuracy, **goal.accuracy}
     benchmark = anchor.get("benchmark") or note("accuracy.benchmark", DEFAULT_BENCHMARK, "default")
-    accuracy: dict[str, Any] = {
-        "benchmark": benchmark,
-        "reference_yaml": anchor.get("reference_yaml")
-        or f"{_tree_path(site, 'accuracy_references')}/{benchmark}.yaml",
-    }
+    accuracy: dict[str, Any] = {"benchmark": benchmark}
+    if anchor.get("reference_yaml"):
+        accuracy["reference_yaml"] = anchor["reference_yaml"]
     model_key = anchor.get("model_key") or (
         note("accuracy.model_key", facts.name, "checkpoint") if facts.name else None
     )
@@ -569,96 +778,116 @@ def derive_spec(
             "--goal): the reference rows are keyed by it, and config.json names none (the "
             "fallback, the checkpoint path's last two components, is no model's name)"
         )
-    if (anchor.get("protocol") or {}).get("chat_template"):
-        accuracy["benchmark_args"] = ["--apply_chat_template"]
-    if max_seq_len:
-        accuracy["max_seq_len"] = max_seq_len
-    if max_batch_size:
-        accuracy["max_batch_size"] = max_batch_size
-    discriminators = _discriminators(facts, kv_dtype, built)
-    if discriminators:
-        accuracy["discriminators"] = discriminators
+    benchmark_args = (
+        ["--apply_chat_template"] if (anchor.get("protocol") or {}).get("chat_template") else []
+    )
+    weights = str(facts.quant_algo or "").strip()
+    if weights.lower() not in _UNQUANTIZED:
+        # The checkpoint's weight format; a deployment's KV dtype and drafter tag its own row.
+        accuracy["discriminators"] = {"quant_algo": weights.upper()}
     if defaults.get("boot"):
         accuracy["boot"] = note("accuracy.boot", dict(defaults["boot"]), "site")
     else:
         accuracy["boot"] = note("accuracy.boot", json.loads(json.dumps(DEFAULT_BOOT)), "default")
-    if DISAGG_FEATURE in built:
-        accuracy["disagg"] = _disagg(defaults, facts, site, note, questions, checkpoint)
 
-    spec: dict[str, Any] = {
-        "checkpoint_path": str(checkpoint),
-        "trtllm_repo_path": site["trtllm_repo_path"],
-        **({"arch": arch} if arch else {}),
-        **_parallel(members, goal.unit_members, built),
-        "features": built,
-        "scope": "text_only" if multimodal is False else "full",
-        "runtime": runtime,
-        "environment": dict(site["environment"]),
-        "accuracy": accuracy,
-    }
-    kv_variants = {
-        f"kv_{dtype}": {
-            "unit": "core",
-            "gates": ["accuracy"],
-            "llm_api_options": {"kv_cache_config": {"dtype": dtype}},
-            "note": f"KV cache stored as {dtype}, judged against the unit's own score",
-        }
-        for dtype in goal.params.get("kv_variants") or ()
-    }
+    def scored(depth: str | None) -> dict[str, Any]:
+        """What a deployment of ``depth`` states of its judging, beside its options."""
+        if depth == DEPTH_SMOKE:
+            return {"benchmarks": []}
+        entry: dict[str, Any] = {}
+        if benchmark_args:
+            entry["benchmarks"] = [{"name": benchmark, "args": list(benchmark_args)}]
+        return entry
+
+    # The deployments: the core configuration at each layout, then each feature on its own.
+    first = members[0]
+    found: list[dict[str, Any]] = [
+        {"name": member, "options": layout_options(member, core), **scored(None)}
+        for member in members
+    ]
+
+    def feature(name: str, overlay: Mapping[str, Any], **entry: Any) -> None:
+        """One deployment per layout the goal gives ``name``: the first layout unsaid."""
+        layouts = list(dict.fromkeys(goal.unit_members.get(name) or [first]))
+        for member in layouts:
+            options = _overlaid(layout_options(member, core), overlay)
+            label = name if len(layouts) == 1 else f"{name}_{member}"
+            found.append(
+                {
+                    "name": label,
+                    "options": options,
+                    **scored(goal.unit_profiles.get(name)),
+                    **entry,
+                }
+            )
+
+    for name in built:
+        if name in SPEC_DEC_ALGO:
+            draft: dict[str, Any] = {
+                "decoding_type": SPEC_DEC_ALGO[name],
+                "max_draft_len": int(goal.params.get("draft_len") or 1),
+            }
+            if goal.params.get("drafter"):
+                draft["speculative_model"] = str(goal.params["drafter"])
+            feature(name, {"speculative_config": draft})
+        elif name == "multimodal":
+            feature(name, {}, inputs=["text", "image"])
+        elif name == DISAGG_FEATURE:
+            environment = site.get("environment") or {}
+            per_node = (
+                (site.get("device") or {}).get("gpus_per_node")
+                or (environment.get("slurm") or {}).get("gpus_per_node")
+                or environment.get("gpus_per_node")
+            )
+            found.append(_disaggregated(defaults, core, goal, first, scored, note, per_node))
+        else:
+            feature(name, {})
+            questions.append(
+                f"{name}: its deployment `{name}` was written with the core options; state in "
+                f"`{ENGINES_DIRNAME}/{name}.yaml` the options that turn {name} on"
+            )
+    for dtype in goal.params.get("kv_variants") or ():
+        found.append(
+            {
+                "name": f"kv_{dtype}",
+                "options": _overlaid(
+                    layout_options(first, core), {"kv_cache_config": {"dtype": dtype}}
+                ),
+                "relative_to": first,
+            }
+        )
     for switch in sorted(goal.switches_on):
-        name = NON_CORE_SWITCHES[switch]
         if switch == "chunked_prefill":
             tokens = int(goal.params.get("chunk_tokens") or DEFAULT_CHUNK_TOKENS)
             overlay: dict[str, Any] = {"enable_chunked_prefill": True, "max_num_tokens": tokens}
-            said = f"chunked prefill on, in chunks of {tokens} tokens"
         else:
             cache: dict[str, Any] = {"enable_block_reuse": True}
             if snapshot:
                 cache["mamba_state_config"] = {"periodic_snapshot_interval": int(snapshot)}
             overlay = {"kv_cache_config": cache}
-            said = "KV-cache block reuse on"
-        kv_variants[name] = {
-            "unit": "core",
-            "gates": ["accuracy"],
-            "runtime": {switch: True},
-            "llm_api_options": overlay,
-            "note": f"{said}, judged against the unit's own score",
-        }
-    if kv_variants:
-        spec["variants"] = kv_variants
+        found.append(
+            {
+                "name": NON_CORE_SWITCHES[switch],
+                "options": _overlaid(layout_options(first, core), overlay),
+                "relative_to": first,
+            }
+        )
+
+    spec: dict[str, Any] = {
+        "checkpoint_path": str(checkpoint),
+        "trtllm_repo_path": site["trtllm_repo_path"],
+        **({"arch": arch} if arch else {}),
+        "environment": dict(site["environment"]),
+        "accuracy": accuracy,
+    }
+    _state_environment(spec["environment"], unstated)
+    questions += _environment_owed(spec["environment"])
+    _fit_sessions(spec, found, note)
+    _no_launcher(spec, found, note)
     if site.get("commit_policy"):
         spec["commit_policy"] = dict(site["commit_policy"])
     if site.get("agents"):
         spec["agents"] = dict(site["agents"])
-    if defaults.get("profile"):
-        spec["profile"] = note("profile", str(defaults["profile"]), "site")
-    chosen = {u: p for u, p in goal.unit_profiles.items() if u in built}
-    if chosen:
-        spec["profile"] = {"default": spec.get("profile") or PROFILE_STANDARD, **chosen}
-    layout = spec["members"] if isinstance(spec.get("members"), dict) else {}
-    everywhere = list(dict.fromkeys(m for listed in layout.values() for m in listed))
-    left_out = [
-        f"{unit}@{member}"
-        for unit in ["core", *built]
-        for member in everywhere
-        if member not in layout.get(unit, layout.get("default", ()))
-    ]
-    if left_out:
-        # Where the goal gates a unit on fewer members, the rest is its choice, not a gap.
-        spec["coverage"] = {"accept": left_out}
-    # The chunk size is the chunked variant's, not core's.
-    params = {k: v for k, v in goal.params.items() if not (chunked and k == "chunk_tokens")}
-    options = _llm_api_options(runtime, built, kv_dtype, params, snapshot, max_batch_size)
-    if goal.tune:
-        draft = options[built[-1]].get("speculative_config") if built else None
-        spec["perf"] = _perf(site, workload, members, draft)
-        adp = [c["name"] for c in spec["perf"]["configs"] if c["name"].startswith("dep")]
-        if adp:
-            note(
-                f"perf ({', '.join(adp)})",
-                "the high concurrency point, a global total across the attention-DP ranks",
-                "default",
-            )
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     derived = {
         "checkpoint": str(checkpoint),
@@ -667,236 +896,164 @@ def derive_spec(
         "goal": goal.text,
         "at": stamp,
     }
-    return Derivation(spec, options, unstated, questions, derived)
+    return Derivation(spec, found, unstated, questions, derived)
 
 
-def _parallel(
-    members: list[str], narrowed: Mapping[str, list[str]], built: list[str]
-) -> dict[str, Any]:
-    """The parallel segment and the member set, per unit where the goal narrows one."""
-    if len(members) == 1:
-        return {"parallel": members[0]}
-    per_unit = {unit: list(narrowed[unit]) for unit in built if unit in narrowed}
-    if not per_unit:
-        return {"parallel": "unified", "members": list(members)}
-    return {"parallel": "unified", "members": {"default": list(members), **per_unit}}
+def _no_launcher(spec: Mapping[str, Any], found: list[dict[str, Any]], note: Any) -> None:
+    """List each deployment a start would refuse for want of a launcher, in the start's words.
 
-
-def _discriminators(
-    facts: CheckpointFacts, kv_dtype: str, built: list[str]
-) -> dict[str, Any] | None:
-    """The reference row each unit anchors to: the weight and KV formats, and the speculator.
-
-    A reference row matches only its exact discriminator set, so a run that
-    names none anchors a quantized checkpoint to the bf16 row. Every unit from
-    the speculative one on runs with its draft, so they anchor to its row too.
+    A deployment wider than one node where no ``environment.slurm`` says how a step crosses
+    nodes. Not a question: the spec as written starts, and that deployment's session is
+    refused before any load.
     """
-    base: dict[str, Any] = {}
-    weights = str(facts.quant_algo or "")
-    if weights.strip().lower() not in _UNQUANTIZED:
-        base["quant_algo"] = weights.strip().upper()
-    if kv_dtype in _KV_DTYPES:
-        base["kv_cache_quant_algo"] = kv_dtype.upper()
-    per_unit: dict[str, dict[str, Any]] = {}
-    algo = None
-    for unit in built:
-        algo = SPEC_DEC_ALGO.get(unit, algo)
-        if algo:
-            per_unit[unit] = {**base, "spec_dec_algo": algo}
-    if per_unit:
-        return {"default": base, **per_unit}
-    return base or None
+    from ..checks import session as session_mod
+
+    probe = {**spec, "deployments": found}
+    try:
+        resolved = deployments_mod.resolve(probe)
+    except Exception:  # a draft that does not resolve yet is the lint's to report
+        return
+    for deployment in resolved:
+        try:
+            session_mod.place(probe, deployment)
+        except session_mod.WiderThanOneNode as exc:
+            note(f"deployments.{deployment.name}", "refused before any load", str(exc))
 
 
-def _llm_api_options(
-    runtime: Mapping[str, Any],
-    built: list[str],
-    kv_dtype: str,
-    params: Mapping[str, Any],
-    snapshot: int | None,
-    max_batch_size: Any,
-) -> dict[str, dict[str, Any]]:
-    """Each unit's LLM-API options: the runtime switches, the KV cache, and its speculator.
+def _fit_sessions(spec: Mapping[str, Any], found: list[dict[str, Any]], note: Any) -> None:
+    """Give each deployment whose session outlasts one holder of the site a limit to start with.
 
-    Every check receives these public constructor options, with runtime switches
-    resolved on the controller. State the capture list here once. A unit carries
-    the speculator of every feature up to it.
+    The spool never admits a job that cannot finish in its allocation, so a session longer
+    than one holder would wait for ever, and the next command refuses the spec. A
+    deployment that states no ``timeout`` is allowed what the flow allows its checks (half
+    an hour to boot, four hours a benchmark): where that is more than one holder admits
+    (``pool.fit_wall_s``: the rule preflight, the pool and the scheduler's fit hold a job
+    to), it gets half of what one holder admits. Derive does not know how long this
+    checkpoint loads and scores, and the spec as written must start. The longest limit a
+    holder admits starts only in the holder's first minutes and, hung, costs all of it;
+    half starts anywhere in about a holder's first half and costs half. It is a value the
+    spec leaves unstated, listed with that reason and with where the real one is read
+    (``note``); it is no question. A site whose holders have no end, or state none,
+    changes nothing.
     """
-    kv: dict[str, Any] = {}
-    if kv_dtype in _KV_DTYPES:
-        kv["dtype"] = kv_dtype
-    if params.get("kv_fraction"):
-        kv["free_gpu_memory_fraction"] = float(params["kv_fraction"])
-    kv["enable_block_reuse"] = bool(runtime["kv_cache_reuse"])
-    if snapshot and runtime["kv_cache_reuse"]:
-        kv["mamba_state_config"] = {"periodic_snapshot_interval": int(snapshot)}
-    base: dict[str, Any] = {
-        "kv_cache_config": kv,
-        "enable_chunked_prefill": bool(runtime["chunked_prefill"]),
-    }
-    if params.get("chunk_tokens"):
-        base["max_num_tokens"] = int(params["chunk_tokens"])
-    if not runtime["overlap_scheduler"]:
-        base["disable_overlap_scheduler"] = True
-    if runtime["cuda_graph"]:
-        graphs: dict[str, Any] = {"enable_padding": True}
-        if max_batch_size:
-            graphs["max_batch_size"] = int(max_batch_size)
-        base["cuda_graph_config"] = graphs
-    else:
-        base["cuda_graph_config"] = None
-    options = {"core": dict(base)}
-    draft: dict[str, Any] | None = None
-    for unit in built:
-        if unit in SPEC_DEC_ALGO:
-            draft = {
-                "decoding_type": SPEC_DEC_ALGO[unit],
-                "max_draft_len": int(params.get("draft_len") or 1),
-            }
-            if params.get("drafter"):
-                draft["speculative_model"] = str(params["drafter"])
-        options[unit] = {**base, **({"speculative_config": dict(draft)} if draft else {})}
-    return options
+    from ..checks import session as session_mod
+
+    try:
+        holder = pool_mod.holder_time_s(spec.get("environment") or {})
+    except (KeyError, TypeError, ValueError):
+        holder = None
+    if not holder:
+        return
+    probe = {**spec, "deployments": found}
+    try:
+        resolved = {d.name: d for d in deployments_mod.resolve(probe)}
+    except Exception:  # a draft that does not resolve yet is the lint's to report
+        return
+    longest = pool_mod.fit_wall_s(holder)
+    fits = int(longest - session_mod.TEARDOWN_S) // 60 * 60
+    start = fits // 2 // 60 * 60
+    for entry in found:
+        deployment = resolved.get(str(entry.get("name")))
+        if deployment is None or entry.get("timeout") or start <= 0:
+            continue
+        wall = session_mod.session_timeout(probe, deployment) + session_mod.TEARDOWN_S
+        if wall <= longest:
+            continue
+        entry["timeout"] = note(
+            f"deployments.{entry['name']}.timeout",
+            start,
+            f"a starting value: half of what one holder of the site admits ({fits}s of its "
+            f"{int(holder)}s; unstated, the session would be allowed {int(wall)}s, which is "
+            "never admitted). With it a session starts anywhere in about a holder's first "
+            "half, and one that hangs costs half a holder. The line the first session prints "
+            "ends with its seconds: put that, with room, in its place",
+        )
 
 
-def _tree_path(site: Mapping[str, Any], key: str) -> str:
-    """Where anchor ``key`` is in the site's checkout (``operators/tree_anchors.py``), else its hint."""
-    found = tree_anchors.resolve(site.get("trtllm_repo_path"), key)
-    return found.paths[0] if found.found else tree_anchors.ANCHORS[key].hint
-
-
-def disagg_layout(
-    weight_bytes: int | None, gpu_memory_gib: Any, gpus_per_node: Any
-) -> tuple[int, int] | None:
-    """``(devices per node, nodes)`` the disaggregated-serving test needs; ``None`` unknown.
-
-    One context and one generation engine, each on the fewest devices that hold
-    the checkpoint's weights (``lint.engine_width``): on one node when both fit,
-    as the tree's own disaggregated accuracy tests run (context and generation
-    sharing a node); else one engine per node, or as many nodes as an engine needs.
-    """
-    from .lint import engine_width
-
-    width = engine_width(weight_bytes, gpu_memory_gib)
-    if width is None or not isinstance(gpus_per_node, int) or gpus_per_node <= 0:
-        return None
-    if 2 * width <= gpus_per_node:
-        return 2 * width, 1
-    if width <= gpus_per_node:
-        return width, 2
-    per_engine = -(-width // gpus_per_node)
-    return gpus_per_node, 2 * per_engine
-
-
-def _disagg(
+def _disaggregated(
     defaults: Mapping[str, Any],
-    facts: CheckpointFacts,
-    site: Mapping[str, Any],
-    note,
-    questions: list[str],
-    checkpoint: Path | None = None,
+    core: Mapping[str, Any],
+    goal: Goal,
+    first: str,
+    scored: Any,
+    note: Any,
+    per_node: Any = None,
 ) -> dict[str, Any]:
-    """The disaggregated-serving test the run writes: the site's settings, its node id, its layout.
+    """The disaggregated deployment a goal's ``disagg`` comes to.
 
-    The node id defaults to a class named for the architecture, in the file whose
-    tests share the tree's disaggregated launcher (``launch_disaggregated_llm``).
-    The layout (:func:`disagg_layout`) is derived from the checkpoint's size:
-    one node when a context and a generation engine fit it, more only when they
-    do not.
+    A context and a generation server, each at one of the layouts the goal gives
+    ``disagg`` (``disagg@tp1/tp2``: context at the first, generation at the second;
+    one layout, or none, for both), each stating what moves the cache between them, and
+    judged against the first deployment's own score where no reference row fits. The
+    site's ``defaults.disagg`` gives its environment (the transport the cluster needs),
+    its timeout and native tests that also judge it.
+
+    A goal that gives no layout puts the first layout on both sides: twice its devices.
+    The pair is written as the goal's words say. Where the site states a node's devices
+    (``per_node``) and the pair does not fit one node, the report says so and names the
+    word that states the two layouts: it runs as a job of whole nodes.
     """
+    stated = goal.unit_members.get(DISAGG_FEATURE)
+    layouts = stated or [first]
+    sides = {"ctx": layouts[0], "gen": layouts[-1]}
+
+    def width(pair: Mapping[str, str]) -> int:
+        return sum(int(LAYOUT.match(layout).group(2)) for layout in pair.values())
+
+    node = int(per_node) if isinstance(per_node, int) and per_node > 0 else 0
+    if node and width(sides) > node:
+        note(
+            f"{DISAGG_DEPLOYMENT} (wider than a node)",
+            f"{width(sides)} devices",
+            f"context `{sides['ctx']}` and generation `{sides['gen']}` together, on a site "
+            f"whose node has {node}: its session runs as one job of whole nodes "
+            f"(`{DISAGG_FEATURE}@<ctx>/<gen>` in --goal names the two layouts)",
+        )
+    moves = {deployments_mod.TRANSCEIVER: {"backend": "DEFAULT"}}
+    entry: dict[str, Any] = {
+        "name": DISAGG_DEPLOYMENT,
+        **{
+            role: {"options": _overlaid(layout_options(layout, core), moves)}
+            for role, layout in sides.items()
+        },
+        "relative_to": first,
+        **scored(goal.unit_profiles.get(DISAGG_FEATURE)),
+    }
     block = dict(defaults.get("disagg") or {})
     if block:
-        note("accuracy.disagg", dict(block), "site")
-    if "devices" not in block and "nodes" not in block and checkpoint is not None:
-        from .lint import checkpoint_weight_bytes
-
-        environment = site.get("environment") or {}
-        per_node = environment.get("gpus_per_node") or (site.get("device") or {}).get(
-            "gpus_per_node"
-        )
-        layout = disagg_layout(
-            checkpoint_weight_bytes(checkpoint), environment.get("gpu_memory_gib"), per_node
-        )
-        if layout is not None:
-            devices, nodes = layout
-            block["devices"] = note("accuracy.disagg.devices", devices, "checkpoint size")
-            if nodes > 1:
-                block["nodes"] = note("accuracy.disagg.nodes", nodes, "checkpoint size")
-    if block.get("test"):
-        return block
-    launcher = tree_anchors.resolve(site.get("trtllm_repo_path"), "disagg_launcher")
-    if launcher.found:
-        name = re.sub(r"\W|For(?:CausalLM|ConditionalGeneration)$", "", facts.architecture)
-        name = name or "Model"
-        block["test"] = note(
-            "accuracy.disagg.test",
-            f"{launcher.paths[0]}::Test{name}::test_auto_dtype",
-            "default",
-        )
-    else:
-        questions.append(
-            "accuracy.disagg.test: name the node id of the disaggregated-serving accuracy test "
-            "the run will write, beside the tree's tests that serve through "
-            "`trtllm-serve disaggregated`"
-        )
-    return block
+        note(DISAGG_DEPLOYMENT, dict(block), "site")
+        entry.update({key: block[key] for key in SITE_DISAGG_KEYS if block.get(key)})
+    return entry
 
 
-def member_options(member: str) -> dict[str, Any]:
-    """The LLM-API parallelism one member (``tp4``, ``tep4``, ``dep4``) serves at."""
-    match = PARALLEL_PATTERN.match(str(member))
-    if match is None:
-        return {}
-    kind, world = match.group(1), int(match.group(2))
-    options: dict[str, Any] = {"tensor_parallel_size": world}
-    if kind in ("tep", "dep"):
-        options["moe_expert_parallel_size"] = world
-    if kind == "dep":
-        options["enable_attention_dp"] = True
-    return options
+#: The scratch variables a run's environment must state (``environment.check_tmpdir``).
+SCRATCH_VARIABLES = ("TMPDIR", "CLAUDE_CODE_TMPDIR")
+#: What running the deriving command again does to the files it wrote, by the command.
+#: ``intake derive`` writes them anew; the command that derives and runs keeps a spec it finds.
+REWRITTEN = (
+    "`intake derive` writes the spec, each deployment's options under `engines/` and this "
+    "report anew every time it runs: what you edit here is lost when it runs again into the "
+    "same directory. Edit a copy, or derive into another directory."
+)
+KEPT = (
+    "Edit it and run the same command to go on with the spec as it stands, your edits "
+    "included; `--clean` derives it again, over them."
+)
 
 
-def _perf(
-    site: Mapping[str, Any],
-    workload: Mapping[str, Any],
-    members: list[str],
-    draft: Mapping[str, Any] | None,
-) -> dict[str, Any]:
-    """The tune stage's block: one config per member at the run's workload, with the speculator."""
-    shared = {
-        "isl": workload.get("isl", 1024),
-        "osl": workload.get("osl", 1024),
-        "concurrency": workload.get("concurrency") or list(DEFAULT_PERF_CONCURRENCY),
-    }
-    configs = []
-    for member in members:
-        options = member_options(member)
-        if draft:
-            options["speculative_config"] = dict(draft)
-        load = dict(shared)
-        kind, _ = parse_parallel_segment(member)
-        if kind == "dep":
-            # Attention DP serves throughput: only its high point. A concurrency (and a batch
-            # size) is always the global total; each rank serves its share of it.
-            load["concurrency"] = [max(shared["concurrency"])]
-        configs.append({"name": member, "workload": load, "llm_api_options": options})
-    return {
-        "enabled": True,
-        **dict(site.get("perf") or {}),
-        "configs": configs,
-    }
+def render_report(derivation: Derivation, spec_path: Path, again: str = REWRITTEN) -> str:
+    """``derive.report.md``: what was read, what was defaulted, and what is still open.
 
-
-def render_report(derivation: Derivation, spec_path: Path) -> str:
-    """``derive.report.md``: what was read, what was defaulted, and what is still open."""
+    ``again`` says what running the command again does to these files (:data:`REWRITTEN`,
+    :data:`KEPT`): it differs by the command that derived them.
+    """
     derived = derivation.derived
     lines = [
         "# The derived spec",
         "",
         f"Derived from `{derived.get('checkpoint')}` ({derived.get('architecture')}), the site "
         f"`{derived.get('site') or '(unnamed)'}` and the goal `{derived.get('goal') or '(none)'}` "
-        f"at {derived.get('at')}, into `{spec_path}`. Edit it and run the same command to change "
-        "it; `--clean` derives it again.",
+        f"at {derived.get('at')}, into `{spec_path}`. {again}",
         "",
         "## What the goal did not state",
         "",
@@ -911,79 +1068,48 @@ def render_report(derivation: Derivation, spec_path: Path) -> str:
     return "\n".join(lines) + "\n"
 
 
-def write_derivation(workspace: Path, derivation: Derivation) -> Path:
-    """Write the spec, each unit's LLM-API options and the report into ``workspace``; the spec's path."""
+def write_derivation(workspace: Path, derivation: Derivation, again: str = REWRITTEN) -> Path:
+    """Write the spec, each deployment's options and the report into ``workspace``; the spec's path.
+
+    ``engines/<name>.yaml`` for an aggregated deployment, ``engines/<name>.ctx.yaml``
+    and ``.gen.yaml`` for a disaggregated one; the spec names each beside itself. Every
+    file is written whole, over one that was there; the report says so (``again``).
+    """
     workspace.mkdir(parents=True, exist_ok=True)
-    options_dir = workspace.resolve() / LLM_API_DIRNAME
-    options_dir.mkdir(parents=True, exist_ok=True)
-    paths: dict[str, str] = {}
-    for unit, options in derivation.llm_api_options.items():
-        path = options_dir / f"{unit}.yaml"
-        path.write_text(yaml.safe_dump(options, sort_keys=False), encoding="utf-8")
-        paths[unit] = str(path)
-    spec = dict(derivation.spec)
-    spec["accuracy"] = {**spec["accuracy"], "llm_api_options": paths}
+    engines = workspace / ENGINES_DIRNAME
+    engines.mkdir(parents=True, exist_ok=True)
+
+    def written(name: str, options: Mapping[str, Any]) -> str:
+        (engines / f"{name}.yaml").write_text(
+            yaml.safe_dump(dict(options), sort_keys=False), encoding="utf-8"
+        )
+        return f"{ENGINES_DIRNAME}/{name}.yaml"
+
+    stated = []
+    for entry in derivation.deployments:
+        entry = dict(entry)
+        if "options" in entry:
+            entry["options"] = written(entry["name"], entry["options"])
+        for role in deployments_mod.ROLES:
+            if role in entry:
+                options = written(f"{entry['name']}.{role}", entry[role]["options"])
+                entry[role] = {**entry[role], "options": options}
+        stated.append(entry)
+    spec = {**derivation.spec, deployments_mod.DEPLOYMENTS_FIELD: stated}
     path = workspace / SPEC_FILENAME
     path.write_text(yaml.safe_dump(spec, sort_keys=False), encoding="utf-8")
-    (workspace / REPORT_FILENAME).write_text(render_report(derivation, path), encoding="utf-8")
+    (workspace / REPORT_FILENAME).write_text(
+        render_report(derivation, path, again), encoding="utf-8"
+    )
     return path
 
 
-#: Checkpoint structure that explicitly describes recurrent attention/state. Keep model names
-#: out of this hint: an unknown architecture can use the same checkpoint schema.
-_RECURRENT_CONFIG_KEYS = (
-    "linear_attn_config",
-    "linear_attention_config",
-    "linear_num_value_heads",
-    "mamba_ssm_cfg",
-    "ssm_cfg",
-    "full_attention_interval",
-)
-#: Words in a per-layer type that name a layer keeping recurrent state:
-#: ``mamba``, ``linear_attention``, a gated delta rule (``*_delta*``).
-_RECURRENT_LAYER_WORDS = ("mamba", "linear", "ssm", "delta", "recurrent")
-_LAYER_TYPE_KEYS = ("layer_types", "layers_block_type")
-
-
-def hybrid_marker(config: Mapping[str, Any]) -> str | None:
-    """What marks a checkpoint's ``config.json`` as a hybrid linear-attention model; ``None``.
-
-    This is a structural intake hint, not the engine's architecture registry. It reads
-    explicit recurrent configuration or layer descriptions on the config and its
-    ``text_config``; runtime evidence decides whether recurrent state is actually used.
-    """
-    for scope, block in (("", config), ("text_config.", config.get("text_config"))):
-        if not isinstance(block, Mapping):
-            continue
-        if block.get("hybrid_override_pattern"):
-            return f"`{scope}hybrid_override_pattern`"
-        for key in _RECURRENT_CONFIG_KEYS:
-            if block.get(key):
-                return f"`{scope}{key}`"
-        for key in _LAYER_TYPE_KEYS:
-            entries = block.get(key)
-            if not isinstance(entries, (list, tuple)):
-                continue
-            recurrent = sorted(
-                {
-                    str(e)
-                    for e in entries
-                    if any(w in str(e).lower() for w in _RECURRENT_LAYER_WORDS)
-                }
-            )
-            if recurrent:
-                return f"`{scope}{key}` with {', '.join(recurrent)}"
-    return None
-
-
 __all__ = [
-    "hybrid_marker",
     "DEFAULT_BOOT",
     "DEFAULT_MEMBERS",
-    "DEFAULT_SNAPSHOT_INTERVAL",
     "DEFAULT_WORKLOAD",
     "DRAFT_LAYER_KEYS",
-    "LLM_API_DIRNAME",
+    "ENGINES_DIRNAME",
     "REPORT_FILENAME",
     "SPEC_DEC_ALGO",
     "SPEC_FILENAME",
@@ -994,7 +1120,7 @@ __all__ = [
     "derive_spec",
     "draft_layers",
     "inspect_checkpoint",
-    "member_options",
+    "layout_options",
     "parse_goal",
     "read_config",
     "render_report",

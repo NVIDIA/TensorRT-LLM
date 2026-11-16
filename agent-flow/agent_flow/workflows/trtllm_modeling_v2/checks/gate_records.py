@@ -21,15 +21,7 @@ from typing import Any, Mapping
 RESULTS_FILENAME = "gate_results.jsonl"
 
 
-KIND_ACCEPTANCE = "acceptance"
-
-
 KIND_FINDING = "finding"
-
-
-#: A checkpoint the stock implementation cannot load, on one GPU architecture:
-#: the acceptance gate's ``=off`` leg is skipped from then on.
-KIND_STOCK_UNAVAILABLE = "stock_unavailable"
 
 
 @dataclass(frozen=True)
@@ -66,10 +58,6 @@ class GateRecord:
 
 def _now() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
-
-
-def _same_key(a: Mapping[str, Any], b: Mapping[str, Any]) -> bool:
-    return json.dumps(dict(a), sort_keys=True) == json.dumps(dict(b), sort_keys=True)
 
 
 class GateRecords:
@@ -115,29 +103,6 @@ class GateRecords:
                 records.append(record)
         return records
 
-    def latest(
-        self,
-        kind: str,
-        key: Mapping[str, Any],
-        *,
-        passed_only: bool = True,
-        exclude_tree: str | None = None,
-    ) -> GateRecord | None:
-        """The newest record of ``kind`` with exactly ``key``.
-
-        ``passed_only`` (the default) skips failed measurements: a regression
-        that failed its gate must not become the next tree's baseline.
-        ``exclude_tree`` skips records of the tree being measured now.
-        """
-        for record in reversed(self.all(kind)):
-            if passed_only and not record.passed:
-                continue
-            if exclude_tree is not None and record.tree == exclude_tree:
-                continue
-            if _same_key(record.key, key):
-                return record
-        return None
-
 
 def open_findings(
     records: GateRecords, acknowledged: Mapping[str, str] | None = None
@@ -167,9 +132,7 @@ def records_for(workspace: str | Path) -> GateRecords:
 __all__ = [
     "GateRecord",
     "GateRecords",
-    "KIND_ACCEPTANCE",
     "KIND_FINDING",
-    "KIND_STOCK_UNAVAILABLE",
     "RESULTS_FILENAME",
     "open_findings",
     "records_for",

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -12,6 +13,34 @@ ROOT = Path(__file__).resolve().parents[1]
 
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+#: Variables that point git at a repository or a work tree whatever the working directory
+#: is. Git exports them to what it starts (`git rebase --exec`, `git bisect run`, a hook):
+#: a suite started from there would run its fixtures' `git init` and `git config` against
+#: the caller's repository instead of the temporary ones it makes.
+GIT_LOCATION_VARIABLES = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_PREFIX",
+)
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Drop the caller's git location before anything of the suite can run git."""
+    for name in GIT_LOCATION_VARIABLES:
+        os.environ.pop(name, None)
+
+
+@pytest.fixture(autouse=True)
+def _no_git_location_from_the_caller(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test runs git against a repository its caller's environment names."""
+    for name in GIT_LOCATION_VARIABLES:
+        monkeypatch.delenv(name, raising=False)
 
 
 def _git(repo: Path, *args: str) -> None:

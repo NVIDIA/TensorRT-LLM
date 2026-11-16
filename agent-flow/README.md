@@ -17,7 +17,7 @@ whichever backend(s) you plan to use:
 
 ## Installation
 
-Since `agent-flow` is not a published wheel package, use the following way to install:
+Python 3.11 or newer. Since `agent-flow` is not a published wheel package, use the following way to install:
 
 ```bash
 pip install -e /path/to/agent-flow

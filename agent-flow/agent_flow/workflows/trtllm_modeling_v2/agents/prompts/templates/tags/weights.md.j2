@@ -1,0 +1,17 @@
+{# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0 -#}
+## Tag `weights`: every checkpoint key, accounted for
+
+**What it is for.** The target loads this checkpoint: each key is loaded,
+transformed, shared out across ranks, or deliberately skipped with the
+reason written beside it.
+
+**Hand back.** The weight-loading code and its test, in the files your card
+names; mapping, transformation and sharding stay in that code. No forward
+and no routing.
+
+**How it is judged.** Your test reads the checkpoint as data (its index and
+its config) and holds the mapping to its keys; it loads no engine. A loader
+that asserts every tensor was consumed must know the ones it skips. Names
+to search: `load_weights`, `post_load_weights`, and the quantization this
+checkpoint states.

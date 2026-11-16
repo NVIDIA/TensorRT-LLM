@@ -74,10 +74,21 @@ def _holds_files(path: Path) -> bool:
 
 
 def benchmarks(task_data: Mapping[str, Any]) -> list[str]:
-    """The known benchmarks the run's units score."""
-    value = (task_data.get("accuracy") or {}).get("benchmark") or "gsm8k"
-    names = value.values() if isinstance(value, Mapping) else [value]
-    return sorted({str(n).lower() for n in names if str(n).lower() in KNOWN})
+    """The known benchmarks the run's deployments score."""
+    from ...spec import deployments as deployments_mod
+
+    names = {b.name.lower() for d in deployments_mod.resolve(task_data) for b in d.benchmarks}
+    return sorted(n for n in names if n in KNOWN)
+
+
+def under_models_root(task_data: Mapping[str, Any], benchmark: str) -> Path | None:
+    """The dataset of ``benchmark`` under the models root, where it is there; else ``None``."""
+    env = (task_data.get("environment") or {}).get("env") or {}
+    root = env.get("LLM_MODELS_ROOT") or os.environ.get("LLM_MODELS_ROOT")
+    if not root or benchmark not in KNOWN:
+        return None
+    path = Path(root) / DIRNAME / KNOWN[benchmark]
+    return path if _holds_files(path) else None
 
 
 def stage(
@@ -94,10 +105,9 @@ def stage(
     given = accuracy.get("dataset_path")
     if given and Path(str(given)).exists():
         return {"state": READY, "path": str(given), "source": "accuracy.dataset_path"}
-    env = (task_data.get("environment") or {}).get("env") or {}
-    root = env.get("LLM_MODELS_ROOT") or os.environ.get("LLM_MODELS_ROOT")
-    if root and _holds_files(Path(root) / DIRNAME / repo):
-        return {"state": READY, "path": str(Path(root) / DIRNAME / repo), "source": "models root"}
+    found = under_models_root(task_data, benchmark)
+    if found is not None:
+        return {"state": READY, "path": str(found), "source": "models root"}
     target = Path(workspace) / DIRNAME / repo
     if _holds_files(target):
         return {"state": READY, "path": str(target), "source": "staged before"}

@@ -1,30 +1,32 @@
 {# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 SPDX-License-Identifier: Apache-2.0 -#}
-## Tag `kernel` — one catalog entry
+## Tag `kernel`: one catalog entry
 
-**One task, one entry**: onboard an op no entry wraps, verify an existing
-entry at values its cells do not hold. Your dispatch says which, and where
-the files land. **Load the `trtllm-modeling-v2-entry` skill before implementing
-or verifying, even if verification changes no code.** It defines entry/test
-certification and local variants. Native torch is not an entry (there is no
-`catalog/torch/`): report it and write nothing. Nor is a torch fallback
-inside the wrapper: it certifies nothing, so land the failure instead.
+**What it is for.** The target's forward calls operations, and each is an
+entry: a thin, stateless wrapper of one kernel call, with its reference in
+plain torch, its guard, and the cells it was certified at. Your task makes
+one entry usable for this checkpoint: `onboard` writes one nobody has,
+`verify` certifies an existing one at values its cells do not hold. Where
+nothing a target may call serves the operation, the entry is its composition
+in torch, copied or adapted from the engine's own code of the same
+computation where there is some: correct first, and slow is acceptable.
 
-A kernel this run writes starts from the closest existing implementation
-where there is one (FlashInfer, CUTLASS, vLLM, SGLang, another target's
-`ops/`): adapt it, keep its license header and name its origin in the
-entry's docstring.
+**Hand back.** The entry's module and its test, committed at the paths your
+dispatch names. `CELLS` holds the cells that pass and `ARCHS` this
+architecture. A cell that fails is left out of `CELLS` and goes under
+`not_done` with its measured numbers. **Load the `trtllm-modeling-v2-entry`
+skill before you write or certify, even if nothing changes**: it says what an
+entry is and what certifies a cell.
 
-When your dispatch states the cells, certify exactly those, plus one at the
-envelope's largest row; a value you notice beyond them goes in the `note` as
-uncertified. Certify measured values, not estimates: `runtime_facts.yaml`
-holds what the engines of passed gates captured and allocated. Certify on a
-run of the whole test file and the source-level gates at your final commit.
-Delivery runs the delivered tests again at the integrated HEAD, and holds
-only if they pass there.
-
-Keep edits inside the task's `touches`. If the entry needs native sources,
-family build declarations, fake registrations or owners/tests beyond those
-paths, follow the native README and report the missing ownership to the
-planner so it can widen the task or plan a prerequisite. A defect outside the
-entry that the task does not own is a symptom to report, not to fix.
+**How it is judged.** By the entry's own test file, which your card's
+command runs on a pin of your tree: it passes when every test in the file
+passes. The test drives the cells in `CELLS`, so a cell that fails and that
+the options of the first deployment (`deployments` in the spec) do not use
+is left out of `CELLS` and the receipt is still `ready`. `blocked` is for an
+entry that cannot be used at all: it does not run, or a cell those options
+use fails. A torch fallback hidden inside a wrapper certifies nothing: land
+the failure instead. A band is derived as the skill says and is never
+widened to make a cell pass. A file you would have to change outside your
+write scope (a shared test helper) is a `blocked` receipt that names it.
+Native code is changed by no task of a run: an entry that needs it changed
+is `blocked`, with what must change and why.

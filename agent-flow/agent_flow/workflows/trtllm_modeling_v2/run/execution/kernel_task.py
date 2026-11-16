@@ -1,94 +1,57 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Kernel task dispatch, prepared prompt context and failed-receipt integration."""
+"""Kernel task dispatch and its prepared prompt context."""
 
 from __future__ import annotations
 
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import yaml
-
 from ...agents.prompts.kernel import KernelContext, kernel_prompt
 from ...operators.coverage import (
     MODEL_OPS_DIRNAME,
+    UNIT_CORE,
     QueueItem,
     entry_paths,
-    is_entry_file,
     shared_entry_paths,
     split_variant,
 )
-from .handoff import TaskResult, uncertified_report
+from .handoff import DEFAULT_DECISION_UNIT, TaskResult
 
 if TYPE_CHECKING:
     from ..graph import Task
 
-FAILED_RECEIPT = "FAILED_RECEIPT"
 
-
-def _run_one_kernel_writer(execution, item: QueueItem, note: str, task: Task) -> TaskResult:
-    """Dispatch the queue item's turn, then safely integrate any failed receipt.
+def _run_one_kernel_writer(
+    execution, item: QueueItem, note: str, task: Task, card: str = "", context: str = ""
+) -> TaskResult:
+    """Dispatch the queue item's turn.
 
     The decision is numbered by ``item.n``; concurrent entries reserve
-    separate paths. A retry or rebase note forces a fresh turn rather than
-    adopting an earlier answer from the same attempt.
+    separate paths. A retry or a note forces a fresh turn rather than
+    adopting an earlier answer from the same attempt. ``context`` is what the
+    task depends on: it follows the row's own text, as in a dispatch of any
+    other kind.
     """
-    decision = execution._dispatch_task(
+    prompt = _kernel_writer_prompt(execution, item, note, task=task, card=card)
+    return execution._dispatch_task(
         "kernel_writer",
-        item.unit,
+        decision_unit_of(item),
         task.id,
-        _kernel_writer_prompt(execution, item, note, task=task),
+        "\n\n".join(part.strip() for part in (prompt, context) if part.strip()),
         iteration=item.n,
         label=f"{item.mode} {item.target}",
         fresh=bool(note),
     )
-    decision.annotate(_land_failed_receipt(execution, item, task, decision.decision))
-    if decision.decision == "LANDED":
-        decision.annotate(uncertified_report(decision.data.get("uncertified")))
-    return decision
 
 
-def _land_failed_receipt(execution, item: QueueItem, task: Task, decision: str) -> str:
-    """Integrate a FAILED_RECEIPT's commits when they change nothing but the entry's files.
+def decision_unit_of(item: QueueItem) -> str:
+    """What a queue row's decision is filed under: its deployment, or the target itself.
 
-    The task's own integration leaves a failed receipt, but what it
-    committed (the input `is_valid` now refuses, the guard test that proves
-    it, the cells that hold) is knowledge every caller of the entry needs.
-    A branch that changes any file outside the entry's (:func:`is_entry_file`,
-    its local variant's or the shared entry's) stays as it is, and the
-    task's next attempt starts from it. What became of the commits reaches
-    the planner with the task's event (:func:`_run_one_kernel_writer`).
+    A row that names no deployment is the target's. Its file is not named for the queue's
+    default word for that: a worker read `core-kernel_writer-3.yaml` as "the core task".
     """
-    integration = getattr(execution, "_integration", None)
-    if decision != FAILED_RECEIPT or integration is None:
-        return ""
-    paths = integration.changed_paths(task.id)
-    if not paths:
-        return ""
-    branch = integration.branch(task.id)
-    landing, _ = _landing(execution, item, task)
-    outside = [
-        path
-        for path in paths
-        if not (is_entry_file(path, item.target) or is_entry_file(path, landing))
-    ]
-    if outside:
-        landed = (
-            f"its commits stay on {branch} for the task's next attempt: they change more "
-            f"than the entry's own files ({', '.join(outside)})"
-        )
-    else:
-        outcome = integration.integrate(task.id)
-        if outcome.merged:
-            integration.close(task.id)
-        landed = (
-            f"its {outcome.commits} commit(s), the entry's own files only, are integrated: "
-            f"what it measured, refuses and tests is on the target"
-            if outcome.merged
-            else f"its commits stay on {branch}: {outcome.detail}"
-        )
-    execution.workflow.journal.event("integration", f"{task.id}: {FAILED_RECEIPT}, {landed}")
-    return landed
+    return DEFAULT_DECISION_UNIT if item.unit == UNIT_CORE else item.unit
 
 
 def _target_rel(execution) -> str:
@@ -125,25 +88,13 @@ def _landing(execution, item: QueueItem, task: Task | None) -> tuple[str, tuple[
     return str(placed.variant), entry_paths(placed, target_rel, repo)
 
 
-def _raw_vocabulary(execution) -> dict:
-    """``vocabulary.yaml`` as written, unvalidated; empty when it cannot be read."""
-    try:
-        data = yaml.safe_load(execution.workflow.vocabulary_path.read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError):
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
 def _kernel_writer_prompt(
-    execution, item: QueueItem, note: str = "", task: Task | None = None
+    execution, item: QueueItem, note: str = "", task: Task | None = None, card: str = ""
 ) -> str:
     """Read the task's inputs once and hand only prepared data to the renderer."""
     workflow = execution.workflow
     target_rel = _target_rel(execution)
     landing, paths = _landing(execution, item, task)
-    rows = _raw_vocabulary(execution).get("queue") or ()
-    row = next((r for r in rows if isinstance(r, dict) and str(r.get("n")) == str(item.n)), {})
-    environment = workflow.task_data.get("environment") or {}
     return kernel_prompt(
         KernelContext(
             item=item,
@@ -153,15 +104,11 @@ def _kernel_writer_prompt(
             target_rel=target_rel,
             vocabulary_path=str(workflow.vocabulary_path),
             note=note,
-            goal=(task.goal or "").strip() if task else "",
+            goal=card or ((task.goal or "").strip() if task else ""),
             task_id=task.id if task else "",
             task_kind=task.kind if task else "kernel",
-            tags=tuple(task.tags) if task else (),
-            tier=row.get("tier"),
             landing=landing,
             paths=paths,
             shared=tuple(shared_entry_paths(item.target)) if landing != item.target else (),
-            environment_kind=str(environment.get("kind", "local")),
-            devices=int(environment.get("gpus_per_node") or 1),
         )
     )

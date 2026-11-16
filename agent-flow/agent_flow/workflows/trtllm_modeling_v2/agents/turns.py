@@ -52,6 +52,10 @@ class TurnTimeout(TurnExecutionError):
     """Nothing answered the turn inside its deadline."""
 
 
+class TurnEnded(TurnExecutionError):
+    """The run ended the turn before it answered (:meth:`InProcessTurnExecutor.end`)."""
+
+
 #: How long a turn may take when neither the caller nor the role says.
 DEFAULT_TURN_TIMEOUT_S = 3 * 60 * 60
 
@@ -60,10 +64,10 @@ DEFAULT_ROLE_TURN_TIMEOUTS: dict[str, float] = {
     "surveyor": 4 * 3600.0,
     "kernel_writer": 6 * 3600.0,
     "assembler": 16 * 3600.0,
-    # One candidate: implement, test on GPU, micro-bench -- hours of spool jobs.
-    "tuner": 8 * 3600.0,
-    "planner": 15 * 60.0,
 }
+
+#: How often a turn in flight looks whether it was ended (:meth:`InProcessTurnExecutor.end`).
+END_POLL_S = 1.0
 
 #: Where in-process turns leave their files, under the workspace.
 TURNS_DIRNAME = "turns"
@@ -356,6 +360,8 @@ class InProcessTurnExecutor:
         self.timeout_s = DEFAULT_TURN_TIMEOUT_S if timeout_s is None else timeout_s
         self.role_timeouts = dict(DEFAULT_ROLE_TURN_TIMEOUTS) if timeout_s is None else {}
         self._log = _TurnLog()
+        #: The turns in flight by the work they are for; set, the turn is ended.
+        self._in_flight: dict[str, threading.Event] = {}
         if records is not None:
             self._log.keep_in(records)
 
@@ -374,6 +380,18 @@ class InProcessTurnExecutor:
     def records(self) -> Path | None:
         """Where turns leave their files, or ``None`` before :meth:`keep_records`."""
         return self._log.root
+
+    def end(self, work: str) -> bool:
+        """End the turn in flight for ``work`` as its own limit would; whether one was.
+
+        The CLI it started is stopped, and the thread that runs it raises
+        :class:`TurnEnded`. For the run's controller, when the session that watches
+        the run answers a task while its agent is still in its turn.
+        """
+        ended = self._in_flight.get(work)
+        if ended is not None:
+            ended.set()
+        return ended is not None
 
     def bound(self, session: Any) -> "InProcessTurnExecutor":
         """Pin every turn to ``session``, whatever the request asks for."""
@@ -480,19 +498,22 @@ class InProcessTurnExecutor:
             _route_activity(layer)
         token = _ACTIVE.set(record)
         outcome, text, error = "raised", None, ""
+        ended = self._in_flight.setdefault(request.work or request.what, threading.Event())
         try:
             with cli_stderr_to(_stderr_sink(record)):
-                answer = self._call(layer, request, timeout_s, record)
+                answer = self._call(layer, request, timeout_s, record, ended)
             text = answer if isinstance(answer, str) else str(answer)
             outcome = "answered"
-        except TurnTimeout as exc:
-            outcome, error = "timed out", str(exc)
+        except (TurnTimeout, TurnEnded) as exc:
+            outcome = "ended" if isinstance(exc, TurnEnded) else "timed out"
+            error = str(exc)
             raise
         except BaseException as exc:
             outcome = "interrupted" if isinstance(exc, KeyboardInterrupt) else "raised"
             error = f"{type(exc).__name__}: {exc}"
             raise
         finally:
+            self._in_flight.pop(request.work or request.what, None)
             _ACTIVE.reset(token)
             if record is not None:
                 record.finish(outcome, text=text, error=error)
@@ -503,18 +524,43 @@ class InProcessTurnExecutor:
         )
 
     @staticmethod
-    def _call(layer: Any, request: TurnRequest, timeout_s: float, record: TurnRecord | None) -> Any:
-        """``layer.aforward(prompt)``, cancelled at ``timeout_s``."""
+    def _call(
+        layer: Any,
+        request: TurnRequest,
+        timeout_s: float,
+        record: TurnRecord | None,
+        ended: threading.Event | None = None,
+    ) -> Any:
+        """``layer.aforward(prompt)``, cancelled at ``timeout_s`` or once ``ended`` is set."""
 
         async def bounded() -> Any:
-            with anyio.move_on_after(timeout_s):
-                return await layer.aforward(request.prompt)
+            with anyio.move_on_after(timeout_s) as limit:
+                async with anyio.create_task_group() as group:
+
+                    async def watch() -> None:
+                        while ended is not None and not ended.is_set():
+                            await anyio.sleep(END_POLL_S)
+                        if ended is not None:
+                            limit.cancel()
+
+                    group.start_soon(watch)
+                    failure: Exception | None = None
+                    try:
+                        answer = await layer.aforward(request.prompt)
+                    except Exception as exc:  # raised below as itself: a group would wrap it
+                        failure = exc
+                    group.cancel_scope.cancel()
+                if failure is not None:
+                    raise failure
+                return answer
             return _EXPIRED
 
         answer = anyio.run(bounded)
         if answer is _EXPIRED:
             name = record.request_id if record is not None else request.role
             where = f" Its activity is in {record.activity_file}." if record is not None else ""
+            if ended is not None and ended.is_set():
+                raise TurnEnded(f"{name}: the turn was ended before it answered.{where}")
             raise TurnTimeout(
                 f"{name}: no answer within {timeout_s:g}s (the {request.role} turn timeout); "
                 f"the turn was stopped.{where}"
@@ -538,6 +584,7 @@ __all__ = [
     "TURNS_DIRNAME",
     "InProcessTurnExecutor",
     "LayerProvider",
+    "TurnEnded",
     "TurnExecutionError",
     "TurnOutcome",
     "TurnRecord",

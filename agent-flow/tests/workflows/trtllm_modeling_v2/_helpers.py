@@ -7,16 +7,16 @@ from __future__ import annotations
 
 import json
 import re
+import socket
 import subprocess
 from pathlib import Path
 
 import yaml
 
 from agent_flow.workflows.trtllm_modeling_v2.checks import delivery
-from agent_flow.workflows.trtllm_modeling_v2.checks.harness import workload_io
+from agent_flow.workflows.trtllm_modeling_v2.checks.harness import session_driver, workload_io
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import CommandResult
 from agent_flow.workflows.trtllm_modeling_v2.operators import coverage as catalog_paths
-from agent_flow.workflows.trtllm_modeling_v2.operators import coverage as vocab
 from agent_flow.workflows.trtllm_modeling_v2.run.records.state import load_state
 from agent_flow.workflows.trtllm_modeling_v2.run.validation import contract as contract_mod
 from agent_flow.workflows.trtllm_modeling_v2.run.workflow import TrtllmModelingV2Workflow
@@ -197,24 +197,22 @@ class FakeLayer:
 class Script:
     """Per-role scripted decisions, keyed by role and turn number."""
 
-    def __init__(self, ctx, plan=("DRAFT_READY",), **roles):
+    def __init__(self, ctx, plan=("ready",), **roles):
         self.ctx = ctx
         self.plan = list(plan)
         self.roles = roles
 
     def __call__(self, role, turn, prompt):
         override = self.roles.get(role)
-        if role == "planner" and not callable(override):
-            return plan_every_unit(turn, prompt)
         if role == "surveyor" and not callable(override):
             return {"decision": self.plan[min(turn, len(self.plan)) - 1], "summary": "drafted"}
         if callable(override):
             return override(turn, prompt)
         if role == "kernel_writer":
             target = _target_from(prompt)
-            return {"decision": "LANDED", "summary": f"landed {target}", "entry": target}
+            return {"decision": "ready", "summary": f"landed {target}", "entry": target}
         if role == "assembler":
-            return {"decision": "UNIT_READY", "summary": "assembled"}
+            return {"decision": "ready", "summary": "assembled"}
         raise AssertionError(f"unscripted role: {role}")
 
 
@@ -263,39 +261,178 @@ def healthy_smi(count: int = 1):
     return runner
 
 
-def driver_records(accepted: int = 320, iterations: int = 100, prompts: int = 32) -> str:
-    """What the engine driver prints for ``prompts`` prompts accepting alike."""
-    lines = []
-    for n in range(prompts):
-        record = {
-            "index": n,
-            "id": f"d{n}",
-            "prompt_sha": f"p{n}",
-            "tokens": accepted,
-            "iterations": iterations,
-            "token_ids": list(range(accepted)),
-            "text": "Paris is the capital of France",
-        }
-        lines.append(f"{workload_io.RECORD_MARKER} {json.dumps(record)}")
+TARGET_CLASS = "tensorrt_llm._torch._experimental.modeling_v2.models.gpt_oss.model.GptOssModel"
+
+
+def session_spec(command: str) -> dict:
+    """The spec of the session ``command`` starts: what `checks/session.py` wrote for its driver."""
+    # The driver's launch is wrapped (`bash -c '<scrub>; exec <python> <driver> --spec <path>'`).
+    found = re.search(r"--spec\s+([^\s'\"]+)", command)
+    assert found, f"no session spec in: {command}"
+    return json.loads(Path(found.group(1)).read_text(encoding="utf-8"))
+
+
+def session_stdout(
+    command: str,
+    *,
+    score: float = 90.0,
+    accepted: int = 320,
+    iterations: int = 100,
+    text: str = "Paris is the capital of France",
+    change=None,
+) -> str:
+    """What the session driver prints for a session in which everything answers.
+
+    The stand-in for one whole session job: every server starts on devices of its own,
+    every rank says it runs the options it was given from the tree measured, every
+    request is answered with ``text``, a benchmark scores ``score`` and a drafter accepts
+    ``accepted`` tokens over ``iterations`` iterations of each prompt. ``change`` may
+    edit each marker's payload before it is printed (``change(marker, payload)``; return
+    ``None`` to drop the line): how a test makes one check of the session fail.
+    """
+    spec = session_spec(command)
+    lines: list[str] = []
+
+    def emit(marker: str, payload: dict) -> None:
+        if change is not None:
+            payload = change(marker, payload)
+        if payload is not None:
+            lines.append(f"{marker} {json.dumps(payload)}")
+
+    host = socket.gethostname()
+    device = 0
+    for instance in spec["instances"]:
+        own = [str(device + n) for n in range(instance["ranks"])]
+        device += instance["ranks"]
+        emit(
+            session_driver.DEVICES_MARKER,
+            {
+                "instance": instance["name"],
+                "role": instance["role"],
+                "index": instance["index"],
+                "host": host,
+                "devices": own,
+                "ranks": instance["ranks"],
+                "held_before": [],
+            },
+        )
+        emit(session_driver.SERVER_MARKER, {"name": instance["name"], "healthy": True})
+        options = yaml.safe_load(Path(instance["options"]).read_text(encoding="utf-8")) or {}
+        for rank in range(instance["ranks"]):
+            emit(
+                workload_io.RANK_ENGINE_MARKER,
+                {
+                    "rank": rank,
+                    "instance": instance["name"],
+                    "role": instance["role"],
+                    "options": options,
+                    "target": TARGET_CLASS,
+                    "origin": f"{spec['tree']}/tensorrt_llm/__init__.py",
+                    "host": host,
+                    "devices": own,
+                },
+            )
+    seen: list[str] = []
+    for step in spec["steps"]:
+        ended = {"step": step["id"], "kind": step["kind"], "error": "", "seconds": 0.1}
+        if step["kind"] == "requests":
+            requests = list(step.get("requests") or ())
+            drawn = int((step.get("dataset") or {}).get("num") or 0)
+            requests += [
+                {"id": f"d{n}", "endpoint": "/v1/completions", "body": {"prompt": f"question {n}"}}
+                for n in range(drawn)
+            ]
+            for index, request in enumerate(requests):
+                body = request["body"]
+                prompt = body.get("prompt")
+                key = json.dumps(prompt)
+                tokens = int(body.get("max_tokens") or 1)
+                record = {
+                    "step": step["id"],
+                    "index": index,
+                    "id": request["id"],
+                    "endpoint": request["endpoint"],
+                    "status": 200,
+                    "text": text,
+                    "finish_reason": "stop",
+                    "error": "",
+                    "tokens": tokens,
+                    "prompt_tokens": len(prompt) if isinstance(prompt, list) else 8,
+                    "cached_tokens": 448 if key in seen else 0,
+                    "speculative_decoding": {
+                        "num_spec_steps": iterations - 1,
+                        "total_accepted_draft_tokens": accepted - iterations,
+                        "total_draft_tokens": 3 * iterations,
+                    },
+                }
+                seen.append(key)
+                emit(workload_io.RECORD_MARKER, record)
+            if step.get("decode"):
+                ended["decoded"] = {str(i): f"t{i}" for i in step["decode"]}
+        elif step["kind"] == "stream":
+            record = {
+                "step": step["id"],
+                "index": 0,
+                "id": "stream",
+                "endpoint": step["request"]["endpoint"],
+                "status": 200,
+                "text": text,
+                "finish_reason": "stop",
+                "events": 2,
+                "done": True,
+                "error": "",
+            }
+            emit(workload_io.RECORD_MARKER, record)
+        elif step["kind"] == "command":
+            Path(step["log"]).parent.mkdir(parents=True, exist_ok=True)
+            Path(step["log"]).write_text(f"lm-eval gsm8k average accuracy: {score}\n")
+            ended.update(returncode=0, log=step["log"], command=" ".join(step["argv"]))
+        emit(session_driver.STEP_MARKER, ended)
+    emit(
+        session_driver.SESSION_MARKER,
+        {
+            "deployment": spec["deployment"],
+            "host": host,
+            "instances": len(spec["instances"]),
+            "loads": len(spec["instances"]),
+            "started": True,
+            "error": "",
+            "reaped": [],
+            "left": [],
+        },
+    )
     return "\n".join(lines) + "\n"
 
 
-def passing_shell(score: float = 90.0, accepted: int = 320, iterations: int = 100):
+def eval_stdout(command: str, score: float = 90.0) -> str:
+    """What `trtllm-eval` in a load of its own prints: each rank's record, then its score."""
+    config = re.search(r"--config=(\S+)", command)
+    tree = re.match(r"cd (\S+) &&", command)
+    options = yaml.safe_load(Path(config.group(1)).read_text()) if config else {}
+    lines = []
+    for rank in range(int((options or {}).get("tensor_parallel_size") or 1)):
+        record = {
+            "rank": rank,
+            "options": options,
+            "target": TARGET_CLASS,
+            "origin": f"{tree.group(1) if tree else ''}/tensorrt_llm/__init__.py",
+        }
+        lines.append(f"{workload_io.RANK_ENGINE_MARKER} {json.dumps(record)}")
+    return "\n".join(lines) + f"\nlm-eval gsm8k average accuracy: {score}\n"
+
+
+def passing_shell(score: float = 90.0, accepted: int = 320, iterations: int = 100, change=None):
+    """A shell in which every job of the run answers: a session, `trtllm-eval`, a native test."""
+
     def runner(command, env=None, timeout=0):
+        if "session_driver.py" in command:
+            said = session_stdout(
+                command, score=score, accepted=accepted, iterations=iterations, change=change
+            )
+            return CommandResult(returncode=0, stdout=said)
         if "trtllm-eval" in command:
-            return CommandResult(returncode=0, stdout=f"lm-eval gsm8k average accuracy: {score}\n")
-        # The gates that need per-request structure run the engine driver,
-        # which prints one record per prompt; the acceptance gate wants 32 of them.
-        if "engine_driver.py" in command:
-            return CommandResult(returncode=0, stdout=driver_records(accepted, iterations))
-        return CommandResult(
-            returncode=0,
-            stdout=(
-                "Paris is the capital of France\n"
-                f"[0] Accept rate: {accepted / iterations:.2f} "
-                f"(tokens={accepted}, iterations={iterations})\n"
-            ),
-        )
+            return CommandResult(returncode=0, stdout=eval_stdout(command, score))
+        return CommandResult(returncode=0, stdout="Paris is the capital of France\n")
 
     return runner
 
@@ -306,21 +443,15 @@ def _workflow(tmp_path, **kwargs):
     # Scripted like every other outside answer: the fixture repo is not a
     # checkout. An explicit `git_runner=None` selects the real, local git.
     kwargs.setdefault("git_runner", fake_git())
-    # The substrate gate issues a boot-shaped command of its own, which a shell
-    # scripted to fail a specific boot would answer; its test turns it on.
-    kwargs.setdefault("skip_substrate_gate", True)
-    # A primer turn per role would answer from the same scripted agents.
-    kwargs.setdefault("primers", False)
     return TrtllmModelingV2Workflow(workspace=tmp_path / "ws", **kwargs)
 
 
 def _write_vocabulary(workspace: Path, queue):
     doc = {
-        "verdict": vocab.VERDICT_AFTER_ADDITIONS if queue else vocab.VERDICT_ASSEMBLABLE,
         "steps": [
             {
                 "step": "norm",
-                "state": vocab.STATE_OK,
+                "state": "OK",
                 "entry": "catalog/norm/flashinfer_rmsnorm.py",
                 "contract_line": "certified sm_103 bf16",
             }
@@ -330,17 +461,10 @@ def _write_vocabulary(workspace: Path, queue):
     (workspace / "vocabulary.yaml").write_text(yaml.safe_dump(doc), encoding="utf-8")
 
 
-_GRAPH_PATH = re.compile(r"Write the next graph to `([^`]+)`")
-
-
-def planner_graph_path(prompt: str) -> Path:
-    match = _GRAPH_PATH.search(prompt)
-    assert match, "the planner's request names no graph path"
-    return Path(match.group(1))
-
-
-def write_graph(prompt: str, tasks: list[dict]) -> None:
-    planner_graph_path(prompt).write_text(yaml.safe_dump({"tasks": tasks}), encoding="utf-8")
+def seed_graph(workspace: Path, tasks: list[dict]) -> None:
+    """Start a run from ``tasks`` instead of the task list code makes."""
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "graph.yaml").write_text(yaml.safe_dump({"tasks": tasks}), encoding="utf-8")
 
 
 def unit_tasks(workspace: Path) -> list[dict]:
@@ -369,15 +493,6 @@ def unit_tasks(workspace: Path) -> list[dict]:
     return tasks
 
 
-def plan_every_unit(turn: int, prompt: str) -> dict:
-    """The default planner: one task per unit on its first turn, DONE after."""
-    if turn == 1:
-        workspace = planner_graph_path(prompt).parent
-        write_graph(prompt, unit_tasks(workspace))
-        return {"decision": "GRAPH_UPDATED", "summary": "one task per unit"}
-    return {"decision": "DONE", "summary": "the contract should hold"}
-
-
 def _git(repo: Path, *args: str) -> str:
     """Run one git command in ``repo``, with an identity the host may not have."""
     return subprocess.run(
@@ -401,7 +516,3 @@ def _git(repo: Path, *args: str) -> str:
 
 def _state(tmp_path):
     return load_state(tmp_path / "ws" / _STATE)
-
-
-def _substrate_boot(command: str) -> bool:
-    return "TRTLLM_MODELING_V2=off" in command and "engine_driver" in command

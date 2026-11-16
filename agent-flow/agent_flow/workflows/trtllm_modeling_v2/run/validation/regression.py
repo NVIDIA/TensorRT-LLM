@@ -1,63 +1,87 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The regression check: what a batch of changes to shared code did to the package's tests.
+"""The final tests: what the run's changes did to the tests, once, on the frozen candidate.
 
-No agent turn runs for it. It runs a declared list, every test under the
-modeling_v2 package's test tree (:data:`PACKAGE_TESTS`), through the run's test
-results (``checks/test_results.py``), which hold at the exact commit they ran at:
+No job runs here before the final pass: a change to shared code that lands in the middle of
+a run starts nothing. When the candidate is frozen (``GraphOrchestrator._final_pass``), one
+selection of test files runs on it, through the run's test results
+(``checks/test_results.py``), which hold at the exact commit they ran at:
 
-1. at the commit the checkout is at (the head), every test file with no result
-   there yet, in a read-only snapshot of the head (:func:`record_at`), less the
-   tests that already fail at the base: none of those can regress;
-2. at the commit the last check cleared, else the run's starting commit (the
-   base), the tests that fail at the head and have no result there;
-3. the results at the head against those at the base.
+1. at the candidate, every selected test file with no result there yet, in a read-only tree
+   of it (:func:`record_at`), less the cases already known to fail at the base: none of
+   those can regress, and some cost a job's whole wall to fail again;
+2. at the base (the commit the run started from), the cases that fail at the candidate and
+   have no result there;
+3. the results at the candidate against those at the base: each failing case is reported
+   with both.
 
-It runs only the test files the change can reach (:func:`affected_files`):
-those it changed, those that import a module it changed (directly, or through
-a helper or another module of the package that does), and the source-level gates.
-A change to code the whole package shares (outside the catalog's and the
-targets' own directories, the catalog's or ``models/``'s own ``__init__.py``, a
-``conftest.py``) reaches every file. A package ``__init__.py`` deeper down (a
-family's, a target's) reaches the files that import any module of that package,
-since importing one runs it. An import inside a function runs only when it is
-called: it reaches the files that import its module by name (a routing test),
-not that module's own importers. The catalog's and ``models/``'s own
-``__init__.py`` import every entry and family to register them; reached, they
-reach no further. A change no unit test imports or reads (integration tests and
-their lists, docs, examples) reaches none. With no base to compare with, every
-file runs.
+What is selected (:func:`select`) is read off the change and the tasks, with no analysis of
+imports: the target's own tests, the tests the tasks' rows and the delivery name, and the
+test files the change itself changed. A change to shared code is covered by the tests of
+the task that was given it; one that no such task was given has an unknown reach, and then
+the package's collected suite (:data:`PACKAGE_TESTS`) runs, once.
 
-A test that passed at the base and fails now, or a new one that fails, is a
-regression, and so is a test with no result at the head: the check fails,
-naming each. The head it found clean is its receipt's ``cleared``, the next
-check's base, whose results this check has already recorded.
+A job states the devices its tests state, or the nodes when a row states whole nodes
+(:class:`SessionJobs`), never a whole node by default. A case that passed at the base and
+fails now, or a new one that fails, fails the final tests, and so does a selected test with
+no result at the candidate. A case that fails at the base too is reported as such and fails
+nothing.
+
+Two things are **not verified**, and say so instead of passing: a selection of which every
+test was skipped and none passed; and a test file a task declared that the candidate does
+not hold. The run then closes ``partial`` with them listed. The base runs with the
+candidate's libraries, which are the base's own: a run rebuilds no native code.
+
+One kind of selected file is **collected and not run**: a test of the engine's accuracy
+harness (``test_results.accuracy_tests``; told by the class it is built on, never by where
+it is).
+Each of its cases loads the model and scores a whole benchmark, which the deployment's
+session has done through the endpoint: running it again is a second load for the same
+number. The file is imported and its cases listed (a file that does not import or collect
+fails the final tests), and it is reported as left to CI, with the benchmark a session of
+this run measured; where no session measured a benchmark it names, that is "not measured
+here" and not verified.
+
+Results are kept per commit and per environment (``checks/test_results.py``). The
+environment is the driver's own digest and the identity each job is given
+(:data:`IDENTITY_VAR`: the native build by content and the runtime): results recorded with
+other libraries are not this build's results.
 """
 
 from __future__ import annotations
 
-import ast
 import contextlib
+import dataclasses
 import math
 import re
 import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Collection, ContextManager, Sequence
+from typing import Any, Callable, Collection, ContextManager, Mapping, Sequence
 
 from ...checks import test_results
 from ...infra.compute.commands import CommandSpec
 from ...infra.compute.executor import FEATURE, select_command_executor
-from ...infra.compute.scheduler import parse_duration
-from ...infra.compute.sessions import GATE_ROLES
-from ...infra.git import git_output, read_files_at
-from ...operators.coverage import CATALOG_DIR, CATALOG_TESTS_DIR, MODELING_V2_PACKAGE
+from ...infra.git import git_output
+from ...operators.coverage import CATALOG_TESTS_DIR
 
-#: The declared list a regression check runs: the package's source-level gates,
-#: the catalog's entries and every target's own.
+#: The package's collected suite: what runs, once, when the reach of a change to shared code
+#: is unknown.
 PACKAGE_TESTS: tuple[str, ...] = (CATALOG_TESTS_DIR,)
-#: Where a check's selections go, under the workspace: ``<this>/<task id>/``.
+#: Where a selection goes, under the workspace: ``<this>/<name>/``.
 SELECTIONS_DIRNAME = "regression"
+#: The name of the final tests: of their jobs, their selection and their row in the ledger.
+FINAL_TESTS = "final-tests"
+#: The verdict of final tests that failed nothing and do not certify (:attr:`TestsResult.unverified`).
+NOT_VERIFIED = "NOT VERIFIED"
+#: The variable a test job carries its identity in. The driver's environment digest takes
+#: every variable of this prefix, so results are kept apart by it.
+IDENTITY_VAR = "TRTLLM_TEST_IDENTITY"
+#: Changed test files the final tests leave to CI: they need its models and its lists.
+CI_TESTS_PREFIX = "tests/integration/"
+#: The spec's key (under ``accuracy``) that has the engine's accuracy tests run in the
+#: final tests, and what tells such a test (``checks/test_results.py``).
+accuracy_tests = test_results.accuracy_tests
 #: How many failing tests a failure names before it counts the rest.
 MAX_NAMED = 20
 #: How long one test job may run at most; less where the gate sessions' usable window is
@@ -73,9 +97,7 @@ PROBE_TIMEOUT_S = 600
 #: start-up and the margin its scheduler wants past a job's wall limit.
 WINDOW_SLACK_S = 600
 
-#: Where a change reaches only the files that import it: the catalog's entries, the targets.
-SCOPED_SOURCE_DIRS: tuple[str, ...] = (f"{CATALOG_DIR}/", f"{MODELING_V2_PACKAGE}/models/")
-#: Paths no modeling_v2 unit test imports or reads: a change there reaches no test file.
+#: Paths no unit test imports or reads: a change there reaches no test file.
 UNREACHED_PREFIXES: tuple[str, ...] = (
     "tests/integration/",
     "docs/",
@@ -85,10 +107,6 @@ UNREACHED_PREFIXES: tuple[str, ...] = (
     ".github/",
 )
 UNREACHED_SUFFIXES: tuple[str, ...] = (".md", ".rst")
-#: Test files every check runs: the package's source-level gates read every entry.
-ALWAYS_RUN = re.compile(
-    r"(?:^|/)test_modeling_v2_(?:[a-z_]*claims[a-z_]*|ci_selection|contracts)\.py$"
-)
 
 #: Runs one command line in a tree on the run's devices; returns its exit code and output tail.
 #: Called ``(command, tree)``, or with ``timeout_s=`` for a job shorter than the run's job size,
@@ -100,63 +118,79 @@ TreeAt = Callable[[str], ContextManager[Path]]
 
 
 @dataclass
-class RegressionResult:
-    """What a regression check found."""
+class TestsResult:
+    """What the final tests found on one candidate."""
+
+    #: Not a test class, whatever its name starts with.
+    __test__ = False
 
     head: str
     base: str | None
-    #: ``CLEAN``, ``REGRESSED`` or ``INCOMPLETE`` (``test_results.CompareReport.verdict``).
+    #: ``CLEAN``, ``REGRESSED`` or ``INCOMPLETE`` (``test_results.CompareReport.verdict``), or
+    #: :data:`NOT_VERIFIED`: nothing failed, and :attr:`unverified` says what was not shown.
     verdict: str
-    #: One line per failing or missing test; empty when clean.
+    #: One line per case that fails the final tests, each with its result at the candidate
+    #: and at the base; empty when clean.
     failures: list[str] = field(default_factory=list)
-    #: Tests that did not fail at the head.
+    #: One line per case that fails at the candidate and at the base too: reported, and it
+    #: fails nothing.
+    at_base: list[str] = field(default_factory=list)
+    #: Tests that did not fail at the candidate.
     held: int = 0
-    #: Test jobs this check ran.
+    #: Test jobs run.
     jobs: int = 0
-    #: Which test files it ran, and why (:func:`affected_files`).
+    #: Which test files ran, and why (:func:`select`).
     scope: str = ""
+    #: The devices each job stated.
+    gpus: int = 0
+    #: The whole nodes each job stated, when a row states nodes; 0 for devices on one node.
+    nodes: int = 0
+    #: What the tests did not show though nothing failed, one line each: the third outcome.
+    unverified: list[str] = field(default_factory=list)
+    #: The engine's accuracy tests that were collected and not run, one line each, with
+    #: the benchmark a session of this run measured: left to CI, and they fail nothing.
+    left: list[str] = field(default_factory=list)
+    #: The last line the last test job wrote, kept when the verdict is ``INCOMPLETE``: no
+    #: case failed there, and what ended the job says where to look.
+    job_said: str = ""
 
     @property
     def passed(self) -> bool:
         return self.verdict == "CLEAN"
 
+    @property
+    def partial(self) -> bool:
+        """Nothing failed, and the tests do not certify: the run closes ``partial``."""
+        return self.verdict == NOT_VERIFIED
+
     def summary(self) -> str:
         base = (self.base or "none")[:10]
+        size = f"{self.nodes} node(s)" if self.nodes > 1 else f"{self.gpus} device(s)"
         return (
             f"{self.verdict} at {self.head[:10]} against {base}: {self.held} test(s) did not "
-            f"fail at the head, {self.jobs} test job(s) run"
+            f"fail at the candidate, {len(self.at_base)} fail(s) at the base too, "
+            f"{self.jobs} test job(s) run, each stating {size}"
+            + (
+                f"; {len(self.left)} accuracy test file(s) collected and left to CI"
+                if self.left
+                else ""
+            )
+            + (f"; not verified: {'; '.join(self.unverified)}" if self.unverified else "")
             + (f"; {self.scope}" if self.scope else "")
         )
 
 
 def job_timeout(environment: Any) -> int:
-    """How long one test job may run in ``environment``: what its gate sessions can run.
+    """How long one test job may run in ``environment``: what one holder can run.
 
-    :data:`JOB_TIMEOUT_S`, or less on a session spool: the longest usable window of a session
-    gate jobs reach (those on ``environment.spool`` and the ones whose role takes them,
-    :data:`sessions.GATE_ROLES`: the pool ``executor.select_command_executor`` sends them to).
-    A session's window is its ``scheduler.default_wall`` and its time limit less its hand-over
-    lead (at least :data:`WINDOW_SLACK_S`), the shorter of those it declares: its scheduler holds
-    a job its allocation cannot finish for the successor, so a job longer than every window never
-    starts. A session declaring neither is not counted.
+    :data:`JOB_TIMEOUT_S`, or less where a holder has an end: a watcher starts a job only
+    where its wall and the fit margin end before the allocation does, so a job as long as a
+    whole holder never starts. The window is the holder's time less :data:`WINDOW_SLACK_S`.
     """
-    if getattr(environment, "kind", "") != "session_spool":
+    limit = getattr(environment, "holder_time_s", None)
+    if not limit:
         return JOB_TIMEOUT_S
-    spool = Path(str(environment.spool or ""))
-    windows = []
-    for session in environment.sessions:
-        if session.role not in GATE_ROLES and Path(str(session.spool)) != spool:
-            continue
-        bounds = []
-        if session.scheduler.get("default_wall"):
-            bounds.append(parse_duration(str(session.scheduler["default_wall"])))
-        if session.time_limit_s:
-            lead = max(session.handover_lead_s, WINDOW_SLACK_S)
-            bounds.append(session.time_limit_s - lead)
-        positive = [bound for bound in bounds if bound > 0]
-        if positive:
-            windows.append(min(positive))
-    return int(min(JOB_TIMEOUT_S, max(windows))) if windows else JOB_TIMEOUT_S
+    return int(min(JOB_TIMEOUT_S, max(60.0, float(limit) - WINDOW_SLACK_S)))
 
 
 def max_jobs(timeout_s: float) -> int:
@@ -164,18 +198,51 @@ def max_jobs(timeout_s: float) -> int:
     return max(1, math.ceil(TEST_BUDGET_S / max(1.0, float(timeout_s))))
 
 
+def one_rank_env(environment: Any) -> dict[str, str]:
+    """What a one-rank engine is given beside the run's own variables, as a session gives it.
+
+    Read from the run's environment at one rank (``RunEnvironment.launch_env``), the one
+    place that knows it: a one-rank engine has no launcher to create its worker, and the
+    spawn the LLM API would use instead is forbidden in a container. A test that
+    constructs an engine in a test job meets the same wall a session's engine would.
+    Empty for an environment that says nothing of it.
+    """
+    try:
+        one = dataclasses.replace(environment, world_size=1)
+        return {key: value for key, value in one.launch_env.items() if key not in one.env}
+    except (AttributeError, TypeError):
+        return {}
+
+
 class SessionJobs:
     """A :data:`RunJob` on the run's devices: each job allowed :func:`job_timeout`, or less.
 
-    A long wait on a job is said to ``note``.
+    Each job states ``gpus`` devices: what the tests it runs state, never a node's count
+    by default; or ``nodes`` whole nodes when a row's check states nodes, as that row's own
+    check does. Each job is given what a session's one-rank engine is given
+    (:func:`one_rank_env`), and ``identity`` (:data:`IDENTITY_VAR`). A long wait on a job
+    is said to ``note``.
     """
 
     def __init__(
-        self, environment: Any, name: str, note: Callable[[str], None] | None = None
+        self,
+        environment: Any,
+        name: str,
+        note: Callable[[str], None] | None = None,
+        *,
+        gpus: int = 1,
+        nodes: int = 0,
+        identity: str = "",
     ) -> None:
         self.environment = environment
         self.name = name
         self.note = note
+        #: The devices one job states.
+        self.gpus = max(0, int(gpus))
+        #: The whole nodes one job states; 0 or 1 for devices on one node.
+        self.nodes = max(0, int(nodes))
+        #: What the results of this job are kept under, beside the commit.
+        self.identity = identity
         #: How long one job may run (:func:`job_timeout`).
         self.timeout_s = job_timeout(environment)
 
@@ -184,31 +251,47 @@ class SessionJobs:
             self.environment,
             name_prefix=self.name,
             tree=tree,
-            gpus="all",
+            gpus=str(self.gpus),
+            # Wider than one node: a job of whole nodes, whose script the lead runs once.
+            nodes=self.nodes if self.nodes > 1 else 0,
+            once=self.nodes > 1,
             priority=FEATURE,
             note=self.note,
         )
         wall = self.timeout_s if timeout_s is None else min(self.timeout_s, timeout_s)
-        done = executor.execute(CommandSpec(argv=command, cwd=str(tree), timeout_s=wall))
+        env = one_rank_env(self.environment)
+        if self.identity:
+            env[IDENTITY_VAR] = self.identity
+        spec = CommandSpec(argv=command, cwd=str(tree), timeout_s=wall, env=env or None)
+        done = executor.execute(spec)
         return done.returncode, (done.stdout + done.stderr)[-2000:]
 
 
-def job_runner(workflow: Any, name: str) -> tuple[TreeAt, RunJob, str]:
+def job_runner(
+    workflow: Any, name: str, *, gpus: int = 1, nodes: int = 0, identity: str = ""
+) -> tuple[TreeAt, RunJob, str]:
     """``(tree_at, run_job, python)``: how ``workflow`` runs a test job, named ``name``.
 
-    In a read-only snapshot of a commit when the run keeps them, else in the
-    checkout; on the run's devices, with no agent turn, each job sized to the
-    gate sessions (:class:`SessionJobs`).
+    In a read-only tree of a commit when the run keeps trees, else in the
+    checkout; on the run's devices, with no agent turn, each job stating ``gpus``
+    devices or ``nodes`` whole nodes and carrying ``identity`` (:class:`SessionJobs`).
     """
     repo = Path(str(workflow.task_data.get("trtllm_repo_path") or ""))
     snapshots = getattr(workflow, "_snapshots", None)
 
     def tree_at(commit: str) -> ContextManager[Path]:
-        return snapshots.lease(commit) if snapshots is not None else contextlib.nullcontext(repo)
+        if snapshots is None:
+            return contextlib.nullcontext(repo)
+        return snapshots.at(snapshots.pinned(commit))
 
     python = str((workflow.task_data.get("environment") or {}).get("python") or "python3")
     jobs = SessionJobs(
-        workflow._gate_env(), name, note=lambda said: workflow.journal.event("waiting", said)
+        workflow._gate_env(),
+        name,
+        note=lambda said: workflow.journal.event("waiting", said),
+        gpus=gpus,
+        nodes=nodes,
+        identity=identity,
     )
     return tree_at, jobs, python
 
@@ -223,12 +306,14 @@ def record_at(
     run_job: RunJob,
     python: str,
     leave_out: Callable[[str], Collection[str]] | None = None,
+    collect: Sequence[str] = (),
 ) -> tuple[test_results.Results, int, int, str]:
     """Probe the current environment, then run missing ``files`` at ``commit``.
 
     The probe is one short job (:data:`PROBE_TIMEOUT_S`); the test jobs, as many as
     :data:`TEST_BUDGET_S` holds at the runner's job size (:func:`_run_unrun`).
     ``leave_out`` names, given the probed environment's digest, the node ids not to run.
+    ``collect`` are files to import and list, not run.
     Returns results, test jobs run, and the last job's exit code and output tail.
     A failed probe returns empty results, never historical results.
     """
@@ -248,6 +333,7 @@ def record_at(
         run_job=run_job,
         python=python,
         skip=leave_out(match.group(1)) if leave_out is not None else (),
+        collect=collect,
     )
 
 
@@ -262,253 +348,146 @@ def _run_unrun(
     run_job: RunJob,
     python: str,
     skip: Collection[str] = (),
+    collect: Sequence[str] = (),
 ) -> tuple[test_results.Results, int, int, str]:
     """Run the ``items`` (test files, node ids) with no result at ``commit`` in ``env_digest``.
 
     A job at a time, each resuming from what the last recorded, while one makes progress and
     :func:`max_jobs` of the runner's job size are not spent. The node ids in ``skip`` are left
-    out and not waited for. Returns what :func:`record_at` does.
+    out and not waited for. The files in ``collect`` that no session collected yet are
+    imported and listed in the same job, before anything runs, and none of their cases
+    runs. Returns what :func:`record_at` does.
     """
     allowed = max_jobs(getattr(run_job, "timeout_s", JOB_TIMEOUT_S))
     results = test_results.recorded(cache_dir, commit, env_digest)
     unrun = results.unrun(items, skip)
+    uncollected = [f for f in collect if results.test_ids(f) is None]
     skipped = (
         test_results.write_selection(out / f"{commit[:12]}.skip.txt", sorted(skip))
         if skip
         else None
     )
+    stem = out / commit[:12]
     jobs, code, tail = 0, 0, ""
-    while unrun and jobs < allowed:
-        listed = test_results.write_selection(out / f"{commit[:12]}.txt", unrun)
+    while (unrun or uncollected) and jobs < allowed:
         with tree_at(commit) as tree:
-            command = test_results.driver_command(python, cache_dir, tree, listed, skipped)
+
+            def line(listed: Path, **how: Any) -> str:
+                return test_results.driver_command(python, cache_dir, tree, listed, **how)
+
+            commands = []
+            if uncollected:
+                listed = test_results.write_selection(Path(f"{stem}.collect.txt"), uncollected)
+                commands.append(line(listed, collect_only=True))
+            if unrun:
+                listed = test_results.write_selection(Path(f"{stem}.txt"), unrun)
+                commands.append(line(listed, skip=skipped))
+            # One job: each driver line records what it did, and the last one's status is the job's.
+            command = commands[0] if len(commands) == 1 else f"( {' ; '.join(commands)} )"
             code, tail = run_job(command, tree)
         jobs += 1
         results = test_results.recorded(cache_dir, commit, env_digest)
-        left = results.unrun(items, skip)
-        if len(left) >= len(unrun):
+        # A file that ran in a tree of unknown state is not run again for it: another job
+        # would learn the same, and the result says why it does not count.
+        left = [i for i in results.unrun(items, skip) if not results.said_of(i)]
+        still = [f for f in collect if results.test_ids(f) is None]
+        if len(left) >= len(unrun) and len(still) >= len(uncollected):
             break
-        unrun = left
+        unrun, uncollected = left, still
     return results, jobs, code, tail
 
 
-def _module_names(path: str) -> list[str]:
-    """How a test may name the module at ``path``: dotted from the root, and its last two parts."""
-    stem = path[: -len(".py")] if path.endswith(".py") else path
-    dotted = stem.replace("/", ".")
-    parts = dotted.split(".")
-    names = [dotted, stem]
-    if len(parts) >= 2:
-        names += [".".join(parts[-2:]), "/".join(parts[-2:])]
-    return names
+def measured_by_sessions(text: str, measured: Mapping[str, Sequence[str]]) -> str:
+    """What the run's sessions measured of the benchmarks an accuracy test's ``text`` names.
 
-
-def _module_of(path: str) -> str:
-    """The dotted module the ``.py`` file at ``path`` is, from the root (a package by its init)."""
-    stem = path[: -len(".py")]
-    if stem.endswith("/__init__"):
-        stem = stem[: -len("/__init__")]
-    return stem.replace("/", ".")
-
-
-def _runs_at_import(tree: ast.Module) -> list[ast.AST]:
-    """The nodes of ``tree`` that run when the module is imported.
-
-    Everything but function bodies (and lambdas) and ``if TYPE_CHECKING:`` blocks: a class
-    body, a top-level ``if`` or ``try`` runs at import.
+    ``measured`` is each benchmark a session measured on the candidate, with the
+    deployments. ``""`` when the file names none of them: nothing measured here stands
+    for it.
     """
-    found: list[ast.AST] = []
-    stack: list[ast.AST] = list(tree.body)
-    while stack:
-        node = stack.pop()
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
-            continue
-        if isinstance(node, ast.If) and "TYPE_CHECKING" in ast.unparse(node.test):
-            stack.extend(node.orelse)
-            continue
-        found.append(node)
-        stack.extend(ast.iter_child_nodes(node))
-    return found
-
-
-def _imported(path: str, text: str, *, eager: bool = False) -> set[str]:
-    """The dotted names the file at ``path`` imports: each module, and each name from one.
-
-    ``from a import b`` gives ``a`` and ``a.b`` (``b`` may be a module); a relative
-    import resolves against the file's own package. With ``eager``, only the imports that
-    run when the file is imported (:func:`_runs_at_import`). A file that does not parse
-    gives none.
-    """
-    try:
-        tree = ast.parse(text)
-    except (SyntaxError, ValueError):
-        return set()
-    module = _module_of(path)
-    package = module if path.endswith("/__init__.py") else module.rpartition(".")[0]
-    names: set[str] = set()
-    for node in _runs_at_import(tree) if eager else ast.walk(tree):
-        if isinstance(node, ast.Import):
-            names.update(alias.name for alias in node.names)
-        elif isinstance(node, ast.ImportFrom):
-            parts = package.split(".") if package else []
-            if node.level > len(parts) + 1:
-                continue
-            up = parts[: len(parts) - node.level + 1] if node.level else []
-            source = ".".join([*up, *([node.module] if node.module else [])])
-            if source:
-                names.add(source)
-                names.update(f"{source}.{a.name}" for a in node.names if a.name != "*")
-    return names
-
-
-def _importers(
-    repo: str | Path, head: str, roots: Sequence[str], changed: Sequence[str]
-) -> set[str] | None:
-    """The ``.py`` files under ``roots`` at ``head`` that import one of ``changed``, directly or not.
-
-    A file names a module by its full dotted path or by any trailing part of it (a test
-    imports a helper beside it, on the path it puts first: ``from _validating import``);
-    an over-match only runs a test more. ``None`` when the files cannot be read.
-    """
-    listing = git_output(repo, "ls-tree", "-r", "-z", "--name-only", head, "--", *roots)
-    if listing is None:
-        return None
-    present = [p for p in listing.split("\0") if p.endswith(".py")]
-    texts = read_files_at(repo, head, present)
-    if texts is None:
-        return None
-    by_name: dict[str, set[str]] = {}
-    inits: dict[str, set[str]] = {}
-    for path in {*present, *(p for p in changed if p.endswith(".py"))}:
-        parts = _module_of(path).split(".")
-        for start in range(len(parts)):
-            by_name.setdefault(".".join(parts[start:]), set()).add(path)
-            if path.endswith("/__init__.py"):
-                inits.setdefault(".".join(parts[start:]), set()).add(path)
-    importers: dict[str, set[str]] = {}
-    lazy: dict[str, set[str]] = {}
-    named: dict[str, set[str]] = {}
-    for path, text in texts.items():
-        every = _imported(path, text)
-        # A test-side helper's functions are what the tests run (a rank matrix's body): only
-        # the package's own modules import lazily.
-        source = path.startswith(f"{MODELING_V2_PACKAGE}/")
-        eager = _imported(path, text, eager=True) if source else every
-        for name in every:
-            for target in by_name.get(name, ()):
-                if target != path:
-                    named.setdefault(target, set()).add(path)
-            if name not in eager:
-                for target in by_name.get(name, ()):
-                    if target != path:
-                        lazy.setdefault(target, set()).add(path)
-                continue
-            # Importing ``a.b.c`` runs the ``__init__.py`` of ``a`` and ``a.b`` as well.
-            parts = name.split(".")
-            targets = set(by_name.get(name, ()))
-            for end in range(1, len(parts)):
-                targets |= inits.get(".".join(parts[:end]), set())
-            for target in targets:
-                if target != path:
-                    importers.setdefault(target, set()).add(path)
-    registries = {f"{d}__init__.py" for d in SCOPED_SOURCE_DIRS}
-    reached, frontier = set(changed), list(changed)
-    called: set[str] = set()
-    while frontier:
-        node = frontier.pop()
-        called |= lazy.get(node, set())
-        if node in registries and node not in changed:
-            continue
-        for importer in importers.get(node, ()):
-            if importer not in reached:
-                reached.add(importer)
-                frontier.append(importer)
-    # A module that imports a reached one inside a function runs it only when called: the
-    # test files that import that module by name reach it, its other importers do not.
-    tests = tuple(f"{t}/" for t in roots if not t.startswith(MODELING_V2_PACKAGE))
-    for module in called - reached:
-        reached |= {f for f in named.get(module, ()) if f.startswith(tests)}
-    return reached
+    lowered = text.lower()
+    said = [
+        f"the session measured `{benchmark}` on {', '.join(f'`{unit}`' for unit in units)}"
+        for benchmark, units in sorted(measured.items())
+        if units and benchmark.lower() in lowered
+    ]
+    return "; ".join(said)
 
 
 def _unreached(path: str) -> bool:
-    """Whether no modeling_v2 unit test imports or reads ``path`` (see :data:`UNREACHED_PREFIXES`)."""
+    """Whether no unit test imports or reads ``path`` (see :data:`UNREACHED_PREFIXES`)."""
     return path.startswith(UNREACHED_PREFIXES) or path.endswith(UNREACHED_SUFFIXES)
 
 
-def affected_files(
+def _inside(path: str, roots: Sequence[str]) -> bool:
+    return any(path == r.rstrip("/") or path.startswith(r.rstrip("/") + "/") for r in roots if r)
+
+
+def select(
     repo: str | Path,
     base: str | None,
     head: str,
-    files: Sequence[str],
-    roots: Sequence[str] = (MODELING_V2_PACKAGE, *PACKAGE_TESTS),
+    *,
+    own: Sequence[str] = (),
+    obligations: Sequence[str] = (),
+    covered: Sequence[str] = (),
+    package: Sequence[str] = PACKAGE_TESTS,
 ) -> tuple[list[str], str]:
-    """The test files of ``files`` the change from ``base`` to ``head`` can reach, and why.
+    """The test files the final tests run at ``head``, and why.
 
-    Every file when there is no base, nothing changed since it, or the change
-    touches code the whole package shares (:data:`SCOPED_SOURCE_DIRS`); else the test files it
-    changed, those that import a module it changed, directly or through any other file under
-    ``roots`` (:func:`_importers`), those beside a test helper that does (a test may start its
-    helper by file path), those whose text names one (dotted, as a path, or by its last two
-    parts: an over-match only runs a test more), and :data:`ALWAYS_RUN`.
+    ``own`` are the run's own paths (its target, and the directory its tests mirror it in):
+    every test file there is the target's. ``obligations`` are the test files and
+    directories the tasks' rows and the delivery name. To those are added the test files
+    the change from ``base`` to ``head`` itself changed. ``covered`` are the shared paths a
+    task with tests of its own was given: its tests are its reach. A change to any other
+    shared file has an unknown reach, as has a run with no base, and then every test file
+    of ``package`` runs too: the collected suite, once. Nothing is inferred from imports.
     """
+    chosen = set(test_results.list_test_files(repo, head, [*own, *obligations]))
     if base is None:
-        return list(files), "every test file (no base to compare with)"
+        files = sorted(chosen | set(test_results.list_test_files(repo, head, package)))
+        return files, (
+            f"{len(files)} test file(s): the package's collected suite, once (no base to "
+            "read the change from)"
+        )
     diff = git_output(repo, "diff", "--no-renames", "--name-only", base, head) or ""
     changed = [p for p in diff.splitlines() if p]
-    if not changed:
-        return list(files), "every test file (nothing changed since the base)"
-    known = set(files)
-    for path in changed:
-        if path in known or _unreached(path):
-            continue
-        name = path.rsplit("/", 1)[-1]
-        scoped = path.endswith(".py") and any(path.startswith(d) for d in SCOPED_SOURCE_DIRS)
-        shared_init = name == "__init__.py" and f"{path.rpartition('/')[0]}/" in SCOPED_SOURCE_DIRS
-        # A helper or package init of the test tree reaches its importers and the files beside it.
-        test_side = path.endswith(".py") and any(path.startswith(f"{t}/") for t in PACKAGE_TESTS)
-        if (not scoped and not test_side) or shared_init or name == "conftest.py":
-            return list(files), f"every test file ({path} is shared by the package)"
-    changed = [p for p in changed if not _unreached(p)]
-    if not changed:
-        chosen = sorted(f for f in files if ALWAYS_RUN.search(f))
-        return (
-            chosen,
-            f"{len(chosen)} of {len(files)} test files (no unit test reaches what changed)",
+    shared = [p for p in changed if not _inside(p, own) and not _unreached(p)]
+    tests = [p for p in shared if test_results.TEST_FILE.search(p)]
+    # The repository's integration tests need CI's models and are run from its lists: a
+    # changed one is not run here, and the selection says which.
+    ci = [p for p in changed if p.startswith(CI_TESTS_PREFIX) and test_results.TEST_FILE.search(p)]
+    left = (
+        f"; {len(ci)} changed test file(s) under {CI_TESTS_PREFIX} are CI's to run and were "
+        f"not run here: {', '.join(ci[:4])}{' ...' if len(ci) > 4 else ''}"
+        if ci
+        else ""
+    )
+    chosen |= set(test_results.list_test_files(repo, head, tests)) if tests else set()
+    unknown = sorted(p for p in shared if p not in tests and not _inside(p, covered))
+    if unknown:
+        files = sorted(chosen | set(test_results.list_test_files(repo, head, package)))
+        more = f" and {len(unknown) - 1} more" if len(unknown) > 1 else ""
+        return files, (
+            f"{len(files)} test file(s): the package's collected suite, once (the reach of "
+            f"the change to {unknown[0]}{more} is unknown: no task with tests of its own "
+            f"was given it){left}"
         )
-    reached = _importers(repo, head, roots, changed)
-    if reached is None:
-        return list(files), "every test file (the imports at the head could not be read)"
-    # A helper a test starts by file path (a collective's rank matrix) reaches the tests beside it;
-    # a test package's ``__init__.py`` reaches every test file under its directory.
-    helpers = {p.rpartition("/")[0] for p in reached if p not in known}
-    test_inits = [
-        p.rpartition("/")[0] + "/"
-        for p in changed
-        if p.endswith("/__init__.py") and any(p.startswith(f"{t}/") for t in PACKAGE_TESTS)
-    ]
-    chosen = {
-        f
-        for f in files
-        if f in reached
-        or f.rpartition("/")[0] in helpers
-        or f.startswith(tuple(test_inits))
-        or ALWAYS_RUN.search(f)
-    }
-    names = sorted({n for p in changed if p.endswith(".py") for n in _module_names(p)})
-    if names and files:
-        args = ["grep", "-l", "-F"]
-        for name in names:
-            args += ["-e", name]
-        found = git_output(repo, *args, head, "--", *files) or ""
-        prefix = f"{head}:"
-        chosen |= {
-            line[len(prefix) :] if line.startswith(prefix) else line
-            for line in found.splitlines()
-            if line
-        } & known
-    picked = sorted(chosen)
-    return picked, f"{len(picked)} of {len(files)} test files reach what changed"
+    files = sorted(chosen)
+    return files, (
+        f"{len(files)} test file(s): the target's, those the tasks and the delivery name, "
+        f"and {len(tests)} the change itself changed{left}"
+    )
+
+
+def missing_declared(repo: str | Path, head: str, declared: Sequence[str]) -> list[str]:
+    """The test files a task declared that ``head`` does not hold.
+
+    ``declared`` are write scopes' test files, by name. A declared test that is not in
+    the candidate was not run: the selection says so, it does not drop it.
+    """
+    named = sorted({p for p in declared if test_results.TEST_FILE.search(p)})
+    held = set(test_results.list_test_files(repo, head, named)) if named else set()
+    return [p for p in named if p not in held]
 
 
 def _named(lines: Sequence[str]) -> list[str]:
@@ -518,46 +497,126 @@ def _named(lines: Sequence[str]) -> list[str]:
     return shown
 
 
+def _why(result: test_results.Result) -> str:
+    if not result.message:
+        return ""
+    said = f": {result.message.splitlines()[0][:200]}"
+    if test_results.cut_at_default(result.message):
+        # Not the test's own limit: the one the driver gives a case that states none.
+        said += (
+            f" (cut at {test_results.CASE_TIMEOUT_S} s, the limit a case gets when it states "
+            "none of its own)"
+        )
+    return said
+
+
+def _no_result(results: test_results.Results, item: str) -> str:
+    """The line of a selected file or test with no result at the candidate, and why."""
+    said = results.said_of(item)
+    return f"{item} ({said})" if said else f"{item} (no result at the candidate)"
+
+
+def _last_line(output: str) -> str:
+    """The last line of a job's ``output`` that says anything."""
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    return lines[-1] if lines else ""
+
+
 def _failure(comparison: test_results.Comparison) -> str:
     head = comparison.head
-    why = f": {head.message.splitlines()[0][:200]}" if head.message else ""
-    was = "new, fails" if comparison.new else "passed at the base, fails now"
-    return f"{head.nodeid} ({was}){why}"
+    was = (
+        "fails at the candidate; the base has no such test"
+        if comparison.new
+        else "fails at the candidate; passed at the base"
+    )
+    return f"{head.nodeid} ({was}){_why(head)}"
 
 
-def run_regression_check(
+def run_final_tests(
     *,
     workspace: Path,
     repo: Path,
     head: str,
+    base: str | None,
+    files: Sequence[str],
     tree_at: TreeAt,
     run_job: RunJob,
     python: str,
-    name: str,
+    scope: str = "",
+    name: str = FINAL_TESTS,
     paths: Sequence[str] = PACKAGE_TESTS,
-) -> RegressionResult:
-    """Run one regression check on ``head``; see the module docstring.
+    missing: Sequence[str] = (),
+    ci: Mapping[str, str] | None = None,
+) -> TestsResult:
+    """Run ``files`` on the candidate ``head`` and compare what fails with ``base``.
 
-    ``repo`` holds both commits; ``tree_at`` gives a read-only tree at one,
-    ``run_job`` runs a command line in it on the run's devices, and
-    ``python`` is the tree's interpreter. ``name`` keeps this check's
-    selections apart from another's.
+    ``repo`` holds both commits; ``tree_at`` gives a read-only tree at one, ``run_job``
+    runs a command line in it on the run's devices, and ``python`` is the tree's
+    interpreter. Every selected file with no result at ``head`` runs there, less the
+    cases a result at ``base`` already says fail there: none of them can regress. A case
+    that fails at ``head`` and has no result at ``base`` runs at ``base``, so that each
+    failing case is reported with both results. ``name`` keeps this selection apart from
+    another's.
+
+    ``missing`` are declared test files the candidate does not hold. They, and a
+    selection of which every test was skipped, make the result :data:`NOT_VERIFIED` when
+    nothing failed.
+
+    ``ci`` are the selected files that are the engine's accuracy tests
+    (:func:`accuracy_tests`), each with what the run's sessions measured of it
+    (:func:`measured_by_sessions`): they are collected and not run, and listed as left to
+    CI (:attr:`TestsResult.left`); one with nothing measured here is not verified; one
+    that does not collect fails.
     """
     cache_dir = Path(workspace) / test_results.CACHE_DIRNAME
     out = Path(workspace) / SELECTIONS_DIRNAME / name
     job = dict(cache_dir=cache_dir, out=out, tree_at=tree_at, run_job=run_job, python=python)
-    base = test_results.default_base(workspace, repo, head)
-    files, scope = affected_files(
-        repo,
-        base,
-        head,
-        test_results.list_test_files(repo, head, paths),
-        roots=(MODELING_V2_PACKAGE, *paths),
-    )
+    gpus = int(getattr(run_job, "gpus", 0) or 0)
+    nodes = int(getattr(run_job, "nodes", 0) or 0)
+    ci = dict(ci or {})
+    files = [f for f in files if f not in ci]
     selected = set(files)
+    unverified = [
+        f"{path} is declared by a task and is not in the candidate: it was not run"
+        for path in missing
+    ]
+
+    def result(verdict: str, failures: Sequence[str], at_base: Sequence[str], held: int, ran: int):
+        view = test_results.head_results(results, files)
+        if files and view.skipped and not view.passed and not view.failing:
+            unverified.append(
+                f"every test that ran was skipped ({len(view.skipped)} skipped, none passed)"
+            )
+        # The accuracy tests left to CI: collected, not run. One that does not collect fails.
+        left, broken, lost = [], [], []
+        for path in sorted(ci):
+            ids = results.test_ids(path)
+            found = results.result(path)
+            if ids is None:
+                lost.append(f"{path} (no result at the candidate: it was not collected)")
+            elif found is not None and found.outcome in test_results.FAILING:
+                broken.append(f"{path} (does not collect at the candidate){_why(found)}")
+            elif ci[path]:
+                left.append(f"{path} ({len(ids)} case(s)): left to CI: {ci[path]}")
+            else:
+                unverified.append(
+                    f"{path} ({len(ids)} case(s)): left to CI, not measured here: no session "
+                    "of this run measured a benchmark it names"
+                )
+        if broken:
+            verdict = "REGRESSED"
+        elif lost and verdict == "CLEAN":
+            verdict = "INCOMPLETE"
+        if verdict == "CLEAN" and unverified:
+            verdict = NOT_VERIFIED
+        return TestsResult(
+            head, base, verdict, _named([*failures, *broken, *lost]), _named(at_base), held,
+            ran, scope, gpus, nodes, list(unverified), left,
+            _last_line(tail) if verdict == "INCOMPLETE" else "",
+        )  # fmt: skip
 
     def failing_at_base(env_digest: str) -> set[str]:
-        """The tests of ``files`` that failed at the base in ``env_digest``: none can regress."""
+        """The selected cases a result at the base says fail there, in ``env_digest``."""
         if base is None:
             return set()
         at_base = test_results.recorded(cache_dir, base, env_digest)
@@ -569,20 +628,30 @@ def run_regression_check(
             and entry.get("outcome") in test_results.FAILING
         }
 
-    results, ran, code, tail = record_at(head, files, leave_out=failing_at_base, **job)
-    if files and not results.env_digest:
-        # No session at the head: nothing the jobs ran can be read.
+    results, ran, code, tail = record_at(
+        head, files, leave_out=failing_at_base, collect=sorted(ci), **job
+    )
+    if (files or ci) and not results.env_digest:
+        # No session at the candidate: nothing the jobs ran can be read.
         failure = f"the test job recorded nothing (exit {code}): {tail[-500:]}"
-        return RegressionResult(head, base, "INCOMPLETE", [failure], 0, ran, scope)
+        return TestsResult(
+            head, base, "INCOMPLETE", [failure], [], 0, ran, scope, gpus, nodes,
+            job_said=_last_line(tail),
+        )  # fmt: skip
     if base is None:
-        # Nothing landed before the head to compare with: each failure is the head's own.
+        # Nothing to compare with: each failure is the candidate's own.
         view = test_results.head_results(results, files)
-        failures = [f"{r.nodeid} (fails; no base to compare with)" for r in view.failing]
-        failures += [f"{nodeid} (no result at the head)" for nodeid in view.not_run]
+        failures = [
+            f"{r.nodeid} (fails at the candidate; no base to compare with){_why(r)}"
+            for r in view.failing
+        ]
+        failures += [_no_result(results, nodeid) for nodeid in view.not_run]
         verdict = "REGRESSED" if view.failing else "INCOMPLETE" if failures else "CLEAN"
-        held = len(view.passed) + len(view.skipped)
-        return RegressionResult(head, base, verdict, _named(failures), held, ran, scope)
+        return result(verdict, failures, [], len(view.passed) + len(view.skipped), ran)
     base_files = [f for f in test_results.list_test_files(repo, base, paths) if f in selected]
+    base_files += [
+        f for f in test_results.list_test_files(repo, base, files) if f not in base_files
+    ]
 
     def against_base() -> test_results.CompareReport:
         at_base = test_results.recorded(cache_dir, base, results.env_digest)
@@ -590,33 +659,47 @@ def run_regression_check(
 
     report = against_base()
     if report.base_unknown:
+        # Each case that fails at the candidate is run at the base: both results are said.
         unknown = [c.head.nodeid for c in report.base_unknown]
         ran += _run_unrun(base, unknown, results.env_digest, **job)[1]
         report = against_base()
     failures = [_failure(c) for c in report.regressions]
-    failures += [f"{nodeid} (no result at the head)" for nodeid in report.not_run]
+    failures += [_no_result(results, nodeid) for nodeid in report.not_run]
     failures += [
-        f"{c.head.nodeid} (fails at the head; no result at the base)" for c in report.base_unknown
+        f"{c.head.nodeid} (fails at the candidate; no result at the base){_why(c.head)}"
+        for c in report.base_unknown
     ]
-    if report.failing_at_base:
-        left_out = f"{len(report.failing_at_base)} test(s) failing at the base not run"
-        scope = f"{scope}; {left_out}" if scope else left_out
-    return RegressionResult(head, base, report.verdict, _named(failures), report.passed, ran, scope)
+    both = [
+        f"{c.head.nodeid} (fails at the candidate and at the base){_why(c.head)}"
+        for c in report.pre_existing
+    ]
+    both += [
+        f"{nodeid} (fails at the base; not run on the candidate: it cannot regress)"
+        for nodeid in report.failing_at_base
+    ]
+    return result(report.verdict, failures, both, report.passed, ran)
 
 
 __all__ = [
+    "FINAL_TESTS",
+    "IDENTITY_VAR",
     "JOB_TIMEOUT_S",
     "MAX_NAMED",
+    "NOT_VERIFIED",
     "PACKAGE_TESTS",
     "PROBE_TIMEOUT_S",
     "SELECTIONS_DIRNAME",
     "TEST_BUDGET_S",
-    "RegressionResult",
     "SessionJobs",
-    "affected_files",
+    "TestsResult",
+    "accuracy_tests",
     "job_runner",
     "job_timeout",
     "max_jobs",
+    "measured_by_sessions",
+    "missing_declared",
+    "one_rank_env",
     "record_at",
-    "run_regression_check",
+    "run_final_tests",
+    "select",
 ]

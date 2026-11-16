@@ -5,14 +5,7 @@
 from __future__ import annotations
 
 from ..decisions import ending_section
-from ._common import (
-    CITATION_DISCIPLINE,
-    EVIDENCE_DISCIPLINE,
-    MODELING_V2_LAYOUT,
-    MODELING_V2_SWITCH,
-    SOURCE_BOUNDARY,
-    tidy,
-)
+from ._common import MODELING_V2_NATIVE, tidy
 from ._render import render_template
 
 WORKER_BASE = render_template("worker_base.md.j2")
@@ -24,26 +17,21 @@ ENDING_EXTRAS: dict[str, str] = {
     "kernel_writer": _KERNEL_WRITER_ENDING,
     "assembler": _ASSEMBLER_ENDING,
 }
-
-_DOCTRINE = (
-    MODELING_V2_LAYOUT,
-    MODELING_V2_SWITCH,
-    SOURCE_BOUNDARY,
-    EVIDENCE_DISCIPLINE,
-    CITATION_DISCIPLINE,
-)
+#: The roles that write and commit code also read two facts about what they test.
+COMMITTING_ROLES: tuple[str, ...] = ("kernel_writer", "assembler")
 
 
-def worker_prompt(ending: str) -> str:
+def worker_prompt(ending: str, *, commits: bool = True) -> str:
     """The worker's system prompt, ending the way one role's turn ends."""
-    return tidy(
-        render_template("worker.md.j2", base=WORKER_BASE, doctrine=_DOCTRINE, ending=ending)
-    )
+    doctrine = (MODELING_V2_NATIVE,) if commits else ()
+    return tidy(render_template("worker.md.j2", base=WORKER_BASE, doctrine=doctrine, ending=ending))
 
 
 def role_prompt(role: str) -> str:
     """The worker's system prompt for a role whose decisions are in the decision table."""
-    return worker_prompt(ending_section(role, ENDING_EXTRAS.get(role, "")))
+    return worker_prompt(
+        ending_section(role, ENDING_EXTRAS.get(role, "")), commits=role in COMMITTING_ROLES
+    )
 
 
-__all__ = ["ENDING_EXTRAS", "WORKER_BASE", "role_prompt", "worker_prompt"]
+__all__ = ["COMMITTING_ROLES", "ENDING_EXTRAS", "WORKER_BASE", "role_prompt", "worker_prompt"]

@@ -28,6 +28,24 @@ def write_text_atomic(path: Path, text: str, *, mode: int = 0o666) -> None:
         staging.unlink(missing_ok=True)
 
 
+def publish_once(path: Path, text: str, *, write=None) -> bool:
+    """Publish a file whole, and once; whether this call is the one that published it.
+
+    The text is written to a sibling file of its own and then linked into place: a reader
+    never sees a part of it, and a second writer never replaces what a first published.
+    ``write`` is the whole-file writer to stage with (:func:`write_text_atomic`).
+    """
+    staging = path.with_name(f".{path.name}.{uuid.uuid4().hex}.once")
+    (write or write_text_atomic)(staging, text)
+    try:
+        os.link(staging, path)
+    except FileExistsError:
+        return False
+    finally:
+        staging.unlink(missing_ok=True)
+    return True
+
+
 def write_json_atomic(path: Path, data: Mapping[str, object]) -> None:
     """Replace a JSON record whole, with deterministic formatting."""
     write_text_atomic(path, json.dumps(data, indent=2, sort_keys=True) + "\n")
@@ -42,4 +60,4 @@ def read_json(path: Path) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-__all__ = ["read_json", "write_json_atomic", "write_text_atomic"]
+__all__ = ["publish_once", "read_json", "write_json_atomic", "write_text_atomic"]

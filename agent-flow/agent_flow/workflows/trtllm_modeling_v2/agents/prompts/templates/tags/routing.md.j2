@@ -1,0 +1,17 @@
+{# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0 -#}
+## Tag `routing`: which configurations reach this target
+
+**What it is for.** The engine picks this target for exactly the
+configurations the run's deployments state, and refuses every other with
+`NoTarget` and a reason a user can act on: the axis, its value, what is
+served instead.
+
+**Hand back.** The target's registration and its route, and nothing else.
+The route decides once, at model load, from the resolved model
+configuration: never from a request, and never by importing the target's
+model code, which another row is still writing.
+
+**How it is judged.** Your test calls the route with each deployment's
+configuration and with one refused value per axis; it loads no engine.
+Names to search: `NoTarget`, and where a family's route is registered.

@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 
 import pytest
+import yaml
 
 from agent_flow.workflows.trtllm_modeling_v2.run import graph as g
 from agent_flow.workflows.trtllm_modeling_v2.run.records.state import (
@@ -16,18 +17,15 @@ from agent_flow.workflows.trtllm_modeling_v2.run.records.state import (
     load_state,
     save_state,
 )
-from agent_flow.workflows.trtllm_modeling_v2.run.validation import contract as c
 
 
-def _t(tid, kind="kernel", deps=(), touches=(), gpus=1, minutes=60, goal=None, **kw):
+def _t(tid, kind="kernel", deps=(), touches=(), goal=None, **kw):
     return g.Task(
         id=tid,
         kind=kind,
         goal=goal or f"do {tid}",
         depends_on=list(deps),
         touches=list(touches),
-        gpus=gpus,
-        est_minutes=minutes,
         **kw,
     )
 
@@ -42,67 +40,66 @@ def test_tasks_that_name_the_same_file_never_run_together():
         _t("b", touches=["models/x/", "./models/x/modeling.py"]),
         _t("c", touches=["models/x/weights.py"]),
     )
-    assert [t.id for t in g.next_to_start(graph, free_gpus=8)] == ["a", "c"]
+    assert [t.id for t in g.next_to_start(graph)] == ["a", "c"]
     graph.tasks[0].status = "running"
-    assert [t.id for t in g.next_to_start(graph, free_gpus=8)] == ["c"]
+    assert [t.id for t in g.next_to_start(graph)] == ["c"]
     graph.tasks[0].status = "done"
-    assert [t.id for t in g.next_to_start(graph, free_gpus=8)] == ["b", "c"]
+    # A directory is what a task may write too: `b` was given `models/x/`, so the file `c`
+    # names inside it waits for `b`.
+    assert [t.id for t in g.next_to_start(graph)] == ["b"]
+    graph.tasks[1].status = "done"
+    assert [t.id for t in g.next_to_start(graph)] == ["c"]
 
 
-def test_an_investigation_never_gates_a_check_and_a_check_never_gates_a_kernel():
-    probe = g.Task(id="probe", kind="investigate", goal="find out why")
-    extra = g.Task(id="extra", kind="feature", goal="nice", priority="nice_to_have")
-    gate = g.Task(id="gate", kind="check", goal="run", satisfies=["core:boot@tp1"])
-    core = g.Task(id="core", kind="assemble", goal="core", satisfies=["core:boot@tp1"],
-                  depends_on=["probe", "extra"])  # fmt: skip
-    kernel = g.Task(id="k1", kind="kernel", goal="entry", depends_on=["gate"])
-    errors = g.validate(g.Graph(tasks=[probe, extra, gate, core, kernel]))
-    assert any("'core': depends on 'probe', an `investigate` task" in e for e in errors)
-    assert any("'core': depends on 'extra', a nice_to_have task" in e for e in errors)
-    assert any("'k1': depends on 'gate', a `check` task" in e for e in errors)
-    core.depends_on, kernel.depends_on = [], []
-    assert not [
-        e
-        for e in g.validate(g.Graph(tasks=[probe, extra, gate, core, kernel]))
-        if "informs" in e or "never waits" in e
-    ]
+def test_a_skipped_required_dependency_and_a_blocked_one_hold_their_dependents():
+    graph = _graph(_t("a"), _t("b", deps=["a"]), _t("c", deps=["b"]), _t("d"))
+    assert [t.id for t in g.ready(graph)] == ["a", "d"]
+    graph.tasks[0].status = "blocked"
+    assert [t.id for t in g.ready(graph)] == ["d"]
+    assert g.blocked_by(graph, "a") == ["b", "c"]
+    # Skipped and required: nothing produced what `b` needs, so it waits too.
+    graph.tasks[0].status = "skipped"
+    assert [t.id for t in g.ready(graph)] == ["d"]
+    # Skipped and only nice to have: what depended on it goes on.
+    graph.tasks[0].priority = "nice_to_have"
+    assert [t.id for t in g.ready(graph)] == ["b", "d"]
+    # Required tasks start before optional ones, each in the graph's order.
+    graph = _graph(_t("x", priority="nice_to_have"), _t("y"), _t("z"))
+    assert [t.id for t in g.next_to_start(graph)] == ["y", "z", "x"]
 
 
-def test_a_regression_check_may_wait_for_a_nice_to_have_task_and_not_for_ever():
-    extra = g.Task(id="extra", kind="feature", goal="nice", priority="nice_to_have",
-                   touches=["tensorrt_llm/_torch/shared.py"])  # fmt: skip
-    review = g.Task(id="regression-2", kind="check", goal="run the package tests",
-                    regression=True, depends_on=["extra"])  # fmt: skip
-    graph = g.Graph(tasks=[extra, review])
-    assert not [e for e in g.validate(graph) if "informs" in e]
-    assert [t.id for t in g.ready(graph)] == ["extra"]
-    # Ended without landing: nothing of it to review, so the check is not held for ever.
-    extra.status, extra.attempts = "failed", 1
-    assert [t.id for t in g.ready(graph)] == ["regression-2"]
-    # Any other check still may not wait for it.
-    review.regression = False
-    assert any("'regression-2': depends on 'extra', a nice_to_have task" in e
-               for e in g.validate(graph))  # fmt: skip
-    assert g.ready(graph) == []
-
-
-def test_a_campaign_waits_for_the_cores_required_checks_only():
-    """A failing variant or feature does not hold the core's tuning back; delivery owes it."""
-    contract = c.Contract(
-        checks=(
-            c.Check("core", "boot", "tp4", c.TIER_INNER),
-            c.Check("core", "accuracy[gsm8k]", "dep4", c.TIER_INNER),
-            c.Check("core", "serve", "tep4", c.TIER_DELIVERY),
-            c.Check("core", "boot", "tp8", c.TIER_INNER, required=False),
-            c.Check("disagg", "disagg", "dep4", c.TIER_PROOF),
-            c.Check("kv_nvfp4", "accuracy[gsm8k]", "dep4", c.TIER_PROOF),
-        )
+def test_a_graph_is_saved_with_what_is_blocked_and_an_older_flows_is_refused(tmp_path):
+    path = tmp_path / g.GRAPH_FILENAME
+    task = _t("k", touches=["a.py"], check="kernel:3", status="blocked", last="it failed",
+              block={"by": "gate", "kind": "attempts_exhausted", "question": "which verb?"},
+              attempts=2, budget=4, ref="3")  # fmt: skip
+    asked = {"kind": "final_tests_failed", "observed": "2 cases fail"}
+    g.Graph(tasks=[task], run_blocked=asked).save(path)
+    loaded = g.Graph.load(path)
+    assert loaded.tasks == [task] and loaded.run_blocked == asked
+    # What an earlier flow kept of its escalations and commands is read past.
+    saved = yaml.safe_load(path.read_text())
+    saved["tasks"][0]["escalation"], saved["consumed"] = "esc-k-2", ["esc-k-1.retry.0123456789"]
+    path.write_text(yaml.safe_dump(saved))
+    assert g.Graph.load(path).tasks == [task]
+    g.Graph(tasks=[task]).save(path)
+    assert g.removed_kinds(path) == []
+    path.write_text(json.dumps({
+        "tasks": [{"id": "t", "kind": "tune"}, {"id": "p", "kind": "kernel", "status": "failed"},
+                  {"id": "r", "kind": "check", "regression": True}],
+        "revisions": [{"number": 1, "reason": "plan"}],
+    }))  # fmt: skip
+    assert g.removed_kinds(path) == [
+        "t (tune)", "p (failed)", "r (a regression check)", "the planner's revisions",
+    ]  # fmt: skip
+    errors = g.validate(_graph(_t("c", kind="check", touches=["x.py"], satisfies=["nope"])),
+                        known_checks=["core:boot@tp1"], required_checks=["core:boot@tp1"])  # fmt: skip
+    assert any("nope is no check of the contract" in e for e in errors)
+    assert any("its `touches` stay empty" in e for e in errors)
+    assert any("required check 'core:boot@tp1' is in no task's `satisfies`" in e for e in errors)
+    assert any(
+        "status 'failed' is not one of" in e for e in g.validate(_graph(_t("x", status="failed")))
     )
-    core = ["core:boot@tp4", "core:accuracy[gsm8k]@dep4", "core:serve@tep4"]
-    assert [k.key for k in c.core_checks(contract)] == core
-    assert [k.key for k in c.core_checks(contract, "core")] == core
-    assert [k.key for k in c.core_checks(contract, "disagg")] == ["disagg:disagg@dep4"]
-    assert c.core_checks(c.Contract(checks=())) == ()
 
 
 def test_round_trip_preserves_every_field_and_an_unknown_version_is_rejected(tmp_path):
@@ -114,7 +111,6 @@ def test_round_trip_preserves_every_field_and_an_unknown_version_is_rejected(tmp
         slug="qwen3-30b-a3b-sm_103-tp1",
         branch="trtllm-modeling-v2/qwen3-30b-a3b-sm_103-tp1",
         devices=[2, 3],
-        tune={"phase": "campaign"},
     )
     save_state(path, original)
     assert load_state(path) == original

@@ -6,11 +6,8 @@ from __future__ import annotations
 
 import os
 import signal
-import socket
 import subprocess
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
@@ -27,37 +24,11 @@ MULTI_TASK_SLURM_VARS = (
 )
 
 
-def free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
 def tail(path: Path, lines: int = 40) -> str:
     try:
         return "".join(path.read_text(errors="replace").splitlines(keepends=True)[-lines:])
     except OSError:
         return ""
-
-
-def wait_healthy(port: int, server: subprocess.Popen, log_path: Path, timeout_s: int) -> float:
-    start = time.monotonic()
-    deadline = start + timeout_s
-    url = f"http://127.0.0.1:{port}/health"
-    while time.monotonic() < deadline:
-        if server.poll() is not None:
-            raise SystemExit(
-                f"server exited with {server.returncode} during boot; tail of {log_path}:\n"
-                f"{tail(log_path)}"
-            )
-        try:
-            with urllib.request.urlopen(url, timeout=5) as response:
-                if response.status == 200:
-                    return time.monotonic() - start
-        except (urllib.error.URLError, ConnectionError, TimeoutError, OSError):
-            pass
-        time.sleep(5)
-    raise SystemExit(f"server not healthy after {timeout_s}s; see {log_path}")
 
 
 def server_devices(count: int) -> str:
@@ -67,20 +38,6 @@ def server_devices(count: int) -> str:
     """
     visible = os.environ.get("CUDA_VISIBLE_DEVICES") or ",".join(str(i) for i in range(count))
     return ",".join(visible.split(",")[: max(count, 1)])
-
-
-def device_memory_used_mib(count: int = 1) -> int | None:
-    """The most memory in use on any of the first ``count`` visible devices (a server's)."""
-    try:
-        out = subprocess.run(
-            ["nvidia-smi", "-i", server_devices(count), "--query-gpu=memory.used",
-             "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=30,
-        ).stdout  # fmt: skip
-    except subprocess.TimeoutExpired:
-        return None
-    used = [int(line) for line in out.split() if line.isdigit()]
-    return max(used) if used else None
 
 
 def device_holders(count: int = 1) -> set[int]:
@@ -186,7 +143,7 @@ def stop_server(
         server.wait()
     stray = holders(world) - before - {os.getpid()}
     if stray and log is not None:
-        log(f"[perf] server left device holders {sorted(stray)}; reaping")
+        log(f"[server] server left device holders {sorted(stray)}; reaping")
     reaped = sorted(set(reap(stray))) if stray else []
     deadline = time.monotonic() + DEVICE_RELEASE_TIMEOUT_S
     while stray and holders(world) & stray and time.monotonic() < deadline:

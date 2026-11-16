@@ -4,22 +4,24 @@
 """What this build can already supply, measured on the host that runs it.
 
 :func:`run_inventory_probe` runs one read-only process under the run's own
-interpreter and reports the catalog entries (certified on this architecture,
-still wired, kept by another target) and the registered ``torch.ops.trtllm``
-ops no entry wraps. What the checkpoint demands is the surveyor's to read,
-from ``config.json`` and the HuggingFace code; joining the two is its
-judgement.
+interpreter and reports the shared catalog's entries: certified on this
+architecture or not, and whether each one's op still resolves in this build.
+What the checkpoint demands is the surveyor's to read, from ``config.json`` and
+the HuggingFace code; joining the two is its judgement. Nothing else reads it:
+the survey's dispatch carries the list.
 """
 
 from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Mapping
 
 from ..infra.compute.environment import RunEnvironment
+from . import tree_anchors
+from .coverage import MODELING_V2_PACKAGE
 
 #: The inventory probe imports the engine, so it pays a real import cost, but
 #: it runs no kernel and allocates nothing. Anything slower than this is not
@@ -39,40 +41,23 @@ RECEIPT_ABSENT = "absent"
 
 @dataclass(frozen=True)
 class CatalogEntry:
-    """One catalog entry as the host actually holds it.
-
-    ``scope`` is empty for the catalog, ``<family>`` for family-shared ops and
-    ``<family>/<target>`` for ops kept by one target.
-    """
+    """One entry of the shared catalog as the host actually holds it."""
 
     path: str
     impl: str = ""
     receipt: str = RECEIPT_ABSENT
     impl_resolves: bool = True
-    scope: str = ""
     #: How many ``Cell`` s the entry certifies; 0 when it states none.
     cells: int = 0
 
     @property
     def name(self) -> str:
-        return Path(self.path).stem
-
-    @property
-    def category(self) -> str:
-        parts = Path(self.path).parts
-        return parts[0] if len(parts) > 1 else ""
-
-    @property
-    def certifiable(self) -> bool:
-        """Every shared entry is an ``OpWrapper`` with cells to certify."""
-        return not self.scope
+        return f"{Path(self.path).parent.name}/{Path(self.path).stem}"
 
     @property
     def spendable(self) -> bool:
-        """Usable without a kernel writer dispatch: shared, certified here, and still wired."""
-        if not self.impl_resolves or self.scope:
-            return False
-        return self.receipt == RECEIPT_PASSED
+        """Usable without a kernel writer dispatch: certified here, and still wired."""
+        return self.impl_resolves and self.receipt == RECEIPT_PASSED
 
 
 @dataclass(frozen=True)
@@ -80,9 +65,7 @@ class Inventory:
     """What the host supplies, measured rather than assumed."""
 
     arch: str = ""
-    trtllm_ops: tuple[str, ...] = ()
     catalog: tuple[CatalogEntry, ...] = ()
-    versions: dict[str, str] = field(default_factory=dict)
     error: str = ""
 
     @property
@@ -95,26 +78,13 @@ class Inventory:
 
     @property
     def uncertified(self) -> tuple[CatalogEntry, ...]:
-        """Present, wired, certifiable, but carrying no pass for this arch."""
-        return tuple(
-            e for e in self.catalog if e.certifiable and e.impl_resolves and not e.spendable
-        )
-
-    @property
-    def other_targets(self) -> tuple[CatalogEntry, ...]:
-        """Ops another target keeps in its own ``ops/``."""
-        return tuple(e for e in self.catalog if e.scope)
+        """Present and wired, but carrying no pass for this arch."""
+        return tuple(e for e in self.catalog if e.impl_resolves and not e.spendable)
 
     @property
     def rotted(self) -> tuple[CatalogEntry, ...]:
         """Entries whose ``impl`` does not resolve in this build."""
         return tuple(e for e in self.catalog if not e.impl_resolves)
-
-    @property
-    def unwrapped_ops(self) -> tuple[str, ...]:
-        """Registered ops that no catalog entry wraps."""
-        wrapped = {e.impl.rsplit(".", 1)[-1] for e in self.catalog if e.impl}
-        return tuple(op for op in self.trtllm_ops if op not in wrapped)
 
 
 #: Runs on the host, inside the run's own interpreter. Kept as a string
@@ -124,28 +94,31 @@ PROBE_SOURCE = r"""
 import ast, json, os, re, sys
 from pathlib import Path
 
-out = {"trtllm_ops": [], "catalog": [], "versions": {}, "error": ""}
+out = {"trtllm_ops": [], "catalog": [], "error": ""}
 repo = Path(sys.argv[1])
 arch = sys.argv[2]
+# The ModelingV2 package, relative to the checkout: the workflow's subject, named once
+# by its caller. The modules that register custom ops: found in the checkout by what
+# they define, by its caller too. Nothing of the engine's layout is written here.
+package = sys.argv[3]
+registering = [m for m in sys.argv[4].split(",") if m]
 
 try:
     import torch
-    out["versions"]["torch"] = torch.__version__
     import tensorrt_llm
-    out["versions"]["tensorrt_llm"] = getattr(tensorrt_llm, "__version__", "?")
     # `torch.ops.<ns>` is a LAZY proxy: `dir()` lists only the names something
     # has already resolved, not every registered name. The registry is the
     # truth; `dir()` stays as a fallback for a torch without the private accessor.
     # Import the Python registration plane before enumerating: an op whose
-    # `custom_ops/*.py` module has not been imported has not registered its
-    # schema either.
-    try:
-        import importlib
+    # registering module has not been imported has not registered its schema
+    # either.
+    import importlib
 
-        importlib.import_module("tensorrt_llm._torch.custom_ops")
-        out["versions"]["custom_ops_imported"] = "yes"
-    except Exception as exc:
-        out["versions"]["custom_ops_imported"] = "no: %s" % type(exc).__name__
+    for module in registering:
+        try:
+            importlib.import_module(module)
+        except Exception:
+            pass
     ops = getattr(torch.ops, "trtllm", None)
     names = set()
     try:
@@ -160,7 +133,8 @@ try:
 except Exception as exc:
     out["error"] = "%s: %s" % (type(exc).__name__, exc)
 
-CATALOG_PKG = "tensorrt_llm._torch._experimental.modeling_v2.catalog"
+PACKAGE_MODULE = package.strip("/").replace("/", ".")
+CATALOG_PKG = PACKAGE_MODULE + ".catalog"
 
 def resolves(dotted, entry_path=None):
     if not dotted:
@@ -171,8 +145,8 @@ def resolves(dotted, entry_path=None):
             return True
         # Not in the registry YET. An op registers when the module holding
         # its `@torch.library.custom_op` is imported, and several live
-        # outside `custom_ops/`. So ask the wrapper: importing it performs
-        # whatever import the op needs.
+        # beside the model that uses them. So ask the wrapper: importing it
+        # performs whatever import the op needs.
         if entry_path:
             import importlib
             module = entry_path
@@ -262,7 +236,7 @@ def entry_certification(py_path):
     match = re.search(r"torch\.ops\.trtllm\.([A-Za-z0-9_]+)", text)
     return sorted(archs), cells, ("torch.ops.trtllm." + match.group(1)) if match else ""
 
-catalog = repo / "tensorrt_llm/_torch/_experimental/modeling_v2/catalog"
+catalog = repo / package / "catalog"
 # The shared vocabulary is the entry files themselves -- there is no index: one
 # OpWrapper per file under catalog/<category>/; underscore modules (_op.py) are
 # the catalog's own infrastructure.
@@ -273,46 +247,48 @@ for py in sorted(catalog.glob("*/*.py")) if catalog.is_dir() else ():
         "path": "%s/%s" % (py.parent.name, py.name),
         "impl": entry_certification(py)[2],
     })
-# A target's own ops: certified for that target, prior art for another.
-models = repo / "tensorrt_llm/_torch/_experimental/modeling_v2/models"
-scoped_ops = sorted({*models.glob("*/*/ops/*/*.py"), *models.glob("*/ops/*/*.py")})
-for py in scoped_ops if models.is_dir() else ():
-    if py.name == "__init__.py":
-        continue
-    target_dir = py.parents[2]
-    out["catalog"].append({
-        "path": "%s/%s" % (py.parent.name, py.name),
-        "impl": entry_certification(py)[2],
-        "scope": target_dir.relative_to(models).as_posix(),
-    })
 for entry in out["catalog"]:
-    if entry.get("scope"):
-        py = models / entry["scope"] / "ops" / entry["path"]
-        module = "tensorrt_llm._torch._experimental.modeling_v2.models.%s.ops.%s" % (
-            entry["scope"].replace("/", "."), entry["path"][:-3].replace("/", "."))
-    else:
-        py = catalog / entry["path"]
-        module = entry["path"]
-    archs, cells, _ = entry_certification(py)
+    archs, cells, _ = entry_certification(catalog / entry["path"])
     entry["cells"] = cells
     entry["receipt"] = "passed" if arch in archs and cells else "absent"
     # Only claim an entry is unwired when the op inventory was actually
     # taken.
-    entry["impl_resolves"] = True if out["error"] else bool(resolves(entry["impl"], module))
+    entry["impl_resolves"] = True if out["error"] else bool(resolves(entry["impl"], entry["path"]))
 
 print("__SURVEY_JSON__" + json.dumps(out))
 """
+
+
+def registering_modules(repo: str | Path) -> tuple[str, ...]:
+    """The modules whose import registers the engine's custom ops, as the checkout has them.
+
+    The packages where ``torch.library.custom_op`` registrations are concentrated
+    (the ``custom_ops`` anchor's homes, :mod:`.tree_anchors`), by their dotted names:
+    importing one imports the modules in it that its ``__init__`` names. Empty when the
+    checkout registers none, or cannot be read.
+    """
+    try:
+        homes = tree_anchors.resolve(repo, "custom_ops").homes
+    except OSError:
+        return ()
+    return tuple(home.strip("/").replace("/", ".") for home in homes)
+
+
+def probe_args(repo: str | Path, arch: str) -> list[str]:
+    """What :data:`PROBE_SOURCE` is run with: the checkout, the architecture, the subject, the modules."""
+    return [str(repo), str(arch), MODELING_V2_PACKAGE, ",".join(registering_modules(repo))]
 
 
 def probe_command(environment: RunEnvironment, *, repo: str | Path, arch: str) -> str:
     """The literal command that takes the inventory, fully prefixed.
 
     Launched as **one** process whatever the run's world size: this is
-    read-only introspection, so nothing in it wants a rank per device.
+    read-only introspection, so nothing in it wants a rank per device. It is told the
+    workflow's subject (the ModelingV2 package) and the modules that register custom
+    ops in this checkout, found here by what they define.
     """
-    return environment.python_command(
-        ["-c", PROBE_SOURCE, str(repo), str(arch)], single_process=True
-    )
+    args = probe_args(repo, arch)
+    return environment.python_command(["-c", PROBE_SOURCE, *args], single_process=True)
 
 
 def parse_inventory(stdout: str, *, arch: str = "") -> Inventory:
@@ -331,18 +307,11 @@ def parse_inventory(stdout: str, *, arch: str = "") -> Inventory:
             impl=str(e.get("impl", "")),
             receipt=str(e.get("receipt", RECEIPT_ABSENT)),
             impl_resolves=bool(e.get("impl_resolves", True)),
-            scope=str(e.get("scope", "") or ""),
             cells=int(e.get("cells", 0) or 0),
         )
         for e in data.get("catalog", ())
     )
-    return Inventory(
-        arch=arch,
-        trtllm_ops=tuple(str(o) for o in data.get("trtllm_ops", ())),
-        catalog=entries,
-        versions={str(k): str(v) for k, v in (data.get("versions") or {}).items()},
-        error=str(data.get("error", "")),
-    )
+    return Inventory(arch=arch, catalog=entries, error=str(data.get("error", "")))
 
 
 def run_inventory_probe(
@@ -362,8 +331,7 @@ def run_inventory_probe(
     # A payload that landed is kept whatever the exit code says. The probe
     # catches its own import failures and still prints what it read off
     # disk.
-    landed = bool(inventory.catalog or inventory.trtllm_ops)
-    if not landed and not getattr(result, "ok", True):
+    if not inventory.catalog and not getattr(result, "ok", True):
         return Inventory(
             arch=arch,
             error=f"{inventory.error} (probe exited {getattr(result, 'returncode', '?')})",
@@ -371,20 +339,8 @@ def run_inventory_probe(
     return inventory
 
 
-# --------------------------------------------------------------------------
-# the block the surveyor reads
-# --------------------------------------------------------------------------
-
-
-def format_surface(
-    inventory: Inventory, *, limit: int = 40, rank: Callable[[str], float] | None = None
-) -> str:
-    """What the build supplies, as the surveyor reads it; ``limit`` caps each list.
-
-    With ``rank`` (``prior_art.ranker``) each list is ordered by how much each name shares
-    the checkpoint's vocabulary before it is cut, so what this checkpoint is likely to
-    reuse is read first, however its name sorts.
-    """
+def format_surface(inventory: Inventory) -> str:
+    """What the shared catalog certifies on this architecture, as the survey's dispatch carries it."""
     lines = ["## Surface survey", ""]
     if not inventory.ok:
         lines += [
@@ -395,68 +351,29 @@ def format_surface(
             "",
         ]
     lines.append(
-        f"Measured on `{inventory.arch or 'this arch'}` before this phase started. What the "
-        "checkpoint demands is yours to read (`config.json`, the HuggingFace code); joining "
-        "the two is your job."
+        f"The shared catalog on `{inventory.arch or 'this arch'}`, measured before this phase "
+        "started. What the checkpoint demands is yours to read (`config.json`, the HuggingFace "
+        "code); joining the two is your job."
     )
-    if rank is not None:
-        lines.append(
-            "Each list is ordered by how much a name shares this checkpoint's `config.json` "
-            "vocabulary, most first; a cut list continues, in the same order, in `surface.md`."
-        )
 
     def listed(title: str, items: list[str]) -> None:
-        if not items:
-            return
-        if rank is not None:
-            items = sorted(items, key=lambda item: (-rank(item), item))
-        lines.extend(["", f"**{title}** ({len(items)}):", ""])
-        lines.extend(f"- `{item}`" for item in items[:limit])
-        if len(items) > limit:
-            lines.append(f"- ... {len(items) - limit} more, see `surface.md`")
+        if items:
+            lines.extend(["", f"**{title}** ({len(items)}):", ""])
+            lines.extend(f"- `{item}`" for item in items)
 
     listed(
-        "Spendable: shared entries certified on this arch and still wired",
-        [f"{e.category}/{e.name}" for e in inventory.spendable],
+        "Certified on this arch and still wired",
+        [e.name for e in inventory.spendable],
     )
     listed(
         "Present but un-run on this arch: driving their cells here is what is missing",
-        [f"{e.category}/{e.name}" for e in inventory.uncertified],
-    )
-    listed(
-        "Family and target ops: reuse within the same family or copy into this target's `ops/` "
-        "(targets never import sibling targets)",
-        [f"{e.scope}/ops/{e.category}/{e.name}" for e in inventory.other_targets],
+        [e.name for e in inventory.uncertified],
     )
     listed(
         "Rotted: the entry's `impl` does not resolve in this build; do not spend these",
-        [f"{e.category}/{e.name} -> {e.impl}" for e in inventory.rotted],
-    )
-    listed(
-        "Registered `torch.ops.trtllm` ops no entry wraps: tier 1, a wrapper and its cells",
-        list(inventory.unwrapped_ops),
+        [f"{e.name} -> {e.impl}" for e in inventory.rotted],
     )
     return "\n".join(lines) + "\n"
-
-
-def surface_names(inventory: Inventory) -> list[str]:
-    """Every name the surface lists, as it lists them: what a ranking is weighed over."""
-    return [
-        *(f"{e.category}/{e.name}" for e in inventory.catalog if not e.scope),
-        *(f"{e.scope}/ops/{e.category}/{e.name}" for e in inventory.other_targets),
-        *inventory.unwrapped_ops,
-    ]
-
-
-def write_surface_file(
-    path: str | Path, inventory: Inventory, *, rank: Callable[[str], float] | None = None
-) -> Path:
-    """Write the survey unabridged, with the versions the probe read, for audit and for agents."""
-    out = Path(path)
-    body = [format_surface(inventory, limit=1_000_000, rank=rank), "## Versions", ""]
-    body.extend(f"- {k}: {v}" for k, v in sorted(inventory.versions.items()))
-    out.write_text("\n".join(body) + "\n", encoding="utf-8")
-    return out
 
 
 __all__ = [
@@ -468,8 +385,8 @@ __all__ = [
     "RECEIPT_PASSED",
     "format_surface",
     "parse_inventory",
+    "probe_args",
     "probe_command",
+    "registering_modules",
     "run_inventory_probe",
-    "surface_names",
-    "write_surface_file",
 ]

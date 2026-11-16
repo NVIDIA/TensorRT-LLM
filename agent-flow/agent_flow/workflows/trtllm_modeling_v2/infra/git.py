@@ -9,16 +9,16 @@ a ``git status`` otherwise refreshes the index under ``index.lock``, and the orc
 fails on the lock.
 
 COMMIT RULES. Every tree-changing task commits with plain ``git commit -s`` on a branch in its own
-worktree (``run/workspace/integration.py``), as the run's one identity (:meth:`CommitIdentity.env`: the
-repository's configured user). Nothing checks a commit as it is made; before a finished task is
-integrated, :func:`audit_commits` reads every commit on its branch, and one that breaks a rule
-goes back to its worker:
+tree (the run's trees, ``run/workspace/integration.py``), as the run's one identity
+(:meth:`CommitIdentity.env`: the repository's configured user). Nothing checks a commit as it is
+made; before a finished task is integrated, :func:`audit_commits` reads every commit on its
+branch, and one that breaks a rule goes back to its worker:
 
 - a ``Signed-off-by`` carries the author's email, and the author is the run's identity; no
   ``Co-authored-by`` unless the policy allows one;
-- no symlink is added (a worktree links the main checkout's native build, and ``.gitignore``
-  names only the directory form), and no sandbox placeholder: a ``.mcp.json``, or anything under
-  ``.claude/`` or ``.cc-writes/``;
+- no symlink is added (a worker's tree links the checkout's native build,
+  and ``.gitignore`` names only the directory form), and no sandbox placeholder: a
+  ``.mcp.json``, or anything under ``.claude/`` or ``.cc-writes/``;
 - every path lies under the policy's allowed prefixes, and outside the denied ones (the run's own
   workspace, when it sits inside the repository).
 
@@ -27,15 +27,14 @@ The delivery audits its whole branch by the same rules, less the author and the 
 
 from __future__ import annotations
 
-import contextlib
-import fcntl
 import os
 import subprocess
 import tempfile
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+
+from .compute.pintree import is_sandbox_placeholder
 
 # Seconds. A git query that takes longer than this is a sick host, and the
 # gate's answer is `unknown` rather than a stall in front of a multi-hour run.
@@ -88,54 +87,9 @@ def resolve_commit(repo: str | Path, rev: str = "HEAD") -> str | None:
     return answer.strip() or None
 
 
-def read_files_at(
-    repo: str | Path, commit: str, paths: Sequence[str], timeout: float = 120
-) -> dict[str, str] | None:
-    """The text of each of ``paths`` at ``commit``, read in one ``git cat-file --batch``.
-
-    A path ``commit`` does not hold is left out. ``None`` when git cannot answer.
-    """
-    if not paths:
-        return {}
-    request = "".join(f"{commit}:{path}\n" for path in paths).encode()
-    try:
-        done = subprocess.run(
-            ["git", "--no-optional-locks", "-C", str(repo), "cat-file", "--batch"],
-            input=request,
-            capture_output=True,
-            timeout=timeout,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if done.returncode != 0:
-        return None
-    out, texts, at = done.stdout, {}, 0
-    for path in paths:
-        end = out.find(b"\n", at)
-        if end < 0:
-            return None
-        header, at = out[at:end], end + 1
-        if header.endswith(b" missing"):
-            continue
-        _, kind, size = header.rsplit(b" ", 2)
-        if kind == b"blob":
-            texts[path] = out[at : at + int(size)].decode("utf-8", "replace")
-        at += int(size) + 1
-    return texts
-
-
 #: The optional task.yaml block that configures the policy; every key has a default.
 COMMIT_POLICY_FIELD = "commit_policy"
 COMMIT_POLICY_KEYS: tuple[str, ...] = ("allowed_paths", "allow_co_authors", "base_ref")
-
-#: Where an onboarding writes, as repo-relative prefixes.
-DEFAULT_ALLOWED_PATHS: tuple[str, ...] = ("tensorrt_llm/", "tests/", "cpp/", "examples/")
-
-#: File names the operator's sandbox drops into every directory its shell
-#: enters, and directory names it creates there.
-SANDBOX_PLACEHOLDER_NAMES: tuple[str, ...] = (".mcp.json",)
-SANDBOX_PLACEHOLDER_DIRS: tuple[str, ...] = (".claude", ".cc-writes")
 
 ENV_NAME = "MV2FLOW_GIT_NAME"
 ENV_EMAIL = "MV2FLOW_GIT_EMAIL"
@@ -212,11 +166,9 @@ class CommitPolicy:
                 denied.append(rel.rstrip("/") + "/")
         return cls(
             identity=identity,
-            allowed_paths=(
-                DEFAULT_ALLOWED_PATHS
-                if allowed is None
-                else tuple(_as_prefix(str(p)) for p in allowed)
-            ),
+            # No list of the engine's directories is remembered: a spec that states none
+            # allows the whole repository, and each task's write scope bounds its commits.
+            allowed_paths=(() if allowed is None else tuple(_as_prefix(str(p)) for p in allowed)),
             denied_paths=tuple(denied),
             allow_co_authors=bool(block.get("allow_co_authors", False)),
             base_ref=str(block.get("base_ref") or ""),
@@ -420,14 +372,6 @@ def audit_commits(
     return findings
 
 
-def is_sandbox_placeholder(path: str) -> bool:
-    """Whether ``path`` (repo-relative) is a file the operator's sandbox leaves behind."""
-    parts = path.strip("/").split("/")
-    return parts[-1] in SANDBOX_PLACEHOLDER_NAMES or any(
-        part in SANDBOX_PLACEHOLDER_DIRS for part in parts[:-1]
-    )
-
-
 def resolve_base(repo: str | Path, candidates: Sequence[str]) -> str:
     """The merge base of ``HEAD`` with the first candidate ref that resolves, or ``""``."""
     for ref in candidates:
@@ -445,7 +389,12 @@ DEFAULT_BASE_REFS: tuple[str, ...] = ("origin/main", "upstream/main", "main")
 
 def commit_instruction(policy: CommitPolicy) -> str:
     """The block every committing role's prompt carries."""
-    where = ", ".join(f"`{p}`" for p in policy.allowed_paths) or "anywhere in the repository"
+    listed = ", ".join(f"`{p}`" for p in policy.allowed_paths)
+    where = (
+        f"Commit only under {listed}"
+        if listed
+        else "Commit only the files your card's write scope names"
+    )
     return (
         "## Committing\n"
         "\n"
@@ -458,7 +407,7 @@ def commit_instruction(policy: CommitPolicy) -> str:
         "```\n"
         "\n"
         "Name every file explicitly: no directories, no globs that could match a file you did "
-        f"not write, never `git add -A`. Commit only under {where}; never a symlink git does "
+        f"not write, never `git add -A`. {where}; never a symlink git does "
         "not track (a worktree's link to the native build), never a sandbox placeholder "
         "(`.mcp.json`, anything under `.claude/`). The run sets the author and the committer: "
         "leave them, sign off with `-s`, and write no `Co-authored-by` line and no AI "
@@ -466,104 +415,26 @@ def commit_instruction(policy: CommitPolicy) -> str:
         "\n"
         "When you finish, every commit on your branch is checked against these rules before "
         "it is integrated, and one that breaks them comes back to you to fix. No other git "
-        "command that writes: never `push`, never a branch operation, never a rebase.\n"
+        "command that writes: never `push`, never a branch operation, and no rebase but one "
+        "this dispatch asks for, on the commit it names.\n"
     )
-
-
-NATIVE_ROOT = "tensorrt_llm"
-
-
-def native_artifacts(repo: str | Path) -> list[str]:
-    """Git-ignored entries directly under ``tensorrt_llm/`` in ``repo``: the native build."""
-    out = git_checked(
-        Path(repo),
-        *("ls-files", "--others", "--ignored", "--exclude-standard", "--directory"),
-        *("--", f"{NATIVE_ROOT}/"),
-        check=False,
-    )
-    found = []
-    for line in out.splitlines():
-        parts = line.strip().rstrip("/").split("/")
-        if len(parts) == 2 and parts[0] == NATIVE_ROOT and parts[1] != "__pycache__":
-            if not parts[1].endswith(".egg-info"):
-                found.append("/".join(parts))
-    return found
-
-
-@contextlib.contextmanager
-def repo_lock(repo: Path):
-    """Serialize worktree creation on one repository.
-
-    Concurrent `git worktree add` on one repository (a campaign stacking a candidate
-    while a tuner request opens another) fails with `Could not reset index file to
-    revision 'HEAD'`.
-    """
-    path = Path(git_checked(repo, "rev-parse", "--git-common-dir"))
-    if not path.is_absolute():
-        path = repo / path
-    with open(path / "mv2flow-worktree.lock", "w") as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(fh, fcntl.LOCK_UN)
-
-
-def add_worktree(repo: Path, tree: Path, *args: str) -> None:
-    """`git worktree add` under the repo lock, retried once after cleaning up a failed attempt.
-
-    Only the registration holds the lock (``--no-checkout``); the checkout, the slow part, runs
-    outside it against the worktree's own index, so several candidates check out at once.
-    """
-    with repo_lock(repo):
-        for attempt in (1, 2):
-            out = subprocess.run(
-                ["git", "-C", str(repo), "worktree", "add", "--no-checkout", *args],
-                capture_output=True,
-                text=True,
-            )
-            if out.returncode == 0:
-                break
-            git_checked(repo, "worktree", "remove", "--force", str(tree), check=False)
-            git_checked(repo, "worktree", "prune", check=False)
-            if attempt == 2:
-                raise RuntimeError(f"git worktree add {' '.join(args)}: {out.stderr.strip()}")
-            time.sleep(5)
-    git_checked(tree, "reset", "--hard", "-q")
-
-
-def link_native(repo: Path, tree: Path) -> None:
-    for rel in native_artifacts(repo):
-        target = tree / rel
-        if target.exists() or target.is_symlink():
-            continue
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.symlink_to(repo / rel)
 
 
 __all__ = [
-    "repo_lock",
-    "native_artifacts",
-    "link_native",
-    "add_worktree",
     "COMMIT_POLICY_FIELD",
     "COMMIT_POLICY_KEYS",
     "CommitFinding",
     "CommitIdentity",
     "CommitPolicy",
     "CommitPolicyError",
-    "DEFAULT_ALLOWED_PATHS",
     "DEFAULT_BASE_REFS",
     "ENV_EMAIL",
     "ENV_NAME",
-    "SANDBOX_PLACEHOLDER_DIRS",
-    "SANDBOX_PLACEHOLDER_NAMES",
     "audit_commits",
     "commit_instruction",
     "git_checked",
     "git_output",
     "is_sandbox_placeholder",
-    "read_files_at",
     "resolve_base",
     "resolve_commit",
     "resolve_commit_identity",

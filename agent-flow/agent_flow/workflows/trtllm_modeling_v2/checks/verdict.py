@@ -12,7 +12,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from ..infra.compute.commands import CommandResult
 from ..infra.git import git_output
-from .runtime_evidence import describe_engine
+from . import attest as attest_mod
 
 #: What a gate records when it could not ask git anything — no repository, no
 #: ``git`` on the host, no commits yet. Never an exception: a gate adjudicates
@@ -75,9 +75,6 @@ class GateResult:
     #: commands imported more than one tree, or a tree no commit pins, or no
     #: snapshot could be made. A void verdict never passes.
     void: str = ""
-    #: The tree's Python files the gate's processes imported, relative to it;
-    #: empty where a command did not say (``run/workspace/snapshots.py:CheckTree.read``).
-    reads: tuple[str, ...] = ()
     #: The per-prompt numbers behind ``measured``, where a gate has them.
     breakdown: str = ""
     #: The accuracy floor the measurement was held to, and the binomial
@@ -98,19 +95,34 @@ class GateResult:
     #: verdict about the target: the workflow re-runs the gate once a session
     #: is back instead of recording it or handing it to the assembler.
     infrastructure: str = ""
-    #: One record per engine the gate built (:meth:`EngineAttestation.record`):
-    #: the configuration it ran against the declared one, the pools it sized
-    #: and the device memory it left free. Empty for a gate that built none.
-    #: Not hashed: the records are mappings.
+    #: Why the check was not run: something it needs (an anchor, a dataset, a protocol,
+    #: a score it is relative to) is missing. Said before any load; never a pass.
+    blocked: str = ""
+    #: Why what this check is for could not be observed (the engine offers no way): it
+    #: passes nothing and fails nothing, and its line says "not verified" with this.
+    unverified: str = ""
+    #: One record per server a session attested (``attest.Attestation.record``): the
+    #: options its ranks ran against the declared ones. Not hashed: the records are mappings.
     engine: tuple[Mapping[str, Any], ...] = field(default=(), hash=False)
 
     def summary(self) -> str:
         """One line for the journal, carrying the numbers verbatim."""
-        verdict = "VOID" if self.void else "PASS" if self.passed else "FAIL"
+        verdict = (
+            "VOID"
+            if self.void
+            else "BLOCKED"
+            if self.blocked
+            else "NOT VERIFIED"
+            if self.unverified and self.passed
+            else "PASS"
+            if self.passed
+            else "FAIL"
+        )
         label = f"{self.name}@{self.member}" if self.member else self.name
         tree = f" [tree {self.tree_state}]"
         breakdown = f" [{self.breakdown}]" if self.breakdown else ""
-        breakdown += describe_engine(self.engine)
+        # A session's attestations say what each server's ranks ran.
+        breakdown += attest_mod.describe(self.engine)
         if self.warnings:
             breakdown += "".join(f" [WARNING: {w}]" for w in self.warnings)
         why = f" -- {self.detail}" if self.detail and (self.explained or not self.passed) else ""
@@ -153,7 +165,6 @@ def measured_on(
     imported: Sequence[str] = (),
     void: str = "",
     warnings: Sequence[str] = (),
-    reads: Sequence[str] = (),
 ) -> GateResult:
     """``result`` as measured on one pinned tree: what it is, its marker, and what was imported.
 
@@ -165,20 +176,11 @@ def measured_on(
         "marker": marker,
         "imported": tuple(imported),
         "warnings": (*result.warnings, *warnings),
-        "reads": tuple(reads),
     }
     if void:
         detail = f"{void}; what it measured: {result.detail}" if result.detail else void
         fields.update(passed=False, void=void, explained=True, detail=detail)
     return replace(result, **fields)
-
-
-def tree_commit(repo_root: str | Path | None) -> str | None:
-    """The full commit ``HEAD`` names in ``repo_root``, or ``None`` if git cannot say."""
-    if not repo_root:
-        return None
-    answer = git_output(repo_root, "rev-parse", "HEAD")
-    return answer.strip() if answer and answer.strip() else None
 
 
 @dataclass
@@ -203,6 +205,5 @@ __all__ = [
     "inspect_tree",
     "lost_session",
     "measured_on",
-    "tree_commit",
     "verdict_factory",
 ]
