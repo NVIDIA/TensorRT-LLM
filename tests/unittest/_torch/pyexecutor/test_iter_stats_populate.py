@@ -1321,6 +1321,7 @@ def test_attention_dp_zero_duration_fanout_keeps_only_the_ranks_with_work():
     assert rows[0]["inflightBatchingStats"]["numGenRequests"] == 3
     assert rows[0]["inflightBatchingStats"]["numScheduledRequests"] == 3
     assert not buffers[0].last_fanout_is_queue_snapshot
+    assert not buffers[0].last_fanout_has_rank0_row
 
 
 def test_attention_dp_fanout_marks_busy_queue_snapshots():
@@ -1340,6 +1341,7 @@ def test_attention_dp_fanout_marks_busy_queue_snapshots():
     assert rows[0]["numQueuedRequests"] == 1
     assert buffers[0].last_fanout_is_queue_snapshot
     assert buffers[0].last_fanout_queued_counters == (1, 0, 0, 0)
+    assert buffers[0].last_fanout_has_rank0_row
     assert buffers[0].last_idle_rank_states is None
 
     _exchange_idle_heartbeat([buffers[0], ADPIterStatsBuffer()], iter_id=10)
@@ -1394,6 +1396,7 @@ def test_attention_dp_fanout_emits_rank_local_rows_with_rank0_queue():
     )
 
     assert len(rows) == 2
+    assert buffer.last_fanout_has_rank0_row
 
     rank0_row = json.loads(rows[0])
     rank0_ifb = rank0_row["inflightBatchingStats"]

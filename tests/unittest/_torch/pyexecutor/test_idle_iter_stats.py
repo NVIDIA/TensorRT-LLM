@@ -72,6 +72,7 @@ def executor(clock):
         _latest_prev_device_step_time_ms=5.0,
         enable_attention_dp=False,
         dist=SimpleNamespace(rank=0, pp_size=1, tp_size=1),
+        perf_manager=SimpleNamespace(take_encoder_gpu_times_ms=Mock(return_value=[])),
         control_requests=[],
         _stats_has_pending_work=False,
         _has_pending_iteration_stats_work=lambda: False,
@@ -83,6 +84,7 @@ def executor(clock):
             last_idle_rank_states=None,
             last_fanout_is_queue_snapshot=False,
             last_fanout_queued_counters=(),
+            last_fanout_has_rank0_row=True,
             next_payload=lambda: None,
             make_idle_heartbeat_rows=Mock(return_value=[]),
         ),
@@ -93,6 +95,7 @@ def executor(clock):
         stub,
         "_stats_scheduler_mode",
         "_zero_duration_stats_row",
+        "_take_mm_encoder_stats",
         "_append_stats_rows",
         "_maybe_emit_quiescent_stats",
         "_build_quiescent_stats",
@@ -302,6 +305,54 @@ def test_attention_dp_fanout_export_follows_the_fanout_kind(executor, kind):
         assert executor.stats == second
 
 
+def test_zero_duration_rows_leave_the_encoder_calls_for_a_measured_record(executor):
+    """A heartbeat can be replaced and a snapshot dropped, so neither takes the encoder calls."""
+    take = executor.perf_manager.take_encoder_gpu_times_ms
+    take.return_value = [2.5]
+
+    _publish_heartbeat(executor)
+    _queue_backlog(executor, 2)
+    executor._maybe_emit_quiescent_stats(engine_idle=False)
+    assert len(executor.stats) == 2 and all(len(row) == 8 for row in executor.stats)
+    take.assert_not_called()
+
+    assert _append_measured(executor)[8] == {"gpuTimesMS": [2.5]}
+    take.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    "kind, has_rank0_row, taken",
+    [
+        ("measured", True, True),
+        # A zero-duration record that dropped rank 0's empty row: the first row is a peer's.
+        ("measured", False, False),
+        ("queue-snapshot", True, False),
+        ("idle-heartbeat", True, False),
+    ],
+)
+def test_attention_dp_encoder_calls_go_on_rank_zeros_measured_row(
+    executor, kind, has_rank0_row, taken
+):
+    executor.enable_attention_dp = True
+    executor.perf_manager.take_encoder_gpu_times_ms.return_value = [2.5]
+    adp_stats = executor._adp_iter_stats
+    adp_stats.last_fanout_is_queue_snapshot = kind == "queue-snapshot"
+    adp_stats.last_fanout_queued_counters = (1, 100, 0, 0)
+    adp_stats.last_fanout_has_rank0_row = has_rank0_row
+    if kind == "idle-heartbeat":
+        adp_stats.last_idle_rank_states = [object(), object()]
+    rows = _adp_rows("first") if has_rank0_row else _adp_rows("first")[1:]
+
+    executor._export_adp_fanout(rows)
+
+    encoder_stats = [json.loads(row).get("multimodalEncoderStats") for row in executor.stats]
+    if taken:
+        assert encoder_stats == [{"gpuTimesMS": [2.5]}, None]
+    else:
+        assert executor.stats == rows
+        executor.perf_manager.take_encoder_gpu_times_ms.assert_not_called()
+
+
 def test_idle_tick_publishes_only_when_due(executor, clock):
     from tensorrt_llm._torch.pyexecutor.py_executor import IDLE_HEARTBEAT_PERIOD_S
 
@@ -464,6 +515,7 @@ def _attention_dp_rank(rank, clock):
         disable_overlap_scheduler=False,
         enable_attention_dp=True,
         dist=SimpleNamespace(rank=rank, pp_size=1, tp_size=2),
+        perf_manager=SimpleNamespace(take_encoder_gpu_times_ms=lambda: []),
         control_requests=[],
         _stats_has_pending_work=False,
         _adp_iter_stats=ADPIterStatsBuffer(),
@@ -484,6 +536,7 @@ def _attention_dp_rank(rank, clock):
         stub,
         "_stats_scheduler_mode",
         "_zero_duration_stats_row",
+        "_take_mm_encoder_stats",
         "_append_stats_rows",
         "_maybe_emit_quiescent_stats",
         "_build_quiescent_stats",
@@ -598,6 +651,7 @@ def _fetch_stub(**overrides):
         ),
         _idle_heartbeat_tick=Mock(return_value=1.0),
         _flush_staged_responses=lambda: None,
+        _waiting_queue_needs_clock=False,
         request_accumulated=[],
         hang_detector=SimpleNamespace(pause=nullcontext),
         executor_request_queue=SimpleNamespace(get_from_request_queue=Mock(return_value=[])),

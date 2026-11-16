@@ -248,12 +248,14 @@ class ADPIterStatsBuffer:
         # What the latest finalize() call did, for the executor on rank 0:
         # whether it settled an iteration at all, the rank states if that
         # iteration was an idle heartbeat (see make_idle_heartbeat_rows),
-        # whether it was a zero-duration queue snapshot of a busy engine, and
-        # the queued totals its rows report (RankIterStatsPayload._QUEUED_FIELDS).
+        # whether it was a zero-duration queue snapshot of a busy engine, the
+        # queued totals its rows report (RankIterStatsPayload._QUEUED_FIELDS),
+        # and whether rank 0's row is among them (then it is the first).
         self.last_finalize_settled = False
         self.last_idle_rank_states: Optional[List[RankState]] = None
         self.last_fanout_is_queue_snapshot = False
         self.last_fanout_queued_counters: tuple = ()
+        self.last_fanout_has_rank0_row = False
         # Rank 0 only: per-request stats preserved for compatibility.
         # RequestStats remain rank-0-owned under Attention-DP.
         self._rank0_req_stats: Dict[int, Optional[List[RequestStats]]] = {}
@@ -493,6 +495,7 @@ class ADPIterStatsBuffer:
         self.last_idle_rank_states = None
         self.last_fanout_is_queue_snapshot = False
         self.last_fanout_queued_counters = ()
+        self.last_fanout_has_rank0_row = False
         pending_states = [s for s in all_rank_states if s.iter_stats.has_iter_stats]
         if not pending_states:
             return []
@@ -563,6 +566,7 @@ class ADPIterStatsBuffer:
                     if any(getattr(s.iter_stats, name) for name in _ROW_WORK_FIELDS)
                     or (s.rank == 0 and any(queued_counters))
                 ]
+            self.last_fanout_has_rank0_row = any(s.rank == 0 for s in exported_states)
             rows = self._rank_rows(
                 rank0_stats,
                 exported_states,

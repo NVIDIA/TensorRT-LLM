@@ -197,6 +197,9 @@ l0_cpu:
   - unittest/_torch/modules
   - unittest/_torch/moe
   - unittest/_torch/multimodal
+  # Every test in it is cpu_only, so l0_b200's unittest/_torch/kv_cache_compression entry
+  # (-m "not cpu_only") runs none of them.
+  - unittest/_torch/kv_cache_compression/test_quantization_for_cold_page.py
   - unittest/_torch/ray_orchestrator/single_gpu/test_cache_transceiver_comm.py
   - unittest/_torch/speculative/hw_agnostic
   - unittest/_torch/speculative/test_device_window_sampling_layout.py
@@ -209,6 +212,7 @@ l0_cpu:
   - unittest/_torch/test_connector.py
   - unittest/_torch/test_connector_adp.py
   - unittest/_torch/models/test_modeling_utils.py::test_tied_embedding_parallel_layout
+  - unittest/_torch/models/test_qwen3next_moe_input_dual_quant.py
   - unittest/_torch/models/test_modeling_utils.py::test_tied_embedding_rejects_incompatible_layout
   - unittest/_torch/models/test_modeling_utils.py::test_quantization_passes_match_declared_fused_checkpoint_names
   - unittest/_torch/test_connector_shared_pool.py
@@ -338,6 +342,7 @@ l0_cpu:
   - unittest/llmapi/apps/test_musespark_tool_parser.py
   - unittest/llmapi/apps/test_openai_chat_disagg_multimodal.py
   - unittest/llmapi/apps/test_openai_chat_multimodal_prompt.py
+  - unittest/llmapi/apps/test_openai_input_metrics.py
   - unittest/llmapi/apps/test_openai_protocol_chat_agent_fields.py
   - unittest/llmapi/apps/test_openai_protocol_chat_store.py
   - unittest/llmapi/apps/test_openai_server_graceful_shutdown.py
@@ -353,6 +358,8 @@ l0_cpu:
   - unittest/llmapi/apps/test_request_metrics.py::test_header_derived_record_keeps_kv_transfer_without_kv_cache_size
   - unittest/llmapi/apps/test_request_metrics.py::test_unpopulated_kv_transfer_timestamps_stay_absent
   - unittest/llmapi/apps/test_request_metrics.py::TestJsonlWriterSurvival
+  - unittest/llmapi/apps/test_request_metrics.py::test_input_metrics_survive_headers_disagg_and_jsonl
+  - unittest/llmapi/apps/test_request_metrics.py::test_input_metrics_are_request_local_and_exported
   - unittest/llmapi/apps/test_responses_custom_tools.py
   - unittest/llmapi/apps/test_responses_deepseek_v41_namespaces.py
   - unittest/llmapi/apps/test_responses_input_preprocess.py

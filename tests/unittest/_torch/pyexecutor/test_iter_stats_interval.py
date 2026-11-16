@@ -379,14 +379,14 @@ def test_zero_duration_row_does_not_repeat_the_latest_kv_iteration_stats():
         _latest_kv_iter_stats={32: "deltas"},
         _latest_host_step_time_ms=6.0,
         _latest_prev_device_step_time_ms=4.0,
+        _take_mm_encoder_stats=lambda: None,
     )
     fake._stats_scheduler_mode = PyExecutor._stats_scheduler_mode.__get__(fake)
-    fake._append_stats_rows = PyExecutor._append_stats_rows.__get__(fake)
     stats = IterationStats()
 
     PyExecutor._append_iter_stats(fake, stats)
     snapshot = PyExecutor._zero_duration_stats_row(fake, stats)
 
     (measured,) = fake.stats
-    assert measured == (stats, None, {32: "deltas"}, None, 6.0, 4.0, "non_overlap", None)
+    assert measured == (stats, None, {32: "deltas"}, None, 6.0, 4.0, "non_overlap", None, None)
     assert snapshot == (stats, None, None, None, 0.0, 0.0, "non_overlap", 0.0)
