@@ -42,7 +42,6 @@ _LAUNCH_MARKERS: tuple[tuple[str, str], ...] = (
     ("tensorrt_llm/llmapi/llm.py", "generate"),
     ("tensorrt_llm/executor/executor.py", "GenerationExecutor.generate"),
 )
-_SERVING_PATH_MARKERS: tuple[str, ...] = ("disaggregated/",)
 # Stage-name markers whose GPU worker is uninstrumented, so capture is partial.
 _UNTRUSTED_STAGE_MARKERS: tuple[str, ...] = ("-Ray-",)
 _MIN_FUNCS = 30
@@ -301,13 +300,24 @@ class TouchDB:
         that failed outright still needs to keep running regardless of how trustworthy its
         (possibly perfectly complete) coverage is.
 
-        - ``outcome``: the test did not pass (or has no recorded outcome at all).
+        - ``outcome``: no pass was recorded, or a failure was recorded. Skipped
+          observations do not invalidate a pass from another attempt of the same stage.
         - ``tainted``: a process saved, but the context channel could not confirm it was
           recording against the right test.
         """
+        # Older schema-5 artifacts embed a view that treats any skipped observation
+        # as incomplete. Reduce their raw outcomes too, without rewriting the artifact.
         rows = self._conn.execute(
             "SELECT test FROM test_case_meta WHERE test != '' AND "
-            "(outcome IS NULL OR outcome != 'passed' OR tainted != 0)"
+            "(tainted != 0 OR test NOT IN ("
+            f"SELECT {_QUALIFIED_TEST_SQL} "
+            "FROM test_result "
+            "JOIN case_stage ON case_stage.id=test_result.case_stage_id "
+            "JOIN stage ON stage.id=case_stage.stage_id "
+            "GROUP BY case_stage.id "
+            "HAVING MAX(CASE WHEN outcome='passed' THEN 1 ELSE 0 END)=1 "
+            "AND MAX(CASE WHEN outcome NOT IN ('', 'passed', 'skipped') "
+            "THEN 1 ELSE 0 END)=0))"
         )
         # Tests that recorded nothing are not selection candidates.
         return {row[0] for row in rows} & self.known_tests()
@@ -318,7 +328,6 @@ class TouchDB:
         self,
         worker_file: str,
         launch_markers: tuple[tuple[str, str], ...],
-        serving_path_markers: tuple[str, ...],
         min_funcs: int,
         untrusted_stage_markers: tuple[str, ...] = (),
     ) -> set[str]:
@@ -337,12 +346,6 @@ class TouchDB:
                     "WHERE file.path=? AND symbol.qualname LIKE ? AND case_stage.test!=''",
                     (file, f"%{qual_substr}%"),
                 )
-            }
-        if serving_path_markers:
-            drove_execution |= {
-                test
-                for test in self.known_tests()
-                if any(marker in test for marker in serving_path_markers)
             }
         missing_worker = drove_execution - self.tests_touching_file(worker_file)
         tiny = {

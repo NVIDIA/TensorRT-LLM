@@ -60,6 +60,10 @@ class Block:
 # the lookup must hit either form so we normalize on both sides.
 _TEST_ID_SUFFIX_RE = re.compile(r"\s+(SKIP|TIMEOUT)\b.*$")
 
+# ISOLATION is an execution directive, not part of the pytest identity. Match
+# only the trailing token so a quoted -k expression containing it stays intact.
+_TEST_ID_ISOLATION_SUFFIX_RE = re.compile(r"\s+ISOLATION$")
+
 # Strip leading `full:<gpu>/` platform prefix used in waives.txt.
 _TEST_ID_PREFIX_RE = re.compile(r"^full:[^/]+/")
 
@@ -67,7 +71,7 @@ _TEST_ID_PREFIX_RE = re.compile(r"^full:[^/]+/")
 def normalize_test_id(test_id: str) -> str:
     """Canonical form for cross-referencing test-db YAML and waives.txt.
 
-    Strips trailing `SKIP`/`TIMEOUT` annotations, trailing `# comment`, and
+    Strips trailing `SKIP`/`TIMEOUT`/`ISOLATION` annotations, trailing `# comment`, and
     leading `full:<gpu>/` prefix. `YAMLIndex` indexes both the raw and the
     normalized form; `rules.waives_rule` looks up by this normalization.
     """
@@ -75,6 +79,7 @@ def normalize_test_id(test_id: str) -> str:
     s = _TEST_ID_SUFFIX_RE.sub("", s).strip()
     if "#" in s:
         s = s.split("#", 1)[0].strip()
+    s = _TEST_ID_ISOLATION_SUFFIX_RE.sub("", s)
     return _TEST_ID_PREFIX_RE.sub("", s)
 
 

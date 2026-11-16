@@ -27,7 +27,7 @@ from click.testing import CliRunner
 from ._dataclass_helpers import ADDED_DATACLASS, added_dataclass_change
 
 __extra_import_path__ = ["~/jenkins/scripts/cbts"]
-from cbts.blocks import Block, Stage, YAMLIndex
+from cbts.blocks import Block, Stage, YAMLIndex, normalize_test_id
 from cbts.command.main import (
     COVERAGE_NEEDS_DIFF_FOR,
     Selector,
@@ -36,6 +36,7 @@ from cbts.command.main import (
     main,
 )
 from cbts.coverage.selection.selector import CoverageSelector
+from cbts.coverage.selection.touch_db import db_key
 from cbts.coverage.tier import apply_coverage_tier, coverage_preflight
 from cbts.rules.base import PRInputs
 from cbts.rules.docs import CPU_TEST_YAML_STEM, DOCS_STAGE, DocsRule
@@ -69,6 +70,76 @@ class _FakeDB:
 
     def untrusted_tests(self, *_args) -> set[str]:
         return set()
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        " ISOLATION",
+        " ISOLATION TIMEOUT (90)",
+        " TIMEOUT (90) ISOLATION",
+        " ISOLATION SKIP (bug)",
+        " ISOLATION # run separately",
+    ],
+)
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "unittest/llmapi/test_mpi_session.py",
+        "test_e2e.py::test_openai_chat_multimodal_example",
+        'unittest/llmapi/test_mpi_lifecycle.py -k "all_failure-2 or reuse-2"',
+    ],
+)
+def test_isolation_directives_do_not_change_coverage_identity(entry: str, suffix: str) -> None:
+    assert normalize_test_id(entry + suffix) == entry
+    assert db_key(entry + suffix) == db_key(entry)
+
+
+def test_isolation_in_a_quoted_keyword_expression_is_preserved() -> None:
+    entry = 'unittest/llmapi/test_mpi_session.py -k "normal or ISOLATION"'
+    assert normalize_test_id(entry) == entry
+    assert normalize_test_id(entry + " ISOLATION") == entry
+
+
+@pytest.mark.parametrize("unittest", [False, True])
+def test_isolation_entries_keep_impact_and_capture_checks(tmp_path: Path, unittest: bool) -> None:
+    """Only a trusted, unaffected isolation entry is pruned; execution directives stay intact."""
+    path = "tensorrt_llm/example.py"
+    source = tmp_path / path
+    source.parent.mkdir(parents=True)
+    source.write_text("def caller():\n    return 2\n")
+    pr = PRInputs(
+        changed_files=[path],
+        diffs={path: "@@ -1,2 +1,2 @@\n def caller():\n-    return 1\n+    return 2\n"},
+    )
+    prefix = "unittest/llmapi/test_" if unittest else "test_e2e.py::test_"
+    names = [prefix + name + (".py" if unittest else "") for name in ("caller", "safe", "unsafe")]
+    keys = [f"test_unittests.py::test_unittests_v2[{name}]" if unittest else name for name in names]
+    entries = [name + " ISOLATION" for name in names]
+    stage = "A10-PyTorch-1"
+
+    class IsolationDB(_FakeDB):
+        def tests_touching_func(self, _path: str, qualname: str) -> set[str]:
+            return {f"{stage}/{keys[0]}"} if qualname == "caller" else set()
+
+        def tests_touching_file(self, _path: str) -> set[str]:
+            return {f"{stage}/{key}" for key in keys}
+
+        def known_by_family(self) -> dict[str, set[str]]:
+            return {"A10-PyTorch": set(keys)}
+
+        def untrusted_tests(self, *_args) -> set[str]:
+            return {f"{stage}/{keys[2]}"}
+
+    index = YAMLIndex()
+    index.blocks = [Block("l0_a10", 0, {}, entries.copy())]
+    stages = {stage: Stage(stage, "l0_a10", "x86_64", 1, 1)}
+    result, note = apply_coverage_tier(pr, [], set(), stages, index, tmp_path, IsolationDB())
+
+    assert result is not None, note
+    assert result.removed == {("l0_a10", 0): {entries[1]}}
+    assert not result.dropped
+    assert index.blocks[0].tests == entries
 
 
 @pytest.mark.parametrize(
