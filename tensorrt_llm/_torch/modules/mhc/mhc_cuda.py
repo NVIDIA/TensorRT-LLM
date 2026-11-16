@@ -261,6 +261,15 @@ _BIGFUSE_BLOCK_SIZE_OPTIONS = (128, 256, 512)
 _FALLBACK_TACTIC = ("fma", 0, 0, 0)
 
 
+def _pre_mapping_dg_allowed(pre_mix_ext: torch.Tensor | None) -> bool:
+    """Whether pre_mapping may run DeepGEMM.
+
+    The lagged (V4.1) pre-mix runs DeepGEMM only on SM90, where the FMA GEMM is
+    several times slower; other GPUs keep the FMA kernels for it.
+    """
+    return pre_mix_ext is None or get_sm_version() == 90
+
+
 class MhcPreMappingRunner(TunableRunner):
     """Profiles the full MHC pre_mapping pipeline (GEMM+sqrsum + big_fuse).
 
@@ -334,7 +343,7 @@ class MhcPreMappingRunner(TunableRunner):
             for bs in _BIGFUSE_BLOCK_SIZE_OPTIONS:
                 tactics.append(("fma", 8, 2, bs))
 
-        if _get_dg_fn() is not None:
+        if _get_dg_fn() is not None and _pre_mapping_dg_allowed(kwargs.get("pre_mix_ext")):
             for bs in _BIGFUSE_BLOCK_SIZE_OPTIONS:
                 tactics.append(("dg_splitk", 0, 0, bs))
                 tactics.append(("dg_nosplit", 0, 0, bs))
@@ -356,6 +365,9 @@ class MhcPreMappingRunner(TunableRunner):
         if tactic == -1:
             tactic = _FALLBACK_TACTIC
         backend, tile_n, tile_m, bigfuse_bs = tactic
+        # The tuning cache does not tell lagged calls from others of the same shape.
+        if backend != "fma" and not _pre_mapping_dg_allowed(kwargs.get("pre_mix_ext")):
+            backend, tile_n, tile_m, bigfuse_bs = _FALLBACK_TACTIC
 
         num_splits = 1
         if backend == "dg_splitk":

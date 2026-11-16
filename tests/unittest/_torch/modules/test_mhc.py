@@ -7,6 +7,7 @@ import os
 from collections import defaultdict
 from pathlib import Path
 from typing import TYPE_CHECKING
+from unittest import mock
 
 import pytest
 import torch
@@ -1336,11 +1337,13 @@ def test_mhc_fused_hc_realistic_scale_regression(tactic, hidden_size: int):
 @pytest.mark.parametrize("num_tokens", [64, 1024])
 def test_mhc_split_dg_lagged_matches_fma(num_tokens: int, num_splits: int):
     """With a lagged pre-mix, the DeepGEMM boundaries match the FMA ones."""
+    from tensorrt_llm._torch.modules.mhc import mhc_cuda
     from tensorrt_llm._torch.modules.mhc.mhc_cuda import (
         MhcFusedHcRunner,
         MhcPreMappingRunner,
         _get_dg_fn,
     )
+    from tensorrt_llm._utils import get_sm_version
 
     if _get_dg_fn() is None:
         pytest.skip("split_dg needs DeepGEMM's TF32 hc_prenorm GEMM")
@@ -1404,7 +1407,15 @@ def test_mhc_split_dg_lagged_matches_fma(num_tokens: int, num_splits: int):
     ]
     dg_backend = "dg_splitk" if num_splits > 1 else "dg_nosplit"
     ref = pre_mapping(inputs=pre_inputs, tactic=("fma", 8, 1, 256), **kwargs)
-    out = pre_mapping(inputs=pre_inputs, tactic=(dg_backend, 0, 0, 256), **kwargs)
+    if get_sm_version() == 90:
+        out = pre_mapping(inputs=pre_inputs, tactic=(dg_backend, 0, 0, 256), **kwargs)
+    else:
+        # Off SM90 a lagged pre_mapping falls back to the FMA kernel.
+        def no_deepgemm(*args, **kwargs):
+            raise AssertionError("a lagged pre_mapping ran DeepGEMM off SM90")
+
+        with mock.patch.object(mhc_cuda, "mhc_gemm_rms_dg_cuda", no_deepgemm):
+            out = pre_mapping(inputs=pre_inputs, tactic=(dg_backend, 0, 0, 256), **kwargs)
     assert len(out) == len(ref) == 4
     for name, tol, o, r in zip(names, tols, out, ref):
         torch.testing.assert_close(o, r, **tol, msg=f"pre_mapping {name} mismatch")
