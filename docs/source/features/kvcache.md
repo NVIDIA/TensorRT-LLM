@@ -77,7 +77,7 @@ scheduler_config:
 ### Selecting the KV Cache Manager
 
 ```{warning}
-KV cache manager V1 (`use_kv_cache_manager_v2: false`, or `auto` when it resolves to V1) is deprecated as of TensorRT-LLM 1.4 (2026-11) and will be removed after the 3-month migration period. Use KV cache manager V2, the default, for supported features. Sleep mode (`sleep_config`), RocketKV, and skip-softmax still require V1 until V2 support is available; keep V1 for these features during migration.
+KV cache manager V1 (`use_kv_cache_manager_v2: false`, or `auto` when it resolves to V1) is deprecated as of TensorRT-LLM 1.4 (2026-11) and will be removed after the 3-month migration period. Use KV cache manager V2, the default, for supported features. Sleep mode (`sleep_config`) and RocketKV still require V1 until V2 support is available; keep V1 for these features during migration.
 ```
 
 TensorRT LLM ships two KV cache manager implementations. `use_kv_cache_manager_v2`
@@ -98,9 +98,27 @@ Models whose preference selects the V2 manager when the setting is `auto`:
 | Gemma3 / Gemma4 (text and multimodal) | Alternating sliding-window and full-attention layers (VSWA); same independent pool sizing |
 | Llama / Llama4 | Uniform KV pool layout; chunked attention does not partition the pools |
 
-Separately, Gemma4 hybrid attention and sparse-attention models are routed to
-V2 unconditionally: their per-layer buffer layouts cannot be represented by V1's
-unified pool, so `use_kv_cache_manager_v2` does not apply to them.
+Separately, Gemma4 hybrid attention models are routed to V2 unconditionally:
+their layers have different head sizes, which V1's unified pool cannot
+represent, so `use_kv_cache_manager_v2` does not apply to them. Sparse attention
+algorithms select their KV cache manager per algorithm:
+
+| Algorithm | KV cache manager |
+| --- | --- |
+| DeepSeek-V4, MiniMax-M3, CSA2 | The algorithm's V2 manager, whatever the setting |
+| QSA | The algorithm's V2 hybrid manager; the setting must select V2 |
+| DSA | Follows the setting (`DSACacheManagerV2` or `DSACacheManager`) |
+| RocketKV | The algorithm's V1 manager, whatever the setting |
+| Skip Softmax Attention | The manager a dense model would get |
+
+Skip Softmax Attention changes only the attention kernel and keeps the dense KV
+cache layout, so `use_kv_cache_manager_v2` applies to it as to a dense model,
+and a Gemma4 hybrid attention model with Skip Softmax still uses V2. With the
+default `true`, Skip Softmax therefore runs on V2, and the V2 requirements apply:
+disaggregated serving needs the Python transceiver with NIXL (set
+`use_kv_cache_manager_v2: false` to keep the C++ transceiver), a KV cache
+connector that serves prefixes needs block reuse, and `reorder_policy_config`
+has no effect.
 
 For a model whose `layer_types` mixes sliding-window and full-attention layers
 and that publishes a single `sliding_window` (GPT-OSS, Gemma3), the V2 manager
@@ -123,8 +141,11 @@ beam width. The transceiver transfers the shared prompt KV once; the generation
 worker expands the beams after the transfer completes. Block reuse remains
 supported. The Python implementation selected by
 `TLLM_KV_CACHE_MANAGER_V2_BACKEND=python` is separate from the Python transceiver
-and does not support beam search. Hybrid Mamba, sparse attention, KV connectors,
-and pipelined KV transfer remain unsupported with V2 beam search.
+and does not support beam search. Hybrid Mamba, sparse attention other than
+Skip Softmax Attention, KV connectors, and pipelined KV transfer remain
+unsupported with V2 beam search. With `max_beam_width > 1`, Skip Softmax decode
+runs the dense MMHA kernel on either manager, so only the prefill threshold
+applies.
 
 For the native V2 cold-storage representation and codec extension contract, see
 [KVCacheManagerV2 Cold-Page Codec Design](../developer-guide/kv-cache-cold-page-codec.md).

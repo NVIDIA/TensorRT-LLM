@@ -54,6 +54,7 @@ from tensorrt_llm.llmapi.llm_args import (
     KvCacheConfig,
     MTPDecodingConfig,
     MultimodalConfig,
+    SkipSoftmaxAttentionConfig,
     TorchLlmArgs,
 )
 from tensorrt_llm.mapping import CpType, Mapping
@@ -201,8 +202,8 @@ def test_mla_profile_supports_dense_prefill_modes(
     elif mode == "spec":
         creator._speculative_config = MTPDecodingConfig(num_nextn_predict_layers=1)
     else:
-        creator._model_engine.model.model_config.sparse_attention_config = SimpleNamespace(
-            algorithm="skip_softmax"
+        creator._model_engine.model.model_config.sparse_attention_config = (
+            SkipSoftmaxAttentionConfig(threshold_scale_factor=1000.0)
         )
     requests = creator._create_dummy_context_requests(262143)
     assert creator._mla_chunked_profile_length == 73728
