@@ -1209,7 +1209,10 @@ def _run_test_for_backend(backend_name,
                     q = inputs_per_layer[layer_idx]["ctx_q"]
                     k = inputs_per_layer[layer_idx]["ctx_k"]
                     v = inputs_per_layer[layer_idx]["ctx_v"]
-                    # Cover compact V and the joint-projection view in existing scenarios.
+                    # Reuse the layer-count scenarios to cover both V layouts without
+                    # adding cases: one layer uses compact V, multiple layers use
+                    # the joint-projection view. Preserve both layouts if the
+                    # layer-count parametrization changes.
                     if num_layers == 1:
                         v = v.contiguous()
                     compressed_kv = inputs_per_layer[layer_idx][

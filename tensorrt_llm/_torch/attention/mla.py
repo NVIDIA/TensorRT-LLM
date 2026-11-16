@@ -66,6 +66,8 @@ from .backends.sparse.mixed_precision_high_rows import store_mixed_precision_hig
 from .backends.utils import create_attention
 from .rotary_embedding import RotaryEmbedding
 
+_MIN_STRIDED_KV_EXPAND_TOKENS = 4096
+
 
 def _slice_hidden_states_to_num_tokens(hidden_states, num_tokens: int):
     """Drop CUDA-graph padding by slicing hidden_states to num_tokens rows.
@@ -1231,11 +1233,13 @@ class MLA(nn.Module):
     def _expand_context_kv(
         self, compressed_kv: torch.Tensor, k_pe: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Expand cached KV, including its already-rotated K columns."""
+        """Expand latent KV whose K RoPE columns are already rotated."""
         k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
-        # Small cached chunks favor one wide GEMM over two per-head launches.
-        min_strided_tokens = 4096
-        if compressed_kv.shape[0] >= min_strided_tokens and self._use_kvbproj_strided_out():
+        # Small chunks favor one wide GEMM over two per-head launches.
+        if (
+            compressed_kv.shape[0] >= _MIN_STRIDED_KV_EXPAND_TOKENS
+            and self._use_kvbproj_strided_out()
+        ):
             k = torch.empty(
                 compressed_kv.shape[0],
                 self.num_context_heads,
