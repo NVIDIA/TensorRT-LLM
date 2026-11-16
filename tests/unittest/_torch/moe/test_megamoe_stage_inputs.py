@@ -123,3 +123,21 @@ def test_stage_inputs_unscaled_activation_has_no_scale_leg(num_tokens):
             act_buffer=act_buffer,
             **{k: buffers[k] for k in ("idx_buffer", "weights_buffer")},
         )
+
+
+@pytest.mark.parametrize("num_tokens", [0, 1, 48])
+@torch.inference_mode()
+def test_stage_inputs_takes_row_strided_slices(num_tokens):
+    """Rows sliced out of wider tensors (row stride != width). One row (or none) still reports
+    ``is_contiguous()``, which callers check, but the compiled call needs compact rows."""
+    from tensorrt_llm._torch.moe.kernels.blackwell.megamoe_stage_inputs import stage_megamoe_inputs
+
+    buffers = _buffers(torch.int64)
+    idx, weights, x, x_sf = _inputs(num_tokens)
+    expected = _reference(buffers, idx, weights, x, x_sf, True)
+    wide = [torch.cat([t, torch.zeros_like(t)], dim=1) for t in (idx, weights, x, x_sf)]
+    sliced = [w[:, : t.shape[1]] for w, t in zip(wide, (idx, weights, x, x_sf))]
+    assert all(s.stride(0) != s.shape[1] for s in sliced)
+    stage_megamoe_inputs(sliced[0], sliced[1], x=sliced[2], x_sf=sliced[3], **buffers)
+    for name, value in expected.items():
+        torch.testing.assert_close(buffers[name], value, atol=0, rtol=0)

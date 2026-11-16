@@ -102,6 +102,15 @@ def _fake_rows(dtype, rows, width: int):
     return cute.runtime.make_fake_compact_tensor(dtype, (rows, width), stride_order=(1, 0))
 
 
+def _compact_rows(rows: torch.Tensor) -> torch.Tensor:
+    """``rows`` with a row stride equal to its width, which the compiled call requires of every
+    operand. A one-row (or empty) tensor reports ``is_contiguous()`` whatever its row stride, for
+    example one row of a wider tensor's column slice, so contiguity alone does not guarantee it."""
+    if rows.stride() == (rows.shape[1], 1):
+        return rows
+    return rows.clone(memory_format=torch.contiguous_format)
+
+
 @functools.cache
 def _compile_stage_inputs(top_k: int, index_dtype: torch.dtype, act_words: int, sf_words: int):
     live, rows = cute.sym_int(), cute.sym_int()
@@ -143,11 +152,18 @@ def stage_megamoe_inputs(
                 f"(x_sf is {'None' if x_sf is None else 'set'}, "
                 f"sf_buffer is {'None' if sf_buffer is None else 'set'})."
             )
-        act_src, act_dst = x.view(torch.int32), act_buffer.view(torch.int32)
+        act_src, act_dst = _compact_rows(x.view(torch.int32)), act_buffer.view(torch.int32)
         act_words = act_dst.shape[1]
         if x_sf is not None:
-            sf_src, sf_dst = x_sf.view(torch.int32), sf_buffer.view(torch.int32)
+            sf_src, sf_dst = _compact_rows(x_sf.view(torch.int32)), sf_buffer.view(torch.int32)
             sf_words = sf_dst.shape[1]
     _compile_stage_inputs(idx_buffer.shape[1], idx_buffer.dtype, act_words, sf_words)(
-        topk_idx, topk_weights, act_src, sf_src, idx_buffer, weights_buffer, act_dst, sf_dst
+        _compact_rows(topk_idx),
+        _compact_rows(topk_weights),
+        act_src,
+        sf_src,
+        idx_buffer,
+        weights_buffer,
+        act_dst,
+        sf_dst,
     )
