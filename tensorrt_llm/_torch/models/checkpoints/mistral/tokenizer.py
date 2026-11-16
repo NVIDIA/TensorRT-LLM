@@ -1,13 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import copy
 import functools
 import hashlib
 from importlib.metadata import version as package_version
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Union
 
+import numpy as np
+from mistral_common.protocol.instruct.chunk import ImageChunk, ImageURLChunk
 from mistral_common.tokens.tokenizers.base import SpecialTokenPolicy, SpecialTokens
+from mistral_common.tokens.tokenizers.image import ImageEncoder, ImageEncoding, image_from_chunk
 from mistral_common.tokens.tokenizers.sentencepiece import SentencePieceTokenizer
 from mistral_common.tokens.tokenizers.tekken import Tekkenizer
 from transformers.tokenization_mistral_common import (
@@ -19,6 +23,24 @@ from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
     import llguidance
+    from mistral_common.tokens.tokenizers.mistral import MistralTokenizer as MistralCommonTokenizer
+
+
+class _ImageGridEncoder(ImageEncoder):
+    """mistral-common's image encoder reduced to each image's token grid.
+
+    The grid of ``[IMG]``, ``[IMG_BREAK]`` and ``[IMG_END]`` tokens depends on the image size
+    alone, so a chat encodes to the same ids as with the full encoder, and no pixel is resized
+    or normalized.
+    """
+
+    def __call__(self, content: Union[ImageChunk, ImageURLChunk]) -> ImageEncoding:
+        width_tokens, height_tokens = self._image_to_num_tokens(image_from_chunk(content))
+        tokens = (
+            [self.special_ids.img] * width_tokens + [self.special_ids.img_break]
+        ) * height_tokens
+        tokens[-1] = self.special_ids.img_end
+        return ImageEncoding(tokens=tokens, image=np.empty((0, 0, 0), dtype=np.float32))
 
 
 # Adapted from:
@@ -83,6 +105,29 @@ class MistralTokenizer(TransformersTokenizer):
             "file_sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest(),
             "mistral_common": package_version("mistral_common"),
         }
+
+    @functools.cached_property
+    def grid_only_mistral(self) -> "MistralCommonTokenizer":
+        """``self.mistral`` with an image encoder that makes each image's token grid only.
+
+        It encodes a chat to the same ids as ``self.mistral``, and an image needs only its
+        size: no pixel is resized or normalized. Chat rendering uses it; the input
+        processor encodes the pixels.
+        """
+        image_encoder = getattr(self.instruct, "image_encoder", None)
+        if image_encoder is None:
+            return self.mistral
+        instruct = copy.copy(self.instruct)
+        instruct.image_encoder = _ImageGridEncoder(
+            image_encoder.image_config, image_encoder.special_ids
+        )
+        # The constructor, not copy.copy: mistral-common pickles (and so copies) a
+        # tokenizer by reloading its file.
+        return type(self.mistral)(
+            instruct,
+            self.mistral._chat_completion_request_validator,
+            self.mistral._instruct_request_normalizer,
+        )
 
     def _get_special_tokens(self, all_special_ids: list[int]) -> list[str]:
         from mistral_common.tokens.tokenizers.base import SpecialTokenPolicy

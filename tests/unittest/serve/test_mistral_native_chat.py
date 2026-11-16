@@ -55,12 +55,15 @@ _CITY_FORMAT = {
 
 
 class _RecordingTokenizer:
+    """Records each mistral-common request the renderer encodes."""
+
     def __init__(self):
         self.calls = []
+        self.grid_only_mistral = SimpleNamespace(encode_chat_completion=self._encode)
 
-    def apply_chat_template(self, messages, **kwargs):
-        self.calls.append((messages, kwargs))
-        return [1]
+    def _encode(self, request):
+        self.calls.append(request)
+        return SimpleNamespace(tokens=[1])
 
 
 def _render(tokenizer, messages, *, add_generation_prompt=True, counts=None, **kwargs):
@@ -100,20 +103,12 @@ def test_the_renderer_gets_only_what_mistral_common_reads():
         documents=[{"title": "t", "text": "x"}],
     )
     _render(tokenizer, _HI)
-    (_, kwargs), (_, unset) = tokenizer.calls
-    assert kwargs == {
-        "tools": [
-            {"type": "function", "function": {"name": "a", "description": None}},
-            {"type": "function", "function": {"name": "b", "strict": True}},
-        ],
-        "continue_final_message": False,
-        "tokenize": True,
-        "return_dict": False,
-        "return_tensors": None,
-        "reasoning_effort": "high",
-    }
+    request, unset = tokenizer.calls
+    # A null `strict` is dropped: mistral-common refuses it.
+    assert [tool.function.name for tool in request.tools] == ["a", "b"]
+    assert str(getattr(request.reasoning_effort, "value", request.reasoning_effort)) == "high"
     assert tools == original
-    assert "reasoning_effort" not in unset  # left to the checkpoint
+    assert unset.reasoning_effort is None  # left to the checkpoint
 
 
 @pytest.mark.parametrize(
@@ -138,7 +133,8 @@ def test_generation_flags_must_agree_with_the_final_message(
     )
     if match is None:
         _render(tokenizer, messages, **kwargs)
-        assert tokenizer.calls[0][1]["continue_final_message"] is True
+        # mistral-common continues the final assistant message as a prefix.
+        assert tokenizer.calls[0].messages[-1].prefix is True
         return
     with pytest.raises(ValueError, match=match):
         _render(tokenizer, messages, **kwargs)
@@ -389,3 +385,41 @@ def test_reasoning_effort_renders_where_the_checkpoint_declares_it(tokenizer):
     assert high != _mistral_ids(tokenizer, _HI, reasoning_effort="none")
     with pytest.raises(ValueError, match="reasoning_effort"):
         _server_ids(tokenizer, messages=_HI, chat_template_kwargs={"reasoning_effort": "turbo"})
+
+
+def _user_with_image(size):
+    return [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Describe."},
+                {"type": "image_url", "image_url": {"url": _image_url(3, size)}},
+            ],
+        }
+    ]
+
+
+# (height, width): tiny, larger than any max_image_size on either side, and extreme aspects.
+@pytest.mark.parametrize("size", [(1, 1), (2000, 24), (24, 2000), (1541, 1541), (7, 1543)])
+def test_image_grids_render_from_the_image_size_alone(tokenizer, size, monkeypatch):
+    """A chat renders the grids mistral-common makes of the images, processing no pixel."""
+    pytest.importorskip("cv2")  # the oracle resizes with OpenCV
+    from mistral_common.tokens.tokenizers import image as mistral_image
+
+    messages = _user_with_image(size)
+    expected = _mistral_ids(tokenizer, messages)
+
+    def no_pixel_work(*args, **kwargs):
+        raise AssertionError("rendering processed or serialized pixels")
+
+    monkeypatch.setattr(mistral_image, "transform_image", no_pixel_work)
+    monkeypatch.setattr(Image.Image, "save", no_pixel_work)
+    assert _server_ids(tokenizer, messages=messages) == expected
+
+
+def test_the_grid_only_tokenizer_shares_everything_but_pixel_work(tokenizer):
+    grid_only = tokenizer.grid_only_mistral
+    assert grid_only.instruct_tokenizer.tokenizer is tokenizer.tokenizer
+    assert grid_only.instruct_tokenizer is not tokenizer.instruct
+    assert tokenizer.instruct.image_encoder is not grid_only.instruct_tokenizer.image_encoder
+    assert tokenizer.grid_only_mistral is grid_only  # built once

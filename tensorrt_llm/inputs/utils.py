@@ -6,8 +6,8 @@ import base64
 from collections import defaultdict
 from io import BytesIO
 from pathlib import Path
-from typing import (Any, Collection, Coroutine, Dict, List, NamedTuple,
-                    Optional, Tuple, TypedDict, Union)
+from typing import (TYPE_CHECKING, Any, Collection, Coroutine, Dict, List,
+                    NamedTuple, Optional, Tuple, TypedDict, Union)
 from urllib.parse import urlparse
 
 import numpy as np
@@ -42,6 +42,10 @@ from tensorrt_llm.tokenizer import TokenizerBase, TransformersTokenizer
 from tensorrt_llm.tokenizer.deepseek_v4 import DeepseekV4Tokenizer
 from tensorrt_llm.tokenizer.deepseek_v32 import DeepseekV32Tokenizer
 from tensorrt_llm.tokenizer.deepseek_v41 import DeepseekV41Tokenizer
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.models.checkpoints.mistral.tokenizer import \
+        MistralTokenizer
 
 logger = logging.get_logger(__name__)
 
@@ -848,35 +852,56 @@ def _native_mistral_response_format(response_format):
                                                      named.get("strict"))))
 
 
-def _encode_native_mistral_chat(tokenizer, messages, *, tools,
-                                continue_final_message, reasoning_effort,
-                                response_format):
-    """Token ids of a chat encoded by mistral-common with a response format.
+# The URL of each image part in the messages `_native_mistral_messages` builds;
+# `_encode_native_mistral_chat` puts an image of the loaded image's size there.
+_NATIVE_MISTRAL_IMAGE_SLOT = "trtllm-loaded-image"
 
-    This passes the request to mistral-common as transformers'
-    `apply_chat_template` does, adding the response format it does not forward.
+
+def _encode_native_mistral_chat(tokenizer: "MistralTokenizer",
+                                messages: list[dict[str, Any]],
+                                image_sizes: list[tuple[int, int]], *,
+                                tools: Optional[list[dict[str, Any]]],
+                                continue_final_message: bool,
+                                reasoning_effort: Optional[str],
+                                response_format: Optional[Any]) -> list[int]:
+    """Token ids of a chat, encoded by mistral-common.
+
+    The image parts are slots that take, in order, a blank image of each
+    `image_sizes` entry (width, height): mistral-common makes an image's token
+    grid from its size alone, and the tokenizer's `grid_only_mistral` makes
+    the grid without processing pixels, which the input processor does.
+    `response_format` is mistral-common's, or None.
     """
+    from mistral_common.protocol.instruct.chunk import ImageChunk, ImageURLChunk
     from mistral_common.protocol.instruct.request import ChatCompletionRequest
 
-    def image_url(part):
-        if part.get("type") != "image" or "base64" not in part:
-            return part
-        url = part["base64"]
-        if not url.startswith("data:image"):
-            url = "data:image/unk;base64," + url
-        return {"type": "image_url", "image_url": {"url": url}}
-
-    openai_messages = [{
-        **message, "content": [image_url(part) for part in message["content"]]
-    } if isinstance(message.get("content"), list) else message
-                       for message in messages]
+    # mistral-common before 1.13.0 has no response formats.
+    request_kwargs = ({} if response_format is None else {
+        "response_format": response_format
+    })
     request = ChatCompletionRequest.from_openai(
-        messages=openai_messages,
+        messages=messages,
         tools=tools,
         continue_final_message=continue_final_message,
         reasoning_effort=reasoning_effort,
-        response_format=response_format)
-    return tokenizer.mistral.encode_chat_completion(request).tokens
+        **request_kwargs)
+    filled = 0
+    for message in request.messages:
+        content = getattr(message, "content", None)
+        if not isinstance(content, list):
+            continue
+        chunks = []
+        for chunk in content:
+            if isinstance(chunk, ImageURLChunk) and chunk.get_url(
+            ) == _NATIVE_MISTRAL_IMAGE_SLOT:
+                chunk = ImageChunk(image=Image.new("1", image_sizes[filled]))
+                filled += 1
+            chunks.append(chunk)
+        message.content = chunks
+    if filled != len(image_sizes):
+        raise ValueError(f"The chat has {filled} image slots for "
+                         f"{len(image_sizes)} images.")
+    return tokenizer.grid_only_mistral.encode_chat_completion(request).tokens
 
 
 def _native_mistral_tools(tools):
@@ -913,8 +938,16 @@ def _validate_native_mistral_chat_args(messages, add_generation_prompt,
                          "the last message is not from the assistant.")
 
 
-def _native_mistral_messages(conversation, mm_placeholder_counts, mm_data):
-    """Restore resolved images at their original positions in each chat turn."""
+def _native_mistral_messages(
+    conversation: list[ConversationMessage],
+    mm_placeholder_counts: list[dict[str, int]],
+    mm_data: Optional[Dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[tuple[int, int]]]:
+    """The chat as OpenAI messages, each image part in its place, and the image sizes.
+
+    Each image part is a slot (see `_encode_native_mistral_chat`); the sizes,
+    (width, height) in the order of the slots, are those of the loaded images.
+    """
     from tensorrt_llm._torch.models.modeling_mistral import \
         MistralCommonImageProcessor
 
@@ -932,7 +965,7 @@ def _native_mistral_messages(conversation, mm_placeholder_counts, mm_data):
             f"The chat has {num_placeholders} images, but {len(images)} were "
             "loaded for rendering; this route does not take images for "
             "Mistral-native checkpoints.")
-    image_index = 0
+    image_sizes = []
     messages = []
     for conv, counts in zip(conversation, mm_placeholder_counts):
         message = {
@@ -942,16 +975,21 @@ def _native_mistral_messages(conversation, mm_placeholder_counts, mm_data):
         }
         if counts or conv.get("content_parts"):
             content = _build_openai_content(conv, counts)
-            for part in content:
+            for index, part in enumerate(content):
                 if part["type"] == "text":
                     continue
-                part["base64"] = encode_base64_image(
-                    MistralCommonImageProcessor.to_pil_image(
-                        images[image_index]))
-                image_index += 1
+                content[index] = {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": _NATIVE_MISTRAL_IMAGE_SLOT
+                    }
+                }
+                image_sizes.append(
+                    MistralCommonImageProcessor.pil_image_size(
+                        images[len(image_sizes)]))
             message["content"] = content
         messages.append(message)
-    return messages
+    return messages, image_sizes
 
 
 def apply_chat_template(
@@ -998,8 +1036,8 @@ def apply_chat_template(
                 "The Mistral-native format renders chats with "
                 "mistral-common's MistralTokenizer, not an HF tokenizer "
                 f"({type(tokenizer).__name__})")
-        messages = _native_mistral_messages(conversation, mm_placeholder_counts,
-                                            mm_data)
+        messages, image_sizes = _native_mistral_messages(
+            conversation, mm_placeholder_counts, mm_data)
         requested = chat_template_kwargs or {}
         continue_final_message = bool(
             requested.get("continue_final_message", False))
@@ -1018,31 +1056,18 @@ def apply_chat_template(
             requested.get("response_format"))
         # mistral-common validates the request against the checkpoint (for
         # example a reasoning effort its tekken.json does not declare); its
-        # errors are invalid requests.
+        # errors are invalid requests. add_generation_prompt only selects the
+        # validation above: the encoder always opens the assistant turn after
+        # a final user or tool message.
         try:
-            if response_format is not None:
-                return _encode_native_mistral_chat(
-                    tokenizer,
-                    messages,
-                    tools=_native_mistral_tools(tools),
-                    continue_final_message=continue_final_message,
-                    reasoning_effort=requested.get("reasoning_effort"),
-                    response_format=response_format)
-            native_kwargs = {}
-            if requested.get("reasoning_effort") is not None:
-                native_kwargs["reasoning_effort"] = requested[
-                    "reasoning_effort"]
-            # add_generation_prompt only selects the validation above: the
-            # encoder always opens the assistant turn after a final user or
-            # tool message.
-            return tokenizer.apply_chat_template(
+            return _encode_native_mistral_chat(
+                tokenizer,
                 messages,
+                image_sizes,
                 tools=_native_mistral_tools(tools),
                 continue_final_message=continue_final_message,
-                tokenize=True,
-                return_dict=False,
-                return_tensors=None,
-                **native_kwargs)
+                reasoning_effort=requested.get("reasoning_effort"),
+                response_format=response_format)
         except MistralCommonException as error:
             raise ValueError(str(error)) from error
 
