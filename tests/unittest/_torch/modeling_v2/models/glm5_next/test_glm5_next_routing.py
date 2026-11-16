@@ -694,6 +694,16 @@ def test_tp4_engine_routes_to_the_tp4_target(mode, sm, spec_config, layout, monk
             _FUSED,
             "tokens_per_block 32",
         ),
+        # the step program binds the cache pools once, and a rebalance resizes them
+        (
+            None,
+            _TP4,
+            dict(
+                kv_cache_config=KvCacheConfig(tokens_per_block=128, enable_kv_pool_rebalance=True)
+            ),
+            _SPLIT,
+            "KV pool rebalance",
+        ),
         # the step program's head takes up to 256 sequences per step (the LLM API's default
         # max_batch_size is 2048)
         (None, _TP4, dict(max_batch_size=512), _SPLIT, "max_batch_size 512"),
@@ -707,6 +717,7 @@ def test_tp4_engine_routes_to_the_tp4_target(mode, sm, spec_config, layout, monk
         "vanilla-mtp",
         "fp8-kv",
         "pages-32",
+        "pool-rebalance",
         "batch-512",
         "max-num-tokens-8190",
     ],

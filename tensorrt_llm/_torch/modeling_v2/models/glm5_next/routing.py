@@ -211,6 +211,13 @@ def _tp4_refused(model_config: ModelConfig, llm_args: TorchLlmArgs, spec_config:
             f"tokens_per_block {kv_cache_config.tokens_per_block} (its kernels address "
             f"{_TP4_TOKENS_PER_BLOCK}-token pages)"
         )
+    # The step program reads the cache pools' addresses and sizes once, and its kernels'
+    # tensor maps declare those sizes; a rebalance resizes the pools.
+    if kv_cache_config.enable_kv_pool_rebalance:
+        refused.append(
+            "KV pool rebalance (its step program binds the cache pools at the sizes they "
+            "start with: kv_cache_config.enable_kv_pool_rebalance False)"
+        )
     if llm_args.max_batch_size is not None and llm_args.max_batch_size > _TP4_MAX_BATCH:
         refused.append(
             f"max_batch_size {llm_args.max_batch_size} (it takes up to {_TP4_MAX_BATCH} "

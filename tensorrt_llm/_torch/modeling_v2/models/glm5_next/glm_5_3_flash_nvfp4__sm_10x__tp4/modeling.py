@@ -161,10 +161,15 @@ def _view(addr: int, dtype: torch.dtype, shape: list[int]) -> torch.Tensor:
 
 
 class _Pools:
-    """The cache manager's per-layer pool views (stable for the manager's lifetime) as the step
-    program's `Pools`, their strides checked against the layouts the kernels address."""
+    """The cache manager's per-layer pool views as the step program's `Pools`, their strides
+    checked against the layouts the kernels address. The views, and the row counts the kernels'
+    tensor maps declare, are read once: they are stable for the manager's lifetime because the
+    target does not run with KV pool rebalance, which resizes the pools."""
 
     def __init__(self, mgr, mla_layers: list[int], kda_layers: list[int], spec: bool):
+        assert not mgr.kv_cache_config.enable_kv_pool_rebalance, (
+            "a KV pool rebalance resizes the pools this target binds once"
+        )
         bf16, f32 = torch.bfloat16, torch.float32
         lat_l, idx_l, lat_rows, idx_rows = [], [], [], []
         lat_pr = idx_pr = None
