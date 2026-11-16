@@ -1,6 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the GLM-5.2 target's cute_dsl_indexer_k_cache_update entry."""
+"""GPU test for the GLM-5.2 target's cute_dsl_indexer_k_cache_update entry.
+
+The `f32_input` cells are the served context path: the keys are the fp32 columns 0..127 of
+the indexer projection's `[T, 160]` output, read in place. Beyond the reference, those
+launchers must write the bytes the bf16 launchers write on the same keys rounded to bf16
+(what the column split gave the K write before), bit for bit.
+"""
 
 import zlib
 
@@ -28,16 +34,22 @@ PAGE, TOKEN_BYTES = 32, 132
 LAYER = 3
 POISON = 0xA7
 THETA = 8.0e6  # the checkpoint's `rope_theta`
+#: The context indexer projection's fp32 output row: 128 key columns, then 32 head weights.
+PROJ_PITCH = 160
 
 _COMPILED: dict = {}
 
 
-def _compiled(cache_contiguous: bool):
-    if cache_contiguous not in _COMPILED:
-        _COMPILED[cache_contiguous] = build(
-            torch.cuda.current_device(), is_neox=False, cache_contiguous=cache_contiguous
+def _compiled(cache_contiguous: bool, f32_input: bool = False):
+    key = (cache_contiguous, f32_input)
+    if key not in _COMPILED:
+        _COMPILED[key] = build(
+            torch.cuda.current_device(),
+            is_neox=False,
+            cache_contiguous=cache_contiguous,
+            f32_input=f32_input,
         )
-    return _COMPILED[cache_contiguous]
+    return _COMPILED[key]
 
 
 def _rope_table(positions: int) -> torch.Tensor:
@@ -57,6 +69,8 @@ def _build(spec, seed):
     `[blocks, page, 1, 132]` view of it. Each token gets a distinct (page, slot)
     and the TRT-LLM slot pair: codes at `block * page * 132 + slot * 128`, the
     scale at `block * page * 132 + page * 128 + slot * 4`. Padding rows get -1.
+    With `f32_input` the keys are fp32 columns 0..127 of a `[tokens, 160]` buffer (the
+    projection output), with values that are not bf16, so the rounding on load is exercised.
     """
     g = torch.Generator(device="cuda").manual_seed(seed)
     cpu = torch.Generator().manual_seed(seed)
@@ -66,7 +80,12 @@ def _build(spec, seed):
     k_cache = pool[:, layer, :].view(blocks, PAGE, 1, TOKEN_BYTES)
 
     keys = torch.randn(tokens, HEAD_DIM, generator=g, device="cuda") * 3.0 + 0.5
-    if spec["misalign"]:
+    if spec.get("f32_input"):
+        proj = torch.randn(tokens, PROJ_PITCH, generator=g, device="cuda")
+        proj[:, :HEAD_DIM] = keys
+        indexer_k = proj[:, :HEAD_DIM]
+        assert indexer_k.stride() == (PROJ_PITCH, 1)
+    elif spec["misalign"]:
         storage = torch.empty(tokens * HEAD_DIM + 1, dtype=torch.bfloat16, device="cuda")
         indexer_k = storage[1:].view(tokens, HEAD_DIM)
         indexer_k.copy_(keys)
@@ -145,7 +164,7 @@ def _compare(k_cache, expected, fp8_slot, scale_slot, num_tokens) -> None:
 def test_certified_cells(cell) -> None:
     args, pool, layer = _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % 2**31)
     k_cache = args[5]
-    compiled = _compiled(k_cache.is_contiguous())
+    compiled = _compiled(k_cache.is_contiguous(), bool(cell.spec.get("f32_input")))
     # The reference reads the bytes it does not write, so it runs first.
     expected = op.reference(*args, is_neox=False, compiled=compiled)
     pool_before = pool.clone()
@@ -156,6 +175,31 @@ def test_certified_cells(cell) -> None:
     others = [i for i in range(pool.shape[1]) if i != layer]
     assert torch.equal(pool[:, others], pool_before[:, others]), "another layer was written"
     _compare(k_cache, expected, args[6], args[7], args[8])
+
+
+#: Context row counts the fp32-key launchers serve (65..8192; the decode handles take at most
+#: 64): partial and full 128-row tiles, both sides of the 1024-row launcher switch, odd counts.
+F32_ROWS = [65, 77, 127, 128, 129, 1024, 1025, 1099, 3001, 4097, 7293, 7999, 8191, 8192]
+
+
+@pytest.mark.parametrize("rows", F32_ROWS)
+def test_f32_keys_write_the_bf16_launchers_bytes(rows) -> None:
+    """The served fp32-key launchers == the bf16 launchers on the keys rounded to bf16, every
+    pool byte (codes, scales, the bytes around them and the other layers), bitwise."""
+    spec = dict(tokens=rows, pool_layers=4, blocks=(rows + PAGE - 1) // PAGE + 3, pad_rows=0,
+                misalign=False, f32_input=True)  # fmt: skip
+    args, pool, _ = _build(spec, seed=zlib.crc32(f"f32 {rows}".encode()) % 2**31)
+    again, pool_bf16, _ = _build(spec, seed=zlib.crc32(f"f32 {rows}".encode()) % 2**31)
+    again = list(again)
+    again[0] = args[0].to(torch.bfloat16)  # round to nearest even, as the split's copy did
+    assert args[0].dtype == torch.float32 and again[0].is_contiguous()
+    op(*args, is_neox=False, compiled=_compiled(False, True))
+    op(*again, is_neox=False, compiled=_compiled(False, False))
+    torch.cuda.synchronize()
+    assert int((pool != POISON).sum()) >= rows * HEAD_DIM // 2, "few K-cache bytes written"
+    assert torch.equal(pool, pool_bf16), (
+        f"rows {rows}: {int((pool != pool_bf16).sum())} pool bytes differ from the bf16 launchers"
+    )
 
 
 def test_a_capturable_call_matches_the_validated_one() -> None:

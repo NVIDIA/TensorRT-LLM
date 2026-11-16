@@ -5,15 +5,17 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, List, Optional
 
 import torch
+from torch import nn
 
 from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm.logger import logger
 
 from ..attention.backends import AttentionMetadata
 from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.scheduler import ScheduledRequests
-from .interface import SpecMetadata, SpecWorkerBase
+from .interface import DraftRowPick, SpecMetadata, SpecWorkerBase
 from .sa_enhancer import SADraftEnhancer
 
 if TYPE_CHECKING:
@@ -271,6 +273,7 @@ class MTPWorker(SpecWorkerBase):
             model_config, "mapping", None)
         self.is_thop = False
         self._is_mamba_hybrid_cache = None
+        self._row_pick = DraftRowPick("MTP layers")
         self.sa_enhancer: Optional[SADraftEnhancer] = None
         if spec_config.sa_config is not None:
             self.sa_enhancer = SADraftEnhancer(spec_config.sa_config.threshold)
@@ -278,6 +281,16 @@ class MTPWorker(SpecWorkerBase):
     @property
     def max_draft_len(self) -> int:
         return self.spec_config.max_draft_len
+
+    def _mtp_layers_pick_rows(self, draft_model: nn.Module) -> bool:
+        """Whether the MTP layers take ``pick_rows`` (see
+        draft_layer_picks_rows). Declined under attention DP, where this
+        worker passes the MTP layers no per-rank token counts."""
+        adp = self.mapping is not None and self.mapping.enable_attention_dp
+        return self._row_pick.resolve(list(
+            getattr(draft_model, "mtp_layers", None) or ()),
+                                      self.mapping,
+                                      decline="attention DP" if adp else None)
 
     def _commit_target_mamba_states(
         self,
@@ -473,6 +486,16 @@ class MTPWorker(SpecWorkerBase):
         draft_kv_cache_manager = self.get_draft_kv_cache_manager(
             resource_manager)
 
+        # Each MTP module reads its output on the last row of every request
+        # only (the LM-head input and the next module's carried hidden state),
+        # so a supporting layer runs its post-attention part on those rows.
+        picks_rows = self._mtp_layers_pick_rows(draft_model)
+        if picks_rows:
+            logger.info_once(
+                f"MTP layers pick {batch_size} of "
+                f"{draft_inputs['input_ids'].shape[0]} rows after attention",
+                key="spec_mtp_pick_rows")
+
         with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
             for i, mtp_layer in enumerate(
                     draft_model.mtp_layers[:runtime_draft_len]):
@@ -482,12 +505,23 @@ class MTPWorker(SpecWorkerBase):
                                                         num_accepted_tokens,
                                                         draft_step=i)
 
+                if picks_rows:
+                    draft_inputs["pick_rows"] = last_tokens_idx
                 hidden_states = mtp_layer(embed_tokens=draft_model.embed_tokens,
                                           **draft_inputs)
+                # The rows of the requests' last tokens, in request order.
+                last_rows = (slice(None) if picks_rows else last_tokens_idx)
 
-                logits = mtp_layer.shared_head(hidden_states,
-                                               draft_model.lm_head,
-                                               attn_metadata).float()
+                if picks_rows:
+                    # The output holds only the last rows: the head takes
+                    # every row it is given (return_context_logits).
+                    logits = mtp_layer.shared_head(hidden_states,
+                                                   draft_model.lm_head,
+                                                   attn_metadata, True).float()
+                else:
+                    logits = mtp_layer.shared_head(hidden_states,
+                                                   draft_model.lm_head,
+                                                   attn_metadata).float()
                 if self.guided_decoder is not None:
                     self.guided_decoder.execute_draft_batch(logits,
                                                             draft_step=i)
@@ -504,7 +538,7 @@ class MTPWorker(SpecWorkerBase):
                 draft_hidden_states = draft_inputs["hidden_states"]
                 draft_hidden_states[:-1] = draft_hidden_states[1:].clone()
                 draft_hidden_states[last_tokens_idx] = hidden_states[
-                    last_tokens_idx, :]
+                    last_rows, :]
                 draft_inputs = {
                     "input_ids": input_ids,
                     "position_ids": draft_inputs["position_ids"],

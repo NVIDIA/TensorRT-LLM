@@ -96,6 +96,7 @@ def make_batch(
         has_initial_states=torch.tensor(has_init, dtype=torch.bool, device="cuda"),
         use_initial_states=any(has_init),
         state_indices=indices,
+        replay_state_indices=indices,
         query_start_loc=cu.to(torch.int32),
         query_start_loc_long=cu,
         kda_max_seqlen=max(lengths, default=0),

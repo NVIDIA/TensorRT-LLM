@@ -10,6 +10,7 @@ import torch
 
 from tensorrt_llm.bindings.executor import KvCacheRetentionConfig
 from tensorrt_llm.runtime import kv_cache_manager_v2 as kv
+from tensorrt_llm.runtime.kv_cache_manager_v2 import _introspection
 
 pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),
@@ -296,6 +297,96 @@ def test_ssm_buffer_reuse_policies(length):
         manager.shutdown()
 
 
+def test_sink_required_claims_sinks_and_selects_window():
+    """SINK_REQUIRED_ONLY sinks constrain the match and are claimed with it; the window stays OPTIONAL."""
+    policy = kv.ReusePolicy.SINK_REQUIRED_ONLY
+    buffers = [kv.BufferConfig(role="key", size=4096)]
+    layers = [
+        kv.AttentionLayerConfig(layer_id=0, buffers=buffers),
+        # One sink block and a one-block window.
+        kv.AttentionLayerConfig(
+            layer_id=1,
+            buffers=buffers,
+            sliding_window_size=4,
+            num_sink_tokens=4,
+            reuse_policy=policy,
+        ),
+        # Two sink blocks, so a 6-token prefix ends inside the sinks.
+        kv.AttentionLayerConfig(
+            layer_id=2,
+            buffers=buffers,
+            sliding_window_size=4,
+            num_sink_tokens=8,
+            reuse_policy=policy,
+        ),
+    ]
+    config = kv.KVCacheManagerConfig(
+        tokens_per_block=4, cache_tiers=[kv.GpuCacheTierConfig(quota=4 << 20)], layers=layers
+    )
+    stream = torch.cuda.Stream()
+    manager = kv.KVCacheManager(config)
+    caches = []
+    tokens = list(range(16))
+    try:
+        source = manager.create_kv_cache(None, [], expected_prompt_length=16)
+        caches.append(source)
+        assert source.resume(stream.cuda_stream)
+        assert source.resize(16)
+        source.commit(tokens)
+        one_sink, two_sinks = (manager.get_layer_group_id(i) for i in (1, 2))
+        old = {group: source.get_base_page_indices(group).copy() for group in (one_sink, two_sinks)}
+        source.close()
+
+        # Window present: selecting it reuses the old window as well as the sinks.
+        warm = manager.create_kv_cache(None, tokens)
+        caches.append(warm)
+        status = warm.reuse_status[one_sink]
+        assert status.policy == policy and status.complete and status.endpoint == 16
+        assert list(status.coverage) == [(0, 4), (12, 16)]
+        assert warm.resume(stream.cuda_stream, optional_reuse_groups=[one_sink])
+        assert warm.get_base_page_indices(one_sink)[0] == old[one_sink][0]
+        assert warm.get_base_page_indices(one_sink)[3] == old[one_sink][3]
+
+        # Endpoint inside a block: the window cannot be selected, the sinks are still claimed.
+        mid = manager.create_kv_cache(None, tokens[:14])
+        caches.append(mid)
+        assert mid.num_committed_tokens == 14 and not mid.reuse_status[one_sink].complete
+        assert mid.resume(stream.cuda_stream, optional_reuse_groups=[])
+        assert mid.get_base_page_indices(one_sink)[0] == old[one_sink][0]
+        assert mid.get_base_page_indices(one_sink)[3] != old[one_sink][3]
+
+        # Prefix ends inside the sinks: the claimed partial sink is copied, as for REQUIRED.
+        short = manager.create_kv_cache(None, tokens[:6])
+        caches.append(short)
+        assert short.num_committed_tokens == 6
+        assert short.resume(stream.cuda_stream, optional_reuse_groups=[])
+        assert short.get_base_page_indices(two_sinks)[0] == old[two_sinks][0]
+        assert short.get_base_page_indices(two_sinks)[1] != old[two_sinks][1]
+
+        # Window evicted: the match keeps its length and only the window gets fresh pages.
+        _introspection.drop_optional_pages(warm, 16, [one_sink])
+        cold = manager.create_kv_cache(None, tokens)
+        caches.append(cold)
+        status = cold.reuse_status[one_sink]
+        assert cold.num_committed_tokens == 16
+        assert not status.complete and not list(status.coverage)
+        with pytest.raises(ValueError):
+            cold.resume(stream.cuda_stream, optional_reuse_groups=[one_sink])
+        assert cold.resume(stream.cuda_stream, optional_reuse_groups=[])
+        assert cold.get_base_page_indices(one_sink)[0] == old[one_sink][0]
+        assert cold.get_base_page_indices(one_sink)[3] != old[one_sink][3]
+
+        # Sink evicted: the match is shortened, as for REQUIRED.
+        _introspection.drop_optional_pages(warm, 4, [one_sink])
+        gone = manager.create_kv_cache(None, tokens)
+        caches.append(gone)
+        assert gone.num_committed_tokens == 0
+    finally:
+        for cache in reversed(caches):
+            cache.close()
+        manager.shutdown()
+
+
 @pytest.mark.parametrize("length", [7, 8])
 @pytest.mark.parametrize("select_optional", [False, True])
 def test_attention_buffer_reuse_policies(length, select_optional):
@@ -385,12 +476,12 @@ def test_scratch_addresses_with_unequal_buffer_membership(split):
         assert cache.resume(stream.cuda_stream)
         assert cache.resize(64)
         required = manager.get_buffer_group_id(0, "key")
-        scratch = cache.get_scratch_desc(required)
-        assert scratch is not None
-        blocks = scratch.range.end - scratch.range.beg
+        scratch_range = cache.get_swa_scratch_range(required)
+        assert scratch_range
+        blocks = scratch_range.end - scratch_range.beg
         # The side pool has one buffer for each of two layers and needs half
         # a slot per logical block, more than K/V's two-fifths share.
-        assert len(scratch.slot_ids) == (blocks + 1) // 2
+        assert len(cache.get_scratch_slots(required)) == (blocks + 1) // 2
         for layer in layers:
             spans = []
             for buffer in layer.buffers:
@@ -399,7 +490,8 @@ def test_scratch_addresses_with_unequal_buffer_membership(split):
                 indices = converter(
                     cache.get_base_page_indices(group),
                     kv.PageIndexMode.PER_LAYER,
-                    cache.get_scratch_desc(group),
+                    cache.get_swa_scratch_range(group),
+                    cache.get_scratch_slots(group),
                 )
                 base = manager.get_mem_pool_base_address(
                     layer.layer_id, buffer.role, kv.PageIndexMode.PER_LAYER
@@ -414,3 +506,20 @@ def test_scratch_addresses_with_unequal_buffer_membership(split):
     finally:
         cache.close()
         manager.shutdown()
+
+
+@pytest.mark.parametrize("window", [None, 4])
+@pytest.mark.parametrize("on_buffer", [False, True])
+def test_sink_required_only_needs_window_and_sinks(on_buffer, window):
+    policy = kv.ReusePolicy.SINK_REQUIRED_ONLY
+    buffer = kv.BufferConfig(role="key", size=4096, reuse_policy=policy if on_buffer else None)
+    layer = kv.AttentionLayerConfig(
+        layer_id=0,
+        buffers=[buffer],
+        sliding_window_size=window,
+        reuse_policy=kv.ReusePolicy.REQUIRED if on_buffer else policy,
+    )
+    with pytest.raises(ValueError, match="requires a sliding window with sink tokens"):
+        kv.KVCacheManagerConfig(
+            tokens_per_block=4, cache_tiers=[kv.GpuCacheTierConfig(quota=4 << 20)], layers=[layer]
+        )

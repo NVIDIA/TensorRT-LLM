@@ -31,6 +31,30 @@ def test_fresh_confidence_spends_budget_on_the_best_real_row():
     assert result.kv_correction.tolist() == [-3, -2, -1, 0, -1, 0, 0, 0]
 
 
+def test_sync_rows_ranks_the_shared_rows_instead_of_the_local_ones():
+    local = torch.tensor([[-10.0] * 5, [10.0] * 5])
+    shared = torch.tensor([[10.0] * 5, [-10.0] * 5, [10.0] * 5, [10.0] * 5])
+    seen = []
+
+    def sync_rows(rows):
+        seen.append(rows.clone())
+        return shared
+
+    result = select_windows_device(
+        confidence_logits=local,
+        slot_idx=torch.tensor([0, 1, 0, 0]),
+        num_real=torch.tensor(2),
+        budget=torch.tensor(2),
+        graph_num_tokens=8,
+        cfg=DSparkScheduleConfig(block_size=5, min_verify_len=1),
+        pad_len=1,
+        sync_rows=sync_rows,
+    )
+
+    assert seen[0].tolist() == [[-10.0] * 5, [10.0] * 5, [-10.0] * 5, [-10.0] * 5]
+    assert result.verify_lens.tolist() == [4, 2, 1, 1]
+
+
 def test_stale_row_fails_open_to_neutral_confidence():
     result = select_windows_device(
         confidence_logits=torch.full((2, 5), -10.0),

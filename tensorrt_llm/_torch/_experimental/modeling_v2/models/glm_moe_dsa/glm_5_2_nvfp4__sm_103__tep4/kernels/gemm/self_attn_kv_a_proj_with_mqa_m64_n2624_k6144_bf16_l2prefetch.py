@@ -47,6 +47,14 @@ SCHEDULE_BY_M = {
     32: tgv_instance(TgvSchedule(32, 128, 8, split_k=2)),
     48: _DECODE_LARGE,
     64: _DECODE_LARGE,
+    # MTP3 / MTP5 (the tcgen05 cells stop at 64): persistent 2-CTA (128, 64), 21 x 2 / 3
+    # clusters. B300, cold weights, us: 128 rows 11.07-11.14 ((64, 64) c1x1 11.41, c4x1
+    # 12.06-12.42, TGV split-K 2 15.69); 192 rows 11.32-11.36 ((128, 96) 11.62, (64, 64)
+    # 12.12, (64, 96) 14.58-14.93, TGV split-K 3 16.29); the PDL wait/signal role measured
+    # 0.2-0.3 us slower here. The context MXF8 quant + GEMM those decode rows took: 13.24-14.03
+    # / 13.76-14.61; the bf16 prefill GEMM 22.93 / 22.92.
+    128: persistent_instance(GemmSchedule(True, (128, 64), (2, 1), raster_along="n")),
+    192: persistent_instance(GemmSchedule(True, (128, 64), (2, 1), raster_along="n")),
 } | context_instances(
     persistent_instance(GemmSchedule(True, (256, 192), (2, 1))),
     persistent_instance(GemmSchedule(True, (256, 256), (2, 1))),
@@ -54,5 +62,7 @@ SCHEDULE_BY_M = {
     persistent_instance(GemmSchedule(True, (256, 256), (2, 1))),
 )
 SUPPORTED_M_VALUES = tuple(SCHEDULE_BY_M)
+# The decode row counts above 64, built only for an engine drafting more than one token.
+MTP_DECODE_M_VALUES = (128, 192)
 
 build = make_build(ABI, SCHEDULE_BY_M)

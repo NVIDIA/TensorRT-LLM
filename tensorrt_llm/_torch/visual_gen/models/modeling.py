@@ -100,6 +100,25 @@ class BaseDiffusionModel(nn.Module):
         Subclasses should call ``super()`` unless they intentionally replace
         the shared registrations.
         """
+        quant_config = self.model_config.attention.quant_attention_config
+        if (
+            quant_config is not None
+            and quant_config.vc_attention
+            and not quant_config.vc_repair_budget
+        ):
+            from tensorrt_llm._torch.visual_gen.attention.backends.trtllm import vc_smooth_phase
+
+            # The tile-mean VC-Attention recipe switches its V-Smooth path by
+            # denoising step while the tensor shapes stay the same, so each phase
+            # replays its own graph. The pipeline publishes the step into this
+            # component's attention metadata state. The repair recipe does not
+            # follow the schedule.
+            state = self.model_config.attention_metadata_state or {}
+            runner.register_extra_key_fn(
+                "vc_smooth_phase",
+                lambda *args, **kwargs: vc_smooth_phase(state.get("denoise_step")),
+            )
+
         sparse_config = self.model_config.attention.sparse_attention_config
         if not isinstance(sparse_config, BaseSparseAttentionConfig):
             return

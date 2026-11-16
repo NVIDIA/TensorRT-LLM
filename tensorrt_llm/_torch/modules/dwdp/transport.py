@@ -31,15 +31,18 @@ Design:
   After copying data into the MNNVL handle the original parameter is freed
   immediately to avoid OOM on memory-constrained systems.
 - GB200 constraint: all handles use CU_MEM_HANDLE_TYPE_FABRIC.
-- Peer views are immutable: after setup, MNNVL handles are never written again.
-  P2P reads are safe across processes without synchronization.
+- Peer views are immutable: after setup the bytes a peer view covers (the
+  owner's own experts) are never written; the owner's prefetches rewrite only
+  the page-alignment edge bytes outside every view, so P2P reads are safe
+  across processes without synchronization.
 """
 
 from __future__ import annotations
 
 import ctypes
 import os
-from typing import Dict, List, Tuple, Union
+from types import TracebackType
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -54,10 +57,9 @@ except ImportError:
 
     logger.debug("[DWDP transport] Falling back to legacy `cuda` bindings")
 
-from .specs import LayerWeightSpecs, MnnvlHandleSet, PeerRanges, compute_peer_ranges
+from .rendezvous import GroupComm
+from .specs import ExpertPartition, LayerWeightSpecs, MnnvlHandleSet, WeightSpec, handle_geometry
 from .vmm import (
-    align_down,
-    align_up,
     check_cu_result,
     create_fabric_handle,
     free_va,
@@ -138,6 +140,126 @@ def _import_handle(payload: Union[bytes, int], htype: cuda.CUmemAllocationHandle
     return int(imported_handle)
 
 
+def _describe_error(exc: BaseException) -> str:
+    """A failure as the status a rank reports to its peers: picklable, one line."""
+    return f"{type(exc).__name__}: {exc}"
+
+
+def _allgather_keeping(comm: GroupComm, obj: object, error: Optional[Exception]) -> list[object]:
+    """``comm.allgather(obj)`` that raises this rank's deferred ``error`` if the collective fails.
+
+    A rank that failed enters the verdict collective anyway, with its failure as its status,
+    and raises ``error`` after it.  If the collective fails as well (a peer died, the store
+    timed out), the rank raises ``error`` rather than the collective's failure, which becomes
+    ``error.__context__``: the rank's own failure is not lost.  ``KeyboardInterrupt`` and
+    ``SystemExit`` pass through unchanged.
+    """
+    try:
+        return comm.allgather(obj)
+    except Exception:
+        if error is None:
+            raise
+        raise error
+
+
+def _export_local_chunk(
+    local_param: torch.Tensor,
+    spec: WeightSpec,
+    phys_size: int,
+    data_offset: int,
+    granularity: int,
+    device_id: int,
+    htype: cuda.CUmemAllocationHandleType,
+    local_handles: List[int],
+    local_export_fds: List[int],
+) -> Tuple[int, Union[bytes, int]]:
+    """Move one local expert chunk into a new handle of ``phys_size`` bytes and export it.
+
+    The handle and, on POSIX_FD, the exported FD are appended to ``local_handles`` and
+    ``local_export_fds`` as soon as they exist, so the caller's rollback releases them.
+
+    Returns:
+        ``(handle, payload)``: the handle and its export (FABRIC bytes or a POSIX FD).
+    """
+    # (a) Create the fabric handle
+    handle = create_fabric_handle(phys_size, device_id)
+    local_handles.append(handle)
+
+    # (b) Reserve temp VA, map, set access, create tensor view
+    temp_va = reserve_va(phys_size, granularity)
+    mapped = False
+    try:
+        map_handle(temp_va, phys_size, handle, 0)
+        mapped = True
+        set_access(temp_va, phys_size, device_id)
+
+        # Create a flat tensor view at data_offset within the
+        # mapped VA, sized exactly to the chunk.
+        data_ptr = temp_va + data_offset
+        handle_tensor = tensor_from_ptr(
+            ptr=data_ptr,
+            shape=spec.chunk_shape,
+            dtype=spec.dtype,
+            device_id=device_id,
+        )
+
+        # (c) Copy local param into the handle memory
+        handle_tensor.copy_(local_param)
+        torch.cuda.synchronize(device_id)
+
+        # (d) Free the original param to reclaim memory
+        local_param.untyped_storage().resize_(0)
+        torch.cuda.empty_cache()
+
+        # (e) Unmap temp VA (handle stays alive)
+        unmap_va(temp_va, phys_size)
+        mapped = False
+    finally:
+        if mapped:
+            try:
+                unmap_va(temp_va, phys_size)
+            except Exception as e:
+                logger.warning(
+                    f"[DWDPTransport] temp VA unmap on error path failed (ignored): {e!r}"
+                )
+        free_va(temp_va, phys_size)
+
+    # (f) Export for the peers
+    exported = _export_handle(handle, htype)
+    if htype == cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR:
+        # Track local FD so it can be closed at release time.
+        # It must remain open through Phase 2 so peers can
+        # pidfd_getfd it.
+        local_export_fds.append(int(exported))
+    return handle, exported
+
+
+def _check_peer_exports(
+    reports: List[Tuple[Optional[str], Union[bytes, int, None]]], *, layer_idx: int, name: str
+) -> None:
+    """The group's verdict on one Phase-1 allgather, before any rank imports a handle of it.
+
+    ``reports[p]`` is rank ``p``'s ``(status, payload)``: its error (None on success) and its
+    export.  Every rank checks the same list, so either every rank goes on to import or every
+    rank raises the same error.  The handles need no geometry check: every rank computes each
+    handle's size and data offset with ``handle_geometry`` from the partition, the granularity
+    and the expert shape and dtype that ``setup_dwdp``'s handshake agreed on.
+
+    Raises:
+        RuntimeError: Listing every rank whose export failed.
+    """
+    problems = [
+        f"rank {peer_rank} failed to export its handle: {status}"
+        for peer_rank, (status, _payload) in enumerate(reports)
+        if status is not None
+    ]
+    if problems:
+        raise RuntimeError(
+            f"[DWDPTransport] Layer {layer_idx} {name}: {'; '.join(problems)}. No peer handle "
+            f"was imported; every rank of the DWDP group raises this."
+        )
+
+
 class DWDPTransport:
     """MNNVL handle allocation and cross-process exchange for DWDP.
 
@@ -164,7 +286,6 @@ class DWDPTransport:
         "_granularity",
         "_handle_set",
         "_peer_views",
-        "_peer_ranges",
         "_local_handles",
         "_imported_handles",
         "_peer_va_mappings",
@@ -180,7 +301,6 @@ class DWDPTransport:
         granularity: int,
         handle_set: MnnvlHandleSet,
         peer_views: Dict[Tuple[int, int, str], torch.Tensor],
-        peer_ranges: PeerRanges,
         local_handles: List[int],
         imported_handles: List[int],
         peer_va_mappings: List[Tuple[int, int]],
@@ -195,11 +315,6 @@ class DWDPTransport:
             granularity: VMM page granularity in bytes.
             handle_set: Local MNNVL handles for WeightBuffer.
             peer_views: Immutable tensor views into peer MNNVL memory.
-            peer_ranges: Per-peer ``(local_start, local_end_capped)`` tuples
-                indexed by DWDP rank.  The capped end truncates the tail
-                rank's padding; consumers (lookup_owner, fill_edge_bytes,
-                weight_manager) read these to find the actual owner of a
-                given expert id.
             local_handles: Raw local handle integers (for cleanup).
             imported_handles: Raw imported handle integers (for cleanup).
             peer_va_mappings: List of (va, size) for peer VA regions (for cleanup).
@@ -210,7 +325,6 @@ class DWDPTransport:
         self._granularity = granularity
         self._handle_set = handle_set
         self._peer_views = peer_views
-        self._peer_ranges = peer_ranges
         self._local_handles = local_handles
         self._imported_handles = imported_handles
         self._peer_va_mappings = peer_va_mappings
@@ -222,38 +336,40 @@ class DWDPTransport:
         cls,
         layer_weight_specs: LayerWeightSpecs,
         local_params: Dict[Tuple[int, str], torch.Tensor],
-        comm,
+        comm: GroupComm,
         dwdp_rank: int,
-        dwdp_size: int,
         device_id: int,
-        local_start: int,
-        local_end: int,
-        num_experts_per_worker: int,
-        num_prefetch_experts: int,
+        partition: ExpertPartition,
     ) -> DWDPTransport:
         """Allocate MNNVL handles, populate them, and exchange with all peers.
 
-        This is the main entry point. Each of the ``dwdp_size`` processes calls
-        this method concurrently. The method:
+        This is the main entry point. Each of the ``partition.dwdp_size``
+        processes calls this method concurrently. The method:
 
         1. For each (layer_idx, weight_name) — one at a time to limit peak
            memory usage — every rank in the DWDP communicator:
-           a. Allocates a fabric handle large enough for the local chunk.
+           a. Allocates a fabric handle of ``handle_geometry`` of its range.
            b. Maps the handle to a temporary VA and copies the local parameter
               tensor into it at the correct ``data_offset``.
            c. Frees the original parameter tensor immediately.
            d. Unmaps the temporary VA (the physical handle persists).
-           e. Exports the handle to bytes and shares it with every peer via
-              a per-pair ``comm.allgather(handle_bytes)``.  The allgather is
-              itself a synchronization point so no explicit barrier is needed
-              between Phase 1 iterations.
+           e. Exports the handle and shares it with every peer via a
+              per-pair ``comm.allgather((status, payload))``, which a rank
+              also enters after a-e failed, with the error as its status.
+              If any rank failed, every rank raises after this allgather
+              (``_check_peer_exports``), before any import.  The allgather
+              is itself a synchronization point so no explicit barrier is
+              needed between Phase 1 iterations.
         2. For each peer rank (skipping self), for each (layer_idx, weight_name):
-           a. Retrieves the peer's exported handle bytes from the Phase 1
+           a. Retrieves the peer's exported payload from the Phase 1
               allgather cache.
-           b. Imports the fabric handle.
-           c. Maps it to a VA and creates a tensor view for P2P reads.
-        3. ``comm.Barrier()`` after all imports — ensures no rank starts
-           consuming peer views before every rank has finished importing.
+           b. Imports the handle.
+           c. Maps it whole, with the size of the peer's range, and creates
+              a tensor view of the peer's rows for P2P reads.
+        3. ``comm.allgather(status)`` after all imports — ensures no rank
+           starts consuming peer views before every rank has finished
+           importing, and makes an import failure on any rank raise on
+           every rank.
 
         Args:
             layer_weight_specs: Per-layer weight specifications. Keys are layer
@@ -261,20 +377,23 @@ class DWDPTransport:
             local_params: Local parameter tensors keyed by (layer_idx, name).
                 Each tensor has shape == spec.chunk_shape and is on the correct
                 CUDA device. These tensors are consumed (freed) during the call.
-            comm: mpi4py communicator scoped to the DWDP group (created by
-                DwdpManager).  Must have exactly ``dwdp_size`` ranks.
-            dwdp_rank: This process's DWDP rank (0..dwdp_size-1).
-            dwdp_size: Total number of DWDP ranks in ``comm``.
+            comm: The DWDP group's communicator, an mpi4py sub-communicator or
+                a ``StoreDwdpGroup`` (created by DwdpManager).  Must have
+                exactly ``partition.dwdp_size`` ranks.
+            dwdp_rank: This process's DWDP rank (0..partition.dwdp_size-1).
             device_id: CUDA device ordinal.
-            local_start: First local expert index (inclusive).
-            local_end: Last local expert index (exclusive).
+            partition: The expert partition the DWDP group agreed on in
+                ``setup_dwdp``.  A rank's range sizes the handle it exports,
+                which every peer maps whole, and the rows of the peers'
+                views of it.
 
         Returns:
             Ready-to-use DWDPTransport with handles and peer views.
 
         Raises:
             ValueError: If local_params keys do not match layer_weight_specs.
-            RuntimeError: If any CUDA operation fails.
+            RuntimeError: If any CUDA operation fails, on any rank: every rank
+                raises after the same allgather.
         """
         granularity = get_allocation_granularity(device_id)
         htype = peer_handle_type()
@@ -283,13 +402,13 @@ class DWDPTransport:
         )
 
         # POSIX_FD path: dup peer FDs into our fd table via pidfd_getfd.
-        # We open one pidfd per peer ≠ self once up front and close them
-        # after Phase 3 Barrier.  ``peer_pidfds`` is empty on the FABRIC
-        # path (aarch64 / GB200).
+        # Phase 2 opens one pidfd per peer ≠ self before importing its
+        # handles; they are closed after the Phase 3 allgather.
+        # ``peer_pidfds`` is empty on the FABRIC path (aarch64 / GB200).
         peer_pidfds: Dict[int, int] = {}
         # FDs returned by ``cuMemExportToShareableHandle`` on this rank.
         # Must outlive every peer's ``pidfd_getfd`` (Phase 2) but are
-        # closed right after the Phase 3 Barrier — at that point every
+        # closed right after the Phase 3 allgather — at that point every
         # peer has finished dup-ing them and the FDs no longer back
         # anything we need.  ``cuMemImportFromShareableHandle`` dups the
         # peer-side FD internally, so we do NOT have to track imported
@@ -299,23 +418,9 @@ class DWDPTransport:
         # the FABRIC path (aarch64 / GB200).
         local_export_fds: List[int] = []
 
-        # Pick any spec to read the model's total expert count.  All layers
-        # share the same ``num_experts`` (the gate-side global expert table).
-        first_spec = next(iter(next(iter(layer_weight_specs.values())).values()))
-        num_experts_total = first_spec.num_experts
-
-        # Compute every peer's valid expert range deterministically from the
-        # shared DwdpConfig.  Used by lookup_owner downstream
-        # (fill_edge_bytes, weight_manager.prefetch_layer, fixup-side
-        # allgathers) so the same first-match owner policy is applied
-        # everywhere — including non-uniform tail padding and redundancy
-        # where adjacent ranges overlap.
-        peer_ranges = compute_peer_ranges(
-            dwdp_size=dwdp_size,
-            num_experts_per_worker=num_experts_per_worker,
-            num_prefetch_experts=num_prefetch_experts,
-            num_experts_total=num_experts_total,
-        )
+        dwdp_size = partition.dwdp_size
+        local_start, local_end = partition.range_of(dwdp_rank)
+        peer_ranges = partition.peer_ranges
 
         # Validate that every (layer_idx, name) in specs has a matching param
         expected_keys = set()
@@ -341,16 +446,11 @@ class DWDPTransport:
         all_exports: Dict[Tuple[int, str], List[Union[bytes, int]]] = {}
 
         try:
-            # On POSIX_FD: open one pidfd per peer ≠ self before Phase 1.
-            if is_posix_fd:
-                all_pids = comm.allgather(os.getpid())
-                for peer_rank, peer_pid in enumerate(all_pids):
-                    if peer_rank == dwdp_rank:
-                        continue
-                    peer_pidfds[peer_rank] = _pidfd_open(peer_pid)
+            # On POSIX_FD: every rank's pid, for the pidfds Phase 2 opens.
+            all_pids = comm.allgather(os.getpid()) if is_posix_fd else []
 
             # ----------------------------------------------------------
-            # Phase 1: Allocate local handles and allgather bytes
+            # Phase 1: Allocate local handles and allgather exports
             # ----------------------------------------------------------
             # Every rank iterates pairs in the same sorted order so that
             # per-pair comm.allgather calls match across ranks.
@@ -359,76 +459,45 @@ class DWDPTransport:
                 for name in sorted(weight_specs.keys()):
                     spec = weight_specs[name]
                     key = (layer_idx, name)
-                    local_param = local_params[key]
 
-                    # Compute physical handle size using the SAME formula
-                    # as PageAlignedLayout.compute() to guarantee that
-                    # phys_size == layout.mnnvl_size.  On GB200, fabric
-                    # handles require cuMemMap with size == phys_size
-                    # (partial mapping returns CUDA_ERROR_NOT_SUPPORTED).
-                    local_start_bytes = local_start * spec.expert_bytes
-                    local_end_bytes = local_end * spec.expert_bytes
-                    page_start = align_down(local_start_bytes, granularity)
-                    page_end = align_up(local_end_bytes, granularity)
-                    phys_size = page_end - page_start
-                    data_offset = local_start_bytes - page_start
-
-                    # (a) Create the fabric handle
-                    handle = create_fabric_handle(phys_size, device_id)
-                    local_handles.append(handle)
-                    handles[key] = handle
-                    sizes[key] = phys_size
-
-                    # (b) Reserve temp VA, map, set access, create tensor view
-                    temp_va = reserve_va(phys_size, granularity)
-                    mapped = False
+                    # The handle spans the pages of this rank's range: the
+                    # handle_geometry() every importer computes for this
+                    # rank, and PageAlignedLayout.mnnvl_size, since a handle
+                    # maps only whole.
+                    phys_size, data_offset = handle_geometry(
+                        spec.expert_bytes, local_start, local_end, granularity
+                    )
+                    export_error = None
                     try:
-                        map_handle(temp_va, phys_size, handle, 0)
-                        mapped = True
-                        set_access(temp_va, phys_size, device_id)
-
-                        # Create a flat tensor view at data_offset within the
-                        # mapped VA, sized exactly to the chunk.
-                        data_ptr = temp_va + data_offset
-                        handle_tensor = tensor_from_ptr(
-                            ptr=data_ptr,
-                            shape=spec.chunk_shape,
-                            dtype=spec.dtype,
-                            device_id=device_id,
+                        handle, exported = _export_local_chunk(
+                            local_params[key],
+                            spec,
+                            phys_size,
+                            data_offset,
+                            granularity,
+                            device_id,
+                            htype,
+                            local_handles,
+                            local_export_fds,
                         )
+                    except Exception as exc:  # reported to the peers below
+                        export_error = exc
+                        report = (_describe_error(exc), None)
+                    else:
+                        handles[key] = handle
+                        sizes[key] = phys_size
+                        report = (None, exported)
 
-                        # (c) Copy local param into the handle memory
-                        handle_tensor.copy_(local_param)
-                        torch.cuda.synchronize(device_id)
-
-                        # (d) Free the original param to reclaim memory
-                        local_param.untyped_storage().resize_(0)
-                        torch.cuda.empty_cache()
-
-                        # (e) Unmap temp VA (handle stays alive)
-                        unmap_va(temp_va, phys_size)
-                        mapped = False
-                    finally:
-                        if mapped:
-                            try:
-                                unmap_va(temp_va, phys_size)
-                            except Exception as e:
-                                logger.warning(
-                                    f"[DWDPTransport] temp VA unmap on error "
-                                    f"path failed (ignored): {e!r}"
-                                )
-                        free_va(temp_va, phys_size)
-
-                    # (f) Export and allgather to all peers
-                    exported = _export_handle(handle, htype)
-                    if is_posix_fd:
-                        # Track local FD so it can be closed at release time.
-                        # It must remain open through Phase 2 so peers can
-                        # pidfd_getfd it.
-                        local_export_fds.append(int(exported))
-                    # comm.allgather implicitly synchronizes all ranks on this
+                    # Entered by every rank, also after a local failure, so
+                    # the verdict below is made from the same reports on every
+                    # rank, before anything is imported.  comm.allgather
+                    # implicitly synchronizes all ranks on this
                     # (layer_idx, name) — no explicit barrier required.
-                    all_exports[key] = comm.allgather(exported)
+                    reports = _allgather_keeping(comm, report, export_error)
+                    if export_error is not None:
+                        raise export_error
+                    _check_peer_exports(reports, layer_idx=layer_idx, name=name)
+                    all_exports[key] = [payload for _status, payload in reports]
 
                     logger.debug(
                         f"[DWDPTransport] Rank {dwdp_rank}: exported + allgathered "
@@ -443,81 +512,125 @@ class DWDPTransport:
             # ----------------------------------------------------------
             # Phase 2: Import peer handles and create tensor views
             # ----------------------------------------------------------
-            for peer_rank in range(dwdp_size):
-                if peer_rank == dwdp_rank:
-                    continue
+            # Local work only: a failure becomes this rank's Phase 3 status.
+            import_error = None
+            try:
+                for peer_rank in range(dwdp_size):
+                    if peer_rank == dwdp_rank:
+                        continue
+                    if is_posix_fd:
+                        # The pidfd through which (b) dups the peer's FDs.
+                        peer_pidfds[peer_rank] = _pidfd_open(all_pids[peer_rank])
 
-                # Compute peer's expert range using the same config-driven
-                # formula every rank uses for itself (size = num_experts_per_worker,
-                # stride = num_prefetch_experts).  All ranks share the same
-                # DwdpConfig, so peer ranges are deterministic — no allgather needed.
-                for layer_idx in sorted(layer_weight_specs.keys()):
-                    weight_specs = layer_weight_specs[layer_idx]
-                    for name in sorted(weight_specs.keys()):
-                        spec = weight_specs[name]
+                    # The peer's range in the agreed partition: its handle is
+                    # handle_geometry() of that range, the size it allocated,
+                    # and its view has that range's rows, which may differ
+                    # from ours under the balanced partition or for a capped
+                    # last rank.
+                    peer_local_start, peer_local_end = peer_ranges[peer_rank]
+                    for layer_idx in sorted(layer_weight_specs.keys()):
+                        weight_specs = layer_weight_specs[layer_idx]
+                        for name in sorted(weight_specs.keys()):
+                            spec = weight_specs[name]
 
-                        peer_local_start = peer_rank * num_prefetch_experts
-                        peer_local_end = peer_local_start + num_experts_per_worker
+                            phys_size, peer_data_offset = handle_geometry(
+                                spec.expert_bytes, peer_local_start, peer_local_end, granularity
+                            )
 
-                        peer_start_bytes = peer_local_start * spec.expert_bytes
-                        peer_end_bytes = peer_local_end * spec.expert_bytes
-                        peer_page_start = align_down(peer_start_bytes, granularity)
-                        peer_page_end = align_up(peer_end_bytes, granularity)
-                        phys_size = peer_page_end - peer_page_start
-                        peer_data_offset = peer_start_bytes - peer_page_start
+                            # (a) Retrieve peer handle payload from Phase 1 cache.
+                            peer_payload = all_exports[(layer_idx, name)][peer_rank]
 
-                        # (a) Retrieve peer handle payload from Phase 1 cache.
-                        peer_payload = all_exports[(layer_idx, name)][peer_rank]
-
-                        # (b) Import the handle.  On POSIX_FD we first dup
-                        # the peer's FD into our fd table via pidfd_getfd;
-                        # cuMemImportFromShareableHandle then accepts that
-                        # local FD and dups it internally, so we close
-                        # ours immediately after the import returns.  On
-                        # FABRIC the bytes blob is consumed directly.
-                        if is_posix_fd:
-                            local_fd = _pidfd_getfd(peer_pidfds[peer_rank], int(peer_payload))
-                            try:
-                                imported_handle = _import_handle(local_fd, htype)
-                            finally:
+                            # (b) Import the handle.  On POSIX_FD we first dup
+                            # the peer's FD into our fd table via pidfd_getfd;
+                            # cuMemImportFromShareableHandle then accepts that
+                            # local FD and dups it internally, so we close
+                            # ours immediately after the import returns.  On
+                            # FABRIC the bytes blob is consumed directly.
+                            if is_posix_fd:
+                                local_fd = _pidfd_getfd(peer_pidfds[peer_rank], int(peer_payload))
                                 try:
-                                    os.close(local_fd)
-                                except OSError as e:
+                                    imported_handle = _import_handle(local_fd, htype)
+                                finally:
+                                    try:
+                                        os.close(local_fd)
+                                    except OSError as e:
+                                        logger.warning(
+                                            f"[DWDPTransport] Failed to close "
+                                            f"imported FD {local_fd}: {e}"
+                                        )
+                            else:
+                                imported_handle = _import_handle(peer_payload, htype)
+                            imported_handles.append(imported_handle)
+
+                            # (c) Reserve VA, map the whole handle, set access.  On a
+                            # failure the VA is unmapped and freed here, best effort, and
+                            # the error is re-raised: the rollback releases only the
+                            # complete mappings in peer_va_mappings.
+                            peer_va = reserve_va(phys_size, granularity)
+                            mapped = False
+                            try:
+                                map_handle(peer_va, phys_size, imported_handle, 0)
+                                mapped = True
+                                set_access(peer_va, phys_size, device_id)
+                            except BaseException:
+                                if mapped:
+                                    try:
+                                        unmap_va(peer_va, phys_size)
+                                    except Exception as e:
+                                        logger.warning(
+                                            f"[DWDPTransport] peer VA unmap on error path failed "
+                                            f"(ignored): {e!r}"
+                                        )
+                                try:
+                                    free_va(peer_va, phys_size)
+                                except Exception as e:
                                     logger.warning(
-                                        f"[DWDPTransport] Failed to close "
-                                        f"imported FD {local_fd}: {e}"
+                                        f"[DWDPTransport] peer VA free on error path failed "
+                                        f"(ignored): {e!r}"
                                     )
-                        else:
-                            imported_handle = _import_handle(peer_payload, htype)
-                        imported_handles.append(imported_handle)
+                                raise
+                            peer_va_mappings.append((peer_va, phys_size))
 
-                        # (c) Reserve VA, map, set access
-                        peer_va = reserve_va(phys_size, granularity)
-                        map_handle(peer_va, phys_size, imported_handle, 0)
-                        set_access(peer_va, phys_size, device_id)
-                        peer_va_mappings.append((peer_va, phys_size))
+                            peer_data_ptr = peer_va + peer_data_offset
+                            peer_tensor = tensor_from_ptr(
+                                ptr=peer_data_ptr,
+                                shape=(peer_local_end - peer_local_start,)
+                                + tuple(spec.chunk_shape[1:]),
+                                dtype=spec.dtype,
+                                device_id=device_id,
+                            )
 
-                        peer_data_ptr = peer_va + peer_data_offset
-                        peer_tensor = tensor_from_ptr(
-                            ptr=peer_data_ptr,
-                            shape=spec.chunk_shape,
-                            dtype=spec.dtype,
-                            device_id=device_id,
-                        )
+                            view_key = (peer_rank, layer_idx, name)
+                            peer_views[view_key] = peer_tensor
 
-                        view_key = (peer_rank, layer_idx, name)
-                        peer_views[view_key] = peer_tensor
-
-                        logger.debug(
-                            f"[DWDPTransport] Rank {dwdp_rank}: imported "
-                            f"peer={peer_rank} layer={layer_idx} name={name} "
-                            f"peer_data_offset={peer_data_offset}"
-                        )
+                            logger.debug(
+                                f"[DWDPTransport] Rank {dwdp_rank}: imported "
+                                f"peer={peer_rank} layer={layer_idx} name={name} "
+                                f"peer_data_offset={peer_data_offset}"
+                            )
+            except Exception as exc:  # reported to the peers in Phase 3
+                import_error = exc
 
             # ----------------------------------------------------------
-            # Phase 3: Barrier — all handles imported
+            # Phase 3: allgather(status) — all handles imported
             # ----------------------------------------------------------
-            comm.Barrier()
+            # Every rank enters this allgather, also after a failed import,
+            # so it synchronizes the group and an import failure on any rank
+            # raises on every rank here.
+            import_status = None if import_error is None else _describe_error(import_error)
+            statuses = _allgather_keeping(comm, import_status, import_error)
+            if import_error is not None:
+                raise import_error
+            failed = [
+                f"rank {rank}: {status}"
+                for rank, status in enumerate(statuses)
+                if status is not None
+            ]
+            if failed:
+                raise RuntimeError(
+                    f"[DWDPTransport] Importing the peer handles failed on "
+                    f"{'; '.join(failed)}. Every rank of the DWDP group raises this."
+                )
 
             # POSIX_FD: close the per-peer pidfds — they're no longer
             # needed once every imported handle has been created.
@@ -530,9 +643,9 @@ class DWDPTransport:
 
             # POSIX_FD: close our exported FDs.  They had to stay open
             # through Phase 2 so peers could ``pidfd_getfd`` them, but
-            # the Barrier above guarantees every peer has finished doing
-            # so.  Closing here (instead of at ``release()``) caps peak
-            # fd usage during setup at ~num_handles per rank.
+            # the Phase 3 allgather above guarantees every peer has
+            # finished doing so.  Closing here (instead of at ``release()``)
+            # caps peak fd usage during setup at ~num_handles per rank.
             for fd in local_export_fds:
                 try:
                     os.close(fd)
@@ -555,7 +668,6 @@ class DWDPTransport:
                 granularity=granularity,
                 handle_set=handle_set,
                 peer_views=peer_views,
-                peer_ranges=peer_ranges,
                 local_handles=local_handles,
                 imported_handles=imported_handles,
                 peer_va_mappings=peer_va_mappings,
@@ -605,9 +717,11 @@ class DWDPTransport:
     def get_peer_views(self) -> Dict[Tuple[int, int, str], torch.Tensor]:
         """Return immutable P2P tensor views into every peer's MNNVL memory.
 
-        Keys are (peer_rank, layer_idx, weight_name). Each tensor has
-        shape == spec.chunk_shape and is read-only (writes would corrupt
-        the peer's data).
+        Keys are (peer_rank, layer_idx, weight_name). Each tensor holds the
+        peer's experts: ``end - start`` rows of its range in the expert
+        partition, which may differ from this rank's row count, and
+        ``spec.chunk_shape[1:]``.  It is read-only (writes would corrupt the
+        peer's data).
 
         Returns:
             Dict mapping (peer_rank, layer_idx, name) to tensor views.
@@ -618,22 +732,6 @@ class DWDPTransport:
         if self._released:
             raise RuntimeError("DWDPTransport has been released")
         return self._peer_views
-
-    def get_peer_ranges(self) -> PeerRanges:
-        """Return per-peer ``(local_start, local_end_capped)`` tuples.
-
-        Used by ``fill_edge_bytes`` and the runtime ``WeightManager`` to
-        resolve the owner of any given expert id under non-uniform
-        partition or redundancy.  The end is capped at ``num_experts``
-        (i.e., reflects the *valid* expert range — not the storage range
-        which may include tail-padding slots).
-
-        Raises:
-            RuntimeError: If transport has been released.
-        """
-        if self._released:
-            raise RuntimeError("DWDPTransport has been released")
-        return self._peer_ranges
 
     @property
     def dwdp_rank(self) -> int:
@@ -698,7 +796,12 @@ class DWDPTransport:
         """Context manager entry."""
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
+    def __exit__(
+        self,
+        exc_type: Optional[type[BaseException]],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[TracebackType],
+    ) -> bool:
         """Context manager exit — release resources."""
         self.release()
         return False
@@ -719,7 +822,7 @@ def _cleanup_resources(
     The POSIX_FD path releases its FDs eagerly during ``create()`` —
     imported FDs are closed inline right after
     ``cuMemImportFromShareableHandle`` (which dups them internally), and
-    local export FDs are closed right after the Phase 3 Barrier — so by
+    local export FDs are closed right after the Phase 3 allgather — so by
     the time normal-path ``release()`` runs ``local_export_fds`` is
     already empty.  This function still iterates it because the
     error-path caller invokes us with whatever FDs were tracked at the

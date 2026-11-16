@@ -199,8 +199,8 @@ def test_mpi_sleep_wakeup_kv_cache_only_tp2(process_gpu_memory_info_available):
         mem_active = _per_device_gpu_memory()
         llm.release(sleep_tags)
         mem_sleep = _per_device_gpu_memory()
+        active_devices = {dev for dev, size in mem_active.items() if size > 0}
         if process_gpu_memory_info_available:
-            active_devices = {dev for dev, size in mem_active.items() if size > 0}
             assert len(active_devices) == 2
             for dev in active_devices:
                 assert mem_sleep.get(dev, 0) < mem_active[dev], (

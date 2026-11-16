@@ -798,9 +798,15 @@ class KimiK25VisionModel(nn.Module):
         self.model_config = copy.copy(model_config)
         self.model_config.extra_attrs = copy.copy(model_config.extra_attrs)
         self.model_config._frozen = False
-        self.model_config.quant_config = QuantConfig(
-            kv_cache_quant_algo=model_config.quant_config.kv_cache_quant_algo
+        self.model_config.attn_backend = model_config.get_encoder_attention_backend(
+            "vision", model_config.attn_backend
         )
+        kv_cache_quant_algo = model_config.quant_config.kv_cache_quant_algo
+        if self.model_config.attn_backend != model_config.attn_backend:
+            # The encoder keeps no KV cache, and FlashInfer rejects FP8
+            # KV-cache quantization without one.
+            kv_cache_quant_algo = None
+        self.model_config.quant_config = QuantConfig(kv_cache_quant_algo=kv_cache_quant_algo)
         self.model_config.pretrained_config = copy.copy(model_config.pretrained_config)
 
         # Extract vision config dict (num_heads is resolved here, with this
@@ -1575,6 +1581,10 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
         llm: DeepseekV3ForCausalLM (MLA + MoE, 61 layers)
     """
 
+    supported_encoder_attention_backends = {
+        "vision": frozenset({"VANILLA", "TRTLLM", "FLASHINFER"})
+    }
+
     _LANG_PREFIX = "language_model."
     # Vision tower class. Subclasses (Kimi K3) override this so the shared
     # __init__/load_weights MetaInitMode deferral-and-recreation logic
@@ -1729,8 +1739,19 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
         """
         return self._mm_token_ids
 
-    def load_weights(self, weights) -> None:
-        """Load vision + projector + LLM weights from checkpoint."""
+    def load_weights(self, weights: Dict[str, torch.Tensor]) -> None:
+        """Load vision + projector + LLM weights from checkpoint.
+
+        Raises:
+            RuntimeError: Dense DWDP is active on the text model; nothing is loaded.
+        """
+        if getattr(getattr(self, "model", None), "_dense_dwdp_active", False):
+            # The text model's dense weights are views of dense DWDP staging slots that several
+            # layers share; refuse before the vision tower is rebuilt or loaded.
+            raise RuntimeError(
+                f"{type(self).__name__} load_weights is not supported while dense DWDP is "
+                "active: the dense weights live in staging slots shared across layers"
+            )
         # Create vision encoder if it was skipped during meta init.
         # Use the saved VLM config since model_config.pretrained_config
         # has been overwritten with text_config by __init__.
