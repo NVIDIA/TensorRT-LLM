@@ -192,7 +192,8 @@ def test_comm_uses_backend_override_quantization(monkeypatch: pytest.MonkeyPatch
 
 def test_nccl_ep_layer_quantization_finalization(monkeypatch: pytest.MonkeyPatch) -> None:
     """Late unquantized settings disable quantized dispatch and combine before context creation."""
-    monkeypatch.setattr(nccl_ep_utils, "is_nccl_ep_installed", lambda: True)
+    monkeypatch.setattr(nccl_ep_utils, "is_nccl_ep_installed", lambda mapping=None: True)
+    monkeypatch.setattr(nccl_ep_utils, "_ep_comm_key", lambda _: ())
     monkeypatch.setattr(nccl_ep_utils, "nccl_ep_supports_version", lambda _: True)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     fake_ep = SimpleNamespace(Layout=SimpleNamespace(RANK_MAJOR=object()))

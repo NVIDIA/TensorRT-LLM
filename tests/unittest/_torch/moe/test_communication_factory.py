@@ -738,7 +738,8 @@ def test_nccl_ep_rejects_format_change_after_context_initialization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An allocated context cannot switch to a different transport format."""
-    monkeypatch.setattr(nccl_ep_utils, "is_nccl_ep_installed", lambda: True)
+    monkeypatch.setattr(nccl_ep_utils, "is_nccl_ep_installed", lambda mapping=None: True)
+    monkeypatch.setattr(nccl_ep_utils, "_ep_comm_key", lambda _: ())
     monkeypatch.setattr(nccl_ep_utils, "nccl_ep_supports_version", lambda _: True)
     comm = NcclEP(
         mapping=SimpleNamespace(moe_ep_size=2, moe_ep_rank=0),
@@ -769,7 +770,8 @@ def test_nccl_ep_falls_back_for_unsupported_quantized_configuration(
     reason: str,
 ) -> None:
     """Unsupported quantized transport keeps BF16 dispatch and disables LP combine."""
-    monkeypatch.setattr(nccl_ep_utils, "is_nccl_ep_installed", lambda: True)
+    monkeypatch.setattr(nccl_ep_utils, "is_nccl_ep_installed", lambda mapping=None: True)
+    monkeypatch.setattr(nccl_ep_utils, "_ep_comm_key", lambda _: ())
     monkeypatch.setattr(nccl_ep_utils, "nccl_ep_supports_version", lambda _: version_supported)
     warning = Mock()
     monkeypatch.setattr(

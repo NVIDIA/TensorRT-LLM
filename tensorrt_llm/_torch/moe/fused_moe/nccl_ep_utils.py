@@ -106,7 +106,7 @@ def _broadcast_ep_unique_id(mapping: Mapping, ep_mpi_comm: "MpiComm | None") -> 
         try:
             unique_id = nccl_core.get_unique_id()
         except Exception as exc:
-            # Even a local programming error must send the sentinel before it escapes.
+            # Every root failure must send the sentinel before model loading aborts.
             error = exc
             logger.error(f"NCCL EP unique ID creation failed: {exc!r}")
     if ep_mpi_comm is not None:
@@ -130,9 +130,10 @@ def _broadcast_ep_unique_id(mapping: Mapping, ep_mpi_comm: "MpiComm | None") -> 
         payload = wire.cpu().numpy().tobytes()
         unique_id = nccl_core.UniqueId.from_bytes(payload[1:]) if payload[0] else None
     if unique_id is None:
-        if error is not None:
-            raise error
-        raise RuntimeInitError("NCCL EP rank 0 could not create a communicator unique ID")
+        # Peers have received the failure sentinel, so no rank may retry model initialization.
+        raise RuntimeInitError(
+            "NCCL EP rank 0 could not create a communicator unique ID"
+        ) from error
     return unique_id
 
 
@@ -169,16 +170,15 @@ def _create_ep_nccl_comm(mapping: Mapping) -> _EpCommState:
         # Rely on uniform NCCL configuration and platform capabilities across EP ranks;
         # under that contract, capability selection needs no additional collective.
         reason = None
-        if not comm.device_api_support:
-            reason = "EP communicator reports NCCL Device API unavailable"
-        elif comm.n_lsa_teams > 1:
-            try:
-                no_gin = comm.gin_type == NcclGinType.NONE
-            except ValueError:
-                # Older nccl4py enums cannot decode newer nonzero GIN transport types.
-                no_gin = False
-            if no_gin:
+        try:
+            if not comm.device_api_support:
+                reason = "EP communicator reports NCCL Device API unavailable"
+            elif comm.n_lsa_teams > 1 and comm.gin_type == NcclGinType.NONE:
                 reason = "low-latency NCCL EP requires GIN between LSA teams"
+        except ValueError:
+            # nccl4py may decode all properties on the first read. Unknown GIN enum
+            # values indicate a nonzero transport, even when another property is read.
+            pass
         if reason is not None:
             logger.info(f"NCCL EP disabled: {reason}")
             _release_ep_nccl_comm(comm, ep_mpi_comm)

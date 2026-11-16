@@ -248,7 +248,7 @@ def test_context_initialization_failure_aborts_without_collective_cleanup(
 
 
 @pytest.mark.parametrize("failure", ["alignment", "version"])
-def test_local_validation_precedes_communicator_creation(
+def test_bf16_transport_fallback_reuses_checked_communicator(
     runtime: SimpleNamespace, failure: Literal["alignment", "version"]
 ) -> None:
     quant = SimpleNamespace(
@@ -256,12 +256,15 @@ def test_local_validation_precedes_communicator_creation(
     )
     if failure == "version":
         runtime.ep.get_lib_version.return_value = "0.1.0"
-    match = "divisible by 256" if failure == "alignment" else "requires libnccl_ep"
-    with pytest.raises(RuntimeError, match=match):
-        NcclEP(runtime.mapping, 4, 128 if failure == "alignment" else 512, quant_config=quant)
-    runtime.core.Communicator.init.assert_not_called()
-    runtime.session.Create_group.assert_not_called()
-    assert not ep_utils._ep_comm_cache
+    first = NcclEP(runtime.mapping, 4, 128 if failure == "alignment" else 512, quant_config=quant)
+    second = NcclEP(runtime.mapping, 4, 512)
+    assert not first.supports_post_quant_dispatch()
+    assert not first.use_low_precision_combine
+    runtime.core.Communicator.init.assert_called_once()
+    runtime.session.Create_group.assert_called_once()
+    first.destroy()
+    second.destroy()
+    runtime.comm.destroy.assert_called_once()
 
 
 def test_pending_cleanup_uses_owning_device(
@@ -327,10 +330,11 @@ def test_errors_are_not_cached_as_unsupported(
     assert runtime.core.Communicator.init.call_count == 2
 
 
+@pytest.mark.parametrize("error_type", [_NativeError, TypeError, AttributeError])
 def test_mpi_unique_id_failure_uses_the_existing_bootstrap_broadcast(
-    runtime: SimpleNamespace,
+    runtime: SimpleNamespace, error_type: type[Exception]
 ) -> None:
-    runtime.core.get_unique_id.side_effect = _NativeError("unique ID failed")
+    runtime.core.get_unique_id.side_effect = error_type("unique ID failed")
     with pytest.raises(RuntimeInitError, match="unique ID"):
         ep_utils.is_nccl_ep_installed(runtime.mapping)
     runtime.mpi.bcast.assert_called_once_with(None, root=0)
@@ -364,19 +368,34 @@ def test_torch_bootstrap_uses_ep_group_without_capability_collectives(
     runtime.session.Create_group.assert_not_called()
 
 
-@pytest.mark.parametrize("gin", [5, ValueError("5 is not a valid NcclGinType")])
+@pytest.mark.parametrize(
+    ("property_name", "teams", "gin"),
+    [
+        ("gin_type", 2, 6),
+        ("gin_type", 2, ValueError("6 is not a valid NcclGinType")),
+        ("device_api_support", 1, ValueError("6 is not a valid NcclGinType")),
+        ("device_api_support", 2, ValueError("6 is not a valid NcclGinType")),
+        ("n_lsa_teams", 1, ValueError("6 is not a valid NcclGinType")),
+        ("n_lsa_teams", 2, ValueError("6 is not a valid NcclGinType")),
+    ],
+)
 def test_gin_property_accepts_transport_unknown_to_old_enum(
-    runtime: SimpleNamespace, gin: int | ValueError
+    runtime: SimpleNamespace, property_name: str, teams: int, gin: int | ValueError
 ) -> None:
-    runtime.comm.n_lsa_teams = 2
+    runtime.comm.n_lsa_teams = teams
     prop = (
         PropertyMock(side_effect=gin)
         if isinstance(gin, ValueError)
         else PropertyMock(return_value=gin)
     )
-    type(runtime.comm).gin_type = prop
+    setattr(type(runtime.comm), property_name, prop)
+    assert ep_utils.is_nccl_ep_installed(runtime.mapping)
     assert ep_utils.is_nccl_ep_installed(runtime.mapping)
     prop.assert_called_once()
+    runtime.core.Communicator.init.assert_called_once()
+    runtime.mpi.bcast.assert_called_once()
+    runtime.comm.abort.assert_not_called()
+    runtime.comm.destroy.assert_not_called()
     runtime.bindings.comm_query_properties.assert_not_called()
 
 
@@ -435,8 +454,9 @@ def _check_ep_bootstrap(rank: int, rendezvous: str, scenario: str) -> None:
             use_low_precision_moe_combine=False,
             moe_load_balancer=None,
         )
-        if scenario == "root_id_failure" and rank == 0:
-            state.core.get_unique_id.side_effect = _NativeError("unique ID failed")
+        if scenario in ("root_id_failure", "root_type_error") and rank == 0:
+            error_type = TypeError if scenario == "root_type_error" else _NativeError
+            state.core.get_unique_id.side_effect = error_type("unique ID failed")
         elif scenario == "unsupported":
             state.comm.device_api_support = False
         elif scenario == "no_gin":
@@ -454,7 +474,7 @@ def _check_ep_bootstrap(rank: int, rendezvous: str, scenario: str) -> None:
         patch.setattr(dist, "broadcast", broadcast)
         patch.setattr(dist, "all_reduce", reduce)
         with MetaInitMode():
-            if scenario in ("root_id_failure", "query_failure", "init_failure"):
+            if scenario in ("root_id_failure", "root_type_error", "query_failure", "init_failure"):
                 with pytest.raises(RuntimeInitError):
                     factory.create_strategy(config, 4, 4, 2, 2)
             else:
@@ -470,7 +490,7 @@ def _check_ep_bootstrap(rank: int, rendezvous: str, scenario: str) -> None:
         broadcast.assert_called_once()
         assert broadcast.call_args.kwargs == {"src": 0, "group": dist.group.WORLD}
         reduce.assert_not_called()
-        if scenario == "root_id_failure":
+        if scenario in ("root_id_failure", "root_type_error"):
             state.core.Communicator.init.assert_not_called()
         elif scenario in ("init_failure", "query_failure"):
             state.comm.finalize.assert_not_called()
@@ -480,7 +500,7 @@ def _check_ep_bootstrap(rank: int, rendezvous: str, scenario: str) -> None:
             state.comm.finalize.assert_called_once()
             state.comm.destroy.assert_called_once()
             state.comm.abort.assert_not_called()
-        if scenario != "root_id_failure":
+        if scenario not in ("root_id_failure", "root_type_error"):
             assert state.core.Communicator.init.call_args.kwargs["unique_id"].as_bytes == b"x" * 128
         state.session.Create_group.assert_not_called()
     finally:
@@ -491,7 +511,15 @@ def _check_ep_bootstrap(rank: int, rendezvous: str, scenario: str) -> None:
 
 @pytest.mark.parametrize(
     "scenario",
-    ["root_id_failure", "unsupported", "no_gin", "query_failure", "init_failure", "unknown_gin"],
+    [
+        "root_id_failure",
+        "root_type_error",
+        "unsupported",
+        "no_gin",
+        "query_failure",
+        "init_failure",
+        "unknown_gin",
+    ],
 )
 def test_two_rank_ep_bootstrap(tmp_path: Path, scenario: str) -> None:
     """Uniform EP configurations bootstrap under MetaInitMode without a capability vote."""
