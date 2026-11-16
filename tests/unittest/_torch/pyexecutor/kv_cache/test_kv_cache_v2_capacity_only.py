@@ -16,6 +16,8 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
 
+pytestmark = pytest.mark.cpu_only
+
 DataType = tensorrt_llm.bindings.DataType
 CacheType = tensorrt_llm.bindings.internal.batch_manager.CacheType
 
@@ -207,7 +209,6 @@ def test_dynamic_tree_reserved_capacity(is_draft: bool, expected_capacity: int) 
     cache.resize.assert_called_once_with(expected_capacity, 200)
 
 
-@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("verify_len", "rewind", "accepted", "expected_capacity"),
     [(2, 1, 1, 252), (5, 2, 3, 254)],
@@ -532,7 +533,6 @@ def test_update_of_a_suspended_cache_still_consumes_its_allocation() -> None:
         "confidence-estimator",
     ],
 )
-@pytest.mark.cpu_only
 def test_index_mapper_reservation_tracks_confidence_scheduling(
     spec_config: SimpleNamespace | None, estimating_kv_cache: bool, expected: int
 ) -> None:

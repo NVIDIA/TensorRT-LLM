@@ -29,9 +29,10 @@ from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from ..speculative.interface import SpecMetadata
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.utils import get_draft_kv_cache_manager
-from ..utils import make_weak_ref, piecewise_cuda_graph
+from ..utils import decode_stream_priority, make_weak_ref, piecewise_cuda_graph
 from . import step_inputs
 from .llm_request import LlmRequest, get_draft_token_length
+from .replay_inputs import stage_replay_inputs
 from .resource_manager import (BaseResourceManager, NoFreeSlotsError,
                                ResourceManager, ResourceManagerType)
 from .sampler import SampleStateTensors
@@ -262,6 +263,12 @@ class CUDAGraphRunnerConfig:
     # process-wide one, so no other engine writes its metadata buffers (an
     # engine that skips unchanged uploads into them relies on that).
     private_metadata_buffers: bool = False
+    # Capture decode graphs on a high-priority stream for a small engine
+    # (RuntimeHooks.prioritize_decode_graphs).
+    prioritize_decode_graphs: bool = False
+    # Write a replay's input ids and positions in one launch
+    # (RuntimeHooks.stage_decode_inputs).
+    stage_decode_inputs: bool = False
     enable_encoder_decoder_mixed_cuda_graph: bool = False
     enable_in_graph_sampling: bool = False
     static_input_ids: Optional[torch.Tensor] = None
@@ -296,6 +303,8 @@ class CUDAGraphRunner:
     # resolver, None keeps one family. Pinned while a capture pass runs.
     packed_split_resolver: Optional[PackedSplitResolver] = None
     _capture_packed_split: Optional[bool] = None
+    # Default for runners built without __init__ (test stubs).
+    _adp_graph_batch_hint: Optional[List[Tuple[bool, int, int]]] = None
 
     def __init__(self, config: CUDAGraphRunnerConfig):
         self.config = config
@@ -319,6 +328,7 @@ class CUDAGraphRunner:
         self._capture_kv_regime = None
         self.packed_split_resolver = None
         self._capture_packed_split = None
+        self._capture_stream: Optional[torch.cuda.Stream] = None
         # Resolves a runtime batch to its tier; registered through the decoder runner so the
         # graph runner does not need to know about the sampler.
         self._sample_type_resolver: Optional[Callable[
@@ -339,6 +349,9 @@ class CUDAGraphRunner:
         self.graph_metadata: Dict[KeyType, Dict[str, Any]] = {}
         self.memory_pool = None
         self.padding_dummy_requests: Dict[int, LlmRequest] = {}
+        # (batch, every rank's sampling mode) when the padding exchange carried one.
+        self._sampling_modes: Optional[Tuple[ScheduledRequests,
+                                             List[int]]] = None
         self.dynamic_draft_len_mapping = config.dynamic_draft_len_mapping
 
         self.shared_static_tensors: Dict[str, torch.Tensor] = {}
@@ -353,6 +366,17 @@ class CUDAGraphRunner:
         # CUDA graphs.  Use allow_capture() context manager during warmup.
         self._capture_allowed = False
         self.is_warmup_only = False
+
+        # Attention-DP padding hint: the per-rank ``(can_run_cuda_graph,
+        # batch_size, sample_tier)`` rows that ``_get_padded_batch`` otherwise
+        # gathers itself. The executor stashes them when its packed
+        # post-schedule exchange (enable_packed_sync) already carried the
+        # values; the next ``_get_padded_batch`` pops the hint instead of
+        # gathering. Set and cleared only by rank-uniform executor code, so on
+        # any rank the runner either has a hint or gathers -- never a mix.
+        # Callers outside the executor loop (warmup, KV-cache estimation,
+        # drafters) never see one and gather exactly as before.
+        self._adp_graph_batch_hint: Optional[List[Tuple[bool, int, int]]] = None
 
     def _create_shared_static_tensors(self):
         """Allocates static tensors sized for the largest possible batch."""
@@ -451,6 +475,7 @@ class CUDAGraphRunner:
                                      batch: ScheduledRequests,
                                      can_run_cuda_graph: bool,
                                      sample_type: SampleType,
+                                     sampling_mode: Optional[int] = None,
                                      kv_regime: Optional[int] = None,
                                      packed_split: Optional[bool] = None):
         """Return ``[(can_run_cuda_graph, batch_size, sample_type, kv_regime,
@@ -461,17 +486,22 @@ class CUDAGraphRunner:
         that resolved different tiers would otherwise replay different graphs.
         So do the KV regime and the packed split decision once the decode
         graphs are keyed by them (-1 from a caller that does not agree them);
-        otherwise the vector keeps its three fields and every rank's regime
-        and decision read None.
+        otherwise every rank's regime and decision read None.
+        A ``sampling_mode`` (every rank passes one or none) rides along too, for
+        ``take_sampling_modes``.
         """
-        vector = [bool(can_run_cuda_graph), batch.batch_size, sample_type.value]
+        payload = [
+            bool(can_run_cuda_graph), batch.batch_size, sample_type.value
+        ]
         keyed_by_kv_regime = self.kv_regime_resolver is not None
         keyed_by_packed_split = self.packed_split_resolver is not None
         if keyed_by_kv_regime:
-            vector.append(-1 if kv_regime is None else int(kv_regime))
+            payload.append(-1 if kv_regime is None else int(kv_regime))
         if keyed_by_packed_split:
-            vector.append(-1 if packed_split is None else int(packed_split))
-        gathered = self.config.dist.tp_allgather_int64(vector)
+            payload.append(-1 if packed_split is None else int(packed_split))
+        if sampling_mode is not None:
+            payload.append(sampling_mode)
+        gathered = self.config.dist.tp_allgather_int64(payload)
         flags = gathered[:, 0].astype(bool).tolist()
         sizes = gathered[:, 1].tolist()
         tiers = gathered[:, 2].tolist()
@@ -489,6 +519,9 @@ class CUDAGraphRunner:
                 None if decision < 0 else bool(decision)
                 for decision in gathered[:, column].tolist()
             ]
+            column += 1
+        if sampling_mode is not None:
+            self._sampling_modes = (batch, gathered[:, column].tolist())
         return list(zip(flags, sizes, tiers, regimes, decisions))
 
     def _max_total_seq_len(
@@ -620,9 +653,11 @@ class CUDAGraphRunner:
         # this field (non-one-engine paths or non-spec batches).
         is_all_greedy_sample = bool(
             getattr(spec_metadata, "is_all_greedy_sample", True))
-        # The temperature-only variant of the advanced-sampling graphs.
-        temperature_only = (not is_all_greedy_sample and bool(
-            getattr(spec_metadata, "temperature_only", False)))
+        # The temperature-only variant of the advanced-sampling graphs: the
+        # one-engine fast paths' flag, or the vocabulary-shard sampler's.
+        temperature_only = not is_all_greedy_sample and (
+            bool(getattr(spec_metadata, "temperature_only", False))
+            or spec_metadata.is_all_temperature_only)
 
         # Sampling tier this graph must contain. Only meaningful when the fast
         # sampler is enabled; otherwise it stays FULL so every batch shares one
@@ -925,8 +960,11 @@ class CUDAGraphRunner:
         local_packed_split = self._packed_split_for_batch(
             batch, new_tensors_device, promoted_context_request_ids)
         graph_batch_info = self._gather_adp_graph_batch_info(
-            batch, can_run_cuda_graph, local_sample_type, local_kv_regime,
-            local_packed_split)
+            batch,
+            can_run_cuda_graph,
+            local_sample_type,
+            kv_regime=local_kv_regime,
+            packed_split=local_packed_split)
         all_can_graph = all(rank_info[0] for rank_info in graph_batch_info)
         all_batch_sizes_equal = all(rank_info[1] == graph_batch_info[0][1]
                                     for rank_info in graph_batch_info)
@@ -1111,6 +1149,18 @@ class CUDAGraphRunner:
         """
         return self.memory_pool
 
+    def _priority_capture_stream(self) -> Optional[torch.cuda.Stream]:
+        """The stream decode graphs are captured on: a high-priority one for a small engine whose
+        model opted in, else PyTorch's capture stream (None)."""
+        if not self.config.prioritize_decode_graphs:
+            return None
+        priority = decode_stream_priority(self.config.max_num_tokens)
+        if priority == 0:
+            return None
+        if self._capture_stream is None:
+            self._capture_stream = torch.cuda.Stream(priority=priority)
+        return self._capture_stream
+
     def _get_num_tokens_for_key(self, key: KeyType) -> int:
         token_per_generation = key.draft_len + 1
         return (key.num_contexts * key.context_query_len +
@@ -1210,7 +1260,8 @@ class CUDAGraphRunner:
             # setup/capture; release its reference before entering.
             output = None
             graph_pool = self.memory_pool or torch.cuda.graph_pool_handle()
-            with nccl_window_graph_capture(graph, graph_pool):
+            with nccl_window_graph_capture(
+                    graph, graph_pool, stream=self._priority_capture_stream()):
                 # A pre-replay hook reads the static inputs before the replay, so their copies must land before it.
                 prologue_pack = (None if self._pre_replay_hooks else
                                  step_inputs.capture_prologue())
@@ -1265,13 +1316,36 @@ class CUDAGraphRunner:
                 "input_ids leaves the tail of the static input buffer stale.")
         # With the decoder runner's buffers as the static inputs (static_input_ids)
         # the source is the static view itself, and there is nothing to copy; a
-        # staged step has already written them.
-        staged = static_inputs_staged == seqlen
+        # prestaged step has already written them.
+        prestaged = static_inputs_staged == seqlen
         static_input_ids = static_tensors["input_ids"][:seqlen]
-        if not staged and input_ids.data_ptr() != static_input_ids.data_ptr():
-            step_inputs.copy_(static_input_ids, input_ids)
+        copy_input_ids = (not prestaged and input_ids.data_ptr()
+                          != static_input_ids.data_ptr())
 
         position_ids = current_inputs["position_ids"]
+        # Hooks get their own corrected positions: the captured preprocessing
+        # corrects the static ones itself.
+        hook_positions = None
+        if self._pre_replay_hooks and position_id_offsets is not None:
+            assert current_inputs["attn_metadata"].num_ctx_tokens == 0, (
+                "Pre-replay position offsets require a generation-only batch")
+            if self._pre_replay_position_ids is None:
+                self._pre_replay_position_ids = torch.empty_like(
+                    static_tensors["position_ids"])
+            hook_positions = self._pre_replay_position_ids[..., :seqlen]
+        # One launch copies the ids and positions and writes the hooks' positions,
+        # unless an open step-input pack still defers copies into its sources.
+        staged = (self.config.stage_decode_inputs and copy_input_ids
+                  and not self.config.use_mrope and not step_inputs.is_open()
+                  and tuple(position_ids.shape) == (1, seqlen)
+                  and stage_replay_inputs(
+                      static_input_ids, input_ids,
+                      static_tensors["position_ids"][:, :seqlen], position_ids,
+                      hook_positions, None if hook_positions is None else
+                      position_id_offsets[:seqlen]))
+        if copy_input_ids and not staged:
+            step_inputs.copy_(static_input_ids, input_ids)
+
         if self.config.use_mrope:
             expected_position_ids_shape = (3, 1, seqlen)
             if tuple(position_ids.shape) != expected_position_ids_shape:
@@ -1280,7 +1354,7 @@ class CUDAGraphRunner:
                     f"for key {key}, but expected {expected_position_ids_shape}. "
                     "torch.Tensor.copy_() silently broadcasts mismatched shapes, "
                     "which would corrupt the static input buffer.")
-            if not staged:
+            if not prestaged:
                 static_tensors["position_ids"][:, :, :seqlen].copy_(
                     position_ids)
             mrope_delta_read_seq_slots = current_inputs.get(
@@ -1319,8 +1393,8 @@ class CUDAGraphRunner:
                     "torch.Tensor.copy_() silently broadcasts mismatched shapes, "
                     "which would corrupt the static input buffer.")
             static_position_ids = static_tensors["position_ids"][:, :seqlen]
-            if not staged and position_ids.data_ptr(
-            ) != static_position_ids.data_ptr():
+            if (not prestaged and not staged and position_ids.data_ptr()
+                    != static_position_ids.data_ptr()):
                 step_inputs.copy_(static_position_ids, position_ids)
 
         num_encoder_tokens = key.num_encoder_tokens
@@ -1357,18 +1431,11 @@ class CUDAGraphRunner:
             prologue_pack.quiesce_graph_window()
         if self._pre_replay_hooks:
             hook_tensors = static_tensors
-            if position_id_offsets is not None:
-                assert current_inputs["attn_metadata"].num_ctx_tokens == 0, (
-                    "Pre-replay position offsets require a generation-only batch"
-                )
-                # Captured preprocessing owns the in-place position update.
-                if self._pre_replay_position_ids is None:
-                    self._pre_replay_position_ids = torch.empty_like(
-                        static_tensors["position_ids"])
-                hook_positions = self._pre_replay_position_ids[..., :seqlen]
-                torch.add(static_tensors["position_ids"][..., :seqlen],
-                          position_id_offsets[:seqlen],
-                          out=hook_positions)
+            if hook_positions is not None:
+                if not staged:
+                    torch.add(static_tensors["position_ids"][..., :seqlen],
+                              position_id_offsets[:seqlen],
+                              out=hook_positions)
                 hook_tensors = dict(static_tensors, position_ids=hook_positions)
             for hook in self._pre_replay_hooks:
                 hook(key, seqlen, hook_tensors, current_inputs)
@@ -1504,9 +1571,24 @@ class CUDAGraphRunner:
         # configured batch size; that sum is just padded_bs.
         return padded_bs <= self.config.batch_size
 
-    def _get_padded_batch(self, batch: ScheduledRequests,
+    def set_adp_graph_batch_hint(self, hint: List[Tuple[bool, int,
+                                                        int]]) -> None:
+        """Stash the per-rank ``(can_run_cuda_graph, batch_size, tier)`` rows.
+
+        Overwrites any previous hint. Must be called identically on every
+        attention-DP rank (see ``_adp_graph_batch_hint``).
+        """
+        self._adp_graph_batch_hint = hint
+
+    def clear_adp_graph_batch_hint(self) -> None:
+        """Drop an unconsumed hint (no-op when none is set)."""
+        self._adp_graph_batch_hint = None
+
+    def _get_padded_batch(self,
+                          batch: ScheduledRequests,
                           resource_manager: ResourceManager,
-                          runtime_draft_len: int) -> int:
+                          runtime_draft_len: int,
+                          sampling_mode: Optional[int] = None) -> int:
         """Pads ``batch.generation_requests`` up to a captured graph size.
 
         Returns the number of appended dummy rows; the caller strips exactly
@@ -1530,7 +1612,9 @@ class CUDAGraphRunner:
         """
         can_run_cuda_graph = self._can_run_cuda_graph_batch(batch)
         batch_size = batch.batch_size
-        new_batch_size = self._get_padding_batch_size(batch, can_run_cuda_graph)
+        self._sampling_modes = None
+        new_batch_size = self._get_padding_batch_size(batch, can_run_cuda_graph,
+                                                      sampling_mode)
 
         if (not self.enabled or not self.padding_enabled
                 or not can_run_cuda_graph
@@ -1573,13 +1657,21 @@ class CUDAGraphRunner:
                                              padding_dummy_request,
                                              padding_size)
 
-    def _get_padding_batch_size(self, batch: ScheduledRequests,
-                                can_run_cuda_graph: bool) -> int:
+    def _get_padding_batch_size(self,
+                                batch: ScheduledRequests,
+                                can_run_cuda_graph: bool,
+                                sampling_mode: Optional[int] = None) -> int:
         new_batch_size = batch.batch_size
         if (self.enabled and self.config.enable_attention_dp
                 and self.config.mapping.tp_size > 1):
-            graph_batch_info = self._gather_adp_graph_batch_info(
-                batch, can_run_cuda_graph, SampleType.FULL)
+            # Stash contract (enable_packed_sync): use the executor's hint if
+            # present, otherwise perform the gather. The hint is popped so it
+            # can never be reused by a later forward.
+            graph_batch_info = self._adp_graph_batch_hint
+            self._adp_graph_batch_hint = None
+            if graph_batch_info is None:
+                graph_batch_info = self._gather_adp_graph_batch_info(
+                    batch, can_run_cuda_graph, SampleType.FULL, sampling_mode)
             if all(rank_info[0] for rank_info in graph_batch_info):
                 new_batch_size = max(rank_info[1]
                                      for rank_info in graph_batch_info)
@@ -1896,15 +1988,27 @@ class CUDAGraphRunner:
         # No suitable graph found
         return 0
 
+    def take_sampling_modes(self,
+                            batch: ScheduledRequests) -> Optional[List[int]]:
+        """Every attention-DP rank's ``sampling_mode`` from ``batch``'s padding exchange, once; None without one."""
+        shared, self._sampling_modes = self._sampling_modes, None
+        if shared is None or shared[0] is not batch:
+            return None
+        return shared[1]
+
     @contextlib.contextmanager
     def pad_batch(self,
                   scheduled_requests: ScheduledRequests,
                   resource_manager: ResourceManager,
-                  runtime_draft_len: int = 0):
-        """Context manager to pad a batch to a graph-compatible size."""
+                  runtime_draft_len: int = 0,
+                  sampling_mode: Optional[int] = None):
+        """Context manager to pad a batch to a graph-compatible size.
+
+        ``sampling_mode``: this rank's value for ``take_sampling_modes`` (every rank passes one or none).
+        """
         padding_size = self._get_padded_batch(scheduled_requests,
                                               resource_manager,
-                                              runtime_draft_len)
+                                              runtime_draft_len, sampling_mode)
         try:
             yield scheduled_requests
         finally:
@@ -2083,11 +2187,14 @@ class DSparkCUDAGraphRunner(CUDAGraphRunner):
             return agreement
         return None
 
-    def _get_padding_batch_size(self, batch: ScheduledRequests,
-                                can_run_cuda_graph: bool) -> int:
+    def _get_padding_batch_size(self,
+                                batch: ScheduledRequests,
+                                can_run_cuda_graph: bool,
+                                sampling_mode: Optional[int] = None) -> int:
         agreement = self._reusable_padding_agreement(batch)
         if agreement is None:
-            return super()._get_padding_batch_size(batch, can_run_cuda_graph)
+            return super()._get_padding_batch_size(batch, can_run_cuda_graph,
+                                                   sampling_mode)
         if not can_run_cuda_graph or not agreement.padding_ready:
             raise RuntimeError(
                 "DSpark cached ADP padding agreement lost a local "

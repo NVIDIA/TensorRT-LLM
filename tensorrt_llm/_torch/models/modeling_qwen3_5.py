@@ -55,6 +55,9 @@ _LANG_PREFIX = "model.language_model."
 
 _MTP_TOP_TO_TRTLLM = {
     "fc": "fc",
+    "fc_embedding": "fc_embedding",
+    "fc_hidden": "fc_hidden",
+    "hyper_connection_mixer": "shared_head.hyper_connection_mixer",
     "norm": "shared_head.norm",
     "pre_fc_norm_embedding": "pre_fc_norm_embedding",
     "pre_fc_norm_hidden": "pre_fc_norm_hidden",
@@ -268,14 +271,16 @@ class Qwen35ConfigCompat:
         """Translate HF quantization exclude-module paths to TRT-LLM names.
 
         - Strip model.language_model. prefix -> model.
-        - Drop model.visual.* and mtp.* entries
+        - Drop model.visual.* entries
         - Map split projection names to packed TRT-LLM names
+        - Keep mtp.* in HF naming for _normalize_qwen35_exclude_modules to
+          translate once num_hidden_layers is known
         """
         normalized = set()
         for name in modules:
             if name.startswith("model.language_model."):
                 name = "model." + name[len("model.language_model.") :]
-            if name.startswith("model.visual.") or name.startswith("mtp."):
+            if name.startswith("model.visual."):
                 continue
             name = re.sub(r"\.in_proj_[ab]$", ".in_proj_ba", name)
             name = re.sub(r"\.in_proj_(q|k|v|z|qkv)$", ".in_proj_qkvz", name)
@@ -489,6 +494,7 @@ def _normalize_qwen35_exclude_modules(model_config, keep_lm_head_quant=False):
     map the MTP layer to ``model.layers.<num_hidden_layers>.*``.  This
     function translates the patterns so that
     ``apply_quant_config_exclude_modules`` can match them.
+    Dense MLP projections include the runtime adapter's ``.mlp.mlp.`` level.
 
     ``keep_lm_head_quant`` (see _lm_head_nvfp4_enabled) skips the lm_head
     force-exclusion so the quantized LMHead path can engage.
@@ -507,6 +513,12 @@ def _normalize_qwen35_exclude_modules(model_config, keep_lm_head_quant=False):
         # Drop vision tensors (not part of the language model graph)
         if name.startswith("model.visual"):
             continue
+        # Only dense _DenseMlpAdapter paths match; MoE expert paths are unchanged.
+        name = re.sub(
+            r"(\.layers\.[^.]+\.mlp)\.(gate_proj|up_proj|down_proj|gate_up_proj)(\b|\*)",
+            r"\1.mlp.\2\3",
+            name,
+        )
         # Translate MTP-namespace patterns to TRT-LLM paths so the MTP
         # layer (which the checkpoint stores unquantized) gets correctly
         # excluded from the global NVFP4/FP8 quant_config.

@@ -83,6 +83,7 @@ COORDINATOR_RESERVATION_TIMEOUT_ENV = "TRTLLM_DISAGG_COORDINATOR_RESERVATION_TIM
 COORDINATOR_RESERVATION_TIMEOUT_DEFAULT_S = 180.0
 COORDINATOR_RESERVATION_LOCK_STRIPES = 256
 COORDINATOR_STATE_SYNC_INTERVAL_S = 3.0
+COORDINATOR_READINESS_TIMEOUT_S = 5.0
 
 
 def coordinator_reservation_timeout() -> float:
@@ -547,6 +548,8 @@ class CoordinatorClient(DisaggCoordinator):
         self._startup_timeout_s = startup_timeout_s
         self._session: Optional[aiohttp.ClientSession] = None
         self._sync_task: Optional[asyncio.Task] = None
+        self._refresh_task: Optional[asyncio.Task[bool]] = None
+        self._stopping = False
         self._is_ready = False
         if config.disagg_cluster_config is not None:
             self._state_sync_interval_s = config.disagg_cluster_config.heartbeat_interval_sec
@@ -599,6 +602,7 @@ class CoordinatorClient(DisaggCoordinator):
         return self._session
 
     async def start(self) -> None:
+        self._stopping = False
         # Fail fast: probe /cluster_info with bounded retry so a delegating server
         # exits non-zero if its coordinator never comes up (vs 500-ing every req).
         info = await self._await_coordinator()
@@ -608,15 +612,25 @@ class CoordinatorClient(DisaggCoordinator):
         )
 
     async def _sync_coordinator_state(self, interval_s: float) -> None:
+        """Periodically join or start the client's shared state refresh."""
         while True:
-            try:
-                await asyncio.sleep(interval_s)
-                await self._apply_cluster_info(await self.cluster_info())
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:  # noqa: BLE001
-                self._is_ready = False
-                logger.warning(f"CoordinatorClient state sync failed: {error}")
+            await asyncio.sleep(interval_s)
+            await asyncio.shield(self._get_refresh_task())
+
+    def _get_refresh_task(self) -> asyncio.Task[bool]:
+        """Keep one refresh in flight, owned by this client rather than a request."""
+        if self._refresh_task is None or self._refresh_task.done():
+            self._refresh_task = asyncio.create_task(self._refresh_coordinator_state())
+        return self._refresh_task
+
+    async def _refresh_coordinator_state(self) -> bool:
+        """Apply a coordinator snapshot, leaving readiness false on failure."""
+        try:
+            await self._apply_cluster_info(await self.cluster_info())
+        except Exception as error:  # noqa: BLE001
+            self._is_ready = False
+            logger.warning(f"CoordinatorClient state sync failed: {error}")
+        return self._is_ready
 
     async def _await_coordinator(self) -> Dict[str, Any]:
         """Poll the coordinator's /cluster_info until reachable, or raise.
@@ -663,13 +677,29 @@ class CoordinatorClient(DisaggCoordinator):
         return get_global_disagg_request_id(self._node_id, self._process_id)
 
     async def is_ready(self) -> bool:
+        """Use cached readiness or await shared refresh work within the caller budget."""
+        if self._stopping:
+            return False
+        if not self._is_ready:
+            # Another fleet worker may have passed /health before this worker's
+            # next background poll. Refresh its local routing state before rejecting.
+            try:
+                # Limit this caller's wait without interrupting shared preparation.
+                return await asyncio.wait_for(
+                    asyncio.shield(self._get_refresh_task()),
+                    timeout=COORDINATOR_READINESS_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                return False
         return self._is_ready
 
     async def _apply_cluster_info(self, info: Dict[str, Any]) -> None:
-        self._is_ready = info.get("is_ready", False)
+        """Publish readiness only after local routing state is fully prepared."""
+        self._is_ready = False
         self._sync_delegating_router_configs(info)
         await self._sync_router_server_lists(info)
         self._sync_render_fingerprints(info)
+        self._is_ready = info.get("is_ready", False)
 
     def _sync_render_fingerprints(self, info: Dict[str, Any]) -> None:
         published = info.get("render_fingerprints")
@@ -749,10 +779,15 @@ class CoordinatorClient(DisaggCoordinator):
             return await resp.read(), resp.status, resp.headers.get("Content-Type")
 
     async def stop(self) -> None:
-        if self._sync_task is not None:
-            self._sync_task.cancel()
-            await asyncio.gather(self._sync_task, return_exceptions=True)
-            self._sync_task = None
+        """Stop owned refresh work before closing its sessions and routers."""
+        self._stopping = True
+        tasks = [task for task in (self._sync_task, self._refresh_task) if task is not None]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self._sync_task = None
+        self._refresh_task = None
+        self._is_ready = False
         if self._session is not None:
             await self._session.close()
             self._session = None

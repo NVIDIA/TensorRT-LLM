@@ -17,6 +17,7 @@
 
 #include "kv_cache_manager_v2/storage/core.h"
 
+#include "kv_cache_manager_v2/utils/copyUtils.h"
 #include "kv_cache_manager_v2/utils/funcGuard.h"
 
 #include "tensorrt_llm/common/assert.h"
@@ -120,7 +121,11 @@ Slot SlotAllocator::allocate()
         throw OutOfPagesError("SlotAllocator: no free slots");
     }
     scrubEvents();
+    return takeFreeSlot();
+}
 
+Slot SlotAllocator::takeFreeSlot()
+{
     Slot slot;
     if (mNumReadyRecycledSlots > 0)
     {
@@ -157,9 +162,11 @@ std::vector<Slot> SlotAllocator::allocateMultiple(SlotCount numSlots)
     }
     std::vector<Slot> result;
     result.reserve(slotCountToSizeT(numSlots));
+    // Slots released together share one event, so one readiness scan serves the whole batch.
+    scrubEvents();
     for (SlotCount slotCount{0}; slotCount < numSlots; ++slotCount)
     {
-        result.push_back(allocate());
+        result.push_back(takeFreeSlot());
     }
     return result;
 }
@@ -187,7 +194,8 @@ void SlotAllocator::release(Slot slot)
     {
         mOverflowSlots.push_back(std::move(slot));
     }
-    scrubEvents();
+    // Readiness is scanned at the next allocation: a request releases all its slots under one
+    // event, which would otherwise be queried once per slot.
     TLLM_CHECK_DEBUG(check());
 }
 
@@ -387,7 +395,8 @@ HostSlotPool::HostSlotPool(size_t slotSize, SlotCount numSlots, size_t vmSize, H
     , mHostMem(std::max(vmSize, alignedSize(numSlots)), alignedSize(numSlots),
           HostMemBackingOptions{.registerUnit = slotSize,
               .allowRemoteNumaFallback = options.allowRemoteNumaFallback,
-              .useThp = options.useThp},
+              .useThp = options.useThp,
+              .numaNode = options.numaNode},
           /*waitForFill=*/false)
 {
 }
@@ -470,6 +479,10 @@ void DiskSlotPool::destroy()
 {
     if (mFd != kBadFileDescriptor)
     {
+        // This file's transfers are normally done by now: the pool group synchronizes its slots' ready events, which
+        // are recorded after each transfer's completion wait, before destroying them. The wait guards the descriptor
+        // against any piece still in flight. It is process-wide, so it also waits for other managers' disk I/O.
+        waitForDiskIo();
         ::close(mFd);
         mFd = kBadFileDescriptor;
     }
