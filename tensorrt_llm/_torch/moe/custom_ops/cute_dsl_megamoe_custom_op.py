@@ -1262,12 +1262,16 @@ def _default_megamoe_tactic_for_problem(
     if not megamoe_quant_kind_is_block_scaled(quant_kind):
         _check_megamoe_quant_kind(quant_kind, sm_version)
         # BF16 runs only the Blackwell kernel, so none of the SM107 tables
-        # apply: the Blackwell token buckets with the BF16 MMA tile K.
-        tactic = (
-            _MEGAMOE_NONBULK_STANDALONE_TACTIC
-            if combine_format != "bf16" or in_kernel_fc2_reduce
-            else default_megamoe_tactic(num_tokens)
-        )
+        # apply: NVFP4's Blackwell choices with the BF16 MMA tile K. A quantized
+        # combine takes NVFP4's quantized-combine tactic (each FC2 tile
+        # publishes its completion at once for the token-back warps); the bulk
+        # NVFP4-combine store stays NVFP4-only.
+        if combine_format != "bf16":
+            tactic = _MEGAMOE_QUANTIZED_COMBINE_TACTIC
+        elif in_kernel_fc2_reduce:
+            tactic = _MEGAMOE_NONBULK_STANDALONE_TACTIC
+        else:
+            tactic = default_megamoe_tactic(num_tokens)
         return _megamoe_tactic_with_mma_tile_k(tactic, _BF16_MMA_TILE_K)
     if combine_format != "bf16":
         if sm_version == 107:
