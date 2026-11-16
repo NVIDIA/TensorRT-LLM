@@ -24,6 +24,7 @@ from ...helpers.ptx_helpers import (
     cp_async_bulk_s2g,
     cp_reduce_async_bulk_add_bf16_s2g,
     cp_reduce_async_bulk_add_u32_s2g,
+    ld_acquire_sys_b64,
     nanosleep,
     read_clock64,
     red_add_relaxed_sys_s32,
@@ -111,6 +112,10 @@ def _copy_atom(dtype, num_bits_per_copy: int):
     return cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), dtype, num_bits_per_copy=num_bits_per_copy)
 
 
+# The top byte of TokenSrcMetadata is reserved; bit 63 marks a landed row.
+_EARLY_PULL_TAG = -(1 << 63)
+
+
 class _MetadataPushRouter(KernelComponent):
     """Sort and push routing metadata into each destination rank's final pool."""
 
@@ -169,6 +174,7 @@ class _MetadataPushRouter(KernelComponent):
             # (one NVLink domain); the internode component sets its ranks_per_node so the size
             # exchange, the metadata push and the ready counters stay inside the node.
             "ranks_per_node": OptionalRequirement(int),
+            "early_pull": OptionalRequirement(bool),
         }
 
     def __init__(self, problem_desc: ProblemDesc, impl_desc: ImplDesc) -> None:
@@ -188,6 +194,7 @@ class _MetadataPushRouter(KernelComponent):
         self.token_padding_block = impl_desc["token_padding_block"]
         self.promised_launchable_sm_count = impl_desc["promised_launchable_sm_count"]
         self.router_smem_limit_bytes = impl_desc.get("router_smem_limit_bytes", 227 * 1024)
+        self.early_pull = bool(impl_desc.get("early_pull", False))
 
         self._validate_router_configuration()
         self.expert_count_padded = round_up(self.expert_count, 4)
@@ -385,6 +392,8 @@ class _MetadataPushRouter(KernelComponent):
             (self.worst_case_token_count,),
             buffer_space="shared",
             byte_alignment=16,
+            # Early pull polls each word until it lands, so every call starts with the words zeroed.
+            reset="tail_reset" if self.early_pull else "data",
         )
         if self.apply_topk_at_fc1:
             workspace.register(
@@ -903,6 +912,8 @@ class _MetadataPushRouter(KernelComponent):
         """Store one sorted route's record (metadata, top-k score, activation scale) into the owner's pool slot."""
         peer_offset = self._peer_rank_ptr_mapper.map(Int64(0), destination_rank, Int64(0))
         metadata = cute.arch.load(source_metadata + route, cutlass.Int64)
+        if cutlass.const_expr(self.early_pull):
+            metadata = metadata ^ Int64(_EARLY_PULL_TAG)
         stg_b64(
             destination_metadata_base + peer_offset + Int64(destination_position) * Int64(TokenSrcMetadata.nbytes),
             metadata,
@@ -1281,6 +1292,16 @@ class _MetadataPushRouter(KernelComponent):
         cute.arch.sync_warp()
 
     @cute.jit
+    def wait_for_push_tables(self, device_workspace: DeviceWorkspace) -> None:
+        thread_idx, _, _ = cute.arch.thread_idx()
+        lane_idx = thread_idx % Int32(32)
+        if lane_idx == Int32(0):
+            ready = device_workspace.ptr(self.push_table_ready_region)
+            while cute.arch.load(ready, Int32, sem="acquire", scope="gpu") != Int32(1):
+                nanosleep(100)
+        cute.arch.sync_warp()
+
+    @cute.jit
     def wait_for_metadata_ready(self, device_workspace: DeviceWorkspace, sleep_cycles: int = 1000) -> None:
         thread_idx, _, _ = cute.arch.thread_idx()
         lane_idx = thread_idx % Int32(32)
@@ -1377,6 +1398,7 @@ class TokenCommNonDeterministic(KernelComponent):
             "reduce_topk_in_kernel": bool,
             "router_smem_limit_bytes": OptionalRequirement(int),
             "one_round_dispatch": OptionalRequirement(bool),
+            "early_pull": OptionalRequirement(bool),
             "comm_cta_count": OptionalRequirement(int),
             "comm_warps": OptionalRequirement(tuple),
             "token_back_on_compute_ctas": OptionalRequirement(bool),
@@ -1452,6 +1474,7 @@ class TokenCommNonDeterministic(KernelComponent):
         # One-round push dispatch (``_OneRoundRouter``): the router launch pushes payloads and records, and
         # ``token_in`` copies rows from the local received plane instead of pulling them from the peers.
         self.one_round_dispatch = bool(impl_desc.get("one_round_dispatch", False))
+        self.early_pull = bool(impl_desc.get("early_pull", False))
         # Tail parity (the kernel enables it on its workspace): the shared tail-reset counters are kept twice and
         # selected by a per-rank call epoch. Call n zeroes the copy call n + 1 uses right after its pulls, so the
         # tail needs only the drain barrier: no shared reset and no publish barrier after it.
@@ -1555,6 +1578,11 @@ class TokenCommNonDeterministic(KernelComponent):
                 raise NotImplementedError("The BF16 wire requires comm_stage_depths[0]=1.")
         if self.sf_padding_block % 128 != 0:
             raise ValueError("sf_padding_block must be a multiple of 128.")
+        if self.early_pull and (
+            self.one_round_dispatch or self.cta_specialized or self.dispatch_stage_depth > 1
+            or self.token_in_stage_split
+        ):
+            raise NotImplementedError("Early pull currently requires fused single-stage metadata-push dispatch.")
         if self.token_in_stage_split:
             if self.activation_is_quantized or self.token_back_enabled:
                 raise NotImplementedError(
@@ -1759,6 +1787,11 @@ class TokenCommNonDeterministic(KernelComponent):
     def pool_expert_base_tensor(self, device_workspace: DeviceWorkspace) -> cute.Tensor:
         """Pool base of every owned expert (padded prefix of ``local_expert_sizes``)."""
         return self._router.pool_expert_base_tensor(device_workspace)
+
+    @cute.jit
+    def wait_for_routing_scores(self, device_workspace: DeviceWorkspace) -> None:
+        if cutlass.const_expr(self.early_pull):
+            self._router.wait_for_metadata_ready(device_workspace)
 
     @cute.jit
     def token_src_metadata_tensor(self, device_workspace: DeviceWorkspace) -> cute.Tensor:
@@ -2614,7 +2647,11 @@ class TokenCommNonDeterministic(KernelComponent):
         iket.range_pop()
 
         iket.range_push("token_in.wait_metadata_ready")
-        self._router.wait_for_metadata_ready(self._device_workspace)
+        if cutlass.const_expr(self.early_pull):
+            # Each row waits for its own metadata word below; the pool bases are all that must be ready.
+            self._router.wait_for_push_tables(self._device_workspace)
+        else:
+            self._router.wait_for_metadata_ready(self._device_workspace)
         if cutlass.const_expr(self.one_round_dispatch):
             # The plane rows were written by peers' generic stores and are read below through TMA.
             fence_proxy_async_global()
@@ -2707,10 +2744,17 @@ class TokenCommNonDeterministic(KernelComponent):
                 ready_slot_idx = expert_ready_slot_begin + token_in_expert // Int32(self.tokens_per_fc1_ready_slot)
 
                 self.wait_for_pool_record(local_expert, token_in_expert)
-                metadata = TokenSrcMetadata.load(
-                    token_metadata_pointer.toint() + Int64(pool_token_idx) * Int64(TokenSrcMetadata.nbytes),
-                    wide_topk=self.wide_topk_records,
-                )
+                metadata_address = token_metadata_pointer.toint() + Int64(pool_token_idx) * Int64(TokenSrcMetadata.nbytes)
+                if cutlass.const_expr(self.early_pull):
+                    word = ld_acquire_sys_b64(metadata_address)
+                    while word == Int64(0):
+                        nanosleep(64)
+                        word = ld_acquire_sys_b64(metadata_address)
+                    metadata = TokenSrcMetadata.unpack(word ^ Int64(_EARLY_PULL_TAG), wide_topk=self.wide_topk_records)
+                    with cute.arch.elect_one():
+                        metadata.store(metadata_address, wide_topk=self.wide_topk_records)
+                else:
+                    metadata = TokenSrcMetadata.load(metadata_address, wide_topk=self.wide_topk_records)
                 if cutlass.const_expr(self.one_round_dispatch):
                     # The source rank already pushed this row into its plane of the local workspace.
                     plane_row = Int64(metadata.src_rank) * Int64(self.max_tokens_per_rank) + Int64(metadata.src_token)

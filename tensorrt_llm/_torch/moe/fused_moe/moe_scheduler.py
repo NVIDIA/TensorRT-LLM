@@ -1523,8 +1523,17 @@ class FusedCommMoEScheduler(MoEScheduler):
         if not outputs:
             cast_dtype = output_dtype if output_dtype is not None else x.dtype
             return x.new_empty((0, x.shape[1]), dtype=cast_dtype)
+        if not do_finalize:
+            # Each launch overwrites the workspace rows the previous one handed back.
+            if len(outputs) != 1:
+                raise NotImplementedError("Unreduced fused-comm MoE output needs a single chunk")
+            return outputs[0]
         output = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
         return self._as_rank_partial_if_reduced_externally(output)
+
+    def _returns_unreduced(self) -> bool:
+        moe = self.moe
+        return moe.use_dp and getattr(moe.backend, "supports_unreduced_output", lambda: False)()
 
     def _as_rank_partial_if_reduced_externally(self, output: torch.Tensor) -> torch.Tensor:
         """Match the external-comm output contract under attention TP (TEP).
@@ -1742,7 +1751,9 @@ class FusedCommMoEScheduler(MoEScheduler):
         assert not moe.apply_router_weight_on_input, (
             "Fused-comm MoE does not support apply_router_weight_on_input"
         )
-        assert do_finalize, "Fused-comm MoE always finalizes inside the fused kernel"
+        assert do_finalize or self._returns_unreduced(), (
+            "Fused-comm MoE always finalizes inside the fused kernel"
+        )
 
         if isinstance(x, Fp4QuantizedTensor):
             raise NotImplementedError(
@@ -1907,15 +1918,16 @@ class FusedCommMoEScheduler(MoEScheduler):
         # num_slots in quantization.py).
         # Fused-comm backends own the EP exchange, so there is no comm plan:
         # nothing outside the fused kernel decided anything about this forward.
-        out = moe.backend.run_moe(
-            MoERunContext(
-                token_selected_experts=token_selected_slots,
-                token_final_scales=token_final_scales,
-                x=moe_input,
-                x_sf=x_sf,
-                output_dtype=output_dtype,
-                replica_plan=replica_plan,
-            )
+        ctx = MoERunContext(
+            token_selected_experts=token_selected_slots,
+            token_final_scales=token_final_scales,
+            x=moe_input,
+            x_sf=x_sf,
+            output_dtype=output_dtype,
+            replica_plan=replica_plan,
+        )
+        out = (
+            moe.backend.run_moe(ctx) if do_finalize else moe.backend.run_moe(ctx, do_finalize=False)
         )
 
         # ----- EPLB: start/done CPU rebalance, AFTER run_moe -----

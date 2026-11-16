@@ -576,6 +576,41 @@ _SM107_DSV41_FLASH_DEFAULT_TACTICS: dict[Tuple, Tuple] = {
 }
 
 
+_SM107_DSV41_FLASH_DEFAULT_TACTICS[
+    (
+        107,
+        8,
+        6,
+        48,
+        5120,
+        2304,
+        4608,
+        2000,
+        str(torch.bfloat16),
+        True,
+        10.0,
+        None,
+        None,
+        False,
+        "bf16",
+        None,
+        None,
+        0,
+    )
+] = (
+    [256, 256, 256],
+    [4, 1, 1],
+    None,
+    ("phase_interleave", None),
+    "atomic_counter",
+    "epi_warps",
+    True,
+    1,
+    1,
+    (1, 4),
+)
+
+
 # Static defaults for the SM103 DeepSeek-V4.1-Flash shapes at DEP2/4/8/16, also with one extra slot
 # per rank (warmup placement with hot-expert copies): above
 # _SM103_DSV41_FLASH_GROUPED_MAX_ROWS_PER_EXPERT, the phase-interleaved cluster-4 schedule with one FC2
@@ -615,23 +650,60 @@ _SM103_DSV41_FLASH_DEFAULT_TACTICS: dict[Tuple, Tuple] = {
     for extra_slots in (0, 1)
 }
 # Mean routed rows per local expert at the rung (max_tokens_per_rank x top-k / experts per rank) up to
-# which the grouped schedule of _SM103_DSV41_FLASH_SMALL_RUNG_TACTICS beats phase interleave.
+# which _SM103_DSV41_FLASH_SMALL_RUNG_TACTICS apply; at 2-16 ranks their grouped schedule wins.
 _SM103_DSV41_FLASH_GROUPED_MAX_ROWS_PER_EXPERT = 32
+# At 32 ranks phase interleave wins: the fused shared expert's FC2 tiles go to the first free CTAs.
+_SM103_DSV41_FLASH_DEP32_SMALL_RUNG_TACTIC: Tuple = (
+    [256, 128, 256],
+    [2, 1, 1],
+    None,
+    ("phase_interleave", 2),
+    "atomic_counter",
+    "epi_warps",
+    True,
+    1,
+    1,
+    (1, 1),
+)
 
 _SM103_DSV41_FLASH_SMALL_RUNG_TACTICS: dict[Tuple, Tuple] = {
-    key: (
-        [256, 128, 256],
-        [4, 1, 1],
-        [2, 1, 1],
-        ("grouped", 512),
-        "atomic_counter",
-        "epi_warps",
-        True,
-        2,
-        1,
-        (1, 4),
-    )
-    for key in _SM103_DSV41_FLASH_DEFAULT_TACTICS
+    **{
+        key: (
+            [256, 128, 256],
+            [4, 1, 1],
+            [2, 1, 1],
+            ("grouped", 512),
+            "atomic_counter",
+            "epi_warps",
+            True,
+            2,
+            1,
+            (1, 4),
+        )
+        for key in _SM103_DSV41_FLASH_DEFAULT_TACTICS
+    },
+    **{
+        (
+            103,
+            32,
+            6,
+            384 // 32 + extra_slots,
+            5120,
+            2304,
+            4608,
+            str(torch.bfloat16),
+            True,
+            10.0,
+            None,
+            None,
+            False,
+            "bf16",
+            None,
+            None,
+            0,
+        ): _SM103_DSV41_FLASH_DEP32_SMALL_RUNG_TACTIC
+        for extra_slots in (0, 1)
+    },
 }
 
 # The evict-first L2 hint on the expert-weight TMA loads pays while each weight tile is streamed
@@ -1817,6 +1889,26 @@ if IS_MEGAMOE_OP_AVAILABLE:
     # an autotune opt-in. Reset profiling scratch on reuse and overwrite READY
     # inputs for every call.
     _MEGAMOE_RUNNER_CACHE: dict = {}
+    _MEGAMOE_UNREDUCED_VIEWS: dict = {}
+
+    def _workspace_region_view(
+        buffer: torch.Tensor, kernel: Any, region: str, dtype: torch.dtype
+    ) -> torch.Tensor:
+        workspace = kernel._device_workspace
+        rows = workspace.region(region).shape
+        flat = buffer.view(torch.uint8).reshape(-1)
+        return (
+            flat.narrow(0, workspace.offset(region), workspace.nbytes(region))
+            .view(dtype)
+            .view(*rows)
+        )
+
+    def megamoe_unreduced_views(
+        shared_workspace: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Combine rows [max_T, top_k, H] and shared expert rows [rows, H] (or None) of the last
+        ``topk_reduce=False`` launch on ``shared_workspace``."""
+        return _MEGAMOE_UNREDUCED_VIEWS[int(shared_workspace.data_ptr())]
 
     @functools.lru_cache(maxsize=1)
     def _cute_launch_helpers():
@@ -3018,6 +3110,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
             peer_offsets: Optional[List[int]] = None,
             shared_workspace: Optional[torch.Tensor] = None,
             shared_num_tokens: int = 0,
+            topk_reduce: bool = True,
             **kwargs,
         ) -> None:
             del kwargs
@@ -3315,6 +3408,11 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 runtime_kwargs["hot_expert_weight_ready_generation"] = cutlass.Uint64(
                     int(self._helper_ready_generation)
                 )
+            if not topk_reduce:
+                # The same kernel and workspaces, launched without its TopkReduce.
+                kernel = copy.copy(kernel)
+                kernel.launch_topk_reduce = False
+                cache_key = (cache_key, "noreduce")
             # unique_id() includes helper_expert_count, separating cached ABIs.
             cached = self.__class__.kernel_cache.get(cache_key)
             if cached is None:
@@ -3332,6 +3430,20 @@ if IS_MEGAMOE_OP_AVAILABLE:
             ):
                 compiled = self._eager_compiled(cache_key, kernel, runtime_kwargs)
             compiled(**runtime_kwargs)
+            if not topk_reduce:
+                _MEGAMOE_UNREDUCED_VIEWS[int(shared_workspace.data_ptr())] = (
+                    _workspace_region_view(
+                        shared_workspace,
+                        kernel,
+                        kernel.token_comm.pre_reduced_activation_region,
+                        combine_output.dtype,
+                    ),
+                    _workspace_region_view(
+                        local_workspace, kernel, kernel.shared_output_region, combine_output.dtype
+                    )
+                    if kernel.fuse_shared
+                    else None,
+                )
             return combine_output
 
         def _eager_compiled(self, cache_key: Tuple, kernel: Any, runtime_kwargs: dict) -> Any:
@@ -3489,6 +3601,7 @@ if IS_MEGAMOE_OP_AVAILABLE:
         helper_expert_count: int = 0,
         hot_expert_weight_ready_flags: Optional[torch.Tensor] = None,
         hot_expert_weight_ready_generation: int = 0,
+        topk_reduce: bool = True,
     ) -> None:
         """Run the fused MegaMoE CuteDSL NVFP4 kernel.
 
@@ -3519,6 +3632,9 @@ if IS_MEGAMOE_OP_AVAILABLE:
         ``shared_intermediate_size`` fuses an FP8 shared expert: MXFP8 weights and the MXFP8
         activation (``shared_num_tokens`` live rows) run as extra tiles, and its output joins the
         top-k reduction into ``combine_output``.
+
+        ``topk_reduce=False`` (form-A only) skips the top-k sum and leaves ``combine_output``
+        untouched; :func:`megamoe_unreduced_views` then returns the combine and shared expert rows.
         """
         sm_version = get_sm_version()
         if sm_version not in (100, 103, 107):
@@ -3600,12 +3716,17 @@ if IS_MEGAMOE_OP_AVAILABLE:
                     peer_offsets=peer_offsets,
                     shared_workspace=shared_workspace,
                     shared_num_tokens=shared_num_tokens,
+                    topk_reduce=topk_reduce,
                 )
             finally:
                 # Release the cached runner reference to this generation's terminal tensor.
                 # The next call supplies fresh READY inputs.
                 runner._helper_ready_flags = None
             return
+        if not topk_reduce:
+            raise NotImplementedError(
+                "topk_reduce=False takes the default tactic, not an autotuned one"
+            )
         tuner = AutoTuner.get()
         # Opt-IN: in tuning mode the MERGE lockstep sweep runs (made safe by
         # the tactic-change fence in forward); outside it choose_one is a pure
@@ -3725,5 +3846,6 @@ if IS_MEGAMOE_OP_AVAILABLE:
         helper_expert_count: int = 0,
         hot_expert_weight_ready_flags: Optional[torch.Tensor] = None,
         hot_expert_weight_ready_generation: int = 0,
+        topk_reduce: bool = True,
     ) -> None:
         return None

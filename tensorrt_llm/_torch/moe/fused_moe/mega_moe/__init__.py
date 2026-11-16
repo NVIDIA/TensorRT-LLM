@@ -33,6 +33,7 @@ from .mega_moe_cute_dsl import (
     MegaMoECuteDsl,
     MegaMoeCuteDslUnavailable,
     MegaMoECuteDslWeightView,
+    MegaMoeUnreduced,
     TrtllmCutedslMegaMoeNvfp4Impl,
     is_megamoe_cute_dsl_runtime_available,
 )
@@ -44,6 +45,7 @@ __all__ = [
     "MegaMoECuteDslWeightView",
     "MegaMoeCuteDslUnavailable",
     "MegaMoEDeepGemm",
+    "MegaMoeUnreduced",
     "NVFP4MegaMoECuteDslMethod",
     "TrtllmCutedslMegaMoeNvfp4Impl",
     "W4A8MXFP4MXFP8MegaMoEDeepGemmMethod",

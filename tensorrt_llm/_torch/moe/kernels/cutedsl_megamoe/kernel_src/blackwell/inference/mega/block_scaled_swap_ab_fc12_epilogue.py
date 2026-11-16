@@ -44,6 +44,7 @@ from .....helpers.ptx_helpers import (
     cvt_f32_to_fp8_to_f32,
     movmatrix_b16,
     red_add_relaxed_sys_v2_bf16x2,
+    stmatrix_x4_trans_b16,
 )
 from .....helpers.smem_workspace import SmemRegion, SmemWorkspace
 from ....function_mapping import CoordinateSpace, FunctionMapping
@@ -966,6 +967,8 @@ class SwapABGatedActEpilogue(KernelComponent):
     )
     # A 144 B FP8 stride rotates each row by four SMEM banks.
     _Fc2UblkFp8RowStrideBytes = 144
+    # A staged row: 256 B of BF16 + 16 B, so the eight rows of an stmatrix block hit distinct banks.
+    _Fc2UblkBf16RowStrideElements = 136
     _ScratchByteAlignment = 128
 
     @classmethod
@@ -992,6 +995,8 @@ class SwapABGatedActEpilogue(KernelComponent):
             "fc1_activation_per_token_scale": OptionalRequirement(bool),
             "swiglu_alpha": OptionalRequirement(Optional[float]),
             "swiglu_beta": OptionalRequirement(Optional[float]),
+            # The DeepSeek-V4 MoE (top-k weights at FC1) stages its BF16 UBLK rows with stmatrix.
+            "apply_topk_at_fc1": OptionalRequirement(bool),
         }
 
     _supported_gate_activations: ClassVar[Tuple[str, ...]] = ("swiglu", "quick_geglu")
@@ -1120,6 +1125,12 @@ class SwapABGatedActEpilogue(KernelComponent):
         self.fc2_use_ublk = self.fc2_use_bulk and not self.fc2_output_is_local
         if self.fc2_use_ublk and self.combine_format.act_dtype.width == 4:
             raise ValueError("FC2 UBLK does not support an FP4 combine payload.")
+        # Only for MoEs that apply the top-k weights at FC1; others keep one 16-bit store per element.
+        self.fc2_ublk_stmatrix = (
+            self.fc2_use_ublk
+            and not self.combine_format.is_quantized
+            and bool(problem_desc.get("apply_topk_at_fc1", False))
+        )
         if self.reduce_topk_in_kernel and self.combine_format.act_dtype is not cutlass.BFloat16:
             raise ValueError("In-kernel top-k reduction requires a BF16 combine format.")
         self.reduce_topk_in_epilogue = self.reduce_topk_in_kernel and not self.token_back_push_data
@@ -1348,6 +1359,8 @@ class SwapABGatedActEpilogue(KernelComponent):
         row_stride_elements = (
             self._Fc2UblkFp8RowStrideBytes
             if self.combine_format.act_dtype.width == 8
+            else self._Fc2UblkBf16RowStrideElements
+            if self.fc2_ublk_stmatrix
             else self._EpilogueFc2HiddenTileSize
         )
         return SmemRegion(
@@ -2593,6 +2606,7 @@ class SwapABFc2Epilogue(_ImmutableAfterInit):
                 combine_format=base.combine_format,
                 cta_token_tile_size=base.cta_tile_n,
                 cta_hidden_tile_size=base.cta_tile_m,
+                stmatrix=base.fc2_ublk_stmatrix,
             )
         else:
             self.smem_tensor = None
@@ -3252,6 +3266,23 @@ def fc2_ublk_tmem_acc_load(*, tmem_subtile_tensor: cute.Tensor, epi, **_):
 
 
 @cute.jit
+def fc2_ublk_stmatrix_tmem_acc_load(*, tmem_subtile_tensor: cute.Tensor, epi, **_):
+    # This warp's 32-hidden x 64-token slice as two 16-lane loads: per 8-token step a thread holds
+    # hidden rows lane // 4 and lane // 4 + 8 at tokens 2 * (lane % 4) and +1 (stmatrix fragments).
+    tmem_subtile_per_warp = cute.logical_divide(tmem_subtile_tensor, (32, None))[(None, epi.warp_idx), None]
+    ptr = tmem_subtile_per_warp.iterator
+    half_lane_offset = 16 * TmemTranspose32x64B16Movm._tmem_row_stride
+    top_view = cute.make_tensor(ptr, TmemTranspose32x64B16Movm._tmem_layout(16, 64))
+    bottom_view = cute.make_tensor(ptr + half_lane_offset, TmemTranspose32x64B16Movm._tmem_layout(16, 64))
+    top = cute.make_rmem_tensor((32,), cutlass.Float32)
+    bottom = cute.make_rmem_tensor((32,), cutlass.Float32)
+    atom_ld16x256 = cute.make_copy_atom(tcgen05.Ld16x256bOp(tcgen05.Repetition.x8), cutlass.Float32)
+    cute.copy(atom_ld16x256, top_view, TmemTranspose32x64B16Movm._rmem_copy_view(top, 32))
+    cute.copy(atom_ld16x256, bottom_view, TmemTranspose32x64B16Movm._rmem_copy_view(bottom, 32))
+    return top, bottom
+
+
+@cute.jit
 def fc2_stg_post_f2fp_reorder(
     *,
     casted: cute.Tensor,  # (subtile_cnt,)
@@ -3478,12 +3509,24 @@ def fc2_ublk_store_function_impl(
         smem_partition = thread_store.partition_D(smem_stage)
         register_partition = cute.composition(data_subtile, cute.make_layout(smem_partition.shape))
         cute.copy(tiled_store, register_partition, smem_partition)
-    else:
+    elif cutlass.const_expr(not epi.fc2_ublk_stmatrix):
         if cutlass.const_expr(cute.size(data_subtile) != epi._EpilogueTokenTileSize):
             raise ValueError("BF16 UBLK staging requires one register per token in the 64-token subtile.")
         warp_hidden_base = cutlass.Int32(warp_idx * 32)
         for token_idx in cutlass.range_constexpr(epi._EpilogueTokenTileSize):
             smem_stage[token_idx, warp_hidden_base + lane_idx] = data_subtile[token_idx]
+    else:
+        # Words 2k / 2k + 1: hidden rows 0-7 / 8-15 of the warp's top half at tokens 8k..8k+7; words
+        # 16 + 2k / 17 + 2k: the bottom half's; stmatrix block b goes to hidden 8b of the warp's 32.
+        words = cute.recast_tensor(data_subtile, cutlass.Int32)
+        row_stride: cutlass.Constexpr[int] = epi._Fc2UblkBf16RowStrideElements
+        lane_hidden = cutlass.Int32(warp_idx * 32) + (lane_idx // cutlass.Int32(8)) * cutlass.Int32(8)
+        lane_token = lane_idx % cutlass.Int32(8)
+        for step in cutlass.range_constexpr(epi._EpilogueTokenTileSize // 8):
+            row_ptr = smem_stage.iterator + (lane_token + step * 8) * row_stride + lane_hidden
+            stmatrix_x4_trans_b16(
+                row_ptr, (words[2 * step], words[2 * step + 1], words[16 + 2 * step], words[17 + 2 * step])
+            )
 
     cute.arch.fence_proxy("async.shared", space="cta")
     smem_read_write_bar.arrive_and_wait()
@@ -3592,7 +3635,11 @@ def make_fc2_redg_process_pipeline(
 
 
 def make_fc2_ublk_process_pipeline(
-    *, combine_format: CombineFormat, cta_token_tile_size: int, cta_hidden_tile_size: int
+    *,
+    combine_format: CombineFormat,
+    cta_token_tile_size: int,
+    cta_hidden_tile_size: int,
+    stmatrix: bool = False,
 ) -> Fc2ProcessPipeline:
     store_out_mapping, sf_store_out_mapping, fundamental_mapping = make_fc2_ublk_store_out_mapping(
         combine_format, cta_token_tile_size, cta_hidden_tile_size
@@ -3603,7 +3650,7 @@ def make_fc2_ublk_process_pipeline(
         tmem_acc_load = fc2_stg_tmem_acc_load
         post_f2fp_reorder = fc2_stg_post_f2fp_reorder
     else:
-        tmem_acc_load = fc2_ublk_tmem_acc_load
+        tmem_acc_load = fc2_ublk_stmatrix_tmem_acc_load if stmatrix else fc2_ublk_tmem_acc_load
         post_f2fp_reorder = post_f2fp_reorder_identity
     return Fc2ProcessPipeline(
         tmem_acc_load=tmem_acc_load,

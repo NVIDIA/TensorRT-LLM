@@ -2083,6 +2083,17 @@ class DeepseekV4MoE(nn.Module):
             self._full_tp_shared_weights = weights
         return self._full_tp_shared_weights
 
+    def unreduced_output_supported(self, all_rank_num_tokens: Optional[list[int]]) -> bool:
+        """Whether ``forward(do_finalize=False)`` returns unsummed ``MegaMoeUnreduced`` rows."""
+        backend = getattr(self.experts, "backend", None)
+        return (
+            self.use_dp
+            and self.shared_experts is None
+            and getattr(backend, "supports_unreduced_output", lambda: False)()
+            and not torch.compiler.is_compiling()
+            and max(all_rank_num_tokens or (0,)) <= self.experts.moe_max_num_tokens
+        )
+
     def compute_routed_output(
         self,
         hidden_states,
@@ -2164,13 +2175,15 @@ class DeepseekV4MoE(nn.Module):
         image_mask: Optional[torch.Tensor] = None,
         unrouted_rows: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """``unrouted_rows`` (bool ``[rows, 1]``) marks filler rows the routed experts may skip."""
+        """``unrouted_rows`` (bool ``[rows, 1]``) marks filler rows the routed experts may skip;
+        ``do_finalize=False`` under attention DP returns a ``MegaMoeUnreduced``."""
+        unreduced = not do_finalize and self.unreduced_output_supported(all_rank_num_tokens)
         if not do_finalize:
-            assert not self.use_dp
+            assert not self.use_dp or unreduced
 
         if self.shared_experts is None:
             # The routed experts' fused kernel also ran the shared expert and added its output.
-            if not do_finalize:
+            if not do_finalize and not unreduced:
                 raise ValueError("A fused shared expert requires do_finalize.")
             final_hidden_states = self.compute_routed_output(
                 hidden_states,

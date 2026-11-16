@@ -3241,6 +3241,32 @@ def test_lag_changes_the_block_output():
     assert rel > 1e-2, f"lagged and unlagged wiring agree to {rel:.3e} — gate is blind"
 
 
+@skip_pre_blackwell
+@requires_cuda
+def test_split_boundary_unreduced_moe_output() -> None:
+    """A split boundary fed MegaMoE's un-reduced output equals the one fed its ``finalize()``, bit
+    for bit, with its MXFP8 copy."""
+    from tensorrt_llm._torch.moe.fused_moe.mega_moe import MegaMoeUnreduced
+
+    rows = 200
+    module = _build_mhc(V41_REAL_HIDDEN_SIZE, seed=5)
+    torch.manual_seed(rows)
+    _, res, post, comb, pre, weight = _split_inputs(rows)
+    hidden = V41_REAL_HIDDEN_SIZE
+    expert_rows = torch.randn(rows, 6, hidden, device="cuda").to(torch.bfloat16)
+    expert_rows[0, :, :8] = -0.0
+    shared = torch.randn(rows, hidden, device="cuda").to(torch.bfloat16)
+    unreduced = MegaMoeUnreduced(expert_rows, shared)
+    args = (res, post, comb, pre, weight, V41_RMS_NORM_EPS)
+    got = module.split_hc_lagged(unreduced, *args, mxfp8=True)
+    want = module.split_hc_lagged(unreduced.finalize(), *args, mxfp8=True)
+    for a, b in zip(got[:5], want[:5]):
+        assert torch.equal(a, b)
+    assert torch.equal(got[6][0].view(torch.uint8), want[6][0].view(torch.uint8))
+    index = _mxfp8_scale_index(rows, hidden)
+    assert torch.equal(got[6][1].view(-1)[index], want[6][1].view(-1)[index])
+
+
 # ---------------------------------------------------------------------------
 # Low-level pre_mapping pipeline benchmark: DG / DG-s16 / FMA
 # ---------------------------------------------------------------------------

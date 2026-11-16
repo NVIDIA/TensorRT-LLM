@@ -445,6 +445,7 @@ class TopkReduce:
         topk_indices: Optional[cute.Tensor] = None,  # (token, topk) global expert ids
         local_rank: Optional[Int32] = None,
         extra_term: Optional[cute.Tensor] = None,  # (>= token, hidden) bf16, added to every reduced row
+        use_pdl: cutlass.Constexpr[bool] = False,  # static reduce only
     ):
         """Launch the reduce.
 
@@ -549,9 +550,9 @@ class TopkReduce:
                 combine_quant, sf, topk_score, reduced_output, counters, num_tokens_dev, topk_indices, extra_term
             ).launch(**launch_kwargs)
         else:
-            self._reduce_static(combine_quant, sf, topk_score, reduced_output, topk_indices, extra_term).launch(
-                **launch_kwargs
-            )
+            self._reduce_static(
+                combine_quant, sf, topk_score, reduced_output, topk_indices, extra_term, use_pdl
+            ).launch(**launch_kwargs, use_pdl=use_pdl)
 
     # -- kernels --------------------------------------------------------------
 
@@ -564,9 +565,15 @@ class TopkReduce:
         reduced_output: cute.Tensor,         # (token, hidden)
         topk_indices: Optional[cute.Tensor] = None,  # (token, topk)
         extra_term: Optional[cute.Tensor] = None,  # (token, hidden) bf16
+        use_pdl: cutlass.Constexpr[bool] = False,
     ):
         """One thread per (token, hidden_tile) worker; the grid carries the
         token count. This is the default path."""
+        if cutlass.const_expr(use_pdl):
+            # The inputs come from the preceding kernel; the next kernel may stage its own inputs
+            # meanwhile and waits for this one before reading the output.
+            cute.arch.griddepcontrol_wait()
+            cute.arch.griddepcontrol_launch_dependents()
         worker_idx = cute.arch.block_idx()[0] * Int32(self._threads) + cute.arch.thread_idx()[0]
         self._reduce_cell(
             worker_idx,

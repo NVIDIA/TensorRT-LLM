@@ -55,6 +55,7 @@ class HCState:
     residual: torch.Tensor
     post_mix: Optional[torch.Tensor] = None
     comb_mix: Optional[torch.Tensor] = None
+    # Under attention DP it may be a ``MegaMoeUnreduced``, which a split boundary sums itself.
     x_prev: Optional[torch.Tensor] = None
     # V4.1 only: the *previous* sublayer's `pre` coefficients, which this
     # sublayer collapses with (`pre_mapping_lagged`). V4 leaves it None, so
@@ -79,10 +80,13 @@ class HCState:
             self.coeff_event = None
 
     def reduced_x_prev(self) -> Optional[torch.Tensor]:
-        """``x_prev`` summed over the tensor-parallel group (all-reduced here if still partial)."""
+        """``x_prev`` summed over the tensor-parallel group (all-reduced here if still partial) and
+        over the top-k experts (finalized here if still un-reduced)."""
         if self.x_prev is not None and self.x_prev_allreduce is not None:
             self.x_prev = self.x_prev_allreduce(self.x_prev)
             self.x_prev_allreduce = None
+        elif self.x_prev is not None and not isinstance(self.x_prev, torch.Tensor):
+            self.x_prev = self.x_prev.finalize()
         return self.x_prev
 
     @classmethod

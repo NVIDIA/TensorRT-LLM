@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Fused pull-dispatch MegaMoE kernel composition for Rubin."""
 
 import hashlib
@@ -73,6 +75,8 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
     scheduler_consumer_thread_count: ClassVar[int] = 7 * 32
     epilogue_register_count: ClassVar[int] = 256
     scheduler_register_count: ClassVar[int] = 72
+    # token_in pulls each row as soon as its routing metadata lands instead of after every source's push.
+    early_pull: ClassVar[bool] = True
 
     @classmethod
     def problem_desc_require(cls) -> dict[str, object]:
@@ -290,6 +294,27 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 "promised_launchable_sm_count": self.mixed_cga_config.total_cta_cnt,
                 "token_back_schedule_mode": self.token_back_schedule_mode,
                 "router_smem_limit_bytes": utils.get_smem_capacity_in_bytes(self.architecture),
+                "early_pull": (
+                    self.early_pull
+                    # Qualified generic DS-V4.1 NVFP4 shapes on EP4/EP8.
+                    # Larger buckets pay a full metadata reset with no measured gain.
+                    and self.hidden_size == 5120
+                    and self.intermediate_gateup_size == 4608
+                    and self.expert_count == 384
+                    and self.topk == 6
+                    and self.world_size in (4, 8)
+                    and (
+                        self.max_tokens_per_rank == 4096
+                        or (self.max_tokens_per_rank == 2000 and self.world_size == 8)
+                    )
+                    and self.quant_kind is QuantKind.nvfp4
+                    and self.comm_clusters == 0
+                    and self.comm_stage_depths[0] == 1
+                    and not self.combine_dedup
+                    and not impl_desc.get("one_round_dispatch", False)
+                    and not impl_desc.get("token_in_stage_split", False)
+                    and not problem_desc.get("fc1_activation_per_token_scale", False)
+                ),
             }
         )
         # One top-level assignment on purpose: tests/test_dlb_contracts.py replays the constructor's
@@ -754,6 +779,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             f"situ{self.situ_beta}x{self.situ_linear_beta}_"
             f"{'apply_topk_fc1' if self.apply_topk_at_fc1 else 'apply_topk_fc2'}_"
             f"{'inkernel_redg' if self.reduce_topk_in_kernel else 'separate_reduce'}"
+            f"{'_earlypull' if self.token_comm.early_pull else ''}"
             "_dlb_v1"
             + ("_fc2readytile_v1" if self.token_back_ready_granularity == "token_tile" else "")  # nosec B105
             + f"_{'dedup' if self.combine_dedup else 'nodedup'}"
@@ -1472,6 +1498,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             tmem_allocator.allocate(self._mainloop.num_tmem_alloc_cols)
             tmem_allocator.wait_for_alloc()
             tmem_pointer = tmem_allocator.retrieve_ptr(self.acc_dtype)
+            self.token_comm.wait_for_routing_scores(self._device_workspace)
             self.epilogue.run(
                 self._smem_workspace,
                 smem_base,

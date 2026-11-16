@@ -133,6 +133,7 @@ __all__ = [
     "MegaMoECuteDsl",
     "MegaMoeCuteDslUnavailable",
     "MegaMoECuteDslWeightView",
+    "MegaMoeUnreduced",
     "TrtllmCutedslMegaMoeNvfp4Impl",
     "is_megamoe_cute_dsl_runtime_available",
 ]
@@ -354,6 +355,33 @@ def _fp4_quantize_has_sm_budget() -> bool:
         "quantization will use the selected backend without SM control"
     )
     return False
+
+
+# ---------------------------------------------------------------------------
+# Output before the top-k sum (``do_finalize=False``)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class MegaMoeUnreduced:
+    """MegaMoE output before its top-k sum: ``rows`` [M, top_k, H] BF16 (routing weights applied),
+    ``shared`` [M, H] BF16 or None, views of the bucket's workspaces valid until its next launch."""
+
+    rows: torch.Tensor
+    shared: Optional[torch.Tensor]
+
+    @property
+    def shape(self) -> torch.Size:
+        return torch.Size((self.rows.shape[0], self.rows.shape[2]))
+
+    def finalize(self) -> torch.Tensor:
+        """TopkReduce's bits: FP32 sum over k from +0, then the shared row, rounded once to BF16."""
+        total = torch.zeros(self.shape, dtype=torch.float32, device=self.rows.device)
+        for k in range(self.rows.shape[1]):
+            total += self.rows[:, k].float()
+        if self.shared is not None:
+            total += self.shared.float()
+        return total.to(self.rows.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -1402,7 +1430,16 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         if self._active_launch_max_tokens is None or self.tactic_autotune or num_tokens == 0:
             return None
         launch_max_T = self._select_launch_max_tokens(self._active_launch_max_tokens)
-        if num_tokens > launch_max_T or launch_max_T in self._genphase_direct_input_buckets:
+        if num_tokens > launch_max_T:
+            return None
+        # Model and draft MoEs can fold the slot lookup into route+quant.
+        # Small draft buckets retain direct inputs to avoid staging overhead.
+        expert_shape = (self.num_experts, top_k)
+        stage_slot_lookup = self._replicated or expert_shape in ((384, 6), (128, 3))
+        min_staged_bucket = 64 if expert_shape == (384, 6) else 128
+        if launch_max_T in self._genphase_direct_input_buckets and (
+            not stage_slot_lookup or launch_max_T < min_staged_bucket
+        ):
             return None
         bufs = self._acquire_buffers(
             top_k=top_k,
@@ -1538,17 +1575,35 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         if replica_plan is not None:
             replica_plan.wait_for_routes()
 
+    def supports_unreduced_output(self) -> bool:
+        """Whether ``run_moe(do_finalize=False)`` can hand back a :class:`MegaMoeUnreduced`."""
+        return (
+            get_sm_version() in (100, 103)
+            and self.combine_format == "bf16"
+            and self.apply_topk_in_fc1
+            and not self.tactic_autotune
+        )
+
     def run_moe(
         self,
         ctx: MoERunContext,
         *,
         workspace: Optional[dict] = None,
-    ) -> torch.Tensor:
+        do_finalize: bool = True,
+    ) -> Union[torch.Tensor, MegaMoeUnreduced]:
         """Run the fused MegaMoE CuteDSL kernel on pre-quantized inputs.
 
         Delegates the staging + kernel launch to :meth:`_run_moe`; staging widens
-        the ``int32`` expert ids to the kernel's index type.
+        the ``int32`` expert ids to the kernel's index type. ``do_finalize=False``
+        skips the top-k sum and returns a :class:`MegaMoeUnreduced`.
         """
+        if not do_finalize and (
+            not self.supports_unreduced_output() or torch.compiler.is_compiling()
+        ):
+            raise NotImplementedError(
+                "MegaMoECuteDsl returns unreduced rows only on SM100/SM103 with a bf16 combine, "
+                "routing weights applied in FC1 and the default tactic, outside torch.compile"
+            )
         del workspace  # The symmetric buffer is this backend's own workspace.
         x = ctx.x
         token_selected_experts = ctx.token_selected_experts
@@ -1605,6 +1660,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             device=device,
             output_dtype=output_dtype,
             replica_plan=replica_plan,
+            do_finalize=do_finalize,
         )
 
     def _ensure_local_staging(self, *, top_k: int, hidden: int, device, output_dtype, max_T: int):
@@ -1868,7 +1924,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         launch_max_T: int,
         replica_plan=None,
         staged_inputs: bool = False,
-    ) -> torch.Tensor:
+        do_finalize: bool = True,
+    ) -> Union[torch.Tensor, MegaMoeUnreduced]:
         """Launch the fused MegaMoE CuteDSL kernel and return its reduced output.
 
         Single-rank and multi-rank reach this point with identical kernel
@@ -2032,6 +2089,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 helper_expert_count=_S_active,
                 hot_expert_weight_ready_flags=helper_ready_flags,
                 hot_expert_weight_ready_generation=int(helper_ready_generation),
+                topk_reduce=do_finalize,
             )
         finally:
             # Always clear: a raising op call must not leave the factory
@@ -2040,6 +2098,15 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             set_active_megamoe_profiling_scratch_factory(None)
             set_active_megamoe_cute_weight_cache(None)
             set_active_megamoe_cute_buffer_cache(None)
+        if not do_finalize:
+            from tensorrt_llm._torch.moe.custom_ops.cute_dsl_megamoe_custom_op import (
+                megamoe_unreduced_views,
+            )
+
+            rows, shared = megamoe_unreduced_views(shared_workspace)
+            return MegaMoeUnreduced(
+                rows[:num_tokens], None if shared is None else shared[:num_tokens]
+            )
         if num_tokens == 0:
             return torch.empty((0, hidden), dtype=output_dtype, device=combine_output.device)
         # The kernel already collapsed the top-k axis into the (T, 1, hidden)
@@ -2164,7 +2231,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         device,
         output_dtype: torch.dtype,
         replica_plan=None,
-    ) -> torch.Tensor:
+        do_finalize: bool = True,
+    ) -> Union[torch.Tensor, MegaMoeUnreduced]:
         """Unified MegaMoE CuteDSL forward: acquire -> stage -> launch.
 
         The kernel is launched with ``T = launch_max_T`` -- the smallest
@@ -2204,6 +2272,13 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                     f"{num_tokens}); route + quantize or quantize_input must precede run_moe."
                 )
         if num_tokens == 0 and self.ep_size == 1:
+            if not do_finalize:
+                return MegaMoeUnreduced(
+                    torch.empty((0, top_k, hidden), dtype=output_dtype, device=device),
+                    None
+                    if self._shared_expert is None
+                    else torch.empty((0, hidden), dtype=output_dtype, device=device),
+                )
             return torch.empty((0, hidden), dtype=output_dtype, device=device)
 
         if (
@@ -2309,6 +2384,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             replica_plan=replica_plan,
             # Direct routing inputs imply direct activation inputs.
             staged_inputs=not use_direct_inputs,
+            do_finalize=do_finalize,
         )
 
 

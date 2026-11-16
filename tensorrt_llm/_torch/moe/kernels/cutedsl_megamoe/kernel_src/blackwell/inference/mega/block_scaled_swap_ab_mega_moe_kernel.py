@@ -222,6 +222,8 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         self.token_back_mode = impl_desc["token_back_mode"]
         self.reduce_topk_in_kernel = impl_desc["reduce_topk_in_kernel"]
         self.skip_topk_reduce = impl_desc.get("skip_topk_reduce", False)
+        # False skips TopkReduce: the combine and shared expert rows stay in the workspaces.
+        self.launch_topk_reduce = True
         self.helper_expert_count = impl_desc.get("helper_expert_count", 0)
         if type(self.helper_expert_count) is not int or self.helper_expert_count < 0:
             raise ValueError("helper_expert_count must be a non-negative exact int")
@@ -758,6 +760,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             f"{'_tailpar' if self.token_comm.tail_parity else ''}"
             # Empty for the NVLink-domain component: the internode=False kernel keeps main's name.
             + (f"_{self.token_comm.name_token}" if self.token_comm.name_token else "")
+            + ("" if self.launch_topk_reduce else "_noreduce")
             + "_dlb_v1"
             # Off / SwiGLU keep the historical name so existing compiled-kernel caches stay valid.
             + ("_fc1actscale" if self.fc1_activation_per_token_scale else "")
@@ -1344,7 +1347,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             )
         if cutlass.const_expr(self.topk_reduce_persistent != (num_valid_tokens is not None)):
             raise ValueError("num_valid_tokens is required exactly when topk_reduce_persistent=True.")
-        if cutlass.const_expr(not self.reduce_topk_in_kernel and not self.skip_topk_reduce):
+        if cutlass.const_expr(not self.reduce_topk_in_kernel and not self.skip_topk_reduce and self.launch_topk_reduce):
             reduce_scores = None if cutlass.const_expr(self.apply_topk_at_fc1) else topk_scores
             extra_term = None
             if cutlass.const_expr(self.fuse_shared):
@@ -1379,6 +1382,8 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                     topk_indices=topk_indices,
                     local_rank=local_rank,
                     extra_term=extra_term,
+                    # Only for MoEs that apply the top-k weights at FC1.
+                    use_pdl=self.use_pdl and self.apply_topk_at_fc1,
                 )
 
     @cute.jit

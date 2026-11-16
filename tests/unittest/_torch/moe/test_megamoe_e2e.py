@@ -8,8 +8,8 @@ bank re-encoded from MXFP4 to NVFP4.
 Against the reference: the routed experts' per-expert NVFP4 math, the fused shared expert within 2% of the separate
 one's error against FP32, the partials' ordered sum against the router GEMM, and the draft layer against FP32 math on
 the same quantization. Bit for bit: the other scheduler with separate staging and no evict-first hint, a repeat and
-an epoch-shifted pass, one CUDA graph of the whole schedule, and the one-round push dispatch (its EP16 gate lowered)
-against the metadata push.
+an epoch-shifted pass, the rows handed back before the top-k sum (do_finalize=False) through their finalize(), one
+CUDA graph of the whole schedule, and the one-round push dispatch (its EP16 gate lowered) against the metadata push.
 """
 
 import pickle
@@ -57,20 +57,6 @@ _SHAPES = {"mid": ([150] * 4, [150, 0, 75, 1]), "hi": ([1280] * 4, [1280, 640, 0
 # rank's 96 experts live, so the phase-interleaved streams end in front of empty experts.
 _VARIANTS = ("base", "hot", "no_rank2", "trailing_empty")
 _LIVE_EXPERTS_PER_RANK = 24
-# The schedule each bucket is compared with: phase interleave (cluster 2) for the grouped mid bucket; the grouped
-# fallback for the phase-interleaved hi bucket.
-_PHASE_INTERLEAVE_TACTIC = (
-    [256, 128, 256],
-    [2, 1, 1],
-    None,
-    ("phase_interleave", 2),
-    "atomic_counter",
-    "epi_warps",
-    True,
-    1,
-    1,
-    (1, 1),
-)
 _REPLAYS = 5
 # Largest fused / separate ratio of the rel-RMS error against the FP32 reference.
 _ERROR_RATIO = 1.02
@@ -554,9 +540,11 @@ def _run(one_round: bool) -> list:
                 default_kinds.update(interleaved for interleaved, _ in schedule)
                 problem = f"{label}: default path staged" if staged and counts[rank] else None
                 _assert_on_all_ranks(problem)
-                # The plain path: the other scheduler, separate staging and no evict-first hint.
+                # The plain path: the other scheduler, separate staging and no evict-first hint. Against the grouped
+                # buckets, the DEP32 small-rung tactic (phase interleave, cluster 2); against the phase-interleaved hi
+                # bucket, the grouped fallback.
                 tactic = (
-                    _PHASE_INTERLEAVE_TACTIC
+                    op._SM103_DSV41_FLASH_DEP32_SMALL_RUNG_TACTIC
                     if max(counts) <= 256
                     else op.default_megamoe_tactic(256)
                 )
@@ -596,6 +584,18 @@ def _run(one_round: bool) -> list:
             for i, out in enumerate(outs):
                 same = torch.equal(out, first[i])
                 _assert_on_all_ranks(None if same else f"{name} pass: {calls[i][0]} differs")
+
+        # Eager only: kernels may not switch on a workspace a captured graph uses.
+        for i, (label, moe, bias, x, counts) in enumerate(calls):
+            moe.gate.e_score_correction_bias.copy_(bias)
+            unreduced = moe.compute_routed_output(x, None, None, counts, False)
+            if not isinstance(unreduced, mega_moe_cute_dsl.MegaMoeUnreduced):
+                problem = f"{label}: do_finalize=False gave {type(unreduced).__name__}"
+            elif not torch.equal(unreduced.finalize(), first[i]):
+                problem = f"{label}: the unreduced rows' finalize() differs"
+            else:
+                problem = None
+            _assert_on_all_ranks(problem)
 
         graph = torch.cuda.CUDAGraph()
         slots = [torch.empty_like(out) for out in first]

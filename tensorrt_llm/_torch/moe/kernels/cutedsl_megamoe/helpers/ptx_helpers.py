@@ -230,6 +230,28 @@ def mbarrier_arrive_expect_tx_on_peer(
 
 
 @dsl_user_op
+def stmatrix_x4_trans_b16(
+    smem_address,
+    words,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> None:
+    """Four transposed 8x8 b16 blocks; ``smem_address`` is this lane's row of block lane // 8."""
+    llvm.inline_asm(
+        None,
+        [smem_address.toint(loc=loc, ip=ip).ir_value()] + [Int32(word).ir_value(loc=loc, ip=ip) for word in words],
+        "stmatrix.sync.aligned.m8n8.x4.trans.shared.b16 [$0], {$1, $2, $3, $4};",
+        "r,r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def cp_async_bulk_s2g(
     destination_gmem,
     source_smem,
@@ -402,6 +424,22 @@ def stg_b64(address: Int64, value: Int64, predicate: Optional[Int32] = None, *, 
         asm_dialect=0,
         loc=loc,
         ip=ip,
+    )
+
+
+@dsl_user_op
+def ld_acquire_sys_b64(address: Int64, *, loc=None, ip=None) -> Int64:
+    return Int64(
+        llvm.inline_asm(
+            T.i64(),
+            [address.ir_value()],
+            "ld.acquire.sys.global.b64 $0, [$1];",
+            "=l,l",
+            has_side_effects=True,
+            asm_dialect=0,
+            loc=loc,
+            ip=ip,
+        )
     )
 
 

@@ -978,6 +978,8 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
         self._moe_nvfp4_input = False
         # Whether that boundary also writes the shared expert's FP8 1x128 input (same pass).
         self._shared_fp8_1x128 = False
+        # Whether the next split entry can sum this layer's unreduced MoE rows (set at load).
+        self._moe_rows_next = False
         # Split boundaries (mHC.split_hc_lagged): coefficients on their own stream.
         aux_stream_dict = args[2] if len(args) > 2 else kwargs.get("aux_stream_dict")
         self._mhc_coeff_stream = (aux_stream_dict or {}).get(AuxStreamType.MhcCoefficients)
@@ -1200,6 +1202,9 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
             if deferred:
                 if lamport is not None and hc_state.x_prev_allreduce is not None:
                     x_prev, entry_allreduce = hc_state.x_prev, lamport
+                elif hc_state.x_prev_allreduce is None:
+                    # A tensor, or the MoE's un-reduced rows that the critical half sums itself.
+                    x_prev = hc_state.x_prev
                 else:
                     x_prev = hc_state.reduced_x_prev()
             mxfp8 = self.self_attn.takes_mxfp8_input_for(residual.shape[0])
@@ -1323,6 +1328,16 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
             and not spec_metadata.spec_dec_mode.is_dspark()
         )
         moe_unfinalized = moe_partial and self._moe_supports_unfinalized() and not materializes_next
+        # Attention DP: the next split entry does the top-k sum, unless this output is captured.
+        moe_unreduced = (
+            not moe_partial
+            and self._moe_rows_next
+            and self._v41_defer_post_mapping
+            and not materializes_next
+            and not (capture_this_layer and not dspark_capture)
+            and self._mhc_split(residual.shape[0])
+            and self.mlp.unreduced_output_supported(attn_metadata.all_rank_num_tokens)
+        )
         x_ffn = self.forward_MoE(
             hidden_states=layer_input,
             attn_metadata=attn_metadata,
@@ -1332,7 +1347,7 @@ class DeepseekV41DecoderLayer(DeepseekV4DecoderLayer):
             unrouted_rows=unrouted_rows,
             skip_allreduce=moe_partial,
             trigger_allreduce_at_end=trigger_allreduce_at_end,
-            unfinalized=moe_unfinalized,
+            unfinalized=moe_unfinalized or moe_unreduced,
             **({"image_mask": image_mask} if image_mask is not None else {}),
         )
         if moe_unfinalized:
@@ -3473,6 +3488,10 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
         # turns deferral off for A/B.
         defer_ok = os.environ.get("TRTLLM_V41_MHC_DEFER", "1").lower() not in ("0", "false")
         defer_ok = defer_ok and not self.model_config.mapping.has_pp()
+        # A remote-tail replay resolves the state at its split layer every generation step.
+        replay_split = (
+            self.model.decoder_replay_split if self.model.disagg_remote_tail_replay else None
+        )
         layers = self._post_load_decoder_layers()
         # The NVFP4 MoEs consume their input as fp4_quantize(x, fc31_input_scale) writes it,
         # which the FFN boundary can produce alongside the BF16 router input. An AWQ/ARC
@@ -3489,6 +3508,10 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
             )
             layer._v41_defer_post_mapping = defer_ok and (
                 idx + 1 < len(layers) or not self.model.disagg_context_only
+            )
+            # An Engram entry materializes the residual before its boundary.
+            layer._moe_rows_next = (
+                idx + 1 < len(layers) and idx + 1 != replay_split and layers[idx + 1].engram is None
             )
             # Look up the all-reduce workspace now rather than during CUDA-graph capture.
             layer._mhc_fused_allreduce()
