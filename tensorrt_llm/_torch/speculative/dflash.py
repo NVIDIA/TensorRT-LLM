@@ -1777,9 +1777,13 @@ class DFlashWorker(SpecWorkerBase):
                 # block table one iteration at a time, so the footprint follows
                 # the sequences served rather than max_batch x max_seq_len. Each
                 # step's allocation must therefore cover the noise block too.
-                check_draft_pool_reserve(
-                    self.spec_config, self._compute_block_size, draft_kv_cache_manager
-                )
+                if self._ctx_unified_cache:
+                    check_draft_pool_reserve(
+                        self.spec_config, self._compute_block_size, draft_kv_cache_manager
+                    )
+                # Separate draft mirrors retain the upstream bounded-context path:
+                # their reserve need not include the complete next draft block.
+                # Shared target/draft caches must preserve the received prompt in full.
                 self._ctx_kv_buf = pool
                 self._ctx_kv_ptrs = torch.tensor(
                     [layer.data_ptr() for layer in pool], dtype=torch.int64, device="cuda"
