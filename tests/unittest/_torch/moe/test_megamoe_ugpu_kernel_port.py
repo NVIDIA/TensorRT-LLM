@@ -142,10 +142,16 @@ def _problem(**overrides: object) -> dict:
     return values
 
 
+# None: the CuTe DSL reads the die itself; a mask: the SM-to-die map for older DSL builds.
+@pytest.mark.parametrize("die_smid_mask", [None, (0xC, 0, 1 << 63, 3)])
 @pytest.mark.parametrize("layout", ["expert_half", "n_split"])
 @pytest.mark.parametrize("capacity", [64, 2048])
 def test_bf16_localized_query_and_runner_share_consumer(
-    op: types.ModuleType, monkeypatch: pytest.MonkeyPatch, layout: str, capacity: int
+    op: types.ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    layout: str,
+    capacity: int,
+    die_smid_mask: tuple | None,
 ) -> None:
     package = "tensorrt_llm._torch.moe.kernels.cutedsl_megamoe"
     imports = {
@@ -173,6 +179,7 @@ def test_bf16_localized_query_and_runner_share_consumer(
         return original(**kwargs)
 
     monkeypatch.setattr(op, "_construct_megamoe_kernel", construct)
+    monkeypatch.setattr(op, "_megamoe_ugpu_die_smid_mask", lambda: die_smid_mask)
     problem = _problem(ugpu_weight_layout=layout, max_tokens_per_rank=capacity)
     query = {
         key: value for key, value in problem.items() if key not in {"local_rank", "output_dtype"}
@@ -196,6 +203,7 @@ def test_bf16_localized_query_and_runner_share_consumer(
         assert kernel.implementation["die_aware"] == (
             "on" if layout == "n_split" else "expert_half"
         )
+        assert kernel.implementation.get("die_smid_mask") == die_smid_mask
     else:
         assert isinstance(kernel, _GenericMetadata)
         assert kernel.implementation["weight_layout"] == (
@@ -213,6 +221,13 @@ def test_bf16_localized_query_and_runner_share_consumer(
     assert runner.unique_id() != ordinary.unique_id()
     # Default tactic tables are keyed without the layout.
     assert runner._tactic_lookup_key() == ordinary._tactic_lookup_key()
+    # A device whose dies map differently keeps the rank-identical unique_id() but gets its own
+    # kernel, descriptor and workspace cache entries; the default path never reads the mask.
+    key, ordinary_key = runner._tactic_cache_key(tactic), ordinary._tactic_cache_key(tactic)
+    monkeypatch.setattr(op, "_megamoe_ugpu_die_smid_mask", lambda: (3, 0, 0, 0))
+    assert op.Sm100MegaMoENvfp4Runner(**problem).unique_id() == runner.unique_id()
+    assert runner._tactic_cache_key(tactic) != key
+    assert ordinary._tactic_cache_key(tactic) == ordinary_key
 
 
 def _method(path: Path, name: str) -> ast.FunctionDef:

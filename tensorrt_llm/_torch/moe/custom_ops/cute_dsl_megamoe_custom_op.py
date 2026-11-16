@@ -1211,6 +1211,18 @@ def _megamoe_ugpu_is_genphase(max_tokens_per_rank: int) -> bool:
 _MEGAMOE_UGPU_DECODE_LEAD = 32
 
 
+def _megamoe_ugpu_die_smid_mask() -> Optional[Tuple[int, ...]]:
+    """TensorRT-LLM local patch until the pinned CuTe DSL provides cute.arch.locality_domain_id:
+    this device's SM-to-die mask for the die-aware kernel, or None when the DSL reads the die itself."""
+    import cutlass.cute as cute
+
+    if hasattr(cute.arch, "locality_domain_id"):
+        return None
+    from ..fused_moe.mega_moe.ugpu_weights import die_smid_mask
+
+    return die_smid_mask(torch.cuda.current_device())
+
+
 def _megamoe_ugpu_tactic() -> tuple:
     """Genphase buckets of localized weights use a geometry both consumers support, without
     the tuning cache; generic (prefill) buckets keep the default tactic."""
@@ -1319,6 +1331,9 @@ def _construct_megamoe_kernel(
     if ugpu_weight_layout != "none":
         if _megamoe_ugpu_is_genphase(common["max_tokens_per_rank"]):
             impl_values["die_aware"] = "on" if ugpu_weight_layout == "n_split" else "expert_half"
+            die_smid_mask = _megamoe_ugpu_die_smid_mask()
+            if die_smid_mask is not None:
+                impl_values["die_smid_mask"] = die_smid_mask
             ugpu_kernel_cls = RubinInferenceGenphaseMegaMoE
         else:
             # expert_half preserves standard indexing; n_split changes only
@@ -3192,6 +3207,9 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 bool(combine_dedup),
                 launch_config,
                 self.weight_evict_first,
+                # The SM-to-die mask is per device, so it stays out of the rank-identical
+                # unique_id() but must split these process-wide caches.
+                _megamoe_ugpu_die_smid_mask() if self.ugpu_weight_layout != "none" else None,
             )
 
         def _resolve_kernel_descriptor(

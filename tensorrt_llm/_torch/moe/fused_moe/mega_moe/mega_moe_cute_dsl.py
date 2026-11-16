@@ -85,6 +85,7 @@ import torch.distributed as dist
 # that gate and therefore stay lazy at the call site.
 from tensorrt_llm._torch.moe.custom_ops.cute_dsl_megamoe_custom_op import (
     _SM107_GENPHASE_MAX_TOKENS_PER_RANK,
+    _megamoe_ugpu_die_smid_mask,
     megamoe_activation_sf_bytes_per_row,
 )
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
@@ -1135,6 +1136,9 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         """Move this layer's packed bank into die-local VMM memory, once."""
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("Install localized MegaMoE weights before CUDA graph capture")
+        # Map the SM dies now (when the CuTe DSL cannot read them), before any graph capture
+        # builds the die-aware kernel; the result is cached per device.
+        _megamoe_ugpu_die_smid_mask()
         originals = {name: self._parameters[name] for name in self._UGPU_PACKED_PARAMS}
         # The die-local bank comes from the driver, while the banks it replaced on earlier
         # layers sit freed in PyTorch's caching allocator; return them to the driver when

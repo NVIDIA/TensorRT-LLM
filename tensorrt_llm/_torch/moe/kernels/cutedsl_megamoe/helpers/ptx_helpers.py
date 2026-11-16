@@ -64,6 +64,14 @@ def read_clock64(*, loc: Optional[ir.Location] = None, ip: Optional[ir.Insertion
 
 
 @dsl_user_op
+def read_smid(*, loc: Optional[ir.Location] = None, ip: Optional[ir.InsertionPoint] = None) -> Int32:
+    """Read the SM id of the calling thread (TensorRT-LLM local patch, used by the die_smid_mask path)."""
+    return Int32(
+        llvm.inline_asm(T.i32(), [], "mov.u32 $0, %smid;", "=r", has_side_effects=True, asm_dialect=0, loc=loc, ip=ip)
+    )
+
+
+@dsl_user_op
 def read_globaltimer_ns(*, loc: Optional[ir.Location] = None, ip: Optional[ir.InsertionPoint] = None) -> cutlass.Uint64:
     """Read the 64-bit global nanosecond timer, independent of SM clock rate."""
     return cutlass.Uint64(
