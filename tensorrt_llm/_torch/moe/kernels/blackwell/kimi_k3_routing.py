@@ -1046,7 +1046,7 @@ def precompile(num_experts: int, use_pdl: bool = TRTLLM_ENABLE_PDL) -> int:
     up to 64, 16-warp CTAs above; ``local_cap`` is ``_SMALL_LOCAL_CAP`` up to that many local
     experts, ``num_experts`` above.
     """
-    if not supports_device(torch.cuda.current_device()):
+    if not _is_supported_device(torch.cuda.current_device()):
         return 0
     compiled = 0
     for warps_per_token, num_warps in ((2, 8), (1, 8), (1, 16)):
