@@ -19,7 +19,7 @@ modeling code and no native library.
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
 
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 
 # The one GPU architecture these targets are written for. sm is part of a
 # target's identity, not a knob: a different SM is a different target. The K3
-# decode kernels (the tcgen05 GEMVs, the fused MoE) are built for GB200 only.
+# decode kernels (the tcgen05 GEMVs, the fused MoE) are built for sm_100 only.
 _SM = (10, 0)
 
 # The MXFP4 checkpoint's config shape; see the note in the sibling gpt_oss
@@ -48,20 +48,50 @@ _SHAPE = (93, 7168, 896, 3584)
 # The KV-cache block size the targets' MLA kernels are built for.
 _TOKENS_PER_BLOCK = 64
 
+# The attention backend whose metadata the targets' attention layers read.
+_ATTN_BACKEND = "TRTLLM"
+
 # The routed-expert backend the targets' MoE runs. The engine resolves AUTO to
 # TRTLLM for Kimi K3 before it routes.
 _MOE_BACKENDS = frozenset({"AUTO", "TRTLLM"})
 
+# Values of TRTLLM_LOW_M_GEMM_BACKEND that its parser reads as off, after it
+# strips the value, lowercases it and maps "_" to "-".
+_LOW_M_GEMM_OFF = frozenset({"", "0", "none", "off", "cublas", "cublaslt"})
+
+# Values of ENABLE_PERFECT_ROUTER that turn the perfect router on; every other
+# value leaves it off.
+_PERFECT_ROUTER_ON = frozenset({"1", "expert_ids"})
+
+
+def _low_m_gemm_off(value: Optional[str]) -> bool:
+    return value is None or value.strip().lower().replace("_", "-") in _LOW_M_GEMM_OFF
+
+
+def _perfect_router_off(value: Optional[str]) -> bool:
+    return value not in _PERFECT_ROUTER_ON
+
+
+def _unset_or(*values: str) -> Callable[[Optional[str]], bool]:
+    return lambda value: value is None or value in values
+
+
 # Environment switches the built-in implementation reads and the targets do
-# not: the name and the values that leave the built-in on the path the targets
-# run (None: unset). The switches the targets read are in ``environment.py``.
+# not: the name, whether a value (None: unset) leaves the built-in on the path
+# the targets run, as the switch's owner reads it, and those values in words.
+# The switches the targets read are in ``environment.py``.
 _ENV_SWITCHES = (
-    ("ENABLE_PERFECT_ROUTER", (None, "0")),
-    ("EXPERT_STATISTIC_ITER_RANGE", (None,)),
-    ("TRTLLM_LOW_M_GEMM_BACKEND", (None, "off")),
-    ("TLLM_KDA_ENABLE_OPT_PREFILL", (None, "1")),
-    ("TLLM_KDA_ENABLE_INDEXED_STATE_POOL", (None, "1")),
-    ("FLA_CONV_BACKEND", (None, "triton")),
+    ("ENABLE_PERFECT_ROUTER", _perfect_router_off, "any value but 1 or expert_ids"),
+    ("EXPERT_STATISTIC_ITER_RANGE", _unset_or(), "unset"),
+    (
+        "TRTLLM_LOW_M_GEMM_BACKEND",
+        _low_m_gemm_off,
+        "unset or one of " + ", ".join(sorted(v for v in _LOW_M_GEMM_OFF if v)),
+    ),
+    ("TLLM_KDA_ENABLE_OPT_PREFILL", _unset_or("1"), "unset or 1"),
+    ("TLLM_KDA_ENABLE_INDEXED_STATE_POOL", _unset_or("1"), "unset or 1"),
+    ("FLA_CONV_BACKEND", _unset_or("triton"), "unset or triton"),
+    ("KIMI_K3_FP8_WEIGHT_READ_MOE_MLP", _unset_or("0"), "unset or 0"),
 )
 
 
@@ -171,9 +201,18 @@ def _unmet_settings(
     kv_cache_quant_algo = engine_kv_cache_quant_algo(model_config, llm_args)
     if kv_cache_quant_algo is not None:
         unmet.append(
-            f"KV cache {getattr(kv_cache_quant_algo, 'name', kv_cache_quant_algo)}: the targets' "
-            "MLA kernels read a bf16 KV cache"
+            f"kv_cache_config.dtype {getattr(kv_cache_quant_algo, 'name', kv_cache_quant_algo)}: "
+            "the targets' MLA kernels read a bf16 KV cache"
         )
+
+    attn_backend = str(model_config.attn_backend).upper()
+    if attn_backend != _ATTN_BACKEND:
+        unmet.append(
+            f"attn_backend {attn_backend}: the targets' attention reads the {_ATTN_BACKEND} "
+            "backend's metadata"
+        )
+    if getattr(llm_args, "torch_compile_config", None) is not None:
+        unmet.append("torch_compile_config set: torch.compile does not trace the targets")
 
     quant_algo = model_config.quant_config.quant_algo
     layer_quant = model_config.quant_config_dict
@@ -223,10 +262,12 @@ def _unmet_settings(
         if getattr(llm_args, name, False):
             unmet.append(f"{name} true: the targets run their bf16 projections on cuBLAS")
 
-    for name, built_for in _ENV_SWITCHES:
+    for name, built_for, accepted in _ENV_SWITCHES:
         value = os.environ.get(name)
-        if value not in built_for:
-            unmet.append(f"environment {name}={value}: the targets do not read this switch")
+        if not built_for(value):
+            unmet.append(
+                f"environment {name}={value}: the targets do not read this switch and need it {accepted}"
+            )
     for reason in _environment.declines():
         unmet.append(f"environment: {reason}")
 
@@ -292,6 +333,6 @@ def route(
         f"moe_tp={mapping.moe_tp_size} moe_ep={mapping.moe_ep_size} "
         f"split_set={getattr(mapping, 'moe_tp_ep_user_specified', False)} "
         f"attention_dp={mapping.enable_attention_dp}; the kimi_k3_vl targets are the MXFP4 "
-        "Kimi K3 checkpoint on sm100 (GB200), 16 ranks of tensor-parallel attention, with the "
+        "Kimi K3 checkpoint on sm100 (GB200 or B200), 16 ranks of tensor-parallel attention, with the "
         "experts split moe_tp 4 x moe_ep 4 or, set explicitly, moe_tp 16 x moe_ep 1"
     )

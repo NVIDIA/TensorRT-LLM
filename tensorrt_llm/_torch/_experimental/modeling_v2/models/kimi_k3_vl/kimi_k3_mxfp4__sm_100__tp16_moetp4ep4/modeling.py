@@ -9,7 +9,7 @@ Attention residuals mix each sublayer's input from a bank of earlier outputs. Th
 checkpoint's compressed-tensors default, read as W4A8_MXFP4_MXFP8); everything else is bf16, and so is the KV pool.
 
 `tp16_moetp4ep4` is `tensor_parallel_size: 16` with `moe_tensor_parallel_size: 4` and
-`moe_expert_parallel_size: 4`, no attention data parallelism, all 16 GPUs in one NVLink domain. Attention is
+`moe_expert_parallel_size: 4`, no attention data parallelism, on 16 GPUs with or without MNNVL. Attention is
 head-split (6 MLA query heads per rank), and every rank holds a quarter of the width of a quarter of the experts.
 
 **Each step is classified once, on the host, from its shape** (`decode_step`, a `DecodeStep` or None), and the
@@ -1002,6 +1002,11 @@ def _check_construction(model_config: ModelConfig) -> None:
     if strategy not in (AllReduceStrategy.AUTO, AllReduceStrategy.MNNVL):
         raise NoTarget(
             f"this target takes allreduce_strategy AUTO or MNNVL; allreduce_strategy is {strategy.name}"
+        )
+    attn_backend = str(model_config.attn_backend).upper()
+    if attn_backend != "TRTLLM":
+        raise NoTarget(
+            f"this target's attention reads the TRTLLM backend's metadata; attn_backend is {attn_backend}"
         )
 
 

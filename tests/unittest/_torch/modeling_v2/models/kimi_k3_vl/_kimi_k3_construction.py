@@ -15,7 +15,9 @@ from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 
-def config(moe_tp, moe_ep, split_set=True, spec_config=None, attention_dp=False):
+def config(
+    moe_tp, moe_ep, split_set=True, spec_config=None, attention_dp=False, attn_backend="TRTLLM"
+):
     """The ModelConfig fields the construction checks read."""
     mapping = types.SimpleNamespace(
         world_size=16,
@@ -36,6 +38,7 @@ def config(moe_tp, moe_ep, split_set=True, spec_config=None, attention_dp=False)
         ),
         quant_config_dict=None,
         allreduce_strategy=AllReduceStrategy.AUTO,
+        attn_backend=attn_backend,
     )
 
 

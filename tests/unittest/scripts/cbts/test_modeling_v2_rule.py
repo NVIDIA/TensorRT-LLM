@@ -252,6 +252,8 @@ def test_k3_ci_runs_once_on_b300_or_gb300_by_topology():
     sm100_tests = {
         "kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_tp16_moetp16ep1_mla_steps.py",
         "kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_tp16_moetp4ep4_mla_steps.py",
+        "kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_modeling_v2_k3_dspark_mla_ops.py",
+        "kimi_k3_mxfp4__sm_100__tp16_moetp4ep4/test_modeling_v2_kimi_k3_mla_drafter.py",
         "ops/attention/test_modeling_v2_k3_cute_dsl_mla_decode.py",
         "ops/attention/test_modeling_v2_k3_flashinfer_mla_decode.py",
         "ops/attention/test_modeling_v2_k3_load_chunked_kv_cache_for_mla.py",
@@ -283,7 +285,10 @@ def test_k3_ci_runs_once_on_b300_or_gb300_by_topology():
             assert name not in seen, (block.yaml_stem, name)
             seen.add(name)
             if block.yaml_stem == "l0_cpu":
-                assert name not in collective_tests
+                assert name not in collective_tests | sm100_tests | non_mnnvl_tests, (
+                    block.yaml_stem,
+                    name,
+                )
                 continue
             if name in sm100_tests:
                 yaml_stem, count, runs_on = "l0_b200", 1, None

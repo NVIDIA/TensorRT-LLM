@@ -39,10 +39,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kimi_k3_mxf
 )
 from tensorrt_llm._torch.model_config import ModelConfig
 
-if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-    pytest.skip(
-        "the MLA DSpark drafter's kernels run on sm_100 and sm_103", allow_module_level=True
-    )
+if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
+    pytest.skip("the MLA DSpark drafter's kernels are certified on sm_100", allow_module_level=True)
 if k3_dspark_mla.mla_decode_unavailability_reason() is not None:
     pytest.skip(k3_dspark_mla.mla_decode_unavailability_reason(), allow_module_level=True)
 

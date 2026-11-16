@@ -351,6 +351,9 @@ class Mxe4m3Mxe2m1BlockScaleMoeRunner(OpWrapper):
         from a correct kernel.
         """
         assert act_type in (ACT_TYPE_SWIGLU, ACT_TYPE_SITU), act_type
+        if act_type == ACT_TYPE_SITU:
+            assert alpha is not None and beta is not None, "SiTU takes both soft caps"
+            assert clamp_limit is None, "SiTU takes no clamp limit"
         num_tokens, hidden = hidden_states.shape
         up_c, up_s, up_b = up
         gt_c, gt_s, gt_b = gate
@@ -450,6 +453,16 @@ class Mxe4m3Mxe2m1BlockScaleMoeRunner(OpWrapper):
                     f"{name} must be contiguous; a strided view is read as if dense "
                     "and silently produces wrong results"
                 )
+        # SiTU divides by its soft caps: a missing or non-positive cap gives NaN or a
+        # sign flip, and the clamp limit belongs to SwiGlu.
+        if act_type == ACT_TYPE_SITU:
+            assert gemm1_alpha is not None and gemm1_beta is not None, (
+                "SiTU reads both soft caps (gemm1_alpha, gemm1_beta)"
+            )
+            assert bool((gemm1_alpha > 0).all()) and bool((gemm1_beta > 0).all()), (
+                "SiTU's soft caps must be positive"
+            )
+            assert gemm1_clamp_limit is None, "SiTU takes no clamp limit"
         # Pure-metadata guard: routing_bias is a no-op for every non-grouped
         # routing method, and for any routing method once topk_ids/topk_weights
         # carry the routing. A caller expecting the bias to shift expert selection

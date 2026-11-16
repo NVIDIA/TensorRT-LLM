@@ -174,7 +174,7 @@ def gqa_unknown_attention_backend(requested: str) -> Optional[str]:
     the constructor): CUTEDSL and any name outside `GQA_ATTENTION_BACKENDS`."""
     if requested not in GQA_ATTENTION_BACKENDS:
         return (
-            "K3DSparkDrafter attention backend must be one of ['VANILLA', 'TRTLLM', 'FA4'], got "
+            f"K3DSparkDrafter attention backend must be one of {list(GQA_ATTENTION_BACKENDS)}, got "
             f"{requested!r}."
         )
     return None
@@ -421,7 +421,7 @@ def standalone_drafter_declines(model_config, spec_config, sm: int) -> Optional[
     kwargs = external_drafter_config_kwargs(model_config, spec_config)
     try:
         pretrained_config = load_pretrained_config(spec_config.speculative_model, **kwargs)
-    except Exception as error:  # noqa: BLE001 - any load failure declines; Modeling V1 reports it.
+    except (OSError, ValueError) as error:  # a missing or malformed config; Modeling V1 reports it.
         return (
             f"the drafter config at {spec_config.speculative_model!r} cannot be loaded "
             f"({type(error).__name__}: {error})"

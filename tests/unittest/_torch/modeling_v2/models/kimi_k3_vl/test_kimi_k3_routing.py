@@ -27,6 +27,7 @@ from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl import (
     drafter_config,
     environment,
+    routing,
 )
 from tensorrt_llm._torch.configs.kimi_k3 import KimiK3Config
 from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
@@ -39,6 +40,7 @@ from tensorrt_llm.llmapi.llm_args import (
     MoeLoadBalancerConfig,
     NGramDecodingConfig,
     SADecodingConfig,
+    TorchCompileConfig,
     TorchLlmArgs,
 )
 from tensorrt_llm.mapping import Mapping
@@ -300,13 +302,15 @@ def _k3_with(mapping_kwargs=_TP16_MOETP4EP4, quant_algo=QuantAlgo.W4A16_MXFP4, *
             "dtype torch.float16",
         ),
         # an fp8 KV cache
-        (_k3_with(), dict(dtype="fp8"), "KV cache FP8"),
+        (_k3_with(), dict(dtype="fp8"), "kv_cache_config.dtype FP8"),
         # a resolved quantization other than the MXFP4 checkpoint's
         (_k3_with(quant_algo=QuantAlgo.NVFP4), {}, "resolved quantization"),
         # per-layer quantization declarations
         (_k3_with(quant_config_dict={"lm_head": QuantConfig()}), {}, "1 per-layer"),
         # an all-reduce strategy other than AUTO or MNNVL
         (_k3_with(allreduce_strategy=AllReduceStrategy.NCCL), {}, "allreduce_strategy NCCL"),
+        # an attention backend other than TRTLLM
+        (_k3_with(attn_backend="FLASHINFER"), {}, "attn_backend FLASHINFER"),
         # the KV cache block size and reuse the deployment did not set
         (_k3_with(), dict(tokens_per_block=32), "tokens_per_block 32"),
         (_k3_with(), dict(enable_block_reuse=True), "enable_block_reuse true"),
@@ -327,6 +331,7 @@ def _k3_with(mapping_kwargs=_TP16_MOETP4EP4, quant_algo=QuantAlgo.W4A16_MXFP4, *
         "nvfp4-resolved",
         "per-layer-quant",
         "nccl-allreduce",
+        "flashinfer-attention",
         "tokens-per-block-32",
         "block-reuse",
         "kv-manager-v1",
@@ -618,7 +623,7 @@ def test_kimi_k3_dspark_mla_drafters_the_target_does_not_build_do_not_match(
             _K3_GQA_DRAFTER,
             None,
             "CUTEDSL",
-            r"K3DSparkDrafter attention backend must be one of \['VANILLA', 'TRTLLM', 'FA4'\], got 'CUTEDSL'",
+            r"K3DSparkDrafter attention backend must be one of \['AUTO', 'TRTLLM', 'VANILLA', 'FA4'\], got 'CUTEDSL'",
         ),
         (
             _K3_GQA_DRAFTER,
@@ -698,11 +703,14 @@ def test_kimi_k3_unsupported_llm_args_do_not_match(field):
     "name, value",
     [
         ("ENABLE_PERFECT_ROUTER", "1"),
+        ("ENABLE_PERFECT_ROUTER", "expert_ids"),
         ("EXPERT_STATISTIC_ITER_RANGE", "0-10"),
         ("TRTLLM_LOW_M_GEMM_BACKEND", "auto"),
+        ("TRTLLM_LOW_M_GEMM_BACKEND", "CUTE_DSL"),
         ("TLLM_KDA_ENABLE_OPT_PREFILL", "0"),
         ("TLLM_KDA_ENABLE_INDEXED_STATE_POOL", "0"),
         ("FLA_CONV_BACKEND", "cuda"),
+        ("KIMI_K3_FP8_WEIGHT_READ_MOE_MLP", "1"),
     ],
 )
 def test_kimi_k3_unread_environment_switches_do_not_match(monkeypatch, name, value):
@@ -717,12 +725,49 @@ def test_kimi_k3_unread_environment_switches_do_not_match(monkeypatch, name, val
 @pytest.mark.usefixtures("_on_sm100")
 @pytest.mark.parametrize(
     "name, value",
-    [("ENABLE_PERFECT_ROUTER", "0"), ("TLLM_KDA_ENABLE_OPT_PREFILL", "1")],
+    [
+        ("ENABLE_PERFECT_ROUTER", "0"),
+        ("ENABLE_PERFECT_ROUTER", ""),
+        ("ENABLE_PERFECT_ROUTER", "false"),
+        ("TRTLLM_LOW_M_GEMM_BACKEND", "off"),
+        ("TRTLLM_LOW_M_GEMM_BACKEND", "0"),
+        ("TRTLLM_LOW_M_GEMM_BACKEND", "OFF"),
+        ("TRTLLM_LOW_M_GEMM_BACKEND", "cublas"),
+        ("TLLM_KDA_ENABLE_OPT_PREFILL", "1"),
+        ("KIMI_K3_FP8_WEIGHT_READ_MOE_MLP", "0"),
+    ],
 )
 def test_kimi_k3_environment_switches_at_their_defaults_match(monkeypatch, name, value):
+    """Values the switches' owners read as off leave the deployment on the target."""
     config = _k3_model_config(_k3_config(), **_TP16_MOETP4EP4)
     monkeypatch.setenv(name, value)
     assert _qualified(modeling_v2_resolve(config, _k3_llm_args("require"))) == _K3_TARGET
+
+
+def test_kimi_k3_route_reads_the_low_m_gemm_switch_as_its_parser_does(monkeypatch):
+    """``route`` keeps a deployment exactly where the low-M GEMM parser reads its switch as off."""
+    from tensorrt_llm._torch.modules import low_m_gemm
+
+    assert routing._LOW_M_GEMM_OFF == low_m_gemm._DISABLED_VALUES
+    for value in sorted(low_m_gemm._DISABLED_VALUES | low_m_gemm._ENABLED_VALUES) + [
+        "CUTE_DSL",
+        " Off ",
+    ]:
+        monkeypatch.setenv("TRTLLM_LOW_M_GEMM_BACKEND", value)
+        assert routing._low_m_gemm_off(value) == (not low_m_gemm._parse_enabled()), value
+
+
+@pytest.mark.usefixtures("_on_sm100")
+def test_kimi_k3_torch_compile_does_not_match():
+    """The targets are not traced by torch.compile: a deployment that asks for it is declined."""
+    config = _k3_model_config(_k3_config(), **_TP16_MOETP4EP4)
+
+    def llm_args(mode):
+        return _k3_llm_args(mode).model_copy(update={"torch_compile_config": TorchCompileConfig()})
+
+    assert modeling_v2_resolve(config, llm_args("auto")) is None
+    with pytest.raises(ValueError, match="torch_compile_config set"):
+        modeling_v2_resolve(config, llm_args("require"))
 
 
 @pytest.mark.usefixtures("_on_sm100")
@@ -772,10 +817,21 @@ def test_kimi_k3_on_another_sm_does_not_match(monkeypatch):
         (
             environment.MLA_MAX_POSITIONS,
             "1e6",
-            "KIMI_K3_MLA_MAX_POSITIONS must be an integer, got '1e6'",
+            "KIMI_K3_MLA_MAX_POSITIONS must be a positive integer, got '1e6'",
+        ),
+        (
+            environment.MLA_MAX_POSITIONS,
+            "-1",
+            "KIMI_K3_MLA_MAX_POSITIONS must be >= 1, got -1",
         ),
     ],
-    ids=["topology", "max-tokens-text", "max-tokens-zero", "mla-positions"],
+    ids=[
+        "topology",
+        "max-tokens-text",
+        "max-tokens-zero",
+        "mla-positions",
+        "mla-positions-negative",
+    ],
 )
 def test_kimi_k3_environment_values_the_targets_reject_do_not_match(
     monkeypatch, name, value, missed
@@ -815,17 +871,20 @@ def test_kimi_k3_environment_values_the_targets_take_match(monkeypatch, values):
 
 def test_kimi_k3_environment_readers_reject_what_route_declines():
     """``environment.declines`` names a variable exactly when its reader raises."""
-    for name, value in (
-        (environment.ATTN_RES_TOPOLOGY, "fused"),
-        (environment.FUSED_ATTN_RES_MAX_TOKENS, "-3"),
-        (environment.MLA_MAX_POSITIONS, "x"),
+    for name, value, read in (
+        (environment.ATTN_RES_TOPOLOGY, "fused", environment.attn_res_topology),
+        (
+            environment.FUSED_ATTN_RES_MAX_TOKENS,
+            "-3",
+            lambda env: environment.fused_attn_res_max_tokens("per_token", env),
+        ),
+        (environment.MLA_MAX_POSITIONS, "x", lambda env: environment.mla_max_positions(1, env)),
+        (environment.MLA_MAX_POSITIONS, "0", lambda env: environment.mla_max_positions(1, env)),
     ):
         env = {name: value}
         assert len(environment.declines(env)) == 1
         with pytest.raises(ValueError):
-            environment.attn_res_topology(env)
-            environment.fused_attn_res_max_tokens("per_token", env)
-            environment.mla_max_positions(1, env)
+            read(env)
     assert environment.declines({}) == []
     assert environment.attn_res_topology({environment.ATTN_RES_TOPOLOGY: "1"}) == "split"
     assert environment.fused_attn_res_max_tokens("split", {}) == 32

@@ -10,7 +10,9 @@ from __future__ import annotations
 import os
 from typing import List, Mapping
 
-#: "1" (the default) runs the attention-residual stream on its own CUDA stream; any other value runs it inline.
+#: Which residual value the DSpark hidden-state tap hands the drafter: "1" (the default) the pre-norm
+#: attention-residual mixture, any other value the running prefix sum. It has to match what the drafter checkpoint was
+#: distilled against; a mismatch lowers acceptance without an error.
 AUX_ATTN_RES_STREAM = "KIMI_K3_AUX_ATTN_RES_STREAM"
 #: "1" (the default) runs the fused attention-residual kernels where they take the shape; any other value turns them
 #: off.
@@ -25,7 +27,7 @@ DISABLE_MIN_LATENCY_LATENT_PROJ = "TLLM_K3_DISABLE_MIN_LATENCY_LATENT_PROJ"
 DISABLE_FUSED_ROUTE_QUANT = "TLLM_K3_DISABLE_FUSED_ROUTE_QUANT"
 #: Unset or "1": the router gate GEMM runs bf16 x bf16 with fp32 output; any other value upcasts to fp32 first.
 ROUTER_BF16 = "KIMI_K3_ROUTER_BF16"
-#: The starting position count of the MLA layers' identity-RoPE table, an integer; unset, the checkpoint's
+#: The starting position count of the MLA layers' identity-RoPE table, a positive integer; unset, the checkpoint's
 #: ``max_position_embeddings``.
 MLA_MAX_POSITIONS = "KIMI_K3_MLA_MAX_POSITIONS"
 
@@ -50,7 +52,8 @@ ATTN_RES_TOPOLOGY_ON = "1"
 
 
 def aux_attn_res_stream(environ: Mapping[str, str] = os.environ) -> bool:
-    """Whether the attention-residual stream runs on its own CUDA stream (`AUX_ATTN_RES_STREAM`)."""
+    """Whether the drafter's hidden-state tap captures the attention-residual mixture, not the running prefix sum
+    (`AUX_ATTN_RES_STREAM`)."""
     return environ.get(AUX_ATTN_RES_STREAM, "1") == "1"
 
 
@@ -117,9 +120,18 @@ def mla_max_positions(default: int, environ: Mapping[str, str] = os.environ) -> 
     """The starting position count of the MLA identity-RoPE table: `MLA_MAX_POSITIONS`, else ``default``.
 
     Raises:
-        ValueError: a value ``int`` does not read.
+        ValueError: a value that is not a positive integer.
     """
-    return int(environ.get(MLA_MAX_POSITIONS, default))
+    if MLA_MAX_POSITIONS not in environ:
+        return default
+    raw = environ[MLA_MAX_POSITIONS]
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(f"{MLA_MAX_POSITIONS} must be a positive integer, got {raw!r}") from None
+    if value < 1:
+        raise ValueError(f"{MLA_MAX_POSITIONS} must be >= 1, got {value}")
+    return value
 
 
 def declines(environ: Mapping[str, str] = os.environ) -> List[str]:
@@ -135,11 +147,8 @@ def declines(environ: Mapping[str, str] = os.environ) -> List[str]:
         fused_attn_res_max_tokens(topology, environ)
     except ValueError as error:
         reasons.append(str(error))
-    if MLA_MAX_POSITIONS in environ:
-        try:
-            mla_max_positions(0, environ)
-        except ValueError:
-            reasons.append(
-                f"{MLA_MAX_POSITIONS} must be an integer, got {environ[MLA_MAX_POSITIONS]!r}"
-            )
+    try:
+        mla_max_positions(1, environ)
+    except ValueError as error:
+        reasons.append(str(error))
     return reasons

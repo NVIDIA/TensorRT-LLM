@@ -18,49 +18,23 @@
 // which the built-in Kimi K3 model keeps using. Compiled with --use_fast_math like the original, so both produce the
 // same bits. Its online-kernel sibling is k3AttnResFwd.cu.
 //
-// Persistent attention-residual kernel WITH the fused epilogue, ported from the
-// vLLM copy of this same kernel (vllm/csrc/libtorch_stable/kimi_k3/
-// attn_res_kernel.cu, also NVIDIA-copyright). Both descend from one source:
-// the constants here (K_TILE, BLK, CHUNK_DEPTH, CONSUMER_GROUPS) and the
-// launcher's `grid = RELEASE_TMEM ? num_sm * 2 : num_sm` are identical to
-// attnResFwd.cu's attn_res_fwd_online_v2_kernel. What that copy grew and ours
-// did not is the epilogue: HAS_DELTA folds the residual add in, and
-// HAS_OUTPUT_NORM folds the trailing RMSNorm in.
+// Persistent attention-residual kernel with the fused epilogue: HAS_DELTA folds the residual add in, and
+// HAS_OUTPUT_NORM folds the trailing RMSNorm in. The constants (K_TILE, BLK, CHUNK_DEPTH, CONSUMER_GROUPS) and the
+// launcher's `grid = RELEASE_TMEM ? num_sm * 2 : num_sm` are those of k3AttnResFwd.cu's
+// attn_res_fwd_online_v2_kernel.
 //
-// Why this is worth trying even though a July 2026 GB300 experiment measured a
-// persistent-grid epilogue as 41-108% SLOWER at T=8192 (run record
-// kimi_k3_attn_res_fusion_kernel_opt/20260730_185026): that experiment's
-// epilogue cost ~150 us against a ~36 us standalone RMSNorm, i.e. ~3.9 us of
-// added time per token per CTA, which a barrier plus a shuffle tree cannot
-// account for -- it must have re-walked H. This version does not: the sum of
-// squares is accumulated in the output pass that already exists, acc32 never
-// leaves registers, and the only added synchronization is one
-// CONSUMER_THREADS-wide named barrier per token. That is a different cost
-// structure, so the old measurement does not settle it.
+// The epilogue does not walk H again: the sum of squares is accumulated in the output pass, acc32 never leaves
+// registers, and the only added synchronization is one CONSUMER_THREADS-wide named barrier per token.
 //
-// One divergence is a bug fix rather than an adaptation, and it is the reason
-// this kernel was unusable before: the source copy triggers the programmatic
-// launch completion before barriering, so in a warp-specialized kernel the
-// producer warp releases the dependent grid while the consumer warps are still
-// storing the output. That is latent upstream, where nothing downstream is
-// launched with the attribute, and fatal here, where PDL is on stack-wide by
-// default. See the barrier near the end of the kernel.
+// Programmatic dependent launch: the kernel triggers the launch completion only after the consumer warps' barrier
+// (see the barrier near the end of the kernel). Triggering it earlier lets the producer warp release the dependent
+// grid while the consumer warps are still storing the output, and PDL is on stack-wide by default.
 //
-// Deliberately a separate translation unit rather than an edit to
-// attnResFwd.cu: everything below sits in an anonymous namespace, so the
-// duplicate sm100::fwd_prod_v2 names have internal linkage and do not collide
-// with the unfused copy. Keeping both lets one A/B the other on identical
-// inputs. If this wins, the follow-up is to merge them, not to keep two.
+// A separate translation unit from k3AttnResFwd.cu: everything below sits in an anonymous namespace, so the
+// duplicate sm100::fwd_prod_v2 names have internal linkage and do not collide with the unfused copy.
 //
-// The __global__ is renamed attn_res_fwd_persistent_fused_kernel rather than
-// keeping the source's attn_res_fwd_online_v2_kernel. Internal linkage settles
-// the linker but not the profiler: nsys keys on the demangled short name, so
-// two same-named kernels in one process collapse into one row and an A/B
-// against attnResFwd.cu cannot tell which copy ran. That cost a full
-// misattribution pass on the 20260902-094152 GB300 traces -- baseline and
-// candidate both showed "attn_res_fwd_online_v2_kernel" and the only thing
-// separating them was the launch grid, which is 152 for both whenever
-// RELEASE_TMEM is false. Distinct names, so the trace answers it directly.
+// The __global__ is named attn_res_fwd_persistent_fused_kernel, not attn_res_fwd_online_v2_kernel: profilers key
+// on the demangled short name, and two same-named kernels in one process collapse into one row.
 
 #include "kimi_k3_vl/csrc/k3AttnResDecode.h"
 #include "tensorrt_llm/common/assert.h"
@@ -1025,7 +999,7 @@ __global__ void __launch_bounds__(BLK, 1)
     // token-to-expert selections landed on slots 0..15, which is what a top-16
     // takes when every expert logit is equal, i.e. when the router read a buffer
     // that was never written. With PDL off the same build reproduces the
-    // baseline histogram exactly (run record 0903_persistent_pdl_race.md).
+    // baseline histogram exactly.
     //
     // attnResFwd.cu's s1 kernels need no barrier here because every thread writes
     // its own slice and then reaches the trigger; only a warp-specialized kernel
@@ -1184,29 +1158,9 @@ void invokeAttnResPersistentFusedFwd(AttnResFwdParams const& params, int smReser
         }
     };
 
-    // NC is 3 and RELEASE_TMEM is false for every shape, which is what both
-    // ancestors do at H=7168:
-    //
-    //   vLLM attn_res_kernel.cu:973   launch_fwd<7168, NUM_SOURCES, 3, false, ...>
-    //                                 the file's ONLY instantiation, so its own
-    //                                 NC==2 branches are dead code there
-    //   attnResFwd.cu:1826            launch_fwd<7168, 4, false>
-    //
-    // This port briefly carried an extra gate selecting NC=2 with RELEASE_TMEM
-    // when numCandidates==9 and T>=4096, under a comment claiming it was
-    // "inherited from the source copy". It was not: neither ancestor selects
-    // NC=2 or RELEASE_TMEM at this hidden size, and the gate fired on exactly
-    // one shape -- the deepest prefill layers and nothing else.
-    //
-    // It is gone rather than kept behind a flag. A four-phase ABBA measured it
-    // as no effect: 72921.94 / 72827.29 ms for NC=3 against 72883.91 /
-    // 72947.56 for NC=2, a between-arm delta of 0.056% against a within-arm
-    // spread of 0.130%, with the four values interleaving. So it buys nothing,
-    // and what it costs is a code path upstream never compiles and therefore
-    // never exercises. RELEASE_TMEM is not only a tile choice: it doubles
-    // occupancy to two CTAs per SM and adds a TMEM dealloc/realloc, which are
-    // properties of how the kernel shares the machine rather than of what it
-    // computes, and single-GPU measurement cannot see them.
+    // NC is 3 and RELEASE_TMEM is false for every shape, as in k3AttnResFwd.cu at H=7168
+    // (`launch_fwd<7168, 4, false, true>`). RELEASE_TMEM is not only a tile choice: it doubles occupancy to two
+    // CTAs per SM and adds a TMEM dealloc/realloc.
     {
         auto dispatch3 = [&](auto nsrc_tok) { launch(nsrc_tok, std::integral_constant<int, 3>{}, std::false_type{}); };
         switch (params.numCandidates)

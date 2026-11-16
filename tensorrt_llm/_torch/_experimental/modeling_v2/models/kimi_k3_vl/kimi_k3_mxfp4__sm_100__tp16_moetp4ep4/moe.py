@@ -137,11 +137,9 @@ class KimiK3MoEGate(nn.Module):
     def check_routing(self) -> None:
         """The routing the routed experts compute: DeepSeek-V3 sigmoid scores with renormalized top-k weights."""
         if self.moe_router_activation_func != "sigmoid":
-            raise ValueError("Kimi K3 ConfigurableMoE routing requires sigmoid scores.")
+            raise ValueError("Kimi K3 routing requires sigmoid scores.")
         if not self.moe_renormalize:
-            raise ValueError(
-                "Kimi K3 ConfigurableMoE routing requires top-k weight renormalization."
-            )
+            raise ValueError("Kimi K3 routing requires top-k weight renormalization.")
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Compute fp32 routing logits shaped ``[num_tokens, num_experts]``."""

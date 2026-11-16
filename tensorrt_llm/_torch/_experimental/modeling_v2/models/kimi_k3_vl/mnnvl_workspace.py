@@ -12,7 +12,7 @@ multicast memory build their state from these functions, once, eagerly, before a
   ``MnnvlWorkspace`` and the family kernels' multicast states (``k3_fused_moe``, ``k3_sandwich``) use it.
 * ``group_comm`` and ``use_fabric_handle``: the communicator and handle rule the built-in MNNVL all-reduce uses (a
   split of the session communicator, collective over every rank of the session; fabric handles across nodes or with
-  ``TRTLLM_FORCE_MNNVL_AR=1``). Target A's ``k3_markov`` and ``k3_spec_accept`` workspaces use them.
+  ``TRTLLM_FORCE_MNNVL_AR=1``). The tp16_moetp4ep4 target's ``k3_markov`` and ``k3_spec_accept`` workspaces use them.
 * ``make_mcast_buffer``: the ``McastGPUBuffer`` that owns the memory. ``get_uc_buffer`` gives this rank's view,
   ``get_mc_buffer`` the multicast view. The memory lives as long as the handle.
 * ``all_ranks_succeeded``: the agreement every step of a collective setup needs. A rank that skips a step while
@@ -155,7 +155,7 @@ def arm_lamport_buffers(
 class MnnvlWorkspace:
     """One TP group's MNNVL Lamport workspace: three buffers of ``buffer_bytes`` behind one multicast mapping, and
     the flag words that rotate them. Every MNNVL call on it takes the next buffer, so all of a group's ranks must
-    make the same calls on it in the same order (see the contract's ``## State``)."""
+    make the same calls on it in the same order."""
 
     lamport: torch.Tensor
     """fp32 [3 * buffer_bytes / 4]: this rank's unicast view of the three buffers (every word -0.0 when armed)."""
@@ -267,10 +267,10 @@ def shared_lamport_workspace(
 
     The built-in MNNVL all-reduce creates and grows it, over its own communicator (a split of the session
     communicator) and with its own handle rule (fabric handles across nodes or with ``TRTLLM_FORCE_MNNVL_AR=1``).
-    The first call for a mapping creates it at ``max(1024 * 8192 * itemsize(dtype), buffer_bytes)``; a later call
-    that needs more replaces it with one rounded up to 8 MiB. Creating or growing is collective over the TP group
-    and cannot run under CUDA-graph capture: make the largest call of each shape once, eagerly, first. A workspace
-    a captured graph used stays alive after it is replaced. A call that needs no growth is local.
+    The first call for a mapping creates it at ``buffer_bytes`` (``1024 * 8192 * itemsize(dtype)`` when None); a
+    later call that needs more replaces it with one rounded up to 8 MiB. Creating or growing is collective over the
+    TP group and cannot run under CUDA-graph capture: make the largest call of each shape once, eagerly, first. A
+    workspace a captured graph used stays alive after it is replaced. A call that needs no growth is local.
     """
     from tensorrt_llm._torch.distributed.ops import get_or_scale_allreduce_mnnvl_workspace
 

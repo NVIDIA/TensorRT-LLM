@@ -70,7 +70,7 @@ class K3DSparkRmsnormRope(OpWrapper):
     ``_rmsnorm_rope_batched`` passes it): a new tensor. ``apply_weight`` / ``apply_rmsnorm`` False skip
     the scale / the normalization."""
 
-    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_100})
     CELLS: tuple[Cell, ...] = (
         *(
             Cell(
@@ -186,7 +186,7 @@ class K3DSparkRopeInto(OpWrapper):
     into ``out[..., out_rope_offset:out_rope_offset + rope_dim]`` of ``out`` [B, T, h, Do]; nothing else of ``out``
     is written. Returns None."""
 
-    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_100})
     CELLS: tuple[Cell, ...] = tuple(
         Cell(
             why=f"q of 4 heads (TP16 rank) into the 576-wide absorbed query, B={b}, T={t}",
@@ -317,7 +317,7 @@ class K3DSparkMlaDecode(OpWrapper):
     latent-space output [B, T, H, L]. ``seq_lens`` [B] is each request's KV length; ``workspace`` the kernel's
     scratch (`mla_decode_workspace_bytes`)."""
 
-    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_100})
     CELLS: tuple[Cell, ...] = tuple(
         Cell(
             why=f"4 heads (TP16 rank), latent 512 + rope 64, page 64, B={b}, T={t}, every row the whole block",
@@ -440,7 +440,7 @@ class K3DSparkMlaPagedDecode(OpWrapper):
     base 2. ``nope_dim`` is the un-absorbed q / k head width the kernel is told about; ``max_kv_len`` the pages'
     capacity per request; ``workspace`` its scratch. Returns None."""
 
-    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_100})
     CELLS: tuple[Cell, ...] = tuple(
         Cell(
             why=f"4 heads (TP16 rank), latent 512 + rope 64, nope 128, page 64, B={b}, T={t}",

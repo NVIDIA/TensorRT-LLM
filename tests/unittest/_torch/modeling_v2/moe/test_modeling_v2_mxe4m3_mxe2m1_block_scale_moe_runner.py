@@ -1977,3 +1977,24 @@ def _check_situ_cell(cell):
     )
     assert y.shape == (spec["tokens"], hidden), y.shape
     _assert_moe_close(y, entry_ref.to(torch.bfloat16))
+
+    # The guard refuses a SiTU call without both positive soft caps, or with a clamp limit.
+    situ = dict(
+        topk_ids=ids,
+        topk_weights=wts,
+        n_group=1,
+        topk_group=1,
+        local_expert_offset=off,
+        local_num_experts=n,
+        routing_method_type=2,
+        act_type=3,
+    )
+    for bad in (
+        dict(gemm1_alpha=alpha, gemm1_beta=None),
+        dict(gemm1_alpha=None, gemm1_beta=beta),
+        dict(gemm1_alpha=torch.zeros_like(alpha), gemm1_beta=beta),
+        dict(gemm1_alpha=alpha, gemm1_beta=-beta),
+        dict(gemm1_alpha=alpha, gemm1_beta=beta, gemm1_clamp_limit=torch.full_like(alpha, 7.0)),
+    ):
+        with pytest.raises(AssertionError, match="SiTU"):
+            _call(data, sf, args, num_experts, top_k, **situ, **bad)

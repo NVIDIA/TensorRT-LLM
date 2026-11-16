@@ -38,6 +38,8 @@ def test_requires_its_layout():
         target._check_construction(config(16, 1))
     with pytest.raises(NoTarget, match="enable_attention_dp false"):
         target._check_construction(config(4, 4, attention_dp=True))
+    with pytest.raises(NoTarget, match="attn_backend is FLASHINFER"):
+        target._check_construction(config(4, 4, attn_backend="FLASHINFER"))
 
 
 def test_routed_quant_is_checked():

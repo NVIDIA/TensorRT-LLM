@@ -234,20 +234,20 @@ class KimiK3DSparkWorker(DSparkWorker):
             if reason is None and not mnnvl_workspace.has_shared_lamport_workspace(mapping):
                 # Not kept: re-checked on later steps, since the model's MNNVL workspace may not exist yet.
                 logger.info_once(
-                    "DFlash: the target logits are all-gathered (the TP all-reduces are not MNNVL)",
+                    "DSpark: the target logits are all-gathered (the TP all-reduces are not MNNVL)",
                     key="dflash_k3_logits_no_mnnvl",
                 )
                 return None
             if mapping is not None and mapping.tp_size > 1:
                 if reason is None:
                     logger.info(
-                        f"DFlash: decode-step target logits stay vocabulary-sharded ({lm_head.weight.shape[0]} "
+                        f"DSpark: decode-step target logits stay vocabulary-sharded ({lm_head.weight.shape[0]} "
                         f"columns per rank); trtllm::k3_spec_accept exchanges the row maxima, and a request's "
                         f"logits post-processors get them gathered"
                     )
                 else:
                     logger.info_once(
-                        f"DFlash: the target logits are all-gathered ({reason})", key=reason
+                        f"DSpark: the target logits are all-gathered ({reason})", key=reason
                     )
             self._k3_shard_head, self._k3_shard_ok = lm_head, reason is None
         if not self._k3_shard_ok:
@@ -389,7 +389,7 @@ class KimiK3DSparkWorker(DSparkWorker):
                 self._k3_ctx_pool = view
         ok = reason is None
         if not ok:
-            logger.info(f"DFlash: context K/V on the Python path ({reason})")
+            logger.info(f"DSpark: context K/V on the Python path ({reason})")
         if not torch.cuda.is_current_stream_capturing():
             cache[n] = ok
         return ok
@@ -522,7 +522,7 @@ class KimiK3DSparkWorker(DSparkWorker):
         if step_shard is not None:
             if step_shard[0] is not logits:
                 raise RuntimeError(
-                    "DFlash: the target logits are not the vocabulary shard target_logits returned"
+                    "DSpark: the target logits are not the vocabulary shard target_logits returned"
                 )
             shard = step_shard[1]
 
@@ -558,7 +558,7 @@ class KimiK3DSparkWorker(DSparkWorker):
             fused_accept = True
         else:
             raise RuntimeError(
-                "DFlash: the target logits are vocabulary-sharded, but the fused acceptance no longer applies"
+                "DSpark: the target logits are vocabulary-sharded, but the fused acceptance no longer applies"
             )
         # Before any store: prefill and decode both address pages through it.
         # Returning False here means an empty batch -- the missing-offsets case

@@ -116,7 +116,8 @@ def _layer_norm_fwd_1pass_kernel(
 
 @triton.heuristics({"OUTPUT_FP8": lambda args: args["FP8_SCALE"] is not None})
 @triton.heuristics({"SAVE_RSTD": lambda args: args["Rstd"] is not None})
-@triton.jit
+# M follows the batch: specializing it (on == 1 and on % 16) would compile variants of identical code mid-serving.
+@triton.jit(do_not_specialize=["M"])
 def _rms_norm_gated_fwd_multirow_kernel(
     X,  # pointer to the input
     Y,  # pointer to the output
