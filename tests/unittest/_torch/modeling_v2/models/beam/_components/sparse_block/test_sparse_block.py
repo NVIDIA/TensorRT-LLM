@@ -506,6 +506,9 @@ def block_results(seed: int, out: torch.Tensor, captured: dict, ref: dict) -> li
         "block_output",
     )
     final["tokens"] = int(matched.sum())
+    if final["tokens"] == 0:
+        final["passed"] = False
+        final["problems"].append("no set-matched tokens: block output was not compared")
     results.append(final)
     results.append(
         compare(

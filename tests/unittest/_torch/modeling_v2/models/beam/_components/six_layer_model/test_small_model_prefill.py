@@ -196,7 +196,7 @@ def recording(model):
         saved.append((cls, original))
 
         def logged(self, *args, _original=original, _name=cls.__name__, **kwargs):
-            keep = weight_args_from.get(_name, len(args))
+            keep = len(args) if current[0] is None else weight_args_from.get(_name, len(args))
             entry = {
                 "op": _name,
                 "block": current[0],
@@ -687,6 +687,12 @@ def test_forward_composes_the_six_blocks(seed, length) -> None:
     assert [c["op"] for c in top] == ["FlashinferRmsnorm", "CublasMm", "BeamLogitSoftcap"]
     norm, head, softcap = top
     assert bitwise_equal(norm["args"][0], events[-1][2].view(length, HIDDEN))
+    assert norm["args"][1] is model.norm
+    assert norm["args"][2] == model.eps == 1e-6
+    head_weight = head["args"][1]
+    assert head_weight.data_ptr() == model.lm_head.data_ptr()
+    assert head_weight.shape == model.lm_head.t().shape
+    assert head_weight.stride() == model.lm_head.t().stride()
     assert bitwise_equal(head["args"][0], norm["output"])
     assert head["output"].dtype == torch.bfloat16 and head["output"].shape == (length, VOCAB)
     # The softcap, exactly once: the returned logits are this expression of the head output.

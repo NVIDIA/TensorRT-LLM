@@ -579,7 +579,7 @@ def cache_rows(
 # -------------------------------------------------- unsupported block inputs
 
 #: The message each hidden-state or position refusal of ``_attention.check_step`` raises.
-#: Metadata refusals have no pattern here: they are checked by type alone.
+#: Include metadata messages so unrelated validation failures cannot satisfy those cases.
 _BAD_INPUT_MATCH = {
     "fp16_hidden": "hidden_states must be a torch.bfloat16 tensor",
     "fp32_hidden": "hidden_states must be a torch.bfloat16 tensor",
@@ -589,6 +589,9 @@ _BAD_INPUT_MATCH = {
     "empty": "supported token counts per call are",
     "non_contiguous": "hidden_states must be contiguous",
     "positions_offset": "its positions must be exactly those",
+    "cached_prefix": "paged-context FMHA is required",
+    "two_requests": "one request per call is supported; metadata has 2",
+    "context_length_mismatch": "do not fill the call's 17 tokens",
     "float_positions": r"position_ids must be an int32/int64 tensor of shape \(1, 17\) on cuda",
     "positions_shape": r"position_ids must be an int32/int64 tensor of shape \(1, 17\) on cuda",
 }
@@ -634,6 +637,8 @@ def bad_block_input(
         context = dict(num_tokens=length, cached_tokens=8)
     elif case == "two_requests":
         context = dict(num_tokens=length, num_requests=2)
+        x = torch.cat((x, x), dim=1)
+        positions = torch.arange(2 * length, device="cuda").view(1, -1)
     elif case == "context_length_mismatch":
         context = dict(num_tokens=length - 1)
     elif case == "kv_cache_heads":

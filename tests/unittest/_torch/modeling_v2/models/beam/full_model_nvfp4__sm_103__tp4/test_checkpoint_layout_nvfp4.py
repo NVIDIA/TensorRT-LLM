@@ -540,9 +540,16 @@ def test_expert_provider_matches_independent_reference(shared_fc1, monkeypatch) 
             ),
             "weight_scale": None,
             "linear_scale": torch.stack([(sf + 1 + i).to(torch.uint8) for i in range(n_experts)]),
-            "input_scale": torch.full((n_experts,), s, dtype=torch.float32),
-            "weight_scale_2": torch.full((n_experts,), w2, dtype=torch.float32),
+            "input_scale": torch.tensor(
+                [s * (i + 2) for i in range(n_experts)], dtype=torch.float32
+            ),
+            "weight_scale_2": torch.tensor(
+                [w2 / (i + 2) ** 2 for i in range(n_experts)], dtype=torch.float32
+            ),
         }
+        # Keep the selected expert's reference operands; other slots must not alias its scalars.
+        bank["input_scale"][expert] = s
+        bank["weight_scale_2"][expert] = w2
         bank["weight"][expert] = packed
         bank["linear_scale"][expert] = sf
         bank["g"] = torch.ones(n_experts, dtype=torch.float32) / bank["input_scale"]
