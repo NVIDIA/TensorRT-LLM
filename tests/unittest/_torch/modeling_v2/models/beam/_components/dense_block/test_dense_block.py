@@ -26,6 +26,8 @@ Optional environment:
   dict of tensors captured from the source block under the reference's record names
   (plus ``input`` and ``positions``). The final output and every replay are then also
   compared against the captures, and the generated input must equal theirs bit for bit.
+  Separate source-capture tests report SKIPPED when this variable is unset; an explicitly
+  configured directory must contain valid captures. Reference tests run independently.
 * ``BEAM_DENSE_BLOCK_EVIDENCE``: a directory that receives one JSON record per test case:
   every comparison with its rule, the op calls and CUDA kernels of the forward, and the
   device and software it ran on; and ``fp32-session.json``, the fp32 GEMM checks made
@@ -312,10 +314,10 @@ def reference_record(seed: int, length: int) -> dict:
     return record
 
 
-def source_captures(seed: int, length: int) -> dict | None:
+def source_captures(seed: int, length: int) -> dict:
     directory = os.environ.get("BEAM_DENSE_BLOCK_SOURCE_CAPTURES")
     if not directory:
-        return None
+        pytest.skip("BEAM_DENSE_BLOCK_SOURCE_CAPTURES is not configured")
     captures = torch.load(
         Path(directory) / f"seed{seed}" / f"T{length}.pt", map_location="cuda", weights_only=True
     )
@@ -761,12 +763,6 @@ def test_block_matches_reference(seed, length, ieee_fp32) -> None:
         final.update(reference="reference")
         results.append(final)
         results.extend(replay(blk, md, ref, "reference"))
-        captures = source_captures(seed, length)
-        if captures is not None:
-            from_source = compare("block_output", out, captures["block_output"], "block_output")
-            from_source.update(reference="source_captures")
-            results.append(from_source)
-            results.extend(replay(blk, md, captures, "source_captures"))
     _write_evidence(
         f"block-seed{seed}-T{length}",
         {
@@ -778,6 +774,23 @@ def test_block_matches_reference(seed, length, ieee_fp32) -> None:
             "environment": _environment(ieee_fp32),
         },
     )
+    assert_all_pass(results)
+
+
+@pytest.mark.skipif(
+    not os.environ.get("BEAM_DENSE_BLOCK_SOURCE_CAPTURES"),
+    reason="BEAM_DENSE_BLOCK_SOURCE_CAPTURES is not configured",
+)
+@pytest.mark.parametrize("seed,length", CASES, ids=CASE_IDS)
+def test_block_matches_source_captures(seed, length, ieee_fp32) -> None:
+    """Optional source qualification, separate from the always-run reference comparisons."""
+    captures = source_captures(seed, length)
+    blk = loaded_block(seed)
+    x, positions = case_inputs(seed, length)
+    with fresh_context(length) as md:
+        out = blk(x, positions, md)
+        results = [compare("block_output", out, captures["block_output"], "block_output")]
+        results.extend(replay(blk, md, captures, "source_captures"))
     assert_all_pass(results)
 
 

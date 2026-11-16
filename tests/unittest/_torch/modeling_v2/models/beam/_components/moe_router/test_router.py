@@ -26,7 +26,9 @@ Optional environment:
   ``fixtures/<name>.pt`` (``hidden``, ``bias`` and the same names). The generated inputs
   must then equal the captured ones bit for bit, the op's ``reference`` must reproduce
   every captured tensor bit for bit, and the component is compared with the captures
-  under the same rules as with the reference.
+  under the same rules as with the reference. Separate source-capture tests report
+  SKIPPED when this variable is unset; a configured directory must contain valid files.
+  Ordinary reference and routing-invariant tests run independently.
 * ``BEAM_MOE_ROUTER_EVIDENCE``: a directory that receives one JSON record per test case:
   every comparison with its rule, hashes of the routed tensors, the torch calls and CUDA
   kernels of the forward, and the device and software it ran on.
@@ -160,19 +162,19 @@ def route_hashes(route: dict) -> dict:
 # ----------------------------------------------------------------------------- source captures
 
 
-def _captures_dir() -> Path | None:
+def _captures_dir() -> Path:
     directory = os.environ.get("BEAM_MOE_ROUTER_SOURCE_CAPTURES")
-    return Path(directory) if directory else None
+    if not directory:
+        pytest.skip("BEAM_MOE_ROUTER_SOURCE_CAPTURES is not configured")
+    return Path(directory)
 
 
 def _as_route(captured: dict) -> dict:
     return {name: captured[key] for name, key in CAPTURE_NAMES.items()}
 
 
-def matrix_captures(seed: int, tokens: int) -> dict | None:
+def matrix_captures(seed: int, tokens: int) -> dict:
     root = _captures_dir()
-    if root is None:
-        return None
     params = torch.load(root / f"seed{seed}" / "params.pt", weights_only=True)
     blob = torch.load(root / f"seed{seed}" / f"T{tokens}.pt", weights_only=True)
     return dict(
@@ -183,21 +185,14 @@ def matrix_captures(seed: int, tokens: int) -> dict | None:
     )
 
 
-def fixture_captures(name: str) -> dict | None:
+def fixture_captures(name: str) -> dict:
     root = _captures_dir()
-    if root is None:
-        return None
     blob = torch.load(root / "fixtures" / f"{name}.pt", weights_only=True)
     return dict(bias=blob["bias"], hidden=blob["hidden"], route=_as_route(blob))
 
 
-def check_against_captures(
-    captured: dict | None, inputs: dict, route: dict, reference: dict
-) -> list:
-    """With captures: same input bytes, the reference reproduces them bitwise, and the
-    component meets the rules against them. Without: nothing."""
-    if captured is None:
-        return []
+def check_against_captures(captured: dict, inputs: dict, route: dict, reference: dict) -> list:
+    """Same input bytes, bitwise reference reproduction, and component comparison rules."""
     results = []
     for name, tensor in inputs.items():
         same = torch.equal(tensor.cpu(), captured[name].cpu())
@@ -583,7 +578,7 @@ def test_precision_path_is_fp32_without_tf32_or_autocast() -> None:
 @pytest.mark.parametrize("seed,tokens", cases.CASES, ids=cases.CASE_IDS)
 def test_matrix(seed, tokens) -> None:
     """One case of the fixed matrix: the output contract, every step against the reference
-    (and the source captures when given), the routing invariants, and the evidence that
+    the routing invariants, and the evidence that
     the routing ran on the GPU in this component's op with no host synchronization."""
     weight, bias, hidden_cpu = cases.matrix_case(seed, tokens)
     router = loaded_router(weight, bias)
@@ -606,12 +601,6 @@ def test_matrix(seed, tokens) -> None:
     results = check_output_contract(weights, ids, hidden)
     results += cases.compare_routes(route, reference, "reference")
     results += check_invariants(route, sum_to_one=True)
-    results += check_against_captures(
-        matrix_captures(seed, tokens),
-        {"weight": weight, "bias": bias, "hidden": hidden_cpu},
-        route,
-        reference,
-    )
 
     host = [c["func"] for c in trace.calls if c["func"] in HOST_TRANSFERS]
     off_device = [
@@ -661,11 +650,51 @@ def test_matrix(seed, tokens) -> None:
     cases.assert_all_pass(results)
 
 
+@pytest.mark.skipif(
+    not os.environ.get("BEAM_MOE_ROUTER_SOURCE_CAPTURES"),
+    reason="BEAM_MOE_ROUTER_SOURCE_CAPTURES is not configured",
+)
+@pytest.mark.parametrize("seed,tokens", cases.CASES, ids=cases.CASE_IDS)
+def test_matrix_matches_source_captures(seed, tokens) -> None:
+    captured = matrix_captures(seed, tokens)
+    weight, bias, hidden_cpu = cases.matrix_case(seed, tokens)
+    router = loaded_router(weight, bias)
+    hidden = hidden_cpu.cuda()
+    _, _, route = routed(router, hidden)
+    cases.assert_all_pass(
+        check_against_captures(
+            captured,
+            {"weight": weight, "bias": bias, "hidden": hidden_cpu},
+            route,
+            reference_route(router, hidden),
+        )
+    )
+
+
+@pytest.mark.skipif(
+    not os.environ.get("BEAM_MOE_ROUTER_SOURCE_CAPTURES"),
+    reason="BEAM_MOE_ROUTER_SOURCE_CAPTURES is not configured",
+)
+@pytest.mark.parametrize("name", tuple(cases.fixtures()))
+def test_fixture_matches_source_captures(name) -> None:
+    captured = fixture_captures(name)
+    route, reference, _ = route_fixture(name)
+    _, bias, hidden = cases.fixture_tensors(cases.fixtures()[name])
+    cases.assert_all_pass(
+        check_against_captures(
+            captured,
+            {"bias": bias, "hidden": hidden},
+            route,
+            reference,
+        )
+    )
+
+
 # ----------------------------------------------------------------------------- controlled fixtures
 
 
 def route_fixture(name: str) -> tuple[dict, dict, list]:
-    """(component route, reference route, comparisons) for one fixture, captures included."""
+    """(component route, reference route, comparisons) independent of source captures."""
     spec = cases.fixtures()[name]
     weight, bias, hidden_cpu = cases.fixture_tensors(spec)
     router = loaded_router(weight, bias)
@@ -674,9 +703,6 @@ def route_fixture(name: str) -> tuple[dict, dict, list]:
     reference = reference_route(router, hidden)
     results = cases.compare_routes(route, reference, "reference")
     results += check_invariants(route, sum_to_one=False)
-    results += check_against_captures(
-        fixture_captures(name), {"bias": bias, "hidden": hidden_cpu}, route, reference
-    )
     exact = torch.equal(route["logits"].cpu(), spec["logits"].float())
     results.append(
         {
