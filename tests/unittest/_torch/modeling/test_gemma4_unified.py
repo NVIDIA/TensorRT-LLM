@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import weakref
+
 import torch
 from transformers import Gemma4ForCausalLM as HFGemma4
 from transformers import Gemma4TextConfig
@@ -23,6 +25,8 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.gemma4_weight_mapper import Gemma4HfWeightMapper
 from tensorrt_llm._torch.models.modeling_gemma4_unified import Gemma4UnifiedForConditionalGeneration
 from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
+from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import enable_breakable_cuda_graph
+from tensorrt_llm._torch.utils import model_extra_attrs
 
 
 @torch.no_grad()
@@ -84,9 +88,8 @@ def test_unified_text_forward_matches_hf(monkeypatch):
     with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
         torch.manual_seed(42)
         reference = HFGemma4(Gemma4TextConfig(**text_config)).to(torch.bfloat16).cuda().eval()
-        model = (
-            model_class(ModelConfig(pretrained_config=config, attn_backend="TRTLLM")).cuda().eval()
-        )
+        model_config = ModelConfig(pretrained_config=config, attn_backend="TRTLLM")
+        model = model_class(model_config).cuda().eval()
 
     mapper = Gemma4HfWeightMapper()
     mapper.init_model_and_config(model.llm, model.llm.model_config)
@@ -132,3 +135,15 @@ def test_unified_text_forward_matches_hf(monkeypatch):
         return_context_logits=True,
     )
     torch.testing.assert_close(embedded_logits, expected, atol=0.05, rtol=0.05)
+    # Under breakable prefill graphs, attention finds its layer in the registry the engine
+    # binds for this model: the extra_attrs of the ModelConfig it was built from.
+    attrs = {**model_config.extra_attrs, "attention_metadata": weakref.ref(metadata)}
+    metadata.prepare()
+    with model_extra_attrs(attrs), enable_breakable_cuda_graph():
+        graph_logits = model(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attn_metadata=metadata,
+            return_context_logits=True,
+        )
+    torch.testing.assert_close(graph_logits, logits, atol=0, rtol=0)

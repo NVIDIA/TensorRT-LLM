@@ -66,8 +66,16 @@ with both context-only and mixed context/decode batches using the KV cache.
 
 The following restrictions are enforced:
 
-- `torch_compile_config`, LoRA, and multimodal models are rejected during
-  engine initialization.
+- `torch_compile_config` and LoRA are rejected during engine initialization.
+- Multimodal models must expose a `DecoderModelForCausalLM` language model
+  through `MultimodalModelMixin`, use a single pipeline stage, and have a
+  language model that sets `supports_multimodal_breakable_cuda_graph` (default
+  false). Other multimodal models are rejected during engine initialization.
+  Encoder work and embedding fusion run outside the captured body. Calls whose
+  optional inputs or tensor layouts differ from capture run the body eagerly.
+- A multimodal model with `disable_mm_encoder` and no local encoder keeps the
+  text path: text batches replay the plain language model body, and batches
+  with multimodal inputs run eagerly.
 - Speculative decoding is supported.
 - Context-logit requests run eagerly instead of replaying a breakable CUDA
   graph.

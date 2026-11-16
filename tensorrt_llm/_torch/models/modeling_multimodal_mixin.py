@@ -654,6 +654,39 @@ class MultimodalModelMixin:
         """Return the token embedding layer used by `fuse_input_embeds`."""
         raise NotImplementedError
 
+    def prepare_breakable_cuda_graph_inputs(self, inputs: dict[str, Any]) -> dict[str, Any]:
+        """Normalize language-model body inputs for breakable prefill graph capture and replay.
+
+        Text and multimodal calls both pass `[num_tokens, hidden_size]` embeddings from
+        `text_embedding_layer`, so they share one captured body. MRoPE generation deltas
+        are padded to the token count so their shape does not depend on the batch.
+        Models with other per-step body inputs extend this hook.
+        """
+        prepared_inputs = dict(inputs)
+        if prepared_inputs.get("inputs_embeds") is None:
+            input_ids = prepared_inputs.get("input_ids")
+            if input_ids is None:
+                raise ValueError("Breakable multimodal prefill requires token IDs or embeddings")
+            prepared_inputs["inputs_embeds"] = self.text_embedding_layer(input_ids)
+        prepared_inputs["input_ids"] = None
+
+        mrope_config = prepared_inputs.get("mrope_config")
+        if mrope_config is not None and "mrope_rotary_cos_sin" in mrope_config:
+            num_tokens = prepared_inputs["inputs_embeds"].shape[0]
+            padded_deltas = torch.zeros(
+                (num_tokens, 1), dtype=torch.int32, device=prepared_inputs["inputs_embeds"].device
+            )
+            deltas = mrope_config.get("mrope_position_deltas")
+            if deltas is not None:
+                if deltas.numel() > num_tokens:
+                    raise ValueError("MRoPE generation deltas exceed the prefill token count")
+                # Generation kernels index deltas from zero, without a context-request offset.
+                padded_deltas[: deltas.numel()].copy_(deltas.reshape(-1, 1))
+            prepared_inputs["mrope_config"] = dict(
+                mrope_config, mrope_position_deltas=padded_deltas
+            )
+        return prepared_inputs
+
     @property
     def embedding_dim(self) -> int:
         """Return the width of each cached multimodal embedding row."""

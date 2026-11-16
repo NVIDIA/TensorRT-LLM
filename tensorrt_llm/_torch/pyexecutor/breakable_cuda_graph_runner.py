@@ -3,12 +3,17 @@
 
 import bisect
 import contextlib
+import inspect
 from enum import Enum
 from typing import Any, Callable, Iterator, Optional
 
 import torch
 from torch import nn
+from torch.utils._pytree import tree_map
 
+from tensorrt_llm.logger import logger
+
+from ..attention.backends.interface import AttentionMetadata
 from ..models.modeling_utils import timing_metric
 from ..nccl_window_graph import (
     abandon_nccl_window_graph_owner,
@@ -16,12 +21,14 @@ from ..nccl_window_graph import (
     release_nccl_window_graph_owner,
 )
 from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
+from ..speculative.interface import SpecMetadata
 from ..utils import make_weak_ref
 from .breakable_cuda_graph import (
     BreakableCUDAGraph,
     BreakableCUDAGraphCapture,
     enable_breakable_cuda_graph,
 )
+from .resource_manager import ResourceManager
 
 
 class BreakableCUDAGraphRunnerState(Enum):
@@ -29,6 +36,40 @@ class BreakableCUDAGraphRunnerState(Enum):
     WARMUP = "warmup"
     CAPTURE = "capture"
     REPLAY = "replay"
+
+
+def _copy_inputs(destination: Any, source: Any) -> bool:
+    """Refresh a captured input tree only when its execution layout matches."""
+    if isinstance(destination, torch.Tensor):
+        if not isinstance(source, torch.Tensor) or (
+            destination.shape != source.shape
+            or destination.dtype != source.dtype
+            or destination.device != source.device
+        ):
+            return False
+        if destination.device.type == "cpu":
+            # Host tensor values may have selected Python branches at capture.
+            return torch.equal(destination, source)
+        destination.copy_(source)
+        return True
+    if type(destination) is not type(source):
+        return False
+    if isinstance(destination, dict):
+        return destination.keys() == source.keys() and all(
+            _copy_inputs(value, source[key]) for key, value in destination.items()
+        )
+    if isinstance(destination, (tuple, list)):
+        return len(destination) == len(source) and all(
+            _copy_inputs(dst, src) for dst, src in zip(destination, source)
+        )
+    if isinstance(destination, (str, int, float, bool, type(None))):
+        return destination == source
+    # These engine-owned objects refresh their tensor state at the eager
+    # execution boundaries. Other mutable host objects can hide captured
+    # Python decisions and must use the eager body instead.
+    return isinstance(destination, (AttentionMetadata, SpecMetadata, ResourceManager)) and (
+        destination is source
+    )
 
 
 class BreakableCUDAGraphRunner:
@@ -43,11 +84,17 @@ class BreakableCUDAGraphRunner:
         self,
         layer_model: nn.Module,
         prepare_replay: Callable[[dict[str, Any]], None] | None = None,
+        prepare_inputs: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     ) -> None:
         self.layer_model = layer_model
         # Refreshes state the captured body reads but computes outside capture, from the
         # body's keyword inputs.
         self._prepare_replay = prepare_replay
+        # Normalizes the body's inputs; capture then stages their tensors in storage the
+        # bucket graph owns, and replay copies the current values into it.
+        self._prepare_inputs = prepare_inputs
+        self._input_signature = inspect.signature(layer_model.forward) if prepare_inputs else None
+        self._inputs: dict[int, dict[str, Any]] = {}
         self._graphs: dict[int, BreakableCUDAGraph] = {}
         self._captured_num_tokens: list[int] = []
         self._outputs: dict[int, torch.Tensor] = {}
@@ -63,6 +110,27 @@ class BreakableCUDAGraphRunner:
         self._active_graph: Optional[BreakableCUDAGraph] = None
         self._active_num_tokens: Optional[int] = None
         self._metrics: dict[str, float] = {}
+
+    def _prepare_body_inputs(self, args: tuple, kwargs: dict) -> dict[str, Any]:
+        assert self._input_signature is not None and self._prepare_inputs is not None
+        bound = self._input_signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        inputs = {}
+        for name, value in bound.arguments.items():
+            kind = self._input_signature.parameters[name].kind
+            if kind == inspect.Parameter.VAR_KEYWORD:
+                inputs.update(value)
+            elif kind == inspect.Parameter.VAR_POSITIONAL:
+                if value:
+                    raise TypeError("Staged BCG body inputs require named parameters")
+            else:
+                inputs[name] = value
+        return self._prepare_inputs(inputs)
+
+    @property
+    def stages_inputs(self) -> bool:
+        """Whether replay refreshes the body's inputs from the current call."""
+        return self._prepare_inputs is not None
 
     @property
     def metrics(self) -> dict[str, float]:
@@ -118,12 +186,20 @@ class BreakableCUDAGraphRunner:
         if self._state != BreakableCUDAGraphRunnerState.IDLE:
             raise RuntimeError(f"Cannot warm up BCG while runner is {self._state.value}")
         self._state = BreakableCUDAGraphRunnerState.WARMUP
+        original_forward = self.layer_model.forward
+        if self._prepare_inputs is not None:
+            # Warm up the body on the inputs that capture and replay give it.
+            self.layer_model.forward = lambda *args, **kwargs: original_forward(
+                **self._prepare_body_inputs(args, kwargs)
+            )
         try:
             with enable_breakable_cuda_graph():
                 for _ in range(steps):
                     with discard_nccl_window_tensor_outputs(scope_inputs):
                         engine_forward()
         finally:
+            if self._prepare_inputs is not None:
+                self.layer_model.forward = original_forward
             self._state = BreakableCUDAGraphRunnerState.IDLE
 
     def capture(
@@ -187,6 +263,7 @@ class BreakableCUDAGraphRunner:
         except Exception:
             if graph is not None:
                 graph.reset()
+            self._inputs.pop(num_tokens, None)
             if created_memory_pool and not self._graphs:
                 # Capture failure can be rank-local; do not return this pool to reuse.
                 abandon_nccl_window_graph_owner(self._memory_pool)
@@ -246,6 +323,14 @@ class BreakableCUDAGraphRunner:
 
         def capture_forward(*args, **kwargs):
             nonlocal captured_output
+            if self._prepare_inputs is not None:
+                inputs = self._prepare_body_inputs(args, kwargs)
+                static_inputs = tree_map(
+                    lambda value: value.clone() if isinstance(value, torch.Tensor) else value,
+                    inputs,
+                )
+                self._inputs[self._active_num_tokens] = static_inputs
+                args, kwargs = (), static_inputs
             with self.capture_context():
                 captured_output = self.capture_output(original_body_forward(*args, **kwargs))
             return captured_output
@@ -302,6 +387,12 @@ class BreakableCUDAGraphRunner:
         original_forward = self.layer_model.forward
 
         def replay_forward(*args, **kwargs):
+            if self._prepare_inputs is not None:
+                inputs = self._prepare_body_inputs(args, kwargs)
+                if not _copy_inputs(self._inputs[num_tokens], inputs):
+                    logger.debug("BCG input layout changed; running the decoder body eagerly")
+                    return original_forward(**inputs)
+                kwargs = self._inputs[num_tokens]
             del args
             if self._prepare_replay is not None:
                 # After the engine's in-place input corrections, as an eager body sees them.
@@ -327,6 +418,7 @@ class BreakableCUDAGraphRunner:
         self._graphs.clear()
         self._captured_num_tokens.clear()
         self._outputs.clear()
+        self._inputs.clear()
         self._shared_output = None
         self._memory_pool = None
         self._break_graph_pool = None

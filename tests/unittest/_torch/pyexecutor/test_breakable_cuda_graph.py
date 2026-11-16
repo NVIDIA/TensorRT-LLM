@@ -797,3 +797,316 @@ def test_padded_context_replay_with_spec_worker_matches_eager():
     replayed = runner.execute(16, forward)
     torch.cuda.synchronize()
     torch.testing.assert_close(replayed, expected)
+
+
+class _PreparedBody(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.forward_calls = 0
+        self.fail_capture = lambda: False
+
+    def forward(self, value, config, optional=None, scale=1, owner=None, **kwargs):
+        self.forward_calls += 1
+        if self.fail_capture():
+            raise ValueError("prepared capture failed")
+        output = value + config["offset"][0]
+        for feature in config["features"]:
+            output = output + feature
+        if optional is not None:
+            output = output + optional
+        if owner is not None:
+            output = output + owner.offset
+        if kwargs.get("host_scale") is not None:
+            output = output * kwargs["host_scale"].item()
+        return (output + kwargs.get("extra", 0)) * scale
+
+
+def _prepared_runner():
+    body = _PreparedBody().cuda()
+    runner = BreakableCUDAGraphRunner(body, prepare_inputs=lambda inputs: inputs)
+    inputs = {
+        "value": torch.zeros((4, 4), device="cuda"),
+        "config": {
+            "features": [torch.ones((4, 4), device="cuda")],
+            "offset": (torch.full((4, 4), 2.0, device="cuda"),),
+        },
+        "owner": None,
+        "extra": torch.full((4, 4), 3.0, device="cuda"),
+        "host_scale": torch.tensor(1.0),
+    }
+
+    def engine_forward():
+        if runner.is_capturing:
+            return runner.capture_model_body(lambda: body(**inputs))
+        return body(**inputs)
+
+    return body, runner, inputs, engine_forward
+
+
+def test_runner_prepared_inputs_refresh_owned_nested_storage(monkeypatch):
+    body, runner, inputs, engine_forward = _prepared_runner()
+    assert runner.stages_inputs
+    source_ref = weakref.ref(inputs["value"])
+    source_ptr = inputs["value"].data_ptr()
+    runner.capture(4, engine_forward)
+    captured = runner._inputs[4]
+    captured_ptr = captured["value"].data_ptr()
+    assert captured_ptr != source_ptr
+    assert captured["config"]["features"][0] is not inputs["config"]["features"][0]
+    assert captured["config"]["offset"][0] is not inputs["config"]["offset"][0]
+
+    replay_calls = []
+    original_replay = runner.replay
+
+    def replay(num_tokens):
+        replay_calls.append(num_tokens)
+        return original_replay(num_tokens)
+
+    monkeypatch.setattr(runner, "replay", replay)
+    for value in (5, 11):
+        inputs["value"] = torch.full((4, 4), float(value), device="cuda")
+        inputs["config"] = {
+            "features": [torch.full((4, 4), float(value + 1), device="cuda")],
+            "offset": (torch.full((4, 4), float(value + 2), device="cuda"),),
+        }
+        inputs["extra"] = torch.full((4, 4), float(value + 3), device="cuda")
+        assert source_ref() is None
+        churn = [torch.full_like(inputs["value"], index) for index in range(8)]
+        assert all(tensor.data_ptr() != captured_ptr for tensor in churn)
+        expected = body(**inputs)
+        eager_calls = body.forward_calls
+
+        actual = runner.execute(4, engine_forward)
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert body.forward_calls == eager_calls
+        assert captured["value"].data_ptr() == captured_ptr
+        for index, tensor in enumerate(churn):
+            torch.testing.assert_close(tensor, torch.full_like(tensor, index))
+    assert replay_calls == [4, 4]
+
+
+@pytest.mark.parametrize(
+    "change", ["shape", "dtype", "optional", "list_length", "list_type", "scalar", "owner"]
+)
+def test_runner_prepared_inputs_incompatible_values_fall_back_eager(monkeypatch, change):
+    body, runner, inputs, engine_forward = _prepared_runner()
+    runner.capture(4, engine_forward)
+    original_forward = body.forward
+    if change == "shape":
+        inputs["config"]["features"][0] = torch.full((1, 4), 5.0, device="cuda")
+    elif change == "dtype":
+        inputs["value"] = inputs["value"].double()
+    elif change == "optional":
+        inputs["optional"] = torch.full_like(inputs["value"], 5)
+    elif change == "list_length":
+        inputs["config"]["features"].append(torch.full_like(inputs["value"], 5))
+    elif change == "list_type":
+        inputs["config"]["features"] = tuple(inputs["config"]["features"])
+    elif change == "scalar":
+        inputs["scale"] = 2
+    else:
+        inputs["owner"] = SimpleNamespace(offset=7.0)
+    expected = body(**inputs)
+    eager_calls = body.forward_calls
+
+    def unexpected_replay(_num_tokens):
+        pytest.fail("incompatible prepared inputs must not replay")
+
+    monkeypatch.setattr(runner, "replay", unexpected_replay)
+    actual = runner.execute(4, engine_forward)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert body.forward_calls == eager_calls + 1
+    assert body.forward == original_forward
+    assert runner.state == BreakableCUDAGraphRunnerState.IDLE
+
+
+@pytest.mark.parametrize("source_kind", ["mutable_owner", "cpu_tensor"])
+def test_runner_prepared_inputs_mutable_host_values_fall_back_eager(monkeypatch, source_kind):
+    body, runner, inputs, engine_forward = _prepared_runner()
+    if source_kind == "mutable_owner":
+        inputs["owner"] = SimpleNamespace(offset=0.5)
+    else:
+        inputs["host_scale"] = torch.tensor(1.0)
+    runner.capture(4, engine_forward)
+    if source_kind == "mutable_owner":
+        inputs["owner"].offset = 7.0
+    else:
+        inputs["host_scale"].fill_(7)
+    expected = body(**inputs)
+    eager_calls = body.forward_calls
+
+    def unexpected_replay(_num_tokens):
+        pytest.fail("changed mutable host values must not replay captured Python decisions")
+
+    monkeypatch.setattr(runner, "replay", unexpected_replay)
+    actual = runner.execute(4, engine_forward)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert body.forward_calls == eager_calls + 1
+
+
+def test_runner_prepared_warmup_normalizes_positional_inputs_under_the_flag():
+    body = _PreparedBody().cuda()
+    normalization_calls = []
+
+    def prepare_inputs(inputs):
+        normalization_calls.append(
+            (inputs["optional"], inputs["scale"], is_in_breakable_cuda_graph())
+        )
+        inputs["value"] = inputs["value"] + 2
+        return inputs
+
+    runner = BreakableCUDAGraphRunner(body, prepare_inputs=prepare_inputs)
+    original_forward = body.forward
+    value = torch.zeros((4, 4), device="cuda")
+    config = {"offset": (torch.zeros_like(value),), "features": []}
+    outputs = []
+
+    runner.warmup(lambda: outputs.append(body(value, config)), steps=2)
+
+    assert normalization_calls == [(None, 1, True), (None, 1, True)]
+    assert body.forward_calls == 2
+    assert body.forward == original_forward
+    assert runner.state == BreakableCUDAGraphRunnerState.IDLE
+    for output in outputs:
+        torch.testing.assert_close(output, torch.full_like(value, 2), rtol=0, atol=0)
+
+
+def test_runner_prepared_input_storage_is_released_on_clear_and_capture_failure():
+    body, runner, _inputs, engine_forward = _prepared_runner()
+    runner.capture(4, engine_forward)
+    staged_ref = weakref.ref(runner._inputs[4]["value"])
+    runner.clear()
+    assert runner._inputs == {}
+    assert staged_ref() is None
+
+    original_forward = body.forward
+    body.fail_capture = lambda: runner.is_capturing
+    with pytest.raises(ValueError, match="prepared capture failed"):
+        runner.capture(4, engine_forward)
+
+    assert runner._inputs == {}
+    assert not runner.has_graph(4)
+    assert runner._memory_pool is None
+    assert body.forward == original_forward
+    assert runner.state == BreakableCUDAGraphRunnerState.IDLE
+
+
+def test_runner_prepared_inputs_follow_the_whole_forward_flag():
+    """Staged runners keep main's flag scope: outer code sees the flag in all three phases."""
+    body = _Body().cuda()
+    runner = BreakableCUDAGraphRunner(body, prepare_inputs=lambda inputs: inputs)
+    inputs = {"value": torch.zeros((4, 4), device="cuda")}
+    seen = []
+
+    def engine_forward():
+        seen.append(is_in_breakable_cuda_graph())
+        if runner.is_capturing:
+            return runner.capture_model_body(lambda: body(**inputs))
+        return body(**inputs)
+
+    runner.capture(4, engine_forward)
+    inputs["value"] = torch.full((4, 4), 5.0, device="cuda")
+    replayed = runner.execute(4, engine_forward)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(replayed, torch.full((4, 4), 6.0, device="cuda"), rtol=0, atol=0)
+    assert len(seen) == BreakableCUDAGraphRunner._WARMUP_STEPS + 2 and all(seen)
+    assert not is_in_breakable_cuda_graph()
+
+
+def test_runner_prepared_body_replays_after_an_encoder_cuda_graph():
+    """An encoder graph replayed in the outer forward feeds the staged body replay."""
+    encoder_input = torch.zeros((4, 4), device="cuda")
+    encoder_graph = torch.cuda.CUDAGraph()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        encoder_output = encoder_input * 3  # warm up outside capture
+        with torch.cuda.graph(encoder_graph, stream=stream):
+            encoder_output = encoder_input * 3
+    torch.cuda.current_stream().wait_stream(stream)
+    body = _Body().cuda()
+    runner = BreakableCUDAGraphRunner(body, prepare_inputs=lambda inputs: inputs)
+
+    def outer():
+        encoder_graph.replay()
+        # Fusion makes a fresh tensor every step, as fuse_input_embeds does.
+        return body(value=encoder_output + 0)
+
+    def engine_forward():
+        return runner.capture_model_body(outer) if runner.is_capturing else outer()
+
+    runner.capture(4, engine_forward)
+    for value in (2.0, 7.0):
+        encoder_input.fill_(value)
+        replayed = runner.execute(4, engine_forward)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            replayed, torch.full_like(replayed, 3 * value + 1), rtol=0, atol=0
+        )
+    encoder_graph.reset()
+    runner.clear()
+
+
+@torch.inference_mode()
+def test_gemma4_opted_in_decoder_captures_and_refreshes_ple_ids():
+    from tensorrt_llm._torch.models.modeling_gemma4 import Gemma4ForCausalLM
+    from tensorrt_llm._torch.models.modeling_gemma4mm import Gemma4ForConditionalGeneration
+
+    class Body(nn.Module):
+        hidden_size_per_layer_input = 1
+
+        def __init__(self):
+            super().__init__()
+            self.forward_calls = 0
+
+        def forward(self, input_ids=None, inputs_embeds=None, ple_input_ids=None):
+            self.forward_calls += 1
+            return inputs_embeds + ple_input_ids[:, None]
+
+    decoder = object.__new__(Gemma4ForCausalLM)
+    nn.Module.__init__(decoder)
+    body = decoder.model = Body()
+    owner = object.__new__(Gemma4ForConditionalGeneration)
+    nn.Module.__init__(owner)
+    owner.llm = decoder
+    owner.model_config = SimpleNamespace(disable_mm_encoder=False)
+    decoder_runner = object.__new__(DecoderRunner)
+    decoder_runner._model = owner
+    decoder_runner._config = SimpleNamespace(
+        prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+        prefill_cuda_graph_num_tokens=[4],
+    )
+    runner = decoder_runner._initialize_breakable_cuda_graph_runner()
+    assert runner.stages_inputs
+    inputs = {
+        "input_ids": torch.zeros(4, dtype=torch.long, device="cuda"),
+        "inputs_embeds": torch.zeros((4, 4), device="cuda"),
+    }
+
+    def outer():
+        return body(**inputs)
+
+    def engine():
+        return runner.capture_model_body(outer) if runner.is_capturing else outer()
+
+    try:
+        runner.capture(4, engine)
+        assert runner.has_graph(4)
+        calls_after_capture = body.forward_calls
+        inputs["input_ids"] = torch.arange(4, device="cuda")
+        inputs["inputs_embeds"] = torch.full((4, 4), 3.0, device="cuda")
+        actual = runner.execute(4, engine)
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(
+            actual, inputs["inputs_embeds"] + inputs["input_ids"][:, None], rtol=0, atol=0
+        )
+        assert body.forward_calls == calls_after_capture
+    finally:
+        runner.clear()

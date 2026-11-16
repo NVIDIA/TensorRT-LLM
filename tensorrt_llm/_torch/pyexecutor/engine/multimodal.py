@@ -22,6 +22,7 @@ from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     MultimodalModelMixin,
 )
 from tensorrt_llm._torch.models.modeling_multimodal_utils import _join_embeddings
+from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm._utils import prefer_pinned
@@ -103,6 +104,21 @@ def is_multimodal(model: nn.Module, input_processor: InputProcessor) -> bool:
     if isinstance(model, MultimodalModelMixin):
         return True
     return isinstance(input_processor, BaseMultimodalInputProcessor)
+
+
+def keeps_text_prefill_body(model: nn.Module, disable_mm_encoder: bool) -> bool:
+    """Whether breakable prefill graphs replay the model's text body on ``input_ids`` unchanged.
+
+    True for a text LLM and for a multimodal wrapper with ``disable_mm_encoder`` and no
+    local encoder. Other multimodal models stage their inputs through
+    ``MultimodalModelMixin.prepare_breakable_cuda_graph_inputs``. The engine's startup check
+    and the decoder runner both decide with this, so they pick the same body.
+    """
+    return isinstance(model, DecoderModelForCausalLM) or (
+        disable_mm_encoder
+        and isinstance(getattr(model, "llm", None), DecoderModelForCausalLM)
+        and getattr(model, "mm_encoder", None) is None
+    )
 
 
 def mm_item_scheduling_enabled(llm_args: TorchLlmArgs, model: nn.Module) -> bool:

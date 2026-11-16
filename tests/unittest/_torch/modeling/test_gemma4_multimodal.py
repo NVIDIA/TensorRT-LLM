@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import os
 import unittest
+import weakref
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -84,6 +85,10 @@ from tensorrt_llm._torch.models.modeling_multimodal_utils import (  # noqa: E402
     get_multimodal_embeddings,
     vision_normalization_from_processor,
 )
+from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import (  # noqa: E402
+    enable_breakable_cuda_graph,
+)
+from tensorrt_llm._torch.utils import model_extra_attrs  # noqa: E402
 from tensorrt_llm.inputs.multimodal import (  # noqa: E402
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalInput,
@@ -148,6 +153,38 @@ SMALL_TEXT_CONFIG = {
         "full_attention": {"rope_type": "default", "rope_theta": 10000.0},
     },
 }
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("use_multimodal_embeds", [False, True])
+def test_gemma4_breakable_inputs_preserve_per_layer_token_ids(use_multimodal_embeds):
+    model = Gemma4MultimodalModelBase.__new__(Gemma4MultimodalModelBase)
+    torch.nn.Module.__init__(model)
+    embedding = torch.nn.Embedding(16, 4)
+    model.llm = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=embedding, hidden_size_per_layer_input=4)
+    )
+    input_ids = torch.tensor([1, 7, 2])
+    safe_input_ids = torch.tensor([1, 0, 2]) if use_multimodal_embeds else None
+    inputs_embeds = torch.randn(3, 4) if use_multimodal_embeds else None
+    inputs = {
+        "input_ids": None if use_multimodal_embeds else input_ids,
+        "inputs_embeds": inputs_embeds,
+        "ple_input_ids": safe_input_ids,
+    }
+
+    prepared = model.prepare_breakable_cuda_graph_inputs(inputs)
+
+    assert prepared is not inputs
+    assert prepared["input_ids"] is None
+    expected_ids = safe_input_ids if use_multimodal_embeds else input_ids
+    assert prepared["ple_input_ids"] is expected_ids
+    if use_multimodal_embeds:
+        assert prepared["inputs_embeds"] is inputs_embeds
+    else:
+        assert inputs["input_ids"] is input_ids
+        assert inputs["ple_input_ids"] is None
+        torch.testing.assert_close(prepared["inputs_embeds"], embedding(input_ids), atol=0, rtol=0)
 
 
 class _Gemma4EncoderCacheHarness(Gemma4MultimodalModelBase):
@@ -696,6 +733,35 @@ class TestGemma4VisionTower(unittest.TestCase):
 
         self.assertEqual(out.shape, torch.Size([output_length, vision_cfg.hidden_size]))
         self.assertFalse(out.isnan().any(), "Vision tower output contains NaN")
+
+    @torch.no_grad()
+    def test_forward_under_breakable_cuda_graph_uses_tower_metadata(self):
+        """An inline encoder under the breakable graph flag keeps its own metadata.
+
+        The outer forward installs the decoder's metadata for registered
+        attention layers; vision attention must not pick it up.
+        """
+        torch.manual_seed(0)
+        vision_cfg = Gemma4VisionConfig(**SMALL_VISION_CONFIG)
+        hf_tower = HFGemma4VisionModel(vision_cfg).to("cuda").to(torch.float32).eval()
+        tower = _build_trt_vision_tower(vision_cfg, dtype=torch.float32)
+        tower.load_weights(dict(hf_tower.state_dict()))
+        # Stand-in for the decoder's metadata: same backend, different length.
+        decoder_metadata = _build_trt_vision_tower(vision_cfg)._prepare_attn_metadata(
+            torch.tensor([4], dtype=torch.int)
+        )
+        attrs = {
+            **tower.model_config.extra_attrs,
+            "attention_metadata": weakref.ref(decoder_metadata),
+        }
+
+        pv, pos, output_length = _make_dummy_pixel_input(vision_cfg, dtype=torch.float32)
+        with torch.inference_mode():
+            expected = tower(pv, pos, output_length=output_length).last_hidden_state
+            with model_extra_attrs(attrs), enable_breakable_cuda_graph():
+                actual = tower(pv, pos, output_length=output_length).last_hidden_state
+
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
     @torch.no_grad()
     def test_load_weights_fuses_qkv(self):

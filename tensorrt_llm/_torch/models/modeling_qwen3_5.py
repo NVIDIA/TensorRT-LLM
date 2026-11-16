@@ -708,6 +708,7 @@ class Qwen3_5MoeForCausalLM(Qwen3NextForCausalLM):
 
     prefill_kernels = True
     decode_kernels = True
+    supports_multimodal_breakable_cuda_graph = True
 
     @classmethod
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
@@ -731,6 +732,7 @@ class Qwen3_5ForCausalLM(Qwen3NextForCausalLM):
     """
 
     decode_kernels = True
+    supports_multimodal_breakable_cuda_graph = True
 
     def __init__(self, model_config):
         keep_lm_head_quant = _lm_head_nvfp4_enabled(model_config)

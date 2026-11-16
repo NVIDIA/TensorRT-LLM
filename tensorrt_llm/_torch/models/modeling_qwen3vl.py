@@ -1998,6 +1998,16 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
         )
         return fused_input_ids, inputs_embeds, tuple(deepstack_buffer.unbind(0))
 
+    def prepare_breakable_cuda_graph_inputs(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
+        prepared_inputs = super().prepare_breakable_cuda_graph_inputs(inputs)
+        if self.deepstack_num_level > 0 and not prepared_inputs.get("deepstack_embeds"):
+            # Text batches replay the same body as image batches, with zero DeepStack rows.
+            num_tokens = prepared_inputs["inputs_embeds"].shape[0]
+            deepstack_buffer = self.deepstack_input_embeds[:, :num_tokens, :]
+            deepstack_buffer.zero_()
+            prepared_inputs["deepstack_embeds"] = list(deepstack_buffer.unbind(0))
+        return prepared_inputs
+
     def get_language_model_extra_forward_kwargs(
         self,
         *,
