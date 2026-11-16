@@ -982,9 +982,9 @@ class DFlashWorker(SpecWorkerBase):
                 f"DFlash: acceptance-statistics recording enabled -> {self._accept_stats.path}"
             )
 
-        # type(self), not a literal: DSparkWorker does not override
-        # __init__, so a hardcoded name reports the base class and the log
-        # cannot evidence which worker a run actually used.
+        # type(self), not a literal: a subclass reaches this through super(),
+        # so a hardcoded name reports the base class and the log cannot
+        # evidence which worker a run actually used.
         logger.info(
             f"{type(self).__name__} initialized with "
             f"use_separate_draft_kv_cache={use_separate_draft_kv_cache}"
@@ -1527,11 +1527,14 @@ class DFlashWorker(SpecWorkerBase):
         self._dummy_slot = num_req_slots
         num_slots = num_req_slots + 1
         # CUDA-graph padding uses ids counting down from
-        # CUDA_GRAPH_DUMMY_REQUEST_ID; a floor of one draft block separates them
-        # from real ids. Imported lazily to avoid an import cycle.
-        from ..pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
+        # CUDA_GRAPH_DUMMY_REQUEST_ID, one per runtime draft length and padding
+        # variant; the lowest of them separates the dummies from real ids.
+        # Imported lazily to avoid an import cycle.
+        from ..pyexecutor.cuda_graph_runner import cuda_graph_dummy_request_id
 
-        self._graph_dummy_id_floor = CUDA_GRAPH_DUMMY_REQUEST_ID - self.max_draft_len
+        self._graph_dummy_id_floor = cuda_graph_dummy_request_id(
+            self.max_draft_len, variant=1, max_draft_len=self.max_draft_len
+        )
 
         self._ctx_len = torch.zeros(num_slots, dtype=torch.long, device="cuda")
         self._ctx_len_host = [0] * num_slots
@@ -2469,6 +2472,14 @@ class DFlashWorker(SpecWorkerBase):
                         gen_draft_tokens,
                     )
 
+                self._on_block_drafted(
+                    draft_model,
+                    num_contexts,
+                    gen_hidden_states.reshape(num_gens, K, -1),
+                    inputs["first_prev_tokens"],
+                    gen_draft_tokens,
+                )
+
         else:
             gen_draft_tokens = torch.empty((0, K), dtype=torch.int32, device="cuda")
 
@@ -2515,6 +2526,40 @@ class DFlashWorker(SpecWorkerBase):
             "next_draft_tokens": next_draft_tokens,
             "next_new_tokens": next_new_tokens,
         }
+
+    def _on_block_drafted(
+        self,
+        draft_model,
+        num_contexts: int,
+        block_hidden: torch.Tensor,
+        first_prev_tokens: torch.Tensor,
+        draft_tokens: torch.Tensor,
+    ) -> None:
+        """Hook run once the generation requests' next block is drafted.
+
+        ``block_hidden`` is the block output at the K draft slots
+        (``[num_gens, K, hidden]``), ``first_prev_tokens`` each request's
+        anchor and ``draft_tokens`` the ``[num_gens, K]`` proposals. A no-op
+        here; a drafter family with a confidence head scores the block.
+        """
+
+    def _gen_target_rows(
+        self, captured_hs: torch.Tensor, spec_metadata, gen_start: int, num_gens: int
+    ) -> torch.Tensor:
+        """The ``K + 1`` captured target rows of every generation request, request-major.
+
+        A ragged verify step packs fewer rows per request; a request's rows
+        past its window then repeat its last one. Their context K/V is never
+        stored, since no more tokens are accepted than were verified.
+        """
+        width = self._draft_tokens_per_req
+        if not spec_metadata.is_ragged_verify:
+            return captured_hs[gen_start : gen_start + num_gens * width]
+        first = gen_start + spec_metadata.qo_indptr[:num_gens].long()
+        last = spec_metadata.verify_lens[:num_gens].long() - 1
+        offsets = torch.arange(width, dtype=torch.long, device=first.device)
+        rows = first.unsqueeze(1) + torch.minimum(offsets.unsqueeze(0), last.unsqueeze(1))
+        return captured_hs.index_select(0, rows.reshape(-1))
 
     def _draft_block_width(self, draft_model) -> int:
         """Block slots the draft forward must compute for K draft tokens.
@@ -2793,9 +2838,8 @@ class DFlashWorker(SpecWorkerBase):
             # Accumulate new accepted features into context buffers
             if has_target_features:
                 gen_start = attn_metadata.num_ctx_tokens
-                # Target now processes exactly K+1 tokens per gen req, so the
-                # captured slice is already the full set we need to project.
-                gen_hs = captured_hs[gen_start : gen_start + num_gens * total_tokens_per_req]
+                # The K+1 target rows per gen req are the full set we need to project.
+                gen_hs = self._gen_target_rows(captured_hs, spec_metadata, gen_start, num_gens)
                 gen_hs_to_project = gen_hs.reshape(-1, gen_hs.shape[-1])
                 projected_to_store = draft_model.project_target_hidden(gen_hs_to_project)
                 if getattr(draft_model, "lilicorr", None) is not None:
@@ -2986,7 +3030,7 @@ class DFlashWorker(SpecWorkerBase):
         )
         gen_start = attn_metadata.num_ctx_tokens
         captured_hs = spec_metadata.get_hidden_states(total_target_tokens)
-        gen_hs = captured_hs[gen_start : gen_start + num_gens * width]
+        gen_hs = self._gen_target_rows(captured_hs, spec_metadata, gen_start, num_gens)
         projected = draft_model.project_target_hidden(gen_hs.reshape(-1, gen_hs.shape[-1]))
         latent, _ = draft_model.precompute_context_kv(
             projected.to(self._ctx_kv_buf[0].dtype), prep.ctx_positions

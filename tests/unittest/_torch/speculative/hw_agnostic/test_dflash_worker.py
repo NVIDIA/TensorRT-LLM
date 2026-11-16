@@ -136,6 +136,7 @@ def test_generation_step_keeps_the_dummy_slot_context_empty():
     spec_metadata = SimpleNamespace(
         hidden_size=hidden,
         runtime_draft_len=max_draft_len,
+        is_ragged_verify=False,
         get_hidden_states=lambda num_tokens: captured[:num_tokens],
     )
     attn_metadata = SimpleNamespace(

@@ -492,10 +492,13 @@ class KimiKDALinearAttention(nn.Module):
         (``prequantized_input``): verify-only batches (:meth:`_is_verify_only_batch`) outside
         the breakable CUDA graph, without padding rows (the operand must cover exactly the
         batch's tokens), whose fused q/k/v/g projection takes a prequantized operand for that
-        many rows. The producer and :meth:`forward` both decide by this method."""
+        many rows. Not a ragged verify step, whose projection reads the rows of the uniform
+        layout instead of the batch's. The producer and :meth:`forward` both decide by this
+        method."""
         return (
             self._qkvg_takes_prequantized is not None
             and self._is_verify_only_batch(attn_metadata)
+            and not getattr(attn_metadata, "is_ragged_verify", False)
             and attn_metadata.num_tokens == num_rows
             and not (self.register_to_config and is_in_breakable_cuda_graph())
             and self.qkvg_takes_prequantized(num_rows)
@@ -540,6 +543,10 @@ class KimiKDALinearAttention(nn.Module):
         otherwise this method returns an allocated core tensor. A
         verify-only batch without ``output`` may instead return the fused
         verify epilogue's MXFP8 core (see ``forward_verify_fused``).
+
+        A ragged verify step (``attn_metadata.is_ragged_verify``: generation
+        request ``i`` carries ``n_i`` rows instead of ``1 + draft_len``) is
+        verified in the uniform layout and returns the core of its own rows.
         """
         mamba_metadata = attn_metadata.mamba_metadata
         num_prefills = attn_metadata.num_contexts
@@ -583,7 +590,10 @@ class KimiKDALinearAttention(nn.Module):
                 cores.append(prefill_core)
         if num_decodes > 0:
             decode_rows = num_tokens - num_ctx_tokens
-            if decode_rows == num_decodes:
+            # A ragged verify step packs each request's verified rows, so its row count
+            # does not tell plain decode from verification.
+            ragged_verify = getattr(attn_metadata, "is_ragged_verify", False)
+            if decode_rows == num_decodes and not ragged_verify:
                 decode_core = self.forward_decode(
                     hidden_states[num_ctx_tokens:num_tokens],
                     conv_pool,
@@ -606,20 +616,37 @@ class KimiKDALinearAttention(nn.Module):
                 # SpeculativeState scratch buffers — never the live pools —
                 # and kv_cache_manager.update_mamba_states() promotes the
                 # accepted step after sampling.
-                assert decode_rows % num_decodes == 0, (
-                    f"ragged generation batch: {decode_rows} tokens for {num_decodes} requests"
-                )
+                verify_states = hidden_states[num_ctx_tokens:num_tokens]
+                verify_output = output[num_ctx_tokens:num_tokens] if output is not None else None
+                if ragged_verify:
+                    # Request i verifies only its first n_i rows. Run the uniform layout
+                    # with its last row repeated in the rows past n_i: only the golden
+                    # token's state is committed (fused) or the accepted step's promoted
+                    # (sequential), and the accepted count is capped at n_i, so neither
+                    # the outputs nor the per-draft records of the repeated rows are
+                    # ever read.
+                    num_steps = self._uniform_verify_steps(layer_cache)
+                    source_rows, kept_rows = attn_metadata.ragged_uniform_rows(num_steps)
+                    verify_states = verify_states.index_select(0, source_rows)
+                else:
+                    assert decode_rows % num_decodes == 0, (
+                        f"ragged generation batch: {decode_rows} tokens for {num_decodes} requests"
+                    )
+                    num_steps = decode_rows // num_decodes
                 verify_core = self.forward_verify(
-                    hidden_states[num_ctx_tokens:num_tokens],
-                    decode_rows // num_decodes,
+                    verify_states,
+                    num_steps,
                     layer_cache,
                     conv_pool,
                     ssm_pool,
                     generation_state_indices,
-                    output=(output[num_ctx_tokens:num_tokens] if output is not None else None),
+                    # The core of a ragged step is in the uniform layout, not the buffer's.
+                    output=None if ragged_verify else verify_output,
                     # The MXFP8 core cannot be concatenated with a prefill
-                    # core or stored into the BCG buffer.
-                    allow_prequantized_output=output is None and num_prefills == 0,
+                    # core, stored into the BCG buffer or gathered by row.
+                    allow_prequantized_output=(
+                        output is None and num_prefills == 0 and not ragged_verify
+                    ),
                     replay_slot_indices=generation_replay_state_indices,
                     # The MXFP8 input covers every row of a verify-only batch.
                     prequantized_input=(
@@ -628,6 +655,10 @@ class KimiKDALinearAttention(nn.Module):
                         else None
                     ),
                 )
+                if ragged_verify:
+                    verify_core = self._store_core(
+                        verify_core.index_select(0, kept_rows), verify_output
+                    )
                 if output is None:
                     cores.append(verify_core)
         if output is not None:
@@ -1288,6 +1319,20 @@ class KimiKDALinearAttention(nn.Module):
         # fallback kernel is [B, 1, H, V]. Prefill returns [tokens, H, V],
         # so a mixed batch can cat the two cores only after this reshape.
         return self._store_core(out, output)
+
+    def _uniform_verify_steps(self, layer_cache) -> int:
+        """Rows per request (1 golden + drafts) of the uniform verify layout that
+        ``layer_cache`` is sized for: the fused kernel's replay caches hold exactly that
+        many drafts, the sequential path's intermediate buffers one state per row."""
+        if self._has_kda_replay_caches(layer_cache):
+            return 1 + layer_cache.kda_k_cache.shape[1]
+        intermediate_ssm = getattr(layer_cache, "intermediate_ssm", None)
+        if intermediate_ssm is None:
+            raise RuntimeError(
+                "ragged speculative verification requires the KDA replay caches or the "
+                "cache manager's intermediate verification buffers"
+            )
+        return intermediate_ssm.shape[1]
 
     def forward_verify(
         self,

@@ -215,6 +215,12 @@ def test_cuda_graph_padding_dummy_slot_count_tracks_reachable_draft_lengths():
     )
     assert _get_num_cuda_graph_padding_dummy_slots(repeated, 64) == 3
 
+    # A ragged verification graph pads with two dummies per draft length.
+    confidence = SimpleNamespace(
+        max_draft_len=4, max_total_draft_tokens=4, enable_confidence_scheduling=True
+    )
+    assert _get_num_cuda_graph_padding_dummy_slots(confidence, 64) == 2
+
 
 def _hybrid_model_config():
     config = SimpleNamespace(

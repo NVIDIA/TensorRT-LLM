@@ -357,6 +357,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         self._num_reserved_dummy_slots = num_cuda_graph_padding_dummy_slots + int(
             mapping.enable_attention_dp
         )
+        # Every dummy request needs a recurrent state, so the dummies counted
+        # above are this manager's index headroom, whatever the caller derived.
+        kwargs.pop("num_reserved_index_slots", None)
         self.ssm_state_dtype = (
             mamba_ssm_cache_dtype if mamba_ssm_cache_dtype is not None else mamba_cache_dtype
         )

@@ -284,6 +284,15 @@ def test_ragged_compressor_warmup_requires_trimmed_tokens():
     DecoderMetadata._warmup_dspark_ragged_compressor_metadata(engine)
 
 
+def test_ragged_compressor_warmup_skips_metadata_without_a_compressor():
+    engine = SimpleNamespace(
+        _ragged_verification_enabled=True,
+        attn_metadata=SimpleNamespace(needs_ragged_compressor_warmup=False),
+    )
+
+    DecoderMetadata._warmup_dspark_ragged_compressor_metadata(engine)
+
+
 def test_ragged_compressor_warmup_rejects_missing_metadata_contract():
     engine = SimpleNamespace(
         _ragged_verification_enabled=True,

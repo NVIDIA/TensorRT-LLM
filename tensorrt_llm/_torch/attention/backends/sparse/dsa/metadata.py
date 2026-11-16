@@ -75,32 +75,15 @@ def build_req_idx_per_token(seq_lens: torch.Tensor, num_tokens: int) -> torch.Te
     return torch.searchsorted(cu_seq_lens, token_idx, right=True)
 
 
-@dataclass(frozen=True)
-class TokenMajorGenView:
-    """One attention row per generation query token.
-
-    Only the MLA RoPE and sparse-MLA generation ops consume this view. The
-    request-major metadata remains unchanged for every other consumer.
-    """
-
-    num_rows: int
-    sequence_length: torch.Tensor
-    host_past_key_value_lengths: torch.Tensor
-    host_context_lengths: torch.Tensor
-    prompt_lens_cuda: torch.Tensor
-    host_request_types: torch.Tensor
-    kv_cache_block_offsets: torch.Tensor
-    # Static row ceiling, not this step's row count. The attention op caches
-    # workspace by max_num_requests, so a per-step value would thrash it.
-    max_num_rows: int
-
-
 @dataclass(init=False)
 class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     """Attention metadata for DSA (Dense Sparse Attention) with indexer state."""
 
     # Sparse attention redirects the selected rows of the mixed-precision high pool itself.
     mixed_precision_block_offsets_redirect: ClassVar[bool] = False
+    # The ragged rows are sized with the expanded indexer buffers, built from
+    # the device-window KV bound and refreshed between the indexer updates.
+    uses_base_ragged_row_hooks: ClassVar[bool] = False
     sparse_metadata_params: Optional[DSAMetadataParams] = None
     use_fp8_ds_mla: bool = field(default=False, init=False)
     # Store reference to indexer for preparation stage
@@ -180,18 +163,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     # cross-step state).
     needs_gvr_prior: bool = field(default=False, init=False)
     gvr_prior_indices: Optional[torch.Tensor] = field(default=None, init=False)
-    # Query tokens per generation request this step, in batch order. None
-    # denotes the uniform runtime stride.
-    ragged_verify_lens: Optional[List[int]] = None
-    # Allocate the row-major and token-major buffers used only by ragged
-    # verification. This is fixed before CUDA-graph metadata is created.
-    enable_ragged_verification: bool = False
-    # In device-window mode the host split determines only the captured shape;
-    # the true windows are installed before replay.
-    device_windows_mode: bool = False
-    # Query tokens per generation request for a uniform runtime tier. Zero
-    # falls back to the static draft-token ceiling.
-    runtime_tokens_per_gen_step: int = 0
 
     @property
     def has_mixed_precision_high_rows(self) -> bool:
@@ -199,18 +170,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         through the high page table (the sparse backends' way; dense attention redirects block
         offsets instead)."""
         return self.mixed_precision_high_block_table is not None
-
-    @property
-    def is_ragged_verify(self) -> bool:
-        return self.ragged_verify_lens is not None
-
-    def _validate_ragged_verification(self) -> None:
-        """Reject layouts whose stable buffers were not enabled at allocation."""
-        if self.ragged_verify_lens is not None and not self.enable_ragged_verification:
-            raise RuntimeError(
-                "ragged verification metadata was installed without enabling "
-                "ragged-verification buffers"
-            )
 
     @property
     def gen_token_stride(self) -> int:
@@ -223,37 +182,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         context_lens = self.kv_lens_cuda_2d[: self.num_generations, :width]
         context_lens.copy_(gen_kv_lens.unsqueeze(-1).expand(-1, width))
         return context_lens
-
-    def mla_prepare_scheduler_buffers(self, num_heads: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Precompute prefixes for the same rows presented to MLA generation."""
-        view = self.token_major_gen_view()
-        if view is None:
-            return super().mla_prepare_scheduler_buffers(num_heads)
-
-        num_ctx = self.num_contexts
-        n_gen = view.num_rows - num_ctx
-        if not self._mla_scheduler_buffers_valid:
-            # RoPE presents one query token per generation row. The device
-            # extents are causal, pre-extra-KV lengths, just like the
-            # cache_seq_lens scanned by the non-precomputed kernel path.
-            torch.cumsum(
-                view.prompt_lens_cuda[num_ctx:],
-                0,
-                dtype=torch.int32,
-                out=self.ragged_mla_cu_q_rows[1 : n_gen + 1],
-            )
-            self.ragged_mla_cu_q_rows[1 : n_gen + 1] *= num_heads
-            torch.cumsum(
-                view.sequence_length[num_ctx:],
-                0,
-                dtype=torch.int32,
-                out=self.ragged_mla_cu_kv_seqlens[1 : n_gen + 1],
-            )
-            self._mla_scheduler_buffers_valid = True
-        return (
-            self.ragged_mla_cu_q_rows[: n_gen + 1],
-            self.ragged_mla_cu_kv_seqlens[: n_gen + 1],
-        )
 
     def gen_token_repeat_list(self) -> List[int]:
         if not self.is_ragged_verify:
@@ -280,7 +208,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
     def __init__(self, *args, **kwargs):
         """Initialize DSA metadata with SM count and indexer chunk size."""
-        self.enable_ragged_verification = bool(kwargs.pop("enable_ragged_verification", False))
         sparse_attention_config = kwargs.pop("sparse_attention_config", None)
         if (
             kwargs.get("sparse_metadata_params") is None
@@ -329,13 +256,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     def __post_init__(self):
         """Allocate indexer K-cache buffers and heuristic TopK metadata."""
         super().__post_init__()
-        if self.is_cross:
-            # Ragged verification is a target self-attention capability. A
-            # cross-attention metadata object may be a shallow copy of one, but
-            # must not inherit its verifier-only buffers or per-step layout.
-            self.enable_ragged_verification = False
-            self.ragged_verify_lens = None
-        self._validate_ragged_verification()
         if not is_dsa_cache_manager(self.kv_cache_manager):
             has_deepseek_v4_cache_interface = all(
                 hasattr(self.kv_cache_manager, attr)
@@ -538,14 +458,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 self.sparse_offload_state, self.request_ids, beam_width=self.beam_width
             )
 
-    def _prepare_device_window_kv_lens(self, kv_lens: torch.Tensor) -> torch.Tensor:
-        """Bound host-side KV extents until device-selected windows are installed."""
-        if self.device_windows_mode and self.is_ragged_verify:
-            nc, ns = self.num_contexts, self.num_seqs
-            kv_lens = kv_lens.clone()
-            kv_lens[nc:ns] += (1 + self.max_draft_tokens) - self.seq_lens_kv[nc:ns]
-            self.kv_lens[nc:ns] = kv_lens[nc:ns]
-        return kv_lens
+    @property
+    def _max_verify_window(self) -> int:
+        return 1 + self.max_draft_tokens
 
     def prepare_for_draft_forward(self) -> dict | None:
         """Select native DSA indexer metadata for a draft forward."""
@@ -1377,28 +1292,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         )
         self.gen_token_repeats_cuda = None
         self.host_gen_token_repeats = None
-        self._ragged_num_rows = 0
-        self._attn_num_rows = 0
-        self.row_kv_lens_cuda = None
-        self.row_kv_lens_host = None
-        self.row_kv_correction_cuda = None
-        self.row_kv_correction_host = None
-        self.row_req_idx_cuda = None
-        self.row_req_idx_host = None
-        self.attn_row_kv_lens_cuda = None
-        self.attn_row_kv_correction_cuda = None
-        self.attn_row_req_idx_cuda = None
-        self.attn_row_kv_lens_host = None
-        self.attn_row_kv_correction_host = None
-        self.attn_row_req_idx_host = None
-        self.attn_row_request_types_host = None
-        self.attn_row_prompt_lens_cuda = None
-        self.attn_row_prompt_lens_cpu = None
-        self.attn_row_block_offsets = None
-        self.ragged_mla_cu_q_rows = None
-        self.ragged_mla_cu_kv_seqlens = None
+        self._reset_ragged_verification_buffers()
         if self.enable_ragged_verification:
-            self._create_ragged_verification_buffers(capture_graph)
+            self._create_ragged_verification_buffers(self.cuda_graph_buffers, capture_graph)
         self.block_table_expanded = self.get_empty(
             self.cuda_graph_buffers,
             [
@@ -1438,11 +1334,11 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             capture_graph=capture_graph,
         )
 
-    def _create_ragged_verification_buffers(self, capture_graph: bool) -> None:
+    def _create_ragged_verification_buffers(self, buffers, capture_graph: bool) -> None:
         """Allocate persistent row layouts required only by ragged verification."""
         # Stable-address repeat vector used by in-graph ragged expansions.
         self.gen_token_repeats_cuda = self.get_empty(
-            self.cuda_graph_buffers,
+            buffers,
             (self.max_num_sequences,),
             cache_name="gen_token_repeats_cuda",
             dtype=torch.int64,
@@ -1453,111 +1349,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             device="cpu",
             pin_memory=prefer_pinned(),
         )
-        row_cap = self.max_num_sequences * (1 + self._draft_sizing_cap)
-        for name in ("ragged_mla_cu_q_rows", "ragged_mla_cu_kv_seqlens"):
-            prefix = self.get_empty(
-                self.cuda_graph_buffers,
-                (row_cap + 1,),
-                cache_name=name,
-                dtype=torch.int32,
-                capture_graph=capture_graph,
-            )
-            prefix[:1].zero_()
-            setattr(self, name, prefix)
-        self.row_kv_lens_cuda = self.get_empty(
-            self.cuda_graph_buffers,
-            (row_cap,),
-            cache_name="row_kv_lens_cuda",
-            dtype=torch.int32,
-            capture_graph=capture_graph,
-        )
-        self.row_kv_lens_host = torch.zeros_like(
-            self.row_kv_lens_cuda, device="cpu", pin_memory=prefer_pinned()
-        )
-        self.row_kv_correction_cuda = self.get_empty(
-            self.cuda_graph_buffers,
-            (row_cap,),
-            cache_name="row_kv_correction_cuda",
-            dtype=torch.int32,
-            capture_graph=capture_graph,
-        )
-        self.row_kv_correction_host = torch.zeros_like(
-            self.row_kv_correction_cuda, device="cpu", pin_memory=prefer_pinned()
-        )
-        self.row_req_idx_cuda = self.get_empty(
-            self.cuda_graph_buffers,
-            (row_cap,),
-            cache_name="row_req_idx_cuda",
-            dtype=torch.long,
-            capture_graph=capture_graph,
-        )
-        self.row_req_idx_host = torch.zeros_like(
-            self.row_req_idx_cuda, device="cpu", pin_memory=prefer_pinned()
-        )
-
-        # MLA RoPE and sparse-MLA generation consume one row per query token;
-        # every other consumer keeps using request-major metadata.
-        attn_rows_cap = self.max_num_sequences * (2 + self._draft_sizing_cap)
-        self.attn_row_kv_lens_cuda = self.get_empty(
-            self.cuda_graph_buffers,
-            (attn_rows_cap,),
-            cache_name="attn_row_kv_lens_cuda",
-            dtype=torch.int32,
-            capture_graph=capture_graph,
-        )
-        self.attn_row_kv_correction_cuda = self.get_empty(
-            self.cuda_graph_buffers,
-            (attn_rows_cap,),
-            cache_name="attn_row_kv_correction_cuda",
-            dtype=torch.int32,
-            capture_graph=capture_graph,
-        )
-        self.attn_row_req_idx_cuda = self.get_empty(
-            self.cuda_graph_buffers,
-            (attn_rows_cap,),
-            cache_name="attn_row_req_idx_cuda",
-            dtype=torch.long,
-            capture_graph=capture_graph,
-        )
-        self.attn_row_kv_lens_host = torch.zeros(
-            (attn_rows_cap,), dtype=torch.int32, pin_memory=prefer_pinned()
-        )
-        self.attn_row_kv_correction_host = torch.zeros(
-            (attn_rows_cap,), dtype=torch.int32, pin_memory=prefer_pinned()
-        )
-        self.attn_row_req_idx_host = torch.zeros(
-            (attn_rows_cap,), dtype=torch.long, pin_memory=prefer_pinned()
-        )
-        self.attn_row_request_types_host = torch.ones(
-            (attn_rows_cap,), dtype=torch.int32, pin_memory=prefer_pinned()
-        )
-        self.attn_row_prompt_lens_cuda = self.get_empty(
-            self.cuda_graph_buffers,
-            (attn_rows_cap,),
-            cache_name="attn_row_prompt_lens_cuda",
-            dtype=torch.int32,
-            capture_graph=capture_graph,
-        )
-        self.attn_row_prompt_lens_cpu = torch.zeros(
-            (attn_rows_cap,), dtype=torch.int32, pin_memory=prefer_pinned()
-        )
-        num_attention_op_pools = getattr(
-            self.kv_cache_manager,
-            "num_attention_op_pools",
-            self.kv_cache_manager.num_pools,
-        )
-        self.attn_row_block_offsets = self.get_empty(
-            self.cuda_graph_buffers,
-            (
-                num_attention_op_pools,
-                attn_rows_cap,
-                2,
-                self.kv_cache_manager.max_blocks_per_seq,
-            ),
-            cache_name="attn_row_block_offsets",
-            dtype=torch.int32,
-            capture_graph=capture_graph,
-        )
+        super()._create_ragged_verification_buffers(buffers, capture_graph)
 
     # This function is only used to create the expanded buffers when the max_draft_tokens is changed.
     # TODO: remove this function once fp8_paged_mqa_logits supports an arbitrary number of MTP draft tokens.
@@ -1952,194 +1744,22 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.dsl_atom = self.gen_token_stride
             self.dsl_kernel_atoms = 1
 
-    def _prepare_ragged_row_kv_lens(self, kv_lens: torch.Tensor) -> None:
-        """Populate the causal KV extent of each ragged generation row."""
-        verify_lens = self.ragged_verify_lens
-        if not verify_lens:
-            return
-        gen_kv_lens = kv_lens[self.num_contexts : self.num_seqs].tolist()
-        assert len(gen_kv_lens) == len(verify_lens), (
-            f"ragged verify lengths {len(verify_lens)} != generation requests {len(gen_kv_lens)}"
-        )
-        expected_gen_tokens = self.num_tokens - self.num_ctx_tokens
-        assert sum(verify_lens) == expected_gen_tokens, (
-            f"ragged verify windows sum to {sum(verify_lens)} but this step has "
-            f"{expected_gen_tokens} generation tokens"
-        )
-
-        rows: List[int] = []
-        corrections: List[int] = []
-        request_indices: List[int] = []
-        for request_idx, (kv_len, verify_len) in enumerate(zip(gen_kv_lens, verify_lens)):
-            verify_len = int(verify_len)
-            base = int(kv_len) - verify_len + 1
-            rows.extend(range(base, base + verify_len))
-            corrections.extend(range(1 - verify_len, 1))
-            request_indices.extend([request_idx] * verify_len)
-
-        num_rows = len(rows)
-        assert num_rows <= self.row_kv_lens_cuda.shape[0]
-        self._ragged_num_rows = num_rows
-        self.row_kv_lens_host[:num_rows].copy_(torch.tensor(rows, dtype=torch.int32))
-        self.row_kv_correction_host[:num_rows].copy_(torch.tensor(corrections, dtype=torch.int32))
-        self.row_req_idx_host[:num_rows].copy_(torch.tensor(request_indices, dtype=torch.long))
-        self.row_kv_lens_cuda[:num_rows].copy_(self.row_kv_lens_host[:num_rows], non_blocking=True)
-        self.row_kv_correction_cuda[:num_rows].copy_(
-            self.row_kv_correction_host[:num_rows], non_blocking=True
-        )
-        self.row_req_idx_cuda[:num_rows].copy_(self.row_req_idx_host[:num_rows], non_blocking=True)
-
-    def refresh_ragged_row_kv_lens(self) -> None:
-        """Refresh ragged extents after overlap changes ``kv_lens_cuda``."""
-        num_rows = self._ragged_num_rows
-        if not self.is_ragged_verify or num_rows <= 0:
-            return
-        gen_kv_lens = self.kv_lens_cuda[self.num_contexts : self.num_seqs]
-        row_kv_lens = self.row_kv_lens_cuda[:num_rows]
-        torch.index_select(
-            gen_kv_lens,
-            0,
-            self.row_req_idx_cuda[:num_rows],
-            out=row_kv_lens,
-        )
-        row_kv_lens.add_(self.row_kv_correction_cuda[:num_rows])
-
-    def _prepare_token_major_gen_rows(self, kv_lens: torch.Tensor) -> None:
-        """Build the temporary one-row-per-query-token attention view."""
-        verify_lens = self.ragged_verify_lens
-        num_gen_rows = self._ragged_num_rows
-        if not verify_lens or num_gen_rows <= 0:
-            self._attn_num_rows = 0
-            return
-
-        num_contexts = self.num_contexts
-        num_rows = num_contexts + num_gen_rows
-        capacity = self.attn_row_kv_lens_cuda.shape[0]
-        assert num_rows <= capacity, (
-            f"token-major generation needs {num_rows} rows but capacity is {capacity}"
-        )
-
-        if num_contexts:
-            self.attn_row_kv_lens_host[:num_contexts].copy_(kv_lens[:num_contexts].to(torch.int32))
-            self.attn_row_kv_correction_host[:num_contexts].zero_()
-            self.attn_row_req_idx_host[:num_contexts].copy_(
-                torch.arange(num_contexts, dtype=torch.long)
-            )
-            self.attn_row_prompt_lens_cpu[:num_contexts].copy_(
-                self.prompt_lens_cpu[:num_contexts].to(torch.int32)
-            )
-
-        self.attn_row_kv_lens_host[num_contexts:num_rows].copy_(
-            self.row_kv_lens_host[:num_gen_rows]
-        )
-        self.attn_row_kv_correction_host[num_contexts:num_rows].copy_(
-            self.row_kv_correction_host[:num_gen_rows]
-        )
-        torch.add(
-            self.row_req_idx_host[:num_gen_rows],
-            num_contexts,
-            out=self.attn_row_req_idx_host[num_contexts:num_rows],
-        )
-        self.attn_row_prompt_lens_cpu[num_contexts:num_rows].fill_(1)
-        if num_contexts:
-            self.attn_row_request_types_host[:num_contexts].zero_()
-        self.attn_row_request_types_host[num_contexts:num_rows].fill_(1)
-
-        self.attn_row_kv_correction_cuda[:num_rows].copy_(
-            self.attn_row_kv_correction_host[:num_rows], non_blocking=True
-        )
-        self.attn_row_kv_lens_cuda[:num_rows].copy_(
-            self.attn_row_kv_lens_host[:num_rows], non_blocking=True
-        )
-        self.attn_row_req_idx_cuda[:num_rows].copy_(
-            self.attn_row_req_idx_host[:num_rows], non_blocking=True
-        )
-        self.attn_row_prompt_lens_cuda[:num_rows].copy_(
-            self.attn_row_prompt_lens_cpu[:num_rows], non_blocking=True
-        )
-        self._attn_num_rows = num_rows
-        self.refresh_token_major_block_table()
-
-    def refresh_token_major_gen_rows(self) -> None:
-        """Refresh token-major KV extents after overlap correction."""
-        num_rows = self._attn_num_rows
-        if not self.is_ragged_verify or num_rows <= 0:
-            return
-        torch.index_select(
-            self.kv_lens_cuda[: self.num_seqs],
-            0,
-            self.attn_row_req_idx_cuda[:num_rows],
-            out=self.attn_row_kv_lens_cuda[:num_rows],
-        )
-        self.attn_row_kv_lens_cuda[:num_rows].add_(self.attn_row_kv_correction_cuda[:num_rows])
-
-    def refresh_token_major_block_table(self) -> None:
-        """Expand the main attention block table along its sequence axis."""
-        num_rows = self._attn_num_rows
-        if num_rows <= 0 or self.kv_cache_block_offsets is None:
-            return
-        source = self.kv_cache_block_offsets
-        num_pools = min(source.shape[0], self.attn_row_block_offsets.shape[0])
-        width = min(source.shape[-1], self.attn_row_block_offsets.shape[-1])
-        torch.index_select(
-            source[:num_pools, :, :, :width],
-            1,
-            self.attn_row_req_idx_cuda[:num_rows],
-            out=self.attn_row_block_offsets[:num_pools, :num_rows, :, :width],
-        )
-
-    def token_major_gen_view(self) -> Optional[TokenMajorGenView]:
-        """Return the ragged generation view expected by ``trtllm.py``."""
-        num_rows = self._attn_num_rows
-        if not self.is_ragged_verify or num_rows <= 0:
-            return None
-        return TokenMajorGenView(
-            num_rows=num_rows,
-            sequence_length=self.attn_row_kv_lens_cuda[:num_rows],
-            host_past_key_value_lengths=self.attn_row_kv_lens_host[:num_rows],
-            host_context_lengths=self.attn_row_prompt_lens_cpu[:num_rows],
-            prompt_lens_cuda=self.attn_row_prompt_lens_cuda[:num_rows],
-            host_request_types=self.attn_row_request_types_host[:num_rows],
-            kv_cache_block_offsets=self.attn_row_block_offsets[:, :num_rows],
-            max_num_rows=self.attn_row_kv_lens_cuda.shape[0],
-        )
-
-    def ragged_row_kv_lens(self, num_tokens: int) -> Optional[torch.Tensor]:
-        if not self.is_ragged_verify:
-            return None
-        assert num_tokens == self._ragged_num_rows, (
-            f"ragged row count moved between prepare ({self._ragged_num_rows}) "
-            f"and forward ({num_tokens})"
-        )
-        return self.row_kv_lens_cuda[:num_tokens]
-
     def apply_device_ragged_layout(
         self,
         verify_lens: torch.Tensor,
         req_idx: torch.Tensor,
         kv_correction: torch.Tensor,
     ) -> None:
-        """Install device-selected windows into stable captured buffers."""
-        self._validate_ragged_verification()
-        if not self.is_ragged_verify:
-            raise RuntimeError("device ragged layout requires enabled ragged verification")
+        """Install device-selected windows, including the indexer's row maps."""
+        super().apply_device_ragged_layout(verify_lens, req_idx, kv_correction)
         num_contexts = self.num_contexts
         num_rows = self._ragged_num_rows
-        num_generations = self.num_generations
-        self.seq_lens_cuda[num_contexts : self.num_seqs] = verify_lens.to(self.seq_lens_cuda.dtype)
-        self.gen_token_repeats_cuda[:num_generations] = verify_lens.to(torch.int64)
-        self.row_req_idx_cuda[:num_rows] = req_idx
-        self.row_kv_correction_cuda[:num_rows] = kv_correction
-        attn_row_start = num_contexts
-        attn_row_end = attn_row_start + num_rows
-        self.attn_row_req_idx_cuda[attn_row_start:attn_row_end] = req_idx + num_contexts
-        self.attn_row_kv_correction_cuda[attn_row_start:attn_row_end] = kv_correction
+        self.gen_token_repeats_cuda[: self.num_generations] = verify_lens.to(torch.int64)
         token_start = self.num_ctx_tokens
         token_end = token_start + num_rows
         self.req_idx_per_token[token_start:token_end] = (req_idx + num_contexts).to(
             self.req_idx_per_token.dtype
         )
-        self.refresh_token_major_block_table()
         width = min(
             self.indexer_k_cache_block_offsets.shape[-1],
             self.block_table_expanded.shape[-1],

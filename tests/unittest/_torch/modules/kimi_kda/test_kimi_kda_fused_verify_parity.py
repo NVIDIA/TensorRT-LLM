@@ -34,7 +34,7 @@ in-kernel gated RMSNorm epilogue reproduce the promoted-state semantics.
 Requires 1 Blackwell GPU, fla-core, nvidia-cutlass-dsl. Skips otherwise.
 """
 
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
@@ -48,6 +48,7 @@ try:
 
     # The model module transitively imports the optional deps above, so it
     # must stay behind the guard too or collection fails instead of skipping.
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
     from tensorrt_llm._torch.configs.kimi_linear import KimiLinearConfig
     from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention
 except ImportError as e:
@@ -663,3 +664,140 @@ def test_fused_verify_mxfp8_output_matches_bf16_projection():
     assert mxfp8_core.activation.dtype is torch.float8_e4m3fn
     assert mxfp8_core.scale.dtype is torch.uint8
     assert _rep("mxfp8 vs bf16 o_proj input", mxfp8_out, bf16_out)
+
+
+def _verify_step_metadata(layer_cache, conv_pool, ssm_pool, slots, verify_lens, *, ragged):
+    """Generation-only attention metadata of one verify step, as ``_forward_impl`` reads it: request ``i`` owns
+    ``verify_lens[i]`` packed rows."""
+    lens = torch.tensor(verify_lens, dtype=torch.int32)
+    num_requests, num_rows = len(verify_lens), int(lens.sum())
+    layer_cache.conv = conv_pool
+    layer_cache.temporal = ssm_pool
+    metadata = SimpleNamespace(
+        mamba_metadata=SimpleNamespace(
+            state_indices=slots,
+            replay_state_indices=slots,
+            query_start_loc_long=torch.zeros(1, dtype=torch.long, device="cuda"),
+        ),
+        num_contexts=0,
+        num_ctx_tokens=0,
+        num_seqs=num_requests,
+        num_generations=num_requests,
+        num_tokens=num_rows,
+        seq_lens=lens,
+        seq_lens_cuda=lens.cuda(),
+        is_ragged_verify=ragged,
+        row_req_idx_cuda=torch.repeat_interleave(torch.arange(num_requests), lens.long()).cuda(),
+        ragged_uniform_source_rows=torch.empty(
+            num_requests * (M + 1), dtype=torch.long, device="cuda"
+        ),
+        ragged_uniform_kept_rows=torch.empty(num_rows, dtype=torch.long, device="cuda"),
+        _ragged_num_rows=num_rows,
+        _ragged_uniform_rows_width=0,
+        kv_cache_manager=SimpleNamespace(mamba_layer_cache=lambda _: layer_cache),
+    )
+    # The attention metadata's own row maps, over this step's rows.
+    metadata.ragged_uniform_rows = MethodType(TrtllmAttentionMetadata.ragged_uniform_rows, metadata)
+    return metadata
+
+
+def _rel_l2(actual, expected):
+    actual, expected = actual.float(), expected.float()
+    return ((actual - expected).norm() / (expected.norm() + 1e-12)).item()
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("fused", [True, False], ids=["fused", "sequential"])
+def test_ragged_verify_matches_uniform(fused):
+    """A ragged verify step, where request ``i`` verifies only its first ``n_i`` rows, gives those rows the outputs
+    of the uniform step over the same tokens and leaves the state the next round continues from: with every
+    verified draft accepted, the next round matches too."""
+    steps = M + 1
+    verify_lens = [steps, 2, 1, 2]
+    batch = len(verify_lens)
+    runtime = _make_runtime(seed=1)
+    if fused:
+        runtime.finalize_decode_weights()
+    slots = torch.arange(batch, dtype=torch.int32, device="cuda")
+    gen = torch.Generator(device="cuda").manual_seed(3)
+    x1, x2 = (
+        (torch.randn(batch * steps, HIDDEN, generator=gen, device="cuda") * 0.5).to(torch.bfloat16)
+        for _ in range(2)
+    )
+    # The ragged step's packed rows: the first n_i rows of each request.
+    kept = torch.tensor(
+        [i * steps + j for i, n in enumerate(verify_lens) for j in range(n)], device="cuda"
+    )
+    # Every verified draft is accepted: the most a ragged request can replay or promote.
+    accept = torch.tensor(verify_lens, device="cuda") - 1
+
+    def run(ragged):
+        conv_pool, ssm_pool = _make_pools(batch, seed=2)
+        cache = _make_fused_layer_cache(batch, conv_pool) if fused else _make_seq_layer_cache(batch)
+
+        def metadata(lens, is_ragged):
+            return _verify_step_metadata(cache, conv_pool, ssm_pool, slots, lens, ragged=is_ragged)
+
+        if ragged:
+            # The breakable-CUDA-graph contract: the packed rows' core goes to the caller's buffer.
+            core1 = x1.new_empty(kept.numel(), H, K)
+            result = runtime._forward_impl(
+                x1.index_select(0, kept), metadata(verify_lens, True), output=core1
+            )
+            assert result is core1
+        else:
+            core1 = runtime._forward_impl(x1, metadata([steps] * batch, False))
+            core1 = core1.index_select(0, kept)
+        if fused:
+            cache.prev_num_accepted_tokens.copy_(accept)
+        else:
+            _promote_sequential(cache, conv_pool, ssm_pool, accept)
+        committed = ssm_pool.clone()
+        core2 = runtime._forward_impl(x2, metadata([steps] * batch, False))
+        return core1, committed, core2, ssm_pool
+
+    names = ("round 1 kept rows", "committed state", "round 2", "state after round 2")
+    for name, actual, expected in zip(names, run(True), run(False)):
+        assert actual.shape == expected.shape, name
+        assert _rel_l2(actual, expected) < 1e-2, name
+
+
+@torch.no_grad()
+def test_ragged_verify_routing(monkeypatch):
+    """A ragged step is verification whatever its row count, on the uniform layout the caches are sized for and
+    without the MXFP8 handoffs, which carry the batch's own rows."""
+    batch = 3
+    runtime = _make_runtime(seed=5)
+    runtime.accept_prequantized_qkvg_input(lambda num_rows: True)
+    conv_pool, ssm_pool = _make_pools(batch, seed=6)
+    cache = _make_fused_layer_cache(batch, conv_pool)
+    slots = torch.arange(batch, dtype=torch.int32, device="cuda")
+    calls = []
+
+    def forward_verify(x2d, num_steps, *args, **kwargs):
+        calls.append((x2d, num_steps, kwargs))
+        return x2d.new_zeros(x2d.shape[0], H, K)
+
+    def forward_decode(*args, **kwargs):
+        raise AssertionError("a ragged step must not take the plain decode path")
+
+    monkeypatch.setattr(runtime, "forward_verify", forward_verify)
+    monkeypatch.setattr(runtime, "forward_decode", forward_decode)
+
+    # One row per request: the row count of a plain decode step.
+    x = (torch.randn(batch, HIDDEN, device="cuda") * 0.5).to(torch.bfloat16)
+    metadata = _verify_step_metadata(cache, conv_pool, ssm_pool, slots, [1] * batch, ragged=True)
+    core = runtime._forward_impl(x, metadata, prequantized_input=(x, x))
+
+    assert core.shape == (batch, H, K)
+    ((x_uniform, num_steps, kwargs),) = calls
+    assert num_steps == M + 1
+    assert torch.equal(x_uniform, x.repeat_interleave(M + 1, dim=0))
+    assert kwargs["output"] is None
+    assert not kwargs["allow_prequantized_output"]
+    assert kwargs["prequantized_input"] is None
+
+    metadata = _verify_step_metadata(cache, conv_pool, ssm_pool, slots, [2, 1, 2], ragged=True)
+    assert not runtime.takes_prequantized_input(metadata.num_tokens, metadata)
+    metadata.is_ragged_verify = False
+    assert runtime.takes_prequantized_input(metadata.num_tokens, metadata)

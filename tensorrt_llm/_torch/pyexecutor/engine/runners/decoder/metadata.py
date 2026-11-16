@@ -204,6 +204,9 @@ class DecoderMetadata:
             return
 
         metadata = getattr(self, "attn_metadata", None)
+        if not getattr(metadata, "needs_ragged_compressor_warmup", True):
+            # A target without the DSv4 KV compressor has no such helpers to compile.
+            return
         required_attributes = (
             "_compute_compressed_mask",
             "_compute_gen_compressed_position_ids",

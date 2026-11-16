@@ -489,11 +489,12 @@ def test_dspark_drafter_loads_head_weights_and_parses_config():
     assert drafter.has_markov_head
     torch.testing.assert_close(drafter.markov_w1.cpu(), weights["markov_w1.weight"])
     torch.testing.assert_close(drafter.markov_w2.cpu(), weights["markov_w2.weight"])
-    # Confidence weights loaded for MR B, but never consumed here.
+    head = drafter.confidence_head
+    assert head.with_markov
     torch.testing.assert_close(
-        drafter.confidence_proj_weight.cpu(), weights["confidence_proj.weight"]
+        head.proj.weight.cpu(), weights["confidence_proj.weight"].float(), rtol=0, atol=0
     )
-    assert drafter.confidence_proj_bias is not None
+    assert head.proj.bias is not None
 
 
 @needs_gpu
@@ -622,7 +623,10 @@ def test_gqa_dspark_keeps_the_trained_row_of_the_speculative_configs_mask_id():
     pretrained = _tiny_config(True, mask_token_id=None)
     pretrained.dspark_noise_token_id = mask_id
     spec = SimpleNamespace(
-        mask_token_id=mask_id, attention_backend="VANILLA", draft_is_embedded_in_target=False
+        mask_token_id=mask_id,
+        attention_backend="VANILLA",
+        draft_is_embedded_in_target=False,
+        max_draft_len=TINY["block_size"],
     )
     drafter = _build_dspark_draft(
         SimpleNamespace(spec_config=spec),
@@ -660,7 +664,7 @@ def test_published_drafter_spelling_activates_the_heads():
     # the next request's anchor slot.
     assert drafter.shift_label
     torch.testing.assert_close(drafter.markov_w1.cpu(), weights["markov_head.markov_w1.weight"])
-    assert drafter.confidence_proj_bias is not None
+    assert drafter.confidence_head.proj.bias is not None
 
 
 @needs_gpu
@@ -747,7 +751,7 @@ def test_plain_dflash_drafter_keeps_old_gates():
     for absent in (
         "has_markov_head",
         "markov_w1",
-        "confidence_proj_weight",
+        "confidence_head",
         "apply_markov_chain_logits",
     ):
         assert not hasattr(drafter, absent), f"DFlash base still carries {absent}"

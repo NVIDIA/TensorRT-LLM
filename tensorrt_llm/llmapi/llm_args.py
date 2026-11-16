@@ -8971,11 +8971,6 @@ class TorchLlmArgs(BaseLlmArgs):
         ragged path at all or takes it with a kernel that mis-attributes rows.
         A hard error at construction is the only signal that survives.
         """
-        if not self.speculative_config.draft_is_embedded_in_target:
-            raise ValueError(
-                "DSpark confidence scheduling supports only the embedded "
-                "DeepSeek-V4 draft. Standalone DSpark retains native "
-                "verification; disable confidence scheduling for that path.")
         speculative_config = self.speculative_config
         if (getattr(speculative_config, "acceptance_rate_window_size", None)
                 and getattr(speculative_config, "acceptance_rate_threshold",

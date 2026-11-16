@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, Dict, Optional, Set, Tuple
+from typing import TYPE_CHECKING, ClassVar, Dict, Optional, Set, Tuple
 
 import torch
 
@@ -33,6 +33,7 @@ if TYPE_CHECKING:
 
 
 class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
+    needs_ragged_compressor_warmup: ClassVar[bool] = True
     # The set of compress ratios for the layers
     compress_ratio_set: Set[int]
     # The set of (compress ratio, attention type) for the layers
