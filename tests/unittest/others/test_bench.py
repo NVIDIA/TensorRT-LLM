@@ -516,72 +516,63 @@ def _llm_api_options(tmp_path, **llm_args):
     return str(options)
 
 
-@pytest.mark.parametrize("checkpoint_format", ["mistral", "mistral_large_3"])
-def test_cli_options_read_a_mistral_native_model_type(tmp_path, checkpoint_format):
-    # A Mistral-native checkpoint keeps its configuration in params.json: its model type
-    # (which selects the multimodal prompt rendering) comes from the native format.
-    env = BenchmarkEnvironment(model="mistral-native", checkpoint_path=tmp_path, workspace=tmp_path)
-    params = {
-        "extra_llm_api_options": _llm_api_options(tmp_path, checkpoint_format=checkpoint_format)
-    }
+@pytest.mark.parametrize("checkpoint_format", [None, "HF", "mistral", "mistral_large_3"])
+def test_cli_options_read_the_model_type_of_the_checkpoint_format(tmp_path, checkpoint_format):
+    """The model type of a Mistral-native checkpoint comes from its native format.
+
+    Its configuration is in params.json; the model type selects the multimodal prompt rendering.
+    """
+    env = BenchmarkEnvironment(model="m", checkpoint_path=tmp_path, workspace=tmp_path)
+    params = {}
+    if checkpoint_format is not None:
+        params["extra_llm_api_options"] = _llm_api_options(
+            tmp_path, checkpoint_format=checkpoint_format
+        )
     options = get_general_cli_options(params, env)
     assert options.checkpoint_format == checkpoint_format
-    with mock.patch(
-        "tensorrt_llm.bench.benchmark.load_pretrained_config",
-        return_value=SimpleNamespace(model_type="mistral_common"),
-    ) as load:
-        assert options.model_type == "mistral_common"
-    load.assert_called_once_with(
-        tmp_path, trust_remote_code=True, checkpoint_format=checkpoint_format
-    )
-    assert get_general_cli_options({}, env).checkpoint_format is None
-
-
-@pytest.mark.parametrize("llm_args", [{}, {"checkpoint_format": "HF"}])
-def test_cli_options_of_other_formats_read_the_hf_config(tmp_path, llm_args):
-    env = BenchmarkEnvironment(model="hf-model", checkpoint_path=tmp_path, workspace=tmp_path)
-    params = {"extra_llm_api_options": _llm_api_options(tmp_path, **llm_args)} if llm_args else {}
-    options = get_general_cli_options(params, env)
+    native = checkpoint_format in ("mistral", "mistral_large_3")
     with (
-        mock.patch("tensorrt_llm.bench.benchmark.load_pretrained_config") as load,
+        mock.patch(
+            "tensorrt_llm.bench.benchmark.load_pretrained_config",
+            return_value=SimpleNamespace(model_type="mistral_common"),
+        ) as load,
         mock.patch(
             "tensorrt_llm.bench.benchmark.get_model_config",
             return_value=SimpleNamespace(model_type="llama"),
         ),
     ):
-        assert options.model_type == "llama"
-    load.assert_not_called()
+        assert options.model_type == ("mistral_common" if native else "llama")
+    if native:
+        load.assert_called_once_with(
+            tmp_path, trust_remote_code=True, checkpoint_format=checkpoint_format
+        )
+    else:
+        load.assert_not_called()
 
 
-@pytest.mark.parametrize("limits", [{}, {"max_batch_size": 16}])
-def test_settings_need_explicit_limits_for_a_mistral_native_checkpoint(tmp_path, limits):
+@pytest.mark.parametrize(
+    "limits", [{}, {"max_batch_size": 16}, {"max_batch_size": 16, "max_num_tokens": 32768}]
+)
+def test_settings_of_a_mistral_native_checkpoint_need_explicit_limits(tmp_path, limits):
+    """The tuning heuristic reads a config.json, which a Mistral-native checkpoint lacks."""
     params = {
         "tp": 4,
         "pp": 1,
         "ep": 4,
-        "extra_llm_api_options": _llm_api_options(tmp_path, checkpoint_format="mistral"),
-        **limits,
-    }
-    with pytest.raises(ValueError, match="--max_batch_size and --max_num_tokens"):
-        get_settings(params, SimpleNamespace(), "mistral-native", tmp_path)
-
-
-def test_settings_take_explicit_limits_for_a_mistral_native_checkpoint(tmp_path):
-    params = {
-        "tp": 4,
-        "pp": 1,
-        "ep": 4,
-        "max_batch_size": 16,
-        "max_num_tokens": 32768,
         "extra_llm_api_options": _llm_api_options(
             tmp_path, checkpoint_format="mistral", enable_chunked_prefill="false"
         ),
+        **limits,
     }
     metadata = SimpleNamespace(max_isl=4096, avg_isl=1024, avg_osl=256)
     with mock.patch(
         "tensorrt_llm.bench.benchmark.utils.general.get_model_config",
         side_effect=AssertionError("the tuning heuristic must not read the checkpoint"),
     ):
+        if len(limits) < 2:
+            with pytest.raises(ValueError, match="--max_batch_size and --max_num_tokens"):
+                get_settings(params, metadata, "mistral-native", tmp_path)
+            return
         settings = get_settings(params, metadata, "mistral-native", tmp_path)
     assert settings["settings_config"]["max_batch_size"] == 16
     assert settings["settings_config"]["max_num_tokens"] == 32768
