@@ -82,7 +82,7 @@ def executor(clock):
             queue=Mock(),
             last_finalize_settled=False,
             last_idle_rank_states=None,
-            last_fanout_is_queue_snapshot=False,
+            last_fanout_is_busy_queue_snapshot=False,
             last_fanout_queued_counters=(),
             last_fanout_has_rank0_row=True,
             next_payload=lambda: None,
@@ -203,7 +203,7 @@ def test_adp_retains_the_global_idle_decision(executor, rank, engine_idle):
         host_step_time_ms=0.0,
         prev_device_step_time_ms=0.0,
         gpu_forward_time_ms=0.0,
-        allow_empty_heartbeat=engine_idle,
+        is_queue_snapshot=True,
         idle_heartbeat=engine_idle,
     )
     assert executor.stats == []
@@ -280,7 +280,7 @@ def test_attention_dp_heartbeat_replaces_every_rank_row(executor):
 def test_attention_dp_fanout_export_follows_the_fanout_kind(executor, kind):
     executor.enable_attention_dp = True
     adp_stats = executor._adp_iter_stats
-    adp_stats.last_fanout_is_queue_snapshot = kind == "queue-snapshot"
+    adp_stats.last_fanout_is_busy_queue_snapshot = kind == "queue-snapshot"
     adp_stats.last_fanout_queued_counters = (1, 100, 0, 0)
     if kind == "idle-heartbeat":
         adp_stats.last_idle_rank_states = [object(), object()]
@@ -313,7 +313,8 @@ def test_zero_duration_rows_leave_the_encoder_calls_for_a_measured_record(execut
     _publish_heartbeat(executor)
     _queue_backlog(executor, 2)
     executor._maybe_emit_quiescent_stats(engine_idle=False)
-    assert len(executor.stats) == 2 and all(len(row) == 8 for row in executor.stats)
+    assert len(executor.stats) == 2
+    assert all(row[8] is None and row[9] is True for row in executor.stats)
     take.assert_not_called()
 
     assert _append_measured(executor)[8] == {"gpuTimesMS": [2.5]}
@@ -336,7 +337,7 @@ def test_attention_dp_encoder_calls_go_on_rank_zeros_measured_row(
     executor.enable_attention_dp = True
     executor.perf_manager.take_encoder_gpu_times_ms.return_value = [2.5]
     adp_stats = executor._adp_iter_stats
-    adp_stats.last_fanout_is_queue_snapshot = kind == "queue-snapshot"
+    adp_stats.last_fanout_is_busy_queue_snapshot = kind == "queue-snapshot"
     adp_stats.last_fanout_queued_counters = (1, 100, 0, 0)
     adp_stats.last_fanout_has_rank0_row = has_rank0_row
     if kind == "idle-heartbeat":

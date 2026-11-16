@@ -3979,6 +3979,8 @@ class PyExecutor:
         #   [6] scheduler_mode: "overlap" | "non_overlap"
         #   [7] gpu_forward_time_ms: Optional[float]
         #   [8] mm_encoder_stats: optional completed rank-0 encoder observations
+        #   [9] is_queue_snapshot: True on a record taken without a forward
+        #       pass (see _zero_duration_stats_row); measured records omit it
         # See _append_queue_snapshot.
         self._queue_snapshot_counters = None
         with self.stats_lock:
@@ -4000,11 +4002,12 @@ class PyExecutor:
         return "overlap" if is_overlap_like else "non_overlap"
 
     def _zero_duration_stats_row(self, stats: IterationStats) -> tuple:
-        """The export row (in the _append_iter_stats layout) of a snapshot
-        taken without a forward pass: it has no request stats, no KV iteration
-        stats, zero per-loop timings and no encoder observations."""
+        """The export row (in the _append_iter_stats layout) of a queue
+        snapshot, a record taken without a forward pass: it is marked as one
+        and has no request stats, no KV iteration stats, zero per-loop timings
+        and no encoder observations."""
         return (stats, None, None, None, 0.0, 0.0, self._stats_scheduler_mode(),
-                0.0)
+                0.0, None, True)
 
     def _take_mm_encoder_stats(self) -> Optional[dict]:
         """Completed rank-0 encoder calls, including side-stream prefetch.
@@ -9243,17 +9246,17 @@ class PyExecutor:
         adp_stats = self._adp_iter_stats
         if adp_stats.last_idle_rank_states is not None:
             self._publish_idle_heartbeat(rows)
-        elif adp_stats.last_fanout_is_queue_snapshot:
+        elif adp_stats.last_fanout_is_busy_queue_snapshot:
             self._append_queue_snapshot(rows,
                                         adp_stats.last_fanout_queued_counters)
         elif rows:
-            # A zero-duration record can drop rank 0's row.
+            # A queue snapshot can drop rank 0's row.
             self._append_stats_rows(
                 rows, take_encoder_stats=adp_stats.last_fanout_has_rank0_row)
 
     def _append_queue_snapshot(self, rows: Sequence[Union[str, tuple]],
                                counters: tuple) -> None:
-        """Export a busy engine's zero-duration queue snapshot.
+        """Export a busy engine's queue snapshot.
 
         Loops without a forward pass can spin far faster than a consumer
         reads, and every pass takes a snapshot. One that repeats the queued
@@ -9319,7 +9322,7 @@ class PyExecutor:
                                        host_step_time_ms=0.0,
                                        prev_device_step_time_ms=0.0,
                                        gpu_forward_time_ms=0.0,
-                                       allow_empty_heartbeat=engine_idle,
+                                       is_queue_snapshot=True,
                                        idle_heartbeat=engine_idle)
         elif engine_idle:
             self._publish_idle_heartbeat([self._zero_duration_stats_row(stats)])

@@ -199,19 +199,14 @@ class WaitingQueue(ABC):
         pass
 
 
-class FCFSWaitingQueue(deque, WaitingQueue):
-    """A first-come-first-served queue that supports deque operations.
+class FCFSWaitingQueue(WaitingQueue):
+    """A first-come-first-served queue."""
 
-    Mutate it only through the WaitingQueue methods: raw deque calls bypass
-    ``queued_load``.
-    """
-
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+    def __init__(self, requests: Iterable[RequestQueueItem] = ()) -> None:
+        self._queue: deque[RequestQueueItem] = deque(requests)
         self.queued_load = QueuedLoadTracker()
-        # deque's own iterator: a subclass may override __iter__.
-        for item in deque.__iter__(self):
-            self.queued_load.add(item)
+        for request in self._queue:
+            self.queued_load.add(request)
 
     @staticmethod
     def _warn_if_priority_set(request: RequestQueueItem) -> None:
@@ -227,7 +222,7 @@ class FCFSWaitingQueue(deque, WaitingQueue):
     def add_request(self, request: RequestQueueItem) -> None:
         """Add a request to the queue according to FCFS policy."""
         self._warn_if_priority_set(request)
-        self.append(request)
+        self._queue.append(request)
         self.queued_load.add(request)
 
     def add_requests(self, requests: Iterable[RequestQueueItem]) -> None:
@@ -235,29 +230,29 @@ class FCFSWaitingQueue(deque, WaitingQueue):
         requests = list(requests)
         for request in requests:
             self._warn_if_priority_set(request)
-        self.extend(requests)
+        self._queue.extend(requests)
         for request in requests:
             self.queued_load.add(request)
 
     def pop_request(self) -> RequestQueueItem:
         """Pop a request from the queue according to FCFS policy."""
-        request = self.popleft()
+        request = self._queue.popleft()
         self.queued_load.discard(request.id)
         return request
 
     def peek_request(self) -> RequestQueueItem:
         """Peek at the next request in the queue without removing it."""
-        if not self:
+        if not self._queue:
             raise IndexError("peek from an empty queue")
-        return self[0]
+        return self._queue[0]
 
     def peek_requests(self, k: int) -> list[RequestQueueItem]:
         """Return up to ``k`` requests from the front of the queue, O(k)."""
-        return list(itertools.islice(self, max(k, 0)))
+        return list(itertools.islice(self._queue, max(k, 0)))
 
     def prepend_request(self, request: RequestQueueItem) -> None:
         """Prepend a request to the front of the queue."""
-        self.appendleft(request)
+        self._queue.appendleft(request)
         self.queued_load.add(request)
 
     def prepend_requests(self, requests: Iterable[RequestQueueItem]) -> None:
@@ -267,29 +262,27 @@ class FCFSWaitingQueue(deque, WaitingQueue):
         ends up at the front of the queue.
         """
         requests = list(requests)
-        self.extendleft(reversed(requests))
+        self._queue.extendleft(reversed(requests))
         for request in requests:
             self.queued_load.add(request)
 
     def remove_by_ids(self, request_ids: set[int]) -> None:
         """Remove requests with the given IDs."""
-        filtered_requests = [req for req in self if req.id not in request_ids]
-        self.clear()
-        self.extend(filtered_requests)
+        self._queue = deque(req for req in self._queue if req.id not in request_ids)
         for request_id in request_ids:
             self.queued_load.discard(request_id, all_items=True)
 
     def __bool__(self) -> bool:
         """Check if queue has any requests."""
-        return len(self) > 0
+        return len(self._queue) > 0
 
     def __len__(self) -> int:
         """Get number of requests in queue."""
-        return super().__len__()
+        return len(self._queue)
 
     def __iter__(self) -> Iterator[RequestQueueItem]:
         """Iterate over the queue according to FCFS policy."""
-        return super().__iter__()
+        return iter(self._queue)
 
 
 class PriorityWaitingQueue(WaitingQueue):

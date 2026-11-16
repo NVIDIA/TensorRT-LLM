@@ -1568,7 +1568,7 @@ def test_get_from_waiting_queue():
     # Add items to waiting queue
     waiting_queue = FCFSWaitingQueue()
     items = [RequestQueueItem(i, Mock()) for i in range(5)]
-    waiting_queue.extend(items)
+    waiting_queue.add_requests(items)
 
     # Get 3 items
     result = get_from_waiting_queue(
@@ -1597,7 +1597,7 @@ def test_get_from_waiting_queue_edge_cases(
     waiting_queue = FCFSWaitingQueue()
     if queue_size > 0:
         items = [RequestQueueItem(i, Mock()) for i in range(queue_size)]
-        waiting_queue.extend(items)
+        waiting_queue.add_requests(items)
 
     result = get_from_waiting_queue(
         waiting_queue, request_count, enable_attention_dp=False, max_num_active_requests=16
@@ -1612,7 +1612,7 @@ def test_get_from_waiting_queue_with_attention_dp(
 ):
     waiting_queue = FCFSWaitingQueue()
     items = [RequestQueueItem(i, Mock()) for i in range(5)]
-    waiting_queue.extend(items)
+    waiting_queue.add_requests(items)
 
     result = get_from_waiting_queue(
         waiting_queue,
@@ -1642,7 +1642,7 @@ def test_get_from_waiting_queue_with_attention_dp_filtering(
     )  # No scheduling params
 
     waiting_queue = FCFSWaitingQueue()
-    waiting_queue.extend([req1, req2, req3])
+    waiting_queue.add_requests([req1, req2, req3])
 
     # Set rank 0 to full capacity to test filtering
     all_ranks_num_active_requests[0] = 8

@@ -133,6 +133,16 @@ class TestStatsSerializer:
         legacy = json.loads(BaseWorker._stats_serializer(stats[:8]))
         assert "multimodalEncoderStats" not in legacy
 
+    def test_serializer_marks_queue_snapshots(self):
+        iter_stats = _make_mock_iteration_stats()
+        measured = (iter_stats, None, None, None, 6.0, 4.0, "overlap", 2.0, None)
+        snapshot = (iter_stats, None, None, None, 0.0, 0.0, "overlap", 0.0, None, True)
+        assert json.loads(BaseWorker._stats_serializer(snapshot))["isQueueSnapshot"] is True
+        assert "isQueueSnapshot" not in json.loads(BaseWorker._stats_serializer(measured))
+        assert "isQueueSnapshot" not in json.loads(
+            BaseWorker._stats_serializer(measured + (False,))
+        )
+
     def test_serializer_without_kv_iter_stats(self):
         """Legacy 2-tuple and 3-tuple with None should produce same output."""
         iter_stats = _make_mock_iteration_stats()

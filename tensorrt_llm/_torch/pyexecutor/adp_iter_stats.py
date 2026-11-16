@@ -49,7 +49,7 @@ _SCHEDULED_WORK_FIELDS = (
     "num_paused_requests",
     "num_paused_kv_tokens",
 )
-# The scheduled counts that give a rank a row of its own in a zero-duration record.
+# The scheduled counts that give a rank a row of its own in a queue snapshot.
 _ROW_WORK_FIELDS = (
     "num_context_requests",
     "num_ctx_tokens",
@@ -242,18 +242,20 @@ class ADPIterStatsBuffer:
         self._synthetic_iters: Set[int] = set()
         # Rank 0 only: full IterationStats objects waiting for ADP fanout.
         self._rank0_iter_stats: Dict[int, IterationStats] = {}
-        self._rank0_allow_empty_heartbeat: Dict[int, bool] = {}
+        # Rank 0 only: whether the pending record is a queue snapshot (see queue()).
+        self._rank0_is_queue_snapshot: Dict[int, bool] = {}
         # All ranks: pending iterations queued as an all-rank idle heartbeat.
         self._idle_heartbeat_iters: Set[int] = set()
         # What the latest finalize() call did, for the executor on rank 0:
         # whether it settled an iteration at all, the rank states if that
         # iteration was an idle heartbeat (see make_idle_heartbeat_rows),
-        # whether it was a zero-duration queue snapshot of a busy engine, the
-        # queued totals its rows report (RankIterStatsPayload._QUEUED_FIELDS),
-        # and whether rank 0's row is among them (then it is the first).
+        # whether it was the queue snapshot of a busy engine with nothing
+        # scheduled on any rank, the queued totals its rows report
+        # (RankIterStatsPayload._QUEUED_FIELDS), and whether rank 0's row is
+        # among them (then it is the first).
         self.last_finalize_settled = False
         self.last_idle_rank_states: Optional[List[RankState]] = None
-        self.last_fanout_is_queue_snapshot = False
+        self.last_fanout_is_busy_queue_snapshot = False
         self.last_fanout_queued_counters: tuple = ()
         self.last_fanout_has_rank0_row = False
         # Rank 0 only: per-request stats preserved for compatibility.
@@ -305,18 +307,23 @@ class ADPIterStatsBuffer:
         host_step_time_ms: Optional[float] = None,
         prev_device_step_time_ms: Optional[float] = None,
         gpu_forward_time_ms: Optional[float] = None,
-        allow_empty_heartbeat: bool = True,
+        is_queue_snapshot: bool = False,
         idle_heartbeat: bool = False,
     ) -> None:
         """Queue local stats; rank 0 also keeps objects needed for fanout.
 
-        ``idle_heartbeat`` marks a zero-duration snapshot taken while every
-        rank is idle (the caller's all-rank decision). It supersedes an idle
+        ``is_queue_snapshot`` marks a record taken without a forward pass: it
+        reports the queues and has no measured duration.
+
+        ``idle_heartbeat`` marks the queue snapshot taken while every rank is
+        idle (the caller's all-rank decision). It supersedes an idle
         heartbeat that is still pending: an idle engine has nothing new to
         say about an earlier moment, and a second pending snapshot would keep
         the buffer from ever draining. Every rank queues it in the same
         iteration, so the pending sets stay aligned.
         """
+        # An idle heartbeat is always a queue snapshot.
+        is_queue_snapshot = is_queue_snapshot or idle_heartbeat
         payload = self.make_payload(stats)
         iter_id = payload.iter_stats_iter
         if idle_heartbeat:
@@ -339,7 +346,7 @@ class ADPIterStatsBuffer:
 
         if is_rank0:
             self._rank0_iter_stats[iter_id] = stats
-            self._rank0_allow_empty_heartbeat[iter_id] = allow_empty_heartbeat
+            self._rank0_is_queue_snapshot[iter_id] = is_queue_snapshot
             self._rank0_req_stats[iter_id] = req_stats
             self._rank0_kv_iter_stats[iter_id] = kv_iter_stats
             self._rank0_host_step_time_ms[iter_id] = host_step_time_ms
@@ -377,7 +384,7 @@ class ADPIterStatsBuffer:
         self._payloads.pop(iter_id, None)
         self._synthetic_iters.discard(iter_id)
         self._rank0_iter_stats.pop(iter_id, None)
-        self._rank0_allow_empty_heartbeat.pop(iter_id, None)
+        self._rank0_is_queue_snapshot.pop(iter_id, None)
         self._idle_heartbeat_iters.discard(iter_id)
         self._rank0_req_stats.pop(iter_id, None)
         self._rank0_kv_iter_stats.pop(iter_id, None)
@@ -493,7 +500,7 @@ class ADPIterStatsBuffer:
         row (``iteration_stats_row`` of that rank's stats) in rank order."""
         self.last_finalize_settled = False
         self.last_idle_rank_states = None
-        self.last_fanout_is_queue_snapshot = False
+        self.last_fanout_is_busy_queue_snapshot = False
         self.last_fanout_queued_counters = ()
         self.last_fanout_has_rank0_row = False
         pending_states = [s for s in all_rank_states if s.iter_stats.has_iter_stats]
@@ -549,17 +556,20 @@ class ADPIterStatsBuffer:
             no_scheduled_work = not any(
                 getattr(s.iter_stats, name) for s in states for name in _SCHEDULED_WORK_FIELDS
             )
-            # Only a queue snapshot of a busy engine may drop its empty rows.
-            drop_empty_rows = not self._rank0_allow_empty_heartbeat[iter_stats_iter]
+            is_queue_snapshot = self._rank0_is_queue_snapshot.get(iter_stats_iter, False)
+            is_idle_heartbeat = iter_stats_iter in self._idle_heartbeat_iters
             # A peer's measured record can share the iteration with rank 0's
             # snapshot; such a fanout is exported like any measured one.
-            self.last_fanout_is_queue_snapshot = drop_empty_rows and no_scheduled_work
+            self.last_fanout_is_busy_queue_snapshot = (
+                is_queue_snapshot and not is_idle_heartbeat and no_scheduled_work
+            )
             self.last_fanout_queued_counters = queued_counters
-            allow_empty = not drop_empty_rows and not any(queued_counters)
+            idle_with_empty_queues = is_idle_heartbeat and not any(queued_counters)
             exported_states = states
-            if not allow_empty and rank0_stats.iter_latency_ms == 0:
-                # A zero-duration record has a row only for the ranks with work to report:
-                # scheduled on that rank, or queued (rank 0's row carries the queued totals).
+            if is_queue_snapshot and not idle_with_empty_queues:
+                # An idle heartbeat with empty queues reports every rank. Any other queue
+                # snapshot has a row only for the ranks with work to report: scheduled on
+                # that rank, or queued (rank 0's row carries the queued totals).
                 exported_states = [
                     s
                     for s in states
@@ -583,8 +593,9 @@ class ADPIterStatsBuffer:
                     scheduler_mode=scheduler_mode,
                     gpu_forward_time_ms=self._rank0_gpu_forward_time_ms.get(iter_stats_iter),
                 ),
+                is_queue_snapshot=is_queue_snapshot,
             )
-            if iter_stats_iter in self._idle_heartbeat_iters and allow_empty and no_scheduled_work:
+            if idle_with_empty_queues and no_scheduled_work:
                 self.last_idle_rank_states = states
 
         self._clear_through(iter_stats_iter)
@@ -604,7 +615,7 @@ class ADPIterStatsBuffer:
         from ``rank0_stats``.
 
         Args:
-            rank0_stats: Rank 0's current zero-duration snapshot.
+            rank0_stats: Rank 0's current queue snapshot.
             scheduler_mode: The rows' ``schedulerMode``, as in finalize().
 
         Returns:
@@ -627,6 +638,7 @@ class ADPIterStatsBuffer:
                 scheduler_mode=scheduler_mode,
                 gpu_forward_time_ms=0.0,
             ),
+            is_queue_snapshot=True,
         )
 
     def _rank_rows(
@@ -637,21 +649,34 @@ class ADPIterStatsBuffer:
         req_stats: Optional[List[RequestStats]],
         kv_iter_stats: Optional[Dict[int, object]],
         timings: Dict[str, object],
+        is_queue_snapshot: bool,
     ) -> List[str]:
         """Rows of ranks other than 0 differ only in their payload counts, KV cache stats,
         speculative-decoding stats and rank: the first is built in full and the others are
-        spliced into its text."""
+        spliced into its text. ``is_queue_snapshot`` marks every row (see queue())."""
         rows: List[str] = []
         template = None
         for state in states:
             if state.rank == 0:
                 stats = self._make_rank_iter_stats(rank0_stats, state, queued_stats)
-                row = iteration_stats_row(stats, req_stats, kv_iter_stats, 0, **timings)
+                row = iteration_stats_row(
+                    stats,
+                    req_stats,
+                    kv_iter_stats,
+                    0,
+                    **timings,
+                    is_queue_snapshot=is_queue_snapshot,
+                )
                 rows.append(json.dumps(row))
                 continue
             if template is None:
                 stats = self._make_rank_iter_stats(rank0_stats, state, queued_stats)
-                row = iteration_stats_row(stats, attention_dp_rank=state.rank, **timings)
+                row = iteration_stats_row(
+                    stats,
+                    attention_dp_rank=state.rank,
+                    **timings,
+                    is_queue_snapshot=is_queue_snapshot,
+                )
                 ifb = row["inflightBatchingStats"]
                 row["inflightBatchingStats"] = _IFB_MARK
                 row["kvCacheStats"] = _KV_MARK

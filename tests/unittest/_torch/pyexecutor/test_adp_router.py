@@ -140,7 +140,7 @@ def _make_request_item(req_id, num_tokens=10, target_dp_rank=None, attention_dp_
 
 def append_to_waiting_queue(waiting_queue, rank, attention_dp_relax):
     req_id = len(waiting_queue)
-    waiting_queue.append(
+    waiting_queue.add_request(
         RequestQueueItem(
             req_id,
             create_mock_request_with_py_schedule_params(
@@ -1360,7 +1360,7 @@ def test_achieve_max_num_active_requests(attention_dp_config):
 
     all_ranks_num_active_requests = [5, 6, 3, 7]
     waiting_queue = FCFSWaitingQueue()
-    waiting_queue.extend(req_list)
+    waiting_queue.add_requests(req_list)
     available = max_num_active_requests * 4 - sum(all_ranks_num_active_requests)
 
     result = get_from_waiting_queue(
@@ -2479,7 +2479,7 @@ class TestDefaultADPRouterKVBalance:
         queue = _gen_queue([8000, 300, 400])
         if case == "context_request":
             context_type = RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION
-            queue.append(_gen_item(3, 400, request_type=context_type))
+            queue.add_request(_gen_item(3, 400, request_type=context_type))
         states = _states([0], [7]) if single_rank else _states([20000, 21000], [8, 7])
         chosen, placement = router.pop_requests(
             queue, states, 1, 8, kv_balance=case != "kv_balance_off"
@@ -2613,7 +2613,7 @@ class TestDefaultADPRouterKVBalance:
         next_id = 0
         while next_id < num_ranks * slots or queue:
             for _ in range(min(rng.choice([1, 2]), num_ranks * slots - next_id)):
-                queue.append(_gen_item(next_id, int(rng.lognormvariate(9.5, 1.0))))
+                queue.add_request(_gen_item(next_id, int(rng.lognormvariate(9.5, 1.0))))
                 next_id += 1
             states = _states(tokens, counts)
             chosen, placement = router.pop_requests(queue, states, len(queue), slots)

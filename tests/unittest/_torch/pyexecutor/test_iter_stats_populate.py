@@ -1186,6 +1186,7 @@ def test_attention_dp_idle_heartbeat_repeats_per_rank_rows_without_an_exchange()
     buffers = [ADPIterStatsBuffer(), ADPIterStatsBuffer()]
     exchanged = [json.loads(row) for row in _exchange_idle_heartbeat(buffers)]
     assert [row["attentionDpRank"] for row in exchanged] == [0, 1]
+    assert all(row["isQueueSnapshot"] is True for row in exchanged)
     assert buffers[0].last_idle_rank_states is not None
     assert buffers[0].next_payload() is None
 
@@ -1201,6 +1202,7 @@ def test_attention_dp_idle_heartbeat_repeats_per_rank_rows_without_an_exchange()
         assert row["iter"] == 10
         assert row["gpuMemUsage"] == 4321
         assert row["iterLatencyMS"] == 0
+        assert row["isQueueSnapshot"] is True
         assert row["inflightBatchingStats"]["numScheduledRequests"] == 0
         assert "requestStats" not in row and "kvCacheIterationStats" not in row
         assert (row["hostStepTimeMS"], row["prevDeviceStepTimeMS"]) == (0.0, 0.0)
@@ -1232,6 +1234,7 @@ def test_attention_dp_idle_rows_expire_with_the_next_fanout(case):
     if case == "measured":
         rows = _exchange_idle_heartbeat(buffers, iter_id=10, idle_heartbeat=False)
         assert len(rows) == 2
+        assert not any("isQueueSnapshot" in json.loads(row) for row in rows)
     elif case == "peer-scheduled":
         rows = _exchange_idle_heartbeat(buffers, iter_id=10, busy_rank=1)
         assert len(rows) == 2
@@ -1239,7 +1242,7 @@ def test_attention_dp_idle_rows_expire_with_the_next_fanout(case):
         assert buffers[0].finalize([RankState(rank=0), RankState(rank=1)], is_rank0=True) == []
 
     assert buffers[0].last_idle_rank_states is None
-    assert not buffers[0].last_fanout_is_queue_snapshot
+    assert not buffers[0].last_fanout_is_busy_queue_snapshot
     assert buffers[0].make_idle_heartbeat_rows(_make_adp_iteration_stats(iter_id=11)) == []
 
 
@@ -1287,7 +1290,7 @@ def test_attention_dp_snapshot_sharing_an_iteration_with_measured_work_is_not_a_
     buffers[0].queue(
         _make_adp_iteration_stats(iter_id=9, num_queued_context_requests=1),
         is_rank0=True,
-        allow_empty_heartbeat=False,
+        is_queue_snapshot=True,
     )
     buffers[1].queue(_make_adp_iteration_stats(iter_id=9, num_gen_requests=3), is_rank0=False)
     states = [
@@ -1299,16 +1302,16 @@ def test_attention_dp_snapshot_sharing_an_iteration_with_measured_work_is_not_a_
 
     assert [row["attentionDpRank"] for row in rows] == [0, 1]
     assert rows[1]["inflightBatchingStats"]["numGenRequests"] == 3
-    assert not buffers[0].last_fanout_is_queue_snapshot
+    # Rank 0 measured no duration for this record, so every row of it is marked.
+    assert all(row["isQueueSnapshot"] is True for row in rows)
+    assert not buffers[0].last_fanout_is_busy_queue_snapshot
     assert buffers[0].last_idle_rank_states is None
 
 
 def test_attention_dp_zero_duration_fanout_keeps_only_the_ranks_with_work():
     """Rank 0's empty snapshot row is dropped; the peer's row does not depend on it."""
     buffers = [ADPIterStatsBuffer(), ADPIterStatsBuffer()]
-    buffers[0].queue(
-        _make_adp_iteration_stats(iter_id=9), is_rank0=True, allow_empty_heartbeat=False
-    )
+    buffers[0].queue(_make_adp_iteration_stats(iter_id=9), is_rank0=True, is_queue_snapshot=True)
     buffers[1].queue(_make_adp_iteration_stats(iter_id=9, num_gen_requests=3), is_rank0=False)
     states = [
         RankState(rank=rank, iter_stats=buffer.next_payload())
@@ -1320,7 +1323,7 @@ def test_attention_dp_zero_duration_fanout_keeps_only_the_ranks_with_work():
     assert [row["attentionDpRank"] for row in rows] == [1]
     assert rows[0]["inflightBatchingStats"]["numGenRequests"] == 3
     assert rows[0]["inflightBatchingStats"]["numScheduledRequests"] == 3
-    assert not buffers[0].last_fanout_is_queue_snapshot
+    assert not buffers[0].last_fanout_is_busy_queue_snapshot
     assert not buffers[0].last_fanout_has_rank0_row
 
 
@@ -1330,22 +1333,23 @@ def test_attention_dp_fanout_marks_busy_queue_snapshots():
     states = []
     for rank, buffer in enumerate(buffers):
         stats = _make_adp_iteration_stats(iter_id=9, num_queued_context_requests=rank)
-        buffer.queue(stats, is_rank0=rank == 0, allow_empty_heartbeat=False)
+        buffer.queue(stats, is_rank0=rank == 0, is_queue_snapshot=True)
         states.append(RankState(rank=rank, iter_stats=buffer.next_payload()))
 
     rows = [json.loads(row) for row in buffers[0].finalize(states, is_rank0=True)]
 
     # Rank 0's row carries the summed backlog; the empty peer row is dropped.
     assert [row["attentionDpRank"] for row in rows] == [0]
+    assert rows[0]["isQueueSnapshot"] is True
     assert rows[0]["inflightBatchingStats"]["numQueuedContextRequests"] == 1
     assert rows[0]["numQueuedRequests"] == 1
-    assert buffers[0].last_fanout_is_queue_snapshot
+    assert buffers[0].last_fanout_is_busy_queue_snapshot
     assert buffers[0].last_fanout_queued_counters == (1, 0, 0, 0)
     assert buffers[0].last_fanout_has_rank0_row
     assert buffers[0].last_idle_rank_states is None
 
     _exchange_idle_heartbeat([buffers[0], ADPIterStatsBuffer()], iter_id=10)
-    assert not buffers[0].last_fanout_is_queue_snapshot
+    assert not buffers[0].last_fanout_is_busy_queue_snapshot
 
 
 def test_attention_dp_fanout_emits_rank_local_rows_with_rank0_queue():
@@ -1846,17 +1850,20 @@ def test_update_iter_stats_does_not_overwrite_construction_iter():
 
 
 @pytest.mark.parametrize(
-    "allow_empty,queued_tokens,iter_latency_ms,expected_ranks",
+    "is_queue_snapshot,idle_heartbeat,queued_tokens,iter_latency_ms,expected_ranks",
     [
-        (False, 0, 0.0, []),
-        (True, 0, 0.0, [0, 1]),
-        (True, 300, 0.0, [0]),
-        (False, 300, 12.5, [0, 1]),
+        (True, False, 0, 0.0, []),
+        (True, True, 0, 0.0, [0, 1]),
+        (True, True, 300, 0.0, [0]),
+        (False, False, 300, 12.5, [0, 1]),
+        # The record's kind is what the caller said, not what its latency suggests.
+        (False, False, 300, 0.0, [0, 1]),
     ],
-    ids=["busy-empty", "all-idle", "queue-veto", "timed-dummy"],
+    ids=["busy-empty", "all-idle", "queue-veto", "timed-dummy", "measured-zero-latency"],
 )
 def test_attention_dp_idle_heartbeat_requires_global_idle(
-    allow_empty,
+    is_queue_snapshot,
+    idle_heartbeat,
     queued_tokens,
     iter_latency_ms,
     expected_ranks,
@@ -1868,7 +1875,12 @@ def test_attention_dp_idle_heartbeat_requires_global_idle(
     )
     stats.iter_latency_ms = iter_latency_ms
     buffer = ADPIterStatsBuffer()
-    buffer.queue(stats, is_rank0=True, allow_empty_heartbeat=allow_empty)
+    buffer.queue(
+        stats,
+        is_rank0=True,
+        is_queue_snapshot=is_queue_snapshot,
+        idle_heartbeat=idle_heartbeat,
+    )
     rows = buffer.finalize(
         [
             RankState(rank=0, iter_stats=buffer.next_payload()),
@@ -1887,6 +1899,7 @@ def test_attention_dp_idle_heartbeat_requires_global_idle(
     for row in rows:
         assert row["inflightBatchingStats"]["numScheduledRequests"] == 0
         assert row["iterLatencyMS"] == iter_latency_ms
+        assert row.get("isQueueSnapshot", False) is is_queue_snapshot
 
 
 def test_queued_scan_skips_unreadable_active_request_state():

@@ -389,4 +389,4 @@ def test_zero_duration_row_does_not_repeat_the_latest_kv_iteration_stats():
 
     (measured,) = fake.stats
     assert measured == (stats, None, {32: "deltas"}, None, 6.0, 4.0, "non_overlap", None, None)
-    assert snapshot == (stats, None, None, None, 0.0, 0.0, "non_overlap", 0.0)
+    assert snapshot == (stats, None, None, None, 0.0, 0.0, "non_overlap", 0.0, None, True)

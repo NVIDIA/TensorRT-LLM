@@ -817,13 +817,13 @@ def llm_return_logprobs_test_harness(prompt_logprobs: Optional[int],
 
 
 def is_idle_heartbeat(stats: dict) -> bool:
-    """Whether a stats record is the zero-duration record of an idle engine.
+    """Whether a stats record is the queue snapshot of an idle engine.
 
     With iteration stats enabled an idle engine keeps reporting such a
     record, so a test that waits for the stats to run dry has to skip them.
     """
     ifb = stats.get("inflightBatchingStats") or {}
-    return (stats.get("iterLatencyMS") == 0
+    return (stats.get("isQueueSnapshot", False)
             and not ifb.get("numScheduledRequests")
             and not ifb.get("numQueuedContextRequests")
             and not ifb.get("numQueuedGenRequests")

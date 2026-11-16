@@ -23,6 +23,7 @@ This module tests the waiting queue functionality including:
 - create_waiting_queue factory function
 """
 
+from collections import deque
 from unittest.mock import Mock, patch
 
 import pytest
@@ -751,6 +752,19 @@ def test_fcfs_queue_built_from_items_tracks_them():
     assert queue.queued_load.totals() == (1, 100, 1, 50)
     queue.pop_request()
     assert queue.queued_load.totals() == (0, 0, 1, 50)
+
+
+def test_fcfs_queue_can_only_be_changed_through_the_waiting_queue_methods():
+    """A raw deque call would bypass the queued-load totals, so the queue offers none."""
+    queue = FCFSWaitingQueue([_load_item(0, 100)])
+    assert not isinstance(queue, deque)
+    for name in dir(deque):
+        if not name.startswith("_"):
+            assert not hasattr(queue, name), name
+    for subscript in (lambda: queue[0], lambda: queue.__setitem__(0, None)):
+        with pytest.raises((TypeError, AttributeError)):
+            subscript()
+    assert queue.queued_load.totals() == (1, 100, 0, 0) and len(queue) == 1
 
 
 def test_aging_queue_tracks_the_requests_past_the_wait_cap():
