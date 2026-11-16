@@ -552,6 +552,7 @@ def recording(*wrappers):
             "quant_mode",
         ),
         qkv=True,
+        record_output=False,
     )
 
 

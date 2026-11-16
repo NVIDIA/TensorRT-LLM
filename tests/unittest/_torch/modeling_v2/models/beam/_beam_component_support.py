@@ -343,11 +343,13 @@ def recording(
     experts: type[BeamMoeBf16Sm103Tp1] | None = None,
     data_ptrs: bool = False,
     qkv: bool = False,
+    record_output: bool = True,
 ) -> Iterator[list[dict]]:
     """Log every call of these entries, in order, with its nesting depth, the arguments that
     identify the path and its output. ``experts``: an MoE class whose ``_expert`` calls are
     also logged, with the expert asked for and the rows it is passed. ``data_ptrs``: the
-    positional tensors' data pointers. ``qkv``: the shape and tensor of a ``q`` keyword."""
+    positional tensors' data pointers. ``qkv``: the shape and tensor of a ``q`` keyword.
+    Set ``record_output=False`` for metadata-only records that must not retain outputs."""
     calls: list[dict] = []
     depth = [0]
     saved = []
@@ -381,7 +383,8 @@ def recording(
                 out = _original(self, *args, **kwargs)
             finally:
                 depth[0] -= 1
-            entry["output"] = out
+            if record_output:
+                entry["output"] = out
             return out
 
         cls.__call__ = logged
