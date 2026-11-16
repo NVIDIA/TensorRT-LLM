@@ -10686,6 +10686,108 @@ TEST(BaseKVCacheManagerCalculateMaxNumBlocks, PerWindowOverrideDivergesByteBudge
     EXPECT_NEAR(static_cast<double>(overLargePrim) / baselineLargePrim, 0.5, 0.01);
 }
 
+TEST(BaseKVCacheManagerCalculateMaxNumBlocks, ThrowsWhenExtraCostExceedsBudget)
+{
+    using SizeType32 = tensorrt_llm::runtime::SizeType32;
+    auto constexpr numLayers = 1;
+    auto constexpr numKvHeads = 1;
+    auto constexpr sizePerHead = 1;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr windowSize = 128;
+    auto constexpr kvFactor = 1;
+    auto constexpr maxBatchSize = 1;
+
+    auto const numKvHeadsPerLayer = std::vector<SizeType32>(numLayers, numKvHeads);
+    auto const windowSizeToLayers
+        = std::map<SizeType32, std::vector<SizeType32>>{{windowSize, std::vector<SizeType32>{0}}};
+    uint64_t constexpr allottedPrimaryMemBytes = 15;
+    uint64_t constexpr allottedSecondaryMemBytes = 0;
+    size_t constexpr extraCostMemory = 16;
+
+    tensorrt_llm::executor::KvCacheConfig config{};
+    config.setFreeGpuMemoryFraction(0.1F);
+    config.setCrossKvCacheFraction(0.1F);
+    tensorrt_llm::runtime::WorldConfig const worldConfig{};
+
+    try
+    {
+        static_cast<void>(BaseKVCacheManager::calculateMaxNumBlocks(config, tensorrt_llm::DataType::kINT8,
+            numKvHeadsPerLayer, sizePerHead, tokensPerBlock, worldConfig, windowSizeToLayers, allottedPrimaryMemBytes,
+            allottedSecondaryMemBytes, extraCostMemory, kvFactor, maxBatchSize));
+        FAIL() << "Expected TllmException";
+    }
+    catch (tc::TllmException const& e)
+    {
+        EXPECT_THAT(e.what(), testing::HasSubstr("cache transceiver pre-allocation"));
+        EXPECT_THAT(e.what(), testing::HasSubstr("cross_kv_cache_fraction"));
+    }
+}
+
+TEST(BaseKVCacheManagerCalculateMaxNumBlocks, AllowsBudgetSlightlyAboveExtraCost)
+{
+    using SizeType32 = tensorrt_llm::runtime::SizeType32;
+    auto constexpr numLayers = 1;
+    auto constexpr numKvHeads = 1;
+    auto constexpr sizePerHead = 1;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr windowSize = 128;
+    auto constexpr kvFactor = 1;
+    auto constexpr maxBatchSize = 1;
+
+    auto const numKvHeadsPerLayer = std::vector<SizeType32>(numLayers, numKvHeads);
+    auto const windowSizeToLayers
+        = std::map<SizeType32, std::vector<SizeType32>>{{windowSize, std::vector<SizeType32>{0}}};
+    uint64_t constexpr allottedPrimaryMemBytes = 20;
+    uint64_t constexpr allottedSecondaryMemBytes = 0;
+    size_t constexpr extraCostMemory = 16;
+
+    tensorrt_llm::executor::KvCacheConfig const config{};
+    tensorrt_llm::runtime::WorldConfig const worldConfig{};
+
+    auto const blocksPerWindow = BaseKVCacheManager::calculateMaxNumBlocks(config, tensorrt_llm::DataType::kINT8,
+        numKvHeadsPerLayer, sizePerHead, tokensPerBlock, worldConfig, windowSizeToLayers, allottedPrimaryMemBytes,
+        allottedSecondaryMemBytes, extraCostMemory, kvFactor, maxBatchSize);
+
+    ASSERT_EQ(blocksPerWindow.count(windowSize), 1);
+    EXPECT_EQ(std::get<0>(blocksPerWindow.at(windowSize)), 1);
+    EXPECT_EQ(std::get<1>(blocksPerWindow.at(windowSize)), 0);
+}
+
+TEST(BaseKVCacheManagerCalculateMaxNumBlocks, ThrowsWhenPrimaryBlockCountExceedsInt32Range)
+{
+    using SizeType32 = tensorrt_llm::runtime::SizeType32;
+    auto constexpr numLayers = 1;
+    auto constexpr numKvHeads = 1;
+    auto constexpr sizePerHead = 1;
+    auto constexpr tokensPerBlock = 1;
+    auto constexpr windowSize = 128;
+    auto constexpr kvFactor = 1;
+    auto constexpr maxBatchSize = 1;
+
+    auto const numKvHeadsPerLayer = std::vector<SizeType32>(numLayers, numKvHeads);
+    auto const windowSizeToLayers
+        = std::map<SizeType32, std::vector<SizeType32>>{{windowSize, std::vector<SizeType32>{0}}};
+    uint64_t constexpr allottedPrimaryMemBytes = static_cast<uint64_t>(std::numeric_limits<SizeType32>::max()) + 1;
+    uint64_t constexpr allottedSecondaryMemBytes = 0;
+    size_t constexpr extraCostMemory = 0;
+
+    tensorrt_llm::executor::KvCacheConfig const config{};
+    tensorrt_llm::runtime::WorldConfig const worldConfig{};
+
+    try
+    {
+        static_cast<void>(BaseKVCacheManager::calculateMaxNumBlocks(config, tensorrt_llm::DataType::kINT8,
+            numKvHeadsPerLayer, sizePerHead, tokensPerBlock, worldConfig, windowSizeToLayers, allottedPrimaryMemBytes,
+            allottedSecondaryMemBytes, extraCostMemory, kvFactor, maxBatchSize));
+        FAIL() << "Expected TllmException";
+    }
+    catch (tc::TllmException const& e)
+    {
+        EXPECT_THAT(e.what(), testing::HasSubstr("primary block count"));
+        EXPECT_THAT(e.what(), testing::HasSubstr("exceeds int32 range"));
+    }
+}
+
 TEST_F(KVCacheManagerTest, KVCacheManagerSWAEvictionCountPerWindow)
 {
     auto constexpr numLayers = 2;

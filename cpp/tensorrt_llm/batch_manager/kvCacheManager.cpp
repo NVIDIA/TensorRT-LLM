@@ -4272,8 +4272,32 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(executor::KvCacheConfi
         && linearAttentionMetadata.has_value() && !config.getEnableBlockReuse();
     bool const isVSWA = cacheSizeBytesPerTokenPerWindow.size() > 1;
 
+    auto const allottedPrimaryMemBytesBeforeExtraCost = allottedPrimaryMemBytes;
     TLLM_LOG_DEBUG("extraCostMemory [Gib]: %0.2f", extraCostMemory / static_cast<double>(1 << 30));
-    allottedPrimaryMemBytes = allottedPrimaryMemBytes - extraCostMemory;
+    if (auto const crossKvCacheFraction = config.getCrossKvCacheFraction(); crossKvCacheFraction.has_value())
+    {
+        TLLM_CHECK_WITH_INFO(allottedPrimaryMemBytes > extraCostMemory,
+            "KV cache budget is too small to cover the cache transceiver pre-allocation. Required: %0.2f GiB, "
+            "allotted: %0.2f GiB. Increase 'kv_cache_free_gpu_mem_fraction' (currently %f) or "
+            "'cross_kv_cache_fraction' (currently %f), or reduce the transceiver pre-allocation via "
+            "TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE, or disable the cache transceiver if disaggregated serving is not "
+            "used.",
+            extraCostMemory / static_cast<double>(1 << 30),
+            allottedPrimaryMemBytesBeforeExtraCost / static_cast<double>(1 << 30),
+            config.getFreeGpuMemoryFraction().value_or(0.F), crossKvCacheFraction.value());
+    }
+    else
+    {
+        TLLM_CHECK_WITH_INFO(allottedPrimaryMemBytes > extraCostMemory,
+            "KV cache budget is too small to cover the cache transceiver pre-allocation. Required: %0.2f GiB, "
+            "allotted: %0.2f GiB. Increase 'kv_cache_free_gpu_mem_fraction' (currently %f), or reduce the "
+            "transceiver pre-allocation via TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE, or disable the cache transceiver if "
+            "disaggregated serving is not used.",
+            extraCostMemory / static_cast<double>(1 << 30),
+            allottedPrimaryMemBytesBeforeExtraCost / static_cast<double>(1 << 30),
+            config.getFreeGpuMemoryFraction().value_or(0.F));
+    }
+    allottedPrimaryMemBytes -= extraCostMemory;
 
     auto windowSizeToShare = computeWindowSizeShares(windowSizeToLayers);
 
@@ -4309,7 +4333,13 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(executor::KvCacheConfi
             }
         }
         TLLM_LOG_DEBUG("Primary maxTokens for windowSize %d: %ld", windowSize, maxTokens);
-        return static_cast<SizeType32>(tc::ceilDiv(maxTokens, tokensPerBlock));
+        auto const numBlocks = tc::ceilDiv(maxTokens, static_cast<uint64_t>(tokensPerBlock));
+        TLLM_CHECK_WITH_INFO(numBlocks <= static_cast<uint64_t>(std::numeric_limits<SizeType32>::max()),
+            "Computed KV cache primary block count (%" PRIu64
+            ") for windowSize %d exceeds int32 range. This indicates a bug in the KV cache budget computation "
+            "(allottedPrimaryMemBytes=%" PRIu64 ", extraCostMemory=%zu).",
+            numBlocks, windowSize, allottedPrimaryMemBytesBeforeExtraCost, extraCostMemory);
+        return static_cast<SizeType32>(numBlocks);
     };
 
     auto const calculateSecondaryBlocks
@@ -4327,8 +4357,14 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(executor::KvCacheConfi
             return linearAttentionMetadata->calcMaxMemoryBlocks(
                 windowSize, tokensPerBlock, memoryBudget, windowSizeToLayers.at(windowSize).size());
         }
-        auto maxTokensSecondary = static_cast<SizeType32>(memoryBudget / cacheSizeBytesPerToken);
-        return std::max(0, maxTokensSecondary / tokensPerBlock);
+        auto const maxTokensSecondary = memoryBudget / cacheSizeBytesPerToken;
+        auto const numBlocks = maxTokensSecondary / static_cast<uint64_t>(tokensPerBlock);
+        TLLM_CHECK_WITH_INFO(numBlocks <= static_cast<uint64_t>(std::numeric_limits<SizeType32>::max()),
+            "Computed KV cache secondary block count (%" PRIu64
+            ") for windowSize %d exceeds int32 range. This indicates a bug in the KV cache budget computation "
+            "(allottedSecondaryMemBytes=%" PRIu64 ").",
+            numBlocks, windowSize, allottedSecondaryMemBytes);
+        return static_cast<SizeType32>(numBlocks);
     };
 
     std::vector<SizeType32> blocksPrimary;
