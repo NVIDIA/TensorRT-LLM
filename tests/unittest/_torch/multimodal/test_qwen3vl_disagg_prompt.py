@@ -285,7 +285,12 @@ def test_external_embeddings_reuse_common_item_metadata(model):
     assert params.get_item_layout() == ((("image", 0), ("image", 1)), (4, 9))
     assert params.multimodal_data["multimodal_embedding"] is embeddings
     assert params.multimodal_data["mrope_config"] is mrope_config
-    assert params.multimodal_input is None
+    # The embeddings have no content hashes: each item gets a random one.
+    mm_input = extra["multimodal_input"]
+    assert mm_input.multimodal_positions == [1, 6]
+    assert mm_input.multimodal_lengths == [4, 9]
+    assert len(mm_input.multimodal_hashes) == 2
+    assert mm_input.multimodal_hashes[0] != mm_input.multimodal_hashes[1]
 
 
 def test_qwen3vl_video_token_count_sums_single_video_grid_rows():

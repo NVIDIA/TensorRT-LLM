@@ -4,6 +4,7 @@
 from types import SimpleNamespace
 from unittest.mock import Mock, call
 
+import numpy as np
 import pytest
 import torch
 
@@ -11,6 +12,7 @@ import tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 as resource_m
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
+from tensorrt_llm.inputs.registry import create_input_processor_with_hash
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     ReuseScope,
     gen_multimodal_cache_key_tokens,
@@ -405,3 +407,54 @@ def test_native_uuid_context_survives_text_only_first_prefill_chunk(exact_runs):
     assert chunks[1][0].uuid == "later-image"
     assert chunks[2] == [1002, 1003]
     assert sum(chunks, []) == manager._augment_tokens_for_block_reuse(tokens, request)
+
+
+class _NoHashingProcessor:
+    """Image tokens 101-104 after one text token; hashing is off."""
+
+    multimodal_hashing_supported = False
+
+    def __call__(self, inputs, sampling_params):
+        return [10, 101, 102, 103, 104, 20, 21, 22], {"multimodal_data": {}}
+
+    def get_num_tokens_per_image(self, *, image):
+        return 4
+
+    def get_vocab_size(self):
+        return 100
+
+    def get_mm_token_ids(self):
+        return None
+
+    def get_mm_special_token_ids(self):
+        return None
+
+
+def test_requests_without_content_hashes_do_not_share_block_keys():
+    """Two images, same prompt, hashing off: no block key is shared.
+
+    Keyed by placeholder tokens alone, the second request would reuse the KV cache of the first
+    image. Each item gets a random hash instead.
+    """
+    wrapped = create_input_processor_with_hash(_NoHashingProcessor())
+    manager = _make_manager(100)
+    block_keys = []
+    for value in (0, 255):
+        image = np.full((2, 2, 3), value, dtype=np.uint8)
+        tokens, extra = wrapped({"prompt": "unused", "multi_modal_data": {"image": [image]}}, None)
+        mm_input = extra.get("multimodal_input")
+        mm_fields = {}
+        if mm_input is not None:
+            mm_fields = dict(
+                multimodal_hashes=mm_input.multimodal_hashes,
+                multimodal_positions=mm_input.multimodal_positions,
+                multimodal_lengths=mm_input.multimodal_lengths,
+                **mm_input.run_metadata(),
+            )
+        request = _make_request(tokens, **mm_fields)
+        augmented = KVCacheManagerV2._augment_tokens_for_block_reuse(manager, tokens, request)
+        keys = sequence_to_blockchain_keys(4, ReuseScope(), augmented)
+        block_keys.append([key for block, key in keys if block])  # Skip the root key.
+
+    assert len(block_keys[0]) == 2
+    assert not set(block_keys[0]) & set(block_keys[1])

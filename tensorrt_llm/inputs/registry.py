@@ -51,7 +51,8 @@ from .multimodal import (MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalInput,
                          _find_mm_token_start_pos_from_masks, apply_mm_hashes,
                          default_hasher, find_mm_token_lengths,
                          get_multimodal_item_metadata, hexdigest_to_int32,
-                         validate_mm_inputs, validate_mm_uuids)
+                         random_mm_hashes, validate_mm_inputs,
+                         validate_mm_uuids)
 # yapf: enable
 from .multimodal_data import MEDIA_MODALITIES, serialize_item
 from .prefix_token_cache import (OffsetTokenizer, PrefixTokenCache,
@@ -1523,7 +1524,24 @@ def create_input_processor_with_hash(
             multimodal_data[
                 "mm_processor_kwargs_hash"] = _hash_mm_processor_kwargs(
                     inputs.get("mm_processor_kwargs") or {}, hash_lib)
+        add_multimodal_input(inputs, prompt_token_ids, extra_processed_inputs,
+                             mm_hashes, mm_uuids_by_key)
+        return prompt_token_ids, extra_processed_inputs
 
+    def add_multimodal_input(
+        inputs: TextPrompt,
+        prompt_token_ids: List[int],
+        extra_processed_inputs: ExtraProcessedInputs,
+        mm_hashes: Optional[Dict[str, List[str]]] = None,
+        mm_uuids_by_key: Optional[Dict[str, List[Optional[str]]]] = None,
+    ) -> None:
+        """Find the prompt span of each item and add the `MultimodalInput`.
+
+        `mm_hashes` maps modality -> content hash of each item. Without them,
+        each item gets a random hash.
+        """
+        mm_data = inputs['multi_modal_data']
+        multimodal_data = extra_processed_inputs["multimodal_data"]
         num_mm_tokens_by_key = find_mm_token_lengths(
             mm_data,
             input_processor,
@@ -1538,7 +1556,7 @@ def create_input_processor_with_hash(
             raise ValueError(
                 "multimodal hashing could not determine multimodal token "
                 "lengths for the provided input.")
-        # `mm_hashes_flat`, `start_positions`, and `num_mm_tokens` must all
+        # The hashes, `start_positions`, and `num_mm_tokens` must all
         # index items at the same offsets — project into prompt order via the
         # manifest.
         mm_item_order = inputs.get("mm_item_order")
@@ -1616,19 +1634,51 @@ def create_input_processor_with_hash(
             extra_processed_inputs["multimodal_data"][
                 "special_token_offsets"] = start_special_token_positions
         # Hashes, UUIDs and token spans use the same prompt-ordered item refs.
-        mm_hashes_flat = [mm_hashes[m][i] for m, i in item_refs]
+        if mm_hashes is None:
+            mm_hashes_int32 = random_mm_hashes(len(item_refs))
+        else:
+            mm_hashes_int32 = [
+                hexdigest_to_int32(mm_hashes[m][i]) for m, i in item_refs
+            ]  # nested list w/ multiple int32 per hash
         mm_uuid_list = (None if mm_uuids_by_key is None else
                         [mm_uuids_by_key[m][i] for m, i in item_refs])
-        validate_mm_inputs(prompt_token_ids, mm_hashes_flat, start_positions,
+        validate_mm_inputs(prompt_token_ids, mm_hashes_int32, start_positions,
                            num_mm_tokens)
-        mm_hashes_int32 = [hexdigest_to_int32(h) for h in mm_hashes_flat
-                           ]  # nested list w/ multiple int32 per hash
 
         extra_processed_inputs[
             "multimodal_input"] = MultimodalInput.from_components(
                 mm_hashes_int32, start_positions, num_mm_tokens, mm_uuid_list,
                 item_run_cu_offsets, run_positions, run_lengths)
-        return prompt_token_ids, extra_processed_inputs
+
+    def add_random_multimodal_input(
+        inputs: TextPrompt,
+        prompt_token_ids: List[int],
+        extra_processed_inputs: Optional[ExtraProcessedInputs],
+    ) -> Optional[ExtraProcessedInputs]:
+        """Give each item of a request without content hashes a random hash.
+
+        KV block reuse keys the blocks of an item by its hash. Without one, the
+        keys come from the placeholder tokens, which are the same for every
+        image, so a request with another image and the same prompt layout
+        would reuse the KV cache of this one. With random hashes, no other
+        request matches these blocks. The request still skips the encoder
+        cache, which needs content hashes. It stays as it is when its item
+        spans cannot be found.
+        """
+        multimodal_data = (extra_processed_inputs or {}).get("multimodal_data")
+        if (not isinstance(multimodal_data, dict)
+                or extra_processed_inputs.get("multimodal_input") is not None):
+            return extra_processed_inputs
+        # Work on copies, so a failure leaves the request unchanged.
+        result = {
+            **extra_processed_inputs, "multimodal_data": dict(multimodal_data)
+        }
+        try:
+            add_multimodal_input(inputs, prompt_token_ids, result)
+        except Exception as e:
+            logger.debug(f"No random multimodal hashes: {e}")
+            return extra_processed_inputs
+        return result
 
     def process_prompt_maybe_hash(
         inputs: TextPrompt, sampling_params: SamplingParams
@@ -1673,11 +1723,16 @@ def create_input_processor_with_hash(
                     input_processor.multimodal_hashing_supported = False
 
         try:
-            return input_processor(inputs, sampling_params)
+            prompt_token_ids, extra_processed_inputs = input_processor(
+                inputs, sampling_params)
         except Exception as e:
             logger.warning(f"Basic input processor failed: {e}.")
             logger.debug(traceback.format_exc())
             raise e
+        if can_hash:
+            extra_processed_inputs = add_random_multimodal_input(
+                inputs, prompt_token_ids, extra_processed_inputs)
+        return prompt_token_ids, extra_processed_inputs
 
     def input_processor_wrapper(
         inputs: TextPrompt, sampling_params: SamplingParams
