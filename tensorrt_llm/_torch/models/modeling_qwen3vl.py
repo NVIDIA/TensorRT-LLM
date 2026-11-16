@@ -70,10 +70,12 @@ from .modeling_multimodal_mixin import (
     encode_multimodal_by_groups,
 )
 from .modeling_qwen2vl import (
+    _QWEN_PAD_TOKENS,
     Qwen2_5_VLVisionAttention,
     Qwen2VLInputProcessorBase,
     _prepare_qwen_vl_mrope_config,
     _qwen_vision_item_partitions,
+    _set_item_grid_metadata,
 )
 from .modeling_utils import (
     ModelConfig,
@@ -257,6 +259,9 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
     than a ``tokens_per_second``-scaled stretch.
     """
 
+    # Each image or video is processed on its own.
+    supports_mm_item_handoff = True
+
     def __init__(
         self,
         model_path: str,
@@ -274,6 +279,35 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
         )
         # Qwen3-VL keeps ``torch_dtype`` only on ``text_config`` under transformers 5.x.
         self._dtype = self.config.text_config.dtype
+
+    def _mm_embedding_width(self) -> int:
+        # Unlike previous Qwen VL models, the embeddings are concatenated with
+        # feature maps from deepstack layers.
+        deepstack_indexes = getattr(self.config.vision_config, "deepstack_visual_indexes", None)
+        return self.config.text_config.hidden_size * (1 + len(deepstack_indexes or []))
+
+    def get_mm_item_text(
+        self,
+        modality: str,
+        placeholder: str,
+        metadata: Dict[str, Any],
+        embedding_shape: Tuple[int, ...],
+    ) -> str:
+        """A video gets "<t seconds>" and its own vision span per frame group, as in HF."""
+        if modality != "video":
+            return super().get_mm_item_text(modality, placeholder, metadata, embedding_shape)
+        grid_t, grid_h, grid_w = self._check_mm_item_grid(modality, metadata, embedding_shape)
+        timestamps = metadata.get("video_timestamps")
+        if timestamps is None or len(timestamps) < grid_t:
+            raise ValueError(
+                f"it needs video_timestamps with one value per frame group ({grid_t}), which "
+                f"{type(self).__name__} writes in the prompt; got {timestamps}. Pass the "
+                "encoder's item metadata (handle['metadata'])."
+            )
+        pad = _QWEN_PAD_TOKENS["video"]
+        frame_rows = grid_h * grid_w // self.config.vision_config.spatial_merge_size**2
+        frame = placeholder.replace(pad, pad * frame_rows)
+        return "".join(f"<{seconds:.1f} seconds>{frame}" for seconds in timestamps[:grid_t])
 
     @classmethod
     def _build_temporal_block(
@@ -455,6 +489,11 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
             video_metadata=video_metadata,
             **proc_kwargs,
         )
+        # The HF Qwen3-VL processor writes a timestamp per frame group into the prompt.
+        add_timestamps = videos is not None and hasattr(self.processor, "_calculate_timestamps")
+        if add_timestamps:
+            # Keep the sampled-frame metadata to get each video's timestamps.
+            processor_kwargs["return_metadata"] = True
         processed = self.processor(**processor_kwargs)
         if normalization:
             if any(
@@ -468,8 +507,20 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
                 # the device lookup table cannot be applied. Rerun it with the host settings.
                 processor_kwargs["do_rescale"] = host_do_rescale
                 processor_kwargs.pop("do_normalize")
-                return self.processor(**processor_kwargs)
-            processed["vision_normalization"] = normalization
+                processed = self.processor(**processor_kwargs)
+            else:
+                processed["vision_normalization"] = normalization
+        sampled_videos = processed.pop("video_metadata", None)
+        if add_timestamps and sampled_videos is not None:
+            # The timestamp of each frame group, as the HF processor puts it in
+            # the prompt ("<t seconds>"). A prefill worker rebuilds the text from it.
+            temporal_patch_size = self.processor.video_processor.temporal_patch_size
+            processed["video_timestamps"] = [
+                self.processor._calculate_timestamps(
+                    list(video.frames_indices), video.fps, temporal_patch_size
+                )
+                for video in sampled_videos
+            ]
         return processed
 
     def _get_vision_normalization(
@@ -645,11 +696,7 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
             raise TypeError("mm_handles must be a list")
 
         # Edge has no deepstack indexes. A missing field is zero levels.
-        deepstack_indexes = getattr(self.config.vision_config, "deepstack_visual_indexes", None)
-        num_deepstack_levels = len(deepstack_indexes or [])
-        # This is because, unlike previous Qwen VL models, the embeddings are concatenated with
-        # feature maps from deepstack layers.
-        expected_size = self.config.text_config.hidden_size * (1 + num_deepstack_levels)
+        expected_size = self._mm_embedding_width()
         for i, mm_handle in enumerate(mm_handles):
             if len(mm_handle["tensor_size"]) != 2:
                 raise ValueError(f"Multimodal embedding {i} must be rank 2")
@@ -1613,6 +1660,10 @@ class Qwen3VisionModelBase(nn.Module):
         modality-batched ViT the aggregated path uses and applies the
         per-request `item_metadata.item_refs` reorder before returning.
         """
+        # The aggregated model also calls this forward. Only the standalone
+        # encoder returns embedding handles.
+        if self.model_config.mm_encoder_only:
+            _set_item_grid_metadata(multimodal_params)
         return [encode_multimodal_by_groups(self.mm_encoder_groups, multimodal_params)]
 
 

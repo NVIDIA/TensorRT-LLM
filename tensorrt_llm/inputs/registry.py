@@ -17,14 +17,16 @@
 
 import enum
 import importlib
+import re
 import traceback
 from abc import ABC, abstractmethod
+from collections import Counter, deque
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from typing import (TYPE_CHECKING, Any, Callable, ClassVar, Dict, Iterator,
-                    List, Mapping, Optional, Protocol, Tuple, Type, TypeVar,
-                    Union)
+                    List, Mapping, Optional, Protocol, Sequence, Tuple, Type,
+                    TypeVar, Union)
 
 import numpy as np
 import torch
@@ -51,7 +53,7 @@ from .multimodal import (MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalInput,
                          _find_mm_token_start_pos_from_masks, apply_mm_hashes,
                          default_hasher, find_mm_token_lengths,
                          get_multimodal_item_metadata, hexdigest_to_int32,
-                         validate_mm_inputs)
+                         split_multimodal_embedding_items, validate_mm_inputs)
 # yapf: enable
 from .multimodal_data import MEDIA_MODALITIES, serialize_item
 from .prefix_token_cache import (OffsetTokenizer, PrefixTokenCache,
@@ -217,6 +219,16 @@ class BaseMultimodalInputProcessor(ABC):
     # inputs to `call_with_token_ids` instead of detokenizing upstream.
     supports_token_id_mm_expansion: ClassVar[bool] = False
 
+    # Whether each media item is processed on its own: its encoder input and
+    # output do not depend on the prompt text or on the other items. When
+    # True, the standalone encoder takes `multi_modal_data` with no prompt and
+    # builds a prompt with one placeholder per item (`get_mm_items_prompt`),
+    # and prefill builds its inputs from the real prompt and per-item results
+    # (`build_mm_item_prefill_inputs`). Such a subclass implements
+    # `get_mm_item_text` and, if it needs more than token ids (for example
+    # mRoPE positions), `get_mm_item_prefill_data`.
+    supports_mm_item_handoff: ClassVar[bool] = False
+
     # Whether the subclass takes `enable_tokenization_cache` in `__init__` and
     # uses `_init_tokenization_cache` and `_encode_with_tokenization_cache`.
     supports_tokenization_cache: ClassVar[bool] = False
@@ -368,9 +380,167 @@ class BaseMultimodalInputProcessor(ABC):
                 and inputs.get("prompt") is None
                 and not self.supports_token_id_mm_expansion):
             inputs = self._detokenize_to_text_prompt(inputs, sampling_params)
+        if self.supports_mm_item_handoff:
+            prompt_token_ids, params = self.build_mm_item_prefill_inputs(
+                inputs, multimodal_embedding, sampling_params)
+            return prompt_token_ids, {
+                "multimodal_data": params.multimodal_data,
+                "multimodal_input": params.multimodal_input,
+            }
         return self._attach_multimodal_embeddings_impl(inputs,
                                                        multimodal_embedding,
                                                        sampling_params)
+
+    def get_mm_item_text(self, modality: str, placeholder: str,
+                         metadata: Dict[str, Any],
+                         embedding_shape: Sequence[int]) -> str:
+        """The prompt text of one encoded item, in place of its placeholder.
+
+        Needed for `supports_mm_item_handoff`. `placeholder` is the registered
+        placeholder the item replaces, `metadata` holds the item's metadata
+        from the encoder (`handle["metadata"]`), and `embedding_shape` is the
+        shape of its embedding. Raise ValueError if they do not fit.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not build item prompt text")
+
+    def get_mm_item_prefill_data(
+        self,
+        prompt_token_ids: List[int],
+        item_refs: Sequence[Tuple[str, int]],
+        item_metadata: Sequence[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Model data for a prompt built from items, such as positions.
+
+        Items are in prompt order. The result is added to `multimodal_data`.
+        """
+        return {}
+
+    def build_mm_item_prefill_inputs(
+        self,
+        inputs: TextPrompt,
+        items: Union[Dict[str, Any], List[Dict[str, Any]]],
+        sampling_params: Optional[SamplingParams],
+        *,
+        mm_hashes: Optional[List[List[int]]] = None,
+    ) -> Tuple[List[int], multimodal.MultimodalParams]:
+        """Build prefill inputs from the real prompt and encoded items.
+
+        Needs `supports_mm_item_handoff`. Items may come from several encode
+        calls or a cache, in one of two forms:
+
+        - By modality, as in `multi_modal_embeddings`:
+          `{"image": [item, ...], "video": [...]}`, where each item is a
+          tensor or `{"mm_embeddings": tensor, **metadata}`. Each modality's
+          items follow the order of its placeholders in the prompt.
+        - In prompt order, as encoder embedding handles with their metadata
+          in `handle["metadata"]`. `mm_hashes` gives their hashes.
+
+        Each registered placeholder in the prompt is replaced with its item's
+        text (`get_mm_item_text`), and the whole text is tokenized once, so
+        the ids are those of a full request. Hashes come from `mm_hashes` or
+        from each item's `multimodal_hash`, for all items or none. Items must
+        have no framing tokens inside their span (`get_mm_special_token_ids`).
+        """
+        if inputs.get("prompt") is None:
+            inputs = self._detokenize_to_text_prompt(inputs, sampling_params)
+        by_modality = isinstance(items, dict)
+        if by_modality:
+            pending = {}
+            for modality, modality_items in items.items():
+                tensors, metadata = split_multimodal_embedding_items(
+                    modality_items)
+                pending[modality] = deque(
+                    (tensor, tuple(tensor.shape), item_metadata)
+                    for tensor, item_metadata in zip(tensors, metadata))
+        else:
+            pending = {None: deque()}
+            for index, handle in enumerate(items):
+                metadata = dict(handle.get("metadata") or {})
+                if mm_hashes is not None:
+                    metadata["multimodal_hash"] = mm_hashes[index]
+                pending[None].append(
+                    (handle, tuple(handle["tensor_size"]), metadata))
+
+        placeholders = MULTIMODAL_PLACEHOLDER_REGISTRY.get_placeholder_metadata(
+            self._placeholder_model_type()).placeholder_map
+        modality_of = {
+            text: modality
+            for modality, text in placeholders.items()
+        }
+        refs, embeddings, rows, item_metadata = [], [], [], []
+        counts = Counter()
+
+        def expand(match: re.Match) -> str:
+            modality = modality_of[match.group(0)]
+            queue = pending.get(modality if by_modality else None)
+            if not queue:
+                raise ValueError(f"The prompt has more {modality} placeholders "
+                                 f"than {modality} items")
+            embedding, shape, metadata = queue.popleft()
+            try:
+                text = self.get_mm_item_text(modality, match.group(0), metadata,
+                                             shape)
+            except ValueError as error:
+                raise ValueError(f"{modality.capitalize()} item "
+                                 f"{counts[modality]} (prompt item "
+                                 f"{len(refs)}): {error}") from error
+            refs.append((modality, counts[modality]))
+            counts[modality] += 1
+            embeddings.append(embedding)
+            rows.append(shape[0])
+            item_metadata.append(metadata)
+            return text
+
+        pattern = "|".join(
+            re.escape(text)
+            for text in sorted(modality_of, key=len, reverse=True))
+        text = re.sub(pattern, expand, inputs["prompt"])
+        unused = sum(len(queue) for queue in pending.values())
+        if unused:
+            raise ValueError(
+                f"{unused} multimodal items have no placeholder in the prompt")
+        if not refs:
+            raise ValueError("The prompt has no multimodal placeholder")
+
+        add_special_tokens = (sampling_params is None
+                              or sampling_params.add_special_tokens)
+        prompt_token_ids = list(
+            self.tokenizer(text,
+                           add_special_tokens=add_special_tokens).input_ids)
+        mm_mask, embed_mask, special_mask = _compute_mm_masks(
+            torch.tensor(prompt_token_ids, dtype=torch.int32),
+            self.get_vocab_size(), self.get_mm_token_ids(),
+            self.get_mm_special_token_ids())
+        if int(mm_mask.sum()) != sum(rows):
+            raise ValueError(
+                f"The prompt has {int(mm_mask.sum())} multimodal tokens, but "
+                f"the items have {sum(rows)} embedding rows")
+        positions, _ = _find_mm_token_start_pos_from_masks(
+            mm_mask, special_mask, rows)
+        run_offsets, run_positions, run_lengths = _find_mm_token_runs_from_mask(
+            mm_mask, rows)
+        hashes = [metadata.get("multimodal_hash") for metadata in item_metadata]
+        if None in hashes:
+            if any(mm_hash is not None for mm_hash in hashes):
+                raise ValueError(
+                    "Give a multimodal_hash for every item or for none")
+            hashes = None
+        params = multimodal.MultimodalParams.from_embeddings(
+            embeddings,
+            MultimodalItemMetadata(refs, output_embedding_lengths=rows),
+            multimodal_hashes=hashes,
+            multimodal_positions=positions,
+            multimodal_lengths=rows,
+            multimodal_item_run_cu_offsets=run_offsets,
+            multimodal_run_positions=run_positions,
+            multimodal_run_lengths=run_lengths,
+        )
+        params.multimodal_data.update(
+            self.get_mm_item_prefill_data(prompt_token_ids, refs,
+                                          item_metadata))
+        _cache_mm_embed_cumsum(params.multimodal_data, embed_mask)
+        return prompt_token_ids, params
 
     def _attach_multimodal_embeddings_impl(
         self,
@@ -645,11 +815,38 @@ class BaseMultimodalInputProcessor(ABC):
         """Whether the selected input path needs caller-supplied media markers."""
         if tokenized and self.supports_token_id_mm_expansion:
             return True
+        return MULTIMODAL_PLACEHOLDER_REGISTRY.get_content_format(
+            self._placeholder_model_type()) != ContentFormat.PASSTHROUGH
+
+    def _placeholder_model_type(self) -> str:
+        """The model type this processor's placeholders are registered under."""
         model_type = getattr(type(self), "_registered_model_type", None)
         if model_type is None:
             model_type = resolve_top_level_model_type(self.config)
-        return MULTIMODAL_PLACEHOLDER_REGISTRY.get_content_format(
-            model_type) != ContentFormat.PASSTHROUGH
+        return model_type
+
+    def get_mm_items_prompt(
+            self,
+            mm_data: Dict[str, Any],
+            mm_item_order: Optional[List[Dict[str, Any]]] = None) -> str:
+        """A prompt with one registered placeholder per item and no other text.
+
+        Items follow `mm_item_order` if given, else each modality in turn, in
+        the order of `mm_data`. Used to encode items without a prompt; needs
+        `supports_mm_item_handoff`.
+        """
+        if not self.supports_mm_item_handoff:
+            raise ValueError(
+                f"{type(self).__name__} needs a prompt to encode multimodal "
+                "data: its items are not processed independently.")
+        order = mm_item_order or [{
+            "modality": modality
+        } for modality, count in _mm_data_to_counts(mm_data).items()
+                                  for _ in range(count)]
+        model_type = self._placeholder_model_type()
+        return "".join(
+            MULTIMODAL_PLACEHOLDER_REGISTRY.get_placeholder(
+                model_type, entry["modality"]) for entry in order)
 
     def get_mm_token_ids(self) -> Optional[Tensor]:
         """Token IDs for a logical multimodal unit; include framing tokens for one contiguous span per unit.

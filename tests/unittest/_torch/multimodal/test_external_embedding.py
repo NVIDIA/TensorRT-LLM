@@ -4,6 +4,8 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
+from tensorrt_llm._torch.models.modeling_llava_next import \
+    LlavaNextInputProcessor
 from tensorrt_llm._torch.models.modeling_qwen3vl import \
     Qwen3VLInputProcessorBase
 from tensorrt_llm.sampling_params import SamplingParams
@@ -34,14 +36,14 @@ def _make_qwen3_vl_config(hidden_size: int):
 
 def _make_tokenizer(input_ids):
     tokenizer = Mock()
-    tokenizer.return_value.input_ids = [torch.tensor(input_ids)]
+    tokenizer.return_value.input_ids = input_ids
     return tokenizer
 
 
 def _make_qwen3_vl_processor(config, tokenizer):
     with patch("tensorrt_llm._torch.models.modeling_qwen2vl.AutoProcessor"
                ) as mock_auto_processor:
-        mock_auto_processor.from_pretrained.return_value = Mock()
+        mock_auto_processor.from_pretrained.return_value = SimpleNamespace()
         return Qwen3VLInputProcessorBase(
             model_path="dummy_path",
             config=config,
@@ -55,10 +57,11 @@ def test_qwen3_vl_attach_multimodal_embeddings_builds_mrope_config():
     config = _make_qwen3_vl_config(hidden_size)
     expected_embedding_width = hidden_size * (
         1 + len(config.vision_config.deepstack_visual_indexes))
+    # Ids of the prompt after its image placeholder is expanded.
     tokenizer = _make_tokenizer([
         7,
         config.vision_start_token_id,
-        config.image_token_id,
+        *[config.image_token_id] * 4,
         config.vision_end_token_id,
         8,
     ])
@@ -71,8 +74,13 @@ def test_qwen3_vl_attach_multimodal_embeddings_builds_mrope_config():
     ).reshape(num_image_tokens, expected_embedding_width)
 
     prompt_token_ids, extra_processed_inputs = processor.attach_multimodal_embeddings(
-        {"prompt": "Describe this image."},
-        {"image": [image_embedding]},
+        {"prompt": "Describe<|vision_start|><|image_pad|><|vision_end|>this."},
+        {
+            "image": [{
+                "mm_embeddings": image_embedding,
+                "image_grid_thw": [1, 4, 4]
+            }]
+        },
         SamplingParams(),
     )
 
@@ -89,8 +97,11 @@ def test_qwen3_vl_attach_multimodal_embeddings_builds_mrope_config():
         config.vision_end_token_id,
         8,
     ]
-    tokenizer.assert_called_once_with("Describe this image.",
-                                      return_tensors="pt")
+    # The placeholder is expanded in the text, which is tokenized once.
+    tokenizer.assert_called_once_with("Describe<|vision_start|>" +
+                                      "<|image_pad|>" * 4 +
+                                      "<|vision_end|>this.",
+                                      add_special_tokens=True)
 
     multimodal_data = extra_processed_inputs["multimodal_data"]
     assert multimodal_data["multimodal_embedding"] == [image_embedding]
@@ -110,6 +121,22 @@ def test_qwen3_vl_attach_multimodal_embeddings_builds_mrope_config():
         mrope_config["mrope_position_deltas"],
         torch.tensor([[-2]], dtype=torch.int32),
     )
+
+
+def test_llava_next_embeddings_keep_tensor_list():
+    """Models without mRoPE still take a plain list of tensors."""
+    processor = object.__new__(LlavaNextInputProcessor)
+    processor._config = SimpleNamespace(
+        image_token_index=9, text_config=SimpleNamespace(hidden_size=4))
+    embeddings = [torch.ones(3, 4), torch.zeros(2, 4)]
+
+    ids, extra = processor.attach_multimodal_embeddings(
+        {"prompt_token_ids": [1, 9, 2, 9, 3]}, {"image": embeddings},
+        SamplingParams())
+
+    assert ids == [1, 9, 9, 9, 2, 9, 9, 3]
+    torch.testing.assert_close(extra["multimodal_data"]["multimodal_embedding"],
+                               torch.cat(embeddings))
 
 
 if __name__ == "__main__":

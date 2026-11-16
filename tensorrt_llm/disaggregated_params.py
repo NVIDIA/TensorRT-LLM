@@ -169,7 +169,16 @@ class DisaggregatedParams:
                 assert len(self.multimodal_embedding_handles) > 0, (
                     "multimodal_embedding_handles must be provided"
                 )
-                vals = np.random.randint(
-                    np.iinfo(np.int32).min, np.iinfo(np.int32).max, size=8, dtype=np.int32
-                ).tolist()
-                self.multimodal_hashes = [vals] * len(self.multimodal_embedding_handles)
+                self.multimodal_hashes = random_multimodal_hashes(
+                    len(self.multimodal_embedding_handles)
+                )
+
+
+def random_multimodal_hashes(num_items: int) -> List[List[int]]:
+    """One random hash (8 int32 values) per item, for items without a content hash.
+
+    Each item gets its own value, so two different items never share a hash.
+    """
+    return np.random.randint(
+        np.iinfo(np.int32).min, np.iinfo(np.int32).max, size=(num_items, 8), dtype=np.int32
+    ).tolist()
