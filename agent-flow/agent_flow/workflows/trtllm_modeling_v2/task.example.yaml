@@ -240,23 +240,20 @@ accuracy:
   #   mtp: {min_absolute: 1.5, floor_source: "03-plan/acceptance-spike.md: reference 2.31"}
   #   dspark: {measured_reference: 3.32}   # floor 3.15
 
-  # The BOOT gate's workload, run-wide or per unit; keywords match
-  # generated text only. A `multimodal` unit with no image prompt sends the tree's
-  # tests/integration/test_input_files/merlion.png.
+  # The BOOT gate's workload, run-wide or per unit. An answer must not be empty; what it
+  # says is the benchmark's to judge. A `multimodal` unit with no image prompt sends the
+  # tree's tests/integration/test_input_files/merlion.png.
   # boot:
   #   prompts:
   #     - "The capital of France is"
-  #     - prompt: "Natalia sold 48 clips in April and half as many in May. How many in all?"
-  #       keywords: ["72"]
+  #     - "In one sentence, photosynthesis is"
   #   # prompts_file: boot_prompts.yaml   # or a YAML/JSON list of plain prompts
-  #   keywords: [Paris]             # each must appear in some generated text
   #   max_tokens: 32                # default
   #   multimodal:
   #     prompts:
   #       - prompt: "<|User|><image>What vegetable is this? One word.<|Assistant|>"
   #         images: [examples/images/carrots.jpeg]   # beside this file, or in the tree
   #         render: raw                              # pre-rendered; or `loader`
-  #         keywords_any: [carrot]
 
   # Optional BOOT BOUNDARIES, off unless `enabled: true` or `profile: certified`.
   # One member's boot of each unit (`members`, else attention DP first, then the widest; never a

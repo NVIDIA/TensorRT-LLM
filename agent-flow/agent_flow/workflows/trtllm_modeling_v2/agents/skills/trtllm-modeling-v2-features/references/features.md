@@ -449,13 +449,15 @@ builds the language model alone and must load and route with the tower absent.
 --modality image --media <image>`. `tests/integration/test_input_files/merlion.png`
 (git-lfs) is a known image.
 
-**Flow proof.** No engine field. A `multimodal` unit is judged by its boot
-sending an image (default the merlion photograph, with keywords such as
-"merlion", "statue", "fountain"), or by an image benchmark
-(`mmmu`, `mmstar`, `chartqa`, ...). The serve gate also sends an image chat.
+**Flow proof.** No engine field. A `multimodal` unit's boot sends an image
+(default the merlion photograph) and the serve gate sends an image chat: both
+show that a request with an image is answered. That the
+image was seen is shown only by an image benchmark (`mmmu`, `mmstar`,
+`chartqa`, ...).
 
-**Blind spots.** One keyword in one description is weak evidence, and a text
-benchmark says nothing about the vision path. Nothing exercises image tokens
+**Blind spots.** Boot and serve do not judge what an answer says, so a target
+that ignores the image passes them, and a text benchmark says nothing about
+the vision path. Nothing exercises image tokens
 split across a chunk, or image-prefix reuse, unless a prompt is built for it.
 For `text_only`, absent by design and absent by accident look alike.
 

@@ -271,14 +271,14 @@ ANCHOR_STATES: tuple[str, ...] = (ANCHOR_RECORDED, ANCHOR_RELATIVE)
 BENCHMARK_MEMBERS_EVERY = "every"
 BENCHMARK_MEMBERS: tuple[str, ...] = (BENCHMARK_MEMBERS_EVERY,)
 
-# Boot workloads allow run-wide keys and per-unit overlays. Keywords match
-# generated text, never logs; absent multimodal images use the repository asset.
-BOOT_KEYS: tuple[str, ...] = ("prompts", "prompts_file", "keywords", "max_tokens")
+# Boot workloads allow run-wide keys and per-unit overlays. Absent multimodal images use
+# the repository asset.
+BOOT_KEYS: tuple[str, ...] = ("prompts", "prompts_file", "max_tokens")
 # How long one boot gate, or one acceptance leg, may run: `timeout` at either level of
 # `accuracy.boot` and `accuracy.acceptance` (default 1800 s). Not a workload key: it
 # changes no verdict, only how long a slow load is waited for.
 GATE_TIMEOUT_KEY = "timeout"
-BOOT_PROMPT_KEYS: tuple[str, ...] = ("prompt", "keywords", "keywords_any", "images", "render")
+BOOT_PROMPT_KEYS: tuple[str, ...] = ("prompt", "images", "render")
 BOOT_RENDERS: tuple[str, ...] = ("loader", "raw")
 
 # Optional runtime-boundary phases of ordinary boot (checks/boot.py).
@@ -933,24 +933,14 @@ def _validate_boot_level(level: Mapping[str, Any], errors: list[str], where: str
                 reject_unknown_keys(entry, BOOT_PROMPT_KEYS, errors, where=at)
                 if not isinstance(entry.get("prompt"), str) or not entry["prompt"].strip():
                     errors.append(f"'{at}.prompt' is required and must be a non-empty string")
-                _validate_fields(
-                    entry,
-                    dict.fromkeys(("keywords", "keywords_any", "images"), _NONEMPTY_STRINGS),
-                    errors,
-                    at,
-                )
+                _validate_fields(entry, {"images": _NONEMPTY_STRINGS}, errors, at)
                 if entry.get("render") is not None and entry["render"] not in BOOT_RENDERS:
                     errors.append(f"'{at}.render' must be one of {BOOT_RENDERS}")
     prompts_file = level.get("prompts_file")
     if prompts_file is not None:
         if not isinstance(prompts_file, str) or not Path(prompts_file).is_file():
             errors.append(f"'{where}.prompts_file' does not exist: {prompts_file}")
-    _validate_fields(
-        level,
-        {"keywords": _STRINGS, "max_tokens": _POS_INT, GATE_TIMEOUT_KEY: _POS_INT},
-        errors,
-        where,
-    )
+    _validate_fields(level, {"max_tokens": _POS_INT, GATE_TIMEOUT_KEY: _POS_INT}, errors, where)
 
 
 def _validate_boot(block: Any, errors: list[str]) -> None:

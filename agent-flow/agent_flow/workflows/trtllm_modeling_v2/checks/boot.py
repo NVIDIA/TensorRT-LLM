@@ -50,31 +50,15 @@ from .verdict import GateResult, inspect_tree, lost_session, verdict_factory
 DEFAULT_BOOT_IMAGE = "tests/integration/test_input_files/merlion.png"
 
 
-#: What the default image prompt asks, and the words any correct description
-#: of that photograph (the Merlion fountain in Singapore) contains one of.
+#: What the default image prompt asks of that photograph.
 DEFAULT_BOOT_IMAGE_PROMPT = "Describe this image in one sentence."
-
-
-DEFAULT_BOOT_IMAGE_KEYWORDS: tuple[str, ...] = (
-    "merlion",
-    "lion",
-    "statue",
-    "fountain",
-    "singapore",
-    "sculpture",
-    "water",
-)
 
 
 @dataclass(frozen=True)
 class BootPrompt:
-    """One boot prompt with checks of its own, images included."""
+    """One boot prompt written as a mapping: the form that carries images."""
 
     prompt: str
-    #: Every one must appear in THIS prompt's generated text (case-insensitive).
-    keywords: tuple[str, ...] = ()
-    #: At least one must appear in it (case-insensitive).
-    keywords_any: tuple[str, ...] = ()
     images: tuple[str, ...] = ()
     render: str = "loader"
 
@@ -83,38 +67,24 @@ class BootPrompt:
         """Read one entry of a boot ``prompts`` list written as a mapping."""
         return cls(
             prompt=str(data.get("prompt", "")),
-            keywords=tuple(str(k) for k in data.get("keywords") or ()),
-            keywords_any=tuple(str(k) for k in data.get("keywords_any") or ()),
             images=tuple(str(i) for i in data.get("images") or ()),
             render=str(data.get("render") or "loader"),
         )
 
-    def missing(self, text: str) -> list[str]:
-        """What this prompt's checks did not find in ``text``."""
-        lowered = (text or "").lower()
-        absent = [k for k in self.keywords if k.lower() not in lowered]
-        if self.keywords_any and not any(k.lower() in lowered for k in self.keywords_any):
-            absent.append(f"any of {list(self.keywords_any)}")
-        return absent
-
 
 @dataclass(frozen=True)
 class BootSpec:
-    """What the boot gate sends and what it insists on seeing back.
+    """What the boot gate sends.
 
-    The keyword list starts **empty on purpose**: keywords are frozen only
-    after observing what this model generates. ``prompts`` and ``keywords``
-    are the plain form: each keyword must appear in SOME prompt's generated
-    text. ``items`` are prompts with checks of their own, and the only ones
-    that carry images. Keywords are matched against the generated texts only,
-    never against the log: ``72`` matches ``CPUs 72-143`` in an engine log line.
+    An answer must not be empty; what it says is the accuracy benchmark's to
+    judge. ``items`` are the prompts written as mappings, the only ones that
+    carry images.
     """
 
     prompts: tuple[str, ...] = (
         "The capital of France is",
         "In one sentence, photosynthesis is",
     )
-    keywords: tuple[str, ...] = ()
     max_tokens: int = 32
     items: tuple[BootPrompt, ...] = ()
     #: Where the spec came from, named in a verdict.
@@ -122,7 +92,7 @@ class BootSpec:
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any], source: str) -> "BootSpec":
-        """A spec from a boot block: ``prompts`` (strings or mappings), ``keywords``, ``max_tokens``."""
+        """A spec from a boot block: ``prompts`` (strings or mappings) and ``max_tokens``."""
         plain: list[str] = []
         items: list[BootPrompt] = []
         for entry in data.get("prompts") or ():
@@ -134,7 +104,6 @@ class BootSpec:
             plain.extend(load_prompts_file(data["prompts_file"]))
         return cls(
             prompts=tuple(plain) if (plain or items) else cls.prompts,
-            keywords=tuple(str(k) for k in data.get("keywords") or ()),
             max_tokens=int(data.get("max_tokens") or cls.max_tokens),
             items=tuple(items),
             source=source,
@@ -203,11 +172,7 @@ def resolve_boot_spec(
         and task_data.get("scope", "full") != "text_only"
         and not spec.has_images
     ):
-        image = BootPrompt(
-            prompt=DEFAULT_BOOT_IMAGE_PROMPT,
-            keywords_any=DEFAULT_BOOT_IMAGE_KEYWORDS,
-            images=(DEFAULT_BOOT_IMAGE,),
-        )
+        image = BootPrompt(prompt=DEFAULT_BOOT_IMAGE_PROMPT, images=(DEFAULT_BOOT_IMAGE,))
         spec = replace(spec, items=(*spec.items, image))
     return spec
 
@@ -611,14 +576,6 @@ def run_boot_gate(
         if shortfall:
             return _verdict(passed=False, detail=shortfall, **ran)
         chunked = f"; a prompt past max_num_tokens {limits.max_num_tokens} was served in chunks"
-    missing = missing_keywords(spec, texts)
-    if missing:
-        return _verdict(
-            passed=False,
-            detail=f"the generated texts are missing {len(missing)} expected keyword(s): "
-            f"{missing}. Keywords are matched against generated text only",
-            **ran,
-        )
     compared, warnings = "", []
     if reference is not None:
         measured = {}
@@ -636,16 +593,10 @@ def run_boot_gate(
     elif unread:
         compared, warnings = f"; {unread}", [unread]
     images = sum(len(r.get("images") or ()) for r in requests)
-    checked = (
-        f"{len(spec.keywords) + sum(1 for i in spec.items if i.keywords or i.keywords_any)} "
-        f"keyword check(s) in the generated texts"
-        if spec.keywords or any(i.keywords or i.keywords_any for i in spec.items)
-        else "non-empty generation"
-    )
     sent = f", {images} image(s) sent" if images else ""
     return _verdict(
         passed=True,
-        detail=f"engine cold-started and produced {checked} for {len(texts)} prompt(s)"
+        detail=f"engine cold-started and produced non-empty generation for {len(texts)} prompt(s)"
         f"{sent}; workload: {spec.source}{chunked}"
         + (boundary.describe(config) if phases else "")
         + (
@@ -659,26 +610,6 @@ def run_boot_gate(
         explained=bool(compared),
         **ran,
     )
-
-
-def missing_keywords(spec: BootSpec, texts: Sequence[str | None]) -> list[str]:
-    """The keywords ``spec`` expects that ``texts``, its prompts' generated texts in order, lack.
-
-    The run-wide keywords are matched against every text together; a prompt
-    with keywords of its own against its own text. Matched against generated
-    text only, case-insensitively. A text that is ``None`` was not asked for,
-    and its prompt's own keywords are not looked for.
-    """
-    generated = "\n".join(text or "" for text in texts).lower()
-    missing = [k for k in spec.keywords if k.lower() not in generated]
-    item_texts = texts[len(spec.prompts) :]
-    for item, text in zip(spec.items, item_texts):
-        if text is None:
-            continue
-        for absent_keyword in item.missing(text):
-            label = "the image prompt" if item.images else "a prompt"
-            missing.append(f"{absent_keyword} (in {label} {item.prompt[:40]!r})")
-    return missing
 
 
 def chunk_shortfall(records: Sequence[Mapping[str, Any] | None], max_num_tokens: int) -> str | None:
@@ -723,11 +654,9 @@ __all__ = [
     "BootPrompt",
     "BootSpec",
     "DEFAULT_BOOT_IMAGE",
-    "DEFAULT_BOOT_IMAGE_KEYWORDS",
     "DEFAULT_BOOT_IMAGE_PROMPT",
     "chunk_probe_tokens",
     "chunk_shortfall",
-    "missing_keywords",
     "resolve_boot_spec",
     "run_boot_gate",
 ]

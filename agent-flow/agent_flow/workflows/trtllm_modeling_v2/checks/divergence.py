@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """How far a target's next-token distribution is from a reference's, recorded rather than gated.
 
-The model-level acceptance: the target answers its prompts reasonably (the boot gate's
-keywords), its first token is the reference's (a flip within ``tie_margin`` nats of the
+The model-level acceptance: the target answers its prompts (the boot gate), its first
+token is the reference's (a flip within ``tie_margin`` nats of the
 reference's own top two is a near-tie, not a disagreement), and its distribution has not
 diverged from the reference's (the Jensen-Shannon divergence of the two top-k distributions,
 in nats, and the centered cosine of their log-probs). The golden rule stays the benchmark
@@ -12,7 +12,7 @@ score against its anchor.
 A divergence past the bounds is **recorded** with the verdict (its numbers and the prompts
 that crossed them), never a failure by itself: a check that blocks a run over a
 low-precision difference costs more than the difference. Only output that is wrong
-(the boot's keywords missing, nothing generated) or a benchmark under its floor fails.
+(nothing generated) or a benchmark under its floor fails.
 The bounds can be loosened per run (``accuracy.reference_logits``); the record stays.
 
 The reference is a file of first-token top-k log-probs per prompt, made once by a run that

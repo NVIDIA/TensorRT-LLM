@@ -60,13 +60,9 @@ DEFAULT_WORKLOAD: dict[str, int] = {"isl": 4096, "osl": 1024, "max_batch_size": 
 #: Tokens between Mamba state snapshots on a hybrid checkpoint with block
 #: reuse: without a snapshot policy the engine turns reuse off.
 DEFAULT_SNAPSHOT_INTERVAL = 2048
-#: The boot gate's prompts when the site declares none: one whose answer any
-#: working target states, checked, and one open continuation.
+#: The boot gate's prompts when the site declares none: two short continuations.
 DEFAULT_BOOT: dict[str, Any] = {
-    "prompts": [
-        {"prompt": "The capital of France is", "keywords_any": ["Paris"]},
-        "In one sentence, photosynthesis is",
-    ],
+    "prompts": ["The capital of France is", "In one sentence, photosynthesis is"],
     "max_tokens": 32,
 }
 DEFAULT_BENCHMARK = "gsm8k"

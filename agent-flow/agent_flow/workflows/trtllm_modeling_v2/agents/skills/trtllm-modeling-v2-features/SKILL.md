@@ -75,8 +75,8 @@ Climb only as far as the claim needs. Each rung says what it cannot see.
    `--mode off` reruns the same command on the stock path as a control. Read the verdict's `[engine ...]` segment: every declared field is
    read back from every rank's worker (`MV2FLOW_RANK_ENGINE`), with the reuse
    probe and pool sizes. A field read as UNKNOWN, or only from the request, is
-   not evidence. *Blind to* accuracy: boot checks a few short continuations
-   for keywords.
+   not evidence. *Blind to* accuracy: boot checks only that a few short
+   continuations are not empty.
 4. **Accuracy, disagg, acceptance.** `gate accuracy` runs the benchmark
    with CUDA graphs (lint blocks an eager accuracy check) and re-attests each
    rank's KV dtype and chunking; `gate disagg --unit disagg` runs the target's

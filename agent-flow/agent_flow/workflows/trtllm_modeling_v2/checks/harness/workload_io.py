@@ -10,8 +10,8 @@ tree's interpreter to load a workload.
 
 RECORDS. A harness prints one line per result, ``<MARKER> <json>``, the JSON
 on one line with ASCII escapes. A gate reads ONLY those lines -- never the
-engine's log -- so a keyword cannot match ``CPUs 72-143`` in a log line, and
-a prefix added by ``srun -l`` or a logger does not hide a record.
+engine's log -- so a log line is never taken for generated text, and a prefix
+added by ``srun -l`` or a logger does not hide a record.
 
 DATASETS. A dataset is a local path (a file or a directory of files: JSON,
 JSON lines, YAML, Parquet or Arrow) or a Hugging Face dataset id, which is

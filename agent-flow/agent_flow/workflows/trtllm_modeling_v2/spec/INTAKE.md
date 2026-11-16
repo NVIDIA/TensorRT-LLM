@@ -112,8 +112,8 @@ benchmark you start by hand runs captured too.
   whose output is neither lm-eval's `accuracy:` line nor MMLU's weighted average needs
   `score_pattern` (a regular expression whose first group is the score, on the anchor's scale)
   and `samples`; without one, its gate quotes the lines that look like a score and fails.
-- **What fails a check.** Output that is wrong (nothing generated, a boot keyword missing) or a
-  benchmark under its floor. Everything stricter is recorded, not gated: the golden rule is the
+- **What fails a check.** Nothing generated, or a benchmark under its floor. Everything
+  stricter is recorded, not gated: the golden rule is the
   benchmark score close to its reference. A model-level reference, when the run has one
   (`accuracy.reference_logits.path`: first-token top-k log-probs per prompt, written by
   `checks/harness/hf_reference.py` where `transformers` loads the checkpoint natively), is
@@ -145,9 +145,9 @@ benchmark you start by hand runs captured too.
   against the unchunked engine. Its floor allows for the error of both scores. A variant that
   names a row of its own is judged against that row (its `discriminators` are layered over the
   unit's).
-- **Boot prompts.** One checked factual prompt and one checked arithmetic word problem (a
-  benchmark-style question with its numeric answer as the keyword): cheap semantic signal at every
-  boot.
+- **Boot prompts.** Two or three short prompts. Boot and serve require an answer, not a
+  word in it: an answer cut at `max_tokens` passes, and whether it is right is the
+  benchmark's to judge.
 - **Boot boundaries** (`accuracy.envelope`). Off unless the request asks for them (prompts at
   `max_seq_len`, loaded batches). When on, one boot per unit runs them (`members` picks it), and a
   probe whose legs part on a near-tie (`tie_margin`) passes with a note. Give `probes` with one
