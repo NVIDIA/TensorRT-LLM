@@ -278,9 +278,9 @@ class DynamicLinearWeightLoader:
                 return False  # Already quantized
             return weight.dtype in (torch.bfloat16, torch.float16, torch.float32)
 
-        if getattr(self.quant_config, "ignored_steps", []):
+        if getattr(self.quant_config, "ignore_steps", []):
             raise ValueError(
-                "`ignored_steps` requires load-time weight quantization (`dynamic: true`). "
+                "`ignore_steps` requires load-time weight quantization (`dynamic: true`). "
                 f"Load-time weight quantization ({quant_algo.name}) is not supported for "
                 f"module '{name}'. The checkpoint provides a {weight.dtype} weight, "
                 "but the VisualGen loader has no load-time quantizer for this algorithm."
@@ -407,7 +407,7 @@ class DynamicLinearWeightLoader:
             self._check_static_quant_scales(weight_dict, quant_algo, name, module)
             self._check_static_nvfp4_input_scale(module, weight_dict, quant_algo, name)
 
-        if getattr(self.quant_config, "ignored_steps", []) and quant_algo is not None:
+        if getattr(self.quant_config, "ignore_steps", []) and quant_algo is not None:
             # Reject unsupported quantization before retaining any BF16 weights.
             for weight_dict in weight_dicts:
                 self._should_dynamic_quantize(weight_dict, quant_algo, name)
@@ -438,7 +438,7 @@ class DynamicLinearWeightLoader:
             for wd in weight_dicts
         ):
             raise ValueError(
-                f"quant_config.ignored_steps requires original BF16/FP16 weights for {name}; "
+                f"quant_config.ignore_steps requires original BF16/FP16 weights for {name}; "
                 "a pre-quantized checkpoint cannot restore the original BF16 precision."
             )
         # Reuse the original module's TP sharding and fused-weight descriptors,

@@ -483,7 +483,7 @@ class TestRingAttentionInitGuards:
         run_test_in_distributed(world_size=4, test_fn=_logic_ring_init_guard_no_lse, use_cuda=False)
 
 
-def _logic_attention_ignored_steps(rank: int, world_size: int, *, parallelism: str) -> None:
+def _logic_attention_ignore_steps(rank: int, world_size: int, *, parallelism: str) -> None:
     """L2: compare sharded attention output with same-input full-sequence FP32 SDPA.
 
     BF16 steps are transparent apart from BF16 rounding and partial-softmax merges;
@@ -530,7 +530,7 @@ def _logic_attention_ignored_steps(rank: int, world_size: int, *, parallelism: s
         attention_config=AttentionConfig(
             backend="CUTEDSL",
             quant_attention_config=QuantAttentionConfig(
-                qk_dtype="nvfp4", v_dtype="fp8", ignored_steps=[0, 2]
+                qk_dtype="nvfp4", v_dtype="fp8", ignore_steps=[0, 2]
             ),
         ),
     )
@@ -576,11 +576,11 @@ def _logic_attention_ignored_steps(rank: int, world_size: int, *, parallelism: s
 
 
 @pytest.mark.parametrize("wrapper", ["ulysses", "ring"])
-def test_attention_ignored_steps_with_sequence_parallel(wrapper: str) -> None:
+def test_attention_ignore_steps_with_sequence_parallel(wrapper: str) -> None:
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("Quantized CuTe DSL attention requires Blackwell")
     run_test_in_distributed(
-        2, functools.partial(_logic_attention_ignored_steps, parallelism=wrapper)
+        2, functools.partial(_logic_attention_ignore_steps, parallelism=wrapper)
     )
 
 

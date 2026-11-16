@@ -104,7 +104,7 @@ def test_linear_steps_create_metadata_for_every_backend(tmp_path, backend):
     _write_dual_transformer_checkpoint(tmp_path, (None, None))
     args = VisualGenArgs(
         model=str(tmp_path),
-        quant_config={"quant_algo": "NVFP4", "dynamic": True, "ignored_steps": [0]},
+        quant_config={"quant_algo": "NVFP4", "dynamic": True, "ignore_steps": [0]},
         attention_config={"backend": backend},
     )
     config = DiffusionPipelineConfig.from_pretrained(str(tmp_path), args=args, device="cpu")
@@ -145,7 +145,7 @@ def test_attention_only_steps_create_component_metadata(tmp_path, backend):
             "quant_attention_config": {
                 "qk_dtype": "fp8" if backend == "CUDNN" else "nvfp4",
                 "v_dtype": "fp8",
-                "ignored_steps": [0],
+                "ignore_steps": [0],
             },
         },
     )
@@ -155,7 +155,7 @@ def test_attention_only_steps_create_component_metadata(tmp_path, backend):
     assert primary.attention_metadata_state is not None
     assert secondary.attention_metadata_state is not None
     assert primary.attention_metadata_state is not secondary.attention_metadata_state
-    assert not getattr(primary.quant_config, "ignored_steps", [])
+    assert not getattr(primary.quant_config, "ignore_steps", [])
 
 
 @pytest.mark.cpu_only

@@ -599,18 +599,18 @@ def generate_visual_gen_schema() -> dict:
 
     schema = _schema_for(VisualGenArgs)
     # ModelOpt dictionaries remain extensible, but their diffusion step selector
-    # has the same constraint as the typed DiffusionQuantConfig branch.
+    # has the same constraint as the typed LinearQuantConfig branch.
     quant_config = schema["properties"]["quant_config"]
     for branch in quant_config.get("anyOf", []):
         if branch.get("type") == "object" and branch.get("additionalProperties") is True:
-            branch.setdefault("properties", {})["ignored_steps"] = {
+            branch.setdefault("properties", {})["ignore_steps"] = {
                 "type": "array",
                 "items": {"type": "integer", "minimum": 0},
             }
     nonempty_steps = {
         "type": "object",
-        "required": ["ignored_steps"],
-        "properties": {"ignored_steps": {"type": "array", "minItems": 1}},
+        "required": ["ignore_steps"],
+        "properties": {"ignore_steps": {"type": "array", "minItems": 1}},
     }
     linear_steps = {
         "required": ["quant_config"],

@@ -29,21 +29,17 @@ from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
 from tensorrt_llm._torch.visual_gen.quantization.quant_dispatcher import (
     install_linear_quant_dispatcher,
 )
-from tensorrt_llm.visual_gen.args import (
-    AttentionConfig,
-    DiffusionQuantConfig,
-    QuantAttentionConfig,
-    VisualGenArgs,
-)
+from tensorrt_llm.visual_gen import LinearQuantConfig
+from tensorrt_llm.visual_gen.args import AttentionConfig, QuantAttentionConfig, VisualGenArgs
 
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("steps", [[-1], [True], [1.5], ["1"], "0,1", None])
 def test_quant_ignore_config_validation(steps: object) -> None:
     for factory in (
-        lambda: DiffusionQuantConfig(ignored_steps=steps),
-        lambda: QuantAttentionConfig(ignored_steps=steps),
-        lambda: VisualGenArgs(quant_config={"quant_algo": "NVFP4", "ignored_steps": steps}),
+        lambda: LinearQuantConfig(ignore_steps=steps),
+        lambda: QuantAttentionConfig(ignore_steps=steps),
+        lambda: VisualGenArgs(quant_config={"quant_algo": "NVFP4", "ignore_steps": steps}),
     ):
         with pytest.raises(ValidationError):
             factory()
@@ -52,41 +48,41 @@ def test_quant_ignore_config_validation(steps: object) -> None:
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "mode",
-    ["block", "linear_quant_ignored_steps", "attention_quant_ignored_steps", "independent_steps"],
+    ["block", "linear_quant_ignore_steps", "attention_quant_ignore_steps", "independent_steps"],
 )
 def test_quant_ignore_config_yaml_roundtrip(tmp_path: Path, mode: str) -> None:
     linear_ignore = ["blocks.0.ffn.*"] if mode == "block" else []
     attention_ignore = ["blocks.1.attn1"] if mode == "block" else []
-    linear_quant_ignored_steps = (
-        [0, 19] if mode in ("linear_quant_ignored_steps", "independent_steps") else []
+    linear_quant_ignore_steps = (
+        [0, 19] if mode in ("linear_quant_ignore_steps", "independent_steps") else []
     )
-    attention_quant_ignored_steps = (
-        [1, 18] if mode in ("attention_quant_ignored_steps", "independent_steps") else []
+    attention_quant_ignore_steps = (
+        [1, 18] if mode in ("attention_quant_ignore_steps", "independent_steps") else []
     )
     path = tmp_path / "quant_ignore.yaml"
     path.write_text(
         "quant_config:\n  quant_algo: NVFP4\n  dynamic: true\n"
-        f"  ignore: {linear_ignore}\n  ignored_steps: {linear_quant_ignored_steps}\n"
+        f"  ignore: {linear_ignore}\n  ignore_steps: {linear_quant_ignore_steps}\n"
         "attention_config:\n  backend: FLASHINFER\n  quant_attention_config:\n"
         "    qk_dtype: nvfp4\n    v_dtype: fp8\n"
-        f"    ignore: {attention_ignore}\n    ignored_steps: {attention_quant_ignored_steps}\n"
+        f"    ignore: {attention_ignore}\n    ignore_steps: {attention_quant_ignore_steps}\n"
     )
     args = VisualGenArgs.from_yaml(path)
     recipe = args.attention_config.quant_attention_config
     assert recipe.ignore == attention_ignore
-    assert recipe.ignored_steps == attention_quant_ignored_steps
+    assert recipe.ignore_steps == attention_quant_ignore_steps
     quant, _, dynamic, activations = DiffusionPipelineConfig.load_diffusion_quant_config(
         args.quant_config
     )
     assert quant.exclude_modules == linear_ignore
-    assert quant.ignored_steps == linear_quant_ignored_steps
+    assert quant.ignore_steps == linear_quant_ignore_steps
     assert dynamic and activations
     assert VisualGenArgs.model_validate(args.model_dump()).model_dump() == args.model_dump()
 
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "linear_ignore,attention_ignore,linear_quant_ignored_steps,attention_quant_ignored_steps,typed",
+    "linear_ignore,attention_ignore,linear_quant_ignore_steps,attention_quant_ignore_steps,typed",
     [
         (["blocks.0.*"], [], [0], [], False),
         (["blocks.0.*"], [], [], [0], True),
@@ -101,21 +97,21 @@ def test_quant_ignore_config_yaml_roundtrip(tmp_path: Path, mode: str) -> None:
 def test_block_and_step_modes_are_globally_exclusive(
     linear_ignore: list[str],
     attention_ignore: list[str],
-    linear_quant_ignored_steps: list[int],
-    attention_quant_ignored_steps: list[int],
+    linear_quant_ignore_steps: list[int],
+    attention_quant_ignore_steps: list[int],
     typed: bool,
 ) -> None:
     quant = (
-        DiffusionQuantConfig(
+        LinearQuantConfig(
             quant_algo="NVFP4",
             exclude_modules=linear_ignore,
-            ignored_steps=linear_quant_ignored_steps,
+            ignore_steps=linear_quant_ignore_steps,
         )
         if typed
         else {
             "quant_algo": "NVFP4",
             "ignore": linear_ignore,
-            "ignored_steps": linear_quant_ignored_steps,
+            "ignore_steps": linear_quant_ignore_steps,
         }
     )
     config = dict(
@@ -126,12 +122,12 @@ def test_block_and_step_modes_are_globally_exclusive(
                 "qk_dtype": "nvfp4",
                 "v_dtype": "fp8",
                 "ignore": attention_ignore,
-                "ignored_steps": attention_quant_ignored_steps,
+                "ignore_steps": attention_quant_ignore_steps,
             },
         },
     )
     if (linear_ignore or attention_ignore) and (
-        linear_quant_ignored_steps or attention_quant_ignored_steps
+        linear_quant_ignore_steps or attention_quant_ignore_steps
     ):
         with pytest.raises(ValidationError, match="mutually exclusive"):
             VisualGenArgs(**config)
@@ -143,8 +139,8 @@ def test_block_and_step_modes_are_globally_exclusive(
 @pytest.mark.parametrize(
     "config",
     [
-        {"quant_algo": "NVFP4", "dynamic": False, "ignored_steps": [0]},
-        {"ignored_steps": [0]},
+        {"quant_algo": "NVFP4", "dynamic": False, "ignore_steps": [0]},
+        {"ignore_steps": [0]},
     ],
 )
 def test_linear_steps_require_load_time_quantization(config: dict[str, object]) -> None:
@@ -167,27 +163,27 @@ def test_linear_steps_require_load_time_quantization(config: dict[str, object]) 
     ],
 )
 def test_linear_step_quant_algo_support_is_validated_by_loader(algo: str, typed: bool) -> None:
-    config = {"quant_algo": algo, "ignored_steps": [0]}
-    quant = DiffusionQuantConfig(**config) if typed else config
+    config = {"quant_algo": algo, "ignore_steps": [0]}
+    quant = LinearQuantConfig(**config) if typed else config
     VisualGenArgs(quant_config=quant)
     parsed, _, dynamic, _ = DiffusionPipelineConfig.load_diffusion_quant_config(config)
     assert parsed.quant_algo == algo
-    assert parsed.ignored_steps == [0]
+    assert parsed.ignore_steps == [0]
     assert dynamic
 
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("attention_only", [False, True])
-def test_ignored_steps_reject_diffusion_caching(attention_only: bool) -> None:
+def test_ignore_steps_reject_diffusion_caching(attention_only: bool) -> None:
     config = (
         {
             "attention_config": {
                 "backend": "CUTEDSL",
-                "quant_attention_config": {"ignored_steps": [0]},
+                "quant_attention_config": {"ignore_steps": [0]},
             }
         }
         if attention_only
-        else {"quant_config": {"quant_algo": "NVFP4", "dynamic": True, "ignored_steps": [0]}}
+        else {"quant_config": {"quant_algo": "NVFP4", "dynamic": True, "ignore_steps": [0]}}
     )
     with pytest.raises(ValidationError, match="diffusion step caching"):
         VisualGenArgs(
@@ -197,10 +193,10 @@ def test_ignored_steps_reject_diffusion_caching(attention_only: bool) -> None:
 
 
 @pytest.mark.cpu_only
-def test_linear_ignored_steps_reject_runtime_lora() -> None:
+def test_linear_ignore_steps_reject_runtime_lora() -> None:
     with pytest.raises(ValidationError, match="runtime LoRA fusion"):
         VisualGenArgs(
-            quant_config={"quant_algo": "NVFP4", "dynamic": True, "ignored_steps": [0]},
+            quant_config={"quant_algo": "NVFP4", "dynamic": True, "ignore_steps": [0]},
             runtime_lora_config={"path": "adapter.safetensors"},
         )
 
@@ -208,11 +204,11 @@ def test_linear_ignored_steps_reject_runtime_lora() -> None:
 @pytest.mark.cpu_only
 def test_attention_steps_do_not_require_linear_quantization_or_restrict_lora() -> None:
     args = VisualGenArgs(
-        attention_config={"backend": "CUTEDSL", "quant_attention_config": {"ignored_steps": [0]}},
+        attention_config={"backend": "CUTEDSL", "quant_attention_config": {"ignore_steps": [0]}},
         runtime_lora_config={"path": "adapter.safetensors"},
     )
     assert args.quant_config is None or args.quant_config.quant_algo is None
-    assert args.attention_config.quant_attention_config.ignored_steps == [0]
+    assert args.attention_config.quant_attention_config.ignore_steps == [0]
 
 
 @pytest.mark.cpu_only
@@ -265,8 +261,8 @@ def test_block_quant_ignore_routes(component: str) -> None:
 def test_step_quant_ignore_routes(component: str) -> None:
     torch.manual_seed(42)
     model = ToyDiT(
-        linear_quant_ignored_steps=(1,) if component == "linear" else (),
-        attention_quant_ignored_steps=(1,) if component == "attention" else (),
+        linear_quant_ignore_steps=(1,) if component == "linear" else (),
+        attention_quant_ignore_steps=(1,) if component == "attention" else (),
         quantized_linear=component == "linear",
         quantized_attention=component == "attention",
     )
@@ -292,7 +288,7 @@ def test_step_quant_ignore_routes(component: str) -> None:
 def test_linear_quant_ignore_uses_original_bf16_weight(
     output_slice: tuple[int, int] | None,
 ) -> None:
-    model = ToyDiT(linear_quant_ignored_steps=(1,), quantized_attention=False)
+    model = ToyDiT(linear_quant_ignore_steps=(1,), quantized_attention=False)
     layer = model.blocks[0].linear
     layer.bias = torch.nn.Parameter(torch.randn(128, dtype=torch.bfloat16), requires_grad=False)
     method = layer.quant_method
@@ -338,7 +334,7 @@ def test_linear_quant_ignore_uses_original_bf16_weight(
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("backend", ["default", "low_m", "cute_dsl", "cublas"])
 def test_bf16_linear_backend_dispatch(backend: str) -> None:
-    model = ToyDiT(linear_quant_ignored_steps=(1,), quantized_attention=False)
+    model = ToyDiT(linear_quant_ignore_steps=(1,), quantized_attention=False)
     layer = model.blocks[0].linear
     layer.use_cute_dsl_bf16_gemm = backend == "cute_dsl"
     layer.use_custom_cublas_mm = backend == "cublas"
@@ -368,7 +364,7 @@ def test_bf16_linear_backend_dispatch(backend: str) -> None:
 def test_attention_quant_ignore_preserves_backend_contract() -> None:
     from tensorrt_llm._torch.visual_gen.attention.backends.parallel import RingAttention
 
-    model = ToyDiT(attention_quant_ignored_steps=(1,), quantized_linear=False)
+    model = ToyDiT(attention_quant_ignore_steps=(1,), quantized_linear=False)
     backend = model.blocks[0].attention.attn
     assert isinstance(backend, AttentionQuantDispatcher)
     assert type(backend.unquantized) is type(backend.quantized) is ToyAttentionBackend
@@ -404,7 +400,7 @@ def test_attention_quant_ignore_preserves_backend_contract() -> None:
 @pytest.mark.cpu_only
 def test_missing_quant_ignore_state_or_unquantized_weight_is_rejected() -> None:
     config = AttentionConfig(
-        backend="CUTEDSL", quant_attention_config=QuantAttentionConfig(ignored_steps=[0])
+        backend="CUTEDSL", quant_attention_config=QuantAttentionConfig(ignore_steps=[0])
     )
     with pytest.raises(ValueError, match="per-component attention state"):
         create_attention(

@@ -489,16 +489,16 @@ def test_config_validation(
     ],
 )
 @pytest.mark.parametrize("attention", [False, True])
-def test_visual_gen_ignored_steps_schema(schemas, steps, valid, attention):
+def test_visual_gen_ignore_steps_schema(schemas, steps, valid, attention):
     config = (
         {
             "attention_config": {
                 "backend": "CUTEDSL",
-                "quant_attention_config": {"ignored_steps": steps},
+                "quant_attention_config": {"ignore_steps": steps},
             }
         }
         if attention
-        else {"quant_config": {"quant_algo": "NVFP4", "dynamic": True, "ignored_steps": steps}}
+        else {"quant_config": {"quant_algo": "NVFP4", "dynamic": True, "ignore_steps": steps}}
     )
     errors = list(Draft202012Validator(schemas[generator.VISUAL_GEN_SCHEMA]).iter_errors(config))
     assert (not errors) == valid, [error.message for error in errors]
@@ -516,7 +516,7 @@ def test_visual_gen_block_and_step_modes_are_globally_exclusive(
         "quant_config": {
             "quant_algo": "NVFP4",
             ignore_field: linear_ignore,
-            "ignored_steps": linear_steps,
+            "ignore_steps": linear_steps,
         },
         "attention_config": {
             "backend": "FLASHINFER",
@@ -524,7 +524,7 @@ def test_visual_gen_block_and_step_modes_are_globally_exclusive(
                 "qk_dtype": "nvfp4",
                 "v_dtype": "fp8",
                 "ignore": attention_ignore,
-                "ignored_steps": attention_steps,
+                "ignore_steps": attention_steps,
             },
         },
     }
@@ -542,7 +542,7 @@ def test_visual_gen_attention_steps_allow_static_linear_weights_and_lora(schemas
             "quant_attention_config": {
                 "qk_dtype": "nvfp4",
                 "v_dtype": "fp8",
-                "ignored_steps": [0, 1],
+                "ignore_steps": [0, 1],
             },
         },
     }
@@ -554,13 +554,13 @@ def test_visual_gen_attention_steps_allow_static_linear_weights_and_lora(schemas
 def test_visual_gen_quant_ignore_cache_combinations(schemas, steps, valid, attention):
     config = {
         "cache_config": {"cache_backend": "teacache"},
-        "quant_config": {"quant_algo": "NVFP4", "ignored_steps": steps},
+        "quant_config": {"quant_algo": "NVFP4", "ignore_steps": steps},
     }
     if attention:
         config.pop("quant_config")
         config["attention_config"] = {
             "backend": "CUTEDSL",
-            "quant_attention_config": {"ignored_steps": steps},
+            "quant_attention_config": {"ignore_steps": steps},
         }
     errors = list(Draft202012Validator(schemas[generator.VISUAL_GEN_SCHEMA]).iter_errors(config))
     assert (not errors) == valid, [error.message for error in errors]
@@ -569,31 +569,31 @@ def test_visual_gen_quant_ignore_cache_combinations(schemas, steps, valid, atten
 @pytest.mark.parametrize(
     "quant,lora,valid",
     [
-        ({"quant_algo": "NVFP4", "ignored_steps": []}, True, True),
-        ({"quant_algo": "NVFP4", "ignored_steps": [0]}, True, False),
-        ({"quant_algo": "NVFP4", "ignored_steps": [0]}, False, True),
-        ({"quant_algo": "NVFP4", "dynamic": False, "ignored_steps": [0]}, False, False),
-        ({"quant_algo": "NVFP4", "dynamic": True, "ignored_steps": [0]}, False, True),
-        ({"quant_algo": "W4A16_AWQ", "dynamic": True, "ignored_steps": [0]}, False, True),
-        ({"quant_algo": "W4A8_AWQ", "dynamic": True, "ignored_steps": [0]}, False, True),
-        ({"quant_algo": "W8A8_SQ_PER_CHANNEL", "dynamic": True, "ignored_steps": [0]}, False, True),
-        ({"quant_algo": "W4A16_AWQ", "dynamic": False, "ignored_steps": [0]}, False, False),
-        ({"quant_algo": "FP8_BLOCK_SCALES", "ignored_steps": [0]}, False, True),
-        ({"quant_algo": "FP8_PER_CHANNEL_PER_TOKEN", "ignored_steps": [0]}, False, True),
+        ({"quant_algo": "NVFP4", "ignore_steps": []}, True, True),
+        ({"quant_algo": "NVFP4", "ignore_steps": [0]}, True, False),
+        ({"quant_algo": "NVFP4", "ignore_steps": [0]}, False, True),
+        ({"quant_algo": "NVFP4", "dynamic": False, "ignore_steps": [0]}, False, False),
+        ({"quant_algo": "NVFP4", "dynamic": True, "ignore_steps": [0]}, False, True),
+        ({"quant_algo": "W4A16_AWQ", "dynamic": True, "ignore_steps": [0]}, False, True),
+        ({"quant_algo": "W4A8_AWQ", "dynamic": True, "ignore_steps": [0]}, False, True),
+        ({"quant_algo": "W8A8_SQ_PER_CHANNEL", "dynamic": True, "ignore_steps": [0]}, False, True),
+        ({"quant_algo": "W4A16_AWQ", "dynamic": False, "ignore_steps": [0]}, False, False),
+        ({"quant_algo": "FP8_BLOCK_SCALES", "ignore_steps": [0]}, False, True),
+        ({"quant_algo": "FP8_PER_CHANNEL_PER_TOKEN", "ignore_steps": [0]}, False, True),
         (
             {
                 "quant_algo": "FP8",
                 "dynamic": False,
                 "config_groups": {"group_0": {"weights": {"dynamic": True}}},
-                "ignored_steps": [0],
+                "ignore_steps": [0],
             },
             False,
             True,
         ),
-        ({"ignored_steps": [0]}, False, False),
-        ({"quant_algo": None, "ignored_steps": [0]}, False, False),
-        ({"quant_algo": "", "ignored_steps": [0]}, False, False),
-        ({"quant_algo": 1, "ignored_steps": [0]}, False, False),
+        ({"ignore_steps": [0]}, False, False),
+        ({"quant_algo": None, "ignore_steps": [0]}, False, False),
+        ({"quant_algo": "", "ignore_steps": [0]}, False, False),
+        ({"quant_algo": 1, "ignore_steps": [0]}, False, False),
     ],
 )
 def test_visual_gen_linear_steps_require_quant_and_reject_lora(schemas, quant, lora, valid):
@@ -622,7 +622,7 @@ def test_visual_gen_grouped_linear_steps_require_dynamic_weights(
             "quant_algo": "FP8",
             "dynamic": True,
             "config_groups": {"group_0": group_config},
-            "ignored_steps": steps,
+            "ignore_steps": steps,
         }
     }
     errors = list(Draft202012Validator(schemas[generator.VISUAL_GEN_SCHEMA]).iter_errors(config))
