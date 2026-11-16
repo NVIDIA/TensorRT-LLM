@@ -1539,7 +1539,17 @@ class PrimsTSFmha(PhasedFmha):
                 mask_type=mask,
                 store_softmax_stats=stats is not None,
             )
-            wrapper.plan(**plan_kwargs, softmax_scale=softmax_scale, output_scale=output_scale)
+            # Planning needs only the scale operand kinds. Do not retain views
+            # of the profiling workspace; every run supplies its current scales.
+            wrapper.plan(
+                **plan_kwargs,
+                softmax_scale=torch.empty_like(softmax_scale)
+                if isinstance(softmax_scale, torch.Tensor)
+                else softmax_scale,
+                output_scale=torch.empty_like(output_scale)
+                if isinstance(output_scale, torch.Tensor)
+                else output_scale,
+            )
             self._mla_context_plan_profiles.add(
                 _MlaContextPlan(
                     **plan_kwargs,

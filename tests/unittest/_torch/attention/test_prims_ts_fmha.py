@@ -395,12 +395,12 @@ def test_mla_context_rejects_unsupported_geometry(overrides: dict, expected_reas
 @pytest.mark.parametrize(
     "mask,store_stats,kv_len,spec_flags,helix",
     [
-        (PredefinedAttentionMask.CAUSAL, False, 4, (True, False), False),
+        (PredefinedAttentionMask.CAUSAL, False, 4, (True, False), True),
         (PredefinedAttentionMask.CAUSAL, True, 4, (False, True), True),
         (PredefinedAttentionMask.FULL, True, 4, (True, True), False),
         (PredefinedAttentionMask.FULL, True, 0, (True, True), True),
     ],
-    ids=["fresh", "final-chunk", "cached-chunk", "empty-cached-chunk"],
+    ids=["fresh-helix-mixed", "final-chunk", "cached-chunk", "empty-cached-chunk"],
 )
 def test_supports_linear_mla_context(
     fp8: bool,
@@ -1521,10 +1521,16 @@ def test_mla_context_wrapper_reuses_plan_and_updates_chunk_offsets(
             assert softmax_scale.shape == (1,)
             assert softmax_scale.data_ptr() == bmm1_scale.data_ptr()
             assert output_scale.data_ptr() == bmm2_scale.data_ptr()
-            assert (
-                wrapper.plan.call_args.kwargs["softmax_scale"].data_ptr() == bmm1_scale.data_ptr()
-            )
-            assert wrapper.plan.call_args.kwargs["output_scale"].data_ptr() == bmm2_scale.data_ptr()
+            for name, runtime_scale in (
+                ("softmax_scale", softmax_scale),
+                ("output_scale", output_scale),
+            ):
+                planned_scale = wrapper.plan.call_args.kwargs[name]
+                assert planned_scale.shape == runtime_scale.shape
+                assert planned_scale.dtype == runtime_scale.dtype
+                assert planned_scale.device == runtime_scale.device
+                assert planned_scale.untyped_storage().data_ptr() != workspace.data_ptr()
+                assert planned_scale.untyped_storage().nbytes() == runtime_scale.element_size()
         else:
             assert softmax_scale == pytest.approx(fmha._get_bmm1_scale(attn))
             assert output_scale == 1.0
@@ -2369,15 +2375,17 @@ def test_mla_eager_wrapper_plans_once_and_reads_live_fixed_metadata(
     wrapper_factory.assert_called_once_with()
     wrapper.plan.assert_called_once()
     assert wrapper.run.call_count == 2
+    run_kwargs = wrapper.run.call_args.kwargs
     assert run_kwargs["block_tables"].data_ptr() == block_tables.data_ptr()
     assert run_kwargs["block_tables"].stride() == (6, 1)
     torch.testing.assert_close(
         run_kwargs["block_tables"],
         torch.tensor([[20, 21, 22], [23, 24, 25]], dtype=torch.int32),
     )
+    assert run_kwargs["seq_lens_kv"].data_ptr() == sequence_lengths.data_ptr()
     torch.testing.assert_close(run_kwargs["seq_lens_kv"], sequence_lengths)
     if helix:
-        torch.testing.assert_close(wrapper.run.call_args.kwargs["kv_bounds"], expected_bounds)
+        torch.testing.assert_close(run_kwargs["kv_bounds"], expected_bounds)
     assert fmha._mla_decode_wrappers[(2, query_width)] is wrapper
     assert len(fmha._mla_decode_plan_profiles) == 1
     assert asdict(next(iter(fmha._mla_decode_plan_profiles))) == {

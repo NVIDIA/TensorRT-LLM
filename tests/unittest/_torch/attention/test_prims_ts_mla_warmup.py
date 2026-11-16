@@ -158,7 +158,24 @@ def test_context_profiles_respect_staging_and_cache_modes() -> None:
 
 
 @pytest.fixture
-def planners(monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleNamespace]:
+def planners(
+    monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> Iterator[SimpleNamespace]:
+    original_modules = {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "tensorrt_llm" or name.startswith("tensorrt_llm.")
+    }
+
+    def restore_modules() -> None:
+        monkeypatch.undo()
+        for name in tuple(sys.modules):
+            if name == "tensorrt_llm" or name.startswith("tensorrt_llm."):
+                if name not in original_modules:
+                    del sys.modules[name]
+        sys.modules.update(original_modules)
+
+    request.addfinalizer(restore_modules)
     for name in (
         "tensorrt_llm",
         "tensorrt_llm._torch",

@@ -5,6 +5,7 @@
 import gc
 import math
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -472,7 +473,7 @@ def test_offloaded_layer_reads_the_sparse_cache_arena(monkeypatch):
     torch.testing.assert_close(got, ref, rtol=2e-2, atol=2e-2)
 
 
-def test_reloaded_kernel_accepts_the_same_launch():
+def test_reloaded_kernel_accepts_the_same_launch(monkeypatch):
     """A kernel reloaded from the persistent compile cache runs the adapter's launch.
 
     CI processes always compile cold, while every later process (and
@@ -495,6 +496,8 @@ def test_reloaded_kernel_accepts_the_same_launch():
     def run_fresh_plan() -> torch.Tensor:
         wrapper = mla_decode.BatchSparseMLADecodePagedTSWrapper()
         wrapper.plan(device, rows, heads, max_topk=topk, max_extra_topk=extra_topk)
+        prepared_run = Mock(wraps=wrapper._run_prepared)
+        monkeypatch.setattr(wrapper, "_run_prepared", prepared_run)
         out = torch.empty(rows, 1, heads, LATENT, dtype=torch.bfloat16, device=device)
         wrapper.run(
             query,
@@ -523,6 +526,7 @@ def test_reloaded_kernel_accepts_the_same_launch():
             validate=False,
         )
         torch.cuda.synchronize()
+        prepared_run.assert_called_once()
         torch.testing.assert_close(prepared_out, out, rtol=0, atol=0)
         return out
 

@@ -298,6 +298,8 @@ class PhasedFmha(Fmha):
 
         Args:
             q, k, v: The call's inputs [num_tokens, ...], context tokens first; k / v None with fused QKV.
+                MLA calls contain only one phase; expanded context K/V may include a cached prefix
+                or chunk whose row count differs from Q.
             metadata: The context phase is its first num_contexts sequences and num_ctx_tokens tokens.
             forward_args: The call's arguments; its output [num_tokens, ...] is written.
             workspace: The call's attention workspace.
