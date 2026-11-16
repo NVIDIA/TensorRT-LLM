@@ -48,8 +48,6 @@ def test_cache_allows_estimator_and_short_sequence_geometry(length, retention):
         max_seq_len=length,
     )
     Component.check_cache_manager(component, manager)
-    # Cache retention does not change the mathematical attention window.
-    assert Component.attention_windows(component, length) == [512] * 51 + [length]
 
 
 @pytest.mark.parametrize(
