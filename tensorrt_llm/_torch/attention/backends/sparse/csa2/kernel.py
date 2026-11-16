@@ -148,11 +148,12 @@ def _glue_kernels():
 
     @cute.jit
     def tensor1d(ptr: cute.Pointer, count: Int64):
-        return cute.make_tensor(ptr, cute.make_layout(count))
+        # Keep offsets beyond 2 GiB in 64 bits on CuTe DSL builds with 32-bit default strides.
+        return cute.make_tensor(ptr, cute.make_layout(count, stride=Int64(1)))
 
     @cute.jit
     def tensor2d(ptr: cute.Pointer, rows: Int64, cols: Int64, row_stride: Int64):
-        return cute.make_tensor(ptr, cute.make_layout((rows, cols), stride=(row_stride, 1)))
+        return cute.make_tensor(ptr, cute.make_layout((rows, cols), stride=(row_stride, Int64(1))))
 
     @cute.jit
     def _int32_ptr(address: Int64):
@@ -7692,13 +7693,22 @@ def _mapping_args(main_mapping, main_slots, main_logical, count: int, device):
     ``(page_table, page_size, max_positions, requests, visible)``; otherwise
     ``main_slots`` already hold physical rows.
     """
+    from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
+
     identity = _constant_zeros(device, (1, 1), torch.int32)
     if main_mapping is None:
         _check(main_slots is not None, "CSA2 staging requires physical main slots or a mapping")
         slots = main_slots if main_slots.dtype == torch.int64 else main_slots.long()
         logical = main_logical if main_logical is not None else slots
         table_args = (_ptr(identity), 1, 1, 1, 1, 2**62)
-        zeros = _constant_zeros(device, (count,), torch.int64)
+        # Pooled rather than a constant per shape: the row count changes from step to step.
+        zeros = get_memory_buffers().get_buffer(
+            [count],
+            torch.int64,
+            buffer_name="csa2_unmapped_rows",
+            reserve_buffer=torch.cuda.is_current_stream_capturing(),
+        )
+        zeros.zero_()
         return (
             True,
             logical,
