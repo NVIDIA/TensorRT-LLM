@@ -13,7 +13,7 @@ from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
 from tensorrt_llm._torch.peft.lora.ownership import DecoderLoraOwner
 from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
-from tensorrt_llm._utils import release_gc
+from tensorrt_llm._utils import is_blackwell_datacenter, release_gc
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor, create_input_processor
 from tensorrt_llm.llmapi.llm_args import (
     DecodingBaseConfig,
@@ -87,6 +87,18 @@ def _spec_decode_fast_paths(model: torch.nn.Module) -> bool:
         except NotImplementedError:
             return False
     return bool(getattr(model, "spec_decode_fast_paths", False))
+
+
+def _steady_decode_prepare(model: torch.nn.Module) -> bool:
+    """Whether the language model opts into ``steady_decode_prepare`` (SM100/SM103 only)."""
+    if not is_blackwell_datacenter():
+        return False
+    if isinstance(model, MultimodalModelMixin):
+        try:
+            model = model.language_model
+        except NotImplementedError:
+            return False
+    return bool(getattr(model, "steady_decode_prepare", False))
 
 
 # Refit only needs the compile wrapper removed before weights are loaded: the
@@ -586,6 +598,7 @@ class ModelEngine:
             spec_decode_fast_paths=self.spec_decode_fast_paths,
             watermark_config=self.llm_args.watermark_config,
             is_disagg=is_disagg_enabled(self.llm_args.cache_transceiver_config),
+            steady_decode_prepare=_steady_decode_prepare(self.model),
             **extra_fields,
         )
 
@@ -656,6 +669,11 @@ class ModelEngine:
     def cuda_graph_padding_enabled(self) -> bool:
         """Return whether decode graph batches are padded to capture sizes."""
         return self._cuda_graph_padding_enabled
+
+    @property
+    def steady_mtp_reads_output_rows(self) -> bool:
+        """Whether the steady MTP prepare reads the previous step's output rows (``steady_decode_prepare``)."""
+        return isinstance(self._runner, DecoderRunner) and self._runner.steady_mtp_reads_output_rows
 
     @property
     def _dspark_confidence_enabled(self) -> bool:
