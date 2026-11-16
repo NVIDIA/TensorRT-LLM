@@ -277,6 +277,7 @@ def test_breakable_prefill_replays_multimodal_batches_only_with_staged_inputs(
         lists=SimpleNamespace(multimodal_params_list=[object()] if multimodal else []),
     )
     attn_metadata = SimpleNamespace(padded_num_tokens=None)
+    incoming_flag = get_per_request_prefill_cuda_graph_flag()
     try:
         preparer._pad_inputs(
             host,
@@ -291,7 +292,7 @@ def test_breakable_prefill_replays_multimodal_batches_only_with_staged_inputs(
         assert attn_metadata.padded_num_tokens == (8 if replays else None)
         assert get_per_request_prefill_cuda_graph_flag() is replays
     finally:
-        set_per_request_prefill_cuda_graph_flag(False)
+        set_per_request_prefill_cuda_graph_flag(incoming_flag)
 
 
 @pytest.mark.cpu_only

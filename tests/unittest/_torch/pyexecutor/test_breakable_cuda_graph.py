@@ -887,6 +887,49 @@ def test_runner_prepared_inputs_refresh_owned_nested_storage(monkeypatch):
     assert replay_calls == [4, 4]
 
 
+def test_runner_prepared_inputs_keep_one_staged_copy_per_bucket(monkeypatch):
+    """Two buckets keep their own staged inputs: alternate replays read each bucket's values."""
+    body = _PreparedBody().cuda()
+    runner = BreakableCUDAGraphRunner(body, prepare_inputs=lambda inputs: inputs)
+    inputs = {}
+
+    def set_inputs(num_tokens, value):
+        def full(offset):
+            return torch.full((num_tokens, 4), float(value + offset), device="cuda")
+
+        inputs.update(value=full(0), config={"features": [full(1)], "offset": (full(2),)})
+        inputs.update(extra=full(3))
+
+    def engine_forward():
+        if runner.is_capturing:
+            return runner.capture_model_body(lambda: body(**inputs))
+        return body(**inputs)
+
+    for num_tokens in (8, 4):
+        set_inputs(num_tokens, 0)
+        runner.capture(num_tokens, engine_forward)
+    calls_after_capture = body.forward_calls
+    replay_calls = []
+    original_replay = runner.replay
+
+    def replay(num_tokens):
+        replay_calls.append(num_tokens)
+        return original_replay(num_tokens)
+
+    monkeypatch.setattr(runner, "replay", replay)
+    steps = [(8, 5), (4, 11), (8, 17), (4, 23)]
+    for num_tokens, value in steps:
+        set_inputs(num_tokens, value)
+        actual = runner.execute(num_tokens, engine_forward)
+        torch.cuda.synchronize()
+
+        # value + offset + feature + extra
+        expected = torch.full((num_tokens, 4), 4.0 * value + 6, device="cuda")
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert body.forward_calls == calls_after_capture
+    assert replay_calls == [num_tokens for num_tokens, _ in steps]
+
+
 @pytest.mark.parametrize(
     "change", ["shape", "dtype", "optional", "list_length", "list_type", "scalar", "owner"]
 )

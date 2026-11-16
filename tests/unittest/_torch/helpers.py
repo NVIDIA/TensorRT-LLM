@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Dict, Optional, Tuple
+from types import SimpleNamespace
+from typing import Callable, Dict, List, Optional, Tuple
 
 import pytest
 import torch
@@ -266,6 +267,77 @@ def create_mock_cuda_graph_runner(
                                    static_input_ids=static_input_ids,
                                    static_position_ids=static_position_ids)
     return CUDAGraphRunner(config)
+
+
+def check_breakable_prefill_replay(model: torch.nn.Module, extra_attrs: dict,
+                                   forward: Callable[[dict], torch.Tensor],
+                                   steps: List[dict], num_tokens: int) -> None:
+    """Capture the language-model body of a multimodal model for one breakable
+    prefill bucket on ``steps[0]``, then replay it on each later step.
+
+    ``forward(inputs)`` runs the outer forward on one step's inputs. Each step
+    must change the eager output, and each replay must run the captured graph
+    and match the eager output exactly.
+    """
+    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import \
+        DecoderRunner
+    from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
+    from tensorrt_llm._torch.utils import model_extra_attrs
+    from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
+
+    backend = PrefillCudaGraphBackend.BREAKABLE
+    # The engine's startup check accepts the model only when its language model opts in.
+    engine = object.__new__(ModelEngine)
+    engine.model = model
+    engine.mapping = SimpleNamespace(pp_size=1)
+    engine.llm_args = SimpleNamespace(prefill_cuda_graph_backend=backend,
+                                      disable_mm_encoder=False)
+    engine._validate_breakable_cuda_graph_compatibility()
+    decoder_runner = object.__new__(DecoderRunner)
+    decoder_runner._model = model
+    decoder_runner._config = SimpleNamespace(
+        prefill_cuda_graph_backend=backend,
+        prefill_cuda_graph_num_tokens=[num_tokens])
+    runner = decoder_runner._initialize_breakable_cuda_graph_runner()
+    assert runner.stages_inputs
+    replay_calls = []
+    replay = runner.replay
+
+    def counted_replay(replay_num_tokens):
+        replay_calls.append(replay_num_tokens)
+        return replay(replay_num_tokens)
+
+    runner.replay = counted_replay
+
+    def fresh(inputs):
+        # Bodies add residuals into inputs_embeds in place; give each call its own tensors.
+        return {
+            key: value.clone() if isinstance(value, torch.Tensor) else value
+            for key, value in inputs.items()
+        }
+
+    current = fresh(steps[0])
+
+    def engine_forward():
+        if runner.is_capturing:
+            return runner.capture_model_body(lambda: forward(current))
+        return forward(current)
+
+    with model_extra_attrs(extra_attrs):
+        try:
+            assert runner.capture(num_tokens, engine_forward)
+            previous = forward(fresh(steps[0]))
+            for index, inputs in enumerate(steps[1:], start=1):
+                expected = forward(fresh(inputs))
+                assert not torch.equal(expected, previous)
+                previous = expected
+                current = fresh(inputs)
+                actual = runner.execute(num_tokens, engine_forward)
+                torch.cuda.synchronize()
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                assert replay_calls == [num_tokens] * index
+        finally:
+            runner.clear()
 
 
 def make_hf_hybrid_cache_for_tests(
