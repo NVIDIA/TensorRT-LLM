@@ -99,7 +99,7 @@ class MultimodalEncoder(_TorchLLM):
 
         Args:
             inputs (tensorrt_llm.inputs.data.PromptInputs, Sequence[tensorrt_llm.inputs.data.PromptInputs]): The prompt text or token ids.
-                It can be single prompt or batched prompts.
+                It can be single prompt or batched prompts. See `generate_async` for inputs with no prompt.
         Returns:
             Union[tensorrt_llm.llmapi.RequestOutput, List[tensorrt_llm.llmapi.RequestOutput]]: The output data of the completion request to the LLM.
         """
@@ -111,7 +111,10 @@ class MultimodalEncoder(_TorchLLM):
         if unbatched:
             inputs = [inputs]
 
-        inputs = [prompt_inputs(i) for i in inputs]
+        # A dict may hold only multi_modal_data (see generate_async).
+        inputs = [
+            i if isinstance(i, dict) else prompt_inputs(i) for i in inputs
+        ]
 
         futures = []
         for request_inputs in inputs:
@@ -139,6 +142,15 @@ class MultimodalEncoder(_TorchLLM):
     ) -> RequestOutput:
         """Generate output for the given multimodal request in the asynchronous mode.
         Asynchronous generation accepts single multimodal request only.
+
+        For models whose input processor sets `supports_mm_item_handoff`, the
+        request may hold only `multi_modal_data` (and optionally
+        `mm_processor_kwargs` and `mm_item_order`), with no prompt. Each item is
+        then encoded as in a full request. The result carries one embedding
+        handle per item, in placeholder order (`mm_item_order`, else the order
+        of `multi_modal_data`), each with the item's metadata and hash, but no
+        prompt layout or mRoPE positions. A prefill worker builds those from the
+        real prompt and the item metadata.
 
         Returns:
             Future that resolves to tensorrt_llm.llmapi.RequestOutput containing mm_embeddings

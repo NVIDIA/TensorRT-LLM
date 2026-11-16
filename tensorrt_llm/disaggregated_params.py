@@ -155,6 +155,15 @@ class DisaggregatedParams:
                     "context_and_generation"
                 )
         if self.multimodal_embedding_handles is not None:
+            if self.multimodal_hashes is None:
+                item_hashes = [
+                    (handle.get("metadata") or {}).get("multimodal_hash")
+                    for handle in self.multimodal_embedding_handles
+                ]
+                if any(value is not None for value in item_hashes):
+                    if None in item_hashes:
+                        raise ValueError("Give a multimodal_hash for every item or for none")
+                    self.multimodal_hashes = item_hashes
             if self.multimodal_hashes is not None:
                 # if mm hashes are provided, kvcache reuse can be enabled
                 assert len(self.multimodal_embedding_handles) == len(self.multimodal_hashes), (
@@ -165,11 +174,20 @@ class DisaggregatedParams:
                     assert len(mm_hash) == 8, "mm_hash must be a list of 8 integers"
                     assert all(isinstance(x, int) for x in mm_hash), "mm_hash must contain integers"
             else:
-                # if user did not provide mm embedding handles, kvcache reuse will be disabled
+                # Fresh keys keep unrelated items from sharing KV blocks.
                 assert len(self.multimodal_embedding_handles) > 0, (
                     "multimodal_embedding_handles must be provided"
                 )
-                vals = np.random.randint(
-                    np.iinfo(np.int32).min, np.iinfo(np.int32).max, size=8, dtype=np.int32
-                ).tolist()
-                self.multimodal_hashes = [vals] * len(self.multimodal_embedding_handles)
+                self.multimodal_hashes = random_multimodal_hashes(
+                    len(self.multimodal_embedding_handles)
+                )
+
+
+def random_multimodal_hashes(num_items: int) -> List[List[int]]:
+    """One random hash (8 int32 values) per item, for items without a content hash.
+
+    Each item gets its own value, so two different items never share a hash.
+    """
+    return np.random.randint(
+        np.iinfo(np.int32).min, np.iinfo(np.int32).max, size=(num_items, 8), dtype=np.int32
+    ).tolist()

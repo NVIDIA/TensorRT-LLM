@@ -216,6 +216,12 @@ class BaseMultimodalInputProcessor(ABC):
     # inputs to `call_with_token_ids` instead of detokenizing upstream.
     supports_token_id_mm_expansion: ClassVar[bool] = False
 
+    # Whether each media item is processed on its own: its encoder input and
+    # output do not depend on the prompt text or on the other items. When
+    # True, the standalone encoder takes `multi_modal_data` with no prompt and
+    # builds a prompt with one placeholder per item (`get_mm_items_prompt`).
+    supports_mm_item_handoff: ClassVar[bool] = False
+
     # Whether the subclass takes `enable_tokenization_cache` in `__init__` and
     # uses `_init_tokenization_cache` and `_encode_with_tokenization_cache`.
     supports_tokenization_cache: ClassVar[bool] = False
@@ -644,11 +650,40 @@ class BaseMultimodalInputProcessor(ABC):
         """Whether the selected input path needs caller-supplied media markers."""
         if tokenized and self.supports_token_id_mm_expansion:
             return True
+        return MULTIMODAL_PLACEHOLDER_REGISTRY.get_content_format(
+            self._placeholder_model_type()) != ContentFormat.PASSTHROUGH
+
+    def _placeholder_model_type(self) -> str:
+        """The model type this processor's placeholders are registered under."""
         model_type = getattr(type(self), "_registered_model_type", None)
         if model_type is None:
             model_type = resolve_top_level_model_type(self.config)
-        return MULTIMODAL_PLACEHOLDER_REGISTRY.get_content_format(
-            model_type) != ContentFormat.PASSTHROUGH
+        return model_type
+
+    def get_mm_items_prompt(
+            self,
+            mm_data: Dict[str, Any],
+            mm_item_order: Optional[List[Dict[str, Any]]] = None) -> str:
+        """A prompt with one registered placeholder per item and no other text.
+
+        Items follow `mm_item_order` if given, else each modality in turn, in
+        the order of `mm_data`. Used to encode items without a prompt; needs
+        `supports_mm_item_handoff`.
+        """
+        if not self.supports_mm_item_handoff:
+            raise ValueError(
+                f"{type(self).__name__} needs a prompt to encode multimodal "
+                "data: its items are not processed independently.")
+        order = mm_item_order or [{
+            "modality": modality
+        } for modality, count in _mm_data_to_counts(mm_data).items()
+                                  for _ in range(count)]
+        model_type = self._placeholder_model_type()
+        prompt = ""
+        for entry in order:
+            prompt += MULTIMODAL_PLACEHOLDER_REGISTRY.get_placeholder(
+                model_type, entry["modality"])
+        return prompt
 
     def get_mm_token_ids(self) -> Optional[Tensor]:
         """Token IDs for a logical multimodal unit; include framing tokens for one contiguous span per unit.
