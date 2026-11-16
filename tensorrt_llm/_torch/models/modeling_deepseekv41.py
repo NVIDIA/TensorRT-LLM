@@ -1806,6 +1806,9 @@ class DeepseekV41Model(DeepseekV4Model):
             self._engram_overlap_decision = self._use_engram_context_overlap(attn_metadata)
         try:
             output = super().forward(attn_metadata, *args, **kwargs)
+            join_swa_refresh = getattr(attn_metadata, "join_swa_refresh_fork", None)
+            if join_swa_refresh is not None:
+                join_swa_refresh()
         finally:
             self._prologue_start = None
             self._engram_overlap_decision = None

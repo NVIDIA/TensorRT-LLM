@@ -1065,6 +1065,7 @@ def _compiled_mma(
     bf16_weights: bool = False,
     out_dtype: torch.dtype = torch.bfloat16,
     k_warps: int = 0,
+    smem_carveout: int = 0,
     a_rope_head_dim: int = 0,
     a_rms_eps: Optional[float] = None,
     n_tiles: int = 1,
@@ -1126,7 +1127,7 @@ def _compiled_mma(
     cos_sin = torch.empty((max(rope_positions, 1), 2, 32), dtype=torch.float32, device=dev)
     gamma = torch.empty((1, k if a_rms_eps is not None else 8), dtype=torch.bfloat16, device=dev)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    return cute.compile(
+    compiled = cute.compile(
         kernel,
         graph_safe_from_dlpack(a),
         graph_safe_from_dlpack(b),
@@ -1138,6 +1139,11 @@ def _compiled_mma(
         graph_safe_from_dlpack(gamma),
         stream,
     )
+    if smem_carveout:
+        from ..attention.backends.sparse.csa2.direct_decode import _set_smem_carveout
+
+        _set_smem_carveout(compiled, smem_carveout)
+    return compiled
 
 
 @functools.lru_cache(maxsize=None)
@@ -1169,6 +1175,7 @@ def mxfp8_lowm_linear(
     split_n: int = 0,
     rope: Optional[Tuple[torch.Tensor, torch.Tensor, int]] = None,
     scale_swizzled: bool = False,
+    smem_carveout: int = 0,
     rms_norm: Optional[Tuple[torch.Tensor, float]] = None,
     n_tiles: int = 1,
     swiglu_out_limit: Optional[float] = None,
@@ -1182,6 +1189,8 @@ def mxfp8_lowm_linear(
     tensors ``(y[:, :split_n], y[:, split_n:])`` written directly by the kernel.
     ``rope``: (positions [M] int, cos/sin [P, 2, 32] fp32, head_dim) applies interleaved RoPE to
     the last 64 columns of every head of the output.
+    ``smem_carveout``: the kernel's preferred shared-memory carveout in percent (0: the driver's
+    choice); the result is unchanged.
     ``rms_norm``: (gamma [K] bf16, eps) projects the RMS-normalized rows of x,
     ``rms_norm(x) * gamma``, instead of x. ``n_tiles`` (N a multiple of ``8 * n_tiles``): 8-column
     tiles per CTA, the same result with fewer CTAs.
@@ -1226,6 +1235,7 @@ def mxfp8_lowm_linear(
         head_dim,
         cos_sin.shape[0] if rope is not None else 0,
         scale_swizzled=scale_swizzled,
+        smem_carveout=smem_carveout,
         a_rms_eps=None if rms_norm is None else float(rms_norm[1]),
         n_tiles=n_tiles,
         bf16_dequant=bf16_dequant,

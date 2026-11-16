@@ -88,7 +88,16 @@ def test_module_sends_whole_context_and_generation_phases(monkeypatch, implement
         torch.testing.assert_close(index, hidden[:, :128], atol=0, rtol=0)
         published.append(("global", layer))
 
-    def write_layer_rows(layer, slots, values, transform=None, *, global_rows=None, index_q=None):
+    def write_layer_rows(
+        layer,
+        slots,
+        values,
+        transform=None,
+        *,
+        global_rows=None,
+        index_q=None,
+        release_after_wait=False,
+    ):
         write_swa(layer, slots, values, transform)
         if global_rows is not None:
             write_global(*global_rows)
@@ -144,6 +153,7 @@ def test_module_sends_whole_context_and_generation_phases(monkeypatch, implement
         native_fp8=False,
         fused_decode=False,
         gen_fmha_serves=lambda *args: False,
+        direct_decode_applies=lambda *args: False,
         layer_idx=0,
         num_heads=1,
         indexer=indexer,
@@ -151,8 +161,11 @@ def test_module_sends_whole_context_and_generation_phases(monkeypatch, implement
     backend._native_slot_mapping = lambda logical: CSA2TrtllmAttention._native_slot_mapping(
         backend, logical
     )
-    backend._resolve_sparse_inputs = lambda count, args: (
-        CSA2TrtllmAttention._resolve_sparse_inputs(backend, count, args)
+    backend.publish_layer_rows = lambda state, **kwargs: CSA2TrtllmAttention.publish_layer_rows(
+        backend, state, **kwargs
+    )
+    backend._resolve_sparse_inputs = lambda count, args, **kwargs: (
+        CSA2TrtllmAttention._resolve_sparse_inputs(backend, count, args, **kwargs)
     )
 
     def compute(query, k, v, metadata, *, forward_args):
@@ -215,7 +228,9 @@ def test_module_sends_whole_context_and_generation_phases(monkeypatch, implement
         global_hidden,
         global_hidden[:, :128],
     )
-    model._project_output = lambda output, position, inverse_rope_applied: output.flatten(1)
+    model._project_output = lambda output, position, inverse_rope_applied, rotated_back: (
+        output.flatten(1)
+    )
     actual = model(hidden, positions, source)
     expected = hidden + (row_ids[:, None].remainder(7) + 1).to(hidden.dtype)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
@@ -742,16 +757,21 @@ def test_native_mxfp8_projection_checkpoint_and_atomic_load(monkeypatch, q_lora_
 @pytest.mark.parametrize("lowm_qkv", [False, True])
 @pytest.mark.parametrize("rows", [6])
 @torch.inference_mode()
-def test_decode_graph_query_projections_match_unfused(rows, lowm_qkv):
+def test_decode_graph_query_projections_match_unfused(monkeypatch, rows, lowm_qkv):
     """Decode-graph query/SWA, Q and index-Q projections (index Q with its RoPE) on the small-M
     kernel, with and without the fused Q-A and KV projection on it, match the plain path at the
     model's shapes (hidden 5120, 8 heads, 32 index heads)."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import module as csa2_module
     from tensorrt_llm._torch.autotuner import AutoTuner
     from tensorrt_llm._torch.modules.linear import (
         flashinfer_mxfp8_autotune,
         flashinfer_mxfp8_decode_graph_capture,
     )
 
+    # The BF16 index query, which the cache write packs.
+    monkeypatch.setattr(
+        csa2_module.DeepseekV41Attention, "_packs_index_q", lambda self, rows, positions: False
+    )
     torch.manual_seed(946)
     model, _ = _native_model(q_lora_rank=1280, hidden_size=5120)
     model._lowm_qkv_projection = lowm_qkv
@@ -1082,6 +1102,135 @@ def test_native_module_auxiliary_stream_and_graph(monkeypatch, module_cache):
             outputs.setdefault(cached, []).append(output)
     for cached, (parallel, serial) in outputs.items():
         torch.testing.assert_close(parallel, serial, atol=0, rtol=0, msg=f"{cached} cached tokens")
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.inference_mode()
+def test_index_query_pack_publishes_rows_beside_index_chain(monkeypatch, module_cache):
+    """A direct-decode step whose index-query projection packs the queries (cache rows published on a
+    side stream) leaves the cache bytes, selections and output of the cache write's packing."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import cache_manager, quantization
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import module as csa2_module
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+    from tensorrt_llm._torch.metadata import KVCacheParams
+    from tensorrt_llm._torch.modules import low_m_gemm
+    from tensorrt_llm._torch.modules.linear import (
+        flashinfer_mxfp8_autotune,
+        flashinfer_mxfp8_decode_graph_capture,
+    )
+
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("The packing projection runs on SM100/SM103")
+    torch.manual_seed(951)
+    # The kernel against the cache write's packing of the BF16 projection.
+    kernel_model, _ = _native_model(q_lora_rank=1280)
+    linear = kernel_model.index_wq_b
+    cos_sin = kernel_model.rotary_emb.rotary_cos_sin.view(-1, 2, 32)
+    for rows in (1, 6, 12, 16):
+        qr = torch.randn(rows, 1280, device="cuda", dtype=torch.bfloat16)
+        for row, scale in zip(range(1, rows), (0.0, 1e-30, 1e30, float("nan"), float("inf"))):
+            qr[row] *= scale
+        positions = torch.randint(0, cos_sin.shape[0], (rows,), device="cuda", dtype=torch.int32)
+        query = low_m_gemm.mxfp8_lowm_linear(
+            qr,
+            linear.weight,
+            linear.weight_scale,
+            rope=(positions, cos_sin, 128),
+            scale_swizzled=True,
+        )
+        expected = quantization.pack_index_queries_split(query.view(rows, 32, 128))
+        actual = low_m_gemm.mxfp8_lowm_index_query(
+            qr, linear.weight, linear.weight_scale, positions, cos_sin
+        )
+        for got, want in zip(actual, expected):
+            assert torch.equal(got.view(torch.uint8), want.view(torch.uint8)), rows
+
+    manager, request = module_cache
+    model, _ = _native_model(
+        aux_stream=torch.cuda.Stream(), layout=manager.layout, kv_cache_dtype="fp8"
+    )
+    for linear in (model.wq_a, model.wq_b, model.wkv):
+        linear.quant_method.tune_mxfp8_backends = True
+    monkeypatch.setattr(csa2_module, "do_multi_stream", lambda: True)
+    side_streams = []
+    side_stream = csa2_module.csa2_side_stream
+    monkeypatch.setattr(
+        csa2_module,
+        "csa2_side_stream",
+        lambda device, index=0: side_streams.append(index) or side_stream(device, index),
+    )
+    packed_queries = []
+    store = cache_manager.store_layer_rows
+    monkeypatch.setattr(
+        cache_manager,
+        "store_layer_rows",
+        lambda *args, index_q=None, **kwargs: packed_queries.append(index_q is not None)
+        or store(*args, index_q=index_q, **kwargs),
+    )
+    metadata = CSA2TrtllmMetadata(max_num_requests=1, max_num_tokens=8, kv_cache_manager=manager)
+    metadata.request_ids = [request.py_request_id]
+    metadata.num_contexts = 1
+    metadata.prompt_lens = [4]
+    metadata.seq_lens = torch.tensor([1], dtype=torch.int32, device="cpu")
+    hidden = torch.randn(1, 128, device="cuda", dtype=torch.bfloat16)
+    metadata.kv_cache_params = KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[0])
+    metadata.prepare()
+    model(hidden, metadata.csa2_positions, metadata)
+    metadata.kv_cache_params = KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[1])
+    metadata.num_contexts = 0
+    metadata.is_cuda_graph = True
+    metadata.prepare()
+    positions = metadata.csa2_positions
+    pools = (manager.get_swa_buffer(0), manager.get_main_buffer(0), manager.get_index_pages(0))
+    torch.cuda.synchronize()
+    base = [pool.clone() for pool in pools]
+
+    packs_index_q = csa2_module.DeepseekV41Attention._packs_index_q
+
+    def run(pack):
+        monkeypatch.setattr(
+            csa2_module.DeepseekV41Attention,
+            "_packs_index_q",
+            packs_index_q if pack else (lambda self, rows, positions: False),
+        )
+        for pool, saved in zip(pools, base):
+            pool.copy_(saved)
+        metadata.reset_routing()
+        return model(hidden, positions, metadata)
+
+    def observe(output):
+        torch.cuda.synchronize()
+        return [output.clone(), metadata.csa2_indices[0].clone(), *(p.clone() for p in pools)]
+
+    with flashinfer_mxfp8_decode_graph_capture():
+        with flashinfer_mxfp8_autotune():
+            run(True)
+        for _ in range(2):
+            hidden.normal_()
+            side_streams.clear()
+            packed_queries.clear()
+            expected = observe(run(False))
+            assert packed_queries == [True] and 4 not in side_streams
+            side_streams.clear()
+            packed_queries.clear()
+            actual = observe(run(True))
+            assert packed_queries == [False] and 4 in side_streams
+            for got, want in zip(actual, expected):
+                assert torch.equal(got, want)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = run(True)
+        for sign in (-1.0, 1.0):
+            hidden.mul_(sign)
+            for pool, saved in zip(pools, base):
+                pool.copy_(saved)
+            graph.replay()
+            actual = observe(captured)
+            expected = observe(run(False))
+            for got, want in zip(actual, expected):
+                assert torch.equal(got, want)
+    torch.cuda.synchronize()
 
 
 @skip_pre_blackwell
