@@ -866,7 +866,7 @@ def test_forward_guided_batch_masks_and_advances_matcher_per_step(monkeypatch):
             self.add_steps.append(draft_step)
             self.add_tokens.append(new_tokens.clone())
 
-        def execute_draft_batch(self, logits, draft_step=0):
+        def execute_draft_batch(self, logits, d2t=None, draft_step=0):
             # Record the exact tensor properties the bitmask kernel requires,
             # BEFORE mutating: contiguous [batch, vocab] with zero-padded
             # context rows.

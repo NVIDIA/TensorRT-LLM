@@ -3769,6 +3769,57 @@ class SpecWorkerBase(nn.Module, ABC):
         if self.guided_decoder is not None:
             self.guided_decoder.execute(logits)
 
+    def _sample_draft_tokens_guided(
+        self,
+        gen_logits: torch.Tensor,
+        spec_metadata,
+        accepted_tokens: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+        num_contexts: int,
+        batch_size: int,
+        K: int,
+    ):
+        """Grammar-constrained sampling of a precomputed draft block.
+
+        Walks the K positions left to right: the matcher is advanced past the
+        previous sampled token (``add_draft_batch``), the position's logits are
+        masked in place (``execute_draft_batch``), then the position is sampled
+        from the masked logits. Both the sampled tokens and the stored draft
+        probabilities are therefore grammar-valid, which keeps the draft
+        distribution q consistent with the masked target distribution p under
+        rejection sampling.
+
+        ``K`` must equal the guided decoder's ``max_num_draft_tokens``: the
+        draft matcher is rolled back to the accepted prefix at step 0 and its
+        draft advances are undone at step K-1.
+        """
+        vocab = gen_logits.shape[-1]
+        # Lay the block out step-major ([K, batch, vocab]) so each step's slice is
+        # a contiguous [batch, vocab] tensor.
+        if num_contexts > 0:
+            full_logits = gen_logits.new_zeros((K, batch_size, vocab))
+            full_logits[:, num_contexts:, :] = gen_logits.transpose(0, 1)
+        else:
+            full_logits = gen_logits.transpose(0, 1).contiguous()
+
+        gidx = (num_accepted_tokens - 1).clamp(min=0).unsqueeze(1).long()
+        new_tokens = accepted_tokens.gather(1, gidx).squeeze(1).to(torch.int32)
+
+        gen_draft_tokens = []
+        for k in range(K):
+            self.guided_decoder.add_draft_batch(new_tokens, num_accepted_tokens, draft_step=k)
+            step_logits = full_logits[k]
+            self.guided_decoder.execute_draft_batch(
+                step_logits, d2t=self._d2t, draft_step=k
+            )
+            step_tokens = self.sample_draft_tokens(
+                step_logits, spec_metadata, batch_size, draft_step=k
+            )
+            gen_draft_tokens.append(step_tokens[num_contexts:])
+            new_tokens = step_tokens
+        gen_draft_tokens = torch.stack(gen_draft_tokens, dim=1)
+        return gen_draft_tokens
+
     def _rollback_guided_decoder_after_verify(self, num_accepted_tokens):
         """Restore the accepted grammar prefix after a one-shot draft step.
 

@@ -866,6 +866,11 @@ class DFlashWorker(SpecWorkerBase):
     # draft_slot_trail_tokens). Set in _lazy_init_ctx_buffers.
     _ctx_pool_windowed = False
     _ctx_pool_trail = 0
+    # Whether guided decoding drafts the block position by position, masking
+    # each position's logits with the grammar before sampling it. Off for
+    # plain DFlash/PARD, which sample the block unmasked and are verified
+    # against the masked target.
+    _guided_draft_loop = False
 
     def __init__(
         self,
@@ -2362,6 +2367,7 @@ class DFlashWorker(SpecWorkerBase):
             total_target_tokens=total_target_tokens,
         )
 
+        guided_draft_loop_ran = False
         if num_gens > 0:
             with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
                 hidden_states_out = draft_model.dflash_forward(
@@ -2441,12 +2447,30 @@ class DFlashWorker(SpecWorkerBase):
                         )
                         vocab_size = gen_logits.shape[-1]
 
-                    gen_draft_tokens = self.sample_draft_tokens(
-                        gen_logits,
-                        spec_metadata,
-                        batch_size,
-                        num_contexts=num_contexts,
-                    )
+                    if (
+                        self.guided_decoder is not None
+                        and self._guided_draft_loop
+                        and K == self.max_draft_len
+                    ):
+                        # The loop's step 0 / step K-1 roll the matcher back,
+                        # so it is only valid for a full-length block.
+                        gen_draft_tokens = self._sample_draft_tokens_guided(
+                            gen_logits,
+                            spec_metadata,
+                            accepted_tokens,
+                            num_accepted_tokens,
+                            num_contexts,
+                            batch_size,
+                            K,
+                        )
+                        guided_draft_loop_ran = True
+                    else:
+                        gen_draft_tokens = self.sample_draft_tokens(
+                            gen_logits,
+                            spec_metadata,
+                            batch_size,
+                            num_contexts=num_contexts,
+                        )
 
                 # Opt-in confidence-calibration recording (env-gated). The
                 # confidence values come from an optional provider on the
@@ -2489,7 +2513,8 @@ class DFlashWorker(SpecWorkerBase):
         self._restore_attn_metadata_from_spec_dec(attn_metadata)
         self._apply_kv_rewind_after_draft(attn_metadata, spec_metadata)
 
-        self._rollback_guided_decoder_after_verify(num_accepted_tokens)
+        if not guided_draft_loop_ran:
+            self._rollback_guided_decoder_after_verify(num_accepted_tokens)
 
         next_new_tokens = self._prepare_next_new_tokens(
             accepted_tokens,

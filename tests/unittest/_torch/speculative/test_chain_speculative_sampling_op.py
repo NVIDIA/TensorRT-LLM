@@ -146,6 +146,33 @@ def test_first_token_follows_the_target(vocab: int) -> None:
     assert tv < 0.02, f"total-variation distance {tv:.4f} from the target"
 
 
+def test_grammar_masked_proposal_and_target_stay_lossless() -> None:
+    """Guided decoding masks both q and p to the grammar's allowed tokens. Every emitted
+    token is then allowed, and the first one is still distributed as the masked target."""
+    rows, vocab = 32768, 32
+    draft_probs, _, target_probs = _request(2, vocab, seed=9)
+    allowed = torch.zeros(vocab, dtype=torch.bool, device=DEV)
+    allowed[::3] = True
+
+    def mask(probs: torch.Tensor) -> torch.Tensor:
+        probs = probs * allowed
+        return probs / probs.sum(dim=-1, keepdim=True)
+
+    draft_probs, target_probs = mask(draft_probs), mask(target_probs)
+    gen = torch.Generator(device=DEV).manual_seed(13)
+    trial_tokens = torch.stack(
+        [torch.multinomial(draft_probs[i], rows, True, generator=gen) for i in range(2)], dim=-1
+    )
+    draft_probs, target_probs = _repeat(rows, draft_probs, target_probs)
+    tokens, num_tokens = rejection_sampling_one_model(
+        draft_probs, trial_tokens.int(), target_probs, *_independent_trials(rows)
+    )
+    emitted = torch.arange(3, device=DEV) < num_tokens.unsqueeze(-1)
+    assert allowed[tokens.long()[emitted]].all()
+    tv = _tv(tokens[:, 0], target_probs[0, 0])
+    assert tv < 0.02, f"total-variation distance {tv:.4f} from the masked target"
+
+
 def test_acceptance_rate_is_the_overlap() -> None:
     """A draft token sampled from q is accepted with probability sum(min(p, q))."""
     rows, vocab = 32768, 64

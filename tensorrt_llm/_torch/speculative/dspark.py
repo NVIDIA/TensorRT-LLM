@@ -1464,44 +1464,6 @@ class DSv4DSparkWorker(SpecWorkerBase):
             self._confidence_stamp[slots] = self._draft_seq_cuda
         return draft_output[0].to(torch.int32) if return_tokens else draft_output[2]
 
-    def _sample_draft_tokens_guided(
-        self,
-        gen_logits: torch.Tensor,
-        spec_metadata: "DSparkSpecMetadata",
-        accepted_tokens: torch.Tensor,
-        num_accepted_tokens: torch.Tensor,
-        num_contexts: int,
-        batch_size: int,
-        K: int,
-    ):
-        """
-        Grammar-constrained draft sampling for the guided-decoding path.
-        """
-        vocab = gen_logits.shape[-1]
-        # Lay the block out step-major ([K, batch, vocab]) so each step's slice is
-        # a contiguous [batch, vocab] tensor.
-        if num_contexts > 0:
-            full_logits = gen_logits.new_zeros((K, batch_size, vocab))
-            full_logits[:, num_contexts:, :] = gen_logits.transpose(0, 1)
-        else:
-            full_logits = gen_logits.transpose(0, 1).contiguous()
-
-        gidx = (num_accepted_tokens - 1).clamp(min=0).unsqueeze(1).long()
-        new_tokens = accepted_tokens.gather(1, gidx).squeeze(1).to(torch.int32)
-
-        gen_draft_tokens = []
-        for k in range(K):
-            self.guided_decoder.add_draft_batch(new_tokens, num_accepted_tokens, draft_step=k)
-            step_logits = full_logits[k]
-            self.guided_decoder.execute_draft_batch(step_logits, draft_step=k)
-            step_tokens = self.sample_draft_tokens(
-                step_logits, spec_metadata, batch_size, draft_step=k
-            )
-            gen_draft_tokens.append(step_tokens[num_contexts:])
-            new_tokens = step_tokens
-        gen_draft_tokens = torch.stack(gen_draft_tokens, dim=1)
-        return gen_draft_tokens
-
     def _forward_impl(
         self,
         input_ids,
@@ -1758,6 +1720,8 @@ class DSparkWorker(DFlashWorker):
     draft K/V here, a worker-owned rolling window in
     :class:`DSv4DSparkWorker`.
     """
+
+    _guided_draft_loop = True
 
     def set_draft_model(self, draft_model) -> None:
         """Reject an unsupported vocab mapping here rather than mid-decode.

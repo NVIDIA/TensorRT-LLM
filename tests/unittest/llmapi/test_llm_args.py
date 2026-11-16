@@ -798,6 +798,33 @@ def test_rejection_sampling_still_gated_on_context_parallel():
 
 
 @pytest.mark.cpu_only
+def test_rejection_sampling_guided_decoding_gate(monkeypatch):
+    """Guided decoding + rejection sampling: allowed for DSpark, gated for MTP."""
+    import tensorrt_llm._torch.flashinfer_utils as fi_utils
+    monkeypatch.setattr(fi_utils, "IS_FLASHINFER_AVAILABLE", True)
+
+    spec_cfg = MTPDecodingConfig(max_draft_len=2,
+                                 use_rejection_sampling=True,
+                                 use_mtp_vanilla=True)
+    with pytest.raises(ValueError, match="guided decoding is enabled"):
+        TorchLlmArgs(model=llama_model_path,
+                     guided_decoding_backend="xgrammar",
+                     speculative_config=spec_cfg)
+
+    # DSpark masks both the draft and the target distribution, so it is not
+    # gated; the DSpark validator needs no checkpoint when the drafter is
+    # embedded in the target.
+    from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig
+    spec_cfg = DSparkDecodingConfig(max_draft_len=3,
+                                    speculative_model=llama_model_path,
+                                    use_rejection_sampling=True)
+    args = TorchLlmArgs(model=llama_model_path,
+                        guided_decoding_backend="xgrammar",
+                        speculative_config=spec_cfg)
+    assert args.speculative_config.use_rejection_sampling is True
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "cp_config",
     [None,

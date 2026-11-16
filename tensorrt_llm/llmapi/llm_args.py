@@ -9353,7 +9353,11 @@ class TorchLlmArgs(BaseLlmArgs):
                 # uniform -- see SpecMetadata.group_all_greedy_sample). Only
                 # context parallelism remains gated.
                 rs_parallel_active = self.context_parallel_size > 1
-                rs_guided_active = self.guided_decoding_backend is not None
+                # DSpark applies the grammar mask to both the target logits and
+                # the draft logits it samples from (so q and p are both
+                # grammar-masked), hence guided decoding is allowed with it.
+                rs_guided_active = (self.guided_decoding_backend is not None
+                                    and not spec_mode.is_dspark())
                 rs_sa_active = getattr(self.speculative_config, "sa_config",
                                        None) is not None
                 rs_relaxed_active = getattr(
@@ -9387,7 +9391,7 @@ class TorchLlmArgs(BaseLlmArgs):
                             reasons.append(
                                 f"spec mode {spec_mode.name} is not a supported "
                                 "rejection-sampling path (supported: the Eagle3 "
-                                "one-model path, vanilla MTP, PARD, DFlash, and "
+                                "one-model path, vanilla MTP, PARD, DFlash, DSpark, and "
                                 "DraftTarget one-model)")
                         if rs_sa_active:
                             reasons.append("SA (sa_config) is active")
