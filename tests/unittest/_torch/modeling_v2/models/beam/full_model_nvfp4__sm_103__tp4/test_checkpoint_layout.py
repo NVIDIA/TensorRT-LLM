@@ -572,3 +572,30 @@ def test_mapping_rejections_and_weight_state_guard() -> None:
     )  # same-shape replacement
     with pytest.raises(RuntimeError):
         _check_weight_state(model, state)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("data_offsets", [0.0, 2.0]),
+        ("data_offsets", ["0", 2]),
+        ("data_offsets", [False, 2]),
+        ("data_offsets", [0, 3]),
+        ("shape", [1.0]),
+        ("shape", [True]),
+        ("shape", [-1]),
+    ],
+)
+def test_catalog_uses_shared_metadata_validation(tmp_path, field, value) -> None:
+    info = {"dtype": "BF16", "shape": [1], "data_offsets": [0, 2]}
+    info[field] = value
+    header = json.dumps({"weight": info}).encode()
+    (tmp_path / "weights.safetensors").write_bytes(
+        struct.pack("<Q", len(header)) + header + b"\0\0"
+    )
+    (tmp_path / loader.INDEX_FILE).write_text(
+        json.dumps({"weight_map": {"weight": "weights.safetensors"}})
+    )
+    with pytest.raises(loader.CheckpointFormatError):
+        loader.SafetensorsCatalog(tmp_path)

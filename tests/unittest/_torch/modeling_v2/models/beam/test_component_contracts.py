@@ -338,24 +338,6 @@ def test_direct_call_device_and_metadata_admission(monkeypatch):
             metadata_values(values, 3, "seq_lens")
 
 
-@pytest.mark.parametrize("offset", [0.0, False, "0"])
-def test_safetensors_offsets_must_be_integers(tmp_path, monkeypatch, offset):
-    import json
-
-    (tmp_path / loader.INDEX_FILE).write_text(json.dumps({"weight_map": {"w": "shard"}}))
-    (tmp_path / "shard").write_bytes(bytes(8))
-    monkeypatch.setattr(
-        loader,
-        "_read_header",
-        lambda path: (
-            {"w": {"dtype": "F32", "shape": [1], "data_offsets": [offset, 4]}},
-            0,
-        ),
-    )
-    with pytest.raises(loader.CheckpointFormatError, match="offsets must be integers"):
-        loader.SafetensorsCatalog(str(tmp_path))
-
-
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("failure", [None, "metadata", "copy", "close", "remote"])
 def test_checkpoint_load_transaction(
@@ -493,7 +475,9 @@ def test_component_constructor_uses_format_storage(monkeypatch, packed: bool) ->
     )
     spec = layout.TensorSpec(layout.EMBED, (8, 2), layout.BF16, "embedding", None, None, 0)
     monkeypatch.setattr(cls, "_tensor_specs", staticmethod(lambda *args: {spec.name: spec}))
-    monkeypatch.setattr(bf16, "AllReduce", lambda **kwargs: NS())
+    monkeypatch.setattr(
+        bf16, "allreduce_group_args", lambda mapping: dict(group=[0, 1, 2, 3], process_group=None)
+    )
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (10, 3))
     real_empty = torch.empty
 

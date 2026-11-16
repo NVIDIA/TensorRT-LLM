@@ -116,7 +116,7 @@ class _Reduce:
 def test_every_rank_runs_the_same_diagnostic_mode(mine: bool, ranks_on: int, ok: bool) -> None:
     reduce = _Reduce(ranks_on)
     component = SimpleNamespace(
-        diagnostics=mine, device=torch.device("cpu"), rank=0, _allreduce=reduce
+        diagnostics=mine, device=torch.device("cpu"), rank=0, _allgather=reduce
     )
     if ok:
         BF16_CLS._check_diagnostics_agree(component)
@@ -153,7 +153,7 @@ def test_router_disagreement_is_detected(monkeypatch: pytest.MonkeyPatch) -> Non
     )
 
     def peers(differing_rank: int | None) -> Callable[..., torch.Tensor]:
-        def allgather(local: torch.Tensor, mapping: object, dim: int = 0) -> torch.Tensor:
+        def allgather(local: torch.Tensor) -> torch.Tensor:
             rows = [local.clone() for _ in range(bf16.WORLD_SIZE)]
             if differing_rank is not None:
                 rows[differing_rank][0] ^= 1
@@ -161,9 +161,9 @@ def test_router_disagreement_is_detected(monkeypatch: pytest.MonkeyPatch) -> Non
 
         return allgather
 
-    monkeypatch.setattr(bf16, "allgather", peers(None))
+    component._allgather = peers(None)
     assert len(BF16_CLS._digests_agree(component, tensors)) == 3
-    monkeypatch.setattr(bf16, "allgather", peers(2))
+    component._allgather = peers(2)
     with pytest.raises(RuntimeError, match="replicated MoE routing differs"):
         BF16_CLS._digests_agree(component, tensors)
 
@@ -257,3 +257,42 @@ def test_diagnostic_mode_is_read_once_from_the_environment(
     assert component.diagnostics is expected
     monkeypatch.setenv(MODELING_V2_VALIDATE_ENV, "0" if expected else "1")
     assert component.diagnostics is expected
+
+
+@pytest.mark.parametrize("process_group", [None, object()], ids=["mpi", "c10d"])
+def test_catalog_collectives_preserve_vocabulary_order(monkeypatch, process_group) -> None:
+    group = [0, 1, 2, 3]
+    args = dict(group=group, process_group=process_group, strategy=0, workspace=None, rank=0)
+    monkeypatch.setattr(bf16, "allreduce_group_args", lambda mapping: args)
+    local = torch.arange(6, dtype=torch.bfloat16).reshape(2, 3)
+    peers = [local + rank * 10 for rank in group]
+
+    def gather(input, *, sizes, group, process_group):
+        assert sizes is None and group == args["group"]
+        assert process_group is args["process_group"]
+        assert input.is_contiguous() and torch.equal(input, local.t())
+        return torch.cat([peer.t() for peer in peers], dim=0)
+
+    def reduce(input, **kwargs):
+        assert all(kwargs[key] is value for key, value in args.items())
+        assert kwargs["op"] == 0 and kwargs["residual"] is None
+        return input * 4
+
+    monkeypatch.setattr(bf16, "allgather", gather)
+    monkeypatch.setattr(bf16, "allreduce", reduce)
+    monkeypatch.setattr(bf16, "cublas_mm", lambda x, w: local)
+    monkeypatch.setattr(bf16, "beam_logit_softcap", lambda x, cap: x)
+    component = SimpleNamespace(
+        mapping=object(),
+        hidden=3,
+        device=torch.device("cpu"),
+        max_tokens=2,
+        softcap=30.0,
+        tensor=lambda name: torch.zeros(3, 3),
+        _check_usable=lambda: None,
+    )
+    BF16_CLS._init_collectives(component)
+    assert torch.equal(BF16_CLS.all_reduce(component, local), local * 4)
+    output = BF16_CLS.head(component, local)
+    assert output.is_contiguous()
+    assert torch.equal(output, torch.cat(peers, dim=-1))
